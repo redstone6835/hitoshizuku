@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -34,24 +35,29 @@ pub(crate) struct KernelApiCrate {
 ///
 /// 网络实现有意不在目录中。`vfs` 与 `general` 对网络 crate 的内部依赖只用于构建
 /// 当前内核，不会产生 `net`、`socket` 或 `mygo-smoltcp` façade。
-pub(crate) const KERNEL_API_CRATES: &[KernelApiCrate] = &[
-    KernelApiCrate { name: "acpi", repository_path: "libs/acpi" },
-    KernelApiCrate { name: "allocator", repository_path: "libs/allocator" },
-    KernelApiCrate { name: "efi", repository_path: "libs/efi" },
-    KernelApiCrate { name: "elf", repository_path: "libs/elf" },
-    KernelApiCrate { name: "errno", repository_path: "libs/errno" },
-    KernelApiCrate { name: "extfs", repository_path: "libs/extfs" },
-    KernelApiCrate { name: "fatfs", repository_path: "libs/fatfs" },
-    KernelApiCrate { name: "general", repository_path: "general" },
-    KernelApiCrate { name: "hal", repository_path: "hal" },
-    KernelApiCrate { name: "log", repository_path: "libs/log" },
-    KernelApiCrate { name: "mm", repository_path: "libs/mm" },
-    KernelApiCrate { name: "sched", repository_path: "libs/sched" },
-    KernelApiCrate { name: "vfs", repository_path: "libs/vfs" },
-];
+const KERNEL_API_CRATE_LIST: &str =
+    include_str!("../../../libs/kernel-symbols/kernel-api-crates.txt");
+
+static KERNEL_API_CRATES: LazyLock<Vec<KernelApiCrate>> = LazyLock::new(|| {
+    KERNEL_API_CRATE_LIST
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let name = fields.next().expect("Kernel API crate 记录缺少名称");
+            let repository_path = fields.next().expect("Kernel API crate 记录缺少路径");
+            assert!(fields.next().is_none(), "Kernel API crate 记录包含多余字段");
+            assert!(valid_crate_name(name), "Kernel API crate 名称无效");
+            KernelApiCrate {
+                name,
+                repository_path,
+            }
+        })
+        .collect()
+});
 
 pub(crate) fn kernel_api_crates() -> &'static [KernelApiCrate] {
-    KERNEL_API_CRATES
+    KERNEL_API_CRATES.as_slice()
 }
 
 pub(crate) fn kernel_api_host_alias(name: &str) -> String {
@@ -72,9 +78,7 @@ fn valid_metadata_file(crate_name: &str, file: &str) -> bool {
     let prefix = format!("lib{crate_name}-");
     file.strip_prefix(&prefix)
         .and_then(|suffix| suffix.strip_suffix(".rlib"))
-        .is_some_and(|hash| {
-            hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
+        .is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +181,9 @@ impl KernelInterfaceManifest {
                 if fields.next().is_some()
                     || !valid_crate_name(name)
                     || file.is_empty()
-                    || metadata.insert(name.to_string(), file.to_string()).is_some()
+                    || metadata
+                        .insert(name.to_string(), file.to_string())
+                        .is_some()
                 {
                     return Err(format!("{} 包含无效或重复的 metadata 记录", path.display()));
                 }
@@ -244,16 +250,16 @@ impl KernelInterfaceManifest {
         {
             return Err("内核接口清单缺少必需身份信息".to_string());
         }
-        for spec in KERNEL_API_CRATES {
+        for spec in kernel_api_crates() {
             if !self.metadata.contains_key(spec.name) {
                 return Err(format!("内核接口清单缺少 {} metadata", spec.name));
             }
         }
-        if self.metadata.len() != KERNEL_API_CRATES.len() {
+        if self.metadata.len() != kernel_api_crates().len() {
             return Err("内核接口清单包含未登记的 metadata crate".to_string());
         }
         let mut metadata_files = BTreeSet::new();
-        for spec in KERNEL_API_CRATES {
+        for spec in kernel_api_crates() {
             let file = &self.metadata[spec.name];
             if !valid_metadata_file(spec.name, file) || !metadata_files.insert(file) {
                 return Err(format!(
@@ -282,6 +288,12 @@ impl KernelInterfaceManifest {
         let mut api_paths = BTreeSet::new();
         let mut link_names = BTreeMap::new();
         for symbol in &self.symbols {
+            if forbidden_network_reference(symbol) {
+                return Err(format!(
+                    "非网络内核接口 {} 的签名或路径引用了网络实现",
+                    symbol.api_path
+                ));
+            }
             if symbol.interface_hash != self.interface_hash
                 || symbol.rust_abi_hash != sha256(symbol.rust_abi.as_bytes())
             {
@@ -481,7 +493,7 @@ pub fn export_kernel_interface(
     let mut metadata = BTreeMap::new();
     let interface_rlibs = exact_kernel_api_rlibs(&deps, kernel, &kernel_bytes)?;
     let mut roots = Vec::new();
-    for (spec, rlib) in KERNEL_API_CRATES.iter().zip(&interface_rlibs) {
+    for (spec, rlib) in kernel_api_crates().iter().zip(&interface_rlibs) {
         let file = rlib
             .file_name()
             .and_then(|name| name.to_str())
@@ -609,7 +621,7 @@ pub fn emit_kernel_symbol_probe(manifest_path: &Path, output: &Path) -> Result<u
 
 fn repository_interface_hash(repository: &Path) -> Result<([u8; 32], usize), String> {
     let mut files = Vec::new();
-    for spec in KERNEL_API_CRATES {
+    for spec in kernel_api_crates() {
         let root = repository.join(spec.repository_path);
         collect_rust_sources(&root.join("src"), &format!("{}/src", spec.name), &mut files)?;
         files.push((format!("{}/Cargo.toml", spec.name), root.join("Cargo.toml")));
@@ -636,7 +648,7 @@ fn framework_distribution_hash(repository: &Path) -> Result<[u8; 32], String> {
         "kernel-symbols",
         &mut files,
     )?;
-    for spec in KERNEL_API_CRATES {
+    for spec in kernel_api_crates() {
         let host_alias = kernel_api_host_alias(spec.name);
         files.push((
             format!("{}/Cargo.toml", spec.name),
@@ -1062,7 +1074,7 @@ fn scan_repository_api_abis(
 
 fn collect_kernel_api_sources(repository: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     let mut output = Vec::new();
-    for spec in KERNEL_API_CRATES {
+    for spec in kernel_api_crates() {
         let source = repository.join(spec.repository_path).join("src");
         let mut files = Vec::new();
         collect_rust_sources(&source, "", &mut files)?;
@@ -1861,8 +1873,8 @@ fn exact_kernel_api_rlibs(
     let input = fs::read_to_string(&kernel_unit)
         .map_err(|error| format!("读取 {} 失败: {error}", kernel_unit.display()))?;
     let fingerprints = parse_kernel_dependency_fingerprints(&input)?;
-    let mut output = Vec::with_capacity(KERNEL_API_CRATES.len());
-    for spec in KERNEL_API_CRATES {
+    let mut output = Vec::with_capacity(kernel_api_crates().len());
+    for spec in kernel_api_crates() {
         let expected = fingerprints.get(spec.name).ok_or_else(|| {
             format!(
                 "活动 kernel 构建图没有直接依赖 {}；Kernel API crate 必须由 kernel 明确依赖",
@@ -2049,11 +2061,7 @@ impl<'a> CargoFingerprintCursor<'a> {
     fn number(&mut self) -> Result<u64, String> {
         self.skip_whitespace();
         let start = self.offset;
-        while self
-            .bytes
-            .get(self.offset)
-            .is_some_and(u8::is_ascii_digit)
-        {
+        while self.bytes.get(self.offset).is_some_and(u8::is_ascii_digit) {
             self.offset += 1;
         }
         if self.offset == start {
@@ -2280,7 +2288,7 @@ fn copy_framework(
         ),
     )
     .map_err(|error| format!("写入 host LSP 接口身份失败: {error}"))?;
-    for spec in KERNEL_API_CRATES {
+    for spec in kernel_api_crates() {
         write_facade(
             &destination.join(spec.name),
             spec.name,
@@ -2310,7 +2318,7 @@ fn write_facade(directory: &Path, name: &str, host_alias: &str) -> Result<(), St
 }
 
 pub(crate) fn metadata_facade_manifest(name: &str, host_alias: &str) -> String {
-    let spec = KERNEL_API_CRATES
+    let spec = kernel_api_crates()
         .iter()
         .find(|spec| spec.name == name)
         .unwrap_or_else(|| panic!("不支持的内核元数据 façade: {name}"));
@@ -2412,13 +2420,22 @@ pub use __elm_backend::*;
 
 unsafe extern "Rust" {{
     #[link_name = "{alloc}"]
-    fn elm_kernel_alloc(layout: Layout) -> *mut u8;
+    fn elm_kernel_alloc(allocator: &KernelMemorySubsystem, layout: Layout) -> *mut u8;
     #[link_name = "{dealloc}"]
-    fn elm_kernel_dealloc(pointer: *mut u8, layout: Layout);
+    fn elm_kernel_dealloc(
+        allocator: &KernelMemorySubsystem,
+        pointer: *mut u8,
+        layout: Layout,
+    );
     #[link_name = "{realloc}"]
-    fn elm_kernel_realloc(pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8;
+    fn elm_kernel_realloc(
+        allocator: &KernelMemorySubsystem,
+        pointer: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> *mut u8;
     #[link_name = "{alloc_zeroed}"]
-    fn elm_kernel_alloc_zeroed(layout: Layout) -> *mut u8;
+    fn elm_kernel_alloc_zeroed(allocator: &KernelMemorySubsystem, layout: Layout) -> *mut u8;
 }}
 
 struct ElmGlobalAllocator;
@@ -2426,22 +2443,22 @@ struct ElmGlobalAllocator;
 unsafe impl GlobalAlloc for ElmGlobalAllocator {{
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {{
         // Safety: 入口由 ELM 装载器绑定到同构内核分配器，layout 来自 GlobalAlloc。
-        unsafe {{ elm_kernel_alloc(layout) }}
+        unsafe {{ elm_kernel_alloc(&KERNEL_ALLOCATOR, layout) }}
     }}
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {{
         // Safety: pointer/layout 必须来自本 ELM 的同一个全局分配器。
-        unsafe {{ elm_kernel_dealloc(pointer, layout) }}
+        unsafe {{ elm_kernel_dealloc(&KERNEL_ALLOCATOR, pointer, layout) }}
     }}
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {{
         // Safety: 调用方遵守 GlobalAlloc::realloc 的所有权和布局约束。
-        unsafe {{ elm_kernel_realloc(pointer, layout, new_size) }}
+        unsafe {{ elm_kernel_realloc(&KERNEL_ALLOCATOR, pointer, layout, new_size) }}
     }}
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {{
         // Safety: 入口由 ELM 装载器绑定，layout 来自 GlobalAlloc。
-        unsafe {{ elm_kernel_alloc_zeroed(layout) }}
+        unsafe {{ elm_kernel_alloc_zeroed(&KERNEL_ALLOCATOR, layout) }}
     }}
 }}
 
@@ -2455,12 +2472,10 @@ pub(crate) fn framework_workspace_manifest() -> String {
     let mut output = String::from(
         "[workspace]\nresolver = \"2\"\nmembers = [\n    \"elm\",\n    \"elm/macros\",\n    \"kernel-symbols\",\n    \"kernel-symbols/macros\",\n",
     );
-    for spec in KERNEL_API_CRATES {
+    for spec in kernel_api_crates() {
         writeln!(output, "    {:?},", spec.name).expect("写入 String 不会失败");
     }
-    output.push_str(
-        "]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    );
+    output.push_str("]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     output
 }
 
@@ -2762,6 +2777,27 @@ fn remove_path(path: &Path) -> Result<(), String> {
     }
 }
 
+fn forbidden_network_reference(symbol: &KernelInterfaceSymbol) -> bool {
+    let fields = [
+        symbol.api_path.as_str(),
+        symbol.item_path.as_str(),
+        symbol.contract.as_str(),
+        symbol.rust_abi.as_str(),
+    ];
+    fields.iter().any(|field| {
+        let normalized = field.replace('-', "_");
+        normalized.starts_with("net.")
+            || normalized.starts_with("socket.")
+            || normalized.contains(".net.")
+            || normalized.contains(".socket.")
+            || normalized.contains("net::")
+            || normalized.contains("socket::")
+            || normalized.contains("mygo_smoltcp")
+            || normalized.contains(".net_socket")
+            || normalized.contains(".netlink_socket")
+    })
+}
+
 fn parse_symbol_record(value: &str) -> Result<KernelInterfaceSymbol, String> {
     let fields = value.split('\t').collect::<Vec<_>>();
     if fields.len() != 12 {
@@ -2873,6 +2909,19 @@ mod tests {
         assert!(allocator_source.contains("cfg(feature = \"lsp\")"));
         assert!(allocator_source.contains("extern crate __elm_lsp_allocator as __elm_backend"));
         assert!(allocator_source.contains("extern crate __elm_host_allocator as __elm_backend"));
+        assert!(
+            allocator_source
+                .contains("fn elm_kernel_alloc(allocator: &KernelMemorySubsystem, layout: Layout)")
+        );
+        assert!(allocator_source.contains("elm_kernel_alloc(&KERNEL_ALLOCATOR, layout)"));
+        assert!(
+            allocator_source.contains("elm_kernel_dealloc(&KERNEL_ALLOCATOR, pointer, layout)")
+        );
+        assert!(
+            allocator_source
+                .contains("elm_kernel_realloc(&KERNEL_ALLOCATOR, pointer, layout, new_size)")
+        );
+        assert!(allocator_source.contains("elm_kernel_alloc_zeroed(&KERNEL_ALLOCATOR, layout)"));
 
         let general = metadata_facade_manifest("general", "__elm_host_general");
         assert!(general.contains("lsp = [\"dep:__elm_lsp_general\"]"));
@@ -2892,7 +2941,8 @@ mod tests {
 
     #[test]
     fn cargo_kernel_dependency_fingerprints_are_parsed_exactly() {
-        let input = r#"{"deps":[[1,"vfs",false,9241382601345381766],[2,"sched",true,7]],"local":[]}"#;
+        let input =
+            r#"{"deps":[[1,"vfs",false,9241382601345381766],[2,"sched",true,7]],"local":[]}"#;
         let parsed = parse_kernel_dependency_fingerprints(input).unwrap();
         assert_eq!(parsed.get("vfs"), Some(&9_241_382_601_345_381_766));
         assert_eq!(parsed.get("sched"), Some(&7));
@@ -2900,18 +2950,12 @@ mod tests {
             parse_cargo_fingerprint("86b5aa5283fc3f80").unwrap(),
             9_241_382_601_345_381_766
         );
-        assert!(valid_metadata_file(
-            "vfs",
-            "libvfs-bcc06a6bb214de4e.rlib"
-        ));
+        assert!(valid_metadata_file("vfs", "libvfs-bcc06a6bb214de4e.rlib"));
         assert!(!valid_metadata_file(
             "vfs",
             "../libvfs-bcc06a6bb214de4e.rlib"
         ));
-        assert!(!valid_metadata_file(
-            "vfs",
-            "libnet-bcc06a6bb214de4e.rlib"
-        ));
+        assert!(!valid_metadata_file("vfs", "libnet-bcc06a6bb214de4e.rlib"));
     }
 
     #[test]
@@ -2963,12 +3007,66 @@ mod tests {
                 && !symbol.api_path.contains(".net_socket")
                 && !symbol.api_path.contains(".netlink_socket")
         }));
-        assert!(KERNEL_API_CRATES.iter().all(|spec| {
+        assert!(kernel_api_crates().iter().all(|spec| {
             !matches!(
                 spec.name,
                 "net" | "socket" | "mygo-smoltcp" | "mygo_smoltcp"
             )
         }));
+        for required in [
+            "elf.parse",
+            "sched.operation.spawn_user_process",
+            "sched.task.Task.pid_root",
+            "vfs.operation.openat",
+            "vfs.operation.close",
+            "vfs.operation.close_for_owner",
+            "vfs.operation.renameat",
+            "vfs.file.File.mount",
+            "vfs.file.File.dentry",
+            "general.vfs.namespace_path",
+        ] {
+            assert!(
+                symbols.iter().any(|symbol| symbol.api_path == required),
+                "缺少 demo 运行链路符号 {required}"
+            );
+        }
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| !forbidden_network_reference(symbol))
+        );
+    }
+
+    #[test]
+    fn tool_and_kernel_use_the_same_interface_source_identity() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let (digest, files) = repository_interface_hash(&repository).unwrap();
+        assert_eq!(digest, kernel_symbols::KERNEL_INTERFACE_SOURCE_SHA256);
+        assert_eq!(files, kernel_symbols::KERNEL_INTERFACE_SOURCE_FILE_COUNT);
+    }
+
+    #[test]
+    fn network_types_cannot_leak_into_non_network_symbol_signatures() {
+        let symbol = KernelInterfaceSymbol {
+            kind: KERNEL_SYMBOL_KIND_FUNCTION,
+            flags: 0,
+            version: 1,
+            capabilities: kernel_symbols::capability::CORE_SAFE,
+            retained_argument_mask: 0,
+            interface_hash: [1; 32],
+            api_path: "general.device.query".to_string(),
+            item_path: "general::device::query".to_string(),
+            link_name: "__elm_kernel_api_test".to_string(),
+            contract: "kernel.device.query@1".to_string(),
+            rust_abi: "fn()->Option<net::InterfaceId>".to_string(),
+            rust_abi_hash: [0; 32],
+            abi_mode: KERNEL_API_MODE_EXACT_RUST.to_string(),
+            aliases: Vec::new(),
+        };
+        assert!(forbidden_network_reference(&symbol));
     }
 
     #[test]
@@ -2989,7 +3087,7 @@ mod tests {
             source_hash: [3; 32],
             framework_hash: framework_distribution_hash(&repository).unwrap(),
             source_file_count: 1,
-            metadata: KERNEL_API_CRATES
+            metadata: kernel_api_crates()
                 .iter()
                 .map(|spec| (spec.name.to_string(), format!("{}.rlib", spec.name)))
                 .collect(),

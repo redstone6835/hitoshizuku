@@ -83,6 +83,7 @@ pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
 pub use migration::MigrationContext;
+pub use operation::spawn_user_process;
 pub use pid::{PidNamespace, PidRegistry, PidT};
 pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};
 pub use process_ops::{
@@ -135,7 +136,10 @@ pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 /// 强制链接器保留调度子系统直接符号所在的代码生成单元。
 #[doc(hidden)]
 pub fn kernel_symbol_catalog_anchor() -> usize {
-    scheduler::current_cpu_id as usize ^ spawn::spawn_child as usize ^ operation::getpid as usize
+    scheduler::current_cpu_id as usize
+        ^ spawn::spawn_child as usize
+        ^ operation::getpid as usize
+        ^ operation::spawn_user_process as usize
 }
 
 #[cfg(test)]

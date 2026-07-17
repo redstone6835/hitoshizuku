@@ -20,32 +20,25 @@ fn main() {
 
 fn repository_interface_identity(manifest_dir: &Path) -> Option<([u8; 32], usize)> {
     let repository = manifest_dir.join("../..");
-    let allocator = repository.join("libs/allocator");
-    let general = repository.join("general");
-    let log = repository.join("libs/log");
-    let sched = repository.join("libs/sched");
-    if !allocator.join("src/lib.rs").is_file()
-        || !general.join("src/dev/mod.rs").is_file()
-        || !log.join("src/lib.rs").is_file()
-        || !sched.join("src/lib.rs").is_file()
-    {
-        return None;
-    }
     let mut files = Vec::new();
-    collect_rust_sources(&allocator.join("src"), "allocator/src", &mut files);
-    collect_rust_sources(&general.join("src/dev"), "general/src/dev", &mut files);
-    collect_rust_sources(&log.join("src"), "log/src", &mut files);
-    collect_rust_sources(&sched.join("src"), "sched/src", &mut files);
-    files.push((
-        "allocator/Cargo.toml".to_string(),
-        allocator.join("Cargo.toml"),
-    ));
-    files.push(("general/Cargo.toml".to_string(), general.join("Cargo.toml")));
-    files.push(("log/Cargo.toml".to_string(), log.join("Cargo.toml")));
-    files.push(("sched/Cargo.toml".to_string(), sched.join("Cargo.toml")));
+    for line in include_str!("kernel-api-crates.txt").lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let name = fields.next().expect("Kernel API crate 记录缺少名称");
+        let relative = fields.next().expect("Kernel API crate 记录缺少路径");
+        assert!(fields.next().is_none(), "Kernel API crate 记录包含多余字段");
+        let root = repository.join(relative);
+        if !root.join("src").is_dir() || !root.join("Cargo.toml").is_file() {
+            return None;
+        }
+        collect_rust_sources(&root.join("src"), &format!("{name}/src"), &mut files);
+        files.push((format!("{name}/Cargo.toml"), root.join("Cargo.toml")));
+    }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     if files.is_empty() {
-        panic!("没有找到 allocator/general/log/sched 规范接口源码");
+        panic!("没有找到非网络 Kernel API 规范接口源码");
     }
 
     let mut hash = Sha256::new();

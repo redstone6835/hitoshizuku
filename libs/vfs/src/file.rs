@@ -418,11 +418,23 @@ impl File {
     }
 
     /// 返回此文件所在挂载点的共享引用。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.mount",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn mount(&self) -> &Arc<crate::vfs::mount::Mount> {
         &self.mount
     }
 
     /// 返回此文件对应的 Dentry。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.dentry",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn dentry(&self) -> &Arc<crate::vfs::dentry::Dentry> {
         &self.dentry
     }

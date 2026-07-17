@@ -268,6 +268,21 @@ pub fn close(fdt: &FdTable, fd: Fd) -> VfsResult<()> {
     fdt.close_fd(fd)
 }
 
+/// 关闭 fd，并释放指定进程在对应 inode 上持有的 POSIX record lock。
+///
+/// 用户态 `close(2)` 通过该统一入口进入 VFS，使普通关闭和带 owner 的关闭都能参与
+/// 内核符号导出、Mixin 观测与权限审计，同时保留 [`FdTable::close_fd_for_owner`] 的语义。
+#[kernel_symbols::export(
+    name = "vfs.operation.close_for_owner",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn close_for_owner(fdt: &FdTable, fd: Fd, owner_pid: i32) -> VfsResult<()> {
+    fdt.close_fd_for_owner(fd, owner_pid)
+}
+
 // ── mkdir ─────────────────────────────────────────────────────────────────────
 
 /// `mkdirat(2)` — 创建目录。

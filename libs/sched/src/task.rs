@@ -494,6 +494,7 @@ pub struct Task {
     pre_exit_cleaned: AtomicBool,
 }
 
+#[kernel_symbols::export]
 impl Task {
     /// 创建一个新任务。`thread_group` / `process_group` / `parent` 由调用方给出，
     /// 调用方负责在返回 `Arc` 之后把它登记进父的 `children` 与组成员表。
@@ -987,6 +988,12 @@ impl Task {
     }
 
     /// 任务在根 ns 中的 pid（对应 Linux `task->pid`）。
+    #[kernel_symbols::export(
+        name = "sched.task.Task.pid_root",
+        contract = "kernel.sched.task-query@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_QUERY
+    )]
     pub fn pid_root(&self) -> Option<PidT> {
         self.rel.lock().pid_in_ns.first().map(|(_, pid)| *pid)
     }

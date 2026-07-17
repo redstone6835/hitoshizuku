@@ -8,6 +8,7 @@
 //! Linux 风格无参数：每个函数内部调 [`crate::scheduler::current_task`] 取
 //! 调用者句柄。返回值统一 `Result<T, errno::Errno>`。
 //!
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -469,6 +470,56 @@ pub fn getcpu() -> Result<(u32, u32), Errno> {
 }
 
 // ── execve / sigreturn ──────────────────────────────────────────────
+
+/// 从内核路径创建并启动一个新的用户进程。
+///
+/// 本函数建立 fork 语义的任务关系和子系统扩展，再把镜像装载与架构用户上下文
+/// 安装交给 [`crate::process_ops::ProcessImageOps`]。返回的任务已经进入运行队列；
+/// 任一步骤失败都会回滚尚未运行的子任务。
+#[kernel_symbols::export(
+    name = "sched.operation.spawn_user_process",
+    contract = "kernel.sched.user-process@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_TASK
+        | kernel_symbols::capability::VFS_IO
+        | kernel_symbols::capability::MM_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn spawn_user_process(
+    parent: &Arc<Task>,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+) -> Result<Arc<Task>, Errno> {
+    if path.is_empty() || path.as_bytes().contains(&0) {
+        return Err(Errno::EINVAL);
+    }
+
+    let child = clone_task(
+        parent,
+        CloneArgs::fork_default(),
+        SchedParams::default_fair(),
+    );
+    if child.state() == TaskState::Dead || child.pid_root().is_none() {
+        abort_new_task(&child);
+        return Err(Errno::EAGAIN);
+    }
+
+    let Some(ops) = process_image_ops() else {
+        abort_new_task(&child);
+        return Err(Errno::ENOSYS);
+    };
+    if let Err(error) = (ops.spawn_user_process)(parent, &child, path, argv, envp) {
+        abort_new_task(&child);
+        return Err(error);
+    }
+    if let Err(error) = activate_task(&child) {
+        abort_new_task(&child);
+        return Err(error);
+    }
+    Ok(child)
+}
 
 pub fn execve(request: ExecRequest) -> Result<(), Errno> {
     execve_with_context(request, UserContextRef::NONE)

@@ -83,6 +83,7 @@ pub fn kernel_symbol_catalog_anchor() -> usize {
         ^ file::file_diag as usize
         ^ path::normalize_path as usize
         ^ operation::openat as usize
+        ^ operation::close_for_owner as usize
         ^ superblock::FsRegistry::register as usize
 }
 

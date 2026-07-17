@@ -57,4 +57,5 @@ pub fn kernel_symbol_catalog_anchor() -> usize {
         ^ ipc::ShmManager::info as usize
         ^ mm::page_size as usize
         ^ mm::VmSpace::mapped_pages as usize
+        ^ vfs::namespace_path as usize
 }
