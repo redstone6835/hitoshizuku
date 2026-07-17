@@ -68,7 +68,6 @@ static PHYSICAL_UDP_REPLY_SEEN: AtomicBool = AtomicBool::new(false);
 static PHYSICAL_UDP_POOL_CONSERVED: AtomicBool = AtomicBool::new(false);
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 static PHYSICAL_UDP_TX_SUBMITTED: AtomicBool = AtomicBool::new(false);
-
 #[repr(align(64))]
 struct CacheLine<T>(T);
 
@@ -595,6 +594,76 @@ struct PendingTxFrame {
     bytes: Vec<u8>,
     completion: net::buf::CompletionToken,
     facade: Option<Arc<SocketFacade>>,
+}
+
+struct DeferredEgress {
+    target: usize,
+    work: EgressWork,
+}
+
+enum PayloadChainError {
+    Retry,
+    Socket(SocketError),
+}
+
+fn allocate_payload_chain(
+    pool: &mut NetBufPoolOwner,
+    payload_len: usize,
+    headroom: u16,
+    max_fragments: usize,
+    mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), SocketError>,
+) -> Result<PacketChain, PayloadChainError> {
+    let capacity = usize::from(pool.buffer_capacity());
+    let first_capacity = capacity.saturating_sub(usize::from(headroom));
+    if first_capacity == 0 || max_fragments == 0 {
+        return Err(PayloadChainError::Socket(SocketError::Buffer));
+    }
+    let required_fragments = if payload_len <= first_capacity {
+        1
+    } else {
+        1 + (payload_len - first_capacity).div_ceil(capacity)
+    };
+    if required_fragments > max_fragments {
+        return Err(PayloadChainError::Socket(SocketError::MessageTooLarge));
+    }
+
+    let mut chain = PacketChain::new();
+    let mut copied = 0usize;
+    for fragment_index in 0..required_fragments {
+        let offset = if fragment_index == 0 { headroom } else { 0 };
+        let available = if fragment_index == 0 {
+            first_capacity
+        } else {
+            capacity
+        };
+        let len = payload_len.saturating_sub(copied).min(available);
+        let mut lease = match pool.lease(offset, len as u16, PacketMetadata::default()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                drop(chain);
+                pool.drain_remote();
+                return Err(PayloadChainError::Retry);
+            }
+        };
+        if len != 0
+            && let Err(error) = copy(
+                copied,
+                lease.as_mut_slice().expect("TX payload lease 范围必须有效"),
+            )
+        {
+            drop(lease);
+            drop(chain);
+            pool.drain_remote();
+            return Err(PayloadChainError::Socket(error));
+        }
+        copied += len;
+        if chain.push(PacketFragment::Exclusive(lease)).is_err() {
+            drop(chain);
+            pool.drain_remote();
+            return Err(PayloadChainError::Socket(SocketError::Buffer));
+        }
+    }
+    Ok(chain)
 }
 
 enum PendingNeighborTx {
@@ -1665,6 +1734,7 @@ struct WorkerContext {
     refill_batch: RxRefillBatch,
     completion_batch: CompletionBatch,
     tx_batch: TxBatch,
+    retry_egress: VecDeque<EgressWork>,
     pending_tx_frames: VecDeque<PendingTxFrame>,
     next_fragment_id: u32,
     ingress_device: net::NetDeviceId,
@@ -1696,6 +1766,7 @@ struct ProtocolContext {
     protocol: FlowShard,
     recycle: PacketBatch,
     tx: TxBatch,
+    deferred_egress: VecDeque<DeferredEgress>,
     pending: [Option<IngressWork>; 32],
     pending_neighbors: BTreeMap<net::control::NeighborKey, PendingNeighbor>,
     dad: Vec<DadState>,
@@ -1822,6 +1893,7 @@ pub fn start_workers() {
                 protocol,
                 recycle: PacketBatch::new(),
                 tx: TxBatch::new(),
+                deferred_egress: VecDeque::new(),
                 pending: core::array::from_fn(|_| None),
                 pending_neighbors: BTreeMap::new(),
                 dad,
@@ -1874,6 +1946,7 @@ pub fn start_workers() {
             refill_batch: RxRefillBatch::new(),
             completion_batch: CompletionBatch::new(),
             tx_batch: TxBatch::new(),
+            retry_egress: VecDeque::new(),
             pending_tx_frames: VecDeque::new(),
             next_fragment_id: 1,
             ingress_device: pending.ingress_device,
@@ -1955,6 +2028,7 @@ unsafe extern "C" fn protocol_worker_entry(slot: usize) -> ! {
 impl ProtocolContext {
     fn run(&mut self) -> ! {
         loop {
+            self.flush_deferred_egress();
             let config = self.config.snapshot();
             let lifecycle = self.drain_lifecycle(256);
             let control = self.drain_control(256, &config);
@@ -1990,6 +2064,8 @@ impl ProtocolContext {
                 || lifecycle == 256
                 || control == 256
                 || dirty == 256
+                || !self.deferred_egress.is_empty()
+                || self.protocol.has_blocked_tcp_output()
                 || self.runtime.finish_drain()
             {
                 let _ = sched::operation::sched_yield();
@@ -2679,9 +2755,10 @@ impl ProtocolContext {
             };
             match facade.kind() {
                 SocketKind::Stream => {
+                    let generation = facade.stream_tx_generation();
                     self.protocol.drain_tcp_send(flow, sched::now_ns_public());
                     self.dispatch_tcp_output();
-                    facade.finish_stream_tx_drain();
+                    facade.finish_stream_tx_drain(generation);
                 }
                 SocketKind::Datagram => {
                     for _ in 0..32 {
@@ -2700,24 +2777,17 @@ impl ProtocolContext {
                                     self.publish_neighbor_work(PendingNeighborTx::Udp(work));
                                     continue;
                                 }
-                                let Some(target) = self
-                                    .runtime
-                                    .egress
-                                    .iter()
-                                    .find(|target| target.interface == work.route.interface)
+                                let Some(target) =
+                                    self.runtime.egress.iter().position(|target| {
+                                        target.interface == work.route.interface
+                                    })
                                 else {
                                     work.payload
                                         .facade()
                                         .set_pending_error(SocketError::NetworkUnreachable);
                                     continue;
                                 };
-                                if let Err(EgressWork::Udp(work)) =
-                                    target.try_push(EgressWork::Udp(work))
-                                {
-                                    work.payload
-                                        .facade()
-                                        .set_pending_error(SocketError::WouldBlock);
-                                }
+                                self.dispatch_or_defer(target, EgressWork::Udp(work));
                             }
                             Err((error, payload)) => {
                                 payload.facade().set_pending_error(error);
@@ -2742,24 +2812,17 @@ impl ProtocolContext {
                                     self.publish_neighbor_work(PendingNeighborTx::Raw(work));
                                     continue;
                                 }
-                                let Some(target) = self
-                                    .runtime
-                                    .egress
-                                    .iter()
-                                    .find(|target| target.interface == work.route.interface)
+                                let Some(target) =
+                                    self.runtime.egress.iter().position(|target| {
+                                        target.interface == work.route.interface
+                                    })
                                 else {
                                     work.payload
                                         .facade()
                                         .set_pending_error(SocketError::NetworkUnreachable);
                                     continue;
                                 };
-                                if let Err(EgressWork::Raw(work)) =
-                                    target.try_push(EgressWork::Raw(work))
-                                {
-                                    work.payload
-                                        .facade()
-                                        .set_pending_error(SocketError::WouldBlock);
-                                }
+                                self.dispatch_or_defer(target, EgressWork::Raw(work));
                             }
                             Err((error, payload)) => payload.facade().set_pending_error(error),
                         }
@@ -2845,7 +2908,7 @@ impl ProtocolContext {
         }
     }
 
-    fn dispatch_neighbor_tx(&self, work: PendingNeighborTx) {
+    fn dispatch_neighbor_tx(&mut self, work: PendingNeighborTx) {
         let interface = match &work {
             PendingNeighborTx::Tcp(work) => work.path.route.interface,
             PendingNeighborTx::Udp(work) => work.route.interface,
@@ -2855,41 +2918,18 @@ impl ProtocolContext {
             .runtime
             .egress
             .iter()
-            .find(|target| target.interface == interface)
+            .position(|target| target.interface == interface)
         else {
             work.facade()
                 .set_pending_error(SocketError::NetworkUnreachable);
             return;
         };
-        let result = match work {
-            PendingNeighborTx::Tcp(work) => {
-                target
-                    .try_push(EgressWork::Tcp(work))
-                    .map_err(|work| match work {
-                        EgressWork::Tcp(work) => work.facade,
-                        _ => unreachable!(),
-                    })
-            }
-            PendingNeighborTx::Udp(work) => {
-                target
-                    .try_push(EgressWork::Udp(work))
-                    .map_err(|work| match work {
-                        EgressWork::Udp(work) => work.payload.facade(),
-                        _ => unreachable!(),
-                    })
-            }
-            PendingNeighborTx::Raw(work) => {
-                target
-                    .try_push(EgressWork::Raw(work))
-                    .map_err(|work| match work {
-                        EgressWork::Raw(work) => work.payload.facade(),
-                        _ => unreachable!(),
-                    })
-            }
+        let work = match work {
+            PendingNeighborTx::Tcp(work) => EgressWork::Tcp(work),
+            PendingNeighborTx::Udp(work) => EgressWork::Udp(work),
+            PendingNeighborTx::Raw(work) => EgressWork::Raw(work),
         };
-        if let Err(facade) = result {
-            facade.set_pending_error(SocketError::WouldBlock);
-        }
+        self.dispatch_or_defer(target, work);
     }
 
     fn fail_interface_neighbors(&mut self, interface: InterfaceId, error: SocketError) {
@@ -3878,46 +3918,84 @@ impl ProtocolContext {
     }
 
     fn dispatch_tx(&mut self, egress: usize) {
-        let target = &self.runtime.egress[egress];
         let len = self.tx.len();
         for index in 0..len {
             let Some(packet) = self.tx.take(index) else {
                 continue;
             };
-            if target.try_push(EgressWork::Packet(packet)).is_err() {
-                target.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                target.stats.drop_reasons[DropReason::TxQueueFull.index()]
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            self.dispatch_or_defer(egress, EgressWork::Packet(packet));
         }
     }
 
     fn dispatch_tcp_output(&mut self) {
+        self.flush_deferred_egress();
+        if !self.deferred_egress.is_empty() {
+            return;
+        }
         let config = self.config.snapshot();
-        while let Some(mut work) = self.protocol.take_tcp_output() {
-            if let Err(error) =
-                self.protocol
-                    .refresh_tcp_tx_path(&mut work, &config, sched::now_ns_public())
-            {
-                work.facade.set_pending_error(error);
-                continue;
+        let now_ns = sched::now_ns_public();
+        let mut resume_budget = 256;
+        loop {
+            while let Some(mut work) = self.protocol.take_tcp_output() {
+                if let Err(error) = self
+                    .protocol
+                    .refresh_tcp_tx_path(&mut work, &config, now_ns)
+                {
+                    work.facade.set_pending_error(error);
+                    continue;
+                }
+                if work.path.unresolved_neighbor.is_some() {
+                    self.publish_neighbor_work(PendingNeighborTx::Tcp(work));
+                    continue;
+                }
+                let Some(target) = self
+                    .runtime
+                    .egress
+                    .iter()
+                    .position(|target| target.interface == work.path.route.interface)
+                else {
+                    work.facade
+                        .set_pending_error(SocketError::NetworkUnreachable);
+                    continue;
+                };
+                self.dispatch_or_defer(target, EgressWork::Tcp(work));
+                if !self.deferred_egress.is_empty() {
+                    return;
+                }
             }
-            if work.path.unresolved_neighbor.is_some() {
-                self.publish_neighbor_work(PendingNeighborTx::Tcp(work));
-                continue;
+            if resume_budget == 0 {
+                return;
             }
-            let Some(target) = self
-                .runtime
-                .egress
-                .iter()
-                .find(|target| target.interface == work.path.route.interface)
-            else {
-                work.facade
-                    .set_pending_error(SocketError::NetworkUnreachable);
-                continue;
-            };
-            if let Err(EgressWork::Tcp(work)) = target.try_push(EgressWork::Tcp(work)) {
-                work.facade.set_pending_error(SocketError::WouldBlock);
+            let resumed = self
+                .protocol
+                .resume_tcp_output(now_ns, resume_budget.min(32));
+            if resumed == 0 {
+                return;
+            }
+            resume_budget -= resumed;
+        }
+    }
+
+    fn dispatch_or_defer(&mut self, target: usize, work: EgressWork) {
+        if !self.deferred_egress.is_empty() {
+            self.deferred_egress
+                .push_back(DeferredEgress { target, work });
+            return;
+        }
+        if let Err(work) = self.runtime.egress[target].try_push(work) {
+            self.deferred_egress
+                .push_back(DeferredEgress { target, work });
+        }
+    }
+
+    fn flush_deferred_egress(&mut self) {
+        while let Some(pending) = self.deferred_egress.pop_front() {
+            if let Err(work) = self.runtime.egress[pending.target].try_push(pending.work) {
+                self.deferred_egress.push_front(DeferredEgress {
+                    target: pending.target,
+                    work,
+                });
+                break;
             }
         }
     }
@@ -4469,9 +4547,11 @@ impl WorkerContext {
                 .store(pool_stats.remote_recycle, Ordering::Relaxed);
             self.refill_rx();
 
-            if self.queue.as_mut().unwrap().has_pending_work()
+            let queue_pending = self.queue.as_mut().unwrap().has_pending_work();
+            if queue_pending
                 || self.egress.has_pending()
                 || !self.tx_batch.is_empty()
+                || !self.retry_egress.is_empty()
                 || !self.pending_tx_frames.is_empty()
                 || self.has_test_work()
             {
@@ -4539,6 +4619,20 @@ impl WorkerContext {
 
     fn drain_egress(&mut self) {
         self.drain_pending_tx_frames();
+        while self.tx_batch.len() < 32 {
+            let Some(work) = self.retry_egress.pop_front() else {
+                break;
+            };
+            if let Err(work) = self.materialize_egress(work) {
+                self.retry_egress.push_front(work);
+                break;
+            }
+        }
+        if !self.retry_egress.is_empty() {
+            self.drain_pending_tx_frames();
+            let _ = self.egress.finish_drain();
+            return;
+        }
         'classes: for (class, quantum) in [(3, 8usize), (2, 4), (1, 2), (0, 1)] {
             for _ in 0..quantum {
                 if self.tx_batch.len() >= 32 {
@@ -4547,26 +4641,50 @@ impl WorkerContext {
                 let Some(work) = self.egress.try_pop_class(class) else {
                     break;
                 };
-                match work {
-                    EgressWork::Packet(packet) => self
-                        .tx_batch
-                        .push(packet)
-                        .unwrap_or_else(|_| unreachable!()),
-                    EgressWork::Tcp(work) => self.materialize_tcp(work),
-                    EgressWork::Udp(work) => self.materialize_udp(work),
-                    EgressWork::Raw(work) => self.materialize_raw(work),
-                    EgressWork::ControlFrame(bytes) => {
-                        self.pending_tx_frames.push_back(PendingTxFrame {
-                            bytes,
-                            completion: net::buf::CompletionToken(0),
-                            facade: None,
-                        });
-                    }
+                if let Err(work) = self.materialize_egress(work) {
+                    self.retry_egress.push_back(work);
+                    break 'classes;
                 }
             }
         }
         self.drain_pending_tx_frames();
         let _ = self.egress.finish_drain();
+    }
+
+    fn materialize_egress(&mut self, work: EgressWork) -> Result<(), EgressWork> {
+        match work {
+            EgressWork::Packet(packet) => {
+                self.tx_batch
+                    .push(packet)
+                    .unwrap_or_else(|_| unreachable!());
+                Ok(())
+            }
+            EgressWork::Tcp(work) => self.materialize_tcp(work).map_err(EgressWork::Tcp),
+            EgressWork::Udp(work) => self.materialize_udp(work).map_err(EgressWork::Udp),
+            EgressWork::Raw(work) => {
+                self.materialize_raw(work);
+                Ok(())
+            }
+            EgressWork::ControlFrame(bytes) => {
+                self.pending_tx_frames.push_back(PendingTxFrame {
+                    bytes,
+                    completion: net::buf::CompletionToken(0),
+                    facade: None,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn max_payload_fragments(&self) -> usize {
+        let caps = self.queue.as_ref().unwrap().caps();
+        if caps.scatter_gather {
+            usize::from(caps.max_tx_descriptors)
+                .saturating_sub(1)
+                .max(1)
+        } else {
+            1
+        }
     }
 
     fn drain_pending_tx_frames(&mut self) {
@@ -4602,7 +4720,32 @@ impl WorkerContext {
         }
     }
 
-    fn materialize_udp(&mut self, work: PreparedUdpTx) {
+    fn materialize_udp(&mut self, work: PreparedUdpTx) -> Result<(), PreparedUdpTx> {
+        let ip_header_len = match work.route.source {
+            IpAddr::V4(_) => 20usize,
+            IpAddr::V6(_) => 40usize,
+        };
+        let fragmented =
+            ip_header_len + 8 + usize::from(work.payload.len) > work.route.mtu as usize;
+        let chain = if fragmented {
+            None
+        } else {
+            let max_fragments = self.max_payload_fragments();
+            match allocate_payload_chain(
+                self.tx_payload_pool.as_mut().unwrap(),
+                usize::from(work.payload.len),
+                128,
+                max_fragments,
+                |offset, output| work.payload.copy_range(offset, output),
+            ) {
+                Ok(chain) => Some(chain),
+                Err(PayloadChainError::Retry) => return Err(work),
+                Err(PayloadChainError::Socket(error)) => {
+                    work.payload.facade().set_pending_error(error);
+                    return Ok(());
+                }
+            }
+        };
         let PreparedUdpTx {
             payload,
             route,
@@ -4616,15 +4759,11 @@ impl WorkerContext {
             unresolved_neighbor: _,
         } = work;
         let facade = payload.facade();
-        let ip_header_len = match route.source {
-            IpAddr::V4(_) => 20usize,
-            IpAddr::V6(_) => 40usize,
-        };
-        if ip_header_len + 8 + usize::from(payload.len) > route.mtu as usize {
+        if fragmented {
             let mut bytes = alloc::vec![0; usize::from(payload.len)];
             if payload.copy_out(&mut bytes).is_err() {
                 facade.set_pending_error(SocketError::Buffer);
-                return;
+                return Ok(());
             }
             payload.complete();
             let identification = self.next_fragment_id;
@@ -4655,27 +4794,11 @@ impl WorkerContext {
                 }
                 Err(_) => facade.set_pending_error(SocketError::Buffer),
             }
-            return;
+            return Ok(());
         }
-        let Ok(mut lease) = self.tx_payload_pool.as_mut().unwrap().lease(
-            128,
-            payload.len,
-            PacketMetadata::default(),
-        ) else {
-            facade.set_pending_error(SocketError::WouldBlock);
-            return;
-        };
-        let Ok(_) = payload.copy_out(
-            lease
-                .as_mut_slice()
-                .expect("socket TX payload lease 范围有效"),
-        ) else {
-            facade.set_pending_error(SocketError::Buffer);
-            return;
-        };
         payload.complete();
         let packet = match build_udp_packet_with_options(
-            PacketChain::from_lease(lease),
+            chain.expect("未分片 UDP 必须拥有 payload chain"),
             route,
             destination,
             source_port,
@@ -4691,12 +4814,13 @@ impl WorkerContext {
             },
             Err(_) => {
                 facade.set_pending_error(SocketError::Buffer);
-                return;
+                return Ok(());
             }
         };
-        if self.tx_batch.push(packet).is_err() {
-            facade.set_pending_error(SocketError::WouldBlock);
-        }
+        self.tx_batch
+            .push(packet)
+            .unwrap_or_else(|_| unreachable!());
+        Ok(())
     }
 
     fn materialize_raw(&mut self, work: PreparedRawTx) {
@@ -4777,35 +4901,36 @@ impl WorkerContext {
         }
     }
 
-    fn materialize_tcp(&mut self, work: PreparedTcpTx) {
+    fn materialize_tcp(&mut self, work: PreparedTcpTx) -> Result<(), PreparedTcpTx> {
         let payload_len = work.payload.as_ref().map_or(0, |payload| payload.len);
-        let Ok(mut lease) = self.tx_payload_pool.as_mut().unwrap().lease(
+        let max_fragments = self.max_payload_fragments();
+        let chain = match allocate_payload_chain(
+            self.tx_payload_pool.as_mut().unwrap(),
+            usize::from(payload_len),
             128,
-            payload_len,
-            PacketMetadata::default(),
-        ) else {
-            work.facade.set_pending_error(SocketError::WouldBlock);
-            return;
+            max_fragments,
+            |offset, output| {
+                if let Some(payload) = work.payload.as_ref() {
+                    payload.copy_range(offset, output)
+                } else {
+                    Ok(())
+                }
+            },
+        ) {
+            Ok(chain) => chain,
+            Err(PayloadChainError::Retry) => return Err(work),
+            Err(PayloadChainError::Socket(error)) => {
+                work.facade.set_pending_error(error);
+                return Ok(());
+            }
         };
-        if let Some(payload) = work.payload.as_ref()
-            && payload
-                .copy_out(
-                    lease
-                        .as_mut_slice()
-                        .expect("TCP payload lease 范围必须有效"),
-                )
-                .is_err()
-        {
-            work.facade.set_pending_error(SocketError::Buffer);
-            return;
-        }
         let low_latency = work.low_latency;
         let completion = net::buf::CompletionToken(work.completion);
-        let chain = match build_tcp_packet(PacketChain::from_lease(lease), &work) {
+        let chain = match build_tcp_packet(chain, &work) {
             Ok(chain) => chain,
             Err(_) => {
                 work.facade.set_pending_error(SocketError::Buffer);
-                return;
+                return Ok(());
             }
         };
         let packet = TxPacket {
@@ -4813,9 +4938,10 @@ impl WorkerContext {
             completion,
             low_latency,
         };
-        if self.tx_batch.push(packet).is_err() {
-            work.facade.set_pending_error(SocketError::WouldBlock);
-        }
+        self.tx_batch
+            .push(packet)
+            .unwrap_or_else(|_| unreachable!());
+        Ok(())
     }
 
     fn recycle_chain(
@@ -5084,6 +5210,9 @@ impl WorkerContext {
                 facade.set_pending_error(SocketError::NetworkUnreachable);
             }
         }
+        while let Some(work) = self.retry_egress.pop_front() {
+            fail_egress_work(work, SocketError::NetworkUnreachable);
+        }
         if self.queue.is_some() {
             self.queue.as_mut().unwrap().quiesce().ok();
             for _ in 0..64 {
@@ -5168,6 +5297,7 @@ impl WorkerContext {
         if self.queue.as_mut().unwrap().has_pending_work()
             || self.egress.has_pending()
             || !self.tx_batch.is_empty()
+            || !self.retry_egress.is_empty()
             || !self.pending_tx_frames.is_empty()
             || self.has_test_work()
         {

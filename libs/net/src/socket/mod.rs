@@ -440,18 +440,26 @@ impl TcpTxLease {
     }
 
     pub fn copy_out(&self, output: &mut [u8]) -> Result<usize, SocketError> {
-        if output.len() < usize::from(self.len) {
+        self.copy_range(0, output)?;
+        Ok(usize::from(self.len))
+    }
+
+    pub fn copy_range(&self, offset: usize, output: &mut [u8]) -> Result<(), SocketError> {
+        if offset
+            .checked_add(output.len())
+            .is_none_or(|end| end > usize::from(self.len))
+        {
             return Err(SocketError::Buffer);
         }
         if !self
             .facade
             .stream_tx
             .lock()
-            .copy_absolute(self.start, &mut output[..usize::from(self.len)])
+            .copy_absolute(self.start + offset as u64, output)
         {
             return Err(SocketError::Closed);
         }
-        Ok(usize::from(self.len))
+        Ok(())
     }
 }
 
@@ -566,21 +574,62 @@ impl TxRing {
         generation: u32,
         output: &mut [u8],
     ) -> Result<usize, SocketError> {
+        let len = usize::from(
+            self.entries[usize::from(slot)]
+                .as_ref()
+                .filter(|entry| entry.generation == generation)
+                .ok_or(SocketError::Closed)?
+                .len,
+        );
+        if output.len() < len {
+            return Err(SocketError::Buffer);
+        }
+        self.copy_range(slot, generation, 0, &mut output[..len])?;
+        Ok(len)
+    }
+
+    fn copy_range(
+        &self,
+        slot: u16,
+        generation: u32,
+        payload_offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), SocketError> {
         let entry = self.entries[usize::from(slot)]
             .as_ref()
             .filter(|entry| entry.generation == generation)
             .ok_or(SocketError::Closed)?;
-        if output.len() < usize::from(entry.len) {
+        let end = payload_offset
+            .checked_add(output.len())
+            .ok_or(SocketError::Buffer)?;
+        if end > usize::from(entry.len) {
             return Err(SocketError::Buffer);
         }
-        let mut copied = 0usize;
-        for chunk in entry.chunks.iter().take(usize::from(entry.chunk_count)) {
-            let len = (usize::from(entry.len) - copied).min(SOCKET_CHUNK_BYTES);
+        let mut copied = 0;
+        let first_chunk = payload_offset / SOCKET_CHUNK_BYTES;
+        let first_offset = payload_offset % SOCKET_CHUNK_BYTES;
+        for (index, chunk) in entry
+            .chunks
+            .iter()
+            .take(usize::from(entry.chunk_count))
+            .enumerate()
+            .skip(first_chunk)
+        {
+            let start = if index == first_chunk {
+                first_offset
+            } else {
+                0
+            };
+            let len = (output.len() - copied).min(SOCKET_CHUNK_BYTES - start);
             let offset = usize::from(*chunk) * SOCKET_CHUNK_BYTES;
-            output[copied..copied + len].copy_from_slice(&self.arena[offset..offset + len]);
+            output[copied..copied + len]
+                .copy_from_slice(&self.arena[offset + start..offset + start + len]);
             copied += len;
+            if copied == output.len() {
+                return Ok(());
+            }
         }
-        Ok(copied)
+        Err(SocketError::Buffer)
     }
 
     fn complete(&mut self, slot: u16, generation: u32) -> bool {
@@ -722,6 +771,15 @@ impl UdpTxLease {
             .copy_out(self.slot, self.generation, output)
     }
 
+    pub fn copy_range(&self, offset: usize, output: &mut [u8]) -> Result<(), SocketError> {
+        self.facade
+            .tx
+            .lock()
+            .as_ref()
+            .expect("UDP facade 必须拥有 TX ring")
+            .copy_range(self.slot, self.generation, offset, output)
+    }
+
     pub fn complete(mut self) {
         self.finish();
     }
@@ -786,6 +844,7 @@ pub struct SocketFacade {
     control_sequence: AtomicU64,
     control_result: Mutex<Option<(u64, Result<(), SocketError>)>>,
     tx_notified: AtomicBool,
+    tx_generation: AtomicU64,
     lifecycle_notified: AtomicBool,
     closing: AtomicBool,
     abortive_close: AtomicBool,
@@ -882,6 +941,7 @@ impl SocketFacade {
             control_sequence: AtomicU64::new(1),
             control_result: Mutex::new(None),
             tx_notified: AtomicBool::new(false),
+            tx_generation: AtomicU64::new(0),
             lifecycle_notified: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             abortive_close: AtomicBool::new(false),
@@ -1420,8 +1480,20 @@ impl SocketFacade {
         }
     }
 
-    pub fn finish_stream_tx_drain(&self) {
+    pub fn stream_tx_generation(&self) -> u64 {
+        self.tx_generation.load(Ordering::Acquire)
+    }
+
+    pub fn finish_stream_tx_drain(self: &Arc<Self>, observed_generation: u64) {
         self.tx_notified.store(false, Ordering::Release);
+        fence(Ordering::SeqCst);
+        if self.tx_generation.load(Ordering::Acquire) != observed_generation
+            && !self.tx_notified.swap(true, Ordering::AcqRel)
+        {
+            socket_runtime()
+                .expect("socket runtime 必须保持安装")
+                .notify_tx(Arc::clone(self));
+        }
     }
 
     pub fn tcp_nodelay(&self) -> bool {
@@ -1455,7 +1527,11 @@ impl SocketFacade {
     }
 
     fn notify_stream_pending(self: &Arc<Self>) {
-        if self.stream_unsent_len() != 0 && !self.tx_notified.swap(true, Ordering::AcqRel) {
+        if self.stream_unsent_len() == 0 {
+            return;
+        }
+        self.tx_generation.fetch_add(1, Ordering::Release);
+        if !self.tx_notified.swap(true, Ordering::AcqRel) {
             if let Ok(runtime) = socket_runtime() {
                 runtime.notify_tx(Arc::clone(self));
             }
@@ -1601,11 +1677,13 @@ impl SocketFacade {
     }
 
     fn notify_tcp_state_change(self: &Arc<Self>) {
-        if matches!(self.owner(), OwnerRef::Flow { .. })
-            && !self.tx_notified.swap(true, Ordering::AcqRel)
-            && let Ok(runtime) = socket_runtime()
-        {
-            runtime.notify_tx(Arc::clone(self));
+        if matches!(self.owner(), OwnerRef::Flow { .. }) {
+            self.tx_generation.fetch_add(1, Ordering::Release);
+            if !self.tx_notified.swap(true, Ordering::AcqRel)
+                && let Ok(runtime) = socket_runtime()
+            {
+                runtime.notify_tx(Arc::clone(self));
+            }
         }
     }
 
@@ -1640,6 +1718,7 @@ impl SocketFacade {
             let copied = self.stream_tx.lock().push(payload);
             if copied != 0 {
                 self.refresh_tx_readiness();
+                self.tx_generation.fetch_add(1, Ordering::Release);
                 if !self.tx_notified.swap(true, Ordering::AcqRel) {
                     socket_runtime()?.notify_tx(Arc::clone(self));
                 }
@@ -2715,6 +2794,42 @@ mod tests {
         let tx = tx.as_ref().unwrap();
         assert_eq!(tx.used_bytes, 0);
         assert_eq!(tx.free_chunk_count(), UDP_BUFFER_BYTES / SOCKET_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn udp_tx_lease_copies_ranges_across_chunks() {
+        let facade = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        let payload = (0usize..5000)
+            .map(|index| index.wrapping_mul(17) as u8)
+            .collect::<Vec<_>>();
+        let lease = facade.test_udp_tx_lease(&payload, destination);
+        let mut output = [0u8; 1000];
+        lease.copy_range(3500, &mut output).unwrap();
+        assert_eq!(&output, &payload[3500..4500]);
+    }
+
+    #[test]
+    fn tcp_tx_lease_copies_subranges() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 10,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        let payload = (0usize..8192)
+            .map(|index| index.wrapping_mul(29) as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+        let lease = facade.take_stream_tx(payload.len()).unwrap();
+        let mut output = [0u8; 700];
+        lease.copy_range(3900, &mut output).unwrap();
+        assert_eq!(&output, &payload[3900..4600]);
     }
 
     #[test]

@@ -132,6 +132,7 @@ pub struct NetBufPool {
     id: NetBufPoolId,
     generation: AtomicU32,
     dying: AtomicBool,
+    buffer_capacity: u16,
     slots: Box<[Slot]>,
     remote_head: AtomicU64,
     counters: PoolCounters,
@@ -161,6 +162,11 @@ impl NetBufPool {
             return Err(NetBufPoolError::StorageTooLarge);
         }
 
+        let buffer_capacity = storages
+            .iter()
+            .map(|storage| storage.capacity() as u16)
+            .min()
+            .expect("非空 pool 必须拥有 storage");
         let raw_id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
         assert!(raw_id != 0, "NetBufPoolId 已耗尽");
         let slots = storages
@@ -173,6 +179,7 @@ impl NetBufPool {
             id: NetBufPoolId(raw_id),
             generation: AtomicU32::new(1),
             dying: AtomicBool::new(false),
+            buffer_capacity,
             slots,
             remote_head: AtomicU64::new(pack_head(0, EMPTY_SLOT)),
             counters: PoolCounters::new(),
@@ -203,6 +210,11 @@ impl NetBufPool {
 
     pub fn capacity(&self) -> usize {
         self.slots.len()
+    }
+
+    /// 任意 slot 都能提供的最小连续字节数。
+    pub const fn buffer_capacity(&self) -> u16 {
+        self.buffer_capacity
     }
 
     pub fn outstanding(&self) -> usize {
@@ -333,6 +345,10 @@ impl NetBufPoolOwner {
 
     pub fn available(&self) -> usize {
         self.local_len
+    }
+
+    pub fn buffer_capacity(&self) -> u16 {
+        self.pool().buffer_capacity()
     }
 
     /// 在 poll turn 前后收割跨 CPU Drop 产生的回收链。
@@ -915,6 +931,17 @@ mod tests {
         assert_eq!(owner.pool().outstanding(), 0);
         assert_eq!(owner.pool().stats().local_recycle, 1);
         assert_eq!(owner.pool().stats().remote_recycle, 1);
+    }
+
+    #[test]
+    fn pool_reports_capacity_guaranteed_by_every_slot() {
+        let storage = [4096, 2048, 8192]
+            .into_iter()
+            .map(|len| Box::new(TestStorage::new(len)) as Box<dyn NetBufStorage>)
+            .collect::<alloc::vec::Vec<_>>()
+            .into_boxed_slice();
+        let owner = NetBufPool::new(storage).unwrap();
+        assert_eq!(owner.buffer_capacity(), 2048);
     }
 
     #[test]

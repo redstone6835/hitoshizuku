@@ -334,6 +334,7 @@ struct TcpFlow {
     last_activity_ns: u64,
     keepalive_probes: u8,
     last_advertised_window: u16,
+    output_blocked: bool,
 }
 
 impl TcpFlow {
@@ -359,6 +360,7 @@ pub struct TcpEndpointTable {
     flows: FlowTable<TcpFlow>,
     listeners: BTreeMap<(IpAddr, u16, Option<InterfaceId>), Listener>,
     output: VecDeque<PreparedTcpTx>,
+    output_blocked: VecDeque<FlowId>,
     next_completion: u64,
     stats: TcpEngineStats,
 }
@@ -377,6 +379,7 @@ impl TcpEndpointTable {
             flows: FlowTable::new(),
             listeners: BTreeMap::new(),
             output: VecDeque::with_capacity(MAX_PENDING_OUTPUT),
+            output_blocked: VecDeque::new(),
             next_completion: 1,
             stats: TcpEngineStats::default(),
         }
@@ -494,6 +497,7 @@ impl TcpEndpointTable {
             last_activity_ns: now_ns,
             keepalive_probes: 0,
             last_advertised_window: initial_window,
+            output_blocked: false,
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         let id = self
@@ -596,6 +600,10 @@ impl TcpEndpointTable {
         }
         let mut unsent_hint = None;
         loop {
+            if self.output.len() >= MAX_PENDING_OUTPUT {
+                self.mark_output_blocked(id);
+                break;
+            }
             let Some(flow) = self.flows.get_mut(id) else {
                 break;
             };
@@ -611,10 +619,17 @@ impl TcpEndpointTable {
                     .get_or_insert(now_ns.saturating_add(flow.persist_ns));
                 break;
             }
+            let (_, options_len) = wire_options(flow, TcpFlags::ACK | TcpFlags::PSH, now_ns);
+            let segment_limit = effective_payload_mss(
+                flow.path.route.mtu,
+                flow.local.addr,
+                flow.peer_mss,
+                options_len,
+            );
             let unsent = unsent_hint.unwrap_or_else(|| flow.facade.stream_unsent_len());
             if (flow.facade.tcp_cork() || flow.facade.tcp_more())
                 && !flow.cork_force
-                && unsent < usize::from(flow.peer_mss)
+                && unsent < usize::from(segment_limit)
             {
                 flow.deadlines
                     .cork
@@ -623,11 +638,11 @@ impl TcpEndpointTable {
             }
             if !flow.facade.tcp_nodelay()
                 && flow.flight_size() != 0
-                && unsent < usize::from(flow.peer_mss)
+                && unsent < usize::from(segment_limit)
             {
                 break;
             }
-            let allowance = flow.send_allowance().min(u32::from(flow.peer_mss));
+            let allowance = flow.send_allowance().min(u32::from(segment_limit));
             if allowance == 0 {
                 break;
             }
@@ -652,6 +667,36 @@ impl TcpEndpointTable {
             queued = true;
         }
         queued
+    }
+
+    pub fn resume_output_blocked(&mut self, now_ns: u64, budget: usize) -> usize {
+        let mut resumed = 0;
+        while resumed < budget && self.output.len() < MAX_PENDING_OUTPUT {
+            let Some(id) = self.output_blocked.pop_front() else {
+                break;
+            };
+            let Some(flow) = self.flows.get_mut(id) else {
+                continue;
+            };
+            flow.output_blocked = false;
+            self.drain_send(id, now_ns);
+            resumed += 1;
+        }
+        resumed
+    }
+
+    pub fn has_output_blocked(&self) -> bool {
+        !self.output_blocked.is_empty()
+    }
+
+    fn mark_output_blocked(&mut self, id: FlowId) {
+        let Some(flow) = self.flows.get_mut(id) else {
+            return;
+        };
+        if !flow.output_blocked {
+            flow.output_blocked = true;
+            self.output_blocked.push_back(id);
+        }
     }
 
     pub fn close_flow(&mut self, id: FlowId, now_ns: u64) -> bool {
@@ -950,6 +995,7 @@ impl TcpEndpointTable {
             last_activity_ns: now_ns,
             keepalive_probes: 0,
             last_advertised_window: initial_window,
+            output_blocked: false,
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         let id = self.flows.insert_prehashed(key, hash, flow).map_err(|_| {
@@ -993,10 +1039,10 @@ impl TcpEndpointTable {
         payload: IngressPayload<'_>,
         now_ns: u64,
     ) -> Result<(), TcpIngressError> {
-        let state_before = self
+        let (state_before, peer_window_before) = self
             .flows
             .get(id)
-            .map(|flow| flow.machine.state())
+            .map(|flow| (flow.machine.state(), flow.peer_window))
             .ok_or(TcpIngressError::NoEndpoint)?;
         {
             let flow = self.flows.get_mut(id).unwrap();
@@ -1039,6 +1085,9 @@ impl TcpEndpointTable {
                 .tcp_keepalive_enabled()
                 .then(|| now_ns.saturating_add(flow.facade.tcp_keepidle_ns()));
         }
+        let peer_window_after = self.flows.get(id).unwrap().peer_window;
+        let peer_window_changed = peer_window_after != peer_window_before;
+        let peer_window_increased = peer_window_after > peer_window_before;
 
         let previous_una = self.flows.get(id).unwrap().machine.send_unacknowledged();
         let receive_before = self.flows.get(id).unwrap().machine.receive_next();
@@ -1073,7 +1122,16 @@ impl TcpEndpointTable {
             self.drain_send(id, now_ns);
             self.maybe_send_fin(id, now_ns);
         } else if tcp.flags.contains(TcpFlags::ACK)
+            && peer_window_increased
+            && matches!(
+                state_before,
+                TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+            )
+        {
+            self.drain_send(id, now_ns);
+        } else if tcp.flags.contains(TcpFlags::ACK)
             && payload.is_empty()
+            && !peer_window_changed
             && matches!(
                 state_before,
                 TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
@@ -1465,7 +1523,7 @@ impl TcpEndpointTable {
         low_latency: bool,
         track: bool,
     ) {
-        if self.output.len() >= MAX_PENDING_OUTPUT {
+        if self.output.len() >= MAX_PENDING_OUTPUT && !low_latency {
             if let Some(flow) = self.flows.get(id) {
                 flow.facade.set_pending_error(SocketError::WouldBlock);
             }
@@ -1790,7 +1848,18 @@ fn path_mss(mtu: u32, address: IpAddr) -> u16 {
         IpAddr::V4(_) => 40,
         IpAddr::V6(_) => 60,
     };
-    mtu.saturating_sub(header).min(u32::from(u16::MAX)).max(536) as u16
+    mtu.min(u32::from(u16::MAX)).saturating_sub(header).max(536) as u16
+}
+
+fn effective_payload_mss(mtu: u32, address: IpAddr, peer_mss: u16, options_len: u8) -> u16 {
+    let ip_header = match address {
+        IpAddr::V4(_) => 20,
+        IpAddr::V6(_) => 40,
+    };
+    let path_limit = mtu
+        .min(u32::from(u16::MAX))
+        .saturating_sub(ip_header + 20 + u32::from(options_len));
+    peer_mss.min(path_limit.max(1) as u16)
 }
 
 fn address_family(address: IpAddr) -> AddressFamily {
@@ -2471,6 +2540,64 @@ mod tests {
     }
 
     #[test]
+    fn output_backpressure_resumes_stream_after_queue_is_drained() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_010,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_010,
+        };
+        let facade = facade(10);
+        facade.set_tcp_nodelay(true);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        {
+            let state = table.flows.get_mut(flow).unwrap();
+            state.peer_window = u32::MAX;
+            state.congestion.cwnd = u32::MAX;
+        }
+        for _ in 0..500 {
+            table.queue_ack(flow, 20_000);
+        }
+        let payload = alloc::vec![0x5a; 256 * 1024];
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+
+        assert!(table.drain_send(flow, 30_000));
+        assert_eq!(table.output.len(), MAX_PENDING_OUTPUT);
+        assert!(table.has_output_blocked());
+        assert_ne!(facade.stream_unsent_len(), 0);
+
+        while table.take_output().is_some() {}
+        assert_eq!(table.resume_output_blocked(40_000, 1), 1);
+        assert_eq!(facade.stream_unsent_len(), 0);
+        assert!(!table.has_output_blocked());
+    }
+
+    #[test]
+    fn control_output_is_not_dropped_when_data_queue_is_full() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_012,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_012,
+        };
+        let facade = facade(12);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        for _ in 0..MAX_PENDING_OUTPUT {
+            table.queue_ack(flow, 20_000);
+        }
+
+        table.queue_ack(flow, 30_000);
+        assert_eq!(table.output.len(), MAX_PENDING_OUTPUT + 1);
+        assert_eq!(facade.take_pending_error(), None);
+    }
+
+    #[test]
     fn full_receive_ring_does_not_advance_sequence() {
         let local = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -2835,6 +2962,50 @@ mod tests {
     }
 
     #[test]
+    fn reopening_peer_window_resumes_unsent_stream_without_new_ack() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_011,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_011,
+        };
+        let facade = facade(11);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        let acknowledgement = table.flows.get(flow).unwrap().machine.send_next().0;
+        let mut zero_window = packet(
+            remote.port,
+            local.port,
+            501,
+            acknowledgement,
+            TcpFlags::ACK,
+            0,
+        );
+        zero_window.window = 0;
+        table
+            .process_segment(flow, zero_window, Vec::new(), 20_000)
+            .unwrap();
+        assert_eq!(facade.test_push_stream_tx(b"window reopened"), 15);
+        assert!(!table.drain_send(flow, 30_000));
+
+        let reopened = packet(
+            remote.port,
+            local.port,
+            501,
+            acknowledgement,
+            TcpFlags::ACK,
+            0,
+        );
+        table
+            .process_segment(flow, reopened, Vec::new(), 40_000)
+            .unwrap();
+        let data = table.take_output().expect("窗口更新后必须恢复发送");
+        assert_eq!(data.payload.as_ref().map(|payload| payload.len), Some(15));
+    }
+
+    #[test]
     fn keepalive_probe_times_out_idle_flow() {
         let local = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -2861,6 +3032,16 @@ mod tests {
         table.handle_timer(flow, generation, second);
         assert!(table.flows.get(flow).is_none());
         assert_eq!(facade.take_pending_error(), Some(SocketError::TimedOut));
+    }
+
+    #[test]
+    fn jumbo_mtu_mss_respects_ip_length_limit() {
+        assert_eq!(path_mss(65_536, IpAddr::V4(Ipv4Addr::LOCALHOST)), 65_495);
+        assert_eq!(path_mss(65_536, IpAddr::V6(Ipv6Addr::LOCALHOST)), 65_475);
+        assert_eq!(
+            effective_payload_mss(65_536, IpAddr::V4(Ipv4Addr::LOCALHOST), 65_495, 12),
+            65_483
+        );
     }
 
     #[test]

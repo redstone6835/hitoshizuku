@@ -211,6 +211,14 @@ impl FlowShard {
         self.tcp.take_output()
     }
 
+    pub fn resume_tcp_output(&mut self, now_ns: u64, budget: usize) -> usize {
+        self.tcp.resume_output_blocked(now_ns, budget)
+    }
+
+    pub fn has_blocked_tcp_output(&self) -> bool {
+        self.tcp.has_output_blocked()
+    }
+
     pub fn next_timer_deadline_ns(&self) -> Option<u64> {
         self.timers.next_deadline_ns()
     }

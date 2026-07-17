@@ -215,6 +215,20 @@ fn udp_vfs_fd_and_epoll_roundtrip() {
         .expect("消费 UDP datagram");
     assert_eq!(received.len, 4);
     assert_eq!(short, *b"abcd");
+
+    let jumbo = (0usize..60_000)
+        .map(|index| index.wrapping_mul(31) as u8)
+        .collect::<alloc::vec::Vec<_>>();
+    assert_eq!(
+        vfs::socket::send(&context, &table, sender_alias, &jumbo, &[], None, 0),
+        Ok(jumbo.len())
+    );
+    wait_readable(&receiver_file);
+    let mut jumbo_received = alloc::vec![0; jumbo.len()];
+    let received = vfs::socket::recv(&table, receiver, &mut jumbo_received, 0, false, 0, None)
+        .expect("接收 jumbo UDP datagram");
+    assert_eq!(received.len, jumbo.len());
+    assert_eq!(jumbo_received, jumbo);
     assert_eq!(
         vfs::socket::send(
             &context,
@@ -320,6 +334,75 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         .expect("client 接收 TCP payload");
     assert_eq!(received.len, 4);
     assert_eq!(&bytes[..4], b"pong");
+
+    let stream = (0usize..2 * 1024 * 1024)
+        .map(|index| index.wrapping_mul(13) as u8)
+        .collect::<alloc::vec::Vec<_>>();
+    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let mut sent = 0usize;
+    let mut consumed = 0usize;
+    let mut receive_window = alloc::vec![0; 64 * 1024];
+    while consumed < stream.len() {
+        let mut progressed = false;
+        if sent < stream.len() {
+            match vfs::socket::send(
+                &context,
+                &table,
+                client,
+                &stream[sent..],
+                &[],
+                None,
+                vfs::socket::MSG_DONTWAIT,
+            ) {
+                Ok(written) => {
+                    sent += written;
+                    progressed |= written != 0;
+                }
+                Err(errno::Errno::EAGAIN) => {}
+                Err(error) => panic!("jumbo TCP send 失败: {:?}", error),
+            }
+        }
+        loop {
+            match vfs::socket::recv(
+                &table,
+                accepted,
+                &mut receive_window,
+                0,
+                false,
+                vfs::socket::MSG_DONTWAIT,
+                None,
+            ) {
+                Ok(output) if output.len != 0 => {
+                    assert_eq!(
+                        &receive_window[..output.len],
+                        &stream[consumed..consumed + output.len]
+                    );
+                    consumed += output.len;
+                    progressed = true;
+                }
+                Ok(_) | Err(errno::Errno::EAGAIN) => break,
+                Err(error) => panic!("jumbo TCP recv 失败: {:?}", error),
+            }
+        }
+        if sched::now_ns_public() >= deadline {
+            panic!(
+                "jumbo TCP loopback 超时: sent={} consumed={} total={}",
+                sent,
+                consumed,
+                stream.len()
+            );
+        }
+        if !progressed {
+            let task = sched::current_task();
+            if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+                let wake = sched::now_ns_public().saturating_add(100_000);
+                let _ = sched::register_sleep_deadline(&task, wake);
+                drop(task);
+                sched::schedule_once(sched::now_ns_public());
+            }
+        }
+    }
+    assert_eq!(sent, stream.len());
 
     vfs::socket::shutdown(&table, client, vfs::socket::SHUT_WR).expect("关闭 client 写方向");
     wait_readable(&accepted_file);
