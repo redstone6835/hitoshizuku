@@ -771,6 +771,15 @@ impl File {
         self.ops.poll_remove_waiter(task)
     }
 
+    /// 判断该打开文件描述是否允许加入 epoll 实例。
+    ///
+    /// `poll(2)` 会把没有专用等待源的普通文件视为立即可读写，但 Linux 的
+    /// `epoll_ctl(2)` 只接纳底层明确提供事件轮询能力的文件。该能力必须由
+    /// 具体 `FileOps` 显式声明，不能根据 inode 类型或当前就绪结果推断。
+    pub fn is_epollable(&self) -> bool {
+        self.ops.is_epollable()
+    }
+
     pub fn on_fd_closed(&self, fd: u32) {
         self.ops.on_fd_closed(fd)
     }
@@ -917,6 +926,14 @@ pub trait FileOps {
 
     /// 显式移除之前登记的等待者。
     fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
+
+    /// 是否允许该打开文件描述加入 epoll。
+    ///
+    /// 默认关闭，避免普通文件、目录以及仅为兼容 `poll(2)` 返回立即就绪的
+    /// 对象被误接纳。真正的事件源应在实现中显式返回 `true`。
+    fn is_epollable(&self) -> bool {
+        false
+    }
 
     /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。
     fn set_status_flags(&self, _flags: OpenOptions) {}

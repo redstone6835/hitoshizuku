@@ -317,6 +317,10 @@ impl FileOps for SocketFileOps {
         self.socket.unregister_waiter(task)
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
         if interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI) {
             socket_timeval_deadline(self.socket.recv_timeout())

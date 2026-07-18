@@ -200,6 +200,10 @@ impl FileOps for PipeReadEnd {
         self.pipe.read_wait.remove(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -324,6 +328,10 @@ impl FileOps for PipeReadWriteEnd {
         self.pipe.write_wait.remove(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -410,6 +418,10 @@ impl FileOps for PipeWriteEnd {
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
         self.pipe.write_wait.remove(task);
+    }
+
+    fn is_epollable(&self) -> bool {
+        true
     }
 
     fn is_seekable(&self) -> bool {

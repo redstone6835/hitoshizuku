@@ -167,6 +167,7 @@ struct EpollWatch {
 
 struct EpollState {
     watches: Vec<EpollWatch>,
+    scan_cursor: usize,
 }
 
 pub struct EpollFileOps {
@@ -178,6 +179,7 @@ impl EpollFileOps {
         Self {
             state: Spinlock::new(EpollState {
                 watches: Vec::new(),
+                scan_cursor: 0,
             }),
         }
     }
@@ -237,6 +239,14 @@ impl EpollFileOps {
             return Err(Errno::ENOENT);
         };
         state.watches.remove(index);
+        if state.watches.is_empty() {
+            state.scan_cursor = 0;
+        } else {
+            if index < state.scan_cursor {
+                state.scan_cursor -= 1;
+            }
+            state.scan_cursor %= state.watches.len();
+        }
         Ok(())
     }
 
@@ -245,11 +255,17 @@ impl EpollFileOps {
         state
             .watches
             .retain(|watch| !Arc::ptr_eq(&watch.file, file));
+        if state.watches.is_empty() {
+            state.scan_cursor = 0;
+        } else {
+            state.scan_cursor %= state.watches.len();
+        }
     }
 
     fn clear_watches(&self) {
         let watches = {
             let mut state = self.state.lock();
+            state.scan_cursor = 0;
             core::mem::take(&mut state.watches)
         };
         drop(watches);
@@ -263,7 +279,16 @@ impl EpollFileOps {
     fn collect_ready(&self, maxevents: usize) -> Vec<EpollEvent> {
         let mut out = Vec::new();
         let mut state = self.state.lock();
-        for watch in state.watches.iter_mut() {
+        let watch_count = state.watches.len();
+        if watch_count == 0 || maxevents == 0 {
+            return out;
+        }
+
+        let start = state.scan_cursor % watch_count;
+        let mut next_cursor = start;
+        for offset in 0..watch_count {
+            let index = (start + offset) % watch_count;
+            let watch = &mut state.watches[index];
             if watch.disabled {
                 continue;
             }
@@ -281,12 +306,18 @@ impl EpollFileOps {
                 events: ready.raw() as u32,
                 data: watch.data,
             });
+            next_cursor = (index + 1) % watch_count;
             if watch.oneshot {
                 watch.disabled = true;
             }
             if out.len() >= maxevents {
                 break;
             }
+        }
+        if !out.is_empty() {
+            // 已报告的 level-triggered 项移到下一轮扫描起点之后，避免一个
+            // 持续就绪的 fd 在 maxevents 较小时长期饿死其余就绪项。
+            state.scan_cursor = next_cursor;
         }
         out
     }
@@ -319,6 +350,24 @@ impl EpollFileOps {
             }
         }
         false
+    }
+
+    fn nesting_depth_recursive(&self, visited: &mut Vec<usize>) -> usize {
+        let state = self.state.lock();
+        let mut max_child_depth = 0;
+        for watch in &state.watches {
+            let ptr = Arc::as_ptr(&watch.file) as usize;
+            if visited.contains(&ptr) {
+                continue;
+            }
+            let Some(child) = watch.file.downcast_ops::<EpollFileOps>() else {
+                continue;
+            };
+            visited.push(ptr);
+            max_child_depth = max_child_depth.max(child.nesting_depth_recursive(visited));
+            visited.pop();
+        }
+        1 + max_child_depth
     }
 
     fn wait(&self, maxevents: usize, timeout_ms: i64) -> Result<Vec<EpollEvent>, Errno> {
@@ -388,6 +437,10 @@ impl FileOps for EpollFileOps {
         for (file, _) in &sources {
             file.poll_remove_waiter(task);
         }
+    }
+
+    fn is_epollable(&self) -> bool {
+        true
     }
 
     fn on_file_description_closed(&self, file: &Arc<File>) {
@@ -568,16 +621,28 @@ pub fn ctl(
     fd: Fd,
     event: Option<EpollEvent>,
 ) -> Result<(), Errno> {
+    const MAX_EPOLL_NESTING_DEPTH: usize = 5;
+
     let epoll_file = fdt.get_file(epfd).ok_or(Errno::EBADF)?;
     let ops = epoll_ops_from_fd(&epoll_file)?;
     let target = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-    if Arc::ptr_eq(&epoll_file, &target) {
-        return Err(Errno::EINVAL);
-    }
-    if let Some(target_epoll) = target.downcast_ops::<EpollFileOps>() {
-        let mut visited = vec![Arc::as_ptr(&target) as usize];
-        if target_epoll.contains_file_recursive(&epoll_file, &mut visited) {
-            return Err(Errno::ELOOP);
+
+    if op == EPOLL_CTL_ADD {
+        if Arc::ptr_eq(&epoll_file, &target) {
+            return Err(Errno::EINVAL);
+        }
+        if !target.is_epollable() {
+            return Err(Errno::EPERM);
+        }
+        if let Some(target_epoll) = target.downcast_ops::<EpollFileOps>() {
+            let mut visited = vec![Arc::as_ptr(&target) as usize];
+            if target_epoll.contains_file_recursive(&epoll_file, &mut visited) {
+                return Err(Errno::ELOOP);
+            }
+            let mut depth_visited = vec![Arc::as_ptr(&target) as usize];
+            if target_epoll.nesting_depth_recursive(&mut depth_visited) >= MAX_EPOLL_NESTING_DEPTH {
+                return Err(Errno::EINVAL);
+            }
         }
     }
     match op {

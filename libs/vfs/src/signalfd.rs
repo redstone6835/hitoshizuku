@@ -96,6 +96,10 @@ impl FileOps for SignalfdFileOps {
         self.waiters.remove(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }

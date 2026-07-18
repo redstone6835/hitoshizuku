@@ -1264,6 +1264,10 @@ impl FileOps for CharDevFileOps {
         self.dev.poll_remove_waiter(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn set_status_flags(&self, flags: OpenOptions) {
         self.nonblock.store(flags.nonblock, Ordering::Release);
     }

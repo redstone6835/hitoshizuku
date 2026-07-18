@@ -385,6 +385,10 @@ impl FileOps for NetSocketFileOps {
         self.wait_queue.remove(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
