@@ -942,6 +942,7 @@ fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
         let delta = now_ns - inner.last_update_ns;
         inner.last_update_ns = now_ns;
         if let Some(curr) = inner.current.as_ref().map(Arc::clone) {
+            curr.account_cpu_runtime(delta);
             match curr.sched.policy() {
                 SchedPolicy::Fair | SchedPolicy::Idle => {
                     update_fair_curr_locked(inner, &curr, delta)

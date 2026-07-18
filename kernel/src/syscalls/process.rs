@@ -892,7 +892,7 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
-    let ns = crate::vdso::clock_time_ns(clock_id).ok_or(Errno::EINVAL)?;
+    let ns = clock_time_ns_for_task(ctx.task(), clock_id).ok_or(Errno::EINVAL)?;
     let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     let mut out = [0u8; 16];
@@ -900,6 +900,30 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     out[8..16].copy_from_slice(&nsec.to_le_bytes());
     copy_to_user(tp, &out).map_err(|e| e.as_errno())?;
     Ok(0)
+}
+
+const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+
+fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
+    match clock_id {
+        CLOCK_PROCESS_CPUTIME_ID => {
+            let now_ns = sched::now_ns_public();
+            let mut total = 0u64;
+            for member in task.thread_group().snapshot() {
+                let usage = member.usage_snapshot(now_ns);
+                total = total
+                    .saturating_add(usage.user_ns)
+                    .saturating_add(usage.system_ns);
+            }
+            Some(total)
+        }
+        CLOCK_THREAD_CPUTIME_ID => {
+            let usage = task.usage_snapshot(sched::now_ns_public());
+            Some(usage.user_ns.saturating_add(usage.system_ns))
+        }
+        _ => crate::vdso::clock_time_ns(clock_id),
+    }
 }
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -928,6 +952,7 @@ pub(super) fn sys_getcpu(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 }
 
 pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    ctx.disable_restart();
     let req_user = ctx.args[0];
     let rem_user = ctx.args[1];
     if req_user == 0 {
@@ -949,7 +974,7 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     match sleep_until_deadline(ctx.task(), deadline, || Ok(sched::now_ns_public())) {
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
-            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()));
+            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()))?;
             Err(Errno::EINTR)
         }
         Err(err) => Err(err),
@@ -991,10 +1016,18 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    ctx.disable_restart();
     let clock_id = ctx.args[0] as i32;
     let flags = ctx.args[1];
     let req_user = ctx.args[2];
     let rem_user = ctx.args[3];
+    const TIMER_ABSTIME: usize = 1;
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if clock_id == CLOCK_THREAD_CPUTIME_ID as i32 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     if clock_id != crate::vdso::CLOCK_REALTIME as i32
         && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
         && clock_id != crate::vdso::CLOCK_MONOTONIC_RAW as i32
@@ -1012,7 +1045,6 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
-    const TIMER_ABSTIME: usize = 1;
     let absolute = (flags & TIMER_ABSTIME) != 0;
     let deadline = if absolute {
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
@@ -1034,7 +1066,10 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
             if !absolute {
-                write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()));
+                write_remaining_timespec(
+                    rem_user,
+                    deadline.saturating_sub(sched::now_ns_public()),
+                )?;
             }
             Err(Errno::EINTR)
         }
@@ -1090,9 +1125,9 @@ fn restore_current_task_after_sleep(task: &Arc<Task>) {
     }
 }
 
-fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) {
+fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) -> Result<(), Errno> {
     if rem_user == 0 {
-        return;
+        return Ok(());
     }
     let remaining_ns = remaining_ns.min(i64::MAX as u64) as i64;
     let rem_sec = remaining_ns / 1_000_000_000;
@@ -1100,13 +1135,16 @@ fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) {
     let mut rem_buf = [0u8; 16];
     rem_buf[0..8].copy_from_slice(&rem_sec.to_le_bytes());
     rem_buf[8..16].copy_from_slice(&rem_nsec.to_le_bytes());
-    let _ = copy_to_user(rem_user, &rem_buf);
+    copy_to_user(rem_user, &rem_buf).map_err(|e| e.as_errno())
 }
 
 pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
-    let res_ns = crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)? as i64;
+    let res_ns = match clock_id {
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => 1,
+        _ => crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)?,
+    } as i64;
     if tp != 0 {
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&0i64.to_le_bytes());

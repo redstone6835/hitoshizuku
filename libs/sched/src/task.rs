@@ -184,9 +184,9 @@ impl Default for SigAltStack {
 
 /// 任务资源使用快照。
 ///
-/// 当前调度器尚未区分用户态/内核态执行时间，因此先把任务生命周期内的可运行
-/// 时间计入 `user_ns`，`system_ns` 保持 0。接口按结构化字段提供给 syscall
-/// 兼容层，后续接入更细的 trap/syscall 记账时无需改动 wait/getrusage ABI。
+/// 当前调度器尚未区分用户态/内核态执行时间，因此先把实际占用 CPU 的时间计入
+/// `user_ns`，`system_ns` 保持 0。接口按结构化字段提供给 syscall 兼容层，后续
+/// 接入 trap/syscall 边界记账时无需改动 wait/getrusage ABI。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TaskUsage {
     pub user_ns: u64,
@@ -457,10 +457,10 @@ pub struct Task {
     sigaltstack: Spinlock<SigAltStack>,
     /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
     comm: Spinlock<[u8; TASK_COMM_LEN]>,
-    /// 任务创建时间，用于在精细 CPU 记账落地前提供稳定的 rusage 近似值。
+    /// 任务创建时的单调时钟值，用于 `/proc/<pid>/stat` 的 starttime。
     start_time_ns: AtomicU64,
-    /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
-    exited_usage_ns: AtomicU64,
+    /// 调度器累计的实际 CPU 运行时间。
+    cpu_runtime_ns: AtomicU64,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -552,7 +552,7 @@ impl Task {
             sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
             start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
-            exited_usage_ns: AtomicU64::new(0),
+            cpu_runtime_ns: AtomicU64::new(0),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -708,10 +708,6 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
-        self.exited_usage_ns.store(
-            self.elapsed_usage_ns(crate::scheduler::now_ns_public()),
-            Ordering::Release,
-        );
         if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
             self.exit_reason
                 .store(EXIT_REASON_EXITED, Ordering::Release);
@@ -1162,17 +1158,19 @@ impl Task {
         *self.comm.lock() = comm;
     }
 
-    fn elapsed_usage_ns(&self, now_ns: u64) -> u64 {
-        let frozen = self.exited_usage_ns.load(Ordering::Acquire);
-        if frozen != 0 {
-            return frozen;
-        }
-        now_ns.saturating_sub(self.start_time_ns.load(Ordering::Acquire))
+    /// 记录本任务在一次运行队列更新时间内实际占用的 CPU 时间。
+    pub(crate) fn account_cpu_runtime(&self, delta_ns: u64) {
+        self.cpu_runtime_ns.fetch_add(delta_ns, Ordering::AcqRel);
     }
 
-    pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
+    /// 返回任务相对系统单调时钟的创建时刻。
+    pub fn start_time_ns(&self) -> u64 {
+        self.start_time_ns.load(Ordering::Acquire)
+    }
+
+    pub fn usage_snapshot(&self, _now_ns: u64) -> TaskUsage {
         TaskUsage {
-            user_ns: self.elapsed_usage_ns(now_ns),
+            user_ns: self.cpu_runtime_ns.load(Ordering::Acquire),
             system_ns: 0,
             minflt: 0,
             majflt: 0,

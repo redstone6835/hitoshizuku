@@ -2100,9 +2100,9 @@ pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
     // 任务可能登记在任一 CPU 的 rq 上；远端 current 不能被本 CPU 直接摘掉，
     // 只能请求对方在调度边界观察到新状态后自行切走。
     #[cfg(feature = "trace-task-lifecycle")]
-    let removed = dequeue_for_state_change(task, 0);
+    let removed = dequeue_for_state_change(task, now_ns_internal());
     #[cfg(not(feature = "trace-task-lifecycle"))]
-    let _ = dequeue_for_state_change(task, 0);
+    let _ = dequeue_for_state_change(task, now_ns_internal());
     task.mark_exited(code);
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(

@@ -2200,13 +2200,37 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let num_threads = task_thread_count(task);
     let (vsize, rss_bytes) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
-    // 这里按当前 Task 模型已经可观测的字段生成 Linux 兼容 stat。fault 计数、
-    // 累积 CPU 时间、信号掩码等尚未进入 sched/mm 的公共快照接口，因此兼容字段
-    // 保持 0，避免在 procfs 层伪造无法证明的数据。
+    let usage = task.usage_snapshot(sched::now_ns_public());
+    let child_usage = task.child_usage_snapshot();
+    let utime = proc_cpu_ticks(usage.user_ns);
+    let stime = proc_cpu_ticks(usage.system_ns);
+    let cutime = proc_cpu_ticks(child_usage.user_ns);
+    let cstime = proc_cpu_ticks(child_usage.system_ns);
+    let starttime = proc_cpu_ticks(task.start_time_ns());
+    // fault 计数、信号掩码等尚未进入 sched/mm 的公共快照接口，对应字段保持 0；
+    // 已有可靠来源的 CPU 时间、创建时间和内存字段必须按 Linux stat 位置导出。
     format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid, pgrp, session, num_threads, vsize, rss_pages,
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid,
+        comm,
+        state,
+        ppid,
+        pgrp,
+        session,
+        utime,
+        stime,
+        cutime,
+        cstime,
+        num_threads,
+        starttime,
+        vsize,
+        rss_pages,
     )
+}
+
+fn proc_cpu_ticks(ns: u64) -> u64 {
+    const USER_HZ: u64 = 100;
+    ns / (1_000_000_000 / USER_HZ)
 }
 
 fn render_task_cmdline(task: &Arc<Task>) -> Vec<u8> {

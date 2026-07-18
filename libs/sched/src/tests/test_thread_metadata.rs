@@ -226,6 +226,23 @@ fn runqueue_class_load_includes_current_task() {
     assert!(rq.dequeue(&current, 3));
 }
 
+/// CPU 使用时间只能累计任务实际作为 current 运行的区间。
+#[ktest]
+fn runqueue_accounts_current_cpu_runtime() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task), 100);
+    let current = rq.pick_next(100).expect("current task");
+
+    rq.tick(150);
+    assert_eq!(current.usage_snapshot(150).user_ns, 50);
+
+    assert!(rq.dequeue(&current, 200));
+    assert_eq!(current.usage_snapshot(300).user_ns, 100);
+    rq.tick(400);
+    assert_eq!(current.usage_snapshot(400).user_ns, 100);
+}
+
 #[ktest]
 fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     let current = make_task();
