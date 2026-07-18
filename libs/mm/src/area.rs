@@ -14,14 +14,39 @@ use core::ops::Range;
 use crate::file_like::FileLike;
 use crate::flags::VmFlags;
 
+/// 共享匿名映射的稳定 backing 身份。
+///
+/// 同一对象会被 fork 后的多个 VMA 共同持有；只要仍有任意 VMA 引用该对象，
+/// 已产生的共享页就必须保持有效，不能因某个进程先退出而丢失内容。
+#[derive(Debug)]
+pub struct SharedAnonObject {
+    _private: (),
+}
+
+impl SharedAnonObject {
+    /// 建立一个新的共享匿名对象；对象身份由其 `Arc` 控制块唯一确定。
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for SharedAnonObject {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// VMA 的数据来源。
 #[derive(Clone)]
 pub enum VmBacking {
     /// 匿名映射：缺页时分配一页零填充。对应 `MAP_ANONYMOUS`。
     Anon,
-    /// 共享匿名对象。`id` 标识同一 shared-anon backing，`offset` 对应
+    /// 共享匿名对象。`object` 标识同一 shared-anon backing，`offset` 对应
     /// `range.start` 在对象内的字节偏移。
-    SharedAnon { id: usize, offset: u64 },
+    SharedAnon {
+        object: Arc<SharedAnonObject>,
+        offset: u64,
+    },
     /// 文件映射：缺页时按偏移从文件读取；超出文件长度的尾部零填充。
     File {
         file: Arc<dyn FileLike>,
@@ -123,8 +148,8 @@ impl VmBacking {
     pub fn checked_shift(&self, shift: usize) -> Option<Self> {
         match self {
             VmBacking::Anon => Some(VmBacking::Anon),
-            VmBacking::SharedAnon { id, offset } => Some(VmBacking::SharedAnon {
-                id: *id,
+            VmBacking::SharedAnon { object, offset } => Some(VmBacking::SharedAnon {
+                object: Arc::clone(object),
                 offset: offset.checked_add(u64::try_from(shift).ok()?)?,
             }),
             VmBacking::File { file, offset } => Some(VmBacking::File {

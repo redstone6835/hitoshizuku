@@ -205,7 +205,13 @@ fn fdtable_has_other_live_owner(task: &Arc<Task>, fdt: &Arc<vfs::fdtable::FdTabl
 
 pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let regs = hal::user::decode_clone_register_args(ctx.args);
-    let flags = CloneFlags::from_raw(regs.flags);
+    let mut raw_flags = regs.flags;
+    if CloneFlags::from_raw(raw_flags).has(CloneFlags::CLONE_THREAD) {
+        // 传统 clone ABI 把退出信号编码在 flags 低位；Linux 对线程克隆忽略该值。
+        // clone3 的 exit_signal 是独立字段，仍由通用校验严格要求为零。
+        raw_flags &= !CloneFlags::CSIGNAL;
+    }
+    let flags = CloneFlags::from_raw(raw_flags);
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[syscall][clone] flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
@@ -227,7 +233,7 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         parent_tid: regs.parent_tid,
         child_tid: regs.child_tid,
         tls: regs.tls,
-        exit_signal: regs.flags & 0xff,
+        exit_signal: raw_flags & CloneFlags::CSIGNAL,
         set_tid: 0,
         set_tid_size: 0,
         requested_pid: 0,
@@ -276,6 +282,9 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         requested_pid: 0,
         cgroup: read_u64(10) as usize,
     };
+    if (args.stack == 0) != (args.stack_size == 0) {
+        return Err(Errno::EINVAL);
+    }
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[syscall][clone3] flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",

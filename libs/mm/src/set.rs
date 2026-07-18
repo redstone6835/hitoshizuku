@@ -339,9 +339,18 @@ impl VmaSet {
                                     true
                                 }
                                 (
-                                    crate::area::VmBacking::SharedAnon { id: il, offset: ol },
-                                    crate::area::VmBacking::SharedAnon { id: ir, offset: or },
-                                ) => il == ir && checked_offset_after(*ol, left_len) == Some(*or),
+                                    crate::area::VmBacking::SharedAnon {
+                                        object: il,
+                                        offset: ol,
+                                    },
+                                    crate::area::VmBacking::SharedAnon {
+                                        object: ir,
+                                        offset: or,
+                                    },
+                                ) => {
+                                    alloc::sync::Arc::ptr_eq(il, ir)
+                                        && checked_offset_after(*ol, left_len) == Some(*or)
+                                }
                                 (
                                     crate::area::VmBacking::File {
                                         file: fl,
@@ -387,6 +396,11 @@ impl VmaSet {
         Self {
             tree: self.tree.clone(),
         }
+    }
+
+    /// 摘出全部 VMA，供地址空间销毁路径先结束 backing 生命周期再回收页缓存。
+    pub fn take_all(&mut self) -> Vec<VmArea> {
+        core::mem::take(&mut self.tree).into_values().collect()
     }
 
     /// 只读迭代全部 VMA，按起址升序。

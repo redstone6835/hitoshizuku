@@ -11,7 +11,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use errno::Errno;
-use mm::{FileLike, VmArea, VmBacking, VmFlags, VmaSet};
+use mm::{FileLike, SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::ops::{PgdHandle, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
@@ -58,9 +58,8 @@ fn covered_len(areas: &[VmArea], range: &Range<usize>) -> usize {
 
 static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
     spin::Mutex::new(BTreeMap::new());
-static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, Weak<ResidentPage>>> =
+static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
     spin::Mutex::new(BTreeMap::new());
-static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
@@ -100,6 +99,15 @@ impl SharedFilePageKey {
 struct SharedAnonPageKey {
     id: usize,
     offset: u64,
+}
+
+struct SharedAnonPageEntry {
+    owner: Weak<SharedAnonObject>,
+    page: Arc<ResidentPage>,
+}
+
+fn shared_anon_object_id(object: &Arc<SharedAnonObject>) -> usize {
+    Arc::as_ptr(object) as usize
 }
 
 /// futex 等用户态同步原语使用的稳定地址 key。
@@ -557,8 +565,8 @@ impl VmSpace {
                     .ok_or(Errno::EINVAL)?,
                 word_offset,
             }),
-            VmBacking::SharedAnon { id, offset } => Ok(VmFutexKey::SharedAnon {
-                id: *id,
+            VmBacking::SharedAnon { object, offset } => Ok(VmFutexKey::SharedAnon {
+                id: shared_anon_object_id(object),
                 offset: offset
                     .checked_add(u64::try_from(page_delta).map_err(|_| Errno::EINVAL)?)
                     .ok_or(Errno::EINVAL)?,
@@ -583,7 +591,7 @@ impl VmSpace {
         let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
-                id: NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed),
+                object: Arc::new(SharedAnonObject::new()),
                 offset: 0,
             }
         } else {
@@ -625,7 +633,7 @@ impl VmSpace {
         let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
-                id: NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed),
+                object: Arc::new(SharedAnonObject::new()),
                 offset: 0,
             }
         } else {
@@ -651,6 +659,9 @@ impl VmSpace {
         for (va, _mapping) in &removed {
             let _ = self.unmap_page(*va);
         }
+        drop(removed);
+        drop(removed_areas);
+        prune_shared_anon_pages();
         Ok(())
     }
 
@@ -685,6 +696,9 @@ impl VmSpace {
         for (va, _mapping) in &removed {
             let _ = self.unmap_page(*va);
         }
+        drop(removed);
+        drop(removed_areas);
+        prune_shared_anon_pages();
         Ok(())
     }
 
@@ -734,6 +748,8 @@ impl VmSpace {
             self.unmap_page(*va)?;
         }
         drop(removed);
+        drop(removed_areas);
+        prune_shared_anon_pages();
         Ok(())
     }
 
@@ -838,6 +854,8 @@ impl VmSpace {
         };
         Self::notify_file_unmapped(&removed_target);
         Self::notify_files_mapped(mapped_tail);
+        drop(removed_target);
+        prune_shared_anon_pages();
 
         let removed_pages = self.remove_page_mappings(new_range.clone());
         for (va, _mapping) in &removed_pages {
@@ -1317,9 +1335,9 @@ impl VmSpace {
             VmBacking::Anon => alloc_zeroed_user_page()
                 .map(ResidentPage::new_anon)
                 .ok_or(Errno::ENOMEM),
-            VmBacking::SharedAnon { id, offset } => {
+            VmBacking::SharedAnon { object, offset } => {
                 let object_off = offset + (page_va - area_start) as u64;
-                shared_anon_page(id, object_off)
+                shared_anon_page(&object, object_off)
             }
             VmBacking::File { file, offset } => {
                 let file_off = offset + (page_va - area_start) as u64;
@@ -1581,14 +1599,18 @@ impl Drop for VmSpace {
     fn drop(&mut self) {
         VM_SPACE_DROPPED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_sub(1, Ordering::Relaxed);
-        let files = {
-            let vmas = self.vmas.lock();
-            Self::collect_file_backings(vmas.iter())
+        let (files, areas) = {
+            let mut vmas = self.vmas.lock();
+            let files = Self::collect_file_backings(vmas.iter());
+            let areas = vmas.take_all();
+            (files, areas)
         };
         for file in files {
             file.on_unmapped();
         }
         self.pages.lock().clear();
+        drop(areas);
+        prune_shared_anon_pages();
         if let Some(ops) = user_pgd_ops() {
             unsafe { (ops.drop_pgd)(self.pgd) };
         }
@@ -1674,21 +1696,41 @@ fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Reside
     Ok(page)
 }
 
-fn shared_anon_page(id: usize, offset: u64) -> Result<Arc<ResidentPage>, Errno> {
-    let key = SharedAnonPageKey { id, offset };
+fn shared_anon_page(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+) -> Result<Arc<ResidentPage>, Errno> {
+    prune_shared_anon_pages();
+    let key = SharedAnonPageKey {
+        id: shared_anon_object_id(object),
+        offset,
+    };
     {
-        let mut cache = SHARED_ANON_PAGES.lock();
-        if let Some(weak) = cache.get(&key) {
-            if let Some(page) = weak.upgrade() {
-                return Ok(page);
-            }
-            cache.remove(&key);
+        let cache = SHARED_ANON_PAGES.lock();
+        if let Some(entry) = cache.get(&key) {
+            return Ok(Arc::clone(&entry.page));
         }
     }
     let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
     let page = ResidentPage::new_shared_anon(paddr);
-    SHARED_ANON_PAGES.lock().insert(key, Arc::downgrade(&page));
+    let mut cache = SHARED_ANON_PAGES.lock();
+    if let Some(entry) = cache.get(&key) {
+        return Ok(Arc::clone(&entry.page));
+    }
+    cache.insert(
+        key,
+        SharedAnonPageEntry {
+            owner: Arc::downgrade(object),
+            page: Arc::clone(&page),
+        },
+    );
     Ok(page)
+}
+
+fn prune_shared_anon_pages() {
+    SHARED_ANON_PAGES
+        .lock()
+        .retain(|_, entry| entry.owner.strong_count() != 0);
 }
 
 fn load_file_page(file: &dyn FileLike, file_off: u64) -> Result<usize, Errno> {

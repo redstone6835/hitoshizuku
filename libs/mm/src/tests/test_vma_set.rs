@@ -7,7 +7,9 @@ extern crate alloc;
 #[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
 
-use crate::{VmArea, VmBacking, VmFlags, VmaSet};
+use alloc::sync::Arc;
+
+use crate::{SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
 use errno::Errno;
 use ktest::ktest;
 
@@ -16,6 +18,19 @@ fn anon_area(start: usize, end: usize) -> VmArea {
         range: start..end,
         flags: VmFlags::from_bits(VmFlags::READ | VmFlags::WRITE | VmFlags::USER),
         backing: VmBacking::Anon,
+    }
+}
+
+fn shared_anon_area(
+    start: usize,
+    end: usize,
+    object: Arc<SharedAnonObject>,
+    offset: u64,
+) -> VmArea {
+    VmArea {
+        range: start..end,
+        flags: VmFlags::from_bits(VmFlags::READ | VmFlags::WRITE | VmFlags::USER | VmFlags::SHARED),
+        backing: VmBacking::SharedAnon { object, offset },
     }
 }
 
@@ -124,4 +139,47 @@ fn merge_neighbors_compatible() {
     vmas.insert(anon_area(0x2000, 0x3000)).unwrap();
     assert_eq!(vmas.len(), 1);
     assert_eq!(vmas.find(0x1500).unwrap().range, 0x1000..0x3000);
+}
+
+/// fork 的 VMA 元数据副本必须继续引用同一共享匿名对象，而不是只复制数值 ID。
+#[ktest]
+fn shared_anon_clone_keeps_object_identity() {
+    let object = Arc::new(SharedAnonObject::new());
+    let mut parent = VmaSet::new();
+    parent
+        .insert(shared_anon_area(0x1000, 0x3000, Arc::clone(&object), 0))
+        .unwrap();
+
+    let child = parent.deep_clone_metadata();
+    let VmBacking::SharedAnon {
+        object: parent_object,
+        ..
+    } = &parent.find(0x1000).unwrap().backing
+    else {
+        panic!("parent backing must be shared anonymous");
+    };
+    let VmBacking::SharedAnon {
+        object: child_object,
+        ..
+    } = &child.find(0x1000).unwrap().backing
+    else {
+        panic!("child backing must be shared anonymous");
+    };
+    assert!(Arc::ptr_eq(parent_object, child_object));
+}
+
+/// 地址空间销毁路径摘出全部 VMA 后，必须能释放其持有的 backing 引用。
+#[ktest]
+fn take_all_releases_shared_anon_references() {
+    let object = Arc::new(SharedAnonObject::new());
+    let mut vmas = VmaSet::new();
+    vmas.insert(shared_anon_area(0x1000, 0x2000, Arc::clone(&object), 0))
+        .unwrap();
+    assert_eq!(Arc::strong_count(&object), 2);
+
+    let areas = vmas.take_all();
+    assert!(vmas.is_empty());
+    assert_eq!(Arc::strong_count(&object), 2);
+    drop(areas);
+    assert_eq!(Arc::strong_count(&object), 1);
 }
