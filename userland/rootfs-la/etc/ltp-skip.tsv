@@ -1,0 +1,22 @@
+# tag或@scenario:<name>	分类	原因（不得包含制表符）
+@scenario:cve	kernel-bound	针对特定 Linux 内核实现漏洞的回归场景
+delete_module01	kernel-bound	依赖 Linux LKM 装载器与模块状态机
+delete_module02	kernel-bound	依赖 Linux LKM 装载器与模块状态机
+delete_module03	kernel-bound	依赖 Linux LKM 装载器与模块状态机
+finit_module01	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+finit_module02	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+init_module01	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+init_module02	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+insmod01_sh	kernel-bound	直接调用 Linux insmod 并装载 ko
+lsmod01_sh	kernel-bound	依赖 Linux 模块列表 ABI
+kallsyms	kernel-bound	校验 Linux kallsyms 内部导出格式
+block_dev	kernel-bound	依赖 LTP Linux 内核测试模块
+tpci	kernel-bound	依赖 LTP Linux PCI 测试模块
+tbio	kernel-bound	依赖 LTP Linux block I/O 测试模块
+ltp_acpi	kernel-bound	依赖 LTP Linux ACPI 测试模块
+uaccess	kernel-bound	依赖 LTP Linux uaccess 测试模块
+rcu_torture	kernel-bound	依赖 Linux rcu_torture 模块
+lock_torture	kernel-bound	依赖 Linux lock_torture 模块
+zram01	kernel-bound	依赖 Linux zram 模块及其 sysfs 实现
+zram02	kernel-bound	依赖 Linux zram 模块及其 sysfs 实现
+zram03	kernel-bound	依赖 Linux zram 模块及其 sysfs 实现

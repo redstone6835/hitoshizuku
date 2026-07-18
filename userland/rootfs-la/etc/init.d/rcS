@@ -20,6 +20,23 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+ltp_mode=0
+if [ -r /sys/kernel/cmdline ]; then
+    for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
+        [ "$arg" = "ltp_run=1" ] && ltp_mode=1
+    done
+fi
+
+if [ "$ltp_mode" -eq 1 ]; then
+    if ! mount -t ext4 /dev/vd0 /mnt; then
+        printf '@@LTP\tfatal\treason=test-image-mount-failed\tdevice=/dev/vd0\n'
+        poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || true
+        exit 1
+    fi
+    echo "[init] entering LoongArch64 LTP runner"
+    exec /bin/sh /etc/ltp-runner.sh
+fi
+
 if mount -t ext4 /dev/vd0 /mnt; then
     echo "[init] mounted /dev/vd0 at /mnt"
     sh_file_list="/tmp/init-sh-files.$$"
