@@ -160,6 +160,21 @@ impl TcpPacket {
 }
 
 pub(crate) fn parse_tcp_packet(chain: &PacketChain, ip: IpPacket) -> Result<TcpPacket, DropReason> {
+    parse_tcp_packet_inner(chain, ip, true)
+}
+
+pub(crate) fn parse_tcp_packet_trusted(
+    chain: &PacketChain,
+    ip: IpPacket,
+) -> Result<TcpPacket, DropReason> {
+    parse_tcp_packet_inner(chain, ip, false)
+}
+
+fn parse_tcp_packet_inner(
+    chain: &PacketChain,
+    ip: IpPacket,
+    verify_checksum: bool,
+) -> Result<TcpPacket, DropReason> {
     if ip.payload_len < TCP_MIN_HEADER_LEN as u32 {
         return Err(DropReason::MalformedTcp);
     }
@@ -184,17 +199,19 @@ pub(crate) fn parse_tcp_packet(chain: &PacketChain, ip: IpPacket) -> Result<TcpP
         usize::from(ip.payload_offset) + TCP_MIN_HEADER_LEN,
         header_len,
     )?;
-    let checksum = transport_checksum(
-        chain,
-        usize::from(ip.payload_offset),
-        ip.payload_len as usize,
-        ip.source,
-        ip.destination,
-        TCP_PROTOCOL_NUMBER,
-    )
-    .map_err(|_| DropReason::MalformedTcp)?;
-    if checksum != 0 {
-        return Err(DropReason::TcpChecksum);
+    if verify_checksum {
+        let checksum = transport_checksum(
+            chain,
+            usize::from(ip.payload_offset),
+            ip.payload_len as usize,
+            ip.source,
+            ip.destination,
+            TCP_PROTOCOL_NUMBER,
+        )
+        .map_err(|_| DropReason::MalformedTcp)?;
+        if checksum != 0 {
+            return Err(DropReason::TcpChecksum);
+        }
     }
 
     let flags = u16::from(header[12] & 1) << 8 | u16::from(header[13]);

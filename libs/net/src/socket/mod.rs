@@ -1788,14 +1788,24 @@ impl SocketFacade {
     }
 
     pub fn take_stream_tx(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
+        let lease = self.take_stream_tx_deferred(max_len)?;
+        self.finish_stream_tx_batch(usize::from(lease.len));
+        Some(lease)
+    }
+
+    pub(crate) fn take_stream_tx_deferred(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
         let (start, len) = self.stream_tx.lock().take_unsent(max_len)?;
-        self.tcp_bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
-        self.refresh_tx_readiness();
         Some(TcpTxLease {
             facade: Arc::clone(self),
             start,
             len: len as u16,
         })
+    }
+
+    pub(crate) fn finish_stream_tx_batch(&self, bytes: usize) {
+        self.tcp_bytes_sent
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.refresh_tx_readiness();
     }
 
     pub fn stream_unsent_len(&self) -> usize {

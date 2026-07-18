@@ -3,7 +3,9 @@
 use crate::buf::{DropReason, NetBufPoolError, PacketBatch, PacketChain, PacketMetadata};
 use crate::control::ConfigSnapshot;
 use crate::flow::{FlowKey, rss_hash};
-use crate::transport::{TCP_PROTOCOL_NUMBER, TcpPacket, parse_tcp_packet};
+use crate::transport::{
+    TCP_PROTOCOL_NUMBER, TcpPacket, parse_tcp_packet, parse_tcp_packet_trusted,
+};
 use crate::tuning::PACKET_BATCH_CAPACITY;
 use crate::{Endpoint, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
 
@@ -275,18 +277,20 @@ impl VectorFrontend {
                     Ok(_) => set_drop(packet, DropReason::NotLocal),
                     Err(reason) => set_drop(packet, reason),
                 },
-                ETHERTYPE_IPV4 => match parse_ipv4(&packet.chain) {
-                    Ok(ip) if is_local_ip(config, interface, ip.destination) => {
-                        packet.parsed.ip = Some(ip);
-                        packet.parsed.disposition = if ip.fragment.is_some() {
-                            FrontendDisposition::Control(ControlPacket::Fragment(ip))
-                        } else {
-                            FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
-                        };
+                ETHERTYPE_IPV4 => {
+                    match parse_ipv4(&packet.chain, !packet.metadata.checksums_validated) {
+                        Ok(ip) if is_local_ip(config, interface, ip.destination) => {
+                            packet.parsed.ip = Some(ip);
+                            packet.parsed.disposition = if ip.fragment.is_some() {
+                                FrontendDisposition::Control(ControlPacket::Fragment(ip))
+                            } else {
+                                FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
+                            };
+                        }
+                        Ok(_) => set_drop(packet, DropReason::NotLocal),
+                        Err(reason) => set_drop(packet, reason),
                     }
-                    Ok(_) => set_drop(packet, DropReason::NotLocal),
-                    Err(reason) => set_drop(packet, reason),
-                },
+                }
                 ETHERTYPE_IPV6 => match parse_ipv6(&packet.chain) {
                     Ok((ip, problem)) if is_local_ip(config, interface, ip.destination) => {
                         packet.parsed.ip = Some(ip);
@@ -327,7 +331,11 @@ impl VectorFrontend {
                 continue;
             }
             match ip.next_header {
-                TCP_PROTOCOL_NUMBER => match parse_tcp_packet(&packet.chain, ip) {
+                TCP_PROTOCOL_NUMBER => match if packet.metadata.checksums_validated {
+                    parse_tcp_packet_trusted(&packet.chain, ip)
+                } else {
+                    parse_tcp_packet(&packet.chain, ip)
+                } {
                     Ok(tcp) => {
                         packet.parsed.tcp = Some(tcp);
                         packet.parsed.flow = FlowKey::new(
@@ -349,28 +357,30 @@ impl VectorFrontend {
                     }
                     Err(reason) => set_drop(packet, reason),
                 },
-                IP_PROTOCOL_UDP => match parse_udp(&packet.chain, ip) {
-                    Ok(udp) => {
-                        packet.parsed.udp = Some(udp);
-                        packet.parsed.flow = FlowKey::new(
-                            Endpoint {
-                                addr: ip.source,
-                                port: udp.source_port,
-                            },
-                            Endpoint {
-                                addr: ip.destination,
-                                port: udp.destination_port,
-                            },
-                            TransportProtocol::Udp,
-                        );
-                        if packet.parsed.flow.is_some() {
-                            packet.parsed.disposition = FrontendDisposition::Udp;
-                        } else {
-                            set_drop(packet, DropReason::MalformedUdp);
+                IP_PROTOCOL_UDP => {
+                    match parse_udp(&packet.chain, ip, !packet.metadata.checksums_validated) {
+                        Ok(udp) => {
+                            packet.parsed.udp = Some(udp);
+                            packet.parsed.flow = FlowKey::new(
+                                Endpoint {
+                                    addr: ip.source,
+                                    port: udp.source_port,
+                                },
+                                Endpoint {
+                                    addr: ip.destination,
+                                    port: udp.destination_port,
+                                },
+                                TransportProtocol::Udp,
+                            );
+                            if packet.parsed.flow.is_some() {
+                                packet.parsed.disposition = FrontendDisposition::Udp;
+                            } else {
+                                set_drop(packet, DropReason::MalformedUdp);
+                            }
                         }
+                        Err(reason) => set_drop(packet, reason),
                     }
-                    Err(reason) => set_drop(packet, reason),
-                },
+                }
                 IP_PROTOCOL_ICMP | IP_PROTOCOL_ICMPV6 => {
                     packet.parsed.disposition = FrontendDisposition::Control(ControlPacket::Icmp {
                         ipv6: ip.next_header == IP_PROTOCOL_ICMPV6,
@@ -434,7 +444,7 @@ fn parse_arp(chain: &PacketChain) -> Result<ArpPacket, DropReason> {
     })
 }
 
-fn parse_ipv4(chain: &PacketChain) -> Result<IpPacket, DropReason> {
+fn parse_ipv4(chain: &PacketChain, verify_checksum: bool) -> Result<IpPacket, DropReason> {
     let mut base = [0u8; 20];
     chain
         .copy_out(14, &mut base)
@@ -450,7 +460,9 @@ fn parse_ipv4(chain: &PacketChain) -> Result<IpPacket, DropReason> {
     {
         return Err(DropReason::MalformedIpv4);
     }
-    if checksum_packet(chain, 14, header_len, &[]).map_err(|_| DropReason::MalformedIpv4)? != 0 {
+    if verify_checksum
+        && checksum_packet(chain, 14, header_len, &[]).map_err(|_| DropReason::MalformedIpv4)? != 0
+    {
         return Err(DropReason::Ipv4Checksum);
     }
     let fragment_field = u16::from_be_bytes([base[6], base[7]]);
@@ -628,7 +640,11 @@ fn validate_ipv6_options(
     Ok(())
 }
 
-fn parse_udp(chain: &PacketChain, ip: IpPacket) -> Result<UdpPacket, DropReason> {
+fn parse_udp(
+    chain: &PacketChain,
+    ip: IpPacket,
+    verify_checksum: bool,
+) -> Result<UdpPacket, DropReason> {
     if ip.payload_len < 8 {
         return Err(DropReason::MalformedUdp);
     }
@@ -644,7 +660,7 @@ fn parse_udp(chain: &PacketChain, ip: IpPacket) -> Result<UdpPacket, DropReason>
     if checksum == 0 && matches!(ip.source, IpAddr::V6(_)) {
         return Err(DropReason::UdpChecksum);
     }
-    if checksum != 0 && !verify_udp_checksum(chain, ip, udp_len)? {
+    if verify_checksum && checksum != 0 && !verify_udp_checksum(chain, ip, udp_len)? {
         return Err(DropReason::UdpChecksum);
     }
     Ok(UdpPacket {
@@ -1058,6 +1074,31 @@ mod tests {
         assert_eq!(packet.parsed.tcp.unwrap().sequence, TcpSequence(123));
         assert_eq!(packet.parsed.flow.unwrap().protocol, TransportProtocol::Tcp);
         assert!(packet.parsed.rss_hash.is_some());
+    }
+
+    #[test]
+    fn trusted_local_packet_skips_checksum_verification() {
+        let mut frame = tcp_frame();
+        frame[24] ^= 0xff;
+        frame[50] ^= 0xff;
+        let mut input = PacketBatch::new();
+        assert!(
+            input
+                .push(
+                    PacketChain::from_owned(frame.to_vec()),
+                    PacketMetadata {
+                        checksums_validated: true,
+                        ..PacketMetadata::default()
+                    },
+                )
+                .is_ok()
+        );
+        let mut output = FrontendBatch::new();
+        VectorFrontend::new([1; 40], 1).process(InterfaceId(1), &config(), &mut input, &mut output);
+        assert_eq!(
+            output.packet(0).unwrap().parsed.disposition,
+            FrontendDisposition::Tcp
+        );
     }
 
     #[test]

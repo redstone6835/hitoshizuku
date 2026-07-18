@@ -14,12 +14,12 @@ pub use raw::{
     PreparedRawTx, RawBindError, RawEndpointInfo, RawEndpointTable, RawIngressResult, RawTxError,
     build_header_included_ipv4_fragments, build_raw_packet,
 };
-pub(crate) use tcp::parse_tcp_packet;
 pub use tcp::{
     TCP_MAX_HEADER_LEN, TCP_MIN_HEADER_LEN, TCP_PROTOCOL_NUMBER, TcpFlags, TcpMachineOutput,
     TcpOptions, TcpPacket, TcpSackBlock, TcpSegment, TcpSequence, TcpState, TcpStateMachine,
     TcpTimestamp, TcpTransmit,
 };
+pub(crate) use tcp::{parse_tcp_packet, parse_tcp_packet_trusted};
 pub use tcp_engine::{
     PreparedTcpTx, TcpBindError, TcpEndpointTable, TcpEngineStats, TcpIngressError, TcpPath,
     build_tcp_packet, build_tcp_reset,

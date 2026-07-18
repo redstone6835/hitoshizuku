@@ -429,6 +429,7 @@ pub struct TxPacket {
     pub chain: PacketChain,
     pub completion: CompletionToken,
     pub low_latency: bool,
+    pub checksums_validated: bool,
     pub layout: PacketLayout,
 }
 

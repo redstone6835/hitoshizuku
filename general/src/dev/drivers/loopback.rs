@@ -308,6 +308,7 @@ impl NetQueuePair for LoopbackQueue {
             self.packets[self.packet_tail] = Some(packet.chain);
             self.metadata[self.packet_tail] = Some(PacketMetadata {
                 frame_len: logical_bytes,
+                checksums_validated: packet.checksums_validated,
                 layout: packet.layout,
                 ..PacketMetadata::default()
             });
@@ -380,6 +381,7 @@ mod tests {
             chain: PacketChain::from_lease(lease),
             completion: CompletionToken(7),
             low_latency: false,
+            checksums_validated: true,
             layout: net::buf::PacketLayout::Plain,
         })
         .unwrap_or_else(|_| unreachable!());
@@ -401,6 +403,7 @@ mod tests {
         assert_eq!(polled.packets, 1);
         assert_eq!(polled.bytes, 64);
         assert!(polled.ring_empty);
+        assert!(rx.metadata(0).unwrap().checksums_validated);
 
         let mut completions = CompletionBatch::new();
         let reclaimed = queue.reclaim_tx_batch(&mut completions);
@@ -436,6 +439,7 @@ mod tests {
             chain,
             completion: CompletionToken(8),
             low_latency: false,
+            checksums_validated: true,
             layout: PacketLayout::UdpSegments(layout),
         })
         .unwrap_or_else(|_| unreachable!());

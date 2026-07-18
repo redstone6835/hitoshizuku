@@ -489,6 +489,7 @@ mod tests {
                 chain: PacketChain::from_lease(lease),
                 completion: CompletionToken(7),
                 low_latency: true,
+                checksums_validated: false,
                 layout: crate::buf::PacketLayout::Plain,
             })
             .is_ok()

@@ -145,6 +145,7 @@ pub struct PacketMetadata {
     pub rss_hash: Option<u32>,
     pub rss_generation: u32,
     pub frame_len: u32,
+    pub checksums_validated: bool,
     pub layout: PacketLayout,
     pub drop_reason: DropReason,
 }
@@ -219,6 +220,7 @@ impl Default for PacketMetadata {
             rss_hash: None,
             rss_generation: 0,
             frame_len: 0,
+            checksums_validated: false,
             layout: PacketLayout::Plain,
             drop_reason: DropReason::None,
         }

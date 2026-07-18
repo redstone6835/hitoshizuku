@@ -3290,7 +3290,8 @@ impl ProtocolContext {
         config: &ConfigSnapshot,
         limit: usize,
     ) {
-        let mut batch = Vec::with_capacity(16);
+        let mut first = None;
+        let mut batch = Vec::new();
         let mut batch_target = None;
         for _ in 0..limit {
             let Some(payload) = facade.take_tx() else {
@@ -3305,7 +3306,7 @@ impl ProtocolContext {
             ) {
                 Ok(work) => {
                     if work.unresolved_neighbor.is_some() {
-                        self.flush_udp_batch(batch_target.take(), &mut batch);
+                        self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
                         self.publish_neighbor_work(PendingNeighborTx::Udp(work));
                         continue;
                     }
@@ -3315,36 +3316,62 @@ impl ProtocolContext {
                         .iter()
                         .position(|target| target.interface == work.route.interface)
                     else {
-                        self.flush_udp_batch(batch_target.take(), &mut batch);
+                        self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
                         work.payload
                             .facade()
                             .set_pending_error(SocketError::NetworkUnreachable);
                         continue;
                     };
-                    let compatible = batch
-                        .first()
-                        .is_none_or(|first| udp_batch_compatible(first, &work));
-                    if batch_target.is_some_and(|current| current != target)
-                        || !compatible
-                        || batch.len() == 16
-                    {
-                        self.flush_udp_batch(batch_target.take(), &mut batch);
-                    }
-                    if udp_batch_candidate(&work) {
-                        batch_target = Some(target);
-                        batch.push(work);
-                    } else {
-                        self.flush_udp_batch(batch_target.take(), &mut batch);
+                    if !udp_batch_candidate(&work) {
+                        self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
                         self.dispatch_egress(target, EgressWork::Udp(work));
+                        continue;
+                    }
+                    if let Some(batch_first) = batch.first() {
+                        if batch_target == Some(target)
+                            && batch.len() < 16
+                            && udp_batch_compatible(batch_first, &work)
+                        {
+                            batch.push(work);
+                        } else {
+                            self.flush_udp_batch(batch_target.take(), &mut batch);
+                            first = Some((target, work));
+                        }
+                        continue;
+                    }
+                    if let Some((pending_target, pending)) = first.take() {
+                        if pending_target == target && udp_batch_compatible(&pending, &work) {
+                            batch.reserve_exact(16);
+                            batch_target = Some(target);
+                            batch.push(pending);
+                            batch.push(work);
+                        } else {
+                            self.dispatch_egress(pending_target, EgressWork::Udp(pending));
+                            first = Some((target, work));
+                        }
+                    } else {
+                        first = Some((target, work));
                     }
                 }
                 Err((error, payload)) => {
-                    self.flush_udp_batch(batch_target.take(), &mut batch);
+                    self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
                     payload.facade().set_pending_error(error);
                 }
             }
         }
-        self.flush_udp_batch(batch_target, &mut batch);
+        self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
+    }
+
+    fn flush_udp_accumulator(
+        &mut self,
+        first: &mut Option<(usize, PreparedUdpTx)>,
+        batch_target: &mut Option<usize>,
+        batch: &mut Vec<PreparedUdpTx>,
+    ) {
+        if let Some((target, work)) = first.take() {
+            self.dispatch_egress(target, EgressWork::Udp(work));
+        }
+        self.flush_udp_batch(batch_target.take(), batch);
     }
 
     fn flush_udp_batch(&mut self, target: Option<usize>, batch: &mut Vec<PreparedUdpTx>) {
@@ -5215,18 +5242,25 @@ impl WorkerContext {
             let _ = self.egress.finish_drain();
             return;
         }
-        'classes: for (class, quantum) in [(3, 8usize), (2, 4), (1, 2), (0, 1)] {
-            for _ in 0..quantum {
-                if self.tx_batch.len() >= 32 {
-                    break 'classes;
+        'rounds: while self.tx_batch.len() < 32 {
+            let mut progressed = false;
+            for (class, quantum) in [(3, 8usize), (2, 4), (1, 2), (0, 1)] {
+                for _ in 0..quantum {
+                    if self.tx_batch.len() >= 32 {
+                        break 'rounds;
+                    }
+                    let Some(work) = self.egress.try_pop_class(class) else {
+                        break;
+                    };
+                    progressed = true;
+                    if let Err(work) = self.materialize_egress(work) {
+                        self.retry_egress.push_back(work);
+                        break 'rounds;
+                    }
                 }
-                let Some(work) = self.egress.try_pop_class(class) else {
-                    break;
-                };
-                if let Err(work) = self.materialize_egress(work) {
-                    self.retry_egress.push_back(work);
-                    break 'classes;
-                }
+            }
+            if !progressed {
+                break;
             }
         }
         self.drain_pending_tx_frames();
@@ -5292,6 +5326,7 @@ impl WorkerContext {
                 chain: PacketChain::from_lease(lease),
                 completion: frame.completion,
                 low_latency: false,
+                checksums_validated: false,
                 layout: net::buf::PacketLayout::Plain,
             };
             if let Err(packet) = self.tx_batch.push(packet) {
@@ -5396,6 +5431,7 @@ impl WorkerContext {
                 chain,
                 completion,
                 low_latency: false,
+                checksums_validated: true,
                 layout: net::buf::PacketLayout::Plain,
             },
             Err(_) => {
@@ -5411,7 +5447,7 @@ impl WorkerContext {
 
     fn materialize_udp_batch(
         &mut self,
-        mut work: Vec<PreparedUdpTx>,
+        work: Vec<PreparedUdpTx>,
     ) -> Result<(), Vec<PreparedUdpTx>> {
         let caps = self.queue.as_ref().unwrap().caps();
         if !caps.udp_segmentation
@@ -5429,14 +5465,62 @@ impl WorkerContext {
             IpAddr::V4(_) => 42u16,
             IpAddr::V6(_) => 62u16,
         };
+        let first = &work[0];
+        let route = first.route;
+        let destination = first.destination;
+        let source_port = first.source_port;
+        let source_mac = first.source_mac;
+        let destination_mac = first.destination_mac;
+        let hop_limit = first.hop_limit;
+        let traffic_class = first.traffic_class;
+        let completion = first.completion;
+        let facade = first.payload.facade();
+        let first_fragment = match allocate_payload_chain(
+            self.tx_payload_pool.as_mut().unwrap(),
+            usize::from(payload_len),
+            header_len,
+            1,
+            |offset, output| first.payload.copy_range(offset, output),
+        ) {
+            Ok(mut payload) => payload
+                .take_fragment(0)
+                .expect("单段 UDP payload 必须拥有 fragment"),
+            Err(PayloadChainError::Retry) => return Err(work),
+            Err(PayloadChainError::Socket(error)) => {
+                for item in work {
+                    item.payload.facade().set_pending_error(error);
+                }
+                return Ok(());
+            }
+        };
         let mut first_chain = PacketChain::new();
-        let mut tail = Vec::with_capacity(work.len().saturating_sub(1));
-        for (index, item) in work.iter().enumerate() {
-            let headroom = if index == 0 { header_len } else { 0 };
-            let lease = match allocate_payload_chain(
+        first_chain
+            .push(first_fragment)
+            .unwrap_or_else(|_| unreachable!());
+        let mut chain = match build_udp_packet_with_options(
+            first_chain,
+            route,
+            destination,
+            source_port,
+            source_mac,
+            destination_mac,
+            hop_limit,
+            traffic_class,
+        ) {
+            Ok(chain) => chain,
+            Err(_) => {
+                for item in work {
+                    item.payload.complete();
+                }
+                facade.set_pending_error(SocketError::Buffer);
+                return Ok(());
+            }
+        };
+        for item in work.iter().skip(1) {
+            let fragment = match allocate_payload_chain(
                 self.tx_payload_pool.as_mut().unwrap(),
                 usize::from(payload_len),
-                headroom,
+                0,
                 1,
                 |offset, output| item.payload.copy_range(offset, output),
             ) {
@@ -5451,49 +5535,10 @@ impl WorkerContext {
                     return Ok(());
                 }
             };
-            if index == 0 {
-                first_chain.push(lease).unwrap_or_else(|_| unreachable!());
-            } else {
-                tail.push(lease);
-            }
+            chain.push(fragment).unwrap_or_else(|_| unreachable!());
         }
-
-        let first = work.remove(0);
-        let PreparedUdpTx {
-            payload,
-            route,
-            destination,
-            source_port,
-            source_mac,
-            destination_mac,
-            hop_limit,
-            traffic_class,
-            completion,
-            unresolved_neighbor: _,
-        } = first;
-        let facade = payload.facade();
-        payload.complete();
         for item in work {
             item.payload.complete();
-        }
-        let mut chain = match build_udp_packet_with_options(
-            first_chain,
-            route,
-            destination,
-            source_port,
-            source_mac,
-            destination_mac,
-            hop_limit,
-            traffic_class,
-        ) {
-            Ok(chain) => chain,
-            Err(_) => {
-                facade.set_pending_error(SocketError::Buffer);
-                return Ok(());
-            }
-        };
-        for fragment in tail {
-            chain.push(fragment).unwrap_or_else(|_| unreachable!());
         }
         let layout = net::buf::UdpSegmentation {
             segment_count: chain.fragment_count() as u8,
@@ -5506,6 +5551,7 @@ impl WorkerContext {
                 chain,
                 completion,
                 low_latency: false,
+                checksums_validated: true,
                 layout: net::buf::PacketLayout::UdpSegments(layout),
             })
             .unwrap_or_else(|_| unreachable!());
@@ -5588,6 +5634,7 @@ impl WorkerContext {
                 chain,
                 completion,
                 low_latency: false,
+                checksums_validated: false,
                 layout: net::buf::PacketLayout::Plain,
             },
             Err((error, _)) => {
@@ -5645,6 +5692,7 @@ impl WorkerContext {
             chain,
             completion,
             low_latency,
+            checksums_validated: true,
             layout: net::buf::PacketLayout::Plain,
         };
         self.tx_batch
@@ -5789,6 +5837,7 @@ impl WorkerContext {
                     chain: PacketChain::from_lease(lease),
                     completion: CompletionToken(0x4152_5001),
                     low_latency: true,
+                    checksums_validated: true,
                     layout: net::buf::PacketLayout::Plain,
                 })
                 .is_ok()

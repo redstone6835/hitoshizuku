@@ -475,6 +475,7 @@ impl FlowShard {
             chain: packet,
             completion,
             low_latency: false,
+            checksums_validated: true,
             layout: crate::buf::PacketLayout::Plain,
         })
     }
@@ -573,6 +574,7 @@ impl FlowShard {
                                             chain,
                                             completion: CompletionToken(self.next_completion),
                                             low_latency: true,
+                                            checksums_validated: true,
                                             layout: crate::buf::PacketLayout::Plain,
                                         };
                                         self.next_completion =
@@ -608,6 +610,7 @@ impl FlowShard {
                                 chain,
                                 completion: CompletionToken(self.next_completion),
                                 low_latency: true,
+                                checksums_validated: true,
                                 layout: crate::buf::PacketLayout::Plain,
                             };
                             self.next_completion = self.next_completion.wrapping_add(1).max(1);
@@ -680,6 +683,7 @@ impl FlowShard {
                                 chain,
                                 completion,
                                 low_latency: true,
+                                checksums_validated: true,
                                 layout: crate::buf::PacketLayout::Plain,
                             };
                             match tx.push(packet) {

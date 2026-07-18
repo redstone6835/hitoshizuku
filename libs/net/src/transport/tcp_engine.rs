@@ -312,6 +312,8 @@ struct TcpFlow {
     accept_group: Option<Arc<ListenGroup>>,
     accept_reserved: bool,
     retransmit: VecDeque<SentSegment>,
+    unacknowledged_segments: u32,
+    retransmitted_segments: u32,
     flight_bytes: u32,
     reassembly: Vec<ReassemblyFragment>,
     reassembly_bytes: usize,
@@ -475,6 +477,8 @@ impl TcpEndpointTable {
             accept_group: None,
             accept_reserved: false,
             retransmit: VecDeque::new(),
+            unacknowledged_segments: 0,
+            retransmitted_segments: 0,
             flight_bytes: 0,
             reassembly: Vec::new(),
             reassembly_bytes: 0,
@@ -570,6 +574,7 @@ impl TcpEndpointTable {
 
     pub fn drain_send(&mut self, id: FlowId, now_ns: u64) -> bool {
         let mut queued = false;
+        let mut queued_bytes = 0usize;
         let window_update = self.flows.get_mut(id).is_some_and(|flow| {
             if flow.facade.tcp_keepalive_enabled()
                 && matches!(
@@ -649,9 +654,10 @@ impl TcpEndpointTable {
             if allowance == 0 {
                 break;
             }
-            let Some(payload) = flow.facade.take_stream_tx(allowance as usize) else {
+            let Some(payload) = flow.facade.take_stream_tx_deferred(allowance as usize) else {
                 break;
             };
+            queued_bytes = queued_bytes.saturating_add(usize::from(payload.len));
             unsent_hint = Some(unsent.saturating_sub(usize::from(payload.len)));
             let Some(sequence) = flow.machine.reserve_send(u32::from(payload.len)) else {
                 break;
@@ -668,6 +674,12 @@ impl TcpEndpointTable {
                 flow.deadlines.cork = None;
             }
             queued = true;
+        }
+        if queued_bytes != 0
+            && let Some(flow) = self.flows.get(id)
+        {
+            flow.facade.finish_stream_tx_batch(queued_bytes);
+            publish_tcp_info(flow);
         }
         queued
     }
@@ -976,6 +988,8 @@ impl TcpEndpointTable {
             accept_group: Some(Arc::clone(&group)),
             accept_reserved: false,
             retransmit: VecDeque::new(),
+            unacknowledged_segments: 0,
+            retransmitted_segments: 0,
             flight_bytes: 0,
             reassembly: Vec::new(),
             reassembly_bytes: 0,
@@ -1317,6 +1331,10 @@ impl TcpEndpointTable {
             }
             let segment = flow.retransmit.pop_front().unwrap();
             if !segment.sacked {
+                flow.unacknowledged_segments = flow.unacknowledged_segments.saturating_sub(1);
+                if segment.transmissions > 1 {
+                    flow.retransmitted_segments = flow.retransmitted_segments.saturating_sub(1);
+                }
                 flow.flight_bytes = flow
                     .flight_bytes
                     .saturating_sub(segment.end.distance_from(segment.sequence));
@@ -1396,6 +1414,9 @@ impl TcpEndpointTable {
             window: advertised_window(&flow.facade, flow.local_window_scale),
         };
         segment.sent_ns = now_ns;
+        if segment.transmissions == 1 {
+            flow.retransmitted_segments = flow.retransmitted_segments.saturating_add(1);
+        }
         segment.transmissions = segment.transmissions.saturating_add(1);
         if !fast {
             flow.rtt.backoff();
@@ -1554,6 +1575,7 @@ impl TcpEndpointTable {
                 transmissions: 1,
                 sacked: false,
             });
+            flow.unacknowledged_segments = flow.unacknowledged_segments.saturating_add(1);
             flow.flight_bytes = flow.flight_bytes.saturating_add(sequence_len);
             flow.deadlines
                 .retransmit
@@ -1584,7 +1606,9 @@ impl TcpEndpointTable {
             completion,
             low_latency,
         });
-        publish_tcp_info(flow);
+        if low_latency {
+            publish_tcp_info(flow);
+        }
     }
 
     fn find_listener_key(
@@ -1719,6 +1743,8 @@ fn ack_for(flow: &TcpFlow) -> TcpTransmit {
 
 fn apply_sack(flow: &mut TcpFlow, blocks: &[Option<TcpSackBlock>; 4]) {
     let mut newly_sacked = 0u32;
+    let mut newly_sacked_segments = 0u32;
+    let mut newly_sacked_retransmitted = 0u32;
     for block in blocks.iter().flatten() {
         for segment in &mut flow.retransmit {
             if segment.sequence.after_or_equal(block.left)
@@ -1726,12 +1752,22 @@ fn apply_sack(flow: &mut TcpFlow, blocks: &[Option<TcpSackBlock>; 4]) {
                 && !segment.sacked
             {
                 segment.sacked = true;
+                newly_sacked_segments = newly_sacked_segments.saturating_add(1);
+                if segment.transmissions > 1 {
+                    newly_sacked_retransmitted = newly_sacked_retransmitted.saturating_add(1);
+                }
                 newly_sacked =
                     newly_sacked.saturating_add(segment.end.distance_from(segment.sequence));
             }
         }
     }
     flow.flight_bytes = flow.flight_bytes.saturating_sub(newly_sacked);
+    flow.unacknowledged_segments = flow
+        .unacknowledged_segments
+        .saturating_sub(newly_sacked_segments);
+    flow.retransmitted_segments = flow
+        .retransmitted_segments
+        .saturating_sub(newly_sacked_retransmitted);
 }
 
 fn wire_options(flow: &TcpFlow, flags: TcpFlags, now_ns: u64) -> ([u8; 40], u8) {
@@ -1824,18 +1860,20 @@ fn linux_tcp_state(state: TcpState) -> u8 {
 }
 
 fn publish_tcp_info(flow: &TcpFlow) {
-    let unacknowledged = flow
-        .retransmit
-        .iter()
-        .filter(|segment| !segment.sacked)
-        .count()
-        .min(u32::MAX as usize) as u32;
-    let retransmitted = flow
-        .retransmit
-        .iter()
-        .filter(|segment| segment.transmissions > 1 && !segment.sacked)
-        .count()
-        .min(u32::MAX as usize) as u32;
+    debug_assert_eq!(
+        flow.unacknowledged_segments,
+        flow.retransmit
+            .iter()
+            .filter(|segment| !segment.sacked)
+            .count() as u32
+    );
+    debug_assert_eq!(
+        flow.retransmitted_segments,
+        flow.retransmit
+            .iter()
+            .filter(|segment| segment.transmissions > 1 && !segment.sacked)
+            .count() as u32
+    );
     flow.facade.update_tcp_info(
         linux_tcp_state(flow.machine.state()),
         to_micros(flow.rtt.rto_ns),
@@ -1844,8 +1882,8 @@ fn publish_tcp_info(flow: &TcpFlow) {
         u32::from(flow.peer_mss),
         flow.congestion.cwnd,
         flow.congestion.ssthresh,
-        unacknowledged,
-        retransmitted,
+        flow.unacknowledged_segments,
+        flow.retransmitted_segments,
     );
 }
 
@@ -2502,6 +2540,7 @@ mod tests {
         let data = table.take_output().unwrap();
         assert_eq!(data.payload.as_ref().unwrap().len, 11);
         assert_eq!(table.flows.get(flow).unwrap().flight_size(), 11);
+        assert_eq!(facade.tcp_info().unacknowledged, 1);
         table
             .process_segment(
                 flow,
@@ -2519,6 +2558,7 @@ mod tests {
             .unwrap();
         assert_eq!(facade.test_stream_tx_len(), 0);
         assert_eq!(table.flows.get(flow).unwrap().flight_size(), 0);
+        assert_eq!(facade.tcp_info().unacknowledged, 0);
 
         table
             .process_segment(
