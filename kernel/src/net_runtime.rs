@@ -990,6 +990,7 @@ struct EgressChannel {
     pending: CacheLine<AtomicBool>,
     lifecycle: CacheLine<EgressLifecycle>,
     task: Spinlock<Option<Arc<sched::Task>>>,
+    inline_consumer: AtomicBool,
     stats: Arc<QueueRuntimeStats>,
 }
 
@@ -1009,6 +1010,7 @@ impl EgressChannel {
                 pushers: AtomicUsize::new(0),
             }),
             task: Spinlock::new(None),
+            inline_consumer: AtomicBool::new(false),
             stats,
         }
     }
@@ -1017,7 +1019,17 @@ impl EgressChannel {
         *self.task.lock() = Some(task);
     }
 
+    fn set_inline_consumer(&self) {
+        self.inline_consumer.store(true, Ordering::Release);
+    }
+
     fn try_push(&self, work: EgressWork) -> Result<(), EgressWork> {
+        self.try_push_deferred(work)?;
+        self.publish();
+        Ok(())
+    }
+
+    fn try_push_deferred(&self, work: EgressWork) -> Result<(), EgressWork> {
         if !self.lifecycle.0.active.load(Ordering::Acquire) {
             return Err(work);
         }
@@ -1029,13 +1041,18 @@ impl EgressChannel {
         let class = work.priority_class();
         let result = self.rings[class].try_push(work);
         self.lifecycle.0.pushers.fetch_sub(1, Ordering::Release);
-        result?;
+        result
+    }
+
+    fn publish(&self) {
         if !self.pending.0.swap(true, Ordering::AcqRel) {
+            if self.inline_consumer.load(Ordering::Acquire) {
+                return;
+            }
             if let Some(task) = self.task.lock().as_ref().cloned() {
                 let _ = sched::activate_task(&task);
             }
         }
-        Ok(())
     }
 
     fn push_wait(&self, mut work: EgressWork) -> Result<(), EgressWork> {
@@ -1179,11 +1196,19 @@ impl ProtocolRuntime {
     }
 
     fn try_push(&self, work: IngressWork) -> Result<(), IngressWork> {
-        self.ingress.try_push(work)?;
+        self.try_push_deferred(work)?;
+        self.publish_ingress();
+        Ok(())
+    }
+
+    fn try_push_deferred(&self, work: IngressWork) -> Result<(), IngressWork> {
+        self.ingress.try_push(work)
+    }
+
+    fn publish_ingress(&self) {
         if !self.pending.swap(true, Ordering::AcqRel) {
             self.wake_owner();
         }
-        Ok(())
     }
 
     fn finish_drain(&self) -> bool {
@@ -2096,6 +2121,7 @@ struct WorkerContext {
     physical_udp_probe_queued: bool,
     control: Arc<WorkerControl>,
     stats: Arc<QueueRuntimeStats>,
+    inline_protocol: bool,
 }
 
 struct ProtocolContext {
@@ -2118,6 +2144,14 @@ struct ProtocolContext {
     physical_udp_probe_flow: Option<FlowId>,
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
     physical_udp_probe_sender: Option<FlowId>,
+    local_queue: Option<Box<WorkerContext>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerTurn {
+    Idle,
+    Pending,
+    Removed,
 }
 
 /// 调度器初始化完成后，为启动期接管的每个 queue 创建固定 affinity worker。
@@ -2245,6 +2279,7 @@ pub fn start_workers() {
                 physical_udp_probe_flow: None,
                 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
                 physical_udp_probe_sender: None,
+                local_queue: None,
             })));
             slot
         };
@@ -2258,7 +2293,7 @@ pub fn start_workers() {
         );
         task.set_cpu_affinity(online);
         runtime.set_owner_task(Arc::clone(&task));
-        protocol_tasks.push((task, runtime.cpu));
+        protocol_tasks.push((task, runtime.cpu, slot));
     }
 
     let mut queue_tasks = Vec::new();
@@ -2307,7 +2342,35 @@ pub fn start_workers() {
             physical_udp_probe_queued: false,
             control: pending.control,
             stats: pending.stats,
+            inline_protocol: false,
         };
+        let attach_local = active_cpus.len() == 1
+            && context
+                .queue
+                .as_ref()
+                .unwrap()
+                .tx_produces_rx_synchronously()
+            && PROTOCOL_STARTS.lock()[protocol_tasks[0].2]
+                .as_ref()
+                .is_some_and(|protocol| protocol.local_queue.is_none());
+        if attach_local {
+            let mut context = context;
+            context.inline_protocol = true;
+            let task = Arc::clone(&protocol_tasks[0].0);
+            let mut starts = PROTOCOL_STARTS.lock();
+            let protocol = starts[protocol_tasks[0].2]
+                .as_mut()
+                .expect("协议 worker 启动上下文不存在");
+            protocol.local_queue = Some(Box::new(context));
+            control.tasks.lock().push(Arc::clone(&task));
+            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+            WORKER_TASKS.lock().push(Arc::clone(&task));
+            egress.set_task(Arc::clone(&task));
+            egress.set_inline_consumer();
+            irq.set_waker(Arc::new(TaskWake { task }))
+                .unwrap_or_else(|error| panic!("NetWorker waker 安装失败: {:?}", error));
+            continue;
+        }
         let slot = {
             let mut starts = WORKER_STARTS.lock();
             let slot = starts.len();
@@ -2336,7 +2399,7 @@ pub fn start_workers() {
     *PROTOCOL_CLUSTER.lock() = Some(cluster);
     net::install_socket_runtime(&SOCKET_RUNTIME_ADAPTER)
         .unwrap_or_else(|_| panic!("socket runtime 重复安装"));
-    for (task, cpu) in protocol_tasks {
+    for (task, cpu, _) in protocol_tasks {
         sched::activate_task_with_cpu_hint(&task, cpu)
             .unwrap_or_else(|error| panic!("协议 worker 启动失败: {:?}", error));
     }
@@ -2369,10 +2432,12 @@ impl ProtocolContext {
         loop {
             #[cfg(feature = "performance-profile")]
             let profile_turn = profiling::scope(profiling::Event::NetProtocolTurn);
+            self.pump_local_queue();
             let config = self.config.snapshot();
-            let lifecycle = self.drain_lifecycle(256);
+            let lifecycle = self.drain_lifecycle(256, &config);
             let control = self.drain_control(256, &config);
             let dirty = self.drain_socket_tx(256, &config);
+            self.pump_local_queue();
             let mut processed = 0usize;
             while processed < 128 {
                 let count = self.drain_ingress();
@@ -2381,6 +2446,7 @@ impl ProtocolContext {
                 }
                 processed += count;
                 self.process_pending(count, &config);
+                self.pump_local_queue();
             }
             self.runtime.timer_fired.store(false, Ordering::Release);
             let now_ns = sched::now_ns_public();
@@ -2389,6 +2455,7 @@ impl ProtocolContext {
             let dad_deadline = self.run_dad(now_ns);
             let dhcp_deadline = self.run_dhcp(now_ns);
             self.dispatch_tcp_output();
+            self.pump_local_queue();
             self.runtime.arm_timer(
                 [
                     self.protocol.next_timer_deadline_ns(),
@@ -2405,7 +2472,8 @@ impl ProtocolContext {
                 || control == 256
                 || dirty == 256
                 || self.protocol.has_blocked_tcp_output()
-                || self.runtime.finish_drain();
+                || self.runtime.finish_drain()
+                || self.local_queue_pending();
             #[cfg(feature = "performance-profile")]
             drop(profile_turn);
             if keep_running {
@@ -2414,6 +2482,27 @@ impl ProtocolContext {
             }
             self.sleep_until_ingress();
         }
+    }
+
+    fn pump_local_queue(&mut self) {
+        let Some(mut queue) = self.local_queue.take() else {
+            return;
+        };
+        if !queue.control.remove_requested.load(Ordering::Acquire) && !queue.has_pending_work() {
+            self.local_queue = Some(queue);
+            return;
+        }
+        if queue.run_turn() == WorkerTurn::Removed {
+            queue.finish_removal();
+        } else {
+            self.local_queue = Some(queue);
+        }
+    }
+
+    fn local_queue_pending(&mut self) -> bool {
+        self.local_queue
+            .as_mut()
+            .is_some_and(|queue| queue.has_pending_work())
     }
 
     fn drain_control(&mut self, budget: usize, config: &ConfigSnapshot) -> usize {
@@ -3089,7 +3178,9 @@ impl ProtocolContext {
                     generation,
                 } if shard == self.runtime.id && generation == facade.generation() => flow,
                 _ => {
-                    facade.set_pending_error(SocketError::Closed);
+                    if !facade.is_closing() {
+                        facade.set_pending_error(SocketError::Closed);
+                    }
                     facade.finish_tx_drain();
                     continue;
                 }
@@ -3175,6 +3266,47 @@ impl ProtocolContext {
             }
         }
         processed
+    }
+
+    /// close 必须排在已经被 sendto 接受的数据之后。UDP TX 与 lifecycle 使用不同
+    /// 的 MPSC 队列，不能依赖两条队列之间的观察顺序，因此在解绑 flow 前直接
+    /// 排空该 socket 的 TX ring。
+    fn drain_udp_before_close(
+        &mut self,
+        facade: &Arc<SocketFacade>,
+        flow: FlowId,
+        config: &ConfigSnapshot,
+    ) {
+        while let Some(payload) = facade.take_tx() {
+            match self.protocol.prepare_udp_tx(
+                flow,
+                payload,
+                facade.socket_mark(),
+                config,
+                sched::now_ns_public(),
+            ) {
+                Ok(work) => {
+                    if work.unresolved_neighbor.is_some() {
+                        self.publish_neighbor_work(PendingNeighborTx::Udp(work));
+                        continue;
+                    }
+                    let Some(target) = self
+                        .runtime
+                        .egress
+                        .iter()
+                        .position(|target| target.interface == work.route.interface)
+                    else {
+                        work.payload
+                            .facade()
+                            .set_pending_error(SocketError::NetworkUnreachable);
+                        continue;
+                    };
+                    self.dispatch_egress(target, EgressWork::Udp(work));
+                }
+                Err((error, payload)) => payload.facade().set_pending_error(error),
+            }
+        }
+        facade.finish_tx_drain();
     }
 
     fn publish_neighbor_work(&self, work: PendingNeighborTx) {
@@ -3920,7 +4052,7 @@ impl ProtocolContext {
         }
     }
 
-    fn drain_lifecycle(&mut self, budget: usize) -> usize {
+    fn drain_lifecycle(&mut self, budget: usize, config: &ConfigSnapshot) -> usize {
         let mut processed = 0;
         while processed < budget {
             let Some(facade) = self.runtime.lifecycle.try_pop() else {
@@ -3953,6 +4085,7 @@ impl ProtocolContext {
                 {
                     match facade.kind() {
                         SocketKind::Datagram => {
+                            self.drain_udp_before_close(&facade, flow, config);
                             self.protocol.close_udp(flow);
                             self.control_plane.release_binding(facade.id());
                         }
@@ -4330,9 +4463,34 @@ impl ProtocolContext {
         }
     }
 
-    fn dispatch_egress(&self, target: usize, work: EgressWork) {
-        if let Err(work) = self.runtime.egress[target].push_wait(work) {
-            fail_egress_work(work, SocketError::NetworkUnreachable);
+    fn dispatch_egress(&mut self, target: usize, mut work: EgressWork) {
+        let local = self
+            .local_queue
+            .as_ref()
+            .is_some_and(|queue| queue.egress_index == target);
+        if !local {
+            if let Err(work) = self.runtime.egress[target].push_wait(work) {
+                fail_egress_work(work, SocketError::NetworkUnreachable);
+            }
+            return;
+        }
+
+        let egress = Arc::clone(&self.runtime.egress[target]);
+        loop {
+            match egress.try_push_deferred(work) {
+                Ok(()) => {
+                    egress.pending.0.store(true, Ordering::Release);
+                    return;
+                }
+                Err(pending) => {
+                    work = pending;
+                    self.pump_local_queue();
+                    if self.local_queue.is_none() {
+                        fail_egress_work(work, SocketError::NetworkUnreachable);
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -4489,7 +4647,7 @@ impl ProtocolContext {
         }
     }
 
-    fn sleep_until_ingress(&self) {
+    fn sleep_until_ingress(&mut self) {
         let task = sched::current_task();
         if !task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
             return;
@@ -4499,6 +4657,7 @@ impl ProtocolContext {
             || !self.runtime.control.is_empty()
             || !self.runtime.dirty.is_empty()
             || !self.runtime.lifecycle.is_empty()
+            || self.local_queue_pending()
         {
             self.runtime.pending.store(true, Ordering::Release);
             let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running);
@@ -4787,103 +4946,115 @@ fn map_tcp_bind_error(error: net::transport::TcpBindError) -> SocketError {
 impl WorkerContext {
     fn run(&mut self) -> ! {
         loop {
-            #[cfg(feature = "performance-profile")]
-            let profile_turn = profiling::scope(profiling::Event::NetWorkerTurn);
-            if self.control.remove_requested.load(Ordering::Acquire) {
-                self.shutdown();
-            }
-            self.rx_pool.as_mut().unwrap().drain_remote();
-            self.tx_header_pool.as_mut().unwrap().drain_remote();
-            self.tx_payload_pool.as_mut().unwrap().drain_remote();
-            self.refill_rx();
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            self.prepare_arp_probe();
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            self.prepare_udp_probe();
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            self.prepare_physical_udp_probe();
-            self.drain_egress();
-            self.reclaim_tx();
-            let turn_start = sched::now_ns_public();
-            let mut packet_budget = 128u16;
-            let mut byte_budget = 256 * 1024u32;
-            while packet_budget != 0
-                && byte_budget != 0
-                && sched::now_ns_public().saturating_sub(turn_start) < 200_000
-            {
-                let result = self.poll_rx_once(RxBudget {
-                    packets: packet_budget.min(32),
-                    bytes: byte_budget,
-                });
-                packet_budget = packet_budget.saturating_sub(result.packets);
-                byte_budget = byte_budget.saturating_sub(result.bytes);
-                if result.fatal.is_some() || result.ring_empty || result.packets == 0 {
-                    break;
+            match self.run_turn() {
+                WorkerTurn::Removed => {
+                    self.finish_removal();
+                    sched::kthread_finish(sched::ExitCode(0));
                 }
+                WorkerTurn::Pending => {
+                    let _ = sched::operation::sched_yield();
+                }
+                WorkerTurn::Idle => self.sleep_until_queue_event(),
             }
-            if packet_budget == 0 {
-                self.stats.budget_packet.fetch_add(1, Ordering::Relaxed);
-            }
-            if byte_budget == 0 {
-                self.stats.budget_byte.fetch_add(1, Ordering::Relaxed);
-            }
-            if sched::now_ns_public().saturating_sub(turn_start) >= 200_000 {
-                self.stats.budget_time.fetch_add(1, Ordering::Relaxed);
-            }
-            self.drain_egress();
-            let submitted = self.submit_tx();
-            if submitted && self.queue.as_ref().unwrap().tx_produces_rx_synchronously() {
-                // loopback 的 RX 在 TX 返回时已经可见。
-                self.reclaim_tx();
-                self.poll_rx_once(RxBudget {
-                    packets: 32,
-                    bytes: 256 * 1024,
-                });
-            }
-            self.rx_pool.as_mut().unwrap().drain_remote();
-            self.tx_header_pool.as_mut().unwrap().drain_remote();
-            self.tx_payload_pool.as_mut().unwrap().drain_remote();
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            if ARP_TX_COMPLETED.load(Ordering::Acquire)
-                && self.tx_payload_pool.as_ref().unwrap().pool().outstanding() == 0
-                && self.tx_payload_pool.as_ref().unwrap().available()
-                    == self.tx_payload_pool.as_ref().unwrap().pool().capacity()
-            {
-                ARP_POOL_CONSERVED.store(true, Ordering::Release);
-            }
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            if self.arp_probe_enabled
-                && PHYSICAL_UDP_TX_SUBMITTED.load(Ordering::Acquire)
-                && self.tx_payload_pool.as_ref().unwrap().pool().outstanding() == 0
-                && self.tx_payload_pool.as_ref().unwrap().available()
-                    == self.tx_payload_pool.as_ref().unwrap().pool().capacity()
-            {
-                PHYSICAL_UDP_POOL_CONSERVED.store(true, Ordering::Release);
-            }
-            let pool_stats = self.rx_pool.as_ref().unwrap().pool().stats();
-            self.stats
-                .pool_local_recycle
-                .store(pool_stats.local_recycle, Ordering::Relaxed);
-            self.stats
-                .pool_remote_recycle
-                .store(pool_stats.remote_recycle, Ordering::Relaxed);
-            self.refill_rx();
-
-            let queue_pending = self.queue.as_mut().unwrap().has_pending_work();
-            #[cfg(feature = "performance-profile")]
-            drop(profile_turn);
-            if queue_pending
-                || self.egress.has_pending()
-                || !self.tx_batch.is_empty()
-                || !self.retry_egress.is_empty()
-                || !self.pending_tx_frames.is_empty()
-                || self.has_test_work()
-            {
-                let _ = sched::operation::sched_yield();
-                continue;
-            }
-            self.sleep_until_queue_event();
         }
+    }
+
+    fn run_turn(&mut self) -> WorkerTurn {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::NetWorkerTurn);
+        if self.control.remove_requested.load(Ordering::Acquire) {
+            return WorkerTurn::Removed;
+        }
+        self.rx_pool.as_mut().unwrap().drain_remote();
+        self.tx_header_pool.as_mut().unwrap().drain_remote();
+        self.tx_payload_pool.as_mut().unwrap().drain_remote();
+        self.refill_rx();
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        self.prepare_arp_probe();
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        self.prepare_udp_probe();
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        self.prepare_physical_udp_probe();
+        self.drain_egress();
+        self.reclaim_tx();
+        let turn_start = sched::now_ns_public();
+        let mut packet_budget = 128u16;
+        let mut byte_budget = 256 * 1024u32;
+        while packet_budget != 0
+            && byte_budget != 0
+            && sched::now_ns_public().saturating_sub(turn_start) < 200_000
+        {
+            let result = self.poll_rx_once(RxBudget {
+                packets: packet_budget.min(32),
+                bytes: byte_budget,
+            });
+            packet_budget = packet_budget.saturating_sub(result.packets);
+            byte_budget = byte_budget.saturating_sub(result.bytes);
+            if result.fatal.is_some() || result.ring_empty || result.packets == 0 {
+                break;
+            }
+        }
+        if packet_budget == 0 {
+            self.stats.budget_packet.fetch_add(1, Ordering::Relaxed);
+        }
+        if byte_budget == 0 {
+            self.stats.budget_byte.fetch_add(1, Ordering::Relaxed);
+        }
+        if sched::now_ns_public().saturating_sub(turn_start) >= 200_000 {
+            self.stats.budget_time.fetch_add(1, Ordering::Relaxed);
+        }
+        self.drain_egress();
+        let submitted = self.submit_tx();
+        if submitted && self.queue.as_ref().unwrap().tx_produces_rx_synchronously() {
+            self.reclaim_tx();
+            self.poll_rx_once(RxBudget {
+                packets: 32,
+                bytes: 256 * 1024,
+            });
+        }
+        self.rx_pool.as_mut().unwrap().drain_remote();
+        self.tx_header_pool.as_mut().unwrap().drain_remote();
+        self.tx_payload_pool.as_mut().unwrap().drain_remote();
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        if ARP_TX_COMPLETED.load(Ordering::Acquire)
+            && self.tx_payload_pool.as_ref().unwrap().pool().outstanding() == 0
+            && self.tx_payload_pool.as_ref().unwrap().available()
+                == self.tx_payload_pool.as_ref().unwrap().pool().capacity()
+        {
+            ARP_POOL_CONSERVED.store(true, Ordering::Release);
+        }
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        if self.arp_probe_enabled
+            && PHYSICAL_UDP_TX_SUBMITTED.load(Ordering::Acquire)
+            && self.tx_payload_pool.as_ref().unwrap().pool().outstanding() == 0
+            && self.tx_payload_pool.as_ref().unwrap().available()
+                == self.tx_payload_pool.as_ref().unwrap().pool().capacity()
+        {
+            PHYSICAL_UDP_POOL_CONSERVED.store(true, Ordering::Release);
+        }
+        let pool_stats = self.rx_pool.as_ref().unwrap().pool().stats();
+        self.stats
+            .pool_local_recycle
+            .store(pool_stats.local_recycle, Ordering::Relaxed);
+        self.stats
+            .pool_remote_recycle
+            .store(pool_stats.remote_recycle, Ordering::Relaxed);
+        self.refill_rx();
+
+        if self.has_pending_work() {
+            WorkerTurn::Pending
+        } else {
+            WorkerTurn::Idle
+        }
+    }
+
+    fn has_pending_work(&mut self) -> bool {
+        self.queue.as_mut().unwrap().has_pending_work()
+            || self.egress.has_pending()
+            || !self.tx_batch.is_empty()
+            || !self.retry_egress.is_empty()
+            || !self.pending_tx_frames.is_empty()
+            || self.has_test_work()
     }
 
     fn enqueue_rx_batch(&mut self) {
@@ -4895,6 +5066,7 @@ impl WorkerContext {
             &mut self.frontend_batch,
         );
         let len = self.frontend_batch.len();
+        let mut published = [false; sched::NR_CPUS];
         for index in 0..len {
             let Some(packet) = self.frontend_batch.take(index) else {
                 continue;
@@ -4928,7 +5100,7 @@ impl WorkerContext {
                 local_mac: self.local_mac,
                 packet,
             });
-            if let Err(IngressWork::Packet(packet)) = target.try_push(work) {
+            if let Err(IngressWork::Packet(packet)) = target.try_push_deferred(work) {
                 self.stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
                 self.stats.drop_reasons[DropReason::IngressRingFull.index()]
                     .fetch_add(1, Ordering::Relaxed);
@@ -4937,6 +5109,18 @@ impl WorkerContext {
                     packet.packet.metadata,
                     DropReason::IngressRingFull,
                 );
+            } else {
+                published[usize::from(target.id.0)] = true;
+            }
+        }
+        for (index, published) in published.into_iter().enumerate() {
+            if published {
+                let target = &self.protocol_cluster.shards[index];
+                if self.inline_protocol {
+                    target.pending.store(true, Ordering::Release);
+                } else {
+                    target.publish_ingress();
+                }
             }
         }
     }
@@ -5564,7 +5748,7 @@ impl WorkerContext {
     }
 
     /// detach 前停止 IRQ、排空可观察 completion，并在释放 queue 前回收所有 batch lease。
-    fn shutdown(&mut self) -> ! {
+    fn finish_removal(&mut self) {
         let _ = self.irq.ack_and_mask();
         self.egress.deactivate();
         while let Some(frame) = self.pending_tx_frames.pop_front() {
@@ -5624,7 +5808,6 @@ impl WorkerContext {
         if completed >= self.control.worker_count.load(Ordering::Acquire) {
             self.control.done.store(true, Ordering::Release);
         }
-        sched::kthread_finish(sched::ExitCode(0));
     }
 
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]

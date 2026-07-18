@@ -498,6 +498,34 @@ fn udp_socket_facade_loopback_roundtrip() {
 }
 
 #[ktest]
+fn udp_send_then_close_preserves_accepted_datagram() {
+    let receiver = net::new_socket_facade(net::AddressFamily::Ipv4).expect("创建 UDP receiver");
+    let local = net::Endpoint {
+        addr: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
+        port: 19_004,
+    };
+    receiver
+        .bind(local, None, net::control::BindOptions::default())
+        .expect("绑定 UDP receiver");
+    let sender = net::new_socket_facade(net::AddressFamily::Ipv4).expect("创建 UDP sender");
+    sender
+        .connect(local, None, net::control::BindOptions::default())
+        .expect("连接 UDP receiver");
+
+    assert_eq!(sender.send(b"last", None, false, None), Ok(4));
+    sender.close();
+
+    let deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let mut payload = [0u8; 4];
+    let received = receiver
+        .recv(&mut payload, false, false, false, Some(deadline))
+        .expect("close 后仍应收到已被 send 接受的 UDP datagram");
+    assert_eq!(received.len, payload.len());
+    assert_eq!(payload, *b"last");
+    receiver.close();
+}
+
+#[ktest]
 fn virtio_user_network_arp_roundtrip() {
     net_runtime::request_arp_probe();
     let deadline = sched::now_ns_public().saturating_add(3_000_000_000);
