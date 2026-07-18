@@ -259,6 +259,15 @@ fn kheap_full_cache_keeps_latest_freed_range_hot() {
 /// 外部维护 API 应能主动释放 kheap 缓存页，并保持 registry 账本不变。
 #[ktest]
 fn allocator_reclaim_releases_kheap_cached_ranges() {
+    KERNEL_ALLOCATOR
+        .reclaim(
+            AllocatorReclaimRequest::caches()
+                .without_slab_cache_flush()
+                .without_slab_empty_reclaim()
+                .without_physical_deferred_reclaim(),
+        )
+        .expect("quiesce kheap cache before reclaim test");
+
     let before = KERNEL_ALLOCATOR.audit();
     assert!(before.is_consistent());
 

@@ -16,8 +16,24 @@ use core::arch::naked_asm;
 
 use crate::*;
 
+/// 为当前 hart 安装统一 trap 入口、开放 vDSO 所需的用户态 `rdtime`，并清空
+/// `sscratch` 的临时锚点。
+///
+/// 这是 per-hart 初始化：boot hart 和每个 secondary hart 在进入调度器前都必须
+/// 调用。把 `scounteren.TIME` 放在这里可避免只初始化 boot hart；任何能够处理
+/// trap 并返回 U-mode 的 hart 都会同时具备 vDSO 时间快路径所需的 CSR 权限。
+///
+/// # Safety
+///
+/// - 必须在 S-mode 下为当前 hart 调用；
+/// - 调用期间不能发生依赖旧 `stvec`/`sscratch` 状态的 trap；
+/// - `__riscv_exception_entry` 的映射必须在后续运行期间保持有效；
+/// - 返回用户态前，调用方必须按 trap-anchor 约定重新发布当前 hart 的 `sscratch`。
 pub unsafe fn install_exception_entry() {
     let entry = __riscv_exception_entry as *const () as usize;
+    // vDSO 的 clock_gettime/gettimeofday 会在 U-mode 直接执行 rdtime。
+    // scounteren 是 per-hart CSR，必须由每个即将运行用户任务的 hart 设置。
+    crate::set_csr!(scounteren, SCOUNTEREN_TIME);
     unsafe {
         core::arch::asm!(
             "csrw {stvec}, {entry}",
@@ -38,49 +54,95 @@ pub unsafe fn install_exception_entry() {
 #[unsafe(link_section = ".text.trap.eentry")]
 pub unsafe extern "C" fn __riscv_exception_entry() {
     naked_asm!(
+        // sscratch 正常为 0（普通 S-mode）或当前 hart 的 TrapAnchor（这里直接使用
+        // HartLocal 指针）。非零时先在 anchor 暂存原始 t5，再以硬件 SPP 判源。
         "csrrw t6, {sscratch}, t6",
-        "bnez t6, 2f",
+        "beqz t6, 20f",
+        "sd t5, {entry_t5_off}(t6)",
+        "csrr t5, {sstatus}",
+        "andi t5, t5, {spp}",
+        "bnez t5, 21f",
 
-        // from_kernel: sscratch=0 是 S-mode 运行不变量；csrrw 后 sscratch
-        // 临时保存原始 t6，t5 尚未被破坏，可以直接写入 TrapFrame。
-        "3:",
+        // from_user：真正的 TrapFrame 位于 top-2*FRAME_SIZE，上方完整预留一帧
+        // 给最终 return-to-user 窗口可能发生的嵌套 S-mode fault。
+        "ld t5, {kernel_stack_top_off}(t6)",
+        "addi t5, t5, -{user_frame_span}",
+        "sd sp, {sp_off}(t5)",
+        "sd tp, {tp_off}(t5)",
+        "sd gp, {gp_off}(t5)",
+        "sd t4, {t4_off}(t5)",
+        "ld t4, {entry_t5_off}(t6)",
+        "sd t4, {t5_off}(t5)",
+        "csrr t4, {sscratch}",
+        "sd t4, {t6_off}(t5)",
+        "ld t4, {kernel_stack_top_off}(t6)",
+        "sd t4, {kstack_top_off}(t5)",
+        "csrr t4, {satp}",
+        "sd t4, {satp_off}(t5)",
+        "mv tp, t6",
+        "mv t6, t5",
+        "mv sp, t6",
+        "csrw {sscratch}, x0",
+        "ld gp, {kernel_gp_off}(tp)",
+        "j 23f",
+
+        // from_kernel 且入口 sscratch 非零：fault 发生在最终用户返回窗口。
+        // 使用预留的 top-FRAME_SIZE 槽，不覆盖下方正在恢复的用户 TrapFrame；
+        // tp/gp 可能已恢复成用户值，因此同时恢复内核 HartLocal。
+        // satp 字段在 kernel frame 中不参与地址空间恢复，借其保存返回锚点。
+        "21:",
+        "ld t5, {kernel_stack_top_off}(t6)",
+        "addi t5, t5, -{frame_size}",
+        "sd sp, {sp_off}(t5)",
+        "sd tp, {tp_off}(t5)",
+        "sd gp, {gp_off}(t5)",
+        "sd t4, {t4_off}(t5)",
+        "ld t4, {entry_t5_off}(t6)",
+        "sd t4, {t5_off}(t5)",
+        "csrr t4, {sscratch}",
+        "sd t4, {t6_off}(t5)",
+        "sd t6, {satp_off}(t5)",
+        "sd zero, {kstack_top_off}(t5)",
+        "mv tp, t6",
+        "mv t6, t5",
+        "ld gp, {kernel_gp_off}(tp)",
+        "csrw {sscratch}, x0",
+        "mv sp, t6",
+        "j 4f",
+
+        // 普通 from_kernel：sscratch=0，直接在被中断内核栈下方保存 frame。
+        "20:",
         "addi t6, sp, -{frame_size}",
         "sd sp, {sp_off}(t6)",
         "sd tp, {tp_off}(t6)",
         "sd gp, {gp_off}(t6)",
         "sd t4, {t4_off}(t6)",
         "sd t5, {t5_off}(t6)",
-        "csrr t5, {sscratch}",      // 取回原始 t6
+        "csrr t5, {sscratch}",
         "sd t5, {t6_off}(t6)",
-        "csrw {sscratch}, x0",      // sscratch 归零
+        "sd zero, {satp_off}(t6)",
+        "sd zero, {kstack_top_off}(t6)",
+        "csrw {sscratch}, x0",
         "mv sp, t6",
         "j 4f",
 
-        // from_user: t6=内核栈顶(原sscratch), sscratch=用户原t6
-        // 统一页表方案：不切 satp，用户 PGD 已包含完整内核映射
-        "2:",
-        "addi t6, t6, -{frame_size}",
-        "sd sp, {sp_off}(t6)",          // 保存用户 sp
-        "sd tp, {tp_off}(t6)",
-        "sd gp, {gp_off}(t6)",
-        "sd t4, {t4_off}(t6)",
-        "sd t5, {t5_off}(t6)",
-        "csrr t5, {sscratch}",          // t5 = 用户原始 t6
-        "sd t5, {t6_off}(t6)",
-        "csrr t4, {satp}",
-        "sd t4, {satp_off}(t6)",        // 保存用户 satp（resume 时恢复）
-        "addi t4, t6, {frame_size}",    // t4 = 内核栈顶（t6 + FRAME_SIZE）
-        "sd t4, {kstack_top_off}(t6)",   // 保存内核栈顶，用于恢复 sscratch
-        // 不切换 satp — 用户页表高半区已有内核映射，直接在用户 satp 下执行内核代码
-        "csrw {sscratch}, x0",
-        "la tp, {hart_locals_sym}",     // 恢复内核 tp → &HART_LOCALS[0]
-        "ld gp, {kernel_gp_off}(tp)",    // 用户态 gp 不可用于内核代码
+        "23:",
 
-        // 系统调用快速路径判断：来自 U-mode 的 ecall（scause=8）跳过 FPU 保存
+        // 系统调用快速路径只接受来自 U-mode 的 ecall。Vector 必须为 Off；FPU
+        // 可以为 Off 或 Clean，后者已有可信内存副本，内核调用后在 sret 前重载即可。
         "csrr t5, {scause}",
         "li t4, 8",
-        "beq t5, t4, 10f",
-        "j 4f",
+        "bne t5, t4, 4f",
+        "csrr t4, {sstatus}",
+        "sd t4, {status_off}(t6)",
+        "li t5, {vs_mask}",
+        "and t5, t4, t5",
+        "bnez t5, 4f",
+        "li t5, {fs_mask}",
+        "and t5, t4, t5",
+        "beqz t5, 10f",
+        "li t4, {fs_clean}",
+        "bne t5, t4, 4f",
 
         // 快速系统调用入口：保存通用寄存器但跳过 FPU
         "10:",
@@ -113,10 +175,15 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         "csrr t0, {sepc}",
         "sd t0, {sepc_off}(sp)",
-        "csrr t0, {sstatus}",
-        "sd t0, {status_off}(sp)",
-        "sd t5, {cause_off}(sp)",       // t5 还是 scause=8
-        // stval 对 syscall 无意义，跳过
+        "li t0, 8",
+        "sd t0, {cause_off}(sp)",
+        // syscall 的 stval 无语义，借该字段保存入口时的 context-switch sequence。
+        // signal/exec 等完整恢复路径不依赖它；下一次硬件 trap 会重新覆盖。
+        "ld t0, {switch_seq_off}(tp)",
+        "sd t0, {tval_off}(sp)",
+
+        // 普通内核 syscall 不生成 FPU 指令，保持入口的 FS=Off/Clean 和 live FPR。
+        // 若内部发生调度，switch sequence 会变化，返回桩再从 frame 恢复。
 
         // 调用 syscall 快速路径 handler（不保存/恢复 FPU）
         "mv a0, sp",
@@ -128,23 +195,42 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "andi t0, a0, 1",
         "bnez t0, 11f",
 
-        // 快速 syscall resume：只恢复 ABI 要求的寄存器
+        // 快速 syscall resume：Rust ABI 已保持 s0-s10；frame-rewrite syscall 会被
+        // handler 强制送往完整恢复，因此这里无需重复加载未变化的 callee-saved GPR。
         "mv s11, a0",
+        "ld t2, {switch_seq_off}(tp)",
+        "ld t1, {tval_off}(s11)",
+        "xor t2, t2, t1",
+        // 同时捕获硬件 FS；若未来普通内核代码意外使用 FPU，Dirty 也会强制恢复。
+        "csrr t3, {sstatus}",
+        "li t1, {fs_mask}",
+        "and t3, t3, t1",
         "ld t0, {sepc_off}(s11)",
         "csrw {sepc}, t0",
         "ld t0, {status_off}(s11)",
-        "andi t0, t0, -3",
+        "li t1, {user_status_keep}",
+        "and t0, t0, t1",
+        "li t1, {user_status_base}",
+        "or t0, t0, t1",
         "csrw {sstatus}, t0",
-        "ld t0, {kstack_top_off}(s11)",
-        "csrw {sscratch}, t0",
+
+        // FS=Off 没有用户状态。FS=Clean 仅在没有 context switch 且硬件仍为
+        // Clean 时复用 live FPR；任一条件不满足都从可信 frame 恢复。
+        "ld t0, {status_off}(s11)",
+        "li t1, {fs_mask}",
+        "and t0, t0, t1",
+        "beqz t0, 32f",
+        "bnez t2, 31f",
+        "li t1, {fs_clean}",
+        "beq t3, t1, 32f",
+        "31:",
+        "mv a0, s11",
+        "call {restore_fast_fpu}",
+        "32:",
         "ld ra, {ra_off}(s11)",
-        "ld tp, {tp_off}(s11)",
-        "ld gp, {gp_off}(s11)",
         "ld t0, {t0_off}(s11)",
         "ld t1, {t1_off}(s11)",
         "ld t2, {t2_off}(s11)",
-        "ld s0, {s0_off}(s11)",
-        "ld s1, {s1_off}(s11)",
         "ld a0, {a0_off}(s11)",
         "ld a1, {a1_off}(s11)",
         "ld a2, {a2_off}(s11)",
@@ -153,19 +239,16 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "ld a5, {a5_off}(s11)",
         "ld a6, {a6_off}(s11)",
         "ld a7, {a7_off}(s11)",
-        "ld s2, {s2_off}(s11)",
-        "ld s3, {s3_off}(s11)",
-        "ld s4, {s4_off}(s11)",
-        "ld s5, {s5_off}(s11)",
-        "ld s6, {s6_off}(s11)",
-        "ld s7, {s7_off}(s11)",
-        "ld s8, {s8_off}(s11)",
-        "ld s9, {s9_off}(s11)",
-        "ld s10, {s10_off}(s11)",
         "ld t3, {t3_off}(s11)",
         "ld t4, {t4_off}(s11)",
         "ld t5, {t5_off}(s11)",
         "ld t6, {t6_off}(s11)",
+
+        // 发布当前内核 tp 指向的 per-hart TrapAnchor。tp/gp 延迟到此后恢复，
+        // 最终窗口内的 S-mode fault 可直接由 anchor 找回内核栈和 kernel gp。
+        "csrw {sscratch}, tp",
+        "ld tp, {tp_off}(s11)",
+        "ld gp, {gp_off}(s11)",
         "ld sp, {sp_off}(s11)",
         "ld s11, {s11_off}(s11)",
         "sret",
@@ -215,10 +298,18 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd t0, {tval_off}(sp)",
         // satp 已在 from_user 入口处正确保存（切换内核页表前），此处不再覆盖
 
-        "csrr t0, {sstatus}",
+        "ld t0, {status_off}(sp)",
         "li t1, {fs_mask}",
-        "and t0, t0, t1",
-        "beqz t0, 5f",
+        "and t2, t0, t1",
+        "beqz t2, 12f",
+        // kernel-origin trap 的 frame 位于任意内核栈位置，不能依赖旧内存副本；
+        // 只有固定任务 frame 上的 user FS=Clean 才能安全跳过整组保存。
+        "andi t3, t0, {spp}",
+        "bnez t3, 18f",
+        "li t1, {fs_clean}",
+        "beq t2, t1, 13f",
+
+        "18:",
 
         ".option arch, +d",
         "csrr t0, {fcsr}",
@@ -240,15 +331,78 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "fsd f28, {f_off}+224(sp)", "fsd f29, {f_off}+232(sp)",
         "fsd f30, {f_off}+240(sp)", "fsd f31, {f_off}+248(sp)",
 
-        // 跳过 FPU 保存：
-        "5:",
+        // 保存完成后把可信 frame 状态转成 Clean。硬件 FS 随后保持 Dirty，供内核
+        // Rust 代码使用；返回路径重新加载用户状态并把硬件标回 Clean。
+        "ld t0, {status_off}(sp)",
+        "li t1, {fs_clear_mask}",
+        "and t0, t0, t1",
+        "li t1, {fs_clean}",
+        "or t0, t0, t1",
+        "sd t0, {status_off}(sp)",
+        "j 13f",
 
+        // FS=Off：先为普通 Rust handler 打开当前 S-mode 的 FS。固定 user frame
+        // 在任务创建时已经清零；只有 kernel-origin 的临时栈 frame 仍需初始化，
+        // 避免后续内核诊断把旧栈内容误认为扩展状态。
+        "12:",
+        "li t1, {fs_dirty}",
+        "csrs {sstatus}, t1",
+        "ld t0, {status_off}(sp)",
+        "andi t0, t0, {spp}",
+        "beqz t0, 19f",
         "mv a0, sp",
+        "call {zero_fpu}",
+        "j 19f",
+        "13:",
+        "li t1, {fs_dirty}",
+        "csrs {sstatus}, t1",
+        "19:",
+
+        // 保留 frame 指针到 callee-saved s0。普通 kernel-origin trap 继续使用当前
+        // 任务的 64 KiB 内核栈；只有最终 return-to-user 窗口生成的 kernel frame
+        // 才以非零 satp 字段标记，并切到 per-hart 紧急栈。
+        "mv s0, sp",
+        "li s1, 0",
+        "ld t0, {status_off}(s0)",
+        "andi t0, t0, {spp}",
+        "beqz t0, 14f",
+        "ld t0, {satp_off}(s0)",
+        "beqz t0, 14f",
+        "ld t1, {irq_stack_top_off}(tp)",
+        "beqz t1, 14f",
+        "ld t2, {sp_off}(s0)",
+        "li t3, {irq_stack_size}",
+        "sub t3, t1, t3",
+        "bltu t2, t3, 15f",
+        "bgeu t2, t1, 15f",
+        "j 14f",
+        "15:",
+        "mv sp, t1",
+        "li s1, 1",
+        "14:",
+
+        // Vector helper 只在 user-origin 且 VS active 时调用。
+        "ld t0, {status_off}(s0)",
+        "andi t1, t0, {spp}",
+        "bnez t1, 16f",
+        "li t1, {vs_mask}",
+        "and t1, t0, t1",
+        "beqz t1, 16f",
+        "mv a0, s0",
         "call {save_vector}",
+        "16:",
 
-        "mv a0, sp",
-        "ld a1, {sp_off}(sp)",
+        "mv a0, s0",
+        "ld a1, {sp_off}(s0)",
         "call {handler}",
+
+        // 紧急栈只走极短的最终返回窗口，退出前检查低地址缓冲区。s1/s2 是
+        // 汇编调用者自用的 callee-saved 寄存器，真正用户值仍保存在 TrapFrame。
+        "mv s2, a0",
+        "beqz s1, 17f",
+        "call {check_irq_stack_guard}",
+        "17:",
+        "mv a0, s2",
 
         // 处理器返回陷阱帧指针（a0），0 表示停机
         "beqz a0, 6f",
@@ -261,11 +415,19 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         handler = sym riscv64_handle_exception,
         fast_handler = sym riscv64_fast_syscall_dispatch,
+        zero_fpu = sym riscv64_zero_inactive_fpu_frame,
+        restore_fast_fpu = sym crate::riscv64::task::__riscv64_restore_clean_fpu_for_fast_return,
         save_vector = sym crate::riscv64::vector::save_vector_from_trap_entry,
+        check_irq_stack_guard = sym crate::riscv64::specific::riscv64_check_irq_stack_guard,
         resume = sym crate::riscv64::task::__riscv64_resume_to_trap_frame,
         frame_size = const FRAME_SIZE,
+        user_frame_span = const (FRAME_SIZE * 2),
+        kernel_stack_top_off = const HART_LOCAL_KERNEL_STACK_TOP_OFF,
         kernel_gp_off = const HART_LOCAL_KERNEL_GP_OFF,
-        hart_locals_sym = sym crate::riscv64::specific::HART_LOCALS,
+        entry_t5_off = const HART_LOCAL_TRAP_ENTRY_T5_OFF,
+        irq_stack_top_off = const HART_LOCAL_IRQ_STACK_TOP_OFF,
+        irq_stack_size = const IRQ_STACK_SIZE,
+        switch_seq_off = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,
 
         sscratch = const CSR_SSCRATCH,
         sepc = const CSR_SEPC,
@@ -275,6 +437,13 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         satp = const CSR_SATP,
         fcsr = const CSR_FCSR,
         fs_mask = const SSTATUS_FS_MASK,
+        fs_clear_mask = const (!SSTATUS_FS_MASK),
+        fs_clean = const SSTATUS_FS_CLEAN,
+        vs_mask = const SSTATUS_VS_MASK,
+        fs_dirty = const SSTATUS_FS_DIRTY,
+        user_status_keep = const SSTATUS_USER_RESTORE_MASK,
+        user_status_base = const SSTATUS_USER_RETURN_BASE,
+        spp = const SSTATUS_SPP,
 
         ra_off = const RA_OFFSET,
         tp_off = const TP_OFFSET,

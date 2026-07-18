@@ -209,7 +209,7 @@ define prepare_compat_rootfs
 	cp -a $(BUILD_DIR)/$(1)/busybox-rootfs/. $(2)/
 	mkdir -p $(2)/etc $(2)/tmp
 	cp -a $(3)/etc/. $(2)/etc/
-	cp -a $(3)/tmp/. $(2)/tmp/
+	if [ -d $(3)/tmp ]; then cp -a $(3)/tmp/. $(2)/tmp/; fi
 	mkdir -p $(2)/etc/ltp-scenarios $(2)/lib/elm
 	rm -f $(2)/etc/ltp-scenarios/* $(2)/lib/elm/*
 	cp $(LTP_SCENARIO_SRC)/* $(2)/etc/ltp-scenarios/

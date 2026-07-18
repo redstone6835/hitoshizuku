@@ -4,16 +4,36 @@
 //! 们提供了保存和恢复中断状态的函数，以及直接使能和禁用中断的接口。这些函数使用
 //! 内联汇编直接操作 SSTATUS 寄存器，以确保高效和正确地管理中断状态。
 //!
-//! 本模块还提供 MSGI（message interrupt）相关接口，用于读取/配置 CSR_SIE 并向
-//! 目标 CPU 核心通过 CSR_MSIP 发送消息中断。
+//! 本模块还提供 S-mode 软件中断（SSIP/SSIE）相关接口。跨 hart 发送由 SBI IPI
+//! 或平台中断控制器完成；本模块只负责当前 hart 的 enable/ack。
 
 use crate::*;
 use general::dev::irq::{IrqLine, IrqLineOps};
 
 /// 本地中断控制辅助实现（基于 `SSTATUS.SIE`）。
 pub struct Riscv64InterruptOps;
-/// 核间消息中断控制辅助实现（基于 `CSR_SIE / CSR_MSIP`）。
+/// 核间消息中断控制辅助实现（基于 `sie.SSIE / sip.SSIP`）。
 pub struct Riscv64MessageInterruptOps;
+
+/// 保存并关闭当前 hart 中断的 RAII guard。
+pub struct LocalIrqGuard {
+    state: usize,
+}
+
+impl LocalIrqGuard {
+    #[inline]
+    pub fn acquire() -> Self {
+        let state = unsafe { Riscv64InterruptOps::save_and_disable() };
+        Self { state }
+    }
+}
+
+impl Drop for LocalIrqGuard {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { Riscv64InterruptOps::restore_interrupt_state(self.state) };
+    }
+}
 
 /// 安装设备 IRQ registry 使用的架构级 line 控制回调。
 ///
@@ -35,13 +55,15 @@ fn disable_irq_line(line: IrqLine) -> bool {
 }
 
 fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
-    let IrqLine::Hardware(0) = line else {
-        return false;
+    let mask = match line {
+        IrqLine::Ipi => SIE_SSIE,
+        IrqLine::Hardware(0) => SIE_SEIE,
+        _ => return false,
     };
     if enabled {
-        set_csr!(sie, SIE_SEIE);
+        set_csr!(sie, mask);
     } else {
-        clear_csr!(sie, SIE_SEIE);
+        clear_csr!(sie, mask);
     }
     true
 }
@@ -57,6 +79,22 @@ impl Riscv64InterruptOps {
         read_csr!(sstatus)
     }
 
+    /// 原子保存 `sstatus` 并清除 SIE。
+    #[inline]
+    pub unsafe fn save_and_disable() -> usize {
+        let state: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrc {state}, {csr}, {mask}",
+                state = out(reg) state,
+                csr = const CSR_SSTATUS,
+                mask = in(reg) SSTATUS_SIE,
+                options(nostack, preserves_flags)
+            );
+        }
+        state
+    }
+
     /// 恢复中断状态。
     ///
     /// # 参数
@@ -64,10 +102,19 @@ impl Riscv64InterruptOps {
     /// - `state`: 之前保存的 `SSTATUS` 原始值。
     #[inline]
     pub unsafe fn restore_interrupt_state(state: usize) {
-        // 无分支恢复：先清 SIE，再用 csrs 写回原来的 SIE 位。
-        // 如果 state 中 SIE=0，csrs 写 0 是 no-op；如果 SIE=1，csrs 置位。
-        clear_csr!(sstatus, SSTATUS_SIE);
-        set_csr!(sstatus, state & SSTATUS_SIE);
+        // save_and_disable() 已经把 SIE 清零；退出临界区时仅在原状态开启的情况下
+        // 执行一次置位，避免每次 guard drop 都做“再清一次 + 写入零掩码”。
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        if state & SSTATUS_SIE != 0 {
+            unsafe {
+                core::arch::asm!(
+                    "csrs {csr}, {mask}",
+                    csr = const CSR_SSTATUS,
+                    mask = in(reg) SSTATUS_SIE,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
     }
 
     /// 使能中断（原子置位 `SSTATUS.SIE`）。
@@ -123,11 +170,11 @@ impl Riscv64MessageInterruptOps {
         crate::riscv64::specific::current_cpu_id()
     }
 
-    /// 读取全局中断使能位（CSR_SIE）。
+    /// 读取当前 hart 的软件中断使能位 `sie.SSIE`。
     ///
     /// # 返回值
     ///
-    /// 返回 SIE 寄存器的当前值，包含软件中断、定时器中断和外部中断的使能位。
+    /// 返回值只包含 SSIE bit。
     #[inline]
     pub unsafe fn message_interrupt_enable_bits() -> usize {
         let sie: usize;
@@ -139,23 +186,26 @@ impl Riscv64MessageInterruptOps {
                 options(nostack, preserves_flags)
             )
         }
-        sie
+        sie & SIE_SSIE
     }
 
-    /// 设置全局中断使能位（CSR_SIE）。
+    /// 按 `bits.SSIE` 设置当前 hart 的软件中断使能状态。
     ///
     /// # 参数
     ///
     /// - `bits`: 要设置的 SIE 值。
     #[inline]
     pub unsafe fn set_message_interrupt_enable_bits(bits: usize) {
-        unsafe {
-            core::arch::asm!(
-                "csrw {csr}, {v}",
-                csr = const CSR_SIE,
-                v = in(reg) bits,
-                options(nostack, preserves_flags)
-            )
+        if bits & SIE_SSIE != 0 {
+            set_csr!(sie, SIE_SSIE);
+        } else {
+            clear_csr!(sie, SIE_SSIE);
         }
+    }
+
+    /// 清除当前 hart 的 SSIP pending 状态。应在 IPI handler 入口调用。
+    #[inline]
+    pub unsafe fn ack_ipi() {
+        clear_csr!(sip, SIP_SSIP);
     }
 }

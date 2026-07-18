@@ -10,7 +10,7 @@
 use core::mem::offset_of;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TrapFrame {
     pub ra: usize,  // x1
     pub tp: usize,  // x4  (trap entry 先存 tp，再存 sp)
@@ -48,7 +48,7 @@ pub struct TrapFrame {
     pub cause: usize,
     pub tval: usize,
     pub satp: usize,
-    /// 内核栈顶地址，resume 时写入 sscratch 以区分 from_user/from_kernel
+    /// 可信内核栈顶；非零同时作为 resume 返回 U-mode 的类型标记。
     pub kstack_top: usize,
     pub f: [u64; 32],
     pub fcsr: u32,
