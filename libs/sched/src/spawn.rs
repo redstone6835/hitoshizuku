@@ -112,6 +112,10 @@ pub fn activate_task(task: &Arc<Task>) -> Result<usize, errno::Errno> {
         | TaskState::Zombie
         | TaskState::Dead => return Err(errno::Errno::EINVAL),
     }
+    #[cfg(feature = "performance-profile")]
+    if task.state() == TaskState::Sleeping {
+        task.mark_profile_woken(now_ns_public());
+    }
     Ok(enqueue_task(Arc::clone(task), now_ns_public()))
 }
 
@@ -131,6 +135,10 @@ pub fn activate_task_with_cpu_hint(
         | TaskState::Continued
         | TaskState::Zombie
         | TaskState::Dead => return Err(errno::Errno::EINVAL),
+    }
+    #[cfg(feature = "performance-profile")]
+    if task.state() == TaskState::Sleeping {
+        task.mark_profile_woken(now_ns_public());
     }
     Ok(enqueue_task_with_hint(
         Arc::clone(task),

@@ -1247,7 +1247,13 @@ impl ProtocolRuntime {
     }
 
     fn try_push_deferred(&self, work: IngressWork) -> Result<(), IngressWork> {
-        self.ingress.try_push(work)
+        self.ingress.try_push(work)?;
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(
+            profiling::Metric::IngressRingDepth,
+            self.ingress.len() as u64,
+        );
+        Ok(())
     }
 
     fn publish_ingress(&self) {
@@ -3284,6 +3290,10 @@ impl ProtocolContext {
                 facade.finish_tx_drain();
             }
         }
+        #[cfg(feature = "performance-profile")]
+        if processed != 0 {
+            profiling::observe(profiling::Metric::DirtyDrainSockets, processed as u64);
+        }
         processed
     }
 
@@ -3310,10 +3320,16 @@ impl ProtocolContext {
         let mut first = None;
         let mut batch = Vec::new();
         let mut batch_target = None;
+        #[cfg(feature = "performance-profile")]
+        let mut drained = 0usize;
         for _ in 0..limit {
             let Some(payload) = facade.take_tx() else {
                 break;
             };
+            #[cfg(feature = "performance-profile")]
+            {
+                drained += 1;
+            }
             match self.protocol.prepare_udp_tx(
                 flow,
                 payload,
@@ -3387,6 +3403,10 @@ impl ProtocolContext {
             }
         }
         self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
+        #[cfg(feature = "performance-profile")]
+        if drained != 0 {
+            profiling::observe(profiling::Metric::SocketDrainDatagrams, drained as u64);
+        }
     }
 
     fn dispatch_local_udp(&mut self, egress: usize, work: PreparedUdpTx) {
@@ -4274,12 +4294,21 @@ impl ProtocolContext {
             self.pending[count] = Some(work);
             count += 1;
         }
+        #[cfg(feature = "performance-profile")]
+        if count != 0 {
+            profiling::observe(
+                profiling::Metric::IngressRingDepth,
+                self.runtime.ingress.len() as u64,
+            );
+        }
         count
     }
 
     fn process_pending(&mut self, count: usize, config: &ConfigSnapshot) {
         #[cfg(feature = "performance-profile")]
         let _profile = profiling::scope(profiling::Event::NetProtocolIngress).packets(count);
+        #[cfg(feature = "performance-profile")]
+        let mut local_count = 0usize;
         for index in 0..count {
             let Some(work) = self.pending[index].take() else {
                 continue;
@@ -4321,12 +4350,24 @@ impl ProtocolContext {
                     egress,
                     interface,
                     work,
-                } => self.process_local_tcp(egress, interface, work, config),
+                } => {
+                    #[cfg(feature = "performance-profile")]
+                    {
+                        local_count += 1;
+                    }
+                    self.process_local_tcp(egress, interface, work, config);
+                }
                 IngressWork::LocalUdp {
                     egress,
                     interface,
                     work,
-                } => self.process_local_udp(egress, interface, work),
+                } => {
+                    #[cfg(feature = "performance-profile")]
+                    {
+                        local_count += 1;
+                    }
+                    self.process_local_udp(egress, interface, work);
+                }
                 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
                 IngressWork::UdpProbe { egress, payload } => {
                     self.start_udp_probe(egress, payload, config);
@@ -4339,6 +4380,10 @@ impl ProtocolContext {
         }
         for pending in &mut self.pending[..count] {
             *pending = None;
+        }
+        #[cfg(feature = "performance-profile")]
+        if local_count != 0 {
+            profiling::observe(profiling::Metric::LocalWorkBatchSize, local_count as u64);
         }
     }
 
@@ -4887,7 +4932,11 @@ impl ProtocolContext {
 
     fn sleep_until_ingress(&mut self) {
         let task = sched::current_task();
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(sched::WaitReason::Other, sched::now_ns_public());
         if !task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
             return;
         }
         fence(Ordering::SeqCst);
@@ -4899,6 +4948,8 @@ impl ProtocolContext {
         {
             self.runtime.pending.store(true, Ordering::Release);
             let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running);
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
             return;
         }
         drop(task);
@@ -6225,7 +6276,11 @@ impl WorkerContext {
 
     fn sleep_until_queue_event(&mut self) {
         let task = sched::current_task();
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(sched::WaitReason::Other, sched::now_ns_public());
         if !task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
             return;
         }
         self.irq.unmask();
@@ -6239,6 +6294,8 @@ impl WorkerContext {
         {
             let _ = self.irq.ack_and_mask();
             let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running);
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
             return;
         }
         drop(task);

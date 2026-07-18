@@ -154,6 +154,8 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         let intr = decode_interrupt(cause);
         // 清除定时器中断标志
         if code == IRQ_S_TIMER {
+            #[cfg(feature = "performance-profile")]
+            profiling::sample_pc(tf.sepc, from_user);
             // RISC-V 的定时器中断需要软件显式清除，否则在 `sret` 后会立即再次陷入，
             // 形成"看似无法返回"的中断风暴。
             super::super::time::rearm_periodic_timer();

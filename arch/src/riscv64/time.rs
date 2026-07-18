@@ -22,7 +22,11 @@ pub fn set_stable_counter_hz(hz: usize) {
 }
 
 /// 默认周期性调度 tick 频率。
+#[cfg(not(feature = "performance-profile"))]
 pub const DEFAULT_TIMER_HZ: usize = 100;
+/// 剖析构建使用非整百频率，增加短测试样本量并降低周期性负载混叠。
+#[cfg(feature = "performance-profile")]
+pub const DEFAULT_TIMER_HZ: usize = 997;
 
 static TIMER_HZ: AtomicUsize = AtomicUsize::new(DEFAULT_TIMER_HZ);
 static TIMER_PERIOD_TICKS: AtomicU64 = AtomicU64::new(100_000);

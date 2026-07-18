@@ -56,7 +56,7 @@ impl NetlinkSocketFileOps {
         Self {
             protocol,
             rx_buf: Mutex::new(VecDeque::new()),
-            wait_queue: WaitQueue::new(),
+            wait_queue: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
             nonblock: AtomicBool::new(nonblock),
             bound: AtomicBool::new(false),
             poll_source: PollSource::new(PollEvents::POLLOUT),

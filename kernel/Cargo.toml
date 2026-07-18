@@ -11,9 +11,11 @@ embedded-initramfs = []
 trace-task-lifecycle = ["sched/trace-task-lifecycle"]
 performance-profile = [
     "dep:profiling",
+    "arch/performance-profile",
     "general/performance-profile",
     "net/performance-profile",
     "sched/performance-profile",
+    "vfs/performance-profile",
 ]
 allocator-tests = [
     "ktest/kernel",

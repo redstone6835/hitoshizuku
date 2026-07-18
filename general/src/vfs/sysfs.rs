@@ -67,6 +67,8 @@ const KERNEL_NET_STATS_INO: u64 = 25;
 const KERNEL_PROFILE_STATS_INO: u64 = 26;
 #[cfg(feature = "performance-profile")]
 const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -1486,6 +1488,8 @@ enum SysRegFile {
     ProfileStats,
     #[cfg(feature = "performance-profile")]
     ProfileControl,
+    #[cfg(feature = "performance-profile")]
+    ProfileSamples,
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
@@ -1909,7 +1913,7 @@ fn render_profile_stats() -> String {
             }
             let _ = writeln!(
                 output,
-                "cpu={} event={} calls={} cycles={} bytes={} packets={} max_cycles={}",
+                "cpu={} event={} calls={} cycles={} bytes={} packets={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} p50_ns={} p95_ns={} p99_ns={} hist={}",
                 cpu,
                 event.name(),
                 value.calls,
@@ -1917,6 +1921,84 @@ fn render_profile_stats() -> String {
                 value.bytes,
                 value.packets,
                 value.max_cycles,
+                value.wall_ns,
+                value.on_cpu_ns,
+                value.off_cpu_ns,
+                value.max_latency_ns,
+                profiling::histogram_percentile(&value.latency, 50),
+                profiling::histogram_percentile(&value.latency, 95),
+                profiling::histogram_percentile(&value.latency, 99),
+                HistogramDisplay(&value.latency),
+            );
+        }
+        for metric in profiling::Metric::ALL {
+            let value = profiling::metric_snapshot(cpu, metric);
+            if value.observations == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                output,
+                "cpu={} metric={} observations={} sum={} max={} p50={} p95={} p99={} hist={}",
+                cpu,
+                metric.name(),
+                value.observations,
+                value.sum,
+                value.max,
+                profiling::histogram_percentile(&value.values, 50),
+                profiling::histogram_percentile(&value.values, 95),
+                profiling::histogram_percentile(&value.values, 99),
+                HistogramDisplay(&value.values),
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+struct HistogramDisplay<'a>(&'a [u64; profiling::HISTOGRAM_BUCKETS]);
+
+#[cfg(feature = "performance-profile")]
+impl core::fmt::Display for HistogramDisplay<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, value) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{value}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_samples() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "enabled={} generation={} slots_per_cpu={}",
+        u8::from(profiling::enabled()),
+        profiling::generation(),
+        profiling::SAMPLE_SLOTS,
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        let _ = writeln!(
+            output,
+            "cpu={} dropped_samples={}",
+            cpu,
+            profiling::dropped_samples(cpu),
+        );
+        for slot in 0..profiling::SAMPLE_SLOTS {
+            let Some(sample) = profiling::sample_slot(cpu, slot) else {
+                continue;
+            };
+            let _ = writeln!(
+                output,
+                "cpu={} mode={} pc={:#x} samples={}",
+                cpu,
+                if sample.from_user { "user" } else { "kernel" },
+                sample.pc,
+                sample.samples,
             );
         }
     }
@@ -1963,6 +2045,8 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::ProfileStats => render_profile_stats(),
         #[cfg(feature = "performance-profile")]
         SysRegFile::ProfileControl => render_profile_control(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileSamples => render_profile_samples(),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
@@ -2661,6 +2745,8 @@ impl SysDirInodeOps {
                 "profile_stats" => mk_reg(KERNEL_PROFILE_STATS_INO, SysRegFile::ProfileStats),
                 #[cfg(feature = "performance-profile")]
                 "profile_control" => mk_reg(KERNEL_PROFILE_CONTROL_INO, SysRegFile::ProfileControl),
+                #[cfg(feature = "performance-profile")]
+                "profile_samples" => mk_reg(KERNEL_PROFILE_SAMPLES_INO, SysRegFile::ProfileSamples),
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::Fs => match name {
@@ -3249,6 +3335,12 @@ impl SysDirInodeOps {
                 mk_dir_entry(
                     KERNEL_PROFILE_CONTROL_INO,
                     "profile_control",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_SAMPLES_INO,
+                    "profile_samples",
                     FileType::Regular,
                 ),
             ],

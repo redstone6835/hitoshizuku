@@ -15,7 +15,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 
 use crate::sync::Spinlock;
-use crate::task::{Task, TaskState};
+use crate::task::{Task, TaskState, WaitReason};
 
 /// 唤醒回调。调用方负责把 task 加入某个 runqueue 并可能触发 IPI。
 ///
@@ -25,12 +25,22 @@ pub type WakeFn = fn(&Arc<Task>);
 /// 等待队列。
 pub struct WaitQueue {
     waiters: Spinlock<VecDeque<Weak<Task>>>,
+    #[cfg(feature = "performance-profile")]
+    reason: WaitReason,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
+        Self::new_with_reason(WaitReason::Other)
+    }
+
+    pub const fn new_with_reason(reason: WaitReason) -> Self {
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = reason;
         Self {
             waiters: Spinlock::new(VecDeque::new()),
+            #[cfg(feature = "performance-profile")]
+            reason,
         }
     }
 
@@ -63,6 +73,8 @@ impl WaitQueue {
         // 先入队再切状态：若先切 Sleeping 再入队，waker 可能在入队前
         // 检查队列（空），唤醒丢失。
         self.enqueue(task);
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(self.reason, crate::scheduler::now_ns_public());
         task.set_state(state);
     }
 
@@ -70,6 +82,8 @@ impl WaitQueue {
     pub fn finish_wait(&self, task: &Arc<Task>) {
         self.remove(task);
         transition_from_wait(task);
+        #[cfg(feature = "performance-profile")]
+        task.cancel_profile_wait();
     }
 
     /// 等到 `condition` 为真。每次真正让出 CPU 前都会在已经登记到队列、
@@ -216,8 +230,11 @@ impl Default for WaitQueue {
 /// 把 Sleeping / Uninterruptible 切回 Runnable。CAS 失败说明任务已经
 /// 处于其他状态（例如刚被另一路径唤醒），跳过即可。
 fn transition_to_runnable(task: &Arc<Task>) {
-    if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
-        let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    let transitioned = task.cas_state(TaskState::Sleeping, TaskState::Runnable)
+        || task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    if transitioned {
+        #[cfg(feature = "performance-profile")]
+        task.mark_profile_woken(crate::scheduler::now_ns_public());
     }
 }
 

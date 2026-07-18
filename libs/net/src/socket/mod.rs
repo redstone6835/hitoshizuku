@@ -298,11 +298,15 @@ impl ByteRing {
         if len == 0 {
             return 0;
         }
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
         let tail = (self.head + self.len) % self.arena.len();
         let first = len.min(self.arena.len() - tail);
         self.arena[tail..tail + first].copy_from_slice(&input[..first]);
         self.arena[..len - first].copy_from_slice(&input[first..len]);
         self.len += len;
+        #[cfg(feature = "performance-profile")]
+        record_payload_copy(copy_start, len);
         len
     }
 
@@ -316,6 +320,8 @@ impl ByteRing {
         if len == 0 {
             return Ok(0);
         }
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
         let tail = (self.head + self.len) % self.arena.len();
         let first = len.min(self.arena.len() - tail);
         copy(0, &mut self.arena[tail..tail + first])?;
@@ -323,6 +329,8 @@ impl ByteRing {
             copy(first, &mut self.arena[..len - first])?;
         }
         self.len += len;
+        #[cfg(feature = "performance-profile")]
+        record_payload_copy(copy_start, len);
         Ok(len)
     }
 
@@ -333,11 +341,15 @@ impl ByteRing {
         if output.is_empty() {
             return true;
         }
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
         let output_len = output.len();
         let start = (self.head + offset) % self.arena.len();
         let first = output_len.min(self.arena.len() - start);
         output[..first].copy_from_slice(&self.arena[start..start + first]);
         output[first..].copy_from_slice(&self.arena[..output_len - first]);
+        #[cfg(feature = "performance-profile")]
+        record_payload_copy(copy_start, output_len);
         true
     }
 
@@ -553,6 +565,8 @@ impl TxRing {
         for chunk in chunks.iter_mut().take(chunk_count) {
             *chunk = self.take_free_chunk().expect("TX chunk 计数失配");
         }
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
         for (part, chunk) in payload.chunks(SOCKET_CHUNK_BYTES).zip(chunks.iter()) {
             let offset = usize::from(*chunk) * SOCKET_CHUNK_BYTES;
             self.arena[offset..offset + part.len()].copy_from_slice(part);
@@ -570,6 +584,11 @@ impl TxRing {
         });
         self.queued.push_back(slot);
         self.used_bytes += payload.len();
+        #[cfg(feature = "performance-profile")]
+        {
+            record_payload_copy(copy_start, payload.len());
+            profiling::observe(profiling::Metric::UdpTxQueueDepth, self.queued.len() as u64);
+        }
         Ok(())
     }
 
@@ -779,6 +798,8 @@ impl RxRing {
         });
         self.tail = (self.tail + 1) % self.entries.len() as u16;
         self.len += 1;
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::RxRingDepth, u64::from(self.len));
         Ok(())
     }
 
@@ -807,6 +828,8 @@ impl RxRing {
             *chunk = self.take_free_chunk().expect("RX chunk 计数失配");
             allocated += 1;
         }
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
         for (index, chunk) in chunks.iter().take(chunk_count).enumerate() {
             let offset = index * SOCKET_CHUNK_BYTES;
             let len = (payload_len - offset).min(SOCKET_CHUNK_BYTES);
@@ -835,6 +858,11 @@ impl RxRing {
         });
         self.tail = (self.tail + 1) % self.entries.len() as u16;
         self.len += 1;
+        #[cfg(feature = "performance-profile")]
+        {
+            record_payload_copy(copy_start, payload_len);
+            profiling::observe(profiling::Metric::RxRingDepth, u64::from(self.len));
+        }
         Ok(())
     }
 
@@ -845,7 +873,9 @@ impl RxRing {
     fn copy_front(&self, output: &mut [u8]) -> Result<(), SocketError> {
         let datagram = self.front().ok_or(SocketError::WouldBlock)?;
         let len = output.len().min(usize::from(datagram.payload_len));
-        match &datagram.payload {
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
+        let result = match &datagram.payload {
             RxPayload::Packet(packet) => packet
                 .packet
                 .copy_out(usize::from(packet.payload_offset), &mut output[..len])
@@ -864,7 +894,12 @@ impl RxRing {
                 }
                 Ok(())
             }
+        };
+        #[cfg(feature = "performance-profile")]
+        if result.is_ok() {
+            record_payload_copy(copy_start, len);
         }
+        result
     }
 
     fn pop(&mut self) -> Option<RxDatagram> {
@@ -874,6 +909,8 @@ impl RxRing {
         let datagram = self.entries[usize::from(self.head)].take();
         self.head = (self.head + 1) % self.entries.len() as u16;
         self.len -= 1;
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::RxRingDepth, u64::from(self.len));
         if let Some(datagram) = datagram.as_ref() {
             self.bytes = self.bytes.saturating_sub(usize::from(datagram.payload_len));
         }
@@ -929,6 +966,23 @@ impl RxRing {
     }
 }
 
+#[cfg(feature = "performance-profile")]
+fn record_payload_copy(start_cycles: u64, bytes: usize) {
+    profiling::observe(profiling::Metric::PayloadCopyBytes, bytes as u64);
+    profiling::observe(
+        profiling::Metric::PayloadCopyCycles,
+        profiling::read_counter().wrapping_sub(start_cycles),
+    );
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_socket_wakeup(queue: &WaitQueue) {
+    profiling::observe(profiling::Metric::SocketWakeup, 1);
+    if queue.len_hint() == 0 {
+        profiling::observe(profiling::Metric::SocketEmptyWakeup, 1);
+    }
+}
+
 pub struct UdpTxLease {
     facade: Arc<SocketFacade>,
     slot: u16,
@@ -979,6 +1033,8 @@ impl UdpTxLease {
         };
         if writable {
             self.facade.set_ready(Readiness::WRITABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.facade.write_wait);
             self.facade.write_wait.wake_one_default();
         }
     }
@@ -1116,10 +1172,10 @@ impl SocketFacade {
             }),
             readiness_generation: AtomicU64::new(1),
             observer: Mutex::new(None),
-            read_wait: WaitQueue::new(),
-            write_wait: WaitQueue::new(),
-            accept_wait: WaitQueue::new(),
-            state_wait: WaitQueue::new(),
+            read_wait: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
+            write_wait: WaitQueue::new_with_reason(sched::WaitReason::SocketWrite),
+            accept_wait: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
+            state_wait: WaitQueue::new_with_reason(sched::WaitReason::Poll),
             control_lock: sched::mutex::Mutex::new(()),
             control_sequence: AtomicU64::new(1),
             control_result: Mutex::new(None),
@@ -2052,6 +2108,8 @@ impl SocketFacade {
         };
         if writable.1 {
             self.set_ready(Readiness::WRITABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.write_wait);
             self.write_wait.wake_one_default();
         }
         writable.0
@@ -2084,6 +2142,8 @@ impl SocketFacade {
             .fetch_add(copied as u64, Ordering::Relaxed);
         if was_empty && copied != 0 {
             self.set_ready(Readiness::READABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.read_wait);
             self.read_wait.wake_one_default();
         }
         Ok(copied)
@@ -2121,6 +2181,8 @@ impl SocketFacade {
             .fetch_add(len as u64, Ordering::Relaxed);
         if was_empty && len != 0 {
             self.set_ready(Readiness::READABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.read_wait);
             self.read_wait.wake_one_default();
         }
         Ok(len)
@@ -2154,6 +2216,8 @@ impl SocketFacade {
             .fetch_add(len as u64, Ordering::Relaxed);
         if was_empty && len != 0 {
             self.set_ready(Readiness::READABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.read_wait);
             self.read_wait.wake_one_default();
         }
         Ok(len)
@@ -2235,6 +2299,8 @@ impl SocketFacade {
         };
         if was_empty {
             self.set_ready(Readiness::READABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.read_wait);
             self.read_wait.wake_one_default();
         }
         Ok(())
@@ -2273,6 +2339,8 @@ impl SocketFacade {
         };
         if was_empty {
             self.set_ready(Readiness::READABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.read_wait);
             self.read_wait.wake_one_default();
         }
         Ok(())
@@ -2835,6 +2903,8 @@ impl SocketFacade {
             self.clear_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
         } else {
             self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
+            #[cfg(feature = "performance-profile")]
+            record_socket_wakeup(&self.accept_wait);
             self.accept_wait.wake_one_default();
         }
     }

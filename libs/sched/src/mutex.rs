@@ -15,7 +15,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scheduler::{current_task, now_ns_public, schedule_once};
-use crate::task::TaskState;
+use crate::task::{TaskState, WaitReason};
 use crate::wait::WaitQueue;
 
 /// 可睡眠互斥锁。
@@ -39,7 +39,7 @@ impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
-            waiters: WaitQueue::new(),
+            waiters: WaitQueue::new_with_reason(WaitReason::Mutex),
             data: UnsafeCell::new(data),
         }
     }

@@ -200,7 +200,7 @@ impl EpollFileOps {
                     watches: Vec::new(),
                     ready: VecDeque::new(),
                 }),
-                waiters: WaitQueue::new(),
+                waiters: WaitQueue::new_with_reason(sched::WaitReason::Poll),
                 poll_source: PollSource::new(PollEvents::default()),
             }),
         }

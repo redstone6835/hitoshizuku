@@ -143,6 +143,8 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         );
         // 清除定时器中断标志（写 CSR_TICLR bit 0）
         if is & IS_TIMER_BIT != 0 {
+            #[cfg(feature = "performance-profile")]
+            profiling::sample_pc(arg0, from_user);
             // LoongArch 的定时器中断通常需要软件显式写 TICLR 清 pending，否则在 `ertn`
             // 后会立即再次陷入，形成“看似无法返回”的中断风暴。
             unsafe {

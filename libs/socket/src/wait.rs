@@ -7,8 +7,8 @@ use alloc::sync::{Arc, Weak};
 
 use sched::sync::Spinlock;
 use sched::{
-    Task, TaskState, WaitQueue, cancel_sleep_deadline, current_task, enqueue_task, is_ready,
-    now_ns_public, register_sleep_deadline, schedule_once,
+    Task, TaskState, WaitQueue, WaitReason, cancel_sleep_deadline, current_task, enqueue_task,
+    is_ready, now_ns_public, register_sleep_deadline, schedule_once,
 };
 
 use crate::types::SocketError;
@@ -26,7 +26,7 @@ pub(crate) struct SocketWaitQueue {
 impl SocketWaitQueue {
     pub const fn new() -> Self {
         Self {
-            queue: WaitQueue::new(),
+            queue: WaitQueue::new_with_reason(WaitReason::SocketRead),
             observer: Spinlock::new(None),
         }
     }
@@ -37,6 +37,17 @@ impl SocketWaitQueue {
 
     pub fn enqueue(&self, task: &Arc<Task>) {
         self.queue.enqueue(task);
+    }
+
+    pub fn prepare_to_wait(&self, task: &Arc<Task>) {
+        #[cfg(feature = "performance-profile")]
+        self.queue.prepare_to_wait(task, TaskState::Sleeping);
+        #[cfg(not(feature = "performance-profile"))]
+        {
+            let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
+            let _ = task.cas_state(TaskState::Runnable, TaskState::Sleeping);
+            self.queue.enqueue(task);
+        }
     }
 
     pub fn remove(&self, task: &Arc<Task>) {
@@ -100,9 +111,7 @@ pub(crate) fn wait_while(
             return Err(SocketError::TemporaryUnavailable);
         }
         let task = current_task();
-        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
-        let _ = task.cas_state(TaskState::Runnable, TaskState::Sleeping);
-        queue.enqueue(&task);
+        queue.prepare_to_wait(&task);
         let deadline_armed =
             deadline.is_some_and(|deadline| register_sleep_deadline(&task, deadline));
         if !predicate() {
@@ -140,4 +149,6 @@ fn restore_current_after_wait(task: &Arc<Task>) {
     if !task.cas_state(TaskState::Sleeping, TaskState::Running) {
         let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
     }
+    #[cfg(feature = "performance-profile")]
+    task.cancel_profile_wait();
 }

@@ -37,6 +37,7 @@ fn main() -> ! {
         profiling::install(
             hal::time::stable_counter_raw,
             ::sched::current_cpu_id,
+            ::sched::current_task_cpu_time_ns,
             hal::time::stable_counter_hz(),
         );
         profiling::set_enabled(true);

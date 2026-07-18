@@ -301,6 +301,8 @@ pub fn init() -> Arc<Task> {
 
     // 8) CPU 0 的 current 指向 init。
     publish_current_task(0, Arc::clone(&init_task));
+    #[cfg(feature = "performance-profile")]
+    init_task.account_switch_in(now_ns_internal());
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
@@ -568,6 +570,8 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
         task.adopt_current_context();
     }
     RUNQUEUES[cpu_id].set_current(Arc::clone(&task));
+    #[cfg(feature = "performance-profile")]
+    task.account_switch_in(now_ns_internal());
     publish_current_task(cpu_id, task);
     Ok(())
 }
@@ -990,6 +994,8 @@ fn wake_expired_sleepers(now_ns: u64) {
     };
     for task in expired {
         if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+            #[cfg(feature = "performance-profile")]
+            task.mark_profile_woken(now_ns);
             enqueue_task(task, now_ns);
         }
     }
@@ -1213,6 +1219,8 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         return;
     }
     if target.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+        #[cfg(feature = "performance-profile")]
+        target.mark_profile_woken(now_ns_internal());
         enqueue_task(Arc::clone(target), now_ns_internal());
     }
     // Running / Runnable：pending 位已经设好；下一轮 schedule 自然会检查。
@@ -1304,7 +1312,16 @@ pub fn schedule_once(now_ns: u64) {
         return;
     }
     #[cfg(feature = "performance-profile")]
-    profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
+    {
+        let account_now_ns = if now_ns == 0 {
+            now_ns_internal()
+        } else {
+            now_ns
+        };
+        profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
+        prev.account_switch_out(account_now_ns);
+        next.account_switch_in(account_now_ns);
+    }
     prev.record_involuntary_context_switch();
     let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
 
@@ -1375,6 +1392,14 @@ pub fn on_timer_tick(now_ns: u64) {
     if RUNQUEUES[cpu_id].tick(now_ns) {
         request_resched(cpu_id);
     }
+}
+
+/// profiling scope 读取当前任务 CPU 时间的无分配回调。
+pub fn current_task_cpu_time_ns() -> u64 {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    current_task_ref().cpu_runtime_ns(now_ns_internal())
 }
 
 /// 在合适的边界（trap 返回前、syscall 返回前、显式让渡入口）调用。读到
