@@ -1551,14 +1551,14 @@ pub(super) fn sys_epoll_pwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
-    let maxevents = ctx.args[2];
+    let maxevents = ctx.args[2] as i32;
     let timeout_ms = ctx.args[3] as i32 as i64;
     let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
-    if maxevents == 0 {
+    if maxevents <= 0 {
         return Err(Errno::EINVAL);
     }
     let _mask_guard = TemporarySigmask::install(sigmask);
-    let ready = vfs::epoll::wait(&fdt, epfd, maxevents, timeout_ms)?;
+    let ready = vfs::epoll::wait(&fdt, epfd, maxevents as usize, timeout_ms)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
 }
@@ -2530,14 +2530,14 @@ pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
-    let maxevents = ctx.args[2];
+    let maxevents = ctx.args[2] as i32;
     let timeout_ms = read_timespec_ms_ceil(ctx.args[3])?;
     let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
-    if maxevents == 0 {
+    if maxevents <= 0 {
         return Err(Errno::EINVAL);
     }
     let _mask_guard = TemporarySigmask::install(sigmask);
-    let ready = vfs::epoll::wait(&fdt, epfd, maxevents, timeout_ms)?;
+    let ready = vfs::epoll::wait(&fdt, epfd, maxevents as usize, timeout_ms)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
 }
