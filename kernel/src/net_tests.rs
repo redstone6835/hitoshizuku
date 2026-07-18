@@ -624,6 +624,9 @@ fn udp_send_then_close_preserves_accepted_datagram() {
 
 #[ktest]
 fn virtio_user_network_arp_roundtrip() {
+    if !net_runtime::physical_network_available() {
+        return;
+    }
     net_runtime::request_arp_probe();
     let deadline = sched::now_ns_public().saturating_add(3_000_000_000);
     while sched::now_ns_public() < deadline {
@@ -657,11 +660,32 @@ fn udp_loopback_frontend_roundtrip() {
             sched::schedule_once(sched::now_ns_public());
         }
     }
-    panic!("3 秒内未完成 UDP loopback frontend 闭环");
+    let stats = net::device::snapshot_stats();
+    let value = |key| {
+        stats
+            .iter()
+            .find(|stat| stat.key == key)
+            .map_or(0, |stat| stat.value)
+    };
+    panic!(
+        "3 秒内未完成 UDP loopback frontend 闭环: poll={} rx={} tx={} tx_err={} fatal_gone={} proto_udp={} proto_tx={} dirty={} time_budget={}",
+        value("poll_total"),
+        value("rx_packets"),
+        value("tx_packets"),
+        value("tx_errors"),
+        value("fatal_device_gone"),
+        value("protocol_udp_delivered"),
+        value("protocol_tx_formed"),
+        value("protocol_dirty_runs"),
+        value("budget_time"),
+    );
 }
 
 #[ktest]
 fn virtio_udp_dns_roundtrip() {
+    if !net_runtime::physical_network_available() {
+        return;
+    }
     net_runtime::request_physical_udp_probe();
     let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
     while sched::now_ns_public() < deadline {

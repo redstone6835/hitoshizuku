@@ -82,14 +82,15 @@ fn main() -> ! {
             integrated
         );
     }
-    // runtime 组件完成网络 queue 注册后，再统一创建固定 affinity worker。
-    net_runtime::start_workers();
     elm::init_builtin_mgr();
     let build_bound = elm::load_build_bound_modules(&init)
         .unwrap_or_else(|error| panic!("[kernel] BuildBound ELM 自动装载失败: {error}"));
     if build_bound != 0 {
         log::info!("[kernel] activated {} BuildBound ELM(s)", build_bound);
     }
+    // 网络 host 允许没有设备启动；BuildBound driver 已激活时会在此首次 attach，后续
+    // 动态装载则通过 ELM 管理路径触发 reconcile。
+    net_runtime::start_workers();
     if device_init::retry_deferred_boot_console(&init) {
         log::info!("[kernel] deferred boot console activated after BuildBound loading");
     }

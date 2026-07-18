@@ -14,6 +14,7 @@ performance-profile = ["dep:profiling"]
 [dependencies]
 elm_model = { package = "elm", path = "../elm" }
 hashbrown = { version = "0.17.1", default-features = false }
+kernel-symbols = { path = "../kernel-symbols", default-features = false }
 profiling = { path = "../profiling", optional = true }
 sched = { path = "../sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }

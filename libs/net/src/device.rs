@@ -3,15 +3,19 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
-use crate::buf::NetBufPoolOwner;
-use crate::queue::NetQueuePair;
+use crate::buf::{CompletionBatch, NetBufPoolOwner, PacketBatch, RxRefillBatch, TxBatch};
+use crate::queue::{
+    NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
+    TxReclaimResult, TxSubmitResult,
+};
 use crate::{NetDeviceId, QueuePairId};
 
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_DEVICE_HANDLE: AtomicU64 = AtomicU64::new(1);
 static BOOT_CONFIG: Mutex<Option<NetBootConfig>> = Mutex::new(None);
 static REGISTRAR: Mutex<Option<&'static dyn NetDeviceRegistrar>> = Mutex::new(None);
 
@@ -110,18 +114,338 @@ pub struct QueueIrqStats {
     pub irq_unmask: u64,
 }
 
+pub const NET_QUEUE_CALL_ABI_VERSION: u16 = 1;
+pub const NET_QUEUE_CALL_RUST_ABI: &str = "fn(&mutnet::device::NetQueueCallV1)->i32";
+pub const NET_QUEUE_CALL_STATUS_OK: i32 = 0;
+pub const NET_QUEUE_CALL_STATUS_INVALID: i32 = -22;
+
+pub const NET_QUEUE_OP_REFILL_RX: u32 = 1;
+pub const NET_QUEUE_OP_POLL_RX: u32 = 2;
+pub const NET_QUEUE_OP_RECLAIM_TX: u32 = 3;
+pub const NET_QUEUE_OP_SUBMIT_TX: u32 = 4;
+pub const NET_QUEUE_OP_HAS_PENDING: u32 = 5;
+pub const NET_QUEUE_OP_QUIESCE: u32 = 6;
+
+/// host 与 driver ELM 间一次同步 queue batch 调用的固定帧。
+#[repr(C)]
+pub struct NetQueueCallV1 {
+    pub abi_version: u16,
+    pub struct_size: u16,
+    pub opcode: u32,
+    pub queue_id: QueuePairId,
+    pub reserved0: u16,
+    pub budget: RxBudget,
+    pub refill_batch: *mut RxRefillBatch,
+    pub packet_batch: *mut PacketBatch,
+    pub completion_batch: *mut CompletionBatch,
+    pub tx_batch: *mut TxBatch,
+    pub tx_header_pool: *mut NetBufPoolOwner,
+    pub rx_refill_result: RxRefillResult,
+    pub rx_poll_result: RxPollResult,
+    pub tx_reclaim_result: TxReclaimResult,
+    pub tx_submit_result: TxSubmitResult,
+    pub pending: bool,
+    pub quiesce_result: Option<QueueFatalError>,
+    pub reserved1: [u64; 2],
+}
+
+#[kernel_symbols::export]
+impl NetQueueCallV1 {
+    pub fn new(opcode: u32, queue_id: QueuePairId) -> Self {
+        Self {
+            abi_version: NET_QUEUE_CALL_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            opcode,
+            queue_id,
+            reserved0: 0,
+            budget: RxBudget {
+                packets: 1,
+                bytes: 1,
+            },
+            refill_batch: core::ptr::null_mut(),
+            packet_batch: core::ptr::null_mut(),
+            completion_batch: core::ptr::null_mut(),
+            tx_batch: core::ptr::null_mut(),
+            tx_header_pool: core::ptr::null_mut(),
+            rx_refill_result: RxRefillResult {
+                posted: 0,
+                descriptor_starved: false,
+                fatal: None,
+            },
+            rx_poll_result: RxPollResult {
+                packets: 0,
+                bytes: 0,
+                ring_empty: true,
+                descriptor_starved: false,
+                fatal: None,
+            },
+            tx_reclaim_result: TxReclaimResult {
+                completions: 0,
+                descriptors: 0,
+                ring_empty: true,
+                fatal: None,
+            },
+            tx_submit_result: TxSubmitResult {
+                packets: 0,
+                descriptors: 0,
+                bytes: 0,
+                queue_full: false,
+                fatal: None,
+            },
+            pending: false,
+            quiesce_result: None,
+            reserved1: [0; 2],
+        }
+    }
+
+    #[kernel_symbols::export(
+        name = "net.device.NetQueueCallV1.valid",
+        contract = "kernel.net.queue-call-frame@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
+    pub fn valid(&self, opcode: u32, queue_id: QueuePairId) -> bool {
+        self.abi_version == NET_QUEUE_CALL_ABI_VERSION
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.opcode == opcode
+            && self.queue_id == queue_id
+            && self.reserved0 == 0
+            && self.reserved1 == [0; 2]
+    }
+}
+
+/// 动态 ELM queue 的代际固定 export 描述；字符串已复制到常驻分配中。
+pub struct PinnedNetQueueEndpoint {
+    owner_cell: u64,
+    owner_generation: u64,
+    export_name: Box<str>,
+    export_contract: Box<str>,
+    export_version: u32,
+    id: QueuePairId,
+    caps: NetQueueCaps,
+    tx_produces_rx_synchronously: bool,
+}
+
+#[kernel_symbols::export]
+impl PinnedNetQueueEndpoint {
+    #[kernel_symbols::export(
+        name = "net.device.PinnedNetQueueEndpoint.current",
+        contract = "kernel.net.queue-endpoint@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
+    pub fn current(
+        export_name: &str,
+        export_contract: &str,
+        export_version: u32,
+        id: QueuePairId,
+        caps: NetQueueCaps,
+        tx_produces_rx_synchronously: bool,
+    ) -> Option<Self> {
+        let context = elm_model::current_context()?;
+        if export_name.is_empty()
+            || export_contract.is_empty()
+            || export_version == 0
+            || elm_model::FlowContract::new(export_contract).is_err()
+        {
+            return None;
+        }
+        Some(Self {
+            owner_cell: context.cell_id.0,
+            owner_generation: context.generation.0,
+            export_name: export_name.into(),
+            export_contract: export_contract.into(),
+            export_version,
+            id,
+            caps,
+            tx_produces_rx_synchronously,
+        })
+    }
+
+    pub const fn owner_cell(&self) -> u64 {
+        self.owner_cell
+    }
+
+    pub const fn owner_generation(&self) -> u64 {
+        self.owner_generation
+    }
+
+    pub fn export_name(&self) -> &str {
+        &self.export_name
+    }
+
+    pub fn export_contract(&self) -> &str {
+        &self.export_contract
+    }
+
+    pub const fn export_version(&self) -> u32 {
+        self.export_version
+    }
+
+    pub const fn id(&self) -> QueuePairId {
+        self.id
+    }
+
+    pub const fn caps(&self) -> NetQueueCaps {
+        self.caps
+    }
+
+    pub const fn tx_produces_rx_synchronously(&self) -> bool {
+        self.tx_produces_rx_synchronously
+    }
+}
+
+pub enum NetQueueEndpoint {
+    Integrated(Box<dyn NetQueuePair>),
+    Pinned(PinnedNetQueueEndpoint),
+}
+
+impl NetQueueEndpoint {
+    pub fn id(&self) -> QueuePairId {
+        match self {
+            Self::Integrated(queue) => queue.id(),
+            Self::Pinned(queue) => queue.id(),
+        }
+    }
+
+    pub fn caps(&self) -> NetQueueCaps {
+        match self {
+            Self::Integrated(queue) => queue.caps(),
+            Self::Pinned(queue) => queue.caps(),
+        }
+    }
+}
+
 /// 一个 queue pair 连同其三个独立 pool owner 的原子注册单元。
 pub struct NetQueueRegistration {
     pub id: QueuePairId,
-    pub queue: Box<dyn NetQueuePair>,
+    pub queue: NetQueueEndpoint,
     pub rx_pool: NetBufPoolOwner,
     pub tx_header_pool: NetBufPoolOwner,
     pub tx_payload_pool: NetBufPoolOwner,
     pub irq: Arc<dyn QueueIrqControl>,
 }
 
+#[kernel_symbols::export]
+impl NetQueueRegistration {
+    pub fn integrated_heap(
+        queue: Box<dyn NetQueuePair>,
+        rx_pool_count: usize,
+        rx_buffer_size: usize,
+        tx_header_pool_count: usize,
+        tx_header_size: usize,
+        tx_payload_pool_count: usize,
+        tx_payload_size: usize,
+    ) -> Result<Self, crate::buf::NetBufPoolError> {
+        let id = queue.id();
+        Ok(Self {
+            id,
+            queue: NetQueueEndpoint::Integrated(queue),
+            rx_pool: crate::buf::NetBufPool::new_heap(rx_pool_count, rx_buffer_size)?,
+            tx_header_pool: crate::buf::NetBufPool::new_heap(tx_header_pool_count, tx_header_size)?,
+            tx_payload_pool: crate::buf::NetBufPool::new_heap(
+                tx_payload_pool_count,
+                tx_payload_size,
+            )?,
+            irq: Arc::new(SoftwareQueueIrq::new()),
+        })
+    }
+
+    #[kernel_symbols::export(
+        name = "net.device.NetQueueRegistration.pinned_heap",
+        contract = "kernel.net.queue-endpoint@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY | kernel_symbols::capability::DEVICE_DRIVER | kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn pinned_heap(
+        endpoint: PinnedNetQueueEndpoint,
+        rx_pool_count: usize,
+        rx_buffer_size: usize,
+        tx_header_pool_count: usize,
+        tx_header_size: usize,
+        tx_payload_pool_count: usize,
+        tx_payload_size: usize,
+    ) -> Result<Self, crate::buf::NetBufPoolError> {
+        let id = endpoint.id();
+        Ok(Self {
+            id,
+            queue: NetQueueEndpoint::Pinned(endpoint),
+            rx_pool: crate::buf::NetBufPool::new_heap(rx_pool_count, rx_buffer_size)?,
+            tx_header_pool: crate::buf::NetBufPool::new_heap(tx_header_pool_count, tx_header_size)?,
+            tx_payload_pool: crate::buf::NetBufPool::new_heap(
+                tx_payload_pool_count,
+                tx_payload_size,
+            )?,
+            irq: Arc::new(SoftwareQueueIrq::new()),
+        })
+    }
+}
+
+struct SoftwareQueueIrq {
+    pending: core::sync::atomic::AtomicBool,
+    masked: core::sync::atomic::AtomicBool,
+    waker: Mutex<Option<Arc<dyn QueueWakeHandle>>>,
+    irq_total: AtomicU64,
+    irq_mask: AtomicU64,
+    irq_unmask: AtomicU64,
+}
+
+impl SoftwareQueueIrq {
+    fn new() -> Self {
+        Self {
+            pending: core::sync::atomic::AtomicBool::new(false),
+            masked: core::sync::atomic::AtomicBool::new(false),
+            waker: Mutex::new(None),
+            irq_total: AtomicU64::new(0),
+            irq_mask: AtomicU64::new(0),
+            irq_unmask: AtomicU64::new(0),
+        }
+    }
+}
+
+impl QueueIrqControl for SoftwareQueueIrq {
+    fn ack_and_mask(&self) -> bool {
+        if !self.pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.masked.store(true, Ordering::Release);
+        self.irq_mask.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn unmask(&self) {
+        self.pending.store(false, Ordering::Release);
+        self.masked.store(false, Ordering::Release);
+        self.irq_unmask.fetch_add(1, Ordering::Relaxed);
+        if self.pending.load(Ordering::Acquire)
+            && let Some(waker) = self.waker.lock().as_ref()
+        {
+            waker.wake();
+        }
+    }
+
+    fn set_waker(&self, waker: Arc<dyn QueueWakeHandle>) -> Result<(), QueueIrqError> {
+        let mut slot = self.waker.lock();
+        if slot.is_some() {
+            return Err(QueueIrqError::WakerAlreadyInstalled);
+        }
+        *slot = Some(waker);
+        Ok(())
+    }
+
+    fn stats(&self) -> QueueIrqStats {
+        QueueIrqStats {
+            irq_total: self.irq_total.load(Ordering::Relaxed),
+            irq_mask: self.irq_mask.load(Ordering::Relaxed),
+            irq_unmask: self.irq_unmask.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// driver 完成协商后一次性交给 kernel 的设备资源。
 pub struct NetDeviceRegistration {
+    handle: NetDeviceHandle,
     pub id: NetDeviceId,
     pub name: Box<str>,
     pub mac_address: [u8; 6],
@@ -130,7 +454,14 @@ pub struct NetDeviceRegistration {
     pub queues: Box<[NetQueueRegistration]>,
 }
 
+#[kernel_symbols::export]
 impl NetDeviceRegistration {
+    #[kernel_symbols::export(
+        name = "net.device.NetDeviceRegistration.new",
+        contract = "kernel.net.device-registration@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
     pub fn new(
         name: Box<str>,
         mac_address: [u8; 6],
@@ -140,7 +471,10 @@ impl NetDeviceRegistration {
     ) -> Self {
         let raw = NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed);
         assert!(raw != 0, "NetDeviceId 已耗尽");
+        let raw_handle = NEXT_DEVICE_HANDLE.fetch_add(1, Ordering::Relaxed);
+        assert!(raw_handle != 0, "NetDeviceHandle 已耗尽");
         Self {
+            handle: NetDeviceHandle(raw_handle),
             id: NetDeviceId(raw),
             name,
             mac_address,
@@ -148,6 +482,10 @@ impl NetDeviceRegistration {
             running,
             queues,
         }
+    }
+
+    pub const fn handle(&self) -> NetDeviceHandle {
+        self.handle
     }
 }
 
@@ -254,6 +592,13 @@ pub fn boot_config() -> Option<NetBootConfig> {
     *BOOT_CONFIG.lock()
 }
 
+#[kernel_symbols::export(
+    name = "net.device.register_device",
+    contract = "kernel.net.device-registration@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER | kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn register_device(
     registration: NetDeviceRegistration,
 ) -> Result<NetDeviceHandle, NetDeviceRegisterError> {
@@ -264,15 +609,98 @@ pub fn register_device(
             registration,
         });
     };
-    registrar.register_device(registration)
+    let handle = registration.handle();
+    let tracked = kernel_symbols::track_owned_resource(
+        kernel_symbols::KERNEL_SYMBOL_RESOURCE_KIND_DEVICE,
+        handle.0,
+        NET_DEVICE_RESOURCE_OPS,
+    );
+    if tracked == kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_FAILED {
+        return Err(NetDeviceRegisterError {
+            kind: NetDeviceRegisterErrorKind::ResourceExhausted,
+            registration,
+        });
+    }
+    match registrar.register_device(registration) {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            if tracked == kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_TRACKED {
+                let _ = kernel_symbols::untrack_owned_resource(
+                    kernel_symbols::KERNEL_SYMBOL_RESOURCE_KIND_DEVICE,
+                    handle.0,
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
+#[kernel_symbols::export(
+    name = "net.device.begin_remove",
+    contract = "kernel.net.device-registration@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER | kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn begin_remove(handle: NetDeviceHandle) -> Result<NetDeviceTeardown, NetDeviceRemoveError> {
     let registrar = *REGISTRAR.lock();
     let Some(registrar) = registrar else {
         return Err(NetDeviceRemoveError::NoDevice);
     };
-    registrar.begin_remove(handle)
+    let result = registrar.begin_remove(handle);
+    if result.is_ok() {
+        let _ = kernel_symbols::untrack_owned_resource(
+            kernel_symbols::KERNEL_SYMBOL_RESOURCE_KIND_DEVICE,
+            handle.0,
+        );
+    }
+    result
+}
+
+const NET_DEVICE_RESOURCE_OPS: kernel_symbols::KernelSymbolOwnedResourceOpsV1 =
+    kernel_symbols::KernelSymbolOwnedResourceOpsV1::new(
+        suspend_net_device_resource,
+        resume_net_device_resource,
+        quiesce_net_device_resource,
+        cancel_net_device_resource,
+        drain_net_device_resource,
+        release_net_device_resource,
+    );
+
+fn suspend_net_device_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i32> {
+    // v1 不承诺暂停后保留 queue 状态；拒绝 pause 比让 worker 继续进入暂停镜像更安全。
+    Err(-16)
+}
+
+fn resume_net_device_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i32> {
+    Ok(())
+}
+
+fn quiesce_net_device_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
+    remove_owned_net_device(NetDeviceHandle(handle))
+}
+
+fn cancel_net_device_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i32> {
+    Ok(())
+}
+
+fn drain_net_device_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
+    remove_owned_net_device(NetDeviceHandle(handle))
+}
+
+fn release_net_device_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
+    remove_owned_net_device(NetDeviceHandle(handle))
+}
+
+fn remove_owned_net_device(handle: NetDeviceHandle) -> Result<(), i32> {
+    let registrar = *REGISTRAR.lock();
+    let Some(registrar) = registrar else {
+        return Err(-19);
+    };
+    match registrar.begin_remove(handle) {
+        Ok(_) | Err(NetDeviceRemoveError::NoDevice) => Ok(()),
+        Err(NetDeviceRemoveError::Busy | NetDeviceRemoveError::AlreadyRemoving) => Err(-16),
+    }
 }
 
 /// registrar 尚未安装时返回空列表，供早期 procfs/sysfs/netlink 安全读取。
@@ -306,5 +734,40 @@ mod tests {
         assert_eq!(config.generation_nonce()[0], 88);
         assert_eq!(config.mac_seed()[0], 96);
         assert_eq!(config.active_cpu_count(), 4);
+    }
+
+    #[test]
+    fn queue_call_frame_rejects_stale_or_corrupt_prefix() {
+        let queue = QueuePairId(3);
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_POLL_RX, queue);
+        assert!(frame.valid(NET_QUEUE_OP_POLL_RX, queue));
+        frame.abi_version = frame.abi_version.saturating_add(1);
+        assert!(!frame.valid(NET_QUEUE_OP_POLL_RX, queue));
+        frame.abi_version = NET_QUEUE_CALL_ABI_VERSION;
+        frame.reserved1[0] = 1;
+        assert!(!frame.valid(NET_QUEUE_OP_POLL_RX, queue));
+    }
+
+    #[test]
+    fn pinned_queue_endpoint_requires_elm_context() {
+        assert!(
+            PinnedNetQueueEndpoint::current(
+                "test.queue",
+                "test.queue@1",
+                1,
+                QueuePairId(0),
+                NetQueueCaps {
+                    queue_size: 16,
+                    scatter_gather: false,
+                    max_tx_descriptors: 1,
+                    max_rx_batch: 32,
+                    max_tx_batch: 32,
+                    udp_segmentation: false,
+                    max_udp_segments: 0,
+                },
+                false,
+            )
+            .is_none()
+        );
     }
 }

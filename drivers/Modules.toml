@@ -87,7 +87,7 @@ name = "net.loopback"
 path = "loopback"
 config = "CONFIG_NET_LOOPBACK"
 prompt = "本地回环网络驱动"
-default = "y"
+default = "m"
 
 [[modules]]
 name = "virtio.framework"

@@ -1,6 +1,7 @@
 //! pinned buffer pool、generation 校验与跨 CPU 回收。
 
 use alloc::boxed::Box;
+use alloc::vec;
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
@@ -47,6 +48,28 @@ pub trait NetBufStorage: Send {
     fn dma_addr(&self) -> Option<u64>;
     fn sync_for_cpu(&self, offset: usize, len: usize);
     fn sync_for_device(&self, offset: usize, len: usize);
+}
+
+struct ResidentHeapStorage {
+    bytes: Box<[u8]>,
+}
+
+impl NetBufStorage for ResidentHeapStorage {
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn base_ptr(&self) -> NonNull<u8> {
+        NonNull::new(self.bytes.as_ptr() as *mut u8).expect("resident heap storage 地址为空")
+    }
+
+    fn dma_addr(&self) -> Option<u64> {
+        None
+    }
+
+    fn sync_for_cpu(&self, _offset: usize, _len: usize) {}
+
+    fn sync_for_device(&self, _offset: usize, _len: usize) {}
 }
 
 /// pool 构造或租借失败。
@@ -144,7 +167,30 @@ pub struct NetBufPool {
 unsafe impl Send for NetBufPool {}
 unsafe impl Sync for NetBufPool {}
 
+#[kernel_symbols::export]
 impl NetBufPool {
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufPool.new_heap",
+        contract = "kernel.net.resident-buffer-pool@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY | kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn new_heap(count: usize, size: usize) -> Result<NetBufPoolOwner, NetBufPoolError> {
+        if count == 0 || size == 0 || size > u16::MAX as usize {
+            return Err(NetBufPoolError::InvalidRange);
+        }
+        let storages = (0..count)
+            .map(|_| {
+                Box::new(ResidentHeapStorage {
+                    bytes: vec![0; size].into_boxed_slice(),
+                }) as Box<dyn NetBufStorage>
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .into_boxed_slice();
+        Self::new(storages)
+    }
+
     /// 构造 pinned pool 和唯一 owner。任一 storage 不合规时整体失败。
     pub fn new(
         storages: Box<[Box<dyn NetBufStorage>]>,
@@ -712,7 +758,15 @@ impl NetBufLease {
     }
 }
 
+#[kernel_symbols::export]
 impl Drop for NetBufLease {
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufLease.drop",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     fn drop(&mut self) {
         // SAFETY: pool teardown 必须等待 outstanding 归零，因此 Drop 时地址有效。
         unsafe { self.pool.as_ref() }.release_remote(
@@ -852,7 +906,15 @@ impl ChunkRef {
     }
 }
 
+#[kernel_symbols::export]
 impl Drop for ChunkRef {
+    #[kernel_symbols::export(
+        name = "net.buf.ChunkRef.drop",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     fn drop(&mut self) {
         // SAFETY: pool teardown 必须等待全部引用归零，因此 Drop 时地址有效。
         unsafe { self.pool.as_ref() }.release_remote(

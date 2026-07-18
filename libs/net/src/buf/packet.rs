@@ -282,6 +282,7 @@ pub struct PacketBatch {
     len: u8,
 }
 
+#[kernel_symbols::export]
 impl PacketBatch {
     pub fn new() -> Self {
         Self {
@@ -299,6 +300,13 @@ impl PacketBatch {
         self.len == 0
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.PacketBatch.push",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn push(
         &mut self,
         packet: PacketChain,
@@ -366,6 +374,7 @@ pub struct RxRefillBatch {
     len: u8,
 }
 
+#[kernel_symbols::export]
 impl RxRefillBatch {
     pub fn new() -> Self {
         Self {
@@ -392,6 +401,13 @@ impl RxRefillBatch {
     }
 
     /// queue 只应取走已经成功发布的前缀 slot。
+    #[kernel_symbols::export(
+        name = "net.buf.RxRefillBatch.take",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn take(&mut self, index: usize) -> Option<NetBufLease> {
         if index >= self.len() {
             return None;
@@ -439,6 +455,7 @@ pub struct TxBatch {
     len: u8,
 }
 
+#[kernel_symbols::export]
 impl TxBatch {
     pub fn new() -> Self {
         Self {
@@ -471,6 +488,13 @@ impl TxBatch {
     }
 
     /// queue 只应取走已经成功发布的前缀 slot。
+    #[kernel_symbols::export(
+        name = "net.buf.TxBatch.take",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn take(&mut self, index: usize) -> Option<TxPacket> {
         if index >= self.len() {
             return None;
@@ -504,6 +528,7 @@ pub struct CompletionBatch {
     len: u8,
 }
 
+#[kernel_symbols::export]
 impl CompletionBatch {
     pub fn new() -> Self {
         Self {
@@ -520,6 +545,13 @@ impl CompletionBatch {
         self.len == 0
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.CompletionBatch.push",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn push(&mut self, token: CompletionToken) -> Result<(), CompletionToken> {
         if self.len as usize == self.tokens.len() {
             return Err(token);

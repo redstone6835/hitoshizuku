@@ -1,22 +1,23 @@
 //! 批量队列的 loopback ELM 设备。
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec;
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Mutex;
 
 use net::QueuePairId;
 use net::buf::{
-    CompletionBatch, CompletionToken, NetBufPool, NetBufPoolOwner, NetBufStorage, PacketBatch,
-    PacketLayout, PacketMetadata, RxRefillBatch, TxBatch,
+    CompletionBatch, CompletionToken, NetBufPoolOwner, PacketBatch, PacketLayout, PacketMetadata,
+    RxRefillBatch, TxBatch,
 };
 use net::device::{
-    NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration, NetDeviceRemoveError,
-    NetQueueRegistration, QueueIrqControl, QueueIrqError, QueueIrqStats, QueueWakeHandle,
+    NET_QUEUE_CALL_STATUS_INVALID, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
+    NET_QUEUE_OP_POLL_RX, NET_QUEUE_OP_QUIESCE, NET_QUEUE_OP_RECLAIM_TX, NET_QUEUE_OP_REFILL_RX,
+    NET_QUEUE_OP_SUBMIT_TX, NetDeviceHandle, NetDeviceRegisterErrorKind, NetDeviceRegistration,
+    NetDeviceRemoveError, NetQueueRegistration,
 };
+#[cfg(not(feature = "elm-integrated"))]
+use net::device::PinnedNetQueueEndpoint;
 use net::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
     TxReclaimResult, TxSubmitResult,
@@ -28,107 +29,9 @@ const LOOPBACK_MTU: u32 = 65_536;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoopbackError {
     Pool,
+    Context,
     Register(NetDeviceRegisterErrorKind),
     Remove(NetDeviceRemoveError),
-}
-
-struct HeapStorage {
-    bytes: Box<[u8]>,
-}
-
-impl HeapStorage {
-    fn new(size: usize) -> Self {
-        Self {
-            bytes: vec![0; size].into_boxed_slice(),
-        }
-    }
-}
-
-impl NetBufStorage for HeapStorage {
-    fn capacity(&self) -> usize {
-        self.bytes.len()
-    }
-
-    fn base_ptr(&self) -> NonNull<u8> {
-        NonNull::new(self.bytes.as_ptr() as *mut u8).expect("loopback storage 地址为空")
-    }
-
-    fn dma_addr(&self) -> Option<u64> {
-        None
-    }
-
-    fn sync_for_cpu(&self, _offset: usize, _len: usize) {}
-
-    fn sync_for_device(&self, _offset: usize, _len: usize) {}
-}
-
-fn make_pool(count: usize, size: usize) -> Result<NetBufPoolOwner, LoopbackError> {
-    let storages = (0..count)
-        .map(|_| Box::new(HeapStorage::new(size)) as Box<dyn NetBufStorage>)
-        .collect::<alloc::vec::Vec<_>>()
-        .into_boxed_slice();
-    NetBufPool::new(storages).map_err(|_| LoopbackError::Pool)
-}
-
-struct LoopbackIrq {
-    pending: AtomicBool,
-    masked: AtomicBool,
-    waker: Mutex<Option<Arc<dyn QueueWakeHandle>>>,
-    irq_total: AtomicU64,
-    irq_mask: AtomicU64,
-    irq_unmask: AtomicU64,
-}
-
-impl LoopbackIrq {
-    fn new() -> Self {
-        Self {
-            pending: AtomicBool::new(false),
-            masked: AtomicBool::new(false),
-            waker: Mutex::new(None),
-            irq_total: AtomicU64::new(0),
-            irq_mask: AtomicU64::new(0),
-            irq_unmask: AtomicU64::new(0),
-        }
-    }
-}
-
-impl QueueIrqControl for LoopbackIrq {
-    fn ack_and_mask(&self) -> bool {
-        if !self.pending.swap(false, Ordering::AcqRel) {
-            return false;
-        }
-        self.masked.store(true, Ordering::Release);
-        self.irq_mask.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
-    fn unmask(&self) {
-        self.pending.store(false, Ordering::Release);
-        self.masked.store(false, Ordering::Release);
-        self.irq_unmask.fetch_add(1, Ordering::Relaxed);
-        if self.pending.load(Ordering::Acquire)
-            && let Some(waker) = self.waker.lock().as_ref()
-        {
-            waker.wake();
-        }
-    }
-
-    fn set_waker(&self, waker: Arc<dyn QueueWakeHandle>) -> Result<(), QueueIrqError> {
-        let mut slot = self.waker.lock();
-        if slot.is_some() {
-            return Err(QueueIrqError::WakerAlreadyInstalled);
-        }
-        *slot = Some(waker);
-        Ok(())
-    }
-
-    fn stats(&self) -> QueueIrqStats {
-        QueueIrqStats {
-            irq_total: self.irq_total.load(Ordering::Relaxed),
-            irq_mask: self.irq_mask.load(Ordering::Relaxed),
-            irq_unmask: self.irq_unmask.load(Ordering::Relaxed),
-        }
-    }
 }
 
 struct LoopbackQueue {
@@ -146,7 +49,21 @@ struct LoopbackQueue {
     quiesced: bool,
 }
 
+static QUEUE: Mutex<Option<LoopbackQueue>> = Mutex::new(None);
+
 impl LoopbackQueue {
+    const fn caps_value() -> NetQueueCaps {
+        NetQueueCaps {
+            queue_size: 256,
+            scatter_gather: true,
+            max_tx_descriptors: 18,
+            max_rx_batch: 32,
+            max_tx_batch: 32,
+            udp_segmentation: true,
+            max_udp_segments: 16,
+        }
+    }
+
     fn new() -> Self {
         Self {
             packets: (0..LOOPBACK_RING_SIZE)
@@ -177,15 +94,7 @@ impl NetQueuePair for LoopbackQueue {
     }
 
     fn caps(&self) -> NetQueueCaps {
-        NetQueueCaps {
-            queue_size: 256,
-            scatter_gather: true,
-            max_tx_descriptors: 18,
-            max_rx_batch: 32,
-            max_tx_batch: 32,
-            udp_segmentation: true,
-            max_udp_segments: 16,
-        }
+        Self::caps_value()
     }
 
     fn tx_produces_rx_synchronously(&self) -> bool {
@@ -233,10 +142,15 @@ impl NetQueuePair for LoopbackQueue {
             let metadata = self.metadata[self.packet_head].unwrap_or_default();
             let (logical_packets, logical_bytes) = match metadata.layout {
                 PacketLayout::Plain => (1u16, stored_len),
-                PacketLayout::UdpSegments(layout) => (
-                    u16::from(layout.segment_count),
-                    layout.logical_bytes().min(u32::MAX as usize) as u32,
-                ),
+                PacketLayout::UdpSegments(layout) => {
+                    let logical_bytes = (usize::from(layout.header_len)
+                        + usize::from(layout.payload_len))
+                    .saturating_mul(usize::from(layout.segment_count));
+                    (
+                        u16::from(layout.segment_count),
+                        logical_bytes.min(u32::MAX as usize) as u32,
+                    )
+                }
             };
             if packets != 0
                 && (packets.saturating_add(logical_packets) > budget.packets
@@ -304,9 +218,10 @@ impl NetQueuePair for LoopbackQueue {
             let stored_len = packet.chain.total_len() as u32;
             let logical_bytes = match packet.layout {
                 PacketLayout::Plain => stored_len,
-                PacketLayout::UdpSegments(layout) => {
-                    layout.logical_bytes().min(u32::MAX as usize) as u32
-                }
+                PacketLayout::UdpSegments(layout) => (usize::from(layout.header_len)
+                    + usize::from(layout.payload_len))
+                .saturating_mul(usize::from(layout.segment_count))
+                .min(u32::MAX as usize) as u32,
             };
             descriptors = descriptors.saturating_add(packet.chain.fragment_count() as u16);
             bytes = bytes.saturating_add(logical_bytes);
@@ -348,14 +263,33 @@ pub(crate) struct LoopbackHandle {
 }
 
 pub(crate) fn register() -> Result<LoopbackHandle, LoopbackError> {
-    let irq = Arc::new(LoopbackIrq::new());
-    let queue = NetQueueRegistration {
-        id: QueuePairId(0),
-        queue: Box::new(LoopbackQueue::new()),
-        rx_pool: make_pool(48, 4096)?,
-        tx_header_pool: make_pool(256, 256)?,
-        tx_payload_pool: make_pool(256, 4096)?,
-        irq,
+    #[cfg(not(feature = "elm-integrated"))]
+    let queue = {
+        let caps = LoopbackQueue::caps_value();
+        let endpoint = PinnedNetQueueEndpoint::current(
+            "net.loopback.queue-call",
+            "mygo.net.queue-call@1",
+            1,
+            QueuePairId(0),
+            caps,
+            true,
+        )
+        .ok_or(LoopbackError::Context)?;
+        NetQueueRegistration::pinned_heap(endpoint, 48, 4096, 256, 256, 256, 4096)
+            .map_err(|_| LoopbackError::Pool)?
+    };
+    #[cfg(feature = "elm-integrated")]
+    let queue = {
+        NetQueueRegistration::integrated_heap(
+            Box::new(LoopbackQueue::new()),
+            48,
+            4096,
+            256,
+            256,
+            256,
+            4096,
+        )
+        .map_err(|_| LoopbackError::Pool)?
     };
     let registration = NetDeviceRegistration::new(
         "lo".into(),
@@ -372,8 +306,84 @@ pub(crate) fn register() -> Result<LoopbackHandle, LoopbackError> {
 
 impl LoopbackHandle {
     pub(crate) fn unregister(&self) -> Result<(), LoopbackError> {
-        net::device::begin_remove(self.handle)
-            .map(|_| ())
-            .map_err(LoopbackError::Remove)
+        match net::device::begin_remove(self.handle) {
+            Ok(_) | Err(NetDeviceRemoveError::NoDevice) => Ok(()),
+            Err(error) => Err(LoopbackError::Remove(error)),
+        }
     }
+}
+
+#[cfg(feature = "elm-integrated")]
+pub(crate) fn create_queue() -> Result<(), LoopbackError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "elm-integrated"))]
+pub(crate) fn create_queue() -> Result<(), LoopbackError> {
+    let mut queue = QUEUE.lock();
+    if queue.is_some() {
+        return Err(LoopbackError::Context);
+    }
+    *queue = Some(LoopbackQueue::new());
+    Ok(())
+}
+
+pub(crate) fn quiesce_queue() {
+    if let Some(queue) = QUEUE.lock().as_mut() {
+        let _ = queue.quiesce();
+    }
+}
+
+pub(crate) fn destroy_queue() {
+    *QUEUE.lock() = None;
+}
+
+#[elm::export(
+    name = "net.loopback.queue-call",
+    contract = "mygo.net.queue-call@1",
+    version = 1,
+    mode = "direct-pinned",
+    visibility = "private"
+)]
+fn loopback_queue_call(frame: &mut net::device::NetQueueCallV1) -> i32 {
+    if !frame.valid(frame.opcode, QueuePairId(0)) {
+        return NET_QUEUE_CALL_STATUS_INVALID;
+    }
+    let mut slot = QUEUE.lock();
+    let Some(queue) = slot.as_mut() else {
+        return NET_QUEUE_CALL_STATUS_INVALID;
+    };
+    match frame.opcode {
+        NET_QUEUE_OP_REFILL_RX => {
+            let Some(batch) = (unsafe { frame.refill_batch.as_mut() }) else {
+                return NET_QUEUE_CALL_STATUS_INVALID;
+            };
+            frame.rx_refill_result = queue.refill_rx_batch(batch);
+        }
+        NET_QUEUE_OP_POLL_RX => {
+            let Some(batch) = (unsafe { frame.packet_batch.as_mut() }) else {
+                return NET_QUEUE_CALL_STATUS_INVALID;
+            };
+            frame.rx_poll_result = queue.poll_rx_batch(frame.budget, batch);
+        }
+        NET_QUEUE_OP_RECLAIM_TX => {
+            let Some(batch) = (unsafe { frame.completion_batch.as_mut() }) else {
+                return NET_QUEUE_CALL_STATUS_INVALID;
+            };
+            frame.tx_reclaim_result = queue.reclaim_tx_batch(batch);
+        }
+        NET_QUEUE_OP_SUBMIT_TX => {
+            let Some(batch) = (unsafe { frame.tx_batch.as_mut() }) else {
+                return NET_QUEUE_CALL_STATUS_INVALID;
+            };
+            let Some(header_pool) = (unsafe { frame.tx_header_pool.as_mut() }) else {
+                return NET_QUEUE_CALL_STATUS_INVALID;
+            };
+            frame.tx_submit_result = queue.submit_tx_batch(batch, header_pool);
+        }
+        NET_QUEUE_OP_HAS_PENDING => frame.pending = queue.has_pending_work(),
+        NET_QUEUE_OP_QUIESCE => frame.quiesce_result = queue.quiesce().err(),
+        _ => return NET_QUEUE_CALL_STATUS_INVALID,
+    }
+    NET_QUEUE_CALL_STATUS_OK
 }

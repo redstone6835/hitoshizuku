@@ -19,9 +19,12 @@ use net::control::{
     ConfigSnapshot, ConfigStore, InterfaceSnapshot, RouteEntry,
 };
 use net::device::{
-    NetDeviceHandle, NetDeviceRegisterError, NetDeviceRegisterErrorKind, NetDeviceRegistrar,
-    NetDeviceRegistration, NetDeviceRemoveError, NetDeviceSnapshot, NetDeviceStats,
-    NetDeviceTeardown, NetQueueRegistration, NetStat, QueueIrqControl, QueueWakeHandle,
+    NET_QUEUE_CALL_RUST_ABI, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
+    NET_QUEUE_OP_POLL_RX, NET_QUEUE_OP_QUIESCE, NET_QUEUE_OP_RECLAIM_TX, NET_QUEUE_OP_REFILL_RX,
+    NET_QUEUE_OP_SUBMIT_TX, NetDeviceHandle, NetDeviceRegisterError, NetDeviceRegisterErrorKind,
+    NetDeviceRegistrar, NetDeviceRegistration, NetDeviceRemoveError, NetDeviceSnapshot,
+    NetDeviceStats, NetDeviceTeardown, NetQueueCallV1, NetQueueEndpoint, NetQueueRegistration,
+    NetStat, QueueIrqControl, QueueWakeHandle,
 };
 use net::flow::FlowKey;
 use net::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
@@ -39,13 +42,15 @@ use net::{
 };
 use sched::sync::Spinlock;
 
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 static DEVICES: Spinlock<Vec<DeviceRecord>> = Spinlock::new(Vec::new());
 static CONFIG_STORE: Spinlock<Option<Arc<ConfigStore>>> = Spinlock::new(None);
 static NET_IOCTL_LOCK: Spinlock<()> = Spinlock::new(());
 static WORKER_STARTS: Spinlock<Vec<Option<Box<WorkerContext>>>> = Spinlock::new(Vec::new());
 static PROTOCOL_STARTS: Spinlock<Vec<Option<Box<ProtocolContext>>>> = Spinlock::new(Vec::new());
 static PROTOCOL_CLUSTER: Spinlock<Option<Arc<ProtocolCluster>>> = Spinlock::new(None);
+static NET_RUNTIME_STARTED: AtomicBool = AtomicBool::new(false);
+static NET_ATTACH_LOCK: Spinlock<()> = Spinlock::new(());
+static PINNED_QUEUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 static WORKER_TASKS: Spinlock<Vec<Arc<sched::Task>>> = Spinlock::new(Vec::new());
 static REGISTRAR: KernelNetRegistrar = KernelNetRegistrar;
@@ -131,6 +136,14 @@ pub fn physical_udp_probe_state() -> (bool, bool) {
         PHYSICAL_UDP_REPLY_SEEN.load(Ordering::Acquire),
         PHYSICAL_UDP_POOL_CONSERVED.load(Ordering::Acquire),
     )
+}
+
+#[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+pub fn physical_network_available() -> bool {
+    DEVICES
+        .lock()
+        .iter()
+        .any(|device| device.snapshot.name.as_ref() != "lo" && device.snapshot.running)
 }
 
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -256,6 +269,217 @@ impl QueueRuntimeStats {
 
 struct KernelNetRegistrar;
 
+struct PinnedQueueAdapter {
+    id: net::QueuePairId,
+    caps: net::queue::NetQueueCaps,
+    tx_produces_rx_synchronously: bool,
+    call: crate::elm::PinnedNativeCall,
+}
+
+impl PinnedQueueAdapter {
+    fn new(endpoint: net::device::PinnedNetQueueEndpoint) -> Self {
+        let call = crate::elm::PinnedNativeCall::new(
+            elm_model::ElmId(endpoint.owner_cell()),
+            elm_model::Generation(endpoint.owner_generation()),
+            endpoint.export_name(),
+            endpoint.export_contract(),
+            endpoint.export_version(),
+            NET_QUEUE_CALL_RUST_ABI,
+        )
+        .expect("PinnedNetQueueEndpoint 必须在注册前通过身份校验");
+        Self {
+            id: endpoint.id(),
+            caps: endpoint.caps(),
+            tx_produces_rx_synchronously: endpoint.tx_produces_rx_synchronously(),
+            call,
+        }
+    }
+
+    fn invoke(&self, frame: &mut NetQueueCallV1) -> bool {
+        let mut ranges = [(0usize, 0usize); 2];
+        let range_count = match frame.opcode {
+            NET_QUEUE_OP_REFILL_RX => {
+                let Some(range) = host_range(frame.refill_batch) else {
+                    return false;
+                };
+                ranges[0] = range;
+                1
+            }
+            NET_QUEUE_OP_POLL_RX => {
+                let Some(range) = host_range(frame.packet_batch) else {
+                    return false;
+                };
+                ranges[0] = range;
+                1
+            }
+            NET_QUEUE_OP_RECLAIM_TX => {
+                let Some(range) = host_range(frame.completion_batch) else {
+                    return false;
+                };
+                ranges[0] = range;
+                1
+            }
+            NET_QUEUE_OP_SUBMIT_TX => {
+                let (Some(batch), Some(pool)) =
+                    (host_range(frame.tx_batch), host_range(frame.tx_header_pool))
+                else {
+                    return false;
+                };
+                ranges[0] = batch;
+                ranges[1] = pool;
+                2
+            }
+            NET_QUEUE_OP_HAS_PENDING | NET_QUEUE_OP_QUIESCE => 0,
+            _ => return false,
+        };
+        let deadline = sched::now_ns_public().saturating_add(2_000_000);
+        let result =
+            crate::elm::invoke_pinned_native(&self.call, frame, &ranges[..range_count], deadline);
+        let valid = frame.valid(frame.opcode, self.id);
+        let success = matches!(result, Ok(NET_QUEUE_CALL_STATUS_OK)) && valid;
+        if !success {
+            let bit = 1u64 << frame.opcode.min(63);
+            if PINNED_QUEUE_FAILURES.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                log::error!(
+                    "[net] pinned queue call failed: queue={} opcode={} result={:?} frame_valid={}",
+                    self.id.0,
+                    frame.opcode,
+                    result,
+                    valid,
+                );
+            }
+        }
+        success
+    }
+
+    const fn fatal_rx_refill() -> net::queue::RxRefillResult {
+        net::queue::RxRefillResult {
+            posted: 0,
+            descriptor_starved: false,
+            fatal: Some(net::queue::QueueFatalError::DeviceGone),
+        }
+    }
+
+    const fn fatal_rx_poll() -> net::queue::RxPollResult {
+        net::queue::RxPollResult {
+            packets: 0,
+            bytes: 0,
+            ring_empty: true,
+            descriptor_starved: false,
+            fatal: Some(net::queue::QueueFatalError::DeviceGone),
+        }
+    }
+
+    const fn fatal_tx_reclaim() -> net::queue::TxReclaimResult {
+        net::queue::TxReclaimResult {
+            completions: 0,
+            descriptors: 0,
+            ring_empty: true,
+            fatal: Some(net::queue::QueueFatalError::DeviceGone),
+        }
+    }
+
+    const fn fatal_tx_submit() -> net::queue::TxSubmitResult {
+        net::queue::TxSubmitResult {
+            packets: 0,
+            descriptors: 0,
+            bytes: 0,
+            queue_full: false,
+            fatal: Some(net::queue::QueueFatalError::DeviceGone),
+        }
+    }
+}
+
+fn host_range<T>(pointer: *mut T) -> Option<(usize, usize)> {
+    let start = pointer as usize;
+    let end = start.checked_add(core::mem::size_of::<T>())?;
+    (start != 0 && start < end).then_some((start, end))
+}
+
+impl NetQueuePair for PinnedQueueAdapter {
+    fn id(&self) -> net::QueuePairId {
+        self.id
+    }
+
+    fn caps(&self) -> net::queue::NetQueueCaps {
+        self.caps
+    }
+
+    fn tx_produces_rx_synchronously(&self) -> bool {
+        self.tx_produces_rx_synchronously
+    }
+
+    fn refill_rx_batch(&mut self, batch: &mut RxRefillBatch) -> net::queue::RxRefillResult {
+        let original_len = batch.len();
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_REFILL_RX, self.id);
+        frame.refill_batch = batch;
+        if !self.invoke(&mut frame) || usize::from(frame.rx_refill_result.posted) > original_len {
+            return Self::fatal_rx_refill();
+        }
+        frame.rx_refill_result
+    }
+
+    fn poll_rx_batch(
+        &mut self,
+        budget: RxBudget,
+        out: &mut PacketBatch,
+    ) -> net::queue::RxPollResult {
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_POLL_RX, self.id);
+        frame.budget = budget;
+        frame.packet_batch = out;
+        if !self.invoke(&mut frame)
+            || frame.rx_poll_result.packets > budget.packets
+            || frame.rx_poll_result.bytes > budget.bytes
+            || out.len() > usize::from(self.caps.max_rx_batch)
+        {
+            return Self::fatal_rx_poll();
+        }
+        frame.rx_poll_result
+    }
+
+    fn reclaim_tx_batch(&mut self, out: &mut CompletionBatch) -> net::queue::TxReclaimResult {
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_RECLAIM_TX, self.id);
+        frame.completion_batch = out;
+        if !self.invoke(&mut frame)
+            || usize::from(frame.tx_reclaim_result.completions) > out.len()
+            || out.len() > usize::from(self.caps.max_tx_batch)
+        {
+            return Self::fatal_tx_reclaim();
+        }
+        frame.tx_reclaim_result
+    }
+
+    fn submit_tx_batch(
+        &mut self,
+        batch: &mut TxBatch,
+        header_pool: &mut NetBufPoolOwner,
+    ) -> net::queue::TxSubmitResult {
+        let original_len = batch.len();
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_SUBMIT_TX, self.id);
+        frame.tx_batch = batch;
+        frame.tx_header_pool = header_pool;
+        if !self.invoke(&mut frame) || usize::from(frame.tx_submit_result.packets) > original_len {
+            return Self::fatal_tx_submit();
+        }
+        frame.tx_submit_result
+    }
+
+    fn has_pending_work(&mut self) -> bool {
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_HAS_PENDING, self.id);
+        self.invoke(&mut frame) && frame.pending
+    }
+
+    fn quiesce(&mut self) -> Result<(), net::queue::QueueFatalError> {
+        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_QUIESCE, self.id);
+        if !self.invoke(&mut frame) {
+            // 生命周期已取得 exclusive token 时新数据面调用会被拒绝；此时资源回调仍可
+            // 继续撤销 worker，模块 finalize 随后释放其私有 queue 状态。
+            return Ok(());
+        }
+        frame.quiesce_result.map_or(Ok(()), Err)
+    }
+}
+
 impl NetDeviceRegistrar for KernelNetRegistrar {
     fn register_device(
         &self,
@@ -278,9 +502,7 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
                 registration,
             });
         }
-        let raw_handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-        assert!(raw_handle != 0, "NetDeviceHandle 已耗尽");
-        let handle = NetDeviceHandle(raw_handle);
+        let handle = registration.handle();
         let queue_stats = registration
             .queues
             .iter()
@@ -300,16 +522,49 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
             running: registration.running,
             stats: NetDeviceStats::default(),
         };
+        let queues = registration
+            .queues
+            .into_vec()
+            .into_iter()
+            .map(|registration| {
+                let NetQueueRegistration {
+                    id,
+                    queue,
+                    rx_pool,
+                    tx_header_pool,
+                    tx_payload_pool,
+                    irq,
+                } = registration;
+                let queue: Box<dyn NetQueuePair> = match queue {
+                    NetQueueEndpoint::Integrated(queue) => queue,
+                    NetQueueEndpoint::Pinned(endpoint) => {
+                        Box::new(PinnedQueueAdapter::new(endpoint))
+                    }
+                };
+                NetQueueRegistration {
+                    id,
+                    queue: NetQueueEndpoint::Integrated(queue),
+                    rx_pool,
+                    tx_header_pool,
+                    tx_payload_pool,
+                    irq,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         DEVICES.lock().push(DeviceRecord {
             handle,
             snapshot,
-            queues: Some(registration.queues),
+            queues: Some(queues),
             queue_stats,
             irqs,
             started: false,
             control: Arc::new(WorkerControl::new()),
         });
         publish_device_config();
+        if NET_RUNTIME_STARTED.load(Ordering::Acquire) && elm_model::current_context().is_none() {
+            reconcile_devices();
+        }
         Ok(handle)
     }
 
@@ -1030,7 +1285,6 @@ struct EgressChannel {
     pending: CacheLine<AtomicBool>,
     lifecycle: CacheLine<EgressLifecycle>,
     task: Spinlock<Option<Arc<sched::Task>>>,
-    inline_consumer: AtomicBool,
     stats: Arc<QueueRuntimeStats>,
 }
 
@@ -1050,17 +1304,12 @@ impl EgressChannel {
                 pushers: AtomicUsize::new(0),
             }),
             task: Spinlock::new(None),
-            inline_consumer: AtomicBool::new(false),
             stats,
         }
     }
 
     fn set_task(&self, task: Arc<sched::Task>) {
         *self.task.lock() = Some(task);
-    }
-
-    fn set_inline_consumer(&self) {
-        self.inline_consumer.store(true, Ordering::Release);
     }
 
     fn try_push(&self, work: EgressWork) -> Result<(), EgressWork> {
@@ -1086,9 +1335,6 @@ impl EgressChannel {
 
     fn publish(&self) {
         if !self.pending.0.swap(true, Ordering::AcqRel) {
-            if self.inline_consumer.load(Ordering::Acquire) {
-                return;
-            }
             if let Some(task) = self.task.lock().as_ref().cloned() {
                 let _ = sched::activate_task(&task);
             }
@@ -1178,7 +1424,7 @@ struct ProtocolRuntime {
     deadline_registration: AtomicU64,
     deadline_ns: AtomicU64,
     timer_fired: AtomicBool,
-    egress: Box<[Arc<EgressChannel>]>,
+    egress: Spinlock<Vec<Option<Arc<EgressChannel>>>>,
 }
 
 impl ProtocolRuntime {
@@ -1195,12 +1441,59 @@ impl ProtocolRuntime {
             deadline_registration: AtomicU64::new(0),
             deadline_ns: AtomicU64::new(0),
             timer_fired: AtomicBool::new(false),
-            egress: egress.into_boxed_slice(),
+            egress: Spinlock::new(egress.into_iter().map(Some).collect()),
         }
     }
 
     fn set_owner_task(&self, task: Arc<sched::Task>) {
         *self.owner_task.lock() = Some(task);
+    }
+
+    fn append_egress(&self, egress: Arc<EgressChannel>) -> usize {
+        let mut targets = self.egress.lock();
+        let index = targets.len();
+        targets.push(Some(egress));
+        index
+    }
+
+    fn egress(&self, index: usize) -> Option<Arc<EgressChannel>> {
+        self.egress
+            .lock()
+            .get(index)
+            .and_then(Option::as_ref)
+            .cloned()
+    }
+
+    fn egress_index(&self, interface: InterfaceId) -> Option<usize> {
+        self.egress.lock().iter().position(|target| {
+            target
+                .as_ref()
+                .is_some_and(|target| target.interface == interface)
+        })
+    }
+
+    #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+    fn egress_snapshot(&self) -> Vec<Arc<EgressChannel>> {
+        self.egress
+            .lock()
+            .iter()
+            .filter_map(|target| target.as_ref().cloned())
+            .collect()
+    }
+
+    fn remove_egress(&self, index: usize, expected: &Arc<EgressChannel>) -> bool {
+        let mut targets = self.egress.lock();
+        let Some(slot) = targets.get_mut(index) else {
+            return false;
+        };
+        if !slot
+            .as_ref()
+            .is_some_and(|target| Arc::ptr_eq(target, expected))
+        {
+            return false;
+        }
+        *slot = None;
+        true
     }
 
     fn wake_owner(&self) {
@@ -1341,6 +1634,15 @@ impl ProtocolCluster {
                     }
                 }
             }
+        }
+    }
+
+    fn remove_egress(&self, index: usize, expected: &Arc<EgressChannel>) {
+        for runtime in &self.shards {
+            assert!(
+                runtime.remove_egress(index, expected),
+                "protocol shard egress 撤销不一致"
+            );
         }
     }
 }
@@ -2180,6 +2482,20 @@ struct WorkerContext {
     inline_protocol: bool,
 }
 
+struct PendingWorker {
+    registration: NetQueueRegistration,
+    ingress_device: net::NetDeviceId,
+    interface: InterfaceId,
+    local_mac: [u8; 6],
+    cpu: usize,
+    egress: Arc<EgressChannel>,
+    egress_index: usize,
+    control: Arc<WorkerControl>,
+    stats: Arc<QueueRuntimeStats>,
+    #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+    arp_probe_enabled: bool,
+}
+
 struct ProtocolContext {
     runtime: Arc<ProtocolRuntime>,
     cluster: Arc<ProtocolCluster>,
@@ -2210,23 +2526,20 @@ enum WorkerTurn {
     Removed,
 }
 
-/// 调度器初始化完成后，为启动期接管的每个 queue 创建固定 affinity worker。
+fn on_elm_lifecycle_event(event: crate::elm::ElmLifecycleEvent) {
+    match event {
+        crate::elm::ElmLifecycleEvent::CellLoaded { .. } => reconcile_devices(),
+    }
+}
+
+/// 调度器初始化完成后启动允许空设备集合的网络 host 和协议 worker。
 pub fn start_workers() {
+    assert!(
+        crate::elm::register_lifecycle_observer("net-runtime", on_elm_lifecycle_event),
+        "无法注册 ELM 生命周期观察者"
+    );
     vfs::net_socket::install_net_ioctl_handler(net_ioctl);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
-    struct PendingWorker {
-        registration: NetQueueRegistration,
-        ingress_device: net::NetDeviceId,
-        interface: InterfaceId,
-        local_mac: [u8; 6],
-        cpu: usize,
-        egress: Arc<EgressChannel>,
-        control: Arc<WorkerControl>,
-        stats: Arc<QueueRuntimeStats>,
-        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-        arp_probe_enabled: bool,
-    }
-
     let online = sched::online_cpu_mask();
     let active_cpus = (0..sched::NR_CPUS)
         .filter(|cpu| online & (1u64 << cpu) != 0)
@@ -2237,42 +2550,10 @@ pub fn start_workers() {
     generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
     let rss_generation = u32::from_le_bytes(generation_bytes).max(1);
 
-    let mut devices = DEVICES.lock();
+    let devices = DEVICES.lock();
     let config = Arc::new(ConfigStore::new(build_device_config(&devices, 1)));
     *CONFIG_STORE.lock() = Some(Arc::clone(&config));
-    let mut pending_workers = Vec::new();
-    for device in devices.iter_mut().filter(|device| !device.started) {
-        let Some(queues) = device.queues.take() else {
-            continue;
-        };
-        for (queue_index, registration) in queues.into_vec().into_iter().enumerate() {
-            device.control.worker_count.fetch_add(1, Ordering::Relaxed);
-            let cpu = active_cpus[registration.id.0 as usize % active_cpus.len()];
-            let interface = InterfaceId(device.snapshot.id.raw());
-            let stats = Arc::clone(&device.queue_stats[queue_index]);
-            let egress = Arc::new(EgressChannel::new(interface, Arc::clone(&stats)));
-            pending_workers.push(PendingWorker {
-                registration,
-                ingress_device: device.snapshot.id,
-                interface,
-                local_mac: device.snapshot.mac_address,
-                cpu,
-                egress,
-                control: Arc::clone(&device.control),
-                stats,
-                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-                arp_probe_enabled: device.snapshot.name.as_ref() != "lo",
-            });
-        }
-        device.started = true;
-    }
     drop(devices);
-
-    assert!(!pending_workers.is_empty(), "没有可启动的网络 queue");
-    let egress = pending_workers
-        .iter()
-        .map(|worker| Arc::clone(&worker.egress))
-        .collect::<Vec<_>>();
     let control_plane = Arc::new(ControlPlane::new(
         active_cpus.len(),
         *boot.rss_key(),
@@ -2285,7 +2566,7 @@ pub fn start_workers() {
             Arc::new(ProtocolRuntime::new(
                 ShardId(index as u16),
                 *cpu,
-                egress.iter().map(Arc::clone).collect(),
+                Vec::new(),
             ))
         })
         .collect::<Vec<_>>();
@@ -2353,8 +2634,80 @@ pub fn start_workers() {
         protocol_tasks.push((task, runtime.cpu, slot));
     }
 
-    let mut queue_tasks = Vec::new();
-    for (egress_index, pending) in pending_workers.into_iter().enumerate() {
+    *PROTOCOL_CLUSTER.lock() = Some(cluster);
+    net::install_socket_runtime(&SOCKET_RUNTIME_ADAPTER)
+        .unwrap_or_else(|_| panic!("socket runtime 重复安装"));
+    for (task, cpu, _) in protocol_tasks {
+        sched::activate_task_with_cpu_hint(&task, cpu)
+            .unwrap_or_else(|error| panic!("协议 worker 启动失败: {:?}", error));
+    }
+    NET_RUNTIME_STARTED.store(true, Ordering::Release);
+    reconcile_devices();
+}
+
+/// 把所有尚未启动的 queue late-attach 到已经运行的 host。
+pub(crate) fn reconcile_devices() {
+    if !NET_RUNTIME_STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let _attach = NET_ATTACH_LOCK.lock();
+    let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref().cloned() else {
+        return;
+    };
+    let Some(config) = CONFIG_STORE.lock().as_ref().cloned() else {
+        return;
+    };
+    let boot = net::device::boot_config().expect("网络启动配置未安装");
+    let online = sched::online_cpu_mask();
+    let active_cpus = (0..sched::NR_CPUS)
+        .filter(|cpu| online & (1u64 << cpu) != 0)
+        .collect::<Vec<_>>();
+    if active_cpus.is_empty() {
+        return;
+    }
+    let mut generation_bytes = [0u8; 4];
+    generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
+    let rss_generation = u32::from_le_bytes(generation_bytes).max(1);
+
+    let mut pending_workers = Vec::new();
+    let mut devices = DEVICES.lock();
+    for device in devices.iter_mut().filter(|device| !device.started) {
+        let Some(queues) = device.queues.take() else {
+            continue;
+        };
+        for (queue_index, registration) in queues.into_vec().into_iter().enumerate() {
+            device.control.worker_count.fetch_add(1, Ordering::Relaxed);
+            let interface = InterfaceId(device.snapshot.id.raw());
+            let stats = Arc::clone(&device.queue_stats[queue_index]);
+            let egress = Arc::new(EgressChannel::new(interface, Arc::clone(&stats)));
+            let mut egress_index = None;
+            for runtime in &cluster.shards {
+                let index = runtime.append_egress(Arc::clone(&egress));
+                assert!(
+                    egress_index.is_none_or(|expected| expected == index),
+                    "protocol shard egress 索引不一致"
+                );
+                egress_index = Some(index);
+            }
+            pending_workers.push(PendingWorker {
+                cpu: active_cpus[registration.id.0 as usize % active_cpus.len()],
+                registration,
+                ingress_device: device.snapshot.id,
+                interface,
+                local_mac: device.snapshot.mac_address,
+                egress,
+                egress_index: egress_index.expect("协议 cluster 必须至少有一个 shard"),
+                control: Arc::clone(&device.control),
+                stats,
+                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+                arp_probe_enabled: device.snapshot.name.as_ref() != "lo",
+            });
+        }
+        device.started = true;
+    }
+    drop(devices);
+
+    for pending in pending_workers {
         let control = Arc::clone(&pending.control);
         let egress = Arc::clone(&pending.egress);
         let NetQueueRegistration {
@@ -2365,6 +2718,12 @@ pub fn start_workers() {
             irq,
             ..
         } = pending.registration;
+        let queue = match queue {
+            NetQueueEndpoint::Integrated(queue) => queue,
+            NetQueueEndpoint::Pinned(_) => {
+                unreachable!("Pinned queue 必须在 registrar 中转换为常驻 adapter")
+            }
+        };
         let context = WorkerContext {
             queue: Some(queue),
             rx_pool: Some(rx_pool),
@@ -2385,7 +2744,7 @@ pub fn start_workers() {
             local_mac: pending.local_mac,
             protocol_cluster: Arc::clone(&cluster),
             config: Arc::clone(&config),
-            egress_index,
+            egress_index: pending.egress_index,
             egress: Arc::clone(&egress),
             rss_generation,
             rss_key: *boot.rss_key(),
@@ -2401,33 +2760,6 @@ pub fn start_workers() {
             stats: pending.stats,
             inline_protocol: false,
         };
-        let attach_local = active_cpus.len() == 1
-            && context
-                .queue
-                .as_ref()
-                .unwrap()
-                .tx_produces_rx_synchronously()
-            && PROTOCOL_STARTS.lock()[protocol_tasks[0].2]
-                .as_ref()
-                .is_some_and(|protocol| protocol.local_queue.is_none());
-        if attach_local {
-            let mut context = context;
-            context.inline_protocol = true;
-            let task = Arc::clone(&protocol_tasks[0].0);
-            let mut starts = PROTOCOL_STARTS.lock();
-            let protocol = starts[protocol_tasks[0].2]
-                .as_mut()
-                .expect("协议 worker 启动上下文不存在");
-            protocol.local_queue = Some(Box::new(context));
-            control.tasks.lock().push(Arc::clone(&task));
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            WORKER_TASKS.lock().push(Arc::clone(&task));
-            egress.set_task(Arc::clone(&task));
-            egress.set_inline_consumer();
-            irq.set_waker(Arc::new(TaskWake { task }))
-                .unwrap_or_else(|error| panic!("NetWorker waker 安装失败: {:?}", error));
-            continue;
-        }
         let slot = {
             let mut starts = WORKER_STARTS.lock();
             let slot = starts.len();
@@ -2451,16 +2783,6 @@ pub fn start_workers() {
             task: Arc::clone(&task),
         }))
         .unwrap_or_else(|error| panic!("NetWorker waker 安装失败: {:?}", error));
-        queue_tasks.push(task);
-    }
-    *PROTOCOL_CLUSTER.lock() = Some(cluster);
-    net::install_socket_runtime(&SOCKET_RUNTIME_ADAPTER)
-        .unwrap_or_else(|_| panic!("socket runtime 重复安装"));
-    for (task, cpu, _) in protocol_tasks {
-        sched::activate_task_with_cpu_hint(&task, cpu)
-            .unwrap_or_else(|error| panic!("协议 worker 启动失败: {:?}", error));
-    }
-    for task in queue_tasks {
         sched::activate_task(&task)
             .unwrap_or_else(|error| panic!("NetWorker 启动失败: {:?}", error));
     }
@@ -3269,10 +3591,7 @@ impl ProtocolContext {
                                     self.publish_neighbor_work(PendingNeighborTx::Raw(work));
                                     continue;
                                 }
-                                let Some(target) =
-                                    self.runtime.egress.iter().position(|target| {
-                                        target.interface == work.route.interface
-                                    })
+                                let Some(target) = self.runtime.egress_index(work.route.interface)
                                 else {
                                     work.payload
                                         .facade()
@@ -3343,12 +3662,7 @@ impl ProtocolContext {
                         self.publish_neighbor_work(PendingNeighborTx::Udp(work));
                         continue;
                     }
-                    let Some(target) = self
-                        .runtime
-                        .egress
-                        .iter()
-                        .position(|target| target.interface == work.route.interface)
-                    else {
+                    let Some(target) = self.runtime.egress_index(work.route.interface) else {
                         self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
                         work.payload
                             .facade()
@@ -3423,8 +3737,10 @@ impl ProtocolContext {
             work,
         };
         if target.try_push(ingress).is_err() {
-            self.runtime.egress[egress].stats.drop_reasons[DropReason::IngressRingFull.index()]
-                .fetch_add(1, Ordering::Relaxed);
+            if let Some(egress) = self.runtime.egress(egress) {
+                egress.stats.drop_reasons[DropReason::IngressRingFull.index()]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -3531,12 +3847,7 @@ impl ProtocolContext {
             PendingNeighborTx::Udp(work) => work.route.interface,
             PendingNeighborTx::Raw(work) => work.route.interface,
         };
-        let Some(target) = self
-            .runtime
-            .egress
-            .iter()
-            .position(|target| target.interface == interface)
-        else {
+        let Some(target) = self.runtime.egress_index(interface) else {
             work.facade()
                 .set_pending_error(SocketError::NetworkUnreachable);
             return;
@@ -3611,12 +3922,10 @@ impl ProtocolContext {
         let Some(frame) = build_neighbor_probe(key, config, false) else {
             return;
         };
-        let Some(target) = self
-            .runtime
-            .egress
-            .iter()
-            .find(|target| target.interface == key.interface)
-        else {
+        let Some(index) = self.runtime.egress_index(key.interface) else {
+            return;
+        };
+        let Some(target) = self.runtime.egress(index) else {
             return;
         };
         if target.try_push(EgressWork::ControlFrame(frame)).is_err() {
@@ -3628,12 +3937,10 @@ impl ProtocolContext {
         let Some(frame) = build_neighbor_probe(key, config, true) else {
             return;
         };
-        let Some(target) = self
-            .runtime
-            .egress
-            .iter()
-            .find(|target| target.interface == key.interface)
-        else {
+        let Some(index) = self.runtime.egress_index(key.interface) else {
+            return;
+        };
+        let Some(target) = self.runtime.egress(index) else {
             return;
         };
         if target.try_push(EgressWork::ControlFrame(frame)).is_err() {
@@ -4021,12 +4328,10 @@ impl ProtocolContext {
     }
 
     fn emit_control_frame(&self, interface: InterfaceId, frame: Vec<u8>) {
-        let Some(target) = self
-            .runtime
-            .egress
-            .iter()
-            .find(|target| target.interface == interface)
-        else {
+        let Some(index) = self.runtime.egress_index(interface) else {
+            return;
+        };
+        let Some(target) = self.runtime.egress(index) else {
             return;
         };
         if target.try_push(EgressWork::ControlFrame(frame)).is_err() {
@@ -4557,7 +4862,9 @@ impl ProtocolContext {
         local_mac: [u8; 6],
         config: &ConfigSnapshot,
     ) {
-        let target = Arc::clone(&self.runtime.egress[egress]);
+        let Some(target) = self.runtime.egress(egress) else {
+            return;
+        };
         let stats = Arc::clone(&target.stats);
         loop {
             self.protocol.process_frontend_batch(
@@ -4696,12 +5003,7 @@ impl ProtocolContext {
                     self.publish_neighbor_work(PendingNeighborTx::Tcp(work));
                     continue;
                 }
-                let Some(target) = self
-                    .runtime
-                    .egress
-                    .iter()
-                    .position(|target| target.interface == work.path.route.interface)
-                else {
+                let Some(target) = self.runtime.egress_index(work.path.route.interface) else {
                     work.facade
                         .set_pending_error(SocketError::NetworkUnreachable);
                     continue;
@@ -4741,8 +5043,10 @@ impl ProtocolContext {
             work,
         };
         if target.try_push(ingress).is_err() {
-            self.runtime.egress[egress].stats.drop_reasons[DropReason::IngressRingFull.index()]
-                .fetch_add(1, Ordering::Relaxed);
+            if let Some(egress) = self.runtime.egress(egress) {
+                egress.stats.drop_reasons[DropReason::IngressRingFull.index()]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -4752,13 +5056,20 @@ impl ProtocolContext {
             .as_ref()
             .is_some_and(|queue| queue.egress_index == target);
         if !local {
-            if let Err(work) = self.runtime.egress[target].push_wait(work) {
+            let Some(egress) = self.runtime.egress(target) else {
+                fail_egress_work(work, SocketError::NetworkUnreachable);
+                return;
+            };
+            if let Err(work) = egress.push_wait(work) {
                 fail_egress_work(work, SocketError::NetworkUnreachable);
             }
             return;
         }
 
-        let egress = Arc::clone(&self.runtime.egress[target]);
+        let Some(egress) = self.runtime.egress(target) else {
+            fail_egress_work(work, SocketError::NetworkUnreachable);
+            return;
+        };
         loop {
             match egress.try_push_deferred(work) {
                 Ok(()) => {
@@ -4779,7 +5090,10 @@ impl ProtocolContext {
 
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
     fn start_udp_probe(&mut self, egress: usize, payload: PacketChain, config: &ConfigSnapshot) {
-        let interface = self.runtime.egress[egress].interface;
+        let Some(egress) = self.runtime.egress(egress) else {
+            return;
+        };
+        let interface = egress.interface;
         let receiver = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 9000,
@@ -4816,14 +5130,8 @@ impl ProtocolContext {
         ) else {
             return;
         };
-        if self.runtime.egress[egress]
-            .try_push(EgressWork::Packet(packet))
-            .is_err()
-        {
-            self.runtime.egress[egress]
-                .stats
-                .tx_dropped
-                .fetch_add(1, Ordering::Relaxed);
+        if egress.try_push(EgressWork::Packet(packet)).is_err() {
+            egress.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
         } else {
             PHYSICAL_UDP_TX_SUBMITTED.store(true, Ordering::Release);
         }
@@ -4861,7 +5169,10 @@ impl ProtocolContext {
         payload: PacketChain,
         config: &ConfigSnapshot,
     ) {
-        let interface = self.runtime.egress[egress].interface;
+        let Some(egress) = self.runtime.egress(egress) else {
+            return;
+        };
+        let interface = egress.interface;
         let receiver = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
             port: 53_000,
@@ -4887,14 +5198,8 @@ impl ProtocolContext {
         ) else {
             return;
         };
-        if self.runtime.egress[egress]
-            .try_push(EgressWork::Packet(packet))
-            .is_err()
-        {
-            self.runtime.egress[egress]
-                .stats
-                .tx_dropped
-                .fetch_add(1, Ordering::Relaxed);
+        if egress.try_push(EgressWork::Packet(packet)).is_err() {
+            egress.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -4922,7 +5227,7 @@ impl ProtocolContext {
         {
             drop(datagram);
             PHYSICAL_UDP_REPLY_SEEN.store(true, Ordering::Release);
-            for target in self.runtime.egress.iter() {
+            for target in self.runtime.egress_snapshot() {
                 if let Some(task) = target.task.lock().as_ref().cloned() {
                     let _ = sched::activate_task(&task);
                 }
@@ -6193,6 +6498,8 @@ impl WorkerContext {
     fn finish_removal(&mut self) {
         let _ = self.irq.ack_and_mask();
         self.egress.deactivate();
+        self.protocol_cluster
+            .remove_egress(self.egress_index, &self.egress);
         while let Some(frame) = self.pending_tx_frames.pop_front() {
             if let Some(facade) = frame.facade {
                 facade.set_pending_error(SocketError::NetworkUnreachable);
