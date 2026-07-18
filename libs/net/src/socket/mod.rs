@@ -1714,21 +1714,76 @@ impl SocketFacade {
         if payload.is_empty() {
             return Ok(0);
         }
+        let mut accepted = 0usize;
         loop {
-            let copied = self.stream_tx.lock().push(payload);
+            if self.closing.load(Ordering::Acquire) {
+                return if accepted == 0 {
+                    Err(SocketError::Closed)
+                } else {
+                    Ok(accepted)
+                };
+            }
+            if self.write_shutdown.load(Ordering::Acquire) {
+                return if accepted == 0 {
+                    Err(SocketError::WriteShutdown)
+                } else {
+                    Ok(accepted)
+                };
+            }
+            let owner = self.owner();
+            if !matches!(owner, OwnerRef::Flow { .. })
+                || !self.stream_connected.load(Ordering::Acquire)
+            {
+                let error =
+                    if matches!(owner, OwnerRef::Closed { .. }) && self.peer_endpoint().is_some() {
+                        SocketError::WriteShutdown
+                    } else {
+                        SocketError::NotConnected
+                    };
+                return if accepted == 0 {
+                    Err(error)
+                } else {
+                    Ok(accepted)
+                };
+            }
+
+            let copied = self.stream_tx.lock().push(&payload[accepted..]);
             if copied != 0 {
+                accepted += copied;
                 self.refresh_tx_readiness();
                 self.tx_generation.fetch_add(1, Ordering::Release);
                 if !self.tx_notified.swap(true, Ordering::AcqRel) {
-                    socket_runtime()?.notify_tx(Arc::clone(self));
+                    match socket_runtime() {
+                        Ok(runtime) => runtime.notify_tx(Arc::clone(self)),
+                        Err(error) => {
+                            self.tx_notified.store(false, Ordering::Release);
+                            return if accepted == 0 {
+                                Err(error)
+                            } else {
+                                Ok(accepted)
+                            };
+                        }
+                    }
                 }
-                return Ok(copied);
+                if accepted == payload.len() || nonblocking {
+                    return Ok(accepted);
+                }
             }
             self.refresh_tx_readiness();
             if nonblocking {
-                return Err(SocketError::WouldBlock);
+                return if accepted == 0 {
+                    Err(SocketError::WouldBlock)
+                } else {
+                    Ok(accepted)
+                };
             }
-            self.wait_write(deadline_ns)?;
+            if let Err(error) = self.wait_write(deadline_ns) {
+                return if accepted == 0 {
+                    Err(error)
+                } else {
+                    Ok(accepted)
+                };
+            }
         }
     }
 

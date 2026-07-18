@@ -8,6 +8,12 @@ static STRESS_SENDER: sched::sync::Spinlock<Option<alloc::sync::Arc<net::SocketF
     sched::sync::Spinlock::new(None);
 static STRESS_WRITER_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+static BLOCKING_STREAM_SENDER: sched::sync::Spinlock<Option<alloc::sync::Arc<net::SocketFacade>>> =
+    sched::sync::Spinlock::new(None);
+static BLOCKING_STREAM_WRITTEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+const BLOCKING_STREAM_BYTES: usize = 256 * 1024;
 
 unsafe extern "C" fn udp_stress_writer(_arg: usize) -> ! {
     let sender = STRESS_SENDER
@@ -21,6 +27,23 @@ unsafe extern "C" fn udp_stress_writer(_arg: usize) -> ! {
             .expect("UDP stress send");
     }
     STRESS_WRITER_DONE.store(true, core::sync::atomic::Ordering::Release);
+    sched::kthread_finish(sched::ExitCode(0));
+}
+
+unsafe extern "C" fn blocking_stream_writer(_arg: usize) -> ! {
+    let sender = BLOCKING_STREAM_SENDER
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("blocking TCP sender 未安装");
+    let payload = (0..BLOCKING_STREAM_BYTES)
+        .map(|index| index.wrapping_mul(17) as u8)
+        .collect::<alloc::vec::Vec<_>>();
+    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let written = sender
+        .send_stream(&payload, false, Some(deadline))
+        .expect("blocking TCP send 失败");
+    BLOCKING_STREAM_WRITTEN.store(written, core::sync::atomic::Ordering::Release);
     sched::kthread_finish(sched::ExitCode(0));
 }
 
@@ -312,11 +335,85 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         vfs::socket::accept(&context, &table, server, vfs::socket::SOCK_NONBLOCK)
             .expect("accept TCP child");
     assert!(peer.is_some());
+
+    let client_facade = client_file
+        .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        .expect("TCP client 缺少网络 socket ops")
+        .facade()
+        .clone();
+    client_facade.set_buffer_limits(Some(16 * 1024), None);
+    BLOCKING_STREAM_WRITTEN.store(usize::MAX, core::sync::atomic::Ordering::Release);
+    *BLOCKING_STREAM_SENDER.lock() = Some(client_facade.clone());
+    let blocking_writer = sched::kthread_create(
+        blocking_stream_writer,
+        0,
+        sched::SchedParams {
+            nice: 0,
+            slice_ns: 0,
+        },
+    );
+    sched::activate_task(&blocking_writer).expect("启动 blocking TCP writer");
+    let accepted_file = table.get_file(accepted).unwrap();
+    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let mut blocking_received = 0usize;
+    let mut blocking_window = alloc::vec![0; 64 * 1024];
+    while blocking_received < BLOCKING_STREAM_BYTES {
+        match vfs::socket::recv(
+            &table,
+            accepted,
+            &mut blocking_window,
+            0,
+            false,
+            vfs::socket::MSG_DONTWAIT,
+            None,
+        ) {
+            Ok(output) if output.len != 0 => {
+                for (offset, byte) in blocking_window[..output.len].iter().enumerate() {
+                    assert_eq!(*byte, (blocking_received + offset).wrapping_mul(17) as u8);
+                }
+                blocking_received += output.len;
+            }
+            Ok(_) | Err(errno::Errno::EAGAIN) => {
+                if sched::now_ns_public() >= deadline {
+                    panic!(
+                        "blocking TCP send 超时: received={} total={}",
+                        blocking_received, BLOCKING_STREAM_BYTES
+                    );
+                }
+                let task = sched::current_task();
+                if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+                    let wake = sched::now_ns_public().saturating_add(100_000);
+                    let _ = sched::register_sleep_deadline(&task, wake);
+                    drop(task);
+                    sched::schedule_once(sched::now_ns_public());
+                }
+            }
+            Err(error) => panic!("blocking TCP recv 失败: {:?}", error),
+        }
+    }
+    while BLOCKING_STREAM_WRITTEN.load(core::sync::atomic::Ordering::Acquire) == usize::MAX {
+        if sched::now_ns_public() >= deadline {
+            panic!("blocking TCP writer 未按时结束");
+        }
+        let task = sched::current_task();
+        if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+            let wake = sched::now_ns_public().saturating_add(100_000);
+            let _ = sched::register_sleep_deadline(&task, wake);
+            drop(task);
+            sched::schedule_once(sched::now_ns_public());
+        }
+    }
+    assert_eq!(
+        BLOCKING_STREAM_WRITTEN.load(core::sync::atomic::Ordering::Acquire),
+        BLOCKING_STREAM_BYTES
+    );
+    *BLOCKING_STREAM_SENDER.lock() = None;
+    client_facade.set_buffer_limits(Some(256 * 1024), None);
+
     assert_eq!(
         vfs::socket::send(&context, &table, client, b"ping", &[], None, 0),
         Ok(4)
     );
-    let accepted_file = table.get_file(accepted).unwrap();
     wait_readable(&accepted_file);
     let mut bytes = [0u8; 8];
     let received = vfs::socket::recv(&table, accepted, &mut bytes, 0, false, 0, None)

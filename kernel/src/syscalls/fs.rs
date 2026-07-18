@@ -1704,9 +1704,6 @@ fn send_inet_stream_from_user(
         let result = unsafe {
             vm.with_user_read_slice(user_ptr, remaining, |data| {
                 let mut chunk_flags = flags;
-                if sent != 0 {
-                    chunk_flags |= vfs_socket::MSG_DONTWAIT;
-                }
                 if sent + data.len() < len {
                     chunk_flags |= vfs_socket::MSG_MORE;
                 }
