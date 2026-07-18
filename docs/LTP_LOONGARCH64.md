@@ -171,11 +171,12 @@ python3 scripts/ltp_la.py report
 | `epoll_ctl02` | 普通文件和目录虽然对 `poll(2)` 表现为立即就绪，却被错误允许加入 epoll | `FileOps` 增加显式 epoll 接纳能力，普通文件和目录默认拒绝，真实事件源逐项声明支持 | 连续运行三次，全部 `pass` |
 | `epoll_ctl04` | epoll 图只检查闭环，没有限制最大嵌套深度 | 对新增边执行递归深度校验，允许最多五个 epoll 实例组成嵌套链；闭环仍优先返回 `ELOOP` | 连续运行三次，全部 `pass`；`epoll_ctl05` 的原有闭环行为由宿主测试覆盖 |
 | `epoll_wait03` | `maxevents` 直接按无符号系统调用参数处理，`-1` 被解释为巨大正数 | 先按 ABI 的有符号 `int` 解码并拒绝所有非正值 | 连续运行三次，全部 `pass` |
+| `epoll_wait05` | inet socket 的 VFS poll 适配只报告可读写，不传播本地读半关闭和 TCP 对端关闭状态 | 将 `SHUT_RD` 映射为 `EPOLLRDHUP`，并从 TCP `Closing/Closed` 状态导出 `POLLIN/EPOLLRDHUP/POLLHUP` | 连续运行三次，全部 `pass` |
 
 宿主执行 `cargo test -p vfs --target x86_64-unknown-linux-gnu`，共 67 项通过；新增测试
 覆盖普通文件拒绝、第六层嵌套拒绝、闭环 `ELOOP` 优先级和 level-triggered 就绪轮转。
 固定容器内 `make kernel-la` 构建通过。
-对应提交为 `b0f46575`、`44cb8f02` 和 `4c3ce0a3`。
+对应提交为 `b0f46575`、`44cb8f02`、`4c3ce0a3` 和 `a07cd804`。
 
 ### pipe 容量与可写语义
 
