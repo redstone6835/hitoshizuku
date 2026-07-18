@@ -98,6 +98,8 @@ pub trait QueueIrqControl: Send + Sync {
     fn ack_and_mask(&self) -> bool;
     fn unmask(&self);
     fn set_waker(&self, waker: Arc<dyn QueueWakeHandle>) -> Result<(), QueueIrqError>;
+
+    fn clear_waker(&self);
     fn stats(&self) -> QueueIrqStats;
 }
 
@@ -434,6 +436,10 @@ impl QueueIrqControl for SoftwareQueueIrq {
         Ok(())
     }
 
+    fn clear_waker(&self) {
+        *self.waker.lock() = None;
+    }
+
     fn stats(&self) -> QueueIrqStats {
         QueueIrqStats {
             irq_total: self.irq_total.load(Ordering::Relaxed),
@@ -677,7 +683,8 @@ fn resume_net_device_resource(_owner: u64, _generation: u64, _handle: u64) -> Re
 }
 
 fn quiesce_net_device_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
-    remove_owned_net_device(NetDeviceHandle(handle))
+    let _ = handle;
+    Ok(())
 }
 
 fn cancel_net_device_resource(_owner: u64, _generation: u64, _handle: u64) -> Result<(), i32> {
@@ -685,22 +692,13 @@ fn cancel_net_device_resource(_owner: u64, _generation: u64, _handle: u64) -> Re
 }
 
 fn drain_net_device_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
-    remove_owned_net_device(NetDeviceHandle(handle))
+    let _ = handle;
+    Ok(())
 }
 
 fn release_net_device_resource(_owner: u64, _generation: u64, handle: u64) -> Result<(), i32> {
-    remove_owned_net_device(NetDeviceHandle(handle))
-}
-
-fn remove_owned_net_device(handle: NetDeviceHandle) -> Result<(), i32> {
-    let registrar = *REGISTRAR.lock();
-    let Some(registrar) = registrar else {
-        return Err(-19);
-    };
-    match registrar.begin_remove(handle) {
-        Ok(_) | Err(NetDeviceRemoveError::NoDevice) => Ok(()),
-        Err(NetDeviceRemoveError::Busy | NetDeviceRemoveError::AlreadyRemoving) => Err(-16),
-    }
+    let _ = handle;
+    Ok(())
 }
 
 /// registrar 尚未安装时返回空列表，供早期 procfs/sysfs/netlink 安全读取。

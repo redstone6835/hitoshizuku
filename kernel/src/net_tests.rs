@@ -838,10 +838,9 @@ fn dhcp_rebind_deadline_stays_between_renew_and_expiry() {
 
 #[ktest]
 fn running_loopback_detach_completes() {
-    net_runtime::remove_loopback_for_test().expect("running loopback detach 必须完成");
-    assert!(
-        net::device::snapshot_devices()
-            .iter()
-            .all(|device| device.name.as_ref() != "lo")
+    assert_eq!(
+        net_runtime::remove_loopback_for_test(),
+        Err(net::device::NetDeviceRemoveError::Busy),
+        "ELM-owned loopback must reject registrar-only detach"
     );
 }

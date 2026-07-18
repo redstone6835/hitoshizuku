@@ -148,13 +148,9 @@ pub fn physical_network_available() -> bool {
 
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 pub fn remove_loopback_for_test() -> Result<(), NetDeviceRemoveError> {
-    let handle = DEVICES
-        .lock()
-        .iter()
-        .find(|device| device.snapshot.name.as_ref() == "lo")
-        .map(|device| device.handle)
-        .ok_or(NetDeviceRemoveError::NoDevice)?;
-    REGISTRAR.begin_remove(handle).map(|_| ())
+    // loopback 归 ELM 所有；通过 registrar 移除会绕过模块生命周期，导致其 queue
+    // lease 继续指向已经释放的 pool。
+    Err(NetDeviceRemoveError::Busy)
 }
 
 pub fn registrar() -> &'static dyn NetDeviceRegistrar {
@@ -173,6 +169,7 @@ struct DeviceRecord {
 
 struct WorkerControl {
     remove_requested: AtomicBool,
+    remove_ready: AtomicBool,
     done: AtomicBool,
     worker_count: AtomicUsize,
     completed: AtomicUsize,
@@ -183,6 +180,7 @@ impl WorkerControl {
     fn new() -> Self {
         Self {
             remove_requested: AtomicBool::new(false),
+            remove_ready: AtomicBool::new(false),
             done: AtomicBool::new(false),
             worker_count: AtomicUsize::new(0),
             completed: AtomicUsize::new(0),
@@ -605,9 +603,18 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
         };
         // 先从配置快照撤销可用接口和路由，再通知各 shard 失效动态状态。
         publish_device_config();
-        if let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref().cloned() {
-            cluster.invalidate_interface(interface);
+        let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref().cloned() else {
+            return Err(NetDeviceRemoveError::Busy);
+        };
+        let invalidation = cluster.invalidate_interface(interface);
+        let invalidation_deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+        while !invalidation.done() && sched::now_ns_public() < invalidation_deadline {
+            let _ = sched::operation::sched_yield();
         }
+        if !invalidation.done() {
+            return Err(NetDeviceRemoveError::Busy);
+        }
+        control.remove_ready.store(true, Ordering::Release);
         for task in control.tasks.lock().iter() {
             let _ = sched::activate_task(task);
         }
@@ -618,11 +625,60 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
         if !control.done.load(Ordering::Acquire) {
             return Err(NetDeviceRemoveError::Busy);
         }
+        let task_exit_deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+        while control.tasks.lock().iter().any(worker_task_still_live)
+            && sched::now_ns_public() < task_exit_deadline
+        {
+            let _ = sched::operation::sched_yield();
+        }
+        if control.tasks.lock().iter().any(worker_task_still_live) {
+            return Err(NetDeviceRemoveError::Busy);
+        }
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        {
+            let tasks = control.tasks.lock();
+            let mut worker_tasks = WORKER_TASKS.lock();
+            worker_tasks
+                .retain(|candidate| !tasks.iter().any(|owned| Arc::ptr_eq(candidate, owned)));
+            worker_tasks.shrink_to_fit();
+        }
+        // 内核线程仍在自己的内核栈上执行时，不能释放自身的 Task 和内核栈。因此调度器
+        // 会在 worker 所在 CPU 上退役最后一个 Task Arc，并在下一个调度边界释放它。
+        // 在 ELM 检查该代际的分配账本前，必须显式推动调度越过这个边界。
+        let task_reap_deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+        loop {
+            let tasks = control.tasks.lock();
+            if tasks.iter().all(|task| Arc::strong_count(task) == 1) {
+                break;
+            }
+            if sched::now_ns_public() >= task_reap_deadline {
+                for task in tasks.iter().filter(|task| Arc::strong_count(task) != 1) {
+                    log::warning!(
+                        "[net] worker task still retained pid={:?} cpu={} refs={}",
+                        task.pid_root(),
+                        task.current_cpu(),
+                        Arc::strong_count(task),
+                    );
+                }
+                return Err(NetDeviceRemoveError::Busy);
+            }
+            for task in tasks.iter() {
+                sched::request_resched(task.current_cpu());
+            }
+            drop(tasks);
+            let _ = sched::operation::sched_yield();
+        }
+        {
+            let mut tasks = control.tasks.lock();
+            tasks.clear();
+            tasks.shrink_to_fit();
+        }
         let mut devices = DEVICES.lock();
         let Some(index) = devices.iter().position(|device| device.handle == handle) else {
             return Err(NetDeviceRemoveError::NoDevice);
         };
         devices.remove(index);
+        devices.shrink_to_fit();
         drop(devices);
         publish_device_config();
         Ok(NetDeviceTeardown { handle })
@@ -791,6 +847,15 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
         });
         output
     }
+}
+
+fn worker_task_still_live(task: &Arc<sched::Task>) -> bool {
+    task.state() != sched::TaskState::Dead
+        || (0..sched::NR_CPUS).any(|cpu| {
+            sched::current_task_on(cpu)
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, task))
+        })
 }
 
 struct TaskWake {
@@ -1085,6 +1150,7 @@ enum ControlWork {
     },
     InterfaceGone {
         interface: InterfaceId,
+        ack: Arc<InterfaceGoneBarrier>,
     },
     ResolveNeighbor(PendingNeighborTx),
     NeighborObserved {
@@ -1103,6 +1169,26 @@ enum ControlWork {
         error: net::transport::TransportControlError,
         now_ns: u64,
     },
+}
+
+struct InterfaceGoneBarrier {
+    remaining: AtomicUsize,
+}
+
+impl InterfaceGoneBarrier {
+    fn new(shards: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(shards),
+        }
+    }
+
+    fn finish(&self) {
+        self.remaining.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn done(&self) -> bool {
+        self.remaining.load(Ordering::Acquire) == 0
+    }
 }
 
 struct ControlPlane {
@@ -1493,6 +1579,10 @@ impl ProtocolRuntime {
             return false;
         }
         *slot = None;
+        while targets.last().is_some_and(Option::is_none) {
+            targets.pop();
+        }
+        targets.shrink_to_fit();
         true
     }
 
@@ -1616,9 +1706,13 @@ impl ProtocolCluster {
         Ok(())
     }
 
-    fn invalidate_interface(&self, interface: InterfaceId) {
+    fn invalidate_interface(&self, interface: InterfaceId) -> Arc<InterfaceGoneBarrier> {
+        let barrier = Arc::new(InterfaceGoneBarrier::new(self.shards.len()));
         for runtime in &self.shards {
-            let mut work = ControlWork::InterfaceGone { interface };
+            let mut work = ControlWork::InterfaceGone {
+                interface,
+                ack: Arc::clone(&barrier),
+            };
             loop {
                 match runtime.control.try_push(work) {
                     Ok(()) => {
@@ -1635,6 +1729,7 @@ impl ProtocolCluster {
                 }
             }
         }
+        barrier
     }
 
     fn remove_egress(&self, index: usize, expected: &Arc<EgressChannel>) {
@@ -2406,6 +2501,9 @@ fn publish_device_config() {
     let Some(store) = store else {
         return;
     };
+    // 设备注册和移除可能从 ELM 生命周期钩子调用此函数。发布的快照属于 host 网络栈，
+    // 生命周期长于对应的 driver 代际，因此其中的分配不能继承当前 cell 的隐式记账归属。
+    let _accounting = allocator::suspend_implicit_allocation_accounting();
     let current = store.snapshot();
     let generation = current.generation.saturating_add(1);
     let devices = DEVICES.lock();
@@ -2724,7 +2822,7 @@ pub(crate) fn reconcile_devices() {
                 unreachable!("Pinned queue 必须在 registrar 中转换为常驻 adapter")
             }
         };
-        let context = WorkerContext {
+        let context = Box::new(WorkerContext {
             queue: Some(queue),
             rx_pool: Some(rx_pool),
             tx_header_pool: Some(tx_header_pool),
@@ -2759,11 +2857,11 @@ pub(crate) fn reconcile_devices() {
             control: pending.control,
             stats: pending.stats,
             inline_protocol: false,
-        };
+        });
         let slot = {
             let mut starts = WORKER_STARTS.lock();
             let slot = starts.len();
-            starts.push(Some(Box::new(context)));
+            starts.push(Some(context));
             slot
         };
         let task = sched::kthread_create(
@@ -2789,11 +2887,18 @@ pub(crate) fn reconcile_devices() {
 }
 
 unsafe extern "C" fn net_worker_entry(slot: usize) -> ! {
-    let mut context = WORKER_STARTS
-        .lock()
-        .get_mut(slot)
-        .and_then(Option::take)
-        .expect("NetWorker 启动上下文不存在");
+    let context = {
+        let mut starts = WORKER_STARTS.lock();
+        let context = starts
+            .get_mut(slot)
+            .and_then(Option::take)
+            .expect("NetWorker 启动上下文不存在");
+        while starts.last().is_some_and(Option::is_none) {
+            starts.pop();
+        }
+        starts.shrink_to_fit();
+        context
+    };
     context.run()
 }
 
@@ -2867,7 +2972,9 @@ impl ProtocolContext {
         let Some(mut queue) = self.local_queue.take() else {
             return;
         };
-        if !queue.control.remove_requested.load(Ordering::Acquire) && !queue.has_pending_work() {
+        let remove_ready = queue.control.remove_requested.load(Ordering::Acquire)
+            && queue.control.remove_ready.load(Ordering::Acquire);
+        if !remove_ready && !queue.has_pending_work() {
             self.local_queue = Some(queue);
             return;
         }
@@ -3013,7 +3120,7 @@ impl ProtocolContext {
                     self.protocol.close_tcp_listener(group);
                     self.dispatch_tcp_output();
                 }
-                ControlWork::InterfaceGone { interface } => {
+                ControlWork::InterfaceGone { interface, ack } => {
                     self.protocol.invalidate_interface(interface);
                     self.fail_interface_neighbors(interface, SocketError::NetworkUnreachable);
                     self.dad.retain(|state| state.interface != interface);
@@ -3030,6 +3137,7 @@ impl ProtocolContext {
                         self.remove_interface_multicast(interface);
                     }
                     self.dispatch_tcp_output();
+                    ack.finish();
                 }
                 ControlWork::ResolveNeighbor(work) => {
                     self.enqueue_neighbor(work, config, sched::now_ns_public());
@@ -5538,11 +5646,12 @@ fn map_tcp_bind_error(error: net::transport::TcpBindError) -> SocketError {
 }
 
 impl WorkerContext {
-    fn run(&mut self) -> ! {
+    fn run(mut self: Box<Self>) -> ! {
         loop {
             match self.run_turn() {
                 WorkerTurn::Removed => {
                     self.finish_removal();
+                    drop(self);
                     sched::kthread_finish(sched::ExitCode(0));
                 }
                 WorkerTurn::Pending => {
@@ -5556,7 +5665,9 @@ impl WorkerContext {
     fn run_turn(&mut self) -> WorkerTurn {
         #[cfg(feature = "performance-profile")]
         let _profile = profiling::scope(profiling::Event::NetWorkerTurn);
-        if self.control.remove_requested.load(Ordering::Acquire) {
+        if self.control.remove_requested.load(Ordering::Acquire)
+            && self.control.remove_ready.load(Ordering::Acquire)
+        {
             return WorkerTurn::Removed;
         }
         self.rx_pool.as_mut().unwrap().drain_remote();
@@ -6276,30 +6387,6 @@ impl WorkerContext {
         }
     }
 
-    fn recycle_rx_batch(&mut self, reason: DropReason) {
-        let len = self.rx_batch.len();
-        for index in 0..len {
-            let Some((mut packet, mut metadata)) = self.rx_batch.take(index) else {
-                continue;
-            };
-            metadata.drop_reason = reason;
-            self.stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
-            self.stats.drop_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
-            let fragments = packet.fragment_count();
-            for fragment_index in 0..fragments {
-                match packet.take_fragment(fragment_index) {
-                    Some(PacketFragment::Exclusive(mut lease)) => {
-                        *lease.metadata_mut() = metadata;
-                        let _ = self.rx_pool.as_mut().unwrap().recycle_local_or_defer(lease);
-                    }
-                    Some(PacketFragment::Shared(chunk)) => drop(chunk),
-                    Some(PacketFragment::Owned(bytes)) => drop(bytes),
-                    None => {}
-                }
-            }
-        }
-    }
-
     fn complete_rx_metadata(&mut self) {
         let timestamp = sched::now_ns_public();
         for index in 0..self.rx_batch.len() {
@@ -6497,6 +6584,8 @@ impl WorkerContext {
     /// detach 前停止 IRQ、排空可观察 completion，并在释放 queue 前回收所有 batch lease。
     fn finish_removal(&mut self) {
         let _ = self.irq.ack_and_mask();
+        self.irq.clear_waker();
+        *self.egress.task.lock() = None;
         self.egress.deactivate();
         self.protocol_cluster
             .remove_egress(self.egress_index, &self.egress);
@@ -6508,31 +6597,9 @@ impl WorkerContext {
         while let Some(work) = self.retry_egress.pop_front() {
             fail_egress_work(work, SocketError::NetworkUnreachable);
         }
-        if self.queue.is_some() {
-            self.queue.as_mut().unwrap().quiesce().ok();
-            for _ in 0..64 {
-                let (result, pending) = {
-                    let queue = self.queue.as_mut().unwrap();
-                    self.completion_batch.clear();
-                    let _ = queue.reclaim_tx_batch(&mut self.completion_batch);
-                    self.rx_batch.clear();
-                    let result = queue.poll_rx_batch(
-                        RxBudget {
-                            packets: 32,
-                            bytes: 256 * 1024,
-                        },
-                        &mut self.rx_batch,
-                    );
-                    let pending = queue.has_pending_work();
-                    (result, pending)
-                };
-                self.complete_rx_metadata();
-                self.recycle_rx_batch(DropReason::DeviceGone);
-                if !pending && result.packets == 0 {
-                    break;
-                }
-            }
-        }
+        // ELM quiesce 已撤销 queue endpoint。此处调用 pinned export 会报告生命周期拒绝，
+        // 并隔离原本可以干净卸载的 cell；新数据面调用被阻断后，释放下方的本地 batch
+        // 和 queue 已足以完成清理。
         for index in 0..self.tx_batch.len() {
             let _ = self.tx_batch.take(index);
         }
@@ -6542,6 +6609,7 @@ impl WorkerContext {
             }
         }
         self.rx_batch.clear();
+        self.frontend_batch.clear();
         self.completion_batch.clear();
         self.rx_pool.as_mut().unwrap().begin_dying();
         self.tx_payload_pool.as_mut().unwrap().begin_dying();

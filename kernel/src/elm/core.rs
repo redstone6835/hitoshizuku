@@ -2088,6 +2088,47 @@ impl ElmCore {
         })
     }
 
+    fn effective_configured_image_source(
+        image: &ElmEbiImage,
+        source: ElmEbiSourceKind,
+        authorization: KernelSymbolAuthorization,
+    ) -> ElmEbiSourceKind {
+        if source != ElmEbiSourceKind::Projection || !authorization.requested {
+            return source;
+        }
+        let Some(fingerprint) = image.abi_fingerprint.as_ref() else {
+            return source;
+        };
+        let ebi_hash = canonical_ebi_digest(image);
+        if super::trust_config::find_build_bound_module(
+            image.unit.manifest.name.as_str(),
+            ebi_hash,
+            fingerprint.kernel_api_profile_hash,
+        )
+        .is_some()
+        {
+            ElmEbiSourceKind::BuildBound
+        } else {
+            source
+        }
+    }
+
+    #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+    pub(crate) fn test_configured_build_bound_promotion(image: &ElmEbiImage) -> bool {
+        let authorized = KernelSymbolAuthorization {
+            requested: true,
+            authority: ELM_AUDIT_AUTHORITY_USER_ADMIN,
+            authority_id: 1,
+        };
+        Self::effective_configured_image_source(image, ElmEbiSourceKind::Projection, authorized)
+            == ElmEbiSourceKind::BuildBound
+            && Self::effective_configured_image_source(
+                image,
+                ElmEbiSourceKind::Projection,
+                KernelSymbolAuthorization::none(),
+            ) == ElmEbiSourceKind::Projection
+    }
+
     fn privileged_kernel_symbols_authorized(
         source: ElmEbiSourceKind,
         request: KernelSymbolAuthorization,
@@ -6262,11 +6303,12 @@ impl ElmCore {
         parent: ElmId,
         budget: ElmResourceBudget,
         grant_management: bool,
-        _symbol_authorization: KernelSymbolAuthorization,
+        symbol_authorization: KernelSymbolAuthorization,
     ) -> ElmLoadCellResponse {
         if let Err(status) = image.validate(arch) {
             return ElmLoadCellResponse::failed(status);
         }
+        let source = Self::effective_configured_image_source(&image, source, symbol_authorization);
         // 局部 Core 入口不执行原生代码，原生镜像必须由正式脱锁装载事务处理。
         if image.has_code_segment() {
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
@@ -6382,6 +6424,7 @@ impl ElmCore {
         if let Err(status) = image.validate(arch) {
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(status));
         }
+        let source = Self::effective_configured_image_source(&image, source, symbol_authorization);
         if !self.native_unit_allowed_by_policy(parent, &image.unit) {
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -16173,9 +16216,8 @@ impl ElmCore {
     fn alloc_cell_id(&mut self) -> Option<ElmId> {
         loop {
             let id = take_monotonic_id(&mut self.next_cell_id).map(ElmId)?;
-            // Multiple ElmCore instances are used by in-kernel tests while the global Core
-            // may already own a BuildBound cell. Never reuse an ID present in either global
-            // resource registry; this keeps test cores from colliding with live generations.
+            // 内核测试会创建多个 ElmCore 实例，而全局 Core 可能已经拥有 BuildBound cell。
+            // 不得复用全局资源注册表中已有的 ID，避免测试 Core 与活跃代际发生冲突。
             if super::resource_accounting::registered(id)
                 || super::owned_resource::owner_snapshot(id).is_some()
             {

@@ -1,5 +1,7 @@
 //! Ethernet/IP 批量解析、校验和与流分类。
 
+use alloc::boxed::Box;
+
 use crate::buf::{DropReason, NetBufPoolError, PacketBatch, PacketChain, PacketMetadata};
 use crate::control::ConfigSnapshot;
 use crate::flow::{FlowKey, rss_hash};
@@ -110,14 +112,16 @@ pub struct FrontendPacket {
 }
 
 pub struct FrontendBatch {
-    packets: [Option<FrontendPacket>; PACKET_BATCH_CAPACITY],
+    packets: Box<[Option<FrontendPacket>]>,
     len: u8,
 }
 
 impl FrontendBatch {
     pub fn new() -> Self {
+        let mut packets = alloc::vec::Vec::with_capacity(PACKET_BATCH_CAPACITY);
+        packets.resize_with(PACKET_BATCH_CAPACITY, || None);
         Self {
-            packets: core::array::from_fn(|_| None),
+            packets: packets.into_boxed_slice(),
             len: 0,
         }
     }
@@ -863,6 +867,12 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn frontend_batch_keeps_packet_storage_off_stack() {
+        assert!(core::mem::size_of::<FrontendBatch>() <= 4 * core::mem::size_of::<usize>());
+        assert_eq!(FrontendBatch::new().packets.len(), PACKET_BATCH_CAPACITY);
+    }
 
     fn reference_checksum(bytes: &[u8]) -> u16 {
         let mut sum = 0u64;

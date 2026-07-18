@@ -1,4 +1,4 @@
-//! 无堆分配的固定容量 packet、TX 与 completion batch。
+//! 创建时预分配、运行期无堆分配的固定容量 packet、TX 与 completion batch。
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -277,8 +277,8 @@ impl Default for PacketChain {
 
 /// RX packet batch 与同索引 sidecar metadata。
 pub struct PacketBatch {
-    packets: [Option<PacketChain>; PACKET_BATCH_CAPACITY],
-    metadata: [Option<PacketMetadata>; PACKET_BATCH_CAPACITY],
+    packets: Box<[Option<PacketChain>]>,
+    metadata: Box<[Option<PacketMetadata>]>,
     len: u8,
 }
 
@@ -286,8 +286,8 @@ pub struct PacketBatch {
 impl PacketBatch {
     pub fn new() -> Self {
         Self {
-            packets: core::array::from_fn(|_| None),
-            metadata: [None; PACKET_BATCH_CAPACITY],
+            packets: empty_batch_slots(),
+            metadata: empty_batch_slots(),
             len: 0,
         }
     }
@@ -370,7 +370,7 @@ impl Default for PacketBatch {
 
 /// worker 交给 queue 的固定 32 项 RX replacement batch。
 pub struct RxRefillBatch {
-    leases: [Option<NetBufLease>; PACKET_BATCH_CAPACITY],
+    leases: Box<[Option<NetBufLease>]>,
     len: u8,
 }
 
@@ -378,7 +378,7 @@ pub struct RxRefillBatch {
 impl RxRefillBatch {
     pub fn new() -> Self {
         Self {
-            leases: core::array::from_fn(|_| None),
+            leases: empty_batch_slots(),
             len: 0,
         }
     }
@@ -451,7 +451,7 @@ pub struct TxPacket {
 
 /// 固定 32 项 TX batch。
 pub struct TxBatch {
-    packets: [Option<TxPacket>; PACKET_BATCH_CAPACITY],
+    packets: Box<[Option<TxPacket>]>,
     len: u8,
 }
 
@@ -459,7 +459,7 @@ pub struct TxBatch {
 impl TxBatch {
     pub fn new() -> Self {
         Self {
-            packets: core::array::from_fn(|_| None),
+            packets: empty_batch_slots(),
             len: 0,
         }
     }
@@ -524,7 +524,7 @@ impl Default for TxBatch {
 
 /// 固定 32 项 completion batch。
 pub struct CompletionBatch {
-    tokens: [Option<CompletionToken>; PACKET_BATCH_CAPACITY],
+    tokens: Box<[Option<CompletionToken>]>,
     len: u8,
 }
 
@@ -532,7 +532,7 @@ pub struct CompletionBatch {
 impl CompletionBatch {
     pub fn new() -> Self {
         Self {
-            tokens: [None; PACKET_BATCH_CAPACITY],
+            tokens: empty_batch_slots(),
             len: 0,
         }
     }
@@ -578,6 +578,12 @@ impl Default for CompletionBatch {
     }
 }
 
+fn empty_batch_slots<T>() -> Box<[Option<T>]> {
+    let mut slots = Vec::with_capacity(PACKET_BATCH_CAPACITY);
+    slots.resize_with(PACKET_BATCH_CAPACITY, || None);
+    slots.into_boxed_slice()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,9 +596,11 @@ mod tests {
         assert!(rx.is_empty());
         assert!(tx.is_empty());
         assert!(completion.is_empty());
-        assert_eq!(
-            core::mem::size_of_val(&rx),
-            core::mem::size_of::<PacketBatch>()
-        );
+        assert_eq!(rx.packets.len(), PACKET_BATCH_CAPACITY);
+        assert_eq!(rx.metadata.len(), PACKET_BATCH_CAPACITY);
+        assert_eq!(tx.packets.len(), PACKET_BATCH_CAPACITY);
+        assert_eq!(completion.tokens.len(), PACKET_BATCH_CAPACITY);
+        assert!(core::mem::size_of::<PacketBatch>() <= 8 * core::mem::size_of::<usize>());
+        assert!(core::mem::size_of::<TxBatch>() <= 4 * core::mem::size_of::<usize>());
     }
 }

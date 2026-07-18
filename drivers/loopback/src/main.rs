@@ -63,10 +63,12 @@ impl ElmModule for LoopbackElm {
         let Some(handle) = self.handle.as_ref() else {
             return Ok(());
         };
+        // 自有资源回调会把 host 移除推迟到 finalize，因此在此释放 queue 持有的
+        // lease 时，pool 仍然有效。
+        driver::destroy_queue();
         match handle.unregister() {
             Ok(()) => {
                 self.handle = None;
-                driver::destroy_queue();
                 Ok(())
             }
             Err(error) => Err(map_net_error(error)),
