@@ -23,13 +23,14 @@ use net::device::{
     NetDeviceRegistration, NetDeviceRemoveError, NetDeviceSnapshot, NetDeviceStats,
     NetDeviceTeardown, NetQueueRegistration, NetStat, QueueIrqControl, QueueWakeHandle,
 };
+use net::flow::FlowKey;
 use net::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
 use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
 use net::transport::{
-    PreparedRawTx, PreparedTcpTx, PreparedUdpTx, RawTxError, TcpPath,
-    build_header_included_ipv4_fragments, build_raw_packet, build_tcp_packet, build_udp_fragments,
-    build_udp_packet_with_options,
+    LocalUdpIngressError, PreparedRawTx, PreparedTcpTx, PreparedUdpTx, RawTxError, TcpPacket,
+    TcpPath, build_header_included_ipv4_fragments, build_raw_packet, build_tcp_packet,
+    build_udp_fragments, build_udp_packet_with_options,
 };
 use net::{
     AddressFamily, Endpoint, FlowId, FlowShard, FlowTurnContext, InterfaceId, IpAddr, Ipv4Addr,
@@ -550,6 +551,16 @@ struct IngressPacket {
 
 enum IngressWork {
     Packet(IngressPacket),
+    LocalTcp {
+        egress: usize,
+        interface: InterfaceId,
+        work: PreparedTcpTx,
+    },
+    LocalUdp {
+        egress: usize,
+        interface: InterfaceId,
+        work: PreparedUdpTx,
+    },
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
     UdpProbe {
         egress: usize,
@@ -1264,6 +1275,7 @@ impl ProtocolRuntime {
 
 struct ProtocolCluster {
     shards: Box<[Arc<ProtocolRuntime>]>,
+    rss_key: [u8; 40],
 }
 
 impl ProtocolCluster {
@@ -1278,6 +1290,10 @@ impl ProtocolCluster {
     fn ingress_target(&self, hash: Option<u32>) -> &Arc<ProtocolRuntime> {
         let index = hash.map_or(0, |hash| hash as usize % self.shards.len());
         &self.shards[index]
+    }
+
+    fn local_ingress_target(&self, key: &net::flow::FlowKey) -> &Arc<ProtocolRuntime> {
+        self.ingress_target(Some(net::flow::rss_hash(&self.rss_key, key)))
     }
 
     fn owner_target(&self, owner: OwnerRef) -> &Arc<ProtocolRuntime> {
@@ -2269,6 +2285,7 @@ pub fn start_workers() {
         .collect::<Vec<_>>();
     let cluster = Arc::new(ProtocolCluster {
         shards: runtimes.clone().into_boxed_slice(),
+        rss_key: *boot.rss_key(),
     });
     let mut protocol_tasks = Vec::with_capacity(runtimes.len());
     for runtime in &runtimes {
@@ -3322,6 +3339,16 @@ impl ProtocolContext {
                             .set_pending_error(SocketError::NetworkUnreachable);
                         continue;
                     };
+                    if config
+                        .interfaces
+                        .iter()
+                        .any(|interface| interface.id == work.route.interface && interface.loopback)
+                        && udp_batch_candidate(&work)
+                    {
+                        self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
+                        self.dispatch_local_udp(target, work);
+                        continue;
+                    }
                     if !udp_batch_candidate(&work) {
                         self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
                         self.dispatch_egress(target, EgressWork::Udp(work));
@@ -3360,6 +3387,25 @@ impl ProtocolContext {
             }
         }
         self.flush_udp_accumulator(&mut first, &mut batch_target, &mut batch);
+    }
+
+    fn dispatch_local_udp(&mut self, egress: usize, work: PreparedUdpTx) {
+        let source = Endpoint {
+            addr: work.route.source,
+            port: work.source_port,
+        };
+        let key = FlowKey::new(source, work.destination, TransportProtocol::Udp)
+            .expect("UDP local transport tuple 必须有效");
+        let target = self.cluster.local_ingress_target(&key);
+        let ingress = IngressWork::LocalUdp {
+            egress,
+            interface: work.route.interface,
+            work,
+        };
+        if target.try_push(ingress).is_err() {
+            self.runtime.egress[egress].stats.drop_reasons[DropReason::IngressRingFull.index()]
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn flush_udp_accumulator(
@@ -4271,6 +4317,16 @@ impl ProtocolContext {
                     }
                     self.process_packet_batch(egress, interface, local_mac, config);
                 }
+                IngressWork::LocalTcp {
+                    egress,
+                    interface,
+                    work,
+                } => self.process_local_tcp(egress, interface, work, config),
+                IngressWork::LocalUdp {
+                    egress,
+                    interface,
+                    work,
+                } => self.process_local_udp(egress, interface, work),
                 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
                 IngressWork::UdpProbe { egress, payload } => {
                     self.start_udp_probe(egress, payload, config);
@@ -4283,6 +4339,85 @@ impl ProtocolContext {
         }
         for pending in &mut self.pending[..count] {
             *pending = None;
+        }
+    }
+
+    fn process_local_tcp(
+        &mut self,
+        egress: usize,
+        interface: InterfaceId,
+        work: PreparedTcpTx,
+        config: &ConfigSnapshot,
+    ) {
+        let source = Endpoint {
+            addr: work.path.route.source,
+            port: work.local_port,
+        };
+        let key = FlowKey::new(source, work.remote, TransportProtocol::Tcp)
+            .expect("TCP local transport tuple 必须有效");
+        let path = TcpPath {
+            route: net::control::RouteDecision {
+                interface,
+                source: work.remote.addr,
+                next_hop: source.addr,
+                mtu: work.path.route.mtu,
+                table: work.path.route.table,
+            },
+            source_mac: work.path.destination_mac,
+            destination_mac: work.path.source_mac,
+            unresolved_neighbor: None,
+            config_generation: config.generation,
+        };
+        let packet = TcpPacket {
+            source_port: work.local_port,
+            destination_port: work.remote.port,
+            sequence: work.sequence,
+            acknowledgement: work.acknowledgement,
+            flags: work.flags,
+            window: work.window,
+            urgent_pointer: 0,
+            header_len: 20 + u16::from(work.options_len),
+            payload_offset: 0,
+            payload_len: work
+                .payload
+                .as_ref()
+                .map_or(0, |payload| u32::from(payload.len)),
+            options: work.parsed_options,
+        };
+        let result = self.protocol.process_local_tcp(
+            interface,
+            path,
+            key,
+            packet,
+            work.payload.as_ref(),
+            sched::now_ns_public(),
+        );
+        if matches!(result, Err(net::transport::TcpIngressError::NoEndpoint)) {
+            self.dispatch_egress(egress, EgressWork::Tcp(work));
+        }
+        self.dispatch_tcp_output();
+    }
+
+    fn process_local_udp(&mut self, egress: usize, interface: InterfaceId, work: PreparedUdpTx) {
+        let source = Endpoint {
+            addr: work.route.source,
+            port: work.source_port,
+        };
+        let result = self.protocol.process_local_udp(
+            interface,
+            source,
+            work.destination,
+            &work.payload,
+            work.hop_limit,
+            work.traffic_class,
+            sched::now_ns_public(),
+        );
+        match result {
+            Ok(_) => work.payload.complete(),
+            Err(LocalUdpIngressError::NoEndpoint | LocalUdpIngressError::Unsupported) => {
+                self.dispatch_egress(egress, EgressWork::Udp(work));
+            }
+            Err(LocalUdpIngressError::RingFull) => {}
         }
     }
 
@@ -4526,6 +4661,12 @@ impl ProtocolContext {
                         .set_pending_error(SocketError::NetworkUnreachable);
                     continue;
                 };
+                if config.interfaces.iter().any(|interface| {
+                    interface.id == work.path.route.interface && interface.loopback
+                }) {
+                    self.dispatch_local_tcp(target, work);
+                    continue;
+                }
                 self.dispatch_egress(target, EgressWork::Tcp(work));
             }
             if resume_budget == 0 {
@@ -4538,6 +4679,25 @@ impl ProtocolContext {
                 return;
             }
             resume_budget -= resumed;
+        }
+    }
+
+    fn dispatch_local_tcp(&mut self, egress: usize, work: PreparedTcpTx) {
+        let source = Endpoint {
+            addr: work.path.route.source,
+            port: work.local_port,
+        };
+        let key = FlowKey::new(source, work.remote, TransportProtocol::Tcp)
+            .expect("TCP local transport tuple 必须有效");
+        let target = self.cluster.local_ingress_target(&key);
+        let ingress = IngressWork::LocalTcp {
+            egress,
+            interface: work.path.route.interface,
+            work,
+        };
+        if target.try_push(ingress).is_err() {
+            self.runtime.egress[egress].stats.drop_reasons[DropReason::IngressRingFull.index()]
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -5880,6 +6040,7 @@ impl WorkerContext {
                 );
             }
             Err(IngressWork::Packet(_)) => unreachable!(),
+            Err(IngressWork::LocalTcp { .. } | IngressWork::LocalUdp { .. }) => unreachable!(),
             Err(IngressWork::PhysicalUdpProbe { .. }) => unreachable!(),
         }
     }
@@ -5923,6 +6084,7 @@ impl WorkerContext {
                 );
             }
             Err(IngressWork::Packet(_) | IngressWork::UdpProbe { .. }) => unreachable!(),
+            Err(IngressWork::LocalTcp { .. } | IngressWork::LocalUdp { .. }) => unreachable!(),
         }
     }
 

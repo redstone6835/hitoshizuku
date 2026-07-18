@@ -63,6 +63,7 @@ pub struct PreparedTcpTx {
     pub window: u16,
     pub options: [u8; 40],
     pub options_len: u8,
+    pub parsed_options: crate::transport::TcpOptions,
     pub completion: u64,
     pub low_latency: bool,
 }
@@ -116,10 +117,16 @@ struct ReassemblyFragment {
 }
 
 enum IngressPayload<'a> {
+    Empty,
     #[cfg(test)]
     Owned(Vec<u8>),
     Packet {
         chain: &'a PacketChain,
+        offset: usize,
+        len: usize,
+    },
+    Lease {
+        lease: &'a TcpTxLease,
         offset: usize,
         len: usize,
     },
@@ -128,9 +135,11 @@ enum IngressPayload<'a> {
 impl IngressPayload<'_> {
     fn len(&self) -> usize {
         match self {
+            Self::Empty => 0,
             #[cfg(test)]
             Self::Owned(bytes) => bytes.len(),
             Self::Packet { len, .. } => *len,
+            Self::Lease { len, .. } => *len,
         }
     }
 
@@ -145,16 +154,21 @@ impl IngressPayload<'_> {
     ) -> Result<usize, SocketError> {
         let len = self.len().saturating_sub(payload_offset);
         match self {
+            Self::Empty => Ok(0),
             #[cfg(test)]
             Self::Owned(bytes) => facade.push_stream_rx(&bytes[payload_offset..]),
             Self::Packet { chain, offset, .. } => {
                 facade.push_stream_rx_chain(chain, offset + payload_offset, len)
+            }
+            Self::Lease { lease, offset, .. } => {
+                facade.push_stream_rx_lease(lease, offset + payload_offset, len)
             }
         }
     }
 
     fn into_vec(self) -> Result<Vec<u8>, TcpIngressError> {
         match self {
+            Self::Empty => Ok(Vec::new()),
             #[cfg(test)]
             Self::Owned(bytes) => Ok(bytes),
             Self::Packet { chain, offset, len } => {
@@ -162,6 +176,14 @@ impl IngressPayload<'_> {
                 bytes.resize(len, 0);
                 chain
                     .copy_out(offset, &mut bytes)
+                    .map_err(|_| TcpIngressError::Malformed)?;
+                Ok(bytes)
+            }
+            Self::Lease { lease, offset, len } => {
+                let mut bytes = Vec::new();
+                bytes.resize(len, 0);
+                lease
+                    .copy_range(offset, &mut bytes)
                     .map_err(|_| TcpIngressError::Malformed)?;
                 Ok(bytes)
             }
@@ -533,16 +555,9 @@ impl TcpEndpointTable {
         let Some(tcp) = packet.parsed.tcp else {
             return Err((TcpIngressError::Malformed, chain, metadata));
         };
-        let hash = flow_hash64(rss_hash(&self.rss_key, &key));
-        let id = match self.flows.find(&key, hash) {
-            Some(id) => id,
-            None if tcp.flags.contains(TcpFlags::SYN) && !tcp.flags.contains(TcpFlags::ACK) => {
-                match self.accept_syn(interface, path, key, tcp, now_ns) {
-                    Ok(id) => id,
-                    Err(error) => return Err((error, chain, metadata)),
-                }
-            }
-            None => return Err((TcpIngressError::NoEndpoint, chain, metadata)),
+        let id = match self.ingress_flow(interface, path, key, tcp, now_ns) {
+            Ok(id) => id,
+            Err(error) => return Err((error, chain, metadata)),
         };
 
         let payload_offset = usize::from(tcp.payload_offset);
@@ -569,6 +584,52 @@ impl TcpEndpointTable {
                 Ok((id, chain, metadata))
             }
             Err(error) => Err((error, chain, metadata)),
+        }
+    }
+
+    pub fn ingest_local(
+        &mut self,
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        tcp: TcpPacket,
+        payload: Option<&TcpTxLease>,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpIngressError> {
+        let payload_len = tcp.payload_len as usize;
+        if payload
+            .as_ref()
+            .map_or(0, |payload| usize::from(payload.len))
+            != payload_len
+        {
+            return Err(TcpIngressError::Malformed);
+        }
+        let id = self.ingress_flow(interface, path, key, tcp, now_ns)?;
+        let ingress = payload.map_or(IngressPayload::Empty, |payload| IngressPayload::Lease {
+            lease: payload,
+            offset: 0,
+            len: payload_len,
+        });
+        self.process_segment_inner(id, tcp, ingress, now_ns)?;
+        self.stats.delivered = self.stats.delivered.saturating_add(1);
+        Ok(id)
+    }
+
+    fn ingress_flow(
+        &mut self,
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        tcp: TcpPacket,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpIngressError> {
+        let hash = flow_hash64(rss_hash(&self.rss_key, &key));
+        match self.flows.find(&key, hash) {
+            Some(id) => Ok(id),
+            None if tcp.flags.contains(TcpFlags::SYN) && !tcp.flags.contains(TcpFlags::ACK) => {
+                self.accept_syn(interface, path, key, tcp, now_ns)
+            }
+            None => Err(TcpIngressError::NoEndpoint),
         }
     }
 
@@ -627,7 +688,7 @@ impl TcpEndpointTable {
                     .get_or_insert(now_ns.saturating_add(flow.persist_ns));
                 break;
             }
-            let (_, options_len) = wire_options(flow, TcpFlags::ACK | TcpFlags::PSH, now_ns);
+            let (_, options_len, _) = wire_options(flow, TcpFlags::ACK | TcpFlags::PSH, now_ns);
             let segment_limit = effective_payload_mss(
                 flow.path.route.mtu,
                 flow.local.addr,
@@ -1581,7 +1642,7 @@ impl TcpEndpointTable {
                 .retransmit
                 .get_or_insert(now_ns.saturating_add(flow.rtt.rto_ns));
         }
-        let (options, options_len) = wire_options(flow, transmit.flags, now_ns);
+        let (options, options_len, parsed_options) = wire_options(flow, transmit.flags, now_ns);
         let advertised = advertised_window(&flow.facade, flow.local_window_scale);
         let wire_window = if transmit.flags.contains(TcpFlags::RST) {
             transmit.window
@@ -1603,6 +1664,7 @@ impl TcpEndpointTable {
             window: wire_window,
             options,
             options_len,
+            parsed_options,
             completion,
             low_latency,
         });
@@ -1770,25 +1832,35 @@ fn apply_sack(flow: &mut TcpFlow, blocks: &[Option<TcpSackBlock>; 4]) {
         .saturating_sub(newly_sacked_retransmitted);
 }
 
-fn wire_options(flow: &TcpFlow, flags: TcpFlags, now_ns: u64) -> ([u8; 40], u8) {
+fn wire_options(
+    flow: &TcpFlow,
+    flags: TcpFlags,
+    now_ns: u64,
+) -> ([u8; 40], u8, crate::transport::TcpOptions) {
     let mut options = [0u8; 40];
+    let mut parsed = crate::transport::TcpOptions::default();
     let mut len = 0usize;
     if flags.contains(TcpFlags::SYN) {
         options[len..len + 4].copy_from_slice(&[2, 4, 0, 0]);
         options[len + 2..len + 4].copy_from_slice(&flow.mss.to_be_bytes());
+        parsed.maximum_segment_size = Some(flow.mss);
         len += 4;
         options[len..len + 4].copy_from_slice(&[1, 3, 3, flow.local_window_scale]);
+        parsed.window_scale = Some(flow.local_window_scale);
         len += 4;
         options[len..len + 4].copy_from_slice(&[1, 1, 4, 2]);
+        parsed.sack_permitted = true;
         len += 4;
     }
     if flow.timestamp_enabled || flags.contains(TcpFlags::SYN) {
         options[len..len + 2].copy_from_slice(&[1, 1]);
         len += 2;
         options[len..len + 2].copy_from_slice(&[8, 10]);
-        options[len + 2..len + 6].copy_from_slice(&((now_ns / 1_000_000) as u32).to_be_bytes());
-        options[len + 6..len + 10]
-            .copy_from_slice(&flow.timestamp_recent.unwrap_or(0).to_be_bytes());
+        let value = (now_ns / 1_000_000) as u32;
+        let echo_reply = flow.timestamp_recent.unwrap_or(0);
+        options[len + 2..len + 6].copy_from_slice(&value.to_be_bytes());
+        options[len + 6..len + 10].copy_from_slice(&echo_reply.to_be_bytes());
+        parsed.timestamp = Some(crate::transport::TcpTimestamp { value, echo_reply });
         len += 10;
     }
     if !flags.contains(TcpFlags::SYN) && flow.sack_permitted && !flow.reassembly.is_empty() {
@@ -1801,13 +1873,14 @@ fn wire_options(flow: &TcpFlow, flags: TcpFlags, now_ns: u64) -> ([u8; 40], u8) 
             options[len] = 5;
             options[len + 1] = (2 + count * 8) as u8;
             len += 2;
-            for fragment in flow.reassembly.iter().take(count) {
+            for (index, fragment) in flow.reassembly.iter().take(count).enumerate() {
                 options[len..len + 4].copy_from_slice(&fragment.sequence.0.to_be_bytes());
-                options[len + 4..len + 8].copy_from_slice(
-                    &(fragment.sequence + fragment.bytes.len() as u32)
-                        .0
-                        .to_be_bytes(),
-                );
+                let right = fragment.sequence + fragment.bytes.len() as u32;
+                options[len + 4..len + 8].copy_from_slice(&right.0.to_be_bytes());
+                parsed.sack_blocks[index] = Some(crate::transport::TcpSackBlock {
+                    left: fragment.sequence,
+                    right,
+                });
                 len += 8;
             }
         }
@@ -1816,7 +1889,7 @@ fn wire_options(flow: &TcpFlow, flags: TcpFlags, now_ns: u64) -> ([u8; 40], u8) 
         options[len] = 1;
         len += 1;
     }
-    (options, len as u8)
+    (options, len as u8, parsed)
 }
 
 fn advertised_window(facade: &SocketFacade, scale: u8) -> u16 {
@@ -2583,6 +2656,87 @@ mod tests {
             5
         );
         assert_eq!(&received[..5], b"reply");
+    }
+
+    #[test]
+    fn local_tcp_handshake_and_payload_use_transport_ingress() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40000,
+        };
+        let listener = facade(40);
+        let group = listen_group(&listener, 40, 1, 4);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        table.listen(local, Some(InterfaceId(1)), group).unwrap();
+        let key = FlowKey::new(remote, local, TransportProtocol::Tcp).unwrap();
+
+        table
+            .ingest_local(
+                InterfaceId(1),
+                path(local.addr, remote.addr),
+                key,
+                packet(remote.port, local.port, 700, 0, TcpFlags::SYN, 0),
+                None,
+                1_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        table
+            .ingest_local(
+                InterfaceId(1),
+                path(local.addr, remote.addr),
+                key,
+                packet(
+                    remote.port,
+                    local.port,
+                    701,
+                    syn_ack.sequence.0.wrapping_add(1),
+                    TcpFlags::ACK,
+                    0,
+                ),
+                None,
+                2_000,
+            )
+            .unwrap();
+        let child = listener.accept(true, None).unwrap();
+        let child_flow = match child.owner() {
+            OwnerRef::Flow { flow, .. } => flow,
+            _ => panic!("accepted child has no flow owner"),
+        };
+
+        let sender = facade(41);
+        let payload = b"direct tcp payload";
+        assert_eq!(sender.test_push_stream_tx(payload), payload.len());
+        let lease = sender.take_stream_tx(payload.len()).unwrap();
+        let receive_next = table.flows.get(child_flow).unwrap().machine.receive_next();
+        let send_next = table.flows.get(child_flow).unwrap().machine.send_next();
+        table
+            .ingest_local(
+                InterfaceId(1),
+                path(local.addr, remote.addr),
+                key,
+                packet(
+                    remote.port,
+                    local.port,
+                    receive_next.0,
+                    send_next.0,
+                    TcpFlags::ACK | TcpFlags::PSH,
+                    payload.len() as u32,
+                ),
+                Some(&lease),
+                3_000,
+            )
+            .unwrap();
+        let mut output = [0u8; 64];
+        assert_eq!(
+            child.recv_stream(&mut output, false, false, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(&output[..payload.len()], payload);
     }
 
     #[test]

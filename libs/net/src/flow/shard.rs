@@ -2,15 +2,16 @@ use crate::buf::{
     CompletionToken, DropReason, PacketBatch, PacketChain, PacketMetadata, TxBatch, TxPacket,
 };
 use crate::control::{ConfigError, ConfigSnapshot, NeighborKey, NeighborTable, PmtuCache, PmtuKey};
+use crate::flow::FlowKey;
 use crate::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
 use crate::transport::{
-    ControlErrorTarget, ControlPacketResult, PreparedRawTx, PreparedTcpTx, PreparedUdpTx,
-    RawBindError, RawEndpointTable, TcpBindError, TcpEndpointTable, TcpIngressError, TcpPath,
-    UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError, build_port_unreachable,
-    build_tcp_reset, build_udp_packet, handle_control_packet,
+    ControlErrorTarget, ControlPacketResult, LocalUdpIngressError, PreparedRawTx, PreparedTcpTx,
+    PreparedUdpTx, RawBindError, RawEndpointTable, TcpBindError, TcpEndpointTable, TcpIngressError,
+    TcpPacket, TcpPath, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
+    build_port_unreachable, build_tcp_reset, build_udp_packet, handle_control_packet,
 };
 use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId};
-use crate::{OwnerRef, SocketError, SocketFacade, UdpTxLease};
+use crate::{OwnerRef, SocketError, SocketFacade, TcpTxLease, UdpTxLease};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
@@ -209,6 +210,46 @@ impl FlowShard {
 
     pub fn take_tcp_output(&mut self) -> Option<PreparedTcpTx> {
         self.tcp.take_output()
+    }
+
+    pub fn process_local_tcp(
+        &mut self,
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        packet: TcpPacket,
+        payload: Option<&TcpTxLease>,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpIngressError> {
+        let flow = self
+            .tcp
+            .ingest_local(interface, path, key, packet, payload, now_ns)?;
+        self.stats.tcp_delivered = self.stats.tcp_delivered.saturating_add(1);
+        self.reschedule_tcp(flow);
+        Ok(flow)
+    }
+
+    pub fn process_local_udp(
+        &mut self,
+        interface: InterfaceId,
+        source: Endpoint,
+        destination: Endpoint,
+        payload: &UdpTxLease,
+        hop_limit: u8,
+        traffic_class: u8,
+        now_ns: u64,
+    ) -> Result<FlowId, LocalUdpIngressError> {
+        let flow = self.udp.ingest_local(
+            interface,
+            source,
+            destination,
+            payload,
+            hop_limit,
+            traffic_class,
+            now_ns,
+        )?;
+        self.stats.udp_delivered = self.stats.udp_delivered.saturating_add(1);
+        Ok(flow)
     }
 
     pub fn resume_tcp_output(&mut self, now_ns: u64, budget: usize) -> usize {

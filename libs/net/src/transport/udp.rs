@@ -110,6 +110,13 @@ pub struct UdpIngressError {
     pub parsed: crate::pipeline::ParsedPacket,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalUdpIngressError {
+    NoEndpoint,
+    RingFull,
+    Unsupported,
+}
+
 pub struct PreparedUdpTx {
     pub payload: UdpTxLease,
     pub route: RouteDecision,
@@ -437,6 +444,145 @@ impl UdpEndpointTable {
 
     pub fn recv(&mut self, id: FlowId) -> Option<UdpDatagram> {
         self.flows.get_mut(id)?.rx.pop()
+    }
+
+    pub fn ingest_local(
+        &mut self,
+        interface: InterfaceId,
+        source: Endpoint,
+        destination: Endpoint,
+        payload: &UdpTxLease,
+        hop_limit: u8,
+        traffic_class: u8,
+        now_ns: u64,
+    ) -> Result<FlowId, LocalUdpIngressError> {
+        if destination.addr.is_multicast() || is_broadcast(destination.addr) {
+            return Err(LocalUdpIngressError::Unsupported);
+        }
+        let flow = FlowKey::new(source, destination, crate::TransportProtocol::Udp)
+            .ok_or(LocalUdpIngressError::Unsupported)?;
+        let hash = flow_hash64(rss_hash(&self.rss_key, &flow));
+        let selected = if let Some(id) = self.flows.find(&flow, hash) {
+            self.flows
+                .get(id)
+                .is_some_and(|endpoint| {
+                    endpoint.interface.is_none_or(|scope| scope == interface)
+                        && endpoint.peer.is_none_or(|peer| peer == source)
+                })
+                .then_some(id)
+        } else {
+            self.select_local_unicast(interface, source, destination, hash)
+        }
+        .ok_or(LocalUdpIngressError::NoEndpoint)?;
+        let endpoint = self
+            .flows
+            .get(selected)
+            .ok_or(LocalUdpIngressError::NoEndpoint)?;
+        let facade = endpoint
+            .facade
+            .as_ref()
+            .cloned()
+            .ok_or(LocalUdpIngressError::Unsupported)?;
+        let delivered_to = if endpoint.local.addr.is_unspecified() {
+            destination
+        } else {
+            endpoint.local
+        };
+        facade
+            .push_local_udp(
+                payload,
+                source,
+                delivered_to,
+                hop_limit,
+                traffic_class,
+                interface,
+                now_ns,
+            )
+            .map_err(|_| LocalUdpIngressError::RingFull)?;
+        self.flows.mark_dirty(selected, DIRTY_INGRESS);
+        Ok(selected)
+    }
+
+    fn select_local_unicast(
+        &self,
+        interface: InterfaceId,
+        source: Endpoint,
+        destination: Endpoint,
+        hash: u64,
+    ) -> Option<FlowId> {
+        let family = family(destination.addr);
+        let keys = [
+            UdpBindKey {
+                family,
+                address: Some(destination.addr),
+                port: destination.port,
+                interface: Some(interface),
+            },
+            UdpBindKey {
+                family,
+                address: Some(destination.addr),
+                port: destination.port,
+                interface: None,
+            },
+            UdpBindKey {
+                family,
+                address: None,
+                port: destination.port,
+                interface: Some(interface),
+            },
+            UdpBindKey {
+                family,
+                address: None,
+                port: destination.port,
+                interface: None,
+            },
+        ];
+        for key in keys {
+            if let Some(entries) = self.binds.get(&key) {
+                return self.select_local_entry(entries, interface, source, hash, false);
+            }
+        }
+        if family == AddressFamily::Ipv4 {
+            for key in [
+                UdpBindKey {
+                    family: AddressFamily::Ipv6,
+                    address: None,
+                    port: destination.port,
+                    interface: Some(interface),
+                },
+                UdpBindKey {
+                    family: AddressFamily::Ipv6,
+                    address: None,
+                    port: destination.port,
+                    interface: None,
+                },
+            ] {
+                if let Some(entries) = self.binds.get(&key) {
+                    return self.select_local_entry(entries, interface, source, hash, true);
+                }
+            }
+        }
+        None
+    }
+
+    fn select_local_entry(
+        &self,
+        entries: &[FlowId],
+        interface: InterfaceId,
+        source: Endpoint,
+        hash: u64,
+        require_ipv4: bool,
+    ) -> Option<FlowId> {
+        let eligible = |id: &&FlowId| {
+            self.flows.get(**id).is_some_and(|endpoint| {
+                (!require_ipv4 || endpoint.accepts_ipv4)
+                    && endpoint.interface.is_none_or(|scope| scope == interface)
+                    && endpoint.peer.is_none_or(|peer| peer == source)
+            })
+        };
+        let count = entries.iter().filter(eligible).count();
+        let selected = usize::try_from(hash).unwrap_or(0) % count.max(1);
+        entries.iter().filter(eligible).nth(selected).copied()
     }
 
     pub fn endpoint_info(&self, id: FlowId) -> Option<UdpEndpointInfo> {
@@ -1008,6 +1154,64 @@ mod tests {
                 .ingest(InterfaceId(1), parsed_packet(1001, 9000))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn local_udp_delivery_copies_payload_and_reclaims_sender_slot() {
+        let mut table = UdpEndpointTable::new([11; 40]);
+        let receiver = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 1,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Datagram,
+        ));
+        let source = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40000,
+        };
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        let flow = table
+            .bind_facade(
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: destination.port,
+                },
+                None,
+                Some(InterfaceId(1)),
+                Arc::clone(&receiver),
+            )
+            .unwrap();
+        let sender = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 2,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Datagram,
+        ));
+        let payload = b"local datagram";
+        let lease = sender.test_udp_tx_lease(payload, destination);
+        assert_eq!(
+            table.ingest_local(InterfaceId(1), source, destination, &lease, 64, 0, 123,),
+            Ok(flow)
+        );
+        lease.complete();
+
+        let mut output = [0u8; 32];
+        let received = receiver
+            .recv(&mut output, false, false, true, None)
+            .unwrap();
+        assert_eq!(received.len, payload.len());
+        assert_eq!(&output[..received.len], payload);
+        assert_eq!(received.source, source);
+        assert_eq!(received.destination, destination);
+        assert!(sender.readiness().0.contains(crate::Readiness::WRITABLE));
+        assert_eq!(sender.test_udp_tx_used_bytes(), 0);
     }
 
     #[test]

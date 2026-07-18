@@ -306,6 +306,26 @@ impl ByteRing {
         len
     }
 
+    fn push_with<E>(
+        &mut self,
+        len: usize,
+        mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let len = len.min(self.available());
+        self.grow_for(len);
+        if len == 0 {
+            return Ok(0);
+        }
+        let tail = (self.head + self.len) % self.arena.len();
+        let first = len.min(self.arena.len() - tail);
+        copy(0, &mut self.arena[tail..tail + first])?;
+        if first != len {
+            copy(first, &mut self.arena[..len - first])?;
+        }
+        self.len += len;
+        Ok(len)
+    }
+
     fn copy_range(&self, offset: usize, output: &mut [u8]) -> bool {
         if offset.saturating_add(output.len()) > self.len {
             return false;
@@ -684,13 +704,36 @@ impl TxRing {
     }
 }
 
+struct LocalUdpDatagram {
+    chunks: [u8; MAX_DATAGRAM_CHUNKS],
+    chunk_count: u8,
+}
+
+enum RxPayload {
+    Packet(crate::transport::UdpDatagram),
+    Local(LocalUdpDatagram),
+}
+
+struct RxDatagram {
+    payload: RxPayload,
+    source: Endpoint,
+    destination: Endpoint,
+    payload_len: u16,
+    ingress_interface: InterfaceId,
+    hop_limit: u8,
+    traffic_class: u8,
+    rx_timestamp_ns: u64,
+}
+
 struct RxRing {
-    entries: Box<[Option<crate::transport::UdpDatagram>]>,
+    entries: Box<[Option<RxDatagram>]>,
     head: u16,
     tail: u16,
     len: u16,
     bytes: usize,
     limit: usize,
+    arena: Box<[u8]>,
+    free_chunks: [u64; 2],
 }
 
 impl RxRing {
@@ -705,6 +748,8 @@ impl RxRing {
             len: 0,
             bytes: 0,
             limit: UDP_BUFFER_BYTES,
+            arena: alloc::vec![0; UDP_BUFFER_BYTES].into_boxed_slice(),
+            free_chunks: [u64::MAX >> 32, 0],
         }
     }
 
@@ -722,17 +767,107 @@ impl RxRing {
             return Err(datagram);
         }
         self.bytes += usize::from(datagram.payload_len);
-        self.entries[usize::from(self.tail)] = Some(datagram);
+        self.entries[usize::from(self.tail)] = Some(RxDatagram {
+            source: datagram.source,
+            destination: datagram.destination,
+            payload_len: datagram.payload_len,
+            ingress_interface: datagram.ingress_interface,
+            hop_limit: datagram.hop_limit,
+            traffic_class: datagram.traffic_class,
+            rx_timestamp_ns: datagram.rx_timestamp_ns,
+            payload: RxPayload::Packet(datagram),
+        });
         self.tail = (self.tail + 1) % self.entries.len() as u16;
         self.len += 1;
         Ok(())
     }
 
-    fn front(&self) -> Option<&crate::transport::UdpDatagram> {
+    fn push_local(
+        &mut self,
+        payload: &UdpTxLease,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+    ) -> Result<(), SocketError> {
+        let payload_len = usize::from(payload.len);
+        let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
+        if usize::from(self.len) == self.entries.len()
+            || self.bytes.saturating_add(payload_len) > self.limit
+            || chunk_count > MAX_DATAGRAM_CHUNKS
+            || self.free_chunk_count() < chunk_count
+        {
+            return Err(SocketError::WouldBlock);
+        }
+        let mut chunks = [0u8; MAX_DATAGRAM_CHUNKS];
+        let mut allocated = 0;
+        for chunk in chunks.iter_mut().take(chunk_count) {
+            *chunk = self.take_free_chunk().expect("RX chunk 计数失配");
+            allocated += 1;
+        }
+        for (index, chunk) in chunks.iter().take(chunk_count).enumerate() {
+            let offset = index * SOCKET_CHUNK_BYTES;
+            let len = (payload_len - offset).min(SOCKET_CHUNK_BYTES);
+            if let Err(error) = payload.copy_range(
+                offset,
+                &mut self.arena[usize::from(*chunk) * SOCKET_CHUNK_BYTES
+                    ..usize::from(*chunk) * SOCKET_CHUNK_BYTES + len],
+            ) {
+                self.release_chunks(&chunks, allocated);
+                return Err(error);
+            }
+        }
+        self.bytes += payload_len;
+        self.entries[usize::from(self.tail)] = Some(RxDatagram {
+            payload: RxPayload::Local(LocalUdpDatagram {
+                chunks,
+                chunk_count: chunk_count as u8,
+            }),
+            source,
+            destination,
+            payload_len: payload.len,
+            ingress_interface,
+            hop_limit,
+            traffic_class,
+            rx_timestamp_ns,
+        });
+        self.tail = (self.tail + 1) % self.entries.len() as u16;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn front(&self) -> Option<&RxDatagram> {
         self.entries[usize::from(self.head)].as_ref()
     }
 
-    fn pop(&mut self) -> Option<crate::transport::UdpDatagram> {
+    fn copy_front(&self, output: &mut [u8]) -> Result<(), SocketError> {
+        let datagram = self.front().ok_or(SocketError::WouldBlock)?;
+        let len = output.len().min(usize::from(datagram.payload_len));
+        match &datagram.payload {
+            RxPayload::Packet(packet) => packet
+                .packet
+                .copy_out(usize::from(packet.payload_offset), &mut output[..len])
+                .map_err(|_| SocketError::Buffer),
+            RxPayload::Local(local) => {
+                let mut copied = 0;
+                for chunk in local.chunks.iter().take(usize::from(local.chunk_count)) {
+                    let part = (len - copied).min(SOCKET_CHUNK_BYTES);
+                    let offset = usize::from(*chunk) * SOCKET_CHUNK_BYTES;
+                    output[copied..copied + part]
+                        .copy_from_slice(&self.arena[offset..offset + part]);
+                    copied += part;
+                    if copied == len {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<RxDatagram> {
         if self.len == 0 {
             return None;
         }
@@ -742,7 +877,55 @@ impl RxRing {
         if let Some(datagram) = datagram.as_ref() {
             self.bytes = self.bytes.saturating_sub(usize::from(datagram.payload_len));
         }
+        if let Some(RxDatagram {
+            payload: RxPayload::Local(local),
+            ..
+        }) = datagram.as_ref()
+        {
+            self.release_chunks(&local.chunks, usize::from(local.chunk_count));
+        }
         datagram
+    }
+
+    fn free_chunk_count(&self) -> usize {
+        self.free_chunks
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    fn take_free_chunk(&mut self) -> Option<u8> {
+        for (word_index, word) in self.free_chunks.iter_mut().enumerate() {
+            if *word == 0 {
+                continue;
+            }
+            let bit = word.trailing_zeros() as usize;
+            *word &= !(1u64 << bit);
+            return Some((word_index * 64 + bit) as u8);
+        }
+        None
+    }
+
+    fn release_chunks(&mut self, chunks: &[u8; MAX_DATAGRAM_CHUNKS], count: usize) {
+        for chunk in chunks.iter().take(count) {
+            let index = usize::from(*chunk);
+            self.free_chunks[index / 64] |= 1u64 << (index % 64);
+        }
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        let limit = limit.clamp(16 * 1024, UDP_BUFFER_HARD_LIMIT);
+        let required_chunks = limit.div_ceil(SOCKET_CHUNK_BYTES);
+        let current_chunks = self.arena.len() / SOCKET_CHUNK_BYTES;
+        if required_chunks > current_chunks {
+            let mut arena = core::mem::take(&mut self.arena).into_vec();
+            arena.resize(required_chunks * SOCKET_CHUNK_BYTES, 0);
+            self.arena = arena.into_boxed_slice();
+            for index in current_chunks..required_chunks {
+                self.free_chunks[index / 64] |= 1u64 << (index % 64);
+            }
+        }
+        self.limit = limit;
     }
 }
 
@@ -1834,6 +2017,15 @@ impl SocketFacade {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_udp_tx_used_bytes(&self) -> usize {
+        self.tx
+            .lock()
+            .as_ref()
+            .expect("datagram facade 必须拥有 TX ring")
+            .used_bytes
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_stream_tx_len(&self) -> usize {
         self.stream_tx.lock().bytes.len
     }
@@ -1934,6 +2126,39 @@ impl SocketFacade {
         Ok(len)
     }
 
+    pub(crate) fn push_stream_rx_lease(
+        &self,
+        lease: &TcpTxLease,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize, SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return Ok(len);
+        }
+        let was_empty;
+        {
+            let mut rx = self.stream_rx.lock();
+            if rx.bytes.available() < len {
+                return Err(SocketError::WouldBlock);
+            }
+            was_empty = rx.bytes.len == 0;
+            let copied = rx.bytes.push_with(len, |copied, output| {
+                lease.copy_range(offset + copied, output)
+            })?;
+            debug_assert_eq!(copied, len);
+        }
+        self.tcp_bytes_received
+            .fetch_add(len as u64, Ordering::Relaxed);
+        if was_empty && len != 0 {
+            self.set_ready(Readiness::READABLE);
+            self.read_wait.wake_one_default();
+        }
+        Ok(len)
+    }
+
     pub fn publish_stream_eof(&self) {
         self.stream_rx.lock().eof = true;
         self.set_ready(Readiness::READABLE | Readiness::READ_HANGUP);
@@ -2015,6 +2240,44 @@ impl SocketFacade {
         Ok(())
     }
 
+    pub(crate) fn push_local_udp(
+        &self,
+        payload: &UdpTxLease,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+    ) -> Result<(), SocketError> {
+        if self.kind != SocketKind::Datagram {
+            return Err(SocketError::InvalidState);
+        }
+        if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return Err(SocketError::Closed);
+        }
+        let was_empty = {
+            let mut rx = self.rx.lock();
+            let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
+            let was_empty = rx.is_empty();
+            rx.push_local(
+                payload,
+                source,
+                destination,
+                hop_limit,
+                traffic_class,
+                ingress_interface,
+                rx_timestamp_ns,
+            )?;
+            was_empty
+        };
+        if was_empty {
+            self.set_ready(Readiness::READABLE);
+            self.read_wait.wake_one_default();
+        }
+        Ok(())
+    }
+
     pub fn recv(
         &self,
         output: &mut [u8],
@@ -2072,10 +2335,7 @@ impl SocketFacade {
         };
         let original_len = usize::from(datagram.payload_len);
         let copied = original_len.min(output.len());
-        datagram
-            .packet
-            .copy_out(usize::from(datagram.payload_offset), &mut output[..copied])
-            .map_err(|_| SocketError::Buffer)?;
+        rx.copy_front(&mut output[..copied])?;
         let result = UdpReceive {
             len: if report_original_len {
                 original_len
@@ -2452,13 +2712,12 @@ impl SocketFacade {
         }
         if let Some(limit) = receive {
             match self.kind {
-                SocketKind::Datagram | SocketKind::Raw => {
-                    self.rx
-                        .lock()
-                        .as_mut()
-                        .expect("UDP facade 必须拥有 RX ring")
-                        .limit = limit.clamp(16 * 1024, UDP_BUFFER_HARD_LIMIT)
-                }
+                SocketKind::Datagram | SocketKind::Raw => self
+                    .rx
+                    .lock()
+                    .as_mut()
+                    .expect("UDP facade 必须拥有 RX ring")
+                    .set_limit(limit),
                 SocketKind::Stream => self.stream_rx.lock().bytes.set_limit(limit),
             }
         }

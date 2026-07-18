@@ -25,6 +25,7 @@ pub use tcp_engine::{
     build_tcp_packet, build_tcp_reset,
 };
 pub use udp::{
-    PreparedUdpTx, UdpBindError, UdpDatagram, UdpEndpointInfo, UdpEndpointTable, UdpIngressError,
-    UdpTxError, build_udp_fragments, build_udp_packet, build_udp_packet_with_options,
+    LocalUdpIngressError, PreparedUdpTx, UdpBindError, UdpDatagram, UdpEndpointInfo,
+    UdpEndpointTable, UdpIngressError, UdpTxError, build_udp_fragments, build_udp_packet,
+    build_udp_packet_with_options,
 };
