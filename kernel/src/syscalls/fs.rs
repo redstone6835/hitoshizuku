@@ -174,7 +174,10 @@ const STATX_BASIC_STATS: u32 = STATX_TYPE
 
 const MSGHDR_SIZE_64: usize = 56;
 const MMSGHDR_SIZE_64: usize = 64;
-const EPOLL_EVENT_SIZE_64: usize = 12;
+// Linux 只在 x86_64 上把 epoll_event 压缩为 12 字节；LoongArch64、
+// RISC-V64 等 64 位架构按 8 字节对齐 data，结构体大小为 16 字节。
+const EPOLL_EVENT_DATA_OFFSET_64: usize = if cfg!(target_arch = "x86_64") { 4 } else { 8 };
+const EPOLL_EVENT_SIZE_64: usize = EPOLL_EVENT_DATA_OFFSET_64 + 8;
 const PSELECT6_SIGSET_ARG_SIZE_64: usize = 16;
 
 pub(super) fn sys_write(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3786,7 +3789,11 @@ fn read_epoll_event(user: usize) -> Result<vfs::epoll::EpollEvent, Errno> {
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
     Ok(vfs::epoll::EpollEvent {
         events: u32::from_le_bytes(raw[0..4].try_into().unwrap()),
-        data: u64::from_le_bytes(raw[4..12].try_into().unwrap()),
+        data: u64::from_le_bytes(
+            raw[EPOLL_EVENT_DATA_OFFSET_64..EPOLL_EVENT_SIZE_64]
+                .try_into()
+                .unwrap(),
+        ),
     })
 }
 
@@ -3794,7 +3801,8 @@ fn write_epoll_events(user: usize, events: &[vfs::epoll::EpollEvent]) -> Result<
     for (index, event) in events.iter().enumerate() {
         let mut raw = [0u8; EPOLL_EVENT_SIZE_64];
         raw[0..4].copy_from_slice(&event.events.to_le_bytes());
-        raw[4..12].copy_from_slice(&event.data.to_le_bytes());
+        raw[EPOLL_EVENT_DATA_OFFSET_64..EPOLL_EVENT_SIZE_64]
+            .copy_from_slice(&event.data.to_le_bytes());
         let ptr = user
             .checked_add(
                 index
