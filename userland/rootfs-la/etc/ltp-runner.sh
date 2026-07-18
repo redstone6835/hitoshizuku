@@ -14,11 +14,19 @@ WORK_ROOT="$WORK_MOUNT/run"
 TEST_DEV=/dev/vd2
 BIG_DEV=/dev/vd3
 SKIP_FILE=/etc/ltp-skip.tsv
+CONFIG_FILE="$WORK_MOUNT/ltp.conf"
 
 cmdline_value() {
     key="$1"
     fallback="$2"
 
+    if [ -r "$CONFIG_FILE" ]; then
+        value="$(awk -F '=' -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$CONFIG_FILE")"
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
     if [ -r /sys/kernel/cmdline ]; then
         for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
             case "$arg" in
@@ -90,7 +98,7 @@ prepare_dynamic_linker() {
 
 prepare_workdir() {
     mkdir -p "$WORK_MOUNT"
-    if ! mount -t ext4 /dev/vd1 "$WORK_MOUNT" 2>/dev/null; then
+    if [ ! -r "$CONFIG_FILE" ] && ! mount -t ext4 /dev/vd1 "$WORK_MOUNT" 2>/dev/null; then
         marker fatal "reason=work-device-mount-failed" "device=/dev/vd1"
         return 1
     fi
@@ -255,35 +263,43 @@ marker runner_start "run_id=$RUN_ID" "group=$GROUP" "scenario=$SCENARIO" \
     "start=$START" "count=$COUNT" "only=$ONLY" "timeout=$CASE_TIMEOUT" \
     "timeout_mul=$TIMEOUT_MUL"
 
-index=0
+SELECTED_FILE="$WORK_ROOT/selected.runtest"
+awk -v start="$START" -v count="$COUNT" -v only="$ONLY" '
+    {
+        line = $0
+        sub(/^[[:space:]]*/, "", line)
+        sub(/[[:space:]]*$/, "", line)
+        if (line == "" || substr(line, 1, 1) == "#")
+            next
+
+        tag = line
+        sub(/[[:space:]].*$/, "", tag)
+        if (only != "") {
+            if (tag == only) {
+                printf "%d\t%s\n", case_index, line
+                exit
+            }
+        } else if (case_index >= start && selected < count) {
+            printf "%d\t%s\n", case_index, line
+            selected++
+        }
+        case_index++
+        if (only == "" && selected >= count)
+            exit
+    }
+' "$RUNT_FILE" >"$SELECTED_FILE"
+
 selected=0
 last_next="$START"
-while IFS= read -r raw_line || [ -n "$raw_line" ]; do
-    line="$(printf '%s\n' "$raw_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    case "$line" in
-        ''|'#'*) continue ;;
-    esac
-
+while IFS= read -r record || [ -n "$record" ]; do
+    index="${record%%	*}"
+    line="${record#*	}"
     tag="${line%%[ 	]*}"
-    if [ -n "$ONLY" ]; then
-        [ "$tag" = "$ONLY" ] || {
-            index=$((index + 1))
-            continue
-        }
-    else
-        [ "$index" -ge "$START" ] || {
-            index=$((index + 1))
-            continue
-        }
-        [ "$selected" -lt "$COUNT" ] || break
-    fi
-
     run_case "$index" "$tag" "$line"
     selected=$((selected + 1))
     last_next=$((index + 1))
-    index=$((index + 1))
-    [ -z "$ONLY" ] || break
-done <"$RUNT_FILE"
+done <"$SELECTED_FILE"
+rm -f "$SELECTED_FILE"
 
 marker shard_end "run_id=$RUN_ID" "group=$GROUP" "scenario=$SCENARIO" \
     "selected=$selected" "next=$last_next"

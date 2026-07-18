@@ -36,6 +36,11 @@ QEMU 使用 4 GiB 内存、4 个 CPU 和 VirtIO PCI 设备。磁盘顺序固定�
 编排器在测试活动前后计算 `sdcard-la.img` 的 SHA-256。哈希变化会使整个活动失败，
 不得把受污染镜像产生的结果并入报告。
 
+QEMU 9.2.1 的 LoongArch64 `-kernel` 直启路径不会把 `-append` 写入当前 EFI stub 的
+LoadedImage options，loader 实际收到的 `cmdline` 为零。编排器因此把同一组参数写入
+`/dev/vd1` 根目录的 `ltp.conf`；rcS 仅在该文件明确包含 `ltp_run=1` 时进入测试模式。
+`/sys/kernel/cmdline` 仍作为受支持启动器的兼容输入，但不作为本测试环境的唯一参数源。
+
 ## 执行模型
 
 Guest 入口为 `userland/rootfs-la/etc/ltp-runner.sh`。它按官方 runtest 的稳定零基索引
@@ -123,14 +128,27 @@ python3 scripts/ltp_la.py report
 - [x] 实现单例隔离、静态跳过、超时和结构化 marker 的 Guest runner。
 - [x] 实现清单、分片、恢复、异常重试、镜像保护和报告生成的宿主编排器。
 - [x] 为清单解析、marker、结果分类和恢复去重添加宿主单元测试。
-- [ ] 构建专用 `kernel-la` 并完成 TPASS、静态跳过和 TCONF 三类冒烟。
+- [x] 构建专用 `kernel-la` 并完成 TPASS、静态跳过和 TCONF 三类冒烟。
 - [ ] 完成 `default` 与 `network` 第一轮全量基线。
 - [ ] 按独立根因修复内核漏洞并完成三次单例与场景分片回归。
 - [ ] 从零完成最终全量复测。
 
 ## Missing Feature
 
-尚未完成第一轮全量基线。本节只接受由实际用例输出确认的缺失功能，不依据代码浏览猜测。
+本节只接受由实际用例输出确认的缺失功能，不依据代码浏览猜测。
+
+| 场景/用例 | 证据 | 结论 |
+| --- | --- | --- |
+| `syscalls/fsopen01` | 两次 `fsopen()` 均返回 `ENOSYS`，LTP 汇总为 2 个 TFAIL | `fsopen(2)` 尚未实现 |
+
+## 冒烟记录
+
+| 用例 | 结果 | 说明 |
+| --- | --- | --- |
+| `syscalls/getpid01` | `pass` | glibc、runltp、工作盘和 marker 全链路正常 |
+| `syscalls/delete_module01` | `static-skip` | 按 Linux LKM 强绑定规则跳过，原因字段完整 |
+| `syscalls/fanotify01` | `tconf` | 测试自身识别可选功能不可用，分类器未误算为通过 |
+| `syscalls/fsopen01` | `fail` | 明确的缺失系统调用，记录到 Missing Feature |
 
 ## 内核缺陷修复
 

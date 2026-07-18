@@ -27,6 +27,17 @@ if [ -r /sys/kernel/cmdline ]; then
     done
 fi
 
+# LoongArch64 的 QEMU 直启路径不保证把 -append 传给 EFI stub，因此宿主编排器
+# 也会把同一组参数写入工作盘。没有该工作盘或配置文件时不改变普通启动行为。
+mkdir -p /ltp-work
+if [ -b /dev/vd1 ] && mount -t ext4 /dev/vd1 /ltp-work 2>/dev/null; then
+    if grep -qx 'ltp_run=1' /ltp-work/ltp.conf 2>/dev/null; then
+        ltp_mode=1
+    elif [ "$ltp_mode" -eq 0 ]; then
+        umount /ltp-work 2>/dev/null || true
+    fi
+fi
+
 if [ "$ltp_mode" -eq 1 ]; then
     if ! mount -t ext4 /dev/vd0 /mnt; then
         printf '@@LTP\tfatal\treason=test-image-mount-failed\tdevice=/dev/vd0\n'

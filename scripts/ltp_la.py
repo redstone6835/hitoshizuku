@@ -458,6 +458,68 @@ def ensure_work_disks(output: Path, docker_image: str, root: Path) -> dict[str, 
     return {"work": work, "test": test, "big": big}
 
 
+def write_work_config(
+    work: Path,
+    fields: dict[str, Any],
+    output: Path,
+    docker_image: str,
+    root: Path,
+) -> None:
+    """把启动参数写入工作盘，绕过 LoongArch64 直启不传递 -append 的限制。"""
+
+    config_dir = output / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    source = config_dir / "ltp.conf"
+    lines: list[str] = []
+    for key, value in fields.items():
+        text = str(value)
+        if "\n" in text or "\r" in text or "=" in key:
+            raise LtpError(f"工作盘配置字段无效: {key}={text!r}")
+        lines.append(f"{key}={text}")
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    if shutil.which("debugfs"):
+        base = ["debugfs", "-w"]
+        image_arg = str(work)
+        source_arg = str(source)
+    else:
+        base = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{root}:/work",
+            "-w",
+            "/work",
+            docker_image,
+            "debugfs",
+            "-w",
+        ]
+        image_arg = relative_to_root(work, root)
+        source_arg = relative_to_root(source, root)
+
+    subprocess.run(
+        [*base, "-R", "rm /ltp.conf", image_arg],
+        cwd=root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    result = subprocess.run(
+        [*base, "-R", f"write {source_arg} /ltp.conf", image_arg],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0 or "Allocated inode" not in result.stdout:
+        raise LtpError(
+            "写入 LTP 工作盘配置失败: "
+            f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}"
+        )
+
+
 def relative_to_root(path: Path, root: Path) -> str:
     """把 QEMU 输入限制在映射到容器的仓库目录内。"""
 
@@ -756,19 +818,25 @@ def run_one_shard(
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = serial_dir / f"{group}-{scenario}-{start:05d}-{stamp}-{uuid.uuid4().hex[:6]}.log"
     container_name = f"ltp-la-{os.getpid()}-{uuid.uuid4().hex[:10]}"
-    cmdline = format_cmdline(
-        {
-            "ltp_run": 1,
-            "ltp_run_id": run_id,
-            "ltp_group": group,
-            "ltp_scenario": scenario,
-            "ltp_start": start,
-            "ltp_count": count,
-            "ltp_only": only,
-            "ltp_case_timeout": args.case_timeout,
-            "ltp_kill_grace": args.kill_grace,
-            "ltp_timeout_mul": args.timeout_mul,
-        }
+    config_fields = {
+        "ltp_run": 1,
+        "ltp_run_id": run_id,
+        "ltp_group": group,
+        "ltp_scenario": scenario,
+        "ltp_start": start,
+        "ltp_count": count,
+        "ltp_only": only,
+        "ltp_case_timeout": args.case_timeout,
+        "ltp_kill_grace": args.kill_grace,
+        "ltp_timeout_mul": args.timeout_mul,
+    }
+    cmdline = format_cmdline(config_fields)
+    write_work_config(
+        disks["work"],
+        config_fields,
+        output,
+        args.docker_image,
+        root,
     )
     command = qemu_command(
         root=root,
@@ -1368,6 +1436,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return report_command(args, root)
         if args.command == "journal":
             return journal_command(args, root)
+    except KeyboardInterrupt:
+        print("ltp_la.py: 用户中断", file=sys.stderr)
+        return 130
     except (LtpError, OSError, subprocess.SubprocessError, ValueError) as error:
         print(f"ltp_la.py: {error}", file=sys.stderr)
         return 2
