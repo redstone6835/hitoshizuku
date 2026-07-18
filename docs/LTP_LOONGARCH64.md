@@ -159,5 +159,20 @@ python3 scripts/ltp_la.py report
 
 ## 内核缺陷修复
 
-尚未开始第一轮全量基线。每个独立根因将记录复现用例、根因、修改、三次单例结果、
-场景回归结果和对应中文原子提交。
+### epoll 控制与用户态 ABI
+
+第一轮 `default/syscalls` 基线在索引 137--149 暴露了多项相互独立的 epoll 缺陷。
+原始失败输出位于
+`build/ltp-loongarch64/serial/default-syscalls-00100-20260719-014819-4e3703.log`。
+
+| 用例 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| `epoll_ctl01`、`epoll_wait01` | 系统调用层把所有 64 位架构的 `struct epoll_event` 固定解释为 x86_64 的 12 字节 packed 布局；LoongArch64 实际大小为 16 字节且 `data` 偏移为 8，事件数组第二项因此从错误地址读写 | 根据目标架构选择结构大小和 `data` 偏移；VFS 就绪扫描增加轮转游标，持续就绪项不再饿死后续项 | 两个用例各连续运行三次，全部 `pass` |
+| `epoll_ctl02` | 普通文件和目录虽然对 `poll(2)` 表现为立即就绪，却被错误允许加入 epoll | `FileOps` 增加显式 epoll 接纳能力，普通文件和目录默认拒绝，真实事件源逐项声明支持 | 连续运行三次，全部 `pass` |
+| `epoll_ctl04` | epoll 图只检查闭环，没有限制最大嵌套深度 | 对新增边执行递归深度校验，允许最多五个 epoll 实例组成嵌套链；闭环仍优先返回 `ELOOP` | 连续运行三次，全部 `pass`；`epoll_ctl05` 的原有闭环行为由宿主测试覆盖 |
+| `epoll_wait03` | `maxevents` 直接按无符号系统调用参数处理，`-1` 被解释为巨大正数 | 先按 ABI 的有符号 `int` 解码并拒绝所有非正值 | 连续运行三次，全部 `pass` |
+
+宿主执行 `cargo test -p vfs --target x86_64-unknown-linux-gnu`，共 67 项通过；新增测试
+覆盖普通文件拒绝、第六层嵌套拒绝、闭环 `ELOOP` 优先级和 level-triggered 就绪轮转。
+固定容器内 `make kernel-la` 构建通过。
+对应提交为 `b0f46575`、`44cb8f02` 和 `4c3ce0a3`。
