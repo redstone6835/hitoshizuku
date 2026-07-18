@@ -60,6 +60,7 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
         Arc::clone(&tgroup),
         Arc::clone(&pgroup),
     );
+    child.inherit_timer_slack_from(parent);
 
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_leader(&child);
@@ -179,6 +180,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&new_tg),
         Arc::clone(&pg),
     );
+    child.inherit_timer_slack_from(parent);
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
     if flags.has(CloneFlags::CLONE_VM) && !flags.has(CloneFlags::CLONE_VFORK) {

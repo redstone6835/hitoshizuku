@@ -79,6 +79,20 @@ fn robust_list_and_rseq_state_roundtrip() {
 }
 
 #[ktest]
+fn timer_slack_defaults_resets_and_inherits() {
+    let parent = make_task();
+    let child = make_task();
+
+    assert_eq!(parent.timer_slack_ns(), crate::DEFAULT_TIMER_SLACK_NS);
+    parent.set_timer_slack_ns(125_000);
+    child.inherit_timer_slack_from(&parent);
+    assert_eq!(child.timer_slack_ns(), 125_000);
+
+    child.set_timer_slack_ns(0);
+    assert_eq!(child.timer_slack_ns(), crate::DEFAULT_TIMER_SLACK_NS);
+}
+
+#[ktest]
 fn supported_cpu_mask_matches_configured_capacity() {
     let expected = if NR_CPUS >= 64 {
         u64::MAX

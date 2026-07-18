@@ -370,18 +370,27 @@ impl EpollFileOps {
         1 + max_child_depth
     }
 
-    fn wait(&self, maxevents: usize, timeout_ms: i64) -> Result<Vec<EpollEvent>, Errno> {
-        let deadline = timeout_deadline(timeout_ms);
+    fn wait_until(
+        &self,
+        maxevents: usize,
+        deadline: Option<u64>,
+    ) -> Result<Vec<EpollEvent>, Errno> {
         loop {
             let ready = self.collect_ready(maxevents);
             if !ready.is_empty() {
                 return Ok(ready);
             }
-            if timeout_expired(deadline) || timeout_ms == 0 {
+            if timeout_expired(deadline) {
                 return Ok(Vec::new());
             }
             let sources = self.wait_sources();
             wait_on_sources(&sources, deadline)?;
+            // 等待路径已经在恢复任务后确认信号状态，并保证有限空等待不会早于
+            // deadline 返回。此处若期限已到，直接完成超时，避免再次锁状态并
+            // 分配 ready Vec；恰好同时到达的事件与 timeout 本就属于允许竞态。
+            if timeout_expired(deadline) {
+                return Ok(Vec::new());
+            }
         }
     }
 }
@@ -491,6 +500,41 @@ fn timeout_expired(deadline: Option<u64>) -> bool {
     deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
 }
 
+pub(crate) fn wait_recheck_deadline(
+    now_ns: u64,
+    deadline: Option<u64>,
+    sources_empty: bool,
+    has_unregistered_source: bool,
+) -> Option<u64> {
+    const EPOLL_RECHECK_NS: u64 = 10_000_000;
+    const SHORT_EMPTY_WAIT_SPIN_TAIL_NS: u64 = 500_000;
+    const LONG_EMPTY_WAIT_SPIN_TAIL_NS: u64 = 2_000_000;
+    const LONG_EMPTY_WAIT_THRESHOLD_NS: u64 = 20_000_000;
+
+    // 有限空 epoll 不可能自行出现事件。提前一个很短的有界尾段唤醒，再由
+    // 调用路径自旋到真实 deadline，可吸收 QEMU 中断到任务恢复之间的抖动，
+    // 同时严格避免提前返回。
+    if sources_empty && let Some(deadline) = deadline {
+        let remaining = deadline.saturating_sub(now_ns);
+        let spin_tail = if remaining >= LONG_EMPTY_WAIT_THRESHOLD_NS {
+            LONG_EMPTY_WAIT_SPIN_TAIL_NS
+        } else {
+            SHORT_EMPTY_WAIT_SPIN_TAIL_NS
+        };
+        return Some(deadline.saturating_sub(spin_tail).max(now_ns));
+    }
+
+    // 所有实际事件源都有精确唤醒能力时，直接睡到最终截止时间。
+    if !has_unregistered_source && (deadline.is_some() || !sources_empty) {
+        return deadline;
+    }
+
+    // 不支持 waiter 的对象仍需周期轮询；无限等待的空 epoll 也保留低频
+    // 复查，以便其它线程后续通过 epoll_ctl 添加事件源。
+    let quantum = now_ns.saturating_add(EPOLL_RECHECK_NS);
+    Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
+}
+
 fn restore_current_task_after_wait(task: &Arc<sched::Task>) {
     if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
         let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
@@ -501,7 +545,6 @@ fn wait_on_sources(
     sources: &[(Arc<File>, PollEvents)],
     deadline: Option<u64>,
 ) -> Result<(), Errno> {
-    const EPOLL_RECHECK_NS: u64 = 10_000_000;
     let task = current_task();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
@@ -514,18 +557,22 @@ fn wait_on_sources(
     let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
 
     let mut registered_waiter = false;
+    let mut has_unregistered_source = false;
     for (file, interest) in sources {
-        registered_waiter |= file.poll_add_waiter(&task, *interest);
+        let registered = file.poll_add_waiter(&task, *interest);
+        registered_waiter |= registered;
+        has_unregistered_source |= !registered;
     }
 
     // epoll 的底层 waiter 可能来自 socket/pipe/嵌套 epoll 等不同对象。
     // 为避免丢失精确唤醒后永久睡眠，和 poll/select 一样使用短周期兜底
     // recheck；用户指定 timeout 仍以原始 deadline 为准。
-    let recheck_deadline = {
-        let now = sched::now_ns_public();
-        let quantum = now.saturating_add(EPOLL_RECHECK_NS);
-        Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
-    };
+    let recheck_deadline = wait_recheck_deadline(
+        sched::now_ns_public(),
+        deadline,
+        sources.is_empty(),
+        has_unregistered_source,
+    );
     let deadline_armed =
         recheck_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
 
@@ -571,6 +618,13 @@ fn wait_on_sources(
     restore_current_task_after_wait(&task);
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
+    }
+    if sources.is_empty()
+        && let Some(deadline) = deadline
+    {
+        while sched::now_ns_public() < deadline {
+            core::hint::spin_loop();
+        }
     }
     Ok(())
 }
@@ -659,7 +713,21 @@ pub fn wait(
     maxevents: usize,
     timeout_ms: i64,
 ) -> Result<Vec<EpollEvent>, Errno> {
+    wait_until(fdt, epfd, maxevents, timeout_deadline(timeout_ms))
+}
+
+/// 使用调用方已建立的绝对单调时钟截止时间等待 epoll 事件。
+///
+/// syscall 层应在完成用户可见的超时参数校验后尽早建立 deadline，再调用本
+/// 接口。这样 fdtable 查找、临时信号掩码安装等固定前处理也计入用户请求的等待
+/// 区间；同时 `epoll_pwait2` 不必把纳秒 timespec 向上取整到毫秒。
+pub fn wait_until(
+    fdt: &FdTable,
+    epfd: Fd,
+    maxevents: usize,
+    deadline: Option<u64>,
+) -> Result<Vec<EpollEvent>, Errno> {
     let epoll_file = fdt.get_file(epfd).ok_or(Errno::EBADF)?;
     let ops = epoll_ops_from_fd(&epoll_file)?;
-    ops.wait(maxevents, timeout_ms)
+    ops.wait_until(maxevents, deadline)
 }

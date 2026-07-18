@@ -73,7 +73,9 @@ pub mod task;
 pub mod wait;
 pub mod wait_flags;
 
-pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry, TaskCpuStateOps};
+pub use arch_hooks::{
+    ArchContextOps, ArchDeadlineTimerOps, CpuControlOps, KernelEntry, TaskCpuStateOps,
+};
 pub use clone_flags::{CloneArgs, CloneFlags};
 pub use cpu::{
     CpuId, CpuMask, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedDomain, SchedPlacement,
@@ -123,12 +125,13 @@ pub use spawn::{
     reap_matching, reparent_to_init, spawn_child,
 };
 pub use task::{
-    ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION,
-    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
-    TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
-    TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt, TaskExtCloneHook, TaskExtExitHook, TaskExtKey,
-    TaskKind, TaskPreExitHook, TaskState, TaskUsage, ext_clone_hook, ext_exit_hook, pre_exit_hook,
-    register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook, task_diag,
+    DEFAULT_TIMER_SLACK_NS, ExitCode, RobustListState, RseqRegistration, SigAltStack,
+    TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH,
+    TASKEXT_RISCV_VECTOR_SIGNAL_STACK, TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME,
+    TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt,
+    TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage,
+    ext_clone_hook, ext_exit_hook, pre_exit_hook, register_ext_clone_hook, register_ext_exit_hook,
+    register_pre_exit_hook, task_diag,
 };
 pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};

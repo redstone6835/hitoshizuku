@@ -170,6 +170,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                     options(nostack, preserves_flags)
                 );
             }
+            // TCFG 使用 one-shot 模式；先恢复常规 tick 作为兜底。调度器处理完
+            // 到期等待后会按新的最早 deadline 再次缩短本次计时。
+            super::super::loader::rearm_local_timer(None);
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
@@ -190,9 +193,24 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 tf.a0 = recovery.return_value;
                 return arg4;
             }
-            sched::on_timer_tick(now_ns);
-            if LoongArch64MessageInterruptOps::current_cpu_id() == 0 {
+            let deadline_fired = sched::on_timer_tick(now_ns);
+            let boot_cpu = LoongArch64MessageInterruptOps::current_cpu_id() == 0;
+            if boot_cpu {
                 super::super::vdso::run_timer_tick_hook(now_ns);
+            }
+            deliver_user_signals_before_return(arg4, from_user);
+
+            // deadline 到期时先让被唤醒任务运行，避免网络和 TTY 周期轮询叠加到
+            // 短超时延迟。普通内核临界区仍禁止抢占；idle 任务是唯一已知安全的
+            // 内核态切换边界。
+            let urgent_preempt = deadline_fired
+                && sched::is_ready()
+                && (from_user || sched::current_task_ref().is_idle_task());
+            if urgent_preempt {
+                sched::preempt_if_needed(now_ns);
+            }
+
+            if boot_cpu {
                 // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
                 // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
                 // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
@@ -202,10 +220,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
                 super::super::vdso::run_tty_poll_hook(now_ns);
             }
-            deliver_user_signals_before_return(arg4, from_user);
             // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
             // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
-            if from_user {
+            if from_user && !urgent_preempt {
                 sched::preempt_if_needed(now_ns);
             }
             return arg4;

@@ -22,6 +22,33 @@ fn root_cred() -> Arc<Credentials> {
     Arc::new(Credentials::root())
 }
 
+/// 有限空 epoll 应只保留有界自旋尾段，不能按固定 10ms 分段唤醒。
+#[ktest]
+fn epoll_empty_finite_wait_uses_bounded_spin_tail() {
+    assert_eq!(
+        epoll::wait_recheck_deadline(1_000, Some(25_000_000), true, false),
+        Some(23_000_000)
+    );
+}
+
+/// 缺少精确 waiter 的事件源必须保留 10ms 周期复查。
+#[ktest]
+fn epoll_unregistered_source_uses_bounded_recheck() {
+    assert_eq!(
+        epoll::wait_recheck_deadline(1_000, Some(25_000_000), false, true),
+        Some(10_001_000)
+    );
+}
+
+/// 无限等待的空 epoll 仍需低频复查，以观察后续 epoll_ctl 变更。
+#[ktest]
+fn epoll_empty_infinite_wait_keeps_recheck() {
+    assert_eq!(
+        epoll::wait_recheck_deadline(1_000, None, true, false),
+        Some(10_001_000)
+    );
+}
+
 /// 普通文件即使对 poll 表现为立即可读写，也不能加入 epoll。
 #[ktest]
 fn epoll_rejects_regular_file() {

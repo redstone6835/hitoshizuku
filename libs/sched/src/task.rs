@@ -130,6 +130,8 @@ pub fn task_diag() -> TaskDiag {
 
 /// Linux 线程名长度，包含结尾 NUL。
 pub const TASK_COMM_LEN: usize = 16;
+/// Linux 普通任务的默认定时器松弛量，单位纳秒。
+pub const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 const DEFAULT_COMM: [u8; TASK_COMM_LEN] =
     [b'm', b'y', b'g', b'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -473,6 +475,9 @@ pub struct Task {
     placement: TaskPlacement,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
+    /// 当前任务允许的定时器松弛量，以及 `PR_SET_TIMERSLACK(0)` 使用的默认值。
+    timer_slack_ns: AtomicU64,
+    default_timer_slack_ns: AtomicU64,
     /// 当前任务挂载的运行时执行状态裸指针。
     ///
     /// 指针的所有权始终由 `TASKEXT_ELM_EXECUTION` 对应的 `Arc` 持有；这里仅为
@@ -556,6 +561,8 @@ impl Task {
             current_cpu: AtomicUsize::new(0),
             placement: TaskPlacement::unbound(),
             ioprio: AtomicU32::new(0),
+            timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
+            default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             elm_execution_ptr: AtomicUsize::new(0),
             hot_ext: HotTaskExt::new(),
             ext: Spinlock::new(Vec::new()),
@@ -584,6 +591,31 @@ impl Task {
 
     pub fn is_idle_task(&self) -> bool {
         self.kind() == TaskKind::Idle
+    }
+
+    /// 返回当前任务通过 `PR_GET_TIMERSLACK` 可见的定时器松弛量。
+    pub fn timer_slack_ns(&self) -> u64 {
+        self.timer_slack_ns.load(Ordering::Acquire)
+    }
+
+    /// 实现 `PR_SET_TIMERSLACK`：非零值直接安装，零值恢复任务默认值。
+    pub fn set_timer_slack_ns(&self, value_ns: u64) {
+        let value_ns = if value_ns == 0 {
+            self.default_timer_slack_ns.load(Ordering::Acquire)
+        } else {
+            value_ns
+        };
+        self.timer_slack_ns.store(value_ns, Ordering::Release);
+    }
+
+    /// fork/clone 时继承父任务的当前值与默认值。
+    pub(crate) fn inherit_timer_slack_from(&self, parent: &Task) {
+        self.timer_slack_ns
+            .store(parent.timer_slack_ns(), Ordering::Release);
+        self.default_timer_slack_ns.store(
+            parent.default_timer_slack_ns.load(Ordering::Acquire),
+            Ordering::Release,
+        );
     }
 
     pub(crate) fn mark_kernel_thread(&self) {

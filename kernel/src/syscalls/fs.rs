@@ -1553,17 +1553,23 @@ pub(super) fn sys_epoll_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_epoll_pwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let timeout_base_ns = sched::now_ns_public();
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
     let maxevents = ctx.args[2] as i32;
     let timeout_ms = ctx.args[3] as i32 as i64;
-    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
     if maxevents <= 0 {
         return Err(Errno::EINVAL);
     }
+    let deadline = if timeout_ms < 0 {
+        None
+    } else {
+        Some(timeout_base_ns.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
+    };
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
     let _mask_guard = TemporarySigmask::install(sigmask);
-    let ready = vfs::epoll::wait(&fdt, epfd, maxevents as usize, timeout_ms)?;
+    let ready = vfs::epoll::wait_until(&fdt, epfd, maxevents as usize, deadline)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
 }
@@ -2532,17 +2538,19 @@ pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 }
 
 pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let timeout_base_ns = sched::now_ns_public();
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
     let maxevents = ctx.args[2] as i32;
-    let timeout_ms = read_timespec_ms_ceil(ctx.args[3])?;
-    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
     if maxevents <= 0 {
         return Err(Errno::EINVAL);
     }
+    let timeout_ns = read_timespec_timeout_ns(ctx.args[3])?;
+    let deadline = timeout_ns.map(|timeout_ns| timeout_base_ns.saturating_add(timeout_ns));
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
     let _mask_guard = TemporarySigmask::install(sigmask);
-    let ready = vfs::epoll::wait(&fdt, epfd, maxevents as usize, timeout_ms)?;
+    let ready = vfs::epoll::wait_until(&fdt, epfd, maxevents as usize, deadline)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
 }
@@ -4360,6 +4368,25 @@ fn read_timespec_ms_ceil(user: usize) -> Result<i64, Errno> {
         ms = ms.saturating_add(((nsec as u64).saturating_add(999_999) / 1_000_000) as i64);
     }
     Ok(ms)
+}
+
+/// 读取相对 timespec，并保留完整纳秒精度；空指针表示无限等待。
+fn read_timespec_timeout_ns(user: usize) -> Result<Option<u64>, Errno> {
+    if user == 0 {
+        return Ok(None);
+    }
+    let mut raw = [0u8; 16];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Some(
+        (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64),
+    ))
 }
 
 fn read_socket_timeout_deadline(user: usize) -> Result<Option<u64>, Errno> {

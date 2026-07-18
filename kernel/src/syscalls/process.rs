@@ -1894,6 +1894,8 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const PR_GET_NAME: usize = 16;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
+    const PR_SET_TIMERSLACK: usize = 29;
+    const PR_GET_TIMERSLACK: usize = 30;
     match ctx.args[0] {
         PR_SET_NAME => {
             let name_user = ctx.args[1];
@@ -1934,6 +1936,11 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             install_credentials(ctx.task(), new);
             Ok(0)
         }
+        PR_SET_TIMERSLACK => {
+            ctx.task().set_timer_slack_ns(ctx.args[1] as u64);
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(ctx.task().timer_slack_ns().min(usize::MAX as u64) as usize),
         _ => Ok(0),
     }
 }
