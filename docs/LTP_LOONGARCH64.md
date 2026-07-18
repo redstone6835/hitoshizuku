@@ -176,3 +176,17 @@ python3 scripts/ltp_la.py report
 覆盖普通文件拒绝、第六层嵌套拒绝、闭环 `ELOOP` 优先级和 level-triggered 就绪轮转。
 固定容器内 `make kernel-la` 构建通过。
 对应提交为 `b0f46575`、`44cb8f02` 和 `4c3ce0a3`。
+
+### pipe 容量与可写语义
+
+`epoll_wait06` 的原始基线首先因 `F_SETPIPE_SZ` 返回 `EINVAL` 而 `TBROK`。实现动态
+容量后，该用例继续暴露 pipe 把任意空闲字节误报为 `POLLOUT` 的第二层缺陷。
+
+| 用例 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| `fcntl30`、`fcntl35`、`fcntl37`、`pipe2_04` | pipe 使用固定 64 KiB 数组，系统调用层没有 `F_SETPIPE_SZ/F_GETPIPE_SZ`，也没有非特权容量上限和对应 procfs 接口 | 实现可调整环形缓冲区、页大小二次幂取整、占用量 `EBUSY`、非特权 `EPERM`、`Capability::SysResource`，并提供可读写的 `/proc/sys/fs/pipe-max-size` | 四个用例各连续运行三次，全部 `pass` |
+| `epoll_wait06` | pipe 只要存在一个空闲字节就报告 `POLLOUT`，且不超过 `PIPE_BUF` 的写入在剩余空间不足时会发生部分写 | 仅在空闲空间达到 4096 字节时报告 `POLLOUT`；不超过 `PIPE_BUF` 的写入保持原子性 | 连续运行三次，全部 `pass` |
+
+宿主 VFS 测试扩展到 75 项，覆盖容量跨端点共享、零值收缩、容量取整、回绕数据保留、
+占用量与权限错误、真实写容量、`PIPE_BUF` 原子写和 `POLLOUT` 阈值，全部通过。
+对应提交为 `a210111c` 和 `aa8953b4`。
