@@ -33,6 +33,9 @@ pub struct HartLocal {
     pub irq_stack_top: usize,
     /// trap 入口在读取 SPP 前暂存原始 t5；仅由当前 hart、关中断窗口访问。
     pub trap_entry_t5: usize,
+    /// 每次内核任务上下文切换递增。syscall fast return 用它判断 live FPU
+    /// 寄存器是否仍属于入口时的任务；仅由当前 hart 在关中断调度路径写入。
+    pub context_switch_seq: usize,
 }
 /// 最终 return-to-user 窗口使用的紧急栈可用大小。
 ///
@@ -48,6 +51,7 @@ pub const HART_LOCAL_KERNEL_STACK_TOP_OFF: usize = offset_of!(HartLocal, kernel_
 pub const HART_LOCAL_KERNEL_GP_OFF: usize = offset_of!(HartLocal, kernel_gp);
 pub const HART_LOCAL_IRQ_STACK_TOP_OFF: usize = offset_of!(HartLocal, irq_stack_top);
 pub const HART_LOCAL_TRAP_ENTRY_T5_OFF: usize = offset_of!(HartLocal, trap_entry_t5);
+pub const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF: usize = offset_of!(HartLocal, context_switch_seq);
 
 /// 全部 hart 的紧急栈（静态分配，按 hart index 索引）。低地址端第一页仅作缓冲。
 #[repr(C, align(4096))]
@@ -72,6 +76,7 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
         kernel_gp: 0,
         irq_stack_top: 0,
         trap_entry_t5: 0,
+        context_switch_seq: 0,
     };
     [EMPTY; MAX_HARTS]
 };

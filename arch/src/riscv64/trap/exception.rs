@@ -91,7 +91,11 @@ fn sanitize_user_return_frame(tf_ptr: usize, trusted_satp: Option<usize>) {
     let trusted_kstack_top = crate::riscv64::specific::current_kernel_stack_top();
     let tf = unsafe { trap_frame_mut(tf_ptr) };
     tf.status = (tf.status & SSTATUS_USER_RESTORE_MASK) | SSTATUS_USER_RETURN_BASE;
-    tf.fcsr &= 0xff;
+    // FS=Off 时 FPU 区不会被恢复；保持它的任务初始化副本不动，避免普通 syscall
+    // 为无浮点任务写入扩展上下文所在的额外 cache line。
+    if tf.status & SSTATUS_FS_MASK != 0 {
+        tf.fcsr &= 0xff;
+    }
     tf.kstack_top = if trusted_kstack_top != 0 {
         trusted_kstack_top
     } else {
@@ -116,7 +120,8 @@ fn finish_trap_return(tf_ptr: usize, from_user: bool) -> usize {
     tf_ptr
 }
 
-/// FS=Off 时汇编入口调用：清除未保存的 FPU 区域，避免将旧内核栈内容视为用户状态。
+/// kernel-origin trap 的临时 frame 在 FS=Off 时调用：清除未初始化的 FPU 区域。
+/// user-origin frame 在任务创建或可信 sigreturn 时已经初始化，不在热路径重复清零。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_zero_inactive_fpu_frame(tf_ptr: usize) {
     let tf = unsafe { trap_frame_mut(tf_ptr) };
@@ -416,8 +421,9 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 ///
 /// 由汇编快速路径在确认 scause=8 后直接调用。
 /// FS=Off 可完全跳过 FPU；FS=Clean 已有可信的 TrapFrame 副本，也可跳过入口保存，
-/// 并由最小返回桩在 sret 前重新加载。FS=Initial/Dirty 或任意 VS active 状态仍走
-/// 完整恢复，避免 signal/resched/frame rewrite 读取不完整的扩展上下文。
+/// 返回桩通过 per-hart context-switch sequence 判断 live FPR 是否仍属于当前任务；
+/// 发生过调度时才重载。FS=Initial/Dirty 或任意 VS active 状态仍走完整恢复，避免
+/// signal/resched/frame rewrite 读取不完整状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
     let (nr, args, original_satp, original_sepc, original_sp) = {
@@ -447,7 +453,6 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         require_full_restore = true;
     }
 
-    sanitize_user_return_frame(tf_ptr, (nr == SYS_RT_SIGRETURN).then_some(original_satp));
     let frame = unsafe { trap_frame_ref(tf_ptr) };
     // signal delivery、exec/sigreturn 或其它上下文重写都会改变 PC/SP。最小返回不会
     // 恢复 s0-s10，因此只有仍保持普通 syscall 收尾形态时才可使用。
@@ -458,6 +463,10 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
     let unsupported_extension_state =
         frame.status & SSTATUS_VS_MASK != 0 || !matches!(fs, 0 | SSTATUS_FS_CLEAN);
     if require_full_restore || unsupported_extension_state {
+        // signal/exec/sigreturn、调度或扩展状态恢复会进入完整 resume；此时必须
+        // 重建可信 kstack/satp 并净化用户可修改的 frame。普通 fast return 的
+        // status 已由汇编掩码，且入口写入的 kstack/satp 未被改动，无需重复写。
+        sanitize_user_return_frame(tf_ptr, (nr == SYS_RT_SIGRETURN).then_some(original_satp));
         return tf_ptr | 1;
     }
     tf_ptr
@@ -468,20 +477,12 @@ fn enable_user_fpu_if_needed(tf: &mut TrapFrame) -> bool {
         return false;
     }
 
-    let new_fs = SSTATUS_FS_DIRTY;
     tf.f.fill(0);
     tf.fcsr = 0;
     tf._pad = 0;
-    unsafe {
-        core::arch::asm!(
-            "csrr t0, sstatus",
-            "or t0, t0, {fs}",
-            "csrw sstatus, t0",
-            fs = in(reg) new_fs,
-            out("t0") _,
-        );
-    }
-    tf.status = (tf.status & !SSTATUS_FS_MASK) | new_fs;
+    // trap entry 已把当前 S-mode 的硬件 FS 临时置为 Dirty，Rust handler 可安全
+    // 执行；这里只发布将要恢复给用户的任务状态，避免首次 FPU fault 重复写 CSR。
+    tf.status = (tf.status & !SSTATUS_FS_MASK) | SSTATUS_FS_DIRTY;
     true
 }
 

@@ -96,10 +96,11 @@ impl TaskOps for Riscv64TaskOps {
         tf.sepc = entry_pc;
         tf.sp = user_sp;
         tf.a0 = arg0;
-        // 使用 Initial 而不是 Off：不依赖 OpenSBI 是否直接委托 illegal instruction。
-        // 首次 resume 的 fld 会把硬件 FS 标成 Dirty，第一次 trap 因而会把零初始化
-        // 状态落到任务自己的固定 TrapFrame；之后按 Dirty/Clean 状态机增量保存。
-        tf.status = SSTATUS_SPIE | SSTATUS_UXL_64 | SSTATUS_FS_INITIAL;
+        // 新任务以 FS=Off 启动。绝大多数 syscall 密集程序并不执行浮点指令，避免
+        // 首次返回用户态无条件加载 32 个零寄存器，并让它们从此进入 FPU-active
+        // 保存/恢复路径。首次真实 F/D 指令由 illegal-instruction handler 清零并
+        // 按需启用；QEMU/OpenSBI 的 S-mode domain 会委托 illegal instruction。
+        tf.status = SSTATUS_SPIE | SSTATUS_UXL_64;
         // 初始化时使用当前内核页表。exec 系统调用时会被替换为目标进程的用户页表。
         let satp_val: usize = read_csr!(satp);
         tf.satp = satp_val;
@@ -122,13 +123,11 @@ impl TaskOps for Riscv64TaskOps {
         if tf.cause != EXC_ECALL_U && tf.cause != EXC_ECALL_S {
             return None;
         }
-        let pc = tf.sepc.checked_sub(4)?;
 
-        // RISC-V C 扩展允许 32 位指令只按 2 字节对齐；确认回退位置确实是 ecall，
-        // 避免把 ucontext PC 暴露到上一条 32 位指令的后半。
-        let mut insn = [0u8; 4];
-        crate::riscv64::mm::user_copy::copy_instruction_from_user(pc, &mut insn).ok()?;
-        (u32::from_le_bytes(insn) == 0x0000_0073).then_some(pc)
+        // cause 由本次硬件 trap/快速入口覆盖，明确表示当前指令就是固定 4-byte
+        // ecall；不必在 signal 热路径再次打开 MXR+SUM 并读取用户页。即使其它线程
+        // 在 syscall 期间改写该页面，取消语义仍应指向实际触发本次 trap 的 PC。
+        tf.sepc.checked_sub(4)
     }
 
     fn init_user_entry() -> unsafe extern "C" fn() -> ! {
@@ -199,6 +198,9 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         // 把回卷前的 ASID 写回硬件。
         "ld t2, {satp_off}(s11)",
         "csrr t3, {satp}",
+        // 绝大多数 trap 返回仍在同一 ASID：先走精确相等分支，避免常见路径的
+        // xor/mask 和 frame 回写。只有 ASID generation 变化时才比较 MODE+PPN。
+        "beq t2, t3, 9f",
         "xor t4, t2, t3",
         "li t5, {satp_address_space_mask}",
         "and t4, t4, t5",
@@ -376,8 +378,8 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
 
 /// syscall 最小返回路径使用的 FPU 恢复桩。
 ///
-/// 入口 a0 指向 FS=Clean 的用户 TrapFrame。内核 Rust 调用期间可能使用过浮点
-/// caller/callee-saved 寄存器，因此返回 U-mode 前完整恢复并把硬件 FS 改回 Clean。
+/// 入口 a0 指向 FS=Clean 的用户 TrapFrame。fast return 检测到 syscall 内发生过
+/// context switch，或硬件 FS 不再为 Clean 时，才调用这里恢复当前任务的可信副本。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __riscv64_restore_clean_fpu_for_fast_return(_tf_ptr: usize) {

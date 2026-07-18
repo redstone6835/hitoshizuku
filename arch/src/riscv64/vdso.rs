@@ -17,11 +17,29 @@ use core::slice;
 
 // ── 常量 ──────────────────────────────────────────────────────────────────────
 
-const TEXT_OFF: usize = 0x200;
+// ELF 元数据必须完整落在代码前。原先 0x200 的代码起点会覆盖 PT_DYNAMIC
+// 后半段，同时 .dynstr 也会覆盖最后一个 Elf64_Sym，导致 libc 无法解析 vDSO。
+const TEXT_OFF: usize = 0x300;
 const DYNSYM_OFF: usize = 0x0B0;
-const DYNSTR_OFF: usize = 0x130;
-const HASH_OFF: usize = 0x1B0;
-const DYNAMIC_OFF: usize = 0x1D0;
+const DYNSTR_OFF: usize = 0x140;
+const HASH_OFF: usize = 0x1C0;
+const VERSYM_OFF: usize = 0x1EC;
+const VERDEF_OFF: usize = 0x1F8;
+const DYNAMIC_OFF: usize = 0x230;
+
+const VDSO_SONAME: &[u8] = b"linux-vdso.so.1";
+const VDSO_VERSION: &[u8] = b"LINUX_4.15";
+const DYNAMIC_ENTRY_COUNT: usize = 10;
+const VERDEF_SIZE: usize = 28;
+
+const _: () = {
+    assert!(DYNSYM_OFF + 6 * 24 <= DYNSTR_OFF);
+    assert!(HASH_OFF + 44 <= VERSYM_OFF);
+    assert!(VERSYM_OFF + 6 * 2 <= VERDEF_OFF);
+    assert!(VERDEF_OFF + 2 * VERDEF_SIZE <= DYNAMIC_OFF);
+    assert!(DYNAMIC_OFF + DYNAMIC_ENTRY_COUNT * 16 <= TEXT_OFF);
+    assert!(TEXT_OFF < VDSO_DATA_PAGE_OFFSET);
+};
 
 /// vDSO 数据页偏移（第 2 页）。
 pub const VDSO_DATA_PAGE_OFFSET: usize = 0x1000;
@@ -49,6 +67,12 @@ global_asm!(
     vdso_data_seq_offset = const VDSO_DATA_SEQ_OFFSET,
     vdso_data_clock_mode_offset = const VDSO_DATA_CLOCK_MODE_OFFSET,
     vdso_data_hz_offset = const VDSO_DATA_HZ_OFFSET,
+    vdso_data_wall_time_sec_offset = const VDSO_DATA_WALL_TIME_SEC_OFFSET,
+    vdso_data_wall_time_nsec_offset = const VDSO_DATA_WALL_TIME_NSEC_OFFSET,
+    vdso_data_monotonic_base_ns_offset = const VDSO_DATA_MONOTONIC_BASE_NS_OFFSET,
+    vdso_data_cs_cycle_last_offset = const VDSO_DATA_CS_CYCLE_LAST_OFFSET,
+    vdso_data_cs_mult_offset = const VDSO_DATA_CS_MULT_OFFSET,
+    vdso_data_cs_shift_offset = const VDSO_DATA_CS_SHIFT_OFFSET,
     vdso_data_cpu_id_offset = const VDSO_DATA_CPU_ID_OFFSET,
     vdso_data_node_id_offset = const VDSO_DATA_NODE_ID_OFFSET,
     vdso_data_clock_realtime_res_offset = const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET,
@@ -125,12 +149,15 @@ pub fn run_tty_poll_hook(now_ns: u64) {
 // ── vDSO ELF 镜像生成 ────────────────────────────────────────────────────────
 
 pub fn vdso_image() -> Vec<u8> {
+    assert_eq!(DYNSTR_NAMES.len() + 1, 6);
+    assert!(DYNSTR_OFF + dynstr_total_len() <= HASH_OFF);
     let mut img = alloc::vec![0u8; VDSO_TOTAL_SIZE];
     build_elf_header(&mut img);
     build_phdr(&mut img);
     build_dynsym(&mut img);
     build_dynstr(&mut img);
     build_hash(&mut img);
+    build_versions(&mut img);
     build_dynamic(&mut img);
     build_text(&mut img);
     img
@@ -170,7 +197,7 @@ fn build_phdr(b: &mut [u8]) {
     w64(b, p + 8, DYNAMIC_OFF as u64);
     w64(b, p + 16, DYNAMIC_OFF as u64);
     w64(b, p + 24, DYNAMIC_OFF as u64);
-    let dyn_sz: u64 = 6 * 16;
+    let dyn_sz: u64 = (DYNAMIC_ENTRY_COUNT * 16) as u64;
     w64(b, p + 32, dyn_sz);
     w64(b, p + 40, dyn_sz);
     w64(b, p + 48, 8);
@@ -199,7 +226,18 @@ fn dynstr_total_len() -> usize {
     for name in &DYNSTR_NAMES {
         len += name.len() + 1;
     }
-    len
+    len + VDSO_SONAME.len() + 1 + VDSO_VERSION.len() + 1
+}
+
+fn dynstr_soname_offset() -> usize {
+    1 + DYNSTR_NAMES
+        .iter()
+        .map(|name| name.len() + 1)
+        .sum::<usize>()
+}
+
+fn dynstr_version_offset() -> usize {
+    dynstr_soname_offset() + VDSO_SONAME.len() + 1
 }
 
 fn build_dynsym(b: &mut [u8]) {
@@ -224,6 +262,11 @@ fn build_dynstr(b: &mut [u8]) {
         b[pos + name.len()] = 0;
         pos += name.len() + 1;
     }
+    b[pos..pos + VDSO_SONAME.len()].copy_from_slice(VDSO_SONAME);
+    b[pos + VDSO_SONAME.len()] = 0;
+    pos += VDSO_SONAME.len() + 1;
+    b[pos..pos + VDSO_VERSION.len()].copy_from_slice(VDSO_VERSION);
+    b[pos + VDSO_VERSION.len()] = 0;
 }
 
 fn build_hash(b: &mut [u8]) {
@@ -254,29 +297,79 @@ fn build_hash(b: &mut [u8]) {
     }
 }
 
+fn build_versions(b: &mut [u8]) {
+    // Elf64_Half .gnu.version[6]：空符号为 local，其余导出均属于
+    // RISC-V Linux ABI 使用的 LINUX_4.15 版本（索引 2）。
+    w16(b, VERSYM_OFF, 0);
+    for sym_idx in 1..=5 {
+        w16(b, VERSYM_OFF + sym_idx * 2, 2);
+    }
+
+    // Elf64_Verdef + Elf64_Verdaux。索引 1 是 soname 的 BASE 定义；索引 2
+    // 是 glibc/musl 查找 __vdso_* 时使用的 LINUX_4.15 定义。
+    build_verdef(
+        b,
+        VERDEF_OFF,
+        1,
+        1, // VER_FLG_BASE
+        VDSO_SONAME,
+        dynstr_soname_offset(),
+        VERDEF_SIZE,
+    );
+    build_verdef(
+        b,
+        VERDEF_OFF + VERDEF_SIZE,
+        2,
+        0,
+        VDSO_VERSION,
+        dynstr_version_offset(),
+        0,
+    );
+}
+
+fn build_verdef(
+    b: &mut [u8],
+    off: usize,
+    index: u16,
+    flags: u16,
+    name: &[u8],
+    name_offset: usize,
+    next: usize,
+) {
+    w16(b, off, 1); // VER_DEF_CURRENT
+    w16(b, off + 2, flags);
+    w16(b, off + 4, index);
+    w16(b, off + 6, 1); // vd_cnt
+    w32(b, off + 8, elf_hash(name));
+    w32(b, off + 12, 20); // vd_aux
+    w32(b, off + 16, next as u32);
+    w32(b, off + 20, name_offset as u32);
+    w32(b, off + 24, 0); // vda_next
+}
+
 fn build_dynamic(b: &mut [u8]) {
     let mut off = DYNAMIC_OFF;
-    w64(b, off, 6);
-    w64(b, off + 8, DYNSYM_OFF as u64);
-    off += 16;
-    w64(b, off, 5);
-    w64(b, off + 8, DYNSTR_OFF as u64);
-    off += 16;
-    w64(b, off, 10);
-    w64(b, off + 8, dynstr_total_len() as u64);
-    off += 16;
-    w64(b, off, 4);
-    w64(b, off + 8, HASH_OFF as u64);
-    off += 16;
-    w64(b, off, 11);
-    w64(b, off + 8, 24);
-    off += 16;
-    w64(b, off, 0);
-    w64(b, off + 8, 0);
+    for (tag, value) in [
+        (6, DYNSYM_OFF as u64),              // DT_SYMTAB
+        (5, DYNSTR_OFF as u64),              // DT_STRTAB
+        (10, dynstr_total_len() as u64),     // DT_STRSZ
+        (4, HASH_OFF as u64),                // DT_HASH
+        (11, 24),                            // DT_SYMENT
+        (0x6fff_fff0, VERSYM_OFF as u64),    // DT_VERSYM
+        (0x6fff_fffc, VERDEF_OFF as u64),    // DT_VERDEF
+        (0x6fff_fffd, 2),                    // DT_VERDEFNUM
+        (14, dynstr_soname_offset() as u64), // DT_SONAME
+        (0, 0),                              // DT_NULL
+    ] {
+        w64(b, off, tag);
+        w64(b, off + 8, value);
+        off += 16;
+    }
 }
 
 fn build_text(b: &mut [u8]) {
     let blob = blob_bytes();
+    assert_eq!(TEXT_OFF + blob.len(), VDSO_DATA_PAGE_OFFSET);
     b[TEXT_OFF..TEXT_OFF + blob.len()].copy_from_slice(blob);
 }
 

@@ -16,6 +16,7 @@
 pub const CSR_SSTATUS: usize = 0x100; // 监管者状态
 pub const CSR_SIE: usize = 0x104; // 中断使能（各源独立）
 pub const CSR_STVEC: usize = 0x105; // 异常入口基地址
+pub const CSR_SCOUNTEREN: usize = 0x106; // 允许 U-mode 读取硬件计数器
 pub const CSR_SSCRATCH: usize = 0x140; // 暂存（trap entry 栈交换）
 pub const CSR_SEPC: usize = 0x141; // 异常返回地址
 pub const CSR_SCAUSE: usize = 0x142; // 异常/中断原因
@@ -42,6 +43,12 @@ pub const SSTATUS_MXR: usize = 1 << 19; // [19]    execute-only 页可读
 pub const SSTATUS_UXL_MASK: usize = 0b11 << 32; // [33:32] U-mode XLEN
 pub const SSTATUS_UXL_64: usize = 0b10 << 32; // [33:32] U-mode 使用 64-bit XLEN
 pub const SSTATUS_SD: usize = 1 << 63; // [63]    FS|VS 脏位汇总
+
+// ── scounteren 位域 ──────────────────────────────────────────────────────────
+
+/// 允许 U-mode 执行 `rdtime`。S-mode 本身已经依赖 `rdtime`，因此 OpenSBI 的
+/// `mcounteren.TIME` 必然可用；这里补齐从 S-mode 到 U-mode 的最后一级授权。
+pub const SCOUNTEREN_TIME: usize = 1 << 1;
 
 /// 从用户上下文中允许恢复的 `sstatus` 位。
 ///

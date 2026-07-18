@@ -16,7 +16,12 @@ use core::arch::naked_asm;
 
 use crate::*;
 
-/// 为当前 hart 安装统一 trap 入口，并清空 `sscratch` 的临时锚点。
+/// 为当前 hart 安装统一 trap 入口、开放 vDSO 所需的用户态 `rdtime`，并清空
+/// `sscratch` 的临时锚点。
+///
+/// 这是 per-hart 初始化：boot hart 和每个 secondary hart 在进入调度器前都必须
+/// 调用。把 `scounteren.TIME` 放在这里可避免只初始化 boot hart；任何能够处理
+/// trap 并返回 U-mode 的 hart 都会同时具备 vDSO 时间快路径所需的 CSR 权限。
 ///
 /// # Safety
 ///
@@ -26,6 +31,9 @@ use crate::*;
 /// - 返回用户态前，调用方必须按 trap-anchor 约定重新发布当前 hart 的 `sscratch`。
 pub unsafe fn install_exception_entry() {
     let entry = __riscv_exception_entry as *const () as usize;
+    // vDSO 的 clock_gettime/gettimeofday 会在 U-mode 直接执行 rdtime。
+    // scounteren 是 per-hart CSR，必须由每个即将运行用户任务的 hart 设置。
+    crate::set_csr!(scounteren, SCOUNTEREN_TIME);
     unsafe {
         core::arch::asm!(
             "csrw {stvec}, {entry}",
@@ -169,23 +177,13 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd t0, {sepc_off}(sp)",
         "li t0, 8",
         "sd t0, {cause_off}(sp)",
-        "sd zero, {tval_off}(sp)",
+        // syscall 的 stval 无语义，借该字段保存入口时的 context-switch sequence。
+        // signal/exec 等完整恢复路径不依赖它；下一次硬件 trap 会重新覆盖。
+        "ld t0, {switch_seq_off}(tp)",
+        "sd t0, {tval_off}(sp)",
 
-        // FS=Off 需要清零未保存区域；FS=Clean 已有可信副本，直接保留。两种情况
-        // 都临时把硬件 FS 置 Dirty，允许普通 Rust 内核代码使用 FPU。
-        "ld t0, {status_off}(sp)",
-        "li t1, {fs_mask}",
-        "and t1, t0, t1",
-        "bnez t1, 30f",
-        "li t0, {fs_dirty}",
-        "csrs {sstatus}, t0",
-        "mv a0, sp",
-        "call {zero_fpu}",
-        "j 31f",
-        "30:",
-        "li t0, {fs_dirty}",
-        "csrs {sstatus}, t0",
-        "31:",
+        // 普通内核 syscall 不生成 FPU 指令，保持入口的 FS=Off/Clean 和 live FPR。
+        // 若内部发生调度，switch sequence 会变化，返回桩再从 frame 恢复。
 
         // 调用 syscall 快速路径 handler（不保存/恢复 FPU）
         "mv a0, sp",
@@ -200,6 +198,13 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         // 快速 syscall resume：Rust ABI 已保持 s0-s10；frame-rewrite syscall 会被
         // handler 强制送往完整恢复，因此这里无需重复加载未变化的 callee-saved GPR。
         "mv s11, a0",
+        "ld t2, {switch_seq_off}(tp)",
+        "ld t1, {tval_off}(s11)",
+        "xor t2, t2, t1",
+        // 同时捕获硬件 FS；若未来普通内核代码意外使用 FPU，Dirty 也会强制恢复。
+        "csrr t3, {sstatus}",
+        "li t1, {fs_mask}",
+        "and t3, t3, t1",
         "ld t0, {sepc_off}(s11)",
         "csrw {sepc}, t0",
         "ld t0, {status_off}(s11)",
@@ -209,11 +214,16 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "or t0, t0, t1",
         "csrw {sstatus}, t0",
 
-        // FS=Clean 的快速返回在 Rust 调用后必须重载用户 FPU；FS=Off 直接跳过。
+        // FS=Off 没有用户状态。FS=Clean 仅在没有 context switch 且硬件仍为
+        // Clean 时复用 live FPR；任一条件不满足都从可信 frame 恢复。
         "ld t0, {status_off}(s11)",
         "li t1, {fs_mask}",
         "and t0, t0, t1",
         "beqz t0, 32f",
+        "bnez t2, 31f",
+        "li t1, {fs_clean}",
+        "beq t3, t1, 32f",
+        "31:",
         "mv a0, s11",
         "call {restore_fast_fpu}",
         "32:",
@@ -331,11 +341,15 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd t0, {status_off}(sp)",
         "j 13f",
 
-        // FS=Off：没有用户/被中断上下文的 FPU 状态；清零 frame 扩展区，并临时
-        // 为普通 Rust handler 打开当前 S-mode 的 FS。
+        // FS=Off：先为普通 Rust handler 打开当前 S-mode 的 FS。固定 user frame
+        // 在任务创建时已经清零；只有 kernel-origin 的临时栈 frame 仍需初始化，
+        // 避免后续内核诊断把旧栈内容误认为扩展状态。
         "12:",
         "li t1, {fs_dirty}",
         "csrs {sstatus}, t1",
+        "ld t0, {status_off}(sp)",
+        "andi t0, t0, {spp}",
+        "beqz t0, 19f",
         "mv a0, sp",
         "call {zero_fpu}",
         "j 19f",
@@ -413,6 +427,7 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         entry_t5_off = const HART_LOCAL_TRAP_ENTRY_T5_OFF,
         irq_stack_top_off = const HART_LOCAL_IRQ_STACK_TOP_OFF,
         irq_stack_size = const IRQ_STACK_SIZE,
+        switch_seq_off = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,
 
         sscratch = const CSR_SSCRATCH,
         sepc = const CSR_SEPC,

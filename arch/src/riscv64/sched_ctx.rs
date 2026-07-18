@@ -13,7 +13,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use general::TaskOps;
 use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
 
-use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns};
+use crate::riscv64::specific::{
+    HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id, kernel_timestamp_ns,
+};
 use crate::riscv64::task::Riscv64TaskOps;
 use crate::riscv64::trap::Riscv64InterruptOps;
 
@@ -60,6 +62,12 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
 #[unsafe(naked)]
 unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
     core::arch::naked_asm!(
+        // fast syscall 可在内部阻塞并切走，随后从同一内核调用点继续。递增 per-hart
+        // 序号，使返回汇编能够判断硬件 FPR 是否可能已被其它任务替换。
+        "ld t0, {switch_seq}(tp)",
+        "addi t0, t0, 1",
+        "sd t0, {switch_seq}(tp)",
+
         "sd ra,  {ra}(a0)",
         "sd sp,  {sp}(a0)",
         "sd s0,  {s0}(a0)",
@@ -98,6 +106,7 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         s6 = const S6_OFFSET, s7 = const S7_OFFSET,
         s8 = const S8_OFFSET, s9 = const S9_OFFSET,
         s10 = const S10_OFFSET, s11 = const S11_OFFSET,
+        switch_seq = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,
     );
 }
 
