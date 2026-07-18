@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}
 use crate::set_csr;
 
 use super::csr::SIE_STIE;
+use super::sbi;
 
 /// 稳定计时器频率（Hz），由 DTB timebase-frequency 填充。
 pub static STABLE_TIMER_HZ: AtomicUsize = AtomicUsize::new(10_000_000);
@@ -107,48 +108,6 @@ pub fn kernel_timestamp_ns() -> u64 {
 }
 
 #[inline]
-fn sbi_set_timer(stime_value: u64) -> isize {
-    const SBI_EXT_TIME: usize = 0x5449_4d45;
-    const SBI_TIME_SET_TIMER: usize = 0;
-
-    let error: usize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") stime_value as usize => error,
-            in("a6") SBI_TIME_SET_TIMER,
-            in("a7") SBI_EXT_TIME,
-            lateout("a1") _,
-            lateout("a2") _,
-            lateout("a3") _,
-            lateout("a4") _,
-            lateout("a5") _,
-            options(nostack)
-        );
-    }
-    error as isize
-}
-
-/// SBI v0.1 legacy `set_timer` fallback（EID=0）。RV64 直接在 a0 传 64-bit deadline。
-#[inline]
-fn sbi_set_timer_legacy(stime_value: u64) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") stime_value as usize => _,
-            lateout("a1") _,
-            lateout("a2") _,
-            lateout("a3") _,
-            lateout("a4") _,
-            lateout("a5") _,
-            lateout("a6") _,
-            in("a7") 0usize,
-            options(nostack)
-        );
-    }
-}
-
-#[inline]
 fn arm_timer_at(deadline_ticks: u64) {
     if has_sstc() {
         unsafe {
@@ -163,8 +122,8 @@ fn arm_timer_at(deadline_ticks: u64) {
     }
 
     if SbiTimerBackend::load() != SbiTimerBackend::Legacy {
-        let error = sbi_set_timer(deadline_ticks);
-        if error == 0 {
+        let ret = sbi::set_timer(deadline_ticks);
+        if ret.is_ok() {
             SbiTimerBackend::Time.store();
             return;
         }
@@ -173,12 +132,12 @@ fn arm_timer_at(deadline_ticks: u64) {
         if !SBI_TIMER_FALLBACK_REPORTED.swap(true, Ordering::AcqRel) {
             log::warning!(
                 "[timer] SBI TIME set_timer failed (error={}); falling back to legacy EID 0",
-                error
+                ret.error
             );
         }
     }
 
-    sbi_set_timer_legacy(deadline_ticks);
+    sbi::legacy_set_timer(deadline_ticks);
 }
 
 /// 根据稳定计时器频率配置周期 tick。

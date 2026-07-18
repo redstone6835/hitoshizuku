@@ -171,6 +171,8 @@ impl TaskOps for Riscv64TaskOps {
 pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
     naked_asm!(
         "mv s11, a0",
+        "li t0, 1",
+        "sd t0, {hart_entry_state_off}(tp)",
 
         // 写 sepc
         "ld t0, {sepc_off}(s11)",
@@ -314,6 +316,7 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "5:",
         "csrw {sscratch}, x0",
         "6:",
+        "sd zero, {hart_entry_state_off}(tp)",
         "ld tp, {tp_off}(s11)",
         "ld gp, {gp_off}(s11)",
         "ld sp, {sp_off}(s11)",
@@ -371,6 +374,7 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         user_status_keep = const SSTATUS_USER_RESTORE_MASK,
         user_status_base = const SSTATUS_USER_RETURN_BASE,
         hart_kstack_off = const crate::riscv64::specific::HART_LOCAL_KERNEL_STACK_TOP_OFF,
+        hart_entry_state_off = const crate::riscv64::specific::HART_LOCAL_TRAP_ENTRY_STATE_OFF,
         satp_off = const crate::riscv64::specific::SATP_OFFSET,
         satp_address_space_mask = const SATP_ADDRESS_SPACE_MASK,
     );

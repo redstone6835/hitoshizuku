@@ -30,13 +30,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
+use crate::riscv64::sbi;
 use crate::riscv64::specific::{kernel_timestamp_ns, phys_to_virt, virt_to_phys};
 use crate::riscv64::time;
 use crate::riscv64::trap;
 use general::dtb::Dtb;
 use general::{
     StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartBootProtocol,
-    StartContext, StartFirmware, StartMemory, StartMemoryMap,
+    StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
+    StartMemoryRegionKind, StartPhysRange,
 };
 
 // ── DTB 访问 ──────────────────────────────────────────────────────────────────
@@ -54,6 +56,17 @@ static DTB_BUFFER: DtbBuffer = DtbBuffer(UnsafeCell::new([0u8; DTB_BUF_SIZE]));
 
 /// 启动 hart ID，由 loader 设置后供 allocator 的 cpu_id 回调使用。
 static HART_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// DTB 中的 RAM 最终会与此启动映射求交集。这样在动态 direct map 落地前，
+/// 物理分配器不会拿到当前页表无法访问的 4 GiB 以上页面。
+static RISCV_BOOT_MEMORY_MAP: [StartMemoryRegion; 1] = [StartMemoryRegion::new(
+    StartPhysRange::new(
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_START,
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_END,
+    ),
+    StartMemoryRegionKind::UsableRam,
+    0,
+)];
 
 /// 返回内核 DTB 视图（始终从内核缓冲区读取）。
 fn kernel_dtb() -> Option<Dtb<'static>> {
@@ -218,6 +231,127 @@ fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
 }
 
+fn read_cells(value: &[u8], cells: usize) -> Option<usize> {
+    if cells == 0 || cells > 2 || value.len() < cells * 4 {
+        return None;
+    }
+    let mut result = 0u64;
+    for chunk in value[..cells * 4].chunks_exact(4) {
+        result = (result << 32) | u32::from_be_bytes(chunk.try_into().ok()?) as u64;
+    }
+    usize::try_from(result).ok()
+}
+
+fn dtb_cstr(value: &[u8]) -> &[u8] {
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0 || byte == b':')
+        .unwrap_or(value.len());
+    &value[..end]
+}
+
+fn find_dtb_node_by_absolute_path<'a>(
+    dtb: &Dtb<'a>,
+    path: &[u8],
+) -> Option<(general::dtb::DtbNode<'a>, general::dtb::DtbNode<'a>, bool)> {
+    if path.first().copied() != Some(b'/') {
+        return None;
+    }
+
+    let root = dtb.root()?;
+    let mut parent = root;
+    let mut current = root;
+    let mut depth = 0usize;
+    for component in path[1..].split(|&byte| byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        parent = current;
+        current = current
+            .children()
+            .find(|child| child.name_bytes() == component)?;
+        depth += 1;
+    }
+    Some((parent, current, depth == 1))
+}
+
+fn dtb_compatible_contains(node: general::dtb::DtbNode<'_>, expected: &[u8]) -> bool {
+    node.find_property("compatible").is_some_and(|property| {
+        property
+            .value()
+            .split(|&byte| byte == 0)
+            .any(|value| value == expected)
+    })
+}
+
+/// 在完整 platform parser 接管前，仅解析 early console 所需的 stdout-path 与首个 reg。
+/// 对带非空 bus `ranges` 的复杂地址转换保持 QEMU fallback，避免在 arch 重复通用解析器。
+fn configure_early_console_from_dtb(dtb: &Dtb<'static>) {
+    let Some(root) = dtb.root() else {
+        return;
+    };
+    let Some(chosen) = root.find_child("chosen") else {
+        return;
+    };
+    let Some(stdout) = chosen.find_property("stdout-path") else {
+        return;
+    };
+
+    let mut path = dtb_cstr(stdout.value());
+    if path.first().copied() != Some(b'/') {
+        let Some(alias_name) = core::str::from_utf8(path).ok() else {
+            return;
+        };
+        let Some(aliases) = root.find_child("aliases") else {
+            return;
+        };
+        let Some(alias) = aliases.find_property(alias_name) else {
+            return;
+        };
+        path = dtb_cstr(alias.value());
+    }
+
+    let Some((parent, serial, parent_is_root)) = find_dtb_node_by_absolute_path(dtb, path) else {
+        return;
+    };
+    if !dtb_compatible_contains(serial, b"ns16550a")
+        && !dtb_compatible_contains(serial, b"ns16550")
+        && !dtb_compatible_contains(serial, b"uart16550")
+    {
+        log::warning!("[loader] DTB stdout is not NS16550-compatible; keeping QEMU fallback");
+        return;
+    }
+    // 根节点的 reg 已经是 CPU 物理地址；子总线只有空 ranges 才明确表示恒等映射。
+    // 缺失 ranges 表示地址不可向父总线转换，非空 ranges 则需要完整 cell 翻译。
+    if !parent_is_root
+        && !parent
+            .find_property("ranges")
+            .is_some_and(|ranges| ranges.value().is_empty())
+    {
+        log::warning!(
+            "[loader] early console bus needs address translation; keeping QEMU fallback"
+        );
+        return;
+    }
+
+    let address_cells = parent
+        .find_property("#address-cells")
+        .and_then(|prop| read_be_u32_prop(prop.value()))
+        .map(|value| value as usize)
+        .unwrap_or(2);
+    let Some(reg) = serial.find_property("reg") else {
+        return;
+    };
+    let Some(phys_base) = read_cells(reg.value(), address_cells) else {
+        return;
+    };
+    if early_console::configure_physical_base(phys_base) {
+        log::info!("[loader] early console relocated from DTB to {phys_base:#x}");
+    } else {
+        log::warning!("[loader] DTB stdout UART {phys_base:#x} is outside the early MMIO window");
+    }
+}
+
 /// 解析 RISC-V DTB 的 timebase-frequency，并启动周期性 S-mode timer。
 fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
     let hz = dtb
@@ -317,6 +451,16 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
         dtb_addr
     );
 
+    let sbi_info = sbi::init();
+    log::info!(
+        "[loader] SBI: base={} spec={:?} impl={:?}/{:?} srst={}",
+        sbi_info.base_available,
+        sbi_info.spec_version,
+        sbi_info.implementation_id,
+        sbi_info.implementation_version,
+        sbi_info.srst_available
+    );
+
     // 初始化引导期分配器
     {
         allocator::KERNEL_ALLOCATOR.bind_address_translation(phys_to_virt, virt_to_phys);
@@ -345,6 +489,13 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
     // 快照 DTB 到内核缓冲区
     let dtb = store_kernel_dtb(dtb_addr).unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
     log::info!("[loader] DTB: {} bytes", dtb.as_bytes().len());
+    log::info!(
+        "[loader] usable RAM handoff constrained to direct map {:#x}..{:#x}",
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_START,
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_END
+    );
+
+    configure_early_console_from_dtb(&dtb);
 
     // 检测 ISA 扩展（Zicboz 等）
     detect_isa_extensions(&dtb);
@@ -374,7 +525,7 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
             firmware: StartFirmware::Dtb(dtb),
             memory: StartMemory {
                 kernel_image: kernel_phys,
-                boot_map: StartMemoryMap::None,
+                boot_map: StartMemoryMap::Regions(&RISCV_BOOT_MEMORY_MAP),
             },
             address: StartAddressOps {
                 phys_to_virt,
