@@ -836,14 +836,14 @@ pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsRe
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
-    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
-        return Err(VfsError::OperationNotPermitted);
-    }
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
     let meta = inode.meta_snapshot();
     if !ctx.cred().can_exec(meta.uid, meta.gid, meta.mode, true) {
         return Err(VfsError::PermissionDenied);
+    }
+    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
+        return Err(VfsError::OperationNotPermitted);
     }
     ctx.set_root(result.dentry, result.mount)
 }

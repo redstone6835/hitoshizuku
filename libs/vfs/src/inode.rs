@@ -513,7 +513,7 @@ pub trait InodeOps {
     /// 在当前目录中创建一个新的普通文件。
     ///
     /// mode 是经过 umask 掩码处理后的最终权限位，cred 是发起操作的进程凭据（驱动
-    /// 应当用 cred 中的 euid 和 egid 设置新文件的所有者和所属组）。如果目录中已
+    /// 应当用 cred 中的 fsuid 和 fsgid 设置新文件的所有者和所属组）。如果目录中已
     /// 存在同名条目，驱动应当返回 AlreadyExists 错误。
     fn create(
         &self,

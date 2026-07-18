@@ -409,8 +409,9 @@ impl InodeOps for ExtInodeOps {
         }
         // 新 inode:S_IFREG | perm
         let full_mode = (S_IFREG) | (mode.bits() & 0o7777);
-        let new_raw = create_disk_inode(&self.state, full_mode, cred.uid.0, cred.gid.0, false, 1)
-            .map_err(map_err)?;
+        let new_raw =
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, false, 1)
+                .map_err(map_err)?;
 
         // 在父目录插 entry
         let mut parent = lock_raw(&self.raw);
@@ -457,7 +458,7 @@ impl InodeOps for ExtInodeOps {
         // 新目录:S_IFDIR | perm,nlink=2("." 指自己),parent 的 nlink += 1
         let full_mode = S_IFDIR | (mode.bits() & 0o7777);
         let mut new_raw =
-            create_disk_inode(&self.state, full_mode, cred.uid.0, cred.gid.0, true, 2)
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, true, 2)
                 .map_err(map_err)?;
 
         // 给新目录分配第一个块,写入 "." / ".."
@@ -630,7 +631,7 @@ impl InodeOps for ExtInodeOps {
         }
         let full_mode = S_IFLNK | 0o777;
         let mut new_raw =
-            create_disk_inode(&self.state, full_mode, cred.uid.0, cred.gid.0, false, 1)
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, false, 1)
                 .map_err(map_err)?;
 
         let tbytes = target.as_bytes();
