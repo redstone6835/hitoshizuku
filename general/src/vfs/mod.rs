@@ -53,7 +53,14 @@ pub fn current_fdtable() -> Option<Arc<FdTable>> {
     payload.downcast::<FdTable>().ok()
 }
 
-/// Return an absolute path for `dentry` in `ctx`'s mount namespace.
+/// 返回 `dentry` 在 `ctx` 挂载命名空间中的绝对路径。
+#[kernel_symbols::export(
+    name = "general.vfs.namespace_path",
+    contract = "kernel.vfs.path@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn namespace_path(
     ctx: &VfsContext,
     dentry: &Arc<Dentry>,

@@ -75,6 +75,15 @@ impl FlashRegistry {
 
 static FLASH_DEVICES: Spinlock<FlashRegistry> = Spinlock::new(FlashRegistry::new());
 
+#[kernel_symbols::export(
+    name = "general.dev.flash.register",
+    contract = "kernel.general.flash@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+    retained_args = 1u64
+)]
 pub fn register(dev: Arc<dyn FlashDevice>) -> Result<FlashHandle, FlashError> {
     let mut registry = FLASH_DEVICES.lock();
     registry
@@ -90,6 +99,13 @@ pub fn register(dev: Arc<dyn FlashDevice>) -> Result<FlashHandle, FlashError> {
     Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.flash.unregister",
+    contract = "kernel.general.flash@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister(handle: FlashHandle) -> Result<(), FlashError> {
     let mut registry = FLASH_DEVICES.lock();
     let Some(index) = registry
@@ -108,6 +124,13 @@ fn release_flash_resource(handle: FlashHandle) -> bool {
 }
 
 /// 将 flash handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.flash.pnp_resource",
+    contract = "kernel.general.flash@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn pnp_resource(handle: FlashHandle, label: &'static str) -> PnpHandleResource<FlashHandle> {
     PnpHandleResource::new(
         PnpResourceKind::Flash,
@@ -117,6 +140,14 @@ pub fn pnp_resource(handle: FlashHandle, label: &'static str) -> PnpHandleResour
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.flash.snapshot",
+    contract = "kernel.general.flash@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn snapshot() -> Vec<Arc<dyn FlashDevice>> {
     FLASH_DEVICES
         .lock()

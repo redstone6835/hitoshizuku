@@ -47,6 +47,13 @@ pub struct FileDiag {
     pub dropped: usize,
 }
 
+#[kernel_symbols::export(
+    name = "vfs.file.file_diag",
+    contract = "kernel.vfs.file-diagnostic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn file_diag() -> FileDiag {
     FileDiag {
         live: FILE_LIVE.load(Ordering::Acquire),
@@ -369,11 +376,21 @@ pub struct File {
     pub(crate) mount: Arc<crate::vfs::mount::Mount>,
 }
 
+#[kernel_symbols::export]
 impl File {
     /// 构造一个新的打开文件描述符。
     ///
     /// 由 VFS 层在 `InodeOps::open` 返回后调用；`dentry` 是打开的文件对应的 Dentry，
     /// 用于 `Dirfd::Fd` 场景下的路径解析基准。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.new",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 1 << 3
+    )]
     pub fn new(
         inode: Arc<Inode>,
         flags: OpenOptions,
@@ -401,21 +418,45 @@ impl File {
     }
 
     /// 返回此文件所在挂载点的共享引用。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.mount",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn mount(&self) -> &Arc<crate::vfs::mount::Mount> {
         &self.mount
     }
 
     /// 返回此文件对应的 Dentry。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.dentry",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn dentry(&self) -> &Arc<crate::vfs::dentry::Dentry> {
         &self.dentry
     }
 
     /// 返回当前读写偏移量。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.pos",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn pos(&self) -> u64 {
         self.pos.load(Ordering::Acquire)
     }
 
     /// 返回打开选项。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.flags",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn flags(&self) -> OpenOptions {
         StatusFlags(self.status_flags.load(Ordering::Acquire)).apply(self.flags)
     }
@@ -471,6 +512,13 @@ impl File {
     /// 读取数据到 `buf`，从当前偏移量开始，读完后推进偏移量。
     ///
     /// 对 `O_PATH` 描述符调用 `read` 将返回 `VfsError::BadFileDescriptor`。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.read",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
@@ -484,6 +532,13 @@ impl File {
     }
 
     /// 将 `buf` 中的数据写入文件，从当前偏移量（或文件末尾，若 `O_APPEND`）开始。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.write",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
         let flags = self.flags();
         if !flags.writable() {
@@ -505,6 +560,12 @@ impl File {
     }
 
     /// 在指定偏移量处读取，不改变描述符的当前偏移量（`pread64`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.read_at",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO
+    )]
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
@@ -516,6 +577,13 @@ impl File {
     }
 
     /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.write_at",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
@@ -527,6 +595,13 @@ impl File {
     }
 
     /// 移动文件偏移量（`lseek`）。返回移动后的绝对偏移量。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.seek",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn seek(&self, from: SeekFrom) -> VfsResult<u64> {
         let _pos_guard = self.pos_lock.lock();
         let new_pos = match from {
@@ -585,6 +660,13 @@ impl File {
     }
 
     /// 修改文件大小，委托给底层文件系统以同步数据容器和 inode 元数据。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.truncate",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn truncate(&self, size: u64) -> VfsResult<()> {
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
@@ -633,6 +715,13 @@ impl File {
     }
 
     /// 将文件内容刷入底层存储（`fsync`）：等待数据和元数据均落盘。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.sync",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync(&self) -> VfsResult<()> {
         self.ops.sync()?;
         self.inode.ops.sync_metadata(&self.inode)
@@ -644,6 +733,12 @@ impl File {
     }
 
     /// 获取文件当前元数据快照（`fstat`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.stat",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn stat(&self) -> VfsResult<FileStat> {
         self.inode.stat()
     }
@@ -653,6 +748,12 @@ impl File {
     /// `interest` 指定调用方感兴趣的事件掩码；返回值为当前已就绪的事件子集
     /// （`interest` 与实际就绪事件的交集）。若无就绪事件，调用方应将此
     /// 描述符加入内核等待队列（等待队列由调度器层实现，此处不涉及）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.poll",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO
+    )]
     pub fn poll(&self, interest: PollEvents) -> PollEvents {
         let ready = self.ops.poll(interest);
         // POLLERR/POLLHUP/POLLNVAL 始终返回，不受 interest 过滤（POSIX 语义）。
@@ -687,6 +788,13 @@ impl File {
     }
 
     /// 执行设备或文件系统特定的控制命令（`ioctl(2)`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.ioctl",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         if self.flags.path_only {
             return Err(Errno::EBADF);

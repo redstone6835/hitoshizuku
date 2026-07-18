@@ -49,6 +49,15 @@ struct FwCfgRegistration {
 static FW_CFG: Spinlock<Option<FwCfgRegistration>> = Spinlock::new(None);
 static NEXT_FW_CFG_ID: AtomicU64 = AtomicU64::new(1);
 
+#[kernel_symbols::export(
+    name = "general.dev.fwcfg.install",
+    contract = "kernel.general.fw-cfg@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+    retained_args = 1u64
+)]
 pub fn install(dev: Arc<dyn FwCfgDevice>) -> Result<FwCfgHandle, FwCfgError> {
     let mut current = FW_CFG.lock();
     if current.is_some() {
@@ -62,6 +71,13 @@ pub fn install(dev: Arc<dyn FwCfgDevice>) -> Result<FwCfgHandle, FwCfgError> {
     Ok(FwCfgHandle { id })
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.fwcfg.uninstall",
+    contract = "kernel.general.fw-cfg@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn uninstall(handle: FwCfgHandle) -> Result<(), FwCfgError> {
     let mut current = FW_CFG.lock();
     let Some(registration) = current.as_ref() else {
@@ -79,6 +95,13 @@ fn release_fwcfg_resource(handle: FwCfgHandle) -> bool {
 }
 
 /// 将 fw_cfg 安装 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.fwcfg.pnp_resource",
+    contract = "kernel.general.fw-cfg@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn pnp_resource(handle: FwCfgHandle, label: &'static str) -> PnpHandleResource<FwCfgHandle> {
     PnpHandleResource::new(
         PnpResourceKind::FwCfg,
@@ -88,6 +111,12 @@ pub fn pnp_resource(handle: FwCfgHandle, label: &'static str) -> PnpHandleResour
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.fwcfg.read_item",
+    contract = "kernel.general.fw-cfg@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+)]
 pub fn read_item(selector: u16, out: &mut [u8]) -> Result<(), FwCfgError> {
     let dev = {
         let current = FW_CFG.lock();

@@ -12,6 +12,7 @@ bench = false
 ktest-kernel = ["ktest/kernel"]
 
 [dependencies]
+kernel-symbols = { path = "../kernel-symbols" }
 ktest = { path = "../ktest", optional = true }
 
 [dev-dependencies]

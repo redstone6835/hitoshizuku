@@ -1,0 +1,7 @@
+ELM-LOCK-V1
+module=virtio.block
+version=0.1.0
+mode=m
+cargo_elm=0.1.0
+rustc=rustc 1.89.0-nightly (60dabef95 2025-05-19)
+profile	loongarch64-unknown-none	contest-2026	1	fa3e568943ffe4372ea703e908e50f7611d2e55b1567b1db844abe04ebc80431	535ad4f1c7d72b83b0e05243e43130ce5b9d2cd703ef2201d83d00b96b291c48	83412ba9ca5cfe6486856ff915abfdb6ac79b954e12356b09473950bce935433	9bec3d86f18546947bb74614d7702bb3bc28dd455c94f9fa5449e7b540b5408c

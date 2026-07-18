@@ -1,0 +1,11 @@
+[elm]
+name = "net.loopback"
+version = "0.1.0"
+kind = "network"
+source = "kernel-tree:drivers.loopback"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

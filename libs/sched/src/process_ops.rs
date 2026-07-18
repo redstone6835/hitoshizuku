@@ -73,6 +73,17 @@ impl ExecRequest {
 
 /// 用户执行路径相关 ops。
 pub struct ProcessImageOps {
+    /// 从内核字符串和参数数组创建一个新的用户进程。
+    ///
+    /// `sched` 已经建立好子任务图和基础扩展；实现负责装载用户镜像、安装首次
+    /// 返回用户态的执行上下文，并在成功返回前保证任务仍未进入运行队列。
+    pub spawn_user_process: fn(
+        parent: &Arc<Task>,
+        child: &Arc<Task>,
+        path: &str,
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<(), Errno>,
     /// 用新镜像替换 `task` 的用户地址空间和返回上下文。
     pub execve:
         fn(task: &Arc<Task>, request: ExecRequest, user_ctx: UserContextRef) -> Result<(), Errno>,

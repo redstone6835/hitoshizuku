@@ -274,6 +274,7 @@ pub struct Bio {
     completion: Option<BioCompletionSlot>,
 }
 
+#[kernel_symbols::export]
 impl Bio {
     /// 创建新 Bio 与配套 Completion。
     pub fn new(
@@ -340,6 +341,13 @@ impl Bio {
     ///
     /// `Ok(())` 表示成功——Bio 自身（包含数据缓冲区）通过 Completion 归还。
     /// `Err(e)` 表示失败——Bio 被消费，等待者收到 `Err(e)`。
+    #[kernel_symbols::export(
+        name = "general.dev.bio.Bio.complete",
+        contract = "kernel.general.block-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn complete(mut self, result: Result<(), BioIoError>) {
         if let Some(observer) = self.observer.as_ref() {
             observer.on_complete(

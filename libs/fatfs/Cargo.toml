@@ -11,6 +11,7 @@ bench = false
 [dependencies]
 vfs = { path = "../vfs" }
 errno = { path = "../errno" }
+kernel-symbols = { path = "../kernel-symbols" }
 log = { path = "../log" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 

@@ -12,3 +12,29 @@ pub fn register_arch_hooks() {
         arch::register_sched_ctx();
     }
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SecondaryCpuReport {
+    pub detected: usize,
+    pub started: usize,
+    pub failed: usize,
+}
+
+pub fn start_secondary_cpus() -> SecondaryCpuReport {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let report = arch::start_secondary_cpus();
+        return SecondaryCpuReport {
+            detected: report.detected,
+            started: report.started,
+            failed: report.failed,
+        };
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    SecondaryCpuReport {
+        detected: 1,
+        started: 1,
+        failed: 0,
+    }
+}

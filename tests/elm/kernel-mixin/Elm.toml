@@ -1,0 +1,10 @@
+[elm]
+name = "test.kernel-mixin"
+version = "0.1.0"
+kind = "debug"
+source = "kernel-tree:test.elm.kernel-mixin"
+mode = "m"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

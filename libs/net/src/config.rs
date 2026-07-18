@@ -130,8 +130,16 @@ pub struct IfConfig {
     pub mode: IfMode,
 }
 
+#[kernel_symbols::export]
 impl IfConfig {
     /// 纯 IPv4 静态配置。
+    #[kernel_symbols::export(
+        name = "net.IfConfig.static_v4",
+        contract = "kernel.net.interface-config@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn static_v4(addr: Ipv4Addr, prefix_len: u8, gateway: Option<Ipv4Addr>) -> Self {
         Self {
             addresses: alloc::vec![CidrAddress::new_v4(addr, prefix_len)],

@@ -9,6 +9,7 @@ doctest = false
 bench = false
 
 [dependencies]
+kernel-symbols = { path = "../kernel-symbols" }
 sched = { path = "../sched" }
 
 [dev-dependencies]

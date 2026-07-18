@@ -1,0 +1,16 @@
+[package]
+name = "kernel-symbols"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = true
+doctest = true
+bench = false
+
+[features]
+default = ["macros"]
+macros = ["dep:kernel-symbols-macros"]
+
+[dependencies]
+kernel-symbols-macros = { path = "macros", optional = true }

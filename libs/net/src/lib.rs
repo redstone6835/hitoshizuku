@@ -28,7 +28,7 @@
 //! ├──────────────────────────────────┤
 //! │  driver.rs (NetDriver trait)     │  ← 设备抽象
 //! ├──────────────────────────────────┤
-//! │  VirtIO-net / e1000 / ...        │  ← 具体驱动（在 general crate）
+//! │  loopback / VirtIO-net / ...     │  ← 具体驱动（drivers 中的 ELM）
 //! └──────────────────────────────────┘
 //! ```
 //!
@@ -47,6 +47,7 @@ pub mod adapter;
 pub mod config;
 pub mod device;
 pub mod driver;
+pub mod elm;
 mod engine;
 pub mod error;
 pub mod interface;
@@ -70,3 +71,22 @@ pub use time::{NetDuration, NetInstant};
 pub use tuning::{
     EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBufferTuning, TcpListenTuning,
 };
+
+/// 强制链接器保留网络设备 ELM 直接符号所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    stack::stack as usize
+        ^ stack::NetStack::attach as usize
+        ^ stack::NetStack::detach as usize
+        ^ stack::NetStack::find_interface_by_name as usize
+        ^ device::NetDevice::new as usize
+        ^ device::NetDevice::id as usize
+        ^ device::NetDevice::mark_gone as usize
+        ^ driver::RxBuf::new as usize
+        ^ driver::RxBuf::len as usize
+        ^ driver::RxBuf::into_storage as usize
+        ^ driver::TxBuf::new_heap as usize
+        ^ driver::TxBuf::len as usize
+        ^ driver::TxBuf::into_heap as usize
+        ^ config::IfConfig::static_v4 as usize
+}

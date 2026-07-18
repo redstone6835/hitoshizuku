@@ -31,6 +31,7 @@
 //! remove 流程严格保证：先阻止新 I/O → 排空已有 I/O → 关闭硬件 → 清理注册。
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -174,6 +175,9 @@ impl From<FunctionRegistryError> for PnpError {
                 PnpError::registration_failed(PnpResourceKind::Function, "function not registered")
             }
             FunctionRegistryError::OutOfMemory => PnpError::OutOfMemory,
+            FunctionRegistryError::InvalidName | FunctionRegistryError::IdExhausted => {
+                PnpError::registration_failed(PnpResourceKind::Function, "invalid function class")
+            }
         }
     }
 }
@@ -211,6 +215,16 @@ pub enum PnpId {
     Platform {
         name: Box<str>,
         identity: PlatformIdentity,
+    },
+    /// 由可扩展总线或 ELM 发现源提交的不透明设备身份。
+    ///
+    /// PnP core 只比较 `bus`、契约标识和规范化字节串，不解释身份内容。这样新
+    /// 总线可以在不修改 PnP 状态机的情况下加入设备树；具体语义由匹配该总线的
+    /// 驱动或发现源负责。
+    Dynamic {
+        bus: BusType,
+        contract: Box<str>,
+        identity: Box<[u8]>,
     },
 }
 
@@ -339,6 +353,15 @@ impl Hash for PnpId {
                 name.as_ref().hash(state);
                 identity.hash(state);
             }
+            PnpId::Dynamic {
+                bus,
+                contract,
+                identity,
+            } => {
+                bus.hash(state);
+                contract.hash(state);
+                identity.hash(state);
+            }
         }
     }
 }
@@ -349,11 +372,19 @@ impl PnpId {
             PnpId::Pci { .. } => BusType::PCI,
             PnpId::Usb { .. } => BusType::USB,
             PnpId::Platform { .. } => BusType::PLATFORM,
+            PnpId::Dynamic { bus, .. } => *bus,
         }
     }
 }
 
+#[kernel_symbols::export]
 impl fmt::Display for PnpId {
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpId.fmt",
+        contract = "kernel.general.device-query@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PnpId::Pci {
@@ -390,6 +421,51 @@ impl fmt::Display for PnpId {
                     )
                 }
             }
+            PnpId::Dynamic {
+                bus,
+                contract,
+                identity,
+            } => write!(f, "dynamic:{}:{}:{:02x?}", bus.raw_id(), contract, identity),
+        }
+    }
+}
+
+impl PnpId {
+    /// 构造一个动态设备身份。
+    pub fn dynamic(bus: BusType, contract: &str, identity: &[u8]) -> Result<Self, PnpError> {
+        if bus == BusType::GENERIC || contract.is_empty() || identity.is_empty() {
+            return Err(PnpError::InvalidState);
+        }
+        let mut contract_copy = String::new();
+        contract_copy
+            .try_reserve(contract.len())
+            .map_err(|_| PnpError::OutOfMemory)?;
+        contract_copy.push_str(contract);
+        let mut identity_copy = Vec::new();
+        identity_copy
+            .try_reserve(identity.len())
+            .map_err(|_| PnpError::OutOfMemory)?;
+        identity_copy.extend_from_slice(identity);
+        Ok(Self::Dynamic {
+            bus,
+            contract: contract_copy.into_boxed_str(),
+            identity: identity_copy.into_boxed_slice(),
+        })
+    }
+
+    /// 返回动态身份的契约标识；固定总线身份返回 `None`。
+    pub fn identity_contract(&self) -> Option<&str> {
+        match self {
+            Self::Dynamic { contract, .. } => Some(contract),
+            _ => None,
+        }
+    }
+
+    /// 返回动态身份的规范化字节串；固定总线身份返回 `None`。
+    pub fn identity_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Dynamic { identity, .. } => Some(identity),
+            _ => None,
         }
     }
 }
@@ -401,27 +477,76 @@ impl fmt::Display for PnpId {
 /// 该类型替代散落的 `"pci"`、`"usb"`、`"platform"` 字符串比较。总线枚举层
 /// 和驱动只需要返回同一个 `BusType` 常量，注册表即可做类型安全的匹配。保留
 /// [`BusType::new`] 是为了后续新增总线时不必修改 PnP core。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BusType(&'static str);
+#[derive(Clone, Copy, Debug)]
+pub struct BusType {
+    id: u64,
+    name: Option<&'static str>,
+}
+
+impl PartialEq for BusType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.name, other.name) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.id == other.id,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BusType {}
+
+impl Hash for BusType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.name {
+            Some(name) => {
+                0u8.hash(state);
+                name.hash(state);
+            }
+            None => {
+                1u8.hash(state);
+                self.id.hash(state);
+            }
+        }
+    }
+}
 
 impl BusType {
-    pub const PCI: Self = Self("pci");
-    pub const USB: Self = Self("usb");
-    pub const PLATFORM: Self = Self("platform");
-    pub const GENERIC: Self = Self("generic");
+    pub const PCI: Self = Self::new("pci");
+    pub const USB: Self = Self::new("usb");
+    pub const PLATFORM: Self = Self::new("platform");
+    pub const GENERIC: Self = Self::new("generic");
 
     pub const fn new(name: &'static str) -> Self {
-        Self(name)
+        Self {
+            id: stable_identifier_hash(name),
+            name: Some(name),
+        }
     }
 
     pub const fn as_str(self) -> &'static str {
-        self.0
+        match self.name {
+            Some(name) => name,
+            None => "dynamic",
+        }
+    }
+
+    /// 返回不透明总线编号，动态总线生命周期内不会复用。
+    pub const fn raw_id(self) -> u64 {
+        self.id
+    }
+
+    /// 从内核分配的动态总线编号构造总线类型。
+    pub const fn dynamic(raw_id: u64) -> Self {
+        Self {
+            id: raw_id,
+            name: None,
+        }
     }
 }
 
 impl fmt::Display for BusType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -429,8 +554,119 @@ pub trait PnpBusInfo: Send + Sync + Any + Debug {
     /// 返回该设备来自哪一种总线。
     fn bus_type(&self) -> BusType;
 
+    /// 返回用于诊断的总线 identifier。
+    ///
+    /// 动态总线不能把 ELM 镜像中的字符串引用放进长期设备对象，因此由其
+    /// `PnpBusInfo` 自己持有内核生命周期内有效的名称。
+    fn bus_name(&self) -> &str {
+        self.bus_type().as_str()
+    }
+
     /// 供具体总线封装在驱动 probe 时恢复强类型信息。
     fn as_any(&self) -> &dyn Any;
+}
+
+/// 动态总线设备的通用属性。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicPnpProperty {
+    pub name: Box<str>,
+    pub value: Box<[u8]>,
+}
+
+/// 动态总线设备的通用资源描述。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicPnpResource {
+    pub kind: u32,
+    pub index: u32,
+    pub start: u64,
+    pub length: u64,
+    pub flags: u64,
+    pub payload: Box<[u8]>,
+}
+
+/// 可扩展设备来源使用的 PnP 总线信息。
+///
+/// 该对象只保存规范化描述，不提供任何隐含的硬件访问能力。驱动仍需通过
+/// 设备资源 API 显式取得 MMIO、IRQ、DMA 或其它资源。
+#[derive(Clone, Debug)]
+pub struct DynamicPnpBusInfo {
+    bus: BusType,
+    bus_name: Box<str>,
+    contract: Box<str>,
+    properties: Vec<DynamicPnpProperty>,
+    resources: Vec<DynamicPnpResource>,
+}
+
+impl DynamicPnpBusInfo {
+    /// 构造动态总线信息，并复制所有传入数据到内核拥有的存储中。
+    pub fn new(
+        bus: BusType,
+        bus_name: &str,
+        contract: &str,
+        properties: Vec<DynamicPnpProperty>,
+        resources: Vec<DynamicPnpResource>,
+    ) -> Result<Self, PnpError> {
+        if bus == BusType::GENERIC || bus_name.is_empty() || contract.is_empty() {
+            return Err(PnpError::InvalidState);
+        }
+        Ok(Self {
+            bus,
+            bus_name: copy_boxed_str(bus_name)?,
+            contract: copy_boxed_str(contract)?,
+            properties,
+            resources,
+        })
+    }
+
+    pub fn bus_name(&self) -> &str {
+        &self.bus_name
+    }
+
+    pub fn contract(&self) -> &str {
+        &self.contract
+    }
+
+    pub fn properties(&self) -> &[DynamicPnpProperty] {
+        &self.properties
+    }
+
+    pub fn resources(&self) -> &[DynamicPnpResource] {
+        &self.resources
+    }
+}
+
+impl PnpBusInfo for DynamicPnpBusInfo {
+    fn bus_type(&self) -> BusType {
+        self.bus
+    }
+
+    fn bus_name(&self) -> &str {
+        &self.bus_name
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+const fn stable_identifier_hash(value: &str) -> u64 {
+    let bytes = value.as_bytes();
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        index += 1;
+    }
+    hash
+}
+
+fn copy_boxed_str(value: &str) -> Result<Box<str>, PnpError> {
+    let mut out = String::new();
+    out.try_reserve(value.len())
+        .map_err(|_| PnpError::OutOfMemory)?;
+    out.push_str(value);
+    Ok(out.into_boxed_str())
 }
 
 // ── 驱动初始化上下文 ─────────────────────────────────────────────────────
@@ -494,16 +730,36 @@ impl DevInitContext {
 }
 
 static DEV_INIT_CONTEXT: Spinlock<Option<DevInitContext>> = Spinlock::new(None);
+static NEXT_PNP_DEVICE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 安装全局驱动初始化上下文。
 ///
 /// 必须在调用 [`register_driver_factory`] 或内建驱动 bootstrap 前完成。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.set_dev_init_context",
+    contract = "kernel.general.device-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn set_dev_init_context(ctx: DevInitContext) {
     *DEV_INIT_CONTEXT.lock() = Some(ctx);
 }
 
 fn dev_init_context() -> Result<DevInitContext, PnpError> {
     DEV_INIT_CONTEXT.lock().ok_or(PnpError::InvalidState)
+}
+
+/// 使用平台安装的设备 MMIO 转换规则取得内核虚拟地址。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.device_mmio_to_virt",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+)]
+pub fn device_mmio_to_virt(physical_address: usize) -> Result<usize, PnpError> {
+    let context = dev_init_context()?;
+    Ok((context.device_mmio_to_virt)(physical_address))
 }
 
 // ── PnpState ─────────────────────────────────────────────────────────────
@@ -552,6 +808,10 @@ pub trait PnpResource: Send {
     fn kind(&self) -> PnpResourceKind;
     /// 资源诊断标签，必须是稳定静态字符串，不能依赖用户态 ABI 名称。
     fn label(&self) -> &'static str;
+    /// 返回可由资源拥有者用于主动撤销的稳定键；普通 LIFO 资源返回空值。
+    fn identity(&self) -> Option<u64> {
+        None
+    }
     /// 释放资源。实现必须允许底层资源已被提前释放并安全返回错误。
     fn release(self: Box<Self>) -> Result<(), PnpResourceReleaseError>;
 }
@@ -679,6 +939,7 @@ struct PnpDeviceInner {
 /// 总线层创建该对象并放入 [`PNP_DEVICES`]；驱动 probe 成功后可以通过
 /// [`PnpDevice::register_function`] 暴露一个或多个开放设备 function。
 pub struct PnpDevice {
+    runtime_id: u64,
     pub id: PnpId,
     pub name: Box<str>,
     pub info: Box<dyn PnpBusInfo>,
@@ -704,9 +965,21 @@ impl Debug for PnpDevice {
     }
 }
 
+#[kernel_symbols::export]
 impl PnpDevice {
-    pub fn new(id: PnpId, name: Box<str>, info: Box<dyn PnpBusInfo>) -> Arc<Self> {
-        Arc::new(Self {
+    /// 构造一个尚未进入全局设备表的 PnP 对象。
+    ///
+    /// 每个对象会取得本次启动期间永不复用的运行时编号；编号空间耗尽时返回
+    /// [`PnpError::OutOfMemory`]，不会因外部设备枚举触发内核 panic。
+    pub fn new(
+        id: PnpId,
+        name: Box<str>,
+        info: Box<dyn PnpBusInfo>,
+    ) -> Result<Arc<Self>, PnpError> {
+        let runtime_id =
+            registry_id::alloc_atomic_id(&NEXT_PNP_DEVICE_ID).map_err(|_| PnpError::OutOfMemory)?;
+        Ok(Arc::new(Self {
+            runtime_id,
             id,
             name,
             info,
@@ -721,7 +994,12 @@ impl PnpDevice {
                 deferred_dependency: None,
             }),
             removal_lock: AtomicBool::new(false),
-        })
+        }))
+    }
+
+    /// 返回本次启动期间唯一且不复用的设备对象编号。
+    pub const fn runtime_id(&self) -> u64 {
+        self.runtime_id
     }
 
     pub fn state(&self) -> PnpState {
@@ -729,8 +1007,18 @@ impl PnpDevice {
     }
 
     /// 返回当前绑定驱动的名称。
-    pub fn bound_driver_name(&self) -> Option<&'static str> {
-        self.inner.lock().bound_driver.as_ref().map(|d| d.name())
+    pub fn bound_driver_name(&self) -> Option<String> {
+        let inner = self.inner.lock();
+        let name = inner.bound_driver.as_ref().map(|d| d.name())?;
+        let mut out = String::new();
+        out.try_reserve(name.len()).ok()?;
+        out.push_str(name);
+        Some(out)
+    }
+
+    /// 返回设备当前是否由驱动管理，不为诊断名称分配临时字符串。
+    pub fn is_bound(&self) -> bool {
+        self.inner.lock().bound_driver.is_some()
     }
 
     fn bound_to_driver(&self, driver: &Arc<dyn PnpDriver>) -> bool {
@@ -755,6 +1043,11 @@ impl PnpDevice {
     /// 返回该设备已注册的 function 快照。
     pub fn functions(&self) -> Vec<Arc<dyn DeviceFunction>> {
         self.try_functions().unwrap_or_default()
+    }
+
+    /// 返回当前 function 数量，不构造快照。
+    pub fn function_count(&self) -> usize {
+        self.inner.lock().functions.len()
     }
 
     /// 返回子设备快照。
@@ -804,11 +1097,27 @@ impl PnpDevice {
     }
 
     /// 保存驱动私有数据。
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpDevice.set_driver_data",
+        contract = "kernel.general.pnp-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 2u64
+    )]
     pub fn set_driver_data(&self, data: Arc<dyn Any + Send + Sync>) {
         self.inner.lock().driver_data = Some(data);
     }
 
     /// 取出并清空驱动私有数据。
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpDevice.take_driver_data",
+        contract = "kernel.general.pnp-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn take_driver_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.inner.lock().driver_data.take()
     }
@@ -908,6 +1217,22 @@ impl PnpDevice {
     where
         R: PnpResource + 'static,
     {
+        self.own_boxed_resource(Box::new(resource))
+    }
+
+    /// 将已经完成类型擦除的资源交给当前 PnP 设备拥有。
+    ///
+    /// 该入口允许常驻子系统在内核侧构造 trait object，再交给动态 ELM 使用，
+    /// 避免把常驻类型的私有 vtable 当成模块链接 ABI。
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpDevice.own_boxed_resource",
+        contract = "kernel.general.device-resource@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 2u64
+    )]
+    pub fn own_boxed_resource(&self, resource: Box<dyn PnpResource>) -> Result<(), PnpError> {
         let mut inner = self.inner.lock();
         if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
             return Err(PnpError::InvalidState);
@@ -916,8 +1241,33 @@ impl PnpDevice {
             .resources
             .try_reserve(1)
             .map_err(|_| PnpError::OutOfMemory)?;
-        inner.resources.push(Box::new(resource));
+        inner.resources.push(resource);
         Ok(())
+    }
+
+    /// 按资源稳定键主动撤销一条由设备拥有的资源。
+    ///
+    /// 该入口只用于资源本身允许主动撤销的扩展对象；没有 identity 的传统资源仍由
+    /// PnP 设备解绑或热拔时统一按登记逆序释放。
+    pub fn release_owned_resource(&self, identity: u64) -> Result<(), PnpError> {
+        if identity == 0 {
+            return Err(PnpError::InvalidState);
+        }
+        let resource = {
+            let mut inner = self.inner.lock();
+            let Some(index) = inner
+                .resources
+                .iter()
+                .position(|resource| resource.identity() == Some(identity))
+            else {
+                return Err(PnpError::MissingResource {
+                    kind: PnpResourceKind::Other("pnp-resource"),
+                    detail: "owned resource not found",
+                });
+            };
+            inner.resources.remove(index)
+        };
+        resource.release().map_err(|_| PnpError::InvalidState)
     }
 
     fn set_deferred_dependency(&self, dependency: Option<PnpDependency>) {
@@ -941,7 +1291,7 @@ impl PnpDevice {
 
 pub trait PnpDriver: Send + Sync {
     /// 驱动名称，用于日志、去重和调试输出。
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// 驱动绑定的总线类型；返回 [`BusType::GENERIC`] 表示作为兜底驱动参与匹配。
     fn bus_type(&self) -> BusType;
@@ -957,6 +1307,14 @@ pub trait PnpDriver: Send + Sync {
 
     /// 判断该驱动是否支持给定 PnP 设备。
     fn matches(&self, id: &PnpId, info: &dyn PnpBusInfo) -> bool;
+
+    /// 在拥有完整设备对象的发现路径上执行匹配。
+    ///
+    /// 默认实现保持旧的 `(id, info)` 语义；需要观察父子关系、运行期属性或其它
+    /// 设备对象状态的动态驱动可以覆盖本入口，避免通过全局列表反查对象。
+    fn matches_device(&self, device: &Arc<PnpDevice>) -> bool {
+        self.matches(&device.id, device.info.as_ref())
+    }
 
     /// 初始化硬件并注册该设备暴露的 function。
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError>;
@@ -1007,6 +1365,7 @@ impl DriverId {
 /// 驱动注册句柄。
 ///
 /// 调用方用该句柄注销驱动，或触发该驱动对既有未绑定设备重新 probe。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DriverHandle {
     id: DriverId,
 }
@@ -1027,7 +1386,7 @@ fn alloc_driver_id(next_id: &AtomicU64) -> Result<DriverId, PnpError> {
 
 pub trait DriverFactory: Send + Sync {
     /// factory 创建的驱动名称。
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     /// 根据启动期上下文创建一个可注册的 PnP 驱动实例。
     fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError>;
 }
@@ -1035,6 +1394,7 @@ pub trait DriverFactory: Send + Sync {
 struct RegisteredDriver {
     id: DriverId,
     driver: Arc<dyn PnpDriver>,
+    accepting: AtomicBool,
 }
 
 /// PnP 驱动运行时注册表。
@@ -1062,7 +1422,18 @@ impl PnpDriverRegistry {
         factory: Arc<dyn DriverFactory>,
     ) -> Result<DriverHandle, PnpError> {
         let ctx = dev_init_context()?;
-        let driver = factory.create(&ctx)?;
+        let factory_name = factory.name();
+        let driver = match factory.create(&ctx) {
+            Ok(driver) => driver,
+            Err(error) => {
+                log::error!(
+                    "[pnp] driver factory {} create failed: {:?}",
+                    factory_name,
+                    error
+                );
+                return Err(error);
+            }
+        };
         let driver_name = driver.name();
         let id = {
             let mut drivers = self.drivers.lock();
@@ -1070,13 +1441,20 @@ impl PnpDriverRegistry {
                 .iter()
                 .any(|registered| registered.driver.name() == driver_name)
             {
+                log::error!("[pnp] duplicate driver name: {}", driver_name);
                 return Err(PnpError::NameConflict);
             }
-            drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+            {
+                // 驱动表容量属于常驻内核注册表，不能在动态 ELM 卸载后继续计入该单元。
+                let _accounting = allocator::suspend_implicit_allocation_accounting()
+                    .ok_or(PnpError::OutOfMemory)?;
+                drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+            }
             let id = alloc_driver_id(&self.next_driver_id)?;
             drivers.push(RegisteredDriver {
                 id,
                 driver: Arc::clone(&driver),
+                accepting: AtomicBool::new(true),
             });
             id
         };
@@ -1102,6 +1480,7 @@ impl PnpDriverRegistry {
             }
         }
 
+        log::debug!("[pnp] registered driver {}", driver_name);
         Ok(DriverHandle { id })
     }
 
@@ -1112,16 +1491,31 @@ impl PnpDriverRegistry {
     /// 的驱动接入时，不需要重新执行固件/总线枚举。
     pub fn unregister(&self, handle: DriverHandle) -> Result<(), PnpError> {
         let driver = {
-            let mut drivers = self.drivers.lock();
-            let pos = drivers
-                .iter()
-                .position(|registered| registered.id == handle.id)
-                .ok_or(PnpError::NoDriver)?;
-            drivers.swap_remove(pos).driver
+            let drivers = self.drivers.lock();
+            let Some(registered) = drivers.iter().find(|registered| registered.id == handle.id)
+            else {
+                return Err(PnpError::NoDriver);
+            };
+            registered.accepting.store(false, Ordering::Release);
+            Arc::clone(&registered.driver)
         };
 
         let mut last_error = None;
-        for dev in PNP_DEVICES.try_list().ok_or(PnpError::OutOfMemory)? {
+        let devices = match PNP_DEVICES.try_list() {
+            Some(devices) => devices,
+            None => {
+                if let Some(registered) = self
+                    .drivers
+                    .lock()
+                    .iter()
+                    .find(|registered| registered.id == handle.id)
+                {
+                    registered.accepting.store(true, Ordering::Release);
+                }
+                return Err(PnpError::OutOfMemory);
+            }
+        };
+        for dev in devices {
             if !dev.bound_to_driver(&driver) {
                 continue;
             }
@@ -1132,8 +1526,19 @@ impl PnpDriverRegistry {
         }
 
         if let Some(err) = last_error {
+            if let Some(registered) = self
+                .drivers
+                .lock()
+                .iter()
+                .find(|registered| registered.id == handle.id)
+            {
+                registered.accepting.store(true, Ordering::Release);
+            }
             return Err(err);
         }
+        self.drivers
+            .lock()
+            .retain(|registered| registered.id != handle.id);
         let _ = self.retry_deferred_devices();
         Ok(())
     }
@@ -1149,7 +1554,7 @@ impl PnpDriverRegistry {
             if !driver_can_probe_bus(driver.as_ref(), dev.info.bus_type()) {
                 continue;
             }
-            if !driver.matches(&dev.id, dev.info.as_ref()) {
+            if !driver.matches_device(&dev) {
                 continue;
             }
             match self.bind_driver_to_device(&dev, Arc::clone(&driver)) {
@@ -1210,7 +1615,14 @@ impl PnpDriverRegistry {
         let mut total_bound = 0usize;
         loop {
             let mut round_bound = 0usize;
-            for dev in PNP_DEVICES.try_list().ok_or(PnpError::OutOfMemory)? {
+            let devices = match PNP_DEVICES.try_list() {
+                Some(devices) => devices,
+                None => {
+                    self.retrying_deferred.store(false, Ordering::Release);
+                    return Err(PnpError::OutOfMemory);
+                }
+            };
+            for dev in devices {
                 if dev.state() != PnpState::Discovered {
                     continue;
                 }
@@ -1240,13 +1652,28 @@ impl PnpDriverRegistry {
         dev: &Arc<PnpDevice>,
         driver: Arc<dyn PnpDriver>,
     ) -> Result<(), PnpError> {
+        if !self.driver_is_accepting(&driver) {
+            return Err(PnpError::NoDriver);
+        }
         dev.transition(PnpState::Discovered, PnpState::Probing)?;
 
         match driver.probe(dev) {
             Ok(()) => {
+                // accepting 校验与 Bound 提交必须位于同一段注册表锁内。否则注销线程
+                // 可能已经完成设备快照，旧 probe 随后却把已摘除驱动重新装回设备。
+                let drivers = self.drivers.lock();
+                if !drivers.iter().any(|registered| {
+                    registered.accepting.load(Ordering::Acquire)
+                        && Arc::ptr_eq(&registered.driver, &driver)
+                }) {
+                    drop(drivers);
+                    dev.rollback_probe_side_effects();
+                    return Err(PnpError::NoDriver);
+                }
                 let mut inner = dev.inner.lock();
                 if inner.state != PnpState::Probing {
                     drop(inner);
+                    drop(drivers);
                     dev.rollback_probe_side_effects();
                     return Err(PnpError::InvalidState);
                 }
@@ -1268,26 +1695,41 @@ impl PnpDriverRegistry {
         &self,
         dev: &Arc<PnpDevice>,
     ) -> Result<Option<Arc<dyn PnpDriver>>, PnpError> {
-        let drivers = self.drivers.lock();
+        // 驱动的 matches_device 可能进入 ELM 回调，并在回调中注册其它设备资源。
+        // 不能在执行不受信任回调时持有 drivers 锁，否则嵌套注册/注销会死锁。
+        let candidates = {
+            let drivers = self.drivers.lock();
+            let mut candidates = Vec::new();
+            candidates
+                .try_reserve(drivers.len())
+                .map_err(|_| PnpError::OutOfMemory)?;
+            candidates.extend(
+                drivers
+                    .iter()
+                    .filter(|registered| registered.accepting.load(Ordering::Acquire))
+                    .map(|registered| Arc::clone(&registered.driver)),
+            );
+            candidates
+        };
         let mut best: Option<((u8, PnpDriverPriority), Arc<dyn PnpDriver>)> = None;
 
-        for registered in drivers.iter() {
-            if !driver_can_probe_bus(registered.driver.as_ref(), dev.info.bus_type()) {
+        for driver in candidates {
+            if !driver_can_probe_bus(driver.as_ref(), dev.info.bus_type()) {
                 continue;
             }
-            if !registered.driver.matches(&dev.id, dev.info.as_ref()) {
+            if !driver.matches_device(dev) {
                 continue;
             }
-            let bus_rank = if registered.driver.bus_type() == dev.info.bus_type() {
+            let bus_rank = if driver.bus_type() == dev.info.bus_type() {
                 1
             } else {
                 0
             };
-            let key = (bus_rank, registered.driver.priority());
+            let key = (bus_rank, driver.priority());
             match best.as_ref() {
-                None => best = Some((key, Arc::clone(&registered.driver))),
+                None => best = Some((key, driver)),
                 Some((best_key, _)) if key > *best_key => {
-                    best = Some((key, Arc::clone(&registered.driver)));
+                    best = Some((key, driver));
                 }
                 Some((best_key, _)) if key == *best_key => return Err(PnpError::DriverAmbiguous),
                 _ => {}
@@ -1301,8 +1743,14 @@ impl PnpDriverRegistry {
         self.drivers
             .lock()
             .iter()
-            .find(|registered| registered.id == id)
+            .find(|registered| registered.id == id && registered.accepting.load(Ordering::Acquire))
             .map(|registered| Arc::clone(&registered.driver))
+    }
+
+    fn driver_is_accepting(&self, driver: &Arc<dyn PnpDriver>) -> bool {
+        self.drivers.lock().iter().any(|registered| {
+            registered.accepting.load(Ordering::Acquire) && Arc::ptr_eq(&registered.driver, driver)
+        })
     }
 }
 
@@ -1321,16 +1769,49 @@ fn driver_can_probe_bus(driver: &dyn PnpDriver, bus_type: BusType) -> bool {
 }
 
 /// 注册驱动 factory 的全局便捷入口。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.register_driver_factory",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_driver_factory(factory: Arc<dyn DriverFactory>) -> Result<DriverHandle, PnpError> {
-    PNP_DRIVERS.register_factory(factory)
+    let handle = PNP_DRIVERS.register_factory(factory)?;
+    if super::elm_lifecycle::track_driver(handle).is_err() {
+        log::error!(
+            "[pnp] 无法登记驱动资源归属: driver_id={}",
+            handle.id().raw()
+        );
+        let _ = PNP_DRIVERS.unregister(handle);
+        return Err(PnpError::OutOfMemory);
+    }
+    Ok(handle)
 }
 
 /// 注销驱动的全局便捷入口。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.unregister_driver",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_driver(handle: DriverHandle) -> Result<(), PnpError> {
-    PNP_DRIVERS.unregister(handle)
+    PNP_DRIVERS.unregister(handle)?;
+    super::elm_lifecycle::forget_driver(handle);
+    Ok(())
 }
 
 /// 让指定驱动认领当前尚未绑定的既有设备。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.probe_existing_devices",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn probe_existing_devices(driver_id: DriverId) -> Result<usize, PnpError> {
     PNP_DRIVERS.probe_existing_devices(driver_id)
 }
@@ -1340,6 +1821,13 @@ pub fn probe_existing_devices(driver_id: DriverId) -> Result<usize, PnpError> {
 /// 资源 registry 在成功登记 controller、syscon、fwcfg 等依赖后调用该函数。
 /// PnP core 会只重试记录了同一依赖的设备；旧式没有精确依赖的 deferred 设备仍由
 /// [`PnpDriverRegistry::retry_deferred_devices`] 兜底处理。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.notify_dependency_ready",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn notify_dependency_ready(dependency: PnpDependency) {
     let _ = PNP_DRIVERS.retry_deferred_dependency(dependency);
 }
@@ -1363,6 +1851,139 @@ pub struct PnpDeviceRegistration {
     pub inserted: bool,
 }
 
+/// PnP 设备全局可见性事件类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpDeviceEventKind {
+    /// 新对象已经进入全局 PnP 设备表。
+    Registered,
+    /// 精确对象已经离开全局 PnP 设备表，旧观察句柄必须失效。
+    Removed,
+}
+
+/// PnP 设备全局可见性事件。
+#[derive(Clone)]
+pub struct PnpDeviceEvent {
+    kind: PnpDeviceEventKind,
+    device: Arc<PnpDevice>,
+}
+
+impl PnpDeviceEvent {
+    pub const fn kind(&self) -> PnpDeviceEventKind {
+        self.kind
+    }
+
+    pub fn device(&self) -> &Arc<PnpDevice> {
+        &self.device
+    }
+}
+
+pub type PnpDeviceEventCallback = fn(&PnpDeviceEvent);
+
+#[derive(Clone, Copy)]
+struct PnpDeviceEventSubscriber {
+    owner: &'static str,
+    name: &'static str,
+    callback: PnpDeviceEventCallback,
+}
+
+static PNP_DEVICE_EVENT_SUBSCRIBERS: Spinlock<Vec<PnpDeviceEventSubscriber>> =
+    Spinlock::new(Vec::new());
+
+/// 注册 PnP 设备生命周期观察者；相同 owner/name 的重复注册是幂等的。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.subscribe_device_events",
+    contract = "kernel.general.pnp-events@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn subscribe_device_events(
+    owner: &'static str,
+    name: &'static str,
+    callback: PnpDeviceEventCallback,
+) -> Result<bool, PnpError> {
+    let mut owned_name = String::new();
+    owned_name
+        .try_reserve(name.len())
+        .map_err(|_| PnpError::OutOfMemory)?;
+    owned_name.push_str(name);
+    let mut subscribers = PNP_DEVICE_EVENT_SUBSCRIBERS.lock();
+    if subscribers
+        .iter()
+        .any(|subscriber| subscriber.owner == owner && subscriber.name == name)
+    {
+        return Ok(false);
+    }
+    subscribers
+        .try_reserve(1)
+        .map_err(|_| PnpError::OutOfMemory)?;
+    subscribers.push(PnpDeviceEventSubscriber {
+        owner,
+        name,
+        callback,
+    });
+    drop(subscribers);
+    if super::elm_lifecycle::track_event_subscription(owner, owned_name.into_boxed_str()).is_err() {
+        let _ = unsubscribe_device_events(owner, name);
+        return Err(PnpError::OutOfMemory);
+    }
+    Ok(true)
+}
+
+/// 注销 PnP 设备生命周期观察者。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.unsubscribe_device_events",
+    contract = "kernel.general.pnp-events@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn unsubscribe_device_events(owner: &'static str, name: &str) -> Result<(), PnpError> {
+    let mut subscribers = PNP_DEVICE_EVENT_SUBSCRIBERS.lock();
+    let Some(index) = subscribers
+        .iter()
+        .position(|subscriber| subscriber.owner == owner && subscriber.name == name)
+    else {
+        return Err(PnpError::MissingResource {
+            kind: PnpResourceKind::Other("pnp-device-event"),
+            detail: "device event subscriber not found",
+        });
+    };
+    subscribers.swap_remove(index);
+    drop(subscribers);
+    super::elm_lifecycle::forget_event_subscription(owner, name);
+    Ok(())
+}
+
+fn publish_device_event(kind: PnpDeviceEventKind, device: Arc<PnpDevice>) {
+    let event = PnpDeviceEvent { kind, device };
+    let mut last_key = None;
+    while let Some(subscriber) = next_device_event_subscriber(last_key) {
+        (subscriber.callback)(&event);
+        last_key = Some((subscriber.owner, subscriber.name));
+    }
+}
+
+fn next_device_event_subscriber(
+    last_key: Option<(&'static str, &'static str)>,
+) -> Option<PnpDeviceEventSubscriber> {
+    let subscribers = PNP_DEVICE_EVENT_SUBSCRIBERS.lock();
+    let mut next = None;
+    for subscriber in subscribers.iter().copied() {
+        let key = (subscriber.owner, subscriber.name);
+        if last_key.is_some_and(|last_key| key <= last_key) {
+            continue;
+        }
+        if next
+            .is_none_or(|existing: PnpDeviceEventSubscriber| key < (existing.owner, existing.name))
+        {
+            next = Some(subscriber);
+        }
+    }
+    next
+}
+
 impl PnpDeviceList {
     pub const fn new() -> Self {
         Self {
@@ -1375,48 +1996,97 @@ impl PnpDeviceList {
     /// 这是总线扫描唯一的登记入口。它不会把重复发现视为错误，适合固件节点重试、
     /// 热插拔重新扫描或驱动依赖恢复后的 probe retry。
     pub fn get_or_insert(&self, dev: Arc<PnpDevice>) -> Result<PnpDeviceRegistration, PnpError> {
-        let mut list = self.devices.lock();
-        list.retain(|d| d.state() != PnpState::Gone);
-        if let Some(existing) = list
-            .iter()
-            .find(|existing| existing.id == dev.id && existing.state() != PnpState::Gone)
-            .cloned()
-        {
+        loop {
+            // 先只在列表锁内复制 Arc，不读取设备状态；设备移除路径的锁顺序是
+            // device -> list，读取 state 必须放到释放列表锁之后，避免反转死锁。
+            let existing = {
+                let list = self.devices.lock();
+                list.iter().find(|existing| existing.id == dev.id).cloned()
+            };
+            if let Some(existing) = existing {
+                if existing.state() != PnpState::Gone {
+                    return Ok(PnpDeviceRegistration {
+                        device: existing,
+                        inserted: false,
+                    });
+                }
+                // Gone 是终态；重新取得列表锁后只移除刚才观察到的对象，随后重新
+                // 检查一次，保证并发扫描不会覆盖另一个线程刚插入的同身份设备。
+                let removed = {
+                    let mut list = self.devices.lock();
+                    list.iter()
+                        .position(|item| Arc::ptr_eq(item, &existing))
+                        .map(|index| list.swap_remove(index))
+                };
+                if let Some(removed) = removed {
+                    publish_device_event(PnpDeviceEventKind::Removed, removed);
+                }
+                continue;
+            }
+
+            let mut list = self.devices.lock();
+            if list.iter().any(|existing| existing.id == dev.id) {
+                drop(list);
+                continue;
+            }
+            list.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+            list.push(Arc::clone(&dev));
+            drop(list);
+            publish_device_event(PnpDeviceEventKind::Registered, Arc::clone(&dev));
+            if super::elm_lifecycle::track_device(Arc::clone(&dev)).is_err() {
+                log::error!("[pnp] 无法登记设备资源归属: {}", dev.id);
+                let _ = self.remove_exact(&dev);
+                return Err(PnpError::OutOfMemory);
+            }
             return Ok(PnpDeviceRegistration {
-                device: existing,
-                inserted: false,
+                device: dev,
+                inserted: true,
             });
         }
-        list.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
-        list.push(Arc::clone(&dev));
-        Ok(PnpDeviceRegistration {
-            device: dev,
-            inserted: true,
-        })
     }
 
-    /// 从全局列表中移除指定设备。
-    pub fn remove(&self, id: &PnpId) -> Option<Arc<PnpDevice>> {
-        let mut list = self.devices.lock();
-        let pos = list.iter().position(|d| d.id == *id)?;
-        Some(list.swap_remove(pos))
+    /// 只移除与给定对象指针完全相同的设备。
+    ///
+    /// 热拔末段允许同一硬件身份被重新枚举；旧对象不能仅凭 `PnpId` 删除已经替换它的
+    /// 新对象，因此设备生命周期和注册回滚路径必须使用本入口。
+    pub fn remove_exact(&self, device: &Arc<PnpDevice>) -> Option<Arc<PnpDevice>> {
+        let removed = {
+            let mut list = self.devices.lock();
+            let pos = list
+                .iter()
+                .position(|existing| Arc::ptr_eq(existing, device))?;
+            list.swap_remove(pos)
+        };
+        publish_device_event(PnpDeviceEventKind::Removed, Arc::clone(&removed));
+        super::elm_lifecycle::forget_device(&removed);
+        Some(removed)
     }
 
     /// 按 PnP 硬件身份查找设备。
     pub fn lookup(&self, id: &PnpId) -> Option<Arc<PnpDevice>> {
-        self.devices
-            .lock()
-            .iter()
-            .find(|d| d.id == *id && d.state() != PnpState::Gone)
-            .cloned()
+        let device = {
+            let list = self.devices.lock();
+            list.iter().find(|device| device.id == *id).cloned()
+        }?;
+        (device.state() != PnpState::Gone).then_some(device)
     }
 
     /// 返回所有尚未 Gone 的设备快照。
     pub fn try_list(&self) -> Option<Vec<Arc<PnpDevice>>> {
-        let list = self.devices.lock();
+        let devices = {
+            let list = self.devices.lock();
+            let mut devices = Vec::new();
+            devices.try_reserve(list.len()).ok()?;
+            devices.extend(list.iter().cloned());
+            devices
+        };
         let mut out = Vec::new();
-        out.try_reserve(list.len()).ok()?;
-        out.extend(list.iter().filter(|d| d.state() != PnpState::Gone).cloned());
+        out.try_reserve(devices.len()).ok()?;
+        out.extend(
+            devices
+                .into_iter()
+                .filter(|device| device.state() != PnpState::Gone),
+        );
         Some(out)
     }
 
@@ -1430,6 +2100,110 @@ impl Default for PnpDeviceList {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 为外部同名 Rust 门面构造真实 PnP 设备对象。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.new",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn direct_pnp_device_new(
+    id: PnpId,
+    name: Box<str>,
+    info: Box<dyn PnpBusInfo>,
+) -> Result<Arc<PnpDevice>, PnpError> {
+    PnpDevice::new(id, name, info)
+}
+
+/// 调用全局 PnP 设备表的 `get_or_insert`。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.get_or_insert",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn direct_pnp_get_or_insert(
+    devices: &PnpDeviceList,
+    device: Arc<PnpDevice>,
+) -> Result<PnpDeviceRegistration, PnpError> {
+    devices.get_or_insert(device)
+}
+
+/// 调用全局 PnP 设备表的精确移除入口。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.remove_exact",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_remove_exact(
+    devices: &PnpDeviceList,
+    device: &Arc<PnpDevice>,
+) -> Option<Arc<PnpDevice>> {
+    devices.remove_exact(device)
+}
+
+/// 调用全局 PnP 设备表的身份查询入口。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.lookup",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+)]
+pub fn direct_pnp_lookup(devices: &PnpDeviceList, id: &PnpId) -> Option<Arc<PnpDevice>> {
+    devices.lookup(id)
+}
+
+/// 返回全局 PnP 设备表的一致快照。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.list",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
+pub fn direct_pnp_list(devices: &PnpDeviceList) -> Vec<Arc<PnpDevice>> {
+    devices.list()
+}
+
+/// 让全局 PnP 驱动表为一个设备执行匹配和 probe。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDriverRegistry.probe_device",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_probe_device(
+    drivers: &PnpDriverRegistry,
+    device: &Arc<PnpDevice>,
+) -> Result<(), PnpError> {
+    drivers.probe_device(device)
+}
+
+/// 重试全部 deferred PnP 设备。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDriverRegistry.retry_deferred_devices",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_retry_deferred_devices(drivers: &PnpDriverRegistry) -> Result<usize, PnpError> {
+    drivers.retry_deferred_devices()
 }
 
 // ── 功能注册 helpers ────────────────────────────────────────────────────
@@ -1455,6 +2229,33 @@ impl PnpDevice {
         Ok(())
     }
 
+    /// 在设备仍处于 probe 或 bound 状态时主动注销一个 function。
+    pub fn unregister_function(
+        self: &Arc<Self>,
+        class_id: crate::dev::function::DeviceClassId,
+        dev_name: &str,
+    ) -> Result<(), PnpError> {
+        let function = {
+            let mut inner = self.inner.lock();
+            if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
+                return Err(PnpError::InvalidState);
+            }
+            let Some(index) = inner.functions.iter().position(|function| {
+                function.class_id() == class_id && function.dev_name() == dev_name
+            }) else {
+                return Err(PnpError::registration_failed(
+                    PnpResourceKind::Function,
+                    "function not attached",
+                ));
+            };
+            inner.functions.remove(index)
+        };
+        function.mark_gone();
+        function.drain_io();
+        self.unregister_function_external(&function);
+        Ok(())
+    }
+
     fn detach_function(&self, func: &Arc<dyn DeviceFunction>) {
         let mut inner = self.inner.lock();
         inner
@@ -1463,7 +2264,8 @@ impl PnpDevice {
     }
 
     fn unregister_function_external(&self, func: &Arc<dyn DeviceFunction>) {
-        DEVICES.unregister_function(func);
+        DEVICES.unregister_quiesced_function(func);
+        super::elm_lifecycle::forget_device_function(self, func.class_id(), func.dev_name());
     }
 
     fn rollback_probe_side_effects(self: &Arc<Self>) {
@@ -1486,6 +2288,11 @@ impl PnpDevice {
 
         for func in &functions {
             func.mark_gone();
+        }
+        for func in &functions {
+            func.drain_io();
+        }
+        for func in &functions {
             self.unregister_function_external(func);
         }
 
@@ -1559,6 +2366,106 @@ impl PnpDevice {
         self.removal_lock.store(false, Ordering::Release);
         Ok(true)
     }
+}
+
+/// 在真实 PnP 对象之间建立父子关系。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.attach_child",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_attach_child(
+    parent: &Arc<PnpDevice>,
+    child: &Arc<PnpDevice>,
+) -> Result<(), PnpError> {
+    parent.attach_child(child)
+}
+
+/// 从真实 PnP 对象中解除父子关系。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.detach_child",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_detach_child(parent: &Arc<PnpDevice>, child: &Arc<PnpDevice>) {
+    parent.detach_child(child);
+}
+
+/// 在真实 PnP 对象上事务式注册一个设备 function。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.register_function",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_register_function(
+    device: &Arc<PnpDevice>,
+    function: Arc<dyn DeviceFunction>,
+) -> Result<(), PnpError> {
+    let class_id = function.class_id();
+    let mut owned_name = String::new();
+    {
+        let name = function.dev_name();
+        owned_name
+            .try_reserve(name.len())
+            .map_err(|_| PnpError::OutOfMemory)?;
+        owned_name.push_str(name);
+    }
+    let mut tracked_name = String::new();
+    tracked_name
+        .try_reserve(owned_name.len())
+        .map_err(|_| PnpError::OutOfMemory)?;
+    tracked_name.push_str(&owned_name);
+    device.register_function(function)?;
+    if super::elm_lifecycle::track_device_function(
+        Arc::clone(device),
+        class_id,
+        tracked_name.into_boxed_str(),
+    )
+    .is_err()
+    {
+        let _ = device.unregister_function(class_id, &owned_name);
+        return Err(PnpError::OutOfMemory);
+    }
+    Ok(())
+}
+
+/// 在真实 PnP 对象上注销一个设备 function。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.unregister_function",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_unregister_function(
+    device: &Arc<PnpDevice>,
+    class_id: crate::dev::function::DeviceClassId,
+    name: &str,
+) -> Result<(), PnpError> {
+    device.unregister_function(class_id, name)
+}
+
+/// 执行真实 PnP 设备的完整热拔流程。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.remove_device",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_remove_device(device: &Arc<PnpDevice>) {
+    device.remove_device();
 }
 
 // ── remove_device：热拔移除流程 ─────────────────────────────────────────
@@ -1645,7 +2552,7 @@ impl PnpDevice {
             inner.deferred_dependency = None;
             inner.state = PnpState::Gone;
         }
-        PNP_DEVICES.remove(&self.id);
+        PNP_DEVICES.remove_exact(self);
         if let Some(parent) = self.parent() {
             parent.detach_child(self);
         }
@@ -1654,5 +2561,20 @@ impl PnpDevice {
 
 // ── 全局单例 ─────────────────────────────────────────────────────────────
 
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PNP_DEVICES",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+        | kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub static PNP_DEVICES: PnpDeviceList = PnpDeviceList::new();
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PNP_DRIVERS",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub static PNP_DRIVERS: PnpDriverRegistry = PnpDriverRegistry::new();

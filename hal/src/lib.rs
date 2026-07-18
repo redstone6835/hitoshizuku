@@ -20,3 +20,15 @@ pub mod sched;
 pub mod time;
 pub mod user;
 pub mod user_context;
+
+/// 强制链接器保留稳定 HAL 直接符号所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    abi::decode_dev_t as usize
+        ^ console::early_write_bytes as usize
+        ^ memory::page_size as usize
+        ^ platform::arch_name as usize
+        ^ time::monotonic_ns as usize
+        ^ user::default_stack_top as usize
+        ^ user_context::set_kernel_trap_stack as usize
+}

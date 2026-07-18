@@ -256,6 +256,18 @@ fn unmap_kernel_heap(vaddr: usize, size: usize) -> bool {
     heap_vm::unmap_kernel_heap_range(vaddr, size).is_ok()
 }
 
+fn protect_kernel_heap(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool {
+    heap_vm::protect_kernel_heap_range(vaddr, size, read, write, execute).is_ok()
+}
+
+fn validate_kernel_heap(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool {
+    heap_vm::validate_kernel_heap_range(vaddr, size, read, write, execute).is_ok()
+}
+
+fn sync_icache() {
+    <crate::riscv64::task::Riscv64TaskOps as general::TaskOps>::sync_icache();
+}
+
 // ── 主入口 ────────────────────────────────────────────────────────────────────
 
 /// 内核架构加载器入口，由 `_start_virtualized` 以 tail-call 方式跳入。
@@ -356,6 +368,9 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 kernel_heap_region: heap_vm::kernel_heap_region,
                 map_kernel_heap_range: map_kernel_heap,
                 unmap_kernel_heap_range: unmap_kernel_heap,
+                protect_kernel_heap_range: protect_kernel_heap,
+                validate_kernel_heap_range: validate_kernel_heap,
+                sync_icache,
                 init_kernel_page_table: heap_vm::init_kernel_page_table,
             }),
         };

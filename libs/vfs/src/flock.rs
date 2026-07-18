@@ -107,23 +107,23 @@ pub fn flock(file: &Arc<File>, exclusive: bool, nonblock: bool) -> Result<(), Er
     let task = sched::current_task();
 
     loop {
-        let should_sleep = {
+        let wait = {
             let mut table = FLOCKS.lock();
             let state = table.entry(key).or_insert_with(LockState::new);
             if state.compatible(owner, wanted) {
                 state.set_owner(owner, wanted);
-                false
+                None
             } else if nonblock {
                 return Err(Errno::EAGAIN);
             } else {
-                state.waiters.prepare_to_wait(&task, TaskState::Sleeping);
-                true
+                let entry = state.waiters.prepare_to_wait(&task, TaskState::Sleeping);
+                Some((Arc::clone(&state.waiters), entry))
             }
         };
 
-        if !should_sleep {
+        let Some((waiters, entry)) = wait else {
             return Ok(());
-        }
+        };
 
         let retry_without_sleep = {
             let table = FLOCKS.lock();
@@ -133,26 +133,16 @@ pub fn flock(file: &Arc<File>, exclusive: bool, nonblock: bool) -> Result<(), Er
                 .unwrap_or(true)
         };
         if retry_without_sleep {
-            finish_wait_for(key, &task);
+            waiters.finish_wait(&entry);
             continue;
         }
         if sched::operation::has_interrupting_signal(&task) {
-            finish_wait_for(key, &task);
+            waiters.finish_wait(&entry);
             return Err(Errno::EINTR);
         }
 
         sched::schedule_once(sched::now_ns_public());
-        finish_wait_for(key, &task);
-    }
-}
-
-fn finish_wait_for(key: LockKey, task: &Arc<sched::Task>) {
-    let waiters = FLOCKS
-        .lock()
-        .get(&key)
-        .map(|state| Arc::clone(&state.waiters));
-    if let Some(waiters) = waiters {
-        waiters.finish_wait(task);
+        waiters.finish_wait(&entry);
     }
 }
 

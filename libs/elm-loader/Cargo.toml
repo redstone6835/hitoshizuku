@@ -1,0 +1,12 @@
+[package]
+name = "elm-loader"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = true
+doctest = true
+bench = false
+
+[dependencies]
+elm = { path = "../elm", default-features = false, features = ["runtime-model"] }

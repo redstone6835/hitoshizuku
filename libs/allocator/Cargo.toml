@@ -15,3 +15,4 @@ ktest-kernel = ["ktest/kernel"]
 log = { path = "../log" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 ktest = { path = "../ktest", optional = true }
+kernel-symbols = { path = "../kernel-symbols" }

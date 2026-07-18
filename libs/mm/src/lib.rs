@@ -28,5 +28,11 @@ pub use file_like::FileLike;
 pub use flags::VmFlags;
 pub use set::{VmAreaMut, VmaSet};
 
+/// 强制链接器保留内存模型直接符号所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    area::VmArea::len as usize ^ set::VmaSet::len as usize
+}
+
 #[cfg(any(test, feature = "ktest-kernel"))]
 mod tests;

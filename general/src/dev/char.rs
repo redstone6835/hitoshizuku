@@ -299,6 +299,7 @@ impl CharDriver for ZeroCharDriver {
     }
 }
 
+#[kernel_symbols::export]
 impl CharDevice {
     #[inline]
     pub fn new<N, D>(fw_name: N, driver: D) -> Self
@@ -310,6 +311,25 @@ impl CharDevice {
             inner: Arc::new(CharDeviceInner {
                 fw_name: fw_name.into(),
                 driver: driver.into_char_driver_arc(),
+                state: AtomicU8::new(CharDeviceState::Active as u8),
+            }),
+        }
+    }
+
+    /// 在常驻内核侧构造字符设备对象，供动态 ELM 传入自身驱动 trait object。
+    #[kernel_symbols::export(
+        name = "general.dev.char.CharDevice.from_arc",
+        contract = "kernel.general.char-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
+    pub fn from_arc(fw_name: Box<str>, driver: Arc<dyn CharDriver>) -> Self {
+        Self {
+            inner: Arc::new(CharDeviceInner {
+                fw_name,
+                driver,
                 state: AtomicU8::new(CharDeviceState::Active as u8),
             }),
         }
