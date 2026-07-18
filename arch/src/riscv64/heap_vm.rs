@@ -1526,7 +1526,7 @@ pub fn protect_kernel_heap_range(
     write: bool,
     execute: bool,
 ) -> Result<(), MapError> {
-    validate_heap_range(vaddr, None, size)?;
+    validate_mapping_range(vaddr, None, size, KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END)?;
     with_kernel_heap_page_table_lock(|| {
         protect_kernel_heap_range_locked(vaddr, size, read, write, execute)
     })
@@ -1539,7 +1539,7 @@ pub fn validate_kernel_heap_range(
     write: bool,
     execute: bool,
 ) -> Result<(), MapError> {
-    validate_heap_range(vaddr, None, size)?;
+    validate_mapping_range(vaddr, None, size, KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END)?;
     with_kernel_heap_page_table_lock(|| {
         let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
         if root_paddr == 0 {

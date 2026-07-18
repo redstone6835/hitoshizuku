@@ -67,8 +67,7 @@ const EARLY_DTB_MAX_SIZE: usize = 2 * 1024 * 1024;
 const EARLY_DTB_LEAF_SIZE: usize = 1 << 30;
 const _: () = assert!(EARLY_DTB_MAX_SIZE <= EARLY_DTB_LEAF_SIZE);
 /// DTB 在 leaf 内的偏移大于该值时，还需要映射下一个 leaf。
-const EARLY_DTB_NEXT_LEAF_THRESHOLD: usize =
-    EARLY_DTB_LEAF_SIZE - EARLY_DTB_MAX_SIZE;
+const EARLY_DTB_NEXT_LEAF_THRESHOLD: usize = EARLY_DTB_LEAF_SIZE - EARLY_DTB_MAX_SIZE;
 
 /// 后续 1GiB RAM 区域（物理地址 0xC000_0000）的 PPN 高位部分。
 const RAM_UPPER_PPN_LUI: usize = 0x30000;
