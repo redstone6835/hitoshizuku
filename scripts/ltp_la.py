@@ -169,6 +169,35 @@ def classify_case(fields: dict[str, str], output: str) -> tuple[str, dict[str, i
         return "timeout", status_counts(output)
 
     counts = status_counts(output)
+    if "ltp_stat" in fields:
+        try:
+            ltp_stat = int(fields["ltp_stat"])
+        except ValueError:
+            ltp_stat = 255
+        if fields.get("termination", "exited") != "exited":
+            counts["broken"] = max(counts["broken"], 1)
+            return "broken", counts
+        if ltp_stat == 0:
+            counts["passed"] = max(counts["passed"], 1)
+            if counts["warnings"]:
+                return "pass-with-warning", counts
+            return "pass", counts
+        if ltp_stat == 32:
+            counts["skipped"] = max(counts["skipped"], 1)
+            return "tconf", counts
+        if ltp_stat < 0 or ltp_stat > 63:
+            return "harness-error", counts
+        if ltp_stat & 2:
+            counts["broken"] = max(counts["broken"], 1)
+            return "broken", counts
+        if ltp_stat & 1:
+            counts["failed"] = max(counts["failed"], 1)
+            return "fail", counts
+        if ltp_stat & 4:
+            counts["warnings"] = max(counts["warnings"], 1)
+            return "warning", counts
+        return "harness-error", counts
+
     try:
         exit_code = int(fields.get("exit", "0"))
     except ValueError:

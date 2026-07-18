@@ -118,96 +118,207 @@ print_artifact() {
     printf '[ltp-artifact] ===== end %s =====\n' "$label"
 }
 
-run_case() {
-    index="$1"
-    tag="$2"
-    command_line="$3"
-    safe_tag="$(printf '%s' "$tag" | tr -c 'A-Za-z0-9_.-' '_')"
-    case_dir="$WORK_ROOT/cases/$(printf '%05d_%s' "$index" "$safe_tag")"
-    case_tmp="$case_dir/tmp"
-    current_name=".mygo-${RUN_ID}-${SCENARIO}-$$"
-    current_file="$LTPROOT/runtest/$current_name"
-    console_log="$case_dir/console.log"
-    result_log="$case_dir/result.log"
-    output_log="$case_dir/output.log"
-    failed_log="$case_dir/failed.log"
-    tconf_log="$case_dir/tconf.log"
+count_pan_results() {
+    result_log="$1"
 
-    skip="$(lookup_skip "$SCENARIO" "$tag" 2>/dev/null || true)"
-    if [ -n "$skip" ]; then
-        category="${skip%%|*}"
-        reason="${skip#*|}"
-        marker case_start "group=$GROUP" "scenario=$SCENARIO" "index=$index" "tag=$tag"
-        marker case_skip "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
-            "tag=$tag" "category=$category" "reason=$reason"
-        marker case_end "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
-            "tag=$tag" "result=skip" "exit=0"
+    [ -r "$result_log" ] || {
+        printf '0\n'
         return 0
-    fi
+    }
+    awk '/^tag=/{ count++ } END { print count + 0 }' "$result_log"
+}
 
-    rm -rf "$case_dir"
-    mkdir -p "$case_tmp" || return 2
-    printf '%s\n' "$command_line" >"$current_file" || return 2
+split_pan_output() {
+    output_log="$1"
+    shard_dir="$2"
 
-    marker case_start "group=$GROUP" "scenario=$SCENARIO" "index=$index" "tag=$tag"
-    printf '[ltp] command: %s\n' "$command_line"
+    [ -r "$output_log" ] || return 0
+    awk -v output_dir="$shard_dir" '
+        /^<<<test_start>>>$/ {
+            sequence++
+            output = sprintf("%s/output.%05d.log", output_dir, sequence)
+        }
+        output != "" { print >> output }
+        /^<<<test_end>>>$/ {
+            close(output)
+            output = ""
+        }
+    ' "$output_log"
+}
 
-    setsid "$LTPROOT/runltp" \
-        -f "$current_name" \
-        -d "$case_tmp" \
-        -b "$TEST_DEV" -B ext2 \
-        -z "$BIG_DEV" -Z ext2 \
-        -l "$result_log" \
-        -o "$output_log" \
-        -C "$failed_log" \
-        -T "$tconf_log" \
-        -q -Q >"$console_log" 2>&1 &
+emit_pan_results() {
+    run_map="$1"
+    result_log="$2"
+    shard_dir="$3"
+    parsed_results="$shard_dir/parsed-results.tsv"
+
+    awk '
+        FNR == NR {
+            fields = split($0, map, "\t")
+            if (fields >= 2) {
+                map_index[++map_count] = map[1]
+                map_tag[map_count] = map[2]
+            }
+            next
+        }
+        /^tag=/ {
+            sequence++
+            reported = ""
+            status = "255"
+            termination = "unknown"
+            duration = "0"
+            fields = split($0, result, /[[:space:]]+/)
+            for (field = 1; field <= fields; field++) {
+                split(result[field], pair, "=")
+                if (pair[1] == "tag")
+                    reported = pair[2]
+                else if (pair[1] == "stat")
+                    status = pair[2]
+                else if (pair[1] == "exit")
+                    termination = pair[2]
+                else if (pair[1] == "dur")
+                    duration = pair[2]
+            }
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", \
+                map_index[sequence], map_tag[sequence], reported, status, termination, duration
+        }
+    ' "$run_map" "$result_log" >"$parsed_results"
+
+    EMITTED_RESULTS=0
+    while IFS='	' read -r index expected_tag reported_tag status termination duration || \
+        [ -n "$index" ]; do
+        [ -n "$index" ] || continue
+        if [ "$expected_tag" != "$reported_tag" ]; then
+            marker fatal "reason=ltp-pan-tag-order-mismatch" "index=$index" \
+                "expected=$expected_tag" "reported=$reported_tag"
+            return 2
+        fi
+        EMITTED_RESULTS=$((EMITTED_RESULTS + 1))
+        case_output="$shard_dir/$(printf 'output.%05d.log' "$EMITTED_RESULTS")"
+        marker case_start "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
+            "tag=$expected_tag"
+        print_artifact output "$case_output"
+        marker case_end "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
+            "tag=$expected_tag" "result=run" "exit=$status" "ltp_stat=$status" \
+            "termination=$termination" "elapsed=$duration"
+    done <"$parsed_results"
+    return 0
+}
+
+stop_pan() {
+    child="$1"
+
+    kill -TERM "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
+    grace=0
+    while kill -0 "$child" 2>/dev/null && [ "$grace" -lt "$KILL_GRACE" ]; do
+        sleep 1
+        grace=$((grace + 1))
+    done
+    kill -KILL "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+}
+
+run_pan_shard() {
+    pan_file="$1"
+    run_map="$2"
+    run_count="$3"
+    shard_dir="$WORK_ROOT/shard-$(printf '%05d' "$START")"
+    shard_tmp="$shard_dir/tmp"
+    console_log="$shard_dir/console.log"
+    result_log="$shard_dir/result.log"
+    output_log="$shard_dir/output.log"
+    failed_log="$shard_dir/failed.log"
+    tconf_log="$shard_dir/tconf.log"
+    zoo_file="$shard_dir/zoo"
+
+    rm -rf "$shard_dir"
+    mkdir -p "$shard_tmp" || return 2
+    chmod 1777 "$shard_tmp" 2>/dev/null || true
+    marker batch_start "group=$GROUP" "scenario=$SCENARIO" "start=$START" \
+        "count=$run_count"
+
+    (
+        cd "$LTPROOT/testcases/bin" || exit 2
+        export TMPBASE="$shard_tmp"
+        export TMPDIR="$shard_tmp"
+        exec setsid "$LTPROOT/bin/ltp-pan" \
+            -Q -e -S \
+            -a "$zoo_file" -n "$RUN_ID-$SCENARIO-$START" \
+            -f "$pan_file" \
+            -l "$result_log" \
+            -o "$output_log" \
+            -C "$failed_log" \
+            -T "$tconf_log"
+    ) >"$console_log" 2>&1 &
     child=$!
     elapsed=0
+    idle=0
+    completed=0
     timed_out=0
 
     while kill -0 "$child" 2>/dev/null; do
-        if [ "$elapsed" -ge "$CASE_TIMEOUT" ]; then
+        sleep 1
+        elapsed=$((elapsed + 1))
+        current="$(count_pan_results "$result_log")"
+        if [ "$current" -gt "$completed" ] 2>/dev/null; then
+            completed="$current"
+            idle=0
+            marker batch_progress "group=$GROUP" "scenario=$SCENARIO" \
+                "completed=$completed" "total=$run_count"
+        else
+            idle=$((idle + 1))
+        fi
+        if [ "$idle" -ge "$CASE_TIMEOUT" ]; then
             timed_out=1
             break
         fi
-        sleep 1
-        elapsed=$((elapsed + 1))
     done
 
     if [ "$timed_out" -eq 1 ]; then
-        kill -TERM "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
-        grace=0
-        while kill -0 "$child" 2>/dev/null && [ "$grace" -lt "$KILL_GRACE" ]; do
-            sleep 1
-            grace=$((grace + 1))
-        done
-        kill -KILL "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null || true
-        wait "$child" 2>/dev/null || true
-        ret=124
+        stop_pan "$child"
+        pan_ret=124
     else
         wait "$child"
-        ret=$?
+        pan_ret=$?
         kill -KILL "-$child" 2>/dev/null || true
     fi
+    completed="$(count_pan_results "$result_log")"
+    split_pan_output "$output_log" "$shard_dir"
+    if ! emit_pan_results "$run_map" "$result_log" "$shard_dir"; then
+        shutdown_runner 2
+    fi
 
-    rm -f "$current_file"
     print_artifact console "$console_log"
-    print_artifact output "$output_log"
     print_artifact result "$result_log"
     print_artifact failed "$failed_log"
     print_artifact tconf "$tconf_log"
 
     if [ "$timed_out" -eq 1 ]; then
-        marker case_end "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
-            "tag=$tag" "result=timeout" "exit=$ret" "elapsed=$elapsed"
-        marker shard_abort "group=$GROUP" "scenario=$SCENARIO" "next=$((index + 1))" \
-            "reason=case-timeout"
+        missing_number=$((completed + 1))
+        missing="$(sed -n "${missing_number}p" "$run_map")"
+        missing_index="${missing%%	*}"
+        missing_tag="${missing#*	}"
+        if [ -z "$missing" ]; then
+            marker fatal "reason=timeout-without-current-case" "completed=$completed" \
+                "total=$run_count"
+            shutdown_runner 2
+        fi
+        marker case_start "group=$GROUP" "scenario=$SCENARIO" "index=$missing_index" \
+            "tag=$missing_tag"
+        marker case_end "group=$GROUP" "scenario=$SCENARIO" "index=$missing_index" \
+            "tag=$missing_tag" "result=timeout" "exit=$pan_ret" "elapsed=$CASE_TIMEOUT"
+        marker shard_abort "group=$GROUP" "scenario=$SCENARIO" \
+            "next=$((missing_index + 1))" "reason=case-timeout"
         shutdown_runner 124
     fi
 
-    marker case_end "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
-        "tag=$tag" "result=run" "exit=$ret" "elapsed=$elapsed"
+    if [ "$EMITTED_RESULTS" -ne "$run_count" ]; then
+        marker fatal "reason=ltp-pan-result-count-mismatch" "expected=$run_count" \
+            "actual=$EMITTED_RESULTS" "exit=$pan_ret"
+        shutdown_runner 2
+    fi
+    marker batch_end "group=$GROUP" "scenario=$SCENARIO" "completed=$completed" \
+        "exit=$pan_ret" "elapsed=$elapsed"
     return 0
 }
 
@@ -290,16 +401,38 @@ awk -v start="$START" -v count="$COUNT" -v only="$ONLY" '
 ' "$RUNT_FILE" >"$SELECTED_FILE"
 
 selected=0
+run_selected=0
 last_next="$START"
+PAN_FILE="$WORK_ROOT/pan.runtest"
+RUN_MAP="$WORK_ROOT/run-map.tsv"
+: >"$PAN_FILE"
+: >"$RUN_MAP"
 while IFS= read -r record || [ -n "$record" ]; do
     index="${record%%	*}"
     line="${record#*	}"
     tag="${line%%[ 	]*}"
-    run_case "$index" "$tag" "$line"
+    skip="$(lookup_skip "$SCENARIO" "$tag" 2>/dev/null || true)"
+    if [ -n "$skip" ]; then
+        category="${skip%%|*}"
+        reason="${skip#*|}"
+        marker case_start "group=$GROUP" "scenario=$SCENARIO" "index=$index" "tag=$tag"
+        marker case_skip "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
+            "tag=$tag" "category=$category" "reason=$reason"
+        marker case_end "group=$GROUP" "scenario=$SCENARIO" "index=$index" \
+            "tag=$tag" "result=skip" "exit=0"
+    else
+        printf '%s\n' "$line" >>"$PAN_FILE"
+        printf '%s\t%s\n' "$index" "$tag" >>"$RUN_MAP"
+        run_selected=$((run_selected + 1))
+    fi
     selected=$((selected + 1))
     last_next=$((index + 1))
 done <"$SELECTED_FILE"
-rm -f "$SELECTED_FILE"
+
+if [ "$run_selected" -gt 0 ]; then
+    run_pan_shard "$PAN_FILE" "$RUN_MAP" "$run_selected"
+fi
+rm -f "$SELECTED_FILE" "$PAN_FILE" "$RUN_MAP"
 
 marker shard_end "run_id=$RUN_ID" "group=$GROUP" "scenario=$SCENARIO" \
     "selected=$selected" "next=$last_next"

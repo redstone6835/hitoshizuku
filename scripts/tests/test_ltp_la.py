@@ -99,6 +99,22 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertEqual(classification, "harness-error")
 
+    def test_ltp_pan_status_is_authoritative(self) -> None:
+        classification, counts = classify_case(
+            {"result": "run", "exit": "32", "ltp_stat": "32", "termination": "exited"},
+            "no textual status was emitted\n",
+        )
+        self.assertEqual(classification, "tconf")
+        self.assertEqual(counts["skipped"], 1)
+
+    def test_signaled_ltp_pan_child_is_broken(self) -> None:
+        classification, counts = classify_case(
+            {"result": "run", "exit": "11", "ltp_stat": "11", "termination": "signaled"},
+            "",
+        )
+        self.assertEqual(classification, "broken")
+        self.assertEqual(counts["broken"], 1)
+
 
 class ResumeTests(unittest.TestCase):
     """验证断点查找和结果去重。"""
