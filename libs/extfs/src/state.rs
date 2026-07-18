@@ -1178,6 +1178,7 @@ pub struct ExtFsDriver {
     backend: Spinlock<Option<Arc<dyn BlockBackend>>>,
 }
 
+#[kernel_symbols::export]
 impl ExtFsDriver {
     pub const fn new() -> Self {
         Self {
@@ -1185,6 +1186,14 @@ impl ExtFsDriver {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "extfs.ExtFsDriver.bind_backend",
+        contract = "kernel.filesystem.ext-driver@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::FILESYSTEM_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 1
+    )]
     pub fn bind_backend(&self, backend: Arc<dyn BlockBackend>) {
         *self.backend.lock() = Some(backend);
     }

@@ -25,10 +25,9 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::dev::block::BlockDevice;
+use crate::dev::block::{BlockAttributes, BlockFeatures, BlockGeometry, BlockIoStatsSnapshot};
 use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::DeviceFunction;
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
 use crate::vfs::device_files::projection::{
@@ -69,6 +68,8 @@ const KERNEL_PROFILE_STATS_INO: u64 = 26;
 const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
 #[cfg(feature = "performance-profile")]
 const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
+const KERNEL_ELM_DIR_INO: u64 = 80;
+const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -80,12 +81,19 @@ const CPU_TOPOLOGY_SLOTS: u64 = 8;
 
 static SYSFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SYSFS_INO_REGISTRY: Spinlock<Option<SysfsInoRegistry>> = Spinlock::new(None);
+static ELM_SYSFS_RENDERER: Spinlock<Option<ElmSysfsRenderer>> = Spinlock::new(None);
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
 const SYSFS_BLOCK_CLASS: &str = "block";
 const SYSFS_CHAR_CLASS: &str = "char";
 const SYSFS_NET_CLASS: &str = NET_CLASS.as_str();
+
+pub type ElmSysfsRenderer = fn(&str) -> String;
+
+pub fn register_elm_renderer(renderer: ElmSysfsRenderer) {
+    *ELM_SYSFS_RENDERER.lock() = Some(renderer);
+}
 
 /// sysfs 用户视图默认策略。
 ///
@@ -353,7 +361,10 @@ struct BlockDevSnapshot {
     /// /sys/block/ 与 /sys/dev/block/ 下的目录名 = `dev.name()`（如 "vd0"）。
     sysfs_name: String,
     rdev: DevId,
-    dev: Arc<BlockDevice>,
+    geometry: BlockGeometry,
+    features: BlockFeatures,
+    attributes: BlockAttributes,
+    io_stats: BlockIoStatsSnapshot,
     class_name: &'static str,
 }
 
@@ -386,15 +397,21 @@ struct SysPnpDeviceSnapshot {
     sysfs_name: String,
     /// PnP core 内部登记名，保留原始固件/总线语义用于展示。
     name: String,
-    bus_type: &'static str,
+    bus_type: String,
     id: PnpId,
     state: &'static str,
-    driver: Option<&'static str>,
+    driver: Option<String>,
     parent: Option<String>,
     child_count: usize,
-    functions: Vec<Arc<dyn DeviceFunction>>,
+    functions: Vec<SysPnpFunctionSnapshot>,
     resources: Vec<PnpOwnedResourceSnapshot>,
     deferred_dependency: Option<PnpDependency>,
+}
+
+#[derive(Clone)]
+struct SysPnpFunctionSnapshot {
+    class_name: String,
+    dev_name: String,
 }
 
 #[derive(Clone)]
@@ -485,7 +502,7 @@ fn push_sysfs_dir_entry(out: &mut Vec<DirEntry>, ino: u64, name: &str, kind: Fil
 struct SysSnapshot {
     devices: Vec<SysDeviceSnapshot>,
     pnp_devices: Vec<SysPnpDeviceSnapshot>,
-    pnp_buses: Vec<&'static str>,
+    pnp_buses: Vec<String>,
     virtual_devices: Vec<SysVirtualDeviceSnapshot>,
     virtual_classes: Vec<&'static str>,
     classes: Vec<SysClassSnapshot>,
@@ -633,7 +650,7 @@ impl SysSnapshot {
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
         for dev in PNP_DEVICES.try_list().unwrap_or_default() {
-            let bus_type = dev.info.bus_type().as_str();
+            let bus_type = dev.info.bus_name().to_string();
             let mut sysfs_name = sysfs_component_name(&dev.name);
             if snap
                 .pnp_devices
@@ -651,7 +668,15 @@ impl SysSnapshot {
                 sysfs_name = sysfs_component_name(&format!("{}-{}-{suffix}", dev.name, dev.id));
                 suffix = suffix.saturating_add(1);
             }
-            let functions = dev.try_functions().unwrap_or_default();
+            let functions = dev
+                .try_functions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|function| SysPnpFunctionSnapshot {
+                    class_name: function.class_name().to_string(),
+                    dev_name: function.dev_name().to_string(),
+                })
+                .collect();
             let resources = dev.try_owned_resources().unwrap_or_default();
             let parent = dev.parent().map(|parent| parent.name.to_string());
             let child_count = dev
@@ -661,7 +686,7 @@ impl SysSnapshot {
             snap.pnp_devices.push(SysPnpDeviceSnapshot {
                 sysfs_name,
                 name: dev.name.to_string(),
-                bus_type,
+                bus_type: bus_type.clone(),
                 id: dev.id.clone(),
                 state: pnp_state_name(dev.state()),
                 driver: dev.bound_driver_name(),
@@ -680,14 +705,17 @@ impl SysSnapshot {
         // projection 层已经确认发布的 devtmpfs+device_numbers 联合快照，sysfs
         // 不再重复解释 `/dev` 节点和设备号表的关联规则。
         for projection in published_block_devnodes(&DEVICES.functions) {
-            let dev = Arc::clone(projection.dev());
+            let dev = projection.dev();
             let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), projection.rdev(), |name| {
                 snap.blocks.iter().any(|block| block.sysfs_name == name)
             });
             snap.blocks.push(BlockDevSnapshot {
                 sysfs_name,
                 rdev: projection.rdev(),
-                dev,
+                geometry: *dev.geometry(),
+                features: dev.features(),
+                attributes: dev.attributes(),
+                io_stats: dev.io_stats(),
                 class_name: projection.class_id().as_str(),
             });
         }
@@ -1490,18 +1518,127 @@ enum SysRegFile {
     ProfileControl,
     #[cfg(feature = "performance-profile")]
     ProfileSamples,
+    Elm {
+        slot: ElmSysfsSlot,
+    },
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
     },
 }
 
+#[derive(Clone, Copy)]
+enum ElmSysfsSlot {
+    Core,
+    Policy,
+    Health,
+    Menu,
+    Topology,
+    Ports,
+    Providers,
+    Bindings,
+    Events,
+    Audit,
+    Api,
+    Trust,
+    ProjectionSources,
+    Journal,
+    Executions,
+    OwnedResources,
+    ResourceAccounting,
+    Workers,
+    Diagnostics,
+}
+
+impl ElmSysfsSlot {
+    const ALL: &'static [Self] = &[
+        Self::Core,
+        Self::Policy,
+        Self::Health,
+        Self::Menu,
+        Self::Topology,
+        Self::Ports,
+        Self::Providers,
+        Self::Bindings,
+        Self::Events,
+        Self::Audit,
+        Self::Api,
+        Self::Trust,
+        Self::ProjectionSources,
+        Self::Journal,
+        Self::Executions,
+        Self::OwnedResources,
+        Self::ResourceAccounting,
+        Self::Workers,
+        Self::Diagnostics,
+    ];
+
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::Core => 0,
+            Self::Policy => 1,
+            Self::Health => 2,
+            Self::Menu => 3,
+            Self::Topology => 4,
+            Self::Ports => 5,
+            Self::Providers => 6,
+            Self::Bindings => 7,
+            Self::Events => 8,
+            Self::Audit => 9,
+            Self::Api => 10,
+            Self::Trust => 11,
+            Self::ProjectionSources => 12,
+            Self::Journal => 13,
+            Self::Executions => 14,
+            Self::OwnedResources => 15,
+            Self::ResourceAccounting => 16,
+            Self::Workers => 18,
+            Self::Diagnostics => 17,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Policy => "policy",
+            Self::Health => "health",
+            Self::Menu => "menu",
+            Self::Topology => "topology",
+            Self::Ports => "ports",
+            Self::Providers => "providers",
+            Self::Bindings => "bindings",
+            Self::Events => "events",
+            Self::Audit => "audit",
+            Self::Api => "api",
+            Self::Trust => "trust",
+            Self::ProjectionSources => "projection-sources",
+            Self::Journal => "journal",
+            Self::Executions => "executions",
+            Self::OwnedResources => "owned-resources",
+            Self::ResourceAccounting => "resource-accounting",
+            Self::Workers => "workers",
+            Self::Diagnostics => "diagnostics",
+        }
+    }
+}
+
+fn elm_sysfs_slot_by_name(name: &str) -> Option<ElmSysfsSlot> {
+    ElmSysfsSlot::ALL
+        .iter()
+        .find(|slot| slot.file_name() == name)
+        .copied()
+}
+
+fn kernel_elm_slot_ino(slot: ElmSysfsSlot) -> u64 {
+    KERNEL_ELM_FILE_BASE_INO + slot.to_u64()
+}
+
 // ─── 内容渲染 ────────────────────────────────────────────────
 
 fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> String {
-    let dev = &snap.blocks[idx].dev;
-    let geom = dev.geometry();
-    let features = dev.features();
+    let dev = &snap.blocks[idx];
+    let geom = &dev.geometry;
+    let features = dev.features;
     match slot {
         BlockDevSlot::Size => {
             let sectors = geom
@@ -1518,7 +1655,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             }
         }
         BlockDevSlot::Removable => {
-            if dev.attributes().removable() {
+            if dev.attributes.removable() {
                 "1\n".into()
             } else {
                 "0\n".into()
@@ -1528,7 +1665,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
-            let stats = dev.io_stats();
+            let stats = dev.io_stats;
             // 这里输出通用块层维护的兼容 diskstats 字段。合并计数和队列总耗时
             // 当前没有独立数据源，保持为 0；完成数、扇区数、inflight 和操作耗时
             // 均来自 BlockDevice 的 BIO 统计。
@@ -1549,7 +1686,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             )
         }
         BlockDevSlot::Inflight => {
-            let stats = dev.io_stats();
+            let stats = dev.io_stats;
             format!("{} {}\n", stats.read_inflight, stats.write_inflight)
         }
         BlockDevSlot::Periodic => String::new(),
@@ -1558,14 +1695,14 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
 }
 
 fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot) -> String {
-    let dev = &snap.blocks[idx].dev;
-    let geom = dev.geometry();
-    let features = dev.features();
+    let dev = &snap.blocks[idx];
+    let geom = &dev.geometry;
+    let features = dev.features;
     match slot {
         BlockQueueSlot::Lbs => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::Pbs => format!("{}\n", geom.physical_block_size().get()),
         BlockQueueSlot::Rotational => {
-            if dev.attributes().rotational() {
+            if dev.attributes.rotational() {
                 "1\n".into()
             } else {
                 "0\n".into()
@@ -1574,7 +1711,7 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
         BlockQueueSlot::NrRequests => {
             // 没有真实队列深度的设备使用 sysfs 用户视图默认值；VirtIO 等驱动会填实际协商值。
             let depth = dev
-                .attributes()
+                .attributes
                 .queue_depth()
                 .map(|n| n.get())
                 .unwrap_or(SYSFS_USER_VIEW_POLICY.block_nr_requests);
@@ -1629,6 +1766,7 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
         PnpDeviceSlot::State => format!("{}\n", dev.state),
         PnpDeviceSlot::Driver => dev
             .driver
+            .as_deref()
             .map(|name| format!("{name}\n"))
             .unwrap_or_default(),
         PnpDeviceSlot::Parent => dev
@@ -1642,7 +1780,7 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
             for function in &dev.functions {
                 let _ = core::fmt::Write::write_fmt(
                     &mut out,
-                    format_args!("{}:{}\n", function.class_id().as_str(), function.dev_name()),
+                    format_args!("{}:{}\n", function.class_name, function.dev_name),
                 );
             }
             out
@@ -2014,6 +2152,13 @@ fn render_profile_control() -> String {
     )
 }
 
+fn render_elm_sysfs_file(name: &str) -> String {
+    match *ELM_SYSFS_RENDERER.lock() {
+        Some(renderer) => renderer(name),
+        None => "status=unavailable\n".into(),
+    }
+}
+
 fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
     match kind {
         SysRegFile::BlockDev { idx, slot } => render_block_dev_file(snap, idx, slot),
@@ -2047,6 +2192,7 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::ProfileControl => render_profile_control(),
         #[cfg(feature = "performance-profile")]
         SysRegFile::ProfileSamples => render_profile_samples(),
+        SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
@@ -2334,10 +2480,10 @@ enum SysDirKind {
     },
     DevicesPnp,
     DevicesPnpBus {
-        bus: &'static str,
+        bus: String,
     },
     PnpDevice {
-        bus: &'static str,
+        bus: String,
         name: String,
     },
     Dev,
@@ -2347,14 +2493,15 @@ enum SysDirKind {
         rdev: DevId,
     },
     Kernel,
+    KernelElm,
     Fs,
     FsCgroup,
     Bus,
     BusClass {
-        bus: &'static str,
+        bus: String,
     },
     BusClassDevices {
-        bus: &'static str,
+        bus: String,
     },
     Class,
     ClassDir {
@@ -2645,9 +2792,9 @@ impl SysDirInodeOps {
                     .position(|bus| *bus == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
-                    pnp_bus_ino(snap.pnp_buses[bus_idx]),
+                    pnp_bus_ino(&snap.pnp_buses[bus_idx]),
                     SysDirKind::DevicesPnpBus {
-                        bus: snap.pnp_buses[bus_idx],
+                        bus: snap.pnp_buses[bus_idx].clone(),
                     },
                 ))
             }
@@ -2660,7 +2807,7 @@ impl SysDirInodeOps {
                     return Err(VfsError::NotFound);
                 }
                 Ok(mk_dir(
-                    pnp_device_ino(bus, name),
+                    pnp_device_ino(&bus, name),
                     SysDirKind::PnpDevice {
                         bus,
                         name: name.to_string(),
@@ -2678,7 +2825,7 @@ impl SysDirInodeOps {
                     .ok_or(VfsError::NotFound)?;
                 let slot = pnp_device_slot_by_name(name).ok_or(VfsError::NotFound)?;
                 mk_reg(
-                    pnp_device_slot_ino(bus, &dev_name, slot.to_u64()),
+                    pnp_device_slot_ino(&bus, &dev_name, slot.to_u64()),
                     SysRegFile::PnpDevice { idx, slot },
                 )
             }
@@ -2747,8 +2894,13 @@ impl SysDirInodeOps {
                 "profile_control" => mk_reg(KERNEL_PROFILE_CONTROL_INO, SysRegFile::ProfileControl),
                 #[cfg(feature = "performance-profile")]
                 "profile_samples" => mk_reg(KERNEL_PROFILE_SAMPLES_INO, SysRegFile::ProfileSamples),
+                "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
+            SysDirKind::KernelElm => {
+                let slot = elm_sysfs_slot_by_name(name).ok_or(VfsError::NotFound)?;
+                mk_reg(kernel_elm_slot_ino(slot), SysRegFile::Elm { slot })
+            }
             SysDirKind::Fs => match name {
                 // 当前内核尚未提供 cgroup controller registry；这里暴露稳定的空根目录，
                 // 等 controller 子系统接入后再由 registry 驱动目录内容。
@@ -2819,15 +2971,15 @@ impl SysDirInodeOps {
                     .position(|bus| *bus == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
-                    bus_class_ino(snap.pnp_buses[bus_idx]),
+                    bus_class_ino(&snap.pnp_buses[bus_idx]),
                     SysDirKind::BusClass {
-                        bus: snap.pnp_buses[bus_idx],
+                        bus: snap.pnp_buses[bus_idx].clone(),
                     },
                 ))
             }
             SysDirKind::BusClass { bus } => match name {
                 "devices" => Ok(mk_dir(
-                    bus_class_devices_ino(bus),
+                    bus_class_devices_ino(&bus),
                     SysDirKind::BusClassDevices { bus },
                 )),
                 _ => Err(VfsError::NotFound),
@@ -2842,7 +2994,7 @@ impl SysDirInodeOps {
                     .position(|dev| dev.bus_type == bus && dev.sysfs_name == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_link(
-                    bus_class_device_link_ino(bus, name),
+                    bus_class_device_link_ino(&bus, name),
                     format!(
                         "../../../devices/pnp/{}/{}",
                         bus, snap.pnp_devices[idx].sysfs_name
@@ -3226,7 +3378,7 @@ impl SysDirInodeOps {
                 for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        pnp_device_ino(dev.bus_type, &dev.sysfs_name),
+                        pnp_device_ino(&dev.bus_type, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Directory,
                     ) {
@@ -3247,7 +3399,7 @@ impl SysDirInodeOps {
                 for slot in PnpDeviceSlot::ALL {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        pnp_device_slot_ino(bus, &name, slot.to_u64()),
+                        pnp_device_slot_ino(&bus, &name, slot.to_u64()),
                         slot.file_name(),
                         FileType::Regular,
                     ) {
@@ -3343,7 +3495,22 @@ impl SysDirInodeOps {
                     "profile_samples",
                     FileType::Regular,
                 ),
+                mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),
             ],
+            SysDirKind::KernelElm => {
+                let mut entries = Vec::new();
+                for slot in ElmSysfsSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        kernel_elm_slot_ino(*slot),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
             SysDirKind::Class => {
@@ -3437,7 +3604,7 @@ impl SysDirInodeOps {
                     return Vec::new();
                 };
                 vec![mk_dir_entry(
-                    bus_class_devices_ino(bus),
+                    bus_class_devices_ino(&bus),
                     "devices",
                     FileType::Directory,
                 )]
@@ -3450,7 +3617,7 @@ impl SysDirInodeOps {
                 for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        bus_class_device_link_ino(bus, &dev.sysfs_name),
+                        bus_class_device_link_ino(&bus, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Symlink,
                     ) {

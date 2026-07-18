@@ -1,0 +1,15 @@
+acpi libs/acpi
+allocator libs/allocator
+efi libs/efi
+elf libs/elf
+errno libs/errno
+extfs libs/extfs
+fatfs libs/fatfs
+general general
+hal hal
+log libs/log
+mm libs/mm
+net libs/net
+sched libs/sched
+socket libs/socket
+vfs libs/vfs

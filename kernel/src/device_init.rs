@@ -5,21 +5,202 @@
 //! 集中在这里，可以避免两个启动路径各自复制顺序并留下不一致的边界条件。
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 
-use general::dev::drivers;
+use general::dev::char::CharDevice;
+use general::dev::enumerate::DEVICES;
 use general::dev::pnp::{DevInitContext, set_dev_init_context};
+use general::vfs::device_files::projection::find_char_device_by_fw_name;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
+use general::vfs::error::VfsError;
+use general::vfs::fdtable::FdTable;
 use general::vfs::mount::{Mount, MountFlags};
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
 use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_standard_shm_tmpfs};
-use log::printk;
+use log::{LogRecord, LogSink, printk};
+use sched::sync::Spinlock;
+use sched::{TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, Task};
 
 const SYSFS_DIR_PATH: &str = "/sys";
 const SYSFS_DIR_MODE: FileMode = FileMode::new(0o555);
 const SYSFS_FS_TYPE: &str = "sysfs";
+
+/// 启动控制台的稳定选择方式。
+pub enum BootConsoleSelector {
+    /// 用户通过命令行指定的 devtmpfs 名称或绝对路径。
+    DeviceName(String),
+    /// 固件 stdout/SPCR 指向的设备固件名称。
+    FirmwareName(String),
+}
+
+impl BootConsoleSelector {
+    fn description(&self) -> &str {
+        match self {
+            Self::DeviceName(name) | Self::FirmwareName(name) => name,
+        }
+    }
+}
+
+struct DeferredBootConsole {
+    tag: &'static str,
+    dev_sb: Arc<Superblock>,
+    selector: BootConsoleSelector,
+}
+
+static DEFERRED_BOOT_CONSOLE: Spinlock<Option<DeferredBootConsole>> = Spinlock::new(None);
+
+static CONSOLE_LOG_SINK: LogSink = LogSink {
+    write_record: write_log_record_to_console,
+};
+
+/// 解析并绑定启动控制台；驱动尚未装载时保存请求，供 BuildBound ELM 装载后重试。
+pub fn bind_or_defer_boot_console(
+    tag: &'static str,
+    vfs_ctx: &VfsContext,
+    dev_sb: Arc<Superblock>,
+    selector: BootConsoleSelector,
+) -> bool {
+    let dev_ops = devtmpfs_ops(&dev_sb, tag);
+    let Some(device) = resolve_boot_console(vfs_ctx, dev_ops, &selector) else {
+        printk!(
+            "[kernel-start][{}] console {} deferred until managed drivers are loaded",
+            tag,
+            selector.description()
+        );
+        *DEFERRED_BOOT_CONSOLE.lock() = Some(DeferredBootConsole {
+            tag,
+            dev_sb,
+            selector,
+        });
+        return false;
+    };
+    activate_console(tag, dev_ops, device, true)
+}
+
+/// 在 BuildBound 设备 ELM 装载完成后重试尚未解析的启动控制台。
+pub fn retry_deferred_boot_console(init: &Arc<Task>) -> bool {
+    let Some(request) = DEFERRED_BOOT_CONSOLE.lock().take() else {
+        return false;
+    };
+    let Some(vfs_ctx) = task_vfs_context(init) else {
+        log::error!(
+            "[kernel-start][{}] deferred console lacks init VFS context",
+            request.tag
+        );
+        *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
+        return false;
+    };
+    let Some(fdtable) = task_fdtable(init) else {
+        log::error!(
+            "[kernel-start][{}] deferred console lacks init fdtable",
+            request.tag
+        );
+        *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
+        return false;
+    };
+    let dev_ops = devtmpfs_ops(&request.dev_sb, request.tag);
+    let Some(device) = resolve_boot_console(&vfs_ctx, dev_ops, &request.selector) else {
+        log::error!(
+            "[kernel-start][{}] deferred console {} is still unavailable",
+            request.tag,
+            request.selector.description()
+        );
+        *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
+        return false;
+    };
+    if !activate_console(request.tag, dev_ops, device, false) {
+        *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
+        return false;
+    }
+    crate::stdio::install_stdio(&vfs_ctx, &fdtable, "/dev/console");
+    true
+}
+
+fn resolve_boot_console(
+    vfs_ctx: &VfsContext,
+    dev_ops: &DevTmpfsSuperblockOps,
+    selector: &BootConsoleSelector,
+) -> Option<CharDevice> {
+    match selector {
+        BootConsoleSelector::FirmwareName(name) => {
+            find_char_device_by_fw_name(&DEVICES.functions, name)
+        }
+        BootConsoleSelector::DeviceName(name) => {
+            if let Some(dev_name) = name.strip_prefix("/dev/")
+                && let Some(device) = dev_ops.char_dev(dev_name)
+            {
+                return Some(device);
+            }
+            if !name.starts_with('/')
+                && let Some(device) = dev_ops.char_dev(name)
+            {
+                return Some(device);
+            }
+            if name.starts_with('/') {
+                return path::lookup(vfs_ctx, &Dirfd::Cwd, name, LookupFlags::default())
+                    .ok()
+                    .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root.root()))
+                    .and_then(|resolved| {
+                        resolved
+                            .strip_prefix("/dev/")
+                            .and_then(|dev_name| dev_ops.char_dev(dev_name))
+                    });
+            }
+            find_char_device_by_fw_name(&DEVICES.functions, name)
+        }
+    }
+}
+
+fn activate_console(
+    tag: &str,
+    dev_ops: &DevTmpfsSuperblockOps,
+    device: CharDevice,
+    stash_for_boot_init: bool,
+) -> bool {
+    match dev_ops.bind_char("console", device.clone()) {
+        Ok(()) => printk!(
+            "[kernel-start][{}] bound /dev/console -> {}",
+            tag,
+            device.fw_name()
+        ),
+        Err(VfsError::AlreadyExists) => {
+            printk!(
+                "[kernel-start][{}] /dev/console already exists; using it for stdio",
+                tag
+            );
+        }
+        Err(error) => {
+            printk!(
+                "[kernel-start][{}] failed to bind /dev/console: {:?}",
+                tag,
+                error
+            );
+            return false;
+        }
+    }
+    general::console::register_console(device);
+    log::bind_log_sink(&CONSOLE_LOG_SINK);
+    if stash_for_boot_init {
+        crate::sched::stash_boot_console_name(String::from("/dev/console"));
+    }
+    true
+}
+
+fn task_vfs_context(task: &Arc<Task>) -> Option<Arc<VfsContext>> {
+    Arc::downcast::<VfsContext>(task.ext_lookup(TASKEXT_VFS_CONTEXT)?).ok()
+}
+
+fn task_fdtable(task: &Arc<Task>) -> Option<Arc<FdTable>> {
+    Arc::downcast::<FdTable>(task.ext_lookup(TASKEXT_VFS_FDTABLE)?).ok()
+}
+
+fn write_log_record_to_console(record: &LogRecord<'_>) {
+    let line = crate::start::format_log_record_line(record);
+    general::console::console_write(line.as_bytes());
+}
 
 /// 注册启动期核心文件系统驱动。
 ///
@@ -193,7 +374,6 @@ pub fn mount_devtmpfs_on_dev(tag: &str, ctx: &VfsContext, dev_sb: Arc<Superblock
 /// `/dev/shm` 和 `/sys` 不是底层设备身份的一部分，但它们依赖启动期设备文件系统
 /// 先就绪。集中到这里可以让 DTB/ACPI 等固件入口共享同一套顺序和幂等规则。
 pub fn mount_standard_user_api_filesystems(tag: &str, ctx: &VfsContext) {
-    general::vfs::user_api::net_socket::install_net_socket_ioctl_adapter();
     mount_standard_shm_tmpfs(ctx).unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to mount tmpfs on /dev/shm: {:?}",
@@ -277,9 +457,28 @@ pub fn activate_device_subsystem(
         tag
     );
 
-    drivers::initialize_for_kernel(bootloader_seed);
+    if let Some(seed) = bootloader_seed {
+        general::dev::random::add_bootloader_randomness(seed);
+    }
+
+    let integrated = crate::integrated_components::initialize_phase(
+        crate::integrated_components::IntegratedPhase::Device,
+    )
+    .unwrap_or_else(|error| panic!("[kernel-start][{tag}] 设备阶段集成组件初始化失败: {error}"));
+    if integrated != 0 {
+        printk!(
+            "[kernel-start][{}] initialized {} device-stage integrated component(s)",
+            tag,
+            integrated
+        );
+    }
+
     let mut material = [0u8; 112];
-    drivers::fill_kernel_random(&mut material);
+    general::dev::random::fill(
+        &mut material,
+        general::dev::random::RandomReadMode::Insecure,
+    )
+    .expect("random ELM 未提供网络启动密钥材料");
     let active_cpu_count = sched::online_cpu_mask().count_ones().clamp(1, 8) as u8;
     let config = net::device::NetBootConfig::from_random_material(material, active_cpu_count)
         .expect("active CPU count 超出网络栈范围");
@@ -290,13 +489,8 @@ pub fn activate_device_subsystem(
         tag
     );
 
-    drivers::register_builtin_drivers().unwrap_or_else(|err| {
-        panic!(
-            "[kernel-start][{}] failed to register built-in PnP driver {}: {:?}",
-            tag,
-            err.driver(),
-            err.error()
-        )
-    });
-    printk!("[kernel-start][{}] registered built-in PnP drivers", tag);
+    printk!(
+        "[kernel-start][{}] registered configured ELM device drivers",
+        tag
+    );
 }

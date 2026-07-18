@@ -138,6 +138,9 @@ impl TaskExtCloneHook for KernelExtCloneHook {
             sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK => {
                 Arc::new(RiscvVectorSignalStack::new(Vec::new()))
             }
+            sched::TASKEXT_ELM_EXECUTION => {
+                Arc::new(general::elm_guard::ElmTaskExecutionState::new())
+            }
             _ => Arc::clone(src),
         }
     }
@@ -156,6 +159,7 @@ impl TaskExtExitHook for KernelExtExitHook {
             let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
         }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
+        let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
         let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
@@ -461,6 +465,46 @@ fn process_execve(
     Ok(())
 }
 
+fn process_spawn_user_process(
+    _parent: &Arc<Task>,
+    child: &Arc<Task>,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+) -> Result<(), Errno> {
+    let loaded = match crate::user::load_user_image_from_path(child, path, argv, envp) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            activate_task_vm(&sched::current_task());
+            return Err(error);
+        }
+    };
+
+    let _ = child.ext_remove(TASKEXT_VM_SPACE);
+    child.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_metadata(child, &loaded.exec_path, argv, envp);
+    if let Some(fdt) = task_fdtable(child) {
+        fdt.close_on_exec();
+    }
+    child
+        .thread_group()
+        .shared_signal()
+        .reset_handlers_for_exec();
+
+    child.into_kernel_thread(user_clone_entry, 0);
+    let kstack_top = child
+        .kernel_stack_top()
+        .expect("[sched][spawn-user] child missing kernel stack");
+    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    frame.set_kernel_stack_top(kstack_top);
+    let _ = child.ext_remove(TASKEXT_USER_TRAP_FRAME);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
+
+    // 装载器会激活新地址空间以布置用户栈；返回调用者前必须恢复当前任务页表。
+    activate_task_vm(&sched::current_task());
+    Ok(())
+}
+
 fn process_clone_user_context(
     parent: &Arc<Task>,
     child: &Arc<Task>,
@@ -753,6 +797,7 @@ fn write_i32(bytes: &mut [u8], off: usize, value: i32) {
 }
 
 static PROCESS_IMAGE_OPS: ProcessImageOps = ProcessImageOps {
+    spawn_user_process: process_spawn_user_process,
     execve: process_execve,
     clone_user_context: process_clone_user_context,
     sigreturn: process_sigreturn,

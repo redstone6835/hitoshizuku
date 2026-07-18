@@ -13,8 +13,8 @@ use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    current_task, enqueue_task, enqueue_task_with_hint, init_task, is_current_on_any_cpu,
-    mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
+    activate_task_on_cpu, current_task, enqueue_task, enqueue_task_with_hint, init_task,
+    is_current_on_any_cpu, mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -35,6 +35,7 @@ pub enum SpawnKind {
 ///
 /// 调用方必须先安装执行上下文，再调用 [`activate_task`]。这样不会把半初始化
 /// 任务暴露给调度器。
+#[kernel_symbols::export(name = "sched.spawn.spawn_child", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> Arc<Task> {
     let root_ns = root_pid_ns();
 
@@ -99,6 +100,7 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
 }
 
 /// 把已经安装执行上下文的任务放入合适的 runqueue。
+#[kernel_symbols::export(name = "sched.spawn.activate_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn activate_task(task: &Arc<Task>) -> Result<usize, errno::Errno> {
     if task.arch_context().is_none() {
         return Err(errno::Errno::EINVAL);
@@ -148,6 +150,7 @@ pub fn activate_task_with_cpu_hint(
 }
 
 /// 回滚尚未运行、尚未入队的新任务。用于 clone/exec 安装用户上下文失败的路径。
+#[kernel_symbols::export(name = "sched.spawn.abort_new_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn abort_new_task(task: &Arc<Task>) {
     if let Some(parent) = task.parent() {
         let _ = parent.remove_child(task);
@@ -165,6 +168,7 @@ pub fn abort_new_task(task: &Arc<Task>) {
 /// POSIX clone(2)：根据 `args.flags` 决定 ThreadGroup / SharedSignal / 父
 /// 选择 / vfork 阻塞，并通过注册的 [`crate::task::TaskExtCloneHook`]
 /// 让上层处理 VFS / FdTable 的拷贝。
+#[kernel_symbols::export(name = "sched.spawn.clone_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> Arc<Task> {
     let flags = args.flags;
     let root_ns = root_pid_ns();
@@ -340,6 +344,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
 /// 投递给父，唤醒 vfork_done。**不**释放 pid 槽——zombie 期间父按 pid 仍能查到。
 ///
 /// 不切换 CPU；调用方决定何时调 [`schedule_once`]。
+#[kernel_symbols::export(name = "sched.spawn.exit_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     if task.is_idle_task() {
         log::error!(
@@ -424,6 +429,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 }
 
 /// 父侧 reap：从 children 取走首个 Zombie 子，释放其 pid，返回 (任务, 退出码)。
+#[kernel_symbols::export(name = "sched.spawn.reap_child", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn reap_child(parent: &Arc<Task>) -> Option<(Arc<Task>, ExitCode)> {
     reap_matching(parent, |_| true)
 }
@@ -466,6 +472,7 @@ where
 }
 
 /// 列出 `parent` 当前所有 Zombie 子。便于 wait4(WNOHANG) 等不阻塞探查。
+#[kernel_symbols::export(name = "sched.spawn.list_zombie_children", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn list_zombie_children(parent: &Arc<Task>) -> Vec<Arc<Task>> {
     parent
         .snapshot_children()
@@ -478,6 +485,7 @@ pub fn list_zombie_children(parent: &Arc<Task>) -> Vec<Arc<Task>> {
 
 /// 从 init 派生一个内核线程。线程入口签名：
 /// `unsafe extern "C" fn(arg: usize) -> !`，内部以 [`kthread_finish`] 退出。
+#[kernel_symbols::export(name = "sched.spawn.kthread_create", contract = "kernel.sched.kernel-thread@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED, retained_args = 1 << 0)]
 pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc<Task> {
     let root_ns = root_pid_ns();
     let session = Session::new();
@@ -518,6 +526,7 @@ pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Ar
 
 /// 从 init 派生并立即启动一个内核线程。线程入口签名：
 /// `unsafe extern "C" fn(arg: usize) -> !`，内部以 [`kthread_finish`] 退出。
+#[kernel_symbols::export(name = "sched.spawn.kthread_spawn", contract = "kernel.sched.kernel-thread@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED, retained_args = 1 << 0)]
 pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc<Task> {
     let child = kthread_create(entry, arg, params);
     if let Err(err) = activate_task(&child) {
@@ -535,6 +544,25 @@ pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc
         entry as *const () as usize,
     );
     child
+}
+
+/// 在指定活动 CPU 上创建并启动一个内核线程。
+///
+/// CPU 亲和性会在任务暴露给运行队列之前安装，因此不存在线程先在其它
+/// CPU 上运行、随后再迁移的窗口。该接口不接受仅 online 但尚未 active 的 CPU。
+#[kernel_symbols::export(name = "sched.spawn.kthread_spawn_on_cpu", contract = "kernel.sched.kernel-thread@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED, retained_args = 1 << 0)]
+pub fn kthread_spawn_on_cpu(
+    entry: KernelEntry,
+    arg: usize,
+    params: SchedParams,
+    cpu_id: usize,
+) -> Result<Arc<Task>, errno::Errno> {
+    let child = kthread_create(entry, arg, params);
+    if let Err(error) = activate_task_on_cpu(&child, cpu_id, now_ns_public()) {
+        abort_new_task(&child);
+        return Err(error);
+    }
+    Ok(child)
 }
 
 /// 内核线程的退出点：标记 Zombie、让出 CPU。控制流不返回。

@@ -447,11 +447,12 @@ impl EpollFileOps {
             if has_unblocked_signal(&task) {
                 return Err(Errno::EINTR);
             }
-            self.core
+            let entry = self
+                .core
                 .waiters
                 .prepare_to_wait(&task, TaskState::Sleeping);
             if self.any_ready() || timeout_expired(deadline) {
-                self.core.waiters.finish_wait(&task);
+                self.core.waiters.finish_wait(&entry);
                 continue;
             }
             let armed =
@@ -459,7 +460,7 @@ impl EpollFileOps {
             drop(task);
             sched::schedule_once(sched::now_ns_public());
             let task = current_task();
-            self.core.waiters.finish_wait(&task);
+            self.core.waiters.finish_wait(&entry);
             if armed {
                 sched::cancel_sleep_deadline(&task);
             }

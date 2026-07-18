@@ -7,8 +7,8 @@ use alloc::sync::{Arc, Weak};
 
 use sched::sync::Spinlock;
 use sched::{
-    Task, TaskState, WaitQueue, WaitReason, cancel_sleep_deadline, current_task, enqueue_task,
-    is_ready, now_ns_public, register_sleep_deadline, schedule_once,
+    Task, TaskState, WaitQueue, WaitQueueEntry, WaitReason, cancel_sleep_deadline, current_task,
+    enqueue_task, is_ready, now_ns_public, register_sleep_deadline, schedule_once,
 };
 
 use crate::types::SocketError;
@@ -39,15 +39,12 @@ impl SocketWaitQueue {
         self.queue.enqueue(task);
     }
 
-    pub fn prepare_to_wait(&self, task: &Arc<Task>) {
-        #[cfg(feature = "performance-profile")]
-        self.queue.prepare_to_wait(task, TaskState::Sleeping);
-        #[cfg(not(feature = "performance-profile"))]
-        {
-            let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
-            let _ = task.cas_state(TaskState::Runnable, TaskState::Sleeping);
-            self.queue.enqueue(task);
-        }
+    pub fn prepare_to_wait(&self, task: &Arc<Task>) -> Arc<WaitQueueEntry> {
+        self.queue.prepare_to_wait(task, TaskState::Sleeping)
+    }
+
+    pub fn finish_wait(&self, entry: &Arc<WaitQueueEntry>) {
+        self.queue.finish_wait(entry);
     }
 
     pub fn remove(&self, task: &Arc<Task>) {
@@ -111,31 +108,28 @@ pub(crate) fn wait_while(
             return Err(SocketError::TemporaryUnavailable);
         }
         let task = current_task();
-        queue.prepare_to_wait(&task);
+        let entry = queue.prepare_to_wait(&task);
         let deadline_armed =
             deadline.is_some_and(|deadline| register_sleep_deadline(&task, deadline));
         if !predicate() {
-            queue.remove(&task);
             if deadline_armed {
                 cancel_sleep_deadline(&task);
             }
-            restore_current_after_wait(&task);
+            queue.finish_wait(&entry);
             return Ok(());
         }
         if deadline_expired(deadline) {
-            queue.remove(&task);
             if deadline_armed {
                 cancel_sleep_deadline(&task);
             }
-            restore_current_after_wait(&task);
+            queue.finish_wait(&entry);
             return Err(SocketError::TemporaryUnavailable);
         }
         schedule_once(now_ns_public());
-        queue.remove(&task);
         if deadline_armed {
             cancel_sleep_deadline(&task);
         }
-        restore_current_after_wait(&task);
+        queue.finish_wait(&entry);
         if has_pending_signal(&task) {
             return Err(SocketError::Interrupted);
         }
@@ -143,12 +137,4 @@ pub(crate) fn wait_while(
             return Err(SocketError::TemporaryUnavailable);
         }
     }
-}
-
-fn restore_current_after_wait(task: &Arc<Task>) {
-    if !task.cas_state(TaskState::Sleeping, TaskState::Running) {
-        let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
-    }
-    #[cfg(feature = "performance-profile")]
-    task.cancel_profile_wait();
 }

@@ -22,7 +22,7 @@ fn vm_layout() -> &'static UserVmLayoutOps {
 }
 
 /// 当前架构注入的用户页粒度。
-#[inline]
+#[kernel_symbols::export(name = "general.mm.page_size", contract = "kernel.mm.query@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
 pub fn page_size() -> usize {
     vm_layout().page_size
 }
@@ -72,6 +72,7 @@ pub struct VmSpaceDiag {
     pub dropped: usize,
 }
 
+#[kernel_symbols::export(name = "general.mm.vm_space_diag", contract = "kernel.mm.diagnostic@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn vm_space_diag() -> VmSpaceDiag {
     VmSpaceDiag {
         live: VM_SPACE_LIVE.load(Ordering::Acquire),
@@ -291,8 +292,10 @@ pub struct VmSpace {
 unsafe impl Send for VmSpace {}
 unsafe impl Sync for VmSpace {}
 
+#[kernel_symbols::export]
 impl VmSpace {
     /// 新建一个空地址空间。必须在 `register_user_pgd` 完成之后调用。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.new", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn new() -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let layout = vm_layout();
@@ -311,10 +314,12 @@ impl VmSpace {
         }
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.pgd", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn pgd(&self) -> PgdHandle {
         self.pgd
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.mapped_pages", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
     pub fn mapped_pages(&self) -> usize {
         self.mapped_pages.load(Ordering::Acquire)
     }
@@ -327,6 +332,7 @@ impl VmSpace {
         }
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.current_brk", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn current_brk(&self) -> usize {
         self.brk_current.load(Ordering::Acquire)
     }
@@ -353,6 +359,7 @@ impl VmSpace {
         self.brk_current.store(brk, Ordering::Release);
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.set_brk", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_brk(&self, requested: usize) -> usize {
         if requested == 0 {
             return self.current_brk();
@@ -392,6 +399,7 @@ impl VmSpace {
         }
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.alloc_mmap_range", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn alloc_mmap_range(&self, len: usize) -> Result<Range<usize>, Errno> {
         let layout = vm_layout();
         let page_size = layout.page_size;
@@ -420,6 +428,7 @@ impl VmSpace {
         Err(Errno::ENOMEM)
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.is_range_free", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_range_free(&self, range: Range<usize>) -> bool {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
     }
@@ -428,6 +437,7 @@ impl VmSpace {
     ///
     /// 这个接口不触发缺页，也不承诺页表页已经常驻；它只用于 syscall 在访问用户
     /// 指针前做快速结构性校验，避免退出清理这类不可失败路径卡在明显损坏的链表上。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.is_user_range_readable", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_user_range_readable(&self, addr: usize, len: usize) -> bool {
         if len == 0 {
             return true;
@@ -567,6 +577,7 @@ impl VmSpace {
     }
 
     /// 注册一段匿名 VMA。不立即分配物理页。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.map_anon", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn map_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
         let flags = self.with_future_mlock(flags);
@@ -587,6 +598,7 @@ impl VmSpace {
     }
 
     /// 注册一段 file-backed VMA。缺页时按 offset + (addr - range.start) 读文件。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.map_file", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 2)]
     pub fn map_file(
         &self,
         range: Range<usize>,
@@ -677,6 +689,7 @@ impl VmSpace {
     }
 
     /// 注册并立即建立一段 direct physical mapping。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.map_direct", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn map_direct(
         &self,
         range: Range<usize>,
@@ -711,6 +724,7 @@ impl VmSpace {
     }
 
     /// 取消映射。同时把已 commit 的页表项摘掉；物理页由 resident page refcount 回收。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.unmap", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
         let removed_areas = self.vmas.lock().unmap_range(&range);
@@ -836,6 +850,7 @@ impl VmSpace {
     }
 
     /// 修改权限。要求整个 range 已被 VMA 连续覆盖。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.mprotect", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
         let mut set = self.vmas.lock();
@@ -865,6 +880,7 @@ impl VmSpace {
         Ok(())
     }
 
+    #[kernel_symbols::export(name = "general.mm.VmSpace.resident_bitmap", contract = "kernel.mm.query@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED | kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
     pub fn resident_bitmap(&self, range: Range<usize>) -> Result<Vec<u8>, Errno> {
         self.validate_range(&range)?;
         let page_size = page_size();
@@ -970,6 +986,7 @@ impl VmSpace {
     }
 
     /// fork：克隆 VMA 元数据，已驻留的页按 private-COW / shared 语义重建页表。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.fork", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn fork(&self) -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let new_pgd = (ops.new_pgd_for_user)();
@@ -1033,6 +1050,7 @@ impl VmSpace {
     }
 
     /// 切到本地址空间（`schedule_once` 调；写 PGDL 并 flush TLB）。
+    #[kernel_symbols::export(name = "general.mm.VmSpace.activate", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn activate(&self) {
         if let Some(ops) = user_pgd_ops() {
             unsafe { (ops.activate)(self.pgd) };
@@ -1787,6 +1805,7 @@ fn user_page_order() -> Option<usize> {
 }
 
 /// 获取 Vec<Range<usize>> 视图，方便调试打印 / smoketest。
+#[kernel_symbols::export(name = "general.mm.dump_vmas", contract = "kernel.mm.diagnostic@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED | kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
     vm.vmas
         .lock()

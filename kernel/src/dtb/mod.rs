@@ -11,7 +11,6 @@ use alloc::vec::Vec;
 
 use allocator::KERNEL_ALLOCATOR;
 use general::dev::block::BlockDevice;
-use general::dev::char::CharDevice;
 use general::dev::enumerate::DEVICES;
 use general::dev::pci::pci_scan_and_register_summary;
 use general::dev::platform::{
@@ -25,16 +24,13 @@ use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
-use general::vfs::device_files::projection::{active_block_devices, find_char_device_by_fw_name};
-use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
-use general::vfs::error::VfsError;
+use general::vfs::device_files::projection::active_block_devices;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
 use general::{StartContext, StartFirmware};
-use log::{LogRecord, LogSink, printk};
+use log::printk;
 
 use crate::start;
 
@@ -150,6 +146,11 @@ pub fn kernel_start_init(context: &StartContext) {
             alloc_ops.map_kernel_heap_range,
             alloc_ops.unmap_kernel_heap_range,
         );
+        general::elm_image::register_elm_image_ops(
+            alloc_ops.protect_kernel_heap_range,
+            alloc_ops.validate_kernel_heap_range,
+            alloc_ops.sync_icache,
+        );
         (alloc_ops.init_kernel_page_table)();
         KERNEL_ALLOCATOR
             .init_vmem(&kernel_reserved)
@@ -215,7 +216,6 @@ pub fn kernel_start_init(context: &StartContext) {
     // superblock。DTB 后续的 platform/PCI probe 会直接把设备节点写入这份树。
     crate::device_init::register_core_filesystems("dtb");
     let dev_sb = crate::device_init::mount_devtmpfs("dtb");
-    let dev_ops = crate::device_init::devtmpfs_ops(&dev_sb, "dtb");
 
     // 小步骤 5.2 接着把 devtmpfs 与 PnP 层连接起来。这样 PCI 扫描过程中一旦发现
     // 可驱动设备，对应的字符设备或块设备节点就能直接写入 devtmpfs；等最终根文件
@@ -439,112 +439,37 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // 小步骤 6.2 然后解析控制台来源。这里优先看命令行 console 参数，找不到时再
     // 用 stdout-path 反查已经注册好的串口驱动实例。
-    let console_registered = {
-        let cmdline_dev = cmdline
-            .as_ref()
-            .and_then(|cl| {
-                cl.find("console")
-                    .map(|v| v.split_once(',').map_or(v, |(d, _)| d))
-            })
-            .and_then(|name| resolve_cmdline_console(&vfs_ctx, dev_ops, name));
-
-        let dev = if let Some(dev) = cmdline_dev {
-            printk!(
-                "[kernel-start][dtb] console from cmdline: {}",
-                dev.fw_name()
-            );
-            Some(dev)
-        } else if let Some(port) = stdout_serial.as_ref() {
-            let found = lookup_char_fw_name(port.name);
-            if let Some(dev) = found.as_ref() {
-                printk!(
-                    "[kernel-start][dtb] console from stdout-path: {}",
-                    dev.fw_name()
-                );
-            }
-            found
-        } else {
-            None
-        };
-
-        if let Some(dev) = dev {
-            general::console::register_console(dev.clone());
-            // 小步骤 6.2.1 在 devtmpfs 里把当前 console 重定向为固定路径
-            // `/dev/console`，让用户态进程通过稳定路径打开它。
-            match dev_ops.bind_char("console", dev.clone()) {
-                Ok(()) => {
-                    printk!(
-                        "[kernel-start][dtb] bound /dev/console -> {}",
-                        dev.fw_name()
-                    );
-                    crate::sched::stash_boot_console_name(alloc::string::String::from(
-                        "/dev/console",
-                    ));
-                }
-                Err(VfsError::AlreadyExists) => {
-                    printk!("[kernel-start][dtb] /dev/console already exists; using it for stdio");
-                    crate::sched::stash_boot_console_name(alloc::string::String::from(
-                        "/dev/console",
-                    ));
-                }
-                Err(err) => {
-                    printk!("[kernel-start][dtb] failed to bind /dev/console: {:?}", err);
-                }
-            }
-            true
-        } else {
-            printk!("[kernel-start][dtb] no console registered");
-            false
-        }
+    let console_selector = if let Some(name) = cmdline.as_ref().and_then(|cl| {
+        cl.find("console")
+            .map(|value| value.split_once(',').map_or(value, |(device, _)| device))
+    }) {
+        printk!("[kernel-start][dtb] console requested by cmdline: {}", name);
+        Some(crate::device_init::BootConsoleSelector::DeviceName(
+            alloc::string::String::from(name),
+        ))
+    } else if let Some(port) = stdout_serial.as_ref() {
+        printk!(
+            "[kernel-start][dtb] console requested by stdout-path: {}",
+            port.name
+        );
+        Some(crate::device_init::BootConsoleSelector::FirmwareName(
+            alloc::string::String::from(port.name),
+        ))
+    } else {
+        None
     };
-
-    // 小步骤 6.3 如果控制台已经可用，就把日志系统的 sink 也切换到这条设备路径上。
-    if console_registered {
-        static LOG_SINK: LogSink = LogSink {
-            write_record: write_log_record_to_console,
-        };
-        log::bind_log_sink(&LOG_SINK);
+    if let Some(selector) = console_selector {
+        let _ = crate::device_init::bind_or_defer_boot_console(
+            "dtb",
+            &vfs_ctx,
+            Arc::clone(&dev_sb),
+            selector,
+        );
+    } else {
+        printk!("[kernel-start][dtb] no console selected");
     }
 
     printk!("[kernel-start][dtb] kernel initialization complete, jumping to main entry");
-}
-
-/// 日志记录回调：将格式化的日志行发送到控制台。
-fn write_log_record_to_console(record: &LogRecord<'_>) {
-    let line = start::format_log_record_line(record);
-    general::console::console_write(line.as_bytes());
-}
-
-fn resolve_cmdline_console(
-    vfs_ctx: &VfsContext,
-    dev_ops: &DevTmpfsSuperblockOps,
-    name: &str,
-) -> Option<CharDevice> {
-    if let Some(dev_name) = name.strip_prefix("/dev/")
-        && let Some(dev) = dev_ops.char_dev(dev_name)
-    {
-        return Some(dev);
-    }
-    if !name.starts_with('/')
-        && let Some(dev) = dev_ops.char_dev(name)
-    {
-        return Some(dev);
-    }
-    if name.starts_with('/') {
-        return path::lookup(vfs_ctx, &Dirfd::Cwd, name, LookupFlags::default())
-            .ok()
-            .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root.root()))
-            .and_then(|resolved| {
-                resolved
-                    .strip_prefix("/dev/")
-                    .and_then(|dev_name| dev_ops.char_dev(dev_name))
-            });
-    }
-    lookup_char_fw_name(name)
-}
-
-fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
-    find_char_device_by_fw_name(&DEVICES.functions, name)
 }
 
 fn mount_tmpfs_superblock() -> Arc<Superblock> {

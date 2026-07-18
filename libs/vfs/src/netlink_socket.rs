@@ -99,14 +99,31 @@ impl NetlinkSocketFileOps {
                 return Err(Errno::EAGAIN);
             }
             let task = sched::current_task();
-            self.wait_queue.enqueue(&task);
+            let entry = self
+                .wait_queue
+                .prepare_to_wait(&task, sched::TaskState::Sleeping);
             let armed = deadline_ns
                 .map(|deadline| sched::register_sleep_deadline(&task, deadline))
                 .unwrap_or(false);
+            if !self.rx_buf.lock().is_empty() {
+                if armed {
+                    sched::cancel_sleep_deadline(&task);
+                }
+                self.wait_queue.finish_wait(&entry);
+                continue;
+            }
+            if deadline_ns.is_some_and(|dl| sched::now_ns_public() >= dl) {
+                if armed {
+                    sched::cancel_sleep_deadline(&task);
+                }
+                self.wait_queue.finish_wait(&entry);
+                return Err(Errno::EAGAIN);
+            }
             sched::schedule_once(sched::now_ns_public());
             if armed {
                 sched::cancel_sleep_deadline(&task);
             }
+            self.wait_queue.finish_wait(&entry);
         }
     }
 
@@ -143,8 +160,15 @@ impl FileOps for NetlinkSocketFileOps {
                 return Err(VfsError::WouldBlock);
             }
             let task = sched::current_task();
-            self.wait_queue.enqueue(&task);
+            let entry = self
+                .wait_queue
+                .prepare_to_wait(&task, sched::TaskState::Sleeping);
+            if !self.rx_buf.lock().is_empty() {
+                self.wait_queue.finish_wait(&entry);
+                continue;
+            }
             sched::schedule_once(sched::now_ns_public());
+            self.wait_queue.finish_wait(&entry);
         }
     }
 

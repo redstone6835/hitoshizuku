@@ -38,6 +38,7 @@ use crate::eevdf::{SchedEntity, SchedParams};
 use crate::group::{ProcessGroup, ThreadGroup};
 use crate::ids::Credentials;
 use crate::pid::{PidNamespace, PidT};
+use crate::placement::{PlacementSnapshot, TaskPlacement};
 use crate::signal::{SharedSignal, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
@@ -364,6 +365,11 @@ impl KernelStack {
         self.base.as_ptr() as usize + self.layout.size()
     }
 
+    /// 逻辑栈底（低地址端）。
+    pub fn start(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
+
     pub fn size(&self) -> usize {
         self.layout.size()
     }
@@ -519,8 +525,15 @@ pub struct Task {
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
     current_cpu: AtomicUsize,
+    /// CPU、调度域、拓扑代际和迁移状态的一致调度归属快照。
+    placement: TaskPlacement,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
+    /// 当前任务挂载的运行时执行状态裸指针。
+    ///
+    /// 指针的所有权始终由 `TASKEXT_ELM_EXECUTION` 对应的 `Arc` 持有；这里仅为
+    /// trap/IRQ 热路径提供无锁查询，避免中断打断 TaskExt 自旋锁后再次取锁。
+    elm_execution_ptr: AtomicUsize,
     /// 子系统侧表：VFS context / fdtable 等通过 [`TaskExtKey`] 挂载。
     /// 详见模块级 [`TaskExtCloneHook`]。
     ///
@@ -537,6 +550,7 @@ pub struct Task {
     pre_exit_cleaned: AtomicBool,
 }
 
+#[kernel_symbols::export]
 impl Task {
     /// 创建一个新任务。`thread_group` / `process_group` / `parent` 由调用方给出，
     /// 调用方负责在返回 `Arc` 之后把它登记进父的 `children` 与组成员表。
@@ -607,7 +621,9 @@ impl Task {
             sched_reset_on_fork: AtomicBool::new(false),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
+            placement: TaskPlacement::unbound(),
             ioprio: AtomicU32::new(0),
+            elm_execution_ptr: AtomicUsize::new(0),
             hot_ext: HotTaskExt::new(),
             ext: Spinlock::new(Vec::new()),
             ext_exit_cleaned: AtomicBool::new(false),
@@ -945,6 +961,14 @@ impl Task {
         self.kstack.lock().as_ref().map(|s| s.top())
     }
 
+    /// 当前任务拥有的完整内核栈地址范围。
+    pub fn kernel_stack_bounds(&self) -> Option<(usize, usize)> {
+        self.kstack
+            .lock()
+            .as_ref()
+            .map(|stack| (stack.start(), stack.top()))
+    }
+
     /// 释放已经不会再运行的任务执行上下文。
     ///
     /// 只能在任务最终切离 CPU 后调用。Zombie 仍需保留 wait/proc 可见的轻量状态，
@@ -1031,6 +1055,12 @@ impl Task {
     }
 
     /// 任务在根 ns 中的 pid（对应 Linux `task->pid`）。
+    #[kernel_symbols::export(
+        name = "sched.task.Task.pid_root",
+        contract = "kernel.sched.task-query@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_QUERY
+    )]
     pub fn pid_root(&self) -> Option<PidT> {
         self.rel.lock().pid_in_ns.first().map(|(_, pid)| *pid)
     }
@@ -1312,6 +1342,57 @@ impl Task {
         self.current_cpu.store(cpu_id, Ordering::Release);
     }
 
+    pub fn placement(&self) -> PlacementSnapshot {
+        self.placement.snapshot()
+    }
+
+    pub(crate) fn bind_placement(
+        &self,
+        cpu: crate::CpuId,
+        domain_id: usize,
+        topology_generation: u64,
+    ) {
+        self.placement.bind(cpu, domain_id, topology_generation);
+        self.set_current_cpu(cpu.get());
+    }
+
+    pub(crate) fn begin_migration(&self, source: PlacementSnapshot) -> bool {
+        self.placement.begin_migration(source)
+    }
+
+    pub(crate) fn begin_offline_repair(&self, source: PlacementSnapshot) -> bool {
+        self.placement.begin_offline_repair(source)
+    }
+
+    pub(crate) fn commit_migration(
+        &self,
+        cpu: crate::CpuId,
+        domain_id: usize,
+        topology_generation: u64,
+    ) {
+        self.placement
+            .store_bound(cpu, domain_id, topology_generation);
+        self.set_current_cpu(cpu.get());
+    }
+
+    pub(crate) fn refresh_placement_topology(
+        &self,
+        source: PlacementSnapshot,
+        domain_id: usize,
+        topology_generation: u64,
+    ) -> bool {
+        self.placement
+            .refresh_topology(source, domain_id, topology_generation)
+    }
+
+    pub(crate) fn rollback_migration(&self, source: PlacementSnapshot) {
+        self.placement.rollback(source);
+    }
+
+    pub(crate) fn unbind_placement(&self) {
+        self.placement.unbind();
+    }
+
     pub fn ioprio(&self) -> u16 {
         self.ioprio.load(Ordering::Acquire) as u16
     }
@@ -1324,7 +1405,16 @@ impl Task {
 
     /// 安装一个子系统状态。同 key 重复装入视作配置错误（debug_assert）。
     pub fn ext_install(&self, key: TaskExtKey, payload: Arc<dyn Any + Send + Sync>) {
+        let execution_ptr = if key == TASKEXT_ELM_EXECUTION {
+            Arc::as_ptr(&payload) as *const () as usize
+        } else {
+            0
+        };
         if self.hot_ext.install(key, &payload) {
+            if execution_ptr != 0 {
+                self.elm_execution_ptr
+                    .store(execution_ptr, Ordering::Release);
+            }
             return;
         }
         let mut ext = self.ext.lock();
@@ -1334,6 +1424,10 @@ impl Task {
             key,
         );
         ext.push(TaskExt { key, payload });
+        if execution_ptr != 0 {
+            self.elm_execution_ptr
+                .store(execution_ptr, Ordering::Release);
+        }
     }
 
     /// 查询某个子系统状态；不存在返回 `None`。
@@ -1350,6 +1444,9 @@ impl Task {
 
     /// 移除并返回某个子系统状态。
     pub fn ext_remove(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
+        if key == TASKEXT_ELM_EXECUTION {
+            self.elm_execution_ptr.store(0, Ordering::Release);
+        }
         if let Some(payload) = self.hot_ext.remove(key) {
             return Some(payload);
         }
@@ -1368,6 +1465,14 @@ impl Task {
                 .map(|e| (e.key, Arc::clone(&e.payload))),
         );
         out
+    }
+
+    /// 返回当前任务的 ELM 执行状态地址。
+    ///
+    /// 返回值只在当前任务仍持有 `TASKEXT_ELM_EXECUTION` 时有效。调用方只能在
+    /// 当前任务上下文或 trap/IRQ 现场临时解引用，不能跨调度点保存。
+    pub fn elm_execution_ptr(&self) -> usize {
+        self.elm_execution_ptr.load(Ordering::Acquire)
     }
 }
 
@@ -1401,6 +1506,8 @@ pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
 /// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
 pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
+/// ELM 当前执行域、恢复帧和生命周期上下文。
+pub const TASKEXT_ELM_EXECUTION: TaskExtKey = 0x0003_0000;
 
 struct HotTaskExt {
     vfs_context: Spinlock<Option<Arc<dyn Any + Send + Sync>>>,

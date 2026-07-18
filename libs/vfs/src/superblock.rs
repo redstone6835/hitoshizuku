@@ -488,6 +488,7 @@ pub struct FsRegistry {
 unsafe impl Sync for FsRegistry {}
 unsafe impl Send for FsRegistry {}
 
+#[kernel_symbols::export]
 impl FsRegistry {
     /// 构造空注册表。
     pub const fn new() -> Self {
@@ -503,6 +504,14 @@ impl FsRegistry {
     ///
     /// 成功返回分配到的索引，注册表已满时返回 `Err`。
     /// 不检查重名——调用方应确保不重复注册同名驱动。
+    #[kernel_symbols::export(
+        name = "vfs.superblock.FsRegistry.register",
+        contract = "kernel.vfs.filesystem-registry@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 1
+    )]
     pub fn register(&self, driver: &'static dyn FsDriver) -> VfsResult<usize> {
         // 1. 原子抢占唯一槽位
         let idx = self.reserved_idx.fetch_add(1, Ordering::Relaxed);
@@ -529,6 +538,13 @@ impl FsRegistry {
     }
 
     /// 按名称查找已注册驱动（O(1) 期望，哈希索引）。
+    #[kernel_symbols::export(
+        name = "vfs.superblock.FsRegistry.find",
+        contract = "kernel.vfs.filesystem-registry@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_MODULE_BORROW
+    )]
     pub fn find(&self, name: &str) -> Option<&'static dyn FsDriver> {
         self.name_index
             .find(name, self.slots.get() as *const Option<FsDriverEntry>)
@@ -559,6 +575,13 @@ impl FsRegistry {
     }
 
     /// 返回所有已注册文件系统的名称列表（用于 `/proc/filesystems`）。
+    #[kernel_symbols::export(
+        name = "vfs.superblock.FsRegistry.list_names",
+        contract = "kernel.vfs.filesystem-registry@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn list_names(&self) -> Vec<String> {
         self.iter().map(|e| String::from(e.driver.name())).collect()
     }

@@ -305,7 +305,11 @@ fn push_record(
     // 设备号表位于用户接口层，启动期和热插拔路径都可能调用。这里不用
     // `Vec::push`/`String::from` 的隐式分配路径，避免低内存时把普通注册失败
     // 放大成内核 panic。
-    registry.records.try_reserve(1).ok()?;
+    {
+        // 设备号记录会在节点解绑时释放；全局表扩容后的容量则由内核继续复用。
+        let _accounting = allocator::suspend_implicit_allocation_accounting()?;
+        registry.records.try_reserve(1).ok()?;
+    }
     let node_name = fallible_string_from(node_name)?;
     let display_name = fallible_string_from(display_name)?;
     let major_name = fallible_string_from(major_name)?;

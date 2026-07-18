@@ -2570,20 +2570,20 @@ impl SocketFacade {
                 return Err(SocketError::TimedOut);
             }
             let task = sched::current_task();
-            self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
+            let entry = self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
             if matches!(self.owner(), OwnerRef::Closed { .. }) {
-                self.state_wait.finish_wait(&task);
+                self.state_wait.finish_wait(&entry);
                 return Ok(());
             }
             if sched::operation::has_interrupting_signal(&task) {
-                self.state_wait.finish_wait(&task);
+                self.state_wait.finish_wait(&entry);
                 return Err(SocketError::Interrupted);
             }
             let armed = sched::register_sleep_deadline(&task, deadline_ns);
             drop(task);
             sched::schedule_once(sched::now_ns_public());
             let task = sched::current_task();
-            self.state_wait.finish_wait(&task);
+            self.state_wait.finish_wait(&entry);
             if armed {
                 sched::cancel_sleep_deadline(&task);
             }
@@ -2919,19 +2919,18 @@ impl SocketFacade {
                 return result;
             }
             let task = sched::current_task();
-            self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
+            let entry = self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
             if let Some(result) = self.take_control_result(sequence) {
-                self.state_wait.finish_wait(&task);
+                self.state_wait.finish_wait(&entry);
                 return result;
             }
             if sched::operation::has_interrupting_signal(&task) {
-                self.state_wait.finish_wait(&task);
+                self.state_wait.finish_wait(&entry);
                 return Err(SocketError::Interrupted);
             }
             drop(task);
             sched::schedule_once(sched::now_ns_public());
-            let task = sched::current_task();
-            self.state_wait.finish_wait(&task);
+            self.state_wait.finish_wait(&entry);
         }
     }
 
@@ -2964,18 +2963,18 @@ impl SocketFacade {
     ) -> Result<(), SocketError> {
         let task = sched::current_task();
         let (_, observed_generation) = self.readiness();
-        queue.prepare_to_wait(&task, TaskState::Sleeping);
+        let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
         let (current, generation) = self.readiness();
         if current.contains(readiness) || generation != observed_generation {
-            queue.finish_wait(&task);
+            queue.finish_wait(&entry);
             return Ok(());
         }
         if sched::operation::has_interrupting_signal(&task) {
-            queue.finish_wait(&task);
+            queue.finish_wait(&entry);
             return Err(SocketError::Interrupted);
         }
         if deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
-            queue.finish_wait(&task);
+            queue.finish_wait(&entry);
             return Err(SocketError::TimedOut);
         }
         let armed =
@@ -2983,7 +2982,7 @@ impl SocketFacade {
         drop(task);
         sched::schedule_once(sched::now_ns_public());
         let task = sched::current_task();
-        queue.finish_wait(&task);
+        queue.finish_wait(&entry);
         if armed {
             sched::cancel_sleep_deadline(&task);
         }

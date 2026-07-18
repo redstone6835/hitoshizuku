@@ -236,8 +236,7 @@ pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_close(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    fdt.close_fd_for_owner(fd, record_lock_owner_pid(ctx))
-        .map_err(|e| e.to_errno())?;
+    operation::close_for_owner(&fdt, fd, record_lock_owner_pid(ctx)).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 

@@ -232,19 +232,12 @@ impl LoongArch64InterruptOps {
 }
 
 impl LoongArch64MessageInterruptOps {
-    /// 读取当前核的 CPU ID（来自 CSR_CPUID）。
-    ///
-    /// # 返回值
-    ///
-    /// 返回当前 CPU 的 ID，范围由 CSR_CPUID_COREID_MASK 定义。
+    /// 读取当前核的硬件 Core ID（来自 CSR_CPUID）。
     #[inline]
-    pub fn current_cpu_id() -> usize {
-        // CPUID 是硬件给出的当前核标识，常用于 per-CPU 数据、IPI 路由和日志标记。
-        // 这里再按 COREID 掩码裁剪，是为了屏蔽寄存器中可能存在的保留高位。
+    pub fn current_hardware_cpu_id() -> usize {
         let cpuid: usize;
         unsafe {
             core::arch::asm!(
-                // 直接读取 CSR_CPUID 寄存器的值到 cpuid 变量中。
                 "csrrd {cpuid}, {csr_cpuid}",
                 cpuid = out(reg) cpuid,
                 csr_cpuid = const CSR_CPUID,
@@ -252,6 +245,16 @@ impl LoongArch64MessageInterruptOps {
             )
         }
         cpuid & CSR_CPUID_COREID_MASK
+    }
+
+    /// 读取当前核的 CPU ID（来自 CSR_CPUID）。
+    ///
+    /// # 返回值
+    ///
+    /// 返回当前 CPU 的 ID，范围由 CSR_CPUID_COREID_MASK 定义。
+    #[inline]
+    pub fn current_cpu_id() -> usize {
+        crate::loongarch64::smp::logical_cpu_id(Self::current_hardware_cpu_id())
     }
 
     /// 读取消息中断使能寄存器 CSR_MSGIE。

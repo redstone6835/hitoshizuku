@@ -69,7 +69,15 @@ pub struct Socket {
     pub(crate) inner: Arc<SocketInner>,
 }
 
+#[kernel_symbols::export]
 impl Socket {
+    #[kernel_symbols::export(
+        name = "socket.Socket.new_unix",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new_unix(kind: SocketType, owner: PeerIdentity) -> Result<Self, SocketError> {
         let options = default_socket_options(kind);
         let kind_impl = match kind {
@@ -116,6 +124,13 @@ impl Socket {
         Ok(socket)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.pair_unix",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn pair_unix(kind: SocketType, owner: PeerIdentity) -> Result<(Self, Self), SocketError> {
         match kind {
             SocketType::Stream => {
@@ -140,26 +155,64 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.socket_type",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn socket_type(&self) -> SocketType {
         self.inner.kind
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.id",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn id(&self) -> u64 {
         self.inner.id
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.owner_identity",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn owner_identity(&self) -> PeerIdentity {
         self.inner.owner
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_passcred",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_passcred(&self, enabled: bool) {
         self.inner.passcred.store(enabled, Ordering::Release);
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.passcred_enabled",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn passcred_enabled(&self) -> bool {
         self.inner.passcred.load(Ordering::Acquire)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.bind",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn bind(&self, address: UnixAddress) -> Result<(), SocketError> {
         let key = address.binding_key().ok_or(SocketError::InvalidInput)?;
         ensure_name_len(&address)?;
@@ -174,6 +227,13 @@ impl Socket {
         Ok(())
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.local_address",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn local_address(&self) -> UnixAddress {
         self.inner
             .local_name
@@ -182,6 +242,13 @@ impl Socket {
             .unwrap_or(UnixAddress::Unnamed)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.peer_address",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn peer_address(&self) -> Result<UnixAddress, SocketError> {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => {
@@ -212,6 +279,12 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.peer_identity",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn peer_identity(&self) -> Result<PeerIdentity, SocketError> {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => {
@@ -235,6 +308,13 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.listen",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn listen(&self, backlog: usize) -> Result<(), SocketError> {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => {
@@ -245,6 +325,14 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.accept",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn accept(&self, options: ReceiveOptions) -> Result<Self, SocketError> {
         let options = ReceiveOptions {
             deadline_ns: effective_recv_deadline(
@@ -272,6 +360,13 @@ impl Socket {
         self.finish_result(result)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.connect",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn connect(
         &self,
         address: UnixAddress,
@@ -298,6 +393,12 @@ impl Socket {
         self.finish_result(result)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.validate_connect_ready",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn validate_connect_ready(&self) -> Result<(), SocketError> {
         if *self.inner.closed.lock() {
             return Err(SocketError::PeerClosed);
@@ -334,6 +435,13 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.shutdown",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn shutdown(&self, how: SocketShutdown) -> Result<(), SocketError> {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => io::shutdown_stream(stream, how),
@@ -342,6 +450,12 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.readiness",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn readiness(&self) -> Readiness {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => io::stream_readiness(stream),
@@ -383,6 +497,14 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.register_waiter",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 1
+    )]
     pub fn register_waiter(&self, task: &Arc<Task>, interest: Readiness) -> bool {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => io::register_stream_waiter(stream, task, interest),
@@ -391,6 +513,13 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.unregister_waiter",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn unregister_waiter(&self, task: &Arc<Task>) {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => io::unregister_stream_waiter(stream, task),
@@ -399,6 +528,12 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.is_listener",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn is_listener(&self) -> bool {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => matches!(*stream.state.lock(), StreamState::Listening(_)),
@@ -407,6 +542,14 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.send",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 2
+    )]
     pub fn send(
         &self,
         data: &[u8],
@@ -447,6 +590,14 @@ impl Socket {
         self.finish_result(result)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.receive",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn receive(
         &self,
         buffer: &mut [u8],
@@ -469,6 +620,13 @@ impl Socket {
         self.finish_result(result)
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.close",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn close(&self) {
         let mut closed = self.inner.closed.lock();
         if *closed {
@@ -492,14 +650,34 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_send_buffer_size",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_send_buffer_size(&self, size: usize) {
         self.inner.options.lock().send_buffer_size = size.max(1);
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.send_buffer_size",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn send_buffer_size(&self) -> usize {
         self.inner.options.lock().send_buffer_size
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_recv_buffer_size",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_recv_buffer_size(&self, size: usize) {
         let size = size.max(1);
         self.inner.options.lock().recv_buffer_size = size;
@@ -525,58 +703,148 @@ impl Socket {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.recv_buffer_size",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn recv_buffer_size(&self) -> usize {
         self.inner.options.lock().recv_buffer_size
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_reuse_addr",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_reuse_addr(&self, enabled: bool) {
         self.inner.options.lock().reuse_addr = enabled;
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.reuse_addr",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn reuse_addr(&self) -> bool {
         self.inner.options.lock().reuse_addr
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_reuse_port",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_reuse_port(&self, enabled: bool) {
         self.inner.options.lock().reuse_port = enabled;
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.reuse_port",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn reuse_port(&self) -> bool {
         self.inner.options.lock().reuse_port
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_linger",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_linger(&self, linger: SocketLinger) {
         self.inner.options.lock().linger = linger;
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.linger",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn linger(&self) -> SocketLinger {
         self.inner.options.lock().linger
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_send_timeout",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_send_timeout(&self, timeout: Option<SocketTimeval>) {
         self.inner.options.lock().send_timeout = timeout;
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.send_timeout",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn send_timeout(&self) -> Option<SocketTimeval> {
         self.inner.options.lock().send_timeout
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.set_recv_timeout",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_recv_timeout(&self, timeout: Option<SocketTimeval>) {
         self.inner.options.lock().recv_timeout = timeout;
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.recv_timeout",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn recv_timeout(&self) -> Option<SocketTimeval> {
         self.inner.options.lock().recv_timeout
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.take_last_error",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn take_last_error(&self) -> Option<SocketError> {
         self.inner.last_error.lock().take()
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.sock_at_mark",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn sock_at_mark(&self) -> bool {
         false
     }
 
+    #[kernel_symbols::export(
+        name = "socket.Socket.would_create_handle_cycle",
+        contract = "kernel.ipc.unix-socket@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::IPC
+    )]
     pub fn would_create_handle_cycle(&self, identity: HandleIdentity) -> bool {
         match identity {
             HandleIdentity::Socket(id) => {
@@ -894,6 +1162,14 @@ fn register_socket(socket: &Arc<SocketInner>) {
     SOCKETS.lock().insert(socket.id, Arc::downgrade(socket));
 }
 
+#[kernel_symbols::export(
+    name = "socket.snapshot_sockets",
+    contract = "kernel.ipc.unix-socket@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::IPC,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn snapshot_sockets() -> Vec<Socket> {
     let mut sockets = SOCKETS.lock();
     let ids: Vec<u64> = sockets.keys().copied().collect();
@@ -961,6 +1237,13 @@ pub(crate) fn registry_remove(key: &BindingKey, socket: &Arc<SocketInner>) {
     }
 }
 
+#[kernel_symbols::export(
+    name = "socket.unregister_path_socket",
+    contract = "kernel.ipc.unix-socket@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::IPC,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_path_socket(key: PathKey) {
     REGISTRY.lock().remove(&BindingKey::Path(key));
 }

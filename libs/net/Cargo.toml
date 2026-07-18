@@ -12,6 +12,7 @@ bench = false
 performance-profile = ["dep:profiling"]
 
 [dependencies]
+elm_model = { package = "elm", path = "../elm" }
 hashbrown = { version = "0.17.1", default-features = false }
 profiling = { path = "../profiling", optional = true }
 sched = { path = "../sched" }

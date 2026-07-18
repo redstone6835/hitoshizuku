@@ -87,6 +87,25 @@ pub struct AllocationRegistrySnapshot {
     pub audit: AllocationRegistryAudit,
 }
 
+/// 指定外部所有者仍存活的分配记录摘要。
+///
+/// 该快照直接扫描 allocator registry，不分配内存，也不暴露对象地址。它用于在 ELM
+/// 退役被资源账本阻塞时区分普通堆对象、大对象、受管对象和显式物理页泄漏。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocationOwnerStats {
+    pub records: usize,
+    pub requested_bytes: usize,
+    pub usable_bytes: usize,
+    pub boot_records: usize,
+    pub small_records: usize,
+    pub large_records: usize,
+    pub managed_records: usize,
+    pub physical_records: usize,
+    pub largest_requested_bytes: usize,
+    pub largest_usable_bytes: usize,
+    pub scan_errors: usize,
+}
+
 impl AllocationRegistryAudit {
     pub const fn is_consistent(self) -> bool {
         self.flags.is_empty()
@@ -388,6 +407,47 @@ impl AllocationRegistry {
         self.get_result(ptr).ok()
     }
 
+    /// 查询完整覆盖给定地址范围的活跃分配记录。
+    ///
+    /// 注册表按分配起点散列，内部指针无法直接命中桶，因此该接口会遍历各 shard。
+    /// 它只用于跨 ABI 裸指针校验，不应放进常规分配热路径。
+    pub fn find_containing(&self, ptr: usize, len: usize) -> Option<AllocationRecord> {
+        if ptr == 0 || len == 0 {
+            return None;
+        }
+        let end = ptr.checked_add(len)?;
+        for shard in &self.shards {
+            let mut inner = shard.inner.lock();
+            if !inner.initialized {
+                continue;
+            }
+            for bucket in 0..inner.bucket_count {
+                let mut current = bucket_head(&inner, bucket);
+                let mut visited = 0usize;
+                while current != 0 {
+                    if visited >= inner.nodes_allocated {
+                        note_chain_corruption_locked(&mut inner);
+                        return None;
+                    }
+                    let node = read_node(current);
+                    let record = node.record;
+                    let usable = record.usable_size.max(record.size);
+                    if usable != 0
+                        && record
+                            .ptr
+                            .checked_add(usable)
+                            .is_some_and(|record_end| record.ptr <= ptr && end <= record_end)
+                    {
+                        return Some(record);
+                    }
+                    current = node.next;
+                    visited += 1;
+                }
+            }
+        }
+        None
+    }
+
     pub fn get_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
         let hash = hash_ptr(ptr);
         let mut inner = self.shard_for_hash(hash).inner.lock();
@@ -625,6 +685,61 @@ impl AllocationRegistry {
             }
         }
         AllocationRegistrySnapshot { stats, audit: out }
+    }
+
+    /// 扫描指定外部所有者仍存活的分配记录。
+    pub fn owner_stats(&self, owner: u64) -> AllocationOwnerStats {
+        let mut out = AllocationOwnerStats::default();
+        for shard in &self.shards {
+            let inner = shard.inner.lock();
+            if !inner.initialized || inner.buckets.is_null() || inner.bucket_count == 0 {
+                out.scan_errors = out.scan_errors.saturating_add(1);
+                continue;
+            }
+            for bucket in 0..inner.bucket_count {
+                let mut current = bucket_head(&inner, bucket);
+                let mut visited = 0usize;
+                while current != 0 {
+                    if visited >= inner.nodes_allocated {
+                        out.scan_errors = out.scan_errors.saturating_add(1);
+                        break;
+                    }
+                    let node = read_node(current);
+                    let record = node.record;
+                    if record.accounting_owner() == owner {
+                        out.records = out.records.saturating_add(1);
+                        out.requested_bytes = out.requested_bytes.saturating_add(record.size);
+                        out.usable_bytes = out
+                            .usable_bytes
+                            .saturating_add(record.usable_size.max(record.size));
+                        out.largest_requested_bytes = out.largest_requested_bytes.max(record.size);
+                        out.largest_usable_bytes = out
+                            .largest_usable_bytes
+                            .max(record.usable_size.max(record.size));
+                        match record.kind {
+                            AllocationKind::Boot => {
+                                out.boot_records = out.boot_records.saturating_add(1)
+                            }
+                            AllocationKind::Small => {
+                                out.small_records = out.small_records.saturating_add(1)
+                            }
+                            AllocationKind::Large => {
+                                out.large_records = out.large_records.saturating_add(1)
+                            }
+                            AllocationKind::Managed => {
+                                out.managed_records = out.managed_records.saturating_add(1)
+                            }
+                            AllocationKind::Physical => {
+                                out.physical_records = out.physical_records.saturating_add(1)
+                            }
+                        }
+                    }
+                    current = node.next;
+                    visited = visited.saturating_add(1);
+                }
+            }
+        }
+        out
     }
 
     fn shard_for_hash(&self, hash: usize) -> &RegistryShard {

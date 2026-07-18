@@ -4,20 +4,43 @@ extern crate alloc;
 extern crate std;
 
 use alloc::sync::Weak;
+use core::ptr::NonNull;
 
 use ktest::ktest;
 
+use crate::runqueue::Runqueue;
 use crate::{
-    CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedAttr,
-    SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
+    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedAttr,
+    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    supported_cpu_mask,
 };
 
-fn make_task() -> alloc::sync::Arc<Task> {
+unsafe fn init_test_context(
+    _ctx: NonNull<u8>,
+    _stack_top: usize,
+    _entry: crate::KernelEntry,
+    _arg: usize,
+) {
+}
+
+unsafe extern "C" fn switch_test_context(_prev: NonNull<u8>, _next: NonNull<u8>) {}
+
+static TEST_ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
+    context_size: 16,
+    context_align: 16,
+    init_kernel_context: init_test_context,
+    switch_context: switch_test_context,
+};
+
+pub(super) fn make_task() -> alloc::sync::Arc<Task> {
+    crate::arch_hooks::register(&TEST_ARCH_CONTEXT_OPS);
     let session = Session::new();
     let pg = ProcessGroup::new(&session);
     session.register_group(&pg);
     let tg = ThreadGroup::new();
-    Task::new(SchedParams::default_fair(), Weak::new(), tg, pg)
+    let task = Task::new(SchedParams::default_fair(), Weak::new(), tg, pg);
+    task.adopt_current_context();
+    task
 }
 
 #[ktest]
@@ -126,6 +149,89 @@ fn runqueue_migratable_load_filters_cpu_affinity() {
 
     assert!(rq.dequeue(&cpu0, 2));
     assert!(rq.dequeue(&cpu1, 2));
+}
+
+#[ktest]
+fn runqueue_reports_migratable_load_by_sched_class() {
+    let fair = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+    let deadline = make_task();
+    deadline
+        .sched
+        .set_sched_attr(SchedAttr::deadline(1_000_000, 4_000_000, 4_000_000));
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&realtime), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&deadline), 1);
+
+    let load = rq.migratable_class_load();
+    assert_eq!(load.fair, 1);
+    assert_eq!(load.realtime, 1);
+    assert_eq!(load.deadline, 1);
+    assert_eq!(load.deadline_utilization, 256);
+    assert_eq!(load.fair_weight, 1024);
+    assert_eq!(load.total(), 3);
+
+    assert!(rq.dequeue(&fair, 2));
+    assert!(rq.dequeue(&realtime, 2));
+    assert!(rq.dequeue(&deadline, 2));
+}
+
+#[ktest]
+fn runqueue_takes_migratable_task_from_requested_class() {
+    let fair = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&realtime), 1);
+
+    let pulled = rq
+        .take_migratable_from_class(SchedClass::Realtime, CpuMask::single_raw(0).bits(), 2)
+        .expect("realtime task should be migratable");
+    assert!(alloc::sync::Arc::ptr_eq(&pulled, &realtime));
+    assert_eq!(rq.migratable_class_load().fair, 1);
+    assert_eq!(rq.migratable_class_load().realtime, 0);
+
+    assert!(rq.dequeue(&fair, 3));
+}
+
+#[ktest]
+fn runqueue_class_load_includes_current_task() {
+    let fair = make_task();
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    let current = rq.pick_next(2).expect("current task");
+
+    assert_eq!(rq.migratable_class_load().fair, 0);
+    assert_eq!(rq.class_load().fair, 1);
+
+    assert!(rq.dequeue(&current, 3));
+}
+
+#[ktest]
+fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
+    let current = make_task();
+    let queued = make_task();
+    let idle = make_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&current));
+    rq.enqueue(alloc::sync::Arc::clone(&queued), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&idle), 1);
+
+    let drained = rq.drain_queued(2);
+
+    assert_eq!(drained.len(), 1);
+    assert!(alloc::sync::Arc::ptr_eq(&drained[0], &queued));
+    assert!(rq.is_current(&current));
+    assert_eq!(rq.nr_running(), 2);
+    assert!(rq.dequeue(&current, 3));
+    assert!(rq.dequeue(&idle, 3));
 }
 
 #[ktest]

@@ -1,6 +1,7 @@
 //! 用户态 trap frame 构造与进入封装。
 
 /// 默认用户栈顶（不含）。
+#[kernel_symbols::export(name = "hal.user.default_stack_top", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn default_stack_top() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -18,6 +19,7 @@ pub fn default_stack_top() -> usize {
 }
 
 /// 默认用户栈大小。
+#[kernel_symbols::export(name = "hal.user.default_stack_size", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn default_stack_size() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -35,6 +37,7 @@ pub fn default_stack_size() -> usize {
 }
 
 /// PIE 主程序默认装载基址。
+#[kernel_symbols::export(name = "hal.user.main_pie_base", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn main_pie_base() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -52,6 +55,7 @@ pub fn main_pie_base() -> usize {
 }
 
 /// ELF interpreter 默认装载基址。
+#[kernel_symbols::export(name = "hal.user.interp_base", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn interp_base() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -69,6 +73,7 @@ pub fn interp_base() -> usize {
 }
 
 /// vDSO 映射基地址。
+#[kernel_symbols::export(name = "hal.user.vdso_base", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn vdso_base() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -86,6 +91,7 @@ pub fn vdso_base() -> usize {
 }
 
 /// vDSO 数据页偏移。
+#[kernel_symbols::export(name = "hal.user.vdso_data_page_offset", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn vdso_data_page_offset() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -99,6 +105,7 @@ pub fn vdso_data_page_offset() -> usize {
 }
 
 /// vDSO 第一页长度（ELF header + text）。
+#[kernel_symbols::export(name = "hal.user.vdso_text_page_len", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn vdso_text_page_len() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -112,6 +119,7 @@ pub fn vdso_text_page_len() -> usize {
 }
 
 /// vDSO 总映射长度。
+#[kernel_symbols::export(name = "hal.user.vdso_total_size", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn vdso_total_size() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -125,6 +133,7 @@ pub fn vdso_total_size() -> usize {
 }
 
 /// 生成 vDSO ELF 镜像字节。
+#[kernel_symbols::export(name = "hal.user.vdso_image", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn vdso_image() -> alloc::vec::Vec<u8> {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -138,6 +147,7 @@ pub fn vdso_image() -> alloc::vec::Vec<u8> {
 }
 
 /// vDSO 中 sigreturn trampoline 的用户态虚拟地址。
+#[kernel_symbols::export(name = "hal.user.sigreturn_entry_va", contract = "kernel.hal.user-layout@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn sigreturn_entry_va() -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -151,6 +161,7 @@ pub fn sigreturn_entry_va() -> usize {
 }
 
 /// 注册 LoongArch64 timer tick 时的 vDSO 数据页更新回调。
+#[kernel_symbols::export(name = "hal.user.register_vdso_tick_hook", contract = "kernel.hal.user-hook@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 0)]
 pub fn register_vdso_tick_hook(hook: fn(u64)) {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -184,6 +195,7 @@ pub fn register_net_poll_hook(hook: fn(u64)) {
 ///
 /// 终端控制字符需要在没有用户 read 调用时也能触发信号；该 hook 供 kernel
 /// 把 VFS 兼容层的 TTY 行规程接入架构 timer 路径。
+#[kernel_symbols::export(name = "hal.user.register_tty_poll_hook", contract = "kernel.hal.user-hook@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 0)]
 pub fn register_tty_poll_hook(hook: fn(u64)) {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -206,6 +218,7 @@ pub struct CloneRegisterArgs {
 }
 
 /// 将传统的 clone(2) 寄存器参数解码为命名字段。
+#[kernel_symbols::export(name = "hal.user.decode_clone_register_args", contract = "kernel.hal.user-abi@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn decode_clone_register_args(args: [usize; 6]) -> CloneRegisterArgs {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -233,6 +246,7 @@ pub fn decode_clone_register_args(args: [usize; 6]) -> CloneRegisterArgs {
 }
 
 /// 在映射 ELF 解释器之前，给架构一个机会修复已知的用户空间 ABI 适配层。
+#[kernel_symbols::export(name = "hal.user.patch_interpreter_image", contract = "kernel.hal.user-abi@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn patch_interpreter_image(interp: &str, bytes: &mut [u8]) {
     #[cfg(target_arch = "loongarch64")]
     {

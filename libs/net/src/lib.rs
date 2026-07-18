@@ -12,6 +12,7 @@ pub mod address;
 pub mod buf;
 pub mod control;
 pub mod device;
+pub mod elm;
 pub mod flow;
 pub mod id;
 pub mod pipeline;
@@ -31,3 +32,9 @@ pub use socket::{
     install_socket_runtime, interface_by_name, new_raw_socket_facade, new_socket_facade,
     new_tcp_socket_facade,
 };
+
+/// 保留网络子系统的 ELM provider 规格代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    elm::providers as usize
+}

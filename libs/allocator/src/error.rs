@@ -258,6 +258,31 @@ pub enum OwnershipError {
     UnknownPointer,
 }
 
+/// 带外部所有者约束的普通内核分配操作错误。
+///
+/// 该错误用于 ELM 等不能被信任为 allocator 全权调用方的执行环境。它把“地址不存在”与
+/// “地址存在但不属于调用方”分开，同时禁止外部所有者取得 boot、managed 或 physical
+/// 对象。调用方不得根据具体错误绕过资源账本继续操作裸地址。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnedAllocationError {
+    /// 所有者编号为零；零只保留给内核自身。
+    InvalidOwner,
+    /// 请求布局、内存域或对象种类不属于普通可调整内核分配。
+    InvalidRequest,
+    /// 地址不是仍然活跃的逐对象分配起始地址。
+    UnknownPointer,
+    /// 活跃对象属于另一个资源所有者。
+    PermissionDenied,
+    /// 调用方要求保持有效的外部区间与待移动对象发生重叠。
+    AliasedRange,
+    /// allocator 尚未激活。
+    Unavailable,
+    /// 资源预算或底层内存不足。
+    OutOfMemory,
+    /// allocator 后端拒绝了已经通过账本校验的操作。
+    BackendFailure,
+}
+
 /// 受管句柄操作错误。
 ///
 /// 受管堆提供了基于句柄的引用计数和 GC 集成。对句柄、根、字段访问的操作可能因为

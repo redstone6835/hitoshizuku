@@ -290,6 +290,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_RT_TGSIGQUEUEINFO, process::sys_rt_tgsigqueueinfo);
     register_syscall(nr::SYS_SCHED_SETATTR, process::sys_sched_setattr);
     register_syscall(nr::SYS_SCHED_GETATTR, process::sys_sched_getattr);
+    register_syscall(nr::SYS_ELM_CTL, crate::elm::syscall::sys_elm_ctl);
     register_syscall(nr::SYS_MYGO_SCHED_INFO, process::sys_mygo_sched_info);
     register_syscall(nr::SYS_MEMBARRIER, process::sys_membarrier);
     register_syscall(nr::SYS_FUTEX, process::sys_futex);

@@ -120,6 +120,14 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
     arg3: usize, // $r7 = SP
     arg4: usize, // $r8 = TrapFrame ptr
 ) -> usize {
+    // 只有实际中断原生 ELM 时，trap 内部分配才需要排除在该单元账本之外。普通用户
+    // syscall 可能在分派阶段启动 ELM，不能让后创建的执行上下文继承暂停状态。
+    let _accounting_suspension = general::elm_guard::native_execution_active()
+        .then(allocator::suspend_implicit_allocation_accounting)
+        .flatten();
+    // 即使 trap 发生前本地临时屏蔽了 IPI，也在进入 Rust 分发的安全边界
+    // 处理其它 CPU 发布的 TLB/I-cache 刷新请求。
+    super::super::smp::handle_shootdown_requests();
     // 汇编入口已经完成最危险的硬件现场保存；Rust 端从这里开始处理“解释现场并决定命运”。
     // 返回非零表示异常可恢复，汇编端将按该 TrapFrame 恢复寄存器并执行 `ertn`；
     // 返回零表示当前策略认定无法恢复，汇编端进入停机路径。
@@ -141,6 +149,15 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             arg0,
             LoongArch64MessageInterruptOps::current_cpu_id()
         );
+        if is & IS_IPI_BIT != 0 {
+            super::super::smp::handle_ipi();
+            let now_ns = super::super::specific::kernel_timestamp_ns();
+            deliver_user_signals_before_return(arg4, from_user);
+            if from_user {
+                sched::preempt_if_needed(now_ns);
+            }
+            return arg4;
+        }
         // 清除定时器中断标志（写 CSR_TICLR bit 0）
         if is & IS_TIMER_BIT != 0 {
             #[cfg(feature = "performance-profile")]
@@ -158,16 +175,35 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
+            let _ = general::elm_guard::request_timeout_if_expired(now_ns);
+            if !from_user
+                && let Some(recovery) = general::elm_guard::try_recover_requested_abort(tf.pc)
+            {
+                log::warning!(
+                    "[trap][elm] forced native exit cell={} phase={} reason={} return_pc={:#x} return_sp={:#x}",
+                    recovery.cell,
+                    recovery.phase,
+                    recovery.reason,
+                    recovery.return_pc,
+                    recovery.return_sp
+                );
+                tf.pc = recovery.return_pc;
+                tf.sp = recovery.return_sp;
+                tf.a0 = recovery.return_value;
+                return arg4;
+            }
             sched::on_timer_tick(now_ns);
-            super::super::vdso::run_timer_tick_hook(now_ns);
-            // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
-            // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
-            // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
-            // 路径在 RX 队列空时本身极快（一次 mutex + 几次状态查询）。
-            super::super::vdso::run_net_poll_hook(now_ns);
-            // TTY 输入泵：即使前台任务没有调用 read()，也要及时处理
-            // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
-            super::super::vdso::run_tty_poll_hook(now_ns);
+            if LoongArch64MessageInterruptOps::current_cpu_id() == 0 {
+                super::super::vdso::run_timer_tick_hook(now_ns);
+                // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
+                // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
+                // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
+                // 路径在 RX 队列空时本身极快（一次 mutex + 几次状态查询）。
+                super::super::vdso::run_net_poll_hook(now_ns);
+                // TTY 输入泵：即使前台任务没有调用 read()，也要及时处理
+                // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
+                super::super::vdso::run_tty_poll_hook(now_ns);
+            }
             deliver_user_signals_before_return(arg4, from_user);
             // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
             // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
@@ -178,6 +214,13 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         }
         let now_ns = super::super::specific::kernel_timestamp_ns();
         let _ = general::dev::irq::dispatch_interrupt(intr);
+        if !from_user && let Some(recovery) = general::elm_guard::try_recover_requested_abort(tf.pc)
+        {
+            tf.pc = recovery.return_pc;
+            tf.sp = recovery.return_sp;
+            tf.a0 = recovery.return_value;
+            return arg4;
+        }
         // 串口输入在 UART 外部中断到来时最可靠：此时硬件 FIFO 已经可读，
         // 需要马上拉进 TTY 行规程，避免没有 reader 的前台任务错过 Ctrl-C。
         super::super::vdso::run_tty_poll_hook(now_ns);
@@ -190,6 +233,24 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         }
         arg4
     } else if ecode == ECODE_SYS {
+        if !from_user
+            && let Some(recovery) = general::elm_guard::try_recover_kernel_fault(arg0, arg2, ecode)
+        {
+            log::warning!(
+                "[trap][elm] recovered native syscall cell={} phase={} pc={:#x} badv={:#x} ecode={} return_pc={:#x} return_sp={:#x}",
+                recovery.cell,
+                recovery.phase,
+                arg0,
+                arg2,
+                ecode,
+                recovery.return_pc,
+                recovery.return_sp
+            );
+            tf.pc = recovery.return_pc;
+            tf.sp = recovery.return_sp;
+            tf.a0 = recovery.return_value;
+            return arg4;
+        }
         // syscall 通过注入的 SyscallFrameOps 读 a7/a0-a5、写返回值、推 PC。
         // general::syscall::dispatch 本轮全部返 ENOSYS；ELF loader 那轮再逐条加 arm。
         // log::debug!("[trap] syscall id={} pc={:#x} from_user={}", tf.a7, arg0, from_user);
@@ -248,6 +309,25 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 arg4
             }
             FaultOutcome::Kernel(reason) => {
+                if !from_user
+                    && let Some(recovery) =
+                        general::elm_guard::try_recover_kernel_fault(arg0, arg2, ecode)
+                {
+                    log::warning!(
+                        "[trap][elm] recovered native fault cell={} phase={} pc={:#x} badv={:#x} ecode={} return_pc={:#x} return_sp={:#x}",
+                        recovery.cell,
+                        recovery.phase,
+                        arg0,
+                        arg2,
+                        ecode,
+                        recovery.return_pc,
+                        recovery.return_sp
+                    );
+                    tf.pc = recovery.return_pc;
+                    tf.sp = recovery.return_sp;
+                    tf.a0 = recovery.return_value;
+                    return arg4;
+                }
                 log::debug!(
                     "[trap][mm] kernel fault ({:?}) pc={:#x} badv={:#x} ecode={}",
                     reason,
@@ -290,6 +370,25 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             tf.t0,
             tf.t1
         );
+
+        if !from_user
+            && let Some(recovery) = general::elm_guard::try_recover_kernel_fault(arg0, arg2, ecode)
+        {
+            log::warning!(
+                "[trap][elm] recovered native exception cell={} phase={} pc={:#x} badv={:#x} ecode={} return_pc={:#x} return_sp={:#x}",
+                recovery.cell,
+                recovery.phase,
+                arg0,
+                arg2,
+                ecode,
+                recovery.return_pc,
+                recovery.return_sp
+            );
+            tf.pc = recovery.return_pc;
+            tf.sp = recovery.return_sp;
+            tf.a0 = recovery.return_value;
+            return arg4;
+        }
 
         if matches!(exc, Exception::Breakpoint) {
             // 断点异常的硬件语义更接近“调试陷入”而不是致命错误；最小可恢复策略就是跳过

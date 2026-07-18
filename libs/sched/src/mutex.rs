@@ -73,19 +73,19 @@ impl<T> Mutex<T> {
             }
 
             let current = current_task();
-            self.waiters.prepare_to_wait(&current, TaskState::Sleeping);
+            let entry = self.waiters.prepare_to_wait(&current, TaskState::Sleeping);
 
             if self
                 .locked
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                self.waiters.finish_wait(&current);
+                self.waiters.finish_wait(&entry);
                 return MutexGuard { lock: self };
             }
 
             schedule_once(now_ns_public());
-            self.waiters.finish_wait(&current);
+            self.waiters.finish_wait(&entry);
         }
     }
 }

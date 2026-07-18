@@ -14,6 +14,7 @@ performance-profile = ["dep:profiling"]
 
 [dependencies]
 errno = { path = "../errno" }
+kernel-symbols = { path = "../kernel-symbols" }
 log = { path = "../log" }
 profiling = { path = "../profiling", optional = true }
 

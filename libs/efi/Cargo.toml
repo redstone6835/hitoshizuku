@@ -12,3 +12,4 @@ bench = false
 cc = "1"
 
 [dependencies]
+kernel-symbols = { path = "../kernel-symbols" }

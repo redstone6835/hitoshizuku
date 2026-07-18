@@ -252,13 +252,22 @@ fn kheap_full_cache_keeps_latest_freed_range_hot() {
         .expect("deallocate reused sentinel");
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
-    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.kheap_live_records, before.kheap_live_records);
     assert_eq!(after.kheap_active_allocs, before.kheap_active_allocs);
 }
 
 /// 外部维护 API 应能主动释放 kheap 缓存页，并保持 registry 账本不变。
 #[ktest]
 fn allocator_reclaim_releases_kheap_cached_ranges() {
+    KERNEL_ALLOCATOR
+        .reclaim(
+            AllocatorReclaimRequest::caches()
+                .without_slab_cache_flush()
+                .without_slab_empty_reclaim()
+                .without_physical_deferred_reclaim(),
+        )
+        .expect("quiesce kheap cache before reclaim test");
+
     let before = KERNEL_ALLOCATOR.audit();
     assert!(before.is_consistent());
 

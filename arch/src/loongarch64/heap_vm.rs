@@ -235,10 +235,12 @@
 //! 7. **统计信息**：记录大页使用率、TLB miss 率等性能指标
 use crate::loongarch64::paging::LoongArch64Paging;
 use crate::loongarch64::specific::phys_to_virt;
+use crate::loongarch64::task::LoongArch64TaskOps;
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
-    MapError, PagingArch, PhysPageTableRoot, find_leaf, unmap_range_entries, walk_and_map,
+    MapError, PagingArch, PhysPageTableRoot, find_leaf, protect_range_entries,
+    replace_empty_table_with_leaf, unmap_range_entries, validate_range_permissions, walk_and_map,
 };
 
 /// 内核堆虚拟地址区域基址（在 DMW 窗口之外）
@@ -415,6 +417,15 @@ pub fn init_kernel_page_table() {
     log::debug!("[arch][heap_vm] kernel page table activated (DMW still active)");
 }
 
+/// 在辅助 CPU 上激活 boot CPU 已建立的内核页表。
+pub(crate) unsafe fn activate_kernel_page_table_for_secondary() {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    assert_ne!(root_paddr, 0, "[smp] kernel page table is not ready");
+    unsafe {
+        LoongArch64Paging::activate(PhysPageTableRoot::new(root_paddr));
+    }
+}
+
 /// 分配页表页
 fn allocate_page_table_page() -> Result<usize, MapError> {
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
@@ -422,6 +433,12 @@ fn allocate_page_table_page() -> Result<usize, MapError> {
         .allocate_physical(request)
         .map_err(|_| MapError::OutOfMemory)?;
     Ok(allocation.paddr)
+}
+
+fn free_page_table_page(paddr: usize) -> bool {
+    allocator::KERNEL_ALLOCATOR
+        .try_free_physical_addr(paddr)
+        .is_ok()
 }
 
 /// 根据 PagePolicy 映射地址范围
@@ -585,7 +602,7 @@ fn map_range_with_policy(
     let end_vaddr = vaddr + size;
 
     while current_vaddr < end_vaddr {
-        if let Err(err) = walk_and_map::<LoongArch64Paging>(
+        if let Err(mut err) = walk_and_map::<LoongArch64Paging>(
             root_vaddr,
             current_vaddr,
             current_paddr,
@@ -598,6 +615,37 @@ fn map_range_with_policy(
             phys_to_virt,
             allocate_page_table_page,
         ) {
+            if matches!(err, MapError::AlreadyMapped)
+                && !matches!(page_policy, PagePolicy::BaseOnly)
+            {
+                match replace_empty_table_with_leaf::<LoongArch64Paging>(
+                    root_vaddr,
+                    current_vaddr,
+                    current_paddr,
+                    target_level,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    phys_to_virt,
+                    free_page_table_page,
+                ) {
+                    Ok(reclaim_failures) => {
+                        if reclaim_failures != 0 {
+                            log::error!(
+                                "[arch][heap_vm] promoted empty page-table subtree with {} unreclaimed page(s): vaddr={:#x}",
+                                reclaim_failures,
+                                current_vaddr
+                            );
+                        }
+                        current_vaddr += page_size;
+                        current_paddr += page_size;
+                        continue;
+                    }
+                    Err(promote_err) => err = promote_err,
+                }
+            }
             let mapped_size = current_vaddr - vaddr;
             let mut rollback_failed = false;
             if mapped_size != 0
@@ -864,4 +912,75 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
     //     size
     // );
     true
+}
+
+pub fn sync_icache() {
+    <LoongArch64TaskOps as general::TaskOps>::sync_icache();
+}
+
+pub fn protect_kernel_heap_range(
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> bool {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    if root_paddr == 0 {
+        log::error!(
+            "[arch][heap_vm] page table not initialized yet, cannot protect: vaddr={:#x} size={:#x}",
+            vaddr,
+            size
+        );
+        return false;
+    }
+
+    let root_vaddr = phys_to_virt(root_paddr);
+    if let Err(err) = protect_range_entries::<LoongArch64Paging>(
+        root_vaddr,
+        vaddr,
+        size,
+        read,
+        write,
+        execute,
+        false,
+        true,
+        phys_to_virt,
+    ) {
+        log::error!(
+            "[arch][heap_vm] failed to protect kernel heap range: vaddr={:#x} size={:#x} error={:?}",
+            vaddr,
+            size,
+            err
+        );
+        return false;
+    }
+
+    unsafe {
+        LoongArch64Paging::flush_tlb(None);
+    }
+    true
+}
+
+pub fn validate_kernel_heap_range(
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> bool {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    if root_paddr == 0 {
+        return false;
+    }
+    validate_range_permissions::<LoongArch64Paging>(
+        phys_to_virt(root_paddr),
+        vaddr,
+        size,
+        read,
+        write,
+        execute,
+        phys_to_virt,
+    )
+    .is_ok()
 }

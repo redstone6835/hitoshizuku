@@ -62,7 +62,14 @@ pub struct BlockGeometry {
     block_count: Option<u64>,
 }
 
+#[kernel_symbols::export]
 impl BlockGeometry {
+    #[kernel_symbols::export(
+        name = "general.dev.block.BlockGeometry.new",
+        contract = "kernel.general.block-model@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     pub fn new(logical: NonZeroU32, physical: NonZeroU32, count: Option<u64>) -> Option<Self> {
         if physical < logical {
             return None;
@@ -140,7 +147,14 @@ impl BlockRangeLimits {
     }
 }
 
+#[kernel_symbols::export]
 impl BlockLimits {
+    #[kernel_symbols::export(
+        name = "general.dev.block.BlockLimits.new",
+        contract = "kernel.general.block-model@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     pub fn new(
         max_blocks_per_io: Option<NonZeroU32>,
         optimal_blocks_per_io: Option<NonZeroU32>,
@@ -563,7 +577,16 @@ pub struct BlockDeviceInit<'a> {
     pub features: BlockFeatures,
 }
 
+#[kernel_symbols::export]
 impl BlockDevice {
+    #[kernel_symbols::export(
+        name = "general.dev.block.BlockDevice.new",
+        contract = "kernel.general.block-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
     pub fn new(
         init: BlockDeviceInit<'_>,
         driver: Arc<dyn BlockDriver>,

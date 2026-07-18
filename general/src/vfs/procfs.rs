@@ -2591,6 +2591,13 @@ fn proc_pnp_id_render_len(id: &PnpId) -> usize {
                 "platform:".len() + name.len() + "[ids=,resources=]".len() + 20
             }
         }
+        PnpId::Dynamic {
+            contract, identity, ..
+        } => "dynamic::"
+            .len()
+            .saturating_add(contract.len())
+            .saturating_add(identity.len().saturating_mul(2))
+            .saturating_add(32),
     }
 }
 
@@ -2678,7 +2685,7 @@ fn render_pnp() -> String {
         let functions = dev.try_functions().unwrap_or_default();
         let resources = dev.try_owned_resources().unwrap_or_default();
         let deferred = dev.deferred_dependency();
-        let driver = dev.bound_driver_name().unwrap_or("-");
+        let driver = dev.bound_driver_name();
         // 诊断输出按设备逐行预留，避免构造 function/resource 的中间字符串列表。
         let functions_len = ProcPnpSchema::function_list_len(&functions);
         let resources_len = ProcPnpSchema::resource_list_len(&resources);
@@ -2687,8 +2694,8 @@ fn render_pnp() -> String {
             .name
             .len()
             .saturating_add(proc_pnp_id_render_len(&dev.id))
-            .saturating_add(dev.info.bus_type().as_str().len())
-            .saturating_add(driver.len())
+            .saturating_add(dev.info.bus_name().len())
+            .saturating_add(driver.as_deref().unwrap_or("-").len())
             .saturating_add(functions_len)
             .saturating_add(resources_len)
             .saturating_add(deferred_len)
@@ -2699,11 +2706,11 @@ fn render_pnp() -> String {
         let _ = write!(
             out,
             "{}\t{}\t{}\t{}\t{}\t",
-            dev.info.bus_type().as_str(),
+            dev.info.bus_name(),
             dev.id,
             dev.name,
             proc_pnp_state_name(dev.state()),
-            driver,
+            driver.as_deref().unwrap_or("-"),
         );
         ProcPnpSchema::write_functions(&mut out, &functions);
         out.push('\t');
