@@ -255,6 +255,8 @@ run_pan_shard() {
     idle=0
     completed=0
     timed_out=0
+    completion_grace=0
+    forced_complete=0
 
     while kill -0 "$child" 2>/dev/null; do
         sleep 1
@@ -268,6 +270,19 @@ run_pan_shard() {
         else
             idle=$((idle + 1))
         fi
+        if [ "$completed" -ge "$run_count" ] 2>/dev/null; then
+            completion_grace=$((completion_grace + 1))
+            if [ "$completion_grace" -ge 2 ]; then
+                # 所有正式测试均已写入并刷盘；剩余时间只属于 ltp-pan 的 orphan 清理。
+                # 当前 VM 随后会整体销毁，因此无需按每个遗留进程组额外等待五秒。
+                kill -KILL "$child" 2>/dev/null || true
+                wait "$child" 2>/dev/null || true
+                forced_complete=1
+                break
+            fi
+        else
+            completion_grace=0
+        fi
         if [ "$idle" -ge "$CASE_TIMEOUT" ]; then
             timed_out=1
             break
@@ -277,6 +292,8 @@ run_pan_shard() {
     if [ "$timed_out" -eq 1 ]; then
         stop_pan "$child"
         pan_ret=124
+    elif [ "$forced_complete" -eq 1 ]; then
+        pan_ret=0
     else
         wait "$child"
         pan_ret=$?
