@@ -5,12 +5,102 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use elm_model::{
     ELM_MGR_BUILTIN_ID, ElmEbiLoadStatus, ElmEbiSourceKind, ElmPrincipal, ElmResourceBudget,
     ElmSliceImageReader, canonical_ebi_digest, sha256,
 };
 use sched::Task;
+use sched::sync::Spinlock;
+
+/// ELM 生命周期通知只描述运行时可观察的状态变化，不携带任何子系统资源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElmLifecycleEvent {
+    CellLoaded { cell: elm_model::ElmId },
+}
+
+type LifecycleObserver = fn(ElmLifecycleEvent);
+
+#[derive(Clone, Copy)]
+struct LifecycleObserverEntry {
+    owner: &'static str,
+    callback: LifecycleObserver,
+}
+
+static LIFECYCLE_OBSERVERS: Spinlock<Vec<LifecycleObserverEntry>> = Spinlock::new(Vec::new());
+
+/// 注册常驻内核的 ELM 生命周期观察者；同一 owner 重复注册是幂等的。
+pub(crate) fn register_lifecycle_observer(
+    owner: &'static str,
+    callback: LifecycleObserver,
+) -> bool {
+    let mut observers = LIFECYCLE_OBSERVERS.lock();
+    if observers.iter().any(|observer| observer.owner == owner) {
+        return true;
+    }
+    if observers.try_reserve(1).is_err() {
+        return false;
+    }
+    observers.push(LifecycleObserverEntry { owner, callback });
+    true
+}
+
+fn notify_lifecycle_event(event: ElmLifecycleEvent) {
+    // 复制函数指针后再回调，避免观察者回调期间持有注册表锁。
+    let registered = LIFECYCLE_OBSERVERS.lock();
+    let mut observers = Vec::new();
+    if observers.try_reserve(registered.len()).is_err() {
+        log::error!("[elm] 生命周期观察者通知分配失败");
+        return;
+    }
+    observers.extend(registered.iter().copied());
+    drop(registered);
+    for observer in observers {
+        (observer.callback)(event);
+    }
+}
+
+/// 常驻内核 consumer 对一个 ELM exact-Rust export 的代际固定描述。
+///
+/// 该对象只保存复制到常驻内存中的身份和 ABI 摘要；每次调用仍由 Core 重新校验 cell
+/// 状态、generation 和 export 路由，并取得 active-execution 引用。
+pub(crate) struct PinnedNativeCall {
+    owner: elm_model::ElmId,
+    generation: elm_model::Generation,
+    name: String,
+    contract: elm_model::FlowContract,
+    version: u32,
+    rust_abi_hash: [u8; 32],
+    stack: native::PinnedNativeStack,
+}
+
+impl PinnedNativeCall {
+    pub(crate) fn new(
+        owner: elm_model::ElmId,
+        generation: elm_model::Generation,
+        name: &str,
+        contract: &str,
+        version: u32,
+        rust_abi: &str,
+    ) -> Result<Self, &'static str> {
+        if owner.0 == 0 || generation.0 == 0 || version == 0 {
+            return Err("invalid pinned native identity");
+        }
+        let stack = native::PinnedNativeStack::allocate()
+            .map_err(|_| "failed to allocate pinned native stack")?;
+        Ok(Self {
+            owner,
+            generation,
+            name: name.to_string(),
+            contract: elm_model::FlowContract::new(contract)
+                .map_err(|_| "invalid pinned native contract")?,
+            version,
+            rust_abi_hash: elm_model::sha256(rust_abi.as_bytes()),
+            stack,
+        })
+    }
+}
 
 mod api_registry;
 mod core;
@@ -137,6 +227,7 @@ pub(crate) fn init_builtin_mgr() {
             }
         }
         core.init_builtin_mgr()?;
+        core.mark_global_runtime_scope();
         Ok::<usize, elm_model::ElmError>(configured_anchor_count)
     }) {
         Ok(configured_anchor_count) => {
@@ -178,6 +269,30 @@ pub(crate) fn synchronize_smp_runtime() {
         snapshot.worker_mask,
         started
     );
+}
+
+/// 执行一次 kernel-consumer pinned native call。
+///
+/// Core 锁只用于准备和完成阶段；模块代码运行期间不持有 Core 锁。
+pub(crate) fn invoke_pinned_native<T>(
+    call: &PinnedNativeCall,
+    frame: &mut T,
+    host_ranges: &[(usize, usize)],
+    deadline_ns: u64,
+) -> Result<i32, i32> {
+    let plan = with_core(|core| core.prepare_pinned_native_call(call))?;
+    let status = native::invoke_pinned_export(
+        plan.callee.cell,
+        plan.callee.generation,
+        plan.address,
+        plan.bounds,
+        frame,
+        host_ranges,
+        &call.stack,
+        plan.callee.allowed_actions,
+        deadline_ns,
+    );
+    with_core(|core| core.complete_pinned_native_call(plan, status))
 }
 
 pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String> {

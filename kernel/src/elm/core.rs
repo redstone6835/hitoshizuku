@@ -53,9 +53,9 @@ use elm_model::{
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE,
     ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
-    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_NATIVE_TODO,
-    ELM_POLICY_BLOCK_POLICY_ESCALATION, ELM_POLICY_BLOCK_PORT_NOT_FOUND,
-    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_NATIVE_CALL_FAILED,
+    ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_POLICY_ESCALATION,
+    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
     ELM_POLICY_BLOCK_RESOURCE_QUOTA, ELM_POLICY_BLOCK_ROLLBACK_REJECTED,
@@ -641,11 +641,11 @@ struct ProviderSnapshotPageResult {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CellExecutionToken {
-    cell: ElmId,
-    generation: Generation,
+pub(super) struct CellExecutionToken {
+    pub(super) cell: ElmId,
+    pub(super) generation: Generation,
     policy_epoch: u64,
-    allowed_actions: u32,
+    pub(super) allowed_actions: u32,
     exclusive: bool,
 }
 
@@ -726,6 +726,12 @@ struct ManagedCallExecutionPlan {
     address: usize,
     bounds: NativeExecutionBounds,
     frame: ElmCallFrame,
+}
+
+pub(super) struct PinnedNativeExecutionPlan {
+    pub(super) callee: CellExecutionToken,
+    pub(super) address: usize,
+    pub(super) bounds: NativeExecutionBounds,
 }
 
 enum PreparedProviderCall {
@@ -1205,6 +1211,7 @@ impl ElmMgrRuntime {
 
 pub(crate) struct ElmCore {
     initialized: bool,
+    global_runtime_scope: bool,
     trust_store: ElmTrustStore,
     allow_unsigned_external: bool,
     mgr_runtime: ElmMgrRuntime,
@@ -1272,6 +1279,7 @@ impl ElmCore {
     pub const fn new() -> Self {
         Self {
             initialized: false,
+            global_runtime_scope: false,
             trust_store: ElmTrustStore::new(),
             allow_unsigned_external: cfg!(feature = "kernel-tests"),
             mgr_runtime: ElmMgrRuntime::new(),
@@ -1339,6 +1347,10 @@ impl ElmCore {
 
     pub(crate) const fn initialized(&self) -> bool {
         self.initialized
+    }
+
+    pub(crate) fn mark_global_runtime_scope(&mut self) {
+        self.global_runtime_scope = true;
     }
 
     pub fn set_allow_unsigned_external(&mut self, allow: bool) -> Result<(), ElmTrustError> {
@@ -10239,6 +10251,12 @@ impl ElmCore {
 
     fn check_health_resources(&self, records: &mut Vec<ElmCoreHealthRecord>) {
         let start = records.len();
+        // 资源账本是进程级运行时状态；临时 ElmCore 只用于 ktest，不能把全局 Core
+        // 的 cell/resource 视为自己的对象。临时 Core 的状态机和 ABI 仍由其它检查覆盖。
+        if !self.global_runtime_scope {
+            push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_RESOURCES);
+            return;
+        }
         let now_ns = sched::now_ns_public();
         for cell in &self.cells {
             if !super::resource_accounting::registered(cell.id)
@@ -13409,6 +13427,57 @@ impl ElmCore {
         Ok(reply)
     }
 
+    pub(super) fn prepare_pinned_native_call(
+        &mut self,
+        call: &super::PinnedNativeCall,
+    ) -> Result<PinnedNativeExecutionPlan, i32> {
+        if self.cell_state(call.owner) != Some(ElmState::Active) {
+            return Err(ELM_MGR_STATUS_BUSY);
+        }
+        let export = self
+            .native_exports
+            .iter()
+            .find(|export| {
+                export.owner == call.owner
+                    && export.generation == call.generation
+                    && export.name == call.name
+                    && export.contract == call.contract
+                    && export.version == call.version
+                    && !native_export_is_managed(export.flags)
+                    && export.flags & elm_model::ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
+                    && export.rust_abi_hash == call.rust_abi_hash
+            })
+            .cloned()
+            .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
+        let bounds = export.bounds.ok_or(ELM_MGR_STATUS_INVALID)?;
+        let callee = self.reserve_cell_execution(call.owner)?;
+        if callee.generation != call.generation {
+            self.release_cell_execution(callee);
+            return Err(ELM_MGR_STATUS_BUSY);
+        }
+        Ok(PinnedNativeExecutionPlan {
+            callee,
+            address: export.address,
+            bounds,
+        })
+    }
+
+    pub(super) fn complete_pinned_native_call(
+        &mut self,
+        plan: PinnedNativeExecutionPlan,
+        status: i32,
+    ) -> Result<i32, i32> {
+        let current = self.cell_execution_is_current(plan.callee);
+        self.release_cell_execution(plan.callee);
+        if !current {
+            return Err(ELM_MGR_STATUS_BUSY);
+        }
+        if status == ELM_CALL_STATUS_PROVIDER_FAULT {
+            self.mark_native_fault(plan.callee.cell, ELM_POLICY_BLOCK_NATIVE_CALL_FAILED);
+        }
+        Ok(status)
+    }
+
     fn reserve_provider_execution(
         &mut self,
         provider_index: usize,
@@ -16102,7 +16171,18 @@ impl ElmCore {
 
     #[allow(dead_code)]
     fn alloc_cell_id(&mut self) -> Option<ElmId> {
-        take_monotonic_id(&mut self.next_cell_id).map(ElmId)
+        loop {
+            let id = take_monotonic_id(&mut self.next_cell_id).map(ElmId)?;
+            // Multiple ElmCore instances are used by in-kernel tests while the global Core
+            // may already own a BuildBound cell. Never reuse an ID present in either global
+            // resource registry; this keeps test cores from colliding with live generations.
+            if super::resource_accounting::registered(id)
+                || super::owned_resource::owner_snapshot(id).is_some()
+            {
+                continue;
+            }
+            return Some(id);
+        }
     }
 
     #[allow(dead_code)]

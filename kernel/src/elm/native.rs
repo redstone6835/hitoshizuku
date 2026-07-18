@@ -39,6 +39,14 @@ struct NativeCallStack {
     base: usize,
 }
 
+pub(super) struct PinnedNativeStack(NativeCallStack);
+
+impl PinnedNativeStack {
+    pub(super) fn allocate() -> ElmResult<Self> {
+        NativeCallStack::allocate().map(Self)
+    }
+}
+
 impl NativeCallStack {
     fn allocate() -> ElmResult<Self> {
         let request =
@@ -160,40 +168,16 @@ impl NativeInvocation {
         bounds: NativeExecutionBounds,
         extra_host_ranges: &[(usize, usize)],
     ) -> i32 {
-        let context_start = context as usize;
-        let Some(context_end) = context_start.checked_add(core::mem::size_of::<T>()) else {
-            return ELM_CALL_STATUS_PROVIDER_FAULT;
-        };
-        let mut host_ranges = [(0usize, 0usize); general::elm_guard::ELM_GUARD_MAX_HOST_RANGES];
-        let required_ranges = 1usize.saturating_add(extra_host_ranges.len());
-        if required_ranges > host_ranges.len()
-            || context_start == 0
-            || context_start >= context_end
-            || address < bounds.code_start
-            || address >= bounds.code_end
-        {
-            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        unsafe {
+            invoke_on_native_stack(
+                &self.guard,
+                &self.stack,
+                address,
+                context,
+                bounds,
+                extra_host_ranges,
+            )
         }
-        host_ranges[0] = (context_start, context_end);
-        for (index, range) in extra_host_ranges.iter().copied().enumerate() {
-            host_ranges[index + 1] = range;
-        }
-        if !self.guard.configure_native_bounds(
-            bounds.code_start,
-            bounds.code_end,
-            bounds.image_start,
-            bounds.image_end,
-            self.stack.start(),
-            self.stack.top(),
-            &host_ranges[..required_ranges],
-        ) {
-            return ELM_CALL_STATUS_PROVIDER_FAULT;
-        }
-        let Some(_domain) = self.guard.enter_domain(ElmExecutionDomain::ElmCode) else {
-            return ELM_CALL_STATUS_PROVIDER_FAULT;
-        };
-        // 安全性：调用方保证入口地址与上下文 ABI；架构调用门只使用本对象持有的隔离栈。
-        unsafe { arch::call_elm_native(address, context.cast::<u8>(), self.stack.top()) }
     }
 
     fn finish(self) -> NativeInvocationResult {
@@ -204,6 +188,50 @@ impl NativeInvocation {
             budget_exceeded: accounting.call_budget_exceeded || accounting.period_budget_exceeded,
         }
     }
+}
+
+unsafe fn invoke_on_native_stack<T>(
+    guard: &ElmGuard,
+    stack: &NativeCallStack,
+    address: usize,
+    context: *mut T,
+    bounds: NativeExecutionBounds,
+    extra_host_ranges: &[(usize, usize)],
+) -> i32 {
+    let context_start = context as usize;
+    let Some(context_end) = context_start.checked_add(core::mem::size_of::<T>()) else {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let mut host_ranges = [(0usize, 0usize); general::elm_guard::ELM_GUARD_MAX_HOST_RANGES];
+    let required_ranges = 1usize.saturating_add(extra_host_ranges.len());
+    if required_ranges > host_ranges.len()
+        || context_start == 0
+        || context_start >= context_end
+        || address < bounds.code_start
+        || address >= bounds.code_end
+    {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    }
+    host_ranges[0] = (context_start, context_end);
+    for (index, range) in extra_host_ranges.iter().copied().enumerate() {
+        host_ranges[index + 1] = range;
+    }
+    if !guard.configure_native_bounds(
+        bounds.code_start,
+        bounds.code_end,
+        bounds.image_start,
+        bounds.image_end,
+        stack.start(),
+        stack.top(),
+        &host_ranges[..required_ranges],
+    ) {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    }
+    let Some(_domain) = guard.enter_domain(ElmExecutionDomain::ElmCode) else {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    // 安全性：调用方保证入口地址与上下文 ABI；架构调用门只使用本对象持有的隔离栈。
+    unsafe { arch::call_elm_native(address, context.cast::<u8>(), stack.top()) }
 }
 
 impl Drop for NativeCallStack {
@@ -1413,6 +1441,73 @@ pub(crate) fn invoke_kernel_mixin_handler(
     let aborted = guard.aborted();
     let accounting = accounting.finish(sched::now_ns_public());
     if aborted || accounting.call_budget_exceeded || accounting.period_budget_exceeded {
+        ELM_CALL_STATUS_PROVIDER_FAULT
+    } else {
+        status
+    }
+}
+
+/// 在隔离栈和 fault guard 中执行一个由常驻内核 consumer 固定的 exact-Rust export。
+pub(crate) fn invoke_pinned_export<T>(
+    cell: ElmId,
+    generation: Generation,
+    address: usize,
+    bounds: NativeExecutionBounds,
+    frame: &mut T,
+    host_ranges: &[(usize, usize)],
+    stack: &PinnedNativeStack,
+    allowed_actions: u32,
+    requested_deadline_ns: u64,
+) -> i32 {
+    if address < bounds.code_start || address >= bounds.code_end {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    }
+    let now_ns = sched::now_ns_public();
+    let Ok(accounting) = super::resource_accounting::begin_native_call(
+        cell,
+        ELM_NATIVE_STACK_TOTAL_SIZE as u64,
+        requested_deadline_ns,
+        now_ns,
+    ) else {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let Some(guard) = ElmGuard::enter(
+        cell.0,
+        ELM_GUARD_PHASE_MANAGED_CALL,
+        accounting.effective_deadline_ns(),
+    ) else {
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let context = ElmContext::new(
+        cell,
+        None,
+        generation,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_allowed_actions(allowed_actions);
+    let Some(_current) = try_enter_current_context(&context) else {
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    // Safety: Core 已校验 export 身份、exact-Rust ABI、代际和 RX 边界；frame 只在同步调用内借用。
+    let status =
+        unsafe { invoke_on_native_stack(&guard, &stack.0, address, frame, bounds, host_ranges) };
+    let aborted = guard.aborted();
+    let abort_reason = guard.abort_reason();
+    let accounting = accounting.finish(sched::now_ns_public());
+    if aborted || accounting.call_budget_exceeded || accounting.period_budget_exceeded {
+        log::error!(
+            "[elm] pinned native call aborted: cell={} reason={} elapsed_ns={} call_budget={} period_budget={} status={}",
+            cell.0,
+            abort_reason,
+            accounting.elapsed_ns,
+            accounting.call_budget_exceeded,
+            accounting.period_budget_exceeded,
+            status,
+        );
         ELM_CALL_STATUS_PROVIDER_FAULT
     } else {
         status
