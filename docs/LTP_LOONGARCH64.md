@@ -136,6 +136,7 @@ python3 scripts/ltp_la.py report
 - [x] 实现清单、分片、恢复、异常重试、镜像保护和报告生成的宿主编排器。
 - [x] 为清单解析、marker、结果分类和恢复去重添加宿主单元测试。
 - [x] 构建专用 `kernel-la` 并完成 TPASS、静态跳过和 TCONF 三类冒烟。
+- [x] 修复 epoll 高精度超时链路，并完成默认四核连续五轮计时回归。
 - [ ] 完成 `default` 与 `network` 第一轮全量基线。
 - [ ] 按独立根因修复内核漏洞并完成三次单例与场景分片回归。
 - [ ] 从零完成最终全量复测。
@@ -191,3 +192,29 @@ python3 scripts/ltp_la.py report
 宿主 VFS 测试扩展到 75 项，覆盖容量跨端点共享、零值收缩、容量取整、回绕数据保留、
 占用量与权限错误、真实写容量、`PIPE_BUF` 原子写和 `POLLOUT` 阈值，全部通过。
 对应提交为 `a210111c` 和 `aa8953b4`。
+
+### LoongArch64 高精度超时与 epoll 计时
+
+`epoll_wait02` 和 `epoll_pwait03` 的早期复现显示，1、2、5、10 ms 请求分别稳定等待
+约 4、8、20、40 ms。修复四倍偏差后，`epoll_pwait03` 仍偶发在 10 ms 或 25 ms
+统计组越过 LTP 阈值，因而继续检查完整 syscall、调度器和架构 timer 链路，而不是把
+该结果归类为测试环境噪声。
+
+| 层次 | 根因 | 修复 |
+| --- | --- | --- |
+| LoongArch64 TCFG | `TCFG.InitVal` 已经以位 47:2 的原始计数格式写入，旧代码仍再次左移两位，使硬件初值精确放大四倍 | 改用 one-shot TCFG，直接写入低两位清零的原始计数值；每次中断先恢复常规 tick，再由调度器发布更早的软件 deadline |
+| 调度器 | 超时等待只能依赖周期 tick；到期项在 IRQ 中先分配临时 `Vec`，且全局最早 deadline 会被每个 CPU 同时装入本地 timer | 增加架构 deadline timer 契约；无分配地逐项消费到期 sleeper；deadline 按登记 CPU 归属，CPU 下线时迁移所有权，避免跨 CPU 定时器惊群 |
+| Linux ABI | `PR_GET_TIMERSLACK` 未实现，LTP 无法得到 Linux 普通任务的 50 us 默认松弛量 | 为任务保存当前值和默认值，实现 `PR_SET_TIMERSLACK`、`PR_GET_TIMERSLACK`，并在 fork/clone 时继承 |
+| epoll syscall | 内核在 fdtable、信号掩码等前处理完成后才开始计算 timeout；`epoll_pwait2` 还把纳秒 timespec 向上取整为毫秒 | 在 syscall handler 入口建立绝对 deadline，向 VFS 传递同一单调时间域的截止时间，`epoll_pwait2` 全程保留纳秒精度 |
+| epoll 返回热路径 | 有限空 epoll 已自旋到真实 deadline 后，仍重新锁状态、分配 ready 向量并再次扫描，固定返回开销使截断均值停留在阈值边缘 | deadline 已到时直接完成空超时；只有期限前被事件唤醒时才重新扫描 ready 集合 |
+
+验证结果：
+
+- `epoll_wait02` 的 1 ms 到 1 s 共 7 个计时组全部通过。
+- `epoll_pwait01`、`epoll_pwait02`、`epoll_pwait04`、`epoll_pwait05` 全部通过。
+- 默认 4 CPU 配置下，`epoll_pwait03` 连续五轮、每轮 14 个计时组全部通过；原始日志
+  为 `case-20260719-054354`、`054452`、`054530`、`054604` 和 `054638`。
+- 宿主 `sched` 127 项、`vfs` 78 项测试全部通过，固定容器内 LoongArch64 release
+  内核及全部内置 ELM 驱动重新构建成功。
+
+对应提交为 `f91d94a5` 和 `5ecf6d3c`。
