@@ -540,6 +540,11 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 .ok_or(Errno::EINVAL)?;
             Ok(memfd.seals() as usize)
         }
+        vfs::pipe::F_SETPIPE_SZ | vfs::pipe::F_GETPIPE_SZ => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+            file.fcntl(cmd, arg, vfs_ctx.cred().as_ref())
+        }
         _ => Err(Errno::EINVAL),
     }
 }

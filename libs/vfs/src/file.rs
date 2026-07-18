@@ -780,6 +780,14 @@ impl File {
         self.ops.is_epollable()
     }
 
+    /// 执行由具体打开文件描述实现的 `fcntl(2)` 命令。
+    ///
+    /// 通用描述符标志和记录锁仍由系统调用层统一处理；只有必须访问底层对象
+    /// 私有状态的命令才下沉到这里，例如 pipe 容量调整。
+    pub fn fcntl(&self, cmd: usize, arg: usize, cred: &Credentials) -> Result<usize, Errno> {
+        self.ops.fcntl(cmd, arg, cred)
+    }
+
     pub fn on_fd_closed(&self, fd: u32) {
         self.ops.on_fd_closed(fd)
     }
@@ -933,6 +941,11 @@ pub trait FileOps {
     /// 对象被误接纳。真正的事件源应在实现中显式返回 `true`。
     fn is_epollable(&self) -> bool {
         false
+    }
+
+    /// 处理文件类型私有的 `fcntl(2)` 命令。
+    fn fcntl(&self, _cmd: usize, _arg: usize, _cred: &Credentials) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
     }
 
     /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。

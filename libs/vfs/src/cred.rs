@@ -75,6 +75,8 @@ pub enum Capability {
     FSetId,
     /// 挂载/卸载文件系统及其他系统管理操作。
     SysAdmin,
+    /// 调整进程或系统资源上限，例如把 pipe 容量提升到非特权上限以上。
+    SysResource,
     /// 创建特殊文件（`mknod`：块/字符设备节点）。
     MkNod,
 }
@@ -91,7 +93,8 @@ impl Capability {
             Self::FOwner => 1 << 3,
             Self::FSetId => 1 << 4,
             Self::SysAdmin => 1 << 5,
-            Self::MkNod => 1 << 6,
+            Self::SysResource => 1 << 6,
+            Self::MkNod => 1 << 7,
         }
     }
 }

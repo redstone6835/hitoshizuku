@@ -4,11 +4,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ops::ControlFlow;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use errno::Errno;
 use sched::{Task, WaitQueue};
 
-use crate::vfs::cred::Credentials;
+use crate::vfs::cred::{Capability, Credentials};
 use crate::vfs::dentry::Dentry;
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::file::{AccessMode, DirEntry, File, FileOps, IoctlCmd, OpenOptions, PollEvents};
@@ -18,7 +19,13 @@ use crate::vfs::stat::{DevId, FileMode, FileType, FsId, Timespec};
 use crate::vfs::superblock::{InodeCache, Superblock, SuperblockOps};
 use crate::vfs::sync::Spinlock;
 
-const PIPE_CAPACITY: usize = 65536;
+pub const F_SETPIPE_SZ: usize = 1031;
+pub const F_GETPIPE_SZ: usize = 1032;
+
+const PIPE_PAGE_SIZE: usize = 4096;
+const PIPE_DEFAULT_CAPACITY: usize = 65536;
+const PIPE_MAX_CAPACITY_LIMIT: usize = i32::MAX as usize;
+static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(1024 * 1024);
 
 struct PipeInner {
     data: Vec<u8>,
@@ -35,14 +42,14 @@ pub struct Pipe {
 }
 
 impl Pipe {
-    fn new() -> Self {
-        Self::with_counts(1, 1)
+    fn new(privileged: bool) -> Self {
+        Self::with_counts(1, 1, initial_pipe_capacity(privileged))
     }
 
-    fn with_counts(reader_count: u32, writer_count: u32) -> Self {
+    fn with_counts(reader_count: u32, writer_count: u32, capacity: usize) -> Self {
         Self {
             inner: Spinlock::new(PipeInner {
-                data: vec![0u8; PIPE_CAPACITY],
+                data: vec![0u8; capacity],
                 read_pos: 0,
                 write_pos: 0,
                 reader_count,
@@ -58,7 +65,7 @@ impl Pipe {
     }
 
     fn free_space(&self, inner: &PipeInner) -> usize {
-        PIPE_CAPACITY.saturating_sub(self.available(inner))
+        inner.data.len().saturating_sub(self.available(inner))
     }
 
     fn write_data(&self, inner: &mut PipeInner, src: &[u8]) -> usize {
@@ -67,7 +74,7 @@ impl Pipe {
         if n == 0 {
             return 0;
         }
-        let cap = PIPE_CAPACITY;
+        let cap = inner.data.len();
         let start = inner.write_pos % cap;
         let first = (cap - start).min(n);
         inner.data[start..start + first].copy_from_slice(&src[..first]);
@@ -85,7 +92,7 @@ impl Pipe {
         if n == 0 {
             return 0;
         }
-        let cap = PIPE_CAPACITY;
+        let cap = inner.data.len();
         let start = inner.read_pos % cap;
         let first = (cap - start).min(n);
         dst[..first].copy_from_slice(&inner.data[start..start + first]);
@@ -96,11 +103,87 @@ impl Pipe {
         inner.read_pos = inner.read_pos.wrapping_add(n);
         n
     }
+
+    fn capacity(&self) -> usize {
+        self.inner.lock().data.len()
+    }
+
+    fn set_capacity(&self, requested: usize, privileged: bool) -> Result<usize, Errno> {
+        let capacity = normalize_pipe_capacity(requested)?;
+        if !privileged && capacity > pipe_max_size() {
+            return Err(Errno::EPERM);
+        }
+
+        let mut inner = self.inner.lock();
+        let available = self.available(&inner);
+        if capacity < available {
+            return Err(Errno::EBUSY);
+        }
+        if capacity == inner.data.len() {
+            return Ok(capacity);
+        }
+
+        let old_capacity = inner.data.len();
+        let mut resized = vec![0u8; capacity];
+        if available != 0 {
+            let start = inner.read_pos % old_capacity;
+            let first = (old_capacity - start).min(available);
+            resized[..first].copy_from_slice(&inner.data[start..start + first]);
+            if first < available {
+                resized[first..available].copy_from_slice(&inner.data[..available - first]);
+            }
+        }
+        inner.data = resized;
+        inner.read_pos = 0;
+        inner.write_pos = available;
+        drop(inner);
+
+        self.write_wait.wake_all();
+        Ok(capacity)
+    }
+
+    fn fcntl(&self, cmd: usize, arg: usize, cred: &Credentials) -> Result<usize, Errno> {
+        match cmd {
+            F_SETPIPE_SZ => self.set_capacity(arg, cred.has_cap(Capability::SysResource)),
+            F_GETPIPE_SZ => Ok(self.capacity()),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+}
+
+fn normalize_pipe_capacity(requested: usize) -> Result<usize, Errno> {
+    if requested > PIPE_MAX_CAPACITY_LIMIT {
+        return Err(Errno::EINVAL);
+    }
+    requested
+        .max(PIPE_PAGE_SIZE)
+        .checked_next_power_of_two()
+        .ok_or(Errno::EINVAL)
+}
+
+fn initial_pipe_capacity(privileged: bool) -> usize {
+    if privileged {
+        PIPE_DEFAULT_CAPACITY
+    } else {
+        PIPE_DEFAULT_CAPACITY.min(pipe_max_size())
+    }
+}
+
+/// 返回非特权进程允许请求的 pipe 最大容量。
+pub fn pipe_max_size() -> usize {
+    PIPE_MAX_SIZE.load(Ordering::Acquire)
+}
+
+/// 更新非特权 pipe 容量上限。
+pub fn set_pipe_max_size(value: usize) -> Result<(), Errno> {
+    let normalized = normalize_pipe_capacity(value)?;
+    PIPE_MAX_SIZE.store(normalized, Ordering::Release);
+    Ok(())
 }
 
 /// 创建命名 FIFO 的共享 pipe 状态。
 pub fn new_fifo() -> Arc<Pipe> {
-    Arc::new(Pipe::with_counts(0, 0))
+    Arc::new(Pipe::with_counts(0, 0, initial_pipe_capacity(false)))
 }
 
 /// 打开命名 FIFO。
@@ -202,6 +285,10 @@ impl FileOps for PipeReadEnd {
 
     fn is_epollable(&self) -> bool {
         true
+    }
+
+    fn fcntl(&self, cmd: usize, arg: usize, cred: &Credentials) -> Result<usize, Errno> {
+        self.pipe.fcntl(cmd, arg, cred)
     }
 
     fn is_seekable(&self) -> bool {
@@ -332,6 +419,10 @@ impl FileOps for PipeReadWriteEnd {
         true
     }
 
+    fn fcntl(&self, cmd: usize, arg: usize, cred: &Credentials) -> Result<usize, Errno> {
+        self.pipe.fcntl(cmd, arg, cred)
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -422,6 +513,10 @@ impl FileOps for PipeWriteEnd {
 
     fn is_epollable(&self) -> bool {
         true
+    }
+
+    fn fcntl(&self, cmd: usize, arg: usize, cred: &Credentials) -> Result<usize, Errno> {
+        self.pipe.fcntl(cmd, arg, cred)
     }
 
     fn is_seekable(&self) -> bool {
@@ -571,7 +666,7 @@ fn get_or_init_pipe_fs() -> (Arc<Mount>, Arc<Inode>, Arc<Dentry>) {
 
 pub fn new_pipe(cred: Arc<Credentials>, nonblock: bool) -> VfsResult<(Arc<File>, Arc<File>)> {
     let (mount, inode, dentry) = get_or_init_pipe_fs();
-    let pipe = Arc::new(Pipe::new());
+    let pipe = Arc::new(Pipe::new(cred.has_cap(Capability::SysResource)));
 
     let read_flags = OpenOptions {
         nonblock,

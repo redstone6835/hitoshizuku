@@ -61,6 +61,8 @@ const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
+const SYS_FS_INO: u64 = 21;
+const SYS_PIPE_MAX_SIZE_INO: u64 = 22;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -228,6 +230,7 @@ enum ProcFileKind {
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
     SysPidMax,
+    SysPipeMaxSize,
 }
 
 #[derive(Clone, Copy)]
@@ -1025,6 +1028,65 @@ impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
+            "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_KERNEL_INO,
+                    name: SmallStr::new("kernel"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_FS_INO,
+                    name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+            ],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_fs_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysFsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysFsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysFsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "pipe-max-size" => Ok(proc_sys_pipe_max_size_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1037,9 +1099,9 @@ impl InodeOps for ProcSysDirOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
             snapshot: vec![DirEntry {
-                ino: SYS_KERNEL_INO,
-                name: SmallStr::new("kernel"),
-                kind: FileType::Directory,
+                ino: SYS_PIPE_MAX_SIZE_INO,
+                name: SmallStr::new("pipe-max-size"),
+                kind: FileType::Regular,
             }],
         }))
     }
@@ -1047,9 +1109,24 @@ impl InodeOps for ProcSysDirOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+fn proc_sys_pipe_max_size_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_PIPE_MAX_SIZE_INO,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysPipeMaxSize,
+        }),
+    )
 }
 
 fn proc_sys_kernel_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
@@ -1695,6 +1772,8 @@ impl InodeOps for ProcRegularInodeOps {
                 Ok(())
             }
             ProcFileKind::SysHotplug => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysPipeMaxSize if size == 0 => Ok(()),
+            ProcFileKind::SysPipeMaxSize => Err(VfsError::InvalidArgument),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -1729,6 +1808,21 @@ impl FileOps for ProcRegularFile {
                 let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
                 let trimmed = text.trim_end_matches(|ch| ch == '\n' || ch == '\0');
                 *HOTPLUG_PATH.lock() = String::from(trimmed);
+                Ok(buf.len())
+            }
+            ProcFileKind::SysPipeMaxSize => {
+                if offset != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+                let value = text
+                    .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\0')
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                vfs::pipe::set_pipe_max_size(value).map_err(|err| match err {
+                    errno::Errno::EPERM => VfsError::OperationNotPermitted,
+                    _ => VfsError::InvalidArgument,
+                })?;
                 Ok(buf.len())
             }
             _ => Err(VfsError::ReadOnlyFilesystem),
@@ -1794,6 +1888,9 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysPipeMaxSize => {
+            Ok(format!("{}\n", vfs::pipe::pipe_max_size()).into_bytes())
+        }
     }
 }
 
