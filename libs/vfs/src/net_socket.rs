@@ -9,7 +9,7 @@ use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use errno::Errno;
-use net::{self, Endpoint, NetError, NetSocketHandle, SocketType};
+use net::{self, Endpoint, NetError, NetSocketHandle, SocketState, SocketType};
 use sched::{Task, WaitQueue, WaitQueueEntry};
 use spin::Mutex;
 
@@ -351,6 +351,10 @@ impl FileOps for NetSocketFileOps {
             Err(_) => return PollEvents::POLLHUP,
         };
         let mut events = PollEvents(0);
+        let (read_shutdown, write_shutdown) = {
+            let options = self.options.lock();
+            (options.read_shutdown, options.write_shutdown)
+        };
         if interest.has(PollEvents::POLLIN) {
             let local = *self.local.lock();
             let remote = *self.remote.lock();
@@ -362,15 +366,41 @@ impl FileOps for NetSocketFileOps {
             } else {
                 net::stack().socket_can_recv(handle)
             };
-            if readable {
+            if readable || read_shutdown {
                 events = events.with(PollEvents::POLLIN);
             }
         }
         if interest.has(PollEvents::POLLOUT)
-            && !self.options.lock().write_shutdown
+            && !write_shutdown
             && net::stack().socket_can_send(handle)
         {
             events = events.with(PollEvents::POLLOUT);
+        }
+        if read_shutdown && interest.has(PollEvents::POLLRDHUP) {
+            events = events.with(PollEvents::POLLRDHUP);
+        }
+
+        if matches!(handle.socket_type(), SocketType::Tcp) {
+            match net::stack().socket_state(handle) {
+                SocketState::Closing => {
+                    if interest.has(PollEvents::POLLIN) {
+                        events = events.with(PollEvents::POLLIN);
+                    }
+                    if interest.has(PollEvents::POLLRDHUP) {
+                        events = events.with(PollEvents::POLLRDHUP);
+                    }
+                }
+                SocketState::Closed if self.remote.lock().is_some() => {
+                    events = events.with(PollEvents::POLLHUP);
+                    if interest.has(PollEvents::POLLIN) {
+                        events = events.with(PollEvents::POLLIN);
+                    }
+                    if interest.has(PollEvents::POLLRDHUP) {
+                        events = events.with(PollEvents::POLLRDHUP);
+                    }
+                }
+                _ => {}
+            }
         }
         events
     }
