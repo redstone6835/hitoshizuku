@@ -10,6 +10,7 @@ use ktest::ktest;
 
 use crate::cred::{Credentials, Gid, Uid};
 use crate::error::VfsError;
+use crate::file::PollEvents;
 use crate::pipe::{self, F_GETPIPE_SZ, F_SETPIPE_SZ};
 
 fn root_cred() -> Arc<Credentials> {
@@ -98,4 +99,35 @@ fn pipe_resize_preserves_wrapped_data() {
     let mut expected = first[2000..].to_vec();
     expected.extend_from_slice(&second);
     assert_eq!(remaining, expected);
+}
+
+/// pipe 只有至少腾出 PIPE_BUF 字节后才报告 POLLOUT。
+#[ktest]
+fn pipe_pollout_requires_pipe_buf_space() {
+    let cred = root_cred();
+    let (read_end, write_end) = pipe::new_pipe(Arc::clone(&cred), true).unwrap();
+    write_end.fcntl(F_SETPIPE_SZ, 4096, cred.as_ref()).unwrap();
+    write_end.write(&vec![0x44; 2048]).unwrap();
+
+    assert!(write_end.poll(PollEvents::POLLOUT).is_empty());
+    let mut consumed = vec![0u8; 2048];
+    read_end.read(&mut consumed).unwrap();
+    assert!(write_end.poll(PollEvents::POLLOUT).has(PollEvents::POLLOUT));
+}
+
+/// 不超过 PIPE_BUF 的写入不能在空间不足时产生部分写。
+#[ktest]
+fn pipe_buf_write_is_atomic() {
+    let cred = root_cred();
+    let (read_end, write_end) = pipe::new_pipe(Arc::clone(&cred), true).unwrap();
+    write_end.fcntl(F_SETPIPE_SZ, 4096, cred.as_ref()).unwrap();
+    write_end.write(&vec![0x55; 2048]).unwrap();
+
+    assert_eq!(
+        write_end.write(&vec![0x66; 3000]),
+        Err(VfsError::WouldBlock)
+    );
+    let mut content = vec![0u8; 4096];
+    assert_eq!(read_end.read(&mut content), Ok(2048));
+    assert!(content[..2048].iter().all(|byte| *byte == 0x55));
 }

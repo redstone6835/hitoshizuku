@@ -23,6 +23,7 @@ pub const F_SETPIPE_SZ: usize = 1031;
 pub const F_GETPIPE_SZ: usize = 1032;
 
 const PIPE_PAGE_SIZE: usize = 4096;
+const PIPE_BUF: usize = 4096;
 const PIPE_DEFAULT_CAPACITY: usize = 65536;
 const PIPE_MAX_CAPACITY_LIMIT: usize = i32::MAX as usize;
 static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(1024 * 1024);
@@ -357,6 +358,9 @@ impl FileOps for PipeReadWriteEnd {
             return Err(VfsError::BrokenPipe);
         }
         let free = self.pipe.free_space(&inner);
+        if buf.len() <= PIPE_BUF && free < buf.len() {
+            return Err(VfsError::WouldBlock);
+        }
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
             drop(inner);
@@ -384,7 +388,7 @@ impl FileOps for PipeReadWriteEnd {
         if self.pipe.available(&inner) > 0 {
             ready = ready.with(PollEvents::POLLIN);
         }
-        if self.pipe.free_space(&inner) > 0 {
+        if self.pipe.free_space(&inner) >= PIPE_BUF {
             ready = ready.with(PollEvents::POLLOUT);
         }
         if inner.writer_count == 0 {
@@ -462,6 +466,9 @@ impl FileOps for PipeWriteEnd {
             return Err(VfsError::BrokenPipe);
         }
         let free = self.pipe.free_space(&inner);
+        if buf.len() <= PIPE_BUF && free < buf.len() {
+            return Err(VfsError::WouldBlock);
+        }
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
             drop(inner);
@@ -488,7 +495,7 @@ impl FileOps for PipeWriteEnd {
     fn poll(&self, interest: PollEvents) -> PollEvents {
         let inner = self.pipe.inner.lock();
         let mut ready = PollEvents::default();
-        if self.pipe.free_space(&inner) > 0 {
+        if self.pipe.free_space(&inner) >= PIPE_BUF {
             ready = ready.with(PollEvents::POLLOUT);
         }
         if inner.reader_count == 0 {
