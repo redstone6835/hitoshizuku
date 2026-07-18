@@ -241,11 +241,24 @@ pub struct PlatformDeviceInfo {
     pub fw_properties: Vec<FirmwareProperty>,
 }
 
+#[kernel_symbols::export]
 impl PlatformDeviceInfo {
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.has_id",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+    )]
     pub fn has_id(&self, expected: &str) -> bool {
         self.ids.iter().any(|id| id.matches_str(expected))
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.first_mmio",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn first_mmio(&self) -> Option<(usize, usize)> {
         self.mmio_at(0)
     }
@@ -259,6 +272,12 @@ impl PlatformDeviceInfo {
     ///
     /// 驱动如果需要“第二段窗口”这类关系，应通过本接口表达对固件资源顺序的依赖，
     /// 不要在具体驱动里直接遍历并匹配 `DeviceResource` 枚举。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.mmio_at",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn mmio_at(&self, index: usize) -> Option<(usize, usize)> {
         self.mmio_resources().nth(index)
     }
@@ -269,14 +288,32 @@ impl PlatformDeviceInfo {
     }
 
     /// 按声明顺序返回第 `index` 个 IRQ 资源。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.irq_at",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
     pub fn irq_at(&self, index: usize) -> Option<FirmwareIrqResource<'_>> {
         self.irq_resources().nth(index)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.has_irq_resource",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
     pub fn has_irq_resource(&self) -> bool {
         self.irq_resources().next().is_some()
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.first_irq_line",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
     pub fn first_irq_line(&self) -> Option<IrqLine> {
         self.resolve_first_irq_line().ok()
     }
@@ -285,6 +322,12 @@ impl PlatformDeviceInfo {
     ///
     /// platform 设备没有统一可枚举配置空间，DMA coherent 等能力来自固件属性。
     /// 未声明时不假设设备 cache coherent；地址转换仍走平台 mapper 的默认入口。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.dma_context",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA
+    )]
     pub fn dma_context(&self) -> DmaContext {
         DmaContext::with_constraints(DmaConstraints {
             address_mask: usize::MAX,
@@ -296,6 +339,12 @@ impl PlatformDeviceInfo {
         })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.resolve_irq_line_at",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
     pub fn resolve_irq_line_at(&self, index: usize) -> Result<IrqLine, PlatformIrqResolveError> {
         let irq = self
             .irq_at(index)
@@ -304,6 +353,12 @@ impl PlatformDeviceInfo {
             .ok_or(PlatformIrqResolveError::Unresolved)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.resolve_first_irq_line",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
     pub fn resolve_first_irq_line(&self) -> Result<IrqLine, PlatformIrqResolveError> {
         let mut saw_irq = false;
         for irq in self.irq_resources() {
@@ -323,6 +378,15 @@ impl PlatformDeviceInfo {
     ///
     /// 驱动只声明“我要消费哪个固件 IRQ 资源”，翻译细节仍由 IRQ domain 完成；
     /// platform 层负责把缺资源、依赖未就绪和 handler 注册失败拆成不同错误。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.register_irq_handler_at",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
     pub fn register_irq_handler_at(
         &self,
         index: usize,
@@ -342,6 +406,15 @@ impl PlatformDeviceInfo {
     /// 多个 IRQ 资源按固件声明顺序检查；已经声明但暂时无法翻译时返回
     /// [`PlatformIrqRegistrationError::Unresolved`]，让 PnP core 保留设备并等待
     /// interrupt-controller 驱动完成注册后重试 probe。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.register_first_irq_handler",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
     pub fn register_first_irq_handler(
         &self,
         handler: Arc<dyn IrqHandler>,
@@ -361,6 +434,12 @@ impl PlatformDeviceInfo {
         })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.u32_property",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn u32_property(&self, name: &str) -> Option<u32> {
         self.fw_properties
             .iter()
@@ -374,6 +453,12 @@ impl PlatformDeviceInfo {
             })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.u32_list_property",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn u32_list_property(&self, name: &str) -> Option<&[u32]> {
         self.fw_properties
             .iter()
@@ -387,12 +472,24 @@ impl PlatformDeviceInfo {
             })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.bool_property",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn bool_property(&self, name: &str) -> bool {
         self.fw_properties.iter().any(|property| {
             property.name.as_ref() == name && matches!(property.value, FirmwarePropertyValue::Bool)
         })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.string_list_property",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn string_list_property(&self, name: &str) -> Option<&[Box<str>]> {
         self.fw_properties
             .iter()
@@ -406,6 +503,12 @@ impl PlatformDeviceInfo {
             })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.bytes_property",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn bytes_property(&self, name: &str) -> Option<&[u8]> {
         self.fw_properties
             .iter()
@@ -419,6 +522,12 @@ impl PlatformDeviceInfo {
             })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.mmio_by_name",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn mmio_by_name(&self, names: &[&str]) -> Option<(usize, usize)> {
         let reg_names = self.string_list_property("reg-names")?;
         let mut mmio_index = 0usize;
@@ -510,6 +619,14 @@ impl PlatformRegistration {
     }
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.platform.register_and_probe_platform_device",
+    contract = "kernel.general.platform-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_and_probe_platform_device(
     info: PlatformDeviceInfo,
 ) -> Result<PlatformRegistration, PnpError> {
@@ -519,7 +636,7 @@ pub fn register_and_probe_platform_device(
         name: name.clone(),
         identity,
     };
-    let new_dev = PnpDevice::new(id, name, Box::new(info));
+    let new_dev = PnpDevice::new(id, name, Box::new(info))?;
     let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev))?;
     let dev = registration.device;
     let inserted = registration.inserted;
@@ -534,7 +651,7 @@ pub fn register_and_probe_platform_device(
         PnpState::Discovered => {}
         PnpState::Probing | PnpState::Removing | PnpState::Gone => {
             if inserted {
-                PNP_DEVICES.remove(&dev.id);
+                PNP_DEVICES.remove_exact(&dev);
             }
             return Err(PnpError::InvalidState);
         }
@@ -555,7 +672,7 @@ pub fn register_and_probe_platform_device(
         }),
         Err(err) => {
             if inserted {
-                PNP_DEVICES.remove(&dev.id);
+                PNP_DEVICES.remove_exact(&dev);
             }
             Err(err)
         }

@@ -569,6 +569,13 @@ pub fn logger_entry(level: LogLevel, timestamp: u64, message: &str) {
 }
 
 /// 记录格式化日志（零堆分配路径）。
+#[kernel_symbols::export(
+    name = "log.logger_entry_fmt",
+    contract = "kernel.log.write@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::CORE_SAFE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn logger_entry_fmt(level: LogLevel, timestamp: u64, args: fmt::Arguments<'_>) {
     let mut buf = StackMessageBuffer::<MAX_LOG_MESSAGE_LEN>::new();
     let _ = fmt::write(&mut buf, args);
@@ -616,6 +623,12 @@ pub fn register_timestamp_source(source: fn() -> u64) {
 
 /// 获取当前时间戳（纳秒）
 /// 这个函数会被 printk 宏调用来获取时间戳
+#[kernel_symbols::export(
+    name = "log.get_timestamp_ns",
+    contract = "kernel.log.timestamp@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::CORE_SAFE
+)]
 pub fn get_timestamp_ns() -> u64 {
     let source = TIMESTAMP_SOURCE.load(Ordering::Acquire);
     if source == 0 {

@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use errno::Errno;
 use net::{self, Endpoint, NetError, NetSocketHandle, SocketType};
-use sched::{Task, WaitQueue};
+use sched::{Task, WaitQueue, WaitQueueEntry};
 use spin::Mutex;
 
 use crate::addr;
@@ -270,14 +270,16 @@ impl NetSocketFileOps {
         self.wait_with_deadline_until(None, ready)
     }
 
-    fn finish_current_wait(&self, task: &Arc<Task>, armed_deadline: bool) {
-        self.wait_queue.remove(task);
+    fn finish_current_wait(
+        &self,
+        task: &Arc<Task>,
+        entry: &Arc<WaitQueueEntry>,
+        armed_deadline: bool,
+    ) {
         if armed_deadline {
             sched::cancel_sleep_deadline(task);
         }
-        if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
-            let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
-        }
+        self.wait_queue.finish_wait(entry);
     }
 
     fn wait_with_deadline_until<F>(&self, deadline: Option<u64>, mut ready: F) -> Result<(), Errno>
@@ -294,9 +296,9 @@ impl NetSocketFileOps {
         if self.deadline_expired(deadline) {
             return Err(Errno::EAGAIN);
         }
-        let _ = task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping);
-        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
-        self.wait_queue.enqueue(&task);
+        let entry = self
+            .wait_queue
+            .prepare_to_wait(&task, sched::TaskState::Sleeping);
         // 同时挂到全局 socket 事件通知队列——下次 NetStack::poll() 完
         // 成后会唤醒，让任务重新检查 socket 状态。
         net::stack().enqueue_socket_waiter(&task);
@@ -304,15 +306,15 @@ impl NetSocketFileOps {
             .map(|dl| sched::register_sleep_deadline(&task, dl))
             .unwrap_or(false);
         if ready() {
-            self.finish_current_wait(&task, armed);
+            self.finish_current_wait(&task, &entry, armed);
             return Ok(());
         }
         if self.deadline_expired(deadline) {
-            self.finish_current_wait(&task, armed);
+            self.finish_current_wait(&task, &entry, armed);
             return Err(Errno::EAGAIN);
         }
         sched::schedule_once(sched::now_ns_public());
-        self.finish_current_wait(&task, armed);
+        self.finish_current_wait(&task, &entry, armed);
         if has_unblocked_signal(&task) {
             return Err(Errno::EINTR);
         }

@@ -45,6 +45,12 @@ use crate::tuning::{EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBuffer
 static STACK: NetStack = NetStack::new();
 
 /// 获取全局网络协议栈实例。
+#[kernel_symbols::export(
+    name = "net.stack",
+    contract = "kernel.net.stack@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER
+)]
 pub fn stack() -> &'static NetStack {
     &STACK
 }
@@ -129,6 +135,7 @@ pub struct NetStack {
     notify_waiters: sched::WaitQueue,
 }
 
+#[kernel_symbols::export]
 impl NetStack {
     const fn new() -> Self {
         Self {
@@ -148,6 +155,14 @@ impl NetStack {
     ///
     /// 设备驱动 probe 成功后调用。创建 smoltcp `Interface` 并配置网络参数。
     /// 此操作短暂持有写锁，会暂停所有正在进行的 poll。
+    #[kernel_symbols::export(
+        name = "net.NetStack.attach",
+        contract = "kernel.net.interface-lifecycle@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 0
+    )]
     pub fn attach(&self, dev: Arc<NetDevice>, config: IfConfig) -> Result<(), NetError> {
         let id = dev.id();
         {
@@ -180,6 +195,13 @@ impl NetStack {
     ///
     /// `NetDevice::mark_gone` 应当由驱动 PnP remove 路径在调用本方法
     /// **之前**调用，使正在进行的 RX/TX 立即看到设备失效。
+    #[kernel_symbols::export(
+        name = "net.NetStack.detach",
+        contract = "kernel.net.interface-lifecycle@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn detach(&self, id: InterfaceId) -> Result<(), NetError> {
         let mut table = self.interfaces.write();
         let removed = table
@@ -334,6 +356,22 @@ impl NetStack {
     /// 检查指定接口是否存在且活跃。
     pub fn has_interface(&self, id: InterfaceId) -> bool {
         self.interfaces.read().contains_key(&id)
+    }
+
+    /// 按接口名称查找现存接口。
+    ///
+    /// 名称只用于驱动注册时的冲突检查和诊断，不替代稳定的接口 ID。
+    #[kernel_symbols::export(
+        name = "net.NetStack.find_interface_by_name",
+        contract = "kernel.net.interface-query@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
+    pub fn find_interface_by_name(&self, name: &str) -> Option<InterfaceId> {
+        let table = self.interfaces.read();
+        table
+            .iter()
+            .find_map(|(&id, iface_lock)| (iface_lock.lock().name() == name).then_some(id))
     }
 
     // ── Socket 创建 ──────────────────────────────────────────────────────

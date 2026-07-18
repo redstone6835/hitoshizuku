@@ -13,6 +13,7 @@ ktest-kernel = ["ktest/kernel"]
 
 [dependencies]
 ktest = { path = "../ktest", optional = true }
+kernel-symbols = { path = "../kernel-symbols" }
 
 [dev-dependencies]
 ktest = { path = "../ktest" }

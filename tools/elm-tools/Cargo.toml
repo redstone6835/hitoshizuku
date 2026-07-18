@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "cargo-elm"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "cargo-elm"
+path = "src/main.rs"
+
+[dependencies]
+elm = { path = "../../libs/elm", default-features = false, features = ["runtime-model", "macros"] }
+kernel-symbols = { path = "../../libs/kernel-symbols", default-features = false }
+ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }
+quote = "=1.0.45"
+syn = { version = "=2.0.117", features = ["full", "parsing"] }

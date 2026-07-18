@@ -14,7 +14,7 @@
 //! general::dev::random_source::with_source(|src| {
 //!     let mut buf = [0u8; 64];
 //!     let sample = src.sample_with_credit(&mut buf);
-//!     general::dev::drivers::random::add_hw_randomness(
+//!     general::dev::random::add_bootloader_randomness(
 //!         &buf[..sample.bytes_written],
 //!         sample.entropy_bits,
 //!     );
@@ -170,6 +170,29 @@ pub fn register_entropy_source(src: &'static dyn EntropySource) {
 /// 取出已注册的熵源；`None` 表示没有 arch 实现。
 pub fn installed_source() -> Option<&'static dyn EntropySource> {
     REGISTERED_SOURCE.lock().as_ref().copied()
+}
+
+/// 从当前架构熵源采集一次样本。
+#[kernel_symbols::export(
+    name = "general.dev.random_source.sample",
+    contract = "kernel.general.entropy-source@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::CORE_SAFE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn sample(output: &mut [u8]) -> Option<EntropySample> {
+    installed_source().map(|source| source.sample_with_credit(output))
+}
+
+/// 读取当前架构熵源的单调时间戳。
+#[kernel_symbols::export(
+    name = "general.dev.random_source.timestamp",
+    contract = "kernel.general.entropy-source@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::CORE_SAFE
+)]
+pub fn timestamp() -> Option<u64> {
+    installed_source().map(EntropySource::timestamp)
 }
 
 /// 取出已注册熵源的便捷包装：调用 `f`，若未注册则不调用。

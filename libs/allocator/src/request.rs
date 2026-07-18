@@ -157,6 +157,7 @@ pub struct MemoryRequest {
     pub reclaim: ReclaimPolicy,
     pub zeroing: Zeroing,
     pub managed: ManagedAllocFlags,
+    pub(crate) accounting_owner: Option<u64>,
 }
 
 impl MemoryRequest {
@@ -170,6 +171,7 @@ impl MemoryRequest {
             reclaim: ReclaimPolicy::TryAllocatorReclaim,
             zeroing: Zeroing::Uninitialized,
             managed: ManagedAllocFlags::new(),
+            accounting_owner: None,
         }
     }
 
@@ -216,6 +218,23 @@ impl MemoryRequest {
         self
     }
 
+    /// 显式指定分配账本所有者。
+    ///
+    /// 所有者编号的含义由注册的计量后端解释；`0` 表示内核自身，不计入外部单元预算。
+    pub const fn with_accounting_owner(mut self, owner: u64) -> Self {
+        self.accounting_owner = Some(owner);
+        self
+    }
+
+    /// 强制把本次分配归入内核自身，避免继承当前扩展执行上下文。
+    pub const fn without_external_accounting(self) -> Self {
+        self.with_accounting_owner(0)
+    }
+
+    pub(crate) const fn accounting_owner(self) -> Option<u64> {
+        self.accounting_owner
+    }
+
     /// 校验通用内存请求的基础 layout 约束。
     ///
     /// typed allocator API 不再把 `size=0` 或 `align=0` 静默改写成 1。这样做可以把调用方
@@ -244,6 +263,7 @@ pub struct PhysicalAllocRequest {
     pub align: usize,
     pub page_policy: PagePolicy,
     pub placement: MemoryPlacement,
+    pub(crate) accounting_owner: Option<u64>,
 }
 
 impl PhysicalAllocRequest {
@@ -253,6 +273,7 @@ impl PhysicalAllocRequest {
             align,
             page_policy: PagePolicy::BaseOnly,
             placement: MemoryPlacement::Any,
+            accounting_owner: None,
         }
     }
 
@@ -264,6 +285,21 @@ impl PhysicalAllocRequest {
     pub const fn with_placement(mut self, placement: MemoryPlacement) -> Self {
         self.placement = placement;
         self
+    }
+
+    /// 显式指定物理页分配的账本所有者。
+    pub const fn with_accounting_owner(mut self, owner: u64) -> Self {
+        self.accounting_owner = Some(owner);
+        self
+    }
+
+    /// 强制把本次物理页分配归入内核自身。
+    pub const fn without_external_accounting(self) -> Self {
+        self.with_accounting_owner(0)
+    }
+
+    pub(crate) const fn accounting_owner(self) -> Option<u64> {
+        self.accounting_owner
     }
 
     /// 校验物理页请求，并返回原请求方便链式使用。
@@ -332,6 +368,7 @@ pub struct AllocationRecord {
     pub align: usize,
     pub order: usize,
     pub page_size: usize,
+    accounting_owner: u64,
     /// 后端私有定位 cookie。
     ///
     /// 这个字段不属于外部所有权语义，只给 allocator 内部热路径使用。例如 slab 会在
@@ -354,6 +391,7 @@ impl AllocationRecord {
             align: 1,
             order: 0,
             page_size: PAGE_SIZE,
+            accounting_owner: 0,
             backend_cookie: 0,
         }
     }
@@ -377,6 +415,16 @@ impl AllocationRecord {
         self
     }
 
+    pub(crate) const fn with_accounting_owner(mut self, owner: u64) -> Self {
+        self.accounting_owner = owner;
+        self
+    }
+
+    /// 返回该对象在外部资源账本中的所有者编号；`0` 表示内核自身。
+    pub const fn accounting_owner(self) -> u64 {
+        self.accounting_owner
+    }
+
     pub(crate) const fn with_backend_cookie(mut self, backend_cookie: usize) -> Self {
         self.backend_cookie = backend_cookie;
         self
@@ -398,6 +446,7 @@ impl fmt::Debug for AllocationRecord {
             .field("align", &self.align)
             .field("order", &self.order)
             .field("page_size", &self.page_size)
+            .field("accounting_owner", &self.accounting_owner)
             .finish()
     }
 }

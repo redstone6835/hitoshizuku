@@ -250,6 +250,13 @@ fn check_name_max(parent: &Arc<Dentry>, name: &str) -> VfsResult<()> {
 /// - [`VfsError::NotADirectory`]：中间分量不是目录；
 /// - [`VfsError::SymlinkLoop`]：符号链接深度超过 `ctx.limits.symlink_max_depth`；
 /// - [`VfsError::NameTooLong`]：某分量字节数超过文件系统的 `name_max`。
+#[kernel_symbols::export(
+    name = "vfs.path.lookup",
+    contract = "kernel.vfs.path@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn lookup(
     ctx: &VfsContext,
     dirfd: &Dirfd,
@@ -631,6 +638,13 @@ fn follow_symlink(
 ///
 /// 注意：这里**不**解析 `..`（因为 `..` 的语义依赖文件系统状态和符号链接），
 /// 仅做纯字符串层面的化简。
+#[kernel_symbols::export(
+    name = "vfs.path.normalize_path",
+    contract = "kernel.vfs.path@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::CORE_SAFE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn normalize_path(path: &str) -> String {
     let absolute = PathComponents::is_absolute(path);
     // 过滤空分量和 "." 分量，重新组装

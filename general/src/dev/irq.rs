@@ -233,7 +233,12 @@ impl IrqRegistry {
         }) {
             return Err(IrqError::AlreadyRegistered);
         }
-        handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        {
+            // handler 表容量在注销单个 handler 后仍由内核复用，不归动态单元所有。
+            let _accounting =
+                allocator::suspend_implicit_allocation_accounting().ok_or(IrqError::OutOfMemory)?;
+            handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        }
         let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
         let line = request.line;
         handlers.push(IrqRegistration {
@@ -482,19 +487,49 @@ struct DefaultIrqDomainRegistration {
     domain: Arc<dyn IrqDomain>,
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.register_irq_handler",
+    contract = "kernel.general.irq-handler@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_irq_handler(
     line: IrqLine,
     handler: Arc<dyn IrqHandler>,
 ) -> Result<IrqHandle, IrqError> {
-    IRQ_REGISTRY.register(line, handler)
+    register_irq_request(IrqRequest::shared(line, "legacy-irq-handler", handler))
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.register_irq_request",
+    contract = "kernel.general.irq-handler@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_irq_request(request: IrqRequest) -> Result<IrqHandle, IrqError> {
-    IRQ_REGISTRY.register_request(request)
+    let handle = IRQ_REGISTRY.register_request(request)?;
+    if super::elm_lifecycle::track_irq_handler(handle).is_err() {
+        let _ = IRQ_REGISTRY.unregister(handle);
+        return Err(IrqError::OutOfMemory);
+    }
+    Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.unregister_irq_handler",
+    contract = "kernel.general.irq-handler@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_irq_handler(handle: IrqHandle) -> Result<(), IrqError> {
-    IRQ_REGISTRY.unregister(handle)
+    IRQ_REGISTRY.unregister(handle)?;
+    super::elm_lifecycle::forget_irq_handler(handle);
+    Ok(())
 }
 
 fn release_irq_handler_resource(handle: IrqHandle) -> bool {
@@ -502,6 +537,13 @@ fn release_irq_handler_resource(handle: IrqHandle) -> bool {
 }
 
 /// 将 IRQ handler 注册 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.irq.irq_handler_pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn irq_handler_pnp_resource(
     handle: IrqHandle,
     label: &'static str,
@@ -514,12 +556,40 @@ pub fn irq_handler_pnp_resource(
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.install_irq_line_ops",
+    contract = "kernel.general.irq-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn install_irq_line_ops(ops: IrqLineOps) {
-    *IRQ_LINE_OPS.lock() = Some(ops);
+    if super::elm_lifecycle::install_irq_line_ops(ops).is_err() {
+        log::error!("[irq] ELM IRQ line 操作安装失败，原操作保持不变");
+    }
 }
 
+pub(crate) fn replace_irq_line_ops(ops: Option<IrqLineOps>) -> Option<IrqLineOps> {
+    let mut current = IRQ_LINE_OPS.lock();
+    core::mem::replace(&mut *current, ops)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.irq.install_iocsr_ops",
+    contract = "kernel.general.irq-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn install_iocsr_ops(ops: IocsrOps) {
-    *IOCSR_OPS.lock() = Some(ops);
+    if super::elm_lifecycle::install_iocsr_ops(ops).is_err() {
+        log::error!("[irq] ELM IOCSR 操作安装失败，原操作保持不变");
+    }
+}
+
+pub(crate) fn replace_iocsr_ops(ops: Option<IocsrOps>) -> Option<IocsrOps> {
+    let mut current = IOCSR_OPS.lock();
+    core::mem::replace(&mut *current, ops)
 }
 
 fn enable_irq_line(line: IrqLine) {
@@ -544,6 +614,13 @@ fn configure_irq_line(
     true
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.set_irq_line_enabled",
+    contract = "kernel.general.irq-control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
     if let IrqLine::Controller { controller, hwirq } = line
         && IRQ_DOMAINS.set_line_enabled(controller, hwirq, enabled)
@@ -560,11 +637,24 @@ pub fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
     }
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.iocsr_read32",
+    contract = "kernel.general.iocsr@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+)]
 pub fn iocsr_read32(offset: usize) -> Option<u32> {
     let ops = (*IOCSR_OPS.lock())?;
     Some((ops.read32)(offset))
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.iocsr_write32",
+    contract = "kernel.general.iocsr@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn iocsr_write32(offset: usize, value: u32) -> bool {
     let Some(ops) = *IOCSR_OPS.lock() else {
         return false;
@@ -573,11 +663,24 @@ pub fn iocsr_write32(offset: usize, value: u32) -> bool {
     true
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.iocsr_read64",
+    contract = "kernel.general.iocsr@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+)]
 pub fn iocsr_read64(offset: usize) -> Option<u64> {
     let ops = (*IOCSR_OPS.lock())?;
     Some((ops.read64)(offset))
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.iocsr_write64",
+    contract = "kernel.general.iocsr@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn iocsr_write64(offset: usize, value: u64) -> bool {
     let Some(ops) = *IOCSR_OPS.lock() else {
         return false;
@@ -586,6 +689,13 @@ pub fn iocsr_write64(offset: usize, value: u64) -> bool {
     true
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.dispatch_interrupt",
+    contract = "kernel.general.irq-dispatch@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn dispatch_interrupt(interrupt: Interrupt) -> bool {
     let Some(line) = IrqLine::from_interrupt(interrupt) else {
         return false;
@@ -597,19 +707,48 @@ pub fn dispatch_interrupt(interrupt: Interrupt) -> bool {
 ///
 /// 架构 trap 入口使用 [`dispatch_interrupt`] 从 CPU interrupt 编码进入；级联
 /// interrupt-controller 驱动在完成寄存器级 demux/ack 后使用本函数分发子线。
+#[kernel_symbols::export(
+    name = "general.dev.irq.dispatch_irq_line",
+    contract = "kernel.general.irq-dispatch@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn dispatch_irq_line(line: IrqLine) -> bool {
     IRQ_REGISTRY.dispatch_line(line)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.register_irq_domain",
+    contract = "kernel.general.irq-domain@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_irq_domain(
     controller: u32,
     domain: Arc<dyn IrqDomain>,
 ) -> Result<IrqDomainHandle, IrqError> {
-    IRQ_DOMAINS.register(controller, domain)
+    let handle = IRQ_DOMAINS.register(controller, domain)?;
+    if super::elm_lifecycle::track_irq_domain(handle).is_err() {
+        let _ = IRQ_DOMAINS.unregister(handle);
+        return Err(IrqError::OutOfMemory);
+    }
+    Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.unregister_irq_domain",
+    contract = "kernel.general.irq-domain@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_irq_domain(handle: IrqDomainHandle) -> Result<(), IrqError> {
-    IRQ_DOMAINS.unregister(handle)
+    IRQ_DOMAINS.unregister(handle)?;
+    super::elm_lifecycle::forget_irq_domain(handle);
+    Ok(())
 }
 
 fn release_irq_domain_resource(handle: IrqDomainHandle) -> bool {
@@ -617,6 +756,13 @@ fn release_irq_domain_resource(handle: IrqDomainHandle) -> bool {
 }
 
 /// 将 IRQ domain 注册 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.irq.irq_domain_pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn irq_domain_pnp_resource(
     handle: IrqDomainHandle,
     label: &'static str,
@@ -635,6 +781,14 @@ pub fn irq_domain_pnp_resource(
 /// 可能直接给出全局中断号，此时 `DeviceResource::Irq { controller: None, .. }`
 /// 会交给这里注册的默认 domain 翻译。该接口只表达资源解释策略，不把任何平台
 /// 的中断号布局硬编码进设备 core。
+#[kernel_symbols::export(
+    name = "general.dev.irq.register_default_irq_domain",
+    contract = "kernel.general.irq-domain@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_default_irq_domain(
     domain: Arc<dyn IrqDomain>,
 ) -> Result<DefaultIrqDomainHandle, IrqError> {
@@ -646,10 +800,22 @@ pub fn register_default_irq_domain(
         .map_err(|_| IrqError::OutOfMemory)?;
     *default = Some(DefaultIrqDomainRegistration { id, domain });
     drop(default);
+    let handle = DefaultIrqDomainHandle { id };
+    if super::elm_lifecycle::track_default_irq_domain(handle).is_err() {
+        let _ = unregister_default_irq_domain(handle);
+        return Err(IrqError::OutOfMemory);
+    }
     pnp::notify_dependency_ready(PnpDependency::DefaultIrqDomain);
-    Ok(DefaultIrqDomainHandle { id })
+    Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.unregister_default_irq_domain",
+    contract = "kernel.general.irq-domain@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_default_irq_domain(handle: DefaultIrqDomainHandle) -> Result<(), IrqError> {
     let mut default = DEFAULT_IRQ_DOMAIN.lock();
     let Some(registration) = default.as_ref() else {
@@ -661,6 +827,8 @@ pub fn unregister_default_irq_domain(handle: DefaultIrqDomainHandle) -> Result<(
         return Err(IrqError::NotFound);
     }
     *default = None;
+    drop(default);
+    super::elm_lifecycle::forget_default_irq_domain(handle);
     Ok(())
 }
 
@@ -669,6 +837,13 @@ fn release_default_irq_domain_resource(handle: DefaultIrqDomainHandle) -> bool {
 }
 
 /// 将默认 IRQ domain 注册 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.irq.default_irq_domain_pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn default_irq_domain_pnp_resource(
     handle: DefaultIrqDomainHandle,
     label: &'static str,
@@ -681,6 +856,12 @@ pub fn default_irq_domain_pnp_resource(
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.irq.translate_firmware_irq",
+    contract = "kernel.general.irq-domain@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+)]
 pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<IrqLine> {
     match controller {
         Some(controller) => IRQ_DOMAINS.translate(controller, cells),

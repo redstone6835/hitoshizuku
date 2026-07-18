@@ -64,11 +64,20 @@ pub struct NetDevice {
     tx_dropped: AtomicU64,
 }
 
+#[kernel_symbols::export]
 impl NetDevice {
     /// 创建一个新的网络设备。
     ///
     /// - `name`：接口名（如 `"eth0"`），显示用途。
     /// - `driver`：底层驱动的共享引用。
+    #[kernel_symbols::export(
+        name = "net.NetDevice.new",
+        contract = "kernel.net.device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 1 << 1
+    )]
     pub fn new(name: &str, driver: Arc<dyn NetDriver>) -> Self {
         Self {
             id: InterfaceId::next(),
@@ -81,6 +90,12 @@ impl NetDevice {
     }
 
     /// 接口 ID（全局唯一）。
+    #[kernel_symbols::export(
+        name = "net.NetDevice.id",
+        contract = "kernel.net.device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
     pub fn id(&self) -> InterfaceId {
         self.id
     }
@@ -112,6 +127,13 @@ impl NetDevice {
     ///
     /// 此操作不可逆——一旦标记为 Gone，设备对象不会复活。
     /// 后续对 driver 的操作可能返回 None / 失败，但不会 panic。
+    #[kernel_symbols::export(
+        name = "net.NetDevice.mark_gone",
+        contract = "kernel.net.device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn mark_gone(&self) {
         self.state.store(DeviceState::Gone as u8, Ordering::Release);
     }

@@ -21,6 +21,7 @@ use crate::mm::ops::user_access_ops;
 use crate::mm::vm_space::VmSpace;
 
 /// 从用户地址 `user` 读 `dst.len()` 字节到 `dst`。
+#[kernel_symbols::export(name = "general.mm.user_access.copy_from_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError> {
     if dst.is_empty() {
         return Ok(());
@@ -58,6 +59,7 @@ pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError
 }
 
 /// 把 `src` 写到用户地址 `user`。
+#[kernel_symbols::export(name = "general.mm.user_access.copy_to_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
     if src.is_empty() {
         return Ok(());
@@ -98,6 +100,7 @@ pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
 }
 
 /// 从用户地址读一段 NUL 结尾的 C 字符串，最多 `max` 字节（不含 NUL）。
+#[kernel_symbols::export(name = "general.mm.user_access.copy_cstr_from_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn copy_cstr_from_user(user: usize, max: usize) -> Result<String, UserAccessError> {
     let Some(ops) = user_access_ops() else {
         return Err(UserAccessError::Fault);

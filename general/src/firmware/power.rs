@@ -121,6 +121,7 @@ static mut POWER_CONTROLS: RuntimePowerControlInfo = RuntimePowerControlInfo {
     reboot: None,
 };
 
+#[kernel_symbols::export(name = "general.firmware.power.clear", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn clear() {
     POWER_CONTROLS_VALID.store(false, Ordering::Release);
     unsafe {
@@ -128,6 +129,7 @@ pub fn clear() {
     }
 }
 
+#[kernel_symbols::export(name = "general.firmware.power.install", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install(info: PowerControlInfo, phys_to_virt: fn(usize) -> usize) {
     let runtime = RuntimePowerControlInfo {
         shutdown: info
@@ -150,10 +152,12 @@ pub fn install(info: PowerControlInfo, phys_to_virt: fn(usize) -> usize) {
     );
 }
 
+#[kernel_symbols::export(name = "general.firmware.power.install_shutdown", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install_shutdown(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
     install_one(Some(runtime_method(method, phys_to_virt)), None);
 }
 
+#[kernel_symbols::export(name = "general.firmware.power.install_reboot", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE, retained_args = 1 << 1)]
 pub fn install_reboot(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
     install_one(None, Some(runtime_method(method, phys_to_virt)));
 }
@@ -184,6 +188,7 @@ fn install_one(
     );
 }
 
+#[kernel_symbols::export(name = "general.firmware.power.shutdown", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn shutdown() -> Result<(), PowerError> {
     let controls = load_controls()?;
     let Some(method) = controls.shutdown else {
@@ -193,6 +198,7 @@ pub fn shutdown() -> Result<(), PowerError> {
     execute(method)
 }
 
+#[kernel_symbols::export(name = "general.firmware.power.reboot", contract = "kernel.firmware.power@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn reboot() -> Result<(), PowerError> {
     let controls = load_controls()?;
     let Some(method) = controls.reboot else {

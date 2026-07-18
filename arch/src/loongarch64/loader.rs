@@ -584,9 +584,47 @@ fn format_log_record_line(record: &log::LogRecord<'_>) -> SinkLineBuffer {
 ///
 /// 初始值 100_000_000（100 MHz）为 QEMU LoongArch64 默认值。
 pub static STABLE_TIMER_HZ: AtomicUsize = AtomicUsize::new(100_000_000);
+static TIMER_HZ: AtomicUsize = AtomicUsize::new(DEFAULT_TIMER_HZ);
 
 /// 启动时刻的原始计时值，用于将后续时间戳归零到启动时刻。
 static BOOT_TIMESTAMP_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn timer_hz() -> usize {
+    TIMER_HZ.load(Ordering::Acquire)
+}
+
+pub(crate) fn configure_local_timer(timer_hz: usize) {
+    let timer_hz = timer_hz.clamp(1, 10_000);
+    TIMER_HZ.store(timer_hz, Ordering::Release);
+    let stable_hz = STABLE_TIMER_HZ.load(Ordering::Relaxed) as u64;
+    let period = (stable_hz / timer_hz as u64).max(1);
+    let tcfg_val = (period << 2) | (1 << 1) | 1;
+    const LIE_TIMER: usize = 1 << 11;
+    const LIE_IPI: usize = 1 << 12;
+    let lie_val = LIE_TIMER | LIE_IPI;
+    let lie_mask = LIE_TIMER | LIE_IPI;
+    unsafe {
+        core::arch::asm!(
+            "csrxchg {val}, {mask}, {csr_ecfg}",
+            val = inout(reg) lie_val => _,
+            mask = in(reg) lie_mask,
+            csr_ecfg = const CSR_ECFG,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "csrwr {val}, {csr_ticlr}",
+            val = in(reg) 1usize,
+            csr_ticlr = const CSR_TICLR,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "csrwr {val}, {csr_tcfg}",
+            val = in(reg) tcfg_val,
+            csr_tcfg = const CSR_TCFG,
+            options(nostack, preserves_flags)
+        );
+    }
+}
 
 // ── 分配器临界区辅助 ──────────────────────────────────────────────
 
@@ -716,38 +754,8 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             }
             hz.max(1).min(10000)
         };
-        let stable_hz = STABLE_TIMER_HZ.load(Ordering::Relaxed) as u64;
-        let period = stable_hz / timer_hz as u64;
-        let tcfg_val = (period << 2) | (1 << 1) | 1;
-        // ECFG.LIE[11] (定时器中断使能) 与 LIE[12] (IPI)
-        const LIE_TIMER: usize = 1 << 11;
-        const LIE_IPI: usize = 1 << 12;
-        let lie_val = LIE_TIMER | LIE_IPI;
-        let lie_mask = LIE_TIMER | LIE_IPI;
-        unsafe {
-            // 开 ECFG 里的定时器/IPI 中断使能位
-            core::arch::asm!(
-                "csrxchg {val}, {mask}, {csr_ecfg}",
-                val = inout(reg) lie_val => _,
-                mask = in(reg) lie_mask,
-                csr_ecfg = const CSR_ECFG,
-                options(nostack, preserves_flags)
-            );
-            // 清理 pending
-            core::arch::asm!(
-                "csrwr {val}, {csr_ticlr}",
-                val = in(reg) 1usize,
-                csr_ticlr = const CSR_TICLR,
-                options(nostack, preserves_flags)
-            );
-            // 使能定时器
-            core::arch::asm!(
-                "csrwr {val}, {csr_tcfg}",
-                val = in(reg) tcfg_val,
-                csr_tcfg = const CSR_TCFG,
-                options(nostack, preserves_flags)
-            );
-        }
+        configure_local_timer(timer_hz);
+        let period = stable_counter_hz() / timer_hz as u64;
         e_print(format_args!(
             "[{:6}.{:06}] [loader] timer configured: hz={} period={}\n",
             0, 0, timer_hz, period,
@@ -1095,6 +1103,9 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
                 kernel_heap_region,
                 map_kernel_heap_range,
                 unmap_kernel_heap_range,
+                protect_kernel_heap_range,
+                validate_kernel_heap_range,
+                sync_icache,
                 init_kernel_page_table,
             }),
         };

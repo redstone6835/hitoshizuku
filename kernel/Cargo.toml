@@ -33,15 +33,25 @@ bench = false
 acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
 arch = { path = "../arch" }
 elf = { path = "../libs/elf" }
+elm_model = { package = "elm", path = "../libs/elm", default-features = false, features = ["runtime-model"] }
+elm-loader = { path = "../libs/elm-loader" }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "zeroize"] }
+efi = { path = "../libs/efi" }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
 general = { path = "../general" }
 ktest = { path = "../libs/ktest" }
+kernel-symbols = { path = "../libs/kernel-symbols", default-features = false }
 log = { path = "../libs/log" }
 allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
 sched = { path = "../libs/sched" }
+socket = { path = "../libs/socket" }
 vfs = { path = "../libs/vfs" }
+
+[build-dependencies]
+ed25519-dalek = { version = "2.2.0", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }

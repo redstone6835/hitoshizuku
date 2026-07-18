@@ -19,6 +19,8 @@ mod start;
 mod task;
 mod trap;
 
+pub mod elm_guard;
+pub mod elm_image;
 pub use page_walk::*;
 pub use paging::*;
 pub use platform::*;
@@ -35,3 +37,25 @@ pub mod ipc;
 pub mod mm;
 pub mod syscall;
 pub mod vfs;
+
+/// 强制链接器抽取设备抽象直接符号目录所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    dev::pnp::register_driver_factory as usize
+        ^ dev::pnp::device_mmio_to_virt as usize
+        ^ dev::function::register_function_class as usize
+        ^ dev::firmware_bus::register as usize
+        ^ dev::dma::set_dma_ops as usize
+        ^ dev::irq::register_irq_request as usize
+        ^ dev::irq::register_irq_domain as usize
+        ^ dev::msi::register_msi_controller as usize
+        ^ dev::pci::register_host_bridge as usize
+        ^ dev::pci::pci_scan_and_register as usize
+        ^ dev::platform::register_and_probe_platform_device as usize
+        ^ console::console_write as usize
+        ^ firmware::power::shutdown as usize
+        ^ ipc::ShmManager::info as usize
+        ^ mm::page_size as usize
+        ^ mm::VmSpace::mapped_pages as usize
+        ^ vfs::namespace_path as usize
+}

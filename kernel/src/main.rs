@@ -5,6 +5,8 @@ extern crate alloc;
 extern crate allocator;
 extern crate hal;
 
+use core::alloc::{GlobalAlloc, Layout};
+
 mod acpi;
 #[cfg(any(
     feature = "bench",
@@ -14,7 +16,9 @@ mod acpi;
 mod bench;
 mod device_init;
 mod dtb;
+mod elm;
 mod initramfs;
+mod integrated_components;
 mod net_poll;
 mod panic;
 mod sched;
@@ -25,20 +29,73 @@ mod tty_poll;
 mod user;
 mod vdso;
 
+struct KernelGlobalAllocator;
+
+unsafe impl GlobalAlloc for KernelGlobalAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Safety: GlobalAlloc 调用方保证 layout 合法，真实所有权由唯一内核分配器维护。
+        unsafe { allocator::KERNEL_ALLOCATOR.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // Safety: GlobalAlloc 调用方保证 pointer/layout 来自同一个全局分配器。
+        unsafe { allocator::KERNEL_ALLOCATOR.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Safety: GlobalAlloc 调用方保证旧分配及新尺寸满足 realloc 契约。
+        unsafe { allocator::KERNEL_ALLOCATOR.realloc(pointer, layout, new_size) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // Safety: GlobalAlloc 调用方保证 layout 合法。
+        unsafe { allocator::KERNEL_ALLOCATOR.alloc_zeroed(layout) }
+    }
+}
+
+#[global_allocator]
+static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
+
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
-    // 注册协议栈 tick 钩子——每个 timer tick 推一帧 `net::stack().poll()`，
-    // 否则整个协议栈不会推进任何状态（RX 帧进不来、TCP 状态机不前进、
-    // soft-remove 的 socket 永远占着槽位）。详见 [`net_poll`] 模块。
+    // 协议栈是被动状态机，必须由定时器持续推进收包、TCP 状态和套接字回收。
     net_poll::register();
-
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    let integrated =
+        integrated_components::initialize_phase(integrated_components::IntegratedPhase::Runtime)
+            .unwrap_or_else(|error| panic!("[kernel] 集成组件初始化失败: {error}"));
+    if integrated != 0 {
+        log::info!(
+            "[kernel] initialized {} integrated component(s)",
+            integrated
+        );
+    }
+    elm::init_builtin_mgr();
+    let build_bound = elm::load_build_bound_modules(&init)
+        .unwrap_or_else(|error| panic!("[kernel] BuildBound ELM 自动装载失败: {error}"));
+    if build_bound != 0 {
+        log::info!("[kernel] activated {} BuildBound ELM(s)", build_bound);
+    }
+    if device_init::retry_deferred_boot_console(&init) {
+        log::info!("[kernel] deferred boot console activated after BuildBound loading");
+    }
     // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则
     // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要
     // 调度器 init/idle 完成后才能派生内核线程。
     tty_poll::register();
+
+    let secondary_cpus = hal::sched::start_secondary_cpus();
+    log::info!(
+        "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
+        secondary_cpus.detected,
+        secondary_cpus.started,
+        secondary_cpus.failed,
+        ::sched::online_cpu_mask(),
+        ::sched::active_cpu_mask(),
+    );
+    elm::synchronize_smp_runtime();
     /*
     #[cfg(debug_assertions)]
     sched::smoketest();

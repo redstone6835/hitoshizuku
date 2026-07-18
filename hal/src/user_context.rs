@@ -16,7 +16,9 @@ pub struct UserTrapFrame {
     inner: arch::TrapFrame,
 }
 
+#[kernel_symbols::export]
 impl UserTrapFrame {
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.from_context", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL)]
     pub fn from_context(raw: usize) -> Self {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -31,6 +33,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.apply_to_context", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn apply_to_context(&self, raw: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -45,6 +48,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.init_user", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL)]
     pub fn init_user(entry_pc: usize, user_sp: usize, arg0: usize) -> Self {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -65,6 +69,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.pc", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
     pub fn pc(&self) -> usize {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -77,6 +82,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.sp", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
     pub fn sp(&self) -> usize {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -89,6 +95,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.set_pc", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_pc(&mut self, pc: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -101,6 +108,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.set_sp", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_sp(&mut self, sp: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -113,6 +121,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.set_tls", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_tls(&mut self, tls: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -125,6 +134,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.set_ret", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_ret(&mut self, value: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -137,6 +147,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.ret", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
     pub fn ret(&self) -> usize {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -154,6 +165,7 @@ impl UserTrapFrame {
         <arch::CurrentTaskOps as TaskOps>::signal_interrupted_syscall_pc(ptr)
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.set_args", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_args(&mut self, arg0: usize, arg1: usize, arg2: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -212,6 +224,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.advance_pc", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn advance_pc(&mut self) {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -224,6 +237,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.encoded_len", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
     pub fn encoded_len() -> usize {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -236,6 +250,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.write_bytes", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn write_bytes(&self, out: &mut [u8]) -> bool {
         let len = Self::encoded_len();
         if out.len() < len {
@@ -450,6 +465,7 @@ impl UserTrapFrame {
         }
     }
 
+    #[kernel_symbols::export(name = "hal.user_context.UserTrapFrame.read_bytes", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
     pub fn read_bytes(input: &[u8]) -> Option<Self> {
         let len = Self::encoded_len();
         if input.len() < len {
@@ -502,6 +518,7 @@ fn read_u64(input: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(raw)
 }
 
+#[kernel_symbols::export(name = "hal.user_context.set_kernel_trap_stack", contract = "kernel.hal.user-context@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn set_kernel_trap_stack(stack_top: usize) {
     #[cfg(target_arch = "loongarch64")]
     {

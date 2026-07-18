@@ -1,6 +1,6 @@
 //! CPU 位图、调度域与拓扑选择。
 //!
-//! 本模块只描述调度核心需要的通用 CPU 拓扑：可支持 CPU 集、当前在线集、
+//! 本模块只描述调度器需要的通用 CPU 拓扑：可支持 CPU 集、当前在线集、
 //! 以及按调度域做任务放置和负载均衡的选择规则。面向用户态的 ABI 编码在
 //! syscall 兼容层完成，这里只保留内核内部的稳定模型。
 
@@ -8,15 +8,18 @@ use errno::Errno;
 
 /// 当前构建支持的最大 CPU 数。
 ///
-/// 这里是调度核心的固定容量，不表示所有 CPU 都已经上线；在线状态由
+/// 这里是调度器的固定容量，不表示所有 CPU 都已经上线；在线状态由
 /// scheduler 运行期维护。固定容量让 per-CPU 数组可以静态分配，避免热路径分配。
 pub const MAX_CPUS: usize = 8;
 
-/// 启动 CPU。空亲和性在核心内部不能存在，必要时统一退回到该 CPU。
+/// 启动 CPU。空亲和性在调度器内部不能存在，必要时统一退回到该 CPU。
 pub const BOOT_CPU_ID: usize = 0;
 
-/// 调度域最大数量。当前以 CPU 数为上限，足够表达根域和每 CPU/每簇子域。
-pub const MAX_SCHED_DOMAINS: usize = MAX_CPUS;
+/// 调度域最大数量。可容纳根域、CPU 叶子域以及中间的 package/cluster/core 域。
+pub const MAX_SCHED_DOMAINS: usize = MAX_CPUS * 2;
+
+/// 单个同构 CPU 的标准调度容量。
+pub const SCHED_CAPACITY_SCALE: u64 = 1024;
 
 /// 根调度域编号。根域必须覆盖所有受支持 CPU。
 pub const ROOT_SCHED_DOMAIN_ID: usize = 0;
@@ -39,7 +42,7 @@ const fn cpu_bit_raw(cpu_id: usize) -> u64 {
     }
 }
 
-/// 调度核心内部使用的 CPU 编号。
+/// 调度器内部使用的 CPU 编号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CpuId(usize);
 
@@ -192,6 +195,7 @@ pub struct SchedDomain {
     span: CpuMask,
     level: u8,
     parent: Option<usize>,
+    capacity: u64,
 }
 
 impl SchedDomain {
@@ -201,6 +205,7 @@ impl SchedDomain {
             span: CpuMask::EMPTY,
             level: 0,
             parent: None,
+            capacity: 0,
         }
     }
 
@@ -210,11 +215,26 @@ impl SchedDomain {
             span: CpuMask::SUPPORTED,
             level: 0,
             parent: None,
+            capacity: MAX_CPUS as u64 * SCHED_CAPACITY_SCALE,
         }
     }
 
     pub fn new(id: usize, span: CpuMask, level: u8, parent: Option<usize>) -> Result<Self, Errno> {
+        let capacity = span.count() as u64 * SCHED_CAPACITY_SCALE;
+        Self::with_capacity(id, span, level, parent, capacity)
+    }
+
+    pub fn with_capacity(
+        id: usize,
+        span: CpuMask,
+        level: u8,
+        parent: Option<usize>,
+        capacity: u64,
+    ) -> Result<Self, Errno> {
         if id >= MAX_SCHED_DOMAINS || span.is_empty() || !CpuMask::SUPPORTED.contains_mask(span) {
+            return Err(Errno::EINVAL);
+        }
+        if capacity == 0 {
             return Err(Errno::EINVAL);
         }
         Ok(Self {
@@ -222,6 +242,7 @@ impl SchedDomain {
             span,
             level,
             parent,
+            capacity,
         })
     }
 
@@ -240,12 +261,26 @@ impl SchedDomain {
     pub const fn parent(self) -> Option<usize> {
         self.parent
     }
+
+    pub const fn capacity(self) -> u64 {
+        self.capacity
+    }
+
+    /// 返回只计入 active CPU 后的有效容量。
+    pub fn effective_capacity(self, active: CpuMask) -> u64 {
+        let total_cpus = self.span.count() as u64;
+        let active_cpus = self.span.intersection(active).count() as u64;
+        if total_cpus == 0 || active_cpus == 0 {
+            return 0;
+        }
+        self.capacity.saturating_mul(active_cpus) / total_cpus
+    }
 }
 
 /// 某个任务在当前拓扑下的调度放置快照。
 ///
-/// 这个结构只描述调度核心的通用事实，不包含任何用户态 ABI 编码。`affinity`
-/// 是任务声明的 CPU 许可集，`effective` 是再与在线 CPU 集相交后的实际可运行集；
+/// 这个结构只描述调度器的通用事实，不包含任何用户态 ABI 编码。`affinity`
+/// 是任务声明的 CPU 许可集，`effective` 是再与 active CPU 集相交后的实际可运行集；
 /// `preferred_cpu` 是按当前负载、调度域和是否优先保持原 CPU 计算出的候选 CPU。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedPlacement {
@@ -272,6 +307,31 @@ impl SchedTopology {
             domains,
             len: 1,
             cpu_domain: [ROOT_SCHED_DOMAIN_ID; MAX_CPUS],
+        }
+    }
+
+    /// 构造 `Root -> Cpu` 的合成拓扑。
+    pub const fn with_cpu_domains() -> Self {
+        let mut domains = [SchedDomain::empty(); MAX_SCHED_DOMAINS];
+        let mut cpu_domain = [ROOT_SCHED_DOMAIN_ID; MAX_CPUS];
+        domains[ROOT_SCHED_DOMAIN_ID] = SchedDomain::root();
+        let mut cpu = 0usize;
+        while cpu < MAX_CPUS {
+            let domain_id = cpu + 1;
+            domains[domain_id] = SchedDomain {
+                id: domain_id,
+                span: CpuMask::single_raw(cpu),
+                level: 1,
+                parent: Some(ROOT_SCHED_DOMAIN_ID),
+                capacity: SCHED_CAPACITY_SCALE,
+            };
+            cpu_domain[cpu] = domain_id;
+            cpu += 1;
+        }
+        Self {
+            domains,
+            len: MAX_CPUS + 1,
+            cpu_domain,
         }
     }
 
@@ -363,6 +423,15 @@ impl SchedTopology {
         self.domain(self.cpu_domain[cpu.get()])
     }
 
+    /// 返回 CPU 所属最小调度域折算到单个 CPU 的容量。
+    pub fn cpu_capacity(self, cpu: CpuId) -> u64 {
+        let domain = self
+            .domain_for_cpu(cpu)
+            .unwrap_or_else(|| self.root_domain());
+        let cpus = domain.span().count().max(1) as u64;
+        (domain.capacity() / cpus).max(1)
+    }
+
     pub fn root_domain(self) -> SchedDomain {
         self.domains[ROOT_SCHED_DOMAIN_ID]
     }
@@ -374,7 +443,7 @@ impl SchedTopology {
     pub fn select_cpu<F>(
         self,
         allowed: CpuMask,
-        online: CpuMask,
+        active: CpuMask,
         current: Option<CpuId>,
         prefer_current: bool,
         mut load_of: F,
@@ -382,7 +451,7 @@ impl SchedTopology {
     where
         F: FnMut(CpuId) -> usize,
     {
-        let eligible = allowed.intersection(online);
+        let eligible = allowed.intersection(active);
         if eligible.is_empty() {
             return None;
         }
@@ -397,12 +466,12 @@ impl SchedTopology {
             && let Some(domain) = self.domain_for_cpu(cpu)
         {
             let local = domain.span.intersection(eligible);
-            if let Some(cpu) = choose_least_loaded(local, &mut load_of) {
+            if let Some(cpu) = choose_least_loaded(self, local, &mut load_of) {
                 return Some(cpu);
             }
         }
 
-        choose_least_loaded(eligible, &mut load_of)
+        choose_least_loaded(self, eligible, &mut load_of)
     }
 
     /// 计算任务在当前拓扑下的放置快照。
@@ -413,7 +482,7 @@ impl SchedTopology {
     pub fn describe_placement<F>(
         self,
         affinity: CpuMask,
-        online: CpuMask,
+        active: CpuMask,
         current: Option<CpuId>,
         prefer_current: bool,
         load_of: F,
@@ -422,11 +491,11 @@ impl SchedTopology {
         F: FnMut(CpuId) -> usize,
     {
         let affinity = affinity.or_boot();
-        let effective = affinity.intersection(online);
+        let effective = affinity.intersection(active);
         let current_domain = current
             .and_then(|cpu| self.domain_for_cpu(cpu))
             .map(|domain| domain.id());
-        let preferred_cpu = self.select_cpu(affinity, online, current, prefer_current, load_of);
+        let preferred_cpu = self.select_cpu(affinity, active, current, prefer_current, load_of);
         SchedPlacement {
             current_cpu: current,
             current_domain,
@@ -437,11 +506,11 @@ impl SchedTopology {
     }
 
     /// 返回最近可拉取任务的调度域 CPU 集，不包含本 CPU。
-    pub fn balance_sources(self, cpu: CpuId, online: CpuMask) -> CpuMask {
+    pub fn balance_sources(self, cpu: CpuId, active: CpuMask) -> CpuMask {
         let mut domain_id = self.cpu_domain[cpu.get()];
         loop {
             let domain = self.domain(domain_id).unwrap_or_else(|| self.root_domain());
-            let sources = domain.span.intersection(online).without(cpu);
+            let sources = domain.span.intersection(active).without(cpu);
             if !sources.is_empty() || domain.id == ROOT_SCHED_DOMAIN_ID {
                 return sources;
             }
@@ -485,17 +554,22 @@ impl SchedTopology {
     }
 }
 
-fn choose_least_loaded<F>(mask: CpuMask, load_of: &mut F) -> Option<CpuId>
+fn choose_least_loaded<F>(topology: SchedTopology, mask: CpuMask, load_of: &mut F) -> Option<CpuId>
 where
     F: FnMut(CpuId) -> usize,
 {
     let mut best = None;
     let mut best_load = usize::MAX;
+    let mut best_capacity = 1u64;
     for cpu in mask.iter() {
         let load = load_of(cpu);
-        if best.is_none() || load < best_load {
+        let capacity = topology.cpu_capacity(cpu);
+        let less_utilized = (load as u128).saturating_mul(best_capacity as u128)
+            < (best_load as u128).saturating_mul(capacity as u128);
+        if best.is_none() || less_utilized {
             best = Some(cpu);
             best_load = load;
+            best_capacity = capacity;
         }
     }
     best
