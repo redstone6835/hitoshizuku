@@ -592,6 +592,8 @@ impl NetQueuePair for VirtioNetQueuePair {
             max_tx_descriptors: 8,
             max_rx_batch: 32,
             max_tx_batch: 32,
+            udp_segmentation: false,
+            max_udp_segments: 0,
         }
     }
 

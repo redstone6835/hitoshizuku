@@ -145,7 +145,69 @@ pub struct PacketMetadata {
     pub rss_hash: Option<u32>,
     pub rss_generation: u32,
     pub frame_len: u32,
+    pub layout: PacketLayout,
     pub drop_reason: DropReason,
+}
+
+/// 报文在队列之间移动时保留的逻辑布局。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PacketLayout {
+    #[default]
+    Plain,
+    UdpSegments(UdpSegmentation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpSegmentation {
+    pub segment_count: u8,
+    pub header_len: u16,
+    pub payload_len: u16,
+}
+
+impl UdpSegmentation {
+    pub fn validate(self, fragment_count: usize, stored_len: usize) -> bool {
+        let count = usize::from(self.segment_count);
+        let header_len = usize::from(self.header_len);
+        let payload_len = usize::from(self.payload_len);
+        (2..=32).contains(&count)
+            && header_len != 0
+            && payload_len != 0
+            && fragment_count == count
+            && stored_len == header_len + payload_len.saturating_mul(count)
+    }
+
+    pub fn logical_frame_len(self) -> usize {
+        usize::from(self.header_len) + usize::from(self.payload_len)
+    }
+
+    pub fn logical_bytes(self) -> usize {
+        self.logical_frame_len()
+            .saturating_mul(usize::from(self.segment_count))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_segmentation_rejects_inconsistent_layouts() {
+        let layout = UdpSegmentation {
+            segment_count: 4,
+            header_len: 42,
+            payload_len: 1400,
+        };
+        assert!(layout.validate(4, 42 + 4 * 1400));
+        assert!(!layout.validate(3, 42 + 4 * 1400));
+        assert!(!layout.validate(4, 42 + 3 * 1400));
+        assert!(
+            !UdpSegmentation {
+                segment_count: 1,
+                ..layout
+            }
+            .validate(1, 42 + 1400)
+        );
+    }
 }
 
 impl Default for PacketMetadata {
@@ -157,6 +219,7 @@ impl Default for PacketMetadata {
             rss_hash: None,
             rss_generation: 0,
             frame_len: 0,
+            layout: PacketLayout::Plain,
             drop_reason: DropReason::None,
         }
     }

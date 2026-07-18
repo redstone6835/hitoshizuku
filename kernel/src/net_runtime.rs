@@ -566,6 +566,7 @@ enum EgressWork {
     Packet(TxPacket),
     Tcp(PreparedTcpTx),
     Udp(PreparedUdpTx),
+    UdpBatch(Vec<PreparedUdpTx>),
     Raw(PreparedRawTx),
     ControlFrame(Vec<u8>),
 }
@@ -577,6 +578,10 @@ impl EgressWork {
             Self::Tcp(work) if work.low_latency => return 3,
             Self::Tcp(work) => work.facade.socket_priority(),
             Self::Udp(work) => work.payload.facade().socket_priority(),
+            Self::UdpBatch(work) => work
+                .first()
+                .map(|work| work.payload.facade().socket_priority())
+                .unwrap_or_default(),
             Self::Raw(work) => work.payload.facade().socket_priority(),
             Self::ControlFrame(_) => return 3,
         };
@@ -591,6 +596,30 @@ pub(crate) const fn tx_priority_class(priority: i32) -> usize {
         3..=5 => 2,
         _ => 3,
     }
+}
+
+fn udp_batch_candidate(work: &PreparedUdpTx) -> bool {
+    let ip_header_len = match work.route.source {
+        IpAddr::V4(_) => 20usize,
+        IpAddr::V6(_) => 40usize,
+    };
+    !work.destination.addr.is_multicast()
+        && !matches!(work.destination.addr, IpAddr::V4(address) if address.is_broadcast())
+        && ip_header_len + 8 + usize::from(work.payload.len) <= work.route.mtu as usize
+        && work.payload.len != 0
+}
+
+fn udp_batch_compatible(first: &PreparedUdpTx, next: &PreparedUdpTx) -> bool {
+    udp_batch_candidate(first)
+        && udp_batch_candidate(next)
+        && first.payload.len == next.payload.len
+        && first.route == next.route
+        && first.destination == next.destination
+        && first.source_port == next.source_port
+        && first.source_mac == next.source_mac
+        && first.destination_mac == next.destination_mac
+        && first.hop_limit == next.hop_limit
+        && first.traffic_class == next.traffic_class
 }
 
 struct PendingTxFrame {
@@ -1117,6 +1146,11 @@ fn fail_egress_work(work: EgressWork, error: SocketError) {
         EgressWork::Packet(_) | EgressWork::ControlFrame(_) => {}
         EgressWork::Tcp(work) => work.facade.set_pending_error(error),
         EgressWork::Udp(work) => work.payload.facade().set_pending_error(error),
+        EgressWork::UdpBatch(work) => {
+            for work in work {
+                work.payload.facade().set_pending_error(error);
+            }
+        }
         EgressWork::Raw(work) => work.payload.facade().set_pending_error(error),
     }
 }
@@ -3193,39 +3227,7 @@ impl ProtocolContext {
                     facade.finish_stream_tx_drain(generation);
                 }
                 SocketKind::Datagram => {
-                    for _ in 0..32 {
-                        let Some(payload) = facade.take_tx() else {
-                            break;
-                        };
-                        match self.protocol.prepare_udp_tx(
-                            flow,
-                            payload,
-                            facade.socket_mark(),
-                            config,
-                            sched::now_ns_public(),
-                        ) {
-                            Ok(work) => {
-                                if work.unresolved_neighbor.is_some() {
-                                    self.publish_neighbor_work(PendingNeighborTx::Udp(work));
-                                    continue;
-                                }
-                                let Some(target) =
-                                    self.runtime.egress.iter().position(|target| {
-                                        target.interface == work.route.interface
-                                    })
-                                else {
-                                    work.payload
-                                        .facade()
-                                        .set_pending_error(SocketError::NetworkUnreachable);
-                                    continue;
-                                };
-                                self.dispatch_egress(target, EgressWork::Udp(work));
-                            }
-                            Err((error, payload)) => {
-                                payload.facade().set_pending_error(error);
-                            }
-                        }
-                    }
+                    self.drain_udp_socket(&facade, flow, config, 32);
                 }
                 SocketKind::Raw => {
                     for _ in 0..32 {
@@ -3277,7 +3279,23 @@ impl ProtocolContext {
         flow: FlowId,
         config: &ConfigSnapshot,
     ) {
-        while let Some(payload) = facade.take_tx() {
+        self.drain_udp_socket(facade, flow, config, usize::MAX);
+        facade.finish_tx_drain();
+    }
+
+    fn drain_udp_socket(
+        &mut self,
+        facade: &Arc<SocketFacade>,
+        flow: FlowId,
+        config: &ConfigSnapshot,
+        limit: usize,
+    ) {
+        let mut batch = Vec::with_capacity(16);
+        let mut batch_target = None;
+        for _ in 0..limit {
+            let Some(payload) = facade.take_tx() else {
+                break;
+            };
             match self.protocol.prepare_udp_tx(
                 flow,
                 payload,
@@ -3287,6 +3305,7 @@ impl ProtocolContext {
             ) {
                 Ok(work) => {
                     if work.unresolved_neighbor.is_some() {
+                        self.flush_udp_batch(batch_target.take(), &mut batch);
                         self.publish_neighbor_work(PendingNeighborTx::Udp(work));
                         continue;
                     }
@@ -3296,17 +3315,49 @@ impl ProtocolContext {
                         .iter()
                         .position(|target| target.interface == work.route.interface)
                     else {
+                        self.flush_udp_batch(batch_target.take(), &mut batch);
                         work.payload
                             .facade()
                             .set_pending_error(SocketError::NetworkUnreachable);
                         continue;
                     };
-                    self.dispatch_egress(target, EgressWork::Udp(work));
+                    let compatible = batch
+                        .first()
+                        .is_none_or(|first| udp_batch_compatible(first, &work));
+                    if batch_target.is_some_and(|current| current != target)
+                        || !compatible
+                        || batch.len() == 16
+                    {
+                        self.flush_udp_batch(batch_target.take(), &mut batch);
+                    }
+                    if udp_batch_candidate(&work) {
+                        batch_target = Some(target);
+                        batch.push(work);
+                    } else {
+                        self.flush_udp_batch(batch_target.take(), &mut batch);
+                        self.dispatch_egress(target, EgressWork::Udp(work));
+                    }
                 }
-                Err((error, payload)) => payload.facade().set_pending_error(error),
+                Err((error, payload)) => {
+                    self.flush_udp_batch(batch_target.take(), &mut batch);
+                    payload.facade().set_pending_error(error);
+                }
             }
         }
-        facade.finish_tx_drain();
+        self.flush_udp_batch(batch_target, &mut batch);
+    }
+
+    fn flush_udp_batch(&mut self, target: Option<usize>, batch: &mut Vec<PreparedUdpTx>) {
+        if batch.is_empty() {
+            return;
+        }
+        let target = target.expect("非空 UDP 批次必须拥有 egress");
+        let mut pending = core::mem::take(batch);
+        if pending.len() == 1 {
+            self.dispatch_egress(target, EgressWork::Udp(pending.pop().unwrap()));
+        } else {
+            self.dispatch_egress(target, EgressWork::UdpBatch(pending));
+        }
     }
 
     fn publish_neighbor_work(&self, work: PendingNeighborTx) {
@@ -5194,6 +5245,9 @@ impl WorkerContext {
             }
             EgressWork::Tcp(work) => self.materialize_tcp(work).map_err(EgressWork::Tcp),
             EgressWork::Udp(work) => self.materialize_udp(work).map_err(EgressWork::Udp),
+            EgressWork::UdpBatch(work) => self
+                .materialize_udp_batch(work)
+                .map_err(EgressWork::UdpBatch),
             EgressWork::Raw(work) => self.materialize_raw(work).map_err(EgressWork::Raw),
             EgressWork::ControlFrame(bytes) => {
                 self.pending_tx_frames.push_back(PendingTxFrame {
@@ -5238,6 +5292,7 @@ impl WorkerContext {
                 chain: PacketChain::from_lease(lease),
                 completion: frame.completion,
                 low_latency: false,
+                layout: net::buf::PacketLayout::Plain,
             };
             if let Err(packet) = self.tx_batch.push(packet) {
                 self.pending_tx_frames.push_front(PendingTxFrame {
@@ -5341,6 +5396,7 @@ impl WorkerContext {
                 chain,
                 completion,
                 low_latency: false,
+                layout: net::buf::PacketLayout::Plain,
             },
             Err(_) => {
                 facade.set_pending_error(SocketError::Buffer);
@@ -5350,6 +5406,127 @@ impl WorkerContext {
         self.tx_batch
             .push(packet)
             .unwrap_or_else(|_| unreachable!());
+        Ok(())
+    }
+
+    fn materialize_udp_batch(
+        &mut self,
+        mut work: Vec<PreparedUdpTx>,
+    ) -> Result<(), Vec<PreparedUdpTx>> {
+        let caps = self.queue.as_ref().unwrap().caps();
+        if !caps.udp_segmentation
+            || work.len() > usize::from(caps.max_udp_segments)
+            || work.len() < 2
+        {
+            return self.materialize_udp_batch_plain(work);
+        }
+        if self.tx_batch.len() >= 32 {
+            return Err(work);
+        }
+
+        let payload_len = work[0].payload.len;
+        let header_len = match work[0].route.source {
+            IpAddr::V4(_) => 42u16,
+            IpAddr::V6(_) => 62u16,
+        };
+        let mut first_chain = PacketChain::new();
+        let mut tail = Vec::with_capacity(work.len().saturating_sub(1));
+        for (index, item) in work.iter().enumerate() {
+            let headroom = if index == 0 { header_len } else { 0 };
+            let lease = match allocate_payload_chain(
+                self.tx_payload_pool.as_mut().unwrap(),
+                usize::from(payload_len),
+                headroom,
+                1,
+                |offset, output| item.payload.copy_range(offset, output),
+            ) {
+                Ok(mut payload) => payload
+                    .take_fragment(0)
+                    .expect("单段 UDP payload 必须拥有 fragment"),
+                Err(PayloadChainError::Retry) => return Err(work),
+                Err(PayloadChainError::Socket(error)) => {
+                    for item in work {
+                        item.payload.facade().set_pending_error(error);
+                    }
+                    return Ok(());
+                }
+            };
+            if index == 0 {
+                first_chain.push(lease).unwrap_or_else(|_| unreachable!());
+            } else {
+                tail.push(lease);
+            }
+        }
+
+        let first = work.remove(0);
+        let PreparedUdpTx {
+            payload,
+            route,
+            destination,
+            source_port,
+            source_mac,
+            destination_mac,
+            hop_limit,
+            traffic_class,
+            completion,
+            unresolved_neighbor: _,
+        } = first;
+        let facade = payload.facade();
+        payload.complete();
+        for item in work {
+            item.payload.complete();
+        }
+        let mut chain = match build_udp_packet_with_options(
+            first_chain,
+            route,
+            destination,
+            source_port,
+            source_mac,
+            destination_mac,
+            hop_limit,
+            traffic_class,
+        ) {
+            Ok(chain) => chain,
+            Err(_) => {
+                facade.set_pending_error(SocketError::Buffer);
+                return Ok(());
+            }
+        };
+        for fragment in tail {
+            chain.push(fragment).unwrap_or_else(|_| unreachable!());
+        }
+        let layout = net::buf::UdpSegmentation {
+            segment_count: chain.fragment_count() as u8,
+            header_len,
+            payload_len,
+        };
+        debug_assert!(layout.validate(chain.fragment_count(), chain.total_len()));
+        self.tx_batch
+            .push(TxPacket {
+                chain,
+                completion,
+                low_latency: false,
+                layout: net::buf::PacketLayout::UdpSegments(layout),
+            })
+            .unwrap_or_else(|_| unreachable!());
+        Ok(())
+    }
+
+    fn materialize_udp_batch_plain(
+        &mut self,
+        mut work: Vec<PreparedUdpTx>,
+    ) -> Result<(), Vec<PreparedUdpTx>> {
+        let available = 32usize.saturating_sub(self.tx_batch.len());
+        if work.len() > available {
+            return Err(work);
+        }
+        while !work.is_empty() {
+            let item = work.remove(0);
+            if let Err(item) = self.materialize_udp(item) {
+                work.insert(0, item);
+                return Err(work);
+            }
+        }
         Ok(())
     }
 
@@ -5411,6 +5588,7 @@ impl WorkerContext {
                 chain,
                 completion,
                 low_latency: false,
+                layout: net::buf::PacketLayout::Plain,
             },
             Err((error, _)) => {
                 facade.set_pending_error(match error {
@@ -5467,6 +5645,7 @@ impl WorkerContext {
             chain,
             completion,
             low_latency,
+            layout: net::buf::PacketLayout::Plain,
         };
         self.tx_batch
             .push(packet)
@@ -5610,6 +5789,7 @@ impl WorkerContext {
                     chain: PacketChain::from_lease(lease),
                     completion: CompletionToken(0x4152_5001),
                     low_latency: true,
+                    layout: net::buf::PacketLayout::Plain,
                 })
                 .is_ok()
         );

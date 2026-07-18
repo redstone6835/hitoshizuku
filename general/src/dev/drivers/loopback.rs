@@ -11,7 +11,7 @@ use spin::Mutex;
 use net::QueuePairId;
 use net::buf::{
     CompletionBatch, CompletionToken, NetBufPool, NetBufPoolOwner, NetBufStorage, PacketBatch,
-    PacketMetadata, RxRefillBatch, TxBatch,
+    PacketLayout, PacketMetadata, RxRefillBatch, TxBatch,
 };
 use net::device::{
     NetDeviceRegistration, NetQueueRegistration, QueueIrqControl, QueueIrqError, QueueIrqStats,
@@ -178,6 +178,8 @@ impl NetQueuePair for LoopbackQueue {
             max_tx_descriptors: 18,
             max_rx_batch: 32,
             max_tx_batch: 32,
+            udp_segmentation: true,
+            max_udp_segments: 16,
         }
     }
 
@@ -219,11 +221,22 @@ impl NetQueuePair for LoopbackQueue {
         let mut packets = 0u16;
         let mut bytes = 0u32;
         while self.packet_count != 0 && packets < budget.packets && packets < 32 {
-            let packet_len = self.packets[self.packet_head]
+            let stored_len = self.packets[self.packet_head]
                 .as_ref()
                 .map(|packet| packet.total_len() as u32)
                 .unwrap_or(0);
-            if packets != 0 && bytes.saturating_add(packet_len) > budget.bytes {
+            let metadata = self.metadata[self.packet_head].unwrap_or_default();
+            let (logical_packets, logical_bytes) = match metadata.layout {
+                PacketLayout::Plain => (1u16, stored_len),
+                PacketLayout::UdpSegments(layout) => (
+                    u16::from(layout.segment_count),
+                    layout.logical_bytes().min(u32::MAX as usize) as u32,
+                ),
+            };
+            if packets != 0
+                && (packets.saturating_add(logical_packets) > budget.packets
+                    || bytes.saturating_add(logical_bytes) > budget.bytes)
+            {
                 break;
             }
             let packet = self.packets[self.packet_head]
@@ -234,8 +247,8 @@ impl NetQueuePair for LoopbackQueue {
             self.packet_count -= 1;
             out.push(packet, metadata)
                 .unwrap_or_else(|_| unreachable!());
-            packets += 1;
-            bytes = bytes.saturating_add(packet_len);
+            packets = packets.saturating_add(logical_packets);
+            bytes = bytes.saturating_add(logical_bytes);
         }
         RxPollResult {
             packets,
@@ -283,12 +296,19 @@ impl NetQueuePair for LoopbackQueue {
             let Some(packet) = batch.take(index) else {
                 continue;
             };
-            let packet_len = packet.chain.total_len() as u32;
+            let stored_len = packet.chain.total_len() as u32;
+            let logical_bytes = match packet.layout {
+                PacketLayout::Plain => stored_len,
+                PacketLayout::UdpSegments(layout) => {
+                    layout.logical_bytes().min(u32::MAX as usize) as u32
+                }
+            };
             descriptors = descriptors.saturating_add(packet.chain.fragment_count() as u16);
-            bytes = bytes.saturating_add(packet_len);
+            bytes = bytes.saturating_add(logical_bytes);
             self.packets[self.packet_tail] = Some(packet.chain);
             self.metadata[self.packet_tail] = Some(PacketMetadata {
-                frame_len: packet_len,
+                frame_len: logical_bytes,
+                layout: packet.layout,
                 ..PacketMetadata::default()
             });
             self.packet_tail = (self.packet_tail + 1) % LOOPBACK_RING_SIZE;
@@ -344,7 +364,7 @@ pub fn register_builtin_driver() -> Result<(), PnpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use net::buf::{PacketChain, TxPacket};
+    use net::buf::{PacketChain, PacketLayout, TxPacket, UdpSegmentation};
 
     #[test]
     fn tx_submission_exposes_rx_and_completion_synchronously() {
@@ -360,6 +380,7 @@ mod tests {
             chain: PacketChain::from_lease(lease),
             completion: CompletionToken(7),
             low_latency: false,
+            layout: net::buf::PacketLayout::Plain,
         })
         .unwrap_or_else(|_| unreachable!());
         let mut header_pool = make_pool(1, 256).unwrap();
@@ -386,5 +407,56 @@ mod tests {
         assert_eq!(reclaimed.completions, 1);
         assert_eq!(completions.token(0), Some(CompletionToken(7)));
         assert!(reclaimed.ring_empty);
+    }
+
+    #[test]
+    fn segmented_udp_uses_logical_rx_budget() {
+        let mut queue = LoopbackQueue::new();
+        let mut payload_pool = make_pool(3, 256).unwrap();
+        let mut chain = PacketChain::new();
+        for (index, len) in [46u16, 4, 4].into_iter().enumerate() {
+            let lease = payload_pool
+                .lease(
+                    if index == 0 { 32 } else { 0 },
+                    len,
+                    PacketMetadata::default(),
+                )
+                .unwrap();
+            chain
+                .push(net::buf::PacketFragment::Exclusive(lease))
+                .unwrap_or_else(|_| unreachable!());
+        }
+        let layout = UdpSegmentation {
+            segment_count: 3,
+            header_len: 42,
+            payload_len: 4,
+        };
+        let mut tx = TxBatch::new();
+        tx.push(TxPacket {
+            chain,
+            completion: CompletionToken(8),
+            low_latency: false,
+            layout: PacketLayout::UdpSegments(layout),
+        })
+        .unwrap_or_else(|_| unreachable!());
+        let mut header_pool = make_pool(1, 256).unwrap();
+        let submitted = queue.submit_tx_batch(&mut tx, &mut header_pool);
+        assert_eq!(submitted.packets, 1);
+        assert_eq!(submitted.bytes, layout.logical_bytes() as u32);
+
+        let mut rx = PacketBatch::new();
+        let polled = queue.poll_rx_batch(
+            RxBudget {
+                packets: 3,
+                bytes: layout.logical_bytes() as u32,
+            },
+            &mut rx,
+        );
+        assert_eq!(polled.packets, 3);
+        assert_eq!(polled.bytes, layout.logical_bytes() as u32);
+        assert_eq!(
+            rx.metadata(0).unwrap().layout,
+            PacketLayout::UdpSegments(layout)
+        );
     }
 }

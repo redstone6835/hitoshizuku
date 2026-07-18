@@ -475,6 +475,7 @@ impl FlowShard {
             chain: packet,
             completion,
             low_latency: false,
+            layout: crate::buf::PacketLayout::Plain,
         })
     }
 
@@ -572,6 +573,7 @@ impl FlowShard {
                                             chain,
                                             completion: CompletionToken(self.next_completion),
                                             low_latency: true,
+                                            layout: crate::buf::PacketLayout::Plain,
                                         };
                                         self.next_completion =
                                             self.next_completion.wrapping_add(1).max(1);
@@ -606,6 +608,7 @@ impl FlowShard {
                                 chain,
                                 completion: CompletionToken(self.next_completion),
                                 low_latency: true,
+                                layout: crate::buf::PacketLayout::Plain,
                             };
                             self.next_completion = self.next_completion.wrapping_add(1).max(1);
                             if let Err(packet) = tx.push(packet) {
@@ -677,6 +680,7 @@ impl FlowShard {
                                 chain,
                                 completion,
                                 low_latency: true,
+                                layout: crate::buf::PacketLayout::Plain,
                             };
                             match tx.push(packet) {
                                 Ok(()) => {

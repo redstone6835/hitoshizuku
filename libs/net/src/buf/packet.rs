@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::{ChunkRef, NetBufLease, PacketMetadata};
+use super::{ChunkRef, NetBufLease, PacketLayout, PacketMetadata};
 use crate::tuning::{PACKET_BATCH_CAPACITY, PACKET_FRAGMENT_CAPACITY};
 
 /// packet fragment 的独占或共享所有权。
@@ -429,6 +429,7 @@ pub struct TxPacket {
     pub chain: PacketChain,
     pub completion: CompletionToken,
     pub low_latency: bool,
+    pub layout: PacketLayout,
 }
 
 /// 固定 32 项 TX batch。

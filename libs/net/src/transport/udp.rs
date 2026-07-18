@@ -3,7 +3,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::buf::{CompletionToken, DropReason, PacketChain};
+use crate::buf::{CompletionToken, DropReason, PacketChain, PacketFragment, PacketLayout};
 use crate::control::RouteDecision;
 use crate::flow::{DIRTY_INGRESS, FlowKey, FlowTable, flow_hash64, rss_hash};
 use crate::pipeline::{FrontendPacket, transport_checksum};
@@ -231,7 +231,7 @@ impl UdpEndpointTable {
     pub fn ingest(
         &mut self,
         interface: InterfaceId,
-        packet: FrontendPacket,
+        mut packet: FrontendPacket,
     ) -> Result<FlowId, UdpIngressError> {
         let flow = packet.parsed.flow.expect("UDP packet 必须携带 FlowKey");
         let udp = packet.parsed.udp.expect("UDP packet 必须携带解析结果");
@@ -275,6 +275,92 @@ impl UdpEndpointTable {
         {
             let selected = usize::try_from(hash).unwrap_or(0) % recipients.len();
             recipients = alloc::vec![recipients[selected]];
+        }
+        if let PacketLayout::UdpSegments(layout) = packet.metadata.layout {
+            if recipients.len() != 1
+                || !layout.validate(packet.chain.fragment_count(), packet.chain.total_len())
+                || layout.header_len != udp.payload_offset
+                || layout.payload_len != udp.payload_len
+            {
+                return Err(UdpIngressError {
+                    reason: DropReason::MalformedUdp,
+                    chain: packet.chain,
+                    metadata: packet.metadata,
+                    parsed: packet.parsed,
+                });
+            }
+            for index in 0..packet.chain.fragment_count() {
+                let expected = if index == 0 {
+                    layout.logical_frame_len()
+                } else {
+                    usize::from(layout.payload_len)
+                };
+                if packet.chain.fragment(index).map(PacketFragment::len) != Some(expected) {
+                    return Err(UdpIngressError {
+                        reason: DropReason::MalformedUdp,
+                        chain: packet.chain,
+                        metadata: packet.metadata,
+                        parsed: packet.parsed,
+                    });
+                }
+            }
+            let id = recipients[0];
+            let destination = self
+                .flows
+                .get(id)
+                .map(|endpoint| {
+                    if endpoint.local.addr.is_unspecified() {
+                        flow.local
+                    } else {
+                        endpoint.local
+                    }
+                })
+                .expect("bind 表指向有效 UDP endpoint");
+            let ip = packet.parsed.ip.expect("UDP packet 必须携带 IP sidecar");
+            let segment_count = usize::from(layout.segment_count);
+            let mut delivered = false;
+            for index in 0..segment_count {
+                let fragment = packet
+                    .chain
+                    .take_fragment(index)
+                    .expect("已校验的 UDP segment 必须存在");
+                let mut chain = PacketChain::new();
+                chain.push(fragment).unwrap_or_else(|_| unreachable!());
+                let datagram = UdpDatagram {
+                    packet: chain,
+                    source: flow.remote,
+                    destination,
+                    payload_offset: if index == 0 { udp.payload_offset } else { 0 },
+                    payload_len: layout.payload_len,
+                    hop_limit: ip.hop_limit,
+                    traffic_class: ip.traffic_class,
+                    ingress_interface: interface,
+                    rx_timestamp_ns: packet.metadata.rx_timestamp_ns,
+                };
+                let endpoint = self
+                    .flows
+                    .get_mut(id)
+                    .expect("bind 表指向有效 UDP endpoint");
+                let accepted = if let Some(facade) = endpoint.facade.as_ref() {
+                    facade.push_rx(datagram).is_ok()
+                } else if endpoint.rx.is_full() {
+                    false
+                } else {
+                    endpoint.rx.push(datagram);
+                    true
+                };
+                delivered |= accepted;
+            }
+            if delivered {
+                self.flows.mark_dirty(id, DIRTY_INGRESS);
+                return Ok(id);
+            }
+            return Err(UdpIngressError {
+                reason: DropReason::UdpRingFull,
+                chain: packet.chain,
+                metadata: packet.metadata,
+                parsed: packet.parsed,
+            });
         }
         let packet_bytes = if recipients.len() > 1 {
             let mut bytes = alloc::vec![0; packet.chain.total_len()];
@@ -874,6 +960,31 @@ mod tests {
         }
     }
 
+    fn segmented_packet(remote_port: u16, local_port: u16) -> FrontendPacket {
+        let mut packet = parsed_packet(remote_port, local_port);
+        let payloads = [[1u8, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]];
+        let mut first = alloc::vec![0; 42 + payloads[0].len()];
+        first[42..].copy_from_slice(&payloads[0]);
+        packet
+            .chain
+            .push(PacketFragment::Owned(first.into_boxed_slice()))
+            .unwrap_or_else(|_| unreachable!());
+        for payload in payloads.iter().skip(1) {
+            packet
+                .chain
+                .push(PacketFragment::Owned(payload.to_vec().into_boxed_slice()))
+                .unwrap_or_else(|_| unreachable!());
+        }
+        packet.parsed.ip.as_mut().unwrap().payload_len = 12;
+        packet.parsed.udp.as_mut().unwrap().payload_len = 4;
+        packet.metadata.layout = PacketLayout::UdpSegments(crate::buf::UdpSegmentation {
+            segment_count: 3,
+            header_len: 42,
+            payload_len: 4,
+        });
+        packet
+    }
+
     #[test]
     fn connected_endpoint_filters_peer_without_scanning_binds() {
         let mut table = UdpEndpointTable::new([3; 40]);
@@ -920,6 +1031,62 @@ mod tests {
         let datagram = table.recv(id).unwrap();
         assert_eq!(datagram.payload_len, 0);
         assert!(table.recv(id).is_none());
+    }
+
+    #[test]
+    fn segmented_udp_restores_ordered_datagram_boundaries() {
+        let mut table = UdpEndpointTable::new([9; 40]);
+        let id = table
+            .bind(
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 9000,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            table
+                .ingest(InterfaceId(1), segmented_packet(1000, 9000))
+                .is_ok()
+        );
+        for expected in [[1u8, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]] {
+            let datagram = table.recv(id).expect("每个 segment 恢复一个 datagram");
+            let mut payload = [0u8; 4];
+            datagram
+                .packet
+                .copy_out(usize::from(datagram.payload_offset), &mut payload)
+                .unwrap();
+            assert_eq!(payload, expected);
+            assert_eq!(datagram.payload_len, 4);
+        }
+        assert!(table.recv(id).is_none());
+    }
+
+    #[test]
+    fn segmented_udp_rejects_mismatched_fragment_lengths() {
+        let mut table = UdpEndpointTable::new([10; 40]);
+        table
+            .bind(
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 9000,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let mut packet = segmented_packet(1000, 9000);
+        packet.metadata.layout = PacketLayout::UdpSegments(crate::buf::UdpSegmentation {
+            segment_count: 3,
+            header_len: 42,
+            payload_len: 5,
+        });
+        assert_eq!(
+            table.ingest(InterfaceId(1), packet).unwrap_err().reason,
+            DropReason::MalformedUdp
+        );
     }
 
     #[test]

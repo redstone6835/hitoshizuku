@@ -59,6 +59,8 @@ pub struct NetQueueCaps {
     pub max_tx_descriptors: u8,
     pub max_rx_batch: u8,
     pub max_tx_batch: u8,
+    pub udp_segmentation: bool,
+    pub max_udp_segments: u8,
 }
 
 impl NetQueueCaps {
@@ -68,6 +70,11 @@ impl NetQueueCaps {
             && self.max_rx_batch == 32
             && self.max_tx_batch == 32
             && self.max_tx_descriptors != 0
+            && if self.udp_segmentation {
+                (2..=32).contains(&self.max_udp_segments)
+            } else {
+                self.max_udp_segments == 0
+            }
     }
 }
 
@@ -278,6 +285,8 @@ mod tests {
                 max_tx_descriptors: 2,
                 max_rx_batch: 32,
                 max_tx_batch: 32,
+                udp_segmentation: false,
+                max_udp_segments: 0,
             }
         }
 
@@ -480,6 +489,7 @@ mod tests {
                 chain: PacketChain::from_lease(lease),
                 completion: CompletionToken(7),
                 low_latency: true,
+                layout: crate::buf::PacketLayout::Plain,
             })
             .is_ok()
         );
