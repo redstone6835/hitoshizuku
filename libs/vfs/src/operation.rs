@@ -96,6 +96,14 @@ fn retire_inode(inode: Arc<Inode>) {
 /// `openat(2)` — 打开或创建文件，返回 fd。
 ///
 /// 将路径解析、权限检查、`InodeOps::open`、挂载引用计数、fd 分配串成完整流程。
+#[kernel_symbols::export(
+    name = "vfs.operation.openat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn openat(
     ctx: &VfsContext,
     fdt: &FdTable,
@@ -111,6 +119,14 @@ pub fn openat(
 ///
 /// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
 /// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+#[kernel_symbols::export(
+    name = "vfs.operation.openat_with_lookup_flags",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn openat_with_lookup_flags(
     ctx: &VfsContext,
     fdt: &FdTable,
@@ -241,13 +257,42 @@ pub fn openat_with_lookup_flags(
 ///
 /// `Arc<File>` 引用计数归零时 `File::drop` 自动调用 `FileOps::release` 并 `dec_open`，
 /// 无需在此处手动处理。
+#[kernel_symbols::export(
+    name = "vfs.operation.close",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn close(fdt: &FdTable, fd: Fd) -> VfsResult<()> {
     fdt.close_fd(fd)
+}
+
+/// 关闭 fd，并释放指定进程在对应 inode 上持有的 POSIX record lock。
+///
+/// 用户态 `close(2)` 通过该统一入口进入 VFS，使普通关闭和带 owner 的关闭都能参与
+/// 内核符号导出、Mixin 观测与权限审计，同时保留 [`FdTable::close_fd_for_owner`] 的语义。
+#[kernel_symbols::export(
+    name = "vfs.operation.close_for_owner",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn close_for_owner(fdt: &FdTable, fd: Fd, owner_pid: i32) -> VfsResult<()> {
+    fdt.close_fd_for_owner(fd, owner_pid)
 }
 
 // ── mkdir ─────────────────────────────────────────────────────────────────────
 
 /// `mkdirat(2)` — 创建目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.mkdirat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> VfsResult<()> {
     if !path.is_empty() && path.as_bytes().iter().all(|&b| b == b'/') {
         return Err(VfsError::AlreadyExists);
@@ -277,6 +322,13 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 // ── rmdir ─────────────────────────────────────────────────────────────────────
 
 /// `unlinkat(AT_REMOVEDIR)` — 删除空目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.rmdir",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
@@ -311,6 +363,13 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 // ── unlink ────────────────────────────────────────────────────────────────────
 
 /// `unlinkat(2)` — 删除文件（减少 nlink）。
+#[kernel_symbols::export(
+    name = "vfs.operation.unlink",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
@@ -345,6 +404,13 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 // ── rename ────────────────────────────────────────────────────────────────────
 
 /// `renameat2(2)` — 重命名/移动文件或目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.renameat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn renameat(
     ctx: &VfsContext,
     old_dirfd: &Dirfd,
@@ -450,6 +516,12 @@ pub fn renameat(
 // ── stat ──────────────────────────────────────────────────────────────────────
 
 /// `fstatat(2)` — 通过路径获取文件元数据。
+#[kernel_symbols::export(
+    name = "vfs.operation.fstatat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY
+)]
 pub fn fstatat(
     ctx: &VfsContext,
     dirfd: &Dirfd,
@@ -467,6 +539,12 @@ pub fn fstatat(
 }
 
 /// `fstat(2)` — 通过已打开的 fd 获取文件元数据。
+#[kernel_symbols::export(
+    name = "vfs.operation.fstat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY
+)]
 pub fn fstat(fdt: &FdTable, fd: Fd) -> VfsResult<stat::FileStat> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
     file.stat()
@@ -475,6 +553,13 @@ pub fn fstat(fdt: &FdTable, fd: Fd) -> VfsResult<stat::FileStat> {
 // ── chdir ─────────────────────────────────────────────────────────────────────
 
 /// `chdir(2)` / `fchdir(2)` — 修改当前工作目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.chdir",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn chdir(ctx: &mut VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
@@ -633,6 +718,14 @@ fn chown_inode(
 /// 挂载文件系统：查找驱动 → 创建 Superblock → 挂载到挂载点。
 ///
 /// `dev` 为块设备路径（如 `"/dev/sda1"`），内存文件系统（tmpfs 等）传 `None`。
+#[kernel_symbols::export(
+    name = "vfs.operation.mount",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn mount(
     ctx: &VfsContext,
     dirfd: &Dirfd,
@@ -713,6 +806,13 @@ pub fn mount(
 }
 
 /// 卸载文件系统。
+#[kernel_symbols::export(
+    name = "vfs.operation.umount",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsResult<()> {
     if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
@@ -728,6 +828,13 @@ pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsRe
 }
 
 /// `chroot(2)` — 修改当前进程可见根目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.chroot",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
@@ -745,6 +852,13 @@ pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 ///
 /// 当前 VFS 的进程根不是对命名空间根的裸引用，因此 pivot 成功后必须同步更新
 /// 调用进程的 root/cwd，后续绝对路径解析才会从新根开始。
+#[kernel_symbols::export(
+    name = "vfs.operation.pivot_root",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn pivot_root(ctx: &VfsContext, new_root_path: &str, put_old_path: &str) -> VfsResult<()> {
     if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);

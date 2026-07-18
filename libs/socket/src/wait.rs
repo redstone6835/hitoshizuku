@@ -51,44 +51,33 @@ pub(crate) fn wait_while(
             return Err(SocketError::TemporaryUnavailable);
         }
         let task = current_task();
-        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
-        let _ = task.cas_state(TaskState::Runnable, TaskState::Sleeping);
-        queue.enqueue(&task);
+        let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
         let deadline_armed =
             deadline.is_some_and(|deadline| register_sleep_deadline(&task, deadline));
         if !predicate() {
-            queue.remove(&task);
             if deadline_armed {
                 cancel_sleep_deadline(&task);
             }
-            restore_current_after_wait(&task);
+            queue.finish_wait(&entry);
             return Ok(());
         }
         if deadline_expired(deadline) {
-            queue.remove(&task);
             if deadline_armed {
                 cancel_sleep_deadline(&task);
             }
-            restore_current_after_wait(&task);
+            queue.finish_wait(&entry);
             return Err(SocketError::TemporaryUnavailable);
         }
         schedule_once(now_ns_public());
-        queue.remove(&task);
         if deadline_armed {
             cancel_sleep_deadline(&task);
         }
-        restore_current_after_wait(&task);
+        queue.finish_wait(&entry);
         if has_pending_signal(&task) {
             return Err(SocketError::Interrupted);
         }
         if deadline_expired(deadline) {
             return Err(SocketError::TemporaryUnavailable);
         }
-    }
-}
-
-fn restore_current_after_wait(task: &Arc<Task>) {
-    if !task.cas_state(TaskState::Sleeping, TaskState::Running) {
-        let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
     }
 }

@@ -304,6 +304,7 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
 
         // 开始恢复寄存器状态，准备继续执行用户态程序。
         "or $r31, $r4, $r0",
+        "bl {handle_shootdown}",
 
         // 恢复程序计数器和状态寄存器的值。
         "ld.d $r12, $r31, {status_offset}",
@@ -427,6 +428,7 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "b .L_halt",
 
         report = sym loongarch64_handle_exception,
+        handle_shootdown = sym crate::loongarch64::smp::handle_shootdown_requests,
         frame_size = const FRAME_SIZE,
         csr_prmd = const CSR_PRMD,
         csr_euen = const CSR_EUEN,

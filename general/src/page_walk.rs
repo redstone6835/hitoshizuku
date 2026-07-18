@@ -148,6 +148,101 @@ pub fn unmap_range_entries<P: PagingArch>(
     Ok(())
 }
 
+/// 原地修改已存在叶子映射的权限。
+///
+/// 此函数只更新覆盖范围内的完整叶子页，不拆分大页，也不创建新映射。调用方如果需要
+/// 对一个段做精确 W^X，应保证该段按最小页大小独立映射，避免和其它段共享同一叶子页。
+pub fn protect_range_entries<P: PagingArch>(
+    root_vaddr: usize,
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+    user: bool,
+    global: bool,
+    phys_to_virt: fn(usize) -> usize,
+) -> Result<(), MapError> {
+    if size == 0 || vaddr % P::PAGE_SIZE != 0 || size % P::PAGE_SIZE != 0 {
+        return Err(MapError::Misaligned);
+    }
+    if !P::is_valid_leaf_perm(read, write, execute, user, global) {
+        return Err(MapError::InvalidPermission);
+    }
+
+    let end_vaddr = vaddr.checked_add(size).ok_or(MapError::Misaligned)?;
+    let mut current_vaddr = vaddr;
+
+    while current_vaddr < end_vaddr {
+        let (level, pte_ptr, old_pte) = find_leaf::<P>(root_vaddr, current_vaddr, phys_to_virt)?;
+        let page_size = P::leaf_page_size(level).ok_or(MapError::UnsupportedLevel)?;
+        let leaf_base = current_vaddr & !(page_size - 1);
+        let next_vaddr = current_vaddr
+            .checked_add(page_size)
+            .ok_or(MapError::Misaligned)?;
+
+        if leaf_base != current_vaddr || next_vaddr > end_vaddr {
+            return Err(MapError::Misaligned);
+        }
+
+        let new_pte = P::make_leaf_pte_for_level(
+            level,
+            P::pte_addr(old_pte),
+            read,
+            write,
+            execute,
+            user,
+            global,
+        )
+        .ok_or(MapError::InvalidPermission)?;
+        unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(new_pte)) };
+        current_vaddr = next_vaddr;
+    }
+
+    Ok(())
+}
+
+/// 验证一个可不对齐的虚拟地址范围是否被连续映射并具备指定权限。
+///
+/// 本函数只读取现有页表，不分配、不拆分大页，也不修改访问位。它适合在跨 ABI 裸
+/// 指针进入内核实现前做防御性检查。
+pub fn validate_range_permissions<P: PagingArch>(
+    root_vaddr: usize,
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+    phys_to_virt: fn(usize) -> usize,
+) -> Result<(), MapError> {
+    if size == 0 || !P::is_canonical_vaddr(vaddr) {
+        return Err(MapError::Misaligned);
+    }
+    let end = vaddr.checked_add(size).ok_or(MapError::Misaligned)?;
+    if end <= vaddr || !P::is_canonical_vaddr(end - 1) {
+        return Err(MapError::Misaligned);
+    }
+
+    let mut current = vaddr;
+    while current < end {
+        let (level, _, pte) = find_leaf::<P>(root_vaddr, current, phys_to_virt)?;
+        let flags = P::pte_flags(pte);
+        if read && !P::flags_readable(flags)
+            || write && !P::flags_writable(flags)
+            || execute && !P::flags_executable(flags)
+        {
+            return Err(MapError::InvalidPermission);
+        }
+        let page_size = P::leaf_page_size(level).ok_or(MapError::UnsupportedLevel)?;
+        let page_base = current & !(page_size - 1);
+        current = page_base
+            .checked_add(page_size)
+            .ok_or(MapError::Misaligned)?
+            .min(end);
+    }
+    Ok(())
+}
+
 /// 页表遍历并创建映射。
 ///
 /// 这是页表操作的核心函数，负责从页表根开始逐层遍历，按需分配中间页表页，
@@ -228,4 +323,149 @@ pub fn walk_and_map<P: PagingArch>(
     unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(leaf_pte)) };
 
     Ok(())
+}
+
+/// 把目标层级下已经完全空闲的页表子树提升为一个大页叶子。
+///
+/// 基础页解除映射后可以保留空的中间页表。此时目标层级的 PTE 仍然有效，但它指向的
+/// 子树已经不含任何叶子映射；直接调用 [`walk_and_map`] 会把这种情况报告为
+/// [`MapError::AlreadyMapped`]。本函数先完整验证子树为空，再断开父 PTE、回收子树页，
+/// 最后写入目标叶子。返回值是未能回收的页表页数量；这些页已经与页表断开，只构成可
+/// 诊断的物理页泄漏，不会形成悬垂映射。
+#[allow(clippy::too_many_arguments)]
+pub fn replace_empty_table_with_leaf<P: PagingArch>(
+    root_vaddr: usize,
+    vaddr: usize,
+    paddr: usize,
+    target_level: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+    user: bool,
+    global: bool,
+    phys_to_virt: fn(usize) -> usize,
+    free_page: fn(usize) -> bool,
+) -> Result<usize, MapError> {
+    if target_level >= P::LEVELS {
+        return Err(MapError::UnsupportedLevel);
+    }
+    let page_size = P::leaf_page_size(target_level).ok_or(MapError::UnsupportedLevel)?;
+    if vaddr % page_size != 0 || paddr % page_size != 0 {
+        return Err(MapError::Misaligned);
+    }
+    if !P::is_valid_leaf_perm(read, write, execute, user, global) {
+        return Err(MapError::InvalidPermission);
+    }
+
+    let mut table_vaddr = root_vaddr;
+    for level in 0..target_level {
+        let pte_ptr = table_entry_ptr::<P>(table_vaddr, vaddr, level);
+        let pte = read_page_table_entry::<P>(pte_ptr);
+        if !P::pte_is_valid(pte) {
+            return Err(MapError::NotMapped);
+        }
+        if P::pte_is_leaf(pte) {
+            return Err(MapError::AlreadyMapped);
+        }
+        table_vaddr = phys_to_virt(P::pte_addr(pte));
+    }
+
+    let target_ptr = table_entry_ptr::<P>(table_vaddr, vaddr, target_level);
+    let target = read_page_table_entry::<P>(target_ptr);
+    if !P::pte_is_valid(target) {
+        return Err(MapError::NotMapped);
+    }
+    if P::pte_is_leaf(target) {
+        return Err(MapError::AlreadyMapped);
+    }
+
+    let subtree_paddr = P::pte_addr(target);
+    if !page_table_subtree_is_empty::<P>(
+        phys_to_virt(subtree_paddr),
+        target_level + 1,
+        phys_to_virt,
+    ) {
+        return Err(MapError::AlreadyMapped);
+    }
+
+    unsafe {
+        core::ptr::write_volatile(target_ptr, P::pte_to_usize(P::invalid_pte()));
+    }
+    let reclaim_failures = reclaim_empty_page_table_subtree::<P>(
+        subtree_paddr,
+        target_level + 1,
+        phys_to_virt,
+        free_page,
+    );
+    let leaf = P::make_leaf_pte_for_level(target_level, paddr, read, write, execute, user, global)
+        .ok_or(MapError::InvalidPermission)?;
+    unsafe {
+        core::ptr::write_volatile(target_ptr, P::pte_to_usize(leaf));
+    }
+    Ok(reclaim_failures)
+}
+
+fn page_table_subtree_is_empty<P: PagingArch>(
+    table_vaddr: usize,
+    level: usize,
+    phys_to_virt: fn(usize) -> usize,
+) -> bool {
+    if level >= P::LEVELS {
+        return false;
+    }
+    for index in 0..P::ENTRIES_PER_TABLE {
+        let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+        let pte = read_page_table_entry::<P>(pte_ptr);
+        if !P::pte_is_valid(pte) {
+            continue;
+        }
+        if P::pte_is_leaf(pte)
+            || level + 1 >= P::LEVELS
+            || !page_table_subtree_is_empty::<P>(
+                phys_to_virt(P::pte_addr(pte)),
+                level + 1,
+                phys_to_virt,
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn reclaim_empty_page_table_subtree<P: PagingArch>(
+    table_paddr: usize,
+    level: usize,
+    phys_to_virt: fn(usize) -> usize,
+    free_page: fn(usize) -> bool,
+) -> usize {
+    let table_vaddr = phys_to_virt(table_paddr);
+    let mut failures = 0usize;
+    if level + 1 < P::LEVELS {
+        for index in 0..P::ENTRIES_PER_TABLE {
+            let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+            let pte = read_page_table_entry::<P>(pte_ptr);
+            if P::pte_is_valid(pte) && !P::pte_is_leaf(pte) {
+                failures = failures.saturating_add(reclaim_empty_page_table_subtree::<P>(
+                    P::pte_addr(pte),
+                    level + 1,
+                    phys_to_virt,
+                    free_page,
+                ));
+            }
+        }
+    }
+    if !free_page(table_paddr) {
+        failures = failures.saturating_add(1);
+    }
+    failures
+}
+
+fn table_entry_ptr<P: PagingArch>(table_vaddr: usize, vaddr: usize, level: usize) -> *mut usize {
+    let index = P::level_index(vaddr, level);
+    (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize
+}
+
+fn read_page_table_entry<P: PagingArch>(pte_ptr: *mut usize) -> P::Pte {
+    P::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) })
 }

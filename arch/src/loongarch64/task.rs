@@ -114,9 +114,7 @@ impl TaskOps for LoongArch64TaskOps {
     }
 
     fn sync_icache() {
-        unsafe {
-            core::arch::asm!("ibar 0", options(nostack, preserves_flags));
-        }
+        crate::loongarch64::smp::sync_icache_all_cpus();
     }
 }
 
@@ -175,6 +173,7 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
     use core::arch::naked_asm;
     naked_asm!(
         "or $r31, $r4, $zero",
+        "bl {handle_shootdown}",
 
         "ld.d $r12, $r31, {status_off}",
         "csrwr $r12, {csr_prmd}",
@@ -344,6 +343,7 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
         csr_euen = const CSR_EUEN,
         csr_llbctl = const CSR_LLBCTL,
         euen_fpe = const EUEN_FPE,
+        handle_shootdown = sym crate::loongarch64::smp::handle_shootdown_requests,
     );
 }
 

@@ -263,9 +263,14 @@ pub fn remember_published_devnodes(
         existing.nodes = nodes.clone();
         return Ok(());
     }
-    published
-        .try_reserve(1)
-        .map_err(|_| VfsError::OutOfMemory)?;
+    {
+        // 已发布记录随 function 注销而释放，但全局表扩容后的容量会由内核长期复用。
+        let _accounting =
+            allocator::suspend_implicit_allocation_accounting().ok_or(VfsError::OutOfMemory)?;
+        published
+            .try_reserve(1)
+            .map_err(|_| VfsError::OutOfMemory)?;
+    }
     published.push(PublishedDevNodeRecord {
         class_name,
         function_name,
@@ -301,9 +306,7 @@ fn update_projection_state(
     state: DeviceFileProjectionStateKind,
     errno: Option<i32>,
 ) {
-    let Some(function_name) = fallible_string(func.dev_name()) else {
-        return;
-    };
+    let function_name = func.dev_name();
     let class_name = func.class_id().as_str();
     let mut states = PROJECTION_STATES.lock();
     if let Some(existing) = states
@@ -314,6 +317,14 @@ fn update_projection_state(
         existing.errno = errno;
         return;
     }
+    // 状态表是内核维护的诊断历史；状态键和扩容容量都会跨 function 注销保留，
+    // 因而不能计入触发注册事件的动态 ELM。
+    let Some(_accounting) = allocator::suspend_implicit_allocation_accounting() else {
+        return;
+    };
+    let Some(function_name) = fallible_string(function_name) else {
+        return;
+    };
     if states.try_reserve(1).is_err() {
         return;
     }

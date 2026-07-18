@@ -18,14 +18,14 @@
 //! // Bus 层：USB host controller 发现设备后
 //! let dev_info = Box::new(UsbDeviceInfo { ... });
 //! let dev_id = PnpId::Usb { bus_id: 0, address: 1, interface: None };
-//! let usb_dev_pnp = PnpDevice::new(dev_id, "usb-0:1".into(), dev_info);
+//! let usb_dev_pnp = PnpDevice::new(dev_id, "usb-0:1".into(), dev_info)?;
 //! PNP_DEVICES.get_or_insert(Arc::clone(&usb_dev_pnp))?;
 //!
 //! // 为每个 interface 创建子 PnpDevice
 //! for iface in &device_desc.interfaces {
 //!     let iface_info = Box::new(UsbInterfaceInfo { class: iface.class, ... });
 //!     let iface_id = PnpId::Usb { bus_id: 0, address: 1, interface: Some(iface.num) };
-//!     let iface_pnp = PnpDevice::new(iface_id, "usb-0:1.0".into(), iface_info);
+//!     let iface_pnp = PnpDevice::new(iface_id, "usb-0:1.0".into(), iface_info)?;
 //!     usb_dev_pnp.attach_child(&iface_pnp)?;
 //!     PNP_DEVICES.get_or_insert(Arc::clone(&iface_pnp))?;
 //!     PNP_DRIVERS.probe_device(&iface_pnp)?;
@@ -271,7 +271,7 @@ impl UsbDevice {
             interface: Some(num),
         };
 
-        let child = PnpDevice::new(id, name, Box::new(info));
+        let child = PnpDevice::new(id, name, Box::new(info))?;
         self.pnp.attach_child(&child)?;
         Ok(child)
     }
@@ -393,7 +393,7 @@ fn rollback_usb_registration(pnp: &Arc<PnpDevice>, inserted: bool) {
     if let Some(parent) = pnp.parent() {
         parent.detach_child(pnp);
     }
-    PNP_DEVICES.remove(&pnp.id);
+    PNP_DEVICES.remove_exact(pnp);
 }
 
 fn probe_registered_usb_pnp(

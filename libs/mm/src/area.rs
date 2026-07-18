@@ -41,8 +41,10 @@ pub struct VmArea {
     pub backing: VmBacking,
 }
 
+#[kernel_symbols::export]
 impl VmArea {
     /// 本 VMA 的字节长度；无效 range 返回 None。
+    #[kernel_symbols::export(name = "mm.area.VmArea.len", contract = "kernel.mm.vma@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn len(&self) -> Option<usize> {
         self.range.end.checked_sub(self.range.start)
     }
@@ -51,6 +53,7 @@ impl VmArea {
     ///
     /// 除 `start < end` 外，file/shared-anon offset 与 direct paddr 也必须能覆盖
     /// 整段长度，避免后续 split/clip/fault 路径上的地址加法溢出。
+    #[kernel_symbols::export(name = "mm.area.VmArea.is_well_formed", contract = "kernel.mm.vma@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_well_formed(&self) -> bool {
         let Some(len) = self.len() else {
             return false;
@@ -59,17 +62,20 @@ impl VmArea {
     }
 
     /// 地址是否落在本 VMA 内（半开区间 `[start, end)`）。
+    #[kernel_symbols::export(name = "mm.area.VmArea.contains", contract = "kernel.mm.vma@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn contains(&self, addr: usize) -> bool {
         self.range.contains(&addr)
     }
 
     /// 本 VMA 与给定区间是否有重叠。
+    #[kernel_symbols::export(name = "mm.area.VmArea.overlap", contract = "kernel.mm.vma@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn overlap(&self, other: &Range<usize>) -> bool {
         self.range.start < other.end && other.start < self.range.end
     }
 
     /// 在 `addr` 处劈成两段。`addr` 必须严格落在 `(start, end)` 内，否则返 None。
     /// file backing 的 offset 在右半边按距离自增。
+    #[kernel_symbols::export(name = "mm.area.VmArea.split_at", contract = "kernel.mm.vma@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn split_at(&self, addr: usize) -> Option<(VmArea, VmArea)> {
         if !self.is_well_formed() || addr <= self.range.start || addr >= self.range.end {
             return None;
@@ -90,6 +96,7 @@ impl VmArea {
 
     /// 裁剪到给定区间。若裁剪结果非空，按"起点偏移"调整 file / Direct 的
     /// backing；完全无重叠则返 None。
+    #[kernel_symbols::export(name = "mm.area.VmArea.clip_to", contract = "kernel.mm.vma@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn clip_to(&self, clip: &Range<usize>) -> Option<VmArea> {
         if !self.is_well_formed() {
             return None;
@@ -109,8 +116,10 @@ impl VmArea {
     }
 }
 
+#[kernel_symbols::export]
 impl VmBacking {
     /// 返回向后移动 `shift` 字节后的 backing；任一地址/offset 加法溢出则返回 None。
+    #[kernel_symbols::export(name = "mm.area.VmBacking.checked_shift", contract = "kernel.mm.vma-backing@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn checked_shift(&self, shift: usize) -> Option<Self> {
         match self {
             VmBacking::Anon => Some(VmBacking::Anon),

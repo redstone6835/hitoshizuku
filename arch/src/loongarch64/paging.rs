@@ -497,10 +497,12 @@ impl LoongArch64Paging {
         }
     }
 
-    /// 按指定 ASID 刷新当前核 TLB。
+    /// 按指定 ASID 同步刷新所有在线 CPU 的 TLB。
     ///
-    /// - `vaddr = Some`：`invtlb 0x5, asid, va`（global=0 且 ASID 命中）
-    /// - `vaddr = None`：`invtlb 0x0, 0, 0`（刷新所有 TLB 项，包含 global 映射）
+    /// - `vaddr = Some`：每个在线 CPU 执行 `invtlb 0x5, asid, va`；
+    /// - `vaddr = None`：每个在线 CPU 执行 `invtlb 0x0, 0, 0`，包含 global 映射。
+    ///
+    /// 发布方等待全部目标 CPU 确认后才返回，因此调用者可在返回后安全回收旧映射。
     ///
     /// # Safety
     ///
@@ -510,23 +512,10 @@ impl LoongArch64Paging {
     /// 粒度做细，这个接口也足够承载按 ASID、按虚拟地址的精确失效。
     #[inline]
     pub unsafe fn flush_tlb_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
-        Self::page_table_barrier();
-        let asid = asid_bits(asid);
-        unsafe {
-            if let Some(addr) = vaddr {
-                core::arch::asm!(
-                    "invtlb 0x5, {asid}, {va}",
-                    asid = in(reg) asid,
-                    va = in(reg) addr.as_usize(),
-                    options(nostack)
-                );
-            } else {
-                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
-            }
-        }
+        crate::loongarch64::smp::flush_tlb_all_cpus(asid, vaddr.map(VirtAddr::as_usize));
     }
 
-    /// 使用当前 CSR_ASID 刷新当前核 TLB。
+    /// 使用当前 CSR_ASID 同步刷新所有在线 CPU 的 TLB。
     ///
     /// # Safety
     ///

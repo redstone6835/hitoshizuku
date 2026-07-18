@@ -163,4 +163,5 @@ unsafe extern "C" fn pre_boot_init(efi_boot: usize, cmdline_ptr: usize, system_t
     EFI_SYSTEM_TABLE_PTR.store(system_table_ptr, Ordering::Release);
     EFI_BOOT.store(efi_boot, Ordering::Release);
     CMDLINE_PTR.store(cmdline_ptr, Ordering::Release);
+    crate::loongarch64::smp::init_boot_cpu_mapping();
 }

@@ -29,12 +29,21 @@ fn get_console() -> Option<CharDevice> {
 }
 
 /// 将一个 [`CharDev`] 注册为内核全局 console。
+#[kernel_symbols::export(
+    name = "general.console.register_console",
+    contract = "kernel.console.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+    retained_args = 1 << 0
+)]
 pub fn register_console(dev: CharDevice) {
     *CONSOLE.lock() = Some(dev);
 }
 
 /// 取已注册的 console 字符设备。供 devtmpfs 把 `/dev/console` 重定向到当前
 /// console，使用户态进程通过固定路径打开它。
+#[kernel_symbols::export(name = "general.console.console_dev", contract = "kernel.console.query@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn console_dev() -> Option<CharDevice> {
     get_console()
 }
@@ -44,7 +53,7 @@ pub fn console_dev() -> Option<CharDevice> {
 /// 向 console 写入字节缓冲区（阻塞直到全部写入）。
 ///
 /// console 未注册时为空操作。
-#[inline]
+#[kernel_symbols::export(name = "general.console.console_write", contract = "kernel.console.io@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn console_write(buf: &[u8]) {
     if let Some(dev) = get_console() {
         let _ = dev.write_all(buf);
@@ -54,7 +63,7 @@ pub fn console_write(buf: &[u8]) {
 /// 从 console 读取最多 `buf.len()` 字节，返回实际读取数。
 ///
 /// console 未注册或无可用数据时返回 0。
-#[inline]
+#[kernel_symbols::export(name = "general.console.console_read", contract = "kernel.console.io@1", version = 1, capabilities = kernel_symbols::capability::HAL_CONTROL, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn console_read(buf: &mut [u8]) -> usize {
     get_console()
         .and_then(|dev| dev.read(buf).ok())

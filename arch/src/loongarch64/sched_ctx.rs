@@ -244,6 +244,7 @@ pub fn register() {
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
         sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
+        sched::arch_hooks::register_cpu_control(&super::smp::CPU_CONTROL_OPS);
         // UserPgdOps / UserAccessOps / FaultDecodeOps
         super::mm::register();
         // SyscallFrameOps

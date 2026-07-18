@@ -55,14 +55,17 @@ pub mod cpu;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
+pub mod migration;
 pub mod mutex;
 pub mod operation;
 pub mod pid;
+pub mod placement;
 pub mod process_ops;
 pub mod rlimit;
-pub mod runqueue;
+mod runqueue;
 pub mod sched_class;
 pub mod scheduler;
+pub mod scheduler_state;
 pub mod signal;
 pub mod spawn;
 pub mod sync;
@@ -72,55 +75,72 @@ pub mod wait_flags;
 
 pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry, TaskCpuStateOps};
 pub use clone_flags::{CloneArgs, CloneFlags};
-pub use cpu::{CpuId, CpuMask, SchedDomain, SchedPlacement, SchedTopology};
+pub use cpu::{
+    CpuId, CpuMask, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedDomain, SchedPlacement,
+    SchedTopology,
+};
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
+pub use migration::MigrationContext;
+pub use operation::spawn_user_process;
 pub use pid::{PidNamespace, PidRegistry, PidT};
+pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};
 pub use process_ops::{
     ExecRequest, ProcessImageOps, UserContextRef, process_image_ops, register_process_image_ops,
 };
 pub use rlimit::{Resource, Rlim, RlimitError, RlimitPair, Rlimits, RlimitsLock};
-pub use runqueue::Runqueue;
+pub use runqueue::RunqueueClassLoad;
 pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
     RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
 };
 pub use scheduler::cancel_sleep_deadline;
 pub use scheduler::{
-    NR_CPUS, balance_once, current_cpu_id, current_task, current_task_fast, current_task_on,
-    current_task_ref, enqueue_task, enqueue_task_preferred, idle_task, init, init_task,
-    install_idle, is_cpu_online, is_ready, migrate_task, needs_resched, needs_resched_current,
-    now_ns_public, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
+    NR_CPUS, activate_cpu, active_cpu_mask, balance_once, current_cpu_id, current_task,
+    current_task_fast, current_task_on, current_task_ref, enqueue_task, enqueue_task_preferred,
+    idle_task, init, init_task, install_idle, is_cpu_active, is_cpu_online, is_ready,
+    mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
+    offline_cpu, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
     register_sleep_deadline, request_balance, request_post_syscall_handoff, request_resched,
-    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, runqueue, runqueue_of,
-    schedule_once, scheduler_diag, set_realtime_itimer, signal_wakeup, spawn_idle_for,
-    supported_cpu_mask,
+    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, schedule_once,
+    scheduler_diag, set_realtime_itimer, signal_wakeup, spawn_idle_for, supported_cpu_mask,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
 pub use scheduler::{
-    current_sched_domain_id, install_sched_topology, sched_topology, task_sched_placement,
+    current_sched_domain_id, install_sched_topology, sched_domain_stats, sched_topology,
+    task_sched_placement,
 };
+pub use scheduler_state::{CpuSchedState, SchedDomainStats, Scheduler, TopologySnapshot};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
     SigSet, SignalNumber, SignalState,
 };
 pub use spawn::{
     SpawnKind, abort_new_task, activate_task, clone_task, exit_task, kthread_create,
-    kthread_finish, kthread_spawn, list_zombie_children, reap_child, reap_matching,
-    reparent_to_init, spawn_child,
+    kthread_finish, kthread_spawn, kthread_spawn_on_cpu, list_zombie_children, reap_child,
+    reap_matching, reparent_to_init, spawn_child,
 };
 pub use task::{
-    ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_EXEC_ARGS,
-    TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
+    ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION,
+    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
     TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
     TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt, TaskExtCloneHook, TaskExtExitHook, TaskExtKey,
     TaskKind, TaskPreExitHook, TaskState, TaskUsage, ext_clone_hook, ext_exit_hook, pre_exit_hook,
     register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook, task_diag,
 };
-pub use wait::WaitQueue;
+pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
+
+/// 强制链接器保留调度子系统直接符号所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    scheduler::current_cpu_id as usize
+        ^ spawn::spawn_child as usize
+        ^ operation::getpid as usize
+        ^ operation::spawn_user_process as usize
+}
 
 #[cfg(test)]
 mod tests;

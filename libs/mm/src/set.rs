@@ -63,6 +63,7 @@ impl<'a> core::ops::Deref for VmAreaMut<'a> {
     }
 }
 
+#[kernel_symbols::export]
 impl VmaSet {
     pub const fn new() -> Self {
         Self {
@@ -70,15 +71,18 @@ impl VmaSet {
         }
     }
 
+    #[kernel_symbols::export(name = "mm.set.VmaSet.len", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn len(&self) -> usize {
         self.tree.len()
     }
 
+    #[kernel_symbols::export(name = "mm.set.VmaSet.is_empty", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_empty(&self) -> bool {
         self.tree.is_empty()
     }
 
     /// 插入新 VMA。与任何已有 VMA 重叠返 `EEXIST`；空 range 返 `EINVAL`。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.insert", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn insert(&mut self, area: VmArea) -> Result<(), Errno> {
         if !area.is_well_formed() {
             return Err(Errno::EINVAL);
@@ -92,6 +96,7 @@ impl VmaSet {
     }
 
     /// 查 `addr` 所在 VMA。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.find", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_MODULE_BORROW)]
     pub fn find(&self, addr: usize) -> Option<&VmArea> {
         // 最靠后且 start <= addr 的那一条。
         let (key, area) = self.tree.range(..=addr).next_back()?;
@@ -115,6 +120,7 @@ impl VmaSet {
 
     /// 若 `page` 落在某个 `GROWS_DOWN` 匿名 VMA 的下方且仍在允许增长窗口内，
     /// 把该 VMA 起点扩到 `page`，并返回新增页应该使用的 flags。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.grow_down_to", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn grow_down_to(
         &mut self,
         page: usize,
@@ -160,11 +166,13 @@ impl VmaSet {
     }
 
     /// `range` 是否完全没有被任何 VMA 占用。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.is_range_free", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_range_free(&self, range: &Range<usize>) -> bool {
         range.start < range.end && self.iter_overlap(range).next().is_none()
     }
 
     /// `range` 是否被现有 VMA 连续覆盖，中间不允许有洞。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.contains_range", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn contains_range(&self, range: &Range<usize>) -> bool {
         if range.start >= range.end {
             return false;
@@ -186,6 +194,7 @@ impl VmaSet {
     }
 
     /// 在 `search` 内找一段长度为 `len` 的空洞。调用方负责页对齐。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.find_gap", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn find_gap(&self, search: Range<usize>, len: usize) -> Option<Range<usize>> {
         if len == 0 || search.start >= search.end {
             return None;
@@ -218,6 +227,7 @@ impl VmaSet {
 
     /// 取消 `range` 内的所有映射，返回被摘掉的 VMA 片段列表（已按 range 裁剪）。
     /// 上层据此对每个片段下发 `UserPgdOps::unmap`。跨 VMA 边界时自动 split。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.unmap_range", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn unmap_range(&mut self, range: &Range<usize>) -> Vec<VmArea> {
         if range.start >= range.end {
             return Vec::new();
@@ -270,6 +280,7 @@ impl VmaSet {
 
     /// 修改 `range` 内全部 VMA 的 flags。跨边界时自动 split；返回被改过片段的
     /// (range, new_flags) 清单，供上层下发页表 protect。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.protect_range", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn protect_range(
         &mut self,
         range: &Range<usize>,
@@ -307,6 +318,7 @@ impl VmaSet {
     /// 合并相邻且 flags/backing 兼容的 VMA（Anon、SharedAnon/File 偏移衔接、
     /// Direct 物理地址衔接）。
     /// 典型调用点：insert 之后的紧邻合并；批量 unmap 之后的收尾。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.merge_neighbors", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn merge_neighbors(&mut self) {
         loop {
             let keys: Vec<usize> = self.tree.keys().copied().collect();
@@ -370,6 +382,7 @@ impl VmaSet {
 
     /// 深拷贝 VMA 元数据（不触物理页；Arc<dyn FileLike> 共享）。
     /// 典型调用：`VmSpace::fork` 的第一步，拿到同构的 VmaSet 之后再逐页复制。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.deep_clone_metadata", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn deep_clone_metadata(&self) -> Self {
         Self {
             tree: self.tree.clone(),

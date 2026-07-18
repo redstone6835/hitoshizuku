@@ -117,6 +117,19 @@ pub struct SchedEntity {
     deadline: AtomicU64,
     lag: AtomicI64,
     on_rq: AtomicBool,
+    enqueue_in_progress: AtomicBool,
+}
+
+pub(crate) struct TaskEnqueueGuard<'a> {
+    entity: &'a SchedEntity,
+}
+
+impl Drop for TaskEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.entity
+            .enqueue_in_progress
+            .store(false, Ordering::Release);
+    }
 }
 
 impl SchedEntity {
@@ -141,6 +154,7 @@ impl SchedEntity {
             deadline: AtomicU64::new(0),
             lag: AtomicI64::new(0),
             on_rq: AtomicBool::new(false),
+            enqueue_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -246,6 +260,13 @@ impl SchedEntity {
         self.on_rq.store(on, Ordering::Release);
     }
 
+    pub(crate) fn try_begin_enqueue(&self) -> Option<TaskEnqueueGuard<'_>> {
+        self.enqueue_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(TaskEnqueueGuard { entity: self })
+    }
+
     pub(crate) fn store_rq_account(&self, vruntime: u64, weight: Weight) {
         self.rq_vruntime.store(vruntime, Ordering::Release);
         self.rq_weight.store(weight, Ordering::Release);
@@ -277,7 +298,7 @@ impl SchedEntity {
         vr.saturating_add(scaled_slice)
     }
 
-    /// 一次性更新 weight + slice。调用方随后应当调 [`crate::Runqueue::resort_after_weight_change`]
+    /// 一次性更新 weight + slice。调用方随后应当让所属 runqueue 重新排序。
     /// 把 task 在 tree 中的位置重算。
     pub fn set_params(&self, params: SchedParams) {
         self.set_nice(params.nice);

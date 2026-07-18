@@ -12,22 +12,24 @@
 //!
 //! ## per-CPU 结构
 //!
-//! [`RUNQUEUES`] / [`CURRENT_TASKS`] / [`IDLE_TASKS`] / [`NEED_RESCHED`] 都是
-//! 长度 [`NR_CPUS`] 的数组；用 [`current_cpu_id`] 选当前槽。AP 启动尚未落地，
-//! 当前永远只有 CPU 0 被填充。
+//! [`Scheduler`](crate::scheduler_state::Scheduler) 统一拥有 topology、
+//! online/active CPU 集和每 CPU 运行状态；用 [`current_cpu_id`] 选择本地 CPU 槽。
+//! AP 启动尚未落地，当前永远只有 CPU 0 被填充。
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
-use crate::eevdf::SchedParams;
+use crate::eevdf::{NICE_0_WEIGHT, SchedParams};
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
+use crate::migration::MigrationContext;
 use crate::pid::PidNamespace;
-use crate::runqueue::Runqueue;
-use crate::sched_class::SchedAttr;
+use crate::runqueue::{Runqueue, RunqueueClassLoad};
+use crate::sched_class::{SchedAttr, SchedClass};
+use crate::scheduler_state::{SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
 use crate::task::Task;
@@ -64,41 +66,39 @@ impl RunqueueLoadSnapshot {
     pub(crate) fn load_of(self, cpu: CpuId) -> usize {
         self.loads[cpu.get()]
     }
+
+    fn add_task(&mut self, cpu: CpuId) {
+        self.loads[cpu.get()] = self.loads[cpu.get()].saturating_add(1);
+    }
 }
 
-// ── 全局锚点 ──────────────────────────────────────────────────────────────────
+/// 一次域平衡决策内使用的各调度类负载快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunqueueClassLoadSnapshot {
+    loads: [RunqueueClassLoad; NR_CPUS],
+}
 
-/// 每核运行队列。
-static RUNQUEUES: [Runqueue; NR_CPUS] = [const { Runqueue::new() }; NR_CPUS];
+impl RunqueueClassLoadSnapshot {
+    pub(crate) fn collect<F>(cpus: CpuMask, mut load_of: F) -> Self
+    where
+        F: FnMut(CpuId) -> RunqueueClassLoad,
+    {
+        let sampled = cpus.intersection(CpuMask::SUPPORTED);
+        let mut loads = [RunqueueClassLoad::default(); NR_CPUS];
+        for cpu in sampled.iter() {
+            loads[cpu.get()] = load_of(cpu);
+        }
+        Self { loads }
+    }
 
-/// 每核当前正在执行的任务。
-static CURRENT_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
-    [const { Spinlock::new(None) }; NR_CPUS];
+    pub(crate) fn load_of(self, cpu: CpuId) -> RunqueueClassLoad {
+        self.loads[cpu.get()]
+    }
 
-/// 每核当前任务的无所有权热路径指针。
-///
-/// 指针由 `Arc::into_raw` 发布，槽位自身持有一份强引用；切换 current 时释放旧
-/// 指针。这样 syscall/trap 热路径可以不拿 `CURRENT_TASKS` 锁。
-static CURRENT_TASK_RAW: [AtomicPtr<Task>; NR_CPUS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; NR_CPUS];
-
-/// 每核 idle 任务句柄。`pick_next` 返 None 时 `schedule_once` 切到这里。
-static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
-    [const { Spinlock::new(None) }; NR_CPUS];
-
-/// 每核抢占请求标志。定时器发现 `Runqueue::tick` 需要抢占时置位；trap 返回
-/// 路径 / 主动 yield 入口读到 true 即调一次 [`schedule_once`]。
-static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
-
-/// 已经最终切走的任务。
-///
-/// Zombie / Dead 任务不会再恢复到自己的内核栈。如果把 `Arc<Task>` 作为普通局部
-/// 留在 `schedule_once` 的旧栈上，它的析构永远不会运行，进而保活 VmSpace/FdTable
-/// 等资源。最终切换前把它移动到这里，后续任意调度边界在当前活任务栈上 drop。
-static RETIRED_TASKS: [Spinlock<Vec<Arc<Task>>>; NR_CPUS] =
-    [const { Spinlock::new(Vec::new()) }; NR_CPUS];
-
-static RETIRED_TASKS_NONEMPTY: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+    pub(crate) fn loads(&self) -> &[RunqueueClassLoad; NR_CPUS] {
+        &self.loads
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SchedulerDiag {
@@ -113,17 +113,6 @@ pub struct SchedulerDiag {
     pub init_children: usize,
     pub init_zombies: usize,
 }
-
-/// 每核负载拉取请求。其它 CPU 不能直接摘走某个 CPU 的 current，因此只能
-/// 通过这个标志让目标 CPU 在调度边界按调度域主动拉取可迁移任务。
-static NEED_BALANCE: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
-
-/// 每核 syscall 收尾后的启动交接轮数。
-///
-/// clone/fork 成功时只登记这个计数；真正调度发生在 syscall 分发器已经写好
-/// 父任务返回值并推进 PC 之后。这样可以给新任务及其 daemon 子进程连续启动
-/// 的机会，同时避免在 clone syscall 内部切换导致父 trap frame 尚未收尾。
-static POST_SYSCALL_HANDOFF: [AtomicU8; NR_CPUS] = [const { AtomicU8::new(0) }; NR_CPUS];
 
 /// 单次 clone 后让渡的轮数。这里只需要一次安全边界交接：
 /// 再多轮只会放大 fork/daemon 一类短任务的 syscall 收尾开销；pthread
@@ -153,15 +142,7 @@ struct RealtimeItimer {
 }
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
-
-/// 已上线 CPU 位图。CPU0 在 init 前后始终视为 online；AP 启动后通过
-/// [`register_cpu`] 打开对应 bit。
-static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
-
-/// 调度域拓扑。默认只有覆盖全部 CPU 的根域；平台发现更细粒度拓扑后可以在
-/// 启动期安装新的域层级。拓扑只用一把独立锁保护，热路径读取后立即释放，
-/// 不与 rq 锁嵌套。
-static SCHED_TOPOLOGY: Spinlock<SchedTopology> = Spinlock::new(SchedTopology::bootstrap());
+static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// init 任务全局锚点。写入即 Release，读取必须 Acquire。
 static mut INIT_TASK: Option<Arc<Task>> = None;
@@ -180,15 +161,25 @@ fn cpu() -> usize {
 }
 
 fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
-    let raw = Arc::into_raw(Arc::clone(&task)) as *mut Task;
-    *CURRENT_TASKS[cpu_id].lock() = Some(task);
-    let old = CURRENT_TASK_RAW[cpu_id].swap(raw, Ordering::AcqRel);
-    if !old.is_null() {
-        // Safety: 旧指针由上一轮 `publish_current_task` 的 `Arc::into_raw` 产生。
-        unsafe { drop(Arc::from_raw(old)) };
-    }
+    SCHEDULER.cpu_or_boot(cpu_id).publish_current(task);
 }
 
+fn bind_task_to_cpu(task: &Task, cpu_id: usize) {
+    bind_task_to_cpu_on(&SCHEDULER, task, cpu_id);
+}
+
+fn bind_task_to_cpu_on(scheduler: &crate::Scheduler, task: &Task, cpu_id: usize) {
+    let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
+    let snapshot = scheduler.topology_snapshot();
+    let domain_id = snapshot
+        .topology
+        .domain_for_cpu(cpu)
+        .unwrap_or_else(|| snapshot.topology.root_domain())
+        .id();
+    task.bind_placement(cpu, domain_id, snapshot.generation);
+}
+
+#[kernel_symbols::export(name = "sched.scheduler.current_cpu_id", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_cpu_id() -> usize {
     cpu()
 }
@@ -200,6 +191,7 @@ fn now_ns_internal() -> u64 {
 }
 
 /// 对外导出的时间戳访问器。上层 idle / main loop 要喂 `schedule_once` 用。
+#[kernel_symbols::export(name = "sched.scheduler.now_ns_public", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn now_ns_public() -> u64 {
     now_ns_internal()
 }
@@ -217,6 +209,8 @@ pub fn init() -> Arc<Task> {
         crate::arch_hooks::ops().is_some(),
         "[sched] init() before arch_hooks::register — call it first"
     );
+
+    SCHEDULER.install_topology(SchedTopology::with_cpu_domains());
 
     // 1) 身份骨架：session / pgroup / thread_group 互指但未填 leader。
     let session = Session::new();
@@ -262,9 +256,13 @@ pub fn init() -> Arc<Task> {
         }
     };
 
-    // 6) 登记为 CPU 0 的 current。其它核的 RUNQUEUES/CURRENT_TASKS 保持空槽，
+    // 6) 登记为 CPU 0 的 current。其它核的 CpuSchedState 保持空槽，
     //    直到 AP 启动路径落地时各自 `adopt_current_context`。
-    RUNQUEUES[0].set_current(Arc::clone(&init_task));
+    bind_task_to_cpu(&init_task, 0);
+    SCHEDULER
+        .cpu_or_boot(0)
+        .runqueue()
+        .set_current(Arc::clone(&init_task));
 
     // 7) 发布全局锚点。Release 保证其它核能看到上面所有字段的写入。
     // Safety: INIT_READY 的 assert 已保证此函数全程仅此一次进入；写入期间
@@ -281,7 +279,7 @@ pub fn init() -> Arc<Task> {
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
-        RUNQUEUES[0].nr_running(),
+        SCHEDULER.cpu_or_boot(0).runqueue().nr_running(),
         init_task.sched.weight(),
     );
 
@@ -291,6 +289,7 @@ pub fn init() -> Arc<Task> {
 // ── 全局访问器 ────────────────────────────────────────────────────────────────
 
 /// 获取 init 任务句柄。init 建立前调用会 panic。
+#[kernel_symbols::export(name = "sched.scheduler.init_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn init_task() -> Arc<Task> {
     assert!(
         INIT_READY.load(Ordering::Acquire),
@@ -306,17 +305,19 @@ pub fn init_task() -> Arc<Task> {
 }
 
 /// 当前 CPU 的 runqueue。
-pub fn runqueue() -> &'static Runqueue {
-    &RUNQUEUES[cpu()]
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn runqueue() -> &'static Runqueue {
+    SCHEDULER.cpu_or_boot(cpu()).runqueue()
 }
 
 /// 指定 CPU 的 runqueue。
-pub fn runqueue_of(cpu_id: usize) -> &'static Runqueue {
+pub(crate) fn runqueue_of(cpu_id: usize) -> &'static Runqueue {
     assert!(cpu_id < NR_CPUS, "[sched] runqueue cpu id out of range");
-    &RUNQUEUES[cpu_id]
+    SCHEDULER.cpu_or_boot(cpu_id).runqueue()
 }
 
 /// 根 PID namespace。
+#[kernel_symbols::export(name = "sched.scheduler.root_pid_ns", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn root_pid_ns() -> Arc<PidNamespace> {
     assert!(
         INIT_READY.load(Ordering::Acquire),
@@ -331,6 +332,7 @@ pub fn root_pid_ns() -> Arc<PidNamespace> {
 }
 
 /// 统计：当前根 ns 已占用的 pid 数（含 init）。
+#[kernel_symbols::export(name = "sched.scheduler.pid_count", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn pid_count() -> usize {
     root_pid_ns().registry().allocated()
 }
@@ -339,11 +341,12 @@ pub fn pid_count() -> usize {
 ///
 /// [`init`] 之后，在 CPU 0 上必然非空。AP 启动路径落地前，其它 CPU 调用此
 /// 函数会 panic（目前不会发生，因为只有 CPU 0 跑代码）。
+#[kernel_symbols::export(name = "sched.scheduler.current_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task() -> Arc<Task> {
     let id = cpu();
-    CURRENT_TASKS[id]
-        .lock()
-        .clone()
+    SCHEDULER
+        .cpu_or_boot(id)
+        .current()
         .expect("[sched] current_task called before sched::init() on this CPU")
 }
 
@@ -352,21 +355,22 @@ pub fn current_task() -> Arc<Task> {
 /// 该接口不增加引用计数，也不加锁；调用方不能把返回引用保存到可能调度之后。
 pub fn current_task_ref() -> &'static Task {
     let id = cpu();
-    let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
+    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
         panic!("[sched] current_task_ref called before sched::init() on this CPU");
     }
     // Safety: raw 指针由 `publish_current_task` 的 `Arc::into_raw` 产生，并由
-    // CURRENT_TASK_RAW 槽位持有强引用。
+    // CpuSchedState 的 raw current 槽位持有强引用。
     unsafe { &*ptr }
 }
 
 /// 当前 CPU 上正在执行的任务句柄，热路径版本。
 ///
-/// 与 [`current_task`] 语义相同，但不进入 `CURRENT_TASKS` 锁。
+/// 与 [`current_task`] 语义相同，但不进入 owning current 锁。
+#[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_fast() -> Arc<Task> {
     let id = cpu();
-    let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
+    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
         panic!("[sched] current_task_fast called before sched::init() on this CPU");
     }
@@ -379,24 +383,24 @@ pub fn current_task_fast() -> Arc<Task> {
 }
 
 /// 查询指定 CPU 上的 current；未登记时返回 None。
+#[kernel_symbols::export(name = "sched.scheduler.current_task_on", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_on(cpu_id: usize) -> Option<Arc<Task>> {
-    if cpu_id >= NR_CPUS {
-        return None;
-    }
-    CURRENT_TASKS[cpu_id].lock().clone()
+    SCHEDULER.cpu(cpu_id)?.current()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.scheduler_diag", contract = "kernel.sched.diagnostic@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn scheduler_diag() -> SchedulerDiag {
     let mut diag = SchedulerDiag::default();
-    for slot in &CURRENT_TASKS {
-        if let Some(task) = slot.lock().as_ref() {
+    for cpu_state in SCHEDULER.cpus() {
+        if let Some(task) = cpu_state.current() {
             diag.current_slots += 1;
             if matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
                 diag.current_zombie_or_dead += 1;
             }
         }
     }
-    for rq in &RUNQUEUES {
+    for cpu_state in SCHEDULER.cpus() {
+        let rq = cpu_state.runqueue();
         if let Some(task) = rq.current() {
             diag.rq_current_slots += 1;
             if matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
@@ -410,8 +414,8 @@ pub fn scheduler_diag() -> SchedulerDiag {
             .filter(|task| matches!(task.state(), TaskState::Zombie | TaskState::Dead))
             .count();
     }
-    for retired in &RETIRED_TASKS {
-        diag.retired_tasks += retired.lock().len();
+    for cpu_state in SCHEDULER.cpus() {
+        diag.retired_tasks += cpu_state.retired_len();
     }
     if INIT_READY.load(Ordering::Acquire) {
         diag.pid_count = pid_count();
@@ -427,11 +431,10 @@ pub fn scheduler_diag() -> SchedulerDiag {
 }
 
 pub(crate) fn is_current_on_any_cpu(task: &Arc<Task>) -> bool {
-    for current in &CURRENT_TASKS {
-        if current
-            .lock()
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, task))
+    for cpu_state in SCHEDULER.cpus() {
+        if cpu_state
+            .current()
+            .is_some_and(|current| Arc::ptr_eq(&current, task))
         {
             return true;
         }
@@ -441,34 +444,42 @@ pub(crate) fn is_current_on_any_cpu(task: &Arc<Task>) -> bool {
 
 /// 指定 CPU 上的 idle 任务句柄。
 pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
-    if cpu_id >= NR_CPUS {
-        return None;
-    }
-    IDLE_TASKS[cpu_id].lock().clone()
+    SCHEDULER.cpu(cpu_id)?.idle()
 }
 
 /// 是否已完成 init（避免有人在早期路径误调 current_task）。
+#[kernel_symbols::export(name = "sched.scheduler.is_ready", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_ready() -> bool {
     INIT_READY.load(Ordering::Acquire)
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.online_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn online_cpu_mask() -> u64 {
-    online_cpu_set().bits()
+    SCHEDULER.online_set().bits()
 }
 
-pub const fn supported_cpu_mask() -> u64 {
+#[kernel_symbols::export(name = "sched.scheduler.active_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn active_cpu_mask() -> u64 {
+    SCHEDULER.active_set().bits()
+}
+
+#[kernel_symbols::export(name = "sched.scheduler.supported_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn supported_cpu_mask() -> u64 {
     CpuMask::SUPPORTED.bits()
 }
 
-fn online_cpu_set() -> CpuMask {
-    CpuMask::from_bits_truncate(CPU_ONLINE.load(Ordering::Acquire)).or_boot()
+fn active_cpu_set() -> CpuMask {
+    SCHEDULER.active_set()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.sched_topology", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn sched_topology() -> SchedTopology {
-    *SCHED_TOPOLOGY.lock()
+    SCHEDULER.topology()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.install_sched_topology", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
     if !topology
         .root_domain()
         .span()
@@ -476,10 +487,57 @@ pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errn
     {
         return Err(errno::Errno::EINVAL);
     }
-    *SCHED_TOPOLOGY.lock() = topology;
+    SCHEDULER.install_topology(topology);
     Ok(())
 }
 
+pub(crate) fn refresh_task_placement(scheduler: &crate::Scheduler, task: &Task) -> bool {
+    let source = task.placement();
+    if source.state != crate::PlacementState::Bound {
+        return false;
+    }
+    let Some(cpu) = source.cpu else {
+        return false;
+    };
+    let snapshot = scheduler.topology_snapshot();
+    if !snapshot.active.contains(cpu)
+        || !CpuMask::from_bits_or_boot(task.cpu_affinity()).contains(cpu)
+    {
+        return false;
+    }
+    let domain_id = snapshot
+        .topology
+        .domain_for_cpu(cpu)
+        .unwrap_or_else(|| snapshot.topology.root_domain())
+        .id();
+    if source.topology_generation == snapshot.generation && source.domain_id == domain_id {
+        return true;
+    }
+    task.refresh_placement_topology(source, domain_id, snapshot.generation)
+}
+
+/// 按已提交的 placement 返回任务所属 runqueue。
+///
+/// placement 是 runqueue 所有权的唯一依据。拓扑代际变化时先刷新 domain 信息；
+/// `current_cpu` 只保留为兼容旧查询路径的镜像，不参与任务定位。
+pub(crate) fn task_runqueue_cpu_on(scheduler: &crate::Scheduler, task: &Task) -> Option<CpuId> {
+    let _ = refresh_task_placement(scheduler, task);
+    let placement = task.placement();
+    if placement.state == crate::PlacementState::Unbound {
+        return None;
+    }
+    let cpu = placement.cpu?;
+    if task.current_cpu() != cpu.get() {
+        task.set_current_cpu(cpu.get());
+    }
+    Some(cpu)
+}
+
+pub(crate) fn task_runqueue_cpu(task: &Task) -> Option<CpuId> {
+    task_runqueue_cpu_on(&SCHEDULER, task)
+}
+
+#[kernel_symbols::export(name = "sched.scheduler.current_sched_domain_id", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
     let cpu = CpuId::new(cpu_id)?;
     sched_topology()
@@ -487,24 +545,52 @@ pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
         .map(|domain| domain.id())
 }
 
+/// 刷新并返回指定调度域的负载统计。
+#[kernel_symbols::export(name = "sched.scheduler.sched_domain_stats", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
+pub fn sched_domain_stats(domain_id: usize) -> Option<crate::SchedDomainStats> {
+    refresh_domain_stats();
+    SCHEDULER.domain_stats(domain_id)
+}
+
 /// 查询某个任务在当前拓扑下的调度放置状态。
 ///
 /// 返回值只是快照：函数不会迁移任务，也不承诺下一次入队一定选中同一 CPU。
 /// 调用方可用它向用户态或诊断路径解释“为什么这个任务能在哪些 CPU 上运行”。
+#[kernel_symbols::export(name = "sched.scheduler.task_sched_placement", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
+    task_sched_placement_on(&SCHEDULER, task)
+}
+
+fn task_sched_placement_on(scheduler: &crate::Scheduler, task: &Arc<Task>) -> SchedPlacement {
+    let _ = refresh_task_placement(scheduler, task);
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
-    let online = online_cpu_set();
+    let active = scheduler.active_set();
     let current = CpuId::new(task.current_cpu());
     let prefer_current = task.state() != TaskState::New;
-    let load_snapshot = collect_rq_load_snapshot(affinity.intersection(online));
+    let load_snapshot = collect_rq_load_snapshot_for(scheduler, affinity.intersection(active));
 
-    sched_topology().describe_placement(affinity, online, current, prefer_current, |cpu| {
-        load_snapshot.load_of(cpu)
+    scheduler
+        .topology()
+        .describe_placement(affinity, active, current, prefer_current, |cpu| {
+            load_snapshot.load_of(cpu)
+        })
+}
+
+fn collect_rq_load_snapshot_for(
+    scheduler: &crate::Scheduler,
+    cpus: CpuMask,
+) -> RunqueueLoadSnapshot {
+    RunqueueLoadSnapshot::collect(cpus, |cpu| {
+        scheduler.cpu_or_boot(cpu.get()).runqueue().nr_running()
     })
 }
 
-fn collect_rq_load_snapshot(cpus: CpuMask) -> RunqueueLoadSnapshot {
-    RunqueueLoadSnapshot::collect(cpus, |cpu| RUNQUEUES[cpu.get()].nr_running())
+fn refresh_domain_stats() {
+    let snapshot = SCHEDULER.topology_snapshot();
+    let loads = RunqueueClassLoadSnapshot::collect(snapshot.active, |cpu| {
+        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
+    });
+    SCHEDULER.update_domain_stats(snapshot, loads.loads());
 }
 
 /// 按当前拓扑、在线 CPU 和一次性 rq 负载快照选择目标 CPU。
@@ -513,58 +599,320 @@ pub(crate) fn select_cpu_for_mask(
     current: Option<CpuId>,
     prefer_current: bool,
 ) -> Option<CpuId> {
-    let online = online_cpu_set();
-    let eligible = allowed.intersection(online);
-    let load_snapshot = collect_rq_load_snapshot(eligible);
-    sched_topology().select_cpu(allowed, online, current, prefer_current, |cpu| {
-        load_snapshot.load_of(cpu)
-    })
+    select_cpu_for_mask_on(&SCHEDULER, allowed, current, prefer_current)
 }
 
+fn select_cpu_for_mask_on(
+    scheduler: &crate::Scheduler,
+    allowed: CpuMask,
+    current: Option<CpuId>,
+    prefer_current: bool,
+) -> Option<CpuId> {
+    let active = scheduler.active_set();
+    let eligible = allowed.intersection(active);
+    let load_snapshot = collect_rq_load_snapshot_for(scheduler, eligible);
+    scheduler
+        .topology()
+        .select_cpu(allowed, active, current, prefer_current, |cpu| {
+            load_snapshot.load_of(cpu)
+        })
+}
+
+#[kernel_symbols::export(name = "sched.scheduler.is_cpu_online", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_cpu_online(cpu_id: usize) -> bool {
-    CpuId::new(cpu_id).is_some_and(|cpu| online_cpu_set().contains(cpu))
+    CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.online_set().contains(cpu))
 }
 
-pub fn register_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
-    let Some(cpu) = CpuId::new(cpu_id) else {
-        return Err(errno::Errno::EINVAL);
-    };
-    CPU_ONLINE.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
+#[kernel_symbols::export(name = "sched.scheduler.is_cpu_active", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn is_cpu_active(cpu_id: usize) -> bool {
+    CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.active_set().contains(cpu))
+}
+
+#[kernel_symbols::export(name = "sched.scheduler.mark_cpu_online", contract = "kernel.sched.cpu-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
+pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+    let _ = SCHEDULER.mark_cpu_online(cpu);
     Ok(())
 }
 
-/// AP 启动路径的调度接入口框架：把当前 CPU 正在执行的 task 登记为该 CPU 的
-/// current。当前 kernel 启动链路不调用它；AP bring-up 落地时可直接接入。
+/// TODO(smp): AP 只能在 current 和 idle 都安装完成后激活；底层通常应通过
+/// [`cpu_start_scheduling`] 完成这一步，而不是提前直接调用本函数。
+#[kernel_symbols::export(name = "sched.scheduler.activate_cpu", contract = "kernel.sched.cpu-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
+pub fn activate_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+    if !cpu_ready_for_activation(&SCHEDULER, cpu_id) {
+        return Err(errno::Errno::EBUSY);
+    }
+    if !SCHEDULER.activate_cpu(cpu) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(())
+}
+
+pub(crate) fn cpu_ready_for_activation(scheduler: &crate::Scheduler, cpu_id: usize) -> bool {
+    scheduler
+        .cpu(cpu_id)
+        .is_some_and(|cpu_state| cpu_state.current().is_some() && cpu_state.idle().is_some())
+}
+
+/// 兼容旧调用：一次完成 online 和 active 发布。
+///
+/// TODO(smp): AP 启动路径不得调用该兼容接口；它不会检查 per-CPU current、idle
+/// 和架构本地状态是否准备完成。
+pub fn register_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    register_cpu_locked(cpu_id)
+}
+
+fn register_cpu_locked(cpu_id: usize) -> Result<(), errno::Errno> {
+    let Some(cpu) = CpuId::new(cpu_id) else {
+        return Err(errno::Errno::EINVAL);
+    };
+    let _ = SCHEDULER.mark_cpu_online(cpu);
+    if !SCHEDULER.activate_cpu(cpu) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(())
+}
+
+struct CpuOfflineTask {
+    task: Arc<Task>,
+    source: crate::PlacementSnapshot,
+    target_cpu: CpuId,
+    target_domain: usize,
+}
+
+/// 将一个非启动 CPU 下线并迁移其排队任务。
+#[kernel_symbols::export(name = "sched.scheduler.offline_cpu", contract = "kernel.sched.cpu-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
+pub fn offline_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    offline_cpu_with_scheduler(&SCHEDULER, cpu_id, now_ns_internal())
+}
+
+pub(crate) fn offline_cpu_with_scheduler(
+    scheduler: &crate::Scheduler,
+    cpu_id: usize,
+    now_ns: u64,
+) -> Result<(), errno::Errno> {
+    let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+    if cpu == CpuId::boot() {
+        return Err(errno::Errno::EBUSY);
+    }
+    if !scheduler.online_set().contains(cpu) {
+        return Ok(());
+    }
+
+    let cpu_state = scheduler.cpu_or_boot(cpu_id);
+    if cpu_state
+        .current()
+        .is_some_and(|current| !current.is_idle_task())
+    {
+        return Err(errno::Errno::EBUSY);
+    }
+
+    if scheduler.active_set().contains(cpu) && !scheduler.deactivate_cpu(cpu) {
+        return Err(errno::Errno::EBUSY);
+    }
+    let drained = cpu_state.runqueue().drain_queued(now_ns);
+    let snapshot = scheduler.topology_snapshot();
+    let mut planned_load = collect_rq_load_snapshot_for(scheduler, snapshot.active);
+    let mut tasks = Vec::new();
+    for task in &drained {
+        let _ = refresh_task_placement(scheduler, task);
+        let source = task.placement();
+        if source.state != crate::PlacementState::Bound
+            || source.cpu != Some(cpu)
+            || task.arch_context().is_none()
+            || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+        {
+            restore_drained_tasks(scheduler, cpu, &drained, now_ns);
+            return Err(errno::Errno::EBUSY);
+        }
+        let allowed = CpuMask::from_bits_or_boot(task.cpu_affinity()).intersection(snapshot.active);
+        let Some(target_cpu) =
+            snapshot
+                .topology
+                .select_cpu(allowed, snapshot.active, None, false, |cpu| {
+                    planned_load.load_of(cpu)
+                })
+        else {
+            restore_drained_tasks(scheduler, cpu, &drained, now_ns);
+            return Err(errno::Errno::EBUSY);
+        };
+        planned_load.add_task(target_cpu);
+        let target_domain = snapshot
+            .topology
+            .domain_for_cpu(target_cpu)
+            .unwrap_or_else(|| snapshot.topology.root_domain())
+            .id();
+        tasks.push(CpuOfflineTask {
+            task: Arc::clone(task),
+            source,
+            target_cpu,
+            target_domain,
+        });
+    }
+
+    let mut prepared = 0usize;
+    for item in &tasks {
+        if !item.task.begin_offline_repair(item.source) {
+            restore_prepared_tasks(scheduler, cpu, &tasks, prepared, now_ns);
+            return Err(errno::Errno::EBUSY);
+        }
+        prepared += 1;
+    }
+
+    for (index, item) in tasks.iter().enumerate() {
+        item.task
+            .commit_migration(item.target_cpu, item.target_domain, snapshot.generation);
+        if !scheduler
+            .cpu_or_boot(item.target_cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(&item.task), now_ns)
+        {
+            restore_unmoved_tasks(scheduler, cpu, &tasks, index, now_ns);
+            return Err(errno::Errno::EIO);
+        }
+        scheduler
+            .cpu_or_boot(item.target_cpu.get())
+            .request_resched();
+    }
+
+    let late = cpu_state.runqueue().drain_queued(now_ns);
+    if !late.is_empty()
+        || cpu_state
+            .current()
+            .is_some_and(|current| !current.is_idle_task())
+    {
+        restore_drained_tasks(scheduler, cpu, &late, now_ns);
+        return Err(errno::Errno::EBUSY);
+    }
+
+    let current = cpu_state.clear_current();
+    let idle = cpu_state.clear_idle();
+    if let Some(task) = current.as_ref() {
+        stop_cpu_task(cpu_state, task, now_ns);
+    }
+    if let Some(task) = idle.as_ref()
+        && current
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, task))
+    {
+        stop_cpu_task(cpu_state, task, now_ns);
+    }
+    cpu_state.clear_scheduling_requests();
+    if !scheduler.mark_cpu_offline(cpu) {
+        return Err(errno::Errno::EBUSY);
+    }
+    Ok(())
+}
+
+fn stop_cpu_task(cpu_state: &crate::CpuSchedState, task: &Arc<Task>, now_ns: u64) {
+    let _ = cpu_state.runqueue().dequeue(task, now_ns);
+    task.set_state(TaskState::Stopped);
+    task.unbind_placement();
+}
+
+fn restore_drained_tasks(
+    scheduler: &crate::Scheduler,
+    cpu: CpuId,
+    tasks: &[Arc<Task>],
+    now_ns: u64,
+) {
+    let _ = scheduler.activate_cpu(cpu);
+    for task in tasks {
+        let _ = refresh_task_placement(scheduler, task);
+        let _ = scheduler
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(task), now_ns);
+    }
+}
+
+fn restore_prepared_tasks(
+    scheduler: &crate::Scheduler,
+    cpu: CpuId,
+    tasks: &[CpuOfflineTask],
+    prepared: usize,
+    now_ns: u64,
+) {
+    let _ = scheduler.activate_cpu(cpu);
+    for (index, item) in tasks.iter().enumerate() {
+        if index < prepared {
+            item.task.rollback_migration(item.source);
+        }
+        let _ = refresh_task_placement(scheduler, &item.task);
+        let _ = scheduler
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(&item.task), now_ns);
+    }
+}
+
+fn restore_unmoved_tasks(
+    scheduler: &crate::Scheduler,
+    cpu: CpuId,
+    tasks: &[CpuOfflineTask],
+    first_unmoved: usize,
+    now_ns: u64,
+) {
+    let _ = scheduler.activate_cpu(cpu);
+    for item in &tasks[first_unmoved..] {
+        item.task.rollback_migration(item.source);
+        let _ = refresh_task_placement(scheduler, &item.task);
+        let _ = scheduler
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(&item.task), now_ns);
+    }
+}
+
+/// AP 启动路径的调度接入口：把当前 CPU 正在执行的 task 登记为该 CPU 的 current。
+///
+/// AP 完成 per-CPU 栈、trap、页表和本地数据初始化后调用。
+/// 本 CPU idle task，最后进入 [`cpu_start_scheduling`]。
 pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Errno> {
     if CpuId::new(cpu_id).is_none() {
         return Err(errno::Errno::EINVAL);
     }
-    register_cpu(cpu_id)?;
-    task.set_current_cpu(cpu_id);
+    mark_cpu_online(cpu_id)?;
+    bind_task_to_cpu(&task, cpu_id);
     if task.arch_context().is_none() {
         task.adopt_current_context();
     }
-    RUNQUEUES[cpu_id].set_current(Arc::clone(&task));
+    SCHEDULER
+        .cpu_or_boot(cpu_id)
+        .runqueue()
+        .set_current(Arc::clone(&task));
     publish_current_task(cpu_id, task);
     Ok(())
 }
 
 pub fn needs_resched(cpu_id: usize) -> bool {
-    cpu_id < NR_CPUS && NEED_RESCHED[cpu_id].load(Ordering::Acquire)
+    SCHEDULER
+        .cpu(cpu_id)
+        .is_some_and(|cpu_state| cpu_state.needs_resched())
 }
 
 pub fn needs_resched_current() -> bool {
     if !INIT_READY.load(Ordering::Acquire) {
         return false;
     }
-    NEED_RESCHED[cpu()].load(Ordering::Acquire)
+    SCHEDULER.cpu_or_boot(cpu()).needs_resched()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.request_resched", contract = "kernel.sched.control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn request_resched(cpu_id: usize) {
     if cpu_id >= NR_CPUS {
         return;
     }
-    NEED_RESCHED[cpu_id].store(true, Ordering::Release);
+    SCHEDULER.cpu_or_boot(cpu_id).request_resched();
+    notify_resched(cpu_id);
+}
+
+fn notify_resched(cpu_id: usize) {
     if cpu_id != cpu() {
         if let Some(ops) = arch_hooks::cpu_control() {
             if (ops.is_online)(cpu_id) {
@@ -578,42 +926,20 @@ pub fn request_balance(cpu_id: usize) {
     if cpu_id >= NR_CPUS {
         return;
     }
-    NEED_BALANCE[cpu_id].store(true, Ordering::Release);
+    SCHEDULER.cpu_or_boot(cpu_id).request_balance();
     request_resched(cpu_id);
 }
 
 pub fn request_post_syscall_handoff() {
     let cpu_id = cpu();
-    let cell = &POST_SYSCALL_HANDOFF[cpu_id];
-    let mut cur = cell.load(Ordering::Acquire);
-    while cur < POST_SYSCALL_HANDOFF_ROUNDS {
-        match cell.compare_exchange(
-            cur,
-            POST_SYSCALL_HANDOFF_ROUNDS,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(next) => cur = next,
-        }
-    }
+    SCHEDULER
+        .cpu_or_boot(cpu_id)
+        .request_post_syscall_handoff(POST_SYSCALL_HANDOFF_ROUNDS);
     request_resched(cpu_id);
 }
 
 fn cleanup_retired_tasks(cpu_id: usize) {
-    if !RETIRED_TASKS_NONEMPTY[cpu_id].load(Ordering::Acquire) {
-        return;
-    }
-    let retired = {
-        let mut slot = RETIRED_TASKS[cpu_id].lock();
-        if slot.is_empty() {
-            RETIRED_TASKS_NONEMPTY[cpu_id].store(false, Ordering::Release);
-            return;
-        }
-        let taken = core::mem::take(&mut *slot);
-        RETIRED_TASKS_NONEMPTY[cpu_id].store(false, Ordering::Release);
-        taken
-    };
+    let retired = SCHEDULER.cpu_or_boot(cpu_id).take_retired();
     for task in retired.iter() {
         task.cleanup_exit_extensions();
         task.retire_execution();
@@ -622,9 +948,7 @@ fn cleanup_retired_tasks(cpu_id: usize) {
 }
 
 fn retire_final_task(cpu_id: usize, task: Arc<Task>) {
-    let mut slot = RETIRED_TASKS[cpu_id].lock();
-    slot.push(task);
-    RETIRED_TASKS_NONEMPTY[cpu_id].store(true, Ordering::Release);
+    SCHEDULER.cpu_or_boot(cpu_id).retire(task);
 }
 
 pub fn run_post_syscall_handoff(now_ns: u64) {
@@ -632,7 +956,8 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
         return;
     }
     let cpu_id = cpu();
-    let rounds = POST_SYSCALL_HANDOFF[cpu_id].swap(0, Ordering::AcqRel);
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let rounds = cpu_state.take_post_syscall_handoff();
     if rounds == 0 {
         return;
     }
@@ -641,15 +966,15 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     // 这里消费了专用交接请求后，如果继续保留 resched 位，新任务第一次 syscall
     // 返回时会立刻再次进入调度器，而父任务还停在 clone 的 syscall 收尾路径上。
     // 因此先清掉兜底位；下面有界交接循环会完成预期的调度工作。
-    let _ = NEED_RESCHED[cpu_id].swap(false, Ordering::AcqRel);
-    if NEED_BALANCE[cpu_id].swap(false, Ordering::AcqRel) {
+    let _ = cpu_state.take_resched();
+    if cpu_state.take_balance() {
         let _ = balance_once(cpu_id);
     }
     // syscall 返回后的父子任务交接是 clone/vfork 热路径；时间戳只需采样一次，
     // 避免有界循环里重复读取时钟。
     let handoff_now = now_ns_internal().max(now_ns);
     for _ in 0..rounds {
-        if RUNQUEUES[cpu_id].nr_running() <= 1 {
+        if cpu_state.runqueue().nr_running() <= 1 {
             break;
         }
         schedule_once(handoff_now);
@@ -661,7 +986,7 @@ pub fn run_post_syscall_handoff_lazy() {
         return;
     }
     let cpu_id = cpu();
-    if POST_SYSCALL_HANDOFF[cpu_id].load(Ordering::Acquire) == 0 {
+    if !SCHEDULER.cpu_or_boot(cpu_id).has_post_syscall_handoff() {
         return;
     }
     run_post_syscall_handoff(now_ns_internal());
@@ -676,10 +1001,45 @@ pub fn select_task_cpu(task: &Arc<Task>) -> usize {
 }
 
 /// 统一入队入口：设置任务 CPU 归属、入目标 runqueue、请求该 CPU 调度。
+#[kernel_symbols::export(name = "sched.scheduler.enqueue_task", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
-    let cpu_id = enqueue_task_locked(task, now_ns);
-    request_resched(cpu_id);
+    let cpu_id = enqueue_task_locked(task, now_ns, true);
+    notify_resched(cpu_id);
     cpu_id
+}
+
+/// 将尚未运行的任务原子绑定并首次加入指定活动 CPU。
+///
+/// active 状态检查、亲和性安装和入队受同一热插拔锁保护，避免 CPU 在检查后、
+/// 任务真正进入 runqueue 前被下线。该接口只供创建路径使用。
+pub(crate) fn activate_task_on_cpu(
+    task: &Arc<Task>,
+    cpu_id: usize,
+    now_ns: u64,
+) -> Result<usize, errno::Errno> {
+    if task.arch_context().is_none()
+        || !matches!(
+            task.state(),
+            TaskState::New | TaskState::Runnable | TaskState::Sleeping
+        )
+    {
+        return Err(errno::Errno::EINVAL);
+    }
+
+    let selected = {
+        let _guard = CPU_HOTPLUG_LOCK.lock();
+        let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+        if !SCHEDULER.active_set().contains(cpu) {
+            return Err(errno::Errno::EINVAL);
+        }
+        task.set_cpu_affinity(cpu.mask().bits());
+        task.set_current_cpu(cpu_id);
+        let selected = enqueue_task_on_scheduler(&SCHEDULER, Arc::clone(task), now_ns, false, true);
+        debug_assert_eq!(selected, cpu_id);
+        selected
+    };
+    notify_resched(selected);
+    Ok(selected)
 }
 
 /// futex 唤醒热路径入口：入队后让下一次本地调度优先尝试运行该任务。
@@ -688,8 +1048,8 @@ pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
 /// 复查任务状态、CPU 亲和性和 class；提示只消费一次，用于避免 pthread
 /// join / condvar / mutex 这类短等待路径退化到等待下一个 tick。
 pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
-    let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true);
-    request_resched(cpu_id);
+    let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true, true);
+    notify_resched(cpu_id);
     cpu_id
 }
 
@@ -700,14 +1060,29 @@ pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
 /// bind/listen。这个入口仅用于这类“父可运行，但当前 child 应先返回用户态”的
 /// 场景。
 pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
-    enqueue_task_locked(task, now_ns)
+    enqueue_task_locked(task, now_ns, false)
 }
 
-fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
-    enqueue_task_locked_with_preference(task, now_ns, false)
+fn enqueue_task_locked(task: Arc<Task>, now_ns: u64, request_reschedule: bool) -> usize {
+    enqueue_task_locked_with_preference(task, now_ns, false, request_reschedule)
 }
 
-fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: bool) -> usize {
+fn enqueue_task_locked_with_preference(
+    task: Arc<Task>,
+    now_ns: u64,
+    preferred: bool,
+    request_reschedule: bool,
+) -> usize {
+    enqueue_task_on_scheduler(&SCHEDULER, task, now_ns, preferred, request_reschedule)
+}
+
+pub(crate) fn enqueue_task_on_scheduler(
+    scheduler: &crate::Scheduler,
+    task: Arc<Task>,
+    now_ns: u64,
+    preferred: bool,
+    request_reschedule: bool,
+) -> usize {
     if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
     {
         // 只有拥有执行体的活任务才能进入 rq。退出清理和 wait/reap 会释放
@@ -720,19 +1095,47 @@ fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: 
             task.state(),
             task.arch_context().is_some(),
         );
-        return task.current_cpu().min(NR_CPUS - 1);
+        let cpu_id = task.current_cpu().min(NR_CPUS - 1);
+        if request_reschedule {
+            scheduler.cpu_or_boot(cpu_id).request_resched();
+        }
+        return cpu_id;
     }
-    if task.sched.on_rq() {
-        return task.current_cpu().min(NR_CPUS - 1);
+    let Some(_task_enqueue_guard) = task.sched.try_begin_enqueue() else {
+        let cpu_id = task.current_cpu().min(NR_CPUS - 1);
+        if request_reschedule {
+            scheduler.cpu_or_boot(cpu_id).request_resched();
+        }
+        return cpu_id;
+    };
+
+    for _ in 0..NR_CPUS {
+        let cpu_id = task_sched_placement_on(scheduler, &task)
+            .preferred_cpu
+            .unwrap_or_else(CpuId::boot)
+            .get();
+        let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
+        let cpu_state = scheduler.cpu_or_boot(cpu_id);
+        let _enqueue_guard = cpu_state.begin_enqueue();
+        if !scheduler.active_set().contains(cpu) {
+            continue;
+        }
+
+        bind_task_to_cpu_on(scheduler, &task, cpu_id);
+        let queued = if preferred {
+            cpu_state
+                .runqueue()
+                .enqueue_preferred(Arc::clone(&task), now_ns)
+        } else {
+            cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
+        };
+        if queued && request_reschedule {
+            cpu_state.request_resched();
+        }
+        return cpu_id;
     }
-    let cpu_id = select_task_cpu(&task);
-    task.set_current_cpu(cpu_id);
-    if preferred {
-        RUNQUEUES[cpu_id].enqueue_preferred(Arc::clone(&task), now_ns);
-    } else {
-        RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
-    }
-    cpu_id
+
+    unreachable!("[sched] boot CPU must accept task enqueue")
 }
 
 /// Register a sleeping task for deadline-based wakeup.
@@ -919,11 +1322,14 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
     }
 }
 
-pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
+fn migration_context(
+    task: &Arc<Task>,
+    target_cpu: usize,
+) -> Result<MigrationContext, errno::Errno> {
     let Some(target) = CpuId::new(target_cpu) else {
         return Err(errno::Errno::EINVAL);
     };
-    if !online_cpu_set().contains(target) {
+    if !active_cpu_set().contains(target) {
         return Err(errno::Errno::EINVAL);
     }
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
@@ -933,40 +1339,120 @@ pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Er
     if task.state() == TaskState::Running {
         return Err(errno::Errno::EBUSY);
     }
-    if !task.sched.on_rq() {
-        task.set_current_cpu(target_cpu);
-        return Ok(());
+    let _ = refresh_task_placement(&SCHEDULER, task);
+    let mut source = task.placement();
+    if source.state == crate::PlacementState::Unbound {
+        bind_task_to_cpu(task, task.current_cpu().min(NR_CPUS - 1));
+        source = task.placement();
     }
-    let now = now_ns_internal();
-    let mut removed = false;
-    let owner = task.current_cpu();
-    if owner < NR_CPUS {
-        removed = RUNQUEUES[owner].dequeue_queued(task, now);
-        if !removed && RUNQUEUES[owner].is_current(task) {
+    if source.state != crate::PlacementState::Bound {
+        return Err(errno::Errno::EBUSY);
+    }
+    let topology = SCHEDULER.topology_snapshot();
+    if source.topology_generation != topology.generation {
+        return Err(errno::Errno::EAGAIN);
+    }
+    let target_domain = topology
+        .topology
+        .domain_for_cpu(target)
+        .unwrap_or_else(|| topology.topology.root_domain())
+        .id();
+    if !task.begin_migration(source) {
+        return Err(errno::Errno::EBUSY);
+    }
+    Ok(MigrationContext {
+        source,
+        target_cpu: target,
+        target_domain,
+        topology_generation: topology.generation,
+    })
+}
+
+fn rollback_migration(task: &Arc<Task>, context: MigrationContext, requeue_source: bool) {
+    task.rollback_migration(context.source);
+    let _ = refresh_task_placement(&SCHEDULER, task);
+    if requeue_source {
+        SCHEDULER
+            .cpu_or_boot(context.source.cpu.map_or(0, CpuId::get))
+            .runqueue()
+            .enqueue(Arc::clone(task), now_ns_internal());
+    }
+}
+
+pub(crate) fn validate_migration_target(
+    context: MigrationContext,
+    topology: TopologySnapshot,
+    affinity: CpuMask,
+) -> Result<(), errno::Errno> {
+    if topology.generation != context.topology_generation {
+        return Err(errno::Errno::EAGAIN);
+    }
+    if !topology.active.contains(context.target_cpu) || !affinity.contains(context.target_cpu) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(())
+}
+
+fn attach_migrated_task(
+    task: &Arc<Task>,
+    context: MigrationContext,
+    source_detached: bool,
+) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    let topology = SCHEDULER.topology_snapshot();
+    if let Err(error) = validate_migration_target(context, topology, affinity) {
+        rollback_migration(task, context, source_detached);
+        return Err(error);
+    }
+    if !source_detached {
+        let source_cpu = context.source.cpu.map_or(0, CpuId::get);
+        if !SCHEDULER
+            .cpu_or_boot(source_cpu)
+            .runqueue()
+            .dequeue_queued(task, now_ns_internal())
+        {
+            rollback_migration(task, context, false);
             return Err(errno::Errno::EBUSY);
         }
     }
-    if !removed {
-        for (cpu_id, rq) in RUNQUEUES.iter().enumerate() {
-            if cpu_id == owner {
-                continue;
-            }
-            if rq.dequeue_queued(task, now) {
-                removed = true;
-                break;
-            }
-            if rq.is_current(task) {
-                return Err(errno::Errno::EBUSY);
-            }
-        }
+    let commit_topology = SCHEDULER.topology_snapshot();
+    let commit_affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    if validate_migration_target(context, commit_topology, commit_affinity).is_err() {
+        rollback_migration(task, context, true);
+        return Err(errno::Errno::EAGAIN);
     }
-    if !removed {
-        return Err(errno::Errno::EBUSY);
+    task.commit_migration(
+        context.target_cpu,
+        context.target_domain,
+        context.topology_generation,
+    );
+    if !SCHEDULER
+        .cpu_or_boot(context.target_cpu.get())
+        .runqueue()
+        .enqueue(Arc::clone(task), now_ns_internal())
+    {
+        rollback_migration(task, context, true);
+        return Err(errno::Errno::EIO);
     }
-    task.set_current_cpu(target_cpu);
-    RUNQUEUES[target_cpu].enqueue(Arc::clone(task), now);
-    request_resched(target_cpu);
+    request_resched(context.target_cpu.get());
     Ok(())
+}
+
+#[kernel_symbols::export(name = "sched.scheduler.migrate_task", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
+pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
+    if !task.sched.on_rq() {
+        let target = CpuId::new(target_cpu).ok_or(errno::Errno::EINVAL)?;
+        if !active_cpu_set().contains(target)
+            || !CpuMask::from_bits_or_boot(task.cpu_affinity()).contains(target)
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        bind_task_to_cpu(task, target_cpu);
+        return Ok(());
+    }
+    let context = migration_context(task, target_cpu)?;
+    attach_migrated_task(task, context, false)
 }
 
 /// 从最忙 CPU 拉一个任务到 `cpu_id`。AP 启动后可由 idle/tick 路径周期调用。
@@ -974,64 +1460,197 @@ pub fn balance_once(cpu_id: usize) -> bool {
     let Some(local_cpu) = CpuId::new(cpu_id) else {
         return false;
     };
-    let online = online_cpu_set();
-    if !online.contains(local_cpu) {
+    let active = active_cpu_set();
+    if !active.contains(local_cpu) {
         return false;
     }
 
-    let topology = sched_topology();
+    let topology_snapshot = SCHEDULER.topology_snapshot();
+    let topology = topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
-    let sample_cpus = topology
-        .balance_sources(local_cpu, online)
-        .union(CpuMask::single(local_cpu));
-    let load_snapshot = RunqueueLoadSnapshot::collect(sample_cpus, |cpu| {
-        RUNQUEUES[cpu.get()].migratable_load_for(allowed)
+    let domain_loads = RunqueueClassLoadSnapshot::collect(active, |cpu| {
+        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
     });
-    let local_load = load_snapshot.load_of(local_cpu);
-    let Some(src) = select_balance_source(topology, local_cpu, online, local_load, |cpu| {
-        load_snapshot.load_of(cpu)
-    })
-    .map(|cpu| cpu.get()) else {
+    SCHEDULER.update_domain_stats(topology_snapshot, domain_loads.loads());
+
+    let load_snapshot = RunqueueClassLoadSnapshot::collect(active, |cpu| {
+        SCHEDULER
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .migratable_class_load_for(allowed)
+    });
+    let classes = [SchedClass::Deadline, SchedClass::Realtime, SchedClass::Fair];
+    let Some((src, class)) = classes.into_iter().find_map(|class| {
+        select_balance_source_for_class(topology, local_cpu, active, class, |cpu| {
+            load_snapshot.load_of(cpu)
+        })
+        .map(|source| (source.get(), class))
+    }) else {
         return false;
     };
-    let Some(task) = RUNQUEUES[src].take_migratable(allowed, now_ns_internal()) else {
+    let Some(task) = SCHEDULER
+        .cpu_or_boot(src)
+        .runqueue()
+        .take_migratable_from_class(class, allowed, now_ns_internal())
+    else {
         return false;
     };
-    task.set_current_cpu(cpu_id);
-    RUNQUEUES[cpu_id].enqueue(task, now_ns_internal());
-    request_resched(cpu_id);
-    true
+    if class == SchedClass::Deadline {
+        let target_load = domain_loads.load_of(local_cpu);
+        let task_utilization = deadline_task_utilization(&task);
+        if !deadline_has_capacity(
+            target_load,
+            task_utilization,
+            topology.cpu_capacity(local_cpu),
+        ) {
+            let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
+            notify_resched(target);
+            return false;
+        }
+    }
+    let source = task.placement();
+    let topology_snapshot = SCHEDULER.topology_snapshot();
+    let target_domain = topology_snapshot
+        .topology
+        .domain_for_cpu(local_cpu)
+        .unwrap_or_else(|| topology_snapshot.topology.root_domain())
+        .id();
+    if source.state != crate::PlacementState::Bound
+        || source.topology_generation != topology_snapshot.generation
+        || !task.begin_migration(source)
+    {
+        let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
+        notify_resched(target);
+        return false;
+    }
+    let context = MigrationContext {
+        source,
+        target_cpu: local_cpu,
+        target_domain,
+        topology_generation: topology_snapshot.generation,
+    };
+    attach_migrated_task(&task, context, true).is_ok()
 }
 
-pub(crate) fn select_balance_source<F>(
+pub(crate) fn requeue_balance_task_on(
+    scheduler: &crate::Scheduler,
+    task: Arc<Task>,
+    source_cpu: usize,
+    now_ns: u64,
+) -> usize {
+    if let Some(source) = CpuId::new(source_cpu) {
+        let cpu_state = scheduler.cpu_or_boot(source_cpu);
+        let _enqueue_guard = cpu_state.begin_enqueue();
+        if scheduler.active_set().contains(source) {
+            if cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns) {
+                cpu_state.request_resched();
+            }
+            return source_cpu;
+        }
+    }
+    enqueue_task_on_scheduler(scheduler, task, now_ns, false, true)
+}
+
+pub(crate) fn select_balance_source_for_class<F>(
     topology: SchedTopology,
     local_cpu: CpuId,
-    online: CpuMask,
-    local_load: usize,
+    active: CpuMask,
+    class: SchedClass,
     mut load_of: F,
 ) -> Option<CpuId>
 where
-    F: FnMut(CpuId) -> usize,
+    F: FnMut(CpuId) -> RunqueueClassLoad,
 {
-    let mut busiest = None;
-    let mut busiest_load = local_load;
-    let sources = topology.balance_sources(local_cpu, online);
-    for other in sources.iter() {
-        let load = load_of(other);
-        if load == 0 {
-            continue;
-        }
-        let should_pull = if local_load == 0 {
-            busiest.is_none() || load > busiest_load
-        } else {
-            load > local_load.saturating_add(1) && load > busiest_load
-        };
-        if should_pull {
-            busiest = Some(other);
-            busiest_load = load;
-        }
+    if class == SchedClass::Idle {
+        return None;
     }
-    busiest
+    let local_load = load_of(local_cpu);
+    let local_capacity = topology.cpu_capacity(local_cpu);
+    let local_utilization = normalized_load(local_load.balance_load(class), local_capacity);
+    let mut domain = topology
+        .domain_for_cpu(local_cpu)
+        .unwrap_or_else(|| topology.root_domain());
+
+    loop {
+        let mut busiest = None;
+        let mut busiest_utilization = local_utilization;
+        for other in domain.span().intersection(active).without(local_cpu).iter() {
+            let load = load_of(other);
+            if !class_allows_pull(class, local_load, load) {
+                continue;
+            }
+            let utilization =
+                normalized_load(load.balance_load(class), topology.cpu_capacity(other));
+            if utilization > busiest_utilization {
+                busiest = Some(other);
+                busiest_utilization = utilization;
+            }
+        }
+        if busiest.is_some() {
+            return busiest;
+        }
+        let Some(parent) = domain.parent() else {
+            return None;
+        };
+        domain = topology.domain(parent)?;
+    }
+}
+
+fn normalized_load(load: u64, capacity: u64) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    load.saturating_mul(crate::SCHED_CAPACITY_SCALE) / capacity
+}
+
+fn class_allows_pull(
+    class: SchedClass,
+    local_load: RunqueueClassLoad,
+    source_load: RunqueueClassLoad,
+) -> bool {
+    match class {
+        // 迁移单个 Deadline 任务不会增加并行度，还会破坏已有 CPU 局部性。
+        SchedClass::Deadline => {
+            source_load.deadline > local_load.deadline.saturating_add(1)
+                && source_load.deadline_utilization > local_load.deadline_utilization
+        }
+        SchedClass::Realtime => {
+            if local_load.realtime == 0 {
+                source_load.realtime > 0
+            } else {
+                source_load.realtime > local_load.realtime.saturating_add(1)
+            }
+        }
+        SchedClass::Fair => {
+            if local_load.fair == 0 {
+                source_load.fair > 0
+            } else {
+                source_load.fair_weight > local_load.fair_weight.saturating_add(NICE_0_WEIGHT)
+            }
+        }
+        SchedClass::Idle => false,
+    }
+}
+
+fn deadline_task_utilization(task: &Arc<Task>) -> u64 {
+    let runtime = task.sched.deadline_runtime_ns();
+    let period = task.sched.deadline_period_ns();
+    if runtime == 0 || period == 0 {
+        return 0;
+    }
+    ((runtime as u128 * crate::SCHED_CAPACITY_SCALE as u128) / period as u128).min(u64::MAX as u128)
+        as u64
+}
+
+pub(crate) fn deadline_has_capacity(
+    target_load: RunqueueClassLoad,
+    task_utilization: u64,
+    capacity: u64,
+) -> bool {
+    target_load
+        .deadline_utilization
+        .saturating_add(task_utilization)
+        <= capacity
 }
 
 fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usize) {
@@ -1047,8 +1666,8 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
         return;
     }
 
-    let online = online_cpu_set();
-    let allowed = affinity.intersection(online).without(source);
+    let active = active_cpu_set();
+    let allowed = affinity.intersection(active).without(source);
     if allowed.is_empty() {
         return;
     }
@@ -1067,6 +1686,7 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
 ///
 /// 调用方已经把 `info` 放进了 target 的 per-task 或共享 pending 队列，这里
 /// 只负责"是否需要唤醒"。`Uninterruptible` 任务不会被打断（Linux 语义）。
+#[kernel_symbols::export(name = "sched.scheduler.signal_wakeup", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;
@@ -1121,12 +1741,21 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
 ///
 /// `now_ns` 是当前时间戳（纳秒）；传 0 表示"不推进虚拟时间"（适合启动期、
 /// 主动 yield 之类无法测时间的路径）。返回时调用方已经重新获得 CPU。
+#[kernel_symbols::export(
+    name = "sched.scheduler.schedule_once",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_TASK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn schedule_once(now_ns: u64) {
     let cpu_id = cpu();
     cleanup_retired_tasks(cpu_id);
 
-    // 1. 取 prev（不持 CURRENT_TASKS 锁跨切换）。
-    let Some(prev) = CURRENT_TASKS[cpu_id].lock().clone() else {
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+
+    // 1. 取 prev（不持 owning current 锁跨切换）。
+    let Some(prev) = cpu_state.current() else {
         return;
     };
 
@@ -1140,11 +1769,14 @@ pub fn schedule_once(now_ns: u64) {
 
     // 2. 挑下一个；pick_next 会把 prev 放回 tree（若仍 runnable）。若 prev 的
     //    亲和性已经排除本 CPU，此时它已稳定停在旧 rq，可通知目标 CPU 拉取。
-    let next = match RUNQUEUES[cpu_id].pick_next_on(now_ns, CpuMask::single_raw(cpu_id).bits()) {
+    let next = match cpu_state
+        .runqueue()
+        .pick_next_on(now_ns, CpuMask::single_raw(cpu_id).bits())
+    {
         Some(t) => t,
         None => {
             // 队列空：回落到本核 idle。idle 未安装则保持 prev 不切。
-            let idle = IDLE_TASKS[cpu_id].lock().clone();
+            let idle = cpu_state.idle();
             let Some(idle) = idle else {
                 return;
             };
@@ -1174,7 +1806,7 @@ pub fn schedule_once(now_ns: u64) {
     // 后续 vm_switch 会激活 next 的页表，task_cpu_state 可能通过 copy_to_user
     // 刷新 rseq。内核态 uaccess 的缺页处理依赖 current_task()->VmSpace，所以
     // 必须先发布 current，再触碰 next 的用户地址空间。
-    next.set_current_cpu(cpu_id);
+    bind_task_to_cpu(&next, cpu_id);
     publish_current_task(cpu_id, Arc::clone(&next));
 
     // 5. 取 ctx。
@@ -1222,9 +1854,11 @@ pub fn schedule_once(now_ns: u64) {
 
 // ── 定时器 / 抢占 ─────────────────────────────────────────────────────────────
 
-/// 定时器中断回调。推进 current 的虚拟时间，若时间片用完则置 NEED_RESCHED。
+/// 定时器中断回调。推进 current 的虚拟时间，若时间片用完则请求 reschedule。
 /// 真正的切换由 trap 返回路径上的 [`preempt_if_needed`] 完成——本函数仅
 /// 记录意图，避免在 IRQ 上下文里持锁切换造成栈污染。
+///
+/// TODO(smp): 每个 AP 的本地 timer 中断都必须调用该接口。
 pub fn on_timer_tick(now_ns: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
@@ -1232,20 +1866,24 @@ pub fn on_timer_tick(now_ns: u64) {
     wake_expired_sleepers(now_ns);
     fire_expired_realtime_itimers(now_ns);
     let cpu_id = cpu();
-    if RUNQUEUES[cpu_id].tick(now_ns) {
+    if SCHEDULER.cpu_or_boot(cpu_id).runqueue().tick(now_ns) {
         request_resched(cpu_id);
     }
 }
 
 /// 在合适的边界（trap 返回前、syscall 返回前、显式让渡入口）调用。读到
-/// NEED_RESCHED 即清零并切一次。
+/// CPU 的 reschedule 意图被置位时即清零并切一次。
+///
+/// TODO(smp): AP 的 timer、reschedule IPI 和 syscall/trap 返回路径都必须在
+/// 恢复用户态前经过该接口；硬中断处理程序不得直接切换上下文。
 pub fn preempt_if_needed(now_ns: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
     let cpu_id = cpu();
-    if NEED_RESCHED[cpu_id].swap(false, Ordering::AcqRel) {
-        if NEED_BALANCE[cpu_id].swap(false, Ordering::AcqRel) {
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    if cpu_state.take_resched() {
+        if cpu_state.take_balance() {
             let _ = balance_once(cpu_id);
         }
         schedule_once(now_ns);
@@ -1258,7 +1896,7 @@ pub fn preempt_if_needed(now_ns: u64) {
 /// "硬件 wfi"等节能指令留到后续接 arch 钩子。
 unsafe extern "C" fn idle_entry(_cpu_arg: usize) -> ! {
     loop {
-        let _ = NEED_BALANCE[cpu()].swap(false, Ordering::AcqRel);
+        let _ = SCHEDULER.cpu_or_boot(cpu()).take_balance();
         let _ = balance_once(cpu());
         // 队列空时 schedule_once 也会走"idle == prev"的快路径直接返回；
         // 一旦有 runnable 任务进来，下一次 schedule_once 会把 idle 切走。
@@ -1273,18 +1911,17 @@ unsafe extern "C" fn idle_entry(_cpu_arg: usize) -> ! {
 
 /// 把 idle 任务装到指定 CPU 的槽位。一个 CPU 同时只能有一个 idle。
 pub fn install_idle(cpu_id: usize, t: Arc<Task>) {
-    register_cpu(cpu_id).expect("[sched] invalid idle cpu id");
-    t.set_current_cpu(cpu_id);
-    let mut slot = IDLE_TASKS[cpu_id].lock();
-    debug_assert!(
-        slot.is_none(),
+    mark_cpu_online(cpu_id).expect("[sched] invalid idle cpu id");
+    bind_task_to_cpu(&t, cpu_id);
+    let installed = SCHEDULER.cpu_or_boot(cpu_id).install_idle(t);
+    assert!(
+        installed.is_ok(),
         "[sched] idle slot for cpu {} already filled",
         cpu_id
     );
-    *slot = Some(t);
 }
 
-/// 派生指定 CPU 的 idle 任务并装入 IDLE_TASKS。返回任务句柄。
+/// 派生指定 CPU 的 idle 任务并装入对应 CpuSchedState。返回任务句柄。
 pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
     // 权重最低（nice=19）；slice 用默认值。这样任何 runnable 任务都会先于
     // idle 被选中，idle 仅在无人可跑时占位。
@@ -1306,19 +1943,27 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
     t
 }
 
-/// [`spawn_idle_for`] 的显式 SMP 命名别名，供未来 AP bring-up 使用。
+/// [`spawn_idle_for`] 的显式 SMP 命名别名，供架构 AP 启动路径使用。
+///
+/// AP 启动前由 boot CPU 创建并安装本 CPU 的 idle task。
 pub fn spawn_idle_for_cpu(cpu_id: usize) -> Arc<Task> {
     spawn_idle_for(cpu_id)
 }
 
-/// AP 调度循环框架。当前启动链路不接入；真实 AP 代码应先调用
+/// AP 调度循环。架构代码应先调用
 /// [`adopt_cpu_current`] / [`spawn_idle_for_cpu`] 完成本 CPU 槽位初始化。
+///
+/// secondary entry 完成 per-CPU 初始化后以此作为调度入口；
+/// 本函数会检查初始化状态、激活 CPU，并开始消费本地 runqueue。
 pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
-    register_cpu(cpu_id).expect("[sched] invalid CPU id for scheduling loop");
+    activate_cpu(cpu_id).expect("[sched] CPU must be online before scheduling loop");
     loop {
-        let _ = balance_once(cpu_id);
         schedule_once(now_ns_internal());
-        core::hint::spin_loop();
+        if let Some(ops) = arch_hooks::idle() {
+            (ops.idle_relax)();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -1345,36 +1990,37 @@ pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
 }
 
 fn dequeue_for_state_change(task: &Arc<Task>, now_ns: u64) -> bool {
-    let local_cpu = cpu();
-    let owner = task.current_cpu();
-    if owner < NR_CPUS && dequeue_on_cpu_for_state_change(task, owner, local_cpu, now_ns) {
-        return true;
-    }
-    for cpu_id in 0..NR_CPUS {
-        if cpu_id == owner {
-            continue;
-        }
-        if dequeue_on_cpu_for_state_change(task, cpu_id, local_cpu, now_ns) {
-            return true;
-        }
-    }
-    false
+    dequeue_for_state_change_on(&SCHEDULER, task, cpu(), now_ns)
+}
+
+pub(crate) fn dequeue_for_state_change_on(
+    scheduler: &crate::Scheduler,
+    task: &Arc<Task>,
+    local_cpu: usize,
+    now_ns: u64,
+) -> bool {
+    let Some(owner) = task_runqueue_cpu_on(scheduler, task) else {
+        return false;
+    };
+    dequeue_on_cpu_for_state_change(scheduler, task, owner.get(), local_cpu, now_ns)
 }
 
 fn dequeue_on_cpu_for_state_change(
+    scheduler: &crate::Scheduler,
     task: &Arc<Task>,
     cpu_id: usize,
     local_cpu: usize,
     now_ns: u64,
 ) -> bool {
+    let rq = scheduler.cpu_or_boot(cpu_id).runqueue();
     if cpu_id == local_cpu {
-        return RUNQUEUES[cpu_id].dequeue(task, now_ns);
+        return rq.dequeue(task, now_ns);
     }
-    if RUNQUEUES[cpu_id].dequeue_queued(task, now_ns) {
+    if rq.dequeue_queued(task, now_ns) {
         return true;
     }
-    if RUNQUEUES[cpu_id].is_current(task) {
-        request_resched(cpu_id);
+    if rq.is_current(task) {
+        scheduler.cpu_or_boot(cpu_id).request_resched();
     }
     false
 }

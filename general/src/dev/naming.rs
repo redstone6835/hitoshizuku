@@ -76,6 +76,7 @@ pub enum StableNameAllocError {
     OutOfMemory,
 }
 
+#[kernel_symbols::export]
 impl StableNameAllocator {
     pub const fn new(prefix: &'static str) -> Self {
         Self { prefix }
@@ -84,7 +85,12 @@ impl StableNameAllocator {
     /// 分配下一个短名，例如 `uart0` 或 `vd1`。
     pub fn try_alloc(&self) -> Result<StableName, StableNameAllocError> {
         let mut prefixes = STABLE_NAME_PREFIXES.lock();
-        let state = prefix_state_mut(&mut prefixes, self.prefix)?;
+        let state = {
+            // 前缀状态跨驱动解绑长期保留，因此属于常驻命名注册表。
+            let _accounting = allocator::suspend_implicit_allocation_accounting()
+                .ok_or(StableNameAllocError::OutOfMemory)?;
+            prefix_state_mut(&mut prefixes, self.prefix)?
+        };
         let index = state.next_index;
         let next = index
             .checked_add(1)
@@ -95,9 +101,22 @@ impl StableNameAllocator {
     }
 
     /// 为稳定设备身份分配或复用短名。
+    #[kernel_symbols::export(
+        name = "general.dev.naming.StableNameAllocator.try_alloc_stable",
+        contract = "kernel.general.device-naming@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn try_alloc_stable(&self, stable_key: &str) -> Result<StableName, StableNameAllocError> {
         let mut prefixes = STABLE_NAME_PREFIXES.lock();
-        let state = prefix_state_mut(&mut prefixes, self.prefix)?;
+        let state = {
+            // 前缀状态跨驱动解绑长期保留，因此属于常驻命名注册表。
+            let _accounting = allocator::suspend_implicit_allocation_accounting()
+                .ok_or(StableNameAllocError::OutOfMemory)?;
+            prefix_state_mut(&mut prefixes, self.prefix)?
+        };
         if let Some(existing) = state
             .reservations
             .iter()
@@ -106,12 +125,31 @@ impl StableNameAllocator {
             return try_clone_name(&existing.name);
         }
 
-        let stable_key = try_clone_string(stable_key)?;
-        state
-            .reservations
-            .try_reserve(1)
-            .map_err(|_| StableNameAllocError::OutOfMemory)?;
-        let (name, reserved_name) = try_alloc_pair(state, self.prefix)?;
+        let index = state.next_index;
+        let next = index
+            .checked_add(1)
+            .ok_or(StableNameAllocError::OutOfMemory)?;
+        let name = StableName {
+            index,
+            name: try_build_name(self.prefix, index)?,
+        };
+        let (stable_key, reserved_name) = {
+            // 稳定 key 和保留名会跨 ELM 卸载继续存在；只把返回给调用方的副本计入单元。
+            let _accounting = allocator::suspend_implicit_allocation_accounting()
+                .ok_or(StableNameAllocError::OutOfMemory)?;
+            state
+                .reservations
+                .try_reserve(1)
+                .map_err(|_| StableNameAllocError::OutOfMemory)?;
+            (
+                try_clone_string(stable_key)?,
+                StableName {
+                    index,
+                    name: try_build_name(self.prefix, index)?,
+                },
+            )
+        };
+        state.next_index = next;
         state.reservations.push(StableNameReservation {
             stable_key,
             name: reserved_name,
@@ -151,29 +189,6 @@ fn try_build_name(prefix: &str, index: usize) -> Result<String, StableNameAllocE
     name.push_str(prefix);
     write!(&mut name, "{}", index).map_err(|_| StableNameAllocError::OutOfMemory)?;
     Ok(name)
-}
-
-fn try_alloc_pair(
-    state: &mut StableNamePrefixState,
-    prefix: &str,
-) -> Result<(StableName, StableName), StableNameAllocError> {
-    let index = state.next_index;
-    let next = index
-        .checked_add(1)
-        .ok_or(StableNameAllocError::OutOfMemory)?;
-    let public_name = try_build_name(prefix, index)?;
-    let reserved_name = try_build_name(prefix, index)?;
-    state.next_index = next;
-    Ok((
-        StableName {
-            index,
-            name: public_name,
-        },
-        StableName {
-            index,
-            name: reserved_name,
-        },
-    ))
 }
 
 fn decimal_digits(mut value: usize) -> usize {
