@@ -55,10 +55,20 @@ pub unsafe fn install_exception_entry() {
 pub unsafe extern "C" fn __riscv_exception_entry() {
     naked_asm!(
         // sscratch 正常为 0（普通 S-mode）或当前 hart 的 TrapAnchor（这里直接使用
-        // HartLocal 指针）。非零时先在 anchor 暂存原始 t5，再以硬件 SPP 判源。
+        // HartLocal 指针）。先保存会被入口逻辑占用的 t4/t5/t6，并标记脆弱入口窗口；
+        // 若窗口内再次 trap，直接切 emergency stack 进入最小 double-fault 路径。
         "csrrw t6, {sscratch}, t6",
         "beqz t6, 20f",
+        "sd t4, {entry_t4_off}(t6)",
         "sd t5, {entry_t5_off}(t6)",
+        // sscratch 此刻保存原始 t6。先把它落到 HartLocal，再立即重新发布 anchor；
+        // 后续任一同步 fault 才能可靠进入下面的嵌套判定，而不会把用户 t6 当指针。
+        "csrrw t4, {sscratch}, t6",
+        "sd t4, {entry_t6_off}(t6)",
+        "ld t5, {entry_state_off}(t6)",
+        "bnez t5, 90f",
+        "li t5, 1",
+        "sd t5, {entry_state_off}(t6)",
         "csrr t5, {sstatus}",
         "andi t5, t5, {spp}",
         "bnez t5, 21f",
@@ -70,10 +80,11 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd sp, {sp_off}(t5)",
         "sd tp, {tp_off}(t5)",
         "sd gp, {gp_off}(t5)",
+        "ld t4, {entry_t4_off}(t6)",
         "sd t4, {t4_off}(t5)",
         "ld t4, {entry_t5_off}(t6)",
         "sd t4, {t5_off}(t5)",
-        "csrr t4, {sscratch}",
+        "ld t4, {entry_t6_off}(t6)",
         "sd t4, {t6_off}(t5)",
         "ld t4, {kernel_stack_top_off}(t6)",
         "sd t4, {kstack_top_off}(t5)",
@@ -96,10 +107,11 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd sp, {sp_off}(t5)",
         "sd tp, {tp_off}(t5)",
         "sd gp, {gp_off}(t5)",
+        "ld t4, {entry_t4_off}(t6)",
         "sd t4, {t4_off}(t5)",
         "ld t4, {entry_t5_off}(t6)",
         "sd t4, {t5_off}(t5)",
-        "csrr t4, {sscratch}",
+        "ld t4, {entry_t6_off}(t6)",
         "sd t4, {t6_off}(t5)",
         "sd t6, {satp_off}(t5)",
         "sd zero, {kstack_top_off}(t5)",
@@ -112,19 +124,53 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         // 普通 from_kernel：sscratch=0，直接在被中断内核栈下方保存 frame。
         "20:",
+        // 第一次 csrrw 把原始 t6 放进 sscratch；这里原子取回并发布 tp anchor。
+        "csrrw t6, {sscratch}, tp",
+        "sd t4, {entry_t4_off}(tp)",
+        "sd t5, {entry_t5_off}(tp)",
+        "sd t6, {entry_t6_off}(tp)",
+        "ld t5, {entry_state_off}(tp)",
+        "bnez t5, 91f",
+        "li t5, 1",
+        "sd t5, {entry_state_off}(tp)",
         "addi t6, sp, -{frame_size}",
         "sd sp, {sp_off}(t6)",
         "sd tp, {tp_off}(t6)",
         "sd gp, {gp_off}(t6)",
+        "ld t4, {entry_t4_off}(tp)",
         "sd t4, {t4_off}(t6)",
+        "ld t5, {entry_t5_off}(tp)",
         "sd t5, {t5_off}(t6)",
-        "csrr t5, {sscratch}",
+        "ld t5, {entry_t6_off}(tp)",
         "sd t5, {t6_off}(t6)",
         "sd zero, {satp_off}(t6)",
         "sd zero, {kstack_top_off}(t6)",
         "csrw {sscratch}, x0",
         "mv sp, t6",
         "j 4f",
+
+        // t6 非零路径的 anchor 在 t6；普通 kernel 路径的 anchor 仍在 tp。
+        "90:",
+        "mv tp, t6",
+        "j 92f",
+        "91:",
+        "92:",
+        "ld t5, {entry_state_off}(tp)",
+        "li t4, 2",
+        "bgeu t5, t4, 93f",
+        "sd t4, {entry_state_off}(tp)",
+        "ld sp, {irq_stack_top_off}(tp)",
+        "ld gp, {kernel_gp_off}(tp)",
+        "csrw {sscratch}, x0",
+        // Rust release 构建可能使用 FPU；fatal helper 前防御性打开 FS。
+        "li t4, {fs_dirty}",
+        "csrs {sstatus}, t4",
+        "tail {double_fault}",
+        "93:",
+        "csrci {sstatus}, 2",
+        "94:",
+        "wfi",
+        "j 94b",
 
         "23:",
 
@@ -186,6 +232,7 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         // 若内部发生调度，switch sequence 会变化，返回桩再从 frame 恢复。
 
         // 调用 syscall 快速路径 handler（不保存/恢复 FPU）
+        "sd zero, {entry_state_off}(tp)",
         "mv a0, sp",
         "ld a1, {sp_off}(sp)",
         "call {fast_handler}",
@@ -198,6 +245,8 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         // 快速 syscall resume：Rust ABI 已保持 s0-s10；frame-rewrite syscall 会被
         // handler 强制送往完整恢复，因此这里无需重复加载未变化的 callee-saved GPR。
         "mv s11, a0",
+        "li t0, 1",
+        "sd t0, {entry_state_off}(tp)",
         "ld t2, {switch_seq_off}(tp)",
         "ld t1, {tval_off}(s11)",
         "xor t2, t2, t1",
@@ -246,6 +295,7 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         // 发布当前内核 tp 指向的 per-hart TrapAnchor。tp/gp 延迟到此后恢复，
         // 最终窗口内的 S-mode fault 可直接由 anchor 找回内核栈和 kernel gp。
+        "sd zero, {entry_state_off}(tp)",
         "csrw {sscratch}, tp",
         "ld tp, {tp_off}(s11)",
         "ld gp, {gp_off}(s11)",
@@ -392,6 +442,9 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "call {save_vector}",
         "16:",
 
+        // Rust handler 可能调度并切换任务；脆弱入口窗口必须在此之前结束，
+        // 否则 per-hart 状态会把其它任务的正常 trap 误判为嵌套 fault。
+        "sd zero, {entry_state_off}(tp)",
         "mv a0, s0",
         "ld a1, {sp_off}(s0)",
         "call {handler}",
@@ -408,10 +461,9 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "beqz a0, 6f",
         "tail {resume}",
 
-        // 停机：
+        // fatal handler 返回 0：使用 SRST/无锁 wfi 收敛，不在损坏状态继续运行。
         "6:",
-        "wfi",
-        "j 6b",
+        "tail {fatal_shutdown}",
 
         handler = sym riscv64_handle_exception,
         fast_handler = sym riscv64_fast_syscall_dispatch,
@@ -419,12 +471,17 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         restore_fast_fpu = sym crate::riscv64::task::__riscv64_restore_clean_fpu_for_fast_return,
         save_vector = sym crate::riscv64::vector::save_vector_from_trap_entry,
         check_irq_stack_guard = sym crate::riscv64::specific::riscv64_check_irq_stack_guard,
+        double_fault = sym crate::riscv64::specific::riscv64_double_fault,
+        fatal_shutdown = sym crate::riscv64::specific::riscv64_fatal_trap_shutdown,
         resume = sym crate::riscv64::task::__riscv64_resume_to_trap_frame,
         frame_size = const FRAME_SIZE,
         user_frame_span = const (FRAME_SIZE * 2),
         kernel_stack_top_off = const HART_LOCAL_KERNEL_STACK_TOP_OFF,
         kernel_gp_off = const HART_LOCAL_KERNEL_GP_OFF,
+        entry_t4_off = const HART_LOCAL_TRAP_ENTRY_T4_OFF,
         entry_t5_off = const HART_LOCAL_TRAP_ENTRY_T5_OFF,
+        entry_t6_off = const HART_LOCAL_TRAP_ENTRY_T6_OFF,
+        entry_state_off = const HART_LOCAL_TRAP_ENTRY_STATE_OFF,
         irq_stack_top_off = const HART_LOCAL_IRQ_STACK_TOP_OFF,
         irq_stack_size = const IRQ_STACK_SIZE,
         switch_seq_off = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,

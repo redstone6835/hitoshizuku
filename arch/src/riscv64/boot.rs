@@ -15,14 +15,15 @@
 //!       └─ jr VA ─────────────────►└─ jr __kernel_arch_loader ───►
 //! ```
 //!
-//! 早期页表布局（3 × 4KiB）：
+//! 早期页表布局（4 × 4KiB）：
 //!
 //! ```text
-//!   PGD[0]   → PUD_identity    PUD_identity[0] = 1G leaf → 0x0 (MMIO, RW)
-//!   PGD[511] → PUD_kernel      PUD_identity[2] = 1G leaf → 0x8000_0000 (RWXAD)
-//!                              PUD_identity[3] = 1G leaf → 0xC000_0000 (RWXAD)
-//!                              PUD_kernel[2]   = 1G leaf → 0x8000_0000 (RWXAD)
-//!                              PUD_kernel[3]   = 1G leaf → 0xC000_0000 (RWXAD)
+//!   PGD[0]   → PUD_identity    PUD_identity[0] = 1G leaf → 0x0 (MMIO, RW+NX)
+//!   PGD[511] → PUD_kernel      PUD_identity[2] ─┐
+//!                              PUD_kernel[2]   ──┴→ PMD_ram（512×2MiB，RX/R/RW）
+//!                              PUD_identity[3] = 1G leaf → 0xC000_0000 (RW+NX)
+//!                              PUD_kernel[3]   = 1G leaf → 0xC000_0000 (RW+NX)
+//!                              PUD[* >= 4]     = 仅高端 DTB 所在 1GiB leaf（R+NX，临时）
 //! ```
 
 use core::arch::naked_asm;
@@ -49,26 +50,37 @@ const VA_OFFSET_HI32: usize = 0xFFFF_FF80;
 // PTE flags（Sv48 叶节点）
 /// MMIO 区域：V|R|W|A|D（无 X，防止投机执行 MMIO）
 const PTE_MMIO_LEAF: usize = 0xC7; // 1100_0111
-/// RAM 区域：V|R|W|X|A|D
-const PTE_RAM_LEAF: usize = 0xCF; // 1100_1111
+/// RAM 数据区域：V|R|W|A|D（NX）。
+const PTE_RAM_RW_LEAF: usize = 0xC7;
+/// 内核 text：V|R|X|A。
+const PTE_RAM_RX_LEAF: usize = 0x4B;
+/// 内核 rodata：V|R|A。
+const PTE_RAM_R_LEAF: usize = 0x43;
 /// 非叶 PTE：仅 V 位
 const PTE_NONLEAF_V: usize = 0x01;
 
-/// 首个 1GiB RAM 区域（物理地址 0x8000_0000）的 PPN 高位部分。
-/// 计算方式：(0x8000_0000 >> 12) = 0x20000，通过 lui 指令加载。
-const RAM_BASE_PPN_LUI: usize = 0x20000;
+/// 2 MiB 物理步长换算为 PTE PPN 字段后的增量：2MiB >> 2。
+const PMD_PTE_STEP: usize = 0x8_0000;
+/// loader 的 DTB 固定缓冲区上限；早期临时 leaf 至少要覆盖这么多字节。
+const EARLY_DTB_MAX_SIZE: usize = 2 * 1024 * 1024;
+/// 高端 DTB 临时映射使用 1 GiB PUD leaf，当前逻辑最多补映射相邻的一个 leaf。
+const EARLY_DTB_LEAF_SIZE: usize = 1 << 30;
+const _: () = assert!(EARLY_DTB_MAX_SIZE <= EARLY_DTB_LEAF_SIZE);
+/// DTB 在 leaf 内的偏移大于该值时，还需要映射下一个 leaf。
+const EARLY_DTB_NEXT_LEAF_THRESHOLD: usize =
+    EARLY_DTB_LEAF_SIZE - EARLY_DTB_MAX_SIZE;
 
 /// 后续 1GiB RAM 区域（物理地址 0xC000_0000）的 PPN 高位部分。
 const RAM_UPPER_PPN_LUI: usize = 0x30000;
 
 // ── 早期页表存储 ──────────────────────────────────────────────────────────────
 
-/// 早期启动页表——3 × 4KiB 数组，由 `_start` 汇编代码在物理地址空间填充。
+/// 早期启动页表——PGD、identity PUD、kernel PUD、共享 RAM PMD。
 #[repr(C, align(4096))]
-struct EarlyPageTable([u64; 512 * 3]);
+struct EarlyPageTable([u64; 512 * 4]);
 
 #[unsafe(link_section = ".data.prepage")]
-static EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 3]);
+static EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 4]);
 
 // ── _start ────────────────────────────────────────────────────────────────────
 
@@ -99,10 +111,12 @@ pub unsafe extern "C" fn _start() {
         "add t1, t0, t1",           // t1 = PUD_identity (t0 + 4K)
         "lui t3, 0x2",
         "add t3, t0, t3",           // t3 = PUD_kernel  (t0 + 8K)
+        "lui t4, 0x3",
+        "add t4, t0, t4",           // t4 = PMD_ram     (t0 + 12K)
 
-        // 清零 12KiB（.data 段不保证零初始化）
+        // 清零 16KiB（.data 段不保证零初始化）
         "mv t5, t0",
-        "lui t6, 0x3",
+        "lui t6, 0x4",
         "add t6, t0, t6",
         "2: sd zero, 0(t5)",
         "addi t5, t5, 8",
@@ -116,35 +130,109 @@ pub unsafe extern "C" fn _start() {
         // PGD[511] → PUD_kernel
         "srli t2, t3, 2",
         "ori t2, t2, {pte_nonleaf_v}",
-        "li t4, 511 * 8",
-        "add t4, t0, t4",
-        "sd t2, 0(t4)",
+        "li t5, 511 * 8",
+        "add t5, t0, t5",
+        "sd t2, 0(t5)",
 
         // PUD_identity[0] = 1G → PA 0 (MMIO, RW, no X)
         "li t2, {pte_mmio_leaf}",
         "sd t2, 0(t1)",
 
-        // PUD_identity[2] = 1G → PA 0x8000_0000 (identity)
-        "lui t2, {ram_base_ppn_lui}",
-        "addi t2, t2, {pte_ram_leaf}",
+        // identity 与高半区共享同一张 RAM PMD；叶项仍映射相同 PA。
+        "srli t2, t4, 2",
+        "ori t2, t2, {pte_nonleaf_v}",
         "sd t2, 16(t1)",
-
-        // PUD_identity[3] = 1G → PA 0xC000_0000 (identity, 覆盖 DTB)
-        "lui t2, {ram_upper_ppn_lui}",
-        "addi t2, t2, {pte_ram_leaf}",
-        "sd t2, 24(t1)",
-
-        // PUD_kernel[2] = 1G → PA 0x8000_0000 (高半区)
-        "lui t2, {ram_base_ppn_lui}",
-        "addi t2, t2, {pte_ram_leaf}",
         "sd t2, 16(t3)",
 
-        // PUD_kernel[3] = 1G → PA 0xC000_0000 (高半区, 覆盖 DTB)
+        // PUD[3] = 1G → PA 0xC000_0000，启动期数据/DTB 只需 RW+NX。
         "lui t2, {ram_upper_ppn_lui}",
-        "addi t2, t2, {pte_ram_leaf}",
+        "addi t2, t2, {pte_ram_rw_leaf}",
+        "sd t2, 24(t1)",
         "sd t2, 24(t3)",
 
+        // QEMU 在大内存配置下会把 DTB 放到 4GiB 以上。loader 会先用
+        // phys_to_virt 复制 DTB，因此在正式 direct map 建好前临时映射 DTB 所在
+        // 1GiB leaf。该映射只读、不可执行，且 heap_vm 发布正式页表时会清除。
+        "srli t5, s1, 39",
+        "bnez t5, 99f",           // 当前早期 PGD 只覆盖低 512GiB PA
+        "srli t5, s1, 30",        // DTB 所在 1GiB leaf 索引
+        "li t6, 4",
+        "bltu t5, t6, 8f",        // PA < 4GiB 已由上述固定映射覆盖
+        "srli t2, s1, 30",
+        "slli t2, t2, 28",        // 1GiB-aligned PA >> 2（PTE PPN 字段）
+        "ori t2, t2, {pte_ram_r_leaf}",
+        "slli t6, t5, 3",
+        "add t0, t1, t6",
+        "sd t2, 0(t0)",
+        "add t0, t3, t6",
+        "sd t2, 0(t0)",
+
+        // DTB 缓冲区最大 2MiB；若起点过于靠近 1GiB 边界，同时映射
+        // 下一个 leaf。跨越当前 512GiB 早期窗口时无法安全继续。
+        "li t6, 0x3fffffff",
+        "and t6, s1, t6",
+        "li t0, {early_dtb_next_leaf_threshold}",
+        "bleu t6, t0, 8f",
+        "li t6, 511",
+        "beq t5, t6, 99f",
+        "addi t5, t5, 1",
+        "li t6, 0x10000000",      // 1GiB >> 2
+        "add t2, t2, t6",
+        "slli t6, t5, 3",
+        "add t0, t1, t6",
+        "sd t2, 0(t0)",
+        "add t0, t3, t6",
+        "sd t2, 0(t0)",
+        "8:",
+
+        // 默认把 PA 0x8000_0000..0xC000_0000 建成 512 个 2MiB RW+NX leaf。
+        "li t2, 0x20000000 + {pte_ram_rw_leaf}",
+        "mv t5, t4",
+        "li t6, 512",
+        "3: sd t2, 0(t5)",
+        "addi t5, t5, 8",
+        "li t0, {pmd_pte_step}",
+        "add t2, t2, t0",
+        "addi t6, t6, -1",
+        "bnez t6, 3b",
+
+        // text 所在 2MiB leaves 改成 RX。链接脚本保证 etext 2MiB 对齐。
+        "la t0, {stext}",
+        "li t1, 0x80000000",
+        "sub t0, t0, t1",
+        "srli t0, t0, 21",
+        "la t2, {etext}",
+        "sub t2, t2, t1",
+        "srli t2, t2, 21",
+        "4: bgeu t0, t2, 5f",
+        "slli t5, t0, 3",
+        "add t5, t4, t5",
+        "ld t6, 0(t5)",
+        "andi t6, t6, -1024",
+        "ori t6, t6, {pte_ram_rx_leaf}",
+        "sd t6, 0(t5)",
+        "addi t0, t0, 1",
+        "j 4b",
+
+        // rodata 所在 leaves 改成 R+NX；erodata 同样按 2MiB 对齐。
+        "5:",
+        "mv t0, t2",
+        "la t2, {erodata}",
+        "sub t2, t2, t1",
+        "srli t2, t2, 21",
+        "6: bgeu t0, t2, 7f",
+        "slli t5, t0, 3",
+        "add t5, t4, t5",
+        "ld t6, 0(t5)",
+        "andi t6, t6, -1024",
+        "ori t6, t6, {pte_ram_r_leaf}",
+        "sd t6, 0(t5)",
+        "addi t0, t0, 1",
+        "j 6b",
+        "7:",
+
         // ── 激活 Sv48 ──
+        "la t0, {early_pt}",
         "srli t2, t0, 12",           // PPN
         "li t3, {satp_mode}",
         "slli t3, t3, 60",           // MODE = Sv48
@@ -161,16 +249,33 @@ pub unsafe extern "C" fn _start() {
         "sfence.vma",
         "jr t0",
 
+        // DTB 超出当前早期 Sv48 窗口时不能冒险越界写页表。
+        "99: csrci sstatus, 2",
+        "100: wfi",
+        "j 100b",
+
         virt_entry = sym _start_virtualized,
         early_pt = sym EARLY_PT,
+        stext = sym stext,
+        etext = sym etext,
+        erodata = sym erodata,
         pte_nonleaf_v = const PTE_NONLEAF_V,
         pte_mmio_leaf = const PTE_MMIO_LEAF,
-        pte_ram_leaf = const PTE_RAM_LEAF,
-        ram_base_ppn_lui = const RAM_BASE_PPN_LUI,
+        pte_ram_rw_leaf = const PTE_RAM_RW_LEAF,
+        pte_ram_rx_leaf = const PTE_RAM_RX_LEAF,
+        pte_ram_r_leaf = const PTE_RAM_R_LEAF,
+        pmd_pte_step = const PMD_PTE_STEP,
+        early_dtb_next_leaf_threshold = const EARLY_DTB_NEXT_LEAF_THRESHOLD,
         ram_upper_ppn_lui = const RAM_UPPER_PPN_LUI,
         satp_mode = const (SATP_MODE_SV48 >> 60),
         va_hi32 = const VA_OFFSET_HI32,
     )
+}
+
+unsafe extern "C" {
+    fn stext();
+    fn etext();
+    fn erodata();
 }
 
 // ── _start_virtualized ────────────────────────────────────────────────────────

@@ -25,8 +25,10 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── NS16550A 常量 ─────────────────────────────────────────────────────────────
 
-/// UART 物理地址（QEMU virt 平台 NS16550A）。
-const UART_PHYS: usize = 0x1000_0000;
+/// UART 物理地址 fallback（QEMU virt 平台 NS16550A）。
+const UART_PHYS_FALLBACK: usize = 0x1000_0000;
+/// 当前启动 identity MMIO leaf 只覆盖 PA 0..1 GiB。
+const EARLY_MMIO_PHYS_END: usize = 0x4000_0000;
 
 // NS16550 寄存器偏移
 const THR: usize = 0; // Transmit Holding Register
@@ -48,13 +50,29 @@ const DLM: u8 = 0;
 
 // ── 运行时状态 ────────────────────────────────────────────────────────────────
 
-/// 运行时 UART 基地址，启动后可通过 [`switch_to_virtual`] 更新。
-static BASE: AtomicUsize = AtomicUsize::new(UART_PHYS);
+/// DTB 解析前使用 QEMU fallback，解析后可更新为 `/chosen/stdout-path` 的物理地址。
+static PHYS_BASE: AtomicUsize = AtomicUsize::new(UART_PHYS_FALLBACK);
+/// 运行时 UART 基地址，正式页表建立后切换到 MMIO 高半区。
+static BASE: AtomicUsize = AtomicUsize::new(UART_PHYS_FALLBACK);
 
 /// 是否已完成 16550 硬件初始化。
 static INITED: AtomicBool = AtomicBool::new(false);
 
 // ── 公开 API ──────────────────────────────────────────────────────────────────
+
+/// DTB 可用后更新 early UART 物理地址。
+///
+/// 返回 false 表示地址不在当前 1 GiB identity MMIO leaf 内，调用方应继续使用
+/// QEMU fallback；配置后的下一条日志就会访问该地址，不能等正式 MMIO window 建好。
+pub fn configure_physical_base(paddr: usize) -> bool {
+    if paddr == 0 || paddr >= EARLY_MMIO_PHYS_END {
+        return false;
+    }
+    PHYS_BASE.store(paddr, Ordering::Release);
+    BASE.store(paddr, Ordering::Release);
+    INITED.store(false, Ordering::Release);
+    true
+}
 
 /// 内核页表就绪后调用，将 UART 访问切换到 MMIO 虚拟地址。
 ///
@@ -64,7 +82,9 @@ static INITED: AtomicBool = AtomicBool::new(false);
 /// - MMIO 虚拟映射已建立（新地址可达）
 /// - identity mapping 尚未拆除（旧地址仍可达，确保切换窗口安全）
 pub fn switch_to_virtual() {
-    let vaddr = UART_PHYS.wrapping_add(crate::riscv64::heap_vm::MMIO_VIRT_BASE);
+    let vaddr = PHYS_BASE
+        .load(Ordering::Acquire)
+        .wrapping_add(crate::riscv64::heap_vm::MMIO_VIRT_BASE);
     BASE.store(vaddr, Ordering::Release);
 }
 

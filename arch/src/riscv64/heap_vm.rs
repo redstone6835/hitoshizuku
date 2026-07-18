@@ -37,7 +37,9 @@ use general::{MapError, PagingArch, find_leaf, unmap_range_entries, validate_ran
 use spin::Mutex;
 
 use crate::riscv64::paging::{Riscv64Paging, Riscv64Pte};
-use crate::riscv64::specific::{KERNEL_VA_OFFSET, SATP_MODE_SV48, phys_to_virt};
+use crate::riscv64::specific::{
+    IRQ_STACK_GUARD_SIZE, IRQ_STACK_SIZE, KERNEL_VA_OFFSET, SATP_MODE_SV48, phys_to_virt,
+};
 use crate::riscv64::trap::LocalIrqGuard;
 
 // ── 常量与静态 ──────────────────────────────────────────────────────────────────
@@ -50,6 +52,26 @@ pub const KERNEL_HEAP_BASE: usize = 0xFFFF_FF80_0000_0000;
 /// 对应页表布局中 PGD[511]→PUD[0..1]，每 PUD 覆盖 1 GiB。
 pub const KERNEL_HEAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
+/// debug 构建为页表 map/unmap/rollback 自检保留一个不会交给 vmem 的窗口。
+#[cfg(debug_assertions)]
+const HEAP_VM_SELFTEST_SIZE: usize = 4 * 1024 * 1024;
+#[cfg(not(debug_assertions))]
+const HEAP_VM_SELFTEST_SIZE: usize = 0;
+
+/// heap window 顶部依次保留 debug self-test、guard page 与 boot hart emergency stack，
+/// 因此 allocator 可使用的 heap 区间必须在这些窗口之前结束。
+const EMERGENCY_STACK_WINDOW_SIZE: usize = IRQ_STACK_GUARD_SIZE + IRQ_STACK_SIZE;
+const KERNEL_HEAP_USABLE_SIZE: usize =
+    KERNEL_HEAP_SIZE - HEAP_VM_SELFTEST_SIZE - EMERGENCY_STACK_WINDOW_SIZE;
+const KERNEL_HEAP_USABLE_END: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_USABLE_SIZE;
+#[cfg(debug_assertions)]
+const HEAP_VM_SELFTEST_BASE: usize = KERNEL_HEAP_USABLE_END;
+#[cfg(debug_assertions)]
+const HEAP_VM_SELFTEST_END: usize = HEAP_VM_SELFTEST_BASE + HEAP_VM_SELFTEST_SIZE;
+const EMERGENCY_STACK_GUARD_BASE: usize = KERNEL_HEAP_USABLE_END + HEAP_VM_SELFTEST_SIZE;
+const EMERGENCY_STACK_BASE: usize = EMERGENCY_STACK_GUARD_BASE + IRQ_STACK_GUARD_SIZE;
+const EMERGENCY_STACK_END: usize = EMERGENCY_STACK_BASE + IRQ_STACK_SIZE;
+
 /// MMIO 直接映射基址（PGD[510]，独立于 kernel heap/code）。
 ///
 /// `device_mmio_to_virt(paddr) = paddr + MMIO_VIRT_BASE`。
@@ -58,6 +80,9 @@ pub const MMIO_VIRT_BASE: usize = 0xFFFF_FF00_0000_0000;
 /// 内核 direct map 覆盖物理 RAM 的基址和大小（QEMU virt 默认从 0x80000000 开始）。
 const KERNEL_PHYS_BASE: usize = 0x8000_0000;
 const KERNEL_DIRECT_MAP_SIZE: usize = 0x4000_0000; // 1 GiB
+/// 当前正式页表实际覆盖的 RAM 物理范围：PUD[2] + PUD[3]，共 2 GiB。
+pub const KERNEL_DIRECT_MAP_PHYS_START: usize = KERNEL_PHYS_BASE;
+pub const KERNEL_DIRECT_MAP_PHYS_END: usize = KERNEL_PHYS_BASE + 2 * KERNEL_DIRECT_MAP_SIZE;
 const HEAP_PMD_SIZE: usize = 2 * 1024 * 1024;
 const HEAP_PUD_SIZE: usize = 1024 * 1024 * 1024;
 const PTE_VALID: usize = 1 << 0;
@@ -88,6 +113,14 @@ static MAP_ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
 static TLB_ADDRESS_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 static TLB_GLOBAL_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TABLE_PAGES_RECLAIMED: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_ALLOCATION_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_CORRUPTIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(debug_assertions)]
+const NO_PAGE_TABLE_ALLOCATION_FAILURE: usize = usize::MAX;
+#[cfg(debug_assertions)]
+static FAIL_PAGE_TABLE_ALLOCATION_AFTER: AtomicUsize =
+    AtomicUsize::new(NO_PAGE_TABLE_ALLOCATION_FAILURE);
 
 const TLB_ADDRESS_THRESHOLD: usize = 64;
 const MAX_RECLAIMED_TABLES: usize = KERNEL_HEAP_SIZE / HEAP_PMD_SIZE + 2;
@@ -136,6 +169,8 @@ pub struct KernelHeapVmStats {
     pub tlb_address_flushes: usize,
     pub tlb_global_flushes: usize,
     pub page_table_pages_reclaimed: usize,
+    pub page_table_allocation_failures: usize,
+    pub page_table_corruptions: usize,
 }
 
 pub fn kernel_heap_vm_stats() -> KernelHeapVmStats {
@@ -147,11 +182,178 @@ pub fn kernel_heap_vm_stats() -> KernelHeapVmStats {
         tlb_address_flushes: TLB_ADDRESS_FLUSHES.load(Ordering::Relaxed),
         tlb_global_flushes: TLB_GLOBAL_FLUSHES.load(Ordering::Relaxed),
         page_table_pages_reclaimed: PAGE_TABLE_PAGES_RECLAIMED.load(Ordering::Relaxed),
+        page_table_allocation_failures: PAGE_TABLE_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        page_table_corruptions: PAGE_TABLE_CORRUPTIONS.load(Ordering::Relaxed),
     }
 }
 
 pub fn kernel_heap_region() -> (usize, usize) {
-    (KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE)
+    (KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_SIZE)
+}
+
+fn install_boot_emergency_stack() -> Result<(), MapError> {
+    let request = PhysicalAllocRequest::new(IRQ_STACK_SIZE, PAGE_SIZE);
+    let allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_physical(request)
+        .map_err(|_| MapError::OutOfMemory)?;
+
+    unsafe {
+        crate::riscv64::specific::zero_memory_fast(phys_to_virt(allocation.paddr), IRQ_STACK_SIZE);
+    }
+    let map_result = map_kernel_range_in_window(
+        EMERGENCY_STACK_BASE,
+        allocation.paddr,
+        IRQ_STACK_SIZE,
+        PagePolicy::BaseOnly,
+        EMERGENCY_STACK_BASE,
+        EMERGENCY_STACK_END,
+    );
+    if let Err(err) = map_result {
+        let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
+        return Err(err);
+    }
+
+    let top = EMERGENCY_STACK_END;
+    let hart = crate::riscv64::specific::current_hart_ptr();
+    unsafe {
+        core::ptr::addr_of_mut!((*hart).irq_stack_top).write_volatile(top);
+    }
+    log::info!(
+        "[arch][heap_vm] emergency stack mapped: guard={:#x} stack={:#x}..{:#x}",
+        EMERGENCY_STACK_GUARD_BASE,
+        EMERGENCY_STACK_BASE,
+        top
+    );
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn debug_verify_unpublished_page_table_transactions() {
+    let test_vaddr = KERNEL_HEAP_BASE;
+    let allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
+        .expect("[arch][heap_vm] debug transaction test page allocation failed");
+
+    // heap 的 PUD 项初始为空，建立一个 4 KiB leaf 需要两张下级页表。分别在
+    // 第一次和第二次分配处失败，验证私有子树不会被提前发布。
+    for successful_allocations_before_failure in 0..=1usize {
+        FAIL_PAGE_TABLE_ALLOCATION_AFTER
+            .store(successful_allocations_before_failure, Ordering::Relaxed);
+        let result = map_kernel_heap_range(
+            test_vaddr,
+            allocation.paddr,
+            PAGE_SIZE,
+            PagePolicy::BaseOnly,
+        );
+        assert!(
+            matches!(result, Err(MapError::OutOfMemory)),
+            "[arch][heap_vm] injected allocation failure returned {result:?}"
+        );
+        assert!(
+            kernel_virt_to_phys(test_vaddr).is_err(),
+            "[arch][heap_vm] failed private page-table branch became reachable"
+        );
+    }
+
+    FAIL_PAGE_TABLE_ALLOCATION_AFTER.store(NO_PAGE_TABLE_ALLOCATION_FAILURE, Ordering::Relaxed);
+    allocator::KERNEL_ALLOCATOR
+        .try_free_physical(allocation)
+        .expect("[arch][heap_vm] debug transaction test page free failed");
+    log::info!("[arch][heap_vm] unpublished page-table fault injection passed");
+}
+
+/// allocator registry 激活后运行发布/回滚/回收自检。
+///
+/// 该函数只能从启动后期的 arch 注册点调用；专用虚拟窗口不会暴露给 vmem，避免
+/// 自检踩到已经分配的 kernel heap range。
+#[cfg(debug_assertions)]
+pub(crate) fn debug_verify_heap_mapping_transactions() {
+    assert!(
+        allocator::KERNEL_ALLOCATOR.is_active(),
+        "[arch][heap_vm] late transaction self-test ran before allocator activation"
+    );
+    let test_vaddr = (HEAP_VM_SELFTEST_BASE + HEAP_PMD_SIZE - 1) & !(HEAP_PMD_SIZE - 1);
+    assert!(
+        test_vaddr + HEAP_PMD_SIZE + PAGE_SIZE <= HEAP_VM_SELFTEST_END,
+        "[arch][heap_vm] debug self-test window is too small"
+    );
+    let allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
+        .expect("[arch][heap_vm] debug reclaim test page allocation failed");
+
+    // 重复发布、解除映射并回收空 PT。PUD/PMD 同时承载顶部 emergency stack，
+    // 因此这里只要求每轮回收 self-test leaf 所属的 PT，并在释放前全局 flush。
+    const RECLAIM_CYCLES: usize = 3;
+    let reclaimed_before = PAGE_TABLE_PAGES_RECLAIMED.load(Ordering::Relaxed);
+    let global_flushes_before = TLB_GLOBAL_FLUSHES.load(Ordering::Relaxed);
+    for _ in 0..RECLAIM_CYCLES {
+        map_kernel_range_in_window(
+            test_vaddr,
+            allocation.paddr,
+            PAGE_SIZE,
+            PagePolicy::BaseOnly,
+            HEAP_VM_SELFTEST_BASE,
+            HEAP_VM_SELFTEST_END,
+        )
+        .expect("[arch][heap_vm] debug transaction test map failed");
+        let translated = kernel_virt_to_phys(test_vaddr)
+            .expect("[arch][heap_vm] debug transaction test translation missing");
+        assert_eq!(
+            translated, allocation.paddr,
+            "[arch][heap_vm] debug transaction test translation mismatch"
+        );
+        unmap_kernel_range_in_window(
+            test_vaddr,
+            PAGE_SIZE,
+            HEAP_VM_SELFTEST_BASE,
+            HEAP_VM_SELFTEST_END,
+        )
+        .expect("[arch][heap_vm] debug transaction test unmap failed");
+        assert!(kernel_virt_to_phys(test_vaddr).is_err());
+    }
+    assert!(
+        PAGE_TABLE_PAGES_RECLAIMED.load(Ordering::Relaxed) >= reclaimed_before + RECLAIM_CYCLES,
+        "[arch][heap_vm] empty PT pages were not reclaimed"
+    );
+    assert!(
+        TLB_GLOBAL_FLUSHES.load(Ordering::Relaxed) >= global_flushes_before + RECLAIM_CYCLES,
+        "[arch][heap_vm] page-table reclaim skipped the global TLB flush"
+    );
+    allocator::KERNEL_ALLOCATOR
+        .try_free_physical(allocation)
+        .expect("[arch][heap_vm] debug transaction test page free failed");
+
+    // 让连续两页跨过 2 MiB 边界：第一页发布完整 PMD+PT，第二页需要再分配一张
+    // PT。第二次页表分配注入失败后，整段映射必须回滚，不能留下第一片 leaf。
+    let rollback_vaddr = test_vaddr - PAGE_SIZE;
+    let rollback_allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_physical(PhysicalAllocRequest::new(2 * PAGE_SIZE, PAGE_SIZE))
+        .expect("[arch][heap_vm] debug partial-rollback allocation failed");
+    let rollbacks_before = MAP_ROLLBACKS.load(Ordering::Relaxed);
+    FAIL_PAGE_TABLE_ALLOCATION_AFTER.store(1, Ordering::Relaxed);
+    let result = map_kernel_range_in_window(
+        rollback_vaddr,
+        rollback_allocation.paddr,
+        2 * PAGE_SIZE,
+        PagePolicy::BaseOnly,
+        HEAP_VM_SELFTEST_BASE,
+        HEAP_VM_SELFTEST_END,
+    );
+    FAIL_PAGE_TABLE_ALLOCATION_AFTER.store(NO_PAGE_TABLE_ALLOCATION_FAILURE, Ordering::Relaxed);
+    assert!(
+        matches!(result, Err(MapError::OutOfMemory)),
+        "[arch][heap_vm] partial-map failure injection returned {result:?}"
+    );
+    assert!(kernel_virt_to_phys(rollback_vaddr).is_err());
+    assert!(kernel_virt_to_phys(rollback_vaddr + PAGE_SIZE).is_err());
+    assert!(
+        MAP_ROLLBACKS.load(Ordering::Relaxed) > rollbacks_before,
+        "[arch][heap_vm] partial mapping did not record a rollback"
+    );
+    allocator::KERNEL_ALLOCATOR
+        .try_free_physical(rollback_allocation)
+        .expect("[arch][heap_vm] debug partial-rollback page free failed");
+    log::info!("[arch][heap_vm] published map rollback/reclaim self-test passed");
 }
 
 pub fn kernel_virt_to_phys(vaddr: usize) -> Result<usize, MapError> {
@@ -182,10 +384,38 @@ fn with_kernel_heap_page_table_lock<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn alloc_page_table_allocation() -> Result<PhysicalAllocation, MapError> {
+    #[cfg(debug_assertions)]
+    {
+        let remaining = FAIL_PAGE_TABLE_ALLOCATION_AFTER.load(Ordering::Relaxed);
+        if remaining != NO_PAGE_TABLE_ALLOCATION_FAILURE {
+            if remaining == 0 {
+                PAGE_TABLE_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return Err(MapError::OutOfMemory);
+            }
+            FAIL_PAGE_TABLE_ALLOCATION_AFTER.store(remaining - 1, Ordering::Relaxed);
+        }
+    }
+
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
     allocator::KERNEL_ALLOCATOR
         .allocate_physical(request)
-        .map_err(|_| MapError::OutOfMemory)
+        .map_err(|_| {
+            PAGE_TABLE_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            MapError::OutOfMemory
+        })
+}
+
+fn checked_page_table_virt(paddr: usize) -> Result<usize, MapError> {
+    let end = paddr.checked_add(PAGE_SIZE).ok_or(MapError::NotMapped)?;
+    if paddr < KERNEL_DIRECT_MAP_PHYS_START
+        || end > KERNEL_DIRECT_MAP_PHYS_END
+        || paddr % PAGE_SIZE != 0
+    {
+        PAGE_TABLE_CORRUPTIONS.fetch_add(1, Ordering::Relaxed);
+        log::error!("[arch][heap_vm] corrupt non-leaf PTE points outside direct map: {paddr:#x}");
+        return Err(MapError::NotMapped);
+    }
+    Ok(phys_to_virt(paddr))
 }
 
 fn free_page_table_allocation(allocation: PhysicalAllocation) {
@@ -239,7 +469,7 @@ fn walk_and_map_heap(
             if Riscv64Paging::pte_is_leaf(pte) {
                 return Err(MapError::AlreadyMapped);
             }
-            table_vaddr = phys_to_virt(Riscv64Paging::pte_addr(pte));
+            table_vaddr = checked_page_table_virt(Riscv64Paging::pte_addr(pte))?;
             continue;
         }
 
@@ -358,14 +588,18 @@ fn locate_early_page_tables() -> EarlyPageTableLayout {
         );
     }
 
-    for index in 2..=3usize {
-        let direct_map_pte = Riscv64Pte(unsafe { core::ptr::read_volatile(pud_kernel.add(index)) });
-        assert!(
-            Riscv64Paging::pte_is_valid(direct_map_pte)
-                && Riscv64Paging::pte_is_leaf(direct_map_pte),
-            "[arch][heap_vm] early PUD[{index}] is not the expected 1 GiB leaf"
-        );
-    }
+    let lower_direct_map = Riscv64Pte(unsafe { core::ptr::read_volatile(pud_kernel.add(2)) });
+    assert!(
+        Riscv64Paging::pte_is_valid(lower_direct_map)
+            && !Riscv64Paging::pte_is_leaf(lower_direct_map),
+        "[arch][heap_vm] early PUD[2] is not the expected PMD table"
+    );
+    let upper_direct_map = Riscv64Pte(unsafe { core::ptr::read_volatile(pud_kernel.add(3)) });
+    assert!(
+        Riscv64Paging::pte_is_valid(upper_direct_map)
+            && Riscv64Paging::pte_is_leaf(upper_direct_map),
+        "[arch][heap_vm] early PUD[3] is not the expected 1 GiB leaf"
+    );
 
     let mmio_pgd = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd.add(510)) });
     assert!(
@@ -473,6 +707,11 @@ fn publish_kernel_page_tables(
     unsafe {
         // 子页表初始化必须先于父 PTE 发布对硬件 page walker 可见。
         core::arch::asm!("fence w, w");
+        // boot 可能为 4GiB 以上 DTB 临时安装 PUD leaf。DTB 已复制到
+        // 内核缓冲区，正式 direct map 只保留 PUD[2..3]，其余高端 leaf 必须清掉。
+        for index in 4..Riscv64Paging::ENTRIES_PER_TABLE {
+            core::ptr::write_volatile(layout.pud_kernel.add(index), 0);
+        }
         core::ptr::write_volatile(layout.pgd.add(510), mmio_pgd_pte.bits());
         // PUD[3] 不包含内核代码，启动完成后收敛为 RW+NX。
         core::ptr::write_volatile(layout.pud_kernel.add(3), upper_ram_leaf.bits());
@@ -526,6 +765,10 @@ pub fn init_kernel_page_table() {
     );
 
     KERNEL_PAGE_TABLE_ROOT.store(layout.root_paddr, Ordering::Release);
+    #[cfg(debug_assertions)]
+    debug_verify_unpublished_page_table_transactions();
+    install_boot_emergency_stack()
+        .unwrap_or_else(|err| panic!("[arch][heap_vm] emergency stack setup failed: {err:?}"));
     verify_kernel_segments(layout.root_paddr);
 
     // MMIO 映射就绪后 UART 不再依赖低地址，identity mapping 才可安全拆除。
@@ -718,7 +961,13 @@ fn verify_kernel_segments(root_paddr: usize) {
     );
 }
 
-fn validate_heap_range(vaddr: usize, paddr: Option<usize>, size: usize) -> Result<(), MapError> {
+fn validate_mapping_range(
+    vaddr: usize,
+    paddr: Option<usize>,
+    size: usize,
+    allowed_start: usize,
+    allowed_end: usize,
+) -> Result<(), MapError> {
     if size == 0 || vaddr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
         return Err(MapError::Misaligned);
     }
@@ -727,14 +976,14 @@ fn validate_heap_range(vaddr: usize, paddr: Option<usize>, size: usize) -> Resul
     }
 
     let end_vaddr = vaddr.checked_add(size).ok_or(MapError::NotMapped)?;
-    let heap_end = KERNEL_HEAP_BASE
-        .checked_add(KERNEL_HEAP_SIZE)
-        .ok_or(MapError::NotMapped)?;
-    if vaddr < KERNEL_HEAP_BASE || end_vaddr > heap_end {
+    if vaddr < allowed_start || end_vaddr > allowed_end {
         return Err(MapError::NotMapped);
     }
     if let Some(addr) = paddr {
-        addr.checked_add(size).ok_or(MapError::NotMapped)?;
+        let end = addr.checked_add(size).ok_or(MapError::NotMapped)?;
+        if addr < KERNEL_DIRECT_MAP_PHYS_START || end > KERNEL_DIRECT_MAP_PHYS_END {
+            return Err(MapError::NotMapped);
+        }
     }
     Ok(())
 }
@@ -932,8 +1181,10 @@ fn map_range_with_policy(
     paddr: usize,
     size: usize,
     page_policy: PagePolicy,
+    allowed_start: usize,
+    allowed_end: usize,
 ) -> Result<(), MapError> {
-    validate_heap_range(vaddr, Some(paddr), size)?;
+    validate_mapping_range(vaddr, Some(paddr), size, allowed_start, allowed_end)?;
 
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     if root_paddr == 0 {
@@ -948,7 +1199,14 @@ fn map_range_with_policy(
         }
         if page_policy == PagePolicy::PreferLarge {
             LARGE_PAGE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            return map_range_with_policy(vaddr, paddr, size, PagePolicy::BaseOnly);
+            return map_range_with_policy(
+                vaddr,
+                paddr,
+                size,
+                PagePolicy::BaseOnly,
+                allowed_start,
+                allowed_end,
+            );
         }
     }
 
@@ -982,7 +1240,14 @@ fn map_range_with_policy(
 
             if page_policy == PagePolicy::PreferLarge && matches!(err, MapError::AlreadyMapped) {
                 LARGE_PAGE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                return map_range_with_policy(vaddr, paddr, size, PagePolicy::BaseOnly);
+                return map_range_with_policy(
+                    vaddr,
+                    paddr,
+                    size,
+                    PagePolicy::BaseOnly,
+                    allowed_start,
+                    allowed_end,
+                );
             }
             return Err(err);
         }
@@ -1063,20 +1328,48 @@ pub(crate) fn flush_kernel_tlb_addr(vaddr: usize) {
     }
 }
 
+fn map_kernel_range_in_window(
+    vaddr: usize,
+    paddr: usize,
+    size: usize,
+    page_policy: PagePolicy,
+    allowed_start: usize,
+    allowed_end: usize,
+) -> Result<(), MapError> {
+    validate_mapping_range(vaddr, Some(paddr), size, allowed_start, allowed_end)?;
+    with_kernel_heap_page_table_lock(|| {
+        map_range_with_policy(vaddr, paddr, size, page_policy, allowed_start, allowed_end)
+    })
+}
+
+fn unmap_kernel_range_in_window(
+    vaddr: usize,
+    size: usize,
+    allowed_start: usize,
+    allowed_end: usize,
+) -> Result<(), MapError> {
+    validate_mapping_range(vaddr, None, size, allowed_start, allowed_end)?;
+    with_kernel_heap_page_table_lock(|| unmap_kernel_heap_range_locked(vaddr, size))
+}
+
 pub fn map_kernel_heap_range(
     vaddr: usize,
     paddr: usize,
     size: usize,
     page_policy: PagePolicy,
 ) -> Result<(), MapError> {
-    validate_heap_range(vaddr, Some(paddr), size)?;
-    with_kernel_heap_page_table_lock(|| map_range_with_policy(vaddr, paddr, size, page_policy))
+    map_kernel_range_in_window(
+        vaddr,
+        paddr,
+        size,
+        page_policy,
+        KERNEL_HEAP_BASE,
+        KERNEL_HEAP_USABLE_END,
+    )
 }
 
 pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> Result<(), MapError> {
-    validate_heap_range(vaddr, None, size)?;
-
-    with_kernel_heap_page_table_lock(|| unmap_kernel_heap_range_locked(vaddr, size))
+    unmap_kernel_range_in_window(vaddr, size, KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END)
 }
 
 fn unmap_kernel_heap_range_locked(vaddr: usize, size: usize) -> Result<(), MapError> {

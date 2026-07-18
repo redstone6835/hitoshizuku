@@ -31,8 +31,15 @@ pub struct HartLocal {
     pub kernel_gp: usize,
     /// 紧急栈栈顶（高地址端）。仅最终 return-to-user 窗口中的 S-mode trap 使用。
     pub irq_stack_top: usize,
+    /// trap 入口在使用临时寄存器前保存原始 t4。
+    pub trap_entry_t4: usize,
     /// trap 入口在读取 SPP 前暂存原始 t5；仅由当前 hart、关中断窗口访问。
     pub trap_entry_t5: usize,
+    /// `csrrw t6, sscratch, t6` 后暂存被覆盖的原始 t6。
+    pub trap_entry_t6: usize,
+    /// 仅标记 trap 入口/返回的脆弱汇编窗口：0=稳定，1=窗口内，2=已进入 fatal。
+    /// Rust handler 执行前必须清零，避免调度切换期间产生伪嵌套。
+    pub trap_entry_state: usize,
     /// 每次内核任务上下文切换递增。syscall fast return 用它判断 live FPU
     /// 寄存器是否仍属于入口时的任务；仅由当前 hart 在关中断调度路径写入。
     pub context_switch_seq: usize,
@@ -50,7 +57,10 @@ pub const IRQ_STACK_ALLOCATION_SIZE: usize = IRQ_STACK_GUARD_SIZE + IRQ_STACK_SI
 pub const HART_LOCAL_KERNEL_STACK_TOP_OFF: usize = offset_of!(HartLocal, kernel_stack_top);
 pub const HART_LOCAL_KERNEL_GP_OFF: usize = offset_of!(HartLocal, kernel_gp);
 pub const HART_LOCAL_IRQ_STACK_TOP_OFF: usize = offset_of!(HartLocal, irq_stack_top);
+pub const HART_LOCAL_TRAP_ENTRY_T4_OFF: usize = offset_of!(HartLocal, trap_entry_t4);
 pub const HART_LOCAL_TRAP_ENTRY_T5_OFF: usize = offset_of!(HartLocal, trap_entry_t5);
+pub const HART_LOCAL_TRAP_ENTRY_T6_OFF: usize = offset_of!(HartLocal, trap_entry_t6);
+pub const HART_LOCAL_TRAP_ENTRY_STATE_OFF: usize = offset_of!(HartLocal, trap_entry_state);
 pub const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF: usize = offset_of!(HartLocal, context_switch_seq);
 
 /// 全部 hart 的紧急栈（静态分配，按 hart index 索引）。低地址端第一页仅作缓冲。
@@ -67,7 +77,8 @@ pub(crate) static mut IRQ_STACKS: [IrqStack; MAX_HARTS] = {
 /// # Safety
 ///
 /// boot 阶段初始化固定字段；运行期仅当前 hart 通过 tp 裸指针或 trap 汇编更新
-/// `kernel_stack_top` / `trap_entry_t5`，不得为整块对象构造长期共享引用。
+/// `kernel_stack_top` / `trap_entry_t4..t6` / `trap_entry_state`，不得为整块对象构造
+/// 长期共享引用。
 pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
     const EMPTY: HartLocal = HartLocal {
         hart_id: 0,
@@ -75,7 +86,10 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
         preempt_count: 0,
         kernel_gp: 0,
         irq_stack_top: 0,
+        trap_entry_t4: 0,
         trap_entry_t5: 0,
+        trap_entry_t6: 0,
+        trap_entry_state: 0,
         context_switch_seq: 0,
     };
     [EMPTY; MAX_HARTS]
@@ -125,9 +139,8 @@ pub unsafe fn set_current_kernel_stack_top(stack_top: usize) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
 }
 
-/// 最终返回窗口的紧急栈使用完毕后检查低地址缓冲区。
-///
-/// 该检查不替代栈大小预算，但能在越界继续破坏相邻静态对象前尽早终止。
+/// 最终返回窗口的紧急栈使用完毕后检查当前 SP 是否仍位于映射区。
+/// 低地址 guard page 在正式页表建立后保持未映射，不能再通过读取零缓冲检查。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_check_irq_stack_guard() {
     let ptr = current_hart_ptr();
@@ -136,17 +149,26 @@ pub extern "C" fn riscv64_check_irq_stack_guard() {
         return;
     }
 
-    let guard_start = top - IRQ_STACK_SIZE - IRQ_STACK_GUARD_SIZE;
-    let guard_end = guard_start + IRQ_STACK_GUARD_SIZE;
-    let mut cursor = guard_start;
-    while cursor < guard_end {
-        let value = unsafe { core::ptr::read_volatile(cursor as *const usize) };
-        assert_eq!(
-            value, 0,
-            "RISC-V emergency trap stack overflowed into its guard buffer"
-        );
-        cursor += core::mem::size_of::<usize>();
+    let sp: usize;
+    unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack)) };
+    let bottom = top.saturating_sub(IRQ_STACK_SIZE);
+    if sp < bottom || sp >= top {
+        riscv64_double_fault();
     }
+}
+
+/// trap 入口或最终返回窗口再次 fault 时使用的最小停机路径。
+/// 不格式化、不分配、不获取调度器或普通日志锁。
+#[unsafe(no_mangle)]
+pub extern "C" fn riscv64_double_fault() -> ! {
+    crate::riscv64::early_console::e_write_bytes(b"\n[arch][trap] fatal nested trap\n");
+    crate::riscv64::sbi::emergency_shutdown()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn riscv64_fatal_trap_shutdown() -> ! {
+    crate::riscv64::early_console::e_write_bytes(b"\n[arch][trap] fatal trap shutdown\n");
+    crate::riscv64::sbi::emergency_shutdown()
 }
 
 #[inline]

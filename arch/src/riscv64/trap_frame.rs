@@ -3,13 +3,12 @@
 //! 字段按 trap entry 汇编的 sd 顺序排列，不可重排（实测重排导致 60% 性能退化，
 //! 原因是 CPU store buffer 对顺序写入有优化）。
 //
-// TODO（V 扩展）：支持 RISC-V Vector 扩展上下文保存/恢复。需要在 TrapFrame 中
-// 预留 vl/vtype/vstart + v0-v31 空间，并采用 lazy 策略（VS=Off，首次使用时
-// trap 进来再保存前一任务的向量状态）。
+// Vector 状态由 `vector.rs` 中的任务扩展对象独立维护。TrapFrame 只保留 VS
+// 状态位，不能在这里重复嵌入可变大小的 v0-v31 保存区。
 
 use core::mem::offset_of;
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrapFrame {
     pub ra: usize,  // x1
@@ -117,3 +116,60 @@ pub const SATP_OFFSET: usize = offset_of!(TrapFrame, satp);
 pub const KSTACK_TOP_OFFSET: usize = offset_of!(TrapFrame, kstack_top);
 pub const F_OFFSET: usize = offset_of!(TrapFrame, f);
 pub const FCSR_OFFSET: usize = offset_of!(TrapFrame, fcsr);
+
+const _: () = {
+    let raw_size = core::mem::size_of::<TrapFrame>();
+    let word = core::mem::size_of::<usize>();
+    let word_offsets = [
+        RA_OFFSET,
+        TP_OFFSET,
+        SP_OFFSET,
+        GP_OFFSET,
+        T0_OFFSET,
+        T1_OFFSET,
+        T2_OFFSET,
+        S0_OFFSET,
+        S1_OFFSET,
+        A0_OFFSET,
+        A1_OFFSET,
+        A2_OFFSET,
+        A3_OFFSET,
+        A4_OFFSET,
+        A5_OFFSET,
+        A6_OFFSET,
+        A7_OFFSET,
+        S2_OFFSET,
+        S3_OFFSET,
+        S4_OFFSET,
+        S5_OFFSET,
+        S6_OFFSET,
+        S7_OFFSET,
+        S8_OFFSET,
+        S9_OFFSET,
+        S10_OFFSET,
+        S11_OFFSET,
+        T3_OFFSET,
+        T4_OFFSET,
+        T5_OFFSET,
+        T6_OFFSET,
+        SEPC_OFFSET,
+        STATUS_OFFSET,
+        CAUSE_OFFSET,
+        TVAL_OFFSET,
+        SATP_OFFSET,
+        KSTACK_TOP_OFFSET,
+    ];
+    assert!(FRAME_SIZE % 16 == 0);
+    assert!(core::mem::align_of::<TrapFrame>() == 16);
+    assert!(raw_size <= FRAME_SIZE);
+    assert!(FRAME_SIZE - raw_size < 16);
+    let mut index = 0usize;
+    while index < word_offsets.len() {
+        assert!(word_offsets[index] == index * word);
+        index += 1;
+    }
+    assert!(F_OFFSET == word_offsets.len() * word);
+    assert!(F_OFFSET % core::mem::align_of::<u64>() == 0);
+    assert!(FCSR_OFFSET == F_OFFSET + 32 * core::mem::size_of::<u64>());
+    assert!(raw_size == FCSR_OFFSET + 2 * core::mem::size_of::<u32>());
+};
