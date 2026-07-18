@@ -1,7 +1,6 @@
-//! 内核构建脚本：校验并打包当前目标架构的 initramfs。
+//! 内核构建脚本。
 //!
-//! 用户态 rootfs 的生成由顶层 Makefile 编排；这里仅把 Cargo 当前目标需要的
-//! rootfs 打包为架构专属 CPIO，并把路径暴露给内核源码的 `include_bytes!`。
+//! 本脚本只校验并嵌入调用方已经准备好的 initramfs，不负责构建任何用户态内容。
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -19,30 +18,19 @@ fn main() {
     generate_elm_build_bound(&root, &out_dir, &target);
     link_integrated_components();
 
-    let initramfs_root = env_path("INITRAMFS_ROOT", &root).unwrap_or_else(|| {
-        root.join(
-            default_rootfs_dir(&target)
-                .unwrap_or_else(|| panic!("不支持的目标 {target}，必须显式设置 INITRAMFS_ROOT")),
-        )
-    });
-    let initramfs_cpio = env_path("INITRAMFS_CPIO", &root).unwrap_or_else(|| {
-        root.join(
-            default_initramfs_cpio(&target)
-                .unwrap_or_else(|| panic!("不支持的目标 {target}，必须显式设置 INITRAMFS_CPIO")),
-        )
-    });
-
-    pack_initramfs(&initramfs_root, &initramfs_cpio);
-
-    println!("cargo:rerun-if-env-changed=INITRAMFS_ROOT");
-    println!("cargo:rerun-if-env-changed=INITRAMFS_CPIO");
+    println!("cargo:rerun-if-env-changed=INITRAMFS");
     println!("cargo:rerun-if-env-changed=ELM_TRUST_ANCHORS_FILE");
     println!("cargo:rerun-if-env-changed=ELM_BUILD_BOUND_MANIFEST");
-    emit_initramfs_rerun_inputs(&initramfs_root);
-    println!(
-        "cargo:rustc-env=MYGO_INITRAMFS_CPIO={}",
-        initramfs_cpio.display()
-    );
+    if std::env::var_os("CARGO_FEATURE_EMBEDDED_INITRAMFS").is_some() {
+        let initramfs = env_path("INITRAMFS", &root)
+            .unwrap_or_else(|| panic!("启用 embedded-initramfs 时必须设置 INITRAMFS"));
+        validate_initramfs(&initramfs);
+        println!("cargo:rerun-if-changed={}", initramfs.display());
+        println!(
+            "cargo:rustc-env=MYGO_INITRAMFS_CPIO={}",
+            initramfs.display()
+        );
+    }
     println!("cargo:rustc-env=ELM_TARGET_TRIPLE={target}");
     println!("cargo:rustc-env=ELM_RUSTC_VERSION={}", rustc_version_line());
 }
@@ -404,74 +392,18 @@ fn env_path(name: &str, root: &Path) -> Option<PathBuf> {
     })
 }
 
-fn default_rootfs_dir(target: &str) -> Option<&'static str> {
-    if target.starts_with("loongarch64") {
-        Some("userland/rootfs-la")
-    } else if target.starts_with("riscv64") {
-        Some("userland/rootfs-rv")
-    } else {
-        None
-    }
-}
-
-fn default_initramfs_cpio(target: &str) -> Option<&'static str> {
-    if target.starts_with("loongarch64") {
-        Some("build/initramfs-la.cpio")
-    } else if target.starts_with("riscv64") {
-        Some("build/initramfs-rv.cpio")
-    } else {
-        None
-    }
-}
-
-fn pack_initramfs(src: &Path, out_cpio: &Path) {
-    if !src.is_dir() {
-        panic!("initramfs 根目录不存在或不是目录：{src:?}");
-    }
-    let parent = out_cpio
-        .parent()
-        .unwrap_or_else(|| panic!("initramfs 输出路径没有父目录：{out_cpio:?}"));
-    std::fs::create_dir_all(parent)
-        .unwrap_or_else(|err| panic!("创建 initramfs 输出目录 {parent:?} 失败：{err}"));
-
-    run_cmd(Command::new("sh").arg("-c").arg(&format!(
-        "cd {} && find . -print0 | cpio --quiet -o -0 -H newc > {}",
-        shell_quote(src),
-        shell_quote(out_cpio)
-    )));
-}
-
-fn emit_initramfs_rerun_inputs(root: &Path) {
-    // Cargo 对目录的 rerun-if-changed 不是递归语义。initramfs 里 rcS、
-    // busybox applet 链接等任一文件变更都必须触发重新打包，否则内嵌
-    // cpio 会继续使用旧内容，启动行为和源码工作区不一致。
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        println!("cargo:rerun-if-changed={}", path.display());
-        if !path.is_dir() {
-            continue;
-        }
-        let mut entries = std::fs::read_dir(&path)
-            .unwrap_or_else(|err| panic!("读取 initramfs 目录 {path:?} 失败：{err}"))
-            .map(|entry| {
-                entry.unwrap_or_else(|err| panic!("读取 initramfs 目录项 {path:?} 失败：{err}"))
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries.into_iter().rev() {
-            stack.push(entry.path());
-        }
-    }
-}
-
-fn shell_quote(path: &Path) -> String {
-    let raw = path.as_os_str().to_string_lossy();
-    format!("'{}'", raw.replace('\'', "'\\''"))
-}
-
-fn run_cmd(cmd: &mut Command) {
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| panic!("启动命令 {cmd:?} 失败：{e}"));
-    assert!(status.success(), "命令 {cmd:?} 退出状态异常：{status:?}");
+fn validate_initramfs(path: &Path) {
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|err| panic!("读取 initramfs {path:?} 失败：{err}"));
+    assert!(!bytes.is_empty(), "initramfs 不能为空：{path:?}");
+    assert!(
+        bytes.starts_with(b"070701") || bytes.starts_with(b"070702"),
+        "initramfs 不是 newc CPIO：{path:?}"
+    );
+    assert!(
+        bytes
+            .windows(b"TRAILER!!!".len())
+            .any(|window| window == b"TRAILER!!!"),
+        "initramfs 缺少 newc 结束记录：{path:?}"
+    );
 }

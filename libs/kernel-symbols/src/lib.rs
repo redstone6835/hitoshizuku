@@ -677,6 +677,11 @@ pub const KERNEL_INTEGRATED_COMPONENT_MAGIC: u64 = u64::from_le_bytes(*b"KINIT00
 /// 集成组件描述符 ABI 版本。
 pub const KERNEL_INTEGRATED_COMPONENT_ABI_V1: u16 = 1;
 
+/// 集成组件在设备枚举前执行。
+pub const KERNEL_INTEGRATED_PHASE_DEVICE: u16 = 1;
+/// 集成组件在调度器基础环境建立后执行。
+pub const KERNEL_INTEGRATED_PHASE_RUNTIME: u16 = 2;
+
 /// 直接链接进内核镜像的普通组件初始化入口。
 pub type KernelIntegratedInit = fn() -> i32;
 /// 直接链接进内核镜像的普通组件终结入口。
@@ -695,8 +700,10 @@ pub struct KernelIntegratedComponentV1 {
     pub abi_version: u16,
     /// 当前结构完整长度。
     pub struct_size: u16,
+    /// 初始化阶段。
+    pub phase: u16,
     /// v1 必须为零。
-    pub flags: u32,
+    pub flags: u16,
     /// 组件编译时使用的内核 API Profile 摘要。
     pub interface_hash: [u8; 32],
     /// 普通内核初始化入口。
@@ -711,11 +718,13 @@ impl KernelIntegratedComponentV1 {
         initialize: KernelIntegratedInit,
         finalize: KernelIntegratedFinalize,
         interface_hash: [u8; 32],
+        phase: u16,
     ) -> Self {
         Self {
             magic: KERNEL_INTEGRATED_COMPONENT_MAGIC,
             abi_version: KERNEL_INTEGRATED_COMPONENT_ABI_V1,
             struct_size: core::mem::size_of::<Self>() as u16,
+            phase,
             flags: 0,
             interface_hash,
             initialize,
@@ -729,6 +738,10 @@ impl KernelIntegratedComponentV1 {
             && self.abi_version == KERNEL_INTEGRATED_COMPONENT_ABI_V1
             && self.struct_size as usize == core::mem::size_of::<Self>()
             && self.flags == 0
+            && matches!(
+                self.phase,
+                KERNEL_INTEGRATED_PHASE_DEVICE | KERNEL_INTEGRATED_PHASE_RUNTIME
+            )
             && self.interface_hash != [0; 32]
             && self.interface_hash == interface_hash
             && self.initialize as usize != 0
@@ -1270,10 +1283,23 @@ mod tests {
         }
 
         let profile = [0x5a; 32];
-        let component = KernelIntegratedComponentV1::new(initialize, finalize, profile);
+        let component = KernelIntegratedComponentV1::new(
+            initialize,
+            finalize,
+            profile,
+            KERNEL_INTEGRATED_PHASE_RUNTIME,
+        );
 
         assert!(component.valid(profile));
         assert!(!component.valid([0xa5; 32]));
-        assert!(!KernelIntegratedComponentV1::new(initialize, finalize, [0; 32]).valid([0; 32]));
+        assert!(
+            !KernelIntegratedComponentV1::new(
+                initialize,
+                finalize,
+                [0; 32],
+                KERNEL_INTEGRATED_PHASE_RUNTIME,
+            )
+            .valid([0; 32])
+        );
     }
 }

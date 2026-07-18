@@ -291,6 +291,7 @@ pub struct CharFunction {
     dev: CharDevice,
 }
 
+#[kernel_symbols::export]
 impl CharFunction {
     /// 创建一个字符设备 function。
     pub fn new(dev_name: &str, dev: CharDevice) -> Self {
@@ -307,6 +308,22 @@ impl CharFunction {
             projection_name: projection_name.into(),
             dev,
         }
+    }
+
+    /// 在常驻内核侧完成字符设备 function 的类型擦除。
+    #[kernel_symbols::export(
+        name = "general.dev.function.CharFunction.with_projection_name_arc",
+        contract = "kernel.general.device-function@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn with_projection_name_arc(
+        dev_name: &str,
+        projection_name: &str,
+        dev: CharDevice,
+    ) -> Arc<dyn DeviceFunction> {
+        Arc::new(Self::with_projection_name(dev_name, projection_name, dev))
     }
 
     /// 返回内部字符设备句柄。
@@ -430,8 +447,8 @@ impl DeviceFunction for BlockFunction {
 /// # 示例
 ///
 /// ```rust,ignore
-/// // 网络设备：function_as::<NetFunction>(func).map(|nf| nf.dev())
-/// // 块设备：  function_as::<BlockFunction>(func).map(|bf| bf.dev())
+/// // 自定义传感器：function_as::<SensorFunction>(func).map(|sensor| sensor.device())
+/// // 块设备：    function_as::<BlockFunction>(func).map(|block| block.dev())
 /// ```
 ///
 /// 这是为新设备类型提供的"开闭原则"路径——新增设备类型不需要改任何 core

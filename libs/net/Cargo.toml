@@ -10,6 +10,7 @@ bench = false
 
 [dependencies]
 elm_model = { package = "elm", path = "../elm" }
+kernel-symbols = { path = "../kernel-symbols" }
 socket = { path = "../socket" }
 smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "alloc",

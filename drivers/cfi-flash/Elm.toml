@@ -1,0 +1,11 @@
+[elm]
+name = "platform.cfi-flash"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.cfi-flash"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

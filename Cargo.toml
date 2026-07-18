@@ -28,6 +28,17 @@ members = [
     "kernel"
 ]
 exclude = [
+    "drivers/cfi-flash",
+    "drivers/firmware-bus",
+    "drivers/fw-cfg",
+    "drivers/goldfish-rtc",
+    "drivers/loongson-irq",
+    "drivers/loopback",
+    "drivers/ls7a-rtc",
+    "drivers/plic",
+    "drivers/random",
+    "drivers/syscon",
+    "drivers/uart16550",
     "drivers/virtio",
     "drivers/virtio-blk",
     "tests/elm/kernel-mixin",

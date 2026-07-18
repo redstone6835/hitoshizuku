@@ -1,0 +1,11 @@
+[elm]
+name = "platform.plic"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.plic"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

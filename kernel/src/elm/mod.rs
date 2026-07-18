@@ -60,6 +60,7 @@ pub(crate) fn init_builtin_mgr() {
     let _ = general::kernel_symbol_catalog_anchor();
     let _ = hal::kernel_symbol_catalog_anchor();
     let _ = mm::kernel_symbol_catalog_anchor();
+    let _ = net::kernel_symbol_catalog_anchor();
     let _ = sched::kernel_symbol_catalog_anchor();
     let _ = vfs::kernel_symbol_catalog_anchor();
     let _ = elm_model::register_current_cpu_id(sched::current_cpu_id);
@@ -211,7 +212,7 @@ pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String
         {
             return Err(format!("BuildBound 模块 {} 的 EBI 身份不匹配", module.name));
         }
-        let budget = ElmResourceBudget::DEFAULT;
+        let budget = ElmResourceBudget::BUILD_BOUND;
         let mut authorization = with_core(|core| {
             core.authorize_mgr_call(
                 ElmPrincipal::kernel(),

@@ -5,7 +5,7 @@
 //! - `pnp` 定义 PnP 设备抽象框架（硬件身份、拓扑、热插拔）；
 //! - `pci` / `usb` 提供总线级设备封装；
 //! - `enumerate` 提供启动期已注册设备的全局对象表；
-//! - `drivers` 放置具体驱动实现。
+//! 具体驱动位于顶层 `drivers/`，本 crate 只提供可扩展设备抽象。
 //!
 //! 这里不再承担设备号分配、`major/minor` 编码或
 //! `device number -> driver` 查找职责；这些若仍有需要，只能存在于
@@ -19,7 +19,6 @@ pub mod completion;
 pub mod control;
 pub mod cpu;
 pub mod dma;
-pub mod drivers;
 pub mod elm;
 pub mod enumerate;
 pub mod firmware_bus;
@@ -35,6 +34,7 @@ pub mod pci;
 pub mod platform;
 pub mod pm_qos;
 pub mod pnp;
+pub mod random;
 pub mod random_source;
 pub mod rtc;
 pub mod syscon;

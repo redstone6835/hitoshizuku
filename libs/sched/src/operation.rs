@@ -1276,6 +1276,12 @@ pub fn sigpending() -> Result<SigSet, Errno> {
 /// pending 位本身不够：SIGCHLD/SIGURG/SIGWINCH 等默认动作是忽略，若没有
 /// 用户 handler，不应让 select/poll/socket wait 返回 EINTR。否则 netserver
 /// 这类程序在子进程退出后会因为默认忽略的 SIGCHLD 直接跳出 accept loop。
+#[kernel_symbols::export(
+    name = "sched.operation.has_interrupting_signal",
+    contract = "kernel.sched.signal@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY
+)]
 pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
     let blocked = task.signal.blocked_snapshot().raw();
     let pending = (task.signal.pending_snapshot().raw()

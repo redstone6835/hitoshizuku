@@ -1966,6 +1966,16 @@ fn resource_budget_model_is_stable() {
         ElmResourceBudget::ROOT.max_provider_ports > ElmResourceBudget::DEFAULT.max_provider_ports
     );
     assert!(ElmResourceBudget::DEFAULT.max_native_faults != 0);
+    assert!(
+        ElmResourceBudget::BUILD_BOUND.max_provider_queue
+            < ElmResourceBudget::DEFAULT.max_provider_queue
+    );
+    assert!(
+        u128::from(ElmResourceBudget::BUILD_BOUND.cpu_budget_ns_per_period)
+            * u128::from(ElmResourceBudget::DEFAULT.cpu_period_ns)
+            < u128::from(ElmResourceBudget::DEFAULT.cpu_budget_ns_per_period)
+                * u128::from(ElmResourceBudget::BUILD_BOUND.cpu_period_ns)
+    );
 
     let usage = ElmResourceUsage {
         provider_ports: 1,

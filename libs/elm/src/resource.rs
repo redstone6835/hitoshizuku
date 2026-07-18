@@ -240,6 +240,28 @@ impl ElmResourceBudget {
         cpu_budget_ns_per_period: 2_500_000_000,
         cpu_period_ns: 10_000_000_000,
     };
+
+    /// `BUILD_BOUND` 是与当前内核构建清单绑定的受管组件使用的默认预算。
+    ///
+    /// BuildBound 组件已经通过不可变清单、镜像摘要和内核接口指纹验证，但它仍是受
+    /// `elm-mgr` 管理的独立单元，因此不能绕过资源核算。该预算只预留驱动和基础服务
+    /// 正常运行所需的资源，并为后续动态装载保留至少一半 CPU 配额和大部分管理容量。
+    pub const BUILD_BOUND: Self = Self {
+        max_provider_ports: 8,
+        max_provider_queue: 8,
+        max_event_subscriptions: 8,
+        max_pending_loads: 1,
+        max_native_images: 1,
+        max_native_faults: 1,
+        max_audit_records: 32,
+        max_concurrent_calls: 8,
+        max_native_image_bytes: 16 * 1024 * 1024,
+        max_native_stack_bytes: 2 * 1024 * 1024,
+        max_dynamic_alloc_bytes: 32 * 1024 * 1024,
+        max_cpu_time_ns_per_call: 1_000_000_000,
+        cpu_budget_ns_per_period: 500_000_000,
+        cpu_period_ns: 10_000_000_000,
+    };
 }
 
 #[repr(C)]

@@ -198,7 +198,9 @@ pub use ebi_wire::{
     ElmEbiSourceKind, ElmEbiSourceRequest, ElmImageSessionReferenceV1, ElmLoadCellResponse,
     ElmProjectionSourceRequest,
 };
-pub use kernel_symbols::KernelIntegratedComponentV1;
+pub use kernel_symbols::{
+    KERNEL_INTEGRATED_PHASE_DEVICE, KERNEL_INTEGRATED_PHASE_RUNTIME, KernelIntegratedComponentV1,
+};
 
 #[doc(hidden)]
 pub mod __private {

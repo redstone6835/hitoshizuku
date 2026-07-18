@@ -18,10 +18,26 @@ pub struct ElmProjectManifest {
     pub kind: String,
     pub source: String,
     pub mode: ElmBuildMode,
+    pub integrated_phase: ElmIntegratedPhase,
     pub api: Option<ElmProjectApi>,
     pub menu: Option<ElmProjectMenu>,
     pub dependencies: Vec<ElmProjectDependency>,
     pub profiles: Vec<ElmProjectProfile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElmIntegratedPhase {
+    Device,
+    Runtime,
+}
+
+impl ElmIntegratedPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Runtime => "runtime",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +174,7 @@ impl ElmProjectManifest {
 
         reject_unknown_keys(
             &elm,
-            &["name", "version", "kind", "source", "mode"],
+            &["name", "version", "kind", "source", "mode", "integrated_phase"],
             "[elm]",
         )?;
         reject_unknown_keys(&menu, &["label", "description", "route"], "[menu]")?;
@@ -179,6 +195,15 @@ impl ElmProjectManifest {
             Some("n") => ElmBuildMode::Disabled,
             Some(mode) => return Err(format!("未知 ELM 构建模式覆盖值: {mode}")),
             None => mode,
+        };
+        let integrated_phase = match elm
+            .get("integrated_phase")
+            .map(String::as_str)
+            .unwrap_or("runtime")
+        {
+            "device" => ElmIntegratedPhase::Device,
+            "runtime" => ElmIntegratedPhase::Runtime,
+            phase => return Err(format!("未知集成 ELM 初始化阶段: {phase}")),
         };
         validate_identifier(&name, 128, "ELM 名称")?;
         validate_version(&version)?;
@@ -300,6 +325,7 @@ impl ElmProjectManifest {
             kind,
             source,
             mode,
+            integrated_phase,
             api,
             menu,
             dependencies: parsed_dependencies,
@@ -827,6 +853,13 @@ pub fn cargo_build_integrated(
     append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
+    rustflags.push(format!(
+        "--cfg=elm_integrated_phase=\"{}\"",
+        project_manifest.integrated_phase.as_str()
+    ));
+    rustflags.push(
+        "--check-cfg=cfg(elm_integrated_phase,values(\"device\",\"runtime\"))".to_string(),
+    );
     let mut command = Command::new("cargo");
     command
         .current_dir(&project)
@@ -2635,6 +2668,7 @@ mod tests {
             kind: kind.to_string(),
             source: "local.test".to_string(),
             mode: ElmBuildMode::Managed,
+            integrated_phase: ElmIntegratedPhase::Runtime,
             api: None,
             menu: None,
             dependencies: Vec::new(),
@@ -2702,8 +2736,8 @@ uri = "forbidden"
         assert!(service_cargo.contains("[[bin]]\nname = \"demo-service\"\npath = \"src/main.rs\""));
         assert!(!service_cargo.contains("[workspace]"));
         assert!(service_cargo.contains("default = [\"elm-lsp\"]"));
-        assert!(service_cargo.contains("\"sched/lsp\", \"vfs/lsp\""));
-        assert!(!service_cargo.contains("\"net/lsp\""));
+        assert!(service_cargo.contains("\"sched/lsp\", \"socket/lsp\", \"vfs/lsp\""));
+        assert!(service_cargo.contains("\"net/lsp\""));
         assert!(service_cargo.contains(".elm/framework/allocator"));
         assert!(service_cargo.contains(".elm/framework/general"));
         assert!(service_cargo.contains(".elm/framework/vfs"));
@@ -2757,6 +2791,7 @@ uri = "forbidden"
                 .join(".elm/framework/vfs/Cargo.toml")
                 .is_file()
         );
+        assert!(service.path().join(".elm/framework/net/Cargo.toml").is_file());
         assert!(service.path().join(".elm/framework/Cargo.toml").is_file());
         assert!(!service.path().join(".elm/framework/elmmgr").exists());
 
@@ -2801,8 +2836,8 @@ members = [
         assert!(migrated.contains("general ="));
         assert!(!migrated.contains("[workspace]"));
         assert!(migrated.contains("default = [\"elm-lsp\"]"));
-        assert!(migrated.contains("\"sched/lsp\", \"vfs/lsp\""));
-        assert!(!migrated.contains("\"net/lsp\""));
+        assert!(migrated.contains("\"sched/lsp\", \"socket/lsp\", \"vfs/lsp\""));
+        assert!(migrated.contains("\"net/lsp\""));
         assert!(migrated.contains("default-features = false"));
 
         fs::write(

@@ -38,7 +38,7 @@ fn repository_interface_identity(manifest_dir: &Path) -> Option<([u8; 32], usize
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     if files.is_empty() {
-        panic!("没有找到非网络 Kernel API 规范接口源码");
+        panic!("没有找到 Kernel API 规范接口源码");
     }
 
     let mut hash = Sha256::new();

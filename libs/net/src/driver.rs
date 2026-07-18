@@ -66,6 +66,7 @@ pub struct RxBuf {
     len: usize,
 }
 
+#[kernel_symbols::export]
 impl RxBuf {
     /// 用一段堆分配的 `Box<[u8]>` 构造接收缓冲区。
     ///
@@ -75,6 +76,13 @@ impl RxBuf {
     /// # Panics
     ///
     /// `len > data.len()` 时 panic——这是驱动层的编程错误，不应静默截断。
+    #[kernel_symbols::export(
+        name = "net.RxBuf.new",
+        contract = "kernel.net.buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new(data: Box<[u8]>, len: usize) -> Self {
         assert!(
             len <= data.len(),
@@ -96,6 +104,12 @@ impl RxBuf {
     }
 
     /// 帧长度。
+    #[kernel_symbols::export(
+        name = "net.RxBuf.len",
+        contract = "kernel.net.buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -107,6 +121,13 @@ impl RxBuf {
     /// 取出底层 `Box<[u8]>`（消费缓冲区）。
     ///
     /// 用于驱动内部 buffer 复用——比如把同一块 DMA 内存重新挂回 RX 环。
+    #[kernel_symbols::export(
+        name = "net.RxBuf.into_storage",
+        contract = "kernel.net.buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn into_storage(self) -> Box<[u8]> {
         self.data
     }
@@ -163,8 +184,16 @@ pub struct TxBuf {
     cap: usize,
 }
 
+#[kernel_symbols::export]
 impl TxBuf {
     /// 用堆内存创建 TxBuf。
+    #[kernel_symbols::export(
+        name = "net.TxBuf.new_heap",
+        contract = "kernel.net.buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new_heap(data: Box<[u8]>) -> Self {
         let c = data.len();
         Self {
@@ -191,6 +220,12 @@ impl TxBuf {
         self.cap
     }
 
+    #[kernel_symbols::export(
+        name = "net.TxBuf.len",
+        contract = "kernel.net.buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -222,6 +257,13 @@ impl TxBuf {
 
     /// 取出堆内存 Box<[u8]>（消费缓冲区）。
     /// 仅 Heap 变体可用；DMA 变体会 panic。
+    #[kernel_symbols::export(
+        name = "net.TxBuf.into_heap",
+        contract = "kernel.net.buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn into_heap(self) -> Box<[u8]> {
         match self.storage {
             TxStorage::Heap(b) => b,

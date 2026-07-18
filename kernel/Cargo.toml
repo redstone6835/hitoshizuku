@@ -49,6 +49,7 @@ hal = { path = "../hal" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
 sched = { path = "../libs/sched" }
+socket = { path = "../libs/socket" }
 vfs = { path = "../libs/vfs" }
 
 [build-dependencies]

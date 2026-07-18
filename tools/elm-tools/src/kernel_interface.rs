@@ -33,8 +33,8 @@ pub(crate) struct KernelApiCrate {
 
 /// v1 尚未发布，因此这里就是当前接口的唯一权威目录。
 ///
-/// 网络实现有意不在目录中。`vfs` 与 `general` 对网络 crate 的内部依赖只用于构建
-/// 当前内核，不会产生 `net`、`socket` 或 `mygo-smoltcp` façade。
+/// 网络协议栈 `net` 作为内核子系统直接接口进入目录，但具体协议引擎
+/// （smoltcp 及其项目副本）仍然是实现细节，不会作为 ELM API 暴露。
 const KERNEL_API_CRATE_LIST: &str =
     include_str!("../../../libs/kernel-symbols/kernel-api-crates.txt");
 
@@ -288,9 +288,9 @@ impl KernelInterfaceManifest {
         let mut api_paths = BTreeSet::new();
         let mut link_names = BTreeMap::new();
         for symbol in &self.symbols {
-            if forbidden_network_reference(symbol) {
+            if forbidden_protocol_engine_reference(symbol) {
                 return Err(format!(
-                    "非网络内核接口 {} 的签名或路径引用了网络实现",
+                    "内核接口 {} 的签名或路径泄漏了网络协议引擎实现",
                     symbol.api_path
                 ));
             }
@@ -1082,9 +1082,6 @@ fn collect_kernel_api_sources(repository: &Path) -> Result<Vec<(PathBuf, String)
             let relative = path
                 .strip_prefix(&source)
                 .map_err(|_| format!("接口源码不在 crate 根目录内: {}", path.display()))?;
-            if excluded_network_source(spec.name, relative) {
-                continue;
-            }
             let module = rust_module_path(spec.name, relative)?;
             output.push((path, module));
         }
@@ -1116,21 +1113,6 @@ fn rust_module_path(crate_name: &str, relative: &Path) -> Result<String, String>
         module.push_str(&component);
     }
     Ok(module)
-}
-
-fn excluded_network_source(crate_name: &str, relative: &Path) -> bool {
-    let path = relative.to_string_lossy().replace('\\', "/");
-    match crate_name {
-        "vfs" => matches!(
-            path.as_str(),
-            "addr.rs" | "net_socket.rs" | "netlink_socket.rs" | "socket.rs"
-        ),
-        "general" => matches!(
-            path.as_str(),
-            "dev/net.rs" | "dev/drivers/loopback.rs" | "vfs/user_api/net_socket.rs"
-        ),
-        _ => false,
-    }
 }
 
 struct SourceExportArgs {
@@ -2331,69 +2313,6 @@ pub(crate) fn metadata_facade_manifest(name: &str, host_alias: &str) -> String {
 
 pub(crate) fn metadata_facade_source(name: &str, host_alias: &str) -> String {
     let lsp_alias = format!("__elm_lsp_{name}");
-    if name == "general" {
-        return format!(
-            r#"#![no_std]
-#![warn(missing_docs)]
-#![allow(hidden_glob_reexports)]
-
-//! 由 elmtools 从目标内核精确元数据生成的只读 general 接口。
-
-#[cfg(feature = "lsp")]
-extern crate {lsp_alias} as __elm_backend;
-#[cfg(not(feature = "lsp"))]
-extern crate {host_alias} as __elm_backend;
-
-pub use __elm_backend::*;
-
-/// 不包含常驻网络实现的设备抽象接口。
-pub mod dev {{
-    pub use super::__elm_backend::dev::*;
-
-    mod net {{}}
-}}
-
-/// 不包含网络 socket 投影的通用 VFS 接口。
-pub mod vfs {{
-    pub use super::__elm_backend::vfs::*;
-
-    mod addr {{}}
-    mod net_socket {{}}
-    mod netlink_socket {{}}
-    mod socket {{}}
-
-    /// 不包含网络 socket ABI 的用户接口投影。
-    pub mod user_api {{
-        pub use super::super::__elm_backend::vfs::user_api::*;
-
-        mod net_socket {{}}
-    }}
-}}
-"#
-        );
-    }
-    if name == "vfs" {
-        return format!(
-            r#"#![no_std]
-#![warn(missing_docs)]
-#![allow(hidden_glob_reexports)]
-
-//! 由 elmtools 从目标内核精确元数据生成的只读 VFS 接口。
-
-#[cfg(feature = "lsp")]
-extern crate {lsp_alias} as __elm_backend;
-#[cfg(not(feature = "lsp"))]
-extern crate {host_alias} as __elm_backend;
-
-pub use __elm_backend::*;
-
-mod addr {{}}
-mod net_socket {{}}
-mod netlink_socket {{}}
-mod socket {{}}
-"#
-        );
-    }
     if name != "allocator" {
         return format!(
             "#![no_std]\n#![warn(missing_docs)]\n\n//! 由 elmtools 从目标内核精确元数据生成的只读接口。\n\n#[cfg(feature = \"lsp\")]\nextern crate {lsp_alias} as __elm_backend;\n#[cfg(not(feature = \"lsp\"))]\nextern crate {host_alias} as __elm_backend;\n\npub use __elm_backend::*;\n"
@@ -2657,13 +2576,6 @@ fn rewrite_lsp_package_manifest(
                     }
                 }
             }
-        } else if package_name == "smoltcp"
-            && section == "[features]"
-            && line.trim_start().starts_with("default = [")
-        {
-            let indentation = &line[..line.len() - line.trim_start().len()];
-            output.push(format!("{indentation}default = []"));
-            line = line.replacen("default", "_elm_lsp_original_default", 1);
         }
         output.push(line);
     }
@@ -2777,7 +2689,7 @@ fn remove_path(path: &Path) -> Result<(), String> {
     }
 }
 
-fn forbidden_network_reference(symbol: &KernelInterfaceSymbol) -> bool {
+fn forbidden_protocol_engine_reference(symbol: &KernelInterfaceSymbol) -> bool {
     let fields = [
         symbol.api_path.as_str(),
         symbol.item_path.as_str(),
@@ -2786,15 +2698,7 @@ fn forbidden_network_reference(symbol: &KernelInterfaceSymbol) -> bool {
     ];
     fields.iter().any(|field| {
         let normalized = field.replace('-', "_");
-        normalized.starts_with("net.")
-            || normalized.starts_with("socket.")
-            || normalized.contains(".net.")
-            || normalized.contains(".socket.")
-            || normalized.contains("net::")
-            || normalized.contains("socket::")
-            || normalized.contains("mygo_smoltcp")
-            || normalized.contains(".net_socket")
-            || normalized.contains(".netlink_socket")
+        normalized.contains("smoltcp") || normalized.contains("mygo_smoltcp")
     })
 }
 
@@ -2928,15 +2832,12 @@ mod tests {
         assert!(general.contains("package = \"elm-lsp-general\""));
         assert!(general.contains("../../kernel-source/general"));
         let general_source = metadata_facade_source("general", "__elm_host_general");
-        assert!(general_source.contains("pub mod dev"));
-        assert!(general_source.contains("mod net {}"));
-        assert!(general_source.contains("pub mod user_api"));
-        assert!(general_source.contains("mod net_socket {}"));
+        assert!(general_source.contains("只读接口"));
+        assert!(!general_source.contains("mod net {}"));
 
         let vfs_source = metadata_facade_source("vfs", "__elm_host_vfs");
-        assert!(vfs_source.contains("只读 VFS 接口"));
-        assert!(vfs_source.contains("mod addr {}"));
-        assert!(vfs_source.contains("mod socket {}"));
+        assert!(vfs_source.contains("只读接口"));
+        assert!(!vfs_source.contains("mod socket {}"));
     }
 
     #[test]
@@ -2965,14 +2866,15 @@ mod tests {
         assert!(manifest.contains("\"kernel-symbols\""));
         assert!(manifest.contains("\"allocator\""));
         assert!(manifest.contains("\"general\""));
+        assert!(manifest.contains("\"socket\""));
         assert!(manifest.contains("\"vfs\""));
         assert!(manifest.contains("\"hal\""));
-        assert!(!manifest.contains("\"net\""));
+        assert!(manifest.contains("\"net\""));
         assert!(manifest.contains("[workspace.package]"));
     }
 
     #[test]
-    fn repository_exports_cover_subsystems_without_network_symbols() {
+    fn repository_exports_cover_subsystems_with_network_symbols() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -2990,7 +2892,9 @@ mod tests {
             "hal.",
             "log.",
             "mm.",
+            "net.",
             "sched.",
+            "socket.",
             "vfs.",
         ] {
             assert!(
@@ -3000,23 +2904,21 @@ mod tests {
                 "缺少 {prefix} 子系统导出"
             );
         }
-        assert!(symbols.iter().all(|symbol| {
-            !symbol.api_path.starts_with("net.")
-                && !symbol.api_path.starts_with("socket.")
-                && !symbol.api_path.contains("smoltcp")
-                && !symbol.api_path.contains(".net_socket")
-                && !symbol.api_path.contains(".netlink_socket")
-        }));
+        assert!(symbols
+            .iter()
+            .all(|symbol| !forbidden_protocol_engine_reference(symbol)));
+        assert!(kernel_api_crates().iter().any(|spec| spec.name == "net"));
         assert!(kernel_api_crates().iter().all(|spec| {
-            !matches!(
-                spec.name,
-                "net" | "socket" | "mygo-smoltcp" | "mygo_smoltcp"
-            )
+            !matches!(spec.name, "mygo-smoltcp" | "mygo_smoltcp")
         }));
+        assert!(kernel_api_crates().iter().any(|spec| spec.name == "socket"));
         for required in [
             "elf.parse",
             "sched.operation.spawn_user_process",
             "sched.task.Task.pid_root",
+            "socket.Socket.new_unix",
+            "socket.Socket.send",
+            "socket.Socket.receive",
             "vfs.operation.openat",
             "vfs.operation.close",
             "vfs.operation.close_for_owner",
@@ -3024,6 +2926,12 @@ mod tests {
             "vfs.file.File.mount",
             "vfs.file.File.dentry",
             "general.vfs.namespace_path",
+            "net.stack",
+            "net.NetStack.attach",
+            "net.NetStack.detach",
+            "net.NetDevice.new",
+            "net.RxBuf.new",
+            "net.TxBuf.new_heap",
         ] {
             assert!(
                 symbols.iter().any(|symbol| symbol.api_path == required),
@@ -3033,7 +2941,7 @@ mod tests {
         assert!(
             symbols
                 .iter()
-                .all(|symbol| !forbidden_network_reference(symbol))
+                .all(|symbol| !forbidden_protocol_engine_reference(symbol))
         );
     }
 
@@ -3049,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn network_types_cannot_leak_into_non_network_symbol_signatures() {
+    fn protocol_engine_types_cannot_leak_into_kernel_symbol_signatures() {
         let symbol = KernelInterfaceSymbol {
             kind: KERNEL_SYMBOL_KIND_FUNCTION,
             flags: 0,
@@ -3061,12 +2969,12 @@ mod tests {
             item_path: "general::device::query".to_string(),
             link_name: "__elm_kernel_api_test".to_string(),
             contract: "kernel.device.query@1".to_string(),
-            rust_abi: "fn()->Option<net::InterfaceId>".to_string(),
+            rust_abi: "fn()->Option<smoltcp::iface::Interface>".to_string(),
             rust_abi_hash: [0; 32],
             abi_mode: KERNEL_API_MODE_EXACT_RUST.to_string(),
             aliases: Vec::new(),
         };
-        assert!(forbidden_network_reference(&symbol));
+        assert!(forbidden_protocol_engine_reference(&symbol));
     }
 
     #[test]

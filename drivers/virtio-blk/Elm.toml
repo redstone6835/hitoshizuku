@@ -4,6 +4,7 @@ version = "0.1.0"
 kind = "driver"
 source = "kernel-tree:drivers.virtio-block"
 mode = "m"
+integrated_phase = "device"
 
 [[dependencies]]
 provider = "virtio.framework"

@@ -377,7 +377,14 @@ impl PnpId {
     }
 }
 
+#[kernel_symbols::export]
 impl fmt::Display for PnpId {
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpId.fmt",
+        contract = "kernel.general.device-query@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PnpId::Pci {

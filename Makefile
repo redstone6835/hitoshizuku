@@ -1,228 +1,256 @@
-.PHONY: all clean cargo-setup defconfig kernel-la kernel-rv rootfs-la rootfs-rv rootfs-ltp-scenarios-la rootfs-ltp-scenarios-rv elm-smoke-la elm-smoke-rv elmctl-la elmctl-rv rootfs-elm-smoke-la rootfs-elm-smoke-rv rootfs-elmctl-la rootfs-elmctl-rv elm-modules-la elm-modules-rv
+.DEFAULT_GOAL := kernel
 
-all: cargo-setup kernel-la kernel-rv
+.PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
+	kernel-la kernel-rv all clean cargo-setup \
+	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
+	_busybox-loongarch64 _busybox-riscv64 \
+	_compat-kernel-loongarch64 _compat-kernel-riscv64
+
+default: kernel
 
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 BUILD_DIR := build
 CARGO_TARGET_DIR ?= target
 FEATURES ?=
-KERNEL_FEATURES = embedded-initramfs $(FEATURES)
-CARGO_FEATURES = $(subst $(space),$(comma),$(strip $(KERNEL_FEATURES)))
+CONFIG_FILE ?= .config
+INITRAMFS ?=
+INSTALL_MOD_PATH ?=
+
 empty :=
 space := $(empty) $(empty)
 comma := ,
 
-CONFIG_FILE ?= .config
--include $(CONFIG_FILE)
-
-CONFIG_VIRTIO ?= y
-CONFIG_VIRTIO_BLK ?= y
-
-ifneq ($(filter $(CONFIG_VIRTIO),y m n),$(CONFIG_VIRTIO))
-$(error CONFIG_VIRTIO 必须为 y、m 或 n)
-endif
-ifneq ($(filter $(CONFIG_VIRTIO_BLK),y n),$(CONFIG_VIRTIO_BLK))
-$(error CONFIG_VIRTIO_BLK 必须为 y 或 n)
-endif
-ifeq ($(CONFIG_VIRTIO),n)
-ifneq ($(CONFIG_VIRTIO_BLK),n)
-$(error CONFIG_VIRTIO_BLK=y 要求 CONFIG_VIRTIO 为 y 或 m)
-endif
-endif
-
+LA_ARCH := loongarch64
 LA_TARGET := loongarch64-unknown-none
-LA_ROOTFS := userland/rootfs-la
-LA_INITRAMFS := $(BUILD_DIR)/initramfs-la.cpio
 LA_CROSS_COMPILE := loongarch64-linux-gnu-
-LA_KERNEL := kernel-la
-LA_ELM_SMOKE := $(BUILD_DIR)/elm-smoke-la/elmctl-smoke
-LA_ELMCTL := $(BUILD_DIR)/elmctl-la/elmctl
+LA_COMPAT_ROOTFS_SOURCE := userland/rootfs-la
+LA_COMPAT_ROOTFS := $(BUILD_DIR)/$(LA_ARCH)/compat-rootfs
+LA_ROOT_KERNEL := kernel-la
 
+RV_ARCH := riscv64
 RV_TARGET := riscv64gc-unknown-none-elf
-RV_ROOTFS := userland/rootfs-rv
-RV_INITRAMFS := $(BUILD_DIR)/initramfs-rv.cpio
 RV_CROSS_COMPILE := riscv64-linux-musl-
-RV_KERNEL := kernel-rv
-RV_ELM_SMOKE := $(BUILD_DIR)/elm-smoke-rv/elmctl-smoke
-RV_ELMCTL := $(BUILD_DIR)/elmctl-rv/elmctl
+RV_COMPAT_ROOTFS_SOURCE := userland/rootfs-rv
+RV_COMPAT_ROOTFS := $(BUILD_DIR)/$(RV_ARCH)/compat-rootfs
+RV_ROOT_KERNEL := kernel-rv
 
+ELM_MODULE_SET := drivers/Modules.toml
+ELM_INTERFACE_ROOT := $(BUILD_DIR)/elm-interface
 ELM_TOOL_TARGET := $(BUILD_DIR)/cargo-elm-target
 ELM_TOOL := $(ELM_TOOL_TARGET)/x86_64-unknown-linux-gnu/release/cargo-elm
-ELM_TOOL_INPUTS := $(wildcard tools/elm-tools/src/*.rs tools/elm-tools/Cargo.toml libs/elm/src/*.rs libs/elm/src/mgr/*.rs libs/elm/macros/src/*.rs libs/elm/macros/Cargo.toml)
-ELM_MODULE_SET := drivers/Modules.toml
-ELM_INTERFACE_ROOT := $(BUILD_DIR)/elm-interface-current
-LA_MODULE_OUTPUT := $(BUILD_DIR)/modules/$(LA_TARGET)
-RV_MODULE_OUTPUT := $(BUILD_DIR)/modules/$(RV_TARGET)
+ELM_TOOL_INPUTS := $(wildcard tools/elm-tools/src/*.rs tools/elm-tools/Cargo.toml \
+	libs/elm/src/*.rs libs/elm/src/mgr/*.rs libs/elm/macros/src/*.rs \
+	libs/elm/macros/Cargo.toml libs/kernel-symbols/src/*.rs \
+	libs/kernel-symbols/macros/src/*.rs) \
+	libs/kernel-symbols/Cargo.toml libs/kernel-symbols/macros/Cargo.toml
 ELM_KERNEL_BUILD := scripts/build-kernel-with-elm.sh
-ELM_DRIVER_FEATURES := $(if $(filter block-bench,$(FEATURES)),block-profile,)
-ELM_DRIVER_FEATURE_ARGS := $(if $(ELM_DRIVER_FEATURES),--features $(ELM_DRIVER_FEATURES),)
 
 BUSYBOX_SRC := third/busybox-1.36.1
 BUSYBOX_ARCHIVE := third/busybox-1.36.1.tar.gz
 ENSURE_BUSYBOX := scripts/ensure-busybox.sh
+BUSYBOX_SKELETON := userland/busybox-initramfs
+PACK_INITRAMFS := scripts/pack-initramfs.sh
+
 LTP_SCENARIO_SRC := userland/ltp-scenarios
 LTP_TESTCODE_SRC := userland/ltp_testcode.sh
 ELM_SMOKE_SRC := userland/elmctl-smoke/elmctl_smoke.c
 ELM_FINGERPRINT_GEN := scripts/gen-elm-fingerprint-header.sh
 ELM_FINGERPRINT_INPUTS := $(wildcard libs/elm/src/*.rs libs/elm/src/mgr/*.rs tools/elm-tools/src/*.rs) \
 	libs/elm/Cargo.toml tools/elm-tools/Cargo.toml
-LA_ELM_FINGERPRINT := $(BUILD_DIR)/elm-smoke-la/elm_fingerprint.h
-RV_ELM_FINGERPRINT := $(BUILD_DIR)/elm-smoke-rv/elm_fingerprint.h
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 ELMCTL_HEADERS := userland/elmctl/include/elmctl_abi.h userland/elmctl/include/elmctl_client.h
+
+ifeq ($(strip $(ARCH)),)
+SELECTED_ARCHES := $(LA_ARCH) $(RV_ARCH)
+else ifeq ($(ARCH),$(LA_ARCH))
+SELECTED_ARCHES := $(LA_ARCH)
+else ifeq ($(ARCH),$(RV_ARCH))
+SELECTED_ARCHES := $(RV_ARCH)
+else
+$(error ARCH 必须为 loongarch64 或 riscv64)
+endif
+
+ifneq ($(strip $(INITRAMFS)),)
+ifeq ($(words $(SELECTED_ARCHES)),2)
+$(error 设置 INITRAMFS 时必须同时指定单一 ARCH)
+endif
+ifeq ($(wildcard $(INITRAMFS)),)
+$(error INITRAMFS 文件不存在: $(INITRAMFS))
+endif
+EMBEDDED_FEATURE := embedded-initramfs
+endif
+
+BASE_KERNEL_FEATURES := $(strip $(FEATURES) $(EMBEDDED_FEATURE))
+CARGO_FEATURES := $(subst $(space),$(comma),$(BASE_KERNEL_FEATURES))
+FEATURE_ARGS := $(if $(strip $(CARGO_FEATURES)),--features "$(CARGO_FEATURES)",)
+BOOTSTRAP_FEATURES := $(subst $(space),$(comma),$(strip $(FEATURES)))
+BOOTSTRAP_FEATURE_ARGS := $(if $(strip $(BOOTSTRAP_FEATURES)),--features "$(BOOTSTRAP_FEATURES)",)
+ELM_DRIVER_FEATURES := $(if $(filter block-bench,$(FEATURES)),block-profile,)
+ELM_DRIVER_FEATURE_ARGS := $(if $(ELM_DRIVER_FEATURES),--features $(ELM_DRIVER_FEATURES),)
+
+kernel: $(addprefix _kernel-,$(SELECTED_ARCHES))
+
+modules: $(addprefix _modules-,$(SELECTED_ARCHES))
 
 cargo-setup:
 	@mkdir -p .cargo
 	@cp cargo-config/config.toml .cargo/config.toml
-	@echo "cargo-config/config.toml → .cargo/config.toml"
 
-$(CONFIG_FILE): configs/default.config
-	cp $< $@
-
-defconfig:
-	cp configs/default.config $(CONFIG_FILE)
+$(CONFIG_FILE):
+	cp configs/default.config $@
 
 $(ELM_TOOL): $(ELM_TOOL_INPUTS)
-	CARGO_TARGET_DIR=$(abspath $(ELM_TOOL_TARGET)) cargo build --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu --release
+	CARGO_TARGET_DIR=$(abspath $(ELM_TOOL_TARGET)) \
+		cargo build --manifest-path tools/elm-tools/Cargo.toml \
+		--target x86_64-unknown-linux-gnu --release
 
-kernel-la: cargo-setup $(CONFIG_FILE) rootfs-la elm-modules-la
-	INITRAMFS_ROOT=$(LA_ROOTFS) INITRAMFS_CPIO=$(LA_INITRAMFS) \
-		$(ELM_KERNEL_BUILD) $(LA_MODULE_OUTPUT)/modules.manifest $(LA_MODULE_OUTPUT)/integrated.archives \
-		cargo build -p kernel --target $(LA_TARGET) --features "$(CARGO_FEATURES)" --release
-	cp $(CARGO_TARGET_DIR)/$(LA_TARGET)/release/kernel $(LA_KERNEL)
+config: $(ELM_TOOL)
+	$(ELM_TOOL) elm configure-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --mode config
 
-kernel-rv: cargo-setup $(CONFIG_FILE) rootfs-rv elm-modules-rv
-	INITRAMFS_ROOT=$(RV_ROOTFS) INITRAMFS_CPIO=$(RV_INITRAMFS) \
-		$(ELM_KERNEL_BUILD) $(RV_MODULE_OUTPUT)/modules.manifest $(RV_MODULE_OUTPUT)/integrated.archives \
-		cargo build -p kernel --target $(RV_TARGET) --features "$(CARGO_FEATURES)" --release
-	cp $(CARGO_TARGET_DIR)/$(RV_TARGET)/release/kernel $(RV_KERNEL)
+oldconfig: $(ELM_TOOL)
+	$(ELM_TOOL) elm configure-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --mode oldconfig
 
-elm-modules-la: cargo-setup $(CONFIG_FILE) rootfs-la $(ELM_TOOL)
-	rm -rf $(LA_ROOTFS)/lib/elm $(LA_MODULE_OUTPUT) $(ELM_INTERFACE_ROOT)/$(LA_TARGET)
-	INITRAMFS_ROOT=$(LA_ROOTFS) INITRAMFS_CPIO=$(LA_INITRAMFS) \
-		env -u ELM_INTEGRATED_ARCHIVES -u ELM_BUILD_BOUND_MANIFEST \
-		cargo build -p kernel --target $(LA_TARGET) --features "$(CARGO_FEATURES)" --release
-	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(LA_TARGET)/release/kernel \
-		--target $(LA_TARGET) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(LA_TARGET)
-	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(LA_TARGET)) \
-		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --target $(LA_TARGET) \
-		--output $(LA_MODULE_OUTPUT) $(ELM_DRIVER_FEATURE_ARGS)
-	mkdir -p $(LA_ROOTFS)/lib/elm
-	install -m 0644 $(LA_MODULE_OUTPUT)/modules.manifest $(LA_ROOTFS)/lib/elm/modules.manifest
-	find $(LA_MODULE_OUTPUT) -maxdepth 1 -type f -name '*.eki' -exec install -m 0644 {} $(LA_ROOTFS)/lib/elm/ \;
+defconfig: $(ELM_TOOL)
+	$(ELM_TOOL) elm configure-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --mode defconfig
 
-elm-modules-rv: cargo-setup $(CONFIG_FILE) rootfs-rv $(ELM_TOOL)
-	rm -rf $(RV_ROOTFS)/lib/elm $(RV_MODULE_OUTPUT) $(ELM_INTERFACE_ROOT)/$(RV_TARGET)
-	INITRAMFS_ROOT=$(RV_ROOTFS) INITRAMFS_CPIO=$(RV_INITRAMFS) \
-		env -u ELM_INTEGRATED_ARCHIVES -u ELM_BUILD_BOUND_MANIFEST \
-		cargo build -p kernel --target $(RV_TARGET) --features "$(CARGO_FEATURES)" --release
-	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(RV_TARGET)/release/kernel \
-		--target $(RV_TARGET) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(RV_TARGET)
-	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(RV_TARGET)) \
-		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --target $(RV_TARGET) \
-		--output $(RV_MODULE_OUTPUT) $(ELM_DRIVER_FEATURE_ARGS)
-	mkdir -p $(RV_ROOTFS)/lib/elm
-	install -m 0644 $(RV_MODULE_OUTPUT)/modules.manifest $(RV_ROOTFS)/lib/elm/modules.manifest
-	find $(RV_MODULE_OUTPUT) -maxdepth 1 -type f -name '*.eki' -exec install -m 0644 {} $(RV_ROOTFS)/lib/elm/ \;
+define build_modules
+	rm -rf $(BUILD_DIR)/$(1)/modules $(ELM_INTERFACE_ROOT)/$(2)
+	env -u ELM_INTEGRATED_ARCHIVES -u ELM_BUILD_BOUND_MANIFEST -u INITRAMFS \
+		cargo build -p kernel --target $(2) $(BOOTSTRAP_FEATURE_ARGS) --release
+	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(2)/release/kernel \
+		--target $(2) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(2)
+	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(2)) \
+		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) \
+		--target $(2) --output $(BUILD_DIR)/$(1)/modules $(ELM_DRIVER_FEATURE_ARGS)
+endef
 
-rootfs-la: $(LA_ROOTFS)/bin/busybox rootfs-ltp-scenarios-la rootfs-elm-smoke-la rootfs-elmctl-la
+_modules-loongarch64: cargo-setup $(CONFIG_FILE) $(ELM_TOOL)
+	$(call build_modules,$(LA_ARCH),$(LA_TARGET))
 
-rootfs-rv: $(RV_ROOTFS)/bin/busybox rootfs-ltp-scenarios-rv rootfs-elm-smoke-rv rootfs-elmctl-rv
+_modules-riscv64: cargo-setup $(CONFIG_FILE) $(ELM_TOOL)
+	$(call build_modules,$(RV_ARCH),$(RV_TARGET))
 
-rootfs-ltp-scenarios-la:
-	mkdir -p $(LA_ROOTFS)/etc/ltp-scenarios
-	rm -f $(LA_ROOTFS)/etc/ltp-scenarios/*
-	cp $(LTP_SCENARIO_SRC)/* $(LA_ROOTFS)/etc/ltp-scenarios/
-	cp $(LTP_TESTCODE_SRC) $(LA_ROOTFS)/etc/ltp_testcode.sh
-	chmod +x $(LA_ROOTFS)/etc/ltp_testcode.sh
+define build_kernel
+	mkdir -p $(BUILD_DIR)/$(1)
+	ELM_BIND_MODULES=$(4) INITRAMFS=$(INITRAMFS) \
+		$(ELM_KERNEL_BUILD) $(BUILD_DIR)/$(1)/modules/modules.manifest \
+		$(BUILD_DIR)/$(1)/modules/integrated.archives \
+		cargo build -p kernel --target $(2) $(FEATURE_ARGS) --release
+	cp $(CARGO_TARGET_DIR)/$(2)/release/kernel $(BUILD_DIR)/$(1)/kernel
+	@echo "kernel image: $(BUILD_DIR)/$(1)/kernel"
+endef
 
-rootfs-ltp-scenarios-rv:
-	mkdir -p $(RV_ROOTFS)/etc/ltp-scenarios
-	rm -f $(RV_ROOTFS)/etc/ltp-scenarios/*
-	cp $(LTP_SCENARIO_SRC)/* $(RV_ROOTFS)/etc/ltp-scenarios/
-	cp $(LTP_TESTCODE_SRC) $(RV_ROOTFS)/etc/ltp_testcode.sh
-	chmod +x $(RV_ROOTFS)/etc/ltp_testcode.sh
+_kernel-loongarch64: _modules-loongarch64
+	$(call build_kernel,$(LA_ARCH),$(LA_TARGET),$(LA_CROSS_COMPILE),0)
 
-$(LA_ROOTFS)/bin/busybox:
-	$(MAKE) rootfs-busybox ROOTFS_DIR=$(LA_ROOTFS) CROSS_COMPILE=$(LA_CROSS_COMPILE)
+_kernel-riscv64: _modules-riscv64
+	$(call build_kernel,$(RV_ARCH),$(RV_TARGET),$(RV_CROSS_COMPILE),0)
 
-$(RV_ROOTFS)/bin/busybox:
-	$(MAKE) rootfs-busybox ROOTFS_DIR=$(RV_ROOTFS) CROSS_COMPILE=$(RV_CROSS_COMPILE)
+modules_install:
+	@test -n "$(ARCH)" || { echo "modules_install 要求 ARCH" >&2; exit 2; }
+	@test -n "$(INSTALL_MOD_PATH)" || { echo "modules_install 要求 INSTALL_MOD_PATH" >&2; exit 2; }
+	$(MAKE) modules ARCH=$(ARCH) CONFIG_FILE=$(CONFIG_FILE) FEATURES="$(FEATURES)"
+	mkdir -p $(INSTALL_MOD_PATH)/lib/elm
+	install -m 0644 $(BUILD_DIR)/$(ARCH)/modules/modules.manifest $(INSTALL_MOD_PATH)/lib/elm/
+	find $(BUILD_DIR)/$(ARCH)/modules -maxdepth 1 -type f -name '*.eki' \
+		-exec install -m 0644 {} $(INSTALL_MOD_PATH)/lib/elm/ \;
 
-elm-smoke-la: $(LA_ELM_SMOKE)
-
-elm-smoke-rv: $(RV_ELM_SMOKE)
-
-elmctl-la: $(LA_ELMCTL)
-
-elmctl-rv: $(RV_ELMCTL)
-
-rootfs-elm-smoke-la: $(LA_ROOTFS)/bin/elmctl-smoke
-
-rootfs-elm-smoke-rv: $(RV_ROOTFS)/bin/elmctl-smoke
-
-rootfs-elmctl-la: $(LA_ROOTFS)/bin/elmctl
-
-rootfs-elmctl-rv: $(RV_ROOTFS)/bin/elmctl
-
-$(LA_ELM_FINGERPRINT): $(ELM_FINGERPRINT_GEN) $(ELM_FINGERPRINT_INPUTS)
-	$(ELM_FINGERPRINT_GEN) $(LA_TARGET) $@
-
-$(RV_ELM_FINGERPRINT): $(ELM_FINGERPRINT_GEN) $(ELM_FINGERPRINT_INPUTS)
-	$(ELM_FINGERPRINT_GEN) $(RV_TARGET) $@
-
-$(LA_ELM_SMOKE): $(ELM_SMOKE_SRC) $(LA_ELM_FINGERPRINT)
-	mkdir -p $(dir $@)
-	$(LA_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra -I$(dir $@) $< -o $@
-	-$(LA_CROSS_COMPILE)strip $@
-
-$(RV_ELM_SMOKE): $(ELM_SMOKE_SRC) $(RV_ELM_FINGERPRINT)
-	mkdir -p $(dir $@)
-	$(RV_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra -I$(dir $@) $< -o $@
-	-$(RV_CROSS_COMPILE)strip $@
-
-$(LA_ELMCTL): $(ELMCTL_SRC) $(ELMCTL_HEADERS)
-	mkdir -p $(dir $@)
-	$(LA_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra -Iuserland/elmctl/include $(ELMCTL_SRC) -o $@
-	-$(LA_CROSS_COMPILE)strip $@
-
-$(RV_ELMCTL): $(ELMCTL_SRC) $(ELMCTL_HEADERS)
-	mkdir -p $(dir $@)
-	$(RV_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra -Iuserland/elmctl/include $(ELMCTL_SRC) -o $@
-	-$(RV_CROSS_COMPILE)strip $@
-
-$(LA_ROOTFS)/bin/elmctl-smoke: $(LA_ELM_SMOKE)
-	mkdir -p $(LA_ROOTFS)/bin
-	install -m 0755 $< $@
-
-$(RV_ROOTFS)/bin/elmctl-smoke: $(RV_ELM_SMOKE)
-	mkdir -p $(RV_ROOTFS)/bin
-	install -m 0755 $< $@
-
-$(LA_ROOTFS)/bin/elmctl: $(LA_ELMCTL)
-	mkdir -p $(LA_ROOTFS)/bin
-	install -m 0755 $< $@
-
-$(RV_ROOTFS)/bin/elmctl: $(RV_ELMCTL)
-	mkdir -p $(RV_ROOTFS)/bin
-	install -m 0755 $< $@
-
-.PHONY: rootfs-busybox
-rootfs-busybox: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE)
+define build_busybox
 	$(ENSURE_BUSYBOX)
-	$(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
-	sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' $(BUSYBOX_SRC)/.config
-	sed -i 's/.*CONFIG_PIE.*/CONFIG_PIE=y/' $(BUSYBOX_SRC)/.config
-	sed -i 's/^CONFIG_TC=.*/# CONFIG_TC is not set/' $(BUSYBOX_SRC)/.config
-	yes '' | $(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) oldconfig
-	$(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) -j$(JOBS)
-	mkdir -p $(ROOTFS_DIR)
-	$(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) CONFIG_PREFIX=$(abspath $(ROOTFS_DIR)) install
-	-$(CROSS_COMPILE)strip $(ROOTFS_DIR)/bin/busybox
-	$(MAKE) -C $(BUSYBOX_SRC) distclean
+	rm -rf $(BUILD_DIR)/$(1)/busybox-build $(BUILD_DIR)/$(1)/busybox-rootfs
+	mkdir -p $(BUILD_DIR)/$(1)/busybox-build $(BUILD_DIR)/$(1)/busybox-rootfs
+	$(MAKE) -C $(BUSYBOX_SRC) O=$(abspath $(BUILD_DIR)/$(1)/busybox-build) \
+		CROSS_COMPILE=$(2) defconfig
+	sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' $(BUILD_DIR)/$(1)/busybox-build/.config
+	sed -i 's/.*CONFIG_PIE.*/CONFIG_PIE=y/' $(BUILD_DIR)/$(1)/busybox-build/.config
+	sed -i 's/^CONFIG_TC=.*/# CONFIG_TC is not set/' $(BUILD_DIR)/$(1)/busybox-build/.config
+	yes '' | $(MAKE) -C $(BUSYBOX_SRC) O=$(abspath $(BUILD_DIR)/$(1)/busybox-build) \
+		CROSS_COMPILE=$(2) oldconfig
+	$(MAKE) -C $(BUSYBOX_SRC) O=$(abspath $(BUILD_DIR)/$(1)/busybox-build) \
+		CROSS_COMPILE=$(2) -j$(JOBS)
+	$(MAKE) -C $(BUSYBOX_SRC) O=$(abspath $(BUILD_DIR)/$(1)/busybox-build) \
+		CROSS_COMPILE=$(2) CONFIG_PREFIX=$(abspath $(BUILD_DIR)/$(1)/busybox-rootfs) install
+	cp -a $(BUSYBOX_SKELETON)/. $(BUILD_DIR)/$(1)/busybox-rootfs/
+	chmod +x $(BUILD_DIR)/$(1)/busybox-rootfs/etc/init.d/rcS
+	mkdir -p $(BUILD_DIR)/$(1)/busybox-rootfs/dev $(BUILD_DIR)/$(1)/busybox-rootfs/proc \
+		$(BUILD_DIR)/$(1)/busybox-rootfs/sys $(BUILD_DIR)/$(1)/busybox-rootfs/tmp
+	-$(2)strip $(BUILD_DIR)/$(1)/busybox-rootfs/bin/busybox
+	$(PACK_INITRAMFS) $(BUILD_DIR)/$(1)/busybox-rootfs $(BUILD_DIR)/$(1)/initramfs.cpio
+	@echo "initramfs image: $(BUILD_DIR)/$(1)/initramfs.cpio"
+endef
+
+busybox: $(addprefix _busybox-,$(SELECTED_ARCHES))
+
+_busybox-loongarch64: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE) $(PACK_INITRAMFS)
+	$(call build_busybox,$(LA_ARCH),$(LA_CROSS_COMPILE))
+
+_busybox-riscv64: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE) $(PACK_INITRAMFS)
+	$(call build_busybox,$(RV_ARCH),$(RV_CROSS_COMPILE))
+
+define build_elm_user_tools
+	mkdir -p $(BUILD_DIR)/$(1)/elm-user $(2)/bin
+	$(ELM_FINGERPRINT_GEN) $(3) $(BUILD_DIR)/$(1)/elm-user/elm_fingerprint.h
+	$(4)gcc -std=c11 -static -Os -Wall -Wextra \
+		-I$(BUILD_DIR)/$(1)/elm-user $(ELM_SMOKE_SRC) \
+		-o $(BUILD_DIR)/$(1)/elm-user/elmctl-smoke
+	$(4)gcc -std=c11 -static -Os -Wall -Wextra -Iuserland/elmctl/include \
+		$(ELMCTL_SRC) -o $(BUILD_DIR)/$(1)/elm-user/elmctl
+	-$(4)strip $(BUILD_DIR)/$(1)/elm-user/elmctl-smoke
+	-$(4)strip $(BUILD_DIR)/$(1)/elm-user/elmctl
+	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/elmctl-smoke $(2)/bin/
+	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/elmctl $(2)/bin/
+endef
+
+define prepare_compat_rootfs
+	$(MAKE) _busybox-$(1)
+	rm -rf $(2)
+	mkdir -p $(2)
+	cp -a $(3)/. $(2)/
+	cp -a $(BUILD_DIR)/$(1)/busybox-rootfs/. $(2)/
+	mkdir -p $(2)/etc $(2)/tmp
+	cp -a $(3)/etc/. $(2)/etc/
+	cp -a $(3)/tmp/. $(2)/tmp/
+	mkdir -p $(2)/etc/ltp-scenarios $(2)/lib/elm
+	rm -f $(2)/etc/ltp-scenarios/* $(2)/lib/elm/*
+	cp $(LTP_SCENARIO_SRC)/* $(2)/etc/ltp-scenarios/
+	cp $(LTP_TESTCODE_SRC) $(2)/etc/ltp_testcode.sh
+	chmod +x $(2)/etc/ltp_testcode.sh
+	$(call build_elm_user_tools,$(1),$(2),$(4),$(5))
+	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
+	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
+		-exec install -m 0644 {} $(2)/lib/elm/ \;
+	$(PACK_INITRAMFS) $(2) $(BUILD_DIR)/$(1)/compat-initramfs.cpio
+endef
+
+kernel-la: _modules-loongarch64 $(PACK_INITRAMFS)
+	$(call prepare_compat_rootfs,$(LA_ARCH),$(LA_COMPAT_ROOTFS),$(LA_COMPAT_ROOTFS_SOURCE),$(LA_TARGET),$(LA_CROSS_COMPILE))
+	$(MAKE) _compat-kernel-loongarch64
+	cp $(BUILD_DIR)/$(LA_ARCH)/kernel $(LA_ROOT_KERNEL)
+
+_compat-kernel-loongarch64:
+	$(eval override INITRAMFS := $(abspath $(BUILD_DIR)/$(LA_ARCH)/compat-initramfs.cpio))
+	$(eval override EMBEDDED_FEATURE := embedded-initramfs)
+	$(eval override BASE_KERNEL_FEATURES := $(strip $(FEATURES) embedded-initramfs))
+	$(eval override CARGO_FEATURES := $(subst $(space),$(comma),$(BASE_KERNEL_FEATURES)))
+	$(eval override FEATURE_ARGS := --features "$(CARGO_FEATURES)")
+	$(call build_kernel,$(LA_ARCH),$(LA_TARGET),$(LA_CROSS_COMPILE),1)
+
+kernel-rv: _modules-riscv64 $(PACK_INITRAMFS)
+	$(call prepare_compat_rootfs,$(RV_ARCH),$(RV_COMPAT_ROOTFS),$(RV_COMPAT_ROOTFS_SOURCE),$(RV_TARGET),$(RV_CROSS_COMPILE))
+	$(MAKE) _compat-kernel-riscv64
+	cp $(BUILD_DIR)/$(RV_ARCH)/kernel $(RV_ROOT_KERNEL)
+
+_compat-kernel-riscv64:
+	$(eval override INITRAMFS := $(abspath $(BUILD_DIR)/$(RV_ARCH)/compat-initramfs.cpio))
+	$(eval override BASE_KERNEL_FEATURES := $(strip $(FEATURES) embedded-initramfs))
+	$(eval override CARGO_FEATURES := $(subst $(space),$(comma),$(BASE_KERNEL_FEATURES)))
+	$(eval override FEATURE_ARGS := --features "$(CARGO_FEATURES)")
+	$(call build_kernel,$(RV_ARCH),$(RV_TARGET),$(RV_CROSS_COMPILE),1)
+
+all: kernel-la kernel-rv
 
 clean:
 	cargo clean
-	rm -f $(LA_KERNEL) $(RV_KERNEL) build/initramfs.cpio $(LA_INITRAMFS) $(RV_INITRAMFS)
-	rm -rf $(BUILD_DIR)/elm-smoke-la $(BUILD_DIR)/elm-smoke-rv $(BUILD_DIR)/elmctl-la $(BUILD_DIR)/elmctl-rv
-	rm -rf $(BUILD_DIR)/modules $(BUILD_DIR)/elm-interface-current $(ELM_TOOL_TARGET)
+	rm -rf $(BUILD_DIR)/loongarch64 $(BUILD_DIR)/riscv64 $(ELM_INTERFACE_ROOT) \
+		$(ELM_TOOL_TARGET)
+	rm -f $(LA_ROOT_KERNEL) $(RV_ROOT_KERNEL)

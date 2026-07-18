@@ -1346,7 +1346,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 ### Rust ELM 独立仓库开发框架
 
-外部 ELM 不维护函数表式第二套内核 API，也不从原内核仓库建立 path dependency。`cargo elm sync` 同步小型 `elm`/`kernel-symbols` 开发框架和声明式生成的非网络子系统 metadata façade；目标专属的真实 metadata、Rust 支持归档、审核导入库与 LSP 源码投影来自共享接口仓库。工程内 `.elm/kernel-interface/<target>` 和 `.elm/kernel-source` 都是指向共享缓存的符号链接，不复制完整内核接口。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，并按 `vfs::*`、`sched::*`、`general::mm::*`、`hal::*` 等原路径调用真实内核能力；Manager 工程额外启用 `management` feature。`net`、`socket`、`mygo-smoltcp` 以及 VFS/general 中的网络专用入口不会生成 façade 或 Kernel API Profile 符号。正式构建严格使用目标接口包中的二进制 metadata，源码投影只参与补全、诊断、悬停、跳转和宿主 `cargo check`。
+外部 ELM 不维护函数表式第二套内核 API，也不从原内核仓库建立 path dependency。`cargo elm sync` 同步小型 `elm`/`kernel-symbols` 开发框架和声明式生成的内核子系统 metadata façade；目标专属的真实 metadata、Rust 支持归档、审核导入库与 LSP 源码投影来自共享接口仓库。工程内 `.elm/kernel-interface/<target>` 和 `.elm/kernel-source` 都是指向共享缓存的符号链接，不复制完整内核接口。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，并按 `vfs::*`、`socket::*`、`net::*`、`sched::*`、`general::mm::*`、`hal::*` 等原路径调用真实内核能力；Manager 工程额外启用 `management` feature。AF_UNIX 所属的 `socket` crate、INET 数据路径所属的 `vfs` 接口，以及网络驱动接入所需的 `net` 类型与方法都是正式 Kernel API。`mygo-smoltcp` 仅作为 `net` 的内部协议引擎存在，不生成独立 façade，也不进入公开符号目录。正式构建严格使用目标接口包中的二进制 metadata，源码投影只参与补全、诊断、悬停、跳转和宿主 `cargo check`。
 
 #### Kernel API Profile 与条件编译
 
@@ -1384,7 +1384,7 @@ fn configure_device() {
 内核在执行 initcall 前再次比较实时符号目录摘要。
 
 同一工程选择的所有 Profile 必须声明相同的 `framework_hash`。`cargo elm sync` 会重新计算
-接口包中 `elm`、`kernel-symbols`、全部已登记非网络子系统 façade 和 framework workspace 的
+接口包中 `elm`、`kernel-symbols`、全部已登记内核子系统 façade 和 framework workspace 的
 完整摘要，既拒绝声明不一致的多 Profile 组合，也拒绝清单与实际文件不一致的损坏快照。
 
 #### `m/y/n` 构建语义
@@ -1431,12 +1431,12 @@ cargo elm new ../demo-hello \
 
 生成结果包含：
 
-- `Cargo.toml`：独立 package，依赖同步后的 `elm` 与全部已登记非网络子系统 façade；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`。默认 `elm-lsp` feature 把这些 metadata façade 接到源码投影，正式构建关闭根 package 的默认 feature；release 与分析使用的 dev profile 都固定 `panic = "abort"`。
+- `Cargo.toml`：独立 package，依赖同步后的 `elm` 与全部已登记内核子系统 façade；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`。默认 `elm-lsp` feature 把这些 metadata façade 接到源码投影，正式构建关闭根 package 的默认 feature；release 与分析使用的 dev profile 都固定 `panic = "abort"`。
 - `Elm.toml`：名称、版本、种类、来源 identifier、`m/y/n` 模式、菜单、单元依赖和可选 `[[profiles]]` 的唯一声明源。未声明 Profile 时构建接口仓库中全部可用 API Profile。
 - `src/main.rs`：唯一业务源码，包含 `no_std + no_main`、唯一 `ElmModule` 实现，以及仅在受管模式启用的 panic 边界。Cargo 的 bin 与 lib 目标都指向该文件，因此 `m` 与 `y` 不维护源码包装层或双轨实现。
 - `elm.ld`：固定的连续 `PT_LOAD`、非装载 `.elm.meta` 和动态重定位布局。
 - `.cargo/config.toml`：RISC-V64 与 LoongArch64 的 PIE/linker 配置，以及活动 Profile 的 `elm_kernel_api`、`elm_kernel_profile` 和完整 check-cfg 值域；不强制宿主默认 target，因此普通 `cargo check` 和 rust-analyzer 不要求安装 bare-metal 标准库。
-- `.elm/framework`：与内核源码解耦的独立嵌套 workspace，包含 `elm`、`kernel-symbols` 和声明式生成的非网络子系统 metadata façade；更新工具后使用 `cargo elm sync` 同步。
+- `.elm/framework`：与内核源码解耦的独立嵌套 workspace，包含 `elm`、`kernel-symbols` 和声明式生成的内核子系统 metadata façade；更新工具后使用 `cargo elm sync` 同步。
 - `.elm/kernel-interface/<target>`：活动目标 Profile 的共享接口包链接。正式构建时工具会原子切换到当前变体。
 - `.elm/kernel-source`：活动接口的共享 LSP 源码投影链接，不进入目标代码生成和链接。
 - `Elm.lock`：记录模块模式、工具版本、rustc、目标、Profile identifier、桥接 ABI、接口摘要、framework 摘要、源码摘要和内核镜像摘要。
@@ -1479,7 +1479,7 @@ panic handler 与业务实现位于同一个 `src/main.rs`，但只在非 `elm-i
 开发者仍不手写 EBI ABI 入口。`y` 模式没有 elm-mgr 调用上下文，因此业务代码若使用
 `elm::runtime::*`，应通过
 `#[cfg(not(feature = "elm-integrated"))]` 提供受管路径，并为集成路径选择直接内核 API 或
-明确的无操作行为；普通非网络子系统调用在两种模式下保持同一源码。
+明确的无操作行为；普通内核子系统调用在两种模式下保持同一源码。
 
 `kind = "manager"` 的工程会由 `cargo elm` 自动启用 `management` feature。管理型 ELM
 通过类型化客户端取得管理命名空间，不接触裸命令号或裸函数指针：
@@ -1586,7 +1586,7 @@ make kernel-rv
 make kernel-la
 ```
 
-`make kernel-rv` 会把 RISC-V64 静态链接版本安装到 `userland/rootfs-rv/bin/elmctl` 和 `userland/rootfs-rv/bin/elmctl-smoke`，并重新打包到 `build/initramfs-rv.cpio`。`make kernel-la` 同理安装 LoongArch64 版本到 `userland/rootfs-la/bin/elmctl` 和 `userland/rootfs-la/bin/elmctl-smoke`。
+`make kernel-rv` 会在 `build/riscv64/compat-rootfs/bin` 安装 RISC-V64 静态链接版本的 `elmctl` 和 `elmctl-smoke`，打包 `build/riscv64/compat-initramfs.cpio`，并输出根目录 `kernel-rv`。`make kernel-la` 使用 `build/loongarch64/compat-rootfs` 和 `build/loongarch64/compat-initramfs.cpio`，最终输出 `kernel-la`。兼容构建不会修改 `userland/rootfs-rv` 或 `userland/rootfs-la`。
 
 RISC-V64 手动运行方式：
 

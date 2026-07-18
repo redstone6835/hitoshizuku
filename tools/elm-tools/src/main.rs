@@ -35,7 +35,8 @@ use kernel_interface::{
     KernelInterfaceManifest, emit_kernel_symbol_probe, export_kernel_interface,
 };
 use project::{
-    ElmBuildMode, ElmProjectDependency, ElmProjectManifest, KernelInterfaceBundle,
+    ElmBuildMode, ElmProjectDependency, ElmProjectManifest,
+    KernelInterfaceBundle,
     activate_kernel_interface, cargo_build, cargo_build_integrated, cargo_check, cargo_test,
     diagnose_project, scaffold_project, selected_kernel_interfaces, sync_framework,
 };
@@ -159,6 +160,7 @@ fn run() -> Result<(), String> {
         "sync" => cmd_sync_framework(command_args),
         "build" => cmd_build(command_args),
         "build-set" => cmd_build_set(command_args),
+        "configure-set" => cmd_configure_set(command_args),
         "check" => cmd_check(command_args),
         "test" => cmd_test(command_args),
         "doctor" => cmd_doctor(command_args),
@@ -199,6 +201,7 @@ fn usage() {
     eprintln!(
         "  build-set <Modules.toml> --config <.config> --target <triple> --output <directory> [--features <a,b>]"
     );
+    eprintln!("  configure-set <Modules.toml> --config <.config> --mode <config|oldconfig|defconfig>");
     eprintln!("  inspect <file.eki>");
     eprintln!("  image-bundle <out.eki> --variant <profile-manifest> <image.eki> <priority> [...]");
 }
@@ -448,6 +451,22 @@ fn cmd_build_set(args: &[String]) -> Result<(), String> {
         output.as_deref().ok_or("build-set 缺少 --output")?,
         &features,
     )
+}
+
+fn cmd_configure_set(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("configure-set 缺少 Modules.toml".to_string());
+    }
+    let set = Path::new(&args[0]);
+    let options = parse_named_options(&args[1..], &["--config", "--mode"])?;
+    let config = Path::new(required_option(&options, "--config")?);
+    let mode = match required_option(&options, "--mode")? {
+        "config" => build_set::ConfigMode::Config,
+        "oldconfig" => build_set::ConfigMode::OldConfig,
+        "defconfig" => build_set::ConfigMode::DefConfig,
+        value => return Err(format!("未知配置模式: {value}")),
+    };
+    build_set::configure_set(set, config, mode)
 }
 
 fn parse_feature_list(value: &str) -> Result<Vec<String>, String> {
@@ -2997,6 +3016,7 @@ mod tests {
             kind: "driver".to_string(),
             source: "local.demo".to_string(),
             mode: ElmBuildMode::Disabled,
+            integrated_phase: project::ElmIntegratedPhase::Runtime,
             api: None,
             menu: None,
             dependencies: Vec::new(),

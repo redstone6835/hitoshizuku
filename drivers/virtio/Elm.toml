@@ -4,6 +4,7 @@ version = "0.1.0"
 kind = "service"
 source = "kernel-tree:drivers.virtio"
 mode = "m"
+integrated_phase = "device"
 
 [api]
 crate = "virtio"

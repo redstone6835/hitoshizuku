@@ -27,11 +27,11 @@
 | 支持架构 | LoongArch64, RISC-V64 |
 | 启动环境 | QEMU virt / contest image |
 | 用户态 | glibc / musl 测试镜像 |
-| 重点能力 | ELF 加载、虚拟内存、调度、VFS、ext4、socket、virtio、RTC、IRQ |
+| 重点能力 | ELF 加载、虚拟内存、调度、VFS、ext4、AF_UNIX、IP 网络、ELM、VirtIO block、RTC、IRQ |
 
 ## 文档
 
-- 初赛技术文档：`doc/main.typ`
+- 初赛技术文档：`docs/main.typ`
 - 初赛技术报告：(待上传)
 - 初赛安全分析报告：(待上传)
 - 初赛 PPT: (待上传)
@@ -41,9 +41,10 @@
 ```text
 .
 ├── arch/       # 架构相关代码：LoongArch64 / RISC-V64 入口、陷入、页表等
-├── kernel/     # syscall、exec、调度、进程与内核主路径
-├── general/    # 设备、内存、VFS 投影、平台驱动等通用内核设施
-├── libs/       # vfs、net、socket、extfs、sched、allocator 等共享库
+├── kernel/     # syscall、exec、调度、进程、ELM 运行时与内核主路径
+├── general/    # 设备骨架、内存、VFS 投影等通用内核设施
+├── drivers/    # 可选择 y/m/n 的 ELM 驱动与基础服务
+├── libs/       # vfs、socket、net、extfs、sched、allocator、elm 等共享库
 ├── hal/        # 平台抽象层
 ├── userland/   # initramfs、rcS、测试入口脚本
 ├── third/      # 外部组件
@@ -58,30 +59,58 @@
 docker run --rm -it -v "$PWD":/work -w /work zhouzhouyi/os-contest:20260510 bash
 ```
 
-进入容器后：
+进入容器后，默认 `make` 构建两个架构的裸内核和所选 ELM，不打包 initramfs：
 
 ```sh
-make kernel-la      # 构建 LoongArch64 内核，输出 ./kernel-la
-make kernel-rv      # 构建 RISC-V64 内核，输出 ./kernel-rv
-cargo fmt --all     # 格式化 workspace
+make
+# build/loongarch64/kernel
+# build/riscv64/kernel
 ```
 
-VirtIO Framework 和 VirtIO Block 由根目录 `.config` 控制，初次构建会从
-`configs/default.config` 生成默认配置：
+常用构建入口：
+
+```sh
+make ARCH=loongarch64             # 只构建 LoongArch64 裸内核和模块
+make ARCH=riscv64                 # 只构建 RISC-V64 裸内核和模块
+make modules ARCH=loongarch64     # 只构建所选架构的 ELM 集合
+make busybox ARCH=loongarch64     # 输出 build/loongarch64/initramfs.cpio
+make ARCH=loongarch64 INITRAMFS=path/to/rootfs.cpio
+make kernel-la                    # 兼容测评构建，输出 ./kernel-la
+make kernel-rv                    # 兼容测评构建，输出 ./kernel-rv
+make all                          # 同时执行 kernel-la 与 kernel-rv
+```
+
+`kernel-la`、`kernel-rv` 在 `build/<arch>/compat-rootfs` 中组装兼容 rootfs，不会修改
+`userland/rootfs-*` 源目录。`make busybox` 只生成独立的 BusyBox initramfs，不参与默认
+内核构建。
+
+所有 `drivers/Modules.toml` 中登记的组件由根目录 `.config` 控制。首次构建会从
+`configs/default.config` 创建配置；也可以使用：
+
+```sh
+make config       # 交互配置
+make oldconfig    # 保留已有选择并询问新增项
+make defconfig    # 恢复仓库默认配置
+```
+
+每个组件统一支持三态：
 
 ```text
-CONFIG_VIRTIO=y
-CONFIG_VIRTIO_BLK=y
+CONFIG_UART16550=y
+CONFIG_VIRTIO=m
+CONFIG_VIRTIO_BLK=m
 ```
 
-- `CONFIG_VIRTIO=y`：把 VirtIO Framework 及启用的依赖驱动直接链接进内核。
-- `CONFIG_VIRTIO=m`：把它们构建为受管 ELM，并安装到 initramfs 的 `/lib/elm`。
-- `CONFIG_VIRTIO=n`：完全不构建 VirtIO；此时 `CONFIG_VIRTIO_BLK` 必须为 `n`。
-- `CONFIG_VIRTIO_BLK=y`：启用块设备 ELM，其实际 `y/m` 模式继承 VirtIO Framework。
-- `CONFIG_VIRTIO_BLK=n`：只保留已启用的 VirtIO Framework，不构建块设备驱动。
+- `y`：作为集成 ELM 直接链接进内核，运行时行为与内建代码一致。
+- `m`：生成受管 EKI，位于 `build/<arch>/modules/*.eki`；兼容构建会放入 `/lib/elm`。
+- `n`：不编译该组件。
 
-修改后可用 `make defconfig` 恢复默认配置。动态和集成构建产物分别位于
-`build/modules/<target>/*.eki` 与 `build/modules/<target>/*.integrated.a`。
+硬依赖组件必须使用相同模式。例如 `virtio.block` 依赖 `virtio.framework`，不能在
+framework 为 `n` 时启用，也不能混用 `y` 与 `m`。构建工具会在编译前拒绝无效配置。
+
+IP 协议栈位于 `libs/net`，INET 套接字数据路径由 `libs/vfs` 接入。loopback 作为
+`net.loopback` ELM 位于 `drivers/loopback`，默认集成进内核，也可以配置为 `m` 或 `n`。
+VirtIO-net 仍未恢复；接入外部网络需要另行提供实现 `net::NetDriver` 的网络设备 ELM。
 
 ## QEMU 运行示例
 
@@ -105,8 +134,9 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 | 类型 | 命令 |
 | --- | --- |
-| socket 单测 | `cargo test -p socket` |
-| extfs 单测 | `cargo test -p extfs` |
+| AF_UNIX 单测 | `cargo test -p socket --target x86_64-unknown-linux-gnu` |
+| IP 网络栈单测 | `cargo test -p net --target x86_64-unknown-linux-gnu` |
+| extfs 单测 | `cargo test -p extfs --target x86_64-unknown-linux-gnu` |
 | 内核启动验证 | 使用上方 QEMU 命令启动目标架构 |
 | 用户态集成测试 | 由 `userland/rootfs-*/etc/init.d/rcS` 按测试镜像脚本触发 |
 

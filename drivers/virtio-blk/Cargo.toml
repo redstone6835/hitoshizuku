@@ -18,11 +18,13 @@ bench = false
 
 [features]
 default = ["elm-lsp"]
-elm-lsp = ["acpi/lsp", "allocator/lsp", "efi/lsp", "elf/lsp", "errno/lsp", "extfs/lsp", "fatfs/lsp", "general/lsp", "hal/lsp", "log/lsp", "mm/lsp", "sched/lsp", "vfs/lsp"]
+elm-lsp = ["acpi/lsp", "allocator/lsp", "efi/lsp", "elf/lsp", "errno/lsp", "extfs/lsp", "fatfs/lsp", "general/lsp", "hal/lsp", "log/lsp", "mm/lsp", "net/lsp", "sched/lsp", "socket/lsp", "vfs/lsp"]
 elm-integrated = ["virtio/elm-integrated"]
 block-profile = []
 
 [dependencies]
+net = { path = ".elm/framework/net", default-features = false }
+socket = { path = ".elm/framework/socket", default-features = false }
 vfs = { path = ".elm/framework/vfs", default-features = false }
 mm = { path = ".elm/framework/mm", default-features = false }
 hal = { path = ".elm/framework/hal", default-features = false }

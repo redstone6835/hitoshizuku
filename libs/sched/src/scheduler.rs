@@ -1741,6 +1741,13 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
 ///
 /// `now_ns` 是当前时间戳（纳秒）；传 0 表示"不推进虚拟时间"（适合启动期、
 /// 主动 yield 之类无法测时间的路径）。返回时调用方已经重新获得 CPU。
+#[kernel_symbols::export(
+    name = "sched.scheduler.schedule_once",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_TASK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn schedule_once(now_ns: u64) {
     let cpu_id = cpu();
     cleanup_retired_tasks(cpu_id);

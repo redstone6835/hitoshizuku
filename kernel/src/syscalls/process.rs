@@ -835,18 +835,49 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Err(Errno::EINVAL);
     }
 
+    let blocking = flags & GRND_NONBLOCK == 0;
+    let mode = if flags & GRND_INSECURE != 0 {
+        general::dev::random::RandomReadMode::Insecure
+    } else if flags & GRND_RANDOM != 0 {
+        general::dev::random::RandomReadMode::Entropy { blocking }
+    } else {
+        general::dev::random::RandomReadMode::Secure { blocking }
+    };
+
     let mut done = 0usize;
     let mut chunk = [0u8; RANDOM_COPY_CHUNK];
     while done < size {
         let n = (size - done).min(chunk.len());
         // 256 字节只作为内核栈上临时缓冲大小，不限制用户态请求长度。
-        prng_fill(&mut chunk[..n]);
+        let produced = match general::dev::random::fill(&mut chunk[..n], mode) {
+            Ok(produced) if produced <= n => produced,
+            Ok(_) if done != 0 => break,
+            Ok(_) => return Err(Errno::EIO),
+            Err(_) if done != 0 => break,
+            Err(error) => {
+                return Err(match error {
+                    general::dev::char::CharIoError::Unavailable => Errno::ENODEV,
+                    general::dev::char::CharIoError::Interrupted => Errno::EINTR,
+                    general::dev::char::CharIoError::Timeout => Errno::EAGAIN,
+                    general::dev::char::CharIoError::HardwareError => Errno::EIO,
+                });
+            }
+        };
+        if produced == 0 {
+            if done == 0 {
+                return Err(Errno::EAGAIN);
+            }
+            break;
+        }
         let dst = buf_user.checked_add(done).ok_or(Errno::EFAULT)?;
-        copy_to_user(dst, &chunk[..n]).map_err(|e| e.as_errno())?;
-        done += n;
+        copy_to_user(dst, &chunk[..produced]).map_err(|e| e.as_errno())?;
+        done += produced;
+        if produced < n {
+            break;
+        }
     }
 
-    Ok(size)
+    Ok(done)
 }
 
 pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4061,22 +4092,4 @@ fn put_u64(out: &mut [u8], off: usize, v: u64) {
 
 fn put_i64(out: &mut [u8], off: usize, v: i64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-static PRNG_STATE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0xDEAD_BEEF_CAFE_BABEu64);
-
-fn prng_fill(buf: &mut [u8]) {
-    let mut state = PRNG_STATE.load(core::sync::atomic::Ordering::Relaxed);
-    if state == 0 {
-        state = sched::now_ns_public() | 1;
-    }
-    for chunk in buf.chunks_mut(8) {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let bytes = state.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    PRNG_STATE.store(state, core::sync::atomic::Ordering::Relaxed);
 }

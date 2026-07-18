@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,7 +22,17 @@ struct ModuleSpec {
     path: PathBuf,
     config: String,
     depends: Vec<String>,
-    inherit_mode: Option<String>,
+    after: Vec<String>,
+    targets: Vec<String>,
+    prompt: String,
+    default: ElmBuildMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigMode {
+    Config,
+    OldConfig,
+    DefConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +58,7 @@ pub fn build_set(
     let set_root = set_path
         .parent()
         .ok_or_else(|| "模块集合路径没有父目录".to_string())?;
-    let modules = parse_module_set(&set_path)?;
+    let modules = active_modules(parse_module_set(&set_path)?, target)?;
     let config = parse_config(config_path)?;
     let ordered = topological_order(&modules)?;
     let modes = resolve_modes(&ordered, &config)?;
@@ -197,7 +208,10 @@ fn parse_module_set(path: &Path) -> Result<Vec<ModuleSpec>, String> {
             .split_once('=')
             .ok_or_else(|| format!("Modules.toml 第 {line_number} 行缺少 '='"))?;
         let key = key.trim();
-        if !matches!(key, "name" | "path" | "config" | "depends" | "inherit_mode") {
+        if !matches!(
+            key,
+            "name" | "path" | "config" | "depends" | "after" | "targets" | "prompt" | "default"
+        ) {
             return Err(format!(
                 "Modules.toml 第 {line_number} 行包含未知字段 {key}"
             ));
@@ -245,15 +259,71 @@ fn parse_module_set(path: &Path) -> Result<Vec<ModuleSpec>, String> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let after = split_list(record.get("after"));
+            let targets = split_list(record.get("targets"));
+            let default = match record.get("default").map(String::as_str).unwrap_or("n") {
+                "y" => ElmBuildMode::Integrated,
+                "m" => ElmBuildMode::Managed,
+                "n" => ElmBuildMode::Disabled,
+                value => return Err(format!("模块 {name} 的 default={value} 不是 y/m/n")),
+            };
             Ok(ModuleSpec {
                 name,
                 path,
                 config: required("config")?,
                 depends,
-                inherit_mode: record.get("inherit_mode").cloned(),
+                after,
+                targets,
+                prompt: required("prompt")?,
+                default,
             })
         })
         .collect()
+}
+
+fn split_list(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn active_modules(modules: Vec<ModuleSpec>, target: &str) -> Result<Vec<ModuleSpec>, String> {
+    let active_names = modules
+        .iter()
+        .filter(|module| module.targets.is_empty() || module.targets.iter().any(|item| item == target))
+        .map(|module| module.name.clone())
+        .collect::<BTreeSet<_>>();
+    let all_names = modules
+        .iter()
+        .map(|module| module.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut active = Vec::new();
+    for mut module in modules {
+        if !active_names.contains(&module.name) {
+            continue;
+        }
+        for dependency in &module.depends {
+            if !all_names.contains(dependency) {
+                return Err(format!("模块 {} 依赖未知模块 {dependency}", module.name));
+            }
+            if !active_names.contains(dependency) {
+                return Err(format!(
+                    "模块 {} 在目标 {target} 上依赖未启用的模块 {dependency}",
+                    module.name
+                ));
+            }
+        }
+        module.after.retain(|dependency| active_names.contains(dependency));
+        active.push(module);
+    }
+    Ok(active)
 }
 
 fn parse_config(path: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -284,18 +354,10 @@ fn topological_order(modules: &[ModuleSpec]) -> Result<Vec<ModuleSpec>, String> 
         .map(|module| (module.name.as_str(), module))
         .collect::<BTreeMap<_, _>>();
     for module in modules {
-        for dependency in &module.depends {
+        for dependency in module.depends.iter().chain(&module.after) {
             if !by_name.contains_key(dependency.as_str()) {
                 return Err(format!("模块 {} 依赖未知模块 {dependency}", module.name));
             }
-        }
-        if let Some(parent) = &module.inherit_mode
-            && !module.depends.iter().any(|dependency| dependency == parent)
-        {
-            return Err(format!(
-                "模块 {} 的 inherit_mode={parent} 必须同时声明为 depends",
-                module.name
-            ));
         }
     }
     let mut pending = modules.iter().collect::<Vec<_>>();
@@ -308,6 +370,7 @@ fn topological_order(modules: &[ModuleSpec]) -> Result<Vec<ModuleSpec>, String> 
             if pending[index]
                 .depends
                 .iter()
+                .chain(&pending[index].after)
                 .all(|dependency| emitted.contains(dependency))
             {
                 let module = pending.remove(index);
@@ -333,41 +396,89 @@ fn resolve_modes(
         let raw = config
             .get(&module.config)
             .map(String::as_str)
-            .unwrap_or("n");
-        let mode = if let Some(parent) = &module.inherit_mode {
-            match raw {
-                "n" => ElmBuildMode::Disabled,
-                "y" => {
-                    let parent_mode = *modes.get(parent).ok_or_else(|| {
-                        format!("模块 {} 在依赖模式确定前继承 {parent}", module.name)
-                    })?;
-                    if parent_mode == ElmBuildMode::Disabled {
-                        return Err(format!(
-                            "模块 {} 已启用，但继承目标 {parent} 已禁用",
-                            module.name
-                        ));
-                    }
-                    parent_mode
-                }
-                "m" => {
-                    return Err(format!(
-                        "{} 只接受 y/n；其实际模式继承 {parent}",
-                        module.config
-                    ));
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            match raw {
-                "y" => ElmBuildMode::Integrated,
-                "m" => ElmBuildMode::Managed,
-                "n" => ElmBuildMode::Disabled,
-                _ => unreachable!(),
-            }
+            .unwrap_or(module.default.as_str());
+        let mode = match raw {
+            "y" => ElmBuildMode::Integrated,
+            "m" => ElmBuildMode::Managed,
+            "n" => ElmBuildMode::Disabled,
+            _ => unreachable!(),
         };
         modes.insert(module.name.clone(), mode);
     }
     Ok(modes)
+}
+
+pub fn configure_set(
+    set_path: &Path,
+    config_path: &Path,
+    mode: ConfigMode,
+) -> Result<(), String> {
+    let modules = parse_module_set(set_path)?;
+    let known = modules
+        .iter()
+        .map(|module| module.config.clone())
+        .collect::<BTreeSet<_>>();
+    let existing = if config_path.is_file() {
+        parse_config(config_path)?
+    } else {
+        BTreeMap::new()
+    };
+    for key in existing.keys() {
+        if !known.contains(key) {
+            return Err(format!("配置包含 Modules.toml 未声明的键 {key}"));
+        }
+    }
+
+    let mut selected = BTreeMap::new();
+    let mut input = String::new();
+    for module in &modules {
+        let fallback = if mode == ConfigMode::DefConfig {
+            module.default.as_str()
+        } else {
+            existing
+                .get(&module.config)
+                .map(String::as_str)
+                .unwrap_or(module.default.as_str())
+        };
+        let value = match mode {
+            ConfigMode::DefConfig => fallback,
+            ConfigMode::OldConfig if existing.contains_key(&module.config) => fallback,
+            ConfigMode::Config | ConfigMode::OldConfig => loop {
+                print!("{} ({}) [y/m/n] ({}): ", module.prompt, module.config, fallback);
+                io::stdout()
+                    .flush()
+                    .map_err(|err| format!("刷新配置提示失败: {err}"))?;
+                input.clear();
+                io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|err| format!("读取配置输入失败: {err}"))?;
+                let answer = input.trim();
+                let answer = if answer.is_empty() { fallback } else { answer };
+                if matches!(answer, "y" | "m" | "n") {
+                    break answer;
+                }
+                eprintln!("请输入 y、m 或 n");
+            },
+        };
+        selected.insert(module.config.clone(), value.to_string());
+    }
+
+    for target in ["loongarch64-unknown-none", "riscv64gc-unknown-none-elf"] {
+        let active = active_modules(modules.clone(), target)?;
+        let ordered = topological_order(&active)?;
+        let modes = resolve_modes(&ordered, &selected)?;
+        validate_enabled_dependencies(&ordered, &modes)?;
+    }
+
+    let mut output = String::from("# 此文件由 make config 生成，请勿提交构建产物。\n");
+    for module in modules {
+        output.push_str(&module.config);
+        output.push('=');
+        output.push_str(&selected[&module.config]);
+        output.push('\n');
+    }
+    fs::write(config_path, output)
+        .map_err(|err| format!("写入配置 {} 失败: {err}", config_path.display()))
 }
 
 fn validate_enabled_dependencies(
@@ -553,31 +664,34 @@ mod tests {
         name: &str,
         config: &str,
         depends: &[&str],
-        inherit_mode: Option<&str>,
+        after: &[&str],
     ) -> ModuleSpec {
         ModuleSpec {
             name: name.to_string(),
             path: PathBuf::from(name),
             config: config.to_string(),
             depends: depends.iter().map(|value| (*value).to_string()).collect(),
-            inherit_mode: inherit_mode.map(str::to_string),
+            after: after.iter().map(|value| (*value).to_string()).collect(),
+            targets: Vec::new(),
+            prompt: name.to_string(),
+            default: ElmBuildMode::Disabled,
         }
     }
 
     fn virtio_modules() -> Vec<ModuleSpec> {
         vec![
-            module("virtio.framework", "CONFIG_VIRTIO", &[], None),
+            module("virtio.framework", "CONFIG_VIRTIO", &[], &[]),
             module(
                 "virtio.block",
                 "CONFIG_VIRTIO_BLK",
                 &["virtio.framework"],
-                Some("virtio.framework"),
+                &[],
             ),
         ]
     }
 
     #[test]
-    fn inherited_module_follows_integrated_and_managed_parent_modes() {
+    fn hard_dependency_requires_matching_mode() {
         let modules = topological_order(&virtio_modules()).expect("依赖图应当有效");
         for (parent, expected) in [
             ("y", ElmBuildMode::Integrated),
@@ -585,9 +699,9 @@ mod tests {
         ] {
             let config = BTreeMap::from([
                 ("CONFIG_VIRTIO".to_string(), parent.to_string()),
-                ("CONFIG_VIRTIO_BLK".to_string(), "y".to_string()),
+                ("CONFIG_VIRTIO_BLK".to_string(), parent.to_string()),
             ]);
-            let modes = resolve_modes(&modules, &config).expect("模式继承应当成功");
+            let modes = resolve_modes(&modules, &config).expect("模式解析应当成功");
             assert_eq!(modes["virtio.framework"], expected);
             assert_eq!(modes["virtio.block"], expected);
             validate_enabled_dependencies(&modules, &modes).expect("依赖模式应当一致");
@@ -595,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_module_can_be_disabled_independently() {
+    fn dependent_module_can_be_disabled_independently() {
         let modules = topological_order(&virtio_modules()).expect("依赖图应当有效");
         let config = BTreeMap::from([
             ("CONFIG_VIRTIO".to_string(), "m".to_string()),
@@ -608,23 +722,15 @@ mod tests {
     }
 
     #[test]
-    fn enabled_inherited_module_rejects_disabled_parent() {
+    fn enabled_module_rejects_disabled_dependency() {
         let modules = topological_order(&virtio_modules()).expect("依赖图应当有效");
         let config = BTreeMap::from([
             ("CONFIG_VIRTIO".to_string(), "n".to_string()),
             ("CONFIG_VIRTIO_BLK".to_string(), "y".to_string()),
         ]);
-        let error = resolve_modes(&modules, &config).expect_err("禁用父模块必须拒绝启用子模块");
-        assert!(error.contains("继承目标 virtio.framework 已禁用"));
-    }
-
-    #[test]
-    fn inherit_mode_requires_explicit_dependency() {
-        let modules = vec![
-            module("framework", "CONFIG_FRAMEWORK", &[], None),
-            module("driver", "CONFIG_DRIVER", &[], Some("framework")),
-        ];
-        let error = topological_order(&modules).expect_err("隐式继承依赖必须被拒绝");
-        assert!(error.contains("必须同时声明为 depends"));
+        let modes = resolve_modes(&modules, &config).expect("模式解析应当成功");
+        let error = validate_enabled_dependencies(&modules, &modes)
+            .expect_err("禁用依赖必须拒绝启用子模块");
+        assert!(error.contains("依赖 virtio.framework 已禁用"));
     }
 }

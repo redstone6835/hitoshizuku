@@ -70,6 +70,7 @@ pub struct WaitQueue {
     waiters: Spinlock<VecDeque<Arc<WaitQueueEntry>>>,
 }
 
+#[kernel_symbols::export]
 impl WaitQueue {
     pub const fn new() -> Self {
         Self {
@@ -82,6 +83,14 @@ impl WaitQueue {
     /// 该接口用于 `poll` 等只登记通知对象的路径。阻塞当前任务应使用
     /// [`prepare_to_wait`](Self::prepare_to_wait)。同一任务可以登记到多个队列，
     /// 但在同一个队列中只保留一个有效条目。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.enqueue",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn enqueue(&self, task: &Arc<Task>) -> Arc<WaitQueueEntry> {
         let mut waiters = self.waiters.lock();
         waiters.retain(|entry| entry.is_waiting() && entry.task().is_some());
@@ -103,6 +112,14 @@ impl WaitQueue {
     /// 调用方必须在 prepare 后重新检查条件；若条件已经满足，应立即
     /// [`finish_wait`]，不要调度出去。这个协议覆盖"事件发生在首次检查和
     /// 真正睡眠之间"的窗口。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.prepare_to_wait",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn prepare_to_wait(&self, task: &Arc<Task>, state: TaskState) -> Arc<WaitQueueEntry> {
         debug_assert!(matches!(
             state,
@@ -131,6 +148,13 @@ impl WaitQueue {
     }
 
     /// 结束等待：从队列移除，并把仍处于睡眠态的任务恢复为可运行态。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.finish_wait",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn finish_wait(&self, entry: &Arc<WaitQueueEntry>) {
         {
             let mut waiters = self.waiters.lock();
@@ -157,6 +181,13 @@ impl WaitQueue {
     }
 
     /// 从队列中显式移除某个任务。常见于被信号打断、提前超时等场景。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.remove",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn remove(&self, task: &Arc<Task>) {
         let mut w = self.waiters.lock();
         w.retain(|entry| match entry.task() {
@@ -172,6 +203,14 @@ impl WaitQueue {
     /// 唤醒一个等待者。用 VecDeque 从队头取元素，避免 Vec::remove(0)
     /// 在 pipe/select 等高频等待路径上反复搬移整段数组。
     /// 返回被唤醒任务的 `Arc`，便于上层决定是否直接转入 runqueue。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.wake_one",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn wake_one(&self, wake: WakeFn) -> Option<Arc<Task>> {
         let picked = {
             let mut w = self.waiters.lock();
@@ -204,11 +243,26 @@ impl WaitQueue {
     }
 
     /// 唤醒所有等待者。先把列表整取出来，锁外逐个调用 wake，防止反序。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.wake_all",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn wake_all(&self) {
         self.wake_all_with(default_wake);
     }
 
     /// 使用默认调度器入口唤醒一个等待者。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.wake_one_default",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn wake_one_default(&self) -> Option<Arc<Task>> {
         self.wake_one(default_wake)
     }
@@ -286,6 +340,13 @@ impl WaitQueue {
     }
 
     /// 当前队列中的登记项数量。该值只用于诊断和测试。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.len_hint",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_QUERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+    )]
     pub fn len_hint(&self) -> usize {
         self.waiters.lock().len()
     }

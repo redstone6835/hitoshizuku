@@ -312,13 +312,18 @@ fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
         } else {
             quote!(0u32)
         };
+        let self_ty_path = LitStr::new(&normalize_abi_tokens(quote!(#self_ty)), Span::call_site());
         let item_path = if let Some(trait_path) = trait_path.as_ref() {
+            let trait_path = LitStr::new(
+                &normalize_abi_tokens(quote!(#trait_path)),
+                Span::call_site(),
+            );
             quote!(concat!(
                 module_path!(),
                 "::",
-                stringify!(#self_ty),
+                #self_ty_path,
                 " as ",
-                stringify!(#trait_path),
+                #trait_path,
                 "::",
                 stringify!(#ident)
             ))
@@ -326,7 +331,7 @@ fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
             quote!(concat!(
                 module_path!(),
                 "::",
-                stringify!(#self_ty),
+                #self_ty_path,
                 "::",
                 stringify!(#ident)
             ))
@@ -818,5 +823,11 @@ mod tests {
             canonical_function_abi(&function.sig).unwrap(),
             "unsafefn(*mutu8,usize)->*mutu8"
         );
+    }
+
+    #[test]
+    fn normalizes_trait_paths_used_in_descriptor_identity() {
+        let trait_path: syn::Path = syn::parse_quote!(fmt::Display);
+        assert_eq!(normalize_abi_tokens(quote!(#trait_path)), "fmt::Display");
     }
 }

@@ -1,13 +1,106 @@
 format = "ELM-MODULE-SET-V1"
 
 [[modules]]
+name = "platform.firmware-bus"
+path = "firmware-bus"
+config = "CONFIG_FIRMWARE_BUS"
+prompt = "固件 platform bus 驱动"
+default = "y"
+
+[[modules]]
+name = "platform.loongson-irq"
+path = "loongson-irq"
+config = "CONFIG_LOONGSON_IRQ"
+prompt = "Loongson 中断控制器驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.plic"
+path = "plic"
+config = "CONFIG_RISCV_PLIC"
+prompt = "RISC-V PLIC 驱动"
+default = "y"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.syscon"
+path = "syscon"
+config = "CONFIG_SYSCON"
+prompt = "Syscon 与固件电源驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.ls7a-rtc"
+path = "ls7a-rtc"
+config = "CONFIG_LS7A_RTC"
+prompt = "Loongson LS7A RTC 驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.loongson-irq"
+
+[[modules]]
+name = "platform.goldfish-rtc"
+path = "goldfish-rtc"
+config = "CONFIG_GOLDFISH_RTC"
+prompt = "Goldfish RTC 驱动"
+default = "y"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.plic"
+
+[[modules]]
+name = "platform.fw-cfg"
+path = "fw-cfg"
+config = "CONFIG_FW_CFG"
+prompt = "QEMU fw_cfg 驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.cfi-flash"
+path = "cfi-flash"
+config = "CONFIG_CFI_FLASH"
+prompt = "CFI NOR flash 驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.uart16550"
+path = "uart16550"
+config = "CONFIG_UART16550"
+prompt = "NS16550A UART 驱动"
+default = "y"
+after = "platform.firmware-bus,platform.loongson-irq,platform.plic"
+
+[[modules]]
+name = "kernel.random"
+path = "random"
+config = "CONFIG_RANDOM"
+prompt = "内核随机服务驱动"
+default = "y"
+
+[[modules]]
+name = "net.loopback"
+path = "loopback"
+config = "CONFIG_NET_LOOPBACK"
+prompt = "本地回环网络驱动"
+default = "y"
+
+[[modules]]
 name = "virtio.framework"
 path = "virtio"
 config = "CONFIG_VIRTIO"
+prompt = "VirtIO framework"
+default = "y"
+after = "platform.firmware-bus"
 
 [[modules]]
 name = "virtio.block"
 path = "virtio-blk"
 config = "CONFIG_VIRTIO_BLK"
+prompt = "VirtIO block 驱动"
+default = "y"
 depends = "virtio.framework"
-inherit_mode = "virtio.framework"

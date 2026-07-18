@@ -18,7 +18,7 @@ if [ -s "$archives" ]; then
     export ELM_INTEGRATED_ARCHIVES
 fi
 
-if grep -Eq '^module_count=[1-9][0-9]*$' "$manifest"; then
+if [ "${ELM_BIND_MODULES:-1}" != "0" ] && grep -Eq '^module_count=[1-9][0-9]*$' "$manifest"; then
     ELM_BUILD_BOUND_MANIFEST=$manifest
     export ELM_BUILD_BOUND_MANIFEST
 fi

@@ -1240,6 +1240,16 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
                 __elm_integrated_initialize_v1,
                 __elm_integrated_finalize_v1,
                 #integrated_profile_hash,
+                {
+                    #[cfg(elm_integrated_phase = "device")]
+                    {
+                        ::elm::KERNEL_INTEGRATED_PHASE_DEVICE
+                    }
+                    #[cfg(not(elm_integrated_phase = "device"))]
+                    {
+                        ::elm::KERNEL_INTEGRATED_PHASE_RUNTIME
+                    }
+                },
             );
     })
 }
