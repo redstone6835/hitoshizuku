@@ -827,14 +827,13 @@ impl FlowShard {
 
     pub fn parse_reassembled(
         &mut self,
-        context: FlowTurnContext<'_>,
         ethernet: &[crate::stack::NetStackEthernetV1],
+        network: &[crate::stack::NetStackNetworkV1],
     ) {
-        self.frontend.process_with_ethernet(
-            context.interface,
-            context.config,
+        self.frontend.process_with_stack_sidecars(
             &mut self.reassembled_input,
             ethernet,
+            network,
             &mut self.frontend_batch,
         );
         let count = self.frontend_batch.len();

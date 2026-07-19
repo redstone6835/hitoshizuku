@@ -2,21 +2,34 @@
 
 use alloc::boxed::Box;
 
+#[cfg(test)]
+use crate::InterfaceId;
 use crate::buf::{DropReason, NetBufPoolError, PacketBatch, PacketChain, PacketMetadata};
+#[cfg(test)]
 use crate::control::ConfigSnapshot;
 use crate::flow::{FlowKey, rss_hash};
 use crate::stack::{
-    NET_STACK_ETHERNET_ACCEPTED, NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
-    NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NetStackEthernetV1,
+    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_DROP_IPV4_CHECKSUM,
+    NET_STACK_DROP_IPV6_EXTENSION_LIMIT, NET_STACK_DROP_MALFORMED_ARP,
+    NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_NOT_LOCAL,
+    NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL, NET_STACK_ETHERNET_ACCEPTED,
+    NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
+    NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
+    NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
+    NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
+    NET_STACK_NETWORK_IP, NET_STACK_NETWORK_SKIPPED, NetStackEthernetV1, NetStackNetworkV1,
 };
 use crate::transport::{
     TCP_PROTOCOL_NUMBER, TcpPacket, parse_tcp_packet, parse_tcp_packet_trusted,
 };
 use crate::tuning::PACKET_BATCH_CAPACITY;
-use crate::{Endpoint, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
+use crate::{Endpoint, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
 
+#[cfg(test)]
 const ETHERTYPE_IPV4: u16 = 0x0800;
+#[cfg(test)]
 const ETHERTYPE_ARP: u16 = 0x0806;
+#[cfg(test)]
 const ETHERTYPE_IPV6: u16 = 0x86dd;
 #[cfg(test)]
 const ETHERTYPE_VLAN: u16 = 0x8100;
@@ -85,6 +98,7 @@ pub enum ControlPacket {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Ipv6OptionProblem {
     pointer: u32,
@@ -236,27 +250,31 @@ impl VectorFrontend {
         self.classify_hash(output);
     }
 
-    /// 使用 `net.stack` 已提交的 Ethernet sidecar 继续执行网络层和传输层解析。
+    /// 使用 `net.stack` 已提交的 Ethernet/L3 sidecar 继续执行传输层解析。
     ///
     /// 调用方必须先完成整个 worker-turn 帧校验；本函数开始后才会移动 packet
     /// ownership，因而 ELM fault 不会留下半消费 batch。
-    pub fn process_with_ethernet(
+    pub fn process_with_stack_sidecars(
         &self,
-        interface: InterfaceId,
-        config: &ConfigSnapshot,
         input: &mut PacketBatch,
         ethernet: &[NetStackEthernetV1],
+        network: &[NetStackNetworkV1],
         output: &mut FrontendBatch,
     ) {
         assert_eq!(input.len(), ethernet.len());
+        assert_eq!(input.len(), network.len());
         output.clear();
         let input_len = input.len();
-        for (index, sidecar) in ethernet.iter().copied().enumerate().take(input_len) {
+        for index in 0..input_len {
+            let ethernet_sidecar = ethernet[index];
+            let network_sidecar = network[index];
             let Some((chain, metadata)) = input.take(index) else {
                 continue;
             };
-            assert!(sidecar.valid());
-            let disposition = match sidecar.status {
+            let frame_len = chain.total_len() as u32;
+            assert!(ethernet_sidecar.valid());
+            assert!(network_sidecar.valid(frame_len, &ethernet_sidecar));
+            let disposition = match ethernet_sidecar.status {
                 NET_STACK_ETHERNET_ACCEPTED => {
                     FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
                 }
@@ -276,9 +294,9 @@ impl VectorFrontend {
                 metadata,
                 parsed: ParsedPacket {
                     ethernet: EthernetHeader {
-                        destination: sidecar.destination,
-                        source: sidecar.source,
-                        ethertype: sidecar.ethertype,
+                        destination: ethernet_sidecar.destination,
+                        source: ethernet_sidecar.source,
+                        ethertype: ethernet_sidecar.ethertype,
                     },
                     ip: None,
                     tcp: None,
@@ -288,8 +306,12 @@ impl VectorFrontend {
                     disposition,
                 },
             });
+            let output_index = output.len() - 1;
+            let packet = output
+                .packet_mut(output_index)
+                .expect("刚提交的 frontend packet 必须存在");
+            apply_network_sidecar(packet, network_sidecar);
         }
-        self.parse_network(interface, config, output);
         self.parse_transport(output);
         self.classify_hash(output);
     }
@@ -328,6 +350,7 @@ impl VectorFrontend {
         }
     }
 
+    #[cfg(test)]
     fn parse_network(
         &self,
         interface: InterfaceId,
@@ -484,11 +507,86 @@ impl VectorFrontend {
     }
 }
 
+fn apply_network_sidecar(packet: &mut FrontendPacket, sidecar: NetStackNetworkV1) {
+    match sidecar.outcome {
+        NET_STACK_NETWORK_SKIPPED => {}
+        NET_STACK_NETWORK_DROP => set_drop(packet, network_drop_reason(sidecar.drop_reason)),
+        NET_STACK_NETWORK_ARP => {
+            packet.parsed.disposition =
+                FrontendDisposition::Control(ControlPacket::Arp(ArpPacket {
+                    operation: sidecar.arp_operation,
+                    sender_mac: sidecar.arp_sender_mac,
+                    sender_ip: Ipv4Addr(sidecar.source[..4].try_into().unwrap()),
+                    target_mac: sidecar.arp_target_mac,
+                    target_ip: Ipv4Addr(sidecar.destination[..4].try_into().unwrap()),
+                }));
+        }
+        NET_STACK_NETWORK_IP => {
+            let source = network_ip(sidecar.family, sidecar.source);
+            let destination = network_ip(sidecar.family, sidecar.destination);
+            let fragment =
+                (sidecar.flags & NET_STACK_NETWORK_FLAG_FRAGMENT != 0).then_some(IpFragment {
+                    identification: sidecar.fragment_identification,
+                    offset: sidecar.fragment_offset,
+                    more: sidecar.flags & NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS != 0,
+                });
+            let ip = IpPacket {
+                source,
+                destination,
+                next_header: sidecar.next_header,
+                header_len: sidecar.header_len,
+                payload_offset: sidecar.payload_offset,
+                payload_len: sidecar.payload_len,
+                hop_limit: sidecar.hop_limit,
+                traffic_class: sidecar.traffic_class,
+                fragment,
+            };
+            packet.parsed.ip = Some(ip);
+            packet.parsed.disposition = if sidecar.flags & NET_STACK_NETWORK_FLAG_IPV6_PROBLEM != 0
+            {
+                FrontendDisposition::Control(ControlPacket::Ipv6ParameterProblem {
+                    pointer: sidecar.problem_pointer,
+                    suppress_for_multicast: sidecar.flags
+                        & NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST
+                        != 0,
+                })
+            } else if fragment.is_some() {
+                FrontendDisposition::Control(ControlPacket::Fragment(ip))
+            } else {
+                FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
+            };
+        }
+        _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
+    }
+}
+
+fn network_ip(family: u8, address: [u8; 16]) -> IpAddr {
+    match family {
+        NET_STACK_ADDRESS_FAMILY_IPV4 => IpAddr::V4(Ipv4Addr(address[..4].try_into().unwrap())),
+        NET_STACK_ADDRESS_FAMILY_IPV6 => IpAddr::V6(Ipv6Addr(address)),
+        _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
+    }
+}
+
+fn network_drop_reason(reason: u8) -> DropReason {
+    match reason {
+        NET_STACK_DROP_MALFORMED_ARP => DropReason::MalformedArp,
+        NET_STACK_DROP_NOT_LOCAL => DropReason::NotLocal,
+        NET_STACK_DROP_MALFORMED_IPV4 => DropReason::MalformedIpv4,
+        NET_STACK_DROP_IPV4_CHECKSUM => DropReason::Ipv4Checksum,
+        NET_STACK_DROP_MALFORMED_IPV6 => DropReason::MalformedIpv6,
+        NET_STACK_DROP_IPV6_EXTENSION_LIMIT => DropReason::Ipv6ExtensionLimit,
+        NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL => DropReason::UnsupportedIpProtocol,
+        _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
+    }
+}
+
 fn set_drop(packet: &mut FrontendPacket, reason: DropReason) {
     packet.metadata.drop_reason = reason;
     packet.parsed.disposition = FrontendDisposition::Drop(reason);
 }
 
+#[cfg(test)]
 fn parse_arp(chain: &PacketChain) -> Result<ArpPacket, DropReason> {
     let mut bytes = [0u8; 28];
     chain
@@ -514,6 +612,7 @@ fn parse_arp(chain: &PacketChain) -> Result<ArpPacket, DropReason> {
     })
 }
 
+#[cfg(test)]
 fn parse_ipv4(chain: &PacketChain, verify_checksum: bool) -> Result<IpPacket, DropReason> {
     let mut base = [0u8; 20];
     chain
@@ -556,6 +655,7 @@ fn parse_ipv4(chain: &PacketChain, verify_checksum: bool) -> Result<IpPacket, Dr
     })
 }
 
+#[cfg(test)]
 fn parse_ipv6(chain: &PacketChain) -> Result<(IpPacket, Option<Ipv6OptionProblem>), DropReason> {
     let mut base = [0u8; 40];
     chain
@@ -654,12 +754,14 @@ fn parse_ipv6(chain: &PacketChain) -> Result<(IpPacket, Option<Ipv6OptionProblem
     ))
 }
 
+#[cfg(test)]
 enum Ipv6OptionError {
     Malformed,
     Silent,
     Parameter(Ipv6OptionProblem),
 }
 
+#[cfg(test)]
 fn validate_ipv6_options(
     chain: &PacketChain,
     mut offset: usize,
@@ -771,6 +873,7 @@ fn verify_udp_checksum(
     Ok(checksum.finish() == 0)
 }
 
+#[cfg(test)]
 fn is_local_ip(config: &ConfigSnapshot, interface: InterfaceId, address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_local_ipv4(config, interface, address),
@@ -780,6 +883,7 @@ fn is_local_ip(config: &ConfigSnapshot, interface: InterfaceId, address: IpAddr)
     }
 }
 
+#[cfg(test)]
 fn is_local_ipv4(config: &ConfigSnapshot, interface: InterfaceId, address: Ipv4Addr) -> bool {
     address.is_broadcast()
         || address.is_multicast()
@@ -1118,9 +1222,10 @@ mod tests {
     }
 
     #[test]
-    fn worker_turn_ethernet_sidecar_is_not_reparsed_by_host() {
+    fn worker_turn_l2_l3_sidecars_are_not_reparsed_by_host() {
         let mut frame = udp_frame();
         frame[12..14].copy_from_slice(&0xffffu16.to_be_bytes());
+        frame[14] = 0;
         let mut input = PacketBatch::new();
         input
             .push(
@@ -1131,19 +1236,44 @@ mod tests {
                 },
             )
             .unwrap_or_else(|_| unreachable!());
-        let sidecar = NetStackEthernetV1 {
+        let ethernet = NetStackEthernetV1 {
             destination: [2; 6],
             source: [1; 6],
             ethertype: ETHERTYPE_IPV4,
             status: NET_STACK_ETHERNET_ACCEPTED,
             reserved: [0; 5],
         };
+        let mut source = [0; 16];
+        source[..4].copy_from_slice(&[10, 0, 2, 2]);
+        let mut destination = [0; 16];
+        destination[..4].copy_from_slice(&[10, 0, 2, 15]);
+        let network = NetStackNetworkV1 {
+            outcome: NET_STACK_NETWORK_IP,
+            family: NET_STACK_ADDRESS_FAMILY_IPV4,
+            next_header: IP_PROTOCOL_UDP,
+            flags: 0,
+            drop_reason: 0,
+            traffic_class: 0,
+            hop_limit: 64,
+            reserved0: 0,
+            header_len: 20,
+            payload_offset: 34,
+            fragment_offset: 0,
+            arp_operation: 0,
+            payload_len: 12,
+            fragment_identification: 0,
+            problem_pointer: 0,
+            source,
+            destination,
+            arp_sender_mac: [0; 6],
+            arp_target_mac: [0; 6],
+            reserved1: [0; 8],
+        };
         let mut output = FrontendBatch::new();
-        VectorFrontend::new([1; 40], 1).process_with_ethernet(
-            InterfaceId(1),
-            &config(),
+        VectorFrontend::new([1; 40], 1).process_with_stack_sidecars(
             &mut input,
-            &[sidecar],
+            &[ethernet],
+            &[network],
             &mut output,
         );
         assert_eq!(

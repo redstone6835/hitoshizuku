@@ -233,6 +233,8 @@ pub(crate) enum WorkerTurnError {
 /// 在当前 active generation 中执行一次只读 RX batch turn。
 pub(crate) fn worker_turn(
     input: &net::buf::PacketBatch,
+    interface: net::InterfaceId,
+    config: &net::control::ConfigSnapshot,
 ) -> Result<NetStackWorkerTurnV1, WorkerTurnError> {
     let (handle, generation, call) = {
         let broker = BROKER.lock();
@@ -248,7 +250,25 @@ pub(crate) fn worker_turn(
 
     let input_pointer = input as *const net::buf::PacketBatch;
     let input_count = input.len() as u8;
-    let mut turn = NetStackWorkerTurnV1::new(generation, input);
+    let local_addresses = config.stack_local_addresses();
+    let Ok(local_address_count) = u32::try_from(local_addresses.len()) else {
+        return Err(WorkerTurnError::StackUnavailable);
+    };
+    if interface.0 == 0
+        || !local_addresses
+            .iter()
+            .all(net::stack::NetStackLocalAddressV1::valid)
+    {
+        return Err(WorkerTurnError::StackUnavailable);
+    }
+    let local_address_pointer = local_addresses.as_ptr();
+    let mut turn = NetStackWorkerTurnV1::new(
+        generation,
+        config.generation,
+        interface.0,
+        local_addresses,
+        input,
+    );
     let turn_pointer = &mut turn as *mut NetStackWorkerTurnV1;
     let mut frame = NetStackCallV1::new(NET_STACK_OP_WORKER_TURN, generation);
     frame.worker_turn = turn_pointer;
@@ -258,16 +278,38 @@ pub(crate) fn worker_turn(
     let Some(input_range) = host_range(input_pointer) else {
         return Err(WorkerTurnError::CallFailed);
     };
-    let result = call.invoke(&mut frame, &[turn_range, input_range]);
+    let mut host_ranges = [(0usize, 0usize); 3];
+    host_ranges[0] = turn_range;
+    host_ranges[1] = input_range;
+    let range_count = if local_addresses.is_empty() {
+        2
+    } else {
+        let Some(address_range) = host_slice_range(local_addresses) else {
+            return Err(WorkerTurnError::CallFailed);
+        };
+        host_ranges[2] = address_range;
+        3
+    };
+    let result = call.invoke(&mut frame, &host_ranges[..range_count]);
     let valid = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
         && frame.valid(NET_STACK_OP_WORKER_TURN, generation)
         && frame.worker_turn == turn_pointer
         && frame.ready == 0
         && frame.quiesced == 0
-        && turn.valid_header(generation, input_pointer)
+        && turn.valid_header(
+            generation,
+            config.generation,
+            interface.0,
+            input_pointer,
+            local_address_pointer,
+            local_address_count,
+        )
         && turn.input_count == input_count
         && input.len() == usize::from(input_count)
-        && turn.fully_committed();
+        && local_addresses
+            .iter()
+            .all(net::stack::NetStackLocalAddressV1::valid)
+        && turn.fully_committed(input);
     if valid {
         return Ok(turn);
     }
@@ -291,5 +333,12 @@ pub(crate) fn worker_turn(
 fn host_range<T>(pointer: *const T) -> Option<(usize, usize)> {
     let start = pointer as usize;
     let end = start.checked_add(core::mem::size_of::<T>())?;
+    (start != 0 && start < end).then_some((start, end))
+}
+
+fn host_slice_range<T>(slice: &[T]) -> Option<(usize, usize)> {
+    let start = slice.as_ptr() as usize;
+    let bytes = core::mem::size_of::<T>().checked_mul(slice.len())?;
+    let end = start.checked_add(bytes)?;
     (start != 0 && start < end).then_some((start, end))
 }

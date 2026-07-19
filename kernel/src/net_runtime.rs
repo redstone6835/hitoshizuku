@@ -4993,16 +4993,14 @@ impl ProtocolContext {
                 },
             );
             if !self.protocol.reassembled_input().is_empty() {
-                match crate::net_stack::worker_turn(self.protocol.reassembled_input()) {
-                    Ok(turn) => self.protocol.parse_reassembled(
-                        FlowTurnContext {
-                            interface,
-                            local_mac,
-                            config,
-                            now_ns: sched::now_ns_public(),
-                        },
-                        turn.ethernet(),
-                    ),
+                match crate::net_stack::worker_turn(
+                    self.protocol.reassembled_input(),
+                    interface,
+                    config,
+                ) {
+                    Ok(turn) => self
+                        .protocol
+                        .parse_reassembled(turn.ethernet(), turn.network()),
                     Err(_) => {
                         while let Some((chain, mut metadata)) =
                             self.protocol.take_unparsed_reassembled()
@@ -5791,7 +5789,7 @@ impl WorkerContext {
 
     fn enqueue_rx_batch(&mut self) {
         let config = self.config.snapshot();
-        let turn = match crate::net_stack::worker_turn(&self.rx_batch) {
+        let turn = match crate::net_stack::worker_turn(&self.rx_batch, self.interface, &config) {
             Ok(turn) => turn,
             Err(_) => {
                 let len = self.rx_batch.len();
@@ -5808,11 +5806,10 @@ impl WorkerContext {
                 return;
             }
         };
-        self.frontend.process_with_ethernet(
-            self.interface,
-            &config,
+        self.frontend.process_with_stack_sidecars(
             &mut self.rx_batch,
             turn.ethernet(),
+            turn.network(),
             &mut self.frontend_batch,
         );
         let len = self.frontend_batch.len();
