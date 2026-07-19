@@ -1381,13 +1381,17 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
         owner_cell: u64,
         generation: u64,
     ) -> Result<(), NetStackRemoveError> {
-        let mut broker = BROKER.lock();
-        broker
-            .lifecycle
-            .begin_remove(handle, owner_cell, generation)?;
-        if !broker.lifecycle.begin_drain(handle) {
-            return Err(NetStackRemoveError::Busy);
+        {
+            let mut broker = BROKER.lock();
+            broker
+                .lifecycle
+                .begin_remove(handle, owner_cell, generation)?;
+            if !broker.lifecycle.begin_drain(handle) {
+                return Err(NetStackRemoveError::Busy);
+            }
         }
+        let detached = net::detach_socket_generation(generation);
+        let mut broker = BROKER.lock();
         broker.record = None;
         if !broker.lifecycle.finish_remove(handle) {
             return Err(NetStackRemoveError::Busy);
@@ -1398,6 +1402,13 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
             generation,
             handle.0
         );
+        if detached != 0 {
+            log::info!(
+                "[net-stack] detached sockets: generation={} count={}",
+                generation,
+                detached
+            );
+        }
         Ok(())
     }
 

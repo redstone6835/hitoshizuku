@@ -225,6 +225,7 @@ impl NetSocketFileOps {
     }
 
     pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
+        self.ensure_backend()?;
         let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
         let options = self.bind_options_for(local.addr);
         let interface = self.options.lock().bind_interface;
@@ -234,6 +235,7 @@ impl NetSocketFileOps {
     }
 
     pub fn listen(&self, backlog: u32) -> Result<(), Errno> {
+        self.ensure_backend()?;
         if self.sock_type != SOCK_STREAM {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -245,6 +247,7 @@ impl NetSocketFileOps {
         wait_nonblocking: bool,
         accepted_nonblocking: bool,
     ) -> Result<Self, Errno> {
+        self.ensure_backend()?;
         if self.sock_type != SOCK_STREAM {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -252,17 +255,20 @@ impl NetSocketFileOps {
             .facade
             .accept(wait_nonblocking, self.recv_deadline())
             .map_err(map_socket_error)?;
+        let stack_generation = self.facade.stack_generation();
         Ok(Self::from_facade(
             self.family,
             self.sock_type,
             self.protocol,
             facade,
+            stack_generation,
             accepted_nonblocking,
             self.options.lock().clone(),
         ))
     }
 
     pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
+        self.ensure_backend()?;
         let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
         let interface = self.options.lock().bind_interface;
         let options = self.bind_options();
@@ -272,6 +278,7 @@ impl NetSocketFileOps {
     }
 
     pub fn shutdown(&self, how: u32) -> Result<(), Errno> {
+        self.ensure_backend()?;
         let (read, write) = match how {
             0 => (true, false),
             1 => (false, true),
@@ -287,6 +294,7 @@ impl NetSocketFileOps {
         sockaddr: Option<&[u8]>,
         opts: InetSendOptions,
     ) -> Result<usize, Errno> {
+        self.ensure_backend()?;
         if self.sock_type == SOCK_STREAM {
             if sockaddr.is_some() {
                 return Err(Errno::EISCONN);
@@ -326,6 +334,7 @@ impl NetSocketFileOps {
     }
 
     pub fn recvfrom(&self, buf: &mut [u8], opts: InetRecvOptions) -> Result<InetRecvResult, Errno> {
+        self.ensure_backend()?;
         let deadline = opts.deadline_ns.or_else(|| self.recv_deadline());
         if self.sock_type == SOCK_STREAM {
             let len = self
@@ -361,6 +370,7 @@ impl NetSocketFileOps {
     }
 
     pub fn getsockname(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.ensure_backend()?;
         let endpoint = self.facade.local_endpoint().unwrap_or(net::Endpoint {
             addr: unspecified(self.family),
             port: 0,
@@ -369,6 +379,7 @@ impl NetSocketFileOps {
     }
 
     pub fn getpeername(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.ensure_backend()?;
         let endpoint = self.facade.peer_endpoint().ok_or(Errno::ENOTCONN)?;
         crate::addr::encode_inet_sockaddr(&endpoint, self.family, buf)
     }
@@ -382,6 +393,7 @@ impl NetSocketFileOps {
     }
 
     fn ensure_bound(&self) -> Result<(), Errno> {
+        self.ensure_backend()?;
         if matches!(self.facade.owner(), net::OwnerRef::Unassigned) {
             let interface = self.options.lock().bind_interface;
             let options = self.bind_options();
@@ -401,6 +413,12 @@ impl NetSocketFileOps {
             }
         }
         Ok(())
+    }
+
+    fn ensure_backend(&self) -> Result<(), Errno> {
+        self.facade
+            .backend_error()
+            .map_or(Ok(()), |error| Err(map_socket_error(error)))
     }
 
     fn bind_options(&self) -> net::control::BindOptions {
@@ -434,9 +452,11 @@ impl NetSocketFileOps {
         sock_type: u16,
         protocol: u16,
         facade: Arc<net::SocketFacade>,
+        stack_generation: u64,
         nonblock: bool,
         options: SocketOptions,
     ) -> Self {
+        net::track_socket_facade(&facade, stack_generation);
         let readiness = facade.readiness();
         let poll_source = Arc::new(PollSource::new(PollEvents::default()));
         let observer: Arc<dyn net::ReadinessObserver> = poll_source.clone();
@@ -593,6 +613,10 @@ pub fn create_net_socket(
     protocol: u16,
     nonblock: bool,
 ) -> Result<NetSocketFileOps, Errno> {
+    let stack = net::stack::stack_snapshot();
+    if stack.state != net::stack::NetStackState::Active || !stack.probed {
+        return Err(Errno::EAFNOSUPPORT);
+    }
     let address_family = match family {
         crate::addr::AF_INET => net::AddressFamily::Ipv4,
         crate::addr::AF_INET6 => net::AddressFamily::Ipv6,
@@ -606,6 +630,7 @@ pub fn create_net_socket(
                 sock_type,
                 17,
                 facade,
+                stack.generation,
                 nonblock,
                 SocketOptions {
                     sndbuf: 128 * 1024,
@@ -621,6 +646,7 @@ pub fn create_net_socket(
                 sock_type,
                 6,
                 facade,
+                stack.generation,
                 nonblock,
                 SocketOptions {
                     sndbuf: 256 * 1024,
@@ -638,6 +664,7 @@ pub fn create_net_socket(
                 sock_type,
                 protocol,
                 facade,
+                stack.generation,
                 nonblock,
                 SocketOptions {
                     sndbuf: 64 * 1024,
@@ -685,6 +712,7 @@ pub(crate) fn map_socket_error_public(error: net::SocketError) -> Errno {
         net::SocketError::Buffer => Errno::ENOMEM,
         net::SocketError::ConnectionRefused => Errno::ECONNREFUSED,
         net::SocketError::ConnectionReset => Errno::ECONNRESET,
+        net::SocketError::NetworkDown => Errno::ENETDOWN,
     }
 }
 
