@@ -11,11 +11,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use net::stack::{
     NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_FLOW_CALL, NET_STACK_OP_PROBE,
     NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER, NET_STACK_OP_WORKER_TURN,
-    NetStackCallV1, NetStackEndpoint, NetStackFlowCallV1, NetStackFlowCommand, NetStackHandle,
-    NetStackLifecycle, NetStackRegisterError, NetStackRegisterErrorKind, NetStackRegistrar,
-    NetStackRegistration, NetStackRemoveError, NetStackSnapshot, NetStackState, NetStackTxError,
-    NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1,
-    NetStackWorkerTurnV1,
+    NetStackCallV1, NetStackControlCommand, NetStackEndpoint, NetStackFlowCallV1,
+    NetStackFlowCommand, NetStackHandle, NetStackLifecycle, NetStackRegisterError,
+    NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration, NetStackRemoveError,
+    NetStackSnapshot, NetStackState, NetStackTxError, NetStackTxFragmentHeaderV1,
+    NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1, NetStackWorkerTurnV1,
 };
 use sched::sync::Spinlock;
 
@@ -917,6 +917,374 @@ impl ElmFlowShard {
     }
 }
 
+impl ElmControlPlane {
+    pub(crate) const fn new() -> Self {
+        Self {
+            call: ElmFlowShard::new(net::ShardId(0)),
+        }
+    }
+
+    fn invoke_with_ranges(
+        &self,
+        command: NetStackControlCommand,
+        ranges: &[(usize, usize)],
+    ) -> Option<NetStackControlCommand> {
+        match self
+            .call
+            .invoke(NetStackFlowCommand::Control { command }, ranges)
+        {
+            Ok(NetStackFlowCommand::Control { command }) => Some(command),
+            _ => None,
+        }
+    }
+
+    fn invoke(&self, command: NetStackControlCommand) -> Option<NetStackControlCommand> {
+        self.invoke_with_ranges(command, &[])
+    }
+
+    pub(crate) fn initialize_autoconfig(
+        &self,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+    ) -> bool {
+        let pointer = config as *const net::control::ConfigSnapshot;
+        let Some(range) = host_range(pointer) else {
+            return false;
+        };
+        matches!(
+            self.invoke_with_ranges(
+                NetStackControlCommand::InitializeAutoconfig {
+                    config: pointer,
+                    now_ns,
+                    output: None,
+                },
+                &[range],
+            ),
+            Some(NetStackControlCommand::InitializeAutoconfig {
+                output: Some(true),
+                ..
+            })
+        )
+    }
+
+    pub(crate) fn run_dad(&self, now_ns: u64) -> Option<net::stack::DadRunOutput> {
+        match self.invoke(NetStackControlCommand::RunDad {
+            now_ns,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::RunDad { output, .. }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn observe_dad_conflict(&self, interface: net::InterfaceId, address: net::Ipv6Addr) {
+        let _ = self.invoke(NetStackControlCommand::ObserveDadConflict { interface, address });
+    }
+
+    pub(crate) fn run_dhcp(
+        &self,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+    ) -> Option<net::stack::DhcpRunOutput> {
+        let pointer = config as *const net::control::ConfigSnapshot;
+        let range = host_range(pointer)?;
+        match self.invoke_with_ranges(
+            NetStackControlCommand::RunDhcp {
+                config: pointer,
+                now_ns,
+                output: None,
+            },
+            &[range],
+        ) {
+            Some(NetStackControlCommand::RunDhcp { output, .. }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn handle_dhcp_packet(
+        &self,
+        interface: net::InterfaceId,
+        packet: &net::pipeline::FrontendPacket,
+        now_ns: u64,
+    ) -> Option<net::stack::DhcpPacketOutput> {
+        let pointer = packet as *const net::pipeline::FrontendPacket;
+        let range = host_range(pointer)?;
+        match self.invoke_with_ranges(
+            NetStackControlCommand::HandleDhcpPacket {
+                interface,
+                packet: pointer,
+                now_ns,
+                output: None,
+            },
+            &[range],
+        ) {
+            Some(NetStackControlCommand::HandleDhcpPacket { output, .. }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn remove_autoconfig_interface(
+        &self,
+        interface: net::InterfaceId,
+    ) -> Option<net::stack::DhcpLeaseChange> {
+        match self.invoke(NetStackControlCommand::RemoveAutoconfigInterface {
+            interface,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::RemoveAutoconfigInterface { output, .. }) => {
+                output.flatten()
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reserve_binding(
+        &self,
+        socket: net::SocketId,
+        request: net::control::BindRequest,
+        shard: net::ShardId,
+    ) -> Result<net::control::BindToken, net::control::BindError> {
+        match self.invoke(NetStackControlCommand::ReserveBinding {
+            socket,
+            request,
+            shard,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::ReserveBinding {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::control::BindError::NoPorts),
+        }
+    }
+
+    pub(crate) fn release_binding(&self, socket: net::SocketId) -> bool {
+        matches!(
+            self.invoke(NetStackControlCommand::ReleaseBinding {
+                socket,
+                output: None,
+            }),
+            Some(NetStackControlCommand::ReleaseBinding {
+                output: Some(true),
+                ..
+            })
+        )
+    }
+
+    pub(crate) fn allocate_listener_id(&self) -> Option<net::ListenGroupId> {
+        match self.invoke(NetStackControlCommand::AllocateListener { output: None }) {
+            Some(NetStackControlCommand::AllocateListener { output }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn install_listener(&self, group: net::ListenGroupId) -> bool {
+        matches!(
+            self.invoke(NetStackControlCommand::InstallListener {
+                group,
+                output: None,
+            }),
+            Some(NetStackControlCommand::InstallListener {
+                output: Some(true),
+                ..
+            })
+        )
+    }
+
+    pub(crate) fn remove_listener(&self, group: net::ListenGroupId) -> bool {
+        matches!(
+            self.invoke(NetStackControlCommand::RemoveListener {
+                group,
+                output: None,
+            }),
+            Some(NetStackControlCommand::RemoveListener {
+                output: Some(true),
+                ..
+            })
+        )
+    }
+
+    pub(crate) fn has_listener(&self, group: net::ListenGroupId) -> bool {
+        matches!(
+            self.invoke(NetStackControlCommand::HasListener {
+                group,
+                output: None,
+            }),
+            Some(NetStackControlCommand::HasListener {
+                output: Some(true),
+                ..
+            })
+        )
+    }
+
+    pub(crate) fn flow_shard(
+        &self,
+        remote: net::Endpoint,
+        local: net::Endpoint,
+        protocol: net::TransportProtocol,
+    ) -> Option<net::ShardId> {
+        match self.invoke(NetStackControlCommand::FlowShard {
+            remote,
+            local,
+            protocol,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::FlowShard { output, .. }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn neighbor_owner(&self, key: net::control::NeighborKey) -> Option<net::ShardId> {
+        match self.invoke(NetStackControlCommand::NeighborOwner { key, output: None }) {
+            Some(NetStackControlCommand::NeighborOwner { output, .. }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn enqueue_neighbor(
+        &self,
+        work: net::stack::PendingNeighborTx,
+        now_ns: u64,
+    ) -> Result<(), net::stack::PendingNeighborTx> {
+        let command = NetStackFlowCommand::Control {
+            command: NetStackControlCommand::EnqueueNeighbor {
+                work: Some(work),
+                now_ns,
+                output: None,
+            },
+        };
+        match self.call.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::Control {
+                command:
+                    NetStackControlCommand::EnqueueNeighbor {
+                        output: Some(result),
+                        ..
+                    },
+            }) => result,
+            Err((
+                _,
+                NetStackFlowCommand::Control {
+                    command:
+                        NetStackControlCommand::EnqueueNeighbor {
+                            work: Some(work), ..
+                        },
+                },
+            )) => Err(work),
+            _ => unreachable!("控制面调用必须归还邻居报文所有权"),
+        }
+    }
+
+    pub(crate) fn resolve_pending_neighbor(
+        &self,
+        key: net::control::NeighborKey,
+        mac_address: [u8; 6],
+    ) -> Vec<net::stack::PendingNeighborTx> {
+        match self.invoke(NetStackControlCommand::ResolvePendingNeighbor {
+            key,
+            mac_address,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::ResolvePendingNeighbor {
+                output: Some(work), ..
+            }) => work,
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn fail_interface_neighbors(
+        &self,
+        interface: net::InterfaceId,
+    ) -> Vec<net::stack::PendingNeighborTx> {
+        match self.invoke(NetStackControlCommand::FailInterfaceNeighbors {
+            interface,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::FailInterfaceNeighbors {
+                output: Some(work), ..
+            }) => work,
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn run_neighbor_timers(
+        &self,
+        now_ns: u64,
+    ) -> Option<net::stack::NeighborTimerOutput> {
+        match self.invoke(NetStackControlCommand::RunNeighborTimers {
+            now_ns,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::RunNeighborTimers { output, .. }) => output,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn join_multicast(
+        &self,
+        socket: net::SocketId,
+        membership: net::MulticastMembership,
+        interface: net::InterfaceId,
+    ) -> Option<bool> {
+        match self.invoke(NetStackControlCommand::JoinMulticast {
+            socket,
+            membership,
+            interface,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::JoinMulticast { output, .. }) => output.flatten(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn leave_multicast(
+        &self,
+        socket: net::SocketId,
+        membership: net::MulticastMembership,
+    ) -> Option<(net::InterfaceId, bool)> {
+        match self.invoke(NetStackControlCommand::LeaveMulticast {
+            socket,
+            membership,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::LeaveMulticast { output, .. }) => output.flatten(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn multicast_groups(&self, interface: net::InterfaceId) -> Vec<net::IpAddr> {
+        match self.invoke(NetStackControlCommand::MulticastGroups {
+            interface,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::MulticastGroups {
+                output: Some(groups),
+                ..
+            }) => groups,
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn remove_interface_multicast(&self, interface: net::InterfaceId) {
+        let _ = self.invoke(NetStackControlCommand::RemoveInterfaceMulticast { interface });
+    }
+
+    pub(crate) fn remove_socket_multicast(
+        &self,
+        socket: net::SocketId,
+    ) -> Vec<(net::InterfaceId, net::IpAddr)> {
+        match self.invoke(NetStackControlCommand::RemoveSocketMulticast {
+            socket,
+            output: None,
+        }) {
+            Some(NetStackControlCommand::RemoveSocketMulticast {
+                output: Some(groups),
+                ..
+            }) => groups,
+            _ => Vec::new(),
+        }
+    }
+}
+
 struct StackRecord {
     handle: NetStackHandle,
     generation: u64,
@@ -928,8 +1296,14 @@ struct KernelNetStackBroker {
     record: Option<StackRecord>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ElmFlowShard {
     id: net::ShardId,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ElmControlPlane {
+    call: ElmFlowShard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

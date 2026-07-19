@@ -30,7 +30,8 @@ use net::stack::{
     NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NET_STACK_TX_HEADER_ABI_VERSION,
     NET_STACK_TX_HEADER_CAPACITY, NET_STACK_TX_RAW_FRAGMENT, NET_STACK_TX_TCP,
     NET_STACK_TX_UDP, NET_STACK_TX_UDP_FRAGMENT, NetStackEthernetV1,
-    NetStackFlowCallV1, NetStackHandle, NetStackLocalAddressV1, NetStackNetworkV1,
+    NetStackControlPlane, NetStackFlowCallV1, NetStackHandle, NetStackLocalAddressV1,
+    NetStackNetworkV1,
     NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackTcpOptionsV1,
     NetStackTransportV1, NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1,
     NetStackTxHeaderV1, NetStackTxInputV1,
@@ -43,6 +44,8 @@ use allocator as _;
 static QUIESCED: AtomicBool = AtomicBool::new(false);
 static FLOW_SHARDS: Spinlock<Vec<Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>>>> =
     Spinlock::new(Vec::new());
+static CONTROL_PLANE: Spinlock<Option<Arc<Spinlock<ManuallyDrop<NetStackControlPlane>>>>> =
+    Spinlock::new(None);
 
 const fn empty_ethernet() -> NetStackEthernetV1 {
     NetStackEthernetV1 {
@@ -1481,6 +1484,9 @@ fn initialize_flow_shards(boot: net::boot::NetStackBootConfig) -> bool {
             ))))
         })
         .collect::<Vec<_>>();
+    *CONTROL_PLANE.lock() = Some(Arc::new(Spinlock::new(ManuallyDrop::new(
+        net::stack::create_control_plane(count, *boot.rss_key(), boot.hash_seed()),
+    ))));
     *FLOW_SHARDS.lock() = shards;
     true
 }
@@ -1494,6 +1500,14 @@ fn flow_shard(id: ShardId) -> Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>> {
 }
 
 fn dispatch_flow_call(call: &mut NetStackFlowCallV1) -> bool {
+    if let net::stack::NetStackFlowCommand::Control { command } = &mut call.command {
+        let Some(control) = CONTROL_PLANE.lock().as_ref().cloned() else {
+            return false;
+        };
+        net::stack::dispatch_control_plane_call(&mut control.lock(), command);
+        call.committed = 1;
+        return true;
+    }
     let Some(shard) = flow_shard(call.shard) else {
         return false;
     };
@@ -1581,6 +1595,14 @@ impl ElmModule for NetStackElm {
                     let state = unsafe { ManuallyDrop::take(&mut guard) };
                     drop(guard);
                     net::stack::destroy_flow_shard(state);
+                }
+                if let Some(control) = CONTROL_PLANE.lock().take() {
+                    let mut guard = control.lock();
+                    // Safety: 控制面只在这里从 ManuallyDrop 中取出一次，随后交给
+                    // 受 capability 约束的 host destructor。
+                    let state = unsafe { ManuallyDrop::take(&mut guard) };
+                    drop(guard);
+                    net::stack::destroy_control_plane(state);
                 }
                 self.handle = None;
                 self.boot = None;
