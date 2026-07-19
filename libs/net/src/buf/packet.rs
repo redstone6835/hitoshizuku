@@ -206,6 +206,12 @@ impl PacketChain {
     }
 
     /// 从可能分散的 fragment 中复制一个连续字节区间。
+    #[kernel_symbols::export(
+        name = "net.buf.PacketChain.copy_out",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn copy_out(&self, offset: usize, output: &mut [u8]) -> Result<(), super::NetBufPoolError> {
         let end = offset
             .checked_add(output.len())

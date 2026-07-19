@@ -103,6 +103,112 @@ fn wait_readable(file: &vfs::file::File) {
 }
 
 #[ktest]
+fn net_stack_elm_builds_udp_and_tcp_tx_headers() {
+    let payload_bytes = b"elm tx payload";
+    let payload = net::buf::PacketChain::from_owned(payload_bytes.to_vec());
+    let cases = [
+        net::stack::NetStackTxInputV1::udp(
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
+            19002,
+            53,
+            [1; 6],
+            [2; 6],
+            64,
+            7,
+            payload_bytes.len() as u32,
+        )
+        .unwrap(),
+        net::stack::NetStackTxInputV1::udp(
+            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
+            net::IpAddr::V6(net::Ipv6Addr([
+                0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
+            ])),
+            19002,
+            53,
+            [1; 6],
+            [2; 6],
+            64,
+            7,
+            payload_bytes.len() as u32,
+        )
+        .unwrap(),
+        net::stack::NetStackTxInputV1::tcp(
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
+            19003,
+            443,
+            [1; 6],
+            [2; 6],
+            1,
+            2,
+            net::transport::TcpFlags::SYN.bits(),
+            32768,
+            &[2, 4, 0x05, 0xb4],
+            payload_bytes.len() as u32,
+        )
+        .unwrap(),
+        net::stack::NetStackTxInputV1::tcp(
+            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
+            net::IpAddr::V6(net::Ipv6Addr([
+                0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
+            ])),
+            19003,
+            443,
+            [1; 6],
+            [2; 6],
+            1,
+            2,
+            net::transport::TcpFlags::SYN.bits(),
+            32768,
+            &[2, 4, 0x05, 0xb4],
+            payload_bytes.len() as u32,
+        )
+        .unwrap(),
+    ];
+
+    for input in cases {
+        let output = net::stack::build_tx_header(&payload, input).expect("ELM TX header 构造失败");
+        let mut frame = output.header_bytes().to_vec();
+        frame.extend_from_slice(payload_bytes);
+        let frame = net::buf::PacketChain::from_owned(frame);
+        let transport_offset = if input.family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
+            assert_eq!(net::pipeline::packet_checksum(&frame, 14, 20), Ok(0));
+            34
+        } else {
+            54
+        };
+        let protocol = if input.kind == net::stack::NET_STACK_TX_UDP {
+            17
+        } else {
+            6
+        };
+        let transport_len = frame.total_len() - transport_offset;
+        let source = if input.family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
+            net::IpAddr::V4(net::Ipv4Addr(input.source[..4].try_into().unwrap()))
+        } else {
+            net::IpAddr::V6(net::Ipv6Addr(input.source))
+        };
+        let destination = if input.family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
+            net::IpAddr::V4(net::Ipv4Addr(input.destination[..4].try_into().unwrap()))
+        } else {
+            net::IpAddr::V6(net::Ipv6Addr(input.destination))
+        };
+        assert_eq!(
+            net::pipeline::transport_checksum(
+                &frame,
+                transport_offset,
+                transport_len,
+                source,
+                destination,
+                protocol,
+            ),
+            Ok(0)
+        );
+    }
+}
+
+#[ktest]
 fn udp_vfs_fd_and_epoll_roundtrip() {
     let (context, table) = current_vfs();
     let raw = vfs::socket::socket(

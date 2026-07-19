@@ -828,6 +828,58 @@ pub fn build_udp_packet(
     )
 }
 
+#[cfg(not(test))]
+pub fn build_udp_packet_with_options(
+    mut payload: PacketChain,
+    route: RouteDecision,
+    destination: Endpoint,
+    source_port: u16,
+    source_mac: [u8; 6],
+    destination_mac: [u8; 6],
+    hop_limit: u8,
+    traffic_class: u8,
+) -> Result<PacketChain, (UdpTxError, PacketChain)> {
+    let payload_len = payload.total_len();
+    let header_len = match (route.source, destination.addr) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => 42usize,
+        (IpAddr::V6(_), IpAddr::V6(_)) => 62usize,
+        _ => return Err((UdpTxError::AddressFamily, payload)),
+    };
+    if payload_len > u16::MAX as usize - 8
+        || (matches!(route.source, IpAddr::V4(_)) && payload_len > u16::MAX as usize - 28)
+    {
+        return Err((UdpTxError::DatagramTooLarge, payload));
+    }
+    if header_len + payload_len > route.mtu as usize + 14 {
+        return Err((UdpTxError::MtuExceeded, payload));
+    }
+    let Some(input) = crate::stack::NetStackTxInputV1::udp(
+        route.source,
+        destination.addr,
+        source_port,
+        destination.port,
+        source_mac,
+        destination_mac,
+        hop_limit,
+        traffic_class,
+        payload_len as u32,
+    ) else {
+        return Err((UdpTxError::AddressFamily, payload));
+    };
+    let output = match crate::stack::build_tx_header(&payload, input) {
+        Ok(output) => output,
+        Err(_) => return Err((UdpTxError::Buffer, payload)),
+    };
+    if usize::from(output.header_len) != header_len
+        || payload.prepend_first_zeroed(output.header_len).is_err()
+        || payload.copy_in(0, output.header_bytes()).is_err()
+    {
+        return Err((UdpTxError::Buffer, payload));
+    }
+    Ok(payload)
+}
+
+#[cfg(test)]
 pub fn build_udp_packet_with_options(
     mut payload: PacketChain,
     route: RouteDecision,

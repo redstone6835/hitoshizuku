@@ -19,13 +19,15 @@ use net::stack::{
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
-    NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE, NET_STACK_OP_WORKER_TURN,
-    NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED, NET_STACK_TCP_OPTION_TIMESTAMP,
-    NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP, NET_STACK_TRANSPORT_ICMP,
-    NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED, NET_STACK_TRANSPORT_TCP,
-    NET_STACK_TRANSPORT_UDP, NetStackEthernetV1, NetStackHandle, NetStackLocalAddressV1,
-    NetStackNetworkV1, NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError,
-    NetStackTcpOptionsV1, NetStackTransportV1,
+    NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE, NET_STACK_OP_TX_HEADER,
+    NET_STACK_OP_WORKER_TURN, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
+    NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
+    NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
+    NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NET_STACK_TX_HEADER_ABI_VERSION,
+    NET_STACK_TX_HEADER_CAPACITY, NET_STACK_TX_TCP, NET_STACK_TX_UDP, NetStackEthernetV1,
+    NetStackHandle, NetStackLocalAddressV1, NetStackNetworkV1, NetStackRegisterErrorKind,
+    NetStackRegistration, NetStackRemoveError, NetStackTcpOptionsV1, NetStackTransportV1,
+    NetStackTxHeaderV1, NetStackTxInputV1,
 };
 
 use allocator as _;
@@ -129,6 +131,68 @@ fn packet_inputs_valid(turn: &net::stack::NetStackWorkerTurnV1) -> bool {
     }) && turn.packet_inputs[count..]
         .iter()
         .all(|facts| *facts == net::stack::NetStackPacketInputV1::empty())
+}
+
+fn tx_input_valid(input: &NetStackTxInputV1) -> bool {
+    if !matches!(
+        input.family,
+        NET_STACK_ADDRESS_FAMILY_IPV4 | NET_STACK_ADDRESS_FAMILY_IPV6
+    ) || input.destination_port == 0
+        || input.reserved0 != [0; 3]
+        || input.reserved1 != [0; 2]
+        || (input.family == NET_STACK_ADDRESS_FAMILY_IPV4
+            && (input.source[4..] != [0; 12] || input.destination[4..] != [0; 12]))
+    {
+        return false;
+    }
+    let transport_len = match input.kind {
+        NET_STACK_TX_UDP => {
+            let tcp_empty = input.tcp_flags == 0
+                && input.tcp_window == 0
+                && input.tcp_options_len == 0
+                && input.tcp_sequence == 0
+                && input.tcp_acknowledgement == 0
+                && input.tcp_options == [0; 40];
+            tcp_empty
+                .then(|| input.payload_len.checked_add(8))
+                .flatten()
+        }
+        NET_STACK_TX_TCP => {
+            let options_len = usize::from(input.tcp_options_len);
+            if input.source_port == 0
+                || input.tcp_flags & !0x01ff != 0
+                || options_len > input.tcp_options.len()
+                || options_len % 4 != 0
+                || input.tcp_options[options_len..] != [0; 40][options_len..]
+            {
+                None
+            } else {
+                input
+                    .payload_len
+                    .checked_add(20 + u32::from(input.tcp_options_len))
+            }
+        }
+        _ => None,
+    };
+    transport_len.is_some_and(|transport_len| {
+        transport_len <= u32::from(u16::MAX)
+            && (input.family != NET_STACK_ADDRESS_FAMILY_IPV4
+                || transport_len <= u32::from(u16::MAX - 20))
+    })
+}
+
+fn tx_header_frame_valid(frame: &NetStackTxHeaderV1, generation: u64) -> bool {
+    frame.abi_version == NET_STACK_TX_HEADER_ABI_VERSION
+        && frame.struct_size as usize == core::mem::size_of::<NetStackTxHeaderV1>()
+        && frame.generation == generation
+        && !frame.payload.is_null()
+        && frame.payload.is_aligned()
+        && tx_input_valid(&frame.input)
+        && frame.committed == 0
+        && frame.reserved0 == 0
+        && frame.header_len == 0
+        && frame.header == [0; NET_STACK_TX_HEADER_CAPACITY]
+        && frame.reserved1 == [0; 2]
 }
 
 fn is_local_ipv4(interface: u32, addresses: &[NetStackLocalAddressV1], address: [u8; 4]) -> bool {
@@ -582,6 +646,164 @@ fn checksum_packet_range(
         copied += chunk;
     }
     true
+}
+
+fn checksum_chain_range(
+    payload: &net::buf::PacketChain,
+    offset: usize,
+    len: usize,
+    checksum: &mut InternetChecksum,
+) -> bool {
+    let mut copied = 0usize;
+    let mut buffer = [0u8; 128];
+    while copied < len {
+        let chunk = (len - copied).min(buffer.len());
+        if payload
+            .copy_out(offset + copied, &mut buffer[..chunk])
+            .is_err()
+        {
+            return false;
+        }
+        checksum.add(&buffer[..chunk]);
+        copied += chunk;
+    }
+    true
+}
+
+fn tx_transport_checksum(
+    payload: &net::buf::PacketChain,
+    input: &NetStackTxInputV1,
+    protocol: u8,
+    transport_header: &[u8],
+) -> Option<u16> {
+    let transport_len = transport_header
+        .len()
+        .checked_add(input.payload_len as usize)?;
+    let mut checksum = InternetChecksum::new();
+    match input.family {
+        NET_STACK_ADDRESS_FAMILY_IPV4 => {
+            let len = u16::try_from(transport_len).ok()?;
+            checksum.add(&input.source[..4]);
+            checksum.add(&input.destination[..4]);
+            checksum.add(&[0, protocol]);
+            checksum.add(&len.to_be_bytes());
+        }
+        NET_STACK_ADDRESS_FAMILY_IPV6 => {
+            let len = u32::try_from(transport_len).ok()?;
+            checksum.add(&input.source);
+            checksum.add(&input.destination);
+            checksum.add(&len.to_be_bytes());
+            checksum.add(&[0, 0, 0, protocol]);
+        }
+        _ => return None,
+    }
+    checksum.add(transport_header);
+    checksum_chain_range(
+        payload,
+        input.payload_offset as usize,
+        input.payload_len as usize,
+        &mut checksum,
+    )
+    .then(|| checksum.finish())
+}
+
+fn build_tx_header(
+    payload: &net::buf::PacketChain,
+    input: &NetStackTxInputV1,
+) -> Option<(u16, [u8; NET_STACK_TX_HEADER_CAPACITY])> {
+    if !tx_input_valid(input)
+        || input
+            .payload_offset
+            .checked_add(input.payload_len)
+            .is_none_or(|end| end > payload.total_len() as u32)
+    {
+        return None;
+    }
+    let ip_header_len = if input.family == NET_STACK_ADDRESS_FAMILY_IPV4 {
+        20usize
+    } else {
+        40usize
+    };
+    let transport_header_len = if input.kind == NET_STACK_TX_UDP {
+        8usize
+    } else {
+        20 + usize::from(input.tcp_options_len)
+    };
+    let header_len = 14 + ip_header_len + transport_header_len;
+    let mut header = [0u8; NET_STACK_TX_HEADER_CAPACITY];
+    header[..6].copy_from_slice(&input.destination_mac);
+    header[6..12].copy_from_slice(&input.source_mac);
+    let protocol = if input.kind == NET_STACK_TX_UDP {
+        17
+    } else {
+        6
+    };
+    let transport_offset = 14 + ip_header_len;
+
+    match input.family {
+        NET_STACK_ADDRESS_FAMILY_IPV4 => {
+            header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            let total_len = ip_header_len
+                .checked_add(transport_header_len)?
+                .checked_add(input.payload_len as usize)?;
+            let total_len = u16::try_from(total_len).ok()?;
+            header[14] = 0x45;
+            header[15] = input.traffic_class;
+            header[16..18].copy_from_slice(&total_len.to_be_bytes());
+            header[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+            header[22] = input.hop_limit;
+            header[23] = protocol;
+            header[26..30].copy_from_slice(&input.source[..4]);
+            header[30..34].copy_from_slice(&input.destination[..4]);
+            let ip_checksum = checksum(&header[14..34]);
+            header[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
+        }
+        NET_STACK_ADDRESS_FAMILY_IPV6 => {
+            header[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+            header[14..18].copy_from_slice(
+                &(0x6000_0000u32 | (u32::from(input.traffic_class) << 20)).to_be_bytes(),
+            );
+            let transport_len = transport_header_len.checked_add(input.payload_len as usize)?;
+            header[18..20].copy_from_slice(&u16::try_from(transport_len).ok()?.to_be_bytes());
+            header[20] = protocol;
+            header[21] = input.hop_limit;
+            header[22..38].copy_from_slice(&input.source);
+            header[38..54].copy_from_slice(&input.destination);
+        }
+        _ => return None,
+    }
+
+    if input.kind == NET_STACK_TX_UDP {
+        let udp_len = u16::try_from(8usize.checked_add(input.payload_len as usize)?).ok()?;
+        let udp = &mut header[transport_offset..transport_offset + 8];
+        udp[..2].copy_from_slice(&input.source_port.to_be_bytes());
+        udp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
+        udp[4..6].copy_from_slice(&udp_len.to_be_bytes());
+        let mut checksum_header = [0u8; 8];
+        checksum_header.copy_from_slice(udp);
+        let checksum = tx_transport_checksum(payload, input, protocol, &checksum_header)?;
+        udp[6..8].copy_from_slice(&(if checksum == 0 { 0xffff } else { checksum }).to_be_bytes());
+    } else {
+        let tcp = &mut header[transport_offset..transport_offset + transport_header_len];
+        tcp[..2].copy_from_slice(&input.source_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&input.tcp_sequence.to_be_bytes());
+        tcp[8..12].copy_from_slice(&input.tcp_acknowledgement.to_be_bytes());
+        tcp[12] = ((transport_header_len / 4) as u8) << 4 | u8::from(input.tcp_flags & 0x100 != 0);
+        tcp[13] = input.tcp_flags as u8;
+        tcp[14..16].copy_from_slice(&input.tcp_window.to_be_bytes());
+        tcp[20..].copy_from_slice(&input.tcp_options[..usize::from(input.tcp_options_len)]);
+        let mut checksum_header = [0u8; 60];
+        checksum_header[..transport_header_len].copy_from_slice(tcp);
+        let checksum = tx_transport_checksum(
+            payload,
+            input,
+            protocol,
+            &checksum_header[..transport_header_len],
+        )?;
+        tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
+    }
+    Some((header_len as u16, header))
 }
 
 fn transport_checksum_valid(
@@ -1167,6 +1389,26 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
                 turn.transport[index] = transport;
                 turn.committed = (index + 1) as u8;
             }
+        }
+        NET_STACK_OP_TX_HEADER => {
+            if QUIESCED.load(Ordering::Acquire) {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            // Safety: host 已把 TX 帧声明为本次 pinned call 的可访问范围；指针只在
+            // 同步调用期间借用，ELM 不保存它。
+            let output = unsafe { &mut *frame.tx_header };
+            if !tx_header_frame_valid(output, frame.generation) {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            // Safety: host 同时声明了只读 PacketChain 外壳范围，payload backing 只会
+            // 由受能力约束的 copy_out 内核符号读取。
+            let payload = unsafe { &*output.payload };
+            let Some((header_len, header)) = build_tx_header(payload, &output.input) else {
+                return NET_STACK_CALL_STATUS_INVALID;
+            };
+            output.header_len = header_len;
+            output.header = header;
+            output.committed = 1;
         }
         NET_STACK_OP_QUIESCE => {
             QUIESCED.store(true, Ordering::Release);
