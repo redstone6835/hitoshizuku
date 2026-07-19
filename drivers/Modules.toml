@@ -83,6 +83,13 @@ prompt = "内核随机服务驱动"
 default = "y"
 
 [[modules]]
+name = "net.stack"
+path = "net-stack"
+config = "CONFIG_NET_STACK"
+prompt = "网络协议栈"
+default = "m"
+
+[[modules]]
 name = "net.loopback"
 path = "loopback"
 config = "CONFIG_NET_LOOPBACK"
