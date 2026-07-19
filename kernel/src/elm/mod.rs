@@ -300,6 +300,18 @@ pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String
     if modules.is_empty() {
         return Ok(0);
     }
+    validate_build_bound_environment(init)?;
+
+    let arch = current_ebi_arch();
+    let mut loaded = 0usize;
+    for module in modules {
+        load_build_bound_module(init, module, arch)?;
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
+fn validate_build_bound_environment(init: &Arc<Task>) -> Result<(), String> {
     let current_profile = kernel_interface_profile_hash()?;
     if current_profile != trust_config::build_profile_hash() {
         return Err("BuildBound Profile 与当前内核符号目录不一致".to_string());
@@ -309,64 +321,111 @@ pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String
     if sha256(&manifest) != trust_config::build_manifest_hash() {
         return Err("initramfs 中的 BuildBound 清单摘要不匹配".to_string());
     }
+    Ok(())
+}
 
-    let arch = current_ebi_arch();
-    let mut loaded = 0usize;
-    for module in modules {
-        let path = format!("/lib/elm/{}", module.file_name);
-        let bytes = crate::user::load_file_from_task_vfs(init, &path)
-            .map_err(|err| format!("读取 BuildBound 模块 {} 失败: {err:?}", module.name))?;
-        if sha256(&bytes) != module.eki_hash {
-            return Err(format!("BuildBound 模块 {} 的 EKI 摘要不匹配", module.name));
-        }
-        let reader = ElmSliceImageReader::new(&bytes);
-        let image = source::project_ebi_image(module.provider_id, &reader, arch)
-            .map_err(|status| format!("投影 BuildBound 模块 {} 失败: {status:?}", module.name))?;
-        if image.unit.manifest.name.as_str() != module.name
-            || canonical_ebi_digest(&image) != module.ebi_hash
-        {
-            return Err(format!("BuildBound 模块 {} 的 EBI 身份不匹配", module.name));
-        }
-        let budget = ElmResourceBudget::BUILD_BOUND;
-        let mut authorization = with_core(|core| {
-            core.authorize_mgr_call(
-                ElmPrincipal::kernel(),
-                elm_model::ElmMgrCallKind::LoadCell,
-                core::ElmMgrAccessTarget::Load(ELM_MGR_BUILTIN_ID, budget),
-            )
-        });
-        if !authorization.allowed() {
-            return Err(format!(
-                "BuildBound 模块 {} 未通过内核装载策略",
-                module.name
-            ));
-        }
-        let response = core::load_ebi_image_unlocked(
-            image,
-            arch,
-            ElmEbiSourceKind::BuildBound,
-            ELM_MGR_BUILTIN_ID,
-            budget,
-            false,
-            true,
-            &mut authorization,
-        )
-        .map_err(|status| format!("装载 BuildBound 模块 {} 失败: {status}", module.name))?;
-        if response.status != ElmEbiLoadStatus::Ok as i32 {
-            return Err(format!(
-                "装载 BuildBound 模块 {} 被运行时拒绝: {}",
-                module.name, response.status
-            ));
-        }
-        loaded += 1;
-        log::info!(
-            "[elm] BuildBound module active: name={} cell={} order={}",
-            module.name,
-            response.cell_id,
-            module.order
-        );
+fn load_build_bound_module(
+    init: &Arc<Task>,
+    module: &trust_config::ElmBuildBoundRecord,
+    arch: elm_model::ElmEbiArch,
+) -> Result<elm_model::ElmId, String> {
+    let path = format!("/lib/elm/{}", module.file_name);
+    let bytes = crate::user::load_file_from_task_vfs(init, &path)
+        .map_err(|err| format!("读取 BuildBound 模块 {} 失败: {err:?}", module.name))?;
+    if sha256(&bytes) != module.eki_hash {
+        return Err(format!("BuildBound 模块 {} 的 EKI 摘要不匹配", module.name));
     }
-    Ok(loaded)
+    let reader = ElmSliceImageReader::new(&bytes);
+    let image = source::project_ebi_image(module.provider_id, &reader, arch)
+        .map_err(|status| format!("投影 BuildBound 模块 {} 失败: {status:?}", module.name))?;
+    if image.unit.manifest.name.as_str() != module.name
+        || canonical_ebi_digest(&image) != module.ebi_hash
+    {
+        return Err(format!("BuildBound 模块 {} 的 EBI 身份不匹配", module.name));
+    }
+    let budget = ElmResourceBudget::BUILD_BOUND;
+    let mut authorization = with_core(|core| {
+        core.authorize_mgr_call(
+            ElmPrincipal::kernel(),
+            elm_model::ElmMgrCallKind::LoadCell,
+            core::ElmMgrAccessTarget::Load(ELM_MGR_BUILTIN_ID, budget),
+        )
+    });
+    if !authorization.allowed() {
+        return Err(format!(
+            "BuildBound 模块 {} 未通过内核装载策略",
+            module.name
+        ));
+    }
+    let response = core::load_ebi_image_unlocked(
+        image,
+        arch,
+        ElmEbiSourceKind::BuildBound,
+        ELM_MGR_BUILTIN_ID,
+        budget,
+        false,
+        true,
+        &mut authorization,
+    )
+    .map_err(|status| format!("装载 BuildBound 模块 {} 失败: {status}", module.name))?;
+    if response.status != ElmEbiLoadStatus::Ok as i32 {
+        return Err(format!(
+            "装载 BuildBound 模块 {} 被运行时拒绝: {}",
+            module.name, response.status
+        ));
+    }
+    log::info!(
+        "[elm] BuildBound module active: name={} cell={} order={}",
+        module.name,
+        response.cell_id,
+        module.order
+    );
+    Ok(elm_model::ElmId(response.cell_id))
+}
+
+#[cfg(feature = "network-tests")]
+pub(crate) fn detach_build_bound_module_for_test(name: &str) -> Result<elm_model::ElmId, String> {
+    let cell = with_core(|core| {
+        core.cells()
+            .iter()
+            .find(|cell| cell.name == name && cell.state == elm_model::ElmState::Active)
+            .map(|cell| cell.id)
+    })
+    .ok_or_else(|| format!("找不到活跃 BuildBound 模块 {name}"))?;
+    let mut authorization = with_core(|core| {
+        core.authorize_mgr_call(
+            ElmPrincipal::kernel(),
+            elm_model::ElmMgrCallKind::DetachCell,
+            core::ElmMgrAccessTarget::Cell(cell),
+        )
+    });
+    if !authorization.allowed() {
+        return Err(format!("BuildBound 模块 {name} 未通过内核卸载策略"));
+    }
+    let response = core::detach_cell_unlocked(cell, &mut authorization)
+        .map_err(|status| format!("卸载 BuildBound 模块 {name} 失败: {status}"))?;
+    if response.status != elm_model::ELM_MGR_STATUS_OK {
+        return Err(format!(
+            "卸载 BuildBound 模块 {name} 被运行时拒绝: {}",
+            response.status
+        ));
+    }
+    Ok(cell)
+}
+
+#[cfg(feature = "network-tests")]
+pub(crate) fn reload_build_bound_module_for_test(
+    init: &Arc<Task>,
+    name: &str,
+) -> Result<elm_model::ElmId, String> {
+    validate_build_bound_environment(init)?;
+    let module = trust_config::build_bound_modules()
+        .iter()
+        .find(|module| module.name == name)
+        .ok_or_else(|| format!("BuildBound 清单中不存在模块 {name}"))?;
+    let cell = load_build_bound_module(init, module, current_ebi_arch())?;
+    notify_lifecycle_event(ElmLifecycleEvent::CellLoaded { cell });
+    Ok(cell)
 }
 
 fn current_ebi_arch() -> elm_model::ElmEbiArch {

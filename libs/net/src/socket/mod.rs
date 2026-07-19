@@ -1,8 +1,11 @@
 //! 跨 CPU 稳定 socket facade、协议数据环与精确 readiness。
 
 mod listen_group;
+mod proxy;
 
 pub use listen_group::ListenGroup;
+pub(crate) use proxy::new_socket_readiness_relay;
+pub use proxy::{NetSocketProxy, detach_proxy_stack};
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -175,6 +178,10 @@ pub enum SocketCommand {
 }
 
 pub trait SocketRuntime: Send + Sync {
+    fn submit_stack_socket(
+        &self,
+        command: crate::stack::NetStackSocketCommandV1,
+    ) -> Result<crate::stack::NetStackSocketCommandV1, crate::stack::NetStackSocketCommandV1>;
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand>;
     fn notify_tx(&self, facade: Arc<SocketFacade>);
     fn notify_lifecycle(&self, facade: Arc<SocketFacade>);
@@ -299,6 +306,37 @@ pub fn track_socket_facade(facade: &Arc<SocketFacade>, generation: u64) {
         && (current.state != crate::stack::NetStackState::Active
             || !current.probed
             || current.generation != generation)
+    {
+        facade.detach_stack();
+    }
+}
+
+/// 将 ELM socket table 持有的 facade 绑定到对应 stack generation。
+///
+/// 该路径不把 facade 注册到常驻 socket registry；唯一强引用由 ELM table
+/// 持有，常驻 VFS 只通过 opaque socket ref 访问。
+pub(crate) fn attach_socket_facade_generation(facade: &Arc<SocketFacade>, generation: u64) {
+    if generation == 0 {
+        facade.detach_stack();
+        return;
+    }
+    match facade.stack_generation.compare_exchange(
+        0,
+        generation,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(current) if current == generation => {}
+        Err(_) => {
+            facade.detach_stack();
+            return;
+        }
+    }
+    let current = crate::stack::stack_snapshot();
+    if current.state != crate::stack::NetStackState::Active
+        || !current.probed
+        || current.generation != generation
     {
         facade.detach_stack();
     }
@@ -1155,6 +1193,7 @@ pub struct SocketFacade {
     state_wait: WaitQueue,
     control_lock: sched::mutex::Mutex<()>,
     control_sequence: AtomicU64,
+    control_pending: AtomicBool,
     control_result: Mutex<Option<(u64, Result<(), SocketError>)>>,
     tx_notified: AtomicBool,
     tx_generation: AtomicU64,
@@ -1254,6 +1293,7 @@ impl SocketFacade {
             state_wait: WaitQueue::new_with_reason(sched::WaitReason::Poll),
             control_lock: sched::mutex::Mutex::new(()),
             control_sequence: AtomicU64::new(1),
+            control_pending: AtomicBool::new(false),
             control_result: Mutex::new(None),
             tx_notified: AtomicBool::new(false),
             tx_generation: AtomicU64::new(0),
@@ -1526,6 +1566,10 @@ impl SocketFacade {
         self.state_wait.wake_all();
     }
 
+    pub fn detach_stack_for_generation(&self) {
+        self.detach_stack();
+    }
+
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
@@ -1601,10 +1645,23 @@ impl SocketFacade {
         interface: Option<InterfaceId>,
         options: BindOptions,
     ) -> Result<(), SocketError> {
+        let sequence = self.begin_bind(local, interface, options)?;
+        self.wait_control(sequence)
+    }
+
+    pub fn begin_bind(
+        self: &Arc<Self>,
+        local: Endpoint,
+        interface: Option<InterfaceId>,
+        options: BindOptions,
+    ) -> Result<u64, SocketError> {
         self.ensure_stack_attached()?;
         let _control = self.control_lock.lock();
         if !matches!(self.owner(), OwnerRef::Unassigned) {
             return Err(SocketError::InvalidState);
+        }
+        if self.control_pending.swap(true, Ordering::AcqRel) {
+            return Err(SocketError::AlreadyInProgress);
         }
         let sequence = self.next_control_sequence();
         let command = SocketCommand::Bind {
@@ -1615,10 +1672,11 @@ impl SocketFacade {
             interface,
             options,
         };
-        socket_runtime()?
-            .submit_control(command)
-            .map_err(|_| SocketError::RuntimeBusy)?;
-        self.wait_control(sequence)
+        if socket_runtime()?.submit_control(command).is_err() {
+            self.control_pending.store(false, Ordering::Release);
+            return Err(SocketError::RuntimeBusy);
+        }
+        Ok(sequence)
     }
 
     pub fn connect(
@@ -1677,11 +1735,19 @@ impl SocketFacade {
     }
 
     pub fn listen(self: &Arc<Self>, backlog: u32) -> Result<(), SocketError> {
+        let sequence = self.begin_listen(backlog)?;
+        self.wait_control(sequence)
+    }
+
+    pub fn begin_listen(self: &Arc<Self>, backlog: u32) -> Result<u64, SocketError> {
         self.ensure_stack_attached()?;
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
         let _control = self.control_lock.lock();
+        if self.control_pending.swap(true, Ordering::AcqRel) {
+            return Err(SocketError::AlreadyInProgress);
+        }
         let sequence = self.next_control_sequence();
         let command = SocketCommand::Listen {
             facade: Arc::clone(self),
@@ -1689,10 +1755,11 @@ impl SocketFacade {
             generation: self.generation(),
             backlog,
         };
-        socket_runtime()?
-            .submit_control(command)
-            .map_err(|_| SocketError::RuntimeBusy)?;
-        self.wait_control(sequence)
+        if socket_runtime()?.submit_control(command).is_err() {
+            self.control_pending.store(false, Ordering::Release);
+            return Err(SocketError::RuntimeBusy);
+        }
+        Ok(sequence)
     }
 
     pub fn accept(
@@ -2640,6 +2707,7 @@ impl SocketFacade {
     }
 
     pub fn complete_control(&self, sequence: u64, result: Result<(), SocketError>) {
+        self.control_pending.store(false, Ordering::Release);
         if let Err(error) = result
             && self.kind == SocketKind::Stream
             && self.connect_pending.swap(false, Ordering::AcqRel)
@@ -2648,6 +2716,10 @@ impl SocketFacade {
         }
         *self.control_result.lock() = Some((sequence, result));
         self.state_wait.wake_all();
+        let (readiness, generation) = self.readiness();
+        if let Some(observer) = self.observer.lock().as_ref().and_then(Weak::upgrade) {
+            observer.readiness_changed(readiness, generation);
+        }
     }
 
     pub fn begin_lifecycle_drain(&self) {
@@ -3083,7 +3155,7 @@ impl SocketFacade {
         }
     }
 
-    fn take_control_result(&self, sequence: u64) -> Option<Result<(), SocketError>> {
+    pub fn take_control_result(&self, sequence: u64) -> Option<Result<(), SocketError>> {
         let mut result = self.control_result.lock();
         if result.as_ref().is_some_and(|entry| entry.0 == sequence) {
             result.take().map(|entry| entry.1)

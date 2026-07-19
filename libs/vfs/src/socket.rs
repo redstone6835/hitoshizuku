@@ -1379,14 +1379,14 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             SO_PROTOCOL => Ok((net_ops.protocol() as i32).to_ne_bytes().to_vec()),
             SO_ERROR => Ok(net_ops.take_last_error_code().to_ne_bytes().to_vec()),
             SO_ACCEPTCONN => Ok(
-                (matches!(net_ops.facade().owner(), net::OwnerRef::Listener { .. }) as i32)
+                (matches!(net_ops.proxy().owner(), net::OwnerRef::Listener { .. }) as i32)
                     .to_ne_bytes()
                     .to_vec(),
             ),
-            SO_SNDBUF => Ok((net_ops.facade().buffer_limits().0 as i32)
+            SO_SNDBUF => Ok((net_ops.proxy().buffer_limits().0 as i32)
                 .to_ne_bytes()
                 .to_vec()),
-            SO_RCVBUF => Ok((net_ops.facade().buffer_limits().1 as i32)
+            SO_RCVBUF => Ok((net_ops.proxy().buffer_limits().1 as i32)
                 .to_ne_bytes()
                 .to_vec()),
             SO_REUSEADDR => Ok((opts.reuseaddr as i32).to_ne_bytes().to_vec()),
@@ -1415,7 +1415,7 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             }
             SO_TIMESTAMP => Ok((opts.timestamp as i32).to_ne_bytes().to_vec()),
             SO_KEEPALIVE if net_ops.sock_type() == SOCK_STREAM as u16 => {
-                Ok((net_ops.facade().tcp_keepalive_enabled() as i32)
+                Ok((net_ops.proxy().tcp_keepalive_enabled() as i32)
                     .to_ne_bytes()
                     .to_vec())
             }
@@ -1458,45 +1458,41 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_TCP if net_ops.sock_type() == SOCK_STREAM as u16 => match optname {
-            TCP_NODELAY => Ok((net_ops.facade().tcp_nodelay() as i32)
+            TCP_NODELAY => Ok((net_ops.proxy().tcp_nodelay() as i32)
                 .to_ne_bytes()
                 .to_vec()),
             TCP_MAXSEG => {
-                let info = net_ops.facade().tcp_info();
+                let info = net_ops.proxy().tcp_info();
                 let mss = if info.send_mss == 0 {
-                    u32::from(net_ops.facade().tcp_maxseg())
+                    u32::from(net_ops.proxy().tcp_maxseg())
                 } else {
                     info.send_mss
                 };
                 Ok((mss as i32).to_ne_bytes().to_vec())
             }
-            TCP_CORK => Ok((net_ops.facade().tcp_cork() as i32).to_ne_bytes().to_vec()),
-            TCP_KEEPIDLE => Ok(
-                ((net_ops.facade().tcp_keepidle_ns() / 1_000_000_000) as i32)
-                    .to_ne_bytes()
-                    .to_vec(),
-            ),
-            TCP_KEEPINTVL => Ok(
-                ((net_ops.facade().tcp_keepintvl_ns() / 1_000_000_000) as i32)
-                    .to_ne_bytes()
-                    .to_vec(),
-            ),
-            TCP_KEEPCNT => Ok((i32::from(net_ops.facade().tcp_keepcount()))
+            TCP_CORK => Ok((net_ops.proxy().tcp_cork() as i32).to_ne_bytes().to_vec()),
+            TCP_KEEPIDLE => Ok(((net_ops.proxy().tcp_keepidle_ns() / 1_000_000_000) as i32)
                 .to_ne_bytes()
                 .to_vec()),
-            TCP_INFO => Ok(encode_tcp_info(net_ops.facade().tcp_info())),
-            TCP_QUICKACK => Ok(0i32.to_ne_bytes().to_vec()),
-            TCP_CONGESTION => Ok(b"newreno\0".to_vec()),
-            TCP_USER_TIMEOUT => Ok(
-                ((net_ops.facade().tcp_user_timeout_ns() / 1_000_000) as i32)
+            TCP_KEEPINTVL => Ok(
+                ((net_ops.proxy().tcp_keepintvl_ns() / 1_000_000_000) as i32)
                     .to_ne_bytes()
                     .to_vec(),
             ),
-            TCP_DEFER_ACCEPT => Ok(((net_ops.facade().tcp_defer_accept_ns() / 1_000_000_000)
+            TCP_KEEPCNT => Ok((i32::from(net_ops.proxy().tcp_keepcount()))
+                .to_ne_bytes()
+                .to_vec()),
+            TCP_INFO => Ok(encode_tcp_info(net_ops.proxy().tcp_info())),
+            TCP_QUICKACK => Ok(0i32.to_ne_bytes().to_vec()),
+            TCP_CONGESTION => Ok(b"newreno\0".to_vec()),
+            TCP_USER_TIMEOUT => Ok(((net_ops.proxy().tcp_user_timeout_ns() / 1_000_000) as i32)
+                .to_ne_bytes()
+                .to_vec()),
+            TCP_DEFER_ACCEPT => Ok(((net_ops.proxy().tcp_defer_accept_ns() / 1_000_000_000)
                 as i32)
                 .to_ne_bytes()
                 .to_vec()),
-            TCP_NOTSENT_LOWAT => Ok(net_ops.facade().tcp_notsent_lowat().to_ne_bytes().to_vec()),
+            TCP_NOTSENT_LOWAT => Ok(net_ops.proxy().tcp_notsent_lowat().to_ne_bytes().to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
@@ -1559,7 +1555,7 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 opts.mark = u32::from_ne_bytes(value[..4].try_into().unwrap());
-                net_ops.facade().set_socket_mark(opts.mark);
+                net_ops.proxy().set_socket_mark(opts.mark);
                 Ok(())
             }
             SO_PRIORITY => {
@@ -1568,7 +1564,7 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 opts.priority = priority;
-                net_ops.facade().set_socket_priority(priority);
+                net_ops.proxy().set_socket_priority(priority);
                 Ok(())
             }
             SO_RXQ_OVFL => {
@@ -1591,14 +1587,14 @@ fn inet_setsockopt(
             }
             SO_SNDBUF => {
                 let requested = parse_int_opt(value)?.max(0) as usize;
-                net_ops.facade().set_buffer_limits(Some(requested), None);
-                opts.sndbuf = net_ops.facade().buffer_limits().0 as i32;
+                net_ops.proxy().set_buffer_limits(Some(requested), None);
+                opts.sndbuf = net_ops.proxy().buffer_limits().0 as i32;
                 Ok(())
             }
             SO_RCVBUF => {
                 let requested = parse_int_opt(value)?.max(0) as usize;
-                net_ops.facade().set_buffer_limits(None, Some(requested));
-                opts.rcvbuf = net_ops.facade().buffer_limits().1 as i32;
+                net_ops.proxy().set_buffer_limits(None, Some(requested));
+                opts.rcvbuf = net_ops.proxy().buffer_limits().1 as i32;
                 Ok(())
             }
             SO_TIMESTAMP => {
@@ -1607,7 +1603,7 @@ fn inet_setsockopt(
             }
             SO_KEEPALIVE if net_ops.sock_type() == SOCK_STREAM as u16 => {
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_tcp_keepalive(parse_int_opt(value)? != 0);
                 Ok(())
             }
@@ -1629,7 +1625,7 @@ fn inet_setsockopt(
                     _ => return Err(Errno::EINVAL),
                 };
                 opts.ttl = ttl;
-                net_ops.facade().set_ip_hop_limit(ttl);
+                net_ops.proxy().set_ip_hop_limit(ttl);
                 Ok(())
             }
             IP_TOS => {
@@ -1638,7 +1634,7 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 opts.traffic_class = value as u8;
-                net_ops.facade().set_ip_traffic_class(value as u8);
+                net_ops.proxy().set_ip_traffic_class(value as u8);
                 Ok(())
             }
             IP_HDRINCL
@@ -1647,7 +1643,7 @@ fn inet_setsockopt(
             {
                 let enabled = parse_int_opt(value)? != 0;
                 opts.header_included = enabled;
-                net_ops.facade().set_raw_header_included(enabled);
+                net_ops.proxy().set_raw_header_included(enabled);
                 Ok(())
             }
             IP_OPTIONS => {
@@ -1675,32 +1671,32 @@ fn inet_setsockopt(
             }
             IP_FREEBIND => {
                 opts.free_bind = parse_int_opt(value)? != 0;
-                net_ops.facade().set_free_bind(opts.free_bind);
+                net_ops.proxy().set_free_bind(opts.free_bind);
                 Ok(())
             }
             IP_MULTICAST_IF => {
                 opts.multicast_interface = parse_multicast_interface(value)?;
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_multicast_interface(opts.multicast_interface);
                 Ok(())
             }
             IP_MULTICAST_TTL => {
                 opts.multicast_hops = parse_u8_socket_opt(value)?;
-                net_ops.facade().set_multicast_hops(opts.multicast_hops);
+                net_ops.proxy().set_multicast_hops(opts.multicast_hops);
                 Ok(())
             }
             IP_MULTICAST_LOOP => {
                 opts.multicast_loop = parse_int_or_byte_opt(value)? != 0;
-                net_ops.facade().set_multicast_loop(opts.multicast_loop);
+                net_ops.proxy().set_multicast_loop(opts.multicast_loop);
                 Ok(())
             }
             IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
                 let membership = parse_ipv4_membership(value)?;
                 if optname == IP_ADD_MEMBERSHIP {
-                    net_ops.facade().add_multicast_membership(membership)
+                    net_ops.proxy().add_multicast_membership(membership)
                 } else {
-                    net_ops.facade().drop_multicast_membership(membership)
+                    net_ops.proxy().drop_multicast_membership(membership)
                 }
                 .map_err(crate::net_socket::map_socket_error_public)
             }
@@ -1715,7 +1711,7 @@ fn inet_setsockopt(
                     _ => return Err(Errno::EINVAL),
                 };
                 opts.ipv6_hops = hops;
-                net_ops.facade().set_ip_hop_limit(hops);
+                net_ops.proxy().set_ip_hop_limit(hops);
                 Ok(())
             }
             IPV6_TCLASS => {
@@ -1726,15 +1722,15 @@ fn inet_setsockopt(
                     _ => return Err(Errno::EINVAL),
                 };
                 opts.ipv6_traffic_class = class;
-                net_ops.facade().set_ip_traffic_class(class);
+                net_ops.proxy().set_ip_traffic_class(class);
                 Ok(())
             }
             IPV6_V6ONLY => {
-                if !matches!(net_ops.facade().owner(), net::OwnerRef::Unassigned) {
+                if !matches!(net_ops.proxy().owner(), net::OwnerRef::Unassigned) {
                     return Err(Errno::EINVAL);
                 }
                 opts.v6only = parse_int_opt(value)? != 0;
-                net_ops.facade().set_v6_only(opts.v6only);
+                net_ops.proxy().set_v6_only(opts.v6only);
                 Ok(())
             }
             IPV6_RECVPKTINFO => {
@@ -1757,7 +1753,7 @@ fn inet_setsockopt(
                 opts.multicast_interface =
                     (interface != 0).then_some(net::InterfaceId(interface as u32));
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_multicast_interface(opts.multicast_interface);
                 Ok(())
             }
@@ -1768,20 +1764,20 @@ fn inet_setsockopt(
                     0..=255 => hops as u8,
                     _ => return Err(Errno::EINVAL),
                 };
-                net_ops.facade().set_multicast_hops(opts.multicast_hops);
+                net_ops.proxy().set_multicast_hops(opts.multicast_hops);
                 Ok(())
             }
             IPV6_MULTICAST_LOOP => {
                 opts.multicast_loop = parse_int_opt(value)? != 0;
-                net_ops.facade().set_multicast_loop(opts.multicast_loop);
+                net_ops.proxy().set_multicast_loop(opts.multicast_loop);
                 Ok(())
             }
             IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => {
                 let membership = parse_ipv6_membership(value)?;
                 if optname == IPV6_ADD_MEMBERSHIP {
-                    net_ops.facade().add_multicast_membership(membership)
+                    net_ops.proxy().add_multicast_membership(membership)
                 } else {
-                    net_ops.facade().drop_multicast_membership(membership)
+                    net_ops.proxy().drop_multicast_membership(membership)
                 }
                 .map_err(crate::net_socket::map_socket_error_public)
             }
@@ -1789,22 +1785,22 @@ fn inet_setsockopt(
         },
         SOL_TCP if net_ops.sock_type() == SOCK_STREAM as u16 => match optname {
             TCP_NODELAY => {
-                net_ops.facade().set_tcp_nodelay(parse_int_opt(value)? != 0);
+                net_ops.proxy().set_tcp_nodelay(parse_int_opt(value)? != 0);
                 Ok(())
             }
             TCP_MAXSEG => {
-                if matches!(net_ops.facade().owner(), net::OwnerRef::Flow { .. }) {
+                if matches!(net_ops.proxy().owner(), net::OwnerRef::Flow { .. }) {
                     return Err(Errno::EISCONN);
                 }
                 let mss = parse_int_opt(value)?;
                 if !(536..=u16::MAX as i32).contains(&mss) {
                     return Err(Errno::EINVAL);
                 }
-                net_ops.facade().set_tcp_maxseg(mss as u16);
+                net_ops.proxy().set_tcp_maxseg(mss as u16);
                 Ok(())
             }
             TCP_CORK => {
-                net_ops.facade().set_tcp_cork(parse_int_opt(value)? != 0);
+                net_ops.proxy().set_tcp_cork(parse_int_opt(value)? != 0);
                 Ok(())
             }
             TCP_KEEPIDLE => {
@@ -1813,7 +1809,7 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_tcp_keepidle_ns((seconds as u64).saturating_mul(1_000_000_000));
                 Ok(())
             }
@@ -1823,7 +1819,7 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_tcp_keepintvl_ns((seconds as u64).saturating_mul(1_000_000_000));
                 Ok(())
             }
@@ -1832,7 +1828,7 @@ fn inet_setsockopt(
                 if !(1..=u16::MAX as i32).contains(&count) {
                     return Err(Errno::EINVAL);
                 }
-                net_ops.facade().set_tcp_keepcount(count as u16);
+                net_ops.proxy().set_tcp_keepcount(count as u16);
                 Ok(())
             }
             TCP_CONGESTION => {
@@ -1847,21 +1843,21 @@ fn inet_setsockopt(
             }
             TCP_QUICKACK => {
                 if parse_int_opt(value)? != 0 {
-                    net_ops.facade().request_quick_ack();
+                    net_ops.proxy().request_quick_ack();
                 }
                 Ok(())
             }
             TCP_USER_TIMEOUT => {
                 let timeout_ms = parse_int_opt(value)?.max(0) as u64;
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_tcp_user_timeout_ns(timeout_ms.saturating_mul(1_000_000));
                 Ok(())
             }
             TCP_DEFER_ACCEPT => {
                 let seconds = parse_int_opt(value)?.max(0) as u64;
                 net_ops
-                    .facade()
+                    .proxy()
                     .set_tcp_defer_accept_ns(seconds.saturating_mul(1_000_000_000));
                 Ok(())
             }
@@ -1870,7 +1866,7 @@ fn inet_setsockopt(
                 if value < 0 {
                     return Err(Errno::EINVAL);
                 }
-                net_ops.facade().set_tcp_notsent_lowat(value as u32);
+                net_ops.proxy().set_tcp_notsent_lowat(value as u32);
                 Ok(())
             }
             TCP_FASTOPEN => Err(Errno::EOPNOTSUPP),
@@ -2441,7 +2437,7 @@ fn encode_inet_receive_control(
     let (mut out, mut truncated) =
         encode_inet_receive_control_with_options(&opts, result, control_len);
     if !truncated && opts.receive_overflow {
-        let dropped = net_ops.facade().take_rx_overflow();
+        let dropped = net_ops.proxy().take_rx_overflow();
         if dropped != 0 {
             truncated |= append_receive_cmsg(
                 &mut out,

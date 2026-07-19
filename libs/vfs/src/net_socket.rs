@@ -1,6 +1,6 @@
 //! INET socket 的 VFS 适配层。
 //!
-//! 本层只保存稳定的 `SocketFacade` 引用和 VFS 可见 option，不保存协议状态。
+//! 本层只保存稳定的 `NetSocketProxy`、`PollSource` 和 VFS 可见 option，不保存协议状态。
 
 use alloc::sync::Arc;
 use core::any::Any;
@@ -148,10 +148,7 @@ impl Default for SocketOptions {
 }
 
 pub struct NetSocketFileOps {
-    family: u16,
-    sock_type: u16,
-    protocol: u16,
-    facade: Arc<net::SocketFacade>,
+    proxy: net::NetSocketProxy,
     poll_source: Arc<PollSource>,
     nonblock: AtomicBool,
     recv_timeout_ns: AtomicU64,
@@ -183,11 +180,18 @@ impl net::ReadinessObserver for PollSource {
 
 impl NetSocketFileOps {
     pub fn family(&self) -> u16 {
-        self.family
+        match self.proxy.family() {
+            net::AddressFamily::Ipv4 => crate::addr::AF_INET,
+            net::AddressFamily::Ipv6 => crate::addr::AF_INET6,
+        }
     }
 
     pub fn sock_type(&self) -> u16 {
-        self.sock_type
+        match self.proxy.kind() {
+            net::SocketKind::Datagram => SOCK_DGRAM,
+            net::SocketKind::Stream => SOCK_STREAM,
+            net::SocketKind::Raw => SOCK_RAW,
+        }
     }
 
     pub fn options(&self) -> &Mutex<SocketOptions> {
@@ -195,7 +199,7 @@ impl NetSocketFileOps {
     }
 
     pub fn take_last_error_code(&self) -> i32 {
-        self.facade
+        self.proxy
             .take_pending_error()
             .map(map_socket_error)
             .map(i32::from)
@@ -204,7 +208,7 @@ impl NetSocketFileOps {
 
     pub fn take_error_record(&self) -> Result<net::SocketErrorRecord, Errno> {
         let options = self.options.lock();
-        let enabled = if self.family == crate::addr::AF_INET {
+        let enabled = if self.family() == crate::addr::AF_INET {
             options.receive_errors_v4
         } else {
             options.receive_errors_v6
@@ -213,7 +217,7 @@ impl NetSocketFileOps {
         if !enabled {
             return Err(Errno::EAGAIN);
         }
-        self.facade.take_error_record().ok_or(Errno::EAGAIN)
+        self.proxy.take_error_record().ok_or(Errno::EAGAIN)
     }
 
     pub fn recv_timeout_ns(&self) -> &AtomicU64 {
@@ -226,20 +230,20 @@ impl NetSocketFileOps {
 
     pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
         self.ensure_backend()?;
-        let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
+        let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family())?;
         let options = self.bind_options_for(local.addr);
         let interface = self.options.lock().bind_interface;
-        self.facade
+        self.proxy
             .bind(local, interface, options)
             .map_err(map_socket_error)
     }
 
     pub fn listen(&self, backlog: u32) -> Result<(), Errno> {
         self.ensure_backend()?;
-        if self.sock_type != SOCK_STREAM {
+        if self.sock_type() != SOCK_STREAM {
             return Err(Errno::EOPNOTSUPP);
         }
-        self.facade.listen(backlog).map_err(map_socket_error)
+        self.proxy.listen(backlog).map_err(map_socket_error)
     }
 
     pub fn accept(
@@ -248,20 +252,15 @@ impl NetSocketFileOps {
         accepted_nonblocking: bool,
     ) -> Result<Self, Errno> {
         self.ensure_backend()?;
-        if self.sock_type != SOCK_STREAM {
+        if self.sock_type() != SOCK_STREAM {
             return Err(Errno::EOPNOTSUPP);
         }
-        let facade = self
-            .facade
+        let proxy = self
+            .proxy
             .accept(wait_nonblocking, self.recv_deadline())
             .map_err(map_socket_error)?;
-        let stack_generation = self.facade.stack_generation();
-        Ok(Self::from_facade(
-            self.family,
-            self.sock_type,
-            self.protocol,
-            facade,
-            stack_generation,
+        Ok(Self::from_proxy(
+            proxy,
             accepted_nonblocking,
             self.options.lock().clone(),
         ))
@@ -269,10 +268,10 @@ impl NetSocketFileOps {
 
     pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
         self.ensure_backend()?;
-        let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
+        let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family())?;
         let interface = self.options.lock().bind_interface;
         let options = self.bind_options();
-        self.facade
+        self.proxy
             .connect_with_mode(peer, interface, options, nonblocking)
             .map_err(map_socket_error)
     }
@@ -285,7 +284,7 @@ impl NetSocketFileOps {
             2 => (true, true),
             _ => return Err(Errno::EINVAL),
         };
-        self.facade.shutdown(read, write).map_err(map_socket_error)
+        self.proxy.shutdown(read, write).map_err(map_socket_error)
     }
 
     pub fn sendto(
@@ -295,14 +294,14 @@ impl NetSocketFileOps {
         opts: InetSendOptions,
     ) -> Result<usize, Errno> {
         self.ensure_backend()?;
-        if self.sock_type == SOCK_STREAM {
+        if self.sock_type() == SOCK_STREAM {
             if sockaddr.is_some() {
                 return Err(Errno::EISCONN);
             }
             let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
-            self.facade.set_tcp_more(opts.more);
+            self.proxy.set_tcp_more(opts.more);
             return self
-                .facade
+                .proxy
                 .send_stream(data, opts.nonblocking, deadline)
                 .map_err(map_socket_error);
         }
@@ -311,7 +310,7 @@ impl NetSocketFileOps {
         }
         self.ensure_bound()?;
         let destination = sockaddr
-            .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family))
+            .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family()))
             .transpose()?;
         let socket_options = self.options.lock().clone();
         if destination.is_some_and(
@@ -321,7 +320,7 @@ impl NetSocketFileOps {
             return Err(Errno::EACCES);
         }
         let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
-        self.facade
+        self.proxy
             .send_datagram(
                 data,
                 destination,
@@ -336,15 +335,15 @@ impl NetSocketFileOps {
     pub fn recvfrom(&self, buf: &mut [u8], opts: InetRecvOptions) -> Result<InetRecvResult, Errno> {
         self.ensure_backend()?;
         let deadline = opts.deadline_ns.or_else(|| self.recv_deadline());
-        if self.sock_type == SOCK_STREAM {
+        if self.sock_type() == SOCK_STREAM {
             let len = self
-                .facade
+                .proxy
                 .recv_stream(buf, opts.peek, opts.wait_all, opts.nonblocking, deadline)
                 .map_err(map_socket_error)?;
             return Ok(InetRecvResult {
                 len,
-                remote: self.facade.peer_endpoint(),
-                local: self.facade.local_endpoint(),
+                remote: self.proxy.peer_endpoint(),
+                local: self.proxy.local_endpoint(),
                 interface_id: None,
                 hop_limit: None,
                 traffic_class: None,
@@ -354,7 +353,7 @@ impl NetSocketFileOps {
         }
         self.ensure_bound()?;
         let received = self
-            .facade
+            .proxy
             .recv(buf, opts.peek, opts.trunc, opts.nonblocking, deadline)
             .map_err(map_socket_error)?;
         Ok(InetRecvResult {
@@ -371,35 +370,35 @@ impl NetSocketFileOps {
 
     pub fn getsockname(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.ensure_backend()?;
-        let endpoint = self.facade.local_endpoint().unwrap_or(net::Endpoint {
-            addr: unspecified(self.family),
+        let endpoint = self.proxy.local_endpoint().unwrap_or(net::Endpoint {
+            addr: unspecified(self.family()),
             port: 0,
         });
-        crate::addr::encode_inet_sockaddr(&endpoint, self.family, buf)
+        crate::addr::encode_inet_sockaddr(&endpoint, self.family(), buf)
     }
 
     pub fn getpeername(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.ensure_backend()?;
-        let endpoint = self.facade.peer_endpoint().ok_or(Errno::ENOTCONN)?;
-        crate::addr::encode_inet_sockaddr(&endpoint, self.family, buf)
+        let endpoint = self.proxy.peer_endpoint().ok_or(Errno::ENOTCONN)?;
+        crate::addr::encode_inet_sockaddr(&endpoint, self.family(), buf)
     }
 
     pub fn protocol(&self) -> u16 {
-        self.protocol
+        u16::from(self.proxy.protocol())
     }
 
-    pub fn facade(&self) -> &Arc<net::SocketFacade> {
-        &self.facade
+    pub fn proxy(&self) -> &net::NetSocketProxy {
+        &self.proxy
     }
 
     fn ensure_bound(&self) -> Result<(), Errno> {
         self.ensure_backend()?;
-        if matches!(self.facade.owner(), net::OwnerRef::Unassigned) {
+        if matches!(self.proxy.owner(), net::OwnerRef::Unassigned) {
             let interface = self.options.lock().bind_interface;
             let options = self.bind_options();
-            let result = self.facade.bind(
+            let result = self.proxy.bind(
                 net::Endpoint {
-                    addr: unspecified(self.family),
+                    addr: unspecified(self.family()),
                     port: 0,
                 },
                 interface,
@@ -407,7 +406,7 @@ impl NetSocketFileOps {
             );
             if let Err(error) = result
                 && !(error == net::SocketError::InvalidState
-                    && matches!(self.facade.owner(), net::OwnerRef::Flow { .. }))
+                    && matches!(self.proxy.owner(), net::OwnerRef::Flow { .. }))
             {
                 return Err(map_socket_error(error));
             }
@@ -416,7 +415,7 @@ impl NetSocketFileOps {
     }
 
     fn ensure_backend(&self) -> Result<(), Errno> {
-        self.facade
+        self.proxy
             .backend_error()
             .map_or(Ok(()), |error| Err(map_socket_error(error)))
     }
@@ -427,7 +426,7 @@ impl NetSocketFileOps {
             reuse_address: options.reuseaddr,
             reuse_port: options.reuseport,
             v6_only: options.v6only,
-            multicast_or_broadcast: self.facade.has_multicast_memberships(),
+            multicast_or_broadcast: self.proxy.has_multicast_memberships(),
             free_bind: options.free_bind,
         }
     }
@@ -447,26 +446,14 @@ impl NetSocketFileOps {
         timeout_deadline(self.send_timeout_ns.load(Ordering::Relaxed))
     }
 
-    fn from_facade(
-        family: u16,
-        sock_type: u16,
-        protocol: u16,
-        facade: Arc<net::SocketFacade>,
-        stack_generation: u64,
-        nonblock: bool,
-        options: SocketOptions,
-    ) -> Self {
-        net::track_socket_facade(&facade, stack_generation);
-        let readiness = facade.readiness();
+    fn from_proxy(proxy: net::NetSocketProxy, nonblock: bool, options: SocketOptions) -> Self {
+        let readiness = proxy.readiness();
         let poll_source = Arc::new(PollSource::new(PollEvents::default()));
         let observer: Arc<dyn net::ReadinessObserver> = poll_source.clone();
-        facade.set_observer(Arc::downgrade(&observer));
+        proxy.set_observer(Arc::downgrade(&observer));
         observer.readiness_changed(readiness.0, readiness.1);
         Self {
-            family,
-            sock_type,
-            protocol,
-            facade,
+            proxy,
             poll_source,
             nonblock: AtomicBool::new(nonblock),
             recv_timeout_ns: AtomicU64::new(0),
@@ -520,7 +507,7 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let readiness = self.facade.readiness().0;
+        let readiness = self.proxy.readiness().0;
         let mut ready = PollEvents::default();
         if readiness.contains(net::Readiness::READABLE) {
             ready = ready.with(PollEvents::POLLIN);
@@ -546,7 +533,7 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
-        self.facade.add_poll_waiter(
+        self.proxy.add_poll_waiter(
             task,
             interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI),
             interest.has(PollEvents::POLLOUT),
@@ -557,7 +544,7 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
-        self.facade.remove_poll_waiter(task);
+        self.proxy.remove_poll_waiter(task);
     }
 
     fn poll_source(&self) -> Option<&PollSource> {
@@ -574,15 +561,18 @@ impl FileOps for NetSocketFileOps {
 
     fn release(&self) {
         let options = self.options.lock().clone();
-        if self.sock_type == SOCK_STREAM && options.linger_enabled && options.linger_seconds == 0 {
-            self.facade.request_abortive_close();
+        if self.sock_type() == SOCK_STREAM && options.linger_enabled && options.linger_seconds == 0
+        {
+            self.proxy.request_abortive_close();
         }
-        self.facade.close();
-        if self.sock_type == SOCK_STREAM && options.linger_enabled && options.linger_seconds != 0 {
-            let deadline = sched::now_ns_public()
-                .saturating_add(u64::from(options.linger_seconds).saturating_mul(1_000_000_000));
-            let _ = self.facade.wait_closed(deadline);
-        }
+        let deadline = (self.sock_type() == SOCK_STREAM
+            && options.linger_enabled
+            && options.linger_seconds != 0)
+            .then(|| {
+                sched::now_ns_public()
+                    .saturating_add(u64::from(options.linger_seconds).saturating_mul(1_000_000_000))
+            });
+        self.proxy.close_with_deadline(deadline);
     }
 
     fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
@@ -617,6 +607,7 @@ pub fn create_net_socket(
     if stack.state != net::stack::NetStackState::Active || !stack.probed {
         return Err(Errno::EAFNOSUPPORT);
     }
+    let stack_instance = stack.handle.ok_or(Errno::EAFNOSUPPORT)?.0;
     let address_family = match family {
         crate::addr::AF_INET => net::AddressFamily::Ipv4,
         crate::addr::AF_INET6 => net::AddressFamily::Ipv6,
@@ -624,13 +615,16 @@ pub fn create_net_socket(
     };
     match sock_type {
         SOCK_DGRAM if matches!(protocol, 0 | 17) => {
-            let facade = net::new_socket_facade(address_family).map_err(map_socket_error)?;
-            Ok(NetSocketFileOps::from_facade(
-                family,
-                sock_type,
+            let proxy = net::NetSocketProxy::create(
+                address_family,
+                net::SocketKind::Datagram,
                 17,
-                facade,
                 stack.generation,
+                stack_instance,
+            )
+            .map_err(map_socket_error)?;
+            Ok(NetSocketFileOps::from_proxy(
+                proxy,
                 nonblock,
                 SocketOptions {
                     sndbuf: 128 * 1024,
@@ -640,13 +634,16 @@ pub fn create_net_socket(
             ))
         }
         SOCK_STREAM if matches!(protocol, 0 | 6) => {
-            let facade = net::new_tcp_socket_facade(address_family).map_err(map_socket_error)?;
-            Ok(NetSocketFileOps::from_facade(
-                family,
-                sock_type,
+            let proxy = net::NetSocketProxy::create(
+                address_family,
+                net::SocketKind::Stream,
                 6,
-                facade,
                 stack.generation,
+                stack_instance,
+            )
+            .map_err(map_socket_error)?;
+            Ok(NetSocketFileOps::from_proxy(
+                proxy,
                 nonblock,
                 SocketOptions {
                     sndbuf: 256 * 1024,
@@ -656,15 +653,17 @@ pub fn create_net_socket(
             ))
         }
         SOCK_RAW if (1..=u8::MAX as u16).contains(&protocol) => {
-            let facade = net::new_raw_socket_facade(address_family, protocol as u8)
-                .map_err(map_socket_error)?;
-            facade.set_buffer_limits(Some(64 * 1024), Some(64 * 1024));
-            Ok(NetSocketFileOps::from_facade(
-                family,
-                sock_type,
-                protocol,
-                facade,
+            let proxy = net::NetSocketProxy::create(
+                address_family,
+                net::SocketKind::Raw,
+                protocol as u8,
                 stack.generation,
+                stack_instance,
+            )
+            .map_err(map_socket_error)?;
+            proxy.set_buffer_limits(Some(64 * 1024), Some(64 * 1024));
+            Ok(NetSocketFileOps::from_proxy(
+                proxy,
                 nonblock,
                 SocketOptions {
                     sndbuf: 64 * 1024,
