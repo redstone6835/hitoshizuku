@@ -42,6 +42,7 @@ exclude = [
     "drivers/uart16550",
     "drivers/virtio",
     "drivers/virtio-blk",
+    "drivers/virtio-net",
     "tests/elm/kernel-mixin",
 ]
 

@@ -156,12 +156,14 @@ impl IrqHandler for PlicCascadeHandler {
 
 struct PlicDriver {
     device_mmio_to_virt: fn(usize) -> usize,
+    boot_hart_id: usize,
 }
 
 impl PlicDriver {
-    fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
+    fn new(device_mmio_to_virt: fn(usize) -> usize, boot_hart_id: usize) -> Self {
         Self {
             device_mmio_to_virt,
+            boot_hart_id,
         }
     }
 
@@ -170,12 +172,19 @@ impl PlicDriver {
             && (info.has_id(COMPAT_SIFIVE_PLIC) || info.has_id(COMPAT_RISCV_PLIC0))
     }
 
-    fn supervisor_context(info: &PlatformDeviceInfo) -> Result<usize, PnpError> {
+    fn supervisor_context(
+        info: &PlatformDeviceInfo,
+        boot_hart_id: usize,
+    ) -> Result<usize, PnpError> {
         let mut saw_irq = false;
+        let mut supervisor_index = 0usize;
         for (index, irq) in info.irq_resources().enumerate() {
             saw_irq = true;
             if irq.cells().first().copied() == Some(RISCV_SUPERVISOR_EXTERNAL_IRQ) {
-                return Ok(index);
+                if supervisor_index == boot_hart_id {
+                    return Ok(index);
+                }
+                supervisor_index += 1;
             }
         }
         if saw_irq {
@@ -238,7 +247,7 @@ impl PnpDriver for PlicDriver {
             return Err(PnpError::missing(PnpResourceKind::Mmio, "plic reg missing"));
         };
         let mmio_base = (self.device_mmio_to_virt)(phys);
-        let context = Self::supervisor_context(info)?;
+        let context = Self::supervisor_context(info, self.boot_hart_id)?;
 
         let plic = Arc::new(Plic {
             inner: Spinlock::new(PlicInner { mmio_base, ndev }),
@@ -299,7 +308,10 @@ impl DriverFactory for PlicFactory {
     }
 
     fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
-        Ok(Arc::new(PlicDriver::new(ctx.device_mmio_to_virt)))
+        Ok(Arc::new(PlicDriver::new(
+            ctx.device_mmio_to_virt,
+            ctx.boot_cpu_id,
+        )))
     }
 }
 

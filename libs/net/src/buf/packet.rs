@@ -14,7 +14,14 @@ pub enum PacketFragment {
     Owned(Box<[u8]>),
 }
 
+#[kernel_symbols::export]
 impl PacketFragment {
+    #[kernel_symbols::export(
+        name = "net.buf.PacketFragment.len",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn len(&self) -> usize {
         match self {
             Self::Exclusive(lease) => lease.len(),
@@ -27,6 +34,13 @@ impl PacketFragment {
         self.len() == 0
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.PacketFragment.dma_addr",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+            | kernel_symbols::capability::DEVICE_DMA
+    )]
     pub fn dma_addr(&self) -> Result<Option<u64>, super::NetBufPoolError> {
         match self {
             Self::Exclusive(lease) => lease.dma_addr(),
@@ -35,6 +49,14 @@ impl PacketFragment {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.PacketFragment.sync_for_device",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+            | kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync_for_device(&self) -> Result<(), super::NetBufPoolError> {
         match self {
             Self::Exclusive(lease) => lease.sync_for_device(),
@@ -74,6 +96,7 @@ pub struct PacketChain {
     total_len: u32,
 }
 
+#[kernel_symbols::export]
 impl PacketChain {
     pub fn new() -> Self {
         Self {
@@ -83,6 +106,13 @@ impl PacketChain {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.PacketChain.from_lease",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn from_lease(lease: NetBufLease) -> Self {
         let mut chain = Self::new();
         chain
@@ -113,11 +143,23 @@ impl PacketChain {
         Ok(())
     }
 
-    pub const fn fragment_count(&self) -> usize {
+    #[kernel_symbols::export(
+        name = "net.buf.PacketChain.fragment_count",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
+    pub fn fragment_count(&self) -> usize {
         self.len as usize
     }
 
-    pub const fn total_len(&self) -> usize {
+    #[kernel_symbols::export(
+        name = "net.buf.PacketChain.total_len",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
+    pub fn total_len(&self) -> usize {
         self.total_len as usize
     }
 
@@ -125,6 +167,12 @@ impl PacketChain {
         self.len == 0
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.PacketChain.fragment",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn fragment(&self, index: usize) -> Option<&PacketFragment> {
         self.fragments.get(index)?.as_ref()
     }
@@ -419,6 +467,14 @@ impl RxRefillBatch {
         lease
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.RxRefillBatch.put",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn put(&mut self, index: usize, lease: NetBufLease) -> Result<(), NetBufLease> {
         if index >= self.leases.len() || self.leases[index].is_some() {
             return Err(lease);
@@ -481,6 +537,12 @@ impl TxBatch {
         Ok(())
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.TxBatch.packet",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn packet(&self, index: usize) -> Option<&TxPacket> {
         (index < self.len())
             .then(|| self.packets[index].as_ref())
@@ -506,6 +568,14 @@ impl TxBatch {
         packet
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.TxBatch.put",
+        contract = "kernel.net.packet-batch@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn put(&mut self, index: usize, packet: TxPacket) -> Result<(), TxPacket> {
         if index >= self.packets.len() || self.packets[index].is_some() {
             return Err(packet);

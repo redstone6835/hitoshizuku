@@ -224,6 +224,7 @@ pub fn kernel_start_init(context: &StartContext) {
         "dtb",
         Arc::clone(&dev_sb),
         DevInitContext::new(context.address.device_mmio_to_virt)
+            .with_boot_cpu_id(context.boot.boot_cpu_id)
             .with_realtime_clock(crate::vdso::set_realtime_ns)
             .with_realtime_source_hooks(
                 crate::vdso::install_realtime_source,
