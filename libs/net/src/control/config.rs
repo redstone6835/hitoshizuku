@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -234,6 +235,7 @@ pub struct ConfigSnapshot {
     pub routes: RouteSnapshot,
     pub policy: Vec<PolicyRule>,
     pub dns_servers: Vec<IpAddr>,
+    stack_local_addresses: Box<[crate::stack::NetStackLocalAddressV1]>,
 }
 
 impl ConfigSnapshot {
@@ -313,6 +315,28 @@ impl ConfigSnapshot {
                 }
             }
         }
+        let stack_local_addresses = addresses
+            .iter()
+            .map(|entry| {
+                let (family, address) = match entry.address {
+                    IpAddr::V4(address) => {
+                        let mut bytes = [0; 16];
+                        bytes[..4].copy_from_slice(&address.0);
+                        (crate::stack::NET_STACK_ADDRESS_FAMILY_IPV4, bytes)
+                    }
+                    IpAddr::V6(address) => (crate::stack::NET_STACK_ADDRESS_FAMILY_IPV6, address.0),
+                };
+                crate::stack::NetStackLocalAddressV1 {
+                    interface: entry.interface.0,
+                    family,
+                    prefix_len: entry.prefix_len,
+                    reserved0: [0; 2],
+                    address,
+                    reserved1: [0; 8],
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(Self {
             generation,
             interfaces,
@@ -320,6 +344,7 @@ impl ConfigSnapshot {
             routes: route_snapshot,
             policy,
             dns_servers,
+            stack_local_addresses,
         })
     }
 
@@ -331,6 +356,7 @@ impl ConfigSnapshot {
             routes: RouteSnapshot::build(&[]).expect("空路由表有效"),
             policy: Vec::new(),
             dns_servers: Vec::new(),
+            stack_local_addresses: Vec::new().into_boxed_slice(),
         }
     }
 
@@ -338,6 +364,10 @@ impl ConfigSnapshot {
         self.addresses
             .iter()
             .any(|entry| entry.interface == interface && entry.address == address)
+    }
+
+    pub fn stack_local_addresses(&self) -> &[crate::stack::NetStackLocalAddressV1] {
+        &self.stack_local_addresses
     }
 
     pub fn route(
@@ -629,6 +659,52 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.snapshot().generation, 1);
+    }
+
+    #[test]
+    fn stack_local_address_projection_is_flat_and_stable() {
+        let config = ConfigSnapshot::new(
+            7,
+            alloc::vec![interface(1)],
+            alloc::vec![
+                AddressEntry {
+                    interface: InterfaceId(1),
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
+                    prefix_len: 24,
+                    primary: true,
+                },
+                AddressEntry {
+                    interface: InterfaceId(1),
+                    address: IpAddr::V6(Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 1])),
+                    prefix_len: 64,
+                    primary: false,
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let projection = config.stack_local_addresses();
+        assert_eq!(projection.len(), 2);
+        assert_eq!(projection[0].interface, 1);
+        assert_eq!(
+            projection[0].family,
+            crate::stack::NET_STACK_ADDRESS_FAMILY_IPV4
+        );
+        assert_eq!(projection[0].prefix_len, 24);
+        assert_eq!(&projection[0].address[..4], &[10, 0, 2, 15]);
+        assert_eq!(projection[0].address[4..], [0; 12]);
+        assert_eq!(
+            projection[1].family,
+            crate::stack::NET_STACK_ADDRESS_FAMILY_IPV6
+        );
+        assert_eq!(projection[1].prefix_len, 64);
+        assert_eq!(projection[1].address[0..2], [0xfe, 0x80]);
+        assert!(
+            projection
+                .iter()
+                .all(crate::stack::NetStackLocalAddressV1::valid)
+        );
     }
 
     #[test]

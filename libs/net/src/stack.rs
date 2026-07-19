@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::boot::NetStackBootConfig;
-use crate::buf::PacketBatch;
+use crate::buf::{DropReason, PacketBatch};
 use crate::tuning::PACKET_BATCH_CAPACITY;
 
 static NEXT_STACK_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -27,6 +27,90 @@ pub const NET_STACK_ETHERNET_ACCEPTED: u8 = 1;
 pub const NET_STACK_ETHERNET_TRUNCATED: u8 = 2;
 pub const NET_STACK_ETHERNET_UNSUPPORTED: u8 = 3;
 pub const NET_STACK_ETHERNET_VLAN_UNSUPPORTED: u8 = 4;
+
+pub const NET_STACK_ADDRESS_FAMILY_IPV4: u8 = 4;
+pub const NET_STACK_ADDRESS_FAMILY_IPV6: u8 = 6;
+
+pub const NET_STACK_NETWORK_SKIPPED: u8 = 1;
+pub const NET_STACK_NETWORK_ARP: u8 = 2;
+pub const NET_STACK_NETWORK_IP: u8 = 3;
+pub const NET_STACK_NETWORK_DROP: u8 = 4;
+
+pub const NET_STACK_DROP_MALFORMED_ARP: u8 = DropReason::MalformedArp as u8;
+pub const NET_STACK_DROP_NOT_LOCAL: u8 = DropReason::NotLocal as u8;
+pub const NET_STACK_DROP_MALFORMED_IPV4: u8 = DropReason::MalformedIpv4 as u8;
+pub const NET_STACK_DROP_IPV4_CHECKSUM: u8 = DropReason::Ipv4Checksum as u8;
+pub const NET_STACK_DROP_MALFORMED_IPV6: u8 = DropReason::MalformedIpv6 as u8;
+pub const NET_STACK_DROP_IPV6_EXTENSION_LIMIT: u8 = DropReason::Ipv6ExtensionLimit as u8;
+pub const NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL: u8 = DropReason::UnsupportedIpProtocol as u8;
+
+pub const NET_STACK_NETWORK_FLAG_FRAGMENT: u8 = 1 << 0;
+pub const NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS: u8 = 1 << 1;
+pub const NET_STACK_NETWORK_FLAG_IPV6_PROBLEM: u8 = 1 << 2;
+pub const NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST: u8 = 1 << 3;
+const NET_STACK_NETWORK_FLAGS: u8 = NET_STACK_NETWORK_FLAG_FRAGMENT
+    | NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS
+    | NET_STACK_NETWORK_FLAG_IPV6_PROBLEM
+    | NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST;
+
+/// 配置快照提供给 stack ELM 的扁平本地地址投影。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct NetStackLocalAddressV1 {
+    pub interface: u32,
+    pub family: u8,
+    pub prefix_len: u8,
+    pub reserved0: [u8; 2],
+    pub address: [u8; 16],
+    pub reserved1: [u8; 8],
+}
+
+impl NetStackLocalAddressV1 {
+    pub fn valid(&self) -> bool {
+        self.interface != 0
+            && matches!(
+                (self.family, self.prefix_len),
+                (NET_STACK_ADDRESS_FAMILY_IPV4, 0..=32) | (NET_STACK_ADDRESS_FAMILY_IPV6, 0..=128)
+            )
+            && (self.family != NET_STACK_ADDRESS_FAMILY_IPV4 || self.address[4..] == [0; 12])
+            && self.reserved0 == [0; 2]
+            && self.reserved1 == [0; 8]
+    }
+}
+
+/// host 为一个只读输入 packet 固定的事实，ELM 不得修改。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct NetStackPacketInputV1 {
+    pub frame_len: u32,
+    pub present: u8,
+    pub checksums_validated: u8,
+    pub reserved: [u8; 2],
+}
+
+impl NetStackPacketInputV1 {
+    pub const fn empty() -> Self {
+        Self {
+            frame_len: 0,
+            present: 0,
+            checksums_validated: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    fn matches_packet(&self, input: &PacketBatch, index: usize) -> bool {
+        match (input.packet(index), input.metadata(index)) {
+            (Some(packet), Some(metadata)) => {
+                self.frame_len == packet.total_len() as u32
+                    && self.present == 1
+                    && self.checksums_validated == u8::from(metadata.checksums_validated)
+                    && self.reserved == [0; 2]
+            }
+            (None, None) => *self == Self::empty(),
+            _ => false,
+        }
+    }
+}
 
 /// `net.stack` 为一个 RX packet 生成的只读 Ethernet 解析 sidecar。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +145,162 @@ impl NetStackEthernetV1 {
     }
 }
 
+/// `net.stack` 为一个 RX packet 生成的网络层解析 sidecar。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct NetStackNetworkV1 {
+    pub outcome: u8,
+    pub family: u8,
+    pub next_header: u8,
+    pub flags: u8,
+    pub drop_reason: u8,
+    pub traffic_class: u8,
+    pub hop_limit: u8,
+    pub reserved0: u8,
+    pub header_len: u16,
+    pub payload_offset: u16,
+    pub fragment_offset: u16,
+    pub arp_operation: u16,
+    pub payload_len: u32,
+    pub fragment_identification: u32,
+    pub problem_pointer: u32,
+    pub source: [u8; 16],
+    pub destination: [u8; 16],
+    pub arp_sender_mac: [u8; 6],
+    pub arp_target_mac: [u8; 6],
+    pub reserved1: [u8; 8],
+}
+
+impl NetStackNetworkV1 {
+    pub const fn empty() -> Self {
+        Self {
+            outcome: 0,
+            family: 0,
+            next_header: 0,
+            flags: 0,
+            drop_reason: 0,
+            traffic_class: 0,
+            hop_limit: 0,
+            reserved0: 0,
+            header_len: 0,
+            payload_offset: 0,
+            fragment_offset: 0,
+            arp_operation: 0,
+            payload_len: 0,
+            fragment_identification: 0,
+            problem_pointer: 0,
+            source: [0; 16],
+            destination: [0; 16],
+            arp_sender_mac: [0; 6],
+            arp_target_mac: [0; 6],
+            reserved1: [0; 8],
+        }
+    }
+
+    pub const fn skipped() -> Self {
+        Self {
+            outcome: NET_STACK_NETWORK_SKIPPED,
+            ..Self::empty()
+        }
+    }
+
+    pub fn valid(&self, frame_len: u32, ethernet: &NetStackEthernetV1) -> bool {
+        if self.flags & !NET_STACK_NETWORK_FLAGS != 0
+            || self.reserved0 != 0
+            || self.reserved1 != [0; 8]
+        {
+            return false;
+        }
+        if ethernet.status != NET_STACK_ETHERNET_ACCEPTED {
+            return *self == Self::skipped();
+        }
+        match self.outcome {
+            NET_STACK_NETWORK_SKIPPED => false,
+            NET_STACK_NETWORK_DROP => {
+                valid_network_drop_reason(self.drop_reason)
+                    && *self
+                        == Self {
+                            outcome: NET_STACK_NETWORK_DROP,
+                            drop_reason: self.drop_reason,
+                            ..Self::empty()
+                        }
+            }
+            NET_STACK_NETWORK_ARP => {
+                ethernet.ethertype == 0x0806
+                    && self.family == NET_STACK_ADDRESS_FAMILY_IPV4
+                    && matches!(self.arp_operation, 1 | 2)
+                    && self.drop_reason == 0
+                    && self.next_header == 0
+                    && self.flags == 0
+                    && self.source[4..] == [0; 12]
+                    && self.destination[4..] == [0; 12]
+                    && self.traffic_class == 0
+                    && self.hop_limit == 0
+                    && self.header_len == 0
+                    && self.payload_offset == 0
+                    && self.fragment_offset == 0
+                    && self.payload_len == 0
+                    && self.fragment_identification == 0
+                    && self.problem_pointer == 0
+            }
+            NET_STACK_NETWORK_IP => {
+                let family_valid = match self.family {
+                    NET_STACK_ADDRESS_FAMILY_IPV4 => {
+                        ethernet.ethertype == 0x0800
+                            && (20..=60).contains(&self.header_len)
+                            && self.source[4..] == [0; 12]
+                            && self.destination[4..] == [0; 12]
+                    }
+                    NET_STACK_ADDRESS_FAMILY_IPV6 => {
+                        ethernet.ethertype == 0x86dd && self.header_len >= 40
+                    }
+                    _ => false,
+                };
+                let fragment_valid = if self.flags & NET_STACK_NETWORK_FLAG_FRAGMENT != 0 {
+                    self.fragment_identification != 0
+                        || self.fragment_offset != 0
+                        || self.flags & NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS != 0
+                } else {
+                    self.fragment_identification == 0
+                        && self.fragment_offset == 0
+                        && self.flags & NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS == 0
+                };
+                let problem_valid = if self.flags & NET_STACK_NETWORK_FLAG_IPV6_PROBLEM != 0 {
+                    self.family == NET_STACK_ADDRESS_FAMILY_IPV6
+                        && self.flags & NET_STACK_NETWORK_FLAG_FRAGMENT == 0
+                        && self.problem_pointer != 0
+                } else {
+                    self.problem_pointer == 0
+                        && self.flags & NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST == 0
+                };
+                family_valid
+                    && fragment_valid
+                    && problem_valid
+                    && self.drop_reason == 0
+                    && self.arp_operation == 0
+                    && self.arp_sender_mac == [0; 6]
+                    && self.arp_target_mac == [0; 6]
+                    && u32::from(self.payload_offset) == 14 + u32::from(self.header_len)
+                    && u32::from(self.payload_offset).saturating_add(self.payload_len) <= frame_len
+            }
+            _ => false,
+        }
+    }
+}
+
+fn valid_network_drop_reason(reason: u8) -> bool {
+    matches!(
+        reason,
+        NET_STACK_DROP_MALFORMED_ARP
+            | NET_STACK_DROP_NOT_LOCAL
+            | NET_STACK_DROP_MALFORMED_IPV4
+            | NET_STACK_DROP_IPV4_CHECKSUM
+            | NET_STACK_DROP_MALFORMED_IPV6
+            | NET_STACK_DROP_IPV6_EXTENSION_LIMIT
+            | NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL
+    )
+}
+
 /// 常驻 worker 与 `net.stack` 间一次批调用的数据帧。
 ///
 /// `input` 在同步调用期间始终归 host 所有。ELM 只能读取它，并逐项提交固定容量
@@ -70,52 +310,114 @@ pub struct NetStackWorkerTurnV1 {
     pub abi_version: u16,
     pub struct_size: u16,
     pub generation: u64,
+    pub config_generation: u64,
     pub input: *const PacketBatch,
+    pub local_addresses: *const NetStackLocalAddressV1,
+    pub interface: u32,
+    pub local_address_count: u32,
     pub input_count: u8,
     pub committed: u8,
     pub reserved0: [u8; 6],
+    pub packet_inputs: [NetStackPacketInputV1; PACKET_BATCH_CAPACITY],
     pub ethernet: [NetStackEthernetV1; PACKET_BATCH_CAPACITY],
+    pub network: [NetStackNetworkV1; PACKET_BATCH_CAPACITY],
     pub reserved1: [u64; 2],
 }
 
 impl NetStackWorkerTurnV1 {
-    pub fn new(generation: u64, input: &PacketBatch) -> Self {
-        Self {
+    pub fn new(
+        generation: u64,
+        config_generation: u64,
+        interface: u32,
+        local_addresses: &[NetStackLocalAddressV1],
+        input: &PacketBatch,
+    ) -> Self {
+        let mut turn = Self {
             abi_version: NET_STACK_WORKER_TURN_ABI_VERSION,
             struct_size: core::mem::size_of::<Self>() as u16,
             generation,
+            config_generation,
             input,
+            local_addresses: local_addresses.as_ptr(),
+            interface,
+            local_address_count: local_addresses.len() as u32,
             input_count: input.len() as u8,
             committed: 0,
             reserved0: [0; 6],
+            packet_inputs: [NetStackPacketInputV1::empty(); PACKET_BATCH_CAPACITY],
             ethernet: [NetStackEthernetV1::empty(); PACKET_BATCH_CAPACITY],
+            network: [NetStackNetworkV1::empty(); PACKET_BATCH_CAPACITY],
             reserved1: [0; 2],
+        };
+        for index in 0..input.len() {
+            if let (Some(packet), Some(metadata)) = (input.packet(index), input.metadata(index)) {
+                turn.packet_inputs[index] = NetStackPacketInputV1 {
+                    frame_len: packet.total_len() as u32,
+                    present: 1,
+                    checksums_validated: u8::from(metadata.checksums_validated),
+                    reserved: [0; 2],
+                };
+            }
         }
+        turn
     }
 
-    pub fn valid_header(&self, generation: u64, input: *const PacketBatch) -> bool {
+    pub fn valid_header(
+        &self,
+        generation: u64,
+        config_generation: u64,
+        interface: u32,
+        input: *const PacketBatch,
+        local_addresses: *const NetStackLocalAddressV1,
+        local_address_count: u32,
+    ) -> bool {
         self.abi_version == NET_STACK_WORKER_TURN_ABI_VERSION
             && self.struct_size as usize == core::mem::size_of::<Self>()
             && self.generation == generation
+            && self.config_generation == config_generation
             && self.input == input
             && !self.input.is_null()
+            && self.local_addresses == local_addresses
+            && self.interface == interface
+            && interface != 0
+            && self.local_address_count == local_address_count
             && usize::from(self.input_count) <= PACKET_BATCH_CAPACITY
             && self.reserved0 == [0; 6]
             && self.reserved1 == [0; 2]
     }
 
-    pub fn fully_committed(&self) -> bool {
+    pub fn fully_committed(&self, input: &PacketBatch) -> bool {
         self.committed == self.input_count
+            && self.packet_inputs[..usize::from(self.input_count)]
+                .iter()
+                .enumerate()
+                .all(|(index, facts)| facts.matches_packet(input, index))
+            && self.packet_inputs[usize::from(self.input_count)..]
+                .iter()
+                .all(|facts| *facts == NetStackPacketInputV1::empty())
             && self.ethernet[..usize::from(self.input_count)]
                 .iter()
                 .all(NetStackEthernetV1::valid)
             && self.ethernet[usize::from(self.input_count)..]
                 .iter()
                 .all(|sidecar| *sidecar == NetStackEthernetV1::empty())
+            && self.network[..usize::from(self.input_count)]
+                .iter()
+                .enumerate()
+                .all(|(index, sidecar)| {
+                    sidecar.valid(self.packet_inputs[index].frame_len, &self.ethernet[index])
+                })
+            && self.network[usize::from(self.input_count)..]
+                .iter()
+                .all(|sidecar| *sidecar == NetStackNetworkV1::empty())
     }
 
     pub fn ethernet(&self) -> &[NetStackEthernetV1] {
         &self.ethernet[..usize::from(self.input_count)]
+    }
+
+    pub fn network(&self) -> &[NetStackNetworkV1] {
+        &self.network[..usize::from(self.input_count)]
     }
 }
 
@@ -593,20 +895,37 @@ mod tests {
                 PacketMetadata::default(),
             )
             .unwrap_or_else(|_| unreachable!());
+        let addresses = [NetStackLocalAddressV1 {
+            interface: 1,
+            family: NET_STACK_ADDRESS_FAMILY_IPV4,
+            prefix_len: 24,
+            reserved0: [0; 2],
+            address: [10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            reserved1: [0; 8],
+        }];
         let input_pointer = &input as *const PacketBatch;
-        let mut turn = NetStackWorkerTurnV1::new(7, &input);
-        assert!(turn.valid_header(7, input_pointer));
-        assert!(!turn.valid_header(8, input_pointer));
-        assert!(!turn.fully_committed());
+        let mut turn = NetStackWorkerTurnV1::new(7, 9, 1, &addresses, &input);
+        assert!(turn.valid_header(7, 9, 1, input_pointer, addresses.as_ptr(), 1));
+        assert!(!turn.valid_header(8, 9, 1, input_pointer, addresses.as_ptr(), 1));
+        assert!(!turn.fully_committed(&input));
 
-        turn.ethernet[0].status = NET_STACK_ETHERNET_ACCEPTED;
+        turn.ethernet[0].status = NET_STACK_ETHERNET_TRUNCATED;
+        turn.network[0] = NetStackNetworkV1::skipped();
         turn.committed = 1;
-        assert!(!turn.fully_committed());
+        assert!(!turn.fully_committed(&input));
         turn.ethernet[1].status = NET_STACK_ETHERNET_TRUNCATED;
+        turn.network[1] = NetStackNetworkV1::skipped();
         turn.committed = 2;
-        assert!(turn.fully_committed());
+        assert!(turn.fully_committed(&input));
+        turn.packet_inputs[0].frame_len += 1;
+        assert!(!turn.fully_committed(&input));
+        turn.packet_inputs[0].frame_len -= 1;
+        turn.packet_inputs[1].checksums_validated = 1;
+        assert!(!turn.fully_committed(&input));
+        turn.packet_inputs[1].checksums_validated = 0;
+        assert!(turn.fully_committed(&input));
         turn.ethernet[2].reserved[0] = 1;
-        assert!(!turn.fully_committed());
+        assert!(!turn.fully_committed(&input));
         assert_eq!(input.len(), 2, "sidecar 提交不得移动 packet ownership");
     }
 
