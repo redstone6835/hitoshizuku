@@ -20,6 +20,7 @@ mod elm;
 mod initramfs;
 mod integrated_components;
 mod net_runtime;
+mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 mod net_tests;
 mod panic;
@@ -88,6 +89,7 @@ fn main() -> ! {
     if build_bound != 0 {
         log::info!("[kernel] activated {} BuildBound ELM(s)", build_bound);
     }
+    net_stack::start_host();
     // 网络 host 允许没有设备启动；BuildBound driver 已激活时会在此首次 attach，后续
     // 动态装载则通过 ELM 管理路径触发 reconcile。
     net_runtime::start_workers();

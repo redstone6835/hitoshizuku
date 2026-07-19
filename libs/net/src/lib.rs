@@ -19,6 +19,7 @@ pub mod pipeline;
 pub mod queue;
 pub mod ring;
 pub mod socket;
+pub mod stack;
 pub mod transport;
 pub mod tuning;
 

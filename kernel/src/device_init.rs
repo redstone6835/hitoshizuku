@@ -484,8 +484,10 @@ pub fn activate_device_subsystem(
         .expect("active CPU count 超出网络栈范围");
     net::device::install_net_runtime(config, crate::net_runtime::registrar())
         .expect("网络运行时被重复安装");
+    net::stack::install_stack_runtime(crate::net_stack::registrar())
+        .expect("网络 stack broker 被重复安装");
     printk!(
-        "[kernel-start][{}] installed network boot config and registrar",
+        "[kernel-start][{}] installed network boot config and registrars",
         tag
     );
 

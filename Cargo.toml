@@ -35,6 +35,7 @@ exclude = [
     "drivers/goldfish-rtc",
     "drivers/loongson-irq",
     "drivers/loopback",
+    "drivers/net-stack",
     "drivers/ls7a-rtc",
     "drivers/plic",
     "drivers/random",
