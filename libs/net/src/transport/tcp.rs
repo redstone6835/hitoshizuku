@@ -2,7 +2,9 @@
 
 use core::ops::{Add, AddAssign, BitOr, BitOrAssign};
 
+#[cfg(test)]
 use crate::buf::{DropReason, PacketChain};
+#[cfg(test)]
 use crate::pipeline::{IpPacket, transport_checksum};
 
 pub const TCP_PROTOCOL_NUMBER: u8 = 6;
@@ -159,10 +161,12 @@ impl TcpPacket {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_tcp_packet(chain: &PacketChain, ip: IpPacket) -> Result<TcpPacket, DropReason> {
     parse_tcp_packet_inner(chain, ip, true)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_tcp_packet_trusted(
     chain: &PacketChain,
     ip: IpPacket,
@@ -170,6 +174,7 @@ pub(crate) fn parse_tcp_packet_trusted(
     parse_tcp_packet_inner(chain, ip, false)
 }
 
+#[cfg(test)]
 fn parse_tcp_packet_inner(
     chain: &PacketChain,
     ip: IpPacket,
@@ -230,6 +235,7 @@ fn parse_tcp_packet_inner(
     })
 }
 
+#[cfg(test)]
 fn parse_options(
     chain: &PacketChain,
     offset: usize,

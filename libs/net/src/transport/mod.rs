@@ -19,6 +19,7 @@ pub use tcp::{
     TcpOptions, TcpPacket, TcpSackBlock, TcpSegment, TcpSequence, TcpState, TcpStateMachine,
     TcpTimestamp, TcpTransmit,
 };
+#[cfg(test)]
 pub(crate) use tcp::{parse_tcp_packet, parse_tcp_packet_trusted};
 pub use tcp_engine::{
     PreparedTcpTx, TcpBindError, TcpEndpointTable, TcpEngineStats, TcpIngressError, TcpPath,

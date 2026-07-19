@@ -829,11 +829,13 @@ impl FlowShard {
         &mut self,
         ethernet: &[crate::stack::NetStackEthernetV1],
         network: &[crate::stack::NetStackNetworkV1],
+        transport: &[crate::stack::NetStackTransportV1],
     ) {
         self.frontend.process_with_stack_sidecars(
             &mut self.reassembled_input,
             ethernet,
             network,
+            transport,
             &mut self.frontend_batch,
         );
         let count = self.frontend_batch.len();

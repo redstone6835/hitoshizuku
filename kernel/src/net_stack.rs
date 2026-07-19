@@ -262,11 +262,20 @@ pub(crate) fn worker_turn(
         return Err(WorkerTurnError::StackUnavailable);
     }
     let local_address_pointer = local_addresses.as_ptr();
+    let Some(boot) = net::stack::boot_config() else {
+        return Err(WorkerTurnError::StackUnavailable);
+    };
+    let mut rss_generation_bytes = [0; 4];
+    rss_generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
+    let rss_generation = u32::from_le_bytes(rss_generation_bytes).max(1);
+    let rss_key = *boot.rss_key();
     let mut turn = NetStackWorkerTurnV1::new(
         generation,
         config.generation,
         interface.0,
         local_addresses,
+        rss_key,
+        rss_generation,
         input,
     );
     let turn_pointer = &mut turn as *mut NetStackWorkerTurnV1;
@@ -303,6 +312,8 @@ pub(crate) fn worker_turn(
             input_pointer,
             local_address_pointer,
             local_address_count,
+            &rss_key,
+            rss_generation,
         )
         && turn.input_count == input_count
         && input.len() == usize::from(input_count)

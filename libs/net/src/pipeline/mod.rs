@@ -7,21 +7,29 @@ use crate::InterfaceId;
 use crate::buf::{DropReason, NetBufPoolError, PacketBatch, PacketChain, PacketMetadata};
 #[cfg(test)]
 use crate::control::ConfigSnapshot;
-use crate::flow::{FlowKey, rss_hash};
+use crate::flow::FlowKey;
+#[cfg(test)]
+use crate::flow::rss_hash;
 use crate::stack::{
     NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_DROP_IPV4_CHECKSUM,
     NET_STACK_DROP_IPV6_EXTENSION_LIMIT, NET_STACK_DROP_MALFORMED_ARP,
-    NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_NOT_LOCAL,
-    NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL, NET_STACK_ETHERNET_ACCEPTED,
-    NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
+    NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_MALFORMED_TCP,
+    NET_STACK_DROP_MALFORMED_UDP, NET_STACK_DROP_NOT_LOCAL, NET_STACK_DROP_TCP_CHECKSUM,
+    NET_STACK_DROP_UDP_CHECKSUM, NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL,
+    NET_STACK_ETHERNET_ACCEPTED, NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
-    NET_STACK_NETWORK_IP, NET_STACK_NETWORK_SKIPPED, NetStackEthernetV1, NetStackNetworkV1,
+    NET_STACK_NETWORK_IP, NET_STACK_NETWORK_SKIPPED, NET_STACK_TCP_OPTION_MSS,
+    NET_STACK_TCP_OPTION_SACK_PERMITTED, NET_STACK_TCP_OPTION_TIMESTAMP,
+    NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP, NET_STACK_TRANSPORT_ICMP,
+    NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED, NET_STACK_TRANSPORT_TCP,
+    NET_STACK_TRANSPORT_UDP, NetStackEthernetV1, NetStackNetworkV1, NetStackTcpOptionsV1,
+    NetStackTransportV1,
 };
-use crate::transport::{
-    TCP_PROTOCOL_NUMBER, TcpPacket, parse_tcp_packet, parse_tcp_packet_trusted,
-};
+#[cfg(test)]
+use crate::transport::{TCP_PROTOCOL_NUMBER, parse_tcp_packet, parse_tcp_packet_trusted};
+use crate::transport::{TcpFlags, TcpOptions, TcpPacket, TcpSackBlock, TcpSequence, TcpTimestamp};
 use crate::tuning::PACKET_BATCH_CAPACITY;
 use crate::{Endpoint, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
 
@@ -35,7 +43,9 @@ const ETHERTYPE_IPV6: u16 = 0x86dd;
 const ETHERTYPE_VLAN: u16 = 0x8100;
 #[cfg(test)]
 const ETHERTYPE_PROVIDER_VLAN: u16 = 0x88a8;
+#[cfg(test)]
 const IP_PROTOCOL_ICMP: u8 = 1;
+#[cfg(test)]
 const IP_PROTOCOL_UDP: u8 = 17;
 const IP_PROTOCOL_ICMPV6: u8 = 58;
 
@@ -198,14 +208,20 @@ impl Default for FrontendBatch {
 }
 
 pub struct VectorFrontend {
+    #[cfg(test)]
     rss_key: [u8; 40],
+    #[cfg(test)]
     rss_generation: u32,
 }
 
 impl VectorFrontend {
     pub const fn new(rss_key: [u8; 40], rss_generation: u32) -> Self {
+        #[cfg(not(test))]
+        let _ = (rss_key, rss_generation);
         Self {
+            #[cfg(test)]
             rss_key,
+            #[cfg(test)]
             rss_generation,
         }
     }
@@ -250,7 +266,7 @@ impl VectorFrontend {
         self.classify_hash(output);
     }
 
-    /// 使用 `net.stack` 已提交的 Ethernet/L3 sidecar 继续执行传输层解析。
+    /// 使用 `net.stack` 已提交的 Ethernet、网络层和传输层 sidecar 构造 frontend batch。
     ///
     /// 调用方必须先完成整个 worker-turn 帧校验；本函数开始后才会移动 packet
     /// ownership，因而 ELM fault 不会留下半消费 batch。
@@ -259,21 +275,25 @@ impl VectorFrontend {
         input: &mut PacketBatch,
         ethernet: &[NetStackEthernetV1],
         network: &[NetStackNetworkV1],
+        transport: &[NetStackTransportV1],
         output: &mut FrontendBatch,
     ) {
         assert_eq!(input.len(), ethernet.len());
         assert_eq!(input.len(), network.len());
+        assert_eq!(input.len(), transport.len());
         output.clear();
         let input_len = input.len();
         for index in 0..input_len {
             let ethernet_sidecar = ethernet[index];
             let network_sidecar = network[index];
+            let transport_sidecar = transport[index];
             let Some((chain, metadata)) = input.take(index) else {
                 continue;
             };
             let frame_len = chain.total_len() as u32;
             assert!(ethernet_sidecar.valid());
             assert!(network_sidecar.valid(frame_len, &ethernet_sidecar));
+            assert!(transport_sidecar.valid(frame_len, &network_sidecar));
             let disposition = match ethernet_sidecar.status {
                 NET_STACK_ETHERNET_ACCEPTED => {
                     FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
@@ -311,9 +331,8 @@ impl VectorFrontend {
                 .packet_mut(output_index)
                 .expect("刚提交的 frontend packet 必须存在");
             apply_network_sidecar(packet, network_sidecar);
+            apply_transport_sidecar(packet, transport_sidecar);
         }
-        self.parse_transport(output);
-        self.classify_hash(output);
     }
 
     #[cfg(test)]
@@ -406,6 +425,7 @@ impl VectorFrontend {
         }
     }
 
+    #[cfg(test)]
     fn parse_transport(&self, batch: &mut FrontendBatch) {
         for index in 0..batch.len() {
             let Some(packet) = batch.packet_mut(index) else {
@@ -486,6 +506,7 @@ impl VectorFrontend {
         }
     }
 
+    #[cfg(test)]
     fn classify_hash(&self, batch: &mut FrontendBatch) {
         for index in 0..batch.len() {
             let Some(packet) = batch.packet_mut(index) else {
@@ -504,6 +525,110 @@ impl VectorFrontend {
             };
             packet.parsed.rss_hash = Some(hash);
         }
+    }
+}
+
+fn apply_transport_sidecar(packet: &mut FrontendPacket, sidecar: NetStackTransportV1) {
+    match sidecar.outcome {
+        NET_STACK_TRANSPORT_SKIPPED => {}
+        NET_STACK_TRANSPORT_DROP => set_drop(packet, transport_drop_reason(sidecar.drop_reason)),
+        NET_STACK_TRANSPORT_TCP => {
+            let ip = packet
+                .parsed
+                .ip
+                .expect("TCP sidecar 必须对应已提交的 IP sidecar");
+            let tcp = TcpPacket {
+                source_port: sidecar.source_port,
+                destination_port: sidecar.destination_port,
+                sequence: TcpSequence(sidecar.tcp_sequence),
+                acknowledgement: TcpSequence(sidecar.tcp_acknowledgement),
+                flags: TcpFlags::from_bits(sidecar.tcp_flags),
+                window: sidecar.tcp_window,
+                urgent_pointer: sidecar.tcp_urgent_pointer,
+                header_len: sidecar.header_len,
+                payload_offset: sidecar.payload_offset,
+                payload_len: sidecar.payload_len,
+                options: tcp_options(sidecar.tcp_options),
+            };
+            packet.parsed.tcp = Some(tcp);
+            packet.parsed.flow = FlowKey::new(
+                Endpoint {
+                    addr: ip.source,
+                    port: tcp.source_port,
+                },
+                Endpoint {
+                    addr: ip.destination,
+                    port: tcp.destination_port,
+                },
+                TransportProtocol::Tcp,
+            );
+            packet.parsed.rss_hash = Some(sidecar.rss_hash);
+            packet.parsed.disposition = FrontendDisposition::Tcp;
+            packet.metadata.checksums_validated = true;
+        }
+        NET_STACK_TRANSPORT_UDP => {
+            let ip = packet
+                .parsed
+                .ip
+                .expect("UDP sidecar 必须对应已提交的 IP sidecar");
+            let udp = UdpPacket {
+                source_port: sidecar.source_port,
+                destination_port: sidecar.destination_port,
+                payload_offset: sidecar.payload_offset,
+                payload_len: sidecar.payload_len as u16,
+            };
+            packet.parsed.udp = Some(udp);
+            packet.parsed.flow = FlowKey::new(
+                Endpoint {
+                    addr: ip.source,
+                    port: udp.source_port,
+                },
+                Endpoint {
+                    addr: ip.destination,
+                    port: udp.destination_port,
+                },
+                TransportProtocol::Udp,
+            );
+            packet.parsed.rss_hash = Some(sidecar.rss_hash);
+            packet.parsed.disposition = FrontendDisposition::Udp;
+            packet.metadata.checksums_validated = true;
+        }
+        NET_STACK_TRANSPORT_ICMP => {
+            packet.parsed.disposition = FrontendDisposition::Control(ControlPacket::Icmp {
+                ipv6: sidecar.protocol == IP_PROTOCOL_ICMPV6,
+                packet_offset: sidecar.payload_offset,
+                packet_len: sidecar.payload_len,
+            });
+            packet.metadata.checksums_validated = true;
+        }
+        NET_STACK_TRANSPORT_RAW => packet.parsed.disposition = FrontendDisposition::Raw,
+        _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
+    }
+}
+
+fn tcp_options(sidecar: NetStackTcpOptionsV1) -> TcpOptions {
+    let mut sack_blocks = [None; 4];
+    for (index, block) in sack_blocks
+        .iter_mut()
+        .enumerate()
+        .take(usize::from(sidecar.sack_count))
+    {
+        *block = Some(TcpSackBlock {
+            left: TcpSequence(sidecar.sack_left[index]),
+            right: TcpSequence(sidecar.sack_right[index]),
+        });
+    }
+    TcpOptions {
+        maximum_segment_size: (sidecar.flags & NET_STACK_TCP_OPTION_MSS != 0)
+            .then_some(sidecar.maximum_segment_size),
+        window_scale: (sidecar.flags & NET_STACK_TCP_OPTION_WINDOW_SCALE != 0)
+            .then_some(sidecar.window_scale),
+        sack_permitted: sidecar.flags & NET_STACK_TCP_OPTION_SACK_PERMITTED != 0,
+        sack_blocks,
+        timestamp: (sidecar.flags & NET_STACK_TCP_OPTION_TIMESTAMP != 0).then_some(TcpTimestamp {
+            value: sidecar.timestamp_value,
+            echo_reply: sidecar.timestamp_echo_reply,
+        }),
     }
 }
 
@@ -577,6 +702,18 @@ fn network_drop_reason(reason: u8) -> DropReason {
         NET_STACK_DROP_MALFORMED_IPV6 => DropReason::MalformedIpv6,
         NET_STACK_DROP_IPV6_EXTENSION_LIMIT => DropReason::Ipv6ExtensionLimit,
         NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL => DropReason::UnsupportedIpProtocol,
+        _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
+    }
+}
+
+fn transport_drop_reason(reason: u8) -> DropReason {
+    match reason {
+        NET_STACK_DROP_MALFORMED_IPV6 => DropReason::MalformedIpv6,
+        NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL => DropReason::UnsupportedIpProtocol,
+        NET_STACK_DROP_MALFORMED_UDP => DropReason::MalformedUdp,
+        NET_STACK_DROP_UDP_CHECKSUM => DropReason::UdpChecksum,
+        NET_STACK_DROP_MALFORMED_TCP => DropReason::MalformedTcp,
+        NET_STACK_DROP_TCP_CHECKSUM => DropReason::TcpChecksum,
         _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
     }
 }
@@ -812,6 +949,7 @@ fn validate_ipv6_options(
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_udp(
     chain: &PacketChain,
     ip: IpPacket,
@@ -843,6 +981,7 @@ fn parse_udp(
     })
 }
 
+#[cfg(test)]
 fn verify_udp_checksum(
     chain: &PacketChain,
     ip: IpPacket,
@@ -1222,10 +1361,48 @@ mod tests {
     }
 
     #[test]
-    fn worker_turn_l2_l3_sidecars_are_not_reparsed_by_host() {
+    fn batch_frontend_reuses_only_current_generation_hardware_rss_hash() {
+        let key = [1; 40];
+        let mut matching = PacketBatch::new();
+        matching
+            .push(
+                PacketChain::from_owned(udp_frame().to_vec()),
+                PacketMetadata {
+                    rss_hash: Some(0x1234_5678),
+                    rss_generation: 7,
+                    ..PacketMetadata::default()
+                },
+            )
+            .unwrap_or_else(|_| unreachable!());
+        let mut output = FrontendBatch::new();
+        VectorFrontend::new(key, 7).process(InterfaceId(1), &config(), &mut matching, &mut output);
+        assert_eq!(output.packet(0).unwrap().parsed.rss_hash, Some(0x1234_5678));
+
+        let mut stale = PacketBatch::new();
+        stale
+            .push(
+                PacketChain::from_owned(udp_frame().to_vec()),
+                PacketMetadata {
+                    rss_hash: Some(0x1234_5678),
+                    rss_generation: 6,
+                    ..PacketMetadata::default()
+                },
+            )
+            .unwrap_or_else(|_| unreachable!());
+        VectorFrontend::new(key, 7).process(InterfaceId(1), &config(), &mut stale, &mut output);
+        let packet = output.packet(0).unwrap();
+        assert_eq!(
+            packet.parsed.rss_hash,
+            Some(rss_hash(&key, &packet.parsed.flow.unwrap()))
+        );
+    }
+
+    #[test]
+    fn worker_turn_l2_l3_l4_sidecars_are_not_reparsed_by_host() {
         let mut frame = udp_frame();
         frame[12..14].copy_from_slice(&0xffffu16.to_be_bytes());
         frame[14] = 0;
+        frame[38..40].fill(0);
         let mut input = PacketBatch::new();
         input
             .push(
@@ -1269,16 +1446,122 @@ mod tests {
             arp_target_mac: [0; 6],
             reserved1: [0; 8],
         };
+        let transport = NetStackTransportV1 {
+            outcome: NET_STACK_TRANSPORT_UDP,
+            protocol: IP_PROTOCOL_UDP,
+            drop_reason: 0,
+            reserved0: 0,
+            source_port: 1000,
+            destination_port: 9000,
+            header_len: 8,
+            payload_offset: 42,
+            tcp_flags: 0,
+            tcp_window: 0,
+            tcp_urgent_pointer: 0,
+            reserved1: 0,
+            payload_len: 4,
+            rss_hash: 123,
+            tcp_sequence: 0,
+            tcp_acknowledgement: 0,
+            tcp_options: NetStackTcpOptionsV1::empty(),
+            reserved2: [0; 2],
+        };
         let mut output = FrontendBatch::new();
         VectorFrontend::new([1; 40], 1).process_with_stack_sidecars(
             &mut input,
             &[ethernet],
             &[network],
+            &[transport],
             &mut output,
         );
         assert_eq!(
             output.packet(0).unwrap().parsed.disposition,
             FrontendDisposition::Udp
+        );
+        assert_eq!(output.packet(0).unwrap().parsed.rss_hash, Some(123));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn worker_turn_tcp_options_are_rebuilt_without_host_reparse() {
+        let mut frame = tcp_frame().to_vec();
+        frame.extend_from_slice(&[0; 4]);
+        frame[12..14].copy_from_slice(&0xffffu16.to_be_bytes());
+        frame[14] = 0;
+        frame[46] = 0;
+        frame[50..52].fill(0);
+        let mut input = PacketBatch::new();
+        input
+            .push(PacketChain::from_owned(frame), PacketMetadata::default())
+            .unwrap_or_else(|_| unreachable!());
+        let ethernet = NetStackEthernetV1 {
+            destination: [2; 6],
+            source: [1; 6],
+            ethertype: ETHERTYPE_IPV4,
+            status: NET_STACK_ETHERNET_ACCEPTED,
+            reserved: [0; 5],
+        };
+        let mut source = [0; 16];
+        source[..4].copy_from_slice(&[10, 0, 2, 2]);
+        let mut destination = [0; 16];
+        destination[..4].copy_from_slice(&[10, 0, 2, 15]);
+        let network = NetStackNetworkV1 {
+            outcome: NET_STACK_NETWORK_IP,
+            family: NET_STACK_ADDRESS_FAMILY_IPV4,
+            next_header: TCP_PROTOCOL_NUMBER,
+            flags: 0,
+            drop_reason: 0,
+            traffic_class: 0,
+            hop_limit: 64,
+            reserved0: 0,
+            header_len: 20,
+            payload_offset: 34,
+            fragment_offset: 0,
+            arp_operation: 0,
+            payload_len: 24,
+            fragment_identification: 0,
+            problem_pointer: 0,
+            source,
+            destination,
+            arp_sender_mac: [0; 6],
+            arp_target_mac: [0; 6],
+            reserved1: [0; 8],
+        };
+        let transport = NetStackTransportV1 {
+            outcome: NET_STACK_TRANSPORT_TCP,
+            protocol: TCP_PROTOCOL_NUMBER,
+            source_port: 1000,
+            destination_port: 9000,
+            header_len: 24,
+            payload_offset: 58,
+            tcp_flags: TcpFlags::SYN.bits(),
+            tcp_window: 32768,
+            payload_len: 0,
+            rss_hash: 456,
+            tcp_sequence: 123,
+            tcp_options: NetStackTcpOptionsV1 {
+                flags: NET_STACK_TCP_OPTION_MSS,
+                maximum_segment_size: 1460,
+                ..NetStackTcpOptionsV1::empty()
+            },
+            ..NetStackTransportV1::empty()
+        };
+        assert!(transport.valid(58, &network));
+
+        let mut output = FrontendBatch::new();
+        VectorFrontend::new([1; 40], 1).process_with_stack_sidecars(
+            &mut input,
+            &[ethernet],
+            &[network],
+            &[transport],
+            &mut output,
+        );
+        let packet = output.packet(0).unwrap();
+        assert_eq!(packet.parsed.disposition, FrontendDisposition::Tcp);
+        assert_eq!(packet.parsed.rss_hash, Some(456));
+        assert_eq!(
+            packet.parsed.tcp.unwrap().options.maximum_segment_size,
+            Some(1460)
         );
         assert!(input.is_empty());
     }

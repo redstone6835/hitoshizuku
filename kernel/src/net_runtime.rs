@@ -4998,9 +4998,11 @@ impl ProtocolContext {
                     interface,
                     config,
                 ) {
-                    Ok(turn) => self
-                        .protocol
-                        .parse_reassembled(turn.ethernet(), turn.network()),
+                    Ok(turn) => self.protocol.parse_reassembled(
+                        turn.ethernet(),
+                        turn.network(),
+                        turn.transport(),
+                    ),
                     Err(_) => {
                         while let Some((chain, mut metadata)) =
                             self.protocol.take_unparsed_reassembled()
@@ -5810,6 +5812,7 @@ impl WorkerContext {
             &mut self.rx_batch,
             turn.ethernet(),
             turn.network(),
+            turn.transport(),
             &mut self.frontend_batch,
         );
         let len = self.frontend_batch.len();
