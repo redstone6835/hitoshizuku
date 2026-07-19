@@ -376,6 +376,19 @@ impl PacketBatch {
             .flatten()
     }
 
+    /// 将指定 packet 的只读区间复制到调用方缓冲区，不暴露 fragment backing 地址。
+    #[kernel_symbols::export(
+        name = "net.buf.PacketBatch.copy_packet_out",
+        contract = "kernel.net.stack-packet-read@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::NETWORK_STACK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn copy_packet_out(&self, index: usize, offset: usize, output: &mut [u8]) -> bool {
+        self.packet(index)
+            .is_some_and(|packet| packet.copy_out(offset, output).is_ok())
+    }
+
     pub fn metadata(&self, index: usize) -> Option<&PacketMetadata> {
         (index < self.len())
             .then(|| self.metadata[index].as_ref())

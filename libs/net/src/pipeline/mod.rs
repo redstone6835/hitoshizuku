@@ -5,6 +5,10 @@ use alloc::boxed::Box;
 use crate::buf::{DropReason, NetBufPoolError, PacketBatch, PacketChain, PacketMetadata};
 use crate::control::ConfigSnapshot;
 use crate::flow::{FlowKey, rss_hash};
+use crate::stack::{
+    NET_STACK_ETHERNET_ACCEPTED, NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
+    NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NetStackEthernetV1,
+};
 use crate::transport::{
     TCP_PROTOCOL_NUMBER, TcpPacket, parse_tcp_packet, parse_tcp_packet_trusted,
 };
@@ -14,7 +18,9 @@ use crate::{Endpoint, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV6: u16 = 0x86dd;
+#[cfg(test)]
 const ETHERTYPE_VLAN: u16 = 0x8100;
+#[cfg(test)]
 const ETHERTYPE_PROVIDER_VLAN: u16 = 0x88a8;
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_UDP: u8 = 17;
@@ -190,7 +196,8 @@ impl VectorFrontend {
         }
     }
 
-    /// 每个解析阶段遍历同一固定 batch，解析结果只通过 sidecar 向后传递。
+    /// 单元测试使用的 host 参考路径；生产数据面必须从 ELM Ethernet sidecar 进入。
+    #[cfg(test)]
     pub fn process(
         &self,
         interface: InterfaceId,
@@ -229,6 +236,65 @@ impl VectorFrontend {
         self.classify_hash(output);
     }
 
+    /// 使用 `net.stack` 已提交的 Ethernet sidecar 继续执行网络层和传输层解析。
+    ///
+    /// 调用方必须先完成整个 worker-turn 帧校验；本函数开始后才会移动 packet
+    /// ownership，因而 ELM fault 不会留下半消费 batch。
+    pub fn process_with_ethernet(
+        &self,
+        interface: InterfaceId,
+        config: &ConfigSnapshot,
+        input: &mut PacketBatch,
+        ethernet: &[NetStackEthernetV1],
+        output: &mut FrontendBatch,
+    ) {
+        assert_eq!(input.len(), ethernet.len());
+        output.clear();
+        let input_len = input.len();
+        for (index, sidecar) in ethernet.iter().copied().enumerate().take(input_len) {
+            let Some((chain, metadata)) = input.take(index) else {
+                continue;
+            };
+            assert!(sidecar.valid());
+            let disposition = match sidecar.status {
+                NET_STACK_ETHERNET_ACCEPTED => {
+                    FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
+                }
+                NET_STACK_ETHERNET_TRUNCATED => {
+                    FrontendDisposition::Drop(DropReason::TruncatedFrame)
+                }
+                NET_STACK_ETHERNET_UNSUPPORTED => {
+                    FrontendDisposition::Drop(DropReason::UnsupportedEthernet)
+                }
+                NET_STACK_ETHERNET_VLAN_UNSUPPORTED => {
+                    FrontendDisposition::Drop(DropReason::VlanUnsupported)
+                }
+                _ => unreachable!("worker-turn sidecar 必须在移动 packet 前完成校验"),
+            };
+            output.push(FrontendPacket {
+                chain,
+                metadata,
+                parsed: ParsedPacket {
+                    ethernet: EthernetHeader {
+                        destination: sidecar.destination,
+                        source: sidecar.source,
+                        ethertype: sidecar.ethertype,
+                    },
+                    ip: None,
+                    tcp: None,
+                    udp: None,
+                    flow: None,
+                    rss_hash: None,
+                    disposition,
+                },
+            });
+        }
+        self.parse_network(interface, config, output);
+        self.parse_transport(output);
+        self.classify_hash(output);
+    }
+
+    #[cfg(test)]
     fn parse_ethernet(&self, batch: &mut FrontendBatch) {
         for index in 0..batch.len() {
             let Some(packet) = batch.packet_mut(index) else {
@@ -1049,6 +1115,42 @@ mod tests {
         assert_eq!(packet.parsed.disposition, FrontendDisposition::Udp);
         assert_eq!(packet.parsed.udp.unwrap().payload_len, 4);
         assert!(packet.parsed.rss_hash.is_some());
+    }
+
+    #[test]
+    fn worker_turn_ethernet_sidecar_is_not_reparsed_by_host() {
+        let mut frame = udp_frame();
+        frame[12..14].copy_from_slice(&0xffffu16.to_be_bytes());
+        let mut input = PacketBatch::new();
+        input
+            .push(
+                PacketChain::from_owned(frame.to_vec()),
+                PacketMetadata {
+                    checksums_validated: true,
+                    ..PacketMetadata::default()
+                },
+            )
+            .unwrap_or_else(|_| unreachable!());
+        let sidecar = NetStackEthernetV1 {
+            destination: [2; 6],
+            source: [1; 6],
+            ethertype: ETHERTYPE_IPV4,
+            status: NET_STACK_ETHERNET_ACCEPTED,
+            reserved: [0; 5],
+        };
+        let mut output = FrontendBatch::new();
+        VectorFrontend::new([1; 40], 1).process_with_ethernet(
+            InterfaceId(1),
+            &config(),
+            &mut input,
+            &[sidecar],
+            &mut output,
+        );
+        assert_eq!(
+            output.packet(0).unwrap().parsed.disposition,
+            FrontendDisposition::Udp
+        );
+        assert!(input.is_empty());
     }
 
     #[test]

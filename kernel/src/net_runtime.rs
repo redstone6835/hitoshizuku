@@ -4992,6 +4992,33 @@ impl ProtocolContext {
                     }
                 },
             );
+            if !self.protocol.reassembled_input().is_empty() {
+                match crate::net_stack::worker_turn(self.protocol.reassembled_input()) {
+                    Ok(turn) => self.protocol.parse_reassembled(
+                        FlowTurnContext {
+                            interface,
+                            local_mac,
+                            config,
+                            now_ns: sched::now_ns_public(),
+                        },
+                        turn.ethernet(),
+                    ),
+                    Err(_) => {
+                        while let Some((chain, mut metadata)) =
+                            self.protocol.take_unparsed_reassembled()
+                        {
+                            metadata.drop_reason = DropReason::NoConsumer;
+                            stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                            stats.drop_reasons[DropReason::NoConsumer.index()]
+                                .fetch_add(1, Ordering::Relaxed);
+                            stats.rx_no_consumer.fetch_add(1, Ordering::Relaxed);
+                            if let Err(chain) = self.recycle.push(chain, metadata) {
+                                drop(chain);
+                            }
+                        }
+                    }
+                }
+            }
             while let Some((error_interface, error_target, error, now_ns)) =
                 self.protocol.take_forwarded_error()
             {
@@ -5764,10 +5791,28 @@ impl WorkerContext {
 
     fn enqueue_rx_batch(&mut self) {
         let config = self.config.snapshot();
-        self.frontend.process(
+        let turn = match crate::net_stack::worker_turn(&self.rx_batch) {
+            Ok(turn) => turn,
+            Err(_) => {
+                let len = self.rx_batch.len();
+                for index in 0..len {
+                    let Some((chain, metadata)) = self.rx_batch.take(index) else {
+                        continue;
+                    };
+                    self.stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.stats.drop_reasons[DropReason::NoConsumer.index()]
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats.rx_no_consumer.fetch_add(1, Ordering::Relaxed);
+                    self.recycle_chain(chain, metadata, DropReason::NoConsumer);
+                }
+                return;
+            }
+        };
+        self.frontend.process_with_ethernet(
             self.interface,
             &config,
             &mut self.rx_batch,
+            turn.ethernet(),
             &mut self.frontend_batch,
         );
         let len = self.frontend_batch.len();
