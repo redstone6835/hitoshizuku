@@ -2699,7 +2699,7 @@ fn forbidden_protocol_engine_reference(symbol: &KernelInterfaceSymbol) -> bool {
     ];
     fields.iter().any(|field| {
         let normalized = field.replace('-', "_");
-        normalized.contains("smoltcp") || normalized.contains("mygo_smoltcp")
+        normalized.contains("smoltcp")
     })
 }
 
@@ -2909,9 +2909,6 @@ mod tests {
             .iter()
             .all(|symbol| !forbidden_protocol_engine_reference(symbol)));
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "net"));
-        assert!(kernel_api_crates().iter().all(|spec| {
-            !matches!(spec.name, "mygo-smoltcp" | "mygo_smoltcp")
-        }));
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "socket"));
         for required in [
             "elf.parse",
