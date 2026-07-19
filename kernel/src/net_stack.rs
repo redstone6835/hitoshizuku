@@ -11,11 +11,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use net::stack::{
     NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_FLOW_CALL, NET_STACK_OP_PROBE,
     NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER, NET_STACK_OP_WORKER_TURN,
-    NetStackCallV1, NetStackControlCommand, NetStackEndpoint, NetStackFlowCallV1,
-    NetStackFlowCommand, NetStackHandle, NetStackLifecycle, NetStackRegisterError,
-    NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration, NetStackRemoveError,
-    NetStackSnapshot, NetStackState, NetStackTxError, NetStackTxFragmentHeaderV1,
-    NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1, NetStackWorkerTurnV1,
+    NET_STACK_SOCKET_CALL_RUST_ABI, NET_STACK_SOCKET_OP_PROBE, NetStackCallV1,
+    NetStackControlCommand, NetStackEndpoint, NetStackFlowCallV1, NetStackFlowCommand,
+    NetStackHandle, NetStackLifecycle, NetStackRegisterError, NetStackRegisterErrorKind,
+    NetStackRegistrar, NetStackRegistration, NetStackRemoveError, NetStackSnapshot,
+    NetStackSocketCallV1, NetStackSocketEndpoint, NetStackState, NetStackTxError,
+    NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1,
+    NetStackWorkerTurnV1,
 };
 use sched::sync::Spinlock;
 
@@ -26,6 +28,11 @@ struct KernelNetStackRegistrar;
 
 enum StackCall {
     Integrated(net::stack::IntegratedNetStackCall),
+    Pinned(Arc<PinnedStackCall>),
+}
+
+enum SocketCall {
+    Integrated(net::stack::IntegratedNetStackSocketCall),
     Pinned(Arc<PinnedStackCall>),
 }
 
@@ -40,10 +47,20 @@ struct PinnedStackCall {
     name: Box<str>,
     contract: Box<str>,
     version: u32,
+    rust_abi: &'static str,
     per_cpu: Spinlock<Vec<Option<Arc<PinnedCallPair>>>>,
 }
 
 impl Clone for StackCall {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Integrated(call) => Self::Integrated(*call),
+            Self::Pinned(call) => Self::Pinned(Arc::clone(call)),
+        }
+    }
+}
+
+impl Clone for SocketCall {
     fn clone(&self) -> Self {
         match self {
             Self::Integrated(call) => Self::Integrated(*call),
@@ -65,8 +82,20 @@ impl StackCall {
     }
 }
 
+impl SocketCall {
+    fn invoke(&self, frame: &mut NetStackSocketCallV1) -> Result<i32, i32> {
+        match self {
+            Self::Integrated(call) => Ok(call(frame)),
+            Self::Pinned(call) => call.invoke(frame, &[]),
+        }
+    }
+}
+
 impl PinnedStackCall {
-    fn new(endpoint: &net::stack::PinnedNetStackEndpoint) -> Result<Self, ()> {
+    fn new(
+        endpoint: &net::stack::PinnedNetStackEndpoint,
+        rust_abi: &'static str,
+    ) -> Result<Self, ()> {
         let owner = elm_model::ElmId(endpoint.owner_cell());
         let generation = elm_model::Generation(endpoint.owner_generation());
         let name: Box<str> = endpoint.export_name().into();
@@ -80,7 +109,7 @@ impl PinnedStackCall {
             return Err(());
         }
         per_cpu[current_cpu] = Some(Arc::new(Self::new_pair(
-            owner, generation, &name, &contract, version,
+            owner, generation, &name, &contract, version, rust_abi,
         )?));
         Ok(Self {
             owner,
@@ -88,6 +117,7 @@ impl PinnedStackCall {
             name,
             contract,
             version,
+            rust_abi,
             per_cpu: Spinlock::new(per_cpu),
         })
     }
@@ -98,25 +128,14 @@ impl PinnedStackCall {
         name: &str,
         contract: &str,
         version: u32,
+        rust_abi: &str,
     ) -> Result<PinnedCallPair, ()> {
-        let primary = crate::elm::PinnedNativeCall::new(
-            owner,
-            generation,
-            name,
-            contract,
-            version,
-            NET_STACK_CALL_RUST_ABI,
-        )
-        .map_err(|_| ())?;
-        let nested = crate::elm::PinnedNativeCall::new(
-            owner,
-            generation,
-            name,
-            contract,
-            version,
-            NET_STACK_CALL_RUST_ABI,
-        )
-        .map_err(|_| ())?;
+        let primary =
+            crate::elm::PinnedNativeCall::new(owner, generation, name, contract, version, rust_abi)
+                .map_err(|_| ())?;
+        let nested =
+            crate::elm::PinnedNativeCall::new(owner, generation, name, contract, version, rust_abi)
+                .map_err(|_| ())?;
         Ok(PinnedCallPair {
             primary: Spinlock::new(primary),
             nested: Spinlock::new(nested),
@@ -138,6 +157,7 @@ impl PinnedStackCall {
                 &self.name,
                 &self.contract,
                 self.version,
+                self.rust_abi,
             )
             .map_err(|_| elm_model::ELM_MGR_STATUS_BUSY)?,
         );
@@ -149,11 +169,7 @@ impl PinnedStackCall {
         Ok(pair)
     }
 
-    fn invoke(
-        &self,
-        frame: &mut NetStackCallV1,
-        host_ranges: &[(usize, usize)],
-    ) -> Result<i32, i32> {
+    fn invoke<T>(&self, frame: &mut T, host_ranges: &[(usize, usize)]) -> Result<i32, i32> {
         let pair = self.current_pair()?;
         let deadline = sched::now_ns_public().saturating_add(2_000_000);
         if let Some(call) = pair.primary.try_lock() {
@@ -1289,6 +1305,7 @@ struct StackRecord {
     handle: NetStackHandle,
     generation: u64,
     call: StackCall,
+    socket_call: SocketCall,
 }
 
 struct KernelNetStackBroker {
@@ -1327,8 +1344,21 @@ impl KernelNetStackBroker {
             }
             NetStackEndpoint::Integrated(_) => Err(()),
             NetStackEndpoint::Pinned(endpoint) => {
-                let call = PinnedStackCall::new(endpoint)?;
+                let call = PinnedStackCall::new(endpoint, NET_STACK_CALL_RUST_ABI)?;
                 Ok(StackCall::Pinned(Arc::new(call)))
+            }
+        }
+    }
+
+    fn build_socket_call(endpoint: &NetStackSocketEndpoint) -> Result<SocketCall, ()> {
+        match endpoint {
+            NetStackSocketEndpoint::Integrated(call) if *call as usize != 0 => {
+                Ok(SocketCall::Integrated(*call))
+            }
+            NetStackSocketEndpoint::Integrated(_) => Err(()),
+            NetStackSocketEndpoint::Pinned(endpoint) => {
+                let call = PinnedStackCall::new(endpoint, NET_STACK_SOCKET_CALL_RUST_ABI)?;
+                Ok(SocketCall::Pinned(Arc::new(call)))
             }
         }
     }
@@ -1358,6 +1388,16 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
                 });
             }
         };
+        let socket_call =
+            match KernelNetStackBroker::build_socket_call(registration.socket_endpoint()) {
+                Ok(call) => call,
+                Err(()) => {
+                    return Err(NetStackRegisterError {
+                        kind: NetStackRegisterErrorKind::ResourceExhausted,
+                        registration,
+                    });
+                }
+            };
         if let Err(kind) = broker.lifecycle.activate(handle, owner_cell, generation) {
             return Err(NetStackRegisterError { kind, registration });
         }
@@ -1365,6 +1405,7 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
             handle,
             generation,
             call,
+            socket_call,
         });
         log::info!(
             "[net-stack] registered generation: cell={} generation={} handle={}",
@@ -1463,19 +1504,32 @@ fn probe_active() {
     if !HOST_STARTED.load(Ordering::Acquire) {
         return;
     }
-    let (handle, generation, call) = {
+    let (handle, generation, call, socket_call) = {
         let broker = BROKER.lock();
         let Some(record) = broker.record.as_ref() else {
             return;
         };
-        (record.handle, record.generation, record.call.clone())
+        (
+            record.handle,
+            record.generation,
+            record.call.clone(),
+            record.socket_call.clone(),
+        )
     };
     let mut frame = NetStackCallV1::new(NET_STACK_OP_PROBE, generation);
     let result = call.invoke(&mut frame, &[]);
-    let success = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
+    let stack_ready = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
         && frame.valid(NET_STACK_OP_PROBE, generation)
         && frame.ready == 1
         && frame.quiesced == 0;
+    let mut socket_frame = NetStackSocketCallV1::new(NET_STACK_SOCKET_OP_PROBE, generation);
+    let socket_result = socket_call.invoke(&mut socket_frame);
+    let socket_ready = matches!(socket_result, Ok(NET_STACK_CALL_STATUS_OK))
+        && socket_frame.valid(NET_STACK_SOCKET_OP_PROBE, generation)
+        && socket_frame.ready == 1
+        && socket_frame.quiesced == 0
+        && socket_frame.committed == 1;
+    let success = stack_ready && socket_ready;
     let mut broker = BROKER.lock();
     if success {
         if broker.lifecycle.mark_probed(handle) {
@@ -1487,10 +1541,11 @@ fn probe_active() {
         }
     } else if broker.lifecycle.mark_faulted(handle) {
         log::error!(
-            "[net-stack] generation probe failed: generation={} handle={} result={:?}",
+            "[net-stack] generation probe failed: generation={} handle={} stack={:?} socket={:?}",
             generation,
             handle.0,
-            result
+            result,
+            socket_result
         );
     }
 }

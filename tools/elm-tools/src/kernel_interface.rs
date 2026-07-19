@@ -2928,6 +2928,7 @@ mod tests {
             "vfs.file.File.dentry",
             "general.vfs.namespace_path",
             "net.stack.NetStackCallV1.valid",
+            "net.stack.NetStackSocketCallV1.valid",
             "net.stack.PinnedNetStackEndpoint.current",
             "net.stack.NetStackRegistration.pinned",
             "net.stack.boot_config",
