@@ -1384,7 +1384,12 @@ pub fn set_realtime_itimer(
 
 fn wake_expired_sleepers(now_ns: u64) {
     let expired = {
-        let mut sleepers = TIMED_SLEEPERS.lock();
+        // 定时器中断可能打断正在注册或取消 deadline 的同一 CPU。中断侧不能
+        // 自旋等待这把锁，否则会等待只能由被打断上下文释放的锁；跳过本次
+        // tick 后，下一次 tick 会重新扫描并唤醒已经到期的任务。
+        let Some(mut sleepers) = TIMED_SLEEPERS.try_lock() else {
+            return;
+        };
         let mut expired = Vec::new();
         sleepers.retain(|entry| {
             let Some(task) = entry.task.upgrade() else {
