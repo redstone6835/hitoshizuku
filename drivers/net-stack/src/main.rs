@@ -22,9 +22,9 @@ use net::stack::{
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
-    NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE,
-    NET_STACK_OP_FLOW_CALL, NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER,
-    NET_STACK_OP_WORKER_TURN, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
+    NET_STACK_NETWORK_IP, NET_STACK_OP_FLOW_CALL, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE,
+    NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER, NET_STACK_OP_WORKER_TURN,
+    NET_STACK_SOCKET_OP_PROBE, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
     NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
     NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
     NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NET_STACK_TX_HEADER_ABI_VERSION,
@@ -1564,11 +1564,18 @@ impl ElmModule for NetStackElm {
             let endpoint =
                 PinnedNetStackEndpoint::current("net.stack.call", "mygo.net.stack-call@1", 1)
                     .ok_or(HookError::new(-22))?;
-            NetStackRegistration::pinned(endpoint)
+            let socket_endpoint = PinnedNetStackEndpoint::current(
+                "net.stack.socket",
+                "mygo.net.stack-socket-call@1",
+                1,
+            )
+            .ok_or(HookError::new(-22))?;
+            NetStackRegistration::pinned(endpoint, socket_endpoint)
+                .ok_or(HookError::new(-22))?
         };
         #[cfg(feature = "elm-integrated")]
-        let registration =
-            NetStackRegistration::integrated(net_stack_call).ok_or(HookError::new(-22))?;
+        let registration = NetStackRegistration::integrated(net_stack_call, net_stack_socket_call)
+            .ok_or(HookError::new(-22))?;
         let handle = net::stack::register_stack(registration)
             .map_err(|error| map_register_error(error.kind))?;
         self.boot = Some(boot);
@@ -1801,6 +1808,29 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
             QUIESCED.store(true, Ordering::Release);
             frame.ready = 0;
             frame.quiesced = 1;
+        }
+        _ => return NET_STACK_CALL_STATUS_INVALID,
+    }
+    NET_STACK_CALL_STATUS_OK
+}
+
+#[elm::export(
+    name = "net.stack.socket",
+    contract = "mygo.net.stack-socket-call@1",
+    version = 1,
+    mode = "direct-pinned",
+    visibility = "private"
+)]
+fn net_stack_socket_call(frame: &mut net::stack::NetStackSocketCallV1) -> i32 {
+    if !frame.valid(frame.opcode, frame.stack_generation) || frame.committed != 0 {
+        return NET_STACK_CALL_STATUS_INVALID;
+    }
+    match frame.opcode {
+        NET_STACK_SOCKET_OP_PROBE => {
+            let quiesced = QUIESCED.load(Ordering::Acquire);
+            frame.ready = u8::from(!quiesced);
+            frame.quiesced = u8::from(quiesced);
+            frame.committed = 1;
         }
         _ => return NET_STACK_CALL_STATUS_INVALID,
     }

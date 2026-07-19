@@ -33,6 +33,8 @@ static STACK_REGISTRAR: Mutex<Option<&'static dyn NetStackRegistrar>> = Mutex::n
 
 pub const NET_STACK_CALL_ABI_VERSION: u16 = 1;
 pub const NET_STACK_CALL_RUST_ABI: &str = "fn(&mutnet::stack::NetStackCallV1)->i32";
+pub const NET_STACK_SOCKET_CALL_ABI_VERSION: u16 = 1;
+pub const NET_STACK_SOCKET_CALL_RUST_ABI: &str = "fn(&mutnet::stack::NetStackSocketCallV1)->i32";
 pub const NET_STACK_CALL_STATUS_OK: i32 = 0;
 pub const NET_STACK_CALL_STATUS_INVALID: i32 = -22;
 
@@ -42,6 +44,8 @@ pub const NET_STACK_OP_QUIESCE: u32 = 3;
 pub const NET_STACK_OP_TX_HEADER: u32 = 4;
 pub const NET_STACK_OP_TX_FRAGMENT_HEADER: u32 = 5;
 pub const NET_STACK_OP_FLOW_CALL: u32 = 6;
+
+pub const NET_STACK_SOCKET_OP_PROBE: u32 = 1;
 
 pub const NET_STACK_WORKER_TURN_ABI_VERSION: u16 = 1;
 pub const NET_STACK_TX_HEADER_ABI_VERSION: u16 = 1;
@@ -3387,6 +3391,60 @@ impl NetStackCallV1 {
     }
 }
 
+/// 常驻 VFS socket host 与 `net.stack` 间一次同步调用的固定帧。
+///
+/// 当前版本只建立独立调用门和代际探测；后续 socket 操作通过保留字段扩展，
+/// 不允许在帧中保存指向 ELM 对象的长期引用。
+#[repr(C)]
+pub struct NetStackSocketCallV1 {
+    pub abi_version: u16,
+    pub struct_size: u16,
+    pub opcode: u32,
+    pub stack_generation: u64,
+    pub ready: u8,
+    pub quiesced: u8,
+    pub committed: u8,
+    pub reserved0: [u8; 5],
+    pub reserved1: [u64; 2],
+}
+
+#[kernel_symbols::export]
+impl NetStackSocketCallV1 {
+    pub fn new(opcode: u32, stack_generation: u64) -> Self {
+        Self {
+            abi_version: NET_STACK_SOCKET_CALL_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            opcode,
+            stack_generation,
+            ready: 0,
+            quiesced: 0,
+            committed: 0,
+            reserved0: [0; 5],
+            reserved1: [0; 2],
+        }
+    }
+
+    #[kernel_symbols::export(
+        name = "net.stack.NetStackSocketCallV1.valid",
+        contract = "kernel.net.stack-socket-call-frame@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
+    pub fn valid(&self, opcode: u32, stack_generation: u64) -> bool {
+        self.abi_version == NET_STACK_SOCKET_CALL_ABI_VERSION
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.opcode == opcode
+            && self.stack_generation == stack_generation
+            && stack_generation != 0
+            && opcode == NET_STACK_SOCKET_OP_PROBE
+            && self.ready <= 1
+            && self.quiesced <= 1
+            && self.committed <= 1
+            && self.reserved0 == [0; 5]
+            && self.reserved1 == [0; 2]
+    }
+}
+
 /// 动态 `net.stack` 的代际固定 export 描述。
 pub struct PinnedNetStackEndpoint {
     owner_cell: u64,
@@ -3444,9 +3502,15 @@ impl PinnedNetStackEndpoint {
 }
 
 pub type IntegratedNetStackCall = fn(&mut NetStackCallV1) -> i32;
+pub type IntegratedNetStackSocketCall = fn(&mut NetStackSocketCallV1) -> i32;
 
 pub enum NetStackEndpoint {
     Integrated(IntegratedNetStackCall),
+    Pinned(PinnedNetStackEndpoint),
+}
+
+pub enum NetStackSocketEndpoint {
+    Integrated(IntegratedNetStackSocketCall),
     Pinned(PinnedNetStackEndpoint),
 }
 
@@ -3454,17 +3518,23 @@ pub enum NetStackEndpoint {
 pub struct NetStackRegistration {
     handle: NetStackHandle,
     endpoint: NetStackEndpoint,
+    socket_endpoint: NetStackSocketEndpoint,
 }
 
 #[kernel_symbols::export]
 impl NetStackRegistration {
-    pub fn integrated(call: IntegratedNetStackCall) -> Option<Self> {
-        if elm_model::current_context().is_some() || call as usize == 0 {
+    pub fn integrated(
+        call: IntegratedNetStackCall,
+        socket_call: IntegratedNetStackSocketCall,
+    ) -> Option<Self> {
+        if elm_model::current_context().is_some() || call as usize == 0 || socket_call as usize == 0
+        {
             return None;
         }
         Some(Self {
             handle: next_stack_handle(),
             endpoint: NetStackEndpoint::Integrated(call),
+            socket_endpoint: NetStackSocketEndpoint::Integrated(socket_call),
         })
     }
 
@@ -3474,11 +3544,20 @@ impl NetStackRegistration {
         version = 1,
         capabilities = kernel_symbols::capability::NETWORK_STACK
     )]
-    pub fn pinned(endpoint: PinnedNetStackEndpoint) -> Self {
-        Self {
+    pub fn pinned(
+        endpoint: PinnedNetStackEndpoint,
+        socket_endpoint: PinnedNetStackEndpoint,
+    ) -> Option<Self> {
+        if endpoint.owner_cell() != socket_endpoint.owner_cell()
+            || endpoint.owner_generation() != socket_endpoint.owner_generation()
+        {
+            return None;
+        }
+        Some(Self {
             handle: next_stack_handle(),
             endpoint: NetStackEndpoint::Pinned(endpoint),
-        }
+            socket_endpoint: NetStackSocketEndpoint::Pinned(socket_endpoint),
+        })
     }
 
     pub const fn handle(&self) -> NetStackHandle {
@@ -3503,12 +3582,26 @@ impl NetStackRegistration {
         &self.endpoint
     }
 
+    pub fn socket_endpoint(&self) -> &NetStackSocketEndpoint {
+        &self.socket_endpoint
+    }
+
     fn valid_for_current_context(&self) -> bool {
-        match (&self.endpoint, elm_model::current_context()) {
-            (NetStackEndpoint::Integrated(_), None) => true,
-            (NetStackEndpoint::Pinned(endpoint), Some(context)) => {
+        match (
+            &self.endpoint,
+            &self.socket_endpoint,
+            elm_model::current_context(),
+        ) {
+            (NetStackEndpoint::Integrated(_), NetStackSocketEndpoint::Integrated(_), None) => true,
+            (
+                NetStackEndpoint::Pinned(endpoint),
+                NetStackSocketEndpoint::Pinned(socket_endpoint),
+                Some(context),
+            ) => {
                 endpoint.owner_cell() == context.cell_id.0
                     && endpoint.owner_generation() == context.generation.0
+                    && socket_endpoint.owner_cell() == context.cell_id.0
+                    && socket_endpoint.owner_generation() == context.generation.0
             }
             _ => false,
         }
@@ -4033,6 +4126,27 @@ mod tests {
         assert!(!frame.valid(NET_STACK_OP_PROBE, 8));
         frame.reserved1[0] = 1;
         assert!(!frame.valid(NET_STACK_OP_PROBE, 7));
+    }
+
+    #[test]
+    fn socket_call_frame_rejects_stale_generation_and_reserved_bits() {
+        let mut frame = NetStackSocketCallV1::new(NET_STACK_SOCKET_OP_PROBE, 7);
+        assert!(frame.valid(NET_STACK_SOCKET_OP_PROBE, 7));
+        assert!(!frame.valid(NET_STACK_SOCKET_OP_PROBE, 8));
+        frame.reserved1[0] = 1;
+        assert!(!frame.valid(NET_STACK_SOCKET_OP_PROBE, 7));
+    }
+
+    #[test]
+    fn pinned_registration_requires_matching_endpoint_generation() {
+        let endpoint = |generation| PinnedNetStackEndpoint {
+            owner_cell: 11,
+            owner_generation: generation,
+            export_name: "net.stack.call".into(),
+            export_contract: "mygo.net.stack-call@1".into(),
+            export_version: 1,
+        };
+        assert!(NetStackRegistration::pinned(endpoint(4), endpoint(5)).is_none());
     }
 
     #[test]
