@@ -14,6 +14,7 @@ use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, S
 use crate::{OwnerRef, SocketError, SocketFacade, TcpTxLease, UdpTxLease};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use super::TimerWheel;
 use super::reassembly::{ReassemblyResult, ReassemblyTable};
@@ -823,6 +824,39 @@ impl FlowShard {
 
     pub fn reassembled_input(&self) -> &PacketBatch {
         &self.reassembled_input
+    }
+
+    pub fn take_reassembled_input(&mut self) -> Option<PacketBatch> {
+        if self.reassembled_input.is_empty() {
+            None
+        } else {
+            Some(core::mem::take(&mut self.reassembled_input))
+        }
+    }
+
+    pub fn parse_reassembled_batch(
+        &mut self,
+        input: PacketBatch,
+        ethernet: &[crate::stack::NetStackEthernetV1],
+        network: &[crate::stack::NetStackNetworkV1],
+        transport: &[crate::stack::NetStackTransportV1],
+    ) -> Result<(), PacketBatch> {
+        if !self.reassembled_input.is_empty()
+            || input.len() != ethernet.len()
+            || input.len() != network.len()
+            || input.len() != transport.len()
+        {
+            return Err(input);
+        }
+        self.reassembled_input = input;
+        self.parse_reassembled(ethernet, network, transport);
+        Ok(())
+    }
+
+    pub fn push_frontend_batch(&mut self, packets: Vec<FrontendPacket>) {
+        for packet in packets {
+            self.push_frontend(packet);
+        }
     }
 
     pub fn parse_reassembled(

@@ -35,9 +35,9 @@ use net::transport::{
     TcpPath, build_raw_packet, build_tcp_packet, build_udp_packet_with_options,
 };
 use net::{
-    AddressFamily, Endpoint, FlowId, FlowShard, FlowTurnContext, InterfaceId, IpAddr, Ipv4Addr,
-    Ipv6Addr, ListenGroup, ListenGroupId, OwnerRef, ShardId, SocketCommand, SocketError,
-    SocketFacade, SocketKind, SocketRuntime, TransportProtocol,
+    AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, ListenGroup,
+    ListenGroupId, OwnerRef, ShardId, SocketCommand, SocketError, SocketFacade, SocketKind,
+    SocketRuntime, TransportProtocol,
 };
 use sched::sync::Spinlock;
 
@@ -2598,7 +2598,7 @@ struct ProtocolContext {
     cluster: Arc<ProtocolCluster>,
     control_plane: Arc<ControlPlane>,
     config: Arc<ConfigStore>,
-    protocol: FlowShard,
+    protocol: crate::net_stack::ElmFlowShard,
     recycle: PacketBatch,
     tx: TxBatch,
     pending: [Option<IngressWork>; 32],
@@ -2643,10 +2643,6 @@ pub fn start_workers() {
         .collect::<Vec<_>>();
     assert!(!active_cpus.is_empty(), "NetWorker 没有 active CPU");
     let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
-    let mut generation_bytes = [0u8; 4];
-    generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
-    let rss_generation = u32::from_le_bytes(generation_bytes).max(1);
-
     let devices = DEVICES.lock();
     let config = Arc::new(ConfigStore::new(build_device_config(&devices, 1)));
     *CONFIG_STORE.lock() = Some(Arc::clone(&config));
@@ -2673,14 +2669,7 @@ pub fn start_workers() {
     });
     let mut protocol_tasks = Vec::with_capacity(runtimes.len());
     for runtime in &runtimes {
-        let protocol = FlowShard::new(
-            runtime.id,
-            *boot.rss_key(),
-            rss_generation,
-            *boot.hash_seed(),
-            *boot.tcp_isn_key(),
-            sched::now_ns_public(),
-        );
+        let protocol = crate::net_stack::ElmFlowShard::new(runtime.id);
         let dad = if runtime.id == ShardId(0) {
             initial_dad_states(&config.snapshot(), sched::now_ns_public())
         } else {
@@ -4730,12 +4719,13 @@ impl ProtocolContext {
                     let egress = packet.egress;
                     let interface = packet.interface;
                     let local_mac = packet.local_mac;
+                    let mut packets = Vec::new();
                     self.observe_ingress_neighbor(interface, &packet.packet);
                     if self.handle_dhcp_packet(interface, &packet.packet) {
                         packet.packet.parsed.disposition =
                             FrontendDisposition::Drop(DropReason::NoConsumer);
                     }
-                    self.protocol.push_frontend(packet.packet);
+                    packets.push(packet.packet);
                     for candidate in index + 1..count {
                         let same_source = matches!(
                             self.pending[candidate].as_ref(),
@@ -4754,8 +4744,9 @@ impl ProtocolContext {
                             packet.packet.parsed.disposition =
                                 FrontendDisposition::Drop(DropReason::NoConsumer);
                         }
-                        self.protocol.push_frontend(packet.packet);
+                        packets.push(packet.packet);
                     }
+                    self.protocol.push_frontend_batch(packets);
                     self.process_packet_batch(egress, interface, local_mac, config);
                 }
                 IngressWork::LocalTcp {
@@ -4974,46 +4965,53 @@ impl ProtocolContext {
         };
         let stats = Arc::clone(&target.stats);
         loop {
-            self.protocol.process_frontend_batch(
-                FlowTurnContext {
-                    interface,
-                    local_mac,
-                    config,
-                    now_ns: sched::now_ns_public(),
-                },
+            let drop_counts = self.protocol.process_frontend_batch(
+                interface,
+                local_mac,
+                config,
+                sched::now_ns_public(),
                 &mut self.tx,
                 &mut self.recycle,
-                |reason| {
-                    stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
-                    stats.drop_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
-                    if reason == DropReason::NoConsumer {
-                        stats.rx_no_consumer.fetch_add(1, Ordering::Relaxed);
-                    }
-                },
             );
-            if !self.protocol.reassembled_input().is_empty() {
-                match crate::net_stack::worker_turn(
-                    self.protocol.reassembled_input(),
-                    interface,
-                    config,
-                ) {
-                    Ok(turn) => self.protocol.parse_reassembled(
-                        turn.ethernet(),
-                        turn.network(),
-                        turn.transport(),
-                    ),
-                    Err(_) => {
-                        while let Some((chain, mut metadata)) =
-                            self.protocol.take_unparsed_reassembled()
+            for (index, count) in drop_counts.into_iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                stats
+                    .rx_dropped
+                    .fetch_add(u64::from(count), Ordering::Relaxed);
+                stats.drop_reasons[index].fetch_add(u64::from(count), Ordering::Relaxed);
+                if index == DropReason::NoConsumer.index() {
+                    stats
+                        .rx_no_consumer
+                        .fetch_add(u64::from(count), Ordering::Relaxed);
+                }
+            }
+            if let Some(reassembled) = self.protocol.take_reassembled_input() {
+                match crate::net_stack::worker_turn(&reassembled, interface, config) {
+                    Ok(turn) => {
+                        if let Err(mut batch) = self.protocol.parse_reassembled(reassembled, &turn)
                         {
+                            for index in 0..batch.len() {
+                                if let Some((chain, mut metadata)) = batch.take(index) {
+                                    metadata.drop_reason = DropReason::NoConsumer;
+                                    let _ = self.recycle.push(chain, metadata);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let mut batch = reassembled;
+                        for index in 0..batch.len() {
+                            let Some((chain, mut metadata)) = batch.take(index) else {
+                                continue;
+                            };
                             metadata.drop_reason = DropReason::NoConsumer;
                             stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
                             stats.drop_reasons[DropReason::NoConsumer.index()]
                                 .fetch_add(1, Ordering::Relaxed);
                             stats.rx_no_consumer.fetch_add(1, Ordering::Relaxed);
-                            if let Err(chain) = self.recycle.push(chain, metadata) {
-                                drop(chain);
-                            }
+                            let _ = self.recycle.push(chain, metadata);
                         }
                     }
                 }
@@ -5053,13 +5051,14 @@ impl ProtocolContext {
                 }
             }
             let mut local = false;
+            let mut local_packets = Vec::new();
             while let Some(packet) = self.protocol.take_reassembled() {
                 let destination = match packet.parsed.disposition {
                     FrontendDisposition::Tcp => self.cluster.ingress_target(packet.parsed.rss_hash),
                     _ => self.cluster.coordinator(),
                 };
                 if destination.id == self.runtime.id {
-                    self.protocol.push_frontend(packet);
+                    local_packets.push(packet);
                     local = true;
                     continue;
                 }
@@ -5075,6 +5074,9 @@ impl ProtocolContext {
                         .fetch_add(1, Ordering::Relaxed);
                     drop(packet.packet.chain);
                 }
+            }
+            if !local_packets.is_empty() {
+                self.protocol.push_frontend_batch(local_packets);
             }
             if !local {
                 break;
