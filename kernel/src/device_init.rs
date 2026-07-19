@@ -480,11 +480,14 @@ pub fn activate_device_subsystem(
     )
     .expect("random ELM 未提供网络启动密钥材料");
     let active_cpu_count = sched::online_cpu_mask().count_ones().clamp(1, 8) as u8;
-    let config = net::device::NetBootConfig::from_random_material(material, active_cpu_count)
-        .expect("active CPU count 超出网络栈范围");
-    net::device::install_net_runtime(config, crate::net_runtime::registrar())
+    let (host_config, driver_config, stack_config) =
+        net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
+            .expect("active CPU count 超出网络栈范围")
+            .split();
+    net::boot::install_host_boot_config(host_config).expect("网络 host 启动配置被重复安装");
+    net::device::install_net_runtime(driver_config, crate::net_runtime::registrar())
         .expect("网络运行时被重复安装");
-    net::stack::install_stack_runtime(crate::net_stack::registrar())
+    net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
         .expect("网络 stack broker 被重复安装");
     printk!(
         "[kernel-start][{}] installed network boot config and registrars",
