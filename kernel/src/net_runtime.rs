@@ -1305,6 +1305,7 @@ fn fail_egress_work(work: EgressWork, error: SocketError) {
 struct ProtocolRuntime {
     id: ShardId,
     cpu: usize,
+    started: AtomicBool,
     ingress: BoundedMpsc<IngressWork>,
     control: BoundedMpsc<ControlWork>,
     dirty: BoundedMpsc<Arc<SocketFacade>>,
@@ -1322,6 +1323,7 @@ impl ProtocolRuntime {
         Self {
             id,
             cpu,
+            started: AtomicBool::new(false),
             ingress: BoundedMpsc::new(1024),
             control: BoundedMpsc::new(256),
             dirty: BoundedMpsc::new(4096),
@@ -1577,6 +1579,13 @@ impl KernelSocketRuntime {
 }
 
 impl SocketRuntime for KernelSocketRuntime {
+    fn submit_stack_socket(
+        &self,
+        command: net::stack::NetStackSocketCommandV1,
+    ) -> Result<net::stack::NetStackSocketCommandV1, net::stack::NetStackSocketCommandV1> {
+        crate::net_stack::socket_command(command).map_err(|(_, command)| command)
+    }
+
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand> {
         let Some(cluster) = self.cluster() else {
             return Err(command);
@@ -2300,6 +2309,25 @@ pub fn start_workers() {
         sched::activate_task_with_cpu_hint(&task, cpu)
             .unwrap_or_else(|error| panic!("协议 worker 启动失败: {:?}", error));
     }
+    let startup_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    while runtimes
+        .iter()
+        .any(|runtime| !runtime.started.load(Ordering::Acquire))
+    {
+        assert!(
+            sched::now_ns_public() < startup_deadline,
+            "协议 worker 未在 1 秒内进入主循环"
+        );
+        let task = sched::current_task();
+        if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+            let wake = sched::now_ns_public().saturating_add(100_000);
+            let _ = sched::register_sleep_deadline(&task, wake);
+            drop(task);
+            sched::schedule_once(sched::now_ns_public());
+        } else {
+            let _ = sched::operation::sched_yield();
+        }
+    }
     NET_RUNTIME_STARTED.store(true, Ordering::Release);
     reconcile_devices();
 }
@@ -2474,6 +2502,7 @@ unsafe extern "C" fn protocol_worker_entry(slot: usize) -> ! {
 
 impl ProtocolContext {
     fn run(&mut self) -> ! {
+        self.runtime.started.store(true, Ordering::Release);
         loop {
             #[cfg(feature = "performance-profile")]
             let profile_turn = profiling::scope(profiling::Event::NetProtocolTurn);

@@ -25,8 +25,10 @@ static HOST_STARTED: AtomicBool = AtomicBool::new(false);
 static NEXT_SOCKET_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static BROKER: Spinlock<KernelNetStackBroker> = Spinlock::new(KernelNetStackBroker::new());
 
-const PINNED_CALL_BUDGET_NS: u64 = 2_000_000;
-const SOCKET_CALL_BUDGET_NS: u64 = 10_000_000;
+// Pinned guard 预算覆盖 ELM 入口、范围校验和 QEMU 调试开销；协议 worker
+// 自身仍使用独立的 200 us turn budget，不能把两者混为一谈。
+const PINNED_CALL_BUDGET_NS: u64 = 10_000_000;
+const SOCKET_CALL_BUDGET_NS: u64 = 50_000_000;
 
 struct KernelNetStackRegistrar;
 
@@ -1449,7 +1451,8 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
                 return Err(NetStackRemoveError::Busy);
             }
         }
-        let detached = net::detach_socket_generation(generation);
+        let detached_proxies = net::detach_proxy_stack(handle.0);
+        let detached_socket_facades = net::detach_socket_generation(generation);
         let mut broker = BROKER.lock();
         broker.record = None;
         if !broker.lifecycle.finish_remove(handle) {
@@ -1461,11 +1464,12 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
             generation,
             handle.0
         );
-        if detached != 0 {
+        if detached_proxies != 0 || detached_socket_facades != 0 {
             log::info!(
-                "[net-stack] detached sockets: generation={} count={}",
+                "[net-stack] detached sockets: generation={} proxies={} socket_facades={}",
                 generation,
-                detached
+                detached_proxies,
+                detached_socket_facades
             );
         }
         Ok(())

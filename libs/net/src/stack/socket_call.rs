@@ -1,10 +1,15 @@
 //! `net.stack` socket 调用 ABI 与代际内套接字表。
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 
 use crate::control::BindOptions;
-use crate::{AddressFamily, Endpoint, InterfaceId, IpAddr, Readiness, SocketId, SocketKind};
+use crate::socket::{attach_socket_facade_generation, new_socket_readiness_relay};
+use crate::{
+    AddressFamily, Endpoint, InterfaceId, MulticastMembership, OwnerRef, ReadinessObserver,
+    SocketError, SocketErrorRecord, SocketFacade, SocketId, SocketKind, TcpInfoSnapshot,
+    new_raw_socket_facade, new_socket_facade, new_tcp_socket_facade,
+};
 
 pub const NET_STACK_SOCKET_CALL_ABI_VERSION: u16 = 1;
 pub const NET_STACK_SOCKET_REQUEST_ABI_VERSION: u16 = 1;
@@ -23,6 +28,11 @@ pub const NET_STACK_SOCKET_OP_GET_OPTION: u32 = 10;
 pub const NET_STACK_SOCKET_OP_SET_OPTION: u32 = 11;
 pub const NET_STACK_SOCKET_OP_QUERY: u32 = 12;
 pub const NET_STACK_SOCKET_OP_SHUTDOWN: u32 = 13;
+pub const NET_STACK_SOCKET_OP_TAKE_ERROR: u32 = 14;
+pub const NET_STACK_SOCKET_OP_TAKE_ERROR_RECORD: u32 = 15;
+pub const NET_STACK_SOCKET_OP_TCP_INFO: u32 = 16;
+pub const NET_STACK_SOCKET_OP_TAKE_RX_OVERFLOW: u32 = 17;
+pub const NET_STACK_SOCKET_OP_MULTICAST: u32 = 18;
 
 pub const NET_STACK_SOCKET_FAMILY_IPV4: u8 = 4;
 pub const NET_STACK_SOCKET_FAMILY_IPV6: u8 = 6;
@@ -30,11 +40,8 @@ pub const NET_STACK_SOCKET_KIND_DATAGRAM: u8 = 1;
 pub const NET_STACK_SOCKET_KIND_STREAM: u8 = 2;
 pub const NET_STACK_SOCKET_KIND_RAW: u8 = 3;
 
-const EPHEMERAL_START: u16 = 49_152;
-const EPHEMERAL_COUNT: usize = 16_384;
 const DATAGRAM_BUFFER_DEFAULT: usize = 128 * 1024;
 const STREAM_BUFFER_DEFAULT: usize = 256 * 1024;
-const DATAGRAM_MAX: usize = 65_527;
 
 /// 常驻 VFS socket 宿主与 `net.stack` 间一次同步调用的固定帧。
 #[repr(C)]
@@ -50,7 +57,6 @@ pub struct NetStackSocketCallV1 {
     pub request: *mut NetStackSocketRequestV1,
     pub reserved1: [u64; 1],
 }
-
 #[kernel_symbols::export]
 impl NetStackSocketCallV1 {
     pub fn new(opcode: u32, stack_generation: u64) -> Self {
@@ -117,10 +123,15 @@ const fn socket_opcode_valid(opcode: u32) -> bool {
             | NET_STACK_SOCKET_OP_SET_OPTION
             | NET_STACK_SOCKET_OP_QUERY
             | NET_STACK_SOCKET_OP_SHUTDOWN
+            | NET_STACK_SOCKET_OP_TAKE_ERROR
+            | NET_STACK_SOCKET_OP_TAKE_ERROR_RECORD
+            | NET_STACK_SOCKET_OP_TCP_INFO
+            | NET_STACK_SOCKET_OP_TAKE_RX_OVERFLOW
+            | NET_STACK_SOCKET_OP_MULTICAST
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NetStackSocketRefV1 {
     pub id: SocketId,
     pub generation: u32,
@@ -165,6 +176,7 @@ pub struct NetStackSocketDescriptorV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetStackSocketSnapshotV1 {
     pub descriptor: NetStackSocketDescriptorV1,
+    pub owner: OwnerRef,
     pub local: Option<Endpoint>,
     pub peer: Option<Endpoint>,
     pub interface: Option<InterfaceId>,
@@ -181,6 +193,9 @@ pub struct NetStackSocketRecvV1 {
     pub source: Option<Endpoint>,
     pub destination: Option<Endpoint>,
     pub interface: Option<InterfaceId>,
+    pub hop_limit: u8,
+    pub traffic_class: u8,
+    pub rx_timestamp_ns: u64,
     pub truncated: bool,
 }
 
@@ -197,6 +212,7 @@ pub enum NetStackSocketErrorV1 {
     DestinationRequired,
     AlreadyConnected,
     InProgress,
+    AlreadyInProgress,
     WouldBlock,
     MessageTooLarge,
     BufferFull,
@@ -236,6 +252,15 @@ pub enum NetStackSocketOptionV1 {
     TcpKeepIntervalNs,
     TcpKeepCount,
     TcpMaxSegment,
+    TcpMore,
+    AbortiveClose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetStackSocketMulticastActionV1 {
+    Add,
+    Drop,
+    Query,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +311,8 @@ pub enum NetStackSocketCommandV1 {
         data: *const u8,
         len: u32,
         destination: Option<Endpoint>,
+        dont_route: bool,
+        confirm: bool,
         output: Option<Result<u32, NetStackSocketErrorV1>>,
     },
     Recv {
@@ -317,6 +344,28 @@ pub enum NetStackSocketCommandV1 {
         write: bool,
         output: Option<Result<NetStackSocketSnapshotV1, NetStackSocketErrorV1>>,
     },
+    TakeError {
+        socket: NetStackSocketRefV1,
+        output: Option<Result<Option<SocketError>, NetStackSocketErrorV1>>,
+    },
+    TakeErrorRecord {
+        socket: NetStackSocketRefV1,
+        output: Option<Result<Option<SocketErrorRecord>, NetStackSocketErrorV1>>,
+    },
+    TcpInfo {
+        socket: NetStackSocketRefV1,
+        output: Option<Result<TcpInfoSnapshot, NetStackSocketErrorV1>>,
+    },
+    TakeRxOverflow {
+        socket: NetStackSocketRefV1,
+        output: Option<Result<u32, NetStackSocketErrorV1>>,
+    },
+    Multicast {
+        socket: NetStackSocketRefV1,
+        action: NetStackSocketMulticastActionV1,
+        membership: Option<MulticastMembership>,
+        output: Option<Result<bool, NetStackSocketErrorV1>>,
+    },
 }
 
 impl NetStackSocketCommandV1 {
@@ -334,13 +383,25 @@ impl NetStackSocketCommandV1 {
             Self::SetOption { .. } => NET_STACK_SOCKET_OP_SET_OPTION,
             Self::Query { .. } => NET_STACK_SOCKET_OP_QUERY,
             Self::Shutdown { .. } => NET_STACK_SOCKET_OP_SHUTDOWN,
+            Self::TakeError { .. } => NET_STACK_SOCKET_OP_TAKE_ERROR,
+            Self::TakeErrorRecord { .. } => NET_STACK_SOCKET_OP_TAKE_ERROR_RECORD,
+            Self::TcpInfo { .. } => NET_STACK_SOCKET_OP_TCP_INFO,
+            Self::TakeRxOverflow { .. } => NET_STACK_SOCKET_OP_TAKE_RX_OVERFLOW,
+            Self::Multicast { .. } => NET_STACK_SOCKET_OP_MULTICAST,
         }
     }
 
     pub const fn allowed_while_quiesced(&self) -> bool {
         matches!(
             self,
-            Self::Close { .. } | Self::Recv { .. } | Self::GetOption { .. } | Self::Query { .. }
+            Self::Close { .. }
+                | Self::Recv { .. }
+                | Self::GetOption { .. }
+                | Self::Query { .. }
+                | Self::TakeError { .. }
+                | Self::TakeErrorRecord { .. }
+                | Self::TcpInfo { .. }
+                | Self::TakeRxOverflow { .. }
         )
     }
 
@@ -366,6 +427,11 @@ impl NetStackSocketCommandV1 {
             Self::SetOption { output, .. } => *output = Some(Err(error)),
             Self::Query { output, .. } => *output = Some(Err(error)),
             Self::Shutdown { output, .. } => *output = Some(Err(error)),
+            Self::TakeError { output, .. } => *output = Some(Err(error)),
+            Self::TakeErrorRecord { output, .. } => *output = Some(Err(error)),
+            Self::TcpInfo { output, .. } => *output = Some(Err(error)),
+            Self::TakeRxOverflow { output, .. } => *output = Some(Err(error)),
+            Self::Multicast { output, .. } => *output = Some(Err(error)),
         }
     }
 }
@@ -418,14 +484,6 @@ impl NetStackSocketRequestV1 {
 }
 
 #[derive(Clone)]
-struct SocketPayload {
-    bytes: Vec<u8>,
-    source: Option<Endpoint>,
-    destination: Option<Endpoint>,
-    interface: Option<InterfaceId>,
-}
-
-#[derive(Clone)]
 struct SocketOptions {
     reuse_address: bool,
     reuse_port: bool,
@@ -456,6 +514,22 @@ struct SocketOptions {
     tcp_keepintvl_ns: u64,
     tcp_keepcount: u32,
     tcp_maxseg: u32,
+    tcp_more: bool,
+    abortive_close: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingControl {
+    Bind {
+        sequence: u64,
+        local: Endpoint,
+        interface: Option<InterfaceId>,
+        options: BindOptions,
+    },
+    Listen {
+        sequence: u64,
+        backlog: u32,
+    },
 }
 
 impl SocketOptions {
@@ -495,6 +569,8 @@ impl SocketOptions {
             tcp_keepintvl_ns: 75_000_000_000,
             tcp_keepcount: 9,
             tcp_maxseg: 0,
+            tcp_more: false,
+            abortive_close: false,
         }
     }
 
@@ -538,6 +614,8 @@ impl SocketOptions {
             OptionId::TcpKeepIntervalNs => NetStackSocketOptionValueV1::U64(self.tcp_keepintvl_ns),
             OptionId::TcpKeepCount => NetStackSocketOptionValueV1::U32(self.tcp_keepcount),
             OptionId::TcpMaxSegment => NetStackSocketOptionValueV1::U32(self.tcp_maxseg),
+            OptionId::TcpMore => NetStackSocketOptionValueV1::Bool(self.tcp_more),
+            OptionId::AbortiveClose => NetStackSocketOptionValueV1::Bool(self.abortive_close),
         }
     }
 
@@ -590,19 +668,11 @@ impl SocketOptions {
             (OptionId::TcpMaxSegment, U32(value)) if value <= u16::MAX as u32 => {
                 self.tcp_maxseg = value
             }
+            (OptionId::TcpMore, Bool(value)) => self.tcp_more = value,
+            (OptionId::AbortiveClose, Bool(value)) => self.abortive_close = value,
             _ => return Err(NetStackSocketErrorV1::InvalidArgument),
         }
         Ok(())
-    }
-
-    fn bind_options(&self) -> BindOptions {
-        BindOptions {
-            reuse_address: self.reuse_address,
-            reuse_port: self.reuse_port,
-            v6_only: self.v6_only,
-            multicast_or_broadcast: false,
-            free_bind: self.free_bind,
-        }
     }
 }
 
@@ -611,78 +681,40 @@ struct SocketEntry {
     family: AddressFamily,
     kind: SocketKind,
     protocol: u8,
-    state: NetStackSocketStateV1,
-    local: Option<Endpoint>,
-    peer: Option<Endpoint>,
-    interface: Option<InterfaceId>,
-    backlog: u32,
-    accepted: VecDeque<NetStackSocketRefV1>,
-    tx: VecDeque<SocketPayload>,
-    rx: VecDeque<SocketPayload>,
-    tx_queued_bytes: usize,
-    rx_queued_bytes: usize,
+    facade: Arc<SocketFacade>,
+    _readiness_relay: Arc<dyn ReadinessObserver>,
     read_shutdown: bool,
     write_shutdown: bool,
-    readiness: Readiness,
-    readiness_generation: u64,
+    pending_control: Option<PendingControl>,
     options: SocketOptions,
 }
 
 impl SocketEntry {
     fn descriptor(&self) -> NetStackSocketDescriptorV1 {
+        let (readiness, readiness_generation) = self.facade.readiness();
         NetStackSocketDescriptorV1 {
             socket: self.socket,
             family: family_raw(self.family),
             kind: kind_raw(self.kind),
             protocol: self.protocol,
-            state: self.state,
-            readiness: self.readiness.raw(),
-            readiness_generation: self.readiness_generation,
+            state: state_from_owner(self.facade.owner()),
+            readiness: readiness.raw(),
+            readiness_generation,
         }
     }
 
     fn snapshot(&self) -> NetStackSocketSnapshotV1 {
         NetStackSocketSnapshotV1 {
             descriptor: self.descriptor(),
-            local: self.local,
-            peer: self.peer,
-            interface: self.interface,
+            owner: self.facade.owner(),
+            local: self.facade.local_endpoint(),
+            peer: self.facade.peer_endpoint(),
+            interface: self.facade.interface(),
             read_shutdown: self.read_shutdown,
             write_shutdown: self.write_shutdown,
-            tx_queued_bytes: self.tx_queued_bytes.min(u32::MAX as usize) as u32,
-            rx_queued_bytes: self.rx_queued_bytes.min(u32::MAX as usize) as u32,
+            tx_queued_bytes: 0,
+            rx_queued_bytes: 0,
         }
-    }
-
-    fn publish_readiness(&mut self, readiness: Readiness) {
-        if self.readiness != readiness {
-            self.readiness = readiness;
-            self.readiness_generation = self.readiness_generation.saturating_add(1);
-        }
-    }
-
-    fn refresh_readiness(&mut self) {
-        let mut readiness = Readiness::default();
-        if !self.rx.is_empty() || self.read_shutdown {
-            readiness = readiness | Readiness::READABLE;
-        }
-        let connected_stream =
-            self.kind != SocketKind::Stream || self.state == NetStackSocketStateV1::Connected;
-        if !self.write_shutdown
-            && connected_stream
-            && self.tx_queued_bytes < self.options.send_buffer
-        {
-            readiness = readiness | Readiness::WRITABLE;
-        }
-        if self.state == NetStackSocketStateV1::Listening && !self.accepted.is_empty() {
-            readiness = readiness | Readiness::ACCEPTABLE | Readiness::READABLE;
-        }
-        if self.read_shutdown && self.write_shutdown {
-            readiness = readiness | Readiness::HANGUP | Readiness::READ_HANGUP;
-        } else if self.read_shutdown {
-            readiness = readiness | Readiness::READ_HANGUP;
-        }
-        self.publish_readiness(readiness);
     }
 }
 
@@ -691,7 +723,6 @@ pub struct NetStackSocketTable {
     stack_generation: u64,
     boot_nonce: u64,
     next_counter: u64,
-    next_ephemeral: u16,
     sockets: BTreeMap<SocketId, SocketEntry>,
 }
 
@@ -705,6 +736,22 @@ impl NetStackSocketTable {
         let family = parse_family(family).ok_or(NetStackSocketErrorV1::InvalidArgument)?;
         let kind = parse_kind(kind).ok_or(NetStackSocketErrorV1::InvalidArgument)?;
         let protocol = normalize_protocol(kind, protocol)?;
+        let facade = match kind {
+            SocketKind::Datagram => new_socket_facade(family),
+            SocketKind::Stream => new_tcp_socket_facade(family),
+            SocketKind::Raw => new_raw_socket_facade(family, protocol),
+        }
+        .map_err(map_socket_error)?;
+        self.insert_facade(family, kind, protocol, facade)
+    }
+
+    fn insert_facade(
+        &mut self,
+        family: AddressFamily,
+        kind: SocketKind,
+        protocol: u8,
+        facade: Arc<SocketFacade>,
+    ) -> Result<NetStackSocketDescriptorV1, NetStackSocketErrorV1> {
         let counter = self.next_counter;
         self.next_counter = self
             .next_counter
@@ -715,28 +762,21 @@ impl NetStackSocketTable {
             counter,
         };
         let socket = NetStackSocketRefV1 { id, generation: 1 };
-        let mut entry = SocketEntry {
+        attach_socket_facade_generation(&facade, self.stack_generation);
+        let relay = new_socket_readiness_relay(socket, self.stack_generation);
+        facade.set_observer(Arc::downgrade(&relay));
+        let entry = SocketEntry {
             socket,
             family,
             kind,
             protocol,
-            state: NetStackSocketStateV1::Unbound,
-            local: None,
-            peer: None,
-            interface: None,
-            backlog: 0,
-            accepted: VecDeque::new(),
-            tx: VecDeque::new(),
-            rx: VecDeque::new(),
-            tx_queued_bytes: 0,
-            rx_queued_bytes: 0,
+            facade,
+            _readiness_relay: relay,
             read_shutdown: false,
             write_shutdown: false,
-            readiness: Readiness::default(),
-            readiness_generation: 1,
+            pending_control: None,
             options: SocketOptions::new(kind),
         };
-        entry.refresh_readiness();
         let descriptor = entry.descriptor();
         self.sockets.insert(id, entry);
         Ok(descriptor)
@@ -775,10 +815,11 @@ impl NetStackSocketTable {
 
     fn close(&mut self, socket: NetStackSocketRefV1) -> Result<(), NetStackSocketErrorV1> {
         self.entry(socket)?;
-        self.sockets.remove(&socket.id);
-        for entry in self.sockets.values_mut() {
-            entry.accepted.retain(|candidate| candidate.id != socket.id);
-            entry.refresh_readiness();
+        if let Some(entry) = self.sockets.remove(&socket.id) {
+            if entry.options.abortive_close {
+                entry.facade.request_abortive_close();
+            }
+            entry.facade.close();
         }
         Ok(())
     }
@@ -786,35 +827,49 @@ impl NetStackSocketTable {
     fn bind(
         &mut self,
         socket: NetStackSocketRefV1,
-        mut local: Endpoint,
+        local: Endpoint,
         interface: Option<InterfaceId>,
         options: BindOptions,
     ) -> Result<Endpoint, NetStackSocketErrorV1> {
-        let (family, protocol, state) = {
-            let entry = self.entry(socket)?;
-            (entry.family, entry.protocol, entry.state)
-        };
-        if state != NetStackSocketStateV1::Unbound
-            || !address_allowed(family, local.addr, options.v6_only)
-        {
-            return Err(NetStackSocketErrorV1::InvalidState);
-        }
-        if local.port == 0 {
-            local.port =
-                self.allocate_ephemeral(family, protocol, local.addr, interface, options)?;
-        } else if self.binding_conflicts(family, protocol, local, interface, options, None) {
-            return Err(NetStackSocketErrorV1::AddressInUse);
-        }
         let entry = self.entry_mut(socket)?;
+        if let Some(pending) = entry.pending_control {
+            let PendingControl::Bind {
+                sequence,
+                local: pending_local,
+                interface: pending_interface,
+                options: pending_options,
+            } = pending
+            else {
+                return Err(NetStackSocketErrorV1::InvalidState);
+            };
+            if pending_local != local
+                || pending_interface != interface
+                || pending_options != options
+            {
+                return Err(NetStackSocketErrorV1::InvalidState);
+            }
+            let Some(result) = entry.facade.take_control_result(sequence) else {
+                return Err(NetStackSocketErrorV1::InProgress);
+            };
+            entry.pending_control = None;
+            result.map_err(map_socket_error)?;
+            return Ok(entry.facade.local_endpoint().unwrap_or(local));
+        }
+        let sequence = entry
+            .facade
+            .begin_bind(local, interface, options)
+            .map_err(map_socket_error)?;
+        entry.pending_control = Some(PendingControl::Bind {
+            sequence,
+            local,
+            interface,
+            options,
+        });
         entry.options.reuse_address = options.reuse_address;
         entry.options.reuse_port = options.reuse_port;
         entry.options.v6_only = options.v6_only;
         entry.options.free_bind = options.free_bind;
-        entry.local = Some(local);
-        entry.interface = interface;
-        entry.state = NetStackSocketStateV1::Bound;
-        entry.refresh_readiness();
-        Ok(local)
+        Err(NetStackSocketErrorV1::InProgress)
     }
 
     fn connect(
@@ -824,31 +879,13 @@ impl NetStackSocketTable {
         interface: Option<InterfaceId>,
         options: BindOptions,
     ) -> Result<NetStackSocketSnapshotV1, NetStackSocketErrorV1> {
-        let (family, state) = {
-            let entry = self.entry(socket)?;
-            (entry.family, entry.state)
-        };
-        if !address_allowed(family, peer.addr, options.v6_only) {
-            return Err(NetStackSocketErrorV1::AddressUnavailable);
-        }
-        if matches!(
-            state,
-            NetStackSocketStateV1::Connected | NetStackSocketStateV1::Listening
-        ) {
-            return Err(NetStackSocketErrorV1::AlreadyConnected);
-        }
-        if state == NetStackSocketStateV1::Unbound {
-            let local = Endpoint {
-                addr: unspecified(family),
-                port: 0,
-            };
-            self.bind(socket, local, interface, options)?;
-        }
         let entry = self.entry_mut(socket)?;
-        entry.peer = Some(peer);
-        entry.interface = interface.or(entry.interface);
-        entry.state = NetStackSocketStateV1::Connected;
-        entry.refresh_readiness();
+        let result = entry
+            .facade
+            .connect_with_mode(peer, interface, options, true);
+        if let Err(error) = result {
+            return Err(map_socket_error(error));
+        }
         Ok(entry.snapshot())
     }
 
@@ -857,54 +894,46 @@ impl NetStackSocketTable {
         socket: NetStackSocketRefV1,
         backlog: u32,
     ) -> Result<NetStackSocketSnapshotV1, NetStackSocketErrorV1> {
-        let (family, kind, state) = {
-            let entry = self.entry(socket)?;
-            (entry.family, entry.kind, entry.state)
-        };
-        if kind != SocketKind::Stream {
-            return Err(NetStackSocketErrorV1::NotSupported);
-        }
-        if state == NetStackSocketStateV1::Unbound {
-            self.bind(
-                socket,
-                Endpoint {
-                    addr: unspecified(family),
-                    port: 0,
-                },
-                None,
-                BindOptions::default(),
-            )?;
-        }
         let entry = self.entry_mut(socket)?;
-        if !matches!(
-            entry.state,
-            NetStackSocketStateV1::Bound | NetStackSocketStateV1::Listening
-        ) {
-            return Err(NetStackSocketErrorV1::InvalidState);
+        if let Some(pending) = entry.pending_control {
+            let PendingControl::Listen {
+                sequence,
+                backlog: pending_backlog,
+            } = pending
+            else {
+                return Err(NetStackSocketErrorV1::InvalidState);
+            };
+            if pending_backlog != backlog {
+                return Err(NetStackSocketErrorV1::InvalidState);
+            }
+            let Some(result) = entry.facade.take_control_result(sequence) else {
+                return Err(NetStackSocketErrorV1::InProgress);
+            };
+            entry.pending_control = None;
+            result.map_err(map_socket_error)?;
+            return Ok(entry.snapshot());
         }
-        entry.state = NetStackSocketStateV1::Listening;
-        entry.backlog = backlog.max(1);
-        entry.refresh_readiness();
-        Ok(entry.snapshot())
+        let sequence = entry
+            .facade
+            .begin_listen(backlog)
+            .map_err(map_socket_error)?;
+        entry.pending_control = Some(PendingControl::Listen { sequence, backlog });
+        Err(NetStackSocketErrorV1::InProgress)
     }
 
     fn accept(
         &mut self,
         socket: NetStackSocketRefV1,
     ) -> Result<NetStackSocketDescriptorV1, NetStackSocketErrorV1> {
-        let child = {
-            let entry = self.entry_mut(socket)?;
-            if entry.state != NetStackSocketStateV1::Listening {
-                return Err(NetStackSocketErrorV1::InvalidState);
-            }
-            let child = entry
-                .accepted
-                .pop_front()
-                .ok_or(NetStackSocketErrorV1::WouldBlock)?;
-            entry.refresh_readiness();
-            child
-        };
-        Ok(self.entry(child)?.descriptor())
+        let child = self
+            .entry(socket)?
+            .facade
+            .accept(true, None)
+            .map_err(map_socket_error)?;
+        let family = child.family();
+        let kind = child.kind();
+        let protocol = child.protocol();
+        self.insert_facade(family, kind, protocol, child)
     }
 
     fn send(
@@ -912,68 +941,26 @@ impl NetStackSocketTable {
         socket: NetStackSocketRefV1,
         data: &[u8],
         destination: Option<Endpoint>,
+        dont_route: bool,
+        confirm: bool,
     ) -> Result<u32, NetStackSocketErrorV1> {
-        let (kind, family, state, interface, bind_options) = {
-            let entry = self.entry(socket)?;
-            (
-                entry.kind,
-                entry.family,
-                entry.state,
-                entry.interface,
-                entry.options.bind_options(),
-            )
-        };
-        if kind != SocketKind::Stream && state == NetStackSocketStateV1::Unbound {
-            self.bind(
-                socket,
-                Endpoint {
-                    addr: unspecified(family),
-                    port: 0,
-                },
-                interface,
-                bind_options,
-            )?;
-        }
         let entry = self.entry_mut(socket)?;
-        if entry.write_shutdown {
-            return Err(NetStackSocketErrorV1::WriteShutdown);
-        }
-        let destination = match entry.kind {
+        let result = match entry.kind {
             SocketKind::Stream => {
                 if destination.is_some() {
                     return Err(NetStackSocketErrorV1::AlreadyConnected);
                 }
-                entry.peer.ok_or(NetStackSocketErrorV1::NotConnected)?
+                entry.facade.send_stream(data, true, None)
             }
-            SocketKind::Datagram | SocketKind::Raw => destination
-                .or(entry.peer)
-                .ok_or(NetStackSocketErrorV1::DestinationRequired)?,
+            SocketKind::Datagram | SocketKind::Raw => {
+                entry
+                    .facade
+                    .send_datagram(data, destination, true, None, dont_route, confirm)
+            }
         };
-        if entry.kind != SocketKind::Stream && data.len() > DATAGRAM_MAX {
-            return Err(NetStackSocketErrorV1::MessageTooLarge);
-        }
-        if entry
-            .tx_queued_bytes
-            .checked_add(data.len())
-            .is_none_or(|total| total > entry.options.send_buffer)
-        {
-            entry.refresh_readiness();
-            return Err(NetStackSocketErrorV1::WouldBlock);
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(data.len())
-            .map_err(|_| NetStackSocketErrorV1::BufferFull)?;
-        bytes.extend_from_slice(data);
-        entry.tx_queued_bytes += bytes.len();
-        entry.tx.push_back(SocketPayload {
-            bytes,
-            source: entry.local,
-            destination: Some(destination),
-            interface: entry.interface,
-        });
-        entry.refresh_readiness();
-        Ok(data.len() as u32)
+        result
+            .map(|length| length.min(u32::MAX as usize) as u32)
+            .map_err(map_socket_error)
     }
 
     fn recv(
@@ -984,41 +971,38 @@ impl NetStackSocketTable {
         truncate: bool,
     ) -> Result<NetStackSocketRecvV1, NetStackSocketErrorV1> {
         let entry = self.entry_mut(socket)?;
-        let Some(payload) = entry.rx.front_mut() else {
-            if entry.read_shutdown {
-                return Ok(NetStackSocketRecvV1 {
-                    len: 0,
-                    original_len: 0,
-                    source: entry.peer,
-                    destination: entry.local,
-                    interface: entry.interface,
-                    truncated: false,
-                });
-            }
-            return Err(NetStackSocketErrorV1::WouldBlock);
-        };
-        let original_len = payload.bytes.len();
-        let copied = original_len.min(output.len());
-        output[..copied].copy_from_slice(&payload.bytes[..copied]);
-        let result = NetStackSocketRecvV1 {
-            len: if truncate { original_len } else { copied }.min(u32::MAX as usize) as u32,
-            original_len: original_len.min(u32::MAX as usize) as u32,
-            source: payload.source,
-            destination: payload.destination,
-            interface: payload.interface,
-            truncated: copied != original_len,
-        };
-        if !peek {
-            if entry.kind == SocketKind::Stream && copied < original_len {
-                payload.bytes.drain(..copied);
-                entry.rx_queued_bytes -= copied;
-            } else {
-                entry.rx.pop_front();
-                entry.rx_queued_bytes -= original_len;
-            }
-            entry.refresh_readiness();
+        if entry.kind == SocketKind::Stream {
+            let len = entry
+                .facade
+                .recv_stream(output, peek, false, true, None)
+                .map_err(map_socket_error)?;
+            return Ok(NetStackSocketRecvV1 {
+                len: len.min(u32::MAX as usize) as u32,
+                original_len: len.min(u32::MAX as usize) as u32,
+                source: entry.facade.peer_endpoint(),
+                destination: entry.facade.local_endpoint(),
+                interface: entry.facade.interface(),
+                hop_limit: 0,
+                traffic_class: 0,
+                rx_timestamp_ns: 0,
+                truncated: false,
+            });
         }
-        Ok(result)
+        let received = entry
+            .facade
+            .recv(output, peek, truncate, true, None)
+            .map_err(map_socket_error)?;
+        Ok(NetStackSocketRecvV1 {
+            len: received.len.min(u32::MAX as usize) as u32,
+            original_len: received.original_len.min(u32::MAX as usize) as u32,
+            source: Some(received.source),
+            destination: Some(received.destination),
+            interface: Some(received.ingress_interface),
+            hop_limit: received.hop_limit,
+            traffic_class: received.traffic_class,
+            rx_timestamp_ns: received.rx_timestamp_ns,
+            truncated: received.truncated,
+        })
     }
 
     fn shutdown(
@@ -1031,13 +1015,12 @@ impl NetStackSocketTable {
             return Err(NetStackSocketErrorV1::InvalidArgument);
         }
         let entry = self.entry_mut(socket)?;
+        entry
+            .facade
+            .shutdown(read, write)
+            .map_err(map_socket_error)?;
         entry.read_shutdown |= read;
         entry.write_shutdown |= write;
-        if read {
-            entry.rx.clear();
-            entry.rx_queued_bytes = 0;
-        }
-        entry.refresh_readiness();
         Ok(entry.snapshot())
     }
 
@@ -1062,124 +1045,69 @@ impl NetStackSocketTable {
         let entry = self.entry_mut(socket)?;
         if !option_supported(entry, option)
             || (option == NetStackSocketOptionV1::V6Only
-                && entry.state != NetStackSocketStateV1::Unbound)
+                && !matches!(entry.facade.owner(), OwnerRef::Unassigned))
             || (option == NetStackSocketOptionV1::TcpMaxSegment
-                && entry.state == NetStackSocketStateV1::Connected)
+                && matches!(entry.facade.owner(), OwnerRef::Flow { .. }))
         {
             return Err(NetStackSocketErrorV1::NotSupported);
         }
         entry.options.set(option, value)?;
-        entry.refresh_readiness();
+        apply_facade_option(&entry.facade, option, value);
+        let (send_limit, receive_limit) = entry.facade.buffer_limits();
+        if option == NetStackSocketOptionV1::SendBuffer {
+            entry.options.send_buffer = send_limit;
+        }
+        if option == NetStackSocketOptionV1::ReceiveBuffer {
+            entry.options.receive_buffer = receive_limit;
+        }
         Ok(())
     }
 
-    fn allocate_ephemeral(
-        &mut self,
-        family: AddressFamily,
-        protocol: u8,
-        address: IpAddr,
-        interface: Option<InterfaceId>,
-        options: BindOptions,
-    ) -> Result<u16, NetStackSocketErrorV1> {
-        for _ in 0..EPHEMERAL_COUNT {
-            let port = self.next_ephemeral;
-            self.next_ephemeral = if port == u16::MAX {
-                EPHEMERAL_START
-            } else {
-                port + 1
-            };
-            let local = Endpoint {
-                addr: address,
-                port,
-            };
-            if !self.binding_conflicts(family, protocol, local, interface, options, None) {
-                return Ok(port);
-            }
-        }
-        Err(NetStackSocketErrorV1::AddressInUse)
-    }
-
-    fn binding_conflicts(
+    fn take_error(
         &self,
-        family: AddressFamily,
-        protocol: u8,
-        local: Endpoint,
-        interface: Option<InterfaceId>,
-        options: BindOptions,
-        exclude: Option<SocketId>,
-    ) -> bool {
-        self.sockets.values().any(|entry| {
-            if Some(entry.socket.id) == exclude
-                || entry.family != family
-                || entry.protocol != protocol
-                || entry.interface != interface
-            {
-                return false;
-            }
-            let Some(existing) = entry.local else {
-                return false;
-            };
-            if existing.port != local.port
-                || !(existing.addr == local.addr
-                    || existing.addr.is_unspecified()
-                    || local.addr.is_unspecified())
-            {
-                return false;
-            }
-            !((options.reuse_port && entry.options.reuse_port)
-                || (options.reuse_address && entry.options.reuse_address))
-        })
-    }
-
-    #[cfg(test)]
-    fn push_received(
-        &mut self,
         socket: NetStackSocketRefV1,
-        bytes: &[u8],
-        source: Option<Endpoint>,
-        destination: Option<Endpoint>,
-    ) -> Result<(), NetStackSocketErrorV1> {
-        let entry = self.entry_mut(socket)?;
-        if entry
-            .rx_queued_bytes
-            .checked_add(bytes.len())
-            .is_none_or(|total| total > entry.options.receive_buffer)
-        {
-            return Err(NetStackSocketErrorV1::BufferFull);
-        }
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| NetStackSocketErrorV1::BufferFull)?;
-        owned.extend_from_slice(bytes);
-        entry.rx_queued_bytes += owned.len();
-        entry.rx.push_back(SocketPayload {
-            bytes: owned,
-            source,
-            destination,
-            interface: entry.interface,
-        });
-        entry.refresh_readiness();
-        Ok(())
+    ) -> Result<Option<SocketError>, NetStackSocketErrorV1> {
+        Ok(self.entry(socket)?.facade.take_pending_error())
     }
 
-    #[cfg(test)]
-    fn enqueue_accepted(
-        &mut self,
-        listener: NetStackSocketRefV1,
-        child: NetStackSocketRefV1,
-    ) -> Result<(), NetStackSocketErrorV1> {
-        self.entry(child)?;
-        let entry = self.entry_mut(listener)?;
-        if entry.state != NetStackSocketStateV1::Listening {
-            return Err(NetStackSocketErrorV1::InvalidState);
+    fn take_error_record(
+        &self,
+        socket: NetStackSocketRefV1,
+    ) -> Result<Option<SocketErrorRecord>, NetStackSocketErrorV1> {
+        Ok(self.entry(socket)?.facade.take_error_record())
+    }
+
+    fn tcp_info(
+        &self,
+        socket: NetStackSocketRefV1,
+    ) -> Result<TcpInfoSnapshot, NetStackSocketErrorV1> {
+        Ok(self.entry(socket)?.facade.tcp_info())
+    }
+
+    fn take_rx_overflow(&self, socket: NetStackSocketRefV1) -> Result<u32, NetStackSocketErrorV1> {
+        Ok(self.entry(socket)?.facade.take_rx_overflow())
+    }
+
+    fn multicast(
+        &self,
+        socket: NetStackSocketRefV1,
+        action: NetStackSocketMulticastActionV1,
+        membership: Option<MulticastMembership>,
+    ) -> Result<bool, NetStackSocketErrorV1> {
+        let facade = &self.entry(socket)?.facade;
+        match action {
+            NetStackSocketMulticastActionV1::Add => facade
+                .add_multicast_membership(membership.ok_or(NetStackSocketErrorV1::InvalidArgument)?)
+                .map(|()| true)
+                .map_err(map_socket_error),
+            NetStackSocketMulticastActionV1::Drop => facade
+                .drop_multicast_membership(
+                    membership.ok_or(NetStackSocketErrorV1::InvalidArgument)?,
+                )
+                .map(|()| true)
+                .map_err(map_socket_error),
+            NetStackSocketMulticastActionV1::Query => Ok(facade.has_multicast_memberships()),
         }
-        if entry.accepted.len() >= entry.backlog as usize {
-            return Err(NetStackSocketErrorV1::BufferFull);
-        }
-        entry.accepted.push_back(child);
-        entry.refresh_readiness();
-        Ok(())
     }
 }
 
@@ -1198,7 +1126,6 @@ pub fn create_socket_table(boot_nonce: u64, stack_generation: u64) -> Option<Net
         stack_generation,
         boot_nonce,
         next_counter: 1,
-        next_ephemeral: EPHEMERAL_START,
         sockets: BTreeMap::new(),
     })
 }
@@ -1210,8 +1137,11 @@ pub fn create_socket_table(boot_nonce: u64, stack_generation: u64) -> Option<Net
     capabilities = kernel_symbols::capability::NETWORK_STACK,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
-pub fn destroy_socket_table(table: NetStackSocketTable) {
-    drop(table);
+pub fn destroy_socket_table(mut table: NetStackSocketTable) {
+    for (_, entry) in core::mem::take(&mut table.sockets) {
+        entry.facade.detach_stack_for_generation();
+        entry.facade.close();
+    }
 }
 
 #[kernel_symbols::export(
@@ -1275,6 +1205,8 @@ pub fn dispatch_socket_table_call(
             data,
             len,
             destination,
+            dont_route,
+            confirm,
             output,
         } => {
             let length = *len as usize;
@@ -1284,7 +1216,7 @@ pub fn dispatch_socket_table_call(
                 // Safety: 宿主将载荷声明为本次 pinned call 的只读范围；长度已校验，
                 // 切片只在同步调用期间使用，套接字表复制后才返回。
                 let input = unsafe { core::slice::from_raw_parts(*data, length) };
-                *output = Some(table.send(*socket, input, *destination));
+                *output = Some(table.send(*socket, input, *destination, *dont_route, *confirm));
             }
         }
         NetStackSocketCommandV1::Recv {
@@ -1329,6 +1261,24 @@ pub fn dispatch_socket_table_call(
             write,
             output,
         } => *output = Some(table.shutdown(*socket, *read, *write)),
+        NetStackSocketCommandV1::TakeError { socket, output } => {
+            *output = Some(table.take_error(*socket));
+        }
+        NetStackSocketCommandV1::TakeErrorRecord { socket, output } => {
+            *output = Some(table.take_error_record(*socket));
+        }
+        NetStackSocketCommandV1::TcpInfo { socket, output } => {
+            *output = Some(table.tcp_info(*socket));
+        }
+        NetStackSocketCommandV1::TakeRxOverflow { socket, output } => {
+            *output = Some(table.take_rx_overflow(*socket));
+        }
+        NetStackSocketCommandV1::Multicast {
+            socket,
+            action,
+            membership,
+            output,
+        } => *output = Some(table.multicast(*socket, *action, *membership)),
     }
     request.committed = 1;
     true
@@ -1375,14 +1325,6 @@ fn normalize_protocol(kind: SocketKind, protocol: u8) -> Result<u8, NetStackSock
     }
 }
 
-fn address_allowed(family: AddressFamily, address: IpAddr, v6_only: bool) -> bool {
-    match (family, address) {
-        (AddressFamily::Ipv4, IpAddr::V4(_)) | (AddressFamily::Ipv6, IpAddr::V6(_)) => true,
-        (AddressFamily::Ipv6, IpAddr::V4(_)) => !v6_only,
-        _ => false,
-    }
-}
-
 fn option_supported(entry: &SocketEntry, option: NetStackSocketOptionV1) -> bool {
     use NetStackSocketOptionV1 as OptionId;
     match option {
@@ -1398,336 +1340,85 @@ fn option_supported(entry: &SocketEntry, option: NetStackSocketOptionV1) -> bool
         | OptionId::TcpKeepIdleNs
         | OptionId::TcpKeepIntervalNs
         | OptionId::TcpKeepCount
-        | OptionId::TcpMaxSegment => entry.kind == SocketKind::Stream,
+        | OptionId::TcpMaxSegment
+        | OptionId::TcpMore
+        | OptionId::AbortiveClose => entry.kind == SocketKind::Stream,
         _ => true,
     }
 }
 
-const fn unspecified(family: AddressFamily) -> IpAddr {
-    match family {
-        AddressFamily::Ipv4 => IpAddr::V4(crate::Ipv4Addr::UNSPECIFIED),
-        AddressFamily::Ipv6 => IpAddr::V6(crate::Ipv6Addr::UNSPECIFIED),
+fn apply_facade_option(
+    facade: &Arc<SocketFacade>,
+    option: NetStackSocketOptionV1,
+    value: NetStackSocketOptionValueV1,
+) {
+    use NetStackSocketOptionV1 as OptionId;
+    use NetStackSocketOptionValueV1::{Bool, I32, Interface, U32, U64};
+    match (option, value) {
+        (OptionId::V6Only, Bool(value)) => facade.set_v6_only(value),
+        (OptionId::FreeBind, Bool(value)) => facade.set_free_bind(value),
+        (OptionId::RawHeaderIncluded, Bool(value)) => facade.set_raw_header_included(value),
+        (OptionId::TcpNoDelay, Bool(value)) => facade.set_tcp_nodelay(value),
+        (OptionId::TcpCork, Bool(value)) => facade.set_tcp_cork(value),
+        (OptionId::TcpQuickAck, Bool(true)) => facade.request_quick_ack(),
+        (OptionId::TcpKeepAlive, Bool(value)) => facade.set_tcp_keepalive(value),
+        (OptionId::IpHopLimit, U32(value)) => facade.set_ip_hop_limit(value as u8),
+        (OptionId::IpTrafficClass, U32(value)) => facade.set_ip_traffic_class(value as u8),
+        (OptionId::MulticastHops, U32(value)) => facade.set_multicast_hops(value as u8),
+        (OptionId::MulticastLoop, Bool(value)) => facade.set_multicast_loop(value),
+        (OptionId::MulticastInterface, Interface(value)) => facade.set_multicast_interface(value),
+        (OptionId::SocketMark, U32(value)) => facade.set_socket_mark(value),
+        (OptionId::SocketPriority, I32(value)) => facade.set_socket_priority(value),
+        (OptionId::SendBuffer, U32(value)) => facade.set_buffer_limits(Some(value as usize), None),
+        (OptionId::ReceiveBuffer, U32(value)) => {
+            facade.set_buffer_limits(None, Some(value as usize))
+        }
+        (OptionId::TcpDeferAcceptNs, U64(value)) => facade.set_tcp_defer_accept_ns(value),
+        (OptionId::TcpNotSentLowat, U32(value)) => facade.set_tcp_notsent_lowat(value),
+        (OptionId::TcpUserTimeoutNs, U64(value)) => facade.set_tcp_user_timeout_ns(value),
+        (OptionId::TcpKeepIdleNs, U64(value)) => facade.set_tcp_keepidle_ns(value),
+        (OptionId::TcpKeepIntervalNs, U64(value)) => facade.set_tcp_keepintvl_ns(value),
+        (OptionId::TcpKeepCount, U32(value)) => facade.set_tcp_keepcount(value as u16),
+        (OptionId::TcpMaxSegment, U32(value)) => facade.set_tcp_maxseg(value as u16),
+        (OptionId::TcpMore, Bool(value)) => facade.set_tcp_more(value),
+        (OptionId::AbortiveClose, Bool(true)) => facade.request_abortive_close(),
+        _ => {}
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Ipv4Addr, Ipv6Addr};
-
-    fn request(
-        table: &mut NetStackSocketTable,
-        id: u64,
-        command: NetStackSocketCommandV1,
-    ) -> NetStackSocketCommandV1 {
-        let mut request = NetStackSocketRequestV1::new(table.stack_generation, id, command);
-        assert!(dispatch_socket_table_call(table, &mut request, false));
-        assert_eq!(request.committed, 1);
-        request.command
+const fn state_from_owner(owner: OwnerRef) -> NetStackSocketStateV1 {
+    match owner {
+        OwnerRef::Unassigned => NetStackSocketStateV1::Unbound,
+        OwnerRef::Bound { .. } => NetStackSocketStateV1::Bound,
+        OwnerRef::Listener { .. } => NetStackSocketStateV1::Listening,
+        OwnerRef::Flow { .. } | OwnerRef::Closed { .. } => NetStackSocketStateV1::Connected,
     }
+}
 
-    fn create(
-        table: &mut NetStackSocketTable,
-        id: u64,
-        family: u8,
-        kind: u8,
-        protocol: u8,
-    ) -> NetStackSocketDescriptorV1 {
-        match request(
-            table,
-            id,
-            NetStackSocketCommandV1::Create {
-                family,
-                kind,
-                protocol,
-                output: None,
-            },
-        ) {
-            NetStackSocketCommandV1::Create {
-                output: Some(Ok(descriptor)),
-                ..
-            } => descriptor,
-            _ => panic!("socket create 未返回 descriptor"),
+const fn map_socket_error(error: SocketError) -> NetStackSocketErrorV1 {
+    match error {
+        SocketError::RuntimeUnavailable | SocketError::NetworkDown => {
+            NetStackSocketErrorV1::Quiesced
         }
-    }
-
-    #[test]
-    fn socket_table_runs_datagram_lifecycle_and_payload_calls() {
-        let mut table = create_socket_table(9, 7).unwrap();
-        let descriptor = create(
-            &mut table,
-            1,
-            NET_STACK_SOCKET_FAMILY_IPV4,
-            NET_STACK_SOCKET_KIND_DATAGRAM,
-            0,
-        );
-        let local = Endpoint {
-            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port: 0,
-        };
-        let bound = match request(
-            &mut table,
-            2,
-            NetStackSocketCommandV1::Bind {
-                socket: descriptor.socket,
-                local,
-                interface: None,
-                options: BindOptions::default(),
-                output: None,
-            },
-        ) {
-            NetStackSocketCommandV1::Bind {
-                output: Some(Ok(bound)),
-                ..
-            } => bound,
-            _ => panic!("socket bind 未返回 endpoint"),
-        };
-        assert_ne!(bound.port, 0);
-        let peer = Endpoint {
-            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2)),
-            port: 9000,
-        };
-        assert!(matches!(
-            request(
-                &mut table,
-                3,
-                NetStackSocketCommandV1::Connect {
-                    socket: descriptor.socket,
-                    peer,
-                    interface: None,
-                    options: BindOptions::default(),
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Connect {
-                output: Some(Ok(_)),
-                ..
-            }
-        ));
-        let payload = b"elm socket";
-        assert!(matches!(
-            request(
-                &mut table,
-                4,
-                NetStackSocketCommandV1::Send {
-                    socket: descriptor.socket,
-                    data: payload.as_ptr(),
-                    len: payload.len() as u32,
-                    destination: None,
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Send {
-                output: Some(Ok(10)),
-                ..
-            }
-        ));
-        table
-            .push_received(descriptor.socket, payload, Some(peer), Some(bound))
-            .unwrap();
-        let mut output = [0u8; 32];
-        assert!(matches!(
-            request(
-                &mut table,
-                5,
-                NetStackSocketCommandV1::Recv {
-                    socket: descriptor.socket,
-                    data: output.as_mut_ptr(),
-                    capacity: output.len() as u32,
-                    peek: false,
-                    truncate: false,
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Recv {
-                output: Some(Ok(NetStackSocketRecvV1 { len: 10, .. })),
-                ..
-            }
-        ));
-        assert_eq!(&output[..payload.len()], payload);
-    }
-
-    #[test]
-    fn socket_table_handles_options_listener_accept_and_close() {
-        let mut table = create_socket_table(12, 4).unwrap();
-        let listener = create(
-            &mut table,
-            1,
-            NET_STACK_SOCKET_FAMILY_IPV6,
-            NET_STACK_SOCKET_KIND_STREAM,
-            6,
-        );
-        assert_eq!(listener.readiness & Readiness::WRITABLE.raw(), 0);
-        assert!(matches!(
-            request(
-                &mut table,
-                2,
-                NetStackSocketCommandV1::SetOption {
-                    socket: listener.socket,
-                    option: NetStackSocketOptionV1::V6Only,
-                    value: NetStackSocketOptionValueV1::Bool(true),
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::SetOption {
-                output: Some(Ok(())),
-                ..
-            }
-        ));
-        let local = Endpoint {
-            addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            port: 8080,
-        };
-        let mut bind_options = BindOptions::default();
-        bind_options.v6_only = true;
-        let _ = request(
-            &mut table,
-            3,
-            NetStackSocketCommandV1::Bind {
-                socket: listener.socket,
-                local,
-                interface: None,
-                options: bind_options,
-                output: None,
-            },
-        );
-        assert!(matches!(
-            request(
-                &mut table,
-                4,
-                NetStackSocketCommandV1::Listen {
-                    socket: listener.socket,
-                    backlog: 8,
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Listen {
-                output: Some(Ok(_)),
-                ..
-            }
-        ));
-        let child = create(
-            &mut table,
-            5,
-            NET_STACK_SOCKET_FAMILY_IPV6,
-            NET_STACK_SOCKET_KIND_STREAM,
-            6,
-        );
-        table
-            .enqueue_accepted(listener.socket, child.socket)
-            .unwrap();
-        assert!(matches!(
-            request(
-                &mut table,
-                6,
-                NetStackSocketCommandV1::Accept {
-                    socket: listener.socket,
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Accept {
-                output: Some(Ok(descriptor)),
-                ..
-            } if descriptor.socket == child.socket
-        ));
-        assert!(matches!(
-            request(
-                &mut table,
-                7,
-                NetStackSocketCommandV1::Close {
-                    socket: child.socket,
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Close {
-                output: Some(Ok(())),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn socket_table_rejects_quiesced_mutation_and_stale_generation() {
-        let mut table = create_socket_table(3, 5).unwrap();
-        let descriptor = create(
-            &mut table,
-            1,
-            NET_STACK_SOCKET_FAMILY_IPV4,
-            NET_STACK_SOCKET_KIND_DATAGRAM,
-            17,
-        );
-        let mut quiesced = NetStackSocketRequestV1::new(
-            5,
-            2,
-            NetStackSocketCommandV1::SetOption {
-                socket: descriptor.socket,
-                option: NetStackSocketOptionV1::Broadcast,
-                value: NetStackSocketOptionValueV1::Bool(true),
-                output: None,
-            },
-        );
-        assert!(dispatch_socket_table_call(&mut table, &mut quiesced, true));
-        assert!(matches!(
-            quiesced.command,
-            NetStackSocketCommandV1::SetOption {
-                output: Some(Err(NetStackSocketErrorV1::Quiesced)),
-                ..
-            }
-        ));
-        let stale = NetStackSocketRefV1 {
-            generation: descriptor.socket.generation + 1,
-            ..descriptor.socket
-        };
-        assert!(matches!(
-            request(
-                &mut table,
-                3,
-                NetStackSocketCommandV1::Query {
-                    socket: stale,
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Query {
-                output: Some(Err(NetStackSocketErrorV1::StaleGeneration)),
-                ..
-            }
-        ));
-
-        let auto_bound = create(
-            &mut table,
-            4,
-            NET_STACK_SOCKET_FAMILY_IPV4,
-            NET_STACK_SOCKET_KIND_DATAGRAM,
-            17,
-        );
-        let payload = b"auto-bind";
-        let destination = Endpoint {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 9000,
-        };
-        assert!(matches!(
-            request(
-                &mut table,
-                5,
-                NetStackSocketCommandV1::Send {
-                    socket: auto_bound.socket,
-                    data: payload.as_ptr(),
-                    len: payload.len() as u32,
-                    destination: Some(destination),
-                    output: None,
-                },
-            ),
-            NetStackSocketCommandV1::Send {
-                output: Some(Ok(9)),
-                ..
-            }
-        ));
-        assert!(
-            table
-                .entry(auto_bound.socket)
-                .unwrap()
-                .local
-                .is_some_and(|local| local.port != 0)
-        );
+        SocketError::RuntimeBusy | SocketError::Buffer => NetStackSocketErrorV1::BufferFull,
+        SocketError::InvalidState => NetStackSocketErrorV1::InvalidState,
+        SocketError::AddressInUse => NetStackSocketErrorV1::AddressInUse,
+        SocketError::AddressUnavailable => NetStackSocketErrorV1::AddressUnavailable,
+        SocketError::NotConnected => NetStackSocketErrorV1::NotConnected,
+        SocketError::DestinationRequired => NetStackSocketErrorV1::DestinationRequired,
+        SocketError::AlreadyConnected => NetStackSocketErrorV1::AlreadyConnected,
+        SocketError::AlreadyInProgress => NetStackSocketErrorV1::AlreadyInProgress,
+        SocketError::InProgress => NetStackSocketErrorV1::InProgress,
+        SocketError::WouldBlock | SocketError::TimedOut | SocketError::Interrupted => {
+            NetStackSocketErrorV1::WouldBlock
+        }
+        SocketError::MessageTooLarge => NetStackSocketErrorV1::MessageTooLarge,
+        SocketError::ReadShutdown => NetStackSocketErrorV1::ReadShutdown,
+        SocketError::WriteShutdown => NetStackSocketErrorV1::WriteShutdown,
+        SocketError::Closed => NetStackSocketErrorV1::NotFound,
+        SocketError::NetworkUnreachable
+        | SocketError::HostUnreachable
+        | SocketError::ConnectionRefused
+        | SocketError::ConnectionReset => NetStackSocketErrorV1::NotConnected,
     }
 }

@@ -8,10 +8,14 @@ static STRESS_SENDER: sched::sync::Spinlock<Option<alloc::sync::Arc<net::SocketF
     sched::sync::Spinlock::new(None);
 static STRESS_WRITER_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static BLOCKING_STREAM_SENDER: sched::sync::Spinlock<Option<alloc::sync::Arc<net::SocketFacade>>> =
+static BLOCKING_STREAM_SENDER: sched::sync::Spinlock<Option<alloc::sync::Arc<vfs::file::File>>> =
     sched::sync::Spinlock::new(None);
 static BLOCKING_STREAM_WRITTEN: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
+static DETACH_READER_FILE: sched::sync::Spinlock<Option<alloc::sync::Arc<vfs::file::File>>> =
+    sched::sync::Spinlock::new(None);
+static DETACH_READER_RESULT: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(i32::MIN);
 
 const BLOCKING_STREAM_BYTES: usize = 256 * 1024;
 
@@ -41,9 +45,49 @@ unsafe extern "C" fn blocking_stream_writer(_arg: usize) -> ! {
         .collect::<alloc::vec::Vec<_>>();
     let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
     let written = sender
-        .send_stream(&payload, false, Some(deadline))
+        .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        .expect("blocking TCP sender 缺少网络 socket ops")
+        .sendto(
+            &payload,
+            None,
+            vfs::net_socket::InetSendOptions {
+                nonblocking: false,
+                more: false,
+                dont_route: false,
+                confirm: false,
+                deadline_ns: Some(deadline),
+            },
+        )
         .expect("blocking TCP send 失败");
     BLOCKING_STREAM_WRITTEN.store(written, core::sync::atomic::Ordering::Release);
+    sched::kthread_finish(sched::ExitCode(0));
+}
+
+unsafe extern "C" fn blocking_detach_reader(_arg: usize) -> ! {
+    let file = DETACH_READER_FILE
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("卸载测试未安装 blocking reader");
+    let mut byte = [0u8; 1];
+    let result = file
+        .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        .expect("卸载测试 socket 缺少网络 ops")
+        .recvfrom(
+            &mut byte,
+            vfs::net_socket::InetRecvOptions {
+                nonblocking: false,
+                peek: false,
+                wait_all: false,
+                trunc: false,
+                deadline_ns: Some(sched::now_ns_public().saturating_add(5_000_000_000)),
+            },
+        );
+    let status = match result {
+        Err(error) => error.as_i32(),
+        Ok(_) => 0,
+    };
+    DETACH_READER_RESULT.store(status, core::sync::atomic::Ordering::Release);
     sched::kthread_finish(sched::ExitCode(0));
 }
 
@@ -102,12 +146,43 @@ fn wait_readable(file: &vfs::file::File) {
     wait_poll(file, vfs::file::PollEvents::POLLIN);
 }
 
+fn wait_net_worker_turn() {
+    let task = sched::current_task();
+    if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+        let wake = sched::now_ns_public().saturating_add(100_000);
+        let _ = sched::register_sleep_deadline(&task, wake);
+        drop(task);
+        sched::schedule_once(sched::now_ns_public());
+    } else {
+        let _ = sched::operation::sched_yield();
+    }
+}
+
 fn elm_socket_command(
-    command: net::stack::NetStackSocketCommandV1,
+    mut command: net::stack::NetStackSocketCommandV1,
 ) -> net::stack::NetStackSocketCommandV1 {
-    match crate::net_stack::socket_command(command) {
-        Ok(command) => command,
-        Err((error, _)) => panic!("ELM socket call 失败: {:?}", error),
+    loop {
+        command = match crate::net_stack::socket_command(command) {
+            Ok(command) => command,
+            Err((error, _)) => panic!("ELM socket call 失败: {:?}", error),
+        };
+        match &mut command {
+            net::stack::NetStackSocketCommandV1::Bind {
+                output: output @ Some(Err(net::stack::NetStackSocketErrorV1::InProgress)),
+                ..
+            } => {
+                *output = None;
+                wait_net_worker_turn();
+            }
+            net::stack::NetStackSocketCommandV1::Listen {
+                output: output @ Some(Err(net::stack::NetStackSocketErrorV1::InProgress)),
+                ..
+            } => {
+                *output = None;
+                wait_net_worker_turn();
+            }
+            _ => return command,
+        }
     }
 }
 
@@ -189,6 +264,8 @@ fn net_stack_elm_socket_table_supports_complete_call_abi() {
             data: payload.as_ptr(),
             len: payload.len() as u32,
             destination: None,
+            dont_route: false,
+            confirm: false,
             output: None,
         }),
         net::stack::NetStackSocketCommandV1::Send {
@@ -564,6 +641,25 @@ fn udp_vfs_fd_and_epoll_roundtrip() {
     .expect("创建 UDP receiver");
     let local = sockaddr_in([127, 0, 0, 1], 19_002);
     vfs::socket::bind(&context, &table, receiver, &local).expect("绑定 UDP receiver");
+    let receiver_file = table.get_file(receiver).expect("读取 UDP receiver file");
+    let receiver_proxy = receiver_file
+        .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        .expect("UDP receiver 缺少网络 socket ops")
+        .proxy();
+    assert_eq!(
+        receiver_proxy.stack_generation(),
+        net::stack::stack_snapshot().generation
+    );
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Query {
+            socket: receiver_proxy.socket_ref(),
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Query {
+            output: Some(Ok(snapshot)),
+            ..
+        } if snapshot.local.is_some_and(|endpoint| endpoint.port == 19_002)
+    ));
 
     let conflict = vfs::socket::socket(
         &context,
@@ -765,14 +861,13 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
             .expect("accept TCP child");
     assert!(peer.is_some());
 
-    let client_facade = client_file
+    let client_proxy = client_file
         .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
         .expect("TCP client 缺少网络 socket ops")
-        .facade()
-        .clone();
-    client_facade.set_buffer_limits(Some(16 * 1024), None);
+        .proxy();
+    client_proxy.set_buffer_limits(Some(16 * 1024), None);
     BLOCKING_STREAM_WRITTEN.store(usize::MAX, core::sync::atomic::Ordering::Release);
-    *BLOCKING_STREAM_SENDER.lock() = Some(client_facade.clone());
+    *BLOCKING_STREAM_SENDER.lock() = Some(alloc::sync::Arc::clone(&client_file));
     let blocking_writer = sched::kthread_create(
         blocking_stream_writer,
         0,
@@ -837,7 +932,7 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         BLOCKING_STREAM_BYTES
     );
     *BLOCKING_STREAM_SENDER.lock() = None;
-    client_facade.set_buffer_limits(Some(256 * 1024), None);
+    client_proxy.set_buffer_limits(Some(256 * 1024), None);
 
     assert_eq!(
         vfs::socket::send(&context, &table, client, b"ping", &[], None, 0),
@@ -1270,6 +1365,124 @@ fn running_loopback_detach_completes() {
     assert_eq!(
         net_runtime::remove_loopback_for_test(),
         Err(net::device::NetDeviceRemoveError::Busy),
-        "ELM-owned loopback must reject registrar-only detach"
+        "ELM 所有的 loopback 必须拒绝只经过 registrar 的卸载"
     );
+}
+
+#[ktest]
+fn net_stack_forced_reload_invalidates_old_fds_and_wakes_waiters() {
+    let (context, table) = current_vfs();
+    let old_fd = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET as usize,
+        vfs::socket::SOCK_DGRAM,
+        17,
+    )
+    .expect("创建卸载测试 UDP socket");
+    let local = sockaddr_in([127, 0, 0, 1], 19_007);
+    vfs::socket::bind(&context, &table, old_fd, &local).expect("绑定卸载测试 UDP socket");
+    let old_file = table.get_file(old_fd).expect("读取卸载测试 socket file");
+    let old_stack_instance = net::stack::stack_snapshot()
+        .handle
+        .expect("卸载测试缺少 stack handle");
+
+    DETACH_READER_RESULT.store(i32::MIN, core::sync::atomic::Ordering::Release);
+    *DETACH_READER_FILE.lock() = Some(alloc::sync::Arc::clone(&old_file));
+    let reader = sched::kthread_create(
+        blocking_detach_reader,
+        0,
+        sched::SchedParams {
+            nice: 0,
+            slice_ns: 0,
+        },
+    );
+    sched::activate_task(&reader).expect("启动卸载测试 blocking reader");
+    let sleep_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    while reader.state() != sched::TaskState::Sleeping {
+        assert!(
+            sched::now_ns_public() < sleep_deadline,
+            "blocking reader 未进入 socket wait queue"
+        );
+        let _ = sched::operation::sched_yield();
+    }
+
+    let old_cell =
+        crate::elm::detach_build_bound_module_for_test("net.stack").expect("强制卸载 net.stack");
+    assert_eq!(
+        net::stack::stack_snapshot().state,
+        net::stack::NetStackState::Absent
+    );
+    let wake_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    while DETACH_READER_RESULT.load(core::sync::atomic::Ordering::Acquire) == i32::MIN {
+        assert!(
+            sched::now_ns_public() < wake_deadline,
+            "net.stack 卸载后 blocking reader 未被唤醒"
+        );
+        let _ = sched::operation::sched_yield();
+    }
+    assert_eq!(
+        DETACH_READER_RESULT.load(core::sync::atomic::Ordering::Acquire),
+        errno::Errno::ENETDOWN.as_i32()
+    );
+    let detached_events = old_file.poll(vfs::file::PollEvents::POLLIN);
+    assert!(detached_events.has(vfs::file::PollEvents::POLLERR));
+    assert!(detached_events.has(vfs::file::PollEvents::POLLHUP));
+
+    let mut byte = [0u8; 1];
+    assert!(matches!(
+        vfs::socket::recv(
+            &table,
+            old_fd,
+            &mut byte,
+            0,
+            false,
+            vfs::socket::MSG_DONTWAIT,
+            None,
+        ),
+        Err(errno::Errno::ENETDOWN)
+    ));
+    assert!(matches!(
+        vfs::socket::socket(
+            &context,
+            &table,
+            vfs::addr::AF_INET as usize,
+            vfs::socket::SOCK_DGRAM | vfs::socket::SOCK_NONBLOCK,
+            17,
+        ),
+        Err(errno::Errno::EAFNOSUPPORT)
+    ));
+
+    let current = sched::current_task();
+    let new_cell = crate::elm::reload_build_bound_module_for_test(&current, "net.stack")
+        .expect("重新装载 net.stack");
+    assert_ne!(new_cell, old_cell);
+    let snapshot = net::stack::stack_snapshot();
+    assert_eq!(snapshot.state, net::stack::NetStackState::Active);
+    assert!(snapshot.probed);
+    assert_ne!(snapshot.handle, Some(old_stack_instance));
+
+    let new_fd = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET as usize,
+        vfs::socket::SOCK_DGRAM | vfs::socket::SOCK_NONBLOCK,
+        17,
+    )
+    .expect("reload 后创建新 UDP socket");
+    assert!(matches!(
+        vfs::socket::recv(
+            &table,
+            old_fd,
+            &mut byte,
+            0,
+            false,
+            vfs::socket::MSG_DONTWAIT,
+            None,
+        ),
+        Err(errno::Errno::ENETDOWN)
+    ));
+    table.close_fd(new_fd).expect("关闭 reload 后新 socket");
+    table.close_fd(old_fd).expect("关闭已失效旧 socket");
+    *DETACH_READER_FILE.lock() = None;
 }
