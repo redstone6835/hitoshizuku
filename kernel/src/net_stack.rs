@@ -3,16 +3,19 @@
 //! 常驻 host 负责 `net.stack` generation 生命周期和 worker-turn pinned batch 调用；
 //! packet ownership 只在完整 sidecar 通过校验后由调用方移动。
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use net::stack::{
-    NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_PROBE,
+    NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_FLOW_CALL, NET_STACK_OP_PROBE,
     NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER, NET_STACK_OP_WORKER_TURN,
-    NetStackCallV1, NetStackEndpoint, NetStackHandle, NetStackLifecycle, NetStackRegisterError,
-    NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration, NetStackRemoveError,
-    NetStackSnapshot, NetStackState, NetStackTxError, NetStackTxFragmentHeaderV1,
-    NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1, NetStackWorkerTurnV1,
+    NetStackCallV1, NetStackEndpoint, NetStackFlowCallV1, NetStackFlowCommand, NetStackHandle,
+    NetStackLifecycle, NetStackRegisterError, NetStackRegisterErrorKind, NetStackRegistrar,
+    NetStackRegistration, NetStackRemoveError, NetStackSnapshot, NetStackState, NetStackTxError,
+    NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1,
+    NetStackWorkerTurnV1,
 };
 use sched::sync::Spinlock;
 
@@ -23,7 +26,21 @@ struct KernelNetStackRegistrar;
 
 enum StackCall {
     Integrated(net::stack::IntegratedNetStackCall),
-    Pinned(Arc<Spinlock<crate::elm::PinnedNativeCall>>),
+    Pinned(Arc<PinnedStackCall>),
+}
+
+struct PinnedCallPair {
+    primary: Spinlock<crate::elm::PinnedNativeCall>,
+    nested: Spinlock<crate::elm::PinnedNativeCall>,
+}
+
+struct PinnedStackCall {
+    owner: elm_model::ElmId,
+    generation: elm_model::Generation,
+    name: Box<str>,
+    contract: Box<str>,
+    version: u32,
+    per_cpu: Spinlock<Vec<Option<Arc<PinnedCallPair>>>>,
 }
 
 impl Clone for StackCall {
@@ -43,10 +60,859 @@ impl StackCall {
     ) -> Result<i32, i32> {
         match self {
             Self::Integrated(call) => Ok(call(frame)),
-            Self::Pinned(call) => {
-                let deadline = sched::now_ns_public().saturating_add(2_000_000);
-                crate::elm::invoke_pinned_native(&call.lock(), frame, host_ranges, deadline)
+            Self::Pinned(call) => call.invoke(frame, host_ranges),
+        }
+    }
+}
+
+impl PinnedStackCall {
+    fn new(endpoint: &net::stack::PinnedNetStackEndpoint) -> Result<Self, ()> {
+        let owner = elm_model::ElmId(endpoint.owner_cell());
+        let generation = elm_model::Generation(endpoint.owner_generation());
+        let name: Box<str> = endpoint.export_name().into();
+        let contract: Box<str> = endpoint.export_contract().into();
+        let version = endpoint.export_version();
+        let mut per_cpu = Vec::new();
+        per_cpu.try_reserve_exact(sched::NR_CPUS).map_err(|_| ())?;
+        per_cpu.resize_with(sched::NR_CPUS, || None);
+        let current_cpu = sched::current_cpu_id();
+        if current_cpu >= sched::NR_CPUS {
+            return Err(());
+        }
+        per_cpu[current_cpu] = Some(Arc::new(Self::new_pair(
+            owner, generation, &name, &contract, version,
+        )?));
+        Ok(Self {
+            owner,
+            generation,
+            name,
+            contract,
+            version,
+            per_cpu: Spinlock::new(per_cpu),
+        })
+    }
+
+    fn new_pair(
+        owner: elm_model::ElmId,
+        generation: elm_model::Generation,
+        name: &str,
+        contract: &str,
+        version: u32,
+    ) -> Result<PinnedCallPair, ()> {
+        let primary = crate::elm::PinnedNativeCall::new(
+            owner,
+            generation,
+            name,
+            contract,
+            version,
+            NET_STACK_CALL_RUST_ABI,
+        )
+        .map_err(|_| ())?;
+        let nested = crate::elm::PinnedNativeCall::new(
+            owner,
+            generation,
+            name,
+            contract,
+            version,
+            NET_STACK_CALL_RUST_ABI,
+        )
+        .map_err(|_| ())?;
+        Ok(PinnedCallPair {
+            primary: Spinlock::new(primary),
+            nested: Spinlock::new(nested),
+        })
+    }
+
+    fn current_pair(&self) -> Result<Arc<PinnedCallPair>, i32> {
+        let cpu = sched::current_cpu_id();
+        if cpu >= sched::NR_CPUS {
+            return Err(elm_model::ELM_MGR_STATUS_BUSY);
+        }
+        if let Some(pair) = self.per_cpu.lock()[cpu].as_ref().map(Arc::clone) {
+            return Ok(pair);
+        }
+        let pair = Arc::new(
+            Self::new_pair(
+                self.owner,
+                self.generation,
+                &self.name,
+                &self.contract,
+                self.version,
+            )
+            .map_err(|_| elm_model::ELM_MGR_STATUS_BUSY)?,
+        );
+        let mut per_cpu = self.per_cpu.lock();
+        if let Some(existing) = per_cpu[cpu].as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        per_cpu[cpu] = Some(Arc::clone(&pair));
+        Ok(pair)
+    }
+
+    fn invoke(
+        &self,
+        frame: &mut NetStackCallV1,
+        host_ranges: &[(usize, usize)],
+    ) -> Result<i32, i32> {
+        let pair = self.current_pair()?;
+        let deadline = sched::now_ns_public().saturating_add(2_000_000);
+        if let Some(call) = pair.primary.try_lock() {
+            return crate::elm::invoke_pinned_native(&call, frame, host_ranges, deadline);
+        }
+        if let Some(call) = pair.nested.try_lock() {
+            return crate::elm::invoke_pinned_native(&call, frame, host_ranges, deadline);
+        }
+        Err(elm_model::ELM_MGR_STATUS_BUSY)
+    }
+}
+
+impl ElmFlowShard {
+    pub(crate) const fn new(id: net::ShardId) -> Self {
+        Self { id }
+    }
+
+    fn invoke(
+        &self,
+        command: NetStackFlowCommand,
+        extra_ranges: &[(usize, usize)],
+    ) -> Result<NetStackFlowCommand, (FlowCallError, NetStackFlowCommand)> {
+        let (generation, call) = {
+            let broker = BROKER.lock();
+            let snapshot = broker.lifecycle.snapshot();
+            if snapshot.state != NetStackState::Active || !snapshot.probed {
+                return Err((FlowCallError::StackUnavailable, command));
             }
+            let Some(record) = broker.record.as_ref() else {
+                return Err((FlowCallError::StackUnavailable, command));
+            };
+            (record.generation, record.call.clone())
+        };
+        let mut flow = NetStackFlowCallV1::new(generation, self.id, command);
+        let pointer = &mut flow as *mut NetStackFlowCallV1;
+        let Some(flow_range) = host_range(pointer) else {
+            return Err((FlowCallError::CallFailed, flow.command));
+        };
+        if extra_ranges.len() > 2 {
+            return Err((FlowCallError::CallFailed, flow.command));
+        }
+        let mut ranges = [(0usize, 0usize); 3];
+        ranges[0] = flow_range;
+        ranges[1..extra_ranges.len() + 1].copy_from_slice(extra_ranges);
+        let mut frame = NetStackCallV1::new(NET_STACK_OP_FLOW_CALL, generation);
+        frame.reserved1[0] = pointer as usize as u64;
+        let result = call.invoke(&mut frame, &ranges[..extra_ranges.len() + 1]);
+        let valid = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
+            && frame.valid(NET_STACK_OP_FLOW_CALL, generation)
+            && frame.reserved1[0] == pointer as usize as u64
+            && frame.ready == 0
+            && frame.quiesced == 0
+            && flow.committed == 1;
+        if valid {
+            return Ok(flow.command);
+        }
+        Err((FlowCallError::CallFailed, flow.command))
+    }
+
+    fn invoke_no_ranges(
+        &self,
+        command: NetStackFlowCommand,
+    ) -> Result<NetStackFlowCommand, (FlowCallError, NetStackFlowCommand)> {
+        self.invoke(command, &[])
+    }
+
+    pub(crate) fn stats(&self) -> net::flow::FlowShardStats {
+        let command = NetStackFlowCommand::Stats { output: None };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::Stats {
+                output: Some(stats),
+            }) => stats,
+            _ => net::flow::FlowShardStats::default(),
+        }
+    }
+
+    pub(crate) fn run_due_timers(&self, now_ns: u64) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::RunDueTimers { now_ns });
+    }
+
+    pub(crate) fn next_timer_deadline_ns(&self) -> Option<u64> {
+        match self.invoke_no_ranges(NetStackFlowCommand::NextTimerDeadline { output: None }) {
+            Ok(NetStackFlowCommand::NextTimerDeadline {
+                output: Some(deadline),
+            }) => deadline,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_blocked_tcp_output(&self) -> bool {
+        match self.invoke_no_ranges(NetStackFlowCommand::HasBlockedTcpOutput { output: None }) {
+            Ok(NetStackFlowCommand::HasBlockedTcpOutput {
+                output: Some(blocked),
+            }) => blocked,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn bind_udp(
+        &self,
+        local: net::Endpoint,
+        peer: Option<net::Endpoint>,
+        interface: Option<net::InterfaceId>,
+    ) -> Result<net::FlowId, net::transport::UdpBindError> {
+        let command = NetStackFlowCommand::BindUdp {
+            local,
+            peer,
+            interface,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::BindUdp {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::UdpBindError::FlowTableFull),
+        }
+    }
+
+    pub(crate) fn bind_udp_facade(
+        &self,
+        local: net::Endpoint,
+        peer: Option<net::Endpoint>,
+        interface: Option<net::InterfaceId>,
+        facade: Arc<net::SocketFacade>,
+        free_bind: bool,
+        accepts_ipv4: bool,
+    ) -> Result<net::FlowId, net::transport::UdpBindError> {
+        let command = NetStackFlowCommand::BindUdpFacade {
+            local,
+            peer,
+            interface,
+            facade,
+            free_bind,
+            accepts_ipv4,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::BindUdpFacade {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::UdpBindError::FlowTableFull),
+        }
+    }
+
+    pub(crate) fn reconnect_udp_facade(
+        &self,
+        flow: net::FlowId,
+        local: net::Endpoint,
+        peer: net::Endpoint,
+        facade: Arc<net::SocketFacade>,
+    ) -> Result<net::FlowId, net::transport::UdpBindError> {
+        let command = NetStackFlowCommand::ReconnectUdpFacade {
+            flow,
+            local,
+            peer,
+            facade,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::ReconnectUdpFacade {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::UdpBindError::FlowTableFull),
+        }
+    }
+
+    pub(crate) fn close_udp(&self, flow: net::FlowId) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::CloseUdp { flow });
+    }
+
+    pub(crate) fn bind_raw_facade(
+        &self,
+        local: net::IpAddr,
+        interface: Option<net::InterfaceId>,
+        facade: Arc<net::SocketFacade>,
+        free_bind: bool,
+    ) -> Result<net::FlowId, net::transport::RawBindError> {
+        let command = NetStackFlowCommand::BindRawFacade {
+            local,
+            interface,
+            facade,
+            free_bind,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::BindRawFacade {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::RawBindError::TableFull),
+        }
+    }
+
+    pub(crate) fn close_raw(&self, flow: net::FlowId) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::CloseRaw { flow });
+    }
+
+    pub(crate) fn listen_tcp(
+        &self,
+        local: net::Endpoint,
+        interface: Option<net::InterfaceId>,
+        group: Arc<net::ListenGroup>,
+    ) -> Result<(), net::transport::TcpBindError> {
+        let command = NetStackFlowCommand::ListenTcp {
+            local,
+            interface,
+            group,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::ListenTcp {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::TcpBindError::Full),
+        }
+    }
+
+    pub(crate) fn connect_tcp(
+        &self,
+        local: net::Endpoint,
+        remote: net::Endpoint,
+        path: net::transport::TcpPath,
+        facade: Arc<net::SocketFacade>,
+        control_sequence: u64,
+        now_ns: u64,
+    ) -> Result<net::FlowId, net::transport::TcpBindError> {
+        let command = NetStackFlowCommand::ConnectTcp {
+            local,
+            remote,
+            path,
+            facade,
+            control_sequence,
+            now_ns,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::ConnectTcp {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::TcpBindError::Full),
+        }
+    }
+
+    pub(crate) fn close_tcp(&self, flow: net::FlowId, now_ns: u64) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::CloseTcp { flow, now_ns });
+    }
+
+    pub(crate) fn abort_tcp(&self, flow: net::FlowId, now_ns: u64) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::AbortTcp { flow, now_ns });
+    }
+
+    pub(crate) fn shutdown_tcp_write(&self, flow: net::FlowId, now_ns: u64) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::ShutdownTcpWrite { flow, now_ns });
+    }
+
+    pub(crate) fn close_tcp_listener(&self, group: net::ListenGroupId) -> bool {
+        match self.invoke_no_ranges(NetStackFlowCommand::CloseTcpListener {
+            group,
+            output: None,
+        }) {
+            Ok(NetStackFlowCommand::CloseTcpListener {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn drain_tcp_send(&self, flow: net::FlowId, now_ns: u64) {
+        let _ = self.invoke_no_ranges(NetStackFlowCommand::DrainTcpSend { flow, now_ns });
+    }
+
+    pub(crate) fn take_tcp_output(&self) -> Option<net::transport::PreparedTcpTx> {
+        match self.invoke_no_ranges(NetStackFlowCommand::TakeTcpOutput { output: None }) {
+            Ok(NetStackFlowCommand::TakeTcpOutput {
+                output: Some(result),
+            }) => result,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn resume_tcp_output(&self, now_ns: u64, budget: usize) -> usize {
+        match self.invoke_no_ranges(NetStackFlowCommand::ResumeTcpOutput {
+            now_ns,
+            budget,
+            output: None,
+        }) {
+            Ok(NetStackFlowCommand::ResumeTcpOutput {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn resolve_tcp_path(
+        &self,
+        destination: net::IpAddr,
+        bound_source: Option<net::IpAddr>,
+        interface: Option<net::InterfaceId>,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+        free_bind: bool,
+    ) -> Result<net::transport::TcpPath, net::SocketError> {
+        let Some(config_range) = host_range(config) else {
+            return Err(net::SocketError::NetworkUnreachable);
+        };
+        let command = NetStackFlowCommand::ResolveTcpPath {
+            destination,
+            bound_source,
+            interface,
+            config: config as *const _,
+            now_ns,
+            free_bind,
+            output: None,
+        };
+        match self.invoke(command, &[config_range]) {
+            Ok(NetStackFlowCommand::ResolveTcpPath {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::SocketError::NetworkUnreachable),
+        }
+    }
+
+    pub(crate) fn refresh_tcp_tx_path(
+        &self,
+        work: &mut net::transport::PreparedTcpTx,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+    ) -> Result<(), net::SocketError> {
+        let pointer = work as *mut net::transport::PreparedTcpTx;
+        let Some(range) = host_range(pointer) else {
+            return Err(net::SocketError::Buffer);
+        };
+        let Some(config_range) = host_range(config) else {
+            return Err(net::SocketError::NetworkUnreachable);
+        };
+        let command = NetStackFlowCommand::RefreshTcpTxPath {
+            work: pointer,
+            config: config as *const _,
+            now_ns,
+            output: None,
+        };
+        match self.invoke(command, &[range, config_range]) {
+            Ok(NetStackFlowCommand::RefreshTcpTxPath {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::SocketError::NetworkUnreachable),
+        }
+    }
+
+    pub(crate) fn process_local_tcp(
+        &self,
+        interface: net::InterfaceId,
+        path: net::transport::TcpPath,
+        key: net::flow::FlowKey,
+        packet: net::transport::TcpPacket,
+        payload: Option<&net::TcpTxLease>,
+        now_ns: u64,
+    ) -> Result<net::FlowId, net::transport::TcpIngressError> {
+        let pointer = payload.map_or(core::ptr::null(), |payload| payload as *const _);
+        let mut ranges = [(0usize, 0usize); 1];
+        let range_count = if let Some(payload) = payload {
+            let Some(range) = host_range(payload) else {
+                return Err(net::transport::TcpIngressError::Malformed);
+            };
+            ranges[0] = range;
+            1
+        } else {
+            0
+        };
+        let command = NetStackFlowCommand::ProcessLocalTcp {
+            interface,
+            path,
+            key,
+            packet,
+            payload: pointer,
+            now_ns,
+            output: None,
+        };
+        match self.invoke(command, &ranges[..range_count]) {
+            Ok(NetStackFlowCommand::ProcessLocalTcp {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::TcpIngressError::NoEndpoint),
+        }
+    }
+
+    pub(crate) fn process_local_udp(
+        &self,
+        interface: net::InterfaceId,
+        source: net::Endpoint,
+        destination: net::Endpoint,
+        payload: &net::UdpTxLease,
+        hop_limit: u8,
+        traffic_class: u8,
+        now_ns: u64,
+    ) -> Result<net::FlowId, net::transport::LocalUdpIngressError> {
+        let Some(range) = host_range(payload) else {
+            return Err(net::transport::LocalUdpIngressError::Unsupported);
+        };
+        let command = NetStackFlowCommand::ProcessLocalUdp {
+            interface,
+            source,
+            destination,
+            payload: payload as *const _,
+            hop_limit,
+            traffic_class,
+            now_ns,
+            output: None,
+        };
+        match self.invoke(command, &[range]) {
+            Ok(NetStackFlowCommand::ProcessLocalUdp {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => Err(net::transport::LocalUdpIngressError::Unsupported),
+        }
+    }
+
+    pub(crate) fn invalidate_interface(&self, interface: net::InterfaceId) -> usize {
+        match self.invoke_no_ranges(NetStackFlowCommand::InvalidateInterface {
+            interface,
+            output: None,
+        }) {
+            Ok(NetStackFlowCommand::InvalidateInterface {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn observe_neighbor(
+        &self,
+        key: net::control::NeighborKey,
+        mac_address: [u8; 6],
+        now_ns: u64,
+    ) -> bool {
+        match self.invoke_no_ranges(NetStackFlowCommand::ObserveNeighbor {
+            key,
+            mac_address,
+            now_ns,
+            output: None,
+        }) {
+            Ok(NetStackFlowCommand::ObserveNeighbor {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn lookup_neighbor(
+        &self,
+        key: net::control::NeighborKey,
+        now_ns: u64,
+    ) -> Option<[u8; 6]> {
+        match self.invoke_no_ranges(NetStackFlowCommand::LookupNeighbor {
+            key,
+            now_ns,
+            output: None,
+        }) {
+            Ok(NetStackFlowCommand::LookupNeighbor {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prepare_udp_tx(
+        &self,
+        flow: net::FlowId,
+        payload: net::UdpTxLease,
+        mark: u32,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+    ) -> Result<net::transport::PreparedUdpTx, (net::SocketError, net::UdpTxLease)> {
+        let Some(config_range) = host_range(config) else {
+            return Err((net::SocketError::NetworkUnreachable, payload));
+        };
+        let command = NetStackFlowCommand::PrepareUdpTx {
+            flow,
+            payload: Some(payload),
+            mark,
+            config: config as *const _,
+            now_ns,
+            output: None,
+        };
+        match self.invoke(command, &[config_range]) {
+            Ok(NetStackFlowCommand::PrepareUdpTx {
+                output: Some(result),
+                ..
+            }) => result,
+            Ok(NetStackFlowCommand::PrepareUdpTx {
+                payload: Some(payload),
+                ..
+            }) => Err((net::SocketError::RuntimeBusy, payload)),
+            Err((
+                _,
+                NetStackFlowCommand::PrepareUdpTx {
+                    payload: Some(payload),
+                    ..
+                },
+            )) => Err((net::SocketError::RuntimeBusy, payload)),
+            _ => panic!("net.stack flow call 丢失 UDP payload"),
+        }
+    }
+
+    pub(crate) fn prepare_raw_tx(
+        &self,
+        flow: net::FlowId,
+        payload: net::UdpTxLease,
+        mark: u32,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+    ) -> Result<net::transport::PreparedRawTx, (net::SocketError, net::UdpTxLease)> {
+        let Some(config_range) = host_range(config) else {
+            return Err((net::SocketError::NetworkUnreachable, payload));
+        };
+        let command = NetStackFlowCommand::PrepareRawTx {
+            flow,
+            payload: Some(payload),
+            mark,
+            config: config as *const _,
+            now_ns,
+            output: None,
+        };
+        match self.invoke(command, &[config_range]) {
+            Ok(NetStackFlowCommand::PrepareRawTx {
+                output: Some(result),
+                ..
+            }) => result,
+            Ok(NetStackFlowCommand::PrepareRawTx {
+                payload: Some(payload),
+                ..
+            }) => Err((net::SocketError::RuntimeBusy, payload)),
+            Err((
+                _,
+                NetStackFlowCommand::PrepareRawTx {
+                    payload: Some(payload),
+                    ..
+                },
+            )) => Err((net::SocketError::RuntimeBusy, payload)),
+            _ => panic!("net.stack flow call 丢失 raw payload"),
+        }
+    }
+
+    pub(crate) fn form_udp_packet(
+        &self,
+        flow: net::FlowId,
+        destination: Option<net::Endpoint>,
+        payload: net::buf::PacketChain,
+        mark: u32,
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+    ) -> Result<net::buf::TxPacket, net::flow::UdpSendFailure> {
+        let Some(config_range) = host_range(config) else {
+            return Err(net::flow::UdpSendFailure {
+                error: net::flow::UdpSendError::Route(net::control::ConfigError::NoRoute),
+                payload,
+            });
+        };
+        let command = NetStackFlowCommand::FormUdpPacket {
+            flow,
+            destination,
+            payload: Some(payload),
+            mark,
+            config: config as *const _,
+            now_ns,
+            output: None,
+        };
+        match self.invoke(command, &[config_range]) {
+            Ok(NetStackFlowCommand::FormUdpPacket {
+                output: Some(result),
+                ..
+            }) => result,
+            Ok(NetStackFlowCommand::FormUdpPacket {
+                payload: Some(payload),
+                ..
+            }) => Err(net::flow::UdpSendFailure {
+                error: net::flow::UdpSendError::Route(net::control::ConfigError::NoRoute),
+                payload,
+            }),
+            Err((
+                _,
+                NetStackFlowCommand::FormUdpPacket {
+                    payload: Some(payload),
+                    ..
+                },
+            )) => Err(net::flow::UdpSendFailure {
+                error: net::flow::UdpSendError::Route(net::control::ConfigError::NoRoute),
+                payload,
+            }),
+            _ => panic!("net.stack flow call 丢失 UDP payload"),
+        }
+    }
+
+    pub(crate) fn recv_udp(&self, flow: net::FlowId) -> Option<net::transport::UdpDatagram> {
+        match self.invoke_no_ranges(NetStackFlowCommand::RecvUdp { flow, output: None }) {
+            Ok(NetStackFlowCommand::RecvUdp {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn push_frontend_batch(&self, packets: Vec<net::pipeline::FrontendPacket>) {
+        let command = NetStackFlowCommand::PushFrontendBatch {
+            packets: Some(packets),
+        };
+        let _ = self.invoke_no_ranges(command);
+    }
+
+    pub(crate) fn process_frontend_batch(
+        &self,
+        interface: net::InterfaceId,
+        local_mac: [u8; 6],
+        config: &net::control::ConfigSnapshot,
+        now_ns: u64,
+        tx: &mut net::buf::TxBatch,
+        recycle: &mut net::buf::PacketBatch,
+    ) -> [u32; net::buf::DropReason::COUNT] {
+        let Some(config_range) = host_range(config) else {
+            return [0; net::buf::DropReason::COUNT];
+        };
+        let command = NetStackFlowCommand::ProcessFrontendBatch {
+            interface,
+            local_mac,
+            config: config as *const _,
+            now_ns,
+            output: None,
+            drop_counts: [0; net::buf::DropReason::COUNT],
+        };
+        let command = match self.invoke(command, &[config_range]) {
+            Ok(command) => command,
+            Err((_, command)) => command,
+        };
+        let NetStackFlowCommand::ProcessFrontendBatch {
+            output: Some((mut formed, mut recycled)),
+            drop_counts,
+            ..
+        } = command
+        else {
+            return [0; net::buf::DropReason::COUNT];
+        };
+        for index in 0..formed.len() {
+            let Some(packet) = formed.take(index) else {
+                continue;
+            };
+            if let Err(packet) = tx.push(packet) {
+                let _ = recycle.push(packet.chain, net::buf::PacketMetadata::default());
+            }
+        }
+        for index in 0..recycled.len() {
+            let Some((packet, metadata)) = recycled.take(index) else {
+                continue;
+            };
+            let _ = recycle.push(packet, metadata);
+        }
+        drop_counts
+    }
+
+    pub(crate) fn take_reassembled_input(&self) -> Option<net::buf::PacketBatch> {
+        match self.invoke_no_ranges(NetStackFlowCommand::TakeReassembledInput { output: None }) {
+            Ok(NetStackFlowCommand::TakeReassembledInput {
+                output: Some(result),
+            }) => result,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn parse_reassembled(
+        &self,
+        input: net::buf::PacketBatch,
+        turn: &NetStackWorkerTurnV1,
+    ) -> Result<(), net::buf::PacketBatch> {
+        let ethernet = turn.ethernet().to_vec();
+        let network = turn.network().to_vec();
+        let transport = turn.transport().to_vec();
+        let command = NetStackFlowCommand::ParseReassembled {
+            input: Some(input),
+            ethernet,
+            network,
+            transport,
+            output: None,
+        };
+        match self.invoke_no_ranges(command) {
+            Ok(NetStackFlowCommand::ParseReassembled {
+                output: Some(result),
+                ..
+            }) => result,
+            Ok(NetStackFlowCommand::ParseReassembled {
+                input: Some(input), ..
+            }) => Err(input),
+            Err((
+                _,
+                NetStackFlowCommand::ParseReassembled {
+                    input: Some(input), ..
+                },
+            )) => Err(input),
+            _ => panic!("net.stack flow call 丢失 reassembly batch"),
+        }
+    }
+
+    pub(crate) fn take_reassembled(&self) -> Option<net::pipeline::FrontendPacket> {
+        match self.invoke_no_ranges(NetStackFlowCommand::TakeReassembled { output: None }) {
+            Ok(NetStackFlowCommand::TakeReassembled {
+                output: Some(result),
+            }) => result,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_forwarded_error(
+        &self,
+    ) -> Option<(
+        net::InterfaceId,
+        net::transport::ControlErrorTarget,
+        net::transport::TransportControlError,
+        u64,
+    )> {
+        match self.invoke_no_ranges(NetStackFlowCommand::TakeForwardedError { output: None }) {
+            Ok(NetStackFlowCommand::TakeForwardedError {
+                output: Some(result),
+            }) => result,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_transport_error(
+        &self,
+        interface: net::InterfaceId,
+        target: net::transport::ControlErrorTarget,
+        error: net::transport::TransportControlError,
+        now_ns: u64,
+    ) -> bool {
+        match self.invoke_no_ranges(NetStackFlowCommand::ApplyTransportError {
+            interface,
+            target,
+            error,
+            now_ns,
+            output: None,
+        }) {
+            Ok(NetStackFlowCommand::ApplyTransportError {
+                output: Some(result),
+                ..
+            }) => result,
+            _ => false,
         }
     }
 }
@@ -60,6 +926,16 @@ struct StackRecord {
 struct KernelNetStackBroker {
     lifecycle: NetStackLifecycle,
     record: Option<StackRecord>,
+}
+
+pub(crate) struct ElmFlowShard {
+    id: net::ShardId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowCallError {
+    StackUnavailable,
+    CallFailed,
 }
 
 impl KernelNetStackBroker {
@@ -77,16 +953,8 @@ impl KernelNetStackBroker {
             }
             NetStackEndpoint::Integrated(_) => Err(()),
             NetStackEndpoint::Pinned(endpoint) => {
-                let call = crate::elm::PinnedNativeCall::new(
-                    elm_model::ElmId(endpoint.owner_cell()),
-                    elm_model::Generation(endpoint.owner_generation()),
-                    endpoint.export_name(),
-                    endpoint.export_contract(),
-                    endpoint.export_version(),
-                    NET_STACK_CALL_RUST_ABI,
-                )
-                .map_err(|_| ())?;
-                Ok(StackCall::Pinned(Arc::new(Spinlock::new(call))))
+                let call = PinnedStackCall::new(endpoint)?;
+                Ok(StackCall::Pinned(Arc::new(call)))
             }
         }
     }

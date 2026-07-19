@@ -1,13 +1,27 @@
 //! 网络协议栈 ELM 与常驻 host 之间的生命周期契约。
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
 use crate::boot::NetStackBootConfig;
-use crate::buf::{DropReason, PacketBatch, PacketChain};
+use crate::buf::{DropReason, PacketBatch, PacketChain, TxBatch, TxPacket};
+use crate::control::{ConfigSnapshot, NeighborKey};
+use crate::flow::{FlowKey, FlowShard, FlowShardStats, UdpSendFailure};
+use crate::pipeline::FrontendPacket;
+use crate::transport::{
+    ControlErrorTarget, LocalUdpIngressError, PreparedRawTx, PreparedTcpTx, PreparedUdpTx,
+    RawBindError, TcpBindError, TcpIngressError, TcpPacket, TcpPath, TransportControlError,
+    UdpBindError, UdpDatagram,
+};
 use crate::tuning::PACKET_BATCH_CAPACITY;
+use crate::{
+    Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId, SocketError,
+    SocketFacade, TcpTxLease, UdpTxLease,
+};
 
 static NEXT_STACK_HANDLE: AtomicU64 = AtomicU64::new(1);
 static STACK_BOOT_CONFIG: Mutex<Option<NetStackBootConfig>> = Mutex::new(None);
@@ -23,9 +37,11 @@ pub const NET_STACK_OP_WORKER_TURN: u32 = 2;
 pub const NET_STACK_OP_QUIESCE: u32 = 3;
 pub const NET_STACK_OP_TX_HEADER: u32 = 4;
 pub const NET_STACK_OP_TX_FRAGMENT_HEADER: u32 = 5;
+pub const NET_STACK_OP_FLOW_CALL: u32 = 6;
 
 pub const NET_STACK_WORKER_TURN_ABI_VERSION: u16 = 1;
 pub const NET_STACK_TX_HEADER_ABI_VERSION: u16 = 1;
+pub const NET_STACK_FLOW_CALL_ABI_VERSION: u16 = 1;
 pub const NET_STACK_TX_HEADER_CAPACITY: usize = 128;
 pub const NET_STACK_TX_UDP: u8 = 1;
 pub const NET_STACK_TX_TCP: u8 = 2;
@@ -1458,6 +1474,625 @@ impl NetStackWorkerTurnV1 {
     }
 }
 
+/// host 与 `net.stack` ELM 之间的 shard 状态操作。
+///
+/// 该枚举只在与内核 build-bound 的 Rust ABI 调用中使用；拥有所有权的输入放在
+/// `Option` 中，ELM 仅在确认 generation 与 shard 后取走。
+pub enum NetStackFlowCommand {
+    Stats {
+        output: Option<FlowShardStats>,
+    },
+    RunDueTimers {
+        now_ns: u64,
+    },
+    NextTimerDeadline {
+        output: Option<Option<u64>>,
+    },
+    HasBlockedTcpOutput {
+        output: Option<bool>,
+    },
+    BindUdp {
+        local: Endpoint,
+        peer: Option<Endpoint>,
+        interface: Option<InterfaceId>,
+        output: Option<Result<FlowId, UdpBindError>>,
+    },
+    BindUdpFacade {
+        local: Endpoint,
+        peer: Option<Endpoint>,
+        interface: Option<InterfaceId>,
+        facade: Arc<SocketFacade>,
+        free_bind: bool,
+        accepts_ipv4: bool,
+        output: Option<Result<FlowId, UdpBindError>>,
+    },
+    ReconnectUdpFacade {
+        flow: FlowId,
+        local: Endpoint,
+        peer: Endpoint,
+        facade: Arc<SocketFacade>,
+        output: Option<Result<FlowId, UdpBindError>>,
+    },
+    CloseUdp {
+        flow: FlowId,
+    },
+    BindRawFacade {
+        local: IpAddr,
+        interface: Option<InterfaceId>,
+        facade: Arc<SocketFacade>,
+        free_bind: bool,
+        output: Option<Result<FlowId, RawBindError>>,
+    },
+    CloseRaw {
+        flow: FlowId,
+    },
+    ListenTcp {
+        local: Endpoint,
+        interface: Option<InterfaceId>,
+        group: Arc<ListenGroup>,
+        output: Option<Result<(), TcpBindError>>,
+    },
+    ConnectTcp {
+        local: Endpoint,
+        remote: Endpoint,
+        path: TcpPath,
+        facade: Arc<SocketFacade>,
+        control_sequence: u64,
+        now_ns: u64,
+        output: Option<Result<FlowId, TcpBindError>>,
+    },
+    CloseTcp {
+        flow: FlowId,
+        now_ns: u64,
+    },
+    AbortTcp {
+        flow: FlowId,
+        now_ns: u64,
+    },
+    ShutdownTcpWrite {
+        flow: FlowId,
+        now_ns: u64,
+    },
+    CloseTcpListener {
+        group: ListenGroupId,
+        output: Option<bool>,
+    },
+    DrainTcpSend {
+        flow: FlowId,
+        now_ns: u64,
+    },
+    TakeTcpOutput {
+        output: Option<Option<PreparedTcpTx>>,
+    },
+    ResumeTcpOutput {
+        now_ns: u64,
+        budget: usize,
+        output: Option<usize>,
+    },
+    ResolveTcpPath {
+        destination: IpAddr,
+        bound_source: Option<IpAddr>,
+        interface: Option<InterfaceId>,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        free_bind: bool,
+        output: Option<Result<TcpPath, SocketError>>,
+    },
+    RefreshTcpTxPath {
+        work: *mut PreparedTcpTx,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<Result<(), SocketError>>,
+    },
+    ProcessLocalTcp {
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        packet: TcpPacket,
+        payload: *const TcpTxLease,
+        now_ns: u64,
+        output: Option<Result<FlowId, TcpIngressError>>,
+    },
+    ProcessLocalUdp {
+        interface: InterfaceId,
+        source: Endpoint,
+        destination: Endpoint,
+        payload: *const UdpTxLease,
+        hop_limit: u8,
+        traffic_class: u8,
+        now_ns: u64,
+        output: Option<Result<FlowId, LocalUdpIngressError>>,
+    },
+    InvalidateInterface {
+        interface: InterfaceId,
+        output: Option<usize>,
+    },
+    ObserveNeighbor {
+        key: NeighborKey,
+        mac_address: [u8; 6],
+        now_ns: u64,
+        output: Option<bool>,
+    },
+    LookupNeighbor {
+        key: NeighborKey,
+        now_ns: u64,
+        output: Option<Option<[u8; 6]>>,
+    },
+    PrepareUdpTx {
+        flow: FlowId,
+        payload: Option<UdpTxLease>,
+        mark: u32,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<Result<PreparedUdpTx, (SocketError, UdpTxLease)>>,
+    },
+    PrepareRawTx {
+        flow: FlowId,
+        payload: Option<UdpTxLease>,
+        mark: u32,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<Result<PreparedRawTx, (SocketError, UdpTxLease)>>,
+    },
+    FormUdpPacket {
+        flow: FlowId,
+        destination: Option<Endpoint>,
+        payload: Option<PacketChain>,
+        mark: u32,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<Result<TxPacket, UdpSendFailure>>,
+    },
+    RecvUdp {
+        flow: FlowId,
+        output: Option<Option<UdpDatagram>>,
+    },
+    PushFrontendBatch {
+        packets: Option<Vec<FrontendPacket>>,
+    },
+    ProcessFrontendBatch {
+        interface: InterfaceId,
+        local_mac: [u8; 6],
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<(TxBatch, PacketBatch)>,
+        drop_counts: [u32; DropReason::COUNT],
+    },
+    TakeReassembledInput {
+        output: Option<Option<PacketBatch>>,
+    },
+    ParseReassembled {
+        input: Option<PacketBatch>,
+        ethernet: Vec<NetStackEthernetV1>,
+        network: Vec<NetStackNetworkV1>,
+        transport: Vec<NetStackTransportV1>,
+        output: Option<Result<(), PacketBatch>>,
+    },
+    TakeReassembled {
+        output: Option<Option<FrontendPacket>>,
+    },
+    TakeForwardedError {
+        output: Option<Option<(InterfaceId, ControlErrorTarget, TransportControlError, u64)>>,
+    },
+    ApplyTransportError {
+        interface: InterfaceId,
+        target: ControlErrorTarget,
+        error: TransportControlError,
+        now_ns: u64,
+        output: Option<bool>,
+    },
+}
+
+/// 一次代际固定的 `FlowShard` 状态调用。
+#[repr(C)]
+pub struct NetStackFlowCallV1 {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub struct_size: u32,
+    pub generation: u64,
+    pub shard: ShardId,
+    pub committed: u8,
+    pub reserved1: [u8; 5],
+    pub command: NetStackFlowCommand,
+}
+
+#[kernel_symbols::export]
+impl NetStackFlowCallV1 {
+    pub fn new(generation: u64, shard: ShardId, command: NetStackFlowCommand) -> Self {
+        Self {
+            abi_version: NET_STACK_FLOW_CALL_ABI_VERSION,
+            reserved0: 0,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            generation,
+            shard,
+            committed: 0,
+            reserved1: [0; 5],
+            command,
+        }
+    }
+
+    #[kernel_symbols::export(
+        name = "net.stack.NetStackFlowCallV1.valid_header",
+        contract = "kernel.net.stack-flow-state@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::NETWORK_STACK
+    )]
+    pub fn valid_header(&self, generation: u64) -> bool {
+        self.abi_version == NET_STACK_FLOW_CALL_ABI_VERSION
+            && self.reserved0 == 0
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.generation == generation
+            && self.committed == 0
+            && self.reserved1 == [0; 5]
+    }
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.create_flow_shard",
+    contract = "kernel.net.stack-flow-state@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn create_flow_shard(id: ShardId, boot: NetStackBootConfig, now_ns: u64) -> FlowShard {
+    let mut generation_bytes = [0; 4];
+    generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
+    FlowShard::new(
+        id,
+        *boot.rss_key(),
+        u32::from_le_bytes(generation_bytes).max(1),
+        *boot.hash_seed(),
+        *boot.tcp_isn_key(),
+        now_ns,
+    )
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.destroy_flow_shard",
+    contract = "kernel.net.stack-flow-state@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn destroy_flow_shard(shard: FlowShard) {
+    drop(shard);
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.dispatch_flow_shard_call",
+    contract = "kernel.net.stack-flow-state@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn dispatch_flow_shard_call(shard: &mut FlowShard, call: &mut NetStackFlowCallV1) -> bool {
+    match &mut call.command {
+        NetStackFlowCommand::Stats { output } => *output = Some(shard.stats()),
+        NetStackFlowCommand::RunDueTimers { now_ns } => shard.run_due_timers(*now_ns),
+        NetStackFlowCommand::NextTimerDeadline { output } => {
+            *output = Some(shard.next_timer_deadline_ns());
+        }
+        NetStackFlowCommand::HasBlockedTcpOutput { output } => {
+            *output = Some(shard.has_blocked_tcp_output());
+        }
+        NetStackFlowCommand::BindUdp {
+            local,
+            peer,
+            interface,
+            output,
+        } => *output = Some(shard.bind_udp(*local, *peer, *interface)),
+        NetStackFlowCommand::BindUdpFacade {
+            local,
+            peer,
+            interface,
+            facade,
+            free_bind,
+            accepts_ipv4,
+            output,
+        } => {
+            *output = Some(shard.bind_udp_facade(
+                *local,
+                *peer,
+                *interface,
+                Arc::clone(facade),
+                *free_bind,
+                *accepts_ipv4,
+            ));
+        }
+        NetStackFlowCommand::ReconnectUdpFacade {
+            flow,
+            local,
+            peer,
+            facade,
+            output,
+        } => {
+            *output = Some(shard.reconnect_udp_facade(*flow, *local, *peer, Arc::clone(facade)));
+        }
+        NetStackFlowCommand::CloseUdp { flow } => shard.close_udp(*flow),
+        NetStackFlowCommand::BindRawFacade {
+            local,
+            interface,
+            facade,
+            free_bind,
+            output,
+        } => {
+            *output =
+                Some(shard.bind_raw_facade(*local, *interface, Arc::clone(facade), *free_bind));
+        }
+        NetStackFlowCommand::CloseRaw { flow } => shard.close_raw(*flow),
+        NetStackFlowCommand::ListenTcp {
+            local,
+            interface,
+            group,
+            output,
+        } => {
+            *output = Some(shard.listen_tcp(*local, *interface, Arc::clone(group)));
+        }
+        NetStackFlowCommand::ConnectTcp {
+            local,
+            remote,
+            path,
+            facade,
+            control_sequence,
+            now_ns,
+            output,
+        } => {
+            *output = Some(shard.connect_tcp(
+                *local,
+                *remote,
+                *path,
+                Arc::clone(facade),
+                *control_sequence,
+                *now_ns,
+            ));
+        }
+        NetStackFlowCommand::CloseTcp { flow, now_ns } => shard.close_tcp(*flow, *now_ns),
+        NetStackFlowCommand::AbortTcp { flow, now_ns } => shard.abort_tcp(*flow, *now_ns),
+        NetStackFlowCommand::ShutdownTcpWrite { flow, now_ns } => {
+            shard.shutdown_tcp_write(*flow, *now_ns);
+        }
+        NetStackFlowCommand::CloseTcpListener { group, output } => {
+            *output = Some(shard.close_tcp_listener(*group));
+        }
+        NetStackFlowCommand::DrainTcpSend { flow, now_ns } => {
+            shard.drain_tcp_send(*flow, *now_ns);
+        }
+        NetStackFlowCommand::TakeTcpOutput { output } => {
+            *output = Some(shard.take_tcp_output());
+        }
+        NetStackFlowCommand::ResumeTcpOutput {
+            now_ns,
+            budget,
+            output,
+        } => *output = Some(shard.resume_tcp_output(*now_ns, *budget)),
+        NetStackFlowCommand::ResolveTcpPath {
+            destination,
+            bound_source,
+            interface,
+            config,
+            now_ns,
+            free_bind,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return false;
+            }
+            // Safety: config 只在同步 state-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(shard.resolve_tcp_path(
+                *destination,
+                *bound_source,
+                *interface,
+                config,
+                *now_ns,
+                *free_bind,
+            ));
+        }
+        NetStackFlowCommand::RefreshTcpTxPath {
+            work,
+            config,
+            now_ns,
+            output,
+        } => {
+            if work.is_null() || !work.is_aligned() || config.is_null() || !config.is_aligned() {
+                return false;
+            }
+            // Safety: ELM 已校验 state-call 中 work 的可写范围，host 不保存指针。
+            let work = unsafe { &mut **work };
+            // Safety: config 只在同步 state-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(shard.refresh_tcp_tx_path(work, config, *now_ns));
+        }
+        NetStackFlowCommand::ProcessLocalTcp {
+            interface,
+            path,
+            key,
+            packet,
+            payload,
+            now_ns,
+            output,
+        } => {
+            if !payload.is_null() && !payload.is_aligned() {
+                return false;
+            }
+            // Safety: 非空 payload 只在同步 state-call 期间借用。
+            let payload = unsafe { payload.as_ref() };
+            *output =
+                Some(shard.process_local_tcp(*interface, *path, *key, *packet, payload, *now_ns));
+        }
+        NetStackFlowCommand::ProcessLocalUdp {
+            interface,
+            source,
+            destination,
+            payload,
+            hop_limit,
+            traffic_class,
+            now_ns,
+            output,
+        } => {
+            if payload.is_null() || !payload.is_aligned() {
+                return false;
+            }
+            // Safety: payload 只在同步 state-call 期间借用。
+            let payload = unsafe { &**payload };
+            *output = Some(shard.process_local_udp(
+                *interface,
+                *source,
+                *destination,
+                payload,
+                *hop_limit,
+                *traffic_class,
+                *now_ns,
+            ));
+        }
+        NetStackFlowCommand::InvalidateInterface { interface, output } => {
+            *output = Some(shard.invalidate_interface(*interface));
+        }
+        NetStackFlowCommand::ObserveNeighbor {
+            key,
+            mac_address,
+            now_ns,
+            output,
+        } => *output = Some(shard.observe_neighbor(*key, *mac_address, *now_ns)),
+        NetStackFlowCommand::LookupNeighbor {
+            key,
+            now_ns,
+            output,
+        } => *output = Some(shard.lookup_neighbor(*key, *now_ns)),
+        NetStackFlowCommand::PrepareUdpTx {
+            flow,
+            payload,
+            mark,
+            config,
+            now_ns,
+            output,
+        } => {
+            let Some(owned) = payload.take() else {
+                return false;
+            };
+            if config.is_null() || !config.is_aligned() {
+                *payload = Some(owned);
+                return false;
+            }
+            // Safety: config 只在同步 state-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(shard.prepare_udp_tx(*flow, owned, *mark, config, *now_ns));
+        }
+        NetStackFlowCommand::PrepareRawTx {
+            flow,
+            payload,
+            mark,
+            config,
+            now_ns,
+            output,
+        } => {
+            let Some(owned) = payload.take() else {
+                return false;
+            };
+            if config.is_null() || !config.is_aligned() {
+                *payload = Some(owned);
+                return false;
+            }
+            // Safety: config 只在同步 state-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(shard.prepare_raw_tx(*flow, owned, *mark, config, *now_ns));
+        }
+        NetStackFlowCommand::FormUdpPacket {
+            flow,
+            destination,
+            payload,
+            mark,
+            config,
+            now_ns,
+            output,
+        } => {
+            let Some(owned) = payload.take() else {
+                return false;
+            };
+            if config.is_null() || !config.is_aligned() {
+                *payload = Some(owned);
+                return false;
+            }
+            // Safety: config 只在同步 state-call 期间借用。
+            let config = unsafe { &**config };
+            *output =
+                Some(shard.form_udp_packet(*flow, *destination, owned, *mark, config, *now_ns));
+        }
+        NetStackFlowCommand::RecvUdp { flow, output } => {
+            *output = Some(shard.recv_udp(*flow));
+        }
+        NetStackFlowCommand::PushFrontendBatch { packets } => {
+            let Some(packets) = packets.take() else {
+                return false;
+            };
+            shard.push_frontend_batch(packets);
+        }
+        NetStackFlowCommand::ProcessFrontendBatch {
+            interface,
+            local_mac,
+            config,
+            now_ns,
+            output,
+            drop_counts,
+        } => {
+            if config.is_null() || !config.is_aligned() || output.is_some() {
+                return false;
+            }
+            // Safety: config 只在同步 state-call 期间借用。
+            let config = unsafe { &**config };
+            let mut tx = TxBatch::new();
+            let mut recycle = PacketBatch::new();
+            shard.process_frontend_batch(
+                crate::FlowTurnContext {
+                    interface: *interface,
+                    local_mac: *local_mac,
+                    config,
+                    now_ns: *now_ns,
+                },
+                &mut tx,
+                &mut recycle,
+                |reason| {
+                    drop_counts[reason.index()] = drop_counts[reason.index()].saturating_add(1);
+                },
+            );
+            *output = Some((tx, recycle));
+        }
+        NetStackFlowCommand::TakeReassembledInput { output } => {
+            *output = Some(shard.take_reassembled_input());
+        }
+        NetStackFlowCommand::ParseReassembled {
+            input,
+            ethernet,
+            network,
+            transport,
+            output,
+        } => {
+            let Some(input) = input.take() else {
+                return false;
+            };
+            *output = Some(shard.parse_reassembled_batch(input, ethernet, network, transport));
+        }
+        NetStackFlowCommand::TakeReassembled { output } => {
+            *output = Some(shard.take_reassembled());
+        }
+        NetStackFlowCommand::TakeForwardedError { output } => {
+            *output = Some(shard.take_forwarded_error());
+        }
+        NetStackFlowCommand::ApplyTransportError {
+            interface,
+            target,
+            error,
+            now_ns,
+            output,
+        } => {
+            *output = Some(shard.apply_transport_error(*interface, *target, *error, *now_ns));
+        }
+    }
+    call.committed = 1;
+    true
+}
+
 /// 常驻 worker shell 与 `net.stack` 间一次同步调用的固定帧。
 #[repr(C)]
 pub struct NetStackCallV1 {
@@ -1503,11 +2138,17 @@ impl NetStackCallV1 {
             && self.generation == generation
             && self.reserved0 == [0; 6]
             && self.reserved1[1] == 0
-            && (opcode == NET_STACK_OP_TX_FRAGMENT_HEADER || self.reserved1[0] == 0)
+            && (matches!(
+                opcode,
+                NET_STACK_OP_TX_FRAGMENT_HEADER | NET_STACK_OP_FLOW_CALL
+            ) || self.reserved1[0] == 0)
             && match opcode {
                 NET_STACK_OP_WORKER_TURN => !self.worker_turn.is_null() && self.tx_header.is_null(),
                 NET_STACK_OP_TX_HEADER => self.worker_turn.is_null() && !self.tx_header.is_null(),
                 NET_STACK_OP_TX_FRAGMENT_HEADER => {
+                    self.worker_turn.is_null() && self.tx_header.is_null() && self.reserved1[0] != 0
+                }
+                NET_STACK_OP_FLOW_CALL => {
                     self.worker_turn.is_null() && self.tx_header.is_null() && self.reserved1[0] != 0
                 }
                 _ => self.worker_turn.is_null() && self.tx_header.is_null(),

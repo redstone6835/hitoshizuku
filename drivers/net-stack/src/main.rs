@@ -3,6 +3,9 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use elm::{ElmModule, HookError, HookResult, LifecycleContext};
@@ -20,21 +23,26 @@ use net::stack::{
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
     NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE,
-    NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER,
+    NET_STACK_OP_FLOW_CALL, NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER,
     NET_STACK_OP_WORKER_TURN, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
     NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
     NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
     NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NET_STACK_TX_HEADER_ABI_VERSION,
     NET_STACK_TX_HEADER_CAPACITY, NET_STACK_TX_RAW_FRAGMENT, NET_STACK_TX_TCP,
     NET_STACK_TX_UDP, NET_STACK_TX_UDP_FRAGMENT, NetStackEthernetV1,
-    NetStackHandle, NetStackLocalAddressV1, NetStackNetworkV1, NetStackRegisterErrorKind,
-    NetStackRegistration, NetStackRemoveError, NetStackTcpOptionsV1, NetStackTransportV1,
-    NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1,
+    NetStackFlowCallV1, NetStackHandle, NetStackLocalAddressV1, NetStackNetworkV1,
+    NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackTcpOptionsV1,
+    NetStackTransportV1, NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1,
+    NetStackTxHeaderV1, NetStackTxInputV1,
 };
+use net::{FlowShard, ShardId};
+use sched::sync::Spinlock;
 
 use allocator as _;
 
 static QUIESCED: AtomicBool = AtomicBool::new(false);
+static FLOW_SHARDS: Spinlock<Vec<Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>>>> =
+    Spinlock::new(Vec::new());
 
 const fn empty_ethernet() -> NetStackEthernetV1 {
     NetStackEthernetV1 {
@@ -1460,6 +1468,38 @@ fn parse_transport(
     }
 }
 
+fn initialize_flow_shards(boot: net::boot::NetStackBootConfig) -> bool {
+    let count = usize::from(boot.active_cpu_count());
+    if count == 0 || count > sched::NR_CPUS {
+        return false;
+    }
+    let now_ns = sched::now_ns_public();
+    let shards = (0..count)
+        .map(|index| {
+            Some(Arc::new(Spinlock::new(ManuallyDrop::new(
+                net::stack::create_flow_shard(ShardId(index as u16), boot, now_ns),
+            ))))
+        })
+        .collect::<Vec<_>>();
+    *FLOW_SHARDS.lock() = shards;
+    true
+}
+
+fn flow_shard(id: ShardId) -> Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>> {
+    FLOW_SHARDS
+        .lock()
+        .get(usize::from(id.0))
+        .and_then(Option::as_ref)
+        .cloned()
+}
+
+fn dispatch_flow_call(call: &mut NetStackFlowCallV1) -> bool {
+    let Some(shard) = flow_shard(call.shard) else {
+        return false;
+    };
+    net::stack::dispatch_flow_shard_call(&mut shard.lock(), call)
+}
+
 struct NetStackElm {
     handle: Option<NetStackHandle>,
     boot: Option<net::boot::NetStackBootConfig>,
@@ -1501,6 +1541,9 @@ impl ElmModule for NetStackElm {
         if boot.active_cpu_count() == 0 || usize::from(boot.active_cpu_count()) > sched::NR_CPUS {
             return Err(HookError::new(-22));
         }
+        if !initialize_flow_shards(boot) {
+            return Err(HookError::new(-12));
+        }
         QUIESCED.store(false, Ordering::Release);
         #[cfg(not(feature = "elm-integrated"))]
         let registration = {
@@ -1530,6 +1573,15 @@ impl ElmModule for NetStackElm {
         };
         match net::stack::begin_remove(handle) {
             Ok(()) | Err(NetStackRemoveError::NoStack) => {
+                let shards = core::mem::take(&mut *FLOW_SHARDS.lock());
+                for shard in shards.into_iter().flatten() {
+                    let mut guard = shard.lock();
+                    // Safety: 每个 shard 只在这里从 ManuallyDrop 中取出一次，随后
+                    // 交给受 capability 约束的 host destructor。
+                    let state = unsafe { ManuallyDrop::take(&mut guard) };
+                    drop(guard);
+                    net::stack::destroy_flow_shard(state);
+                }
                 self.handle = None;
                 self.boot = None;
                 Ok(())
@@ -1707,6 +1759,21 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
             output.next_fragment_offset = if more { next_offset } else { 0 };
             output.more_fragments = u8::from(more);
             output.committed = 1;
+        }
+        NET_STACK_OP_FLOW_CALL => {
+            if QUIESCED.load(Ordering::Acquire) || frame.reserved1[0] == 0 {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            let call_pointer = frame.reserved1[0] as usize as *mut NetStackFlowCallV1;
+            if !call_pointer.is_aligned() {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            // Safety: host 将 state-call 帧声明为本次 pinned call 的可写范围；ELM
+            // 只在同步调用期间访问并按 Option 所有权协议取放值。
+            let call = unsafe { &mut *call_pointer };
+            if !call.valid_header(frame.generation) || !dispatch_flow_call(call) {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
         }
         NET_STACK_OP_QUIESCE => {
             QUIESCED.store(true, Ordering::Release);

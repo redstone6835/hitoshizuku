@@ -327,6 +327,24 @@ fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
 }
 
 #[ktest]
+fn net_stack_elm_persists_flow_shard_state() {
+    let shard = crate::net_stack::ElmFlowShard::new(net::ShardId(0));
+    let local = net::Endpoint {
+        addr: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
+        port: 49_151,
+    };
+    let first = shard
+        .bind_udp(local, None, None)
+        .expect("ELM shard 应接受首个 UDP endpoint");
+    let second = shard
+        .bind_udp(local, None, None)
+        .expect("ELM shard 应保留并扩展 UDP endpoint 表");
+    assert_ne!(first, second);
+    shard.close_udp(first);
+    shard.close_udp(second);
+}
+
+#[ktest]
 fn udp_vfs_fd_and_epoll_roundtrip() {
     let (context, table) = current_vfs();
     let raw = vfs::socket::socket(
