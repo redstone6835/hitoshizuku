@@ -1,5 +1,9 @@
 //! 网络协议栈 ELM 与常驻 host 之间的生命周期契约。
 
+mod socket_call;
+
+pub use socket_call::*;
+
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
@@ -33,8 +37,6 @@ static STACK_REGISTRAR: Mutex<Option<&'static dyn NetStackRegistrar>> = Mutex::n
 
 pub const NET_STACK_CALL_ABI_VERSION: u16 = 1;
 pub const NET_STACK_CALL_RUST_ABI: &str = "fn(&mutnet::stack::NetStackCallV1)->i32";
-pub const NET_STACK_SOCKET_CALL_ABI_VERSION: u16 = 1;
-pub const NET_STACK_SOCKET_CALL_RUST_ABI: &str = "fn(&mutnet::stack::NetStackSocketCallV1)->i32";
 pub const NET_STACK_CALL_STATUS_OK: i32 = 0;
 pub const NET_STACK_CALL_STATUS_INVALID: i32 = -22;
 
@@ -44,8 +46,6 @@ pub const NET_STACK_OP_QUIESCE: u32 = 3;
 pub const NET_STACK_OP_TX_HEADER: u32 = 4;
 pub const NET_STACK_OP_TX_FRAGMENT_HEADER: u32 = 5;
 pub const NET_STACK_OP_FLOW_CALL: u32 = 6;
-
-pub const NET_STACK_SOCKET_OP_PROBE: u32 = 1;
 
 pub const NET_STACK_WORKER_TURN_ABI_VERSION: u16 = 1;
 pub const NET_STACK_TX_HEADER_ABI_VERSION: u16 = 1;
@@ -3391,60 +3391,6 @@ impl NetStackCallV1 {
     }
 }
 
-/// 常驻 VFS socket host 与 `net.stack` 间一次同步调用的固定帧。
-///
-/// 当前版本只建立独立调用门和代际探测；后续 socket 操作通过保留字段扩展，
-/// 不允许在帧中保存指向 ELM 对象的长期引用。
-#[repr(C)]
-pub struct NetStackSocketCallV1 {
-    pub abi_version: u16,
-    pub struct_size: u16,
-    pub opcode: u32,
-    pub stack_generation: u64,
-    pub ready: u8,
-    pub quiesced: u8,
-    pub committed: u8,
-    pub reserved0: [u8; 5],
-    pub reserved1: [u64; 2],
-}
-
-#[kernel_symbols::export]
-impl NetStackSocketCallV1 {
-    pub fn new(opcode: u32, stack_generation: u64) -> Self {
-        Self {
-            abi_version: NET_STACK_SOCKET_CALL_ABI_VERSION,
-            struct_size: core::mem::size_of::<Self>() as u16,
-            opcode,
-            stack_generation,
-            ready: 0,
-            quiesced: 0,
-            committed: 0,
-            reserved0: [0; 5],
-            reserved1: [0; 2],
-        }
-    }
-
-    #[kernel_symbols::export(
-        name = "net.stack.NetStackSocketCallV1.valid",
-        contract = "kernel.net.stack-socket-call-frame@1",
-        version = 1,
-        capabilities = kernel_symbols::capability::CORE_SAFE
-    )]
-    pub fn valid(&self, opcode: u32, stack_generation: u64) -> bool {
-        self.abi_version == NET_STACK_SOCKET_CALL_ABI_VERSION
-            && self.struct_size as usize == core::mem::size_of::<Self>()
-            && self.opcode == opcode
-            && self.stack_generation == stack_generation
-            && stack_generation != 0
-            && opcode == NET_STACK_SOCKET_OP_PROBE
-            && self.ready <= 1
-            && self.quiesced <= 1
-            && self.committed <= 1
-            && self.reserved0 == [0; 5]
-            && self.reserved1 == [0; 2]
-    }
-}
-
 /// 动态 `net.stack` 的代际固定 export 描述。
 pub struct PinnedNetStackEndpoint {
     owner_cell: u64,
@@ -4131,10 +4077,10 @@ mod tests {
     #[test]
     fn socket_call_frame_rejects_stale_generation_and_reserved_bits() {
         let mut frame = NetStackSocketCallV1::new(NET_STACK_SOCKET_OP_PROBE, 7);
-        assert!(frame.valid(NET_STACK_SOCKET_OP_PROBE, 7));
-        assert!(!frame.valid(NET_STACK_SOCKET_OP_PROBE, 8));
+        assert!(frame.valid(NET_STACK_SOCKET_OP_PROBE, 7, core::ptr::null_mut()));
+        assert!(!frame.valid(NET_STACK_SOCKET_OP_PROBE, 8, core::ptr::null_mut()));
         frame.reserved1[0] = 1;
-        assert!(!frame.valid(NET_STACK_SOCKET_OP_PROBE, 7));
+        assert!(!frame.valid(NET_STACK_SOCKET_OP_PROBE, 7, core::ptr::null_mut()));
     }
 
     #[test]

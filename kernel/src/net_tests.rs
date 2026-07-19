@@ -102,6 +102,193 @@ fn wait_readable(file: &vfs::file::File) {
     wait_poll(file, vfs::file::PollEvents::POLLIN);
 }
 
+fn elm_socket_command(
+    command: net::stack::NetStackSocketCommandV1,
+) -> net::stack::NetStackSocketCommandV1 {
+    match crate::net_stack::socket_command(command) {
+        Ok(command) => command,
+        Err((error, _)) => panic!("ELM socket call 失败: {:?}", error),
+    }
+}
+
+#[ktest]
+fn net_stack_elm_socket_table_supports_complete_call_abi() {
+    let descriptor = match elm_socket_command(net::stack::NetStackSocketCommandV1::Create {
+        family: net::stack::NET_STACK_SOCKET_FAMILY_IPV4,
+        kind: net::stack::NET_STACK_SOCKET_KIND_DATAGRAM,
+        protocol: 0,
+        output: None,
+    }) {
+        net::stack::NetStackSocketCommandV1::Create {
+            output: Some(Ok(descriptor)),
+            ..
+        } => descriptor,
+        _ => panic!("ELM socket create 未返回 descriptor"),
+    };
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::SetOption {
+            socket: descriptor.socket,
+            option: net::stack::NetStackSocketOptionV1::Broadcast,
+            value: net::stack::NetStackSocketOptionValueV1::Bool(true),
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::SetOption {
+            output: Some(Ok(())),
+            ..
+        }
+    ));
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::GetOption {
+            socket: descriptor.socket,
+            option: net::stack::NetStackSocketOptionV1::Broadcast,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::GetOption {
+            output: Some(Ok(net::stack::NetStackSocketOptionValueV1::Bool(true))),
+            ..
+        }
+    ));
+    let local = match elm_socket_command(net::stack::NetStackSocketCommandV1::Bind {
+        socket: descriptor.socket,
+        local: net::Endpoint {
+            addr: net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+            port: 0,
+        },
+        interface: None,
+        options: net::control::BindOptions::default(),
+        output: None,
+    }) {
+        net::stack::NetStackSocketCommandV1::Bind {
+            output: Some(Ok(local)),
+            ..
+        } => local,
+        _ => panic!("ELM socket bind 未返回 endpoint"),
+    };
+    assert_ne!(local.port, 0);
+    let peer = net::Endpoint {
+        addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
+        port: 53,
+    };
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Connect {
+            socket: descriptor.socket,
+            peer,
+            interface: None,
+            options: net::control::BindOptions::default(),
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Connect {
+            output: Some(Ok(_)),
+            ..
+        }
+    ));
+    let payload = b"socket-call";
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Send {
+            socket: descriptor.socket,
+            data: payload.as_ptr(),
+            len: payload.len() as u32,
+            destination: None,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Send {
+            output: Some(Ok(11)),
+            ..
+        }
+    ));
+    let mut receive = [0u8; 16];
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Recv {
+            socket: descriptor.socket,
+            data: receive.as_mut_ptr(),
+            capacity: receive.len() as u32,
+            peek: false,
+            truncate: false,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Recv {
+            output: Some(Err(net::stack::NetStackSocketErrorV1::WouldBlock)),
+            ..
+        }
+    ));
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Query {
+            socket: descriptor.socket,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Query {
+            output: Some(Ok(snapshot)),
+            ..
+        } if snapshot.local == Some(local) && snapshot.peer == Some(peer)
+    ));
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Shutdown {
+            socket: descriptor.socket,
+            read: true,
+            write: true,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Shutdown {
+            output: Some(Ok(snapshot)),
+            ..
+        } if snapshot.read_shutdown && snapshot.write_shutdown
+    ));
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Close {
+            socket: descriptor.socket,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Close {
+            output: Some(Ok(())),
+            ..
+        }
+    ));
+
+    let listener = match elm_socket_command(net::stack::NetStackSocketCommandV1::Create {
+        family: net::stack::NET_STACK_SOCKET_FAMILY_IPV6,
+        kind: net::stack::NET_STACK_SOCKET_KIND_STREAM,
+        protocol: 6,
+        output: None,
+    }) {
+        net::stack::NetStackSocketCommandV1::Create {
+            output: Some(Ok(descriptor)),
+            ..
+        } => descriptor,
+        _ => panic!("ELM listener create 未返回 descriptor"),
+    };
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Listen {
+            socket: listener.socket,
+            backlog: 4,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Listen {
+            output: Some(Ok(_)),
+            ..
+        }
+    ));
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Accept {
+            socket: listener.socket,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Accept {
+            output: Some(Err(net::stack::NetStackSocketErrorV1::WouldBlock)),
+            ..
+        }
+    ));
+    assert!(matches!(
+        elm_socket_command(net::stack::NetStackSocketCommandV1::Close {
+            socket: listener.socket,
+            output: None,
+        }),
+        net::stack::NetStackSocketCommandV1::Close {
+            output: Some(Ok(())),
+            ..
+        }
+    ));
+}
+
 #[ktest]
 fn net_stack_elm_builds_udp_and_tcp_tx_headers() {
     let payload_bytes = b"elm tx payload";

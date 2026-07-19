@@ -46,6 +46,8 @@ static FLOW_SHARDS: Spinlock<Vec<Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>>>
     Spinlock::new(Vec::new());
 static CONTROL_PLANE: Spinlock<Option<Arc<Spinlock<ManuallyDrop<NetStackControlPlane>>>>> =
     Spinlock::new(None);
+static SOCKET_TABLE: Spinlock<Option<ManuallyDrop<net::stack::NetStackSocketTable>>> =
+    Spinlock::new(None);
 
 const fn empty_ethernet() -> NetStackEthernetV1 {
     NetStackEthernetV1 {
@@ -1514,6 +1516,50 @@ fn dispatch_flow_call(call: &mut NetStackFlowCallV1) -> bool {
     net::stack::dispatch_flow_shard_call(&mut shard.lock(), call)
 }
 
+fn initialize_socket_table(boot: net::boot::NetStackBootConfig, generation: u64) -> bool {
+    let boot_nonce = u64::from_le_bytes(
+        boot.generation_nonce()[..8]
+            .try_into()
+            .expect("generation nonce 长度固定"),
+    );
+    let Some(table) = net::stack::create_socket_table(boot_nonce, generation) else {
+        return false;
+    };
+    let mut slot = SOCKET_TABLE.lock();
+    if slot.is_some() {
+        net::stack::destroy_socket_table(table);
+        return false;
+    }
+    *slot = Some(ManuallyDrop::new(table));
+    true
+}
+
+fn destroy_generation_state() {
+    if let Some(mut table) = SOCKET_TABLE.lock().take() {
+        // Safety: 套接字表只在这里从 ManuallyDrop 中取出一次，随后交给受
+        // capability 约束的宿主析构函数。
+        let state = unsafe { ManuallyDrop::take(&mut table) };
+        net::stack::destroy_socket_table(state);
+    }
+    let shards = core::mem::take(&mut *FLOW_SHARDS.lock());
+    for shard in shards.into_iter().flatten() {
+        let mut guard = shard.lock();
+        // Safety: 每个 shard 只在这里从 ManuallyDrop 中取出一次，随后交给受
+        // capability 约束的宿主析构函数。
+        let state = unsafe { ManuallyDrop::take(&mut guard) };
+        drop(guard);
+        net::stack::destroy_flow_shard(state);
+    }
+    if let Some(control) = CONTROL_PLANE.lock().take() {
+        let mut guard = control.lock();
+        // Safety: 控制面只在这里从 ManuallyDrop 中取出一次，随后交给受
+        // capability 约束的宿主析构函数。
+        let state = unsafe { ManuallyDrop::take(&mut guard) };
+        drop(guard);
+        net::stack::destroy_control_plane(state);
+    }
+}
+
 struct NetStackElm {
     handle: Option<NetStackHandle>,
     boot: Option<net::boot::NetStackBootConfig>,
@@ -1560,24 +1606,40 @@ impl ElmModule for NetStackElm {
         }
         QUIESCED.store(false, Ordering::Release);
         #[cfg(not(feature = "elm-integrated"))]
-        let registration = {
+        let (registration, generation) = {
             let endpoint =
                 PinnedNetStackEndpoint::current("net.stack.call", "mygo.net.stack-call@1", 1)
                     .ok_or(HookError::new(-22))?;
+            let generation = endpoint.owner_generation();
             let socket_endpoint = PinnedNetStackEndpoint::current(
                 "net.stack.socket",
                 "mygo.net.stack-socket-call@1",
                 1,
             )
             .ok_or(HookError::new(-22))?;
-            NetStackRegistration::pinned(endpoint, socket_endpoint)
-                .ok_or(HookError::new(-22))?
+            (
+                NetStackRegistration::pinned(endpoint, socket_endpoint)
+                    .ok_or(HookError::new(-22))?,
+                generation,
+            )
         };
         #[cfg(feature = "elm-integrated")]
-        let registration = NetStackRegistration::integrated(net_stack_call, net_stack_socket_call)
-            .ok_or(HookError::new(-22))?;
-        let handle = net::stack::register_stack(registration)
-            .map_err(|error| map_register_error(error.kind))?;
+        let (registration, generation) = (
+            NetStackRegistration::integrated(net_stack_call, net_stack_socket_call)
+                .ok_or(HookError::new(-22))?,
+            1,
+        );
+        if !initialize_socket_table(boot, generation) {
+            destroy_generation_state();
+            return Err(HookError::new(-12));
+        }
+        let handle = match net::stack::register_stack(registration) {
+            Ok(handle) => handle,
+            Err(error) => {
+                destroy_generation_state();
+                return Err(map_register_error(error.kind));
+            }
+        };
         self.boot = Some(boot);
         self.handle = Some(handle);
         Ok(())
@@ -1594,23 +1656,7 @@ impl ElmModule for NetStackElm {
         };
         match net::stack::begin_remove(handle) {
             Ok(()) | Err(NetStackRemoveError::NoStack) => {
-                let shards = core::mem::take(&mut *FLOW_SHARDS.lock());
-                for shard in shards.into_iter().flatten() {
-                    let mut guard = shard.lock();
-                    // Safety: 每个 shard 只在这里从 ManuallyDrop 中取出一次，随后
-                    // 交给受 capability 约束的 host destructor。
-                    let state = unsafe { ManuallyDrop::take(&mut guard) };
-                    drop(guard);
-                    net::stack::destroy_flow_shard(state);
-                }
-                if let Some(control) = CONTROL_PLANE.lock().take() {
-                    let mut guard = control.lock();
-                    // Safety: 控制面只在这里从 ManuallyDrop 中取出一次，随后交给
-                    // 受 capability 约束的 host destructor。
-                    let state = unsafe { ManuallyDrop::take(&mut guard) };
-                    drop(guard);
-                    net::stack::destroy_control_plane(state);
-                }
+                destroy_generation_state();
                 self.handle = None;
                 self.boot = None;
                 Ok(())
@@ -1822,7 +1868,8 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
     visibility = "private"
 )]
 fn net_stack_socket_call(frame: &mut net::stack::NetStackSocketCallV1) -> i32 {
-    if !frame.valid(frame.opcode, frame.stack_generation) || frame.committed != 0 {
+    let request_pointer = frame.request;
+    if !frame.valid(frame.opcode, frame.stack_generation, request_pointer) || frame.committed != 0 {
         return NET_STACK_CALL_STATUS_INVALID;
     }
     match frame.opcode {
@@ -1832,7 +1879,26 @@ fn net_stack_socket_call(frame: &mut net::stack::NetStackSocketCallV1) -> i32 {
             frame.quiesced = u8::from(quiesced);
             frame.committed = 1;
         }
-        _ => return NET_STACK_CALL_STATUS_INVALID,
+        _ => {
+            if request_pointer.is_null() || !request_pointer.is_aligned() {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            // Safety: 宿主将请求声明为本次 pinned call 的可写范围；指针只在
+            // 同步调用期间使用，ELM 不保存它。
+            let request = unsafe { &mut *request_pointer };
+            let mut table = SOCKET_TABLE.lock();
+            let Some(table) = table.as_mut() else {
+                return NET_STACK_CALL_STATUS_INVALID;
+            };
+            if !net::stack::dispatch_socket_table_call(
+                table,
+                request,
+                QUIESCED.load(Ordering::Acquire),
+            ) {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            frame.committed = 1;
+        }
     }
     NET_STACK_CALL_STATUS_OK
 }

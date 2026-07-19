@@ -2929,11 +2929,15 @@ mod tests {
             "general.vfs.namespace_path",
             "net.stack.NetStackCallV1.valid",
             "net.stack.NetStackSocketCallV1.valid",
+            "net.stack.NetStackSocketRequestV1.valid_header",
             "net.stack.PinnedNetStackEndpoint.current",
             "net.stack.NetStackRegistration.pinned",
             "net.stack.boot_config",
             "net.stack.register_stack",
             "net.stack.begin_remove",
+            "net.stack.create_socket_table",
+            "net.stack.destroy_socket_table",
+            "net.stack.dispatch_socket_table_call",
             "net.device.register_device",
             "net.device.begin_remove",
             "net.buf.PacketBatch.push",
@@ -2954,6 +2958,9 @@ mod tests {
             "net.stack.boot_config",
             "net.stack.register_stack",
             "net.stack.begin_remove",
+            "net.stack.create_socket_table",
+            "net.stack.destroy_socket_table",
+            "net.stack.dispatch_socket_table_call",
         ] {
             let symbol = symbols
                 .iter()

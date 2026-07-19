@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use net::stack::{
     NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_FLOW_CALL, NET_STACK_OP_PROBE,
@@ -15,14 +15,18 @@ use net::stack::{
     NetStackControlCommand, NetStackEndpoint, NetStackFlowCallV1, NetStackFlowCommand,
     NetStackHandle, NetStackLifecycle, NetStackRegisterError, NetStackRegisterErrorKind,
     NetStackRegistrar, NetStackRegistration, NetStackRemoveError, NetStackSnapshot,
-    NetStackSocketCallV1, NetStackSocketEndpoint, NetStackState, NetStackTxError,
-    NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1,
-    NetStackWorkerTurnV1,
+    NetStackSocketCallV1, NetStackSocketCommandV1, NetStackSocketEndpoint, NetStackSocketRequestV1,
+    NetStackState, NetStackTxError, NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1,
+    NetStackTxHeaderV1, NetStackTxInputV1, NetStackWorkerTurnV1,
 };
 use sched::sync::Spinlock;
 
 static HOST_STARTED: AtomicBool = AtomicBool::new(false);
+static NEXT_SOCKET_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static BROKER: Spinlock<KernelNetStackBroker> = Spinlock::new(KernelNetStackBroker::new());
+
+const PINNED_CALL_BUDGET_NS: u64 = 2_000_000;
+const SOCKET_CALL_BUDGET_NS: u64 = 10_000_000;
 
 struct KernelNetStackRegistrar;
 
@@ -83,10 +87,15 @@ impl StackCall {
 }
 
 impl SocketCall {
-    fn invoke(&self, frame: &mut NetStackSocketCallV1) -> Result<i32, i32> {
+    fn invoke(
+        &self,
+        frame: &mut NetStackSocketCallV1,
+        host_ranges: &[(usize, usize)],
+        budget_ns: u64,
+    ) -> Result<i32, i32> {
         match self {
             Self::Integrated(call) => Ok(call(frame)),
-            Self::Pinned(call) => call.invoke(frame, &[]),
+            Self::Pinned(call) => call.invoke_with_budget(frame, host_ranges, budget_ns),
         }
     }
 }
@@ -170,8 +179,17 @@ impl PinnedStackCall {
     }
 
     fn invoke<T>(&self, frame: &mut T, host_ranges: &[(usize, usize)]) -> Result<i32, i32> {
+        self.invoke_with_budget(frame, host_ranges, PINNED_CALL_BUDGET_NS)
+    }
+
+    fn invoke_with_budget<T>(
+        &self,
+        frame: &mut T,
+        host_ranges: &[(usize, usize)],
+        budget_ns: u64,
+    ) -> Result<i32, i32> {
         let pair = self.current_pair()?;
-        let deadline = sched::now_ns_public().saturating_add(2_000_000);
+        let deadline = sched::now_ns_public().saturating_add(budget_ns);
         if let Some(call) = pair.primary.try_lock() {
             return crate::elm::invoke_pinned_native(&call, frame, host_ranges, deadline);
         }
@@ -1523,9 +1541,9 @@ fn probe_active() {
         && frame.ready == 1
         && frame.quiesced == 0;
     let mut socket_frame = NetStackSocketCallV1::new(NET_STACK_SOCKET_OP_PROBE, generation);
-    let socket_result = socket_call.invoke(&mut socket_frame);
+    let socket_result = socket_call.invoke(&mut socket_frame, &[], PINNED_CALL_BUDGET_NS);
     let socket_ready = matches!(socket_result, Ok(NET_STACK_CALL_STATUS_OK))
-        && socket_frame.valid(NET_STACK_SOCKET_OP_PROBE, generation)
+        && socket_frame.valid(NET_STACK_SOCKET_OP_PROBE, generation, core::ptr::null_mut())
         && socket_frame.ready == 1
         && socket_frame.quiesced == 0
         && socket_frame.committed == 1;
@@ -1548,6 +1566,83 @@ fn probe_active() {
             socket_result
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketCallError {
+    StackUnavailable,
+    CallFailed,
+}
+
+/// 在当前活跃代际中提交一次有限时、非阻塞 socket 操作。
+pub(crate) fn socket_command(
+    command: NetStackSocketCommandV1,
+) -> Result<NetStackSocketCommandV1, (SocketCallError, NetStackSocketCommandV1)> {
+    let (handle, generation, call) = {
+        let broker = BROKER.lock();
+        let snapshot = broker.lifecycle.snapshot();
+        if snapshot.state != NetStackState::Active || !snapshot.probed {
+            return Err((SocketCallError::StackUnavailable, command));
+        }
+        let Some(record) = broker.record.as_ref() else {
+            return Err((SocketCallError::StackUnavailable, command));
+        };
+        (record.handle, record.generation, record.socket_call.clone())
+    };
+    let request_id = NEXT_SOCKET_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(request_id != 0, "socket request id 已耗尽");
+    let payload_binding = command.payload_binding();
+    let mut request = NetStackSocketRequestV1::new(generation, request_id, command);
+    let request_pointer = &mut request as *mut NetStackSocketRequestV1;
+    let Some(request_range) = host_range(request_pointer) else {
+        return Err((SocketCallError::CallFailed, request.command));
+    };
+    let mut ranges = [(0usize, 0usize); 2];
+    ranges[0] = request_range;
+    let range_count = match payload_binding {
+        Some((pointer, length, _)) if length != 0 => {
+            let Some(range) = host_bytes_range(pointer, length) else {
+                return Err((SocketCallError::CallFailed, request.command));
+            };
+            ranges[1] = range;
+            2
+        }
+        Some((pointer, 0, _)) if pointer == 0 => {
+            return Err((SocketCallError::CallFailed, request.command));
+        }
+        _ => 1,
+    };
+    let opcode = request.opcode;
+    let mut frame = NetStackSocketCallV1::new(opcode, generation);
+    frame.request = request_pointer;
+    let result = call.invoke(&mut frame, &ranges[..range_count], SOCKET_CALL_BUDGET_NS);
+    let valid = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
+        && frame.valid(opcode, generation, request_pointer)
+        && frame.ready == 0
+        && frame.quiesced == 0
+        && frame.committed == 1
+        && request.valid_header(opcode, generation, request_id)
+        && request.committed == 1
+        && request.command.payload_binding() == payload_binding;
+    if valid {
+        return Ok(request.command);
+    }
+
+    let mut broker = BROKER.lock();
+    let current = broker
+        .record
+        .as_ref()
+        .is_some_and(|record| record.handle == handle && record.generation == generation);
+    if current && broker.lifecycle.mark_faulted(handle) {
+        log::error!(
+            "[net-stack] socket call failed: generation={} handle={} opcode={} result={:?}",
+            generation,
+            handle.0,
+            opcode,
+            result
+        );
+    }
+    Err((SocketCallError::CallFailed, request.command))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1790,6 +1885,12 @@ fn host_range<T>(pointer: *const T) -> Option<(usize, usize)> {
     let start = pointer as usize;
     let end = start.checked_add(core::mem::size_of::<T>())?;
     (start != 0 && start < end).then_some((start, end))
+}
+
+fn host_bytes_range(start: usize, length: usize) -> Option<(usize, usize)> {
+    let end = start.checked_add(length)?;
+    (start != 0 && length != 0 && length <= isize::MAX as usize && start < end)
+        .then_some((start, end))
 }
 
 fn host_slice_range<T>(slice: &[T]) -> Option<(usize, usize)> {
