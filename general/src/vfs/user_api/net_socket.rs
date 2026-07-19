@@ -84,6 +84,7 @@ fn map_net_errno(err: net::NetError) -> Errno {
         net::NetError::ResourceExhausted => Errno::ENOMEM,
         net::NetError::WouldBlock => Errno::EAGAIN,
         net::NetError::AddressInUse => Errno::EADDRINUSE,
+        net::NetError::AddressNotAvailable => Errno::EADDRNOTAVAIL,
         net::NetError::TimedOut => Errno::ETIMEDOUT,
         net::NetError::ConnectionRefused => Errno::ECONNREFUSED,
         net::NetError::ConnectionReset => Errno::ECONNRESET,

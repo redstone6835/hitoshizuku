@@ -1016,7 +1016,7 @@ fn pathname_bind_connect_unlink_and_double_bind_cleanup() {
     );
     assert_eq!(
         vsock::bind(&fx.ctx, &fx.fdt, one, &path_addr(&second_path)),
-        Err(Errno::EADDRINUSE)
+        Err(Errno::EINVAL)
     );
     assert!(operation::fstatat(&fx.ctx, &Dirfd::Cwd, &second_path, false).is_err());
 }
@@ -1056,4 +1056,28 @@ fn invalid_sockaddr_and_wrong_fd_errors_are_mapped_at_vfs_boundary() {
         vsock::recv(&fx.fdt, fd, &mut buf, 0, false, 0x8000_0000, None).map(|out| out.len),
         Err(Errno::EINVAL)
     );
+}
+
+#[ktest]
+fn privileged_inet_ports_require_explicit_capability() {
+    let privileged = net::Endpoint {
+        addr: net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+        port: 463,
+    };
+    assert_eq!(
+        crate::net_socket::validate_bind_permission(&privileged, false),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        crate::net_socket::validate_bind_permission(&privileged, true),
+        Ok(())
+    );
+
+    for port in [0, 1024, u16::MAX] {
+        let endpoint = net::Endpoint { port, ..privileged };
+        assert_eq!(
+            crate::net_socket::validate_bind_permission(&endpoint, false),
+            Ok(())
+        );
+    }
 }

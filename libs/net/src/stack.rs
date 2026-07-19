@@ -2453,7 +2453,7 @@ fn ensure_local_addr_available(managed: &ManagedInterface, addr: &IpAddr) -> Res
     {
         return Ok(());
     }
-    Err(NetError::InvalidArgument)
+    Err(NetError::AddressNotAvailable)
 }
 
 fn endpoint_from_ip_address(addr: IpAddress) -> Endpoint {
@@ -3078,7 +3078,7 @@ mod tests {
                     port: 7777,
                 },
             ),
-            Err(NetError::InvalidArgument)
+            Err(NetError::AddressNotAvailable)
         );
         assert_eq!(
             stack.udp_bind(
@@ -3088,7 +3088,7 @@ mod tests {
                     port: 0,
                 },
             ),
-            Err(NetError::InvalidArgument)
+            Err(NetError::AddressNotAvailable)
         );
         assert_eq!(stack.udp_local_endpoint(handle), None);
     }
@@ -3765,7 +3765,7 @@ mod tests {
                     port: 8080,
                 },
             ),
-            Err(NetError::InvalidArgument)
+            Err(NetError::AddressNotAvailable)
         );
         assert_eq!(
             stack.tcp_listen(
@@ -3775,7 +3775,7 @@ mod tests {
                     port: 0,
                 },
             ),
-            Err(NetError::InvalidArgument)
+            Err(NetError::AddressNotAvailable)
         );
         assert_eq!(stack.socket_state(handle), SocketState::Closed);
     }
@@ -4726,7 +4726,7 @@ mod tests {
                     port: 33434,
                 },
             ),
-            Err(NetError::InvalidArgument)
+            Err(NetError::AddressNotAvailable)
         );
         assert_eq!(
             stack.icmp_bind_udp(

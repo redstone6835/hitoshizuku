@@ -119,6 +119,7 @@ fn map_net_control_error(err: net::NetError) -> ControlError {
         | net::NetError::Unreachable
         | net::NetError::Closed => ControlError::Io,
         net::NetError::InterfaceExists | net::NetError::AddressInUse => ControlError::Busy,
+        net::NetError::AddressNotAvailable => ControlError::NoDevice,
         net::NetError::ConnectionRefused
         | net::NetError::WouldBlock
         | net::NetError::BufferTooSmall => ControlError::Invalid,

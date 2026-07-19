@@ -325,9 +325,10 @@ fn handle_newroute(seq: u32, ifaces: &[InterfaceSnapshot], payload: &[u8]) -> Ve
 
 fn map_net_error(e: net::NetError) -> i32 {
     match e {
-        net::NetError::InterfaceNotFound => 19, // ENODEV
-        net::NetError::AddressInUse => 98,      // EADDRINUSE
-        _ => 22,                                // EINVAL
+        net::NetError::InterfaceNotFound => 19,   // ENODEV
+        net::NetError::AddressInUse => 98,        // EADDRINUSE
+        net::NetError::AddressNotAvailable => 99, // EADDRNOTAVAIL
+        _ => 22,                                  // EINVAL
     }
 }
 

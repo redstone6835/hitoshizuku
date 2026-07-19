@@ -500,8 +500,9 @@ impl FileOps for NetSocketFileOps {
 // ── 网络操作（由 socket.rs dispatch 调用）────────────────────────────────────
 
 impl NetSocketFileOps {
-    pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
-        let ep = addr::parse_inet_sockaddr(sockaddr)?;
+    pub fn bind(&self, sockaddr: &[u8], allow_privileged_port: bool) -> Result<(), Errno> {
+        let ep = addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
+        validate_bind_permission(&ep, allow_privileged_port)?;
         let handle = self.rehome_for_endpoint(self.get_handle()?, &ep)?;
         match handle.socket_type() {
             SocketType::Udp => {
@@ -1389,11 +1390,22 @@ fn map_net_error(e: NetError) -> Errno {
         NetError::ConnectionReset => Errno::ECONNRESET,
         NetError::Closed => Errno::EPIPE,
         NetError::AddressInUse => Errno::EADDRINUSE,
+        NetError::AddressNotAvailable => Errno::EADDRNOTAVAIL,
         NetError::TimedOut => Errno::ETIMEDOUT,
         NetError::Unreachable => Errno::Other(113),
         NetError::InvalidArgument => Errno::EINVAL,
         _ => Errno::EINVAL,
     }
+}
+
+pub(crate) fn validate_bind_permission(
+    endpoint: &Endpoint,
+    allow_privileged_port: bool,
+) -> Result<(), Errno> {
+    if endpoint.port != 0 && endpoint.port < 1024 && !allow_privileged_port {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
 }
 
 fn datagram_msg_flags(len: usize, buf_len: usize, trunc_requested: bool) -> usize {

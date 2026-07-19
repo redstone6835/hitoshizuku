@@ -624,7 +624,10 @@ pub fn socketpair(
 pub fn bind(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
-        return net_ops.bind(raw_addr);
+        let allow_privileged_port = ctx
+            .cred()
+            .has_cap(crate::vfs::cred::Capability::NetBindService);
+        return net_ops.bind(raw_addr, allow_privileged_port);
     }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return nl_ops.bind(raw_addr);
@@ -1216,6 +1219,7 @@ fn map_inet_net_error(err: net::NetError) -> Errno {
         net::NetError::ResourceExhausted => Errno::ENOMEM,
         net::NetError::WouldBlock => Errno::EAGAIN,
         net::NetError::AddressInUse => Errno::EADDRINUSE,
+        net::NetError::AddressNotAvailable => Errno::EADDRNOTAVAIL,
         net::NetError::TimedOut => Errno::ETIMEDOUT,
         net::NetError::ConnectionRefused => Errno::ECONNREFUSED,
         net::NetError::ConnectionReset => Errno::ECONNRESET,

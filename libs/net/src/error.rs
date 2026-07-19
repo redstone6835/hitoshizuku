@@ -22,6 +22,8 @@ pub enum NetError {
     TimedOut,
     /// 本地地址/端口已被占用。
     AddressInUse,
+    /// 请求绑定的地址不属于任何本地接口。
+    AddressNotAvailable,
     /// 操作会阻塞但调用方要求非阻塞（EAGAIN / EWOULDBLOCK）。
     WouldBlock,
     /// 连接被远端重置（收到 RST）。

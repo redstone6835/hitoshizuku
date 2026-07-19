@@ -35,6 +35,10 @@ pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
         (SchedCapability::DacReadSearch, VfsCapability::DacReadSearch),
         (SchedCapability::Fowner, VfsCapability::FOwner),
         (SchedCapability::Fsetid, VfsCapability::FSetId),
+        (
+            SchedCapability::NetBindService,
+            VfsCapability::NetBindService,
+        ),
         (SchedCapability::SysAdmin, VfsCapability::SysAdmin),
         (SchedCapability::SysBoot, VfsCapability::SysAdmin),
         (SchedCapability::SysResource, VfsCapability::SysResource),

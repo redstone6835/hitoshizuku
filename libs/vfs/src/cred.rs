@@ -79,6 +79,8 @@ pub enum Capability {
     SysResource,
     /// 创建特殊文件（`mknod`：块/字符设备节点）。
     MkNod,
+    /// 将 Internet socket 绑定到 1--1023 的特权端口。
+    NetBindService,
 }
 
 impl Capability {
@@ -95,6 +97,7 @@ impl Capability {
             Self::SysAdmin => 1 << 5,
             Self::SysResource => 1 << 6,
             Self::MkNod => 1 << 7,
+            Self::NetBindService => 1 << 8,
         }
     }
 }

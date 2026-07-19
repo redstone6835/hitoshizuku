@@ -10,12 +10,13 @@ use core::any::Any;
 
 use spin::Mutex;
 
-use net::config::{IfConfig, Ipv4Addr};
+use net::config::{CidrAddress, IfConfig, IfMode, Ipv4Addr, Ipv6Addr};
 use net::device::NetDevice;
 use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 
 const LOOPBACK_NAME: &str = "lo";
 const LOOPBACK_IPV4_PREFIX: u8 = 8;
+const LOOPBACK_IPV6_PREFIX: u8 = 128;
 const LOOPBACK_MTU: usize = 65_536;
 const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
 const MAX_LOOPBACK_FREE_FRAMES: usize = 1024;
@@ -138,9 +139,16 @@ pub(crate) fn register() -> Result<LoopbackHandle, net::NetError> {
     let driver: Arc<dyn NetDriver> = Arc::new(LoopbackDriver::new());
     let device = Arc::new(NetDevice::new(LOOPBACK_NAME, driver));
     let id = device.id();
-    let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, LOOPBACK_IPV4_PREFIX, None);
+    let config = IfConfig {
+        addresses: alloc::vec![
+            CidrAddress::new_v4(Ipv4Addr::LOCALHOST, LOOPBACK_IPV4_PREFIX),
+            CidrAddress::new_v6(Ipv6Addr::LOCALHOST, LOOPBACK_IPV6_PREFIX),
+        ],
+        gateway: None,
+        mode: IfMode::Static,
+    };
     stack.attach(Arc::clone(&device), config)?;
-    log::printk!("[loopback] attached lo 127.0.0.1/8");
+    log::printk!("[loopback] attached lo 127.0.0.1/8 ::1/128");
     Ok(LoopbackHandle { device, id })
 }
 

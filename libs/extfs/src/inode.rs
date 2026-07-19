@@ -59,6 +59,40 @@ pub(crate) fn file_type_from_mode(mode: u16) -> FileType {
     }
 }
 
+/// 返回 ext 族文件系统中特殊文件对应的 inode 类型位和目录项类型。
+pub(crate) fn special_file_layout(kind: FileType) -> Option<(u16, u8)> {
+    match kind {
+        FileType::CharDevice => Some((S_IFCHR, DT_CHR)),
+        FileType::BlockDevice => Some((S_IFBLK, DT_BLK)),
+        FileType::Fifo => Some((S_IFIFO, DT_FIFO)),
+        FileType::Socket => Some((S_IFSOCK, DT_SOCK)),
+        FileType::Regular | FileType::Directory | FileType::Symlink => None,
+    }
+}
+
+/// 按 ext2/3/4 的 `i_block[0..2]` 约定编码设备号。
+pub(crate) fn encode_special_device(dev: DevId) -> VfsResult<(u32, u32)> {
+    if dev.major > 0x0fff || dev.minor > 0x0f_ffff {
+        return Err(VfsError::InvalidArgument);
+    }
+    if dev.major < 256 && dev.minor < 256 {
+        return Ok(((dev.major << 8) | dev.minor, 0));
+    }
+    let encoded = (dev.minor & 0xff) | (dev.major << 8) | ((dev.minor & !0xff) << 12);
+    Ok((0, encoded))
+}
+
+/// 解码 ext2/3/4 存储在 `i_block[0..2]` 中的设备号。
+pub(crate) fn decode_special_device(old: u32, new: u32) -> DevId {
+    if old != 0 {
+        return DevId::new((old >> 8) & 0xff, old & 0xff);
+    }
+    DevId::new(
+        (new & 0x000f_ff00) >> 8,
+        (new & 0xff) | ((new >> 12) & 0x000f_ff00),
+    )
+}
+
 fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
     let mode = u16::from_le_bytes([raw[0], raw[1]]);
     let uid_lo = u16::from_le_bytes([raw[2], raw[3]]) as u32;
@@ -262,6 +296,14 @@ fn build_inode_for(
     }
     let (meta, raw) = load_inode(state, ino).map_err(map_err)?;
     let kind = file_type_from_mode(meta.mode);
+    let rdev = if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+        let block = i_block_slice(&raw);
+        let old = u32::from_le_bytes(block[0..4].try_into().unwrap());
+        let new = u32::from_le_bytes(block[4..8].try_into().unwrap());
+        decode_special_device(old, new)
+    } else {
+        DevId::new(0, 0)
+    };
     let mode = FileMode::new((meta.mode & 0o7777) as u16);
     let vmeta = InodeMeta {
         size: meta.size,
@@ -282,7 +324,7 @@ fn build_inode_for(
             ino: ino as u64,
         },
         kind,
-        DevId::new(0, 0),
+        rdev,
         block_size,
         None,
         vmeta,
@@ -674,6 +716,66 @@ impl InodeOps for ExtInodeOps {
         .map_err(map_err)?;
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
+        parent.set_size(new_size);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
+        write_raw(&self.state, &parent).map_err(map_err)?;
+        sync_vfs_meta(inode, &parent);
+        drop(parent);
+
+        let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
+        build_inode_for(&self.state, &sb, new_raw.ino)
+    }
+
+    fn mknod(
+        &self,
+        inode: &Inode,
+        name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        self.check_writable()?;
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(VfsError::InvalidArgument);
+        }
+        let (type_mode, dir_type) = special_file_layout(kind).ok_or(VfsError::InvalidArgument)?;
+        if self.lookup(inode, name).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
+        let encoded_device = if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+            Some(encode_special_device(dev)?)
+        } else {
+            None
+        };
+
+        let full_mode = type_mode | (mode.bits() & 0o7777);
+        let mut new_raw =
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, false, 1)
+                .map_err(map_err)?;
+        if let Some((old, new)) = encoded_device {
+            new_raw.i_block_mut()[0..4].copy_from_slice(&old.to_le_bytes());
+            new_raw.i_block_mut()[4..8].copy_from_slice(&new.to_le_bytes());
+            write_raw(&self.state, &new_raw).map_err(map_err)?;
+        }
+
+        let mut parent = lock_raw(&self.raw);
+        let mut parent_block = copy_i_block(parent.i_block());
+        let mut parent_flags = parent.flags();
+        let new_size = dir_wr::insert_entry(
+            &self.state,
+            self.ino,
+            parent.generation(),
+            &mut parent_block,
+            &mut parent_flags,
+            parent.size(),
+            new_raw.ino,
+            dir_type,
+            name,
+        )
+        .map_err(map_err)?;
+        parent.i_block_mut().copy_from_slice(&parent_block);
+        parent.set_flags(parent_flags);
         parent.set_size(new_size);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;

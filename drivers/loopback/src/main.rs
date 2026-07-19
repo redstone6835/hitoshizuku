@@ -21,6 +21,7 @@ fn map_net_error(error: net::NetError) -> HookError {
         net::NetError::ConnectionRefused => -111,
         net::NetError::TimedOut => -110,
         net::NetError::AddressInUse => -98,
+        net::NetError::AddressNotAvailable => -99,
         net::NetError::WouldBlock => -11,
         net::NetError::ConnectionReset => -104,
         net::NetError::Unreachable => -101,

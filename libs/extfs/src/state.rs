@@ -1576,8 +1576,11 @@ mod tests {
             u32::from_le_bytes([i_block[0], i_block[1], i_block[2], i_block[3]]),
             4
         );
-        // direct 新块由文件写路径覆盖/补零；alloc 路径只允许写分配元数据，
-        // 不能提前写物理数据块 4，否则小块覆盖写会被大量无意义清零拖慢。
+        // direct 新块由文件写路径覆盖/补零；分配位图先进入 write-back cache，
+        // 分配阶段不应同步写块设备。显式 flush 后只能出现位图写入，不能提前
+        // 清零物理数据块 4，否则小块覆盖写会被大量无意义 I/O 拖慢。
+        assert!(backend.writes().is_empty());
+        state.flush_dirty_blocks().expect("flush allocation bitmap");
         let writes = backend.writes();
         assert!(writes.contains(&(2, 2)));
         assert!(!writes.contains(&(8, 2)));
