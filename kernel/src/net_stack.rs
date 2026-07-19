@@ -1,16 +1,16 @@
 //! 常驻网络协议栈 broker。
 //!
-//! 当前阶段只负责 `net.stack` generation 的注册、探测与撤销；真实 packet 和
-//! socket 数据面仍由 `net_runtime` 独占，后续迁移 worker turn 时再接入调用帧。
+//! 常驻 host 负责 `net.stack` generation 生命周期和 worker-turn pinned batch 调用；
+//! packet ownership 只在完整 sidecar 通过校验后由调用方移动。
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use net::stack::{
-    NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_PROBE, NetStackCallV1,
-    NetStackEndpoint, NetStackHandle, NetStackLifecycle, NetStackRegisterError,
-    NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration, NetStackRemoveError,
-    NetStackSnapshot,
+    NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_PROBE,
+    NET_STACK_OP_WORKER_TURN, NetStackCallV1, NetStackEndpoint, NetStackHandle, NetStackLifecycle,
+    NetStackRegisterError, NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration,
+    NetStackRemoveError, NetStackSnapshot, NetStackState, NetStackWorkerTurnV1,
 };
 use sched::sync::Spinlock;
 
@@ -34,12 +34,16 @@ impl Clone for StackCall {
 }
 
 impl StackCall {
-    fn invoke(&self, frame: &mut NetStackCallV1) -> Result<i32, i32> {
+    fn invoke(
+        &self,
+        frame: &mut NetStackCallV1,
+        host_ranges: &[(usize, usize)],
+    ) -> Result<i32, i32> {
         match self {
             Self::Integrated(call) => Ok(call(frame)),
             Self::Pinned(call) => {
                 let deadline = sched::now_ns_public().saturating_add(2_000_000);
-                crate::elm::invoke_pinned_native(&call.lock(), frame, &[], deadline)
+                crate::elm::invoke_pinned_native(&call.lock(), frame, host_ranges, deadline)
             }
         }
     }
@@ -196,7 +200,7 @@ fn probe_active() {
         (record.handle, record.generation, record.call.clone())
     };
     let mut frame = NetStackCallV1::new(NET_STACK_OP_PROBE, generation);
-    let result = call.invoke(&mut frame);
+    let result = call.invoke(&mut frame, &[]);
     let success = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
         && frame.valid(NET_STACK_OP_PROBE, generation)
         && frame.ready == 1
@@ -218,4 +222,74 @@ fn probe_active() {
             result
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerTurnError {
+    StackUnavailable,
+    CallFailed,
+}
+
+/// 在当前 active generation 中执行一次只读 RX batch turn。
+pub(crate) fn worker_turn(
+    input: &net::buf::PacketBatch,
+) -> Result<NetStackWorkerTurnV1, WorkerTurnError> {
+    let (handle, generation, call) = {
+        let broker = BROKER.lock();
+        let snapshot = broker.lifecycle.snapshot();
+        if snapshot.state != NetStackState::Active || !snapshot.probed {
+            return Err(WorkerTurnError::StackUnavailable);
+        }
+        let Some(record) = broker.record.as_ref() else {
+            return Err(WorkerTurnError::StackUnavailable);
+        };
+        (record.handle, record.generation, record.call.clone())
+    };
+
+    let input_pointer = input as *const net::buf::PacketBatch;
+    let input_count = input.len() as u8;
+    let mut turn = NetStackWorkerTurnV1::new(generation, input);
+    let turn_pointer = &mut turn as *mut NetStackWorkerTurnV1;
+    let mut frame = NetStackCallV1::new(NET_STACK_OP_WORKER_TURN, generation);
+    frame.worker_turn = turn_pointer;
+    let Some(turn_range) = host_range(turn_pointer) else {
+        return Err(WorkerTurnError::CallFailed);
+    };
+    let Some(input_range) = host_range(input_pointer) else {
+        return Err(WorkerTurnError::CallFailed);
+    };
+    let result = call.invoke(&mut frame, &[turn_range, input_range]);
+    let valid = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
+        && frame.valid(NET_STACK_OP_WORKER_TURN, generation)
+        && frame.worker_turn == turn_pointer
+        && frame.ready == 0
+        && frame.quiesced == 0
+        && turn.valid_header(generation, input_pointer)
+        && turn.input_count == input_count
+        && input.len() == usize::from(input_count)
+        && turn.fully_committed();
+    if valid {
+        return Ok(turn);
+    }
+
+    let mut broker = BROKER.lock();
+    let current = broker
+        .record
+        .as_ref()
+        .is_some_and(|record| record.handle == handle && record.generation == generation);
+    if current && broker.lifecycle.mark_faulted(handle) {
+        log::error!(
+            "[net-stack] worker turn failed: generation={} handle={} result={:?}",
+            generation,
+            handle.0,
+            result
+        );
+    }
+    Err(WorkerTurnError::CallFailed)
+}
+
+fn host_range<T>(pointer: *const T) -> Option<(usize, usize)> {
+    let start = pointer as usize;
+    let end = start.checked_add(core::mem::size_of::<T>())?;
+    (start != 0 && start < end).then_some((start, end))
 }

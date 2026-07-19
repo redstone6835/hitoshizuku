@@ -60,6 +60,7 @@ pub struct FlowShard {
     neighbors: NeighborTable,
     pmtu: PmtuCache,
     reassembly: ReassemblyTable,
+    reassembled_input: PacketBatch,
     reassembled: VecDeque<FrontendPacket>,
     forwarded_errors: VecDeque<(
         InterfaceId,
@@ -93,6 +94,7 @@ impl FlowShard {
             neighbors: NeighborTable::new(hash_seed),
             pmtu: PmtuCache::new(),
             reassembly: ReassemblyTable::new(),
+            reassembled_input: PacketBatch::new(),
             reassembled: VecDeque::new(),
             forwarded_errors: VecDeque::new(),
             timers: TimerWheel::new(8192, now_ns / 1_000_000),
@@ -521,6 +523,7 @@ impl FlowShard {
         })
     }
 
+    #[cfg(test)]
     pub fn process_rx(
         &mut self,
         context: FlowTurnContext<'_>,
@@ -558,7 +561,10 @@ impl FlowShard {
         for _ in 0..self.reassembly.expire(context.now_ns) {
             record_drop(DropReason::FragmentTimeout);
         }
-        let mut reassembled = PacketBatch::new();
+        assert!(
+            self.reassembled_input.is_empty(),
+            "上一次重组 batch 必须先由常驻 worker 完成 ELM 解析或回收"
+        );
         let len = self.frontend_batch.len();
         for index in 0..len {
             let Some(packet) = self.frontend_batch.take(index) else {
@@ -685,7 +691,7 @@ impl FlowShard {
                     {
                         ReassemblyResult::Pending => {}
                         ReassemblyResult::Complete(chain, metadata) => {
-                            if let Err(chain) = reassembled.push(chain, metadata) {
+                            if let Err(chain) = self.reassembled_input.push(chain, metadata) {
                                 let mut metadata = metadata;
                                 metadata.drop_reason = DropReason::FragmentLimit;
                                 record_drop(DropReason::FragmentLimit);
@@ -811,22 +817,37 @@ impl FlowShard {
                 }
             }
         }
-        if !reassembled.is_empty() {
-            self.frontend.process(
-                context.interface,
-                context.config,
-                &mut reassembled,
-                &mut self.frontend_batch,
-            );
-            let count = self.frontend_batch.len();
-            for index in 0..count {
-                if let Some(packet) = self.frontend_batch.take(index) {
-                    self.reassembled.push_back(packet);
-                }
-            }
-        }
         self.run_timers(context.now_ns);
         self.run_dirty(256);
+    }
+
+    pub fn reassembled_input(&self) -> &PacketBatch {
+        &self.reassembled_input
+    }
+
+    pub fn parse_reassembled(
+        &mut self,
+        context: FlowTurnContext<'_>,
+        ethernet: &[crate::stack::NetStackEthernetV1],
+    ) {
+        self.frontend.process_with_ethernet(
+            context.interface,
+            context.config,
+            &mut self.reassembled_input,
+            ethernet,
+            &mut self.frontend_batch,
+        );
+        let count = self.frontend_batch.len();
+        for index in 0..count {
+            if let Some(packet) = self.frontend_batch.take(index) {
+                self.reassembled.push_back(packet);
+            }
+        }
+    }
+
+    pub fn take_unparsed_reassembled(&mut self) -> Option<(PacketChain, PacketMetadata)> {
+        let count = self.reassembled_input.len();
+        (0..count).find_map(|index| self.reassembled_input.take(index))
     }
 
     pub fn push_frontend(&mut self, packet: FrontendPacket) {
