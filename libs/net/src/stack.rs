@@ -1,6 +1,7 @@
 //! 网络协议栈 ELM 与常驻 host 之间的生命周期契约。
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -9,7 +10,9 @@ use spin::Mutex;
 
 use crate::boot::NetStackBootConfig;
 use crate::buf::{DropReason, PacketBatch, PacketChain, TxBatch, TxPacket};
-use crate::control::{ConfigSnapshot, NeighborKey};
+use crate::control::{
+    BindError, BindRegistry, BindRequest, BindToken, ConfigSnapshot, NeighborKey,
+};
 use crate::flow::{FlowKey, FlowShard, FlowShardStats, UdpSendFailure};
 use crate::pipeline::FrontendPacket;
 use crate::transport::{
@@ -19,8 +22,9 @@ use crate::transport::{
 };
 use crate::tuning::PACKET_BATCH_CAPACITY;
 use crate::{
-    Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId, SocketError,
-    SocketFacade, TcpTxLease, UdpTxLease,
+    Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, ListenGroup, ListenGroupId,
+    MulticastMembership, ShardId, SocketError, SocketFacade, SocketId, TcpTxLease,
+    TransportProtocol, UdpTxLease,
 };
 
 static NEXT_STACK_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -1479,6 +1483,9 @@ impl NetStackWorkerTurnV1 {
 /// 该枚举只在与内核 build-bound 的 Rust ABI 调用中使用；拥有所有权的输入放在
 /// `Option` 中，ELM 仅在确认 generation 与 shard 后取走。
 pub enum NetStackFlowCommand {
+    Control {
+        command: NetStackControlCommand,
+    },
     Stats {
         output: Option<FlowShardStats>,
     },
@@ -1683,6 +1690,1229 @@ pub enum NetStackFlowCommand {
     },
 }
 
+/// 常驻 host 对 ELM 全局网络控制面的同步操作。
+///
+/// 命令与返回值只在一次 build-bound Rust ABI 调用中存活，不允许 ELM 保存其中引用。
+pub enum NetStackControlCommand {
+    InitializeAutoconfig {
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<bool>,
+    },
+    RunDad {
+        now_ns: u64,
+        output: Option<DadRunOutput>,
+    },
+    ObserveDadConflict {
+        interface: InterfaceId,
+        address: Ipv6Addr,
+    },
+    RunDhcp {
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<DhcpRunOutput>,
+    },
+    HandleDhcpPacket {
+        interface: InterfaceId,
+        packet: *const FrontendPacket,
+        now_ns: u64,
+        output: Option<DhcpPacketOutput>,
+    },
+    RemoveAutoconfigInterface {
+        interface: InterfaceId,
+        output: Option<Option<DhcpLeaseChange>>,
+    },
+    ReserveBinding {
+        socket: SocketId,
+        request: BindRequest,
+        shard: ShardId,
+        output: Option<Result<BindToken, BindError>>,
+    },
+    ReleaseBinding {
+        socket: SocketId,
+        output: Option<bool>,
+    },
+    AllocateListener {
+        output: Option<ListenGroupId>,
+    },
+    InstallListener {
+        group: ListenGroupId,
+        output: Option<bool>,
+    },
+    RemoveListener {
+        group: ListenGroupId,
+        output: Option<bool>,
+    },
+    HasListener {
+        group: ListenGroupId,
+        output: Option<bool>,
+    },
+    FlowShard {
+        remote: Endpoint,
+        local: Endpoint,
+        protocol: TransportProtocol,
+        output: Option<ShardId>,
+    },
+    NeighborOwner {
+        key: NeighborKey,
+        output: Option<ShardId>,
+    },
+    EnqueueNeighbor {
+        work: Option<PendingNeighborTx>,
+        now_ns: u64,
+        output: Option<Result<(), PendingNeighborTx>>,
+    },
+    ResolvePendingNeighbor {
+        key: NeighborKey,
+        mac_address: [u8; 6],
+        output: Option<Vec<PendingNeighborTx>>,
+    },
+    FailInterfaceNeighbors {
+        interface: InterfaceId,
+        output: Option<Vec<PendingNeighborTx>>,
+    },
+    RunNeighborTimers {
+        now_ns: u64,
+        output: Option<NeighborTimerOutput>,
+    },
+    JoinMulticast {
+        socket: SocketId,
+        membership: MulticastMembership,
+        interface: InterfaceId,
+        output: Option<Option<bool>>,
+    },
+    LeaveMulticast {
+        socket: SocketId,
+        membership: MulticastMembership,
+        output: Option<Option<(InterfaceId, bool)>>,
+    },
+    MulticastGroups {
+        interface: InterfaceId,
+        output: Option<Vec<IpAddr>>,
+    },
+    RemoveInterfaceMulticast {
+        interface: InterfaceId,
+    },
+    RemoveSocketMulticast {
+        socket: SocketId,
+        output: Option<Vec<(InterfaceId, IpAddr)>>,
+    },
+}
+
+struct DadState {
+    interface: InterfaceId,
+    address: Ipv6Addr,
+    probe_sent: bool,
+    conflict: bool,
+    deadline_ns: u64,
+}
+
+pub struct DadRunOutput {
+    pub probes: Vec<NeighborKey>,
+    pub ready: Vec<(InterfaceId, Ipv6Addr)>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DhcpLease {
+    pub address: Ipv4Addr,
+    pub prefix_len: u8,
+    pub router: Option<Ipv4Addr>,
+    pub dns: Vec<Ipv4Addr>,
+    pub lease_seconds: u32,
+}
+
+enum DhcpPhase {
+    Discovering,
+    Requesting {
+        lease: DhcpLease,
+        server: Ipv4Addr,
+    },
+    Bound {
+        lease: DhcpLease,
+        server: Ipv4Addr,
+        renew_ns: u64,
+        rebind_ns: u64,
+        expires_ns: u64,
+    },
+}
+
+struct DhcpClient {
+    interface: InterfaceId,
+    mac_address: [u8; 6],
+    transaction_id: u32,
+    phase: DhcpPhase,
+    next_action_ns: u64,
+    retry_seconds: u32,
+    installed: Option<DhcpLease>,
+}
+
+struct DhcpReply {
+    message_type: u8,
+    transaction_id: u32,
+    client_mac: [u8; 6],
+    offered: Ipv4Addr,
+    server: Option<Ipv4Addr>,
+    subnet_mask: Option<Ipv4Addr>,
+    router: Option<Ipv4Addr>,
+    dns: Vec<Ipv4Addr>,
+    lease_seconds: Option<u32>,
+    renewal_seconds: Option<u32>,
+    rebinding_seconds: Option<u32>,
+}
+
+pub struct DhcpLeaseChange {
+    pub interface: InterfaceId,
+    pub old: Option<DhcpLease>,
+    pub new: Option<DhcpLease>,
+    pub retained_dns: Vec<Ipv4Addr>,
+}
+
+pub struct DhcpRunOutput {
+    pub frames: Vec<(InterfaceId, Vec<u8>)>,
+    pub lease_changes: Vec<DhcpLeaseChange>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+pub struct DhcpPacketOutput {
+    pub handled: bool,
+    pub lease_change: Option<DhcpLeaseChange>,
+}
+
+pub enum PendingNeighborTx {
+    Tcp(PreparedTcpTx),
+    Udp(PreparedUdpTx),
+    Raw(PreparedRawTx),
+}
+
+impl PendingNeighborTx {
+    pub fn key(&self) -> NeighborKey {
+        match self {
+            Self::Tcp(work) => work.path.unresolved_neighbor,
+            Self::Udp(work) => work.unresolved_neighbor,
+            Self::Raw(work) => work.unresolved_neighbor,
+        }
+        .expect("待解析发送必须携带 neighbor key")
+    }
+
+    pub fn facade(&self) -> Arc<SocketFacade> {
+        match self {
+            Self::Tcp(work) => Arc::clone(&work.facade),
+            Self::Udp(work) => work.payload.facade(),
+            Self::Raw(work) => work.payload.facade(),
+        }
+    }
+
+    pub fn resolve(&mut self, mac_address: [u8; 6]) {
+        match self {
+            Self::Tcp(work) => {
+                work.path.destination_mac = mac_address;
+                work.path.unresolved_neighbor = None;
+            }
+            Self::Udp(work) => {
+                work.destination_mac = mac_address;
+                work.unresolved_neighbor = None;
+            }
+            Self::Raw(work) => {
+                work.destination_mac = mac_address;
+                work.unresolved_neighbor = None;
+            }
+        }
+    }
+}
+
+pub struct NeighborTimerOutput {
+    pub probes: Vec<NeighborKey>,
+    pub expired: Vec<PendingNeighborTx>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+struct PendingNeighbor {
+    packets: VecDeque<PendingNeighborTx>,
+    probes: u8,
+    next_probe_ns: u64,
+    expires_ns: u64,
+}
+
+/// 由 `net.stack` ELM 独占的全局控制面状态。
+pub struct NetStackControlPlane {
+    bind_registry: BindRegistry,
+    bindings: Mutex<BTreeMap<SocketId, BindToken>>,
+    listeners: Mutex<BTreeSet<ListenGroupId>>,
+    next_listener: AtomicU64,
+    rss_key: [u8; 40],
+    shard_count: usize,
+    pending_neighbors_per_interface: Mutex<BTreeMap<InterfaceId, usize>>,
+    pending_neighbors: Mutex<BTreeMap<NeighborKey, PendingNeighbor>>,
+    dad: Mutex<Vec<DadState>>,
+    dad_errors: Mutex<BTreeMap<InterfaceId, SocketError>>,
+    dhcp: Mutex<Vec<DhcpClient>>,
+    multicast_refs: Mutex<BTreeMap<(InterfaceId, IpAddr), usize>>,
+    multicast_bindings: Mutex<BTreeMap<(SocketId, MulticastMembership), InterfaceId>>,
+}
+
+impl NetStackControlPlane {
+    fn new(shard_count: usize, rss_key: [u8; 40], hash_seed: &[u8; 16]) -> Self {
+        Self {
+            bind_registry: BindRegistry::new(shard_count, hash_seed),
+            bindings: Mutex::new(BTreeMap::new()),
+            listeners: Mutex::new(BTreeSet::new()),
+            next_listener: AtomicU64::new(1),
+            rss_key,
+            shard_count: shard_count.max(1),
+            pending_neighbors_per_interface: Mutex::new(BTreeMap::new()),
+            pending_neighbors: Mutex::new(BTreeMap::new()),
+            dad: Mutex::new(Vec::new()),
+            dad_errors: Mutex::new(BTreeMap::new()),
+            dhcp: Mutex::new(Vec::new()),
+            multicast_refs: Mutex::new(BTreeMap::new()),
+            multicast_bindings: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn reserve_binding(
+        &self,
+        socket: SocketId,
+        request: BindRequest,
+        shard: ShardId,
+    ) -> Result<BindToken, BindError> {
+        let token = if request.port == 0 {
+            self.bind_registry.reserve_ephemeral(request, shard)?
+        } else {
+            self.bind_registry.reserve(request)?
+        };
+        if let Some(previous) = self.bindings.lock().insert(socket, token) {
+            let _ = self.bind_registry.release(previous);
+        }
+        Ok(token)
+    }
+
+    fn release_binding(&self, socket: SocketId) -> bool {
+        self.bindings
+            .lock()
+            .remove(&socket)
+            .is_some_and(|token| self.bind_registry.release(token).is_ok())
+    }
+
+    fn flow_shard(
+        &self,
+        remote: Endpoint,
+        local: Endpoint,
+        protocol: TransportProtocol,
+    ) -> ShardId {
+        let key = FlowKey::new(remote, local, protocol).expect("协议 flow 端点必须属于同一地址族");
+        ShardId((crate::flow::rss_hash(&self.rss_key, &key) as usize % self.shard_count) as u16)
+    }
+
+    fn neighbor_owner(&self, key: NeighborKey) -> ShardId {
+        let mut hash = u64::from(key.interface.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let bytes: &[u8] = match &key.address {
+            IpAddr::V4(address) => &address.0,
+            IpAddr::V6(address) => &address.0,
+        };
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+        }
+        ShardId((hash as usize % self.shard_count) as u16)
+    }
+
+    fn reserve_neighbor_packet(&self, interface: InterfaceId) -> bool {
+        let mut counts = self.pending_neighbors_per_interface.lock();
+        let count = counts.entry(interface).or_default();
+        if *count >= 256 {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    fn release_neighbor_packets(&self, interface: InterfaceId, count: usize) {
+        let mut counts = self.pending_neighbors_per_interface.lock();
+        let Some(current) = counts.get_mut(&interface) else {
+            return;
+        };
+        *current = current.saturating_sub(count);
+        if *current == 0 {
+            counts.remove(&interface);
+        }
+    }
+
+    fn enqueue_neighbor(
+        &self,
+        work: PendingNeighborTx,
+        now_ns: u64,
+    ) -> Result<(), PendingNeighborTx> {
+        let key = work.key();
+        let mut pending = self.pending_neighbors.lock();
+        if pending
+            .get(&key)
+            .is_some_and(|entry| entry.packets.len() >= 32)
+            || !self.reserve_neighbor_packet(key.interface)
+        {
+            return Err(work);
+        }
+        pending
+            .entry(key)
+            .or_insert_with(|| PendingNeighbor {
+                packets: VecDeque::new(),
+                probes: 0,
+                next_probe_ns: now_ns,
+                expires_ns: now_ns.saturating_add(3_000_000_000),
+            })
+            .packets
+            .push_back(work);
+        Ok(())
+    }
+
+    fn resolve_pending_neighbor(
+        &self,
+        key: NeighborKey,
+        mac_address: [u8; 6],
+    ) -> Vec<PendingNeighborTx> {
+        let Some(mut pending) = self.pending_neighbors.lock().remove(&key) else {
+            return Vec::new();
+        };
+        self.release_neighbor_packets(key.interface, pending.packets.len());
+        pending
+            .packets
+            .iter_mut()
+            .for_each(|work| work.resolve(mac_address));
+        pending.packets.into_iter().collect()
+    }
+
+    fn fail_interface_neighbors(&self, interface: InterfaceId) -> Vec<PendingNeighborTx> {
+        let mut pending = self.pending_neighbors.lock();
+        let keys = pending
+            .keys()
+            .filter(|key| key.interface == interface)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut failed = Vec::new();
+        for key in keys {
+            if let Some(entry) = pending.remove(&key) {
+                self.release_neighbor_packets(interface, entry.packets.len());
+                failed.extend(entry.packets);
+            }
+        }
+        failed
+    }
+
+    fn run_neighbor_timers(&self, now_ns: u64) -> NeighborTimerOutput {
+        let mut pending = self.pending_neighbors.lock();
+        let keys = pending.keys().copied().collect::<Vec<_>>();
+        let mut probes = Vec::new();
+        let mut expired = Vec::new();
+        for key in keys {
+            if pending
+                .get(&key)
+                .is_some_and(|entry| entry.expires_ns <= now_ns)
+            {
+                let entry = pending.remove(&key).expect("邻居条目必须存在");
+                self.release_neighbor_packets(key.interface, entry.packets.len());
+                expired.extend(entry.packets);
+                continue;
+            }
+            if pending
+                .get(&key)
+                .is_some_and(|entry| entry.probes < 3 && entry.next_probe_ns <= now_ns)
+            {
+                probes.push(key);
+                let entry = pending.get_mut(&key).expect("邻居条目必须存在");
+                entry.probes += 1;
+                entry.next_probe_ns = entry.next_probe_ns.saturating_add(1_000_000_000);
+            }
+        }
+        let next_deadline_ns = pending
+            .values()
+            .map(|entry| {
+                if entry.probes < 3 {
+                    entry.next_probe_ns.min(entry.expires_ns)
+                } else {
+                    entry.expires_ns
+                }
+            })
+            .min();
+        NeighborTimerOutput {
+            probes,
+            expired,
+            next_deadline_ns,
+        }
+    }
+
+    fn initialize_autoconfig(&self, config: &ConfigSnapshot, now_ns: u64) {
+        *self.dad.lock() = initial_dad_states(config, now_ns);
+        self.dad_errors.lock().clear();
+        *self.dhcp.lock() = initial_dhcp_clients(config, now_ns);
+    }
+
+    fn run_dad(&self, now_ns: u64) -> DadRunOutput {
+        let mut dad = self.dad.lock();
+        let mut probes = Vec::new();
+        for state in dad.iter_mut().filter(|state| !state.probe_sent) {
+            probes.push(NeighborKey {
+                interface: state.interface,
+                address: IpAddr::V6(state.address),
+            });
+            state.probe_sent = true;
+        }
+        let mut ready = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut index = 0;
+        while index < dad.len() {
+            if dad[index].deadline_ns > now_ns {
+                index += 1;
+                continue;
+            }
+            let state = dad.swap_remove(index);
+            if state.conflict {
+                conflicts.push(state.interface);
+            } else {
+                ready.push((state.interface, state.address));
+            }
+        }
+        let next_deadline_ns = dad.iter().map(|state| state.deadline_ns).min();
+        drop(dad);
+        let mut errors = self.dad_errors.lock();
+        for interface in conflicts {
+            errors.insert(interface, SocketError::AddressInUse);
+        }
+        DadRunOutput {
+            probes,
+            ready,
+            next_deadline_ns,
+        }
+    }
+
+    fn observe_dad_conflict(&self, interface: InterfaceId, address: Ipv6Addr) {
+        for state in self.dad.lock().iter_mut() {
+            if state.interface == interface && state.address == address {
+                state.conflict = true;
+            }
+        }
+    }
+
+    fn run_dhcp(&self, config: &ConfigSnapshot, now_ns: u64) -> DhcpRunOutput {
+        let mut dhcp = self.dhcp.lock();
+        dhcp.retain(|client| {
+            let configured = config.addresses.iter().find_map(|entry| {
+                (entry.interface == client.interface)
+                    .then_some(entry.address)
+                    .and_then(|address| match address {
+                        IpAddr::V4(address) => Some(address),
+                        IpAddr::V6(_) => None,
+                    })
+            });
+            match (&client.installed, configured) {
+                (Some(lease), Some(address)) => lease.address == address,
+                (None, None) => true,
+                _ => false,
+            }
+        });
+        let mut frames = Vec::new();
+        let mut changes = Vec::new();
+        for index in 0..dhcp.len() {
+            let expired = matches!(
+                &dhcp[index].phase,
+                DhcpPhase::Bound { expires_ns, .. } if *expires_ns <= now_ns
+            );
+            if expired {
+                let interface = dhcp[index].interface;
+                let old = dhcp[index].installed.take();
+                dhcp[index].phase = DhcpPhase::Discovering;
+                dhcp[index].next_action_ns = now_ns;
+                dhcp[index].retry_seconds = 1;
+                changes.push((interface, old, None));
+            }
+            if dhcp[index].next_action_ns > now_ns {
+                continue;
+            }
+            let frame = match &dhcp[index].phase {
+                DhcpPhase::Discovering => build_dhcp_frame(&dhcp[index], 1, None, None),
+                DhcpPhase::Requesting { lease, server } => {
+                    build_dhcp_frame(&dhcp[index], 3, Some(lease.address), Some(*server))
+                }
+                DhcpPhase::Bound {
+                    lease,
+                    server,
+                    renew_ns,
+                    rebind_ns,
+                    ..
+                } if *renew_ns <= now_ns => build_dhcp_frame(
+                    &dhcp[index],
+                    3,
+                    Some(lease.address),
+                    (*rebind_ns > now_ns).then_some(*server),
+                ),
+                DhcpPhase::Bound { renew_ns, .. } => {
+                    dhcp[index].next_action_ns = *renew_ns;
+                    continue;
+                }
+            };
+            frames.push((dhcp[index].interface, frame));
+            let retry = dhcp[index].retry_seconds.clamp(1, 64);
+            dhcp[index].next_action_ns =
+                now_ns.saturating_add(u64::from(retry).saturating_mul(1_000_000_000));
+            dhcp[index].retry_seconds = retry.saturating_mul(2).min(64);
+        }
+        let retained_dns = installed_dns(&dhcp);
+        let lease_changes = changes
+            .into_iter()
+            .map(|(interface, old, new)| DhcpLeaseChange {
+                interface,
+                old,
+                new,
+                retained_dns: retained_dns.clone(),
+            })
+            .collect();
+        DhcpRunOutput {
+            frames,
+            lease_changes,
+            next_deadline_ns: dhcp.iter().map(|client| client.next_action_ns).min(),
+        }
+    }
+
+    fn handle_dhcp_packet(
+        &self,
+        interface: InterfaceId,
+        packet: &FrontendPacket,
+        now_ns: u64,
+    ) -> DhcpPacketOutput {
+        let Some(reply) = parse_dhcp_reply(packet) else {
+            return DhcpPacketOutput {
+                handled: false,
+                lease_change: None,
+            };
+        };
+        let mut dhcp = self.dhcp.lock();
+        let Some(index) = dhcp.iter().position(|client| {
+            client.interface == interface
+                && client.transaction_id == reply.transaction_id
+                && client.mac_address == reply.client_mac
+        }) else {
+            return DhcpPacketOutput {
+                handled: false,
+                lease_change: None,
+            };
+        };
+        let mut change = None;
+        match reply.message_type {
+            2 => {
+                let Some(server) = reply.server else {
+                    return DhcpPacketOutput {
+                        handled: true,
+                        lease_change: None,
+                    };
+                };
+                let prefix_len = reply.subnet_mask.and_then(ipv4_mask_prefix).unwrap_or(24);
+                dhcp[index].phase = DhcpPhase::Requesting {
+                    lease: DhcpLease {
+                        address: reply.offered,
+                        prefix_len,
+                        router: reply.router,
+                        dns: reply.dns,
+                        lease_seconds: reply.lease_seconds.unwrap_or(3600).max(60),
+                    },
+                    server,
+                };
+                dhcp[index].next_action_ns = now_ns;
+                dhcp[index].retry_seconds = 1;
+            }
+            5 => {
+                let (requested, previous_server) = match &dhcp[index].phase {
+                    DhcpPhase::Requesting { lease, server }
+                    | DhcpPhase::Bound { lease, server, .. } => {
+                        (Some(lease.clone()), Some(*server))
+                    }
+                    DhcpPhase::Discovering => (None, None),
+                };
+                let address = if reply.offered == Ipv4Addr::UNSPECIFIED {
+                    requested
+                        .as_ref()
+                        .map(|lease| lease.address)
+                        .unwrap_or(reply.offered)
+                } else {
+                    reply.offered
+                };
+                if address == Ipv4Addr::UNSPECIFIED {
+                    return DhcpPacketOutput {
+                        handled: true,
+                        lease_change: None,
+                    };
+                }
+                let lease = DhcpLease {
+                    address,
+                    prefix_len: reply
+                        .subnet_mask
+                        .and_then(ipv4_mask_prefix)
+                        .or_else(|| requested.as_ref().map(|lease| lease.prefix_len))
+                        .unwrap_or(24),
+                    router: reply
+                        .router
+                        .or_else(|| requested.as_ref().and_then(|lease| lease.router)),
+                    dns: if reply.dns.is_empty() {
+                        requested
+                            .as_ref()
+                            .map(|lease| lease.dns.clone())
+                            .unwrap_or_default()
+                    } else {
+                        reply.dns
+                    },
+                    lease_seconds: reply
+                        .lease_seconds
+                        .or_else(|| requested.as_ref().map(|lease| lease.lease_seconds))
+                        .unwrap_or(3600)
+                        .max(60),
+                };
+                let server = reply
+                    .server
+                    .or(previous_server)
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED);
+                let old = dhcp[index].installed.clone();
+                let renew_seconds = reply
+                    .renewal_seconds
+                    .unwrap_or(lease.lease_seconds / 2)
+                    .clamp(1, lease.lease_seconds.saturating_sub(1));
+                let renew_ns =
+                    now_ns.saturating_add(u64::from(renew_seconds).saturating_mul(1_000_000_000));
+                let rebind_seconds = dhcp_rebind_seconds(
+                    lease.lease_seconds,
+                    renew_seconds,
+                    reply.rebinding_seconds,
+                );
+                let rebind_ns =
+                    now_ns.saturating_add(u64::from(rebind_seconds).saturating_mul(1_000_000_000));
+                let expires_ns = now_ns
+                    .saturating_add(u64::from(lease.lease_seconds).saturating_mul(1_000_000_000));
+                dhcp[index].installed = Some(lease.clone());
+                dhcp[index].phase = DhcpPhase::Bound {
+                    lease: lease.clone(),
+                    server,
+                    renew_ns,
+                    rebind_ns,
+                    expires_ns,
+                };
+                dhcp[index].next_action_ns = renew_ns;
+                dhcp[index].retry_seconds = 1;
+                change = Some((old, Some(lease)));
+            }
+            6 => {
+                let old = dhcp[index].installed.take();
+                dhcp[index].phase = DhcpPhase::Discovering;
+                dhcp[index].next_action_ns = now_ns;
+                dhcp[index].retry_seconds = 1;
+                change = Some((old, None));
+            }
+            _ => {}
+        }
+        let retained_dns = installed_dns(&dhcp);
+        DhcpPacketOutput {
+            handled: true,
+            lease_change: change.map(|(old, new)| DhcpLeaseChange {
+                interface,
+                old,
+                new,
+                retained_dns,
+            }),
+        }
+    }
+
+    fn remove_autoconfig_interface(&self, interface: InterfaceId) -> Option<DhcpLeaseChange> {
+        self.dad.lock().retain(|state| state.interface != interface);
+        self.dad_errors.lock().remove(&interface);
+        let mut dhcp = self.dhcp.lock();
+        let index = dhcp
+            .iter()
+            .position(|client| client.interface == interface)?;
+        let client = dhcp.remove(index);
+        let retained_dns = installed_dns(&dhcp);
+        client.installed.map(|old| DhcpLeaseChange {
+            interface,
+            old: Some(old),
+            new: None,
+            retained_dns,
+        })
+    }
+
+    fn join_multicast(
+        &self,
+        socket: SocketId,
+        membership: MulticastMembership,
+        interface: InterfaceId,
+    ) -> Option<bool> {
+        let key = (socket, membership);
+        if self.multicast_bindings.lock().contains_key(&key) {
+            return None;
+        }
+        self.multicast_bindings.lock().insert(key, interface);
+        let mut refs = self.multicast_refs.lock();
+        let count = refs.entry((interface, membership.group)).or_default();
+        *count += 1;
+        Some(*count == 1)
+    }
+
+    fn leave_multicast(
+        &self,
+        socket: SocketId,
+        membership: MulticastMembership,
+    ) -> Option<(InterfaceId, bool)> {
+        let interface = self
+            .multicast_bindings
+            .lock()
+            .remove(&(socket, membership))?;
+        let mut refs = self.multicast_refs.lock();
+        let key = (interface, membership.group);
+        let count = refs.get_mut(&key)?;
+        *count = count.saturating_sub(1);
+        let last = *count == 0;
+        if last {
+            refs.remove(&key);
+        }
+        Some((interface, last))
+    }
+
+    fn remove_socket_multicast(&self, socket: SocketId) -> Vec<(InterfaceId, IpAddr)> {
+        let memberships = self
+            .multicast_bindings
+            .lock()
+            .keys()
+            .filter_map(|(candidate, membership)| (*candidate == socket).then_some(*membership))
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        for membership in memberships {
+            if let Some((interface, true)) = self.leave_multicast(socket, membership) {
+                removed.push((interface, membership.group));
+            }
+        }
+        removed
+    }
+}
+
+fn initial_dad_states(config: &ConfigSnapshot, now_ns: u64) -> Vec<DadState> {
+    config
+        .interfaces
+        .iter()
+        .filter(|interface| {
+            !interface.loopback && interface.running && interface.mac_address != [0; 6]
+        })
+        .map(|interface| {
+            let mac = interface.mac_address;
+            DadState {
+                interface: interface.id,
+                address: Ipv6Addr([
+                    0xfe,
+                    0x80,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    mac[0] ^ 0x02,
+                    mac[1],
+                    mac[2],
+                    0xff,
+                    0xfe,
+                    mac[3],
+                    mac[4],
+                    mac[5],
+                ]),
+                probe_sent: false,
+                conflict: false,
+                deadline_ns: now_ns.saturating_add(1_000_000_000),
+            }
+        })
+        .collect()
+}
+
+fn initial_dhcp_clients(config: &ConfigSnapshot, now_ns: u64) -> Vec<DhcpClient> {
+    config
+        .interfaces
+        .iter()
+        .filter(|interface| {
+            !interface.loopback
+                && interface.running
+                && interface.mac_address != [0; 6]
+                && !config.addresses.iter().any(|entry| {
+                    entry.interface == interface.id && matches!(entry.address, IpAddr::V4(_))
+                })
+        })
+        .map(|interface| {
+            let mut transaction_id = interface.id.0.wrapping_mul(0x9e37_79b9);
+            for byte in interface.mac_address {
+                transaction_id = transaction_id.rotate_left(5) ^ u32::from(byte);
+            }
+            DhcpClient {
+                interface: interface.id,
+                mac_address: interface.mac_address,
+                transaction_id: transaction_id.max(1),
+                phase: DhcpPhase::Discovering,
+                next_action_ns: now_ns,
+                retry_seconds: 1,
+                installed: None,
+            }
+        })
+        .collect()
+}
+
+fn installed_dns(clients: &[DhcpClient]) -> Vec<Ipv4Addr> {
+    let mut dns = Vec::new();
+    for server in clients
+        .iter()
+        .filter_map(|client| client.installed.as_ref())
+        .flat_map(|lease| lease.dns.iter().copied())
+    {
+        if !dns.contains(&server) {
+            dns.push(server);
+        }
+    }
+    dns
+}
+
+fn build_dhcp_frame(
+    client: &DhcpClient,
+    message_type: u8,
+    requested: Option<Ipv4Addr>,
+    server: Option<Ipv4Addr>,
+) -> Vec<u8> {
+    let mut payload = alloc::vec![0; 300];
+    payload[0] = 1;
+    payload[1] = 1;
+    payload[2] = 6;
+    payload[4..8].copy_from_slice(&client.transaction_id.to_be_bytes());
+    payload[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+    if matches!(&client.phase, DhcpPhase::Bound { .. })
+        && let Some(address) = requested
+    {
+        payload[12..16].copy_from_slice(&address.0);
+    }
+    payload[28..34].copy_from_slice(&client.mac_address);
+    payload[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    let mut offset = 240;
+    payload[offset..offset + 3].copy_from_slice(&[53, 1, message_type]);
+    offset += 3;
+    payload[offset..offset + 9].copy_from_slice(&[
+        61,
+        7,
+        1,
+        client.mac_address[0],
+        client.mac_address[1],
+        client.mac_address[2],
+        client.mac_address[3],
+        client.mac_address[4],
+        client.mac_address[5],
+    ]);
+    offset += 9;
+    if let Some(address) = requested {
+        payload[offset..offset + 6].copy_from_slice(&[
+            50,
+            4,
+            address.0[0],
+            address.0[1],
+            address.0[2],
+            address.0[3],
+        ]);
+        offset += 6;
+    }
+    if let Some(server) = server {
+        payload[offset..offset + 6].copy_from_slice(&[
+            54,
+            4,
+            server.0[0],
+            server.0[1],
+            server.0[2],
+            server.0[3],
+        ]);
+        offset += 6;
+    }
+    payload[offset..offset + 8].copy_from_slice(&[55, 6, 1, 3, 6, 51, 58, 59]);
+    offset += 8;
+    payload[offset] = 255;
+    payload.truncate(offset + 1);
+
+    let udp_len = 8 + payload.len();
+    let mut frame = alloc::vec![0; 14 + 20 + udp_len];
+    frame[..6].fill(0xff);
+    frame[6..12].copy_from_slice(&client.mac_address);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[14] = 0x45;
+    frame[16..18].copy_from_slice(&((20 + udp_len) as u16).to_be_bytes());
+    frame[18..20].copy_from_slice(&(client.transaction_id as u16).to_be_bytes());
+    frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+    frame[22] = 64;
+    frame[23] = 17;
+    frame[30..34].fill(0xff);
+    let checksum = crate::pipeline::checksum_bytes(&frame[14..34]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame[34..36].copy_from_slice(&68u16.to_be_bytes());
+    frame[36..38].copy_from_slice(&67u16.to_be_bytes());
+    frame[38..40].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    frame[42..].copy_from_slice(&payload);
+    frame
+}
+
+fn parse_dhcp_reply(packet: &FrontendPacket) -> Option<DhcpReply> {
+    let udp = packet.parsed.udp?;
+    if udp.source_port != 67 || udp.destination_port != 68 || udp.payload_len < 240 {
+        return None;
+    }
+    let mut payload = alloc::vec![0; usize::from(udp.payload_len)];
+    packet
+        .chain
+        .copy_out(usize::from(udp.payload_offset), &mut payload)
+        .ok()?;
+    if payload[0] != 2
+        || payload[1] != 1
+        || payload[2] != 6
+        || payload[236..240] != [99, 130, 83, 99]
+    {
+        return None;
+    }
+    let mut reply = DhcpReply {
+        message_type: 0,
+        transaction_id: u32::from_be_bytes(payload[4..8].try_into().ok()?),
+        client_mac: payload[28..34].try_into().ok()?,
+        offered: Ipv4Addr(payload[16..20].try_into().ok()?),
+        server: None,
+        subnet_mask: None,
+        router: None,
+        dns: Vec::new(),
+        lease_seconds: None,
+        renewal_seconds: None,
+        rebinding_seconds: None,
+    };
+    let mut offset = 240usize;
+    while offset < payload.len() {
+        let kind = payload[offset];
+        offset += 1;
+        if kind == 0 {
+            continue;
+        }
+        if kind == 255 {
+            break;
+        }
+        let len = usize::from(*payload.get(offset)?);
+        offset += 1;
+        let value = payload.get(offset..offset.checked_add(len)?)?;
+        match (kind, len) {
+            (53, 1) => reply.message_type = value[0],
+            (54, 4) => reply.server = Some(Ipv4Addr(value.try_into().ok()?)),
+            (1, 4) => reply.subnet_mask = Some(Ipv4Addr(value.try_into().ok()?)),
+            (3, len) if len >= 4 => reply.router = Some(Ipv4Addr(value[..4].try_into().ok()?)),
+            (6, len) if len >= 4 => {
+                reply.dns.extend(
+                    value
+                        .chunks_exact(4)
+                        .take(4)
+                        .map(|entry| Ipv4Addr(entry.try_into().unwrap())),
+                );
+            }
+            (51, 4) => reply.lease_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
+            (58, 4) => reply.renewal_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
+            (59, 4) => reply.rebinding_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
+            _ => {}
+        }
+        offset += len;
+    }
+    (reply.message_type != 0).then_some(reply)
+}
+
+fn ipv4_mask_prefix(mask: Ipv4Addr) -> Option<u8> {
+    let value = mask.as_u32();
+    let prefix = value.leading_ones() as u8;
+    let expected = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (value == expected).then_some(prefix)
+}
+
+pub fn dhcp_rebind_seconds(lease_seconds: u32, renew_seconds: u32, offered: Option<u32>) -> u32 {
+    let latest = lease_seconds.saturating_sub(1);
+    let earliest = renew_seconds.saturating_add(1).min(latest);
+    offered
+        .unwrap_or(lease_seconds.saturating_mul(7) / 8)
+        .clamp(earliest, latest)
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.create_control_plane",
+    contract = "kernel.net.stack-control-state@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn create_control_plane(
+    shard_count: usize,
+    rss_key: [u8; 40],
+    hash_seed: &[u8; 16],
+) -> NetStackControlPlane {
+    NetStackControlPlane::new(shard_count, rss_key, hash_seed)
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.destroy_control_plane",
+    contract = "kernel.net.stack-control-state@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn destroy_control_plane(plane: NetStackControlPlane) {
+    drop(plane);
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.dispatch_control_plane_call",
+    contract = "kernel.net.stack-control-state@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn dispatch_control_plane_call(
+    plane: &NetStackControlPlane,
+    command: &mut NetStackControlCommand,
+) {
+    match command {
+        NetStackControlCommand::InitializeAutoconfig {
+            config,
+            now_ns,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return;
+            }
+            // Safety: config 只在同步 control-call 期间借用。
+            let config = unsafe { &**config };
+            plane.initialize_autoconfig(config, *now_ns);
+            *output = Some(true);
+        }
+        NetStackControlCommand::RunDad { now_ns, output } => {
+            *output = Some(plane.run_dad(*now_ns));
+        }
+        NetStackControlCommand::ObserveDadConflict { interface, address } => {
+            plane.observe_dad_conflict(*interface, *address);
+        }
+        NetStackControlCommand::RunDhcp {
+            config,
+            now_ns,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return;
+            }
+            // Safety: config 只在同步 control-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(plane.run_dhcp(config, *now_ns));
+        }
+        NetStackControlCommand::HandleDhcpPacket {
+            interface,
+            packet,
+            now_ns,
+            output,
+        } => {
+            if packet.is_null() || !packet.is_aligned() {
+                return;
+            }
+            // Safety: packet 只在同步 control-call 期间借用。
+            let packet = unsafe { &**packet };
+            *output = Some(plane.handle_dhcp_packet(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::RemoveAutoconfigInterface { interface, output } => {
+            *output = Some(plane.remove_autoconfig_interface(*interface));
+        }
+        NetStackControlCommand::ReserveBinding {
+            socket,
+            request,
+            shard,
+            output,
+        } => *output = Some(plane.reserve_binding(*socket, *request, *shard)),
+        NetStackControlCommand::ReleaseBinding { socket, output } => {
+            *output = Some(plane.release_binding(*socket));
+        }
+        NetStackControlCommand::AllocateListener { output } => {
+            let id = plane.next_listener.fetch_add(1, Ordering::Relaxed);
+            assert!(id != 0, "ListenGroupId 已耗尽");
+            *output = Some(ListenGroupId(id));
+        }
+        NetStackControlCommand::InstallListener { group, output } => {
+            *output = Some(plane.listeners.lock().insert(*group));
+        }
+        NetStackControlCommand::RemoveListener { group, output } => {
+            *output = Some(plane.listeners.lock().remove(group));
+        }
+        NetStackControlCommand::HasListener { group, output } => {
+            *output = Some(plane.listeners.lock().contains(group));
+        }
+        NetStackControlCommand::FlowShard {
+            remote,
+            local,
+            protocol,
+            output,
+        } => *output = Some(plane.flow_shard(*remote, *local, *protocol)),
+        NetStackControlCommand::NeighborOwner { key, output } => {
+            *output = Some(plane.neighbor_owner(*key));
+        }
+        NetStackControlCommand::EnqueueNeighbor {
+            work,
+            now_ns,
+            output,
+        } => {
+            let Some(work) = work.take() else {
+                return;
+            };
+            *output = Some(plane.enqueue_neighbor(work, *now_ns));
+        }
+        NetStackControlCommand::ResolvePendingNeighbor {
+            key,
+            mac_address,
+            output,
+        } => {
+            *output = Some(plane.resolve_pending_neighbor(*key, *mac_address));
+        }
+        NetStackControlCommand::FailInterfaceNeighbors { interface, output } => {
+            *output = Some(plane.fail_interface_neighbors(*interface));
+        }
+        NetStackControlCommand::RunNeighborTimers { now_ns, output } => {
+            *output = Some(plane.run_neighbor_timers(*now_ns));
+        }
+        NetStackControlCommand::JoinMulticast {
+            socket,
+            membership,
+            interface,
+            output,
+        } => *output = Some(plane.join_multicast(*socket, *membership, *interface)),
+        NetStackControlCommand::LeaveMulticast {
+            socket,
+            membership,
+            output,
+        } => *output = Some(plane.leave_multicast(*socket, *membership)),
+        NetStackControlCommand::MulticastGroups { interface, output } => {
+            *output = Some(
+                plane
+                    .multicast_refs
+                    .lock()
+                    .keys()
+                    .filter_map(|(candidate, group)| (*candidate == *interface).then_some(*group))
+                    .collect(),
+            );
+        }
+        NetStackControlCommand::RemoveInterfaceMulticast { interface } => {
+            plane
+                .multicast_bindings
+                .lock()
+                .retain(|_, bound| *bound != *interface);
+            plane
+                .multicast_refs
+                .lock()
+                .retain(|(bound, _), _| *bound != *interface);
+        }
+        NetStackControlCommand::RemoveSocketMulticast { socket, output } => {
+            *output = Some(plane.remove_socket_multicast(*socket));
+        }
+    }
+}
+
 /// 一次代际固定的 `FlowShard` 状态调用。
 #[repr(C)]
 pub struct NetStackFlowCallV1 {
@@ -1768,6 +2998,7 @@ pub fn destroy_flow_shard(shard: FlowShard) {
 )]
 pub fn dispatch_flow_shard_call(shard: &mut FlowShard, call: &mut NetStackFlowCallV1) -> bool {
     match &mut call.command {
+        NetStackFlowCommand::Control { .. } => return false,
         NetStackFlowCommand::Stats { output } => *output = Some(shard.stats()),
         NetStackFlowCommand::RunDueTimers { now_ns } => shard.run_due_timers(*now_ns),
         NetStackFlowCommand::NextTimerDeadline { output } => {
@@ -2604,6 +3835,196 @@ impl Default for NetStackLifecycle {
 mod tests {
     use super::*;
     use crate::buf::{PacketChain, PacketMetadata};
+
+    #[test]
+    fn control_plane_owns_binding_neighbor_and_multicast_lifecycles() {
+        let plane = NetStackControlPlane::new(2, [7; 40], &[11; 16]);
+        let socket_a = SocketId {
+            boot_nonce: 1,
+            counter: 1,
+        };
+        let socket_b = SocketId {
+            boot_nonce: 1,
+            counter: 2,
+        };
+        let address = IpAddr::V4(crate::Ipv4Addr::new(10, 0, 2, 15));
+        let request = BindRequest {
+            owner: socket_a.counter,
+            family: crate::AddressFamily::Ipv4,
+            protocol: TransportProtocol::Udp,
+            address: crate::control::BindAddress::Specified(address),
+            port: 9000,
+            interface: Some(InterfaceId(1)),
+            options: crate::control::BindOptions::default(),
+        };
+        assert_eq!(
+            plane.reserve_binding(socket_a, request, ShardId(0)),
+            Ok(BindToken { id: 1, port: 9000 })
+        );
+        assert_eq!(
+            plane.reserve_binding(
+                socket_b,
+                BindRequest {
+                    owner: socket_b.counter,
+                    ..request
+                },
+                ShardId(1),
+            ),
+            Err(BindError::AddressInUse)
+        );
+        assert!(plane.release_binding(socket_a));
+        assert!(
+            plane
+                .reserve_binding(
+                    socket_b,
+                    BindRequest {
+                        owner: socket_b.counter,
+                        ..request
+                    },
+                    ShardId(1),
+                )
+                .is_ok()
+        );
+
+        let neighbor = NeighborKey {
+            interface: InterfaceId(1),
+            address,
+        };
+        assert_eq!(plane.neighbor_owner(neighbor).0 < 2, true);
+        for _ in 0..256 {
+            assert!(plane.reserve_neighbor_packet(InterfaceId(1)));
+        }
+        assert!(!plane.reserve_neighbor_packet(InterfaceId(1)));
+        plane.release_neighbor_packets(InterfaceId(1), 256);
+        assert!(plane.reserve_neighbor_packet(InterfaceId(1)));
+
+        let membership = MulticastMembership {
+            group: IpAddr::V4(crate::Ipv4Addr::new(239, 1, 2, 3)),
+            interface: Some(InterfaceId(1)),
+        };
+        assert_eq!(
+            plane.join_multicast(socket_a, membership, InterfaceId(1)),
+            Some(true)
+        );
+        assert_eq!(
+            plane.join_multicast(socket_b, membership, InterfaceId(1)),
+            Some(false)
+        );
+        assert_eq!(
+            plane.leave_multicast(socket_a, membership),
+            Some((InterfaceId(1), false))
+        );
+        assert_eq!(
+            plane.remove_socket_multicast(socket_b),
+            alloc::vec![(InterfaceId(1), membership.group)]
+        );
+    }
+
+    #[test]
+    fn control_plane_owns_dad_and_dhcp_timers() {
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new(1, [3; 40], &[5; 16]);
+        plane.initialize_autoconfig(&config, 100);
+
+        let first_dad = plane.run_dad(100);
+        assert_eq!(first_dad.probes.len(), 1);
+        assert!(first_dad.ready.is_empty());
+        let address = first_dad.probes[0].address;
+        let IpAddr::V6(address) = address else {
+            unreachable!();
+        };
+        plane.observe_dad_conflict(InterfaceId(1), address);
+        let conflict = plane.run_dad(1_100_000_100);
+        assert!(conflict.ready.is_empty());
+
+        plane.initialize_autoconfig(&config, 200);
+        let discover = plane.run_dhcp(&config, 200);
+        assert_eq!(discover.frames.len(), 1);
+        assert_eq!(discover.frames[0].0, InterfaceId(1));
+        assert_eq!(discover.frames[0].1[34..38], [0, 68, 0, 67]);
+        assert!(plane.run_dhcp(&config, 200).frames.is_empty());
+
+        let (transaction_id, client_mac) = {
+            let dhcp = plane.dhcp.lock();
+            (dhcp[0].transaction_id, dhcp[0].mac_address)
+        };
+        let reply = |message_type: u8| {
+            let mut payload = alloc::vec![0; 256];
+            payload[0] = 2;
+            payload[1] = 1;
+            payload[2] = 6;
+            payload[4..8].copy_from_slice(&transaction_id.to_be_bytes());
+            payload[16..20].copy_from_slice(&[10, 0, 2, 20]);
+            payload[28..34].copy_from_slice(&client_mac);
+            payload[236..240].copy_from_slice(&[99, 130, 83, 99]);
+            payload[240..243].copy_from_slice(&[53, 1, message_type]);
+            payload[243..249].copy_from_slice(&[54, 4, 10, 0, 2, 2]);
+            payload[249..255].copy_from_slice(&[51, 4, 0, 0, 0, 60]);
+            payload[255] = 255;
+            FrontendPacket {
+                chain: PacketChain::from_owned(payload),
+                metadata: PacketMetadata::default(),
+                parsed: crate::pipeline::ParsedPacket {
+                    ethernet: crate::pipeline::EthernetHeader {
+                        destination: client_mac,
+                        source: [1; 6],
+                        ethertype: 0x0800,
+                    },
+                    ip: None,
+                    tcp: None,
+                    udp: Some(crate::pipeline::UdpPacket {
+                        source_port: 67,
+                        destination_port: 68,
+                        payload_offset: 0,
+                        payload_len: 256,
+                    }),
+                    flow: None,
+                    rss_hash: None,
+                    disposition: crate::pipeline::FrontendDisposition::Udp,
+                },
+            }
+        };
+        let offer = plane.handle_dhcp_packet(InterfaceId(1), &reply(2), 300);
+        assert!(offer.handled);
+        assert!(offer.lease_change.is_none());
+        assert_eq!(plane.run_dhcp(&config, 300).frames.len(), 1);
+        let ack = plane.handle_dhcp_packet(InterfaceId(1), &reply(5), 400);
+        let lease = ack.lease_change.unwrap().new.unwrap();
+        assert_eq!(lease.address, Ipv4Addr::new(10, 0, 2, 20));
+        assert_eq!(lease.lease_seconds, 60);
+        let configured = ConfigSnapshot::new(
+            2,
+            config.interfaces.clone(),
+            alloc::vec![crate::control::AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V4(lease.address),
+                prefix_len: lease.prefix_len,
+                primary: true,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plane.run_dhcp(&configured, 400).next_deadline_ns,
+            Some(30_000_000_400)
+        );
+        assert_eq!(dhcp_rebind_seconds(800, 400, Some(1)), 401);
+    }
 
     #[test]
     fn call_frame_rejects_stale_generation_and_reserved_bits() {

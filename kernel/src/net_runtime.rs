@@ -1,7 +1,7 @@
 //! 网络设备接管与 NetWorker 运行时。
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
@@ -15,8 +15,8 @@ use net::buf::{
     PacketMetadata, RxRefillBatch, TxBatch, TxPacket,
 };
 use net::control::{
-    AddressEntry, BindAddress, BindError, BindOptions, BindRegistry, BindRequest, BindToken,
-    ConfigSnapshot, ConfigStore, InterfaceSnapshot, RouteEntry,
+    AddressEntry, BindAddress, BindError, BindOptions, BindRequest, ConfigSnapshot, ConfigStore,
+    InterfaceSnapshot, RouteEntry,
 };
 use net::device::{
     NET_QUEUE_CALL_RUST_ABI, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
@@ -30,6 +30,7 @@ use net::flow::FlowKey;
 use net::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
 use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
+use net::stack::PendingNeighborTx;
 use net::transport::{
     LocalUdpIngressError, PreparedRawTx, PreparedTcpTx, PreparedUdpTx, RawTxError, TcpPacket,
     TcpPath, build_raw_packet, build_tcp_packet, build_udp_packet_with_options,
@@ -1023,111 +1024,6 @@ fn allocate_payload_chain(
     Ok(chain)
 }
 
-enum PendingNeighborTx {
-    Tcp(PreparedTcpTx),
-    Udp(PreparedUdpTx),
-    Raw(PreparedRawTx),
-}
-
-impl PendingNeighborTx {
-    fn key(&self) -> net::control::NeighborKey {
-        match self {
-            Self::Tcp(work) => work.path.unresolved_neighbor,
-            Self::Udp(work) => work.unresolved_neighbor,
-            Self::Raw(work) => work.unresolved_neighbor,
-        }
-        .expect("待解析发送必须携带 neighbor key")
-    }
-
-    fn facade(&self) -> Arc<SocketFacade> {
-        match self {
-            Self::Tcp(work) => Arc::clone(&work.facade),
-            Self::Udp(work) => work.payload.facade(),
-            Self::Raw(work) => work.payload.facade(),
-        }
-    }
-
-    fn resolve(&mut self, mac_address: [u8; 6]) {
-        match self {
-            Self::Tcp(work) => {
-                work.path.destination_mac = mac_address;
-                work.path.unresolved_neighbor = None;
-            }
-            Self::Udp(work) => {
-                work.destination_mac = mac_address;
-                work.unresolved_neighbor = None;
-            }
-            Self::Raw(work) => {
-                work.destination_mac = mac_address;
-                work.unresolved_neighbor = None;
-            }
-        }
-    }
-}
-
-struct PendingNeighbor {
-    packets: VecDeque<PendingNeighborTx>,
-    probes: u8,
-    next_probe_ns: u64,
-    expires_ns: u64,
-}
-
-struct DadState {
-    interface: InterfaceId,
-    address: Ipv6Addr,
-    probe_sent: bool,
-    conflict: bool,
-    deadline_ns: u64,
-}
-
-#[derive(Clone)]
-struct DhcpLease {
-    address: Ipv4Addr,
-    prefix_len: u8,
-    router: Option<Ipv4Addr>,
-    dns: Vec<Ipv4Addr>,
-    lease_seconds: u32,
-}
-
-enum DhcpPhase {
-    Discovering,
-    Requesting {
-        lease: DhcpLease,
-        server: Ipv4Addr,
-    },
-    Bound {
-        lease: DhcpLease,
-        server: Ipv4Addr,
-        renew_ns: u64,
-        rebind_ns: u64,
-        expires_ns: u64,
-    },
-}
-
-struct DhcpClient {
-    interface: InterfaceId,
-    mac_address: [u8; 6],
-    transaction_id: u32,
-    phase: DhcpPhase,
-    next_action_ns: u64,
-    retry_seconds: u32,
-    installed: Option<DhcpLease>,
-}
-
-struct DhcpReply {
-    message_type: u8,
-    transaction_id: u32,
-    client_mac: [u8; 6],
-    offered: Ipv4Addr,
-    server: Option<Ipv4Addr>,
-    subnet_mask: Option<Ipv4Addr>,
-    router: Option<Ipv4Addr>,
-    dns: Vec<Ipv4Addr>,
-    lease_seconds: Option<u32>,
-    renewal_seconds: Option<u32>,
-    rebinding_seconds: Option<u32>,
-}
-
 enum ControlWork {
     Socket(SocketCommand),
     ConnectTcp {
@@ -1190,96 +1086,6 @@ impl InterfaceGoneBarrier {
     }
 }
 
-struct ControlPlane {
-    bind_registry: BindRegistry,
-    bindings: Spinlock<BTreeMap<net::SocketId, BindToken>>,
-    listeners: Spinlock<BTreeMap<ListenGroupId, Arc<ListenGroup>>>,
-    next_listener: AtomicU64,
-    rss_key: [u8; 40],
-    shard_count: usize,
-    pending_neighbors_per_interface: Spinlock<BTreeMap<InterfaceId, usize>>,
-    dad_errors: Spinlock<BTreeMap<InterfaceId, SocketError>>,
-    multicast_refs: Spinlock<BTreeMap<(InterfaceId, IpAddr), usize>>,
-    multicast_bindings: Spinlock<BTreeMap<(net::SocketId, net::MulticastMembership), InterfaceId>>,
-}
-
-impl ControlPlane {
-    fn new(shard_count: usize, rss_key: [u8; 40], hash_seed: &[u8; 16]) -> Self {
-        Self {
-            bind_registry: BindRegistry::new(shard_count, hash_seed),
-            bindings: Spinlock::new(BTreeMap::new()),
-            listeners: Spinlock::new(BTreeMap::new()),
-            next_listener: AtomicU64::new(1),
-            rss_key,
-            shard_count,
-            pending_neighbors_per_interface: Spinlock::new(BTreeMap::new()),
-            dad_errors: Spinlock::new(BTreeMap::new()),
-            multicast_refs: Spinlock::new(BTreeMap::new()),
-            multicast_bindings: Spinlock::new(BTreeMap::new()),
-        }
-    }
-
-    fn allocate_listener_id(&self) -> ListenGroupId {
-        let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
-        assert!(id != 0, "ListenGroupId 已耗尽");
-        ListenGroupId(id)
-    }
-
-    fn flow_shard(
-        &self,
-        remote: Endpoint,
-        local: Endpoint,
-        protocol: TransportProtocol,
-    ) -> ShardId {
-        let key = net::flow::FlowKey::new(remote, local, protocol)
-            .expect("协议 flow 端点必须属于同一地址族");
-        ShardId((net::flow::rss_hash(&self.rss_key, &key) as usize % self.shard_count) as u16)
-    }
-
-    fn neighbor_owner(&self, key: net::control::NeighborKey) -> ShardId {
-        let mut hash = u64::from(key.interface.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let bytes: &[u8] = match &key.address {
-            IpAddr::V4(address) => &address.0,
-            IpAddr::V6(address) => &address.0,
-        };
-        for byte in bytes {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
-        }
-        ShardId((hash as usize % self.shard_count) as u16)
-    }
-
-    fn reserve_neighbor_packet(&self, interface: InterfaceId) -> bool {
-        let mut counts = self.pending_neighbors_per_interface.lock();
-        let count = counts.entry(interface).or_default();
-        if *count >= 256 {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    fn release_neighbor_packets(&self, interface: InterfaceId, count: usize) {
-        let mut counts = self.pending_neighbors_per_interface.lock();
-        let Some(current) = counts.get_mut(&interface) else {
-            return;
-        };
-        *current = current.saturating_sub(count);
-        if *current == 0 {
-            counts.remove(&interface);
-        }
-    }
-
-    fn remember_binding(&self, socket: net::SocketId, token: BindToken) {
-        self.bindings.lock().insert(socket, token);
-    }
-
-    fn release_binding(&self, socket: net::SocketId) {
-        if let Some(token) = self.bindings.lock().remove(&socket) {
-            let _ = self.bind_registry.release(token);
-        }
-    }
-}
-
 struct ListenerInstall {
     facade: Arc<SocketFacade>,
     group: Arc<ListenGroup>,
@@ -1290,7 +1096,7 @@ struct ListenerInstall {
     generation: u32,
     remaining: AtomicUsize,
     failed: AtomicBool,
-    control: Arc<ControlPlane>,
+    control: crate::net_stack::ElmControlPlane,
     cluster: Arc<ProtocolCluster>,
 }
 
@@ -1302,7 +1108,10 @@ impl ListenerInstall {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        if self.failed.load(Ordering::Acquire) || self.facade.generation() != self.generation {
+        if self.failed.load(Ordering::Acquire)
+            || self.facade.generation() != self.generation
+            || !self.control.install_listener(self.group.id())
+        {
             self.group.close();
             for runtime in &self.cluster.shards {
                 let mut work = ControlWork::DiscardListener {
@@ -1328,10 +1137,6 @@ impl ListenerInstall {
                 .complete_control(self.sequence, Err(SocketError::InvalidState));
             return;
         }
-        self.control
-            .listeners
-            .lock()
-            .insert(self.group.id(), Arc::clone(&self.group));
         self.facade.install_listen_group(Arc::clone(&self.group));
         self.facade.publish_binding(
             OwnerRef::Listener {
@@ -1350,7 +1155,7 @@ struct ListenerRemove {
     facade: Arc<SocketFacade>,
     group: ListenGroupId,
     remaining: AtomicUsize,
-    control: Arc<ControlPlane>,
+    control: crate::net_stack::ElmControlPlane,
 }
 
 impl ListenerRemove {
@@ -1358,7 +1163,7 @@ impl ListenerRemove {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        self.control.listeners.lock().remove(&self.group);
+        self.control.remove_listener(self.group);
         self.control.release_binding(self.facade.id());
         self.facade.publish_closed();
     }
@@ -1941,222 +1746,6 @@ fn build_device_config(devices: &[DeviceRecord], generation: u64) -> ConfigSnaps
         .expect("启动网络配置无效")
 }
 
-fn initial_dad_states(config: &ConfigSnapshot, now_ns: u64) -> Vec<DadState> {
-    config
-        .interfaces
-        .iter()
-        .filter(|interface| {
-            !interface.loopback && interface.running && interface.mac_address != [0; 6]
-        })
-        .map(|interface| {
-            let mac = interface.mac_address;
-            let address = Ipv6Addr([
-                0xfe,
-                0x80,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                mac[0] ^ 0x02,
-                mac[1],
-                mac[2],
-                0xff,
-                0xfe,
-                mac[3],
-                mac[4],
-                mac[5],
-            ]);
-            DadState {
-                interface: interface.id,
-                address,
-                probe_sent: false,
-                conflict: false,
-                deadline_ns: now_ns.saturating_add(1_000_000_000),
-            }
-        })
-        .collect()
-}
-
-fn initial_dhcp_clients(config: &ConfigSnapshot, now_ns: u64) -> Vec<DhcpClient> {
-    config
-        .interfaces
-        .iter()
-        .filter(|interface| {
-            !interface.loopback
-                && interface.running
-                && interface.mac_address != [0; 6]
-                && !config.addresses.iter().any(|entry| {
-                    entry.interface == interface.id && matches!(entry.address, IpAddr::V4(_))
-                })
-        })
-        .map(|interface| {
-            let mut transaction_id = interface.id.0.wrapping_mul(0x9e37_79b9);
-            for byte in interface.mac_address {
-                transaction_id = transaction_id.rotate_left(5) ^ u32::from(byte);
-            }
-            DhcpClient {
-                interface: interface.id,
-                mac_address: interface.mac_address,
-                transaction_id: transaction_id.max(1),
-                phase: DhcpPhase::Discovering,
-                next_action_ns: now_ns,
-                retry_seconds: 1,
-                installed: None,
-            }
-        })
-        .collect()
-}
-
-fn build_dhcp_frame(
-    client: &DhcpClient,
-    message_type: u8,
-    requested: Option<Ipv4Addr>,
-    server: Option<Ipv4Addr>,
-) -> Vec<u8> {
-    let mut payload = alloc::vec![0; 300];
-    payload[0] = 1;
-    payload[1] = 1;
-    payload[2] = 6;
-    payload[4..8].copy_from_slice(&client.transaction_id.to_be_bytes());
-    payload[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
-    if matches!(&client.phase, DhcpPhase::Bound { .. }) {
-        if let Some(address) = requested {
-            payload[12..16].copy_from_slice(&address.0);
-        }
-    }
-    payload[28..34].copy_from_slice(&client.mac_address);
-    payload[236..240].copy_from_slice(&[99, 130, 83, 99]);
-    let mut offset = 240;
-    payload[offset..offset + 3].copy_from_slice(&[53, 1, message_type]);
-    offset += 3;
-    payload[offset..offset + 9].copy_from_slice(&[
-        61,
-        7,
-        1,
-        client.mac_address[0],
-        client.mac_address[1],
-        client.mac_address[2],
-        client.mac_address[3],
-        client.mac_address[4],
-        client.mac_address[5],
-    ]);
-    offset += 9;
-    if let Some(address) = requested {
-        payload[offset..offset + 6].copy_from_slice(&[
-            50,
-            4,
-            address.0[0],
-            address.0[1],
-            address.0[2],
-            address.0[3],
-        ]);
-        offset += 6;
-    }
-    if let Some(server) = server {
-        payload[offset..offset + 6].copy_from_slice(&[
-            54,
-            4,
-            server.0[0],
-            server.0[1],
-            server.0[2],
-            server.0[3],
-        ]);
-        offset += 6;
-    }
-    payload[offset..offset + 8].copy_from_slice(&[55, 6, 1, 3, 6, 51, 58, 59]);
-    offset += 8;
-    payload[offset] = 255;
-    payload.truncate(offset + 1);
-
-    let udp_len = 8 + payload.len();
-    let mut frame = alloc::vec![0; 14 + 20 + udp_len];
-    frame[..6].fill(0xff);
-    frame[6..12].copy_from_slice(&client.mac_address);
-    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-    frame[14] = 0x45;
-    frame[16..18].copy_from_slice(&((20 + udp_len) as u16).to_be_bytes());
-    frame[18..20].copy_from_slice(&(client.transaction_id as u16).to_be_bytes());
-    frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
-    frame[22] = 64;
-    frame[23] = 17;
-    frame[30..34].fill(0xff);
-    let checksum = net::pipeline::checksum_bytes(&frame[14..34]);
-    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
-    frame[34..36].copy_from_slice(&68u16.to_be_bytes());
-    frame[36..38].copy_from_slice(&67u16.to_be_bytes());
-    frame[38..40].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    frame[42..].copy_from_slice(&payload);
-    frame
-}
-
-fn parse_dhcp_reply(packet: &FrontendPacket) -> Option<DhcpReply> {
-    let udp = packet.parsed.udp?;
-    if udp.source_port != 67 || udp.destination_port != 68 || udp.payload_len < 240 {
-        return None;
-    }
-    let mut payload = alloc::vec![0; usize::from(udp.payload_len)];
-    packet
-        .chain
-        .copy_out(usize::from(udp.payload_offset), &mut payload)
-        .ok()?;
-    if payload[0] != 2
-        || payload[1] != 1
-        || payload[2] != 6
-        || payload[236..240] != [99, 130, 83, 99]
-    {
-        return None;
-    }
-    let mut reply = DhcpReply {
-        message_type: 0,
-        transaction_id: u32::from_be_bytes(payload[4..8].try_into().ok()?),
-        client_mac: payload[28..34].try_into().ok()?,
-        offered: Ipv4Addr(payload[16..20].try_into().ok()?),
-        server: None,
-        subnet_mask: None,
-        router: None,
-        dns: Vec::new(),
-        lease_seconds: None,
-        renewal_seconds: None,
-        rebinding_seconds: None,
-    };
-    let mut offset = 240usize;
-    while offset < payload.len() {
-        let kind = payload[offset];
-        offset += 1;
-        if kind == 0 {
-            continue;
-        }
-        if kind == 255 {
-            break;
-        }
-        let len = usize::from(*payload.get(offset)?);
-        offset += 1;
-        let value = payload.get(offset..offset.checked_add(len)?)?;
-        match (kind, len) {
-            (53, 1) => reply.message_type = value[0],
-            (54, 4) => reply.server = Some(Ipv4Addr(value.try_into().ok()?)),
-            (1, 4) => reply.subnet_mask = Some(Ipv4Addr(value.try_into().ok()?)),
-            (3, len) if len >= 4 => reply.router = Some(Ipv4Addr(value[..4].try_into().ok()?)),
-            (6, len) if len >= 4 => {
-                reply.dns.extend(
-                    value
-                        .chunks_exact(4)
-                        .take(4)
-                        .map(|entry| Ipv4Addr(entry.try_into().unwrap())),
-                );
-            }
-            (51, 4) => reply.lease_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
-            (58, 4) => reply.renewal_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
-            (59, 4) => reply.rebinding_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
-            _ => {}
-        }
-        offset += len;
-    }
-    (reply.message_type != 0).then_some(reply)
-}
-
 fn ipv4_mask_prefix(mask: Ipv4Addr) -> Option<u8> {
     let value = mask.as_u32();
     let prefix = value.leading_ones() as u8;
@@ -2596,15 +2185,12 @@ struct PendingWorker {
 struct ProtocolContext {
     runtime: Arc<ProtocolRuntime>,
     cluster: Arc<ProtocolCluster>,
-    control_plane: Arc<ControlPlane>,
+    control_plane: crate::net_stack::ElmControlPlane,
     config: Arc<ConfigStore>,
     protocol: crate::net_stack::ElmFlowShard,
     recycle: PacketBatch,
     tx: TxBatch,
     pending: [Option<IngressWork>; 32],
-    pending_neighbors: BTreeMap<net::control::NeighborKey, PendingNeighbor>,
-    dad: Vec<DadState>,
-    dhcp: Vec<DhcpClient>,
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
     udp_probe_flow: Option<FlowId>,
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -2647,11 +2233,11 @@ pub fn start_workers() {
     let config = Arc::new(ConfigStore::new(build_device_config(&devices, 1)));
     *CONFIG_STORE.lock() = Some(Arc::clone(&config));
     drop(devices);
-    let control_plane = Arc::new(ControlPlane::new(
-        active_cpus.len(),
-        *boot.rss_key(),
-        boot.hash_seed(),
-    ));
+    let control_plane = crate::net_stack::ElmControlPlane::new();
+    assert!(
+        control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_public()),
+        "net.stack 自动配置状态初始化失败"
+    );
     let runtimes = active_cpus
         .iter()
         .enumerate()
@@ -2670,31 +2256,18 @@ pub fn start_workers() {
     let mut protocol_tasks = Vec::with_capacity(runtimes.len());
     for runtime in &runtimes {
         let protocol = crate::net_stack::ElmFlowShard::new(runtime.id);
-        let dad = if runtime.id == ShardId(0) {
-            initial_dad_states(&config.snapshot(), sched::now_ns_public())
-        } else {
-            Vec::new()
-        };
-        let dhcp = if runtime.id == ShardId(0) {
-            initial_dhcp_clients(&config.snapshot(), sched::now_ns_public())
-        } else {
-            Vec::new()
-        };
         let slot = {
             let mut starts = PROTOCOL_STARTS.lock();
             let slot = starts.len();
             starts.push(Some(Box::new(ProtocolContext {
                 runtime: Arc::clone(runtime),
                 cluster: Arc::clone(&cluster),
-                control_plane: Arc::clone(&control_plane),
+                control_plane,
                 config: Arc::clone(&config),
                 protocol,
                 recycle: PacketBatch::new(),
                 tx: TxBatch::new(),
                 pending: core::array::from_fn(|_| None),
-                pending_neighbors: BTreeMap::new(),
-                dad,
-                dhcp,
                 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
                 udp_probe_flow: None,
                 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -3111,17 +2684,12 @@ impl ProtocolContext {
                 ControlWork::InterfaceGone { interface, ack } => {
                     self.protocol.invalidate_interface(interface);
                     self.fail_interface_neighbors(interface, SocketError::NetworkUnreachable);
-                    self.dad.retain(|state| state.interface != interface);
-                    let removed_lease = self
-                        .dhcp
-                        .iter()
-                        .find(|client| client.interface == interface)
-                        .and_then(|client| client.installed.clone());
-                    if let Some(lease) = removed_lease.as_ref() {
-                        self.replace_dhcp_lease(interface, Some(lease), None);
-                    }
-                    self.dhcp.retain(|client| client.interface != interface);
                     if self.runtime.id == ShardId(0) {
+                        if let Some(change) =
+                            self.control_plane.remove_autoconfig_interface(interface)
+                        {
+                            self.replace_dhcp_lease(&change);
+                        }
                         self.remove_interface_multicast(interface);
                     }
                     self.dispatch_tcp_output();
@@ -3271,17 +2839,10 @@ impl ProtocolContext {
             interface,
             options,
         };
-        let token = if local.port == 0 {
-            self.control_plane
-                .bind_registry
-                .reserve_ephemeral(request, self.runtime.id)
-                .map_err(map_bind_error)?
-        } else {
-            self.control_plane
-                .bind_registry
-                .reserve(request)
-                .map_err(map_bind_error)?
-        };
+        let token = self
+            .control_plane
+            .reserve_binding(facade.id(), request, self.runtime.id)
+            .map_err(map_bind_error)?;
         local.port = token.port;
         facade.set_free_bind(options.free_bind);
         let accepts_ipv4 = family == AddressFamily::Ipv6
@@ -3297,11 +2858,10 @@ impl ProtocolContext {
         ) {
             Ok(flow) => flow,
             Err(error) => {
-                let _ = self.control_plane.bind_registry.release(token);
+                self.control_plane.release_binding(facade.id());
                 return Err(map_udp_bind_error(error));
             }
         };
-        self.control_plane.remember_binding(facade.id(), token);
         facade.publish_binding(
             OwnerRef::Flow {
                 shard: self.runtime.id,
@@ -3351,20 +2911,12 @@ impl ProtocolContext {
             interface,
             options,
         };
-        let token = if local.port == 0 {
-            self.control_plane
-                .bind_registry
-                .reserve_ephemeral(request, self.runtime.id)
-                .map_err(map_bind_error)?
-        } else {
-            self.control_plane
-                .bind_registry
-                .reserve(request)
-                .map_err(map_bind_error)?
-        };
+        let token = self
+            .control_plane
+            .reserve_binding(facade.id(), request, self.runtime.id)
+            .map_err(map_bind_error)?;
         local.port = token.port;
         facade.set_free_bind(options.free_bind);
-        self.control_plane.remember_binding(facade.id(), token);
         facade.publish_binding(
             OwnerRef::Bound {
                 generation: facade.generation(),
@@ -3422,7 +2974,8 @@ impl ProtocolContext {
             }
             let target = self
                 .control_plane
-                .flow_shard(peer, local, TransportProtocol::Tcp);
+                .flow_shard(peer, local, TransportProtocol::Tcp)
+                .ok_or(SocketError::RuntimeBusy)?;
             if target == self.runtime.id {
                 self.install_tcp_flow(facade, control_sequence, local, peer, path)?;
             } else {
@@ -3596,7 +3149,9 @@ impl ProtocolContext {
             .map(|runtime| runtime.cpu)
             .collect::<Vec<_>>();
         let group = ListenGroup::new_with_cpu_hints(
-            self.control_plane.allocate_listener_id(),
+            self.control_plane
+                .allocate_listener_id()
+                .ok_or(SocketError::RuntimeBusy)?,
             facade,
             &cpu_hints,
             backlog,
@@ -3613,7 +3168,7 @@ impl ProtocolContext {
             generation: facade.generation(),
             remaining: AtomicUsize::new(self.cluster.shards.len()),
             failed: AtomicBool::new(false),
-            control: Arc::clone(&self.control_plane),
+            control: self.control_plane,
             cluster: Arc::clone(&self.cluster),
         });
         for runtime in &self.cluster.shards {
@@ -3866,7 +3421,10 @@ impl ProtocolContext {
     }
 
     fn publish_neighbor_work(&self, work: PendingNeighborTx) {
-        let target_id = self.control_plane.neighbor_owner(work.key());
+        let Some(target_id) = self.control_plane.neighbor_owner(work.key()) else {
+            work.facade().set_pending_error(SocketError::RuntimeBusy);
+            return;
+        };
         let Some(target) = self.cluster.shard(target_id) else {
             work.facade()
                 .set_pending_error(SocketError::HostUnreachable);
@@ -3902,37 +3460,19 @@ impl ProtocolContext {
             self.dispatch_neighbor_tx(work);
             return;
         }
-        if self
-            .pending_neighbors
-            .get(&key)
-            .is_some_and(|pending| pending.packets.len() >= 32)
-            || !self.control_plane.reserve_neighbor_packet(key.interface)
-        {
+        if let Err(work) = self.control_plane.enqueue_neighbor(work, now_ns) {
             work.facade()
                 .set_pending_error(SocketError::HostUnreachable);
             return;
         }
-        self.pending_neighbors
-            .entry(key)
-            .or_insert_with(|| PendingNeighbor {
-                packets: VecDeque::new(),
-                probes: 0,
-                next_probe_ns: now_ns,
-                expires_ns: now_ns.saturating_add(3_000_000_000),
-            })
-            .packets
-            .push_back(work);
         self.run_neighbor_timers(config, now_ns);
     }
 
     fn resolve_neighbor(&mut self, key: net::control::NeighborKey, mac_address: [u8; 6]) {
-        let Some(mut pending) = self.pending_neighbors.remove(&key) else {
-            return;
-        };
-        self.control_plane
-            .release_neighbor_packets(key.interface, pending.packets.len());
-        while let Some(mut work) = pending.packets.pop_front() {
-            work.resolve(mac_address);
+        for work in self
+            .control_plane
+            .resolve_pending_neighbor(key, mac_address)
+        {
             self.dispatch_neighbor_tx(work);
         }
     }
@@ -3957,61 +3497,21 @@ impl ProtocolContext {
     }
 
     fn fail_interface_neighbors(&mut self, interface: InterfaceId, error: SocketError) {
-        let keys = self
-            .pending_neighbors
-            .keys()
-            .filter(|key| key.interface == interface)
-            .copied()
-            .collect::<Vec<_>>();
-        for key in keys {
-            if let Some(mut pending) = self.pending_neighbors.remove(&key) {
-                self.control_plane
-                    .release_neighbor_packets(interface, pending.packets.len());
-                for work in pending.packets.drain(..) {
-                    work.facade().set_pending_error(error);
-                }
-            }
+        for work in self.control_plane.fail_interface_neighbors(interface) {
+            work.facade().set_pending_error(error);
         }
     }
 
     fn run_neighbor_timers(&mut self, config: &ConfigSnapshot, now_ns: u64) -> Option<u64> {
-        let keys = self.pending_neighbors.keys().copied().collect::<Vec<_>>();
-        for key in keys {
-            let expired = self
-                .pending_neighbors
-                .get(&key)
-                .is_some_and(|pending| pending.expires_ns <= now_ns);
-            if expired {
-                let mut pending = self.pending_neighbors.remove(&key).unwrap();
-                self.control_plane
-                    .release_neighbor_packets(key.interface, pending.packets.len());
-                for work in pending.packets.drain(..) {
-                    work.facade()
-                        .set_pending_error(SocketError::HostUnreachable);
-                }
-                continue;
-            }
-            let probe = self
-                .pending_neighbors
-                .get(&key)
-                .is_some_and(|pending| pending.probes < 3 && pending.next_probe_ns <= now_ns);
-            if probe {
-                self.emit_neighbor_probe(key, config);
-                let pending = self.pending_neighbors.get_mut(&key).unwrap();
-                pending.probes += 1;
-                pending.next_probe_ns = pending.next_probe_ns.saturating_add(1_000_000_000);
-            }
+        let output = self.control_plane.run_neighbor_timers(now_ns)?;
+        for key in output.probes {
+            self.emit_neighbor_probe(key, config);
         }
-        self.pending_neighbors
-            .values()
-            .map(|pending| {
-                if pending.probes < 3 {
-                    pending.next_probe_ns.min(pending.expires_ns)
-                } else {
-                    pending.expires_ns
-                }
-            })
-            .min()
+        for work in output.expired {
+            work.facade()
+                .set_pending_error(SocketError::HostUnreachable);
+        }
+        output.next_deadline_ns
     }
 
     fn emit_neighbor_probe(&self, key: net::control::NeighborKey, config: &ConfigSnapshot) {
@@ -4045,36 +3545,18 @@ impl ProtocolContext {
     }
 
     fn run_dad(&mut self, now_ns: u64) -> Option<u64> {
+        if self.runtime.id != ShardId(0) {
+            return None;
+        }
+        let output = self.control_plane.run_dad(now_ns)?;
         let snapshot = self.config.snapshot();
-        for index in 0..self.dad.len() {
-            if !self.dad[index].probe_sent {
-                self.emit_dad_probe(
-                    net::control::NeighborKey {
-                        interface: self.dad[index].interface,
-                        address: IpAddr::V6(self.dad[index].address),
-                    },
-                    &snapshot,
-                );
-                self.dad[index].probe_sent = true;
-            }
+        for key in output.probes {
+            self.emit_dad_probe(key, &snapshot);
         }
-        let mut index = 0;
-        while index < self.dad.len() {
-            if self.dad[index].deadline_ns > now_ns {
-                index += 1;
-                continue;
-            }
-            let state = self.dad.swap_remove(index);
-            if state.conflict {
-                self.control_plane
-                    .dad_errors
-                    .lock()
-                    .insert(state.interface, SocketError::AddressInUse);
-            } else {
-                self.publish_dad_address(state.interface, state.address);
-            }
+        for (interface, address) in output.ready {
+            self.publish_dad_address(interface, address);
         }
-        self.dad.iter().map(|state| state.deadline_ns).min()
+        output.next_deadline_ns
     }
 
     fn publish_dad_address(&self, interface: InterfaceId, address: Ipv6Addr) {
@@ -4124,194 +3606,37 @@ impl ProtocolContext {
     }
 
     fn run_dhcp(&mut self, now_ns: u64) -> Option<u64> {
-        let config = self.config.snapshot();
-        self.dhcp.retain(|client| {
-            let configured = config.addresses.iter().find_map(|entry| {
-                (entry.interface == client.interface)
-                    .then_some(entry.address)
-                    .and_then(|address| match address {
-                        IpAddr::V4(address) => Some(address),
-                        IpAddr::V6(_) => None,
-                    })
-            });
-            match (&client.installed, configured) {
-                (Some(lease), Some(address)) => lease.address == address,
-                (None, None) => true,
-                _ => false,
-            }
-        });
-        for index in 0..self.dhcp.len() {
-            let expired = matches!(
-                &self.dhcp[index].phase,
-                DhcpPhase::Bound { expires_ns, .. } if *expires_ns <= now_ns
-            );
-            if expired {
-                let interface = self.dhcp[index].interface;
-                let old = self.dhcp[index].installed.take();
-                self.replace_dhcp_lease(interface, old.as_ref(), None);
-                self.dhcp[index].phase = DhcpPhase::Discovering;
-                self.dhcp[index].next_action_ns = now_ns;
-                self.dhcp[index].retry_seconds = 1;
-            }
-            if self.dhcp[index].next_action_ns > now_ns {
-                continue;
-            }
-            let client = &self.dhcp[index];
-            let frame = match &client.phase {
-                DhcpPhase::Discovering => build_dhcp_frame(client, 1, None, None),
-                DhcpPhase::Requesting { lease, server } => {
-                    build_dhcp_frame(client, 3, Some(lease.address), Some(*server))
-                }
-                DhcpPhase::Bound {
-                    lease,
-                    server,
-                    renew_ns,
-                    rebind_ns,
-                    ..
-                } if *renew_ns <= now_ns => build_dhcp_frame(
-                    client,
-                    3,
-                    Some(lease.address),
-                    (*rebind_ns > now_ns).then_some(*server),
-                ),
-                DhcpPhase::Bound { renew_ns, .. } => {
-                    self.dhcp[index].next_action_ns = *renew_ns;
-                    continue;
-                }
-            };
-            self.emit_control_frame(client.interface, frame);
-            let retry = self.dhcp[index].retry_seconds.clamp(1, 64);
-            self.dhcp[index].next_action_ns =
-                now_ns.saturating_add(u64::from(retry).saturating_mul(1_000_000_000));
-            self.dhcp[index].retry_seconds = retry.saturating_mul(2).min(64);
+        if self.runtime.id != ShardId(0) {
+            return None;
         }
-        self.dhcp.iter().map(|client| client.next_action_ns).min()
+        let config = self.config.snapshot();
+        let output = self.control_plane.run_dhcp(&config, now_ns)?;
+        for change in output.lease_changes {
+            self.replace_dhcp_lease(&change);
+        }
+        for (interface, frame) in output.frames {
+            self.emit_control_frame(interface, frame);
+        }
+        output.next_deadline_ns
     }
 
     fn handle_dhcp_packet(&mut self, interface: InterfaceId, packet: &FrontendPacket) -> bool {
-        let Some(reply) = parse_dhcp_reply(packet) else {
+        let Some(output) =
+            self.control_plane
+                .handle_dhcp_packet(interface, packet, sched::now_ns_public())
+        else {
             return false;
         };
-        let Some(index) = self.dhcp.iter().position(|client| {
-            client.interface == interface
-                && client.transaction_id == reply.transaction_id
-                && client.mac_address == reply.client_mac
-        }) else {
-            return false;
-        };
-        match reply.message_type {
-            2 => {
-                let Some(server) = reply.server else {
-                    return true;
-                };
-                let prefix_len = reply.subnet_mask.and_then(ipv4_mask_prefix).unwrap_or(24);
-                self.dhcp[index].phase = DhcpPhase::Requesting {
-                    lease: DhcpLease {
-                        address: reply.offered,
-                        prefix_len,
-                        router: reply.router,
-                        dns: reply.dns,
-                        lease_seconds: reply.lease_seconds.unwrap_or(3600).max(60),
-                    },
-                    server,
-                };
-                self.dhcp[index].next_action_ns = sched::now_ns_public();
-                self.dhcp[index].retry_seconds = 1;
-            }
-            5 => {
-                let now_ns = sched::now_ns_public();
-                let (requested, previous_server) = match &self.dhcp[index].phase {
-                    DhcpPhase::Requesting { lease, server }
-                    | DhcpPhase::Bound { lease, server, .. } => {
-                        (Some(lease.clone()), Some(*server))
-                    }
-                    DhcpPhase::Discovering => (None, None),
-                };
-                let address = if reply.offered == Ipv4Addr::UNSPECIFIED {
-                    requested
-                        .as_ref()
-                        .map(|lease| lease.address)
-                        .unwrap_or(reply.offered)
-                } else {
-                    reply.offered
-                };
-                if address == Ipv4Addr::UNSPECIFIED {
-                    return true;
-                }
-                let lease = DhcpLease {
-                    address,
-                    prefix_len: reply
-                        .subnet_mask
-                        .and_then(ipv4_mask_prefix)
-                        .or_else(|| requested.as_ref().map(|lease| lease.prefix_len))
-                        .unwrap_or(24),
-                    router: reply
-                        .router
-                        .or_else(|| requested.as_ref().and_then(|lease| lease.router)),
-                    dns: if reply.dns.is_empty() {
-                        requested
-                            .as_ref()
-                            .map(|lease| lease.dns.clone())
-                            .unwrap_or_default()
-                    } else {
-                        reply.dns
-                    },
-                    lease_seconds: reply
-                        .lease_seconds
-                        .or_else(|| requested.as_ref().map(|lease| lease.lease_seconds))
-                        .unwrap_or(3600)
-                        .max(60),
-                };
-                let server = reply
-                    .server
-                    .or(previous_server)
-                    .unwrap_or(Ipv4Addr::UNSPECIFIED);
-                let old = self.dhcp[index].installed.clone();
-                self.replace_dhcp_lease(interface, old.as_ref(), Some(&lease));
-                let renew_seconds = reply
-                    .renewal_seconds
-                    .unwrap_or(lease.lease_seconds / 2)
-                    .clamp(1, lease.lease_seconds.saturating_sub(1));
-                let renew_ns =
-                    now_ns.saturating_add(u64::from(renew_seconds).saturating_mul(1_000_000_000));
-                let rebind_seconds = dhcp_rebind_seconds(
-                    lease.lease_seconds,
-                    renew_seconds,
-                    reply.rebinding_seconds,
-                );
-                let rebind_ns =
-                    now_ns.saturating_add(u64::from(rebind_seconds).saturating_mul(1_000_000_000));
-                let expires_ns = now_ns
-                    .saturating_add(u64::from(lease.lease_seconds).saturating_mul(1_000_000_000));
-                self.dhcp[index].installed = Some(lease.clone());
-                self.dhcp[index].phase = DhcpPhase::Bound {
-                    lease,
-                    server,
-                    renew_ns,
-                    rebind_ns,
-                    expires_ns,
-                };
-                self.dhcp[index].next_action_ns = renew_ns;
-                self.dhcp[index].retry_seconds = 1;
-            }
-            6 => {
-                let old = self.dhcp[index].installed.take();
-                self.replace_dhcp_lease(interface, old.as_ref(), None);
-                self.dhcp[index].phase = DhcpPhase::Discovering;
-                self.dhcp[index].next_action_ns = sched::now_ns_public();
-                self.dhcp[index].retry_seconds = 1;
-            }
-            _ => {}
+        if let Some(change) = output.lease_change {
+            self.replace_dhcp_lease(&change);
         }
-        true
+        output.handled
     }
 
-    fn replace_dhcp_lease(
-        &self,
-        interface: InterfaceId,
-        old: Option<&DhcpLease>,
-        new: Option<&DhcpLease>,
-    ) {
+    fn replace_dhcp_lease(&self, change: &net::stack::DhcpLeaseChange) {
+        let interface = change.interface;
+        let old = change.old.as_ref();
+        let new = change.new.as_ref();
         let current = self.config.snapshot();
         let mut addresses = current.addresses.clone();
         let mut routes = current.routes.entries().to_vec();
@@ -4362,14 +3687,7 @@ impl ProtocolContext {
         if let Some(old) = old {
             for server in &old.dns {
                 let address = IpAddr::V4(*server);
-                let used_elsewhere = self.dhcp.iter().any(|client| {
-                    client.interface != interface
-                        && client
-                            .installed
-                            .as_ref()
-                            .is_some_and(|lease| lease.dns.contains(server))
-                });
-                if !used_elsewhere
+                if !change.retained_dns.contains(server)
                     && let Some(index) = dns_servers.iter().rposition(|entry| *entry == address)
                 {
                     dns_servers.remove(index);
@@ -4447,55 +3765,25 @@ impl ProtocolContext {
             if facade.is_closing() {
                 return;
             }
-            if self
-                .control_plane
-                .multicast_bindings
-                .lock()
-                .contains_key(&binding_key)
-            {
-                return;
-            }
             let Some(interface) = self.resolve_multicast_interface(facade, membership, config)
             else {
                 facade.set_pending_error(SocketError::NetworkUnreachable);
                 return;
             };
-            self.control_plane
-                .multicast_bindings
-                .lock()
-                .insert(binding_key, interface);
-            let first = {
-                let mut refs = self.control_plane.multicast_refs.lock();
-                let count = refs.entry((interface, membership.group)).or_insert(0);
-                *count += 1;
-                *count == 1
-            };
-            if first {
+            if self
+                .control_plane
+                .join_multicast(binding_key.0, binding_key.1, interface)
+                == Some(true)
+            {
                 self.emit_multicast_control(interface, membership.group, true, config);
             }
             return;
         }
-        let Some(interface) = self
+        let Some((interface, last)) = self
             .control_plane
-            .multicast_bindings
-            .lock()
-            .remove(&binding_key)
+            .leave_multicast(binding_key.0, binding_key.1)
         else {
             return;
-        };
-        let last = {
-            let mut refs = self.control_plane.multicast_refs.lock();
-            let key = (interface, membership.group);
-            let Some(count) = refs.get_mut(&key) else {
-                return;
-            };
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                refs.remove(&key);
-                true
-            } else {
-                false
-            }
         };
         if last {
             self.emit_multicast_control(interface, membership.group, false, config);
@@ -4543,13 +3831,7 @@ impl ProtocolContext {
     }
 
     fn emit_interface_multicast_reports(&self, interface: InterfaceId) {
-        let groups = self
-            .control_plane
-            .multicast_refs
-            .lock()
-            .keys()
-            .filter_map(|(candidate, group)| (*candidate == interface).then_some(*group))
-            .collect::<Vec<_>>();
+        let groups = self.control_plane.multicast_groups(interface);
         let config = self.config.snapshot();
         for group in groups {
             self.emit_multicast_control(interface, group, true, &config);
@@ -4557,43 +3839,13 @@ impl ProtocolContext {
     }
 
     fn remove_interface_multicast(&self, interface: InterfaceId) {
-        self.control_plane
-            .multicast_bindings
-            .lock()
-            .retain(|_, bound| *bound != interface);
-        self.control_plane
-            .multicast_refs
-            .lock()
-            .retain(|(bound, _), _| *bound != interface);
+        self.control_plane.remove_interface_multicast(interface);
     }
 
     fn remove_socket_multicast(&self, socket: net::SocketId) {
-        let memberships = self
-            .control_plane
-            .multicast_bindings
-            .lock()
-            .keys()
-            .filter_map(|(candidate, membership)| (*candidate == socket).then_some(*membership))
-            .collect::<Vec<_>>();
         let config = self.config.snapshot();
-        for membership in memberships {
-            if let Some(interface) = self
-                .control_plane
-                .multicast_bindings
-                .lock()
-                .remove(&(socket, membership))
-            {
-                let mut refs = self.control_plane.multicast_refs.lock();
-                let key = (interface, membership.group);
-                if let Some(count) = refs.get_mut(&key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        refs.remove(&key);
-                        drop(refs);
-                        self.emit_multicast_control(interface, membership.group, false, &config);
-                    }
-                }
-            }
+        for (interface, group) in self.control_plane.remove_socket_multicast(socket) {
+            self.emit_multicast_control(interface, group, false, &config);
         }
     }
 
@@ -4640,12 +3892,12 @@ impl ProtocolContext {
                     facade.publish_closed();
                 }
                 OwnerRef::Listener { group, .. } if facade.is_closing() => {
-                    if self.control_plane.listeners.lock().contains_key(&group) {
+                    if self.control_plane.has_listener(group) {
                         let transaction = Arc::new(ListenerRemove {
                             facade: Arc::clone(&facade),
                             group,
                             remaining: AtomicUsize::new(self.cluster.shards.len()),
-                            control: Arc::clone(&self.control_plane),
+                            control: self.control_plane,
                         });
                         for runtime in &self.cluster.shards {
                             let mut work = ControlWork::RemoveListener {
@@ -4885,11 +4137,7 @@ impl ProtocolContext {
                 && matches!(message[0], 135 | 136)
             {
                 let target = Ipv6Addr(message[8..24].try_into().unwrap());
-                for state in &mut self.dad {
-                    if state.interface == interface && state.address == target {
-                        state.conflict = true;
-                    }
-                }
+                self.control_plane.observe_dad_conflict(interface, target);
             }
         }
         let observed = match packet.parsed.disposition {
@@ -5022,7 +4270,8 @@ impl ProtocolContext {
                 let owner = match error_target {
                     net::transport::ControlErrorTarget::Flow(flow) => self
                         .control_plane
-                        .flow_shard(flow.remote, flow.local, flow.protocol),
+                        .flow_shard(flow.remote, flow.local, flow.protocol)
+                        .unwrap_or(ShardId(0)),
                     net::transport::ControlErrorTarget::Raw { .. } => ShardId(0),
                 };
                 if owner == self.runtime.id {
@@ -5533,11 +4782,7 @@ pub(crate) fn dhcp_rebind_seconds(
     renew_seconds: u32,
     offered: Option<u32>,
 ) -> u32 {
-    let latest = lease_seconds.saturating_sub(1);
-    let earliest = renew_seconds.saturating_add(1).min(latest);
-    offered
-        .unwrap_or(lease_seconds.saturating_mul(7) / 8)
-        .clamp(earliest, latest)
+    net::stack::dhcp_rebind_seconds(lease_seconds, renew_seconds, offered)
 }
 
 pub(crate) fn build_multicast_control_frame(
