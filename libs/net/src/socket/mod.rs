@@ -16,7 +16,6 @@ use spin::{Mutex, RwLock};
 use crate::IpAddr;
 use crate::buf::PacketChain;
 use crate::control::BindOptions;
-use crate::device::boot_config;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, ListenGroupId, ShardId, SocketId};
 
 const UDP_RING_ENTRIES: usize = 256;
@@ -227,7 +226,7 @@ pub fn new_raw_socket_facade(
     if protocol == 0 {
         return Err(SocketError::InvalidState);
     }
-    let boot = boot_config().ok_or(SocketError::RuntimeUnavailable)?;
+    let boot = crate::stack::boot_config().ok_or(SocketError::RuntimeUnavailable)?;
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     assert!(counter != 0, "SocketId 已耗尽");
@@ -243,7 +242,7 @@ pub fn new_raw_socket_facade(
 }
 
 fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacade>, SocketError> {
-    let boot = boot_config().ok_or(SocketError::RuntimeUnavailable)?;
+    let boot = crate::stack::boot_config().ok_or(SocketError::RuntimeUnavailable)?;
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     assert!(counter != 0, "SocketId 已耗尽");

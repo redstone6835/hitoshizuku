@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
+use crate::boot::NetDriverBootConfig;
 use crate::buf::{CompletionBatch, NetBufPoolOwner, PacketBatch, RxRefillBatch, TxBatch};
 use crate::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
@@ -16,77 +17,8 @@ use crate::{NetDeviceId, QueuePairId};
 
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_DEVICE_HANDLE: AtomicU64 = AtomicU64::new(1);
-static BOOT_CONFIG: Mutex<Option<NetBootConfig>> = Mutex::new(None);
+static BOOT_CONFIG: Mutex<Option<NetDriverBootConfig>> = Mutex::new(None);
 static REGISTRAR: Mutex<Option<&'static dyn NetDeviceRegistrar>> = Mutex::new(None);
-
-/// 网络用途的启动期独立 key 材料。
-#[derive(Clone, Copy)]
-pub struct NetBootConfig {
-    rss_key: [u8; 40],
-    tcp_isn_key: [u8; 16],
-    ephemeral_port_key: [u8; 16],
-    hash_seed: [u8; 16],
-    generation_nonce: [u8; 8],
-    mac_seed: [u8; 16],
-    active_cpu_count: u8,
-}
-
-impl NetBootConfig {
-    pub fn from_random_material(material: [u8; 112], active_cpu_count: u8) -> Option<Self> {
-        if active_cpu_count == 0 || active_cpu_count > 8 {
-            return None;
-        }
-        let mut rss_key = [0; 40];
-        let mut tcp_isn_key = [0; 16];
-        let mut ephemeral_port_key = [0; 16];
-        let mut hash_seed = [0; 16];
-        let mut generation_nonce = [0; 8];
-        let mut mac_seed = [0; 16];
-        rss_key.copy_from_slice(&material[0..40]);
-        tcp_isn_key.copy_from_slice(&material[40..56]);
-        ephemeral_port_key.copy_from_slice(&material[56..72]);
-        hash_seed.copy_from_slice(&material[72..88]);
-        generation_nonce.copy_from_slice(&material[88..96]);
-        mac_seed.copy_from_slice(&material[96..112]);
-        Some(Self {
-            rss_key,
-            tcp_isn_key,
-            ephemeral_port_key,
-            hash_seed,
-            generation_nonce,
-            mac_seed,
-            active_cpu_count,
-        })
-    }
-
-    pub const fn rss_key(&self) -> &[u8; 40] {
-        &self.rss_key
-    }
-
-    pub const fn tcp_isn_key(&self) -> &[u8; 16] {
-        &self.tcp_isn_key
-    }
-
-    pub const fn ephemeral_port_key(&self) -> &[u8; 16] {
-        &self.ephemeral_port_key
-    }
-
-    pub const fn hash_seed(&self) -> &[u8; 16] {
-        &self.hash_seed
-    }
-
-    pub const fn generation_nonce(&self) -> &[u8; 8] {
-        &self.generation_nonce
-    }
-
-    pub const fn mac_seed(&self) -> &[u8; 16] {
-        &self.mac_seed
-    }
-
-    pub const fn active_cpu_count(&self) -> u8 {
-        self.active_cpu_count
-    }
-}
 
 /// IRQ handler 安装到 queue 的唤醒目标。
 pub trait QueueWakeHandle: Send + Sync {
@@ -581,7 +513,7 @@ pub enum InstallNetRuntimeError {
 
 /// 在任何网络 PnP probe 前一次性安装 boot key 与 kernel registrar。
 pub fn install_net_runtime(
-    config: NetBootConfig,
+    config: NetDriverBootConfig,
     registrar: &'static dyn NetDeviceRegistrar,
 ) -> Result<(), InstallNetRuntimeError> {
     let mut config_slot = BOOT_CONFIG.lock();
@@ -594,7 +526,7 @@ pub fn install_net_runtime(
     Ok(())
 }
 
-pub fn boot_config() -> Option<NetBootConfig> {
+pub fn boot_config() -> Option<NetDriverBootConfig> {
     *BOOT_CONFIG.lock()
 }
 
@@ -719,20 +651,6 @@ pub fn snapshot_stats() -> Vec<NetStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn boot_material_is_split_without_overlap() {
-        let material = core::array::from_fn(|index| index as u8);
-        let config = NetBootConfig::from_random_material(material, 4).unwrap();
-        assert_eq!(config.rss_key()[0], 0);
-        assert_eq!(config.rss_key()[39], 39);
-        assert_eq!(config.tcp_isn_key()[0], 40);
-        assert_eq!(config.ephemeral_port_key()[0], 56);
-        assert_eq!(config.hash_seed()[0], 72);
-        assert_eq!(config.generation_nonce()[0], 88);
-        assert_eq!(config.mac_seed()[0], 96);
-        assert_eq!(config.active_cpu_count(), 4);
-    }
 
     #[test]
     fn queue_call_frame_rejects_stale_or_corrupt_prefix() {

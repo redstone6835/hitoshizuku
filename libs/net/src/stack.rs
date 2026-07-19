@@ -5,7 +5,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
+use crate::boot::NetStackBootConfig;
+
 static NEXT_STACK_HANDLE: AtomicU64 = AtomicU64::new(1);
+static STACK_BOOT_CONFIG: Mutex<Option<NetStackBootConfig>> = Mutex::new(None);
 static STACK_REGISTRAR: Mutex<Option<&'static dyn NetStackRegistrar>> = Mutex::new(None);
 
 pub const NET_STACK_CALL_ABI_VERSION: u16 = 1;
@@ -76,7 +79,7 @@ impl PinnedNetStackEndpoint {
         name = "net.stack.PinnedNetStackEndpoint.current",
         contract = "kernel.net.stack-endpoint@1",
         version = 1,
-        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+        capabilities = kernel_symbols::capability::NETWORK_STACK
     )]
     pub fn current(export_name: &str, export_contract: &str, export_version: u32) -> Option<Self> {
         let context = elm_model::current_context()?;
@@ -146,7 +149,7 @@ impl NetStackRegistration {
         name = "net.stack.NetStackRegistration.pinned",
         contract = "kernel.net.stack-registration@1",
         version = 1,
-        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+        capabilities = kernel_symbols::capability::NETWORK_STACK
     )]
     pub fn pinned(endpoint: PinnedNetStackEndpoint) -> Self {
         Self {
@@ -273,21 +276,34 @@ pub enum InstallNetStackRuntimeError {
 
 /// 在任何 `net.stack` 初始化前一次性安装常驻 broker。
 pub fn install_stack_runtime(
+    config: NetStackBootConfig,
     registrar: &'static dyn NetStackRegistrar,
 ) -> Result<(), InstallNetStackRuntimeError> {
+    let mut config_slot = STACK_BOOT_CONFIG.lock();
     let mut slot = STACK_REGISTRAR.lock();
-    if slot.is_some() {
+    if config_slot.is_some() || slot.is_some() {
         return Err(InstallNetStackRuntimeError::AlreadyInstalled);
     }
+    *config_slot = Some(config);
     *slot = Some(registrar);
     Ok(())
+}
+
+#[kernel_symbols::export(
+    name = "net.stack.boot_config",
+    contract = "kernel.net.stack-boot-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::NETWORK_STACK
+)]
+pub fn boot_config() -> Option<NetStackBootConfig> {
+    *STACK_BOOT_CONFIG.lock()
 }
 
 #[kernel_symbols::export(
     name = "net.stack.register_stack",
     contract = "kernel.net.stack-registration@1",
     version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn register_stack(
@@ -313,7 +329,7 @@ pub fn register_stack(
     name = "net.stack.begin_remove",
     contract = "kernel.net.stack-registration@1",
     version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    capabilities = kernel_symbols::capability::NETWORK_STACK,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn begin_remove(handle: NetStackHandle) -> Result<(), NetStackRemoveError> {

@@ -9,6 +9,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod address;
+pub mod boot;
 pub mod buf;
 pub mod control;
 pub mod device;

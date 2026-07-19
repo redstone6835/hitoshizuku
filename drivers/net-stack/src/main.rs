@@ -20,6 +20,7 @@ static QUIESCED: AtomicBool = AtomicBool::new(false);
 
 struct NetStackElm {
     handle: Option<NetStackHandle>,
+    boot: Option<net::boot::NetStackBootConfig>,
 }
 
 fn map_register_error(error: NetStackRegisterErrorKind) -> HookError {
@@ -44,12 +45,19 @@ fn map_remove_error(error: NetStackRemoveError) -> HookError {
 #[elm::module]
 impl ElmModule for NetStackElm {
     fn create(_context: &LifecycleContext) -> Result<Self, HookError> {
-        Ok(Self { handle: None })
+        Ok(Self {
+            handle: None,
+            boot: None,
+        })
     }
 
     fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
         if self.handle.is_some() {
             return Err(HookError::new(-16));
+        }
+        let boot = net::stack::boot_config().ok_or(HookError::new(-19))?;
+        if boot.active_cpu_count() == 0 || usize::from(boot.active_cpu_count()) > sched::NR_CPUS {
+            return Err(HookError::new(-22));
         }
         QUIESCED.store(false, Ordering::Release);
         #[cfg(not(feature = "elm-integrated"))]
@@ -64,6 +72,7 @@ impl ElmModule for NetStackElm {
             NetStackRegistration::integrated(net_stack_call).ok_or(HookError::new(-22))?;
         let handle = net::stack::register_stack(registration)
             .map_err(|error| map_register_error(error.kind))?;
+        self.boot = Some(boot);
         self.handle = Some(handle);
         Ok(())
     }
@@ -80,6 +89,7 @@ impl ElmModule for NetStackElm {
         match net::stack::begin_remove(handle) {
             Ok(()) | Err(NetStackRemoveError::NoStack) => {
                 self.handle = None;
+                self.boot = None;
                 Ok(())
             }
             Err(error) => Err(map_remove_error(error)),

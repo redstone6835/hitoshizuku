@@ -2643,7 +2643,7 @@ pub fn start_workers() {
         .filter(|cpu| online & (1u64 << cpu) != 0)
         .collect::<Vec<_>>();
     assert!(!active_cpus.is_empty(), "NetWorker 没有 active CPU");
-    let boot = net::device::boot_config().expect("网络启动配置未安装");
+    let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let mut generation_bytes = [0u8; 4];
     generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
     let rss_generation = u32::from_le_bytes(generation_bytes).max(1);
@@ -2755,7 +2755,7 @@ pub(crate) fn reconcile_devices() {
     let Some(config) = CONFIG_STORE.lock().as_ref().cloned() else {
         return;
     };
-    let boot = net::device::boot_config().expect("网络启动配置未安装");
+    let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();
     let active_cpus = (0..sched::NR_CPUS)
         .filter(|cpu| online & (1u64 << cpu) != 0)
