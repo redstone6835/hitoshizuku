@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::boot::NetStackBootConfig;
-use crate::buf::{DropReason, PacketBatch};
+use crate::buf::{DropReason, PacketBatch, PacketChain};
 use crate::tuning::PACKET_BATCH_CAPACITY;
 
 static NEXT_STACK_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -21,8 +21,13 @@ pub const NET_STACK_CALL_STATUS_INVALID: i32 = -22;
 pub const NET_STACK_OP_PROBE: u32 = 1;
 pub const NET_STACK_OP_WORKER_TURN: u32 = 2;
 pub const NET_STACK_OP_QUIESCE: u32 = 3;
+pub const NET_STACK_OP_TX_HEADER: u32 = 4;
 
 pub const NET_STACK_WORKER_TURN_ABI_VERSION: u16 = 1;
+pub const NET_STACK_TX_HEADER_ABI_VERSION: u16 = 1;
+pub const NET_STACK_TX_HEADER_CAPACITY: usize = 128;
+pub const NET_STACK_TX_UDP: u8 = 1;
+pub const NET_STACK_TX_TCP: u8 = 2;
 pub const NET_STACK_ETHERNET_ACCEPTED: u8 = 1;
 pub const NET_STACK_ETHERNET_TRUNCATED: u8 = 2;
 pub const NET_STACK_ETHERNET_UNSUPPORTED: u8 = 3;
@@ -581,6 +586,373 @@ fn valid_transport_drop_reason(reason: u8) -> bool {
     )
 }
 
+/// host 提交给 `net.stack` 的单个 TX header 构造输入。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct NetStackTxInputV1 {
+    pub kind: u8,
+    pub family: u8,
+    pub hop_limit: u8,
+    pub traffic_class: u8,
+    pub source_mac: [u8; 6],
+    pub destination_mac: [u8; 6],
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub tcp_flags: u16,
+    pub tcp_window: u16,
+    pub tcp_options_len: u8,
+    pub reserved0: [u8; 3],
+    pub payload_offset: u32,
+    pub payload_len: u32,
+    pub tcp_sequence: u32,
+    pub tcp_acknowledgement: u32,
+    pub source: [u8; 16],
+    pub destination: [u8; 16],
+    pub tcp_options: [u8; 40],
+    pub reserved1: [u64; 2],
+}
+
+impl NetStackTxInputV1 {
+    pub fn udp(
+        source: crate::IpAddr,
+        destination: crate::IpAddr,
+        source_port: u16,
+        destination_port: u16,
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+        hop_limit: u8,
+        traffic_class: u8,
+        payload_len: u32,
+    ) -> Option<Self> {
+        let (family, source, destination) = tx_addresses(source, destination)?;
+        Some(Self {
+            kind: NET_STACK_TX_UDP,
+            family,
+            hop_limit,
+            traffic_class,
+            source_mac,
+            destination_mac,
+            source_port,
+            destination_port,
+            tcp_flags: 0,
+            tcp_window: 0,
+            tcp_options_len: 0,
+            reserved0: [0; 3],
+            payload_offset: 0,
+            payload_len,
+            tcp_sequence: 0,
+            tcp_acknowledgement: 0,
+            source,
+            destination,
+            tcp_options: [0; 40],
+            reserved1: [0; 2],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tcp(
+        source: crate::IpAddr,
+        destination: crate::IpAddr,
+        source_port: u16,
+        destination_port: u16,
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u16,
+        window: u16,
+        options: &[u8],
+        payload_len: u32,
+    ) -> Option<Self> {
+        let (family, source, destination) = tx_addresses(source, destination)?;
+        if options.len() > 40 || options.len() % 4 != 0 {
+            return None;
+        }
+        let mut tcp_options = [0; 40];
+        tcp_options[..options.len()].copy_from_slice(options);
+        Some(Self {
+            kind: NET_STACK_TX_TCP,
+            family,
+            hop_limit: 64,
+            traffic_class: 0,
+            source_mac,
+            destination_mac,
+            source_port,
+            destination_port,
+            tcp_flags: flags,
+            tcp_window: window,
+            tcp_options_len: options.len() as u8,
+            reserved0: [0; 3],
+            payload_offset: 0,
+            payload_len,
+            tcp_sequence: sequence,
+            tcp_acknowledgement: acknowledgement,
+            source,
+            destination,
+            tcp_options,
+            reserved1: [0; 2],
+        })
+    }
+
+    pub fn valid(&self) -> bool {
+        if !matches!(
+            self.family,
+            NET_STACK_ADDRESS_FAMILY_IPV4 | NET_STACK_ADDRESS_FAMILY_IPV6
+        ) || self.destination_port == 0
+            || self.reserved0 != [0; 3]
+            || self.reserved1 != [0; 2]
+            || (self.family == NET_STACK_ADDRESS_FAMILY_IPV4
+                && (self.source[4..] != [0; 12] || self.destination[4..] != [0; 12]))
+        {
+            return false;
+        }
+        let transport_len = match self.kind {
+            NET_STACK_TX_UDP => {
+                if self.tcp_fields_empty() {
+                    self.payload_len.checked_add(8)
+                } else {
+                    None
+                }
+            }
+            NET_STACK_TX_TCP => {
+                let options_len = usize::from(self.tcp_options_len);
+                if self.source_port == 0
+                    || self.tcp_flags & !0x01ff != 0
+                    || options_len > self.tcp_options.len()
+                    || options_len % 4 != 0
+                    || self.tcp_options[options_len..] != [0; 40][options_len..]
+                {
+                    None
+                } else {
+                    self.payload_len
+                        .checked_add(20 + u32::from(self.tcp_options_len))
+                }
+            }
+            _ => None,
+        };
+        transport_len.is_some_and(|transport_len| {
+            transport_len <= u32::from(u16::MAX)
+                && (self.family != NET_STACK_ADDRESS_FAMILY_IPV4
+                    || transport_len <= u32::from(u16::MAX - 20))
+        })
+    }
+
+    pub fn expected_header_len(&self) -> Option<u16> {
+        if !self.valid() {
+            return None;
+        }
+        let ip_len = if self.family == NET_STACK_ADDRESS_FAMILY_IPV4 {
+            20
+        } else {
+            40
+        };
+        let transport_len = if self.kind == NET_STACK_TX_UDP {
+            8
+        } else {
+            20 + u16::from(self.tcp_options_len)
+        };
+        Some(14 + ip_len + transport_len)
+    }
+
+    fn tcp_fields_empty(&self) -> bool {
+        self.tcp_flags == 0
+            && self.tcp_window == 0
+            && self.tcp_options_len == 0
+            && self.tcp_sequence == 0
+            && self.tcp_acknowledgement == 0
+            && self.tcp_options == [0; 40]
+    }
+}
+
+fn tx_addresses(
+    source: crate::IpAddr,
+    destination: crate::IpAddr,
+) -> Option<(u8, [u8; 16], [u8; 16])> {
+    match (source, destination) {
+        (crate::IpAddr::V4(source), crate::IpAddr::V4(destination)) => {
+            let mut source_bytes = [0; 16];
+            source_bytes[..4].copy_from_slice(&source.0);
+            let mut destination_bytes = [0; 16];
+            destination_bytes[..4].copy_from_slice(&destination.0);
+            Some((
+                NET_STACK_ADDRESS_FAMILY_IPV4,
+                source_bytes,
+                destination_bytes,
+            ))
+        }
+        (crate::IpAddr::V6(source), crate::IpAddr::V6(destination)) => {
+            Some((NET_STACK_ADDRESS_FAMILY_IPV6, source.0, destination.0))
+        }
+        _ => None,
+    }
+}
+
+/// `net.stack` 返回给 host 的固定容量 TX header。
+#[repr(C)]
+pub struct NetStackTxHeaderV1 {
+    pub abi_version: u16,
+    pub struct_size: u16,
+    pub generation: u64,
+    pub payload: *const PacketChain,
+    pub input: NetStackTxInputV1,
+    pub committed: u8,
+    pub reserved0: u8,
+    pub header_len: u16,
+    pub header: [u8; NET_STACK_TX_HEADER_CAPACITY],
+    pub reserved1: [u64; 2],
+}
+
+impl NetStackTxHeaderV1 {
+    pub fn new(generation: u64, payload: &PacketChain, input: NetStackTxInputV1) -> Self {
+        Self {
+            abi_version: NET_STACK_TX_HEADER_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            generation,
+            payload,
+            input,
+            committed: 0,
+            reserved0: 0,
+            header_len: 0,
+            header: [0; NET_STACK_TX_HEADER_CAPACITY],
+            reserved1: [0; 2],
+        }
+    }
+
+    pub fn valid_header(
+        &self,
+        generation: u64,
+        payload: *const PacketChain,
+        input: &NetStackTxInputV1,
+    ) -> bool {
+        self.abi_version == NET_STACK_TX_HEADER_ABI_VERSION
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.generation == generation
+            && self.payload == payload
+            && !self.payload.is_null()
+            && &self.input == input
+            && self.input.valid()
+            && self.reserved0 == 0
+            && self.reserved1 == [0; 2]
+    }
+
+    pub fn fully_committed(&self, payload: &PacketChain) -> bool {
+        if self.committed != 1
+            || self
+                .input
+                .payload_offset
+                .checked_add(self.input.payload_len)
+                .is_none_or(|end| end > payload.total_len() as u32)
+            || self.input.expected_header_len() != Some(self.header_len)
+            || usize::from(self.header_len) > self.header.len()
+            || self.header[usize::from(self.header_len)..]
+                != [0; NET_STACK_TX_HEADER_CAPACITY][usize::from(self.header_len)..]
+        {
+            return false;
+        }
+        self.output_valid()
+    }
+
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.header[..usize::from(self.header_len)]
+    }
+
+    fn output_valid(&self) -> bool {
+        let header = self.header_bytes();
+        if header[..6] != self.input.destination_mac || header[6..12] != self.input.source_mac {
+            return false;
+        }
+        let transport_offset = match self.input.family {
+            NET_STACK_ADDRESS_FAMILY_IPV4 => {
+                let transport_len = self.header_len as u32 - 34 + self.input.payload_len;
+                let total_len = 20 + transport_len;
+                if header[12..14] != 0x0800u16.to_be_bytes() || header[14] != 0x45 {
+                    return false;
+                }
+                if header[15] != self.input.traffic_class
+                    || header[16..18] != (total_len as u16).to_be_bytes()
+                    || header[18..20] != [0; 2]
+                    || header[20..22] != 0x4000u16.to_be_bytes()
+                    || header[22] != self.input.hop_limit
+                    || header[23]
+                        != if self.input.kind == NET_STACK_TX_UDP {
+                            17
+                        } else {
+                            6
+                        }
+                    || header[26..30] != self.input.source[..4]
+                    || header[30..34] != self.input.destination[..4]
+                    || checksum_bytes(&header[14..34]) != 0
+                {
+                    return false;
+                }
+                34
+            }
+            NET_STACK_ADDRESS_FAMILY_IPV6 => {
+                let transport_len = self.header_len as u32 - 54 + self.input.payload_len;
+                let version_class = 0x6000_0000u32 | (u32::from(self.input.traffic_class) << 20);
+                if header[12..14] != 0x86ddu16.to_be_bytes()
+                    || header[14..18] != version_class.to_be_bytes()
+                    || header[18..20] != (transport_len as u16).to_be_bytes()
+                    || header[20]
+                        != if self.input.kind == NET_STACK_TX_UDP {
+                            17
+                        } else {
+                            6
+                        }
+                    || header[21] != self.input.hop_limit
+                    || header[22..38] != self.input.source
+                    || header[38..54] != self.input.destination
+                {
+                    return false;
+                }
+                54
+            }
+            _ => return false,
+        };
+        match self.input.kind {
+            NET_STACK_TX_UDP => {
+                let udp = &header[transport_offset..transport_offset + 8];
+                let udp_len = self.input.payload_len + 8;
+                udp[..2] == self.input.source_port.to_be_bytes()
+                    && udp[2..4] == self.input.destination_port.to_be_bytes()
+                    && udp[4..6] == (udp_len as u16).to_be_bytes()
+                    && udp[6..8] != [0; 2]
+            }
+            NET_STACK_TX_TCP => {
+                let tcp_len = 20 + usize::from(self.input.tcp_options_len);
+                let tcp = &header[transport_offset..transport_offset + tcp_len];
+                tcp[..2] == self.input.source_port.to_be_bytes()
+                    && tcp[2..4] == self.input.destination_port.to_be_bytes()
+                    && tcp[4..8] == self.input.tcp_sequence.to_be_bytes()
+                    && tcp[8..12] == self.input.tcp_acknowledgement.to_be_bytes()
+                    && tcp[12]
+                        == ((tcp_len / 4) as u8) << 4 | u8::from(self.input.tcp_flags & 0x100 != 0)
+                    && tcp[13] == self.input.tcp_flags as u8
+                    && tcp[14..16] == self.input.tcp_window.to_be_bytes()
+                    && tcp[18..20] == [0; 2]
+                    && tcp[20..]
+                        == self.input.tcp_options[..usize::from(self.input.tcp_options_len)]
+            }
+            _ => false,
+        }
+    }
+}
+
+fn checksum_bytes(bytes: &[u8]) -> u16 {
+    let mut sum = 0u64;
+    let mut words = bytes.chunks_exact(2);
+    for word in &mut words {
+        sum += u64::from(u16::from_be_bytes([word[0], word[1]]));
+    }
+    if let Some(&last) = words.remainder().first() {
+        sum += u64::from(u16::from_be_bytes([last, 0]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// 常驻 worker 与 `net.stack` 间一次批调用的数据帧。
 ///
 /// `input` 在同步调用期间始终归 host 所有。ELM 只能读取它，并逐项提交固定容量
@@ -741,6 +1113,7 @@ pub struct NetStackCallV1 {
     pub quiesced: u8,
     pub reserved0: [u8; 6],
     pub worker_turn: *mut NetStackWorkerTurnV1,
+    pub tx_header: *mut NetStackTxHeaderV1,
     pub reserved1: [u64; 2],
 }
 
@@ -756,6 +1129,7 @@ impl NetStackCallV1 {
             quiesced: 0,
             reserved0: [0; 6],
             worker_turn: core::ptr::null_mut(),
+            tx_header: core::ptr::null_mut(),
             reserved1: [0; 2],
         }
     }
@@ -773,10 +1147,10 @@ impl NetStackCallV1 {
             && self.generation == generation
             && self.reserved0 == [0; 6]
             && self.reserved1 == [0; 2]
-            && if opcode == NET_STACK_OP_WORKER_TURN {
-                !self.worker_turn.is_null()
-            } else {
-                self.worker_turn.is_null()
+            && match opcode {
+                NET_STACK_OP_WORKER_TURN => !self.worker_turn.is_null() && self.tx_header.is_null(),
+                NET_STACK_OP_TX_HEADER => self.worker_turn.is_null() && !self.tx_header.is_null(),
+                _ => self.worker_turn.is_null() && self.tx_header.is_null(),
             }
     }
 }
@@ -970,6 +1344,13 @@ pub enum NetStackRemoveError {
     Busy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetStackTxError {
+    InvalidInput,
+    StackUnavailable,
+    CallFailed,
+}
+
 pub trait NetStackRegistrar: Send + Sync {
     fn register_stack(
         &self,
@@ -982,6 +1363,12 @@ pub trait NetStackRegistrar: Send + Sync {
         owner_cell: u64,
         generation: u64,
     ) -> Result<(), NetStackRemoveError>;
+
+    fn build_tx_header(
+        &self,
+        payload: &PacketChain,
+        input: NetStackTxInputV1,
+    ) -> Result<NetStackTxHeaderV1, NetStackTxError>;
 
     fn snapshot(&self) -> NetStackSnapshot;
 }
@@ -1065,6 +1452,24 @@ pub fn stack_snapshot() -> NetStackSnapshot {
     registrar
         .map(NetStackRegistrar::snapshot)
         .unwrap_or_else(NetStackSnapshot::absent)
+}
+
+pub fn build_tx_header(
+    payload: &PacketChain,
+    input: NetStackTxInputV1,
+) -> Result<NetStackTxHeaderV1, NetStackTxError> {
+    if !input.valid()
+        || input
+            .payload_offset
+            .checked_add(input.payload_len)
+            .is_none_or(|end| end > payload.total_len() as u32)
+    {
+        return Err(NetStackTxError::InvalidInput);
+    }
+    let registrar = *STACK_REGISTRAR.lock();
+    registrar
+        .ok_or(NetStackTxError::StackUnavailable)?
+        .build_tx_header(payload, input)
 }
 
 /// 由常驻 broker 使用的严格生命周期状态机。
@@ -1187,6 +1592,60 @@ mod tests {
         assert!(!frame.valid(NET_STACK_OP_PROBE, 8));
         frame.reserved1[0] = 1;
         assert!(!frame.valid(NET_STACK_OP_PROBE, 7));
+    }
+
+    #[test]
+    fn tx_header_frame_binds_input_payload_and_normalized_output() {
+        let source = crate::IpAddr::V4(crate::Ipv4Addr::new(10, 0, 2, 2));
+        let destination = crate::IpAddr::V4(crate::Ipv4Addr::new(10, 0, 2, 15));
+        let payload = PacketChain::from_owned(b"test".to_vec());
+        let input =
+            NetStackTxInputV1::udp(source, destination, 1000, 9000, [1; 6], [2; 6], 64, 7, 4)
+                .unwrap();
+        let payload_pointer = &payload as *const PacketChain;
+        let mut output = NetStackTxHeaderV1::new(9, &payload, input);
+        assert!(output.valid_header(9, payload_pointer, &input));
+        assert!(!output.fully_committed(&payload));
+
+        output.header_len = 42;
+        output.header[..6].copy_from_slice(&[2; 6]);
+        output.header[6..12].copy_from_slice(&[1; 6]);
+        output.header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        output.header[14] = 0x45;
+        output.header[15] = 7;
+        output.header[16..18].copy_from_slice(&32u16.to_be_bytes());
+        output.header[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+        output.header[22] = 64;
+        output.header[23] = 17;
+        output.header[26..30].copy_from_slice(&[10, 0, 2, 2]);
+        output.header[30..34].copy_from_slice(&[10, 0, 2, 15]);
+        let ip_checksum = checksum_bytes(&output.header[14..34]);
+        output.header[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
+        output.header[34..36].copy_from_slice(&1000u16.to_be_bytes());
+        output.header[36..38].copy_from_slice(&9000u16.to_be_bytes());
+        output.header[38..40].copy_from_slice(&12u16.to_be_bytes());
+
+        let mut full_packet = output.header[..42].to_vec();
+        full_packet.extend_from_slice(b"test");
+        let checksum_packet = PacketChain::from_owned(full_packet);
+        let udp_checksum =
+            crate::pipeline::transport_checksum(&checksum_packet, 34, 12, source, destination, 17)
+                .unwrap();
+        output.header[40..42].copy_from_slice(&udp_checksum.to_be_bytes());
+        output.committed = 1;
+        assert!(output.fully_committed(&payload));
+
+        output.header[15] ^= 1;
+        assert!(!output.fully_committed(&payload));
+        output.header[15] ^= 1;
+        assert!(output.fully_committed(&payload));
+        output.input.payload_len += 1;
+        assert!(!output.valid_header(9, payload_pointer, &input));
+
+        let mut call = NetStackCallV1::new(NET_STACK_OP_TX_HEADER, 9);
+        assert!(!call.valid(NET_STACK_OP_TX_HEADER, 9));
+        call.tx_header = &mut output;
+        assert!(call.valid(NET_STACK_OP_TX_HEADER, 9));
     }
 
     #[test]

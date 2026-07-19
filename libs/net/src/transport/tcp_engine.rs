@@ -10,10 +10,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::buf::{PacketChain, PacketMetadata};
 use crate::control::RouteDecision;
 use crate::flow::{FlowKey, FlowTable, flow_hash64, rss_hash};
-use crate::pipeline::{EthernetHeader, FrontendPacket, IpPacket, transport_checksum};
+#[cfg(test)]
+use crate::pipeline::transport_checksum;
+use crate::pipeline::{EthernetHeader, FrontendPacket, IpPacket};
+#[cfg(test)]
+use crate::transport::TCP_PROTOCOL_NUMBER;
 use crate::transport::{
-    TCP_PROTOCOL_NUMBER, TcpFlags, TcpPacket, TcpSackBlock, TcpSequence, TcpState, TcpStateMachine,
-    TcpTransmit, TransportControlError,
+    TcpFlags, TcpPacket, TcpSackBlock, TcpSequence, TcpState, TcpStateMachine, TcpTransmit,
+    TransportControlError,
 };
 use crate::{
     AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, ListenGroup,
@@ -2074,6 +2078,45 @@ fn sip_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
     *v2 = v2.rotate_left(32);
 }
 
+#[cfg(not(test))]
+pub fn build_tcp_packet(
+    mut payload: PacketChain,
+    work: &PreparedTcpTx,
+) -> Result<PacketChain, PacketChain> {
+    let options_len = usize::from(work.options_len);
+    if options_len > work.options.len() || options_len % 4 != 0 {
+        return Err(payload);
+    }
+    let payload_len = payload.total_len();
+    let Some(input) = crate::stack::NetStackTxInputV1::tcp(
+        work.path.route.source,
+        work.remote.addr,
+        work.local_port,
+        work.remote.port,
+        work.path.source_mac,
+        work.path.destination_mac,
+        work.sequence.0,
+        work.acknowledgement.0,
+        work.flags.bits(),
+        work.window,
+        &work.options[..options_len],
+        payload_len as u32,
+    ) else {
+        return Err(payload);
+    };
+    let output = match crate::stack::build_tx_header(&payload, input) {
+        Ok(output) => output,
+        Err(_) => return Err(payload),
+    };
+    if payload.prepend_first_zeroed(output.header_len).is_err()
+        || payload.copy_in(0, output.header_bytes()).is_err()
+    {
+        return Err(payload);
+    }
+    Ok(payload)
+}
+
+#[cfg(test)]
 pub fn build_tcp_packet(
     mut payload: PacketChain,
     work: &PreparedTcpTx,
@@ -2179,6 +2222,55 @@ pub fn build_tcp_packet(
     Ok(payload)
 }
 
+#[cfg(not(test))]
+pub fn build_tcp_reset(
+    mut packet: PacketChain,
+    ethernet: EthernetHeader,
+    ip: IpPacket,
+    tcp: TcpPacket,
+) -> Result<PacketChain, PacketChain> {
+    if tcp.flags.contains(TcpFlags::RST) {
+        return Err(packet);
+    }
+    let (sequence, acknowledgement, flags) = if tcp.flags.contains(TcpFlags::ACK) {
+        (tcp.acknowledgement.0, 0, TcpFlags::RST)
+    } else {
+        (
+            0,
+            (tcp.sequence + tcp.sequence_len()).0,
+            TcpFlags::RST | TcpFlags::ACK,
+        )
+    };
+    let Some(mut input) = crate::stack::NetStackTxInputV1::tcp(
+        ip.destination,
+        ip.source,
+        tcp.destination_port,
+        tcp.source_port,
+        ethernet.destination,
+        ethernet.source,
+        sequence,
+        acknowledgement,
+        flags.bits(),
+        0,
+        &[],
+        0,
+    ) else {
+        return Err(packet);
+    };
+    input.payload_offset = 0;
+    let output = match crate::stack::build_tx_header(&packet, input) {
+        Ok(output) => output,
+        Err(_) => return Err(packet),
+    };
+    if packet.total_len() < usize::from(output.header_len)
+        || packet.copy_in(0, output.header_bytes()).is_err()
+    {
+        return Err(packet);
+    }
+    Ok(packet)
+}
+
+#[cfg(test)]
 pub fn build_tcp_reset(
     mut packet: PacketChain,
     ethernet: EthernetHeader,

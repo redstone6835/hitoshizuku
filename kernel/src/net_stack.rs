@@ -7,10 +7,11 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use net::stack::{
-    NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_PROBE,
+    NET_STACK_CALL_RUST_ABI, NET_STACK_CALL_STATUS_OK, NET_STACK_OP_PROBE, NET_STACK_OP_TX_HEADER,
     NET_STACK_OP_WORKER_TURN, NetStackCallV1, NetStackEndpoint, NetStackHandle, NetStackLifecycle,
     NetStackRegisterError, NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration,
-    NetStackRemoveError, NetStackSnapshot, NetStackState, NetStackWorkerTurnV1,
+    NetStackRemoveError, NetStackSnapshot, NetStackState, NetStackTxError, NetStackTxHeaderV1,
+    NetStackTxInputV1, NetStackWorkerTurnV1,
 };
 use sched::sync::Spinlock;
 
@@ -155,6 +156,14 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
             handle.0
         );
         Ok(())
+    }
+
+    fn build_tx_header(
+        &self,
+        payload: &net::buf::PacketChain,
+        input: NetStackTxInputV1,
+    ) -> Result<NetStackTxHeaderV1, NetStackTxError> {
+        tx_header(payload, input)
     }
 
     fn snapshot(&self) -> NetStackSnapshot {
@@ -339,6 +348,69 @@ pub(crate) fn worker_turn(
         );
     }
     Err(WorkerTurnError::CallFailed)
+}
+
+fn tx_header(
+    payload: &net::buf::PacketChain,
+    input: NetStackTxInputV1,
+) -> Result<NetStackTxHeaderV1, NetStackTxError> {
+    if !input.valid()
+        || input
+            .payload_offset
+            .checked_add(input.payload_len)
+            .is_none_or(|end| end > payload.total_len() as u32)
+    {
+        return Err(NetStackTxError::InvalidInput);
+    }
+    let (handle, generation, call) = {
+        let broker = BROKER.lock();
+        let snapshot = broker.lifecycle.snapshot();
+        if snapshot.state != NetStackState::Active || !snapshot.probed {
+            return Err(NetStackTxError::StackUnavailable);
+        }
+        let Some(record) = broker.record.as_ref() else {
+            return Err(NetStackTxError::StackUnavailable);
+        };
+        (record.handle, record.generation, record.call.clone())
+    };
+
+    let payload_pointer = payload as *const net::buf::PacketChain;
+    let mut output = NetStackTxHeaderV1::new(generation, payload, input);
+    let output_pointer = &mut output as *mut NetStackTxHeaderV1;
+    let mut frame = NetStackCallV1::new(NET_STACK_OP_TX_HEADER, generation);
+    frame.tx_header = output_pointer;
+    let Some(output_range) = host_range(output_pointer) else {
+        return Err(NetStackTxError::CallFailed);
+    };
+    let Some(payload_range) = host_range(payload_pointer) else {
+        return Err(NetStackTxError::CallFailed);
+    };
+    let result = call.invoke(&mut frame, &[output_range, payload_range]);
+    let valid = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
+        && frame.valid(NET_STACK_OP_TX_HEADER, generation)
+        && frame.tx_header == output_pointer
+        && frame.ready == 0
+        && frame.quiesced == 0
+        && output.valid_header(generation, payload_pointer, &input)
+        && output.fully_committed(payload);
+    if valid {
+        return Ok(output);
+    }
+
+    let mut broker = BROKER.lock();
+    let current = broker
+        .record
+        .as_ref()
+        .is_some_and(|record| record.handle == handle && record.generation == generation);
+    if current && broker.lifecycle.mark_faulted(handle) {
+        log::error!(
+            "[net-stack] TX header call failed: generation={} handle={} result={:?}",
+            generation,
+            handle.0,
+            result
+        );
+    }
+    Err(NetStackTxError::CallFailed)
 }
 
 fn host_range<T>(pointer: *const T) -> Option<(usize, usize)> {
