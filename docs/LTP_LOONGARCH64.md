@@ -137,9 +137,14 @@ python3 scripts/ltp_la.py report
 - [x] 为清单解析、marker、结果分类和恢复去重添加宿主单元测试。
 - [x] 构建专用 `kernel-la` 并完成 TPASS、静态跳过和 TCONF 三类冒烟。
 - [x] 修复 epoll 高精度超时链路，并完成默认四核连续五轮计时回归。
+- [x] 修复 VFS 凭据、clone、CPU 时钟和 socket bind 的已确认内核缺陷，并完成单例回归。
 - [ ] 完成 `default` 与 `network` 第一轮全量基线。
 - [ ] 按独立根因修复内核漏洞并完成三次单例与场景分片回归。
 - [ ] 从零完成最终全量复测。
+
+`build/ltp-loongarch64/results.jsonl` 中已有的前 100 条记录来自修复前内核，只保留为
+历史基线，不再通过 `resume` 混入新结果。修复后的正式活动使用新的输出目录和固定内核
+哈希从零开始，完成后再生成最终报告。
 
 ## Missing Feature
 
@@ -148,6 +153,8 @@ python3 scripts/ltp_la.py report
 | 场景/用例 | 证据 | 结论 |
 | --- | --- | --- |
 | `syscalls/fsopen01` | 两次 `fsopen()` 均返回 `ENOSYS`，LTP 汇总为 2 个 TFAIL | `fsopen(2)` 尚未实现 |
+| `syscalls/clone301` | 普通 clone3、退出信号和 pidfd 共 6 个子项通过，`CLONE_NEWPID` 子项失败 | PID namespace 尚未实现 |
+| `syscalls/clock_nanosleep03`、`clock_gettime03` | 测试要求 `CLONE_NEWTIME`、`timens_offsets` 和 `setns` | TIME namespace 尚未实现 |
 
 ## 冒烟记录
 
@@ -218,3 +225,66 @@ python3 scripts/ltp_la.py report
   内核及全部内置 ELM 驱动重新构建成功。
 
 对应提交为 `f91d94a5` 和 `5ecf6d3c`。
+
+### VFS 凭据与路径错误优先级
+
+修复高精度超时后继续检查 `syscalls` 场景，确认文件创建凭据和路径解析错误优先级存在
+三类相互独立的问题。
+
+| 用例 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| `chmod03`、`chown03`、`chown03_16` | extfs 创建 inode 时使用真实 uid/gid，而不是 VFS 已计算的 fsuid/fsgid；切换有效身份后会错误创建 root 所有文件 | VFS 创建接口统一传递最终凭据，extfs 按 fsuid/fsgid 写入 inode 所有者 | `chmod03`、`chown03` 连续三轮通过；`chown03_16` 从环境性 TBROK 恢复为架构预期 TCONF |
+| `access04` | 路径中间分量先做目录搜索权限检查，后判断其是否为目录，导致应返回 `ENOTDIR` 时抢先返回 `EACCES` | 先确认中间分量类型，再执行目录搜索权限检查 | 连续三轮通过 |
+| `chroot04` | `chroot` 在解析路径和检查搜索权限前先检查管理能力，导致应返回 `EACCES` 时抢先返回 `EPERM` | 按 Linux 可观察语义调整路径解析、DAC 检查和能力检查顺序 | 连续三轮通过 |
+
+对应提交为 `3e545581`。
+
+### 共享匿名映射与 clone 语义
+
+`clone03` 最初表现为父进程在子进程退出后读到零页。复核缺页路径后确认问题不在
+LoongArch64 trap frame，而在共享匿名映射 backing 的所有权模型；同一批 clone 测试还
+暴露了参数校验、退出信号和 wait 唤醒竞争问题。
+
+| 用例 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| `clone03` | 未预触页的 `MAP_SHARED|MAP_ANONYMOUS` 映射只通过数值 ID 和 `Weak` 页缓存关联；子进程退出后 backing 可被释放，父进程随后得到新的零页 | 让共享匿名 VMA 持有强 backing，并在 fork/clone 时共享同一对象 | 连续三轮通过 |
+| `clone08` | 传统 `clone` 的 `CLONE_THREAD` 错误复用了 clone3 的 `exit_signal` 规则，把 flags 低位 `SIGCHLD` 判为非法 | 区分 legacy clone 与 clone3 的退出信号校验 | 连续三轮通过 |
+| `clone302` | clone3 接受非零 `stack` 配合零 `stack_size`，随后构造出损坏的用户栈 | 强制 `stack` 与 `stack_size` 成对出现，并校验范围 | 连续三轮通过 |
+| `clone301` | 子进程退出状态与退出信号同时唤醒 `wait4` 时，内核在重查 zombie 前直接返回 `EINTR` | 信号唤醒后先重查可回收子进程，再决定是否返回中断 | 普通 clone3、退出信号和 pidfd 共 6 个子项通过；PID namespace 子项列为 Missing Feature |
+
+宿主 VMA 集合测试新增共享 backing 生命周期和 clone 拆分覆盖，全部通过。对应提交为
+`cc9d7d7b`。
+
+### CPU 时间钟与睡眠中断
+
+`clock_gettime01/02` 显示进程和线程 CPU 时间恒为零；`clock_nanosleep01` 的信号子项
+则因每次信号后自动重新开始睡眠而耗时约 30 秒。两者分别属于运行时间记账和 syscall
+重启策略缺陷。
+
+| 用例 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| `clock_gettime01`、`clock_gettime02` | runqueue 未累计任务实际运行时间，procfs `stat` 固定输出零，进程/线程 CPU clock 未实现 | 在调度切换边界累计实际 CPU 时间，向 procfs 和 `clock_gettime` 暴露进程及线程时间钟 | 两个用例各连续三轮通过 |
+| `clock_nanosleep01` | 通用 syscall 分发器对全部 `EINTR` 应用 `SA_RESTART`，错误重启 Linux 明确不可自动重启的 nanosleep/clock_nanosleep | 为不可重启睡眠建立独立策略，并修正错误码和 `rem` 指针语义 | 连续三轮通过 |
+| `clock_getres01`、`clock_nanosleep02`、`clock_nanosleep04` | 相关时钟分辨率、绝对睡眠和错误路径回归 | 沿用统一时间域和新的睡眠中断语义 | 回归通过 |
+
+TIME namespace 相关的 `clock_nanosleep03`、`clock_gettime03` 依赖完整命名空间语义，
+不使用占位实现伪造通过。对应提交为 `078286ac`。
+
+### socket bind 与 extfs 特殊节点
+
+`bind01` 至 `bind05` 同时覆盖 pathname Unix socket、特权端口、非本地地址、IPv6
+loopback 和重复绑定。逐例复现确认五项失败来自不同层，不能通过统一 errno 映射规避。
+
+| 用例 | 根因 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| `bind01` | extfs 未实现 socket/FIFO/字符设备/块设备特殊 inode 创建，pathname Unix socket bind 返回 `EOPNOTSUPP` | 实现特殊 inode 和目录项类型，按 ext2/3/4 约定编码、解码 8:8 与 12:20 设备号 | 连续三轮通过 |
+| `bind02` | Internet socket 未限制 1--1023 端口 | 增加 `CAP_NET_BIND_SERVICE`，从调度凭据映射到 VFS 并在 bind 前检查 | 连续三轮通过 |
+| `bind03` | 非本地地址被协议栈归类为通用参数错误 | 新增 `AddressNotAvailable` 并完整映射为 `EADDRNOTAVAIL` | 连续三轮通过 |
+| `bind04` | loopback 只有 `127.0.0.1/8`，没有 `::1/128`；bind 也未严格校验 socket 与 sockaddr 地址族 | loopback 同时注册 IPv4/IPv6 地址，并按 socket family 解析 bind 地址 | 连续三轮通过 |
+| `bind05` | 已绑定 socket 再次绑定与另一 socket 抢占同名地址共用 `EADDRINUSE` | 重绑定返回 `EINVAL`，真实名称冲突保留 `EADDRINUSE` | 连续三轮通过 |
+
+宿主 `socket` 54 项、`net` 102 项、`vfs` 79 项、`extfs` 21 项测试全部通过；最终四核
+LoongArch64 内核上五个用例各连续三轮通过。最终验证内核 SHA-256 为
+`095d06da07c4164172e65bb01f10a6bb648487917cc688620d332d608239d708`，LTP 基盘哈希
+保持为 `1aa79d03cf41e2a80ae4ed43771101c1e67ec8db41c3c20b77792fe6b1b85b50`。对应提交为
+`1bec6752`。
