@@ -19,15 +19,17 @@ use net::stack::{
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
-    NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE, NET_STACK_OP_TX_HEADER,
+    NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE,
+    NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER,
     NET_STACK_OP_WORKER_TURN, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
     NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
     NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
     NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NET_STACK_TX_HEADER_ABI_VERSION,
-    NET_STACK_TX_HEADER_CAPACITY, NET_STACK_TX_TCP, NET_STACK_TX_UDP, NetStackEthernetV1,
+    NET_STACK_TX_HEADER_CAPACITY, NET_STACK_TX_RAW_FRAGMENT, NET_STACK_TX_TCP,
+    NET_STACK_TX_UDP, NET_STACK_TX_UDP_FRAGMENT, NetStackEthernetV1,
     NetStackHandle, NetStackLocalAddressV1, NetStackNetworkV1, NetStackRegisterErrorKind,
     NetStackRegistration, NetStackRemoveError, NetStackTcpOptionsV1, NetStackTransportV1,
-    NetStackTxHeaderV1, NetStackTxInputV1,
+    NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1, NetStackTxHeaderV1, NetStackTxInputV1,
 };
 
 use allocator as _;
@@ -192,6 +194,61 @@ fn tx_header_frame_valid(frame: &NetStackTxHeaderV1, generation: u64) -> bool {
         && frame.reserved0 == 0
         && frame.header_len == 0
         && frame.header == [0; NET_STACK_TX_HEADER_CAPACITY]
+        && frame.reserved1 == [0; 2]
+}
+
+fn tx_fragment_input_valid(input: &NetStackTxFragmentInputV1) -> bool {
+    if input.reserved != [0; 2]
+        || input.mtu == 0
+        || input.identification == 0
+        || !matches!(
+            input.family,
+            NET_STACK_ADDRESS_FAMILY_IPV4 | NET_STACK_ADDRESS_FAMILY_IPV6
+        )
+        || (input.family == NET_STACK_ADDRESS_FAMILY_IPV4
+            && (input.source[4..] != [0; 12] || input.destination[4..] != [0; 12]))
+    {
+        return false;
+    }
+    match input.kind {
+        NET_STACK_TX_UDP_FRAGMENT => {
+            input.source_port != 0
+                && input.destination_port != 0
+                && input.raw_header_len == 0
+                && input.raw_flags == 0
+                && input.fragment_offset <= input.payload_len
+                && input.fragment_offset % 8 == 0
+                && input.payload_len <= u32::from(u16::MAX - 8)
+        }
+        NET_STACK_TX_RAW_FRAGMENT => {
+            input.family == NET_STACK_ADDRESS_FAMILY_IPV4
+                && input.source_port == 0
+                && input.destination_port == 0
+                && input.fragment_offset % 8 == 0
+                && (input.raw_header_len == 0
+                    || ((20..=60).contains(&input.raw_header_len)
+                        && input.raw_header_len % 4 == 0
+                        && u32::from(input.raw_header_len) <= input.payload_len))
+        }
+        _ => false,
+    }
+}
+
+fn tx_fragment_frame_valid(frame: &NetStackTxFragmentHeaderV1, generation: u64) -> bool {
+    frame.abi_version == NET_STACK_TX_HEADER_ABI_VERSION
+        && frame.struct_size as usize == core::mem::size_of::<NetStackTxFragmentHeaderV1>()
+        && frame.generation == generation
+        && !frame.payload.is_null()
+        && frame.payload.is_aligned()
+        && tx_fragment_input_valid(&frame.input)
+        && frame.committed == 0
+        && frame.more_fragments == 0
+        && frame.reserved0 == [0; 2]
+        && frame.header_len == 0
+        && frame.header == [0; NET_STACK_TX_HEADER_CAPACITY]
+        && frame.payload_offset == 0
+        && frame.payload_len == 0
+        && frame.next_fragment_offset == 0
         && frame.reserved1 == [0; 2]
 }
 
@@ -806,6 +863,216 @@ fn build_tx_header(
     Some((header_len as u16, header))
 }
 
+fn fragment_udp_checksum(
+    payload: &net::buf::PacketChain,
+    input: &NetStackTxFragmentInputV1,
+    header: &[u8; 8],
+) -> Option<u16> {
+    let total_len = 8usize.checked_add(input.payload_len as usize)?;
+    let mut checksum = InternetChecksum::new();
+    match input.family {
+        NET_STACK_ADDRESS_FAMILY_IPV4 => {
+            let length = u16::try_from(total_len).ok()?;
+            checksum.add(&input.source[..4]);
+            checksum.add(&input.destination[..4]);
+            checksum.add(&[0, 17]);
+            checksum.add(&length.to_be_bytes());
+        }
+        NET_STACK_ADDRESS_FAMILY_IPV6 => {
+            let length = u32::try_from(total_len).ok()?;
+            checksum.add(&input.source);
+            checksum.add(&input.destination);
+            checksum.add(&length.to_be_bytes());
+            checksum.add(&[0, 0, 0, 17]);
+        }
+        _ => return None,
+    }
+    checksum.add(header);
+    checksum_chain_range(payload, 0, input.payload_len as usize, &mut checksum)
+        .then(|| checksum.finish())
+}
+
+fn build_tx_fragment_header(
+    payload: &net::buf::PacketChain,
+    input: &NetStackTxFragmentInputV1,
+) -> Option<(
+    u16,
+    [u8; NET_STACK_TX_HEADER_CAPACITY],
+    u32,
+    u32,
+    u32,
+    bool,
+)> {
+    if !tx_fragment_input_valid(input) || input.payload_len as usize > payload.total_len() {
+        return None;
+    }
+    let mut header = [0u8; NET_STACK_TX_HEADER_CAPACITY];
+    header[..6].copy_from_slice(&input.destination_mac);
+    header[6..12].copy_from_slice(&input.source_mac);
+    match input.kind {
+        NET_STACK_TX_UDP_FRAGMENT => {
+            let datagram_len = 8usize.checked_add(input.payload_len as usize)?;
+            let (_ip_header_len, _fragment_header_len, fragment_capacity) = match input.family {
+                NET_STACK_ADDRESS_FAMILY_IPV4 => (
+                    20usize,
+                    0usize,
+                    (input.mtu as usize).checked_sub(20)? & !7,
+                ),
+                NET_STACK_ADDRESS_FAMILY_IPV6 => (
+                    40usize,
+                    8usize,
+                    (input.mtu as usize).checked_sub(48)? & !7,
+                ),
+                _ => return None,
+            };
+            if fragment_capacity < 8 {
+                return None;
+            }
+            let datagram_offset = if input.fragment_offset == 0 {
+                0usize
+            } else {
+                8usize.checked_add(input.fragment_offset as usize)?
+            };
+            if datagram_offset >= datagram_len {
+                return None;
+            }
+            let chunk_len = fragment_capacity.min(datagram_len - datagram_offset);
+            let first = input.fragment_offset == 0;
+            let payload_offset = input.fragment_offset;
+            let payload_len = chunk_len.checked_sub(if first { 8 } else { 0 })? as u32;
+            let next_offset = payload_offset.checked_add(payload_len)?;
+            let more = next_offset < input.payload_len;
+            let fragment_field = (datagram_offset / 8) as u16;
+            match input.family {
+                NET_STACK_ADDRESS_FAMILY_IPV4 => {
+                    header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+                    header[14] = 0x45;
+                    header[15] = input.traffic_class;
+                    header[16..18]
+                        .copy_from_slice(&u16::try_from(20 + chunk_len).ok()?.to_be_bytes());
+                    header[18..20].copy_from_slice(&(input.identification as u16).to_be_bytes());
+                    header[20..22].copy_from_slice(
+                        &(fragment_field | if more { 0x2000 } else { 0 }).to_be_bytes(),
+                    );
+                    header[22] = input.hop_limit;
+                    header[23] = 17;
+                    header[26..30].copy_from_slice(&input.source[..4]);
+                    header[30..34].copy_from_slice(&input.destination[..4]);
+                    let checksum = checksum(&header[14..34]);
+                    header[24..26].copy_from_slice(&checksum.to_be_bytes());
+                    if first {
+                        let udp = &mut header[34..42];
+                        udp[..2].copy_from_slice(&input.source_port.to_be_bytes());
+                        udp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
+                        udp[4..6].copy_from_slice(&u16::try_from(datagram_len).ok()?.to_be_bytes());
+                        let mut checksum_header = [0u8; 8];
+                        checksum_header.copy_from_slice(udp);
+                        let value = fragment_udp_checksum(payload, input, &checksum_header)?;
+                        udp[6..8].copy_from_slice(&(if value == 0 { 0xffff } else { value }).to_be_bytes());
+                    }
+                    Some((
+                        (34 + if first { 8 } else { 0 }) as u16,
+                        header,
+                        payload_offset,
+                        payload_len,
+                        next_offset,
+                        more,
+                    ))
+                }
+                NET_STACK_ADDRESS_FAMILY_IPV6 => {
+                    header[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+                    header[14..18].copy_from_slice(
+                        &(0x6000_0000u32 | (u32::from(input.traffic_class) << 20)).to_be_bytes(),
+                    );
+                    let ipv6_payload_len = 8usize + chunk_len;
+                    header[18..20].copy_from_slice(&u16::try_from(ipv6_payload_len).ok()?.to_be_bytes());
+                    header[20] = 44;
+                    header[21] = input.hop_limit;
+                    header[22..38].copy_from_slice(&input.source);
+                    header[38..54].copy_from_slice(&input.destination);
+                    header[54] = 17;
+                    header[56..58].copy_from_slice(
+                        &(((fragment_field) << 3) | u16::from(more)).to_be_bytes(),
+                    );
+                    header[58..62].copy_from_slice(&input.identification.to_be_bytes());
+                    if first {
+                        let udp = &mut header[62..70];
+                        udp[..2].copy_from_slice(&input.source_port.to_be_bytes());
+                        udp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
+                        udp[4..6].copy_from_slice(&u16::try_from(datagram_len).ok()?.to_be_bytes());
+                        let mut checksum_header = [0u8; 8];
+                        checksum_header.copy_from_slice(udp);
+                        let value = fragment_udp_checksum(payload, input, &checksum_header)?;
+                        udp[6..8].copy_from_slice(&(if value == 0 { 0xffff } else { value }).to_be_bytes());
+                    }
+                    Some((
+                        (62 + if first { 8 } else { 0 }) as u16,
+                        header,
+                        payload_offset,
+                        payload_len,
+                        next_offset,
+                        more,
+                    ))
+                }
+                _ => None,
+            }
+        }
+        NET_STACK_TX_RAW_FRAGMENT => {
+            if payload.total_len() != input.payload_len as usize || payload.total_len() < 20 {
+                return None;
+            }
+            let mut ip = [0u8; 60];
+            payload.copy_out(0, &mut ip[..20]).ok()?;
+            let header_len = usize::from(ip[0] & 0x0f) * 4;
+            if ip[0] >> 4 != 4
+                || !(20..=60).contains(&header_len)
+                || header_len % 4 != 0
+                || input.raw_header_len != 0 && usize::from(input.raw_header_len) != header_len
+            {
+                return None;
+            }
+            payload.copy_out(0, &mut ip[..header_len]).ok()?;
+            let body_len = payload.total_len().checked_sub(header_len)?;
+            let capacity = (input.mtu as usize).checked_sub(header_len)? & !7;
+            if capacity < 8 || input.fragment_offset as usize >= body_len {
+                return None;
+            }
+            let chunk_len = capacity.min(body_len - input.fragment_offset as usize);
+            let more = input.fragment_offset as usize + chunk_len < body_len;
+            let flags = u16::from_be_bytes([ip[6], ip[7]]);
+            if flags & 0x4000 != 0 {
+                return None;
+            }
+            ip[2..4].copy_from_slice(&u16::try_from(header_len + chunk_len).ok()?.to_be_bytes());
+            ip[6..8].copy_from_slice(
+                &((flags & 0x8000)
+                    | ((input.fragment_offset / 8) as u16)
+                    | if more { 0x2000 } else { 0 })
+                    .to_be_bytes(),
+            );
+            if ip[12..16] == [0; 4] {
+                ip[12..16].copy_from_slice(&input.source[..4]);
+            }
+            ip[16..20].copy_from_slice(&input.destination[..4]);
+            ip[10..12].fill(0);
+            let ip_checksum = checksum(&ip[..header_len]);
+            ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+            header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            header[14..14 + header_len].copy_from_slice(&ip[..header_len]);
+            let next_offset = input.fragment_offset.saturating_add(chunk_len as u32);
+            Some((
+                (14 + header_len) as u16,
+                header,
+                header_len as u32 + input.fragment_offset,
+                chunk_len as u32,
+                next_offset,
+                more,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn transport_checksum_valid(
     input: &net::buf::PacketBatch,
     index: usize,
@@ -1408,6 +1675,37 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
             };
             output.header_len = header_len;
             output.header = header;
+            output.committed = 1;
+        }
+        NET_STACK_OP_TX_FRAGMENT_HEADER => {
+            if QUIESCED.load(Ordering::Acquire) || frame.reserved1[0] == 0 {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            let output_pointer =
+                frame.reserved1[0] as usize as *mut NetStackTxFragmentHeaderV1;
+            if !output_pointer.is_aligned() {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            // Safety: host 将分片输出帧声明为本次 pinned call 的可访问范围；
+            // 指针只在同步调用期间借用，ELM 不保存它。
+            let output = unsafe { &mut *output_pointer };
+            if !tx_fragment_frame_valid(output, frame.generation) {
+                return NET_STACK_CALL_STATUS_INVALID;
+            }
+            // Safety: host 同时声明了只读 PacketChain 外壳范围，payload backing 只会
+            // 由受能力约束的 copy_out 内核符号读取。
+            let payload = unsafe { &*output.payload };
+            let Some((header_len, header, payload_offset, payload_len, next_offset, more)) =
+                build_tx_fragment_header(payload, &output.input)
+            else {
+                return NET_STACK_CALL_STATUS_INVALID;
+            };
+            output.header_len = header_len;
+            output.header = header;
+            output.payload_offset = payload_offset;
+            output.payload_len = payload_len;
+            output.next_fragment_offset = if more { next_offset } else { 0 };
+            output.more_fragments = u8::from(more);
             output.committed = 1;
         }
         NET_STACK_OP_QUIESCE => {

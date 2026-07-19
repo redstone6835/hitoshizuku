@@ -32,8 +32,7 @@ use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
 use net::transport::{
     LocalUdpIngressError, PreparedRawTx, PreparedTcpTx, PreparedUdpTx, RawTxError, TcpPacket,
-    TcpPath, build_header_included_ipv4_fragments, build_raw_packet, build_tcp_packet,
-    build_udp_fragments, build_udp_packet_with_options,
+    TcpPath, build_raw_packet, build_tcp_packet, build_udp_packet_with_options,
 };
 use net::{
     AddressFamily, Endpoint, FlowId, FlowShard, FlowTurnContext, InterfaceId, IpAddr, Ipv4Addr,
@@ -6060,31 +6059,68 @@ impl WorkerContext {
             payload.complete();
             let identification = self.next_fragment_id;
             self.next_fragment_id = self.next_fragment_id.wrapping_add(1).max(1);
-            match build_udp_fragments(
-                &bytes,
-                route,
-                destination,
-                source_port,
-                source_mac,
-                destination_mac,
-                hop_limit,
-                traffic_class,
-                identification,
-            ) {
-                Ok(frames) => {
-                    self.pending_tx_frames
-                        .extend(frames.into_iter().map(|bytes| PendingTxFrame {
-                            bytes,
-                            completion,
-                            facade: Some(Arc::clone(&facade)),
-                        }));
-                    self.drain_pending_tx_frames();
+            let chain = PacketChain::from_owned(bytes);
+            let mut fragment_offset = 0u32;
+            let mut frames = Vec::new();
+            let mut complete = false;
+            loop {
+                let input = net::stack::NetStackTxFragmentInputV1::udp(
+                    route.source,
+                    destination.addr,
+                    source_port,
+                    destination.port,
+                    source_mac,
+                    destination_mac,
+                    hop_limit,
+                    traffic_class,
+                    chain.total_len() as u32,
+                    route.mtu,
+                    identification,
+                    fragment_offset,
+                );
+                let Some(input) = input else {
+                    facade.set_pending_error(SocketError::MessageTooLarge);
+                    break;
+                };
+                let output = match net::stack::build_tx_fragment_header(&chain, input) {
+                    Ok(output) => output,
+                    Err(net::stack::NetStackTxError::InvalidInput) => {
+                        facade.set_pending_error(SocketError::MessageTooLarge);
+                        break;
+                    }
+                    Err(_) => {
+                        facade.set_pending_error(SocketError::Buffer);
+                        break;
+                    }
+                };
+                let mut frame =
+                    alloc::vec![0; usize::from(output.header_len) + output.payload_len as usize];
+                frame[..usize::from(output.header_len)].copy_from_slice(output.header_bytes());
+                if chain
+                    .copy_out(
+                        output.payload_offset as usize,
+                        &mut frame[usize::from(output.header_len)..],
+                    )
+                    .is_err()
+                {
+                    facade.set_pending_error(SocketError::Buffer);
+                    break;
                 }
-                Err(net::transport::UdpTxError::DatagramTooLarge)
-                | Err(net::transport::UdpTxError::MtuExceeded) => {
-                    facade.set_pending_error(SocketError::MessageTooLarge)
+                frames.push(frame);
+                if output.more_fragments == 0 {
+                    complete = true;
+                    break;
                 }
-                Err(_) => facade.set_pending_error(SocketError::Buffer),
+                fragment_offset = output.next_fragment_offset;
+            }
+            if complete {
+                self.pending_tx_frames
+                    .extend(frames.into_iter().map(|bytes| PendingTxFrame {
+                        bytes,
+                        completion,
+                        facade: Some(Arc::clone(&facade)),
+                    }));
+                self.drain_pending_tx_frames();
             }
             return Ok(());
         }
@@ -6257,25 +6293,74 @@ impl WorkerContext {
                 return Ok(());
             }
             let completion = work.completion;
-            let built = build_header_included_ipv4_fragments(&bytes, &work);
             work.payload.complete();
-            match built {
-                Ok(frames) => {
-                    self.pending_tx_frames
-                        .extend(frames.into_iter().map(|bytes| PendingTxFrame {
-                            bytes,
-                            completion,
-                            facade: Some(Arc::clone(&facade)),
-                        }));
-                    self.drain_pending_tx_frames();
+            let chain = PacketChain::from_owned(bytes);
+            let Some(input) = net::stack::NetStackTxFragmentInputV1::raw_ipv4(
+                work.route.source,
+                work.destination,
+                work.source_mac,
+                work.destination_mac,
+                chain.total_len() as u32,
+                work.route.mtu,
+                1,
+                0,
+                0,
+                0,
+            ) else {
+                facade.set_pending_error(SocketError::InvalidState);
+                return Ok(());
+            };
+            let mut fragment_offset = 0u32;
+            let mut frames = Vec::new();
+            let mut complete = false;
+            loop {
+                let input = net::stack::NetStackTxFragmentInputV1 {
+                    fragment_offset,
+                    ..input
+                };
+                let output = match net::stack::build_tx_fragment_header(&chain, input) {
+                    Ok(output) => output,
+                    Err(net::stack::NetStackTxError::InvalidInput) => {
+                        facade.set_pending_error(if work.route.mtu < 28 {
+                            SocketError::MessageTooLarge
+                        } else {
+                            SocketError::InvalidState
+                        });
+                        break;
+                    }
+                    Err(_) => {
+                        facade.set_pending_error(SocketError::Buffer);
+                        break;
+                    }
+                };
+                let mut frame =
+                    alloc::vec![0; usize::from(output.header_len) + output.payload_len as usize];
+                frame[..usize::from(output.header_len)].copy_from_slice(output.header_bytes());
+                if chain
+                    .copy_out(
+                        output.payload_offset as usize,
+                        &mut frame[usize::from(output.header_len)..],
+                    )
+                    .is_err()
+                {
+                    facade.set_pending_error(SocketError::Buffer);
+                    break;
                 }
-                Err(RawTxError::MtuExceeded | RawTxError::PacketTooLarge) => {
-                    facade.set_pending_error(SocketError::MessageTooLarge)
+                frames.push(frame);
+                if output.more_fragments == 0 {
+                    complete = true;
+                    break;
                 }
-                Err(RawTxError::AddressFamily | RawTxError::InvalidHeader) => {
-                    facade.set_pending_error(SocketError::InvalidState)
-                }
-                Err(RawTxError::Buffer) => facade.set_pending_error(SocketError::Buffer),
+                fragment_offset = output.next_fragment_offset;
+            }
+            if complete {
+                self.pending_tx_frames
+                    .extend(frames.into_iter().map(|bytes| PendingTxFrame {
+                        bytes,
+                        completion,
+                        facade: Some(Arc::clone(&facade)),
+                    }));
+                self.drain_pending_tx_frames();
             }
             return Ok(());
         }
