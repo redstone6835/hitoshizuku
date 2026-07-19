@@ -6,12 +6,15 @@ use alloc::vec::Vec;
 use crate::buf::{CompletionToken, DropReason, PacketChain, PacketFragment, PacketLayout};
 use crate::control::RouteDecision;
 use crate::flow::{DIRTY_INGRESS, FlowKey, FlowTable, flow_hash64, rss_hash};
-use crate::pipeline::{FrontendPacket, transport_checksum};
+use crate::pipeline::FrontendPacket;
+#[cfg(test)]
+use crate::pipeline::transport_checksum;
 use crate::transport::TransportControlError;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::{SocketFacade, UdpTxLease};
 
 const UDP_RX_DATAGRAMS: usize = 256;
+#[cfg(test)]
 const IP_PROTOCOL_UDP: u8 = 17;
 
 pub struct UdpDatagram {
@@ -979,6 +982,7 @@ pub fn build_udp_packet_with_options(
 }
 
 /// UDP 超出路径 MTU 时形成 IPv4 fragment 或 IPv6 Fragment header 报文。
+#[cfg(test)]
 pub fn build_udp_fragments(
     payload: &[u8],
     route: RouteDecision,
@@ -1081,6 +1085,7 @@ pub fn build_udp_fragments(
     Ok(frames)
 }
 
+#[cfg(test)]
 fn write_udp_header(header: &mut [u8], source: u16, destination: u16, len: u16) {
     header[0..2].copy_from_slice(&source.to_be_bytes());
     header[2..4].copy_from_slice(&destination.to_be_bytes());

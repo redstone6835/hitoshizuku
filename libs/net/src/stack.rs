@@ -22,12 +22,15 @@ pub const NET_STACK_OP_PROBE: u32 = 1;
 pub const NET_STACK_OP_WORKER_TURN: u32 = 2;
 pub const NET_STACK_OP_QUIESCE: u32 = 3;
 pub const NET_STACK_OP_TX_HEADER: u32 = 4;
+pub const NET_STACK_OP_TX_FRAGMENT_HEADER: u32 = 5;
 
 pub const NET_STACK_WORKER_TURN_ABI_VERSION: u16 = 1;
 pub const NET_STACK_TX_HEADER_ABI_VERSION: u16 = 1;
 pub const NET_STACK_TX_HEADER_CAPACITY: usize = 128;
 pub const NET_STACK_TX_UDP: u8 = 1;
 pub const NET_STACK_TX_TCP: u8 = 2;
+pub const NET_STACK_TX_UDP_FRAGMENT: u8 = 3;
+pub const NET_STACK_TX_RAW_FRAGMENT: u8 = 4;
 pub const NET_STACK_ETHERNET_ACCEPTED: u8 = 1;
 pub const NET_STACK_ETHERNET_TRUNCATED: u8 = 2;
 pub const NET_STACK_ETHERNET_UNSUPPORTED: u8 = 3;
@@ -612,6 +615,359 @@ pub struct NetStackTxInputV1 {
     pub reserved1: [u64; 2],
 }
 
+/// host 提交给 `net.stack` 的单个分片 header 构造输入。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct NetStackTxFragmentInputV1 {
+    pub kind: u8,
+    pub family: u8,
+    pub hop_limit: u8,
+    pub traffic_class: u8,
+    pub source_mac: [u8; 6],
+    pub destination_mac: [u8; 6],
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub payload_len: u32,
+    pub mtu: u32,
+    pub identification: u32,
+    pub fragment_offset: u32,
+    pub raw_header_len: u16,
+    pub raw_flags: u16,
+    pub source: [u8; 16],
+    pub destination: [u8; 16],
+    pub reserved: [u64; 2],
+}
+
+impl NetStackTxFragmentInputV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn udp(
+        source: crate::IpAddr,
+        destination: crate::IpAddr,
+        source_port: u16,
+        destination_port: u16,
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+        hop_limit: u8,
+        traffic_class: u8,
+        payload_len: u32,
+        mtu: u32,
+        identification: u32,
+        fragment_offset: u32,
+    ) -> Option<Self> {
+        let (family, source, destination) = tx_addresses(source, destination)?;
+        Some(Self {
+            kind: NET_STACK_TX_UDP_FRAGMENT,
+            family,
+            hop_limit,
+            traffic_class,
+            source_mac,
+            destination_mac,
+            source_port,
+            destination_port,
+            payload_len,
+            mtu,
+            identification,
+            fragment_offset,
+            raw_header_len: 0,
+            raw_flags: 0,
+            source,
+            destination,
+            reserved: [0; 2],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raw_ipv4(
+        source: crate::IpAddr,
+        destination: crate::IpAddr,
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+        payload_len: u32,
+        mtu: u32,
+        identification: u32,
+        fragment_offset: u32,
+        raw_header_len: u16,
+        raw_flags: u16,
+    ) -> Option<Self> {
+        let (family, source, destination) = tx_addresses(source, destination)?;
+        (family == NET_STACK_ADDRESS_FAMILY_IPV4).then_some(Self {
+            kind: NET_STACK_TX_RAW_FRAGMENT,
+            family,
+            hop_limit: 0,
+            traffic_class: 0,
+            source_mac,
+            destination_mac,
+            source_port: 0,
+            destination_port: 0,
+            payload_len,
+            mtu,
+            identification,
+            fragment_offset,
+            raw_header_len,
+            raw_flags,
+            source,
+            destination,
+            reserved: [0; 2],
+        })
+    }
+
+    pub fn valid(&self) -> bool {
+        if self.reserved != [0; 2]
+            || self.mtu == 0
+            || self.identification == 0
+            || self.family != NET_STACK_ADDRESS_FAMILY_IPV4
+                && self.family != NET_STACK_ADDRESS_FAMILY_IPV6
+            || (self.family == NET_STACK_ADDRESS_FAMILY_IPV4
+                && (self.source[4..] != [0; 12] || self.destination[4..] != [0; 12]))
+        {
+            return false;
+        }
+        match self.kind {
+            NET_STACK_TX_UDP_FRAGMENT => {
+                self.source_port != 0
+                    && self.destination_port != 0
+                    && self.raw_header_len == 0
+                    && self.raw_flags == 0
+                    && self.fragment_offset <= self.payload_len
+                    && self.fragment_offset % 8 == 0
+                    && self.payload_len <= u32::from(u16::MAX - 8)
+            }
+            NET_STACK_TX_RAW_FRAGMENT => {
+                self.family == NET_STACK_ADDRESS_FAMILY_IPV4
+                    && self.source_port == 0
+                    && self.destination_port == 0
+                    && self.payload_len <= u32::from(u16::MAX)
+                    && self.fragment_offset % 8 == 0
+                    && (self.raw_header_len == 0
+                        || ((20..=60).contains(&self.raw_header_len)
+                            && self.raw_header_len % 4 == 0
+                            && u32::from(self.raw_header_len) <= self.payload_len))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `net.stack` 返回给 host 的单个分片 header 与 payload 范围。
+#[repr(C)]
+pub struct NetStackTxFragmentHeaderV1 {
+    pub abi_version: u16,
+    pub struct_size: u16,
+    pub generation: u64,
+    pub payload: *const PacketChain,
+    pub input: NetStackTxFragmentInputV1,
+    pub committed: u8,
+    pub more_fragments: u8,
+    pub reserved0: [u8; 2],
+    pub header_len: u16,
+    pub header: [u8; NET_STACK_TX_HEADER_CAPACITY],
+    pub payload_offset: u32,
+    pub payload_len: u32,
+    pub next_fragment_offset: u32,
+    pub reserved1: [u64; 2],
+}
+
+impl NetStackTxFragmentHeaderV1 {
+    pub fn new(generation: u64, payload: &PacketChain, input: NetStackTxFragmentInputV1) -> Self {
+        Self {
+            abi_version: NET_STACK_TX_HEADER_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            generation,
+            payload,
+            input,
+            committed: 0,
+            more_fragments: 0,
+            reserved0: [0; 2],
+            header_len: 0,
+            header: [0; NET_STACK_TX_HEADER_CAPACITY],
+            payload_offset: 0,
+            payload_len: 0,
+            next_fragment_offset: 0,
+            reserved1: [0; 2],
+        }
+    }
+
+    pub fn valid_header(
+        &self,
+        generation: u64,
+        payload: *const PacketChain,
+        input: &NetStackTxFragmentInputV1,
+    ) -> bool {
+        self.abi_version == NET_STACK_TX_HEADER_ABI_VERSION
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.generation == generation
+            && self.payload == payload
+            && !self.payload.is_null()
+            && &self.input == input
+            && input.valid()
+            && self.reserved0 == [0; 2]
+            && self.reserved1 == [0; 2]
+    }
+
+    pub fn fully_committed(&self, payload: &PacketChain) -> bool {
+        let end = self.payload_offset.checked_add(self.payload_len);
+        self.committed == 1
+            && self.more_fragments <= 1
+            && end.is_some_and(|end| end <= payload.total_len() as u32)
+            && self.payload_offset <= payload.total_len() as u32
+            && self.header_len as usize <= self.header.len()
+            && self.header[self.header_len as usize..]
+                == [0; NET_STACK_TX_HEADER_CAPACITY][self.header_len as usize..]
+            && if self.more_fragments != 0 {
+                self.next_fragment_offset > self.input.fragment_offset
+                    && self.next_fragment_offset <= self.input.payload_len
+            } else {
+                self.next_fragment_offset == 0
+            }
+            && self.output_valid(payload)
+    }
+
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.header[..usize::from(self.header_len)]
+    }
+
+    fn output_valid(&self, payload: &PacketChain) -> bool {
+        let header = self.header_bytes();
+        if header.len() < 34
+            || header[..6] != self.input.destination_mac
+            || header[6..12] != self.input.source_mac
+        {
+            return false;
+        }
+        match self.input.kind {
+            NET_STACK_TX_UDP_FRAGMENT => {
+                let fragment_offset = match self.input.family {
+                    NET_STACK_ADDRESS_FAMILY_IPV4 => {
+                        if header.len() < 34 || header[12..14] != 0x0800u16.to_be_bytes() {
+                            return false;
+                        }
+                        let expected_ip_len = 20
+                            + usize::from(self.input.fragment_offset == 0) * 8
+                            + self.payload_len as usize;
+                        if header[14] != 0x45
+                            || header[15] != self.input.traffic_class
+                            || header[16..18] != (expected_ip_len as u16).to_be_bytes()
+                            || header[18..20] != (self.input.identification as u16).to_be_bytes()
+                            || header[22] != self.input.hop_limit
+                            || header[23] != 17
+                            || header[26..30] != self.input.source[..4]
+                            || header[30..34] != self.input.destination[..4]
+                            || checksum_bytes(&header[14..34]) != 0
+                        {
+                            return false;
+                        }
+                        let field = u16::from_be_bytes([header[20], header[21]]);
+                        if u8::from(field & 0x2000 != 0) != self.more_fragments {
+                            return false;
+                        }
+                        usize::from(field & 0x1fff) * 8
+                    }
+                    NET_STACK_ADDRESS_FAMILY_IPV6 => {
+                        let expected_payload_len = 8
+                            + usize::from(self.input.fragment_offset == 0) * 8
+                            + self.payload_len as usize;
+                        if header.len() < 62
+                            || header[12..14] != 0x86ddu16.to_be_bytes()
+                            || header[14..18]
+                                != (0x6000_0000u32 | (u32::from(self.input.traffic_class) << 20))
+                                    .to_be_bytes()
+                            || header[18..20] != (expected_payload_len as u16).to_be_bytes()
+                            || header[20] != 44
+                            || header[21] != self.input.hop_limit
+                            || header[22..38] != self.input.source
+                            || header[38..54] != self.input.destination
+                            || header[54] != 17
+                            || header[55] != 0
+                            || header[58..62] != self.input.identification.to_be_bytes()
+                        {
+                            return false;
+                        }
+                        let field = u16::from_be_bytes([header[56], header[57]]);
+                        if u8::from(field & 1 != 0) != self.more_fragments || field & 6 != 0 {
+                            return false;
+                        }
+                        usize::from(field >> 3) * 8
+                    }
+                    _ => return false,
+                };
+                let expected_fragment_offset = if self.input.fragment_offset == 0 {
+                    0
+                } else {
+                    self.input.fragment_offset as usize + 8
+                };
+                if fragment_offset != expected_fragment_offset {
+                    return false;
+                }
+                if self.input.fragment_offset == 0 {
+                    let transport_offset = if self.input.family == NET_STACK_ADDRESS_FAMILY_IPV4 {
+                        if self.header_len != 42 {
+                            return false;
+                        }
+                        34
+                    } else {
+                        if self.header_len != 70 {
+                            return false;
+                        }
+                        62
+                    };
+                    let udp = &header[transport_offset..transport_offset + 8];
+                    udp[..2] == self.input.source_port.to_be_bytes()
+                        && udp[2..4] == self.input.destination_port.to_be_bytes()
+                        && udp[4..6] == ((self.input.payload_len + 8) as u16).to_be_bytes()
+                        && udp[6..8] != [0; 2]
+                } else {
+                    self.header_len
+                        == if self.input.family == NET_STACK_ADDRESS_FAMILY_IPV4 {
+                            34
+                        } else {
+                            62
+                        }
+                }
+            }
+            NET_STACK_TX_RAW_FRAGMENT => {
+                let mut original = [0u8; 60];
+                if payload.copy_out(0, &mut original[..20]).is_err() {
+                    return false;
+                }
+                let original_header_len = usize::from(original[0] & 0x0f) * 4;
+                if !(20..=60).contains(&original_header_len)
+                    || payload
+                        .copy_out(0, &mut original[..original_header_len])
+                        .is_err()
+                {
+                    return false;
+                }
+                let expected_source = if original[12..16] == [0; 4] {
+                    &self.input.source[..4]
+                } else {
+                    &original[12..16]
+                };
+                if self.input.family != NET_STACK_ADDRESS_FAMILY_IPV4
+                    || usize::from(self.header_len) != 14 + original_header_len
+                    || header[12..14] != 0x0800u16.to_be_bytes()
+                    || header[14] != original[0]
+                    || header[15] != original[1]
+                    || header[16..18]
+                        != ((original_header_len + self.payload_len as usize) as u16).to_be_bytes()
+                    || header[18..20] != original[4..6]
+                    || header[22..24] != original[8..10]
+                    || header[26..30] != *expected_source
+                    || header[30..34] != self.input.destination[..4]
+                    || header[34..usize::from(self.header_len)] != original[20..original_header_len]
+                    || checksum_bytes(&header[14..usize::from(self.header_len)]) != 0
+                {
+                    return false;
+                }
+                let field = u16::from_be_bytes([header[20], header[21]]);
+                usize::from(field & 0x1fff) * 8 == self.input.fragment_offset as usize
+                    && u8::from(field & 0x2000 != 0) == self.more_fragments
+                    && field & 0x8000 == u16::from_be_bytes([original[6], original[7]]) & 0x8000
+            }
+            _ => false,
+        }
+    }
+}
+
 impl NetStackTxInputV1 {
     pub fn udp(
         source: crate::IpAddr,
@@ -1146,10 +1502,14 @@ impl NetStackCallV1 {
             && self.opcode == opcode
             && self.generation == generation
             && self.reserved0 == [0; 6]
-            && self.reserved1 == [0; 2]
+            && self.reserved1[1] == 0
+            && (opcode == NET_STACK_OP_TX_FRAGMENT_HEADER || self.reserved1[0] == 0)
             && match opcode {
                 NET_STACK_OP_WORKER_TURN => !self.worker_turn.is_null() && self.tx_header.is_null(),
                 NET_STACK_OP_TX_HEADER => self.worker_turn.is_null() && !self.tx_header.is_null(),
+                NET_STACK_OP_TX_FRAGMENT_HEADER => {
+                    self.worker_turn.is_null() && self.tx_header.is_null() && self.reserved1[0] != 0
+                }
                 _ => self.worker_turn.is_null() && self.tx_header.is_null(),
             }
     }
@@ -1370,6 +1730,12 @@ pub trait NetStackRegistrar: Send + Sync {
         input: NetStackTxInputV1,
     ) -> Result<NetStackTxHeaderV1, NetStackTxError>;
 
+    fn build_tx_fragment_header(
+        &self,
+        payload: &PacketChain,
+        input: NetStackTxFragmentInputV1,
+    ) -> Result<NetStackTxFragmentHeaderV1, NetStackTxError>;
+
     fn snapshot(&self) -> NetStackSnapshot;
 }
 
@@ -1470,6 +1836,19 @@ pub fn build_tx_header(
     registrar
         .ok_or(NetStackTxError::StackUnavailable)?
         .build_tx_header(payload, input)
+}
+
+pub fn build_tx_fragment_header(
+    payload: &PacketChain,
+    input: NetStackTxFragmentInputV1,
+) -> Result<NetStackTxFragmentHeaderV1, NetStackTxError> {
+    if !input.valid() || input.payload_len as usize > payload.total_len() {
+        return Err(NetStackTxError::InvalidInput);
+    }
+    let registrar = *STACK_REGISTRAR.lock();
+    registrar
+        .ok_or(NetStackTxError::StackUnavailable)?
+        .build_tx_fragment_header(payload, input)
 }
 
 /// 由常驻 broker 使用的严格生命周期状态机。

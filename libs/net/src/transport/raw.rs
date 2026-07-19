@@ -509,6 +509,7 @@ fn build_header_included_ipv4(
     Ok(packet)
 }
 
+#[cfg(test)]
 pub fn build_header_included_ipv4_fragments(
     packet: &[u8],
     work: &PreparedRawTx,

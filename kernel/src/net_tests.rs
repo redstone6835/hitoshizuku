@@ -209,6 +209,124 @@ fn net_stack_elm_builds_udp_and_tcp_tx_headers() {
 }
 
 #[ktest]
+fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
+    let payload_bytes = (0u32..2200)
+        .map(|index| index.wrapping_mul(13) as u8)
+        .collect::<alloc::vec::Vec<_>>();
+    for (source, destination, family) in [
+        (
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
+            net::stack::NET_STACK_ADDRESS_FAMILY_IPV4,
+        ),
+        (
+            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
+            net::IpAddr::V6(net::Ipv6Addr([
+                0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
+            ])),
+            net::stack::NET_STACK_ADDRESS_FAMILY_IPV6,
+        ),
+    ] {
+        let payload = net::buf::PacketChain::from_owned(payload_bytes.clone());
+        let mut offset = 0u32;
+        let mut reconstructed = alloc::vec::Vec::new();
+        loop {
+            let input = net::stack::NetStackTxFragmentInputV1::udp(
+                source,
+                destination,
+                19002,
+                53,
+                [1; 6],
+                [2; 6],
+                64,
+                7,
+                payload_bytes.len() as u32,
+                600,
+                7,
+                offset,
+            )
+            .unwrap();
+            let output = net::stack::build_tx_fragment_header(&payload, input)
+                .expect("ELM UDP 分片 header 构造失败");
+            assert!(output.header_len as usize + output.payload_len as usize <= 614);
+            assert_eq!(output.payload_offset, offset);
+            assert!(output.payload_len != 0);
+            if family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
+                assert_eq!(output.header_len, if offset == 0 { 42 } else { 34 });
+                assert_eq!(
+                    net::pipeline::packet_checksum(
+                        &net::buf::PacketChain::from_owned(output.header_bytes().to_vec()),
+                        14,
+                        20,
+                    ),
+                    Ok(0)
+                );
+            } else {
+                assert_eq!(output.header_len, if offset == 0 { 70 } else { 62 });
+            }
+            let mut bytes = alloc::vec![0; output.payload_len as usize];
+            payload
+                .copy_out(output.payload_offset as usize, &mut bytes)
+                .expect("复制 ELM 分片 payload");
+            reconstructed.extend_from_slice(&bytes);
+            if output.more_fragments == 0 {
+                break;
+            }
+            offset = output.next_fragment_offset;
+        }
+        assert_eq!(reconstructed, payload_bytes);
+    }
+
+    let raw_header_len = 24usize;
+    let mut raw_bytes = alloc::vec![0; raw_header_len + 1600];
+    raw_bytes[0] = 0x46;
+    let raw_len = raw_bytes.len() as u16;
+    raw_bytes[2..4].copy_from_slice(&raw_len.to_be_bytes());
+    raw_bytes[4..6].copy_from_slice(&7u16.to_be_bytes());
+    raw_bytes[8] = 64;
+    raw_bytes[9] = 99;
+    raw_bytes[12..16].copy_from_slice(&[0, 0, 0, 0]);
+    raw_bytes[16..20].copy_from_slice(&[10, 0, 2, 2]);
+    raw_bytes[20..24].copy_from_slice(&[1, 1, 0, 0]);
+    let raw = net::buf::PacketChain::from_owned(raw_bytes.clone());
+    let mut offset = 0u32;
+    let mut reconstructed = alloc::vec::Vec::new();
+    loop {
+        let input = net::stack::NetStackTxFragmentInputV1::raw_ipv4(
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
+            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
+            [1; 6],
+            [2; 6],
+            raw_bytes.len() as u32,
+            600,
+            1,
+            offset,
+            0,
+            0,
+        )
+        .unwrap();
+        let output = net::stack::build_tx_fragment_header(&raw, input)
+            .expect("ELM raw 分片 header 构造失败");
+        assert_eq!(output.header_len, 14 + raw_header_len as u16);
+        assert!(output.header_len as usize + output.payload_len as usize <= 614);
+        let header = net::buf::PacketChain::from_owned(output.header_bytes().to_vec());
+        assert_eq!(
+            net::pipeline::packet_checksum(&header, 14, raw_header_len),
+            Ok(0)
+        );
+        let mut bytes = alloc::vec![0; output.payload_len as usize];
+        raw.copy_out(output.payload_offset as usize, &mut bytes)
+            .expect("复制 ELM raw 分片 payload");
+        reconstructed.extend_from_slice(&bytes);
+        if output.more_fragments == 0 {
+            break;
+        }
+        offset = output.next_fragment_offset;
+    }
+    assert_eq!(reconstructed, raw_bytes[raw_header_len..]);
+}
+
+#[ktest]
 fn udp_vfs_fd_and_epoll_roundtrip() {
     let (context, table) = current_vfs();
     let raw = vfs::socket::socket(
