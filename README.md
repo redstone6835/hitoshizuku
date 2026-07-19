@@ -134,7 +134,8 @@ qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 \
 RISC-V64：
 
 ```sh
-qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
+qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
+  -kernel kernel-rv -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-rv.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```

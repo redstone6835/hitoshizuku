@@ -104,3 +104,12 @@ config = "CONFIG_VIRTIO_BLK"
 prompt = "VirtIO block 驱动"
 default = "y"
 depends = "virtio.framework"
+
+[[modules]]
+name = "net.virtio"
+path = "virtio-net"
+config = "CONFIG_VIRTIO_NET"
+prompt = "VirtIO 网络驱动"
+default = "m"
+depends = "virtio.framework"
+after = "virtio.framework"

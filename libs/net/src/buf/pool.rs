@@ -380,6 +380,7 @@ pub struct NetBufPoolOwner {
 
 unsafe impl Send for NetBufPoolOwner {}
 
+#[kernel_symbols::export]
 impl NetBufPoolOwner {
     pub fn pool(&self) -> &NetBufPool {
         self.pool.as_ref().get_ref()
@@ -440,6 +441,14 @@ impl NetBufPoolOwner {
     }
 
     /// 租借一个独占 buffer，并设置有效数据范围。
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufPoolOwner.lease",
+        contract = "kernel.net.resident-buffer-pool@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn lease(
         &mut self,
         data_offset: u16,
@@ -598,6 +607,7 @@ pub struct NetBufLease {
 
 unsafe impl Send for NetBufLease {}
 
+#[kernel_symbols::export]
 impl NetBufLease {
     pub const fn pool_id(&self) -> NetBufPoolId {
         self.pool_id
@@ -615,7 +625,13 @@ impl NetBufLease {
         self.data_offset
     }
 
-    pub const fn len(&self) -> usize {
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufLease.len",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
+    pub fn len(&self) -> usize {
         self.data_len as usize
     }
 
@@ -636,6 +652,13 @@ impl NetBufLease {
     }
 
     /// completion 后把 descriptor 覆盖范围收窄为实际 packet 数据。
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufLease.set_data_range",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_data_range(
         &mut self,
         data_offset: u16,
@@ -663,6 +686,13 @@ impl NetBufLease {
         )
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufLease.as_mut_slice",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn as_mut_slice(&mut self) -> Result<&mut [u8], NetBufPoolError> {
         let (slot, start, len) = self.validated_range()?;
         slot.storage.sync_for_cpu(start, len);
@@ -672,6 +702,14 @@ impl NetBufLease {
         })
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufLease.sync_for_device",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+            | kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync_for_device(&self) -> Result<(), NetBufPoolError> {
         let (slot, start, len) = self.validated_range()?;
         slot.storage.sync_for_device(start, len);
@@ -697,6 +735,13 @@ impl NetBufLease {
         Ok(())
     }
 
+    #[kernel_symbols::export(
+        name = "net.buf.NetBufLease.dma_addr",
+        contract = "kernel.net.buffer-ownership@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+            | kernel_symbols::capability::DEVICE_DMA
+    )]
     pub fn dma_addr(&self) -> Result<Option<u64>, NetBufPoolError> {
         let (slot, start, _) = self.validated_range()?;
         Ok(slot.storage.dma_addr().map(|base| base + start as u64))

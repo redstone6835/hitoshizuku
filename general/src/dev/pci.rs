@@ -771,7 +771,7 @@ pub struct PciMsiPnpResource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PciMsixError {
+pub enum PciMsixError {
     NotSupported,
     InvalidCount,
     InvalidTable,
@@ -789,41 +789,44 @@ impl From<PciConfigError> for PciMsixError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PciMsixVector {
+struct PciMsixVector {
     table_index: u16,
     allocation: msi::MsiHandle,
 }
 
-impl PciMsixVector {
-    pub(crate) const fn line(self) -> IrqLine {
-        self.allocation.line()
-    }
-}
-
-pub(crate) struct PciMsixSet {
+pub struct PciMsixSet {
     cap_offset: u16,
     table_vaddr: usize,
     vectors: Box<[PciMsixVector]>,
 }
 
+#[kernel_symbols::export]
 impl PciMsixSet {
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.vectors.len()
     }
 
-    pub(crate) fn vector(&self, index: usize) -> Option<PciMsixVector> {
-        self.vectors.get(index).copied()
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciMsixSet.line",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
+    pub fn line(&self, index: usize) -> Option<IrqLine> {
+        self.vectors
+            .get(index)
+            .map(|vector| vector.allocation.line())
     }
 }
 
-pub(crate) struct PciMsixPnpResource {
+struct PciMsixPnpResource {
     pci: PciDevice,
     set: PciMsixSet,
     label: &'static str,
 }
 
 impl PciMsixPnpResource {
-    pub(crate) const fn new(pci: PciDevice, set: PciMsixSet, label: &'static str) -> Self {
+    const fn new(pci: PciDevice, set: PciMsixSet, label: &'static str) -> Self {
         Self { pci, set, label }
     }
 }
@@ -841,6 +844,28 @@ impl PnpResource for PciMsixPnpResource {
         self.pci.release_configured_msix(self.set);
         Ok(())
     }
+}
+
+/// 将已配置的 MSI-X set 交给 PnP 设备管理。
+///
+/// 资源对象及其 trait vtable 均在常驻内核侧构造；登记失败时会先关闭 MSI-X、
+/// 释放 vector，再把错误返回给动态 ELM。
+#[kernel_symbols::export(
+    name = "general.dev.pci.attach_msix_pnp_resource",
+    contract = "kernel.general.pci-route@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+    retained_args = 1u64 << 3
+)]
+pub fn attach_msix_pnp_resource(
+    dev: &Arc<PnpDevice>,
+    pci: PciDevice,
+    set: PciMsixSet,
+    label: &'static str,
+) -> Result<(), PnpError> {
+    dev.own_boxed_resource_or_release(Box::new(PciMsixPnpResource::new(pci, set, label)))
 }
 
 #[kernel_symbols::export]
@@ -1581,7 +1606,15 @@ impl PciDevice {
         Some((control & PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1)
     }
 
-    pub(crate) fn try_configure_msix(&self, count: u16) -> Result<PciMsixSet, PciMsixError> {
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_configure_msix",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn try_configure_msix(&self, count: u16) -> Result<PciMsixSet, PciMsixError> {
         let capability = self.msix_capability().ok_or(PciMsixError::NotSupported)?;
         let control = self.try_read_config_u16(capability + PCI_MSIX_CONTROL_OFFSET)?;
         let table_size = (control & PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1;
@@ -1654,7 +1687,14 @@ impl PciDevice {
         })
     }
 
-    pub(crate) fn try_enable_configured_msix(&self, set: &PciMsixSet) -> Result<(), PciMsixError> {
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_enable_configured_msix",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn try_enable_configured_msix(&self, set: &PciMsixSet) -> Result<(), PciMsixError> {
         for vector in set.vectors.iter().copied() {
             set_msix_entry_mask(set.table_vaddr, vector.table_index, false);
         }
@@ -1666,7 +1706,14 @@ impl PciDevice {
         Ok(())
     }
 
-    pub(crate) fn release_configured_msix(&self, set: PciMsixSet) {
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.release_configured_msix",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn release_configured_msix(&self, set: PciMsixSet) {
         if let Ok(control) = self.try_read_config_u16(set.cap_offset + PCI_MSIX_CONTROL_OFFSET) {
             let _ = self.try_write_config_u16(
                 set.cap_offset + PCI_MSIX_CONTROL_OFFSET,

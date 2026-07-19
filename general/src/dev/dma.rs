@@ -1,5 +1,10 @@
 //! 通用 DMA 分配与同步辅助。
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use spin::mutex::Mutex;
 
@@ -626,4 +631,38 @@ impl net::buf::NetBufStorage for DmaBuffer {
             direction: self.direction(),
         });
     }
+}
+
+/// 在常驻 DMA 子系统中构造网络 buffer pool，使 storage trait vtable 和回收入口
+/// 不依赖可卸载的 driver ELM 镜像。
+#[kernel_symbols::export(
+    name = "general.dev.dma.new_netbuf_pool",
+    contract = "kernel.general.dma-netbuf-pool@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+        | kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn new_netbuf_pool(
+    context: DmaContext,
+    count: usize,
+    size: usize,
+    align: usize,
+    direction: DmaDirection,
+) -> Result<net::buf::NetBufPoolOwner, &'static str> {
+    if count == 0 {
+        return Err("DMA NetBuf pool 不能为空");
+    }
+    let mut storages: Vec<Box<dyn net::buf::NetBufStorage>> = Vec::new();
+    storages
+        .try_reserve_exact(count)
+        .map_err(|_| "DMA NetBuf pool 元数据分配失败")?;
+    for _ in 0..count {
+        storages.push(Box::new(DmaBuffer::new_in(
+            context, size, align, direction,
+        )?));
+    }
+    net::buf::NetBufPool::new(storages.into_boxed_slice()).map_err(|_| "DMA NetBuf pool 构造失败")
 }

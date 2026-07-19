@@ -203,10 +203,16 @@ pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiErr
             .allocations_in_flight
             .checked_add(1)
             .ok_or(MsiError::Busy)?;
-        controllers[index]
-            .vectors
-            .try_reserve(next_in_flight)
-            .map_err(|_| MsiError::OutOfMemory)?;
+        {
+            // vector 注册表容量由常驻 MSI controller 长期复用，不能把扩容
+            // 记到触发本次分配的动态 ELM 名下。
+            let _accounting =
+                allocator::suspend_implicit_allocation_accounting().ok_or(MsiError::OutOfMemory)?;
+            controllers[index]
+                .vectors
+                .try_reserve(next_in_flight)
+                .map_err(|_| MsiError::OutOfMemory)?;
+        }
         controllers[index].allocations_in_flight = next_in_flight;
         (
             controllers[index].id,
