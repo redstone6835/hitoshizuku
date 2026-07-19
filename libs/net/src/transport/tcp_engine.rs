@@ -1034,6 +1034,7 @@ impl TcpEndpointTable {
             group.release_syn();
             TcpIngressError::FlowTableFull
         })?;
+        child.inherit_stack_generation(&parent);
         child.set_tcp_maxseg(parent.tcp_maxseg());
         child.set_tcp_defer_accept_ns(parent.tcp_defer_accept_ns());
         let mss = apply_user_mss(path_mss(path.route.mtu, key.local.addr), child.tcp_maxseg());

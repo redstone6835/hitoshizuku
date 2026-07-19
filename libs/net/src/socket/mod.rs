@@ -34,6 +34,7 @@ const TCP_KEEPCNT_DEFAULT: u16 = 9;
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(None);
+static SOCKET_REGISTRY: RwLock<Vec<Weak<SocketFacade>>> = RwLock::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerRef {
@@ -119,6 +120,7 @@ pub enum SocketError {
     Buffer,
     ConnectionRefused,
     ConnectionReset,
+    NetworkDown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -230,7 +232,7 @@ pub fn new_raw_socket_facade(
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     assert!(counter != 0, "SocketId 已耗尽");
-    Ok(Arc::new(SocketFacade::new_with_protocol(
+    let facade = Arc::new(SocketFacade::new_with_protocol(
         SocketId {
             boot_nonce,
             counter,
@@ -238,7 +240,8 @@ pub fn new_raw_socket_facade(
         family,
         SocketKind::Raw,
         protocol,
-    )))
+    ));
+    Ok(facade)
 }
 
 fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacade>, SocketError> {
@@ -246,14 +249,84 @@ fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacad
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     assert!(counter != 0, "SocketId 已耗尽");
-    Ok(Arc::new(SocketFacade::new(
+    let facade = Arc::new(SocketFacade::new(
         SocketId {
             boot_nonce,
             counter,
         },
         family,
         kind,
-    )))
+    ));
+    Ok(facade)
+}
+
+/// 将一个已经交给常驻 host/VFS 的 socket 纳入代际卸载跟踪。
+pub fn track_socket_facade(facade: &Arc<SocketFacade>, generation: u64) {
+    if generation == 0 {
+        facade.detach_stack();
+        return;
+    }
+    match facade.stack_generation.compare_exchange(
+        0,
+        generation,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(current) if current == generation => {}
+        Err(_) => {
+            facade.detach_stack();
+            return;
+        }
+    }
+    let mut registry = SOCKET_REGISTRY.write();
+    let mut present = false;
+    registry.retain(|entry| {
+        let Some(existing) = entry.upgrade() else {
+            return false;
+        };
+        present |= Arc::ptr_eq(&existing, facade);
+        true
+    });
+    if !present {
+        registry.push(Arc::downgrade(facade));
+    }
+    drop(registry);
+
+    let generation = facade.stack_generation();
+    let current = crate::stack::stack_snapshot();
+    if generation != 0
+        && (current.state != crate::stack::NetStackState::Active
+            || !current.probed
+            || current.generation != generation)
+    {
+        facade.detach_stack();
+    }
+}
+
+/// 使指定网络栈代际创建的全部 socket 进入稳定的断网状态。
+pub fn detach_socket_generation(generation: u64) -> usize {
+    if generation == 0 {
+        return 0;
+    }
+    let sockets = {
+        let mut registry = SOCKET_REGISTRY.write();
+        let mut sockets = Vec::new();
+        registry.retain(|entry| {
+            let Some(facade) = entry.upgrade() else {
+                return false;
+            };
+            if facade.stack_generation() == generation {
+                sockets.push(facade);
+            }
+            true
+        });
+        sockets
+    };
+    for facade in &sockets {
+        facade.detach_stack();
+    }
+    sockets.len()
 }
 
 struct ByteRing {
@@ -1062,6 +1135,8 @@ pub struct SocketFacade {
     family: AddressFamily,
     kind: SocketKind,
     protocol: u8,
+    stack_generation: AtomicU64,
+    stack_detached: AtomicBool,
     generation: AtomicU32,
     owner: Mutex<OwnerRef>,
     local: Mutex<Option<Endpoint>>,
@@ -1155,6 +1230,8 @@ impl SocketFacade {
             family,
             kind,
             protocol,
+            stack_generation: AtomicU64::new(0),
+            stack_detached: AtomicBool::new(false),
             generation: AtomicU32::new(1),
             owner: Mutex::new(OwnerRef::Unassigned),
             local: Mutex::new(None),
@@ -1293,6 +1370,7 @@ impl SocketFacade {
         self: &Arc<Self>,
         membership: MulticastMembership,
     ) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         if !membership.group.is_multicast()
             || matches!(
                 (self.family, membership.group),
@@ -1325,6 +1403,7 @@ impl SocketFacade {
         self: &Arc<Self>,
         membership: MulticastMembership,
     ) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         let mut memberships = self.multicast_memberships.lock();
         let Some(index) = memberships.iter().position(|entry| *entry == membership) else {
             return Err(SocketError::AddressUnavailable);
@@ -1406,6 +1485,47 @@ impl SocketFacade {
         self.generation.load(Ordering::Acquire)
     }
 
+    pub fn stack_generation(&self) -> u64 {
+        self.stack_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn inherit_stack_generation(&self, parent: &Self) {
+        let generation = parent.stack_generation();
+        if generation != 0 {
+            let _ = self.stack_generation.compare_exchange(
+                0,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    pub fn backend_error(&self) -> Option<SocketError> {
+        self.stack_detached
+            .load(Ordering::Acquire)
+            .then_some(SocketError::NetworkDown)
+    }
+
+    fn ensure_stack_attached(&self) -> Result<(), SocketError> {
+        self.backend_error().map_or(Ok(()), Err)
+    }
+
+    fn detach_stack(&self) {
+        if self.stack_detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.set_pending_error(SocketError::NetworkDown);
+        self.update_ready(
+            (Readiness::ERROR | Readiness::HANGUP | Readiness::READ_HANGUP).0,
+            Readiness::WRITABLE.0 | Readiness::ACCEPTABLE.0,
+        );
+        self.read_wait.wake_all();
+        self.write_wait.wake_all();
+        self.accept_wait.wake_all();
+        self.state_wait.wake_all();
+    }
+
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
@@ -1481,6 +1601,7 @@ impl SocketFacade {
         interface: Option<InterfaceId>,
         options: BindOptions,
     ) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         let _control = self.control_lock.lock();
         if !matches!(self.owner(), OwnerRef::Unassigned) {
             return Err(SocketError::InvalidState);
@@ -1516,6 +1637,7 @@ impl SocketFacade {
         options: BindOptions,
         nonblocking: bool,
     ) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         let _control = self.control_lock.lock();
         if self.kind == SocketKind::Stream && self.connect_pending.swap(true, Ordering::AcqRel) {
             return Err(SocketError::AlreadyInProgress);
@@ -1555,6 +1677,7 @@ impl SocketFacade {
     }
 
     pub fn listen(self: &Arc<Self>, backlog: u32) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
@@ -1577,10 +1700,12 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<Arc<SocketFacade>, SocketError> {
+        self.ensure_stack_attached()?;
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
         loop {
+            self.ensure_stack_attached()?;
             let group = self.listen_group.lock().as_ref().cloned();
             let Some(group) = group else {
                 return Err(if self.closing.load(Ordering::Acquire) {
@@ -1647,6 +1772,7 @@ impl SocketFacade {
         dont_route: bool,
         confirm: bool,
     ) -> Result<usize, SocketError> {
+        self.ensure_stack_attached()?;
         if self.closing.load(Ordering::Acquire) {
             return Err(SocketError::Closed);
         }
@@ -1931,6 +2057,7 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
+        self.ensure_stack_attached()?;
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
@@ -1954,6 +2081,13 @@ impl SocketFacade {
         }
         let mut accepted = 0usize;
         loop {
+            if let Some(error) = self.backend_error() {
+                return if accepted == 0 {
+                    Err(error)
+                } else {
+                    Ok(accepted)
+                };
+            }
             if self.closing.load(Ordering::Acquire) {
                 return if accepted == 0 {
                     Err(SocketError::Closed)
@@ -2237,8 +2371,12 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
+        self.ensure_stack_attached()?;
         let mut total = 0usize;
         loop {
+            if let Some(error) = self.backend_error() {
+                return if total == 0 { Err(error) } else { Ok(total) };
+            }
             let (copied, eof) = {
                 let mut rx = self.stream_rx.lock();
                 let copied = (output.len() - total).min(rx.bytes.len);
@@ -2353,7 +2491,9 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<UdpReceive, SocketError> {
+        self.ensure_stack_attached()?;
         loop {
+            self.ensure_stack_attached()?;
             if let Some(result) = self.try_recv(output, peek, report_original_len)? {
                 return Ok(result);
             }
@@ -2433,6 +2573,7 @@ impl SocketFacade {
     }
 
     pub fn shutdown(self: &Arc<Self>, read: bool, write: bool) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         if !read && !write {
             return Err(SocketError::InvalidState);
         }
@@ -2483,6 +2624,10 @@ impl SocketFacade {
                     child.close();
                 }
             }
+        }
+        if self.stack_detached.load(Ordering::Acquire) {
+            *self.owner.lock() = OwnerRef::Closed { generation };
+            return;
         }
         match socket_runtime() {
             Ok(runtime) => {
@@ -2914,11 +3059,16 @@ impl SocketFacade {
 
     fn wait_control(&self, sequence: u64) -> Result<(), SocketError> {
         loop {
+            self.ensure_stack_attached()?;
             if let Some(result) = self.take_control_result(sequence) {
                 return result;
             }
             let task = sched::current_task();
             let entry = self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
+            if let Err(error) = self.ensure_stack_attached() {
+                self.state_wait.finish_wait(&entry);
+                return Err(error);
+            }
             if let Some(result) = self.take_control_result(sequence) {
                 self.state_wait.finish_wait(&entry);
                 return result;
@@ -2960,9 +3110,14 @@ impl SocketFacade {
         readiness: Readiness,
         deadline_ns: Option<u64>,
     ) -> Result<(), SocketError> {
+        self.ensure_stack_attached()?;
         let task = sched::current_task();
         let (_, observed_generation) = self.readiness();
         let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
+        if let Err(error) = self.ensure_stack_attached() {
+            queue.finish_wait(&entry);
+            return Err(error);
+        }
         let (current, generation) = self.readiness();
         if current.contains(readiness) || generation != observed_generation {
             queue.finish_wait(&entry);
@@ -2985,6 +3140,7 @@ impl SocketFacade {
         if armed {
             sched::cancel_sleep_deadline(&task);
         }
+        self.ensure_stack_attached()?;
         if sched::operation::has_interrupting_signal(&task) {
             return Err(SocketError::Interrupted);
         }
@@ -3042,6 +3198,38 @@ mod tests {
     use super::*;
     use crate::buf::PacketFragment;
     use crate::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn stack_generation_detach_publishes_stable_network_down() {
+        let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        let generation = u64::MAX.saturating_sub(counter);
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 1,
+                counter,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Datagram,
+        ));
+        facade.stack_generation.store(generation, Ordering::Release);
+        SOCKET_REGISTRY.write().push(Arc::downgrade(&facade));
+
+        assert_eq!(detach_socket_generation(generation), 1);
+        assert_eq!(facade.backend_error(), Some(SocketError::NetworkDown));
+        let readiness = facade.readiness().0;
+        assert!(readiness.contains(Readiness::ERROR));
+        assert!(readiness.contains(Readiness::HANGUP));
+        assert!(readiness.contains(Readiness::READ_HANGUP));
+        assert!(!readiness.contains(Readiness::WRITABLE));
+        assert_eq!(facade.take_pending_error(), Some(SocketError::NetworkDown));
+        assert_eq!(facade.backend_error(), Some(SocketError::NetworkDown));
+        assert_eq!(
+            facade.send(&[1], None, true, None),
+            Err(SocketError::NetworkDown)
+        );
+        facade.close();
+        assert!(matches!(facade.owner(), OwnerRef::Closed { .. }));
+    }
 
     fn facade() -> Arc<SocketFacade> {
         Arc::new(SocketFacade::new(
