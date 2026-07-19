@@ -11,16 +11,21 @@ use net::stack::PinnedNetStackEndpoint;
 use net::stack::{
     NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_CALL_STATUS_INVALID,
     NET_STACK_CALL_STATUS_OK, NET_STACK_DROP_IPV4_CHECKSUM, NET_STACK_DROP_IPV6_EXTENSION_LIMIT,
-    NET_STACK_DROP_MALFORMED_ARP, NET_STACK_DROP_MALFORMED_IPV4,
-    NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_NOT_LOCAL,
+    NET_STACK_DROP_MALFORMED_ARP, NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6,
+    NET_STACK_DROP_MALFORMED_TCP, NET_STACK_DROP_MALFORMED_UDP, NET_STACK_DROP_NOT_LOCAL,
+    NET_STACK_DROP_TCP_CHECKSUM, NET_STACK_DROP_UDP_CHECKSUM,
     NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL, NET_STACK_ETHERNET_ACCEPTED,
     NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
     NET_STACK_NETWORK_IP, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE, NET_STACK_OP_WORKER_TURN,
-    NetStackEthernetV1, NetStackHandle, NetStackLocalAddressV1, NetStackNetworkV1,
-    NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError,
+    NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED, NET_STACK_TCP_OPTION_TIMESTAMP,
+    NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP, NET_STACK_TRANSPORT_ICMP,
+    NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED, NET_STACK_TRANSPORT_TCP,
+    NET_STACK_TRANSPORT_UDP, NetStackEthernetV1, NetStackHandle, NetStackLocalAddressV1,
+    NetStackNetworkV1, NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError,
+    NetStackTcpOptionsV1, NetStackTransportV1,
 };
 
 use allocator as _;
@@ -45,10 +50,7 @@ fn ethernet_is_empty(sidecar: &NetStackEthernetV1) -> bool {
         && sidecar.reserved == [0; 5]
 }
 
-fn worker_turn_header_valid(
-    turn: &net::stack::NetStackWorkerTurnV1,
-    generation: u64,
-) -> bool {
+fn worker_turn_header_valid(turn: &net::stack::NetStackWorkerTurnV1, generation: u64) -> bool {
     turn.abi_version == net::stack::NET_STACK_WORKER_TURN_ABI_VERSION
         && turn.struct_size as usize == core::mem::size_of::<net::stack::NetStackWorkerTurnV1>()
         && turn.generation == generation
@@ -56,6 +58,7 @@ fn worker_turn_header_valid(
         && !turn.input.is_null()
         && !turn.local_addresses.is_null()
         && turn.interface != 0
+        && turn.rss_generation != 0
         && usize::from(turn.input_count) <= turn.ethernet.len()
         && turn.reserved0 == [0; 6]
         && turn.reserved1 == [0; 2]
@@ -102,8 +105,7 @@ fn address_projection_valid(address: &NetStackLocalAddressV1) -> bool {
     address.interface != 0
         && matches!(
             (address.family, address.prefix_len),
-            (NET_STACK_ADDRESS_FAMILY_IPV4, 0..=32)
-                | (NET_STACK_ADDRESS_FAMILY_IPV6, 0..=128)
+            (NET_STACK_ADDRESS_FAMILY_IPV4, 0..=32) | (NET_STACK_ADDRESS_FAMILY_IPV6, 0..=128)
         )
         && (address.family != NET_STACK_ADDRESS_FAMILY_IPV4 || address.address[4..] == [0; 12])
         && address.reserved0 == [0; 2]
@@ -115,18 +117,21 @@ fn packet_inputs_valid(turn: &net::stack::NetStackWorkerTurnV1) -> bool {
     turn.packet_inputs[..count].iter().all(|facts| {
         matches!(facts.present, 0 | 1)
             && matches!(facts.checksums_validated, 0 | 1)
-            && facts.reserved == [0; 2]
-            && (facts.present == 1 || facts.frame_len == 0)
+            && matches!(facts.rss_hash_present, 0 | 1)
+            && facts.reserved == 0
+            && (facts.rss_hash_present == 1 || facts.rss_hash == 0)
+            && (facts.present == 1
+                || (facts.frame_len == 0
+                    && facts.rss_hash == 0
+                    && facts.rss_generation == 0
+                    && facts.checksums_validated == 0
+                    && facts.rss_hash_present == 0))
     }) && turn.packet_inputs[count..]
         .iter()
-        .all(|facts| facts.frame_len == 0 && facts.present == 0 && facts.checksums_validated == 0)
+        .all(|facts| *facts == net::stack::NetStackPacketInputV1::empty())
 }
 
-fn is_local_ipv4(
-    interface: u32,
-    addresses: &[NetStackLocalAddressV1],
-    address: [u8; 4],
-) -> bool {
+fn is_local_ipv4(interface: u32, addresses: &[NetStackLocalAddressV1], address: [u8; 4]) -> bool {
     if address == [255; 4] || (224..=239).contains(&address[0]) {
         return true;
     }
@@ -147,11 +152,7 @@ fn is_local_ipv4(
     })
 }
 
-fn is_local_ipv6(
-    interface: u32,
-    addresses: &[NetStackLocalAddressV1],
-    address: [u8; 16],
-) -> bool {
+fn is_local_ipv6(interface: u32, addresses: &[NetStackLocalAddressV1], address: [u8; 16]) -> bool {
     address[0] == 0xff
         || addresses.iter().any(|entry| {
             entry.interface == interface
@@ -468,6 +469,508 @@ fn parse_ipv6(
     }
 }
 
+const fn empty_transport() -> NetStackTransportV1 {
+    NetStackTransportV1 {
+        outcome: 0,
+        protocol: 0,
+        drop_reason: 0,
+        reserved0: 0,
+        source_port: 0,
+        destination_port: 0,
+        header_len: 0,
+        payload_offset: 0,
+        tcp_flags: 0,
+        tcp_window: 0,
+        tcp_urgent_pointer: 0,
+        reserved1: 0,
+        payload_len: 0,
+        rss_hash: 0,
+        tcp_sequence: 0,
+        tcp_acknowledgement: 0,
+        tcp_options: NetStackTcpOptionsV1 {
+            flags: 0,
+            window_scale: 0,
+            sack_count: 0,
+            reserved0: 0,
+            maximum_segment_size: 0,
+            reserved1: 0,
+            sack_left: [0; 4],
+            sack_right: [0; 4],
+            timestamp_value: 0,
+            timestamp_echo_reply: 0,
+        },
+        reserved2: [0; 2],
+    }
+}
+
+fn transport_is_empty(sidecar: &NetStackTransportV1) -> bool {
+    *sidecar == empty_transport()
+}
+
+const fn transport_skipped() -> NetStackTransportV1 {
+    NetStackTransportV1 {
+        outcome: NET_STACK_TRANSPORT_SKIPPED,
+        ..empty_transport()
+    }
+}
+
+const fn transport_drop(reason: u8) -> NetStackTransportV1 {
+    NetStackTransportV1 {
+        outcome: NET_STACK_TRANSPORT_DROP,
+        drop_reason: reason,
+        ..empty_transport()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InternetChecksum {
+    sum: u64,
+    pending: Option<u8>,
+}
+
+impl InternetChecksum {
+    const fn new() -> Self {
+        Self {
+            sum: 0,
+            pending: None,
+        }
+    }
+
+    fn add(&mut self, mut bytes: &[u8]) {
+        if let Some(high) = self.pending.take() {
+            if let Some((&low, rest)) = bytes.split_first() {
+                self.sum += u64::from(u16::from_be_bytes([high, low]));
+                bytes = rest;
+            } else {
+                self.pending = Some(high);
+                return;
+            }
+        }
+        let mut words = bytes.chunks_exact(2);
+        for word in &mut words {
+            self.sum += u64::from(u16::from_be_bytes([word[0], word[1]]));
+        }
+        self.pending = words.remainder().first().copied();
+    }
+
+    fn finish(mut self) -> u16 {
+        if let Some(high) = self.pending {
+            self.sum += u64::from(u16::from_be_bytes([high, 0]));
+        }
+        while self.sum >> 16 != 0 {
+            self.sum = (self.sum & 0xffff) + (self.sum >> 16);
+        }
+        !(self.sum as u16)
+    }
+}
+
+fn checksum_packet_range(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    offset: usize,
+    len: usize,
+    checksum: &mut InternetChecksum,
+) -> bool {
+    let mut copied = 0usize;
+    let mut buffer = [0u8; 128];
+    while copied < len {
+        let chunk = (len - copied).min(buffer.len());
+        if !input.copy_packet_out(index, offset + copied, &mut buffer[..chunk]) {
+            return false;
+        }
+        checksum.add(&buffer[..chunk]);
+        copied += chunk;
+    }
+    true
+}
+
+fn transport_checksum_valid(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    network: &NetStackNetworkV1,
+    protocol: u8,
+    len: usize,
+) -> bool {
+    let mut checksum = InternetChecksum::new();
+    match network.family {
+        NET_STACK_ADDRESS_FAMILY_IPV4 => {
+            let Ok(len) = u16::try_from(len) else {
+                return false;
+            };
+            checksum.add(&network.source[..4]);
+            checksum.add(&network.destination[..4]);
+            checksum.add(&[0, protocol]);
+            checksum.add(&len.to_be_bytes());
+        }
+        NET_STACK_ADDRESS_FAMILY_IPV6 => {
+            let Ok(len) = u32::try_from(len) else {
+                return false;
+            };
+            checksum.add(&network.source);
+            checksum.add(&network.destination);
+            checksum.add(&len.to_be_bytes());
+            checksum.add(&[0, 0, 0, protocol]);
+        }
+        _ => return false,
+    }
+    checksum_packet_range(
+        input,
+        index,
+        usize::from(network.payload_offset),
+        len,
+        &mut checksum,
+    ) && checksum.finish() == 0
+}
+
+fn icmpv4_checksum_valid(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    network: &NetStackNetworkV1,
+) -> bool {
+    let mut checksum = InternetChecksum::new();
+    checksum_packet_range(
+        input,
+        index,
+        usize::from(network.payload_offset),
+        network.payload_len as usize,
+        &mut checksum,
+    ) && checksum.finish() == 0
+}
+
+fn flow_hash(
+    rss_key: &[u8; 40],
+    rss_generation: u32,
+    facts: net::stack::NetStackPacketInputV1,
+    network: &NetStackNetworkV1,
+    source_port: u16,
+    destination_port: u16,
+) -> Option<u32> {
+    if destination_port == 0 {
+        return None;
+    }
+    Some(
+        if facts.rss_hash_present != 0 && facts.rss_generation == rss_generation {
+            facts.rss_hash
+        } else {
+            let mut input = [0u8; 36];
+            let len = match network.family {
+                NET_STACK_ADDRESS_FAMILY_IPV4 => {
+                    input[0..4].copy_from_slice(&network.source[..4]);
+                    input[4..8].copy_from_slice(&network.destination[..4]);
+                    input[8..10].copy_from_slice(&source_port.to_be_bytes());
+                    input[10..12].copy_from_slice(&destination_port.to_be_bytes());
+                    12
+                }
+                NET_STACK_ADDRESS_FAMILY_IPV6 => {
+                    input[0..16].copy_from_slice(&network.source);
+                    input[16..32].copy_from_slice(&network.destination);
+                    input[32..34].copy_from_slice(&source_port.to_be_bytes());
+                    input[34..36].copy_from_slice(&destination_port.to_be_bytes());
+                    36
+                }
+                _ => return None,
+            };
+            toeplitz(rss_key, &input[..len])
+        },
+    )
+}
+
+fn toeplitz(key: &[u8; 40], input: &[u8]) -> u32 {
+    let mut result = 0u32;
+    let mut window = u32::from_be_bytes(key[0..4].try_into().unwrap());
+    for bit_index in 0..input.len() * 8 {
+        if input[bit_index / 8] & (0x80 >> (bit_index % 8)) != 0 {
+            result ^= window;
+        }
+        let next_bit = bit_index + 32;
+        let incoming = if next_bit < key.len() * 8 {
+            u32::from((key[next_bit / 8] >> (7 - next_bit % 8)) & 1)
+        } else {
+            0
+        };
+        window = window << 1 | incoming;
+    }
+    result
+}
+
+fn parse_tcp_options(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    offset: usize,
+    header_len: usize,
+) -> Result<NetStackTcpOptionsV1, u8> {
+    let options_len = header_len - 20;
+    let mut bytes = [0u8; 40];
+    if !input.copy_packet_out(index, offset, &mut bytes[..options_len]) {
+        return Err(NET_STACK_DROP_MALFORMED_TCP);
+    }
+    let mut parsed = NetStackTcpOptionsV1::empty();
+    let mut sack_seen = false;
+    let mut cursor = 0usize;
+    while cursor < options_len {
+        let kind = bytes[cursor];
+        match kind {
+            0 => {
+                if bytes[cursor..options_len].iter().any(|byte| *byte != 0) {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                break;
+            }
+            1 => {
+                cursor += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if cursor + 2 > options_len {
+            return Err(NET_STACK_DROP_MALFORMED_TCP);
+        }
+        let len = usize::from(bytes[cursor + 1]);
+        if len < 2 || cursor + len > options_len {
+            return Err(NET_STACK_DROP_MALFORMED_TCP);
+        }
+        let option = &bytes[cursor..cursor + len];
+        match kind {
+            2 => {
+                if len != 4 || parsed.flags & NET_STACK_TCP_OPTION_MSS != 0 {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                let mss = u16::from_be_bytes([option[2], option[3]]);
+                if mss == 0 {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                parsed.flags |= NET_STACK_TCP_OPTION_MSS;
+                parsed.maximum_segment_size = mss;
+            }
+            3 => {
+                if len != 3 || parsed.flags & NET_STACK_TCP_OPTION_WINDOW_SCALE != 0 {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                parsed.flags |= NET_STACK_TCP_OPTION_WINDOW_SCALE;
+                parsed.window_scale = option[2].min(14);
+            }
+            4 => {
+                if len != 2 || parsed.flags & NET_STACK_TCP_OPTION_SACK_PERMITTED != 0 {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                parsed.flags |= NET_STACK_TCP_OPTION_SACK_PERMITTED;
+            }
+            5 => {
+                if sack_seen || len < 10 || len > 34 || (len - 2) % 8 != 0 {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                sack_seen = true;
+                for (block_index, block) in option[2..].chunks_exact(8).enumerate() {
+                    parsed.sack_left[block_index] =
+                        u32::from_be_bytes(block[0..4].try_into().unwrap());
+                    parsed.sack_right[block_index] =
+                        u32::from_be_bytes(block[4..8].try_into().unwrap());
+                    parsed.sack_count += 1;
+                }
+            }
+            8 => {
+                if len != 10 || parsed.flags & NET_STACK_TCP_OPTION_TIMESTAMP != 0 {
+                    return Err(NET_STACK_DROP_MALFORMED_TCP);
+                }
+                parsed.flags |= NET_STACK_TCP_OPTION_TIMESTAMP;
+                parsed.timestamp_value = u32::from_be_bytes(option[2..6].try_into().unwrap());
+                parsed.timestamp_echo_reply = u32::from_be_bytes(option[6..10].try_into().unwrap());
+            }
+            _ => {}
+        }
+        cursor += len;
+    }
+    Ok(parsed)
+}
+
+fn parse_tcp(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    network: &NetStackNetworkV1,
+    facts: net::stack::NetStackPacketInputV1,
+    rss_key: &[u8; 40],
+    rss_generation: u32,
+) -> NetStackTransportV1 {
+    if network.payload_len < 20 {
+        return transport_drop(NET_STACK_DROP_MALFORMED_TCP);
+    }
+    let mut header = [0u8; 20];
+    if !input.copy_packet_out(index, usize::from(network.payload_offset), &mut header) {
+        return transport_drop(NET_STACK_DROP_MALFORMED_TCP);
+    }
+    let header_len = usize::from(header[12] >> 4) * 4;
+    if !(20..=60).contains(&header_len)
+        || header_len > network.payload_len as usize
+        || header[12] & 0x0e != 0
+    {
+        return transport_drop(NET_STACK_DROP_MALFORMED_TCP);
+    }
+    let options = match parse_tcp_options(
+        input,
+        index,
+        usize::from(network.payload_offset) + 20,
+        header_len,
+    ) {
+        Ok(options) => options,
+        Err(reason) => return transport_drop(reason),
+    };
+    if facts.checksums_validated == 0
+        && !transport_checksum_valid(input, index, network, 6, network.payload_len as usize)
+    {
+        return transport_drop(NET_STACK_DROP_TCP_CHECKSUM);
+    }
+    let source_port = u16::from_be_bytes([header[0], header[1]]);
+    let destination_port = u16::from_be_bytes([header[2], header[3]]);
+    let Some(rss_hash) = flow_hash(
+        rss_key,
+        rss_generation,
+        facts,
+        network,
+        source_port,
+        destination_port,
+    ) else {
+        return transport_drop(NET_STACK_DROP_MALFORMED_TCP);
+    };
+    NetStackTransportV1 {
+        outcome: NET_STACK_TRANSPORT_TCP,
+        protocol: 6,
+        source_port,
+        destination_port,
+        header_len: header_len as u16,
+        payload_offset: network.payload_offset + header_len as u16,
+        tcp_flags: u16::from(header[12] & 1) << 8 | u16::from(header[13]),
+        tcp_window: u16::from_be_bytes([header[14], header[15]]),
+        tcp_urgent_pointer: u16::from_be_bytes([header[18], header[19]]),
+        payload_len: network.payload_len - header_len as u32,
+        rss_hash,
+        tcp_sequence: u32::from_be_bytes(header[4..8].try_into().unwrap()),
+        tcp_acknowledgement: u32::from_be_bytes(header[8..12].try_into().unwrap()),
+        tcp_options: options,
+        ..empty_transport()
+    }
+}
+
+fn parse_udp(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    network: &NetStackNetworkV1,
+    facts: net::stack::NetStackPacketInputV1,
+    rss_key: &[u8; 40],
+    rss_generation: u32,
+) -> NetStackTransportV1 {
+    if network.payload_len < 8 {
+        return transport_drop(NET_STACK_DROP_MALFORMED_UDP);
+    }
+    let mut header = [0u8; 8];
+    if !input.copy_packet_out(index, usize::from(network.payload_offset), &mut header) {
+        return transport_drop(NET_STACK_DROP_MALFORMED_UDP);
+    }
+    let udp_len = usize::from(u16::from_be_bytes([header[4], header[5]]));
+    if udp_len < 8 || udp_len > network.payload_len as usize {
+        return transport_drop(NET_STACK_DROP_MALFORMED_UDP);
+    }
+    let checksum = u16::from_be_bytes([header[6], header[7]]);
+    if checksum == 0 && network.family == NET_STACK_ADDRESS_FAMILY_IPV6 {
+        return transport_drop(NET_STACK_DROP_UDP_CHECKSUM);
+    }
+    if facts.checksums_validated == 0
+        && checksum != 0
+        && !transport_checksum_valid(input, index, network, 17, udp_len)
+    {
+        return transport_drop(NET_STACK_DROP_UDP_CHECKSUM);
+    }
+    let source_port = u16::from_be_bytes([header[0], header[1]]);
+    let destination_port = u16::from_be_bytes([header[2], header[3]]);
+    let Some(rss_hash) = flow_hash(
+        rss_key,
+        rss_generation,
+        facts,
+        network,
+        source_port,
+        destination_port,
+    ) else {
+        return transport_drop(NET_STACK_DROP_MALFORMED_UDP);
+    };
+    NetStackTransportV1 {
+        outcome: NET_STACK_TRANSPORT_UDP,
+        protocol: 17,
+        source_port,
+        destination_port,
+        header_len: 8,
+        payload_offset: network.payload_offset + 8,
+        payload_len: (udp_len - 8) as u32,
+        rss_hash,
+        ..empty_transport()
+    }
+}
+
+fn parse_icmp(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    network: &NetStackNetworkV1,
+    facts: net::stack::NetStackPacketInputV1,
+) -> NetStackTransportV1 {
+    if network.payload_len < 8 {
+        return transport_drop(if network.family == NET_STACK_ADDRESS_FAMILY_IPV6 {
+            NET_STACK_DROP_MALFORMED_IPV6
+        } else {
+            NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL
+        });
+    }
+    let checksum_valid = facts.checksums_validated != 0
+        || if network.family == NET_STACK_ADDRESS_FAMILY_IPV6 {
+            transport_checksum_valid(
+                input,
+                index,
+                network,
+                network.next_header,
+                network.payload_len as usize,
+            )
+        } else {
+            icmpv4_checksum_valid(input, index, network)
+        };
+    if !checksum_valid {
+        return transport_drop(NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL);
+    }
+    NetStackTransportV1 {
+        outcome: NET_STACK_TRANSPORT_ICMP,
+        protocol: network.next_header,
+        payload_offset: network.payload_offset,
+        payload_len: network.payload_len,
+        ..empty_transport()
+    }
+}
+
+fn parse_transport(
+    input: &net::buf::PacketBatch,
+    index: usize,
+    network: &NetStackNetworkV1,
+    facts: net::stack::NetStackPacketInputV1,
+    rss_key: &[u8; 40],
+    rss_generation: u32,
+) -> NetStackTransportV1 {
+    if network.outcome != NET_STACK_NETWORK_IP
+        || network.flags & (NET_STACK_NETWORK_FLAG_FRAGMENT | NET_STACK_NETWORK_FLAG_IPV6_PROBLEM)
+            != 0
+    {
+        return transport_skipped();
+    }
+    match (network.family, network.next_header) {
+        (_, 6) => parse_tcp(input, index, network, facts, rss_key, rss_generation),
+        (_, 17) => parse_udp(input, index, network, facts, rss_key, rss_generation),
+        (NET_STACK_ADDRESS_FAMILY_IPV4, 1) | (NET_STACK_ADDRESS_FAMILY_IPV6, 58) => {
+            parse_icmp(input, index, network, facts)
+        }
+        _ => NetStackTransportV1 {
+            outcome: NET_STACK_TRANSPORT_RAW,
+            protocol: network.next_header,
+            payload_offset: network.payload_offset,
+            payload_len: network.payload_len,
+            ..empty_transport()
+        },
+    }
+}
+
 struct NetStackElm {
     handle: Option<NetStackHandle>,
     boot: Option<net::boot::NetStackBootConfig>,
@@ -580,8 +1083,8 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
             let Ok(address_count) = usize::try_from(turn.local_address_count) else {
                 return NET_STACK_CALL_STATUS_INVALID;
             };
-            let Some(address_bytes) = address_count
-                .checked_mul(core::mem::size_of::<NetStackLocalAddressV1>())
+            let Some(address_bytes) =
+                address_count.checked_mul(core::mem::size_of::<NetStackLocalAddressV1>())
             else {
                 return NET_STACK_CALL_STATUS_INVALID;
             };
@@ -592,6 +1095,8 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
             // Safety: host 已把地址投影声明为本次 pinned call 的只读范围；长度和对齐
             // 已在上面校验，slice 只在同步调用期间借用，ELM 不保存它。
             let addresses = unsafe { core::slice::from_raw_parts(address_pointer, address_count) };
+            let rss_key = turn.rss_key;
+            let rss_generation = turn.rss_generation;
             if input.len() != usize::from(turn.input_count)
                 || !packet_inputs_valid(turn)
                 || !addresses.iter().all(address_projection_valid)
@@ -601,6 +1106,7 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
             for index in 0..usize::from(turn.input_count) {
                 if !ethernet_is_empty(&turn.ethernet[index])
                     || !network_is_empty(&turn.network[index])
+                    || !transport_is_empty(&turn.transport[index])
                 {
                     return NET_STACK_CALL_STATUS_INVALID;
                 }
@@ -642,18 +1148,23 @@ fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
                             facts.frame_len,
                             facts.checksums_validated != 0,
                         ),
-                        0x86dd => parse_ipv6(
-                            input,
-                            index,
-                            turn.interface,
-                            addresses,
-                            facts.frame_len,
-                        ),
+                        0x86dd => {
+                            parse_ipv6(input, index, turn.interface, addresses, facts.frame_len)
+                        }
                         _ => return NET_STACK_CALL_STATUS_INVALID,
                     }
                 };
+                let transport = parse_transport(
+                    input,
+                    index,
+                    &network,
+                    turn.packet_inputs[index],
+                    &rss_key,
+                    rss_generation,
+                );
                 turn.ethernet[index] = sidecar;
                 turn.network[index] = network;
+                turn.transport[index] = transport;
                 turn.committed = (index + 1) as u8;
             }
         }

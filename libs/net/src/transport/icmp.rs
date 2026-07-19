@@ -239,7 +239,9 @@ fn build_ipv6_parameter_problem(
 }
 
 fn handle_icmpv4(mut packet: FrontendPacket, offset: u16, len: u32) -> ControlPacketResult {
-    if len < 8 || packet_checksum(&packet.chain, usize::from(offset), len as usize).ok() != Some(0)
+    if len < 8
+        || (!packet.metadata.checksums_validated
+            && packet_checksum(&packet.chain, usize::from(offset), len as usize).ok() != Some(0))
     {
         return ControlPacketResult::Drop(DropReason::UnsupportedIpProtocol, packet.chain);
     }
@@ -320,16 +322,17 @@ fn handle_icmpv6(
         return ControlPacketResult::Drop(DropReason::MalformedIpv6, packet.chain);
     }
     let ip = packet.parsed.ip.unwrap();
-    if transport_checksum(
-        &packet.chain,
-        usize::from(offset),
-        len as usize,
-        ip.source,
-        ip.destination,
-        58,
-    )
-    .ok()
-        != Some(0)
+    if !packet.metadata.checksums_validated
+        && transport_checksum(
+            &packet.chain,
+            usize::from(offset),
+            len as usize,
+            ip.source,
+            ip.destination,
+            58,
+        )
+        .ok()
+            != Some(0)
     {
         return ControlPacketResult::Drop(DropReason::UnsupportedIpProtocol, packet.chain);
     }
