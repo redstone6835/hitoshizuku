@@ -153,8 +153,8 @@ qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
 
 ## 第三方组件与参考来源
 
-本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`、
-`libs/mygo-smoltcp/` 和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
+本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`
+和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
 用户态工具链及 Rust 生态依赖均按其原始许可证保留来源信息。
 
 MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配、系统调用兼容层、

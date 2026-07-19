@@ -22,7 +22,6 @@ members = [
     "libs/elm-loader",
     "libs/kernel-symbols",
     "libs/kernel-symbols/macros",
-    "libs/mygo-smoltcp",
     "arch",
     "hal",
     "general",
