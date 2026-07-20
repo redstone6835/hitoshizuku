@@ -2301,7 +2301,9 @@ pub fn start_workers() {
                 slice_ns: 0,
             },
         );
-        task.set_cpu_affinity(online);
+        // 每个协议 shard 的队列、timer、waker 与 ELM pinned call 都归属于
+        // runtime.cpu；允许迁移会让多个 shard 争用同一 CPU 的调用槽。
+        task.set_cpu_affinity(1u64 << runtime.cpu);
         runtime.set_owner_task(Arc::clone(&task));
         protocol_tasks.push((task, runtime.cpu, slot));
     }

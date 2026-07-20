@@ -26,6 +26,7 @@ pub const MAX_HARTS: usize = 8;
 #[repr(C)]
 pub struct HartLocal {
     pub hart_id: usize,
+    pub logical_id: usize,
     pub kernel_stack_top: usize,
     pub preempt_count: usize,
     pub kernel_gp: usize,
@@ -82,6 +83,7 @@ pub(crate) static mut IRQ_STACKS: [IrqStack; MAX_HARTS] = {
 pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
     const EMPTY: HartLocal = HartLocal {
         hart_id: 0,
+        logical_id: 0,
         kernel_stack_top: 0,
         preempt_count: 0,
         kernel_gp: 0,
@@ -104,6 +106,39 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
 pub(crate) unsafe fn boot_hart_local_ptr() -> *mut HartLocal {
     // Safety: 调用方保证在单核 boot 阶段调用（pre_boot_init），此时无并发访问 HART_LOCALS。
     core::ptr::addr_of_mut!(HART_LOCALS) as *mut HartLocal
+}
+
+/// 初始化辅助 hart 的本地状态并返回应写入 `tp` 的指针。
+///
+/// # Safety
+///
+/// `logical_id` 必须唯一且当前尚未被其它 hart 使用；调用期间该槽位不可并发访问。
+pub(crate) unsafe fn init_secondary_hart_local(
+    logical_id: usize,
+    hart_id: usize,
+    kernel_gp: usize,
+) -> *mut HartLocal {
+    assert!(logical_id > 0 && logical_id < MAX_HARTS);
+    let locals = core::ptr::addr_of_mut!(HART_LOCALS) as *mut HartLocal;
+    let local = unsafe { locals.add(logical_id) };
+    let irq_stacks = core::ptr::addr_of!(IRQ_STACKS) as usize;
+    unsafe {
+        local.write(HartLocal {
+            hart_id,
+            logical_id,
+            kernel_stack_top: 0,
+            preempt_count: 0,
+            kernel_gp,
+            irq_stack_top: irq_stacks + (logical_id + 1) * IRQ_STACK_ALLOCATION_SIZE,
+            trap_entry_t4: 0,
+            trap_entry_t5: 0,
+            trap_entry_t6: 0,
+            trap_entry_state: 0,
+            context_switch_seq: 0,
+        });
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+    local
 }
 /// 读取 tp 中的当前 HartLocal 裸指针。
 ///
@@ -173,11 +208,10 @@ pub extern "C" fn riscv64_fatal_trap_shutdown() -> ! {
 
 #[inline]
 pub fn current_cpu_id() -> usize {
-    // 当前启动链只会让 boot hart 进入调度器，因此逻辑 CPU 固定为 0。
-    // TODO(SMP): secondary hart 启动后建立 hart ID 到调度器逻辑 CPU ID 的映射；
-    // 不能直接把 HartLocal.hart_id 当作数组下标，因为固件 hart ID 未必连续。
-    let _ = current_hart_ptr(); // 确保当前 hart 已完成 HartLocal 初始化。
-    0
+    let ptr = current_hart_ptr();
+    let logical_id = unsafe { core::ptr::addr_of!((*ptr).logical_id).read_volatile() };
+    debug_assert!(logical_id < sched::NR_CPUS);
+    logical_id.min(sched::NR_CPUS - 1)
 }
 
 // ── ISA 扩展能力检测 ──────────────────────────────────────────────────────────

@@ -146,6 +146,7 @@ impl TaskOps for Riscv64TaskOps {
         unsafe {
             core::arch::asm!("fence.i", options(nostack, preserves_flags));
         }
+        crate::riscv64::smp::sync_icache_remote();
     }
 }
 
