@@ -274,6 +274,7 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
 
     if code == IRQ_S_SOFT {
         unsafe { Riscv64MessageInterruptOps::ack_ipi() };
+        crate::riscv64::smp::handle_ipi();
     }
 
     let sepc = unsafe { trap_frame_ref(tf_ptr) }.sepc;

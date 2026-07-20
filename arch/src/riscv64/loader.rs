@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
 use crate::riscv64::sbi;
-use crate::riscv64::specific::{kernel_timestamp_ns, phys_to_virt, virt_to_phys};
+use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns, phys_to_virt, virt_to_phys};
 use crate::riscv64::time;
 use crate::riscv64::trap;
 use general::dtb::Dtb;
@@ -53,9 +53,6 @@ static DTB_VALID_LEN: AtomicUsize = AtomicUsize::new(0);
 struct DtbBuffer(UnsafeCell<[u8; DTB_BUF_SIZE]>);
 unsafe impl Sync for DtbBuffer {}
 static DTB_BUFFER: DtbBuffer = DtbBuffer(UnsafeCell::new([0u8; DTB_BUF_SIZE]));
-
-/// 启动 hart ID，由 loader 设置后供 allocator 的 cpu_id 回调使用。
-static HART_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// DTB 中的 RAM 最终会与此启动映射求交集。这样在动态 direct map 落地前，
 /// 物理分配器不会拿到当前页表无法访问的 4 GiB 以上页面。
@@ -465,23 +462,22 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
 
     let sbi_info = sbi::init();
     log::info!(
-        "[loader] SBI: base={} spec={:?} impl={:?}/{:?} srst={}",
+        "[loader] SBI: base={} spec={:?} impl={:?}/{:?} srst={} hsm={} ipi={} rfence={}",
         sbi_info.base_available,
         sbi_info.spec_version,
         sbi_info.implementation_id,
         sbi_info.implementation_version,
-        sbi_info.srst_available
+        sbi_info.srst_available,
+        sbi_info.hsm_available,
+        sbi_info.ipi_available,
+        sbi_info.rfence_available,
     );
 
     // 初始化引导期分配器
     {
         allocator::KERNEL_ALLOCATOR.bind_address_translation(phys_to_virt, virt_to_phys);
 
-        HART_ID.store(hart_id, Ordering::Relaxed);
-        fn get_cpu_id() -> usize {
-            HART_ID.load(Ordering::Relaxed)
-        }
-        allocator::KERNEL_ALLOCATOR.bind_cpu_id(get_cpu_id);
+        allocator::KERNEL_ALLOCATOR.bind_cpu_id(current_cpu_id);
 
         unsafe extern "C" {
             fn sheap();
