@@ -2571,48 +2571,107 @@ fn futex_requeue_key(
     requeue_count: usize,
     bitset: u32,
 ) -> usize {
-    let (wake, requeue) = {
+    let (wake, requeued) = {
         let mut table = FUTEX_TABLE.lock();
-        let mut wake = Vec::new();
-        let mut requeue = Vec::new();
-        if let Some(bucket) = table.get_mut(&src) {
-            let mut idx = 0;
-            while idx < bucket.waiters.len()
-                && (wake.len() < wake_count || requeue.len() < requeue_count)
-            {
-                if (bucket.waiters[idx].bitset & bitset) == 0 {
-                    idx += 1;
-                    continue;
-                }
-                let waiter = bucket.waiters.remove(idx);
-                if wake.len() < wake_count {
-                    if let Some(task) = waiter.task.upgrade() {
-                        wake.push((task, waiter.state));
-                    }
-                } else if requeue.len() < requeue_count {
-                    if waiter.task.strong_count() != 0 {
-                        requeue.push(waiter);
-                    }
-                }
-            }
-            if bucket.waiters.is_empty() {
-                table.remove(&src);
-            }
-        }
-        let requeued = requeue.len();
-        if !requeue.is_empty() {
-            table
-                .entry(dst)
-                .or_insert(FutexBucket {
-                    waiters: Vec::new(),
-                })
-                .waiters
-                .extend(requeue);
-        }
-        (wake, requeued)
+        futex_requeue_locked(&mut table, src, dst, wake_count, requeue_count, bitset)
     };
-    wake_futex_waiters(wake) + requeue
+    wake_futex_waiters(wake) + requeued
 }
+
+fn futex_cmp_requeue_key(
+    vm: &VmSpace,
+    uaddr: usize,
+    expected: u32,
+    src: FutexKey,
+    dst: FutexKey,
+    wake_count: usize,
+    requeue_count: usize,
+    bitset: u32,
+) -> Result<usize, Errno> {
+    // 先在表锁外触发可能需要的 lazy fault；自旋锁临界区内只允许 nofault 读取。
+    if read_user_u32(uaddr)? != expected {
+        return Err(Errno::EAGAIN);
+    }
+    futex_cmp_requeue_after_prefault(
+        vm,
+        uaddr,
+        expected,
+        src,
+        dst,
+        wake_count,
+        requeue_count,
+        bitset,
+    )
+}
+
+fn futex_cmp_requeue_after_prefault(
+    vm: &VmSpace,
+    uaddr: usize,
+    expected: u32,
+    src: FutexKey,
+    dst: FutexKey,
+    wake_count: usize,
+    requeue_count: usize,
+    bitset: u32,
+) -> Result<usize, Errno> {
+    let (wake, requeued) = {
+        let mut table = FUTEX_TABLE.lock();
+        if vm.read_user_u32_nofault(uaddr)? != expected {
+            return Err(Errno::EAGAIN);
+        }
+        futex_requeue_locked(&mut table, src, dst, wake_count, requeue_count, bitset)
+    };
+    Ok(wake_futex_waiters(wake) + requeued)
+}
+
+fn futex_requeue_locked(
+    table: &mut BTreeMap<FutexKey, FutexBucket>,
+    src: FutexKey,
+    dst: FutexKey,
+    wake_count: usize,
+    requeue_count: usize,
+    bitset: u32,
+) -> (Vec<(Arc<Task>, Arc<FutexWaitState>)>, usize) {
+    let mut wake = Vec::new();
+    let mut requeue = Vec::new();
+    if let Some(bucket) = table.get_mut(&src) {
+        let mut idx = 0;
+        while idx < bucket.waiters.len()
+            && (wake.len() < wake_count || requeue.len() < requeue_count)
+        {
+            if (bucket.waiters[idx].bitset & bitset) == 0 {
+                idx += 1;
+                continue;
+            }
+            let waiter = bucket.waiters.remove(idx);
+            if wake.len() < wake_count {
+                if let Some(task) = waiter.task.upgrade() {
+                    wake.push((task, waiter.state));
+                }
+            } else if requeue.len() < requeue_count && waiter.task.strong_count() != 0 {
+                requeue.push(waiter);
+            }
+        }
+        if bucket.waiters.is_empty() {
+            table.remove(&src);
+        }
+    }
+    let requeued = requeue.len();
+    if !requeue.is_empty() {
+        table
+            .entry(dst)
+            .or_insert(FutexBucket {
+                waiters: Vec::new(),
+            })
+            .waiters
+            .extend(requeue);
+    }
+    (wake, requeued)
+}
+
+#[cfg(any(feature = "kernel-tests", feature = "smp-tests"))]
+#[path = "../tests/futex.rs"]
+mod futex_tests;
 
 fn futex_wake_op(
     task: &Arc<Task>,
@@ -2833,12 +2892,24 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if uaddr2 == 0 || uaddr2 % 4 != 0 {
                 return Err(Errno::EINVAL);
             }
-            if cmd == FUTEX_CMP_REQUEUE && read_user_u32(uaddr)? != val3 {
-                return Err(Errno::EAGAIN);
+            let vm = task_vm_space_for_futex(ctx.task())?;
+            let src = vm.futex_key_for(uaddr, private)?;
+            let dst = vm.futex_key_for(uaddr2, private)?;
+            if cmd == FUTEX_CMP_REQUEUE {
+                return futex_cmp_requeue_key(
+                    &vm,
+                    uaddr,
+                    val3,
+                    src,
+                    dst,
+                    val as usize,
+                    timeout,
+                    FUTEX_BITSET_MATCH_ANY,
+                );
             }
             Ok(futex_requeue_key(
-                futex_key(ctx.task(), uaddr, private)?,
-                futex_key(ctx.task(), uaddr2, private)?,
+                src,
+                dst,
                 val as usize,
                 timeout,
                 FUTEX_BITSET_MATCH_ANY,
@@ -3045,16 +3116,17 @@ pub(super) fn sys_futex_requeue(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     }
     let src = read_futex_waitv_entry(waiters, 0)?;
     let dst = read_futex_waitv_entry(waiters + FUTEX_WAITV_ENTRY_SIZE, 1)?;
-    if read_user_u32(src.uaddr)? != src.expected {
-        return Err(Errno::EAGAIN);
-    }
-    Ok(futex_requeue_key(
+    let vm = task_vm_space_for_futex(ctx.task())?;
+    futex_cmp_requeue_key(
+        &vm,
+        src.uaddr,
+        src.expected,
         src.key,
         dst.key,
         nr_wake as usize,
         nr_requeue as usize,
         FUTEX_BITSET_MATCH_ANY,
-    ))
+    )
 }
 
 pub(super) fn sys_unshare(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
