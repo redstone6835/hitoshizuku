@@ -26,6 +26,18 @@ pub fn install_net_ioctl_handler(handler: fn(u32, usize) -> Result<usize, Errno>
     *NET_IOCTL_HANDLER.lock() = Some(handler);
 }
 
+/// 将 socket ioctl 交给当前网络运行时处理。
+///
+/// Linux 的接口查询 ioctl 并不要求文件描述符来自 INET socket；glibc 的
+/// `if_nametoindex()` 等接口通常会使用 AF_UNIX 数据报 socket。因此所有 socket
+/// 类型必须共享同一个网络 ioctl 分派入口。
+pub fn dispatch_net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
+    let Some(handler) = *NET_IOCTL_HANDLER.lock() else {
+        return Err(Errno::ENOTTY);
+    };
+    handler(cmd, arg)
+}
+
 pub fn install_net_realtime_clock(clock: fn() -> u64) {
     *NET_REALTIME_CLOCK.lock() = Some(clock);
 }
@@ -617,10 +629,7 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
-        let Some(handler) = *NET_IOCTL_HANDLER.lock() else {
-            return Err(Errno::ENOTTY);
-        };
-        handler(cmd.raw() as u32, arg)
+        dispatch_net_ioctl(cmd.raw() as u32, arg)
     }
 
     fn as_any(&self) -> &dyn Any {
