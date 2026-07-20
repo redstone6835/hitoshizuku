@@ -12,6 +12,36 @@
 @scenario:net_stress.route	stress-test	路由反复重配置压力场景，不属于本轮功能验证
 @scenario:containers	missing-functionality	内核尚未实现 LTP 容器场景依赖的 namespace 对象模型
 @scenario:controllers	missing-functionality	内核尚未实现 cgroup 文件系统与 controller 模型
+@scenario:nptl	stress-test	nptl01 固定执行十万轮条件变量竞态并允许持续二十小时，属于线程压力场景
+@scenario:pty	missing-functionality	内核尚未实现 /dev/ptmx、Unix98 PTY 分配、devpts 与配套终端 ioctl
+@scenario:fs_bind	missing-functionality	内核尚未实现 MS_BIND、MS_MOVE、MS_REC 与 mount namespace 绑定挂载语义
+@scenario:power_management_tests	missing-functionality	内核尚未实现 Linux 电源管理 sysfs 控制面与休眠状态机
+@scenario:hugetlb	missing-functionality	内核尚未实现 hugetlbfs、显式大页映射与大页 System V 共享内存
+@scenario:hyperthreading	architecture-inapplicable	LoongArch64 QEMU 平台没有 Linux SMT topology 与控制接口
+@scenario:can	missing-functionality	网络栈尚未实现 PF_CAN、CAN_RAW 与 CAN_BCM 协议族
+@scenario:cpuhotplug	missing-functionality	内核尚未实现 CPU 热插拔状态机与 Linux CPU online sysfs 控制面
+@scenario:input	missing-functionality	内核尚未实现 Linux input event 设备 ABI
+@scenario:crypto	missing-functionality	内核尚未实现 AF_ALG 与 Linux crypto user netlink 接口
+@scenario:uevent	missing-functionality	内核尚未实现 Linux kobject uevent 与对应 netlink 通知接口
+@scenario:watchqueue	missing-functionality	内核尚未实现 watch_queue 通知管道与过滤接口
+@scenario:net.features	stress-test	官方场景用于持续施压高级网络特性，不属于本轮基础功能验证
+@scenario:net.nfs	missing-functionality	内核尚未实现 NFS 客户端、服务端与远端测试环境协议
+@scenario:net.sctp	missing-functionality	网络栈尚未实现 SCTP 协议及其 socket ABI
+@scenario:fcntl-locktests	stress-test	NFSv4 locktests 固定派生 100 个客户端执行全文件逐字节锁竞争，属于锁压力场景
+ldd01_sh	test-environment	initramfs 未打包 glibc ldd 脚本，用例未进入动态链接器验证
+tar01_sh	test-environment	用例要求 GNU tar 的 d 与 r 操作，BusyBox tar 不提供这些选项
+gzip01_sh	test-environment	用例要求 GNU gzip 的递归压缩选项，BusyBox gzip 不提供该选项
+mv01_sh	test-environment	基础目录移动已经通过，用例后续要求 BusyBox mv 不提供的备份选项
+df01_sh	test-environment	用例依赖 GNU stat 的 --printf 选项，BusyBox stat 不提供该选项
+mkfs01_sh	test-environment	initramfs 只有具体文件系统 mkfs applet，未提供 util-linux 通用 mkfs 前端
+mkfs01_ext2_sh	test-environment	initramfs 未提供用例要求的 util-linux 通用 mkfs 前端
+mkfs01_minix_sh	test-environment	initramfs 未提供用例要求的 util-linux 通用 mkfs 前端
+mkfs01_vfat_sh	test-environment	initramfs 未提供用例要求的 util-linux 通用 mkfs 前端
+unshare01_sh	missing-functionality	内核尚未实现 user 与 mount namespace 以及绑定挂载
+sysctl02_sh	missing-functionality	内核尚未实现 /proc/sys/fs/file-max 及其可写 sysctl 控制面
+asapi_01	missing-functionality	网络栈尚未完整实现 RFC 3542 IPv6 高级 socket API 与协议数据库环境
+asapi_02	missing-functionality	网络栈尚未实现 ICMPv6 raw socket 过滤器
+asapi_03	missing-functionality	网络栈尚未实现 IPv6 PKTINFO 等发送辅助数据控制消息
 mm01	stress-test	大规模 mmap 压力场景，不属于本轮功能验证
 mm02	stress-test	大规模 mmap 压力场景，不属于本轮功能验证
 mtest01	stress-test	高内存占用压力场景，不属于本轮功能验证
@@ -73,7 +103,14 @@ max_map_count	missing-functionality	内核尚未实现 Linux vm.max_map_count pr
 min_free_kbytes	missing-functionality	内核尚未实现 Linux vm.min_free_kbytes 水位策略与 procfs 控制面
 hackbench01	performance-test	hackbench 进程调度吞吐测试，不属于本轮功能验证
 hackbench02	performance-test	hackbench 线程调度吞吐测试，不属于本轮功能验证
+time-schedule01	performance-test	上下文切换计时基准，不属于本轮功能验证
+trace_sched01	performance-test	批量实时调度跟踪基准，不属于本轮功能验证
+cfs_bandwidth01	missing-functionality	依赖 Linux cgroup CFS bandwidth 控制器
+starvation	stress-test	默认执行两百万次跨进程信号并允许运行 240 秒，属于调度压力场景
+proc_sched_rt01	kernel-bound	针对 Linux sched_rt_period/runtime 与 RR timeslice sysctl 内部策略
+sched_cli_serv	stress-test	多线程调度 client-server 负载场景，不属于本轮功能验证
 sched_stress	stress-test	调度器长时间压力场景，不属于本轮功能验证
+autogroup01	kernel-bound	针对 Linux scheduler autogroup 内部对象生命周期与专属 sysctl
 msgstress01	stress-test	System V 消息队列压力场景，不属于本轮功能验证
 pth_str01	stress-test	POSIX 线程调度压力场景，不属于本轮功能验证
 pth_str02	stress-test	POSIX 线程高迭代调度压力场景，不属于本轮功能验证
@@ -85,6 +122,10 @@ pipeio_5	missing-functionality	用例依赖尚未实现的 System V semaphore se
 pipeio_6	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
 pipeio_8	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
 irqbalance01	missing-functionality	用例依赖尚未实现的 /proc/interrupts 中断统计视图
+cn_pec_sh	kernel-bound	依赖 Linux connector proc event 内核接口
+kmsg01	missing-functionality	内核尚未实现 Linux /dev/kmsg 记录注入接口
+fw_load	kernel-bound	依赖 Linux firmware loader sysfs 状态机与测试固件模块
+cpufreq_boost	architecture-inapplicable	LoongArch64 QEMU 平台没有 Linux cpufreq boost 控制接口
 delete_module01	kernel-bound	依赖 Linux LKM 装载器与模块状态机
 delete_module02	kernel-bound	依赖 Linux LKM 装载器与模块状态机
 delete_module03	kernel-bound	依赖 Linux LKM 装载器与模块状态机
@@ -128,3 +169,4 @@ bpf_prog04	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子
 bpf_prog05	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
 bpf_prog06	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
 bpf_prog07	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+rtc01	missing-functionality	RTC 读取已通过，但内核尚未实现 RTC_AIE_ON 与 RTC_UIE_ON 中断控制
