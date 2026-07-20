@@ -1,13 +1,15 @@
 //! RISC-V Supervisor Binary Interface 封装。
 //!
-//! 这里只封装当前单 hart 路径需要的 BASE、TIME 与 SRST。HSM、IPI、RFENCE
-//! 属于后续 SMP 工作，不在本模块提前建立半成品协议。
+//! 封装 BASE、TIME、SRST 以及 SMP 所需的 HSM、IPI、RFENCE 扩展。
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 pub const SBI_EXT_BASE: usize = 0x10;
 pub const SBI_EXT_TIME: usize = 0x5449_4d45;
 pub const SBI_EXT_SRST: usize = 0x5352_5354;
+pub const SBI_EXT_HSM: usize = 0x4853_4d;
+pub const SBI_EXT_IPI: usize = 0x7350_49;
+pub const SBI_EXT_RFENCE: usize = 0x5246_4e43;
 
 const SBI_BASE_GET_SPEC_VERSION: usize = 0;
 const SBI_BASE_GET_IMPL_ID: usize = 1;
@@ -15,6 +17,13 @@ const SBI_BASE_GET_IMPL_VERSION: usize = 2;
 const SBI_BASE_PROBE_EXTENSION: usize = 3;
 const SBI_TIME_SET_TIMER: usize = 0;
 const SBI_SRST_SYSTEM_RESET: usize = 0;
+const SBI_HSM_HART_START: usize = 0;
+const SBI_HSM_HART_STOP: usize = 1;
+const SBI_HSM_HART_GET_STATUS: usize = 2;
+const SBI_IPI_SEND_IPI: usize = 0;
+const SBI_RFENCE_REMOTE_FENCE_I: usize = 0;
+const SBI_RFENCE_REMOTE_SFENCE_VMA: usize = 1;
+const SBI_RFENCE_REMOTE_SFENCE_VMA_ASID: usize = 2;
 
 pub const SBI_SUCCESS: isize = 0;
 pub const SBI_ERR_FAILED: isize = -1;
@@ -33,6 +42,9 @@ const CAPABILITY_AVAILABLE: u8 = 2;
 
 static SBI_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SBI_BASE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static SBI_HSM_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static SBI_IPI_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static SBI_RFENCE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static SBI_SPEC_VERSION: AtomicUsize = AtomicUsize::new(0);
 static SBI_IMPL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static SBI_IMPL_VERSION: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +70,9 @@ pub struct SbiInfo {
     pub implementation_id: Option<usize>,
     pub implementation_version: Option<usize>,
     pub srst_available: bool,
+    pub hsm_available: bool,
+    pub ipi_available: bool,
+    pub rfence_available: bool,
 }
 
 /// 执行 SBI v0.2+ ecall。
@@ -95,39 +110,62 @@ pub fn init() -> SbiInfo {
     let base_available = spec.is_ok();
     SBI_BASE_AVAILABLE.store(base_available, Ordering::Release);
 
-    let (spec_version, implementation_id, implementation_version, srst_available) =
-        if base_available {
-            let impl_id = base_call(SBI_BASE_GET_IMPL_ID, 0);
-            let impl_version = base_call(SBI_BASE_GET_IMPL_VERSION, 0);
-            let srst = base_call(SBI_BASE_PROBE_EXTENSION, SBI_EXT_SRST);
-            let srst_available = srst.is_ok() && srst.value != 0;
-
-            SBI_SPEC_VERSION.store(spec.value, Ordering::Release);
-            if impl_id.is_ok() {
-                SBI_IMPL_ID.store(impl_id.value, Ordering::Release);
-            }
-            if impl_version.is_ok() {
-                SBI_IMPL_VERSION.store(impl_version.value, Ordering::Release);
-            }
-            SBI_SRST_CAPABILITY.store(
-                if srst_available {
-                    CAPABILITY_AVAILABLE
-                } else {
-                    CAPABILITY_UNAVAILABLE
-                },
-                Ordering::Release,
-            );
-
-            (
-                Some(spec.value),
-                impl_id.is_ok().then_some(impl_id.value),
-                impl_version.is_ok().then_some(impl_version.value),
-                srst_available,
-            )
-        } else {
-            SBI_SRST_CAPABILITY.store(CAPABILITY_UNAVAILABLE, Ordering::Release);
-            (None, None, None, false)
+    let (
+        spec_version,
+        implementation_id,
+        implementation_version,
+        srst_available,
+        hsm_available,
+        ipi_available,
+        rfence_available,
+    ) = if base_available {
+        let impl_id = base_call(SBI_BASE_GET_IMPL_ID, 0);
+        let impl_version = base_call(SBI_BASE_GET_IMPL_VERSION, 0);
+        let srst = base_call(SBI_BASE_PROBE_EXTENSION, SBI_EXT_SRST);
+        let srst_available = srst.is_ok() && srst.value != 0;
+        let extension_available = |extension| {
+            let ret = base_call(SBI_BASE_PROBE_EXTENSION, extension);
+            ret.is_ok() && ret.value != 0
         };
+        let hsm_available = extension_available(SBI_EXT_HSM);
+        let ipi_available = extension_available(SBI_EXT_IPI);
+        let rfence_available = extension_available(SBI_EXT_RFENCE);
+
+        SBI_SPEC_VERSION.store(spec.value, Ordering::Release);
+        if impl_id.is_ok() {
+            SBI_IMPL_ID.store(impl_id.value, Ordering::Release);
+        }
+        if impl_version.is_ok() {
+            SBI_IMPL_VERSION.store(impl_version.value, Ordering::Release);
+        }
+        SBI_SRST_CAPABILITY.store(
+            if srst_available {
+                CAPABILITY_AVAILABLE
+            } else {
+                CAPABILITY_UNAVAILABLE
+            },
+            Ordering::Release,
+        );
+        SBI_HSM_AVAILABLE.store(hsm_available, Ordering::Release);
+        SBI_IPI_AVAILABLE.store(ipi_available, Ordering::Release);
+        SBI_RFENCE_AVAILABLE.store(rfence_available, Ordering::Release);
+
+        (
+            Some(spec.value),
+            impl_id.is_ok().then_some(impl_id.value),
+            impl_version.is_ok().then_some(impl_version.value),
+            srst_available,
+            hsm_available,
+            ipi_available,
+            rfence_available,
+        )
+    } else {
+        SBI_SRST_CAPABILITY.store(CAPABILITY_UNAVAILABLE, Ordering::Release);
+        SBI_HSM_AVAILABLE.store(false, Ordering::Release);
+        SBI_IPI_AVAILABLE.store(false, Ordering::Release);
+        SBI_RFENCE_AVAILABLE.store(false, Ordering::Release);
+        (None, None, None, false, false, false, false)
+    };
 
     SBI_INITIALIZED.store(true, Ordering::Release);
     SbiInfo {
@@ -136,6 +174,9 @@ pub fn init() -> SbiInfo {
         implementation_id,
         implementation_version,
         srst_available,
+        hsm_available,
+        ipi_available,
+        rfence_available,
     }
 }
 
@@ -172,6 +213,91 @@ pub fn probe_extension(extension: usize) -> bool {
     }
     let ret = base_call(SBI_BASE_PROBE_EXTENSION, extension);
     ret.is_ok() && ret.value != 0
+}
+
+#[inline]
+pub fn hsm_available() -> bool {
+    SBI_HSM_AVAILABLE.load(Ordering::Acquire)
+}
+
+#[inline]
+pub fn ipi_available() -> bool {
+    SBI_IPI_AVAILABLE.load(Ordering::Acquire)
+}
+
+#[inline]
+pub fn rfence_available() -> bool {
+    SBI_RFENCE_AVAILABLE.load(Ordering::Acquire)
+}
+
+#[inline]
+pub fn hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> SbiRet {
+    call(
+        SBI_EXT_HSM,
+        SBI_HSM_HART_START,
+        [hart_id, start_addr, opaque, 0, 0, 0],
+    )
+}
+
+#[inline]
+pub fn hart_stop() -> SbiRet {
+    call(SBI_EXT_HSM, SBI_HSM_HART_STOP, [0; 6])
+}
+
+#[inline]
+pub fn hart_get_status(hart_id: usize) -> SbiRet {
+    call(
+        SBI_EXT_HSM,
+        SBI_HSM_HART_GET_STATUS,
+        [hart_id, 0, 0, 0, 0, 0],
+    )
+}
+
+#[inline]
+pub fn send_ipi(hart_mask: usize, hart_mask_base: usize) -> SbiRet {
+    call(
+        SBI_EXT_IPI,
+        SBI_IPI_SEND_IPI,
+        [hart_mask, hart_mask_base, 0, 0, 0, 0],
+    )
+}
+
+#[inline]
+pub fn remote_fence_i(hart_mask: usize, hart_mask_base: usize) -> SbiRet {
+    call(
+        SBI_EXT_RFENCE,
+        SBI_RFENCE_REMOTE_FENCE_I,
+        [hart_mask, hart_mask_base, 0, 0, 0, 0],
+    )
+}
+
+#[inline]
+pub fn remote_sfence_vma(
+    hart_mask: usize,
+    hart_mask_base: usize,
+    start_addr: usize,
+    size: usize,
+) -> SbiRet {
+    call(
+        SBI_EXT_RFENCE,
+        SBI_RFENCE_REMOTE_SFENCE_VMA,
+        [hart_mask, hart_mask_base, start_addr, size, 0, 0],
+    )
+}
+
+#[inline]
+pub fn remote_sfence_vma_asid(
+    hart_mask: usize,
+    hart_mask_base: usize,
+    start_addr: usize,
+    size: usize,
+    asid: usize,
+) -> SbiRet {
+    call(
+        SBI_EXT_RFENCE,
+        SBI_RFENCE_REMOTE_SFENCE_VMA_ASID,
+        [hart_mask, hart_mask_base, start_addr, size, asid, 0],
+    )
 }
 
 #[inline]

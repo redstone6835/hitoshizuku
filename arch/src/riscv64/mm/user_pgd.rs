@@ -57,7 +57,7 @@ const fn tag_generation(tag: usize) -> usize {
     tag >> ASID_TAG_BITS
 }
 
-/// 探测 satp.ASID 的 WARL 位宽，并初始化单 hart generation allocator。
+/// 探测 satp.ASID 的 WARL 位宽，并初始化全局 generation allocator。
 ///
 /// 临时写入全 1 ASID 后立即恢复原 satp；调用发生在第一个用户地址空间创建前。
 pub(super) fn init_asid_allocator() {
