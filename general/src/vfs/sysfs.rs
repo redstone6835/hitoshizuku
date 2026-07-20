@@ -68,6 +68,8 @@ const KERNEL_PROFILE_STATS_INO: u64 = 26;
 const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
 #[cfg(feature = "performance-profile")]
 const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_CATALOG_INO: u64 = 29;
 const KERNEL_ELM_DIR_INO: u64 = 80;
 const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
@@ -1518,6 +1520,8 @@ enum SysRegFile {
     ProfileControl,
     #[cfg(feature = "performance-profile")]
     ProfileSamples,
+    #[cfg(feature = "performance-profile")]
+    ProfileCatalog,
     Elm {
         slot: ElmSysfsSlot,
     },
@@ -2036,14 +2040,22 @@ fn render_net_stats() -> String {
 fn render_profile_stats() -> String {
     use alloc::fmt::Write;
     let mut output = String::new();
+    let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "enabled={} generation={} counter_hz={}",
+        "state={} enabled={} session={} generation={} active_writers={} counter_hz={} event_mask={:#x} sampling={} cpu_slots={} histogram_buckets={}",
+        session.state.name(),
         u8::from(profiling::enabled()),
-        profiling::generation(),
-        profiling::counter_hz(),
+        session.session_id,
+        session.generation,
+        session.active_writers,
+        session.counter_hz,
+        session.event_mask,
+        u8::from(session.sampling_enabled),
+        profiling::CPU_SLOTS,
+        profiling::HISTOGRAM_BUCKETS,
     );
-    for cpu in 0..profiling::MAX_CPUS {
+    for cpu in 0..profiling::CPU_SLOTS {
         for event in profiling::Event::ALL {
             let value = profiling::snapshot(cpu, event);
             if value.calls == 0 {
@@ -2051,9 +2063,11 @@ fn render_profile_stats() -> String {
             }
             let _ = writeln!(
                 output,
-                "cpu={} event={} calls={} cycles={} bytes={} packets={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} p50_ns={} p95_ns={} p99_ns={} hist={}",
-                cpu,
+                "cpu={} event={} event_id={} category={} calls={} cycles={} bytes={} packets={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                ProfileCpuDisplay(cpu),
                 event.name(),
+                event as usize,
+                event.category().name(),
                 value.calls,
                 value.cycles,
                 value.bytes,
@@ -2063,6 +2077,7 @@ fn render_profile_stats() -> String {
                 value.on_cpu_ns,
                 value.off_cpu_ns,
                 value.max_latency_ns,
+                value.migrations,
                 profiling::histogram_percentile(&value.latency, 50),
                 profiling::histogram_percentile(&value.latency, 95),
                 profiling::histogram_percentile(&value.latency, 99),
@@ -2077,7 +2092,7 @@ fn render_profile_stats() -> String {
             let _ = writeln!(
                 output,
                 "cpu={} metric={} observations={} sum={} max={} p50={} p95={} p99={} hist={}",
-                cpu,
+                ProfileCpuDisplay(cpu),
                 metric.name(),
                 value.observations,
                 value.sum,
@@ -2096,6 +2111,20 @@ fn render_profile_stats() -> String {
 struct HistogramDisplay<'a>(&'a [u64; profiling::HISTOGRAM_BUCKETS]);
 
 #[cfg(feature = "performance-profile")]
+struct ProfileCpuDisplay(usize);
+
+#[cfg(feature = "performance-profile")]
+impl core::fmt::Display for ProfileCpuDisplay {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == profiling::MIXED_CPU {
+            formatter.write_str("mixed")
+        } else {
+            write!(formatter, "{}", self.0)
+        }
+    }
+}
+
+#[cfg(feature = "performance-profile")]
 impl core::fmt::Display for HistogramDisplay<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for (index, value) in self.0.iter().enumerate() {
@@ -2112,11 +2141,15 @@ impl core::fmt::Display for HistogramDisplay<'_> {
 fn render_profile_samples() -> String {
     use alloc::fmt::Write;
     let mut output = String::new();
+    let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "enabled={} generation={} slots_per_cpu={}",
+        "state={} enabled={} session={} generation={} sampling={} slots_per_cpu={}",
+        session.state.name(),
         u8::from(profiling::enabled()),
-        profiling::generation(),
+        session.session_id,
+        session.generation,
+        u8::from(session.sampling_enabled),
         profiling::SAMPLE_SLOTS,
     );
     for cpu in 0..profiling::MAX_CPUS {
@@ -2145,11 +2178,42 @@ fn render_profile_samples() -> String {
 
 #[cfg(feature = "performance-profile")]
 fn render_profile_control() -> String {
+    let session = profiling::session_info();
     format!(
-        "enabled={} generation={}\n",
+        "state={} enabled={} session={} generation={} active_writers={} event_mask={:#x} sampling={} commands=start,resume,freeze,stop,reset,events=<mask>,samples=0|1\n",
+        session.state.name(),
         u8::from(profiling::enabled()),
-        profiling::generation(),
+        session.session_id,
+        session.generation,
+        session.active_writers,
+        session.event_mask,
+        u8::from(session.sampling_enabled),
     )
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_catalog() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    for event in profiling::Event::ALL {
+        let _ = writeln!(
+            output,
+            "kind=event id={} name={} category={} mask={:#x}",
+            event as usize,
+            event.name(),
+            event.category().name(),
+            1u64 << event as usize,
+        );
+    }
+    for metric in profiling::Metric::ALL {
+        let _ = writeln!(
+            output,
+            "kind=metric id={} name={}",
+            metric as usize,
+            metric.name(),
+        );
+    }
+    output
 }
 
 fn render_elm_sysfs_file(name: &str) -> String {
@@ -2192,6 +2256,8 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::ProfileControl => render_profile_control(),
         #[cfg(feature = "performance-profile")]
         SysRegFile::ProfileSamples => render_profile_samples(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileCatalog => render_profile_catalog(),
         SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
@@ -2357,9 +2423,25 @@ impl FileOps for SysRegFileOps {
             let command = core::str::from_utf8(_buf)
                 .map_err(|_| VfsError::InvalidArgument)?
                 .trim();
+            if let Some(mask) = command.strip_prefix("events=") {
+                let mask = mask.strip_prefix("0x").unwrap_or(mask);
+                let mask = u64::from_str_radix(mask, 16).map_err(|_| VfsError::InvalidArgument)?;
+                profiling::set_event_mask(mask);
+                return Ok(_buf.len());
+            }
+            if let Some(enabled) = command.strip_prefix("samples=") {
+                match enabled {
+                    "0" | "off" => profiling::set_sampling_enabled(false),
+                    "1" | "on" => profiling::set_sampling_enabled(true),
+                    _ => return Err(VfsError::InvalidArgument),
+                }
+                return Ok(_buf.len());
+            }
             match command {
-                "0" | "disable" => profiling::set_enabled(false),
-                "1" | "enable" => profiling::set_enabled(true),
+                "start" => profiling::start(),
+                "1" | "enable" | "resume" => profiling::resume(),
+                "0" | "freeze" => profiling::freeze(),
+                "disable" | "stop" => profiling::stop(),
                 "reset" => profiling::reset(),
                 _ => return Err(VfsError::InvalidArgument),
             }
@@ -2894,6 +2976,8 @@ impl SysDirInodeOps {
                 "profile_control" => mk_reg(KERNEL_PROFILE_CONTROL_INO, SysRegFile::ProfileControl),
                 #[cfg(feature = "performance-profile")]
                 "profile_samples" => mk_reg(KERNEL_PROFILE_SAMPLES_INO, SysRegFile::ProfileSamples),
+                #[cfg(feature = "performance-profile")]
+                "profile_catalog" => mk_reg(KERNEL_PROFILE_CATALOG_INO, SysRegFile::ProfileCatalog),
                 "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
@@ -3493,6 +3577,12 @@ impl SysDirInodeOps {
                 mk_dir_entry(
                     KERNEL_PROFILE_SAMPLES_INO,
                     "profile_samples",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_CATALOG_INO,
+                    "profile_catalog",
                     FileType::Regular,
                 ),
                 mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),

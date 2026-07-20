@@ -697,6 +697,8 @@ pub fn iocsr_write64(offset: usize, value: u64) -> bool {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn dispatch_interrupt(interrupt: Interrupt) -> bool {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::IrqDispatch);
     let Some(line) = IrqLine::from_interrupt(interrupt) else {
         return false;
     };

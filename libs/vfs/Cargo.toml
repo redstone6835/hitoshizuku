@@ -9,7 +9,11 @@ doctest = false
 bench = false
 
 [features]
-performance-profile = ["sched/performance-profile", "socket/performance-profile"]
+performance-profile = [
+    "dep:profiling",
+    "sched/performance-profile",
+    "socket/performance-profile",
+]
 
 [dependencies]
 elm_model = { package = "elm", path = "../elm" }
@@ -17,6 +21,7 @@ errno = { path = "../errno" }
 kernel-symbols = { path = "../kernel-symbols" }
 mm = { path = "../mm" }
 net = { path = "../net" }
+profiling = { path = "../profiling", optional = true }
 sched = { path = "../sched" }
 socket = { path = "../socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

@@ -149,6 +149,8 @@ pub fn dispatch(tf: TrapFramePtr) {
         (ops.advance_pc)(tf);
         return;
     }
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SyscallDispatch);
 
     let task = sched::current_task();
     let mut ctx = SyscallContext {
@@ -254,6 +256,8 @@ where
     F: FnMut(TrapFramePtr, isize),
 {
     let task = sched::current_task_fast();
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SyscallDispatch);
 
     let entry = if nr < SYSCALL_TABLE_LEN {
         let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);

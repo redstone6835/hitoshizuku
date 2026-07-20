@@ -511,6 +511,8 @@ pub struct Task {
     wakeup_ns: AtomicU64,
     #[cfg(feature = "performance-profile")]
     wait_reason: AtomicU8,
+    #[cfg(feature = "performance-profile")]
+    wait_cpu: AtomicUsize,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -607,6 +609,8 @@ impl Task {
             wakeup_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             wait_reason: AtomicU8::new(WaitReason::Other as u8),
+            #[cfg(feature = "performance-profile")]
+            wait_cpu: AtomicUsize::new(profiling::MIXED_CPU),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -1238,6 +1242,8 @@ impl Task {
         #[cfg(feature = "performance-profile")]
         {
             self.wait_reason.store(reason as u8, Ordering::Release);
+            self.wait_cpu
+                .store(profiling::current_cpu_slot(), Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
             self.wait_started_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -1252,6 +1258,7 @@ impl Task {
         {
             self.wait_started_ns.store(0, Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
+            self.wait_cpu.store(profiling::MIXED_CPU, Ordering::Release);
         }
     }
 
@@ -1264,9 +1271,10 @@ impl Task {
                 return;
             }
             #[cfg(feature = "performance-profile")]
-            profiling::record_duration(
+            profiling::record_duration_on_cpu(
                 WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire)).profile_event(),
                 now_ns.saturating_sub(encoded - 1),
+                self.wait_cpu.load(Ordering::Acquire),
             );
             self.wakeup_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);

@@ -520,6 +520,8 @@ impl File {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsRead);
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
@@ -528,6 +530,8 @@ impl File {
         let n = self.ops.read_at(buf, offset)?;
         self.pos
             .store(offset.saturating_add(n as u64), Ordering::Release);
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(n);
         Ok(n)
     }
 
@@ -540,6 +544,8 @@ impl File {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsWrite);
         let flags = self.flags();
         if !flags.writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
@@ -549,12 +555,16 @@ impl File {
             let n = self.ops.write_at(buf, u64::MAX)?;
             let new_eof = self.inode.size();
             self.pos.store(new_eof, Ordering::Release);
+            #[cfg(feature = "performance-profile")]
+            profile.set_bytes(n);
             Ok(n)
         } else {
             let offset = self.pos.load(Ordering::Acquire);
             let n = self.ops.write_at(buf, offset)?;
             self.pos
                 .store(offset.saturating_add(n as u64), Ordering::Release);
+            #[cfg(feature = "performance-profile")]
+            profile.set_bytes(n);
             Ok(n)
         }
     }
@@ -567,13 +577,18 @@ impl File {
         capabilities = kernel_symbols::capability::VFS_IO
     )]
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsRead);
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
-        self.ops.read_at(buf, offset)
+        let n = self.ops.read_at(buf, offset)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(n);
+        Ok(n)
     }
 
     /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。
@@ -585,13 +600,18 @@ impl File {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsWrite);
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
-        self.ops.write_at(buf, offset)
+        let n = self.ops.write_at(buf, offset)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(n);
+        Ok(n)
     }
 
     /// 移动文件偏移量（`lseek`）。返回移动后的绝对偏移量。
