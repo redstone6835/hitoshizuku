@@ -1089,3 +1089,18 @@ fn privileged_inet_ports_require_explicit_capability() {
         );
     }
 }
+
+#[ktest]
+fn connect_unspecified_destination_resolves_to_loopback() {
+    let v4 = crate::net_socket::normalize_connect_endpoint(net::Endpoint {
+        addr: net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+        port: 1234,
+    });
+    assert_eq!(v4.addr, net::IpAddr::V4(net::Ipv4Addr::LOCALHOST));
+
+    let v6 = crate::net_socket::normalize_connect_endpoint(net::Endpoint {
+        addr: net::IpAddr::V6(net::Ipv6Addr::UNSPECIFIED),
+        port: 1234,
+    });
+    assert_eq!(v6.addr, net::IpAddr::V6(net::Ipv6Addr::LOCALHOST));
+}

@@ -6,7 +6,10 @@
 
 extern crate std;
 
-use crate::signal::{SigSet, SignalNumber};
+use crate::ids::Uid;
+use crate::signal::{
+    SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigSet, SignalNumber,
+};
 use ktest::ktest;
 
 /// 空集不包含任何信号。
@@ -89,4 +92,33 @@ fn signal_number_bit() {
 #[ktest]
 fn signal_number_as_usize() {
     assert_eq!(SignalNumber::SIGKILL.as_usize(), 9);
+}
+
+/// CLONE_SIGHAND 共享处理表，但不能共享线程组 pending 队列。
+#[ktest]
+fn clone_sighand_shares_actions_without_sharing_pending() {
+    let parent = SharedSignal::new();
+    let child = parent.clone_sighand();
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        flags: SigActionFlags(0),
+        mask: SigSet::EMPTY,
+        restorer: 0,
+    };
+
+    child.set_action(SignalNumber::SIGUSR2, ignored);
+    assert_eq!(
+        parent.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+
+    parent.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR2,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    assert!(parent.pending_snapshot().has(SignalNumber::SIGUSR2));
+    assert!(!child.pending_snapshot().has(SignalNumber::SIGUSR2));
 }

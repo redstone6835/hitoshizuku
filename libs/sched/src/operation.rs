@@ -689,7 +689,8 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWUSER
         | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNET
-        | CloneFlags::CLONE_IO;
+        | CloneFlags::CLONE_IO
+        | CloneFlags::CLONE_CLEAR_SIGHAND;
     const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
         | CloneFlags::CLONE_NEWNS
         | CloneFlags::CLONE_NEWCGROUP
@@ -727,6 +728,9 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         return Err(Errno::EINVAL);
     }
     if flags.has(CloneFlags::CLONE_SIGHAND) && !flags.has(CloneFlags::CLONE_VM) {
+        return Err(Errno::EINVAL);
+    }
+    if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) && flags.has(CloneFlags::CLONE_SIGHAND) {
         return Err(Errno::EINVAL);
     }
     if flags.has(CloneFlags::CLONE_THREAD)

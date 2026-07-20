@@ -1552,6 +1552,8 @@ pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
 /// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
 pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
+/// 当前任务持有的可执行文件访问租约集合。
+pub const TASKEXT_EXEC_ACCESS: TaskExtKey = 0x0002_0003;
 /// ELM 当前执行域、恢复帧和生命周期上下文。
 pub const TASKEXT_ELM_EXECUTION: TaskExtKey = 0x0003_0000;
 

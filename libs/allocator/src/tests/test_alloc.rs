@@ -978,7 +978,13 @@ fn registry_max_chain_len_shrinks_after_collision_removal() {
 }
 
 fn registry_test_shard(ptr: usize, shard_mask: usize) -> usize {
-    ((ptr >> 3) ^ (ptr >> 11) ^ (ptr >> 19) ^ (ptr >> 27)) & shard_mask
+    let mut value = ptr as u64;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value as usize & shard_mask
 }
 
 /// 审计接口应能把 registry 和后端计数稳定对齐。

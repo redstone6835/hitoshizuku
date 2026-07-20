@@ -131,3 +131,25 @@ fn pipe_buf_write_is_atomic() {
     assert_eq!(read_end.read(&mut content), Ok(2048));
     assert!(content[..2048].iter().all(|byte| *byte == 0x55));
 }
+
+/// 匿名管道不是可同步文件，fsync/fdatasync 必须按 Linux 语义返回 EINVAL。
+#[ktest]
+fn pipe_rejects_file_sync() {
+    let cred = root_cred();
+    let (read_end, write_end) = pipe::new_pipe(cred, true).unwrap();
+
+    assert_eq!(read_end.sync(), Err(VfsError::InvalidArgument));
+    assert_eq!(write_end.datasync(), Err(VfsError::InvalidArgument));
+}
+
+/// pipefs 必须提供有效的 statfs 结果，供 fstatfs(pipefd) 查询。
+#[ktest]
+fn pipe_filesystem_reports_statfs() {
+    let (read_end, _) = pipe::new_pipe(root_cred(), true).unwrap();
+    let sb = read_end.inode().superblock().unwrap();
+    let stat = sb.statfs().unwrap();
+
+    assert_eq!(stat.fs_type, 0x5049_5045);
+    assert_eq!(stat.block_size, 4096);
+    assert_eq!(stat.name_max, 255);
+}

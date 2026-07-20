@@ -54,16 +54,7 @@ if mount -t ext4 /dev/vd0 /mnt; then
     : > "$sh_file_list"
 
     echo "[init] /mnt directory tree:"
-    find /mnt -print 2>/dev/null | sort | while IFS= read -r path; do
-        printf '%s\n' "$path"
-        case "$path" in
-            *.sh)
-                if [ -f "$path" ] && [ ! -L "$path" ]; then
-                    printf '%s\n' "$path" >> "$sh_file_list"
-                fi
-                ;;
-        esac
-    done
+    ls /mnt
     echo "[init] /mnt directory tree end"
 
     if [ -s "$sh_file_list" ]; then

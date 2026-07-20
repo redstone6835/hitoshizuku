@@ -952,6 +952,13 @@ def initial_state(
         "image_sha256_before": image_hash,
         "kernel": str(args.kernel),
         "kernel_sha256": kernel_hash,
+        "kernel_history": [
+            {
+                "sha256": kernel_hash,
+                "accepted_at": utc_now(),
+                "reason": "campaign-start",
+            }
+        ],
         "docker_image": args.docker_image,
         "shard_size": args.shard_size,
         "case_timeout": args.case_timeout,
@@ -1000,8 +1007,41 @@ def execute_campaign(args: argparse.Namespace, root: Path, resume: bool) -> int:
         image_hash = sha256_file(args.image)
         if image_hash != state["image_sha256_before"]:
             raise LtpError("LTP 原始镜像哈希已变化，拒绝恢复")
-        if sha256_file(args.kernel) != state["kernel_sha256"]:
-            raise LtpError("kernel-la 与活动开始时不同，拒绝混合结果")
+        current_kernel_hash = sha256_file(args.kernel)
+        if current_kernel_hash != state["kernel_sha256"]:
+            if not args.accept_kernel_change:
+                raise LtpError(
+                    "kernel-la 与活动当前记录不同；修复后恢复测试时请显式传入 "
+                    "--accept-kernel-change"
+                )
+            previous_kernel_hash = str(state["kernel_sha256"])
+            history = state.setdefault(
+                "kernel_history",
+                [
+                    {
+                        "sha256": previous_kernel_hash,
+                        "accepted_at": state.get("created_at", utc_now()),
+                        "reason": "campaign-start",
+                    }
+                ],
+            )
+            history.append(
+                {
+                    "sha256": current_kernel_hash,
+                    "accepted_at": utc_now(),
+                    "reason": "resume-after-kernel-fix",
+                }
+            )
+            state["kernel_sha256"] = current_kernel_hash
+            state["updated_at"] = utc_now()
+            atomic_write_json(state_path, state)
+            journal.record(
+                "campaign-kernel-change",
+                "接受修复后的 LoongArch64 内核镜像并从断点继续",
+                run_id=run_id,
+                previous_kernel_sha256=previous_kernel_hash,
+                kernel_sha256=current_kernel_hash,
+            )
         journal.record("campaign-resume", "恢复 LoongArch64 LTP 测试活动", run_id=run_id)
     else:
         validate_common_paths(args, root)
@@ -1044,6 +1084,7 @@ def execute_campaign(args: argparse.Namespace, root: Path, resume: bool) -> int:
 
     disks = ensure_work_disks(output, args.docker_image, root)
     retry_counts: dict[str, int] = state.setdefault("retry_counts", {})
+    isolation_counts: dict[str, int] = {}
 
     for group in args.groups:
         scenarios = inventory["groups"][group]["scenarios"]
@@ -1056,7 +1097,8 @@ def execute_campaign(args: argparse.Namespace, root: Path, resume: bool) -> int:
                 start = first_missing_index(len(cases), completed[(group, scenario)])
                 if start >= len(cases):
                     break
-                count = min(args.shard_size, len(cases) - start)
+                isolation_key = f"{group}/{scenario}/{start}"
+                count = min(isolation_counts.get(isolation_key, args.shard_size), len(cases) - start)
                 print(f"[ltp-la] {group}/{scenario}: {start}..{start + count - 1} / {len(cases)}")
                 journal.record(
                     "shard-start",
@@ -1119,11 +1161,33 @@ def execute_campaign(args: argparse.Namespace, root: Path, resume: bool) -> int:
                 next_index = first_missing_index(len(cases), after)
                 if next_index > start:
                     retry_counts.pop(f"{group}/{scenario}/{start}", None)
+                    isolation_counts.pop(isolation_key, None)
                     state["updated_at"] = utc_now()
                     atomic_write_json(state_path, state)
                     continue
 
                 retry_key = f"{group}/{scenario}/{start}"
+                if count > 1:
+                    reduced_count = max(1, count // 2)
+                    isolation_counts[isolation_key] = reduced_count
+                    retry_counts.pop(retry_key, None)
+                    state["updated_at"] = utc_now()
+                    atomic_write_json(state_path, state)
+                    journal.record(
+                        "shard-isolate",
+                        "批量分片无结果，缩小范围以定位真实阻塞用例",
+                        run_id=run_id,
+                        group=group,
+                        scenario=scenario,
+                        index=start,
+                        previous_count=count,
+                        next_count=reduced_count,
+                        timed_out=qemu.timed_out,
+                        timeout_kind=qemu.timeout_kind,
+                        serial_log=str(qemu.log_path),
+                    )
+                    continue
+
                 attempts = retry_counts.get(retry_key, 0) + 1
                 retry_counts[retry_key] = attempts
                 state["updated_at"] = utc_now()
@@ -1152,7 +1216,8 @@ def execute_campaign(args: argparse.Namespace, root: Path, resume: bool) -> int:
                     ),
                     None,
                 )
-                if started_case or qemu.timed_out:
+                runner_reached_guest = qemu.parsed.runner_start is not None
+                if started_case or (qemu.timed_out and runner_reached_guest):
                     failure = synthetic_failure(
                         run_id=run_id,
                         group=group,
@@ -1420,6 +1485,11 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--groups", nargs="+", default=list(DEFAULT_GROUPS))
     resume.add_argument("--shard-size", type=int, default=50)
     resume.add_argument("--retries", type=int, default=2)
+    resume.add_argument(
+        "--accept-kernel-change",
+        action="store_true",
+        help="记录修复后的 kernel-la 哈希并从现有断点继续",
+    )
     resume.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
 
     case = subparsers.add_parser("case", help="复现单个 LTP tag")

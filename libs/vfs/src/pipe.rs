@@ -641,7 +641,17 @@ impl SuperblockOps for PipeSuperblockOps {
     }
 
     fn statfs(&self, _sb: &Arc<Superblock>) -> VfsResult<crate::vfs::stat::FsStat> {
-        Err(VfsError::NotSupported)
+        Ok(crate::vfs::stat::FsStat {
+            fs_type: 0x5049_5045,
+            block_size: 4096,
+            total_blocks: 0,
+            free_blocks: 0,
+            avail_blocks: 0,
+            total_inodes: 0,
+            free_inodes: 0,
+            fs_id: 0x7069_7065_6673_0000,
+            name_max: 255,
+        })
     }
 
     fn sync_fs(&self, _sb: &Arc<Superblock>) -> VfsResult<()> {

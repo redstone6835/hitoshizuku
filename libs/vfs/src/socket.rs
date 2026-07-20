@@ -1238,6 +1238,8 @@ const IP_MULTICAST_TTL: i32 = 33;
 const IP_MULTICAST_LOOP: i32 = 34;
 const IP_ADD_MEMBERSHIP: i32 = 35;
 const IP_DROP_MEMBERSHIP: i32 = 36;
+const MCAST_JOIN_GROUP: i32 = 42;
+const MCAST_LEAVE_GROUP: i32 = 45;
 
 const IPV6_RECVERR: i32 = 25;
 const IPV6_V6ONLY: i32 = 26;
@@ -1327,6 +1329,46 @@ fn parse_ipv6_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno
     })
 }
 
+/// 解析 64 位 Linux ABI 的 `struct group_req`。
+fn parse_multicast_group_req(
+    value: &[u8],
+    expected_family: u16,
+) -> Result<net::MulticastMembership, Errno> {
+    const GROUP_REQ_LEN: usize = 136;
+    const SOCKADDR_OFFSET: usize = 8;
+    if value.len() < GROUP_REQ_LEN {
+        return Err(Errno::EINVAL);
+    }
+
+    let index = u32::from_ne_bytes(value[..4].try_into().unwrap());
+    let family = u16::from_ne_bytes(
+        value[SOCKADDR_OFFSET..SOCKADDR_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    );
+    if family != expected_family {
+        return Err(Errno::EINVAL);
+    }
+
+    let group = match family {
+        crate::addr::AF_INET => {
+            let offset = SOCKADDR_OFFSET + 4;
+            net::IpAddr::V4(net::Ipv4Addr(value[offset..offset + 4].try_into().unwrap()))
+        }
+        crate::addr::AF_INET6 => {
+            let offset = SOCKADDR_OFFSET + 8;
+            net::IpAddr::V6(net::Ipv6Addr(
+                value[offset..offset + 16].try_into().unwrap(),
+            ))
+        }
+        _ => return Err(Errno::EAFNOSUPPORT),
+    };
+    Ok(net::MulticastMembership {
+        group,
+        interface: (index != 0).then_some(net::InterfaceId(index)),
+    })
+}
+
 /// 解析 `struct timeval { tv_sec; tv_usec; }`（每个字段 8 字节，LP64 ABI）。
 fn parse_timeval_ns(value: &[u8]) -> u64 {
     if value.len() < 16 {
@@ -1378,6 +1420,9 @@ fn encode_tcp_info(info: net::TcpInfoSnapshot) -> Vec<u8> {
 }
 
 fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
+    if level == SOL_IPV6 && net_ops.family() != crate::addr::AF_INET6 {
+        return Err(Errno::ENOPROTOOPT);
+    }
     let opts = net_ops.options().lock();
     match level {
         SOL_SOCKET => match optname {
@@ -1512,6 +1557,9 @@ fn inet_setsockopt(
     optname: i32,
     value: &[u8],
 ) -> Result<(), Errno> {
+    if level == SOL_IPV6 && net_ops.family() != crate::addr::AF_INET6 {
+        return Err(Errno::ENOPROTOOPT);
+    }
     let mut opts = net_ops.options().lock();
     match level {
         SOL_SOCKET => match optname {
@@ -1707,6 +1755,15 @@ fn inet_setsockopt(
                 }
                 .map_err(crate::net_socket::map_socket_error_public)
             }
+            MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
+                let membership = parse_multicast_group_req(value, crate::addr::AF_INET)?;
+                if optname == MCAST_JOIN_GROUP {
+                    net_ops.proxy().add_multicast_membership(membership)
+                } else {
+                    net_ops.proxy().drop_multicast_membership(membership)
+                }
+                .map_err(crate::net_socket::map_socket_error_public)
+            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
@@ -1782,6 +1839,15 @@ fn inet_setsockopt(
             IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => {
                 let membership = parse_ipv6_membership(value)?;
                 if optname == IPV6_ADD_MEMBERSHIP {
+                    net_ops.proxy().add_multicast_membership(membership)
+                } else {
+                    net_ops.proxy().drop_multicast_membership(membership)
+                }
+                .map_err(crate::net_socket::map_socket_error_public)
+            }
+            MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
+                let membership = parse_multicast_group_req(value, crate::addr::AF_INET6)?;
+                if optname == MCAST_JOIN_GROUP {
                     net_ops.proxy().add_multicast_membership(membership)
                 } else {
                     net_ops.proxy().drop_multicast_membership(membership)
@@ -2551,6 +2617,47 @@ const fn align_cmsg(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multicast_group_req_parses_linux_64_bit_layout() {
+        let mut request = [0u8; 136];
+        request[0..4].copy_from_slice(&3u32.to_ne_bytes());
+        request[8..10].copy_from_slice(&crate::addr::AF_INET.to_ne_bytes());
+        request[12..16].copy_from_slice(&[239, 1, 2, 3]);
+
+        assert_eq!(
+            parse_multicast_group_req(&request, crate::addr::AF_INET),
+            Ok(net::MulticastMembership {
+                group: net::IpAddr::V4(net::Ipv4Addr::new(239, 1, 2, 3)),
+                interface: Some(net::InterfaceId(3)),
+            })
+        );
+    }
+
+    #[test]
+    fn multicast_group_req_uses_fallback_and_rejects_wrong_family() {
+        let mut request = [0u8; 136];
+        request[8..10].copy_from_slice(&crate::addr::AF_INET6.to_ne_bytes());
+        request[16..32].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+        assert_eq!(
+            parse_multicast_group_req(&request, crate::addr::AF_INET6),
+            Ok(net::MulticastMembership {
+                group: net::IpAddr::V6(net::Ipv6Addr([
+                    0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ])),
+                interface: None,
+            })
+        );
+        assert_eq!(
+            parse_multicast_group_req(&request, crate::addr::AF_INET),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_multicast_group_req(&request[..135], crate::addr::AF_INET6),
+            Err(Errno::EINVAL)
+        );
+    }
 
     fn parse_cmsgs(control: &[u8]) -> Vec<(i32, i32, Vec<u8>)> {
         let mut out = Vec::new();

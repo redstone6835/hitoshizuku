@@ -40,6 +40,7 @@ use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
+static KERNEL_TAINT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
 const ROOT_INO: u64 = 1;
 const FILESYSTEMS_INO: u64 = 2;
@@ -63,6 +64,7 @@ const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
 const SYS_FS_INO: u64 = 21;
 const SYS_PIPE_MAX_SIZE_INO: u64 = 22;
+const SYS_TAINTED_INO: u64 = 23;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -231,6 +233,21 @@ enum ProcFileKind {
     SysHotplug,
     SysPidMax,
     SysPipeMaxSize,
+    SysTainted,
+}
+
+/// 返回当前内核故障污染位图。
+///
+/// 位值由故障来源自行定义；procfs 只负责提供稳定的十进制诊断视图。
+pub fn kernel_taint_flags() -> u64 {
+    KERNEL_TAINT_FLAGS.load(Ordering::Acquire)
+}
+
+/// 原子地记录内核故障污染标志，并返回更新后的完整位图。
+///
+/// 污染标志只能累加，不能在运行中清除，确保测试和诊断工具不会丢失已经发生的故障。
+pub fn mark_kernel_tainted(flags: u64) -> u64 {
+    KERNEL_TAINT_FLAGS.fetch_or(flags, Ordering::AcqRel) | flags
 }
 
 #[derive(Clone, Copy)]
@@ -1009,6 +1026,7 @@ impl InodeOps for ProcSysKernelDirOps {
         match name {
             "hotplug" => Ok(proc_sys_hotplug_inode(self.fs_id, &self.weak_sb)),
             "pid_max" => Ok(proc_sys_pid_max_inode(self.fs_id, &self.weak_sb)),
+            "tainted" => Ok(proc_sys_tainted_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1029,6 +1047,11 @@ impl InodeOps for ProcSysKernelDirOps {
                 DirEntry {
                     ino: SYS_PID_MAX_INO,
                     name: SmallStr::new("pid_max"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_TAINTED_INO,
+                    name: SmallStr::new("tainted"),
                     kind: FileType::Regular,
                 },
             ],
@@ -1067,6 +1090,20 @@ fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPidMax,
+        }),
+    )
+}
+
+fn proc_sys_tainted_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_TAINTED_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysTainted,
         }),
     )
 }
@@ -1743,6 +1780,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysTainted => Ok(format!("{}\n", kernel_taint_flags()).into_bytes()),
         ProcFileKind::SysPipeMaxSize => {
             Ok(format!("{}\n", vfs::pipe::pipe_max_size()).into_bytes())
         }

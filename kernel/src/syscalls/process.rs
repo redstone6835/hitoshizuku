@@ -2166,6 +2166,15 @@ fn install_credentials(task: &Arc<Task>, new: Credentials) {
     }
 }
 
+const LINUX_FS_CAP_MASK: u64 = (1u64 << Capability::Chown as u32)
+    | (1u64 << Capability::DacOverride as u32)
+    | (1u64 << Capability::DacReadSearch as u32)
+    | (1u64 << Capability::Fowner as u32)
+    | (1u64 << Capability::Fsetid as u32)
+    | (1u64 << 9) // CAP_LINUX_IMMUTABLE
+    | (1u64 << 27) // CAP_MKNOD
+    | (1u64 << 32); // CAP_MAC_OVERRIDE
+
 fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     let lost_root_uid = (old.uid == Uid::ROOT || old.euid == Uid::ROOT || old.suid == Uid::ROOT)
         && new.uid != Uid::ROOT
@@ -2182,64 +2191,83 @@ fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     } else if gained_effective_root {
         new.caps = new.cap_permitted;
     }
+
+    // Linux 将 fsuid=0 视为文件系统能力的开关，但不改变 permitted 集合。
+    if old.fsuid == Uid::ROOT && new.fsuid != Uid::ROOT {
+        new.caps = CapSet::from_raw(new.caps.raw() & !LINUX_FS_CAP_MASK);
+    } else if old.fsuid != Uid::ROOT && new.fsuid == Uid::ROOT {
+        new.caps = CapSet::from_raw(new.caps.raw() | (new.cap_permitted.raw() & LINUX_FS_CAP_MASK));
+    }
 }
 
 pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let uid = Uid(ctx.args[0] as u32);
+    if uid.0 == u32::MAX {
+        return Err(Errno::EINVAL);
+    }
     let creds = ctx.task().credentials();
-    if creds.euid == Uid::ROOT || creds.uid == uid || creds.euid == uid || creds.suid == uid {
-        let mut new = (*creds).clone();
+    let mut new = (*creds).clone();
+    if creds.has_cap(Capability::Setuid) {
         new.uid = uid;
         new.euid = uid;
         new.suid = uid;
         new.fsuid = uid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
-        install_credentials(ctx.task(), new);
-        Ok(0)
+    } else if uid == creds.uid || uid == creds.suid {
+        new.euid = uid;
+        new.fsuid = uid;
     } else {
-        Err(Errno::EPERM)
+        return Err(Errno::EPERM);
     }
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
+    Ok(0)
 }
 
 pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let gid = Gid(ctx.args[0] as u32);
+    if gid.0 == u32::MAX {
+        return Err(Errno::EINVAL);
+    }
     let creds = ctx.task().credentials();
-    if creds.euid == Uid::ROOT || creds.gid == gid || creds.egid == gid || creds.sgid == gid {
-        let mut new = (*creds).clone();
+    let mut new = (*creds).clone();
+    if creds.has_cap(Capability::Setgid) {
         new.gid = gid;
         new.egid = gid;
         new.sgid = gid;
         new.fsgid = gid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
-        install_credentials(ctx.task(), new);
-        Ok(0)
+    } else if gid == creds.gid || gid == creds.sgid {
+        new.egid = gid;
+        new.fsgid = gid;
     } else {
-        Err(Errno::EPERM)
+        return Err(Errno::EPERM);
     }
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
+    Ok(0)
 }
 
 pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let ruid = ctx.args[0] as u32;
     let euid = ctx.args[1] as u32;
     let creds = ctx.task().credentials();
+    let privileged = creds.has_cap(Capability::Setuid);
     let mut new = (*creds).clone();
     if ruid != u32::MAX {
-        if creds.euid != Uid::ROOT && ruid != creds.uid.0 && ruid != creds.euid.0 {
+        if !privileged && ruid != creds.uid.0 && ruid != creds.euid.0 {
             return Err(Errno::EPERM);
         }
         new.uid = Uid(ruid);
     }
     if euid != u32::MAX {
-        if creds.euid != Uid::ROOT
-            && euid != creds.uid.0
-            && euid != creds.euid.0
-            && euid != creds.suid.0
-        {
+        if !privileged && euid != creds.uid.0 && euid != creds.euid.0 && euid != creds.suid.0 {
             return Err(Errno::EPERM);
         }
         let new_euid = Uid(euid);
         new.euid = new_euid;
         new.fsuid = new_euid;
+    }
+    if ruid != u32::MAX || (euid != u32::MAX && euid != creds.uid.0) {
+        new.suid = new.euid;
     }
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
@@ -2250,24 +2278,24 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let rgid = ctx.args[0] as u32;
     let egid = ctx.args[1] as u32;
     let creds = ctx.task().credentials();
+    let privileged = creds.has_cap(Capability::Setgid);
     let mut new = (*creds).clone();
     if rgid != u32::MAX {
-        if creds.euid != Uid::ROOT && rgid != creds.gid.0 && rgid != creds.egid.0 {
+        if !privileged && rgid != creds.gid.0 && rgid != creds.egid.0 {
             return Err(Errno::EPERM);
         }
         new.gid = Gid(rgid);
     }
     if egid != u32::MAX {
-        if creds.euid != Uid::ROOT
-            && egid != creds.gid.0
-            && egid != creds.egid.0
-            && egid != creds.sgid.0
-        {
+        if !privileged && egid != creds.gid.0 && egid != creds.egid.0 && egid != creds.sgid.0 {
             return Err(Errno::EPERM);
         }
         let new_egid = Gid(egid);
         new.egid = new_egid;
         new.fsgid = new_egid;
+    }
+    if rgid != u32::MAX || (egid != u32::MAX && egid != creds.gid.0) {
+        new.sgid = new.egid;
     }
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
@@ -2279,7 +2307,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let euid = ctx.args[1] as u32;
     let suid = ctx.args[2] as u32;
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setuid) {
         if ruid != u32::MAX && ruid != creds.uid.0 && ruid != creds.euid.0 && ruid != creds.suid.0 {
             return Err(Errno::EPERM);
         }
@@ -2295,13 +2323,12 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.uid = Uid(ruid);
     }
     if euid != u32::MAX {
-        let new_euid = Uid(euid);
-        new.euid = new_euid;
-        new.fsuid = new_euid;
+        new.euid = Uid(euid);
     }
     if suid != u32::MAX {
         new.suid = Uid(suid);
     }
+    new.fsuid = new.euid;
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
@@ -2312,7 +2339,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let egid = ctx.args[1] as u32;
     let sgid = ctx.args[2] as u32;
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setgid) {
         if rgid != u32::MAX && rgid != creds.gid.0 && rgid != creds.egid.0 && rgid != creds.sgid.0 {
             return Err(Errno::EPERM);
         }
@@ -2328,13 +2355,12 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.gid = Gid(rgid);
     }
     if egid != u32::MAX {
-        let new_egid = Gid(egid);
-        new.egid = new_egid;
-        new.fsgid = new_egid;
+        new.egid = Gid(egid);
     }
     if sgid != u32::MAX {
         new.sgid = Gid(sgid);
     }
+    new.fsgid = new.egid;
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
@@ -2344,14 +2370,16 @@ pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let uid = Uid(ctx.args[0] as u32);
     let creds = ctx.task().credentials();
     let old = creds.fsuid;
-    if creds.has_cap(Capability::Setuid)
-        || uid == creds.uid
-        || uid == creds.euid
-        || uid == creds.suid
-        || uid == creds.fsuid
+    if uid.0 != u32::MAX
+        && (creds.has_cap(Capability::Setuid)
+            || uid == creds.uid
+            || uid == creds.euid
+            || uid == creds.suid
+            || uid == creds.fsuid)
     {
         let mut new = (*creds).clone();
         new.fsuid = uid;
+        drop_caps_after_uid_gid_change(&creds, &mut new);
         install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
@@ -2361,11 +2389,12 @@ pub(super) fn sys_setfsgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let gid = Gid(ctx.args[0] as u32);
     let creds = ctx.task().credentials();
     let old = creds.fsgid;
-    if creds.has_cap(Capability::Setgid)
-        || gid == creds.gid
-        || gid == creds.egid
-        || gid == creds.sgid
-        || gid == creds.fsgid
+    if gid.0 != u32::MAX
+        && (creds.has_cap(Capability::Setgid)
+            || gid == creds.gid
+            || gid == creds.egid
+            || gid == creds.sgid
+            || gid == creds.fsgid)
     {
         let mut new = (*creds).clone();
         new.fsgid = gid;
@@ -3335,20 +3364,30 @@ pub(super) fn sys_execveat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
     let path = copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?;
 
+    if path.is_empty() && dirfd_raw as i32 != AT_FDCWD {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let fd_raw = u32::try_from(dirfd_raw).map_err(|_| Errno::EBADF)?;
+        let fd = Fd::from_raw(fd_raw);
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        if (flags & AT_SYMLINK_NOFOLLOW) != 0 && file.inode().kind() == vfs::stat::FileType::Symlink
+        {
+            return Err(Errno::ELOOP);
+        }
+        let request = ExecRequest::from_file_descriptor(fd_raw, argv_user, envp_user);
+        sched::operation::execve_with_context(request, UserContextRef::new(ctx.tf.as_usize()))?;
+        ctx.finalize_frame();
+        return Ok(0);
+    }
+
     let exec_path = if path.is_empty() {
         if (flags & AT_EMPTY_PATH) == 0 {
             return Err(Errno::ENOENT);
         }
-        if dirfd_raw as i32 == AT_FDCWD {
-            vfs::namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount())
-                .ok_or(Errno::ENOENT)?
-        } else {
-            let fd = Fd::from_raw(dirfd_raw as u32);
-            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-            vfs::namespace_path(&vfs_ctx, file.dentry(), file.mount()).ok_or(Errno::ENOENT)?
-        }
+        vfs::namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount()).ok_or(Errno::ENOENT)?
     } else {
-        let dirfd = if dirfd_raw as i32 == AT_FDCWD {
+        let dirfd = if path.starts_with('/') || dirfd_raw as i32 == AT_FDCWD {
             vfs::path::Dirfd::Cwd
         } else {
             let file = fdt

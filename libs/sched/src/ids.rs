@@ -82,6 +82,7 @@ pub enum Capability {
     SysNice = 23,
     SysResource = 24,
     SysTime = 25,
+    Syslog = 34,
     CheckpointRestore = 40,
 }
 

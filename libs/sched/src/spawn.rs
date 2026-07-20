@@ -16,7 +16,7 @@ use crate::scheduler::{
     activate_task_on_cpu, current_task, enqueue_task, enqueue_task_with_hint, init_task,
     is_current_on_any_cpu, mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
 };
-use crate::signal::SignalNumber;
+use crate::signal::{SharedSignal, SignalNumber};
 use crate::task::{Task, ext_clone_hook};
 use crate::{ExitCode, TaskState};
 
@@ -179,9 +179,14 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let new_tg = if flags.has(CloneFlags::CLONE_THREAD) {
         parent_tg
     } else {
-        // CLONE_SIGHAND 共享 SharedSignal（即便不 CLONE_THREAD）。
+        // CLONE_SIGHAND 只共享 handler 表；独立线程组必须拥有自己的
+        // 进程级 pending 队列。CLONE_THREAD 才复用完整 SharedSignal。
         let tg = if flags.has(CloneFlags::CLONE_SIGHAND) {
-            ThreadGroup::new_sharing_signal(Arc::clone(parent_tg.shared_signal()))
+            ThreadGroup::new_sharing_signal(Arc::new(parent_tg.shared_signal().clone_sighand()))
+        } else if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            // glibc 的 posix_spawn/system 路径使用此标志，要求子进程在 exec 前
+            // 看不到父进程安装的 handler，也不能继承进程级 pending 信号。
+            ThreadGroup::new_sharing_signal(Arc::new(SharedSignal::new()))
         } else {
             // 不共享 → 深拷一份 sigaction。
             let copied = parent_tg.shared_signal().fork_copy();
