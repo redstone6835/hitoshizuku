@@ -261,11 +261,19 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
         }
         arg4
-    } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD | ECODE_ASXD) {
+    } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD) {
         let enable = match ecode {
             ECODE_FPD => EUEN_FPE,
-            ECODE_SXD => EUEN_SXE,
-            ECODE_ASXD => EUEN_SXE | EUEN_ASXE,
+            ECODE_SXD => {
+                // SXE 关闭时入口没有可保存的向量状态。用已有 FPR 低 64 位初始化
+                // 每个 LSX 寄存器，并清零高 64 位，再让返回路径装入确定的状态。
+                let scalar_state_saved = tf.euen & FPU_SAVED != 0;
+                for index in 0..tf.lsx.len() {
+                    tf.lsx[index] = [if scalar_state_saved { tf.f[index] } else { 0 }, 0];
+                }
+                tf.euen |= LSX_SAVED;
+                EUEN_SXE
+            }
             _ => 0,
         };
         tf.euen |= enable;
