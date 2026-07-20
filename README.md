@@ -35,7 +35,7 @@
 - 技术汇报 PPT： [`MyGO!!!!! OS 内核技术汇报.pptx`](MyGO!!!!!%20OS%20内核技术汇报.pptx)
 - 测试演示视频：参见 https://pan.baidu.com/s/1xAara1sTKwMhglExJ3PNDw?pwd=tr9h
 - 架构说明：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- ELM 说明：[`docs/ELM.md`](docs/ELM.md)
+- ELM 设计说明：[`docs/ELM.md`](docs/ELM.md)
 - 技术文档源码：[`docs/main.typ`](docs/main.typ)
 - 安全分析报告：[`docs/SECURITY_REPORT.md`](docs/SECURITY_REPORT.md)
 - 开发与贡献说明：[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
@@ -51,7 +51,7 @@
 ├── drivers/    # 可选择 y/m/n 的 ELM 驱动与基础服务
 ├── libs/       # vfs、socket、net、extfs、sched、allocator、elm 等共享库
 ├── hal/        # 平台抽象层
-├── userland/   # initramfs、rcS、测试入口脚本
+├── userland/   # initramfs、rcS 与用户态管理工具
 ├── third/      # 外部组件
 └── vendor/     # 离线 Cargo 依赖镜像
 ```
@@ -114,13 +114,16 @@ CONFIG_VIRTIO_BLK=m
 硬依赖组件必须使用相同模式。例如 `virtio.block` 依赖 `virtio.framework`，不能在
 framework 为 `n` 时启用，也不能混用 `y` 与 `m`。构建工具会在编译前拒绝无效配置。
 
-IP 协议栈当前位于 `libs/net` 和 `kernel/src/net_runtime.rs`，INET 套接字数据路径由
-`libs/vfs` 接入。`net.stack` ELM 已建立 generation 注册、探测和撤销骨架，协议 worker
-和 socket 状态仍在后续迁移。`net.loopback` 与 `net.virtio` 是可独立装卸的网络驱动
-ELM，默认均构建为 `m`。
+IP 协议栈实现位于 `libs/net`，协议状态由 `drivers/net-stack` 中的 `net.stack` ELM
+承载；`kernel/src/net_runtime.rs` 负责宿主调度和设备桥接，INET 套接字数据路径由
+`libs/vfs` 接入。loopback 与 VirtIO-net 分别由 `net.loopback` 和 `net.virtio` ELM
+提供，默认均构建为 `m`，可独立配置和装卸。
+
+构建目标会自动将可提交的 `cargo-config/` 同步到本地 `.cargo/`。`kernel-la` 和
+`kernel-rv` 会把兼容 initramfs 打包进内核镜像；默认裸内核构建不会打包 initramfs。
 
 QEMU 运行示例默认使用 `build/sdcard-la.img` 和 `build/sdcard-rv.img`。这些镜像由
-比赛评测环境提供；本地复现时可从评测数据包中的对应压缩镜像解压到 `build/` 目录。
+比赛评测环境提供；本地复现时可从评测数据包中的对应压缩镜像解压到 `build/`。
 
 ## QEMU 运行示例
 
@@ -149,7 +152,7 @@ qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
 | IP 网络栈单测 | `cargo test -p net --target x86_64-unknown-linux-gnu` |
 | extfs 单测 | `cargo test -p extfs --target x86_64-unknown-linux-gnu` |
 | 内核启动验证 | 使用上方 QEMU 命令启动目标架构 |
-| 用户态集成测试 | 由 `userland/rootfs-*/etc/init.d/rcS` 按测试镜像脚本触发 |
+| 启动盘内容检查 | `userland/rootfs-*/etc/init.d/rcS` 挂载 `/dev/vd0`，输出 `/mnt` 目录树和其中的 `.sh` 文件内容 |
 
 ## 第三方组件与参考来源
 
@@ -158,8 +161,8 @@ qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
 用户态工具链及 Rust 生态依赖均按其原始许可证保留来源信息。
 
 MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配、系统调用兼容层、
-任务调度、虚拟内存、VFS 投影、设备模型、virtio 块/网卡接入、测试镜像集成和
-比赛测例适配等部分。更详细的来源、差异和创新点说明见
+任务调度、虚拟内存、VFS 投影、设备模型、VirtIO 块设备和 ELM 运行时等部分。
+更详细的来源、差异和创新点说明见
 [`docs/main.typ`](docs/main.typ) 及 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 许可证
