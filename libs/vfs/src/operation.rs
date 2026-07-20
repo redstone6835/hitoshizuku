@@ -50,16 +50,56 @@ fn check_parent_perm(
     Ok(())
 }
 
-/// 应用 umask 并根据 CAP_FSETID 清除 SUID/SGID 位。
+/// 根据父目录和调用者凭据计算新 inode 的最终模式与所有者凭据。
 ///
-/// POSIX：不持有 CAP_FSETID 的进程不得创建 setuid/setgid 文件，
-/// VFS 层在传入驱动之前统一清除特殊位，防止权限提升。
-fn apply_create_mode(ctx: &VfsContext, mode: FileMode) -> FileMode {
-    let mut m = ctx.apply_umask(mode);
-    if !ctx.cred().has_cap(cred::Capability::FSetId) {
-        m = m.without(FileMode::SUID_SGID);
+/// setgid 目录中的新对象继承目录 GID，子目录还继承 setgid 位。普通文件请求
+/// setgid 时，调用者必须属于最终文件组或持有 `CAP_FSETID`；setuid 位不会在创建时
+/// 无条件清除，因为文件所有者仍是调用者自身。
+pub(crate) fn derive_create_attributes(
+    mode_after_umask: FileMode,
+    caller: &cred::Credentials,
+    parent_meta: &inode::InodeMeta,
+    kind: stat::FileType,
+) -> (FileMode, cred::Credentials) {
+    let mut mode = mode_after_umask;
+    let mut owner = caller.clone();
+    let parent_setgid = parent_meta.mode.has(FileMode::ISGID);
+
+    if parent_setgid {
+        owner.fsgid = parent_meta.gid;
+        if kind == stat::FileType::Directory {
+            mode = mode.with(FileMode::ISGID);
+        }
     }
-    m
+
+    let inherited_directory_setgid = parent_setgid && kind == stat::FileType::Directory;
+    let caller_in_final_group = caller.fsgid == owner.fsgid
+        || caller.egid == owner.fsgid
+        || caller.groups.contains(&owner.fsgid);
+    if mode.has(FileMode::ISGID)
+        && !inherited_directory_setgid
+        && !caller_in_final_group
+        && !caller.has_cap(cred::Capability::FSetId)
+    {
+        mode = mode.without(FileMode::ISGID);
+    }
+
+    (mode, owner)
+}
+
+fn create_attributes(
+    ctx: &VfsContext,
+    parent_inode: &Arc<Inode>,
+    requested_mode: FileMode,
+    kind: stat::FileType,
+) -> (FileMode, cred::Credentials) {
+    let caller = ctx.cred();
+    derive_create_attributes(
+        ctx.apply_umask(requested_mode),
+        &caller,
+        &parent_inode.meta_snapshot(),
+        kind,
+    )
 }
 
 fn unregister_socket_inode(inode: &Inode) {
@@ -175,8 +215,8 @@ pub fn openat_with_lookup_flags(
             check_parent_perm(ctx, &parent_inode, None)?;
 
             // 驱动的 create 负责原子地检查 O_EXCL（若文件已并发创建，返回 AlreadyExists）
-            let effective_mode = apply_create_mode(ctx, mode);
-            let cred = ctx.cred();
+            let (effective_mode, cred) =
+                create_attributes(ctx, &parent_inode, mode, stat::FileType::Regular);
             let new_inode = parent_inode
                 .ops
                 .create(&parent_inode, name, effective_mode, &cred)?;
@@ -222,6 +262,14 @@ pub fn openat_with_lookup_flags(
         }
     }
 
+    // 普通文件的写打开必须先与执行映像租约完成原子排斥，再执行 O_TRUNC 或驱动
+    // open。这样并发 execve 不会落入“已经截断但最终返回 ETXTBSY”的半完成状态。
+    let write_access = if flags.writable() && inode.kind == stat::FileType::Regular {
+        Some(inode.acquire_write_access()?)
+    } else {
+        None
+    };
+
     // ── O_TRUNC ──
     if flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular {
         inode.ops.truncate(&inode, 0)?;
@@ -230,14 +278,26 @@ pub fn openat_with_lookup_flags(
     // ── 调用驱动 open，VFS 层组装 File（含 Mount，Drop 时自动 dec_open）──
     let cred = ctx.cred();
     let ops = inode.ops.open(&inode, &flags, &cred)?;
-    let file = File::new(
-        Arc::clone(&inode),
-        flags,
-        Arc::clone(&cred),
-        ops,
-        Arc::clone(&dentry),
-        Arc::clone(&mount), // File::drop 时自动 dec_open
-    );
+    let file = if let Some(write_access) = write_access {
+        File::new_with_write_access(
+            Arc::clone(&inode),
+            flags,
+            Arc::clone(&cred),
+            ops,
+            Arc::clone(&dentry),
+            Arc::clone(&mount),
+            write_access,
+        )
+    } else {
+        File::new(
+            Arc::clone(&inode),
+            flags,
+            Arc::clone(&cred),
+            ops,
+            Arc::clone(&dentry),
+            Arc::clone(&mount),
+        )
+    };
 
     // ── 挂载引用计数：inc_open 在 File 构造之后，alloc_fd 之前 ──
     mount.inc_open();
@@ -309,8 +369,8 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let effective_mode = apply_create_mode(ctx, mode);
-    let cred = ctx.cred();
+    let (effective_mode, cred) =
+        create_attributes(ctx, &parent_inode, mode, stat::FileType::Directory);
     let new_inode = parent_inode
         .ops
         .mkdir(&parent_inode, name, effective_mode, &cred)?;
@@ -355,7 +415,10 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.rmdir(&parent_inode, name, &child_inode)?;
-    DCACHE.invalidate_subtree(&target.dentry);
+    // rmdir 成功已经证明目录为空；此时全局扫描 dcache 子树只会反复检查不相关条目，
+    // 并在批量删树时退化为平方复杂度。负向子项无法再由命名空间抵达，逐出根键即可。
+    DCACHE.invalidate_dentry(&target.dentry);
+    target.dentry.invalidate();
     retire_inode(child_inode);
     Ok(())
 }
@@ -900,7 +963,12 @@ pub fn symlinkat(ctx: &VfsContext, target: &str, dirfd: &Dirfd, link_path: &str)
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let cred = ctx.cred();
+    let (_, cred) = create_attributes(
+        ctx,
+        &parent_inode,
+        FileMode::new(0o777),
+        stat::FileType::Symlink,
+    );
     let new_inode = parent_inode
         .ops
         .symlink(&parent_inode, name, target, &cred)?;
@@ -935,6 +1003,11 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
             return Err(VfsError::PermissionDenied);
         }
     }
+    let _write_access = if inode.kind == stat::FileType::Regular {
+        Some(inode.acquire_write_access()?)
+    } else {
+        None
+    };
     inode.ops.truncate(&inode, size)
 }
 
@@ -1117,8 +1190,7 @@ pub fn mknodat(
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let effective_mode = apply_create_mode(ctx, mode);
-    let cred = ctx.cred();
+    let (effective_mode, cred) = create_attributes(ctx, &parent_inode, mode, kind);
     let new_inode =
         parent_inode
             .ops

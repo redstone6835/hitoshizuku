@@ -42,6 +42,8 @@ pub(crate) struct Superblock {
 
     /// 当前已用 + 空闲 inode / block 计数(初始化 FsState 时用)。
     pub free_blocks_count: u64,
+    /// 仅特权进程可使用的保留块总数。
+    pub reserved_blocks_count: u64,
     pub free_inodes_count: u32,
 
     /// ext4 orphan_file inode 号。当前写路径不维护 orphan_file,
@@ -206,13 +208,15 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
     let groups_count = (((blocks_count - first_data_block as u64) + blocks_per_group as u64 - 1)
         / blocks_per_group as u64) as u32;
 
-    // free_blocks / free_inodes
+    // reserved_blocks / free_blocks / free_inodes
+    let reserved_blocks_lo = le32(sb, 8);
     let free_blocks_lo = le32(sb, 12);
-    let free_blocks_hi = if feature_incompat & INCOMPAT_64BIT != 0 {
-        le32(sb, 0x154)
+    let (reserved_blocks_hi, free_blocks_hi) = if feature_incompat & INCOMPAT_64BIT != 0 {
+        (le32(sb, 0x154), le32(sb, 0x158))
     } else {
-        0
+        (0, 0)
     };
+    let reserved_blocks_count = ((reserved_blocks_hi as u64) << 32) | reserved_blocks_lo as u64;
     let free_blocks_count = ((free_blocks_hi as u64) << 32) | free_blocks_lo as u64;
     let free_inodes_count = le32(sb, 16);
     let orphan_file_inum = le32(sb, 0x280);
@@ -237,8 +241,46 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
         metadata_csum,
         csum_seed,
         free_blocks_count,
+        reserved_blocks_count,
         free_inodes_count,
         orphan_file_inum,
         groups_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+        raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+        raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parse_64bit_space_counters_uses_distinct_high_fields() {
+        let mut raw = [0u8; SUPERBLOCK_SIZE];
+        put_u32(&mut raw, 0, 1024);
+        put_u32(&mut raw, 4, 11);
+        put_u32(&mut raw, 8, 22);
+        put_u32(&mut raw, 12, 33);
+        put_u32(&mut raw, 32, u32::MAX);
+        put_u32(&mut raw, 40, 1024);
+        put_u16(&mut raw, 56, SUPERBLOCK_MAGIC);
+        put_u32(&mut raw, 76, 1);
+        put_u16(&mut raw, 88, 128);
+        put_u32(&mut raw, 96, INCOMPAT_64BIT);
+        put_u16(&mut raw, 254, 64);
+        put_u32(&mut raw, 0x150, 5);
+        put_u32(&mut raw, 0x154, 2);
+        put_u32(&mut raw, 0x158, 3);
+
+        let parsed = parse(&raw).expect("解析 64 位 ext 超级块");
+        assert_eq!(parsed.blocks_count, (5u64 << 32) | 11);
+        assert_eq!(parsed.reserved_blocks_count, (2u64 << 32) | 22);
+        assert_eq!(parsed.free_blocks_count, (3u64 << 32) | 33);
+    }
 }

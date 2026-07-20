@@ -45,7 +45,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -174,6 +174,13 @@ pub struct Inode {
     /// `meta.nlink` 的原子镜像，用于 link/unlink/evict 相关热路径。
     cached_nlink: AtomicU32,
 
+    /// 普通文件的写打开与执行映像排斥状态。
+    ///
+    /// 正值表示当前持有写访问的打开文件描述数量，负值表示当前引用该 inode 的
+    /// 执行映像数量，零表示空闲。两类访问通过同一个原子量切换，保证并发
+    /// `open(O_WRONLY)` 与 `execve` 不会同时成功。
+    exec_write_state: AtomicIsize,
+
     /// 文件系统驱动提供的操作实现。VFS 层通过这个 trait object 调用 lookup、
     /// create、read、write 等操作，实现对不同文件系统（ext4、tmpfs、procfs 等）
     /// 的透明访问。通过 Arc 共享操作对象，使同一类 inode 可以复用同一套方法实现，
@@ -219,6 +226,7 @@ impl Inode {
             meta: crate::vfs::sync::Spinlock::new(meta),
             cached_size: AtomicU64::new(meta.size),
             cached_nlink: AtomicU32::new(meta.nlink),
+            exec_write_state: AtomicIsize::new(0),
             ops,
             superblock,
             lifecycle: AtomicU8::new(STATE_LIVE),
@@ -243,6 +251,64 @@ impl Inode {
     /// 返回当前硬链接计数的无锁快照。
     pub fn nlink(&self) -> u32 {
         self.cached_nlink.load(Ordering::Acquire)
+    }
+
+    /// 获取普通文件写访问租约。
+    ///
+    /// 当该 inode 正被任一执行映像占用时返回 `ETXTBSY`。同类写访问可以并存，
+    /// 租约析构时自动递减计数，因此 `dup`/`fork` 共享同一个 `File` 时不会重复计数。
+    pub(crate) fn acquire_write_access(self: &Arc<Self>) -> VfsResult<InodeWriteAccess> {
+        let mut current = self.exec_write_state.load(Ordering::Acquire);
+        loop {
+            if current < 0 {
+                return Err(VfsError::TextFileBusy);
+            }
+            let next = current
+                .checked_add(1)
+                .ok_or(VfsError::TooManyOpenFilesSystem)?;
+            match self.exec_write_state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(InodeWriteAccess {
+                        inode: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// 获取执行映像租约。
+    ///
+    /// 当该 inode 已有写打开时返回 `ETXTBSY`。多个由 `fork` 或重复 `exec` 产生的
+    /// 执行映像可以同时持有租约；最后一个租约释放前，新的写打开和路径截断均被拒绝。
+    pub fn acquire_exec_access(self: &Arc<Self>) -> VfsResult<InodeExecAccess> {
+        let mut current = self.exec_write_state.load(Ordering::Acquire);
+        loop {
+            if current > 0 {
+                return Err(VfsError::TextFileBusy);
+            }
+            let next = current
+                .checked_sub(1)
+                .ok_or(VfsError::TooManyOpenFilesSystem)?;
+            match self.exec_write_state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(InodeExecAccess {
+                        inode: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// 返回当前元数据的一致性快照。
@@ -467,6 +533,33 @@ impl Inode {
             sb.remove_inode(self.id.ino);
         }
         true
+    }
+}
+
+/// 普通文件写访问租约，只能由 VFS 打开和路径截断流程创建。
+pub(crate) struct InodeWriteAccess {
+    inode: Arc<Inode>,
+}
+
+impl Drop for InodeWriteAccess {
+    fn drop(&mut self) {
+        let previous = self.inode.exec_write_state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "write access state must be positive");
+    }
+}
+
+/// 执行映像租约。
+///
+/// 装载器必须在 ELF 校验和复制前获取该租约，并将其保存到任务执行状态；这样文件
+/// 从 `execve` 成功直至最后一个相关任务退出期间都不能被写打开或截断。
+pub struct InodeExecAccess {
+    inode: Arc<Inode>,
+}
+
+impl Drop for InodeExecAccess {
+    fn drop(&mut self) {
+        let previous = self.inode.exec_write_state.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous < 0, "exec access state must be negative");
     }
 }
 

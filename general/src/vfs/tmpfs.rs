@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use vfs::cred::{Credentials, Gid, Uid};
 use vfs::dentry::{Dentry, SmallStr};
 use vfs::error::{VfsError, VfsResult};
-use vfs::file::{DirEntry, FileOps, OpenOptions, PollEvents};
+use vfs::file::{DirEntry, FallocateMode, FileOps, OpenOptions, PollEvents};
 use vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use vfs::mount::MountFlags;
 use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
@@ -28,6 +28,120 @@ static TMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const TMPFS_VIRTUAL_BLOCKS: u64 = 256 * 1024;
 const TMPFS_VIRTUAL_INODES: u64 = 1_000_000;
+const TMPFS_PAGE_SIZE: usize = 4096;
+const TMPFS_PAGE_SIZE_U64: u64 = TMPFS_PAGE_SIZE as u64;
+
+#[derive(Clone, Copy)]
+struct TmpfsMountOptions {
+    total_blocks: u64,
+    total_inodes: u64,
+    mode: FileMode,
+    uid: Uid,
+    gid: Gid,
+}
+
+impl Default for TmpfsMountOptions {
+    fn default() -> Self {
+        Self {
+            total_blocks: TMPFS_VIRTUAL_BLOCKS,
+            total_inodes: TMPFS_VIRTUAL_INODES,
+            mode: FileMode::new(0o755),
+            uid: Uid::ROOT,
+            gid: Gid::ROOT,
+        }
+    }
+}
+
+fn parse_decimal(value: &str) -> VfsResult<u64> {
+    if value.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    let mut result = 0u64;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(VfsError::InvalidArgument);
+        }
+        result = result
+            .checked_mul(10)
+            .and_then(|value| value.checked_add((byte - b'0') as u64))
+            .ok_or(VfsError::FileTooLarge)?;
+    }
+    Ok(result)
+}
+
+fn parse_quantity(value: &str) -> VfsResult<u64> {
+    let value = value.trim();
+    let digit_end = value
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = parse_decimal(&value[..digit_end])?;
+    let suffix = &value[digit_end..];
+    let multiplier = match suffix {
+        "" | "b" | "B" => 1,
+        "k" | "K" | "kb" | "KB" => 1024,
+        "m" | "M" | "mb" | "MB" => 1024 * 1024,
+        "g" | "G" | "gb" | "GB" => 1024 * 1024 * 1024,
+        "t" | "T" | "tb" | "TB" => 1024u64 * 1024 * 1024 * 1024,
+        "p" | "P" | "pb" | "PB" => 1024u64 * 1024 * 1024 * 1024 * 1024,
+        _ => return Err(VfsError::InvalidArgument),
+    };
+    number.checked_mul(multiplier).ok_or(VfsError::FileTooLarge)
+}
+
+fn parse_octal(value: &str) -> VfsResult<u16> {
+    if value.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    let mut result = 0u16;
+    for byte in value.bytes() {
+        if !(b'0'..=b'7').contains(&byte) {
+            return Err(VfsError::InvalidArgument);
+        }
+        result = result
+            .checked_mul(8)
+            .and_then(|value| value.checked_add((byte - b'0') as u16))
+            .ok_or(VfsError::InvalidArgument)?;
+    }
+    Ok(result)
+}
+
+fn parse_mount_options(data: &str) -> VfsResult<TmpfsMountOptions> {
+    let mut options = TmpfsMountOptions::default();
+    for item in data.split(',').filter(|item| !item.is_empty()) {
+        let (key, value) = item.split_once('=').unwrap_or((item, ""));
+        match key {
+            "size" => {
+                let bytes = parse_quantity(value)?;
+                options.total_blocks = bytes
+                    .checked_add(TMPFS_PAGE_SIZE_U64 - 1)
+                    .ok_or(VfsError::FileTooLarge)?
+                    / TMPFS_PAGE_SIZE_U64;
+            }
+            "nr_blocks" => options.total_blocks = parse_quantity(value)?,
+            "nr_inodes" => options.total_inodes = parse_quantity(value)?,
+            "mode" => options.mode = FileMode::new(parse_octal(value)?),
+            "uid" => {
+                options.uid = Uid(parse_decimal(value)?
+                    .try_into()
+                    .map_err(|_| VfsError::InvalidArgument)?)
+            }
+            "gid" => {
+                options.gid = Gid(parse_decimal(value)?
+                    .try_into()
+                    .map_err(|_| VfsError::InvalidArgument)?)
+            }
+            // 这些选项影响 Linux 的其他 tmpfs 后端；当前内存后端没有对应
+            // 的策略状态，但接受它们可以保持通用挂载工具的参数兼容性。
+            "huge" | "mpol" | "noswap" | "inode32" | "inode64" => {}
+            _ => return Err(VfsError::InvalidArgument),
+        }
+    }
+    if options.total_inodes == 0 {
+        return Err(VfsError::InvalidArgument);
+    }
+    Ok(options)
+}
 
 // ── Tmpfs 驱动 ────────────────────────────────────────────────────────────────
 
@@ -43,13 +157,17 @@ impl FsDriver for TmpfsDriver {
         FsDriverFlags::NODEV
     }
 
-    fn mount(&self, _source: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
+    fn mount(&self, _source: Option<&str>, data: &str) -> VfsResult<Arc<Superblock>> {
+        let options = parse_mount_options(data)?;
         let fs_id = FsId::new(TMPFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
         let sb = Superblock::new(|weak_sb| {
             let sb_ops = Box::new(TmpfsSuperblockOps {
                 next_ino: AtomicU64::new(2),
-                total_inodes: AtomicU64::new(1),
+                total_blocks: options.total_blocks,
+                used_blocks: AtomicU64::new(0),
+                total_inodes: options.total_inodes,
+                used_inodes: AtomicU64::new(1),
             });
 
             // 创建根目录 inode
@@ -57,9 +175,9 @@ impl FsDriver for TmpfsDriver {
             let root_meta = InodeMeta {
                 size: 0,
                 nlink: 2,
-                mode: FileMode::new(0o755),
-                uid: Uid::ROOT,
-                gid: Gid::ROOT,
+                mode: options.mode,
+                uid: options.uid,
+                gid: options.gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -117,14 +235,56 @@ impl FsDriver for TmpfsDriver {
 
 struct TmpfsSuperblockOps {
     next_ino: AtomicU64,
-    total_inodes: AtomicU64,
+    total_blocks: u64,
+    used_blocks: AtomicU64,
+    total_inodes: u64,
+    used_inodes: AtomicU64,
 }
 
 impl TmpfsSuperblockOps {
-    fn alloc_ino(&self) -> u64 {
-        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-        self.total_inodes.fetch_add(1, Ordering::Relaxed);
-        ino
+    fn try_reserve(counter: &AtomicU64, limit: u64, amount: u64) -> VfsResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(amount) else {
+                return Err(VfsError::NoSpace);
+            };
+            if next > limit {
+                return Err(VfsError::NoSpace);
+            }
+            match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release(counter: &AtomicU64, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        let previous = counter.fetch_sub(amount, Ordering::AcqRel);
+        debug_assert!(previous >= amount, "tmpfs resource counter underflow");
+    }
+
+    fn alloc_ino(&self) -> VfsResult<u64> {
+        Self::try_reserve(&self.used_inodes, self.total_inodes, 1)?;
+        Ok(self.next_ino.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn release_inode(&self) {
+        Self::release(&self.used_inodes, 1);
+    }
+
+    fn reserve_blocks(&self, blocks: u64) -> VfsResult<()> {
+        Self::try_reserve(&self.used_blocks, self.total_blocks, blocks)
+    }
+
+    fn release_blocks(&self, blocks: u64) {
+        Self::release(&self.used_blocks, blocks);
     }
 }
 
@@ -138,16 +298,17 @@ impl SuperblockOps for TmpfsSuperblockOps {
     }
 
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
-        let used_inodes = self.total_inodes.load(Ordering::Relaxed);
-        let total_inodes = TMPFS_VIRTUAL_INODES.max(used_inodes);
-        let free_inodes = total_inodes.saturating_sub(used_inodes);
+        let used_blocks = self.used_blocks.load(Ordering::Acquire);
+        let used_inodes = self.used_inodes.load(Ordering::Acquire);
+        let free_blocks = self.total_blocks.saturating_sub(used_blocks);
+        let free_inodes = self.total_inodes.saturating_sub(used_inodes);
         Ok(FsStat {
             fs_type: 0x01021994,
             block_size: sb.block_size as u64,
-            total_blocks: TMPFS_VIRTUAL_BLOCKS,
-            free_blocks: TMPFS_VIRTUAL_BLOCKS,
-            avail_blocks: TMPFS_VIRTUAL_BLOCKS,
-            total_inodes,
+            total_blocks: self.total_blocks,
+            free_blocks,
+            avail_blocks: free_blocks,
+            total_inodes: self.total_inodes,
             free_inodes,
             fs_id: sb.fs_id.raw(),
             name_max: sb.name_max,
@@ -177,9 +338,6 @@ enum TmpfsInodeData {
     Special,
 }
 
-const TMPFS_PAGE_SIZE: usize = 4096;
-const TMPFS_PAGE_SIZE_U64: u64 = TMPFS_PAGE_SIZE as u64;
-
 struct TmpfsPage {
     index: u64,
     data: Vec<u8>,
@@ -202,7 +360,8 @@ impl TmpfsFileData {
         (self.pages.len() as u64 * TMPFS_PAGE_SIZE_U64).div_ceil(512)
     }
 
-    fn truncate(&mut self, new_size: u64) {
+    fn truncate(&mut self, new_size: u64) -> u64 {
+        let old_pages = self.pages.len();
         if new_size < self.size {
             let keep_pages = new_size.div_ceil(TMPFS_PAGE_SIZE_U64);
             self.pages.retain(|page| page.index < keep_pages);
@@ -215,6 +374,7 @@ impl TmpfsFileData {
             }
         }
         self.size = new_size;
+        (old_pages - self.pages.len()) as u64
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> usize {
@@ -244,7 +404,56 @@ impl TmpfsFileData {
         n
     }
 
-    fn write_at(&mut self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+    fn seek_data(&self, offset: u64) -> VfsResult<u64> {
+        if offset >= self.size {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        }
+        let page_index = offset / TMPFS_PAGE_SIZE_U64;
+        let pos = self.lower_bound(page_index);
+        let Some(page) = self.pages.get(pos) else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        if page.index == page_index {
+            return Ok(offset);
+        }
+        let candidate = page.index * TMPFS_PAGE_SIZE_U64;
+        if candidate < self.size {
+            Ok(candidate)
+        } else {
+            Err(VfsError::NoSuchDeviceOrAddress)
+        }
+    }
+
+    fn seek_hole(&self, offset: u64) -> VfsResult<u64> {
+        if offset >= self.size {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        }
+        let page_index = offset / TMPFS_PAGE_SIZE_U64;
+        let pos = self.lower_bound(page_index);
+        if self
+            .pages
+            .get(pos)
+            .is_none_or(|page| page.index != page_index)
+        {
+            return Ok(offset);
+        }
+
+        let mut expected = page_index + 1;
+        for page in &self.pages[pos + 1..] {
+            if page.index != expected {
+                break;
+            }
+            expected += 1;
+        }
+        Ok((expected * TMPFS_PAGE_SIZE_U64).min(self.size))
+    }
+
+    fn write_at(
+        &mut self,
+        buf: &[u8],
+        offset: u64,
+        accounting: &TmpfsSuperblockOps,
+    ) -> VfsResult<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -261,7 +470,7 @@ impl TmpfsFileData {
             let page_index = file_off / TMPFS_PAGE_SIZE_U64;
             let page_offset = (file_off % TMPFS_PAGE_SIZE_U64) as usize;
             let chunk = (TMPFS_PAGE_SIZE - page_offset).min(buf.len() - written);
-            let page = match self.get_or_create_page(page_index) {
+            let page = match self.get_or_create_page(page_index, accounting) {
                 Ok(page) => page,
                 Err(_) if written != 0 => {
                     self.size = self.size.max(offset + written as u64);
@@ -277,29 +486,111 @@ impl TmpfsFileData {
         Ok(written)
     }
 
-    fn reserve(&mut self, offset: u64, len: u64) -> VfsResult<()> {
+    fn reserve(
+        &mut self,
+        offset: u64,
+        len: u64,
+        accounting: &TmpfsSuperblockOps,
+    ) -> VfsResult<u64> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
         if end > usize::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         }
-        self.size = self.size.max(end);
-        Ok(())
+        let first_page = offset / TMPFS_PAGE_SIZE_U64;
+        let end_page = end.div_ceil(TMPFS_PAGE_SIZE_U64);
+        let first_pos = self.lower_bound(first_page);
+        let end_pos = self.lower_bound(end_page);
+        let requested = end_page.saturating_sub(first_page);
+        let existing = (end_pos - first_pos) as u64;
+        let missing = requested.saturating_sub(existing);
+        if missing == 0 {
+            return Ok(0);
+        }
+        let missing_usize: usize = missing.try_into().map_err(|_| VfsError::NoSpace)?;
+
+        accounting.reserve_blocks(missing)?;
+        if self.pages.try_reserve(missing_usize).is_err() {
+            accounting.release_blocks(missing);
+            return Err(VfsError::OutOfMemory);
+        }
+
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(missing_usize).is_err() {
+            accounting.release_blocks(missing);
+            return Err(VfsError::OutOfMemory);
+        }
+        for index in first_page..end_page {
+            if self.page_pos(index).is_ok() {
+                continue;
+            }
+            let mut data = Vec::new();
+            if data.try_reserve_exact(TMPFS_PAGE_SIZE).is_err() {
+                accounting.release_blocks(missing);
+                return Err(VfsError::OutOfMemory);
+            }
+            data.resize(TMPFS_PAGE_SIZE, 0);
+            pending.push(TmpfsPage { index, data });
+        }
+        debug_assert_eq!(pending.len(), missing_usize);
+        for page in pending {
+            let pos = self.lower_bound(page.index);
+            self.pages.insert(pos, page);
+        }
+        Ok(missing)
+    }
+
+    fn punch_hole(&mut self, offset: u64, len: u64) -> VfsResult<u64> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+        let old_pages = self.pages.len();
+        self.pages.retain_mut(|page| {
+            let page_start = page.index * TMPFS_PAGE_SIZE_U64;
+            let page_end = page_start + TMPFS_PAGE_SIZE_U64;
+            let zero_start = offset.max(page_start);
+            let zero_end = end.min(page_end);
+            if zero_start >= zero_end {
+                return true;
+            }
+            if zero_start == page_start && zero_end == page_end {
+                return false;
+            }
+            let start = (zero_start - page_start) as usize;
+            let end = (zero_end - page_start) as usize;
+            page.data[start..end].fill(0);
+            true
+        });
+        Ok((old_pages - self.pages.len()) as u64)
     }
 
     fn page_pos(&self, index: u64) -> Result<usize, usize> {
         self.pages.binary_search_by_key(&index, |page| page.index)
     }
 
-    fn get_or_create_page(&mut self, index: u64) -> VfsResult<&mut [u8]> {
+    fn lower_bound(&self, index: u64) -> usize {
+        match self.page_pos(index) {
+            Ok(pos) | Err(pos) => pos,
+        }
+    }
+
+    fn get_or_create_page(
+        &mut self,
+        index: u64,
+        accounting: &TmpfsSuperblockOps,
+    ) -> VfsResult<&mut [u8]> {
         match self.page_pos(index) {
             Ok(pos) => Ok(self.pages[pos].data.as_mut_slice()),
             Err(pos) => {
                 self.pages
                     .try_reserve(1)
                     .map_err(|_| VfsError::OutOfMemory)?;
+                accounting.reserve_blocks(1)?;
                 let mut data = Vec::new();
-                data.try_reserve_exact(TMPFS_PAGE_SIZE)
-                    .map_err(|_| VfsError::OutOfMemory)?;
+                if data.try_reserve_exact(TMPFS_PAGE_SIZE).is_err() {
+                    accounting.release_blocks(1);
+                    return Err(VfsError::OutOfMemory);
+                }
                 data.resize(TMPFS_PAGE_SIZE, 0);
                 self.pages.insert(pos, TmpfsPage { index, data });
                 Ok(self.pages[pos].data.as_mut_slice())
@@ -310,7 +601,7 @@ impl TmpfsFileData {
 
 fn tmpfs_blocks_for_len(len: u64) -> u64 {
     // stat.st_blocks 的单位固定为 512 字节，不等同于 tmpfs 的页大小。
-    len.saturating_add(511) / 512
+    len.div_ceil(TMPFS_PAGE_SIZE_U64) * (TMPFS_PAGE_SIZE_U64 / 512)
 }
 
 fn ensure_empty_tmpfs_dir(inode: &Inode) -> VfsResult<()> {
@@ -439,7 +730,7 @@ impl InodeOps for TmpfsInodeOps {
             return Err(VfsError::AlreadyExists);
         }
 
-        let ino = sb_ops.alloc_ino();
+        let ino = sb_ops.alloc_ino()?;
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
@@ -505,7 +796,7 @@ impl InodeOps for TmpfsInodeOps {
             return Err(VfsError::AlreadyExists);
         }
 
-        let ino = sb_ops.alloc_ino();
+        let ino = sb_ops.alloc_ino()?;
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
@@ -635,7 +926,12 @@ impl InodeOps for TmpfsInodeOps {
             return Err(VfsError::AlreadyExists);
         }
 
-        let ino = sb_ops.alloc_ino();
+        let ino = sb_ops.alloc_ino()?;
+        let target_pages = (target.len() as u64).div_ceil(TMPFS_PAGE_SIZE_U64);
+        if let Err(error) = sb_ops.reserve_blocks(target_pages) {
+            sb_ops.release_inode();
+            return Err(error);
+        }
         let now = Timespec::now();
         let meta = InodeMeta {
             size: target.len() as u64,
@@ -703,7 +999,7 @@ impl InodeOps for TmpfsInodeOps {
             return Err(VfsError::AlreadyExists);
         }
 
-        let ino = sb_ops.alloc_ino();
+        let ino = sb_ops.alloc_ino()?;
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
@@ -928,13 +1224,21 @@ impl InodeOps for TmpfsInodeOps {
             return Err(VfsError::FileTooLarge);
         }
 
+        let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .ops
+            .as_any()
+            .downcast_ref::<TmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+
         let mut data = self.data.lock();
         let file_data = match &mut *data {
             TmpfsInodeData::File(data) => data,
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        file_data.truncate(new_size);
+        let released = file_data.truncate(new_size);
+        sb_ops.release_blocks(released);
         inode.set_size_and_blocks(new_size, file_data.blocks());
         inode.touch_mtime();
         inode.touch_ctime();
@@ -971,8 +1275,29 @@ impl InodeOps for TmpfsInodeOps {
         }))
     }
 
-    fn evict(&self, _inode: &Inode) {
-        // tmpfs 数据随 InodeOps 一起释放
+    fn evict(&self, inode: &Inode) {
+        let Some(sb) = inode.superblock() else {
+            return;
+        };
+        let Some(sb_ops) = sb.ops.as_any().downcast_ref::<TmpfsSuperblockOps>() else {
+            return;
+        };
+        let released = {
+            let mut data = self.data.lock();
+            match &mut *data {
+                TmpfsInodeData::File(file) => {
+                    let pages = file.pages.len() as u64;
+                    file.pages.clear();
+                    pages
+                }
+                TmpfsInodeData::Symlink(target) => {
+                    (target.len() as u64).div_ceil(TMPFS_PAGE_SIZE_U64)
+                }
+                _ => 0,
+            }
+        };
+        sb_ops.release_blocks(released);
+        sb_ops.release_inode();
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -993,6 +1318,8 @@ unsafe impl Sync for TmpfsFileOps {}
 
 impl FileOps for TmpfsFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        // Safety: `inode_ops` 指向由 `inode` 持有的同一个 InodeOps，`inode` 字段
+        // 保证该对象在整个 FileOps 生命周期内保持存活。
         let ops = unsafe { &*self.inode_ops };
         let data = ops.data.lock();
         let file_data = match &*data {
@@ -1008,7 +1335,14 @@ impl FileOps for TmpfsFileOps {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        // Safety: `inode_ops` 的生命周期由同一 inode 的 Arc 保证，见 `read_at`。
         let ops = unsafe { &*self.inode_ops };
+        let sb_ops = self
+            .sb
+            .ops
+            .as_any()
+            .downcast_ref::<TmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
         let mut data = ops.data.lock();
         let file_data = match &mut *data {
             TmpfsInodeData::File(data) => data,
@@ -1023,7 +1357,7 @@ impl FileOps for TmpfsFileOps {
             offset
         };
 
-        let n = file_data.write_at(buf, start)?;
+        let n = file_data.write_at(buf, start, sb_ops)?;
         self.inode
             .set_size_and_blocks(file_data.size, file_data.blocks());
         if n != 0 {
@@ -1033,25 +1367,77 @@ impl FileOps for TmpfsFileOps {
         Ok(n)
     }
 
-    fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+    fn seek_data(&self, offset: u64, _file_size: u64) -> VfsResult<u64> {
+        // Safety: `inode_ops` 的生命周期由 `inode` 字段中的强引用保证。
+        let ops = unsafe { &*self.inode_ops };
+        let data = ops.data.lock();
+        match &*data {
+            TmpfsInodeData::File(file) => file.seek_data(offset),
+            _ => Err(VfsError::InvalidArgument),
+        }
+    }
+
+    fn seek_hole(&self, offset: u64, _file_size: u64) -> VfsResult<u64> {
+        // Safety: `inode_ops` 的生命周期由 `inode` 字段中的强引用保证。
+        let ops = unsafe { &*self.inode_ops };
+        let data = ops.data.lock();
+        match &*data {
+            TmpfsInodeData::File(file) => file.seek_hole(offset),
+            _ => Err(VfsError::InvalidArgument),
+        }
+    }
+
+    fn fallocate(&self, mode: FallocateMode, offset: u64, len: u64) -> VfsResult<()> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
         if end > usize::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         }
 
+        // Safety: `inode_ops` 的生命周期由 `inode` 字段中的强引用保证。
         let ops = unsafe { &*self.inode_ops };
+        let sb_ops = self
+            .sb
+            .ops
+            .as_any()
+            .downcast_ref::<TmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
         let mut data = ops.data.lock();
         let file_data = match &mut *data {
             TmpfsInodeData::File(data) => data,
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        if end > file_data.size {
-            file_data.reserve(offset, len)?;
-            let size = file_data.size;
-            self.inode.set_size_and_blocks(size, file_data.blocks());
-            self.inode.touch_mtime();
-            self.inode.touch_ctime();
+        match mode.bits() {
+            0 => {
+                let old_size = file_data.size;
+                file_data.reserve(offset, len, sb_ops)?;
+                if end > old_size {
+                    file_data.size = end;
+                }
+                self.inode
+                    .set_size_and_blocks(file_data.size, file_data.blocks());
+                self.inode.touch_mtime();
+                self.inode.touch_ctime();
+            }
+            bits if bits == FallocateMode::KEEP_SIZE.bits() => {
+                file_data.reserve(offset, len, sb_ops)?;
+                self.inode
+                    .set_size_and_blocks(file_data.size, file_data.blocks());
+                self.inode.touch_ctime();
+            }
+            bits if bits
+                == FallocateMode::PUNCH_HOLE
+                    .with(FallocateMode::KEEP_SIZE)
+                    .bits() =>
+            {
+                let released = file_data.punch_hole(offset, len)?;
+                sb_ops.release_blocks(released);
+                self.inode
+                    .set_size_and_blocks(file_data.size, file_data.blocks());
+                self.inode.touch_mtime();
+                self.inode.touch_ctime();
+            }
+            _ => return Err(VfsError::NotSupported),
         }
         Ok(())
     }
@@ -1061,6 +1447,7 @@ impl FileOps for TmpfsFileOps {
         pos: u64,
         sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
     ) -> VfsResult<u64> {
+        // Safety: `inode_ops` 的生命周期由 `inode` 字段中的强引用保证。
         let ops = unsafe { &*self.inode_ops };
         let data = ops.data.lock();
         let entries = match &*data {

@@ -576,7 +576,7 @@ impl VmSpace {
                 paddr: base.checked_add(page_delta).ok_or(Errno::EINVAL)?,
                 word_offset,
             }),
-            VmBacking::Anon => Ok(VmFutexKey::Private {
+            VmBacking::Anon { .. } => Ok(VmFutexKey::Private {
                 vm: self as *const Self as usize,
                 page,
                 offset: word_offset,
@@ -595,7 +595,7 @@ impl VmSpace {
                 offset: 0,
             }
         } else {
-            VmBacking::Anon
+            VmBacking::anonymous()
         };
         let area = VmArea {
             range,
@@ -637,7 +637,7 @@ impl VmSpace {
                 offset: 0,
             }
         } else {
-            VmBacking::Anon
+            VmBacking::anonymous()
         };
         let area = VmArea {
             range: range.clone(),
@@ -655,9 +655,9 @@ impl VmSpace {
             removed_areas
         };
         Self::notify_file_unmapped(&removed_areas);
-        let removed = self.remove_page_mappings(range.clone());
-        for (va, _mapping) in &removed {
-            let _ = self.unmap_page(*va);
+        let removed = self.unmap_page_mappings(range.clone())?;
+        if !removed.is_empty() {
+            self.invalidate_user_range(range.start, range.end - range.start);
         }
         drop(removed);
         drop(removed_areas);
@@ -692,9 +692,9 @@ impl VmSpace {
         };
         Self::notify_file_unmapped(&removed_areas);
         mapped_file.on_mapped();
-        let removed = self.remove_page_mappings(range.clone());
-        for (va, _mapping) in &removed {
-            let _ = self.unmap_page(*va);
+        let removed = self.unmap_page_mappings(range.clone())?;
+        if !removed.is_empty() {
+            self.invalidate_user_range(range.start, range.end - range.start);
         }
         drop(removed);
         drop(removed_areas);
@@ -729,11 +729,14 @@ impl VmSpace {
             let off = va - range.start;
             let page = ResidentPage::new_direct(paddr + off);
             let access = access_for_new_page(area_flags, &page);
-            self.map_page(va, page.paddr(), pte_flags_for(area_flags, access))?;
+            self.map_page_no_flush(va, page.paddr(), pte_flags_for(area_flags, access))?;
             pages.insert(va, PageMapping { page, access });
             va += page_size;
         }
-        self.mapped_pages.store(pages.len(), Ordering::Release);
+        let mapped = pages.len();
+        drop(pages);
+        self.mapped_pages.store(mapped, Ordering::Release);
+        self.invalidate_user_range(range.start, range.end - range.start);
         Ok(())
     }
 
@@ -743,9 +746,9 @@ impl VmSpace {
         self.validate_range(&range)?;
         let removed_areas = self.vmas.lock().unmap_range(&range);
         Self::notify_file_unmapped(&removed_areas);
-        let removed = self.remove_page_mappings(range);
-        for (va, _mapping) in &removed {
-            self.unmap_page(*va)?;
+        let removed = self.unmap_page_mappings(range.clone())?;
+        if !removed.is_empty() {
+            self.invalidate_user_range(range.start, range.end - range.start);
         }
         drop(removed);
         drop(removed_areas);
@@ -857,9 +860,9 @@ impl VmSpace {
         drop(removed_target);
         prune_shared_anon_pages();
 
-        let removed_pages = self.remove_page_mappings(new_range.clone());
-        for (va, _mapping) in &removed_pages {
-            self.unmap_page(*va)?;
+        let removed_pages = self.unmap_page_mappings(new_range.clone())?;
+        if !removed_pages.is_empty() {
+            self.invalidate_user_range(new_range.start, new_range.end - new_range.start);
         }
         drop(removed_pages);
         self.move_page_mappings(old_range.start, new_range.start, old_len)?;
@@ -871,29 +874,37 @@ impl VmSpace {
     #[kernel_symbols::export(name = "general.mm.VmSpace.mprotect", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
-        let mut set = self.vmas.lock();
-        if !set.contains_range(&range) {
-            return Err(Errno::ENOMEM);
-        }
-        set.protect_range(&range, new_flags.with(VmFlags::USER));
+        let mut touched = false;
+        {
+            let mut set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+            set.protect_range(&range, new_flags.with(VmFlags::USER));
 
-        let mut pages = self.pages.lock();
-        // mprotect 会被动态链接器和 lmbench mmap/munmap 小测频繁调用。
-        // range 已按页对齐，直接逐页探测现有映射，避免先收集 key 到 Vec。
-        let page_size = page_size();
-        let mut va = range.start;
-        while va < range.end {
-            let Some(area) = set.find(va) else {
+            let mut pages = self.pages.lock();
+            // mprotect 会被动态链接器和 lmbench mmap/munmap 小测频繁调用。
+            // range 已按页对齐，直接逐页探测现有映射，避免先收集 key 到 Vec。
+            let page_size = page_size();
+            let mut va = range.start;
+            while va < range.end {
+                let Some(area) = set.find(va) else {
+                    va += page_size;
+                    continue;
+                };
+                let Some(mapping) = pages.get_mut(&va) else {
+                    va += page_size;
+                    continue;
+                };
+                let access = access_for_existing_page(area.flags, &mapping.page);
+                self.protect_page_no_flush(va, pte_flags_for(area.flags, access))?;
+                mapping.access = access;
+                touched = true;
                 va += page_size;
-                continue;
-            };
-            let Some(mapping) = pages.get_mut(&va) else {
-                va += page_size;
-                continue;
-            };
-            mapping.access = access_for_existing_page(area.flags, &mapping.page);
-            self.protect_page(va, pte_flags_for(area.flags, mapping.access))?;
-            va += page_size;
+            }
+        }
+        if touched {
+            self.invalidate_user_range(range.start, range.end - range.start);
         }
         Ok(())
     }
@@ -932,10 +943,11 @@ impl VmSpace {
     /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
     pub fn discard_resident_range(&self, range: Range<usize>) -> Result<(), Errno> {
         self.contains_user_range(range.clone())?;
-        let removed = self.remove_page_mappings(range);
-        for (va, _mapping) in &removed {
-            self.unmap_page(*va)?;
+        let removed = self.unmap_page_mappings(range.clone())?;
+        if !removed.is_empty() {
+            self.invalidate_user_range(range.start, range.end - range.start);
         }
+        drop(removed);
         Ok(())
     }
 
@@ -1008,7 +1020,7 @@ impl VmSpace {
     pub fn fork(&self) -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let new_pgd = (ops.new_pgd_for_user)();
-        let cloned_set = self.vmas.lock().deep_clone_metadata();
+        let cloned_set = self.vmas.lock().fork_clone_metadata();
         let cloned_file_backings = Self::collect_file_backings(cloned_set.iter());
         let mut child_pages = BTreeMap::new();
         let mut child_maps = Vec::new();
@@ -1089,8 +1101,13 @@ impl VmSpace {
             else {
                 return FaultOutcome::Segv;
             };
+            let backing = set
+                .find(page)
+                .expect("[mm] grow_down_to 成功后必须覆盖目标页")
+                .backing
+                .clone();
             drop(set);
-            return self.commit_fault_page(page, VmBacking::Anon, flags, page, kind);
+            return self.commit_fault_page(page, backing, flags, page, kind);
         };
         if !permits(area.flags, kind) {
             return FaultOutcome::Segv;
@@ -1100,11 +1117,8 @@ impl VmSpace {
         let area_start = area.range.start;
         drop(set);
 
-        {
-            let mut pages = self.pages.lock();
-            if let Some(mapping) = pages.get_mut(&page) {
-                return self.handle_resident_fault(page, flags, kind, mapping);
-            }
+        if let Some(outcome) = self.handle_resident_fault(page, flags, kind) {
+            return outcome;
         }
 
         self.commit_fault_page(page, backing, flags, area_start, kind)
@@ -1198,11 +1212,14 @@ impl VmSpace {
             }
             let page = ResidentPage::new_anon(paddr);
             let access = access_for_new_page(area_flags, &page);
-            self.map_page(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
+            self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
             pages.insert(page_va, PageMapping { page, access });
             page_va += page_size;
         }
-        self.mapped_pages.store(pages.len(), Ordering::Release);
+        let mapped = pages.len();
+        drop(pages);
+        self.mapped_pages.store(mapped, Ordering::Release);
+        self.invalidate_user_range(start, end - start);
         Ok(())
     }
 
@@ -1274,11 +1291,14 @@ impl VmSpace {
 
             let page = ResidentPage::new_anon(paddr);
             let access = access_for_new_page(area_flags, &page);
-            self.map_page(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
+            self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
             pages.insert(page_va, PageMapping { page, access });
             page_va += page_size;
         }
-        self.mapped_pages.store(pages.len(), Ordering::Release);
+        let mapped = pages.len();
+        drop(pages);
+        self.mapped_pages.store(mapped, Ordering::Release);
+        self.invalidate_user_range(start, end - start);
         Ok(())
     }
 
@@ -1332,7 +1352,7 @@ impl VmSpace {
         kind: FaultKind,
     ) -> FaultOutcome {
         let page = match backing {
-            VmBacking::Anon => alloc_zeroed_user_page()
+            VmBacking::Anon { .. } => alloc_zeroed_user_page()
                 .map(ResidentPage::new_anon)
                 .ok_or(Errno::ENOMEM),
             VmBacking::SharedAnon { object, offset } => {
@@ -1370,13 +1390,21 @@ impl VmSpace {
 
         let mut pages = self.pages.lock();
         if let Some(mapping) = pages.get_mut(&page_va) {
-            return self.handle_resident_fault(page_va, flags, kind, mapping);
+            let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
+            drop(pages);
+            return self.finish_resident_fault(page_va, update);
         }
-        if let Err(err) = self.map_page(page_va, page.paddr(), pte_flags_for(flags, access)) {
+        if let Err(err) =
+            self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
+        {
+            drop(pages);
             return fault_from_errno(err);
         }
         pages.insert(page_va, PageMapping { page, access });
-        self.mapped_pages.store(pages.len(), Ordering::Release);
+        let mapped = pages.len();
+        drop(pages);
+        self.mapped_pages.store(mapped, Ordering::Release);
+        self.invalidate_user_range(page_va, page_size());
         FaultOutcome::Fixed
     }
 
@@ -1385,75 +1413,81 @@ impl VmSpace {
         page_va: usize,
         flags: VmFlags,
         kind: FaultKind,
-        mapping: &mut PageMapping,
+    ) -> Option<FaultOutcome> {
+        let mut pages = self.pages.lock();
+        let mapping = pages.get_mut(&page_va)?;
+        let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
+        drop(pages);
+        Some(self.finish_resident_fault(page_va, update))
+    }
+
+    fn finish_resident_fault(
+        &self,
+        page_va: usize,
+        update: (FaultOutcome, bool, Option<Arc<ResidentPage>>),
     ) -> FaultOutcome {
+        let (outcome, invalidate, retired) = update;
+        if invalidate {
+            self.invalidate_user_range(page_va, page_size());
+        }
+        // COW 的旧页必须活到所有 CPU 都完成 TLB 失效之后，避免远端仍通过旧
+        // TLB 访问已回收的物理页。
+        drop(retired);
+        outcome
+    }
+
+    fn handle_resident_fault_locked(
+        &self,
+        page_va: usize,
+        flags: VmFlags,
+        kind: FaultKind,
+        mapping: &mut PageMapping,
+    ) -> (FaultOutcome, bool, Option<Arc<ResidentPage>>) {
         if matches!(kind, FaultKind::Privilege) {
-            return match self.protect_page(page_va, pte_flags_for(flags, mapping.access)) {
-                Ok(()) => FaultOutcome::Fixed,
-                Err(err) => fault_from_errno(err),
+            return match self.protect_page_no_flush(page_va, pte_flags_for(flags, mapping.access)) {
+                Ok(()) => (FaultOutcome::Fixed, true, None),
+                Err(err) => (fault_from_errno(err), false, None),
             };
         }
         if !is_write_fault(kind) {
-            return FaultOutcome::Fixed;
+            return (FaultOutcome::Fixed, false, None);
         }
         match mapping.access {
-            PageAccess::Writable => FaultOutcome::Fixed,
+            PageAccess::Writable => (FaultOutcome::Fixed, false, None),
             PageAccess::SharedTracked => {
-                mapping.page.mark_dirty();
-                mapping.access = PageAccess::Writable;
-                match self.protect_page(page_va, pte_flags_for(flags, mapping.access)) {
-                    Ok(()) => FaultOutcome::Fixed,
-                    Err(err) => fault_from_errno(err),
+                let access = PageAccess::Writable;
+                if let Err(err) = self.protect_page_no_flush(page_va, pte_flags_for(flags, access))
+                {
+                    return (fault_from_errno(err), false, None);
                 }
+                mapping.page.mark_dirty();
+                mapping.access = access;
+                (FaultOutcome::Fixed, true, None)
             }
             PageAccess::Cow => {
                 let new_page = match clone_page_to_anon(&mapping.page) {
                     Ok(page) => page,
-                    Err(err) => return fault_from_errno(err),
+                    Err(err) => return (fault_from_errno(err), false, None),
                 };
-                if let Err(err) = self.replace_page(
+                if let Err(err) = self.replace_page_no_flush(
                     page_va,
                     new_page.paddr(),
                     pte_flags_for(flags, PageAccess::Writable),
                 ) {
-                    return fault_from_errno(err);
+                    return (fault_from_errno(err), false, None);
                 }
-                mapping.page = new_page;
+                let old_page = core::mem::replace(&mut mapping.page, new_page);
                 mapping.access = PageAccess::Writable;
-                FaultOutcome::Fixed
+                (FaultOutcome::Fixed, true, Some(old_page))
             }
-            PageAccess::ReadOnly => FaultOutcome::Segv,
+            PageAccess::ReadOnly => (FaultOutcome::Segv, false, None),
         }
     }
 
-    fn map_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
+    fn map_page_no_flush(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        let page_size = page_size();
         unsafe {
             (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
-            (ops.invalidate_range)(self.pgd, vaddr, page_size);
-        }
-        Ok(())
-    }
-
-    fn unmap_page(&self, vaddr: usize) -> Result<(), Errno> {
-        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        let page_size = page_size();
-        unsafe {
-            (ops.unmap)(self.pgd, vaddr, page_size);
-            (ops.invalidate_range)(self.pgd, vaddr, page_size);
-        }
-        Ok(())
-    }
-
-    fn protect_page(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
-        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        let page_size = page_size();
-        unsafe {
-            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
-            // mprotect 会在 pthread 创建路径把预留栈从 PROT_NONE 改为 RW。
-            // 权限位修改后必须刷掉旧 TLB，否则用户态可能继续命中旧的不可访问权限。
-            (ops.invalidate_range)(self.pgd, vaddr, page_size);
         }
         Ok(())
     }
@@ -1480,29 +1514,36 @@ impl VmSpace {
         }
     }
 
-    fn replace_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
+    fn replace_page_no_flush(
+        &self,
+        vaddr: usize,
+        paddr: usize,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let page_size = page_size();
         unsafe {
             (ops.unmap)(self.pgd, vaddr, page_size);
-            (ops.invalidate_range)(self.pgd, vaddr, page_size);
             (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
-            (ops.invalidate_range)(self.pgd, vaddr, page_size);
         }
         Ok(())
     }
 
-    fn remove_page_mappings(&self, range: Range<usize>) -> Vec<(usize, PageMapping)> {
+    fn unmap_page_mappings(&self, range: Range<usize>) -> Result<Vec<(usize, PageMapping)>, Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let mut pages = self.pages.lock();
         let keys: Vec<usize> = pages.range(range).map(|(k, _)| *k).collect();
         let mut removed = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(mapping) = pages.remove(&key) {
+                unsafe { (ops.unmap)(self.pgd, key, page_size()) };
                 removed.push((key, mapping));
             }
         }
-        self.mapped_pages.store(pages.len(), Ordering::Release);
-        removed
+        let mapped = pages.len();
+        drop(pages);
+        self.mapped_pages.store(mapped, Ordering::Release);
+        Ok(removed)
     }
 
     fn move_page_mappings(
@@ -1511,22 +1552,39 @@ impl VmSpace {
         new_start: usize,
         len: usize,
     ) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let old_range = old_start..old_start + len;
-        let moved = self.remove_page_mappings(old_range);
         let set = self.vmas.lock();
         let mut pages = self.pages.lock();
-        for (old_va, mapping) in moved {
-            self.unmap_page(old_va)?;
+        let keys: Vec<usize> = pages.range(old_range.clone()).map(|(va, _)| *va).collect();
+        let mut moves = Vec::with_capacity(keys.len());
+        for old_va in &keys {
             let new_va = new_start + (old_va - old_start);
             let area = set.find(new_va).ok_or(Errno::ENOMEM)?;
-            self.map_page(
+            let mapping = pages.get(old_va).ok_or(Errno::ENOMEM)?;
+            moves.push((
+                *old_va,
                 new_va,
                 mapping.page.paddr(),
                 pte_flags_for(area.flags, mapping.access),
-            )?;
+            ));
+        }
+        for (old_va, new_va, paddr, flags) in moves {
+            let mapping = pages.remove(&old_va).ok_or(Errno::ENOMEM)?;
+            unsafe {
+                (ops.unmap)(self.pgd, old_va, page_size());
+                (ops.map)(self.pgd, new_va, paddr, flags.with(VmFlags::USER));
+            }
             pages.insert(new_va, mapping);
         }
-        self.mapped_pages.store(pages.len(), Ordering::Release);
+        let mapped = pages.len();
+        drop(pages);
+        drop(set);
+        self.mapped_pages.store(mapped, Ordering::Release);
+        if !keys.is_empty() {
+            self.invalidate_user_range(old_start, len);
+            self.invalidate_user_range(new_start, len);
+        }
         Ok(())
     }
 

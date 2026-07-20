@@ -6,6 +6,16 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
+# 本内核不使用 Linux Kconfig 描述能力。跳过配置预筛选，让测试通过实际
+# syscall、procfs 和设备行为判断支持状态，避免在进入测试逻辑前误报 TBROK。
+KCONFIG_SKIP_CHECK=1
+export KCONFIG_SKIP_CHECK
+
+# 测试始终运行在 QEMU 中。initramfs 不携带 systemd-detect-virt，若不使用
+# LTP 提供的覆盖入口，时钟类用例会错误采用物理机的 5 ms 调度抖动阈值。
+LTP_VIRT_OVERRIDE=qemu
+export LTP_VIRT_OVERRIDE
+
 LTP_MOUNT=/mnt
 LTPROOT="$LTP_MOUNT/glibc/ltp"
 GLIBC_LIB="$LTP_MOUNT/glibc/lib"
@@ -82,13 +92,19 @@ lookup_skip() {
 prepare_dynamic_linker() {
     [ -d "$GLIBC_LIB" ] || return 1
 
-    mkdir -p /lib
+    mkdir -p /lib /usr/lib /usr/lib64
     if [ ! -e /lib64 ]; then
         ln -s "$GLIBC_LIB" /lib64 2>/dev/null || true
     fi
-    for loader in "$GLIBC_LIB"/ld-*.so*; do
-        [ -f "$loader" ] || continue
-        ln -sf "$loader" "/lib/${loader##*/}" 2>/dev/null || true
+    for library in "$GLIBC_LIB"/*.so* "$GLIBC_LIB"/ld-*.so*; do
+        [ -e "$library" ] || continue
+        name="${library##*/}"
+        ln -sf "$library" "/lib/$name" 2>/dev/null || true
+        if [ -d /lib64 ] && [ ! -L /lib64 ]; then
+            ln -sf "$library" "/lib64/$name" 2>/dev/null || true
+        fi
+        ln -sf "$library" "/usr/lib/$name" 2>/dev/null || true
+        ln -sf "$library" "/usr/lib64/$name" 2>/dev/null || true
     done
 
     LD_LIBRARY_PATH="$GLIBC_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

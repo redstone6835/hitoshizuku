@@ -4,10 +4,9 @@
 //! 路径先改内存副本,调用 [`inode_wr::write_raw`] 落盘,最后同步到 VFS
 //! [`vfs::inode::Inode`] 的镜像字段(`size`/`nlink`/...)。
 //!
-//! 写路径统一的"降级策略":一旦要改写扩展了 extent 的文件,先走
-//! [`extent_wr::demote_if_extent`] 把它转成"空间接布局",之后所有扩容/截断
-//! 都走 [`map_wr`]。读路径不受影响 —— 读到的 extent 文件保持原样,直到
-//! 第一次写入才改动。
+//! 写路径统一的"降级策略":改写 extent 文件时必须保留仍在文件尺寸内的
+//! 数据映射，再转换成间接块布局；只有截断到零时才允许释放整棵 extent 树。
+//! 转换完成后的扩容和部分截断统一走 [`map_wr`]。
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -244,14 +243,21 @@ pub struct ExtInodeOps {
     /// superblock cache 中摘掉，因此打开文件不能再依赖 `sb.find_inode()` 找回
     /// 状态，否则会破坏 Linux 的 unlink-but-open 语义。
     pub(crate) raw: Arc<Spinlock<RawInode>>,
+    /// 命名 FIFO 的运行时数据通道。
+    ///
+    /// ext 磁盘格式只保存 FIFO inode 类型，缓冲区和打开端点属于内存态；同一
+    /// inode 的所有打开文件共享此对象，最后一个 inode 引用释放后自动销毁。
+    fifo: Option<Arc<vfs::pipe::Pipe>>,
 }
 
 impl ExtInodeOps {
     pub(crate) fn new(state: Arc<FsState>, ino: u32, bytes: Vec<u8>) -> Self {
+        let kind = file_type_from_mode(parse_inode_meta(&bytes).mode);
         Self {
             state,
             ino,
             raw: Arc::new(Spinlock::new(RawInode::new(ino, bytes))),
+            fifo: (kind == FileType::Fifo).then(vfs::pipe::new_fifo),
         }
     }
 
@@ -1008,13 +1014,22 @@ impl InodeOps for ExtInodeOps {
         if new_size < cur_size {
             let mut ib = copy_i_block(raw.i_block());
             let mut flags = raw.flags();
-            // extent 文件先降级成间接布局再做精确释放
-            extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
 
             if new_size == 0 {
-                map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
+                if flags & EXT4_EXTENTS_FL != 0 {
+                    extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib)
+                        .map_err(map_err)?;
+                } else {
+                    map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
+                }
                 raw.set_blocks_lo(0);
             } else {
+                // 部分截断必须保留前缀数据，禁止使用会释放整棵 extent 树的降级路径。
+                if !extent_wr::demote_preserve_if_extent(&self.state, &mut flags, &mut ib)
+                    .map_err(map_err)?
+                {
+                    return Err(VfsError::NotSupported);
+                }
                 // 从第一个超出 new_size 的逻辑块开始全部释放
                 let first_free_lb = ((new_size + block_size - 1) / block_size) as u32;
                 map_wr::free_blocks_from(&self.state, &mut ib, first_free_lb).map_err(map_err)?;
@@ -1133,6 +1148,10 @@ impl InodeOps for ExtInodeOps {
                 self.ino,
                 Arc::clone(&self.raw),
             ))),
+            FileType::Fifo => vfs::pipe::open_fifo(
+                Arc::clone(self.fifo.as_ref().ok_or(VfsError::InvalidArgument)?),
+                opts,
+            ),
             _ => Err(VfsError::NotSupported),
         }
     }

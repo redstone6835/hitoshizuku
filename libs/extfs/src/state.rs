@@ -654,6 +654,17 @@ impl FsState {
         self.sb_free_inodes
             .load(core::sync::atomic::Ordering::Acquire)
     }
+
+    fn statfs_counts(&self) -> (u64, u64, u64) {
+        let free_blocks = self.ext_sb_free_blocks().min(self.ext_sb.blocks_count);
+        let reserved_blocks = self
+            .ext_sb
+            .reserved_blocks_count
+            .min(self.ext_sb.blocks_count);
+        let avail_blocks = free_blocks.saturating_sub(reserved_blocks);
+        let free_inodes = u64::from(self.ext_sb_free_inodes()).min(self.ext_sb.inodes_count as u64);
+        (free_blocks, avail_blocks, free_inodes)
+    }
     #[inline]
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
@@ -1245,14 +1256,15 @@ impl SuperblockOps for ExtFsSuperblockOps {
     }
     fn statfs(&self, sb: &Arc<VfsSuperblock>) -> VfsResult<FsStat> {
         let s = &self.state.ext_sb;
+        let (free_blocks, avail_blocks, free_inodes) = self.state.statfs_counts();
         Ok(FsStat {
-            fs_type: 0xef53_0000,
+            fs_type: 0xef53,
             block_size: s.block_size as u64,
             total_blocks: s.blocks_count,
-            free_blocks: 0,
-            avail_blocks: 0,
+            free_blocks,
+            avail_blocks,
             total_inodes: s.inodes_count as u64,
-            free_inodes: s.free_inodes_count as u64,
+            free_inodes,
             fs_id: sb.fs_id.raw(),
             name_max: 255,
         })
@@ -1520,6 +1532,7 @@ mod tests {
             metadata_csum: false,
             csum_seed: 0,
             free_blocks_count: free_blocks,
+            reserved_blocks_count: 4,
             free_inodes_count: 16,
             orphan_file_inum: 0,
             groups_count: 1,
@@ -1584,6 +1597,17 @@ mod tests {
         let writes = backend.writes();
         assert!(writes.contains(&(2, 2)));
         assert!(!writes.contains(&(8, 2)));
+    }
+
+    #[test]
+    fn statfs_counts_follow_runtime_allocations_and_reserved_blocks() {
+        let backend = Arc::new(CountingBackend::new(128, 512));
+        let state = alloc_test_state(backend);
+
+        assert_eq!(state.statfs_counts(), (60, 56, 16));
+        state.adjust_sb_free_blocks(-7).expect("扣减空闲块");
+        state.adjust_sb_free_inodes(-3).expect("扣减空闲 inode");
+        assert_eq!(state.statfs_counts(), (53, 49, 13));
     }
 
     #[test]

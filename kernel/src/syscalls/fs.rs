@@ -16,7 +16,7 @@ use sched::{Capability, SigProcMaskHow, SigSet};
 use vfs::cred::{Gid, Uid};
 use vfs::error::VfsError;
 use vfs::fdtable::{Fd, FdFlags};
-use vfs::file::{AccessMode, IoctlCmd, OpenOptions, PollEvents, SeekFrom};
+use vfs::file::{AccessMode, FallocateMode, IoctlCmd, OpenOptions, PollEvents, SeekFrom};
 use vfs::mount::MountFlags;
 use vfs::operation;
 use vfs::path::{Dirfd, LookupFlags};
@@ -59,6 +59,9 @@ const O_NOATIME: usize = 0o01000000;
 const O_CLOEXEC: usize = 0o02000000;
 const O_PATH: usize = 0o10000000;
 const O_SYNC: usize = 0o4010000;
+
+const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
 
 const MS_RDONLY: usize = 1 << 0;
 const MS_NOSUID: usize = 1 << 1;
@@ -260,6 +263,18 @@ pub(super) fn sys_lseek(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         1 => SeekFrom::Current(offset),
         2 => SeekFrom::End(offset),
+        3 => {
+            if offset < 0 {
+                return Err(Errno::EINVAL);
+            }
+            SeekFrom::Data(offset as u64)
+        }
+        4 => {
+            if offset < 0 {
+                return Err(Errno::EINVAL);
+            }
+            SeekFrom::Hole(offset as u64)
+        }
         _ => return Err(Errno::EINVAL),
     };
     file.seek(from)
@@ -379,7 +394,10 @@ pub(super) fn sys_getcwd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     copy_to_user(user, path.as_bytes()).map_err(|e| e.as_errno())?;
     copy_to_user(user + path.len(), &[0]).map_err(|e| e.as_errno())?;
-    Ok(user)
+    // Linux getcwd(2) syscall 返回包含结尾 NUL 的字节数，而 libc 的 getcwd()
+    // 再把它转换为用户缓冲区指针。返回地址会让 glibc 误判结果并进入基于
+    // 文件描述符的兼容回退路径。
+    Ok(needed)
 }
 
 pub(super) fn sys_dup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -734,12 +752,15 @@ pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 }
 
 pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let flags = ctx.args[4];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let (uid, gid) = decode_optional_owner(ctx.args[2] as u32, ctx.args[3] as u32);
-    let flags = ctx.args[4];
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
     operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -868,7 +889,7 @@ pub(super) fn sys_fsync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_fdatasync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let file = file_for_fd(fd)?;
-    file.sync().map_err(|e| e.to_errno())?;
+    file.datasync().map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -877,6 +898,18 @@ pub(super) fn sys_getdents64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let dirent = ctx.args[1];
     let count = ctx.args[2];
     let file = file_for_fd(fd)?;
+    if !file.flags().readable() {
+        return Err(Errno::EBADF);
+    }
+    if file.inode().kind() != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    if file.inode().nlink() == 0 {
+        return Err(Errno::ENOENT);
+    }
+    if count < 24 {
+        return Err(Errno::EINVAL);
+    }
 
     let mut buf_pos = 0usize;
     let mut copy_error = None;
@@ -1311,17 +1344,22 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
 
 pub(super) fn sys_fallocate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
-    let mode = ctx.args[1];
+    let raw_mode = ctx.args[1];
     let offset = nonnegative_i64_arg(ctx.args[2])?;
     let len = nonnegative_i64_arg(ctx.args[3])?;
-    if mode != 0 {
+    if raw_mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
+    if raw_mode & FALLOC_FL_PUNCH_HOLE != 0 && raw_mode & FALLOC_FL_KEEP_SIZE == 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let mode = FallocateMode::from_bits(raw_mode as u32);
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EBADF);
     }
-    file.fallocate(offset, len).map_err(|e| e.to_errno())?;
+    file.fallocate(mode, offset, len)
+        .map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -4027,7 +4065,11 @@ fn read_socklen_user(user: usize) -> Result<usize, Errno> {
     }
     let mut raw = [0u8; 4];
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
-    Ok(u32::from_le_bytes(raw) as usize)
+    let len = i32::from_le_bytes(raw);
+    if len < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(len as usize)
 }
 
 fn write_socklen_user(user: usize, len: usize) -> Result<(), Errno> {

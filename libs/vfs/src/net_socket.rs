@@ -269,7 +269,10 @@ impl NetSocketFileOps {
 
     pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
         self.ensure_backend()?;
-        let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family())?;
+        let peer = normalize_connect_endpoint(crate::addr::parse_inet_sockaddr_for_socket(
+            sockaddr,
+            self.family(),
+        )?);
         let interface = self.options.lock().bind_interface;
         let options = self.bind_options();
         self.proxy
@@ -462,6 +465,19 @@ impl NetSocketFileOps {
             options: Mutex::new(options),
         }
     }
+}
+
+pub(crate) fn normalize_connect_endpoint(mut endpoint: net::Endpoint) -> net::Endpoint {
+    endpoint.addr = match endpoint.addr {
+        net::IpAddr::V4(address) if address == net::Ipv4Addr::UNSPECIFIED => {
+            net::IpAddr::V4(net::Ipv4Addr::LOCALHOST)
+        }
+        net::IpAddr::V6(address) if address == net::Ipv6Addr::UNSPECIFIED => {
+            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST)
+        }
+        address => address,
+    };
+    endpoint
 }
 
 pub(crate) fn validate_bind_permission(
