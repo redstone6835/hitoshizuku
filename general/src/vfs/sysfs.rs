@@ -2423,6 +2423,17 @@ struct SysDirFile {
 struct SysRegFileOps {
     kind: SysRegFile,
     snap: Arc<SysSnapshot>,
+    snapshot: Option<Box<[u8]>>,
+}
+
+fn read_bytes_at(buf: &mut [u8], offset: u64, bytes: &[u8]) -> VfsResult<usize> {
+    let off = offset as usize;
+    if off >= bytes.len() {
+        return Ok(0);
+    }
+    let n = core::cmp::min(buf.len(), bytes.len() - off);
+    buf[..n].copy_from_slice(&bytes[off..off + n]);
+    Ok(n)
 }
 
 fn feed_dir_entries(
@@ -2473,16 +2484,11 @@ impl FileOps for SysDirFile {
 
 impl FileOps for SysRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let s = render_reg_file(&self.snap, self.kind);
-        let bytes = s.as_bytes();
-        let total = bytes.len();
-        let off = offset as usize;
-        if off >= total {
-            return Ok(0);
+        if let Some(snapshot) = self.snapshot.as_deref() {
+            return read_bytes_at(buf, offset, snapshot);
         }
-        let n = core::cmp::min(buf.len(), total - off);
-        buf[..n].copy_from_slice(&bytes[off..off + n]);
-        Ok(n)
+        let s = render_reg_file(&self.snap, self.kind);
+        read_bytes_at(buf, offset, s.as_bytes())
     }
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
         #[cfg(feature = "performance-profile")]
@@ -2712,9 +2718,19 @@ impl InodeOps for SysRegInodeOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        // trace 是有界环，打开时固定窗口，避免 read_at 重渲染或读取期间窗口漂移。
+        #[cfg(feature = "performance-profile")]
+        let snapshot = if matches!(self.kind, SysRegFile::ProfileTrace) {
+            Some(render_profile_trace().into_bytes().into_boxed_slice())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "performance-profile"))]
+        let snapshot = None;
         Ok(Box::new(SysRegFileOps {
             kind: self.kind,
             snap: Arc::clone(&self.snap),
+            snapshot,
         }))
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
@@ -3943,4 +3959,29 @@ fn build_root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, snap: Arc<SysSnapsh
         ops,
         weak_sb.clone(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regular_file_reads_stable_open_snapshot() {
+        let file = SysRegFileOps {
+            kind: SysRegFile::Hostname,
+            snap: Arc::new(SysSnapshot::default()),
+            snapshot: Some(b"trace-snapshot\n".to_vec().into_boxed_slice()),
+        };
+        let mut first = [0u8; 6];
+        let first_len = file.read_at(&mut first, 0).unwrap();
+        assert_eq!(&first[..first_len], b"trace-");
+
+        let mut second = [0u8; 16];
+        let second_len = file.read_at(&mut second, first_len as u64).unwrap();
+        assert_eq!(&second[..second_len], b"snapshot\n");
+        assert_eq!(
+            file.read_at(&mut second, (first_len + second_len) as u64),
+            Ok(0)
+        );
+    }
 }
