@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use errno::Errno;
 use mm::{FileLike, VmArea, VmBacking, VmFlags, VmaSet};
@@ -1126,6 +1126,40 @@ impl VmSpace {
         let (_page, kva, len) = self.user_page_window(user, max_len, FaultKind::Load)?;
         let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, len) };
         Ok(f(slice))
+    }
+
+    /// 从已经常驻的用户页原子读取一个 futex word，不触发缺页或分配。
+    ///
+    /// 调用方应先在普通上下文中完成 fault-in。该接口只用于已经持有其它子系统
+    /// 自旋锁、不能再进入缺页路径的窄临界区；映射或权限已经变化时返回 EFAULT。
+    pub fn read_user_u32_nofault(&self, user: usize) -> Result<u32, Errno> {
+        if user % core::mem::align_of::<u32>() != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = user
+            .checked_add(core::mem::size_of::<u32>())
+            .ok_or(Errno::EFAULT)?;
+        let page_va = page_base(user);
+        if end > page_va.checked_add(page_size()).ok_or(Errno::EFAULT)? {
+            return Err(Errno::EFAULT);
+        }
+
+        // 同时持有 VMA 和 resident page 锁，确保权限检查与物理页选择来自同一份
+        // 映射快照。Arc 由 pages 表持有，因此原子读取期间物理页不会被回收。
+        let set = self.vmas.lock();
+        let area = set.find(user).ok_or(Errno::EFAULT)?;
+        if end > area.range.end || !area.flags.contains_all(VmFlags::USER | VmFlags::READ) {
+            return Err(Errno::EFAULT);
+        }
+        let pages = self.pages.lock();
+        let mapping = pages.get(&page_va).ok_or(Errno::EFAULT)?;
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let pointer = (virt_fn(mapping.page.paddr()) + (user - page_va)) as *const AtomicU32;
+        // Safety: futex 地址已经按 u32 对齐，四字节不会跨页；VMA/pages 锁保证当前
+        // resident mapping 不被替换，底层页由 mapping 的 Arc 保活。
+        Ok(unsafe { (*pointer).load(Ordering::Acquire) })
     }
 
     /// 取得写入用户地址的一页内连续窗口。
