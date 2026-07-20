@@ -12,11 +12,12 @@ use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 #[cfg(not(feature = "elm-integrated"))]
 use net::stack::PinnedNetStackEndpoint;
 use net::stack::{
-    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_CALL_STATUS_INVALID,
-    NET_STACK_CALL_STATUS_OK, NET_STACK_DROP_IPV4_CHECKSUM, NET_STACK_DROP_IPV6_EXTENSION_LIMIT,
-    NET_STACK_DROP_MALFORMED_ARP, NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6,
-    NET_STACK_DROP_MALFORMED_TCP, NET_STACK_DROP_MALFORMED_UDP, NET_STACK_DROP_NOT_LOCAL,
-    NET_STACK_DROP_TCP_CHECKSUM, NET_STACK_DROP_UDP_CHECKSUM,
+    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_CALL_STATUS_BUSY,
+    NET_STACK_CALL_STATUS_INVALID, NET_STACK_CALL_STATUS_OK, NET_STACK_DROP_IPV4_CHECKSUM,
+    NET_STACK_DROP_IPV6_EXTENSION_LIMIT, NET_STACK_DROP_MALFORMED_ARP,
+    NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_MALFORMED_TCP,
+    NET_STACK_DROP_MALFORMED_UDP, NET_STACK_DROP_NOT_LOCAL, NET_STACK_DROP_TCP_CHECKSUM,
+    NET_STACK_DROP_UDP_CHECKSUM,
     NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL, NET_STACK_ETHERNET_ACCEPTED,
     NET_STACK_ETHERNET_TRUNCATED, NET_STACK_ETHERNET_UNSUPPORTED,
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
@@ -1886,7 +1887,11 @@ fn net_stack_socket_call(frame: &mut net::stack::NetStackSocketCallV1) -> i32 {
             // Safety: 宿主将请求声明为本次 pinned call 的可写范围；指针只在
             // 同步调用期间使用，ELM 不保存它。
             let request = unsafe { &mut *request_pointer };
-            let mut table = SOCKET_TABLE.lock();
+            // socket 操作可能在宿主 control/lifecycle 队列回压时让出 CPU。此时同核
+            // 后续调用不能自旋等待，否则持锁任务无法恢复；由宿主退出 ELM 后重试。
+            let Some(mut table) = SOCKET_TABLE.try_lock() else {
+                return NET_STACK_CALL_STATUS_BUSY;
+            };
             let Some(table) = table.as_mut() else {
                 return NET_STACK_CALL_STATUS_INVALID;
             };

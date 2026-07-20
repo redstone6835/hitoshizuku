@@ -38,6 +38,7 @@ static STACK_REGISTRAR: Mutex<Option<&'static dyn NetStackRegistrar>> = Mutex::n
 pub const NET_STACK_CALL_ABI_VERSION: u16 = 1;
 pub const NET_STACK_CALL_RUST_ABI: &str = "fn(&mutnet::stack::NetStackCallV1)->i32";
 pub const NET_STACK_CALL_STATUS_OK: i32 = 0;
+pub const NET_STACK_CALL_STATUS_BUSY: i32 = -16;
 pub const NET_STACK_CALL_STATUS_INVALID: i32 = -22;
 
 pub const NET_STACK_OP_PROBE: u32 = 1;
