@@ -33,6 +33,7 @@ impl CloneFlags {
     pub const CLONE_NEWPID: u64 = 0x20000000;
     pub const CLONE_NEWNET: u64 = 0x40000000;
     pub const CLONE_IO: u64 = 0x80000000;
+    pub const CLONE_CLEAR_SIGHAND: u64 = 0x00000001_00000000;
 
     pub const fn from_raw(bits: u64) -> Self {
         Self(bits)

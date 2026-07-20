@@ -23,6 +23,14 @@ fn has_vm_flag() {
     assert!(f.has(CloneFlags::CLONE_VM));
 }
 
+/// CLONE_CLEAR_SIGHAND 位位于传统 32 位标志范围之外，解析时不得被截断。
+#[ktest]
+fn has_clear_sighand_flag() {
+    let f = CloneFlags::from_raw(CloneFlags::CLONE_CLEAR_SIGHAND);
+    assert!(f.has(CloneFlags::CLONE_CLEAR_SIGHAND));
+    assert_eq!(CloneFlags::CLONE_CLEAR_SIGHAND, 1u64 << 32);
+}
+
 /// fork 默认标志仅包含 SIGCHLD (17)，不含 CLONE_VM/CLONE_THREAD。
 #[ktest]
 fn fork_default_flags() {
