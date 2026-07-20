@@ -8,20 +8,21 @@ fi
 
 log=$1
 elf=${2:-}
-if [ -z "$elf" ]; then
-    run_dir=$(dirname "$(dirname "$log")")
-    case $(basename "$log") in
-        la-*) target=loongarch64-unknown-none ;;
-        rv-*) target=riscv64gc-unknown-none-elf ;;
-        *) target= ;;
-    esac
-    [ -z "$target" ] || elf="$run_dir/target/$target/release/kernel"
-fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 clean_log="$tmp/log"
 tr -d '\r' <"$log" >"$clean_log"
+
+for marker in \
+    '@@PROFILE_STATS_BEGIN phase=before ' \
+    '@@PROFILE_STATS_BEGIN phase=after '
+do
+    if ! grep -q "^$marker" "$clean_log"; then
+        echo "profile report: missing marker: $marker" >&2
+        exit 1
+    fi
+done
 
 echo "EVENTS"
 awk '
@@ -34,16 +35,16 @@ function value(name,    i, pair) {
 }
 function percentile(key, before, pct,    i, total, target, seen, count) {
     total = 0
-    for (i = 0; i < 32; i++) total += hist[key, i] - hist[before, i]
+    for (i = 0; i < 64; i++) total += hist[key, i] - hist[before, i]
     if (total <= 0) return 0
     target = int((total * pct + 99) / 100)
     seen = 0
-    for (i = 0; i < 32; i++) {
+    for (i = 0; i < 64; i++) {
         count = hist[key, i] - hist[before, i]
         seen += count
         if (seen >= target) return i == 0 ? 0 : 2 ^ (i - 1)
     }
-    return 2 ^ 30
+    return 2 ^ 62
 }
 /^@@PROFILE_STATS_BEGIN / {
     phase = value("phase")
@@ -62,13 +63,14 @@ active && /^cpu=/ && / event=/ {
     wall[key] += value("wall_ns")
     oncpu[key] += value("on_cpu_ns")
     offcpu[key] += value("off_cpu_ns")
+    migrations[key] += value("migrations")
     split(value("hist"), buckets, ",")
-    for (i = 1; i <= 32; i++) hist[key, i - 1] += buckets[i]
+    for (i = 1; i <= 64; i++) hist[key, i - 1] += buckets[i]
     observed[key] = 1
     next
 }
 END {
-    print "case\tevent\tcalls\tcycles\tbytes\tpackets\twall_ns\ton_cpu_ns\toff_cpu_ns\toff_cpu%\tp50_ns\tp95_ns\tp99_ns"
+    print "case\tevent\tcalls\tcycles\tbytes\tpackets\twall_ns\ton_cpu_ns\toff_cpu_ns\tmigrations\toff_cpu%\tp50_ns\tp95_ns\tp99_ns"
     for (key in observed) {
         split(key, parts, SUBSEP)
         if (parts[3] != "after") continue
@@ -80,10 +82,11 @@ END {
         dwall = wall[key] - wall[before]
         don = oncpu[key] - oncpu[before]
         doff = offcpu[key] - offcpu[before]
+        dmigrations = migrations[key] - migrations[before]
         offpct = dwall ? doff * 100 / dwall : 0
-        printf "%s\t%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.1f\t%.0f\t%.0f\t%.0f\n", \
+        printf "%s\t%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.1f\t%.0f\t%.0f\t%.0f\n", \
             parts[1], parts[2], dcalls, dcycles, dbytes, dpackets, \
-            dwall, don, doff, offpct, percentile(key, before, 50), \
+            dwall, don, doff, dmigrations, offpct, percentile(key, before, 50), \
             percentile(key, before, 95), percentile(key, before, 99)
     }
 }
@@ -105,16 +108,16 @@ function value(name,    i, pair) {
 }
 function percentile(key, before, pct,    i, total, target, seen, count) {
     total = 0
-    for (i = 0; i < 32; i++) total += hist[key, i] - hist[before, i]
+    for (i = 0; i < 64; i++) total += hist[key, i] - hist[before, i]
     if (total <= 0) return 0
     target = int((total * pct + 99) / 100)
     seen = 0
-    for (i = 0; i < 32; i++) {
+    for (i = 0; i < 64; i++) {
         count = hist[key, i] - hist[before, i]
         seen += count
         if (seen >= target) return i == 0 ? 0 : 2 ^ (i - 1)
     }
-    return 2 ^ 30
+    return 2 ^ 62
 }
 /^@@PROFILE_STATS_BEGIN / {
     phase = value("phase")
@@ -130,11 +133,11 @@ active && /^cpu=/ && / metric=/ {
     sum[key] += value("sum")
     if (value("max") > max[key]) max[key] = value("max")
     split(value("hist"), buckets, ",")
-    for (i = 1; i <= 32; i++) hist[key, i - 1] += buckets[i]
+    for (i = 1; i <= 64; i++) hist[key, i - 1] += buckets[i]
     observed[key] = 1
 }
 END {
-    print "case\tmetric\tobservations\tsum\tmean\tmax\tp50\tp95\tp99"
+    print "case\tmetric\tobservations\tsum\tmean\tmax\tmax_exact\tp50\tp95\tp99"
     for (key in observed) {
         split(key, parts, SUBSEP)
         if (parts[3] != "after") continue
@@ -142,8 +145,10 @@ END {
         count = observations[key] - observations[before]
         total = sum[key] - sum[before]
         mean = count ? total / count : 0
-        printf "%s\t%s\t%.0f\t%.0f\t%.2f\t%.0f\t%.0f\t%.0f\t%.0f\n", \
-            parts[1], parts[2], count, total, mean, max[key], \
+        max_exact = observations[before] == 0 ? 1 : 0
+        interval_max = max_exact ? max[key] : 0
+        printf "%s\t%s\t%.0f\t%.0f\t%.2f\t%.0f\t%d\t%.0f\t%.0f\t%.0f\n", \
+            parts[1], parts[2], count, total, mean, interval_max, max_exact, \
             percentile(key, before, 50), percentile(key, before, 95), \
             percentile(key, before, 99)
     }
@@ -165,18 +170,21 @@ function value(name,    i, pair) {
 /^@@PROFILE_SAMPLES_BEGIN / {
     phase = value("phase")
     case_id = value("case")
-    active = phase == "after"
+    active = 1
     next
 }
 /^@@PROFILE_SAMPLES_END / { active = 0; next }
 active && /^cpu=/ && / mode=/ {
-    key = case_id SUBSEP value("mode") SUBSEP value("pc")
+    key = case_id SUBSEP value("mode") SUBSEP value("pc") SUBSEP phase
     samples[key] += value("samples")
+    if (phase == "after") observed[key] = 1
 }
 END {
-    for (key in samples) {
+    for (key in observed) {
         split(key, parts, SUBSEP)
-        print parts[1] "\t" parts[2] "\t" parts[3] "\t" samples[key]
+        before = parts[1] SUBSEP parts[2] SUBSEP parts[3] SUBSEP "before"
+        delta = samples[key] - samples[before]
+        if (delta > 0) print parts[1] "\t" parts[2] "\t" parts[3] "\t" delta
     }
 }
 ' "$clean_log" >"$tmp/samples"

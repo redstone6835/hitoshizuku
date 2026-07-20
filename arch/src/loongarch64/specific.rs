@@ -348,11 +348,7 @@ pub const ARCH_ID_LOONGARCH64: usize = 2;
 pub const PER_CPU_KSTACK_OFFSET: usize = 0;
 
 /// 默认定时器中断频率（Hz）。可通过内核命令行 `timer_hz=N` 覆盖。
-#[cfg(not(feature = "performance-profile"))]
 pub const DEFAULT_TIMER_HZ: usize = 100;
-/// 剖析构建使用非整百频率，增加短测试样本量并降低周期性负载混叠。
-#[cfg(feature = "performance-profile")]
-pub const DEFAULT_TIMER_HZ: usize = 997;
 
 #[inline]
 /// 读取稳定计数器原始周期值。

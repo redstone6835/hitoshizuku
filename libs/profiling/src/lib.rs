@@ -1,12 +1,55 @@
 #![no_std]
 //! 固定内存、低侵入的内核性能剖析原语。
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+extern crate std;
+
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const MAX_CPUS: usize = 8;
-pub const HISTOGRAM_BUCKETS: usize = 32;
+pub const MIXED_CPU: usize = MAX_CPUS;
+pub const CPU_SLOTS: usize = MAX_CPUS + 1;
+pub const HISTOGRAM_BUCKETS: usize = 64;
 pub const SAMPLE_SLOTS: usize = 4096;
 const SAMPLE_PROBES: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum SessionState {
+    Idle = 0,
+    Running = 1,
+    Frozen = 2,
+}
+
+impl SessionState {
+    const fn from_raw(raw: usize) -> Self {
+        match raw {
+            1 => Self::Running,
+            2 => Self::Frozen,
+            _ => Self::Idle,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Frozen => "frozen",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub state: SessionState,
+    pub session_id: u64,
+    pub generation: u64,
+    pub active_writers: usize,
+    pub counter_hz: u64,
+    pub event_mask: u64,
+    pub sampling_enabled: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -35,10 +78,40 @@ pub enum Event {
     WaitYield,
     WaitOther,
     WakeupLatency,
+    SyscallDispatch,
+    VfsRead,
+    VfsWrite,
+    PageFault,
+    IrqDispatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventCategory {
+    Syscall,
+    Network,
+    Scheduler,
+    Wait,
+    Filesystem,
+    Memory,
+    Interrupt,
+}
+
+impl EventCategory {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Syscall => "syscall",
+            Self::Network => "network",
+            Self::Scheduler => "scheduler",
+            Self::Wait => "wait",
+            Self::Filesystem => "filesystem",
+            Self::Memory => "memory",
+            Self::Interrupt => "interrupt",
+        }
+    }
 }
 
 impl Event {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 29] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -63,6 +136,11 @@ impl Event {
         Self::WaitYield,
         Self::WaitOther,
         Self::WakeupLatency,
+        Self::SyscallDispatch,
+        Self::VfsRead,
+        Self::VfsWrite,
+        Self::PageFault,
+        Self::IrqDispatch,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -91,6 +169,43 @@ impl Event {
             Self::WaitYield => "wait_yield",
             Self::WaitOther => "wait_other",
             Self::WakeupLatency => "wakeup_latency",
+            Self::SyscallDispatch => "syscall_dispatch",
+            Self::VfsRead => "vfs_read",
+            Self::VfsWrite => "vfs_write",
+            Self::PageFault => "page_fault",
+            Self::IrqDispatch => "irq_dispatch",
+        }
+    }
+
+    pub const fn category(self) -> EventCategory {
+        match self {
+            Self::SysSendCopy
+            | Self::SysSendSocket
+            | Self::SysRecvSocket
+            | Self::SysRecvCopy
+            | Self::SyscallDispatch => EventCategory::Syscall,
+            Self::NetProtocolTurn
+            | Self::NetProtocolIngress
+            | Self::NetTcpOutput
+            | Self::NetEgressBackpressure
+            | Self::NetWorkerTurn
+            | Self::NetTxMaterialize
+            | Self::NetChecksum
+            | Self::NetVirtioSubmit
+            | Self::NetVirtioReclaim => EventCategory::Network,
+            Self::SchedYield | Self::SchedSwitch => EventCategory::Scheduler,
+            Self::WaitSocketRead
+            | Self::WaitSocketWrite
+            | Self::WaitPoll
+            | Self::WaitMutex
+            | Self::WaitFutex
+            | Self::WaitTimer
+            | Self::WaitYield
+            | Self::WaitOther
+            | Self::WakeupLatency => EventCategory::Wait,
+            Self::VfsRead | Self::VfsWrite => EventCategory::Filesystem,
+            Self::PageFault => EventCategory::Memory,
+            Self::IrqDispatch => EventCategory::Interrupt,
         }
     }
 }
@@ -142,6 +257,7 @@ impl Metric {
 
 const EVENT_COUNT: usize = Event::ALL.len();
 const METRIC_COUNT: usize = Metric::ALL.len();
+const ALL_EVENT_MASK: u64 = (1u64 << EVENT_COUNT) - 1;
 
 struct Histogram {
     buckets: [AtomicU64; HISTOGRAM_BUCKETS],
@@ -179,6 +295,7 @@ struct Counter {
     on_cpu_ns: AtomicU64,
     off_cpu_ns: AtomicU64,
     max_latency_ns: AtomicU64,
+    migrations: AtomicU64,
     latency: Histogram,
 }
 
@@ -194,6 +311,7 @@ impl Counter {
             on_cpu_ns: AtomicU64::new(0),
             off_cpu_ns: AtomicU64::new(0),
             max_latency_ns: AtomicU64::new(0),
+            migrations: AtomicU64::new(0),
             latency: Histogram::new(),
         }
     }
@@ -208,6 +326,7 @@ impl Counter {
         self.on_cpu_ns.store(0, Ordering::Relaxed);
         self.off_cpu_ns.store(0, Ordering::Relaxed);
         self.max_latency_ns.store(0, Ordering::Relaxed);
+        self.migrations.store(0, Ordering::Relaxed);
         self.latency.reset();
     }
 }
@@ -257,17 +376,21 @@ impl SampleSlot {
     }
 }
 
-static COUNTERS: [[Counter; EVENT_COUNT]; MAX_CPUS] =
-    [const { [const { Counter::new() }; EVENT_COUNT] }; MAX_CPUS];
-static METRICS: [[MetricCounter; METRIC_COUNT]; MAX_CPUS] =
-    [const { [const { MetricCounter::new() }; METRIC_COUNT] }; MAX_CPUS];
+static COUNTERS: [[Counter; EVENT_COUNT]; CPU_SLOTS] =
+    [const { [const { Counter::new() }; EVENT_COUNT] }; CPU_SLOTS];
+static METRICS: [[MetricCounter; METRIC_COUNT]; CPU_SLOTS] =
+    [const { [const { MetricCounter::new() }; METRIC_COUNT] }; CPU_SLOTS];
 static SAMPLES: [[SampleSlot; SAMPLE_SLOTS]; MAX_CPUS] =
     [const { [const { SampleSlot::new() }; SAMPLE_SLOTS] }; MAX_CPUS];
 static DROPPED_SAMPLES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
+static STATE: AtomicUsize = AtomicUsize::new(SessionState::Idle as usize);
+static SESSION_ID: AtomicU64 = AtomicU64::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_WRITERS: AtomicUsize = AtomicUsize::new(0);
 static COUNTER_HZ: AtomicU64 = AtomicU64::new(0);
+static EVENT_MASK: AtomicU64 = AtomicU64::new(ALL_EVENT_MASK);
+static SAMPLING_ENABLED: AtomicUsize = AtomicUsize::new(1);
 static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_CPU_NS: AtomicUsize = AtomicUsize::new(0);
@@ -284,12 +407,16 @@ pub fn install(
     COUNTER_HZ.store(counter_hz, Ordering::Release);
 }
 
-pub fn set_enabled(enabled: bool) {
-    ENABLED.store(enabled, Ordering::Release);
+pub fn state() -> SessionState {
+    SessionState::from_raw(STATE.load(Ordering::Acquire))
 }
 
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Acquire)
+    state() == SessionState::Running
+}
+
+pub fn session_id() -> u64 {
+    SESSION_ID.load(Ordering::Acquire)
 }
 
 pub fn generation() -> u64 {
@@ -300,22 +427,103 @@ pub fn counter_hz() -> u64 {
     COUNTER_HZ.load(Ordering::Acquire)
 }
 
-pub fn reset() {
-    let was_enabled = ENABLED.swap(false, Ordering::AcqRel);
-    for cpu in 0..MAX_CPUS {
+pub fn session_info() -> SessionInfo {
+    SessionInfo {
+        state: state(),
+        session_id: session_id(),
+        generation: generation(),
+        active_writers: ACTIVE_WRITERS.load(Ordering::Acquire),
+        counter_hz: counter_hz(),
+        event_mask: event_mask(),
+        sampling_enabled: sampling_enabled(),
+    }
+}
+
+pub fn event_mask() -> u64 {
+    EVENT_MASK.load(Ordering::Acquire)
+}
+
+pub fn set_event_mask(mask: u64) {
+    EVENT_MASK.store(mask & ALL_EVENT_MASK, Ordering::Release);
+}
+
+pub fn event_enabled(event: Event) -> bool {
+    event_mask() & (1u64 << event as usize) != 0
+}
+
+pub fn sampling_enabled() -> bool {
+    SAMPLING_ENABLED.load(Ordering::Acquire) != 0
+}
+
+pub fn set_sampling_enabled(enabled: bool) {
+    SAMPLING_ENABLED.store(usize::from(enabled), Ordering::Release);
+}
+
+fn freeze_internal(next_state: SessionState) {
+    STATE.store(next_state as usize, Ordering::Release);
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    while ACTIVE_WRITERS.load(Ordering::Acquire) != 0 {
+        spin_loop();
+    }
+}
+
+pub fn start() {
+    freeze_internal(SessionState::Frozen);
+    clear_samples_and_counters();
+    SESSION_ID.fetch_add(1, Ordering::AcqRel);
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    STATE.store(SessionState::Running as usize, Ordering::Release);
+}
+
+pub fn resume() {
+    if state() == SessionState::Idle {
+        start();
+        return;
+    }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    STATE.store(SessionState::Running as usize, Ordering::Release);
+}
+
+pub fn freeze() {
+    freeze_internal(SessionState::Frozen);
+}
+
+pub fn stop() {
+    freeze_internal(SessionState::Idle);
+}
+
+pub fn set_enabled(enabled: bool) {
+    if enabled {
+        resume();
+    } else {
+        freeze();
+    }
+}
+
+fn clear_samples_and_counters() {
+    for cpu in 0..CPU_SLOTS {
         for counter in &COUNTERS[cpu] {
             counter.reset();
         }
         for metric in &METRICS[cpu] {
             metric.reset();
         }
+    }
+    for cpu in 0..MAX_CPUS {
         for slot in &SAMPLES[cpu] {
             slot.reset();
         }
         DROPPED_SAMPLES[cpu].store(0, Ordering::Relaxed);
     }
+}
+
+pub fn reset() {
+    let previous = state();
+    freeze_internal(SessionState::Frozen);
+    clear_samples_and_counters();
+    SESSION_ID.fetch_add(1, Ordering::AcqRel);
     GENERATION.fetch_add(1, Ordering::AcqRel);
-    ENABLED.store(was_enabled, Ordering::Release);
+    STATE.store(previous as usize, Ordering::Release);
 }
 
 fn installed_fn(raw: &AtomicUsize) -> usize {
@@ -332,14 +540,19 @@ pub fn read_counter() -> u64 {
     read()
 }
 
-fn current_cpu() -> usize {
+pub fn current_cpu_slot() -> usize {
     let raw = installed_fn(&CURRENT_CPU);
     if raw == 0 {
         return 0;
     }
     // SAFETY: install 只接受相同签名的函数指针，安装后不会撤销。
     let current: fn() -> usize = unsafe { core::mem::transmute(raw) };
-    current().min(MAX_CPUS - 1)
+    let cpu = current();
+    if cpu < MAX_CPUS { cpu } else { MIXED_CPU }
+}
+
+fn current_cpu() -> usize {
+    current_cpu_slot()
 }
 
 fn current_task_cpu_ns() -> u64 {
@@ -360,6 +573,7 @@ pub struct Scope {
     packets: u64,
     active: bool,
     generation: u64,
+    start_cpu: usize,
 }
 
 impl Scope {
@@ -389,13 +603,21 @@ impl Drop for Scope {
         }
         let on_cpu_ns = current_task_cpu_ns().saturating_sub(self.start_on_cpu_ns);
         let cycles = read_counter().wrapping_sub(self.start_cycles);
-        record_scope(self.event, cycles, on_cpu_ns, self.bytes, self.packets);
+        record_scope(
+            self.event,
+            cycles,
+            on_cpu_ns,
+            self.bytes,
+            self.packets,
+            self.start_cpu,
+            self.generation,
+        );
     }
 }
 
 pub fn scope(event: Event) -> Scope {
     let generation = generation();
-    let active = enabled() && installed_fn(&READ_COUNTER) != 0;
+    let active = enabled() && event_enabled(event) && installed_fn(&READ_COUNTER) != 0;
     Scope {
         event,
         start_cycles: if active { read_counter() } else { 0 },
@@ -404,6 +626,7 @@ pub fn scope(event: Event) -> Scope {
         packets: 0,
         active,
         generation,
+        start_cpu: current_cpu(),
     }
 }
 
@@ -419,13 +642,52 @@ fn cycles_to_ns(cycles: u64) -> u64 {
         .saturating_add(remainder.saturating_mul(1_000_000_000) / hz)
 }
 
-fn record_scope(event: Event, cycles: u64, on_cpu_ns: u64, bytes: u64, packets: u64) {
-    if !enabled() {
+struct WriteGuard;
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        ACTIVE_WRITERS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn begin_write(expected_generation: Option<u64>) -> Option<WriteGuard> {
+    let observed_generation = generation();
+    if state() != SessionState::Running
+        || expected_generation.is_some_and(|expected| expected != observed_generation)
+    {
+        return None;
+    }
+    ACTIVE_WRITERS.fetch_add(1, Ordering::AcqRel);
+    if state() != SessionState::Running
+        || generation() != observed_generation
+        || expected_generation.is_some_and(|expected| expected != observed_generation)
+    {
+        ACTIVE_WRITERS.fetch_sub(1, Ordering::Release);
+        return None;
+    }
+    Some(WriteGuard)
+}
+
+fn record_scope(
+    event: Event,
+    cycles: u64,
+    on_cpu_ns: u64,
+    bytes: u64,
+    packets: u64,
+    start_cpu: usize,
+    scope_generation: u64,
+) {
+    if !event_enabled(event) {
         return;
     }
+    let Some(_guard) = begin_write(Some(scope_generation)) else {
+        return;
+    };
     let wall_ns = cycles_to_ns(cycles);
     let on_cpu_ns = on_cpu_ns.min(wall_ns);
-    let counter = &COUNTERS[current_cpu()][event as usize];
+    let cpu = current_cpu().min(MAX_CPUS - 1);
+    let cpu = if cpu == start_cpu { cpu } else { MIXED_CPU };
+    let counter = &COUNTERS[cpu][event as usize];
     counter.calls.fetch_add(1, Ordering::Relaxed);
     counter.cycles.fetch_add(cycles, Ordering::Relaxed);
     counter.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -436,15 +698,21 @@ fn record_scope(event: Event, cycles: u64, on_cpu_ns: u64, bytes: u64, packets: 
     counter
         .off_cpu_ns
         .fetch_add(wall_ns.saturating_sub(on_cpu_ns), Ordering::Relaxed);
+    if cpu == MIXED_CPU {
+        counter.migrations.fetch_add(1, Ordering::Relaxed);
+    }
     counter.max_latency_ns.fetch_max(wall_ns, Ordering::Relaxed);
     counter.latency.observe(wall_ns);
 }
 
 /// 记录已有调用点的 cycle 统计。该接口把时间视为纯 on-CPU。
 pub fn record(event: Event, cycles: u64, bytes: u64, packets: u64) {
-    if !enabled() {
+    if !event_enabled(event) {
         return;
     }
+    let Some(_guard) = begin_write(None) else {
+        return;
+    };
     let ns = cycles_to_ns(cycles);
     let counter = &COUNTERS[current_cpu()][event as usize];
     counter.calls.fetch_add(1, Ordering::Relaxed);
@@ -462,10 +730,18 @@ pub fn record(event: Event, cycles: u64, bytes: u64, packets: u64) {
 
 /// 记录阻塞或唤醒延迟，单位为纳秒。
 pub fn record_duration(event: Event, duration_ns: u64) {
-    if !enabled() {
+    record_duration_on_cpu(event, duration_ns, current_cpu());
+}
+
+pub fn record_duration_on_cpu(event: Event, duration_ns: u64, cpu: usize) {
+    if !event_enabled(event) {
         return;
     }
-    let counter = &COUNTERS[current_cpu()][event as usize];
+    let Some(_guard) = begin_write(None) else {
+        return;
+    };
+    let cpu = cpu.min(MIXED_CPU);
+    let counter = &COUNTERS[cpu][event as usize];
     counter.calls.fetch_add(1, Ordering::Relaxed);
     counter.wall_ns.fetch_add(duration_ns, Ordering::Relaxed);
     counter.off_cpu_ns.fetch_add(duration_ns, Ordering::Relaxed);
@@ -476,9 +752,9 @@ pub fn record_duration(event: Event, duration_ns: u64) {
 }
 
 pub fn observe(metric: Metric, value: u64) {
-    if !enabled() {
+    let Some(_guard) = begin_write(None) else {
         return;
-    }
+    };
     let counter = &METRICS[current_cpu()][metric as usize];
     counter.observations.fetch_add(1, Ordering::Relaxed);
     counter.sum.fetch_add(value, Ordering::Relaxed);
@@ -486,7 +762,7 @@ pub fn observe(metric: Metric, value: u64) {
     counter.values.observe(value);
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub calls: u64,
     pub cycles: u64,
@@ -497,11 +773,30 @@ pub struct Snapshot {
     pub on_cpu_ns: u64,
     pub off_cpu_ns: u64,
     pub max_latency_ns: u64,
+    pub migrations: u64,
     pub latency: [u64; HISTOGRAM_BUCKETS],
 }
 
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            cycles: 0,
+            bytes: 0,
+            packets: 0,
+            max_cycles: 0,
+            wall_ns: 0,
+            on_cpu_ns: 0,
+            off_cpu_ns: 0,
+            max_latency_ns: 0,
+            migrations: 0,
+            latency: [0; HISTOGRAM_BUCKETS],
+        }
+    }
+}
+
 pub fn snapshot(cpu: usize, event: Event) -> Snapshot {
-    if cpu >= MAX_CPUS {
+    if cpu >= CPU_SLOTS {
         return Snapshot::default();
     }
     let counter = &COUNTERS[cpu][event as usize];
@@ -515,11 +810,12 @@ pub fn snapshot(cpu: usize, event: Event) -> Snapshot {
         on_cpu_ns: counter.on_cpu_ns.load(Ordering::Relaxed),
         off_cpu_ns: counter.off_cpu_ns.load(Ordering::Relaxed),
         max_latency_ns: counter.max_latency_ns.load(Ordering::Relaxed),
+        migrations: counter.migrations.load(Ordering::Relaxed),
         latency: counter.latency.snapshot(),
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricSnapshot {
     pub observations: u64,
     pub sum: u64,
@@ -527,8 +823,19 @@ pub struct MetricSnapshot {
     pub values: [u64; HISTOGRAM_BUCKETS],
 }
 
+impl Default for MetricSnapshot {
+    fn default() -> Self {
+        Self {
+            observations: 0,
+            sum: 0,
+            max: 0,
+            values: [0; HISTOGRAM_BUCKETS],
+        }
+    }
+}
+
 pub fn metric_snapshot(cpu: usize, metric: Metric) -> MetricSnapshot {
-    if cpu >= MAX_CPUS {
+    if cpu >= CPU_SLOTS {
         return MetricSnapshot::default();
     }
     let counter = &METRICS[cpu][metric as usize];
@@ -570,10 +877,13 @@ pub fn histogram_percentile(histogram: &[u64; HISTOGRAM_BUCKETS], percentile: u6
 
 /// 在 timer IRQ 中记录被打断的 PC。函数只执行有界原子探测。
 pub fn sample_pc(pc: usize, from_user: bool) {
-    if !enabled() || pc == 0 {
+    if !sampling_enabled() || pc == 0 {
         return;
     }
-    let cpu = current_cpu();
+    let Some(_guard) = begin_write(None) else {
+        return;
+    };
+    let cpu = current_cpu().min(MAX_CPUS - 1);
     let key = (pc & !1usize) | usize::from(from_user);
     let mut slot_index = sample_hash(key) & (SAMPLE_SLOTS - 1);
     for _ in 0..SAMPLE_PROBES {
@@ -639,9 +949,11 @@ pub fn dropped_samples(cpu: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     static CLOCK: AtomicU64 = AtomicU64::new(10);
     static TASK_CPU_NS: AtomicU64 = AtomicU64::new(100);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn clock() -> u64 {
         CLOCK.fetch_add(7, Ordering::Relaxed)
@@ -657,6 +969,7 @@ mod tests {
 
     #[test]
     fn scope_records_wall_and_cpu_time() {
+        let _lock = TEST_LOCK.lock().unwrap();
         install(clock, cpu, task_cpu_ns, 1_000_000_000);
         reset();
         set_enabled(true);
@@ -674,16 +987,19 @@ mod tests {
         reset();
         drop(stale);
         assert_eq!(snapshot(1, Event::NetWorkerTurn).calls, 0);
+        stop();
     }
 
     #[test]
     fn histogram_and_sampler_are_bounded() {
+        let _lock = TEST_LOCK.lock().unwrap();
         install(clock, cpu, task_cpu_ns, 1_000_000_000);
         reset();
         set_enabled(true);
         observe(Metric::IngressRingDepth, 17);
         let metric = metric_snapshot(1, Metric::IngressRingDepth);
         assert_eq!(metric.observations, 1);
+        assert_eq!(metric.sum, 17);
         assert_eq!(histogram_percentile(&metric.values, 50), 16);
 
         sample_pc(0x8020_1234, false);
@@ -694,5 +1010,64 @@ mod tests {
             .unwrap();
         assert_eq!(found.samples, 2);
         assert!(!found.from_user);
+        freeze();
+        sample_pc(0x8020_5678, false);
+        assert!(
+            (0..SAMPLE_SLOTS)
+                .filter_map(|slot| sample_slot(1, slot))
+                .all(|sample| sample.pc != 0x8020_5678)
+        );
+        stop();
+    }
+
+    #[test]
+    fn reset_and_freeze_invalidate_old_scopes() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(clock, cpu, task_cpu_ns, 1_000_000_000);
+        start();
+        let stale = scope(Event::NetWorkerTurn);
+        freeze();
+        drop(stale);
+        assert_eq!(snapshot(0, Event::NetWorkerTurn).calls, 0);
+        assert_eq!(state(), SessionState::Frozen);
+        assert_eq!(session_info().active_writers, 0);
+        let previous_session = session_id();
+        start();
+        assert!(session_id() > previous_session);
+        stop();
+        assert_eq!(state(), SessionState::Idle);
+    }
+
+    #[test]
+    fn migrated_scope_is_accounted_in_mixed_cpu_slot() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        static CPU: AtomicUsize = AtomicUsize::new(0);
+        fn changing_cpu() -> usize {
+            CPU.load(Ordering::Relaxed)
+        }
+        install(clock, changing_cpu, task_cpu_ns, 1_000_000_000);
+        start();
+        CPU.store(0, Ordering::Relaxed);
+        let scope = scope(Event::NetProtocolTurn);
+        CPU.store(1, Ordering::Relaxed);
+        drop(scope);
+        assert_eq!(snapshot(MIXED_CPU, Event::NetProtocolTurn).migrations, 1);
+        stop();
+    }
+
+    #[test]
+    fn event_filter_and_long_latency_histogram_are_preserved() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(clock, cpu, task_cpu_ns, 1_000_000_000);
+        start();
+        set_event_mask(1u64 << Event::WaitTimer as usize);
+        record_duration(Event::WaitFutex, 5_000_000_000);
+        record_duration(Event::WaitTimer, 5_000_000_000);
+        assert_eq!(snapshot(1, Event::WaitFutex).calls, 0);
+        let timer = snapshot(1, Event::WaitTimer);
+        assert_eq!(timer.calls, 1);
+        assert_eq!(histogram_percentile(&timer.latency, 50), 1u64 << 32);
+        set_event_mask(ALL_EVENT_MASK);
+        stop();
     }
 }

@@ -60,6 +60,8 @@ pub enum KernelFaultReason {
 
 /// 由 arch trap handler 在 page-fault 分支调用。
 pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::PageFault);
     let Some(decoder) = fault_decode_ops() else {
         return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
     };
