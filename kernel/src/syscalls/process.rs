@@ -2454,7 +2454,6 @@ const FUTEX_WAIT_SLEEPING: u8 = 1;
 const FUTEX_WAIT_WOKEN: u8 = 2;
 
 static FUTEX_TABLE: Spinlock<BTreeMap<FutexKey, FutexBucket>> = Spinlock::new(BTreeMap::new());
-static FUTEX_USER_OP_LOCK: Spinlock<()> = Spinlock::new(());
 
 fn futex_cmd(futex_op: u32) -> u32 {
     futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
@@ -2564,6 +2563,27 @@ fn futex_remove_task_waiters(task: &Arc<Task>) -> usize {
     removed
 }
 
+fn futex_enqueue_waiter_if_equal(
+    vm: &VmSpace,
+    key: FutexKey,
+    uaddr: usize,
+    expected: u32,
+    waiter: FutexWaiter,
+) -> Result<(), Errno> {
+    let mut table = FUTEX_TABLE.lock();
+    if vm.read_user_u32_nofault(uaddr)? != expected {
+        return Err(Errno::EAGAIN);
+    }
+    table
+        .entry(key)
+        .or_insert(FutexBucket {
+            waiters: Vec::new(),
+        })
+        .waiters
+        .push(waiter);
+    Ok(())
+}
+
 fn futex_requeue_key(
     src: FutexKey,
     dst: FutexKey,
@@ -2589,9 +2609,7 @@ fn futex_cmp_requeue_key(
     bitset: u32,
 ) -> Result<usize, Errno> {
     // 先在表锁外触发可能需要的 lazy fault；自旋锁临界区内只允许 nofault 读取。
-    if read_user_u32(uaddr)? != expected {
-        return Err(Errno::EAGAIN);
-    }
+    vm.prefault_user_u32(uaddr, false)?;
     futex_cmp_requeue_after_prefault(
         vm,
         uaddr,
@@ -2673,6 +2691,23 @@ fn futex_requeue_locked(
 #[path = "../tests/futex.rs"]
 mod futex_tests;
 
+fn futex_atomic_update_user(
+    vm: &VmSpace,
+    uaddr: usize,
+    update: impl Fn(u32) -> Result<u32, Errno>,
+) -> Result<u32, Errno> {
+    vm.prefault_user_u32(uaddr, true)?;
+    let mut current = vm.read_user_u32_nofault(uaddr)?;
+    loop {
+        let new = update(current)?;
+        let observed = vm.compare_exchange_user_u32_nofault(uaddr, current, new)?;
+        if observed == current {
+            return Ok(current);
+        }
+        current = observed;
+    }
+}
+
 fn futex_wake_op(
     task: &Arc<Task>,
     uaddr: usize,
@@ -2684,13 +2719,8 @@ fn futex_wake_op(
 ) -> Result<usize, Errno> {
     let key1 = futex_key(task, uaddr, private)?;
     let key2 = futex_key(task, uaddr2, private)?;
-    let old = {
-        let _guard = FUTEX_USER_OP_LOCK.lock();
-        let old = read_user_u32(uaddr2)?;
-        let new = futex_apply_wake_op(old, encoded)?;
-        write_user_u32(uaddr2, new)?;
-        old
-    };
+    let vm = task_vm_space_for_futex(task)?;
+    let old = futex_atomic_update_user(&vm, uaddr2, |old| futex_apply_wake_op(old, encoded))?;
     let mut woken = futex_wake_key(key1, wake_count, FUTEX_BITSET_MATCH_ANY);
     if futex_wake_op_cmp(old, encoded)? {
         woken += futex_wake_key(key2, wake_count2, FUTEX_BITSET_MATCH_ANY);
@@ -2756,33 +2786,33 @@ fn futex_lock_pi(
         return Err(Errno::ESRCH);
     }
     let key = futex_key(task, uaddr, private)?;
+    let vm = task_vm_space_for_futex(task)?;
+    vm.prefault_user_u32(uaddr, true)?;
     loop {
-        let expected = {
-            let _guard = FUTEX_USER_OP_LOCK.lock();
-            let cur = read_user_u32(uaddr)?;
-            let owner = cur & FUTEX_TID_MASK;
-            if owner == 0 {
-                let new = (cur & FUTEX_OWNER_DIED) | tid;
-                write_user_u32(uaddr, new)?;
+        let cur = vm.read_user_u32_nofault(uaddr)?;
+        let owner = cur & FUTEX_TID_MASK;
+        if owner == 0 {
+            let new = (cur & FUTEX_OWNER_DIED) | tid;
+            if vm.compare_exchange_user_u32_nofault(uaddr, cur, new)? == cur {
                 return Ok(0);
             }
-            if owner == tid {
-                return Err(Errno::EDEADLK);
-            }
-            if try_only {
-                return Err(Errno::EAGAIN);
-            }
-            let waiting = cur | FUTEX_WAITERS;
-            if waiting != cur {
-                write_user_u32(uaddr, waiting)?;
-            }
-            waiting
-        };
+            continue;
+        }
+        if owner == tid {
+            return Err(Errno::EDEADLK);
+        }
+        if try_only {
+            return Err(Errno::EAGAIN);
+        }
+        let waiting = cur | FUTEX_WAITERS;
+        if waiting != cur && vm.compare_exchange_user_u32_nofault(uaddr, cur, waiting)? != cur {
+            continue;
+        }
         match futex_wait(
             task,
             key,
             uaddr,
-            expected,
+            waiting,
             FUTEX_BITSET_MATCH_ANY,
             deadline_ns,
         ) {
@@ -2798,15 +2828,17 @@ fn futex_unlock_pi(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<usiz
         return Err(Errno::ESRCH);
     }
     let key = futex_key(task, uaddr, private)?;
-    let had_waiters = {
-        let _guard = FUTEX_USER_OP_LOCK.lock();
-        let cur = read_user_u32(uaddr)?;
+    let vm = task_vm_space_for_futex(task)?;
+    vm.prefault_user_u32(uaddr, true)?;
+    let had_waiters = loop {
+        let cur = vm.read_user_u32_nofault(uaddr)?;
         if (cur & FUTEX_TID_MASK) != tid {
             return Err(Errno::EPERM);
         }
         let had_waiters = (cur & FUTEX_WAITERS) != 0;
-        write_user_u32(uaddr, 0)?;
-        had_waiters
+        if vm.compare_exchange_user_u32_nofault(uaddr, cur, 0)? == cur {
+            break had_waiters;
+        }
     };
     Ok(if had_waiters {
         futex_wake_key(key, 1, FUTEX_BITSET_MATCH_ANY)
@@ -2957,10 +2989,12 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         return Err(Errno::EINVAL);
     }
     let deadline = futex2_abs_deadline(timeout, clockid)?;
+    let vm = task_vm_space_for_futex(ctx.task())?;
     let mut entries = Vec::new();
     for index in 0..nr {
         let entry = read_futex_waitv_entry(waiters + index * FUTEX_WAITV_ENTRY_SIZE, index)?;
-        if read_user_u32(entry.uaddr)? != entry.expected {
+        vm.prefault_user_u32(entry.uaddr, false)?;
+        if vm.read_user_u32_nofault(entry.uaddr)? != entry.expected {
             return Err(Errno::EAGAIN);
         }
         entries.push(entry);
@@ -2970,23 +3004,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     {
         return Err(Errno::ETIMEDOUT);
     }
-    {
-        let mut table = FUTEX_TABLE.lock();
-        for entry in entries.iter() {
-            table
-                .entry(entry.key)
-                .or_insert(FutexBucket {
-                    waiters: Vec::new(),
-                })
-                .waiters
-                .push(FutexWaiter {
-                    task: Arc::downgrade(ctx.task()),
-                    bitset: FUTEX_BITSET_MATCH_ANY,
-                    waitv_index: Some(entry.index),
-                    state: Arc::clone(&entry.wait_state),
-                });
-        }
-    }
+    futex_waitv_enqueue_if_equal(&vm, &entries, ctx.task())?;
 
     loop {
         if sched::operation::has_interrupting_signal(ctx.task()) {
@@ -3507,28 +3525,29 @@ fn futex_wait(
 ) -> Result<usize, Errno> {
     let me = Arc::clone(task);
     let wait_state = Arc::new(FutexWaitState::new());
-    if read_user_u32(uaddr)? != expected {
-        return Err(Errno::EAGAIN);
-    }
+    let vm = task_vm_space_for_futex(task)?;
+    vm.prefault_user_u32(uaddr, false)?;
     if let Some(deadline) = deadline_ns {
         if !sched::register_sleep_deadline(task, deadline) {
             return Err(Errno::ETIMEDOUT);
         }
     }
-    {
-        let mut table = FUTEX_TABLE.lock();
-        table
-            .entry(key)
-            .or_insert(FutexBucket {
-                waiters: Vec::new(),
-            })
-            .waiters
-            .push(FutexWaiter {
-                task: Arc::downgrade(&me),
-                bitset,
-                waitv_index: None,
-                state: Arc::clone(&wait_state),
-            });
+    if let Err(err) = futex_enqueue_waiter_if_equal(
+        &vm,
+        key,
+        uaddr,
+        expected,
+        FutexWaiter {
+            task: Arc::downgrade(&me),
+            bitset,
+            waitv_index: None,
+            state: Arc::clone(&wait_state),
+        },
+    ) {
+        if deadline_ns.is_some() {
+            sched::cancel_sleep_deadline(task);
+        }
+        return Err(err);
     }
     loop {
         if let Some(deadline) = deadline_ns {
@@ -3547,7 +3566,10 @@ fn futex_wait(
             }
             return Err(Errno::EINTR);
         }
-        if read_user_u32(uaddr).map_or(true, |cur| cur != expected) {
+        if vm
+            .read_user_u32_nofault(uaddr)
+            .map_or(true, |cur| cur != expected)
+        {
             futex_remove_waiter(key, &me);
             restore_current_task_after_sleep(task);
             if deadline_ns.is_some() {
@@ -3604,6 +3626,34 @@ struct FutexWaitvEntry {
     expected: u32,
     key: FutexKey,
     wait_state: Arc<FutexWaitState>,
+}
+
+fn futex_waitv_enqueue_if_equal(
+    vm: &VmSpace,
+    entries: &[FutexWaitvEntry],
+    task: &Arc<Task>,
+) -> Result<(), Errno> {
+    let mut table = FUTEX_TABLE.lock();
+    for entry in entries {
+        if vm.read_user_u32_nofault(entry.uaddr)? != entry.expected {
+            return Err(Errno::EAGAIN);
+        }
+    }
+    for entry in entries {
+        table
+            .entry(entry.key)
+            .or_insert(FutexBucket {
+                waiters: Vec::new(),
+            })
+            .waiters
+            .push(FutexWaiter {
+                task: Arc::downgrade(task),
+                bitset: FUTEX_BITSET_MATCH_ANY,
+                waitv_index: Some(entry.index),
+                state: Arc::clone(&entry.wait_state),
+            });
+    }
+    Ok(())
 }
 
 const FUTEX2_SIZE_U32: u32 = 0x02;

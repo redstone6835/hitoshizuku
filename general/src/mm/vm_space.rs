@@ -1128,11 +1128,49 @@ impl VmSpace {
         Ok(f(slice))
     }
 
-    /// 从已经常驻的用户页原子读取一个 futex word，不触发缺页或分配。
+    /// 为用户态原子 u32 访问预先解析 lazy fault 和可选的 COW。
+    ///
+    /// 该操作可能分配和修改页表，只能在获取 futex 等子系统自旋锁之前调用。
+    pub fn prefault_user_u32(&self, user: usize, write: bool) -> Result<(), Errno> {
+        self.user_u32_location(user)?;
+        let kind = if write {
+            FaultKind::Store
+        } else {
+            FaultKind::Load
+        };
+        match self.handle_fault(user, kind) {
+            FaultOutcome::Fixed => self.with_user_atomic_u32(user, write, |_| ((), false)),
+            FaultOutcome::Segv | FaultOutcome::Kernel(_) => Err(Errno::EFAULT),
+        }
+    }
+
+    /// 从已经常驻的用户页原子读取一个 u32，不触发缺页或分配。
     ///
     /// 调用方应先在普通上下文中完成 fault-in。该接口只用于已经持有其它子系统
     /// 自旋锁、不能再进入缺页路径的窄临界区；映射或权限已经变化时返回 EFAULT。
     pub fn read_user_u32_nofault(&self, user: usize) -> Result<u32, Errno> {
+        self.with_user_atomic_u32(user, false, |word| (word.load(Ordering::Acquire), false))
+    }
+
+    /// 对已经常驻且可写的用户 u32 执行原子 compare-exchange。
+    ///
+    /// 返回本次观察到的旧值；仅当它等于 `current` 时写入 `new`。该接口不会
+    /// 触发缺页或 COW，调用方必须先执行 [`Self::prefault_user_u32`]。
+    pub fn compare_exchange_user_u32_nofault(
+        &self,
+        user: usize,
+        current: u32,
+        new: u32,
+    ) -> Result<u32, Errno> {
+        self.with_user_atomic_u32(user, true, |word| {
+            match word.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(previous) => (previous, true),
+                Err(observed) => (observed, false),
+            }
+        })
+    }
+
+    fn user_u32_location(&self, user: usize) -> Result<(usize, usize), Errno> {
         if user % core::mem::align_of::<u32>() != 0 {
             return Err(Errno::EINVAL);
         }
@@ -1143,23 +1181,44 @@ impl VmSpace {
         if end > page_va.checked_add(page_size()).ok_or(Errno::EFAULT)? {
             return Err(Errno::EFAULT);
         }
+        Ok((page_va, end))
+    }
 
+    fn with_user_atomic_u32<R>(
+        &self,
+        user: usize,
+        write: bool,
+        operation: impl FnOnce(&AtomicU32) -> (R, bool),
+    ) -> Result<R, Errno> {
+        let (page_va, end) = self.user_u32_location(user)?;
         // 同时持有 VMA 和 resident page 锁，确保权限检查与物理页选择来自同一份
-        // 映射快照。Arc 由 pages 表持有，因此原子读取期间物理页不会被回收。
+        // 映射快照。Arc 由 pages 表持有，因此原子操作期间物理页不会被回收。
         let set = self.vmas.lock();
         let area = set.find(user).ok_or(Errno::EFAULT)?;
-        if end > area.range.end || !area.flags.contains_all(VmFlags::USER | VmFlags::READ) {
+        let required = if write {
+            VmFlags::USER | VmFlags::READ | VmFlags::WRITE
+        } else {
+            VmFlags::USER | VmFlags::READ
+        };
+        if end > area.range.end || !area.flags.contains_all(required) {
             return Err(Errno::EFAULT);
         }
         let pages = self.pages.lock();
         let mapping = pages.get(&page_va).ok_or(Errno::EFAULT)?;
+        if write && !mapping.access.pte_writable() {
+            return Err(Errno::EFAULT);
+        }
         let virt_fn = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EFAULT)?;
         let pointer = (virt_fn(mapping.page.paddr()) + (user - page_va)) as *const AtomicU32;
         // Safety: futex 地址已经按 u32 对齐，四字节不会跨页；VMA/pages 锁保证当前
         // resident mapping 不被替换，底层页由 mapping 的 Arc 保活。
-        Ok(unsafe { (*pointer).load(Ordering::Acquire) })
+        let (result, changed) = operation(unsafe { &*pointer });
+        if changed {
+            mapping.page.mark_dirty();
+        }
+        Ok(result)
     }
 
     /// 取得写入用户地址的一页内连续窗口。
