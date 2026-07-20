@@ -7,7 +7,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use vfs::sync::Spinlock;
 
@@ -199,17 +199,20 @@ impl IrqHandle {
 
 struct IrqRegistration {
     id: u64,
+    proc_irq: u32,
     line: IrqLine,
-    _owner: &'static str,
+    owner: &'static str,
     sharing: IrqSharing,
     _trigger: Option<IrqTrigger>,
     _polarity: Option<IrqPolarity>,
     handler: Arc<dyn IrqHandler>,
     bottom_half: Option<Arc<dyn IrqBottomHalf>>,
+    counts: [u64; sched::NR_CPUS],
 }
 
 pub struct IrqRegistry {
     next_id: AtomicU64,
+    next_proc_irq: AtomicU64,
     handlers: Spinlock<Vec<IrqRegistration>>,
 }
 
@@ -217,6 +220,7 @@ impl IrqRegistry {
     pub const fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
+            next_proc_irq: AtomicU64::new(1),
             handlers: Spinlock::new(Vec::new()),
         }
     }
@@ -240,16 +244,28 @@ impl IrqRegistry {
             handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
         }
         let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
+        let proc_irq = handlers
+            .iter()
+            .find(|entry| entry.line == request.line)
+            .map(|entry| entry.proc_irq)
+            .map(Ok)
+            .unwrap_or_else(|| {
+                registry_id::alloc_atomic_id(&self.next_proc_irq)
+                    .map_err(|_| IrqError::OutOfMemory)
+                    .and_then(|value| u32::try_from(value).map_err(|_| IrqError::OutOfMemory))
+            })?;
         let line = request.line;
         handlers.push(IrqRegistration {
             id,
+            proc_irq,
             line,
-            _owner: request.owner,
+            owner: request.owner,
             sharing: request.sharing,
             _trigger: request.trigger,
             _polarity: request.polarity,
             handler: request.handler,
             bottom_half: request.bottom_half,
+            counts: [0; sched::NR_CPUS],
         });
         drop(handlers);
         enable_irq_line(line);
@@ -272,8 +288,17 @@ impl IrqRegistry {
         else {
             return Err(IrqError::NotFound);
         };
-        handlers.remove(index);
-        let still_used = handlers.iter().any(|entry| entry.line == handle.line);
+        let removed = handlers.remove(index);
+        let still_used = if let Some(remaining) =
+            handlers.iter_mut().find(|entry| entry.line == handle.line)
+        {
+            for cpu in 0..sched::NR_CPUS {
+                remaining.counts[cpu] = remaining.counts[cpu].saturating_add(removed.counts[cpu]);
+            }
+            true
+        } else {
+            false
+        };
         drop(handlers);
         if !still_used {
             disable_irq_line(handle.line);
@@ -317,7 +342,55 @@ impl IrqRegistry {
             }
         }
 
+        if handled {
+            let cpu = sched::current_cpu_id().min(sched::NR_CPUS - 1);
+            if let Some(entry) = self
+                .handlers
+                .lock()
+                .iter_mut()
+                .find(|entry| entry.line == line)
+            {
+                entry.counts[cpu] = entry.counts[cpu].saturating_add(1);
+            }
+        }
+
         handled
+    }
+
+    fn snapshot(&self) -> Vec<IrqLineSnapshot> {
+        let handlers = self.handlers.lock();
+        let mut snapshot: Vec<IrqLineSnapshot> = Vec::new();
+        if snapshot.try_reserve(handlers.len()).is_err() {
+            return snapshot;
+        }
+        for entry in handlers.iter() {
+            if let Some(existing) = snapshot
+                .iter_mut()
+                .find(|item| item.proc_irq == entry.proc_irq)
+            {
+                for cpu in 0..sched::NR_CPUS {
+                    existing.counts[cpu] = existing.counts[cpu].saturating_add(entry.counts[cpu]);
+                }
+                if !existing.owners.contains(&entry.owner) && existing.owners.try_reserve(1).is_ok()
+                {
+                    existing.owners.push(entry.owner);
+                }
+                continue;
+            }
+            let mut owners = Vec::new();
+            if owners.try_reserve(1).is_err() {
+                continue;
+            }
+            owners.push(entry.owner);
+            snapshot.push(IrqLineSnapshot {
+                proc_irq: entry.proc_irq,
+                line: entry.line,
+                counts: entry.counts,
+                owners,
+            });
+        }
+        snapshot.sort_unstable_by_key(|entry| entry.proc_irq);
+        snapshot
     }
 }
 
@@ -328,10 +401,36 @@ impl Default for IrqRegistry {
 }
 
 static IRQ_REGISTRY: IrqRegistry = IrqRegistry::new();
+static TIMER_INTERRUPT_COUNTS: [AtomicU64; sched::NR_CPUS] =
+    [const { AtomicU64::new(0) }; sched::NR_CPUS];
 static IRQ_LINE_OPS: Spinlock<Option<IrqLineOps>> = Spinlock::new(None);
 static IOCSR_OPS: Spinlock<Option<IocsrOps>> = Spinlock::new(None);
 static DEFAULT_IRQ_DOMAIN: Spinlock<Option<DefaultIrqDomainRegistration>> = Spinlock::new(None);
 static NEXT_DEFAULT_IRQ_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub struct IrqLineSnapshot {
+    pub proc_irq: u32,
+    pub line: IrqLine,
+    pub counts: [u64; sched::NR_CPUS],
+    pub owners: Vec<&'static str>,
+}
+
+/// 记录当前 CPU 收到的一次调度定时器中断。
+pub fn record_timer_interrupt() {
+    let cpu = sched::current_cpu_id().min(sched::NR_CPUS - 1);
+    TIMER_INTERRUPT_COUNTS[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
+/// 返回每个 CPU 已处理的调度定时器中断数。
+pub fn timer_interrupt_counts() -> [u64; sched::NR_CPUS] {
+    core::array::from_fn(|cpu| TIMER_INTERRUPT_COUNTS[cpu].load(Ordering::Relaxed))
+}
+
+/// 返回当前已注册 IRQ line 的稳定诊断快照。
+pub fn snapshot_irq_lines() -> Vec<IrqLineSnapshot> {
+    IRQ_REGISTRY.snapshot()
+}
 
 pub trait IrqDomain: Send + Sync {
     /// 将固件中断 specifier 翻译成规范化 [`IrqLine`]。

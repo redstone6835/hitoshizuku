@@ -61,6 +61,7 @@ const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
+const INTERRUPTS_INO: u64 = 21;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -205,6 +206,7 @@ enum RootFileKind {
     MemInfo,
     Uptime,
     Stat,
+    Interrupts,
     Devices,
     Pnp,
     DeviceFunctions,
@@ -337,6 +339,10 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("meminfo", mk_root_file(MEMINFO_INO, RootFileKind::MemInfo)),
         ("uptime", mk_root_file(UPTIME_INO, RootFileKind::Uptime)),
         ("stat", mk_root_file(STAT_INO, RootFileKind::Stat)),
+        (
+            "interrupts",
+            mk_root_file(INTERRUPTS_INO, RootFileKind::Interrupts),
+        ),
         ("devices", mk_root_file(DEVICES_INO, RootFileKind::Devices)),
         ("pnp", mk_root_file(PNP_INO, RootFileKind::Pnp)),
         (
@@ -1774,6 +1780,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::MemInfo => render_meminfo().into_bytes(),
             RootFileKind::Uptime => render_uptime().into_bytes(),
             RootFileKind::Stat => render_stat().into_bytes(),
+            RootFileKind::Interrupts => render_interrupts().into_bytes(),
             RootFileKind::Devices => render_devices().into_bytes(),
             RootFileKind::Pnp => render_pnp().into_bytes(),
             RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
@@ -2634,6 +2641,52 @@ fn render_stat() -> String {
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
         processes, running, blocked
     )
+}
+
+fn render_interrupts() -> String {
+    let mut online_mask = sched::online_cpu_mask();
+    if online_mask == 0 {
+        online_mask = 1;
+    }
+    let mut out = String::new();
+    out.push_str("           ");
+    for cpu in 0..sched::NR_CPUS {
+        if online_mask & (1u64 << cpu) != 0 {
+            let _ = write!(out, "CPU{cpu:>7}");
+        }
+    }
+    out.push('\n');
+
+    let timer_counts = crate::dev::irq::timer_interrupt_counts();
+    let _ = write!(out, "  0:");
+    for cpu in 0..sched::NR_CPUS {
+        if online_mask & (1u64 << cpu) != 0 {
+            let _ = write!(out, " {:>10}", timer_counts[cpu]);
+        }
+    }
+    out.push_str("  timer\n");
+
+    for entry in crate::dev::irq::snapshot_irq_lines() {
+        let _ = write!(out, "{:>3}:", entry.proc_irq);
+        for cpu in 0..sched::NR_CPUS {
+            if online_mask & (1u64 << cpu) != 0 {
+                let _ = write!(out, " {:>10}", entry.counts[cpu]);
+            }
+        }
+        if entry.owners.is_empty() {
+            let _ = write!(out, "  {:?}", entry.line);
+        } else {
+            out.push_str("  ");
+            for (index, owner) in entry.owners.iter().enumerate() {
+                if index != 0 {
+                    out.push(',');
+                }
+                out.push_str(owner);
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn render_devices() -> String {

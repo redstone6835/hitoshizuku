@@ -170,6 +170,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                     options(nostack, preserves_flags)
                 );
             }
+            general::dev::irq::record_timer_interrupt();
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
