@@ -55,6 +55,7 @@ pub mod cpu;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
+pub mod membarrier;
 pub mod migration;
 pub mod mutex;
 pub mod operation;
@@ -82,6 +83,7 @@ pub use cpu::{
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
+pub use membarrier::{handle_ipi as handle_membarrier_ipi, synchronize_cpus};
 pub use migration::MigrationContext;
 pub use operation::spawn_user_process;
 pub use pid::{PidNamespace, PidRegistry, PidT};

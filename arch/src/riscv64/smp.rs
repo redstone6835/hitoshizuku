@@ -55,27 +55,46 @@ fn cpu_is_online(logical_id: usize) -> bool {
     logical_id < MAX_CPUS && ONLINE_HARTS.load(Ordering::Acquire) & (1 << logical_id) != 0
 }
 
-fn send_reschedule(logical_id: usize) {
+fn send_software_ipi(logical_id: usize) -> bool {
     let Some(hart_id) = physical_hart_id(logical_id) else {
-        return;
+        return false;
     };
     let ret = sbi::send_ipi(1, hart_id);
-    if !ret.is_ok() {
+    ret.is_ok()
+}
+
+fn send_reschedule(logical_id: usize) {
+    if !send_software_ipi(logical_id) {
+        let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
         log::warning!(
-            "[smp] reschedule IPI failed: logical={} hart={} error={}",
+            "[smp] reschedule IPI failed: logical={} hart={}",
             logical_id,
             hart_id,
-            ret.error
         );
     }
 }
 
+fn send_membarrier(logical_id: usize) -> bool {
+    let sent = send_software_ipi(logical_id);
+    if !sent {
+        let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
+        log::warning!(
+            "[smp] membarrier IPI failed: logical={} hart={}",
+            logical_id,
+            hart_id,
+        );
+    }
+    sent
+}
+
 pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
     send_resched: send_reschedule,
+    send_membarrier,
     is_online: cpu_is_online,
 };
 
 pub(crate) fn handle_ipi() {
+    sched::handle_membarrier_ipi();
     // request_resched() 在发送 IPI 前已发布目标 CPU 的 need_resched；trap 返回路径
     // 会在安全边界消费该标志。RFENCE 由 OpenSBI 同步执行，不进入 S-mode handler。
 }

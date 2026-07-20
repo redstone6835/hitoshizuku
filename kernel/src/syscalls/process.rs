@@ -671,42 +671,39 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
     const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
     const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
-    let single_cpu = sched::online_cpu_mask().count_ones() <= 1;
-    let supported = if single_cpu {
-        MEMBARRIER_CMD_GLOBAL
-            | MEMBARRIER_CMD_GLOBAL_EXPEDITED
-            | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
-            | MEMBARRIER_CMD_PRIVATE_EXPEDITED
-            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
-    } else {
-        // TODO(smp): 多核 membarrier 需要 IPI rendezvous，确保目标 CPU 在
-        // 返回前经过调度点或显式内存屏障；单 CPU fence 不能扩展成 SMP 语义。
-        0
-    };
+    let supported = MEMBARRIER_CMD_GLOBAL
+        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
 
     let cmd = ctx.args[0];
     let flags = ctx.args[1];
-    if cmd != MEMBARRIER_CMD_QUERY && flags != 0 {
+    if flags != 0 {
         return Err(Errno::EINVAL);
     }
     match cmd {
         MEMBARRIER_CMD_QUERY => Ok(supported),
         MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
-            if (supported & cmd) != 0 {
-                Ok(0)
-            } else {
-                Err(Errno::EOPNOTSUPP)
-            }
+            let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
+            vm.register_membarrier(cmd);
+            Ok(0)
         }
-        MEMBARRIER_CMD_GLOBAL
-        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
-        | MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
-            if (supported & cmd) == 0 {
-                return Err(Errno::EOPNOTSUPP);
+        MEMBARRIER_CMD_GLOBAL => {
+            sched::synchronize_cpus()?;
+            Ok(0)
+        }
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED | MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
+            let required_registration = match cmd {
+                MEMBARRIER_CMD_GLOBAL_EXPEDITED => MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED,
+                MEMBARRIER_CMD_PRIVATE_EXPEDITED => MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+                _ => unreachable!(),
+            };
+            let vm = task_vm_space(ctx.task()).ok_or(Errno::EINVAL)?;
+            if vm.membarrier_registration() & required_registration == 0 {
+                return Err(Errno::EPERM);
             }
-            // 当前内核只启动单 CPU；完整 SMP IPI rendezvous 接入前，SeqCst fence
-            // 已足以满足本 CPU 上的 membarrier 可见性语义。
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            sched::synchronize_cpus()?;
             Ok(0)
         }
         _ => Err(Errno::EINVAL),

@@ -284,6 +284,8 @@ pub struct VmSpace {
     brk_current: AtomicUsize,
     mmap_next: AtomicUsize,
     mlock_future: AtomicBool,
+    /// `membarrier(2)` expedited 命令的地址空间级注册位。
+    membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
     mapped_pages: AtomicUsize,
 }
@@ -310,6 +312,7 @@ impl VmSpace {
             brk_current: AtomicUsize::new(layout.user_heap_base),
             mmap_next: AtomicUsize::new(layout.user_mmap_base),
             mlock_future: AtomicBool::new(false),
+            membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
         }
     }
@@ -322,6 +325,16 @@ impl VmSpace {
     #[kernel_symbols::export(name = "general.mm.VmSpace.mapped_pages", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
     pub fn mapped_pages(&self) -> usize {
         self.mapped_pages.load(Ordering::Acquire)
+    }
+
+    /// 为当前地址空间登记可用的 expedited membarrier 命令。
+    pub fn register_membarrier(&self, commands: usize) {
+        self.membarrier_registration
+            .fetch_or(commands, Ordering::AcqRel);
+    }
+
+    pub fn membarrier_registration(&self) -> usize {
+        self.membarrier_registration.load(Ordering::Acquire)
     }
 
     fn with_future_mlock(&self, flags: VmFlags) -> VmFlags {
@@ -1045,6 +1058,8 @@ impl VmSpace {
             brk_current: AtomicUsize::new(self.current_brk()),
             mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
             mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
+            // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
+            membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
         }
     }
