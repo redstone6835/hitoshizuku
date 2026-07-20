@@ -250,8 +250,19 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
                 return recover_elm_trap(tf_ptr, recovery, "forced native exit");
             }
         }
-        sched::on_timer_tick(now_ns);
         vdso::run_timer_tick_hook(now_ns);
+        // timer 可打断持有 runqueue、topology 等普通自旋锁的内核路径。
+        // top-half 只记录待处理时间；syscall 返回或下一次主动调度会在无锁
+        // 边界补做调度工作，避免同一 CPU 重入锁后永久自旋。
+        if !from_user {
+            sched::defer_timer_tick(now_ns);
+            if general::elm_guard::active_cell() == 0 {
+                vdso::run_net_poll_hook(now_ns);
+                vdso::run_tty_poll_hook(now_ns);
+            }
+            return finish_trap_return(tf_ptr, false);
+        }
+        sched::on_timer_tick(now_ns);
         vdso::run_net_poll_hook(now_ns);
         vdso::run_tty_poll_hook(now_ns);
         deliver_user_signals_before_return(tf_ptr, from_user);

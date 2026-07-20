@@ -183,10 +183,13 @@ fn reserve_locked(state: &mut BindState, request: BindRequest) -> Result<BindTok
 
 fn can_share(left: BindRequest, right: BindRequest) -> bool {
     if left.protocol == TransportProtocol::Udp
-        && left.options.multicast_or_broadcast
-        && right.options.multicast_or_broadcast
+        && right.protocol == TransportProtocol::Udp
+        && left.options.reuse_address
+        && right.options.reuse_address
     {
-        return left.options.reuse_address && right.options.reuse_address;
+        // UDP 的 SO_REUSEADDR 允许旧的 connected socket 与新 listener 暂时共享
+        // 本地端口；入站分流随后优先匹配完整四元组。
+        return true;
     }
     left.options.reuse_port && right.options.reuse_port
 }
@@ -270,6 +273,31 @@ mod tests {
         };
         registry.reserve(udp(1, BindAddress::Any, options)).unwrap();
         registry.reserve(udp(2, BindAddress::Any, options)).unwrap();
+    }
+
+    #[test]
+    fn udp_reuse_address_can_replace_connected_listener() {
+        let registry = BindRegistry::new(1, &[13; 16]);
+        let options = BindOptions {
+            reuse_address: true,
+            ..BindOptions::default()
+        };
+        registry.reserve(udp(1, BindAddress::Any, options)).unwrap();
+        registry.reserve(udp(2, BindAddress::Any, options)).unwrap();
+    }
+
+    #[test]
+    fn udp_reuse_address_requires_both_sockets_to_opt_in() {
+        let registry = BindRegistry::new(1, &[15; 16]);
+        let options = BindOptions {
+            reuse_address: true,
+            ..BindOptions::default()
+        };
+        registry.reserve(udp(1, BindAddress::Any, options)).unwrap();
+        assert_eq!(
+            registry.reserve(udp(2, BindAddress::Any, BindOptions::default())),
+            Err(BindError::AddressInUse)
+        );
     }
 
     #[test]

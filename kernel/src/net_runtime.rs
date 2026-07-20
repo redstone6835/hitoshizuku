@@ -330,9 +330,13 @@ impl PinnedQueueAdapter {
             NET_QUEUE_OP_HAS_PENDING | NET_QUEUE_OP_QUIESCE => 0,
             _ => return false,
         };
-        let deadline = sched::now_ns_public().saturating_add(2_000_000);
-        let result =
-            crate::elm::invoke_pinned_native(&self.call, frame, &ranges[..range_count], deadline);
+        // 队列 ABI 由每轮报文数和字节数边界协作限流，不把墙钟耗时当 CPU 配额。
+        let result = crate::elm::invoke_pinned_native(
+            &self.call,
+            frame,
+            &ranges[..range_count],
+            crate::elm::NO_WATCHDOG_DEADLINE_NS,
+        );
         let valid = frame.valid(frame.opcode, self.id);
         let success = matches!(result, Ok(NET_QUEUE_CALL_STATUS_OK)) && valid;
         if !success {
@@ -2318,15 +2322,9 @@ pub fn start_workers() {
             sched::now_ns_public() < startup_deadline,
             "协议 worker 未在 1 秒内进入主循环"
         );
-        let task = sched::current_task();
-        if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-            let wake = sched::now_ns_public().saturating_add(100_000);
-            let _ = sched::register_sleep_deadline(&task, wake);
-            drop(task);
-            sched::schedule_once(sched::now_ns_public());
-        } else {
-            let _ = sched::operation::sched_yield();
-        }
+        // 这里只需把 CPU 交给刚激活的协议 worker。把启动线程送入 timed-sleeper
+        // 会额外制造“状态已 Sleeping、deadline 尚未稳定入队”的唤醒窗口。
+        let _ = sched::operation::sched_yield();
     }
     NET_RUNTIME_STARTED.store(true, Ordering::Release);
     reconcile_devices();

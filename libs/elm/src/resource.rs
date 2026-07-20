@@ -1,8 +1,8 @@
 //! ELM 单元资源预算、用量和 owned resource 收口协议。
 //!
-//! [`ElmResourceBudget`] 限制 provider 端口、队列、订阅、镜像、故障、审计、并发调用、内存和
-//! CPU 时间；[`ElmResourceUsage`] 是运行时核算快照。预算不是建议值，装载、注册、调用和
-//! 动态调整都必须在提交前检查，子单元不能通过更新策略超过父级允许范围。
+//! [`ElmResourceBudget`] 限制提供方端口、队列、订阅、镜像、故障、审计、并发调用和内存，
+//! 并声明 CPU 时间软阈值；[`ElmResourceUsage`] 是运行时核算快照。硬配额在提交前检查，
+//! CPU 阈值用于观测和调度策略，子单元仍不能通过更新策略超过父级允许范围。
 //!
 //! owned resource 协议用于登记模块创建但需要运行时协助排空的 timer、task、work item、
 //! callback、IRQ callback 和异步请求。运行时按 quiesce、cancel、drain、release 顺序调用
@@ -196,11 +196,11 @@ pub struct ElmResourceBudget {
     pub max_native_stack_bytes: u64,
     /// `max_dynamic_alloc_bytes` 对应区域或资源的字节数量；参与运算前必须检查整数溢出。
     pub max_dynamic_alloc_bytes: u64,
-    /// `max_cpu_time_ns_per_call` 对应资源预算的硬上限；零值语义由所属预算结构定义。
+    /// 单次调用的 CPU 时间软阈值，用于资源观测和后续调度策略，不作为墙钟超时。
     pub max_cpu_time_ns_per_call: u64,
-    /// `cpu_budget_ns_per_period` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
+    /// 一个核算周期内的 CPU 时间软阈值；超额不会把当前调用或 ELM 判为故障。
     pub cpu_budget_ns_per_period: u64,
-    /// `cpu_period_ns` 使用纳秒单位；具体时钟域由所属记录定义。
+    /// CPU 核算周期使用的墙钟窗口，单位为纳秒。
     pub cpu_period_ns: u64,
 }
 

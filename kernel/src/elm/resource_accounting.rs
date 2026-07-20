@@ -21,6 +21,8 @@ pub(crate) struct ResourceAccountingSnapshot {
     pub cpu_time_ns_total: u64,
     pub cpu_time_ns_period: u64,
     pub cpu_period_started_at_ns: u64,
+    pub cpu_call_overruns: u64,
+    pub cpu_period_overruns: u64,
     pub quota_denials: u64,
     pub accounting_errors: u64,
 }
@@ -30,15 +32,13 @@ pub(crate) enum NativeCallAdmissionError {
     CellNotRegistered,
     StackQuota,
     ConcurrentQuota,
-    CpuQuota,
     CounterOverflow,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeCallAccountingResult {
-    pub elapsed_ns: u64,
-    pub call_budget_exceeded: bool,
-    pub period_budget_exceeded: bool,
+    pub cpu_time_ns: u64,
+    pub watchdog_expired: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +52,8 @@ struct ResourceEntry {
     cpu_time_ns_total: u64,
     cpu_time_ns_period: u64,
     cpu_period_started_at_ns: u64,
+    cpu_call_overruns: u64,
+    cpu_period_overruns: u64,
     quota_denials: u64,
     accounting_errors: u64,
 }
@@ -68,6 +70,8 @@ impl ResourceEntry {
             cpu_time_ns_total: 0,
             cpu_time_ns_period: 0,
             cpu_period_started_at_ns: 0,
+            cpu_call_overruns: 0,
+            cpu_period_overruns: 0,
             quota_denials: 0,
             accounting_errors: 0,
         }
@@ -83,6 +87,8 @@ impl ResourceEntry {
             cpu_time_ns_total: self.cpu_time_ns_total,
             cpu_time_ns_period: self.cpu_time_ns_period,
             cpu_period_started_at_ns: self.cpu_period_started_at_ns,
+            cpu_call_overruns: self.cpu_call_overruns,
+            cpu_period_overruns: self.cpu_period_overruns,
             quota_denials: self.quota_denials,
             accounting_errors: self.accounting_errors,
         }
@@ -253,22 +259,26 @@ pub(crate) fn has_live_allocations(cell: ElmId) -> bool {
 pub(crate) struct NativeCallPermit {
     cell: ElmId,
     stack_bytes: u64,
-    started_at_ns: u64,
-    effective_deadline_ns: u64,
+    started_cpu_time_ns: u64,
+    watchdog_deadline_ns: u64,
     finished: bool,
 }
 
 impl NativeCallPermit {
-    pub(crate) const fn effective_deadline_ns(&self) -> u64 {
-        self.effective_deadline_ns
+    pub(crate) const fn watchdog_deadline_ns(&self) -> u64 {
+        self.watchdog_deadline_ns
     }
 
     pub(crate) fn finish(mut self, now_ns: u64) -> NativeCallAccountingResult {
-        let mut result =
-            finish_native_call(self.cell, self.stack_bytes, self.started_at_ns, now_ns);
-        if self.effective_deadline_ns != 0 && now_ns > self.effective_deadline_ns {
-            result.call_budget_exceeded = true;
-        }
+        let now_cpu_time_ns = sched::current_task_cpu_time_ns();
+        let result = finish_native_call(
+            self.cell,
+            self.stack_bytes,
+            self.started_cpu_time_ns,
+            now_cpu_time_ns,
+            self.watchdog_deadline_ns,
+            now_ns,
+        );
         self.finished = true;
         result
     }
@@ -277,11 +287,14 @@ impl NativeCallPermit {
 impl Drop for NativeCallPermit {
     fn drop(&mut self) {
         if !self.finished {
+            let now_ns = sched::now_ns_public();
             let _ = finish_native_call(
                 self.cell,
                 self.stack_bytes,
-                self.started_at_ns,
-                sched::now_ns_public(),
+                self.started_cpu_time_ns,
+                sched::current_task_cpu_time_ns(),
+                self.watchdog_deadline_ns,
+                now_ns,
             );
             self.finished = true;
         }
@@ -294,6 +307,7 @@ pub(crate) fn begin_native_call(
     requested_deadline_ns: u64,
     now_ns: u64,
 ) -> Result<NativeCallPermit, NativeCallAdmissionError> {
+    let started_cpu_time_ns = sched::current_task_cpu_time_ns();
     let mut registry = RESOURCE_REGISTRY.lock();
     begin_native_call_locked(
         &mut registry,
@@ -301,6 +315,7 @@ pub(crate) fn begin_native_call(
         stack_bytes,
         requested_deadline_ns,
         now_ns,
+        started_cpu_time_ns,
     )
 }
 
@@ -310,6 +325,7 @@ fn begin_native_call_locked(
     stack_bytes: u64,
     requested_deadline_ns: u64,
     now_ns: u64,
+    started_cpu_time_ns: u64,
 ) -> Result<NativeCallPermit, NativeCallAdmissionError> {
     let Some(entry) = registry.entry_mut(cell.0) else {
         return Err(NativeCallAdmissionError::CellNotRegistered);
@@ -324,13 +340,8 @@ fn begin_native_call_locked(
         entry.quota_denials = entry.quota_denials.saturating_add(1);
         return Err(NativeCallAdmissionError::StackQuota);
     }
-    if entry.budget.max_cpu_time_ns_per_call == 0
-        || entry.budget.cpu_budget_ns_per_period == 0
-        || entry.cpu_time_ns_period >= entry.budget.cpu_budget_ns_per_period
-    {
-        entry.quota_denials = entry.quota_denials.saturating_add(1);
-        return Err(NativeCallAdmissionError::CpuQuota);
-    }
+    // CPU 阈值只做真实运行时间记账。调度器尚未提供可等待的 ELM 节流队列，
+    // 因此不能在同步调用门返回提供方故障；栈和并发仍按硬配额拒绝。
     let Some(active_native_calls) = entry.active_native_calls.checked_add(1) else {
         entry.quota_denials = entry.quota_denials.saturating_add(1);
         return Err(NativeCallAdmissionError::CounterOverflow);
@@ -340,24 +351,13 @@ fn begin_native_call_locked(
         return Err(NativeCallAdmissionError::ConcurrentQuota);
     }
 
-    let remaining_period = entry
-        .budget
-        .cpu_budget_ns_per_period
-        .saturating_sub(entry.cpu_time_ns_period);
-    let call_deadline = now_ns.saturating_add(entry.budget.max_cpu_time_ns_per_call);
-    let period_deadline = now_ns.saturating_add(remaining_period);
-    let mut effective_deadline_ns = call_deadline.min(period_deadline);
-    if requested_deadline_ns != 0 {
-        effective_deadline_ns = effective_deadline_ns.min(requested_deadline_ns);
-    }
-
     entry.native_stack_bytes = next_stack;
     entry.active_native_calls = active_native_calls;
     Ok(NativeCallPermit {
         cell,
         stack_bytes,
-        started_at_ns: now_ns,
-        effective_deadline_ns,
+        started_cpu_time_ns,
+        watchdog_deadline_ns: requested_deadline_ns,
         finished: false,
     })
 }
@@ -365,29 +365,37 @@ fn begin_native_call_locked(
 fn finish_native_call(
     cell: ElmId,
     stack_bytes: u64,
-    started_at_ns: u64,
+    started_cpu_time_ns: u64,
+    now_cpu_time_ns: u64,
+    watchdog_deadline_ns: u64,
     now_ns: u64,
 ) -> NativeCallAccountingResult {
-    let elapsed_ns = now_ns.saturating_sub(started_at_ns);
+    let cpu_time_ns = now_cpu_time_ns.saturating_sub(started_cpu_time_ns);
     let mut registry = RESOURCE_REGISTRY.lock();
     let Some(entry) = registry.entry_mut(cell.0) else {
         return NativeCallAccountingResult {
-            elapsed_ns,
-            call_budget_exceeded: true,
-            period_budget_exceeded: true,
+            cpu_time_ns,
+            watchdog_expired: watchdog_deadline_ns != 0 && now_ns > watchdog_deadline_ns,
         };
     };
+    entry.refresh_cpu_period(now_ns);
     if entry.native_stack_bytes < stack_bytes || entry.active_native_calls == 0 {
         entry.accounting_errors = entry.accounting_errors.saturating_add(1);
     }
     entry.native_stack_bytes = entry.native_stack_bytes.saturating_sub(stack_bytes);
     entry.active_native_calls = entry.active_native_calls.saturating_sub(1);
-    entry.cpu_time_ns_total = entry.cpu_time_ns_total.saturating_add(elapsed_ns);
-    entry.cpu_time_ns_period = entry.cpu_time_ns_period.saturating_add(elapsed_ns);
+    let period_was_over_budget = entry.cpu_time_ns_period > entry.budget.cpu_budget_ns_per_period;
+    entry.cpu_time_ns_total = entry.cpu_time_ns_total.saturating_add(cpu_time_ns);
+    entry.cpu_time_ns_period = entry.cpu_time_ns_period.saturating_add(cpu_time_ns);
+    if cpu_time_ns > entry.budget.max_cpu_time_ns_per_call {
+        entry.cpu_call_overruns = entry.cpu_call_overruns.saturating_add(1);
+    }
+    if !period_was_over_budget && entry.cpu_time_ns_period > entry.budget.cpu_budget_ns_per_period {
+        entry.cpu_period_overruns = entry.cpu_period_overruns.saturating_add(1);
+    }
     NativeCallAccountingResult {
-        elapsed_ns,
-        call_budget_exceeded: elapsed_ns > entry.budget.max_cpu_time_ns_per_call,
-        period_budget_exceeded: entry.cpu_time_ns_period > entry.budget.cpu_budget_ns_per_period,
+        cpu_time_ns,
+        watchdog_expired: watchdog_deadline_ns != 0 && now_ns > watchdog_deadline_ns,
     }
 }
 
@@ -463,7 +471,6 @@ fn allocation_release(owner: u64, bytes: u64) {
 fn usage_fits_budget(entry: ResourceEntry, budget: ElmResourceBudget) -> bool {
     entry.dynamic_alloc_bytes <= budget.max_dynamic_alloc_bytes
         && entry.native_stack_bytes <= budget.max_native_stack_bytes
-        && entry.cpu_time_ns_period <= budget.cpu_budget_ns_per_period
 }
 
 pub(crate) const fn budget_is_valid(budget: ElmResourceBudget) -> bool {

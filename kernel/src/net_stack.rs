@@ -25,11 +25,6 @@ static HOST_STARTED: AtomicBool = AtomicBool::new(false);
 static NEXT_SOCKET_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static BROKER: Spinlock<KernelNetStackBroker> = Spinlock::new(KernelNetStackBroker::new());
 
-// Pinned guard 预算覆盖 ELM 入口、范围校验和 QEMU 调试开销；协议 worker
-// 自身仍使用独立的 200 us turn budget，不能把两者混为一谈。
-const PINNED_CALL_BUDGET_NS: u64 = 10_000_000;
-const SOCKET_CALL_BUDGET_NS: u64 = 50_000_000;
-
 struct KernelNetStackRegistrar;
 
 enum StackCall {
@@ -93,11 +88,10 @@ impl SocketCall {
         &self,
         frame: &mut NetStackSocketCallV1,
         host_ranges: &[(usize, usize)],
-        budget_ns: u64,
     ) -> Result<i32, i32> {
         match self {
             Self::Integrated(call) => Ok(call(frame)),
-            Self::Pinned(call) => call.invoke_with_budget(frame, host_ranges, budget_ns),
+            Self::Pinned(call) => call.invoke(frame, host_ranges),
         }
     }
 }
@@ -181,22 +175,23 @@ impl PinnedStackCall {
     }
 
     fn invoke<T>(&self, frame: &mut T, host_ranges: &[(usize, usize)]) -> Result<i32, i32> {
-        self.invoke_with_budget(frame, host_ranges, PINNED_CALL_BUDGET_NS)
-    }
-
-    fn invoke_with_budget<T>(
-        &self,
-        frame: &mut T,
-        host_ranges: &[(usize, usize)],
-        budget_ns: u64,
-    ) -> Result<i32, i32> {
         let pair = self.current_pair()?;
-        let deadline = sched::now_ns_public().saturating_add(budget_ns);
+        // 网络 ABI 都有显式的批次、报文或状态机边界；卸载取消仍由 ELM 保护域处理。
         if let Some(call) = pair.primary.try_lock() {
-            return crate::elm::invoke_pinned_native(&call, frame, host_ranges, deadline);
+            return crate::elm::invoke_pinned_native(
+                &call,
+                frame,
+                host_ranges,
+                crate::elm::NO_WATCHDOG_DEADLINE_NS,
+            );
         }
         if let Some(call) = pair.nested.try_lock() {
-            return crate::elm::invoke_pinned_native(&call, frame, host_ranges, deadline);
+            return crate::elm::invoke_pinned_native(
+                &call,
+                frame,
+                host_ranges,
+                crate::elm::NO_WATCHDOG_DEADLINE_NS,
+            );
         }
         Err(elm_model::ELM_MGR_STATUS_BUSY)
     }
@@ -1545,7 +1540,7 @@ fn probe_active() {
         && frame.ready == 1
         && frame.quiesced == 0;
     let mut socket_frame = NetStackSocketCallV1::new(NET_STACK_SOCKET_OP_PROBE, generation);
-    let socket_result = socket_call.invoke(&mut socket_frame, &[], PINNED_CALL_BUDGET_NS);
+    let socket_result = socket_call.invoke(&mut socket_frame, &[]);
     let socket_ready = matches!(socket_result, Ok(NET_STACK_CALL_STATUS_OK))
         && socket_frame.valid(NET_STACK_SOCKET_OP_PROBE, generation, core::ptr::null_mut())
         && socket_frame.ready == 1
@@ -1619,7 +1614,7 @@ pub(crate) fn socket_command(
     let opcode = request.opcode;
     let mut frame = NetStackSocketCallV1::new(opcode, generation);
     frame.request = request_pointer;
-    let result = call.invoke(&mut frame, &ranges[..range_count], SOCKET_CALL_BUDGET_NS);
+    let result = call.invoke(&mut frame, &ranges[..range_count]);
     let valid = matches!(result, Ok(NET_STACK_CALL_STATUS_OK))
         && frame.valid(opcode, generation, request_pointer)
         && frame.ready == 0
