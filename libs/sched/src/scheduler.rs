@@ -2048,6 +2048,7 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    prev.mark_rseq_event(crate::rseq::RseqEvent::Preempt);
     let account_now_ns = if now_ns == 0 {
         now_ns_internal()
     } else {

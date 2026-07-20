@@ -10,8 +10,8 @@ use ktest::ktest;
 
 use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedAttr,
-    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqEvent, RseqRegistration,
+    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
     supported_cpu_mask,
 };
 
@@ -74,8 +74,14 @@ fn robust_list_and_rseq_state_roundtrip() {
     };
     task.set_rseq_registration(rseq);
     assert_eq!(task.rseq_registration(), rseq);
+    task.mark_rseq_event(RseqEvent::Preempt);
+    assert!(task.rseq_events().contains(RseqEvent::Preempt));
+    task.publish_rseq_cpu(0);
+    task.publish_rseq_cpu(1);
+    assert!(task.rseq_events().contains(RseqEvent::Migrate));
     task.clear_rseq_registration();
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
+    assert!(task.rseq_events().is_empty());
 }
 
 #[ktest]

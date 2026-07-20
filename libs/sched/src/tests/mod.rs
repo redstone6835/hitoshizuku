@@ -7,6 +7,7 @@ mod test_eevdf;
 mod test_ids;
 mod test_migration;
 mod test_placement;
+mod test_rseq;
 mod test_sched_attr;
 mod test_scheduler_state;
 mod test_signal;

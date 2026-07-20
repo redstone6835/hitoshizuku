@@ -24,6 +24,7 @@ mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 mod net_tests;
 mod panic;
+mod rseq;
 mod sched;
 mod start;
 mod stdio;

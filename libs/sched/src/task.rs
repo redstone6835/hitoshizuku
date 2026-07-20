@@ -39,6 +39,7 @@ use crate::group::{ProcessGroup, ThreadGroup};
 use crate::ids::Credentials;
 use crate::pid::{PidNamespace, PidT};
 use crate::placement::{PlacementSnapshot, TaskPlacement};
+use crate::rseq::{RseqEvent, RseqEvents};
 use crate::signal::{SharedSignal, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
@@ -140,7 +141,7 @@ pub struct RobustListState {
     pub len: usize,
 }
 
-/// 每线程 rseq 注册状态。当前仅作为 ABI 占位，不执行 rseq 快路径。
+/// 每线程 rseq 注册状态。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RseqRegistration {
     pub ptr: usize,
@@ -493,8 +494,11 @@ pub struct Task {
     clear_child_tid: AtomicUsize,
     /// `set_robust_list` 注册的每线程 robust futex 链表。
     robust_list: Spinlock<RobustListState>,
-    /// `rseq` 注册状态。完整 restartable sequence 语义后续由 arch/trap 接入。
+    /// `rseq` 注册状态与尚未在返回用户态边界消费的调度事件。
     rseq: Spinlock<RseqRegistration>,
+    rseq_events: AtomicU8,
+    /// 最近一次实际向用户态发布的 CPU；`usize::MAX` 表示尚未发布。
+    rseq_cpu: AtomicUsize,
     /// `sigaltstack(2)` 的 per-thread alternate signal stack。
     sigaltstack: Spinlock<SigAltStack>,
     /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
@@ -596,6 +600,8 @@ impl Task {
             clear_child_tid: AtomicUsize::new(0),
             robust_list: Spinlock::new(RobustListState::default()),
             rseq: Spinlock::new(RseqRegistration::default()),
+            rseq_events: AtomicU8::new(0),
+            rseq_cpu: AtomicUsize::new(usize::MAX),
             sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
             cpu_runtime_ns: AtomicU64::new(0),
@@ -1155,11 +1161,39 @@ impl Task {
     }
 
     pub fn set_rseq_registration(&self, registration: RseqRegistration) {
+        self.rseq_events.store(0, Ordering::Release);
+        self.rseq_cpu.store(usize::MAX, Ordering::Release);
         *self.rseq.lock() = registration;
     }
 
     pub fn clear_rseq_registration(&self) {
         *self.rseq.lock() = RseqRegistration::default();
+        self.rseq_events.store(0, Ordering::Release);
+        self.rseq_cpu.store(usize::MAX, Ordering::Release);
+    }
+
+    pub fn mark_rseq_event(&self, event: RseqEvent) {
+        if self.rseq_registration().registered {
+            self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
+        }
+    }
+
+    pub fn rseq_events(&self) -> RseqEvents {
+        RseqEvents::from_bits(self.rseq_events.load(Ordering::Acquire))
+    }
+
+    pub fn clear_rseq_events(&self, events: RseqEvents) {
+        self.rseq_events.fetch_and(!events.bits(), Ordering::AcqRel);
+    }
+
+    pub fn publish_rseq_cpu(&self, cpu_id: usize) {
+        if !self.rseq_registration().registered {
+            return;
+        }
+        let previous = self.rseq_cpu.swap(cpu_id, Ordering::AcqRel);
+        if previous != usize::MAX && previous != cpu_id {
+            self.mark_rseq_event(RseqEvent::Migrate);
+        }
     }
 
     pub fn sigaltstack(&self) -> SigAltStack {
