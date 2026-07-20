@@ -70,6 +70,8 @@ const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
 const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
 #[cfg(feature = "performance-profile")]
 const KERNEL_PROFILE_CATALOG_INO: u64 = 29;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_TRACE_INO: u64 = 73;
 const KERNEL_ELM_DIR_INO: u64 = 80;
 const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
@@ -1522,6 +1524,8 @@ enum SysRegFile {
     ProfileSamples,
     #[cfg(feature = "performance-profile")]
     ProfileCatalog,
+    #[cfg(feature = "performance-profile")]
+    ProfileTrace,
     Elm {
         slot: ElmSysfsSlot,
     },
@@ -2043,7 +2047,7 @@ fn render_profile_stats() -> String {
     let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "state={} enabled={} session={} generation={} active_writers={} counter_hz={} event_mask={:#x} sampling={} cpu_slots={} histogram_buckets={}",
+        "state={} enabled={} session={} generation={} active_writers={} counter_hz={} event_mask={:#x} sampling={} trace={} cpu_slots={} histogram_buckets={}",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
@@ -2052,6 +2056,7 @@ fn render_profile_stats() -> String {
         session.counter_hz,
         session.event_mask,
         u8::from(session.sampling_enabled),
+        u8::from(session.trace_enabled),
         profiling::CPU_SLOTS,
         profiling::HISTOGRAM_BUCKETS,
     );
@@ -2177,10 +2182,64 @@ fn render_profile_samples() -> String {
 }
 
 #[cfg(feature = "performance-profile")]
+fn render_profile_trace() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let session = profiling::session_info();
+    let _ = writeln!(
+        output,
+        "state={} enabled={} session={} generation={} trace={} counter_hz={} slots_per_cpu={} record_bytes={} format_version=1",
+        session.state.name(),
+        u8::from(profiling::enabled()),
+        session.session_id,
+        session.generation,
+        u8::from(session.trace_enabled),
+        session.counter_hz,
+        profiling::TRACE_SLOTS_PER_CPU,
+        profiling::TRACE_RECORD_BYTES,
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        let window = profiling::trace_window(cpu);
+        let _ = writeln!(
+            output,
+            "cpu={} first_sequence={} next_sequence={} retained={} overwritten={}",
+            cpu,
+            window.first_sequence,
+            window.next_sequence,
+            window.next_sequence.saturating_sub(window.first_sequence),
+            window.overwritten,
+        );
+        for sequence in window.first_sequence..window.next_sequence {
+            let Some(record) = profiling::trace_record(cpu, sequence) else {
+                continue;
+            };
+            let _ = writeln!(
+                output,
+                "cpu={} sequence={} session={} generation={} timestamp_cycles={} duration_cycles={} kind={} event={} event_id={} category={} task={} arg0={} arg1={}",
+                record.cpu,
+                record.sequence,
+                record.session_id,
+                record.generation,
+                record.timestamp_cycles,
+                record.duration_cycles,
+                record.kind.name(),
+                record.event.name(),
+                record.event as usize,
+                record.event.category().name(),
+                record.task_id,
+                record.arg0,
+                record.arg1,
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
 fn render_profile_control() -> String {
     let session = profiling::session_info();
     format!(
-        "state={} enabled={} session={} generation={} active_writers={} event_mask={:#x} sampling={} commands=start,resume,freeze,stop,reset,events=<mask>,samples=0|1\n",
+        "state={} enabled={} session={} generation={} active_writers={} event_mask={:#x} sampling={} trace={} commands=start,resume,freeze,stop,reset,events=<mask>,samples=0|1,trace=0|1\n",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
@@ -2188,6 +2247,7 @@ fn render_profile_control() -> String {
         session.active_writers,
         session.event_mask,
         u8::from(session.sampling_enabled),
+        u8::from(session.trace_enabled),
     )
 }
 
@@ -2211,6 +2271,14 @@ fn render_profile_catalog() -> String {
             "kind=metric id={} name={}",
             metric as usize,
             metric.name(),
+        );
+    }
+    for kind in profiling::TraceKind::ALL {
+        let _ = writeln!(
+            output,
+            "kind=trace id={} name={}",
+            kind as usize,
+            kind.name(),
         );
     }
     output
@@ -2258,6 +2326,8 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::ProfileSamples => render_profile_samples(),
         #[cfg(feature = "performance-profile")]
         SysRegFile::ProfileCatalog => render_profile_catalog(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileTrace => render_profile_trace(),
         SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
@@ -2433,6 +2503,14 @@ impl FileOps for SysRegFileOps {
                 match enabled {
                     "0" | "off" => profiling::set_sampling_enabled(false),
                     "1" | "on" => profiling::set_sampling_enabled(true),
+                    _ => return Err(VfsError::InvalidArgument),
+                }
+                return Ok(_buf.len());
+            }
+            if let Some(enabled) = command.strip_prefix("trace=") {
+                match enabled {
+                    "0" | "off" => profiling::set_trace_enabled(false),
+                    "1" | "on" => profiling::set_trace_enabled(true),
                     _ => return Err(VfsError::InvalidArgument),
                 }
                 return Ok(_buf.len());
@@ -2978,6 +3056,8 @@ impl SysDirInodeOps {
                 "profile_samples" => mk_reg(KERNEL_PROFILE_SAMPLES_INO, SysRegFile::ProfileSamples),
                 #[cfg(feature = "performance-profile")]
                 "profile_catalog" => mk_reg(KERNEL_PROFILE_CATALOG_INO, SysRegFile::ProfileCatalog),
+                #[cfg(feature = "performance-profile")]
+                "profile_trace" => mk_reg(KERNEL_PROFILE_TRACE_INO, SysRegFile::ProfileTrace),
                 "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
@@ -3585,6 +3665,8 @@ impl SysDirInodeOps {
                     "profile_catalog",
                     FileType::Regular,
                 ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(KERNEL_PROFILE_TRACE_INO, "profile_trace", FileType::Regular),
                 mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),
             ],
             SysDirKind::KernelElm => {

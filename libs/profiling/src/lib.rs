@@ -12,7 +12,10 @@ pub const MIXED_CPU: usize = MAX_CPUS;
 pub const CPU_SLOTS: usize = MAX_CPUS + 1;
 pub const HISTOGRAM_BUCKETS: usize = 64;
 pub const SAMPLE_SLOTS: usize = 4096;
+pub const TRACE_SLOTS_PER_CPU: usize = 1024;
+pub const TRACE_RECORD_BYTES: usize = 72;
 const SAMPLE_PROBES: usize = 16;
+const TRACE_SLOT_INVALID: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -49,6 +52,7 @@ pub struct SessionInfo {
     pub counter_hz: u64,
     pub event_mask: u64,
     pub sampling_enabled: bool,
+    pub trace_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +181,14 @@ impl Event {
         }
     }
 
+    pub const fn from_id(id: usize) -> Option<Self> {
+        if id < Self::ALL.len() {
+            Some(Self::ALL[id])
+        } else {
+            None
+        }
+    }
+
     pub const fn category(self) -> EventCategory {
         match self {
             Self::SysSendCopy
@@ -208,6 +220,65 @@ impl Event {
             Self::IrqDispatch => EventCategory::Interrupt,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TraceKind {
+    Scope = 0,
+    SchedSwitch = 1,
+    TaskBlock = 2,
+    TaskWake = 3,
+}
+
+impl TraceKind {
+    pub const ALL: [Self; 4] = [
+        Self::Scope,
+        Self::SchedSwitch,
+        Self::TaskBlock,
+        Self::TaskWake,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Scope => "scope",
+            Self::SchedSwitch => "sched_switch",
+            Self::TaskBlock => "task_block",
+            Self::TaskWake => "task_wake",
+        }
+    }
+
+    const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Scope),
+            1 => Some(Self::SchedSwitch),
+            2 => Some(Self::TaskBlock),
+            3 => Some(Self::TaskWake),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceRecord {
+    pub sequence: u64,
+    pub timestamp_cycles: u64,
+    pub duration_cycles: u64,
+    pub session_id: u64,
+    pub generation: u64,
+    pub task_id: u64,
+    pub cpu: usize,
+    pub kind: TraceKind,
+    pub event: Event,
+    pub arg0: u64,
+    pub arg1: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TraceWindow {
+    pub first_sequence: u64,
+    pub next_sequence: u64,
+    pub overwritten: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,6 +447,36 @@ impl SampleSlot {
     }
 }
 
+struct TraceSlot {
+    published_sequence: AtomicU64,
+    timestamp_cycles: AtomicU64,
+    duration_cycles: AtomicU64,
+    session_id: AtomicU64,
+    generation: AtomicU64,
+    task_id: AtomicU64,
+    metadata: AtomicU64,
+    arg0: AtomicU64,
+    arg1: AtomicU64,
+}
+
+impl TraceSlot {
+    const fn new() -> Self {
+        Self {
+            published_sequence: AtomicU64::new(TRACE_SLOT_INVALID),
+            timestamp_cycles: AtomicU64::new(0),
+            duration_cycles: AtomicU64::new(0),
+            session_id: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            task_id: AtomicU64::new(0),
+            metadata: AtomicU64::new(0),
+            arg0: AtomicU64::new(0),
+            arg1: AtomicU64::new(0),
+        }
+    }
+}
+
+const _: [(); TRACE_RECORD_BYTES] = [(); core::mem::size_of::<TraceSlot>()];
+
 static COUNTERS: [[Counter; EVENT_COUNT]; CPU_SLOTS] =
     [const { [const { Counter::new() }; EVENT_COUNT] }; CPU_SLOTS];
 static METRICS: [[MetricCounter; METRIC_COUNT]; CPU_SLOTS] =
@@ -383,6 +484,10 @@ static METRICS: [[MetricCounter; METRIC_COUNT]; CPU_SLOTS] =
 static SAMPLES: [[SampleSlot; SAMPLE_SLOTS]; MAX_CPUS] =
     [const { [const { SampleSlot::new() }; SAMPLE_SLOTS] }; MAX_CPUS];
 static DROPPED_SAMPLES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static TRACE_SLOTS: [[TraceSlot; TRACE_SLOTS_PER_CPU]; MAX_CPUS] =
+    [const { [const { TraceSlot::new() }; TRACE_SLOTS_PER_CPU] }; MAX_CPUS];
+static TRACE_HEADS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static OVERWRITTEN_TRACE_RECORDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 static STATE: AtomicUsize = AtomicUsize::new(SessionState::Idle as usize);
 static SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -391,19 +496,23 @@ static ACTIVE_WRITERS: AtomicUsize = AtomicUsize::new(0);
 static COUNTER_HZ: AtomicU64 = AtomicU64::new(0);
 static EVENT_MASK: AtomicU64 = AtomicU64::new(ALL_EVENT_MASK);
 static SAMPLING_ENABLED: AtomicUsize = AtomicUsize::new(1);
+static TRACE_ENABLED: AtomicUsize = AtomicUsize::new(1);
 static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_CPU_NS: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn install(
     read_counter: fn() -> u64,
     current_cpu: fn() -> usize,
     current_task_cpu_ns: fn() -> u64,
+    current_task_id: fn() -> u64,
     counter_hz: u64,
 ) {
     READ_COUNTER.store(read_counter as usize, Ordering::Release);
     CURRENT_CPU.store(current_cpu as usize, Ordering::Release);
     CURRENT_TASK_CPU_NS.store(current_task_cpu_ns as usize, Ordering::Release);
+    CURRENT_TASK_ID.store(current_task_id as usize, Ordering::Release);
     COUNTER_HZ.store(counter_hz, Ordering::Release);
 }
 
@@ -436,6 +545,7 @@ pub fn session_info() -> SessionInfo {
         counter_hz: counter_hz(),
         event_mask: event_mask(),
         sampling_enabled: sampling_enabled(),
+        trace_enabled: trace_enabled(),
     }
 }
 
@@ -459,6 +569,14 @@ pub fn set_sampling_enabled(enabled: bool) {
     SAMPLING_ENABLED.store(usize::from(enabled), Ordering::Release);
 }
 
+pub fn trace_enabled() -> bool {
+    TRACE_ENABLED.load(Ordering::Acquire) != 0
+}
+
+pub fn set_trace_enabled(enabled: bool) {
+    TRACE_ENABLED.store(usize::from(enabled), Ordering::Release);
+}
+
 fn freeze_internal(next_state: SessionState) {
     STATE.store(next_state as usize, Ordering::Release);
     GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -469,7 +587,7 @@ fn freeze_internal(next_state: SessionState) {
 
 pub fn start() {
     freeze_internal(SessionState::Frozen);
-    clear_samples_and_counters();
+    clear_session_data();
     SESSION_ID.fetch_add(1, Ordering::AcqRel);
     GENERATION.fetch_add(1, Ordering::AcqRel);
     STATE.store(SessionState::Running as usize, Ordering::Release);
@@ -500,7 +618,7 @@ pub fn set_enabled(enabled: bool) {
     }
 }
 
-fn clear_samples_and_counters() {
+fn clear_session_data() {
     for cpu in 0..CPU_SLOTS {
         for counter in &COUNTERS[cpu] {
             counter.reset();
@@ -514,13 +632,15 @@ fn clear_samples_and_counters() {
             slot.reset();
         }
         DROPPED_SAMPLES[cpu].store(0, Ordering::Relaxed);
+        TRACE_HEADS[cpu].store(0, Ordering::Relaxed);
+        OVERWRITTEN_TRACE_RECORDS[cpu].store(0, Ordering::Relaxed);
     }
 }
 
 pub fn reset() {
     let previous = state();
     freeze_internal(SessionState::Frozen);
-    clear_samples_and_counters();
+    clear_session_data();
     SESSION_ID.fetch_add(1, Ordering::AcqRel);
     GENERATION.fetch_add(1, Ordering::AcqRel);
     STATE.store(previous as usize, Ordering::Release);
@@ -565,34 +685,62 @@ fn current_task_cpu_ns() -> u64 {
     current()
 }
 
+fn current_task_id() -> u64 {
+    let raw = installed_fn(&CURRENT_TASK_ID);
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: install 只接受相同签名的函数指针，安装后不会撤销。
+    let current: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    current()
+}
+
 pub struct Scope {
     event: Event,
     start_cycles: u64,
     start_on_cpu_ns: u64,
     bytes: u64,
     packets: u64,
+    trace_arg0: u64,
+    trace_arg1: u64,
     active: bool,
     generation: u64,
     start_cpu: usize,
+    start_task_id: u64,
 }
 
 impl Scope {
     pub fn bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes as u64;
+        self.trace_arg0 = bytes as u64;
         self
     }
 
     pub fn packets(mut self, packets: usize) -> Self {
         self.packets = packets as u64;
+        self.trace_arg1 = packets as u64;
+        self
+    }
+
+    pub fn trace_args(mut self, arg0: u64, arg1: u64) -> Self {
+        self.trace_arg0 = arg0;
+        self.trace_arg1 = arg1;
         self
     }
 
     pub fn set_bytes(&mut self, bytes: usize) {
         self.bytes = bytes as u64;
+        self.trace_arg0 = bytes as u64;
     }
 
     pub fn set_packets(&mut self, packets: usize) {
         self.packets = packets as u64;
+        self.trace_arg1 = packets as u64;
+    }
+
+    pub fn set_trace_args(&mut self, arg0: u64, arg1: u64) {
+        self.trace_arg0 = arg0;
+        self.trace_arg1 = arg1;
     }
 }
 
@@ -605,11 +753,15 @@ impl Drop for Scope {
         let cycles = read_counter().wrapping_sub(self.start_cycles);
         record_scope(
             self.event,
+            self.start_cycles,
             cycles,
             on_cpu_ns,
             self.bytes,
             self.packets,
             self.start_cpu,
+            self.start_task_id,
+            self.trace_arg0,
+            self.trace_arg1,
             self.generation,
         );
     }
@@ -624,9 +776,12 @@ pub fn scope(event: Event) -> Scope {
         start_on_cpu_ns: if active { current_task_cpu_ns() } else { 0 },
         bytes: 0,
         packets: 0,
+        trace_arg0: 0,
+        trace_arg1: 0,
         active,
         generation,
         start_cpu: current_cpu(),
+        start_task_id: if active { current_task_id() } else { 0 },
     }
 }
 
@@ -668,13 +823,80 @@ fn begin_write(expected_generation: Option<u64>) -> Option<WriteGuard> {
     Some(WriteGuard)
 }
 
+fn trace_metadata(cpu: usize, kind: TraceKind, event: Event) -> u64 {
+    (cpu as u64 & 0xff) | ((kind as u64) << 8) | ((event as u64) << 16)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_trace_record(
+    cpu: usize,
+    timestamp_cycles: u64,
+    duration_cycles: u64,
+    record_generation: u64,
+    task_id: u64,
+    kind: TraceKind,
+    event: Event,
+    arg0: u64,
+    arg1: u64,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    let cpu = cpu.min(MAX_CPUS - 1);
+    let sequence = TRACE_HEADS[cpu].fetch_add(1, Ordering::AcqRel);
+    if sequence >= TRACE_SLOTS_PER_CPU as u64 {
+        OVERWRITTEN_TRACE_RECORDS[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    let slot = &TRACE_SLOTS[cpu][sequence as usize & (TRACE_SLOTS_PER_CPU - 1)];
+    slot.published_sequence
+        .store(TRACE_SLOT_INVALID, Ordering::Release);
+    slot.timestamp_cycles
+        .store(timestamp_cycles, Ordering::Relaxed);
+    slot.duration_cycles
+        .store(duration_cycles, Ordering::Relaxed);
+    slot.session_id.store(session_id(), Ordering::Relaxed);
+    slot.generation.store(record_generation, Ordering::Relaxed);
+    slot.task_id.store(task_id, Ordering::Relaxed);
+    slot.metadata
+        .store(trace_metadata(cpu, kind, event), Ordering::Relaxed);
+    slot.arg0.store(arg0, Ordering::Relaxed);
+    slot.arg1.store(arg1, Ordering::Relaxed);
+    slot.published_sequence
+        .store(sequence.wrapping_add(1), Ordering::Release);
+}
+
+pub fn trace_task_event(kind: TraceKind, event: Event, task_id: u64, arg0: u64, arg1: u64) {
+    if !trace_enabled() || !event_enabled(event) || installed_fn(&READ_COUNTER) == 0 {
+        return;
+    }
+    let record_generation = generation();
+    let Some(_guard) = begin_write(Some(record_generation)) else {
+        return;
+    };
+    push_trace_record(
+        current_cpu(),
+        read_counter(),
+        0,
+        record_generation,
+        task_id,
+        kind,
+        event,
+        arg0,
+        arg1,
+    );
+}
+
 fn record_scope(
     event: Event,
+    start_cycles: u64,
     cycles: u64,
     on_cpu_ns: u64,
     bytes: u64,
     packets: u64,
     start_cpu: usize,
+    task_id: u64,
+    trace_arg0: u64,
+    trace_arg1: u64,
     scope_generation: u64,
 ) {
     if !event_enabled(event) {
@@ -685,8 +907,12 @@ fn record_scope(
     };
     let wall_ns = cycles_to_ns(cycles);
     let on_cpu_ns = on_cpu_ns.min(wall_ns);
-    let cpu = current_cpu().min(MAX_CPUS - 1);
-    let cpu = if cpu == start_cpu { cpu } else { MIXED_CPU };
+    let trace_cpu = current_cpu().min(MAX_CPUS - 1);
+    let cpu = if trace_cpu == start_cpu {
+        trace_cpu
+    } else {
+        MIXED_CPU
+    };
     let counter = &COUNTERS[cpu][event as usize];
     counter.calls.fetch_add(1, Ordering::Relaxed);
     counter.cycles.fetch_add(cycles, Ordering::Relaxed);
@@ -703,6 +929,17 @@ fn record_scope(
     }
     counter.max_latency_ns.fetch_max(wall_ns, Ordering::Relaxed);
     counter.latency.observe(wall_ns);
+    push_trace_record(
+        trace_cpu,
+        start_cycles,
+        cycles,
+        scope_generation,
+        task_id,
+        TraceKind::Scope,
+        event,
+        trace_arg0,
+        trace_arg1,
+    );
 }
 
 /// 记录已有调用点的 cycle 统计。该接口把时间视为纯 on-CPU。
@@ -725,6 +962,20 @@ pub fn record(event: Event, cycles: u64, bytes: u64, packets: u64) {
     if ns != 0 {
         counter.max_latency_ns.fetch_max(ns, Ordering::Relaxed);
         counter.latency.observe(ns);
+    }
+    if trace_enabled() && event != Event::SchedSwitch {
+        let end_cycles = read_counter();
+        push_trace_record(
+            current_cpu(),
+            end_cycles.wrapping_sub(cycles),
+            cycles,
+            generation(),
+            current_task_id(),
+            TraceKind::Scope,
+            event,
+            bytes,
+            packets,
+        );
     }
 }
 
@@ -946,6 +1197,60 @@ pub fn dropped_samples(cpu: usize) -> u64 {
         .map_or(0, |value| value.load(Ordering::Relaxed))
 }
 
+pub fn trace_window(cpu: usize) -> TraceWindow {
+    if cpu >= MAX_CPUS {
+        return TraceWindow::default();
+    }
+    let next_sequence = TRACE_HEADS[cpu].load(Ordering::Acquire);
+    TraceWindow {
+        first_sequence: next_sequence.saturating_sub(TRACE_SLOTS_PER_CPU as u64),
+        next_sequence,
+        overwritten: OVERWRITTEN_TRACE_RECORDS[cpu].load(Ordering::Acquire),
+    }
+}
+
+pub fn trace_record(cpu: usize, sequence: u64) -> Option<TraceRecord> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let window = trace_window(cpu);
+    if sequence < window.first_sequence || sequence >= window.next_sequence {
+        return None;
+    }
+    let expected = sequence.wrapping_add(1);
+    let slot = &TRACE_SLOTS[cpu][sequence as usize & (TRACE_SLOTS_PER_CPU - 1)];
+    if slot.published_sequence.load(Ordering::Acquire) != expected {
+        return None;
+    }
+    let timestamp_cycles = slot.timestamp_cycles.load(Ordering::Relaxed);
+    let duration_cycles = slot.duration_cycles.load(Ordering::Relaxed);
+    let record_session_id = slot.session_id.load(Ordering::Relaxed);
+    let record_generation = slot.generation.load(Ordering::Relaxed);
+    let task_id = slot.task_id.load(Ordering::Relaxed);
+    let metadata = slot.metadata.load(Ordering::Relaxed);
+    let arg0 = slot.arg0.load(Ordering::Relaxed);
+    let arg1 = slot.arg1.load(Ordering::Relaxed);
+    if slot.published_sequence.load(Ordering::Acquire) != expected {
+        return None;
+    }
+    let record_cpu = (metadata & 0xff) as usize;
+    let kind = TraceKind::from_raw(((metadata >> 8) & 0xff) as u8)?;
+    let event = Event::from_id(((metadata >> 16) & 0xffff) as usize)?;
+    Some(TraceRecord {
+        sequence,
+        timestamp_cycles,
+        duration_cycles,
+        session_id: record_session_id,
+        generation: record_generation,
+        task_id,
+        cpu: record_cpu,
+        kind,
+        event,
+        arg0,
+        arg1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,10 +1272,14 @@ mod tests {
         TASK_CPU_NS.fetch_add(3, Ordering::Relaxed)
     }
 
+    fn task_id() -> u64 {
+        42
+    }
+
     #[test]
     fn scope_records_wall_and_cpu_time() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, 1_000_000_000);
+        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
         reset();
         set_enabled(true);
         drop(scope(Event::NetProtocolTurn).bytes(64).packets(2));
@@ -982,6 +1291,13 @@ mod tests {
         assert_eq!(value.off_cpu_ns, 4);
         assert_eq!(value.bytes, 64);
         assert_eq!(value.packets, 2);
+        let trace = trace_record(1, 0).expect("scope trace record");
+        assert_eq!(trace.kind, TraceKind::Scope);
+        assert_eq!(trace.event, Event::NetProtocolTurn);
+        assert_eq!(trace.task_id, 42);
+        assert_eq!(trace.duration_cycles, 7);
+        assert_eq!(trace.arg0, 64);
+        assert_eq!(trace.arg1, 2);
 
         let stale = scope(Event::NetWorkerTurn);
         reset();
@@ -993,7 +1309,7 @@ mod tests {
     #[test]
     fn histogram_and_sampler_are_bounded() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, 1_000_000_000);
+        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
         reset();
         set_enabled(true);
         observe(Metric::IngressRingDepth, 17);
@@ -1023,7 +1339,7 @@ mod tests {
     #[test]
     fn reset_and_freeze_invalidate_old_scopes() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, 1_000_000_000);
+        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
         start();
         let stale = scope(Event::NetWorkerTurn);
         freeze();
@@ -1045,7 +1361,7 @@ mod tests {
         fn changing_cpu() -> usize {
             CPU.load(Ordering::Relaxed)
         }
-        install(clock, changing_cpu, task_cpu_ns, 1_000_000_000);
+        install(clock, changing_cpu, task_cpu_ns, task_id, 1_000_000_000);
         start();
         CPU.store(0, Ordering::Relaxed);
         let scope = scope(Event::NetProtocolTurn);
@@ -1058,7 +1374,7 @@ mod tests {
     #[test]
     fn event_filter_and_long_latency_histogram_are_preserved() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, 1_000_000_000);
+        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
         start();
         set_event_mask(1u64 << Event::WaitTimer as usize);
         record_duration(Event::WaitFutex, 5_000_000_000);
@@ -1068,6 +1384,27 @@ mod tests {
         assert_eq!(timer.calls, 1);
         assert_eq!(histogram_percentile(&timer.latency, 50), 1u64 << 32);
         set_event_mask(ALL_EVENT_MASK);
+        stop();
+    }
+
+    #[test]
+    fn trace_ring_overwrites_oldest_records_and_freezes_cleanly() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
+        start();
+        for value in 0..TRACE_SLOTS_PER_CPU as u64 + 3 {
+            trace_task_event(TraceKind::TaskWake, Event::WaitOther, task_id(), value, 0);
+        }
+        freeze();
+        let window = trace_window(1);
+        assert_eq!(window.first_sequence, 3);
+        assert_eq!(window.next_sequence, TRACE_SLOTS_PER_CPU as u64 + 3);
+        assert_eq!(window.overwritten, 3);
+        assert!(trace_record(1, 2).is_none());
+        let first = trace_record(1, 3).expect("oldest retained trace record");
+        assert_eq!(first.arg0, 3);
+        trace_task_event(TraceKind::TaskWake, Event::WaitOther, task_id(), 9999, 0);
+        assert_eq!(trace_window(1), window);
         stop();
     }
 }
