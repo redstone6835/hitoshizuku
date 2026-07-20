@@ -244,6 +244,8 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         // 快速 syscall resume：Rust ABI 已保持 s0-s10；frame-rewrite syscall 会被
         // handler 强制送往完整恢复，因此这里无需重复加载未变化的 callee-saved GPR。
+        // handler 返回时 SIE 可能已开启；先关中断，再进入脆弱恢复窗口。
+        "csrci {sstatus}, 2",
         "mv s11, a0",
         "li t0, 1",
         "sd t0, {entry_state_off}(tp)",
