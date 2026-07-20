@@ -28,6 +28,8 @@ mod sched;
 mod start;
 mod stdio;
 mod syscalls;
+#[cfg(any(feature = "kernel-tests", feature = "smp-tests"))]
+mod tests;
 mod tty_poll;
 mod user;
 mod vdso;
@@ -124,7 +126,8 @@ fn main() -> ! {
     #[cfg(any(
         feature = "kernel-tests",
         feature = "network-tests",
-        feature = "allocator-tests"
+        feature = "allocator-tests",
+        feature = "smp-tests"
     ))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);
