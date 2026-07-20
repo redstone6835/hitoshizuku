@@ -40,6 +40,7 @@ use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
+static FILE_MAX: AtomicU64 = AtomicU64::new(i64::MAX as u64);
 
 const ROOT_INO: u64 = 1;
 const FILESYSTEMS_INO: u64 = 2;
@@ -62,6 +63,8 @@ const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
 const INTERRUPTS_INO: u64 = 21;
+const SYS_FS_INO: u64 = 22;
+const SYS_FILE_MAX_INO: u64 = 23;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -230,6 +233,7 @@ enum ProcFileKind {
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
     SysPidMax,
+    SysFileMax,
 }
 
 #[derive(Clone, Copy)]
@@ -1031,6 +1035,65 @@ impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
+            "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_KERNEL_INO,
+                    name: SmallStr::new("kernel"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_FS_INO,
+                    name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+            ],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_fs_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysFsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysFsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysFsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "file-max" => Ok(proc_sys_file_max_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1043,9 +1106,9 @@ impl InodeOps for ProcSysDirOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
             snapshot: vec![DirEntry {
-                ino: SYS_KERNEL_INO,
-                name: SmallStr::new("kernel"),
-                kind: FileType::Directory,
+                ino: SYS_FILE_MAX_INO,
+                name: SmallStr::new("file-max"),
+                kind: FileType::Regular,
             }],
         }))
     }
@@ -1053,6 +1116,7 @@ impl InodeOps for ProcSysDirOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -1141,6 +1205,20 @@ fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPidMax,
+        }),
+    )
+}
+
+fn proc_sys_file_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FILE_MAX_INO,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysFileMax,
         }),
     )
 }
@@ -1701,6 +1779,8 @@ impl InodeOps for ProcRegularInodeOps {
                 Ok(())
             }
             ProcFileKind::SysHotplug => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysFileMax if size == 0 => Ok(()),
+            ProcFileKind::SysFileMax => Err(VfsError::InvalidArgument),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -1735,6 +1815,14 @@ impl FileOps for ProcRegularFile {
                 let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
                 let trimmed = text.trim_end_matches(|ch| ch == '\n' || ch == '\0');
                 *HOTPLUG_PATH.lock() = String::from(trimmed);
+                Ok(buf.len())
+            }
+            ProcFileKind::SysFileMax => {
+                if offset != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let value = vfs::sysctl::parse_nonnegative_long(buf)?;
+                FILE_MAX.store(value, Ordering::Relaxed);
                 Ok(buf.len())
             }
             _ => Err(VfsError::ReadOnlyFilesystem),
@@ -1801,6 +1889,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysFileMax => Ok(render_file_max().into_bytes()),
     }
 }
 
@@ -2220,6 +2309,10 @@ fn render_hotplug() -> String {
 
 fn render_pid_max() -> String {
     format!("{}\n", sched::pid::DEFAULT_PID_MAX)
+}
+
+fn render_file_max() -> String {
+    format!("{}\n", FILE_MAX.load(Ordering::Relaxed))
 }
 
 fn render_filesystems() -> String {

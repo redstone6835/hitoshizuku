@@ -36,6 +36,7 @@ pub mod socket;
 pub mod stat;
 pub mod superblock;
 pub mod sync;
+pub mod sysctl;
 pub mod timerfd;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
