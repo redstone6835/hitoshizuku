@@ -246,6 +246,8 @@ impl ElmResourceBudget {
     /// BuildBound 组件已经通过不可变清单、镜像摘要和内核接口指纹验证，但它仍是受
     /// `elm-mgr` 管理的独立单元，因此不能绕过资源核算。该预算只预留驱动和基础服务
     /// 正常运行所需的资源，并为后续动态装载保留至少一半 CPU 配额和大部分管理容量。
+    /// 动态内存上限不得低于普通 ELM，因为网络栈等基础服务会按在线 CPU 建立状态分片；
+    /// 管理对象数量和 CPU 时间仍使用更严格的 BuildBound 上限。
     pub const BUILD_BOUND: Self = Self {
         max_provider_ports: 8,
         max_provider_queue: 8,
@@ -257,7 +259,7 @@ impl ElmResourceBudget {
         max_concurrent_calls: 8,
         max_native_image_bytes: 16 * 1024 * 1024,
         max_native_stack_bytes: 2 * 1024 * 1024,
-        max_dynamic_alloc_bytes: 32 * 1024 * 1024,
+        max_dynamic_alloc_bytes: 64 * 1024 * 1024,
         max_cpu_time_ns_per_call: 1_000_000_000,
         cpu_budget_ns_per_period: 500_000_000,
         cpu_period_ns: 10_000_000_000,
