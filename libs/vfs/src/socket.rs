@@ -401,11 +401,11 @@ impl FileOps for SocketFileOps {
         false
     }
 
-    fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
-        if _cmd.raw() == SIOCATMARK {
+    fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
+        if cmd.raw() == SIOCATMARK {
             return Ok(self.socket.sock_at_mark() as usize);
         }
-        Err(Errno::ENOTTY)
+        crate::net_socket::dispatch_net_ioctl(cmd.raw() as u32, arg)
     }
 
     fn release(&self) {
@@ -818,6 +818,9 @@ pub fn getsockname(fdt: &FdTable, fd: Fd) -> Result<Vec<u8>, Errno> {
         let len = net_ops.getsockname(&mut buf)?;
         buf.truncate(len);
         return Ok(buf);
+    }
+    if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        return Ok(nl_ops.local_address().to_vec());
     }
     let socket = socket_from_file(&file)?;
     Ok(encode_sockaddr_un(&socket.local_address()))

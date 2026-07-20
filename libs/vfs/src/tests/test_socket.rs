@@ -23,7 +23,7 @@ use crate::cred::{Credentials, Gid, Uid};
 use crate::dentry::{Dentry, VfsRoot};
 use crate::error::{VfsError, VfsResult};
 use crate::fdtable::{Fd, FdFlags, FdTable};
-use crate::file::{DirEntry, FileOps, OpenOptions, PollEvents};
+use crate::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 use crate::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use crate::limits::VfsLimits;
 use crate::mount::{Mount, MountFlags, MountNamespace};
@@ -367,6 +367,10 @@ fn read_i64_pair(bytes: &[u8]) -> (i64, i64) {
         i64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
         i64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
     )
+}
+
+fn test_net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
+    Ok(cmd as usize + arg)
 }
 
 fn make_plain_file(fx: &Fixture) -> Fd {
@@ -1064,6 +1068,89 @@ fn invalid_sockaddr_and_wrong_fd_errors_are_mapped_at_vfs_boundary() {
         vsock::recv(&fx.fdt, fd, &mut buf, 0, false, 0x8000_0000, None).map(|out| out.len),
         Err(Errno::EINVAL)
     );
+}
+
+#[ktest]
+fn unix_socket_delegates_interface_ioctl_to_network_runtime() {
+    crate::net_socket::install_net_ioctl_handler(test_net_ioctl);
+    let fx = fixture();
+    let fd = vsock::socket(
+        &fx.ctx,
+        &fx.fdt,
+        vsock::AF_UNIX as usize,
+        vsock::SOCK_DGRAM,
+        0,
+    )
+    .expect("socket");
+    let file = fx.fdt.get_file(fd).expect("socket file");
+    let command = 0x8933usize;
+    let argument = 17usize;
+
+    assert_eq!(
+        file.ioctl(IoctlCmd::new(command), argument),
+        Ok(command + argument)
+    );
+}
+
+#[ktest]
+fn netlink_bind_assigns_port_and_getsockname_returns_sockaddr_nl() {
+    let fx = fixture();
+    let fd = vsock::socket(&fx.ctx, &fx.fdt, 16, vsock::SOCK_RAW, 0).expect("netlink socket");
+    let mut requested = [0u8; 12];
+    requested[..2].copy_from_slice(&16u16.to_ne_bytes());
+    vsock::bind(&fx.ctx, &fx.fdt, fd, &requested).expect("netlink bind");
+
+    let address = vsock::getsockname(&fx.fdt, fd).expect("netlink getsockname");
+    assert_eq!(address.len(), 12);
+    assert_eq!(u16::from_ne_bytes(address[..2].try_into().unwrap()), 16);
+    assert_ne!(u32::from_ne_bytes(address[4..8].try_into().unwrap()), 0);
+    assert_eq!(u32::from_ne_bytes(address[8..12].try_into().unwrap()), 0);
+}
+
+#[ktest]
+fn netlink_route_dump_replies_with_the_bound_port_id() {
+    let fx = fixture();
+    let fd = vsock::socket(&fx.ctx, &fx.fdt, 16, vsock::SOCK_RAW, 0).expect("netlink socket");
+    let mut requested = [0u8; 12];
+    requested[..2].copy_from_slice(&16u16.to_ne_bytes());
+    vsock::bind(&fx.ctx, &fx.fdt, fd, &requested).expect("netlink bind");
+    let address = vsock::getsockname(&fx.fdt, fd).expect("netlink getsockname");
+    let local_pid = u32::from_ne_bytes(address[4..8].try_into().unwrap());
+
+    let sequence = 0x1234_5678u32;
+    let mut request = [0u8; 20];
+    request[..4].copy_from_slice(&20u32.to_ne_bytes());
+    request[4..6].copy_from_slice(&18u16.to_ne_bytes());
+    request[6..8].copy_from_slice(&0x301u16.to_ne_bytes());
+    request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    assert_eq!(
+        vsock::send(&fx.ctx, &fx.fdt, fd, &request, &[], None, 0),
+        Ok(request.len())
+    );
+
+    let mut response = [0u8; 8192];
+    let output = vsock::recv(&fx.fdt, fd, &mut response, 0, false, 0, None).expect("netlink recv");
+    assert!(output.len >= 20);
+    let mut offset = 0usize;
+    let mut saw_done = false;
+    while offset + 16 <= output.len {
+        let length = u32::from_ne_bytes(response[offset..offset + 4].try_into().unwrap()) as usize;
+        assert!(length >= 16);
+        assert!(offset + length <= output.len);
+        assert_eq!(
+            u32::from_ne_bytes(response[offset + 8..offset + 12].try_into().unwrap()),
+            sequence
+        );
+        assert_eq!(
+            u32::from_ne_bytes(response[offset + 12..offset + 16].try_into().unwrap()),
+            local_pid
+        );
+        if u16::from_ne_bytes(response[offset + 4..offset + 6].try_into().unwrap()) == 3 {
+            saw_done = true;
+        }
+        offset += (length + 3) & !3;
+    }
+    assert!(saw_done);
 }
 
 #[ktest]
