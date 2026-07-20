@@ -1781,6 +1781,8 @@ fn ipv4_network(address: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
 
 const IFREQ_LEN: usize = 40;
 const IFNAMSIZ: usize = 16;
+const IFCONF_LEN: usize = 16;
+const IFCONF_BUF_PTR_OFFSET: usize = 8;
 const AF_INET: u16 = 2;
 const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: u16 = 0x1;
@@ -1789,6 +1791,7 @@ const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
 const IFF_MULTICAST: u16 = 0x1000;
 const SIOCGIFNAME: u32 = 0x8910;
+const SIOCGIFCONF: u32 = 0x8912;
 const SIOCGIFFLAGS: u32 = 0x8913;
 const SIOCSIFFLAGS: u32 = 0x8914;
 const SIOCGIFADDR: u32 = 0x8915;
@@ -1814,6 +1817,9 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
     if arg == 0 {
         return Err(Errno::EFAULT);
     }
+    if cmd == SIOCGIFCONF {
+        return ioctl_get_interface_config(arg);
+    }
     let mut ifreq = [0u8; IFREQ_LEN];
     copy_from_user(arg, &mut ifreq).map_err(|error| error.as_errno())?;
     if cmd == SIOCGIFNAME {
@@ -1822,7 +1828,7 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         let device = devices
             .iter()
             .find(|device| device.snapshot.id.raw() == index as u32)
-            .ok_or(Errno::ENODEV)?;
+            .ok_or(Errno::ENXIO)?;
         write_ifreq_name(&mut ifreq, device.snapshot.name.as_bytes());
         copy_to_user(arg, &ifreq).map_err(|error| error.as_errno())?;
         return Ok(0);
@@ -1937,6 +1943,61 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         _ => return Err(Errno::EOPNOTSUPP),
     }
     copy_to_user(arg, &ifreq).map_err(|error| error.as_errno())?;
+    Ok(0)
+}
+
+fn ioctl_get_interface_config(arg: usize) -> Result<usize, Errno> {
+    let mut ifconf = [0u8; IFCONF_LEN];
+    copy_from_user(arg, &mut ifconf).map_err(|error| error.as_errno())?;
+    let buffer_len = i32::from_ne_bytes(ifconf[..4].try_into().unwrap()).max(0) as usize;
+    let buffer = usize::from_ne_bytes(
+        ifconf[IFCONF_BUF_PTR_OFFSET..IFCONF_BUF_PTR_OFFSET + core::mem::size_of::<usize>()]
+            .try_into()
+            .unwrap(),
+    );
+    let devices: Vec<NetDeviceSnapshot> = DEVICES
+        .lock()
+        .iter()
+        .map(|device| device.snapshot.clone())
+        .collect();
+    let config = CONFIG_STORE.lock().as_ref().map(|store| store.snapshot());
+
+    let available = if buffer == 0 {
+        devices.len()
+    } else {
+        devices.len().min(buffer_len / IFREQ_LEN)
+    };
+    if buffer != 0 {
+        for (index, device) in devices.iter().take(available).enumerate() {
+            let mut ifreq = [0u8; IFREQ_LEN];
+            write_ifreq_name(&mut ifreq, device.name.as_bytes());
+            ifreq[16..18].copy_from_slice(&AF_INET.to_ne_bytes());
+            let interface = InterfaceId(device.id.raw());
+            if let Some(address) = config.as_ref().and_then(|snapshot| {
+                snapshot.addresses.iter().find_map(|entry| {
+                    (entry.interface == interface)
+                        .then_some(entry)
+                        .and_then(|entry| {
+                            if let IpAddr::V4(address) = entry.address {
+                                Some(address)
+                            } else {
+                                None
+                            }
+                        })
+                })
+            }) {
+                ifreq[20..24].copy_from_slice(&address.0);
+            }
+            let offset = index
+                .checked_mul(IFREQ_LEN)
+                .and_then(|offset| buffer.checked_add(offset))
+                .ok_or(Errno::EFAULT)?;
+            copy_to_user(offset, &ifreq).map_err(|error| error.as_errno())?;
+        }
+    }
+
+    ifconf[..4].copy_from_slice(&((available * IFREQ_LEN) as i32).to_ne_bytes());
+    copy_to_user(arg, &ifconf).map_err(|error| error.as_errno())?;
     Ok(0)
 }
 

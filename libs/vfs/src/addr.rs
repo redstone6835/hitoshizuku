@@ -6,6 +6,7 @@
 use errno::Errno;
 use net::{Endpoint, IpAddr, Ipv4Addr, Ipv6Addr};
 
+pub const AF_UNSPEC: u16 = 0;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
 

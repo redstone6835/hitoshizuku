@@ -52,6 +52,7 @@ BUSYBOX_SKELETON := userland/busybox-initramfs
 PACK_INITRAMFS := scripts/pack-initramfs.sh
 
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
+INIT_KEYWAIT_SRC := userland/init-keywait.c
 
 ifeq ($(strip $(ARCH)),)
 SELECTED_ARCHES := $(LA_ARCH) $(RV_ARCH)
@@ -187,6 +188,10 @@ define build_elm_user_tools
 		$(ELMCTL_SRC) -o $(BUILD_DIR)/$(1)/elm-user/elmctl
 	-$(3)strip $(BUILD_DIR)/$(1)/elm-user/elmctl
 	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/elmctl $(2)/bin/
+	$(3)gcc -std=c11 -static -Os -Wall -Wextra \
+		$(INIT_KEYWAIT_SRC) -o $(BUILD_DIR)/$(1)/elm-user/init-keywait
+	-$(3)strip $(BUILD_DIR)/$(1)/elm-user/init-keywait
+	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/init-keywait $(2)/bin/
 endef
 
 define prepare_compat_rootfs

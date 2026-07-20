@@ -26,7 +26,9 @@ use crate::boot::BootAllocator;
 use crate::error::RegistryError;
 use crate::request::{AllocationKind, AllocationRecord, MemoryDomain};
 
-const DEFAULT_BUCKETS: usize = 4096;
+// 注册表覆盖所有内核堆对象，桶数需要按长期活跃对象规模配置。两份 usize 数组
+// （桶头与链长）合计占用 1 MiB，避免文件系统等高分配负载退化成长链扫描。
+const DEFAULT_BUCKETS: usize = 65_536;
 const REGISTRY_NODE_REFILL: usize = 64;
 /// registry 固定分片数。保持 2 的幂，才能用哈希低位直接选择 shard。
 const REGISTRY_SHARDS: usize = 64;
@@ -135,6 +137,7 @@ impl AllocationRegistryAuditFlags {
     pub const WRONG_BUCKET: Self = Self(1 << 10);
     pub const ACCOUNTING_UNDERFLOW: Self = Self(1 << 11);
     pub const CHAIN_CORRUPTION_OBSERVED: Self = Self(1 << 12);
+    pub const BUCKET_LENGTH_MISMATCH: Self = Self(1 << 13);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -165,6 +168,8 @@ struct RegistryNode {
 
 struct AllocationRegistryInner {
     buckets: *mut usize,
+    /// 每个桶当前的链长。它与桶头数组在同一块 metadata 内存中连续存放。
+    bucket_lengths: *mut usize,
     bucket_count: usize,
     /// 空闲 RegistryNode 单链表的头地址。
     ///
@@ -193,6 +198,7 @@ impl AllocationRegistryInner {
     const fn new() -> Self {
         Self {
             buckets: null_mut(),
+            bucket_lengths: null_mut(),
             bucket_count: 0,
             free_nodes: 0,
             free_node_count: 0,
@@ -265,7 +271,14 @@ impl AllocationRegistry {
                 continue;
             }
 
-            let layout = match Layout::array::<usize>(buckets_per_shard) {
+            let metadata_slots = match buckets_per_shard.checked_mul(2) {
+                Some(count) => count,
+                None => {
+                    shard.inner.lock().initializing = false;
+                    return false;
+                }
+            };
+            let layout = match Layout::array::<usize>(metadata_slots) {
                 Ok(layout) => layout,
                 Err(_) => {
                     shard.inner.lock().initializing = false;
@@ -277,7 +290,7 @@ impl AllocationRegistry {
                 shard.inner.lock().initializing = false;
                 return false;
             }
-            for idx in 0..buckets_per_shard {
+            for idx in 0..metadata_slots {
                 unsafe {
                     buckets.add(idx).write(0);
                 }
@@ -289,6 +302,7 @@ impl AllocationRegistry {
                 continue;
             }
             inner.buckets = buckets;
+            inner.bucket_lengths = unsafe { buckets.add(buckets_per_shard) };
             inner.bucket_count = buckets_per_shard;
             inner.free_nodes = 0;
             inner.free_node_count = 0;
@@ -396,6 +410,7 @@ impl AllocationRegistry {
             inner.live_records += 1;
             inner.live_by_kind[kind_index(record.kind)] += 1;
             let chain_len = 1 + chain_len_before;
+            set_bucket_chain_len(&inner, bucket, chain_len);
             if chain_len > inner.max_chain_len {
                 inner.max_chain_len = chain_len;
             }
@@ -496,6 +511,12 @@ impl AllocationRegistry {
 
             let node = read_node(current);
             if node.record.ptr == ptr {
+                let old_chain_len = bucket_chain_len(&inner, bucket);
+                if old_chain_len == 0 {
+                    note_chain_corruption_locked(&mut inner);
+                    inner.remove_failures += 1;
+                    return Err(RegistryError::InvalidRecord);
+                }
                 if prev == 0 {
                     set_bucket_head(&inner, bucket, node.next);
                 } else {
@@ -503,7 +524,8 @@ impl AllocationRegistry {
                     prev_node.next = node.next;
                     write_node(prev, prev_node);
                 }
-                refresh_max_chain_len_after_remove_locked(&mut inner, bucket);
+                set_bucket_chain_len(&inner, bucket, old_chain_len - 1);
+                refresh_max_chain_len_after_remove_locked(&mut inner, old_chain_len);
 
                 let mut recycled = node;
                 recycled.next = inner.free_nodes;
@@ -640,7 +662,8 @@ impl AllocationRegistry {
             }
             out.initialized_shards += 1;
 
-            if inner.buckets.is_null() || inner.bucket_count == 0 {
+            if inner.buckets.is_null() || inner.bucket_lengths.is_null() || inner.bucket_count == 0
+            {
                 shard_flags.insert(AllocationRegistryAuditFlags::NULL_BUCKETS);
                 out.corrupt_shards += 1;
                 out.flags.insert(shard_flags);
@@ -692,7 +715,11 @@ impl AllocationRegistry {
         let mut out = AllocationOwnerStats::default();
         for shard in &self.shards {
             let inner = shard.inner.lock();
-            if !inner.initialized || inner.buckets.is_null() || inner.bucket_count == 0 {
+            if !inner.initialized
+                || inner.buckets.is_null()
+                || inner.bucket_lengths.is_null()
+                || inner.bucket_count == 0
+            {
                 out.scan_errors = out.scan_errors.saturating_add(1);
                 continue;
             }
@@ -811,6 +838,9 @@ fn audit_shard_locked(
 
             current = node.next;
         }
+        if bucket_chain_len(inner, bucket) != chain_len {
+            flags.insert(AllocationRegistryAuditFlags::BUCKET_LENGTH_MISMATCH);
+        }
         scan.max_chain_len = scan.max_chain_len.max(chain_len);
     }
 
@@ -882,32 +912,23 @@ fn note_chain_corruption_locked(inner: &mut AllocationRegistryInner) {
     inner.chain_corruptions = inner.chain_corruptions.saturating_add(1);
 }
 
-fn refresh_max_chain_len_after_remove_locked(inner: &mut AllocationRegistryInner, bucket: usize) {
-    let new_bucket_len = match bounded_chain_len(bucket_head(inner, bucket), inner.nodes_allocated)
-    {
-        Ok(len) => len,
-        Err(()) => {
-            note_chain_corruption_locked(inner);
-            return;
-        }
-    };
-    if new_bucket_len.saturating_add(1) != inner.max_chain_len {
+fn refresh_max_chain_len_after_remove_locked(
+    inner: &mut AllocationRegistryInner,
+    old_bucket_len: usize,
+) {
+    if old_bucket_len != inner.max_chain_len {
         return;
     }
 
-    match recompute_max_chain_len_locked(inner) {
-        Ok(max_chain_len) => inner.max_chain_len = max_chain_len,
-        Err(()) => note_chain_corruption_locked(inner),
-    }
+    inner.max_chain_len = recompute_max_chain_len_locked(inner);
 }
 
-fn recompute_max_chain_len_locked(inner: &AllocationRegistryInner) -> Result<usize, ()> {
+fn recompute_max_chain_len_locked(inner: &AllocationRegistryInner) -> usize {
     let mut max_chain_len = 0usize;
     for bucket in 0..inner.bucket_count {
-        let chain_len = bounded_chain_len(bucket_head(inner, bucket), inner.nodes_allocated)?;
-        max_chain_len = max_chain_len.max(chain_len);
+        max_chain_len = max_chain_len.max(bucket_chain_len(inner, bucket));
     }
-    Ok(max_chain_len)
+    max_chain_len
 }
 
 fn recycle_node_list_locked(inner: &mut AllocationRegistryInner, head: usize, count: usize) {
@@ -957,7 +978,14 @@ fn alloc_node_batch() -> Option<(usize, usize)> {
 }
 
 fn hash_ptr(ptr: usize) -> usize {
-    (ptr >> 3) ^ (ptr >> 11) ^ (ptr >> 19) ^ (ptr >> 27)
+    // SplitMix64 的终结混合能打散 slab 地址中的页号、size class 和对齐低位相关性。
+    let mut value = ptr as u64;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value as usize
 }
 
 fn bucket_index(hash: usize, bucket_count: usize) -> usize {
@@ -986,6 +1014,16 @@ fn bucket_head(inner: &AllocationRegistryInner, bucket: usize) -> usize {
 fn set_bucket_head(inner: &AllocationRegistryInner, bucket: usize, head: usize) {
     unsafe {
         inner.buckets.add(bucket).write(head);
+    }
+}
+
+fn bucket_chain_len(inner: &AllocationRegistryInner, bucket: usize) -> usize {
+    unsafe { *inner.bucket_lengths.add(bucket) }
+}
+
+fn set_bucket_chain_len(inner: &AllocationRegistryInner, bucket: usize, length: usize) {
+    unsafe {
+        inner.bucket_lengths.add(bucket).write(length);
     }
 }
 
@@ -1024,18 +1062,6 @@ fn find_node_and_chain_len(
         head = node.next;
     }
     Ok((None, len))
-}
-
-fn bounded_chain_len(mut head: usize, limit: usize) -> Result<usize, ()> {
-    let mut len = 0usize;
-    while head != 0 {
-        if len >= limit {
-            return Err(());
-        }
-        len += 1;
-        head = read_node(head).next;
-    }
-    Ok(len)
 }
 
 fn kind_index(kind: AllocationKind) -> usize {

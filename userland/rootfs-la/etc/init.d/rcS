@@ -20,30 +20,54 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+enter_shell=0
+trap 'enter_shell=1' INT
+echo "[init] press Ctrl+C within 3 seconds to enter shell"
+/bin/init-keywait 3000
+keywait_status=$?
+trap - INT
+
+if [ "$enter_shell" -eq 1 ] || [ "$keywait_status" -eq 0 ]; then
+    echo "[init] Ctrl+C detected, entering shell"
+    exec /bin/sh -i
+fi
+if [ "$keywait_status" -ne 1 ]; then
+    echo "[init] Ctrl+C detector failed with status $keywait_status; continuing tests"
+fi
+
+shutdown_system() {
+    status=$1
+    sync
+    echo "[init] powering off with test status $status"
+    poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || \
+        reboot -f >/dev/null 2>&1 || true
+    exit "$status"
+}
+
 if ! mount -t ext4 /dev/vd0 /mnt; then
     echo "[init] failed to mount /dev/vd0 at /mnt"
-    exit 1
+    shutdown_system 1
 fi
 
 echo "[init] mounted /dev/vd0 at /mnt"
 
-# 测试程序需要在测试盘自己的根目录、库和工具链中运行。
+# CAgent 必须在测试盘自己的 glibc 根环境中运行。
 mkdir -p /mnt/proc /mnt/sys /mnt/dev /mnt/tmp
 mount -t proc proc /mnt/proc 2>/dev/null || true
 mount -t sysfs sysfs /mnt/sys 2>/dev/null || true
 mount -t devtmpfs devtmpfs /mnt/dev 2>/dev/null || true
 
-runner=/mnt/tmp/.shiori-run-glibc-tests
+runner=/mnt/tmp/.shiori-run-cagent-tests
 if ! cp /etc/init.d/run-glibc-tests "$runner"; then
-    echo "[init] failed to install glibc test runner"
-    exit 1
+    echo "[init] failed to install CAgent test runner"
+    shutdown_system 1
 fi
 chmod 0755 "$runner" 2>/dev/null || true
 
 echo "[init] switching to the glibc test root"
-chroot /mnt /bin/bash /tmp/.shiori-run-glibc-tests
+chroot /mnt /bin/bash /tmp/.shiori-run-cagent-tests
 status=$?
 
 rm -f "$runner"
-echo "[init] glibc tests finished with status $status"
-exit "$status"
+echo "[init] CAgent tests finished with status $status"
+shutdown_system "$status"

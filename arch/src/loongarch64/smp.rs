@@ -281,13 +281,17 @@ fn wait_for_shootdown(kind: usize, targets: usize, expected: &[usize; MAX_CPUS])
             // 避免双方都处于关中断临界区时相互等待。
             handle_shootdown_requests();
             if stable_counter_raw().wrapping_sub(started_at) >= timeout_ticks {
+                let observed = completed.load(Ordering::Acquire);
+                if shootdown_sequence_reached(observed, expected[logical_id]) {
+                    break;
+                }
                 panic!(
                     "[smp] shootdown 确认超时 kind={} source={} target={} expected={} completed={} online={:#x}",
                     kind,
                     LoongArch64MessageInterruptOps::current_cpu_id(),
                     logical_id,
                     expected[logical_id],
-                    completed.load(Ordering::Acquire),
+                    observed,
                     ONLINE_CPUS.load(Ordering::Acquire),
                 );
             }

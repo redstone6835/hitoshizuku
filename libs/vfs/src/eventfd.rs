@@ -141,6 +141,10 @@ impl FileOps for EventfdFileOps {
         self.write_wait.remove(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn poll_source(&self) -> Option<&PollSource> {
         Some(&self.poll_source)
     }

@@ -60,6 +60,7 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
         Arc::clone(&tgroup),
         Arc::clone(&pgroup),
     );
+    child.inherit_timer_slack_from(parent);
 
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_leader(&child);
@@ -178,11 +179,13 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let new_tg = if flags.has(CloneFlags::CLONE_THREAD) {
         parent_tg
     } else {
-        // CLONE_SIGHAND 共享 SharedSignal（即便不 CLONE_THREAD）。
+        // CLONE_SIGHAND 只共享 handler 表；独立线程组必须拥有自己的
+        // 进程级 pending 队列。CLONE_THREAD 才复用完整 SharedSignal。
         let tg = if flags.has(CloneFlags::CLONE_SIGHAND) {
-            ThreadGroup::new_sharing_signal(Arc::clone(parent_tg.shared_signal()))
+            ThreadGroup::new_sharing_signal(Arc::new(parent_tg.shared_signal().clone_sighand()))
         } else {
-            // 不共享 → 深拷一份 sigaction。
+            // 不共享时深拷 sigaction；CLEAR_SIGHAND 只重置用户处理函数，父进程
+            // 显式忽略的信号仍须保持 SIG_IGN。
             let copied = if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
                 parent_tg.shared_signal().fork_copy_clearing_handlers()
             } else {
@@ -215,6 +218,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&new_tg),
         Arc::clone(&pg),
     );
+    child.inherit_timer_slack_from(parent);
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
     if flags.has(CloneFlags::CLONE_VM) && !flags.has(CloneFlags::CLONE_VFORK) {
