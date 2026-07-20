@@ -463,6 +463,14 @@ impl SharedSignal {
         }
     }
 
+    /// 为 `CLONE_CLEAR_SIGHAND` 深拷信号表，并把所有用户处理函数恢复为默认动作。
+    /// 被显式忽略的信号保持忽略，pending 信号不复制。
+    pub fn fork_copy_clearing_handlers(&self) -> Self {
+        let copied = self.fork_copy();
+        copied.reset_handlers_for_exec();
+        copied
+    }
+
     /// 订阅当前线程组共享 pending 信号变化。
     pub fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
         self.observers.subscribe(observer);
