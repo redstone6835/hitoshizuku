@@ -212,6 +212,7 @@ fn publish_task_cpu_state(task: &Arc<Task>, cpu_id: usize) {
     let Ok(cpu) = u32::try_from(cpu_id) else {
         return;
     };
+    task.publish_rseq_cpu(cpu_id);
     let Some(start_addr) = registration.ptr.checked_add(RSEQ_CPU_ID_START_OFFSET) else {
         return;
     };
@@ -801,6 +802,7 @@ static PROCESS_IMAGE_OPS: ProcessImageOps = ProcessImageOps {
     execve: process_execve,
     clone_user_context: process_clone_user_context,
     sigreturn: process_sigreturn,
+    prepare_user_return: crate::rseq::prepare_user_return,
     setup_signal_frame: process_setup_signal_frame,
 };
 

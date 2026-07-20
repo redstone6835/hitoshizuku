@@ -609,7 +609,8 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
 }
 
 pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    const RSEQ_MIN_SIZE: usize = 32;
+    const RSEQ_SIZE: usize = 32;
+    const RSEQ_ALIGN: usize = 32;
     const RSEQ_FLAG_UNREGISTER: usize = 1;
     let ptr = ctx.args[0];
     let len = ctx.args[1];
@@ -619,7 +620,7 @@ pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if (flags & !RSEQ_FLAG_UNREGISTER) != 0 {
         return Err(Errno::EINVAL);
     }
-    if ptr == 0 || len < RSEQ_MIN_SIZE || len > u32::MAX as usize {
+    if ptr == 0 || len != RSEQ_SIZE || ptr & (RSEQ_ALIGN - 1) != 0 {
         return Err(Errno::EINVAL);
     }
 
@@ -628,20 +629,31 @@ pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         if !current.registered {
             return Err(Errno::EINVAL);
         }
-        if current.ptr != ptr || current.len as usize != len || current.signature != signature {
+        if current.ptr != ptr || current.len as usize != len {
             return Err(Errno::EINVAL);
         }
+        if current.signature != signature {
+            return Err(Errno::EPERM);
+        }
+        reset_rseq_cpu_fields(ptr)?;
         ctx.task().clear_rseq_registration();
         return Ok(0);
     }
 
     if current.registered {
+        if current.ptr != ptr || current.len as usize != len {
+            return Err(Errno::EINVAL);
+        }
+        if current.signature != signature {
+            return Err(Errno::EPERM);
+        }
         return Err(Errno::EBUSY);
     }
 
     // 注册成功前先确认用户区可写，并把当前 CPU 写入 rseq 的两个 CPU 字段。
     // 后续迁移/切换由 kernel::sched 的 TaskCpuStateOps hook 继续刷新。
-    let cpu = sched::current_cpu_id() as u32;
+    let cpu_id = sched::current_cpu_id();
+    let cpu = u32::try_from(cpu_id).map_err(|_| Errno::EINVAL)?;
     write_rseq_cpu_fields(ptr, cpu)?;
     ctx.task().set_rseq_registration(RseqRegistration {
         ptr,
@@ -649,6 +661,7 @@ pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         signature,
         registered: true,
     });
+    ctx.task().publish_rseq_cpu(cpu_id);
     Ok(0)
 }
 
@@ -662,6 +675,15 @@ fn write_rseq_cpu_fields(ptr: usize, cpu: u32) -> Result<(), Errno> {
     let current_addr = ptr.checked_add(RSEQ_CPU_ID_OFFSET).ok_or(Errno::EFAULT)?;
     write_user_u32(start_addr, cpu)?;
     write_user_u32(current_addr, cpu)
+}
+
+fn reset_rseq_cpu_fields(ptr: usize) -> Result<(), Errno> {
+    let start_addr = ptr
+        .checked_add(RSEQ_CPU_ID_START_OFFSET)
+        .ok_or(Errno::EFAULT)?;
+    let current_addr = ptr.checked_add(RSEQ_CPU_ID_OFFSET).ok_or(Errno::EFAULT)?;
+    write_user_u32(start_addr, 0)?;
+    write_user_u32(current_addr, u32::MAX)
 }
 
 pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

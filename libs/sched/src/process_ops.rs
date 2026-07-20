@@ -96,6 +96,8 @@ pub struct ProcessImageOps {
     ) -> Result<(), Errno>,
     /// 从当前 signal frame 恢复用户态上下文。
     pub sigreturn: fn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno>,
+    /// 在恢复用户态前处理 rseq 等依赖当前 PC 和用户地址空间的线程状态。
+    pub prepare_user_return: fn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno>,
     /// 为用户 handler 构造 signal frame。
     pub setup_signal_frame: fn(
         task: &Arc<Task>,

@@ -64,6 +64,7 @@ pub mod pid;
 pub mod placement;
 pub mod process_ops;
 pub mod rlimit;
+pub mod rseq;
 mod runqueue;
 pub mod sched_class;
 pub mod scheduler;
@@ -93,6 +94,7 @@ pub use process_ops::{
     ExecRequest, ProcessImageOps, UserContextRef, process_image_ops, register_process_image_ops,
 };
 pub use rlimit::{Resource, Rlim, RlimitError, RlimitPair, Rlimits, RlimitsLock};
+pub use rseq::{RseqCs, RseqError, RseqEvent, RseqEvents, RseqResumeAction, validate_signature};
 pub use runqueue::RunqueueClassLoad;
 pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,

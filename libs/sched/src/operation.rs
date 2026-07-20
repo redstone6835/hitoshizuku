@@ -22,6 +22,7 @@ use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
 use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
+use crate::rseq::RseqEvent;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
@@ -1621,29 +1622,84 @@ pub fn deliver_pending_signals_for_task(
         }
         SigHandler::Ignore => None,
         SigHandler::Handler(_) => {
-            let Some(ops) = process_image_ops() else {
+            if process_image_ops().is_none() {
                 me.signal.deliver(info);
                 return Some(info);
-            };
-            match (ops.setup_signal_frame)(me, info, action, user_ctx) {
+            }
+            match setup_user_signal_frame_for_task(me, info, action, user_ctx) {
                 Ok(()) => None,
                 Err(Errno::ENOSYS) => {
                     me.signal.deliver(info);
                     Some(info)
                 }
-                Err(_) => {
-                    apply_default_action(SigInfo {
-                        sig: SignalNumber::SIGSEGV,
-                        code: 0,
-                        sender_pid: 0,
-                        sender_uid: crate::ids::Uid::ROOT,
-                        raw: None,
-                    });
-                    None
-                }
+                Err(_) => None,
             }
         }
     }
+}
+
+/// 在保存 signal frame 前先应用 rseq 的 SIGNAL 事件。
+pub fn setup_user_signal_frame_for_task(
+    task: &Arc<Task>,
+    info: SigInfo,
+    action: crate::signal::SigAction,
+    user_ctx: UserContextRef,
+) -> Result<(), Errno> {
+    if user_ctx.is_none() {
+        return Err(Errno::ENOSYS);
+    }
+    let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
+    task.mark_rseq_event(RseqEvent::Signal);
+    if (ops.prepare_user_return)(task, user_ctx).is_err() {
+        task.clear_rseq_registration();
+        apply_default_action(SigInfo {
+            sig: SignalNumber::SIGSEGV,
+            code: 0,
+            sender_pid: 0,
+            sender_uid: crate::ids::Uid::ROOT,
+            raw: None,
+        });
+        return Err(Errno::EFAULT);
+    }
+    match (ops.setup_signal_frame)(task, info, action, user_ctx) {
+        Ok(()) => Ok(()),
+        Err(Errno::ENOSYS) => Err(Errno::ENOSYS),
+        Err(error) => {
+            apply_default_action(SigInfo {
+                sig: SignalNumber::SIGSEGV,
+                code: 0,
+                sender_pid: 0,
+                sender_uid: crate::ids::Uid::ROOT,
+                raw: None,
+            });
+            Err(error)
+        }
+    }
+}
+
+/// 在即将恢复用户态时处理依赖当前 trap frame 的线程状态。
+pub fn prepare_user_return_for_task(
+    task: &Arc<Task>,
+    user_ctx: UserContextRef,
+) -> Result<(), Errno> {
+    if task.is_kernel_task() || user_ctx.is_none() {
+        return Ok(());
+    }
+    let Some(ops) = process_image_ops() else {
+        return Ok(());
+    };
+    let result = (ops.prepare_user_return)(task, user_ctx);
+    if result.is_err() {
+        task.clear_rseq_registration();
+        apply_default_action(SigInfo {
+            sig: SignalNumber::SIGSEGV,
+            code: 0,
+            sender_pid: 0,
+            sender_uid: crate::ids::Uid::ROOT,
+            raw: None,
+        });
+    }
+    result
 }
 
 pub fn apply_default_action(info: SigInfo) {
