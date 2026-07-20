@@ -160,6 +160,8 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         }
         // 清除定时器中断标志（写 CSR_TICLR bit 0）
         if is & IS_TIMER_BIT != 0 {
+            #[cfg(feature = "performance-profile")]
+            profiling::sample_pc(arg0, from_user);
             // LoongArch 的定时器中断通常需要软件显式写 TICLR 清 pending，否则在 `ertn`
             // 后会立即再次陷入，形成“看似无法返回”的中断风暴。
             unsafe {
@@ -193,23 +195,31 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 tf.a0 = recovery.return_value;
                 return arg4;
             }
-            let deadline_fired = sched::on_timer_tick(now_ns);
             let boot_cpu = LoongArch64MessageInterruptOps::current_cpu_id() == 0;
             if boot_cpu {
                 super::super::vdso::run_timer_tick_hook(now_ns);
             }
+            // timer 可能打断持有 runqueue、topology 等普通自旋锁的内核路径。
+            // 内核态 top-half 只记录待处理时间，随后由 syscall 返回或主动调度的
+            // 无锁边界补做调度工作，避免本 CPU 重入锁后永久自旋。
+            if !from_user {
+                sched::defer_timer_tick(now_ns);
+                if boot_cpu && general::elm_guard::active_cell() == 0 {
+                    super::super::vdso::run_net_poll_hook(now_ns);
+                    super::super::vdso::run_tty_poll_hook(now_ns);
+                }
+                return arg4;
+            }
+
+            let deadline_fired = sched::on_timer_tick(now_ns);
             deliver_user_signals_before_return(arg4, from_user);
 
             // deadline 到期时先让被唤醒任务运行，避免网络和 TTY 周期轮询叠加到
-            // 短超时延迟。普通内核临界区仍禁止抢占；idle 任务是唯一已知安全的
-            // 内核态切换边界。
-            let urgent_preempt = deadline_fired
-                && sched::is_ready()
-                && (from_user || sched::current_task_ref().is_idle_task());
+            // 短超时延迟。内核态中断已经在上方返回，此处是安全的用户态返回边界。
+            let urgent_preempt = deadline_fired && sched::is_ready();
             if urgent_preempt {
                 sched::preempt_if_needed(now_ns);
             }
-
             if boot_cpu {
                 // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
                 // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
@@ -222,7 +232,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             }
             // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
             // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
-            if from_user && !urgent_preempt {
+            if !urgent_preempt {
                 sched::preempt_if_needed(now_ns);
             }
             return arg4;

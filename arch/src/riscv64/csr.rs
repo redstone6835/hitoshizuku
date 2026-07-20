@@ -16,6 +16,7 @@
 pub const CSR_SSTATUS: usize = 0x100; // 监管者状态
 pub const CSR_SIE: usize = 0x104; // 中断使能（各源独立）
 pub const CSR_STVEC: usize = 0x105; // 异常入口基地址
+pub const CSR_SCOUNTEREN: usize = 0x106; // 允许 U-mode 读取硬件计数器
 pub const CSR_SSCRATCH: usize = 0x140; // 暂存（trap entry 栈交换）
 pub const CSR_SEPC: usize = 0x141; // 异常返回地址
 pub const CSR_SCAUSE: usize = 0x142; // 异常/中断原因
@@ -35,10 +36,26 @@ pub const SSTATUS_VS_CLEAN: usize = 0b10 << 9; // [10:9]  VS = Clean；向量上
 pub const SSTATUS_VS_DIRTY: usize = 0b11 << 9; // [10:9]  VS = Dirty；向量上下文需要保存
 pub const SSTATUS_FS_MASK: usize = 0b11 << 13; // [14:13] 浮点状态（2-bit 提取掩码）
 pub const SSTATUS_FS_INITIAL: usize = 0b01 << 13; // [14:13] FS = Initial；首次允许用户执行浮点指令
+pub const SSTATUS_FS_CLEAN: usize = 0b10 << 13; // [14:13] FS = Clean；内存副本与硬件一致
 pub const SSTATUS_FS_DIRTY: usize = 0b11 << 13; // [14:13] FS = Dirty；数值恰等于 MASK（0b11 是最大编码值）
 pub const SSTATUS_SUM: usize = 1 << 18; // [18]    S-mode 访问 U 页
 pub const SSTATUS_MXR: usize = 1 << 19; // [19]    execute-only 页可读
+pub const SSTATUS_UXL_MASK: usize = 0b11 << 32; // [33:32] U-mode XLEN
+pub const SSTATUS_UXL_64: usize = 0b10 << 32; // [33:32] U-mode 使用 64-bit XLEN
 pub const SSTATUS_SD: usize = 1 << 63; // [63]    FS|VS 脏位汇总
+
+// ── scounteren 位域 ──────────────────────────────────────────────────────────
+
+/// 允许 U-mode 执行 `rdtime`。S-mode 本身已经依赖 `rdtime`，因此 OpenSBI 的
+/// `mcounteren.TIME` 必然可用；这里补齐从 S-mode 到 U-mode 的最后一级授权。
+pub const SCOUNTEREN_TIME: usize = 1 << 1;
+
+/// 从用户上下文中允许恢复的 `sstatus` 位。
+///
+/// 其它位均由内核拥有：返回 U-mode 时固定清除 SPP/SIE/SUM/MXR，固定设置
+/// SPIE 和 UXL=64，仅允许用户的 FPU/Vector 状态机随上下文恢复。
+pub const SSTATUS_USER_RESTORE_MASK: usize = SSTATUS_FS_MASK | SSTATUS_VS_MASK;
+pub const SSTATUS_USER_RETURN_BASE: usize = SSTATUS_SPIE | SSTATUS_UXL_64;
 
 // ── Vector CSR 编号 ─────────────────────────────────────────────────────────
 
@@ -53,6 +70,7 @@ pub const CSR_VLENB: usize = 0xc22;
 pub const SIE_SSIE: usize = 1 << IRQ_S_SOFT; // S-mode 软件中断使能
 pub const SIE_STIE: usize = 1 << IRQ_S_TIMER; // S-mode 定时器中断使能
 pub const SIE_SEIE: usize = 1 << IRQ_S_EXT; // S-mode 外部中断使能
+pub const SIP_SSIP: usize = SIE_SSIE; // sip.SSIP 与 sie.SSIE 使用相同 bit 位置
 
 // ── scause ────────────────────────────────────────────────────────────────────
 

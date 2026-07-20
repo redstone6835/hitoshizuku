@@ -11,7 +11,7 @@
 
 use alloc::boxed::Box;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use general::mm::{PgdHandle, UserPgdOps};
 use general::{
@@ -21,39 +21,92 @@ use mm::VmFlags;
 
 use crate::riscv64::paging::Riscv64Paging;
 use crate::riscv64::specific::phys_to_virt;
+use spin::Mutex;
 
-static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
-/// ASID 位宽上限（硬件相关，Sv48 通常 16 位 = 65535）。
-/// 初始化时通过探测硬件获取实际值。
+const SATP_ASID_SHIFT: usize = 44;
+const SATP_ASID_MASK: usize = 0xffff;
+const ASID_TAG_BITS: usize = 16;
+
+/// 硬件实际实现的 ASID 掩码。0 表示没有 ASID 支持。
 static MAX_ASID: AtomicUsize = AtomicUsize::new(0xFFFF);
 
-/// 分配下一个 ASID。到达上限时回绕到 1 并 flush 全 TLB。
-// TODO(SMP): 多核时需改为 generation-based 方案——回绕时递增 generation，
-// 各核在 context switch 时 lazy 重分配，避免全核 IPI + 全 TLB flush。
-fn alloc_asid() -> usize {
-    loop {
-        let cur = NEXT_ASID.load(Ordering::Relaxed);
-        let max = MAX_ASID.load(Ordering::Relaxed);
-        let next = if cur >= max { 1 } else { cur + 1 };
-        if NEXT_ASID
-            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            if cur >= max {
-                // 回绕：flush 全 TLB（所有 ASID）
-                unsafe {
-                    core::arch::asm!("sfence.vma zero, zero");
-                }
-            }
-            return cur;
-        }
+#[derive(Clone, Copy)]
+struct AsidAllocator {
+    next: usize,
+    generation: usize,
+}
+
+static ASID_ALLOCATOR: Mutex<AsidAllocator> = Mutex::new(AsidAllocator {
+    next: 1,
+    generation: 1,
+});
+static CURRENT_ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
+
+#[inline]
+const fn make_asid_tag(generation: usize, asid: usize) -> usize {
+    (generation << ASID_TAG_BITS) | asid
+}
+
+#[inline]
+const fn tag_asid(tag: usize) -> usize {
+    tag & SATP_ASID_MASK
+}
+
+#[inline]
+const fn tag_generation(tag: usize) -> usize {
+    tag >> ASID_TAG_BITS
+}
+
+/// 探测 satp.ASID 的 WARL 位宽，并初始化单 hart generation allocator。
+///
+/// 临时写入全 1 ASID 后立即恢复原 satp；调用发生在第一个用户地址空间创建前。
+pub(super) fn init_asid_allocator() {
+    let old_satp = crate::read_csr!(satp);
+    let probe_satp = old_satp | (SATP_ASID_MASK << SATP_ASID_SHIFT);
+    crate::write_csr!(satp, probe_satp);
+    let implemented = (crate::read_csr!(satp) >> SATP_ASID_SHIFT) & SATP_ASID_MASK;
+    crate::write_csr!(satp, old_satp);
+    unsafe { Riscv64Paging::flush_tlb_global(None) };
+
+    MAX_ASID.store(implemented, Ordering::Release);
+    let mut allocator = ASID_ALLOCATOR.lock();
+    allocator.next = 1;
+    allocator.generation = 1;
+    CURRENT_ASID_GENERATION.store(1, Ordering::Release);
+    log::info!(
+        "[arch][mm] satp ASID probe: mask={:#x} bits={}",
+        implemented,
+        implemented.count_ones()
+    );
+}
+
+/// 在当前 generation 中分配 ASID。回绕时只做一次全局 flush；旧地址空间在
+/// 下一次 activate 时 lazy 获取新一代 ASID，因此不会与新地址空间共享 tag。
+fn alloc_asid_tag() -> usize {
+    let max = MAX_ASID.load(Ordering::Acquire);
+    if max == 0 {
+        return 0;
     }
+
+    let mut allocator = ASID_ALLOCATOR.lock();
+    if allocator.next > max {
+        allocator.generation = allocator.generation.wrapping_add(1).max(1);
+        allocator.next = 1;
+        unsafe { Riscv64Paging::flush_tlb_global(None) };
+        CURRENT_ASID_GENERATION.store(allocator.generation, Ordering::Release);
+    }
+
+    let asid = allocator.next;
+    allocator.next += 1;
+    make_asid_tag(allocator.generation, asid)
 }
 
 struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
-    asid: usize,
+    asid_tag: AtomicUsize,
+    needs_page_table_fence: AtomicBool,
+    needs_asid_fence: AtomicBool,
 }
 
 impl UserPgdInner {
@@ -87,11 +140,13 @@ impl UserPgdInner {
             }
         }
 
-        let asid = alloc_asid();
+        let asid_tag = alloc_asid_tag();
         Some(Box::new(Self {
             pgd_phys,
             pgd_virt,
-            asid,
+            asid_tag: AtomicUsize::new(asid_tag),
+            needs_page_table_fence: AtomicBool::new(true),
+            needs_asid_fence: AtomicBool::new(false),
         }))
     }
 
@@ -104,7 +159,20 @@ impl UserPgdInner {
     }
 
     fn asid(&self) -> usize {
-        self.asid
+        let tag = self.asid_tag.load(Ordering::Acquire);
+        if tag == 0 {
+            return 0;
+        }
+
+        let generation = CURRENT_ASID_GENERATION.load(Ordering::Acquire);
+        if tag_generation(tag) == generation {
+            return tag_asid(tag);
+        }
+
+        let new_tag = alloc_asid_tag();
+        self.asid_tag.store(new_tag, Ordering::Release);
+        self.needs_asid_fence.store(true, Ordering::Release);
+        tag_asid(new_tag)
     }
 }
 
@@ -171,15 +239,17 @@ unsafe fn drop_pgd(pgd: PgdHandle) {
     let _ = unsafe { Box::from_raw(raw) };
 }
 
-fn pgd_phys(pgd: PgdHandle) -> PhysPageTableRoot {
-    let inner = unsafe { inner_ref(pgd) };
-    PhysPageTableRoot::new(inner.pgd_phys())
-}
-
 unsafe fn activate(pgd: PgdHandle) {
     let inner = unsafe { inner_ref(pgd) };
+    let asid = inner.asid();
+    let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::AcqRel);
+    let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::AcqRel);
     unsafe {
-        Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(inner.pgd_phys()), inner.asid());
+        Riscv64Paging::activate_with_asid(
+            PhysPageTableRoot::new(inner.pgd_phys()),
+            asid,
+            needs_page_table_fence || needs_asid_fence,
+        );
     }
 }
 
@@ -220,6 +290,7 @@ fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
 
 unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
     let inner = unsafe { inner_ref(pgd) };
+    inner.needs_page_table_fence.store(true, Ordering::Release);
     let root_virt = inner.pgd_virt();
     let read = flags.has(VmFlags::READ);
     let write = flags.has(VmFlags::WRITE);
@@ -243,12 +314,13 @@ unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFl
 
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
+    inner.needs_page_table_fence.store(true, Ordering::Release);
     let _ = unmap_range_entries::<Riscv64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
-    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
     let inner = unsafe { inner_ref(pgd) };
+    inner.needs_page_table_fence.store(true, Ordering::Release);
     let read = flags.has(VmFlags::READ);
     let write = flags.has(VmFlags::WRITE);
     let exec = flags.has(VmFlags::EXEC);
@@ -274,7 +346,6 @@ unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: Vm
         }
         va += Riscv64Paging::PAGE_SIZE;
     }
-    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn clone_for_fork_user_pages(
@@ -331,25 +402,17 @@ unsafe fn clone_for_fork_user_pages(
         }
         va += Riscv64Paging::PAGE_SIZE;
     }
-}
-
-fn lookup_pgd(pgd: PgdHandle, vaddr: usize) -> Option<usize> {
-    let inner = unsafe { inner_ref(pgd) };
-    let root_virt = inner.pgd_virt();
-    find_leaf::<Riscv64Paging>(root_virt, vaddr, phys_to_virt)
-        .map(|(_, _, pte)| Riscv64Paging::pte_addr(pte))
-        .ok()
-}
-
-#[allow(dead_code)]
-fn get_asid(pgd: PgdHandle) -> usize {
-    let inner = unsafe { inner_ref(pgd) };
-    inner.asid()
+    dst_inner
+        .needs_page_table_fence
+        .store(true, Ordering::Release);
 }
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
     flush_user_tlb_range(inner.asid(), vaddr, len);
+    // 本次定向 fence 已覆盖相应页表修改，但不能消费新一代 ASID 的首次激活
+    // 标记；后者要求 activate() 在安装该 ASID 时完成一次完整 ASID fence。
+    inner.needs_page_table_fence.store(false, Ordering::Release);
 }
 
 unsafe fn count_mapped_pages(pgd: PgdHandle, vaddr: usize, len: usize) -> usize {

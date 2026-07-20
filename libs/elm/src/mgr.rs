@@ -258,6 +258,9 @@ pub const ELM_POLICY_BLOCK_SCOPE_DENIED: u64 = 1 << 34;
 pub const ELM_POLICY_BLOCK_POLICY_ESCALATION: u64 = 1 << 35;
 /// `ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE` 策略能力位；策略求值器以此决定是否允许对应操作。
 pub const ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE: u64 = 1 << 36;
+/// `ELM_POLICY_BLOCK_NATIVE_CALL_FAILED` 策略能力位；数据面 pinned native call 失败。
+#[allow(dead_code)]
+pub const ELM_POLICY_BLOCK_NATIVE_CALL_FAILED: u64 = 1 << 37;
 
 /// `ELM_MGR_RELATION_CONTRACT_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;

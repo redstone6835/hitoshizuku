@@ -1314,6 +1314,7 @@ fn exported_constant(name: &str) -> Option<u64> {
         "IPC" => kernel_symbols::capability::IPC,
         "HAL_QUERY" => kernel_symbols::capability::HAL_QUERY,
         "HAL_CONTROL" => kernel_symbols::capability::HAL_CONTROL,
+        "NETWORK_STACK" => kernel_symbols::capability::NETWORK_STACK,
         "KERNEL_SYMBOL_FLAG_MUTATES_STATE" => {
             u64::from(kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)
         }
@@ -2698,7 +2699,7 @@ fn forbidden_protocol_engine_reference(symbol: &KernelInterfaceSymbol) -> bool {
     ];
     fields.iter().any(|field| {
         let normalized = field.replace('-', "_");
-        normalized.contains("smoltcp") || normalized.contains("mygo_smoltcp")
+        normalized.contains("smoltcp")
     })
 }
 
@@ -2908,9 +2909,6 @@ mod tests {
             .iter()
             .all(|symbol| !forbidden_protocol_engine_reference(symbol)));
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "net"));
-        assert!(kernel_api_crates().iter().all(|spec| {
-            !matches!(spec.name, "mygo-smoltcp" | "mygo_smoltcp")
-        }));
         assert!(kernel_api_crates().iter().any(|spec| spec.name == "socket"));
         for required in [
             "elf.parse",
@@ -2926,12 +2924,20 @@ mod tests {
             "vfs.file.File.mount",
             "vfs.file.File.dentry",
             "general.vfs.namespace_path",
-            "net.stack",
-            "net.NetStack.attach",
-            "net.NetStack.detach",
-            "net.NetDevice.new",
-            "net.RxBuf.new",
-            "net.TxBuf.new_heap",
+            "net.stack.NetStackCallV1.valid",
+            "net.stack.NetStackSocketCallV1.valid",
+            "net.stack.NetStackSocketRequestV1.valid_header",
+            "net.stack.PinnedNetStackEndpoint.current",
+            "net.stack.NetStackRegistration.pinned",
+            "net.stack.boot_config",
+            "net.stack.register_stack",
+            "net.stack.begin_remove",
+            "net.stack.create_socket_table",
+            "net.stack.destroy_socket_table",
+            "net.stack.dispatch_socket_table_call",
+            "net.device.register_device",
+            "net.device.begin_remove",
+            "net.buf.PacketBatch.push",
         ] {
             assert!(
                 symbols.iter().any(|symbol| symbol.api_path == required),
@@ -2943,6 +2949,26 @@ mod tests {
                 .iter()
                 .all(|symbol| !forbidden_protocol_engine_reference(symbol))
         );
+        for api_path in [
+            "net.stack.PinnedNetStackEndpoint.current",
+            "net.stack.NetStackRegistration.pinned",
+            "net.stack.boot_config",
+            "net.stack.register_stack",
+            "net.stack.begin_remove",
+            "net.stack.create_socket_table",
+            "net.stack.destroy_socket_table",
+            "net.stack.dispatch_socket_table_call",
+        ] {
+            let symbol = symbols
+                .iter()
+                .find(|symbol| symbol.api_path == api_path)
+                .unwrap();
+            assert_eq!(
+                symbol.capabilities,
+                kernel_symbols::capability::NETWORK_STACK,
+                "{api_path} 使用了错误的 capability"
+            );
+        }
     }
 
     #[test]

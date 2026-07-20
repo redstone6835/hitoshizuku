@@ -336,12 +336,37 @@ fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
                 stringify!(#ident)
             ))
         };
-        let address = if let Some(trait_path) = trait_path.as_ref() {
-            quote!(<#self_ty as #trait_path>::#ident as *const ())
+        let is_drop_method = trait_path.as_ref().is_some_and(|path| {
+            path.segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Drop")
+                && ident == "drop"
+        });
+        let link_declaration_ident = format_ident!(
+            "__ELM_KERNEL_METHOD_LINK_{}",
+            descriptor.to_string().to_ascii_uppercase()
+        );
+        let (address_declaration, address) = if is_drop_method {
+            (
+                quote! {
+                    unsafe extern "Rust" {
+                        #[link_name = #link_name]
+                        fn #link_declaration_ident(value: &mut #self_ty);
+                    }
+                },
+                quote!(#link_declaration_ident as *const ()),
+            )
+        } else if let Some(trait_path) = trait_path.as_ref() {
+            (
+                quote!(),
+                quote!(<#self_ty as #trait_path>::#ident as *const ()),
+            )
         } else {
-            quote!(<#self_ty>::#ident as *const ())
+            (quote!(), quote!(<#self_ty>::#ident as *const ()))
         };
         descriptors.push(quote! {
+            #address_declaration
+
             #[doc(hidden)]
             #[used]
             #[unsafe(link_section = ".elm.kernel_symbols")]

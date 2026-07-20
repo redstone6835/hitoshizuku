@@ -97,12 +97,16 @@ pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
     RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
 };
-pub use scheduler::cancel_sleep_deadline;
+pub use scheduler::{
+    DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
+    reserve_deadline_observer_id,
+};
 pub use scheduler::{
     NR_CPUS, activate_cpu, active_cpu_mask, balance_once, current_cpu_id, current_task,
-    current_task_fast, current_task_on, current_task_ref, enqueue_task, enqueue_task_preferred,
-    idle_task, init, init_task, install_idle, is_cpu_active, is_cpu_online, is_ready,
-    mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
+    current_task_cpu_time_ns, current_task_fast, current_task_on, current_task_ref,
+    defer_timer_tick, drain_deferred_timer_tick, enqueue_task, enqueue_task_preferred,
+    enqueue_task_with_hint, idle_task, init, init_task, install_idle, is_cpu_active, is_cpu_online,
+    is_ready, mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
     offline_cpu, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
     register_sleep_deadline, request_balance, request_post_syscall_handoff, request_resched,
     root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, schedule_once,
@@ -117,8 +121,9 @@ pub use scheduler::{
 pub use scheduler_state::{CpuSchedState, SchedDomainStats, Scheduler, TopologySnapshot};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
-    SigSet, SignalNumber, SignalState,
+    SigSet, SignalNumber, SignalObserver, SignalState,
 };
+pub use spawn::activate_task_with_cpu_hint;
 pub use spawn::{
     SpawnKind, abort_new_task, activate_task, clone_task, exit_task, kthread_create,
     kthread_finish, kthread_spawn, kthread_spawn_on_cpu, list_zombie_children, reap_child,
@@ -130,8 +135,8 @@ pub use task::{
     TASKEXT_RISCV_VECTOR_SIGNAL_STACK, TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME,
     TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt,
     TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage,
-    ext_clone_hook, ext_exit_hook, pre_exit_hook, register_ext_clone_hook, register_ext_exit_hook,
-    register_pre_exit_hook, task_diag,
+    WaitReason, ext_clone_hook, ext_exit_hook, pre_exit_hook, register_ext_clone_hook,
+    register_ext_exit_hook, register_pre_exit_hook, task_diag,
 };
 pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};

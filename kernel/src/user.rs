@@ -639,11 +639,7 @@ fn load_exec_image(
         }
     }
     if update_brk {
-        if img.is_pie {
-            vm.init_brk_after_pie_load(max_segment_end);
-        } else {
-            vm.init_brk_after_load(max_segment_end);
-        }
+        vm.init_brk_after_load(max_segment_end);
     }
     Ok(LoadedImage {
         entry: load_bias

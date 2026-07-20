@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::std::sync::Barrier;
 use super::std::thread;
@@ -11,8 +11,8 @@ use ktest::ktest;
 use super::test_thread_metadata::make_task;
 use crate::scheduler::{
     cpu_ready_for_activation, dequeue_for_state_change_on, enqueue_task_on_scheduler,
-    offline_cpu_with_scheduler, refresh_task_placement, requeue_balance_task_on,
-    task_runqueue_cpu_on,
+    offline_cpu_with_scheduler, record_deferred_timer_tick, refresh_task_placement,
+    requeue_balance_task_on, take_deferred_timer_tick, task_runqueue_cpu_on,
 };
 use crate::{
     CpuId, CpuMask, PlacementState, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass,
@@ -49,6 +49,18 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     assert_eq!(cpu1.take_post_syscall_handoff(), 1);
     assert!(cpu1.take_resched());
     assert!(!cpu1.needs_resched());
+}
+
+#[ktest]
+fn deferred_timer_tick_coalesces_latest_timestamp_and_clears_on_take() {
+    let slot = AtomicU64::new(0);
+
+    record_deferred_timer_tick(&slot, 30);
+    record_deferred_timer_tick(&slot, 20);
+    record_deferred_timer_tick(&slot, 40);
+
+    assert_eq!(take_deferred_timer_tick(&slot), 40);
+    assert_eq!(take_deferred_timer_tick(&slot), 0);
 }
 
 #[ktest]

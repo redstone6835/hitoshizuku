@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://www.tyut.edu.cn/__local/C/F7/F9/0713FC3F036E6F49D48EA3B1504_80DE602B_A853.jpg" width="384" alt="太原理工大学" />
+  <img src="docs/assets/tyut-logo.jpg" width="384" alt="太原理工大学" />
 
 </div>
 
@@ -31,10 +31,15 @@
 
 ## 文档
 
-- 初赛技术文档：`docs/main.typ`
-- 初赛技术报告：(待上传)
-- 初赛安全分析报告：(待上传)
-- 初赛 PPT: (待上传)
+- 内核技术文档：[`内核技术手册.pdf`](内核技术手册.pdf)
+- 技术汇报 PPT： [`MyGO!!!!! OS 内核技术汇报.pptx`](MyGO!!!!!%20OS%20内核技术汇报.pptx)
+- 测试演示视频：参见 https://pan.baidu.com/s/1xAara1sTKwMhglExJ3PNDw?pwd=tr9h
+- 架构说明：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- ELM 说明：[`docs/ELM.md`](docs/ELM.md)
+- 技术文档源码：[`docs/main.typ`](docs/main.typ)
+- 安全分析报告：[`docs/SECURITY_REPORT.md`](docs/SECURITY_REPORT.md)
+- 开发与贡献说明：[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
+- 代码样式约定：[`docs/STYLES.md`](docs/STYLES.md)
 
 ## 代码目录地图
 
@@ -78,6 +83,7 @@ make ARCH=loongarch64 INITRAMFS=path/to/rootfs.cpio
 make kernel-la                    # 兼容测评构建，输出 ./kernel-la
 make kernel-rv                    # 兼容测评构建，输出 ./kernel-rv
 make all                          # 同时执行 kernel-la 与 kernel-rv
+cargo fmt --all                   # 格式化 workspace
 ```
 
 `kernel-la`、`kernel-rv` 在 `build/<arch>/compat-rootfs` 中组装兼容 rootfs，不会修改
@@ -108,9 +114,13 @@ CONFIG_VIRTIO_BLK=m
 硬依赖组件必须使用相同模式。例如 `virtio.block` 依赖 `virtio.framework`，不能在
 framework 为 `n` 时启用，也不能混用 `y` 与 `m`。构建工具会在编译前拒绝无效配置。
 
-IP 协议栈位于 `libs/net`，INET 套接字数据路径由 `libs/vfs` 接入。loopback 作为
-`net.loopback` ELM 位于 `drivers/loopback`，默认集成进内核，也可以配置为 `m` 或 `n`。
-VirtIO-net 仍未恢复；接入外部网络需要另行提供实现 `net::NetDriver` 的网络设备 ELM。
+IP 协议栈当前位于 `libs/net` 和 `kernel/src/net_runtime.rs`，INET 套接字数据路径由
+`libs/vfs` 接入。`net.stack` ELM 已建立 generation 注册、探测和撤销骨架，协议 worker
+和 socket 状态仍在后续迁移。`net.loopback` 与 `net.virtio` 是可独立装卸的网络驱动
+ELM，默认均构建为 `m`。
+
+QEMU 运行示例默认使用 `build/sdcard-la.img` 和 `build/sdcard-rv.img`。这些镜像由
+比赛评测环境提供；本地复现时可从评测数据包中的对应压缩镜像解压到 `build/` 目录。
 
 ## QEMU 运行示例
 
@@ -125,7 +135,8 @@ qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 \
 RISC-V64：
 
 ```sh
-qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
+qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
+  -kernel kernel-rv -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-rv.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```
@@ -139,6 +150,21 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 | extfs 单测 | `cargo test -p extfs --target x86_64-unknown-linux-gnu` |
 | 内核启动验证 | 使用上方 QEMU 命令启动目标架构 |
 | 启动盘内容检查 | `userland/rootfs-*/etc/init.d/rcS` 挂载 `/dev/vd0`，输出 `/mnt` 目录树和其中的 `.sh` 文件内容 |
+
+## 第三方组件与参考来源
+
+本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`
+和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
+用户态工具链及 Rust 生态依赖均按其原始许可证保留来源信息。
+
+MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配、系统调用兼容层、
+任务调度、虚拟内存、VFS 投影、设备模型、virtio 块/网卡接入、测试镜像集成和
+比赛测例适配等部分。更详细的来源、差异和创新点说明见
+[`docs/main.typ`](docs/main.typ) 及 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+
+## 许可证
+
+本项目依照 GPL v3 开源协议进行开源，请参阅 [LICENSE](LICENSE)。
 
 ## 备注
 

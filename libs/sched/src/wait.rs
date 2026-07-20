@@ -16,7 +16,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::sync::Spinlock;
-use crate::task::{Task, TaskState};
+use crate::task::{Task, TaskState, WaitReason};
 
 /// 唤醒回调。调用方负责把 task 加入某个 runqueue 并可能触发 IPI。
 ///
@@ -68,13 +68,23 @@ impl WaitQueueEntry {
 /// 等待队列。
 pub struct WaitQueue {
     waiters: Spinlock<VecDeque<Arc<WaitQueueEntry>>>,
+    #[cfg(feature = "performance-profile")]
+    reason: WaitReason,
 }
 
 #[kernel_symbols::export]
 impl WaitQueue {
     pub const fn new() -> Self {
+        Self::new_with_reason(WaitReason::Other)
+    }
+
+    pub const fn new_with_reason(reason: WaitReason) -> Self {
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = reason;
         Self {
             waiters: Spinlock::new(VecDeque::new()),
+            #[cfg(feature = "performance-profile")]
+            reason,
         }
     }
 
@@ -143,6 +153,8 @@ impl WaitQueue {
             });
         // 状态切换与登记由同一把锁序列化。waker 要么先完成且调用方随后重新
         // 检查条件，要么在这里之后看到 Sleeping/Uninterruptible。
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(self.reason, crate::scheduler::now_ns_public());
         task.set_state(state);
         entry
     }
@@ -361,12 +373,16 @@ impl Default for WaitQueue {
 /// 把 Sleeping / Uninterruptible 切回 Runnable。CAS 失败说明任务已经
 /// 处于其他状态（例如刚被另一路径唤醒），跳过即可。
 fn transition_to_runnable(task: &Arc<Task>) {
+    #[cfg(feature = "performance-profile")]
+    task.cancel_profile_wait();
     if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
         let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
     }
 }
 
 fn transition_from_wait(task: &Arc<Task>) {
+    #[cfg(feature = "performance-profile")]
+    task.cancel_profile_wait();
     if crate::scheduler::is_ready() {
         let current = crate::scheduler::current_task();
         if Arc::ptr_eq(&current, task) {
