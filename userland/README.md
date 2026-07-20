@@ -13,15 +13,19 @@
 
 ## rcS 启动流程
 
-`rootfs-{la,rv}/etc/init.d/rcS` 与 BusyBox 骨架中的启动脚本保持一致，依次执行：
+LoongArch64 的 `rootfs-la/etc/init.d/rcS` 会依次执行：
 
-1. 建立基础目录并挂载 `/dev`、`/proc` 和 `/sys`。
-2. 扫描设备节点并将 ext4 设备 `/dev/vd0` 挂载到 `/mnt`。
-3. 完整输出 `/mnt` 的排序目录树，同时记录其中的常规 `.sh` 文件。
-4. 目录树输出结束后，按相同顺序打印各 `.sh` 文件内容。
+1. 建立基础目录并挂载 initramfs 的 `/dev`、`/proc` 和 `/sys`。
+2. 将 ext4 设备 `/dev/vd0` 挂载到 `/mnt`，并在测试盘内挂载对应的伪文件系统。
+3. 通过 `chroot /mnt` 进入测试盘自身的 Debian 根环境。
+4. 忽略 musl，自动运行 `/glibc/cagent_testcode.sh` 和 `/glibc/buildstorm_testcode.sh`。
+5. 输出两个测试的结果后返回控制台。
 
-启动脚本只检查磁盘内容，不执行磁盘中的脚本，也不会自动关机。脚本返回后由
-BusyBox init 启动控制台 shell。
+LoongArch64 启动器通过临时副本修正 cagent 脚本会等待常驻服务器的问题，并以可回收
+整个进程组的 shell 超时器运行两个测试。buildstorm 工具链预检通过时保留原有的
+14400 秒编译上限；预检已经失败时只保留 30 秒失败清理窗口，避免不可能成功的编译
+永久阻塞 init。测试盘中的原始脚本不会被修改。RISC-V64 仍使用原有的磁盘目录检查
+启动脚本。
 
 ## 构建
 
