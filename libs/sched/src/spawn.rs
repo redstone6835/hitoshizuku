@@ -182,6 +182,10 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         // CLONE_SIGHAND 共享 SharedSignal（即便不 CLONE_THREAD）。
         let tg = if flags.has(CloneFlags::CLONE_SIGHAND) {
             ThreadGroup::new_sharing_signal(Arc::clone(parent_tg.shared_signal()))
+        } else if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            ThreadGroup::new_sharing_signal(Arc::new(
+                parent_tg.shared_signal().fork_copy_clearing_handlers(),
+            ))
         } else {
             // 不共享 → 深拷一份 sigaction。
             let copied = parent_tg.shared_signal().fork_copy();

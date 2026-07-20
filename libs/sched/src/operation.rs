@@ -688,7 +688,7 @@ pub fn clone_with_context_outcome(
     Ok(CloneOutcome { pid, child })
 }
 
-fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
+pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
     let flags = args.flags;
     const KNOWN: u64 = CloneFlags::CSIGNAL
         | CloneFlags::CLONE_VM
@@ -714,7 +714,8 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWUSER
         | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNET
-        | CloneFlags::CLONE_IO;
+        | CloneFlags::CLONE_IO
+        | CloneFlags::CLONE_CLEAR_SIGHAND;
     const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
         | CloneFlags::CLONE_NEWNS
         | CloneFlags::CLONE_NEWCGROUP
@@ -725,6 +726,9 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_IO;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
+        return Err(Errno::EINVAL);
+    }
+    if flags.has(CloneFlags::CLONE_SIGHAND) && flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
         return Err(Errno::EINVAL);
     }
     if (flags.raw() & !KNOWN) != 0 || (flags.raw() & UNSUPPORTED) != 0 || args.cgroup != 0 {
