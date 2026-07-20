@@ -61,6 +61,13 @@ const KERNEL_OSRELEASE_INO: u64 = 21;
 const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
 const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
+const KERNEL_NET_STATS_INO: u64 = 25;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_STATS_INO: u64 = 26;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
 const KERNEL_ELM_DIR_INO: u64 = 80;
 const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
@@ -865,11 +872,11 @@ impl SysSnapshot {
                 SysClassNodeKind::Symlink { target },
             );
         }
-        for iface in net::stack().snapshot_interfaces() {
+        for iface in net::device::snapshot_devices() {
             push_class_node(
                 &mut snap,
                 SYSFS_NET_CLASS,
-                iface.name,
+                iface.name.into_string(),
                 SysClassNodeKind::NetInterface {
                     iface_id: iface.id.raw(),
                 },
@@ -1177,7 +1184,7 @@ fn class_net_stats_slot_ino(iface_id: u32, slot: u64) -> u64 {
     sysfs_dynamic_ino(SysfsKey::net_stats_slot(iface_id, slot))
 }
 
-fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -> String {
+fn render_netdev_file(iface: &net::device::NetDeviceSnapshot, slot: NetDevSlot) -> String {
     use alloc::fmt::Write;
     let mut s = String::new();
     match slot {
@@ -1187,7 +1194,7 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_link_type_ether);
         }
         NetDevSlot::Address => {
-            let mac = iface.mac;
+            let mac = iface.mac_address;
             let _ = writeln!(
                 s,
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1198,7 +1205,8 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", iface.mtu);
         }
         NetDevSlot::Flags => {
-            let _ = writeln!(s, "0x{:x}", iface.flags);
+            let flags = if iface.running { 0x41u32 } else { 0 };
+            let _ = writeln!(s, "0x{:x}", flags);
         }
         NetDevSlot::IfIndex => {
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_ifindex(iface.id.raw()));
@@ -1207,19 +1215,11 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_tx_queue_len);
         }
         NetDevSlot::Carrier => {
-            let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 {
-                "1"
-            } else {
-                "0"
-            };
+            let carrier = if iface.running { "1" } else { "0" };
             let _ = writeln!(s, "{}", carrier);
         }
         NetDevSlot::Operstate => {
-            let state = if iface.flags & net::stack::IFF_UP != 0 {
-                "up"
-            } else {
-                "down"
-            };
+            let state = if iface.running { "up" } else { "down" };
             let _ = writeln!(s, "{}", state);
         }
         NetDevSlot::StatisticsRxBytes => {
@@ -1511,6 +1511,13 @@ enum SysRegFile {
     Version,
     Cmdline,
     DeviceFunctions,
+    NetStats,
+    #[cfg(feature = "performance-profile")]
+    ProfileStats,
+    #[cfg(feature = "performance-profile")]
+    ProfileControl,
+    #[cfg(feature = "performance-profile")]
+    ProfileSamples,
     Elm {
         slot: ElmSysfsSlot,
     },
@@ -2012,6 +2019,139 @@ fn render_kernel_cmdline() -> String {
     }
 }
 
+fn render_net_stats() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    for stat in net::device::snapshot_stats() {
+        let _ = writeln!(
+            output,
+            "device={} queue={} key={} value={}",
+            stat.device.0, stat.queue.0, stat.key, stat.value,
+        );
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_stats() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "enabled={} generation={} counter_hz={}",
+        u8::from(profiling::enabled()),
+        profiling::generation(),
+        profiling::counter_hz(),
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        for event in profiling::Event::ALL {
+            let value = profiling::snapshot(cpu, event);
+            if value.calls == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                output,
+                "cpu={} event={} calls={} cycles={} bytes={} packets={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                cpu,
+                event.name(),
+                value.calls,
+                value.cycles,
+                value.bytes,
+                value.packets,
+                value.max_cycles,
+                value.wall_ns,
+                value.on_cpu_ns,
+                value.off_cpu_ns,
+                value.max_latency_ns,
+                profiling::histogram_percentile(&value.latency, 50),
+                profiling::histogram_percentile(&value.latency, 95),
+                profiling::histogram_percentile(&value.latency, 99),
+                HistogramDisplay(&value.latency),
+            );
+        }
+        for metric in profiling::Metric::ALL {
+            let value = profiling::metric_snapshot(cpu, metric);
+            if value.observations == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                output,
+                "cpu={} metric={} observations={} sum={} max={} p50={} p95={} p99={} hist={}",
+                cpu,
+                metric.name(),
+                value.observations,
+                value.sum,
+                value.max,
+                profiling::histogram_percentile(&value.values, 50),
+                profiling::histogram_percentile(&value.values, 95),
+                profiling::histogram_percentile(&value.values, 99),
+                HistogramDisplay(&value.values),
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+struct HistogramDisplay<'a>(&'a [u64; profiling::HISTOGRAM_BUCKETS]);
+
+#[cfg(feature = "performance-profile")]
+impl core::fmt::Display for HistogramDisplay<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, value) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{value}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_samples() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "enabled={} generation={} slots_per_cpu={}",
+        u8::from(profiling::enabled()),
+        profiling::generation(),
+        profiling::SAMPLE_SLOTS,
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        let _ = writeln!(
+            output,
+            "cpu={} dropped_samples={}",
+            cpu,
+            profiling::dropped_samples(cpu),
+        );
+        for slot in 0..profiling::SAMPLE_SLOTS {
+            let Some(sample) = profiling::sample_slot(cpu, slot) else {
+                continue;
+            };
+            let _ = writeln!(
+                output,
+                "cpu={} mode={} pc={:#x} samples={}",
+                cpu,
+                if sample.from_user { "user" } else { "kernel" },
+                sample.pc,
+                sample.samples,
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_control() -> String {
+    format!(
+        "enabled={} generation={}\n",
+        u8::from(profiling::enabled()),
+        profiling::generation(),
+    )
+}
+
 fn render_elm_sysfs_file(name: &str) -> String {
     match *ELM_SYSFS_RENDERER.lock() {
         Some(renderer) => renderer(name),
@@ -2045,10 +2185,16 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
             append_function_projection_diagnostics(&mut out);
             out
         }
+        SysRegFile::NetStats => render_net_stats(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileStats => render_profile_stats(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileControl => render_profile_control(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileSamples => render_profile_samples(),
         SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
-            if let Some(iface) = net::stack()
-                .snapshot_interfaces()
+            if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
                 .find(|i| i.id.raw() == iface_id)
             {
@@ -2202,7 +2348,23 @@ impl FileOps for SysRegFileOps {
         buf[..n].copy_from_slice(&bytes[off..off + n]);
         Ok(n)
     }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        if matches!(self.kind, SysRegFile::ProfileControl) {
+            if _offset != 0 {
+                return Err(VfsError::InvalidArgument);
+            }
+            let command = core::str::from_utf8(_buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            match command {
+                "0" | "disable" => profiling::set_enabled(false),
+                "1" | "enable" => profiling::set_enabled(true),
+                "reset" => profiling::reset(),
+                _ => return Err(VfsError::InvalidArgument),
+            }
+            return Ok(_buf.len());
+        }
         Err(VfsError::ReadOnlyFilesystem)
     }
     fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
@@ -2238,12 +2400,20 @@ fn build_child_inode(
         kind,
         snap: Arc::clone(snap),
     });
+    #[cfg(feature = "performance-profile")]
+    let mode = if matches!(kind, SysRegFile::ProfileControl) {
+        0o644
+    } else {
+        0o444
+    };
+    #[cfg(not(feature = "performance-profile"))]
+    let mode = 0o444;
     Some(mk_inode(
         fs_id,
         weak_sb,
         ino,
         FileType::Regular,
-        0o444,
+        mode,
         1,
         ops,
     ))
@@ -2717,6 +2887,13 @@ impl SysDirInodeOps {
                 "device_functions" => {
                     mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
                 }
+                "net_stats" => mk_reg(KERNEL_NET_STATS_INO, SysRegFile::NetStats),
+                #[cfg(feature = "performance-profile")]
+                "profile_stats" => mk_reg(KERNEL_PROFILE_STATS_INO, SysRegFile::ProfileStats),
+                #[cfg(feature = "performance-profile")]
+                "profile_control" => mk_reg(KERNEL_PROFILE_CONTROL_INO, SysRegFile::ProfileControl),
+                #[cfg(feature = "performance-profile")]
+                "profile_samples" => mk_reg(KERNEL_PROFILE_SAMPLES_INO, SysRegFile::ProfileSamples),
                 "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
@@ -3301,6 +3478,21 @@ impl SysDirInodeOps {
                 mk_dir_entry(
                     KERNEL_DEVICE_FUNCTIONS_INO,
                     "device_functions",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(KERNEL_NET_STATS_INO, "net_stats", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(KERNEL_PROFILE_STATS_INO, "profile_stats", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_CONTROL_INO,
+                    "profile_control",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_SAMPLES_INO,
+                    "profile_samples",
                     FileType::Regular,
                 ),
                 mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),

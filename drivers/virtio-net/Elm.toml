@@ -1,0 +1,16 @@
+[elm]
+name = "net.virtio"
+version = "0.1.0"
+kind = "network"
+source = "kernel-tree:drivers.virtio-net"
+mode = "m"
+integrated_phase = "runtime"
+
+[[dependencies]]
+provider = "virtio.framework"
+contract = "driver.virtio.framework@1"
+crate = "virtio"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

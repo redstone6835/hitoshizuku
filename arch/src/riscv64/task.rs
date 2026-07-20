@@ -170,6 +170,9 @@ impl TaskOps for Riscv64TaskOps {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
     naked_asm!(
+        // 调用方可能在 SIE 开启时进入恢复桩。必须先关闭本地中断，再标记脆弱
+        // 恢复窗口；否则 timer interrupt 会被 trap 入口误判为嵌套 fault。
+        "csrci {sstatus}, 2",
         "mv s11, a0",
         "li t0, 1",
         "sd t0, {hart_entry_state_off}(tp)",

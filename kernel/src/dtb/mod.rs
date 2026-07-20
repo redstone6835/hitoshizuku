@@ -224,20 +224,14 @@ pub fn kernel_start_init(context: &StartContext) {
         "dtb",
         Arc::clone(&dev_sb),
         DevInitContext::new(context.address.device_mmio_to_virt)
+            .with_boot_cpu_id(context.boot.boot_cpu_id)
             .with_realtime_clock(crate::vdso::set_realtime_ns)
             .with_realtime_source_hooks(
                 crate::vdso::install_realtime_source,
                 crate::vdso::unregister_realtime_source,
             ),
+        rng_seed.as_deref(),
     );
-
-    if let Some(seed) = rng_seed.as_ref() {
-        general::dev::random::add_bootloader_randomness(seed);
-        printk!(
-            "[kernel-start][dtb] mixed chosen/rng-seed into random pool: {} bytes",
-            seed.len()
-        );
-    }
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;

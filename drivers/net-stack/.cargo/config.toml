@@ -1,0 +1,59 @@
+[build]
+rustflags = [
+    "--cfg=elm_kernel_api=\"contest-2026\"",
+    "--check-cfg=cfg(elm_kernel_api,values(\"contest-2026\"))",
+    "--cfg=elm_kernel_profile=\"7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498\"",
+    "--check-cfg=cfg(elm_kernel_profile,values(\"7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498\"))",
+]
+
+[target.riscv64gc-unknown-none-elf]
+linker = "rust-lld"
+rustflags = [
+    "-C",
+    "link-arg=-Telm.ld",
+    "-C",
+    "relocation-model=pic",
+    "-C",
+    "code-model=small",
+    "-C",
+    "link-arg=-pie",
+    "-C",
+    "link-arg=-z",
+    "-C",
+    "link-arg=notext",
+    "-C",
+    "link-arg=--gc-sections",
+    "-C",
+    "link-arg=--build-id=none",
+    "--cfg=elm_kernel_api=\"contest-2026\"",
+    "--check-cfg=cfg(elm_kernel_api,values(\"contest-2026\"))",
+    "--cfg=elm_kernel_profile=\"7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498\"",
+    "--check-cfg=cfg(elm_kernel_profile,values(\"7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498\"))",
+]
+
+[target.loongarch64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C",
+    "link-arg=-Telm.ld",
+    "-C",
+    "relocation-model=pic",
+    "-C",
+    "code-model=small",
+    "-C",
+    "link-arg=-pie",
+    "-C",
+    "link-arg=-z",
+    "-C",
+    "link-arg=notext",
+    "-C",
+    "link-arg=--gc-sections",
+    "-C",
+    "link-arg=--build-id=none",
+    "-A",
+    "named_asm_labels",
+    "--cfg=elm_kernel_api=\"contest-2026\"",
+    "--check-cfg=cfg(elm_kernel_api,values(\"contest-2026\"))",
+    "--cfg=elm_kernel_profile=\"7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498\"",
+    "--check-cfg=cfg(elm_kernel_profile,values(\"7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498\"))",
+]

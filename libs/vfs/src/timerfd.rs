@@ -1,13 +1,15 @@
 //! timerfd-backed anonymous files.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::ops::ControlFlow;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use errno::Errno;
-use sched::{Task, WaitQueue};
+use sched::{DeadlineObserver, Task, WaitQueue};
 
+use crate::poll_source::PollSource;
 use crate::vfs::anon;
 use crate::vfs::cred::Credentials;
 use crate::vfs::error::{VfsError, VfsResult};
@@ -28,22 +30,32 @@ struct TimerfdState {
 }
 
 pub struct TimerfdFileOps {
+    shared: Arc<TimerfdShared>,
+    clock_id: usize,
+}
+
+struct TimerfdShared {
     state: Spinlock<TimerfdState>,
     waiters: WaitQueue,
-    clock_id: usize,
+    poll_source: PollSource,
+    registration: AtomicU64,
+    self_weak: Weak<TimerfdShared>,
 }
 
 impl TimerfdFileOps {
     pub fn new(clock_id: usize) -> Self {
-        Self {
+        let shared = Arc::new_cyclic(|self_weak| TimerfdShared {
             state: Spinlock::new(TimerfdState {
                 next_expiry_ns: None,
                 interval_ns: 0,
                 expirations: 0,
             }),
             waiters: WaitQueue::new(),
-            clock_id,
-        }
+            poll_source: PollSource::new(PollEvents::default()),
+            registration: AtomicU64::new(0),
+            self_weak: self_weak.clone(),
+        });
+        Self { shared, clock_id }
     }
 
     pub fn clock_id(&self) -> usize {
@@ -71,7 +83,7 @@ impl TimerfdFileOps {
     }
 
     pub fn set_time(&self, now_ns: u64, new_value: TimerSpec) -> TimerSpec {
-        let mut state = self.state.lock();
+        let mut state = self.shared.state.lock();
         Self::refresh_locked(&mut state, now_ns);
         let old = Self::remaining_locked(&state, now_ns);
         state.interval_ns = new_value.interval_ns;
@@ -82,7 +94,8 @@ impl TimerfdFileOps {
             Some(now_ns.saturating_add(new_value.value_ns))
         };
         drop(state);
-        self.waiters.wake_all();
+        self.shared.refresh_and_arm(now_ns);
+        self.shared.waiters.wake_all();
         old
     }
 
@@ -92,19 +105,20 @@ impl TimerfdFileOps {
         deadline_ns: Option<u64>,
         interval_ns: u64,
     ) -> TimerSpec {
-        let mut state = self.state.lock();
+        let mut state = self.shared.state.lock();
         Self::refresh_locked(&mut state, now_ns);
         let old = Self::remaining_locked(&state, now_ns);
         state.interval_ns = interval_ns;
         state.expirations = 0;
         state.next_expiry_ns = deadline_ns;
         drop(state);
-        self.waiters.wake_all();
+        self.shared.refresh_and_arm(now_ns);
+        self.shared.waiters.wake_all();
         old
     }
 
     pub fn get_time(&self, now_ns: u64) -> TimerSpec {
-        let mut state = self.state.lock();
+        let mut state = self.shared.state.lock();
         Self::refresh_locked(&mut state, now_ns);
         Self::remaining_locked(&state, now_ns)
     }
@@ -121,13 +135,103 @@ impl TimerfdFileOps {
     }
 }
 
+impl TimerfdShared {
+    fn publish_readiness(&self, now_ns: u64) -> Option<u64> {
+        let (ready, next, version) = {
+            let mut state = self.state.lock();
+            TimerfdFileOps::refresh_locked(&mut state, now_ns);
+            (
+                if state.expirations != 0 {
+                    PollEvents::POLLIN
+                } else {
+                    PollEvents::default()
+                },
+                state.next_expiry_ns,
+                self.poll_source.reserve_version(),
+            )
+        };
+        self.poll_source.publish_versioned(ready, version);
+        next
+    }
+
+    fn refresh_and_arm(&self, now_ns: u64) {
+        let next = self.publish_readiness(now_ns);
+        self.arm(next, now_ns);
+    }
+
+    fn arm(&self, deadline: Option<u64>, now_ns: u64) {
+        let old = self.registration.swap(0, Ordering::AcqRel);
+        if old != 0 {
+            sched::cancel_deadline_observer(old);
+        }
+        let Some(deadline) = deadline else {
+            return;
+        };
+        if deadline <= now_ns {
+            if let Some(next) = self.deadline_expired(0, now_ns) {
+                self.arm(Some(next), now_ns);
+            }
+            return;
+        }
+        let Some(this) = self.self_weak.upgrade() else {
+            return;
+        };
+        let observer: Arc<dyn DeadlineObserver> = this;
+        let registration = sched::reserve_deadline_observer_id();
+        self.registration.store(registration, Ordering::Release);
+        if !sched::register_deadline_observer(registration, deadline, Arc::downgrade(&observer)) {
+            if self
+                .registration
+                .compare_exchange(registration, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let now_ns = sched::now_ns_public();
+                if let Some(next) = self.deadline_expired(0, now_ns) {
+                    self.arm(Some(next), now_ns);
+                }
+            }
+        }
+    }
+}
+
+impl DeadlineObserver for TimerfdShared {
+    fn deadline_expired(&self, registration: u64, now_ns: u64) -> Option<u64> {
+        if registration != 0 && self.registration.load(Ordering::Acquire) != registration {
+            return None;
+        }
+        let was_ready = self.poll_source.snapshot().0.has(PollEvents::POLLIN);
+        let next = self.publish_readiness(now_ns);
+        if !was_ready && self.poll_source.snapshot().0.has(PollEvents::POLLIN) {
+            self.waiters.wake_all();
+        }
+        if next.is_none() && registration != 0 {
+            let _ = self.registration.compare_exchange(
+                registration,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        next
+    }
+}
+
+impl Drop for TimerfdShared {
+    fn drop(&mut self) {
+        let registration = self.registration.swap(0, Ordering::AcqRel);
+        if registration != 0 {
+            sched::cancel_deadline_observer(registration);
+        }
+    }
+}
+
 impl FileOps for TimerfdFileOps {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         if buf.len() < 8 {
             return Err(VfsError::InvalidArgument);
         }
         let value = {
-            let mut state = self.state.lock();
+            let mut state = self.shared.state.lock();
             Self::refresh_locked(&mut state, sched::now_ns_public());
             if state.expirations == 0 {
                 return Err(VfsError::WouldBlock);
@@ -137,6 +241,7 @@ impl FileOps for TimerfdFileOps {
             value
         };
         buf[..8].copy_from_slice(&value.to_ne_bytes());
+        self.shared.publish_readiness(sched::now_ns_public());
         Ok(8)
     }
 
@@ -157,25 +262,23 @@ impl FileOps for TimerfdFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let mut state = self.state.lock();
-        Self::refresh_locked(&mut state, sched::now_ns_public());
-        let ready = if state.expirations > 0 {
-            PollEvents::POLLIN
-        } else {
-            PollEvents::default()
-        };
-        ready.intersect(interest)
+        self.shared.publish_readiness(sched::now_ns_public());
+        self.shared.poll_source.snapshot().0.intersect(interest)
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
         if interest.has(PollEvents::POLLIN) {
-            self.waiters.enqueue(task);
+            self.shared.waiters.enqueue(task);
         }
         true
     }
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
-        self.waiters.remove(task);
+        self.shared.waiters.remove(task);
+    }
+
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.shared.poll_source)
     }
 
     fn is_seekable(&self) -> bool {
@@ -187,7 +290,7 @@ impl FileOps for TimerfdFileOps {
     }
 
     fn release(&self) {
-        self.waiters.wake_all();
+        self.shared.waiters.wake_all();
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -220,4 +323,33 @@ pub fn create(
         Box::new(TimerfdFileOps::new(clock_id)),
     )
     .map_err(|err| err.to_errno())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_publishes_readiness_without_epoll_scanning() {
+        let timer = TimerfdFileOps::new(1);
+        let now = sched::now_ns_public();
+        timer.set_deadline(now, Some(now.saturating_add(10)), 0);
+        assert!(timer.shared.poll_source.snapshot().0.is_empty());
+        let registration = timer.shared.registration.load(Ordering::Acquire);
+        let _ = timer
+            .shared
+            .deadline_expired(registration, now.saturating_add(10));
+        assert!(
+            timer
+                .shared
+                .poll_source
+                .snapshot()
+                .0
+                .has(PollEvents::POLLIN)
+        );
+        let mut value = [0u8; 8];
+        assert_eq!(timer.read_at(&mut value, 0), Ok(8));
+        assert_eq!(u64::from_ne_bytes(value), 1);
+        assert!(timer.shared.poll_source.snapshot().0.is_empty());
+    }
 }

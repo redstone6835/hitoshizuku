@@ -8,6 +8,9 @@ test = true
 doctest = false
 bench = false
 
+[features]
+performance-profile = ["sched/performance-profile", "socket/performance-profile"]
+
 [dependencies]
 elm_model = { package = "elm", path = "../elm" }
 errno = { path = "../errno" }

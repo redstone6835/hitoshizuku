@@ -677,43 +677,6 @@ fn render_proc_net_route() -> String {
         out,
         "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"
     );
-    let ifaces = net::stack().snapshot_interfaces();
-    for iface in &ifaces {
-        // 每个配置的 CIDR 地址生成一条 connected route
-        for cidr in &iface.addresses {
-            if let net::config::IpAddr::V4(v4) = cidr.addr {
-                let prefix = cidr.prefix_len.min(32);
-                let mask: u32 = if prefix == 0 {
-                    0
-                } else {
-                    !0u32 << (32 - prefix)
-                };
-                let dst = u32::from_be_bytes(v4.0) & mask;
-                let _ = writeln!(
-                    out,
-                    "{}\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0",
-                    iface.name,
-                    dst.to_be(),
-                    mask.to_be()
-                );
-            }
-        }
-        // default route via gateway
-        if let Some(ref gw) = iface.gateway {
-            let gw_ip = match gw {
-                net::config::Gateway::V4(v4) => u32::from_be_bytes(v4.0),
-                _ => 0,
-            };
-            if gw_ip != 0 {
-                let _ = writeln!(
-                    out,
-                    "{}\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0",
-                    iface.name,
-                    gw_ip.to_be()
-                );
-            }
-        }
-    }
     out
 }
 
@@ -724,31 +687,6 @@ fn render_proc_net_tcp() -> String {
         out,
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
     );
-    let connections = net::stack().snapshot_tcp_connections();
-    let mut slot: u64 = 0;
-    for (_iface_id, conns) in &connections {
-        for c in conns {
-            let local_hex = endpoint_to_hex(&c.local);
-            let remote_hex = endpoint_to_hex(&c.remote);
-            let _ = writeln!(
-                out,
-                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
-                slot,
-                local_hex,
-                remote_hex,
-                c.state,
-                c.tx_queue,
-                c.rx_queue,
-                0u8,
-                0u32,
-                0u32,
-                0u32,
-                0u32,
-                c.inode,
-            );
-            slot += 1;
-        }
-    }
     out
 }
 
@@ -759,50 +697,7 @@ fn render_proc_net_udp() -> String {
         out,
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
     );
-    let sockets = net::stack().snapshot_udp_sockets();
-    let mut slot: u64 = 0;
-    for (_iface_id, socks) in &sockets {
-        for s in socks {
-            let local_hex = endpoint_to_hex(&s.local);
-            let remote_hex = match &s.remote {
-                Some(ep) => endpoint_to_hex(ep),
-                None => "00000000:0000".into(),
-            };
-            let _ = writeln!(
-                out,
-                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
-                slot,
-                local_hex,
-                remote_hex,
-                7u8, // ESTABLISHED
-                0usize,
-                0usize,
-                0u8,
-                0u32,
-                0u32,
-                0u32,
-                0u32,
-                s.inode,
-            );
-            slot += 1;
-        }
-    }
     out
-}
-
-fn endpoint_to_hex(ep: &net::Endpoint) -> alloc::string::String {
-    use alloc::fmt::Write;
-    let mut s = alloc::string::String::new();
-    match ep.addr {
-        net::IpAddr::V4(v4) => {
-            let ip = u32::from_be_bytes(v4.0);
-            let _ = write!(s, "{:08X}:{:04X}", ip, ep.port);
-        }
-        net::IpAddr::V6(_v6) => {
-            let _ = write!(s, "00000000000000000000000000000000:{:04X}", ep.port);
-        }
-    }
-    s
 }
 
 fn render_proc_net_unix() -> String {
@@ -865,53 +760,14 @@ fn render_proc_net_arp() -> String {
         out,
         "IP address       HW type     Flags       HW address            Mask     Device"
     );
-    let neighbors = net::stack().all_neighbors();
-    for (iface_id, entries) in &neighbors {
-        let iface_name = net::stack()
-            .snapshot_interfaces()
-            .into_iter()
-            .find(|i| i.id == *iface_id)
-            .map(|i| i.name)
-            .unwrap_or_else(|| alloc::string::String::from("?"));
-        for entry in entries {
-            let ip_str = match entry.ip_addr {
-                net::IpAddr::V4(v4) => {
-                    let mut s = alloc::string::String::new();
-                    let _ = write!(s, "{}.{}.{}.{}", v4.0[0], v4.0[1], v4.0[2], v4.0[3]);
-                    s
-                }
-                net::IpAddr::V6(_) => alloc::string::String::from("::1"),
-            };
-            let _ = writeln!(
-                out,
-                "{:<16} 0x1         0x2         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
-                ip_str,
-                entry.hw_addr[0],
-                entry.hw_addr[1],
-                entry.hw_addr[2],
-                entry.hw_addr[3],
-                entry.hw_addr[4],
-                entry.hw_addr[5],
-                iface_name,
-            );
-        }
-    }
     out
 }
 
 fn render_proc_net_sockstat() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let tcp_total: usize = net::stack()
-        .snapshot_tcp_connections()
-        .iter()
-        .map(|(_, v)| v.len())
-        .sum();
-    let udp_total: usize = net::stack()
-        .snapshot_udp_sockets()
-        .iter()
-        .map(|(_, v)| v.len())
-        .sum();
+    let tcp_total = 0usize;
+    let udp_total = 0usize;
     let unix_total = socket::snapshot_sockets().len();
     let total = tcp_total + udp_total + unix_total;
     let _ = writeln!(out, "sockets: used {}", total);
@@ -991,9 +847,8 @@ fn render_proc_net_dev() -> String {
         out,
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
     );
-    let ifaces = net::stack().snapshot_interfaces();
-    for iface in &ifaces {
-        let s = &iface.stats;
+    for iface in net::device::snapshot_devices() {
+        let s = iface.stats;
         let _ = writeln!(
             out,
             "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",

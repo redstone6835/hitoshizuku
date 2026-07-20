@@ -771,6 +771,10 @@ impl File {
         self.ops.poll_remove_waiter(task)
     }
 
+    pub fn poll_source(&self) -> Option<&crate::poll_source::PollSource> {
+        self.ops.poll_source()
+    }
+
     pub fn on_fd_closed(&self, fd: u32) {
         self.ops.on_fd_closed(fd)
     }
@@ -917,6 +921,10 @@ pub trait FileOps {
 
     /// 显式移除之前登记的等待者。
     fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
+
+    fn poll_source(&self) -> Option<&crate::poll_source::PollSource> {
+        None
+    }
 
     /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。
     fn set_status_flags(&self, _flags: OpenOptions) {}
