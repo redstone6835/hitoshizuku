@@ -83,11 +83,18 @@ prompt = "内核随机服务驱动"
 default = "y"
 
 [[modules]]
+name = "net.stack"
+path = "net-stack"
+config = "CONFIG_NET_STACK"
+prompt = "网络协议栈"
+default = "m"
+
+[[modules]]
 name = "net.loopback"
 path = "loopback"
 config = "CONFIG_NET_LOOPBACK"
 prompt = "本地回环网络驱动"
-default = "y"
+default = "m"
 
 [[modules]]
 name = "virtio.framework"
@@ -104,3 +111,12 @@ config = "CONFIG_VIRTIO_BLK"
 prompt = "VirtIO block 驱动"
 default = "y"
 depends = "virtio.framework"
+
+[[modules]]
+name = "net.virtio"
+path = "virtio-net"
+config = "CONFIG_VIRTIO_NET"
+prompt = "VirtIO 网络驱动"
+default = "m"
+depends = "virtio.framework"
+after = "virtio.framework"

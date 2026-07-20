@@ -1,0 +1,7 @@
+ELM-LOCK-V1
+module=net.stack
+version=0.1.0
+mode=m
+cargo_elm=0.1.0
+rustc=rustc 1.89.0-nightly (60dabef95 2025-05-19)
+profile	loongarch64-unknown-none	contest-2026	1	7eb0b740eb54537c1f94019c5221eb8e8b69f1b3776d49d632b0b7ca66296498	baf8c183a991c7d1bc534030c0aeeb9cb8f1e01f6a4d278c579ef528ef510133	930dd18ec23368441fecbc22da71f6006cc8fa4337bd503b0627e6e5f077e658	29d0e2f3718c785c33e9f46fecbccad66ce3d6e58823d051fb190a1023a79ef7

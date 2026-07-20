@@ -160,6 +160,8 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         }
         // 清除定时器中断标志（写 CSR_TICLR bit 0）
         if is & IS_TIMER_BIT != 0 {
+            #[cfg(feature = "performance-profile")]
+            profiling::sample_pc(arg0, from_user);
             // LoongArch 的定时器中断通常需要软件显式写 TICLR 清 pending，否则在 `ertn`
             // 后会立即再次陷入，形成“看似无法返回”的中断风暴。
             unsafe {
@@ -190,9 +192,23 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 tf.a0 = recovery.return_value;
                 return arg4;
             }
-            sched::on_timer_tick(now_ns);
-            if LoongArch64MessageInterruptOps::current_cpu_id() == 0 {
+            let boot_cpu = LoongArch64MessageInterruptOps::current_cpu_id() == 0;
+            if boot_cpu {
                 super::super::vdso::run_timer_tick_hook(now_ns);
+            }
+            // timer 可打断持有 runqueue、topology 等普通自旋锁的内核路径。
+            // top-half 只记录待处理时间；syscall 返回或下一次主动调度会在无锁
+            // 边界补做调度工作，避免同一 CPU 重入锁后永久自旋。
+            if !from_user {
+                sched::defer_timer_tick(now_ns);
+                if boot_cpu && general::elm_guard::active_cell() == 0 {
+                    super::super::vdso::run_net_poll_hook(now_ns);
+                    super::super::vdso::run_tty_poll_hook(now_ns);
+                }
+                return arg4;
+            }
+            sched::on_timer_tick(now_ns);
+            if boot_cpu {
                 // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
                 // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
                 // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll

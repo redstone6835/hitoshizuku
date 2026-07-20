@@ -114,9 +114,10 @@ CONFIG_VIRTIO_BLK=m
 硬依赖组件必须使用相同模式。例如 `virtio.block` 依赖 `virtio.framework`，不能在
 framework 为 `n` 时启用，也不能混用 `y` 与 `m`。构建工具会在编译前拒绝无效配置。
 
-IP 协议栈位于 `libs/net`，INET 套接字数据路径由 `libs/vfs` 接入。loopback 作为
-`net.loopback` ELM 位于 `drivers/loopback`，默认集成进内核，也可以配置为 `m` 或 `n`。
-VirtIO-net 仍未恢复；接入外部网络需要另行提供实现 `net::NetDriver` 的网络设备 ELM。
+IP 协议栈当前位于 `libs/net` 和 `kernel/src/net_runtime.rs`，INET 套接字数据路径由
+`libs/vfs` 接入。`net.stack` ELM 已建立 generation 注册、探测和撤销骨架，协议 worker
+和 socket 状态仍在后续迁移。`net.loopback` 与 `net.virtio` 是可独立装卸的网络驱动
+ELM，默认均构建为 `m`。
 
 QEMU 运行示例默认使用 `build/sdcard-la.img` 和 `build/sdcard-rv.img`。这些镜像由
 比赛评测环境提供；本地复现时可从评测数据包中的对应压缩镜像解压到 `build/` 目录。
@@ -134,7 +135,8 @@ qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 \
 RISC-V64：
 
 ```sh
-qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
+qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
+  -kernel kernel-rv -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-rv.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```
@@ -151,8 +153,8 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 ## 第三方组件与参考来源
 
-本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`、
-`libs/mygo-smoltcp/` 和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
+本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`
+和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
 用户态工具链及 Rust 生态依赖均按其原始许可证保留来源信息。
 
 MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配、系统调用兼容层、

@@ -1046,10 +1046,14 @@ fn sleep_until_deadline(
             return Err(Errno::EINTR);
         }
 
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(sched::WaitReason::Timer, sched::now_ns_public());
         if !task.cas_state(TaskState::Running, TaskState::Sleeping)
             && !task.cas_state(TaskState::Runnable, TaskState::Sleeping)
             && task.state() != TaskState::Sleeping
         {
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
             sched::operation::sched_yield()?;
             continue;
         }
@@ -1079,6 +1083,8 @@ fn restore_current_task_after_sleep(task: &Arc<Task>) {
     if !task.cas_state(TaskState::Sleeping, TaskState::Running) {
         let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
     }
+    #[cfg(feature = "performance-profile")]
+    task.cancel_profile_wait();
 }
 
 fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) {
@@ -2478,6 +2484,8 @@ fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> 
         match state.mark_woken() {
             FUTEX_WAIT_SLEEPING => {
                 if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+                    #[cfg(feature = "performance-profile")]
+                    waiter.mark_profile_woken(sched::now_ns_public());
                     // futex 唤醒属于短等待热路径，优先让被唤醒者尽快继续执行，
                     // 避免 join / condvar / mutex 反复多等一个时间片。
                     sched::enqueue_task_preferred(waiter, sched::now_ns_public());
@@ -2928,6 +2936,9 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
                 return Err(Errno::ETIMEDOUT);
             }
         }
+        #[cfg(feature = "performance-profile")]
+        ctx.task()
+            .begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
         let _ = ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping);
@@ -3460,6 +3471,8 @@ fn futex_wait(
             restore_current_task_after_sleep(task);
             return Ok(0);
         }
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             if wait_state.is_woken() {

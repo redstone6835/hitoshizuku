@@ -299,6 +299,8 @@ pub fn exit_group(code: i32) -> ! {
 
 #[kernel_symbols::export(name = "sched.operation.sched_yield", contract = "kernel.sched.process-control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn sched_yield() -> Result<(), Errno> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SchedYield);
     current_task().record_voluntary_context_switch();
     schedule_once(0);
     Ok(())
