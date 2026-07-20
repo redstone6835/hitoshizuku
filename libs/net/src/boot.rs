@@ -4,6 +4,25 @@ use spin::Mutex;
 
 static HOST_BOOT_CONFIG: Mutex<Option<NetHostBootConfig>> = Mutex::new(None);
 
+/// 当前协议状态允许建立的最大 shard 数。
+///
+/// 每个 `FlowShard` 仍会预分配一套完整的 4096-flow 状态，而当前 VirtIO-net
+/// 驱动只注册一个 queue pair。在状态容量能够按全局预算分摊以前，限制协议 shard
+/// 数可以避免在线 CPU 增加时线性复制内存与高优先级 worker。
+pub const MAX_PROTOCOL_SHARDS: u8 = 4;
+
+/// 按在线 CPU 数选择启动期协议 shard 数。
+pub const fn select_protocol_shard_count(online_cpu_count: u32) -> Option<u8> {
+    if online_cpu_count == 0 {
+        return None;
+    }
+    Some(if online_cpu_count > MAX_PROTOCOL_SHARDS as u32 {
+        MAX_PROTOCOL_SHARDS
+    } else {
+        online_cpu_count as u8
+    })
+}
+
 /// 只能由常驻 host 保存的启动配置。
 #[derive(Clone, Copy)]
 pub struct NetHostBootConfig {
@@ -20,6 +39,7 @@ impl NetHostBootConfig {
 #[derive(Clone, Copy)]
 pub struct NetDriverBootConfig {
     rss_key: [u8; 40],
+    /// 驱动用于 RSS 映射的协议 shard 数，不是系统在线 CPU 总数。
     active_cpu_count: u8,
 }
 
@@ -41,6 +61,7 @@ pub struct NetStackBootConfig {
     ephemeral_port_key: [u8; 16],
     hash_seed: [u8; 16],
     generation_nonce: [u8; 8],
+    /// 本代协议状态与 worker 必须共同采用的 shard 数。
     active_cpu_count: u8,
 }
 
@@ -116,7 +137,7 @@ pub struct NetBootConfigs {
 
 impl NetBootConfigs {
     pub fn from_random_material(material: [u8; 112], active_cpu_count: u8) -> Option<Self> {
-        if active_cpu_count == 0 || active_cpu_count > 8 {
+        if active_cpu_count == 0 || active_cpu_count > MAX_PROTOCOL_SHARDS {
             return None;
         }
         let mut rss_key = [0; 40];
@@ -199,6 +220,14 @@ mod tests {
     #[test]
     fn boot_material_rejects_invalid_cpu_count() {
         assert!(NetBootConfigs::from_random_material([0; 112], 0).is_none());
-        assert!(NetBootConfigs::from_random_material([0; 112], 9).is_none());
+        assert!(NetBootConfigs::from_random_material([0; 112], MAX_PROTOCOL_SHARDS + 1).is_none());
+    }
+
+    #[test]
+    fn protocol_shard_policy_caps_cpu_scaled_state() {
+        assert_eq!(select_protocol_shard_count(0), None);
+        assert_eq!(select_protocol_shard_count(1), Some(1));
+        assert_eq!(select_protocol_shard_count(4), Some(4));
+        assert_eq!(select_protocol_shard_count(8), Some(4));
     }
 }

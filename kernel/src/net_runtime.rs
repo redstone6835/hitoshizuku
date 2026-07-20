@@ -2297,12 +2297,20 @@ pub fn start_workers() {
     );
     vfs::net_socket::install_net_ioctl_handler(net_ioctl);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
+    let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();
-    let active_cpus = (0..sched::NR_CPUS)
+    // 设备 queue worker 仍可使用全部在线 CPU；协议状态必须遵循启动配置的 shard 数，
+    // 否则 host 与 net.stack ELM 会分别创建不同数量的状态分片。
+    let mut protocol_cpus = (0..sched::NR_CPUS)
         .filter(|cpu| online & (1u64 << cpu) != 0)
         .collect::<Vec<_>>();
-    assert!(!active_cpus.is_empty(), "NetWorker 没有 active CPU");
-    let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
+    assert!(!protocol_cpus.is_empty(), "NetWorker 没有 active CPU");
+    let protocol_shards = usize::from(boot.active_cpu_count());
+    assert!(
+        protocol_shards != 0 && protocol_shards <= protocol_cpus.len(),
+        "网络协议 shard 数量与在线 CPU 不一致"
+    );
+    protocol_cpus.truncate(protocol_shards);
     let devices = DEVICES.lock();
     let config = Arc::new(ConfigStore::new(build_device_config(&devices, 1)));
     *CONFIG_STORE.lock() = Some(Arc::clone(&config));
@@ -2312,7 +2320,7 @@ pub fn start_workers() {
         control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_public()),
         "net.stack 自动配置状态初始化失败"
     );
-    let runtimes = active_cpus
+    let runtimes = protocol_cpus
         .iter()
         .enumerate()
         .map(|(index, cpu)| {
