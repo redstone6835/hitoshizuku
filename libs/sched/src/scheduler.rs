@@ -18,7 +18,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
@@ -169,10 +169,10 @@ struct RealtimeItimer {
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 
-/// init 任务全局锚点。写入即 Release，读取必须 Acquire。
-static mut INIT_TASK: Option<Arc<Task>> = None;
+/// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
+static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
-static mut ROOT_PID_NS: Option<Arc<PidNamespace>> = None;
+static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
 static DEFERRED_TIMER_TICK_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 
@@ -290,14 +290,29 @@ pub fn init() -> Arc<Task> {
         .runqueue()
         .set_current(Arc::clone(&init_task));
 
-    // 7) 发布全局锚点。Release 保证其它核能看到上面所有字段的写入。
-    // Safety: INIT_READY 的 assert 已保证此函数全程仅此一次进入；写入期间
-    // 没有其它代码路径能读取 INIT_TASK / ROOT_PID_NS（它们必须先见到
-    // INIT_READY=true）。
-    unsafe {
-        core::ptr::addr_of_mut!(INIT_TASK).write(Some(Arc::clone(&init_task)));
-        core::ptr::addr_of_mut!(ROOT_PID_NS).write(Some(Arc::clone(&root_ns)));
-    }
+    // 7) 发布全局锚点。AtomicPtr 持有的强引用与内核同寿命，不参与常规回收。
+    let init_ptr = Arc::into_raw(Arc::clone(&init_task)).cast_mut();
+    let root_ptr = Arc::into_raw(Arc::clone(&root_ns)).cast_mut();
+    assert!(
+        INIT_TASK
+            .compare_exchange(
+                core::ptr::null_mut(),
+                init_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
+    assert!(
+        ROOT_PID_NS
+            .compare_exchange(
+                core::ptr::null_mut(),
+                root_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
     INIT_READY.store(true, Ordering::Release);
 
     // 8) CPU 0 的 current 指向 init。
@@ -322,13 +337,7 @@ pub fn init_task() -> Arc<Task> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] init_task() called before sched::init()"
     );
-    // Safety: INIT_READY=true 时 INIT_TASK 已写入且永不再变；Acquire load 与
-    // init() 中的 Release store 配对。
-    let slot = unsafe { &*core::ptr::addr_of!(INIT_TASK) };
-    Arc::clone(
-        slot.as_ref()
-            .expect("[sched] INIT_TASK flag set but slot empty"),
-    )
+    clone_global_arc(&INIT_TASK, "[sched] INIT_TASK flag set but slot empty")
 }
 
 /// 当前 CPU 的 runqueue。
@@ -350,12 +359,18 @@ pub fn root_pid_ns() -> Arc<PidNamespace> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] root_pid_ns() called before sched::init()"
     );
-    // Safety: INIT_READY=true 时 ROOT_PID_NS 已写入且永不再变。
-    let slot = unsafe { &*core::ptr::addr_of!(ROOT_PID_NS) };
-    Arc::clone(
-        slot.as_ref()
-            .expect("[sched] ROOT_PID_NS flag set but slot empty"),
-    )
+    clone_global_arc(&ROOT_PID_NS, "[sched] ROOT_PID_NS flag set but slot empty")
+}
+
+fn clone_global_arc<T>(slot: &AtomicPtr<T>, empty_message: &str) -> Arc<T> {
+    let ptr = slot.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "{}", empty_message);
+    unsafe {
+        // Safety: 槽位永久保留 `Arc::into_raw` 产生的强引用，因此 ptr 在内核运行期
+        // 始终有效；先增加强计数，再用 from_raw 构造本次调用拥有的 Arc。
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
 }
 
 /// 统计：当前根 ns 已占用的 pid 数（含 init）。
