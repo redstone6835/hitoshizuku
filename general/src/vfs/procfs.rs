@@ -2034,15 +2034,24 @@ fn task_session(task: &Arc<Task>) -> PidT {
         .unwrap_or(0)
 }
 
-fn task_memory_usage(task: &Arc<Task>) -> (u64, u64) {
+fn task_memory_usage(task: &Arc<Task>) -> (u64, u64, u64) {
     let Some(vm) = task_vm_space(task) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
-    let vsize = dump_vmas(&vm).into_iter().fold(0u64, |acc, (range, _)| {
-        acc.saturating_add((range.end - range.start) as u64)
-    });
+    let mut vsize = 0u64;
+    let mut data = 0u64;
+    for (range, flags) in dump_vmas(&vm) {
+        let size = (range.end - range.start) as u64;
+        vsize = vsize.saturating_add(size);
+        if flags.has(VmFlags::WRITE)
+            && !flags.has(VmFlags::SHARED)
+            && !flags.has(VmFlags::GROWS_DOWN)
+        {
+            data = data.saturating_add(size);
+        }
+    }
     let rss = vm.mapped_pages() as u64 * page_size() as u64;
-    (vsize, rss)
+    (vsize, rss, data)
 }
 
 fn task_thread_count(task: &Arc<Task>) -> usize {
@@ -2059,9 +2068,9 @@ fn render_task_status(task: &Arc<Task>) -> String {
     let fd_count = task_fdtable(task)
         .map(|fdt| fdt.snapshot_fds().len())
         .unwrap_or(0);
-    let (vsize, rss) = task_memory_usage(task);
+    let (vsize, rss, data) = task_memory_usage(task);
     format!(
-        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n",
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\n",
         name,
         task_state_char(state),
         task_state_name(state),
@@ -2079,6 +2088,7 @@ fn render_task_status(task: &Arc<Task>) -> String {
         fd_count,
         vsize / 1024,
         rss / 1024,
+        data / 1024,
         task_thread_count(task),
     )
 }
@@ -2091,7 +2101,7 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let pgrp = task_pgrp(task);
     let session = task_session(task);
     let num_threads = task_thread_count(task);
-    let (vsize, rss_bytes) = task_memory_usage(task);
+    let (vsize, rss_bytes, _) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
     let usage = task.usage_snapshot(sched::now_ns_public());
     let child_usage = task.child_usage_snapshot();
