@@ -373,11 +373,14 @@ impl Default for WaitQueue {
 /// 把 Sleeping / Uninterruptible 切回 Runnable。CAS 失败说明任务已经
 /// 处于其他状态（例如刚被另一路径唤醒），跳过即可。
 fn transition_to_runnable(task: &Arc<Task>) {
+    let transitioned = task.cas_state(TaskState::Sleeping, TaskState::Runnable)
+        || task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
     #[cfg(feature = "performance-profile")]
-    task.cancel_profile_wait();
-    if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
-        let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    if transitioned {
+        task.mark_profile_woken(crate::scheduler::now_ns_public());
     }
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = transitioned;
 }
 
 fn transition_from_wait(task: &Arc<Task>) {
@@ -394,7 +397,9 @@ fn transition_from_wait(task: &Arc<Task>) {
             return;
         }
     }
-    transition_to_runnable(task);
+    if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+        let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    }
 }
 
 fn default_wake(task: &Arc<Task>) {

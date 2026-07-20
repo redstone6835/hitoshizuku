@@ -5,6 +5,7 @@ control=${PROFILE_CONTROL:-/sys/kernel/profile_control}
 stats=${PROFILE_STATS:-/sys/kernel/profile_stats}
 samples=${PROFILE_SAMPLES:-/sys/kernel/profile_samples}
 catalog=${PROFILE_CATALOG:-/sys/kernel/profile_catalog}
+trace=${PROFILE_TRACE_FILE:-/sys/kernel/profile_trace}
 
 usage() {
     echo "usage: $0 <start|stop|status|catalog> [case-id]" >&2
@@ -26,6 +27,11 @@ snapshot() {
         cat "$samples"
         echo "@@PROFILE_SAMPLES_END phase=$phase case=$case_id"
     fi
+    if [ -r "$trace" ]; then
+        echo "@@PROFILE_TRACE_BEGIN phase=$phase case=$case_id"
+        cat "$trace"
+        echo "@@PROFILE_TRACE_END phase=$phase case=$case_id"
+    fi
 }
 
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
@@ -45,6 +51,8 @@ case "$command" in
             write_control "events=$PROFILE_EVENT_MASK"
         [ -z "${PROFILE_SAMPLING:-}" ] || \
             write_control "samples=$PROFILE_SAMPLING"
+        [ -z "${PROFILE_TRACE_ENABLED:-}" ] || \
+            write_control "trace=$PROFILE_TRACE_ENABLED"
         snapshot before "$case_id"
         write_control resume
         ;;
