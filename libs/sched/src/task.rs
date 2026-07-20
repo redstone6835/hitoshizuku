@@ -130,6 +130,8 @@ pub fn task_diag() -> TaskDiag {
 
 /// Linux 线程名长度，包含结尾 NUL。
 pub const TASK_COMM_LEN: usize = 16;
+/// Linux 普通任务的默认定时器松弛量，单位纳秒。
+pub const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 const DEFAULT_COMM: [u8; TASK_COMM_LEN] =
     [b'm', b'y', b'g', b'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -182,9 +184,9 @@ impl Default for SigAltStack {
 
 /// 任务资源使用快照。
 ///
-/// 当前调度器尚未区分用户态/内核态执行时间，因此先把任务生命周期内的可运行
-/// 时间计入 `user_ns`，`system_ns` 保持 0。接口按结构化字段提供给 syscall
-/// 兼容层，后续接入更细的 trap/syscall 记账时无需改动 wait/getrusage ABI。
+/// 当前调度器尚未区分用户态/内核态执行时间，因此先把实际占用 CPU 的时间计入
+/// `user_ns`，`system_ns` 保持 0。接口按结构化字段提供给 syscall 兼容层，后续
+/// 接入 trap/syscall 边界记账时无需改动 wait/getrusage ABI。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TaskUsage {
     pub user_ns: u64,
@@ -499,8 +501,11 @@ pub struct Task {
     sigaltstack: Spinlock<SigAltStack>,
     /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
     comm: Spinlock<[u8; TASK_COMM_LEN]>,
+    /// 任务创建时的单调时钟值，用于 `/proc/<pid>/stat` 的 starttime。
+    start_time_ns: AtomicU64,
     /// 调度器累计的真实 CPU 运行时间；剖析开关只控制事件采样，不改变记账语义。
     cpu_runtime_ns: AtomicU64,
+    /// 当前连续运行区间的起点加一；零表示任务当前不占用 CPU。
     running_since_ns: AtomicU64,
     /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
     exited_usage_ns: AtomicU64,
@@ -525,6 +530,9 @@ pub struct Task {
     placement: TaskPlacement,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
+    /// 当前任务允许的定时器松弛量，以及 `PR_SET_TIMERSLACK(0)` 使用的默认值。
+    timer_slack_ns: AtomicU64,
+    default_timer_slack_ns: AtomicU64,
     /// 当前任务挂载的运行时执行状态裸指针。
     ///
     /// 指针的所有权始终由 `TASKEXT_ELM_EXECUTION` 对应的 `Arc` 持有；这里仅为
@@ -598,6 +606,7 @@ impl Task {
             rseq: Spinlock::new(RseqRegistration::default()),
             sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
+            start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
             cpu_runtime_ns: AtomicU64::new(0),
             running_since_ns: AtomicU64::new(0),
             exited_usage_ns: AtomicU64::new(0),
@@ -615,6 +624,8 @@ impl Task {
             current_cpu: AtomicUsize::new(0),
             placement: TaskPlacement::unbound(),
             ioprio: AtomicU32::new(0),
+            timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
+            default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             elm_execution_ptr: AtomicUsize::new(0),
             hot_ext: HotTaskExt::new(),
             ext: Spinlock::new(Vec::new()),
@@ -643,6 +654,31 @@ impl Task {
 
     pub fn is_idle_task(&self) -> bool {
         self.kind() == TaskKind::Idle
+    }
+
+    /// 返回当前任务通过 `PR_GET_TIMERSLACK` 可见的定时器松弛量。
+    pub fn timer_slack_ns(&self) -> u64 {
+        self.timer_slack_ns.load(Ordering::Acquire)
+    }
+
+    /// 实现 `PR_SET_TIMERSLACK`：非零值直接安装，零值恢复任务默认值。
+    pub fn set_timer_slack_ns(&self, value_ns: u64) {
+        let value_ns = if value_ns == 0 {
+            self.default_timer_slack_ns.load(Ordering::Acquire)
+        } else {
+            value_ns
+        };
+        self.timer_slack_ns.store(value_ns, Ordering::Release);
+    }
+
+    /// fork/clone 时继承父任务的当前值与默认值。
+    pub(crate) fn inherit_timer_slack_from(&self, parent: &Task) {
+        self.timer_slack_ns
+            .store(parent.timer_slack_ns(), Ordering::Release);
+        self.default_timer_slack_ns.store(
+            parent.default_timer_slack_ns.load(Ordering::Acquire),
+            Ordering::Release,
+        );
     }
 
     pub(crate) fn mark_kernel_thread(&self) {
@@ -736,7 +772,7 @@ impl Task {
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
         self.exited_usage_ns.store(
-            self.elapsed_usage_ns(crate::scheduler::now_ns_public()),
+            self.cpu_runtime_ns(crate::scheduler::now_ns_public()),
             Ordering::Release,
         );
         if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
@@ -1190,9 +1226,8 @@ impl Task {
     }
 
     fn elapsed_usage_ns(&self, now_ns: u64) -> u64 {
-        let frozen = self.exited_usage_ns.load(Ordering::Acquire);
-        if frozen != 0 {
-            return frozen;
+        if matches!(self.state(), TaskState::Zombie | TaskState::Dead) {
+            return self.exited_usage_ns.load(Ordering::Acquire);
         }
         self.cpu_runtime_ns(now_ns)
     }
@@ -1205,6 +1240,24 @@ impl Task {
             accumulated
         } else {
             accumulated.saturating_add(now_ns.saturating_sub(encoded - 1))
+        }
+    }
+
+    /// 记录 runqueue 自上次更新时间以来由本任务实际占用的 CPU 时间。
+    ///
+    /// 已建立切换时间戳时以时间戳为准，避免 runqueue 的全局基线早于任务真正
+    /// 切入时刻；独立 runqueue 测试等没有切换时间戳的场景继续使用 `delta_ns`。
+    pub(crate) fn account_cpu_runtime(&self, delta_ns: u64, now_ns: u64) {
+        let encoded = self.running_since_ns.load(Ordering::Acquire);
+        let charged = if encoded == 0 {
+            delta_ns
+        } else {
+            now_ns.saturating_sub(encoded - 1)
+        };
+        self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
+        if encoded != 0 {
+            self.running_since_ns
+                .store(now_ns.saturating_add(1), Ordering::Release);
         }
     }
 
@@ -1273,6 +1326,11 @@ impl Task {
         }
         #[cfg(not(feature = "performance-profile"))]
         let _ = now_ns;
+    }
+
+    /// 返回任务相对系统单调时钟的创建时刻。
+    pub fn start_time_ns(&self) -> u64 {
+        self.start_time_ns.load(Ordering::Acquire)
     }
 
     pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
@@ -1494,6 +1552,8 @@ pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
 /// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
 pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
+/// 当前任务持有的可执行文件访问租约集合。
+pub const TASKEXT_EXEC_ACCESS: TaskExtKey = 0x0002_0003;
 /// ELM 当前执行域、恢复帧和生命周期上下文。
 pub const TASKEXT_ELM_EXECUTION: TaskExtKey = 0x0003_0000;
 

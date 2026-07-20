@@ -172,6 +172,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                     options(nostack, preserves_flags)
                 );
             }
+            // TCFG 使用 one-shot 模式；先恢复常规 tick 作为兜底。调度器处理完
+            // 到期等待后会按新的最早 deadline 再次缩短本次计时。
+            super::super::loader::rearm_local_timer(None);
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
@@ -196,9 +199,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             if boot_cpu {
                 super::super::vdso::run_timer_tick_hook(now_ns);
             }
-            // timer 可打断持有 runqueue、topology 等普通自旋锁的内核路径。
-            // top-half 只记录待处理时间；syscall 返回或下一次主动调度会在无锁
-            // 边界补做调度工作，避免同一 CPU 重入锁后永久自旋。
+            // timer 可能打断持有 runqueue、topology 等普通自旋锁的内核路径。
+            // 内核态 top-half 只记录待处理时间，随后由 syscall 返回或主动调度的
+            // 无锁边界补做调度工作，避免本 CPU 重入锁后永久自旋。
             if !from_user {
                 sched::defer_timer_tick(now_ns);
                 if boot_cpu && general::elm_guard::active_cell() == 0 {
@@ -207,7 +210,16 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 }
                 return arg4;
             }
-            sched::on_timer_tick(now_ns);
+
+            let deadline_fired = sched::on_timer_tick(now_ns);
+            deliver_user_signals_before_return(arg4, from_user);
+
+            // deadline 到期时先让被唤醒任务运行，避免网络和 TTY 周期轮询叠加到
+            // 短超时延迟。内核态中断已经在上方返回，此处是安全的用户态返回边界。
+            let urgent_preempt = deadline_fired && sched::is_ready();
+            if urgent_preempt {
+                sched::preempt_if_needed(now_ns);
+            }
             if boot_cpu {
                 // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
                 // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
@@ -218,10 +230,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
                 super::super::vdso::run_tty_poll_hook(now_ns);
             }
-            deliver_user_signals_before_return(arg4, from_user);
             // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
             // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
-            if from_user {
+            if !urgent_preempt {
                 sched::preempt_if_needed(now_ns);
             }
             return arg4;

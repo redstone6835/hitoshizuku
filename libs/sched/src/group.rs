@@ -58,7 +58,10 @@ impl ThreadGroup {
         })
     }
 
-    /// 创建一个线程组并共享给定的 SharedSignal（CLONE_SIGHAND 语义）。
+    /// 创建一个线程组并安装给定的线程组信号状态。
+    ///
+    /// `CLONE_SIGHAND` 调用方应传入通过 `clone_sighand()` 构造的新状态，
+    /// 仅让其中的 handler 表共享；不能直接复用父线程组 pending 队列。
     pub fn new_sharing_signal(shared: Arc<SharedSignal>) -> Arc<Self> {
         Arc::new(Self {
             tgid: AtomicI32::new(PID_INVALID),

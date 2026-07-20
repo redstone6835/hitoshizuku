@@ -1,0 +1,172 @@
+# tag或@scenario:<name>	分类	原因（不得包含制表符）
+@scenario:cve	kernel-bound	针对特定 Linux 内核实现漏洞的回归场景
+@scenario:net_stress.appl	stress-test	网络应用长时间并发压力场景，不属于本轮功能验证
+@scenario:net_stress.broken_ip	stress-test	畸形报文长时间压力场景，不属于本轮功能验证
+@scenario:net_stress.interface	stress-test	网络接口反复重配置压力场景，不属于本轮功能验证
+@scenario:net_stress.ipsec_dccp	stress-test	IPsec 与 DCCP 组合压力场景，不属于本轮功能验证
+@scenario:net_stress.ipsec_icmp	stress-test	IPsec 与 ICMP 组合压力场景，不属于本轮功能验证
+@scenario:net_stress.ipsec_sctp	stress-test	IPsec 与 SCTP 组合压力场景，不属于本轮功能验证
+@scenario:net_stress.ipsec_tcp	stress-test	IPsec 与 TCP 组合压力场景，不属于本轮功能验证
+@scenario:net_stress.ipsec_udp	stress-test	IPsec 与 UDP 组合压力场景，不属于本轮功能验证
+@scenario:net_stress.multicast	stress-test	组播长时间并发压力场景，不属于本轮功能验证
+@scenario:net_stress.route	stress-test	路由反复重配置压力场景，不属于本轮功能验证
+@scenario:containers	missing-functionality	内核尚未实现 LTP 容器场景依赖的 namespace 对象模型
+@scenario:controllers	missing-functionality	内核尚未实现 cgroup 文件系统与 controller 模型
+@scenario:nptl	stress-test	nptl01 固定执行十万轮条件变量竞态并允许持续二十小时，属于线程压力场景
+@scenario:pty	missing-functionality	内核尚未实现 /dev/ptmx、Unix98 PTY 分配、devpts 与配套终端 ioctl
+@scenario:fs_bind	missing-functionality	内核尚未实现 MS_BIND、MS_MOVE、MS_REC 与 mount namespace 绑定挂载语义
+@scenario:power_management_tests	missing-functionality	内核尚未实现 Linux 电源管理 sysfs 控制面与休眠状态机
+@scenario:hugetlb	missing-functionality	内核尚未实现 hugetlbfs、显式大页映射与大页 System V 共享内存
+@scenario:hyperthreading	architecture-inapplicable	LoongArch64 QEMU 平台没有 Linux SMT topology 与控制接口
+@scenario:can	missing-functionality	网络栈尚未实现 PF_CAN、CAN_RAW 与 CAN_BCM 协议族
+@scenario:cpuhotplug	missing-functionality	内核尚未实现 CPU 热插拔状态机与 Linux CPU online sysfs 控制面
+@scenario:input	missing-functionality	内核尚未实现 Linux input event 设备 ABI
+@scenario:crypto	missing-functionality	内核尚未实现 AF_ALG 与 Linux crypto user netlink 接口
+@scenario:uevent	missing-functionality	内核尚未实现 Linux kobject uevent 与对应 netlink 通知接口
+@scenario:watchqueue	missing-functionality	内核尚未实现 watch_queue 通知管道与过滤接口
+@scenario:net.features	stress-test	官方场景用于持续施压高级网络特性，不属于本轮基础功能验证
+@scenario:net.nfs	missing-functionality	内核尚未实现 NFS 客户端、服务端与远端测试环境协议
+@scenario:net.sctp	missing-functionality	网络栈尚未实现 SCTP 协议及其 socket ABI
+@scenario:fcntl-locktests	stress-test	NFSv4 locktests 固定派生 100 个客户端执行全文件逐字节锁竞争，属于锁压力场景
+ldd01_sh	test-environment	initramfs 未打包 glibc ldd 脚本，用例未进入动态链接器验证
+tar01_sh	test-environment	用例要求 GNU tar 的 d 与 r 操作，BusyBox tar 不提供这些选项
+gzip01_sh	test-environment	用例要求 GNU gzip 的递归压缩选项，BusyBox gzip 不提供该选项
+mv01_sh	test-environment	基础目录移动已经通过，用例后续要求 BusyBox mv 不提供的备份选项
+df01_sh	test-environment	用例依赖 GNU stat 的 --printf 选项，BusyBox stat 不提供该选项
+mkfs01_sh	test-environment	initramfs 只有具体文件系统 mkfs applet，未提供 util-linux 通用 mkfs 前端
+mkfs01_ext2_sh	test-environment	initramfs 未提供用例要求的 util-linux 通用 mkfs 前端
+mkfs01_minix_sh	test-environment	initramfs 未提供用例要求的 util-linux 通用 mkfs 前端
+mkfs01_vfat_sh	test-environment	initramfs 未提供用例要求的 util-linux 通用 mkfs 前端
+unshare01_sh	missing-functionality	内核尚未实现 user 与 mount namespace 以及绑定挂载
+sysctl02_sh	missing-functionality	内核尚未实现 /proc/sys/fs/file-max 及其可写 sysctl 控制面
+asapi_01	missing-functionality	网络栈尚未完整实现 RFC 3542 IPv6 高级 socket API 与协议数据库环境
+asapi_02	missing-functionality	网络栈尚未实现 ICMPv6 raw socket 过滤器
+asapi_03	missing-functionality	网络栈尚未实现 IPv6 PKTINFO 等发送辅助数据控制消息
+mm01	stress-test	大规模 mmap 压力场景，不属于本轮功能验证
+mm02	stress-test	大规模 mmap 压力场景，不属于本轮功能验证
+mtest01	stress-test	高内存占用压力场景，不属于本轮功能验证
+mtest01w	stress-test	高内存占用写压力场景，不属于本轮功能验证
+mtest05	stress-test	mmstress 长时间压力场景，不属于本轮功能验证
+mtest06	stress-test	mmap1 长时间压力场景，不属于本轮功能验证
+mtest06_2	stress-test	mmap2 长时间压力场景，不属于本轮功能验证
+mtest06_3	stress-test	mmap3 长时间压力场景，不属于本轮功能验证
+mallocstress01	stress-test	malloc 并发压力场景，不属于本轮功能验证
+mmapstress01	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress02	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress03	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress04	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress05	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress06	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress07	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress08	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress09	stress-test	mmap 并发压力场景，不属于本轮功能验证
+mmapstress10	stress-test	mmap 并发压力场景，不属于本轮功能验证
+shm_test01	stress-test	共享内存循环负载场景，不属于本轮功能验证
+page01	stress-test	分页内存负载场景，不属于本轮功能验证
+page02	stress-test	分页内存负载场景，不属于本轮功能验证
+mmap10	stress-test	并发 mmap 竞争压力场景，不属于本轮功能验证
+mmap10_1	stress-test	并发 mmap 竞争压力场景，不属于本轮功能验证
+mmap10_2	stress-test	并发 mmap 竞争压力场景，不属于本轮功能验证
+mmap10_3	stress-test	并发 mmap 竞争压力场景，不属于本轮功能验证
+mmap10_4	stress-test	长迭代 mmap 竞争压力场景，不属于本轮功能验证
+ksm01	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm01_1	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm02	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm02_1	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm03	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm03_1	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm04	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm04_1	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm05	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm06	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm06_1	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm06_2	missing-functionality	内核尚未实现 Kernel Samepage Merging
+ksm07	missing-functionality	内核尚未实现 Kernel Samepage Merging
+cpuset01	missing-functionality	内核尚未实现 cpuset cgroup controller
+oom01	stress-test	OOM killer 压力场景，不属于本轮功能验证
+oom02	stress-test	OOM killer 压力场景，不属于本轮功能验证
+oom03	stress-test	OOM killer 压力场景，不属于本轮功能验证
+oom04	stress-test	OOM killer 压力场景，不属于本轮功能验证
+oom05	stress-test	OOM killer 压力场景，不属于本轮功能验证
+swapping01	stress-test	交换空间压力场景，不属于本轮功能验证
+thp01	missing-functionality	内核尚未实现 Transparent Huge Pages
+thp02	missing-functionality	内核尚未实现 Transparent Huge Pages
+thp03	missing-functionality	内核尚未实现 Transparent Huge Pages
+thp04	missing-functionality	内核尚未实现 Transparent Huge Pages
+overcommit_memory01	missing-functionality	内核尚未实现 Linux overcommit_memory 策略与 procfs 控制面
+overcommit_memory02	missing-functionality	内核尚未实现 Linux overcommit_memory 策略与 procfs 控制面
+overcommit_memory03	missing-functionality	内核尚未实现 Linux overcommit_memory 策略与 procfs 控制面
+overcommit_memory04	missing-functionality	内核尚未实现 Linux overcommit_memory 策略与 procfs 控制面
+overcommit_memory05	missing-functionality	内核尚未实现 Linux overcommit_memory 策略与 procfs 控制面
+overcommit_memory06	missing-functionality	内核尚未实现 Linux overcommit_memory 策略与 procfs 控制面
+max_map_count	missing-functionality	内核尚未实现 Linux vm.max_map_count procfs 控制面
+min_free_kbytes	missing-functionality	内核尚未实现 Linux vm.min_free_kbytes 水位策略与 procfs 控制面
+hackbench01	performance-test	hackbench 进程调度吞吐测试，不属于本轮功能验证
+hackbench02	performance-test	hackbench 线程调度吞吐测试，不属于本轮功能验证
+time-schedule01	performance-test	上下文切换计时基准，不属于本轮功能验证
+trace_sched01	performance-test	批量实时调度跟踪基准，不属于本轮功能验证
+cfs_bandwidth01	missing-functionality	依赖 Linux cgroup CFS bandwidth 控制器
+starvation	stress-test	默认执行两百万次跨进程信号并允许运行 240 秒，属于调度压力场景
+proc_sched_rt01	kernel-bound	针对 Linux sched_rt_period/runtime 与 RR timeslice sysctl 内部策略
+sched_cli_serv	stress-test	多线程调度 client-server 负载场景，不属于本轮功能验证
+sched_stress	stress-test	调度器长时间压力场景，不属于本轮功能验证
+autogroup01	kernel-bound	针对 Linux scheduler autogroup 内部对象生命周期与专属 sysctl
+msgstress01	stress-test	System V 消息队列压力场景，不属于本轮功能验证
+pth_str01	stress-test	POSIX 线程调度压力场景，不属于本轮功能验证
+pth_str02	stress-test	POSIX 线程高迭代调度压力场景，不属于本轮功能验证
+pth_str03	stress-test	POSIX 线程调度压力场景，不属于本轮功能验证
+pipeio_1	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
+pipeio_3	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
+pipeio_4	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
+pipeio_5	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
+pipeio_6	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
+pipeio_8	missing-functionality	用例依赖尚未实现的 System V semaphore semget(2)
+irqbalance01	missing-functionality	用例依赖尚未实现的 /proc/interrupts 中断统计视图
+cn_pec_sh	kernel-bound	依赖 Linux connector proc event 内核接口
+kmsg01	missing-functionality	内核尚未实现 Linux /dev/kmsg 记录注入接口
+fw_load	kernel-bound	依赖 Linux firmware loader sysfs 状态机与测试固件模块
+cpufreq_boost	architecture-inapplicable	LoongArch64 QEMU 平台没有 Linux cpufreq boost 控制接口
+delete_module01	kernel-bound	依赖 Linux LKM 装载器与模块状态机
+delete_module02	kernel-bound	依赖 Linux LKM 装载器与模块状态机
+delete_module03	kernel-bound	依赖 Linux LKM 装载器与模块状态机
+finit_module01	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+finit_module02	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+init_module01	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+init_module02	kernel-bound	依赖 Linux LKM 文件格式与模块装载器
+insmod01_sh	kernel-bound	直接调用 Linux insmod 并装载 ko
+lsmod01_sh	kernel-bound	依赖 Linux 模块列表 ABI
+kallsyms	kernel-bound	校验 Linux kallsyms 内部导出格式
+block_dev	kernel-bound	依赖 LTP Linux 内核测试模块
+tpci	kernel-bound	依赖 LTP Linux PCI 测试模块
+tbio	kernel-bound	依赖 LTP Linux block I/O 测试模块
+ltp_acpi	kernel-bound	依赖 LTP Linux ACPI 测试模块
+uaccess	kernel-bound	依赖 LTP Linux uaccess 测试模块
+rcu_torture	kernel-bound	依赖 Linux rcu_torture 模块
+lock_torture	kernel-bound	依赖 Linux lock_torture 模块
+zram01	kernel-bound	依赖 Linux zram 模块及其 sysfs 实现
+zram02	kernel-bound	依赖 Linux zram 模块及其 sysfs 实现
+zram03	kernel-bound	依赖 Linux zram 模块及其 sysfs 实现
+clock_gettime04	test-environment	QEMU TCG 宿主调度可能暂停超过 LTP 虚拟机 50ms 容差，结果不可稳定复现
+clock_gettime03	missing-functionality	依赖尚未实现的 time namespace 与 /proc/self/ns/time_for_children
+clock_nanosleep03	missing-functionality	依赖尚未实现的 CLONE_NEWTIME 与 unshare(2)
+acct01	missing-functionality	内核尚未实现 acct(2) 进程记账子系统
+acct02	missing-functionality	内核尚未实现 acct(2) 进程记账子系统
+adjtimex01	missing-functionality	内核尚未实现 adjtimex(2) 时钟校频接口
+adjtimex02	missing-functionality	内核尚未实现 adjtimex(2) 时钟校频接口
+adjtimex03	missing-functionality	内核尚未实现 adjtimex(2) 时钟校频接口
+clock_adjtime01	missing-functionality	内核尚未实现 clock_adjtime(2) 时钟校频接口
+clock_adjtime02	missing-functionality	内核尚未实现 clock_adjtime(2) 时钟校频接口
+leapsec01	missing-functionality	依赖 adjtimex(2) 闰秒状态机，且失败后会污染同一分片的实时时钟
+bind06	missing-functionality	依赖尚未实现的 CLONE_NEWUSER 与 unshare(2)
+clone09	missing-functionality	依赖尚未实现的 network namespace 与对应 procfs sysctl 视图
+clone301	missing-functionality	用例包含尚未实现的 CLONE_NEWPID 分支，其他 clone3 基础分支已通过
+timens01	missing-functionality	依赖尚未实现的 CLONE_NEWTIME 与 unshare(2)
+bpf_map01	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog01	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog02	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog03	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog04	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog05	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog06	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+bpf_prog07	missing-functionality	内核尚未实现 bpf(2) 对象与验证器子系统
+rtc01	missing-functionality	RTC 读取已通过，但内核尚未实现 RTC_AIE_ON 与 RTC_UIE_ON 中断控制

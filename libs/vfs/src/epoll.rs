@@ -436,11 +436,32 @@ impl EpollFileOps {
         false
     }
 
-    fn wait(&self, maxevents: usize, timeout_ms: i64) -> Result<Vec<EpollEvent>, Errno> {
-        let deadline = timeout_deadline(timeout_ms);
+    fn nesting_depth_recursive(&self, visited: &mut Vec<usize>) -> usize {
+        let watches = self.core.state.lock().watches.clone();
+        let mut max_child_depth = 0;
+        for watch in watches {
+            let ptr = Arc::as_ptr(&watch.file) as usize;
+            if visited.contains(&ptr) {
+                continue;
+            }
+            let Some(child) = watch.file.downcast_ops::<EpollFileOps>() else {
+                continue;
+            };
+            visited.push(ptr);
+            max_child_depth = max_child_depth.max(child.nesting_depth_recursive(visited));
+            visited.pop();
+        }
+        1 + max_child_depth
+    }
+
+    fn wait_until(
+        &self,
+        maxevents: usize,
+        deadline: Option<u64>,
+    ) -> Result<Vec<EpollEvent>, Errno> {
         loop {
             let ready = self.collect_ready(maxevents);
-            if !ready.is_empty() || timeout_ms == 0 || timeout_expired(deadline) {
+            if !ready.is_empty() || timeout_expired(deadline) {
                 return Ok(ready);
             }
             let task = current_task();
@@ -619,6 +640,10 @@ impl FileOps for EpollFileOps {
         Some(&self.core.poll_source)
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn on_file_description_closed(&self, file: &Arc<File>) {
         self.remove_closed_file(file);
     }
@@ -650,6 +675,34 @@ fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
 
 fn timeout_expired(deadline: Option<u64>) -> bool {
     deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
+}
+
+#[cfg(test)]
+pub(crate) fn wait_recheck_deadline(
+    now_ns: u64,
+    deadline: Option<u64>,
+    sources_empty: bool,
+    has_unregistered_source: bool,
+) -> Option<u64> {
+    const EPOLL_RECHECK_NS: u64 = 10_000_000;
+    const SHORT_EMPTY_WAIT_SPIN_TAIL_NS: u64 = 500_000;
+    const LONG_EMPTY_WAIT_SPIN_TAIL_NS: u64 = 2_000_000;
+    const LONG_EMPTY_WAIT_THRESHOLD_NS: u64 = 20_000_000;
+
+    if sources_empty && let Some(deadline) = deadline {
+        let remaining = deadline.saturating_sub(now_ns);
+        let spin_tail = if remaining >= LONG_EMPTY_WAIT_THRESHOLD_NS {
+            LONG_EMPTY_WAIT_SPIN_TAIL_NS
+        } else {
+            SHORT_EMPTY_WAIT_SPIN_TAIL_NS
+        };
+        return Some(deadline.saturating_sub(spin_tail).max(now_ns));
+    }
+    if !has_unregistered_source && (deadline.is_some() || !sources_empty) {
+        return deadline;
+    }
+    let quantum = now_ns.saturating_add(EPOLL_RECHECK_NS);
+    Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
 }
 
 fn has_unblocked_signal(task: &Arc<sched::Task>) -> bool {
@@ -698,16 +751,28 @@ pub fn ctl(
     fd: Fd,
     event: Option<EpollEvent>,
 ) -> Result<(), Errno> {
+    const MAX_EPOLL_NESTING_DEPTH: usize = 5;
+
     let epoll_file = fdt.get_file(epfd).ok_or(Errno::EBADF)?;
     let ops = epoll_ops_from_fd(&epoll_file)?;
     let target = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-    if Arc::ptr_eq(&epoll_file, &target) {
-        return Err(Errno::EINVAL);
-    }
-    if let Some(target_epoll) = target.downcast_ops::<EpollFileOps>() {
-        let mut visited = vec![Arc::as_ptr(&target) as usize];
-        if target_epoll.contains_file_recursive(&epoll_file, &mut visited) {
-            return Err(Errno::ELOOP);
+
+    if op == EPOLL_CTL_ADD {
+        if Arc::ptr_eq(&epoll_file, &target) {
+            return Err(Errno::EINVAL);
+        }
+        if !target.is_epollable() {
+            return Err(Errno::EPERM);
+        }
+        if let Some(target_epoll) = target.downcast_ops::<EpollFileOps>() {
+            let mut visited = vec![Arc::as_ptr(&target) as usize];
+            if target_epoll.contains_file_recursive(&epoll_file, &mut visited) {
+                return Err(Errno::ELOOP);
+            }
+            let mut depth_visited = vec![Arc::as_ptr(&target) as usize];
+            if target_epoll.nesting_depth_recursive(&mut depth_visited) >= MAX_EPOLL_NESTING_DEPTH {
+                return Err(Errno::EINVAL);
+            }
         }
     }
     match op {
@@ -724,9 +789,22 @@ pub fn wait(
     maxevents: usize,
     timeout_ms: i64,
 ) -> Result<Vec<EpollEvent>, Errno> {
+    wait_until(fdt, epfd, maxevents, timeout_deadline(timeout_ms))
+}
+
+/// 使用调用方建立的绝对单调时钟截止时间等待 epoll 事件。
+///
+/// syscall 层应尽早建立 deadline，使 fd 查找与临时信号掩码安装等固定前处理
+/// 计入等待时间，同时避免 `epoll_pwait2` 把纳秒超时向上取整为毫秒。
+pub fn wait_until(
+    fdt: &FdTable,
+    epfd: Fd,
+    maxevents: usize,
+    deadline: Option<u64>,
+) -> Result<Vec<EpollEvent>, Errno> {
     let epoll_file = fdt.get_file(epfd).ok_or(Errno::EBADF)?;
     let ops = epoll_ops_from_fd(&epoll_file)?;
-    ops.wait(maxevents, timeout_ms)
+    ops.wait_until(maxevents, deadline)
 }
 
 #[cfg(test)]

@@ -49,6 +49,14 @@ fn vfork_default_flags() {
     assert_eq!(f.exit_signal(), 17);
 }
 
+/// CLONE_CLEAR_SIGHAND 使用 clone3 的高 32 位标志位，不能被截断。
+#[ktest]
+fn clear_sighand_flag_matches_linux_uapi() {
+    let flags = CloneFlags::from_raw(CloneFlags::CLONE_CLEAR_SIGHAND);
+    assert!(flags.has(CloneFlags::CLONE_CLEAR_SIGHAND));
+    assert_eq!(flags.raw(), 0x1_00000000);
+}
+
 /// exit_signal 从低 8 位（CSIGNAL 掩码）提取退出信号编号。
 #[ktest]
 fn exit_signal_extract() {

@@ -147,6 +147,10 @@ impl FileOps for SignalfdFileOps {
         Some(&self.shared.poll_source)
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
