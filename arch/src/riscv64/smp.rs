@@ -31,6 +31,7 @@ static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
 static STARTED_HARTS: AtomicUsize = AtomicUsize::new(0);
 static AP_IDLE_TASKS: [AtomicPtr<sched::Task>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+static REMOTE_FENCE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 #[repr(C, align(16))]
 struct SecondaryStack([u8; AP_STACK_SIZE]);
@@ -81,6 +82,10 @@ pub(crate) fn handle_ipi() {
 }
 
 fn for_each_remote_hart(mut action: impl FnMut(usize) -> sbi::SbiRet) {
+    // SBI RFENCE 是同步操作。若多个 hart 同时互相发起 fence，固件可能让每个
+    // 调用都等待另一个仍停留在 RFENCE ecall 中的 hart。统一串行化所有远端
+    // TLB/I-cache fence，避免形成跨 hart 等待环。
+    let _guard = REMOTE_FENCE_LOCK.lock();
     let source = crate::riscv64::specific::current_cpu_id();
     let targets = ONLINE_HARTS.load(Ordering::Acquire) & !(1 << source);
     for logical_id in 0..MAX_CPUS {

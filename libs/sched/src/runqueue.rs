@@ -264,6 +264,22 @@ impl Runqueue {
 
     fn enqueue_with_preference(&self, task: Arc<Task>, now_ns: u64, preferred: bool) -> bool {
         let mut inner = self.inner.lock();
+        if inner
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &task))
+            && matches!(
+                task.state(),
+                TaskState::Running | TaskState::Runnable | TaskState::Sleeping
+            )
+        {
+            // 睡眠准备与并发唤醒之间允许出现“任务仍是 current，但状态已是
+            // Sleeping”的窗口。此时唤醒必须原地撤销睡眠，不能把同一任务同时
+            // 放进 current 和就绪队列，否则下一次 pick 会留下重复队列节点。
+            task.set_state(TaskState::Running);
+            task.sched.set_on_rq(false);
+            return false;
+        }
         if !task_can_enter_runqueue(&task) {
             task.sched.set_on_rq(false);
             log::warning!(
