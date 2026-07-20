@@ -11,7 +11,7 @@ use ktest::ktest;
 use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedAttr,
-    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskState, ThreadGroup,
     supported_cpu_mask,
 };
 
@@ -263,6 +263,25 @@ fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     assert_eq!(rq.nr_running(), 2);
     assert!(rq.dequeue(&current, 3));
     assert!(rq.dequeue(&idle, 3));
+}
+
+#[ktest]
+fn runqueue_wake_current_sleep_transition_does_not_duplicate_task() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&task));
+    task.set_state(TaskState::Sleeping);
+
+    assert!(!rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq.is_current(&task));
+    assert_eq!(task.state(), TaskState::Running);
+    assert!(!task.sched.on_rq());
+    assert_eq!(rq.nr_running(), 1);
+
+    let current = rq.pick_next(2).expect("current task");
+    assert!(alloc::sync::Arc::ptr_eq(&current, &task));
+    assert_eq!(rq.nr_running(), 1);
+    assert!(rq.dequeue(&current, 3));
 }
 
 #[ktest]
