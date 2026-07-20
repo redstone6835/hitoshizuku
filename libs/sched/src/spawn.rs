@@ -152,6 +152,7 @@ pub fn activate_task_with_cpu_hint(
 /// 回滚尚未运行、尚未入队的新任务。用于 clone/exec 安装用户上下文失败的路径。
 #[kernel_symbols::export(name = "sched.spawn.abort_new_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn abort_new_task(task: &Arc<Task>) {
+    crate::scheduler::deadline_admission().release(task);
     if let Some(parent) = task.parent() {
         let _ = parent.remove_child(task);
     }
@@ -355,6 +356,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     }
 
     task.cleanup_before_exit();
+    crate::scheduler::deadline_admission().release(task);
 
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
     //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。

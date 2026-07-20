@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
+use crate::deadline_admission::{DeadlineAdmission, utilization_of};
 use crate::eevdf::{NICE_0_WEIGHT, SchedParams};
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
@@ -512,6 +513,14 @@ fn active_cpu_set() -> CpuMask {
     SCHEDULER.active_set()
 }
 
+pub(crate) fn cpu_capacity(cpu: CpuId) -> u64 {
+    SCHEDULER.topology_snapshot().topology.cpu_capacity(cpu)
+}
+
+pub(crate) fn deadline_admission() -> &'static DeadlineAdmission {
+    SCHEDULER.deadline_admission()
+}
+
 #[kernel_symbols::export(name = "sched.scheduler.sched_topology", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn sched_topology() -> SchedTopology {
     SCHEDULER.topology()
@@ -526,6 +535,13 @@ pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errn
         .contains_mask(CpuMask::SUPPORTED)
     {
         return Err(errno::Errno::EINVAL);
+    }
+    let mut capacities = [0; NR_CPUS];
+    for cpu in CpuMask::SUPPORTED.iter() {
+        capacities[cpu.get()] = topology.cpu_capacity(cpu);
+    }
+    if !SCHEDULER.deadline_admission().fits_capacities(capacities) {
+        return Err(errno::Errno::EBUSY);
     }
     SCHEDULER.install_topology(topology);
     Ok(())
@@ -722,6 +738,7 @@ struct CpuOfflineTask {
     source: crate::PlacementSnapshot,
     target_cpu: CpuId,
     target_domain: usize,
+    was_queued: bool,
 }
 
 /// 将一个非启动 CPU 下线并迁移其排队任务。
@@ -756,10 +773,17 @@ pub(crate) fn offline_cpu_with_scheduler(
         return Err(errno::Errno::EBUSY);
     }
     let drained = cpu_state.runqueue().drain_queued(now_ns);
+    let mut candidates = drained.clone();
+    for task in scheduler.deadline_admission().tasks_on_cpu(cpu) {
+        if !candidates.iter().any(|queued| Arc::ptr_eq(queued, &task)) {
+            candidates.push(task);
+        }
+    }
     let snapshot = scheduler.topology_snapshot();
     let mut planned_load = collect_rq_load_snapshot_for(scheduler, snapshot.active);
+    let mut planned_deadline = scheduler.deadline_admission().totals();
     let mut tasks = Vec::new();
-    for task in &drained {
+    for task in &candidates {
         let _ = refresh_task_placement(scheduler, task);
         let source = task.placement();
         if source.state != crate::PlacementState::Bound
@@ -771,17 +795,33 @@ pub(crate) fn offline_cpu_with_scheduler(
             return Err(errno::Errno::EBUSY);
         }
         let allowed = CpuMask::from_bits_or_boot(task.cpu_affinity()).intersection(snapshot.active);
-        let Some(target_cpu) =
+        let deadline_utilization = utilization_of(task.sched.sched_attr());
+        let target_cpu = if deadline_utilization != 0 {
+            allowed
+                .iter()
+                .filter(|target| {
+                    planned_deadline[target.get()].saturating_add(deadline_utilization)
+                        <= snapshot.topology.cpu_capacity(*target)
+                })
+                .min_by_key(|target| planned_load.load_of(*target))
+        } else {
             snapshot
                 .topology
-                .select_cpu(allowed, snapshot.active, None, false, |cpu| {
-                    planned_load.load_of(cpu)
+                .select_cpu(allowed, snapshot.active, None, false, |target| {
+                    planned_load.load_of(target)
                 })
-        else {
+        };
+        let Some(target_cpu) = target_cpu else {
             restore_drained_tasks(scheduler, cpu, &drained, now_ns);
             return Err(errno::Errno::EBUSY);
         };
         planned_load.add_task(target_cpu);
+        if deadline_utilization != 0 {
+            planned_deadline[cpu.get()] =
+                planned_deadline[cpu.get()].saturating_sub(deadline_utilization);
+            planned_deadline[target_cpu.get()] =
+                planned_deadline[target_cpu.get()].saturating_add(deadline_utilization);
+        }
         let target_domain = snapshot
             .topology
             .domain_for_cpu(target_cpu)
@@ -792,6 +832,7 @@ pub(crate) fn offline_cpu_with_scheduler(
             source,
             target_cpu,
             target_domain,
+            was_queued: drained.iter().any(|queued| Arc::ptr_eq(queued, task)),
         });
     }
 
@@ -805,15 +846,30 @@ pub(crate) fn offline_cpu_with_scheduler(
     }
 
     for (index, item) in tasks.iter().enumerate() {
-        item.task
-            .commit_migration(item.target_cpu, item.target_domain, snapshot.generation);
-        if !scheduler
-            .cpu_or_boot(item.target_cpu.get())
-            .runqueue()
-            .enqueue(Arc::clone(&item.task), now_ns)
+        let capacity = snapshot.topology.cpu_capacity(item.target_cpu);
+        if scheduler
+            .deadline_admission()
+            .migrate(&item.task, cpu, item.target_cpu, capacity, || {
+                item.task.commit_migration(
+                    item.target_cpu,
+                    item.target_domain,
+                    snapshot.generation,
+                );
+                if item.was_queued
+                    && !scheduler
+                        .cpu_or_boot(item.target_cpu.get())
+                        .runqueue()
+                        .enqueue(Arc::clone(&item.task), now_ns)
+                {
+                    item.task.rollback_migration(item.source);
+                    return Err(errno::Errno::EIO);
+                }
+                Ok(())
+            })
+            .is_err()
         {
             restore_unmoved_tasks(scheduler, cpu, &tasks, index, now_ns);
-            return Err(errno::Errno::EIO);
+            return Err(errno::Errno::EBUSY);
         }
         scheduler
             .cpu_or_boot(item.target_cpu.get())
@@ -822,6 +878,7 @@ pub(crate) fn offline_cpu_with_scheduler(
 
     let late = cpu_state.runqueue().drain_queued(now_ns);
     if !late.is_empty()
+        || !scheduler.deadline_admission().tasks_on_cpu(cpu).is_empty()
         || cpu_state
             .current()
             .is_some_and(|current| !current.is_idle_task())
@@ -884,10 +941,12 @@ fn restore_prepared_tasks(
             item.task.rollback_migration(item.source);
         }
         let _ = refresh_task_placement(scheduler, &item.task);
-        let _ = scheduler
-            .cpu_or_boot(cpu.get())
-            .runqueue()
-            .enqueue(Arc::clone(&item.task), now_ns);
+        if item.was_queued {
+            let _ = scheduler
+                .cpu_or_boot(cpu.get())
+                .runqueue()
+                .enqueue(Arc::clone(&item.task), now_ns);
+        }
     }
 }
 
@@ -902,10 +961,12 @@ fn restore_unmoved_tasks(
     for item in &tasks[first_unmoved..] {
         item.task.rollback_migration(item.source);
         let _ = refresh_task_placement(scheduler, &item.task);
-        let _ = scheduler
-            .cpu_or_boot(cpu.get())
-            .runqueue()
-            .enqueue(Arc::clone(&item.task), now_ns);
+        if item.was_queued {
+            let _ = scheduler
+                .cpu_or_boot(cpu.get())
+                .runqueue()
+                .enqueue(Arc::clone(&item.task), now_ns);
+        }
     }
 }
 
@@ -1036,6 +1097,9 @@ pub fn run_post_syscall_handoff_lazy() {
 
 /// 按调度域、亲和性和当前负载选择目标 CPU。
 pub fn select_task_cpu(task: &Arc<Task>) -> usize {
+    if let Some((cpu, _)) = SCHEDULER.deadline_admission().reservation_of(task) {
+        return cpu.get();
+    }
     task_sched_placement(task)
         .preferred_cpu
         .unwrap_or_else(CpuId::boot)
@@ -1159,8 +1223,11 @@ pub(crate) fn enqueue_task_on_scheduler(
     };
 
     for _ in 0..NR_CPUS {
-        let cpu_id = task_sched_placement_on(scheduler, &task)
-            .preferred_cpu
+        let cpu_id = scheduler
+            .deadline_admission()
+            .reservation_of(&task)
+            .map(|(cpu, _)| cpu)
+            .or_else(|| task_sched_placement_on(scheduler, &task).preferred_cpu)
             .unwrap_or_else(CpuId::boot)
             .get();
         let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
@@ -1198,9 +1265,15 @@ fn enqueue_task_locked_with_hint(task: Arc<Task>, now_ns: u64, cpu_hint: usize) 
     }
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let active = active_cpu_set();
-    let hinted =
-        CpuId::new(cpu_hint).filter(|cpu| affinity.contains(*cpu) && active.contains(*cpu));
-    let cpu_id = hinted
+    let reserved = SCHEDULER
+        .deadline_admission()
+        .reservation_of(&task)
+        .map(|(cpu, _)| cpu)
+        .filter(|cpu| affinity.contains(*cpu) && active.contains(*cpu));
+    let hinted = CpuId::new(cpu_hint)
+        .filter(|cpu| reserved.is_none() && affinity.contains(*cpu) && active.contains(*cpu));
+    let cpu_id = reserved
+        .or(hinted)
         .or_else(|| select_cpu_for_mask(affinity, None, false))
         .unwrap_or_else(CpuId::boot)
         .get();
@@ -1566,6 +1639,14 @@ fn attach_migrated_task(
     source_detached: bool,
 ) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
+    attach_migrated_task_locked(task, context, source_detached)
+}
+
+fn attach_migrated_task_locked(
+    task: &Arc<Task>,
+    context: MigrationContext,
+    source_detached: bool,
+) -> Result<(), errno::Errno> {
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let topology = SCHEDULER.topology_snapshot();
     if let Err(error) = validate_migration_target(context, topology, affinity) {
@@ -1589,25 +1670,41 @@ fn attach_migrated_task(
         rollback_migration(task, context, true);
         return Err(errno::Errno::EAGAIN);
     }
-    task.commit_migration(
+    let source_cpu = context.source.cpu.unwrap_or_else(CpuId::boot);
+    let target_capacity = topology.topology.cpu_capacity(context.target_cpu);
+    SCHEDULER.deadline_admission().migrate(
+        task,
+        source_cpu,
         context.target_cpu,
-        context.target_domain,
-        context.topology_generation,
-    );
-    if !SCHEDULER
-        .cpu_or_boot(context.target_cpu.get())
-        .runqueue()
-        .enqueue(Arc::clone(task), now_ns_internal())
-    {
-        rollback_migration(task, context, true);
-        return Err(errno::Errno::EIO);
-    }
+        target_capacity,
+        || {
+            task.commit_migration(
+                context.target_cpu,
+                context.target_domain,
+                context.topology_generation,
+            );
+            if !SCHEDULER
+                .cpu_or_boot(context.target_cpu.get())
+                .runqueue()
+                .enqueue(Arc::clone(task), now_ns_internal())
+            {
+                rollback_migration(task, context, true);
+                return Err(errno::Errno::EIO);
+            }
+            Ok(())
+        },
+    )?;
     request_resched(context.target_cpu.get());
     Ok(())
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.migrate_task", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    migrate_task_locked(task, target_cpu)
+}
+
+fn migrate_task_locked(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
     if !task.sched.on_rq() {
         let target = CpuId::new(target_cpu).ok_or(errno::Errno::EINVAL)?;
         if !active_cpu_set().contains(target)
@@ -1615,11 +1712,17 @@ pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Er
         {
             return Err(errno::Errno::EINVAL);
         }
-        bind_task_to_cpu(task, target_cpu);
-        return Ok(());
+        let source = task.placement().cpu.unwrap_or_else(CpuId::boot);
+        let capacity = cpu_capacity(target);
+        return SCHEDULER
+            .deadline_admission()
+            .migrate(task, source, target, capacity, || {
+                bind_task_to_cpu(task, target_cpu);
+                Ok(())
+            });
     }
     let context = migration_context(task, target_cpu)?;
-    attach_migrated_task(task, context, false)
+    attach_migrated_task_locked(task, context, false)
 }
 
 /// 从最忙 CPU 拉一个任务到 `cpu_id`。AP 启动后可由 idle/tick 路径周期调用。
@@ -1663,11 +1766,9 @@ pub fn balance_once(cpu_id: usize) -> bool {
         return false;
     };
     if class == SchedClass::Deadline {
-        let target_load = domain_loads.load_of(local_cpu);
-        let task_utilization = deadline_task_utilization(&task);
-        if !deadline_has_capacity(
-            target_load,
-            task_utilization,
+        if !SCHEDULER.deadline_admission().can_migrate(
+            &task,
+            local_cpu,
             topology.cpu_capacity(local_cpu),
         ) {
             let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
@@ -1797,27 +1898,6 @@ fn class_allows_pull(
         }
         SchedClass::Idle => false,
     }
-}
-
-fn deadline_task_utilization(task: &Arc<Task>) -> u64 {
-    let runtime = task.sched.deadline_runtime_ns();
-    let period = task.sched.deadline_period_ns();
-    if runtime == 0 || period == 0 {
-        return 0;
-    }
-    ((runtime as u128 * crate::SCHED_CAPACITY_SCALE as u128) / period as u128).min(u64::MAX as u128)
-        as u64
-}
-
-pub(crate) fn deadline_has_capacity(
-    target_load: RunqueueClassLoad,
-    task_utilization: u64,
-    capacity: u64,
-) -> bool {
-    target_load
-        .deadline_utilization
-        .saturating_add(task_utilization)
-        <= capacity
 }
 
 fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usize) {
