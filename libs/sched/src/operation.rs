@@ -22,7 +22,7 @@ use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
 use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
-use crate::sched_class::SchedAttr;
+use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
     migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
@@ -353,8 +353,11 @@ pub fn sched_setattr(pid: PidT, attr: SchedAttr) -> Result<(), Errno> {
 
 pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
     let attr = attr.validate()?;
-    update_task_sched_entity(task, |cpu_id, task, now_ns| {
-        runqueue_of(cpu_id).update_sched_attr(task, attr, now_ns)
+    let now_ns = crate::scheduler::now_ns_public();
+    let owner = task_runqueue_cpu(task).unwrap_or_else(CpuId::boot);
+    let capacity = crate::scheduler::cpu_capacity(owner);
+    crate::scheduler::deadline_admission().update_attr(task, owner, attr, capacity, || {
+        runqueue_of(owner.get()).update_sched_attr(task, attr, now_ns)
     })
 }
 
@@ -441,8 +444,8 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
     if requested.intersection(online).is_empty() {
         return Err(Errno::EINVAL);
     }
-    let supported = requested.bits();
-    task.set_cpu_affinity(supported);
+    let old_affinity = task.cpu_affinity();
+    task.set_cpu_affinity(requested.bits());
 
     let current_cpu = task.current_cpu();
     let current = CpuId::new(current_cpu);
@@ -450,15 +453,37 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
         return Ok(());
     }
 
-    let target = select_cpu_for_mask(requested, current, false).map(|cpu| cpu.get());
+    let target = if task.sched.policy() == SchedPolicy::Deadline {
+        requested
+            .intersection(online)
+            .iter()
+            .filter(|cpu| {
+                crate::scheduler::deadline_admission().can_migrate(
+                    task,
+                    *cpu,
+                    crate::scheduler::cpu_capacity(*cpu),
+                )
+            })
+            .min_by_key(|cpu| crate::scheduler::deadline_admission().reserved(*cpu))
+            .map(CpuId::get)
+    } else {
+        select_cpu_for_mask(requested, current, false).map(CpuId::get)
+    };
 
     if let Some(target_cpu) = target {
-        if migrate_task(task, target_cpu).is_err() {
+        if let Err(error) = migrate_task(task, target_cpu) {
+            if task.sched.policy() == SchedPolicy::Deadline {
+                task.set_cpu_affinity(old_affinity);
+                return Err(error);
+            }
             request_balance(target_cpu);
             if current_cpu < NR_CPUS {
                 request_resched(current_cpu);
             }
         }
+    } else if task.sched.policy() == SchedPolicy::Deadline {
+        task.set_cpu_affinity(old_affinity);
+        return Err(Errno::EBUSY);
     } else if current_cpu < NR_CPUS {
         request_resched(current_cpu);
     }

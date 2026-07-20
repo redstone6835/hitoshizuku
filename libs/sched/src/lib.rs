@@ -52,6 +52,7 @@ extern crate alloc;
 pub mod arch_hooks;
 pub mod clone_flags;
 pub mod cpu;
+mod deadline_admission;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
