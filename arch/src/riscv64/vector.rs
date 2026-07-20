@@ -13,7 +13,7 @@ use sched::{TASKEXT_RISCV_VECTOR_STATE, Task};
 use spin::Mutex;
 
 use crate::riscv64::specific::{
-    SSTATUS_SPP, SSTATUS_VS_CLEAN, SSTATUS_VS_INITIAL, SSTATUS_VS_MASK, TrapFrame,
+    SSTATUS_SPP, SSTATUS_VS_CLEAN, SSTATUS_VS_DIRTY, SSTATUS_VS_INITIAL, SSTATUS_VS_MASK, TrapFrame,
 };
 
 pub static HAS_VECTOR: AtomicBool = AtomicBool::new(false);
@@ -148,6 +148,16 @@ fn current_state_or_alloc() -> Result<SharedUserVectorState, ()> {
     Ok(state)
 }
 
+/// 同步硬件 `sstatus.VS`，避免 TrapFrame 已净化但处理器仍允许用户访问旧 V 寄存器。
+#[inline]
+fn set_hardware_vs(vs: usize) {
+    let status = crate::read_csr!(sstatus);
+    crate::write_csr!(
+        sstatus,
+        (status & !SSTATUS_VS_MASK) | (vs & SSTATUS_VS_MASK)
+    );
+}
+
 pub fn clone_ext_payload(src: &Arc<dyn Any + Send + Sync>) -> Arc<dyn Any + Send + Sync> {
     let state = Arc::clone(src)
         .downcast::<Mutex<UserVectorState>>()
@@ -180,15 +190,22 @@ pub fn restore_signal_snapshot(tf: &mut TrapFrame, snapshot: Option<UserVectorSt
 }
 
 pub fn save_current_if_active(tf: &mut TrapFrame) {
-    if (tf.status & SSTATUS_VS_MASK) == 0 {
+    let saved_vs = tf.status & SSTATUS_VS_MASK;
+    if saved_vs == 0 {
         return;
     }
     if let Some(state) = current_state() {
-        let mut guard = state.lock();
-        unsafe { save_vector_state(&mut guard) };
+        // Clean/Initial 表示 task-local 副本仍是最新的；只有用户真正改写过
+        // 向量寄存器（Dirty）时才搬运整组 v0-v31。
+        if saved_vs == SSTATUS_VS_DIRTY {
+            let mut guard = state.lock();
+            unsafe { save_vector_state(&mut guard) };
+        }
         tf.status = (tf.status & !SSTATUS_VS_MASK) | SSTATUS_VS_CLEAN;
+        set_hardware_vs(SSTATUS_VS_CLEAN);
     } else {
         tf.status &= !SSTATUS_VS_MASK;
+        set_hardware_vs(0);
     }
 }
 
@@ -209,8 +226,14 @@ pub fn restore_current_if_active(tf: &mut TrapFrame) {
         let guard = state.lock();
         unsafe { restore_vector_state(&guard) };
         tf.status = (tf.status & !SSTATUS_VS_MASK) | SSTATUS_VS_CLEAN;
+        // restore 指令会把硬件 VS 标成 Dirty；状态已经完整落盘，返回用户前
+        // 改回 Clean，使下一次未使用 Vector 的 trap 可以跳过整组保存。
+        set_hardware_vs(SSTATUS_VS_CLEAN);
     } else {
         tf.status &= !SSTATUS_VS_MASK;
+        // 用户可通过当前 raw signal ABI 伪造 VS bits，但没有配套的 task-local
+        // vector state 时绝不能带着旧硬件寄存器返回 U-mode。
+        set_hardware_vs(0);
     }
 }
 
@@ -239,7 +262,7 @@ pub fn enable_user_vector_if_needed(tf: &mut TrapFrame) -> bool {
 
 fn looks_like_vector_instruction(pc: usize) -> bool {
     let mut lo = [0u8; 2];
-    if general::mm::copy_from_user(pc, &mut lo).is_err() {
+    if crate::riscv64::mm::user_copy::copy_instruction_from_user(pc, &mut lo).is_err() {
         return false;
     }
     let half = u16::from_le_bytes(lo);
@@ -249,7 +272,9 @@ fn looks_like_vector_instruction(pc: usize) -> bool {
 
     let mut raw = [0u8; 4];
     raw[..2].copy_from_slice(&lo);
-    if general::mm::copy_from_user(pc.wrapping_add(2), &mut raw[2..]).is_err() {
+    if crate::riscv64::mm::user_copy::copy_instruction_from_user(pc.wrapping_add(2), &mut raw[2..])
+        .is_err()
+    {
         return false;
     }
     let insn = u32::from_le_bytes(raw);

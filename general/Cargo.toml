@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-test = false
+test = true
 doctest = false
 bench = false
 
 [features]
 block-profile = []
 trace-syscall = []
+performance-profile = ["dep:profiling"]
 
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false }
@@ -24,6 +25,7 @@ log = { path = "../libs/log" }
 kernel-symbols = { path = "../libs/kernel-symbols" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
+profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 socket = { path = "../libs/socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

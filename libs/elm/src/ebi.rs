@@ -56,7 +56,7 @@ pub const ELM_EBI_MAX_EXPORTS: usize = 64;
 /// `ELM_EBI_MAX_SYMBOL_LOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_SYMBOL_LOCATIONS: usize = 128;
 /// `ELM_EBI_MAX_RELOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
-pub const ELM_EBI_MAX_RELOCATIONS: usize = 512;
+pub const ELM_EBI_MAX_RELOCATIONS: usize = 8192;
 /// `ELM_EBI_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EBI_NAME_LEN: usize = 128;
 /// `ELM_EBI_SYMBOL_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。

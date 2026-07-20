@@ -238,6 +238,50 @@ pub enum TaskState {
     Dead = 8,
 }
 
+/// 性能剖析使用的阻塞原因。它属于调度语义，不依赖具体等待队列实现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WaitReason {
+    SocketRead = 0,
+    SocketWrite,
+    Poll,
+    Mutex,
+    Futex,
+    Timer,
+    Yield,
+    Other,
+}
+
+impl WaitReason {
+    #[cfg(feature = "performance-profile")]
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::SocketRead,
+            1 => Self::SocketWrite,
+            2 => Self::Poll,
+            3 => Self::Mutex,
+            4 => Self::Futex,
+            5 => Self::Timer,
+            6 => Self::Yield,
+            _ => Self::Other,
+        }
+    }
+
+    #[cfg(feature = "performance-profile")]
+    fn profile_event(self) -> profiling::Event {
+        match self {
+            Self::SocketRead => profiling::Event::WaitSocketRead,
+            Self::SocketWrite => profiling::Event::WaitSocketWrite,
+            Self::Poll => profiling::Event::WaitPoll,
+            Self::Mutex => profiling::Event::WaitMutex,
+            Self::Futex => profiling::Event::WaitFutex,
+            Self::Timer => profiling::Event::WaitTimer,
+            Self::Yield => profiling::Event::WaitYield,
+            Self::Other => profiling::Event::WaitOther,
+        }
+    }
+}
+
 impl TaskState {
     fn from_u8(raw: u8) -> Self {
         match raw {
@@ -459,8 +503,19 @@ pub struct Task {
     comm: Spinlock<[u8; TASK_COMM_LEN]>,
     /// 任务创建时的单调时钟值，用于 `/proc/<pid>/stat` 的 starttime。
     start_time_ns: AtomicU64,
-    /// 调度器累计的实际 CPU 运行时间。
+    /// 调度器累计的真实 CPU 运行时间；剖析开关只控制事件采样，不改变记账语义。
     cpu_runtime_ns: AtomicU64,
+    /// 当前连续运行区间的起点加一；零表示任务当前不占用 CPU。
+    running_since_ns: AtomicU64,
+    /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
+    exited_usage_ns: AtomicU64,
+    /// 当前阻塞起点、被唤醒时刻和原因；只存在于剖析构建。
+    #[cfg(feature = "performance-profile")]
+    wait_started_ns: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    wakeup_ns: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    wait_reason: AtomicU8,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -553,6 +608,14 @@ impl Task {
             comm: Spinlock::new(DEFAULT_COMM),
             start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
             cpu_runtime_ns: AtomicU64::new(0),
+            running_since_ns: AtomicU64::new(0),
+            exited_usage_ns: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            wait_started_ns: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            wakeup_ns: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            wait_reason: AtomicU8::new(WaitReason::Other as u8),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -708,6 +771,10 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
+        self.exited_usage_ns.store(
+            self.cpu_runtime_ns(crate::scheduler::now_ns_public()),
+            Ordering::Release,
+        );
         if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
             self.exit_reason
                 .store(EXIT_REASON_EXITED, Ordering::Release);
@@ -1158,9 +1225,107 @@ impl Task {
         *self.comm.lock() = comm;
     }
 
-    /// 记录本任务在一次运行队列更新时间内实际占用的 CPU 时间。
-    pub(crate) fn account_cpu_runtime(&self, delta_ns: u64) {
-        self.cpu_runtime_ns.fetch_add(delta_ns, Ordering::AcqRel);
+    fn elapsed_usage_ns(&self, now_ns: u64) -> u64 {
+        if matches!(self.state(), TaskState::Zombie | TaskState::Dead) {
+            return self.exited_usage_ns.load(Ordering::Acquire);
+        }
+        self.cpu_runtime_ns(now_ns)
+    }
+
+    /// 当前任务的真实 CPU 执行时间快照。
+    pub fn cpu_runtime_ns(&self, now_ns: u64) -> u64 {
+        let accumulated = self.cpu_runtime_ns.load(Ordering::Acquire);
+        let encoded = self.running_since_ns.load(Ordering::Acquire);
+        if encoded == 0 {
+            accumulated
+        } else {
+            accumulated.saturating_add(now_ns.saturating_sub(encoded - 1))
+        }
+    }
+
+    /// 记录 runqueue 自上次更新时间以来由本任务实际占用的 CPU 时间。
+    ///
+    /// 已建立切换时间戳时以时间戳为准，避免 runqueue 的全局基线早于任务真正
+    /// 切入时刻；独立 runqueue 测试等没有切换时间戳的场景继续使用 `delta_ns`。
+    pub(crate) fn account_cpu_runtime(&self, delta_ns: u64, now_ns: u64) {
+        let encoded = self.running_since_ns.load(Ordering::Acquire);
+        let charged = if encoded == 0 {
+            delta_ns
+        } else {
+            now_ns.saturating_sub(encoded - 1)
+        };
+        self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
+        if encoded != 0 {
+            self.running_since_ns
+                .store(now_ns.saturating_add(1), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn account_switch_in(&self, now_ns: u64) {
+        self.running_since_ns
+            .store(now_ns.saturating_add(1), Ordering::Release);
+        #[cfg(feature = "performance-profile")]
+        {
+            let encoded = self.wakeup_ns.swap(0, Ordering::AcqRel);
+            if encoded != 0 {
+                profiling::record_duration(
+                    profiling::Event::WakeupLatency,
+                    now_ns.saturating_sub(encoded - 1),
+                );
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn account_switch_out(&self, now_ns: u64) {
+        let encoded = self.running_since_ns.swap(0, Ordering::AcqRel);
+        if encoded != 0 {
+            self.cpu_runtime_ns
+                .fetch_add(now_ns.saturating_sub(encoded - 1), Ordering::AcqRel);
+        }
+    }
+
+    #[inline]
+    pub fn begin_profile_wait(&self, reason: WaitReason, now_ns: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.wait_reason.store(reason as u8, Ordering::Release);
+            self.wakeup_ns.store(0, Ordering::Release);
+            self.wait_started_ns
+                .store(now_ns.saturating_add(1), Ordering::Release);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = (reason, now_ns);
+    }
+
+    #[inline]
+    pub fn cancel_profile_wait(&self) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.wait_started_ns.store(0, Ordering::Release);
+            self.wakeup_ns.store(0, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn mark_profile_woken(&self, now_ns: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            let encoded = self.wait_started_ns.swap(0, Ordering::AcqRel);
+            if encoded == 0 {
+                return;
+            }
+            #[cfg(feature = "performance-profile")]
+            profiling::record_duration(
+                WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire)).profile_event(),
+                now_ns.saturating_sub(encoded - 1),
+            );
+            self.wakeup_ns
+                .store(now_ns.saturating_add(1), Ordering::Release);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = now_ns;
     }
 
     /// 返回任务相对系统单调时钟的创建时刻。
@@ -1168,9 +1333,9 @@ impl Task {
         self.start_time_ns.load(Ordering::Acquire)
     }
 
-    pub fn usage_snapshot(&self, _now_ns: u64) -> TaskUsage {
+    pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
         TaskUsage {
-            user_ns: self.cpu_runtime_ns.load(Ordering::Acquire),
+            user_ns: self.elapsed_usage_ns(now_ns),
             system_ns: 0,
             minflt: 0,
             majflt: 0,

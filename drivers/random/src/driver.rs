@@ -722,6 +722,22 @@ pub fn force_reseed() {
     random_core().reseed_locked();
 }
 
+/// 内核子系统从已初始化 CSPRNG 取得随机材料。
+pub fn fill_kernel_random(out: &mut [u8]) {
+    random_core().read_nonblocking(out);
+}
+
+/// 在依赖随机 key 的 PnP 驱动注册前完成启动 seed 和首次 reseed。
+pub fn initialize_for_kernel(bootloader_seed: Option<&[u8]>) {
+    if let Some(seed) = bootloader_seed {
+        add_bootloader_randomness(seed);
+    }
+    if !random_core().first_seed_done.load(Ordering::Acquire) {
+        seed_from_startup();
+    }
+}
+
+// ──────────────────────── CharDriver 实现 ─────────────────────────────────
 struct RandomBackendImpl;
 
 impl RandomBackend for RandomBackendImpl {

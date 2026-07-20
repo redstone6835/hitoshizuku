@@ -974,6 +974,8 @@ pub mod capability {
     pub const HAL_QUERY: u64 = 1 << 29;
     /// HAL 钩子、硬件控制和用户上下文状态修改。
     pub const HAL_CONTROL: u64 = 1 << 30;
+    /// 网络协议栈 generation 的注册、启动材料和数据面调用。
+    pub const NETWORK_STACK: u64 = 1 << 31;
 
     /// 默认不需要额外管理员批准的能力组。
     pub const SAFE_DEFAULT: u64 = CORE_SAFE
@@ -1020,7 +1022,8 @@ pub mod capability {
         | FIRMWARE_ALL
         | FILESYSTEM_DRIVER
         | IPC
-        | HAL_ALL;
+        | HAL_ALL
+        | NETWORK_STACK;
 }
 
 /// 链接到内核镜像中的直接符号描述符。

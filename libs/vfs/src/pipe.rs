@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use errno::Errno;
 use sched::{Task, WaitQueue};
 
+use crate::poll_source::PollSource;
 use crate::vfs::cred::{Capability, Credentials};
 use crate::vfs::dentry::Dentry;
 use crate::vfs::error::{VfsError, VfsResult};
@@ -40,6 +41,9 @@ pub struct Pipe {
     inner: Spinlock<PipeInner>,
     read_wait: WaitQueue,
     write_wait: WaitQueue,
+    read_source: PollSource,
+    write_source: PollSource,
+    read_write_source: PollSource,
 }
 
 impl Pipe {
@@ -48,17 +52,66 @@ impl Pipe {
     }
 
     fn with_counts(reader_count: u32, writer_count: u32, capacity: usize) -> Self {
+        let inner = PipeInner {
+            data: vec![0u8; capacity],
+            read_pos: 0,
+            write_pos: 0,
+            reader_count,
+            writer_count,
+        };
+        let (read_ready, write_ready, read_write_ready) = Self::readiness(&inner);
         Self {
-            inner: Spinlock::new(PipeInner {
-                data: vec![0u8; capacity],
-                read_pos: 0,
-                write_pos: 0,
-                reader_count,
-                writer_count,
-            }),
+            inner: Spinlock::new(inner),
             read_wait: WaitQueue::new(),
             write_wait: WaitQueue::new(),
+            read_source: PollSource::new(read_ready),
+            write_source: PollSource::new(write_ready),
+            read_write_source: PollSource::new(read_write_ready),
         }
+    }
+
+    fn readiness(inner: &PipeInner) -> (PollEvents, PollEvents, PollEvents) {
+        let available = inner.write_pos.saturating_sub(inner.read_pos);
+        let free = inner.data.len().saturating_sub(available);
+        let mut read = PollEvents::default();
+        let mut write = PollEvents::default();
+        let mut read_write = PollEvents::default();
+        if available > 0 {
+            read = read.with(PollEvents::POLLIN);
+            read_write = read_write.with(PollEvents::POLLIN);
+        }
+        if free >= PIPE_BUF {
+            write = write.with(PollEvents::POLLOUT);
+            read_write = read_write.with(PollEvents::POLLOUT);
+        }
+        if inner.writer_count == 0 {
+            read = read.with(PollEvents::POLLHUP);
+            read_write = read_write.with(PollEvents::POLLHUP);
+        }
+        if inner.reader_count == 0 {
+            write = write.with(PollEvents::POLLERR);
+            read_write = read_write.with(PollEvents::POLLERR);
+        }
+        (read, write, read_write)
+    }
+
+    fn publish_readiness(&self) {
+        let (read, write, read_write, read_version, write_version, read_write_version) = {
+            let inner = self.inner.lock();
+            let (read, write, read_write) = Self::readiness(&inner);
+            (
+                read,
+                write,
+                read_write,
+                self.read_source.reserve_version(),
+                self.write_source.reserve_version(),
+                self.read_write_source.reserve_version(),
+            )
+        };
+        self.read_source.publish_versioned(read, read_version);
+        self.write_source.publish_versioned(write, write_version);
+        self.read_write_source
+            .publish_versioned(read_write, read_write_version);
     }
 
     fn available(&self, inner: &PipeInner) -> usize {
@@ -140,6 +193,7 @@ impl Pipe {
         drop(inner);
 
         self.write_wait.wake_all();
+        self.publish_readiness();
         Ok(capacity)
     }
 
@@ -204,6 +258,7 @@ pub fn open_fifo(pipe: Arc<Pipe>, opts: &OpenOptions) -> VfsResult<Box<dyn FileO
             }
         }
     }
+    pipe.publish_readiness();
 
     match opts.access {
         AccessMode::ReadOnly => Ok(Box::new(PipeReadEnd::new(pipe, opts.nonblock))),
@@ -229,6 +284,7 @@ impl FileOps for PipeReadEnd {
         if avail > 0 {
             let n = self.pipe.read_data(&mut inner, buf);
             drop(inner);
+            self.pipe.publish_readiness();
             // 正常读出数据只释放了部分缓冲空间，唤醒一个写者即可；
             // 端点关闭等状态变化仍在 release() 中广播给全部等待者。
             self.pipe.write_wait.wake_one_default();
@@ -258,16 +314,11 @@ impl FileOps for PipeReadEnd {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let inner = self.pipe.inner.lock();
-        let mut ready = PollEvents::default();
-        let avail = self.pipe.available(&inner);
-        if avail > 0 {
-            ready = ready.with(PollEvents::POLLIN);
-        }
-        if inner.writer_count == 0 {
-            ready = ready.with(PollEvents::POLLHUP);
-        }
-        ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
+        self.pipe
+            .read_source
+            .snapshot()
+            .0
+            .intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
@@ -292,6 +343,10 @@ impl FileOps for PipeReadEnd {
         self.pipe.fcntl(cmd, arg, cred)
     }
 
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.pipe.read_source)
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -305,6 +360,7 @@ impl FileOps for PipeReadEnd {
         inner.reader_count = inner.reader_count.saturating_sub(1);
         let last = inner.reader_count == 0;
         drop(inner);
+        self.pipe.publish_readiness();
         if last {
             self.pipe.write_wait.wake_all();
         }
@@ -342,6 +398,7 @@ impl FileOps for PipeReadWriteEnd {
         if avail > 0 {
             let n = self.pipe.read_data(&mut inner, buf);
             drop(inner);
+            self.pipe.publish_readiness();
             self.pipe.write_wait.wake_one_default();
             return Ok(n);
         }
@@ -364,6 +421,7 @@ impl FileOps for PipeReadWriteEnd {
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
             drop(inner);
+            self.pipe.publish_readiness();
             self.pipe.read_wait.wake_one_default();
             return Ok(n);
         }
@@ -383,21 +441,11 @@ impl FileOps for PipeReadWriteEnd {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let inner = self.pipe.inner.lock();
-        let mut ready = PollEvents::default();
-        if self.pipe.available(&inner) > 0 {
-            ready = ready.with(PollEvents::POLLIN);
-        }
-        if self.pipe.free_space(&inner) >= PIPE_BUF {
-            ready = ready.with(PollEvents::POLLOUT);
-        }
-        if inner.writer_count == 0 {
-            ready = ready.with(PollEvents::POLLHUP);
-        }
-        if inner.reader_count == 0 {
-            ready = ready.with(PollEvents::POLLERR);
-        }
-        ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
+        self.pipe
+            .read_write_source
+            .snapshot()
+            .0
+            .intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
@@ -427,6 +475,10 @@ impl FileOps for PipeReadWriteEnd {
         self.pipe.fcntl(cmd, arg, cred)
     }
 
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.pipe.read_write_source)
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -442,6 +494,7 @@ impl FileOps for PipeReadWriteEnd {
         let no_reader = inner.reader_count == 0;
         let no_writer = inner.writer_count == 0;
         drop(inner);
+        self.pipe.publish_readiness();
         if no_reader {
             self.pipe.write_wait.wake_all();
         }
@@ -472,6 +525,7 @@ impl FileOps for PipeWriteEnd {
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
             drop(inner);
+            self.pipe.publish_readiness();
             // 写入后只需要一个读者消费新数据，避免 lmbench pipe 场景
             // 中把所有等待任务同时推回 runqueue 造成惊群。
             self.pipe.read_wait.wake_one_default();
@@ -493,15 +547,11 @@ impl FileOps for PipeWriteEnd {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let inner = self.pipe.inner.lock();
-        let mut ready = PollEvents::default();
-        if self.pipe.free_space(&inner) >= PIPE_BUF {
-            ready = ready.with(PollEvents::POLLOUT);
-        }
-        if inner.reader_count == 0 {
-            ready = ready.with(PollEvents::POLLERR);
-        }
-        ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
+        self.pipe
+            .write_source
+            .snapshot()
+            .0
+            .intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
@@ -526,6 +576,10 @@ impl FileOps for PipeWriteEnd {
         self.pipe.fcntl(cmd, arg, cred)
     }
 
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.pipe.write_source)
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -539,6 +593,7 @@ impl FileOps for PipeWriteEnd {
         inner.writer_count = inner.writer_count.saturating_sub(1);
         let last = inner.writer_count == 0;
         drop(inner);
+        self.pipe.publish_readiness();
         if last {
             self.pipe.read_wait.wake_all();
         }

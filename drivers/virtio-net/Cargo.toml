@@ -1,0 +1,51 @@
+[package]
+name = "net-virtio"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "net-virtio"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lib]
+name = "net_virtio"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[features]
+default = ["elm-lsp"]
+elm-lsp = ["acpi/lsp", "allocator/lsp", "efi/lsp", "elf/lsp", "errno/lsp", "extfs/lsp", "fatfs/lsp", "general/lsp", "hal/lsp", "log/lsp", "mm/lsp", "net/lsp", "sched/lsp", "socket/lsp", "vfs/lsp"]
+elm-integrated = ["virtio/elm-integrated"]
+
+[dependencies]
+vfs = { path = ".elm/framework/vfs", default-features = false }
+socket = { path = ".elm/framework/socket", default-features = false }
+sched = { path = ".elm/framework/sched", default-features = false }
+mm = { path = ".elm/framework/mm", default-features = false }
+hal = { path = ".elm/framework/hal", default-features = false }
+fatfs = { path = ".elm/framework/fatfs", default-features = false }
+extfs = { path = ".elm/framework/extfs", default-features = false }
+errno = { path = ".elm/framework/errno", default-features = false }
+elf = { path = ".elm/framework/elf", default-features = false }
+efi = { path = ".elm/framework/efi", default-features = false }
+acpi = { path = ".elm/framework/acpi", default-features = false }
+elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
+allocator = { path = ".elm/framework/allocator", default-features = false }
+general = { path = ".elm/framework/general", default-features = false }
+log = { path = ".elm/framework/log", default-features = false }
+net = { path = ".elm/framework/net", default-features = false }
+virtio = { path = ".elm/dependencies/virtio", default-features = false, features = ["elm-consumer"] }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = false
+strip = false
+
+[profile.dev]
+panic = "abort"

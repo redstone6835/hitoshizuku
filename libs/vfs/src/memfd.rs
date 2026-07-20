@@ -9,6 +9,7 @@ use core::ops::ControlFlow;
 use errno::Errno;
 use sched::{Task, WaitQueue};
 
+use crate::poll_source::PollSource;
 use crate::vfs::anon;
 use crate::vfs::cred::Credentials;
 use crate::vfs::error::{VfsError, VfsResult};
@@ -158,6 +159,7 @@ struct MemfdState {
     inner: Spinlock<MemfdInner>,
     allow_sealing: bool,
     waiters: WaitQueue,
+    poll_source: PollSource,
 }
 
 impl MemfdState {
@@ -171,6 +173,7 @@ impl MemfdState {
             }),
             allow_sealing,
             waiters: WaitQueue::new(),
+            poll_source: PollSource::new(PollEvents::READ_WRITE_READY),
         }
     }
 
@@ -193,6 +196,18 @@ impl MemfdState {
             return Err(Errno::EPERM);
         }
         inner.seals |= seals;
+        let writable = (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) == 0;
+        let version = self.poll_source.reserve_version();
+        drop(inner);
+        self.poll_source.publish_versioned(
+            if writable {
+                PollEvents::READ_WRITE_READY
+            } else {
+                PollEvents::POLLIN
+            },
+            version,
+        );
+        self.waiters.wake_all();
         Ok(())
     }
 
@@ -308,11 +323,7 @@ impl FileOps for MemfdFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let mut ready = PollEvents::POLLIN.with(PollEvents::POLLOUT);
-        if (self.state.inner.lock().seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
-            ready = ready.without(PollEvents::POLLOUT);
-        }
-        ready.intersect(interest)
+        self.state.poll_source.snapshot().0.intersect(interest)
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, _interest: PollEvents) -> bool {
@@ -322,6 +333,10 @@ impl FileOps for MemfdFileOps {
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
         self.state.waiters.remove(task);
+    }
+
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.state.poll_source)
     }
 
     fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {

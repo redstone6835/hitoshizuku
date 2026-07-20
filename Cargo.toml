@@ -5,6 +5,7 @@ members = [
     "libs/ktest/ktest-mock",
     "libs/errno",
     "libs/log",
+    "libs/profiling",
     "libs/efi",
     "libs/elf",
     "libs/mm",
@@ -21,7 +22,6 @@ members = [
     "libs/elm-loader",
     "libs/kernel-symbols",
     "libs/kernel-symbols/macros",
-    "libs/mygo-smoltcp",
     "arch",
     "hal",
     "general",
@@ -34,6 +34,7 @@ exclude = [
     "drivers/goldfish-rtc",
     "drivers/loongson-irq",
     "drivers/loopback",
+    "drivers/net-stack",
     "drivers/ls7a-rtc",
     "drivers/plic",
     "drivers/random",
@@ -41,6 +42,7 @@ exclude = [
     "drivers/uart16550",
     "drivers/virtio",
     "drivers/virtio-blk",
+    "drivers/virtio-net",
     "tests/elm/kernel-mixin",
 ]
 

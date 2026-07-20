@@ -788,6 +788,14 @@ impl File {
         self.ops.fcntl(cmd, arg, cred)
     }
 
+    /// 返回可供事件订阅器直接监听的就绪源。
+    ///
+    /// 新的 epoll 实现以该对象的代际通知为准；旧式 `poll_add_waiter` 仍保留给
+    /// 不具备稳定就绪源的文件类型和普通阻塞 I/O。
+    pub fn poll_source(&self) -> Option<&crate::poll_source::PollSource> {
+        self.ops.poll_source()
+    }
+
     pub fn on_fd_closed(&self, fd: u32) {
         self.ops.on_fd_closed(fd)
     }
@@ -946,6 +954,11 @@ pub trait FileOps {
     /// 处理文件类型私有的 `fcntl(2)` 命令。
     fn fcntl(&self, _cmd: usize, _arg: usize, _cred: &Credentials) -> Result<usize, Errno> {
         Err(Errno::EINVAL)
+    }
+
+    /// 返回稳定的就绪状态发布源；默认文件类型不提供事件订阅能力。
+    fn poll_source(&self) -> Option<&crate::poll_source::PollSource> {
+        None
     }
 
     /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。

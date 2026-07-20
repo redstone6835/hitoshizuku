@@ -695,6 +695,8 @@ pub struct RealtimeClockSource {
 pub struct DevInitContext {
     /// 将设备 MMIO 物理地址转换为可访问的内核虚拟地址。
     pub device_mmio_to_virt: fn(usize) -> usize,
+    /// 固件选择的启动 CPU/hart ID，供中断控制器选择对应的本地上下文。
+    pub boot_cpu_id: usize,
     /// 用硬件 RTC 读出的 Unix 纳秒时间更新内核 realtime 时钟。
     pub set_realtime_ns: Option<fn(u64)>,
     /// 安装一个可撤销 realtime 来源。返回 `true` 表示本来源成为当前 owner。
@@ -707,10 +709,16 @@ impl DevInitContext {
     pub const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
         Self {
             device_mmio_to_virt,
+            boot_cpu_id: 0,
             set_realtime_ns: None,
             install_realtime_source: None,
             unregister_realtime_source: None,
         }
+    }
+
+    pub const fn with_boot_cpu_id(mut self, boot_cpu_id: usize) -> Self {
+        self.boot_cpu_id = boot_cpu_id;
+        self
     }
 
     pub const fn with_realtime_clock(mut self, set_realtime_ns: fn(u64)) -> Self {
@@ -1243,6 +1251,54 @@ impl PnpDevice {
             .map_err(|_| PnpError::OutOfMemory)?;
         inner.resources.push(resource);
         Ok(())
+    }
+
+    /// 将常驻子系统构造的资源交给设备；登记失败时立即执行资源释放。
+    ///
+    /// 动态 ELM 不应拿回常驻资源的具体类型或 trait vtable。PCI 等常驻子系统
+    /// 可通过此入口把构造、登记和失败回滚收口在内核侧。
+    pub(crate) fn own_boxed_resource_or_release(
+        &self,
+        resource: Box<dyn PnpResource>,
+    ) -> Result<(), PnpError> {
+        let error = {
+            let mut inner = self.inner.lock();
+            if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
+                PnpError::InvalidState
+            } else if inner.resources.try_reserve(1).is_err() {
+                PnpError::OutOfMemory
+            } else {
+                inner.resources.push(resource);
+                return Ok(());
+            }
+        };
+
+        let kind = resource.kind();
+        let label = resource.label();
+        if let Err(release_error) = resource.release() {
+            log::error!(
+                "[pnp] 回滚 {:?} 资源 {} 失败: {}",
+                kind,
+                label,
+                release_error.detail
+            );
+        }
+        Err(error)
+    }
+
+    /// 为即将成组登记的资源预留槽位。
+    ///
+    /// 驱动应在创建外部 handle 前调用；预留成功后，同一 probe 事务内后续
+    /// `own_resource` 不会因扩容失败而把尚未登记的 IRQ/MSI handle 泄漏掉。
+    pub(crate) fn reserve_owned_resources(&self, additional: usize) -> Result<(), PnpError> {
+        let mut inner = self.inner.lock();
+        if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
+            return Err(PnpError::InvalidState);
+        }
+        inner
+            .resources
+            .try_reserve(additional)
+            .map_err(|_| PnpError::OutOfMemory)
     }
 
     /// 按资源稳定键主动撤销一条由设备拥有的资源。
