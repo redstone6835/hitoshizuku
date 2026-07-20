@@ -20,38 +20,30 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
-if mount -t ext4 /dev/vd0 /mnt; then
-    echo "[init] mounted /dev/vd0 at /mnt"
-    sh_file_list="/tmp/init-sh-files.$$"
-    : > "$sh_file_list"
-
-    echo "[init] /mnt directory tree:"
-    find /mnt -print 2>/dev/null | sort | while IFS= read -r path; do
-        printf '%s\n' "$path"
-        case "$path" in
-            *.sh)
-                if [ -f "$path" ] && [ ! -L "$path" ]; then
-                    printf '%s\n' "$path" >> "$sh_file_list"
-                fi
-                ;;
-        esac
-    done
-    echo "[init] /mnt directory tree end"
-
-    if [ -s "$sh_file_list" ]; then
-        echo "[init] shell file contents:"
-        while IFS= read -r script; do
-            printf '\n[init] ===== %s =====\n' "$script"
-            cat "$script" || echo "[init] failed to read $script"
-            printf '\n[init] ===== end %s =====\n' "$script"
-        done < "$sh_file_list"
-    else
-        echo "[init] no .sh files found under /mnt"
-    fi
-
-    rm -f "$sh_file_list"
-else
+if ! mount -t ext4 /dev/vd0 /mnt; then
     echo "[init] failed to mount /dev/vd0 at /mnt"
+    exit 1
 fi
 
-echo "[init] startup inspection complete"
+echo "[init] mounted /dev/vd0 at /mnt"
+
+# 测试程序需要在测试盘自己的根目录、库和工具链中运行。
+mkdir -p /mnt/proc /mnt/sys /mnt/dev /mnt/tmp
+mount -t proc proc /mnt/proc 2>/dev/null || true
+mount -t sysfs sysfs /mnt/sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /mnt/dev 2>/dev/null || true
+
+runner=/mnt/tmp/.shiori-run-glibc-tests
+if ! cp /etc/init.d/run-glibc-tests "$runner"; then
+    echo "[init] failed to install glibc test runner"
+    exit 1
+fi
+chmod 0755 "$runner" 2>/dev/null || true
+
+echo "[init] switching to the glibc test root"
+chroot /mnt /bin/bash /tmp/.shiori-run-glibc-tests
+status=$?
+
+rm -f "$runner"
+echo "[init] glibc tests finished with status $status"
+exit "$status"

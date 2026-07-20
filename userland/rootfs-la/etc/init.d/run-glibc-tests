@@ -1,0 +1,166 @@
+#!/bin/bash
+
+ulimit -c 0 2>/dev/null || true
+export PATH=/tmp:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export RUSTUP_HOME=/root/.rustup
+export CARGO_HOME=/root/.cargo
+export RUSTUP_TOOLCHAIN=nightly-2026-05-28
+export CARGO_NET_OFFLINE=true
+
+# 测试镜像中的 timeout 是目标系统上的原生程序。若它自身异常退出，
+# 可能留下仍持有管道的子进程，使 init 永远等不到测试结束。用 shell
+# 实现相同的超时契约，并把被测命令放进独立进程组，确保超时时连同子进程一起回收。
+timeout_wrapper=/tmp/.shiori-timeout
+if ! printf '%s\n' \
+    '#!/bin/bash' \
+    'limit=$1' \
+    'shift' \
+    'case "$limit" in' \
+    '    *s) seconds=${limit%s} ;;' \
+    '    *m) seconds=$(( ${limit%m} * 60 )) ;;' \
+    '    *h) seconds=$(( ${limit%h} * 3600 )) ;;' \
+    '    *) seconds=$limit ;;' \
+    'esac' \
+    'if [ "$#" -eq 0 ] || ! [ "$seconds" -ge 0 ] 2>/dev/null; then exit 125; fi' \
+    'isolated=0' \
+    'if command -v setsid >/dev/null 2>&1; then' \
+    '    setsid "$@" &' \
+    '    isolated=1' \
+    'else' \
+    '    "$@" &' \
+    'fi' \
+    'child=$!' \
+    'if [ "$isolated" -eq 1 ]; then pgid=$child; else pgid=; fi' \
+    '(' \
+    '    sleep "$seconds"' \
+    '    if [ -n "$pgid" ]; then kill -TERM -- "-$pgid" 2>/dev/null || true; else kill -TERM "$child" 2>/dev/null || true; fi' \
+    '    sleep 1' \
+    '    if [ -n "$pgid" ]; then kill -KILL -- "-$pgid" 2>/dev/null || true; else kill -KILL "$child" 2>/dev/null || true; fi' \
+    ') &' \
+    'watchdog=$!' \
+    'wait "$child"' \
+    'status=$?' \
+    'if [ -n "$pgid" ]; then' \
+    '    kill -TERM -- "-$pgid" 2>/dev/null || true' \
+    '    sleep 1' \
+    '    kill -KILL -- "-$pgid" 2>/dev/null || true' \
+    'fi' \
+    'kill "$watchdog" 2>/dev/null || true' \
+    'wait "$watchdog" 2>/dev/null || true' \
+    'exit "$status"' > "$timeout_wrapper"; then
+    echo "[init] failed to install timeout wrapper"
+    exit 1
+fi
+chmod 0755 "$timeout_wrapper" 2>/dev/null || exit 1
+
+echo "[init] starting glibc cagent tests"
+
+# 原始 cagent 脚本的裸 wait 会把常驻 LLM 服务也纳入等待对象。
+# 这里只改写等待和清理逻辑，保留测试提示、判定和超时参数不变。
+cagent_script=/glibc/cagent_testcode.sh
+cagent_rewritten=/tmp/.shiori-cagent-testcode.sh
+awk '
+    NR == 1 {
+        print
+        print "CAGENT_FAILURE_FILE=/tmp/.shiori-cagent-failed"
+        print "CAGENT_WAIT_STATUS=0"
+        print "rm -f \"$CAGENT_FAILURE_FILE\""
+        next
+    }
+    /^[[:space:]]*wait[[:space:]]*$/ {
+        print "for pid in $CAGENT_TEST_PIDS; do wait \"$pid\" || CAGENT_WAIT_STATUS=1; done"
+        next
+    }
+    /^[[:space:]]*kill[[:space:]]+\$SERVER_PID/ {
+        print "kill -KILL \"$SERVER_PID\" 2>/dev/null"
+        print "wait \"$SERVER_PID\" 2>/dev/null || true"
+        next
+    }
+    {
+        if ($0 ~ /echo "testcase cagent .* reject/) {
+            print "        : > \"$CAGENT_FAILURE_FILE\""
+        }
+        print
+        if ($0 ~ /^[[:space:]]*[0-9]+[[:space:]]*&[[:space:]]*$/) {
+            print "CAGENT_TEST_PIDS=\"$CAGENT_TEST_PIDS $!\""
+        }
+    }
+    END {
+        print "if [ \"$CAGENT_WAIT_STATUS\" -ne 0 ] || [ -e \"$CAGENT_FAILURE_FILE\" ]; then"
+        print "    rm -f \"$CAGENT_FAILURE_FILE\""
+        print "    exit 1"
+        print "fi"
+        print "rm -f \"$CAGENT_FAILURE_FILE\""
+        print "exit 0"
+    }
+' "$cagent_script" > "$cagent_rewritten"
+
+if [ ! -s "$cagent_rewritten" ]; then
+    echo "[init] failed to prepare cagent test"
+    cagent_status=1
+else
+    cd /glibc || exit 1
+    /bin/bash "$cagent_rewritten"
+    cagent_status=$?
+fi
+rm -f "$cagent_rewritten"
+
+echo "[init] cagent tests finished with status $cagent_status"
+echo "[init] starting glibc buildstorm tests"
+buildstorm_script=/glibc/buildstorm_testcode.sh
+buildstorm_rewritten=/tmp/.shiori-buildstorm-testcode.sh
+buildstorm_timeout_override=
+if ! rustc --version >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+    # 工具链入口已经不可执行时，完整编译不可能成功，无需再等待四小时。
+    buildstorm_timeout_override=30
+    echo "[init] buildstorm toolchain preflight failed; limiting compile cleanup to 30 seconds"
+fi
+
+if awk -v wrapper="$timeout_wrapper" -v timeout_override="$buildstorm_timeout_override" '
+    NR == 1 {
+        print
+        print "SHIORI_BUILDSTORM_STATUS=0"
+        next
+    }
+    {
+        if ($0 ~ /timeout[[:space:]]+[0-9]+[smh]?[[:space:]]+cargo[[:space:]]+xtask/) {
+            if (timeout_override != "") {
+                sub(/[0-9]+[smh]?[[:space:]]+cargo[[:space:]]+xtask/,
+                    timeout_override " cargo xtask")
+            }
+            sub(/timeout[[:space:]]+/, wrapper " ")
+            replaced=1
+        }
+        if ($0 ~ /echo "BUILDSTORM_(TOOLCHAIN|MINIBUILD) fail"/ \
+            || $0 ~ /echo "BUILDSTORM_COMPILE .*ok=false/) {
+            print "SHIORI_BUILDSTORM_STATUS=1"
+        }
+        if ($0 ~ /^[[:space:]]*sync[[:space:]]*$/) {
+            print "exit \"$SHIORI_BUILDSTORM_STATUS\""
+            sync_replaced=1
+            next
+        }
+        print
+    }
+    END {
+        if (!replaced || !sync_replaced) exit 1
+    }
+' "$buildstorm_script" > "$buildstorm_rewritten"; then
+    /bin/bash "$buildstorm_rewritten"
+    buildstorm_status=$?
+else
+    echo "[init] failed to prepare buildstorm test"
+    buildstorm_status=1
+fi
+rm -f "$buildstorm_rewritten"
+echo "[init] buildstorm tests finished with status $buildstorm_status"
+rm -f "$timeout_wrapper"
+
+if [ "$cagent_status" -eq 0 ] && [ "$buildstorm_status" -eq 0 ]; then
+    echo "[init] all glibc tests finished successfully"
+    exit 0
+fi
+
+echo "[init] one or more glibc tests failed or did not finish cleanly"
+exit 1
