@@ -10343,9 +10343,11 @@ impl ElmCore {
                     ELM_HEALTH_DETAIL_RESOURCE_LEAK,
                 ));
             }
+            // CPU 超额是调度策略输入，不代表账本损坏或资源泄漏。
             if accounting.dynamic_alloc_bytes > cell.resource_budget.max_dynamic_alloc_bytes
                 || accounting.native_stack_bytes > cell.resource_budget.max_native_stack_bytes
-                || accounting.cpu_time_ns_period > cell.resource_budget.cpu_budget_ns_per_period
+                || accounting.active_native_calls
+                    > u32::from(cell.resource_budget.max_concurrent_calls)
             {
                 records.push(ElmCoreHealthRecord::invalid(
                     ELM_HEALTH_CHECK_RESOURCES,
@@ -11078,7 +11080,7 @@ impl ElmCore {
             let allocations = allocator::KERNEL_ALLOCATOR.owner_allocation_stats(cell.id.0);
             out.push_str(
                 format!(
-                    "cell={} dynamic_alloc_bytes={} peak_dynamic_alloc_bytes={} max_dynamic_alloc_bytes={} native_stack_bytes={} active_native_calls={} cpu_time_ns_total={} cpu_time_ns_period={} quota_denials={} accounting_errors={} live_allocs={} alloc_requested_bytes={} alloc_usable_bytes={} alloc_boot={} alloc_small={} alloc_large={} alloc_managed={} alloc_physical={} alloc_largest={} alloc_largest_usable={} alloc_scan_errors={}\n",
+                    "cell={} dynamic_alloc_bytes={} peak_dynamic_alloc_bytes={} max_dynamic_alloc_bytes={} native_stack_bytes={} active_native_calls={} cpu_time_ns_total={} cpu_time_ns_period={} cpu_call_overruns={} cpu_period_overruns={} quota_denials={} accounting_errors={} live_allocs={} alloc_requested_bytes={} alloc_usable_bytes={} alloc_boot={} alloc_small={} alloc_large={} alloc_managed={} alloc_physical={} alloc_largest={} alloc_largest_usable={} alloc_scan_errors={}\n",
                     cell.id.0,
                     usage.dynamic_alloc_bytes,
                     usage.peak_dynamic_alloc_bytes,
@@ -11087,6 +11089,8 @@ impl ElmCore {
                     usage.active_native_calls,
                     usage.cpu_time_ns_total,
                     usage.cpu_time_ns_period,
+                    usage.cpu_call_overruns,
+                    usage.cpu_period_overruns,
                     usage.quota_denials,
                     usage.accounting_errors,
                     allocations.records,

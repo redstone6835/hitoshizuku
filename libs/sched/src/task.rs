@@ -499,12 +499,8 @@ pub struct Task {
     sigaltstack: Spinlock<SigAltStack>,
     /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
     comm: Spinlock<[u8; TASK_COMM_LEN]>,
-    /// 普通构建继续用生命周期近似 rusage，剖析构建另行维护真实 CPU runtime。
-    #[cfg(not(feature = "performance-profile"))]
-    start_time_ns: AtomicU64,
-    #[cfg(feature = "performance-profile")]
+    /// 调度器累计的真实 CPU 运行时间；剖析开关只控制事件采样，不改变记账语义。
     cpu_runtime_ns: AtomicU64,
-    #[cfg(feature = "performance-profile")]
     running_since_ns: AtomicU64,
     /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
     exited_usage_ns: AtomicU64,
@@ -602,11 +598,7 @@ impl Task {
             rseq: Spinlock::new(RseqRegistration::default()),
             sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
-            #[cfg(not(feature = "performance-profile"))]
-            start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
-            #[cfg(feature = "performance-profile")]
             cpu_runtime_ns: AtomicU64::new(0),
-            #[cfg(feature = "performance-profile")]
             running_since_ns: AtomicU64::new(0),
             exited_usage_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
@@ -1207,35 +1199,31 @@ impl Task {
 
     /// 当前任务的真实 CPU 执行时间快照。
     pub fn cpu_runtime_ns(&self, now_ns: u64) -> u64 {
-        #[cfg(not(feature = "performance-profile"))]
-        return now_ns.saturating_sub(self.start_time_ns.load(Ordering::Acquire));
-        #[cfg(feature = "performance-profile")]
-        {
-            let accumulated = self.cpu_runtime_ns.load(Ordering::Acquire);
-            let encoded = self.running_since_ns.load(Ordering::Acquire);
-            if encoded == 0 {
-                accumulated
-            } else {
-                accumulated.saturating_add(now_ns.saturating_sub(encoded - 1))
-            }
+        let accumulated = self.cpu_runtime_ns.load(Ordering::Acquire);
+        let encoded = self.running_since_ns.load(Ordering::Acquire);
+        if encoded == 0 {
+            accumulated
+        } else {
+            accumulated.saturating_add(now_ns.saturating_sub(encoded - 1))
         }
     }
 
-    #[cfg(feature = "performance-profile")]
     #[inline]
     pub(crate) fn account_switch_in(&self, now_ns: u64) {
         self.running_since_ns
             .store(now_ns.saturating_add(1), Ordering::Release);
-        let encoded = self.wakeup_ns.swap(0, Ordering::AcqRel);
-        if encoded != 0 {
-            profiling::record_duration(
-                profiling::Event::WakeupLatency,
-                now_ns.saturating_sub(encoded - 1),
-            );
+        #[cfg(feature = "performance-profile")]
+        {
+            let encoded = self.wakeup_ns.swap(0, Ordering::AcqRel);
+            if encoded != 0 {
+                profiling::record_duration(
+                    profiling::Event::WakeupLatency,
+                    now_ns.saturating_sub(encoded - 1),
+                );
+            }
         }
     }
 
-    #[cfg(feature = "performance-profile")]
     #[inline]
     pub(crate) fn account_switch_out(&self, now_ns: u64) {
         let encoded = self.running_since_ns.swap(0, Ordering::AcqRel);

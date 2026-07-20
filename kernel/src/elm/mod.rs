@@ -14,6 +14,9 @@ use elm_model::{
 use sched::Task;
 use sched::sync::Spinlock;
 
+/// 不启用墙钟看门狗；调用仍受保护域取消、异常和 ABI 校验约束。
+pub(crate) const NO_WATCHDOG_DEADLINE_NS: u64 = 0;
+
 /// ELM 生命周期通知只描述运行时可观察的状态变化，不携带任何子系统资源。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ElmLifecycleEvent {

@@ -113,7 +113,6 @@ struct NativeInvocation {
 #[derive(Debug, Clone, Copy)]
 struct NativeInvocationResult {
     aborted: bool,
-    budget_exceeded: bool,
 }
 
 impl NativeInvocation {
@@ -143,17 +142,16 @@ impl NativeInvocation {
             );
             error
         })?;
-        let guard = ElmGuard::enter(cell.0, phase, accounting.effective_deadline_ns()).ok_or_else(
-            || {
+        let guard =
+            ElmGuard::enter(cell.0, phase, accounting.watchdog_deadline_ns()).ok_or_else(|| {
                 log::error!(
                     "[elm] 原生调用保护域拒绝进入 cell={} phase={} deadline_ns={}",
                     cell.0,
                     phase,
-                    accounting.effective_deadline_ns()
+                    accounting.watchdog_deadline_ns()
                 );
                 ElmError::InvalidTransition
-            },
-        )?;
+            })?;
         Ok(Self {
             guard,
             accounting,
@@ -184,8 +182,7 @@ impl NativeInvocation {
         let aborted = self.guard.aborted();
         let accounting = self.accounting.finish(sched::now_ns_public());
         NativeInvocationResult {
-            aborted,
-            budget_exceeded: accounting.call_budget_exceeded || accounting.period_budget_exceeded,
+            aborted: aborted || accounting.watchdog_expired,
         }
     }
 }
@@ -1039,14 +1036,12 @@ fn call_native_hook(
         )
     };
     let outcome = invocation.finish();
-    if outcome.aborted || outcome.budget_exceeded {
+    if outcome.aborted {
         log::error!(
-            "[elm] native lifecycle aborted cell={} phase={:?} address=0x{:x} aborted={} budget_exceeded={} status={}",
+            "[elm] native lifecycle aborted cell={} phase={:?} address=0x{:x} status={}",
             context.cell_id().0,
             context.phase(),
             address,
-            outcome.aborted,
-            outcome.budget_exceeded,
             status
         );
         return Err(ElmError::InvalidTransition);
@@ -1196,13 +1191,11 @@ fn call_native_migration_hook(
         )
     };
     let outcome = invocation.finish();
-    if outcome.aborted || outcome.budget_exceeded {
+    if outcome.aborted {
         log::error!(
-            "[elm] native entry aborted cell={} address=0x{:x} aborted={} budget_exceeded={} status={}",
+            "[elm] native entry aborted cell={} address=0x{:x} status={}",
             cell.0,
             address,
-            outcome.aborted,
-            outcome.budget_exceeded,
             status
         );
         return Err(ElmError::InvalidTransition);
@@ -1271,13 +1264,11 @@ fn call_optional_native_entry(
         )
     };
     let outcome = invocation.finish();
-    if outcome.aborted || outcome.budget_exceeded {
+    if outcome.aborted {
         log::error!(
-            "[elm] 原生模块入口中止 cell={} address=0x{:x} aborted={} budget_exceeded={} status={}",
+            "[elm] 原生模块入口中止 cell={} address=0x{:x} status={}",
             cell.0,
             address,
-            outcome.aborted,
-            outcome.budget_exceeded,
             status
         );
         return Err(ElmError::InvalidTransition);
@@ -1440,7 +1431,7 @@ pub(crate) fn invoke_kernel_mixin_handler(
     };
     let aborted = guard.aborted();
     let accounting = accounting.finish(sched::now_ns_public());
-    if aborted || accounting.call_budget_exceeded || accounting.period_budget_exceeded {
+    if aborted || accounting.watchdog_expired {
         ELM_CALL_STATUS_PROVIDER_FAULT
     } else {
         status
@@ -1474,7 +1465,7 @@ pub(crate) fn invoke_pinned_export<T>(
     let Some(guard) = ElmGuard::enter(
         cell.0,
         ELM_GUARD_PHASE_MANAGED_CALL,
-        accounting.effective_deadline_ns(),
+        accounting.watchdog_deadline_ns(),
     ) else {
         let _ = accounting.finish(sched::now_ns_public());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
@@ -1498,14 +1489,13 @@ pub(crate) fn invoke_pinned_export<T>(
     let aborted = guard.aborted();
     let abort_reason = guard.abort_reason();
     let accounting = accounting.finish(sched::now_ns_public());
-    if aborted || accounting.call_budget_exceeded || accounting.period_budget_exceeded {
+    if aborted || accounting.watchdog_expired {
         log::error!(
-            "[elm] pinned native call aborted: cell={} reason={} elapsed_ns={} call_budget={} period_budget={} status={}",
+            "[elm] pinned native call aborted: cell={} reason={} cpu_time_ns={} watchdog_expired={} status={}",
             cell.0,
             abort_reason,
-            accounting.elapsed_ns,
-            accounting.call_budget_exceeded,
-            accounting.period_budget_exceeded,
+            accounting.cpu_time_ns,
+            accounting.watchdog_expired,
             status,
         );
         ELM_CALL_STATUS_PROVIDER_FAULT
@@ -1573,7 +1563,6 @@ pub(crate) fn invoke_managed_export(
     };
     let outcome = invocation.finish();
     if outcome.aborted
-        || outcome.budget_exceeded
         || status != 0
         || call.abi_version != ELM_NATIVE_MANAGED_CALL_ABI_VERSION
         || call.flags != 0
@@ -1655,7 +1644,6 @@ pub(crate) fn invoke_provider_handler(
     };
     let outcome = invocation.finish();
     if outcome.aborted
-        || outcome.budget_exceeded
         || status != 0
         || call.abi_version != ELM_NATIVE_PROVIDER_CALL_ABI_VERSION
         || call.flags != 0
@@ -1745,7 +1733,6 @@ pub(crate) fn invoke_provider_snapshot(
     };
     let response_more = frame.flags & ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE != 0;
     if outcome.aborted
-        || outcome.budget_exceeded
         || call_status != 0
         || frame.abi_version != ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION
         || frame.flags & !allowed_flags != 0

@@ -1953,8 +1953,11 @@ impl SocketFacade {
         self.tcp_more.load(Ordering::Acquire)
     }
 
-    pub fn set_tcp_more(&self, enabled: bool) {
-        self.tcp_more.store(enabled, Ordering::Release);
+    pub fn set_tcp_more(self: &Arc<Self>, enabled: bool) {
+        let changed = self.tcp_more.swap(enabled, Ordering::AcqRel) != enabled;
+        if changed && !enabled {
+            self.notify_stream_pending();
+        }
     }
 
     fn notify_stream_pending(self: &Arc<Self>) {
@@ -3579,5 +3582,24 @@ mod tests {
         assert!(!facade.readiness().0.contains(Readiness::WRITABLE));
         assert_eq!(facade.take_stream_tx(5).unwrap().len, 5);
         assert!(facade.readiness().0.contains(Readiness::WRITABLE));
+    }
+
+    #[test]
+    fn clearing_tcp_more_reschedules_buffered_stream_data() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 11,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        facade.set_tcp_more(true);
+        assert_eq!(facade.test_push_stream_tx(b"pending"), 7);
+        let generation = facade.stream_tx_generation();
+
+        facade.set_tcp_more(false);
+
+        assert_eq!(facade.stream_tx_generation(), generation + 1);
     }
 }

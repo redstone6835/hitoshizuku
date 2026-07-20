@@ -18,7 +18,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
@@ -172,6 +172,7 @@ static mut INIT_TASK: Option<Arc<Task>> = None;
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
 static mut ROOT_PID_NS: Option<Arc<PidNamespace>> = None;
 static INIT_READY: AtomicBool = AtomicBool::new(false);
+static DEFERRED_TIMER_TICK_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────────────
 
@@ -299,7 +300,6 @@ pub fn init() -> Arc<Task> {
 
     // 8) CPU 0 的 current 指向 init。
     publish_current_task(0, Arc::clone(&init_task));
-    #[cfg(feature = "performance-profile")]
     init_task.account_switch_in(now_ns_internal());
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
@@ -911,7 +911,6 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
         .cpu_or_boot(cpu_id)
         .runqueue()
         .set_current(Arc::clone(&task));
-    #[cfg(feature = "performance-profile")]
     task.account_switch_in(now_ns_internal());
     publish_current_task(cpu_id, task);
     Ok(())
@@ -1012,6 +1011,7 @@ pub fn run_post_syscall_handoff_lazy() {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
+    drain_deferred_timer_tick();
     let cpu_id = cpu();
     if !SCHEDULER.cpu_or_boot(cpu_id).has_post_syscall_handoff() {
         return;
@@ -1903,6 +1903,7 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn schedule_once(now_ns: u64) {
+    drain_deferred_timer_tick();
     let cpu_id = cpu();
     cleanup_retired_tasks(cpu_id);
 
@@ -1952,17 +1953,15 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    let account_now_ns = if now_ns == 0 {
+        now_ns_internal()
+    } else {
+        now_ns
+    };
     #[cfg(feature = "performance-profile")]
-    {
-        let account_now_ns = if now_ns == 0 {
-            now_ns_internal()
-        } else {
-            now_ns
-        };
-        profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
-        prev.account_switch_out(account_now_ns);
-        next.account_switch_in(account_now_ns);
-    }
+    profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
+    prev.account_switch_out(account_now_ns);
+    next.account_switch_in(account_now_ns);
     prev.record_involuntary_context_switch();
     let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
 
@@ -2024,10 +2023,36 @@ pub fn schedule_once(now_ns: u64) {
 /// 记录意图，避免在 IRQ 上下文里持锁切换造成栈污染。
 ///
 /// TODO(smp): 每个 AP 的本地 timer 中断都必须调用该接口。
+pub fn defer_timer_tick(now_ns: u64) {
+    if INIT_READY.load(Ordering::Acquire) {
+        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()], now_ns);
+    }
+}
+
+pub fn drain_deferred_timer_tick() {
+    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    if now_ns != 0 {
+        on_timer_tick_inner(now_ns);
+    }
+}
+
 pub fn on_timer_tick(now_ns: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
+    let deferred_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    on_timer_tick_inner(now_ns.max(deferred_ns));
+}
+
+pub(crate) fn record_deferred_timer_tick(slot: &AtomicU64, now_ns: u64) {
+    slot.fetch_max(now_ns, Ordering::AcqRel);
+}
+
+pub(crate) fn take_deferred_timer_tick(slot: &AtomicU64) -> u64 {
+    slot.swap(0, Ordering::AcqRel)
+}
+
+fn on_timer_tick_inner(now_ns: u64) {
     wake_expired_sleepers(now_ns);
     fire_expired_deadline_observers(now_ns);
     fire_expired_realtime_itimers(now_ns);
@@ -2037,7 +2062,7 @@ pub fn on_timer_tick(now_ns: u64) {
     }
 }
 
-/// profiling scope 读取当前任务 CPU 时间的无分配回调。
+/// 读取当前任务真实 CPU 时间的无分配回调。
 pub fn current_task_cpu_time_ns() -> u64 {
     if !INIT_READY.load(Ordering::Acquire) {
         return 0;
