@@ -91,7 +91,7 @@ static EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 4]);
 /// 仅由硬件/固件在引导时调用一次。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
+#[unsafe(link_section = ".text.entry.boot")]
 pub unsafe extern "C" fn _start() {
     naked_asm!(
         // ── 保存启动参数 ──

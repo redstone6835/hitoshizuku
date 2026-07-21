@@ -61,6 +61,7 @@ mod random_source;
 pub use elm_native::{
     call_elm_native, call_elm_native_current_stack, elm_native_recovery_address, resume_elm_panic,
 };
+pub use heap_vm::activate_kernel_page_table;
 pub use mm::user_copy::set_sum;
 pub use random_source::register as register_entropy_source;
 pub use sched_ctx::register as register_sched_ctx;
