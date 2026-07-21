@@ -11,7 +11,11 @@ use sched::{Task, TaskUsage};
 use vfs::file::File;
 
 const ACCT_RECORD_SIZE: usize = 64;
-const ACCT_VERSION: u8 = 2;
+const ACCT_V3_VERSION: u8 = 3;
+#[cfg(target_endian = "big")]
+const ACCT_BYTEORDER: u8 = 0x80;
+#[cfg(target_endian = "little")]
+const ACCT_BYTEORDER: u8 = 0;
 const ACCT_HZ: u64 = 100;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
@@ -100,7 +104,7 @@ fn encode_record(
     }
 
     out[0] = flags;
-    out[1] = ACCT_VERSION;
+    out[1] = acct_v3_version();
     put_u16(&mut out, 2, 0);
     put_u32(&mut out, 4, status.raw() as u32);
     put_u32(&mut out, 8, creds.uid.0);
@@ -130,6 +134,10 @@ fn encode_record(
     put_u16(&mut out, 44, encode_comp_t(usage.majflt));
     out[48..64].copy_from_slice(&task.comm());
     out
+}
+
+pub(crate) const fn acct_v3_version() -> u8 {
+    ACCT_V3_VERSION | ACCT_BYTEORDER
 }
 
 fn ns_to_acct_ticks(ns: u64) -> u64 {
