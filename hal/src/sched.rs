@@ -2,7 +2,7 @@
 
 /// 注册调度、时间、trap、MM 与 syscall 所需的架构侧 ops。
 pub fn register_arch_hooks() {
-    #[cfg(target_arch = "loongarch64")]
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
     {
         arch::register_sched_ctx();
     }
@@ -21,7 +21,7 @@ pub struct SecondaryCpuReport {
 }
 
 pub fn start_secondary_cpus() -> SecondaryCpuReport {
-    #[cfg(target_arch = "loongarch64")]
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
     {
         let report = arch::start_secondary_cpus();
         return SecondaryCpuReport {
@@ -31,7 +31,7 @@ pub fn start_secondary_cpus() -> SecondaryCpuReport {
         };
     }
 
-    #[cfg(not(target_arch = "loongarch64"))]
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
     SecondaryCpuReport {
         detected: 1,
         started: 1,

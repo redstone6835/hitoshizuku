@@ -107,6 +107,9 @@ pub const EUEN_FPE: usize = 0x1;
 /// EUEN bit 4（保留位）：内核内部标志，记录异常入口时是否保存了 FPU 上下文。
 /// 写入 CSR_EUEN 前必须清除。
 pub const FPU_SAVED: usize = 0x10;
+/// EUEN bit 5（保留位）：内核内部标志，记录异常入口时是否保存了 LSX 上下文。
+/// 写入 CSR_EUEN 前必须清除。
+pub const LSX_SAVED: usize = 0x20;
 pub const EUEN_SXE: usize = 0x2;
 pub const EUEN_ASXE: usize = 0x4;
 pub const EUEN_BTE: usize = 0x8;
@@ -225,7 +228,7 @@ pub const ECODE_FPE: usize = 18; // 浮点异常
 ///
 /// LoongArch64 的异常上下文包含了所有通用寄存器、核心控制寄存器以及浮点寄存器的
 /// 状态，以便在异常处理过程中能够完整地保存和恢复用户态程序的执行状态。
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
     // 1. 除 $r0 之外的 31 个通用寄存器
@@ -267,7 +270,11 @@ pub struct TrapFrame {
     pub euen: usize,   // CSR_EUEN
     pub llbctl: usize, // CSR_LLBCTL
 
-    // 3. FPU 浮点寄存器
+    // 3. LSX 向量寄存器。显式填充使寄存器区保持 16 字节对齐。
+    pub _lsx_padding: u64,
+    pub lsx: [[u64; 2]; 32], // VR0..VR31
+
+    // 4. FPU 浮点寄存器
     pub f: [u64; 32], // F0..F31
     pub fcsr: u64,    // FCSR 控制位
     pub fcc: u64,     // FPU 浮点使能标志位
@@ -334,9 +341,17 @@ pub const PC_OFFSET: usize = offset_of!(TrapFrame, pc);
 pub const STATUS_OFFSET: usize = offset_of!(TrapFrame, status);
 pub const EUEN_OFFSET: usize = offset_of!(TrapFrame, euen);
 pub const LLBCTL_OFFSET: usize = offset_of!(TrapFrame, llbctl);
+pub const LSX_PADDING_OFFSET: usize = offset_of!(TrapFrame, _lsx_padding);
+pub const LSX_OFFSET: usize = offset_of!(TrapFrame, lsx);
 pub const F_OFFSET: usize = offset_of!(TrapFrame, f);
 pub const FCSR_OFFSET: usize = offset_of!(TrapFrame, fcsr);
 pub const FCC_OFFSET: usize = offset_of!(TrapFrame, fcc);
+
+const _: () = {
+    assert!(LSX_OFFSET % 16 == 0);
+    assert!(align_of::<TrapFrame>() >= 16);
+    assert!(FRAME_SIZE % 16 == 0);
+};
 
 /// LoongArch64 架构的 ID 标识 (用于异常分发)。
 pub const ARCH_ID_LOONGARCH64: usize = 2;
@@ -348,7 +363,11 @@ pub const ARCH_ID_LOONGARCH64: usize = 2;
 pub const PER_CPU_KSTACK_OFFSET: usize = 0;
 
 /// 默认定时器中断频率（Hz）。可通过内核命令行 `timer_hz=N` 覆盖。
+#[cfg(not(feature = "performance-profile"))]
 pub const DEFAULT_TIMER_HZ: usize = 100;
+/// 剖析构建使用非整百频率，增加短测试样本量并降低周期性负载混叠。
+#[cfg(feature = "performance-profile")]
+pub const DEFAULT_TIMER_HZ: usize = 997;
 
 #[inline]
 /// 读取稳定计数器原始周期值。

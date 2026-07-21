@@ -6,7 +6,6 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
-use sched::WaitQueue;
 use sched::sync::Spinlock;
 
 use crate::state::{
@@ -17,7 +16,7 @@ use crate::state::{
 use crate::types::{
     PeerIdentity, ReceiveOptions, SendOptions, SocketError, SocketType, UnixAddress,
 };
-use crate::wait::{wait_while, wake_task};
+use crate::wait::{SocketWaitQueue, wait_while, wake_task};
 
 /// 连接型套接字的通用状态机操作 trait。
 /// Stream 和 Sequenced 两种类型各自实现此 trait。
@@ -168,8 +167,8 @@ pub(crate) fn listen_connection_state<S: ConnectionStateOps>(
 /// 若队列为空则阻塞等待,直到有新连接到来、超时或被信号中断。
 pub(crate) fn accept_connection_socket<S: ConnectionStateOps<Accepted = Socket>>(
     state_lock: &Spinlock<S>,
-    accept_wait: &WaitQueue,
-    connect_wait: &WaitQueue,
+    accept_wait: &SocketWaitQueue,
+    connect_wait: &SocketWaitQueue,
     options: ReceiveOptions,
 ) -> Result<Socket, SocketError> {
     loop {
@@ -349,6 +348,8 @@ pub(crate) fn install_stream_pair(a: &Socket, b: &Socket) -> Result<(), SocketEr
     };
     *a_stream.state.lock() = StreamState::Connected(a_conn);
     *b_stream.state.lock() = StreamState::Connected(b_conn);
+    a.attach_readiness_observer();
+    b.attach_readiness_observer();
     Ok(())
 }
 
@@ -403,6 +404,8 @@ pub(crate) fn install_seqpacket_pair(a: &Socket, b: &Socket) -> Result<(), Socke
     };
     *a_seq.state.lock() = SequencedState::Connected(a_conn);
     *b_seq.state.lock() = SequencedState::Connected(b_conn);
+    a.attach_readiness_observer();
+    b.attach_readiness_observer();
     Ok(())
 }
 
@@ -462,6 +465,7 @@ pub(crate) fn connect_stream(
             listener.pending.push_back(server_socket);
             drop(my_state);
             drop(peer_state);
+            socket.attach_readiness_observer();
             peer_stream.accept_wait.wake_one_with(wake_task);
             return Ok(());
         }
@@ -537,6 +541,7 @@ pub(crate) fn connect_seqpacket(
             listener.pending.push_back(server_socket);
             drop(my_state);
             drop(peer_state);
+            socket.attach_readiness_observer();
             peer_seq.accept_wait.wake_one_with(wake_task);
             return Ok(());
         }

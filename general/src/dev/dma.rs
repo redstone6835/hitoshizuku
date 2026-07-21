@@ -1,5 +1,10 @@
 //! 通用 DMA 分配与同步辅助。
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use spin::mutex::Mutex;
 
@@ -172,6 +177,26 @@ impl DmaContext {
 
     pub const fn constraints(self) -> DmaConstraints {
         self.constraints
+    }
+
+    pub(crate) const fn sync_handle(self, region: DmaSyncRegion) -> DmaSyncHandle {
+        DmaSyncHandle {
+            mapper: self.mapper,
+            region,
+        }
+    }
+}
+
+/// 可跨对象保存的 DMA 同步句柄，不拥有底层内存。
+#[derive(Clone, Copy)]
+pub(crate) struct DmaSyncHandle {
+    mapper: &'static dyn DmaMapper,
+    region: DmaSyncRegion,
+}
+
+impl DmaSyncHandle {
+    pub(crate) fn sync_for_device(self) {
+        self.mapper.sync_for_device(self.region);
     }
 }
 
@@ -412,6 +437,10 @@ impl DmaBuffer {
         self.context.mapper.sync_for_cpu(self.sync_region());
     }
 
+    pub(crate) fn sync_handle(&self) -> DmaSyncHandle {
+        self.context.sync_handle(self.sync_region())
+    }
+
     fn sync_region(&self) -> DmaSyncRegion {
         DmaSyncRegion {
             paddr: self.paddr(),
@@ -564,4 +593,76 @@ impl core::ops::DerefMut for DmaPage {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.buffer
     }
+}
+
+impl net::buf::NetBufStorage for DmaBuffer {
+    fn capacity(&self) -> usize {
+        self.len()
+    }
+
+    fn base_ptr(&self) -> core::ptr::NonNull<u8> {
+        core::ptr::NonNull::new(self.vaddr() as *mut u8).expect("DMA buffer 虚拟地址为空")
+    }
+
+    fn dma_addr(&self) -> Option<u64> {
+        Some(self.dma_addr() as u64)
+    }
+
+    fn sync_for_cpu(&self, offset: usize, len: usize) {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return;
+        }
+        self.context.mapper.sync_for_cpu(DmaSyncRegion {
+            paddr: self.paddr() + offset,
+            vaddr: self.vaddr() + offset,
+            len,
+            direction: self.direction(),
+        });
+    }
+
+    fn sync_for_device(&self, offset: usize, len: usize) {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return;
+        }
+        self.context.mapper.sync_for_device(DmaSyncRegion {
+            paddr: self.paddr() + offset,
+            vaddr: self.vaddr() + offset,
+            len,
+            direction: self.direction(),
+        });
+    }
+}
+
+/// 在常驻 DMA 子系统中构造网络 buffer pool，使 storage trait vtable 和回收入口
+/// 不依赖可卸载的 driver ELM 镜像。
+#[kernel_symbols::export(
+    name = "general.dev.dma.new_netbuf_pool",
+    contract = "kernel.general.dma-netbuf-pool@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+        | kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn new_netbuf_pool(
+    context: DmaContext,
+    count: usize,
+    size: usize,
+    align: usize,
+    direction: DmaDirection,
+) -> Result<net::buf::NetBufPoolOwner, &'static str> {
+    if count == 0 {
+        return Err("DMA NetBuf pool 不能为空");
+    }
+    let mut storages: Vec<Box<dyn net::buf::NetBufStorage>> = Vec::new();
+    storages
+        .try_reserve_exact(count)
+        .map_err(|_| "DMA NetBuf pool 元数据分配失败")?;
+    for _ in 0..count {
+        storages.push(Box::new(DmaBuffer::new_in(
+            context, size, align, direction,
+        )?));
+    }
+    net::buf::NetBufPool::new(storages.into_boxed_slice()).map_err(|_| "DMA NetBuf pool 构造失败")
 }

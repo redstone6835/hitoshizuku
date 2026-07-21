@@ -36,6 +36,7 @@
 - 测试演示视频：参见 https://pan.baidu.com/s/1xAara1sTKwMhglExJ3PNDw?pwd=tr9h
 - 架构说明：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - ELM 设计说明：[`docs/ELM.md`](docs/ELM.md)
+- 技术文档源码：[`docs/main.typ`](docs/main.typ)
 - 安全分析报告：[`docs/SECURITY_REPORT.md`](docs/SECURITY_REPORT.md)
 - 开发与贡献说明：[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
 - 代码样式约定：[`docs/STYLES.md`](docs/STYLES.md)
@@ -82,6 +83,7 @@ make ARCH=loongarch64 INITRAMFS=path/to/rootfs.cpio
 make kernel-la                    # 兼容测评构建，输出 ./kernel-la
 make kernel-rv                    # 兼容测评构建，输出 ./kernel-rv
 make all                          # 同时执行 kernel-la 与 kernel-rv
+cargo fmt --all                   # 格式化 workspace
 ```
 
 `kernel-la`、`kernel-rv` 在 `build/<arch>/compat-rootfs` 中组装兼容 rootfs，不会修改
@@ -112,9 +114,10 @@ CONFIG_VIRTIO_BLK=m
 硬依赖组件必须使用相同模式。例如 `virtio.block` 依赖 `virtio.framework`，不能在
 framework 为 `n` 时启用，也不能混用 `y` 与 `m`。构建工具会在编译前拒绝无效配置。
 
-IP 协议栈位于 `libs/net`，INET 套接字数据路径由 `libs/vfs` 接入。loopback 作为
-`net.loopback` ELM 位于 `drivers/loopback`，默认集成进内核，也可以配置为 `m` 或 `n`。
-VirtIO-net 仍未恢复；接入外部网络需要另行提供实现 `net::NetDriver` 的网络设备 ELM。
+IP 协议栈实现位于 `libs/net`，协议状态由 `drivers/net-stack` 中的 `net.stack` ELM
+承载；`kernel/src/net_runtime.rs` 负责宿主调度和设备桥接，INET 套接字数据路径由
+`libs/vfs` 接入。loopback 与 VirtIO-net 分别由 `net.loopback` 和 `net.virtio` ELM
+提供，默认均构建为 `m`，可独立配置和装卸。
 
 构建目标会自动将可提交的 `cargo-config/` 同步到本地 `.cargo/`。`kernel-la` 和
 `kernel-rv` 会把兼容 initramfs 打包进内核镜像；默认裸内核构建不会打包 initramfs。
@@ -135,7 +138,8 @@ qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 \
 RISC-V64：
 
 ```sh
-qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
+qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
+  -kernel kernel-rv -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-rv.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```
@@ -148,12 +152,13 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 | IP 网络栈单测 | `cargo test -p net --target x86_64-unknown-linux-gnu` |
 | extfs 单测 | `cargo test -p extfs --target x86_64-unknown-linux-gnu` |
 | 内核启动验证 | 使用上方 QEMU 命令启动目标架构 |
-| 启动盘内容检查 | `userland/rootfs-*/etc/init.d/rcS` 挂载 `/dev/vd0`，输出 `/mnt` 目录树和其中的 `.sh` 文件内容 |
+| LoongArch64 CAgent | `userland/rootfs-la/etc/init.d/rcS` 等待 3 秒后挂载 `/dev/vd0`，进入测试盘根环境运行 glibc CAgent 并关机 |
+| RISC-V64 启动盘检查 | `userland/rootfs-rv/etc/init.d/rcS` 挂载 `/dev/vd0`，输出 `/mnt` 目录树和其中的 `.sh` 文件内容 |
 
 ## 第三方组件与参考来源
 
-本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`、
-`libs/mygo-smoltcp/` 和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
+本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`
+和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
 用户态工具链及 Rust 生态依赖均按其原始许可证保留来源信息。
 
 MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配、系统调用兼容层、

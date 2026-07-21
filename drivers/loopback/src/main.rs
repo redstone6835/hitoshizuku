@@ -13,21 +13,22 @@ struct LoopbackElm {
     handle: Option<driver::LoopbackHandle>,
 }
 
-fn map_net_error(error: net::NetError) -> HookError {
+fn map_net_error(error: driver::LoopbackError) -> HookError {
     let code = match error {
-        net::NetError::InterfaceNotFound => -19,
-        net::NetError::InterfaceExists => -16,
-        net::NetError::LinkDown => -100,
-        net::NetError::ConnectionRefused => -111,
-        net::NetError::TimedOut => -110,
-        net::NetError::AddressInUse => -98,
-        net::NetError::WouldBlock => -11,
-        net::NetError::ConnectionReset => -104,
-        net::NetError::Unreachable => -101,
-        net::NetError::Closed => -9,
-        net::NetError::BufferTooSmall => -75,
-        net::NetError::InvalidArgument => -22,
-        net::NetError::ResourceExhausted => -12,
+        driver::LoopbackError::Pool => -12,
+        driver::LoopbackError::Context => -22,
+        driver::LoopbackError::Register(
+            net::device::NetDeviceRegisterErrorKind::RegistrarNotReady,
+        ) => -19,
+        driver::LoopbackError::Register(
+            net::device::NetDeviceRegisterErrorKind::InvalidRegistration,
+        ) => -22,
+        driver::LoopbackError::Register(
+            net::device::NetDeviceRegisterErrorKind::ResourceExhausted,
+        ) => -12,
+        driver::LoopbackError::Remove(net::device::NetDeviceRemoveError::NoDevice) => -19,
+        driver::LoopbackError::Remove(net::device::NetDeviceRemoveError::Busy) => -16,
+        driver::LoopbackError::Remove(net::device::NetDeviceRemoveError::AlreadyRemoving) => -114,
     };
     HookError::new(code)
 }
@@ -42,7 +43,19 @@ impl ElmModule for LoopbackElm {
         if self.handle.is_some() {
             return Err(HookError::new(-16));
         }
-        self.handle = Some(driver::register().map_err(map_net_error)?);
+        driver::create_queue().map_err(map_net_error)?;
+        match driver::register() {
+            Ok(handle) => self.handle = Some(handle),
+            Err(error) => {
+                driver::destroy_queue();
+                return Err(map_net_error(error));
+            }
+        }
+        Ok(())
+    }
+
+    fn quiesce(&mut self, _context: &LifecycleContext) -> HookResult {
+        driver::quiesce_queue();
         Ok(())
     }
 
@@ -50,6 +63,9 @@ impl ElmModule for LoopbackElm {
         let Some(handle) = self.handle.as_ref() else {
             return Ok(());
         };
+        // 自有资源回调会把 host 移除推迟到 finalize，因此在此释放 queue 持有的
+        // lease 时，pool 仍然有效。
+        driver::destroy_queue();
         match handle.unregister() {
             Ok(()) => {
                 self.handle = None;

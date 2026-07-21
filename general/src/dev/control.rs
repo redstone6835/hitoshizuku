@@ -3,7 +3,6 @@
 //! `ioctl` 只应该存在于 VFS/ABI 适配层；驱动层通过这里的 typed
 //! request/response 表达控制动作，避免底层驱动解析用户指针或 ioctl number。
 
-use alloc::boxed::Box;
 #[cfg(feature = "block-profile")]
 use alloc::string::String;
 
@@ -99,42 +98,4 @@ pub enum BlockControlResponse {
     IoHints(BlockIoHints),
     #[cfg(feature = "block-profile")]
     DebugText(String),
-}
-
-/// 网络设备类的通用控制请求。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetControlRequest {
-    GetInterfaceId,
-    GetName,
-    GetMedium,
-    GetLinkState,
-    GetMacAddress,
-    GetMtu,
-    GetTxDropped,
-    GetStats,
-    /// 设置接口运行期 MTU。该值只能在底层设备声明的硬件上限内下调。
-    SetMtu {
-        mtu: usize,
-    },
-    /// 设置接口的管理启用状态。
-    ///
-    /// 这里表达的是设备管理层的布尔语义；兼容层的原始 flags 位由
-    /// ioctl 适配代码解析，不能泄入底层设备控制接口。
-    SetAdminUp {
-        up: bool,
-    },
-}
-
-/// 网络设备类的通用控制响应。
-#[derive(Debug, Clone)]
-pub enum NetControlResponse {
-    Done,
-    U32(u32),
-    U64(u64),
-    Usize(usize),
-    Name(Box<str>),
-    Medium(net::LinkMedium),
-    LinkState(net::LinkState),
-    MacAddress([u8; 6]),
-    Stats(net::NetStats),
 }

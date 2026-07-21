@@ -313,12 +313,6 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
         if !is_last {
             step(state, component, true)?;
             if let Some(inode) = state.current.inode() {
-                {
-                    let meta = inode.meta_snapshot();
-                    if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
-                        return Err(VfsError::PermissionDenied);
-                    }
-                }
                 if inode.kind == crate::vfs::stat::FileType::Symlink {
                     if flags.has(LookupFlags::NO_SYMLINKS) {
                         return Err(symlink_not_allowed(state));
@@ -333,6 +327,14 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
                 } else if inode.kind != crate::vfs::stat::FileType::Directory {
                     return Err(VfsError::NotADirectory);
                 }
+            }
+            let inode = state.current.inode().ok_or(VfsError::NotFound)?;
+            if inode.kind != crate::vfs::stat::FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            let meta = inode.meta_snapshot();
+            if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                return Err(VfsError::PermissionDenied);
             }
             continue;
         }

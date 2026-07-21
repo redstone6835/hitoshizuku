@@ -40,6 +40,7 @@ use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
+static KERNEL_TAINT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
 const ROOT_INO: u64 = 1;
 const FILESYSTEMS_INO: u64 = 2;
@@ -61,6 +62,9 @@ const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
+const SYS_FS_INO: u64 = 21;
+const SYS_PIPE_MAX_SIZE_INO: u64 = 22;
+const SYS_TAINTED_INO: u64 = 23;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -228,6 +232,22 @@ enum ProcFileKind {
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
     SysPidMax,
+    SysPipeMaxSize,
+    SysTainted,
+}
+
+/// 返回当前内核故障污染位图。
+///
+/// 位值由故障来源自行定义；procfs 只负责提供稳定的十进制诊断视图。
+pub fn kernel_taint_flags() -> u64 {
+    KERNEL_TAINT_FLAGS.load(Ordering::Acquire)
+}
+
+/// 原子地记录内核故障污染标志，并返回更新后的完整位图。
+///
+/// 污染标志只能累加，不能在运行中清除，确保测试和诊断工具不会丢失已经发生的故障。
+pub fn mark_kernel_tainted(flags: u64) -> u64 {
+    KERNEL_TAINT_FLAGS.fetch_or(flags, Ordering::AcqRel) | flags
 }
 
 #[derive(Clone, Copy)]
@@ -677,43 +697,6 @@ fn render_proc_net_route() -> String {
         out,
         "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"
     );
-    let ifaces = net::stack().snapshot_interfaces();
-    for iface in &ifaces {
-        // 每个配置的 CIDR 地址生成一条 connected route
-        for cidr in &iface.addresses {
-            if let net::config::IpAddr::V4(v4) = cidr.addr {
-                let prefix = cidr.prefix_len.min(32);
-                let mask: u32 = if prefix == 0 {
-                    0
-                } else {
-                    !0u32 << (32 - prefix)
-                };
-                let dst = u32::from_be_bytes(v4.0) & mask;
-                let _ = writeln!(
-                    out,
-                    "{}\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0",
-                    iface.name,
-                    dst.to_be(),
-                    mask.to_be()
-                );
-            }
-        }
-        // default route via gateway
-        if let Some(ref gw) = iface.gateway {
-            let gw_ip = match gw {
-                net::config::Gateway::V4(v4) => u32::from_be_bytes(v4.0),
-                _ => 0,
-            };
-            if gw_ip != 0 {
-                let _ = writeln!(
-                    out,
-                    "{}\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0",
-                    iface.name,
-                    gw_ip.to_be()
-                );
-            }
-        }
-    }
     out
 }
 
@@ -724,31 +707,6 @@ fn render_proc_net_tcp() -> String {
         out,
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
     );
-    let connections = net::stack().snapshot_tcp_connections();
-    let mut slot: u64 = 0;
-    for (_iface_id, conns) in &connections {
-        for c in conns {
-            let local_hex = endpoint_to_hex(&c.local);
-            let remote_hex = endpoint_to_hex(&c.remote);
-            let _ = writeln!(
-                out,
-                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
-                slot,
-                local_hex,
-                remote_hex,
-                c.state,
-                c.tx_queue,
-                c.rx_queue,
-                0u8,
-                0u32,
-                0u32,
-                0u32,
-                0u32,
-                c.inode,
-            );
-            slot += 1;
-        }
-    }
     out
 }
 
@@ -759,50 +717,7 @@ fn render_proc_net_udp() -> String {
         out,
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
     );
-    let sockets = net::stack().snapshot_udp_sockets();
-    let mut slot: u64 = 0;
-    for (_iface_id, socks) in &sockets {
-        for s in socks {
-            let local_hex = endpoint_to_hex(&s.local);
-            let remote_hex = match &s.remote {
-                Some(ep) => endpoint_to_hex(ep),
-                None => "00000000:0000".into(),
-            };
-            let _ = writeln!(
-                out,
-                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
-                slot,
-                local_hex,
-                remote_hex,
-                7u8, // ESTABLISHED
-                0usize,
-                0usize,
-                0u8,
-                0u32,
-                0u32,
-                0u32,
-                0u32,
-                s.inode,
-            );
-            slot += 1;
-        }
-    }
     out
-}
-
-fn endpoint_to_hex(ep: &net::Endpoint) -> alloc::string::String {
-    use alloc::fmt::Write;
-    let mut s = alloc::string::String::new();
-    match ep.addr {
-        net::IpAddr::V4(v4) => {
-            let ip = u32::from_be_bytes(v4.0);
-            let _ = write!(s, "{:08X}:{:04X}", ip, ep.port);
-        }
-        net::IpAddr::V6(_v6) => {
-            let _ = write!(s, "00000000000000000000000000000000:{:04X}", ep.port);
-        }
-    }
-    s
 }
 
 fn render_proc_net_unix() -> String {
@@ -865,53 +780,14 @@ fn render_proc_net_arp() -> String {
         out,
         "IP address       HW type     Flags       HW address            Mask     Device"
     );
-    let neighbors = net::stack().all_neighbors();
-    for (iface_id, entries) in &neighbors {
-        let iface_name = net::stack()
-            .snapshot_interfaces()
-            .into_iter()
-            .find(|i| i.id == *iface_id)
-            .map(|i| i.name)
-            .unwrap_or_else(|| alloc::string::String::from("?"));
-        for entry in entries {
-            let ip_str = match entry.ip_addr {
-                net::IpAddr::V4(v4) => {
-                    let mut s = alloc::string::String::new();
-                    let _ = write!(s, "{}.{}.{}.{}", v4.0[0], v4.0[1], v4.0[2], v4.0[3]);
-                    s
-                }
-                net::IpAddr::V6(_) => alloc::string::String::from("::1"),
-            };
-            let _ = writeln!(
-                out,
-                "{:<16} 0x1         0x2         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
-                ip_str,
-                entry.hw_addr[0],
-                entry.hw_addr[1],
-                entry.hw_addr[2],
-                entry.hw_addr[3],
-                entry.hw_addr[4],
-                entry.hw_addr[5],
-                iface_name,
-            );
-        }
-    }
     out
 }
 
 fn render_proc_net_sockstat() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let tcp_total: usize = net::stack()
-        .snapshot_tcp_connections()
-        .iter()
-        .map(|(_, v)| v.len())
-        .sum();
-    let udp_total: usize = net::stack()
-        .snapshot_udp_sockets()
-        .iter()
-        .map(|(_, v)| v.len())
-        .sum();
+    let tcp_total = 0usize;
+    let udp_total = 0usize;
     let unix_total = socket::snapshot_sockets().len();
     let total = tcp_total + udp_total + unix_total;
     let _ = writeln!(out, "sockets: used {}", total);
@@ -991,9 +867,8 @@ fn render_proc_net_dev() -> String {
         out,
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
     );
-    let ifaces = net::stack().snapshot_interfaces();
-    for iface in &ifaces {
-        let s = &iface.stats;
+    for iface in net::device::snapshot_devices() {
+        let s = iface.stats;
         let _ = writeln!(
             out,
             "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
@@ -1025,6 +900,65 @@ impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
+            "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_KERNEL_INO,
+                    name: SmallStr::new("kernel"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_FS_INO,
+                    name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+            ],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_fs_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysFsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysFsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysFsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "pipe-max-size" => Ok(proc_sys_pipe_max_size_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1037,9 +971,9 @@ impl InodeOps for ProcSysDirOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
             snapshot: vec![DirEntry {
-                ino: SYS_KERNEL_INO,
-                name: SmallStr::new("kernel"),
-                kind: FileType::Directory,
+                ino: SYS_PIPE_MAX_SIZE_INO,
+                name: SmallStr::new("pipe-max-size"),
+                kind: FileType::Regular,
             }],
         }))
     }
@@ -1047,9 +981,24 @@ impl InodeOps for ProcSysDirOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+fn proc_sys_pipe_max_size_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_PIPE_MAX_SIZE_INO,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysPipeMaxSize,
+        }),
+    )
 }
 
 fn proc_sys_kernel_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
@@ -1077,6 +1026,7 @@ impl InodeOps for ProcSysKernelDirOps {
         match name {
             "hotplug" => Ok(proc_sys_hotplug_inode(self.fs_id, &self.weak_sb)),
             "pid_max" => Ok(proc_sys_pid_max_inode(self.fs_id, &self.weak_sb)),
+            "tainted" => Ok(proc_sys_tainted_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1097,6 +1047,11 @@ impl InodeOps for ProcSysKernelDirOps {
                 DirEntry {
                     ino: SYS_PID_MAX_INO,
                     name: SmallStr::new("pid_max"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_TAINTED_INO,
+                    name: SmallStr::new("tainted"),
                     kind: FileType::Regular,
                 },
             ],
@@ -1135,6 +1090,20 @@ fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPidMax,
+        }),
+    )
+}
+
+fn proc_sys_tainted_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_TAINTED_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysTainted,
         }),
     )
 }
@@ -1695,6 +1664,8 @@ impl InodeOps for ProcRegularInodeOps {
                 Ok(())
             }
             ProcFileKind::SysHotplug => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysPipeMaxSize if size == 0 => Ok(()),
+            ProcFileKind::SysPipeMaxSize => Err(VfsError::InvalidArgument),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -1729,6 +1700,21 @@ impl FileOps for ProcRegularFile {
                 let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
                 let trimmed = text.trim_end_matches(|ch| ch == '\n' || ch == '\0');
                 *HOTPLUG_PATH.lock() = String::from(trimmed);
+                Ok(buf.len())
+            }
+            ProcFileKind::SysPipeMaxSize => {
+                if offset != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+                let value = text
+                    .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\0')
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                vfs::pipe::set_pipe_max_size(value).map_err(|err| match err {
+                    errno::Errno::EPERM => VfsError::OperationNotPermitted,
+                    _ => VfsError::InvalidArgument,
+                })?;
                 Ok(buf.len())
             }
             _ => Err(VfsError::ReadOnlyFilesystem),
@@ -1794,6 +1780,10 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysTainted => Ok(format!("{}\n", kernel_taint_flags()).into_bytes()),
+        ProcFileKind::SysPipeMaxSize => {
+            Ok(format!("{}\n", vfs::pipe::pipe_max_size()).into_bytes())
+        }
     }
 }
 
@@ -2044,15 +2034,24 @@ fn task_session(task: &Arc<Task>) -> PidT {
         .unwrap_or(0)
 }
 
-fn task_memory_usage(task: &Arc<Task>) -> (u64, u64) {
+fn task_memory_usage(task: &Arc<Task>) -> (u64, u64, u64) {
     let Some(vm) = task_vm_space(task) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
-    let vsize = dump_vmas(&vm).into_iter().fold(0u64, |acc, (range, _)| {
-        acc.saturating_add((range.end - range.start) as u64)
-    });
+    let mut vsize = 0u64;
+    let mut data = 0u64;
+    for (range, flags) in dump_vmas(&vm) {
+        let size = (range.end - range.start) as u64;
+        vsize = vsize.saturating_add(size);
+        if flags.has(VmFlags::WRITE)
+            && !flags.has(VmFlags::SHARED)
+            && !flags.has(VmFlags::GROWS_DOWN)
+        {
+            data = data.saturating_add(size);
+        }
+    }
     let rss = vm.mapped_pages() as u64 * page_size() as u64;
-    (vsize, rss)
+    (vsize, rss, data)
 }
 
 fn task_thread_count(task: &Arc<Task>) -> usize {
@@ -2069,9 +2068,9 @@ fn render_task_status(task: &Arc<Task>) -> String {
     let fd_count = task_fdtable(task)
         .map(|fdt| fdt.snapshot_fds().len())
         .unwrap_or(0);
-    let (vsize, rss) = task_memory_usage(task);
+    let (vsize, rss, data) = task_memory_usage(task);
     format!(
-        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n",
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\n",
         name,
         task_state_char(state),
         task_state_name(state),
@@ -2089,6 +2088,7 @@ fn render_task_status(task: &Arc<Task>) -> String {
         fd_count,
         vsize / 1024,
         rss / 1024,
+        data / 1024,
         task_thread_count(task),
     )
 }
@@ -2101,15 +2101,39 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let pgrp = task_pgrp(task);
     let session = task_session(task);
     let num_threads = task_thread_count(task);
-    let (vsize, rss_bytes) = task_memory_usage(task);
+    let (vsize, rss_bytes, _) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
-    // 这里按当前 Task 模型已经可观测的字段生成 Linux 兼容 stat。fault 计数、
-    // 累积 CPU 时间、信号掩码等尚未进入 sched/mm 的公共快照接口，因此兼容字段
-    // 保持 0，避免在 procfs 层伪造无法证明的数据。
+    let usage = task.usage_snapshot(sched::now_ns_public());
+    let child_usage = task.child_usage_snapshot();
+    let utime = proc_cpu_ticks(usage.user_ns);
+    let stime = proc_cpu_ticks(usage.system_ns);
+    let cutime = proc_cpu_ticks(child_usage.user_ns);
+    let cstime = proc_cpu_ticks(child_usage.system_ns);
+    let starttime = proc_cpu_ticks(task.start_time_ns());
+    // fault 计数、信号掩码等尚未进入 sched/mm 的公共快照接口，对应字段保持 0；
+    // 已有可靠来源的 CPU 时间、创建时间和内存字段必须按 Linux stat 位置导出。
     format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid, pgrp, session, num_threads, vsize, rss_pages,
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid,
+        comm,
+        state,
+        ppid,
+        pgrp,
+        session,
+        utime,
+        stime,
+        cutime,
+        cstime,
+        num_threads,
+        starttime,
+        vsize,
+        rss_pages,
     )
+}
+
+fn proc_cpu_ticks(ns: u64) -> u64 {
+    const USER_HZ: u64 = 100;
+    ns / (1_000_000_000 / USER_HZ)
 }
 
 fn render_task_cmdline(task: &Arc<Task>) -> Vec<u8> {

@@ -22,7 +22,7 @@ pub mod file_like;
 pub mod flags;
 pub mod set;
 
-pub use area::{VmArea, VmBacking};
+pub use area::{SharedAnonObject, VmArea, VmBacking};
 pub use error::UserAccessError;
 pub use file_like::FileLike;
 pub use flags::VmFlags;

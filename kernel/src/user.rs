@@ -17,6 +17,7 @@ use general::mm::{VmSpace, user_pgd_ops};
 use general::vfs::{
     self, FdTable, FileMode, VfsContext,
     file::{AccessMode, File, OpenOptions},
+    inode::InodeExecAccess,
     path::{Dirfd, LookupFlags},
 };
 use mm::VmFlags;
@@ -90,6 +91,20 @@ pub struct LoadedUserImage {
     pub entry_pc: usize,
     pub user_sp: usize,
     pub exec_path: String,
+    pub exec_access: Arc<ExecutableAccessSet>,
+}
+
+/// 一次成功执行映像持有的全部 inode 执行租约。
+///
+/// 主程序和内核装载的动态解释器都保存在同一个集合中。任务 fork 时共享该集合，
+/// exec 替换或最后一个相关任务退出时集合析构，从而精确维持 ETXTBSY 生命周期。
+pub struct ExecutableAccessSet {
+    leases: Vec<InodeExecAccess>,
+}
+
+struct LoadedInterpreter {
+    bytes: Vec<u8>,
+    access: InodeExecAccess,
 }
 
 struct LoadedImage {
@@ -142,6 +157,16 @@ pub fn load_user_image_from_path(
     load_user_image_from_path_inner(task, path, argv, envp, 0)
 }
 
+pub fn load_user_image_from_file(
+    task: &Arc<Task>,
+    file: Arc<File>,
+    exec_path: &str,
+    argv: &[String],
+    envp: &[String],
+) -> Result<LoadedUserImage, errno::Errno> {
+    load_user_image_from_file_inner(task, file, exec_path, argv, envp, 0)
+}
+
 fn load_user_image_from_path_inner(
     task: &Arc<Task>,
     path: &str,
@@ -156,16 +181,44 @@ fn load_user_image_from_path_inner(
             return Err(e);
         }
     };
+    load_user_image_from_file_inner(task, file, path, argv, envp, shebang_depth)
+}
+
+fn load_user_image_from_file_inner(
+    task: &Arc<Task>,
+    file: Arc<File>,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    shebang_depth: usize,
+) -> Result<LoadedUserImage, errno::Errno> {
+    check_exec_permission(task, &file)?;
+    let main_exec_access = file
+        .inode()
+        .acquire_exec_access()
+        .map_err(|error| error.to_errno())?;
+    let file = if file.flags().readable() {
+        file
+    } else {
+        let cred = task_vfs_context(task)?.cred();
+        file.open_exec_view(cred)
+            .map_err(|error| error.to_errno())?
+    };
     let prefix = load_elf_prefix_from_file(&file)?;
     if prefix.starts_with(b"#!") {
         let script = parse_shebang(path, argv, &prefix, shebang_depth)?;
-        return load_user_image_from_path_inner(
+        let mut loaded = load_user_image_from_path_inner(
             task,
             &script.interpreter,
             &script.argv,
             envp,
             shebang_depth + 1,
-        );
+        )?;
+        Arc::get_mut(&mut loaded.exec_access)
+            .ok_or(errno::Errno::EIO)?
+            .leases
+            .push(main_exec_access);
+        return Ok(loaded);
     }
 
     let exec_image = match load_exec_image_from_file(&file) {
@@ -208,19 +261,19 @@ fn load_user_image_from_path_inner(
     };
     let main_loaded = load_exec_image(&vm, &exec_image, &file, main_bias, true, "exec")?;
     let exec_path = resolve_exec_path(task, path);
+    let mut exec_access = Vec::new();
+    exec_access.push(main_exec_access);
 
     let interp_loaded = if let Some(interp) = exec_image.interpreter.as_deref() {
         match load_interpreter_from_task_vfs(task, &exec_path, interp) {
-            Ok(mut interp_bytes) => {
-                hal::user::patch_interpreter_image(interp, &mut interp_bytes);
-                let interp_img = elf::parse(&interp_bytes).map_err(|_| errno::Errno::ENOEXEC)?;
+            Ok(loaded_interpreter) => {
+                let LoadedInterpreter { mut bytes, access } = loaded_interpreter;
+                hal::user::patch_interpreter_image(interp, &mut bytes);
+                let interp_img = elf::parse(&bytes).map_err(|_| errno::Errno::ENOEXEC)?;
                 validate_user_image_result(&*interp_img).map_err(|_| errno::Errno::ENOEXEC)?;
-                Some(load_image(
-                    &vm,
-                    &*interp_img,
-                    hal::user::interp_base(),
-                    "interp",
-                )?)
+                let loaded = load_image(&vm, &*interp_img, hal::user::interp_base(), "interp")?;
+                exec_access.push(access);
+                Some(loaded)
             }
             Err(errno::Errno::ENOENT) if exec_image.can_run_without_interpreter => None,
             Err(err) => return Err(err),
@@ -301,6 +354,9 @@ fn load_user_image_from_path_inner(
         entry_pc,
         user_sp,
         exec_path,
+        exec_access: Arc::new(ExecutableAccessSet {
+            leases: exec_access,
+        }),
     })
 }
 
@@ -1052,9 +1108,9 @@ fn load_interpreter_from_task_vfs(
     task: &Arc<Task>,
     exec_path: &str,
     interp: &str,
-) -> Result<Vec<u8>, errno::Errno> {
-    match load_file_from_task_vfs(task, interp) {
-        Ok(bytes) => return Ok(bytes),
+) -> Result<LoadedInterpreter, errno::Errno> {
+    match load_executable_bytes_from_task_vfs(task, interp) {
+        Ok(loaded) => return Ok(loaded),
         Err(errno::Errno::ENOENT) => {}
         Err(err) => return Err(err),
     }
@@ -1074,8 +1130,8 @@ fn load_interpreter_from_task_vfs(
     }
 
     for candidate in candidates {
-        match load_file_from_task_vfs(task, &candidate) {
-            Ok(bytes) => return Ok(bytes),
+        match load_executable_bytes_from_task_vfs(task, &candidate) {
+            Ok(loaded) => return Ok(loaded),
             Err(errno::Errno::ENOENT) => continue,
             Err(err) => return Err(err),
         }
@@ -1192,7 +1248,49 @@ pub(crate) fn load_file_from_task_vfs(
     path: &str,
 ) -> Result<Vec<u8>, errno::Errno> {
     let file = open_file_from_task_vfs(task, path)?;
-    let size = usize::try_from(file_size(&file)?).map_err(|_| errno::Errno::EFBIG)?;
+    read_entire_file(&file)
+}
+
+fn load_executable_bytes_from_task_vfs(
+    task: &Arc<Task>,
+    path: &str,
+) -> Result<LoadedInterpreter, errno::Errno> {
+    let file = open_file_from_task_vfs(task, path)?;
+    check_exec_permission(task, &file)?;
+    let access = file
+        .inode()
+        .acquire_exec_access()
+        .map_err(|error| error.to_errno())?;
+    let bytes = read_entire_file(&file)?;
+    Ok(LoadedInterpreter { bytes, access })
+}
+
+fn check_exec_permission(task: &Arc<Task>, file: &Arc<File>) -> Result<(), errno::Errno> {
+    if file.inode().kind() != vfs::stat::FileType::Regular {
+        return Err(errno::Errno::EACCES);
+    }
+    if file
+        .mount()
+        .flags_snapshot()
+        .has(vfs::mount::MountFlags::NOEXEC)
+    {
+        return Err(errno::Errno::EACCES);
+    }
+    let stat = file.inode().stat().map_err(|error| error.to_errno())?;
+    let ctx = task_vfs_context(task)?;
+    if !ctx.cred().can_exec(
+        vfs::cred::Uid(stat.uid),
+        vfs::cred::Gid(stat.gid),
+        FileMode::new(stat.mode as u16),
+        false,
+    ) {
+        return Err(errno::Errno::EACCES);
+    }
+    Ok(())
+}
+
+fn read_entire_file(file: &Arc<File>) -> Result<Vec<u8>, errno::Errno> {
+    let size = usize::try_from(file_size(file)?).map_err(|_| errno::Errno::EFBIG)?;
     if size == 0 {
         return Err(errno::Errno::ENOEXEC);
     }

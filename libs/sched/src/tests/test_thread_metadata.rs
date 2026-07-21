@@ -11,7 +11,7 @@ use ktest::ktest;
 use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedAttr,
-    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskState, ThreadGroup,
     supported_cpu_mask,
 };
 
@@ -76,6 +76,20 @@ fn robust_list_and_rseq_state_roundtrip() {
     assert_eq!(task.rseq_registration(), rseq);
     task.clear_rseq_registration();
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
+}
+
+#[ktest]
+fn timer_slack_defaults_resets_and_inherits() {
+    let parent = make_task();
+    let child = make_task();
+
+    assert_eq!(parent.timer_slack_ns(), crate::DEFAULT_TIMER_SLACK_NS);
+    parent.set_timer_slack_ns(125_000);
+    child.inherit_timer_slack_from(&parent);
+    assert_eq!(child.timer_slack_ns(), 125_000);
+
+    child.set_timer_slack_ns(0);
+    assert_eq!(child.timer_slack_ns(), crate::DEFAULT_TIMER_SLACK_NS);
 }
 
 #[ktest]
@@ -212,6 +226,23 @@ fn runqueue_class_load_includes_current_task() {
     assert!(rq.dequeue(&current, 3));
 }
 
+/// CPU 使用时间只能累计任务实际作为 current 运行的区间。
+#[ktest]
+fn runqueue_accounts_current_cpu_runtime() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task), 100);
+    let current = rq.pick_next(100).expect("current task");
+
+    rq.tick(150);
+    assert_eq!(current.usage_snapshot(150).user_ns, 50);
+
+    assert!(rq.dequeue(&current, 200));
+    assert_eq!(current.usage_snapshot(300).user_ns, 100);
+    rq.tick(400);
+    assert_eq!(current.usage_snapshot(400).user_ns, 100);
+}
+
 #[ktest]
 fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     let current = make_task();
@@ -232,6 +263,25 @@ fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     assert_eq!(rq.nr_running(), 2);
     assert!(rq.dequeue(&current, 3));
     assert!(rq.dequeue(&idle, 3));
+}
+
+#[ktest]
+fn runqueue_wake_current_sleep_transition_does_not_duplicate_task() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&task));
+    task.set_state(TaskState::Sleeping);
+
+    assert!(!rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq.is_current(&task));
+    assert_eq!(task.state(), TaskState::Running);
+    assert!(!task.sched.on_rq());
+    assert_eq!(rq.nr_running(), 1);
+
+    let current = rq.pick_next(2).expect("current task");
+    assert!(alloc::sync::Arc::ptr_eq(&current, &task));
+    assert_eq!(rq.nr_running(), 1);
+    assert!(rq.dequeue(&current, 3));
 }
 
 #[ktest]

@@ -24,7 +24,7 @@
 //!  └─────────────────────────────┘
 //!           │
 //!           ▼
-//!     /dev/random  ── read：熵不足挂 WaitQueue 睡眠等待
+//!     /dev/random  ── read：CSPRNG 未安全播种时挂 WaitQueue 睡眠等待
 //!     /dev/urandom ── read：永远走 CSPRNG（永不阻塞）
 //! ```
 //!
@@ -241,12 +241,6 @@ impl EntropyPool {
             .min(POOL_BITS);
     }
 
-    /// 扣除熵估计，不允许下溢成负数。
-    fn debit(&mut self, bits: u64) -> u64 {
-        let actual = bits.min(self.estimated_entropy_bits);
-        self.estimated_entropy_bits -= actual;
-        actual
-    }
 }
 
 // ──────────────────────── ChaCha20 CSPRNG ─────────────────────────────────
@@ -396,10 +390,10 @@ impl Crng {
 pub struct RandomCore {
     pool: SpinLock<EntropyPool>,
     crng: SpinLock<Crng>,
-    /// `/dev/random` 等待真实 entropy credit 的睡眠队列。
+    /// `/dev/random` 等待 CSPRNG 安全播种的睡眠队列。
     ///
-    /// 注意：队列只表示“可能有新 credit”，唤醒后仍必须重新检查并在池锁
-    /// 下扣减。这样多个 reader 同时被唤醒时不会重复消费同一份熵估计。
+    /// 队列只表示“可能已经完成安全播种”，唤醒后仍必须重新检查
+    /// `secure_ready`，不能把一次唤醒当成随机数据已经可用。
     entropy_wait: WaitQueue,
     /// 输出字节统计。
     total_bytes_output: AtomicU64,
@@ -407,7 +401,7 @@ pub struct RandomCore {
     total_add_calls: AtomicU64,
     /// 是否已完成首次 seed 注入（用于诊断）。
     first_seed_done: AtomicBool,
-    /// 是否已经累计足够熵完成安全播种；一旦置位便不随 `/dev/random` 扣减而回退。
+    /// 是否已经累计足够熵完成安全播种；置位后不会因读取而回退。
     secure_ready: AtomicBool,
 }
 
@@ -476,27 +470,6 @@ impl RandomCore {
         self.entropy_wait.wake_all();
     }
 
-    fn try_debit_entropy(&self, bits: u64) -> bool {
-        let mut pool = self.pool.lock();
-        if pool.estimated_entropy_bits < bits {
-            return false;
-        }
-        pool.debit(bits);
-        true
-    }
-
-    fn wait_and_debit_entropy(&self, bits: u64, blocking: bool) -> Result<bool, CharIoError> {
-        loop {
-            if self.try_debit_entropy(bits) {
-                return Ok(true);
-            }
-            if !blocking {
-                return Ok(false);
-            }
-            self.wait_for_entropy(bits)?;
-        }
-    }
-
     /// 估算可用熵。
     fn estimated_entropy_bits(&self) -> u64 {
         self.pool.lock().estimated_entropy_bits
@@ -549,48 +522,6 @@ impl RandomCore {
         Ok(true)
     }
 
-    /// 阻塞到至少有 `bits` 可用熵。
-    fn wait_for_entropy(&self, bits: u64) -> Result<(), CharIoError> {
-        if bits == 0 || self.estimated_entropy_bits() >= bits {
-            return Ok(());
-        }
-
-        if sched::is_ready() {
-            loop {
-                if self.estimated_entropy_bits() >= bits {
-                    return Ok(());
-                }
-                let task = sched::current_task();
-                if sched::operation::has_interrupting_signal(&task) {
-                    return Err(CharIoError::Interrupted);
-                }
-                let entry = self
-                    .entropy_wait
-                    .prepare_to_wait(&task, sched::TaskState::Sleeping);
-                if self.estimated_entropy_bits() >= bits {
-                    self.entropy_wait.finish_wait(&entry);
-                    return Ok(());
-                }
-                drop(task);
-                sched::schedule_once(sched::now_ns_public());
-                let task = sched::current_task();
-                self.entropy_wait.finish_wait(&entry);
-                if sched::operation::has_interrupting_signal(&task) {
-                    return Err(CharIoError::Interrupted);
-                }
-            }
-        }
-
-        // 调度器启动前没有 current task 可挂队列，只能保留极早期兼容兜底；
-        // 调度器 ready 后的 `/dev/random` read 不会走到这里。
-        while self.estimated_entropy_bits() < bits {
-            for _ in 0..RANDOM_WAIT_RETRIES {
-                core::hint::spin_loop();
-            }
-        }
-        Ok(())
-    }
-
     /// 走 CSPRNG 输出；不消耗熵。
     fn crng_fill(&self, out: &mut [u8]) {
         if out.is_empty() {
@@ -620,26 +551,11 @@ impl RandomCore {
 
     /// `/dev/random` 的 read 实现。
     ///
-    /// `blocking == true`：熵不足时挂 WaitQueue 阻塞等待。
-    /// `blocking == false`：立刻返回 0。
+    /// `blocking == true`：CSPRNG 尚未安全播种时挂 WaitQueue 睡眠等待。
+    /// `blocking == false`：尚未安全播种时立刻返回 0；完成播种后与
+    /// `/dev/urandom` 共用同一个 CSPRNG，读取不会耗尽有限的熵估计。
     fn read_blocking(&self, buf: &mut [u8], blocking: bool) -> Result<usize, CharIoError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let mut done = 0usize;
-        while done < buf.len() {
-            // 熵池最多只记 POOL_BITS；大读按池容量分段等待，避免要求一个
-            // 永远不可能同时满足的 credit 数。
-            let chunk = (buf.len() - done).min(POOL_BYTES);
-            let need_bits = (chunk as u64).saturating_mul(8);
-            if !self.wait_and_debit_entropy(need_bits, blocking)? {
-                break;
-            }
-            self.crng_fill(&mut buf[done..done + chunk]);
-            done += chunk;
-        }
-        Ok(done)
+        self.read_secure(buf, blocking)
     }
 
     /// `/dev/urandom` 的 read 实现（永不阻塞，从 CSPRNG 直接取）。
@@ -722,6 +638,22 @@ pub fn force_reseed() {
     random_core().reseed_locked();
 }
 
+/// 内核子系统从已初始化 CSPRNG 取得随机材料。
+pub fn fill_kernel_random(out: &mut [u8]) {
+    random_core().read_nonblocking(out);
+}
+
+/// 在依赖随机 key 的 PnP 驱动注册前完成启动 seed 和首次 reseed。
+pub fn initialize_for_kernel(bootloader_seed: Option<&[u8]>) {
+    if let Some(seed) = bootloader_seed {
+        add_bootloader_randomness(seed);
+    }
+    if !random_core().first_seed_done.load(Ordering::Acquire) {
+        seed_from_startup();
+    }
+}
+
+// ──────────────────────── CharDriver 实现 ─────────────────────────────────
 struct RandomBackendImpl;
 
 impl RandomBackend for RandomBackendImpl {

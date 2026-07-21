@@ -105,14 +105,17 @@ const VIRTIO_CC_DEVICE_FEATURE_SELECT: usize = 0x00;
 const VIRTIO_CC_DEVICE_FEATURE: usize = 0x04;
 const VIRTIO_CC_DRIVER_FEATURE_SELECT: usize = 0x08;
 const VIRTIO_CC_DRIVER_FEATURE: usize = 0x0c;
+const VIRTIO_CC_CONFIG_MSIX_VECTOR: usize = 0x10;
 const VIRTIO_CC_DEVICE_STATUS: usize = 0x14;
 const VIRTIO_CC_QUEUE_SELECT: usize = 0x16;
 const VIRTIO_CC_QUEUE_SIZE: usize = 0x18;
+const VIRTIO_CC_QUEUE_MSIX_VECTOR: usize = 0x1a;
 const VIRTIO_CC_QUEUE_ENABLE: usize = 0x1c;
 const VIRTIO_CC_QUEUE_NOTIFY_OFF: usize = 0x1e;
 const VIRTIO_CC_QUEUE_DESC: usize = 0x20;
 const VIRTIO_CC_QUEUE_DRIVER: usize = 0x28;
 const VIRTIO_CC_QUEUE_DEVICE: usize = 0x30;
+pub const VIRTIO_MSI_NO_VECTOR: u16 = u16::MAX;
 
 /// VirtIO PCI function 描述。
 ///
@@ -296,6 +299,7 @@ pub enum VirtioPciTransportError {
     NotifyOffsetOverflow,
     NotifyOutOfRange,
     NotifyAddressOverflow,
+    MsixVectorRejected,
 }
 
 /// 已校验的 VirtIO PCI transport 访问器。
@@ -384,6 +388,26 @@ impl VirtioPciTransport {
 
     pub fn set_selected_queue_size(&self, queue_size: u16) {
         wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_SIZE, queue_size);
+    }
+
+    pub fn set_config_msix_vector(&self, vector: u16) -> Result<(), VirtioPciTransportError> {
+        wr_u16(
+            self.caps.common.vaddr + VIRTIO_CC_CONFIG_MSIX_VECTOR,
+            vector,
+        );
+        (rd_u16(self.caps.common.vaddr + VIRTIO_CC_CONFIG_MSIX_VECTOR) != VIRTIO_MSI_NO_VECTOR)
+            .then_some(())
+            .ok_or(VirtioPciTransportError::MsixVectorRejected)
+    }
+
+    pub fn set_selected_queue_msix_vector(
+        &self,
+        vector: u16,
+    ) -> Result<(), VirtioPciTransportError> {
+        wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_MSIX_VECTOR, vector);
+        (rd_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_MSIX_VECTOR) != VIRTIO_MSI_NO_VECTOR)
+            .then_some(())
+            .ok_or(VirtioPciTransportError::MsixVectorRejected)
     }
 
     pub fn set_selected_queue_addresses(&self, desc: u64, driver: u64, device: u64) {
@@ -558,10 +582,10 @@ pub enum VirtQueueError {
 
 /// 描述符链内联保存的描述符数量。
 ///
-/// split virtqueue 的块设备请求通常是 header/data/status 三段，flush 是两段。
-/// 小链内联可以消除每次提交路径上的临时堆分配；更长链仍自动退化到 `Vec`，
-/// 因此这里是缓存策略，不是协议形状假设。
-const INLINE_DESCRIPTOR_CHAIN: usize = 4;
+/// split virtqueue 的块设备请求通常是 header/data/status 三段；网络队列最多使用
+/// 一个 VirtIO header 加 18 个 packet fragment。覆盖这两种规范上限后，正常 I/O
+/// 提交路径不需要临时堆分配；更长的非网络链仍可退化到 `Vec`。
+const INLINE_DESCRIPTOR_CHAIN: usize = 19;
 
 #[derive(Debug)]
 enum DescriptorChainStorage {
@@ -794,6 +818,11 @@ impl SplitVirtQueue {
 
     pub const fn used_dma_addr(&self) -> usize {
         self.used.dma_addr()
+    }
+
+    /// 返回 split ring 的 `avail.flags` 常驻地址，供常驻 IRQ top-half 抑制中断。
+    pub const fn avail_flags_addr(&self) -> usize {
+        self.avail.vaddr()
     }
 
     pub fn desc_len(&self) -> usize {
@@ -1061,6 +1090,18 @@ impl SplitVirtQueue {
             head,
             len: elem.len,
         }))
+    }
+
+    /// 不推进 consumer index，判断设备是否发布了新的 used element。
+    pub fn has_used(&self) -> Result<bool, VirtQueueError> {
+        self.used.sync_for_cpu();
+        fence(Ordering::Acquire);
+        let used_idx = self.used_idx();
+        let pending = used_idx.wrapping_sub(self.last_used_idx);
+        if usize::from(pending) > self.queue_len() {
+            return Err(VirtQueueError::UsedRingOverrun);
+        }
+        Ok(pending != 0)
     }
 
     pub fn set_avail_flags(&mut self, flags: u16) {

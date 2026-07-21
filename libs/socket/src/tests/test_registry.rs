@@ -14,7 +14,7 @@ fn abstract_bind_rejects_duplicates_and_rebind() {
     assert_eq!(second.bind(addr), Err(SocketError::NameAlreadyBound));
     assert_eq!(
         first.bind(UnixAddress::Abstract(b"other".to_vec())),
-        Err(SocketError::NameAlreadyBound)
+        Err(SocketError::StateMismatch)
     );
 }
 

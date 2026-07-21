@@ -18,7 +18,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
@@ -121,10 +121,34 @@ const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 1;
 
 struct TimedSleeper {
     deadline_ns: u64,
+    cpu_id: usize,
     task: Weak<Task>,
 }
 
 static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
+
+/// 由调度定时器在指定 deadline 到期后定向通知的对象。
+pub trait DeadlineObserver: Send + Sync {
+    fn deadline_expired(&self, registration: u64, now_ns: u64) -> Option<u64>;
+}
+
+struct DeadlineEntry {
+    id: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+    firing: bool,
+}
+
+struct DeadlineObservers {
+    next_id: u64,
+    entries: Vec<DeadlineEntry>,
+}
+
+static DEADLINE_OBSERVERS: Spinlock<DeadlineObservers> = Spinlock::new(DeadlineObservers {
+    next_id: 1,
+    entries: Vec::new(),
+});
+static HAS_DEADLINE_OBSERVERS: AtomicBool = AtomicBool::new(false);
 
 /// POSIX `ITIMER_REAL` 的纳秒级内核表示。
 ///
@@ -138,17 +162,19 @@ pub struct RealtimeItimerSpec {
 struct RealtimeItimer {
     deadline_ns: u64,
     interval_ns: u64,
+    cpu_id: usize,
     thread_group: Weak<ThreadGroup>,
 }
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 
-/// init 任务全局锚点。写入即 Release，读取必须 Acquire。
-static mut INIT_TASK: Option<Arc<Task>> = None;
+/// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
+static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
-static mut ROOT_PID_NS: Option<Arc<PidNamespace>> = None;
+static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
+static DEFERRED_TIMER_TICK_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────────────
 
@@ -264,18 +290,34 @@ pub fn init() -> Arc<Task> {
         .runqueue()
         .set_current(Arc::clone(&init_task));
 
-    // 7) 发布全局锚点。Release 保证其它核能看到上面所有字段的写入。
-    // Safety: INIT_READY 的 assert 已保证此函数全程仅此一次进入；写入期间
-    // 没有其它代码路径能读取 INIT_TASK / ROOT_PID_NS（它们必须先见到
-    // INIT_READY=true）。
-    unsafe {
-        core::ptr::addr_of_mut!(INIT_TASK).write(Some(Arc::clone(&init_task)));
-        core::ptr::addr_of_mut!(ROOT_PID_NS).write(Some(Arc::clone(&root_ns)));
-    }
+    // 7) 发布全局锚点。AtomicPtr 持有的强引用与内核同寿命，不参与常规回收。
+    let init_ptr = Arc::into_raw(Arc::clone(&init_task)).cast_mut();
+    let root_ptr = Arc::into_raw(Arc::clone(&root_ns)).cast_mut();
+    assert!(
+        INIT_TASK
+            .compare_exchange(
+                core::ptr::null_mut(),
+                init_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
+    assert!(
+        ROOT_PID_NS
+            .compare_exchange(
+                core::ptr::null_mut(),
+                root_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
     INIT_READY.store(true, Ordering::Release);
 
     // 8) CPU 0 的 current 指向 init。
     publish_current_task(0, Arc::clone(&init_task));
+    init_task.account_switch_in(now_ns_internal());
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
@@ -295,13 +337,7 @@ pub fn init_task() -> Arc<Task> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] init_task() called before sched::init()"
     );
-    // Safety: INIT_READY=true 时 INIT_TASK 已写入且永不再变；Acquire load 与
-    // init() 中的 Release store 配对。
-    let slot = unsafe { &*core::ptr::addr_of!(INIT_TASK) };
-    Arc::clone(
-        slot.as_ref()
-            .expect("[sched] INIT_TASK flag set but slot empty"),
-    )
+    clone_global_arc(&INIT_TASK, "[sched] INIT_TASK flag set but slot empty")
 }
 
 /// 当前 CPU 的 runqueue。
@@ -323,12 +359,18 @@ pub fn root_pid_ns() -> Arc<PidNamespace> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] root_pid_ns() called before sched::init()"
     );
-    // Safety: INIT_READY=true 时 ROOT_PID_NS 已写入且永不再变。
-    let slot = unsafe { &*core::ptr::addr_of!(ROOT_PID_NS) };
-    Arc::clone(
-        slot.as_ref()
-            .expect("[sched] ROOT_PID_NS flag set but slot empty"),
-    )
+    clone_global_arc(&ROOT_PID_NS, "[sched] ROOT_PID_NS flag set but slot empty")
+}
+
+fn clone_global_arc<T>(slot: &AtomicPtr<T>, empty_message: &str) -> Arc<T> {
+    let ptr = slot.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "{}", empty_message);
+    unsafe {
+        // Safety: 槽位永久保留 `Arc::into_raw` 产生的强引用，因此 ptr 在内核运行期
+        // 始终有效；先增加强计数，再用 from_raw 构造本次调用拥有的 Arc。
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
 }
 
 /// 统计：当前根 ns 已占用的 pid 数（含 init）。
@@ -696,6 +738,7 @@ pub(crate) fn offline_cpu_with_scheduler(
     cpu_id: usize,
     now_ns: u64,
 ) -> Result<(), errno::Errno> {
+    let executing_cpu_id = cpu();
     let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
     if cpu == CpuId::boot() {
         return Err(errno::Errno::EBUSY);
@@ -806,6 +849,15 @@ pub(crate) fn offline_cpu_with_scheduler(
     if !scheduler.mark_cpu_offline(cpu) {
         return Err(errno::Errno::EBUSY);
     }
+    let current_cpu =
+        CpuId::new(executing_cpu_id).filter(|current| scheduler.active_set().contains(*current));
+    let timer_target = current_cpu
+        .or_else(|| scheduler.active_set().iter().next())
+        .unwrap_or_else(CpuId::boot);
+    migrate_deadline_owners(cpu_id, timer_target.get());
+    if timer_target.get() == executing_cpu_id {
+        reprogram_deadline_timer();
+    }
     Ok(())
 }
 
@@ -886,6 +938,7 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
         .cpu_or_boot(cpu_id)
         .runqueue()
         .set_current(Arc::clone(&task));
+    task.account_switch_in(now_ns_internal());
     publish_current_task(cpu_id, task);
     Ok(())
 }
@@ -985,6 +1038,7 @@ pub fn run_post_syscall_handoff_lazy() {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
+    drain_deferred_timer_tick();
     let cpu_id = cpu();
     if !SCHEDULER.cpu_or_boot(cpu_id).has_post_syscall_handoff() {
         return;
@@ -1050,6 +1104,13 @@ pub(crate) fn activate_task_on_cpu(
 pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
     let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true, true);
     notify_resched(cpu_id);
+    cpu_id
+}
+
+/// 按一次性 CPU 提示入队；提示不在线或不在 affinity 中时退回正常放置。
+pub fn enqueue_task_with_hint(task: Arc<Task>, cpu_hint: usize, now_ns: u64) -> usize {
+    let cpu_id = enqueue_task_locked_with_hint(task, now_ns, cpu_hint);
+    request_resched(cpu_id);
     cpu_id
 }
 
@@ -1138,44 +1199,188 @@ pub(crate) fn enqueue_task_on_scheduler(
     unreachable!("[sched] boot CPU must accept task enqueue")
 }
 
+fn enqueue_task_locked_with_hint(task: Arc<Task>, now_ns: u64, cpu_hint: usize) -> usize {
+    if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+    {
+        task.sched.set_on_rq(false);
+        return task.current_cpu().min(NR_CPUS - 1);
+    }
+    if task.sched.on_rq() {
+        return task.current_cpu().min(NR_CPUS - 1);
+    }
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    let active = active_cpu_set();
+    let hinted =
+        CpuId::new(cpu_hint).filter(|cpu| affinity.contains(*cpu) && active.contains(*cpu));
+    let cpu_id = hinted
+        .or_else(|| select_cpu_for_mask(affinity, None, false))
+        .unwrap_or_else(CpuId::boot)
+        .get();
+    task.set_current_cpu(cpu_id);
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    if cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns) {
+        cpu_state.request_resched();
+    }
+    cpu_id
+}
+
 /// Register a sleeping task for deadline-based wakeup.
 ///
 /// The caller owns the actual sleep transition and must cancel the registration
 /// after it resumes. This helper only records the timeout side channel used by
 /// timer ticks to move an expired sleeper back to Runnable.
 pub fn register_sleep_deadline(task: &Arc<Task>, deadline_ns: u64) -> bool {
-    if now_ns_internal() >= deadline_ns {
+    let cpu_id = cpu();
+    if !register_sleep_deadline_on_cpu(task, deadline_ns, cpu_id) {
         return false;
     }
-    let mut sleepers = TIMED_SLEEPERS.lock();
-    sleepers.retain(|entry| entry.task.upgrade().is_some());
-    if let Some(entry) = sleepers.iter_mut().find(|entry| {
-        entry
-            .task
-            .upgrade()
-            .as_ref()
-            .is_some_and(|queued| Arc::ptr_eq(queued, task))
-    }) {
-        entry.deadline_ns = entry.deadline_ns.min(deadline_ns);
-        return true;
-    }
-    sleepers.push(TimedSleeper {
-        deadline_ns,
-        task: Arc::downgrade(task),
-    });
+    reprogram_deadline_timer();
     true
 }
 
-/// Remove all deadline wakeups registered for `task`.
-pub fn cancel_sleep_deadline(task: &Arc<Task>) {
-    let mut sleepers = TIMED_SLEEPERS.lock();
-    sleepers.retain(|entry| {
-        entry
-            .task
-            .upgrade()
-            .as_ref()
-            .is_some_and(|queued| !Arc::ptr_eq(queued, task))
+fn register_sleep_deadline_on_cpu(task: &Arc<Task>, deadline_ns: u64, cpu_id: usize) -> bool {
+    if now_ns_internal() >= deadline_ns {
+        return false;
+    }
+    {
+        let mut sleepers = TIMED_SLEEPERS.lock();
+        sleepers.retain(|entry| entry.task.upgrade().is_some());
+        if let Some(entry) = sleepers.iter_mut().find(|entry| {
+            entry
+                .task
+                .upgrade()
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, task))
+        }) {
+            entry.deadline_ns = entry.deadline_ns.min(deadline_ns);
+            entry.cpu_id = cpu_id;
+        } else {
+            sleepers.push(TimedSleeper {
+                deadline_ns,
+                cpu_id,
+                task: Arc::downgrade(task),
+            });
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn register_sleep_deadline_for_test(
+    task: &Arc<Task>,
+    deadline_ns: u64,
+    cpu_id: usize,
+) -> bool {
+    register_sleep_deadline_on_cpu(task, deadline_ns, cpu_id)
+}
+
+/// 移除 `task` 登记的全部 deadline wakeup。
+///
+/// 返回 `true` 表示队列内容确实发生变化。已经由 timer 消费的登记项不再触发
+/// 冗余硬件重编程，缩短超时 syscall 的返回热路径。
+pub fn cancel_sleep_deadline(task: &Arc<Task>) -> bool {
+    let changed = {
+        let mut sleepers = TIMED_SLEEPERS.lock();
+        let old_len = sleepers.len();
+        sleepers.retain(|entry| {
+            entry
+                .task
+                .upgrade()
+                .as_ref()
+                .is_some_and(|queued| !Arc::ptr_eq(queued, task))
+        });
+        sleepers.len() != old_len
+    };
+    if changed {
+        reprogram_deadline_timer();
+    }
+    changed
+}
+
+/// 预留一个不重复的 deadline 注册号，供调用方在入队前发布身份。
+pub fn reserve_deadline_observer_id() -> u64 {
+    let mut observers = DEADLINE_OBSERVERS.lock();
+    let id = observers.next_id;
+    observers.next_id = observers.next_id.wrapping_add(1).max(1);
+    assert!(id != 0, "deadline observer id 已耗尽");
+    id
+}
+
+/// 将 observer 按 deadline 放入调度定时器；deadline 已过期时返回 `false`。
+pub fn register_deadline_observer(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> bool {
+    if now_ns_internal() >= deadline_ns {
+        return false;
+    }
+    let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.push(DeadlineEntry {
+        id: registration,
+        deadline_ns,
+        observer,
+        firing: false,
     });
+    observers
+        .entries
+        .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
+    HAS_DEADLINE_OBSERVERS.store(true, Ordering::Release);
+    true
+}
+
+/// 取消尚未到期的 observer 注册。
+pub fn cancel_deadline_observer(registration: u64) {
+    let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.retain(|entry| entry.id != registration);
+    if observers.entries.is_empty() {
+        HAS_DEADLINE_OBSERVERS.store(false, Ordering::Release);
+    }
+}
+
+fn fire_expired_deadline_observers(now_ns: u64) {
+    if !HAS_DEADLINE_OBSERVERS.load(Ordering::Acquire) {
+        return;
+    }
+    loop {
+        let expired = {
+            let mut observers = DEADLINE_OBSERVERS.lock();
+            let Some(entry) = observers.entries.first_mut() else {
+                HAS_DEADLINE_OBSERVERS.store(false, Ordering::Release);
+                return;
+            };
+            if entry.deadline_ns > now_ns || entry.firing {
+                return;
+            }
+            entry.firing = true;
+            (entry.id, entry.observer.clone())
+        };
+        let next = expired
+            .1
+            .upgrade()
+            .and_then(|observer| observer.deadline_expired(expired.0, now_ns));
+        let mut observers = DEADLINE_OBSERVERS.lock();
+        let Some(index) = observers
+            .entries
+            .iter()
+            .position(|entry| entry.id == expired.0)
+        else {
+            continue;
+        };
+        if let Some(deadline_ns) = next.filter(|deadline| *deadline > now_ns) {
+            let entry = &mut observers.entries[index];
+            entry.deadline_ns = deadline_ns;
+            entry.firing = false;
+            observers
+                .entries
+                .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
+        } else {
+            observers.entries.remove(index);
+            if observers.entries.is_empty() {
+                HAS_DEADLINE_OBSERVERS.store(false, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// 查询当前线程组的 `ITIMER_REAL`。
@@ -1208,60 +1413,134 @@ pub fn set_realtime_itimer(
 ) -> RealtimeItimerSpec {
     let tg = task.thread_group();
     let now_ns = now_ns_internal();
-    let mut timers = REALTIME_ITIMERS.lock();
-    timers.retain(|entry| entry.thread_group.upgrade().is_some());
+    let cpu_id = cpu();
+    let old = {
+        let mut timers = REALTIME_ITIMERS.lock();
+        timers.retain(|entry| entry.thread_group.upgrade().is_some());
 
-    let mut old = RealtimeItimerSpec::default();
-    if let Some(pos) = timers.iter().position(|entry| {
-        entry
-            .thread_group
-            .upgrade()
-            .as_ref()
-            .is_some_and(|queued| Arc::ptr_eq(queued, &tg))
-    }) {
-        let entry = timers.swap_remove(pos);
-        old = RealtimeItimerSpec {
-            value_ns: entry.deadline_ns.saturating_sub(now_ns),
-            interval_ns: entry.interval_ns,
-        };
-    }
+        let mut old = RealtimeItimerSpec::default();
+        if let Some(pos) = timers.iter().position(|entry| {
+            entry
+                .thread_group
+                .upgrade()
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, &tg))
+        }) {
+            let entry = timers.swap_remove(pos);
+            old = RealtimeItimerSpec {
+                value_ns: entry.deadline_ns.saturating_sub(now_ns),
+                interval_ns: entry.interval_ns,
+            };
+        }
 
-    // POSIX: value 为 0 时取消计时器；interval 仅在 value 非 0 时有意义。
-    if value_ns != 0 {
-        timers.push(RealtimeItimer {
-            deadline_ns: now_ns.saturating_add(value_ns),
-            interval_ns,
-            thread_group: Arc::downgrade(&tg),
-        });
-    }
+        // POSIX: value 为 0 时取消计时器；interval 仅在 value 非 0 时有意义。
+        if value_ns != 0 {
+            timers.push(RealtimeItimer {
+                deadline_ns: now_ns.saturating_add(value_ns),
+                interval_ns,
+                cpu_id,
+                thread_group: Arc::downgrade(&tg),
+            });
+        }
+        old
+    };
+    reprogram_deadline_timer();
     old
 }
 
-fn wake_expired_sleepers(now_ns: u64) {
-    let expired = {
+fn earliest_deadline(cpu_id: usize) -> Option<u64> {
+    let sleeper_deadline = {
         let mut sleepers = TIMED_SLEEPERS.lock();
-        let mut expired = Vec::new();
-        sleepers.retain(|entry| {
-            let Some(task) = entry.task.upgrade() else {
-                return false;
-            };
-            if entry.deadline_ns <= now_ns {
-                expired.push(task);
-                false
-            } else {
-                true
-            }
-        });
-        expired
+        sleepers.retain(|entry| entry.task.upgrade().is_some());
+        sleepers
+            .iter()
+            .filter(|entry| entry.cpu_id == cpu_id)
+            .map(|entry| entry.deadline_ns)
+            .min()
     };
-    for task in expired {
-        if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
-            enqueue_task(task, now_ns);
+    let itimer_deadline = {
+        let mut timers = REALTIME_ITIMERS.lock();
+        timers.retain(|entry| entry.thread_group.upgrade().is_some());
+        timers
+            .iter()
+            .filter(|entry| entry.cpu_id == cpu_id)
+            .map(|entry| entry.deadline_ns)
+            .min()
+    };
+    match (sleeper_deadline, itimer_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn earliest_deadline_for_test(cpu_id: usize) -> Option<u64> {
+    earliest_deadline(cpu_id)
+}
+
+/// 读取当前 CPU 的软件计时源，并据此重编程本地定时器。
+///
+/// 每个等待只由登记它的 CPU 驱动。这样不会在同一绝对时刻制造跨 CPU 定时器
+/// 惊群，也不需要由任意 CPU 抢占 deadline 后再迁移被唤醒任务。
+fn reprogram_deadline_timer() {
+    let deadline = earliest_deadline(cpu());
+    if let Some(ops) = arch_hooks::deadline_timer() {
+        (ops.reprogram)(deadline);
+    }
+}
+
+/// CPU 下线时把其尚未到期的软件计时器迁移到仍在线的 CPU。
+///
+/// sleeper 的任务放置与 timer 所有权彼此独立；新所有者只负责在期限到达时触发
+/// 常规 enqueue，最终 runqueue 仍由任务亲和性和放置快照决定。
+fn migrate_deadline_owners(source_cpu: usize, target_cpu: usize) {
+    {
+        let mut sleepers = TIMED_SLEEPERS.lock();
+        for entry in sleepers.iter_mut() {
+            if entry.cpu_id == source_cpu {
+                entry.cpu_id = target_cpu;
+            }
+        }
+    }
+    let mut timers = REALTIME_ITIMERS.lock();
+    for entry in timers.iter_mut() {
+        if entry.cpu_id == source_cpu {
+            entry.cpu_id = target_cpu;
         }
     }
 }
 
-fn fire_expired_realtime_itimers(now_ns: u64) {
+fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
+    let mut sleepers = TIMED_SLEEPERS.lock();
+    let mut index = 0;
+    while index < sleepers.len() {
+        let Some(task) = sleepers[index].task.upgrade() else {
+            sleepers.swap_remove(index);
+            continue;
+        };
+        if sleepers[index].cpu_id == cpu_id && sleepers[index].deadline_ns <= now_ns {
+            sleepers.swap_remove(index);
+            return Some(task);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn wake_expired_sleepers(now_ns: u64, cpu_id: usize) -> bool {
+    let mut woke = false;
+    while let Some(task) = take_expired_sleeper(now_ns, cpu_id) {
+        if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+            task.mark_profile_woken(now_ns);
+            enqueue_task_preferred(task, now_ns);
+            woke = true;
+        }
+    }
+    woke
+}
+
+fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
     let expired = {
         let mut timers = REALTIME_ITIMERS.lock();
         let mut expired = Vec::new();
@@ -1271,7 +1550,7 @@ fn fire_expired_realtime_itimers(now_ns: u64) {
                 timers.swap_remove(idx);
                 continue;
             };
-            if timers[idx].deadline_ns > now_ns {
+            if timers[idx].cpu_id != cpu_id || timers[idx].deadline_ns > now_ns {
                 idx += 1;
                 continue;
             }
@@ -1297,9 +1576,11 @@ fn fire_expired_realtime_itimers(now_ns: u64) {
         expired
     };
 
+    let fired = !expired.is_empty();
     for tg in expired {
         deliver_sigalrm_to_thread_group(&tg);
     }
+    fired
 }
 
 fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
@@ -1696,6 +1977,8 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         return;
     }
     if target.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+        #[cfg(feature = "performance-profile")]
+        target.mark_profile_woken(now_ns_internal());
         enqueue_task(Arc::clone(target), now_ns_internal());
     }
     // Running / Runnable：pending 位已经设好；下一轮 schedule 自然会检查。
@@ -1749,6 +2032,7 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn schedule_once(now_ns: u64) {
+    drain_deferred_timer_tick();
     let cpu_id = cpu();
     cleanup_retired_tasks(cpu_id);
 
@@ -1798,6 +2082,15 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    let account_now_ns = if now_ns == 0 {
+        now_ns_internal()
+    } else {
+        now_ns
+    };
+    #[cfg(feature = "performance-profile")]
+    profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
+    prev.account_switch_out(account_now_ns);
+    next.account_switch_in(account_now_ns);
     prev.record_involuntary_context_switch();
     let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
 
@@ -1854,21 +2147,61 @@ pub fn schedule_once(now_ns: u64) {
 
 // ── 定时器 / 抢占 ─────────────────────────────────────────────────────────────
 
+/// 记录一次发生在内核临界区中的 timer tick，等待下一处安全调度边界处理。
+pub fn defer_timer_tick(now_ns: u64) {
+    if INIT_READY.load(Ordering::Acquire) {
+        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()], now_ns);
+    }
+}
+
+/// 在不持有调度器内部锁的边界消费本 CPU 延迟的 timer tick。
+pub fn drain_deferred_timer_tick() {
+    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    if now_ns != 0 {
+        let _ = on_timer_tick_inner(now_ns);
+    }
+}
+
 /// 定时器中断回调。推进 current 的虚拟时间，若时间片用完则请求 reschedule。
-/// 真正的切换由 trap 返回路径上的 [`preempt_if_needed`] 完成——本函数仅
-/// 记录意图，避免在 IRQ 上下文里持锁切换造成栈污染。
+///
+/// 真正的切换由 trap 返回路径上的 [`preempt_if_needed`] 完成。返回值表示本次
+/// tick 是否唤醒 deadline sleeper 或触发实时计时器，供架构层优先调度。
 ///
 /// TODO(smp): 每个 AP 的本地 timer 中断都必须调用该接口。
-pub fn on_timer_tick(now_ns: u64) {
+pub fn on_timer_tick(now_ns: u64) -> bool {
     if !INIT_READY.load(Ordering::Acquire) {
-        return;
+        return false;
     }
-    wake_expired_sleepers(now_ns);
-    fire_expired_realtime_itimers(now_ns);
+    let deferred_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    on_timer_tick_inner(now_ns.max(deferred_ns))
+}
+
+pub(crate) fn record_deferred_timer_tick(slot: &AtomicU64, now_ns: u64) {
+    slot.fetch_max(now_ns, Ordering::AcqRel);
+}
+
+pub(crate) fn take_deferred_timer_tick(slot: &AtomicU64) -> u64 {
+    slot.swap(0, Ordering::AcqRel)
+}
+
+fn on_timer_tick_inner(now_ns: u64) -> bool {
+    fire_expired_deadline_observers(now_ns);
     let cpu_id = cpu();
+    let deadline_fired = wake_expired_sleepers(now_ns, cpu_id);
+    let realtime_fired = fire_expired_realtime_itimers(now_ns, cpu_id);
+    reprogram_deadline_timer();
     if SCHEDULER.cpu_or_boot(cpu_id).runqueue().tick(now_ns) {
         request_resched(cpu_id);
     }
+    deadline_fired || realtime_fired
+}
+
+/// 读取当前任务真实 CPU 时间的无分配回调。
+pub fn current_task_cpu_time_ns() -> u64 {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    current_task_ref().cpu_runtime_ns(now_ns_internal())
 }
 
 /// 在合适的边界（trap 返回前、syscall 返回前、显式让渡入口）调用。读到
@@ -1975,9 +2308,9 @@ pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
     // 任务可能登记在任一 CPU 的 rq 上；远端 current 不能被本 CPU 直接摘掉，
     // 只能请求对方在调度边界观察到新状态后自行切走。
     #[cfg(feature = "trace-task-lifecycle")]
-    let removed = dequeue_for_state_change(task, 0);
+    let removed = dequeue_for_state_change(task, now_ns_internal());
     #[cfg(not(feature = "trace-task-lifecycle"))]
-    let _ = dequeue_for_state_change(task, 0);
+    let _ = dequeue_for_state_change(task, now_ns_internal());
     task.mark_exited(code);
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
@@ -2040,4 +2373,38 @@ fn stopped_signal_is_fatal(target: &Arc<Task>, info: &SigInfo) -> bool {
         default_action(info.sig),
         DefaultAction::Term | DefaultAction::Core
     )
+}
+
+#[cfg(test)]
+mod deadline_observer_tests {
+    use super::*;
+    use core::sync::atomic::AtomicU64;
+
+    struct RearmObserver(AtomicU64);
+
+    impl DeadlineObserver for RearmObserver {
+        fn deadline_expired(&self, _registration: u64, now_ns: u64) -> Option<u64> {
+            let calls = self.0.fetch_add(1, Ordering::AcqRel) + 1;
+            (calls == 1).then_some(now_ns.saturating_add(10))
+        }
+    }
+
+    #[test]
+    fn periodic_deadline_reuses_registration_until_observer_stops() {
+        let observer = Arc::new(RearmObserver(AtomicU64::new(0)));
+        let subscriber: Arc<dyn DeadlineObserver> = observer.clone();
+        let registration = reserve_deadline_observer_id();
+        let deadline = u64::MAX - 100;
+        assert!(register_deadline_observer(
+            registration,
+            deadline,
+            Arc::downgrade(&subscriber),
+        ));
+        fire_expired_deadline_observers(deadline - 1);
+        assert_eq!(observer.0.load(Ordering::Acquire), 0);
+        fire_expired_deadline_observers(deadline);
+        assert_eq!(observer.0.load(Ordering::Acquire), 1);
+        fire_expired_deadline_observers(deadline + 10);
+        assert_eq!(observer.0.load(Ordering::Acquire), 2);
+    }
 }

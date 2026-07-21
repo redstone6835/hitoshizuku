@@ -13,7 +13,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use general::TaskOps;
 use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
 
-use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns};
+use crate::riscv64::specific::{
+    HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id, kernel_timestamp_ns,
+};
 use crate::riscv64::task::Riscv64TaskOps;
 use crate::riscv64::trap::Riscv64InterruptOps;
 
@@ -25,20 +27,20 @@ pub(crate) const KCTX_ALIGN: usize = 16;
 //   +0x20 s2    +0x28 s3    +0x30 s4    +0x38 s5
 //   +0x40 s6    +0x48 s7    +0x50 s8    +0x58 s9
 //   +0x60 s10   +0x68 s11
-const RA_OFF: usize = 0x00;
-const SP_OFF: usize = 0x08;
-const S0_OFF: usize = 0x10;
-const S1_OFF: usize = 0x18;
-const S2_OFF: usize = 0x20;
-const S3_OFF: usize = 0x28;
-const S4_OFF: usize = 0x30;
-const S5_OFF: usize = 0x38;
-const S6_OFF: usize = 0x40;
-const S7_OFF: usize = 0x48;
-const S8_OFF: usize = 0x50;
-const S9_OFF: usize = 0x58;
-const S10_OFF: usize = 0x60;
-const S11_OFF: usize = 0x68;
+const RA_OFFSET: usize = 0x00;
+const SP_OFFSET: usize = 0x08;
+const S0_OFFSET: usize = 0x10;
+const S1_OFFSET: usize = 0x18;
+const S2_OFFSET: usize = 0x20;
+const S3_OFFSET: usize = 0x28;
+const S4_OFFSET: usize = 0x30;
+const S5_OFFSET: usize = 0x38;
+const S6_OFFSET: usize = 0x40;
+const S7_OFFSET: usize = 0x48;
+const S8_OFFSET: usize = 0x50;
+const S9_OFFSET: usize = 0x58;
+const S10_OFFSET: usize = 0x60;
+const S11_OFFSET: usize = 0x68;
 
 /// # Safety
 ///
@@ -50,16 +52,22 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
     unsafe {
         core::ptr::write_bytes(base, 0, KCTX_SIZE);
         let w = |off: usize, v: usize| (base.add(off) as *mut usize).write(v);
-        w(RA_OFF, __kthread_trampoline as usize);
-        w(SP_OFF, stack_top & !0xF); // 保证 16 字节对齐
-        w(S0_OFF, entry as usize);
-        w(S1_OFF, arg);
+        w(RA_OFFSET, __kthread_trampoline as usize);
+        w(SP_OFFSET, stack_top & !0xF); // 保证 16 字节对齐
+        w(S0_OFFSET, entry as usize);
+        w(S1_OFFSET, arg);
     }
 }
 
 #[unsafe(naked)]
 unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
     core::arch::naked_asm!(
+        // fast syscall 可在内部阻塞并切走，随后从同一内核调用点继续。递增 per-hart
+        // 序号，使返回汇编能够判断硬件 FPR 是否可能已被其它任务替换。
+        "ld t0, {switch_seq}(tp)",
+        "addi t0, t0, 1",
+        "sd t0, {switch_seq}(tp)",
+
         "sd ra,  {ra}(a0)",
         "sd sp,  {sp}(a0)",
         "sd s0,  {s0}(a0)",
@@ -91,13 +99,14 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         "ld s11, {s11}(a1)",
 
         "ret",
-        ra = const RA_OFF, sp = const SP_OFF,
-        s0 = const S0_OFF, s1 = const S1_OFF,
-        s2 = const S2_OFF, s3 = const S3_OFF,
-        s4 = const S4_OFF, s5 = const S5_OFF,
-        s6 = const S6_OFF, s7 = const S7_OFF,
-        s8 = const S8_OFF, s9 = const S9_OFF,
-        s10 = const S10_OFF, s11 = const S11_OFF,
+        ra = const RA_OFFSET, sp = const SP_OFFSET,
+        s0 = const S0_OFFSET, s1 = const S1_OFFSET,
+        s2 = const S2_OFFSET, s3 = const S3_OFFSET,
+        s4 = const S4_OFFSET, s5 = const S5_OFFSET,
+        s6 = const S6_OFFSET, s7 = const S7_OFFSET,
+        s8 = const S8_OFFSET, s9 = const S9_OFFSET,
+        s10 = const S10_OFFSET, s11 = const S11_OFFSET,
+        switch_seq = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,
     );
 }
 
@@ -159,6 +168,7 @@ pub fn register() {
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
         sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
+        sched::arch_hooks::register_cpu_control(&super::smp::CPU_CONTROL_OPS);
         crate::riscv64::mm::register();
         crate::riscv64::syscall::register();
     }
