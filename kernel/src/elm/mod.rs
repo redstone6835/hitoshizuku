@@ -386,7 +386,7 @@ fn load_build_bound_module(
     Ok(elm_model::ElmId(response.cell_id))
 }
 
-#[cfg(feature = "network-tests")]
+#[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 pub(crate) fn detach_build_bound_module_for_test(name: &str) -> Result<elm_model::ElmId, String> {
     let cell = with_core(|core| {
         core.cells()
@@ -416,7 +416,7 @@ pub(crate) fn detach_build_bound_module_for_test(name: &str) -> Result<elm_model
     Ok(cell)
 }
 
-#[cfg(feature = "network-tests")]
+#[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 pub(crate) fn reload_build_bound_module_for_test(
     init: &Arc<Task>,
     name: &str,
