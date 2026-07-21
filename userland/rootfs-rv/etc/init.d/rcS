@@ -71,9 +71,10 @@ maybe_enter_shell() {
 }
 
 # 两套 libc 测试环境分别持有策略。glibc 暂不运行 libctest；musl 不运行依赖
-# 完整根环境的 CAgent。BuildStorm 另在调度入口临时硬屏蔽。
+# CAgent 需要完整根环境；BuildStorm 默认启用，可通过 buildstorm=0 临时关闭。
 GLIBC_BLACKLIST="unixbench libctest"
 MUSL_BLACKLIST="unixbench copy-file-range interuppts splice cagent buildstorm"
+BUILDSTORM_ENABLED=1
 
 if [ -r /sys/kernel/cmdline ]; then
     for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
@@ -94,6 +95,12 @@ if [ -r /sys/kernel/cmdline ]; then
             musl_blacklist=none) MUSL_BLACKLIST="" ;;
             musl_blacklist=*)
                 MUSL_BLACKLIST="$(printf '%s' "${arg#musl_blacklist=}" | tr ',' ' ')"
+                ;;
+            buildstorm=1|buildstorm=on|buildstorm=yes)
+                BUILDSTORM_ENABLED=1
+                ;;
+            buildstorm=0|buildstorm=off|buildstorm=no)
+                BUILDSTORM_ENABLED=0
                 ;;
         esac
     done
@@ -445,8 +452,14 @@ run_test_script_file() {
 
     case "$name" in
         buildstorm_testcode.sh)
-            echo "[init] skip $libc_name/$name (temporarily disabled)"
-            return 0
+            if [ "$BUILDSTORM_ENABLED" != "1" ]; then
+                echo "[init] skip $libc_name/$name (temporarily disabled)"
+                return 0
+            fi
+            if [ "$libc_name" != "glibc" ]; then
+                echo "[init] skip $libc_name/$name (requires glibc chroot)"
+                return 0
+            fi
             ;;
         cagent_testcode.sh)
             if [ "$libc_name" != "glibc" ]; then
