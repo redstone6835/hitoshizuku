@@ -39,6 +39,8 @@ use crate::group::{ProcessGroup, ThreadGroup};
 use crate::ids::Credentials;
 use crate::pid::{PidNamespace, PidT};
 use crate::placement::{PlacementSnapshot, TaskPlacement};
+use crate::rseq::{RseqEvent, RseqEvents};
+use crate::sched_class::{RT_PRIO_MAX, SchedAttr, SchedPolicy};
 use crate::signal::{SharedSignal, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
@@ -142,7 +144,75 @@ pub struct RobustListState {
     pub len: usize,
 }
 
-/// 每线程 rseq 注册状态。当前仅作为 ABI 占位，不执行 rseq 快路径。
+#[derive(Clone, Copy)]
+struct PiDonation {
+    token: usize,
+    attr: SchedAttr,
+}
+
+struct PiState {
+    base: SchedAttr,
+    donations: Vec<PiDonation>,
+}
+
+impl PiState {
+    fn new(base: SchedAttr) -> Self {
+        Self {
+            base: base.normalized(),
+            donations: Vec::new(),
+        }
+    }
+
+    fn effective(&self) -> SchedAttr {
+        let mut effective = self.base;
+        for donation in &self.donations {
+            effective = more_urgent(effective, donation.attr);
+        }
+        effective
+    }
+}
+
+/// 比较 PI donation 的调度紧迫程度。
+///
+/// RT waiter 可以把普通任务提升到 RT；同为 fair 时继承更高权重（更小
+/// nice）。Deadline donation 暂时折算为最高 RT，避免把 owner 的 deadline
+/// 带宽状态伪造成另一份 admission reservation。
+fn more_urgent(current: SchedAttr, donated: SchedAttr) -> SchedAttr {
+    match donated.policy {
+        SchedPolicy::Deadline => {
+            if current.policy == SchedPolicy::Deadline {
+                current
+            } else {
+                SchedAttr::rt_fifo(RT_PRIO_MAX)
+            }
+        }
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
+            let donated_prio = donated.priority;
+            match current.policy {
+                SchedPolicy::Deadline => current,
+                SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin
+                    if current.priority >= donated_prio =>
+                {
+                    current
+                }
+                SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => SchedAttr::rt_fifo(donated_prio),
+                _ => SchedAttr::rt_fifo(donated_prio),
+            }
+        }
+        SchedPolicy::Fair => {
+            if current.policy == SchedPolicy::Fair && donated.nice < current.nice {
+                let mut boosted = current;
+                boosted.nice = donated.nice;
+                boosted
+            } else {
+                current
+            }
+        }
+        SchedPolicy::Idle => current,
+    }
+}
+
+/// 每线程 rseq 注册状态。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RseqRegistration {
     pub ptr: usize,
@@ -495,8 +565,14 @@ pub struct Task {
     clear_child_tid: AtomicUsize,
     /// `set_robust_list` 注册的每线程 robust futex 链表。
     robust_list: Spinlock<RobustListState>,
-    /// `rseq` 注册状态。完整 restartable sequence 语义后续由 arch/trap 接入。
+    /// PI futex 的基础调度属性和当前 donation。该状态与 sched entity 分开保存，
+    /// 这样解除最后一个 donation 时可以恢复用户实际设置的基础属性。
+    pi: Spinlock<PiState>,
+    /// `rseq` 注册状态与尚未在返回用户态边界消费的调度事件。
     rseq: Spinlock<RseqRegistration>,
+    rseq_events: AtomicU8,
+    /// 最近一次实际向用户态发布的 CPU；`usize::MAX` 表示尚未发布。
+    rseq_cpu: AtomicUsize,
     /// `sigaltstack(2)` 的 per-thread alternate signal stack。
     sigaltstack: Spinlock<SigAltStack>,
     /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
@@ -516,6 +592,14 @@ pub struct Task {
     wakeup_ns: AtomicU64,
     #[cfg(feature = "performance-profile")]
     wait_reason: AtomicU8,
+    #[cfg(feature = "performance-profile")]
+    wait_cpu: AtomicUsize,
+    #[cfg(feature = "performance-profile")]
+    wait_trace_emitted: AtomicBool,
+    #[cfg(feature = "performance-profile")]
+    wait_generation: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_span_id: AtomicU64,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -603,7 +687,10 @@ impl Task {
             vforking: AtomicBool::new(false),
             clear_child_tid: AtomicUsize::new(0),
             robust_list: Spinlock::new(RobustListState::default()),
+            pi: Spinlock::new(PiState::new(SchedAttr::from(params))),
             rseq: Spinlock::new(RseqRegistration::default()),
+            rseq_events: AtomicU8::new(0),
+            rseq_cpu: AtomicUsize::new(usize::MAX),
             sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
             start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
@@ -616,6 +703,14 @@ impl Task {
             wakeup_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             wait_reason: AtomicU8::new(WaitReason::Other as u8),
+            #[cfg(feature = "performance-profile")]
+            wait_cpu: AtomicUsize::new(profiling::MIXED_CPU),
+            #[cfg(feature = "performance-profile")]
+            wait_trace_emitted: AtomicBool::new(false),
+            #[cfg(feature = "performance-profile")]
+            wait_generation: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_span_id: AtomicU64::new(0),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -783,6 +878,9 @@ impl Task {
         self.wait_stop_pending.store(0, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
         self.set_state(TaskState::Zombie);
+        if let Some(hook) = exit_accounting_hook() {
+            hook.account_on_exit(self);
+        }
         self.exit_waiters.wake_all();
     }
 
@@ -1191,11 +1289,39 @@ impl Task {
     }
 
     pub fn set_rseq_registration(&self, registration: RseqRegistration) {
+        self.rseq_events.store(0, Ordering::Release);
+        self.rseq_cpu.store(usize::MAX, Ordering::Release);
         *self.rseq.lock() = registration;
     }
 
     pub fn clear_rseq_registration(&self) {
         *self.rseq.lock() = RseqRegistration::default();
+        self.rseq_events.store(0, Ordering::Release);
+        self.rseq_cpu.store(usize::MAX, Ordering::Release);
+    }
+
+    pub fn mark_rseq_event(&self, event: RseqEvent) {
+        if self.rseq_registration().registered {
+            self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
+        }
+    }
+
+    pub fn rseq_events(&self) -> RseqEvents {
+        RseqEvents::from_bits(self.rseq_events.load(Ordering::Acquire))
+    }
+
+    pub fn clear_rseq_events(&self, events: RseqEvents) {
+        self.rseq_events.fetch_and(!events.bits(), Ordering::AcqRel);
+    }
+
+    pub fn publish_rseq_cpu(&self, cpu_id: usize) {
+        if !self.rseq_registration().registered {
+            return;
+        }
+        let previous = self.rseq_cpu.swap(cpu_id, Ordering::AcqRel);
+        if previous != usize::MAX && previous != cpu_id {
+            self.mark_rseq_event(RseqEvent::Migrate);
+        }
     }
 
     pub fn sigaltstack(&self) -> SigAltStack {
@@ -1290,7 +1416,16 @@ impl Task {
     pub fn begin_profile_wait(&self, reason: WaitReason, now_ns: u64) {
         #[cfg(feature = "performance-profile")]
         {
+            if !profiling::enabled() {
+                self.cancel_profile_wait();
+                return;
+            }
             self.wait_reason.store(reason as u8, Ordering::Release);
+            self.wait_cpu
+                .store(profiling::current_cpu_slot(), Ordering::Release);
+            self.wait_trace_emitted.store(false, Ordering::Release);
+            self.wait_generation
+                .store(profiling::generation(), Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
             self.wait_started_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -1305,7 +1440,47 @@ impl Task {
         {
             self.wait_started_ns.store(0, Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
+            self.wait_cpu.store(profiling::MIXED_CPU, Ordering::Release);
+            self.wait_trace_emitted.store(false, Ordering::Release);
+            self.wait_generation.store(0, Ordering::Release);
         }
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_span_id(&self) -> u64 {
+        self.profile_span_id.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn set_profile_span_id(&self, span_id: u64) {
+        self.profile_span_id.store(span_id, Ordering::Release);
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub(crate) fn mark_profile_blocked(&self) {
+        if !profiling::enabled()
+            || self.wait_generation.load(Ordering::Acquire) != profiling::generation()
+        {
+            self.cancel_profile_wait();
+            return;
+        }
+        if self.wait_started_ns.load(Ordering::Acquire) == 0
+            || self.wait_trace_emitted.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let reason = WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire));
+        profiling::trace_task_event_with_span(
+            profiling::TraceKind::TaskBlock,
+            reason.profile_event(),
+            self.pid_root_cached().unwrap_or(0) as u64,
+            self.profile_span_id(),
+            reason as u64,
+            self.wait_cpu.load(Ordering::Acquire) as u64,
+        );
     }
 
     #[inline]
@@ -1313,13 +1488,30 @@ impl Task {
         #[cfg(feature = "performance-profile")]
         {
             let encoded = self.wait_started_ns.swap(0, Ordering::AcqRel);
+            let wait_generation = self.wait_generation.swap(0, Ordering::AcqRel);
             if encoded == 0 {
                 return;
             }
-            #[cfg(feature = "performance-profile")]
-            profiling::record_duration(
-                WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire)).profile_event(),
-                now_ns.saturating_sub(encoded - 1),
+            if !profiling::enabled() || wait_generation != profiling::generation() {
+                self.wait_trace_emitted.store(false, Ordering::Release);
+                self.wakeup_ns.store(0, Ordering::Release);
+                return;
+            }
+            if !self.wait_trace_emitted.swap(false, Ordering::AcqRel) {
+                self.wakeup_ns.store(0, Ordering::Release);
+                return;
+            }
+            let reason = WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire));
+            let duration_ns = now_ns.saturating_sub(encoded - 1);
+            let origin_cpu = self.wait_cpu.load(Ordering::Acquire);
+            profiling::record_duration_on_cpu(reason.profile_event(), duration_ns, origin_cpu);
+            profiling::trace_task_event_with_span(
+                profiling::TraceKind::TaskWake,
+                reason.profile_event(),
+                self.pid_root_cached().unwrap_or(0) as u64,
+                self.profile_span_id(),
+                duration_ns,
+                origin_cpu as u64,
             );
             self.wakeup_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -1367,6 +1559,79 @@ impl Task {
 
     pub fn set_sched_reset_on_fork(&self, enabled: bool) {
         self.sched_reset_on_fork.store(enabled, Ordering::Release);
+    }
+
+    /// 设置用户请求的基础调度属性，同时重新计算 PI donation 后的有效属性。
+    /// runqueue 锁由调用方持有；这里不直接改变队列索引。
+    pub(crate) fn set_sched_attr(&self, attr: SchedAttr) {
+        let effective = {
+            let mut pi = self.pi.lock();
+            pi.base = attr.normalized();
+            pi.effective()
+        };
+        self.sched.set_sched_attr(effective);
+    }
+
+    pub(crate) fn set_sched_params(&self, params: SchedParams) {
+        let effective = {
+            let mut pi = self.pi.lock();
+            if pi.donations.is_empty() {
+                pi.base = self.sched.sched_attr();
+            }
+            pi.base.nice = params.nice;
+            pi.base.slice_ns = params.slice();
+            pi.base = pi.base.normalized();
+            pi.effective()
+        };
+        self.sched.set_sched_attr(effective);
+    }
+
+    pub(crate) fn set_nice(&self, nice: i8) {
+        let effective = {
+            let mut pi = self.pi.lock();
+            if pi.donations.is_empty() {
+                pi.base = self.sched.sched_attr();
+            }
+            pi.base.nice = nice;
+            pi.base = pi.base.normalized();
+            pi.effective()
+        };
+        self.sched.set_sched_attr(effective);
+    }
+
+    /// 登记一个 PI waiter 的 donation，返回 owner 应采用的有效属性。
+    pub fn pi_add_donation(&self, token: usize, attr: SchedAttr) -> SchedAttr {
+        let mut pi = self.pi.lock();
+        if let Some(existing) = pi.donations.iter_mut().find(|d| d.token == token) {
+            existing.attr = attr.normalized();
+        } else {
+            pi.donations.push(PiDonation {
+                token,
+                attr: attr.normalized(),
+            });
+        }
+        pi.effective()
+    }
+
+    /// 移除一个 PI waiter 的 donation，返回 owner 恢复后的有效属性。
+    pub fn pi_remove_donation(&self, token: usize) -> SchedAttr {
+        let mut pi = self.pi.lock();
+        pi.donations.retain(|donation| donation.token != token);
+        pi.effective()
+    }
+
+    pub fn pi_effective_attr(&self) -> SchedAttr {
+        self.pi.lock().effective()
+    }
+
+    pub fn pi_base_attr(&self) -> SchedAttr {
+        self.pi.lock().base
+    }
+
+    /// PI donation 存在时，任务可能是必须运行的锁 owner；RT bandwidth
+    /// 节流不能阻止它运行到释放所持有的 PI 锁。
+    pub(crate) fn pi_is_boosted(&self) -> bool {
+        !self.pi.lock().donations.is_empty()
     }
 
     // ── CPU 亲和性 ───────────────────────────────────────────────────────
@@ -1656,9 +1921,17 @@ pub trait TaskPreExitHook: Send + Sync {
     fn cleanup_before_exit(&self, task: &Arc<Task>);
 }
 
+/// 任务进入 Zombie 时的记账 hook。调用点早于 exit waiter 唤醒，避免父进程
+/// 在 wait 返回后看不到已经退出的进程记账记录。
+pub trait TaskExitAccountingHook: Send + Sync {
+    fn account_on_exit(&self, task: &Task);
+}
+
 static EXT_CLONE_HOOK: Spinlock<Option<&'static dyn TaskExtCloneHook>> = Spinlock::new(None);
 static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
 static PRE_EXIT_HOOK: Spinlock<Option<&'static dyn TaskPreExitHook>> = Spinlock::new(None);
+static EXIT_ACCOUNTING_HOOK: Spinlock<Option<&'static dyn TaskExitAccountingHook>> =
+    Spinlock::new(None);
 
 /// 注册全局 ext clone hook。kernel 启动期调用一次。
 pub fn register_ext_clone_hook(hook: &'static dyn TaskExtCloneHook) {
@@ -1688,4 +1961,12 @@ pub fn register_pre_exit_hook(hook: &'static dyn TaskPreExitHook) {
 /// 取已注册的 pre-exit hook；未注册返回 `None`。
 pub fn pre_exit_hook() -> Option<&'static dyn TaskPreExitHook> {
     *PRE_EXIT_HOOK.lock()
+}
+
+pub fn register_exit_accounting_hook(hook: &'static dyn TaskExitAccountingHook) {
+    *EXIT_ACCOUNTING_HOOK.lock() = Some(hook);
+}
+
+fn exit_accounting_hook() -> Option<&'static dyn TaskExitAccountingHook> {
+    *EXIT_ACCOUNTING_HOOK.lock()
 }

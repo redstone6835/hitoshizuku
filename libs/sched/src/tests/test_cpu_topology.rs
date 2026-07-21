@@ -5,9 +5,7 @@ use core::cell::Cell;
 use ktest::ktest;
 
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, ROOT_SCHED_DOMAIN_ID, SchedDomain, SchedTopology};
-use crate::scheduler::{
-    RunqueueLoadSnapshot, deadline_has_capacity, select_balance_source_for_class,
-};
+use crate::scheduler::{RunqueueLoadSnapshot, select_balance_source_for_class};
 use crate::{NR_CPUS, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedClass, supported_cpu_mask};
 
 fn class_load(class: SchedClass, tasks: usize) -> RunqueueClassLoad {
@@ -400,15 +398,6 @@ fn deadline_balance_does_not_move_single_task() {
         |cpu| class_load(SchedClass::Deadline, if cpu.get() == 0 { 2 } else { 0 }),
     );
     assert_eq!(overloaded, CpuId::new(0));
-}
-
-#[ktest]
-fn deadline_balance_checks_target_capacity() {
-    let mut target = RunqueueClassLoad::default();
-    target.deadline_utilization = 800;
-
-    assert!(deadline_has_capacity(target, 200, SCHED_CAPACITY_SCALE));
-    assert!(!deadline_has_capacity(target, 300, SCHED_CAPACITY_SCALE));
 }
 
 #[ktest]

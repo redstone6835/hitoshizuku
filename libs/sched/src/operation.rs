@@ -22,7 +22,8 @@ use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
 use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
-use crate::sched_class::SchedAttr;
+use crate::rseq::RseqEvent;
+use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
     migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
@@ -309,7 +310,7 @@ pub fn sched_yield() -> Result<(), Errno> {
 /// `nice(inc)`：相对当前 nice 调整，结果钳到 [-20, 19]。返回新 nice 值。
 pub fn nice(inc: i32) -> Result<i32, Errno> {
     let me = current_task();
-    let cur_nice = me.sched.nice() as i32;
+    let cur_nice = me.pi_base_attr().nice as i32;
     let mut new_nice = cur_nice.saturating_add(inc);
     if new_nice < -20 {
         new_nice = -20;
@@ -353,9 +354,27 @@ pub fn sched_setattr(pid: PidT, attr: SchedAttr) -> Result<(), Errno> {
 
 pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
     let attr = attr.validate()?;
-    update_task_sched_entity(task, |cpu_id, task, now_ns| {
-        runqueue_of(cpu_id).update_sched_attr(task, attr, now_ns)
+    let now_ns = crate::scheduler::now_ns_public();
+    let owner = task_runqueue_cpu(task).unwrap_or_else(CpuId::boot);
+    let capacity = crate::scheduler::cpu_capacity(owner);
+    crate::scheduler::deadline_admission().update_attr(task, owner, attr, capacity, || {
+        runqueue_of(owner.get()).update_sched_attr(task, attr, now_ns)
     })
+}
+
+/// 应用 PI 子系统已经计算出的有效调度属性。
+///
+/// 该入口不改写用户设置的基础属性，也不创建新的 Deadline 带宽 reservation；
+/// PI 解除后调用方必须再次传入 `Task::pi_remove_donation` 返回的属性。
+pub fn pi_apply_effective_attr(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
+    let owner = task_runqueue_cpu(task).unwrap_or_else(CpuId::boot).get();
+    let result = update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_sched_attr_raw(task, attr.normalized(), now_ns)
+    });
+    if result.is_ok() {
+        request_resched(owner);
+    }
+    result
 }
 
 fn update_task_sched_entity(
@@ -378,7 +397,7 @@ pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
 }
 
 pub fn sched_getattr_for_task(task: &Arc<Task>) -> SchedAttr {
-    task.sched.sched_attr()
+    task.pi_base_attr()
 }
 
 pub fn set_sched_reset_on_fork(pid: PidT, enabled: bool) -> Result<(), Errno> {
@@ -391,7 +410,7 @@ pub fn sched_reset_on_fork(pid: PidT) -> Result<bool, Errno> {
 }
 
 pub fn set_task_nice(task: &Arc<Task>, nice: i8) {
-    let mut attr = task.sched.sched_attr();
+    let mut attr = task.pi_base_attr();
     attr.nice = nice.clamp(crate::eevdf::NICE_MIN, crate::eevdf::NICE_MAX);
     let owner = task_runqueue_cpu(task).map_or(0, CpuId::get);
     runqueue_of(owner).update_sched_attr(task, attr, crate::scheduler::now_ns_public());
@@ -441,8 +460,8 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
     if requested.intersection(online).is_empty() {
         return Err(Errno::EINVAL);
     }
-    let supported = requested.bits();
-    task.set_cpu_affinity(supported);
+    let old_affinity = task.cpu_affinity();
+    task.set_cpu_affinity(requested.bits());
 
     let current_cpu = task.current_cpu();
     let current = CpuId::new(current_cpu);
@@ -450,15 +469,37 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
         return Ok(());
     }
 
-    let target = select_cpu_for_mask(requested, current, false).map(|cpu| cpu.get());
+    let target = if task.sched.policy() == SchedPolicy::Deadline {
+        requested
+            .intersection(online)
+            .iter()
+            .filter(|cpu| {
+                crate::scheduler::deadline_admission().can_migrate(
+                    task,
+                    *cpu,
+                    crate::scheduler::cpu_capacity(*cpu),
+                )
+            })
+            .min_by_key(|cpu| crate::scheduler::deadline_admission().reserved(*cpu))
+            .map(CpuId::get)
+    } else {
+        select_cpu_for_mask(requested, current, false).map(CpuId::get)
+    };
 
     if let Some(target_cpu) = target {
-        if migrate_task(task, target_cpu).is_err() {
+        if let Err(error) = migrate_task(task, target_cpu) {
+            if task.sched.policy() == SchedPolicy::Deadline {
+                task.set_cpu_affinity(old_affinity);
+                return Err(error);
+            }
             request_balance(target_cpu);
             if current_cpu < NR_CPUS {
                 request_resched(current_cpu);
             }
         }
+    } else if task.sched.policy() == SchedPolicy::Deadline {
+        task.set_cpu_affinity(old_affinity);
+        return Err(Errno::EBUSY);
     } else if current_cpu < NR_CPUS {
         request_resched(current_cpu);
     }
@@ -663,7 +704,7 @@ pub fn clone_with_context_outcome(
     Ok(CloneOutcome { pid, child })
 }
 
-fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
+pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
     let flags = args.flags;
     const KNOWN: u64 = CloneFlags::CSIGNAL
         | CloneFlags::CLONE_VM
@@ -701,6 +742,9 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_IO;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
+        return Err(Errno::EINVAL);
+    }
+    if flags.has(CloneFlags::CLONE_SIGHAND) && flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
         return Err(Errno::EINVAL);
     }
     if (flags.raw() & !KNOWN) != 0 || (flags.raw() & UNSUPPORTED) != 0 || args.cgroup != 0 {
@@ -1594,29 +1638,84 @@ pub fn deliver_pending_signals_for_task(
         }
         SigHandler::Ignore => None,
         SigHandler::Handler(_) => {
-            let Some(ops) = process_image_ops() else {
+            if process_image_ops().is_none() {
                 me.signal.deliver(info);
                 return Some(info);
-            };
-            match (ops.setup_signal_frame)(me, info, action, user_ctx) {
+            }
+            match setup_user_signal_frame_for_task(me, info, action, user_ctx) {
                 Ok(()) => None,
                 Err(Errno::ENOSYS) => {
                     me.signal.deliver(info);
                     Some(info)
                 }
-                Err(_) => {
-                    apply_default_action(SigInfo {
-                        sig: SignalNumber::SIGSEGV,
-                        code: 0,
-                        sender_pid: 0,
-                        sender_uid: crate::ids::Uid::ROOT,
-                        raw: None,
-                    });
-                    None
-                }
+                Err(_) => None,
             }
         }
     }
+}
+
+/// 在保存 signal frame 前先应用 rseq 的 SIGNAL 事件。
+pub fn setup_user_signal_frame_for_task(
+    task: &Arc<Task>,
+    info: SigInfo,
+    action: crate::signal::SigAction,
+    user_ctx: UserContextRef,
+) -> Result<(), Errno> {
+    if user_ctx.is_none() {
+        return Err(Errno::ENOSYS);
+    }
+    let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
+    task.mark_rseq_event(RseqEvent::Signal);
+    if (ops.prepare_user_return)(task, user_ctx).is_err() {
+        task.clear_rseq_registration();
+        apply_default_action(SigInfo {
+            sig: SignalNumber::SIGSEGV,
+            code: 0,
+            sender_pid: 0,
+            sender_uid: crate::ids::Uid::ROOT,
+            raw: None,
+        });
+        return Err(Errno::EFAULT);
+    }
+    match (ops.setup_signal_frame)(task, info, action, user_ctx) {
+        Ok(()) => Ok(()),
+        Err(Errno::ENOSYS) => Err(Errno::ENOSYS),
+        Err(error) => {
+            apply_default_action(SigInfo {
+                sig: SignalNumber::SIGSEGV,
+                code: 0,
+                sender_pid: 0,
+                sender_uid: crate::ids::Uid::ROOT,
+                raw: None,
+            });
+            Err(error)
+        }
+    }
+}
+
+/// 在即将恢复用户态时处理依赖当前 trap frame 的线程状态。
+pub fn prepare_user_return_for_task(
+    task: &Arc<Task>,
+    user_ctx: UserContextRef,
+) -> Result<(), Errno> {
+    if task.is_kernel_task() || user_ctx.is_none() {
+        return Ok(());
+    }
+    let Some(ops) = process_image_ops() else {
+        return Ok(());
+    };
+    let result = (ops.prepare_user_return)(task, user_ctx);
+    if result.is_err() {
+        task.clear_rseq_registration();
+        apply_default_action(SigInfo {
+            sig: SignalNumber::SIGSEGV,
+            code: 0,
+            sender_pid: 0,
+            sender_uid: crate::ids::Uid::ROOT,
+            raw: None,
+        });
+    }
+    result
 }
 
 pub fn apply_default_action(info: SigInfo) {

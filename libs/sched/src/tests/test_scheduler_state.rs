@@ -233,6 +233,44 @@ fn cpu_offline_drains_queued_tasks_to_active_cpu() {
 }
 
 #[ktest]
+fn cpu_offline_moves_sleeping_deadline_reservation() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_state(TaskState::Sleeping);
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    let attr = SchedAttr::deadline(500, 500, 1_000).normalized();
+    scheduler
+        .deadline_admission()
+        .update_attr(
+            &task,
+            CpuId::new(1).expect("cpu1"),
+            attr,
+            SCHED_CAPACITY_SCALE,
+            || {
+                task.sched.set_sched_attr(attr);
+                true
+            },
+        )
+        .expect("睡眠 Deadline 任务应准入");
+
+    offline_cpu_with_scheduler(&scheduler, 1, 2).expect("offline cpu1");
+
+    assert_eq!(task.state(), TaskState::Sleeping);
+    assert_eq!(task.placement().cpu, CpuId::new(0));
+    assert_eq!(
+        scheduler.deadline_admission().reservation_of(&task),
+        Some((CpuId::new(0).expect("cpu0"), 512))
+    );
+    assert_eq!(
+        enqueue_task_on_scheduler(&scheduler, Arc::clone(&task), 3, false, true),
+        0
+    );
+    assert!(scheduler.cpu_or_boot(0).runqueue().dequeue_queued(&task, 4));
+    scheduler.deadline_admission().release(&task);
+}
+
+#[ktest]
 fn cpu_offline_restores_source_when_affinity_has_no_target() {
     let scheduler = two_cpu_scheduler();
     let task = make_task();

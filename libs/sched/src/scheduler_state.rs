@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize
 use crate::cpu::{
     CpuId, CpuMask, MAX_CPUS, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedTopology,
 };
+use crate::deadline_admission::DeadlineAdmission;
 use crate::runqueue::{Runqueue, RunqueueClassLoad};
 use crate::sched_class::SchedClass;
 use crate::sync::Spinlock;
@@ -201,6 +202,7 @@ impl Drop for CpuEnqueueGuard<'_> {
 /// placement、域负载和迁移事务继续挂到该对象上，而不是重新引入旁路全局状态。
 pub struct Scheduler {
     cpus: [CpuSchedState; MAX_CPUS],
+    deadline_admission: DeadlineAdmission,
     online: AtomicU64,
     active: AtomicU64,
     topology: Spinlock<TopologyState>,
@@ -261,6 +263,7 @@ impl Scheduler {
     pub const fn new() -> Self {
         Self {
             cpus: [const { CpuSchedState::new() }; MAX_CPUS],
+            deadline_admission: DeadlineAdmission::new(),
             online: AtomicU64::new(CpuMask::BOOT.bits()),
             active: AtomicU64::new(CpuMask::BOOT.bits()),
             topology: Spinlock::new(TopologyState {
@@ -281,6 +284,10 @@ impl Scheduler {
 
     pub fn cpus(&self) -> &[CpuSchedState; MAX_CPUS] {
         &self.cpus
+    }
+
+    pub(crate) fn deadline_admission(&self) -> &DeadlineAdmission {
+        &self.deadline_admission
     }
 
     pub fn online_set(&self) -> CpuMask {

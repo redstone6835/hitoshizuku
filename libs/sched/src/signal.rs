@@ -506,6 +506,10 @@ impl SharedSignal {
     /// execve 时按 POSIX 重置信号处理：所有 caught 信号恢复为 SIG_DFL，
     /// SIG_IGN 保持（除 SIGCHLD 特殊情况）。SIGKILL/SIGSTOP 不可改，跳过。
     pub fn reset_handlers_for_exec(&self) {
+        self.reset_caught_handlers();
+    }
+
+    fn reset_caught_handlers(&self) {
         let mut guard = self.actions.lock();
         for sig_idx in 0..guard.len() {
             let sig = SignalNumber::from_raw(sig_idx as i32);

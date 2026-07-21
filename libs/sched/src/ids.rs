@@ -77,6 +77,7 @@ pub enum Capability {
     Setuid = 7,
     Setpcap = 8,
     NetBindService = 10,
+    SysPacct = 20,
     SysAdmin = 21,
     SysBoot = 22,
     SysNice = 23,
