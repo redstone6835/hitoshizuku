@@ -202,6 +202,43 @@ fn kheap_reuses_cached_base_ranges_without_registry_leak() {
     assert_eq!(after.kheap_active_allocs, before.kheap_active_allocs);
 }
 
+/// 中等大小的内核堆对象也应复用已建立的映射，避免每次 fork/exec 都修改全局页表。
+#[ktest]
+fn kheap_reuses_cached_medium_ranges_without_registry_leak() {
+    const SIZE: usize = 64 * 1024;
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let kheap_before = KERNEL_ALLOCATOR.layer_stats().kheap;
+
+    let first = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(MemoryDomain::Kernel, SIZE, PAGE_SIZE))
+        .expect("allocate medium cacheable kheap range");
+    assert_eq!(first.kind, AllocationKind::Large);
+    assert_eq!(first.order, 4);
+    KERNEL_ALLOCATOR
+        .deallocate(first.ptr)
+        .expect("cache medium kheap range");
+
+    let after_free = KERNEL_ALLOCATOR.layer_stats().kheap;
+    assert!(after_free.cache_inserts > kheap_before.cache_inserts);
+    assert!(after_free.cached_ranges > 0);
+
+    let second = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(MemoryDomain::Kernel, SIZE, PAGE_SIZE))
+        .expect("reuse medium cached kheap range");
+    assert_eq!(second.ptr, first.ptr);
+    let after_reuse = KERNEL_ALLOCATOR.layer_stats().kheap;
+    assert!(after_reuse.cache_hits > after_free.cache_hits);
+    KERNEL_ALLOCATOR
+        .deallocate(second.ptr)
+        .expect("deallocate reused medium kheap range");
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.kheap_active_allocs, before.kheap_active_allocs);
+}
+
 /// kheap cache 满桶时应保留最新释放的 range，而不是把最热对象直接释放回后端。
 #[ktest]
 fn kheap_full_cache_keeps_latest_freed_range_hot() {

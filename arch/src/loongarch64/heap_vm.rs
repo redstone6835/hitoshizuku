@@ -426,6 +426,16 @@ pub(crate) unsafe fn activate_kernel_page_table_for_secondary() {
     }
 }
 
+/// 将当前 hart 切回内核地址空间。
+///
+/// LoongArch64 的内核映射由 DMW 窗口独立提供，但仍切换到统一的内核页表，
+/// 使调度器在不同架构上拥有相同的地址空间生命周期语义。
+pub fn activate_kernel_page_table() {
+    // Safety: 内核根在正式页表初始化和 CPU 上线前已经发布；函数只在调度
+    // 切换边界调用，满足架构页表激活契约。
+    unsafe { activate_kernel_page_table_for_secondary() };
+}
+
 /// 分配页表页
 fn allocate_page_table_page() -> Result<usize, MapError> {
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
