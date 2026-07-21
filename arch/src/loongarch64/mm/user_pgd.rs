@@ -207,6 +207,23 @@ unsafe fn map(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
     .expect("[arch][mm] walk_and_map failed");
 }
 
+unsafe fn publish_new_mapping(handle: PgdHandle, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // Safety: 由 UserPgdOps 契约保证 handle 与范围合法。
+    let inner = unsafe { inner_ref(handle) };
+    let page_size = LoongArch64Paging::PAGE_SIZE;
+    let aligned_start = vaddr & !(page_size - 1);
+    let targeted = vaddr
+        .checked_add(len)
+        .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
+    let address = targeted.then(|| VirtAddr::new(aligned_start));
+    // Safety: 调用方保证这些叶 PTE 此前无有效映射；这里只发布写入并收敛本核
+    // 可能缓存的无效 translation，不承担旧映射回收同步。
+    unsafe { LoongArch64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
+}
+
 unsafe fn unmap(handle: PgdHandle, vaddr: usize, len: usize) {
     use general::unmap_range_entries;
     // Safety: 同上。
@@ -348,6 +365,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map,
+    publish_new_mapping,
     unmap,
     protect,
     clone_for_fork,

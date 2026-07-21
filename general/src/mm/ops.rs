@@ -154,6 +154,18 @@ pub struct UserPgdOps {
     /// `vaddr` 必须 4K 对齐；`paddr` 同；`flags` 必须含 [`VmFlags::USER`]。
     pub map: unsafe fn(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags),
 
+    /// 发布一段从“无叶 PTE”变为“有效叶 PTE”的新映射。
+    ///
+    /// 本回调只保证先前页表写对当前 CPU 的硬件页表遍历可见，并清除当前 CPU
+    /// 可能缓存的无效 translation；不会等待其它 CPU，也不能用于替换、解除映射
+    /// 或权限变更。其它正在运行同一地址空间的 CPU 若命中旧无效状态，会在缺页
+    /// 重试路径调用同一回调完成本地收敛。
+    ///
+    /// # Safety
+    /// `handle` 必须合法；区间必须按基础页对齐，且调用方必须确认其中所有新写入
+    /// 的叶 PTE 此前均无有效映射。
+    pub publish_new_mapping: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize),
+
     /// 解除 `[vaddr, vaddr+len)` 区间的映射。`len` 必须是 4K 倍数。
     ///
     /// # Safety
@@ -191,6 +203,36 @@ pub struct UserPgdOps {
 // Safety: 仅函数指针。
 unsafe impl Sync for UserPgdOps {}
 unsafe impl Send for UserPgdOps {}
+
+/// 用户页表更新的发布范围。
+///
+/// 新建映射没有可越过资源回收边界的旧有效 translation，只需当前 CPU 本地
+/// 收敛；其它更新可能遗留仍可访问旧物理页或旧权限的 TLB 项，必须同步所有曾经
+/// 激活过该地址空间的 CPU。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserPteUpdate {
+    NewMapping,
+    ExistingMapping,
+}
+
+impl UserPteUpdate {
+    /// 按更新类型选择本地发布或同步跨核失效。
+    ///
+    /// # Safety
+    /// 调用方必须满足所选 [`UserPgdOps`] 回调的句柄、地址范围和映射状态契约。
+    pub(super) unsafe fn publish(
+        self,
+        ops: &UserPgdOps,
+        handle: PgdHandle,
+        vaddr: usize,
+        len: usize,
+    ) {
+        match self {
+            Self::NewMapping => unsafe { (ops.publish_new_mapping)(handle, vaddr, len) },
+            Self::ExistingMapping => unsafe { (ops.invalidate_range)(handle, vaddr, len) },
+        }
+    }
+}
 
 // ── UserAccessOps ────────────────────────────────────────────────────────────
 
@@ -284,4 +326,67 @@ pub fn all_ops_registered() -> bool {
         && user_pgd_ops().is_some()
         && user_access_ops().is_some()
         && fault_decode_ops().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ops::Range;
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{PgdHandle, UserPgdOps, UserPteUpdate};
+    use mm::VmFlags;
+
+    static LOCAL_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
+    static REMOTE_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn new_pgd() -> PgdHandle {
+        PgdHandle::from_raw(NonNull::dangling())
+    }
+
+    unsafe fn ignore_handle(_: PgdHandle) {}
+    unsafe fn ignore_map(_: PgdHandle, _: usize, _: usize, _: VmFlags) {}
+    unsafe fn record_local(_: PgdHandle, _: usize, _: usize) {
+        LOCAL_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn ignore_protect(_: PgdHandle, _: usize, _: usize, _: VmFlags) {}
+    unsafe fn ignore_clone(_: PgdHandle, _: PgdHandle, _: Range<usize>) {}
+    unsafe fn record_remote(_: PgdHandle, _: usize, _: usize) {
+        REMOTE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn count_none(_: PgdHandle, _: usize, _: usize) -> usize {
+        0
+    }
+
+    fn fake_ops() -> UserPgdOps {
+        UserPgdOps {
+            new_pgd_for_user: new_pgd,
+            drop_pgd: ignore_handle,
+            map: ignore_map,
+            publish_new_mapping: record_local,
+            unmap: record_remote,
+            protect: ignore_protect,
+            clone_for_fork: ignore_clone,
+            activate: ignore_handle,
+            invalidate_range: record_remote,
+            count_mapped: count_none,
+        }
+    }
+
+    #[test]
+    fn user_pte_update_routes_local_and_remote_publication() {
+        LOCAL_PUBLICATIONS.store(0, Ordering::Relaxed);
+        REMOTE_INVALIDATIONS.store(0, Ordering::Relaxed);
+        let ops = fake_ops();
+        let handle = (ops.new_pgd_for_user)();
+
+        // Safety: fake 回调不解引用句柄；地址范围仅用于验证 vtable 路由。
+        unsafe {
+            UserPteUpdate::NewMapping.publish(&ops, handle, 0x1000, 0x1000);
+            UserPteUpdate::ExistingMapping.publish(&ops, handle, 0x2000, 0x1000);
+        }
+
+        assert_eq!(LOCAL_PUBLICATIONS.load(Ordering::Relaxed), 1);
+        assert_eq!(REMOTE_INVALIDATIONS.load(Ordering::Relaxed), 1);
+    }
 }
