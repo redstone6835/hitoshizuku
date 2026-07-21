@@ -487,7 +487,9 @@ pub fn install_network_boot_config() {
         general::dev::random::RandomReadMode::Insecure,
     )
     .expect("random ELM 未提供网络启动密钥材料");
-    let active_cpu_count = sched::online_cpu_mask().count_ones().clamp(1, 8) as u8;
+    let online_cpu_count = sched::online_cpu_mask().count_ones();
+    let active_cpu_count =
+        net::boot::select_protocol_shard_count(online_cpu_count).expect("网络启动时没有在线 CPU");
     let (host_config, driver_config, stack_config) =
         net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
             .expect("active CPU count 超出网络栈范围")
@@ -498,7 +500,8 @@ pub fn install_network_boot_config() {
     net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
         .expect("网络 stack broker 被重复安装");
     log::info!(
-        "[kernel] installed network boot config: active_cpus={}",
+        "[kernel] installed network boot config: online_cpus={} protocol_shards={}",
+        online_cpu_count,
         active_cpu_count
     );
 }
