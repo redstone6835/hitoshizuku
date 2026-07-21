@@ -415,8 +415,15 @@ impl Runqueue {
         let _ = update_curr_locked(&mut inner, now_ns);
 
         let mut fair_prev_addr = None;
+        let mut kernel_idle = None;
         if let Some(prev) = inner.current.take() {
-            if task_can_enter_runqueue(&prev)
+            if prev.is_idle_task() {
+                // 内核 idle task 由每 CPU idle 槽提供，不属于可排队的
+                // SCHED_IDLE 任务。把它每个 tick 插入再移出 BTreeMap 会在
+                // rq 锁内反复分配节点，并让多核空闲系统争用全局分配器。
+                prev.sched.set_on_rq(false);
+                kernel_idle = Some(prev);
+            } else if task_can_enter_runqueue(&prev)
                 && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
             {
                 prev.set_state(TaskState::Runnable);
@@ -440,7 +447,8 @@ impl Runqueue {
         }
 
         let preferred_fair_addr = inner.preferred_fair_addr.take();
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask);
+        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask)
+            .or(kernel_idle);
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));

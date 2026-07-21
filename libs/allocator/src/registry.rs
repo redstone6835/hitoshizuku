@@ -189,6 +189,11 @@ struct AllocationRegistryInner {
     accounting_underflows: u64,
     chain_corruptions: u64,
     max_chain_len: usize,
+    /// 删除当前最长链中的节点后，缓存的最大链长可能只是上界。
+    ///
+    /// alloc/free 热路径只标记失效；stats/audit 等冷路径读取前再扫描桶长数组，
+    /// 避免稀疏哈希表在 `max_chain_len == 1` 时每次释放都持锁遍历整个 shard。
+    max_chain_len_dirty: bool,
     live_by_kind: [usize; 5],
     initializing: bool,
     initialized: bool,
@@ -214,6 +219,7 @@ impl AllocationRegistryInner {
             accounting_underflows: 0,
             chain_corruptions: 0,
             max_chain_len: 0,
+            max_chain_len_dirty: false,
             live_by_kind: [0; 5],
             initializing: false,
             initialized: false,
@@ -318,6 +324,7 @@ impl AllocationRegistry {
             inner.accounting_underflows = 0;
             inner.chain_corruptions = 0;
             inner.max_chain_len = 0;
+            inner.max_chain_len_dirty = false;
             inner.live_by_kind = [0; 5];
             inner.initializing = false;
             inner.initialized = true;
@@ -411,9 +418,7 @@ impl AllocationRegistry {
             inner.live_by_kind[kind_index(record.kind)] += 1;
             let chain_len = 1 + chain_len_before;
             set_bucket_chain_len(&inner, bucket, chain_len);
-            if chain_len > inner.max_chain_len {
-                inner.max_chain_len = chain_len;
-            }
+            note_chain_insert_locked(&mut inner, chain_len);
             return Ok(());
         }
     }
@@ -525,7 +530,7 @@ impl AllocationRegistry {
                     write_node(prev, prev_node);
                 }
                 set_bucket_chain_len(&inner, bucket, old_chain_len - 1);
-                refresh_max_chain_len_after_remove_locked(&mut inner, old_chain_len);
+                note_chain_remove_locked(&mut inner, old_chain_len);
 
                 let mut recycled = node;
                 recycled.next = inner.free_nodes;
@@ -633,7 +638,8 @@ impl AllocationRegistry {
             ..AllocationRegistryStats::default()
         };
         for shard in &self.shards {
-            let inner = shard.inner.lock();
+            let mut inner = shard.inner.lock();
+            refresh_max_chain_len_if_dirty_locked(&mut inner);
             accumulate_stats_locked(&mut out, &inner);
         }
         out
@@ -650,7 +656,8 @@ impl AllocationRegistry {
         };
         let mut out = AllocationRegistryAudit::default();
         for (shard_idx, shard) in self.shards.iter().enumerate() {
-            let inner = shard.inner.lock();
+            let mut inner = shard.inner.lock();
+            refresh_max_chain_len_if_dirty_locked(&mut inner);
             let mut shard_flags = AllocationRegistryAuditFlags::empty();
             accumulate_stats_locked(&mut stats, &inner);
 
@@ -692,7 +699,7 @@ impl AllocationRegistry {
             if scanned.live_records.saturating_add(scanned.free_nodes) != inner.nodes_allocated {
                 shard_flags.insert(AllocationRegistryAuditFlags::NODE_ACCOUNTING_MISMATCH);
             }
-            if scanned.max_chain_len > inner.max_chain_len {
+            if scanned.max_chain_len != inner.max_chain_len {
                 shard_flags.insert(AllocationRegistryAuditFlags::MAX_CHAIN_MISMATCH);
             }
             if inner.accounting_underflows != 0 {
@@ -912,15 +919,27 @@ fn note_chain_corruption_locked(inner: &mut AllocationRegistryInner) {
     inner.chain_corruptions = inner.chain_corruptions.saturating_add(1);
 }
 
-fn refresh_max_chain_len_after_remove_locked(
-    inner: &mut AllocationRegistryInner,
-    old_bucket_len: usize,
-) {
-    if old_bucket_len != inner.max_chain_len {
+fn note_chain_insert_locked(inner: &mut AllocationRegistryInner, chain_len: usize) {
+    if chain_len >= inner.max_chain_len {
+        // 若缓存此前因删除而失效，新链已经达到旧上界，就能重新证明最大值精确；
+        // 超过旧上界时同理，新链必然是唯一可能的新最大值。
+        inner.max_chain_len = chain_len;
+        inner.max_chain_len_dirty = false;
+    }
+}
+
+fn note_chain_remove_locked(inner: &mut AllocationRegistryInner, old_bucket_len: usize) {
+    if old_bucket_len == inner.max_chain_len {
+        inner.max_chain_len_dirty = true;
+    }
+}
+
+fn refresh_max_chain_len_if_dirty_locked(inner: &mut AllocationRegistryInner) {
+    if !inner.max_chain_len_dirty {
         return;
     }
-
     inner.max_chain_len = recompute_max_chain_len_locked(inner);
+    inner.max_chain_len_dirty = false;
 }
 
 fn recompute_max_chain_len_locked(inner: &AllocationRegistryInner) -> usize {

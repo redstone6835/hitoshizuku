@@ -100,14 +100,19 @@ impl KernelHeapAuditFlags {
     }
 }
 
-const KHEAP_CACHE_MAX_ORDER: usize = 1;
+// fork/exec 会高频创建 16 KiB 到 256 KiB 的 Vec、地址空间元数据和内核栈。
+// 保留这些范围的虚拟映射可以避免每次释放都修改全局内核页表。高阶容量逐级收紧，
+// 整个缓存填满时最多保留约 18 MiB 后备页。
+const KHEAP_CACHE_MAX_ORDER: usize = 6;
 const KHEAP_CACHE_ORDER_COUNT: usize = KHEAP_CACHE_MAX_ORDER + 1;
-const KHEAP_CACHE_CAPACITY_PER_ORDER: usize = 128;
+const KHEAP_CACHE_SLOT_COUNT: usize = 128;
+const KHEAP_CACHE_CAPACITY_PER_ORDER: [usize; KHEAP_CACHE_ORDER_COUNT] =
+    [128, 128, 128, 64, 64, 32, 16];
 const KHEAP_CACHEABLE_BACKEND_COOKIE: usize = 1;
 
 #[derive(Clone, Copy)]
 struct CachedOrderRanges {
-    ranges: [Option<BackedRange>; KHEAP_CACHE_CAPACITY_PER_ORDER],
+    ranges: [Option<BackedRange>; KHEAP_CACHE_SLOT_COUNT],
     head: usize,
     len: usize,
 }
@@ -115,27 +120,27 @@ struct CachedOrderRanges {
 impl CachedOrderRanges {
     const fn new() -> Self {
         Self {
-            ranges: [None; KHEAP_CACHE_CAPACITY_PER_ORDER],
+            ranges: [None; KHEAP_CACHE_SLOT_COUNT],
             head: 0,
             len: 0,
         }
     }
 
-    fn push(&mut self, range: BackedRange) -> bool {
-        if self.len == self.ranges.len() {
+    fn push(&mut self, range: BackedRange, capacity: usize) -> bool {
+        if self.len == capacity {
             return false;
         }
-        let tail = self.tail_index();
+        let tail = self.tail_index(capacity);
         self.ranges[tail] = Some(range);
         self.len += 1;
         true
     }
 
-    fn pop(&mut self) -> Option<BackedRange> {
+    fn pop(&mut self, capacity: usize) -> Option<BackedRange> {
         if self.len == 0 {
             return None;
         }
-        let tail = self.newest_index();
+        let tail = self.newest_index(capacity);
         let range = self.ranges[tail].take();
         self.len -= 1;
         if self.len == 0 {
@@ -144,8 +149,8 @@ impl CachedOrderRanges {
         range
     }
 
-    fn push_or_evict_oldest(&mut self, range: BackedRange) -> Option<BackedRange> {
-        if self.push(range) {
+    fn push_or_evict_oldest(&mut self, range: BackedRange, capacity: usize) -> Option<BackedRange> {
+        if self.push(range, capacity) {
             return None;
         }
 
@@ -153,41 +158,46 @@ impl CachedOrderRanges {
         // 同阶对象；环形队列淘汰最旧元素并把当前 range 放到最新位置，避免满桶时搬移
         // 128 个槽位。
         let evicted = self.ranges[self.head].replace(range);
-        self.head = self.next_index(self.head);
+        self.head = self.next_index(self.head, capacity);
         evicted
     }
 
-    fn tail_index(&self) -> usize {
-        (self.head + self.len) % self.ranges.len()
+    fn tail_index(&self, capacity: usize) -> usize {
+        (self.head + self.len) % capacity
     }
 
-    fn newest_index(&self) -> usize {
-        (self.head + self.len - 1) % self.ranges.len()
+    fn newest_index(&self, capacity: usize) -> usize {
+        (self.head + self.len - 1) % capacity
     }
 
-    fn next_index(&self, index: usize) -> usize {
+    fn next_index(&self, index: usize, capacity: usize) -> usize {
         let next = index + 1;
-        if next == self.ranges.len() { 0 } else { next }
+        if next == capacity { 0 } else { next }
     }
 
     fn audit(&self, order: usize, audit: &mut KernelHeapAudit) {
+        let capacity = cache_capacity_for_order(order);
         // kheap cache 是环形队列：active 窗口必须全部为合法 range，窗口外必须为空。
         // 这能发现 len/head 损坏、坏槽位残留，以及错误 order 的 range 被放入缓存。
-        if self.len > self.ranges.len()
-            || self.head >= self.ranges.len()
+        if capacity == 0
+            || capacity > self.ranges.len()
+            || self.len > capacity
+            || self.head >= capacity
             || (self.len == 0 && self.head != 0)
         {
             audit.flags.insert(KernelHeapAuditFlags::CACHE_RING_INVALID);
         }
 
-        let len = self.len.min(self.ranges.len());
+        let len = self.len.min(capacity);
         for slot in 0..self.ranges.len() {
-            let offset = if slot >= self.head {
+            let offset = if slot >= capacity {
+                capacity
+            } else if slot >= self.head {
                 slot - self.head
             } else {
-                self.ranges.len() - self.head + slot
+                capacity - self.head + slot
             };
-            let active_slot = offset < len;
+            let active_slot = slot < capacity && offset < len;
             match (active_slot, self.ranges[slot]) {
                 (true, Some(range)) => {
                     if !is_expected_cached_range(range, order) {
@@ -230,17 +240,17 @@ impl KernelHeapRangeCache {
 
     fn push_or_evict_oldest(&mut self, range: BackedRange) -> Option<BackedRange> {
         let idx = cache_order_index(range.order)?;
-        self.orders[idx].push_or_evict_oldest(range)
+        self.orders[idx].push_or_evict_oldest(range, cache_capacity_for_order(idx))
     }
 
     fn pop(&mut self, order: usize) -> Option<BackedRange> {
         let idx = cache_order_index(order)?;
-        self.orders[idx].pop()
+        self.orders[idx].pop(cache_capacity_for_order(idx))
     }
 
     fn pop_any(&mut self) -> Option<BackedRange> {
         for idx in (0..self.orders.len()).rev() {
-            if let Some(range) = self.orders[idx].pop() {
+            if let Some(range) = self.orders[idx].pop(cache_capacity_for_order(idx)) {
                 return Some(range);
             }
         }
@@ -656,6 +666,14 @@ fn cache_order_index(order: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+#[inline]
+fn cache_capacity_for_order(order: usize) -> usize {
+    KHEAP_CACHE_CAPACITY_PER_ORDER
+        .get(order)
+        .copied()
+        .unwrap_or(0)
 }
 
 #[inline]

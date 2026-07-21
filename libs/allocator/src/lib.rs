@@ -1756,7 +1756,18 @@ impl KernelMemorySubsystem {
             .with_reclaim(ReclaimPolicy::TryAllocatorReclaim);
         match self.allocate(request) {
             Ok(record) => record.ptr as *mut u8,
-            Err(_) => null_mut(),
+            Err(error) => {
+                let accounting_owner = resolve_accounting_owner(None);
+                log::error!(
+                    "[alloc] global allocation failed: size={} align={} zeroing={:?} owner={} error={:?}",
+                    layout.size(),
+                    layout.align(),
+                    zeroing,
+                    accounting_owner,
+                    error,
+                );
+                null_mut()
+            }
         }
     }
 
