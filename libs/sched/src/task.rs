@@ -1485,6 +1485,12 @@ impl Task {
         self.pi.lock().base
     }
 
+    /// PI donation 存在时，任务可能是必须运行的锁 owner；RT bandwidth
+    /// 节流不能阻止它运行到释放所持有的 PI 锁。
+    pub(crate) fn pi_is_boosted(&self) -> bool {
+        !self.pi.lock().donations.is_empty()
+    }
+
     // ── CPU 亲和性 ───────────────────────────────────────────────────────
 
     pub fn cpu_affinity(&self) -> u64 {

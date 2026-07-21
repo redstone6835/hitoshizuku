@@ -504,6 +504,188 @@ static int test_pi_timedlock(void) {
     return result.error == ETIMEDOUT ? 0 : (result.error != 0 ? result.error : EIO);
 }
 
+struct rt_bandwidth_context {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int ready;
+    int release_hog;
+    int release_observer;
+    atomic_int hog_running;
+    atomic_int observer_ran;
+    atomic_int stop;
+};
+
+static struct rt_bandwidth_context rt_bandwidth;
+
+static void *rt_bandwidth_hog(void *unused) {
+    (void)unused;
+    int error = pthread_mutex_lock(&rt_bandwidth.mutex);
+    if (error != 0) {
+        return (void *)(intptr_t)error;
+    }
+    rt_bandwidth.ready++;
+    pthread_cond_broadcast(&rt_bandwidth.cond);
+    while (!rt_bandwidth.release_hog) {
+        error = pthread_cond_wait(&rt_bandwidth.cond, &rt_bandwidth.mutex);
+        if (error != 0) {
+            pthread_mutex_unlock(&rt_bandwidth.mutex);
+            return (void *)(intptr_t)error;
+        }
+    }
+    pthread_mutex_unlock(&rt_bandwidth.mutex);
+
+    atomic_store_explicit(&rt_bandwidth.hog_running, 1, memory_order_release);
+    while (!atomic_load_explicit(&rt_bandwidth.stop, memory_order_acquire)) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    return NULL;
+}
+
+static void *rt_bandwidth_observer(void *unused) {
+    (void)unused;
+    int error = pthread_mutex_lock(&rt_bandwidth.mutex);
+    if (error != 0) {
+        return (void *)(intptr_t)error;
+    }
+    rt_bandwidth.ready++;
+    pthread_cond_broadcast(&rt_bandwidth.cond);
+    while (!rt_bandwidth.release_observer) {
+        error = pthread_cond_wait(&rt_bandwidth.cond, &rt_bandwidth.mutex);
+        if (error != 0) {
+            pthread_mutex_unlock(&rt_bandwidth.mutex);
+            return (void *)(intptr_t)error;
+        }
+    }
+    pthread_mutex_unlock(&rt_bandwidth.mutex);
+
+    atomic_store_explicit(&rt_bandwidth.observer_ran, 1, memory_order_release);
+    atomic_store_explicit(&rt_bandwidth.stop, 1, memory_order_release);
+    return NULL;
+}
+
+static int test_rt_bandwidth_recovery(void) {
+    cpu_set_t original_affinity;
+    int error = pthread_getaffinity_np(pthread_self(), sizeof(original_affinity),
+                                       &original_affinity);
+    if (error != 0) {
+        return error;
+    }
+    int main_cpu = -1;
+    int rt_cpu = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &original_affinity)) {
+            continue;
+        }
+        if (main_cpu < 0) {
+            main_cpu = cpu;
+        } else {
+            rt_cpu = cpu;
+            break;
+        }
+    }
+    if (rt_cpu < 0) {
+        return ENOTSUP;
+    }
+
+    cpu_set_t main_affinity;
+    CPU_ZERO(&main_affinity);
+    CPU_SET(main_cpu, &main_affinity);
+    error = pthread_setaffinity_np(pthread_self(), sizeof(main_affinity), &main_affinity);
+    if (error != 0) {
+        return error;
+    }
+
+    rt_bandwidth = (struct rt_bandwidth_context){
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .cond = PTHREAD_COND_INITIALIZER,
+    };
+    pthread_t hog_thread;
+    pthread_t observer_thread;
+    int hog_created = 0;
+    int observer_created = 0;
+
+    error = pthread_create(&hog_thread, NULL, rt_bandwidth_hog, NULL);
+    if (error == 0) {
+        hog_created = 1;
+        error = pthread_create(&observer_thread, NULL, rt_bandwidth_observer, NULL);
+    }
+    if (error == 0) {
+        observer_created = 1;
+        error = pthread_mutex_lock(&rt_bandwidth.mutex);
+    }
+    while (error == 0 && rt_bandwidth.ready != 2) {
+        error = pthread_cond_wait(&rt_bandwidth.cond, &rt_bandwidth.mutex);
+    }
+    if (error == 0) {
+        cpu_set_t target_affinity;
+        CPU_ZERO(&target_affinity);
+        CPU_SET(rt_cpu, &target_affinity);
+        error = pthread_setaffinity_np(hog_thread, sizeof(target_affinity), &target_affinity);
+        if (error == 0) {
+            error = pthread_setaffinity_np(observer_thread, sizeof(target_affinity),
+                                           &target_affinity);
+        }
+    }
+    if (error == 0) {
+        struct sched_param param = {.sched_priority = 50};
+        error = pthread_setschedparam(hog_thread, SCHED_FIFO, &param);
+    }
+    if (error == 0) {
+        rt_bandwidth.release_hog = 1;
+        pthread_cond_broadcast(&rt_bandwidth.cond);
+    }
+    if (observer_created) {
+        pthread_mutex_unlock(&rt_bandwidth.mutex);
+    }
+
+    if (error == 0) {
+        error = wait_for_flag(&rt_bandwidth.hog_running, 1);
+    }
+    if (error == 0) {
+        error = pthread_mutex_lock(&rt_bandwidth.mutex);
+        if (error == 0) {
+            rt_bandwidth.release_observer = 1;
+            pthread_cond_broadcast(&rt_bandwidth.cond);
+            pthread_mutex_unlock(&rt_bandwidth.mutex);
+        }
+    }
+    if (error == 0) {
+        error = wait_for_flag(&rt_bandwidth.observer_ran, 1);
+    }
+
+    atomic_store_explicit(&rt_bandwidth.stop, 1, memory_order_release);
+    if (hog_created || observer_created) {
+        pthread_mutex_lock(&rt_bandwidth.mutex);
+        rt_bandwidth.release_hog = 1;
+        rt_bandwidth.release_observer = 1;
+        pthread_cond_broadcast(&rt_bandwidth.cond);
+        pthread_mutex_unlock(&rt_bandwidth.mutex);
+    }
+    if (hog_created) {
+        void *result = NULL;
+        int join_error = pthread_join(hog_thread, &result);
+        if (error == 0 && join_error != 0) {
+            error = join_error;
+        } else if (error == 0 && result != NULL) {
+            error = (int)(intptr_t)result;
+        }
+    }
+    if (observer_created) {
+        void *result = NULL;
+        int join_error = pthread_join(observer_thread, &result);
+        if (error == 0 && join_error != 0) {
+            error = join_error;
+        } else if (error == 0 && result != NULL) {
+            error = (int)(intptr_t)result;
+        }
+    }
+    int restore_error =
+        pthread_setaffinity_np(pthread_self(), sizeof(original_affinity), &original_affinity);
+    pthread_cond_destroy(&rt_bandwidth.cond);
+    pthread_mutex_destroy(&rt_bandwidth.mutex);
+    return error != 0 ? error : restore_error;
+}
+
 struct test_case {
     const char *name;
     int (*run)(void);
@@ -518,6 +700,7 @@ int main(void) {
         {"pthread robust owner exit", test_robust_owner_exit},
         {"pthread PI timed lock", test_pi_timedlock},
         {"pthread PI priority handoff", test_pi_priority_handoff},
+        {"pthread RT bandwidth recovery", test_rt_bandwidth_recovery},
     };
 
     setvbuf(stdout, NULL, _IONBF, 0);
