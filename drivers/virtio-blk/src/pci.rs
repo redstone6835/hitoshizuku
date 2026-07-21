@@ -25,15 +25,13 @@ use core::num::NonZeroU32;
 use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
-
 #[cfg(feature = "block-profile")]
 use super::common::VirtioBlkProfile;
 use super::common::{
-    MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest, VirtioBlkCapabilities,
-    VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore, VirtioBlkQueueId,
-    VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits, free_allocated_request,
-    negotiate_supported_features, read_device_config, status_to_result,
+    IrqSafeMutex, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest,
+    VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore,
+    VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
+    free_allocated_request, negotiate_supported_features, read_device_config, status_to_result,
     validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
     write_data_payload,
 };
@@ -93,7 +91,7 @@ struct VirtioBlkInner {
     capacity: u64,
     block_size: u32,
     capabilities: VirtioBlkCapabilities,
-    queue: Mutex<VirtioBlkQueueCore>,
+    queue: IrqSafeMutex<VirtioBlkQueueCore>,
     irq_count: AtomicUsize,
     #[cfg(feature = "block-profile")]
     profile: VirtioBlkProfile,
@@ -228,7 +226,7 @@ impl VirtioBlkPci {
             capacity,
             block_size,
             capabilities,
-            queue: Mutex::new(queue),
+            queue: IrqSafeMutex::new(queue),
             irq_count: AtomicUsize::new(0),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
@@ -464,6 +462,7 @@ impl VirtioBlkPciIo {
 
 impl BlockDriver for VirtioBlkPciIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
+        // 先回收设备已发布的完成项，避免并发提交在中断合并时丢失进度。
         self.driver.poll();
         let mut queue = self.driver.inner.queue.lock();
         if queue.is_failed() {

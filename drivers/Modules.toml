@@ -111,6 +111,7 @@ config = "CONFIG_VIRTIO_BLK"
 prompt = "VirtIO block 驱动"
 default = "m"
 depends = "virtio.framework"
+features = "block-profile"
 
 [[modules]]
 name = "net.virtio"
