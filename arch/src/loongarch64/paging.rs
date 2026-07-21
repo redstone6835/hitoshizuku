@@ -110,6 +110,44 @@ const _: () = {
     assert!(PALEN <= 48);
 };
 
+/// 判断当前硬件地址空间是否已经与目标完全一致。
+///
+/// `CSR_ASID` 还包含硬件实现的 ASID 位宽等只读字段，比较前必须只保留实际 ASID 域。
+#[inline]
+const fn activation_state_matches(
+    current_pgdl: usize,
+    current_pgdh: usize,
+    current_asid: usize,
+    target_pgdl: usize,
+    target_pgdh: usize,
+    target_asid: usize,
+) -> bool {
+    current_pgdl == target_pgdl
+        && current_pgdh == target_pgdh
+        && asid_bits(current_asid) == asid_bits(target_asid)
+}
+
+// 编译期覆盖完全相同、每一项单独变化以及 ASID 高位被规范化的判定语义。
+const _: () = {
+    assert!(activation_state_matches(
+        0x1000,
+        0x2000,
+        0x00ff_0007,
+        0x1000,
+        0x2000,
+        0x0407,
+    ));
+    assert!(!activation_state_matches(
+        0x1000, 0x2000, 7, 0x3000, 0x2000, 7,
+    ));
+    assert!(!activation_state_matches(
+        0x1000, 0x2000, 7, 0x1000, 0x3000, 7,
+    ));
+    assert!(!activation_state_matches(
+        0x1000, 0x2000, 7, 0x1000, 0x2000, 8,
+    ));
+};
+
 /// 叶子映射权限的内部聚合表示。
 ///
 /// 仅在构造 PTE 时使用，避免接口层直接处理位操作。
@@ -462,12 +500,41 @@ impl LoongArch64Paging {
         high_root: PhysPageTableRoot,
         asid: usize,
     ) {
-        Self::page_table_barrier();
-        // 注意：LoongArch 的 csrwr/csrxchg 会把旧 CSR 值写回 rd。
-        // 因此每条写 CSR 指令都使用独立 rd 输入并声明为 inout，避免寄存器污染。
         let pgdl = low_root.as_usize();
         let pgdh = high_root.as_usize();
         let asid_val = asid_bits(asid);
+        let current_pgdl: usize;
+        let current_pgdh: usize;
+        let current_asid: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrd {current_pgdl}, {csr_pgdl}",
+                "csrrd {current_pgdh}, {csr_pgdh}",
+                "csrrd {current_asid}, {csr_asid}",
+                current_pgdl = out(reg) current_pgdl,
+                current_pgdh = out(reg) current_pgdh,
+                current_asid = out(reg) current_asid,
+                csr_pgdl = const CSR_PGDL,
+                csr_pgdh = const CSR_PGDH,
+                csr_asid = const CSR_ASID,
+                options(nostack, preserves_flags)
+            );
+        }
+        if activation_state_matches(
+            current_pgdl,
+            current_pgdh,
+            current_asid,
+            pgdl,
+            pgdh,
+            asid_val,
+        ) {
+            // pthread 等同地址空间切换无需重复写 CSR，更不能承担一次全局 TLB 失效。
+            return;
+        }
+
+        Self::page_table_barrier();
+        // 注意：LoongArch 的 csrwr/csrxchg 会把旧 CSR 值写回 rd。
+        // 因此每条写 CSR 指令都使用独立 rd 输入并声明为 inout，避免寄存器污染。
         let asid_mask = CSR_ASID_ASID_MASK;
         let pwcl = Self::page_walk_pwcl();
         let pwch = Self::page_walk_pwch();
