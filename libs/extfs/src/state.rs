@@ -1423,6 +1423,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::bgd::GroupDesc;
+    use crate::file::read_aligned_blocks;
     use crate::layout::ExtKind;
     use crate::map_wr::{self, BlockAllocState};
     use crate::sb::Superblock;
@@ -1509,16 +1510,20 @@ mod tests {
         }
     }
 
-    fn alloc_test_state(backend: Arc<CountingBackend>) -> FsState {
-        let block_size = 1024;
-        let free_blocks = 60;
+    fn alloc_test_state(
+        backend: Arc<CountingBackend>,
+        block_size: u32,
+        blocks_count: u64,
+    ) -> FsState {
+        let free_blocks = blocks_count.saturating_sub(4);
+        let blocks_per_group = blocks_count.min(u32::MAX as u64) as u32;
         let ext_sb = Superblock {
             kind: ExtKind::Ext2,
             inodes_count: 16,
-            blocks_count: 64,
+            blocks_count,
             first_data_block: 0,
             block_size,
-            blocks_per_group: 64,
+            blocks_per_group,
             inodes_per_group: 16,
             inode_size: 128,
             desc_size: 32,
@@ -1542,12 +1547,12 @@ mod tests {
             inode_bitmap: 2,
             inode_table: 3,
             flags: 0,
-            free_blocks_count: free_blocks as u32,
+            free_blocks_count: free_blocks.min(u32::MAX as u64) as u32,
             free_inodes_count: 16,
             used_dirs_count: 1,
         }];
         let group_counts = vec![GroupCounts {
-            free_blocks: free_blocks as u32,
+            free_blocks: free_blocks.min(u32::MAX as u64) as u32,
             free_inodes: 16,
             used_dirs: 1,
         }];
@@ -1578,7 +1583,7 @@ mod tests {
         bitmap[0] = 0b0000_1111;
         backend.seed_block(1, 1024, &bitmap);
 
-        let state = alloc_test_state(Arc::clone(&backend));
+        let state = alloc_test_state(Arc::clone(&backend), 1024, 64);
         let mut i_block = [0u8; 60];
 
         let block = map_wr::ensure_block_for_write(&state, &mut i_block, 0, false)
@@ -1602,7 +1607,7 @@ mod tests {
     #[test]
     fn statfs_counts_follow_runtime_allocations_and_reserved_blocks() {
         let backend = Arc::new(CountingBackend::new(128, 512));
-        let state = alloc_test_state(backend);
+        let state = alloc_test_state(backend, 1024, 64);
 
         assert_eq!(state.statfs_counts(), (60, 56, 16));
         state.adjust_sb_free_blocks(-7).expect("扣减空闲块");
@@ -1617,7 +1622,7 @@ mod tests {
         data[0] = 0xaa;
         backend.seed_block(8, 1024, &data);
 
-        let state = alloc_test_state(Arc::clone(&backend));
+        let state = alloc_test_state(Arc::clone(&backend), 1024, 64);
         let mut first = vec![0u8; 1024];
         let mut second = vec![0u8; 1024];
 
@@ -1630,9 +1635,49 @@ mod tests {
     }
 
     #[test]
+    fn aligned_sequential_read_prefetches_once_then_hits_cache() {
+        const BLOCK_SIZE: usize = 4096;
+        const PHYS_START: u64 = 8;
+        let backend = Arc::new(CountingBackend::new(256, 512));
+        for block in PHYS_START..PHYS_START + 16 {
+            backend.seed_block(block, BLOCK_SIZE, &vec![block as u8; BLOCK_SIZE]);
+        }
+        let state = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE as u32, 32);
+        let mut scratch = Vec::new();
+        let mut first = vec![0u8; BLOCK_SIZE];
+        let mut second = vec![0u8; BLOCK_SIZE];
+
+        read_aligned_blocks(&state, &mut scratch, PHYS_START, 1, 16, &mut first)
+            .expect("first sequential read");
+        read_aligned_blocks(&state, &mut scratch, PHYS_START + 1, 1, 15, &mut second)
+            .expect("cached sequential read");
+
+        assert_eq!(first, vec![PHYS_START as u8; BLOCK_SIZE]);
+        assert_eq!(second, vec![(PHYS_START + 1) as u8; BLOCK_SIZE]);
+        assert_eq!(backend.reads(), vec![(PHYS_START * 8, 16 * 8)]);
+    }
+
+    #[test]
+    fn aligned_random_read_keeps_single_block_io() {
+        const BLOCK_SIZE: usize = 4096;
+        const PHYS_START: u64 = 24;
+        let backend = Arc::new(CountingBackend::new(256, 512));
+        backend.seed_block(PHYS_START, BLOCK_SIZE, &vec![PHYS_START as u8; BLOCK_SIZE]);
+        let state = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE as u32, 32);
+        let mut scratch = Vec::new();
+        let mut dst = vec![0u8; BLOCK_SIZE];
+
+        read_aligned_blocks(&state, &mut scratch, PHYS_START, 1, 1, &mut dst)
+            .expect("random aligned read");
+
+        assert_eq!(dst, vec![PHYS_START as u8; BLOCK_SIZE]);
+        assert_eq!(backend.reads(), vec![(PHYS_START * 8, 8)]);
+    }
+
+    #[test]
     fn flush_alloc_metadata_writes_only_dirty_group() {
         let backend = Arc::new(CountingBackend::new(256, 512));
-        let state = alloc_test_state(Arc::clone(&backend));
+        let state = alloc_test_state(Arc::clone(&backend), 1024, 64);
         state.adjust_group_free_blocks(0, -1).expect("mark dirty");
         backend.writes.lock().clear();
 
