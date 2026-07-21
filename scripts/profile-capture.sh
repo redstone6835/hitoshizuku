@@ -10,11 +10,26 @@ trace=${PROFILE_TRACE_FILE:-/sys/kernel/profile_trace}
 usage() {
     echo "usage: $0 <start|stop|status|catalog> [case-id]" >&2
     echo "       $0 run <case-id> <command> [args...]" >&2
+    echo "       PROFILE_PRESET=io|syscall|filesystem|block|full" >&2
     exit 2
 }
 
 write_control() {
     printf '%s\n' "$1" | dd of="$control" conv=notrunc 2>/dev/null
+}
+
+preset_mask() {
+    case "$1" in
+        io) echo 0x1e3ff4000 ;;
+        syscall) echo 0x1000000 ;;
+        filesystem) echo 0x3000000 ;;
+        block) echo 0x1e0000000 ;;
+        full) echo 0x1ffffffff ;;
+        *)
+            echo "profile capture: unknown PROFILE_PRESET=$1" >&2
+            exit 2
+            ;;
+    esac
 }
 
 snapshot() {
@@ -59,10 +74,21 @@ metadata() {
 
 start_capture() {
     case_id=$1
+    if [ -n "${PROFILE_EVENT_MASK:-}" ] && [ -n "${PROFILE_PRESET:-}" ]; then
+        echo "profile capture: PROFILE_EVENT_MASK and PROFILE_PRESET are mutually exclusive" >&2
+        exit 2
+    fi
+    preset=
+    if [ -n "${PROFILE_PRESET:-}" ]; then
+        preset=$(preset_mask "$PROFILE_PRESET")
+    fi
     write_control freeze
     write_control reset
-    [ -z "${PROFILE_EVENT_MASK:-}" ] || \
+    if [ -n "${PROFILE_EVENT_MASK:-}" ]; then
         write_control "events=$PROFILE_EVENT_MASK"
+    elif [ -n "$preset" ]; then
+        write_control "events=$preset"
+    fi
     [ -z "${PROFILE_SAMPLING:-}" ] || \
         write_control "samples=$PROFILE_SAMPLING"
     [ -z "${PROFILE_TRACE_ENABLED:-}" ] || \

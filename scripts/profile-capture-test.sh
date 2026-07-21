@@ -14,7 +14,9 @@ for arg in "$@"; do
     esac
 done
 [ -n "${output:-}" ] || exit 2
-cat >"$output"
+input=$(cat)
+[ -z "${PROFILE_DD_LOG:-}" ] || printf '%s\n' "$input" >>"$PROFILE_DD_LOG"
+printf '%s\n' "$input" >"$output"
 EOF
 chmod +x "$tmp/bin/dd"
 
@@ -43,6 +45,8 @@ PROFILE_KERNEL_RELEASE=mygo \
 PROFILE_KERNEL_IMAGE_ID=kernel-sha256 \
 PROFILE_ROOTFS_IMAGE_ID=rootfs-sha256 \
 PROFILE_CMDLINE='console=ttyS0' \
+PROFILE_DD_LOG="$tmp/dd.log" \
+PROFILE_PRESET=io \
     "$root/scripts/profile-capture.sh" run smoke /bin/sh -c 'exit 7' >"$output"
 status=$?
 set -e
@@ -55,5 +59,16 @@ grep -q '^workload_exit_status=7$' "$output"
 grep -q '^kernel_image_id=kernel-sha256$' "$output"
 grep -q '^rootfs_image_id=rootfs-sha256$' "$output"
 grep -q '^@@PROFILE_TRACE_END phase=after case=smoke$' "$output"
+grep -q '^events=0x1e3ff4000$' "$tmp/dd.log"
+
+if PATH="$tmp/bin:$PATH" \
+    PROFILE_CONTROL="$control" \
+    PROFILE_STATS="$stats" \
+    PROFILE_EVENT_MASK=0x1 \
+    PROFILE_PRESET=io \
+    "$root/scripts/profile-capture.sh" start conflict >/dev/null 2>&1; then
+    echo "profile-capture fixture: conflicting event selectors were accepted" >&2
+    exit 1
+fi
 
 echo "profile-capture fixture: ok"
