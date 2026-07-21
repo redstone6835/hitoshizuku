@@ -226,6 +226,8 @@ pub fn deadline_timer() -> Option<&'static ArchDeadlineTimerOps> {
 #[repr(C)]
 pub struct CpuControlOps {
     pub send_resched: fn(cpu_id: usize),
+    /// 向目标 CPU 发送 membarrier rendezvous IPI。返回 false 表示没有成功投递。
+    pub send_membarrier: fn(cpu_id: usize) -> bool,
     pub is_online: fn(cpu_id: usize) -> bool,
 }
 

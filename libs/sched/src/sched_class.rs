@@ -58,6 +58,11 @@ pub const RT_PRIO_MAX: u8 = 99;
 /// 默认 RR 时间片：100ms，接近 Linux 默认 `sched_rr_timeslice_ms`。
 pub const DEFAULT_RR_SLICE_NS: u64 = 100_000_000;
 
+/// RT bandwidth 周期：每个 CPU 独立记账。
+pub const DEFAULT_RT_PERIOD_NS: u64 = 1_000_000_000;
+/// 默认 RT bandwidth 预算：保留 5% 给 fair/idle 任务和内核工作线程。
+pub const DEFAULT_RT_RUNTIME_NS: u64 = 950_000_000;
+
 /// deadline class 的保守默认参数。
 pub const DEFAULT_DL_RUNTIME_NS: u64 = 4_000_000;
 pub const DEFAULT_DL_DEADLINE_NS: u64 = 16_000_000;

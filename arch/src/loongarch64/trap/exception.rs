@@ -38,23 +38,42 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready() {
+        return;
+    }
+    let task = sched::current_task();
+    let _ =
+        sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
+    match task.state() {
+        sched::TaskState::Zombie | sched::TaskState::Dead => {
+            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            panic!("[trap][signal] terminal task scheduled back unexpectedly");
+        }
+        sched::TaskState::Stopped | sched::TaskState::Continued => {
+            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+        }
+        _ => {}
+    }
+}
+
 /// 在从用户态 trap 返回前投递异步信号。
 ///
 /// syscall 返回路径已经在 `general::syscall::dispatch` 中带 trap-frame context
 /// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。这样忙循环的用户线程
 /// 即使不再进入 syscall，也能在下一次时钟中断返回前进入用户信号 handler。
 fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
+    prepare_user_state_before_return(tf_ptr, from_user);
     if !from_user || !sched::is_ready() {
         return;
     }
     let task = sched::current_task();
-    if !task.signal.has_any_pending() && task.shared_signal_pending_bits_quick() == 0 {
-        return;
+    if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
+        let _ = sched::operation::deliver_pending_signals_for_task(
+            &task,
+            sched::UserContextRef::new(tf_ptr),
+        );
     }
-    let _ = sched::operation::deliver_pending_signals_for_task(
-        &task,
-        sched::UserContextRef::new(tf_ptr),
-    );
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
             sched::schedule_once(super::super::specific::kernel_timestamp_ns());
@@ -120,6 +139,21 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
     arg3: usize, // $r7 = SP
     arg4: usize, // $r8 = TrapFrame ptr
 ) -> usize {
+    let from_user = unsafe { trap_frame_mut(arg4) }.status & CSR_PRMD_PPLV_MASK != 0;
+    let result = unsafe { loongarch64_handle_exception_inner(arg0, arg1, arg2, arg3, arg4) };
+    if result != 0 {
+        prepare_user_state_before_return(result, from_user);
+    }
+    result
+}
+
+unsafe fn loongarch64_handle_exception_inner(
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+) -> usize {
     // 只有实际中断原生 ELM 时，trap 内部分配才需要排除在该单元账本之外。普通用户
     // syscall 可能在分派阶段启动 ELM，不能让后创建的执行上下文继承暂停状态。
     let _accounting_suspension = general::elm_guard::native_execution_active()
@@ -172,6 +206,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                     options(nostack, preserves_flags)
                 );
             }
+            general::dev::irq::record_timer_interrupt();
             // TCFG 使用 one-shot 模式；先恢复常规 tick 作为兜底。调度器处理完
             // 到期等待后会按新的最早 deadline 再次缩短本次计时。
             super::super::loader::rearm_local_timer(None);

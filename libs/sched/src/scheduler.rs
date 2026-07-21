@@ -18,17 +18,20 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
+use crate::deadline_admission::{DeadlineAdmission, utilization_of};
 use crate::eevdf::{NICE_0_WEIGHT, SchedParams};
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
 use crate::migration::MigrationContext;
 use crate::pid::PidNamespace;
 use crate::runqueue::{Runqueue, RunqueueClassLoad};
-use crate::sched_class::{SchedAttr, SchedClass};
+use crate::sched_class::{
+    DEFAULT_RR_SLICE_NS, DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, SchedAttr, SchedClass,
+};
 use crate::scheduler_state::{SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
@@ -168,6 +171,60 @@ struct RealtimeItimer {
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
+
+const NSEC_PER_USEC: u64 = 1_000;
+const NSEC_PER_MSEC: u64 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RtSchedulingConfig {
+    period_us: i32,
+    runtime_us: i32,
+}
+
+impl RtSchedulingConfig {
+    pub(crate) const DEFAULT: Self = Self {
+        period_us: (DEFAULT_RT_PERIOD_NS / NSEC_PER_USEC) as i32,
+        runtime_us: (DEFAULT_RT_RUNTIME_NS / NSEC_PER_USEC) as i32,
+    };
+
+    pub(crate) fn with_period_us(self, value: i64) -> Result<Self, errno::Errno> {
+        if !(1..=i32::MAX as i64).contains(&value)
+            || (self.runtime_us >= 0 && self.runtime_us as i64 > value)
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        Ok(Self {
+            period_us: value as i32,
+            ..self
+        })
+    }
+
+    pub(crate) fn with_runtime_us(self, value: i64) -> Result<Self, errno::Errno> {
+        if !(-1..=i32::MAX as i64).contains(&value) || (value >= 0 && value > self.period_us as i64)
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        Ok(Self {
+            runtime_us: value as i32,
+            ..self
+        })
+    }
+
+    fn bandwidth_ns(self) -> (u64, u64) {
+        let period_ns = self.period_us as u64 * NSEC_PER_USEC;
+        let runtime_ns = if self.runtime_us < 0 {
+            period_ns
+        } else {
+            self.runtime_us as u64 * NSEC_PER_USEC
+        };
+        (period_ns, runtime_ns)
+    }
+}
+
+static RT_SCHEDULING_CONFIG: Spinlock<RtSchedulingConfig> =
+    Spinlock::new(RtSchedulingConfig::DEFAULT);
+static SCHED_RR_TIMESLICE_MS: AtomicI32 =
+    AtomicI32::new((DEFAULT_RR_SLICE_NS / NSEC_PER_MSEC) as i32);
 
 /// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
 static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
@@ -424,6 +481,45 @@ pub fn current_task_fast() -> Arc<Task> {
     }
 }
 
+/// 当前 CPU task 的根 namespace tid；启动早期没有 current 时返回 0。
+pub fn current_task_id() -> u64 {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return 0;
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，读取期间不会失效。
+    unsafe { &*ptr }.pid_root_cached().unwrap_or(0) as u64
+}
+
+#[cfg(feature = "performance-profile")]
+pub fn current_profile_span_id() -> u64 {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return 0;
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，读取期间不会失效。
+    unsafe { &*ptr }.profile_span_id()
+}
+
+#[cfg(feature = "performance-profile")]
+pub fn set_current_profile_span_id(span_id: u64) {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return;
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，写入期间不会失效。
+    unsafe { &*ptr }.set_profile_span_id(span_id);
+}
+
 /// 查询指定 CPU 上的 current；未登记时返回 None。
 #[kernel_symbols::export(name = "sched.scheduler.current_task_on", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_on(cpu_id: usize) -> Option<Arc<Task>> {
@@ -510,8 +606,79 @@ pub fn supported_cpu_mask() -> u64 {
     CpuMask::SUPPORTED.bits()
 }
 
+pub fn sched_rt_period_us() -> i32 {
+    RT_SCHEDULING_CONFIG.lock().period_us
+}
+
+pub fn sched_rt_runtime_us() -> i32 {
+    RT_SCHEDULING_CONFIG.lock().runtime_us
+}
+
+pub fn sched_rr_timeslice_ms() -> i32 {
+    SCHED_RR_TIMESLICE_MS.load(Ordering::Acquire)
+}
+
+pub fn sched_rr_timeslice_ns() -> u64 {
+    sched_rr_timeslice_ms() as u64 * NSEC_PER_MSEC
+}
+
+pub fn set_sched_rt_period_us(value: i64) -> Result<(), errno::Errno> {
+    update_rt_bandwidth(|config| config.with_period_us(value))
+}
+
+pub fn set_sched_rt_runtime_us(value: i64) -> Result<(), errno::Errno> {
+    update_rt_bandwidth(|config| config.with_runtime_us(value))
+}
+
+pub fn set_sched_rr_timeslice_ms(value: i64) -> Result<(), errno::Errno> {
+    let value = normalize_rr_timeslice_ms(value)?;
+    SCHED_RR_TIMESLICE_MS.store(value, Ordering::Release);
+    Ok(())
+}
+
+pub(crate) fn normalize_rr_timeslice_ms(value: i64) -> Result<i32, errno::Errno> {
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(if value <= 0 {
+        (DEFAULT_RR_SLICE_NS / NSEC_PER_MSEC) as i32
+    } else {
+        value as i32
+    })
+}
+
+fn update_rt_bandwidth(
+    update: impl FnOnce(RtSchedulingConfig) -> Result<RtSchedulingConfig, errno::Errno>,
+) -> Result<(), errno::Errno> {
+    let mut config = RT_SCHEDULING_CONFIG.lock();
+    let next = update(*config)?;
+    let (period_ns, runtime_ns) = next.bandwidth_ns();
+    let now_ns = now_ns_internal();
+    for cpu_id in 0..NR_CPUS {
+        runqueue_of(cpu_id).set_rt_bandwidth(period_ns, runtime_ns, now_ns);
+    }
+    *config = next;
+    drop(config);
+
+    let online = online_cpu_mask();
+    for cpu_id in 0..NR_CPUS {
+        if online & (1u64 << cpu_id) != 0 {
+            request_resched(cpu_id);
+        }
+    }
+    Ok(())
+}
+
 fn active_cpu_set() -> CpuMask {
     SCHEDULER.active_set()
+}
+
+pub(crate) fn cpu_capacity(cpu: CpuId) -> u64 {
+    SCHEDULER.topology_snapshot().topology.cpu_capacity(cpu)
+}
+
+pub(crate) fn deadline_admission() -> &'static DeadlineAdmission {
+    SCHEDULER.deadline_admission()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.sched_topology", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
@@ -528,6 +695,13 @@ pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errn
         .contains_mask(CpuMask::SUPPORTED)
     {
         return Err(errno::Errno::EINVAL);
+    }
+    let mut capacities = [0; NR_CPUS];
+    for cpu in CpuMask::SUPPORTED.iter() {
+        capacities[cpu.get()] = topology.cpu_capacity(cpu);
+    }
+    if !SCHEDULER.deadline_admission().fits_capacities(capacities) {
+        return Err(errno::Errno::EBUSY);
     }
     SCHEDULER.install_topology(topology);
     Ok(())
@@ -724,6 +898,7 @@ struct CpuOfflineTask {
     source: crate::PlacementSnapshot,
     target_cpu: CpuId,
     target_domain: usize,
+    was_queued: bool,
 }
 
 /// 将一个非启动 CPU 下线并迁移其排队任务。
@@ -759,10 +934,17 @@ pub(crate) fn offline_cpu_with_scheduler(
         return Err(errno::Errno::EBUSY);
     }
     let drained = cpu_state.runqueue().drain_queued(now_ns);
+    let mut candidates = drained.clone();
+    for task in scheduler.deadline_admission().tasks_on_cpu(cpu) {
+        if !candidates.iter().any(|queued| Arc::ptr_eq(queued, &task)) {
+            candidates.push(task);
+        }
+    }
     let snapshot = scheduler.topology_snapshot();
     let mut planned_load = collect_rq_load_snapshot_for(scheduler, snapshot.active);
+    let mut planned_deadline = scheduler.deadline_admission().totals();
     let mut tasks = Vec::new();
-    for task in &drained {
+    for task in &candidates {
         let _ = refresh_task_placement(scheduler, task);
         let source = task.placement();
         if source.state != crate::PlacementState::Bound
@@ -774,17 +956,33 @@ pub(crate) fn offline_cpu_with_scheduler(
             return Err(errno::Errno::EBUSY);
         }
         let allowed = CpuMask::from_bits_or_boot(task.cpu_affinity()).intersection(snapshot.active);
-        let Some(target_cpu) =
+        let deadline_utilization = utilization_of(task.sched.sched_attr());
+        let target_cpu = if deadline_utilization != 0 {
+            allowed
+                .iter()
+                .filter(|target| {
+                    planned_deadline[target.get()].saturating_add(deadline_utilization)
+                        <= snapshot.topology.cpu_capacity(*target)
+                })
+                .min_by_key(|target| planned_load.load_of(*target))
+        } else {
             snapshot
                 .topology
-                .select_cpu(allowed, snapshot.active, None, false, |cpu| {
-                    planned_load.load_of(cpu)
+                .select_cpu(allowed, snapshot.active, None, false, |target| {
+                    planned_load.load_of(target)
                 })
-        else {
+        };
+        let Some(target_cpu) = target_cpu else {
             restore_drained_tasks(scheduler, cpu, &drained, now_ns);
             return Err(errno::Errno::EBUSY);
         };
         planned_load.add_task(target_cpu);
+        if deadline_utilization != 0 {
+            planned_deadline[cpu.get()] =
+                planned_deadline[cpu.get()].saturating_sub(deadline_utilization);
+            planned_deadline[target_cpu.get()] =
+                planned_deadline[target_cpu.get()].saturating_add(deadline_utilization);
+        }
         let target_domain = snapshot
             .topology
             .domain_for_cpu(target_cpu)
@@ -795,6 +993,7 @@ pub(crate) fn offline_cpu_with_scheduler(
             source,
             target_cpu,
             target_domain,
+            was_queued: drained.iter().any(|queued| Arc::ptr_eq(queued, task)),
         });
     }
 
@@ -808,15 +1007,30 @@ pub(crate) fn offline_cpu_with_scheduler(
     }
 
     for (index, item) in tasks.iter().enumerate() {
-        item.task
-            .commit_migration(item.target_cpu, item.target_domain, snapshot.generation);
-        if !scheduler
-            .cpu_or_boot(item.target_cpu.get())
-            .runqueue()
-            .enqueue(Arc::clone(&item.task), now_ns)
+        let capacity = snapshot.topology.cpu_capacity(item.target_cpu);
+        if scheduler
+            .deadline_admission()
+            .migrate(&item.task, cpu, item.target_cpu, capacity, || {
+                item.task.commit_migration(
+                    item.target_cpu,
+                    item.target_domain,
+                    snapshot.generation,
+                );
+                if item.was_queued
+                    && !scheduler
+                        .cpu_or_boot(item.target_cpu.get())
+                        .runqueue()
+                        .enqueue(Arc::clone(&item.task), now_ns)
+                {
+                    item.task.rollback_migration(item.source);
+                    return Err(errno::Errno::EIO);
+                }
+                Ok(())
+            })
+            .is_err()
         {
             restore_unmoved_tasks(scheduler, cpu, &tasks, index, now_ns);
-            return Err(errno::Errno::EIO);
+            return Err(errno::Errno::EBUSY);
         }
         scheduler
             .cpu_or_boot(item.target_cpu.get())
@@ -825,6 +1039,7 @@ pub(crate) fn offline_cpu_with_scheduler(
 
     let late = cpu_state.runqueue().drain_queued(now_ns);
     if !late.is_empty()
+        || !scheduler.deadline_admission().tasks_on_cpu(cpu).is_empty()
         || cpu_state
             .current()
             .is_some_and(|current| !current.is_idle_task())
@@ -896,10 +1111,12 @@ fn restore_prepared_tasks(
             item.task.rollback_migration(item.source);
         }
         let _ = refresh_task_placement(scheduler, &item.task);
-        let _ = scheduler
-            .cpu_or_boot(cpu.get())
-            .runqueue()
-            .enqueue(Arc::clone(&item.task), now_ns);
+        if item.was_queued {
+            let _ = scheduler
+                .cpu_or_boot(cpu.get())
+                .runqueue()
+                .enqueue(Arc::clone(&item.task), now_ns);
+        }
     }
 }
 
@@ -914,10 +1131,12 @@ fn restore_unmoved_tasks(
     for item in &tasks[first_unmoved..] {
         item.task.rollback_migration(item.source);
         let _ = refresh_task_placement(scheduler, &item.task);
-        let _ = scheduler
-            .cpu_or_boot(cpu.get())
-            .runqueue()
-            .enqueue(Arc::clone(&item.task), now_ns);
+        if item.was_queued {
+            let _ = scheduler
+                .cpu_or_boot(cpu.get())
+                .runqueue()
+                .enqueue(Arc::clone(&item.task), now_ns);
+        }
     }
 }
 
@@ -1048,6 +1267,9 @@ pub fn run_post_syscall_handoff_lazy() {
 
 /// 按调度域、亲和性和当前负载选择目标 CPU。
 pub fn select_task_cpu(task: &Arc<Task>) -> usize {
+    if let Some((cpu, _)) = SCHEDULER.deadline_admission().reservation_of(task) {
+        return cpu.get();
+    }
     task_sched_placement(task)
         .preferred_cpu
         .unwrap_or_else(CpuId::boot)
@@ -1171,8 +1393,11 @@ pub(crate) fn enqueue_task_on_scheduler(
     };
 
     for _ in 0..NR_CPUS {
-        let cpu_id = task_sched_placement_on(scheduler, &task)
-            .preferred_cpu
+        let cpu_id = scheduler
+            .deadline_admission()
+            .reservation_of(&task)
+            .map(|(cpu, _)| cpu)
+            .or_else(|| task_sched_placement_on(scheduler, &task).preferred_cpu)
             .unwrap_or_else(CpuId::boot)
             .get();
         let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
@@ -1210,9 +1435,15 @@ fn enqueue_task_locked_with_hint(task: Arc<Task>, now_ns: u64, cpu_hint: usize) 
     }
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let active = active_cpu_set();
-    let hinted =
-        CpuId::new(cpu_hint).filter(|cpu| affinity.contains(*cpu) && active.contains(*cpu));
-    let cpu_id = hinted
+    let reserved = SCHEDULER
+        .deadline_admission()
+        .reservation_of(&task)
+        .map(|(cpu, _)| cpu)
+        .filter(|cpu| affinity.contains(*cpu) && active.contains(*cpu));
+    let hinted = CpuId::new(cpu_hint)
+        .filter(|cpu| reserved.is_none() && affinity.contains(*cpu) && active.contains(*cpu));
+    let cpu_id = reserved
+        .or(hinted)
         .or_else(|| select_cpu_for_mask(affinity, None, false))
         .unwrap_or_else(CpuId::boot)
         .get();
@@ -1680,6 +1911,14 @@ fn attach_migrated_task(
     source_detached: bool,
 ) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
+    attach_migrated_task_locked(task, context, source_detached)
+}
+
+fn attach_migrated_task_locked(
+    task: &Arc<Task>,
+    context: MigrationContext,
+    source_detached: bool,
+) -> Result<(), errno::Errno> {
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let topology = SCHEDULER.topology_snapshot();
     if let Err(error) = validate_migration_target(context, topology, affinity) {
@@ -1703,25 +1942,41 @@ fn attach_migrated_task(
         rollback_migration(task, context, true);
         return Err(errno::Errno::EAGAIN);
     }
-    task.commit_migration(
+    let source_cpu = context.source.cpu.unwrap_or_else(CpuId::boot);
+    let target_capacity = topology.topology.cpu_capacity(context.target_cpu);
+    SCHEDULER.deadline_admission().migrate(
+        task,
+        source_cpu,
         context.target_cpu,
-        context.target_domain,
-        context.topology_generation,
-    );
-    if !SCHEDULER
-        .cpu_or_boot(context.target_cpu.get())
-        .runqueue()
-        .enqueue(Arc::clone(task), now_ns_internal())
-    {
-        rollback_migration(task, context, true);
-        return Err(errno::Errno::EIO);
-    }
+        target_capacity,
+        || {
+            task.commit_migration(
+                context.target_cpu,
+                context.target_domain,
+                context.topology_generation,
+            );
+            if !SCHEDULER
+                .cpu_or_boot(context.target_cpu.get())
+                .runqueue()
+                .enqueue(Arc::clone(task), now_ns_internal())
+            {
+                rollback_migration(task, context, true);
+                return Err(errno::Errno::EIO);
+            }
+            Ok(())
+        },
+    )?;
     request_resched(context.target_cpu.get());
     Ok(())
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.migrate_task", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    migrate_task_locked(task, target_cpu)
+}
+
+fn migrate_task_locked(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
     if !task.sched.on_rq() {
         let target = CpuId::new(target_cpu).ok_or(errno::Errno::EINVAL)?;
         if !active_cpu_set().contains(target)
@@ -1729,11 +1984,17 @@ pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Er
         {
             return Err(errno::Errno::EINVAL);
         }
-        bind_task_to_cpu(task, target_cpu);
-        return Ok(());
+        let source = task.placement().cpu.unwrap_or_else(CpuId::boot);
+        let capacity = cpu_capacity(target);
+        return SCHEDULER
+            .deadline_admission()
+            .migrate(task, source, target, capacity, || {
+                bind_task_to_cpu(task, target_cpu);
+                Ok(())
+            });
     }
     let context = migration_context(task, target_cpu)?;
-    attach_migrated_task(task, context, false)
+    attach_migrated_task_locked(task, context, false)
 }
 
 /// 从最忙 CPU 拉一个任务到 `cpu_id`。AP 启动后可由 idle/tick 路径周期调用。
@@ -1777,11 +2038,9 @@ pub fn balance_once(cpu_id: usize) -> bool {
         return false;
     };
     if class == SchedClass::Deadline {
-        let target_load = domain_loads.load_of(local_cpu);
-        let task_utilization = deadline_task_utilization(&task);
-        if !deadline_has_capacity(
-            target_load,
-            task_utilization,
+        if !SCHEDULER.deadline_admission().can_migrate(
+            &task,
+            local_cpu,
             topology.cpu_capacity(local_cpu),
         ) {
             let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
@@ -1911,27 +2170,6 @@ fn class_allows_pull(
         }
         SchedClass::Idle => false,
     }
-}
-
-fn deadline_task_utilization(task: &Arc<Task>) -> u64 {
-    let runtime = task.sched.deadline_runtime_ns();
-    let period = task.sched.deadline_period_ns();
-    if runtime == 0 || period == 0 {
-        return 0;
-    }
-    ((runtime as u128 * crate::SCHED_CAPACITY_SCALE as u128) / period as u128).min(u64::MAX as u128)
-        as u64
-}
-
-pub(crate) fn deadline_has_capacity(
-    target_load: RunqueueClassLoad,
-    task_utilization: u64,
-    capacity: u64,
-) -> bool {
-    target_load
-        .deadline_utilization
-        .saturating_add(task_utilization)
-        <= capacity
 }
 
 fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usize) {
@@ -2082,13 +2320,27 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    prev.mark_rseq_event(crate::rseq::RseqEvent::Preempt);
     let account_now_ns = if now_ns == 0 {
         now_ns_internal()
     } else {
         now_ns
     };
     #[cfg(feature = "performance-profile")]
-    profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
+    {
+        prev.mark_profile_blocked();
+        let prev_id = prev.pid_root_cached().unwrap_or(0) as u64;
+        let next_id = next.pid_root_cached().unwrap_or(0) as u64;
+        profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
+        profiling::trace_task_event_with_span(
+            profiling::TraceKind::SchedSwitch,
+            profiling::Event::SchedSwitch,
+            prev_id,
+            prev.profile_span_id(),
+            prev_id,
+            next_id,
+        );
+    }
     prev.account_switch_out(account_now_ns);
     next.account_switch_in(account_now_ns);
     prev.record_involuntary_context_switch();
@@ -2264,7 +2516,7 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
     };
     let t = crate::spawn::kthread_create(idle_entry, cpu_id, params);
     t.mark_idle_task();
-    t.sched.set_sched_attr(SchedAttr::idle());
+    t.set_sched_attr(SchedAttr::idle());
     t.set_cpu_affinity(CpuMask::single_raw(cpu_id).bits());
     install_idle(cpu_id, Arc::clone(&t));
     log::info!(

@@ -10,7 +10,9 @@ use alloc::vec::Vec;
 
 use crate::cpu::SCHED_CAPACITY_SCALE;
 use crate::eevdf::{NICE_0_WEIGHT, SchedParams};
-use crate::sched_class::{RT_PRIO_MAX, SchedAttr, SchedClass, SchedPolicy};
+use crate::sched_class::{
+    DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, SchedAttr, SchedClass, SchedPolicy,
+};
 use crate::sync::Spinlock;
 use crate::task::{Task, TaskState};
 
@@ -101,6 +103,11 @@ struct RqInner {
     last_update_ns: u64,
     enqueue_seq: u64,
     preferred_fair_addr: Option<usize>,
+    rt_period_ns: u64,
+    rt_runtime_ns: u64,
+    rt_period_start_ns: u64,
+    rt_runtime_used_ns: u64,
+    rt_throttled: bool,
 }
 
 /// 单 CPU 运行队列。每个 online CPU 持有一份。
@@ -188,6 +195,38 @@ impl Runqueue {
                 last_update_ns: 0,
                 enqueue_seq: 0,
                 preferred_fair_addr: None,
+                rt_period_ns: DEFAULT_RT_PERIOD_NS,
+                rt_runtime_ns: DEFAULT_RT_RUNTIME_NS,
+                rt_period_start_ns: 0,
+                rt_runtime_used_ns: 0,
+                rt_throttled: false,
+            }),
+        }
+    }
+
+    /// 创建带有指定 RT bandwidth 的运行队列，仅供调度器初始化和测试使用。
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn new_with_rt_bandwidth(period_ns: u64, runtime_ns: u64) -> Self {
+        let period_ns = period_ns.max(1);
+        Self {
+            inner: Spinlock::new(RqInner {
+                fair_tree: BTreeMap::new(),
+                rt_tree: BTreeMap::new(),
+                deadline_tree: BTreeMap::new(),
+                deadline_throttled: BTreeMap::new(),
+                idle_tree: BTreeMap::new(),
+                total_weight: 0,
+                weighted_vruntime_sum: 0,
+                min_vruntime: 0,
+                current: None,
+                last_update_ns: 0,
+                enqueue_seq: 0,
+                preferred_fair_addr: None,
+                rt_period_ns: period_ns,
+                rt_runtime_ns: runtime_ns.min(period_ns),
+                rt_period_start_ns: 0,
+                rt_runtime_used_ns: 0,
+                rt_throttled: false,
             }),
         }
     }
@@ -206,6 +245,19 @@ impl Runqueue {
             + inner.deadline_throttled.len()
             + inner.idle_tree.len()
             + usize::from(inner.current.is_some())
+    }
+
+    /// 原子替换本 CPU 的 RT bandwidth 参数并重新开始记账周期。
+    pub(crate) fn set_rt_bandwidth(&self, period_ns: u64, runtime_ns: u64, now_ns: u64) {
+        let period_ns = period_ns.max(1);
+        let runtime_ns = runtime_ns.min(period_ns);
+        let mut inner = self.inner.lock();
+        let _ = update_curr_locked(&mut inner, now_ns);
+        inner.rt_period_ns = period_ns;
+        inner.rt_runtime_ns = runtime_ns;
+        inner.rt_period_start_ns = now_ns - now_ns % period_ns;
+        inner.rt_runtime_used_ns = 0;
+        inner.rt_throttled = runtime_ns == 0;
     }
 
     /// 可跨 CPU 迁移的就绪负载。
@@ -327,7 +379,7 @@ impl Runqueue {
     pub(crate) fn tick(&self, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
         let replenished = update_curr_locked(&mut inner, now_ns);
-        let Some(curr) = inner.current.as_ref() else {
+        let Some(curr) = inner.current.as_ref().map(Arc::clone) else {
             return replenished;
         };
         replenished
@@ -337,10 +389,12 @@ impl Runqueue {
                         || now_ns > curr.sched.absolute_deadline_ns()
                 }
                 SchedPolicy::RtRoundRobin => {
-                    curr.sched.rr_remaining_ns() == 0
-                        && has_rt_peer_locked(&inner, curr.sched.rt_priority())
+                    (inner.rt_throttled && !curr.pi_is_boosted())
+                        || ((!inner.rt_throttled || curr.pi_is_boosted())
+                            && curr.sched.rr_remaining_ns() == 0
+                            && has_rt_peer_locked(&inner, curr.sched.rt_priority()))
                 }
-                SchedPolicy::RtFifo => false,
+                SchedPolicy::RtFifo => inner.rt_throttled && !curr.pi_is_boosted(),
                 SchedPolicy::Fair | SchedPolicy::Idle => {
                     curr.sched.vruntime() >= curr.sched.deadline()
                 }
@@ -463,16 +517,26 @@ impl Runqueue {
 
     /// 在 rq 锁内更新 nice / slice，并按旧属性先完成出队记账。
     pub(crate) fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) -> bool {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params))
+        self.update_sched_entity(task, now_ns, |task| task.set_sched_params(params))
     }
 
     /// 在 rq 锁内只更新 nice/weight，保持策略与时间片不变。
     pub(crate) fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) -> bool {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice))
+        self.update_sched_entity(task, now_ns, |task| task.set_nice(nice))
     }
 
     /// 在 rq 锁内更新完整调度属性，并按旧 class / 权重完成出队记账。
     pub(crate) fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.set_sched_attr(attr))
+    }
+
+    /// 只应用 PI 计算出的有效属性，不改写任务保存的用户基础属性。
+    pub(crate) fn update_sched_attr_raw(
+        &self,
+        task: &Arc<Task>,
+        attr: SchedAttr,
+        now_ns: u64,
+    ) -> bool {
         self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr))
     }
 
@@ -676,7 +740,9 @@ fn pick_queued_candidate_locked(
     if let Some(key) = inner
         .rt_tree
         .iter()
-        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .find(|(_, task)| {
+            task_allowed_on(task, cpu_mask) && (!inner.rt_throttled || task.pi_is_boosted())
+        })
         .map(|(key, _)| *key)
     {
         return inner.rt_tree.remove(&key);
@@ -954,7 +1020,9 @@ fn take_deadline_migratable_locked(
 }
 
 fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
+    let mut rt_replenished = refresh_rt_bandwidth_locked(inner, now_ns);
     if now_ns > inner.last_update_ns {
+        let previous_ns = inner.last_update_ns;
         let delta = now_ns - inner.last_update_ns;
         inner.last_update_ns = now_ns;
         if let Some(curr) = inner.current.as_ref().map(Arc::clone) {
@@ -965,15 +1033,41 @@ fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
                 }
                 SchedPolicy::RtRoundRobin => {
                     let _ = curr.sched.charge_rr_runtime(delta);
+                    charge_rt_bandwidth_locked(inner, previous_ns, now_ns);
                 }
                 SchedPolicy::Deadline => {
                     let _ = curr.sched.charge_deadline_runtime(delta);
                 }
-                SchedPolicy::RtFifo => {}
+                SchedPolicy::RtFifo => charge_rt_bandwidth_locked(inner, previous_ns, now_ns),
             }
         }
     }
-    requeue_ready_deadline_locked(inner, now_ns)
+    rt_replenished |= requeue_ready_deadline_locked(inner, now_ns);
+    rt_replenished
+}
+
+fn refresh_rt_bandwidth_locked(inner: &mut RqInner, now_ns: u64) -> bool {
+    let period_start = now_ns - (now_ns % inner.rt_period_ns);
+    if period_start == inner.rt_period_start_ns {
+        return false;
+    }
+    let was_throttled = inner.rt_throttled;
+    inner.rt_period_start_ns = period_start;
+    inner.rt_runtime_used_ns = 0;
+    inner.rt_throttled = inner.rt_runtime_ns == 0;
+    was_throttled && !inner.rt_throttled
+}
+
+fn charge_rt_bandwidth_locked(inner: &mut RqInner, previous_ns: u64, now_ns: u64) {
+    if inner.rt_throttled || inner.rt_runtime_ns == inner.rt_period_ns {
+        return;
+    }
+    let charge_from = previous_ns.max(inner.rt_period_start_ns);
+    let delta = now_ns.saturating_sub(charge_from);
+    inner.rt_runtime_used_ns = inner.rt_runtime_used_ns.saturating_add(delta);
+    if inner.rt_runtime_used_ns >= inner.rt_runtime_ns {
+        inner.rt_throttled = true;
+    }
 }
 
 fn requeue_ready_deadline_locked(inner: &mut RqInner, now_ns: u64) -> bool {

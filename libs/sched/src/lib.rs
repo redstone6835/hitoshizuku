@@ -31,16 +31,18 @@
 //!
 //! ## 锁顺序 (Lock Ordering)
 //!
-//! 1. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
-//! 2. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
-//! 3. `Task::creds` / `Task::shared_signal` / `Task::kstack` / `Task::ctx`
+//! 1. `RT_SCHEDULING_CONFIG` —— 仅 sysctl 更新路径持有；可依次进入各 CPU
+//!    `Runqueue::inner`，反向获取禁止。
+//! 2. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
+//! 3. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
+//! 4. `Task::creds` / `Task::shared_signal` / `Task::kstack` / `Task::ctx`
 //!    / `Task::ext` —— 同一 Task 内的次级字段锁，彼此独立，禁止互相嵌套。
-//! 4. `ThreadGroup::members` / `ProcessGroup::members` / `Session::groups` ——
+//! 5. `ThreadGroup::members` / `ProcessGroup::members` / `Session::groups` ——
 //!    组成员索引。
-//! 5. `SharedSignal::actions` / `SharedSignal::shared_pending_infos` ——
+//! 6. `SharedSignal::actions` / `SharedSignal::shared_pending_infos` ——
 //!    tg 共享信号表。
-//! 6. `WaitQueue::waiters` —— 等待者列表。
-//! 7. `SignalState::pending_infos` —— per-task 信号队列。
+//! 7. `WaitQueue::waiters` —— 等待者列表。
+//! 8. `SignalState::pending_infos` —— per-task 信号队列。
 //!
 //! 调用可能触发唤醒 / 分配的函数前必须释放所有 rq 锁。
 //!
@@ -52,9 +54,11 @@ extern crate alloc;
 pub mod arch_hooks;
 pub mod clone_flags;
 pub mod cpu;
+mod deadline_admission;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
+pub mod membarrier;
 pub mod migration;
 pub mod mutex;
 pub mod operation;
@@ -62,6 +66,7 @@ pub mod pid;
 pub mod placement;
 pub mod process_ops;
 pub mod rlimit;
+pub mod rseq;
 mod runqueue;
 pub mod sched_class;
 pub mod scheduler;
@@ -84,6 +89,7 @@ pub use cpu::{
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
+pub use membarrier::{handle_ipi as handle_membarrier_ipi, synchronize_cpus};
 pub use migration::MigrationContext;
 pub use operation::spawn_user_process;
 pub use pid::{PidNamespace, PidRegistry, PidT};
@@ -92,10 +98,12 @@ pub use process_ops::{
     ExecRequest, ProcessImageOps, UserContextRef, process_image_ops, register_process_image_ops,
 };
 pub use rlimit::{Resource, Rlim, RlimitError, RlimitPair, Rlimits, RlimitsLock};
+pub use rseq::{RseqCs, RseqError, RseqEvent, RseqEvents, RseqResumeAction, validate_signature};
 pub use runqueue::RunqueueClassLoad;
 pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
-    RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
+    DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass,
+    SchedPolicy,
 };
 pub use scheduler::{
     DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
@@ -103,17 +111,22 @@ pub use scheduler::{
 };
 pub use scheduler::{
     NR_CPUS, activate_cpu, active_cpu_mask, balance_once, current_cpu_id, current_task,
-    current_task_cpu_time_ns, current_task_fast, current_task_on, current_task_ref,
-    defer_timer_tick, drain_deferred_timer_tick, enqueue_task, enqueue_task_preferred,
-    enqueue_task_with_hint, idle_task, init, init_task, install_idle, is_cpu_active, is_cpu_online,
-    is_ready, mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
-    offline_cpu, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
-    register_sleep_deadline, request_balance, request_post_syscall_handoff, request_resched,
-    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, schedule_once,
-    scheduler_diag, set_realtime_itimer, signal_wakeup, spawn_idle_for, supported_cpu_mask,
+    current_task_cpu_time_ns, current_task_fast, current_task_id, current_task_on,
+    current_task_ref, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
+    enqueue_task_preferred, enqueue_task_with_hint, idle_task, init, init_task, install_idle,
+    is_cpu_active, is_cpu_online, is_ready, mark_cpu_online, migrate_task, needs_resched,
+    needs_resched_current, now_ns_public, offline_cpu, on_timer_tick, online_cpu_mask, pid_count,
+    preempt_if_needed, register_cpu, register_sleep_deadline, request_balance,
+    request_post_syscall_handoff, request_resched, root_pid_ns, run_post_syscall_handoff,
+    run_post_syscall_handoff_lazy, sched_rr_timeslice_ms, sched_rr_timeslice_ns,
+    sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag, set_realtime_itimer,
+    set_sched_rr_timeslice_ms, set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup,
+    spawn_idle_for, supported_cpu_mask,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
+#[cfg(feature = "performance-profile")]
+pub use scheduler::{current_profile_span_id, set_current_profile_span_id};
 pub use scheduler::{
     current_sched_domain_id, install_sched_topology, sched_domain_stats, sched_topology,
     task_sched_placement,
@@ -134,10 +147,10 @@ pub use task::{
     TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS, TASKEXT_EXEC_ARGS,
     TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
     TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
-    TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt, TaskExtCloneHook, TaskExtExitHook, TaskExtKey,
-    TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason, ext_clone_hook, ext_exit_hook,
-    pre_exit_hook, register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook,
-    task_diag,
+    TASKEXT_VM_SPACE, Task, TaskDiag, TaskExitAccountingHook, TaskExt, TaskExtCloneHook,
+    TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason,
+    ext_clone_hook, ext_exit_hook, pre_exit_hook, register_exit_accounting_hook,
+    register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook, task_diag,
 };
 pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};

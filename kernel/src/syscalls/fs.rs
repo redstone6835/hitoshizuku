@@ -2536,8 +2536,43 @@ pub(super) fn sys_sync_file_range2(ctx: &mut SyscallContext<'_>) -> Result<usize
     Ok(0)
 }
 
-pub(super) fn sys_acct(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_acct(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    if !ctx.task().credentials().has_cap(Capability::SysPacct) {
+        return Err(Errno::EPERM);
+    }
+    if ctx.args[0] == 0 {
+        crate::acct::disable();
+        return Ok(0);
+    }
+
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = vfs::fdtable::FdTable::new_default();
+    let path = copy_path_from_user(ctx.args[0])?;
+    let options = OpenOptions {
+        access: AccessMode::WriteOnly,
+        append: true,
+        ..OpenOptions::default()
+    };
+    let fd = operation::openat(
+        &vfs_ctx,
+        &fdt,
+        &Dirfd::Cwd,
+        &path,
+        options,
+        FileMode::new(0),
+    )
+    .map_err(|error| error.to_errno())?;
+    let Some(file) = fdt.get_file(fd) else {
+        let _ = operation::close(&fdt, fd);
+        return Err(Errno::EBADF);
+    };
+    let regular = file.inode().kind() == FileType::Regular;
+    operation::close(&fdt, fd).map_err(|error| error.to_errno())?;
+    if !regular {
+        return Err(Errno::EACCES);
+    }
+    crate::acct::install(file);
+    Ok(0)
 }
 
 pub(super) fn sys_fanotify_init(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

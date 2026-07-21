@@ -20,6 +20,22 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+if [ -x /bin/pthread-smp-test ]; then
+    echo "[init][smp-tests] running pthread SMP tests"
+    /bin/pthread-smp-test
+    status=$?
+    echo "[init][smp-tests] pthread SMP tests exit=$status"
+fi
+
+if [ -x /bin/acct-test ]; then
+    echo "[init][acct-tests] running process accounting tests"
+    /bin/acct-test record
+    record_status=$?
+    /bin/acct-test verify "$record_status"
+    status=$?
+    echo "[init][acct-tests] process accounting tests exit=$status"
+fi
+
 enter_shell=0
 trap 'enter_shell=1' INT
 echo "[init] press Ctrl+C within 3 seconds to enter shell"

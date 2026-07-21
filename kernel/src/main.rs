@@ -7,6 +7,7 @@ extern crate hal;
 
 use core::alloc::{GlobalAlloc, Layout};
 
+mod acct;
 mod acpi;
 #[cfg(any(
     feature = "bench",
@@ -24,10 +25,13 @@ mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 mod net_tests;
 mod panic;
+mod rseq;
 mod sched;
 mod start;
 mod stdio;
 mod syscalls;
+#[cfg(any(feature = "kernel-tests", feature = "smp-tests"))]
+mod tests;
 mod tty_poll;
 mod user;
 mod vdso;
@@ -70,9 +74,11 @@ fn main() -> ! {
             hal::time::stable_counter_raw,
             ::sched::current_cpu_id,
             ::sched::current_task_cpu_time_ns,
+            ::sched::current_task_id,
+            ::sched::current_profile_span_id,
+            ::sched::set_current_profile_span_id,
             hal::time::stable_counter_hz(),
         );
-        profiling::set_enabled(true);
     }
     let secondary_cpus = hal::sched::start_secondary_cpus();
     log::info!(
@@ -124,7 +130,8 @@ fn main() -> ! {
     #[cfg(any(
         feature = "kernel-tests",
         feature = "network-tests",
-        feature = "allocator-tests"
+        feature = "allocator-tests",
+        feature = "smp-tests"
     ))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);
