@@ -17,15 +17,13 @@ use core::num::NonZeroU32;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
-
 #[cfg(feature = "block-profile")]
 use super::common::VirtioBlkProfile;
 use super::common::{
-    MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest, VirtioBlkCapabilities,
-    VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore, VirtioBlkQueueId,
-    VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits, free_allocated_request,
-    negotiate_supported_features, read_device_config, status_to_result,
+    IrqSafeMutex, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest,
+    VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore,
+    VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
+    free_allocated_request, negotiate_supported_features, read_device_config, status_to_result,
     validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
     write_data_payload,
 };
@@ -87,7 +85,7 @@ struct VirtioBlkInner {
     interrupt_status_addr: usize,
     interrupt_ack_addr: usize,
     /// 队列
-    queue: Mutex<VirtioBlkQueueCore>,
+    queue: IrqSafeMutex<VirtioBlkQueueCore>,
     /// 中断计数（用于轮询模式）
     irq_count: AtomicUsize,
     #[cfg(feature = "block-profile")]
@@ -255,7 +253,7 @@ impl VirtioBlk {
             notify_value: u32::from(queue_id.raw()),
             interrupt_status_addr: mmio_base + MMIO_INTERRUPT_STATUS,
             interrupt_ack_addr: mmio_base + MMIO_INTERRUPT_ACK,
-            queue: Mutex::new(VirtioBlkQueueCore::new(split_queue)),
+            queue: IrqSafeMutex::new(VirtioBlkQueueCore::new(split_queue)),
             irq_count: AtomicUsize::new(0),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
@@ -514,7 +512,7 @@ struct VirtioBlkIo {
 
 impl BlockDriver for VirtioBlkIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
-        // 进来先尝试 drain 一下硬件已完成的请求，给后面的提交腾描述符。
+        // 先回收设备已发布的完成项，避免并发提交在中断合并时丢失进度。
         self.driver.poll();
         let mut queue = self.driver.inner.queue.lock();
         if queue.is_failed() {
