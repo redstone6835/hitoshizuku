@@ -64,8 +64,13 @@ active && /^state=/ {
     if (value("active_writers") != "0") fail("active writers remain for case=" case_id " phase=" phase)
     if (value("format_version") != "2") fail("unsupported trace format for case=" case_id " phase=" phase)
     if (value("counter_hz") + 0 <= 0) fail("invalid counter frequency for case=" case_id " phase=" phase)
+    if (value("slots_per_cpu") + 0 <= 0) fail("invalid trace capacity for case=" case_id " phase=" phase)
+    if (value("record_bytes") != "80") fail("invalid trace record size for case=" case_id " phase=" phase)
     current_session = value("session")
     sessions[key] = current_session
+    frequencies[key] = value("counter_hz")
+    capacities[key] = value("slots_per_cpu")
+    record_sizes[key] = value("record_bytes")
     cases[case_id] = 1
     next
 }
@@ -90,6 +95,10 @@ END {
             fail("missing trace header for case=" case_id)
         else if (sessions[before] == "" || sessions[before] != sessions[after])
             fail("session mismatch for case=" case_id)
+        else if (frequencies[before] != frequencies[after])
+            fail("counter frequency mismatch for case=" case_id)
+        else if (capacities[before] != capacities[after] || record_sizes[before] != record_sizes[after])
+            fail("trace layout mismatch for case=" case_id)
         if (!seen_meta[before] || !seen_meta[after]) {
             fail("missing metadata for case=" case_id)
             continue
