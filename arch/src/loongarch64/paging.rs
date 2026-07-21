@@ -619,6 +619,33 @@ impl LoongArch64Paging {
         crate::loongarch64::smp::flush_tlb_on_cpus(asid, vaddr.map(VirtAddr::as_usize), targets);
     }
 
+    /// 发布页表写并只失效当前 CPU 的目标用户 translation。
+    ///
+    /// `Some(vaddr)` 使用 ASID + 地址定向失效；`None` 保守清空当前 CPU 全部 TLB。
+    /// 本接口不通知远端 CPU，只能用于从无效 PTE 新建映射，或确认叶 PTE 已存在后
+    /// 收敛当前 CPU 缓存的旧无效 translation。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证页表写已经完成，且不能用本接口发布解除映射、权限变化或
+    /// 物理页替换。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_local_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
+        Self::page_table_barrier();
+        unsafe {
+            if let Some(addr) = vaddr {
+                core::arch::asm!(
+                    "invtlb 0x5, {asid}, {address}",
+                    asid = in(reg) asid_bits(asid),
+                    address = in(reg) addr.as_usize(),
+                    options(nostack)
+                );
+            } else {
+                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
+            }
+        }
+    }
+
     /// 使用当前 CSR_ASID 同步刷新所有在线 CPU 的 TLB。
     ///
     /// # Safety

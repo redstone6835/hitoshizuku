@@ -15,7 +15,7 @@ use mm::{FileLike, SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
 use sched::sync::Spinlock;
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
-use crate::mm::ops::{PgdHandle, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
+use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
 
 #[inline]
 fn vm_layout() -> &'static UserVmLayoutOps {
@@ -750,7 +750,7 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(range.start, range.end - range.start);
+        self.publish_new_user_range(range.start, range.end - range.start);
         Ok(())
     }
 
@@ -1105,6 +1105,20 @@ impl VmSpace {
 
     /// page-fault 分派进来的入口。按 VMA backing / 权限决定该做什么。
     pub fn handle_fault(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
+        self.handle_fault_inner(addr, kind, true)
+    }
+
+    /// 预解析用户页访问，但不把已驻留页当作硬件缓存了无效 translation。
+    fn ensure_page_access(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
+        self.handle_fault_inner(addr, kind, false)
+    }
+
+    fn handle_fault_inner(
+        &self,
+        addr: usize,
+        kind: FaultKind,
+        publish_unchanged_mapping: bool,
+    ) -> FaultOutcome {
         if user_pgd_ops().is_none() {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
         }
@@ -1133,7 +1147,9 @@ impl VmSpace {
         let area_start = area.range.start;
         drop(set);
 
-        if let Some(outcome) = self.handle_resident_fault(page, flags, kind) {
+        if let Some(outcome) =
+            self.handle_resident_fault(page, flags, kind, publish_unchanged_mapping)
+        {
             return outcome;
         }
 
@@ -1171,7 +1187,7 @@ impl VmSpace {
         } else {
             FaultKind::Load
         };
-        match self.handle_fault(user, kind) {
+        match self.ensure_page_access(user, kind) {
             FaultOutcome::Fixed => self.with_user_atomic_u32(user, write, |_| ((), false)),
             FaultOutcome::Segv | FaultOutcome::Kernel(_) => Err(Errno::EFAULT),
         }
@@ -1328,7 +1344,7 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(start, end - start);
+        self.publish_new_user_range(start, end - start);
         Ok(())
     }
 
@@ -1407,7 +1423,7 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(start, end - start);
+        self.publish_new_user_range(start, end - start);
         Ok(())
     }
 
@@ -1431,7 +1447,7 @@ impl VmSpace {
         if max_len == 0 || user.checked_add(max_len - 1).is_none() {
             return Err(Errno::EFAULT);
         }
-        match self.handle_fault(user, kind) {
+        match self.ensure_page_access(user, kind) {
             FaultOutcome::Fixed => {}
             FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
         }
@@ -1501,7 +1517,7 @@ impl VmSpace {
         if let Some(mapping) = pages.get_mut(&page_va) {
             let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
             drop(pages);
-            return self.finish_resident_fault(page_va, update);
+            return self.finish_resident_fault(page_va, update, true);
         }
         if let Err(err) =
             self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
@@ -1513,7 +1529,7 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(page_va, page_size());
+        self.publish_new_user_range(page_va, page_size());
         FaultOutcome::Fixed
     }
 
@@ -1522,22 +1538,28 @@ impl VmSpace {
         page_va: usize,
         flags: VmFlags,
         kind: FaultKind,
+        publish_unchanged_mapping: bool,
     ) -> Option<FaultOutcome> {
         let mut pages = self.pages.lock();
         let mapping = pages.get_mut(&page_va)?;
         let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
         drop(pages);
-        Some(self.finish_resident_fault(page_va, update))
+        Some(self.finish_resident_fault(page_va, update, publish_unchanged_mapping))
     }
 
     fn finish_resident_fault(
         &self,
         page_va: usize,
         update: (FaultOutcome, bool, Option<Arc<ResidentPage>>),
+        publish_unchanged_mapping: bool,
     ) -> FaultOutcome {
         let (outcome, invalidate, retired) = update;
         if invalidate {
             self.invalidate_user_range(page_va, page_size());
+        } else if publish_unchanged_mapping && matches!(outcome, FaultOutcome::Fixed) {
+            // 本核因旧无效 translation 进入缺页，但另一 CPU 可能已经安装了叶 PTE。
+            // 这里只需收敛当前 CPU；该分支没有替换任何旧有效映射。
+            self.publish_new_user_range(page_va, page_size());
         }
         // COW 的旧页必须活到所有 CPU 都完成 TLB 失效之后，避免远端仍通过旧
         // TLB 访问已回收的物理页。
@@ -1612,7 +1634,21 @@ impl VmSpace {
 
     fn invalidate_user_range(&self, vaddr: usize, len: usize) {
         if let Some(ops) = user_pgd_ops() {
-            unsafe { (ops.invalidate_range)(self.pgd, vaddr, len) };
+            // Safety: 调用方已经完成页表更新；ExistingMapping 要求同步所有历史
+            // 激活 CPU，防止旧有效 translation 越过权限或资源回收边界。
+            unsafe {
+                UserPteUpdate::ExistingMapping.publish(ops, self.pgd, vaddr, len);
+            }
+        }
+    }
+
+    fn publish_new_user_range(&self, vaddr: usize, len: usize) {
+        if let Some(ops) = user_pgd_ops() {
+            // Safety: 仅由确认原先没有叶 PTE 的建图路径或硬件缺页的无效缓存
+            // 收敛路径调用；不会替换仍可能被其它 CPU 使用的有效 translation。
+            unsafe {
+                UserPteUpdate::NewMapping.publish(ops, self.pgd, vaddr, len);
+            }
         }
     }
 

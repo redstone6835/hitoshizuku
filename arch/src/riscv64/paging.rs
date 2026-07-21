@@ -220,8 +220,17 @@ impl Riscv64Paging {
         );
     }
 
+    /// 排序先前页表写，并只失效当前 hart 的目标 ASID translation。
+    ///
+    /// 本接口不发 SBI RFENCE。调用者只有在确认不存在旧有效映射，或只是收敛
+    /// 当前 hart 缓存的无效 translation 时才能单独使用它。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 S-mode 下调用；解除映射、权限变化和物理页替换仍需使用同步多核
+    /// 失效接口。
     #[inline]
-    unsafe fn flush_tlb_local_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
+    pub(crate) unsafe fn flush_tlb_local_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
         unsafe {
             if let Some(addr) = vaddr {
                 core::arch::asm!(
