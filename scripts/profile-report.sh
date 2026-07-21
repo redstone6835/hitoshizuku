@@ -24,6 +24,126 @@ do
     fi
 done
 
+awk '
+function value(name,    i, pair) {
+    for (i = 1; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == name) return pair[2]
+    }
+    return ""
+}
+function fail(message) {
+    print "profile report: " message > "/dev/stderr"
+    invalid = 1
+}
+/^@@PROFILE_STATS_BEGIN / {
+    phase = value("phase")
+    case_id = value("case")
+    stats_active = 1
+    next
+}
+/^@@PROFILE_STATS_END / { stats_active = 0; next }
+/^@@PROFILE_META_BEGIN / {
+    meta_phase = value("phase")
+    meta_case = value("case")
+    meta_key = meta_case SUBSEP meta_phase
+    if (seen_meta[meta_key]++) fail("duplicate metadata for case=" meta_case " phase=" meta_phase)
+    meta_active = 1
+    next
+}
+/^@@PROFILE_META_END / { meta_active = 0; next }
+meta_active && /^[a-z_]+=/ {
+    name = $0
+    sub(/=.*/, "", name)
+    contents = $0
+    sub(/^[^=]*=/, "", contents)
+    field_key = meta_key SUBSEP name
+    if (seen_meta_field[field_key]++) fail("duplicate metadata field " name " for case=" meta_case " phase=" meta_phase)
+    metadata[field_key] = contents
+    next
+}
+stats_active && /^state=/ {
+    key = case_id SUBSEP phase
+    if (seen_stats[key]++) fail("duplicate stats header for case=" case_id " phase=" phase)
+    if (value("state") != "frozen") fail("capture is not frozen for case=" case_id " phase=" phase)
+    if (value("enabled") != "0") fail("capture is still enabled for case=" case_id " phase=" phase)
+    if (value("active_writers") != "0") fail("active writers remain for case=" case_id " phase=" phase)
+    sessions[key] = value("session")
+    cases[case_id] = 1
+    next
+}
+/^@@PROFILE_SAMPLES_BEGIN / {
+    sample_case = value("case")
+    sample_phase = value("phase")
+    samples_active = 1
+    next
+}
+/^@@PROFILE_SAMPLES_END / { samples_active = 0; next }
+samples_active && / dropped_samples=/ {
+    if (value("dropped_samples") + 0 != 0)
+        fail("dropped PC samples for case=" sample_case " phase=" sample_phase " cpu=" value("cpu"))
+}
+END {
+    required_count = split("arch cpu_online kernel_release kernel_features kernel_image_id rootfs_image_id workload workload_exit_status cmdline control", required, " ")
+    stable_count = split("arch cpu_online kernel_release kernel_features kernel_image_id rootfs_image_id workload cmdline", stable, " ")
+    for (case_id in cases) {
+        before = case_id SUBSEP "before"
+        after = case_id SUBSEP "after"
+        if (!seen_stats[before] || !seen_stats[after])
+            fail("missing stats header for case=" case_id)
+        else if (sessions[before] == "" || sessions[before] != sessions[after])
+            fail("session mismatch for case=" case_id)
+        if (!seen_meta[before] || !seen_meta[after]) {
+            fail("missing metadata for case=" case_id)
+            continue
+        }
+        for (i = 1; i <= required_count; i++) {
+            name = required[i]
+            if (!seen_meta_field[before SUBSEP name] || metadata[before SUBSEP name] == "")
+                fail("missing metadata field " name " for case=" case_id " phase=before")
+            if (!seen_meta_field[after SUBSEP name] || metadata[after SUBSEP name] == "")
+                fail("missing metadata field " name " for case=" case_id " phase=after")
+        }
+        for (i = 1; i <= stable_count; i++) {
+            name = stable[i]
+            if (metadata[before SUBSEP name] != metadata[after SUBSEP name])
+                fail("metadata mismatch for case=" case_id " field=" name)
+        }
+    }
+    if (invalid) exit 1
+}
+' "$clean_log"
+
+echo "METADATA"
+awk '
+function value(name,    i, pair) {
+    for (i = 1; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == name) return pair[2]
+    }
+    return ""
+}
+/^@@PROFILE_META_BEGIN / {
+    phase = value("phase")
+    case_id = value("case")
+    active = phase == "after"
+    next
+}
+/^@@PROFILE_META_END / { active = 0; next }
+active && /^[a-z_]+=/ {
+    name = $0
+    sub(/=.*/, "", name)
+    contents = $0
+    sub(/^[^=]*=/, "", contents)
+    print case_id "\t" name "\t" contents
+}
+' "$clean_log" | {
+    printf 'case\tfield\tvalue\n'
+    sort
+}
+
+echo
+
 echo "EVENTS"
 awk '
 function value(name,    i, pair) {

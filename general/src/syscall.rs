@@ -150,7 +150,9 @@ pub fn dispatch(tf: TrapFramePtr) {
         return;
     }
     #[cfg(feature = "performance-profile")]
-    let _profile = profiling::scope(profiling::Event::SyscallDispatch);
+    let _span = profiling::enter_span();
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
 
     let task = sched::current_task();
     let mut ctx = SyscallContext {
@@ -257,7 +259,9 @@ where
 {
     let task = sched::current_task_fast();
     #[cfg(feature = "performance-profile")]
-    let _profile = profiling::scope(profiling::Event::SyscallDispatch);
+    let _span = profiling::enter_span();
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
 
     let entry = if nr < SYSCALL_TABLE_LEN {
         let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
