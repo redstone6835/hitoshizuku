@@ -88,9 +88,14 @@ fn send_membarrier(logical_id: usize) -> bool {
     sent
 }
 
+fn poll_urgent() {
+    sched::handle_membarrier_ipi();
+}
+
 pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
     send_resched: send_reschedule,
     send_membarrier,
+    poll_urgent,
     is_online: cpu_is_online,
 };
 
