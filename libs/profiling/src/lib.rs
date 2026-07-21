@@ -247,14 +247,16 @@ pub enum TraceKind {
     SchedSwitch = 1,
     TaskBlock = 2,
     TaskWake = 3,
+    TaskSpawn = 4,
 }
 
 impl TraceKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Scope,
         Self::SchedSwitch,
         Self::TaskBlock,
         Self::TaskWake,
+        Self::TaskSpawn,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -263,6 +265,7 @@ impl TraceKind {
             Self::SchedSwitch => "sched_switch",
             Self::TaskBlock => "task_block",
             Self::TaskWake => "task_wake",
+            Self::TaskSpawn => "task_spawn",
         }
     }
 
@@ -272,6 +275,7 @@ impl TraceKind {
             1 => Some(Self::SchedSwitch),
             2 => Some(Self::TaskBlock),
             3 => Some(Self::TaskWake),
+            4 => Some(Self::TaskSpawn),
             _ => None,
         }
     }
@@ -449,6 +453,7 @@ impl MetricCounter {
 struct SampleSlot {
     /// PC 的最低位保存用户态标志；指令地址至少 2 字节对齐。
     key: AtomicUsize,
+    task_id: AtomicU64,
     samples: AtomicU64,
 }
 
@@ -456,12 +461,14 @@ impl SampleSlot {
     const fn new() -> Self {
         Self {
             key: AtomicUsize::new(0),
+            task_id: AtomicU64::new(0),
             samples: AtomicU64::new(0),
         }
     }
 
     fn reset(&self) {
         self.samples.store(0, Ordering::Relaxed);
+        self.task_id.store(0, Ordering::Relaxed);
         self.key.store(0, Ordering::Relaxed);
     }
 }
@@ -993,6 +1000,34 @@ pub fn trace_task_event_with_span(
     );
 }
 
+/// 记录任务亲缘关系。生命周期记录不受 event mask 影响，否则仅启用 syscall
+/// preset 时会丢失 workload 子进程，导致控制面和负载无法可靠分离。
+pub fn trace_task_spawn(parent_task_id: u64, child_task_id: u64) {
+    if !trace_enabled()
+        || parent_task_id == 0
+        || child_task_id == 0
+        || installed_fn(&READ_COUNTER) == 0
+    {
+        return;
+    }
+    let record_generation = generation();
+    let Some(_guard) = begin_write(Some(record_generation)) else {
+        return;
+    };
+    push_trace_record(
+        current_cpu(),
+        read_counter(),
+        0,
+        record_generation,
+        child_task_id,
+        0,
+        TraceKind::TaskSpawn,
+        Event::SchedSwitch,
+        parent_task_id,
+        child_task_id,
+    );
+}
+
 fn record_scope(
     event: Event,
     start_cycles: u64,
@@ -1276,12 +1311,13 @@ pub fn sample_pc(pc: usize, from_user: bool) {
         return;
     };
     let cpu = current_cpu().min(MAX_CPUS - 1);
+    let task_id = current_task_id();
     let key = (pc & !1usize) | usize::from(from_user);
-    let mut slot_index = sample_hash(key) & (SAMPLE_SLOTS - 1);
+    let mut slot_index = sample_hash(key ^ task_id as usize) & (SAMPLE_SLOTS - 1);
     for _ in 0..SAMPLE_PROBES {
         let slot = &SAMPLES[cpu][slot_index];
         let observed = slot.key.load(Ordering::Relaxed);
-        if observed == key {
+        if observed == key && slot.task_id.load(Ordering::Relaxed) == task_id {
             slot.samples.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1291,6 +1327,7 @@ pub fn sample_pc(pc: usize, from_user: bool) {
                 .compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            slot.task_id.store(task_id, Ordering::Relaxed);
             slot.samples.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1312,6 +1349,7 @@ fn sample_hash(key: usize) -> usize {
 pub struct PcSample {
     pub pc: usize,
     pub from_user: bool,
+    pub task_id: u64,
     pub samples: u64,
 }
 
@@ -1328,6 +1366,7 @@ pub fn sample_slot(cpu: usize, slot: usize) -> Option<PcSample> {
     Some(PcSample {
         pc: key & !1usize,
         from_user: key & 1 != 0,
+        task_id: entry.task_id.load(Ordering::Relaxed),
         samples,
     })
 }
@@ -1539,6 +1578,7 @@ mod tests {
             .unwrap();
         assert_eq!(found.samples, 2);
         assert!(!found.from_user);
+        assert_eq!(found.task_id, 42);
         freeze();
         sample_pc(0x8020_5678, false);
         assert!(
@@ -1546,6 +1586,31 @@ mod tests {
                 .filter_map(|slot| sample_slot(1, slot))
                 .all(|sample| sample.pc != 0x8020_5678)
         );
+        stop();
+    }
+
+    #[test]
+    fn task_spawn_trace_bypasses_event_filter() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
+        start();
+        set_event_mask(0);
+        trace_task_spawn(42, 43);
+        freeze();
+        let trace = trace_record(1, 0).expect("task spawn trace");
+        assert_eq!(trace.kind, TraceKind::TaskSpawn);
+        assert_eq!(trace.event, Event::SchedSwitch);
+        assert_eq!(trace.task_id, 43);
+        assert_eq!((trace.arg0, trace.arg1), (42, 43));
+        set_event_mask(ALL_EVENT_MASK);
         stop();
     }
 

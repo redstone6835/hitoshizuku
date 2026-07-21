@@ -8,15 +8,8 @@ mkdir -p "$tmp/bin"
 
 cat >"$tmp/bin/dd" <<'EOF'
 #!/bin/sh
-for arg in "$@"; do
-    case "$arg" in
-        of=*) output=${arg#of=} ;;
-    esac
-done
-[ -n "${output:-}" ] || exit 2
-input=$(cat)
-[ -z "${PROFILE_DD_LOG:-}" ] || printf '%s\n' "$input" >>"$PROFILE_DD_LOG"
-printf '%s\n' "$input" >"$output"
+echo invoked >>"$PROFILE_DD_LOG"
+exit 99
 EOF
 chmod +x "$tmp/bin/dd"
 
@@ -60,7 +53,8 @@ grep -Eq '^@@PROFILE_WORKLOAD case=smoke pid=[0-9]+$' "$output"
 grep -q '^kernel_image_id=kernel-sha256$' "$output"
 grep -q '^rootfs_image_id=rootfs-sha256$' "$output"
 grep -q '^@@PROFILE_TRACE_END phase=after case=smoke$' "$output"
-grep -q '^events=0x1e3ff4000$' "$tmp/dd.log"
+[ ! -e "$tmp/dd.log" ]
+[ "$(cat "$control")" = freeze ]
 
 printf 'token\n' | PATH="$tmp/bin:$PATH" \
     PROFILE_CONTROL="$control" \

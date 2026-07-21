@@ -2170,8 +2170,9 @@ fn render_profile_samples() -> String {
             };
             let _ = writeln!(
                 output,
-                "cpu={} mode={} pc={:#x} samples={}",
+                "cpu={} task={} mode={} pc={:#x} samples={}",
                 cpu,
+                sample.task_id,
                 if sample.from_user { "user" } else { "kernel" },
                 sample.pc,
                 sample.samples,
@@ -2711,6 +2712,19 @@ struct SysDirInodeOps {
     snap: Arc<SysSnapshot>,
 }
 
+fn truncate_sys_reg(kind: SysRegFile, size: u64) -> VfsResult<()> {
+    #[cfg(feature = "performance-profile")]
+    if matches!(kind, SysRegFile::ProfileControl) {
+        return if size == 0 {
+            Ok(())
+        } else {
+            Err(VfsError::InvalidArgument)
+        };
+    }
+    let _ = (kind, size);
+    Err(VfsError::ReadOnlyFilesystem)
+}
+
 impl InodeOps for SysRegInodeOps {
     fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
         Err(VfsError::NotADirectory)
@@ -2735,6 +2749,9 @@ impl InodeOps for SysRegInodeOps {
             snap: Arc::clone(&self.snap),
             snapshot,
         }))
+    }
+    fn truncate(&self, _: &Inode, size: u64) -> VfsResult<()> {
+        truncate_sys_reg(self.kind, size)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
@@ -3985,6 +4002,20 @@ mod tests {
         assert_eq!(
             file.read_at(&mut second, (first_len + second_len) as u64),
             Ok(0)
+        );
+    }
+
+    #[cfg(feature = "performance-profile")]
+    #[test]
+    fn profile_control_accepts_shell_truncate() {
+        assert_eq!(truncate_sys_reg(SysRegFile::ProfileControl, 0), Ok(()));
+        assert_eq!(
+            truncate_sys_reg(SysRegFile::ProfileControl, 1),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(
+            truncate_sys_reg(SysRegFile::ProfileStats, 0),
+            Err(VfsError::ReadOnlyFilesystem)
         );
     }
 }

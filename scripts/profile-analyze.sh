@@ -64,17 +64,15 @@ NF < 13 { next }
     if (interval_start < first[key]) first[key] = interval_start
     if (timestamp + duration > last[key]) last[key] = timestamp + duration
     records[key]++
-    if (role == "workload-root") workload_root[key] = 1
+    if (role == "workload-root" || role == "workload-child") workload_member[key] = 1
     event_duration[key, event] += effective_duration
     event_seen[key, event] = 1
-    if (duration > 0) {
+    if (effective_duration > 0) {
         record_count[key]++
         record_index = record_count[key]
-        record_start[key, record_index] = timestamp
+        record_start[key, record_index] = interval_start
         record_end[key, record_index] = timestamp + duration
         record_event[key, record_index] = event
-    } else if (effective_duration > 0) {
-        event_exclusive[key, event] += effective_duration
     }
     if (event == "syscall_dispatch") {
         syscall[key] = $9
@@ -138,7 +136,7 @@ END {
             }
             if (duration > 0)
                 printf "%s\t%s\t%s\t%s\t%.3f\t%.1f\n", case_id, span, syscall[key], event, duration, (wall > 0 ? duration * 100 / wall : 0) > bottlenecks
-            if (workload_root[key] && duration > 0)
+            if (workload_member[key] && duration > 0)
                 printf "%s\t%s\t%s\t%s\t%.3f\t%.1f\n", case_id, span, syscall[key], event, duration, (wall > 0 ? duration * 100 / wall : 0) > workload_bottlenecks
             if (is_io && duration > 0)
                 printf "%s\t%s\t%s\t%s\t%.3f\t%.1f\n", case_id, span, syscall[key], event, duration, (wall > 0 ? duration * 100 / wall : 0) > io_bottlenecks
@@ -151,7 +149,7 @@ END {
             event_duration[key, "wait_other"] + event_duration[key, "wait_futex"] + event_duration[key, "wait_mutex"] + event_duration[key, "wait_timer"] + event_duration[key, "wait_yield"], \
             dominant, dominant_duration, (wall > 0 ? dominant_duration * 100 / wall : 0))
         print line > summary
-        if (workload_root[key]) print line > workload_summary
+        if (workload_member[key]) print line > workload_summary
     }
 }
 ' "$rows"
@@ -161,19 +159,21 @@ NR == 1 { next }
 {
     total[$1]++
     if ($14 == "workload-root") root[$1]++
+    else if ($14 == "workload-child") child[$1]++
     else if ($14 == "other") other[$1]++
     else unclassified[$1]++
 }
 END {
-    print "case\ttotal_records\tworkload_root_records\tother_records\tunclassified_records\tworkload_root_pct"
+    print "case\ttotal_records\tworkload_records\tworkload_root_records\tworkload_child_records\tother_records\tunclassified_records\tworkload_pct"
     for (case_id in total)
-        printf "%s\t%d\t%d\t%d\t%d\t%.1f\n", case_id, total[case_id], root[case_id], \
-            other[case_id], unclassified[case_id], total[case_id] ? root[case_id] * 100 / total[case_id] : 0
+        printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.1f\n", case_id, total[case_id], \
+            root[case_id] + child[case_id], root[case_id], child[case_id], other[case_id], \
+            unclassified[case_id], total[case_id] ? (root[case_id] + child[case_id]) * 100 / total[case_id] : 0
 }
 ' "$rows" >"$attribution"
 
-awk -F '\t' 'NR > 1 && $3 != "" { print $1 "\t" $3 "\t" $6 "\t" $12 }' "$summary" >"$sys_rows"
-awk -F '\t' 'NR == 1 || ($8 + $9 + $10 + $11 + $12) > 0' "$summary" >"$io_summary"
+awk -F '\t' 'NR > 1 && $3 != "" { print $1 "\t" $3 "\t" $6 "\t" $12 }' "$workload_summary" >"$sys_rows"
+awk -F '\t' 'NR == 1 || ($8 + $9 + $10 + $11 + $12) > 0' "$workload_summary" >"$io_summary"
 
 capacity=$(tr -d '\r' <"$log" | awk -F '[ =]' '
 function value(name,    i) {
@@ -194,16 +194,16 @@ END {
 }
 ')
 
-echo "PROFILE_ANALYSIS version=1 top=$top"
+echo "PROFILE_ANALYSIS version=2 top=$top"
 echo "$capacity"
 echo "WORKLOAD_ATTRIBUTION"
 cat "$attribution"
 echo
-echo "WORKLOAD_ROOT_SPANS"
+echo "WORKLOAD_SPANS"
 head -n 1 "$workload_summary"
 tail -n +2 "$workload_summary" | sort -t "$tab" -k6,6nr | head -n "$top"
 echo
-echo "WORKLOAD_ROOT_BOTTLENECKS"
+echo "WORKLOAD_BOTTLENECKS"
 head -n 1 "$workload_bottlenecks"
 tail -n +2 "$workload_bottlenecks" | sort -t "$tab" -k5,5nr | head -n "$top"
 echo
@@ -217,7 +217,7 @@ head -n 1 "$summary"
 tail -n +2 "$summary" | sort -t "$tab" -k6,6nr | head -n "$top"
 
 echo
-echo "SYSCALL_SUMMARY"
+echo "WORKLOAD_SYSCALL_SUMMARY"
 printf 'case\tsyscall\tspans\twall_total_us\tmean_wall_us\tp50_wall_us\tp95_wall_us\tp99_wall_us\tblock_wait_total_us\n'
 cut -f1,2 "$sys_rows" | sort -u | while IFS="$tab" read -r case_id syscall; do
     values=$tmp/values
@@ -240,11 +240,11 @@ cut -f1,2 "$sys_rows" | sort -u | while IFS="$tab" read -r case_id syscall; do
 done
 
 echo
-echo "TOP_BOTTLENECKS"
+echo "CASE_TOP_BOTTLENECKS"
 head -n 1 "$bottlenecks"
 tail -n +2 "$bottlenecks" | sort -t "$tab" -k5,5nr | head -n "$top"
 
 echo
-echo "TOP_IO_BOTTLENECKS"
+echo "CASE_TOP_IO_BOTTLENECKS"
 head -n 1 "$io_bottlenecks"
 tail -n +2 "$io_bottlenecks" | sort -t "$tab" -k5,5nr | head -n "$top"

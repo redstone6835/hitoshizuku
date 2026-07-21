@@ -28,7 +28,7 @@ log=$tmp/trace.log
     echo "@@PROFILE_TRACE_END phase=before case=io"
     echo "@@PROFILE_TRACE_BEGIN phase=after case=io"
     echo "state=frozen enabled=0 session=1 generation=4 active_writers=0 counter_hz=1000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
-    echo "cpu=0 first_sequence=0 next_sequence=10 retained=10 overwritten=0"
+    echo "cpu=0 first_sequence=0 next_sequence=13 retained=13 overwritten=0"
     echo "cpu=0 sequence=0 session=1 generation=3 timestamp_cycles=100 duration_cycles=100 kind=scope event=syscall_dispatch task=7 span=10 arg0=63 arg1=0"
     echo "cpu=0 sequence=1 session=1 generation=3 timestamp_cycles=110 duration_cycles=70 kind=scope event=vfs_read task=7 span=10 arg0=4096 arg1=0"
     echo "cpu=0 sequence=2 session=1 generation=3 timestamp_cycles=120 duration_cycles=10 kind=scope event=block_submit task=7 span=10 arg0=8 arg1=1"
@@ -39,16 +39,19 @@ log=$tmp/trace.log
     echo "cpu=0 sequence=7 session=1 generation=3 timestamp_cycles=300 duration_cycles=200 kind=scope event=syscall_dispatch task=7 span=20 arg0=63 arg1=0"
     echo "cpu=0 sequence=8 session=1 generation=3 timestamp_cycles=320 duration_cycles=20 kind=scope event=vfs_read task=7 span=20 arg0=4096 arg1=0"
     echo "cpu=0 sequence=9 session=1 generation=3 timestamp_cycles=500 duration_cycles=0 kind=sched_switch event=sched_switch task=7 span=20 arg0=7 arg1=8"
+    echo "cpu=0 sequence=10 session=1 generation=3 timestamp_cycles=510 duration_cycles=0 kind=task_spawn event=sched_switch task=8 span=0 arg0=7 arg1=8"
+    echo "cpu=0 sequence=11 session=1 generation=3 timestamp_cycles=520 duration_cycles=50 kind=scope event=syscall_dispatch task=8 span=30 arg0=63 arg1=0"
+    echo "cpu=0 sequence=12 session=1 generation=3 timestamp_cycles=580 duration_cycles=60 kind=scope event=syscall_dispatch task=9 span=40 arg0=63 arg1=0"
     echo "@@PROFILE_TRACE_END phase=after case=io"
 } >"$log"
 
 output=$($root/scripts/profile-analyze.sh "$log" 20)
-printf '%s\n' "$output" | grep -q '^PROFILE_ANALYSIS version=1 top=20$'
-printf '%s\n' "$output" | grep -q '^TRACE_CAPACITY max_retained=10 slots_per_cpu=1024 utilization_pct=1.0 warning=none$'
+printf '%s\n' "$output" | grep -q '^PROFILE_ANALYSIS version=2 top=20$'
+printf '%s\n' "$output" | grep -q '^TRACE_CAPACITY max_retained=13 slots_per_cpu=1024 utilization_pct=1.3 warning=none$'
 printf '%s\n' "$output" | grep -q '^WORKLOAD_ATTRIBUTION$'
-printf '%s\n' "$output" | grep -q '^io[[:space:]]10[[:space:]]10[[:space:]]0[[:space:]]0[[:space:]]100.0$'
-printf '%s\n' "$output" | grep -q '^WORKLOAD_ROOT_SPANS$'
-printf '%s\n' "$output" | grep -q '^WORKLOAD_ROOT_BOTTLENECKS$'
+printf '%s\n' "$output" | grep -q '^io[[:space:]]13[[:space:]]12[[:space:]]10[[:space:]]2[[:space:]]1[[:space:]]0[[:space:]]92.3$'
+printf '%s\n' "$output" | grep -q '^WORKLOAD_SPANS$'
+printf '%s\n' "$output" | grep -q '^WORKLOAD_BOTTLENECKS$'
 printf '%s\n' "$output" | grep -q '^IO_CRITICAL_PATHS$'
 printf '%s\n' "$output" | awk -F '\t' '
 $1 == "io" && $2 == "10" && NF == 16 {
@@ -57,7 +60,8 @@ $1 == "io" && $2 == "10" && NF == 16 {
 }
 END { exit !found }
 '
-printf '%s\n' "$output" | grep -q '^io[[:space:]]63[[:space:]]2[[:space:]]300.000[[:space:]]150.000[[:space:]]100.000[[:space:]]200.000[[:space:]]200.000[[:space:]]40.000$'
-printf '%s\n' "$output" | grep -q '^io[[:space:]]10[[:space:]]63[[:space:]]block_wait[[:space:]]30.000[[:space:]]30.0$'
+printf '%s\n' "$output" | grep -q '^io[[:space:]]63[[:space:]]3[[:space:]]350.000[[:space:]]116.667[[:space:]]100.000[[:space:]]200.000[[:space:]]200.000[[:space:]]40.000$'
+printf '%s\n' "$output" | grep -q '^io[[:space:]]10[[:space:]]63[[:space:]]block_wait[[:space:]]10.000[[:space:]]10.0$'
+printf '%s\n' "$output" | grep -q '^io[[:space:]]10[[:space:]]63[[:space:]]wait_other[[:space:]]20.000[[:space:]]20.0$'
 
 echo "profile-analyze fixture: ok"

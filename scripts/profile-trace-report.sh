@@ -136,6 +136,19 @@ function value(name,    i) {
     for (i = 1; i < NF; i++) if ($i == name) return $(i + 1)
     return ""
 }
+function role_for(case_id, task,    root, current, parent, depth) {
+    root = workload_pid[case_id]
+    if (root == "") return "unclassified"
+    if (task == root) return "workload-root"
+    current = task
+    for (depth = 0; depth < 128; depth++) {
+        parent = task_parent[case_id SUBSEP current]
+        if (parent == "" || parent == 0 || parent == current) break
+        if (parent == root) return "workload-child"
+        current = parent
+    }
+    return "other"
+}
 /^@@PROFILE_WORKLOAD / {
     workload_pid[value("case")] = value("pid")
     next
@@ -154,15 +167,30 @@ active && /^state=/ {
 }
 active && /^cpu=/ && / sequence=/ {
     if (hz <= 0) next
-    ts = value("timestamp_cycles") * 1000000 / hz
-    dur = value("duration_cycles") * 1000000 / hz
-    task = value("task")
-    role = workload_pid[case_id] == "" ? "unclassified" : \
-        (task == workload_pid[case_id] ? "workload-root" : "other")
-    printf "%s\t%.6f\t%.6f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
-        case_id, ts, dur, value("cpu"), task, value("span"), value("kind"), \
-        value("event"), value("arg0"), value("arg1"), value("session"), \
-        value("generation"), value("sequence"), role
+    rows++
+    row_case[rows] = case_id
+    row_ts[rows] = value("timestamp_cycles") * 1000000 / hz
+    row_dur[rows] = value("duration_cycles") * 1000000 / hz
+    row_cpu[rows] = value("cpu")
+    row_task[rows] = value("task")
+    row_span[rows] = value("span")
+    row_kind[rows] = value("kind")
+    row_event[rows] = value("event")
+    row_arg0[rows] = value("arg0")
+    row_arg1[rows] = value("arg1")
+    row_session[rows] = value("session")
+    row_generation[rows] = value("generation")
+    row_sequence[rows] = value("sequence")
+    if (row_kind[rows] == "task_spawn")
+        task_parent[case_id SUBSEP row_task[rows]] = row_arg0[rows]
+}
+END {
+    for (i = 1; i <= rows; i++)
+        printf "%s\t%.6f\t%.6f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+            row_case[i], row_ts[i], row_dur[i], row_cpu[i], row_task[i], \
+            row_span[i], row_kind[i], row_event[i], row_arg0[i], row_arg1[i], \
+            row_session[i], row_generation[i], row_sequence[i], \
+            role_for(row_case[i], row_task[i])
 }
 ' "$clean_log" >"$rows"
 

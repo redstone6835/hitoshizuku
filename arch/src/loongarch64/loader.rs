@@ -737,7 +737,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         ));
 
         // 步骤 1.1b：配置定时器中断，使其按配置频率产生中断。
-        // 普通构建默认 100 Hz，剖析构建默认 997 Hz；命令行仍可覆盖。
+        // 默认 100 Hz；命令行 `timer_hz=N` 可覆盖。
         let timer_hz = {
             let mut hz = DEFAULT_TIMER_HZ;
             let raw = CMDLINE_PTR.load(Ordering::Acquire);

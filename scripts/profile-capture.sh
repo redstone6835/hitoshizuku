@@ -15,7 +15,7 @@ usage() {
 }
 
 write_control() {
-    printf '%s\n' "$1" | dd of="$control" conv=notrunc 2>/dev/null
+    printf '%s\n' "$1" >"$control"
 }
 
 preset_mask() {

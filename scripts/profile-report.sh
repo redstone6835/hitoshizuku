@@ -1,13 +1,22 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    echo "usage: $0 <serial-log> [kernel-elf]" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
+    echo "usage: $0 <serial-log> [kernel-elf] [user-elf] [user-load-base]" >&2
     exit 2
 fi
 
 log=$1
 elf=${2:-}
+user_elf=${3:-}
+user_base=${4:-0}
+case "$user_base" in
+    0x[0-9a-fA-F]*|[0-9]*) ;;
+    *)
+        echo "profile report: invalid user load base: $user_base" >&2
+        exit 2
+        ;;
+esac
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -146,7 +155,7 @@ active && /^[a-z_]+=/ {
 
 echo
 
-echo "EVENTS"
+echo "CASE_EVENTS"
 awk '
 function value(name,    i, pair) {
     for (i = 1; i <= NF; i++) {
@@ -289,6 +298,33 @@ function value(name,    i, pair) {
     }
     return ""
 }
+function role_for(case_id, task,    root, current, parent, depth) {
+    root = workload_pid[case_id]
+    if (root == "" || task == 0) return "unclassified"
+    if (task == root) return "workload-root"
+    current = task
+    for (depth = 0; depth < 128; depth++) {
+        parent = task_parent[case_id SUBSEP current]
+        if (parent == "" || parent == 0 || parent == current) break
+        if (parent == root) return "workload-child"
+        current = parent
+    }
+    return "other"
+}
+/^@@PROFILE_WORKLOAD / {
+    workload_pid[value("case")] = value("pid")
+    next
+}
+/^@@PROFILE_TRACE_BEGIN / {
+    trace_case = value("case")
+    trace_active = value("phase") == "after"
+    next
+}
+/^@@PROFILE_TRACE_END / { trace_active = 0; next }
+trace_active && /^cpu=/ && / sequence=/ && / kind=task_spawn / {
+    task_parent[trace_case SUBSEP value("task")] = value("arg0")
+    next
+}
 /^@@PROFILE_SAMPLES_BEGIN / {
     phase = value("phase")
     case_id = value("case")
@@ -336,6 +372,33 @@ function value(name,    i, pair) {
     }
     return ""
 }
+function role_for(case_id, task,    root, current, parent, depth) {
+    root = workload_pid[case_id]
+    if (root == "" || task == 0) return "unclassified"
+    if (task == root) return "workload-root"
+    current = task
+    for (depth = 0; depth < 128; depth++) {
+        parent = task_parent[case_id SUBSEP current]
+        if (parent == "" || parent == 0 || parent == current) break
+        if (parent == root) return "workload-child"
+        current = parent
+    }
+    return "other"
+}
+/^@@PROFILE_WORKLOAD / {
+    workload_pid[value("case")] = value("pid")
+    next
+}
+/^@@PROFILE_TRACE_BEGIN / {
+    trace_case = value("case")
+    trace_active = value("phase") == "after"
+    next
+}
+/^@@PROFILE_TRACE_END / { trace_active = 0; next }
+trace_active && /^cpu=/ && / sequence=/ && / kind=task_spawn / {
+    task_parent[trace_case SUBSEP value("task")] = value("arg0")
+    next
+}
 /^@@PROFILE_SAMPLES_BEGIN / {
     phase = value("phase")
     case_id = value("case")
@@ -344,16 +407,19 @@ function value(name,    i, pair) {
 }
 /^@@PROFILE_SAMPLES_END / { active = 0; next }
 active && /^cpu=/ && / mode=/ {
-    key = case_id SUBSEP value("mode") SUBSEP value("pc") SUBSEP phase
+    task = value("task")
+    if (task == "") task = 0
+    key = case_id SUBSEP value("mode") SUBSEP value("pc") SUBSEP task SUBSEP phase
     samples[key] += value("samples")
     if (phase == "after") observed[key] = 1
 }
 END {
     for (key in observed) {
         split(key, parts, SUBSEP)
-        before = parts[1] SUBSEP parts[2] SUBSEP parts[3] SUBSEP "before"
+        before = parts[1] SUBSEP parts[2] SUBSEP parts[3] SUBSEP parts[4] SUBSEP "before"
         delta = samples[key] - samples[before]
-        if (delta > 0) print parts[1] "\t" parts[2] "\t" parts[3] "\t" delta
+        if (delta > 0) print parts[1] "\t" parts[2] "\t" parts[3] "\t" \
+            parts[4] "\t" role_for(parts[1], parts[4]) "\t" delta
     }
 }
 ' "$clean_log" >"$tmp/samples"
@@ -381,38 +447,57 @@ if [ -n "$addr2line" ] && [ -n "$elf" ] && [ -r "$elf" ]; then
     else
         : >"$tmp/map"
     fi
-    awk -F '\t' '
-        FILENAME == ARGV[1] { symbols[$1] = $2; next }
-        {
-            symbol = $2 == "kernel" ? symbols[$3] : "[user ELF not supplied]"
-            if (symbol == "") symbol = "??"
-            print $1 "\t" $2 "\t" $3 "\t" $4 "\t" symbol
-        }
-    ' "$tmp/map" "$tmp/samples" >"$tmp/resolved"
 else
-    awk -F '\t' '{ print $0 "\t[raw; pass kernel ELF as argument 2]" }' \
-        "$tmp/samples" >"$tmp/resolved"
+    : >"$tmp/map"
 fi
 
-printf 'case\tmode\tpc\tsamples\tshare%%\tsymbol\n'
+: >"$tmp/user-map"
+if [ -n "$addr2line" ] && [ -n "$user_elf" ] && [ -r "$user_elf" ]; then
+    awk '$2 == "user" { print $3 }' "$tmp/samples" | sort -u | while IFS= read -r pc; do
+        [ -n "$pc" ] || continue
+        printf '%s\t0x%x\n' "$pc" "$((pc - user_base))"
+    done >"$tmp/user-pcs"
+    if [ -s "$tmp/user-pcs" ]; then
+        cut -f2 "$tmp/user-pcs" | "$addr2line" -e "$user_elf" -f -C -p >"$tmp/user-symbols"
+        paste "$tmp/user-pcs" "$tmp/user-symbols" | cut -f1,3 >"$tmp/user-map"
+    fi
+fi
+
 awk -F '\t' '
-    NR == FNR { total[$1] += $4; next }
+    FILENAME == ARGV[1] { kernel_symbols[$1] = $2; next }
+    FILENAME == ARGV[2] { user_symbols[$1] = $2; next }
     {
-        share = total[$1] ? $4 * 100 / total[$1] : 0
-        printf "%s\t%s\t%s\t%s\t%.2f\t%s\n", $1, $2, $3, $4, share, $5
+        if ($2 == "kernel") {
+            symbol = kernel_symbols[$3]
+            if (symbol == "") symbol = "[raw; pass kernel ELF as argument 2]"
+        } else {
+            symbol = user_symbols[$3]
+            if (symbol == "") symbol = "[user ELF not supplied]"
+        }
+        print $0 "\t" symbol
     }
-' "$tmp/resolved" "$tmp/resolved" | sort -t '	' -k1,1 -k4,4nr
+' "$tmp/map" "$tmp/user-map" "$tmp/samples" >"$tmp/resolved"
+
+printf 'case\tmode\tpc\ttask\trole\tsamples\tshare%%\tsymbol\n'
+awk -F '\t' '
+    NR == FNR { total[$1] += $6; next }
+    {
+        share = total[$1] ? $6 * 100 / total[$1] : 0
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%.2f\t%s\n", \
+            $1, $2, $3, $4, $5, $6, share, $7
+    }
+' "$tmp/resolved" "$tmp/resolved" | sort -t '	' -k1,1 -k6,6nr
 
 echo
 echo "TOP FUNCTIONS"
 printf 'case\tsamples\tshare%%\tfunction\n'
 awk -F '\t' '
     {
-        function_name = $5
+        function_name = $7
         sub(/ at .*/, "", function_name)
         key = $1 SUBSEP function_name
-        samples[key] += $4
-        total[$1] += $4
+        samples[key] += $6
+        total[$1] += $6
     }
     END {
         for (key in samples) {
