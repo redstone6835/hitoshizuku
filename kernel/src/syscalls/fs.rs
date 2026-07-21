@@ -16,7 +16,7 @@ use sched::{Capability, SigProcMaskHow, SigSet};
 use vfs::cred::{Gid, Uid};
 use vfs::error::VfsError;
 use vfs::fdtable::{Fd, FdFlags};
-use vfs::file::{AccessMode, IoctlCmd, OpenOptions, PollEvents, SeekFrom};
+use vfs::file::{AccessMode, FallocateMode, IoctlCmd, OpenOptions, PollEvents, SeekFrom};
 use vfs::mount::MountFlags;
 use vfs::operation;
 use vfs::path::{Dirfd, LookupFlags};
@@ -59,6 +59,9 @@ const O_NOATIME: usize = 0o01000000;
 const O_CLOEXEC: usize = 0o02000000;
 const O_PATH: usize = 0o10000000;
 const O_SYNC: usize = 0o4010000;
+
+const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
 
 const MS_RDONLY: usize = 1 << 0;
 const MS_NOSUID: usize = 1 << 1;
@@ -174,7 +177,10 @@ const STATX_BASIC_STATS: u32 = STATX_TYPE
 
 const MSGHDR_SIZE_64: usize = 56;
 const MMSGHDR_SIZE_64: usize = 64;
-const EPOLL_EVENT_SIZE_64: usize = 12;
+// Linux 只在 x86_64 上把 epoll_event 压缩为 12 字节；LoongArch64、
+// RISC-V64 等 64 位架构按 8 字节对齐 data，结构体大小为 16 字节。
+const EPOLL_EVENT_DATA_OFFSET_64: usize = if cfg!(target_arch = "x86_64") { 4 } else { 8 };
+const EPOLL_EVENT_SIZE_64: usize = EPOLL_EVENT_DATA_OFFSET_64 + 8;
 const PSELECT6_SIGSET_ARG_SIZE_64: usize = 16;
 
 pub(super) fn sys_write(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -257,6 +263,18 @@ pub(super) fn sys_lseek(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         1 => SeekFrom::Current(offset),
         2 => SeekFrom::End(offset),
+        3 => {
+            if offset < 0 {
+                return Err(Errno::EINVAL);
+            }
+            SeekFrom::Data(offset as u64)
+        }
+        4 => {
+            if offset < 0 {
+                return Err(Errno::EINVAL);
+            }
+            SeekFrom::Hole(offset as u64)
+        }
         _ => return Err(Errno::EINVAL),
     };
     file.seek(from)
@@ -376,7 +394,10 @@ pub(super) fn sys_getcwd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     copy_to_user(user, path.as_bytes()).map_err(|e| e.as_errno())?;
     copy_to_user(user + path.len(), &[0]).map_err(|e| e.as_errno())?;
-    Ok(user)
+    // Linux getcwd(2) syscall 返回包含结尾 NUL 的字节数，而 libc 的 getcwd()
+    // 再把它转换为用户缓冲区指针。返回地址会让 glibc 误判结果并进入基于
+    // 文件描述符的兼容回退路径。
+    Ok(needed)
 }
 
 pub(super) fn sys_dup(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -536,6 +557,11 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 .downcast_ops::<vfs::memfd::MemfdFileOps>()
                 .ok_or(Errno::EINVAL)?;
             Ok(memfd.seals() as usize)
+        }
+        vfs::pipe::F_SETPIPE_SZ | vfs::pipe::F_GETPIPE_SZ => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+            file.fcntl(cmd, arg, vfs_ctx.cred().as_ref())
         }
         _ => Err(Errno::EINVAL),
     }
@@ -726,12 +752,15 @@ pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 }
 
 pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let flags = ctx.args[4];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let (uid, gid) = decode_optional_owner(ctx.args[2] as u32, ctx.args[3] as u32);
-    let flags = ctx.args[4];
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
     operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -860,7 +889,7 @@ pub(super) fn sys_fsync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_fdatasync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let file = file_for_fd(fd)?;
-    file.sync().map_err(|e| e.to_errno())?;
+    file.datasync().map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -869,6 +898,18 @@ pub(super) fn sys_getdents64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let dirent = ctx.args[1];
     let count = ctx.args[2];
     let file = file_for_fd(fd)?;
+    if !file.flags().readable() {
+        return Err(Errno::EBADF);
+    }
+    if file.inode().kind() != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    if file.inode().nlink() == 0 {
+        return Err(Errno::ENOENT);
+    }
+    if count < 24 {
+        return Err(Errno::EINVAL);
+    }
 
     let mut buf_pos = 0usize;
     let mut copy_error = None;
@@ -1303,17 +1344,22 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
 
 pub(super) fn sys_fallocate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
-    let mode = ctx.args[1];
+    let raw_mode = ctx.args[1];
     let offset = nonnegative_i64_arg(ctx.args[2])?;
     let len = nonnegative_i64_arg(ctx.args[3])?;
-    if mode != 0 {
+    if raw_mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
+    if raw_mode & FALLOC_FL_PUNCH_HOLE != 0 && raw_mode & FALLOC_FL_KEEP_SIZE == 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let mode = FallocateMode::from_bits(raw_mode as u32);
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EBADF);
     }
-    file.fallocate(offset, len).map_err(|e| e.to_errno())?;
+    file.fallocate(mode, offset, len)
+        .map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -1545,17 +1591,23 @@ pub(super) fn sys_epoll_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_epoll_pwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let timeout_base_ns = sched::now_ns_public();
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
-    let maxevents = ctx.args[2];
+    let maxevents = ctx.args[2] as i32;
     let timeout_ms = ctx.args[3] as i32 as i64;
-    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
-    if maxevents == 0 {
+    if maxevents <= 0 {
         return Err(Errno::EINVAL);
     }
+    let deadline = if timeout_ms < 0 {
+        None
+    } else {
+        Some(timeout_base_ns.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
+    };
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
     let _mask_guard = TemporarySigmask::install(sigmask);
-    let ready = vfs::epoll::wait(&fdt, epfd, maxevents, timeout_ms)?;
+    let ready = vfs::epoll::wait_until(&fdt, epfd, maxevents as usize, deadline)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
 }
@@ -1632,9 +1684,20 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         Some(copy_sockaddr_from_user(ctx.args[4], ctx.args[5])?)
     };
+    if addr.is_none()
+        && len > COPY_CHUNK
+        && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
+        && let Some(vm) = current_vm_space()
+    {
+        return send_inet_stream_from_user(&vm, &vfs_ctx, &fdt, fd, ctx.args[1], len, ctx.args[3]);
+    }
     if len <= COPY_CHUNK {
         let mut data = [0u8; COPY_CHUNK];
-        copy_from_user(ctx.args[1], &mut data[..len]).map_err(|e| e.as_errno())?;
+        {
+            #[cfg(feature = "performance-profile")]
+            let _profile = profiling::scope(profiling::Event::SysSendCopy).bytes(len);
+            copy_from_user(ctx.args[1], &mut data[..len]).map_err(|e| e.as_errno())?;
+        }
         send_socket_payload(
             &vfs_ctx,
             &fdt,
@@ -1645,7 +1708,11 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         )
     } else {
         let mut data = zeroed_vec(len)?;
-        copy_from_user(ctx.args[1], &mut data).map_err(|e| e.as_errno())?;
+        {
+            #[cfg(feature = "performance-profile")]
+            let _profile = profiling::scope(profiling::Event::SysSendCopy).bytes(len);
+            copy_from_user(ctx.args[1], &mut data).map_err(|e| e.as_errno())?;
+        }
         send_socket_payload(&vfs_ctx, &fdt, fd, &data, addr.as_deref(), ctx.args[3])
     }
 }
@@ -1655,6 +1722,14 @@ pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let fd = fd_arg(ctx.args[0])?;
     let len = ctx.args[2].min(MAX_SOCKET_IO);
     let want_addr = ctx.args[4] != 0 && ctx.args[5] != 0;
+    let flags = ctx.args[3];
+    if len > COPY_CHUNK
+        && (flags & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
+        && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
+        && let Some(vm) = current_vm_space()
+    {
+        return recv_inet_stream_to_user(&vm, &fdt, fd, ctx.args[1], len, want_addr, flags, ctx);
+    }
     if len <= COPY_CHUNK {
         let mut data = [0u8; COPY_CHUNK];
         recv_socket_payload(&fdt, fd, ctx.args[1], &mut data[..len], want_addr, ctx)
@@ -1662,6 +1737,112 @@ pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         let mut data = zeroed_vec(len)?;
         recv_socket_payload(&fdt, fd, ctx.args[1], &mut data, want_addr, ctx)
     }
+}
+
+fn send_inet_stream_from_user(
+    vm: &VmSpace,
+    vfs_ctx: &vfs::VfsContext,
+    fdt: &vfs::fdtable::FdTable,
+    fd: Fd,
+    user: usize,
+    len: usize,
+    flags: usize,
+) -> Result<usize, Errno> {
+    let mut sent = 0usize;
+    while sent < len {
+        let user_ptr = user.checked_add(sent).ok_or(Errno::EFAULT)?;
+        let remaining = len - sent;
+        let result = unsafe {
+            vm.with_user_read_slice(user_ptr, remaining, |data| {
+                let mut chunk_flags = flags;
+                if sent + data.len() < len {
+                    chunk_flags |= vfs_socket::MSG_MORE;
+                }
+                send_socket_payload(vfs_ctx, fdt, fd, data, None, chunk_flags)
+                    .map(|written| (written, data.len()))
+            })
+        };
+        let (written, window_len) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) if sent != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+                return Ok(sent);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return if sent == 0 { Err(error) } else { Ok(sent) },
+        };
+        sent += written;
+        if written == 0 || written < window_len {
+            break;
+        }
+    }
+    Ok(sent)
+}
+
+fn recv_inet_stream_to_user(
+    vm: &VmSpace,
+    fdt: &vfs::fdtable::FdTable,
+    fd: Fd,
+    user: usize,
+    len: usize,
+    want_addr: bool,
+    flags: usize,
+    ctx: &SyscallContext<'_>,
+) -> Result<usize, Errno> {
+    let mut received = 0usize;
+    let mut address = None;
+    while received < len {
+        let user_ptr = user.checked_add(received).ok_or(Errno::EFAULT)?;
+        let remaining = len - received;
+        let result = unsafe {
+            vm.with_user_write_slice(user_ptr, remaining, |data| {
+                let mut chunk_flags = flags;
+                if received != 0 {
+                    chunk_flags |= vfs_socket::MSG_DONTWAIT;
+                }
+                #[cfg(feature = "performance-profile")]
+                let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+                let result = vfs_socket::recv(
+                    fdt,
+                    fd,
+                    data,
+                    0,
+                    want_addr && received == 0,
+                    chunk_flags,
+                    None,
+                );
+                #[cfg(feature = "performance-profile")]
+                if let Ok(output) = &result {
+                    profile.set_bytes(output.len);
+                }
+                result.map(|output| (output, data.len()))
+            })
+        };
+        let (output, window_len) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) if received != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+                break;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                return if received == 0 {
+                    Err(error)
+                } else {
+                    Ok(received)
+                };
+            }
+        };
+        if received == 0 {
+            address = output.address;
+        }
+        received += output.len;
+        if output.len == 0 || output.len < window_len {
+            break;
+        }
+    }
+    if want_addr {
+        copy_sockaddr_to_user(ctx.args[4], ctx.args[5], address.as_deref())?;
+    }
+    Ok(received)
 }
 
 fn send_socket_payload(
@@ -1672,6 +1853,8 @@ fn send_socket_payload(
     addr: Option<&[u8]>,
     flags: usize,
 ) -> Result<usize, Errno> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SysSendSocket).bytes(data.len());
     vfs_socket::send(vfs_ctx, fdt, fd, data, &[], addr, flags).map_err(|err| {
         if err == Errno::EPIPE && (flags & vfs_socket::MSG_NOSIGNAL) == 0 {
             deliver_sigpipe();
@@ -1688,8 +1871,17 @@ fn recv_socket_payload(
     want_addr: bool,
     ctx: &SyscallContext<'_>,
 ) -> Result<usize, Errno> {
-    let out = vfs_socket::recv(fdt, fd, data, 0, want_addr, ctx.args[3], None)?;
+    let out = {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+        let out = vfs_socket::recv(fdt, fd, data, 0, want_addr, ctx.args[3], None)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(out.len);
+        out
+    };
     if out.len != 0 {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::SysRecvCopy).bytes(out.len);
         copy_to_user(user_buf, &data[..out.len]).map_err(|e| e.as_errno())?;
     }
     if want_addr {
@@ -1703,6 +1895,18 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let hdr = read_msghdr(ctx.args[1])?;
+    if hdr.iovlen == 1
+        && hdr.controllen == 0
+        && (hdr.name == 0 || hdr.namelen == 0)
+        && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
+        && let Some(vm) = current_vm_space()
+    {
+        let (base, len) = read_iovec(hdr.iov, 0)?;
+        let len = len.min(MAX_SOCKET_IO);
+        if len > COPY_CHUNK {
+            return send_inet_stream_from_user(&vm, &vfs_ctx, &fdt, fd, base, len, ctx.args[2]);
+        }
+    }
     let data = copy_send_iovecs(hdr.iov, hdr.iovlen)?;
     let control = copy_user_region(hdr.control, hdr.controllen)?;
     let addr = if hdr.name == 0 || hdr.namelen == 0 {
@@ -1770,6 +1974,22 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fd = fd_arg(ctx.args[0])?;
     let mut hdr = read_msghdr(ctx.args[1])?;
     let total = iov_total_len_capped(hdr.iov, hdr.iovlen, MAX_SOCKET_IO)?;
+    if hdr.iovlen == 1
+        && hdr.controllen == 0
+        && (hdr.name == 0 || hdr.namelen == 0)
+        && total > COPY_CHUNK
+        && (ctx.args[2] & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
+        && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
+        && let Some(vm) = current_vm_space()
+    {
+        let (base, _) = read_iovec(hdr.iov, 0)?;
+        let len = recv_inet_stream_to_user(&vm, &fdt, fd, base, total, false, ctx.args[2], ctx)?;
+        hdr.controllen = 0;
+        hdr.namelen = 0;
+        hdr.flags = 0;
+        write_msghdr(ctx.args[1], &hdr)?;
+        return Ok(len);
+    }
     let mut data = zeroed_vec(total)?;
     let want_addr = hdr.name != 0 && hdr.namelen != 0;
     let out = vfs_socket::recv(
@@ -2524,17 +2744,19 @@ pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 }
 
 pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let timeout_base_ns = sched::now_ns_public();
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
-    let maxevents = ctx.args[2];
-    let timeout_ms = read_timespec_ms_ceil(ctx.args[3])?;
-    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
-    if maxevents == 0 {
+    let maxevents = ctx.args[2] as i32;
+    if maxevents <= 0 {
         return Err(Errno::EINVAL);
     }
+    let timeout_ns = read_timespec_timeout_ns(ctx.args[3])?;
+    let deadline = timeout_ns.map(|timeout_ns| timeout_base_ns.saturating_add(timeout_ns));
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
     let _mask_guard = TemporarySigmask::install(sigmask);
-    let ready = vfs::epoll::wait(&fdt, epfd, maxevents, timeout_ms)?;
+    let ready = vfs::epoll::wait_until(&fdt, epfd, maxevents as usize, deadline)?;
     write_epoll_events(events_user, &ready)?;
     Ok(ready.len())
 }
@@ -3786,7 +4008,11 @@ fn read_epoll_event(user: usize) -> Result<vfs::epoll::EpollEvent, Errno> {
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
     Ok(vfs::epoll::EpollEvent {
         events: u32::from_le_bytes(raw[0..4].try_into().unwrap()),
-        data: u64::from_le_bytes(raw[4..12].try_into().unwrap()),
+        data: u64::from_le_bytes(
+            raw[EPOLL_EVENT_DATA_OFFSET_64..EPOLL_EVENT_SIZE_64]
+                .try_into()
+                .unwrap(),
+        ),
     })
 }
 
@@ -3794,7 +4020,8 @@ fn write_epoll_events(user: usize, events: &[vfs::epoll::EpollEvent]) -> Result<
     for (index, event) in events.iter().enumerate() {
         let mut raw = [0u8; EPOLL_EVENT_SIZE_64];
         raw[0..4].copy_from_slice(&event.events.to_le_bytes());
-        raw[4..12].copy_from_slice(&event.data.to_le_bytes());
+        raw[EPOLL_EVENT_DATA_OFFSET_64..EPOLL_EVENT_SIZE_64]
+            .copy_from_slice(&event.data.to_le_bytes());
         let ptr = user
             .checked_add(
                 index
@@ -3838,7 +4065,11 @@ fn read_socklen_user(user: usize) -> Result<usize, Errno> {
     }
     let mut raw = [0u8; 4];
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
-    Ok(u32::from_le_bytes(raw) as usize)
+    let len = i32::from_le_bytes(raw);
+    if len < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(len as usize)
 }
 
 fn write_socklen_user(user: usize, len: usize) -> Result<(), Errno> {
@@ -4347,6 +4578,25 @@ fn read_timespec_ms_ceil(user: usize) -> Result<i64, Errno> {
         ms = ms.saturating_add(((nsec as u64).saturating_add(999_999) / 1_000_000) as i64);
     }
     Ok(ms)
+}
+
+/// 读取相对 timespec，并保留完整纳秒精度；空指针表示无限等待。
+fn read_timespec_timeout_ns(user: usize) -> Result<Option<u64>, Errno> {
+    if user == 0 {
+        return Ok(None);
+    }
+    let mut raw = [0u8; 16];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Some(
+        (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64),
+    ))
 }
 
 fn read_socket_timeout_deadline(user: usize) -> Result<Option<u64>, Errno> {

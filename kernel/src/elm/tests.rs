@@ -6346,3 +6346,15 @@ fn elm_native_replace_recovers_only_a_healthy_old_generation() {
 fn elm_kernel_symbol_import_bookkeeping_is_transactional() {
     assert!(ElmCore::test_kernel_symbol_import_bookkeeping());
 }
+
+#[ktest]
+fn elm_configured_build_bound_projection_requires_explicit_authorization() {
+    let module = super::trust_config::build_bound_modules()
+        .first()
+        .expect("kernel-tests build must include a configured BuildBound module");
+    let path = alloc::format!("/lib/elm/{}", module.file_name);
+    let bytes = crate::user::load_file_from_task_vfs(&sched::init_task(), &path)
+        .expect("configured BuildBound EKI must exist in initramfs");
+    let image = elm_model::parse_eki_image(&bytes).expect("configured EKI must parse");
+    assert!(ElmCore::test_configured_build_bound_promotion(&image));
+}

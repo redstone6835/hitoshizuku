@@ -36,11 +36,13 @@ pub mod paging;
 // ── 任务 ──────────────────────────────────────────────────────────────────────
 
 pub mod sched_ctx;
+pub mod smp;
 pub mod task;
 
 // ── 平台服务 ──────────────────────────────────────────────────────────────────
 
 pub mod early_console;
+pub mod sbi;
 pub mod specific;
 pub mod time;
 pub mod vdso;
@@ -62,5 +64,6 @@ pub use elm_native::{
 pub use mm::user_copy::set_sum;
 pub use random_source::register as register_entropy_source;
 pub use sched_ctx::register as register_sched_ctx;
+pub use smp::{SecondaryCpuReport, start_secondary_cpus};
 pub use specific::*;
 pub use task::Riscv64TaskOps;

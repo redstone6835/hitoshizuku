@@ -428,7 +428,12 @@ fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
 ///
 /// `ctx` 只携带底层设备驱动需要的内核能力；`/dev` 命名、设备号等用户接口层
 /// 信息不进入这个上下文，仍由 devtmpfs/VFS 投影层处理。
-pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevInitContext) {
+pub fn activate_device_subsystem(
+    tag: &str,
+    dev_sb: Arc<Superblock>,
+    ctx: DevInitContext,
+    bootloader_seed: Option<&[u8]>,
+) {
     general::vfs::devtmpfs::install_function_projection(Arc::clone(&dev_sb)).unwrap_or_else(
         |err| {
             panic!(
@@ -452,6 +457,10 @@ pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevIni
         tag
     );
 
+    if let Some(seed) = bootloader_seed {
+        general::dev::random::add_bootloader_randomness(seed);
+    }
+
     let integrated = crate::integrated_components::initialize_phase(
         crate::integrated_components::IntegratedPhase::Device,
     )
@@ -467,5 +476,32 @@ pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevIni
     printk!(
         "[kernel-start][{}] registered configured ELM device drivers",
         tag
+    );
+}
+
+/// 在辅助 CPU 启动完成后安装网络 host、driver 与 stack 的共享启动配置。
+pub fn install_network_boot_config() {
+    let mut material = [0u8; 112];
+    general::dev::random::fill(
+        &mut material,
+        general::dev::random::RandomReadMode::Insecure,
+    )
+    .expect("random ELM 未提供网络启动密钥材料");
+    let online_cpu_count = sched::online_cpu_mask().count_ones();
+    let active_cpu_count =
+        net::boot::select_protocol_shard_count(online_cpu_count).expect("网络启动时没有在线 CPU");
+    let (host_config, driver_config, stack_config) =
+        net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
+            .expect("active CPU count 超出网络栈范围")
+            .split();
+    net::boot::install_host_boot_config(host_config).expect("网络 host 启动配置被重复安装");
+    net::device::install_net_runtime(driver_config, crate::net_runtime::registrar())
+        .expect("网络运行时被重复安装");
+    net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
+        .expect("网络 stack broker 被重复安装");
+    log::info!(
+        "[kernel] installed network boot config: online_cpus={} protocol_shards={}",
+        online_cpu_count,
+        active_cpu_count
     );
 }

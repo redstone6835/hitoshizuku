@@ -46,6 +46,7 @@ fn caps_empty_has_none() {
 fn caps_full_has_all() {
     assert!(CapSet::FULL.has(Capability::DacOverride));
     assert!(CapSet::FULL.has(Capability::SysAdmin));
+    assert!(CapSet::FULL.has(Capability::NetBindService));
 }
 
 /// with 添加后再 without 移除，has 返回 false。
@@ -77,6 +78,7 @@ fn cred_root_has_multiple_caps() {
     assert!(c.has_cap(Capability::DacReadSearch));
     assert!(c.has_cap(Capability::FOwner));
     assert!(c.has_cap(Capability::SysAdmin));
+    assert!(c.has_cap(Capability::NetBindService));
 }
 
 /// unprivileged 构造的凭据无任何能力。

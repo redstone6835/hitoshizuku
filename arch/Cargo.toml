@@ -8,11 +8,15 @@ test = false
 doctest = false
 bench = false
 
+[features]
+performance-profile = ["dep:profiling"]
+
 [dependencies]
 general = { path = "../general" }
 allocator = { path = "../libs/allocator" }
 efi = { path = "../libs/efi" }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
+profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

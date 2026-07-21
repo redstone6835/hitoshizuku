@@ -5,12 +5,105 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use elm_model::{
     ELM_MGR_BUILTIN_ID, ElmEbiLoadStatus, ElmEbiSourceKind, ElmPrincipal, ElmResourceBudget,
     ElmSliceImageReader, canonical_ebi_digest, sha256,
 };
 use sched::Task;
+use sched::sync::Spinlock;
+
+/// 不启用墙钟看门狗；调用仍受保护域取消、异常和 ABI 校验约束。
+pub(crate) const NO_WATCHDOG_DEADLINE_NS: u64 = 0;
+
+/// ELM 生命周期通知只描述运行时可观察的状态变化，不携带任何子系统资源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElmLifecycleEvent {
+    CellLoaded { cell: elm_model::ElmId },
+}
+
+type LifecycleObserver = fn(ElmLifecycleEvent);
+
+#[derive(Clone, Copy)]
+struct LifecycleObserverEntry {
+    owner: &'static str,
+    callback: LifecycleObserver,
+}
+
+static LIFECYCLE_OBSERVERS: Spinlock<Vec<LifecycleObserverEntry>> = Spinlock::new(Vec::new());
+
+/// 注册常驻内核的 ELM 生命周期观察者；同一 owner 重复注册是幂等的。
+pub(crate) fn register_lifecycle_observer(
+    owner: &'static str,
+    callback: LifecycleObserver,
+) -> bool {
+    let mut observers = LIFECYCLE_OBSERVERS.lock();
+    if observers.iter().any(|observer| observer.owner == owner) {
+        return true;
+    }
+    if observers.try_reserve(1).is_err() {
+        return false;
+    }
+    observers.push(LifecycleObserverEntry { owner, callback });
+    true
+}
+
+fn notify_lifecycle_event(event: ElmLifecycleEvent) {
+    // 复制函数指针后再回调，避免观察者回调期间持有注册表锁。
+    let registered = LIFECYCLE_OBSERVERS.lock();
+    let mut observers = Vec::new();
+    if observers.try_reserve(registered.len()).is_err() {
+        log::error!("[elm] 生命周期观察者通知分配失败");
+        return;
+    }
+    observers.extend(registered.iter().copied());
+    drop(registered);
+    for observer in observers {
+        (observer.callback)(event);
+    }
+}
+
+/// 常驻内核 consumer 对一个 ELM exact-Rust export 的代际固定描述。
+///
+/// 该对象只保存复制到常驻内存中的身份和 ABI 摘要；每次调用仍由 Core 重新校验 cell
+/// 状态、generation 和 export 路由，并取得 active-execution 引用。
+pub(crate) struct PinnedNativeCall {
+    owner: elm_model::ElmId,
+    generation: elm_model::Generation,
+    name: String,
+    contract: elm_model::FlowContract,
+    version: u32,
+    rust_abi_hash: [u8; 32],
+    stack: native::PinnedNativeStack,
+}
+
+impl PinnedNativeCall {
+    pub(crate) fn new(
+        owner: elm_model::ElmId,
+        generation: elm_model::Generation,
+        name: &str,
+        contract: &str,
+        version: u32,
+        rust_abi: &str,
+    ) -> Result<Self, &'static str> {
+        if owner.0 == 0 || generation.0 == 0 || version == 0 {
+            return Err("invalid pinned native identity");
+        }
+        let stack = native::PinnedNativeStack::allocate()
+            .map_err(|_| "failed to allocate pinned native stack")?;
+        Ok(Self {
+            owner,
+            generation,
+            name: name.to_string(),
+            contract: elm_model::FlowContract::new(contract)
+                .map_err(|_| "invalid pinned native contract")?,
+            version,
+            rust_abi_hash: elm_model::sha256(rust_abi.as_bytes()),
+            stack,
+        })
+    }
+}
 
 mod api_registry;
 mod core;
@@ -137,6 +230,7 @@ pub(crate) fn init_builtin_mgr() {
             }
         }
         core.init_builtin_mgr()?;
+        core.mark_global_runtime_scope();
         Ok::<usize, elm_model::ElmError>(configured_anchor_count)
     }) {
         Ok(configured_anchor_count) => {
@@ -180,11 +274,47 @@ pub(crate) fn synchronize_smp_runtime() {
     );
 }
 
+/// 执行一次 kernel-consumer pinned native call。
+///
+/// Core 锁只用于准备和完成阶段；模块代码运行期间不持有 Core 锁。
+pub(crate) fn invoke_pinned_native<T>(
+    call: &PinnedNativeCall,
+    frame: &mut T,
+    host_ranges: &[(usize, usize)],
+    deadline_ns: u64,
+) -> Result<i32, i32> {
+    let plan = with_core(|core| core.prepare_pinned_native_call(call))?;
+    let status = native::invoke_pinned_export(
+        plan.callee.cell,
+        plan.callee.generation,
+        plan.address,
+        plan.bounds,
+        frame,
+        host_ranges,
+        &call.stack,
+        plan.callee.allowed_actions,
+        deadline_ns,
+    );
+    with_core(|core| core.complete_pinned_native_call(plan, status))
+}
+
 pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String> {
     let modules = trust_config::build_bound_modules();
     if modules.is_empty() {
         return Ok(0);
     }
+    validate_build_bound_environment(init)?;
+
+    let arch = current_ebi_arch();
+    let mut loaded = 0usize;
+    for module in modules {
+        load_build_bound_module(init, module, arch)?;
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
+fn validate_build_bound_environment(init: &Arc<Task>) -> Result<(), String> {
     let current_profile = kernel_interface_profile_hash()?;
     if current_profile != trust_config::build_profile_hash() {
         return Err("BuildBound Profile 与当前内核符号目录不一致".to_string());
@@ -194,64 +324,111 @@ pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String
     if sha256(&manifest) != trust_config::build_manifest_hash() {
         return Err("initramfs 中的 BuildBound 清单摘要不匹配".to_string());
     }
+    Ok(())
+}
 
-    let arch = current_ebi_arch();
-    let mut loaded = 0usize;
-    for module in modules {
-        let path = format!("/lib/elm/{}", module.file_name);
-        let bytes = crate::user::load_file_from_task_vfs(init, &path)
-            .map_err(|err| format!("读取 BuildBound 模块 {} 失败: {err:?}", module.name))?;
-        if sha256(&bytes) != module.eki_hash {
-            return Err(format!("BuildBound 模块 {} 的 EKI 摘要不匹配", module.name));
-        }
-        let reader = ElmSliceImageReader::new(&bytes);
-        let image = source::project_ebi_image(module.provider_id, &reader, arch)
-            .map_err(|status| format!("投影 BuildBound 模块 {} 失败: {status:?}", module.name))?;
-        if image.unit.manifest.name.as_str() != module.name
-            || canonical_ebi_digest(&image) != module.ebi_hash
-        {
-            return Err(format!("BuildBound 模块 {} 的 EBI 身份不匹配", module.name));
-        }
-        let budget = ElmResourceBudget::BUILD_BOUND;
-        let mut authorization = with_core(|core| {
-            core.authorize_mgr_call(
-                ElmPrincipal::kernel(),
-                elm_model::ElmMgrCallKind::LoadCell,
-                core::ElmMgrAccessTarget::Load(ELM_MGR_BUILTIN_ID, budget),
-            )
-        });
-        if !authorization.allowed() {
-            return Err(format!(
-                "BuildBound 模块 {} 未通过内核装载策略",
-                module.name
-            ));
-        }
-        let response = core::load_ebi_image_unlocked(
-            image,
-            arch,
-            ElmEbiSourceKind::BuildBound,
-            ELM_MGR_BUILTIN_ID,
-            budget,
-            false,
-            true,
-            &mut authorization,
-        )
-        .map_err(|status| format!("装载 BuildBound 模块 {} 失败: {status}", module.name))?;
-        if response.status != ElmEbiLoadStatus::Ok as i32 {
-            return Err(format!(
-                "装载 BuildBound 模块 {} 被运行时拒绝: {}",
-                module.name, response.status
-            ));
-        }
-        loaded += 1;
-        log::info!(
-            "[elm] BuildBound module active: name={} cell={} order={}",
-            module.name,
-            response.cell_id,
-            module.order
-        );
+fn load_build_bound_module(
+    init: &Arc<Task>,
+    module: &trust_config::ElmBuildBoundRecord,
+    arch: elm_model::ElmEbiArch,
+) -> Result<elm_model::ElmId, String> {
+    let path = format!("/lib/elm/{}", module.file_name);
+    let bytes = crate::user::load_file_from_task_vfs(init, &path)
+        .map_err(|err| format!("读取 BuildBound 模块 {} 失败: {err:?}", module.name))?;
+    if sha256(&bytes) != module.eki_hash {
+        return Err(format!("BuildBound 模块 {} 的 EKI 摘要不匹配", module.name));
     }
-    Ok(loaded)
+    let reader = ElmSliceImageReader::new(&bytes);
+    let image = source::project_ebi_image(module.provider_id, &reader, arch)
+        .map_err(|status| format!("投影 BuildBound 模块 {} 失败: {status:?}", module.name))?;
+    if image.unit.manifest.name.as_str() != module.name
+        || canonical_ebi_digest(&image) != module.ebi_hash
+    {
+        return Err(format!("BuildBound 模块 {} 的 EBI 身份不匹配", module.name));
+    }
+    let budget = ElmResourceBudget::BUILD_BOUND;
+    let mut authorization = with_core(|core| {
+        core.authorize_mgr_call(
+            ElmPrincipal::kernel(),
+            elm_model::ElmMgrCallKind::LoadCell,
+            core::ElmMgrAccessTarget::Load(ELM_MGR_BUILTIN_ID, budget),
+        )
+    });
+    if !authorization.allowed() {
+        return Err(format!(
+            "BuildBound 模块 {} 未通过内核装载策略",
+            module.name
+        ));
+    }
+    let response = core::load_ebi_image_unlocked(
+        image,
+        arch,
+        ElmEbiSourceKind::BuildBound,
+        ELM_MGR_BUILTIN_ID,
+        budget,
+        false,
+        true,
+        &mut authorization,
+    )
+    .map_err(|status| format!("装载 BuildBound 模块 {} 失败: {status}", module.name))?;
+    if response.status != ElmEbiLoadStatus::Ok as i32 {
+        return Err(format!(
+            "装载 BuildBound 模块 {} 被运行时拒绝: {}",
+            module.name, response.status
+        ));
+    }
+    log::info!(
+        "[elm] BuildBound module active: name={} cell={} order={}",
+        module.name,
+        response.cell_id,
+        module.order
+    );
+    Ok(elm_model::ElmId(response.cell_id))
+}
+
+#[cfg(feature = "network-tests")]
+pub(crate) fn detach_build_bound_module_for_test(name: &str) -> Result<elm_model::ElmId, String> {
+    let cell = with_core(|core| {
+        core.cells()
+            .iter()
+            .find(|cell| cell.name == name && cell.state == elm_model::ElmState::Active)
+            .map(|cell| cell.id)
+    })
+    .ok_or_else(|| format!("找不到活跃 BuildBound 模块 {name}"))?;
+    let mut authorization = with_core(|core| {
+        core.authorize_mgr_call(
+            ElmPrincipal::kernel(),
+            elm_model::ElmMgrCallKind::DetachCell,
+            core::ElmMgrAccessTarget::Cell(cell),
+        )
+    });
+    if !authorization.allowed() {
+        return Err(format!("BuildBound 模块 {name} 未通过内核卸载策略"));
+    }
+    let response = core::detach_cell_unlocked(cell, &mut authorization)
+        .map_err(|status| format!("卸载 BuildBound 模块 {name} 失败: {status}"))?;
+    if response.status != elm_model::ELM_MGR_STATUS_OK {
+        return Err(format!(
+            "卸载 BuildBound 模块 {name} 被运行时拒绝: {}",
+            response.status
+        ));
+    }
+    Ok(cell)
+}
+
+#[cfg(feature = "network-tests")]
+pub(crate) fn reload_build_bound_module_for_test(
+    init: &Arc<Task>,
+    name: &str,
+) -> Result<elm_model::ElmId, String> {
+    validate_build_bound_environment(init)?;
+    let module = trust_config::build_bound_modules()
+        .iter()
+        .find(|module| module.name == name)
+        .ok_or_else(|| format!("BuildBound 清单中不存在模块 {name}"))?;
+    let cell = load_build_bound_module(init, module, current_ebi_arch())?;
+    notify_lifecycle_event(ElmLifecycleEvent::CellLoaded { cell });
+    Ok(cell)
 }
 
 fn current_ebi_arch() -> elm_model::ElmEbiArch {

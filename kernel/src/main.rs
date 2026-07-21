@@ -19,7 +19,10 @@ mod dtb;
 mod elm;
 mod initramfs;
 mod integrated_components;
-mod net_poll;
+mod net_runtime;
+mod net_stack;
+#[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+mod net_tests;
 mod panic;
 mod sched;
 mod start;
@@ -59,10 +62,28 @@ static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
-    // 协议栈是被动状态机，必须由定时器持续推进收包、TCP 状态和套接字回收。
-    net_poll::register();
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    #[cfg(feature = "performance-profile")]
+    {
+        profiling::install(
+            hal::time::stable_counter_raw,
+            ::sched::current_cpu_id,
+            ::sched::current_task_cpu_time_ns,
+            hal::time::stable_counter_hz(),
+        );
+        profiling::set_enabled(true);
+    }
+    let secondary_cpus = hal::sched::start_secondary_cpus();
+    log::info!(
+        "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
+        secondary_cpus.detected,
+        secondary_cpus.started,
+        secondary_cpus.failed,
+        ::sched::online_cpu_mask(),
+        ::sched::active_cpu_mask(),
+    );
+    device_init::install_network_boot_config();
     let integrated =
         integrated_components::initialize_phase(integrated_components::IntegratedPhase::Runtime)
             .unwrap_or_else(|error| panic!("[kernel] 集成组件初始化失败: {error}"));
@@ -78,6 +99,10 @@ fn main() -> ! {
     if build_bound != 0 {
         log::info!("[kernel] activated {} BuildBound ELM(s)", build_bound);
     }
+    net_stack::start_host();
+    // 网络 host 允许没有设备启动；BuildBound driver 已激活时会在此首次 attach，后续
+    // 动态装载则通过 ELM 管理路径触发 reconcile。
+    net_runtime::start_workers();
     if device_init::retry_deferred_boot_console(&init) {
         log::info!("[kernel] deferred boot console activated after BuildBound loading");
     }
@@ -86,15 +111,6 @@ fn main() -> ! {
     // 调度器 init/idle 完成后才能派生内核线程。
     tty_poll::register();
 
-    let secondary_cpus = hal::sched::start_secondary_cpus();
-    log::info!(
-        "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
-        secondary_cpus.detected,
-        secondary_cpus.started,
-        secondary_cpus.failed,
-        ::sched::online_cpu_mask(),
-        ::sched::active_cpu_mask(),
-    );
     elm::synchronize_smp_runtime();
     /*
     #[cfg(debug_assertions)]
@@ -105,7 +121,11 @@ fn main() -> ! {
     general::mm::smoketest::run();
     */
 
-    #[cfg(any(feature = "kernel-tests", feature = "allocator-tests"))]
+    #[cfg(any(
+        feature = "kernel-tests",
+        feature = "network-tests",
+        feature = "allocator-tests"
+    ))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);
         let report = ktest::runner::run_all();

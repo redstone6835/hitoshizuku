@@ -585,6 +585,10 @@ fn format_log_record_line(record: &log::LogRecord<'_>) -> SinkLineBuffer {
 /// 初始值 100_000_000（100 MHz）为 QEMU LoongArch64 默认值。
 pub static STABLE_TIMER_HZ: AtomicUsize = AtomicUsize::new(100_000_000);
 static TIMER_HZ: AtomicUsize = AtomicUsize::new(DEFAULT_TIMER_HZ);
+static TIMER_PERIOD_TICKS: AtomicU64 = AtomicU64::new(1_000_000);
+
+/// TCFG.InitVal 可写入位 47:2 的最大原始计数值。
+const TCFG_MAX_TICKS: u64 = ((1u64 << 48) - 1) & !0b11;
 
 /// 启动时刻的原始计时值，用于将后续时间戳归零到启动时刻。
 static BOOT_TIMESTAMP_NS: AtomicU64 = AtomicU64::new(0);
@@ -598,7 +602,7 @@ pub(crate) fn configure_local_timer(timer_hz: usize) {
     TIMER_HZ.store(timer_hz, Ordering::Release);
     let stable_hz = STABLE_TIMER_HZ.load(Ordering::Relaxed) as u64;
     let period = (stable_hz / timer_hz as u64).max(1);
-    let tcfg_val = (period << 2) | (1 << 1) | 1;
+    TIMER_PERIOD_TICKS.store(period.min(TCFG_MAX_TICKS), Ordering::Release);
     const LIE_TIMER: usize = 1 << 11;
     const LIE_IPI: usize = 1 << 12;
     let lie_val = LIE_TIMER | LIE_IPI;
@@ -617,6 +621,36 @@ pub(crate) fn configure_local_timer(timer_hz: usize) {
             csr_ticlr = const CSR_TICLR,
             options(nostack, preserves_flags)
         );
+    }
+    rearm_local_timer(None);
+}
+
+/// 按软件绝对截止时间重装当前 CPU 的 one-shot 定时器。
+///
+/// 无论是否存在软件 deadline，下一次中断都不会晚于常规调度 tick；这样短超时
+/// 可以获得亚 tick 精度，同时 EEVDF、网络轮询等周期工作不会因 one-shot 模式
+/// 而停止。所有纳秒到计数值的转换均向上取整，避免定时器早于请求时间触发。
+pub(crate) fn rearm_local_timer(deadline_ns: Option<u64>) {
+    let period = TIMER_PERIOD_TICKS
+        .load(Ordering::Acquire)
+        .clamp(1, TCFG_MAX_TICKS);
+    let ticks = deadline_ns.map_or(period, |deadline| {
+        let now_ns = kernel_timestamp_ns();
+        let delta_ns = deadline.saturating_sub(now_ns);
+        let stable_hz = STABLE_TIMER_HZ.load(Ordering::Relaxed).max(1) as u128;
+        let ticks = if delta_ns == 0 {
+            1
+        } else {
+            ((delta_ns as u128 * stable_hz).saturating_add(999_999_999) / 1_000_000_000)
+                .clamp(1, TCFG_MAX_TICKS as u128) as u64
+        };
+        ticks.min(period)
+    });
+    // TCFG 的计数值直接占据位 47:2，硬件按 4 递减；它不是需要左移后再
+    // 填入的普通整数位域。额外左移两位会把所有超时精确放大为四倍。
+    let ticks = ticks.clamp(4, TCFG_MAX_TICKS).saturating_add(3) & !0b11;
+    let tcfg_val = ticks | 1;
+    unsafe {
         core::arch::asm!(
             "csrwr {val}, {csr_tcfg}",
             val = in(reg) tcfg_val,
@@ -737,7 +771,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         ));
 
         // 步骤 1.1b：配置定时器中断，使其按配置频率产生中断。
-        // 默认 100 Hz，可通过内核命令行 "timer_hz=N" 覆盖。
+        // 普通构建默认 100 Hz，剖析构建默认 997 Hz；命令行仍可覆盖。
         let timer_hz = {
             let mut hz = DEFAULT_TIMER_HZ;
             let raw = CMDLINE_PTR.load(Ordering::Acquire);

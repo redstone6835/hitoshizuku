@@ -1,0 +1,11 @@
+[elm]
+name = "net.stack"
+version = "0.1.0"
+kind = "network"
+source = "kernel-tree:drivers.net-stack"
+mode = "m"
+integrated_phase = "runtime"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

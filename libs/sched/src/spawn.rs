@@ -13,8 +13,8 @@ use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    activate_task_on_cpu, current_task, enqueue_task, init_task, is_current_on_any_cpu,
-    mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
+    activate_task_on_cpu, current_task, enqueue_task, enqueue_task_with_hint, init_task,
+    is_current_on_any_cpu, mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -60,6 +60,7 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
         Arc::clone(&tgroup),
         Arc::clone(&pgroup),
     );
+    child.inherit_timer_slack_from(parent);
 
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_leader(&child);
@@ -114,7 +115,39 @@ pub fn activate_task(task: &Arc<Task>) -> Result<usize, errno::Errno> {
         | TaskState::Zombie
         | TaskState::Dead => return Err(errno::Errno::EINVAL),
     }
+    #[cfg(feature = "performance-profile")]
+    if task.state() == TaskState::Sleeping {
+        task.mark_profile_woken(now_ns_public());
+    }
     Ok(enqueue_task(Arc::clone(task), now_ns_public()))
+}
+
+/// 唤醒任务并优先放到指定 CPU；提示不可用时仍会选择其它合法 CPU。
+pub fn activate_task_with_cpu_hint(
+    task: &Arc<Task>,
+    cpu_hint: usize,
+) -> Result<usize, errno::Errno> {
+    if task.arch_context().is_none() {
+        return Err(errno::Errno::EINVAL);
+    }
+    match task.state() {
+        TaskState::New | TaskState::Runnable | TaskState::Sleeping => {}
+        TaskState::Running
+        | TaskState::Uninterruptible
+        | TaskState::Stopped
+        | TaskState::Continued
+        | TaskState::Zombie
+        | TaskState::Dead => return Err(errno::Errno::EINVAL),
+    }
+    #[cfg(feature = "performance-profile")]
+    if task.state() == TaskState::Sleeping {
+        task.mark_profile_woken(now_ns_public());
+    }
+    Ok(enqueue_task_with_hint(
+        Arc::clone(task),
+        cpu_hint,
+        now_ns_public(),
+    ))
 }
 
 /// 回滚尚未运行、尚未入队的新任务。用于 clone/exec 安装用户上下文失败的路径。
@@ -146,12 +179,18 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let new_tg = if flags.has(CloneFlags::CLONE_THREAD) {
         parent_tg
     } else {
-        // CLONE_SIGHAND 共享 SharedSignal（即便不 CLONE_THREAD）。
+        // CLONE_SIGHAND 只共享 handler 表；独立线程组必须拥有自己的
+        // 进程级 pending 队列。CLONE_THREAD 才复用完整 SharedSignal。
         let tg = if flags.has(CloneFlags::CLONE_SIGHAND) {
-            ThreadGroup::new_sharing_signal(Arc::clone(parent_tg.shared_signal()))
+            ThreadGroup::new_sharing_signal(Arc::new(parent_tg.shared_signal().clone_sighand()))
         } else {
-            // 不共享 → 深拷一份 sigaction。
-            let copied = parent_tg.shared_signal().fork_copy();
+            // 不共享时深拷 sigaction；CLEAR_SIGHAND 只重置用户处理函数，父进程
+            // 显式忽略的信号仍须保持 SIG_IGN。
+            let copied = if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
+                parent_tg.shared_signal().fork_copy_clearing_handlers()
+            } else {
+                parent_tg.shared_signal().fork_copy()
+            };
             ThreadGroup::new_sharing_signal(Arc::new(copied))
         };
         {
@@ -179,6 +218,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&new_tg),
         Arc::clone(&pg),
     );
+    child.inherit_timer_slack_from(parent);
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
     if flags.has(CloneFlags::CLONE_VM) && !flags.has(CloneFlags::CLONE_VFORK) {

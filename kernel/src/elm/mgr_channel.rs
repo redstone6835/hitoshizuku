@@ -13,17 +13,17 @@ use elm_model::{
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
     ELM_REPLACE_CELL_ABI_VERSION, ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS,
     ELM_REPLACE_CELL_FLAGS_MASK, ElmCellPolicyRequest, ElmCellPolicyV1, ElmEbiArch,
-    ElmEbiSourceKind, ElmEbiSourceRequest, ElmExtensionAttachRequest, ElmExtensionDetachRequest,
-    ElmExtensionDispatchRequest, ElmId, ElmImageSessionBeginRequestV1, ElmImageSessionReferenceV1,
-    ElmImageSessionRequestV1, ElmImageSessionWriteRequestV1, ElmKind, ElmLifecyclePlanRequest,
-    ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest,
-    ElmMgrEventUnsubscribeRequest, ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest,
-    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmPrincipal, ElmProjectionSourceRequest,
-    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncSubmitRequest,
-    ElmProviderInvokeRequest, ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest,
-    ElmProviderSnapshotRequest, ElmReplaceCellRequestV1, ElmResourceBudgetRequest,
-    ElmResourceBudgetUpdateRequest, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
-    ElmSliceImageReader,
+    ElmEbiLoadStatus, ElmEbiSourceKind, ElmEbiSourceRequest, ElmExtensionAttachRequest,
+    ElmExtensionDetachRequest, ElmExtensionDispatchRequest, ElmId, ElmImageSessionBeginRequestV1,
+    ElmImageSessionReferenceV1, ElmImageSessionRequestV1, ElmImageSessionWriteRequestV1, ElmKind,
+    ElmLifecyclePlanRequest, ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind,
+    ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrResponseHeader,
+    ElmMgrSubscribedEventReadRequest, ElmNexusBindRequest, ElmNexusUnbindRequest, ElmPrincipal,
+    ElmProjectionSourceRequest, ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest,
+    ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderPortRegisterRequest,
+    ElmProviderPortUnregisterRequest, ElmProviderSnapshotRequest, ElmReplaceCellRequestV1,
+    ElmResourceBudgetRequest, ElmResourceBudgetUpdateRequest, ElmRuntimeEventRequest,
+    ElmRuntimeLogRequest, ElmSliceImageReader,
 };
 
 use super::{
@@ -103,7 +103,16 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                         authorize_privileged_symbols,
                         &mut authorization,
                     ) {
-                        Ok(response) => response_with_plain_payload(&response),
+                        Ok(response) => {
+                            if response.status == ElmEbiLoadStatus::Ok as i32 {
+                                super::notify_lifecycle_event(
+                                    super::ElmLifecycleEvent::CellLoaded {
+                                        cell: ElmId(response.cell_id),
+                                    },
+                                );
+                            }
+                            response_with_plain_payload(&response)
+                        }
                         Err(status) => response_only(response_header_from_status(status)),
                     };
                     finish_unlocked_call(kind, authorization, response)
