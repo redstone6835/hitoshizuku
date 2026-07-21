@@ -21,6 +21,7 @@ log=$tmp/trace.log
         echo "control=state=frozen enabled=0"
         echo "@@PROFILE_META_END phase=$phase case=io"
     done
+    echo "@@PROFILE_WORKLOAD case=io pid=7"
     echo "@@PROFILE_TRACE_BEGIN phase=before case=io"
     echo "state=frozen enabled=0 session=1 generation=2 active_writers=0 counter_hz=1000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
     echo "cpu=0 first_sequence=0 next_sequence=0 retained=0 overwritten=0"
@@ -44,6 +45,10 @@ log=$tmp/trace.log
 output=$($root/scripts/profile-analyze.sh "$log" 20)
 printf '%s\n' "$output" | grep -q '^PROFILE_ANALYSIS version=1 top=20$'
 printf '%s\n' "$output" | grep -q '^TRACE_CAPACITY max_retained=10 slots_per_cpu=1024 utilization_pct=1.0 warning=none$'
+printf '%s\n' "$output" | grep -q '^WORKLOAD_ATTRIBUTION$'
+printf '%s\n' "$output" | grep -q '^io[[:space:]]10[[:space:]]10[[:space:]]0[[:space:]]0[[:space:]]100.0$'
+printf '%s\n' "$output" | grep -q '^WORKLOAD_ROOT_SPANS$'
+printf '%s\n' "$output" | grep -q '^WORKLOAD_ROOT_BOTTLENECKS$'
 printf '%s\n' "$output" | grep -q '^IO_CRITICAL_PATHS$'
 printf '%s\n' "$output" | awk -F '\t' '
 $1 == "io" && $2 == "10" && NF == 16 {

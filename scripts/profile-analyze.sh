@@ -22,6 +22,9 @@ rows=$tmp/rows
 summary=$tmp/summary
 bottlenecks=$tmp/bottlenecks
 io_bottlenecks=$tmp/io-bottlenecks
+workload_summary=$tmp/workload-summary
+workload_bottlenecks=$tmp/workload-bottlenecks
+attribution=$tmp/attribution
 sys_rows=$tmp/syscall-rows
 io_summary=$tmp/io-summary
 tab=$(printf '\t')
@@ -32,7 +35,9 @@ if ! "$root/scripts/profile-trace-report.sh" "$log" >"$rows"; then
     exit 1
 fi
 
-awk -F '\t' -v summary="$summary" -v bottlenecks="$bottlenecks" -v io_bottlenecks="$io_bottlenecks" '
+awk -F '\t' -v summary="$summary" -v bottlenecks="$bottlenecks" \
+    -v io_bottlenecks="$io_bottlenecks" -v workload_summary="$workload_summary" \
+    -v workload_bottlenecks="$workload_bottlenecks" '
 NR == 1 { next }
 NF < 13 { next }
 {
@@ -43,6 +48,7 @@ NF < 13 { next }
     span = $6
     kind = $7
     event = $8
+    role = $14
     if (span == "" || span == "0") next
     key = case_id SUBSEP span
     effective_duration = duration
@@ -58,6 +64,7 @@ NF < 13 { next }
     if (interval_start < first[key]) first[key] = interval_start
     if (timestamp + duration > last[key]) last[key] = timestamp + duration
     records[key]++
+    if (role == "workload-root") workload_root[key] = 1
     event_duration[key, event] += effective_duration
     event_seen[key, event] = 1
     if (duration > 0) {
@@ -76,7 +83,9 @@ NF < 13 { next }
 }
 END {
     print "case\tspan\tsyscall\ttask\trecords\twall_us\tsyscall_us\tvfs_us\tblock_submit_us\tblock_drain_us\tblock_complete_us\tblock_wait_us\twait_us\tdominant_event\tdominant_us\tdominant_share_pct" > summary
+    print "case\tspan\tsyscall\ttask\trecords\twall_us\tsyscall_us\tvfs_us\tblock_submit_us\tblock_drain_us\tblock_complete_us\tblock_wait_us\twait_us\tdominant_event\tdominant_us\tdominant_share_pct" > workload_summary
     print "case\tspan\tsyscall\tevent\texclusive_us\tshare_pct" > bottlenecks
+    print "case\tspan\tsyscall\tevent\texclusive_us\tshare_pct" > workload_bottlenecks
     print "case\tspan\tsyscall\tevent\texclusive_us\tshare_pct" > io_bottlenecks
     for (key in first) {
         split(key, parts, SUBSEP)
@@ -129,19 +138,39 @@ END {
             }
             if (duration > 0)
                 printf "%s\t%s\t%s\t%s\t%.3f\t%.1f\n", case_id, span, syscall[key], event, duration, (wall > 0 ? duration * 100 / wall : 0) > bottlenecks
+            if (workload_root[key] && duration > 0)
+                printf "%s\t%s\t%s\t%s\t%.3f\t%.1f\n", case_id, span, syscall[key], event, duration, (wall > 0 ? duration * 100 / wall : 0) > workload_bottlenecks
             if (is_io && duration > 0)
                 printf "%s\t%s\t%s\t%s\t%.3f\t%.1f\n", case_id, span, syscall[key], event, duration, (wall > 0 ? duration * 100 / wall : 0) > io_bottlenecks
         }
-        printf "%s\t%s\t%s\t%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%.3f\t%.1f\n", \
+        line = sprintf("%s\t%s\t%s\t%s\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\t%.3f\t%.1f", \
             case_id, span, syscall[key], first_task[key], records[key], wall, \
             event_duration[key, "syscall_dispatch"], event_duration[key, "vfs_read"] + event_duration[key, "vfs_write"], \
             event_duration[key, "block_submit"], event_duration[key, "block_drain"], \
             event_duration[key, "block_complete"], event_duration[key, "block_wait"], \
             event_duration[key, "wait_other"] + event_duration[key, "wait_futex"] + event_duration[key, "wait_mutex"] + event_duration[key, "wait_timer"] + event_duration[key, "wait_yield"], \
-            dominant, dominant_duration, (wall > 0 ? dominant_duration * 100 / wall : 0) > summary
+            dominant, dominant_duration, (wall > 0 ? dominant_duration * 100 / wall : 0))
+        print line > summary
+        if (workload_root[key]) print line > workload_summary
     }
 }
 ' "$rows"
+
+awk -F '\t' '
+NR == 1 { next }
+{
+    total[$1]++
+    if ($14 == "workload-root") root[$1]++
+    else if ($14 == "other") other[$1]++
+    else unclassified[$1]++
+}
+END {
+    print "case\ttotal_records\tworkload_root_records\tother_records\tunclassified_records\tworkload_root_pct"
+    for (case_id in total)
+        printf "%s\t%d\t%d\t%d\t%d\t%.1f\n", case_id, total[case_id], root[case_id], \
+            other[case_id], unclassified[case_id], total[case_id] ? root[case_id] * 100 / total[case_id] : 0
+}
+' "$rows" >"$attribution"
 
 awk -F '\t' 'NR > 1 && $3 != "" { print $1 "\t" $3 "\t" $6 "\t" $12 }' "$summary" >"$sys_rows"
 awk -F '\t' 'NR == 1 || ($8 + $9 + $10 + $11 + $12) > 0' "$summary" >"$io_summary"
@@ -167,6 +196,17 @@ END {
 
 echo "PROFILE_ANALYSIS version=1 top=$top"
 echo "$capacity"
+echo "WORKLOAD_ATTRIBUTION"
+cat "$attribution"
+echo
+echo "WORKLOAD_ROOT_SPANS"
+head -n 1 "$workload_summary"
+tail -n +2 "$workload_summary" | sort -t "$tab" -k6,6nr | head -n "$top"
+echo
+echo "WORKLOAD_ROOT_BOTTLENECKS"
+head -n 1 "$workload_bottlenecks"
+tail -n +2 "$workload_bottlenecks" | sort -t "$tab" -k5,5nr | head -n "$top"
+echo
 echo "IO_CRITICAL_PATHS"
 head -n 1 "$io_summary"
 tail -n +2 "$io_summary" | sort -t "$tab" -k6,6nr | head -n "$top"
