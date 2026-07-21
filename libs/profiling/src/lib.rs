@@ -13,7 +13,8 @@ pub const CPU_SLOTS: usize = MAX_CPUS + 1;
 pub const HISTOGRAM_BUCKETS: usize = 64;
 pub const SAMPLE_SLOTS: usize = 4096;
 pub const TRACE_SLOTS_PER_CPU: usize = 1024;
-pub const TRACE_RECORD_BYTES: usize = 72;
+pub const TRACE_RECORD_BYTES: usize = 80;
+pub const TRACE_FORMAT_VERSION: usize = 2;
 const SAMPLE_PROBES: usize = 16;
 const TRACE_SLOT_INVALID: u64 = u64::MAX;
 
@@ -87,6 +88,10 @@ pub enum Event {
     VfsWrite,
     PageFault,
     IrqDispatch,
+    BlockSubmit,
+    BlockDrain,
+    BlockComplete,
+    BlockWait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +103,7 @@ pub enum EventCategory {
     Filesystem,
     Memory,
     Interrupt,
+    Block,
 }
 
 impl EventCategory {
@@ -110,12 +116,13 @@ impl EventCategory {
             Self::Filesystem => "filesystem",
             Self::Memory => "memory",
             Self::Interrupt => "interrupt",
+            Self::Block => "block",
         }
     }
 }
 
 impl Event {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 33] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -145,6 +152,10 @@ impl Event {
         Self::VfsWrite,
         Self::PageFault,
         Self::IrqDispatch,
+        Self::BlockSubmit,
+        Self::BlockDrain,
+        Self::BlockComplete,
+        Self::BlockWait,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -178,6 +189,10 @@ impl Event {
             Self::VfsWrite => "vfs_write",
             Self::PageFault => "page_fault",
             Self::IrqDispatch => "irq_dispatch",
+            Self::BlockSubmit => "block_submit",
+            Self::BlockDrain => "block_drain",
+            Self::BlockComplete => "block_complete",
+            Self::BlockWait => "block_wait",
         }
     }
 
@@ -218,6 +233,9 @@ impl Event {
             Self::VfsRead | Self::VfsWrite => EventCategory::Filesystem,
             Self::PageFault => EventCategory::Memory,
             Self::IrqDispatch => EventCategory::Interrupt,
+            Self::BlockSubmit | Self::BlockDrain | Self::BlockComplete | Self::BlockWait => {
+                EventCategory::Block
+            }
         }
     }
 }
@@ -267,6 +285,7 @@ pub struct TraceRecord {
     pub session_id: u64,
     pub generation: u64,
     pub task_id: u64,
+    pub span_id: u64,
     pub cpu: usize,
     pub kind: TraceKind,
     pub event: Event,
@@ -454,6 +473,7 @@ struct TraceSlot {
     session_id: AtomicU64,
     generation: AtomicU64,
     task_id: AtomicU64,
+    span_id: AtomicU64,
     metadata: AtomicU64,
     arg0: AtomicU64,
     arg1: AtomicU64,
@@ -468,6 +488,7 @@ impl TraceSlot {
             session_id: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             task_id: AtomicU64::new(0),
+            span_id: AtomicU64::new(0),
             metadata: AtomicU64::new(0),
             arg0: AtomicU64::new(0),
             arg1: AtomicU64::new(0),
@@ -501,18 +522,25 @@ static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_CPU_NS: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_SPAN_ID: AtomicUsize = AtomicUsize::new(0);
+static SET_CURRENT_SPAN_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn install(
     read_counter: fn() -> u64,
     current_cpu: fn() -> usize,
     current_task_cpu_ns: fn() -> u64,
     current_task_id: fn() -> u64,
+    current_span_id: fn() -> u64,
+    set_current_span_id: fn(u64),
     counter_hz: u64,
 ) {
     READ_COUNTER.store(read_counter as usize, Ordering::Release);
     CURRENT_CPU.store(current_cpu as usize, Ordering::Release);
     CURRENT_TASK_CPU_NS.store(current_task_cpu_ns as usize, Ordering::Release);
     CURRENT_TASK_ID.store(current_task_id as usize, Ordering::Release);
+    CURRENT_SPAN_ID.store(current_span_id as usize, Ordering::Release);
+    SET_CURRENT_SPAN_ID.store(set_current_span_id as usize, Ordering::Release);
     COUNTER_HZ.store(counter_hz, Ordering::Release);
 }
 
@@ -695,6 +723,68 @@ fn current_task_id() -> u64 {
     current()
 }
 
+pub fn current_span_id() -> u64 {
+    let raw = installed_fn(&CURRENT_SPAN_ID);
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: install 只接受相同签名的函数指针，安装后不会撤销。
+    let current: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    current()
+}
+
+fn set_current_span_id(span_id: u64) {
+    let raw = installed_fn(&SET_CURRENT_SPAN_ID);
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: install 只接受相同签名的函数指针，安装后不会撤销。
+    let set: fn(u64) = unsafe { core::mem::transmute(raw) };
+    set(span_id);
+}
+
+pub struct SpanGuard {
+    previous: u64,
+    span_id: u64,
+    active: bool,
+}
+
+impl SpanGuard {
+    pub const fn id(&self) -> u64 {
+        self.span_id
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        if self.active {
+            set_current_span_id(self.previous);
+        }
+    }
+}
+
+pub fn enter_span() -> SpanGuard {
+    if !enabled() || installed_fn(&CURRENT_SPAN_ID) == 0 || installed_fn(&SET_CURRENT_SPAN_ID) == 0
+    {
+        return SpanGuard {
+            previous: 0,
+            span_id: 0,
+            active: false,
+        };
+    }
+    let previous = current_span_id();
+    let mut span_id = NEXT_SPAN_ID.fetch_add(1, Ordering::AcqRel);
+    if span_id == 0 {
+        span_id = NEXT_SPAN_ID.fetch_add(1, Ordering::AcqRel);
+    }
+    set_current_span_id(span_id);
+    SpanGuard {
+        previous,
+        span_id,
+        active: true,
+    }
+}
+
 pub struct Scope {
     event: Event,
     start_cycles: u64,
@@ -707,6 +797,7 @@ pub struct Scope {
     generation: u64,
     start_cpu: usize,
     start_task_id: u64,
+    span_id: u64,
 }
 
 impl Scope {
@@ -760,6 +851,7 @@ impl Drop for Scope {
             self.packets,
             self.start_cpu,
             self.start_task_id,
+            self.span_id,
             self.trace_arg0,
             self.trace_arg1,
             self.generation,
@@ -782,6 +874,7 @@ pub fn scope(event: Event) -> Scope {
         generation,
         start_cpu: current_cpu(),
         start_task_id: if active { current_task_id() } else { 0 },
+        span_id: if active { current_span_id() } else { 0 },
     }
 }
 
@@ -834,6 +927,7 @@ fn push_trace_record(
     duration_cycles: u64,
     record_generation: u64,
     task_id: u64,
+    span_id: u64,
     kind: TraceKind,
     event: Event,
     arg0: u64,
@@ -857,6 +951,7 @@ fn push_trace_record(
     slot.session_id.store(session_id(), Ordering::Relaxed);
     slot.generation.store(record_generation, Ordering::Relaxed);
     slot.task_id.store(task_id, Ordering::Relaxed);
+    slot.span_id.store(span_id, Ordering::Relaxed);
     slot.metadata
         .store(trace_metadata(cpu, kind, event), Ordering::Relaxed);
     slot.arg0.store(arg0, Ordering::Relaxed);
@@ -866,6 +961,17 @@ fn push_trace_record(
 }
 
 pub fn trace_task_event(kind: TraceKind, event: Event, task_id: u64, arg0: u64, arg1: u64) {
+    trace_task_event_with_span(kind, event, task_id, current_span_id(), arg0, arg1);
+}
+
+pub fn trace_task_event_with_span(
+    kind: TraceKind,
+    event: Event,
+    task_id: u64,
+    span_id: u64,
+    arg0: u64,
+    arg1: u64,
+) {
     if !trace_enabled() || !event_enabled(event) || installed_fn(&READ_COUNTER) == 0 {
         return;
     }
@@ -879,6 +985,7 @@ pub fn trace_task_event(kind: TraceKind, event: Event, task_id: u64, arg0: u64, 
         0,
         record_generation,
         task_id,
+        span_id,
         kind,
         event,
         arg0,
@@ -895,6 +1002,7 @@ fn record_scope(
     packets: u64,
     start_cpu: usize,
     task_id: u64,
+    span_id: u64,
     trace_arg0: u64,
     trace_arg1: u64,
     scope_generation: u64,
@@ -935,6 +1043,7 @@ fn record_scope(
         cycles,
         scope_generation,
         task_id,
+        span_id,
         TraceKind::Scope,
         event,
         trace_arg0,
@@ -944,6 +1053,37 @@ fn record_scope(
 
 /// 记录已有调用点的 cycle 统计。该接口把时间视为纯 on-CPU。
 pub fn record(event: Event, cycles: u64, bytes: u64, packets: u64) {
+    record_with_trace_args(event, cycles, bytes, packets, bytes, packets);
+}
+
+pub fn record_with_trace_args(
+    event: Event,
+    cycles: u64,
+    bytes: u64,
+    packets: u64,
+    trace_arg0: u64,
+    trace_arg1: u64,
+) {
+    record_with_trace_args_and_span(
+        event,
+        cycles,
+        bytes,
+        packets,
+        current_span_id(),
+        trace_arg0,
+        trace_arg1,
+    );
+}
+
+pub fn record_with_trace_args_and_span(
+    event: Event,
+    cycles: u64,
+    bytes: u64,
+    packets: u64,
+    span_id: u64,
+    trace_arg0: u64,
+    trace_arg1: u64,
+) {
     if !event_enabled(event) {
         return;
     }
@@ -971,10 +1111,11 @@ pub fn record(event: Event, cycles: u64, bytes: u64, packets: u64) {
             cycles,
             generation(),
             current_task_id(),
+            span_id,
             TraceKind::Scope,
             event,
-            bytes,
-            packets,
+            trace_arg0,
+            trace_arg1,
         );
     }
 }
@@ -1227,6 +1368,7 @@ pub fn trace_record(cpu: usize, sequence: u64) -> Option<TraceRecord> {
     let record_session_id = slot.session_id.load(Ordering::Relaxed);
     let record_generation = slot.generation.load(Ordering::Relaxed);
     let task_id = slot.task_id.load(Ordering::Relaxed);
+    let span_id = slot.span_id.load(Ordering::Relaxed);
     let metadata = slot.metadata.load(Ordering::Relaxed);
     let arg0 = slot.arg0.load(Ordering::Relaxed);
     let arg1 = slot.arg1.load(Ordering::Relaxed);
@@ -1243,6 +1385,7 @@ pub fn trace_record(cpu: usize, sequence: u64) -> Option<TraceRecord> {
         session_id: record_session_id,
         generation: record_generation,
         task_id,
+        span_id,
         cpu: record_cpu,
         kind,
         event,
@@ -1259,6 +1402,7 @@ mod tests {
     static CLOCK: AtomicU64 = AtomicU64::new(10);
     static TASK_CPU_NS: AtomicU64 = AtomicU64::new(100);
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_SPAN_ID: AtomicU64 = AtomicU64::new(77);
 
     fn clock() -> u64 {
         CLOCK.fetch_add(7, Ordering::Relaxed)
@@ -1276,10 +1420,27 @@ mod tests {
         42
     }
 
+    fn span_id() -> u64 {
+        TEST_SPAN_ID.load(Ordering::Relaxed)
+    }
+
+    fn set_span_id(value: u64) {
+        TEST_SPAN_ID.store(value, Ordering::Relaxed);
+    }
+
     #[test]
     fn scope_records_wall_and_cpu_time() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
+        TEST_SPAN_ID.store(77, Ordering::Relaxed);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
         reset();
         set_enabled(true);
         drop(scope(Event::NetProtocolTurn).bytes(64).packets(2));
@@ -1295,6 +1456,7 @@ mod tests {
         assert_eq!(trace.kind, TraceKind::Scope);
         assert_eq!(trace.event, Event::NetProtocolTurn);
         assert_eq!(trace.task_id, 42);
+        assert_eq!(trace.span_id, 77);
         assert_eq!(trace.duration_cycles, 7);
         assert_eq!(trace.arg0, 64);
         assert_eq!(trace.arg1, 2);
@@ -1307,9 +1469,60 @@ mod tests {
     }
 
     #[test]
+    fn spans_are_inherited_restored_and_can_be_recorded_explicitly() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        TEST_SPAN_ID.store(77, Ordering::Relaxed);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
+        reset();
+        set_enabled(true);
+
+        let outer = enter_span();
+        let outer_id = outer.id();
+        assert_ne!(outer_id, 0);
+        assert_eq!(current_span_id(), outer_id);
+        drop(scope(Event::VfsRead));
+
+        let inner = enter_span();
+        let inner_id = inner.id();
+        assert_ne!(inner_id, outer_id);
+        drop(inner);
+        assert_eq!(current_span_id(), outer_id);
+
+        record_with_trace_args_and_span(Event::BlockComplete, 0, 0, 0, 900, 11, 22);
+        drop(outer);
+        assert_eq!(current_span_id(), 77);
+        freeze();
+
+        let nested_scope = trace_record(1, 0).expect("nested scope trace");
+        assert_eq!(nested_scope.event, Event::VfsRead);
+        assert_eq!(nested_scope.span_id, outer_id);
+        let explicit = trace_record(1, 1).expect("explicit span trace");
+        assert_eq!(explicit.event, Event::BlockComplete);
+        assert_eq!(explicit.span_id, 900);
+        assert_eq!((explicit.arg0, explicit.arg1), (11, 22));
+        stop();
+    }
+
+    #[test]
     fn histogram_and_sampler_are_bounded() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
         reset();
         set_enabled(true);
         observe(Metric::IngressRingDepth, 17);
@@ -1339,7 +1552,15 @@ mod tests {
     #[test]
     fn reset_and_freeze_invalidate_old_scopes() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
         start();
         let stale = scope(Event::NetWorkerTurn);
         freeze();
@@ -1361,7 +1582,15 @@ mod tests {
         fn changing_cpu() -> usize {
             CPU.load(Ordering::Relaxed)
         }
-        install(clock, changing_cpu, task_cpu_ns, task_id, 1_000_000_000);
+        install(
+            clock,
+            changing_cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
         start();
         CPU.store(0, Ordering::Relaxed);
         let scope = scope(Event::NetProtocolTurn);
@@ -1374,7 +1603,15 @@ mod tests {
     #[test]
     fn event_filter_and_long_latency_histogram_are_preserved() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
         start();
         set_event_mask(1u64 << Event::WaitTimer as usize);
         record_duration(Event::WaitFutex, 5_000_000_000);
@@ -1390,7 +1627,15 @@ mod tests {
     #[test]
     fn trace_ring_overwrites_oldest_records_and_freezes_cleanly() {
         let _lock = TEST_LOCK.lock().unwrap();
-        install(clock, cpu, task_cpu_ns, task_id, 1_000_000_000);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
         start();
         for value in 0..TRACE_SLOTS_PER_CPU as u64 + 3 {
             trace_task_event(TraceKind::TaskWake, Event::WaitOther, task_id(), value, 0);

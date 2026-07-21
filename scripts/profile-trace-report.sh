@@ -25,6 +25,97 @@ function value(name,    i) {
     for (i = 1; i < NF; i++) if ($i == name) return $(i + 1)
     return ""
 }
+function fail(message) {
+    print "profile trace report: " message > "/dev/stderr"
+    invalid = 1
+}
+/^@@PROFILE_TRACE_BEGIN / {
+    phase = value("phase")
+    case_id = value("case")
+    active = 1
+    current_session = ""
+    next
+}
+/^@@PROFILE_TRACE_END / { active = 0; next }
+/^@@PROFILE_META_BEGIN / {
+    meta_phase = value("phase")
+    meta_case = value("case")
+    meta_key = meta_case SUBSEP meta_phase
+    if (seen_meta[meta_key]++) fail("duplicate metadata for case=" meta_case " phase=" meta_phase)
+    meta_active = 1
+    next
+}
+/^@@PROFILE_META_END / { meta_active = 0; next }
+meta_active && /^[a-z_]+=/ {
+    name = $0
+    sub(/=.*/, "", name)
+    contents = $0
+    sub(/^[^=]*=/, "", contents)
+    field_key = meta_key SUBSEP name
+    if (seen_meta_field[field_key]++) fail("duplicate metadata field " name " for case=" meta_case " phase=" meta_phase)
+    metadata[field_key] = contents
+    next
+}
+active && /^state=/ {
+    key = case_id SUBSEP phase
+    if (seen_header[key]++) fail("duplicate trace header for case=" case_id " phase=" phase)
+    if (value("state") != "frozen") fail("capture is not frozen for case=" case_id " phase=" phase)
+    if (value("enabled") != "0") fail("capture is still enabled for case=" case_id " phase=" phase)
+    if (value("active_writers") != "0") fail("active writers remain for case=" case_id " phase=" phase)
+    if (value("format_version") != "2") fail("unsupported trace format for case=" case_id " phase=" phase)
+    if (value("counter_hz") + 0 <= 0) fail("invalid counter frequency for case=" case_id " phase=" phase)
+    current_session = value("session")
+    sessions[key] = current_session
+    cases[case_id] = 1
+    next
+}
+active && /^cpu=/ && / first_sequence=/ {
+    if (value("overwritten") + 0 != 0)
+        fail("overwritten trace records for case=" case_id " phase=" phase " cpu=" value("cpu"))
+    next
+}
+active && /^cpu=/ && / sequence=/ {
+    if (current_session == "" || value("session") != current_session)
+        fail("record session mismatch for case=" case_id " phase=" phase " cpu=" value("cpu") " sequence=" value("sequence"))
+    if (value("span") == "")
+        fail("trace record has no span id for case=" case_id " phase=" phase)
+}
+END {
+    required_count = split("arch cpu_online kernel_release kernel_features kernel_image_id rootfs_image_id workload workload_exit_status cmdline control", required, " ")
+    stable_count = split("arch cpu_online kernel_release kernel_features kernel_image_id rootfs_image_id workload cmdline", stable, " ")
+    for (case_id in cases) {
+        before = case_id SUBSEP "before"
+        after = case_id SUBSEP "after"
+        if (!seen_header[before] || !seen_header[after])
+            fail("missing trace header for case=" case_id)
+        else if (sessions[before] == "" || sessions[before] != sessions[after])
+            fail("session mismatch for case=" case_id)
+        if (!seen_meta[before] || !seen_meta[after]) {
+            fail("missing metadata for case=" case_id)
+            continue
+        }
+        for (i = 1; i <= required_count; i++) {
+            name = required[i]
+            if (!seen_meta_field[before SUBSEP name] || metadata[before SUBSEP name] == "")
+                fail("missing metadata field " name " for case=" case_id " phase=before")
+            if (!seen_meta_field[after SUBSEP name] || metadata[after SUBSEP name] == "")
+                fail("missing metadata field " name " for case=" case_id " phase=after")
+        }
+        for (i = 1; i <= stable_count; i++) {
+            name = stable[i]
+            if (metadata[before SUBSEP name] != metadata[after SUBSEP name])
+                fail("metadata mismatch for case=" case_id " field=" name)
+        }
+    }
+    if (invalid) exit 1
+}
+' "$clean_log"
+
+awk -F '[ =]' '
+function value(name,    i) {
+    for (i = 1; i < NF; i++) if ($i == name) return $(i + 1)
+    return ""
+}
 /^@@PROFILE_TRACE_BEGIN / {
     phase = value("phase")
     case_id = value("case")
@@ -42,9 +133,9 @@ active && /^cpu=/ && / sequence=/ {
     ts = value("timestamp_cycles") * 1000000 / hz
     dur = value("duration_cycles") * 1000000 / hz
     print case_id "\t" ts "\t" dur "\t" value("cpu") "\t" \
-        value("task") "\t" value("kind") "\t" value("event") "\t" \
-        value("arg0") "\t" value("arg1") "\t" value("session") "\t" \
-        value("generation") "\t" value("sequence")
+        value("task") "\t" value("span") "\t" value("kind") "\t" \
+        value("event") "\t" value("arg0") "\t" value("arg1") "\t" \
+        value("session") "\t" value("generation") "\t" value("sequence")
 }
 ' "$clean_log" >"$rows"
 
@@ -53,8 +144,8 @@ if [ ! -s "$rows" ]; then
     exit 1
 fi
 
-sort -t '	' -k1,1 -k2,2n -k4,4n -k12,12n "$rows" >"$sorted"
-printf 'case\tts_us\tdur_us\tcpu\ttask\tkind\tevent\targ0\targ1\tsession\tgeneration\tsequence\n'
+sort -t '	' -k1,1 -k2,2n -k4,4n -k13,13n "$rows" >"$sorted"
+printf 'case\tts_us\tdur_us\tcpu\ttask\tspan\tkind\tevent\targ0\targ1\tsession\tgeneration\tsequence\n'
 cat "$sorted"
 
 if [ -z "$chrome_json" ]; then
@@ -73,8 +164,8 @@ BEGIN { print "{\"traceEvents\":["; first = 1 }
 {
     if (!first) print ","
     first = 0
-    name = $6 == "scope" ? $7 : $6
-    printf "{\"name\":\"%s\",\"cat\":\"%s\",", escape(name), escape($6)
+    name = $7 == "scope" ? $8 : $7
+    printf "{\"name\":\"%s\",\"cat\":\"%s\",", escape(name), escape($7)
     if ($3 > 0) {
         printf "\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,", $2, $3
     } else {
@@ -82,10 +173,10 @@ BEGIN { print "{\"traceEvents\":["; first = 1 }
     }
     printf "\"pid\":1,\"tid\":%s,", $5
     printf "\"args\":{\"case\":\"%s\",\"cpu\":%s,", escape($1), $4
-    printf "\"event\":\"%s\",\"arg0\":\"%s\",\"arg1\":\"%s\",", \
-        escape($7), escape($8), escape($9)
+    printf "\"span\":\"%s\",\"event\":\"%s\",\"arg0\":\"%s\",\"arg1\":\"%s\",", \
+        escape($6), escape($8), escape($9), escape($10)
     printf "\"session\":\"%s\",\"generation\":\"%s\",\"sequence\":\"%s\"}}", \
-        escape($10), escape($11), escape($12)
+        escape($11), escape($12), escape($13)
 }
 END { print "\n]}" }
 ' "$sorted" >"$chrome_json"

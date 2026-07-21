@@ -71,6 +71,8 @@ fn main() -> ! {
             ::sched::current_cpu_id,
             ::sched::current_task_cpu_time_ns,
             ::sched::current_task_id,
+            ::sched::current_profile_span_id,
+            ::sched::set_current_profile_span_id,
             hal::time::stable_counter_hz(),
         );
     }

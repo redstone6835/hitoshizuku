@@ -40,6 +40,11 @@ static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 /// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
 const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 256;
 
+#[cfg(feature = "performance-profile")]
+fn profile_block_args(op: BioOp, range: BlockRange) -> (u64, u64) {
+    (range.lba, ((op as u64) << 32) | u64::from(range.blocks))
+}
+
 fn allocate_block_diskseq() -> u64 {
     loop {
         let current = NEXT_BLOCK_DISKSEQ.load(Ordering::Acquire).max(1);
@@ -766,6 +771,8 @@ impl BlockDevice {
         buffer: BioBuffer,
     ) -> Result<Bio, BioError> {
         self.validate_bio(op, range, &buffer)?;
+        #[cfg(feature = "performance-profile")]
+        let (profile_arg0, profile_arg1) = profile_block_args(op, range);
         let submitted_ns = sched::now_ns_public();
         let (bio, completion) = Bio::new_shared_with_observer(
             op,
@@ -776,14 +783,36 @@ impl BlockDevice {
             None,
         );
         self.io_stats.begin(op);
-        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+        let queue_result = {
+            #[cfg(feature = "performance-profile")]
+            let _submit_profile = profiling::scope(profiling::Event::BlockSubmit)
+                .trace_args(profile_arg0, profile_arg1);
+            self.driver.queue_bio(bio)
+        };
+        if let Err((err, _bio)) = queue_result {
             self.io_stats.cancel(op);
             return Err(BioError::Submit(err));
         }
 
+        #[cfg(feature = "performance-profile")]
+        let _wait_profile =
+            profiling::scope(profiling::Event::BlockWait).trace_args(profile_arg0, profile_arg1);
+
+        #[cfg(feature = "performance-profile")]
+        let mut drain_cycles = 0u64;
+        #[cfg(feature = "performance-profile")]
+        let mut drain_calls = 0u64;
         while !completion.is_done() {
             for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                #[cfg(feature = "performance-profile")]
+                let drain_start = profiling::read_counter();
                 self.driver.drain();
+                #[cfg(feature = "performance-profile")]
+                {
+                    drain_cycles = drain_cycles
+                        .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                    drain_calls = drain_calls.saturating_add(1);
+                }
                 if completion.is_done() {
                     break;
                 }
@@ -798,6 +827,15 @@ impl BlockDevice {
                 core::hint::spin_loop();
             }
         }
+        #[cfg(feature = "performance-profile")]
+        profiling::record_with_trace_args(
+            profiling::Event::BlockDrain,
+            drain_cycles,
+            drain_calls,
+            range.blocks as u64,
+            profile_arg0,
+            profile_arg1,
+        );
         let result = completion.wait();
         let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
         if result.is_ok() {
@@ -823,6 +861,8 @@ impl BlockDevice {
         range: BlockRange,
         buffer: BioBuffer,
     ) -> Result<(Bio, BlockSubmitProfile), BioError> {
+        #[cfg(feature = "performance-profile")]
+        let (profile_arg0, profile_arg1) = profile_block_args(op, range);
         let total_start = sched::now_ns_public();
         let mut profile = BlockSubmitProfile::default();
 
@@ -844,7 +884,13 @@ impl BlockDevice {
 
         self.io_stats.begin(op);
         let t0 = sched::now_ns_public();
-        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+        let queue_result = {
+            #[cfg(feature = "performance-profile")]
+            let _submit_profile = profiling::scope(profiling::Event::BlockSubmit)
+                .trace_args(profile_arg0, profile_arg1);
+            self.driver.queue_bio(bio)
+        };
+        if let Err((err, _bio)) = queue_result {
             profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
             self.io_stats.cancel(op);
             profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
@@ -852,10 +898,23 @@ impl BlockDevice {
         }
         profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
 
+        #[cfg(feature = "performance-profile")]
+        let _wait_profile =
+            profiling::scope(profiling::Event::BlockWait).trace_args(profile_arg0, profile_arg1);
+
+        #[cfg(feature = "performance-profile")]
+        let mut profile_drain_cycles = 0u64;
         while !completion.is_done() {
             for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
                 let t0 = sched::now_ns_public();
+                #[cfg(feature = "performance-profile")]
+                let drain_start = profiling::read_counter();
                 self.driver.drain();
+                #[cfg(feature = "performance-profile")]
+                {
+                    profile_drain_cycles = profile_drain_cycles
+                        .saturating_add(profiling::read_counter().wrapping_sub(drain_start));
+                }
                 profile.drain_ns = profile
                     .drain_ns
                     .saturating_add(sched::now_ns_public().saturating_sub(t0));
@@ -881,6 +940,16 @@ impl BlockDevice {
                 profile.spin_calls = profile.spin_calls.saturating_add(1);
             }
         }
+
+        #[cfg(feature = "performance-profile")]
+        profiling::record_with_trace_args(
+            profiling::Event::BlockDrain,
+            profile_drain_cycles,
+            profile.drain_calls,
+            range.blocks as u64,
+            profile_arg0,
+            profile_arg1,
+        );
 
         let t0 = sched::now_ns_public();
         let result = completion.wait();
@@ -939,6 +1008,8 @@ impl BlockDevice {
         buffer: BioBuffer,
     ) -> Result<BioFuture, BioError> {
         self.validate_bio(op, range, &buffer)?;
+        #[cfg(feature = "performance-profile")]
+        let (profile_arg0, profile_arg1) = profile_block_args(op, range);
         let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
         let submitted_ns = sched::now_ns_public();
         let (bio, completion) = Bio::new_shared_with_observer(
@@ -950,11 +1021,22 @@ impl BlockDevice {
             Some(observer),
         );
         self.io_stats.begin(op);
-        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+        let queue_result = {
+            #[cfg(feature = "performance-profile")]
+            let _submit_profile = profiling::scope(profiling::Event::BlockSubmit)
+                .trace_args(profile_arg0, profile_arg1);
+            self.driver.queue_bio(bio)
+        };
+        if let Err((err, _bio)) = queue_result {
             self.io_stats.cancel(op);
             return Err(BioError::Submit(err));
         }
-        Ok(BioFuture { completion })
+        Ok(BioFuture {
+            completion,
+            #[cfg(feature = "performance-profile")]
+            _wait_profile: profiling::scope(profiling::Event::BlockWait)
+                .trace_args(profile_arg0, profile_arg1),
+        })
     }
 
     // ── 参数校验 ──────────────────────────────────────
@@ -1112,6 +1194,8 @@ fn map_bio_control_error(err: BioError) -> ControlError {
 /// 块 I/O Future。poll 时检查底层 Completion 状态。
 pub struct BioFuture {
     completion: Arc<Completion<BioResult>>,
+    #[cfg(feature = "performance-profile")]
+    _wait_profile: profiling::Scope,
 }
 
 impl Future for BioFuture {

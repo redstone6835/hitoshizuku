@@ -113,6 +113,8 @@ pub use scheduler::{
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
+#[cfg(feature = "performance-profile")]
+pub use scheduler::{current_profile_span_id, set_current_profile_span_id};
 pub use scheduler::{
     current_sched_domain_id, install_sched_topology, sched_domain_stats, sched_topology,
     task_sched_placement,

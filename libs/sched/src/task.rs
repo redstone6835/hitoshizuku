@@ -517,6 +517,8 @@ pub struct Task {
     wait_trace_emitted: AtomicBool,
     #[cfg(feature = "performance-profile")]
     wait_generation: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_span_id: AtomicU64,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -619,6 +621,8 @@ impl Task {
             wait_trace_emitted: AtomicBool::new(false),
             #[cfg(feature = "performance-profile")]
             wait_generation: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_span_id: AtomicU64::new(0),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -1281,6 +1285,18 @@ impl Task {
 
     #[inline]
     #[cfg(feature = "performance-profile")]
+    pub fn profile_span_id(&self) -> u64 {
+        self.profile_span_id.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn set_profile_span_id(&self, span_id: u64) {
+        self.profile_span_id.store(span_id, Ordering::Release);
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
     pub(crate) fn mark_profile_blocked(&self) {
         if !profiling::enabled()
             || self.wait_generation.load(Ordering::Acquire) != profiling::generation()
@@ -1294,10 +1310,11 @@ impl Task {
             return;
         }
         let reason = WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire));
-        profiling::trace_task_event(
+        profiling::trace_task_event_with_span(
             profiling::TraceKind::TaskBlock,
             reason.profile_event(),
             self.pid_root_cached().unwrap_or(0) as u64,
+            self.profile_span_id(),
             reason as u64,
             self.wait_cpu.load(Ordering::Acquire) as u64,
         );
@@ -1325,10 +1342,11 @@ impl Task {
             let duration_ns = now_ns.saturating_sub(encoded - 1);
             let origin_cpu = self.wait_cpu.load(Ordering::Acquire);
             profiling::record_duration_on_cpu(reason.profile_event(), duration_ns, origin_cpu);
-            profiling::trace_task_event(
+            profiling::trace_task_event_with_span(
                 profiling::TraceKind::TaskWake,
                 reason.profile_event(),
                 self.pid_root_cached().unwrap_or(0) as u64,
+                self.profile_span_id(),
                 duration_ns,
                 origin_cpu as u64,
             );

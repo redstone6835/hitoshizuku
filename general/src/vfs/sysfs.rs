@@ -2188,15 +2188,17 @@ fn render_profile_trace() -> String {
     let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "state={} enabled={} session={} generation={} trace={} counter_hz={} slots_per_cpu={} record_bytes={} format_version=1",
+        "state={} enabled={} session={} generation={} active_writers={} trace={} counter_hz={} slots_per_cpu={} record_bytes={} format_version={}",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
         session.generation,
+        session.active_writers,
         u8::from(session.trace_enabled),
         session.counter_hz,
         profiling::TRACE_SLOTS_PER_CPU,
         profiling::TRACE_RECORD_BYTES,
+        profiling::TRACE_FORMAT_VERSION,
     );
     for cpu in 0..profiling::MAX_CPUS {
         let window = profiling::trace_window(cpu);
@@ -2215,7 +2217,7 @@ fn render_profile_trace() -> String {
             };
             let _ = writeln!(
                 output,
-                "cpu={} sequence={} session={} generation={} timestamp_cycles={} duration_cycles={} kind={} event={} event_id={} category={} task={} arg0={} arg1={}",
+                "cpu={} sequence={} session={} generation={} timestamp_cycles={} duration_cycles={} kind={} event={} event_id={} category={} task={} span={} arg0={} arg1={}",
                 record.cpu,
                 record.sequence,
                 record.session_id,
@@ -2227,6 +2229,7 @@ fn render_profile_trace() -> String {
                 record.event as usize,
                 record.event.category().name(),
                 record.task_id,
+                record.span_id,
                 record.arg0,
                 record.arg1,
             );

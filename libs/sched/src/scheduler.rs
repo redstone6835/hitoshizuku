@@ -420,6 +420,32 @@ pub fn current_task_id() -> u64 {
     unsafe { &*ptr }.pid_root_cached().unwrap_or(0) as u64
 }
 
+#[cfg(feature = "performance-profile")]
+pub fn current_profile_span_id() -> u64 {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return 0;
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，读取期间不会失效。
+    unsafe { &*ptr }.profile_span_id()
+}
+
+#[cfg(feature = "performance-profile")]
+pub fn set_current_profile_span_id(span_id: u64) {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return;
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，写入期间不会失效。
+    unsafe { &*ptr }.set_profile_span_id(span_id);
+}
+
 /// 查询指定 CPU 上的 current；未登记时返回 None。
 #[kernel_symbols::export(name = "sched.scheduler.current_task_on", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_on(cpu_id: usize) -> Option<Arc<Task>> {
@@ -1977,10 +2003,11 @@ pub fn schedule_once(now_ns: u64) {
         let prev_id = prev.pid_root_cached().unwrap_or(0) as u64;
         let next_id = next.pid_root_cached().unwrap_or(0) as u64;
         profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
-        profiling::trace_task_event(
+        profiling::trace_task_event_with_span(
             profiling::TraceKind::SchedSwitch,
             profiling::Event::SchedSwitch,
             prev_id,
+            prev.profile_span_id(),
             prev_id,
             next_id,
         );
