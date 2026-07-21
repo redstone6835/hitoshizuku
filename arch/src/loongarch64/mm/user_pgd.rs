@@ -25,6 +25,9 @@ struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
     asid: usize,
+    /// 曾经激活过本地址空间的逻辑 CPU。位图在 PGD 生命周期内单调增长，确保
+    /// 已经缓存过该 ASID translation 的 CPU 不会被后续 shootdown 遗漏。
+    active_cpus: AtomicUsize,
 }
 
 impl UserPgdInner {
@@ -39,17 +42,12 @@ impl UserPgdInner {
         // Safety: 刚分配的物理页对应内核直映窗口，本次唯一写入者。
         unsafe { core::ptr::write_bytes(pgd_virt as *mut u8, 0, allocator::PAGE_SIZE) };
 
-        // 复制内核侧 PGD 项，让用户进程能在 trap 进入内核态时访问内核映射。
-        let kernel_pgd = super::super::heap_vm::KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
-        if kernel_pgd != 0 {
-            copy_kernel_pgd_entries(pgd_virt, kernel_pgd);
-        }
-
         let asid = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
         Some(Box::new(Self {
             pgd_phys,
             pgd_virt,
             asid,
+            active_cpus: AtomicUsize::new(0),
         }))
     }
 
@@ -70,20 +68,6 @@ impl Drop for UserPgdInner {
     fn drop(&mut self) {
         free_user_page_table_pages(self.pgd_virt);
         free_page_table_page(self.pgd_phys);
-    }
-}
-
-fn copy_kernel_pgd_entries(dst_pgd_virt: usize, src_pgd_phys: usize) {
-    let src_pgd_virt = phys_to_virt(src_pgd_phys);
-    let entries = LoongArch64Paging::ENTRIES_PER_TABLE;
-    let half = entries / 2;
-    let src = src_pgd_virt as *const usize;
-    let dst = dst_pgd_virt as *mut usize;
-    for i in half..entries {
-        // Safety: src/dst 指向 PAGE_SIZE 字节的 PGD 缓冲，按 usize 对齐；
-        //         本次只读源、独占写目的，无并发访问者。
-        let entry = unsafe { core::ptr::read_volatile(src.add(i)) };
-        unsafe { core::ptr::write_volatile(dst.add(i), entry) };
     }
 }
 
@@ -134,31 +118,32 @@ fn allocate_page_table_page() -> Result<usize, general::MapError> {
     Ok(allocation.paddr)
 }
 
-fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
+fn flush_user_tlb_range(asid: usize, active_cpus: usize, vaddr: usize, len: usize) {
     if len == 0 {
         return;
     }
     let page_size = LoongArch64Paging::PAGE_SIZE;
-    const PAGE_THRESHOLD: usize = 64;
     let Some(end) = vaddr.checked_add(len) else {
-        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+        // Safety: 激活位图单调增长，完整失效覆盖该 ASID 的所有历史执行 CPU。
+        unsafe { LoongArch64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
         return;
     };
     let aligned_start = vaddr & !(page_size - 1);
     let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
-    if pages > PAGE_THRESHOLD {
-        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
-        return;
-    }
-    let mut va = aligned_start;
-    while va < end {
-        // Safety: flush_tlb_with_asid 不解引用任何指针，仅发 invtlb。
-        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };
-        let Some(next) = va.checked_add(page_size) else {
-            unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
-            return;
+    if pages == 1 {
+        // Safety: 激活位图单调增长，包含所有可能缓存过该 ASID 的 CPU。
+        unsafe {
+            LoongArch64Paging::flush_tlb_with_asid_on_cpus(
+                asid,
+                Some(VirtAddr::new(aligned_start)),
+                active_cpus,
+            )
         };
-        va = next;
+    } else {
+        // 远端 LoongArch IPI 没有携带地址范围，接收端本来就执行完整失效。多页
+        // 范围只发布一次完整请求，避免把一次 munmap 放大为最多 64 轮全核 IPI。
+        // Safety: 激活位图单调增长，完整失效覆盖该 ASID 的所有历史执行 CPU。
+        unsafe { LoongArch64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
     }
 }
 
@@ -315,11 +300,23 @@ unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range
 unsafe fn activate(handle: PgdHandle) {
     // Safety: 由 UserPgdOps 契约保证 handle 合法。
     let inner = unsafe { inner_ref(handle) };
-    // Safety: activate_with_asid 写 PGDL/ASID/PWCL/PWCH 与 CRMD，在调度器
-    //         切换边界调用。
+    let cpu = crate::loongarch64::trap::LoongArch64MessageInterruptOps::current_cpu_id();
+    let cpu_bit = 1usize
+        .checked_shl(cpu as u32)
+        .expect("[arch][mm] logical CPU exceeds active mask width");
+    // 先发布激活位，再安装双根页表。并发 invalidation 即使抢先完成，下面的
+    // activate_with_asid_roots 也会在当前 CPU 上执行完整本地失效。
+    inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel);
+    let kernel_pgd = super::super::heap_vm::KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    assert_ne!(
+        kernel_pgd, 0,
+        "[arch][mm] user address space activated before kernel PGDH"
+    );
+    // Safety: 两个根均在各自生命周期内有效；本函数只在调度器地址空间切换边界调用。
     unsafe {
-        LoongArch64Paging::activate_with_asid(
+        LoongArch64Paging::activate_with_asid_roots(
             PhysPageTableRoot::new(inner.pgd_phys()),
+            PhysPageTableRoot::new(kernel_pgd),
             inner.asid(),
         );
     }
@@ -328,7 +325,8 @@ unsafe fn activate(handle: PgdHandle) {
 unsafe fn invalidate_range(handle: PgdHandle, vaddr: usize, len: usize) {
     // Safety: 同上。
     let inner = unsafe { inner_ref(handle) };
-    flush_user_tlb_range(inner.asid(), vaddr, len);
+    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
+    flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
 }
 
 unsafe fn count_mapped(handle: PgdHandle, vaddr: usize, len: usize) -> usize {

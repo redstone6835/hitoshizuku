@@ -80,6 +80,7 @@ pub mod wait_flags;
 
 pub use arch_hooks::{
     ArchContextOps, ArchDeadlineTimerOps, CpuControlOps, KernelEntry, TaskCpuStateOps,
+    poll_urgent_work,
 };
 pub use clone_flags::{CloneArgs, CloneFlags};
 pub use cpu::{
