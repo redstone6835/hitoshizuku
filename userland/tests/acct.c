@@ -10,6 +10,12 @@
 #include <unistd.h>
 
 #define ACCT_FLAG_GROUP 0x20
+#define ACCT_V3_VERSION 3
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define ACCT_BYTEORDER_FLAG 0x80
+#else
+#define ACCT_BYTEORDER_FLAG 0
+#endif
 #define RECORD_EXIT_STATUS 37
 
 static const char accounting_path[] = "/tmp/pacct-test";
@@ -56,7 +62,8 @@ static int disable_and_verify(int recorded_status) {
     if (error != 0) {
         return error;
     }
-    if (recorded_status != RECORD_EXIT_STATUS || record.ac_version != 2 || record.ac_pid == 0 ||
+    if (recorded_status != RECORD_EXIT_STATUS ||
+        record.ac_version != (ACCT_V3_VERSION | ACCT_BYTEORDER_FLAG) || record.ac_pid == 0 ||
         record.ac_exitcode != (uint32_t)(RECORD_EXIT_STATUS << 8) ||
         (record.ac_flag & ACCT_FLAG_GROUP) == 0) {
         return EPROTO;

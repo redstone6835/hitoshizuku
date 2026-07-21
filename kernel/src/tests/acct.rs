@@ -2,6 +2,8 @@ use ktest::ktest;
 
 #[ktest]
 fn accounting_encodes_comp_t_and_elapsed_float_without_fpu() {
+    assert_eq!(crate::acct::acct_v3_version(), 3);
+
     assert_eq!(crate::acct::encode_comp_t(0), 0);
     assert_eq!(crate::acct::encode_comp_t(0x1fff), 0x1fff);
     assert_eq!(crate::acct::encode_comp_t(0x2000), 0x2400);
