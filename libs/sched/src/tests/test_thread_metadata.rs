@@ -11,8 +11,8 @@ use ktest::ktest;
 use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqEvent, RseqRegistration,
-    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
-    supported_cpu_mask,
+    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskUsage,
+    ThreadGroup, supported_cpu_mask,
 };
 
 unsafe fn init_test_context(
@@ -52,6 +52,38 @@ fn task_comm_is_nul_padded_and_truncated() {
     let comm = task.comm();
     assert_eq!(&comm[..TASK_COMM_LEN - 1], b"abcdefghijklmno");
     assert_eq!(comm[TASK_COMM_LEN - 1], 0);
+}
+
+#[ktest]
+fn thread_group_accounting_waits_for_last_member_and_aggregates_usage() {
+    let group = ThreadGroup::new();
+    let first = make_task();
+    let second = make_task();
+    group.add_member(&first);
+    group.add_member(&second);
+
+    assert!(!group.account_member_exit(TaskUsage {
+        user_ns: 10,
+        minflt: 2,
+        ..TaskUsage::default()
+    }));
+    assert!(group.account_member_exit(TaskUsage {
+        system_ns: 20,
+        majflt: 3,
+        ..TaskUsage::default()
+    }));
+    assert_eq!(
+        group.exited_usage_snapshot(),
+        TaskUsage {
+            user_ns: 10,
+            system_ns: 20,
+            minflt: 2,
+            majflt: 3,
+            ..TaskUsage::default()
+        }
+    );
+    assert!(group.try_claim_acct_record());
+    assert!(!group.try_claim_acct_record());
 }
 
 #[ktest]

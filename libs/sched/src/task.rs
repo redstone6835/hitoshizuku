@@ -577,6 +577,8 @@ pub struct Task {
     comm: Spinlock<[u8; TASK_COMM_LEN]>,
     /// 调度器累计的真实 CPU 运行时间；剖析开关只控制事件采样，不改变记账语义。
     cpu_runtime_ns: AtomicU64,
+    /// 任务创建时的单调时间，用于进程记账的 elapsed/btime 计算。
+    start_time_ns: u64,
     running_since_ns: AtomicU64,
     /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
     exited_usage_ns: AtomicU64,
@@ -678,6 +680,7 @@ impl Task {
             sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
             cpu_runtime_ns: AtomicU64::new(0),
+            start_time_ns: crate::arch_hooks::time().map_or(0, |time| (time.now_ns)()),
             running_since_ns: AtomicU64::new(0),
             exited_usage_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
@@ -826,6 +829,9 @@ impl Task {
         self.wait_stop_pending.store(0, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
         self.set_state(TaskState::Zombie);
+        if let Some(hook) = exit_accounting_hook() {
+            hook.account_on_exit(self);
+        }
         self.exit_waiters.wake_all();
     }
 
@@ -1315,6 +1321,10 @@ impl Task {
         }
     }
 
+    pub fn start_time_ns(&self) -> u64 {
+        self.start_time_ns
+    }
+
     #[inline]
     pub(crate) fn account_switch_in(&self, now_ns: u64) {
         self.running_since_ns
@@ -1776,9 +1786,17 @@ pub trait TaskPreExitHook: Send + Sync {
     fn cleanup_before_exit(&self, task: &Arc<Task>);
 }
 
+/// 任务进入 Zombie 时的记账 hook。调用点早于 exit waiter 唤醒，避免父进程
+/// 在 wait 返回后看不到已经退出的进程记账记录。
+pub trait TaskExitAccountingHook: Send + Sync {
+    fn account_on_exit(&self, task: &Task);
+}
+
 static EXT_CLONE_HOOK: Spinlock<Option<&'static dyn TaskExtCloneHook>> = Spinlock::new(None);
 static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
 static PRE_EXIT_HOOK: Spinlock<Option<&'static dyn TaskPreExitHook>> = Spinlock::new(None);
+static EXIT_ACCOUNTING_HOOK: Spinlock<Option<&'static dyn TaskExitAccountingHook>> =
+    Spinlock::new(None);
 
 /// 注册全局 ext clone hook。kernel 启动期调用一次。
 pub fn register_ext_clone_hook(hook: &'static dyn TaskExtCloneHook) {
@@ -1808,4 +1826,12 @@ pub fn register_pre_exit_hook(hook: &'static dyn TaskPreExitHook) {
 /// 取已注册的 pre-exit hook；未注册返回 `None`。
 pub fn pre_exit_hook() -> Option<&'static dyn TaskPreExitHook> {
     *PRE_EXIT_HOOK.lock()
+}
+
+pub fn register_exit_accounting_hook(hook: &'static dyn TaskExitAccountingHook) {
+    *EXIT_ACCOUNTING_HOOK.lock() = Some(hook);
+}
+
+fn exit_accounting_hook() -> Option<&'static dyn TaskExitAccountingHook> {
+    *EXIT_ACCOUNTING_HOOK.lock()
 }

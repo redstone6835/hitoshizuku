@@ -27,6 +27,15 @@ if [ -x /bin/pthread-smp-test ]; then
     echo "[init][smp-tests] pthread SMP tests exit=$status"
 fi
 
+if [ -x /bin/acct-test ]; then
+    echo "[init][acct-tests] running process accounting tests"
+    /bin/acct-test record
+    record_status=$?
+    /bin/acct-test verify "$record_status"
+    status=$?
+    echo "[init][acct-tests] process accounting tests exit=$status"
+fi
+
 if mount -t ext4 /dev/vd0 /mnt; then
     echo "[init] mounted /dev/vd0 at /mnt"
     sh_file_list="/tmp/init-sh-files.$$"

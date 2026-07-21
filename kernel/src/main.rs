@@ -7,6 +7,7 @@ extern crate hal;
 
 use core::alloc::{GlobalAlloc, Layout};
 
+mod acct;
 mod acpi;
 #[cfg(any(
     feature = "bench",

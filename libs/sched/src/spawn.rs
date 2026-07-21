@@ -159,7 +159,9 @@ pub fn abort_new_task(task: &Arc<Task>) {
     for (ns, pid) in task.pid_namespaces_snapshot() {
         ns.registry().release(pid);
     }
-    task.thread_group().remove_member(task);
+    let group = task.thread_group();
+    group.cancel_member_accounting();
+    group.remove_member(task);
     task.process_group().remove_member(task);
     task.set_state(TaskState::Dead);
 }

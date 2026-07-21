@@ -53,6 +53,7 @@ PACK_INITRAMFS := scripts/pack-initramfs.sh
 
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
+ACCT_TEST_SRC := userland/tests/acct.c
 
 ifeq ($(strip $(ARCH)),)
 SELECTED_ARCHES := $(LA_ARCH) $(RV_ARCH)
@@ -196,8 +197,12 @@ define build_smp_user_tests
 		mkdir -p $(BUILD_DIR)/$(1)/smp-user $(2)/bin; \
 		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -pthread \
 			$(PTHREAD_SMP_TEST_SRC) -o $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test; \
+		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -pthread \
+			$(ACCT_TEST_SRC) -o $(BUILD_DIR)/$(1)/smp-user/acct-test; \
 		$(3)strip $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test || true; \
+		$(3)strip $(BUILD_DIR)/$(1)/smp-user/acct-test || true; \
 		install -m 0755 $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test $(2)/bin/; \
+		install -m 0755 $(BUILD_DIR)/$(1)/smp-user/acct-test $(2)/bin/; \
 	fi
 endef
 

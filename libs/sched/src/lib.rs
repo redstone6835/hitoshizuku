@@ -137,10 +137,10 @@ pub use task::{
     ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION,
     TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
     TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
-    TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt, TaskExtCloneHook, TaskExtExitHook, TaskExtKey,
-    TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason, ext_clone_hook, ext_exit_hook,
-    pre_exit_hook, register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook,
-    task_diag,
+    TASKEXT_VM_SPACE, Task, TaskDiag, TaskExitAccountingHook, TaskExt, TaskExtCloneHook,
+    TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason,
+    ext_clone_hook, ext_exit_hook, pre_exit_hook, register_exit_accounting_hook,
+    register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook, task_diag,
 };
 pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
