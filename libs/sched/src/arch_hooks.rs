@@ -228,6 +228,15 @@ pub struct CpuControlOps {
     pub send_resched: fn(cpu_id: usize),
     /// 向目标 CPU 发送 membarrier rendezvous IPI。返回 false 表示没有成功投递。
     pub send_membarrier: fn(cpu_id: usize) -> bool,
+    /// 在当前 CPU 上服务不能推迟到普通中断返回路径的架构请求。
+    ///
+    /// 调度器和依赖调度器的子系统会在自旋锁等待期间调用本钩子。回调可能运行在
+    /// 中断关闭且调用方正等待任意内核锁的上下文中，因此必须满足以下约束：
+    ///
+    /// - 只能执行有界的原子操作、内存屏障和本地 TLB/I-cache 失效；
+    /// - 不得分配、阻塞、获取锁、触发调度或调用日志设施；
+    /// - 没有待处理请求时必须快速返回。
+    pub poll_urgent: fn(),
     pub is_online: fn(cpu_id: usize) -> bool,
 }
 
@@ -249,6 +258,65 @@ pub fn cpu_control() -> Option<&'static CpuControlOps> {
     } else {
         // Safety: register_cpu_control only stores 'static ops.
         Some(unsafe { &*(ptr as *const CpuControlOps) })
+    }
+}
+
+#[inline]
+fn dispatch_urgent_work(ops: Option<&CpuControlOps>) {
+    if let Some(ops) = ops {
+        (ops.poll_urgent)();
+    }
+}
+
+/// 在当前 CPU 上协作处理架构级紧急请求。
+///
+/// 该函数专供不能安全打开中断或让出 CPU 的自旋等待路径使用。未注册
+/// [`CpuControlOps`] 时为无操作。
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.poll_urgent_work",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+#[inline(never)]
+pub fn poll_urgent_work() {
+    dispatch_urgent_work(cpu_control());
+}
+
+#[cfg(test)]
+mod cpu_control_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{CpuControlOps, dispatch_urgent_work};
+
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn no_cpu_action(_: usize) {}
+    fn no_membarrier(_: usize) -> bool {
+        false
+    }
+    fn poll() {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn offline(_: usize) -> bool {
+        false
+    }
+
+    static TEST_OPS: CpuControlOps = CpuControlOps {
+        send_resched: no_cpu_action,
+        send_membarrier: no_membarrier,
+        poll_urgent: poll,
+        is_online: offline,
+    };
+
+    #[test]
+    fn urgent_dispatch_is_optional_and_invokes_registered_hook() {
+        POLLS.store(0, Ordering::Relaxed);
+        dispatch_urgent_work(None);
+        assert_eq!(POLLS.load(Ordering::Relaxed), 0);
+        dispatch_urgent_work(Some(&TEST_OPS));
+        assert_eq!(POLLS.load(Ordering::Relaxed), 1);
     }
 }
 

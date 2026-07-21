@@ -21,6 +21,20 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+const URGENT_POLL_INTERVAL: usize = 64;
+
+#[inline]
+fn spin_until_unlocked(locked: &AtomicBool, mut poll_urgent: impl FnMut()) {
+    let mut spins = 0usize;
+    while locked.load(Ordering::Relaxed) {
+        hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(URGENT_POLL_INTERVAL) {
+            poll_urgent();
+        }
+    }
+}
+
 /// 基于 `AtomicBool` 的自旋锁。
 ///
 /// `T` 是被保护的数据，存放在 [`UnsafeCell`] 中以允许通过共享引用修改其内容。
@@ -77,9 +91,7 @@ impl<T> Spinlock<T> {
         {
             // 锁被其他核持有时，先以 Relaxed 轮询，避免频繁发出 LOCK 前缀
             // 指令（该指令会独占总线，影响其他核的缓存一致性）。
-            while self.locked.load(Ordering::Relaxed) {
-                hint::spin_loop();
-            }
+            spin_until_unlocked(&self.locked, sched::poll_urgent_work);
         }
         SpinlockGuard {
             lock: self,
@@ -137,5 +149,26 @@ impl<T> Drop for SpinlockGuard<'_, T> {
         // Release 语义：确保临界区内的所有写操作在释放锁之前对其他核可见，
         // 与 lock() 中的 Acquire 配对，形成完整的 acquire-release 同步对。
         self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::spin_until_unlocked;
+
+    #[test]
+    fn contended_wait_polls_urgent_work_periodically() {
+        let locked = AtomicBool::new(true);
+        let polls = AtomicUsize::new(0);
+
+        spin_until_unlocked(&locked, || {
+            if polls.fetch_add(1, Ordering::Relaxed) == 2 {
+                locked.store(false, Ordering::Release);
+            }
+        });
+
+        assert_eq!(polls.load(Ordering::Relaxed), 3);
     }
 }

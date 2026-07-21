@@ -28,7 +28,8 @@
 //!
 //! - 当前解除映射只清除叶子 PTE，不回收中间页表页；
 //! - 不支持”把已有大页拆成小页后继续映射”的自动 split；
-//! - 默认采用全局 TLB 刷新策略，代码简单但代价偏保守。
+//! - 新建映射在对外发布前只失效本核 TLB；解除映射和权限变更会在释放页表锁后
+//!   同步所有在线 CPU，保证旧 translation 不会越过物理页或虚拟区间的回收边界。
 //!
 //! # 大页支持
 //!
@@ -188,7 +189,7 @@
 //!         │   ├─> 遇到无效 PTE 就分配新页表页
 //!         │   ├─> 到达目标层级写入叶子 PTE
 //!         │   └─> 返回继续下一页
-//!         ├─> 刷新 TLB（全局刷新）
+//!         ├─> 发布页表写并失效本核 TLB
 //!         └─> 返回 true（成功）
 //! ```
 //!
@@ -231,7 +232,7 @@
 //! 3. **按地址范围刷新 TLB**：只刷新相关地址范围，而不是全局刷新
 //! 4. **大页自动拆分**：支持把 2MiB 大页拆成 512 个 4KiB 小页
 //! 5. **页表页缓存**：复用已释放的页表页，减少分配开销
-//! 6. **多核 TLB 一致性**：使用 IPI 通知其他核刷新 TLB
+//! 6. **精细化多核失效**：按实际使用内核堆映射的 CPU 和地址范围缩小 IPI 集合
 //! 7. **统计信息**：记录大页使用率、TLB miss 率等性能指标
 use crate::loongarch64::paging::LoongArch64Paging;
 use crate::loongarch64::specific::phys_to_virt;
@@ -242,6 +243,7 @@ use general::{
     MapError, PagingArch, PhysPageTableRoot, find_leaf, protect_range_entries,
     replace_empty_table_with_leaf, unmap_range_entries, validate_range_permissions, walk_and_map,
 };
+use spin::Mutex;
 
 /// 内核堆虚拟地址区域基址（在 DMW 窗口之外）
 /// 使用 canonical 地址空间的高半区。
@@ -255,6 +257,19 @@ pub const KERNEL_HEAP_SIZE: usize = 32 * 1024 * 1024 * 1024;
 
 /// 内核页表根物理地址
 pub(crate) static KERNEL_PAGE_TABLE_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// 串行化动态内核页表更新。
+///
+/// allocator 可在多个 CPU 上并发扩展或回收内核堆。页表遍历中的“检查空项、分配
+/// 下级页表、安装 PTE”不是单条原子事务，必须由同一把锁保护。同步 TLB 失效不得
+/// 在持锁时执行，否则目标 CPU 若正在等待本锁，会与发起方形成 shootdown 锁环。
+static KERNEL_PAGE_TABLE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 每次成功发布一批新内核堆 PTE 后递增。新映射不等待远端 shootdown；其它 CPU
+/// 若命中旧的无效 translation，会在缺页入口按本代次完成一次本核懒失效。
+static KERNEL_MAPPING_GENERATION: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_MAPPING_OBSERVED: [AtomicUsize; sched::NR_CPUS] =
+    [const { AtomicUsize::new(0) }; sched::NR_CPUS];
 
 /// 返回内核堆虚拟地址区域
 pub fn kernel_heap_region() -> (usize, usize) {
@@ -276,6 +291,7 @@ pub fn kernel_virt_to_phys(vaddr: usize) -> usize {
         return vaddr & 0x0000_FFFF_FFFF_FFFF;
     }
 
+    let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
     let root_vaddr = phys_to_virt(root_paddr);
     let Ok((level, _pte_ptr, pte)) =
         find_leaf::<LoongArch64Paging>(root_vaddr, vaddr, phys_to_virt)
@@ -451,6 +467,28 @@ fn free_page_table_page(paddr: usize) -> bool {
         .is_ok()
 }
 
+#[inline]
+fn flush_local_kernel_translation_state() {
+    // LoongArch 本核可能保留页表遍历产生的旧 translation 状态；安装新 PTE 后仅做
+    // `dbar` 不足以保证紧随其后的堆访问成功。新范围尚未向其它 CPU 发布，不应为
+    // 新增映射发起同步远端 shootdown；其它 CPU 缓存的无效状态由映射代次缺页路径
+    // 懒收敛。
+    // Safety: 两条指令只排序页表写并失效当前 CPU 的 TLB，不访问 Rust 对象。
+    unsafe {
+        core::arch::asm!(
+            "dbar 0",
+            "invtlb 0x0, $zero, $zero",
+            options(nostack, preserves_flags)
+        )
+    };
+}
+
+#[inline]
+fn publish_new_kernel_mappings() {
+    flush_local_kernel_translation_state();
+    KERNEL_MAPPING_GENERATION.fetch_add(1, Ordering::Release);
+}
+
 /// 根据 PagePolicy 映射地址范围
 ///
 /// 这是页表映射的主入口函数，负责把 allocator 请求的"虚拟地址 + 物理地址 + 大小"
@@ -487,8 +525,10 @@ fn free_page_table_page(paddr: usize) -> bool {
 /// 3. **逐页遍历**: 按照选定的页大小，从 `vaddr` 开始逐页调用 `walk_and_map` 创建
 ///    映射，直到覆盖整个 `size` 区域。
 ///
-/// 4. **TLB 刷新**: 映射完成后调用 `flush_tlb(None)` 全局刷新 TLB，确保 CPU 能看到
-///    新的映射。这里采用保守策略（全局刷新），未来可以优化为按地址范围刷新。
+/// 4. **页表发布**: 映射完成后执行 `dbar` 并失效本核 TLB。新地址要到本函数成功
+///    返回后才会由 allocator 发布，其他 CPU 不可能持有该地址的有效 translation；
+///    它们此前缓存的无效状态由映射代次缺页路径懒收敛，因而这里不发同步远端
+///    shootdown。
 ///
 /// # 错误处理
 ///
@@ -676,9 +716,9 @@ fn map_range_with_policy(
                 rollback_failed = true;
             }
             if mapped_size != 0 {
-                unsafe {
-                    LoongArch64Paging::flush_tlb(None);
-                }
+                // 该范围尚未向 allocator 调用方发布，不可能存在可用 translation。
+                // 回滚只需保证 PTE 清除先于物理页回收，无需同步打断其它 CPU。
+                flush_local_kernel_translation_state();
             }
             if !rollback_failed
                 && matches!(page_policy, PagePolicy::PreferLarge)
@@ -693,10 +733,11 @@ fn map_range_with_policy(
         current_paddr += page_size;
     }
 
-    // 刷新 TLB
-    unsafe {
-        LoongArch64Paging::flush_tlb(None); // 全局刷新
-    }
+    // allocator 只会在本函数成功返回后发布新虚拟地址。目标范围此前不存在有效
+    // translation，旧映射若被复用也已在对应 unmap 返回前完成失效；因此这里只需
+    // 发布 PTE 写入并失效本核，不能在任意调用方锁内制造无意义的同步远端
+    // shootdown。
+    publish_new_kernel_mappings();
 
     // log::debug!(
     //     "[arch][heap_vm] mapping complete: vaddr={:#x} paddr={:#x} size={:#x}",
@@ -762,8 +803,8 @@ fn map_range_with_policy(
 /// - **大页优势**: 当 `page_policy=PreferLarge` 且地址对齐时，使用 2MiB 大页
 ///   可以显著减少 TLB miss，提升大块内存访问性能
 ///
-/// - **TLB 刷新开销**: 每次映射后都会全局刷新 TLB，这是保守策略。未来可以
-///   优化为批量映射后统一刷新，或者只刷新相关地址范围
+/// - **TLB 刷新开销**: 每次映射只发布页表写并失效本核 TLB，不等待远端 CPU；
+///   解除映射和权限收紧仍会在资源复用前完成同步多核失效
 ///
 /// - **页表页分配**: 首次映射某个虚拟地址区域时，需要分配中间页表页。这些
 ///   页表页会一直保留，后续映射相同区域的其他地址时可以复用
@@ -785,7 +826,11 @@ pub fn map_kernel_heap_range(
         return false;
     }
 
-    match map_range_with_policy(vaddr, paddr, size, page_policy) {
+    let result = {
+        let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
+        map_range_with_policy(vaddr, paddr, size, page_policy)
+    };
+    match result {
         Ok(()) => {
             // log::debug!(
             //     "[arch][heap_vm] mapped kernel heap range: vaddr={:#x} paddr={:#x} size={:#x} policy={:?}",
@@ -886,23 +931,23 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
         return false;
     }
 
-    let root_vaddr = phys_to_virt(root_paddr);
-
-    if let Err(err) =
+    let update_result = {
+        let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
+        let root_vaddr = phys_to_virt(root_paddr);
         unmap_range_entries::<LoongArch64Paging>(root_vaddr, vaddr, size, false, phys_to_virt)
-    {
-        log::error!(
-            "[arch][heap_vm] failed to validate kernel heap unmap: vaddr={:#x} size={:#x} error={:?}",
-            vaddr,
-            size,
-            err
-        );
-        return false;
-    }
+            .and_then(|_| {
+                unmap_range_entries::<LoongArch64Paging>(
+                    root_vaddr,
+                    vaddr,
+                    size,
+                    true,
+                    phys_to_virt,
+                )
+            })
+            .map(|()| flush_local_kernel_translation_state())
+    };
 
-    if let Err(err) =
-        unmap_range_entries::<LoongArch64Paging>(root_vaddr, vaddr, size, true, phys_to_virt)
-    {
+    if let Err(err) = update_result {
         log::error!(
             "[arch][heap_vm] failed to unmap kernel heap range: vaddr={:#x} size={:#x} error={:?}",
             vaddr,
@@ -912,6 +957,8 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
         return false;
     }
 
+    // 页表锁必须先释放：目标 CPU 可能正等待另一条需要该锁的 allocator 路径。
+    // PTE 已清除但物理页和虚拟区间尚未回收，等待远端确认期间不存在复用竞态。
     unsafe {
         LoongArch64Paging::flush_tlb(None);
     }
@@ -945,18 +992,22 @@ pub fn protect_kernel_heap_range(
         return false;
     }
 
-    let root_vaddr = phys_to_virt(root_paddr);
-    if let Err(err) = protect_range_entries::<LoongArch64Paging>(
-        root_vaddr,
-        vaddr,
-        size,
-        read,
-        write,
-        execute,
-        false,
-        true,
-        phys_to_virt,
-    ) {
+    let update_result = {
+        let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
+        protect_range_entries::<LoongArch64Paging>(
+            phys_to_virt(root_paddr),
+            vaddr,
+            size,
+            read,
+            write,
+            execute,
+            false,
+            true,
+            phys_to_virt,
+        )
+        .map(|()| flush_local_kernel_translation_state())
+    };
+    if let Err(err) = update_result {
         log::error!(
             "[arch][heap_vm] failed to protect kernel heap range: vaddr={:#x} size={:#x} error={:?}",
             vaddr,
@@ -983,6 +1034,7 @@ pub fn validate_kernel_heap_range(
     if root_paddr == 0 {
         return false;
     }
+    let _page_table_guard = KERNEL_PAGE_TABLE_LOCK.lock();
     validate_range_permissions::<LoongArch64Paging>(
         phys_to_virt(root_paddr),
         vaddr,
@@ -993,4 +1045,41 @@ pub fn validate_kernel_heap_range(
         phys_to_virt,
     )
     .is_ok()
+}
+
+/// 尝试收敛当前 CPU 对新内核堆映射缓存的无效 translation。
+///
+/// 新映射在返回 allocator 前已经完整发布，但 LoongArch64 允许本核保留此前页表
+/// 遍历得到的无效状态。为了避免在任意上层锁内同步等待所有 CPU，新映射采用懒
+/// 收敛：只有确认目标 PTE 当前存在、权限满足且本 CPU 尚未观察本映射代次时，才
+/// 执行一次本核完整失效并重试原指令。同一代次再次故障会返回 `false`，由 trap
+/// 路径按真实内核错误处理，避免掩盖损坏的页表或无限重试。
+pub(crate) fn recover_stale_kernel_heap_translation(
+    vaddr: usize,
+    write: bool,
+    execute: bool,
+) -> bool {
+    let Some(region_end) = KERNEL_HEAP_BASE.checked_add(KERNEL_HEAP_SIZE) else {
+        return false;
+    };
+    if vaddr < KERNEL_HEAP_BASE || vaddr >= region_end {
+        return false;
+    }
+
+    let cpu = crate::loongarch64::trap::LoongArch64MessageInterruptOps::current_cpu_id();
+    let Some(observed) = KERNEL_MAPPING_OBSERVED.get(cpu) else {
+        return false;
+    };
+    let page = vaddr & !(PAGE_SIZE - 1);
+    if !validate_kernel_heap_range(page, PAGE_SIZE, true, write, execute) {
+        return false;
+    }
+
+    let generation = KERNEL_MAPPING_GENERATION.load(Ordering::Acquire);
+    if generation == observed.load(Ordering::Relaxed) {
+        return false;
+    }
+    flush_local_kernel_translation_state();
+    observed.store(generation, Ordering::Release);
+    true
 }
