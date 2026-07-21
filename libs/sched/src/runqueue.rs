@@ -247,6 +247,19 @@ impl Runqueue {
             + usize::from(inner.current.is_some())
     }
 
+    /// 原子替换本 CPU 的 RT bandwidth 参数并重新开始记账周期。
+    pub(crate) fn set_rt_bandwidth(&self, period_ns: u64, runtime_ns: u64, now_ns: u64) {
+        let period_ns = period_ns.max(1);
+        let runtime_ns = runtime_ns.min(period_ns);
+        let mut inner = self.inner.lock();
+        let _ = update_curr_locked(&mut inner, now_ns);
+        inner.rt_period_ns = period_ns;
+        inner.rt_runtime_ns = runtime_ns;
+        inner.rt_period_start_ns = now_ns - now_ns % period_ns;
+        inner.rt_runtime_used_ns = 0;
+        inner.rt_throttled = runtime_ns == 0;
+    }
+
     /// 可跨 CPU 迁移的就绪负载。
     ///
     /// idle 任务只属于本 CPU，deadline throttled 任务当前不可运行，current 任务
@@ -1021,11 +1034,11 @@ fn refresh_rt_bandwidth_locked(inner: &mut RqInner, now_ns: u64) -> bool {
     if period_start == inner.rt_period_start_ns {
         return false;
     }
-    let replenished = inner.rt_throttled;
+    let was_throttled = inner.rt_throttled;
     inner.rt_period_start_ns = period_start;
     inner.rt_runtime_used_ns = 0;
-    inner.rt_throttled = false;
-    replenished
+    inner.rt_throttled = inner.rt_runtime_ns == 0;
+    was_throttled && !inner.rt_throttled
 }
 
 fn charge_rt_bandwidth_locked(inner: &mut RqInner, previous_ns: u64, now_ns: u64) {

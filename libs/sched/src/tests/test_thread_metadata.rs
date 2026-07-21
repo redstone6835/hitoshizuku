@@ -342,6 +342,27 @@ fn runqueue_rt_bandwidth_charges_round_robin_runtime() {
 }
 
 #[ktest]
+fn runqueue_zero_rt_runtime_stays_throttled_across_periods() {
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));
+    let fair = make_task();
+    let rq = Runqueue::new_with_rt_bandwidth(100, 80);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    rq.set_rt_bandwidth(100, 0, 0);
+
+    let first = rq.pick_next(1).expect("fair task with zero RT runtime");
+    assert!(alloc::sync::Arc::ptr_eq(&first, &fair));
+    assert!(!rq.tick(100));
+    let next_period = rq.pick_next(100).expect("fair task in next period");
+    assert!(alloc::sync::Arc::ptr_eq(&next_period, &fair));
+
+    assert!(rq.dequeue(&realtime, 101));
+    assert!(rq.dequeue(&fair, 101));
+}
+
+#[ktest]
 fn runqueue_pi_boosted_owner_bypasses_rt_throttle() {
     let realtime = make_task();
     realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));

@@ -31,16 +31,18 @@
 //!
 //! ## 锁顺序 (Lock Ordering)
 //!
-//! 1. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
-//! 2. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
-//! 3. `Task::creds` / `Task::shared_signal` / `Task::kstack` / `Task::ctx`
+//! 1. `RT_SCHEDULING_CONFIG` —— 仅 sysctl 更新路径持有；可依次进入各 CPU
+//!    `Runqueue::inner`，反向获取禁止。
+//! 2. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
+//! 3. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
+//! 4. `Task::creds` / `Task::shared_signal` / `Task::kstack` / `Task::ctx`
 //!    / `Task::ext` —— 同一 Task 内的次级字段锁，彼此独立，禁止互相嵌套。
-//! 4. `ThreadGroup::members` / `ProcessGroup::members` / `Session::groups` ——
+//! 5. `ThreadGroup::members` / `ProcessGroup::members` / `Session::groups` ——
 //!    组成员索引。
-//! 5. `SharedSignal::actions` / `SharedSignal::shared_pending_infos` ——
+//! 6. `SharedSignal::actions` / `SharedSignal::shared_pending_infos` ——
 //!    tg 共享信号表。
-//! 6. `WaitQueue::waiters` —— 等待者列表。
-//! 7. `SignalState::pending_infos` —— per-task 信号队列。
+//! 7. `WaitQueue::waiters` —— 等待者列表。
+//! 8. `SignalState::pending_infos` —— per-task 信号队列。
 //!
 //! 调用可能触发唤醒 / 分配的函数前必须释放所有 rq 锁。
 //!
@@ -113,8 +115,10 @@ pub use scheduler::{
     is_ready, mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
     offline_cpu, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
     register_sleep_deadline, request_balance, request_post_syscall_handoff, request_resched,
-    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, schedule_once,
-    scheduler_diag, set_realtime_itimer, signal_wakeup, spawn_idle_for, supported_cpu_mask,
+    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, sched_rr_timeslice_ms,
+    sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag,
+    set_realtime_itimer, set_sched_rr_timeslice_ms, set_sched_rt_period_us,
+    set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for, supported_cpu_mask,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};

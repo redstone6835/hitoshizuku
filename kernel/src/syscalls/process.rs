@@ -1442,7 +1442,11 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     let attr = SchedAttr {
         policy,
         nice: old.nice,
-        slice_ns: old.slice_ns,
+        slice_ns: if policy == SchedPolicy::RtRoundRobin {
+            sched::sched_rr_timeslice_ns()
+        } else {
+            old.slice_ns
+        },
         priority: rt_priority,
         runtime_ns: 0,
         deadline_ns: 0,
@@ -1641,7 +1645,9 @@ pub(super) fn sys_sched_rr_get_interval(ctx: &mut SyscallContext<'_>) -> Result<
     }
     let task = sched_task_from_pid(pid, ctx.task())?;
     let attr = sched::operation::sched_getattr_for_task(&task);
-    let interval_ns = if attr.slice_ns == 0 {
+    let interval_ns = if attr.policy == SchedPolicy::RtRoundRobin {
+        sched::sched_rr_timeslice_ns()
+    } else if attr.slice_ns == 0 {
         sched::DEFAULT_RR_SLICE_NS
     } else {
         attr.slice_ns
@@ -1660,7 +1666,10 @@ pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
-    let (attr, reset_on_fork) = read_linux_sched_attr(attr_user)?;
+    let (mut attr, reset_on_fork) = read_linux_sched_attr(attr_user)?;
+    if attr.policy == SchedPolicy::RtRoundRobin {
+        attr.slice_ns = sched::sched_rr_timeslice_ns();
+    }
     let task = sched_task_from_pid(pid, ctx.task())?;
     let old = task.pi_base_attr();
     check_sched_attr_permission(ctx.task(), &task, old, attr)?;
