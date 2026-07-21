@@ -589,6 +589,14 @@ pub struct Task {
     wakeup_ns: AtomicU64,
     #[cfg(feature = "performance-profile")]
     wait_reason: AtomicU8,
+    #[cfg(feature = "performance-profile")]
+    wait_cpu: AtomicUsize,
+    #[cfg(feature = "performance-profile")]
+    wait_trace_emitted: AtomicBool,
+    #[cfg(feature = "performance-profile")]
+    wait_generation: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_span_id: AtomicU64,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -689,6 +697,14 @@ impl Task {
             wakeup_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             wait_reason: AtomicU8::new(WaitReason::Other as u8),
+            #[cfg(feature = "performance-profile")]
+            wait_cpu: AtomicUsize::new(profiling::MIXED_CPU),
+            #[cfg(feature = "performance-profile")]
+            wait_trace_emitted: AtomicBool::new(false),
+            #[cfg(feature = "performance-profile")]
+            wait_generation: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_span_id: AtomicU64::new(0),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -1354,7 +1370,16 @@ impl Task {
     pub fn begin_profile_wait(&self, reason: WaitReason, now_ns: u64) {
         #[cfg(feature = "performance-profile")]
         {
+            if !profiling::enabled() {
+                self.cancel_profile_wait();
+                return;
+            }
             self.wait_reason.store(reason as u8, Ordering::Release);
+            self.wait_cpu
+                .store(profiling::current_cpu_slot(), Ordering::Release);
+            self.wait_trace_emitted.store(false, Ordering::Release);
+            self.wait_generation
+                .store(profiling::generation(), Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
             self.wait_started_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -1369,7 +1394,47 @@ impl Task {
         {
             self.wait_started_ns.store(0, Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
+            self.wait_cpu.store(profiling::MIXED_CPU, Ordering::Release);
+            self.wait_trace_emitted.store(false, Ordering::Release);
+            self.wait_generation.store(0, Ordering::Release);
         }
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_span_id(&self) -> u64 {
+        self.profile_span_id.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn set_profile_span_id(&self, span_id: u64) {
+        self.profile_span_id.store(span_id, Ordering::Release);
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub(crate) fn mark_profile_blocked(&self) {
+        if !profiling::enabled()
+            || self.wait_generation.load(Ordering::Acquire) != profiling::generation()
+        {
+            self.cancel_profile_wait();
+            return;
+        }
+        if self.wait_started_ns.load(Ordering::Acquire) == 0
+            || self.wait_trace_emitted.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let reason = WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire));
+        profiling::trace_task_event_with_span(
+            profiling::TraceKind::TaskBlock,
+            reason.profile_event(),
+            self.pid_root_cached().unwrap_or(0) as u64,
+            self.profile_span_id(),
+            reason as u64,
+            self.wait_cpu.load(Ordering::Acquire) as u64,
+        );
     }
 
     #[inline]
@@ -1377,13 +1442,30 @@ impl Task {
         #[cfg(feature = "performance-profile")]
         {
             let encoded = self.wait_started_ns.swap(0, Ordering::AcqRel);
+            let wait_generation = self.wait_generation.swap(0, Ordering::AcqRel);
             if encoded == 0 {
                 return;
             }
-            #[cfg(feature = "performance-profile")]
-            profiling::record_duration(
-                WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire)).profile_event(),
-                now_ns.saturating_sub(encoded - 1),
+            if !profiling::enabled() || wait_generation != profiling::generation() {
+                self.wait_trace_emitted.store(false, Ordering::Release);
+                self.wakeup_ns.store(0, Ordering::Release);
+                return;
+            }
+            if !self.wait_trace_emitted.swap(false, Ordering::AcqRel) {
+                self.wakeup_ns.store(0, Ordering::Release);
+                return;
+            }
+            let reason = WaitReason::from_u8(self.wait_reason.load(Ordering::Acquire));
+            let duration_ns = now_ns.saturating_sub(encoded - 1);
+            let origin_cpu = self.wait_cpu.load(Ordering::Acquire);
+            profiling::record_duration_on_cpu(reason.profile_event(), duration_ns, origin_cpu);
+            profiling::trace_task_event_with_span(
+                profiling::TraceKind::TaskWake,
+                reason.profile_event(),
+                self.pid_root_cached().unwrap_or(0) as u64,
+                self.profile_span_id(),
+                duration_ns,
+                origin_cpu as u64,
             );
             self.wakeup_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
