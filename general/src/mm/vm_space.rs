@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use errno::Errno;
 use mm::{FileLike, VmArea, VmBacking, VmFlags, VmaSet};
@@ -284,6 +284,8 @@ pub struct VmSpace {
     brk_current: AtomicUsize,
     mmap_next: AtomicUsize,
     mlock_future: AtomicBool,
+    /// `membarrier(2)` expedited 命令的地址空间级注册位。
+    membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
     mapped_pages: AtomicUsize,
 }
@@ -310,6 +312,7 @@ impl VmSpace {
             brk_current: AtomicUsize::new(layout.user_heap_base),
             mmap_next: AtomicUsize::new(layout.user_mmap_base),
             mlock_future: AtomicBool::new(false),
+            membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
         }
     }
@@ -322,6 +325,16 @@ impl VmSpace {
     #[kernel_symbols::export(name = "general.mm.VmSpace.mapped_pages", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
     pub fn mapped_pages(&self) -> usize {
         self.mapped_pages.load(Ordering::Acquire)
+    }
+
+    /// 为当前地址空间登记可用的 expedited membarrier 命令。
+    pub fn register_membarrier(&self, commands: usize) {
+        self.membarrier_registration
+            .fetch_or(commands, Ordering::AcqRel);
+    }
+
+    pub fn membarrier_registration(&self) -> usize {
+        self.membarrier_registration.load(Ordering::Acquire)
     }
 
     fn with_future_mlock(&self, flags: VmFlags) -> VmFlags {
@@ -1045,6 +1058,8 @@ impl VmSpace {
             brk_current: AtomicUsize::new(self.current_brk()),
             mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
             mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
+            // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
+            membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
         }
     }
@@ -1111,6 +1126,99 @@ impl VmSpace {
         let (_page, kva, len) = self.user_page_window(user, max_len, FaultKind::Load)?;
         let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, len) };
         Ok(f(slice))
+    }
+
+    /// 为用户态原子 u32 访问预先解析 lazy fault 和可选的 COW。
+    ///
+    /// 该操作可能分配和修改页表，只能在获取 futex 等子系统自旋锁之前调用。
+    pub fn prefault_user_u32(&self, user: usize, write: bool) -> Result<(), Errno> {
+        self.user_u32_location(user)?;
+        let kind = if write {
+            FaultKind::Store
+        } else {
+            FaultKind::Load
+        };
+        match self.handle_fault(user, kind) {
+            FaultOutcome::Fixed => self.with_user_atomic_u32(user, write, |_| ((), false)),
+            FaultOutcome::Segv | FaultOutcome::Kernel(_) => Err(Errno::EFAULT),
+        }
+    }
+
+    /// 从已经常驻的用户页原子读取一个 u32，不触发缺页或分配。
+    ///
+    /// 调用方应先在普通上下文中完成 fault-in。该接口只用于已经持有其它子系统
+    /// 自旋锁、不能再进入缺页路径的窄临界区；映射或权限已经变化时返回 EFAULT。
+    pub fn read_user_u32_nofault(&self, user: usize) -> Result<u32, Errno> {
+        self.with_user_atomic_u32(user, false, |word| (word.load(Ordering::Acquire), false))
+    }
+
+    /// 对已经常驻且可写的用户 u32 执行原子 compare-exchange。
+    ///
+    /// 返回本次观察到的旧值；仅当它等于 `current` 时写入 `new`。该接口不会
+    /// 触发缺页或 COW，调用方必须先执行 [`Self::prefault_user_u32`]。
+    pub fn compare_exchange_user_u32_nofault(
+        &self,
+        user: usize,
+        current: u32,
+        new: u32,
+    ) -> Result<u32, Errno> {
+        self.with_user_atomic_u32(user, true, |word| {
+            match word.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(previous) => (previous, true),
+                Err(observed) => (observed, false),
+            }
+        })
+    }
+
+    fn user_u32_location(&self, user: usize) -> Result<(usize, usize), Errno> {
+        if user % core::mem::align_of::<u32>() != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = user
+            .checked_add(core::mem::size_of::<u32>())
+            .ok_or(Errno::EFAULT)?;
+        let page_va = page_base(user);
+        if end > page_va.checked_add(page_size()).ok_or(Errno::EFAULT)? {
+            return Err(Errno::EFAULT);
+        }
+        Ok((page_va, end))
+    }
+
+    fn with_user_atomic_u32<R>(
+        &self,
+        user: usize,
+        write: bool,
+        operation: impl FnOnce(&AtomicU32) -> (R, bool),
+    ) -> Result<R, Errno> {
+        let (page_va, end) = self.user_u32_location(user)?;
+        // 同时持有 VMA 和 resident page 锁，确保权限检查与物理页选择来自同一份
+        // 映射快照。Arc 由 pages 表持有，因此原子操作期间物理页不会被回收。
+        let set = self.vmas.lock();
+        let area = set.find(user).ok_or(Errno::EFAULT)?;
+        let required = if write {
+            VmFlags::USER | VmFlags::READ | VmFlags::WRITE
+        } else {
+            VmFlags::USER | VmFlags::READ
+        };
+        if end > area.range.end || !area.flags.contains_all(required) {
+            return Err(Errno::EFAULT);
+        }
+        let pages = self.pages.lock();
+        let mapping = pages.get(&page_va).ok_or(Errno::EFAULT)?;
+        if write && !mapping.access.pte_writable() {
+            return Err(Errno::EFAULT);
+        }
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let pointer = (virt_fn(mapping.page.paddr()) + (user - page_va)) as *const AtomicU32;
+        // Safety: futex 地址已经按 u32 对齐，四字节不会跨页；VMA/pages 锁保证当前
+        // resident mapping 不被替换，底层页由 mapping 的 Arc 保活。
+        let (result, changed) = operation(unsafe { &*pointer });
+        if changed {
+            mapping.page.mark_dirty();
+        }
+        Ok(result)
     }
 
     /// 取得写入用户地址的一页内连续窗口。

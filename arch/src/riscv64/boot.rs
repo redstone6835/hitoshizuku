@@ -330,6 +330,7 @@ unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
         let kernel_gp: usize;
         core::arch::asm!("mv {}, gp", out(reg) kernel_gp, options(nomem, nostack));
         (*hl).hart_id = hartid;
+        (*hl).logical_id = 0;
         (*hl).kernel_gp = kernel_gp;
         // 中断栈栈顶 = IRQ_STACKS[0] 末尾（栈向低地址增长）
         (*hl).irq_stack_top = core::ptr::addr_of!(IRQ_STACKS) as usize + IRQ_STACK_ALLOCATION_SIZE;

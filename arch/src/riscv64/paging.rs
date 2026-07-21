@@ -211,6 +211,7 @@ impl Riscv64Paging {
                 );
             }
         }
+        crate::riscv64::smp::remote_sfence_vma(Some(asid), vaddr.map(VirtAddr::as_usize));
     }
 
     /// 使用当前 ASID 刷新 TLB。
@@ -233,8 +234,8 @@ impl Riscv64Paging {
     ///
     /// # Safety
     ///
-    /// 必须在 S-mode 下调用；调用方负责在释放被解除映射的物理页或页表页之前，
-    /// 完成所需的远程 hart shootdown。
+    /// 必须在 S-mode 下调用；函数返回前会完成本地失效和远端 hart shootdown，
+    /// 调用方随后才能释放被解除映射的物理页或页表页。
     #[inline]
     pub unsafe fn flush_tlb_global(vaddr: Option<VirtAddr>) {
         unsafe {
@@ -248,6 +249,7 @@ impl Riscv64Paging {
                 core::arch::asm!("sfence.vma zero, zero", options(nostack));
             }
         }
+        crate::riscv64::smp::remote_sfence_vma(None, vaddr.map(VirtAddr::as_usize));
     }
 }
 

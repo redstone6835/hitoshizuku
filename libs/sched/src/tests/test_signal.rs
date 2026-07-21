@@ -6,7 +6,7 @@
 
 extern crate std;
 
-use crate::signal::{SigSet, SignalNumber};
+use crate::signal::{SharedSignal, SigAction, SigActionFlags, SigHandler, SigSet, SignalNumber};
 use ktest::ktest;
 
 /// 空集不包含任何信号。
@@ -14,6 +14,40 @@ use ktest::ktest;
 fn sigset_empty() {
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGKILL));
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGTERM));
+}
+
+/// CLONE_CLEAR_SIGHAND 只重置已捕获的 handler，SIG_IGN 在子进程中保持。
+#[ktest]
+fn clear_sighand_copy_resets_handlers_but_keeps_ignored_signals() {
+    let parent = SharedSignal::new();
+    let caught = SigAction {
+        handler: SigHandler::Handler(0x1234),
+        mask: SigSet::EMPTY.with(SignalNumber::SIGTERM),
+        flags: SigActionFlags(SigActionFlags::SA_RESTART),
+        restorer: 0x5678,
+    };
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        mask: SigSet::EMPTY,
+        flags: SigActionFlags(0),
+        restorer: 0,
+    };
+    parent.set_action(SignalNumber::SIGUSR1, caught);
+    parent.set_action(SignalNumber::SIGUSR2, ignored);
+
+    let child = parent.fork_copy_clearing_handlers();
+    let child_caught = child.get_action(SignalNumber::SIGUSR1);
+    let child_ignored = child.get_action(SignalNumber::SIGUSR2);
+
+    assert!(matches!(child_caught.handler, SigHandler::Default));
+    assert_eq!(child_caught.mask, SigSet::EMPTY);
+    assert_eq!(child_caught.flags, SigActionFlags(0));
+    assert_eq!(child_caught.restorer, 0);
+    assert!(matches!(child_ignored.handler, SigHandler::Ignore));
+    assert!(matches!(
+        parent.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234)
+    ));
 }
 
 /// with 添加信号后 has 返回 true。

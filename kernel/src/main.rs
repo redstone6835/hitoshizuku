@@ -7,6 +7,7 @@ extern crate hal;
 
 use core::alloc::{GlobalAlloc, Layout};
 
+mod acct;
 mod acpi;
 #[cfg(any(
     feature = "bench",
@@ -24,10 +25,13 @@ mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 mod net_tests;
 mod panic;
+mod rseq;
 mod sched;
 mod start;
 mod stdio;
 mod syscalls;
+#[cfg(any(feature = "kernel-tests", feature = "smp-tests"))]
+mod tests;
 mod tty_poll;
 mod user;
 mod vdso;
@@ -74,6 +78,16 @@ fn main() -> ! {
         );
         profiling::set_enabled(true);
     }
+    let secondary_cpus = hal::sched::start_secondary_cpus();
+    log::info!(
+        "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
+        secondary_cpus.detected,
+        secondary_cpus.started,
+        secondary_cpus.failed,
+        ::sched::online_cpu_mask(),
+        ::sched::active_cpu_mask(),
+    );
+    device_init::install_network_boot_config();
     let integrated =
         integrated_components::initialize_phase(integrated_components::IntegratedPhase::Runtime)
             .unwrap_or_else(|error| panic!("[kernel] 集成组件初始化失败: {error}"));
@@ -101,15 +115,6 @@ fn main() -> ! {
     // 调度器 init/idle 完成后才能派生内核线程。
     tty_poll::register();
 
-    let secondary_cpus = hal::sched::start_secondary_cpus();
-    log::info!(
-        "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
-        secondary_cpus.detected,
-        secondary_cpus.started,
-        secondary_cpus.failed,
-        ::sched::online_cpu_mask(),
-        ::sched::active_cpu_mask(),
-    );
     elm::synchronize_smp_runtime();
     /*
     #[cfg(debug_assertions)]
@@ -123,7 +128,8 @@ fn main() -> ! {
     #[cfg(any(
         feature = "kernel-tests",
         feature = "network-tests",
-        feature = "allocator-tests"
+        feature = "allocator-tests",
+        feature = "smp-tests"
     ))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);

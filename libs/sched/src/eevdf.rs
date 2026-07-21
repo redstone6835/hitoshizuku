@@ -368,7 +368,7 @@ impl SchedEntity {
 
     pub(crate) fn reset_rr_slice(&self) {
         self.rr_remaining_ns
-            .store(self.slice_ns().max(1), Ordering::Release);
+            .store(crate::scheduler::sched_rr_timeslice_ns(), Ordering::Release);
     }
 
     pub(crate) fn rr_remaining_ns(&self) -> u64 {
