@@ -6,17 +6,83 @@
 
 use core::mem;
 use core::num::NonZeroU32;
+use core::ops::{Deref, DerefMut};
 #[cfg(feature = "block-profile")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
 use general::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
 use general::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
+use spin::mutex::{Mutex, MutexGuard};
 use virtio::{
     DescriptorChain, SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
 };
 
 use super::VIRTIO_BLK_SECTOR_SIZE;
+
+/// 关闭本地中断后持有的互斥锁。
+///
+/// VirtIO 完成中断与进程提交路径会访问同一 virtqueue。普通自旋锁允许本 CPU
+/// 在持锁期间被设备中断重入，单核上中断处理程序随后会永久等待自己打断的锁持有者。
+/// 此包装遵循 `spin_lock_irqsave` 语义，并确保先释放锁再恢复中断。
+pub(super) struct IrqSafeMutex<T> {
+    inner: Mutex<T>,
+}
+
+impl<T> IrqSafeMutex<T> {
+    pub(super) const fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+
+    pub(super) fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
+        let irq_state = LocalIrqState::acquire();
+        let guard = self.inner.lock();
+        IrqSafeMutexGuard {
+            guard,
+            _irq_state: irq_state,
+        }
+    }
+}
+
+struct LocalIrqState {
+    state: usize,
+}
+
+impl LocalIrqState {
+    fn acquire() -> Self {
+        Self {
+            state: hal::interrupt::save_and_disable_local(),
+        }
+    }
+}
+
+impl Drop for LocalIrqState {
+    fn drop(&mut self) {
+        hal::interrupt::restore_local(self.state);
+    }
+}
+
+pub(super) struct IrqSafeMutexGuard<'a, T> {
+    // 字段按声明顺序析构，必须先解锁再恢复本地中断。
+    guard: MutexGuard<'a, T>,
+    _irq_state: LocalIrqState,
+}
+
+impl<T> Deref for IrqSafeMutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for IrqSafeMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
 
 #[cfg(feature = "block-profile")]
 #[derive(Clone, Copy, Debug, Default)]
