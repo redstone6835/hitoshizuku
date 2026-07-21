@@ -79,42 +79,104 @@ pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
 pub(crate) fn handle_ipi() {
     // request_resched() 在发送 IPI 前已发布目标 CPU 的 need_resched；trap 返回路径
     // 会在安全边界消费该标志。RFENCE 由 OpenSBI 同步执行，不进入 S-mode handler。
+    sched::acknowledge_resched_notification();
 }
 
-fn for_each_remote_hart(mut action: impl FnMut(usize) -> sbi::SbiRet) {
+fn for_each_remote_hart_mask(
+    logical_targets: usize,
+    mut action: impl FnMut(usize, usize) -> sbi::SbiRet,
+) {
     // SBI RFENCE 是同步操作。若多个 hart 同时互相发起 fence，固件可能让每个
     // 调用都等待另一个仍停留在 RFENCE ecall 中的 hart。统一串行化所有远端
     // TLB/I-cache fence，避免形成跨 hart 等待环。
-    let _guard = REMOTE_FENCE_LOCK.lock();
     let source = crate::riscv64::specific::current_cpu_id();
-    let targets = ONLINE_HARTS.load(Ordering::Acquire) & !(1 << source);
+    let targets = logical_targets & ONLINE_HARTS.load(Ordering::Acquire) & !(1 << source);
+    if targets == 0 {
+        return;
+    }
+    let _guard = REMOTE_FENCE_LOCK.lock();
+
+    // SBI 的 hart mask 允许一次 ecall 通知一组 hart。旧实现按逻辑 CPU
+    // 逐个调用 RFENCE；在 QEMU/OpenSBI 上这会把一次页表更新放大成最多
+    // MAX_CPUS-1 次 M-mode 往返。物理 hart 编号不保证连续，因此先按
+    // `hart_mask_base` 可表示的窗口分组；通常 QEMU 的 hart 编号落在同一
+    // 个 usize 窗口内，只产生一次 ecall。
+    let mut hart_ids = [0usize; MAX_CPUS];
+    let mut count = 0usize;
     for logical_id in 0..MAX_CPUS {
         if targets & (1 << logical_id) == 0 {
             continue;
         }
-        let hart_id = physical_hart_id(logical_id).expect("[smp] online hart has no mapping");
-        let ret = action(hart_id);
+        hart_ids[count] = physical_hart_id(logical_id).expect("[smp] online hart has no mapping");
+        count += 1;
+    }
+    hart_ids[..count].sort_unstable();
+
+    let mask_bits = usize::BITS as usize;
+    let mut first = 0usize;
+    while first < count {
+        let base = hart_ids[first];
+        let mut mask = 0usize;
+        let mut next = first;
+        while next < count {
+            let offset = hart_ids[next].wrapping_sub(base);
+            if offset >= mask_bits {
+                break;
+            }
+            mask |= 1usize << offset;
+            next += 1;
+        }
+        let ret = action(mask, base);
         assert!(
             ret.is_ok(),
-            "[smp] remote fence failed: logical={} hart={} error={}",
-            logical_id,
-            hart_id,
+            "[smp] remote fence failed: mask={:#x} base={} error={}",
+            mask,
+            base,
             ret.error
         );
+        first = next;
     }
 }
 
 pub(crate) fn remote_sfence_vma(asid: Option<usize>, address: Option<usize>) {
+    remote_sfence_vma_on(usize::MAX, asid, address);
+}
+
+/// 只在指定逻辑 CPU 集合上执行远端 TLB 失效。
+///
+/// `logical_targets` 来自用户地址空间记录的活跃 CPU 位图；函数仍会与在线集合
+/// 求交并排除当前 CPU，因此离线 CPU 和本地 hart 不会进入 SBI hart mask。
+pub(crate) fn remote_sfence_vma_on(
+    logical_targets: usize,
+    asid: Option<usize>,
+    address: Option<usize>,
+) {
     let start = address.unwrap_or(0);
     let size = address.map_or(0, |_| allocator::PAGE_SIZE);
-    for_each_remote_hart(|hart_id| match asid {
-        Some(asid) => sbi::remote_sfence_vma_asid(1, hart_id, start, size, asid),
-        None => sbi::remote_sfence_vma(1, hart_id, start, size),
+    remote_sfence_vma_range_on(logical_targets, asid, start, size);
+}
+
+/// 使用一次 SBI RFENCE 失效指定逻辑 CPU 上的连续虚拟地址范围。
+///
+/// 本地 hart 不包含在目标集合中，调用方需要先完成对应的本地 `sfence.vma`。
+/// `size == 0` 保留 SBI 的“全部地址”语义；非零范围必须按基本页对齐。
+pub(crate) fn remote_sfence_vma_range_on(
+    logical_targets: usize,
+    asid: Option<usize>,
+    start: usize,
+    size: usize,
+) {
+    debug_assert!(size == 0 || start.is_multiple_of(allocator::PAGE_SIZE));
+    debug_assert!(size == 0 || size.is_multiple_of(allocator::PAGE_SIZE));
+    debug_assert!(size == 0 || start.checked_add(size).is_some());
+    for_each_remote_hart_mask(logical_targets, |hart_mask, hart_mask_base| match asid {
+        Some(asid) => sbi::remote_sfence_vma_asid(hart_mask, hart_mask_base, start, size, asid),
+        None => sbi::remote_sfence_vma(hart_mask, hart_mask_base, start, size),
     });
 }
 
 pub(crate) fn sync_icache_remote() {
-    for_each_remote_hart(|hart_id| sbi::remote_fence_i(1, hart_id));
+    for_each_remote_hart_mask(usize::MAX, sbi::remote_fence_i);
 }
 
 pub fn start_secondary_cpus() -> SecondaryCpuReport {

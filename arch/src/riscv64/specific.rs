@@ -187,7 +187,10 @@ pub extern "C" fn riscv64_check_irq_stack_guard() {
     let sp: usize;
     unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack)) };
     let bottom = top.saturating_sub(IRQ_STACK_SIZE);
-    if sp < bottom || sp >= top {
+    // 向下增长的栈在尚未压入任何内容时合法 SP 就等于 `top`。RISC-V 的
+    // `call` 只写 ra，不会隐式压栈，因此本叶函数可能原样观察到该边界值。
+    // 低地址端则指向最后一段可用栈空间，仍属于映射范围。
+    if sp < bottom || sp > top {
         riscv64_double_fault();
     }
 }
