@@ -172,6 +172,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                     options(nostack, preserves_flags)
                 );
             }
+            general::dev::irq::record_timer_interrupt();
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
@@ -277,11 +278,19 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
         }
         arg4
-    } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD | ECODE_ASXD) {
+    } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD) {
         let enable = match ecode {
             ECODE_FPD => EUEN_FPE,
-            ECODE_SXD => EUEN_SXE,
-            ECODE_ASXD => EUEN_SXE | EUEN_ASXE,
+            ECODE_SXD => {
+                // SXE 关闭时入口没有可保存的向量状态。用已有 FPR 低 64 位初始化
+                // 每个 LSX 寄存器，并清零高 64 位，再让返回路径装入确定的状态。
+                let scalar_state_saved = tf.euen & FPU_SAVED != 0;
+                for index in 0..tf.lsx.len() {
+                    tf.lsx[index] = [if scalar_state_saved { tf.f[index] } else { 0 }, 0];
+                }
+                tf.euen |= LSX_SAVED;
+                EUEN_SXE
+            }
             _ => 0,
         };
         tf.euen |= enable;

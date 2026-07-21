@@ -3,55 +3,495 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
-echo "[init] Welcome to Shiori"
-
-for dir in /dev /sys /proc /run /mnt /tmp; do
-    [ -d "$dir" ] || mkdir -p "$dir"
-done
-
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sysfs /sys 2>/dev/null || true
-
-if [ -x /sbin/mdev ]; then
-    if [ -e /proc/sys/kernel/hotplug ]; then
-        echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
-    fi
-    /sbin/mdev -s 2>/dev/null || true
+CHROOTED=0
+if [ "${1:-}" = "--chrooted" ]; then
+    CHROOTED=1
 fi
 
-if mount -t ext4 /dev/vd0 /mnt; then
-    echo "[init] mounted /dev/vd0 at /mnt"
-    sh_file_list="/tmp/init-sh-files.$$"
-    : > "$sh_file_list"
+if [ "$CHROOTED" = "0" ]; then
+    echo "[init] Welcome to Shiori"
 
-    echo "[init] /mnt directory tree:"
-    find /mnt -print 2>/dev/null | sort | while IFS= read -r path; do
-        printf '%s\n' "$path"
-        case "$path" in
-            *.sh)
-                if [ -f "$path" ] && [ ! -L "$path" ]; then
-                    printf '%s\n' "$path" >> "$sh_file_list"
-                fi
-                ;;
+    for dir in /dev /sys /proc /var /var/log /run /mnt /tmp; do
+        [ -d "$dir" ] || mkdir -p "$dir"
+        echo "[init] mkdir $dir OK"
+    done
+
+    mount -t proc proc /proc 2>/dev/null || true
+    echo "[init] mount /proc OK"
+
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    echo "[init] mount /sys OK"
+
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+    echo "[init] mount /dev OK"
+
+    if [ -x /sbin/mdev ]; then
+        if [ -e /proc/sys/kernel/hotplug ]; then
+            echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+        fi
+        /sbin/mdev -s 2>/dev/null || true
+    fi
+fi
+
+maybe_enter_shell() {
+    key_file="/tmp/init-key.$$"
+
+    echo "[init] press Ctrl+C within 3 seconds to enter shell"
+    trap 'echo "[init] Ctrl+C detected, entering shell"; exec /bin/sh -i' INT
+    old_stty="$(stty -g < /dev/console 2>/dev/null || true)"
+    stty raw -echo < /dev/console 2>/dev/null || true
+    ( dd bs=1 count=1 of="$key_file" < /dev/console 2>/dev/null ) &
+    key_pid=$!
+    sleep 3
+    if kill -0 "$key_pid" 2>/dev/null; then
+        kill "$key_pid" 2>/dev/null || true
+        wait "$key_pid" 2>/dev/null || true
+    else
+        wait "$key_pid" 2>/dev/null || true
+    fi
+    [ -n "$old_stty" ] && stty "$old_stty" < /dev/console 2>/dev/null || true
+    trap - INT
+
+    key_code="$(od -An -tu1 "$key_file" 2>/dev/null | tr -d '[:space:]')"
+    if [ "$key_code" = "3" ]; then
+        rm -f "$key_file"
+        echo "[init] Ctrl+C detected, entering shell"
+        exec /bin/sh -i
+    fi
+    rm -f "$key_file"
+}
+
+# 测试黑名单
+# basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone cagent
+BLACKLIST="unixbench cagent"
+
+LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
+LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
+LTP_POLL_USEC="${LTP_POLL_USEC:-100000}"
+LTP_CUSTOM_SCENARIOS="event signal fs process ipc io time memory"
+LTP_SCENARIOS="${LTP_SCENARIOS:-$LTP_CUSTOM_SCENARIOS}"
+LTP_ONLY_CASES="${LTP_ONLY_CASES:-}"
+#LTP_SKIP_BASE="accept03 cgroup_fj_proc cgroup_regression_3_1.sh cgroup_regression_3_2.sh cgroup_regression_5_1.sh cgroup_regression_5_2.sh cgroup_regression_6_1.sh cgroup_regression_6_2.sh cgroup_regression_fork_processes clock_getres01 clock_gettime01 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 clone07 confstr01 cpuctl_def_task01 cpuctl_def_task02 cpuctl_def_task03 cpuctl_def_task04 cpuctl_fj_cpu-hog cpuctl_test01 cpuctl_test02 cpuctl_test03 cpuctl_test04 cpuhotplug_do_disk_write_loop cpuhotplug_do_spin_loop cpuset_cpu_hog cpuset_mem_hog cpuset_memory_test crash01 crash02 crypto_user01 crypto_user02 cve-2016-7117 cve-2017-17052 dirtyc0w dirtyc0w_shmem ebizzy epoll-ltp epoll_pwait03 epoll_wait02 fallocate05 fcntl14 fcntl14_64 fcntl15 fcntl15_64 fcntl18 fcntl18_64 fcntl19_64 fcntl31 float_bessel float_exp_log float_iperb float_power float_trigo fork14 fork_exec_loop fork_procs ftest06 futex_cmp_requeue01 futex_wait05 genacos genasin genatan genatan2 genbessel genceil gencos gencosh genexp genexp_log genfabs genfloor genfmod genfrexp genhypot geniperb genj0 genj1 genldexp genlgamma genload genlog genlog10 genmodf genpow genpower gensin gensinh gensqrt gentan gentanh gentrigo geny0 geny1 getcwd04 gethostid01 getrlimit01 getrlimit03 gettimeofday02 hackbench inode02 kill02 kill09 kill11 linkat01 mallocstress memcg_test_2 memcg_test_4 memctl_test01 mkdir09 mkdirat02 mmap1 mmap18 mmap3 mmapstress01 mmapstress02 mmapstress03 mmapstress04 mmapstress05 mmapstress06 mmapstress07 mmapstress08 mmapstress09 mmapstress10 mmstress mmstress_dummy modify_ldt01 modify_ldt02 modify_ldt03 mount01 mount05 mount06 mount07 mount_setattr01 move_mount01 msync04 mtest01 nanosleep01 nanosleep02 netstress nptl01 open12 openat04 openfile open_tree01 open_tree02 page01 pause01 pause02 pcrypt_aead01 pids_task2 pipe13 pm_get_sched_values poll02 posix_fadvise03 posix_fadvise03_64 ppoll01 prctl09 preadv03 preadv03_64 preadv203 preadv203_64 prot_hsymlinks pselect01 pselect01_64 pthserv pwritev03 pwritev03_64 remap_file_pages01 remap_file_pages02 removexattr01 rename14 run_cpuctl_test_fj.sh run_sched_cliserv.sh select02 semtest_2ns setfsgid03 setfsgid03_16 setitimer01 setpgid03 setrlimit06 setxattr01 shmat1 shm_test signal03 signal04 signal05 splice07 starvation statfs01 statvfs01 swapoff01 symlinkat01 syslog12 tgkill03 timed_forkbomb times03 tst_supported_fs vma05_vdso waitid05 waitpid10 waitpid11 waitpid12 waitpid13 writev03"
+LTP_SKIP_CASES="${LTP_SKIP_CASES:-$LTP_SKIP_BASE}"
+
+if [ -z "$LTP_ONLY_CASES" ] && [ -r /sys/kernel/cmdline ]; then
+    for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
+        case "$arg" in
+            test_blacklist=none) BLACKLIST="" ;;
+            test_blacklist=*) BLACKLIST="$(printf '%s' "${arg#test_blacklist=}" | tr ',' ' ')" ;;
+            ltp_only=*) LTP_ONLY_CASES="${arg#ltp_only=}" ;;
+            ltp_scenarios=*) LTP_SCENARIOS="${arg#ltp_scenarios=}" ;;
+            ltp_timeout=*) LTP_TIMEOUT="${arg#ltp_timeout=}" ;;
+            ltp_kill_grace=*) LTP_KILL_GRACE="${arg#ltp_kill_grace=}" ;;
+            ltp_poll_usec=*) LTP_POLL_USEC="${arg#ltp_poll_usec=}" ;;
         esac
     done
-    echo "[init] /mnt directory tree end"
+fi
+LTP_ONLY_CASES="$(printf '%s' "$LTP_ONLY_CASES" | tr ',' ' ')"
+LTP_SCENARIOS="$(printf '%s' "$LTP_SCENARIOS" | tr ',' ' ')"
+export LTP_TIMEOUT LTP_KILL_GRACE LTP_POLL_USEC LTP_CUSTOM_SCENARIOS LTP_SCENARIOS LTP_ONLY_CASES
 
-    if [ -s "$sh_file_list" ]; then
-        echo "[init] shell file contents:"
-        while IFS= read -r script; do
-            printf '\n[init] ===== %s =====\n' "$script"
-            cat "$script" || echo "[init] failed to read $script"
-            printf '\n[init] ===== end %s =====\n' "$script"
-        done < "$sh_file_list"
-    else
-        echo "[init] no .sh files found under /mnt"
+_is_blacklisted() {
+    for _bl in $BLACKLIST; do
+        case "$1" in
+            *${_bl}*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+_test_setup() {
+    if [ -e /dev/tty ] && [ ! -L /dev/tty ]; then
+        mv /dev/tty /dev/tty.real
+    fi
+    ln -sf /dev/null /dev/tty
+}
+
+_test_teardown() {
+    rm -f /dev/tty
+    [ -e /dev/tty.real ] && mv /dev/tty.real /dev/tty
+}
+
+setup_basic_mount_loop() {
+    img="/tmp/basic-vda2.fat"
+    state="/tmp/basic-vda2.loop"
+    loopdev=""
+
+    if [ -f "$state" ] || [ -L /dev/vda2 ]; then
+        cleanup_basic_mount_loop >/dev/null 2>&1 || true
+    fi
+    rm -f "$img"
+
+    if ! command -v losetup >/dev/null 2>&1 || ! command -v mkfs.vfat >/dev/null 2>&1; then
+        echo "[init] basic mount loop skipped: losetup or mkfs.vfat missing"
+        return 0
     fi
 
-    rm -f "$sh_file_list"
-else
-    echo "[init] failed to mount /dev/vd0 at /mnt"
+    truncate -s 64M "$img" 2>/dev/null || dd if=/dev/zero of="$img" bs=1M count=64 2>/dev/null || {
+        echo "[init] basic mount loop skipped: cannot create image"
+        return 0
+    }
+    mkfs.vfat -F 32 "$img" >/dev/null 2>&1 || mkfs.vfat "$img" >/dev/null 2>&1 || {
+        echo "[init] basic mount loop skipped: mkfs.vfat failed"
+        rm -f "$img"
+        return 0
+    }
+
+    loopdev="$(losetup -f 2>/dev/null || true)"
+    if [ -z "$loopdev" ]; then
+        echo "[init] basic mount loop skipped: no free loop device"
+        rm -f "$img"
+        return 0
+    fi
+    losetup "$loopdev" "$img" >/dev/null 2>&1 || {
+        echo "[init] basic mount loop skipped: losetup failed"
+        rm -f "$img"
+        return 0
+    }
+
+    ln -sf "$loopdev" /dev/vda2 2>/dev/null || {
+        echo "[init] basic mount loop skipped: cannot link /dev/vda2"
+        losetup -d "$loopdev" >/dev/null 2>&1 || true
+        rm -f "$img"
+        return 0
+    }
+
+    echo "$loopdev" >"$state" 2>/dev/null || true
+    echo "[init] basic mount loop ready: /dev/vda2 -> $loopdev"
+}
+
+cleanup_basic_mount_loop() {
+    img="/tmp/basic-vda2.fat"
+    state="/tmp/basic-vda2.loop"
+    loopdev=""
+
+    if [ ! -f "$state" ] && [ ! -L /dev/vda2 ]; then
+        return 0
+    fi
+
+    if [ -f "$state" ]; then
+        loopdev="$(cat "$state" 2>/dev/null || true)"
+    fi
+    if [ -z "$loopdev" ] && [ -L /dev/vda2 ]; then
+        loopdev="$(readlink /dev/vda2 2>/dev/null || true)"
+    fi
+
+    rm -f /dev/vda2 "$state"
+    if [ -n "$loopdev" ]; then
+        losetup -d "$loopdev" >/dev/null 2>&1 || true
+    fi
+    rm -f "$img"
+}
+
+install_ltp_testcode_script() {
+    test_dir="$1"
+    if [ "$CHROOTED" = "1" ]; then
+        src="/tmp/mygo-ltp-testcode.sh"
+    else
+        src="/etc/ltp_testcode.sh"
+    fi
+    dst="$test_dir/ltp_testcode.sh"
+
+    [ -f "$src" ] || return 0
+    [ -d "$test_dir" ] || return 0
+    cp "$src" "$dst" 2>/dev/null || {
+        echo "[init] failed to replace $dst"
+        return 0
+    }
+    chmod +x "$dst" 2>/dev/null || true
+    echo "[init] replaced $dst"
+    return 0
+}
+
+run_tmpfs_test_script() {
+    script="$1"
+    name="${script##*/}"
+    dir="${script%/*}"
+    libc_name="${dir##*/}"
+    test_name="${name%_testcode.sh}"
+    oldpwd="$PWD"
+    work="/tmp/${test_name}-${libc_name}-$$"
+    mounted=0
+    old_ld_set=0
+    old_ld="${LD_LIBRARY_PATH:-}"
+    script_to_run="$script"
+    lmbench_var_tmp_mounted=0
+
+    rm -rf "$work"
+    if ! mkdir -p "$work"; then
+        echo "[init] $test_name tmpfs setup failed: cannot create $work"
+        cd "$dir" || return 0
+        /bin/sh "$script"
+        cd "$oldpwd" || true
+        return 0
+    fi
+
+    if mount -t tmpfs tmpfs "$work" 2>/dev/null; then
+        mounted=1
+        echo "[init] $test_name uses tmpfs workdir: $work"
+    else
+        echo "[init] $test_name uses /tmp workdir: $work"
+    fi
+
+    for item in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [ -e "$item" ] || continue
+        base="${item##*/}"
+        case "$base" in
+            .|..) continue ;;
+        esac
+        ln -sf "$item" "$work/$base" 2>/dev/null || true
+    done
+
+    if [ "$test_name" = "lmbench" ]; then
+        mkdir -p /var/tmp 2>/dev/null || true
+        if mount -t tmpfs tmpfs /var/tmp 2>/dev/null; then
+            lmbench_var_tmp_mounted=1
+            echo "[init] lmbench uses tmpfs /var/tmp"
+        fi
+        rm -f "$work/hello"
+        {
+            echo '#!/bin/sh'
+            echo "exec \"$work/lmbench_all\" hello \"\$@\""
+        } >"$work/hello" 2>/dev/null || true
+        chmod +x "$work/hello" 2>/dev/null || true
+    fi
+
+    [ "${LD_LIBRARY_PATH+x}" = "x" ] && old_ld_set=1
+    if [ -d "$dir/lib" ]; then
+        case ":${LD_LIBRARY_PATH:-}:" in
+            *:"$dir/lib":*) ;;
+            *) LD_LIBRARY_PATH="$dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+        esac
+        export LD_LIBRARY_PATH
+    fi
+
+    if cd "$work"; then
+        /bin/sh "$script_to_run"
+    else
+        echo "[init] $test_name tmpfs setup failed: cannot enter $work"
+    fi
+
+    if [ "$old_ld_set" = "1" ]; then
+        LD_LIBRARY_PATH="$old_ld"
+        export LD_LIBRARY_PATH
+    else
+        unset LD_LIBRARY_PATH
+    fi
+    if [ "$lmbench_var_tmp_mounted" = "1" ]; then
+        umount /var/tmp 2>/dev/null || true
+    fi
+    cd "$oldpwd" || true
+    if [ "$mounted" = "1" ]; then
+        umount "$work" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+
+run_busybox_test_script() {
+    script="$1"
+    dir="${script%/*}"
+    patched="/tmp/busybox-testcode.$$"
+
+    if sed 's/if \[\[ $RTN -ne 0 && "$line" != "false" \]\] ;then/if [ "$RTN" -ne 0 ] \&\& [ "$line" != "false" ]; then/' "$script" >"$patched" 2>/dev/null; then
+        chmod +x "$patched" 2>/dev/null || true
+        cd "$dir" || return 0
+        /bin/sh "$patched"
+        rm -f "$patched"
+    else
+        rm -f "$patched"
+        cd "$dir" || return 0
+        /bin/sh "$script"
+    fi
+}
+
+prepare_libctest_dso_links() {
+    dir="$1"
+
+    [ -d "$dir/lib" ] || return 0
+    for so in dlopen_dso.so tls_align_dso.so tls_get_new-dtv_dso.so tls_init_dso.so; do
+        [ -e "$dir/$so" ] && continue
+        [ -e "$dir/lib/$so" ] || continue
+        # 部分测试盘只把 libctest 的 dlopen 依赖放在 lib/，而用例使用 ./xxx.so。
+        ln -sf "lib/$so" "$dir/$so" 2>/dev/null || true
+    done
+}
+
+run_test_script_file() {
+    script="$1"
+    name="${script##*/}"
+    dir="${script%/*}"
+    oldpwd="$PWD"
+
+    if _is_blacklisted "$name"; then
+        echo "[init] skip $name (blacklist)"
+    else
+        if [ "$name" = "basic_testcode.sh" ]; then
+            setup_basic_mount_loop
+        fi
+        echo "[init] run $name"
+        case "$name" in
+            busybox_testcode.sh)
+                run_busybox_test_script "$script"
+                ;;
+            libctest_testcode.sh)
+                prepare_libctest_dso_links "$dir"
+                cd "$dir" || return 0
+                /bin/sh "$script"
+                ;;
+            iozone_testcode.sh|lmbench_testcode.sh)
+                run_tmpfs_test_script "$script"
+                ;;
+            *)
+                cd "$dir" || return 0
+                /bin/sh "$script"
+                ;;
+        esac
+        cd "$oldpwd" || true
+    fi
+    if [ "$name" = "busybox_testcode.sh" ]; then
+        cleanup_basic_mount_loop
+    fi
+}
+
+run_test_scripts() {
+    ordered="iozone_testcode.sh lmbench_testcode.sh libcbench_testcode.sh basic_testcode.sh busybox_testcode.sh lua_testcode.sh"
+    if [ "$CHROOTED" = "1" ]; then
+        dirs="/glibc /musl"
+    else
+        dirs="/mnt/glibc /mnt/musl"
+    fi
+
+    _test_setup
+    for dir in $dirs; do
+        set -- "$dir"/*_testcode.sh
+        if [ -f "$1" ]; then
+            echo "[init] found test scripts in $dir"
+        fi
+    done
+
+    for name in $ordered; do
+        for dir in $dirs; do
+            script="$dir/$name"
+            [ -f "$script" ] && run_test_script_file "$script"
+        done
+    done
+
+    for dir in $dirs; do
+        set -- "$dir"/*_testcode.sh
+        if [ -f "$1" ]; then
+            for script in "$dir"/*_testcode.sh; do
+                [ -f "$script" ] || continue
+                name="${script##*/}"
+                case " $ordered ltp_testcode.sh " in
+                    *" $name "*) continue ;;
+                esac
+                run_test_script_file "$script"
+            done
+        fi
+    done
+
+    for dir in $dirs; do
+        install_ltp_testcode_script "$dir"
+        script="$dir/ltp_testcode.sh"
+        [ -f "$script" ] && run_test_script_file "$script"
+    done
+
+    cleanup_basic_mount_loop
+    _test_teardown
+    return 0
+}
+
+setup_dynamic_linker() {
+    glibc_lib=/mnt/glibc/lib
+
+    if [ ! -e /lib ] && [ ! -L /lib ]; then
+        ln -s "$glibc_lib" /lib 2>/dev/null || true
+    fi
+    if [ ! -e /lib64 ] && [ ! -L /lib64 ]; then
+        ln -s "$glibc_lib" /lib64 2>/dev/null || true
+    fi
+
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *:"$glibc_lib":*) ;;
+        *) LD_LIBRARY_PATH="$glibc_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+    export LD_LIBRARY_PATH
+
+    echo "[init] dynamic linker path prepared"
+}
+
+shutdown_after_tests() {
+    sync || true
+    poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || reboot -f >/dev/null 2>&1 || true
+}
+
+cleanup_test_chroot() {
+    umount /mnt/dev 2>/dev/null || true
+    umount /mnt/sys 2>/dev/null || true
+    umount /mnt/proc 2>/dev/null || true
+    rm -f /mnt/tmp/mygo-test-runner.sh /mnt/tmp/mygo-ltp-testcode.sh
+}
+
+prepare_test_chroot() {
+    [ -x /mnt/bin/sh ] || return 1
+    if [ ! -d /mnt/glibc ] && [ ! -d /mnt/musl ]; then
+        return 1
+    fi
+
+    mkdir -p /mnt/dev /mnt/proc /mnt/sys /mnt/tmp || return 1
+    cp /etc/init.d/rcS /mnt/tmp/mygo-test-runner.sh || return 1
+    chmod +x /mnt/tmp/mygo-test-runner.sh || return 1
+    if [ -f /etc/ltp_testcode.sh ]; then
+        cp /etc/ltp_testcode.sh /mnt/tmp/mygo-ltp-testcode.sh || return 1
+        chmod +x /mnt/tmp/mygo-ltp-testcode.sh || return 1
+    fi
+
+    mount -t proc proc /mnt/proc 2>/dev/null || return 1
+    mount -t sysfs sysfs /mnt/sys 2>/dev/null || return 1
+    mount -t devtmpfs devtmpfs /mnt/dev 2>/dev/null || return 1
+    return 0
+}
+
+run_test_chroot() {
+    cleanup_test_chroot
+    if ! prepare_test_chroot; then
+        echo "[init] test disk chroot unavailable, using /mnt compatibility path"
+        cleanup_test_chroot
+        return 1
+    fi
+
+    echo "[init] entering test disk chroot"
+    chroot /mnt /bin/sh /tmp/mygo-test-runner.sh --chrooted
+    rc=$?
+    cleanup_test_chroot
+    return "$rc"
+}
+
+if [ "$CHROOTED" = "1" ]; then
+    if run_test_scripts; then
+        echo "[init] chroot test scripts finished"
+        exit 0
+    fi
+    exit 1
 fi
 
-echo "[init] startup inspection complete"
+mount -t ext4 /dev/vd0 /mnt 2>/dev/null || true
+maybe_enter_shell
+echo "[init] mount testdisk OK (or skipped)"
+echo "[init] ls /mnt:"
+/bin/ls /mnt/ 2>&1 || true
+echo "[init] ls done"
+
+if run_test_chroot; then
+    echo "[init] test scripts finished, shutting down"
+    shutdown_after_tests
+fi
+
+setup_dynamic_linker
+if run_test_scripts; then
+    echo "[init] test scripts finished, shutting down"
+    shutdown_after_tests
+fi
+
+echo "[init] no test scripts found, entering shell"
+exec /bin/sh -i

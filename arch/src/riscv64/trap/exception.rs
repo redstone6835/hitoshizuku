@@ -242,6 +242,7 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
     if code == IRQ_S_TIMER {
         // Timer 必须先重装 compare，否则 sret 后会立刻再次陷入。
         let now_ticks = time::rearm_periodic_timer();
+        general::dev::irq::record_timer_interrupt();
         let now_ns = time::stable_counter_to_ns(now_ticks);
         let _ = general::elm_guard::request_timeout_if_expired(now_ns);
         if !from_user {
