@@ -40,6 +40,7 @@ use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
+static FILE_MAX: AtomicU64 = AtomicU64::new(i64::MAX as u64);
 
 const ROOT_INO: u64 = 1;
 const FILESYSTEMS_INO: u64 = 2;
@@ -61,6 +62,9 @@ const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
+const INTERRUPTS_INO: u64 = 21;
+const SYS_FS_INO: u64 = 22;
+const SYS_FILE_MAX_INO: u64 = 23;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -205,6 +209,7 @@ enum RootFileKind {
     MemInfo,
     Uptime,
     Stat,
+    Interrupts,
     Devices,
     Pnp,
     DeviceFunctions,
@@ -228,6 +233,7 @@ enum ProcFileKind {
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
     SysPidMax,
+    SysFileMax,
 }
 
 #[derive(Clone, Copy)]
@@ -337,6 +343,10 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("meminfo", mk_root_file(MEMINFO_INO, RootFileKind::MemInfo)),
         ("uptime", mk_root_file(UPTIME_INO, RootFileKind::Uptime)),
         ("stat", mk_root_file(STAT_INO, RootFileKind::Stat)),
+        (
+            "interrupts",
+            mk_root_file(INTERRUPTS_INO, RootFileKind::Interrupts),
+        ),
         ("devices", mk_root_file(DEVICES_INO, RootFileKind::Devices)),
         ("pnp", mk_root_file(PNP_INO, RootFileKind::Pnp)),
         (
@@ -880,6 +890,65 @@ impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
+            "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_KERNEL_INO,
+                    name: SmallStr::new("kernel"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_FS_INO,
+                    name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+            ],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_fs_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysFsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysFsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysFsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "file-max" => Ok(proc_sys_file_max_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -892,9 +961,9 @@ impl InodeOps for ProcSysDirOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
             snapshot: vec![DirEntry {
-                ino: SYS_KERNEL_INO,
-                name: SmallStr::new("kernel"),
-                kind: FileType::Directory,
+                ino: SYS_FILE_MAX_INO,
+                name: SmallStr::new("file-max"),
+                kind: FileType::Regular,
             }],
         }))
     }
@@ -902,6 +971,7 @@ impl InodeOps for ProcSysDirOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -990,6 +1060,20 @@ fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPidMax,
+        }),
+    )
+}
+
+fn proc_sys_file_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FILE_MAX_INO,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysFileMax,
         }),
     )
 }
@@ -1550,6 +1634,8 @@ impl InodeOps for ProcRegularInodeOps {
                 Ok(())
             }
             ProcFileKind::SysHotplug => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysFileMax if size == 0 => Ok(()),
+            ProcFileKind::SysFileMax => Err(VfsError::InvalidArgument),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -1584,6 +1670,14 @@ impl FileOps for ProcRegularFile {
                 let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
                 let trimmed = text.trim_end_matches(|ch| ch == '\n' || ch == '\0');
                 *HOTPLUG_PATH.lock() = String::from(trimmed);
+                Ok(buf.len())
+            }
+            ProcFileKind::SysFileMax => {
+                if offset != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let value = vfs::sysctl::parse_nonnegative_long(buf)?;
+                FILE_MAX.store(value, Ordering::Relaxed);
                 Ok(buf.len())
             }
             _ => Err(VfsError::ReadOnlyFilesystem),
@@ -1629,6 +1723,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::MemInfo => render_meminfo().into_bytes(),
             RootFileKind::Uptime => render_uptime().into_bytes(),
             RootFileKind::Stat => render_stat().into_bytes(),
+            RootFileKind::Interrupts => render_interrupts().into_bytes(),
             RootFileKind::Devices => render_devices().into_bytes(),
             RootFileKind::Pnp => render_pnp().into_bytes(),
             RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
@@ -1649,6 +1744,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysFileMax => Ok(render_file_max().into_bytes()),
     }
 }
 
@@ -2070,6 +2166,10 @@ fn render_pid_max() -> String {
     format!("{}\n", sched::pid::DEFAULT_PID_MAX)
 }
 
+fn render_file_max() -> String {
+    format!("{}\n", FILE_MAX.load(Ordering::Relaxed))
+}
+
 fn render_filesystems() -> String {
     let mut out = String::new();
     for entry in FS_REGISTRY.iter() {
@@ -2489,6 +2589,52 @@ fn render_stat() -> String {
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
         processes, running, blocked
     )
+}
+
+fn render_interrupts() -> String {
+    let mut online_mask = sched::online_cpu_mask();
+    if online_mask == 0 {
+        online_mask = 1;
+    }
+    let mut out = String::new();
+    out.push_str("           ");
+    for cpu in 0..sched::NR_CPUS {
+        if online_mask & (1u64 << cpu) != 0 {
+            let _ = write!(out, "CPU{cpu:>7}");
+        }
+    }
+    out.push('\n');
+
+    let timer_counts = crate::dev::irq::timer_interrupt_counts();
+    let _ = write!(out, "  0:");
+    for cpu in 0..sched::NR_CPUS {
+        if online_mask & (1u64 << cpu) != 0 {
+            let _ = write!(out, " {:>10}", timer_counts[cpu]);
+        }
+    }
+    out.push_str("  timer\n");
+
+    for entry in crate::dev::irq::snapshot_irq_lines() {
+        let _ = write!(out, "{:>3}:", entry.proc_irq);
+        for cpu in 0..sched::NR_CPUS {
+            if online_mask & (1u64 << cpu) != 0 {
+                let _ = write!(out, " {:>10}", entry.counts[cpu]);
+            }
+        }
+        if entry.owners.is_empty() {
+            let _ = write!(out, "  {:?}", entry.line);
+        } else {
+            out.push_str("  ");
+            for (index, owner) in entry.owners.iter().enumerate() {
+                if index != 0 {
+                    out.push(',');
+                }
+                out.push_str(owner);
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn render_devices() -> String {
