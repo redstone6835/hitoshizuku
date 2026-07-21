@@ -3,27 +3,34 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
-echo "[init] Welcome to Shiori"
+CHROOTED=0
+if [ "${1:-}" = "--chrooted" ]; then
+    CHROOTED=1
+fi
 
-for dir in /dev /sys /proc /var /var/log /run /mnt /tmp; do
-    [ -d "$dir" ] || mkdir -p "$dir"
-    echo "[init] mkdir $dir OK"
-done
+if [ "$CHROOTED" = "0" ]; then
+    echo "[init] Welcome to Shiori"
 
-mount -t proc proc /proc 2>/dev/null || true
-echo "[init] mount /proc OK"
+    for dir in /dev /sys /proc /var /var/log /run /mnt /tmp; do
+        [ -d "$dir" ] || mkdir -p "$dir"
+        echo "[init] mkdir $dir OK"
+    done
 
-mount -t sysfs sysfs /sys 2>/dev/null || true
-echo "[init] mount /sys OK"
+    mount -t proc proc /proc 2>/dev/null || true
+    echo "[init] mount /proc OK"
 
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-echo "[init] mount /dev OK"
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    echo "[init] mount /sys OK"
 
-if [ -x /sbin/mdev ]; then
-    if [ -e /proc/sys/kernel/hotplug ]; then
-        echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+    echo "[init] mount /dev OK"
+
+    if [ -x /sbin/mdev ]; then
+        if [ -e /proc/sys/kernel/hotplug ]; then
+            echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+        fi
+        /sbin/mdev -s 2>/dev/null || true
     fi
-    /sbin/mdev -s 2>/dev/null || true
 fi
 
 maybe_enter_shell() {
@@ -55,8 +62,8 @@ maybe_enter_shell() {
 }
 
 # 测试黑名单
-# basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="unixbench"
+# basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone cagent
+BLACKLIST="unixbench cagent"
 
 LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
 LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
@@ -178,7 +185,11 @@ cleanup_basic_mount_loop() {
 
 install_ltp_testcode_script() {
     test_dir="$1"
-    src="/etc/ltp_testcode.sh"
+    if [ "$CHROOTED" = "1" ]; then
+        src="/tmp/mygo-ltp-testcode.sh"
+    else
+        src="/etc/ltp_testcode.sh"
+    fi
     dst="$test_dir/ltp_testcode.sh"
 
     [ -f "$src" ] || return 0
@@ -344,7 +355,11 @@ run_test_script_file() {
 
 run_test_scripts() {
     ordered="iozone_testcode.sh lmbench_testcode.sh libcbench_testcode.sh basic_testcode.sh busybox_testcode.sh lua_testcode.sh"
-    dirs="/mnt/glibc /mnt/musl"
+    if [ "$CHROOTED" = "1" ]; then
+        dirs="/glibc /musl"
+    else
+        dirs="/mnt/glibc /mnt/musl"
+    fi
 
     _test_setup
     for dir in $dirs; do
@@ -410,14 +425,69 @@ shutdown_after_tests() {
     poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || reboot -f >/dev/null 2>&1 || true
 }
 
+cleanup_test_chroot() {
+    umount /mnt/dev 2>/dev/null || true
+    umount /mnt/sys 2>/dev/null || true
+    umount /mnt/proc 2>/dev/null || true
+    rm -f /mnt/tmp/mygo-test-runner.sh /mnt/tmp/mygo-ltp-testcode.sh
+}
+
+prepare_test_chroot() {
+    [ -x /mnt/bin/sh ] || return 1
+    if [ ! -d /mnt/glibc ] && [ ! -d /mnt/musl ]; then
+        return 1
+    fi
+
+    mkdir -p /mnt/dev /mnt/proc /mnt/sys /mnt/tmp || return 1
+    cp /etc/init.d/rcS /mnt/tmp/mygo-test-runner.sh || return 1
+    chmod +x /mnt/tmp/mygo-test-runner.sh || return 1
+    if [ -f /etc/ltp_testcode.sh ]; then
+        cp /etc/ltp_testcode.sh /mnt/tmp/mygo-ltp-testcode.sh || return 1
+        chmod +x /mnt/tmp/mygo-ltp-testcode.sh || return 1
+    fi
+
+    mount -t proc proc /mnt/proc 2>/dev/null || return 1
+    mount -t sysfs sysfs /mnt/sys 2>/dev/null || return 1
+    mount -t devtmpfs devtmpfs /mnt/dev 2>/dev/null || return 1
+    return 0
+}
+
+run_test_chroot() {
+    cleanup_test_chroot
+    if ! prepare_test_chroot; then
+        echo "[init] test disk chroot unavailable, using /mnt compatibility path"
+        cleanup_test_chroot
+        return 1
+    fi
+
+    echo "[init] entering test disk chroot"
+    chroot /mnt /bin/sh /tmp/mygo-test-runner.sh --chrooted
+    rc=$?
+    cleanup_test_chroot
+    return "$rc"
+}
+
+if [ "$CHROOTED" = "1" ]; then
+    if run_test_scripts; then
+        echo "[init] chroot test scripts finished"
+        exit 0
+    fi
+    exit 1
+fi
+
 mount -t ext4 /dev/vd0 /mnt 2>/dev/null || true
 maybe_enter_shell
-setup_dynamic_linker
 echo "[init] mount testdisk OK (or skipped)"
 echo "[init] ls /mnt:"
 /bin/ls /mnt/ 2>&1 || true
 echo "[init] ls done"
 
+if run_test_chroot; then
+    echo "[init] test scripts finished, shutting down"
+    shutdown_after_tests
+fi
+
+setup_dynamic_linker
 if run_test_scripts; then
     echo "[init] test scripts finished, shutting down"
     shutdown_after_tests

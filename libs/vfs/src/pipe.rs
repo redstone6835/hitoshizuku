@@ -19,6 +19,7 @@ use crate::vfs::superblock::{InodeCache, Superblock, SuperblockOps};
 use crate::vfs::sync::Spinlock;
 
 const PIPE_CAPACITY: usize = 65536;
+const PIPE_BUF: usize = 4096;
 
 struct PipeInner {
     data: Vec<u8>,
@@ -61,9 +62,18 @@ impl Pipe {
         PIPE_CAPACITY.saturating_sub(self.available(inner))
     }
 
+    fn writable_len(requested: usize, free: usize) -> usize {
+        // 不超过 PIPE_BUF 的写入必须保持原子性，空间不足时整次等待。
+        if requested <= PIPE_BUF && free < requested {
+            0
+        } else {
+            requested.min(free)
+        }
+    }
+
     fn write_data(&self, inner: &mut PipeInner, src: &[u8]) -> usize {
         let free = self.free_space(inner);
-        let n = src.len().min(free);
+        let n = Self::writable_len(src.len(), free);
         if n == 0 {
             return 0;
         }
@@ -265,9 +275,8 @@ impl FileOps for PipeReadWriteEnd {
         if inner.reader_count == 0 {
             return Err(VfsError::BrokenPipe);
         }
-        let free = self.pipe.free_space(&inner);
-        if free > 0 {
-            let n = self.pipe.write_data(&mut inner, buf);
+        let n = self.pipe.write_data(&mut inner, buf);
+        if n > 0 {
             drop(inner);
             self.pipe.read_wait.wake_one_default();
             return Ok(n);
@@ -293,7 +302,7 @@ impl FileOps for PipeReadWriteEnd {
         if self.pipe.available(&inner) > 0 {
             ready = ready.with(PollEvents::POLLIN);
         }
-        if self.pipe.free_space(&inner) > 0 {
+        if self.pipe.free_space(&inner) >= PIPE_BUF {
             ready = ready.with(PollEvents::POLLOUT);
         }
         if inner.writer_count == 0 {
@@ -362,9 +371,8 @@ impl FileOps for PipeWriteEnd {
         if inner.reader_count == 0 {
             return Err(VfsError::BrokenPipe);
         }
-        let free = self.pipe.free_space(&inner);
-        if free > 0 {
-            let n = self.pipe.write_data(&mut inner, buf);
+        let n = self.pipe.write_data(&mut inner, buf);
+        if n > 0 {
             drop(inner);
             // 写入后只需要一个读者消费新数据，避免 lmbench pipe 场景
             // 中把所有等待任务同时推回 runqueue 造成惊群。
@@ -389,7 +397,7 @@ impl FileOps for PipeWriteEnd {
     fn poll(&self, interest: PollEvents) -> PollEvents {
         let inner = self.pipe.inner.lock();
         let mut ready = PollEvents::default();
-        if self.pipe.free_space(&inner) > 0 {
+        if self.pipe.free_space(&inner) >= PIPE_BUF {
             ready = ready.with(PollEvents::POLLOUT);
         }
         if inner.reader_count == 0 {
@@ -593,4 +601,41 @@ pub fn new_pipe(cred: Arc<Credentials>, nonblock: bool) -> VfsResult<(Arc<File>,
     mount.inc_open();
 
     Ok((Arc::new(read_end), Arc::new(write_end)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_write_waits_for_enough_space() {
+        let pipe = Pipe::new();
+        let mut inner = pipe.inner.lock();
+        inner.write_pos = PIPE_CAPACITY - PIPE_BUF + 1;
+        let before = inner.write_pos;
+
+        assert_eq!(pipe.write_data(&mut inner, &[0u8; PIPE_BUF]), 0);
+        assert_eq!(inner.write_pos, before);
+    }
+
+    #[test]
+    fn small_write_is_written_in_one_piece() {
+        let pipe = Pipe::new();
+        let mut inner = pipe.inner.lock();
+        let src = [0x5au8; PIPE_BUF];
+
+        assert_eq!(pipe.write_data(&mut inner, &src), PIPE_BUF);
+        assert_eq!(inner.write_pos, PIPE_BUF);
+        assert_eq!(&inner.data[..PIPE_BUF], &src);
+    }
+
+    #[test]
+    fn large_write_can_use_partial_space() {
+        let pipe = Pipe::new();
+        let mut inner = pipe.inner.lock();
+        inner.write_pos = PIPE_CAPACITY - 10;
+
+        assert_eq!(pipe.write_data(&mut inner, &[0xa5u8; PIPE_BUF + 1]), 10);
+        assert_eq!(inner.write_pos, PIPE_CAPACITY);
+    }
 }
