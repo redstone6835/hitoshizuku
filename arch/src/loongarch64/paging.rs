@@ -439,15 +439,34 @@ impl LoongArch64Paging {
     /// - 正式页表准备好后切到 `DA=0, PG=1`，让普通虚拟地址走页表翻译；
     /// - 切换之后立即刷新 TLB，避免旧翻译继续被命中。
     ///
-    /// 另外，LoongArch64 把偶地址和奇地址空间页目录根拆成 `PGDL/PGDH` 两个 CSR。
-    /// 当前内核还没有实现双根策略，因此这里暂时写入同一个根。
+    /// 该兼容入口把低半区和高半区都绑定到同一个根。用户地址空间应调用
+    /// [`Self::activate_with_asid_roots`]，让私有用户根与全局内核根保持分离。
     #[inline]
     pub unsafe fn activate_with_asid(root: PhysPageTableRoot, asid: usize) {
+        unsafe { Self::activate_with_asid_roots(root, root, asid) };
+    }
+
+    /// 使用独立的低半区和高半区页表根激活地址空间。
+    ///
+    /// LoongArch64 根据虚拟地址最高有效位选择 `PGDL` 或 `PGDH`。用户上下文将
+    /// `low_root` 设为进程私有根、`high_root` 设为全局内核根，使运行期新增的内核堆
+    /// 映射立即出现在所有地址空间中，无需复制并维护每个用户 PGD 的高半区目录项。
+    ///
+    /// # Safety
+    ///
+    /// 两个根都必须指向遵循当前 `PWCL/PWCH` 配置的有效页表，`asid` 必须与
+    /// `low_root` 所属地址空间匹配。调用期间必须处于允许切换当前地址空间的边界。
+    #[inline]
+    pub unsafe fn activate_with_asid_roots(
+        low_root: PhysPageTableRoot,
+        high_root: PhysPageTableRoot,
+        asid: usize,
+    ) {
         Self::page_table_barrier();
         // 注意：LoongArch 的 csrwr/csrxchg 会把旧 CSR 值写回 rd。
         // 因此每条写 CSR 指令都使用独立 rd 输入并声明为 inout，避免寄存器污染。
-        let pgdl = root.as_usize();
-        let pgdh = root.as_usize();
+        let pgdl = low_root.as_usize();
+        let pgdh = high_root.as_usize();
         let asid_val = asid_bits(asid);
         let asid_mask = CSR_ASID_ASID_MASK;
         let pwcl = Self::page_walk_pwcl();
@@ -456,7 +475,7 @@ impl LoongArch64Paging {
         let mut crmd: usize;
         unsafe {
             core::arch::asm!(
-                // 写入偶/奇地址空间页全局目录根。
+                // 分别写入低半区和高半区页全局目录根。
                 "csrwr {pgdl}, {csr_pgdl}",
                 "csrwr {pgdh}, {csr_pgdh}",
                 // 仅交换 CSR_ASID 的 ASID 域。
@@ -508,11 +527,29 @@ impl LoongArch64Paging {
     ///
     /// 调用者必须保证对应页表修改已完成，且该 ASID 与目标地址空间一致。
     ///
-    /// 当前 `heap_vm` 多数时候采用全局刷新，这是更保守的实现策略；如果以后把 VM
-    /// 粒度做细，这个接口也足够承载按 ASID、按虚拟地址的精确失效。
+    /// `heap_vm` 在撤销映射和收紧权限后采用该同步接口；新映射使用本核发布加缺页
+    /// 代次收敛，不在任意 allocator 调用方锁内等待远端 CPU。
     #[inline]
     pub unsafe fn flush_tlb_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
         crate::loongarch64::smp::flush_tlb_all_cpus(asid, vaddr.map(VirtAddr::as_usize));
+    }
+
+    /// 仅在指定逻辑 CPU 集合上同步失效该 ASID 的 TLB。
+    ///
+    /// 当前 CPU 始终执行本地失效；`targets` 只约束远端通知。调用方通常传入地址
+    /// 空间生命周期内单调增长的激活 CPU 位图，使从未运行过该地址空间的 CPU 不会
+    /// 阻塞页表更新。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证 `targets` 包含所有可能缓存过该 ASID translation 的 CPU。
+    #[inline]
+    pub unsafe fn flush_tlb_with_asid_on_cpus(
+        asid: usize,
+        vaddr: Option<VirtAddr>,
+        targets: usize,
+    ) {
+        crate::loongarch64::smp::flush_tlb_on_cpus(asid, vaddr.map(VirtAddr::as_usize), targets);
     }
 
     /// 使用当前 CSR_ASID 同步刷新所有在线 CPU 的 TLB。
