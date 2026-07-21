@@ -51,6 +51,14 @@ fn insert_overlapping_returns_eexist() {
     assert_eq!(vmas.insert(anon_area(0x2000, 0x4000)), Err(Errno::EEXIST));
 }
 
+/// 新 VMA 仅与后继相交时也必须拒绝，覆盖局部重叠检查的右侧分支。
+#[ktest]
+fn insert_overlapping_successor_returns_eexist() {
+    let mut vmas = VmaSet::new();
+    vmas.insert(anon_area(0x3000, 0x5000)).unwrap();
+    assert_eq!(vmas.insert(anon_area(0x2000, 0x4000)), Err(Errno::EEXIST));
+}
+
 /// 插入空 range（start >= end）返回 EINVAL。
 #[ktest]
 fn insert_empty_range_returns_einval() {
@@ -139,6 +147,61 @@ fn merge_neighbors_compatible() {
     vmas.insert(anon_area(0x2000, 0x3000)).unwrap();
     assert_eq!(vmas.len(), 1);
     assert_eq!(vmas.find(0x1500).unwrap().range, 0x1000..0x3000);
+}
+
+/// 从左侧插入时只命中后继，也应完成局部合并。
+#[ktest]
+fn merge_neighbors_successor_only() {
+    let mut vmas = VmaSet::new();
+    vmas.insert(anon_area(0x2000, 0x3000)).unwrap();
+    vmas.insert(anon_area(0x1000, 0x2000)).unwrap();
+    assert_eq!(vmas.len(), 1);
+    assert_eq!(vmas.find(0x1800).unwrap().range, 0x1000..0x3000);
+}
+
+/// 显式全树规整仍应合并通过受限可变视图变为兼容的历史邻居。
+#[ktest]
+fn merge_neighbors_repairs_existing_compatible_pair() {
+    let mut vmas = VmaSet::new();
+    let expected = anon_area(0x1000, 0x2000).flags;
+    let mut right = anon_area(0x2000, 0x3000);
+    right.flags = VmFlags::from_bits(VmFlags::READ | VmFlags::USER);
+    vmas.insert(anon_area(0x1000, 0x2000)).unwrap();
+    vmas.insert(right).unwrap();
+    assert_eq!(vmas.len(), 2);
+
+    vmas.find_mut(0x2000).unwrap().set_flags(expected);
+    vmas.merge_neighbors();
+    assert_eq!(vmas.len(), 1);
+    assert_eq!(vmas.find(0x1800).unwrap().range, 0x1000..0x3000);
+}
+
+/// 共享匿名映射只有对象相同且 backing offset 连续时才允许合并。
+#[ktest]
+fn shared_anon_merge_requires_contiguous_offset() {
+    let object = Arc::new(SharedAnonObject::new());
+    let mut contiguous = VmaSet::new();
+    contiguous
+        .insert(shared_anon_area(0x1000, 0x2000, Arc::clone(&object), 0))
+        .unwrap();
+    contiguous
+        .insert(shared_anon_area(
+            0x2000,
+            0x3000,
+            Arc::clone(&object),
+            0x1000,
+        ))
+        .unwrap();
+    assert_eq!(contiguous.len(), 1);
+
+    let mut discontinuous = VmaSet::new();
+    discontinuous
+        .insert(shared_anon_area(0x1000, 0x2000, Arc::clone(&object), 0))
+        .unwrap();
+    discontinuous
+        .insert(shared_anon_area(0x2000, 0x3000, object, 0x2000))
+        .unwrap();
+    assert_eq!(discontinuous.len(), 2);
 }
 
 /// fork 的 VMA 元数据副本必须继续引用同一共享匿名对象，而不是只复制数值 ID。
