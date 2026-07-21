@@ -799,7 +799,25 @@ pub fn dispatch_interrupt(interrupt: Interrupt) -> bool {
     let Some(line) = IrqLine::from_interrupt(interrupt) else {
         return false;
     };
-    dispatch_irq_line(line)
+    #[cfg(feature = "performance-profile")]
+    let mut profile =
+        profiling::scope(profiling::Event::IrqDispatch).trace_args(profile_irq_line(line), 0);
+    let handled = dispatch_irq_line(line);
+    #[cfg(feature = "performance-profile")]
+    profile.set_trace_args(profile_irq_line(line), u64::from(handled));
+    handled
+}
+
+#[cfg(feature = "performance-profile")]
+fn profile_irq_line(line: IrqLine) -> u64 {
+    match line {
+        IrqLine::Ipi => 0,
+        IrqLine::Hardware(hwirq) => (1u64 << 56) | hwirq as u64,
+        IrqLine::Controller { controller, hwirq } => {
+            (2u64 << 56) | ((controller as u64) << 32) | hwirq as u64
+        }
+        IrqLine::Other(value) => (3u64 << 56) | value as u64,
+    }
 }
 
 /// 分发一条已经规范化的 IRQ line。

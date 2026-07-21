@@ -260,6 +260,11 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
     let interrupt = decode_interrupt(cause);
 
     if code == IRQ_S_TIMER {
+        #[cfg(feature = "performance-profile")]
+        {
+            let pc = unsafe { trap_frame_ref(tf_ptr) }.sepc;
+            profiling::sample_pc(pc, from_user);
+        }
         // Timer 必须先重装 compare，否则 sret 后会立刻再次陷入。
         let now_ticks = time::rearm_periodic_timer();
         general::dev::irq::record_timer_interrupt();

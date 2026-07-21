@@ -272,6 +272,8 @@ pub struct Bio {
     submitted_ns: u64,
     observer: Option<Arc<dyn BioCompletionObserver>>,
     completion: Option<BioCompletionSlot>,
+    #[cfg(feature = "performance-profile")]
+    profile_span_id: u64,
 }
 
 #[kernel_symbols::export]
@@ -305,6 +307,8 @@ impl Bio {
             submitted_ns,
             observer,
             completion: Some(Arc::clone(&completion)),
+            #[cfg(feature = "performance-profile")]
+            profile_span_id: profiling::current_span_id(),
         };
         (bio, completion)
     }
@@ -328,6 +332,8 @@ impl Bio {
             submitted_ns,
             observer,
             completion: Some(completion),
+            #[cfg(feature = "performance-profile")]
+            profile_span_id: profiling::current_span_id(),
         }
     }
 
@@ -349,6 +355,16 @@ impl Bio {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn complete(mut self, result: Result<(), BioIoError>) {
+        #[cfg(feature = "performance-profile")]
+        profiling::record_with_trace_args_and_span(
+            profiling::Event::BlockComplete,
+            0,
+            0,
+            0,
+            self.profile_span_id,
+            self.range.lba,
+            ((self.op as u64) << 32) | u64::from(self.range.blocks),
+        );
         if let Some(observer) = self.observer.as_ref() {
             observer.on_complete(
                 self.op,

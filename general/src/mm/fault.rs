@@ -60,6 +60,8 @@ pub enum KernelFaultReason {
 
 /// 由 arch trap handler 在 page-fault 分支调用。
 pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
+    #[cfg(feature = "performance-profile")]
+    let mut profile = profiling::scope(profiling::Event::PageFault);
     let Some(decoder) = fault_decode_ops() else {
         return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
     };
@@ -67,6 +69,11 @@ pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
     let from_user = (decoder.fault_from_user)(tf);
     let addr = (decoder.fault_addr)(tf);
     let kind = (decoder.fault_kind)(tf);
+    #[cfg(feature = "performance-profile")]
+    profile.set_trace_args(
+        addr as u64,
+        profile_fault_kind(kind) | (u64::from(from_user) << 63),
+    );
     if !from_user {
         // 内核态访问用户 buffer 时，也允许按当前进程 VMA 进行 lazy fault-in。
         if let Some(vm) = current_task_vm_space() {
@@ -87,6 +94,19 @@ pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
     };
     let outcome = vm.handle_fault(addr, kind);
     outcome
+}
+
+#[cfg(feature = "performance-profile")]
+const fn profile_fault_kind(kind: FaultKind) -> u64 {
+    match kind {
+        FaultKind::Load => 0,
+        FaultKind::Store => 1,
+        FaultKind::Exec => 2,
+        FaultKind::PermRead => 3,
+        FaultKind::PermWrite => 4,
+        FaultKind::PermExec => 5,
+        FaultKind::Privilege => 6,
+    }
 }
 
 /// 从当前 task 的 ext 表里取 VmSpace 的 Arc。需要 sched 已就绪。
