@@ -4517,10 +4517,12 @@ fn futex_wait_deadline(futex_op: u32, cmd: u32, timeout_user: usize) -> Result<O
     if cmd == FUTEX_WAIT {
         return Ok(Some(sched_now.saturating_add(timeout_ns)));
     }
-    let clock_id = if (futex_op & FUTEX_CLOCK_REALTIME) != 0 {
-        crate::vdso::CLOCK_REALTIME
-    } else {
-        crate::vdso::CLOCK_MONOTONIC
+    let clock_id = match cmd {
+        // Linux 的旧 PI ABI 固定把 timeout 解释为绝对 CLOCK_REALTIME；
+        // LOCK_PI2 才允许在 CLOCK_MONOTONIC 与 CLOCK_REALTIME 之间选择。
+        FUTEX_LOCK_PI | FUTEX_WAIT_REQUEUE_PI => crate::vdso::CLOCK_REALTIME,
+        _ if (futex_op & FUTEX_CLOCK_REALTIME) != 0 => crate::vdso::CLOCK_REALTIME,
+        _ => crate::vdso::CLOCK_MONOTONIC,
     };
     let clock_now = crate::vdso::clock_time_ns(clock_id).unwrap_or(sched_now);
     Ok(Some(if timeout_ns <= clock_now {

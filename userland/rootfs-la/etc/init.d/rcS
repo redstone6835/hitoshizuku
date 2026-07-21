@@ -20,6 +20,13 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+if [ -x /bin/pthread-smp-test ]; then
+    echo "[init][smp-tests] running pthread SMP tests"
+    /bin/pthread-smp-test
+    status=$?
+    echo "[init][smp-tests] pthread SMP tests exit=$status"
+fi
+
 if mount -t ext4 /dev/vd0 /mnt; then
     echo "[init] mounted /dev/vd0 at /mnt"
     sh_file_list="/tmp/init-sh-files.$$"
