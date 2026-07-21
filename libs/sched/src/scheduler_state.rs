@@ -30,6 +30,7 @@ pub struct CpuSchedState {
     retired: Spinlock<Vec<Arc<Task>>>,
     retired_nonempty: AtomicBool,
     need_resched: AtomicBool,
+    resched_notification_pending: AtomicBool,
     need_balance: AtomicBool,
     post_syscall_handoff: AtomicU8,
     enqueue_in_progress: AtomicUsize,
@@ -45,6 +46,7 @@ impl CpuSchedState {
             retired: Spinlock::new(Vec::new()),
             retired_nonempty: AtomicBool::new(false),
             need_resched: AtomicBool::new(false),
+            resched_notification_pending: AtomicBool::new(false),
             need_balance: AtomicBool::new(false),
             post_syscall_handoff: AtomicU8::new(0),
             enqueue_in_progress: AtomicUsize::new(0),
@@ -110,8 +112,27 @@ impl CpuSchedState {
         self.need_resched.store(true, Ordering::Release);
     }
 
+    /// 尝试取得一次远端调度通知的发送权。
+    ///
+    /// `need_resched` 可以在同一目标 CPU 真正处理前被多个生产者重复设置；这个
+    /// 独立状态只合并硬件 IPI，不改变调度请求本身。返回 `true` 的调用者负责
+    /// 实际发送通知。
+    pub(crate) fn claim_resched_notification(&self) -> bool {
+        !self
+            .resched_notification_pending
+            .swap(true, Ordering::AcqRel)
+    }
+
+    /// 清除已经消费或即将在本调度边界处理的远端通知状态。
+    pub(crate) fn clear_resched_notification(&self) {
+        self.resched_notification_pending
+            .store(false, Ordering::Release);
+    }
+
     pub fn take_resched(&self) -> bool {
-        self.need_resched.swap(false, Ordering::AcqRel)
+        let requested = self.need_resched.swap(false, Ordering::AcqRel);
+        self.clear_resched_notification();
+        requested
     }
 
     pub fn request_balance(&self) {
@@ -146,6 +167,7 @@ impl CpuSchedState {
 
     pub fn clear_scheduling_requests(&self) {
         self.need_resched.store(false, Ordering::Release);
+        self.clear_resched_notification();
         self.need_balance.store(false, Ordering::Release);
         self.post_syscall_handoff.store(0, Ordering::Release);
     }
