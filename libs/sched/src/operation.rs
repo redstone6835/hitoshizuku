@@ -310,7 +310,7 @@ pub fn sched_yield() -> Result<(), Errno> {
 /// `nice(inc)`：相对当前 nice 调整，结果钳到 [-20, 19]。返回新 nice 值。
 pub fn nice(inc: i32) -> Result<i32, Errno> {
     let me = current_task();
-    let cur_nice = me.sched.nice() as i32;
+    let cur_nice = me.pi_base_attr().nice as i32;
     let mut new_nice = cur_nice.saturating_add(inc);
     if new_nice < -20 {
         new_nice = -20;
@@ -362,6 +362,21 @@ pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), E
     })
 }
 
+/// 应用 PI 子系统已经计算出的有效调度属性。
+///
+/// 该入口不改写用户设置的基础属性，也不创建新的 Deadline 带宽 reservation；
+/// PI 解除后调用方必须再次传入 `Task::pi_remove_donation` 返回的属性。
+pub fn pi_apply_effective_attr(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
+    let owner = task_runqueue_cpu(task).unwrap_or_else(CpuId::boot).get();
+    let result = update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_sched_attr_raw(task, attr.normalized(), now_ns)
+    });
+    if result.is_ok() {
+        request_resched(owner);
+    }
+    result
+}
+
 fn update_task_sched_entity(
     task: &Arc<Task>,
     mut update: impl FnMut(usize, &Arc<Task>, u64) -> bool,
@@ -382,7 +397,7 @@ pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
 }
 
 pub fn sched_getattr_for_task(task: &Arc<Task>) -> SchedAttr {
-    task.sched.sched_attr()
+    task.pi_base_attr()
 }
 
 pub fn set_sched_reset_on_fork(pid: PidT, enabled: bool) -> Result<(), Errno> {
@@ -395,7 +410,7 @@ pub fn sched_reset_on_fork(pid: PidT) -> Result<bool, Errno> {
 }
 
 pub fn set_task_nice(task: &Arc<Task>, nice: i8) {
-    let mut attr = task.sched.sched_attr();
+    let mut attr = task.pi_base_attr();
     attr.nice = nice.clamp(crate::eevdf::NICE_MIN, crate::eevdf::NICE_MAX);
     let owner = task_runqueue_cpu(task).map_or(0, CpuId::get);
     runqueue_of(owner).update_sched_attr(task, attr, crate::scheduler::now_ns_public());

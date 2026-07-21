@@ -9,6 +9,7 @@ fn waiter(task: &Arc<Task>) -> FutexWaiter {
         task: Arc::downgrade(task),
         bitset: FUTEX_BITSET_MATCH_ANY,
         waitv_index: None,
+        pi_target: None,
         state: Arc::new(FutexWaitState::new()),
     }
 }
@@ -177,6 +178,7 @@ fn futex_wait_requeue_and_user_rmw_are_atomic() {
                     task: Weak::new(),
                     bitset: FUTEX_BITSET_MATCH_ANY,
                     waitv_index: None,
+                    pi_target: None,
                     state: Arc::new(FutexWaitState::new()),
                 },
                 waiter(&task),
@@ -198,5 +200,118 @@ fn futex_wait_requeue_and_user_rmw_are_atomic() {
     task.ext_remove(sched::TASKEXT_VM_SPACE);
     if let Some(saved_vm) = saved_vm {
         task.ext_install(sched::TASKEXT_VM_SPACE, saved_vm);
+    }
+}
+
+unsafe extern "C" fn pi_test_thread(_arg: usize) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[ktest]
+fn pi_requeue_donates_and_hands_lock_to_highest_priority_waiter() {
+    let owner = sched::current_task();
+    let saved_vm = owner.ext_remove(sched::TASKEXT_VM_SPACE);
+    let vm = Arc::new(VmSpace::new());
+    owner.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
+    let page_size = general::mm::page_size();
+    vm.map_anon(
+        PROBE..PROBE + page_size,
+        VmFlags::EMPTY
+            .with(VmFlags::READ)
+            .with(VmFlags::WRITE)
+            .with(VmFlags::USER),
+    )
+    .expect("PI futex 测试映射失败");
+
+    let fair = sched::kthread_create(pi_test_thread, 0, sched::SchedParams::default_fair());
+    let realtime = sched::kthread_create(pi_test_thread, 0, sched::SchedParams::default_fair());
+    fair.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
+    realtime.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
+    sched::operation::sched_setattr_for_task(&fair, SchedAttr::fair(-10, 0))
+        .expect("设置 fair waiter 属性失败");
+    sched::operation::sched_setattr_for_task(&realtime, SchedAttr::rt_fifo(80))
+        .expect("设置 RT waiter 属性失败");
+
+    let src_uaddr = PROBE;
+    let dst_uaddr = PROBE + 4;
+    let src = vm
+        .futex_key_for(src_uaddr, true)
+        .expect("PI requeue 源 key 失败");
+    let dst = vm
+        .futex_key_for(dst_uaddr, true)
+        .expect("PI requeue 目标 key 失败");
+    write_user_u32(src_uaddr, 7).expect("初始化 PI requeue 源字失败");
+    write_user_u32(dst_uaddr, owner.pid_root().expect("owner 无 pid") as u32)
+        .expect("初始化 PI owner 字失败");
+
+    let fair_state = Arc::new(FutexWaitState::new());
+    let rt_state = Arc::new(FutexWaitState::new());
+    {
+        let mut table = FUTEX_TABLE.lock();
+        table.insert(
+            src,
+            FutexBucket {
+                waiters: alloc::vec![
+                    FutexWaiter {
+                        task: Arc::downgrade(&fair),
+                        bitset: FUTEX_BITSET_MATCH_ANY,
+                        waitv_index: None,
+                        pi_target: Some((dst, dst_uaddr)),
+                        state: Arc::clone(&fair_state),
+                    },
+                    FutexWaiter {
+                        task: Arc::downgrade(&realtime),
+                        bitset: FUTEX_BITSET_MATCH_ANY,
+                        waitv_index: None,
+                        pi_target: Some((dst, dst_uaddr)),
+                        state: Arc::clone(&rt_state),
+                    },
+                ],
+            },
+        );
+    }
+
+    assert_eq!(
+        futex_cmp_requeue_pi(&owner, src_uaddr, 7, dst_uaddr, true, 1, 1),
+        Ok(2)
+    );
+    assert_eq!(owner.sched.policy(), SchedPolicy::RtFifo);
+    assert_eq!(owner.sched.rt_priority(), 80);
+    assert_eq!(
+        PI_FUTEX_TABLE.lock().get(&dst).map(|s| s.waiters.len()),
+        Some(2)
+    );
+
+    assert_eq!(futex_unlock_pi(&owner, dst_uaddr, true), Ok(0));
+    assert_eq!(
+        read_user_u32(dst_uaddr).unwrap() & FUTEX_TID_MASK,
+        realtime.pid_root().unwrap() as u32
+    );
+    assert!(rt_state.is_woken());
+    assert!(!fair_state.is_woken());
+    assert_eq!(owner.sched.sched_attr(), owner.pi_base_attr());
+
+    assert_eq!(futex_unlock_pi(&realtime, dst_uaddr, true), Ok(0));
+    assert_eq!(
+        read_user_u32(dst_uaddr).unwrap() & FUTEX_TID_MASK,
+        fair.pid_root().unwrap() as u32
+    );
+    assert!(fair_state.is_woken());
+    assert_eq!(futex_unlock_pi(&fair, dst_uaddr, true), Ok(0));
+    assert_eq!(read_user_u32(dst_uaddr), Ok(0));
+
+    FUTEX_TABLE.lock().remove(&src);
+    PI_FUTEX_TABLE.lock().remove(&dst);
+    fair.ext_remove(sched::TASKEXT_VM_SPACE);
+    realtime.ext_remove(sched::TASKEXT_VM_SPACE);
+    sched::abort_new_task(&fair);
+    sched::abort_new_task(&realtime);
+    vm.unmap(PROBE..PROBE + page_size)
+        .expect("清理 PI futex 测试映射失败");
+    owner.ext_remove(sched::TASKEXT_VM_SPACE);
+    if let Some(saved_vm) = saved_vm {
+        owner.ext_install(sched::TASKEXT_VM_SPACE, saved_vm);
     }
 }

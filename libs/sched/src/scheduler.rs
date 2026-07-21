@@ -2226,7 +2226,7 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
     };
     let t = crate::spawn::kthread_create(idle_entry, cpu_id, params);
     t.mark_idle_task();
-    t.sched.set_sched_attr(SchedAttr::idle());
+    t.set_sched_attr(SchedAttr::idle());
     t.set_cpu_affinity(CpuMask::single_raw(cpu_id).bits());
     install_idle(cpu_id, Arc::clone(&t));
     log::info!(

@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
@@ -1243,7 +1243,7 @@ pub(super) fn sys_getpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let targets = priority_targets(ctx.args[0], ctx.args[1], ctx.task())?;
     let best = targets
         .iter()
-        .map(|task| task.sched.nice() as i32)
+        .map(|task| task.pi_base_attr().nice as i32)
         .min()
         .ok_or(Errno::ESRCH)?;
     Ok(linux_priority_from_nice(best))
@@ -1344,7 +1344,7 @@ fn check_setpriority_permission(
     }
     check_sched_target_owner(&caller_creds, target)?;
 
-    let current = target.sched.nice() as i32;
+    let current = target.pi_base_attr().nice as i32;
     if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
         return Err(Errno::EACCES);
     }
@@ -1388,7 +1388,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
     let task = sched_task_from_pid(pid, ctx.task())?;
-    let old = task.sched.sched_attr();
+    let old = task.pi_base_attr();
     let mut attr = old;
     match attr.policy {
         SchedPolicy::Fair | SchedPolicy::Idle => {
@@ -1438,7 +1438,7 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
         0
     };
     let task = sched_task_from_pid(pid, ctx.task())?;
-    let old = task.sched.sched_attr();
+    let old = task.pi_base_attr();
     let attr = SchedAttr {
         policy,
         nice: old.nice,
@@ -1662,7 +1662,7 @@ pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     }
     let (attr, reset_on_fork) = read_linux_sched_attr(attr_user)?;
     let task = sched_task_from_pid(pid, ctx.task())?;
-    let old = task.sched.sched_attr();
+    let old = task.pi_base_attr();
     check_sched_attr_permission(ctx.task(), &task, old, attr)?;
     sched::operation::sched_setattr_for_task(&task, attr)?;
     task.set_sched_reset_on_fork(reset_on_fork);
@@ -2407,6 +2407,7 @@ struct FutexWaiter {
     task: Weak<sched::Task>,
     bitset: u32,
     waitv_index: Option<usize>,
+    pi_target: Option<(FutexKey, usize)>,
     state: Arc<FutexWaitState>,
 }
 
@@ -2449,11 +2450,29 @@ struct FutexBucket {
     waiters: Vec<FutexWaiter>,
 }
 
+struct PiFutexWaiter {
+    task: Weak<sched::Task>,
+    state: Arc<FutexWaitState>,
+    seq: usize,
+}
+
+struct PiFutexState {
+    token: usize,
+    owner: Weak<sched::Task>,
+    vm: Weak<VmSpace>,
+    uaddr: usize,
+    waiters: Vec<PiFutexWaiter>,
+}
+
 const FUTEX_WAIT_ARMED: u8 = 0;
 const FUTEX_WAIT_SLEEPING: u8 = 1;
 const FUTEX_WAIT_WOKEN: u8 = 2;
 
 static FUTEX_TABLE: Spinlock<BTreeMap<FutexKey, FutexBucket>> = Spinlock::new(BTreeMap::new());
+static PI_FUTEX_TABLE: Spinlock<BTreeMap<FutexKey, PiFutexState>> = Spinlock::new(BTreeMap::new());
+static NEXT_PI_FUTEX_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static NEXT_PI_WAITER_SEQ: AtomicUsize = AtomicUsize::new(1);
+const PI_CHAIN_MAX: usize = 32;
 
 fn futex_cmd(futex_op: u32) -> u32 {
     futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
@@ -2468,6 +2487,152 @@ fn task_vm_space_for_futex(task: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
 
 fn futex_key(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<FutexKey, Errno> {
     task_vm_space_for_futex(task)?.futex_key_for(uaddr, private)
+}
+
+fn next_pi_token() -> usize {
+    NEXT_PI_FUTEX_TOKEN.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+fn pi_urgency(attr: SchedAttr) -> u16 {
+    match attr.policy {
+        SchedPolicy::Deadline => 400,
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => 200 + attr.priority as u16,
+        SchedPolicy::Fair => 100 + (19i16 - attr.nice as i16).max(0) as u16,
+        SchedPolicy::Idle => 0,
+    }
+}
+
+fn pi_best_waiter(state: &PiFutexState) -> Option<(usize, Arc<Task>)> {
+    state
+        .waiters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, waiter)| {
+            waiter
+                .task
+                .upgrade()
+                .filter(|task| task.pid_root().is_some_and(|pid| pid > 0))
+                .map(|task| {
+                    let urgency = pi_urgency(task.sched.sched_attr());
+                    (index, task, urgency, usize::MAX - waiter.seq)
+                })
+        })
+        .max_by_key(|(_, _, urgency, fifo)| (*urgency, *fifo))
+        .map(|(index, task, _, _)| (index, task))
+}
+
+fn pi_owner_update(owner: &Arc<Task>, token: usize, donated: Option<SchedAttr>) {
+    let effective = match donated {
+        Some(attr) => owner.pi_add_donation(token, attr),
+        None => owner.pi_remove_donation(token),
+    };
+    let _ = sched::operation::pi_apply_effective_attr(owner, effective);
+    pi_propagate_from(owner);
+}
+
+fn pi_top_donation(state: &PiFutexState) -> Option<SchedAttr> {
+    pi_best_waiter(state).map(|(_, task)| task.sched.sched_attr())
+}
+
+fn pi_refresh_owner(key: FutexKey) {
+    let update = {
+        let table = PI_FUTEX_TABLE.lock();
+        let Some(state) = table.get(&key) else {
+            return;
+        };
+        state
+            .owner
+            .upgrade()
+            .map(|owner| (owner, state.token, pi_top_donation(state)))
+    };
+    if let Some((owner, token, donation)) = update {
+        pi_owner_update(&owner, token, donation);
+    }
+}
+
+fn pi_waiting_owner_locked(
+    table: &BTreeMap<FutexKey, PiFutexState>,
+    waiter: &Arc<Task>,
+) -> Option<Arc<Task>> {
+    table.values().find_map(|state| {
+        state
+            .waiters
+            .iter()
+            .any(|entry| {
+                entry
+                    .task
+                    .upgrade()
+                    .is_some_and(|task| Arc::ptr_eq(&task, waiter))
+            })
+            .then(|| state.owner.upgrade())
+            .flatten()
+    })
+}
+
+fn pi_chain_reaches_locked(
+    table: &BTreeMap<FutexKey, PiFutexState>,
+    start: &Arc<Task>,
+    target: &Arc<Task>,
+) -> bool {
+    let mut current = Arc::clone(start);
+    let mut visited = [0usize; PI_CHAIN_MAX];
+    for depth in 0..PI_CHAIN_MAX {
+        if Arc::ptr_eq(&current, target) {
+            return true;
+        }
+        let address = Arc::as_ptr(&current) as usize;
+        if visited[..depth].contains(&address) {
+            return false;
+        }
+        visited[depth] = address;
+        let Some(next) = pi_waiting_owner_locked(table, &current) else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+fn pi_propagate_from(waiter: &Arc<Task>) {
+    let mut current = Arc::clone(waiter);
+    let mut visited = [0usize; PI_CHAIN_MAX];
+    for depth in 0..PI_CHAIN_MAX {
+        let address = Arc::as_ptr(&current) as usize;
+        if visited[..depth].contains(&address) {
+            return;
+        }
+        visited[depth] = address;
+        let update = {
+            let table = PI_FUTEX_TABLE.lock();
+            table.values().find_map(|state| {
+                state
+                    .waiters
+                    .iter()
+                    .any(|entry| {
+                        entry
+                            .task
+                            .upgrade()
+                            .is_some_and(|task| Arc::ptr_eq(&task, &current))
+                    })
+                    .then(|| {
+                        state
+                            .owner
+                            .upgrade()
+                            .map(|owner| (owner, state.token, pi_top_donation(state)))
+                    })
+                    .flatten()
+            })
+        };
+        let Some((owner, token, donation)) = update else {
+            return;
+        };
+        let effective = match donation {
+            Some(attr) => owner.pi_add_donation(token, attr),
+            None => owner.pi_remove_donation(token),
+        };
+        let _ = sched::operation::pi_apply_effective_attr(&owner, effective);
+        current = owner;
+    }
 }
 
 fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
@@ -2561,6 +2726,49 @@ fn futex_remove_task_waiters(task: &Arc<Task>) -> usize {
         table.remove(&key);
     }
     removed
+}
+
+fn pi_remove_task_waiters(task: &Arc<Task>) {
+    let mut updates = Vec::new();
+    {
+        let mut table = PI_FUTEX_TABLE.lock();
+        for state in table.values_mut() {
+            let before = state.waiters.len();
+            state.waiters.retain(|waiter| {
+                !waiter
+                    .task
+                    .upgrade()
+                    .is_some_and(|queued| Arc::ptr_eq(&queued, task))
+            });
+            if before != state.waiters.len() {
+                if let Some(owner) = state.owner.upgrade() {
+                    updates.push((owner, state.token, pi_top_donation(state)));
+                }
+            }
+        }
+    }
+    for (owner, token, donation) in updates {
+        pi_owner_update(&owner, token, donation);
+    }
+}
+
+fn pi_release_owned_futexes(task: &Arc<Task>) {
+    let owned = {
+        let table = PI_FUTEX_TABLE.lock();
+        table
+            .iter()
+            .filter_map(|(key, state)| {
+                state
+                    .owner
+                    .upgrade()
+                    .filter(|owner| Arc::ptr_eq(owner, task))
+                    .and_then(|_| state.vm.upgrade().map(|vm| (*key, vm, state.uaddr)))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (key, vm, uaddr) in owned {
+        let _ = pi_owner_died_key(&vm, key, uaddr, task);
+    }
 }
 
 fn futex_enqueue_waiter_if_equal(
@@ -2657,6 +2865,10 @@ fn futex_requeue_locked(
         while idx < bucket.waiters.len()
             && (wake.len() < wake_count || requeue.len() < requeue_count)
         {
+            if bucket.waiters[idx].pi_target.is_some() {
+                idx += 1;
+                continue;
+            }
             if (bucket.waiters[idx].bitset & bitset) == 0 {
                 idx += 1;
                 continue;
@@ -2774,6 +2986,183 @@ fn sign_extend_12(value: u32) -> i32 {
     ((value << 20) as i32) >> 20
 }
 
+fn pi_register_owner(key: FutexKey, vm: &Arc<VmSpace>, uaddr: usize, owner: &Arc<Task>) {
+    let mut table = PI_FUTEX_TABLE.lock();
+    let state = table.entry(key).or_insert_with(|| PiFutexState {
+        token: next_pi_token(),
+        owner: Arc::downgrade(owner),
+        vm: Arc::downgrade(vm),
+        uaddr,
+        waiters: Vec::new(),
+    });
+    state.owner = Arc::downgrade(owner);
+    state.vm = Arc::downgrade(vm);
+    state.uaddr = uaddr;
+    drop(table);
+    pi_refresh_owner(key);
+}
+
+fn pi_enqueue_waiter(
+    vm: &Arc<VmSpace>,
+    key: FutexKey,
+    uaddr: usize,
+    task: &Arc<Task>,
+    wait_state: &Arc<FutexWaitState>,
+) -> Result<(), Errno> {
+    let tid = task.pid_root().unwrap_or(0) as u32;
+    loop {
+        let observed = vm.read_user_u32_nofault(uaddr)?;
+        let owner_tid = observed & FUTEX_TID_MASK;
+        if owner_tid == 0 {
+            return Err(Errno::EAGAIN);
+        }
+        if owner_tid == tid {
+            return Err(Errno::EDEADLK);
+        }
+        let owner = lookup_root_task(owner_tid as i32)?;
+        let mut table = PI_FUTEX_TABLE.lock();
+        let current = vm.read_user_u32_nofault(uaddr)?;
+        if (current & FUTEX_TID_MASK) != owner_tid {
+            continue;
+        }
+        if pi_chain_reaches_locked(&table, &owner, task) {
+            return Err(Errno::EDEADLK);
+        }
+        let waiting = current | FUTEX_WAITERS;
+        if waiting != current
+            && vm.compare_exchange_user_u32_nofault(uaddr, current, waiting)? != current
+        {
+            continue;
+        }
+        let state = table.entry(key).or_insert_with(|| PiFutexState {
+            token: next_pi_token(),
+            owner: Arc::downgrade(&owner),
+            vm: Arc::downgrade(vm),
+            uaddr,
+            waiters: Vec::new(),
+        });
+        state.owner = Arc::downgrade(&owner);
+        state.vm = Arc::downgrade(vm);
+        state.uaddr = uaddr;
+        state
+            .waiters
+            .retain(|waiter| waiter.task.strong_count() != 0);
+        if state.waiters.iter().any(|waiter| {
+            waiter
+                .task
+                .upgrade()
+                .is_some_and(|queued| Arc::ptr_eq(&queued, task))
+        }) {
+            return Err(Errno::EDEADLK);
+        }
+        state.waiters.push(PiFutexWaiter {
+            task: Arc::downgrade(task),
+            state: Arc::clone(wait_state),
+            seq: NEXT_PI_WAITER_SEQ.fetch_add(1, Ordering::Relaxed),
+        });
+        drop(table);
+        pi_refresh_owner(key);
+        return Ok(());
+    }
+}
+
+fn pi_remove_waiter(
+    vm: &VmSpace,
+    key: FutexKey,
+    uaddr: usize,
+    task: &Arc<Task>,
+    wait_state: &Arc<FutexWaitState>,
+) -> Result<bool, Errno> {
+    let update = {
+        let mut table = PI_FUTEX_TABLE.lock();
+        let Some(state) = table.get_mut(&key) else {
+            return Ok(false);
+        };
+        let Some(index) = state.waiters.iter().position(|waiter| {
+            Arc::ptr_eq(&waiter.state, wait_state)
+                && waiter
+                    .task
+                    .upgrade()
+                    .is_some_and(|queued| Arc::ptr_eq(&queued, task))
+        }) else {
+            return Ok(false);
+        };
+        state.waiters.remove(index);
+        state
+            .waiters
+            .retain(|waiter| waiter.task.strong_count() != 0);
+        let owner = state.owner.upgrade();
+        let token = state.token;
+        let donation = pi_top_donation(state);
+        if state.waiters.is_empty() {
+            loop {
+                let current = vm.read_user_u32_nofault(uaddr)?;
+                if (current & FUTEX_WAITERS) == 0 {
+                    break;
+                }
+                let new = current & !FUTEX_WAITERS;
+                if vm.compare_exchange_user_u32_nofault(uaddr, current, new)? == current {
+                    break;
+                }
+            }
+        }
+        owner.map(|owner| (owner, token, donation))
+    };
+    if let Some((owner, token, donation)) = update {
+        pi_owner_update(&owner, token, donation);
+    }
+    Ok(true)
+}
+
+fn pi_wait_registered(
+    vm: &VmSpace,
+    key: FutexKey,
+    uaddr: usize,
+    task: &Arc<Task>,
+    wait_state: &Arc<FutexWaitState>,
+    deadline_ns: Option<u64>,
+) -> Result<usize, Errno> {
+    loop {
+        if wait_state.is_woken() {
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            restore_current_task_after_sleep(task);
+            return Ok(0);
+        }
+        if let Some(deadline) = deadline_ns
+            && sched::now_ns_public() >= deadline
+            && pi_remove_waiter(vm, key, uaddr, task, wait_state)?
+        {
+            restore_current_task_after_sleep(task);
+            sched::cancel_sleep_deadline(task);
+            return Err(Errno::ETIMEDOUT);
+        }
+        if sched::operation::has_interrupting_signal(task)
+            && pi_remove_waiter(vm, key, uaddr, task, wait_state)?
+        {
+            restore_current_task_after_sleep(task);
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            return Err(Errno::EINTR);
+        }
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
+        if !wait_state.mark_sleeping() {
+            restore_current_task_after_sleep(task);
+            continue;
+        }
+        if wait_state.is_woken() {
+            restore_current_task_after_sleep(task);
+            continue;
+        }
+        sched::operation::sched_yield()?;
+        restore_current_task_after_sleep(task);
+    }
+}
+
 fn futex_lock_pi(
     task: &Arc<Task>,
     uaddr: usize,
@@ -2794,6 +3183,7 @@ fn futex_lock_pi(
         if owner == 0 {
             let new = (cur & FUTEX_OWNER_DIED) | tid;
             if vm.compare_exchange_user_u32_nofault(uaddr, cur, new)? == cur {
+                pi_register_owner(key, &vm, uaddr, task);
                 return Ok(0);
             }
             continue;
@@ -2804,20 +3194,25 @@ fn futex_lock_pi(
         if try_only {
             return Err(Errno::EAGAIN);
         }
-        let waiting = cur | FUTEX_WAITERS;
-        if waiting != cur && vm.compare_exchange_user_u32_nofault(uaddr, cur, waiting)? != cur {
-            continue;
+        if let Some(deadline) = deadline_ns
+            && !sched::register_sleep_deadline(task, deadline)
+        {
+            return Err(Errno::ETIMEDOUT);
         }
-        match futex_wait(
-            task,
-            key,
-            uaddr,
-            waiting,
-            FUTEX_BITSET_MATCH_ANY,
-            deadline_ns,
-        ) {
-            Ok(_) | Err(Errno::EAGAIN) => continue,
-            Err(err) => return Err(err),
+        let wait_state = Arc::new(FutexWaitState::new());
+        match pi_enqueue_waiter(&vm, key, uaddr, task, &wait_state) {
+            Ok(()) => return pi_wait_registered(&vm, key, uaddr, task, &wait_state, deadline_ns),
+            Err(Errno::EAGAIN) => {
+                if deadline_ns.is_some() {
+                    sched::cancel_sleep_deadline(task);
+                }
+            }
+            Err(err) => {
+                if deadline_ns.is_some() {
+                    sched::cancel_sleep_deadline(task);
+                }
+                return Err(err);
+            }
         }
     }
 }
@@ -2830,21 +3225,357 @@ fn futex_unlock_pi(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<usiz
     let key = futex_key(task, uaddr, private)?;
     let vm = task_vm_space_for_futex(task)?;
     vm.prefault_user_u32(uaddr, true)?;
-    let had_waiters = loop {
+    loop {
+        let mut table = PI_FUTEX_TABLE.lock();
         let cur = vm.read_user_u32_nofault(uaddr)?;
         if (cur & FUTEX_TID_MASK) != tid {
             return Err(Errno::EPERM);
         }
-        let had_waiters = (cur & FUTEX_WAITERS) != 0;
-        if vm.compare_exchange_user_u32_nofault(uaddr, cur, 0)? == cur {
-            break had_waiters;
+        let Some(state) = table.get_mut(&key) else {
+            if vm.compare_exchange_user_u32_nofault(uaddr, cur, 0)? == cur {
+                return Ok(0);
+            }
+            continue;
+        };
+        state
+            .waiters
+            .retain(|waiter| waiter.task.strong_count() != 0);
+        let token = state.token;
+        let old_owner = state.owner.upgrade().unwrap_or_else(|| Arc::clone(task));
+        let Some((next_index, next_owner)) = pi_best_waiter(state) else {
+            if vm.compare_exchange_user_u32_nofault(uaddr, cur, 0)? != cur {
+                continue;
+            }
+            table.remove(&key);
+            drop(table);
+            pi_owner_update(&old_owner, token, None);
+            return Ok(0);
+        };
+        let next_tid = next_owner.pid_root().unwrap_or(0) as u32;
+        if next_tid == 0 {
+            state.waiters.remove(next_index);
+            continue;
+        }
+        let remaining = state.waiters.len().saturating_sub(1);
+        let mut new = (cur & FUTEX_OWNER_DIED) | next_tid;
+        if remaining != 0 {
+            new |= FUTEX_WAITERS;
+        }
+        if vm.compare_exchange_user_u32_nofault(uaddr, cur, new)? != cur {
+            continue;
+        }
+        let handed = state.waiters.remove(next_index);
+        state.owner = Arc::downgrade(&next_owner);
+        let next_donation = pi_top_donation(state);
+        drop(table);
+
+        pi_owner_update(&old_owner, token, None);
+        pi_owner_update(&next_owner, token, next_donation);
+        let _ = wake_futex_waiters(alloc::vec![(next_owner, handed.state)]);
+        return Ok(0);
+    }
+}
+
+fn pi_owner_died_key(vm: &VmSpace, key: FutexKey, uaddr: usize, task: &Arc<Task>) -> bool {
+    let update = {
+        let mut table = PI_FUTEX_TABLE.lock();
+        let Some(state) = table.get_mut(&key) else {
+            return false;
+        };
+        if !state
+            .owner
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, task))
+        {
+            return false;
+        }
+        let Ok(cur) = vm.read_user_u32_nofault(uaddr) else {
+            return false;
+        };
+        if (cur & FUTEX_TID_MASK) != task.pid_root().unwrap_or(0) as u32 {
+            return false;
+        }
+        state
+            .waiters
+            .retain(|waiter| waiter.task.strong_count() != 0);
+        let token = state.token;
+        if let Some((index, next)) = pi_best_waiter(state) {
+            let next_tid = next.pid_root().unwrap_or(0) as u32;
+            if next_tid == 0 {
+                return false;
+            }
+            let remaining = state.waiters.len().saturating_sub(1);
+            let mut new = FUTEX_OWNER_DIED | next_tid;
+            if remaining != 0 {
+                new |= FUTEX_WAITERS;
+            }
+            if vm.compare_exchange_user_u32_nofault(uaddr, cur, new).ok() != Some(cur) {
+                return false;
+            }
+            let waiter = state.waiters.remove(index);
+            state.owner = Arc::downgrade(&next);
+            let donation = pi_top_donation(state);
+            Some((token, Some((next, donation, waiter.state))))
+        } else {
+            if vm
+                .compare_exchange_user_u32_nofault(uaddr, cur, FUTEX_OWNER_DIED)
+                .ok()
+                != Some(cur)
+            {
+                return false;
+            }
+            table.remove(&key);
+            Some((token, None))
         }
     };
-    Ok(if had_waiters {
-        futex_wake_key(key, 1, FUTEX_BITSET_MATCH_ANY)
-    } else {
-        0
-    })
+    if let Some((token, handoff)) = update {
+        pi_owner_update(task, token, None);
+        if let Some((next, donation, state)) = handoff {
+            pi_owner_update(&next, token, donation);
+            let _ = wake_futex_waiters(alloc::vec![(next, state)]);
+        }
+    }
+    true
+}
+
+fn futex_wait_requeue_pi(
+    task: &Arc<Task>,
+    src_uaddr: usize,
+    expected: u32,
+    dst_uaddr: usize,
+    private: bool,
+    deadline_ns: Option<u64>,
+) -> Result<usize, Errno> {
+    if dst_uaddr == 0 || dst_uaddr % 4 != 0 || src_uaddr == dst_uaddr {
+        return Err(Errno::EINVAL);
+    }
+    let vm = task_vm_space_for_futex(task)?;
+    let src = vm.futex_key_for(src_uaddr, private)?;
+    let dst = vm.futex_key_for(dst_uaddr, private)?;
+    if src == dst {
+        return Err(Errno::EINVAL);
+    }
+    vm.prefault_user_u32(src_uaddr, false)?;
+    vm.prefault_user_u32(dst_uaddr, true)?;
+    if let Some(deadline) = deadline_ns
+        && !sched::register_sleep_deadline(task, deadline)
+    {
+        return Err(Errno::ETIMEDOUT);
+    }
+    let wait_state = Arc::new(FutexWaitState::new());
+    if let Err(err) = futex_enqueue_waiter_if_equal(
+        &vm,
+        src,
+        src_uaddr,
+        expected,
+        FutexWaiter {
+            task: Arc::downgrade(task),
+            bitset: FUTEX_BITSET_MATCH_ANY,
+            waitv_index: None,
+            pi_target: Some((dst, dst_uaddr)),
+            state: Arc::clone(&wait_state),
+        },
+    ) {
+        if deadline_ns.is_some() {
+            sched::cancel_sleep_deadline(task);
+        }
+        return Err(err);
+    }
+
+    loop {
+        if wait_state.is_woken() {
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            restore_current_task_after_sleep(task);
+            return Ok(0);
+        }
+        let timed_out = deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline);
+        let interrupted = sched::operation::has_interrupting_signal(task);
+        if timed_out || interrupted {
+            let removed = futex_remove_waiter(src, task)
+                || pi_remove_waiter(&vm, dst, dst_uaddr, task, &wait_state)?;
+            if removed {
+                restore_current_task_after_sleep(task);
+                if deadline_ns.is_some() {
+                    sched::cancel_sleep_deadline(task);
+                }
+                return Err(if timed_out {
+                    Errno::ETIMEDOUT
+                } else {
+                    Errno::EINTR
+                });
+            }
+            continue;
+        }
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
+        if !wait_state.mark_sleeping() {
+            restore_current_task_after_sleep(task);
+            continue;
+        }
+        if wait_state.is_woken() {
+            restore_current_task_after_sleep(task);
+            continue;
+        }
+        sched::operation::sched_yield()?;
+        restore_current_task_after_sleep(task);
+    }
+}
+
+fn futex_cmp_requeue_pi(
+    task: &Arc<Task>,
+    src_uaddr: usize,
+    expected: u32,
+    dst_uaddr: usize,
+    private: bool,
+    wake_count: usize,
+    requeue_count: usize,
+) -> Result<usize, Errno> {
+    if wake_count != 1 || dst_uaddr == 0 || dst_uaddr % 4 != 0 || src_uaddr == dst_uaddr {
+        return Err(Errno::EINVAL);
+    }
+    let vm = task_vm_space_for_futex(task)?;
+    let src = vm.futex_key_for(src_uaddr, private)?;
+    let dst = vm.futex_key_for(dst_uaddr, private)?;
+    if src == dst {
+        return Err(Errno::EINVAL);
+    }
+    vm.prefault_user_u32(src_uaddr, false)?;
+    vm.prefault_user_u32(dst_uaddr, true)?;
+
+    loop {
+        let dst_observed = vm.read_user_u32_nofault(dst_uaddr)?;
+        let owner_tid = dst_observed & FUTEX_TID_MASK;
+        let owner = if owner_tid == 0 {
+            None
+        } else {
+            Some(lookup_root_task(owner_tid as i32)?)
+        };
+        let (moved, acquired, donation_update) = {
+            let mut futex_table = FUTEX_TABLE.lock();
+            let mut pi_table = PI_FUTEX_TABLE.lock();
+            if vm.read_user_u32_nofault(src_uaddr)? != expected {
+                return Err(Errno::EAGAIN);
+            }
+            let dst_current = vm.read_user_u32_nofault(dst_uaddr)?;
+            if (dst_current & FUTEX_TID_MASK) != owner_tid {
+                continue;
+            }
+            let Some(bucket) = futex_table.get_mut(&src) else {
+                return Ok(0);
+            };
+            let limit = requeue_count.saturating_add(1);
+            let eligible = bucket
+                .waiters
+                .iter()
+                .filter(|waiter| waiter.pi_target == Some((dst, dst_uaddr)))
+                .filter(|waiter| waiter.task.strong_count() != 0)
+                .take(limit)
+                .count();
+            if eligible == 0 {
+                return Ok(0);
+            }
+
+            let direct_owner = if owner_tid == 0 {
+                bucket
+                    .waiters
+                    .iter()
+                    .find(|waiter| waiter.pi_target == Some((dst, dst_uaddr)))
+                    .filter(|waiter| waiter.task.strong_count() != 0)
+                    .and_then(|waiter| waiter.task.upgrade())
+            } else {
+                None
+            };
+            if let Some(pi_owner) = owner.as_ref()
+                && bucket
+                    .waiters
+                    .iter()
+                    .filter(|waiter| waiter.pi_target == Some((dst, dst_uaddr)))
+                    .filter_map(|waiter| waiter.task.upgrade())
+                    .take(limit)
+                    .any(|waiter| pi_chain_reaches_locked(&pi_table, pi_owner, &waiter))
+            {
+                return Err(Errno::EDEADLK);
+            }
+            let queued = eligible.saturating_sub(usize::from(direct_owner.is_some()));
+            let new_word = if let Some(next) = direct_owner.as_ref() {
+                let next_tid = next.pid_root().unwrap_or(0) as u32;
+                if next_tid == 0 {
+                    return Err(Errno::ESRCH);
+                }
+                next_tid | if queued != 0 { FUTEX_WAITERS } else { 0 }
+            } else {
+                dst_current | FUTEX_WAITERS
+            };
+            if vm.compare_exchange_user_u32_nofault(dst_uaddr, dst_current, new_word)?
+                != dst_current
+            {
+                continue;
+            }
+
+            let mut selected = Vec::new();
+            let mut index = 0;
+            while index < bucket.waiters.len() && selected.len() < limit {
+                if bucket.waiters[index].pi_target == Some((dst, dst_uaddr)) {
+                    let waiter = bucket.waiters.remove(index);
+                    if waiter.task.strong_count() != 0 {
+                        selected.push(waiter);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            let source_empty = bucket.waiters.is_empty();
+            if source_empty {
+                futex_table.remove(&src);
+            }
+
+            let acquired_waiter = if direct_owner.is_some() {
+                Some(selected.remove(0))
+            } else {
+                None
+            };
+            let pi_owner = direct_owner.or(owner).ok_or(Errno::ESRCH)?;
+            let state = pi_table.entry(dst).or_insert_with(|| PiFutexState {
+                token: next_pi_token(),
+                owner: Arc::downgrade(&pi_owner),
+                vm: Arc::downgrade(&vm),
+                uaddr: dst_uaddr,
+                waiters: Vec::new(),
+            });
+            state.owner = Arc::downgrade(&pi_owner);
+            state.vm = Arc::downgrade(&vm);
+            state.uaddr = dst_uaddr;
+            state
+                .waiters
+                .extend(selected.into_iter().filter_map(|waiter| {
+                    let task = waiter.task.upgrade()?;
+                    Some(PiFutexWaiter {
+                        task: Arc::downgrade(&task),
+                        state: waiter.state,
+                        seq: NEXT_PI_WAITER_SEQ.fetch_add(1, Ordering::Relaxed),
+                    })
+                }));
+            let donation = pi_top_donation(state);
+            let token = state.token;
+            (
+                eligible,
+                acquired_waiter
+                    .and_then(|waiter| waiter.task.upgrade().map(|task| (task, waiter.state))),
+                Some((pi_owner, token, donation)),
+            )
+        };
+
+        if let Some((owner, token, donation)) = donation_update {
+            pi_owner_update(&owner, token, donation);
+        }
+        if let Some((task, state)) = acquired {
+            let _ = wake_futex_waiters(alloc::vec![(task, state)]);
+        }
+        return Ok(moved);
+    }
 }
 
 fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
@@ -2961,14 +3692,38 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 val3,
             )
         }
-        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => futex_lock_pi(ctx.task(), uaddr, private, false, None),
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => futex_lock_pi(
+            ctx.task(),
+            uaddr,
+            private,
+            false,
+            (timeout != 0)
+                .then(|| futex_wait_deadline(futex_op, cmd, timeout))
+                .transpose()?
+                .flatten(),
+        ),
         FUTEX_TRYLOCK_PI => futex_lock_pi(ctx.task(), uaddr, private, true, None),
         FUTEX_UNLOCK_PI => futex_unlock_pi(ctx.task(), uaddr, private),
-        FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI => {
-            // TODO(threading): requeue_pi 需要把普通等待者原子迁移到 PI owner
-            // 队列，并在迁移期间维护 owner 继承关系；不能退化成普通 requeue。
-            Err(Errno::EOPNOTSUPP)
-        }
+        FUTEX_WAIT_REQUEUE_PI => futex_wait_requeue_pi(
+            ctx.task(),
+            uaddr,
+            val,
+            uaddr2,
+            private,
+            (timeout != 0)
+                .then(|| futex_wait_deadline(futex_op, cmd, timeout))
+                .transpose()?
+                .flatten(),
+        ),
+        FUTEX_CMP_REQUEUE_PI => futex_cmp_requeue_pi(
+            ctx.task(),
+            uaddr,
+            val3,
+            uaddr2,
+            private,
+            val as usize,
+            timeout,
+        ),
         _ => {
             // TODO(threading): 其它 futex 操作需要扩展独立的等待队列状态。
             Err(Errno::EOPNOTSUPP)
@@ -3541,6 +4296,7 @@ fn futex_wait(
             task: Arc::downgrade(&me),
             bitset,
             waitv_index: None,
+            pi_target: None,
             state: Arc::clone(&wait_state),
         },
     ) {
@@ -3650,6 +4406,7 @@ fn futex_waitv_enqueue_if_equal(
                 task: Arc::downgrade(task),
                 bitset: FUTEX_BITSET_MATCH_ANY,
                 waitv_index: Some(entry.index),
+                pi_target: None,
                 state: Arc::clone(&entry.wait_state),
             });
     }
@@ -3905,6 +4662,8 @@ pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
 
 fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
     let _ = futex_remove_task_waiters(task);
+    pi_remove_task_waiters(task);
+    pi_release_owned_futexes(task);
     exit_robust_list(task);
     clear_child_tid_and_wake(task);
 }
@@ -4005,6 +4764,17 @@ fn handle_robust_node(task: &Arc<Task>, node: usize, futex_offset: isize, tid: u
     };
     if (cur & FUTEX_TID_MASK) != tid {
         return;
+    }
+    if let Ok(vm) = task_vm_space_for_futex(task) {
+        let mut handed_off = false;
+        for private in [true, false] {
+            if let Ok(key) = vm.futex_key_for(uaddr, private) {
+                handed_off |= pi_owner_died_key(&vm, key, uaddr, task);
+            }
+        }
+        if handed_off {
+            return;
+        }
     }
     let new = (cur & !FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
     if write_user_u32(uaddr, new).is_ok() {

@@ -226,14 +226,14 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     if parent.sched_reset_on_fork() && !flags.has(CloneFlags::CLONE_THREAD) {
         // 父任务通过 SCHED_RESET_ON_FORK 要求子进程不能继承 RT/deadline
         // 或负 nice 权重；子任务自身不继续携带该继承标志。
-        let parent_attr = parent.sched.sched_attr();
+        let parent_attr = parent.pi_base_attr();
         let child_attr = match parent_attr.policy {
             SchedPolicy::Fair | SchedPolicy::Idle => SchedAttr::fair(parent_attr.nice.max(0), 0),
             SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin | SchedPolicy::Deadline => {
                 SchedAttr::fair(0, 0)
             }
         };
-        child.sched.set_sched_attr(child_attr);
+        child.set_sched_attr(child_attr);
         child.set_sched_reset_on_fork(false);
     }
 
