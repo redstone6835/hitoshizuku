@@ -98,7 +98,8 @@ pub use rseq::{RseqCs, RseqError, RseqEvent, RseqEvents, RseqResumeAction, valid
 pub use runqueue::RunqueueClassLoad;
 pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
-    RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
+    DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass,
+    SchedPolicy,
 };
 pub use scheduler::{
     DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,

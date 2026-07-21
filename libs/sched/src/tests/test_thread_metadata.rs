@@ -258,6 +258,95 @@ fn runqueue_class_load_includes_current_task() {
 }
 
 #[ktest]
+fn runqueue_rt_bandwidth_throttles_fifo_and_replenishes_next_period() {
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));
+    let fair = make_task();
+    let rq = Runqueue::new_with_rt_bandwidth(100, 80);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    let first = rq.pick_next(1).expect("RT task should run first");
+    assert!(alloc::sync::Arc::ptr_eq(&first, &realtime));
+
+    assert!(!rq.tick(80));
+    assert!(rq.tick(81), "RT budget exhaustion must request reschedule");
+    let throttled_pick = rq
+        .pick_next(81)
+        .expect("fair fallback while RT is throttled");
+    assert!(alloc::sync::Arc::ptr_eq(&throttled_pick, &fair));
+
+    assert!(rq.tick(100), "new RT period must request reschedule");
+    let replenished = rq.pick_next(100).expect("RT task after replenishment");
+    assert!(alloc::sync::Arc::ptr_eq(&replenished, &realtime));
+
+    assert!(rq.dequeue(&realtime, 101));
+    assert!(rq.dequeue(&fair, 101));
+}
+
+#[ktest]
+fn runqueue_rt_bandwidth_charges_round_robin_runtime() {
+    let realtime = make_task();
+    realtime
+        .sched
+        .set_sched_attr(SchedAttr::rt_round_robin(30, 1_000));
+    let fair = make_task();
+    let rq = Runqueue::new_with_rt_bandwidth(100, 40);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(1).expect("RR task"),
+        &realtime
+    ));
+    assert!(rq.tick(41));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(41).expect("fair fallback"),
+        &fair
+    ));
+
+    assert!(rq.dequeue(&realtime, 42));
+    assert!(rq.dequeue(&fair, 42));
+}
+
+#[ktest]
+fn runqueue_pi_boosted_owner_bypasses_rt_throttle() {
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));
+    let fair = make_task();
+    let owner = make_task();
+    let effective = owner.pi_add_donation(7, SchedAttr::rt_fifo(60));
+    owner.sched.set_sched_attr(effective);
+    let rq = Runqueue::new_with_rt_bandwidth(100, 20);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(1).expect("RT task"),
+        &realtime
+    ));
+    assert!(rq.tick(21));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(21).expect("fair fallback"),
+        &fair
+    ));
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&owner), 22));
+    let boosted = rq.pick_next(22).expect("PI owner must bypass throttle");
+    assert!(alloc::sync::Arc::ptr_eq(&boosted, &owner));
+
+    let restored = owner.pi_remove_donation(7);
+    assert!(rq.update_sched_attr_raw(&owner, restored, 23));
+    let after_unlock = rq.pick_next(24).expect("fair task after PI unlock");
+    assert_eq!(after_unlock.sched.policy(), SchedPolicy::Fair);
+    assert!(!alloc::sync::Arc::ptr_eq(&after_unlock, &realtime));
+
+    assert!(rq.dequeue(&realtime, 25));
+    assert!(rq.dequeue(&fair, 25));
+    assert!(rq.dequeue(&owner, 25));
+}
+
+#[ktest]
 fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     let current = make_task();
     let queued = make_task();
