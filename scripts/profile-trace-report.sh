@@ -56,6 +56,15 @@ meta_active && /^[a-z_]+=/ {
     metadata[field_key] = contents
     next
 }
+/^@@PROFILE_WORKLOAD / {
+    marker_case = value("case")
+    marker_pid = value("pid")
+    if (seen_workload[marker_case]++)
+        fail("duplicate workload marker for case=" marker_case)
+    if (marker_case == "" || marker_pid !~ /^[0-9]+$/ || marker_pid == 0)
+        fail("invalid workload marker")
+    next
+}
 active && /^state=/ {
     key = case_id SUBSEP phase
     if (seen_header[key]++) fail("duplicate trace header for case=" case_id " phase=" phase)
@@ -105,9 +114,11 @@ END {
         }
         for (i = 1; i <= required_count; i++) {
             name = required[i]
-            if (!seen_meta_field[before SUBSEP name] || metadata[before SUBSEP name] == "")
+            if (!seen_meta_field[before SUBSEP name] || \
+                (name != "cmdline" && metadata[before SUBSEP name] == ""))
                 fail("missing metadata field " name " for case=" case_id " phase=before")
-            if (!seen_meta_field[after SUBSEP name] || metadata[after SUBSEP name] == "")
+            if (!seen_meta_field[after SUBSEP name] || \
+                (name != "cmdline" && metadata[after SUBSEP name] == ""))
                 fail("missing metadata field " name " for case=" case_id " phase=after")
         }
         for (i = 1; i <= stable_count; i++) {
@@ -125,6 +136,10 @@ function value(name,    i) {
     for (i = 1; i < NF; i++) if ($i == name) return $(i + 1)
     return ""
 }
+/^@@PROFILE_WORKLOAD / {
+    workload_pid[value("case")] = value("pid")
+    next
+}
 /^@@PROFILE_TRACE_BEGIN / {
     phase = value("phase")
     case_id = value("case")
@@ -141,10 +156,13 @@ active && /^cpu=/ && / sequence=/ {
     if (hz <= 0) next
     ts = value("timestamp_cycles") * 1000000 / hz
     dur = value("duration_cycles") * 1000000 / hz
-    print case_id "\t" ts "\t" dur "\t" value("cpu") "\t" \
-        value("task") "\t" value("span") "\t" value("kind") "\t" \
-        value("event") "\t" value("arg0") "\t" value("arg1") "\t" \
-        value("session") "\t" value("generation") "\t" value("sequence")
+    task = value("task")
+    role = workload_pid[case_id] == "" ? "unclassified" : \
+        (task == workload_pid[case_id] ? "workload-root" : "other")
+    printf "%s\t%.6f\t%.6f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+        case_id, ts, dur, value("cpu"), task, value("span"), value("kind"), \
+        value("event"), value("arg0"), value("arg1"), value("session"), \
+        value("generation"), value("sequence"), role
 }
 ' "$clean_log" >"$rows"
 
@@ -154,7 +172,7 @@ if [ ! -s "$rows" ]; then
 fi
 
 sort -t '	' -k1,1 -k2,2n -k4,4n -k13,13n "$rows" >"$sorted"
-printf 'case\tts_us\tdur_us\tcpu\ttask\tspan\tkind\tevent\targ0\targ1\tsession\tgeneration\tsequence\n'
+printf 'case\tts_us\tdur_us\tcpu\ttask\tspan\tkind\tevent\targ0\targ1\tsession\tgeneration\tsequence\trole\n'
 cat "$sorted"
 
 if [ -z "$chrome_json" ]; then
@@ -184,8 +202,8 @@ BEGIN { print "{\"traceEvents\":["; first = 1 }
     printf "\"args\":{\"case\":\"%s\",\"cpu\":%s,", escape($1), $4
     printf "\"span\":\"%s\",\"event\":\"%s\",\"arg0\":\"%s\",\"arg1\":\"%s\",", \
         escape($6), escape($8), escape($9), escape($10)
-    printf "\"session\":\"%s\",\"generation\":\"%s\",\"sequence\":\"%s\"}}", \
-        escape($11), escape($12), escape($13)
+    printf "\"session\":\"%s\",\"generation\":\"%s\",\"sequence\":\"%s\",\"role\":\"%s\"}}", \
+        escape($11), escape($12), escape($13), escape($14)
 }
 END { print "\n]}" }
 ' "$sorted" >"$chrome_json"

@@ -140,7 +140,10 @@ case "$command" in
             export PROFILE_WORKLOAD
         fi
         start_capture "$case_id"
-        if "$@"; then
+        "$@" <&0 &
+        workload_pid=$!
+        echo "@@PROFILE_WORKLOAD case=$case_id pid=$workload_pid"
+        if wait "$workload_pid"; then
             workload_status=0
         else
             workload_status=$?

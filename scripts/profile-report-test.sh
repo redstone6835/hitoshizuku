@@ -30,6 +30,7 @@ zero=$(awk 'BEGIN { for (i = 0; i < 64; i++) printf "%s0", (i == 0 ? "" : ","); 
     echo "cpu=0 metric=ingress_ring_depth observations=0 sum=0 max=0 hist=$zero"
     echo "@@PROFILE_STATS_END phase=before case=smoke"
     echo "@@PROFILE_SAMPLES_BEGIN phase=before case=smoke"
+    echo "state=frozen enabled=0 session=1 generation=1 sampling=1 slots_per_cpu=4096"
     echo "cpu=0 dropped_samples=0"
     echo "@@PROFILE_SAMPLES_END phase=before case=smoke"
     echo "@@PROFILE_STATS_BEGIN phase=after case=smoke"
@@ -38,6 +39,7 @@ zero=$(awk 'BEGIN { for (i = 0; i < 64; i++) printf "%s0", (i == 0 ? "" : ","); 
     echo "cpu=0 metric=ingress_ring_depth observations=2 sum=10 max=8 hist=$hist"
     echo "@@PROFILE_STATS_END phase=after case=smoke"
     echo "@@PROFILE_SAMPLES_BEGIN phase=after case=smoke"
+    echo "state=frozen enabled=0 session=1 generation=2 sampling=1 slots_per_cpu=4096"
     echo "cpu=0 dropped_samples=0"
     echo "cpu=0 mode=kernel pc=0x1000 samples=2"
     echo "@@PROFILE_SAMPLES_END phase=after case=smoke"
@@ -47,6 +49,7 @@ output=$($root/scripts/profile-report.sh "$tmp")
 printf '%s\n' "$output" | grep -q 'smoke.*net_protocol_turn.*2.*1.*40.0'
 printf '%s\n' "$output" | grep -q 'smoke.*ingress_ring_depth.*2.*5.00.*8.*1'
 printf '%s\n' "$output" | grep -q 'smoke.*kernel.*0x1000.*2'
+printf '%s\n' "$output" | grep -q 'smoke.*1.*2.*0.*ok'
 printf '%s\n' "$output" | grep -q 'smoke.*kernel_image_id.*kernel-sha256'
 sed '0,/dropped_samples=0/s//dropped_samples=1/' "$tmp" >"$bad"
 if $root/scripts/profile-report.sh "$bad" >/dev/null 2>&1; then
@@ -68,4 +71,13 @@ if $root/scripts/profile-report.sh "$bad" >/dev/null 2>&1; then
     echo "profile-report fixture: mismatched session was accepted" >&2
     exit 1
 fi
+sed 's/^cmdline=console=ttyS0$/cmdline=/' "$tmp" >"$bad"
+$root/scripts/profile-report.sh "$bad" >/dev/null
+sed 's/mode=kernel/mode=user/' "$tmp" >"$bad"
+output=$($root/scripts/profile-report.sh "$bad" /bin/sh)
+printf '%s\n' "$output" | grep -q 'smoke.*user.*0x1000.*2.*user ELF not supplied'
+sed '/mode=kernel/d' "$tmp" >"$bad"
+output=$($root/scripts/profile-report.sh "$bad" 2>"$bad.err")
+printf '%s\n' "$output" | grep -q 'smoke.*1.*0.*0.*no_samples'
+grep -q 'sampling enabled but no PC samples for case=smoke' "$bad.err"
 echo "profile-report fixture: ok"

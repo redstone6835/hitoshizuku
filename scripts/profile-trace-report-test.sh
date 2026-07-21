@@ -22,21 +22,22 @@ json="$tmp/trace.json"
         echo "control=state=frozen enabled=0"
         echo "@@PROFILE_META_END phase=$phase case=smoke"
     done
+    echo "@@PROFILE_WORKLOAD case=smoke pid=7"
     echo "@@PROFILE_TRACE_BEGIN phase=before case=smoke"
-    echo "state=frozen enabled=0 session=1 generation=2 active_writers=0 counter_hz=1000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
+    echo "state=frozen enabled=0 session=1 generation=2 active_writers=0 counter_hz=10000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
     echo "cpu=0 first_sequence=0 next_sequence=0 retained=0 overwritten=0"
     echo "@@PROFILE_TRACE_END phase=before case=smoke"
     echo "@@PROFILE_TRACE_BEGIN phase=after case=smoke"
-    echo "state=frozen enabled=0 session=1 generation=4 active_writers=0 counter_hz=1000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
+    echo "state=frozen enabled=0 session=1 generation=4 active_writers=0 counter_hz=10000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
     echo "cpu=0 first_sequence=0 next_sequence=2 retained=2 overwritten=0"
-    echo "cpu=0 sequence=0 session=1 generation=3 timestamp_cycles=100 duration_cycles=25 kind=scope event=vfs_read task=7 span=42 arg0=64 arg1=0"
-    echo "cpu=0 sequence=1 session=1 generation=3 timestamp_cycles=130 duration_cycles=0 kind=sched_switch event=sched_switch task=7 span=42 arg0=7 arg1=8"
+    echo "cpu=0 sequence=0 session=1 generation=3 timestamp_cycles=801204345 duration_cycles=817 kind=scope event=vfs_read task=7 span=42 arg0=64 arg1=0"
+    echo "cpu=0 sequence=1 session=1 generation=3 timestamp_cycles=801205050 duration_cycles=0 kind=sched_switch event=sched_switch task=7 span=42 arg0=7 arg1=8"
     echo "@@PROFILE_TRACE_END phase=after case=smoke"
 } >"$log"
 
 output=$($root/scripts/profile-trace-report.sh "$log" "$json")
-printf '%s\n' "$output" | grep -q 'smoke.*100.*25.*vfs_read.*64'
-printf '%s\n' "$output" | grep -q 'smoke.*130.*sched_switch.*7.*8'
+printf '%s\n' "$output" | grep -q 'smoke.*80120434.500000.*81.700000.*vfs_read.*64.*workload-root'
+printf '%s\n' "$output" | grep -q 'smoke.*80120505.000000.*sched_switch.*7.*8.*workload-root'
 grep -q '"name":"vfs_read"' "$json"
 grep -q '"ph":"X"' "$json"
 grep -q '"name":"sched_switch"' "$json"
@@ -44,6 +45,12 @@ grep -q '"ph":"i"' "$json"
 sed 's/overwritten=0/overwritten=1/' "$log" >"$tmp/lost.log"
 if $root/scripts/profile-trace-report.sh "$tmp/lost.log" >/dev/null 2>&1; then
     echo "profile-trace-report fixture: overwritten records were accepted" >&2
+    exit 1
+fi
+sed 's/@@PROFILE_WORKLOAD case=smoke pid=7/@@PROFILE_WORKLOAD case=smoke pid=bad/' \
+    "$log" >"$tmp/bad-workload.log"
+if $root/scripts/profile-trace-report.sh "$tmp/bad-workload.log" >/dev/null 2>&1; then
+    echo "profile-trace-report fixture: invalid workload marker was accepted" >&2
     exit 1
 fi
 sed '0,/rootfs_image_id=rootfs-sha256/s//rootfs_image_id=wrong-image/' "$log" >"$tmp/mismatch.log"
@@ -61,4 +68,6 @@ if $root/scripts/profile-trace-report.sh "$tmp/session.log" >/dev/null 2>&1; the
     echo "profile-trace-report fixture: mismatched session was accepted" >&2
     exit 1
 fi
+sed 's/^cmdline=console=ttyS0$/cmdline=/' "$log" >"$tmp/empty-cmdline.log"
+$root/scripts/profile-trace-report.sh "$tmp/empty-cmdline.log" >/dev/null
 echo "profile-trace-report fixture: ok"

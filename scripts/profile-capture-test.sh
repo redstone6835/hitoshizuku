@@ -56,10 +56,20 @@ grep -q '^@@PROFILE_META_BEGIN phase=before case=smoke$' "$output"
 grep -q '^@@PROFILE_META_BEGIN phase=after case=smoke$' "$output"
 grep -q '^workload=/bin/sh -c exit 7$' "$output"
 grep -q '^workload_exit_status=7$' "$output"
+grep -Eq '^@@PROFILE_WORKLOAD case=smoke pid=[0-9]+$' "$output"
 grep -q '^kernel_image_id=kernel-sha256$' "$output"
 grep -q '^rootfs_image_id=rootfs-sha256$' "$output"
 grep -q '^@@PROFILE_TRACE_END phase=after case=smoke$' "$output"
 grep -q '^events=0x1e3ff4000$' "$tmp/dd.log"
+
+printf 'token\n' | PATH="$tmp/bin:$PATH" \
+    PROFILE_CONTROL="$control" \
+    PROFILE_STATS="$stats" \
+    PROFILE_SAMPLES="$tmp/missing-samples" \
+    PROFILE_TRACE_FILE="$trace" \
+    PROFILE_CMDLINE='' \
+    "$root/scripts/profile-capture.sh" run stdin /bin/sh -c \
+        'read value && [ "$value" = token ]' >/dev/null
 
 if PATH="$tmp/bin:$PATH" \
     PROFILE_CONTROL="$control" \

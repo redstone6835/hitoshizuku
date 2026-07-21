@@ -99,9 +99,11 @@ END {
         }
         for (i = 1; i <= required_count; i++) {
             name = required[i]
-            if (!seen_meta_field[before SUBSEP name] || metadata[before SUBSEP name] == "")
+            if (!seen_meta_field[before SUBSEP name] || \
+                (name != "cmdline" && metadata[before SUBSEP name] == ""))
                 fail("missing metadata field " name " for case=" case_id " phase=before")
-            if (!seen_meta_field[after SUBSEP name] || metadata[after SUBSEP name] == "")
+            if (!seen_meta_field[after SUBSEP name] || \
+                (name != "cmdline" && metadata[after SUBSEP name] == ""))
                 fail("missing metadata field " name " for case=" case_id " phase=after")
         }
         for (i = 1; i <= stable_count; i++) {
@@ -291,6 +293,53 @@ function value(name,    i, pair) {
     phase = value("phase")
     case_id = value("case")
     active = 1
+    cases[case_id] = 1
+    next
+}
+/^@@PROFILE_SAMPLES_END / { active = 0; next }
+active && /^state=/ && / sampling=/ {
+    enabled[case_id, phase] = value("sampling") + 0
+    next
+}
+active && /^cpu=/ && / dropped_samples=/ {
+    dropped[case_id, phase] += value("dropped_samples") + 0
+    next
+}
+active && /^cpu=/ && / mode=/ {
+    samples[case_id, phase] += value("samples") + 0
+}
+END {
+    print "case\tenabled\tsamples\tdropped\tstatus"
+    for (case_id in cases) {
+        sample_delta = samples[case_id, "after"] - samples[case_id, "before"]
+        dropped_delta = dropped[case_id, "after"] - dropped[case_id, "before"]
+        is_enabled = enabled[case_id, "after"]
+        status = !is_enabled ? "disabled" : \
+            (dropped_delta > 0 ? "dropped" : (sample_delta > 0 ? "ok" : "no_samples"))
+        printf "%s\t%d\t%d\t%d\t%s\n", case_id, is_enabled, sample_delta, dropped_delta, status
+    }
+}
+' "$clean_log" >"$tmp/sampling-health"
+
+echo
+echo "SAMPLING HEALTH"
+cat "$tmp/sampling-health"
+awk -F '\t' 'NR > 1 && $5 == "no_samples" {
+    print "profile report: warning: sampling enabled but no PC samples for case=" $1 > "/dev/stderr"
+}' "$tmp/sampling-health"
+
+awk '
+function value(name,    i, pair) {
+    for (i = 1; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == name) return pair[2]
+    }
+    return ""
+}
+/^@@PROFILE_SAMPLES_BEGIN / {
+    phase = value("phase")
+    case_id = value("case")
+    active = 1
     next
 }
 /^@@PROFILE_SAMPLES_END / { active = 0; next }
@@ -333,7 +382,7 @@ if [ -n "$addr2line" ] && [ -n "$elf" ] && [ -r "$elf" ]; then
         : >"$tmp/map"
     fi
     awk -F '\t' '
-        NR == FNR { symbols[$1] = $2; next }
+        FILENAME == ARGV[1] { symbols[$1] = $2; next }
         {
             symbol = $2 == "kernel" ? symbols[$3] : "[user ELF not supplied]"
             if (symbol == "") symbol = "??"
