@@ -24,6 +24,7 @@ struct ModuleSpec {
     depends: Vec<String>,
     after: Vec<String>,
     targets: Vec<String>,
+    features: Vec<String>,
     prompt: String,
     default: ElmBuildMode,
 }
@@ -111,8 +112,9 @@ pub fn build_set(
         if mode == ElmBuildMode::Managed {
             command.arg("--unsigned");
         }
-        if !extra_features.is_empty() {
-            command.arg("--features").arg(extra_features.join(","));
+        let module_features = module_build_features(&ordered, module, extra_features);
+        if !module_features.is_empty() {
+            command.arg("--features").arg(module_features.join(","));
         }
         let status = command
             .status()
@@ -210,7 +212,15 @@ fn parse_module_set(path: &Path) -> Result<Vec<ModuleSpec>, String> {
         let key = key.trim();
         if !matches!(
             key,
-            "name" | "path" | "config" | "depends" | "after" | "targets" | "prompt" | "default"
+            "name"
+                | "path"
+                | "config"
+                | "depends"
+                | "after"
+                | "targets"
+                | "features"
+                | "prompt"
+                | "default"
         ) {
             return Err(format!(
                 "Modules.toml 第 {line_number} 行包含未知字段 {key}"
@@ -261,6 +271,7 @@ fn parse_module_set(path: &Path) -> Result<Vec<ModuleSpec>, String> {
                 .unwrap_or_default();
             let after = split_list(record.get("after"));
             let targets = split_list(record.get("targets"));
+            let features = split_list(record.get("features"));
             let default = match record.get("default").map(String::as_str).unwrap_or("n") {
                 "y" => ElmBuildMode::Integrated,
                 "m" => ElmBuildMode::Managed,
@@ -274,10 +285,32 @@ fn parse_module_set(path: &Path) -> Result<Vec<ModuleSpec>, String> {
                 depends,
                 after,
                 targets,
+                features,
                 prompt: required("prompt")?,
                 default,
             })
         })
+        .collect()
+}
+
+/// 解析集合级附加特性在当前模块上的有效子集。
+///
+/// 一旦某个特性由至少一个模块显式声明，该特性只传给声明它的模块；没有任何
+/// 声明的特性继续维持旧版全局透传语义，避免破坏现有外部模块集合。
+fn module_build_features(
+    modules: &[ModuleSpec],
+    module: &ModuleSpec,
+    requested: &[String],
+) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|feature| {
+            let scoped = modules
+                .iter()
+                .any(|candidate| candidate.features.contains(feature));
+            !scoped || module.features.contains(feature)
+        })
+        .cloned()
         .collect()
 }
 
@@ -673,6 +706,7 @@ mod tests {
             depends: depends.iter().map(|value| (*value).to_string()).collect(),
             after: after.iter().map(|value| (*value).to_string()).collect(),
             targets: Vec::new(),
+            features: Vec::new(),
             prompt: name.to_string(),
             default: ElmBuildMode::Disabled,
         }
@@ -732,5 +766,28 @@ mod tests {
         let error = validate_enabled_dependencies(&modules, &modes)
             .expect_err("禁用依赖必须拒绝启用子模块");
         assert!(error.contains("依赖 virtio.framework 已禁用"));
+    }
+
+    #[test]
+    fn declared_build_feature_is_only_passed_to_its_owner() {
+        let mut modules = virtio_modules();
+        modules[1].features.push("block-profile".to_string());
+        let requested = vec!["block-profile".to_string()];
+
+        assert!(module_build_features(&modules, &modules[0], &requested).is_empty());
+        assert_eq!(
+            module_build_features(&modules, &modules[1], &requested),
+            requested
+        );
+    }
+
+    #[test]
+    fn undeclared_build_feature_keeps_global_compatibility() {
+        let modules = virtio_modules();
+        let requested = vec!["diagnostic".to_string()];
+
+        for module in &modules {
+            assert_eq!(module_build_features(&modules, module, &requested), requested);
+        }
     }
 }
