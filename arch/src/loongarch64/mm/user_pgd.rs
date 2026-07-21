@@ -228,7 +228,6 @@ unsafe fn unmap(handle: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(handle) };
     let _ =
         unmap_range_entries::<LoongArch64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
-    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
@@ -259,7 +258,6 @@ unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
         }
         va += LoongArch64Paging::PAGE_SIZE;
     }
-    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range<usize>) {

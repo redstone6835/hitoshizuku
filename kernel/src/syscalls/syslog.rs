@@ -6,6 +6,7 @@ use errno::Errno;
 use general::mm::copy_to_user;
 use general::syscall::SyscallContext;
 use log::{self, LogLevel};
+use sched::ids::Capability;
 
 const SYSLOG_ACTION_CLOSE: usize = 0;
 const SYSLOG_ACTION_OPEN: usize = 1;
@@ -22,7 +23,12 @@ const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
 pub(super) fn sys_syslog(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let action = ctx.args[0];
     let buf = ctx.args[1];
-    let len = ctx.args[2];
+    let raw_len = ctx.args[2];
+
+    if action > SYSLOG_ACTION_SIZE_BUFFER {
+        return Err(Errno::EINVAL);
+    }
+    check_permissions(ctx, action)?;
 
     match action {
         SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => Ok(0),
@@ -35,16 +41,42 @@ pub(super) fn sys_syslog(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             Ok(0)
         }
         SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            let len = checked_len(raw_len)?;
+            if buf == 0 {
+                return Err(Errno::EINVAL);
+            }
             read_kernel_log(buf, len, action == SYSLOG_ACTION_READ_CLEAR)
         }
         SYSLOG_ACTION_CLEAR => {
             log::LOGGER.clear();
             Ok(0)
         }
-        SYSLOG_ACTION_CONSOLE_LEVEL => set_console_level(len),
+        SYSLOG_ACTION_CONSOLE_LEVEL => set_console_level(checked_len(raw_len)?),
         SYSLOG_ACTION_SIZE_UNREAD => Ok(log::LOGGER.unread_len()),
         SYSLOG_ACTION_SIZE_BUFFER => Ok(log::LOGGER.capacity()),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+fn check_permissions(ctx: &SyscallContext<'_>, action: usize) -> Result<(), Errno> {
+    // Linux 默认允许读取完整日志和查询缓冲区容量；其它控制动作要求 CAP_SYSLOG。
+    if matches!(action, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_SIZE_BUFFER)
+        || action == SYSLOG_ACTION_OPEN
+        || ctx.task().credentials().has_cap(Capability::Syslog)
+    {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+fn checked_len(raw_len: usize) -> Result<usize, Errno> {
+    // syslog(2) 的 len 是有符号 int，不能把负值扩展成超大的用户缓冲区长度。
+    let len = raw_len as i32;
+    if len < 0 {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(len as usize)
     }
 }
 

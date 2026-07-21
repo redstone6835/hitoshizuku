@@ -10,18 +10,87 @@
 use alloc::sync::Arc;
 use core::convert::TryFrom;
 use core::ops::Range;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::file_like::FileLike;
 use crate::flags::VmFlags;
 
+/// 下一个私有匿名 VMA 合并域编号。
+///
+/// 编号只用于区分仍然存活的映射来源，不进入用户 ABI，也不承担安全身份用途。
+/// 64 位地址空间内不可能在编号回绕前保留如此多的 VMA；仍显式跳过零值，避免
+/// 回绕瞬间产生保留编号。
+static NEXT_ANON_MERGE_DOMAIN: AtomicUsize = AtomicUsize::new(1);
+
+/// 私有匿名 VMA 的合并来源。
+///
+/// `fork` 前，两个新建匿名映射只要其他属性相同便可像 Linux 一样合并；一旦
+/// 映射被父子地址空间共同继承，其来源便被封存。封存后的映射只能与同一来源
+/// 分裂出的片段重合并，不能吞并任一进程后来新建的相邻映射。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnonMergeDomain {
+    id: usize,
+    inherited: bool,
+}
+
+impl AnonMergeDomain {
+    fn fresh() -> Self {
+        loop {
+            let id = NEXT_ANON_MERGE_DOMAIN.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return Self {
+                    id,
+                    inherited: false,
+                };
+            }
+        }
+    }
+
+    pub(crate) fn mark_inherited(&mut self) {
+        self.inherited = true;
+    }
+
+    pub(crate) fn can_merge(self, other: Self) -> bool {
+        self.id == other.id || (!self.inherited && !other.inherited)
+    }
+}
+
+/// 共享匿名映射的稳定 backing 身份。
+///
+/// 同一对象会被 fork 后的多个 VMA 共同持有；只要仍有任意 VMA 引用该对象，
+/// 已产生的共享页就必须保持有效，不能因某个进程先退出而丢失内容。
+#[derive(Debug)]
+pub struct SharedAnonObject {
+    _private: (),
+}
+
+impl SharedAnonObject {
+    /// 建立一个新的共享匿名对象；对象身份由其 `Arc` 控制块唯一确定。
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for SharedAnonObject {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// VMA 的数据来源。
 #[derive(Clone)]
 pub enum VmBacking {
-    /// 匿名映射：缺页时分配一页零填充。对应 `MAP_ANONYMOUS`。
-    Anon,
-    /// 共享匿名对象。`id` 标识同一 shared-anon backing，`offset` 对应
+    /// 私有匿名映射：缺页时分配一页零填充。对应 `MAP_ANONYMOUS | MAP_PRIVATE`。
+    Anon {
+        /// 保持分裂/合并与 `fork` 继承边界的内部来源信息。
+        merge_domain: AnonMergeDomain,
+    },
+    /// 共享匿名对象。`object` 标识同一 shared-anon backing，`offset` 对应
     /// `range.start` 在对象内的字节偏移。
-    SharedAnon { id: usize, offset: u64 },
+    SharedAnon {
+        object: Arc<SharedAnonObject>,
+        offset: u64,
+    },
     /// 文件映射：缺页时按偏移从文件读取；超出文件长度的尾部零填充。
     File {
         file: Arc<dyn FileLike>,
@@ -118,13 +187,30 @@ impl VmArea {
 
 #[kernel_symbols::export]
 impl VmBacking {
+    /// 建立一个具有独立合并来源的私有匿名 backing。
+    #[kernel_symbols::export(name = "mm.area.VmBacking.anonymous", contract = "kernel.mm.vma-backing@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
+    pub fn anonymous() -> Self {
+        Self::Anon {
+            merge_domain: AnonMergeDomain::fresh(),
+        }
+    }
+
+    /// 将私有匿名 backing 标记为已跨 `fork` 继承。
+    pub(crate) fn mark_fork_inherited(&mut self) {
+        if let Self::Anon { merge_domain } = self {
+            merge_domain.mark_inherited();
+        }
+    }
+
     /// 返回向后移动 `shift` 字节后的 backing；任一地址/offset 加法溢出则返回 None。
     #[kernel_symbols::export(name = "mm.area.VmBacking.checked_shift", contract = "kernel.mm.vma-backing@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn checked_shift(&self, shift: usize) -> Option<Self> {
         match self {
-            VmBacking::Anon => Some(VmBacking::Anon),
-            VmBacking::SharedAnon { id, offset } => Some(VmBacking::SharedAnon {
-                id: *id,
+            VmBacking::Anon { merge_domain } => Some(VmBacking::Anon {
+                merge_domain: *merge_domain,
+            }),
+            VmBacking::SharedAnon { object, offset } => Some(VmBacking::SharedAnon {
+                object: Arc::clone(object),
                 offset: offset.checked_add(u64::try_from(shift).ok()?)?,
             }),
             VmBacking::File { file, offset } => Some(VmBacking::File {

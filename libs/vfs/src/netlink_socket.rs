@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use errno::Errno;
 use sched::{Task, WaitQueue};
@@ -40,6 +40,9 @@ const IFF_UP: u32 = 1;
 const IFF_BROADCAST: u32 = 2;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
+const AF_NETLINK: u16 = 16;
+
+static NEXT_NETLINK_PORT: AtomicU32 = AtomicU32::new(1);
 
 pub struct NetlinkSocketFileOps {
     #[allow(dead_code)]
@@ -48,6 +51,8 @@ pub struct NetlinkSocketFileOps {
     wait_queue: WaitQueue,
     nonblock: AtomicBool,
     bound: AtomicBool,
+    local_pid: AtomicU32,
+    groups: AtomicU32,
     poll_source: PollSource,
 }
 
@@ -59,6 +64,8 @@ impl NetlinkSocketFileOps {
             wait_queue: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
             nonblock: AtomicBool::new(nonblock),
             bound: AtomicBool::new(false),
+            local_pid: AtomicU32::new(0),
+            groups: AtomicU32::new(0),
             poll_source: PollSource::new(PollEvents::POLLOUT),
         }
     }
@@ -73,9 +80,41 @@ impl NetlinkSocketFileOps {
         self.poll_source.publish_versioned(readiness, version);
     }
 
-    pub fn bind(&self, _addr: &[u8]) -> Result<(), Errno> {
-        self.bound.store(true, Ordering::Relaxed);
+    pub fn bind(&self, addr: &[u8]) -> Result<(), Errno> {
+        if addr.len() < 12 {
+            return Err(Errno::EINVAL);
+        }
+        let family = u16::from_ne_bytes(addr[..2].try_into().unwrap());
+        if family != AF_NETLINK {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        if self
+            .bound
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Errno::EINVAL);
+        }
+        let requested_pid = u32::from_ne_bytes(addr[4..8].try_into().unwrap());
+        let local_pid = if requested_pid == 0 {
+            NEXT_NETLINK_PORT.fetch_add(1, Ordering::Relaxed).max(1)
+        } else {
+            requested_pid
+        };
+        self.local_pid.store(local_pid, Ordering::Release);
+        self.groups.store(
+            u32::from_ne_bytes(addr[8..12].try_into().unwrap()),
+            Ordering::Release,
+        );
         Ok(())
+    }
+
+    pub fn local_address(&self) -> [u8; 12] {
+        let mut address = [0u8; 12];
+        address[..2].copy_from_slice(&AF_NETLINK.to_ne_bytes());
+        address[4..8].copy_from_slice(&self.local_pid.load(Ordering::Acquire).to_ne_bytes());
+        address[8..12].copy_from_slice(&self.groups.load(Ordering::Acquire).to_ne_bytes());
+        address
     }
 
     pub fn recv(
@@ -133,8 +172,8 @@ impl NetlinkSocketFileOps {
         }
         let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
         let seq = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let pid = u32::from_ne_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let responses = dispatch_message(msg_type, seq, pid);
+        let local_pid = self.local_pid.load(Ordering::Acquire);
+        let responses = dispatch_message(msg_type, seq, local_pid);
         let mut combined = Vec::new();
         for response in responses {
             combined.extend_from_slice(&response);
@@ -201,6 +240,10 @@ impl FileOps for NetlinkSocketFileOps {
         Some(&self.poll_source)
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -216,21 +259,31 @@ pub fn create_netlink_socket(protocol: u32, nonblock: bool) -> NetlinkSocketFile
     NetlinkSocketFileOps::new(protocol, nonblock)
 }
 
-fn dispatch_message(msg_type: u16, seq: u32, pid: u32) -> Vec<Vec<u8>> {
+fn dispatch_message(msg_type: u16, seq: u32, local_pid: u32) -> Vec<Vec<u8>> {
     match msg_type {
         RTM_GETLINK => {
             let mut messages = net::device::snapshot_devices()
                 .into_iter()
-                .map(|device| build_ifinfomsg(&device, seq, pid))
+                .map(|device| build_ifinfomsg(&device, seq, local_pid))
                 .collect::<Vec<_>>();
-            messages.push(build_nlmsg_done(seq));
+            messages.push(build_nlmsg_done(seq, local_pid));
             messages
         }
-        RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH => vec![build_nlmsg_done(seq)],
-        RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE => {
-            vec![build_nlmsg_error(seq, -i32::from(Errno::EAFNOSUPPORT))]
+        RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH => {
+            vec![build_nlmsg_done(seq, local_pid)]
         }
-        _ => vec![build_nlmsg_error(seq, -i32::from(Errno::EOPNOTSUPP))],
+        RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE => {
+            vec![build_nlmsg_error(
+                seq,
+                local_pid,
+                -i32::from(Errno::EAFNOSUPPORT),
+            )]
+        }
+        _ => vec![build_nlmsg_error(
+            seq,
+            local_pid,
+            -i32::from(Errno::EOPNOTSUPP),
+        )],
     }
 }
 
@@ -277,11 +330,11 @@ fn wrap_nlmsg(msg_type: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> 
     message
 }
 
-fn build_nlmsg_done(seq: u32) -> Vec<u8> {
-    wrap_nlmsg(NLMSG_DONE, 0, seq, 0, &0u32.to_ne_bytes())
+fn build_nlmsg_done(seq: u32, local_pid: u32) -> Vec<u8> {
+    wrap_nlmsg(NLMSG_DONE, 0, seq, local_pid, &0u32.to_ne_bytes())
 }
 
-fn build_nlmsg_error(seq: u32, error: i32) -> Vec<u8> {
+fn build_nlmsg_error(seq: u32, local_pid: u32, error: i32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(20);
     payload.extend_from_slice(&error.to_ne_bytes());
     payload.extend_from_slice(&16u32.to_ne_bytes());
@@ -289,5 +342,5 @@ fn build_nlmsg_error(seq: u32, error: i32) -> Vec<u8> {
     payload.extend_from_slice(&0u16.to_ne_bytes());
     payload.extend_from_slice(&seq.to_ne_bytes());
     payload.extend_from_slice(&0u32.to_ne_bytes());
-    wrap_nlmsg(NLMSG_ERROR, 0, seq, 0, &payload)
+    wrap_nlmsg(NLMSG_ERROR, 0, seq, local_pid, &payload)
 }

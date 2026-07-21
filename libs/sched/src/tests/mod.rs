@@ -3,6 +3,7 @@ extern crate std;
 mod test_clone_flags;
 mod test_cpu_topology;
 mod test_deadline_admission;
+mod test_deadline_timer;
 mod test_eevdf;
 mod test_ids;
 mod test_migration;

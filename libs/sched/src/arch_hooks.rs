@@ -174,6 +174,51 @@ pub fn time() -> Option<&'static ArchTimeOps> {
     }
 }
 
+// ── ArchDeadlineTimerOps ────────────────────────────────────────────────────
+
+/// 调度器软件截止时间到架构本地定时器的重编程契约。
+///
+/// 调度核心只发布归属于当前 CPU 的定时等待中最早的绝对纳秒截止时间，不假设
+/// 底层定时器是周期模式还是比较器模式。架构实现必须保证下一次本地定时器中断
+/// 不晚于该截止时间，同时仍需保留常规调度 tick 的最大间隔。deadline 在登记
+/// 时绑定到本地 CPU，避免多个 CPU 为同一等待同时触发中断并争用全局队列。
+#[repr(C)]
+pub struct ArchDeadlineTimerOps {
+    /// 重编程当前 CPU 的本地定时器。
+    ///
+    /// `Some(deadline_ns)` 使用与 [`ArchTimeOps::now_ns`] 相同的绝对时间域；
+    /// `None` 表示当前没有软件截止时间，架构应恢复常规调度 tick。调用本函数
+    /// 时调度器不会持有定时等待队列锁。
+    pub reprogram: fn(deadline_ns: Option<u64>),
+}
+
+// Safety: 仅包含函数指针。
+unsafe impl Sync for ArchDeadlineTimerOps {}
+unsafe impl Send for ArchDeadlineTimerOps {}
+
+static DEADLINE_TIMER_OPS: AtomicPtr<ArchDeadlineTimerOps> = AtomicPtr::new(core::ptr::null_mut());
+
+/// 注入架构本地 deadline timer 契约。
+pub fn register_deadline_timer(ops: &'static ArchDeadlineTimerOps) {
+    register_once(
+        &DEADLINE_TIMER_OPS,
+        ops as *const _ as *mut _,
+        "ArchDeadlineTimerOps",
+    );
+}
+
+/// 读取已注入的 deadline timer 契约。
+pub fn deadline_timer() -> Option<&'static ArchDeadlineTimerOps> {
+    let ptr = DEADLINE_TIMER_OPS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: register_deadline_timer 仅接受 'static；Acquire 与注册时的
+        // Release 配对，因此函数表一旦可见便永久有效。
+        Some(unsafe { &*(ptr as *const ArchDeadlineTimerOps) })
+    }
+}
+
 // ── CpuControlOps ────────────────────────────────────────────────────────────
 
 /// 跨 CPU 调度控制契约。AP/真实 IPI 未接入时可以不注册；sched 会只置本地

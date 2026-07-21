@@ -14,7 +14,9 @@ use crate::vfs::anon;
 use crate::vfs::cred::Credentials;
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::fdtable::{Fd, FdFlags, FdTable};
-use crate::vfs::file::{AccessMode, DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
+use crate::vfs::file::{
+    AccessMode, DirEntry, FallocateMode, FileOps, IoctlCmd, OpenOptions, PollEvents,
+};
 use crate::vfs::inode::{Inode, InodeOps};
 use crate::vfs::stat::{FileMode, FileType};
 use crate::vfs::sync::Spinlock;
@@ -65,6 +67,27 @@ impl MemfdFileData {
             }
         }
         self.size = new_size;
+    }
+
+    fn punch_hole(&mut self, offset: u64, len: u64) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        self.pages.retain_mut(|page| {
+            let page_start = page.index * MEMFD_PAGE_SIZE_U64;
+            let page_end = page_start + MEMFD_PAGE_SIZE_U64;
+            let zero_start = offset.max(page_start);
+            let zero_end = end.min(page_end);
+            if zero_start >= zero_end {
+                return true;
+            }
+            if zero_start == page_start && zero_end == page_end {
+                return false;
+            }
+            let start = (zero_start - page_start) as usize;
+            let end = (zero_end - page_start) as usize;
+            page.data[start..end].fill(0);
+            true
+        });
+        Ok(())
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> usize {
@@ -339,11 +362,35 @@ impl FileOps for MemfdFileOps {
         Some(&self.state.poll_source)
     }
 
-    fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+    fn fallocate(&self, mode: FallocateMode, offset: u64, len: u64) -> VfsResult<()> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
-        // memfd/tmpfs backing is sparse: reserve logical size here and allocate
-        // real pages lazily when data is written or a shared mmap page is dirtied.
-        self.state.truncate(end)
+        match mode.bits() {
+            0 => self.state.truncate(end),
+            bits if bits == FallocateMode::KEEP_SIZE.bits() => {
+                let inner = self.state.inner.lock();
+                if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                // memfd 后端保持稀疏表示；KEEP_SIZE 不产生可见的逻辑大小变化。
+                Ok(())
+            }
+            bits if bits
+                == FallocateMode::PUNCH_HOLE
+                    .with(FallocateMode::KEEP_SIZE)
+                    .bits() =>
+            {
+                let mut inner = self.state.inner.lock();
+                if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                inner.file.punch_hole(offset, len)?;
+                Self::state_update_inode_size(&inner);
+                drop(inner);
+                self.state.waiters.wake_all();
+                Ok(())
+            }
+            _ => Err(VfsError::NotSupported),
+        }
     }
 
     fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {

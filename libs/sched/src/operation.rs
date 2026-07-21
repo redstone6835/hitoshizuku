@@ -774,6 +774,9 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
     if flags.has(CloneFlags::CLONE_SIGHAND) && !flags.has(CloneFlags::CLONE_VM) {
         return Err(Errno::EINVAL);
     }
+    if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) && flags.has(CloneFlags::CLONE_SIGHAND) {
+        return Err(Errno::EINVAL);
+    }
     if flags.has(CloneFlags::CLONE_THREAD)
         && (!flags.has(CloneFlags::CLONE_SIGHAND) || !flags.has(CloneFlags::CLONE_VM))
     {
@@ -949,10 +952,8 @@ fn wait_common(
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
         me.exit_waiters.finish_wait(&entry);
-        if has_interrupting_signal(&me) {
-            return Err(Errno::EINTR);
-        }
-        // 唤醒后重新轮询。
+        // 子退出和信号可能同时唤醒等待者。先回到循环顶部消费已可观察的
+        // 子状态；只有仍无结果时，下一轮才按信号语义返回 EINTR。
     }
 }
 
