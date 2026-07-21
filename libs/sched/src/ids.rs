@@ -76,12 +76,14 @@ pub enum Capability {
     Setgid = 6,
     Setuid = 7,
     Setpcap = 8,
+    NetBindService = 10,
     SysPacct = 20,
     SysAdmin = 21,
     SysBoot = 22,
     SysNice = 23,
     SysResource = 24,
     SysTime = 25,
+    Syslog = 34,
     CheckpointRestore = 40,
 }
 

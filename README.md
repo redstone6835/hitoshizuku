@@ -152,7 +152,8 @@ qemu-system-riscv64 -machine virt -global virtio-mmio.force-legacy=false \
 | IP 网络栈单测 | `cargo test -p net --target x86_64-unknown-linux-gnu` |
 | extfs 单测 | `cargo test -p extfs --target x86_64-unknown-linux-gnu` |
 | 内核启动验证 | 使用上方 QEMU 命令启动目标架构 |
-| 启动盘内容检查 | `userland/rootfs-*/etc/init.d/rcS` 挂载 `/dev/vd0`，输出 `/mnt` 目录树和其中的 `.sh` 文件内容 |
+| LoongArch64 CAgent | `userland/rootfs-la/etc/init.d/rcS` 等待 3 秒后挂载 `/dev/vd0`，进入测试盘根环境运行 glibc CAgent 并关机 |
+| RISC-V64 启动盘检查 | `userland/rootfs-rv/etc/init.d/rcS` 挂载 `/dev/vd0`，输出 `/mnt` 目录树和其中的 `.sh` 文件内容 |
 
 ## 第三方组件与参考来源
 

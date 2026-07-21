@@ -87,6 +87,10 @@ impl FileOps for PidfdFileOps {
         self.task.exit_waiters.remove(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }

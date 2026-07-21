@@ -45,6 +45,7 @@ static BOOT_CONSOLE_NAME: Spinlock<Option<alloc::string::String>> = Spinlock::ne
 pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = sched::TASKEXT_EXEC_PATH;
 pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
 pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
+pub(crate) const TASKEXT_EXEC_ACCESS: TaskExtKey = sched::TASKEXT_EXEC_ACCESS;
 
 #[cfg(target_arch = "riscv64")]
 type RiscvVectorSignalStack = Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
@@ -162,6 +163,7 @@ impl TaskExtExitHook for KernelExtExitHook {
         }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
+        let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
         let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
@@ -310,6 +312,11 @@ fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[
     task.ext_install(TASKEXT_EXEC_ENVP, Arc::new(envp.to_vec()));
 }
 
+fn install_exec_access(task: &Arc<Task>, access: Arc<crate::user::ExecutableAccessSet>) {
+    let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
+    task.ext_install(TASKEXT_EXEC_ACCESS, access);
+}
+
 fn read_user_usize(user: usize) -> Result<usize, Errno> {
     let mut raw = [0u8; size_of::<usize>()];
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
@@ -430,17 +437,37 @@ fn process_execve(
     }
 
     let old_vm = task_vm_space(task);
-    let path = match request.path {
-        ExecPath::User(path_user) => {
-            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?
+    let (path, file) = match request.path {
+        ExecPath::User(path_user) => (
+            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?,
+            None,
+        ),
+        ExecPath::Kernel(path) => (path, None),
+        ExecPath::FileDescriptor(fd_raw) => {
+            let fdt = task_fdtable(task).ok_or(Errno::EBADF)?;
+            let file = fdt
+                .get_file(vfs::fdtable::Fd::from_raw(fd_raw))
+                .ok_or(Errno::EBADF)?;
+            let vfs_ctx = task
+                .ext_lookup(TASKEXT_VFS_CONTEXT)
+                .ok_or(Errno::EBADF)?
+                .downcast::<VfsContext>()
+                .map_err(|_| Errno::EBADF)?;
+            let display_path = general::vfs::namespace_path(&vfs_ctx, file.dentry(), file.mount())
+                .unwrap_or_else(|| alloc::format!("/proc/self/fd/{fd_raw}"));
+            (display_path, Some(file))
         }
-        ExecPath::Kernel(path) => path,
     };
     let mut used = path.len().checked_add(1).ok_or(Errno::EINVAL)?;
     let argv = collect_user_string_array(request.argv_user, &mut used)?;
     let envp = collect_user_string_array(request.envp_user, &mut used)?;
 
-    let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
+    let load_result = if let Some(file) = file {
+        crate::user::load_user_image_from_file(task, file, &path, &argv, &envp)
+    } else {
+        crate::user::load_user_image_from_path(task, &path, &argv, &envp)
+    };
+    let loaded = match load_result {
         Ok(loaded) => loaded,
         Err(err) => {
             if matches!(err, Errno::ENOEXEC | Errno::ENOENT) {
@@ -457,6 +484,7 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_access(task, Arc::clone(&loaded.exec_access));
     #[cfg(target_arch = "riscv64")]
     arch::riscv64::vector::clear_for_task(task);
     loaded.vm.activate();
@@ -495,6 +523,7 @@ fn process_spawn_user_process(
 
     let _ = child.ext_remove(TASKEXT_VM_SPACE);
     child.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_access(child, Arc::clone(&loaded.exec_access));
     install_exec_metadata(child, &loaded.exec_path, argv, envp);
     if let Some(fdt) = task_fdtable(child) {
         fdt.close_on_exec();
@@ -929,6 +958,7 @@ fn enter_loaded_user_image(
     let exec_path = loaded.exec_path.clone();
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_access(task, Arc::clone(&loaded.exec_access));
     install_exec_metadata(task, &exec_path, argv, envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();

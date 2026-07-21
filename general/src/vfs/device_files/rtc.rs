@@ -245,6 +245,10 @@ impl FileOps for RtcFileOps {
         self.dev.remove_irq_waiter(task);
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }

@@ -4,10 +4,9 @@
 //! 路径先改内存副本,调用 [`inode_wr::write_raw`] 落盘,最后同步到 VFS
 //! [`vfs::inode::Inode`] 的镜像字段(`size`/`nlink`/...)。
 //!
-//! 写路径统一的"降级策略":一旦要改写扩展了 extent 的文件,先走
-//! [`extent_wr::demote_if_extent`] 把它转成"空间接布局",之后所有扩容/截断
-//! 都走 [`map_wr`]。读路径不受影响 —— 读到的 extent 文件保持原样,直到
-//! 第一次写入才改动。
+//! 写路径统一的"降级策略":改写 extent 文件时必须保留仍在文件尺寸内的
+//! 数据映射，再转换成间接块布局；只有截断到零时才允许释放整棵 extent 树。
+//! 转换完成后的扩容和部分截断统一走 [`map_wr`]。
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -57,6 +56,40 @@ pub(crate) fn file_type_from_mode(mode: u16) -> FileType {
         S_IFSOCK => FileType::Socket,
         _ => FileType::Regular,
     }
+}
+
+/// 返回 ext 族文件系统中特殊文件对应的 inode 类型位和目录项类型。
+pub(crate) fn special_file_layout(kind: FileType) -> Option<(u16, u8)> {
+    match kind {
+        FileType::CharDevice => Some((S_IFCHR, DT_CHR)),
+        FileType::BlockDevice => Some((S_IFBLK, DT_BLK)),
+        FileType::Fifo => Some((S_IFIFO, DT_FIFO)),
+        FileType::Socket => Some((S_IFSOCK, DT_SOCK)),
+        FileType::Regular | FileType::Directory | FileType::Symlink => None,
+    }
+}
+
+/// 按 ext2/3/4 的 `i_block[0..2]` 约定编码设备号。
+pub(crate) fn encode_special_device(dev: DevId) -> VfsResult<(u32, u32)> {
+    if dev.major > 0x0fff || dev.minor > 0x0f_ffff {
+        return Err(VfsError::InvalidArgument);
+    }
+    if dev.major < 256 && dev.minor < 256 {
+        return Ok(((dev.major << 8) | dev.minor, 0));
+    }
+    let encoded = (dev.minor & 0xff) | (dev.major << 8) | ((dev.minor & !0xff) << 12);
+    Ok((0, encoded))
+}
+
+/// 解码 ext2/3/4 存储在 `i_block[0..2]` 中的设备号。
+pub(crate) fn decode_special_device(old: u32, new: u32) -> DevId {
+    if old != 0 {
+        return DevId::new((old >> 8) & 0xff, old & 0xff);
+    }
+    DevId::new(
+        (new & 0x000f_ff00) >> 8,
+        (new & 0xff) | ((new >> 12) & 0x000f_ff00),
+    )
 }
 
 fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
@@ -210,14 +243,21 @@ pub struct ExtInodeOps {
     /// superblock cache 中摘掉，因此打开文件不能再依赖 `sb.find_inode()` 找回
     /// 状态，否则会破坏 Linux 的 unlink-but-open 语义。
     pub(crate) raw: Arc<Spinlock<RawInode>>,
+    /// 命名 FIFO 的运行时数据通道。
+    ///
+    /// ext 磁盘格式只保存 FIFO inode 类型，缓冲区和打开端点属于内存态；同一
+    /// inode 的所有打开文件共享此对象，最后一个 inode 引用释放后自动销毁。
+    fifo: Option<Arc<vfs::pipe::Pipe>>,
 }
 
 impl ExtInodeOps {
     pub(crate) fn new(state: Arc<FsState>, ino: u32, bytes: Vec<u8>) -> Self {
+        let kind = file_type_from_mode(parse_inode_meta(&bytes).mode);
         Self {
             state,
             ino,
             raw: Arc::new(Spinlock::new(RawInode::new(ino, bytes))),
+            fifo: (kind == FileType::Fifo).then(vfs::pipe::new_fifo),
         }
     }
 
@@ -262,6 +302,14 @@ fn build_inode_for(
     }
     let (meta, raw) = load_inode(state, ino).map_err(map_err)?;
     let kind = file_type_from_mode(meta.mode);
+    let rdev = if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+        let block = i_block_slice(&raw);
+        let old = u32::from_le_bytes(block[0..4].try_into().unwrap());
+        let new = u32::from_le_bytes(block[4..8].try_into().unwrap());
+        decode_special_device(old, new)
+    } else {
+        DevId::new(0, 0)
+    };
     let mode = FileMode::new((meta.mode & 0o7777) as u16);
     let vmeta = InodeMeta {
         size: meta.size,
@@ -282,7 +330,7 @@ fn build_inode_for(
             ino: ino as u64,
         },
         kind,
-        DevId::new(0, 0),
+        rdev,
         block_size,
         None,
         vmeta,
@@ -409,8 +457,9 @@ impl InodeOps for ExtInodeOps {
         }
         // 新 inode:S_IFREG | perm
         let full_mode = (S_IFREG) | (mode.bits() & 0o7777);
-        let new_raw = create_disk_inode(&self.state, full_mode, cred.uid.0, cred.gid.0, false, 1)
-            .map_err(map_err)?;
+        let new_raw =
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, false, 1)
+                .map_err(map_err)?;
 
         // 在父目录插 entry
         let mut parent = lock_raw(&self.raw);
@@ -457,7 +506,7 @@ impl InodeOps for ExtInodeOps {
         // 新目录:S_IFDIR | perm,nlink=2("." 指自己),parent 的 nlink += 1
         let full_mode = S_IFDIR | (mode.bits() & 0o7777);
         let mut new_raw =
-            create_disk_inode(&self.state, full_mode, cred.uid.0, cred.gid.0, true, 2)
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, true, 2)
                 .map_err(map_err)?;
 
         // 给新目录分配第一个块,写入 "." / ".."
@@ -630,7 +679,7 @@ impl InodeOps for ExtInodeOps {
         }
         let full_mode = S_IFLNK | 0o777;
         let mut new_raw =
-            create_disk_inode(&self.state, full_mode, cred.uid.0, cred.gid.0, false, 1)
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, false, 1)
                 .map_err(map_err)?;
 
         let tbytes = target.as_bytes();
@@ -673,6 +722,66 @@ impl InodeOps for ExtInodeOps {
         .map_err(map_err)?;
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
+        parent.set_size(new_size);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
+        write_raw(&self.state, &parent).map_err(map_err)?;
+        sync_vfs_meta(inode, &parent);
+        drop(parent);
+
+        let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
+        build_inode_for(&self.state, &sb, new_raw.ino)
+    }
+
+    fn mknod(
+        &self,
+        inode: &Inode,
+        name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        self.check_writable()?;
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(VfsError::InvalidArgument);
+        }
+        let (type_mode, dir_type) = special_file_layout(kind).ok_or(VfsError::InvalidArgument)?;
+        if self.lookup(inode, name).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
+        let encoded_device = if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+            Some(encode_special_device(dev)?)
+        } else {
+            None
+        };
+
+        let full_mode = type_mode | (mode.bits() & 0o7777);
+        let mut new_raw =
+            create_disk_inode(&self.state, full_mode, cred.fsuid.0, cred.fsgid.0, false, 1)
+                .map_err(map_err)?;
+        if let Some((old, new)) = encoded_device {
+            new_raw.i_block_mut()[0..4].copy_from_slice(&old.to_le_bytes());
+            new_raw.i_block_mut()[4..8].copy_from_slice(&new.to_le_bytes());
+            write_raw(&self.state, &new_raw).map_err(map_err)?;
+        }
+
+        let mut parent = lock_raw(&self.raw);
+        let mut parent_block = copy_i_block(parent.i_block());
+        let mut parent_flags = parent.flags();
+        let new_size = dir_wr::insert_entry(
+            &self.state,
+            self.ino,
+            parent.generation(),
+            &mut parent_block,
+            &mut parent_flags,
+            parent.size(),
+            new_raw.ino,
+            dir_type,
+            name,
+        )
+        .map_err(map_err)?;
+        parent.i_block_mut().copy_from_slice(&parent_block);
+        parent.set_flags(parent_flags);
         parent.set_size(new_size);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
@@ -905,13 +1014,22 @@ impl InodeOps for ExtInodeOps {
         if new_size < cur_size {
             let mut ib = copy_i_block(raw.i_block());
             let mut flags = raw.flags();
-            // extent 文件先降级成间接布局再做精确释放
-            extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
 
             if new_size == 0 {
-                map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
+                if flags & EXT4_EXTENTS_FL != 0 {
+                    extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib)
+                        .map_err(map_err)?;
+                } else {
+                    map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
+                }
                 raw.set_blocks_lo(0);
             } else {
+                // 部分截断必须保留前缀数据，禁止使用会释放整棵 extent 树的降级路径。
+                if !extent_wr::demote_preserve_if_extent(&self.state, &mut flags, &mut ib)
+                    .map_err(map_err)?
+                {
+                    return Err(VfsError::NotSupported);
+                }
                 // 从第一个超出 new_size 的逻辑块开始全部释放
                 let first_free_lb = ((new_size + block_size - 1) / block_size) as u32;
                 map_wr::free_blocks_from(&self.state, &mut ib, first_free_lb).map_err(map_err)?;
@@ -1030,6 +1148,10 @@ impl InodeOps for ExtInodeOps {
                 self.ino,
                 Arc::clone(&self.raw),
             ))),
+            FileType::Fifo => vfs::pipe::open_fifo(
+                Arc::clone(self.fifo.as_ref().ok_or(VfsError::InvalidArgument)?),
+                opts,
+            ),
             _ => Err(VfsError::NotSupported),
         }
     }

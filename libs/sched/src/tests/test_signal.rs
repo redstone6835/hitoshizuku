@@ -6,7 +6,10 @@
 
 extern crate std;
 
-use crate::signal::{SharedSignal, SigAction, SigActionFlags, SigHandler, SigSet, SignalNumber};
+use crate::ids::Uid;
+use crate::signal::{
+    SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigSet, SignalNumber,
+};
 use ktest::ktest;
 
 /// 空集不包含任何信号。
@@ -123,4 +126,70 @@ fn signal_number_bit() {
 #[ktest]
 fn signal_number_as_usize() {
     assert_eq!(SignalNumber::SIGKILL.as_usize(), 9);
+}
+
+/// CLONE_CLEAR_SIGHAND 的信号表副本清除用户处理函数，但保留 SIG_IGN。
+#[ktest]
+fn clear_sighand_copy_resets_handlers_and_keeps_ignored_actions() {
+    let source = SharedSignal::new();
+    source.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            mask: SigSet::EMPTY.with(SignalNumber::SIGTERM),
+            flags: SigActionFlags(SigActionFlags::SA_RESTART),
+            restorer: 0x5678,
+        },
+    );
+    source.set_action(
+        SignalNumber::SIGUSR2,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+
+    let copied = source.fork_copy_clearing_handlers();
+
+    assert_eq!(
+        copied.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Default
+    );
+    assert_eq!(
+        copied.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+    assert_eq!(
+        source.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234)
+    );
+}
+
+/// CLONE_SIGHAND 共享处理表，但不能共享线程组 pending 队列。
+#[ktest]
+fn clone_sighand_shares_actions_without_sharing_pending() {
+    let parent = SharedSignal::new();
+    let child = parent.clone_sighand();
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        flags: SigActionFlags(0),
+        mask: SigSet::EMPTY,
+        restorer: 0,
+    };
+
+    child.set_action(SignalNumber::SIGUSR2, ignored);
+    assert_eq!(
+        parent.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+
+    parent.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR2,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    assert!(parent.pending_snapshot().has(SignalNumber::SIGUSR2));
+    assert!(!child.pending_snapshot().has(SignalNumber::SIGUSR2));
 }

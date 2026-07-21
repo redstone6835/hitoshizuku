@@ -158,9 +158,13 @@ pub struct UserPgdOps {
     ///
     /// # Safety
     /// 区间需位于用户半空间且属于本 PGD 拥有的页。
+    /// 页表修改完成后不会自动执行跨 CPU TLB 失效；调用方必须在不持有内部
+    /// 自旋锁的情况下单独调用 [`Self::invalidate_range`]。
     pub unmap: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize),
 
     /// 改变现有映射的权限。
+    /// 页表修改完成后不会自动执行跨 CPU TLB 失效；调用方必须在不持有内部
+    /// 自旋锁的情况下单独调用 [`Self::invalidate_range`]。
     pub protect: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags),
 
     /// fork 时把 src 的 [`range`] 区间已映射页拷到 dst。保底"全深拷"语义；

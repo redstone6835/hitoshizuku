@@ -205,7 +205,13 @@ fn fdtable_has_other_live_owner(task: &Arc<Task>, fdt: &Arc<vfs::fdtable::FdTabl
 
 pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let regs = hal::user::decode_clone_register_args(ctx.args);
-    let flags = CloneFlags::from_raw(regs.flags);
+    let mut raw_flags = regs.flags;
+    if CloneFlags::from_raw(raw_flags).has(CloneFlags::CLONE_THREAD) {
+        // 传统 clone ABI 把退出信号编码在 flags 低位；Linux 对线程克隆忽略该值。
+        // clone3 的 exit_signal 是独立字段，仍由通用校验严格要求为零。
+        raw_flags &= !CloneFlags::CSIGNAL;
+    }
+    let flags = CloneFlags::from_raw(raw_flags);
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[syscall][clone] flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
@@ -227,7 +233,7 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         parent_tid: regs.parent_tid,
         child_tid: regs.child_tid,
         tls: regs.tls,
-        exit_signal: regs.flags & 0xff,
+        exit_signal: raw_flags & CloneFlags::CSIGNAL,
         set_tid: 0,
         set_tid_size: 0,
         requested_pid: 0,
@@ -276,6 +282,9 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         requested_pid: 0,
         cgroup: read_u64(10) as usize,
     };
+    if (args.stack == 0) != (args.stack_size == 0) {
+        return Err(Errno::EINVAL);
+    }
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[syscall][clone3] flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
@@ -902,7 +911,7 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
-    let ns = crate::vdso::clock_time_ns(clock_id).ok_or(Errno::EINVAL)?;
+    let ns = clock_time_ns_for_task(ctx.task(), clock_id).ok_or(Errno::EINVAL)?;
     let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     let mut out = [0u8; 16];
@@ -910,6 +919,30 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     out[8..16].copy_from_slice(&nsec.to_le_bytes());
     copy_to_user(tp, &out).map_err(|e| e.as_errno())?;
     Ok(0)
+}
+
+const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+
+fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
+    match clock_id {
+        CLOCK_PROCESS_CPUTIME_ID => {
+            let now_ns = sched::now_ns_public();
+            let mut total = 0u64;
+            for member in task.thread_group().snapshot() {
+                let usage = member.usage_snapshot(now_ns);
+                total = total
+                    .saturating_add(usage.user_ns)
+                    .saturating_add(usage.system_ns);
+            }
+            Some(total)
+        }
+        CLOCK_THREAD_CPUTIME_ID => {
+            let usage = task.usage_snapshot(sched::now_ns_public());
+            Some(usage.user_ns.saturating_add(usage.system_ns))
+        }
+        _ => crate::vdso::clock_time_ns(clock_id),
+    }
 }
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -938,6 +971,7 @@ pub(super) fn sys_getcpu(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 }
 
 pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    ctx.disable_restart();
     let req_user = ctx.args[0];
     let rem_user = ctx.args[1];
     if req_user == 0 {
@@ -959,7 +993,7 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     match sleep_until_deadline(ctx.task(), deadline, || Ok(sched::now_ns_public())) {
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
-            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()));
+            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()))?;
             Err(Errno::EINTR)
         }
         Err(err) => Err(err),
@@ -1001,10 +1035,18 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    ctx.disable_restart();
     let clock_id = ctx.args[0] as i32;
     let flags = ctx.args[1];
     let req_user = ctx.args[2];
     let rem_user = ctx.args[3];
+    const TIMER_ABSTIME: usize = 1;
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if clock_id == CLOCK_THREAD_CPUTIME_ID as i32 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     if clock_id != crate::vdso::CLOCK_REALTIME as i32
         && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
         && clock_id != crate::vdso::CLOCK_MONOTONIC_RAW as i32
@@ -1022,7 +1064,6 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
-    const TIMER_ABSTIME: usize = 1;
     let absolute = (flags & TIMER_ABSTIME) != 0;
     let deadline = if absolute {
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
@@ -1044,7 +1085,10 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
             if !absolute {
-                write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()));
+                write_remaining_timespec(
+                    rem_user,
+                    deadline.saturating_sub(sched::now_ns_public()),
+                )?;
             }
             Err(Errno::EINTR)
         }
@@ -1106,9 +1150,9 @@ fn restore_current_task_after_sleep(task: &Arc<Task>) {
     task.cancel_profile_wait();
 }
 
-fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) {
+fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) -> Result<(), Errno> {
     if rem_user == 0 {
-        return;
+        return Ok(());
     }
     let remaining_ns = remaining_ns.min(i64::MAX as u64) as i64;
     let rem_sec = remaining_ns / 1_000_000_000;
@@ -1116,13 +1160,16 @@ fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) {
     let mut rem_buf = [0u8; 16];
     rem_buf[0..8].copy_from_slice(&rem_sec.to_le_bytes());
     rem_buf[8..16].copy_from_slice(&rem_nsec.to_le_bytes());
-    let _ = copy_to_user(rem_user, &rem_buf);
+    copy_to_user(rem_user, &rem_buf).map_err(|e| e.as_errno())
 }
 
 pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
-    let res_ns = crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)? as i64;
+    let res_ns = match clock_id {
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => 1,
+        _ => crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)?,
+    } as i64;
     if tp != 0 {
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&0i64.to_le_bytes());
@@ -1928,6 +1975,8 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const PR_GET_NAME: usize = 16;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
+    const PR_SET_TIMERSLACK: usize = 29;
+    const PR_GET_TIMERSLACK: usize = 30;
     match ctx.args[0] {
         PR_SET_NAME => {
             let name_user = ctx.args[1];
@@ -1968,6 +2017,11 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             install_credentials(ctx.task(), new);
             Ok(0)
         }
+        PR_SET_TIMERSLACK => {
+            ctx.task().set_timer_slack_ns(ctx.args[1] as u64);
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(ctx.task().timer_slack_ns().min(usize::MAX as u64) as usize),
         _ => Ok(0),
     }
 }
@@ -2140,6 +2194,15 @@ fn install_credentials(task: &Arc<Task>, new: Credentials) {
     }
 }
 
+const LINUX_FS_CAP_MASK: u64 = (1u64 << Capability::Chown as u32)
+    | (1u64 << Capability::DacOverride as u32)
+    | (1u64 << Capability::DacReadSearch as u32)
+    | (1u64 << Capability::Fowner as u32)
+    | (1u64 << Capability::Fsetid as u32)
+    | (1u64 << 9) // CAP_LINUX_IMMUTABLE
+    | (1u64 << 27) // CAP_MKNOD
+    | (1u64 << 32); // CAP_MAC_OVERRIDE
+
 fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     let lost_root_uid = (old.uid == Uid::ROOT || old.euid == Uid::ROOT || old.suid == Uid::ROOT)
         && new.uid != Uid::ROOT
@@ -2156,64 +2219,83 @@ fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
     } else if gained_effective_root {
         new.caps = new.cap_permitted;
     }
+
+    // Linux 将 fsuid=0 视为文件系统能力的开关，但不改变 permitted 集合。
+    if old.fsuid == Uid::ROOT && new.fsuid != Uid::ROOT {
+        new.caps = CapSet::from_raw(new.caps.raw() & !LINUX_FS_CAP_MASK);
+    } else if old.fsuid != Uid::ROOT && new.fsuid == Uid::ROOT {
+        new.caps = CapSet::from_raw(new.caps.raw() | (new.cap_permitted.raw() & LINUX_FS_CAP_MASK));
+    }
 }
 
 pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let uid = Uid(ctx.args[0] as u32);
+    if uid.0 == u32::MAX {
+        return Err(Errno::EINVAL);
+    }
     let creds = ctx.task().credentials();
-    if creds.euid == Uid::ROOT || creds.uid == uid || creds.euid == uid || creds.suid == uid {
-        let mut new = (*creds).clone();
+    let mut new = (*creds).clone();
+    if creds.has_cap(Capability::Setuid) {
         new.uid = uid;
         new.euid = uid;
         new.suid = uid;
         new.fsuid = uid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
-        install_credentials(ctx.task(), new);
-        Ok(0)
+    } else if uid == creds.uid || uid == creds.suid {
+        new.euid = uid;
+        new.fsuid = uid;
     } else {
-        Err(Errno::EPERM)
+        return Err(Errno::EPERM);
     }
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
+    Ok(0)
 }
 
 pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let gid = Gid(ctx.args[0] as u32);
+    if gid.0 == u32::MAX {
+        return Err(Errno::EINVAL);
+    }
     let creds = ctx.task().credentials();
-    if creds.euid == Uid::ROOT || creds.gid == gid || creds.egid == gid || creds.sgid == gid {
-        let mut new = (*creds).clone();
+    let mut new = (*creds).clone();
+    if creds.has_cap(Capability::Setgid) {
         new.gid = gid;
         new.egid = gid;
         new.sgid = gid;
         new.fsgid = gid;
-        drop_caps_after_uid_gid_change(&creds, &mut new);
-        install_credentials(ctx.task(), new);
-        Ok(0)
+    } else if gid == creds.gid || gid == creds.sgid {
+        new.egid = gid;
+        new.fsgid = gid;
     } else {
-        Err(Errno::EPERM)
+        return Err(Errno::EPERM);
     }
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
+    Ok(0)
 }
 
 pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let ruid = ctx.args[0] as u32;
     let euid = ctx.args[1] as u32;
     let creds = ctx.task().credentials();
+    let privileged = creds.has_cap(Capability::Setuid);
     let mut new = (*creds).clone();
     if ruid != u32::MAX {
-        if creds.euid != Uid::ROOT && ruid != creds.uid.0 && ruid != creds.euid.0 {
+        if !privileged && ruid != creds.uid.0 && ruid != creds.euid.0 {
             return Err(Errno::EPERM);
         }
         new.uid = Uid(ruid);
     }
     if euid != u32::MAX {
-        if creds.euid != Uid::ROOT
-            && euid != creds.uid.0
-            && euid != creds.euid.0
-            && euid != creds.suid.0
-        {
+        if !privileged && euid != creds.uid.0 && euid != creds.euid.0 && euid != creds.suid.0 {
             return Err(Errno::EPERM);
         }
         let new_euid = Uid(euid);
         new.euid = new_euid;
         new.fsuid = new_euid;
+    }
+    if ruid != u32::MAX || (euid != u32::MAX && euid != creds.uid.0) {
+        new.suid = new.euid;
     }
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
@@ -2224,24 +2306,24 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let rgid = ctx.args[0] as u32;
     let egid = ctx.args[1] as u32;
     let creds = ctx.task().credentials();
+    let privileged = creds.has_cap(Capability::Setgid);
     let mut new = (*creds).clone();
     if rgid != u32::MAX {
-        if creds.euid != Uid::ROOT && rgid != creds.gid.0 && rgid != creds.egid.0 {
+        if !privileged && rgid != creds.gid.0 && rgid != creds.egid.0 {
             return Err(Errno::EPERM);
         }
         new.gid = Gid(rgid);
     }
     if egid != u32::MAX {
-        if creds.euid != Uid::ROOT
-            && egid != creds.gid.0
-            && egid != creds.egid.0
-            && egid != creds.sgid.0
-        {
+        if !privileged && egid != creds.gid.0 && egid != creds.egid.0 && egid != creds.sgid.0 {
             return Err(Errno::EPERM);
         }
         let new_egid = Gid(egid);
         new.egid = new_egid;
         new.fsgid = new_egid;
+    }
+    if rgid != u32::MAX || (egid != u32::MAX && egid != creds.gid.0) {
+        new.sgid = new.egid;
     }
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
@@ -2253,7 +2335,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let euid = ctx.args[1] as u32;
     let suid = ctx.args[2] as u32;
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setuid) {
         if ruid != u32::MAX && ruid != creds.uid.0 && ruid != creds.euid.0 && ruid != creds.suid.0 {
             return Err(Errno::EPERM);
         }
@@ -2269,13 +2351,12 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.uid = Uid(ruid);
     }
     if euid != u32::MAX {
-        let new_euid = Uid(euid);
-        new.euid = new_euid;
-        new.fsuid = new_euid;
+        new.euid = Uid(euid);
     }
     if suid != u32::MAX {
         new.suid = Uid(suid);
     }
+    new.fsuid = new.euid;
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
@@ -2286,7 +2367,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let egid = ctx.args[1] as u32;
     let sgid = ctx.args[2] as u32;
     let creds = ctx.task().credentials();
-    if creds.euid != Uid::ROOT {
+    if !creds.has_cap(Capability::Setgid) {
         if rgid != u32::MAX && rgid != creds.gid.0 && rgid != creds.egid.0 && rgid != creds.sgid.0 {
             return Err(Errno::EPERM);
         }
@@ -2302,13 +2383,12 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.gid = Gid(rgid);
     }
     if egid != u32::MAX {
-        let new_egid = Gid(egid);
-        new.egid = new_egid;
-        new.fsgid = new_egid;
+        new.egid = Gid(egid);
     }
     if sgid != u32::MAX {
         new.sgid = Gid(sgid);
     }
+    new.fsgid = new.egid;
     drop_caps_after_uid_gid_change(&creds, &mut new);
     install_credentials(ctx.task(), new);
     Ok(0)
@@ -2318,14 +2398,16 @@ pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let uid = Uid(ctx.args[0] as u32);
     let creds = ctx.task().credentials();
     let old = creds.fsuid;
-    if creds.has_cap(Capability::Setuid)
-        || uid == creds.uid
-        || uid == creds.euid
-        || uid == creds.suid
-        || uid == creds.fsuid
+    if uid.0 != u32::MAX
+        && (creds.has_cap(Capability::Setuid)
+            || uid == creds.uid
+            || uid == creds.euid
+            || uid == creds.suid
+            || uid == creds.fsuid)
     {
         let mut new = (*creds).clone();
         new.fsuid = uid;
+        drop_caps_after_uid_gid_change(&creds, &mut new);
         install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
@@ -2335,11 +2417,12 @@ pub(super) fn sys_setfsgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let gid = Gid(ctx.args[0] as u32);
     let creds = ctx.task().credentials();
     let old = creds.fsgid;
-    if creds.has_cap(Capability::Setgid)
-        || gid == creds.gid
-        || gid == creds.egid
-        || gid == creds.sgid
-        || gid == creds.fsgid
+    if gid.0 != u32::MAX
+        && (creds.has_cap(Capability::Setgid)
+            || gid == creds.gid
+            || gid == creds.egid
+            || gid == creds.sgid
+            || gid == creds.fsgid)
     {
         let mut new = (*creds).clone();
         new.fsgid = gid;
@@ -4154,20 +4237,30 @@ pub(super) fn sys_execveat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
     let path = copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?;
 
+    if path.is_empty() && dirfd_raw as i32 != AT_FDCWD {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let fd_raw = u32::try_from(dirfd_raw).map_err(|_| Errno::EBADF)?;
+        let fd = Fd::from_raw(fd_raw);
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        if (flags & AT_SYMLINK_NOFOLLOW) != 0 && file.inode().kind() == vfs::stat::FileType::Symlink
+        {
+            return Err(Errno::ELOOP);
+        }
+        let request = ExecRequest::from_file_descriptor(fd_raw, argv_user, envp_user);
+        sched::operation::execve_with_context(request, UserContextRef::new(ctx.tf.as_usize()))?;
+        ctx.finalize_frame();
+        return Ok(0);
+    }
+
     let exec_path = if path.is_empty() {
         if (flags & AT_EMPTY_PATH) == 0 {
             return Err(Errno::ENOENT);
         }
-        if dirfd_raw as i32 == AT_FDCWD {
-            vfs::namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount())
-                .ok_or(Errno::ENOENT)?
-        } else {
-            let fd = Fd::from_raw(dirfd_raw as u32);
-            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
-            vfs::namespace_path(&vfs_ctx, file.dentry(), file.mount()).ok_or(Errno::ENOENT)?
-        }
+        vfs::namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount()).ok_or(Errno::ENOENT)?
     } else {
-        let dirfd = if dirfd_raw as i32 == AT_FDCWD {
+        let dirfd = if path.starts_with('/') || dirfd_raw as i32 == AT_FDCWD {
             vfs::path::Dirfd::Cwd
         } else {
             let file = fdt
