@@ -193,6 +193,7 @@ pub(crate) fn handle_ipi() {
     }
     // request_resched() 在发送 IPI 前已经发布目标 CPU 的 need_resched。
     let _ = action & IPI_RESCHEDULE;
+    sched::acknowledge_resched_notification();
 }
 
 fn local_tlb_flush(asid: usize, address: usize) {
