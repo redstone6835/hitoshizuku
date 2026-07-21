@@ -37,6 +37,8 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     let cpu1 = core.cpu(1).expect("cpu1 state");
 
     cpu1.request_resched();
+    assert!(cpu1.claim_resched_notification());
+    assert!(!cpu1.claim_resched_notification());
     cpu1.request_balance();
     cpu1.request_post_syscall_handoff(1);
     cpu1.request_post_syscall_handoff(1);
@@ -48,7 +50,19 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     assert!(cpu1.take_balance());
     assert_eq!(cpu1.take_post_syscall_handoff(), 1);
     assert!(cpu1.take_resched());
+    assert!(cpu1.claim_resched_notification());
     assert!(!cpu1.needs_resched());
+}
+
+#[ktest]
+fn reschedule_notification_can_be_rearmed_after_interrupt_ack() {
+    let scheduler = Scheduler::new();
+    let cpu = scheduler.cpu(0).expect("boot cpu state");
+
+    cpu.request_resched();
+    assert!(cpu.claim_resched_notification());
+    cpu.clear_resched_notification();
+    assert!(cpu.claim_resched_notification());
 }
 
 #[ktest]
@@ -115,6 +129,30 @@ fn scheduler_state_publishes_online_before_active() {
     assert!(!scheduler.mark_cpu_offline(cpu1));
     assert!(scheduler.deactivate_cpu(cpu1));
     assert!(scheduler.mark_cpu_offline(cpu1));
+}
+
+#[ktest]
+fn unbound_task_placement_does_not_use_compatibility_cpu_mirror() {
+    let scheduler = two_cpu_scheduler();
+    let busy = make_task();
+    bind_to_cpu(&scheduler, &busy, 0);
+    scheduler
+        .cpu_or_boot(0)
+        .runqueue()
+        .set_current(Arc::clone(&busy));
+
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+
+    assert_eq!(task.placement().state, PlacementState::Unbound);
+    assert_eq!(task.current_cpu(), 0);
+
+    let cpu_id = enqueue_task_on_scheduler(&scheduler, Arc::clone(&task), 1, false, true);
+
+    assert_eq!(cpu_id, 1);
+    assert_eq!(task.placement().cpu, CpuId::new(1));
+    assert!(scheduler.cpu_or_boot(1).runqueue().dequeue_queued(&task, 2));
+    let _ = scheduler.cpu_or_boot(0).runqueue().dequeue(&busy, 2);
 }
 
 #[ktest]
