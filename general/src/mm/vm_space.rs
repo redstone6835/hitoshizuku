@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use errno::Errno;
 use mm::{FileLike, SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
+use sched::sync::Spinlock;
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::ops::{PgdHandle, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
@@ -56,10 +57,10 @@ fn covered_len(areas: &[VmArea], range: &Range<usize>) -> usize {
     total
 }
 
-static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
-    spin::Mutex::new(BTreeMap::new());
-static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
-    spin::Mutex::new(BTreeMap::new());
+static SHARED_FILE_PAGES: Spinlock<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
+    Spinlock::new(BTreeMap::new());
+static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
+    Spinlock::new(BTreeMap::new());
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
@@ -285,8 +286,8 @@ impl Drop for ResidentPage {
 
 /// 进程地址空间。
 pub struct VmSpace {
-    vmas: spin::Mutex<VmaSet>,
-    pages: spin::Mutex<BTreeMap<usize, PageMapping>>,
+    vmas: Spinlock<VmaSet>,
+    pages: Spinlock<BTreeMap<usize, PageMapping>>,
     pgd: PgdHandle,
     brk_start: AtomicUsize,
     brk_current: AtomicUsize,
@@ -313,8 +314,8 @@ impl VmSpace {
         VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
-            vmas: spin::Mutex::new(VmaSet::new()),
-            pages: spin::Mutex::new(BTreeMap::new()),
+            vmas: Spinlock::new(VmaSet::new()),
+            pages: Spinlock::new(BTreeMap::new()),
             pgd,
             brk_start: AtomicUsize::new(layout.user_heap_base),
             brk_current: AtomicUsize::new(layout.user_heap_base),
@@ -1081,8 +1082,8 @@ impl VmSpace {
         VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
-            vmas: spin::Mutex::new(cloned_set),
-            pages: spin::Mutex::new(child_pages),
+            vmas: Spinlock::new(cloned_set),
+            pages: Spinlock::new(child_pages),
             pgd: new_pgd,
             brk_start: AtomicUsize::new(self.brk_start.load(Ordering::Relaxed)),
             brk_current: AtomicUsize::new(self.current_brk()),
