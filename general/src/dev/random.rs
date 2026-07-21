@@ -23,7 +23,11 @@ pub enum RandomReadMode {
     Secure { blocking: bool },
     /// 即使尚未完成安全播种也允许输出，只供显式请求的早期启动路径使用。
     Insecure,
-    /// 按输出长度扣减熵估计，对应 `/dev/random` 与 `GRND_RANDOM`。
+    /// 等待安全播种后输出，对应 `/dev/random` 与 `GRND_RANDOM`。
+    ///
+    /// 熵估计只用于判断 CSPRNG 是否已经完成初始化；初始化完成后，读取
+    /// 不会按输出长度耗尽一个有限的 credit 计数器。这与现代 Linux 的
+    /// `/dev/random` 语义一致，也避免一个正常的长读永久等待新的“熵位”。
     Entropy { blocking: bool },
 }
 

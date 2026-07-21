@@ -6,7 +6,10 @@
 
 extern crate std;
 
-use crate::signal::{SigSet, SignalNumber};
+use crate::ids::Uid;
+use crate::signal::{
+    SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigSet, SignalNumber,
+};
 use ktest::ktest;
 
 /// 空集不包含任何信号。
@@ -14,6 +17,40 @@ use ktest::ktest;
 fn sigset_empty() {
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGKILL));
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGTERM));
+}
+
+/// CLONE_CLEAR_SIGHAND 只重置已捕获的 handler，SIG_IGN 在子进程中保持。
+#[ktest]
+fn clear_sighand_copy_resets_handlers_but_keeps_ignored_signals() {
+    let parent = SharedSignal::new();
+    let caught = SigAction {
+        handler: SigHandler::Handler(0x1234),
+        mask: SigSet::EMPTY.with(SignalNumber::SIGTERM),
+        flags: SigActionFlags(SigActionFlags::SA_RESTART),
+        restorer: 0x5678,
+    };
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        mask: SigSet::EMPTY,
+        flags: SigActionFlags(0),
+        restorer: 0,
+    };
+    parent.set_action(SignalNumber::SIGUSR1, caught);
+    parent.set_action(SignalNumber::SIGUSR2, ignored);
+
+    let child = parent.fork_copy_clearing_handlers();
+    let child_caught = child.get_action(SignalNumber::SIGUSR1);
+    let child_ignored = child.get_action(SignalNumber::SIGUSR2);
+
+    assert!(matches!(child_caught.handler, SigHandler::Default));
+    assert_eq!(child_caught.mask, SigSet::EMPTY);
+    assert_eq!(child_caught.flags, SigActionFlags(0));
+    assert_eq!(child_caught.restorer, 0);
+    assert!(matches!(child_ignored.handler, SigHandler::Ignore));
+    assert!(matches!(
+        parent.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234)
+    ));
 }
 
 /// with 添加信号后 has 返回 true。
@@ -89,4 +126,70 @@ fn signal_number_bit() {
 #[ktest]
 fn signal_number_as_usize() {
     assert_eq!(SignalNumber::SIGKILL.as_usize(), 9);
+}
+
+/// CLONE_CLEAR_SIGHAND 的信号表副本清除用户处理函数，但保留 SIG_IGN。
+#[ktest]
+fn clear_sighand_copy_resets_handlers_and_keeps_ignored_actions() {
+    let source = SharedSignal::new();
+    source.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            mask: SigSet::EMPTY.with(SignalNumber::SIGTERM),
+            flags: SigActionFlags(SigActionFlags::SA_RESTART),
+            restorer: 0x5678,
+        },
+    );
+    source.set_action(
+        SignalNumber::SIGUSR2,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+
+    let copied = source.fork_copy_clearing_handlers();
+
+    assert_eq!(
+        copied.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Default
+    );
+    assert_eq!(
+        copied.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+    assert_eq!(
+        source.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234)
+    );
+}
+
+/// CLONE_SIGHAND 共享处理表，但不能共享线程组 pending 队列。
+#[ktest]
+fn clone_sighand_shares_actions_without_sharing_pending() {
+    let parent = SharedSignal::new();
+    let child = parent.clone_sighand();
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        flags: SigActionFlags(0),
+        mask: SigSet::EMPTY,
+        restorer: 0,
+    };
+
+    child.set_action(SignalNumber::SIGUSR2, ignored);
+    assert_eq!(
+        parent.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+
+    parent.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR2,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    assert!(parent.pending_snapshot().has(SignalNumber::SIGUSR2));
+    assert!(!child.pending_snapshot().has(SignalNumber::SIGUSR2));
 }

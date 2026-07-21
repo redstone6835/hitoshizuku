@@ -9,7 +9,7 @@ use alloc::collections::BTreeMap;
 
 use errno::Errno;
 
-use crate::vfs::file::File;
+use crate::vfs::file::{AccessMode, File};
 use crate::vfs::sync::Spinlock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +50,17 @@ static LEASES: Spinlock<BTreeMap<LeaseKey, LeaseState>> = Spinlock::new(BTreeMap
 
 /// 设置或释放当前进程在 inode 上的 lease。
 pub fn setlease(file: &File, owner_pid: i32, lease_type: LeaseType) -> Result<(), Errno> {
+    match (lease_type, file.flags().access) {
+        // Linux 只允许在只读描述符上建立读 lease；可写描述符上的读 lease
+        // 必须返回 EAGAIN，不能悄悄建立一个语义不成立的租约。
+        (LeaseType::Read, AccessMode::ReadOnly) => {}
+        (LeaseType::Read, _) => return Err(Errno::EAGAIN),
+        // 写 lease 要求描述符具备写权限，O_WRONLY 与 O_RDWR 均合法。
+        (LeaseType::Write, AccessMode::WriteOnly | AccessMode::ReadWrite) => {}
+        (LeaseType::Write, _) => return Err(Errno::EAGAIN),
+        (LeaseType::Unlock, _) => {}
+    }
+
     let key = LeaseKey::from_file(file);
     let mut leases = LEASES.lock();
     match lease_type {

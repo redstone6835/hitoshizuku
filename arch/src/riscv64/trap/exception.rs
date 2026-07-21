@@ -36,22 +36,41 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready() {
+        return;
+    }
+    let task = sched::current_task();
+    let _ =
+        sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
+    match task.state() {
+        sched::TaskState::Zombie | sched::TaskState::Dead => {
+            sched::schedule_once(kernel_timestamp_ns());
+            panic!("[trap][signal] terminal task scheduled back unexpectedly");
+        }
+        sched::TaskState::Stopped | sched::TaskState::Continued => {
+            sched::schedule_once(kernel_timestamp_ns());
+        }
+        _ => {}
+    }
+}
+
 /// 在从用户态 trap 返回前投递异步信号。
 ///
 /// syscall 返回路径已经在 `general::syscall::dispatch` 中带 trap-frame context
 /// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。
 fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
+    prepare_user_state_before_return(tf_ptr, from_user);
     if !from_user || !sched::is_ready() {
         return;
     }
     let task = sched::current_task();
-    if !task.signal.has_any_pending() && task.shared_signal_pending_bits_quick() == 0 {
-        return;
+    if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
+        let _ = sched::operation::deliver_pending_signals_for_task(
+            &task,
+            sched::UserContextRef::new(tf_ptr),
+        );
     }
-    let _ = sched::operation::deliver_pending_signals_for_task(
-        &task,
-        sched::UserContextRef::new(tf_ptr),
-    );
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
             sched::schedule_once(kernel_timestamp_ns());
@@ -115,6 +134,7 @@ fn sanitize_user_return_frame(tf_ptr: usize, trusted_satp: Option<usize>) {
 #[inline]
 fn finish_trap_return(tf_ptr: usize, from_user: bool) -> usize {
     if from_user {
+        prepare_user_state_before_return(tf_ptr, true);
         sanitize_user_return_frame(tf_ptr, None);
     }
     tf_ptr
@@ -240,8 +260,14 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
     let interrupt = decode_interrupt(cause);
 
     if code == IRQ_S_TIMER {
+        #[cfg(feature = "performance-profile")]
+        {
+            let pc = unsafe { trap_frame_ref(tf_ptr) }.sepc;
+            profiling::sample_pc(pc, from_user);
+        }
         // Timer 必须先重装 compare，否则 sret 后会立刻再次陷入。
         let now_ticks = time::rearm_periodic_timer();
+        general::dev::irq::record_timer_interrupt();
         let now_ns = time::stable_counter_to_ns(now_ticks);
         let _ = general::elm_guard::request_timeout_if_expired(now_ns);
         if !from_user {
@@ -274,6 +300,7 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
 
     if code == IRQ_S_SOFT {
         unsafe { Riscv64MessageInterruptOps::ack_ipi() };
+        crate::riscv64::smp::handle_ipi();
     }
 
     let sepc = unsafe { trap_frame_ref(tf_ptr) }.sepc;
@@ -308,6 +335,7 @@ fn handle_user_syscall(tf_ptr: usize) -> usize {
     if sched::needs_resched_current() {
         sched::preempt_if_needed(kernel_timestamp_ns());
     }
+    prepare_user_state_before_return(tf_ptr, true);
     sanitize_user_return_frame(tf_ptr, (nr == SYS_RT_SIGRETURN).then_some(original_satp));
     tf_ptr
 }
@@ -539,6 +567,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         sched::preempt_if_needed(kernel_timestamp_ns());
         require_full_restore = true;
     }
+    prepare_user_state_before_return(tf_ptr, true);
 
     let frame = unsafe { trap_frame_ref(tf_ptr) };
     // signal delivery、exec/sigreturn 或其它上下文重写都会改变 PC/SP。最小返回不会

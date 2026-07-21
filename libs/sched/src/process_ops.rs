@@ -36,13 +36,15 @@ impl UserContextRef {
     }
 }
 
-/// execve 的路径来源。
+/// execve 的执行映像来源。
 #[derive(Debug, Clone)]
 pub enum ExecPath {
     /// 用户 ABI 传入的 C 字符串指针，由 kernel ops 在当前地址空间解释。
     User(usize),
     /// syscall 层已经解析好的内核字符串，典型用于 `execveat` 的 dirfd 相对路径。
     Kernel(String),
+    /// 已打开文件描述符，供 `execveat(AT_EMPTY_PATH)` 直接执行其指向的对象。
+    FileDescriptor(u32),
 }
 
 /// execve 的 ABI 参数。argv/envp 仍是用户指针，路径可以来自用户指针或内核字符串。
@@ -65,6 +67,14 @@ impl ExecRequest {
     pub fn from_kernel_path(path: String, argv_user: usize, envp_user: usize) -> Self {
         Self {
             path: ExecPath::Kernel(path),
+            argv_user,
+            envp_user,
+        }
+    }
+
+    pub const fn from_file_descriptor(fd: u32, argv_user: usize, envp_user: usize) -> Self {
+        Self {
+            path: ExecPath::FileDescriptor(fd),
             argv_user,
             envp_user,
         }
@@ -96,6 +106,8 @@ pub struct ProcessImageOps {
     ) -> Result<(), Errno>,
     /// 从当前 signal frame 恢复用户态上下文。
     pub sigreturn: fn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno>,
+    /// 在恢复用户态前处理 rseq 等依赖当前 PC 和用户地址空间的线程状态。
+    pub prepare_user_return: fn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno>,
     /// 为用户 handler 构造 signal frame。
     pub setup_signal_frame: fn(
         task: &Arc<Task>,

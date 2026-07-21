@@ -10,9 +10,9 @@ use ktest::ktest;
 
 use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedAttr,
-    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
-    supported_cpu_mask,
+    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqEvent, RseqRegistration,
+    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskState,
+    TaskUsage, ThreadGroup, supported_cpu_mask,
 };
 
 unsafe fn init_test_context(
@@ -55,6 +55,38 @@ fn task_comm_is_nul_padded_and_truncated() {
 }
 
 #[ktest]
+fn thread_group_accounting_waits_for_last_member_and_aggregates_usage() {
+    let group = ThreadGroup::new();
+    let first = make_task();
+    let second = make_task();
+    group.add_member(&first);
+    group.add_member(&second);
+
+    assert!(!group.account_member_exit(TaskUsage {
+        user_ns: 10,
+        minflt: 2,
+        ..TaskUsage::default()
+    }));
+    assert!(group.account_member_exit(TaskUsage {
+        system_ns: 20,
+        majflt: 3,
+        ..TaskUsage::default()
+    }));
+    assert_eq!(
+        group.exited_usage_snapshot(),
+        TaskUsage {
+            user_ns: 10,
+            system_ns: 20,
+            minflt: 2,
+            majflt: 3,
+            ..TaskUsage::default()
+        }
+    );
+    assert!(group.try_claim_acct_record());
+    assert!(!group.try_claim_acct_record());
+}
+
+#[ktest]
 fn robust_list_and_rseq_state_roundtrip() {
     let task = make_task();
     task.set_robust_list(0x1000, 24);
@@ -74,8 +106,67 @@ fn robust_list_and_rseq_state_roundtrip() {
     };
     task.set_rseq_registration(rseq);
     assert_eq!(task.rseq_registration(), rseq);
+    task.mark_rseq_event(RseqEvent::Preempt);
+    assert!(task.rseq_events().contains(RseqEvent::Preempt));
+    task.publish_rseq_cpu(0);
+    task.publish_rseq_cpu(1);
+    assert!(task.rseq_events().contains(RseqEvent::Migrate));
     task.clear_rseq_registration();
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
+    assert!(task.rseq_events().is_empty());
+}
+
+#[ktest]
+fn pi_donation_tracks_nested_sources_and_restores_base_attr() {
+    let task = make_task();
+    task.set_sched_attr(SchedAttr::fair(8, 0));
+
+    let fair = task.pi_add_donation(1, SchedAttr::fair(-5, 0));
+    assert_eq!(fair.policy, SchedPolicy::Fair);
+    assert_eq!(fair.nice, -5);
+
+    let rt = task.pi_add_donation(2, SchedAttr::rt_fifo(40));
+    assert_eq!(rt.policy, SchedPolicy::RtFifo);
+    assert_eq!(rt.priority, 40);
+
+    let still_rt = task.pi_remove_donation(1);
+    assert_eq!(still_rt.policy, SchedPolicy::RtFifo);
+    assert_eq!(still_rt.priority, 40);
+
+    let restored = task.pi_remove_donation(2);
+    assert_eq!(restored.policy, SchedPolicy::Fair);
+    assert_eq!(restored.nice, 8);
+}
+
+#[ktest]
+fn pi_donation_preserves_base_update_until_last_waiter_leaves() {
+    let task = make_task();
+    task.set_sched_attr(SchedAttr::fair(10, 0));
+    let boosted = task.pi_add_donation(9, SchedAttr::rt_round_robin(30, 1_000_000));
+    task.sched.set_sched_attr(boosted);
+
+    task.set_sched_attr(SchedAttr::fair(3, 0));
+    assert_eq!(task.sched.policy(), SchedPolicy::RtFifo);
+    assert_eq!(task.sched.rt_priority(), 30);
+    assert_eq!(task.pi_base_attr().nice, 3);
+
+    let restored = task.pi_remove_donation(9);
+    assert_eq!(restored.policy, SchedPolicy::Fair);
+    assert_eq!(restored.nice, 3);
+}
+
+#[ktest]
+fn timer_slack_defaults_resets_and_inherits() {
+    let parent = make_task();
+    let child = make_task();
+
+    assert_eq!(parent.timer_slack_ns(), crate::DEFAULT_TIMER_SLACK_NS);
+    parent.set_timer_slack_ns(125_000);
+    child.inherit_timer_slack_from(&parent);
+    assert_eq!(child.timer_slack_ns(), 125_000);
+
+    child.set_timer_slack_ns(0);
+    assert_eq!(child.timer_slack_ns(), crate::DEFAULT_TIMER_SLACK_NS);
 }
 
 #[ktest]
@@ -212,6 +303,133 @@ fn runqueue_class_load_includes_current_task() {
     assert!(rq.dequeue(&current, 3));
 }
 
+/// CPU 使用时间只能累计任务实际作为 current 运行的区间。
+#[ktest]
+fn runqueue_accounts_current_cpu_runtime() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task), 100);
+    let current = rq.pick_next(100).expect("current task");
+
+    rq.tick(150);
+    assert_eq!(current.usage_snapshot(150).user_ns, 50);
+
+    assert!(rq.dequeue(&current, 200));
+    assert_eq!(current.usage_snapshot(300).user_ns, 100);
+    rq.tick(400);
+    assert_eq!(current.usage_snapshot(400).user_ns, 100);
+}
+
+#[ktest]
+fn runqueue_rt_bandwidth_throttles_fifo_and_replenishes_next_period() {
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));
+    let fair = make_task();
+    let rq = Runqueue::new_with_rt_bandwidth(100, 80);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    let first = rq.pick_next(1).expect("RT task should run first");
+    assert!(alloc::sync::Arc::ptr_eq(&first, &realtime));
+
+    assert!(!rq.tick(80));
+    assert!(rq.tick(81), "RT budget exhaustion must request reschedule");
+    let throttled_pick = rq
+        .pick_next(81)
+        .expect("fair fallback while RT is throttled");
+    assert!(alloc::sync::Arc::ptr_eq(&throttled_pick, &fair));
+
+    assert!(rq.tick(100), "new RT period must request reschedule");
+    let replenished = rq.pick_next(100).expect("RT task after replenishment");
+    assert!(alloc::sync::Arc::ptr_eq(&replenished, &realtime));
+
+    assert!(rq.dequeue(&realtime, 101));
+    assert!(rq.dequeue(&fair, 101));
+}
+
+#[ktest]
+fn runqueue_rt_bandwidth_charges_round_robin_runtime() {
+    let realtime = make_task();
+    realtime
+        .sched
+        .set_sched_attr(SchedAttr::rt_round_robin(30, 1_000));
+    let fair = make_task();
+    let rq = Runqueue::new_with_rt_bandwidth(100, 40);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(1).expect("RR task"),
+        &realtime
+    ));
+    assert!(rq.tick(41));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(41).expect("fair fallback"),
+        &fair
+    ));
+
+    assert!(rq.dequeue(&realtime, 42));
+    assert!(rq.dequeue(&fair, 42));
+}
+
+#[ktest]
+fn runqueue_zero_rt_runtime_stays_throttled_across_periods() {
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));
+    let fair = make_task();
+    let rq = Runqueue::new_with_rt_bandwidth(100, 80);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    rq.set_rt_bandwidth(100, 0, 0);
+
+    let first = rq.pick_next(1).expect("fair task with zero RT runtime");
+    assert!(alloc::sync::Arc::ptr_eq(&first, &fair));
+    assert!(!rq.tick(100));
+    let next_period = rq.pick_next(100).expect("fair task in next period");
+    assert!(alloc::sync::Arc::ptr_eq(&next_period, &fair));
+
+    assert!(rq.dequeue(&realtime, 101));
+    assert!(rq.dequeue(&fair, 101));
+}
+
+#[ktest]
+fn runqueue_pi_boosted_owner_bypasses_rt_throttle() {
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(40));
+    let fair = make_task();
+    let owner = make_task();
+    let effective = owner.pi_add_donation(7, SchedAttr::rt_fifo(60));
+    owner.sched.set_sched_attr(effective);
+    let rq = Runqueue::new_with_rt_bandwidth(100, 20);
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 0));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&fair), 0));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(1).expect("RT task"),
+        &realtime
+    ));
+    assert!(rq.tick(21));
+    assert!(alloc::sync::Arc::ptr_eq(
+        &rq.pick_next(21).expect("fair fallback"),
+        &fair
+    ));
+
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&owner), 22));
+    let boosted = rq.pick_next(22).expect("PI owner must bypass throttle");
+    assert!(alloc::sync::Arc::ptr_eq(&boosted, &owner));
+
+    let restored = owner.pi_remove_donation(7);
+    assert!(rq.update_sched_attr_raw(&owner, restored, 23));
+    let after_unlock = rq.pick_next(24).expect("fair task after PI unlock");
+    assert_eq!(after_unlock.sched.policy(), SchedPolicy::Fair);
+    assert!(!alloc::sync::Arc::ptr_eq(&after_unlock, &realtime));
+
+    assert!(rq.dequeue(&realtime, 25));
+    assert!(rq.dequeue(&fair, 25));
+    assert!(rq.dequeue(&owner, 25));
+}
+
 #[ktest]
 fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     let current = make_task();
@@ -232,6 +450,25 @@ fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
     assert_eq!(rq.nr_running(), 2);
     assert!(rq.dequeue(&current, 3));
     assert!(rq.dequeue(&idle, 3));
+}
+
+#[ktest]
+fn runqueue_wake_current_sleep_transition_does_not_duplicate_task() {
+    let task = make_task();
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&task));
+    task.set_state(TaskState::Sleeping);
+
+    assert!(!rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq.is_current(&task));
+    assert_eq!(task.state(), TaskState::Running);
+    assert!(!task.sched.on_rq());
+    assert_eq!(rq.nr_running(), 1);
+
+    let current = rq.pick_next(2).expect("current task");
+    assert!(alloc::sync::Arc::ptr_eq(&current, &task));
+    assert_eq!(rq.nr_running(), 1);
+    assert!(rq.dequeue(&current, 3));
 }
 
 #[ktest]

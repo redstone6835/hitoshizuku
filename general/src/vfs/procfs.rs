@@ -40,6 +40,8 @@ use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
+static FILE_MAX: AtomicU64 = AtomicU64::new(i64::MAX as u64);
+static KERNEL_TAINT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
 const ROOT_INO: u64 = 1;
 const FILESYSTEMS_INO: u64 = 2;
@@ -61,6 +63,14 @@ const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
+const INTERRUPTS_INO: u64 = 21;
+const SYS_FS_INO: u64 = 22;
+const SYS_FILE_MAX_INO: u64 = 23;
+const SYS_SCHED_RT_PERIOD_INO: u64 = 24;
+const SYS_SCHED_RT_RUNTIME_INO: u64 = 25;
+const SYS_SCHED_RR_TIMESLICE_INO: u64 = 26;
+const SYS_PIPE_MAX_SIZE_INO: u64 = 27;
+const SYS_TAINTED_INO: u64 = 28;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -205,6 +215,7 @@ enum RootFileKind {
     MemInfo,
     Uptime,
     Stat,
+    Interrupts,
     Devices,
     Pnp,
     DeviceFunctions,
@@ -228,6 +239,26 @@ enum ProcFileKind {
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
     SysPidMax,
+    SysFileMax,
+    SysSchedRtPeriod,
+    SysSchedRtRuntime,
+    SysSchedRrTimeslice,
+    SysPipeMaxSize,
+    SysTainted,
+}
+
+/// 返回当前内核故障污染位图。
+///
+/// 位值由故障来源自行定义；procfs 只负责提供稳定的十进制诊断视图。
+pub fn kernel_taint_flags() -> u64 {
+    KERNEL_TAINT_FLAGS.load(Ordering::Acquire)
+}
+
+/// 原子地记录内核故障污染标志，并返回更新后的完整位图。
+///
+/// 污染标志只能累加，不能在运行中清除，确保测试和诊断工具不会丢失已经发生的故障。
+pub fn mark_kernel_tainted(flags: u64) -> u64 {
+    KERNEL_TAINT_FLAGS.fetch_or(flags, Ordering::AcqRel) | flags
 }
 
 #[derive(Clone, Copy)]
@@ -337,6 +368,10 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("meminfo", mk_root_file(MEMINFO_INO, RootFileKind::MemInfo)),
         ("uptime", mk_root_file(UPTIME_INO, RootFileKind::Uptime)),
         ("stat", mk_root_file(STAT_INO, RootFileKind::Stat)),
+        (
+            "interrupts",
+            mk_root_file(INTERRUPTS_INO, RootFileKind::Interrupts),
+        ),
         ("devices", mk_root_file(DEVICES_INO, RootFileKind::Devices)),
         ("pnp", mk_root_file(PNP_INO, RootFileKind::Pnp)),
         (
@@ -880,6 +915,7 @@ impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
+            "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -891,11 +927,18 @@ impl InodeOps for ProcSysDirOps {
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
-            snapshot: vec![DirEntry {
-                ino: SYS_KERNEL_INO,
-                name: SmallStr::new("kernel"),
-                kind: FileType::Directory,
-            }],
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_KERNEL_INO,
+                    name: SmallStr::new("kernel"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_FS_INO,
+                    name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+            ],
         }))
     }
 
@@ -905,6 +948,80 @@ impl InodeOps for ProcSysDirOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+fn proc_sys_fs_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysFsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysFsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysFsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "file-max" => Ok(proc_sys_file_max_inode(self.fs_id, &self.weak_sb)),
+            "pipe-max-size" => Ok(proc_sys_pipe_max_size_inode(self.fs_id, &self.weak_sb)),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_FILE_MAX_INO,
+                    name: SmallStr::new("file-max"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_PIPE_MAX_SIZE_INO,
+                    name: SmallStr::new("pipe-max-size"),
+                    kind: FileType::Regular,
+                },
+            ],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_pipe_max_size_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_PIPE_MAX_SIZE_INO,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysPipeMaxSize,
+        }),
+    )
 }
 
 fn proc_sys_kernel_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
@@ -932,6 +1049,25 @@ impl InodeOps for ProcSysKernelDirOps {
         match name {
             "hotplug" => Ok(proc_sys_hotplug_inode(self.fs_id, &self.weak_sb)),
             "pid_max" => Ok(proc_sys_pid_max_inode(self.fs_id, &self.weak_sb)),
+            "sched_rt_period_us" => Ok(proc_sys_sched_inode(
+                self.fs_id,
+                &self.weak_sb,
+                SYS_SCHED_RT_PERIOD_INO,
+                ProcFileKind::SysSchedRtPeriod,
+            )),
+            "sched_rt_runtime_us" => Ok(proc_sys_sched_inode(
+                self.fs_id,
+                &self.weak_sb,
+                SYS_SCHED_RT_RUNTIME_INO,
+                ProcFileKind::SysSchedRtRuntime,
+            )),
+            "sched_rr_timeslice_ms" => Ok(proc_sys_sched_inode(
+                self.fs_id,
+                &self.weak_sb,
+                SYS_SCHED_RR_TIMESLICE_INO,
+                ProcFileKind::SysSchedRrTimeslice,
+            )),
+            "tainted" => Ok(proc_sys_tainted_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -952,6 +1088,26 @@ impl InodeOps for ProcSysKernelDirOps {
                 DirEntry {
                     ino: SYS_PID_MAX_INO,
                     name: SmallStr::new("pid_max"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_SCHED_RT_PERIOD_INO,
+                    name: SmallStr::new("sched_rt_period_us"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_SCHED_RT_RUNTIME_INO,
+                    name: SmallStr::new("sched_rt_runtime_us"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_SCHED_RR_TIMESLICE_INO,
+                    name: SmallStr::new("sched_rr_timeslice_ms"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_TAINTED_INO,
+                    name: SmallStr::new("tainted"),
                     kind: FileType::Regular,
                 },
             ],
@@ -991,6 +1147,51 @@ fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPidMax,
         }),
+    )
+}
+
+fn proc_sys_file_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FILE_MAX_INO,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysFileMax,
+        }),
+    )
+}
+
+fn proc_sys_tainted_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_TAINTED_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysTainted,
+        }),
+    )
+}
+
+fn proc_sys_sched_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    ino: u64,
+    kind: ProcFileKind,
+) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        ino,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps { kind }),
     )
 }
 
@@ -1549,7 +1750,18 @@ impl InodeOps for ProcRegularInodeOps {
                 HOTPLUG_PATH.lock().clear();
                 Ok(())
             }
+            ProcFileKind::SysSchedRtPeriod
+            | ProcFileKind::SysSchedRtRuntime
+            | ProcFileKind::SysSchedRrTimeslice
+                if size == 0 =>
+            {
+                Ok(())
+            }
             ProcFileKind::SysHotplug => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysFileMax if size == 0 => Ok(()),
+            ProcFileKind::SysFileMax => Err(VfsError::InvalidArgument),
+            ProcFileKind::SysPipeMaxSize if size == 0 => Ok(()),
+            ProcFileKind::SysPipeMaxSize => Err(VfsError::InvalidArgument),
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
     }
@@ -1584,6 +1796,38 @@ impl FileOps for ProcRegularFile {
                 let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
                 let trimmed = text.trim_end_matches(|ch| ch == '\n' || ch == '\0');
                 *HOTPLUG_PATH.lock() = String::from(trimmed);
+                Ok(buf.len())
+            }
+            ProcFileKind::SysFileMax => {
+                if offset != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let value = vfs::sysctl::parse_nonnegative_long(buf)?;
+                FILE_MAX.store(value, Ordering::Relaxed);
+                Ok(buf.len())
+            }
+            ProcFileKind::SysSchedRtPeriod => {
+                write_sched_sysctl(buf, offset, |value| sched::set_sched_rt_period_us(value))
+            }
+            ProcFileKind::SysSchedRtRuntime => {
+                write_sched_sysctl(buf, offset, |value| sched::set_sched_rt_runtime_us(value))
+            }
+            ProcFileKind::SysSchedRrTimeslice => {
+                write_sched_sysctl(buf, offset, |value| sched::set_sched_rr_timeslice_ms(value))
+            }
+            ProcFileKind::SysPipeMaxSize => {
+                if offset != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+                let value = text
+                    .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\0')
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                vfs::pipe::set_pipe_max_size(value).map_err(|err| match err {
+                    errno::Errno::EPERM => VfsError::OperationNotPermitted,
+                    _ => VfsError::InvalidArgument,
+                })?;
                 Ok(buf.len())
             }
             _ => Err(VfsError::ReadOnlyFilesystem),
@@ -1629,6 +1873,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::MemInfo => render_meminfo().into_bytes(),
             RootFileKind::Uptime => render_uptime().into_bytes(),
             RootFileKind::Stat => render_stat().into_bytes(),
+            RootFileKind::Interrupts => render_interrupts().into_bytes(),
             RootFileKind::Devices => render_devices().into_bytes(),
             RootFileKind::Pnp => render_pnp().into_bytes(),
             RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
@@ -1649,7 +1894,38 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysFileMax => Ok(render_file_max().into_bytes()),
+        ProcFileKind::SysSchedRtPeriod => {
+            Ok(format!("{}\n", sched::sched_rt_period_us()).into_bytes())
+        }
+        ProcFileKind::SysSchedRtRuntime => {
+            Ok(format!("{}\n", sched::sched_rt_runtime_us()).into_bytes())
+        }
+        ProcFileKind::SysSchedRrTimeslice => {
+            Ok(format!("{}\n", sched::sched_rr_timeslice_ms()).into_bytes())
+        }
+        ProcFileKind::SysTainted => Ok(format!("{}\n", kernel_taint_flags()).into_bytes()),
+        ProcFileKind::SysPipeMaxSize => {
+            Ok(format!("{}\n", vfs::pipe::pipe_max_size()).into_bytes())
+        }
     }
+}
+
+fn write_sched_sysctl(
+    buf: &[u8],
+    offset: u64,
+    update: impl FnOnce(i64) -> Result<(), errno::Errno>,
+) -> VfsResult<usize> {
+    if offset != 0 {
+        return Err(VfsError::InvalidArgument);
+    }
+    let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+    let value = text
+        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\0')
+        .parse::<i64>()
+        .map_err(|_| VfsError::InvalidArgument)?;
+    update(value).map_err(|_| VfsError::InvalidArgument)?;
+    Ok(buf.len())
 }
 
 fn parse_pid_component(name: &str) -> Option<PidT> {
@@ -1899,15 +2175,24 @@ fn task_session(task: &Arc<Task>) -> PidT {
         .unwrap_or(0)
 }
 
-fn task_memory_usage(task: &Arc<Task>) -> (u64, u64) {
+fn task_memory_usage(task: &Arc<Task>) -> (u64, u64, u64) {
     let Some(vm) = task_vm_space(task) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
-    let vsize = dump_vmas(&vm).into_iter().fold(0u64, |acc, (range, _)| {
-        acc.saturating_add((range.end - range.start) as u64)
-    });
+    let mut vsize = 0u64;
+    let mut data = 0u64;
+    for (range, flags) in dump_vmas(&vm) {
+        let size = (range.end - range.start) as u64;
+        vsize = vsize.saturating_add(size);
+        if flags.has(VmFlags::WRITE)
+            && !flags.has(VmFlags::SHARED)
+            && !flags.has(VmFlags::GROWS_DOWN)
+        {
+            data = data.saturating_add(size);
+        }
+    }
     let rss = vm.mapped_pages() as u64 * page_size() as u64;
-    (vsize, rss)
+    (vsize, rss, data)
 }
 
 fn task_thread_count(task: &Arc<Task>) -> usize {
@@ -1924,9 +2209,9 @@ fn render_task_status(task: &Arc<Task>) -> String {
     let fd_count = task_fdtable(task)
         .map(|fdt| fdt.snapshot_fds().len())
         .unwrap_or(0);
-    let (vsize, rss) = task_memory_usage(task);
+    let (vsize, rss, data) = task_memory_usage(task);
     format!(
-        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n",
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nThreads:\t{}\n",
         name,
         task_state_char(state),
         task_state_name(state),
@@ -1944,6 +2229,7 @@ fn render_task_status(task: &Arc<Task>) -> String {
         fd_count,
         vsize / 1024,
         rss / 1024,
+        data / 1024,
         task_thread_count(task),
     )
 }
@@ -1956,15 +2242,39 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let pgrp = task_pgrp(task);
     let session = task_session(task);
     let num_threads = task_thread_count(task);
-    let (vsize, rss_bytes) = task_memory_usage(task);
+    let (vsize, rss_bytes, _) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
-    // 这里按当前 Task 模型已经可观测的字段生成 Linux 兼容 stat。fault 计数、
-    // 累积 CPU 时间、信号掩码等尚未进入 sched/mm 的公共快照接口，因此兼容字段
-    // 保持 0，避免在 procfs 层伪造无法证明的数据。
+    let usage = task.usage_snapshot(sched::now_ns_public());
+    let child_usage = task.child_usage_snapshot();
+    let utime = proc_cpu_ticks(usage.user_ns);
+    let stime = proc_cpu_ticks(usage.system_ns);
+    let cutime = proc_cpu_ticks(child_usage.user_ns);
+    let cstime = proc_cpu_ticks(child_usage.system_ns);
+    let starttime = proc_cpu_ticks(task.start_time_ns());
+    // fault 计数、信号掩码等尚未进入 sched/mm 的公共快照接口，对应字段保持 0；
+    // 已有可靠来源的 CPU 时间、创建时间和内存字段必须按 Linux stat 位置导出。
     format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid, pgrp, session, num_threads, vsize, rss_pages,
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid,
+        comm,
+        state,
+        ppid,
+        pgrp,
+        session,
+        utime,
+        stime,
+        cutime,
+        cstime,
+        num_threads,
+        starttime,
+        vsize,
+        rss_pages,
     )
+}
+
+fn proc_cpu_ticks(ns: u64) -> u64 {
+    const USER_HZ: u64 = 100;
+    ns / (1_000_000_000 / USER_HZ)
 }
 
 fn render_task_cmdline(task: &Arc<Task>) -> Vec<u8> {
@@ -2068,6 +2378,10 @@ fn render_hotplug() -> String {
 
 fn render_pid_max() -> String {
     format!("{}\n", sched::pid::DEFAULT_PID_MAX)
+}
+
+fn render_file_max() -> String {
+    format!("{}\n", FILE_MAX.load(Ordering::Relaxed))
 }
 
 fn render_filesystems() -> String {
@@ -2489,6 +2803,52 @@ fn render_stat() -> String {
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
         processes, running, blocked
     )
+}
+
+fn render_interrupts() -> String {
+    let mut online_mask = sched::online_cpu_mask();
+    if online_mask == 0 {
+        online_mask = 1;
+    }
+    let mut out = String::new();
+    out.push_str("           ");
+    for cpu in 0..sched::NR_CPUS {
+        if online_mask & (1u64 << cpu) != 0 {
+            let _ = write!(out, "CPU{cpu:>7}");
+        }
+    }
+    out.push('\n');
+
+    let timer_counts = crate::dev::irq::timer_interrupt_counts();
+    let _ = write!(out, "  0:");
+    for cpu in 0..sched::NR_CPUS {
+        if online_mask & (1u64 << cpu) != 0 {
+            let _ = write!(out, " {:>10}", timer_counts[cpu]);
+        }
+    }
+    out.push_str("  timer\n");
+
+    for entry in crate::dev::irq::snapshot_irq_lines() {
+        let _ = write!(out, "{:>3}:", entry.proc_irq);
+        for cpu in 0..sched::NR_CPUS {
+            if online_mask & (1u64 << cpu) != 0 {
+                let _ = write!(out, " {:>10}", entry.counts[cpu]);
+            }
+        }
+        if entry.owners.is_empty() {
+            let _ = write!(out, "  {:?}", entry.line);
+        } else {
+            out.push_str("  ");
+            for (index, owner) in entry.owners.iter().enumerate() {
+                if index != 0 {
+                    out.push(',');
+                }
+                out.push_str(owner);
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn render_devices() -> String {

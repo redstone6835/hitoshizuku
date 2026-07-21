@@ -29,6 +29,7 @@ kernel-tests = [
     "log/ktest-kernel",
     "allocator/ktest-kernel",
 ]
+smp-tests = ["ktest/kernel"]
 network-tests = ["ktest/kernel"]
 
 [[bin]]

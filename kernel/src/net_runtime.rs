@@ -30,6 +30,7 @@ use net::flow::FlowKey;
 use net::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
 use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
+use net::runtime::WorkSignal;
 use net::stack::PendingNeighborTx;
 use net::transport::{
     LocalUdpIngressError, PreparedRawTx, PreparedTcpTx, PreparedUdpTx, RawTxError, TcpPacket,
@@ -100,7 +101,7 @@ pub fn arp_probe_complete() -> bool {
 pub fn request_udp_loopback_probe() {
     UDP_PROBE_REQUESTED.store(true, Ordering::Release);
     if let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref() {
-        cluster.coordinator().wake_owner();
+        cluster.coordinator().publish_work();
     }
     for task in WORKER_TASKS.lock().iter() {
         let _ = sched::activate_task(task);
@@ -117,7 +118,7 @@ pub fn request_physical_udp_probe() {
     ARP_PROBE_REQUESTED.store(true, Ordering::Release);
     PHYSICAL_UDP_PROBE_REQUESTED.store(true, Ordering::Release);
     if let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref() {
-        cluster.coordinator().wake_owner();
+        cluster.coordinator().publish_work();
     }
     for task in WORKER_TASKS.lock().iter() {
         let _ = sched::activate_task(task);
@@ -1124,14 +1125,12 @@ impl ListenerInstall {
                 loop {
                     match runtime.control.try_push(work) {
                         Ok(()) => {
-                            if !runtime.pending.swap(true, Ordering::AcqRel) {
-                                runtime.wake_owner();
-                            }
+                            runtime.publish_work();
                             break;
                         }
                         Err(pending) => {
                             work = pending;
-                            runtime.wake_owner();
+                            runtime.publish_work();
                             let _ = sched::operation::sched_yield();
                         }
                     }
@@ -1314,7 +1313,7 @@ struct ProtocolRuntime {
     control: BoundedMpsc<ControlWork>,
     dirty: BoundedMpsc<Arc<SocketFacade>>,
     lifecycle: BoundedMpsc<Arc<SocketFacade>>,
-    pending: AtomicBool,
+    work_signal: WorkSignal,
     owner_task: Spinlock<Option<Arc<sched::Task>>>,
     deadline_registration: AtomicU64,
     deadline_ns: AtomicU64,
@@ -1332,7 +1331,7 @@ impl ProtocolRuntime {
             control: BoundedMpsc::new(256),
             dirty: BoundedMpsc::new(4096),
             lifecycle: BoundedMpsc::new(4096),
-            pending: AtomicBool::new(false),
+            work_signal: WorkSignal::new(),
             owner_task: Spinlock::new(None),
             deadline_registration: AtomicU64::new(0),
             deadline_ns: AtomicU64::new(0),
@@ -1398,7 +1397,15 @@ impl ProtocolRuntime {
 
     fn wake_owner(&self) {
         if let Some(task) = self.owner_task.lock().as_ref().cloned() {
-            let _ = sched::activate_task_with_cpu_hint(&task, self.cpu);
+            // 通用入口能原地撤销“仍是 current、但已标记 Sleeping”的睡眠准备；
+            // 协议任务已有单核亲和性约束，不需要再使用一次性 CPU 提示。
+            let _ = sched::activate_task(&task);
+        }
+    }
+
+    fn publish_work(&self) {
+        if self.work_signal.publish_work() {
+            self.wake_owner();
         }
     }
 
@@ -1427,9 +1434,7 @@ impl ProtocolRuntime {
                 .ok();
             self.deadline_ns.store(0, Ordering::Release);
             self.timer_fired.store(true, Ordering::Release);
-            if !self.pending.swap(true, Ordering::AcqRel) {
-                self.wake_owner();
-            }
+            self.publish_work();
         }
     }
 
@@ -1450,25 +1455,17 @@ impl ProtocolRuntime {
     }
 
     fn publish_ingress(&self) {
-        if !self.pending.swap(true, Ordering::AcqRel) {
-            self.wake_owner();
-        }
+        self.publish_work();
     }
 
     fn finish_drain(&self) -> bool {
-        self.pending.store(false, Ordering::Release);
-        fence(Ordering::SeqCst);
-        if !self.ingress.is_empty()
-            || !self.control.is_empty()
-            || !self.dirty.is_empty()
-            || !self.lifecycle.is_empty()
-            || self.timer_fired.load(Ordering::Acquire)
-        {
-            self.pending.store(true, Ordering::Release);
-            true
-        } else {
-            false
-        }
+        self.work_signal.finish_drain(|| {
+            !self.ingress.is_empty()
+                || !self.control.is_empty()
+                || !self.dirty.is_empty()
+                || !self.lifecycle.is_empty()
+                || self.timer_fired.load(Ordering::Acquire)
+        })
     }
 }
 
@@ -1510,9 +1507,7 @@ impl ProtocolCluster {
             return Err(work);
         };
         runtime.control.try_push(work)?;
-        if !runtime.pending.swap(true, Ordering::AcqRel) {
-            runtime.wake_owner();
-        }
+        runtime.publish_work();
         Ok(())
     }
 
@@ -1526,14 +1521,12 @@ impl ProtocolCluster {
             loop {
                 match runtime.control.try_push(work) {
                     Ok(()) => {
-                        if !runtime.pending.swap(true, Ordering::AcqRel) {
-                            runtime.wake_owner();
-                        }
+                        runtime.publish_work();
                         break;
                     }
                     Err(pending) => {
                         work = pending;
-                        runtime.wake_owner();
+                        runtime.publish_work();
                         let _ = sched::operation::sched_yield();
                     }
                 }
@@ -1561,8 +1554,7 @@ impl sched::DeadlineObserver for ProtocolRuntime {
         {
             self.deadline_ns.store(0, Ordering::Release);
             self.timer_fired.store(true, Ordering::Release);
-            self.pending.store(true, Ordering::Release);
-            self.wake_owner();
+            self.publish_work();
         }
         None
     }
@@ -1576,9 +1568,7 @@ impl KernelSocketRuntime {
     }
 
     fn publish_work(&self, runtime: &ProtocolRuntime) {
-        if !runtime.pending.swap(true, Ordering::AcqRel) {
-            runtime.wake_owner();
-        }
+        runtime.publish_work();
     }
 }
 
@@ -1781,6 +1771,8 @@ fn ipv4_network(address: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
 
 const IFREQ_LEN: usize = 40;
 const IFNAMSIZ: usize = 16;
+const IFCONF_LEN: usize = 16;
+const IFCONF_BUF_PTR_OFFSET: usize = 8;
 const AF_INET: u16 = 2;
 const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: u16 = 0x1;
@@ -1789,6 +1781,7 @@ const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
 const IFF_MULTICAST: u16 = 0x1000;
 const SIOCGIFNAME: u32 = 0x8910;
+const SIOCGIFCONF: u32 = 0x8912;
 const SIOCGIFFLAGS: u32 = 0x8913;
 const SIOCSIFFLAGS: u32 = 0x8914;
 const SIOCGIFADDR: u32 = 0x8915;
@@ -1814,6 +1807,9 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
     if arg == 0 {
         return Err(Errno::EFAULT);
     }
+    if cmd == SIOCGIFCONF {
+        return ioctl_get_interface_config(arg);
+    }
     let mut ifreq = [0u8; IFREQ_LEN];
     copy_from_user(arg, &mut ifreq).map_err(|error| error.as_errno())?;
     if cmd == SIOCGIFNAME {
@@ -1822,7 +1818,7 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         let device = devices
             .iter()
             .find(|device| device.snapshot.id.raw() == index as u32)
-            .ok_or(Errno::ENODEV)?;
+            .ok_or(Errno::ENXIO)?;
         write_ifreq_name(&mut ifreq, device.snapshot.name.as_bytes());
         copy_to_user(arg, &ifreq).map_err(|error| error.as_errno())?;
         return Ok(0);
@@ -1937,6 +1933,61 @@ fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         _ => return Err(Errno::EOPNOTSUPP),
     }
     copy_to_user(arg, &ifreq).map_err(|error| error.as_errno())?;
+    Ok(0)
+}
+
+fn ioctl_get_interface_config(arg: usize) -> Result<usize, Errno> {
+    let mut ifconf = [0u8; IFCONF_LEN];
+    copy_from_user(arg, &mut ifconf).map_err(|error| error.as_errno())?;
+    let buffer_len = i32::from_ne_bytes(ifconf[..4].try_into().unwrap()).max(0) as usize;
+    let buffer = usize::from_ne_bytes(
+        ifconf[IFCONF_BUF_PTR_OFFSET..IFCONF_BUF_PTR_OFFSET + core::mem::size_of::<usize>()]
+            .try_into()
+            .unwrap(),
+    );
+    let devices: Vec<NetDeviceSnapshot> = DEVICES
+        .lock()
+        .iter()
+        .map(|device| device.snapshot.clone())
+        .collect();
+    let config = CONFIG_STORE.lock().as_ref().map(|store| store.snapshot());
+
+    let available = if buffer == 0 {
+        devices.len()
+    } else {
+        devices.len().min(buffer_len / IFREQ_LEN)
+    };
+    if buffer != 0 {
+        for (index, device) in devices.iter().take(available).enumerate() {
+            let mut ifreq = [0u8; IFREQ_LEN];
+            write_ifreq_name(&mut ifreq, device.name.as_bytes());
+            ifreq[16..18].copy_from_slice(&AF_INET.to_ne_bytes());
+            let interface = InterfaceId(device.id.raw());
+            if let Some(address) = config.as_ref().and_then(|snapshot| {
+                snapshot.addresses.iter().find_map(|entry| {
+                    (entry.interface == interface)
+                        .then_some(entry)
+                        .and_then(|entry| {
+                            if let IpAddr::V4(address) = entry.address {
+                                Some(address)
+                            } else {
+                                None
+                            }
+                        })
+                })
+            }) {
+                ifreq[20..24].copy_from_slice(&address.0);
+            }
+            let offset = index
+                .checked_mul(IFREQ_LEN)
+                .and_then(|offset| buffer.checked_add(offset))
+                .ok_or(Errno::EFAULT)?;
+            copy_to_user(offset, &ifreq).map_err(|error| error.as_errno())?;
+        }
+    }
+
+    ifconf[..4].copy_from_slice(&((available * IFREQ_LEN) as i32).to_ne_bytes());
+    copy_to_user(arg, &ifconf).map_err(|error| error.as_errno())?;
     Ok(0)
 }
 
@@ -2178,7 +2229,6 @@ struct WorkerContext {
     physical_udp_probe_queued: bool,
     control: Arc<WorkerControl>,
     stats: Arc<QueueRuntimeStats>,
-    inline_protocol: bool,
 }
 
 struct PendingWorker {
@@ -2236,12 +2286,20 @@ pub fn start_workers() {
     );
     vfs::net_socket::install_net_ioctl_handler(net_ioctl);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
+    let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();
-    let active_cpus = (0..sched::NR_CPUS)
+    // 设备 queue worker 仍可使用全部在线 CPU；协议状态必须遵循启动配置的 shard 数，
+    // 否则 host 与 net.stack ELM 会分别创建不同数量的状态分片。
+    let mut protocol_cpus = (0..sched::NR_CPUS)
         .filter(|cpu| online & (1u64 << cpu) != 0)
         .collect::<Vec<_>>();
-    assert!(!active_cpus.is_empty(), "NetWorker 没有 active CPU");
-    let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
+    assert!(!protocol_cpus.is_empty(), "NetWorker 没有 active CPU");
+    let protocol_shards = usize::from(boot.active_cpu_count());
+    assert!(
+        protocol_shards != 0 && protocol_shards <= protocol_cpus.len(),
+        "网络协议 shard 数量与在线 CPU 不一致"
+    );
+    protocol_cpus.truncate(protocol_shards);
     let devices = DEVICES.lock();
     let config = Arc::new(ConfigStore::new(build_device_config(&devices, 1)));
     *CONFIG_STORE.lock() = Some(Arc::clone(&config));
@@ -2251,7 +2309,7 @@ pub fn start_workers() {
         control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_public()),
         "net.stack 自动配置状态初始化失败"
     );
-    let runtimes = active_cpus
+    let runtimes = protocol_cpus
         .iter()
         .enumerate()
         .map(|(index, cpu)| {
@@ -2301,7 +2359,9 @@ pub fn start_workers() {
                 slice_ns: 0,
             },
         );
-        task.set_cpu_affinity(online);
+        // 每个协议 shard 的队列、timer、waker 与 ELM pinned call 都归属于
+        // runtime.cpu；允许迁移会让多个 shard 争用同一 CPU 的调用槽。
+        task.set_cpu_affinity(1u64 << runtime.cpu);
         runtime.set_owner_task(Arc::clone(&task));
         protocol_tasks.push((task, runtime.cpu, slot));
     }
@@ -2443,7 +2503,6 @@ pub(crate) fn reconcile_devices() {
             physical_udp_probe_queued: false,
             control: pending.control,
             stats: pending.stats,
-            inline_protocol: false,
         });
         let slot = {
             let mut starts = WORKER_STARTS.lock();
@@ -3205,14 +3264,12 @@ impl ProtocolContext {
             loop {
                 match runtime.control.try_push(work) {
                     Ok(()) => {
-                        if !runtime.pending.swap(true, Ordering::AcqRel) {
-                            runtime.wake_owner();
-                        }
+                        runtime.publish_work();
                         break;
                     }
                     Err(pending) => {
                         work = pending;
-                        runtime.wake_owner();
+                        runtime.publish_work();
                         let _ = sched::operation::sched_yield();
                     }
                 }
@@ -3461,14 +3518,12 @@ impl ProtocolContext {
         loop {
             match target.control.try_push(control) {
                 Ok(()) => {
-                    if !target.pending.swap(true, Ordering::AcqRel) {
-                        target.wake_owner();
-                    }
+                    target.publish_work();
                     return;
                 }
                 Err(pending) => {
                     control = pending;
-                    target.wake_owner();
+                    target.publish_work();
                     let _ = sched::operation::sched_yield();
                 }
             }
@@ -3933,14 +3988,12 @@ impl ProtocolContext {
                             loop {
                                 match runtime.control.try_push(work) {
                                     Ok(()) => {
-                                        if !runtime.pending.swap(true, Ordering::AcqRel) {
-                                            runtime.wake_owner();
-                                        }
+                                        runtime.publish_work();
                                         break;
                                     }
                                     Err(pending) => {
                                         work = pending;
-                                        runtime.wake_owner();
+                                        runtime.publish_work();
                                         let _ = sched::operation::sched_yield();
                                     }
                                 }
@@ -4213,14 +4266,12 @@ impl ProtocolContext {
             loop {
                 match target.control.try_push(work) {
                     Ok(()) => {
-                        if !target.pending.swap(true, Ordering::AcqRel) {
-                            target.wake_owner();
-                        }
+                        target.publish_work();
                         break;
                     }
                     Err(pending) => {
                         work = pending;
-                        target.wake_owner();
+                        target.publish_work();
                         let _ = sched::operation::sched_yield();
                     }
                 }
@@ -4651,26 +4702,36 @@ impl ProtocolContext {
         let task = sched::current_task();
         #[cfg(feature = "performance-profile")]
         task.begin_profile_wait(sched::WaitReason::Other, sched::now_ns_public());
+        if !self.runtime.work_signal.begin_sleep() {
+            self.runtime.work_signal.end_sleep();
+            #[cfg(feature = "performance-profile")]
+            task.cancel_profile_wait();
+            return;
+        }
         if !task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
+            self.runtime.work_signal.end_sleep();
             #[cfg(feature = "performance-profile")]
             task.cancel_profile_wait();
             return;
         }
         fence(Ordering::SeqCst);
-        if !self.runtime.ingress.is_empty()
+        if self.runtime.work_signal.sleep_invalidated()
+            || self.runtime.timer_fired.load(Ordering::Acquire)
+            || !self.runtime.ingress.is_empty()
             || !self.runtime.control.is_empty()
             || !self.runtime.dirty.is_empty()
             || !self.runtime.lifecycle.is_empty()
             || self.local_queue_pending()
         {
-            self.runtime.pending.store(true, Ordering::Release);
             let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running);
+            self.runtime.work_signal.end_sleep();
             #[cfg(feature = "performance-profile")]
             task.cancel_profile_wait();
             return;
         }
         drop(task);
         sched::schedule_once(sched::now_ns_public());
+        self.runtime.work_signal.end_sleep();
     }
 }
 
@@ -5139,11 +5200,7 @@ impl WorkerContext {
         for (index, published) in published.into_iter().enumerate() {
             if published {
                 let target = &self.protocol_cluster.shards[index];
-                if self.inline_protocol {
-                    target.pending.store(true, Ordering::Release);
-                } else {
-                    target.publish_ingress();
-                }
+                target.publish_ingress();
             }
         }
     }

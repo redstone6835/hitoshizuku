@@ -26,6 +26,18 @@ pub fn install_net_ioctl_handler(handler: fn(u32, usize) -> Result<usize, Errno>
     *NET_IOCTL_HANDLER.lock() = Some(handler);
 }
 
+/// 将 socket ioctl 交给当前网络运行时处理。
+///
+/// Linux 的接口查询 ioctl 并不要求文件描述符来自 INET socket；glibc 的
+/// `if_nametoindex()` 等接口通常会使用 AF_UNIX 数据报 socket。因此所有 socket
+/// 类型必须共享同一个网络 ioctl 分派入口。
+pub fn dispatch_net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
+    let Some(handler) = *NET_IOCTL_HANDLER.lock() else {
+        return Err(Errno::ENOTTY);
+    };
+    handler(cmd, arg)
+}
+
 pub fn install_net_realtime_clock(clock: fn() -> u64) {
     *NET_REALTIME_CLOCK.lock() = Some(clock);
 }
@@ -228,9 +240,10 @@ impl NetSocketFileOps {
         &self.send_timeout_ns
     }
 
-    pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
+    pub fn bind(&self, sockaddr: &[u8], allow_privileged_port: bool) -> Result<(), Errno> {
         self.ensure_backend()?;
         let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family())?;
+        validate_bind_permission(&local, allow_privileged_port)?;
         let options = self.bind_options_for(local.addr);
         let interface = self.options.lock().bind_interface;
         self.proxy
@@ -268,7 +281,10 @@ impl NetSocketFileOps {
 
     pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
         self.ensure_backend()?;
-        let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family())?;
+        let peer = normalize_connect_endpoint(crate::addr::parse_inet_sockaddr_for_socket(
+            sockaddr,
+            self.family(),
+        )?);
         let interface = self.options.lock().bind_interface;
         let options = self.bind_options();
         self.proxy
@@ -463,6 +479,29 @@ impl NetSocketFileOps {
     }
 }
 
+pub(crate) fn normalize_connect_endpoint(mut endpoint: net::Endpoint) -> net::Endpoint {
+    endpoint.addr = match endpoint.addr {
+        net::IpAddr::V4(address) if address == net::Ipv4Addr::UNSPECIFIED => {
+            net::IpAddr::V4(net::Ipv4Addr::LOCALHOST)
+        }
+        net::IpAddr::V6(address) if address == net::Ipv6Addr::UNSPECIFIED => {
+            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST)
+        }
+        address => address,
+    };
+    endpoint
+}
+
+pub(crate) fn validate_bind_permission(
+    endpoint: &net::Endpoint,
+    allow_privileged_port: bool,
+) -> Result<(), Errno> {
+    if endpoint.port != 0 && endpoint.port < 1024 && !allow_privileged_port {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
 impl FileOps for NetSocketFileOps {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         self.recvfrom(
@@ -551,6 +590,10 @@ impl FileOps for NetSocketFileOps {
         Some(&self.poll_source)
     }
 
+    fn is_epollable(&self) -> bool {
+        true
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }
@@ -586,10 +629,7 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
-        let Some(handler) = *NET_IOCTL_HANDLER.lock() else {
-            return Err(Errno::ENOTTY);
-        };
-        handler(cmd.raw() as u32, arg)
+        dispatch_net_ioctl(cmd.raw() as u32, arg)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -1,7 +1,7 @@
 /*
  * RISC-V64 vDSO 用户态代码段。
  *
- * clock_gettime/gettimeofday/getcpu/clock_getres 快路径读取紧邻代码页的共享
+ * clock_gettime/gettimeofday/clock_getres 快路径读取紧邻代码页的共享
  * 数据页；共享页由 kernel 以 seqlock 协议更新。boot 阶段为当前 hart 设置
  * scounteren.TIME，因此用户态可以直接执行 rdtime；共享页无效时回退 syscall。
  */
@@ -301,25 +301,9 @@ __mygo_rv64_vdso_clock_getres:
 .balign 4
 .global __mygo_rv64_vdso_getcpu
 __mygo_rv64_vdso_getcpu:
-    lla     t0, __mygo_rv64_vdso_data_anchor
-
-.Lgetcpu_retry:
-    lwu     t1, VDSO_DATA_SEQ_OFFSET(t0)
-    andi    t2, t1, 1
-    bnez    t2, .Lgetcpu_retry
-    fence   r, r
-    lwu     t3, VDSO_DATA_CPU_ID_OFFSET(t0)
-    lwu     t4, VDSO_DATA_NODE_ID_OFFSET(t0)
-    fence   r, r
-    lwu     t2, VDSO_DATA_SEQ_OFFSET(t0)
-    bne     t1, t2, .Lgetcpu_retry
-    beqz    a0, .Lgetcpu_node
-    sw      t3, 0(a0)
-.Lgetcpu_node:
-    beqz    a1, .Lgetcpu_success
-    sw      t4, 0(a1)
-.Lgetcpu_success:
-    li      a0, 0
+    /* 共享数据页无法表达调用者所在 CPU，多核下必须回退内核查询。 */
+    li      a7, SYS_GETCPU
+    ecall
     ret
 
 .global __mygo_rv64_vdso_text_end

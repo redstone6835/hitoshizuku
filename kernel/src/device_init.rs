@@ -473,13 +473,23 @@ pub fn activate_device_subsystem(
         );
     }
 
+    printk!(
+        "[kernel-start][{}] registered configured ELM device drivers",
+        tag
+    );
+}
+
+/// 在辅助 CPU 启动完成后安装网络 host、driver 与 stack 的共享启动配置。
+pub fn install_network_boot_config() {
     let mut material = [0u8; 112];
     general::dev::random::fill(
         &mut material,
         general::dev::random::RandomReadMode::Insecure,
     )
     .expect("random ELM 未提供网络启动密钥材料");
-    let active_cpu_count = sched::online_cpu_mask().count_ones().clamp(1, 8) as u8;
+    let online_cpu_count = sched::online_cpu_mask().count_ones();
+    let active_cpu_count =
+        net::boot::select_protocol_shard_count(online_cpu_count).expect("网络启动时没有在线 CPU");
     let (host_config, driver_config, stack_config) =
         net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
             .expect("active CPU count 超出网络栈范围")
@@ -489,13 +499,9 @@ pub fn activate_device_subsystem(
         .expect("网络运行时被重复安装");
     net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
         .expect("网络 stack broker 被重复安装");
-    printk!(
-        "[kernel-start][{}] installed network boot config and registrars",
-        tag
-    );
-
-    printk!(
-        "[kernel-start][{}] registered configured ELM device drivers",
-        tag
+    log::info!(
+        "[kernel] installed network boot config: online_cpus={} protocol_shards={}",
+        online_cpu_count,
+        active_cpu_count
     );
 }

@@ -98,8 +98,17 @@ pub enum VfsError {
     /// 设备不存在或驱动未就绪（ENODEV）。
     NoDevice,
 
+    /// 指定偏移不存在数据或空洞，或设备地址无效（ENXIO）。
+    NoSuchDeviceOrAddress,
+
     /// 设备忙，操作无法立即完成（EBUSY）。
     DeviceBusy,
+
+    /// 正在执行的普通文件不能被写打开或截断（ETXTBSY）。
+    ///
+    /// 该错误与一般设备繁忙不同：它专门表示 inode 的执行映像租约与写访问租约
+    /// 冲突，调用方不能将其降级为 EBUSY。
+    TextFileBusy,
 
     // ── 操作语义 ──────────────────────────────────────────────────────────────
     /// 传入的参数无效（EINVAL）。
@@ -155,7 +164,9 @@ impl VfsError {
             VfsError::TooManyLinks => Errno::EMLINK,
             VfsError::Io => Errno::EIO,
             VfsError::NoDevice => Errno::ENODEV,
+            VfsError::NoSuchDeviceOrAddress => Errno::ENXIO,
             VfsError::DeviceBusy => Errno::EBUSY,
+            VfsError::TextFileBusy => Errno::ETXTBSY,
             VfsError::InvalidArgument => Errno::EINVAL,
             VfsError::NotSupported => Errno::EOPNOTSUPP,
             VfsError::IllegalSeek => Errno::ESPIPE,

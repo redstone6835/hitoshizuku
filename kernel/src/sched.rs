@@ -26,7 +26,9 @@ use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecPath, ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
-use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskPreExitHook};
+use sched::task::{
+    TaskExitAccountingHook, TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskPreExitHook,
+};
 use sched::{
     TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
@@ -43,6 +45,7 @@ static BOOT_CONSOLE_NAME: Spinlock<Option<alloc::string::String>> = Spinlock::ne
 pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = sched::TASKEXT_EXEC_PATH;
 pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
 pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
+pub(crate) const TASKEXT_EXEC_ACCESS: TaskExtKey = sched::TASKEXT_EXEC_ACCESS;
 
 #[cfg(target_arch = "riscv64")]
 type RiscvVectorSignalStack = Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
@@ -160,6 +163,7 @@ impl TaskExtExitHook for KernelExtExitHook {
         }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
+        let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
         let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
@@ -167,6 +171,16 @@ impl TaskExtExitHook for KernelExtExitHook {
 }
 
 static EXIT_HOOK: KernelExtExitHook = KernelExtExitHook;
+
+struct KernelExitAccountingHook;
+
+impl TaskExitAccountingHook for KernelExitAccountingHook {
+    fn account_on_exit(&self, task: &Task) {
+        crate::acct::account_task_exit(task);
+    }
+}
+
+static EXIT_ACCOUNTING_HOOK: KernelExitAccountingHook = KernelExitAccountingHook;
 
 struct KernelPreExitHook;
 
@@ -212,6 +226,7 @@ fn publish_task_cpu_state(task: &Arc<Task>, cpu_id: usize) {
     let Ok(cpu) = u32::try_from(cpu_id) else {
         return;
     };
+    task.publish_rseq_cpu(cpu_id);
     let Some(start_addr) = registration.ptr.checked_add(RSEQ_CPU_ID_START_OFFSET) else {
         return;
     };
@@ -295,6 +310,11 @@ fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[
 
     let _ = task.ext_remove(TASKEXT_EXEC_ENVP);
     task.ext_install(TASKEXT_EXEC_ENVP, Arc::new(envp.to_vec()));
+}
+
+fn install_exec_access(task: &Arc<Task>, access: Arc<crate::user::ExecutableAccessSet>) {
+    let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
+    task.ext_install(TASKEXT_EXEC_ACCESS, access);
 }
 
 fn read_user_usize(user: usize) -> Result<usize, Errno> {
@@ -417,17 +437,37 @@ fn process_execve(
     }
 
     let old_vm = task_vm_space(task);
-    let path = match request.path {
-        ExecPath::User(path_user) => {
-            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?
+    let (path, file) = match request.path {
+        ExecPath::User(path_user) => (
+            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?,
+            None,
+        ),
+        ExecPath::Kernel(path) => (path, None),
+        ExecPath::FileDescriptor(fd_raw) => {
+            let fdt = task_fdtable(task).ok_or(Errno::EBADF)?;
+            let file = fdt
+                .get_file(vfs::fdtable::Fd::from_raw(fd_raw))
+                .ok_or(Errno::EBADF)?;
+            let vfs_ctx = task
+                .ext_lookup(TASKEXT_VFS_CONTEXT)
+                .ok_or(Errno::EBADF)?
+                .downcast::<VfsContext>()
+                .map_err(|_| Errno::EBADF)?;
+            let display_path = general::vfs::namespace_path(&vfs_ctx, file.dentry(), file.mount())
+                .unwrap_or_else(|| alloc::format!("/proc/self/fd/{fd_raw}"));
+            (display_path, Some(file))
         }
-        ExecPath::Kernel(path) => path,
     };
     let mut used = path.len().checked_add(1).ok_or(Errno::EINVAL)?;
     let argv = collect_user_string_array(request.argv_user, &mut used)?;
     let envp = collect_user_string_array(request.envp_user, &mut used)?;
 
-    let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
+    let load_result = if let Some(file) = file {
+        crate::user::load_user_image_from_file(task, file, &path, &argv, &envp)
+    } else {
+        crate::user::load_user_image_from_path(task, &path, &argv, &envp)
+    };
+    let loaded = match load_result {
         Ok(loaded) => loaded,
         Err(err) => {
             if matches!(err, Errno::ENOEXEC | Errno::ENOENT) {
@@ -444,6 +484,7 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_access(task, Arc::clone(&loaded.exec_access));
     #[cfg(target_arch = "riscv64")]
     arch::riscv64::vector::clear_for_task(task);
     loaded.vm.activate();
@@ -482,6 +523,7 @@ fn process_spawn_user_process(
 
     let _ = child.ext_remove(TASKEXT_VM_SPACE);
     child.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_access(child, Arc::clone(&loaded.exec_access));
     install_exec_metadata(child, &loaded.exec_path, argv, envp);
     if let Some(fdt) = task_fdtable(child) {
         fdt.close_on_exec();
@@ -801,6 +843,7 @@ static PROCESS_IMAGE_OPS: ProcessImageOps = ProcessImageOps {
     execve: process_execve,
     clone_user_context: process_clone_user_context,
     sigreturn: process_sigreturn,
+    prepare_user_return: crate::rseq::prepare_user_return,
     setup_signal_frame: process_setup_signal_frame,
 };
 
@@ -817,23 +860,26 @@ pub fn boot_init() -> Arc<Task> {
     // 3. 注入 ext exit hook，让 wait/reap 能在 kernel 上下文释放 VM/FDT 等大对象。
     sched::register_ext_exit_hook(&EXIT_HOOK);
 
-    // 4. 注入 pre-exit hook。robust futex / clear-child-tid 必须在释放 VM 前完成。
+    // 4. 在 exit waiter 唤醒前输出进程记账，保证 wait 返回时记录已经可见。
+    sched::register_exit_accounting_hook(&EXIT_ACCOUNTING_HOOK);
+
+    // 5. 注入 pre-exit hook。robust futex / clear-child-tid 必须在释放 VM 前完成。
     sched::register_pre_exit_hook(&PRE_EXIT_HOOK);
 
-    // 5. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
+    // 6. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
     sched::register_process_image_ops(&PROCESS_IMAGE_OPS);
 
-    // 6. 注入 VmSwitchOps：schedule_once 切换前据此激活用户页表。注册点必须
+    // 7. 注入 VmSwitchOps：schedule_once 切换前据此激活用户页表。注册点必须
     //    在 sched::init 之前，这样即便 init 之外的 kthread 启动也会被回调。
     sched::arch_hooks::register_vm_switch(&VM_SWITCH_OPS);
 
-    // 7. 注入任务 CPU 状态发布 hook：调度器切到用户任务前用它刷新 rseq。
+    // 8. 注入任务 CPU 状态发布 hook：调度器切到用户任务前用它刷新 rseq。
     sched::arch_hooks::register_task_cpu_state(&TASK_CPU_STATE_OPS);
 
-    // 8. 建 init。sched::init 内部会 assert arch_hooks 已注入。
+    // 9. 建 init。sched::init 内部会 assert arch_hooks 已注入。
     let init = sched::init();
 
-    // 7. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
+    // 10. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
     //    （理论上不会）就跳过——调度 / 信号路径不依赖 ext，仅 VFS syscall 受影响。
     if let Some(parts) = BOOT_VFS_PARTS.lock().take() {
         let vfs_ctx = Arc::new(VfsContext::new(
@@ -858,7 +904,7 @@ pub fn boot_init() -> Arc<Task> {
         log::info!("[sched][boot] BOOT_VFS_PARTS empty — init has no vfs ext");
     }
 
-    // 8. 为 CPU 0 启动独立 idle 内核线程。`pick_next` 返 None 时 schedule_once
+    // 11. 为 CPU 0 启动独立 idle 内核线程。`pick_next` 返 None 时 schedule_once
     //    会回落到这个 idle，main() 后续显式让渡时也按它兜底。
     sched::spawn_idle_for(0);
 
@@ -912,6 +958,7 @@ fn enter_loaded_user_image(
     let exec_path = loaded.exec_path.clone();
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    install_exec_access(task, Arc::clone(&loaded.exec_access));
     install_exec_metadata(task, &exec_path, argv, envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();

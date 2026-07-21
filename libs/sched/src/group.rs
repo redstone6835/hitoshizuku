@@ -22,13 +22,13 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::pid::{PID_INVALID, PidT};
 use crate::rlimit::Rlimits;
 use crate::signal::SharedSignal;
 use crate::sync::Spinlock;
-use crate::task::Task;
+use crate::task::{Task, TaskUsage};
 
 // ── ThreadGroup ─────────────────────────────────────────────────────────────
 
@@ -44,6 +44,12 @@ pub struct ThreadGroup {
     shared_signal: Arc<SharedSignal>,
     /// 进程级资源限制（per-tg 共享；fork 时复制一份）。
     rlimits: Spinlock<Rlimits>,
+    /// 已退出线程的 usage 累计，供进程记账在最后一个线程退出时汇总。
+    exited_usage: Spinlock<TaskUsage>,
+    /// 尚未执行退出清理的成员数，保证最后一个线程汇总时其余 usage 已经入账。
+    acct_live_members: AtomicUsize,
+    /// 防止并发退出路径重复输出同一条 acct 记录。
+    acct_emitted: AtomicBool,
 }
 
 impl ThreadGroup {
@@ -55,10 +61,16 @@ impl ThreadGroup {
             members: Spinlock::new(Vec::new()),
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
+            exited_usage: Spinlock::new(TaskUsage::default()),
+            acct_live_members: AtomicUsize::new(0),
+            acct_emitted: AtomicBool::new(false),
         })
     }
 
-    /// 创建一个线程组并共享给定的 SharedSignal（CLONE_SIGHAND 语义）。
+    /// 创建一个线程组并安装给定的线程组信号状态。
+    ///
+    /// `CLONE_SIGHAND` 调用方应传入通过 `clone_sighand()` 构造的新状态，
+    /// 仅让其中的 handler 表共享；不能直接复用父线程组 pending 队列。
     pub fn new_sharing_signal(shared: Arc<SharedSignal>) -> Arc<Self> {
         Arc::new(Self {
             tgid: AtomicI32::new(PID_INVALID),
@@ -66,6 +78,9 @@ impl ThreadGroup {
             members: Spinlock::new(Vec::new()),
             shared_signal: shared,
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
+            exited_usage: Spinlock::new(TaskUsage::default()),
+            acct_live_members: AtomicUsize::new(0),
+            acct_emitted: AtomicBool::new(false),
         })
     }
 
@@ -91,6 +106,7 @@ impl ThreadGroup {
             }
         }
         self.members.lock().push(Arc::downgrade(task));
+        self.acct_live_members.fetch_add(1, Ordering::Release);
     }
 
     /// 移除一个成员，同时顺带清理已死的 Weak。
@@ -121,6 +137,41 @@ impl ThreadGroup {
         self.tgid.load(Ordering::Acquire)
     }
 
+    /// 计入一个成员的最终 usage；返回 true 表示它是最后完成退出清理的成员。
+    pub fn account_member_exit(&self, usage: TaskUsage) -> bool {
+        self.exited_usage.lock().add_assign(usage);
+        match self
+            .acct_live_members
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |members| {
+                members.checked_sub(1)
+            }) {
+            Ok(previous) => previous == 1,
+            Err(_) => {
+                debug_assert!(false, "thread-group accounting member underflow");
+                false
+            }
+        }
+    }
+
+    /// 撤销尚未启动成功的成员，不把它计入进程退出 usage。
+    pub fn cancel_member_accounting(&self) {
+        let _ =
+            self.acct_live_members
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |members| {
+                    members.checked_sub(1)
+                });
+    }
+
+    pub fn exited_usage_snapshot(&self) -> TaskUsage {
+        *self.exited_usage.lock()
+    }
+
+    pub fn try_claim_acct_record(&self) -> bool {
+        self.acct_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub fn set_tgid(&self, pid: PidT) {
         if pid <= PID_INVALID {
             return;
@@ -145,6 +196,9 @@ impl Default for ThreadGroup {
             members: Spinlock::new(Vec::new()),
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
+            exited_usage: Spinlock::new(TaskUsage::default()),
+            acct_live_members: AtomicUsize::new(0),
+            acct_emitted: AtomicBool::new(false),
         }
     }
 }

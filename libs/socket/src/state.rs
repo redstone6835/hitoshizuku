@@ -219,7 +219,7 @@ impl Socket {
         {
             let current = self.inner.local_name.lock();
             if current.is_some() {
-                return Err(SocketError::NameAlreadyBound);
+                return Err(SocketError::StateMismatch);
             }
         }
         registry_insert(key, &self.inner)?;

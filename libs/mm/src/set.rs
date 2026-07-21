@@ -28,7 +28,7 @@ use crate::area::{VmArea, VmBacking};
 use crate::flags::VmFlags;
 
 /// VMA 集合。线程安全由外层（VmSpace）决定；本结构不自带锁。
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct VmaSet {
     tree: BTreeMap<usize, VmArea>,
 }
@@ -134,7 +134,7 @@ impl VmaSet {
         if page >= area.range.start || !area.flags.has(VmFlags::GROWS_DOWN) {
             return None;
         }
-        if !matches!(area.backing, VmBacking::Anon) {
+        if !matches!(area.backing, VmBacking::Anon { .. }) {
             return None;
         }
         if let Some((_, prev)) = self.tree.range(..key).next_back() {
@@ -335,13 +335,27 @@ impl VmaSet {
                             let adjacent = l.range.end == r.range.start;
                             let same_flags = l.flags == r.flags;
                             let same_backing = match (&l.backing, &r.backing) {
-                                (crate::area::VmBacking::Anon, crate::area::VmBacking::Anon) => {
-                                    true
-                                }
                                 (
-                                    crate::area::VmBacking::SharedAnon { id: il, offset: ol },
-                                    crate::area::VmBacking::SharedAnon { id: ir, offset: or },
-                                ) => il == ir && checked_offset_after(*ol, left_len) == Some(*or),
+                                    crate::area::VmBacking::Anon {
+                                        merge_domain: left_domain,
+                                    },
+                                    crate::area::VmBacking::Anon {
+                                        merge_domain: right_domain,
+                                    },
+                                ) => left_domain.can_merge(*right_domain),
+                                (
+                                    crate::area::VmBacking::SharedAnon {
+                                        object: il,
+                                        offset: ol,
+                                    },
+                                    crate::area::VmBacking::SharedAnon {
+                                        object: ir,
+                                        offset: or,
+                                    },
+                                ) => {
+                                    alloc::sync::Arc::ptr_eq(il, ir)
+                                        && checked_offset_after(*ol, left_len) == Some(*or)
+                                }
                                 (
                                     crate::area::VmBacking::File {
                                         file: fl,
@@ -380,13 +394,23 @@ impl VmaSet {
         }
     }
 
-    /// 深拷贝 VMA 元数据（不触物理页；Arc<dyn FileLike> 共享）。
-    /// 典型调用：`VmSpace::fork` 的第一步，拿到同构的 VmaSet 之后再逐页复制。
-    #[kernel_symbols::export(name = "mm.set.VmaSet.deep_clone_metadata", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
-    pub fn deep_clone_metadata(&self) -> Self {
+    /// 为 `fork` 克隆 VMA 元数据，并封存父子双方既有的私有匿名合并来源。
+    ///
+    /// 文件对象和共享匿名对象仍由 `Arc` 共享；本方法不复制或修改物理页。调用后
+    /// 任一地址空间新建的匿名映射都不会与继承区域跨边界合并。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.fork_clone_metadata", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
+    pub fn fork_clone_metadata(&mut self) -> Self {
+        for area in self.tree.values_mut() {
+            area.backing.mark_fork_inherited();
+        }
         Self {
             tree: self.tree.clone(),
         }
+    }
+
+    /// 摘出全部 VMA，供地址空间销毁路径先结束 backing 生命周期再回收页缓存。
+    pub fn take_all(&mut self) -> Vec<VmArea> {
+        core::mem::take(&mut self.tree).into_values().collect()
     }
 
     /// 只读迭代全部 VMA，按起址升序。

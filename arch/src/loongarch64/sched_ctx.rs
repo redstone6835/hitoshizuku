@@ -51,7 +51,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
-use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
+use sched::arch_hooks::{
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry,
+};
 
 use super::specific::kernel_timestamp_ns;
 use super::task::LoongArch64TaskOps;
@@ -196,6 +198,11 @@ static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
     current_cpu_id: arch_current_cpu_id,
 };
 
+/// 将调度器发布的绝对软件截止时间投影到当前 CPU 的 TCFG one-shot 定时器。
+static ARCH_DEADLINE_TIMER_OPS: ArchDeadlineTimerOps = ArchDeadlineTimerOps {
+    reprogram: super::loader::rearm_local_timer,
+};
+
 fn arch_current_cpu_id() -> usize {
     LoongArch64MessageInterruptOps::current_cpu_id()
 }
@@ -242,6 +249,7 @@ pub fn register() {
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
+        sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
         sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
         sched::arch_hooks::register_cpu_control(&super::smp::CPU_CONTROL_OPS);

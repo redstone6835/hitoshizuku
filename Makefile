@@ -51,14 +51,10 @@ ENSURE_BUSYBOX := scripts/ensure-busybox.sh
 BUSYBOX_SKELETON := userland/busybox-initramfs
 PACK_INITRAMFS := scripts/pack-initramfs.sh
 
-LTP_SCENARIO_SRC := userland/ltp-scenarios
-LTP_TESTCODE_SRC := userland/ltp_testcode.sh
-ELM_SMOKE_SRC := userland/elmctl-smoke/elmctl_smoke.c
-ELM_FINGERPRINT_GEN := scripts/gen-elm-fingerprint-header.sh
-ELM_FINGERPRINT_INPUTS := $(wildcard libs/elm/src/*.rs libs/elm/src/mgr/*.rs tools/elm-tools/src/*.rs) \
-	libs/elm/Cargo.toml tools/elm-tools/Cargo.toml
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
-ELMCTL_HEADERS := userland/elmctl/include/elmctl_abi.h userland/elmctl/include/elmctl_client.h
+PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
+ACCT_TEST_SRC := userland/tests/acct.c
+INIT_KEYWAIT_SRC := userland/init-keywait.c
 
 ifeq ($(strip $(ARCH)),)
 SELECTED_ARCHES := $(LA_ARCH) $(RV_ARCH)
@@ -188,34 +184,44 @@ _busybox-riscv64: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE) $(PACK_INITRAMFS)
 	$(call build_busybox,$(RV_ARCH),$(RV_CROSS_COMPILE))
 
 define build_elm_user_tools
+	rm -rf $(BUILD_DIR)/$(1)/elm-user
 	mkdir -p $(BUILD_DIR)/$(1)/elm-user $(2)/bin
-	$(ELM_FINGERPRINT_GEN) $(3) $(BUILD_DIR)/$(1)/elm-user/elm_fingerprint.h
-	$(4)gcc -std=c11 -static -Os -Wall -Wextra \
-		-I$(BUILD_DIR)/$(1)/elm-user $(ELM_SMOKE_SRC) \
-		-o $(BUILD_DIR)/$(1)/elm-user/elmctl-smoke
-	$(4)gcc -std=c11 -static -Os -Wall -Wextra -Iuserland/elmctl/include \
+	$(3)gcc -std=c11 -static -Os -Wall -Wextra -Iuserland/elmctl/include \
 		$(ELMCTL_SRC) -o $(BUILD_DIR)/$(1)/elm-user/elmctl
-	-$(4)strip $(BUILD_DIR)/$(1)/elm-user/elmctl-smoke
-	-$(4)strip $(BUILD_DIR)/$(1)/elm-user/elmctl
-	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/elmctl-smoke $(2)/bin/
+	-$(3)strip $(BUILD_DIR)/$(1)/elm-user/elmctl
 	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/elmctl $(2)/bin/
+	$(3)gcc -std=c11 -static -Os -Wall -Wextra \
+		$(INIT_KEYWAIT_SRC) -o $(BUILD_DIR)/$(1)/elm-user/init-keywait
+	-$(3)strip $(BUILD_DIR)/$(1)/elm-user/init-keywait
+	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/init-keywait $(2)/bin/
+endef
+
+define build_smp_user_tests
+	@if [ -n "$(filter smp-tests,$(FEATURES))" ]; then \
+		rm -rf $(BUILD_DIR)/$(1)/smp-user; \
+		mkdir -p $(BUILD_DIR)/$(1)/smp-user $(2)/bin; \
+		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -pthread \
+			$(PTHREAD_SMP_TEST_SRC) -o $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test; \
+		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -pthread \
+			$(ACCT_TEST_SRC) -o $(BUILD_DIR)/$(1)/smp-user/acct-test; \
+		$(3)strip $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test || true; \
+		$(3)strip $(BUILD_DIR)/$(1)/smp-user/acct-test || true; \
+		install -m 0755 $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test $(2)/bin/; \
+		install -m 0755 $(BUILD_DIR)/$(1)/smp-user/acct-test $(2)/bin/; \
+	fi
 endef
 
 define prepare_compat_rootfs
 	$(MAKE) _busybox-$(1)
 	rm -rf $(2)
 	mkdir -p $(2)
-	cp -a $(3)/. $(2)/
 	cp -a $(BUILD_DIR)/$(1)/busybox-rootfs/. $(2)/
 	mkdir -p $(2)/etc $(2)/tmp
 	cp -a $(3)/etc/. $(2)/etc/
-	if [ -d $(3)/tmp ]; then cp -a $(3)/tmp/. $(2)/tmp/; fi
-	mkdir -p $(2)/etc/ltp-scenarios $(2)/lib/elm
-	rm -f $(2)/etc/ltp-scenarios/* $(2)/lib/elm/*
-	cp $(LTP_SCENARIO_SRC)/* $(2)/etc/ltp-scenarios/
-	cp $(LTP_TESTCODE_SRC) $(2)/etc/ltp_testcode.sh
-	chmod +x $(2)/etc/ltp_testcode.sh
-	$(call build_elm_user_tools,$(1),$(2),$(4),$(5))
+	mkdir -p $(2)/lib/elm
+	rm -f $(2)/lib/elm/*
+	$(call build_elm_user_tools,$(1),$(2),$(5))
+	$(call build_smp_user_tests,$(1),$(2),$(5))
 	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
 	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
 		-exec install -m 0644 {} $(2)/lib/elm/ \;

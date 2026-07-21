@@ -77,6 +77,7 @@ pub struct SyscallContext<'a> {
     pub tf: TrapFramePtr,
     task: Option<Arc<sched::Task>>,
     frame_finalized: bool,
+    restart_disabled: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
 
@@ -97,6 +98,20 @@ impl SyscallContext<'_> {
 
     pub fn frame_finalized(&self) -> bool {
         self.frame_finalized
+    }
+
+    /// 禁止 `SA_RESTART` 自动重新执行本次系统调用。
+    ///
+    /// Linux 对 `nanosleep`、`clock_nanosleep` 等调用明确要求把 `EINTR` 暴露给
+    /// 用户态，即使信号动作带有 `SA_RESTART`。这类 syscall 必须在执行前设置
+    /// 本标志，避免通用分发器错误恢复到原 syscall 指令。
+    pub fn disable_restart(&mut self) {
+        self.restart_disabled = true;
+    }
+
+    /// 查询当前系统调用是否禁止 `SA_RESTART` 自动重启。
+    pub fn restart_disabled(&self) -> bool {
+        self.restart_disabled
     }
 }
 
@@ -149,6 +164,10 @@ pub fn dispatch(tf: TrapFramePtr) {
         (ops.advance_pc)(tf);
         return;
     }
+    #[cfg(feature = "performance-profile")]
+    let _span = profiling::enter_span();
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
 
     let task = sched::current_task();
     let mut ctx = SyscallContext {
@@ -157,6 +176,7 @@ pub fn dispatch(tf: TrapFramePtr) {
         tf,
         task: Some(task),
         frame_finalized: false,
+        restart_disabled: false,
         _phantom: core::marker::PhantomData,
     };
 
@@ -184,19 +204,15 @@ pub fn dispatch(tf: TrapFramePtr) {
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
-        if ret == -(Errno::EINTR.as_i32() as isize) {
+        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
-                let delivered = sched::process_image_ops()
-                    .and_then(|ops| {
-                        (ops.setup_signal_frame)(
-                            ctx.task(),
-                            info,
-                            action,
-                            sched::UserContextRef::new(tf.as_usize()),
-                        )
-                        .ok()
-                    })
-                    .is_some();
+                let delivered = sched::operation::setup_user_signal_frame_for_task(
+                    ctx.task(),
+                    info,
+                    action,
+                    sched::UserContextRef::new(tf.as_usize()),
+                )
+                .is_ok();
                 if delivered {
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
@@ -254,6 +270,10 @@ where
     F: FnMut(TrapFramePtr, isize),
 {
     let task = sched::current_task_fast();
+    #[cfg(feature = "performance-profile")]
+    let _span = profiling::enter_span();
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
 
     let entry = if nr < SYSCALL_TABLE_LEN {
         let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
@@ -272,6 +292,7 @@ where
         tf,
         task: Some(task),
         frame_finalized: false,
+        restart_disabled: false,
         _phantom: core::marker::PhantomData,
     };
 
@@ -285,19 +306,15 @@ where
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
-        if ret == -(Errno::EINTR.as_i32() as isize) {
+        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
-                let delivered = sched::process_image_ops()
-                    .and_then(|pops| {
-                        (pops.setup_signal_frame)(
-                            ctx.task(),
-                            info,
-                            action,
-                            sched::UserContextRef::new(tf.as_usize()),
-                        )
-                        .ok()
-                    })
-                    .is_some();
+                let delivered = sched::operation::setup_user_signal_frame_for_task(
+                    ctx.task(),
+                    info,
+                    action,
+                    sched::UserContextRef::new(tf.as_usize()),
+                )
+                .is_ok();
                 if delivered {
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;

@@ -1275,12 +1275,12 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - 直接符号链路已经使用独立仓库 ELM 在 RISC-V64 与 LoongArch64 QEMU 中完成验证：镜像能够解析并调用 allocator 分配、释放、扩容、查询以及 `general::dev` 查询符号，随后完成 initialize、健康快照、finalize 和 detach。启动期 `kernel-tests` 同时覆盖目录校验、能力拒绝、可选槽、事务回滚和设备资源归属。
 - 内核符号级 Mixin 已完成 `HEAD/RETURN` 稳定链路：145 个导出符号中的 142 个函数生成 284 个真实站点，运行时使用零分配不可变路由、优先级处理链、continuation、故障禁用、暂停/恢复和 generation 事务。`tests/elm/kernel-mixin` 已在 LoongArch64 QEMU 中对真实 `allocator.GlobalAlloc.alloc` 完成首次装载、参数修改、覆盖、返回值观察、迁移拒绝回滚、成功热替换和卸载验证；189 项启动期内核测试同时通过。
 
-## 18. 运行期 smoke 测试链路
+## 18. 运行期管理链路
 
 当前已经具备从用户态进入 `elm-mgr` 的完整运行链路：
 
 ```text
-用户态 /bin/elmctl 或 /bin/elmctl-smoke
+用户态 /bin/elmctl
     -> syscall(SYS_ELM_CTL = 509)
         -> ElmCtlCommand::MgrCall
             -> elm-mgr 管理通道
@@ -1290,10 +1290,9 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 `elm-mgr` 本身是启动期内建 ELM。它在 `sched::boot_init()` 之后、用户态 init 进程启动之前完成初始化，地位类似用户态的 init 进程：后续所有动态 ELM 都位于 `elm-mgr` 管理树中，但可以通过装载请求挂到任意合法动态父单元之下；所有外部管理工具都通过 `elm-mgr` 暴露的控制面进入 ELM Core。`elm-mgr` 的来源固定显示为 `<builtin>`，不会显示为 EKI、soyo、ELF 或其他镜像类型。内建 `eki` 是 `elm-mgr` 的子 ELM，来源同样显示为 `<builtin>`，它只负责提供 EKI 投影能力。未来 VFS、调度、设备等常驻子系统如果需要对外提供可发现、可绑定、可审计的运行时服务，应注册为枢纽连接层端口；计划迁出的网络栈由对应 ELM 自己发布端口。普通稳定 Rust API 则由常驻子系统登记为内核直接符号，ELM 通过同名接口 crate 调用真实实现，不为每个子系统新增私有 syscall，也不让 `elm-mgr` 成为数据热路径。
 
-仓库提供两个用户态入口：
+仓库提供以下管理入口：
 
 - `userland/elmctl/`：正式管理工具骨架，构建后安装为 `/bin/elmctl`。它使用共享 C ABI 头和 client helper，支持 Core query、snapshot、全局事件、debug dump、所有 `elm-mgr` 查询命令、EKI 装载/替换、生命周期操作、绑定/解绑、runtime log/event、provider 注册/注销/调用、异步 provider、provider snapshot 和事件订阅。管理器自有查询表会结构化解码；具体子系统 provider 的业务 payload 保持十六进制输出，由对应子系统协议解释。
-- `userland/elmctl-smoke/elmctl_smoke.c`：运行期验收工具，构建后安装为 `/bin/elmctl-smoke`。它不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL` 并执行固定验收步骤。
 - `tools/elm-tools/`：`cargo-elm` 的源码目录。安装后以 Cargo 子命令 `cargo elm` 使用，提供 `new`、`sync`、`check`、`test`、`doctor`、`profile-export`、`symbol-probe`、`build`、`inspect` 与 `image-*`。工具自身使用宿主目标构建；外部 ELM 的目标架构由命令显式选择。
 
 ### elmapi v1 与单一 API 根
@@ -1561,23 +1560,6 @@ cargo elm image-verify signed.eki
 
 elmapi 尚未发布，因此上述全部接口都是 v1；不存在 v2、兼容别名或旧式直接日志导入路径。未来正式发布后才允许在现有兼容版本集合上演进。
 
-`elmctl-smoke` 会执行以下检查：
-
-- `CoreQuery`：确认 ELM Core magic、ABI、能力位、cell 数量、内建 `elm-mgr`/`eki` 拓扑和端口数量。
-- `QueryPolicy`：确认 `elm-mgr` 支持 provider invoke、健康检查、异步 provider、TODO registry、资源预算策略、lifecycle hook failed blocker 和 resource quota blocker。
-- `QueryMenu`：确认内建健康检查菜单项 `elm/mgr/health` 存在，并读取其 action id。
-- `QueryHealth`：确认 Core 结构化健康检查为 OK。
-- `QueryTodoRegistry`：确认运行时 TODO registry 可通过用户态管理通道查询。
-- `QueryNexusBindings` / `CommitBind`：复用或创建 `elm-mgr -> mgr.action.invoke@1` 能力绑定。
-- `InvokeProvider`：通过 `ElmCallFrame` 调用健康检查 action provider。
-- `QueryProviderPorts` / `QueryProviderSnapshot`：确认启动期只存在 ELM 自有 provider；显式注册 provider 后再验证 provider 可发现和 snapshot 路由。
-- `QueryApiRegistry`：确认 `elm-mgr` API 网关至少公开当前已知管理 API、事件 API 和 provider API；子系统 provider 只在显式注册后进入 API 注册表。
-- `SubscribeEvent` / `QueryEventSubscriptions`：为内建 `elm-mgr` 创建事件订阅租约，并确认订阅快照可读。
-- `LoadCell`：构造一个最小 EKI payload，经固定 ID 的内建 EKI Projection Source 投影并由 `elm-mgr` 管理通道装载为 EBI 协议对象，预期进入 `Active`。
-- `DetachCell`：摘除上一步已激活的 EKI 元数据单元，确认元数据路径可清理。
-- `ReadSubscribedEvents` / `UnsubscribeEvent`：读取 EKI 装载和脱离产生的订阅事件，然后撤销订阅租约并确认没有订阅泄漏。
-- `QueryAudit`：确认管理审计流可读。
-
 构建方式：
 
 ```sh
@@ -1586,7 +1568,7 @@ make kernel-rv
 make kernel-la
 ```
 
-`make kernel-rv` 会在 `build/riscv64/compat-rootfs/bin` 安装 RISC-V64 静态链接版本的 `elmctl` 和 `elmctl-smoke`，打包 `build/riscv64/compat-initramfs.cpio`，并输出根目录 `kernel-rv`。`make kernel-la` 使用 `build/loongarch64/compat-rootfs` 和 `build/loongarch64/compat-initramfs.cpio`，最终输出 `kernel-la`。兼容构建不会修改 `userland/rootfs-rv` 或 `userland/rootfs-la`。
+`make kernel-rv` 会在 `build/riscv64/compat-rootfs/bin` 安装 RISC-V64 静态链接版本的 `elmctl`，打包 `build/riscv64/compat-initramfs.cpio`，并输出根目录 `kernel-rv`。`make kernel-la` 使用 `build/loongarch64/compat-rootfs` 和 `build/loongarch64/compat-initramfs.cpio`，最终输出 `kernel-la`。兼容构建不会修改 `userland/rootfs-rv` 或 `userland/rootfs-la`。
 
 RISC-V64 手动运行方式：
 
@@ -1596,13 +1578,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
   -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```
 
-启动后在 `press Ctrl+C within 3 seconds to enter shell` 窗口按 `Ctrl+C` 进入 shell，然后运行：
-
-```sh
-/bin/elmctl-smoke
-```
-
-人工诊断时可以运行：
+启动脚本会挂载 `/dev/vd0`，完整输出 `/mnt` 目录树，然后依次打印其中常规 `.sh` 文件的内容。启动脚本退出后由 BusyBox init 启动控制台 shell，可以使用以下命令进行人工诊断：
 
 ```sh
 /bin/elmctl core
@@ -1614,31 +1590,6 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 /bin/elmctl api
 /bin/elmctl todo
 ```
-
-预期输出包含：
-
-```text
-[elm-smoke] core query ok
-[elm-smoke] policy query ok
-[elm-smoke] menu query ok
-[elm-smoke] health query ok
-[elm-smoke] todo registry ok
-[elm-smoke] bind mgr action provider ok
-[elm-smoke] invoke health action ok
-[elm-smoke] device discovery payload ok
-[elm-smoke] device discovery provider ok
-[elm-smoke] vfs lookup provider ok
-[elm-smoke] api registry ok
-[elm-smoke] event subscribe ok
-[elm-smoke] load minimal EKI ok
-[elm-smoke] detach minimal EKI ok
-[elm-smoke] subscribed event read ok
-[elm-smoke] event unsubscribe ok
-[elm-smoke] audit query ok
-[elm-smoke] PASS
-```
-
-如果某一步失败，`elmctl-smoke` 会返回非零状态，并打印失败步骤、errno 或管理通道状态。该工具是当前阶段的运行期验收入口；如果它不能通过，说明 `elm-mgr` 用户态控制链路、固定布局 ABI、API 注册表、事件订阅、能力绑定、provider 调用或 EBI Source 边界发生了退化。
 
 当前剩余主线：
 

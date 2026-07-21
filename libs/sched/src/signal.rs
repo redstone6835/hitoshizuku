@@ -3,7 +3,7 @@
 //! 本实现覆盖 Linux 常用 64 个信号（标准 1..=31 + 实时 32..=64）。SIGKILL/SIGSTOP
 //! 不可被 handler / blocked / ignored —— 投递路径直接走默认动作。
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -436,7 +436,9 @@ impl Default for SignalState {
 
 /// ThreadGroup 共享的信号表：sigaction + 进程级 pending。
 pub struct SharedSignal {
-    actions: Spinlock<[SigAction; NSIG]>,
+    /// 信号处理表可由 `CLONE_SIGHAND` 跨线程组共享。
+    actions: Arc<Spinlock<[SigAction; NSIG]>>,
+    /// pending 队列只属于当前线程组，不能随 `CLONE_SIGHAND` 共享。
     shared_pending_bits: AtomicU64,
     shared_pending_infos: Spinlock<Vec<SigInfo>>,
     observers: SignalObservers,
@@ -445,7 +447,7 @@ pub struct SharedSignal {
 impl SharedSignal {
     pub fn new() -> Self {
         Self {
-            actions: Spinlock::new([SigAction::default_new(); NSIG]),
+            actions: Arc::new(Spinlock::new([SigAction::default_new(); NSIG])),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
             observers: SignalObservers::new(),
@@ -456,11 +458,32 @@ impl SharedSignal {
     pub fn fork_copy(&self) -> Self {
         let actions_copy = *self.actions.lock();
         Self {
-            actions: Spinlock::new(actions_copy),
+            actions: Arc::new(Spinlock::new(actions_copy)),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
             observers: SignalObservers::new(),
         }
+    }
+
+    /// 构造 `CLONE_SIGHAND` 子进程的信号状态。
+    ///
+    /// 处理表与父进程共享，但进程级 pending 队列从空状态开始。只有
+    /// `CLONE_THREAD` 才应直接复用同一个 [`SharedSignal`]。
+    pub fn clone_sighand(&self) -> Self {
+        Self {
+            actions: Arc::clone(&self.actions),
+            shared_pending_bits: AtomicU64::new(0),
+            shared_pending_infos: Spinlock::new(Vec::new()),
+            observers: SignalObservers::new(),
+        }
+    }
+
+    /// 为 `CLONE_CLEAR_SIGHAND` 深拷信号表，并把所有用户处理函数恢复为默认动作。
+    /// 被显式忽略的信号保持忽略，pending 信号不复制。
+    pub fn fork_copy_clearing_handlers(&self) -> Self {
+        let copied = self.fork_copy();
+        copied.reset_handlers_for_exec();
+        copied
     }
 
     /// 订阅当前线程组共享 pending 信号变化。
@@ -483,6 +506,10 @@ impl SharedSignal {
     /// execve 时按 POSIX 重置信号处理：所有 caught 信号恢复为 SIG_DFL，
     /// SIG_IGN 保持（除 SIGCHLD 特殊情况）。SIGKILL/SIGSTOP 不可改，跳过。
     pub fn reset_handlers_for_exec(&self) {
+        self.reset_caught_handlers();
+    }
+
+    fn reset_caught_handlers(&self) {
         let mut guard = self.actions.lock();
         for sig_idx in 0..guard.len() {
             let sig = SignalNumber::from_raw(sig_idx as i32);

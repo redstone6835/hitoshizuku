@@ -36,10 +36,12 @@ const ACTION_BOOT: u32 = 0;
 const ACTION_RESCHEDULE: u32 = 1;
 const ACTION_TLB_SHOOTDOWN: u32 = 2;
 const ACTION_ICACHE_SYNC: u32 = 3;
+const ACTION_MEMBARRIER: u32 = 4;
 
 const IPI_RESCHEDULE: u32 = 1 << ACTION_RESCHEDULE;
 const IPI_TLB_SHOOTDOWN: u32 = 1 << ACTION_TLB_SHOOTDOWN;
 const IPI_ICACHE_SYNC: u32 = 1 << ACTION_ICACHE_SYNC;
+const IPI_MEMBARRIER: u32 = 1 << ACTION_MEMBARRIER;
 
 const SHOOTDOWN_TLB: usize = 1;
 const SHOOTDOWN_ICACHE: usize = 2;
@@ -169,12 +171,24 @@ fn send_reschedule(logical_id: usize) {
     }
 }
 
+fn send_membarrier(logical_id: usize) -> bool {
+    if !cpu_is_online(logical_id) {
+        return false;
+    }
+    let Some(physical_id) = physical_cpu_id(logical_id) else {
+        return false;
+    };
+    send_ipi_to_physical(physical_id, ACTION_MEMBARRIER);
+    true
+}
+
 fn cpu_is_online(logical_id: usize) -> bool {
     logical_id < MAX_CPUS && ONLINE_CPUS.load(Ordering::Acquire) & (1 << logical_id) != 0
 }
 
 pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
     send_resched: send_reschedule,
+    send_membarrier,
     is_online: cpu_is_online,
 };
 
@@ -190,6 +204,9 @@ pub(crate) fn handle_ipi() {
     }
     if action & (IPI_TLB_SHOOTDOWN | IPI_ICACHE_SYNC) != 0 {
         handle_shootdown_requests();
+    }
+    if action & IPI_MEMBARRIER != 0 {
+        sched::handle_membarrier_ipi();
     }
     // request_resched() 在发送 IPI 前已经发布目标 CPU 的 need_resched。
     let _ = action & IPI_RESCHEDULE;
@@ -281,13 +298,17 @@ fn wait_for_shootdown(kind: usize, targets: usize, expected: &[usize; MAX_CPUS])
             // 避免双方都处于关中断临界区时相互等待。
             handle_shootdown_requests();
             if stable_counter_raw().wrapping_sub(started_at) >= timeout_ticks {
+                let observed = completed.load(Ordering::Acquire);
+                if shootdown_sequence_reached(observed, expected[logical_id]) {
+                    break;
+                }
                 panic!(
                     "[smp] shootdown 确认超时 kind={} source={} target={} expected={} completed={} online={:#x}",
                     kind,
                     LoongArch64MessageInterruptOps::current_cpu_id(),
                     logical_id,
                     expected[logical_id],
-                    completed.load(Ordering::Acquire),
+                    observed,
                     ONLINE_CPUS.load(Ordering::Acquire),
                 );
             }
