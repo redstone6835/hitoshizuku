@@ -29,18 +29,23 @@ json="$tmp/trace.json"
     echo "@@PROFILE_TRACE_END phase=before case=smoke"
     echo "@@PROFILE_TRACE_BEGIN phase=after case=smoke"
     echo "state=frozen enabled=0 session=1 generation=4 active_writers=0 counter_hz=10000000 slots_per_cpu=1024 record_bytes=80 format_version=2"
-    echo "cpu=0 first_sequence=0 next_sequence=2 retained=2 overwritten=0"
+    echo "cpu=0 first_sequence=0 next_sequence=4 retained=4 overwritten=0"
     echo "cpu=0 sequence=0 session=1 generation=3 timestamp_cycles=801204345 duration_cycles=817 kind=scope event=vfs_read task=7 span=42 arg0=64 arg1=0"
     echo "cpu=0 sequence=1 session=1 generation=3 timestamp_cycles=801205050 duration_cycles=0 kind=sched_switch event=sched_switch task=7 span=42 arg0=7 arg1=8"
+    echo "cpu=0 sequence=2 session=1 generation=3 timestamp_cycles=801205100 duration_cycles=0 kind=task_spawn event=sched_switch task=8 span=0 arg0=7 arg1=8"
+    echo "cpu=0 sequence=3 session=1 generation=3 timestamp_cycles=801205200 duration_cycles=100 kind=scope event=vfs_read task=8 span=43 arg0=32 arg1=0"
     echo "@@PROFILE_TRACE_END phase=after case=smoke"
 } >"$log"
 
 output=$($root/scripts/profile-trace-report.sh "$log" "$json")
 printf '%s\n' "$output" | grep -q 'smoke.*80120434.500000.*81.700000.*vfs_read.*64.*workload-root'
 printf '%s\n' "$output" | grep -q 'smoke.*80120505.000000.*sched_switch.*7.*8.*workload-root'
+printf '%s\n' "$output" | grep -q 'smoke.*task_spawn.*8.*workload-child'
+printf '%s\n' "$output" | grep -q 'smoke.*vfs_read.*32.*workload-child'
 grep -q '"name":"vfs_read"' "$json"
 grep -q '"ph":"X"' "$json"
 grep -q '"name":"sched_switch"' "$json"
+grep -q '"name":"task_spawn"' "$json"
 grep -q '"ph":"i"' "$json"
 sed 's/overwritten=0/overwritten=1/' "$log" >"$tmp/lost.log"
 if $root/scripts/profile-trace-report.sh "$tmp/lost.log" >/dev/null 2>&1; then

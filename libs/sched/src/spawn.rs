@@ -89,6 +89,11 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
         pgroup.set_pgid(pid);
     }
 
+    #[cfg(feature = "performance-profile")]
+    if let Some(parent_pid) = parent.pid_root() {
+        profiling::trace_task_spawn(parent_pid as u64, pid as u64);
+    }
+
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][spawn] kind={:?} pid={} parent_pid={:?}",
@@ -311,6 +316,11 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     }
     if pg.pgid() <= 0 {
         pg.set_pgid(pid);
+    }
+
+    #[cfg(feature = "performance-profile")]
+    if let Some(parent_pid) = real_parent.pid_root() {
+        profiling::trace_task_spawn(parent_pid as u64, pid as u64);
     }
 
     // 10. ext clone hook：把上层注册的 VFS / fdtable 等子系统状态按 flags 拷贝。
