@@ -18,7 +18,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
@@ -29,7 +29,9 @@ use crate::ids::Uid;
 use crate::migration::MigrationContext;
 use crate::pid::PidNamespace;
 use crate::runqueue::{Runqueue, RunqueueClassLoad};
-use crate::sched_class::{SchedAttr, SchedClass};
+use crate::sched_class::{
+    DEFAULT_RR_SLICE_NS, DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, SchedAttr, SchedClass,
+};
 use crate::scheduler_state::{SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
@@ -167,6 +169,60 @@ struct RealtimeItimer {
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
+
+const NSEC_PER_USEC: u64 = 1_000;
+const NSEC_PER_MSEC: u64 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RtSchedulingConfig {
+    period_us: i32,
+    runtime_us: i32,
+}
+
+impl RtSchedulingConfig {
+    pub(crate) const DEFAULT: Self = Self {
+        period_us: (DEFAULT_RT_PERIOD_NS / NSEC_PER_USEC) as i32,
+        runtime_us: (DEFAULT_RT_RUNTIME_NS / NSEC_PER_USEC) as i32,
+    };
+
+    pub(crate) fn with_period_us(self, value: i64) -> Result<Self, errno::Errno> {
+        if !(1..=i32::MAX as i64).contains(&value)
+            || (self.runtime_us >= 0 && self.runtime_us as i64 > value)
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        Ok(Self {
+            period_us: value as i32,
+            ..self
+        })
+    }
+
+    pub(crate) fn with_runtime_us(self, value: i64) -> Result<Self, errno::Errno> {
+        if !(-1..=i32::MAX as i64).contains(&value) || (value >= 0 && value > self.period_us as i64)
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        Ok(Self {
+            runtime_us: value as i32,
+            ..self
+        })
+    }
+
+    fn bandwidth_ns(self) -> (u64, u64) {
+        let period_ns = self.period_us as u64 * NSEC_PER_USEC;
+        let runtime_ns = if self.runtime_us < 0 {
+            period_ns
+        } else {
+            self.runtime_us as u64 * NSEC_PER_USEC
+        };
+        (period_ns, runtime_ns)
+    }
+}
+
+static RT_SCHEDULING_CONFIG: Spinlock<RtSchedulingConfig> =
+    Spinlock::new(RtSchedulingConfig::DEFAULT);
+static SCHED_RR_TIMESLICE_MS: AtomicI32 =
+    AtomicI32::new((DEFAULT_RR_SLICE_NS / NSEC_PER_MSEC) as i32);
 
 /// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
 static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
@@ -507,6 +563,69 @@ pub fn active_cpu_mask() -> u64 {
 #[kernel_symbols::export(name = "sched.scheduler.supported_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn supported_cpu_mask() -> u64 {
     CpuMask::SUPPORTED.bits()
+}
+
+pub fn sched_rt_period_us() -> i32 {
+    RT_SCHEDULING_CONFIG.lock().period_us
+}
+
+pub fn sched_rt_runtime_us() -> i32 {
+    RT_SCHEDULING_CONFIG.lock().runtime_us
+}
+
+pub fn sched_rr_timeslice_ms() -> i32 {
+    SCHED_RR_TIMESLICE_MS.load(Ordering::Acquire)
+}
+
+pub fn sched_rr_timeslice_ns() -> u64 {
+    sched_rr_timeslice_ms() as u64 * NSEC_PER_MSEC
+}
+
+pub fn set_sched_rt_period_us(value: i64) -> Result<(), errno::Errno> {
+    update_rt_bandwidth(|config| config.with_period_us(value))
+}
+
+pub fn set_sched_rt_runtime_us(value: i64) -> Result<(), errno::Errno> {
+    update_rt_bandwidth(|config| config.with_runtime_us(value))
+}
+
+pub fn set_sched_rr_timeslice_ms(value: i64) -> Result<(), errno::Errno> {
+    let value = normalize_rr_timeslice_ms(value)?;
+    SCHED_RR_TIMESLICE_MS.store(value, Ordering::Release);
+    Ok(())
+}
+
+pub(crate) fn normalize_rr_timeslice_ms(value: i64) -> Result<i32, errno::Errno> {
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(if value <= 0 {
+        (DEFAULT_RR_SLICE_NS / NSEC_PER_MSEC) as i32
+    } else {
+        value as i32
+    })
+}
+
+fn update_rt_bandwidth(
+    update: impl FnOnce(RtSchedulingConfig) -> Result<RtSchedulingConfig, errno::Errno>,
+) -> Result<(), errno::Errno> {
+    let mut config = RT_SCHEDULING_CONFIG.lock();
+    let next = update(*config)?;
+    let (period_ns, runtime_ns) = next.bandwidth_ns();
+    let now_ns = now_ns_internal();
+    for cpu_id in 0..NR_CPUS {
+        runqueue_of(cpu_id).set_rt_bandwidth(period_ns, runtime_ns, now_ns);
+    }
+    *config = next;
+    drop(config);
+
+    let online = online_cpu_mask();
+    for cpu_id in 0..NR_CPUS {
+        if online & (1u64 << cpu_id) != 0 {
+            request_resched(cpu_id);
+        }
+    }
+    Ok(())
 }
 
 fn active_cpu_set() -> CpuMask {
