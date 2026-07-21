@@ -171,6 +171,9 @@ struct RealtimeItimer {
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
+// 跨多个 runqueue 采样时统一取得这把锁，保证所有采样者以同一顺序观察
+// CPU 队列。单个 runqueue 的调度操作不取得它，避免把普通切换路径串行化。
+static RUNQUEUE_SNAPSHOT_LOCK: Spinlock<()> = Spinlock::new(());
 
 const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_MSEC: u64 = 1_000_000;
@@ -778,11 +781,22 @@ pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
 }
 
 fn task_sched_placement_on(scheduler: &crate::Scheduler, task: &Arc<Task>) -> SchedPlacement {
-    let _ = refresh_task_placement(scheduler, task);
+    // 未绑定任务的 current_cpu 只是兼容查询镜像，不能把它误当作真实的
+    // 放置位置；否则每 CPU 独立调度域会把所有新任务固定到启动 CPU。
+    let current = task_runqueue_cpu_on(scheduler, task);
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let active = scheduler.active_set();
-    let current = CpuId::new(task.current_cpu());
     let prefer_current = task.state() != TaskState::New;
+
+    // 已经有稳定放置位置的任务在唤醒、信号和超时路径中占绝大多数。
+    // `prefer_current` 的契约本来就要求保留该 CPU，因此无需为这类任务
+    // 读取所有 runqueue 的负载；这也避免在 timer 路径中制造跨队列锁竞争。
+    if prefer_current && current.is_some_and(|cpu| affinity.intersection(active).contains(cpu)) {
+        return scheduler
+            .topology()
+            .describe_placement(affinity, active, current, true, |_| 0);
+    }
+
     let load_snapshot = collect_rq_load_snapshot_for(scheduler, affinity.intersection(active));
 
     scheduler
@@ -796,16 +810,25 @@ fn collect_rq_load_snapshot_for(
     scheduler: &crate::Scheduler,
     cpus: CpuMask,
 ) -> RunqueueLoadSnapshot {
+    let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
     RunqueueLoadSnapshot::collect(cpus, |cpu| {
         scheduler.cpu_or_boot(cpu.get()).runqueue().nr_running()
     })
 }
 
+fn collect_class_load_snapshot_for(
+    scheduler: &crate::Scheduler,
+    cpus: CpuMask,
+) -> RunqueueClassLoadSnapshot {
+    let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
+    RunqueueClassLoadSnapshot::collect(cpus, |cpu| {
+        scheduler.cpu_or_boot(cpu.get()).runqueue().class_load()
+    })
+}
+
 fn refresh_domain_stats() {
     let snapshot = SCHEDULER.topology_snapshot();
-    let loads = RunqueueClassLoadSnapshot::collect(snapshot.active, |cpu| {
-        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
-    });
+    let loads = collect_class_load_snapshot_for(&SCHEDULER, snapshot.active);
     SCHEDULER.update_domain_stats(snapshot, loads.loads());
 }
 
@@ -1187,11 +1210,21 @@ pub fn request_resched(cpu_id: usize) {
 fn notify_resched(cpu_id: usize) {
     if cpu_id != cpu() {
         if let Some(ops) = arch_hooks::cpu_control() {
-            if (ops.is_online)(cpu_id) {
+            let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+            if (ops.is_online)(cpu_id) && cpu_state.claim_resched_notification() {
                 (ops.send_resched)(cpu_id);
             }
         }
     }
+}
+
+/// 确认当前 CPU 已经接收远端调度通知。
+///
+/// 硬件 IPI 被中断入口消费后，通知合并位必须立即释放；否则目标 CPU 尚未
+/// 进入 `schedule_once` 时再次加入任务会被误认为已有未处理 IPI，从而永久
+/// 丢失唤醒。真正的 `need_resched` 请求仍保留到安全调度边界处理。
+pub fn acknowledge_resched_notification() {
+    SCHEDULER.cpu_or_boot(cpu()).clear_resched_notification();
 }
 
 pub fn request_balance(cpu_id: usize) {
@@ -1343,7 +1376,16 @@ pub fn enqueue_task_with_hint(task: Arc<Task>, cpu_hint: usize, now_ns: u64) -> 
 /// bind/listen。这个入口仅用于这类“父可运行，但当前 child 应先返回用户态”的
 /// 场景。
 pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
-    enqueue_task_locked(task, now_ns, false)
+    let local_cpu = cpu();
+    let cpu_id = enqueue_task_locked(task, now_ns, false);
+    if cpu_id != local_cpu {
+        // 本核上的 child 仍然优先返回用户态；父任务若落在远端睡眠 CPU，
+        // 则必须设置 need_resched 并发送 IPI，否则它只能等到下一次无关的
+        // 时钟或调度事件，vfork/exec 的等待可能永久卡住。
+        SCHEDULER.cpu_or_boot(cpu_id).request_resched();
+        notify_resched(cpu_id);
+    }
+    cpu_id
 }
 
 fn enqueue_task_locked(task: Arc<Task>, now_ns: u64, request_reschedule: bool) -> usize {
@@ -2010,17 +2052,18 @@ pub fn balance_once(cpu_id: usize) -> bool {
     let topology_snapshot = SCHEDULER.topology_snapshot();
     let topology = topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
-    let domain_loads = RunqueueClassLoadSnapshot::collect(active, |cpu| {
-        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
-    });
+    let domain_loads = collect_class_load_snapshot_for(&SCHEDULER, active);
     SCHEDULER.update_domain_stats(topology_snapshot, domain_loads.loads());
 
-    let load_snapshot = RunqueueClassLoadSnapshot::collect(active, |cpu| {
-        SCHEDULER
-            .cpu_or_boot(cpu.get())
-            .runqueue()
-            .migratable_class_load_for(allowed)
-    });
+    let load_snapshot = {
+        let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
+        RunqueueClassLoadSnapshot::collect(active, |cpu| {
+            SCHEDULER
+                .cpu_or_boot(cpu.get())
+                .runqueue()
+                .migratable_class_load_for(allowed)
+        })
+    };
     let classes = [SchedClass::Deadline, SchedClass::Realtime, SchedClass::Fair];
     let Some((src, class)) = classes.into_iter().find_map(|class| {
         select_balance_source_for_class(topology, local_cpu, active, class, |cpu| {
@@ -2275,6 +2318,9 @@ pub fn schedule_once(now_ns: u64) {
     cleanup_retired_tasks(cpu_id);
 
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    // 主动调度和 IPI 返回都会经过这里。进入选取过程即表示本 CPU 已经观察到
+    // runnable 状态，可以允许后续新请求再次发送远端通知。
+    cpu_state.clear_resched_notification();
 
     // 1. 取 prev（不持 owning current 锁跨切换）。
     let Some(prev) = cpu_state.current() else {
@@ -2481,11 +2527,11 @@ pub fn preempt_if_needed(now_ns: u64) {
 /// "硬件 wfi"等节能指令留到后续接 arch 钩子。
 unsafe extern "C" fn idle_entry(_cpu_arg: usize) -> ! {
     loop {
-        let _ = SCHEDULER.cpu_or_boot(cpu()).take_balance();
-        let _ = balance_once(cpu());
+        service_idle_scheduler_requests(cpu());
         // 队列空时 schedule_once 也会走"idle == prev"的快路径直接返回；
         // 一旦有 runnable 任务进来，下一次 schedule_once 会把 idle 切走。
-        schedule_once(now_ns_internal());
+        let now_ns = now_ns_internal();
+        schedule_once(now_ns);
         if let Some(ops) = arch_hooks::idle() {
             (ops.idle_relax)();
         } else {
@@ -2543,12 +2589,25 @@ pub fn spawn_idle_for_cpu(cpu_id: usize) -> Arc<Task> {
 pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
     activate_cpu(cpu_id).expect("[sched] CPU must be online before scheduling loop");
     loop {
-        schedule_once(now_ns_internal());
+        service_idle_scheduler_requests(cpu_id);
+        let now_ns = now_ns_internal();
+        schedule_once(now_ns);
         if let Some(ops) = arch_hooks::idle() {
             (ops.idle_relax)();
         } else {
             core::hint::spin_loop();
         }
+    }
+}
+
+fn service_idle_scheduler_requests(cpu_id: usize) {
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    // idle 循环本身每轮都会执行一次 schedule_once，因此这里只消费通知位，
+    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。若入队发生在本次
+    // 消费之后，生产者会重新置位并通过 IPI 关闭检查到 WFI 之间的竞态窗口。
+    let _ = cpu_state.take_resched();
+    if cpu_state.take_balance() {
+        let _ = balance_once(cpu_id);
     }
 }
 

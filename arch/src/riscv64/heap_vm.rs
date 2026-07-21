@@ -33,7 +33,10 @@
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest, PhysicalAllocation};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use general::{MapError, PagingArch, find_leaf, unmap_range_entries, validate_range_permissions};
+use general::{
+    MapError, PagingArch, PhysPageTableRoot, find_leaf, unmap_range_entries,
+    validate_range_permissions,
+};
 use spin::Mutex;
 
 use crate::riscv64::paging::{Riscv64Paging, Riscv64Pte};
@@ -311,6 +314,12 @@ pub(crate) fn debug_verify_heap_mapping_transactions() {
         )
         .expect("[arch][heap_vm] debug transaction test unmap failed");
         assert!(kernel_virt_to_phys(test_vaddr).is_err());
+        // 正式 free 保留空下级页表；自检在专用窗口显式触发冷路径回收，继续验证
+        // 摘除父 PTE、全局 fence 与物理页释放的事务顺序。
+        assert!(with_kernel_heap_page_table_lock(|| {
+            let root = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+            reclaim_empty_heap_page_tables(phys_to_virt(root), test_vaddr, PAGE_SIZE)
+        }));
     }
     assert!(
         PAGE_TABLE_PAGES_RECLAIMED.load(Ordering::Relaxed) >= reclaimed_before + RECLAIM_CYCLES,
@@ -362,8 +371,8 @@ pub fn kernel_virt_to_phys(vaddr: usize) -> Result<usize, MapError> {
         return Err(MapError::NotMapped);
     }
 
-    // heap 的下级页表可能在 unmap 后被立即回收。查询必须与 map/unmap 使用同一把
-    // 结构锁，否则 find_leaf() 可能沿着刚被摘除并释放的页表页继续遍历。
+    // 查询与 map/unmap 使用同一把结构锁，避免在叶 PTE 更新中观察到部分状态；
+    // 映射失败回滚和显式调试回收仍可能摘除下级页表。
     with_kernel_heap_page_table_lock(|| {
         let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
         if root_paddr == 0 {
@@ -787,6 +796,18 @@ pub(crate) fn kernel_page_table_root() -> usize {
     root_paddr
 }
 
+/// 将当前 hart 切回内核地址空间。
+///
+/// 用户任务离开 CPU 后，调度器不能继续保留它的用户根页表；否则该任务的
+/// `VmSpace` 释放后，下一次内核访问可能落到已经复用的物理页表页。内核根使用
+/// ASID 0，`activate_with_asid` 会在根或 ASID 变化时执行本地失效。
+pub fn activate_kernel_page_table() {
+    let root_paddr = kernel_page_table_root();
+    unsafe {
+        Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root_paddr), 0, false);
+    }
+}
+
 /// 为 SBI HSM 的物理入口临时恢复内核镜像所在 1 GiB 的 identity mapping。
 pub(crate) fn install_secondary_identity_mapping() {
     let _guard = KERNEL_HEAP_PAGE_TABLE_LOCK.lock();
@@ -1049,16 +1070,20 @@ fn flush_kernel_tlb_all() {
     TLB_GLOBAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
 }
 
-fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan) {
+fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, range_size: usize) {
     if plan.global {
-        flush_kernel_tlb_all();
-        return;
+        unsafe { Riscv64Paging::flush_tlb_global_local(None) };
+        TLB_GLOBAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        for &vaddr in &plan.addresses[..plan.count] {
+            unsafe { Riscv64Paging::flush_tlb_global_local(Some(general::VirtAddr::new(vaddr))) };
+            TLB_ADDRESS_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    for &vaddr in &plan.addresses[..plan.count] {
-        flush_kernel_tlb_addr(vaddr);
-        TLB_ADDRESS_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    }
+    // 本地 sfence 需要逐 leaf 执行，但 SBI RFENCE 原生接受连续范围。把原先最多
+    // 64 次 M-mode 往返合并为一次，同时仍在返回前等待所有远端 hart 完成失效。
+    crate::riscv64::smp::remote_sfence_vma_range_on(usize::MAX, None, range_start, range_size);
 }
 
 fn uniform_kernel_tlb_flush_plan(
@@ -1289,7 +1314,7 @@ fn map_range_with_policy(
                 }
                 if !reclaim_empty_heap_page_tables(root_vaddr, vaddr, mapped_size) {
                     let plan = uniform_kernel_tlb_flush_plan(vaddr, mapped_size, page_size);
-                    execute_kernel_tlb_flush_plan(&plan);
+                    execute_kernel_tlb_flush_plan(&plan, vaddr, mapped_size);
                 }
             }
 
@@ -1317,7 +1342,7 @@ fn map_range_with_policy(
         LARGE_PAGE_MAPS.fetch_add(size / page_size, Ordering::Relaxed);
     }
     let plan = uniform_kernel_tlb_flush_plan(vaddr, size, page_size);
-    execute_kernel_tlb_flush_plan(&plan);
+    execute_kernel_tlb_flush_plan(&plan, vaddr, size);
     Ok(())
 }
 
@@ -1377,12 +1402,6 @@ fn find_leaf_level(
     }
 }
 
-pub(crate) fn flush_kernel_tlb_addr(vaddr: usize) {
-    unsafe {
-        Riscv64Paging::flush_tlb_global(Some(general::VirtAddr::new(vaddr)));
-    }
-}
-
 fn map_kernel_range_in_window(
     vaddr: usize,
     paddr: usize,
@@ -1439,11 +1458,10 @@ fn unmap_kernel_heap_range_locked(vaddr: usize, size: usize) -> Result<(), MapEr
     let flush_plan = existing_kernel_tlb_flush_plan(root_vaddr, vaddr, size)?;
     clear_kernel_heap_entries(root_vaddr, vaddr, size)?;
 
-    // 若摘除了中间页表，reclaim 内的一次全局 flush 已同时覆盖叶 translation；
-    // 否则按预先保存的实际 leaf 地址做精确刷新。
-    if !reclaim_empty_heap_page_tables(root_vaddr, vaddr, size) {
-        execute_kernel_tlb_flush_plan(&flush_plan);
-    }
+    // 内核堆完整覆盖 2 GiB 时，下级页表的物理上界约为 4 MiB。普通 free 保留
+    // 已建立的空 PT/PMD，避免短生命周期大对象反复扫描 512 项、释放页表页并在
+    // 下一次分配中重新建立同一层级。叶映射仍在返回前完成全 hart 失效。
+    execute_kernel_tlb_flush_plan(&flush_plan, vaddr, size);
     Ok(())
 }
 
@@ -1570,7 +1588,7 @@ fn protect_kernel_heap_range_locked(
         }
         current = next;
     }
-    execute_kernel_tlb_flush_plan(&flush_plan);
+    execute_kernel_tlb_flush_plan(&flush_plan, vaddr, size);
     Ok(())
 }
 

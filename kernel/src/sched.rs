@@ -202,8 +202,14 @@ fn vm_on_switch(next: &Arc<Task>) {
     if let Some(payload) = next.ext_lookup(TASKEXT_VM_SPACE) {
         if let Ok(vm) = payload.downcast::<VmSpace>() {
             vm.activate();
+            return;
         }
     }
+
+    // 内核线程和 idle 没有用户地址空间。RISC-V 若在这里保持上一个用户
+    // satp，旧 VmSpace 释放后其根页会被重新分配，内核随后会在悬空页表下
+    // 执行；所有架构统一在切换前恢复内核根。
+    hal::sched::activate_kernel_address_space();
 }
 
 static VM_SWITCH_OPS: VmSwitchOps = VmSwitchOps {

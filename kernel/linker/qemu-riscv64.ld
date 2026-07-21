@@ -13,7 +13,9 @@ SECTIONS
 
     stext = .;
     .text ALIGN(4K) : AT(ADDR(.text) - LOAD_OFFSET) {
-        KEEP(*(.text.entry))
+        /* OpenSBI 跳转到物理装载基址，主入口必须严格占据首地址。 */
+        KEEP(*(.text.entry.boot))
+        KEEP(*(.text.entry .text.entry.*))
         . = ALIGN(4K);
         KEEP(*(.text.trap.eentry))
         . = ALIGN(4K);
@@ -102,3 +104,6 @@ SECTIONS
 
     . = ALIGN(8);
 }
+
+ASSERT(_start == VIRTUAL_BASE_ADDRESS,
+       "RISC-V boot entry must be the first byte of the load image")

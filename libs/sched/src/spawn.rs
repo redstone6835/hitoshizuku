@@ -477,10 +477,11 @@ where
     zombie.thread_group().remove_member(&zombie);
     zombie.process_group().remove_member(&zombie);
 
-    // 进程已经不再运行；在父进程 wait 上下文释放 VM/FDT/VFS 等重量级资源。
-    // wait 状态和 procfs 需要的轻量字段仍保留在 Task 本体中。
-    zombie.cleanup_exit_extensions();
-    zombie.retire_execution();
+    // 执行体不能在 reap 这里释放：任务可能仍是某个 CPU 的 current，或者正处于
+    // 调度器发布 next、尚未完成上下文切换的窗口。exit_task 已经负责非 current
+    // 任务的扩展清理；current 任务会在最终切出后的 retired 队列中统一清理。
+    // 这里只移除父子关系和 PID 所有权，剩余执行体由调度器或 Task 的 Arc 生命周期
+    // 回收，避免父进程与远端调度器并发释放上下文/内核栈。
 
     debug_assert_eq!(zombie.state(), TaskState::Dead);
     #[cfg(feature = "trace-task-lifecycle")]

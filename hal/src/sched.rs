@@ -13,6 +13,17 @@ pub fn register_arch_hooks() {
     }
 }
 
+/// 将当前 CPU 切回内核地址空间。
+///
+/// 用户任务切换到 idle 或内核线程时，调用方必须执行此操作，不能把旧用户
+/// 地址空间留在硬件根寄存器中。各架构负责处理自己的根页表、ASID 与 TLB 语义。
+pub fn activate_kernel_address_space() {
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    {
+        arch::activate_kernel_page_table();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SecondaryCpuReport {
     pub detected: usize,

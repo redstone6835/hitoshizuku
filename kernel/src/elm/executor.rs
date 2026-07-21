@@ -13,6 +13,13 @@ static PROVIDER_WORKER_WAITS: [AtomicU64; sched::NR_CPUS] =
 static PROVIDER_WORKER_WAKEUPS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WORK_QUEUE: sched::WaitQueue = sched::WaitQueue::new();
 
+/// 单次连续处理的异步工作上限。
+///
+/// provider worker 是内核线程，内核态 timer trap 只记录延迟 tick，不会在任意
+/// 自旋锁临界区强行切换。因此即使工作队列持续非空，也必须主动回到调度器，
+/// 否则低优先级 worker 仍可能长期占住一个 CPU。
+const PROVIDER_WORK_BUDGET: usize = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderWorkerSnapshot {
     pub online_mask: u64,
@@ -125,6 +132,7 @@ pub(crate) fn wake_provider_worker() {
 unsafe extern "C" fn provider_worker(cpu_id: usize) -> ! {
     log::info!("[elm][executor] provider worker ready on CPU {}", cpu_id);
     loop {
+        let mut budget = 0usize;
         loop {
             PROVIDER_WORKER_BUSY[cpu_id].store(true, Ordering::Release);
             let handled = super::core::run_one_async_provider_job_unlocked(sched::now_ns_public());
@@ -133,6 +141,13 @@ unsafe extern "C" fn provider_worker(cpu_id: usize) -> ! {
                 break;
             }
             PROVIDER_WORKER_COMPLETED[cpu_id].fetch_add(1, Ordering::Relaxed);
+            budget += 1;
+            if budget >= PROVIDER_WORK_BUDGET {
+                // 内核线程不会走用户态 trap 返回的抢占收尾；有界主动调度既
+                // 响应 need_resched，也让同一 CPU 上的用户任务及时获得机会。
+                budget = 0;
+                sched::schedule_once(sched::now_ns_public());
+            }
         }
 
         let current = sched::current_task();
