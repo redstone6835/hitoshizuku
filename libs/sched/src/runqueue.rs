@@ -447,16 +447,26 @@ impl Runqueue {
 
     /// 在 rq 锁内更新 nice / slice，并按旧属性先完成出队记账。
     pub(crate) fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) -> bool {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params))
+        self.update_sched_entity(task, now_ns, |task| task.set_sched_params(params))
     }
 
     /// 在 rq 锁内只更新 nice/weight，保持策略与时间片不变。
     pub(crate) fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) -> bool {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice))
+        self.update_sched_entity(task, now_ns, |task| task.set_nice(nice))
     }
 
     /// 在 rq 锁内更新完整调度属性，并按旧 class / 权重完成出队记账。
     pub(crate) fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.set_sched_attr(attr))
+    }
+
+    /// 只应用 PI 计算出的有效属性，不改写任务保存的用户基础属性。
+    pub(crate) fn update_sched_attr_raw(
+        &self,
+        task: &Arc<Task>,
+        attr: SchedAttr,
+        now_ns: u64,
+    ) -> bool {
         self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr))
     }
 

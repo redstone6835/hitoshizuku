@@ -85,6 +85,45 @@ fn robust_list_and_rseq_state_roundtrip() {
 }
 
 #[ktest]
+fn pi_donation_tracks_nested_sources_and_restores_base_attr() {
+    let task = make_task();
+    task.set_sched_attr(SchedAttr::fair(8, 0));
+
+    let fair = task.pi_add_donation(1, SchedAttr::fair(-5, 0));
+    assert_eq!(fair.policy, SchedPolicy::Fair);
+    assert_eq!(fair.nice, -5);
+
+    let rt = task.pi_add_donation(2, SchedAttr::rt_fifo(40));
+    assert_eq!(rt.policy, SchedPolicy::RtFifo);
+    assert_eq!(rt.priority, 40);
+
+    let still_rt = task.pi_remove_donation(1);
+    assert_eq!(still_rt.policy, SchedPolicy::RtFifo);
+    assert_eq!(still_rt.priority, 40);
+
+    let restored = task.pi_remove_donation(2);
+    assert_eq!(restored.policy, SchedPolicy::Fair);
+    assert_eq!(restored.nice, 8);
+}
+
+#[ktest]
+fn pi_donation_preserves_base_update_until_last_waiter_leaves() {
+    let task = make_task();
+    task.set_sched_attr(SchedAttr::fair(10, 0));
+    let boosted = task.pi_add_donation(9, SchedAttr::rt_round_robin(30, 1_000_000));
+    task.sched.set_sched_attr(boosted);
+
+    task.set_sched_attr(SchedAttr::fair(3, 0));
+    assert_eq!(task.sched.policy(), SchedPolicy::RtFifo);
+    assert_eq!(task.sched.rt_priority(), 30);
+    assert_eq!(task.pi_base_attr().nice, 3);
+
+    let restored = task.pi_remove_donation(9);
+    assert_eq!(restored.policy, SchedPolicy::Fair);
+    assert_eq!(restored.nice, 3);
+}
+
+#[ktest]
 fn supported_cpu_mask_matches_configured_capacity() {
     let expected = if NR_CPUS >= 64 {
         u64::MAX

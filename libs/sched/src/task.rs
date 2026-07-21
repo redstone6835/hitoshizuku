@@ -40,6 +40,7 @@ use crate::ids::Credentials;
 use crate::pid::{PidNamespace, PidT};
 use crate::placement::{PlacementSnapshot, TaskPlacement};
 use crate::rseq::{RseqEvent, RseqEvents};
+use crate::sched_class::{RT_PRIO_MAX, SchedAttr, SchedPolicy};
 use crate::signal::{SharedSignal, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
@@ -139,6 +140,74 @@ const DEFAULT_COMM: [u8; TASK_COMM_LEN] =
 pub struct RobustListState {
     pub head: usize,
     pub len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PiDonation {
+    token: usize,
+    attr: SchedAttr,
+}
+
+struct PiState {
+    base: SchedAttr,
+    donations: Vec<PiDonation>,
+}
+
+impl PiState {
+    fn new(base: SchedAttr) -> Self {
+        Self {
+            base: base.normalized(),
+            donations: Vec::new(),
+        }
+    }
+
+    fn effective(&self) -> SchedAttr {
+        let mut effective = self.base;
+        for donation in &self.donations {
+            effective = more_urgent(effective, donation.attr);
+        }
+        effective
+    }
+}
+
+/// 比较 PI donation 的调度紧迫程度。
+///
+/// RT waiter 可以把普通任务提升到 RT；同为 fair 时继承更高权重（更小
+/// nice）。Deadline donation 暂时折算为最高 RT，避免把 owner 的 deadline
+/// 带宽状态伪造成另一份 admission reservation。
+fn more_urgent(current: SchedAttr, donated: SchedAttr) -> SchedAttr {
+    match donated.policy {
+        SchedPolicy::Deadline => {
+            if current.policy == SchedPolicy::Deadline {
+                current
+            } else {
+                SchedAttr::rt_fifo(RT_PRIO_MAX)
+            }
+        }
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
+            let donated_prio = donated.priority;
+            match current.policy {
+                SchedPolicy::Deadline => current,
+                SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin
+                    if current.priority >= donated_prio =>
+                {
+                    current
+                }
+                SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => SchedAttr::rt_fifo(donated_prio),
+                _ => SchedAttr::rt_fifo(donated_prio),
+            }
+        }
+        SchedPolicy::Fair => {
+            if current.policy == SchedPolicy::Fair && donated.nice < current.nice {
+                let mut boosted = current;
+                boosted.nice = donated.nice;
+                boosted
+            } else {
+                current
+            }
+        }
+        SchedPolicy::Idle => current,
+    }
 }
 
 /// 每线程 rseq 注册状态。
@@ -494,6 +563,9 @@ pub struct Task {
     clear_child_tid: AtomicUsize,
     /// `set_robust_list` 注册的每线程 robust futex 链表。
     robust_list: Spinlock<RobustListState>,
+    /// PI futex 的基础调度属性和当前 donation。该状态与 sched entity 分开保存，
+    /// 这样解除最后一个 donation 时可以恢复用户实际设置的基础属性。
+    pi: Spinlock<PiState>,
     /// `rseq` 注册状态与尚未在返回用户态边界消费的调度事件。
     rseq: Spinlock<RseqRegistration>,
     rseq_events: AtomicU8,
@@ -599,6 +671,7 @@ impl Task {
             vforking: AtomicBool::new(false),
             clear_child_tid: AtomicUsize::new(0),
             robust_list: Spinlock::new(RobustListState::default()),
+            pi: Spinlock::new(PiState::new(SchedAttr::from(params))),
             rseq: Spinlock::new(RseqRegistration::default()),
             rseq_events: AtomicU8::new(0),
             rseq_cpu: AtomicUsize::new(usize::MAX),
@@ -1343,6 +1416,73 @@ impl Task {
 
     pub fn set_sched_reset_on_fork(&self, enabled: bool) {
         self.sched_reset_on_fork.store(enabled, Ordering::Release);
+    }
+
+    /// 设置用户请求的基础调度属性，同时重新计算 PI donation 后的有效属性。
+    /// runqueue 锁由调用方持有；这里不直接改变队列索引。
+    pub(crate) fn set_sched_attr(&self, attr: SchedAttr) {
+        let effective = {
+            let mut pi = self.pi.lock();
+            pi.base = attr.normalized();
+            pi.effective()
+        };
+        self.sched.set_sched_attr(effective);
+    }
+
+    pub(crate) fn set_sched_params(&self, params: SchedParams) {
+        let effective = {
+            let mut pi = self.pi.lock();
+            if pi.donations.is_empty() {
+                pi.base = self.sched.sched_attr();
+            }
+            pi.base.nice = params.nice;
+            pi.base.slice_ns = params.slice();
+            pi.base = pi.base.normalized();
+            pi.effective()
+        };
+        self.sched.set_sched_attr(effective);
+    }
+
+    pub(crate) fn set_nice(&self, nice: i8) {
+        let effective = {
+            let mut pi = self.pi.lock();
+            if pi.donations.is_empty() {
+                pi.base = self.sched.sched_attr();
+            }
+            pi.base.nice = nice;
+            pi.base = pi.base.normalized();
+            pi.effective()
+        };
+        self.sched.set_sched_attr(effective);
+    }
+
+    /// 登记一个 PI waiter 的 donation，返回 owner 应采用的有效属性。
+    pub fn pi_add_donation(&self, token: usize, attr: SchedAttr) -> SchedAttr {
+        let mut pi = self.pi.lock();
+        if let Some(existing) = pi.donations.iter_mut().find(|d| d.token == token) {
+            existing.attr = attr.normalized();
+        } else {
+            pi.donations.push(PiDonation {
+                token,
+                attr: attr.normalized(),
+            });
+        }
+        pi.effective()
+    }
+
+    /// 移除一个 PI waiter 的 donation，返回 owner 恢复后的有效属性。
+    pub fn pi_remove_donation(&self, token: usize) -> SchedAttr {
+        let mut pi = self.pi.lock();
+        pi.donations.retain(|donation| donation.token != token);
+        pi.effective()
+    }
+
+    pub fn pi_effective_attr(&self) -> SchedAttr {
+        self.pi.lock().effective()
+    }
+
+    pub fn pi_base_attr(&self) -> SchedAttr {
+        self.pi.lock().base
     }
 
     // ── CPU 亲和性 ───────────────────────────────────────────────────────
