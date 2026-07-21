@@ -152,13 +152,16 @@ pub fn activate_task_with_cpu_hint(
 /// 回滚尚未运行、尚未入队的新任务。用于 clone/exec 安装用户上下文失败的路径。
 #[kernel_symbols::export(name = "sched.spawn.abort_new_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn abort_new_task(task: &Arc<Task>) {
+    crate::scheduler::deadline_admission().release(task);
     if let Some(parent) = task.parent() {
         let _ = parent.remove_child(task);
     }
     for (ns, pid) in task.pid_namespaces_snapshot() {
         ns.registry().release(pid);
     }
-    task.thread_group().remove_member(task);
+    let group = task.thread_group();
+    group.cancel_member_accounting();
+    group.remove_member(task);
     task.process_group().remove_member(task);
     task.set_state(TaskState::Dead);
 }
@@ -181,6 +184,10 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         // CLONE_SIGHAND 共享 SharedSignal（即便不 CLONE_THREAD）。
         let tg = if flags.has(CloneFlags::CLONE_SIGHAND) {
             ThreadGroup::new_sharing_signal(Arc::clone(parent_tg.shared_signal()))
+        } else if flags.has(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            ThreadGroup::new_sharing_signal(Arc::new(
+                parent_tg.shared_signal().fork_copy_clearing_handlers(),
+            ))
         } else {
             // 不共享 → 深拷一份 sigaction。
             let copied = parent_tg.shared_signal().fork_copy();
@@ -221,14 +228,14 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     if parent.sched_reset_on_fork() && !flags.has(CloneFlags::CLONE_THREAD) {
         // 父任务通过 SCHED_RESET_ON_FORK 要求子进程不能继承 RT/deadline
         // 或负 nice 权重；子任务自身不继续携带该继承标志。
-        let parent_attr = parent.sched.sched_attr();
+        let parent_attr = parent.pi_base_attr();
         let child_attr = match parent_attr.policy {
             SchedPolicy::Fair | SchedPolicy::Idle => SchedAttr::fair(parent_attr.nice.max(0), 0),
             SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin | SchedPolicy::Deadline => {
                 SchedAttr::fair(0, 0)
             }
         };
-        child.sched.set_sched_attr(child_attr);
+        child.set_sched_attr(child_attr);
         child.set_sched_reset_on_fork(false);
     }
 
@@ -355,6 +362,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     }
 
     task.cleanup_before_exit();
+    crate::scheduler::deadline_admission().release(task);
 
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
     //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。

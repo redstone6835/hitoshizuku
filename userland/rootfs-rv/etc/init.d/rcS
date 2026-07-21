@@ -8,6 +8,22 @@ if [ "${1:-}" = "--chrooted" ]; then
     CHROOTED=1
 fi
 
+if [ -x /bin/pthread-smp-test ]; then
+    echo "[init][smp-tests] running pthread SMP tests"
+    /bin/pthread-smp-test
+    status=$?
+    echo "[init][smp-tests] pthread SMP tests exit=$status"
+fi
+
+if [ -x /bin/acct-test ]; then
+    echo "[init][acct-tests] running process accounting tests"
+    /bin/acct-test record
+    record_status=$?
+    /bin/acct-test verify "$record_status"
+    status=$?
+    echo "[init][acct-tests] process accounting tests exit=$status"
+fi
+
 if [ "$CHROOTED" = "0" ]; then
     echo "[init] Welcome to Shiori"
 

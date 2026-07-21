@@ -186,17 +186,13 @@ pub fn dispatch(tf: TrapFramePtr) {
     if !frame_finalized {
         if ret == -(Errno::EINTR.as_i32() as isize) {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
-                let delivered = sched::process_image_ops()
-                    .and_then(|ops| {
-                        (ops.setup_signal_frame)(
-                            ctx.task(),
-                            info,
-                            action,
-                            sched::UserContextRef::new(tf.as_usize()),
-                        )
-                        .ok()
-                    })
-                    .is_some();
+                let delivered = sched::operation::setup_user_signal_frame_for_task(
+                    ctx.task(),
+                    info,
+                    action,
+                    sched::UserContextRef::new(tf.as_usize()),
+                )
+                .is_ok();
                 if delivered {
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
@@ -287,17 +283,13 @@ where
     if !frame_finalized {
         if ret == -(Errno::EINTR.as_i32() as isize) {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
-                let delivered = sched::process_image_ops()
-                    .and_then(|pops| {
-                        (pops.setup_signal_frame)(
-                            ctx.task(),
-                            info,
-                            action,
-                            sched::UserContextRef::new(tf.as_usize()),
-                        )
-                        .ok()
-                    })
-                    .is_some();
+                let delivered = sched::operation::setup_user_signal_frame_for_task(
+                    ctx.task(),
+                    info,
+                    action,
+                    sched::UserContextRef::new(tf.as_usize()),
+                )
+                .is_ok();
                 if delivered {
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;

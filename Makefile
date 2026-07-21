@@ -52,6 +52,8 @@ BUSYBOX_SKELETON := userland/busybox-initramfs
 PACK_INITRAMFS := scripts/pack-initramfs.sh
 
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
+PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
+ACCT_TEST_SRC := userland/tests/acct.c
 
 ifeq ($(strip $(ARCH)),)
 SELECTED_ARCHES := $(LA_ARCH) $(RV_ARCH)
@@ -189,6 +191,21 @@ define build_elm_user_tools
 	install -m 0755 $(BUILD_DIR)/$(1)/elm-user/elmctl $(2)/bin/
 endef
 
+define build_smp_user_tests
+	@if [ -n "$(filter smp-tests,$(FEATURES))" ]; then \
+		rm -rf $(BUILD_DIR)/$(1)/smp-user; \
+		mkdir -p $(BUILD_DIR)/$(1)/smp-user $(2)/bin; \
+		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -pthread \
+			$(PTHREAD_SMP_TEST_SRC) -o $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test; \
+		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -pthread \
+			$(ACCT_TEST_SRC) -o $(BUILD_DIR)/$(1)/smp-user/acct-test; \
+		$(3)strip $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test || true; \
+		$(3)strip $(BUILD_DIR)/$(1)/smp-user/acct-test || true; \
+		install -m 0755 $(BUILD_DIR)/$(1)/smp-user/pthread-smp-test $(2)/bin/; \
+		install -m 0755 $(BUILD_DIR)/$(1)/smp-user/acct-test $(2)/bin/; \
+	fi
+endef
+
 define prepare_compat_rootfs
 	$(MAKE) _busybox-$(1)
 	rm -rf $(2)
@@ -199,6 +216,7 @@ define prepare_compat_rootfs
 	mkdir -p $(2)/lib/elm
 	rm -f $(2)/lib/elm/*
 	$(call build_elm_user_tools,$(1),$(2),$(5))
+	$(call build_smp_user_tests,$(1),$(2),$(5))
 	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
 	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
 		-exec install -m 0644 {} $(2)/lib/elm/ \;

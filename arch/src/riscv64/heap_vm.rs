@@ -98,6 +98,7 @@ const PAGE_TABLE_UNINITIALIZED: usize = 0;
 const PAGE_TABLE_INITIALIZING: usize = 1;
 const PAGE_TABLE_INITIALIZED: usize = 2;
 static PAGE_TABLE_INIT_STATE: AtomicUsize = AtomicUsize::new(PAGE_TABLE_UNINITIALIZED);
+static SECONDARY_IDENTITY_PUD: AtomicUsize = AtomicUsize::new(0);
 
 /// 动态 kernel heap 页表的结构锁。
 ///
@@ -777,6 +778,60 @@ pub fn init_kernel_page_table() {
 
     PAGE_TABLE_INIT_STATE.store(PAGE_TABLE_INITIALIZED, Ordering::Release);
     log::info!("[arch][heap_vm] identity mapping (PGD[0]) removed");
+}
+
+/// 返回 boot hart 已发布的正式 Sv48 根页表物理地址。
+pub(crate) fn kernel_page_table_root() -> usize {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    assert_ne!(root_paddr, 0, "[smp] kernel page table is not ready");
+    root_paddr
+}
+
+/// 为 SBI HSM 的物理入口临时恢复内核镜像所在 1 GiB 的 identity mapping。
+pub(crate) fn install_secondary_identity_mapping() {
+    let _guard = KERNEL_HEAP_PAGE_TABLE_LOCK.lock();
+    if SECONDARY_IDENTITY_PUD.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let root_paddr = kernel_page_table_root();
+    let pgd = phys_to_virt(root_paddr) as *mut usize;
+    let kernel_pud_pte = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd.add(511)) });
+    assert!(
+        Riscv64Paging::pte_is_valid(kernel_pud_pte) && !Riscv64Paging::pte_is_leaf(kernel_pud_pte)
+    );
+    let kernel_pud = phys_to_virt(Riscv64Paging::pte_addr(kernel_pud_pte)) as *mut usize;
+    let identity_pud_paddr = alloc_page_table_allocation()
+        .expect("[smp] identity PUD allocation failed")
+        .paddr;
+    let identity_pud = phys_to_virt(identity_pud_paddr) as *mut usize;
+    unsafe {
+        core::ptr::write_bytes(identity_pud, 0, PAGE_SIZE / core::mem::size_of::<usize>());
+        let kernel_image_pte = core::ptr::read_volatile(kernel_pud.add(2));
+        core::ptr::write_volatile(identity_pud.add(2), kernel_image_pte);
+        core::arch::asm!("fence w, w", options(nostack));
+        let identity_pgd_pte = Riscv64Paging::make_table_pte(identity_pud_paddr);
+        core::ptr::write_volatile(pgd, identity_pgd_pte.bits());
+        core::arch::asm!("fence rw, rw", options(nostack));
+        Riscv64Paging::flush_tlb_global(None);
+    }
+    SECONDARY_IDENTITY_PUD.store(identity_pud_paddr, Ordering::Release);
+}
+
+/// 所有 AP 已跳入高半区后撤销临时 identity mapping。
+pub(crate) fn remove_secondary_identity_mapping() {
+    let _guard = KERNEL_HEAP_PAGE_TABLE_LOCK.lock();
+    let identity_pud_paddr = SECONDARY_IDENTITY_PUD.swap(0, Ordering::AcqRel);
+    if identity_pud_paddr == 0 {
+        return;
+    }
+    let root_paddr = kernel_page_table_root();
+    let pgd = phys_to_virt(root_paddr) as *mut usize;
+    unsafe {
+        core::ptr::write_volatile(pgd, 0);
+        core::arch::asm!("fence rw, rw", options(nostack));
+        Riscv64Paging::flush_tlb_global(None);
+    }
+    free_page_table_page(identity_pud_paddr);
 }
 
 /// 验证内核关键段的页表权限。仅在 debug 构建中生效。

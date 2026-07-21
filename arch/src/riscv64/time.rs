@@ -40,7 +40,8 @@ pub const DEFAULT_TIMER_HZ: usize = 997;
 
 static TIMER_HZ: AtomicUsize = AtomicUsize::new(DEFAULT_TIMER_HZ);
 static TIMER_PERIOD_TICKS: AtomicU64 = AtomicU64::new(100_000);
-static NEXT_TIMER_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static NEXT_TIMER_DEADLINES: [AtomicU64; sched::NR_CPUS] =
+    [const { AtomicU64::new(0) }; sched::NR_CPUS];
 static HAS_SSTC: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +158,7 @@ pub fn init_periodic_timer(timer_hz: usize) {
     TIMER_PERIOD_TICKS.store(period, Ordering::Relaxed);
     set_csr!(sie, SIE_STIE);
     let deadline = stable_counter_raw().saturating_add(period);
-    NEXT_TIMER_DEADLINE.store(deadline, Ordering::Release);
+    NEXT_TIMER_DEADLINES[current_timer_cpu()].store(deadline, Ordering::Release);
     arm_timer_at(deadline);
 }
 
@@ -165,7 +166,8 @@ pub fn init_periodic_timer(timer_hz: usize) {
 pub fn rearm_periodic_timer() -> u64 {
     let period = TIMER_PERIOD_TICKS.load(Ordering::Relaxed).max(1);
     let now = stable_counter_raw();
-    let previous = NEXT_TIMER_DEADLINE.load(Ordering::Acquire);
+    let deadline = &NEXT_TIMER_DEADLINES[current_timer_cpu()];
+    let previous = deadline.load(Ordering::Acquire);
     let mut next = if previous == 0 {
         now.saturating_add(period)
     } else {
@@ -180,9 +182,14 @@ pub fn rearm_periodic_timer() -> u64 {
         }
     }
 
-    NEXT_TIMER_DEADLINE.store(next, Ordering::Release);
+    deadline.store(next, Ordering::Release);
     arm_timer_at(next);
     now
+}
+
+#[inline]
+fn current_timer_cpu() -> usize {
+    crate::riscv64::specific::current_cpu_id().min(sched::NR_CPUS - 1)
 }
 
 #[inline]

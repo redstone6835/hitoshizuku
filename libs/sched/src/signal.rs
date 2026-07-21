@@ -463,6 +463,14 @@ impl SharedSignal {
         }
     }
 
+    /// 为 `CLONE_CLEAR_SIGHAND` 深拷信号表，并把父进程中已捕获的信号恢复
+    /// 为默认 disposition。`SIG_IGN` 按 Linux 语义继续保持忽略。
+    pub fn fork_copy_clearing_handlers(&self) -> Self {
+        let copied = self.fork_copy();
+        copied.reset_caught_handlers();
+        copied
+    }
+
     /// 订阅当前线程组共享 pending 信号变化。
     pub fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
         self.observers.subscribe(observer);
@@ -483,6 +491,10 @@ impl SharedSignal {
     /// execve 时按 POSIX 重置信号处理：所有 caught 信号恢复为 SIG_DFL，
     /// SIG_IGN 保持（除 SIGCHLD 特殊情况）。SIGKILL/SIGSTOP 不可改，跳过。
     pub fn reset_handlers_for_exec(&self) {
+        self.reset_caught_handlers();
+    }
+
+    fn reset_caught_handlers(&self) {
         let mut guard = self.actions.lock();
         for sig_idx in 0..guard.len() {
             let sig = SignalNumber::from_raw(sig_idx as i32);

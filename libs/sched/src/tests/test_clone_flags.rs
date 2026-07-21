@@ -5,7 +5,8 @@
 
 extern crate std;
 
-use crate::clone_flags::CloneFlags;
+use crate::clone_flags::{CloneArgs, CloneFlags};
+use errno::Errno;
 use ktest::ktest;
 
 /// CLONE_THREAD 位被正确检测。
@@ -46,4 +47,32 @@ fn vfork_default_flags() {
 fn exit_signal_extract() {
     let f = CloneFlags::from_raw(0x0000_0009);
     assert_eq!(f.exit_signal(), 9);
+}
+
+/// CLONE_CLEAR_SIGHAND 使用 clone3 的 64 位 flag 位，不得被低 32 位截断。
+#[ktest]
+fn clear_sighand_flag_uses_linux_uapi_bit() {
+    let flags = CloneFlags::from_raw(CloneFlags::CLONE_CLEAR_SIGHAND);
+    assert_eq!(CloneFlags::CLONE_CLEAR_SIGHAND, 1u64 << 32);
+    assert!(flags.has(CloneFlags::CLONE_CLEAR_SIGHAND));
+}
+
+/// CLONE_CLEAR_SIGHAND 可以单独使用，但不能与 CLONE_SIGHAND 同时指定。
+#[ktest]
+fn clear_sighand_conflicts_with_shared_sighand() {
+    let mut args = CloneArgs::fork_default();
+    args.flags =
+        CloneFlags::from_raw(CloneFlags::CLONE_CLEAR_SIGHAND | CloneFlags::fork_default().raw());
+    assert_eq!(crate::operation::validate_clone_args(args), Ok(()));
+
+    args.flags = CloneFlags::from_raw(
+        CloneFlags::CLONE_CLEAR_SIGHAND
+            | CloneFlags::CLONE_SIGHAND
+            | CloneFlags::CLONE_VM
+            | CloneFlags::fork_default().raw(),
+    );
+    assert_eq!(
+        crate::operation::validate_clone_args(args),
+        Err(Errno::EINVAL)
+    );
 }

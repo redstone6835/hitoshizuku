@@ -65,6 +65,9 @@ const SYS_PID_MAX_INO: u64 = 20;
 const INTERRUPTS_INO: u64 = 21;
 const SYS_FS_INO: u64 = 22;
 const SYS_FILE_MAX_INO: u64 = 23;
+const SYS_SCHED_RT_PERIOD_INO: u64 = 24;
+const SYS_SCHED_RT_RUNTIME_INO: u64 = 25;
+const SYS_SCHED_RR_TIMESLICE_INO: u64 = 26;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -234,6 +237,9 @@ enum ProcFileKind {
     SysHotplug,
     SysPidMax,
     SysFileMax,
+    SysSchedRtPeriod,
+    SysSchedRtRuntime,
+    SysSchedRrTimeslice,
 }
 
 #[derive(Clone, Copy)]
@@ -1002,6 +1008,24 @@ impl InodeOps for ProcSysKernelDirOps {
         match name {
             "hotplug" => Ok(proc_sys_hotplug_inode(self.fs_id, &self.weak_sb)),
             "pid_max" => Ok(proc_sys_pid_max_inode(self.fs_id, &self.weak_sb)),
+            "sched_rt_period_us" => Ok(proc_sys_sched_inode(
+                self.fs_id,
+                &self.weak_sb,
+                SYS_SCHED_RT_PERIOD_INO,
+                ProcFileKind::SysSchedRtPeriod,
+            )),
+            "sched_rt_runtime_us" => Ok(proc_sys_sched_inode(
+                self.fs_id,
+                &self.weak_sb,
+                SYS_SCHED_RT_RUNTIME_INO,
+                ProcFileKind::SysSchedRtRuntime,
+            )),
+            "sched_rr_timeslice_ms" => Ok(proc_sys_sched_inode(
+                self.fs_id,
+                &self.weak_sb,
+                SYS_SCHED_RR_TIMESLICE_INO,
+                ProcFileKind::SysSchedRrTimeslice,
+            )),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1022,6 +1046,21 @@ impl InodeOps for ProcSysKernelDirOps {
                 DirEntry {
                     ino: SYS_PID_MAX_INO,
                     name: SmallStr::new("pid_max"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_SCHED_RT_PERIOD_INO,
+                    name: SmallStr::new("sched_rt_period_us"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_SCHED_RT_RUNTIME_INO,
+                    name: SmallStr::new("sched_rt_runtime_us"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_SCHED_RR_TIMESLICE_INO,
+                    name: SmallStr::new("sched_rr_timeslice_ms"),
                     kind: FileType::Regular,
                 },
             ],
@@ -1075,6 +1114,23 @@ fn proc_sys_file_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysFileMax,
         }),
+    )
+}
+
+fn proc_sys_sched_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    ino: u64,
+    kind: ProcFileKind,
+) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        ino,
+        FileType::Regular,
+        0o644,
+        1,
+        Arc::new(ProcRegularInodeOps { kind }),
     )
 }
 
@@ -1633,6 +1689,13 @@ impl InodeOps for ProcRegularInodeOps {
                 HOTPLUG_PATH.lock().clear();
                 Ok(())
             }
+            ProcFileKind::SysSchedRtPeriod
+            | ProcFileKind::SysSchedRtRuntime
+            | ProcFileKind::SysSchedRrTimeslice
+                if size == 0 =>
+            {
+                Ok(())
+            }
             ProcFileKind::SysHotplug => Err(VfsError::InvalidArgument),
             ProcFileKind::SysFileMax if size == 0 => Ok(()),
             ProcFileKind::SysFileMax => Err(VfsError::InvalidArgument),
@@ -1679,6 +1742,15 @@ impl FileOps for ProcRegularFile {
                 let value = vfs::sysctl::parse_nonnegative_long(buf)?;
                 FILE_MAX.store(value, Ordering::Relaxed);
                 Ok(buf.len())
+            }
+            ProcFileKind::SysSchedRtPeriod => {
+                write_sched_sysctl(buf, offset, |value| sched::set_sched_rt_period_us(value))
+            }
+            ProcFileKind::SysSchedRtRuntime => {
+                write_sched_sysctl(buf, offset, |value| sched::set_sched_rt_runtime_us(value))
+            }
+            ProcFileKind::SysSchedRrTimeslice => {
+                write_sched_sysctl(buf, offset, |value| sched::set_sched_rr_timeslice_ms(value))
             }
             _ => Err(VfsError::ReadOnlyFilesystem),
         }
@@ -1745,7 +1817,33 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
         ProcFileKind::SysFileMax => Ok(render_file_max().into_bytes()),
+        ProcFileKind::SysSchedRtPeriod => {
+            Ok(format!("{}\n", sched::sched_rt_period_us()).into_bytes())
+        }
+        ProcFileKind::SysSchedRtRuntime => {
+            Ok(format!("{}\n", sched::sched_rt_runtime_us()).into_bytes())
+        }
+        ProcFileKind::SysSchedRrTimeslice => {
+            Ok(format!("{}\n", sched::sched_rr_timeslice_ms()).into_bytes())
+        }
     }
+}
+
+fn write_sched_sysctl(
+    buf: &[u8],
+    offset: u64,
+    update: impl FnOnce(i64) -> Result<(), errno::Errno>,
+) -> VfsResult<usize> {
+    if offset != 0 {
+        return Err(VfsError::InvalidArgument);
+    }
+    let text = core::str::from_utf8(buf).map_err(|_| VfsError::InvalidArgument)?;
+    let value = text
+        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\0')
+        .parse::<i64>()
+        .map_err(|_| VfsError::InvalidArgument)?;
+    update(value).map_err(|_| VfsError::InvalidArgument)?;
+    Ok(buf.len())
 }
 
 fn parse_pid_component(name: &str) -> Option<PidT> {

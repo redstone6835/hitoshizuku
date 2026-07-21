@@ -75,7 +75,8 @@
 
 #### FUTEX_CMP_REQUEUE 锁外值比较违反 Linux 语义
 
-- **文件**：`kernel/src/syscalls/process.rs:2771-2784`
+- **状态**：已于 2026-07-20 修复。传统 futex 与 futex2 入口都会先在锁外完成 fault-in，再在 `FUTEX_TABLE` 锁内通过 nofault 原子读取重新比较；只有比较成功才在同一临界区迁移等待者。2026-07-21 又补齐了 WAIT/WAITV 的比较-登记事务，以及 WAKE_OP/PI 用户字的 CAS 更新。
+- **文件**：`kernel/src/syscalls/process.rs:2581-2669`、`kernel/src/syscalls/process.rs:2891-2916`、`kernel/src/syscalls/process.rs:3105-3129`、`general/src/mm/vm_space.rs:1131-1162`
 - **根因**：`FUTEX_CMP_REQUEUE` 的实现分两步：(1) 在获取 futex bucket 锁之前，通过 `copy_from_user` 读取 `uaddr` 处的用户值并与 `val3` 比较；(2) 匹配后获取 bucket 锁，调用 `futex_requeue_key` 将等待者从源 futex 转移到目标 futex。但第二步不再重新检查 `uaddr` 处的值。Linux 规范要求条件比较必须在锁内进行——线程 A 可在第一步和第二步之间修改 `uaddr`，使唤醒条件不再成立，导致等待者被错误转移，在 pthread 条件变量语义下可能永久阻塞。
 - **触发条件**：多线程程序使用 `pthread_cond_broadcast`（内部依赖 `FUTEX_CMP_REQUEUE`），同时另一线程修改条件变量关联的 futex 字。
 
