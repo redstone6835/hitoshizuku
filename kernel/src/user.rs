@@ -4,7 +4,7 @@
 //!
 //! 流程：
 //! - 解析 ELF；
-//! - 建 VmSpace，对每个 PT_LOAD 段调 VmSpace::commit_segment；
+//! - 建 VmSpace，对主程序 PT_LOAD 段注册 file-backed 按需映射；
 //! - 预分配用户栈并布 argc/argv/envp/auxv；
 //! - 返回 LoadedUserImage（vm + entry_pc + user_sp）。
 
@@ -687,7 +687,7 @@ fn load_exec_image(
             seg.memsz,
             seg.file_offset,
             seg.file_size,
-            file.as_ref(),
+            file.clone(),
             flags,
         )?;
         if seg_end > max_segment_end {
