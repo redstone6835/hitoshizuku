@@ -3,7 +3,7 @@
 extern crate alloc;
 extern crate std;
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use core::ptr::NonNull;
 
 use ktest::ktest;
@@ -11,8 +11,8 @@ use ktest::ktest;
 use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqEvent, RseqRegistration,
-    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskState,
-    TaskUsage, ThreadGroup, supported_cpu_mask,
+    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, SignalNumber, TASK_COMM_LEN, Task,
+    TaskState, TaskUsage, ThreadGroup, supported_cpu_mask,
 };
 
 unsafe fn init_test_context(
@@ -39,6 +39,16 @@ pub(super) fn make_task() -> alloc::sync::Arc<Task> {
     session.register_group(&pg);
     let tg = ThreadGroup::new();
     let task = Task::new(SchedParams::default_fair(), Weak::new(), tg, pg);
+    task.adopt_current_context();
+    task
+}
+
+fn make_task_in_group(group: Arc<ThreadGroup>) -> Arc<Task> {
+    crate::arch_hooks::register(&TEST_ARCH_CONTEXT_OPS);
+    let session = Session::new();
+    let pg = ProcessGroup::new(&session);
+    session.register_group(&pg);
+    let task = Task::new(SchedParams::default_fair(), Weak::new(), group, pg);
     task.adopt_current_context();
     task
 }
@@ -84,6 +94,188 @@ fn thread_group_accounting_waits_for_last_member_and_aggregates_usage() {
     );
     assert!(group.try_claim_acct_record());
     assert!(!group.try_claim_acct_record());
+}
+
+#[ktest]
+fn thread_group_leader_becomes_waitable_only_after_last_member() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    assert!(group.try_add_member(&leader));
+    assert!(group.try_add_member(&worker));
+
+    leader.set_state(TaskState::Zombie);
+    assert!(!group.mark_terminated_if_all_members_terminal());
+    assert!(!leader.is_waitable_zombie());
+
+    let pidfd_waiter = make_task();
+    let wait_entry = leader
+        .exit_waiters
+        .prepare_to_wait(&pidfd_waiter, TaskState::Sleeping);
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+
+    assert!(group.is_terminated());
+    assert!(leader.is_waitable_zombie());
+    assert_eq!(pidfd_waiter.state(), TaskState::Runnable);
+    leader.exit_waiters.finish_wait(&wait_entry);
+
+    let late = make_task_in_group(Arc::clone(&group));
+    assert!(!group.try_add_member(&late));
+}
+
+#[ktest]
+fn reap_delays_thread_group_leader_until_group_termination() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+
+    leader.set_state(TaskState::Zombie);
+    assert!(!group.mark_terminated_if_all_members_terminal());
+    assert!(parent.reap_matching(|_| true).is_none());
+
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("leader must become reapable after the final member exits");
+    assert!(Arc::ptr_eq(&reaped, &leader));
+    assert_eq!(leader.state(), TaskState::Dead);
+}
+
+#[ktest]
+fn leader_parent_notification_is_deferred_until_worker_exit() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    leader.reparent_to(&parent);
+    worker.reparent_to(&parent);
+    parent.add_child(Arc::clone(&leader));
+
+    crate::spawn::exit_task(&leader, crate::ExitCode(19));
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(!leader.is_waitable_zombie());
+    assert_eq!(parent.shared_signal().pending_len_hint(), 0);
+    assert!(parent.reap_matching(|_| true).is_none());
+
+    worker.set_exit_signal(0);
+    crate::spawn::exit_task(&worker, crate::ExitCode(19));
+    assert_eq!(worker.state(), TaskState::Dead);
+    assert!(leader.is_waitable_zombie());
+    assert_eq!(parent.shared_signal().pending_len_hint(), 1);
+}
+
+#[ktest]
+fn late_exit_group_status_overrides_leader_raw_exit_for_parent_wait() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+
+    leader.mark_exited(crate::ExitCode(7));
+    assert_eq!(group.request_group_exit(42), 42);
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("parent must reap the terminated leader");
+    assert_eq!(reaped.exit_code(), Some(crate::ExitCode(42)));
+    let status = reaped.exit_wait_status().expect("leader wait status");
+    assert!(status.wifexited());
+    assert_eq!(status.wexitstatus(), 42);
+}
+
+#[ktest]
+fn late_sigkill_status_overrides_leader_raw_exit_for_parent_wait() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+
+    leader.mark_exited(crate::ExitCode(7));
+    let _ = group.request_group_signal(SignalNumber::SIGKILL, false);
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("parent must reap the SIGKILL-terminated leader");
+    assert_eq!(reaped.exit_code(), Some(crate::ExitCode(9)));
+    let status = reaped.exit_wait_status().expect("leader wait status");
+    assert!(status.wifsignaled());
+    assert_eq!(status.wtermsig(), SignalNumber::SIGKILL.raw() as i32);
+    assert!(!status.wcoredump());
+}
+
+#[ktest]
+fn group_exit_sleep_commit_is_cancelled_after_precheck_window() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.set_state(TaskState::Running);
+
+    assert!(!task.group_exit_pending());
+    assert_eq!(group.request_group_exit(33), 33);
+    task.publish_group_exit_wakeup();
+    assert!(!task.cas_state(TaskState::Running, TaskState::Sleeping));
+    assert_eq!(task.state(), TaskState::Running);
+
+    let queue = crate::WaitQueue::new();
+    let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
+    assert_eq!(task.state(), TaskState::Running);
+    queue.finish_wait(&entry);
+    assert_eq!(task.state(), TaskState::Running);
+
+    // 反向时序：睡眠已提交后才发布请求，调度入口必须
+    // 撤销它，覆盖未通过 WaitQueue 的直接睡眠路径。
+    let late_group = ThreadGroup::new();
+    let late_task = make_task_in_group(Arc::clone(&late_group));
+    late_group.set_leader(&late_task);
+    late_group.add_member(&late_task);
+    late_task.set_state(TaskState::Running);
+    assert!(late_task.cas_state(TaskState::Running, TaskState::Sleeping));
+    assert_eq!(late_group.request_group_exit(34), 34);
+    late_task.publish_group_exit_wakeup();
+    assert!(late_task.abort_group_exit_sleep());
+    assert_eq!(late_task.state(), TaskState::Running);
+}
+
+#[ktest]
+fn fatal_group_resume_does_not_publish_continued_event() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.set_state(TaskState::Running);
+    assert!(task.mark_stopped(SignalNumber::SIGSTOP));
+    assert_eq!(task.state(), TaskState::Stopped);
+
+    let _ = group.request_group_signal(SignalNumber::SIGKILL, false);
+    task.publish_group_exit_wakeup();
+    assert!(task.resume_for_fatal_exit());
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert!(task.wait_continued_status(false).is_none());
+    assert!(task.wait_stopped_status(false).is_none());
 }
 
 #[ktest]

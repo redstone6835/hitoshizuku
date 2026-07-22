@@ -20,7 +20,7 @@
 use core::alloc::Layout;
 use core::ptr::null_mut;
 
-use spin::mutex::Mutex;
+use crate::Mutex;
 
 use crate::boot::BootAllocator;
 use crate::error::RegistryError;

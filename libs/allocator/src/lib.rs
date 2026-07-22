@@ -102,7 +102,31 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
+use spin::relax::RelaxStrategy;
+
+/// allocator 内部锁竞争时的架构紧急工作轮询器。
+///
+/// 内核堆回收会在释放 allocator 锁后同步等待全核 TLB 失效；另一 CPU 若正等待
+/// allocator 锁且本地中断暂时关闭，纯自旋会形成锁环。自定义 relax 在每次竞争
+/// 迭代处理一次已注册的无分配回调，使 shootdown 可以完成。
+pub struct AllocatorRelax;
+
+pub(crate) type Mutex<T> = spin::mutex::Mutex<T, AllocatorRelax>;
+
+static URGENT_POLL_FN: AtomicUsize = AtomicUsize::new(0);
+
+impl RelaxStrategy for AllocatorRelax {
+    #[inline]
+    fn relax() {
+        let raw = URGENT_POLL_FN.load(Ordering::Acquire);
+        if raw != 0 {
+            // Safety: `bind_urgent_poll` 只接受静态函数地址，注册后不再撤销。
+            let poll = unsafe { core::mem::transmute::<usize, UrgentPollFn>(raw) };
+            poll();
+        }
+        core::hint::spin_loop();
+    }
+}
 
 const OWNED_ALLOCATION_LOCK_COUNT: usize = 64;
 static OWNED_ALLOCATION_LOCKS: [Mutex<()>; OWNED_ALLOCATION_LOCK_COUNT] =
@@ -167,6 +191,7 @@ pub type MappedRange = BackedRange;
 pub type PhysToVirtFn = fn(paddr: usize) -> usize;
 pub type VirtToPhysFn = fn(vaddr: usize) -> usize;
 pub type CpuIdFn = fn() -> usize;
+pub type UrgentPollFn = fn();
 pub type GcEnterCriticalFn = fn() -> usize;
 pub type GcLeaveCriticalFn = fn(state: usize);
 pub type ManagedGcMoveCallbackFn = fn(old_ptr: usize, new_record: AllocationRecord) -> bool;
@@ -415,6 +440,20 @@ impl KernelMemorySubsystem {
 
     pub fn bind_cpu_id(&self, cpu_id_fn: CpuIdFn) {
         self.cpu_id_fn.store(cpu_id_fn as usize, Ordering::Release);
+    }
+
+    /// 注册 allocator 自旋锁竞争时使用的无分配紧急工作回调。
+    ///
+    /// 该回调可能在任意 allocator 锁的等待路径执行，必须只使用原子状态或架构
+    /// 指令，不能分配、阻塞或再次获取 allocator 锁。
+    pub fn bind_urgent_poll(&self, poll: UrgentPollFn) {
+        let address = poll as usize;
+        match URGENT_POLL_FN.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {}
+            Err(existing) => {
+                assert_eq!(existing, address, "allocator urgent poll hook replaced");
+            }
+        }
     }
 
     pub fn bind_gc_critical_section(&self, enter: GcEnterCriticalFn, leave: GcLeaveCriticalFn) {

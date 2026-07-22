@@ -17,7 +17,7 @@ use errno::Errno;
 use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::cpu::{CpuId, CpuMask};
 use crate::eevdf::SchedParams;
-use crate::group::{ProcessGroup, Session};
+use crate::group::{GroupExitStatus, ProcessGroup, Session};
 use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
@@ -278,6 +278,7 @@ pub fn exit(code: i32) -> ! {
 pub fn exit_group(code: i32) -> ! {
     let me = current_task();
     let tg = me.thread_group();
+    let code = tg.request_group_exit(code);
     let members = tg.snapshot();
     for m in members.iter() {
         if Arc::ptr_eq(m, &me) {
@@ -287,13 +288,33 @@ pub fn exit_group(code: i32) -> ! {
             continue;
         }
         if m.state() != TaskState::Zombie && m.state() != TaskState::Dead {
-            exit_task(m, ExitCode(code));
+            // 不能从发送者上下文直接 exit：目标可能停在 futex/poll 内核栈上，
+            // 栈上的 Arc<VmSpace> 只有在线程自行展开时才会析构。
+            crate::scheduler::group_exit_wakeup(m);
         }
     }
     drop(members);
     drop(tg);
     drop(me);
     exit(code);
+}
+
+/// 在目标线程自己的安全边界完成已经发布的 exit_group 请求。
+pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
+    let Some(status) = task.thread_group().group_exit_status() else {
+        return false;
+    };
+    if !matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
+        if let GroupExitStatus::Signaled {
+            signal,
+            core_dumped,
+        } = status
+        {
+            task.mark_signaled_exit(signal, core_dumped);
+        }
+        exit_task(task, ExitCode(status.exit_code()));
+    }
+    true
 }
 
 // ── 调度器相关 ────────────────────────────────────────────────────────────────
@@ -678,10 +699,13 @@ pub fn clone_with_context_outcome(
                 break;
             }
             let parent = current_task();
+            if parent.group_exit_pending() {
+                break;
+            }
             let entry = wait_child
                 .vfork_done
                 .prepare_to_wait(&parent, TaskState::Sleeping);
-            if !wait_child.is_vforking() {
+            if !wait_child.is_vforking() || parent.group_exit_pending() {
                 wait_child.vfork_done.finish_wait(&entry);
                 break;
             }
@@ -817,7 +841,7 @@ fn wait_child_observable(
         .filter(|c| matches_waitid(c, &target, parent))
     {
         any_match = true;
-        if wait_exited && child.state() == TaskState::Zombie {
+        if wait_exited && child.is_waitable_zombie() {
             return true;
         }
         if (wait_stopped || child.is_ptrace_traced()) && child.wait_stopped_status(true).is_some() {
@@ -874,7 +898,7 @@ fn wait_common(
                 if let Some(child) = me
                     .snapshot_children()
                     .into_iter()
-                    .find(|c| c.state() == TaskState::Zombie && pred(c))
+                    .find(|c| c.is_waitable_zombie() && pred(c))
                 {
                     let code = child
                         .exit_code()
@@ -941,6 +965,10 @@ fn wait_common(
             return Err(Errno::EINTR);
         }
         let entry = me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
+        if has_interrupting_signal(&me) {
+            me.exit_waiters.finish_wait(&entry);
+            return Err(Errno::EINTR);
+        }
         if wait_child_observable(
             &me,
             target.clone(),
@@ -1013,7 +1041,11 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
     }
 
     let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
-    let members = target.thread_group().snapshot();
+    let group = target.thread_group();
+    // 与 CLONE_THREAD 登记通过 members 锁排序：先登记者会进入本次 snapshot，
+    // 后到者被拒绝，避免 SIGKILL 之后仍产生未收到终止请求的新线程。
+    let _ = group.request_group_signal(info.sig, core_dumped);
+    let members = group.snapshot();
     let mut terminated = false;
     let current = current_task();
     let mut need_handoff = false;
@@ -1025,14 +1057,9 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
         if matches!(member.state(), TaskState::Zombie | TaskState::Dead) {
             continue;
         }
-        member.mark_signaled_exit(info.sig, core_dumped);
-        // 不在发送者上下文直接 exit 目标任务。目标可能正阻塞在
-        // poll/epoll/accept 等 syscall 中，栈上持有 Arc<File> 临时引用；
-        // 远程 exit 会 drain fdtable，但不会运行目标 Rust 栈帧析构，导致
-        // socket listener 等资源被隐藏引用保活。把 fatal signal 投到目标
-        // per-task pending 并唤醒它，让目标在线程自己的调用栈上消费默认动作。
-        member.signal.deliver(info);
-        signal_wakeup(member, &info);
+        // 不在发送者上下文直接 exit 目标任务。目标恢复自己的
+        // 阻塞调用栈，再在 syscall/用户返回边界消费权威组状态。
+        crate::scheduler::group_exit_wakeup(member);
         if !Arc::ptr_eq(member, &current) {
             need_handoff = true;
         }
@@ -1334,6 +1361,9 @@ pub fn sigpending() -> Result<SigSet, Errno> {
     capabilities = kernel_symbols::capability::SCHED_QUERY
 )]
 pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
+    if task.group_exit_pending() {
+        return true;
+    }
     let blocked = task.signal.blocked_snapshot().raw();
     let pending = (task.signal.pending_snapshot().raw()
         | task.shared_signal().pending_snapshot().raw())
@@ -1441,6 +1471,10 @@ pub fn sigtimedwait_wait(these: SigSet, timeout_ns: Option<u64>) -> bool {
     let deadline = timeout_ns.map(|ns| now_ns_public().saturating_add(ns));
     me.signal.begin_sigtimedwait(these);
     loop {
+        if me.group_exit_pending() {
+            me.signal.end_sigtimedwait();
+            return false;
+        }
         if sigtimedwait_pending(these) {
             me.signal.end_sigtimedwait();
             return true;
@@ -1702,6 +1736,9 @@ pub fn prepare_user_return_for_task(
     user_ctx: UserContextRef,
 ) -> Result<(), Errno> {
     if task.is_kernel_task() || user_ctx.is_none() {
+        return Ok(());
+    }
+    if complete_group_exit_if_requested(task) {
         return Ok(());
     }
     let Some(ops) = process_image_ops() else {

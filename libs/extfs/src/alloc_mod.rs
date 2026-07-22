@@ -10,7 +10,8 @@ use core::sync::atomic::Ordering;
 use crate::bgd;
 use crate::crc;
 use crate::layout::{
-    COMPAT_ORPHAN_FILE, RO_COMPAT_ORPHAN_PRESENT, SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET,
+    COMPAT_ORPHAN_FILE, EXT4_BG_BLOCK_UNINIT, EXT4_BG_INODE_UNINIT, EXT4_BG_INODE_ZEROED,
+    RO_COMPAT_ORPHAN_PRESENT, SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET,
 };
 use crate::state::{BlockBackendError, FsState};
 use vfs::sync::{Spinlock, SpinlockGuard};
@@ -18,7 +19,7 @@ use vfs::sync::{Spinlock, SpinlockGuard};
 /// 互斥锁:整个 FS 串行化分配/释放路径。粒度粗但简单,不留 torn-state。
 static ALLOC_LOCK: Spinlock<()> = Spinlock::new(());
 
-fn lock_alloc() -> SpinlockGuard<'static, ()> {
+pub(crate) fn lock_alloc() -> SpinlockGuard<'static, ()> {
     loop {
         if let Some(guard) = ALLOC_LOCK.try_lock() {
             return guard;
@@ -27,6 +28,10 @@ fn lock_alloc() -> SpinlockGuard<'static, ()> {
         // 下持锁任务拿不到 CPU。这里必须用真实时间戳推进 fair 调度；
         // `schedule_once(0)` 不记账，在 iozone 多进程写入时会放大成饥饿。
         if sched::is_ready() {
+            // LoongArch syscall 内核栈可能暂时保持中断关闭；仅让出 CPU 在本任务
+            // 被再次选中时不会消费 IPI。先显式处理紧急 shootdown，避免持锁方
+            // 等待本 CPU 确认而形成锁环。
+            sched::poll_urgent_work();
             sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
@@ -156,6 +161,16 @@ pub(crate) fn alloc_blocks_run(
         } else {
             sb.blocks_per_group
         };
+        if gd.flags & EXT4_BG_BLOCK_UNINIT != 0 {
+            // 惰性块位图不能当作普通磁盘内容读取。当前仅物化描述符声明“全部有效块
+            // 都空闲”的块组；含本地备份或元数据的块组先跳过，避免覆盖元数据。
+            if state.group_counts(group)?.free_blocks != bits_in_group {
+                continue;
+            }
+            initialize_empty_bitmap(&mut bitmap_scratch, bits_in_group);
+            state.write_block(bmap, &bitmap_scratch)?;
+            state.clear_group_flags(group, EXT4_BG_BLOCK_UNINIT)?;
+        }
         let start_bit = if group == start_group {
             (start_rel % sb.blocks_per_group as u64) as u32
         } else {
@@ -340,6 +355,14 @@ mod tests {
         }
 
         assert_eq!(choose_zero_run(&bits, 16, 32, 6), Some((2, 6)));
+    }
+
+    #[test]
+    fn initialized_bitmap_marks_only_tail_bits_used() {
+        let mut bits = [0xa5; 3];
+        initialize_empty_bitmap(&mut bits, 13);
+
+        assert_eq!(bits, [0, 0b1110_0000, 0xff]);
     }
 }
 
@@ -564,20 +587,40 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
             continue;
         }
         let gd = state.group_desc_mut(group)?;
+        let used_before = group as u64 * sb.inodes_per_group as u64;
+        let bits_in_group = (sb.inodes_count as u64)
+            .saturating_sub(used_before)
+            .min(sb.inodes_per_group as u64) as u32;
+        if bits_in_group == 0 {
+            continue;
+        }
+        if gd.flags & EXT4_BG_INODE_UNINIT != 0 {
+            // 新 inode 不能暴露磁盘旧数据。惰性初始化镜像通常同时带
+            // INODE_ZEROED；其它布局在实现整张 inode 表清零前保守跳过。
+            if gd.flags & EXT4_BG_INODE_ZEROED == 0
+                || state.group_counts(group)?.free_inodes != bits_in_group
+            {
+                continue;
+            }
+            initialize_empty_bitmap(&mut bitmap_scratch, bits_in_group);
+            state.write_block(gd.inode_bitmap, &bitmap_scratch)?;
+            state.clear_group_flags(group, EXT4_BG_INODE_UNINIT)?;
+        }
         let start_bit = if group == start_group {
-            start_rel % sb.inodes_per_group
+            (start_rel % sb.inodes_per_group).min(bits_in_group)
         } else {
             0
         };
         let nr = alloc_bit_in_bitmap(
             state,
             gd.inode_bitmap,
-            sb.inodes_per_group,
+            bits_in_group,
             start_bit,
             &mut bitmap_scratch,
         )?;
         if let Some(nr) = nr {
             let ino = group * sb.inodes_per_group + nr + 1;
+            state.record_inode_table_use(group, bits_in_group - nr - 1)?;
             state
                 .inode_alloc_hint
                 .store(group * sb.inodes_per_group + nr + 1, Ordering::Relaxed);
@@ -590,6 +633,15 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
         }
     }
     Err(BlockBackendError::OutOfRange)
+}
+
+/// 构造已初始化的空位图：有效项保持空闲，块组范围外的尾部位全部标记为已用。
+fn initialize_empty_bitmap(bitmap: &mut [u8], valid_bits: u32) {
+    bitmap.fill(0);
+    let total_bits = bitmap.len().saturating_mul(8);
+    for bit in valid_bits as usize..total_bits {
+        bitmap[bit / 8] |= 1u8 << (bit % 8);
+    }
 }
 
 pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), BlockBackendError> {

@@ -19,6 +19,8 @@ use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, us
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
 const FILE_FAULT_AROUND_PAGES: usize = 16;
+/// 内容持续变化时最多尝试发布缓存快照的次数，随后退回不缓存读取保证前进性。
+const PRIVATE_FILE_CACHE_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileFaultAroundWindow {
@@ -145,8 +147,10 @@ fn covered_len(areas: &[VmArea], range: &Range<usize>) -> usize {
     total
 }
 
-static SHARED_FILE_PAGES: Spinlock<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
-    Spinlock::new(BTreeMap::new());
+type FilePageCache = Spinlock<BTreeMap<FilePageKey, Weak<ResidentPage>>>;
+
+static PRIVATE_FILE_PAGES: FilePageCache = Spinlock::new(BTreeMap::new());
+static SHARED_FILE_PAGES: FilePageCache = Spinlock::new(BTreeMap::new());
 static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
     Spinlock::new(BTreeMap::new());
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -185,16 +189,18 @@ pub fn vm_space_diag() -> VmSpaceDiag {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct SharedFilePageKey {
+struct FilePageKey {
     file_key: usize,
     offset: u64,
+    generation: u64,
 }
 
-impl SharedFilePageKey {
-    fn new(file: &Arc<dyn FileLike>, offset: u64) -> Self {
+impl FilePageKey {
+    fn new(file: &Arc<dyn FileLike>, offset: u64, generation: u64) -> Self {
         Self {
             file_key: file.cache_key(),
             offset,
+            generation,
         }
     }
 }
@@ -284,7 +290,10 @@ enum FaultAroundCommit {
 enum ResidentPageKind {
     Anon,
     SharedAnon,
-    PrivateFile,
+    PrivateFile {
+        cache_key: Option<FilePageKey>,
+        _file: Arc<dyn FileLike>,
+    },
     SharedFile {
         file: Arc<dyn FileLike>,
         offset: u64,
@@ -315,10 +324,17 @@ impl ResidentPage {
         })
     }
 
-    fn new_private_file(paddr: usize) -> Arc<Self> {
+    fn new_private_file(
+        paddr: usize,
+        cache_key: Option<FilePageKey>,
+        file: Arc<dyn FileLike>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             paddr,
-            kind: ResidentPageKind::PrivateFile,
+            kind: ResidentPageKind::PrivateFile {
+                cache_key,
+                _file: file,
+            },
             dirty: AtomicBool::new(false),
         })
     }
@@ -349,6 +365,10 @@ impl ResidentPage {
 
     fn is_shared_anon(&self) -> bool {
         matches!(self.kind, ResidentPageKind::SharedAnon)
+    }
+
+    fn is_private_file(&self) -> bool {
+        matches!(self.kind, ResidentPageKind::PrivateFile { .. })
     }
 
     fn is_sysv_shm(&self) -> bool {
@@ -394,6 +414,22 @@ impl ResidentPage {
 
 impl Drop for ResidentPage {
     fn drop(&mut self) {
+        match &self.kind {
+            ResidentPageKind::PrivateFile {
+                cache_key: Some(key),
+                ..
+            } => {
+                remove_cached_file_page(&PRIVATE_FILE_PAGES, *key, self);
+            }
+            ResidentPageKind::SharedFile { file, offset } => {
+                remove_cached_file_page(
+                    &SHARED_FILE_PAGES,
+                    FilePageKey::new(file, *offset, 0),
+                    self,
+                );
+            }
+            _ => {}
+        }
         if let Err(err) = self.flush_to_backing() {
             log::error!(
                 "[mm] failed to flush shared mmap page paddr={:#x}: {:?}",
@@ -455,11 +491,8 @@ impl PrivateFileFaultAround {
                 .fault_file_offset
                 .checked_add(u64::try_from(delta).map_err(|_| Errno::EINVAL)?)
                 .ok_or(Errno::EINVAL)?;
-            match load_file_page(&*self.file, file_offset) {
-                Ok(paddr) => prepared.push(PreparedFilePage {
-                    vaddr,
-                    page: ResidentPage::new_private_file(paddr),
-                }),
+            match private_file_page(Arc::clone(&self.file), file_offset) {
+                Ok(page) => prepared.push(PreparedFilePage { vaddr, page }),
                 Err(err) if index == 0 => return Err(err),
                 Err(_) => break,
             }
@@ -825,13 +858,20 @@ impl VmSpace {
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
         let flags = self.with_future_mlock(flags);
+        let shared_writable = flags.contains_all(VmFlags::SHARED | VmFlags::WRITE);
         let mapped_file = Arc::clone(&file);
         let area = VmArea {
             range,
             flags,
             backing: VmBacking::File { file, offset },
         };
-        self.vmas.lock().insert(area)?;
+        {
+            let mut vmas = self.vmas.lock();
+            vmas.insert(area)?;
+            if shared_writable {
+                mapped_file.disable_private_page_cache();
+            }
+        }
         mapped_file.on_mapped();
         Ok(())
     }
@@ -883,6 +923,7 @@ impl VmSpace {
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
         let flags = self.with_future_mlock(flags);
+        let shared_writable = flags.contains_all(VmFlags::SHARED | VmFlags::WRITE);
         let mapped_file = Arc::clone(&file);
         let area = VmArea {
             range: range.clone(),
@@ -896,6 +937,9 @@ impl VmSpace {
                 drop(vmas);
                 Self::notify_file_unmapped(&removed_areas);
                 return Err(err);
+            }
+            if shared_writable {
+                mapped_file.disable_private_page_cache();
             }
             removed_areas
         };
@@ -1088,6 +1132,16 @@ impl VmSpace {
             let mut set = self.vmas.lock();
             if !set.contains_range(&range) {
                 return Err(Errno::ENOMEM);
+            }
+            if new_flags.has(VmFlags::WRITE) {
+                for area in set.iter_overlap(&range) {
+                    if !area.flags.has(VmFlags::SHARED) {
+                        continue;
+                    }
+                    if let VmBacking::File { file, .. } = &area.backing {
+                        file.disable_private_page_cache();
+                    }
+                }
             }
             set.protect_range(&range, new_flags.with(VmFlags::USER));
 
@@ -1818,7 +1872,7 @@ impl VmSpace {
                 if flags.has(VmFlags::SHARED) {
                     shared_file_page(file, file_off)
                 } else {
-                    load_file_page(&*file, file_off).map(ResidentPage::new_private_file)
+                    private_file_page(file, file_off)
                 }
             }
             VmBacking::Direct(base) => {
@@ -1830,7 +1884,15 @@ impl VmSpace {
             Ok(page) => page,
             Err(err) => return fault_from_errno(err),
         };
+        let mut page = page;
         let mut access = access_for_new_page(flags, &page);
+        if is_write_fault(kind) && matches!(access, PageAccess::Cow) {
+            page = match clone_page_to_anon(&page) {
+                Ok(page) => page,
+                Err(err) => return fault_from_errno(err),
+            };
+            access = PageAccess::Writable;
+        }
         if page.is_sysv_shm() && flags.has(VmFlags::WRITE) {
             // SysV shm is a shared memory object, not a regular file mapping.
             // Keep it writable across fork, but conservatively flush it back if
@@ -2150,6 +2212,9 @@ impl Drop for VmSpace {
 }
 
 fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
+    if page.is_private_file() {
+        return access_for_private_file(flags);
+    }
     if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
@@ -2167,6 +2232,9 @@ fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
 }
 
 fn access_for_existing_page(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
+    if page.is_private_file() {
+        return access_for_private_file(flags);
+    }
     if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
@@ -2202,6 +2270,14 @@ fn access_after_fork(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
     }
 }
 
+fn access_for_private_file(flags: VmFlags) -> PageAccess {
+    if flags.has(VmFlags::WRITE) {
+        PageAccess::Cow
+    } else {
+        PageAccess::ReadOnly
+    }
+}
+
 fn pte_flags_for(flags: VmFlags, access: PageAccess) -> VmFlags {
     let flags = flags.with(VmFlags::USER);
     if access.pte_writable() {
@@ -2212,20 +2288,71 @@ fn pte_flags_for(flags: VmFlags, access: PageAccess) -> VmFlags {
 }
 
 fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
-    let key = SharedFilePageKey::new(&file, file_off);
-    {
-        let mut cache = SHARED_FILE_PAGES.lock();
-        if let Some(weak) = cache.get(&key) {
-            if let Some(page) = weak.upgrade() {
-                return Ok(page);
-            }
-            cache.remove(&key);
-        }
+    let key = FilePageKey::new(&file, file_off, 0);
+    if let Some(page) = find_cached_file_page(&SHARED_FILE_PAGES, key) {
+        return Ok(page);
     }
     let paddr = load_file_page(&*file, file_off)?;
     let page = ResidentPage::new_shared_file(paddr, Arc::clone(&file), file_off);
-    SHARED_FILE_PAGES.lock().insert(key, Arc::downgrade(&page));
-    Ok(page)
+    Ok(publish_cached_file_page(&SHARED_FILE_PAGES, key, page))
+}
+
+fn private_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
+    for _ in 0..PRIVATE_FILE_CACHE_RETRIES {
+        let Some(generation) = file.private_page_cache_generation() else {
+            let paddr = load_file_page(&*file, file_off)?;
+            return Ok(ResidentPage::new_private_file(paddr, None, file));
+        };
+        let key = FilePageKey::new(&file, file_off, generation);
+        if let Some(page) = find_cached_file_page(&PRIVATE_FILE_PAGES, key) {
+            if file.private_page_cache_generation() == Some(generation) {
+                return Ok(page);
+            }
+            continue;
+        }
+        let paddr = load_file_page(&*file, file_off)?;
+        let page = ResidentPage::new_private_file(paddr, Some(key), Arc::clone(&file));
+        if file.private_page_cache_generation() != Some(generation) {
+            continue;
+        }
+        let page = publish_cached_file_page(&PRIVATE_FILE_PAGES, key, page);
+        if file.private_page_cache_generation() == Some(generation) {
+            return Ok(page);
+        }
+    }
+    let paddr = load_file_page(&*file, file_off)?;
+    Ok(ResidentPage::new_private_file(paddr, None, file))
+}
+
+fn find_cached_file_page(cache: &FilePageCache, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+    cache.lock().get(&key).and_then(Weak::upgrade)
+}
+
+/// 并发缺页可能在锁外同时读出同一文件页；这里只允许一个候选进入缓存，
+/// 其它候选在释放缓存锁后析构，避免重复驻留和锁递归。
+fn publish_cached_file_page(
+    cache: &FilePageCache,
+    key: FilePageKey,
+    candidate: Arc<ResidentPage>,
+) -> Arc<ResidentPage> {
+    let mut pages = cache.lock();
+    if let Some(existing) = pages.get(&key).and_then(Weak::upgrade) {
+        drop(pages);
+        return existing;
+    }
+    pages.insert(key, Arc::downgrade(&candidate));
+    drop(pages);
+    candidate
+}
+
+fn remove_cached_file_page(cache: &FilePageCache, key: FilePageKey, page: &ResidentPage) {
+    let mut pages = cache.lock();
+    if pages
+        .get(&key)
+        .is_some_and(|weak| core::ptr::eq(weak.as_ptr(), page as *const ResidentPage))
+    {
+        pages.remove(&key);
+    }
 }
 
 fn shared_anon_page(
@@ -2278,13 +2405,30 @@ fn load_file_page(file: &dyn FileLike, file_off: u64) -> Result<usize, Errno> {
         let page_size = page_size();
         let len = (file_size - file_off).min(page_size as u64) as usize;
         let kbuf = unsafe { core::slice::from_raw_parts_mut(virt(paddr) as *mut u8, page_size) };
-        file.read_at(file_off, &mut kbuf[..len])?;
-        Ok(())
+        read_file_bytes_exact(file, file_off, &mut kbuf[..len])
     })();
     if result.is_err() {
         free_user_page(paddr);
     }
     result.map(|()| paddr)
+}
+
+/// FileLike 允许合法短读；页填充必须持续读取到请求末端。文件长度快照声称仍有
+/// 数据却提前返回 EOF 时，确定性报告 I/O 错误，不能把零页尾误当成文件内容。
+fn read_file_bytes_exact(file: &dyn FileLike, offset: u64, buf: &mut [u8]) -> Result<(), Errno> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let read_offset = offset
+            .checked_add(u64::try_from(done).map_err(|_| Errno::EINVAL)?)
+            .ok_or(Errno::EINVAL)?;
+        let remaining = &mut buf[done..];
+        let count = file.read_at(read_offset, remaining)?;
+        if count == 0 || count > remaining.len() {
+            return Err(Errno::EIO);
+        }
+        done += count;
+    }
+    Ok(())
 }
 
 fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno> {
@@ -2443,12 +2587,57 @@ pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
+
     use super::{
-        FILE_FAULT_AROUND_PAGES, FaultKind, VmFlags, file_fault_around_window,
-        permits_file_fault_around, plan_file_segment, unmapped_prefix_len,
+        FILE_FAULT_AROUND_PAGES, FaultKind, FilePageCache, FilePageKey, PageAccess, ResidentPage,
+        VmFlags, access_for_private_file, file_fault_around_window, permits_file_fault_around,
+        plan_file_segment, publish_cached_file_page, read_file_bytes_exact, unmapped_prefix_len,
     };
+    use errno::Errno;
+    use mm::FileLike;
+    use sched::sync::Spinlock;
 
     const PAGE_SIZE: usize = 4096;
+
+    struct ChunkedFile {
+        bytes: &'static [u8],
+        max_chunk: usize,
+        eof_at: usize,
+    }
+
+    impl FileLike for ChunkedFile {
+        fn cache_key(&self) -> usize {
+            self as *const Self as usize
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            let start = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+            let end_limit = self.eof_at.min(self.bytes.len());
+            if start >= end_limit {
+                return Ok(0);
+            }
+            let count = buf
+                .len()
+                .min(self.max_chunk)
+                .min(end_limit.saturating_sub(start));
+            buf[..count].copy_from_slice(&self.bytes[start..start + count]);
+            Ok(count)
+        }
+
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
+            Err(Errno::EIO)
+        }
+
+        fn sync(&self) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
 
     #[test]
     fn aligned_file_pages_remain_fully_lazy() {
@@ -2591,5 +2780,62 @@ mod tests {
             0
         );
         assert_eq!(unmapped_prefix_len(candidates, |_| false), candidates.len());
+    }
+
+    #[test]
+    fn writable_private_file_page_starts_as_cow() {
+        let read_only = VmFlags::EMPTY.with(VmFlags::READ);
+        let writable = read_only.with(VmFlags::WRITE);
+
+        assert_eq!(access_for_private_file(read_only), PageAccess::ReadOnly);
+        assert_eq!(access_for_private_file(writable), PageAccess::Cow);
+    }
+
+    #[test]
+    fn file_page_reader_completes_legal_short_reads() {
+        let file = ChunkedFile {
+            bytes: b"0123456789abcdef",
+            max_chunk: 3,
+            eof_at: 16,
+        };
+        let mut output = [0u8; 9];
+
+        read_file_bytes_exact(&file, 2, &mut output).expect("short reads must be retried");
+
+        assert_eq!(&output, b"23456789a");
+    }
+
+    #[test]
+    fn file_page_reader_rejects_premature_eof() {
+        let file = ChunkedFile {
+            bytes: b"0123456789abcdef",
+            max_chunk: 3,
+            eof_at: 6,
+        };
+        let mut output = [0u8; 8];
+
+        assert_eq!(
+            read_file_bytes_exact(&file, 2, &mut output),
+            Err(Errno::EIO)
+        );
+    }
+
+    #[test]
+    fn concurrent_file_page_publish_keeps_first_candidate() {
+        let cache: FilePageCache = Spinlock::new(BTreeMap::new());
+        let key = FilePageKey {
+            file_key: 7,
+            offset: 0x2000,
+            generation: 11,
+        };
+        let first = ResidentPage::new_direct(0x1000);
+        let second = ResidentPage::new_direct(0x2000);
+
+        let published = publish_cached_file_page(&cache, key, Arc::clone(&first));
+        let raced = publish_cached_file_page(&cache, key, second);
+
+        assert!(Arc::ptr_eq(&published, &first));
+        assert!(Arc::ptr_eq(&raced, &first));
+        assert_eq!(cache.lock().len(), 1);
     }
 }

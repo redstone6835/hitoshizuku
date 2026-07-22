@@ -11,6 +11,10 @@ use ktest::ktest;
 struct EmptyInodeOps;
 
 impl InodeOps for EmptyInodeOps {
+    fn supports_private_page_cache(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _inode: &Inode, _name: &str) -> crate::error::VfsResult<Arc<Inode>> {
         Err(VfsError::NotFound)
     }
@@ -160,4 +164,35 @@ fn writable_access_rejects_exec_until_last_lease_drops() {
 
     let executable = inode.acquire_exec_access().unwrap();
     drop(executable);
+}
+
+#[ktest]
+fn inode_data_mutation_stays_unstable_until_last_guard_drops() {
+    let inode = regular_inode();
+    let initial = inode.data_generation();
+
+    let first = inode.begin_data_mutation();
+    let second = inode.begin_data_mutation();
+    assert_eq!(inode.private_page_cache_generation(), None);
+
+    drop(first);
+    assert_eq!(inode.private_page_cache_generation(), None);
+    drop(second);
+
+    assert_eq!(inode.data_generation(), initial + 2);
+    assert_eq!(inode.private_page_cache_generation(), Some(initial + 2));
+}
+
+#[ktest]
+fn writable_shared_mapping_permanently_disables_private_cache() {
+    let inode = regular_inode();
+    let initial = inode.data_generation();
+
+    inode.disable_private_page_cache();
+    assert_eq!(inode.private_page_cache_generation(), None);
+
+    let mutation = inode.begin_data_mutation();
+    drop(mutation);
+    assert_eq!(inode.private_page_cache_generation(), None);
+    assert_eq!(inode.data_generation(), initial + 2);
 }

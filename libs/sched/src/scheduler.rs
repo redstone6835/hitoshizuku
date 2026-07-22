@@ -2254,7 +2254,11 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         return;
     }
     if target.state() == TaskState::Stopped && stopped_signal_is_fatal(target, info) {
-        crate::spawn::exit_task(target, ExitCode((info.sig.raw() as i32) & 0x7f));
+        // 只恢复运行，由目标在自己的调度/syscall 边界消费
+        // 致命信号。这里不发布 WCONTINUED，也不远程废弃其内核栈。
+        if target.resume_for_fatal_exit() {
+            enqueue_task(Arc::clone(target), now_ns_internal());
+        }
         return;
     }
     if target.cas_state(TaskState::Sleeping, TaskState::Runnable) {
@@ -2265,6 +2269,24 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
     // Running / Runnable：pending 位已经设好；下一轮 schedule 自然会检查。
     // Stopped：只有 SIGCONT 可以恢复；其它信号保持 pending。
     // Uninterruptible / Zombie / Dead：什么都不做。
+}
+
+/// 唤醒收到协作式 exit_group 请求的线程，但不在发送者上下文远程终止它。
+///
+/// 目标必须恢复自己的内核调用栈并在 syscall / 用户返回边界完成退出，才能让
+/// 栈上 Arc 正常析构。Stopped 任务先恢复，Running 任务通过 resched IPI 尽快
+/// 到达安全边界。
+pub fn group_exit_wakeup(target: &Arc<Task>) {
+    target.publish_group_exit_wakeup();
+    let resumed = target.resume_for_fatal_exit()
+        || target.cas_state(TaskState::Sleeping, TaskState::Runnable)
+        || target.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    if resumed {
+        #[cfg(feature = "performance-profile")]
+        target.mark_profile_woken(now_ns_internal());
+        enqueue_task(Arc::clone(target), now_ns_internal());
+    }
+    request_resched(target.current_cpu().min(NR_CPUS - 1));
 }
 
 /// 把任务切入停止态：从 runqueue/current 中摘掉并记录可等待的 stopped 事件。
@@ -2313,6 +2335,9 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn schedule_once(now_ns: u64) {
+    // LoongArch syscall 路径可能在本地中断暂时关闭时主动调度。即使本次仍选回
+    // 当前任务，也必须先消费 TLB/membarrier 请求，避免同步发起方永久等待。
+    crate::poll_urgent_work();
     drain_deferred_timer_tick();
     let cpu_id = cpu();
     cleanup_retired_tasks(cpu_id);
@@ -2326,6 +2351,11 @@ pub fn schedule_once(now_ns: u64) {
     let Some(prev) = cpu_state.current() else {
         return;
     };
+
+    // 调度入口是所有阻塞路径共用的睡眠提交边界。若组退出
+    // 已在调用者的条件检查后发布，这里再次撤销睡眠，使其
+    // 恢复阻塞调用栈并返回 syscall 安全边界。
+    let _ = prev.abort_group_exit_sleep();
 
     // 在调度边界消费当前任务的 pending signal。默认 Term/Core 会把 prev 标成
     // Zombie；后续 pick_next 看到它不再 runnable，就不会放回 runqueue。

@@ -1018,6 +1018,39 @@ impl FsState {
         Ok(())
     }
 
+    /// 对应位图进入共享块缓存后，清除块组的惰性初始化标志。
+    pub(crate) fn clear_group_flags(
+        &self,
+        group: u32,
+        flags: u16,
+    ) -> Result<(), BlockBackendError> {
+        {
+            let mut descs = self.group_desc.lock();
+            let desc = descs
+                .get_mut(group as usize)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            desc.flags &= !flags;
+        }
+        self.mark_group_dirty(group)
+    }
+
+    /// inode 分配推进高水位后收缩 `bg_itable_unused`。释放 inode 时不再增大该值，
+    /// 因为对应 inode 表项已经完成过初始化。
+    pub(crate) fn record_inode_table_use(
+        &self,
+        group: u32,
+        trailing_unused: u32,
+    ) -> Result<(), BlockBackendError> {
+        {
+            let mut descs = self.group_desc.lock();
+            let desc = descs
+                .get_mut(group as usize)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            desc.itable_unused_count = desc.itable_unused_count.min(trailing_unused);
+        }
+        self.mark_group_dirty(group)
+    }
+
     fn mark_group_dirty(&self, group: u32) -> Result<(), BlockBackendError> {
         let mut dirty = self.alloc_group_dirty.lock();
         let slot = dirty
@@ -1479,6 +1512,7 @@ impl FsState {
 
     fn wait_for_writeback_progress() {
         if sched::is_ready() {
+            sched::poll_urgent_work();
             sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
@@ -1563,6 +1597,11 @@ impl FsState {
     }
 
     pub(crate) fn flush_alloc_metadata(&self) -> Result<(), BlockBackendError> {
+        // 第一次先排空普通脏块，缩短全局分配锁的持有时间。随后取得分配锁并再次
+        // 排空：此前进行中的 bitmap 修改至此已经发布，锁内快照的 flags/counts
+        // 与落盘 bitmap 属于同一状态，sync 返回时也不会遗漏刚被摘走的 dirty 位。
+        self.flush_dirty_blocks()?;
+        let _alloc = crate::alloc_mod::lock_alloc();
         self.flush_dirty_blocks()?;
         let dirty_groups = {
             let mut dirty = self.alloc_group_dirty.lock();
@@ -1973,7 +2012,7 @@ mod tests {
     use crate::file::{ExtRegFileOps, read_aligned_blocks};
     use crate::inode::{ExtInodeOps, load_inode};
     use crate::inode_wr::{RawInode, write_raw};
-    use crate::layout::{ExtKind, S_IFREG};
+    use crate::layout::{EXT4_EXTENTS_FL, ExtKind, S_IFREG};
     use crate::map_wr::{self, BlockAllocState};
     use crate::sb::Superblock;
     use vfs::dentry::Dentry;
@@ -2301,6 +2340,7 @@ mod tests {
             free_blocks_count: free_blocks.min(u32::MAX as u64) as u32,
             free_inodes_count: 16,
             used_dirs_count: 1,
+            itable_unused_count: 0,
         }];
         let group_counts = vec![GroupCounts {
             free_blocks: free_blocks.min(u32::MAX as u64) as u32,
@@ -2789,13 +2829,21 @@ mod tests {
 
         let file = ExtRegFileOps::new(Arc::clone(&state), Arc::clone(&sb), INO, open_raw);
         assert_eq!(file.write_at(b"test", 0).expect("write file"), 4);
+        // 越过 direct 区域写入一个新块时，除了数据块还会新建一级间接块。
+        // `i_blocks` 必须同时反映这两个文件系统块（1024B 块即 4 sectors）。
+        assert_eq!(
+            file.write_at(b"x", (12 * BLOCK_SIZE) as u64)
+                .expect("write through indirect block"),
+            1
+        );
 
         // 模拟 dentry 未缓存/被驱逐：不调用 sync，直接从 inode table 重建。
         // 新 size、块映射和数据必须已经对后续 lookup 可见。
         sb.remove_inode(INO as u64);
         drop(file);
         let (reloaded_meta, reloaded_raw) = load_inode(&state, INO).expect("reload inode");
-        assert_eq!(reloaded_meta.size, 4);
+        assert_eq!(reloaded_meta.size, 12 * BLOCK_SIZE as u64 + 1);
+        assert_eq!(reloaded_meta.blocks_512, 6);
         assert_ne!(&reloaded_raw[0x28..0x2c], &[0u8; 4]);
 
         let reloaded_file = ExtRegFileOps::new(
@@ -3205,6 +3253,85 @@ mod tests {
         let writes = backend.writes();
         assert!(writes.contains(&(2, 2)));
         assert!(!writes.contains(&(8, 2)));
+    }
+
+    #[test]
+    fn indirect_allocation_reports_only_new_index_blocks() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(CountingBackend::new(4096, 512));
+        let mut bitmap = vec![0u8; BLOCK_SIZE as usize];
+        bitmap[0] = 0b0000_1111;
+        backend.seed_block(1, BLOCK_SIZE as usize, &bitmap);
+
+        let state = alloc_test_state(backend, BLOCK_SIZE, 2048);
+        let mut i_block = [0u8; 60];
+        let mut scratch = Vec::new();
+
+        let (first_l1, first_l1_indexes) = map_wr::ensure_block_for_write_with_scratch_count(
+            &state,
+            &mut i_block,
+            12,
+            false,
+            &mut scratch,
+        )
+        .expect("allocate first L1 data block");
+        assert_eq!(first_l1, BlockAllocState::NewlyAllocated(5));
+        assert_eq!(first_l1_indexes, 1);
+
+        let (_, next_l1_indexes) = map_wr::ensure_block_for_write_with_scratch_count(
+            &state,
+            &mut i_block,
+            13,
+            false,
+            &mut scratch,
+        )
+        .expect("reuse L1 index block");
+        assert_eq!(next_l1_indexes, 0);
+
+        let (first_l2, first_l2_indexes) = map_wr::ensure_block_for_write_with_scratch_count(
+            &state,
+            &mut i_block,
+            12 + BLOCK_SIZE / 4,
+            false,
+            &mut scratch,
+        )
+        .expect("allocate first L2 data block");
+        assert_eq!(first_l2, BlockAllocState::NewlyAllocated(9));
+        assert_eq!(first_l2_indexes, 2);
+        assert_eq!(map_wr::count_all_blocks(&state, &i_block), Ok(6));
+    }
+
+    #[test]
+    fn extent_demotion_reports_new_indirect_indexes() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(CountingBackend::new(4096, 512));
+        let mut bitmap = vec![0u8; BLOCK_SIZE as usize];
+        for bit in 0..24usize {
+            bitmap[bit / 8] |= 1 << (bit % 8);
+        }
+        backend.seed_block(1, BLOCK_SIZE as usize, &bitmap);
+
+        let state = alloc_test_state(backend, BLOCK_SIZE, 2048);
+        let mut i_block = [0u8; 60];
+        crate::extent_wr::init_empty_root(&mut i_block);
+        for (logical, physical) in [(0, 20), (12, 21), (24, 22), (36, 23)] {
+            assert!(crate::extent_wr::try_append_leaf(
+                &mut i_block,
+                logical,
+                physical,
+                1
+            ));
+        }
+        let mut flags = EXT4_EXTENTS_FL;
+
+        let (converted, new_indexes) =
+            crate::extent_wr::demote_preserve_if_extent_count(&state, &mut flags, &mut i_block)
+                .expect("demote extent mappings");
+
+        assert!(converted);
+        assert_eq!(new_indexes, 1);
+        assert_eq!(flags & EXT4_EXTENTS_FL, 0);
+        assert_eq!(map_wr::count_all_blocks(&state, &i_block), Ok(5));
     }
 
     #[test]

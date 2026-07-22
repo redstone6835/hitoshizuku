@@ -85,6 +85,9 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 let file = fdt
                     .get_file(Fd::from_raw(fd_raw as u32))
                     .ok_or(Errno::EBADF)?;
+                if !file.flags().readable() {
+                    return Err(Errno::EACCES);
+                }
                 if is_shared && (prot & PROT_WRITE) != 0 && !file.flags().writable() {
                     return Err(Errno::EACCES);
                 }
@@ -429,6 +432,9 @@ fn map_range(
     let file = fdt
         .get_file(Fd::from_raw(fd_raw as u32))
         .ok_or(Errno::EBADF)?;
+    if !file.flags().readable() {
+        return Err(Errno::EACCES);
+    }
     if shared && (prot & PROT_WRITE) != 0 && !file.flags().writable() {
         return Err(Errno::EACCES);
     }

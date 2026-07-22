@@ -479,7 +479,7 @@ impl FileOps for ExtRegFileOps {
                         let lb = (written as u64 / block_size) as u32;
                         let in_block = (written as u64 % block_size) as usize;
                         let want = ((block_size - in_block as u64) as usize).min(total - written);
-                        let block = ensure_block_any(
+                        let (block, new_metadata) = ensure_block_any(
                             &self.state,
                             &mut flags,
                             &mut i_block,
@@ -487,6 +487,7 @@ impl FileOps for ExtRegFileOps {
                             &mut map_scratch,
                         )
                         .map_err(map_err)?;
+                        newly_allocated_blocks += new_metadata as u64;
                         if block.is_new() {
                             newly_allocated_blocks += 1;
                         }
@@ -548,7 +549,7 @@ impl FileOps for ExtRegFileOps {
                     let lb = lb as u32;
                     let in_block = (file_off % block_size) as usize;
                     let want = ((block_size - in_block as u64) as usize).min(buf.len() - written);
-                    let block = ensure_block_any(
+                    let (block, new_metadata) = ensure_block_any(
                         &self.state,
                         &mut flags,
                         &mut i_block,
@@ -556,6 +557,7 @@ impl FileOps for ExtRegFileOps {
                         &mut map_scratch,
                     )
                     .map_err(map_err)?;
+                    newly_allocated_blocks += new_metadata as u64;
                     if block.is_new() {
                         newly_allocated_blocks += 1;
                     }
@@ -700,18 +702,27 @@ fn ensure_block_any(
     i_block: &mut [u8],
     lb: u32,
     scratch: &mut Vec<u8>,
-) -> Result<BlockAllocState, crate::state::BlockBackendError> {
+) -> Result<(BlockAllocState, u32), crate::state::BlockBackendError> {
+    let mut new_metadata = 0u32;
     if *flags & crate::layout::EXT4_EXTENTS_FL != 0 {
         if let Some(block) = extent_wr::ensure_block_in_extent_for_write(state, i_block, lb)? {
-            return Ok(block);
+            return Ok((block, 0));
         }
         // 原地追加失败 → 保留已有数据地降级为间接块布局。
-        if !extent_wr::demote_preserve_if_extent(state, flags, i_block)? {
+        let (converted, demoted_metadata) =
+            extent_wr::demote_preserve_if_extent_count(state, flags, i_block)?;
+        if !converted {
             return Err(crate::state::BlockBackendError::Unsupported);
         }
+        new_metadata = demoted_metadata;
     }
     // 文件写路径会自行处理新块未覆盖区域，避免整块覆盖时先写零再写数据。
-    map_wr::ensure_block_for_write_with_scratch(state, i_block, lb, false, scratch)
+    let (block, mapped_metadata) =
+        map_wr::ensure_block_for_write_with_scratch_count(state, i_block, lb, false, scratch)?;
+    new_metadata = new_metadata
+        .checked_add(mapped_metadata)
+        .ok_or(crate::state::BlockBackendError::OutOfRange)?;
+    Ok((block, new_metadata))
 }
 
 #[inline]

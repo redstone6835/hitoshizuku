@@ -160,6 +160,7 @@ pub(crate) fn lock_raw(raw: &Spinlock<RawInode>) -> SpinlockGuard<'_, RawInode> 
             return guard;
         }
         if sched::is_ready() {
+            sched::poll_urgent_work();
             sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
@@ -425,6 +426,10 @@ fn clear_deleted_inode(raw: &mut RawInode) {
 }
 
 impl InodeOps for ExtInodeOps {
+    fn supports_private_page_cache(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, inode: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         let meta = self.snapshot_meta();
         if file_type_from_mode(meta.mode) != FileType::Directory {

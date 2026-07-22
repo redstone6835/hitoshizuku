@@ -19,7 +19,7 @@ use core::alloc::Layout;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
+use crate::Mutex;
 
 use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::request::AllocationRecord;

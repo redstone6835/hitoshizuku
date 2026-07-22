@@ -15,6 +15,103 @@ use crate::state::{BlockBackendError, FsState};
 
 const EXT_HEADER_SIZE: usize = 12;
 const EXT_ENTRY_SIZE: usize = 12;
+const MAX_INITIALIZED_EXTENT_LEN: u32 = 0x8000;
+const MAX_EXTENT_PHYSICAL_BLOCK: u64 = (1u64 << 48) - 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LeafExtent {
+    logical: u32,
+    len: u32,
+    physical: u64,
+    initialized: bool,
+}
+
+impl LeafExtent {
+    #[inline]
+    fn logical_end(self) -> u64 {
+        self.logical as u64 + self.len as u64
+    }
+
+    #[inline]
+    fn physical_end(self) -> u64 {
+        self.physical + self.len as u64
+    }
+}
+
+fn read_leaf_extent(root: &[u8], index: usize) -> Option<LeafExtent> {
+    let off = EXT_HEADER_SIZE.checked_add(index.checked_mul(EXT_ENTRY_SIZE)?)?;
+    let entry = root.get(off..off + EXT_ENTRY_SIZE)?;
+    let logical = u32::from_le_bytes(entry[0..4].try_into().ok()?);
+    let encoded_len = u16::from_le_bytes(entry[4..6].try_into().ok()?);
+    if encoded_len == 0 {
+        return None;
+    }
+    let initialized = encoded_len <= 0x8000;
+    let len = if initialized {
+        encoded_len as u32
+    } else {
+        (encoded_len - 0x8000) as u32
+    };
+    let physical_hi = u16::from_le_bytes(entry[6..8].try_into().ok()?) as u64;
+    let physical_lo = u32::from_le_bytes(entry[8..12].try_into().ok()?) as u64;
+    let extent = LeafExtent {
+        logical,
+        len,
+        physical: (physical_hi << 32) | physical_lo,
+        initialized,
+    };
+    if extent.logical_end() > u32::MAX as u64 + 1
+        || extent.physical_end().checked_sub(1)? > MAX_EXTENT_PHYSICAL_BLOCK
+    {
+        return None;
+    }
+    Some(extent)
+}
+
+fn write_initialized_leaf(root: &mut [u8], index: usize, extent: LeafExtent) {
+    debug_assert!(extent.initialized);
+    debug_assert!((1..=MAX_INITIALIZED_EXTENT_LEN).contains(&extent.len));
+    let off = EXT_HEADER_SIZE + index * EXT_ENTRY_SIZE;
+    root[off..off + 4].copy_from_slice(&extent.logical.to_le_bytes());
+    root[off + 4..off + 6].copy_from_slice(&(extent.len as u16).to_le_bytes());
+    root[off + 6..off + 8].copy_from_slice(&((extent.physical >> 32) as u16).to_le_bytes());
+    root[off + 8..off + 12].copy_from_slice(&(extent.physical as u32).to_le_bytes());
+}
+
+/// 校验 inode 内嵌叶子根，并确保已有条目按逻辑块排序且互不重叠。
+fn validated_leaf_root(root: &[u8]) -> Option<(usize, usize)> {
+    if root.len() < EXT_HEADER_SIZE
+        || u16::from_le_bytes(root[0..2].try_into().ok()?) != EXT4_EXT_MAGIC
+        || u16::from_le_bytes(root[6..8].try_into().ok()?) != 0
+    {
+        return None;
+    }
+    let entries = u16::from_le_bytes(root[2..4].try_into().ok()?) as usize;
+    let max = u16::from_le_bytes(root[4..6].try_into().ok()?) as usize;
+    let capacity = (root.len() - EXT_HEADER_SIZE) / EXT_ENTRY_SIZE;
+    if entries > max || max > capacity {
+        return None;
+    }
+
+    let mut previous_end = 0u64;
+    for index in 0..entries {
+        let extent = read_leaf_extent(root, index)?;
+        if index != 0 && (extent.logical as u64) < previous_end {
+            return None;
+        }
+        previous_end = extent.logical_end();
+    }
+    Some((entries, max))
+}
+
+#[inline]
+fn can_merge(left: LeafExtent, right: LeafExtent) -> bool {
+    left.initialized
+        && right.initialized
+        && left.logical_end() == right.logical as u64
+        && left.physical_end() == right.physical
+        && left.len + right.len <= MAX_INITIALIZED_EXTENT_LEN
+}
 
 /// 递归释放 extent tree 指向的所有数据块 + 子节点块。
 /// `root` 是当前节点的前 (≥ header_size) 字节;对 inode 根只传 60 字节。
@@ -152,44 +249,59 @@ pub(crate) fn demote_preserve_if_extent(
     flags: &mut u32,
     i_block: &mut [u8],
 ) -> Result<bool, BlockBackendError> {
+    demote_preserve_if_extent_count(state, flags, i_block).map(|(converted, _)| converted)
+}
+
+/// 与 [`demote_preserve_if_extent`] 相同，并返回转换期间新分配的间接索引块数。
+/// 原 extent 的数据块只是搬运映射，不计入该增量。
+pub(crate) fn demote_preserve_if_extent_count(
+    state: &FsState,
+    flags: &mut u32,
+    i_block: &mut [u8],
+) -> Result<(bool, u32), BlockBackendError> {
     if *flags & EXT4_EXTENTS_FL == 0 {
-        return Ok(true);
+        return Ok((true, 0));
     }
     if i_block.len() < EXT_HEADER_SIZE {
-        return Ok(false);
+        return Ok((false, 0));
     }
     let magic = u16::from_le_bytes([i_block[0], i_block[1]]);
     if magic != EXT4_EXT_MAGIC {
-        return Ok(false);
+        return Ok((false, 0));
     }
     let entries = u16::from_le_bytes([i_block[2], i_block[3]]) as usize;
     let depth = u16::from_le_bytes([i_block[6], i_block[7]]);
     if depth != 0 {
-        return Ok(false);
+        return Ok((false, 0));
     }
 
     let old = i_block.to_vec();
     reset_to_indirect(i_block);
+    let mut new_metadata = 0u32;
     for i in 0..entries {
         let off = EXT_HEADER_SIZE + i * EXT_ENTRY_SIZE;
         if off + EXT_ENTRY_SIZE > old.len() {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let ee_block = u32::from_le_bytes([old[off], old[off + 1], old[off + 2], old[off + 3]]);
         let ee_len = u16::from_le_bytes([old[off + 4], old[off + 5]]);
         if ee_len > 0x8000 {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let start_hi = u16::from_le_bytes([old[off + 6], old[off + 7]]) as u64;
         let start_lo =
             u32::from_le_bytes([old[off + 8], old[off + 9], old[off + 10], old[off + 11]]) as u64;
         let start = (start_hi << 32) | start_lo;
         for b in 0..ee_len as u32 {
-            crate::map_wr::set_existing_block(state, i_block, ee_block + b, start + b as u64)?;
+            let allocated =
+                crate::map_wr::set_existing_block(state, i_block, ee_block + b, start + b as u64)?;
+            new_metadata = new_metadata
+                .checked_add(allocated)
+                .ok_or(BlockBackendError::OutOfRange)?;
         }
     }
     *flags &= !EXT4_EXTENTS_FL;
-    Ok(true)
+    Ok((true, new_metadata))
 }
 
 /// 判断 i_block 是否已经是合法的 extent 根(简单看 magic)。
@@ -227,69 +339,101 @@ pub(crate) fn collect_entries(root: &[u8]) -> Vec<(u32, u16, u64)> {
     out
 }
 
-/// 尝试在 i_block 根节点里原地追加一个叶子 extent,覆盖逻辑块 `lb` 指向新分配
-/// 的物理块 `phys`。仅当 depth=0 且 `entries < max` 时成功。
+/// 尝试在 i_block 根节点里原地插入一个叶子 extent,覆盖逻辑块 `lb` 指向新分配
+/// 的物理块 `phys`。条目始终按逻辑块排序，并尽量与物理、逻辑都连续的相邻项合并。
 ///
-/// 返回 `true` 表示已追加。失败说明根已满或是索引节点,调用方应 fallback 到
+/// 返回 `true` 表示已插入或合并。失败说明根已满、映射重叠或是索引节点,调用方应 fallback 到
 /// `demote_if_extent` + 间接块。
 pub(crate) fn try_append_leaf(i_block: &mut [u8], lb: u32, phys: u64, len: u16) -> bool {
-    if i_block.len() < EXT_HEADER_SIZE {
+    let len = len as u32;
+    if len == 0
+        || len > MAX_INITIALIZED_EXTENT_LEN
+        || lb as u64 + len as u64 > u32::MAX as u64 + 1
+        || phys
+            .checked_add(len as u64 - 1)
+            .is_none_or(|last| last > MAX_EXTENT_PHYSICAL_BLOCK)
+    {
         return false;
     }
-    let magic = u16::from_le_bytes([i_block[0], i_block[1]]);
-    if magic != EXT4_EXT_MAGIC {
+
+    let Some((entries, max)) = validated_leaf_root(i_block) else {
+        return false;
+    };
+    let new_extent = LeafExtent {
+        logical: lb,
+        len,
+        physical: phys,
+        initialized: true,
+    };
+    let insert_at = (0..entries)
+        .find(|&index| read_leaf_extent(i_block, index).unwrap().logical >= lb)
+        .unwrap_or(entries);
+    let left = insert_at
+        .checked_sub(1)
+        .map(|index| read_leaf_extent(i_block, index).unwrap());
+    let right = (insert_at < entries).then(|| read_leaf_extent(i_block, insert_at).unwrap());
+
+    if left.is_some_and(|extent| extent.logical_end() > lb as u64)
+        || right.is_some_and(|extent| new_extent.logical_end() > extent.logical as u64)
+    {
         return false;
     }
-    let entries = u16::from_le_bytes([i_block[2], i_block[3]]);
-    let max = u16::from_le_bytes([i_block[4], i_block[5]]);
-    let depth = u16::from_le_bytes([i_block[6], i_block[7]]);
-    if depth != 0 || entries >= max {
-        return false;
-    }
-    // 尝试合并:若新 extent 紧邻上一条(相同物理连续 + lb 连续 + 未越 16bit len),
-    // 就把上一条 len 加 1 即可(一样的路径 ext4 的 extent_append 里做了 merge)。
-    if entries > 0 {
-        let last_off = EXT_HEADER_SIZE + (entries as usize - 1) * EXT_ENTRY_SIZE;
-        let last_blk = u32::from_le_bytes([
-            i_block[last_off],
-            i_block[last_off + 1],
-            i_block[last_off + 2],
-            i_block[last_off + 3],
-        ]);
-        let last_len = u16::from_le_bytes([i_block[last_off + 4], i_block[last_off + 5]]);
-        let last_hi = u16::from_le_bytes([i_block[last_off + 6], i_block[last_off + 7]]) as u64;
-        let last_lo = u32::from_le_bytes([
-            i_block[last_off + 8],
-            i_block[last_off + 9],
-            i_block[last_off + 10],
-            i_block[last_off + 11],
-        ]) as u64;
-        let last_start = (last_hi << 32) | last_lo;
-        let last_uninit = last_len > 0x8000;
-        if !last_uninit {
-            let real_last_len = last_len;
-            if last_blk + real_last_len as u32 == lb
-                && last_start + real_last_len as u64 == phys
-                && (real_last_len as u32 + len as u32) < 0x8000
-            {
-                let new_len = real_last_len + len;
-                i_block[last_off + 4..last_off + 6].copy_from_slice(&new_len.to_le_bytes());
-                return true;
-            }
+
+    let merge_left = left.is_some_and(|extent| can_merge(extent, new_extent));
+    let merge_right = right.is_some_and(|extent| can_merge(new_extent, extent));
+    if merge_left && merge_right {
+        let left_extent = left.unwrap();
+        let right_extent = right.unwrap();
+        if left_extent.len + new_extent.len + right_extent.len <= MAX_INITIALIZED_EXTENT_LEN {
+            write_initialized_leaf(
+                i_block,
+                insert_at - 1,
+                LeafExtent {
+                    len: left_extent.len + new_extent.len + right_extent.len,
+                    ..left_extent
+                },
+            );
+            let entries_end = EXT_HEADER_SIZE + entries * EXT_ENTRY_SIZE;
+            let right_off = EXT_HEADER_SIZE + insert_at * EXT_ENTRY_SIZE;
+            i_block.copy_within(right_off + EXT_ENTRY_SIZE..entries_end, right_off);
+            i_block[entries_end - EXT_ENTRY_SIZE..entries_end].fill(0);
+            i_block[2..4].copy_from_slice(&((entries - 1) as u16).to_le_bytes());
+            return true;
         }
     }
-    let off = EXT_HEADER_SIZE + entries as usize * EXT_ENTRY_SIZE;
-    if off + EXT_ENTRY_SIZE > i_block.len() {
+    if merge_left {
+        let left_extent = left.unwrap();
+        write_initialized_leaf(
+            i_block,
+            insert_at - 1,
+            LeafExtent {
+                len: left_extent.len + new_extent.len,
+                ..left_extent
+            },
+        );
+        return true;
+    }
+    if merge_right {
+        let right_extent = right.unwrap();
+        write_initialized_leaf(
+            i_block,
+            insert_at,
+            LeafExtent {
+                len: new_extent.len + right_extent.len,
+                ..new_extent
+            },
+        );
+        return true;
+    }
+    if entries >= max {
         return false;
     }
-    i_block[off..off + 4].copy_from_slice(&lb.to_le_bytes());
-    i_block[off + 4..off + 6].copy_from_slice(&len.to_le_bytes());
-    let hi = (phys >> 32) as u16;
-    let lo = phys as u32;
-    i_block[off + 6..off + 8].copy_from_slice(&hi.to_le_bytes());
-    i_block[off + 8..off + 12].copy_from_slice(&lo.to_le_bytes());
-    let new_entries = entries + 1;
-    i_block[2..4].copy_from_slice(&new_entries.to_le_bytes());
+
+    let insert_off = EXT_HEADER_SIZE + insert_at * EXT_ENTRY_SIZE;
+    let entries_end = EXT_HEADER_SIZE + entries * EXT_ENTRY_SIZE;
+    i_block.copy_within(insert_off..entries_end, insert_off + EXT_ENTRY_SIZE);
+    write_initialized_leaf(i_block, insert_at, new_extent);
+    i_block[2..4].copy_from_slice(&((entries + 1) as u16).to_le_bytes());
     true
 }
 
@@ -410,8 +554,12 @@ pub(crate) fn ensure_extent_run(
         return Ok(Some((phys, run)));
     }
 
-    // 未映射：批量分配连续物理块
-    let (new_phys, got) = crate::alloc_mod::alloc_blocks_run(state, count)?;
+    // 未映射：分配长度必须截断到下一条已有 extent 之前，否则随机 pwrite 会让
+    // 新映射覆盖后面的有效映射。单条 initialized extent 也不能超过 0x8000 块。
+    let Some(alloc_count) = clip_unmapped_run(i_block, start_lb, count) else {
+        return Ok(None);
+    };
+    let (new_phys, got) = crate::alloc_mod::alloc_blocks_run(state, alloc_count)?;
     if try_append_leaf(i_block, start_lb, new_phys, got as u16) {
         Ok(Some((new_phys, got)))
     } else {
@@ -429,6 +577,30 @@ pub(crate) fn ensure_extent_run(
             Ok(None)
         }
     }
+}
+
+/// 把一个 hole 中的分配请求裁剪到下一条 extent 的起点。
+fn clip_unmapped_run(i_block: &[u8], start_lb: u32, count: u32) -> Option<u32> {
+    if count == 0 {
+        return None;
+    }
+    let (entries, _) = validated_leaf_root(i_block)?;
+    let start = start_lb as u64;
+    let logical_limit = u32::MAX as u64 + 1;
+    let mut clipped = (count as u64)
+        .min(MAX_INITIALIZED_EXTENT_LEN as u64)
+        .min(logical_limit - start);
+    for index in 0..entries {
+        let extent = read_leaf_extent(i_block, index)?;
+        if start >= extent.logical as u64 && start < extent.logical_end() {
+            return None;
+        }
+        if start < extent.logical as u64 {
+            clipped = clipped.min(extent.logical as u64 - start);
+            break;
+        }
+    }
+    u32::try_from(clipped).ok().filter(|len| *len != 0)
 }
 
 /// Public wrapper for `lookup_extent_run` — used by file write path to
@@ -484,7 +656,15 @@ fn lookup_extent_run(i_block: &[u8], lb: u32, max_count: u32) -> Option<(u64, u3
 
 #[cfg(test)]
 mod tests {
-    use super::{init_empty_root, lookup_extent_run, try_append_leaf};
+    use alloc::{vec, vec::Vec};
+
+    use super::{
+        clip_unmapped_run, collect_entries, init_empty_root, lookup_extent_run, try_append_leaf,
+    };
+
+    fn entries(root: &[u8]) -> Vec<(u32, u16, u64)> {
+        collect_entries(root)
+    }
 
     #[test]
     fn lookup_extent_run_clips_inside_single_extent() {
@@ -495,5 +675,81 @@ mod tests {
         assert_eq!(lookup_extent_run(&root, 12, 32), Some((1004, 12)));
         assert_eq!(lookup_extent_run(&root, 20, 2), Some((1012, 2)));
         assert_eq!(lookup_extent_run(&root, 24, 1), None);
+    }
+
+    #[test]
+    fn out_of_order_writes_stay_sorted() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        assert!(try_append_leaf(&mut root, 0, 100, 1));
+        assert!(try_append_leaf(&mut root, 16, 200, 1));
+        assert!(try_append_leaf(&mut root, 15, 300, 1));
+
+        assert_eq!(
+            entries(&root),
+            vec![(0, 1, 100), (15, 1, 300), (16, 1, 200)]
+        );
+    }
+
+    #[test]
+    fn inserts_between_existing_extents() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        assert!(try_append_leaf(&mut root, 0, 100, 2));
+        assert!(try_append_leaf(&mut root, 10, 200, 2));
+        assert!(try_append_leaf(&mut root, 5, 150, 2));
+
+        assert_eq!(entries(&root), vec![(0, 2, 100), (5, 2, 150), (10, 2, 200)]);
+    }
+
+    #[test]
+    fn insertion_merges_both_neighbors() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        assert!(try_append_leaf(&mut root, 0, 100, 2));
+        assert!(try_append_leaf(&mut root, 4, 104, 2));
+        assert!(try_append_leaf(&mut root, 2, 102, 2));
+
+        assert_eq!(entries(&root), vec![(0, 6, 100)]);
+    }
+
+    #[test]
+    fn full_root_can_merge_but_rejects_isolated_insertion() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        for (logical, physical) in [(0, 100), (10, 200), (20, 300), (30, 400)] {
+            assert!(try_append_leaf(&mut root, logical, physical, 1));
+        }
+
+        assert!(try_append_leaf(&mut root, 1, 101, 1));
+        assert_eq!(entries(&root)[0], (0, 2, 100));
+        let unchanged = root;
+        assert!(!try_append_leaf(&mut root, 5, 500, 1));
+        assert_eq!(root, unchanged);
+    }
+
+    #[test]
+    fn overlapping_insertion_is_rejected_without_changes() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        assert!(try_append_leaf(&mut root, 8, 100, 4));
+        let unchanged = root;
+
+        assert!(!try_append_leaf(&mut root, 7, 200, 2));
+        assert!(!try_append_leaf(&mut root, 10, 300, 4));
+        assert_eq!(root, unchanged);
+    }
+
+    #[test]
+    fn allocation_run_stops_at_next_extent() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        assert!(try_append_leaf(&mut root, 0, 100, 2));
+        assert!(try_append_leaf(&mut root, 16, 200, 4));
+
+        assert_eq!(clip_unmapped_run(&root, 2, 100), Some(14));
+        assert_eq!(clip_unmapped_run(&root, 15, 8), Some(1));
+        assert_eq!(clip_unmapped_run(&root, 16, 8), None);
+        assert_eq!(clip_unmapped_run(&root, 20, 8), Some(8));
     }
 }

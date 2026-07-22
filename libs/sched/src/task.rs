@@ -35,7 +35,7 @@ use crate::arch_hooks::KernelEntry;
 use crate::clone_flags::CloneFlags;
 use crate::cpu::CpuMask;
 use crate::eevdf::{SchedEntity, SchedParams};
-use crate::group::{ProcessGroup, ThreadGroup};
+use crate::group::{GroupExitStatus, ProcessGroup, ThreadGroup};
 use crate::ids::Credentials;
 use crate::pid::{PidNamespace, PidT};
 use crate::placement::{PlacementSnapshot, TaskPlacement};
@@ -530,6 +530,9 @@ pub struct Task {
     /// signal/exit_group/wait 模型中隔离出去。
     kind: AtomicU8,
     state: AtomicU8,
+    /// 发送者已对本成员发布协作组退出。与睡眠状态使用
+    /// SeqCst 握手，覆盖“waker 先观察到 Running”的提交窗口。
+    group_exit_requested: AtomicBool,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
     exit_reason: AtomicU8,
@@ -659,6 +662,7 @@ impl Task {
             sched: SchedEntity::new(params),
             kind: AtomicU8::new(TaskKind::User as u8),
             state: AtomicU8::new(TaskState::New as u8),
+            group_exit_requested: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
             exit_reason: AtomicU8::new(EXIT_REASON_NONE),
@@ -792,9 +796,97 @@ impl Task {
 
     /// CAS 状态，成功时返回 `true`。用于 wakeup 路径无锁切换。
     pub fn cas_state(&self, expect: TaskState, new: TaskState) -> bool {
+        let entering_wait = matches!(new, TaskState::Sleeping | TaskState::Uninterruptible);
+        if entering_wait && self.group_exit_wakeup_pending() {
+            return false;
+        }
+        let ordered_exit_transition = entering_wait || self.group_exit_wakeup_pending();
+        let transitioned = if ordered_exit_transition {
+            self.state
+                .compare_exchange(expect as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst)
+        } else {
+            self.state.compare_exchange(
+                expect as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        };
+        if transitioned.is_err() {
+            return false;
+        }
+        if entering_wait && self.group_exit_wakeup_pending() {
+            // 与 group_exit_wakeup 构成两阶段握手：请求若在首次
+            // 检查后发布，waker 要么把已提交的睡眠拉回 Runnable，
+            // 要么由这里撤销较晚的睡眠提交。
+            let _ = self.state.compare_exchange(
+                new as u8,
+                expect as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 等待队列统一的睡眠提交入口。
+    pub(crate) fn prepare_wait_state(&self, state: TaskState) -> bool {
+        debug_assert!(matches!(
+            state,
+            TaskState::Sleeping | TaskState::Uninterruptible
+        ));
+        loop {
+            let current = self.state();
+            if current == state {
+                if !self.group_exit_wakeup_pending() {
+                    return true;
+                }
+                let _ = self.state.compare_exchange(
+                    state as u8,
+                    TaskState::Running as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return false;
+            }
+            if matches!(
+                current,
+                TaskState::Stopped | TaskState::Continued | TaskState::Zombie | TaskState::Dead
+            ) {
+                return false;
+            }
+            if self.cas_state(current, state) {
+                return true;
+            }
+            if self.group_exit_wakeup_pending() {
+                return false;
+            }
+        }
+    }
+
+    /// 在调度入口撤销已发布组退出任务的睡眠。
+    pub(crate) fn abort_group_exit_sleep(&self) -> bool {
+        if !self.group_exit_wakeup_pending() {
+            return false;
+        }
         self.state
-            .compare_exchange(expect as u8, new as u8, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                TaskState::Sleeping as u8,
+                TaskState::Running as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_ok()
+            || self
+                .state
+                .compare_exchange(
+                    TaskState::Uninterruptible as u8,
+                    TaskState::Running as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
     }
 
     pub fn enable_ptrace_traced(&self) -> bool {
@@ -853,6 +945,54 @@ impl Task {
         Arc::clone(&self.rel.lock().thread_group)
     }
 
+    /// 当前用户任务是否需要协作退出线程组。
+    ///
+    /// 内核任务可能与 init 共享历史线程组，不应被用户态
+    /// `exit_group` 带走。
+    pub fn group_exit_pending(&self) -> bool {
+        self.is_user_task() && self.thread_group().group_exit_status().is_some()
+    }
+
+    /// 对单个组成员发布协作退出唤醒。
+    pub(crate) fn publish_group_exit_wakeup(&self) {
+        if self.is_user_task() {
+            self.group_exit_requested.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn group_exit_wakeup_pending(&self) -> bool {
+        self.group_exit_requested.load(Ordering::SeqCst)
+    }
+
+    /// 当前任务是否是线程组 leader。
+    pub fn is_thread_group_leader(&self) -> bool {
+        self.thread_group()
+            .leader()
+            .is_some_and(|leader| core::ptr::eq(Arc::as_ptr(&leader), self))
+    }
+
+    /// 退出事件是否已经可被 pidfd 等进程级观察者报告。
+    ///
+    /// 非 leader 线程保持原有逐线程语义；leader 即使已是 Zombie，也必须等到
+    /// 线程组所有成员完成各自的退出清理后才代表整个进程终止。
+    pub fn exit_event_ready(&self) -> bool {
+        match self.state() {
+            TaskState::Dead => true,
+            TaskState::Zombie => {
+                let group = self.thread_group();
+                let is_leader = group
+                    .leader()
+                    .is_some_and(|leader| core::ptr::eq(Arc::as_ptr(&leader), self));
+                !is_leader || group.is_terminated()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_waitable_zombie(&self) -> bool {
+        self.state() == TaskState::Zombie && self.exit_event_ready()
+    }
+
     pub fn process_group(&self) -> Arc<ProcessGroup> {
         Arc::clone(&self.rel.lock().process_group)
     }
@@ -886,10 +1026,12 @@ impl Task {
 
     pub fn exit_code(&self) -> Option<ExitCode> {
         if self.has_exit_code.load(Ordering::Acquire) == 0 {
-            None
-        } else {
-            Some(ExitCode(self.exit_code.load(Ordering::Acquire)))
+            return None;
         }
+        if let Some(status) = self.authoritative_group_exit_status() {
+            return Some(ExitCode(status.exit_code()));
+        }
+        Some(ExitCode(self.exit_code.load(Ordering::Acquire)))
     }
 
     /// 标记下一次退出是信号终止。随后 [`mark_exited`] 会保留该原因，
@@ -909,6 +1051,22 @@ impl Task {
 
     /// 把已记录的退出原因转换成 wait4/waitid 的 `wstatus`。
     pub fn exit_wait_status(&self) -> Option<WaitStatus> {
+        if self.has_exit_code.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        if let Some(status) = self.authoritative_group_exit_status() {
+            return Some(match status {
+                GroupExitStatus::Exited(code) => WaitStatus::from_exit(code),
+                GroupExitStatus::Signaled {
+                    signal,
+                    core_dumped: true,
+                } => WaitStatus::from_signal_core(signal),
+                GroupExitStatus::Signaled {
+                    signal,
+                    core_dumped: false,
+                } => WaitStatus::from_signal(signal),
+            });
+        }
         let code = self.exit_code()?;
         match self.exit_reason.load(Ordering::Acquire) {
             EXIT_REASON_SIGNALED | EXIT_REASON_CORE_DUMPED => {
@@ -922,6 +1080,14 @@ impl Task {
             }
             _ => Some(WaitStatus::from_exit(code.0)),
         }
+    }
+
+    fn authoritative_group_exit_status(&self) -> Option<GroupExitStatus> {
+        let group = self.thread_group();
+        let is_leader = group
+            .leader()
+            .is_some_and(|leader| core::ptr::eq(Arc::as_ptr(&leader), self));
+        is_leader.then(|| group.group_exit_status()).flatten()
     }
 
     /// 标记任务因 stop 信号进入停止态，并记录一次可被 `wait(WUNTRACED)` 观察的事件。
@@ -962,6 +1128,25 @@ impl Task {
         true
     }
 
+    /// 为协作退出恢复停止任务，不发布 `WCONTINUED` 事件。
+    pub(crate) fn resume_for_fatal_exit(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                TaskState::Stopped as u8,
+                TaskState::Runnable as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.wait_stop_pending.store(0, Ordering::Release);
+        self.wait_continue_pending.store(0, Ordering::Release);
+        true
+    }
+
     /// 返回并按需消费一次 stopped wait 事件。
     pub(crate) fn wait_stopped_status(&self, nowait: bool) -> Option<WaitStatus> {
         let pending = if nowait {
@@ -994,10 +1179,7 @@ impl Task {
     /// 返回 `None` 表示当前没有可回收的退出子。
     pub fn reap_any_zombie(&self) -> Option<Arc<Task>> {
         let mut rel = self.rel.lock();
-        let pos = rel
-            .children
-            .iter()
-            .position(|c| c.state() == TaskState::Zombie)?;
+        let pos = rel.children.iter().position(|c| c.is_waitable_zombie())?;
         let zombie = rel.children.swap_remove(pos);
         zombie.set_state(TaskState::Dead);
         Some(zombie)
@@ -1013,12 +1195,12 @@ impl Task {
             let candidate = self
                 .snapshot_children()
                 .into_iter()
-                .find(|c| c.state() == TaskState::Zombie && pred(c))?;
+                .find(|c| c.is_waitable_zombie() && pred(c))?;
             let mut rel = self.rel.lock();
             let Some(pos) = rel.children.iter().position(|c| Arc::ptr_eq(c, &candidate)) else {
                 continue;
             };
-            if rel.children[pos].state() != TaskState::Zombie {
+            if !rel.children[pos].is_waitable_zombie() {
                 continue;
             }
             let zombie = rel.children.swap_remove(pos);

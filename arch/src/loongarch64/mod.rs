@@ -26,7 +26,7 @@ mod loader;
 mod mm;
 mod paging;
 mod random_source;
-mod sched_ctx;
+pub(crate) mod sched_ctx;
 mod smp;
 mod specific;
 mod syscall;

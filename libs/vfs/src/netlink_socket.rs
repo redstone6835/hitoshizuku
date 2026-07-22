@@ -138,6 +138,9 @@ impl NetlinkSocketFileOps {
                 return Err(Errno::EAGAIN);
             }
             let task = sched::current_task();
+            if sched::operation::has_interrupting_signal(&task) {
+                return Err(Errno::EINTR);
+            }
             let entry = self
                 .wait_queue
                 .prepare_to_wait(&task, sched::TaskState::Sleeping);
@@ -199,6 +202,9 @@ impl FileOps for NetlinkSocketFileOps {
                 return Err(VfsError::WouldBlock);
             }
             let task = sched::current_task();
+            if sched::operation::has_interrupting_signal(&task) {
+                return Err(VfsError::Interrupted);
+            }
             let entry = self
                 .wait_queue
                 .prepare_to_wait(&task, sched::TaskState::Sleeping);

@@ -22,6 +22,8 @@ pub(crate) struct GroupDesc {
     pub free_blocks_count: u32,
     pub free_inodes_count: u32,
     pub used_dirs_count: u32,
+    /// 块组尾部尚未初始化的 inode 表项数（`bg_itable_unused`）。
+    pub itable_unused_count: u32,
 }
 
 /// 读取所有块组描述符到内存;小文件系统(~GB)下总量很小,无需缓存。
@@ -82,18 +84,27 @@ pub(crate) fn load_all(
         let free_blocks_lo = u16::from_le_bytes([raw[12], raw[13]]) as u32;
         let free_inodes_lo = u16::from_le_bytes([raw[14], raw[15]]) as u32;
         let used_dirs_lo = u16::from_le_bytes([raw[16], raw[17]]) as u32;
-        let (free_blocks_count, free_inodes_count, used_dirs_count) = if desc_size == 64 {
-            let fb_hi = u16::from_le_bytes([raw[44], raw[45]]) as u32;
-            let fi_hi = u16::from_le_bytes([raw[46], raw[47]]) as u32;
-            let ud_hi = u16::from_le_bytes([raw[48], raw[49]]) as u32;
-            (
-                (fb_hi << 16) | free_blocks_lo,
-                (fi_hi << 16) | free_inodes_lo,
-                (ud_hi << 16) | used_dirs_lo,
-            )
-        } else {
-            (free_blocks_lo, free_inodes_lo, used_dirs_lo)
-        };
+        let itable_unused_lo = u16::from_le_bytes([raw[28], raw[29]]) as u32;
+        let (free_blocks_count, free_inodes_count, used_dirs_count, itable_unused_count) =
+            if desc_size == 64 {
+                let fb_hi = u16::from_le_bytes([raw[44], raw[45]]) as u32;
+                let fi_hi = u16::from_le_bytes([raw[46], raw[47]]) as u32;
+                let ud_hi = u16::from_le_bytes([raw[48], raw[49]]) as u32;
+                let iu_hi = u16::from_le_bytes([raw[50], raw[51]]) as u32;
+                (
+                    (fb_hi << 16) | free_blocks_lo,
+                    (fi_hi << 16) | free_inodes_lo,
+                    (ud_hi << 16) | used_dirs_lo,
+                    (iu_hi << 16) | itable_unused_lo,
+                )
+            } else {
+                (
+                    free_blocks_lo,
+                    free_inodes_lo,
+                    used_dirs_lo,
+                    itable_unused_lo,
+                )
+            };
 
         out.push(GroupDesc {
             block_bitmap,
@@ -103,6 +114,7 @@ pub(crate) fn load_all(
             free_blocks_count,
             free_inodes_count,
             used_dirs_count,
+            itable_unused_count,
         });
     }
     Ok(out)
@@ -177,6 +189,7 @@ pub(crate) fn write_desc(
     raw[14..16].copy_from_slice(&(free_inodes_count as u16).to_le_bytes());
     raw[16..18].copy_from_slice(&(used_dirs_count as u16).to_le_bytes());
     raw[18..20].copy_from_slice(&desc.flags.to_le_bytes());
+    raw[28..30].copy_from_slice(&(desc.itable_unused_count as u16).to_le_bytes());
 
     if desc_size == 64 {
         raw[32..36].copy_from_slice(&((desc.block_bitmap >> 32) as u32).to_le_bytes());
@@ -188,6 +201,7 @@ pub(crate) fn write_desc(
         raw[44..46].copy_from_slice(&free_blk_hi.to_le_bytes());
         raw[46..48].copy_from_slice(&free_ino_hi.to_le_bytes());
         raw[48..50].copy_from_slice(&used_dirs_hi.to_le_bytes());
+        raw[50..52].copy_from_slice(&((desc.itable_unused_count >> 16) as u16).to_le_bytes());
     }
 
     // metadata_csum 下 bitmap 内容变化后,group descriptor 中也保存了

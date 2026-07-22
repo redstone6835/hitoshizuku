@@ -216,15 +216,43 @@ static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
     idle_relax: loongarch64_idle_relax,
 };
 
+// 只有在 idle 任务已经离开调度器临界区、即将执行 `idle 0` 时置位。
+// IPI 处理器据此区分“安全唤醒窗口”和“恰好打断 schedule_once”两种情况，
+// 避免为了修复 idle 丢唤醒而在持有 runqueue 锁时重入调度器。
+static IDLE_WAITING: [AtomicBool; sched::NR_CPUS] =
+    [const { AtomicBool::new(false) }; sched::NR_CPUS];
+
+#[inline]
+fn idle_waiting_slot() -> &'static AtomicBool {
+    let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
+    &IDLE_WAITING[cpu.min(sched::NR_CPUS - 1)]
+}
+
+pub(crate) fn idle_waiting() -> bool {
+    idle_waiting_slot().load(Ordering::Acquire)
+}
+
+/// 消费当前 CPU 的 idle 等待标记。IPI 处理器在切入调度前调用，避免标记
+/// 跨越上下文切换残留为真；idle_relax 返回时的 store(false) 仍保持幂等。
+pub(crate) fn take_idle_waiting() -> bool {
+    idle_waiting_slot().swap(false, Ordering::AcqRel)
+}
+
 fn loongarch64_idle_relax() {
+    idle_waiting_slot().store(true, Ordering::Release);
     unsafe {
         // idle 任务运行在内核态，普通 trap/系统调用返回路径不会替它恢复
         // PRMD.PIE。进入 idle 等待窗口前必须临时打开 CRMD.IE，否则 timer
         // interrupt 不能唤醒 timed sleepers，阻塞 read/select 会永久睡眠。
         LoongArch64InterruptOps::enable_interrupts();
-        core::arch::asm!("idle 0", options(nomem, nostack, preserves_flags));
+        // 若 resched IPI 在 schedule_once 返回后、等待标记发布前到达，处理器
+        // 不会在内核态重入调度；这里的复查负责撤销即将发生的 WFI。
+        if !sched::needs_resched_current() {
+            core::arch::asm!("idle 0", options(nomem, nostack, preserves_flags));
+        }
         LoongArch64InterruptOps::disable_interrupts();
     }
+    idle_waiting_slot().store(false, Ordering::Release);
 }
 
 /// 把 [`LoongArch64TaskOps::set_kernel_trap_stack`] 拉成裸 `unsafe fn` 指针，

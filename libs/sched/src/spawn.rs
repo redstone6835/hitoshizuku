@@ -65,7 +65,10 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_leader(&child);
     }
-    tgroup.add_member(&child);
+    if !tgroup.try_add_member(&child) {
+        child.set_state(TaskState::Dead);
+        return child;
+    }
     pgroup.add_member(&child);
 
     parent.add_child(Arc::clone(&child));
@@ -166,10 +169,14 @@ pub fn abort_new_task(task: &Arc<Task>) {
         ns.registry().release(pid);
     }
     let group = task.thread_group();
-    group.cancel_member_accounting();
-    group.remove_member(task);
+    if group.remove_member(task) {
+        group.cancel_member_accounting();
+    }
     task.process_group().remove_member(task);
     task.set_state(TaskState::Dead);
+    if group.mark_terminated_if_all_members_terminal() {
+        notify_terminated_thread_group(&group);
+    }
 }
 
 // ── 完整 clone：处理 CLONE_* flags、ext hook、vfork ──────────────────────────
@@ -280,7 +287,10 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     if !flags.has(CloneFlags::CLONE_THREAD) {
         new_tg.set_leader(&child);
     }
-    new_tg.add_member(&child);
+    if !new_tg.try_add_member(&child) {
+        child.set_state(TaskState::Dead);
+        return child;
+    }
     pg.add_member(&child);
 
     // 8. 父登记（亲缘图保活）。CLONE_THREAD 线程不进入普通 child/wait 模型。
@@ -361,6 +371,38 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
 
 // ── exit / reap ──────────────────────────────────────────────────────────────
 
+/// 向单个可等待任务的父进程发布退出事件。
+fn notify_task_parent(task: &Arc<Task>) {
+    let Some(parent) = task.parent() else {
+        return;
+    };
+    let exit_sig = task.exit_signal();
+    if exit_sig > 0
+        && let Some(sig) = SignalNumber::from_raw(exit_sig)
+    {
+        let info = crate::signal::SigInfo {
+            sig,
+            code: 1, // CLD_EXITED
+            sender_pid: task.pid_root().unwrap_or(0),
+            sender_uid: crate::ids::Uid::ROOT,
+            raw: None,
+        };
+        parent.thread_group().shared_signal().deliver(info);
+        crate::scheduler::signal_wakeup(&parent, &info);
+    }
+    parent.exit_waiters.wake_all();
+}
+
+/// 最后一个线程完成退出后，重新发布此前被延迟的 leader 退出事件。
+fn notify_terminated_thread_group(group: &Arc<ThreadGroup>) {
+    let Some(leader) = group.leader() else {
+        return;
+    };
+    if leader.state() == TaskState::Zombie {
+        notify_task_parent(&leader);
+    }
+}
+
 /// 标记任务退出：出 runqueue、置 Zombie、唤醒 `exit_waiters`，把退出信号
 /// 投递给父，唤醒 vfork_done。**不**释放 pid 槽——zombie 期间父按 pid 仍能查到。
 ///
@@ -375,6 +417,9 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
         return;
     }
 
+    let group = task.thread_group();
+    let is_group_leader = task.is_thread_group_leader();
+
     task.cleanup_before_exit();
     crate::scheduler::deadline_admission().release(task);
 
@@ -388,7 +433,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
             // 已经是 Zombie 的子需要让 init 感知——否则它们的 SIGCHLD 之前投给
             // 了旧父，init 不会来 reap。这里只对刚被过继的 Zombie 重投一次。
             for c in children.iter() {
-                if c.state() == TaskState::Zombie {
+                if c.is_waitable_zombie() {
                     if let Some(sig) = SignalNumber::from_raw(SignalNumber::SIGCHLD.raw() as i32) {
                         let info = crate::signal::SigInfo {
                             sig,
@@ -406,6 +451,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     }
 
     mark_task_exited(task, code);
+    let group_terminated = group.mark_terminated_if_all_members_terminal();
     if !is_current_on_any_cpu(task) {
         task.cleanup_exit_extensions();
     }
@@ -416,37 +462,23 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
         task.vfork_done.wake_all();
     }
 
-    // 给父投递 exit_signal。
+    // CLONE_THREAD 成员的 exit_signal 为 0，直接释放独立 TID；线程组 leader
+    // 必须保留 Zombie/PID，直到所有成员终止后才允许父进程观察和回收。
     let exit_sig = task.exit_signal();
     if exit_sig == 0 {
         for (ns, pid) in task.pid_namespaces_snapshot() {
             ns.registry().release(pid);
         }
-        task.thread_group().remove_member(task);
+        group.remove_member(task);
         task.process_group().remove_member(task);
         task.set_state(TaskState::Dead);
-        return;
-    }
-    if exit_sig > 0 {
-        if let Some(parent) = task.parent() {
-            if let Some(sig) = SignalNumber::from_raw(exit_sig) {
-                let info = crate::signal::SigInfo {
-                    sig,
-                    code: 1, // CLD_EXITED
-                    sender_pid: task.pid_root().unwrap_or(0),
-                    sender_uid: crate::ids::Uid::ROOT,
-                    raw: None,
-                };
-                // 共享投递（thread-group level）：parent 任意线程能收到。
-                parent.thread_group().shared_signal().deliver(info);
-                crate::scheduler::signal_wakeup(&parent, &info);
-            }
-        }
+    } else if !is_group_leader {
+        // 非 leader 若显式携带退出信号，仍保持逐任务通知语义。
+        notify_task_parent(task);
     }
 
-    // 唤醒 parent 的 exit_waiters（wait4 / waitid 阻塞者）。
-    if let Some(parent) = task.parent() {
-        parent.exit_waiters.wake_all();
+    if group_terminated {
+        notify_terminated_thread_group(&group);
     }
 }
 
@@ -500,7 +532,7 @@ pub fn list_zombie_children(parent: &Arc<Task>) -> Vec<Arc<Task>> {
     parent
         .snapshot_children()
         .into_iter()
-        .filter(|c| c.is_user_task() && c.state() == TaskState::Zombie)
+        .filter(|c| c.is_user_task() && c.is_waitable_zombie())
         .collect()
 }
 

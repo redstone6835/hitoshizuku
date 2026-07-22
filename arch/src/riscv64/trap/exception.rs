@@ -45,10 +45,12 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
         sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}
@@ -73,10 +75,12 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     }
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}

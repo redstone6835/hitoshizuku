@@ -146,6 +146,17 @@ pub fn registered_count() -> usize {
         .count()
 }
 
+/// syscall 实现已经返回，此时深层调用栈中的 VmSpace/File 等临时 Arc 均已析构；
+/// 在这个边界消费 exit_group 请求，避免远程废弃另一个线程的 Rust 栈。
+fn complete_group_exit_at_boundary(ctx: &mut SyscallContext<'_>) {
+    if !sched::operation::complete_group_exit_if_requested(ctx.task()) {
+        return;
+    }
+    ctx.release_task_ref();
+    sched::schedule_once(0);
+    panic!("[syscall] group-exit task scheduled back unexpectedly");
+}
+
 // ── 3. 主分发 ────────────────────────────────────────────────────────────────
 
 /// arch 的 ECODE_SYS 分支调用。把 trap frame 翻成 [`SyscallContext`] 后查表
@@ -201,6 +212,8 @@ pub fn dispatch(tf: TrapFramePtr) {
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+
+    complete_group_exit_at_boundary(&mut ctx);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
@@ -303,6 +316,8 @@ where
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+
+    complete_group_exit_at_boundary(&mut ctx);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {

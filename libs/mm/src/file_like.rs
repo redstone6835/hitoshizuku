@@ -13,6 +13,21 @@ pub trait FileLike: Send + Sync {
     /// vnode 级身份，而不是单个打开描述符身份。
     fn cache_key(&self) -> usize;
 
+    /// 可供私有干净页缓存使用的稳定内容代际。
+    ///
+    /// 返回 `Some` 的实现必须在内容开始变化前先让本方法返回 `None`，并保证旧代际
+    /// 不会再次出现。无法提供这一保证的 FileLike 始终返回 `None`。
+    fn private_page_cache_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// 永久停止为该文件发布新的私有干净页缓存。
+    ///
+    /// 可写 `MAP_SHARED` 可能长期绕过 VFS 直接修改物理页，无法为每次 store
+    /// 发布短暂代际。VM 在这类映射生效前调用本 hook；实现应永久返回 `None`。
+    /// 该 hook 可能在 VMA 锁内执行，必须无阻塞且不能回调 VM。
+    fn disable_private_page_cache(&self) {}
+
     /// 从 `offset` 处读最多 `buf.len()` 字节到 `buf`，返回实际读取字节数。
     /// 短读允许；EOF 时返 0。
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno>;

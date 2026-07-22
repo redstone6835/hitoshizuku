@@ -650,6 +650,7 @@ impl File {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         let _pos_guard = self.pos_lock.lock();
+        let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
         if flags.append {
             let n = self.ops.write_at(buf, u64::MAX)?;
             let new_eof = self.inode.size();
@@ -707,6 +708,7 @@ impl File {
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
+        let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
         let n = self.ops.write_at(buf, offset)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
@@ -793,7 +795,9 @@ impl File {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         self.mount.check_writable()?;
-        self.inode.ops.truncate(&self.inode, size)
+        let _data_mutation = self.inode.begin_data_mutation();
+        self.inode.ops.truncate(&self.inode, size)?;
+        Ok(())
     }
 
     /// 按指定模式调整文件范围的底层存储。是否支持由具体文件系统决定。
@@ -811,7 +815,9 @@ impl File {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
         self.mount.check_writable()?;
-        self.ops.fallocate(mode, offset, len)
+        let _data_mutation = self.inode.begin_data_mutation();
+        self.ops.fallocate(mode, offset, len)?;
+        Ok(())
     }
 
     /// 将文件操作对象向下转型为具体驱动类型 `T`。
@@ -995,6 +1001,17 @@ impl Drop for File {
 impl ::mm::FileLike for File {
     fn cache_key(&self) -> usize {
         Arc::as_ptr(&self.inode) as usize
+    }
+
+    fn private_page_cache_generation(&self) -> Option<u64> {
+        (self.inode.kind() == crate::vfs::stat::FileType::Regular
+            && self.inode.ops.supports_private_page_cache())
+        .then(|| self.inode.private_page_cache_generation())
+        .flatten()
+    }
+
+    fn disable_private_page_cache(&self) {
+        self.inode.disable_private_page_cache();
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, errno::Errno> {

@@ -45,7 +45,9 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -174,6 +176,18 @@ pub struct Inode {
     /// `meta.nlink` 的原子镜像，用于 link/unlink/evict 相关热路径。
     cached_nlink: AtomicU32,
 
+    /// 文件内容代际。每轮可能修改数据或长度的操作结束后递增，供私有 mmap
+    /// 干净页缓存拒绝操作前的旧快照；失败也递增以覆盖部分写副作用。
+    data_generation: AtomicU64,
+
+    /// 正在修改内容的 VFS 操作数量。非零期间私有缺页只能生成
+    /// 不发布到跨地址空间缓存的临时快照；可写 MAP_SHARED 由下方的永久 latch 处理。
+    data_mutations: AtomicUsize,
+
+    /// 可写 MAP_SHARED 一旦生效便永久置位。用户 store 不再经过 VFS，无法安全
+    /// 判断最后一次修改何时完成，因此该 inode 生命周期内不再恢复私有页缓存。
+    private_page_cache_disabled: AtomicBool,
+
     /// 普通文件的写打开与执行映像排斥状态。
     ///
     /// 正值表示当前持有写访问的打开文件描述数量，负值表示当前引用该 inode 的
@@ -198,6 +212,20 @@ pub struct Inode {
     /// - ORPHANED: 已从命名空间摘除，等待最后一个强引用释放；
     /// - EVICTED: 已执行底层资源回收。
     lifecycle: AtomicU8,
+}
+
+/// 文件内容发布区间的 RAII guard。只对显式声明支持私有页缓存的普通文件激活。
+pub(crate) struct InodeDataMutation<'a> {
+    inode: &'a Inode,
+    active: bool,
+}
+
+impl Drop for InodeDataMutation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.inode.end_data_mutation_raw();
+        }
+    }
 }
 
 impl Inode {
@@ -226,6 +254,9 @@ impl Inode {
             meta: crate::vfs::sync::Spinlock::new(meta),
             cached_size: AtomicU64::new(meta.size),
             cached_nlink: AtomicU32::new(meta.nlink),
+            data_generation: AtomicU64::new(1),
+            data_mutations: AtomicUsize::new(0),
+            private_page_cache_disabled: AtomicBool::new(false),
             exec_write_state: AtomicIsize::new(0),
             ops,
             superblock,
@@ -251,6 +282,83 @@ impl Inode {
     /// 返回当前硬链接计数的无锁快照。
     pub fn nlink(&self) -> u32 {
         self.cached_nlink.load(Ordering::Acquire)
+    }
+
+    /// 返回当前文件内容代际的无锁快照。
+    pub fn data_generation(&self) -> u64 {
+        self.data_generation.load(Ordering::Acquire)
+    }
+
+    /// 发布一轮已经结束的数据或长度修改尝试。
+    pub(crate) fn bump_data_generation(&self) {
+        if self
+            .data_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            // 代际不能回绕后重用旧 key；饱和后保守地永久停止发布。
+            self.private_page_cache_disabled
+                .store(true, Ordering::Release);
+        }
+    }
+
+    /// 返回可用于私有干净页缓存的稳定代际。
+    ///
+    /// 两次读取 active 夹住 generation，覆盖写者在第一次检查后才开始的窗口；
+    /// VM 在读取文件页之后还会再次验证同一代际，形成完整的乐观快照协议。
+    pub(crate) fn private_page_cache_generation(&self) -> Option<u64> {
+        if self.private_page_cache_disabled.load(Ordering::Acquire)
+            || self.data_mutations.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        let generation = self.data_generation();
+        (!self.private_page_cache_disabled.load(Ordering::Acquire)
+            && self.data_mutations.load(Ordering::Acquire) == 0)
+            .then_some(generation)
+    }
+
+    fn begin_data_mutation_raw(&self) {
+        self.data_mutations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn end_data_mutation_raw(&self) {
+        // 必须先推进代际再撤销最后一个 active，防止读者观察到“稳定的旧代际”。
+        self.bump_data_generation();
+        let previous = self.data_mutations.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "[vfs] data mutation publication underflow");
+    }
+
+    fn private_page_cache_supported(&self) -> bool {
+        self.kind == FileType::Regular && self.ops.supports_private_page_cache()
+    }
+
+    /// 在可能修改文件内容的 VFS 调用前建立发布 guard。失败路径也会推进代际，
+    /// 因为文件系统错误可能发生在已经写入部分块之后。
+    pub(crate) fn begin_data_mutation(&self) -> InodeDataMutation<'_> {
+        let active = self.private_page_cache_supported();
+        if active {
+            self.begin_data_mutation_raw();
+        }
+        InodeDataMutation {
+            inode: self,
+            active,
+        }
+    }
+
+    /// 在可写共享映射生效前永久关闭私有干净页缓存。先置 latch 再推进代际，
+    /// 与 VM 发布候选页前的二次 generation 检查共同封闭并发窗口。
+    pub(crate) fn disable_private_page_cache(&self) {
+        if self.private_page_cache_supported()
+            && self
+                .private_page_cache_disabled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.bump_data_generation();
+        }
     }
 
     /// 获取普通文件写访问租约。
@@ -595,6 +703,14 @@ impl Drop for Inode {
 /// NotSupported 错误的默认实现，只读文件系统只需实现 lookup、readlink 和 open
 /// 等读取类方法即可。
 pub trait InodeOps {
+    /// 是否保证普通文件内容的每次变化都经由 VFS 数据代际发布。
+    ///
+    /// 默认关闭，避免 procfs、sysfs 和设备文件等动态内容被跨地址空间复用。
+    /// 只有内容变化完全受 VFS write/truncate/fallocate 路径约束的文件系统才能开启。
+    fn supports_private_page_cache(&self) -> bool {
+        false
+    }
+
     /// 在当前目录中按名称查找子项。
     ///
     /// name 是单个路径分量（不含路径分隔符），例如 "etc" 或 "passwd"。如果目录中

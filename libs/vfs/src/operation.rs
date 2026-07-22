@@ -270,8 +270,14 @@ pub fn openat_with_lookup_flags(
         None
     };
 
+    // guard 覆盖驱动 open 内可能重复执行的 O_TRUNC；即使失败也发布新代际，
+    // 防止已产生部分副作用的文件页进入私有缓存。
+    let truncates_data =
+        flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular;
+    let _data_mutation = truncates_data.then(|| inode.begin_data_mutation());
+
     // ── O_TRUNC ──
-    if flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular {
+    if truncates_data {
         inode.ops.truncate(&inode, 0)?;
     }
 
@@ -1008,7 +1014,9 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
     } else {
         None
     };
-    inode.ops.truncate(&inode, size)
+    let _data_mutation = inode.begin_data_mutation();
+    inode.ops.truncate(&inode, size)?;
+    Ok(())
 }
 
 // ── utimes ────────────────────────────────────────────────────────────────────
