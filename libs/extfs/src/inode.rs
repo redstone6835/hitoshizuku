@@ -1,7 +1,7 @@
 //! ext2/3/4 inode 加载/写回 + VFS `InodeOps` 实现。
 //!
 //! 运行时每个 `Inode` 持有一个 `Spinlock<RawInode>`(完整磁盘字节),所有写
-//! 路径先改内存副本,调用 [`inode_wr::write_raw`] 落盘,最后同步到 VFS
+//! 路径先改内存副本,调用 [`FsState::publish_inode_write`] 发布,最后同步到 VFS
 //! [`vfs::inode::Inode`] 的镜像字段(`size`/`nlink`/...)。
 //!
 //! 写路径统一的"降级策略":改写 extent 文件时必须保留仍在文件尺寸内的
@@ -21,7 +21,7 @@ use vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use vfs::stat::{DevId, FileMode, FileType, Timespec};
 use vfs::sync::{Spinlock, SpinlockGuard};
 
-use crate::inode_wr::{RawInode, read_raw, write_raw};
+use crate::inode_wr::{RawInode, read_raw};
 use crate::layout::*;
 use crate::state::{BlockBackendError, FsState, map_err};
 use crate::{alloc_mod, dir_wr, extent_wr, map_wr};
@@ -369,7 +369,7 @@ fn create_disk_inode(
         // linux 默认 32(至少覆盖 atime_extra/ctime_extra/...);我们用 32
         raw.bytes[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
     }
-    write_raw(state, &raw)?;
+    state.publish_inode_write(&raw)?;
     Ok(raw)
 }
 
@@ -481,7 +481,7 @@ impl InodeOps for ExtInodeOps {
         parent.set_flags(pflags);
         parent.set_size(new_size);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -532,7 +532,7 @@ impl InodeOps for ExtInodeOps {
         new_raw.i_block_mut()[0..4].copy_from_slice(&(block as u32).to_le_bytes());
         new_raw.set_size(self.state.ext_sb.block_size as u64);
         new_raw.set_blocks_lo((self.state.ext_sb.block_size / 512) as u32);
-        write_raw(&self.state, &new_raw).map_err(map_err)?;
+        self.state.publish_inode_write(&new_raw).map_err(map_err)?;
 
         // 父目录:插 entry + nlink++
         let mut parent = lock_raw(&self.raw);
@@ -556,7 +556,7 @@ impl InodeOps for ExtInodeOps {
         let new_nl = parent.nlink() + 1;
         parent.set_nlink(new_nl);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -591,7 +591,7 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&pi_block);
         parent.set_flags(pflags);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -604,7 +604,7 @@ impl InodeOps for ExtInodeOps {
         let mut traw = lock_raw(&t_ops.raw);
         let nl = traw.nlink().saturating_sub(1);
         traw.set_nlink(nl);
-        write_raw(&self.state, &traw).map_err(map_err)?;
+        self.state.publish_inode_write(&traw).map_err(map_err)?;
         sync_vfs_meta(&target, &traw);
         drop(traw);
         Ok(())
@@ -649,7 +649,7 @@ impl InodeOps for ExtInodeOps {
         let pn = parent.nlink().saturating_sub(1);
         parent.set_nlink(pn);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -657,7 +657,7 @@ impl InodeOps for ExtInodeOps {
         // 数据块和 inode 位图必须等最后一个打开引用释放时由 evict() 回收。
         let mut traw = lock_raw(&t_ops.raw);
         traw.set_nlink(0);
-        write_raw(&self.state, &traw).map_err(map_err)?;
+        self.state.publish_inode_write(&traw).map_err(map_err)?;
         sync_vfs_meta(&target, &traw);
         drop(traw);
         Ok(())
@@ -702,7 +702,7 @@ impl InodeOps for ExtInodeOps {
             new_raw.i_block_mut()[0..4].copy_from_slice(&(block as u32).to_le_bytes());
             new_raw.set_blocks_lo((self.state.ext_sb.block_size / 512) as u32);
         }
-        write_raw(&self.state, &new_raw).map_err(map_err)?;
+        self.state.publish_inode_write(&new_raw).map_err(map_err)?;
 
         // 父目录插 entry
         let mut parent = lock_raw(&self.raw);
@@ -724,7 +724,7 @@ impl InodeOps for ExtInodeOps {
         parent.set_flags(pflags);
         parent.set_size(new_size);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -762,7 +762,7 @@ impl InodeOps for ExtInodeOps {
         if let Some((old, new)) = encoded_device {
             new_raw.i_block_mut()[0..4].copy_from_slice(&old.to_le_bytes());
             new_raw.i_block_mut()[4..8].copy_from_slice(&new.to_le_bytes());
-            write_raw(&self.state, &new_raw).map_err(map_err)?;
+            self.state.publish_inode_write(&new_raw).map_err(map_err)?;
         }
 
         let mut parent = lock_raw(&self.raw);
@@ -784,7 +784,7 @@ impl InodeOps for ExtInodeOps {
         parent.set_flags(parent_flags);
         parent.set_size(new_size);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -811,7 +811,7 @@ impl InodeOps for ExtInodeOps {
             let mut traw = lock_raw(&t_ops.raw);
             let new_nl = traw.nlink() + 1;
             traw.set_nlink(new_nl);
-            write_raw(&self.state, &traw).map_err(map_err)?;
+            self.state.publish_inode_write(&traw).map_err(map_err)?;
         }
         sync_vfs_meta(target, &lock_raw(&t_ops.raw));
 
@@ -844,7 +844,7 @@ impl InodeOps for ExtInodeOps {
         parent.set_flags(pflags);
         parent.set_size(new_size);
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         Ok(())
     }
@@ -935,7 +935,7 @@ impl InodeOps for ExtInodeOps {
                 ndir.set_nlink(nl);
             }
             refresh_blocks_lo(&self.state, &mut ndir).map_err(map_err)?;
-            write_raw(&self.state, &ndir).map_err(map_err)?;
+            self.state.publish_inode_write(&ndir).map_err(map_err)?;
             sync_vfs_meta(new_dir, &ndir);
         }
         // 从源目录移除 old_name 条目;跨目录时顺手减 nlink
@@ -976,7 +976,7 @@ impl InodeOps for ExtInodeOps {
             parent.i_block_mut().copy_from_slice(&ib);
             parent.set_flags(flags);
             refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-            write_raw(&self.state, &parent).map_err(map_err)?;
+            self.state.publish_inode_write(&parent).map_err(map_err)?;
             sync_vfs_meta(inode, &parent);
         }
 
@@ -1058,7 +1058,7 @@ impl InodeOps for ExtInodeOps {
         }
         // new_size > cur_size:不分配新块,读路径返回零;下次 write 触及再补。
         raw.set_size(new_size);
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1077,7 +1077,7 @@ impl InodeOps for ExtInodeOps {
         if let Some(ts) = mtime {
             raw.set_mtime_sec(ts.secs);
         }
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1087,7 +1087,7 @@ impl InodeOps for ExtInodeOps {
         let mut raw = lock_raw(&self.raw);
         let cur = raw.mode();
         raw.set_mode((cur & S_IFMT) | (mode.bits() & 0o7777));
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1101,7 +1101,7 @@ impl InodeOps for ExtInodeOps {
         if let Some(g) = gid {
             raw.set_gid(g.0);
         }
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1177,7 +1177,7 @@ impl InodeOps for ExtInodeOps {
             return;
         }
         clear_deleted_inode(&mut raw);
-        if write_raw(&self.state, &raw).is_err() {
+        if self.state.publish_inode_write(&raw).is_err() {
             return;
         }
         drop(raw);

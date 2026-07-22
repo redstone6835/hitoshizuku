@@ -341,10 +341,17 @@ impl Dentry {
     /// 对没有持久化后端的文件系统（tmpfs / ramfs / devtmpfs），驱逐 positive
     /// Dentry 等同于删除文件——Superblock 的 inode_cache 持有的是 Weak 引用，
     /// Dentry 是 Inode 的唯一强引用持有者。一旦驱逐，inode 被 drop，文件数据
-    /// 永久丢失。
-    pub fn is_evictable(&self) -> bool {
+    /// 永久丢失。是否能安全重建由具体文件系统显式声明，不能用
+    /// `dev_id` 推断；后者只描述 `stat(2)` 的设备号来源。
+    ///
+    /// 正向项只有在缓存是唯一强引用时才可驱逐，避免让挂载点、当前
+    /// 工作目录或正在路径遍历中的 Dentry 与重建后的新对象失联。
+    pub fn is_evictable(self: &Arc<Self>) -> bool {
         if self.state_flag.load(Ordering::Acquire) != STATE_POSITIVE {
             return true;
+        }
+        if Arc::strong_count(self) != 1 {
+            return false;
         }
         let Some(inode) = self.inode.as_ref() else {
             return true;
@@ -352,7 +359,7 @@ impl Dentry {
         let Some(sb) = inode.superblock() else {
             return true;
         };
-        sb.dev_id.is_some()
+        sb.ops.can_evict_positive_dentry()
     }
 
     /// 将 Dentry 标记为失效（文件被删除时调用）。
@@ -712,10 +719,12 @@ impl DentryShard {
         }
     }
 
-    /// 机会式驱逐一个无效或负向条目，优先驱逐已经失效的缓存项。
+    /// 机会式驱逐一个无效或负向条目。
     fn evict_one_non_positive(&mut self) -> Option<Arc<Dentry>> {
-        self.evict_from_cursor(|dentry| dentry.is_invalid())
-            .or_else(|| self.evict_from_cursor(|dentry| dentry.is_negative()))
+        if self.non_positive_count == 0 {
+            return None;
+        }
+        self.evict_from_cursor(|dentry| !dentry.is_positive())
     }
 
     fn evict_one_any(&mut self) -> Option<Arc<Dentry>> {

@@ -1,6 +1,7 @@
 extern crate std;
 
 mod test_cred;
+mod test_dentry;
 mod test_epoll;
 mod test_fdtable;
 mod test_limits;
