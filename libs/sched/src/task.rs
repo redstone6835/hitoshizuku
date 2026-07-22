@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 
 use crate::arch_hooks;
@@ -612,6 +612,10 @@ pub struct Task {
     current_cpu: AtomicUsize,
     /// CPU、调度域、拓扑代际和迁移状态的一致调度归属快照。
     placement: TaskPlacement,
+    /// 硬 IRQ 延迟唤醒链表节点。queued 位合并同一任务的重复唤醒，额外 Arc
+    /// 在安全调度边界消费前保持任务存活。
+    deferred_wake_next: AtomicPtr<Task>,
+    deferred_wake_queued: AtomicBool,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
     /// 当前任务允许的定时器松弛量，以及 `PR_SET_TIMERSLACK(0)` 使用的默认值。
@@ -718,6 +722,8 @@ impl Task {
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
             placement: TaskPlacement::unbound(),
+            deferred_wake_next: AtomicPtr::new(core::ptr::null_mut()),
+            deferred_wake_queued: AtomicBool::new(false),
             ioprio: AtomicU32::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
@@ -1655,6 +1661,25 @@ impl Task {
 
     pub fn placement(&self) -> PlacementSnapshot {
         self.placement.snapshot()
+    }
+
+    pub(crate) fn try_begin_deferred_wake(&self) -> bool {
+        self.deferred_wake_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn set_deferred_wake_next(&self, next: *mut Task) {
+        self.deferred_wake_next.store(next, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_deferred_wake_next(&self) -> *mut Task {
+        self.deferred_wake_next
+            .swap(core::ptr::null_mut(), Ordering::Relaxed)
+    }
+
+    pub(crate) fn finish_deferred_wake(&self) {
+        self.deferred_wake_queued.store(false, Ordering::Release);
     }
 
     pub(crate) fn bind_placement(

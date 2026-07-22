@@ -112,7 +112,7 @@ pub use scheduler::{
 pub use scheduler::{
     NR_CPUS, activate_cpu, active_cpu_mask, balance_once, current_cpu_id, current_task,
     current_task_cpu_time_ns, current_task_fast, current_task_id, current_task_on,
-    current_task_ref, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
+    current_task_ref, defer_task_wake, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
     enqueue_task_preferred, enqueue_task_with_hint, idle_task, init, init_task, install_idle,
     is_cpu_active, is_cpu_online, is_ready, mark_cpu_online, migrate_task, needs_resched,
     needs_resched_current, now_ns_public, offline_cpu, on_timer_tick, online_cpu_mask, pid_count,

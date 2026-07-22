@@ -232,6 +232,8 @@ static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
 static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
 static DEFERRED_TIMER_TICK_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static DEFERRED_TASK_WAKES: [AtomicPtr<Task>; NR_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; NR_CPUS];
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────────────
 
@@ -1210,6 +1212,54 @@ pub fn request_post_syscall_handoff() {
     request_resched(cpu_id);
 }
 
+/// 硬 IRQ 使用的无锁任务唤醒入口。
+///
+/// IRQ 可能打断持有 topology 或 runqueue 普通自旋锁的路径，不能原地调用
+/// `activate_task`。这里仅发布一份 Arc 到目标 CPU 的 Treiber 链表并请求调度；
+/// 真正入队由 `schedule_once` 在无调度锁边界完成。
+pub fn defer_task_wake(task: &Arc<Task>) {
+    if !INIT_READY.load(Ordering::Acquire) || !task.try_begin_deferred_wake() {
+        return;
+    }
+    // 先挂到当前 IRQ 所在 CPU，确保该 CPU 返回安全调度边界时一定能消费；
+    // 真正入队仍按任务 placement 选择目标 CPU，并在需要时发送远端 IPI。
+    let target = cpu();
+    let raw = Arc::into_raw(Arc::clone(task)).cast_mut();
+    let head = &DEFERRED_TASK_WAKES[target];
+    let mut observed = head.load(Ordering::Acquire);
+    loop {
+        task.set_deferred_wake_next(observed);
+        match head.compare_exchange_weak(observed, raw, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => observed = actual,
+        }
+    }
+    request_resched(target);
+}
+
+fn drain_deferred_task_wakes() {
+    let mut raw = DEFERRED_TASK_WAKES[cpu()].swap(core::ptr::null_mut(), Ordering::AcqRel);
+    while !raw.is_null() {
+        // Safety: 节点由 defer_task_wake 的 Arc::into_raw 创建，本消费者对从
+        // per-CPU head 摘下的链表拥有对应强引用。
+        let task = unsafe { Arc::from_raw(raw) };
+        raw = task.take_deferred_wake_next();
+        task.finish_deferred_wake();
+        if task.arch_context().is_some()
+            && matches!(
+                task.state(),
+                TaskState::New | TaskState::Runnable | TaskState::Sleeping
+            )
+        {
+            #[cfg(feature = "performance-profile")]
+            if task.state() == TaskState::Sleeping {
+                task.mark_profile_woken(now_ns_internal());
+            }
+            let _ = enqueue_task_on_scheduler(&SCHEDULER, task, now_ns_internal(), false, true);
+        }
+    }
+}
+
 fn cleanup_retired_tasks(cpu_id: usize) {
     let retired = SCHEDULER.cpu_or_boot(cpu_id).take_retired();
     for task in retired.iter() {
@@ -1391,6 +1441,38 @@ pub(crate) fn enqueue_task_on_scheduler(
         }
         return cpu_id;
     };
+
+    // 普通睡眠任务的 placement 已经提交，且有效时拓扑规则必然保留原 CPU。
+    // IRQ/timer 唤醒不能为了得到同一结论再读取 topology 和所有远端 rq 锁；
+    // 这些普通 Spinlock 可能正被被中断路径持有。Deadline 任务仍由准入表决定。
+    if task.sched.class() != SchedClass::Deadline {
+        let placement = task.placement();
+        let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+        if placement.state == crate::PlacementState::Bound
+            && let Some(cpu) = placement.cpu
+            && scheduler.active_set().contains(cpu)
+            && affinity.contains(cpu)
+        {
+            let cpu_state = scheduler.cpu_or_boot(cpu.get());
+            let _enqueue_guard = cpu_state.begin_enqueue();
+            if scheduler.active_set().contains(cpu)
+                && CpuMask::from_bits_or_boot(task.cpu_affinity()).contains(cpu)
+                && task.placement() == placement
+            {
+                let queued = if preferred {
+                    cpu_state
+                        .runqueue()
+                        .enqueue_preferred(Arc::clone(&task), now_ns)
+                } else {
+                    cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
+                };
+                if queued && request_reschedule {
+                    cpu_state.request_resched();
+                }
+                return cpu.get();
+            }
+        }
+    }
 
     for _ in 0..NR_CPUS {
         let cpu_id = scheduler
@@ -2270,8 +2352,15 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn schedule_once(now_ns: u64) {
-    drain_deferred_timer_tick();
+    drain_deferred_task_wakes();
     let cpu_id = cpu();
+    // 用户 syscall 进入 S-mode 后会保持本地中断关闭。若多个可运行任务持续在
+    // 阻塞 syscall 与内核 worker 之间切换，CPU 可能长期不回 idle/user，硬件
+    // timer 只能保持 pending。调度边界本身已经是无锁安全点，因此用单调时钟
+    // 主动推进 sleeper/ITIMER_REAL，不能只依赖已经实际进入过的 timer IRQ。
+    let deferred_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id]);
+    let timer_now_ns = now_ns_internal().max(now_ns).max(deferred_ns);
+    service_expired_timer_events(timer_now_ns, cpu_id);
     cleanup_retired_tasks(cpu_id);
 
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
@@ -2437,14 +2526,19 @@ pub(crate) fn take_deferred_timer_tick(slot: &AtomicU64) -> u64 {
 }
 
 fn on_timer_tick_inner(now_ns: u64) -> bool {
-    fire_expired_deadline_observers(now_ns);
     let cpu_id = cpu();
-    let deadline_fired = wake_expired_sleepers(now_ns, cpu_id);
-    let realtime_fired = fire_expired_realtime_itimers(now_ns, cpu_id);
-    reprogram_deadline_timer();
+    let fired = service_expired_timer_events(now_ns, cpu_id);
     if SCHEDULER.cpu_or_boot(cpu_id).runqueue().tick(now_ns) {
         request_resched(cpu_id);
     }
+    fired
+}
+
+fn service_expired_timer_events(now_ns: u64, cpu_id: usize) -> bool {
+    fire_expired_deadline_observers(now_ns);
+    let deadline_fired = wake_expired_sleepers(now_ns, cpu_id);
+    let realtime_fired = fire_expired_realtime_itimers(now_ns, cpu_id);
+    reprogram_deadline_timer();
     deadline_fired || realtime_fired
 }
 

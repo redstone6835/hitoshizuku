@@ -449,6 +449,21 @@ fn task_enqueue_falls_back_when_previous_cpu_is_inactive() {
 }
 
 #[ktest]
+fn sleeping_task_enqueue_keeps_active_current_cpu() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_state(TaskState::Sleeping);
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+
+    let cpu_id = enqueue_task_on_scheduler(&scheduler, Arc::clone(&task), 1, false, true);
+
+    assert_eq!(cpu_id, 1);
+    assert_eq!(task.placement().cpu, CpuId::new(1));
+    assert!(scheduler.cpu_or_boot(1).runqueue().dequeue_queued(&task, 2));
+}
+
+#[ktest]
 fn balance_requeue_avoids_inactive_source_cpu() {
     let scheduler = two_cpu_scheduler();
     let task = make_task();
