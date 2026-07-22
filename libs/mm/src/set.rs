@@ -87,11 +87,12 @@ impl VmaSet {
         if !area.is_well_formed() {
             return Err(Errno::EINVAL);
         }
-        if self.iter_overlap(&area.range).next().is_some() {
+        if self.overlaps_range(&area.range) {
             return Err(Errno::EEXIST);
         }
-        self.tree.insert(area.range.start, area);
-        self.merge_neighbors();
+        let key = area.range.start;
+        self.tree.insert(key, area);
+        self.merge_around(key);
         Ok(())
     }
 
@@ -168,7 +169,7 @@ impl VmaSet {
     /// `range` 是否完全没有被任何 VMA 占用。
     #[kernel_symbols::export(name = "mm.set.VmaSet.is_range_free", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_range_free(&self, range: &Range<usize>) -> bool {
-        range.start < range.end && self.iter_overlap(range).next().is_none()
+        range.start < range.end && !self.overlaps_range(range)
     }
 
     /// `range` 是否被现有 VMA 连续覆盖，中间不允许有洞。
@@ -320,76 +321,12 @@ impl VmaSet {
     /// 典型调用点：insert 之后的紧邻合并；批量 unmap 之后的收尾。
     #[kernel_symbols::export(name = "mm.set.VmaSet.merge_neighbors", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn merge_neighbors(&mut self) {
-        loop {
-            let keys: Vec<usize> = self.tree.keys().copied().collect();
-            let mut merged = false;
-            for pair in keys.windows(2) {
-                let k_left = pair[0];
-                let k_right = pair[1];
-                let (can_merge, new_end) = match (self.tree.get(&k_left), self.tree.get(&k_right)) {
-                    (Some(l), Some(r)) => {
-                        if !l.is_well_formed() || !r.is_well_formed() {
-                            (false, 0)
-                        } else {
-                            let left_len = l.range.end - l.range.start;
-                            let adjacent = l.range.end == r.range.start;
-                            let same_flags = l.flags == r.flags;
-                            let same_backing = match (&l.backing, &r.backing) {
-                                (
-                                    crate::area::VmBacking::Anon {
-                                        merge_domain: left_domain,
-                                    },
-                                    crate::area::VmBacking::Anon {
-                                        merge_domain: right_domain,
-                                    },
-                                ) => left_domain.can_merge(*right_domain),
-                                (
-                                    crate::area::VmBacking::SharedAnon {
-                                        object: il,
-                                        offset: ol,
-                                    },
-                                    crate::area::VmBacking::SharedAnon {
-                                        object: ir,
-                                        offset: or,
-                                    },
-                                ) => {
-                                    alloc::sync::Arc::ptr_eq(il, ir)
-                                        && checked_offset_after(*ol, left_len) == Some(*or)
-                                }
-                                (
-                                    crate::area::VmBacking::File {
-                                        file: fl,
-                                        offset: ol,
-                                    },
-                                    crate::area::VmBacking::File {
-                                        file: fr,
-                                        offset: or,
-                                    },
-                                ) => {
-                                    alloc::sync::Arc::ptr_eq(fl, fr)
-                                        && checked_offset_after(*ol, left_len) == Some(*or)
-                                }
-                                (
-                                    crate::area::VmBacking::Direct(bl),
-                                    crate::area::VmBacking::Direct(br),
-                                ) => bl.checked_add(left_len) == Some(*br),
-                                _ => false,
-                            };
-                            (adjacent && same_flags && same_backing, r.range.end)
-                        }
-                    }
-                    _ => (false, 0),
-                };
-                if can_merge {
-                    let _right = self.tree.remove(&k_right);
-                    let left = self.tree.get_mut(&k_left).unwrap();
-                    left.range.end = new_end;
-                    merged = true;
-                    break;
-                }
-            }
-            if !merged {
-                break;
+        let Some(mut left_key) = self.tree.keys().next().copied() else {
+            return;
+        };
+        while let Some(right_key) = self.next_key(left_key) {
+            if !self.try_merge_pair(left_key, right_key) {
+                left_key = right_key;
             }
         }
     }
@@ -416,6 +353,102 @@ impl VmaSet {
     /// 只读迭代全部 VMA，按起址升序。
     pub fn iter(&self) -> impl Iterator<Item = &VmArea> + '_ {
         self.tree.values()
+    }
+
+    /// 只检查目标区间的即时前驱与首个区间内起点，避免从树首扫描。
+    fn overlaps_range(&self, range: &Range<usize>) -> bool {
+        self.tree
+            .range(..range.start)
+            .next_back()
+            .is_some_and(|(_, left)| left.range.end > range.start)
+            || self.tree.range(range.clone()).next().is_some()
+    }
+
+    fn next_key(&self, key: usize) -> Option<usize> {
+        self.tree.range(key..).nth(1).map(|(next, _)| *next)
+    }
+
+    fn try_merge_pair(&mut self, left_key: usize, right_key: usize) -> bool {
+        let new_end = match (self.tree.get(&left_key), self.tree.get(&right_key)) {
+            (Some(left), Some(right)) if can_merge_areas(left, right) => right.range.end,
+            _ => return false,
+        };
+        let _right = self
+            .tree
+            .remove(&right_key)
+            .expect("checked right VMA must exist");
+        self.tree
+            .get_mut(&left_key)
+            .expect("checked left VMA must exist")
+            .range
+            .end = new_end;
+        true
+    }
+
+    /// 插入后只规整与新节点相连的局部邻居。
+    fn merge_around(&mut self, mut key: usize) {
+        if let Some(left_key) = self.tree.range(..key).next_back().map(|(left, _)| *left)
+            && self.try_merge_pair(left_key, key)
+        {
+            key = left_key;
+        }
+        while let Some(right_key) = self.next_key(key) {
+            if !self.try_merge_pair(key, right_key) {
+                break;
+            }
+        }
+    }
+}
+
+fn can_merge_areas(left: &VmArea, right: &VmArea) -> bool {
+    if !left.is_well_formed()
+        || !right.is_well_formed()
+        || left.range.end != right.range.start
+        || left.flags != right.flags
+    {
+        return false;
+    }
+
+    let left_len = left.range.end - left.range.start;
+    match (&left.backing, &right.backing) {
+        (
+            VmBacking::Anon {
+                merge_domain: left_domain,
+            },
+            VmBacking::Anon {
+                merge_domain: right_domain,
+            },
+        ) => left_domain.can_merge(*right_domain),
+        (
+            VmBacking::SharedAnon {
+                object: left_object,
+                offset: left_offset,
+            },
+            VmBacking::SharedAnon {
+                object: right_object,
+                offset: right_offset,
+            },
+        ) => {
+            alloc::sync::Arc::ptr_eq(left_object, right_object)
+                && checked_offset_after(*left_offset, left_len) == Some(*right_offset)
+        }
+        (
+            VmBacking::File {
+                file: left_file,
+                offset: left_offset,
+            },
+            VmBacking::File {
+                file: right_file,
+                offset: right_offset,
+            },
+        ) => {
+            alloc::sync::Arc::ptr_eq(left_file, right_file)
+                && checked_offset_after(*left_offset, left_len) == Some(*right_offset)
+        }
+        (VmBacking::Direct(left_base), VmBacking::Direct(right_base)) => {
+            left_base.checked_add(left_len) == Some(*right_base)
+        }
+        _ => false,
     }
 }
 

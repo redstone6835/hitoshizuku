@@ -437,8 +437,14 @@ pub fn init_kernel_page_table() {
 pub(crate) unsafe fn activate_kernel_page_table_for_secondary() {
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     assert_ne!(root_paddr, 0, "[smp] kernel page table is not ready");
+    // 先把逻辑地址空间切为内核。调度器已经发布 next，当前 CPU 不会再访问旧
+    // 用户地址；紧随其后的 dbar + 完整 invtlb 会在任何后续用户执行前清除旧状态。
+    super::smp::publish_current_logical_asid(super::asid_tracker::KERNEL_LOGICAL_ASID);
     unsafe {
-        LoongArch64Paging::activate(PhysPageTableRoot::new(root_paddr));
+        LoongArch64Paging::activate_with_asid(
+            PhysPageTableRoot::new(root_paddr),
+            super::asid_tracker::KERNEL_LOGICAL_ASID,
+        );
     }
 }
 

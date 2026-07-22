@@ -118,32 +118,32 @@ fn allocate_page_table_page() -> Result<usize, general::MapError> {
     Ok(allocation.paddr)
 }
 
-fn flush_user_tlb_range(asid: usize, active_cpus: usize, vaddr: usize, len: usize) {
+fn flush_user_tlb_range(asid: usize, target_cpus: usize, vaddr: usize, len: usize) {
     if len == 0 {
         return;
     }
     let page_size = LoongArch64Paging::PAGE_SIZE;
     let Some(end) = vaddr.checked_add(len) else {
-        // Safety: 激活位图单调增长，完整失效覆盖该 ASID 的所有历史执行 CPU。
-        unsafe { LoongArch64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
+        // Safety: 动态目标包含仍可能在下一次完整激活失效前执行该 ASID 的 CPU。
+        unsafe { LoongArch64Paging::flush_tlb_with_asid_on_cpus(asid, None, target_cpus) };
         return;
     };
     let aligned_start = vaddr & !(page_size - 1);
     let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
     if pages == 1 {
-        // Safety: 激活位图单调增长，包含所有可能缓存过该 ASID 的 CPU。
+        // Safety: 动态目标包含仍可能在下一次完整激活失效前执行该 ASID 的 CPU。
         unsafe {
             LoongArch64Paging::flush_tlb_with_asid_on_cpus(
                 asid,
                 Some(VirtAddr::new(aligned_start)),
-                active_cpus,
+                target_cpus,
             )
         };
     } else {
         // 远端 LoongArch IPI 没有携带地址范围，接收端本来就执行完整失效。多页
         // 范围只发布一次完整请求，避免把一次 munmap 放大为最多 64 轮全核 IPI。
-        // Safety: 激活位图单调增长，完整失效覆盖该 ASID 的所有历史执行 CPU。
-        unsafe { LoongArch64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
+        // Safety: 动态目标包含仍可能在下一次完整激活失效前执行该 ASID 的 CPU。
+        unsafe { LoongArch64Paging::flush_tlb_with_asid_on_cpus(asid, None, target_cpus) };
     }
 }
 
@@ -205,6 +205,23 @@ unsafe fn map(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
         allocate_page_table_page,
     )
     .expect("[arch][mm] walk_and_map failed");
+}
+
+unsafe fn publish_new_mapping(handle: PgdHandle, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // Safety: 由 UserPgdOps 契约保证 handle 与范围合法。
+    let inner = unsafe { inner_ref(handle) };
+    let page_size = LoongArch64Paging::PAGE_SIZE;
+    let aligned_start = vaddr & !(page_size - 1);
+    let targeted = vaddr
+        .checked_add(len)
+        .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
+    let address = targeted.then(|| VirtAddr::new(aligned_start));
+    // Safety: 调用方保证这些叶 PTE 此前无有效映射；这里只发布写入并收敛本核
+    // 可能缓存的无效 translation，不承担旧映射回收同步。
+    unsafe { LoongArch64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
 }
 
 unsafe fn unmap(handle: PgdHandle, vaddr: usize, len: usize) {
@@ -304,20 +321,23 @@ unsafe fn activate(handle: PgdHandle) {
     let cpu_bit = 1usize
         .checked_shl(cpu as u32)
         .expect("[arch][mm] logical CPU exceeds active mask width");
-    // 先发布激活位，再安装双根页表。并发 invalidation 即使抢先完成，下面的
-    // activate_with_asid_roots 也会在当前 CPU 上执行完整本地失效。
-    inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel);
     let kernel_pgd = super::super::heap_vm::KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     assert_ne!(
         kernel_pgd, 0,
         "[arch][mm] user address space activated before kernel PGDH"
     );
+    let asid = inner.asid();
+    // 历史位和当前逻辑 ASID 都先于地址空间安装发布。失效方若看到本 ASID 就发送
+    // IPI；若仍看到旧值，则下面以 dbar 开始并以完整 invtlb 结束的激活覆盖该次
+    // PTE 更新。SeqCst 与失效方的 PTE-write→fence→scan 形成全序闭环。
+    inner.active_cpus.fetch_or(cpu_bit, Ordering::SeqCst);
+    super::super::smp::publish_current_logical_asid(asid);
     // Safety: 两个根均在各自生命周期内有效；本函数只在调度器地址空间切换边界调用。
     unsafe {
         LoongArch64Paging::activate_with_asid_roots(
             PhysPageTableRoot::new(inner.pgd_phys()),
             PhysPageTableRoot::new(kernel_pgd),
-            inner.asid(),
+            asid,
         );
     }
 }
@@ -325,8 +345,9 @@ unsafe fn activate(handle: PgdHandle) {
 unsafe fn invalidate_range(handle: PgdHandle, vaddr: usize, len: usize) {
     // Safety: 同上。
     let inner = unsafe { inner_ref(handle) };
-    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
-    flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
+    let asid = inner.asid();
+    let targets = super::super::smp::shootdown_targets_after_pte_update(&inner.active_cpus, asid);
+    flush_user_tlb_range(asid, targets, vaddr, len);
 }
 
 unsafe fn count_mapped(handle: PgdHandle, vaddr: usize, len: usize) -> usize {
@@ -348,6 +369,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map,
+    publish_new_mapping,
     unmap,
     protect,
     clone_for_fork,
