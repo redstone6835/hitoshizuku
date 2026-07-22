@@ -323,6 +323,23 @@ unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFl
     inner.needs_page_table_fence.store(true, Ordering::Release);
 }
 
+unsafe fn publish_new_mapping(pgd: PgdHandle, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // Safety: 由 UserPgdOps 契约保证 handle 与范围合法。
+    let inner = unsafe { inner_ref(pgd) };
+    let page_size = Riscv64Paging::PAGE_SIZE;
+    let aligned_start = vaddr & !(page_size - 1);
+    let targeted = vaddr
+        .checked_add(len)
+        .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
+    let address = targeted.then(|| VirtAddr::new(aligned_start));
+    // Safety: sfence.vma 同时排序先前 PTE store 并清除本 hart 的旧无效状态；
+    // needs_page_table_fence 保留为 true，使以后首次激活该 PGD 的其它 hart 仍会 fence。
+    unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
+}
+
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
     let _ = unmap_range_entries::<Riscv64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
@@ -445,6 +462,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map: map_user_pages,
+    publish_new_mapping,
     unmap: unmap_user_pages,
     protect: protect_user_pages,
     clone_for_fork: clone_for_fork_user_pages,

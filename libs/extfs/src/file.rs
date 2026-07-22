@@ -297,13 +297,18 @@ impl ExtRegFileOps {
         if aligned_bytes != 0 {
             let phys = phys_start + (cur - range_byte_start) / block_size;
             let dst_pos = (cur - request_offset) as usize;
-            self.state
-                .read_data_blocks(
-                    phys,
-                    (aligned_bytes / block_size) as u32,
-                    &mut dst[dst_pos..dst_pos + aligned_bytes as usize],
-                )
-                .map_err(map_err)?;
+            let requested_blocks = (aligned_bytes / block_size) as u32;
+            let readahead_blocks =
+                readahead_blocks_for(block_size, range_byte_end, cur, allow_readahead);
+            read_aligned_blocks(
+                &self.state,
+                scratch,
+                phys,
+                requested_blocks,
+                readahead_blocks,
+                &mut dst[dst_pos..dst_pos + aligned_bytes as usize],
+            )
+            .map_err(map_err)?;
             cur += aligned_bytes;
         }
 
@@ -739,6 +744,53 @@ fn read_partial_block(
     Ok(())
 }
 
+pub(crate) fn read_aligned_blocks(
+    state: &FsState,
+    scratch: &mut Vec<u8>,
+    phys: u64,
+    requested_blocks: u32,
+    readahead_blocks: u32,
+    dst: &mut [u8],
+) -> Result<(), crate::state::BlockBackendError> {
+    let block_size = state.ext_sb.block_size as usize;
+    let requested_bytes = block_size * requested_blocks as usize;
+    if dst.len() != requested_bytes {
+        return Err(crate::state::BlockBackendError::OutOfRange);
+    }
+
+    let blocks = requested_blocks.max(readahead_blocks.max(1));
+    // 随机访问或大块请求没有额外窗口，沿用原批量读路径并直接写入目标缓冲区。
+    if blocks == requested_blocks {
+        return state.read_data_blocks(phys, requested_blocks, dst);
+    }
+
+    // 预读块已在 cache 时只拷贝调用方请求的前缀，避免为补下一窗口重复发 I/O。
+    {
+        let mut cache = state.block_cache.lock();
+        let mut all_cached = true;
+        for i in 0..requested_blocks {
+            let start = block_size * i as usize;
+            let end = start + block_size;
+            if !cache.read_partial(phys + i as u64, 0, &mut dst[start..end]) {
+                all_cached = false;
+                break;
+            }
+        }
+        if all_cached {
+            return Ok(());
+        }
+    }
+
+    // 顺序读把后端请求扩大到同一连续映射内最多 16 块；随机读的窗口仍为请求本身。
+    let bytes = block_size * blocks as usize;
+    if scratch.len() != bytes {
+        scratch.resize(bytes, 0);
+    }
+    state.read_data_blocks(phys, blocks, scratch)?;
+    dst.copy_from_slice(&scratch[..requested_bytes]);
+    Ok(())
+}
+
 fn readahead_blocks_for(
     block_size: u64,
     range_byte_end: u64,
@@ -800,7 +852,7 @@ fn first_overlapping_range(ranges: &[(u32, u32, u64)], first_lb: u32) -> usize {
 mod tests {
     use alloc::vec;
 
-    use super::{clip_ranges, first_overlapping_range};
+    use super::{clip_ranges, first_overlapping_range, readahead_blocks_for};
 
     #[test]
     fn clip_ranges_starts_inside_existing_range() {
@@ -816,5 +868,16 @@ mod tests {
 
         assert_eq!(first_overlapping_range(&ranges, 5), 1);
         assert_eq!(clip_ranges(&ranges, 5, 5), vec![(5, 2, 201), (8, 2, 300)]);
+    }
+
+    #[test]
+    fn readahead_window_respects_mapping_end_and_random_access() {
+        let block_size = 4096;
+
+        assert_eq!(readahead_blocks_for(block_size, 4 * block_size, 0, true), 4);
+        assert_eq!(
+            readahead_blocks_for(block_size, 64 * block_size, 0, false),
+            1
+        );
     }
 }
