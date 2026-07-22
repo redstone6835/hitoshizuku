@@ -1685,7 +1685,7 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         Some(copy_sockaddr_from_user(ctx.args[4], ctx.args[5])?)
     };
     if addr.is_none()
-        && len > COPY_CHUNK
+        && len != 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
     {
@@ -1723,7 +1723,7 @@ pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let len = ctx.args[2].min(MAX_SOCKET_IO);
     let want_addr = ctx.args[4] != 0 && ctx.args[5] != 0;
     let flags = ctx.args[3];
-    if len > COPY_CHUNK
+    if len != 0
         && (flags & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
@@ -1772,6 +1772,45 @@ fn send_inet_stream_from_user(
         };
         sent += written;
         if written == 0 || written < window_len {
+            break;
+        }
+    }
+    Ok(sent)
+}
+
+fn send_inet_stream_iovecs_from_user(
+    vm: &VmSpace,
+    vfs_ctx: &vfs::VfsContext,
+    fdt: &vfs::fdtable::FdTable,
+    fd: Fd,
+    iov: usize,
+    iovcnt: usize,
+    total: usize,
+    flags: usize,
+) -> Result<usize, Errno> {
+    let mut sent = 0usize;
+    for index in 0..iovcnt {
+        let (base, len) = read_iovec(iov, index)?;
+        let len = len.min(total.saturating_sub(sent));
+        if len == 0 {
+            continue;
+        }
+        let chunk_flags = if sent + len < total {
+            flags | vfs_socket::MSG_MORE
+        } else {
+            flags
+        };
+        match send_inet_stream_from_user(vm, vfs_ctx, fdt, fd, base, len, chunk_flags) {
+            Ok(written) => {
+                sent += written;
+                if written < len {
+                    break;
+                }
+            }
+            Err(_error) if sent != 0 => return Ok(sent),
+            Err(error) => return Err(error),
+        }
+        if sent == total {
             break;
         }
     }
@@ -1845,6 +1884,47 @@ fn recv_inet_stream_to_user(
     Ok(received)
 }
 
+fn recv_inet_stream_iovecs_to_user(
+    vm: &VmSpace,
+    fdt: &vfs::fdtable::FdTable,
+    fd: Fd,
+    iov: usize,
+    iovcnt: usize,
+    total: usize,
+    flags: usize,
+    ctx: &SyscallContext<'_>,
+) -> Result<usize, Errno> {
+    let mut received = 0usize;
+    for index in 0..iovcnt {
+        let (base, len) = read_iovec(iov, index)?;
+        let len = len.min(total.saturating_sub(received));
+        if len == 0 {
+            continue;
+        }
+        let chunk_flags = if received == 0 {
+            flags
+        } else {
+            flags | vfs_socket::MSG_DONTWAIT
+        };
+        match recv_inet_stream_to_user(vm, fdt, fd, base, len, false, chunk_flags, ctx) {
+            Ok(copied) => {
+                received += copied;
+                if copied < len {
+                    break;
+                }
+            }
+            Err(error) if received != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+                return Ok(received);
+            }
+            Err(error) => return Err(error),
+        }
+        if received == total {
+            break;
+        }
+    }
+    Ok(received)
+}
+
 fn send_socket_payload(
     vfs_ctx: &vfs::VfsContext,
     fdt: &vfs::fdtable::FdTable,
@@ -1895,16 +1975,24 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let hdr = read_msghdr(ctx.args[1])?;
-    if hdr.iovlen == 1
+    if hdr.iovlen <= 1024
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
     {
-        let (base, len) = read_iovec(hdr.iov, 0)?;
-        let len = len.min(MAX_SOCKET_IO);
-        if len > COPY_CHUNK {
-            return send_inet_stream_from_user(&vm, &vfs_ctx, &fdt, fd, base, len, ctx.args[2]);
+        let total = iov_total_len_capped(hdr.iov, hdr.iovlen, MAX_SOCKET_IO)?;
+        if total != 0 {
+            return send_inet_stream_iovecs_from_user(
+                &vm,
+                &vfs_ctx,
+                &fdt,
+                fd,
+                hdr.iov,
+                hdr.iovlen,
+                total,
+                ctx.args[2],
+            );
         }
     }
     let data = copy_send_iovecs(hdr.iov, hdr.iovlen)?;
@@ -1974,16 +2062,24 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fd = fd_arg(ctx.args[0])?;
     let mut hdr = read_msghdr(ctx.args[1])?;
     let total = iov_total_len_capped(hdr.iov, hdr.iovlen, MAX_SOCKET_IO)?;
-    if hdr.iovlen == 1
+    if hdr.iovlen <= 1024
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
-        && total > COPY_CHUNK
+        && total != 0
         && (ctx.args[2] & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
     {
-        let (base, _) = read_iovec(hdr.iov, 0)?;
-        let len = recv_inet_stream_to_user(&vm, &fdt, fd, base, total, false, ctx.args[2], ctx)?;
+        let len = recv_inet_stream_iovecs_to_user(
+            &vm,
+            &fdt,
+            fd,
+            hdr.iov,
+            hdr.iovlen,
+            total,
+            ctx.args[2],
+            ctx,
+        )?;
         hdr.controllen = 0;
         hdr.namelen = 0;
         hdr.flags = 0;
@@ -2229,7 +2325,6 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
     let deadline = timeout_deadline(timeout_ms);
-
     loop {
         clear_fdset(read_out);
         clear_fdset(write_out);

@@ -7,13 +7,12 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::buf::{PacketChain, PacketMetadata};
+use crate::buf::{PacketChain, PacketMetadata, RxPoolPressure};
 use crate::control::RouteDecision;
 use crate::flow::{FlowKey, FlowTable, flow_hash64, rss_hash};
-#[cfg(test)]
-use crate::pipeline::transport_checksum;
 use crate::pipeline::{EthernetHeader, FrontendPacket, IpPacket};
-#[cfg(test)]
+use crate::pipeline::{partial_transport_checksum, transport_checksum};
+use crate::socket::{StreamRxCommit, StreamRxStorageKind};
 use crate::transport::TCP_PROTOCOL_NUMBER;
 use crate::transport::{
     TcpFlags, TcpPacket, TcpSackBlock, TcpSequence, TcpState, TcpStateMachine, TcpTransmit,
@@ -97,6 +96,10 @@ pub struct TcpEngineStats {
     pub fast_retransmit: u64,
     pub out_of_order: u64,
     pub paws_drop: u64,
+    pub rx_pinned_bytes: u64,
+    pub rx_compact_copy_bytes: u64,
+    pub loopback_shared_bytes: u64,
+    pub rx_pool_low_water_fallbacks: u64,
 }
 
 struct Listener {
@@ -125,9 +128,10 @@ enum IngressPayload<'a> {
     #[cfg(test)]
     Owned(Vec<u8>),
     Packet {
-        chain: &'a PacketChain,
+        chain: &'a mut PacketChain,
         offset: usize,
         len: usize,
+        pressure: RxPoolPressure,
     },
     Lease {
         lease: &'a TcpTxLease,
@@ -152,20 +156,27 @@ impl IngressPayload<'_> {
     }
 
     fn copy_to_socket(
-        &self,
+        &mut self,
         facade: &SocketFacade,
         payload_offset: usize,
-    ) -> Result<usize, SocketError> {
+    ) -> Result<StreamRxCommit, SocketError> {
         let len = self.len().saturating_sub(payload_offset);
         match self {
-            Self::Empty => Ok(0),
+            Self::Empty => Ok(StreamRxCommit {
+                len: 0,
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            }),
             #[cfg(test)]
-            Self::Owned(bytes) => facade.push_stream_rx(&bytes[payload_offset..]),
-            Self::Packet { chain, offset, .. } => {
-                facade.push_stream_rx_chain(chain, offset + payload_offset, len)
-            }
+            Self::Owned(bytes) => facade.push_stream_rx_compact(&bytes[payload_offset..]),
+            Self::Packet {
+                chain,
+                offset,
+                pressure,
+                ..
+            } => facade.push_stream_rx_packet(chain, *offset + payload_offset, len, *pressure),
             Self::Lease { lease, offset, .. } => {
-                facade.push_stream_rx_lease(lease, offset + payload_offset, len)
+                facade.push_stream_rx_lease(lease, *offset + payload_offset, len)
             }
         }
     }
@@ -175,7 +186,9 @@ impl IngressPayload<'_> {
             Self::Empty => Ok(Vec::new()),
             #[cfg(test)]
             Self::Owned(bytes) => Ok(bytes),
-            Self::Packet { chain, offset, len } => {
+            Self::Packet {
+                chain, offset, len, ..
+            } => {
                 let mut bytes = Vec::new();
                 bytes.resize(len, 0);
                 chain
@@ -427,7 +440,14 @@ impl TcpEndpointTable {
             return Err(TcpBindError::InvalidEndpoint);
         }
         let key = (local.addr, local.port, interface);
-        if self.listeners.contains_key(&key) {
+        // close() 先标记 ListenGroup，再把跨 shard 的清理工作排队。
+        // 允许新 listener 在这段过渡期替换旧条目，避免连续 close/bind/listen
+        // 时因为某个 shard 仍未消费 RemoveListener 而让整个安装事务失败。
+        if self
+            .listeners
+            .get(&key)
+            .is_some_and(|listener| !listener.group.is_closing())
+        {
             return Err(TcpBindError::Duplicate);
         }
         self.listeners.insert(key, Listener { group });
@@ -450,9 +470,13 @@ impl TcpEndpointTable {
         let pending: Vec<_> = (1..=4096)
             .map(FlowId)
             .filter(|id| {
-                self.flows
-                    .get(*id)
-                    .is_some_and(|flow| flow.listener_key.is_some_and(|key| keys.contains(&key)))
+                self.flows.get(*id).is_some_and(|flow| {
+                    flow.listener_key.is_some_and(|key| keys.contains(&key))
+                        || flow
+                            .accept_group
+                            .as_ref()
+                            .is_some_and(|listener| listener.id() == group)
+                })
             })
             .collect();
         for id in pending {
@@ -552,7 +576,7 @@ impl TcpEndpointTable {
     ) -> Result<(FlowId, PacketChain, PacketMetadata), (TcpIngressError, PacketChain, PacketMetadata)>
     {
         let metadata = packet.metadata;
-        let chain = packet.chain;
+        let mut chain = packet.chain;
         let Some(key) = packet.parsed.flow else {
             return Err((TcpIngressError::Malformed, chain, metadata));
         };
@@ -576,9 +600,10 @@ impl TcpEndpointTable {
             id,
             tcp,
             IngressPayload::Packet {
-                chain: &chain,
+                chain: &mut chain,
                 offset: payload_offset,
                 len: payload_len,
+                pressure: metadata.rx_pool_pressure,
             },
             now_ns,
         );
@@ -767,6 +792,10 @@ impl TcpEndpointTable {
 
     pub fn has_output_blocked(&self) -> bool {
         !self.output_blocked.is_empty()
+    }
+
+    pub fn has_pending_output(&self) -> bool {
+        !self.output.is_empty()
     }
 
     fn mark_output_blocked(&mut self, id: FlowId) {
@@ -1279,7 +1308,7 @@ impl TcpEndpointTable {
         id: FlowId,
         expected: TcpSequence,
         sequence: TcpSequence,
-        payload: IngressPayload<'_>,
+        mut payload: IngressPayload<'_>,
         now_ns: u64,
     ) -> Result<(), TcpIngressError> {
         let payload_start = sequence
@@ -1288,10 +1317,14 @@ impl TcpEndpointTable {
             .unwrap_or(0);
         if sequence.before_or_equal(expected) && payload_start < payload.len() {
             let accepted = payload.len() - payload_start;
+            let commit = {
+                let flow = self.flows.get_mut(id).unwrap();
+                payload
+                    .copy_to_socket(&flow.facade, payload_start)
+                    .map_err(|_| TcpIngressError::ReceiveBufferFull)?
+            };
+            self.record_rx_commit(commit);
             let flow = self.flows.get_mut(id).unwrap();
-            payload
-                .copy_to_socket(&flow.facade, payload_start)
-                .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
             if sequence.before(expected) {
                 flow.machine.advance_receive(accepted as u32);
             }
@@ -1360,9 +1393,35 @@ impl TcpEndpointTable {
             flow.facade
                 .push_stream_rx(accepted)
                 .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+            self.stats.rx_compact_copy_bytes = self
+                .stats
+                .rx_compact_copy_bytes
+                .saturating_add(accepted.len() as u64);
             flow.machine.advance_receive(accepted.len() as u32);
         }
         Ok(())
+    }
+
+    fn record_rx_commit(&mut self, commit: StreamRxCommit) {
+        let len = commit.len as u64;
+        match commit.storage {
+            StreamRxStorageKind::Discarded => {}
+            StreamRxStorageKind::Compact => {
+                self.stats.rx_compact_copy_bytes =
+                    self.stats.rx_compact_copy_bytes.saturating_add(len);
+            }
+            StreamRxStorageKind::PhysicalPinned => {
+                self.stats.rx_pinned_bytes = self.stats.rx_pinned_bytes.saturating_add(len);
+            }
+            StreamRxStorageKind::LoopbackShared => {
+                self.stats.loopback_shared_bytes =
+                    self.stats.loopback_shared_bytes.saturating_add(len);
+            }
+        }
+        if commit.low_water_fallback {
+            self.stats.rx_pool_low_water_fallbacks =
+                self.stats.rx_pool_low_water_fallbacks.saturating_add(1);
+        }
     }
 
     fn acknowledge(
@@ -2079,48 +2138,10 @@ fn sip_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
     *v2 = v2.rotate_left(32);
 }
 
-#[cfg(not(test))]
 pub fn build_tcp_packet(
     mut payload: PacketChain,
     work: &PreparedTcpTx,
-) -> Result<PacketChain, PacketChain> {
-    let options_len = usize::from(work.options_len);
-    if options_len > work.options.len() || options_len % 4 != 0 {
-        return Err(payload);
-    }
-    let payload_len = payload.total_len();
-    let Some(input) = crate::stack::NetStackTxInputV1::tcp(
-        work.path.route.source,
-        work.remote.addr,
-        work.local_port,
-        work.remote.port,
-        work.path.source_mac,
-        work.path.destination_mac,
-        work.sequence.0,
-        work.acknowledgement.0,
-        work.flags.bits(),
-        work.window,
-        &work.options[..options_len],
-        payload_len as u32,
-    ) else {
-        return Err(payload);
-    };
-    let output = match crate::stack::build_tx_header(&payload, input) {
-        Ok(output) => output,
-        Err(_) => return Err(payload),
-    };
-    if payload.prepend_first_zeroed(output.header_len).is_err()
-        || payload.copy_in(0, output.header_bytes()).is_err()
-    {
-        return Err(payload);
-    }
-    Ok(payload)
-}
-
-#[cfg(test)]
-pub fn build_tcp_packet(
-    mut payload: PacketChain,
-    work: &PreparedTcpTx,
+    checksum_offload: bool,
 ) -> Result<PacketChain, PacketChain> {
     let options_len = usize::from(work.options_len);
     let tcp_header_len = 20 + options_len;
@@ -2169,16 +2190,28 @@ pub fn build_tcp_packet(
             {
                 return Err(payload);
             }
-            let checksum = match transport_checksum(
-                &payload,
-                34,
-                tcp_header_len + payload_len,
-                work.path.route.source,
-                work.remote.addr,
-                TCP_PROTOCOL_NUMBER,
-            ) {
-                Ok(checksum) => checksum,
-                Err(_) => return Err(payload),
+            let checksum = if checksum_offload {
+                let Ok(checksum) = partial_transport_checksum(
+                    work.path.route.source,
+                    work.remote.addr,
+                    tcp_header_len + payload_len,
+                    TCP_PROTOCOL_NUMBER,
+                ) else {
+                    return Err(payload);
+                };
+                checksum
+            } else {
+                match transport_checksum(
+                    &payload,
+                    34,
+                    tcp_header_len + payload_len,
+                    work.path.route.source,
+                    work.remote.addr,
+                    TCP_PROTOCOL_NUMBER,
+                ) {
+                    Ok(checksum) => checksum,
+                    Err(_) => return Err(payload),
+                }
             };
             if payload.copy_in(50, &checksum.to_be_bytes()).is_err() {
                 return Err(payload);
@@ -2203,16 +2236,28 @@ pub fn build_tcp_packet(
             {
                 return Err(payload);
             }
-            let checksum = match transport_checksum(
-                &payload,
-                54,
-                transport_len,
-                work.path.route.source,
-                work.remote.addr,
-                TCP_PROTOCOL_NUMBER,
-            ) {
-                Ok(checksum) => checksum,
-                Err(_) => return Err(payload),
+            let checksum = if checksum_offload {
+                let Ok(checksum) = partial_transport_checksum(
+                    work.path.route.source,
+                    work.remote.addr,
+                    transport_len,
+                    TCP_PROTOCOL_NUMBER,
+                ) else {
+                    return Err(payload);
+                };
+                checksum
+            } else {
+                match transport_checksum(
+                    &payload,
+                    54,
+                    transport_len,
+                    work.path.route.source,
+                    work.remote.addr,
+                    TCP_PROTOCOL_NUMBER,
+                ) {
+                    Ok(checksum) => checksum,
+                    Err(_) => return Err(payload),
+                }
             };
             if payload.copy_in(70, &checksum.to_be_bytes()).is_err() {
                 return Err(payload);
@@ -2223,55 +2268,6 @@ pub fn build_tcp_packet(
     Ok(payload)
 }
 
-#[cfg(not(test))]
-pub fn build_tcp_reset(
-    mut packet: PacketChain,
-    ethernet: EthernetHeader,
-    ip: IpPacket,
-    tcp: TcpPacket,
-) -> Result<PacketChain, PacketChain> {
-    if tcp.flags.contains(TcpFlags::RST) {
-        return Err(packet);
-    }
-    let (sequence, acknowledgement, flags) = if tcp.flags.contains(TcpFlags::ACK) {
-        (tcp.acknowledgement.0, 0, TcpFlags::RST)
-    } else {
-        (
-            0,
-            (tcp.sequence + tcp.sequence_len()).0,
-            TcpFlags::RST | TcpFlags::ACK,
-        )
-    };
-    let Some(mut input) = crate::stack::NetStackTxInputV1::tcp(
-        ip.destination,
-        ip.source,
-        tcp.destination_port,
-        tcp.source_port,
-        ethernet.destination,
-        ethernet.source,
-        sequence,
-        acknowledgement,
-        flags.bits(),
-        0,
-        &[],
-        0,
-    ) else {
-        return Err(packet);
-    };
-    input.payload_offset = 0;
-    let output = match crate::stack::build_tx_header(&packet, input) {
-        Ok(output) => output,
-        Err(_) => return Err(packet),
-    };
-    if packet.total_len() < usize::from(output.header_len)
-        || packet.copy_in(0, output.header_bytes()).is_err()
-    {
-        return Err(packet);
-    }
-    Ok(packet)
-}
-
-#[cfg(test)]
 pub fn build_tcp_reset(
     mut packet: PacketChain,
     ethernet: EthernetHeader,
@@ -3144,6 +3140,32 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn closing_listener_can_be_replaced_before_shard_drain() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9007,
+        };
+        let old_listener = facade(21);
+        let old_group = listen_group(&old_listener, 21, 2, 8);
+        let mut table = TcpEndpointTable::new_on_shard(ShardId(0), [1; 40], [2; 16]);
+        table
+            .listen(local, Some(InterfaceId(1)), Arc::clone(&old_group))
+            .unwrap();
+
+        old_group.close();
+        let new_listener = facade(22);
+        let new_group = listen_group(&new_listener, 22, 2, 8);
+        assert!(
+            table
+                .listen(local, Some(InterfaceId(1)), Arc::clone(&new_group))
+                .is_ok()
+        );
+
+        assert!(!table.close_listener(old_group.id()));
+        assert!(table.close_listener(new_group.id()));
     }
 
     #[test]

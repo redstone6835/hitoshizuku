@@ -4,7 +4,6 @@ mod listen_group;
 mod proxy;
 
 pub use listen_group::ListenGroup;
-pub(crate) use proxy::new_socket_readiness_relay;
 pub use proxy::{NetSocketProxy, detach_proxy_stack};
 
 use alloc::boxed::Box;
@@ -17,7 +16,10 @@ use sched::{TaskState, WaitQueue};
 use spin::{Mutex, RwLock};
 
 use crate::IpAddr;
-use crate::buf::PacketChain;
+use crate::buf::{
+    ChunkRef, NetBufLease, PacketChain, PacketFragment, PacketMetadata, RxPoolPressure,
+    SharedNetBufPool,
+};
 use crate::control::BindOptions;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, ListenGroupId, ShardId, SocketId};
 
@@ -38,6 +40,12 @@ const TCP_KEEPCNT_DEFAULT: u16 = 9;
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(None);
 static SOCKET_REGISTRY: RwLock<Vec<Weak<SocketFacade>>> = RwLock::new(Vec::new());
+static DMA_TX_POOL_WAITERS: Mutex<VecDeque<DmaTxPoolWaiter>> = Mutex::new(VecDeque::new());
+
+struct DmaTxPoolWaiter {
+    pool_key: usize,
+    facade: Weak<SocketFacade>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerRef {
@@ -84,6 +92,10 @@ impl Readiness {
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
     }
 }
 
@@ -178,10 +190,6 @@ pub enum SocketCommand {
 }
 
 pub trait SocketRuntime: Send + Sync {
-    fn submit_stack_socket(
-        &self,
-        command: crate::stack::NetStackSocketCommandV1,
-    ) -> Result<crate::stack::NetStackSocketCommandV1, crate::stack::NetStackSocketCommandV1>;
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand>;
     fn notify_tx(&self, facade: Arc<SocketFacade>);
     fn notify_lifecycle(&self, facade: Arc<SocketFacade>);
@@ -239,6 +247,7 @@ pub fn new_raw_socket_facade(
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     assert!(counter != 0, "SocketId 已耗尽");
+    let _resident = enter_resident_allocation_scope()?;
     let facade = Arc::new(SocketFacade::new_with_protocol(
         SocketId {
             boot_nonce,
@@ -256,6 +265,7 @@ fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacad
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     assert!(counter != 0, "SocketId 已耗尽");
+    let _resident = enter_resident_allocation_scope()?;
     let facade = Arc::new(SocketFacade::new(
         SocketId {
             boot_nonce,
@@ -265,6 +275,26 @@ fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacad
         kind,
     ));
     Ok(facade)
+}
+
+fn enter_resident_allocation_scope()
+-> Result<Option<elm_model::ElmCurrentContextGuard>, SocketError> {
+    if elm_model::current_context().is_none() {
+        return Ok(None);
+    }
+    // SocketFacade 可能由 ELM shard turn 为被动 accept 创建，但它的身份和缓冲必须在
+    // ELM 卸载后继续由 resident VFS 持有。cell 0 是 allocator 的 kernel owner。
+    let context = elm_model::ElmContext::new(
+        elm_model::ElmId(0),
+        None,
+        elm_model::Generation::FIRST,
+        elm_model::ElmState::Active,
+        elm_model::ElmLifecyclePhase::Initialize,
+        0,
+    );
+    elm_model::enter_current_context(&context)
+        .map(Some)
+        .ok_or(SocketError::Buffer)
 }
 
 /// 将一个已经交给常驻 host/VFS 的 socket 纳入代际卸载跟踪。
@@ -304,39 +334,8 @@ pub fn track_socket_facade(facade: &Arc<SocketFacade>, generation: u64) {
     let current = crate::stack::stack_snapshot();
     if generation != 0
         && (current.state != crate::stack::NetStackState::Active
-            || !current.probed
+            || !current.ready
             || current.generation != generation)
-    {
-        facade.detach_stack();
-    }
-}
-
-/// 将 ELM socket table 持有的 facade 绑定到对应 stack generation。
-///
-/// 该路径不把 facade 注册到常驻 socket registry；唯一强引用由 ELM table
-/// 持有，常驻 VFS 只通过 opaque socket ref 访问。
-pub(crate) fn attach_socket_facade_generation(facade: &Arc<SocketFacade>, generation: u64) {
-    if generation == 0 {
-        facade.detach_stack();
-        return;
-    }
-    match facade.stack_generation.compare_exchange(
-        0,
-        generation,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => {}
-        Err(current) if current == generation => {}
-        Err(_) => {
-            facade.detach_stack();
-            return;
-        }
-    }
-    let current = crate::stack::stack_snapshot();
-    if current.state != crate::stack::NetStackState::Active
-        || !current.probed
-        || current.generation != generation
     {
         facade.detach_stack();
     }
@@ -372,6 +371,302 @@ struct ByteRing {
     head: usize,
     len: usize,
     limit: usize,
+}
+
+struct DmaTxChunk {
+    start: u64,
+    used: usize,
+    exclusive: Option<NetBufLease>,
+    shared: Option<ChunkRef>,
+}
+
+struct DmaByteRing {
+    pool: SharedNetBufPool,
+    chunks: VecDeque<DmaTxChunk>,
+    len: usize,
+    limit: usize,
+}
+
+impl DmaByteRing {
+    fn new(pool: SharedNetBufPool, limit: usize) -> Self {
+        Self {
+            pool,
+            chunks: VecDeque::with_capacity(TCP_INITIAL_CHUNKS),
+            len: 0,
+            limit,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.limit.saturating_sub(self.len)
+    }
+
+    fn writable(&self) -> bool {
+        if self.available() == 0 {
+            return false;
+        }
+        if self
+            .chunks
+            .back()
+            .and_then(|chunk| chunk.exclusive.as_ref().map(|lease| (chunk, lease)))
+            .is_some_and(|(chunk, lease)| chunk.used < usize::from(lease.capacity()))
+        {
+            return true;
+        }
+        let mut pool = self.pool.lock();
+        pool.drain_remote();
+        pool.available() != 0
+    }
+
+    fn reserve(&mut self, absolute_tail: u64) -> bool {
+        if !self.writable() {
+            return false;
+        }
+        if self
+            .chunks
+            .back()
+            .and_then(|chunk| chunk.exclusive.as_ref().map(|lease| (chunk, lease)))
+            .is_some_and(|(chunk, lease)| chunk.used < usize::from(lease.capacity()))
+        {
+            return true;
+        }
+        let mut pool = self.pool.lock();
+        pool.drain_remote();
+        let Ok(lease) = pool.lease(0, 0, PacketMetadata::default()) else {
+            return false;
+        };
+        drop(pool);
+        self.chunks.push_back(DmaTxChunk {
+            start: absolute_tail,
+            used: 0,
+            exclusive: Some(lease),
+            shared: None,
+        });
+        true
+    }
+
+    fn pool_key(&self) -> usize {
+        Arc::as_ptr(&self.pool) as usize
+    }
+
+    fn pool_exhausted(&self) -> bool {
+        if self.available() == 0
+            || self
+                .chunks
+                .back()
+                .and_then(|chunk| chunk.exclusive.as_ref().map(|lease| (chunk, lease)))
+                .is_some_and(|(chunk, lease)| chunk.used < usize::from(lease.capacity()))
+        {
+            return false;
+        }
+        let mut pool = self.pool.lock();
+        pool.drain_remote();
+        pool.available() == 0
+    }
+
+    fn push(&mut self, absolute_tail: u64, input: &[u8]) -> usize {
+        let target = input.len().min(self.available());
+        let mut copied = 0usize;
+        while copied < target {
+            let appended = self.append_to_tail(&input[copied..target]);
+            if appended != 0 {
+                copied += appended;
+                continue;
+            }
+
+            let mut pool = self.pool.lock();
+            pool.drain_remote();
+            let capacity = usize::from(pool.buffer_capacity());
+            let Ok(mut lease) = pool.lease(0, capacity as u16, PacketMetadata::default()) else {
+                break;
+            };
+            drop(pool);
+            let len = (target - copied).min(capacity);
+            lease.as_mut_slice().expect("socket TX DMA lease 范围有效")[..len]
+                .copy_from_slice(&input[copied..copied + len]);
+            lease
+                .set_data_range(0, len as u16)
+                .expect("socket TX DMA lease 收窄有效");
+            self.chunks.push_back(DmaTxChunk {
+                start: absolute_tail + copied as u64,
+                used: len,
+                exclusive: Some(lease),
+                shared: None,
+            });
+            copied += len;
+        }
+        self.len += copied;
+        copied
+    }
+
+    fn append_to_tail(&mut self, input: &[u8]) -> usize {
+        let Some(tail) = self.chunks.back_mut() else {
+            return 0;
+        };
+        let Some(lease) = tail.exclusive.as_mut() else {
+            return 0;
+        };
+        let capacity = usize::from(lease.capacity());
+        let len = input.len().min(capacity.saturating_sub(tail.used));
+        if len == 0 {
+            return 0;
+        }
+        lease
+            .set_data_range(0, capacity as u16)
+            .expect("socket TX DMA lease 扩展有效");
+        lease.as_mut_slice().expect("socket TX DMA lease 范围有效")[tail.used..tail.used + len]
+            .copy_from_slice(&input[..len]);
+        tail.used += len;
+        lease
+            .set_data_range(0, tail.used as u16)
+            .expect("socket TX DMA lease 收窄有效");
+        len
+    }
+
+    fn copy_range(&self, absolute: u64, output: &mut [u8]) -> bool {
+        let Some(end) = absolute.checked_add(output.len() as u64) else {
+            return false;
+        };
+        let mut copied = 0usize;
+        for chunk in &self.chunks {
+            let chunk_end = chunk.start + chunk.used as u64;
+            if absolute >= chunk_end || end <= chunk.start {
+                continue;
+            }
+            let start = absolute.saturating_sub(chunk.start) as usize;
+            let stop = chunk.used.min((end - chunk.start) as usize);
+            let bytes = match (&chunk.exclusive, &chunk.shared) {
+                (Some(lease), None) => lease.as_slice(),
+                (None, Some(shared)) => shared.as_slice(),
+                _ => return false,
+            };
+            let Ok(bytes) = bytes else {
+                return false;
+            };
+            let len = stop - start;
+            output[copied..copied + len].copy_from_slice(&bytes[start..stop]);
+            copied += len;
+            if copied == output.len() {
+                return true;
+            }
+        }
+        copied == output.len()
+    }
+
+    fn pin_range(&mut self, absolute: u64, len: usize) -> Result<PacketChain, SocketError> {
+        let end = absolute
+            .checked_add(len as u64)
+            .ok_or(SocketError::Buffer)?;
+        let mut chain = PacketChain::new();
+        let mut pinned = 0usize;
+        for chunk in &mut self.chunks {
+            let chunk_end = chunk.start + chunk.used as u64;
+            if absolute >= chunk_end || end <= chunk.start {
+                continue;
+            }
+            if chunk.shared.is_none() {
+                let lease = chunk.exclusive.take().ok_or(SocketError::Buffer)?;
+                chunk.shared = Some(lease.into_chunk().map_err(|_| SocketError::Buffer)?);
+            }
+            let start = absolute.saturating_sub(chunk.start) as usize;
+            let stop = chunk.used.min((end - chunk.start) as usize);
+            let fragment = chunk
+                .shared
+                .as_ref()
+                .ok_or(SocketError::Buffer)?
+                .slice(start, stop - start)
+                .and_then(|chunk| chunk.retain_pool(Arc::clone(&self.pool)))
+                .map_err(|_| SocketError::Buffer)?;
+            pinned += stop - start;
+            chain
+                .push(PacketFragment::Shared(fragment))
+                .map_err(|_| SocketError::Buffer)?;
+        }
+        (pinned == len).then_some(chain).ok_or(SocketError::Buffer)
+    }
+
+    fn consume_to(&mut self, new_base: u64, consumed: usize) {
+        self.len = self.len.saturating_sub(consumed);
+        while self
+            .chunks
+            .front()
+            .is_some_and(|chunk| chunk.start + chunk.used as u64 <= new_base)
+        {
+            self.chunks.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
+}
+
+enum StreamBytes {
+    Heap(ByteRing),
+    Dma(DmaByteRing),
+}
+
+impl StreamBytes {
+    fn len(&self) -> usize {
+        match self {
+            Self::Heap(bytes) => bytes.len,
+            Self::Dma(bytes) => bytes.len,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        match self {
+            Self::Heap(bytes) => bytes.limit,
+            Self::Dma(bytes) => bytes.limit,
+        }
+    }
+
+    fn writable(&self) -> bool {
+        match self {
+            Self::Heap(bytes) => bytes.available() != 0,
+            Self::Dma(bytes) => bytes.writable(),
+        }
+    }
+
+    fn copy_range(&self, base: u64, offset: usize, output: &mut [u8]) -> bool {
+        match self {
+            Self::Heap(bytes) => bytes.copy_range(offset, output),
+            Self::Dma(bytes) => bytes.copy_range(base + offset as u64, output),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Heap(bytes) => bytes.clear(),
+            Self::Dma(bytes) => bytes.clear(),
+        }
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        let limit = limit.clamp(16 * 1024, TCP_BUFFER_HARD_LIMIT);
+        match self {
+            Self::Heap(bytes) => bytes.set_limit(limit),
+            Self::Dma(bytes) => bytes.limit = limit,
+        }
+    }
+
+    #[cfg(test)]
+    fn allocated_capacity(&self) -> usize {
+        match self {
+            Self::Heap(bytes) => bytes.arena.len(),
+            Self::Dma(bytes) => bytes
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    chunk
+                        .exclusive
+                        .as_ref()
+                        .map_or(SOCKET_CHUNK_BYTES, |lease| usize::from(lease.capacity()))
+                })
+                .sum(),
+        }
+    }
 }
 
 impl ByteRing {
@@ -420,30 +715,6 @@ impl ByteRing {
         len
     }
 
-    fn push_with<E>(
-        &mut self,
-        len: usize,
-        mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
-    ) -> Result<usize, E> {
-        let len = len.min(self.available());
-        self.grow_for(len);
-        if len == 0 {
-            return Ok(0);
-        }
-        #[cfg(feature = "performance-profile")]
-        let copy_start = profiling::read_counter();
-        let tail = (self.head + self.len) % self.arena.len();
-        let first = len.min(self.arena.len() - tail);
-        copy(0, &mut self.arena[tail..tail + first])?;
-        if first != len {
-            copy(first, &mut self.arena[..len - first])?;
-        }
-        self.len += len;
-        #[cfg(feature = "performance-profile")]
-        record_payload_copy(copy_start, len);
-        Ok(len)
-    }
-
     fn copy_range(&self, offset: usize, output: &mut [u8]) -> bool {
         if offset.saturating_add(output.len()) > self.len {
             return false;
@@ -483,7 +754,7 @@ impl ByteRing {
 }
 
 struct StreamTxRing {
-    bytes: ByteRing,
+    bytes: StreamBytes,
     base: u64,
     sent: usize,
 }
@@ -491,18 +762,48 @@ struct StreamTxRing {
 impl StreamTxRing {
     fn new() -> Self {
         Self {
-            bytes: ByteRing::new(),
+            bytes: StreamBytes::Heap(ByteRing::new()),
             base: 0,
             sent: 0,
         }
     }
 
     fn push(&mut self, input: &[u8]) -> usize {
-        self.bytes.push(input)
+        match &mut self.bytes {
+            StreamBytes::Heap(bytes) => bytes.push(input),
+            StreamBytes::Dma(bytes) => bytes.push(self.base + bytes.len as u64, input),
+        }
+    }
+
+    fn writable(&self) -> bool {
+        self.bytes.writable()
+    }
+
+    fn exhausted_pool_key(&self) -> Option<usize> {
+        match &self.bytes {
+            StreamBytes::Dma(bytes) if bytes.pool_exhausted() => Some(bytes.pool_key()),
+            _ => None,
+        }
+    }
+
+    fn pool_key(&self) -> Option<usize> {
+        match &self.bytes {
+            StreamBytes::Dma(bytes) => Some(bytes.pool_key()),
+            StreamBytes::Heap(_) => None,
+        }
+    }
+
+    fn reserve_pool_chunk(&mut self, pool_key: usize) -> bool {
+        match &mut self.bytes {
+            StreamBytes::Dma(bytes) if bytes.pool_key() == pool_key => {
+                bytes.reserve(self.base.saturating_add(bytes.len as u64))
+            }
+            _ => false,
+        }
     }
 
     fn take_unsent(&mut self, max_len: usize) -> Option<(u64, usize)> {
-        let len = self.bytes.len.saturating_sub(self.sent).min(max_len);
+        let len = self.bytes.len().saturating_sub(self.sent).min(max_len);
         if len == 0 {
             return None;
         }
@@ -515,20 +816,26 @@ impl StreamTxRing {
         let Some(offset) = start.checked_sub(self.base) else {
             return false;
         };
-        self.bytes.copy_range(offset as usize, output)
+        self.bytes.copy_range(self.base, offset as usize, output)
     }
 
     fn contains(&self, start: u64, len: usize) -> bool {
         start
             .checked_sub(self.base)
             .and_then(|offset| (offset as usize).checked_add(len))
-            .is_some_and(|end| end <= self.bytes.len)
+            .is_some_and(|end| end <= self.bytes.len())
     }
 
     fn acknowledge(&mut self, len: usize) -> usize {
-        let consumed = self.bytes.consume(len.min(self.sent));
+        let consumed = len.min(self.sent).min(self.bytes.len());
         self.base = self.base.saturating_add(consumed as u64);
         self.sent -= consumed;
+        match &mut self.bytes {
+            StreamBytes::Heap(bytes) => {
+                bytes.consume(consumed);
+            }
+            StreamBytes::Dma(bytes) => bytes.consume_to(self.base, consumed),
+        }
         consumed
     }
 
@@ -537,17 +844,233 @@ impl StreamTxRing {
         self.base = self.base.saturating_add(self.sent as u64);
         self.sent = 0;
     }
+
+    fn install_pool(&mut self, pool: SharedNetBufPool) -> bool {
+        if matches!(&self.bytes, StreamBytes::Dma(bytes) if Arc::ptr_eq(&bytes.pool, &pool)) {
+            return true;
+        }
+        let StreamBytes::Heap(heap) = &self.bytes else {
+            return false;
+        };
+        let mut dma = DmaByteRing::new(pool, heap.limit);
+        let mut offset = 0usize;
+        let mut buffer = [0u8; SOCKET_CHUNK_BYTES];
+        while offset < heap.len {
+            let len = (heap.len - offset).min(buffer.len());
+            if !heap.copy_range(offset, &mut buffer[..len])
+                || dma.push(self.base + offset as u64, &buffer[..len]) != len
+            {
+                return false;
+            }
+            offset += len;
+        }
+        self.bytes = StreamBytes::Dma(dma);
+        true
+    }
+
+    fn pin_absolute(&mut self, start: u64, len: usize) -> Result<Option<PacketChain>, SocketError> {
+        match &mut self.bytes {
+            StreamBytes::Heap(_) => Ok(None),
+            StreamBytes::Dma(bytes) => bytes.pin_range(start, len).map(Some),
+        }
+    }
+}
+
+enum StreamRxChunkStorage {
+    Shared(ChunkRef),
+    Compact(Box<[u8]>),
+}
+
+struct StreamRxChunk {
+    storage: StreamRxChunkStorage,
+    consumed: usize,
+    len: usize,
+}
+
+impl StreamRxChunk {
+    fn bytes(&self) -> Result<&[u8], SocketError> {
+        let bytes = match &self.storage {
+            StreamRxChunkStorage::Shared(chunk) => {
+                chunk.as_slice().map_err(|_| SocketError::Buffer)?
+            }
+            StreamRxChunkStorage::Compact(bytes) => bytes,
+        };
+        Ok(&bytes[self.consumed..self.len])
+    }
+}
+
+struct StreamRxBytes {
+    chunks: VecDeque<StreamRxChunk>,
+    len: usize,
+    limit: usize,
+}
+
+impl StreamRxBytes {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::with_capacity(TCP_INITIAL_CHUNKS),
+            len: 0,
+            limit: TCP_BUFFER_BYTES,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.limit.saturating_sub(self.len)
+    }
+
+    fn push_compact(&mut self, input: &[u8]) -> Result<usize, SocketError> {
+        self.push_compact_with(input.len(), |offset, output| {
+            output.copy_from_slice(&input[offset..offset + output.len()]);
+            Ok(())
+        })
+    }
+
+    fn push_compact_with<E>(
+        &mut self,
+        len: usize,
+        mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let len = len.min(self.available());
+        let mut chunks = VecDeque::new();
+        let mut copied = 0usize;
+        while copied < len {
+            let payload_len = (len - copied).min(SOCKET_CHUNK_BYTES);
+            let capacity = compact_rx_class(payload_len);
+            let mut bytes = alloc::vec![0; capacity].into_boxed_slice();
+            copy(copied, &mut bytes[..payload_len])?;
+            chunks.push_back(StreamRxChunk {
+                storage: StreamRxChunkStorage::Compact(bytes),
+                consumed: 0,
+                len: payload_len,
+            });
+            copied += payload_len;
+        }
+        self.chunks.extend(chunks);
+        self.len += copied;
+        Ok(copied)
+    }
+
+    fn push_shared_chain(&mut self, mut chain: PacketChain) -> Result<usize, SocketError> {
+        let len = chain.total_len();
+        if len > self.available()
+            || (0..chain.fragment_count())
+                .any(|index| !matches!(chain.fragment(index), Some(PacketFragment::Shared(_))))
+        {
+            return Err(SocketError::Buffer);
+        }
+        let count = chain.fragment_count();
+        for index in 0..count {
+            let Some(PacketFragment::Shared(chunk)) = chain.take_fragment(index) else {
+                unreachable!("shared RX chain was prevalidated");
+            };
+            let chunk_len = chunk.len();
+            self.chunks.push_back(StreamRxChunk {
+                storage: StreamRxChunkStorage::Shared(chunk),
+                consumed: 0,
+                len: chunk_len,
+            });
+        }
+        self.len += len;
+        Ok(len)
+    }
+
+    fn copy_range(&self, offset: usize, output: &mut [u8]) -> bool {
+        if offset.saturating_add(output.len()) > self.len {
+            return false;
+        }
+        let mut skipped = offset;
+        let mut copied = 0usize;
+        for chunk in &self.chunks {
+            let Ok(bytes) = chunk.bytes() else {
+                return false;
+            };
+            if skipped >= bytes.len() {
+                skipped -= bytes.len();
+                continue;
+            }
+            let len = (bytes.len() - skipped).min(output.len() - copied);
+            output[copied..copied + len].copy_from_slice(&bytes[skipped..skipped + len]);
+            copied += len;
+            skipped = 0;
+            if copied == output.len() {
+                return true;
+            }
+        }
+        copied == output.len()
+    }
+
+    fn consume(&mut self, len: usize) -> usize {
+        let mut remaining = len.min(self.len);
+        let consumed = remaining;
+        while remaining != 0 {
+            let front = self.chunks.front_mut().expect("RX length tracks chunks");
+            let available = front.len - front.consumed;
+            let take = available.min(remaining);
+            front.consumed += take;
+            remaining -= take;
+            if front.consumed == front.len {
+                self.chunks.pop_front();
+            }
+        }
+        self.len -= consumed;
+        consumed
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.clamp(16 * 1024, TCP_BUFFER_HARD_LIMIT);
+    }
+
+    #[cfg(test)]
+    fn allocated_capacity(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|chunk| match &chunk.storage {
+                StreamRxChunkStorage::Shared(chunk) => chunk.len(),
+                StreamRxChunkStorage::Compact(bytes) => bytes.len(),
+            })
+            .sum()
+    }
+}
+
+const fn compact_rx_class(len: usize) -> usize {
+    match len {
+        0..=256 => 256,
+        257..=512 => 512,
+        513..=1024 => 1024,
+        1025..=2048 => 2048,
+        _ => 4096,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamRxStorageKind {
+    Discarded,
+    Compact,
+    PhysicalPinned,
+    LoopbackShared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamRxCommit {
+    pub len: usize,
+    pub storage: StreamRxStorageKind,
+    pub low_water_fallback: bool,
 }
 
 struct StreamRxRing {
-    bytes: ByteRing,
+    bytes: StreamRxBytes,
     eof: bool,
 }
 
 impl StreamRxRing {
     fn new() -> Self {
         Self {
-            bytes: ByteRing::new(),
+            bytes: StreamRxBytes::new(),
             eof: false,
         }
     }
@@ -603,6 +1126,13 @@ impl TcpTxLease {
         }
         Ok(())
     }
+
+    pub fn packet_chain(&self) -> Result<Option<PacketChain>, SocketError> {
+        self.facade
+            .stream_tx
+            .lock()
+            .pin_absolute(self.start, usize::from(self.len))
+    }
 }
 
 struct TxEntry {
@@ -613,6 +1143,7 @@ struct TxEntry {
     destination: Endpoint,
     dont_route: bool,
     confirm: bool,
+    dma_payload: Option<PacketChain>,
 }
 
 struct TxRing {
@@ -624,6 +1155,7 @@ struct TxRing {
     free_chunks: [u64; 2],
     used_bytes: usize,
     limit: usize,
+    dma_pool: Option<SharedNetBufPool>,
 }
 
 impl TxRing {
@@ -642,13 +1174,28 @@ impl TxRing {
             free_chunks: [u64::MAX >> 32, 0],
             used_bytes: 0,
             limit: UDP_BUFFER_BYTES,
+            dma_pool: None,
         }
     }
 
     fn writable(&self) -> bool {
-        !self.free_slots.is_empty()
-            && self.free_chunks.iter().any(|word| *word != 0)
-            && self.used_bytes < self.limit
+        self.can_push_len(1)
+    }
+
+    fn can_push_len(&self, payload_len: usize) -> bool {
+        let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
+        if chunk_count > MAX_DATAGRAM_CHUNKS
+            || self.used_bytes.saturating_add(payload_len) > self.limit
+            || self.free_slots.is_empty()
+        {
+            return false;
+        }
+        let Some(pool) = self.dma_pool.as_ref() else {
+            return self.free_chunk_count() >= chunk_count;
+        };
+        let mut owner = pool.lock();
+        owner.drain_remote();
+        owner.available() >= chunk_count
     }
 
     fn is_empty(&self) -> bool {
@@ -662,6 +1209,9 @@ impl TxRing {
         dont_route: bool,
         confirm: bool,
     ) -> Result<(), SocketError> {
+        if let Some(pool) = self.dma_pool.as_ref().cloned() {
+            return self.push_dma(payload, destination, dont_route, confirm, pool);
+        }
         let chunk_count = payload.len().div_ceil(SOCKET_CHUNK_BYTES);
         if chunk_count > MAX_DATAGRAM_CHUNKS
             || self.used_bytes.saturating_add(payload.len()) > self.limit
@@ -691,6 +1241,7 @@ impl TxRing {
             destination,
             dont_route,
             confirm,
+            dma_payload: None,
         });
         self.queued.push_back(slot);
         self.used_bytes += payload.len();
@@ -699,6 +1250,66 @@ impl TxRing {
             record_payload_copy(copy_start, payload.len());
             profiling::observe(profiling::Metric::UdpTxQueueDepth, self.queued.len() as u64);
         }
+        Ok(())
+    }
+
+    fn push_dma(
+        &mut self,
+        payload: &[u8],
+        destination: Endpoint,
+        dont_route: bool,
+        confirm: bool,
+        pool: SharedNetBufPool,
+    ) -> Result<(), SocketError> {
+        let chunk_count = payload.len().div_ceil(SOCKET_CHUNK_BYTES);
+        if chunk_count > MAX_DATAGRAM_CHUNKS
+            || self.used_bytes.saturating_add(payload.len()) > self.limit
+            || self.free_slots.is_empty()
+        {
+            return Err(SocketError::WouldBlock);
+        }
+        let mut leases: [Option<NetBufLease>; MAX_DATAGRAM_CHUNKS] = core::array::from_fn(|_| None);
+        {
+            let mut owner = pool.lock();
+            owner.drain_remote();
+            for (index, part) in payload.chunks(SOCKET_CHUNK_BYTES).enumerate() {
+                let mut lease = owner
+                    .lease(0, part.len() as u16, PacketMetadata::default())
+                    .map_err(|_| SocketError::WouldBlock)?;
+                lease
+                    .as_mut_slice()
+                    .map_err(|_| SocketError::Buffer)?
+                    .copy_from_slice(part);
+                leases[index] = Some(lease);
+            }
+        }
+        let mut chain = PacketChain::new();
+        for lease in leases.into_iter().flatten() {
+            let chunk = lease
+                .into_chunk()
+                .and_then(|chunk| chunk.retain_pool(Arc::clone(&pool)))
+                .map_err(|_| SocketError::Buffer)?;
+            chain
+                .push(PacketFragment::Shared(chunk))
+                .map_err(|_| SocketError::Buffer)?;
+        }
+        let slot = self.free_slots.pop().unwrap();
+        let generation = self.generations[usize::from(slot)].wrapping_add(1).max(1);
+        self.generations[usize::from(slot)] = generation;
+        self.entries[usize::from(slot)] = Some(TxEntry {
+            generation,
+            chunks: [0; MAX_DATAGRAM_CHUNKS],
+            chunk_count: 0,
+            len: payload.len() as u16,
+            destination,
+            dont_route,
+            confirm,
+            dma_payload: Some(chain),
+        });
+        self.queued.push_back(slot);
+        self.used_bytes += payload.len();
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::UdpTxQueueDepth, self.queued.len() as u64);
         Ok(())
     }
 
@@ -748,6 +1359,11 @@ impl TxRing {
             .as_ref()
             .filter(|entry| entry.generation == generation)
             .ok_or(SocketError::Closed)?;
+        if let Some(payload) = entry.dma_payload.as_ref() {
+            return payload
+                .copy_out(payload_offset, output)
+                .map_err(|_| SocketError::Buffer);
+        }
         let end = payload_offset
             .checked_add(output.len())
             .ok_or(SocketError::Buffer)?;
@@ -796,6 +1412,34 @@ impl TxRing {
         self.used_bytes = self.used_bytes.saturating_sub(usize::from(entry.len));
         self.free_slots.push(slot);
         true
+    }
+
+    fn pin_payload(&self, slot: u16, generation: u32) -> Result<Option<PacketChain>, SocketError> {
+        let entry = self.entries[usize::from(slot)]
+            .as_ref()
+            .filter(|entry| entry.generation == generation)
+            .ok_or(SocketError::Closed)?;
+        entry
+            .dma_payload
+            .as_ref()
+            .map(|payload| payload.pin_shared().map_err(|_| SocketError::Buffer))
+            .transpose()
+    }
+
+    fn install_pool(&mut self, pool: SharedNetBufPool) {
+        self.dma_pool = Some(pool);
+    }
+
+    fn pool_key(&self) -> Option<usize> {
+        self.dma_pool
+            .as_ref()
+            .map(|pool| Arc::as_ptr(pool) as usize)
+    }
+
+    fn exhausted_pool_key(&self) -> Option<usize> {
+        (!self.writable() && self.free_slots.len() != 0 && self.used_bytes < self.limit)
+            .then(|| self.pool_key())
+            .flatten()
     }
 
     fn free_chunk_count(&self) -> usize {
@@ -1086,11 +1730,17 @@ fn record_payload_copy(start_cycles: u64, bytes: usize) {
 }
 
 #[cfg(feature = "performance-profile")]
-fn record_socket_wakeup(queue: &WaitQueue) {
+fn record_socket_wakeup() {
     profiling::observe(profiling::Metric::SocketWakeup, 1);
+}
+
+fn wake_one_socket_waiter(queue: &WaitQueue) {
     if queue.len_hint() == 0 {
-        profiling::observe(profiling::Metric::SocketEmptyWakeup, 1);
+        return;
     }
+    #[cfg(feature = "performance-profile")]
+    record_socket_wakeup();
+    queue.wake_one_default();
 }
 
 pub struct UdpTxLease {
@@ -1127,6 +1777,15 @@ impl UdpTxLease {
             .copy_range(self.slot, self.generation, offset, output)
     }
 
+    pub fn packet_chain(&self) -> Result<Option<PacketChain>, SocketError> {
+        self.facade
+            .tx
+            .lock()
+            .as_ref()
+            .expect("UDP facade 必须拥有 TX ring")
+            .pin_payload(self.slot, self.generation)
+    }
+
     pub fn complete(mut self) {
         self.finish();
     }
@@ -1136,16 +1795,30 @@ impl UdpTxLease {
             return;
         }
         self.completed = true;
-        let writable = {
+        let (completed, pool_key) = {
             let mut tx = self.facade.tx.lock();
             let tx = tx.as_mut().expect("UDP facade 必须拥有 TX ring");
-            tx.complete(self.slot, self.generation) && tx.writable()
+            let pool_key = tx.pool_key();
+            (tx.complete(self.slot, self.generation), pool_key)
         };
+        if !completed {
+            return;
+        }
+        if let Some(pool_key) = pool_key {
+            wake_dma_tx_pool_waiter(pool_key, Arc::as_ptr(&self.facade));
+        }
+        let writable = self
+            .facade
+            .tx
+            .lock()
+            .as_ref()
+            .expect("UDP facade 必须拥有 TX ring")
+            .writable();
         if writable {
             self.facade.set_ready(Readiness::WRITABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.facade.write_wait);
-            self.facade.write_wait.wake_one_default();
+            wake_one_socket_waiter(&self.facade.write_wait);
+        } else {
+            self.facade.clear_ready(Readiness::WRITABLE);
         }
     }
 }
@@ -1246,6 +1919,51 @@ pub struct SocketFacade {
     receive_window_update: AtomicBool,
     connect_pending: AtomicBool,
     stream_connected: AtomicBool,
+}
+
+fn queue_dma_tx_pool_waiter(facade: &Arc<SocketFacade>, pool_key: usize) {
+    let mut waiters = DMA_TX_POOL_WAITERS.lock();
+    let mut present = false;
+    waiters.retain(|waiter| {
+        let Some(existing) = waiter.facade.upgrade() else {
+            return false;
+        };
+        present |= waiter.pool_key == pool_key && Arc::ptr_eq(&existing, facade);
+        true
+    });
+    if !present {
+        waiters.push_back(DmaTxPoolWaiter {
+            pool_key,
+            facade: Arc::downgrade(facade),
+        });
+    }
+}
+
+fn wake_dma_tx_pool_waiter(pool_key: usize, exclude: *const SocketFacade) -> bool {
+    let initial_len = DMA_TX_POOL_WAITERS.lock().len();
+    for _ in 0..initial_len {
+        let waiter = DMA_TX_POOL_WAITERS.lock().pop_front();
+        let Some(waiter) = waiter else {
+            break;
+        };
+        let Some(facade) = waiter.facade.upgrade() else {
+            continue;
+        };
+        if waiter.pool_key != pool_key {
+            DMA_TX_POOL_WAITERS.lock().push_back(waiter);
+            continue;
+        }
+        if Arc::as_ptr(&facade) == exclude {
+            continue;
+        }
+        if facade.reserve_dma_tx_capacity(pool_key) {
+            return true;
+        }
+        if facade.exhausted_dma_tx_pool_key() == Some(pool_key) {
+            DMA_TX_POOL_WAITERS.lock().push_back(waiter);
+        }
+    }
+    false
 }
 
 impl SocketFacade {
@@ -1363,6 +2081,21 @@ impl SocketFacade {
 
     pub const fn protocol(&self) -> u8 {
         self.protocol
+    }
+
+    /// 将 TCP 发送 ring 迁移到目标 queue 的稳定 payload pool。
+    ///
+    /// 已经排队的数据只在安装时迁移一次；失败时保留原 heap ring，发送语义不变。
+    pub fn install_stream_tx_pool(&self, pool: SharedNetBufPool) -> bool {
+        self.kind == SocketKind::Stream && self.stream_tx.lock().install_pool(pool)
+    }
+
+    /// 让后续 datagram 直接写入目标 queue 的 payload pool。
+    pub fn install_datagram_tx_pool(&self, pool: SharedNetBufPool) {
+        if let Some(tx) = self.tx.lock().as_mut() {
+            tx.install_pool(pool);
+        }
+        self.refresh_tx_readiness();
     }
 
     pub fn raw_header_included(&self) -> bool {
@@ -1859,19 +2592,29 @@ impl SocketFacade {
             return Err(SocketError::MessageTooLarge);
         }
         loop {
-            let was_empty = {
+            let pushed = {
                 let mut tx_guard = self.tx.lock();
                 let tx = tx_guard.as_mut().expect("UDP facade 必须拥有 TX ring");
                 let was_empty = tx.is_empty();
                 match tx.push(payload, destination, dont_route, confirm) {
-                    Ok(()) => was_empty,
-                    Err(SocketError::WouldBlock) if !nonblocking => {
-                        drop(tx_guard);
-                        self.wait_write(deadline_ns)?;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
+                    Ok(()) => Ok(was_empty),
+                    Err(error) => Err((error, tx.exhausted_pool_key())),
                 }
+            };
+            let was_empty = match pushed {
+                Ok(was_empty) => was_empty,
+                Err((SocketError::WouldBlock, pool_key)) => {
+                    if let Some(pool_key) = pool_key {
+                        queue_dma_tx_pool_waiter(self, pool_key);
+                    }
+                    self.refresh_tx_readiness();
+                    if nonblocking {
+                        return Err(SocketError::WouldBlock);
+                    }
+                    self.wait_datagram_write(payload.len(), deadline_ns)?;
+                    continue;
+                }
+                Err((error, _)) => return Err(error),
             };
             self.refresh_tx_readiness();
             if was_empty && !self.tx_notified.swap(true, Ordering::AcqRel) {
@@ -1901,7 +2644,7 @@ impl SocketFacade {
                 .is_empty(),
             SocketKind::Stream => {
                 let tx = self.stream_tx.lock();
-                tx.sent < tx.bytes.len
+                tx.sent < tx.bytes.len()
             }
         };
         if pending && !self.tx_notified.swap(true, Ordering::AcqRel) {
@@ -1909,6 +2652,16 @@ impl SocketFacade {
                 .expect("socket runtime 必须保持安装")
                 .notify_tx(Arc::clone(self));
         }
+    }
+
+    pub fn has_pending_datagram_tx(&self) -> bool {
+        matches!(self.kind, SocketKind::Datagram | SocketKind::Raw)
+            && !self
+                .tx
+                .lock()
+                .as_ref()
+                .expect("datagram facade 必须拥有 TX ring")
+                .is_empty()
     }
 
     pub fn stream_tx_generation(&self) -> u64 {
@@ -2211,6 +2964,11 @@ impl SocketFacade {
                     return Ok(accepted);
                 }
             }
+            if copied == 0
+                && let Some(pool_key) = self.stream_tx.lock().exhausted_pool_key()
+            {
+                queue_dma_tx_pool_waiter(self, pool_key);
+            }
             self.refresh_tx_readiness();
             if nonblocking {
                 return if accepted == 0 {
@@ -2252,7 +3010,7 @@ impl SocketFacade {
 
     pub fn stream_unsent_len(&self) -> usize {
         let tx = self.stream_tx.lock();
-        tx.bytes.len.saturating_sub(tx.sent)
+        tx.bytes.len().saturating_sub(tx.sent)
     }
 
     #[cfg(test)]
@@ -2286,7 +3044,7 @@ impl SocketFacade {
 
     #[cfg(test)]
     pub(crate) fn test_stream_tx_len(&self) -> usize {
-        self.stream_tx.lock().bytes.len
+        self.stream_tx.lock().bytes.len()
     }
 
     pub fn retransmit_stream(self: &Arc<Self>, start: u64, len: usize) -> Option<TcpTxLease> {
@@ -2303,19 +3061,24 @@ impl SocketFacade {
     }
 
     pub fn acknowledge_stream(&self, len: usize) -> usize {
-        let writable = {
+        let (consumed, pool_key) = {
             let mut tx = self.stream_tx.lock();
             let consumed = tx.acknowledge(len);
-            let writable = tx.bytes.available() != 0;
-            (consumed, writable)
+            (consumed, tx.pool_key())
         };
-        if writable.1 {
-            self.set_ready(Readiness::WRITABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.write_wait);
-            self.write_wait.wake_one_default();
+        if consumed != 0 {
+            pool_key.inspect(|pool_key| {
+                wake_dma_tx_pool_waiter(*pool_key, core::ptr::from_ref(self));
+            });
         }
-        writable.0
+        if self.stream_is_writable() {
+            if self.set_ready(Readiness::WRITABLE) {
+                wake_one_socket_waiter(&self.write_wait);
+            }
+        } else {
+            self.clear_ready(Readiness::WRITABLE);
+        }
+        consumed
     }
 
     pub fn abort_stream_tx(&self) {
@@ -2324,71 +3087,91 @@ impl SocketFacade {
     }
 
     pub fn push_stream_rx(&self, payload: &[u8]) -> Result<usize, SocketError> {
+        self.push_stream_rx_compact(payload)
+            .map(|commit| commit.len)
+    }
+
+    pub(crate) fn push_stream_rx_compact(
+        &self,
+        payload: &[u8],
+    ) -> Result<StreamRxCommit, SocketError> {
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
         if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
-            return Ok(payload.len());
+            return Ok(StreamRxCommit {
+                len: payload.len(),
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            });
         }
-        let was_empty;
-        let copied;
-        {
+        let (was_empty, copied) = {
             let mut rx = self.stream_rx.lock();
             if rx.bytes.available() < payload.len() {
                 return Err(SocketError::WouldBlock);
             }
-            was_empty = rx.bytes.len == 0;
-            copied = rx.bytes.push(payload);
-        }
+            let was_empty = rx.bytes.len == 0;
+            let copied = rx.bytes.push_compact(payload)?;
+            (was_empty, copied)
+        };
         debug_assert_eq!(copied, payload.len());
-        self.tcp_bytes_received
-            .fetch_add(copied as u64, Ordering::Relaxed);
-        if was_empty && copied != 0 {
-            self.set_ready(Readiness::READABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.read_wait);
-            self.read_wait.wake_one_default();
-        }
-        Ok(copied)
+        self.finish_stream_rx_commit(was_empty, copied);
+        Ok(StreamRxCommit {
+            len: copied,
+            storage: StreamRxStorageKind::Compact,
+            low_water_fallback: false,
+        })
     }
 
-    pub fn push_stream_rx_chain(
+    pub(crate) fn push_stream_rx_packet(
         &self,
-        packet: &PacketChain,
+        packet: &mut PacketChain,
         offset: usize,
         len: usize,
-    ) -> Result<usize, SocketError> {
+        pressure: RxPoolPressure,
+    ) -> Result<StreamRxCommit, SocketError> {
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
         if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
-            return Ok(len);
+            return Ok(StreamRxCommit {
+                len,
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            });
         }
-        let was_empty;
-        {
+        let should_pin =
+            pressure == RxPoolPressure::Normal && len >= crate::tuning::TCP_RX_PIN_MIN_BYTES;
+        let low_water_fallback =
+            matches!(pressure, RxPoolPressure::Low | RxPoolPressure::Emergency)
+                && len >= crate::tuning::TCP_RX_PIN_MIN_BYTES;
+        let (was_empty, storage) = {
             let mut rx = self.stream_rx.lock();
             if rx.bytes.available() < len {
                 return Err(SocketError::WouldBlock);
             }
-            was_empty = rx.bytes.len == 0;
-            let mut copied = 0usize;
-            packet
-                .for_each_slice(offset, len, |payload| {
-                    copied += rx.bytes.push(payload);
-                    Ok::<_, ()>(())
-                })
-                .map_err(|_| SocketError::Buffer)?;
-            debug_assert_eq!(copied, len);
-        }
-        self.tcp_bytes_received
-            .fetch_add(len as u64, Ordering::Relaxed);
-        if was_empty && len != 0 {
-            self.set_ready(Readiness::READABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.read_wait);
-            self.read_wait.wake_one_default();
-        }
-        Ok(len)
+            let was_empty = rx.bytes.len == 0;
+            if should_pin
+                && let Ok(shared) = packet.pin_range_shared(offset, len)
+                && rx.bytes.push_shared_chain(shared).is_ok()
+            {
+                (was_empty, StreamRxStorageKind::PhysicalPinned)
+            } else {
+                let copied = rx.bytes.push_compact_with(len, |copied, output| {
+                    packet
+                        .copy_out(offset + copied, output)
+                        .map_err(|_| SocketError::Buffer)
+                })?;
+                debug_assert_eq!(copied, len);
+                (was_empty, StreamRxStorageKind::Compact)
+            }
+        };
+        self.finish_stream_rx_commit(was_empty, len);
+        Ok(StreamRxCommit {
+            len,
+            storage,
+            low_water_fallback,
+        })
     }
 
     pub(crate) fn push_stream_rx_lease(
@@ -2396,34 +3179,52 @@ impl SocketFacade {
         lease: &TcpTxLease,
         offset: usize,
         len: usize,
-    ) -> Result<usize, SocketError> {
+    ) -> Result<StreamRxCommit, SocketError> {
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
         if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
-            return Ok(len);
+            return Ok(StreamRxCommit {
+                len,
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            });
         }
-        let was_empty;
-        {
+        let (was_empty, storage) = {
             let mut rx = self.stream_rx.lock();
             if rx.bytes.available() < len {
                 return Err(SocketError::WouldBlock);
             }
-            was_empty = rx.bytes.len == 0;
-            let copied = rx.bytes.push_with(len, |copied, output| {
-                lease.copy_range(offset + copied, output)
-            })?;
-            debug_assert_eq!(copied, len);
-        }
+            let was_empty = rx.bytes.len == 0;
+            let shared = lease
+                .packet_chain()?
+                .and_then(|chain| chain.pin_shared_range(offset, len).ok());
+            if let Some(shared) = shared {
+                rx.bytes.push_shared_chain(shared)?;
+                (was_empty, StreamRxStorageKind::LoopbackShared)
+            } else {
+                let copied = rx.bytes.push_compact_with(len, |copied, output| {
+                    lease.copy_range(offset + copied, output)
+                })?;
+                debug_assert_eq!(copied, len);
+                (was_empty, StreamRxStorageKind::Compact)
+            }
+        };
+        self.finish_stream_rx_commit(was_empty, len);
+        Ok(StreamRxCommit {
+            len,
+            storage,
+            low_water_fallback: false,
+        })
+    }
+
+    fn finish_stream_rx_commit(&self, was_empty: bool, len: usize) {
         self.tcp_bytes_received
             .fetch_add(len as u64, Ordering::Relaxed);
         if was_empty && len != 0 {
             self.set_ready(Readiness::READABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.read_wait);
-            self.read_wait.wake_one_default();
+            wake_one_socket_waiter(&self.read_wait);
         }
-        Ok(len)
     }
 
     pub fn publish_stream_eof(&self) {
@@ -2506,9 +3307,7 @@ impl SocketFacade {
         };
         if was_empty {
             self.set_ready(Readiness::READABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.read_wait);
-            self.read_wait.wake_one_default();
+            wake_one_socket_waiter(&self.read_wait);
         }
         Ok(())
     }
@@ -2546,9 +3345,7 @@ impl SocketFacade {
         };
         if was_empty {
             self.set_ready(Readiness::READABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.read_wait);
-            self.read_wait.wake_one_default();
+            wake_one_socket_waiter(&self.read_wait);
         }
         Ok(())
     }
@@ -2636,7 +3433,7 @@ impl SocketFacade {
             if empty {
                 self.refresh_rx_readiness();
             } else {
-                self.read_wait.wake_one_default();
+                wake_one_socket_waiter(&self.read_wait);
             }
         }
         Ok(Some(result))
@@ -2728,6 +3525,16 @@ impl SocketFacade {
     pub fn begin_lifecycle_drain(&self) {
         self.lifecycle_notified.store(false, Ordering::Release);
         fence(Ordering::SeqCst);
+    }
+
+    pub fn retry_lifecycle(self: &Arc<Self>) {
+        if self.closing.load(Ordering::Acquire)
+            && !self.lifecycle_notified.swap(true, Ordering::AcqRel)
+        {
+            socket_runtime()
+                .expect("socket runtime 必须保持安装")
+                .notify_lifecycle(Arc::clone(self));
+        }
     }
 
     pub fn publish_binding(
@@ -3025,7 +3832,7 @@ impl SocketFacade {
                     .limit,
             ),
             SocketKind::Stream => (
-                self.stream_tx.lock().bytes.limit,
+                self.stream_tx.lock().bytes.limit(),
                 self.stream_rx.lock().bytes.limit,
             ),
         }
@@ -3067,9 +3874,46 @@ impl SocketFacade {
 
     fn stream_is_writable(&self) -> bool {
         let tx = self.stream_tx.lock();
-        tx.bytes.available() != 0
-            && tx.bytes.len.saturating_sub(tx.sent)
-                < self.tcp_notsent_lowat.load(Ordering::Acquire) as usize
+        if tx.bytes.len().saturating_sub(tx.sent)
+            >= self.tcp_notsent_lowat.load(Ordering::Acquire) as usize
+        {
+            return false;
+        }
+        tx.writable()
+    }
+
+    fn reserve_dma_tx_capacity(&self, pool_key: usize) -> bool {
+        if self.write_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        let reserved = match self.kind {
+            SocketKind::Stream => {
+                let mut tx = self.stream_tx.lock();
+                tx.bytes.len().saturating_sub(tx.sent)
+                    < self.tcp_notsent_lowat.load(Ordering::Acquire) as usize
+                    && tx.reserve_pool_chunk(pool_key)
+            }
+            SocketKind::Datagram | SocketKind::Raw => self
+                .tx
+                .lock()
+                .as_ref()
+                .is_some_and(|tx| tx.pool_key() == Some(pool_key) && tx.writable()),
+        };
+        if reserved {
+            if self.set_ready(Readiness::WRITABLE) {
+                wake_one_socket_waiter(&self.write_wait);
+            }
+        }
+        reserved
+    }
+
+    fn exhausted_dma_tx_pool_key(&self) -> Option<usize> {
+        match self.kind {
+            SocketKind::Stream => self.stream_tx.lock().exhausted_pool_key(),
+            SocketKind::Datagram | SocketKind::Raw => {
+                self.tx.lock().as_ref().and_then(TxRing::exhausted_pool_key)
+            }
+        }
     }
 
     fn refresh_rx_readiness(&self) {
@@ -3122,9 +3966,7 @@ impl SocketFacade {
             self.clear_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
         } else {
             self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
-            #[cfg(feature = "performance-profile")]
-            record_socket_wakeup(&self.accept_wait);
-            self.accept_wait.wake_one_default();
+            wake_one_socket_waiter(&self.accept_wait);
         }
     }
 
@@ -3175,6 +4017,22 @@ impl SocketFacade {
         self.wait_io(&self.write_wait, Readiness::WRITABLE, deadline_ns)
     }
 
+    fn wait_datagram_write(
+        &self,
+        payload_len: usize,
+        deadline_ns: Option<u64>,
+    ) -> Result<(), SocketError> {
+        self.wait_io_until(&self.write_wait, deadline_ns, |facade| {
+            let (current, _) = facade.readiness();
+            socket_wait_terminal(current)
+                || facade
+                    .tx
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|tx| tx.can_push_len(payload_len))
+        })
+    }
+
     fn wait_accept(&self, deadline_ns: Option<u64>) -> Result<(), SocketError> {
         self.wait_io(&self.accept_wait, Readiness::ACCEPTABLE, deadline_ns)
     }
@@ -3185,22 +4043,36 @@ impl SocketFacade {
         readiness: Readiness,
         deadline_ns: Option<u64>,
     ) -> Result<(), SocketError> {
+        self.wait_io_until(queue, deadline_ns, |facade| {
+            let (current, _) = facade.readiness();
+            socket_wait_observable(current, readiness)
+        })
+    }
+
+    fn wait_io_until(
+        &self,
+        queue: &WaitQueue,
+        deadline_ns: Option<u64>,
+        observable: impl Fn(&Self) -> bool,
+    ) -> Result<(), SocketError> {
+        // Timer IRQ 若发生在内核态，只会记录 deferred tick。持续背压可能在
+        // readiness generation 变化与重试之间长期停留在同一个 syscall，先在
+        // 无锁边界推进 ITIMER_REAL，避免 alarm 被高频 socket wait 饿死。
+        sched::drain_deferred_timer_tick();
         self.ensure_stack_attached()?;
         let task = sched::current_task();
-        let (_, observed_generation) = self.readiness();
         let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
         if let Err(error) = self.ensure_stack_attached() {
             queue.finish_wait(&entry);
             return Err(error);
         }
-        let (current, generation) = self.readiness();
-        if current.contains(readiness) || generation != observed_generation {
-            queue.finish_wait(&entry);
-            return Ok(());
-        }
         if sched::operation::has_interrupting_signal(&task) {
             queue.finish_wait(&entry);
             return Err(SocketError::Interrupted);
+        }
+        if observable(self) {
+            queue.finish_wait(&entry);
+            return Ok(());
         }
         if deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
             queue.finish_wait(&entry);
@@ -3225,20 +4097,20 @@ impl SocketFacade {
         Ok(())
     }
 
-    fn set_ready(&self, bits: Readiness) {
-        self.update_ready(bits.0, 0);
+    fn set_ready(&self, bits: Readiness) -> bool {
+        self.update_ready(bits.0, 0)
     }
 
     fn clear_ready(&self, bits: Readiness) {
         self.update_ready(0, bits.0);
     }
 
-    fn update_ready(&self, set: u16, clear: u16) {
+    fn update_ready(&self, set: u16, clear: u16) -> bool {
         let mut current = self.readiness.load(Ordering::Acquire);
         loop {
             let next = (current | set) & !clear;
             if next == current {
-                return;
+                return false;
             }
             match self.readiness.compare_exchange_weak(
                 current,
@@ -3256,12 +4128,20 @@ impl SocketFacade {
                     if let Some(observer) = observer {
                         observer.readiness_changed(Readiness(next), generation);
                     }
-                    return;
+                    return true;
                 }
                 Err(observed) => current = observed,
             }
         }
     }
+}
+
+fn socket_wait_observable(current: Readiness, requested: Readiness) -> bool {
+    current.contains(requested) || socket_wait_terminal(current)
+}
+
+fn socket_wait_terminal(current: Readiness) -> bool {
+    current.intersects(Readiness::ERROR | Readiness::HANGUP | Readiness::READ_HANGUP)
 }
 
 fn error_code(error: SocketError) -> u32 {
@@ -3271,8 +4151,31 @@ fn error_code(error: SocketError) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buf::PacketFragment;
+    use crate::buf::NetBufPool;
     use crate::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn resident_allocation_scope_restores_outer_elm_context() {
+        assert!(elm_model::current_context().is_none());
+        let outer = elm_model::ElmContext::new(
+            elm_model::ElmId(7),
+            None,
+            elm_model::Generation::FIRST,
+            elm_model::ElmState::Active,
+            elm_model::ElmLifecyclePhase::Initialize,
+            0,
+        );
+        let _outer = elm_model::enter_current_context(&outer).expect("进入外层 ELM 上下文");
+        assert_eq!(elm_model::current_cell(), Some(elm_model::ElmId(7)));
+
+        let resident = enter_resident_allocation_scope()
+            .expect("建立 resident allocation scope")
+            .expect("ELM 内必须建立嵌套 scope");
+        assert!(elm_model::current_cell().is_none());
+        drop(resident);
+
+        assert_eq!(elm_model::current_cell(), Some(elm_model::ElmId(7)));
+    }
 
     #[test]
     fn stack_generation_detach_publishes_stable_network_down() {
@@ -3330,13 +4233,10 @@ mod tests {
         assert!(facade.tx.lock().is_none());
         assert!(facade.rx.lock().is_none());
         assert_eq!(
-            facade.stream_tx.lock().bytes.arena.len(),
+            facade.stream_tx.lock().bytes.allocated_capacity(),
             2 * SOCKET_CHUNK_BYTES
         );
-        assert_eq!(
-            facade.stream_rx.lock().bytes.arena.len(),
-            2 * SOCKET_CHUNK_BYTES
-        );
+        assert_eq!(facade.stream_rx.lock().bytes.allocated_capacity(), 0);
     }
 
     #[test]
@@ -3359,31 +4259,66 @@ mod tests {
     }
 
     #[test]
-    fn stream_rx_copies_packet_chain_without_linearizing() {
+    fn stream_rx_pins_healthy_physical_chunk_until_user_consumes_it() {
+        let mut owner = NetBufPool::new_heap(2, SOCKET_CHUNK_BYTES).unwrap();
+        let mut lease = owner.lease(0, 1024, PacketMetadata::default()).unwrap();
+        lease.as_mut_slice().unwrap().fill(0x5a);
+        let mut packet = PacketChain::from_lease(lease);
         let facade = Arc::new(SocketFacade::new(
             SocketId {
                 boot_nonce: 7,
-                counter: 5,
+                counter: 51,
             },
             AddressFamily::Ipv4,
             SocketKind::Stream,
         ));
-        let mut packet = PacketChain::from_owned(alloc::vec![0, 1, 2, 3]);
-        packet
-            .push(PacketFragment::Owned(
-                alloc::vec![4, 5, 6, 7].into_boxed_slice(),
-            ))
-            .unwrap_or_else(|_| unreachable!());
 
-        assert_eq!(facade.push_stream_rx_chain(&packet, 2, 5), Ok(5));
-        let mut output = [0u8; 8];
+        let commit = facade
+            .push_stream_rx_packet(&mut packet, 0, 1024, RxPoolPressure::Normal)
+            .unwrap();
+        assert_eq!(commit.storage, StreamRxStorageKind::PhysicalPinned);
+        drop(packet);
+        owner.drain_remote();
+        assert_eq!(owner.available(), 1);
+
+        let mut output = alloc::vec![0; 1024];
         assert_eq!(
             facade
-                .recv_stream(&mut output, false, false, true, None)
+                .recv_stream(&mut output, false, true, true, None)
                 .unwrap(),
-            5
+            output.len()
         );
-        assert_eq!(&output[..5], &[2, 3, 4, 5, 6]);
+        assert!(output.iter().all(|byte| *byte == 0x5a));
+        owner.drain_remote();
+        assert_eq!(owner.available(), 2);
+    }
+
+    #[test]
+    fn stream_rx_low_water_compacts_and_returns_dma_chunk_immediately() {
+        let mut owner = NetBufPool::new_heap(1, SOCKET_CHUNK_BYTES).unwrap();
+        let mut lease = owner.lease(0, 1024, PacketMetadata::default()).unwrap();
+        lease.as_mut_slice().unwrap().fill(0x6b);
+        let mut packet = PacketChain::from_lease(lease);
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 52,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+
+        let commit = facade
+            .push_stream_rx_packet(&mut packet, 0, 1024, RxPoolPressure::Low)
+            .unwrap();
+        assert_eq!(commit.storage, StreamRxStorageKind::Compact);
+        assert!(commit.low_water_fallback);
+        drop(packet);
+        owner.drain_remote();
+        assert_eq!(owner.available(), 1);
+
+        let rx = facade.stream_rx.lock();
+        assert_eq!(rx.bytes.allocated_capacity(), 1024);
     }
 
     #[test]
@@ -3488,6 +4423,329 @@ mod tests {
     }
 
     #[test]
+    fn dma_tcp_ring_pins_retransmits_and_conserves_pool() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(4, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 12,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        assert!(facade.install_stream_tx_pool(Arc::clone(&pool)));
+        let payload = alloc::vec![0x5a; SOCKET_CHUNK_BYTES + 300];
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+        assert_eq!(pool.lock().available(), 2);
+
+        let first = facade.take_stream_tx(payload.len()).unwrap();
+        let first_chain = first.packet_chain().unwrap().unwrap();
+        let retransmit = facade
+            .retransmit_stream(first.start, usize::from(first.len))
+            .unwrap();
+        let retransmit_chain = retransmit.packet_chain().unwrap().unwrap();
+        assert_eq!(first_chain.fragment_count(), 2);
+        assert_eq!(retransmit_chain.fragment_count(), 2);
+        assert_eq!(facade.acknowledge_stream(payload.len()), payload.len());
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 2);
+
+        drop(first_chain);
+        drop(retransmit_chain);
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 4);
+
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+        let aborted = facade.take_stream_tx(payload.len()).unwrap();
+        let completion = aborted.packet_chain().unwrap().unwrap();
+        facade.abort_stream_tx();
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 2);
+        drop(completion);
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 4);
+    }
+
+    #[test]
+    fn loopback_tcp_rx_keeps_an_independent_shared_tx_reference() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(2, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let sender = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 53,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        let receiver = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 54,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        assert!(sender.install_stream_tx_pool(Arc::clone(&pool)));
+        let payload = alloc::vec![0x7c; 1024];
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        let lease = sender.take_stream_tx(payload.len()).unwrap();
+
+        let commit = receiver
+            .push_stream_rx_lease(&lease, 0, payload.len())
+            .unwrap();
+        assert_eq!(commit.storage, StreamRxStorageKind::LoopbackShared);
+        assert_eq!(sender.acknowledge_stream(payload.len()), payload.len());
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 1);
+
+        let mut output = alloc::vec![0; payload.len()];
+        assert_eq!(
+            receiver
+                .recv_stream(&mut output, false, true, true, None)
+                .unwrap(),
+            payload.len()
+        );
+        assert_eq!(output, payload);
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 2);
+    }
+
+    #[test]
+    fn dma_tcp_writability_tracks_shared_pool_capacity() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(1, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 13,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        assert!(facade.install_stream_tx_pool(Arc::clone(&pool)));
+        assert!(facade.stream_is_writable());
+
+        let payload = alloc::vec![0x5a; SOCKET_CHUNK_BYTES];
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+        assert!(!facade.stream_is_writable());
+
+        let lease = facade.take_stream_tx(payload.len()).unwrap();
+        assert_eq!(facade.acknowledge_stream(payload.len()), payload.len());
+        assert!(facade.stream_is_writable());
+        assert_eq!(pool.lock().available(), 1);
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+        drop(lease);
+    }
+
+    #[test]
+    fn dma_tcp_pool_capacity_is_handed_to_waiting_socket() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(1, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let first = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 14,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        let second = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 15,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        assert!(first.install_stream_tx_pool(Arc::clone(&pool)));
+        assert!(second.install_stream_tx_pool(Arc::clone(&pool)));
+        assert!(first.stream_is_writable());
+
+        let payload = alloc::vec![0x5a; SOCKET_CHUNK_BYTES];
+        assert_eq!(first.test_push_stream_tx(&payload), payload.len());
+        assert!(!second.stream_is_writable());
+        let lease = first.take_stream_tx(payload.len()).unwrap();
+        let pool_key = first.stream_tx.lock().pool_key().unwrap();
+        queue_dma_tx_pool_waiter(&second, pool_key);
+        queue_dma_tx_pool_waiter(&second, pool_key);
+        assert_eq!(
+            DMA_TX_POOL_WAITERS
+                .lock()
+                .iter()
+                .filter(|waiter| waiter
+                    .facade
+                    .upgrade()
+                    .is_some_and(|facade| Arc::ptr_eq(&facade, &second)))
+                .count(),
+            1
+        );
+        assert_eq!(first.acknowledge_stream(payload.len()), payload.len());
+
+        assert!(second.stream_is_writable());
+        assert!(!first.stream_is_writable());
+        assert_eq!(second.test_push_stream_tx(&payload), payload.len());
+        drop(lease);
+    }
+
+    #[test]
+    fn dma_tcp_pool_handoff_keeps_remaining_capacity_work_conserving() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(2, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let first = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 16,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        let second = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 17,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        assert!(first.install_stream_tx_pool(Arc::clone(&pool)));
+        assert!(second.install_stream_tx_pool(Arc::clone(&pool)));
+
+        let payload = alloc::vec![0x5a; 2 * SOCKET_CHUNK_BYTES];
+        assert_eq!(first.test_push_stream_tx(&payload), payload.len());
+        assert!(!second.stream_is_writable());
+        let lease = first.take_stream_tx(payload.len()).unwrap();
+        let pool_key = first.stream_tx.lock().pool_key().unwrap();
+        queue_dma_tx_pool_waiter(&second, pool_key);
+        assert_eq!(first.acknowledge_stream(payload.len()), payload.len());
+
+        assert!(first.stream_is_writable());
+        assert!(second.stream_is_writable());
+        assert_eq!(
+            second.test_push_stream_tx(&payload[..SOCKET_CHUNK_BYTES]),
+            SOCKET_CHUNK_BYTES
+        );
+        assert_eq!(
+            first.test_push_stream_tx(&payload[..SOCKET_CHUNK_BYTES]),
+            SOCKET_CHUNK_BYTES
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn dma_udp_completion_keeps_pool_alive_after_socket_close() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(2, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let weak = Arc::downgrade(&pool);
+        let facade = facade();
+        facade.install_datagram_tx_pool(Arc::clone(&pool));
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        let payload = alloc::vec![0x33; SOCKET_CHUNK_BYTES + 1];
+        {
+            let mut tx = facade.tx.lock();
+            let tx = tx.as_mut().unwrap();
+            assert!(tx.push(&payload, destination, false, false).is_ok());
+            assert_eq!(
+                tx.push(&[1], destination, false, false),
+                Err(SocketError::WouldBlock)
+            );
+        }
+        let lease = facade.take_tx().unwrap();
+        let completion = lease.packet_chain().unwrap().unwrap();
+        lease.complete();
+        facade.close();
+        drop(facade);
+        drop(pool);
+        assert!(weak.upgrade().is_some());
+        drop(completion);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn dma_udp_readiness_tracks_pool_exhaustion() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(1, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let facade = facade();
+        facade.install_datagram_tx_pool(Arc::clone(&pool));
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        facade
+            .tx
+            .lock()
+            .as_mut()
+            .unwrap()
+            .push(&[0x5a; SOCKET_CHUNK_BYTES], destination, false, false)
+            .unwrap();
+        facade.refresh_tx_readiness();
+        assert!(!facade.readiness().0.contains(Readiness::WRITABLE));
+
+        facade.take_tx().unwrap().complete();
+        assert!(facade.readiness().0.contains(Readiness::WRITABLE));
+    }
+
+    #[test]
+    fn socket_wait_only_observes_requested_or_terminal_readiness() {
+        assert!(socket_wait_observable(
+            Readiness::WRITABLE,
+            Readiness::WRITABLE
+        ));
+        assert!(socket_wait_observable(
+            Readiness::ERROR,
+            Readiness::WRITABLE
+        ));
+        assert!(socket_wait_observable(
+            Readiness::HANGUP,
+            Readiness::READABLE
+        ));
+        assert!(!socket_wait_observable(
+            Readiness::READABLE,
+            Readiness::WRITABLE
+        ));
+    }
+
+    #[test]
+    fn dma_udp_completion_wakes_another_pool_waiter() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(1, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let first = facade();
+        let second = facade();
+        first.install_datagram_tx_pool(Arc::clone(&pool));
+        second.install_datagram_tx_pool(Arc::clone(&pool));
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        first
+            .tx
+            .lock()
+            .as_mut()
+            .unwrap()
+            .push(&[0x5a; SOCKET_CHUNK_BYTES], destination, false, false)
+            .unwrap();
+        second.refresh_tx_readiness();
+        assert!(!second.readiness().0.contains(Readiness::WRITABLE));
+        let pool_key = first.tx.lock().as_ref().unwrap().pool_key().unwrap();
+        queue_dma_tx_pool_waiter(&second, pool_key);
+
+        first.take_tx().unwrap().complete();
+        assert!(second.readiness().0.contains(Readiness::WRITABLE));
+    }
+
+    #[test]
     fn full_tx_ring_rejects_whole_datagram() {
         let facade = facade();
         let destination = Endpoint {
@@ -3513,6 +4771,23 @@ mod tests {
                 .push(&[2], destination, false, false),
             Err(SocketError::WouldBlock)
         );
+    }
+
+    #[test]
+    fn udp_capacity_is_checked_for_the_whole_datagram() {
+        let facade = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        let mut tx = facade.tx.lock();
+        let tx = tx.as_mut().unwrap();
+        tx.limit = 16 * 1024;
+        for _ in 0..16 {
+            tx.push(&[1; 1000], destination, false, false).unwrap();
+        }
+        assert!(tx.can_push_len(384));
+        assert!(!tx.can_push_len(1000));
     }
 
     #[test]

@@ -644,7 +644,7 @@ pub fn create_net_socket(
     nonblock: bool,
 ) -> Result<NetSocketFileOps, Errno> {
     let stack = net::stack::stack_snapshot();
-    if stack.state != net::stack::NetStackState::Active || !stack.probed {
+    if stack.state != net::stack::NetStackState::Active || !stack.ready {
         return Err(Errno::EAFNOSUPPORT);
     }
     let stack_instance = stack.handle.ok_or(Errno::EAFNOSUPPORT)?.0;

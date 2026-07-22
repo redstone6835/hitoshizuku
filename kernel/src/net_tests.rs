@@ -146,334 +146,86 @@ fn wait_readable(file: &vfs::file::File) {
     wait_poll(file, vfs::file::PollEvents::POLLIN);
 }
 
-fn wait_net_worker_turn() {
-    let task = sched::current_task();
-    if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-        let wake = sched::now_ns_public().saturating_add(100_000);
-        let _ = sched::register_sleep_deadline(&task, wake);
-        drop(task);
-        sched::schedule_once(sched::now_ns_public());
-    } else {
-        let _ = sched::operation::sched_yield();
-    }
-}
-
-fn elm_socket_command(
-    mut command: net::stack::NetStackSocketCommandV1,
-) -> net::stack::NetStackSocketCommandV1 {
-    loop {
-        command = match crate::net_stack::socket_command(command) {
-            Ok(command) => command,
-            Err((error, _)) => panic!("ELM socket call 失败: {:?}", error),
-        };
-        match &mut command {
-            net::stack::NetStackSocketCommandV1::Bind {
-                output: output @ Some(Err(net::stack::NetStackSocketErrorV1::InProgress)),
-                ..
-            } => {
-                *output = None;
-                wait_net_worker_turn();
-            }
-            net::stack::NetStackSocketCommandV1::Listen {
-                output: output @ Some(Err(net::stack::NetStackSocketErrorV1::InProgress)),
-                ..
-            } => {
-                *output = None;
-                wait_net_worker_turn();
-            }
-            _ => return command,
-        }
-    }
-}
-
 #[ktest]
-fn net_stack_elm_socket_table_supports_complete_call_abi() {
-    let descriptor = match elm_socket_command(net::stack::NetStackSocketCommandV1::Create {
-        family: net::stack::NET_STACK_SOCKET_FAMILY_IPV4,
-        kind: net::stack::NET_STACK_SOCKET_KIND_DATAGRAM,
-        protocol: 0,
-        output: None,
-    }) {
-        net::stack::NetStackSocketCommandV1::Create {
-            output: Some(Ok(descriptor)),
-            ..
-        } => descriptor,
-        _ => panic!("ELM socket create 未返回 descriptor"),
-    };
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::SetOption {
-            socket: descriptor.socket,
-            option: net::stack::NetStackSocketOptionV1::Broadcast,
-            value: net::stack::NetStackSocketOptionValueV1::Bool(true),
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::SetOption {
-            output: Some(Ok(())),
-            ..
-        }
-    ));
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::GetOption {
-            socket: descriptor.socket,
-            option: net::stack::NetStackSocketOptionV1::Broadcast,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::GetOption {
-            output: Some(Ok(net::stack::NetStackSocketOptionValueV1::Bool(true))),
-            ..
-        }
-    ));
-    let local = match elm_socket_command(net::stack::NetStackSocketCommandV1::Bind {
-        socket: descriptor.socket,
-        local: net::Endpoint {
-            addr: net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
-            port: 0,
-        },
-        interface: None,
-        options: net::control::BindOptions::default(),
-        output: None,
-    }) {
-        net::stack::NetStackSocketCommandV1::Bind {
-            output: Some(Ok(local)),
-            ..
-        } => local,
-        _ => panic!("ELM socket bind 未返回 endpoint"),
-    };
+fn resident_socket_control_and_shard_turn_data_path_work_together() {
+    let generation = net::stack::stack_snapshot().generation;
+    let facade =
+        net::new_socket_facade(net::AddressFamily::Ipv4).expect("创建 resident UDP facade");
+    net::track_socket_facade(&facade, generation);
+    facade.set_free_bind(true);
+    assert!(facade.free_bind());
+    facade
+        .bind(
+            net::Endpoint {
+                addr: net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+                port: 0,
+            },
+            None,
+            net::control::BindOptions::default(),
+        )
+        .expect("resident facade bind");
+    let local = facade.local_endpoint().expect("bind 后必须有本地 endpoint");
     assert_ne!(local.port, 0);
     let peer = net::Endpoint {
         addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
         port: 53,
     };
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Connect {
-            socket: descriptor.socket,
-            peer,
-            interface: None,
-            options: net::control::BindOptions::default(),
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Connect {
-            output: Some(Ok(_)),
-            ..
-        }
-    ));
-    let payload = b"socket-call";
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Send {
-            socket: descriptor.socket,
-            data: payload.as_ptr(),
-            len: payload.len() as u32,
-            destination: None,
-            dont_route: false,
-            confirm: false,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Send {
-            output: Some(Ok(11)),
-            ..
-        }
-    ));
+    facade
+        .connect(peer, None, net::control::BindOptions::default())
+        .expect("resident facade connect");
+    let payload = b"resident-facade";
+    assert_eq!(facade.send(payload, None, true, None), Ok(payload.len()));
     let mut receive = [0u8; 16];
     assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Recv {
-            socket: descriptor.socket,
-            data: receive.as_mut_ptr(),
-            capacity: receive.len() as u32,
-            peek: false,
-            truncate: false,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Recv {
-            output: Some(Err(net::stack::NetStackSocketErrorV1::WouldBlock)),
-            ..
-        }
+        facade.recv(&mut receive, false, false, true, None),
+        Err(net::SocketError::WouldBlock)
     ));
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Query {
-            socket: descriptor.socket,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Query {
-            output: Some(Ok(snapshot)),
-            ..
-        } if snapshot.local == Some(local) && snapshot.peer == Some(peer)
-    ));
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Shutdown {
-            socket: descriptor.socket,
-            read: true,
-            write: true,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Shutdown {
-            output: Some(Ok(snapshot)),
-            ..
-        } if snapshot.read_shutdown && snapshot.write_shutdown
-    ));
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Close {
-            socket: descriptor.socket,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Close {
-            output: Some(Ok(())),
-            ..
-        }
-    ));
+    assert_eq!(facade.local_endpoint(), Some(local));
+    assert_eq!(facade.peer_endpoint(), Some(peer));
+    facade
+        .shutdown(true, true)
+        .expect("resident facade shutdown");
+    facade.close();
 
-    let listener = match elm_socket_command(net::stack::NetStackSocketCommandV1::Create {
-        family: net::stack::NET_STACK_SOCKET_FAMILY_IPV6,
-        kind: net::stack::NET_STACK_SOCKET_KIND_STREAM,
-        protocol: 6,
-        output: None,
-    }) {
-        net::stack::NetStackSocketCommandV1::Create {
-            output: Some(Ok(descriptor)),
-            ..
-        } => descriptor,
-        _ => panic!("ELM listener create 未返回 descriptor"),
-    };
+    let listener_facade =
+        net::new_tcp_socket_facade(net::AddressFamily::Ipv6).expect("创建 resident TCP facade");
+    net::track_socket_facade(&listener_facade, generation);
+    listener_facade
+        .bind(
+            net::Endpoint {
+                addr: net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
+                port: 49_160,
+            },
+            None,
+            net::control::BindOptions::default(),
+        )
+        .expect("resident listener bind");
+    listener_facade.listen(4).expect("resident listener listen");
     assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Listen {
-            socket: listener.socket,
-            backlog: 4,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Listen {
-            output: Some(Ok(_)),
-            ..
-        }
+        listener_facade.accept(true, None),
+        Err(net::SocketError::WouldBlock)
     ));
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Accept {
-            socket: listener.socket,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Accept {
-            output: Some(Err(net::stack::NetStackSocketErrorV1::WouldBlock)),
-            ..
-        }
-    ));
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Close {
-            socket: listener.socket,
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Close {
-            output: Some(Ok(())),
-            ..
-        }
-    ));
+    listener_facade.close();
+
+    let replacement =
+        net::new_tcp_socket_facade(net::AddressFamily::Ipv6).expect("创建替代 TCP facade");
+    net::track_socket_facade(&replacement, generation);
+    replacement
+        .bind(
+            net::Endpoint {
+                addr: net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
+                port: 49_160,
+            },
+            None,
+            net::control::BindOptions::default(),
+        )
+        .expect("listener close 后应立即允许同端口重绑");
+    replacement.listen(4).expect("替代 listener listen");
+    replacement.close();
 }
 
 #[ktest]
-fn net_stack_elm_builds_udp_and_tcp_tx_headers() {
-    let payload_bytes = b"elm tx payload";
-    let payload = net::buf::PacketChain::from_owned(payload_bytes.to_vec());
-    let cases = [
-        net::stack::NetStackTxInputV1::udp(
-            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
-            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
-            19002,
-            53,
-            [1; 6],
-            [2; 6],
-            64,
-            7,
-            payload_bytes.len() as u32,
-        )
-        .unwrap(),
-        net::stack::NetStackTxInputV1::udp(
-            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
-            net::IpAddr::V6(net::Ipv6Addr([
-                0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
-            ])),
-            19002,
-            53,
-            [1; 6],
-            [2; 6],
-            64,
-            7,
-            payload_bytes.len() as u32,
-        )
-        .unwrap(),
-        net::stack::NetStackTxInputV1::tcp(
-            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
-            net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
-            19003,
-            443,
-            [1; 6],
-            [2; 6],
-            1,
-            2,
-            net::transport::TcpFlags::SYN.bits(),
-            32768,
-            &[2, 4, 0x05, 0xb4],
-            payload_bytes.len() as u32,
-        )
-        .unwrap(),
-        net::stack::NetStackTxInputV1::tcp(
-            net::IpAddr::V6(net::Ipv6Addr::LOCALHOST),
-            net::IpAddr::V6(net::Ipv6Addr([
-                0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
-            ])),
-            19003,
-            443,
-            [1; 6],
-            [2; 6],
-            1,
-            2,
-            net::transport::TcpFlags::SYN.bits(),
-            32768,
-            &[2, 4, 0x05, 0xb4],
-            payload_bytes.len() as u32,
-        )
-        .unwrap(),
-    ];
-
-    for input in cases {
-        let output = net::stack::build_tx_header(&payload, input).expect("ELM TX header 构造失败");
-        let mut frame = output.header_bytes().to_vec();
-        frame.extend_from_slice(payload_bytes);
-        let frame = net::buf::PacketChain::from_owned(frame);
-        let transport_offset = if input.family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
-            assert_eq!(net::pipeline::packet_checksum(&frame, 14, 20), Ok(0));
-            34
-        } else {
-            54
-        };
-        let protocol = if input.kind == net::stack::NET_STACK_TX_UDP {
-            17
-        } else {
-            6
-        };
-        let transport_len = frame.total_len() - transport_offset;
-        let source = if input.family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
-            net::IpAddr::V4(net::Ipv4Addr(input.source[..4].try_into().unwrap()))
-        } else {
-            net::IpAddr::V6(net::Ipv6Addr(input.source))
-        };
-        let destination = if input.family == net::stack::NET_STACK_ADDRESS_FAMILY_IPV4 {
-            net::IpAddr::V4(net::Ipv4Addr(input.destination[..4].try_into().unwrap()))
-        } else {
-            net::IpAddr::V6(net::Ipv6Addr(input.destination))
-        };
-        assert_eq!(
-            net::pipeline::transport_checksum(
-                &frame,
-                transport_offset,
-                transport_len,
-                source,
-                destination,
-                protocol,
-            ),
-            Ok(0)
-        );
-    }
-}
-
-#[ktest]
-fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
+fn net_stack_builds_udp_and_raw_fragment_plans() {
     let payload_bytes = (0u32..2200)
         .map(|index| index.wrapping_mul(13) as u8)
         .collect::<alloc::vec::Vec<_>>();
@@ -495,7 +247,7 @@ fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
         let mut offset = 0u32;
         let mut reconstructed = alloc::vec::Vec::new();
         loop {
-            let input = net::stack::NetStackTxFragmentInputV1::udp(
+            let input = net::stack::TxFragmentInput::udp(
                 source,
                 destination,
                 19002,
@@ -510,7 +262,7 @@ fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
                 offset,
             )
             .unwrap();
-            let output = net::stack::build_tx_fragment_header(&payload, input)
+            let output = net::stack::build_tx_fragment_plan(&payload, input)
                 .expect("ELM UDP 分片 header 构造失败");
             assert!(output.header_len as usize + output.payload_len as usize <= 614);
             assert_eq!(output.payload_offset, offset);
@@ -556,7 +308,7 @@ fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
     let mut offset = 0u32;
     let mut reconstructed = alloc::vec::Vec::new();
     loop {
-        let input = net::stack::NetStackTxFragmentInputV1::raw_ipv4(
+        let input = net::stack::TxFragmentInput::raw_ipv4(
             net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
             net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 2)),
             [1; 6],
@@ -569,8 +321,8 @@ fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
             0,
         )
         .unwrap();
-        let output = net::stack::build_tx_fragment_header(&raw, input)
-            .expect("ELM raw 分片 header 构造失败");
+        let output =
+            net::stack::build_tx_fragment_plan(&raw, input).expect("ELM raw 分片 header 构造失败");
         assert_eq!(output.header_len, 14 + raw_header_len as u16);
         assert!(output.header_len as usize + output.payload_len as usize <= 614);
         let header = net::buf::PacketChain::from_owned(output.header_bytes().to_vec());
@@ -592,20 +344,52 @@ fn net_stack_elm_builds_udp_and_raw_fragment_headers() {
 
 #[ktest]
 fn net_stack_elm_persists_flow_shard_state() {
-    let shard = crate::net_stack::ElmFlowShard::new(net::ShardId(0));
+    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(0));
     let local = net::Endpoint {
         addr: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
         port: 49_151,
     };
-    let first = shard
-        .bind_udp(local, None, None)
-        .expect("ELM shard 应接受首个 UDP endpoint");
-    let second = shard
-        .bind_udp(local, None, None)
-        .expect("ELM shard 应保留并扩展 UDP endpoint 表");
+    let commands = alloc::vec![
+        net::stack::NetStackFlowCommand::BindUdp {
+            local,
+            peer: None,
+            interface: None,
+            output: None,
+        },
+        net::stack::NetStackFlowCommand::BindUdp {
+            local,
+            peer: None,
+            interface: None,
+            output: None,
+        },
+    ];
+    let mut commands = shard
+        .invoke_turn(commands, &[])
+        .unwrap_or_else(|_| panic!("ELM shard 应接受 UDP endpoint batch"));
+    let second = match commands.pop() {
+        Some(net::stack::NetStackFlowCommand::BindUdp {
+            output: Some(Ok(flow)),
+            ..
+        }) => flow,
+        _ => panic!("第二个 UDP endpoint 未提交"),
+    };
+    let first = match commands.pop() {
+        Some(net::stack::NetStackFlowCommand::BindUdp {
+            output: Some(Ok(flow)),
+            ..
+        }) => flow,
+        _ => panic!("首个 UDP endpoint 未提交"),
+    };
     assert_ne!(first, second);
-    shard.close_udp(first);
-    shard.close_udp(second);
+    shard
+        .invoke_turn(
+            alloc::vec![
+                net::stack::NetStackFlowCommand::CloseUdp { flow: first },
+                net::stack::NetStackFlowCommand::CloseUdp { flow: second },
+            ],
+            &[],
+        )
+        .unwrap_or_else(|_| panic!("ELM shard 应提交 UDP close batch"));
 }
 
 #[ktest]
@@ -650,16 +434,11 @@ fn udp_vfs_fd_and_epoll_roundtrip() {
         receiver_proxy.stack_generation(),
         net::stack::stack_snapshot().generation
     );
-    assert!(matches!(
-        elm_socket_command(net::stack::NetStackSocketCommandV1::Query {
-            socket: receiver_proxy.socket_ref(),
-            output: None,
-        }),
-        net::stack::NetStackSocketCommandV1::Query {
-            output: Some(Ok(snapshot)),
-            ..
-        } if snapshot.local.is_some_and(|endpoint| endpoint.port == 19_002)
-    ));
+    assert!(
+        receiver_proxy
+            .local_endpoint()
+            .is_some_and(|endpoint| endpoint.port == 19_002)
+    );
 
     let conflict = vfs::socket::socket(
         &context,
@@ -865,6 +644,16 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
         .expect("TCP client 缺少网络 socket ops")
         .proxy();
+    let stat_max = |key: &str| {
+        net::device::snapshot_stats()
+            .into_iter()
+            .filter(|stat| stat.key == key)
+            .map(|stat| stat.value)
+            .max()
+            .unwrap_or(0)
+    };
+    let shared_before = stat_max("tcp_loopback_shared_bytes");
+    let compact_before = stat_max("tcp_rx_compact_copy_bytes");
     client_proxy.set_buffer_limits(Some(16 * 1024), None);
     BLOCKING_STREAM_WRITTEN.store(usize::MAX, core::sync::atomic::Ordering::Release);
     *BLOCKING_STREAM_SENDER.lock() = Some(alloc::sync::Arc::clone(&client_file));
@@ -1024,6 +813,15 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         }
     }
     assert_eq!(sent, stream.len());
+    let expected_shared = BLOCKING_STREAM_BYTES + 4 + 4 + stream.len();
+    assert_eq!(
+        stat_max("tcp_loopback_shared_bytes").saturating_sub(shared_before),
+        expected_shared as u64
+    );
+    assert_eq!(
+        stat_max("tcp_rx_compact_copy_bytes").saturating_sub(compact_before),
+        0
+    );
 
     vfs::socket::shutdown(&table, client, vfs::socket::SHUT_WR).expect("关闭 client 写方向");
     wait_readable(&accepted_file);
@@ -1361,6 +1159,70 @@ fn dhcp_rebind_deadline_stays_between_renew_and_expiry() {
 }
 
 #[ktest]
+fn dhcp_waits_for_unconfigured_interface_egress() {
+    let loopback = net::InterfaceId(1);
+    let physical = net::InterfaceId(2);
+    let interfaces = alloc::vec![
+        net::control::InterfaceSnapshot {
+            id: loopback,
+            device: net::NetDeviceId(1),
+            mac_address: [0; 6],
+            mtu: 65_535,
+            running: true,
+            loopback: true,
+        },
+        net::control::InterfaceSnapshot {
+            id: physical,
+            device: net::NetDeviceId(2),
+            mac_address: [2, 0, 0, 0, 0, 2],
+            mtu: 1500,
+            running: true,
+            loopback: false,
+        },
+    ];
+    let loopback_address = net::control::AddressEntry {
+        interface: loopback,
+        address: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
+        prefix_len: 8,
+        primary: true,
+    };
+    let unconfigured = net::control::ConfigSnapshot::new(
+        1,
+        interfaces.clone(),
+        alloc::vec![loopback_address],
+        alloc::vec![],
+        alloc::vec![],
+    )
+    .expect("unconfigured snapshot");
+
+    assert!(!net_runtime::autoconfig_egress_ready(&unconfigured, |_| {
+        false
+    }));
+    assert!(net_runtime::autoconfig_egress_ready(
+        &unconfigured,
+        |interface| { interface == physical }
+    ));
+
+    let configured = net::control::ConfigSnapshot::new(
+        2,
+        interfaces,
+        alloc::vec![
+            loopback_address,
+            net::control::AddressEntry {
+                interface: physical,
+                address: net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 2, 15)),
+                prefix_len: 24,
+                primary: true,
+            },
+        ],
+        alloc::vec![],
+        alloc::vec![],
+    )
+    .expect("configured snapshot");
+    assert!(net_runtime::autoconfig_egress_ready(&configured, |_| false));
+}
+
+#[ktest]
 fn running_loopback_detach_completes() {
     assert_eq!(
         net_runtime::remove_loopback_for_test(),
@@ -1459,7 +1321,7 @@ fn net_stack_forced_reload_invalidates_old_fds_and_wakes_waiters() {
     assert_ne!(new_cell, old_cell);
     let snapshot = net::stack::stack_snapshot();
     assert_eq!(snapshot.state, net::stack::NetStackState::Active);
-    assert!(snapshot.probed);
+    assert!(snapshot.ready);
     assert_ne!(snapshot.handle, Some(old_stack_instance));
 
     let new_fd = vfs::socket::socket(

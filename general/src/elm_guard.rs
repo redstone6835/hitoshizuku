@@ -36,7 +36,8 @@ pub const ELM_GUARD_ABORT_TRAP: usize = 3;
 pub const ELM_GUARD_ABORT_PANIC: usize = 4;
 
 pub const ELM_GUARD_MAX_DEPTH: usize = 16;
-pub const ELM_GUARD_MAX_HOST_RANGES: usize = 4;
+// 一次 shard-turn 需要登记数据帧、调用头、控制批次、流批次和配置快照。
+pub const ELM_GUARD_MAX_HOST_RANGES: usize = 6;
 pub const ELM_GUARD_FAULT_RING_PER_CPU: usize = 16;
 
 const ELM_GUARD_MAX_CPUS: usize = sched::NR_CPUS;

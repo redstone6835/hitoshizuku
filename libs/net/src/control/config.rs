@@ -235,7 +235,7 @@ pub struct ConfigSnapshot {
     pub routes: RouteSnapshot,
     pub policy: Vec<PolicyRule>,
     pub dns_servers: Vec<IpAddr>,
-    stack_local_addresses: Box<[crate::stack::NetStackLocalAddressV1]>,
+    stack_local_addresses: Box<[crate::stack::NetStackLocalAddress]>,
 }
 
 impl ConfigSnapshot {
@@ -326,7 +326,7 @@ impl ConfigSnapshot {
                     }
                     IpAddr::V6(address) => (crate::stack::NET_STACK_ADDRESS_FAMILY_IPV6, address.0),
                 };
-                crate::stack::NetStackLocalAddressV1 {
+                crate::stack::NetStackLocalAddress {
                     interface: entry.interface.0,
                     family,
                     prefix_len: entry.prefix_len,
@@ -366,7 +366,7 @@ impl ConfigSnapshot {
             .any(|entry| entry.interface == interface && entry.address == address)
     }
 
-    pub fn stack_local_addresses(&self) -> &[crate::stack::NetStackLocalAddressV1] {
+    pub fn stack_local_addresses(&self) -> &[crate::stack::NetStackLocalAddress] {
         &self.stack_local_addresses
     }
 
@@ -703,7 +703,7 @@ mod tests {
         assert!(
             projection
                 .iter()
-                .all(crate::stack::NetStackLocalAddressV1::valid)
+                .all(crate::stack::NetStackLocalAddress::valid)
         );
     }
 

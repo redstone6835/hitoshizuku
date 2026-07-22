@@ -12,7 +12,7 @@ use crate::transport::{
 };
 use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId};
 use crate::{OwnerRef, SocketError, SocketFacade, TcpTxLease, UdpTxLease};
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -27,6 +27,10 @@ pub struct FlowShardStats {
     pub tx_formed: u64,
     pub dirty_runs: u64,
     pub timer_expired: u64,
+    pub tcp_rx_pinned_bytes: u64,
+    pub tcp_rx_compact_copy_bytes: u64,
+    pub tcp_loopback_shared_bytes: u64,
+    pub tcp_rx_pool_low_water_fallbacks: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +55,186 @@ pub struct UdpSendFailure {
     pub payload: PacketChain,
 }
 
+pub const MAX_PENDING_NEIGHBOR_PACKETS_PER_KEY: usize = 32;
+pub const MAX_PENDING_NEIGHBOR_PACKETS_PER_INTERFACE: usize = 256;
+
+pub enum PendingNeighborTx {
+    Tcp(PreparedTcpTx),
+    Udp(PreparedUdpTx),
+    Raw(PreparedRawTx),
+}
+
+impl PendingNeighborTx {
+    pub fn key_opt(&self) -> Option<NeighborKey> {
+        match self {
+            Self::Tcp(work) => work.path.unresolved_neighbor,
+            Self::Udp(work) => work.unresolved_neighbor,
+            Self::Raw(work) => work.unresolved_neighbor,
+        }
+    }
+
+    pub fn key(&self) -> NeighborKey {
+        self.key_opt().expect("待解析发送必须携带 neighbor key")
+    }
+
+    pub fn facade(&self) -> Arc<SocketFacade> {
+        match self {
+            Self::Tcp(work) => Arc::clone(&work.facade),
+            Self::Udp(work) => work.payload.facade(),
+            Self::Raw(work) => work.payload.facade(),
+        }
+    }
+
+    pub fn resolve(&mut self, mac_address: [u8; 6]) {
+        match self {
+            Self::Tcp(work) => {
+                work.path.destination_mac = mac_address;
+                work.path.unresolved_neighbor = None;
+            }
+            Self::Udp(work) => {
+                work.destination_mac = mac_address;
+                work.unresolved_neighbor = None;
+            }
+            Self::Raw(work) => {
+                work.destination_mac = mac_address;
+                work.unresolved_neighbor = None;
+            }
+        }
+    }
+}
+
+pub enum NeighborEnqueueOutput {
+    Queued,
+    Resolved(PendingNeighborTx),
+    Rejected(PendingNeighborTx),
+}
+
+pub struct NeighborTimerOutput {
+    pub probes: Vec<NeighborKey>,
+    pub expired: Vec<PendingNeighborTx>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+struct PendingNeighbor<T> {
+    packets: VecDeque<T>,
+    probes: u8,
+    next_probe_ns: u64,
+    expires_ns: u64,
+}
+
+struct PendingNeighborQueue<T> {
+    per_interface: BTreeMap<InterfaceId, usize>,
+    entries: BTreeMap<NeighborKey, PendingNeighbor<T>>,
+}
+
+impl<T> PendingNeighborQueue<T> {
+    fn new() -> Self {
+        Self {
+            per_interface: BTreeMap::new(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        key: NeighborKey,
+        work: T,
+        now_ns: u64,
+        interface_limit: usize,
+    ) -> Result<(), T> {
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.packets.len() >= MAX_PENDING_NEIGHBOR_PACKETS_PER_KEY)
+            || self.per_interface.get(&key.interface).copied().unwrap_or(0) >= interface_limit
+        {
+            return Err(work);
+        }
+        *self.per_interface.entry(key.interface).or_default() += 1;
+        self.entries
+            .entry(key)
+            .or_insert_with(|| PendingNeighbor {
+                packets: VecDeque::new(),
+                probes: 0,
+                next_probe_ns: now_ns,
+                expires_ns: now_ns.saturating_add(3_000_000_000),
+            })
+            .packets
+            .push_back(work);
+        Ok(())
+    }
+
+    fn remove(&mut self, key: NeighborKey) -> Vec<T> {
+        let Some(entry) = self.entries.remove(&key) else {
+            return Vec::new();
+        };
+        self.release(key.interface, entry.packets.len());
+        entry.packets.into_iter().collect()
+    }
+
+    fn fail_interface(&mut self, interface: InterfaceId) -> Vec<T> {
+        let keys = self
+            .entries
+            .keys()
+            .filter(|key| key.interface == interface)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut failed = Vec::new();
+        for key in keys {
+            failed.extend(self.remove(key));
+        }
+        failed
+    }
+
+    fn run_timers(&mut self, now_ns: u64) -> (Vec<NeighborKey>, Vec<T>, Option<u64>) {
+        let keys = self.entries.keys().copied().collect::<Vec<_>>();
+        let mut probes = Vec::new();
+        let mut expired = Vec::new();
+        for key in keys {
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.expires_ns <= now_ns)
+            {
+                expired.extend(self.remove(key));
+                continue;
+            }
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.probes < 3 && entry.next_probe_ns <= now_ns)
+            {
+                probes.push(key);
+                let entry = self.entries.get_mut(&key).expect("邻居条目必须存在");
+                entry.probes += 1;
+                entry.next_probe_ns = entry.next_probe_ns.saturating_add(1_000_000_000);
+            }
+        }
+        let next_deadline_ns = self
+            .entries
+            .values()
+            .map(|entry| {
+                if entry.probes < 3 {
+                    entry.next_probe_ns.min(entry.expires_ns)
+                } else {
+                    entry.expires_ns
+                }
+            })
+            .min();
+        (probes, expired, next_deadline_ns)
+    }
+
+    fn release(&mut self, interface: InterfaceId, count: usize) {
+        let Some(current) = self.per_interface.get_mut(&interface) else {
+            return;
+        };
+        *current = current.saturating_sub(count);
+        if *current == 0 {
+            self.per_interface.remove(&interface);
+        }
+    }
+}
+
 pub struct FlowShard {
     id: ShardId,
     frontend: VectorFrontend,
@@ -59,6 +243,7 @@ pub struct FlowShard {
     tcp: TcpEndpointTable,
     raw: RawEndpointTable,
     neighbors: NeighborTable,
+    pending_neighbors: PendingNeighborQueue<PendingNeighborTx>,
     pmtu: PmtuCache,
     reassembly: ReassemblyTable,
     reassembled_input: PacketBatch,
@@ -71,6 +256,7 @@ pub struct FlowShard {
     )>,
     timers: TimerWheel,
     next_completion: u64,
+    next_fragment_id: u32,
     stats: FlowShardStats,
     icmp_error_tokens: u32,
     icmp_error_refill_ns: u64,
@@ -93,6 +279,7 @@ impl FlowShard {
             tcp: TcpEndpointTable::new_on_shard(id, rss_key, tcp_isn_key),
             raw: RawEndpointTable::new(),
             neighbors: NeighborTable::new(hash_seed),
+            pending_neighbors: PendingNeighborQueue::new(),
             pmtu: PmtuCache::new(),
             reassembly: ReassemblyTable::new(),
             reassembled_input: PacketBatch::new(),
@@ -100,6 +287,7 @@ impl FlowShard {
             forwarded_errors: VecDeque::new(),
             timers: TimerWheel::new(8192, now_ns / 1_000_000),
             next_completion: 1,
+            next_fragment_id: 1,
             stats: FlowShardStats::default(),
             icmp_error_tokens: 100,
             icmp_error_refill_ns: now_ns,
@@ -110,8 +298,21 @@ impl FlowShard {
         self.id
     }
 
-    pub const fn stats(&self) -> FlowShardStats {
-        self.stats
+    pub fn stats(&self) -> FlowShardStats {
+        let tcp = self.tcp.stats();
+        FlowShardStats {
+            tcp_rx_pinned_bytes: tcp.rx_pinned_bytes,
+            tcp_rx_compact_copy_bytes: tcp.rx_compact_copy_bytes,
+            tcp_loopback_shared_bytes: tcp.loopback_shared_bytes,
+            tcp_rx_pool_low_water_fallbacks: tcp.rx_pool_low_water_fallbacks,
+            ..self.stats
+        }
+    }
+
+    pub fn allocate_fragment_id(&mut self) -> u32 {
+        let id = self.next_fragment_id;
+        self.next_fragment_id = self.next_fragment_id.wrapping_add(1).max(1);
+        id
     }
 
     pub fn bind_udp(
@@ -215,6 +416,10 @@ impl FlowShard {
         self.tcp.take_output()
     }
 
+    pub fn tcp_facade(&self, flow: FlowId) -> Option<Arc<SocketFacade>> {
+        self.tcp.facade(flow)
+    }
+
     pub fn process_local_tcp(
         &mut self,
         interface: InterfaceId,
@@ -260,7 +465,7 @@ impl FlowShard {
     }
 
     pub fn has_blocked_tcp_output(&self) -> bool {
-        self.tcp.has_output_blocked()
+        self.tcp.has_output_blocked() || self.tcp.has_pending_output()
     }
 
     pub fn next_timer_deadline_ns(&self) -> Option<u64> {
@@ -307,6 +512,7 @@ impl FlowShard {
 
     pub fn run_due_timers(&mut self, now_ns: u64) {
         self.run_timers(now_ns);
+        self.run_dirty(256);
     }
 
     pub fn refresh_tcp_tx_path(
@@ -378,6 +584,55 @@ impl FlowShard {
         now_ns: u64,
     ) -> bool {
         self.neighbors.observe(key, mac_address, now_ns).is_ok()
+    }
+
+    pub fn observe_and_resolve_neighbor(
+        &mut self,
+        key: NeighborKey,
+        mac_address: [u8; 6],
+        now_ns: u64,
+    ) -> Vec<PendingNeighborTx> {
+        if !self.observe_neighbor(key, mac_address, now_ns) {
+            return Vec::new();
+        }
+        let mut pending = self.pending_neighbors.remove(key);
+        pending
+            .iter_mut()
+            .for_each(|work| work.resolve(mac_address));
+        pending
+    }
+
+    pub fn enqueue_neighbor(
+        &mut self,
+        mut work: PendingNeighborTx,
+        now_ns: u64,
+        interface_limit: usize,
+    ) -> NeighborEnqueueOutput {
+        let key = work.key();
+        if let Some(mac_address) = self.lookup_neighbor(key, now_ns) {
+            work.resolve(mac_address);
+            return NeighborEnqueueOutput::Resolved(work);
+        }
+        match self
+            .pending_neighbors
+            .enqueue(key, work, now_ns, interface_limit)
+        {
+            Ok(()) => NeighborEnqueueOutput::Queued,
+            Err(work) => NeighborEnqueueOutput::Rejected(work),
+        }
+    }
+
+    pub fn fail_interface_neighbors(&mut self, interface: InterfaceId) -> Vec<PendingNeighborTx> {
+        self.pending_neighbors.fail_interface(interface)
+    }
+
+    pub fn run_neighbor_timers(&mut self, now_ns: u64) -> NeighborTimerOutput {
+        let (probes, expired, next_deadline_ns) = self.pending_neighbors.run_timers(now_ns);
+        NeighborTimerOutput {
+            probes,
+            expired,
+            next_deadline_ns,
+        }
     }
 
     pub fn lookup_neighbor(&self, key: NeighborKey, now_ns: u64) -> Option<[u8; 6]> {
@@ -519,7 +774,7 @@ impl FlowShard {
             chain: packet,
             completion,
             low_latency: false,
-            checksums_validated: true,
+            checksum: crate::buf::TxChecksum::Complete,
             layout: crate::buf::PacketLayout::Plain,
         })
     }
@@ -622,7 +877,7 @@ impl FlowShard {
                                             chain,
                                             completion: CompletionToken(self.next_completion),
                                             low_latency: true,
-                                            checksums_validated: true,
+                                            checksum: crate::buf::TxChecksum::Complete,
                                             layout: crate::buf::PacketLayout::Plain,
                                         };
                                         self.next_completion =
@@ -658,7 +913,7 @@ impl FlowShard {
                                 chain,
                                 completion: CompletionToken(self.next_completion),
                                 low_latency: true,
-                                checksums_validated: true,
+                                checksum: crate::buf::TxChecksum::Complete,
                                 layout: crate::buf::PacketLayout::Plain,
                             };
                             self.next_completion = self.next_completion.wrapping_add(1).max(1);
@@ -731,7 +986,7 @@ impl FlowShard {
                                 chain,
                                 completion,
                                 low_latency: true,
-                                checksums_validated: true,
+                                checksum: crate::buf::TxChecksum::Complete,
                                 layout: crate::buf::PacketLayout::Plain,
                             };
                             match tx.push(packet) {
@@ -818,8 +1073,6 @@ impl FlowShard {
                 }
             }
         }
-        self.run_timers(context.now_ns);
-        self.run_dirty(256);
     }
 
     pub fn reassembled_input(&self) -> &PacketBatch {
@@ -837,9 +1090,9 @@ impl FlowShard {
     pub fn parse_reassembled_batch(
         &mut self,
         input: PacketBatch,
-        ethernet: &[crate::stack::NetStackEthernetV1],
-        network: &[crate::stack::NetStackNetworkV1],
-        transport: &[crate::stack::NetStackTransportV1],
+        ethernet: &[crate::stack::NetStackEthernet],
+        network: &[crate::stack::NetStackNetwork],
+        transport: &[crate::stack::NetStackTransport],
     ) -> Result<(), PacketBatch> {
         if !self.reassembled_input.is_empty()
             || input.len() != ethernet.len()
@@ -853,17 +1106,17 @@ impl FlowShard {
         Ok(())
     }
 
-    pub fn push_frontend_batch(&mut self, packets: Vec<FrontendPacket>) {
-        for packet in packets {
+    pub fn push_frontend_batch(&mut self, packets: &mut Vec<FrontendPacket>) {
+        for packet in packets.drain(..) {
             self.push_frontend(packet);
         }
     }
 
     pub fn parse_reassembled(
         &mut self,
-        ethernet: &[crate::stack::NetStackEthernetV1],
-        network: &[crate::stack::NetStackNetworkV1],
-        transport: &[crate::stack::NetStackTransportV1],
+        ethernet: &[crate::stack::NetStackEthernet],
+        network: &[crate::stack::NetStackNetwork],
+        transport: &[crate::stack::NetStackTransport],
     ) {
         self.frontend.process_with_stack_sidecars(
             &mut self.reassembled_input,
@@ -1263,5 +1516,56 @@ fn multicast_mac(address: IpAddr) -> [u8; 6] {
             address.0[14],
             address.0[15],
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Ipv4Addr;
+
+    fn key(address: u8) -> NeighborKey {
+        NeighborKey {
+            interface: InterfaceId(1),
+            address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, address)),
+        }
+    }
+
+    #[test]
+    fn pending_neighbor_queue_enforces_key_and_interface_limits() {
+        let mut queue = PendingNeighborQueue::new();
+        for packet in 0..MAX_PENDING_NEIGHBOR_PACKETS_PER_KEY {
+            assert!(queue.enqueue(key(1), packet, 0, 256).is_ok());
+        }
+        assert_eq!(
+            queue.enqueue(key(1), 99, 0, 256),
+            Err(99),
+            "单邻居不得超过 32 个待发 packet"
+        );
+
+        let mut limited = PendingNeighborQueue::new();
+        assert!(limited.enqueue(key(1), 1, 0, 2).is_ok());
+        assert!(limited.enqueue(key(2), 2, 0, 2).is_ok());
+        assert_eq!(limited.enqueue(key(3), 3, 0, 2), Err(3));
+        assert_eq!(limited.remove(key(1)), alloc::vec![1]);
+        assert!(limited.enqueue(key(3), 3, 0, 2).is_ok());
+    }
+
+    #[test]
+    fn pending_neighbor_queue_probes_three_times_then_expires() {
+        let mut queue = PendingNeighborQueue::new();
+        assert!(queue.enqueue(key(1), 7, 0, 256).is_ok());
+
+        for second in 0..3 {
+            let (probes, expired, deadline) = queue.run_timers(second * 1_000_000_000);
+            assert_eq!(probes, alloc::vec![key(1)]);
+            assert!(expired.is_empty());
+            assert_eq!(deadline, Some((second + 1) * 1_000_000_000));
+        }
+
+        let (probes, expired, deadline) = queue.run_timers(3_000_000_000);
+        assert!(probes.is_empty());
+        assert_eq!(expired, alloc::vec![7]);
+        assert_eq!(deadline, None);
     }
 }

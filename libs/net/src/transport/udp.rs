@@ -7,14 +7,12 @@ use crate::buf::{CompletionToken, DropReason, PacketChain, PacketFragment, Packe
 use crate::control::RouteDecision;
 use crate::flow::{DIRTY_INGRESS, FlowKey, FlowTable, flow_hash64, rss_hash};
 use crate::pipeline::FrontendPacket;
-#[cfg(test)]
-use crate::pipeline::transport_checksum;
+use crate::pipeline::{partial_transport_checksum, transport_checksum};
 use crate::transport::TransportControlError;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::{SocketFacade, UdpTxLease};
 
 const UDP_RX_DATAGRAMS: usize = 256;
-#[cfg(test)]
 const IP_PROTOCOL_UDP: u8 = 17;
 
 pub struct UdpDatagram {
@@ -828,10 +826,10 @@ pub fn build_udp_packet(
         destination_mac,
         64,
         0,
+        false,
     )
 }
 
-#[cfg(not(test))]
 pub fn build_udp_packet_with_options(
     mut payload: PacketChain,
     route: RouteDecision,
@@ -841,57 +839,7 @@ pub fn build_udp_packet_with_options(
     destination_mac: [u8; 6],
     hop_limit: u8,
     traffic_class: u8,
-) -> Result<PacketChain, (UdpTxError, PacketChain)> {
-    let payload_len = payload.total_len();
-    let header_len = match (route.source, destination.addr) {
-        (IpAddr::V4(_), IpAddr::V4(_)) => 42usize,
-        (IpAddr::V6(_), IpAddr::V6(_)) => 62usize,
-        _ => return Err((UdpTxError::AddressFamily, payload)),
-    };
-    if payload_len > u16::MAX as usize - 8
-        || (matches!(route.source, IpAddr::V4(_)) && payload_len > u16::MAX as usize - 28)
-    {
-        return Err((UdpTxError::DatagramTooLarge, payload));
-    }
-    if header_len + payload_len > route.mtu as usize + 14 {
-        return Err((UdpTxError::MtuExceeded, payload));
-    }
-    let Some(input) = crate::stack::NetStackTxInputV1::udp(
-        route.source,
-        destination.addr,
-        source_port,
-        destination.port,
-        source_mac,
-        destination_mac,
-        hop_limit,
-        traffic_class,
-        payload_len as u32,
-    ) else {
-        return Err((UdpTxError::AddressFamily, payload));
-    };
-    let output = match crate::stack::build_tx_header(&payload, input) {
-        Ok(output) => output,
-        Err(_) => return Err((UdpTxError::Buffer, payload)),
-    };
-    if usize::from(output.header_len) != header_len
-        || payload.prepend_first_zeroed(output.header_len).is_err()
-        || payload.copy_in(0, output.header_bytes()).is_err()
-    {
-        return Err((UdpTxError::Buffer, payload));
-    }
-    Ok(payload)
-}
-
-#[cfg(test)]
-pub fn build_udp_packet_with_options(
-    mut payload: PacketChain,
-    route: RouteDecision,
-    destination: Endpoint,
-    source_port: u16,
-    source_mac: [u8; 6],
-    destination_mac: [u8; 6],
-    hop_limit: u8,
-    traffic_class: u8,
+    checksum_offload: bool,
 ) -> Result<PacketChain, (UdpTxError, PacketChain)> {
     let payload_len = payload.total_len();
     let (header_len, protocol_header_len) = match (route.source, destination.addr) {
@@ -930,15 +878,28 @@ pub fn build_udp_packet_with_options(
             if payload.copy_in(0, &ethernet).is_err() || payload.copy_in(14, &header).is_err() {
                 return Err((UdpTxError::Buffer, payload));
             }
-            let Ok(checksum) = transport_checksum(
-                &payload,
-                34,
-                usize::from(udp_len),
-                route.source,
-                destination.addr,
-                IP_PROTOCOL_UDP,
-            ) else {
-                return Err((UdpTxError::Buffer, payload));
+            let checksum = if checksum_offload {
+                let Ok(checksum) = partial_transport_checksum(
+                    route.source,
+                    destination.addr,
+                    usize::from(udp_len),
+                    IP_PROTOCOL_UDP,
+                ) else {
+                    return Err((UdpTxError::Buffer, payload));
+                };
+                checksum
+            } else {
+                let Ok(checksum) = transport_checksum(
+                    &payload,
+                    34,
+                    usize::from(udp_len),
+                    route.source,
+                    destination.addr,
+                    IP_PROTOCOL_UDP,
+                ) else {
+                    return Err((UdpTxError::Buffer, payload));
+                };
+                checksum
             };
             let checksum = if checksum == 0 { 0xffff } else { checksum };
             if payload.copy_in(40, &checksum.to_be_bytes()).is_err() {
@@ -960,15 +921,28 @@ pub fn build_udp_packet_with_options(
             if payload.copy_in(0, &ethernet).is_err() || payload.copy_in(14, &header).is_err() {
                 return Err((UdpTxError::Buffer, payload));
             }
-            let Ok(checksum) = transport_checksum(
-                &payload,
-                54,
-                usize::from(udp_len),
-                route.source,
-                destination.addr,
-                IP_PROTOCOL_UDP,
-            ) else {
-                return Err((UdpTxError::Buffer, payload));
+            let checksum = if checksum_offload {
+                let Ok(checksum) = partial_transport_checksum(
+                    route.source,
+                    destination.addr,
+                    usize::from(udp_len),
+                    IP_PROTOCOL_UDP,
+                ) else {
+                    return Err((UdpTxError::Buffer, payload));
+                };
+                checksum
+            } else {
+                let Ok(checksum) = transport_checksum(
+                    &payload,
+                    54,
+                    usize::from(udp_len),
+                    route.source,
+                    destination.addr,
+                    IP_PROTOCOL_UDP,
+                ) else {
+                    return Err((UdpTxError::Buffer, payload));
+                };
+                checksum
             };
             let checksum = if checksum == 0 { 0xffff } else { checksum };
             if payload.copy_in(60, &checksum.to_be_bytes()).is_err() {
@@ -1085,7 +1059,6 @@ pub fn build_udp_fragments(
     Ok(frames)
 }
 
-#[cfg(test)]
 fn write_udp_header(header: &mut [u8], source: u16, destination: u16, len: u16) {
     header[0..2].copy_from_slice(&source.to_be_bytes());
     header[2..4].copy_from_slice(&destination.to_be_bytes());

@@ -7,11 +7,19 @@ use super::{ChunkRef, NetBufLease, PacketLayout, PacketMetadata};
 use crate::tuning::{PACKET_BATCH_CAPACITY, PACKET_FRAGMENT_CAPACITY};
 
 /// packet fragment 的独占或共享所有权。
+#[repr(C, u8)]
 pub enum PacketFragment {
     Exclusive(NetBufLease),
     Shared(ChunkRef),
     /// IP 重组等有界慢路径拥有的普通内存，不可直接提交给 DMA queue。
     Owned(Box<[u8]>),
+}
+
+/// 跨 ELM 移动时使用显式空值，避免依赖 `Option<PacketFragment>` 的 niche 编码。
+#[repr(C, u8)]
+enum FragmentSlot {
+    Empty,
+    Occupied(PacketFragment),
 }
 
 #[kernel_symbols::export]
@@ -87,11 +95,33 @@ impl PacketFragment {
             Self::Owned(bytes) => Ok(bytes),
         }
     }
+
+    fn promote_shared(&mut self) -> Result<(), super::NetBufPoolError> {
+        if matches!(self, Self::Shared(_)) {
+            return Ok(());
+        }
+        let fragment = core::mem::replace(self, Self::Owned(Box::new([])));
+        match fragment {
+            Self::Exclusive(lease) => {
+                *self = Self::Shared(lease.into_chunk()?);
+                Ok(())
+            }
+            Self::Shared(chunk) => {
+                *self = Self::Shared(chunk);
+                Ok(())
+            }
+            Self::Owned(bytes) => {
+                *self = Self::Owned(bytes);
+                Err(super::NetBufPoolError::CorruptState)
+            }
+        }
+    }
 }
 
 /// 一个逻辑 packet，最多内联 18 个 fragment。
+#[repr(C)]
 pub struct PacketChain {
-    fragments: [Option<PacketFragment>; PACKET_FRAGMENT_CAPACITY],
+    fragments: [FragmentSlot; PACKET_FRAGMENT_CAPACITY],
     len: u8,
     total_len: u32,
 }
@@ -100,7 +130,7 @@ pub struct PacketChain {
 impl PacketChain {
     pub fn new() -> Self {
         Self {
-            fragments: core::array::from_fn(|_| None),
+            fragments: core::array::from_fn(|_| FragmentSlot::Empty),
             len: 0,
             total_len: 0,
         }
@@ -137,7 +167,7 @@ impl PacketChain {
         let Some(total_len) = self.total_len.checked_add(fragment_len as u32) else {
             return Err(fragment);
         };
-        self.fragments[self.len as usize] = Some(fragment);
+        self.fragments[self.len as usize] = FragmentSlot::Occupied(fragment);
         self.len += 1;
         self.total_len = total_len;
         Ok(())
@@ -174,23 +204,149 @@ impl PacketChain {
         capabilities = kernel_symbols::capability::DEVICE_RESOURCE
     )]
     pub fn fragment(&self, index: usize) -> Option<&PacketFragment> {
-        self.fragments.get(index)?.as_ref()
+        match self.fragments.get(index)? {
+            FragmentSlot::Empty => None,
+            FragmentSlot::Occupied(fragment) => Some(fragment),
+        }
     }
 
     pub fn fragment_mut(&mut self, index: usize) -> Option<&mut PacketFragment> {
-        self.fragments.get_mut(index)?.as_mut()
+        match self.fragments.get_mut(index)? {
+            FragmentSlot::Empty => None,
+            FragmentSlot::Occupied(fragment) => Some(fragment),
+        }
     }
 
     pub fn take_fragment(&mut self, index: usize) -> Option<PacketFragment> {
         if index >= self.len as usize {
             return None;
         }
-        let fragment = self.fragments[index].take()?;
+        let fragment = match core::mem::replace(&mut self.fragments[index], FragmentSlot::Empty) {
+            FragmentSlot::Empty => return None,
+            FragmentSlot::Occupied(fragment) => fragment,
+        };
         self.total_len = self.total_len.saturating_sub(fragment.len() as u32);
-        while self.len != 0 && self.fragments[self.len as usize - 1].is_none() {
+        while self.len != 0 && matches!(self.fragments[self.len as usize - 1], FragmentSlot::Empty)
+        {
             self.len -= 1;
         }
         Some(fragment)
+    }
+
+    /// pin 全部共享 fragment，生成拥有独立引用的同范围 packet chain。
+    pub fn pin_shared(&self) -> Result<Self, super::NetBufPoolError> {
+        let mut output = Self::new();
+        for index in 0..self.fragment_count() {
+            let fragment = match self
+                .fragment(index)
+                .ok_or(super::NetBufPoolError::CorruptState)?
+            {
+                PacketFragment::Shared(chunk) => PacketFragment::Shared(chunk.pin()?),
+                PacketFragment::Exclusive(_) | PacketFragment::Owned(_) => {
+                    return Err(super::NetBufPoolError::CorruptState);
+                }
+            };
+            output
+                .push(fragment)
+                .map_err(|_| super::NetBufPoolError::CorruptState)?;
+        }
+        Ok(output)
+    }
+
+    /// pin 共享 fragment 覆盖的一个连续区间，不复制 packet 数据。
+    pub fn pin_shared_range(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self, super::NetBufPoolError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(super::NetBufPoolError::InvalidRange)?;
+        if end > self.total_len() {
+            return Err(super::NetBufPoolError::InvalidRange);
+        }
+        let mut output = Self::new();
+        if len == 0 {
+            return Ok(output);
+        }
+
+        let mut packet_offset = 0usize;
+        let mut pinned = 0usize;
+        for index in 0..self.fragment_count() {
+            let fragment = self
+                .fragment(index)
+                .ok_or(super::NetBufPoolError::CorruptState)?;
+            let fragment_end = packet_offset + fragment.len();
+            if offset < fragment_end && end > packet_offset {
+                let start = offset.saturating_sub(packet_offset);
+                let stop = fragment.len().min(end - packet_offset);
+                let fragment = match fragment {
+                    PacketFragment::Shared(chunk) => {
+                        PacketFragment::Shared(chunk.slice(start, stop - start)?)
+                    }
+                    PacketFragment::Exclusive(_) | PacketFragment::Owned(_) => {
+                        return Err(super::NetBufPoolError::CorruptState);
+                    }
+                };
+                pinned += fragment.len();
+                output
+                    .push(fragment)
+                    .map_err(|_| super::NetBufPoolError::CorruptState)?;
+            }
+            packet_offset = fragment_end;
+            if pinned == len {
+                return Ok(output);
+            }
+        }
+        Err(super::NetBufPoolError::InvalidRange)
+    }
+
+    /// 将区间覆盖的独占 pool fragment 原地提升为共享 backing，并 pin 出独立引用。
+    pub fn pin_range_shared(
+        &mut self,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self, super::NetBufPoolError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(super::NetBufPoolError::InvalidRange)?;
+        if end > self.total_len() {
+            return Err(super::NetBufPoolError::InvalidRange);
+        }
+        let mut packet_offset = 0usize;
+        for index in 0..self.fragment_count() {
+            let fragment = self
+                .fragment_mut(index)
+                .ok_or(super::NetBufPoolError::CorruptState)?;
+            let fragment_end = packet_offset + fragment.len();
+            if offset < fragment_end && end > packet_offset {
+                fragment.promote_shared()?;
+            }
+            packet_offset = fragment_end;
+        }
+        self.pin_shared_range(offset, len)
+    }
+
+    /// 将独占 pool lease 转成共享引用，使同一 packet 可被多个 TX 分片引用。
+    pub fn into_shared(mut self) -> Result<Self, super::NetBufPoolError> {
+        let count = self.fragment_count();
+        let mut output = Self::new();
+        for index in 0..count {
+            let fragment = self
+                .take_fragment(index)
+                .ok_or(super::NetBufPoolError::CorruptState)?;
+            let fragment = match fragment {
+                PacketFragment::Exclusive(lease) => PacketFragment::Shared(lease.into_chunk()?),
+                PacketFragment::Shared(chunk) => PacketFragment::Shared(chunk),
+                PacketFragment::Owned(_) => {
+                    return Err(super::NetBufPoolError::CorruptState);
+                }
+            };
+            output
+                .push(fragment)
+                .map_err(|_| super::NetBufPoolError::CorruptState)?;
+        }
+        Ok(output)
     }
 
     pub fn prepend_first_zeroed(&mut self, len: u16) -> Result<(), super::NetBufPoolError> {
@@ -520,8 +676,35 @@ pub struct TxPacket {
     pub chain: PacketChain,
     pub completion: CompletionToken,
     pub low_latency: bool,
-    pub checksums_validated: bool,
+    pub checksum: TxChecksum,
     pub layout: PacketLayout,
+}
+
+/// TX transport checksum 的设备处理方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TxChecksum {
+    #[default]
+    Complete,
+    Partial {
+        start: u16,
+        offset: u16,
+    },
+}
+
+impl TxChecksum {
+    #[inline(always)]
+    pub fn valid_for(self, partial_supported: bool, packet_len: usize) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Partial { start, offset } => {
+                partial_supported
+                    && usize::from(start)
+                        .checked_add(usize::from(offset))
+                        .and_then(|field| field.checked_add(2))
+                        .is_some_and(|end| end <= packet_len)
+            }
+        }
+    }
 }
 
 /// 固定 32 项 TX batch。
@@ -691,5 +874,52 @@ mod tests {
         assert_eq!(completion.tokens.len(), PACKET_BATCH_CAPACITY);
         assert!(core::mem::size_of::<PacketBatch>() <= 8 * core::mem::size_of::<usize>());
         assert!(core::mem::size_of::<TxBatch>() <= 4 * core::mem::size_of::<usize>());
+    }
+
+    #[test]
+    fn shared_range_spans_fragments_and_releases_pool() {
+        let mut owner = super::super::NetBufPool::new_heap(2, 16).unwrap();
+        let mut chain = PacketChain::new();
+        for bytes in [[0u8, 1, 2, 3], [4u8, 5, 6, 7]] {
+            let mut lease = owner
+                .lease(0, bytes.len() as u16, PacketMetadata::default())
+                .unwrap();
+            lease.as_mut_slice().unwrap().copy_from_slice(&bytes);
+            chain
+                .push(PacketFragment::Exclusive(lease))
+                .unwrap_or_else(|_| unreachable!());
+        }
+        assert_eq!(owner.outstanding(), 2);
+
+        let chain = chain.into_shared().unwrap();
+        let range = chain.pin_shared_range(2, 4).unwrap();
+        assert_eq!(range.fragment_count(), 2);
+        let mut output = [0u8; 4];
+        range.copy_out(0, &mut output).unwrap();
+        assert_eq!(output, [2, 3, 4, 5]);
+        assert!(matches!(
+            chain.pin_shared_range(7, 2),
+            Err(super::super::NetBufPoolError::InvalidRange)
+        ));
+
+        drop(chain);
+        owner.drain_remote();
+        assert_eq!(owner.outstanding(), 2);
+        drop(range);
+        owner.drain_remote();
+        assert_eq!(owner.outstanding(), 0);
+        assert_eq!(owner.available(), 2);
+    }
+
+    #[test]
+    fn partial_checksum_requires_capability_and_in_bounds_field() {
+        let checksum = TxChecksum::Partial {
+            start: 34,
+            offset: 16,
+        };
+        assert!(checksum.valid_for(true, 64));
+        assert!(!checksum.valid_for(false, 64));
+        assert!(!checksum.valid_for(true, 51));
+        assert!(TxChecksum::Complete.valid_for(false, 0));
     }
 }

@@ -6,7 +6,7 @@ use core::ptr::read_volatile;
 use general::dev::irq::{self, IrqError, IrqHandle};
 use general::dev::net::{
     NetQueueIrqBinding, net_function, queue_irq_control, queue_irq_handler,
-    virtio_mmio_queue_irq,
+    virtio_mmio_queue_irq, virtio_mmio_queue_irq_event_idx,
 };
 use general::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use general::dev::pnp::{
@@ -14,7 +14,7 @@ use general::dev::pnp::{
     PnpDriver, PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
 use virtio::virtio_mmio::{
-    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
     VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
     VirtioMmioTransport, detect as detect_virtio_mmio,
 };
@@ -32,11 +32,13 @@ const MMIO_INTERRUPT_ACK: usize = 0x064;
 const NET_CONFIG_BASE: usize = 0x100;
 
 const VIRTIO_NET_F_MTU: u64 = 1 << 3;
+const VIRTIO_NET_F_CSUM: u64 = 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
 const REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
-const OPTIONAL_FEATURES: u64 = VIRTIO_NET_F_MTU | VIRTIO_NET_F_STATUS;
+const OPTIONAL_FEATURES: u64 =
+    VIRTIO_NET_F_CSUM | VIRTIO_NET_F_MTU | VIRTIO_NET_F_STATUS | VIRTIO_F_RING_EVENT_IDX;
 
 fn read_mac(base: usize) -> [u8; 6] {
     let mut mac = [0u8; 6];
@@ -110,16 +112,38 @@ fn probe_queue(
     let mtu = read_mtu(base, accepted);
     let rx = setup_queue(transport.as_ref(), context, 0)?;
     let tx = setup_queue(transport.as_ref(), context, 1)?;
-    let irq = virtio_mmio_queue_irq(
-        rx.avail_flags_addr(),
-        tx.avail_flags_addr(),
-        base + MMIO_INTERRUPT_STATUS,
-        base + MMIO_INTERRUPT_ACK,
-    );
+    let event_idx = accepted & VIRTIO_F_RING_EVENT_IDX != 0;
+    let tx_checksum = accepted & VIRTIO_NET_F_CSUM != 0;
+    let irq = if event_idx {
+        virtio_mmio_queue_irq_event_idx(
+            rx.used_event_addr()
+                .map_err(|_| "VirtIO-net MMIO RX EVENT_IDX 布局无效")?,
+            rx.used_idx_addr(),
+            tx.used_event_addr()
+                .map_err(|_| "VirtIO-net MMIO TX EVENT_IDX 布局无效")?,
+            tx.used_idx_addr(),
+            base + MMIO_INTERRUPT_STATUS,
+            base + MMIO_INTERRUPT_ACK,
+        )
+    } else {
+        virtio_mmio_queue_irq(
+            rx.avail_flags_addr(),
+            tx.avail_flags_addr(),
+            base + MMIO_INTERRUPT_STATUS,
+            base + MMIO_INTERRUPT_ACK,
+        )
+    };
     let _ = queue_irq_control(&irq).ack_and_mask();
     transport.add_status(VIRTIO_STATUS_DRIVER_OK);
     Ok((
-        VirtioNetQueue::new(VirtioNetTransport::Mmio(transport), rx, tx),
+        VirtioNetQueue::new(
+            net::QueuePairId(0),
+            VirtioNetTransport::Mmio(transport),
+            rx,
+            tx,
+            event_idx,
+            tx_checksum,
+        ),
         irq,
         mac,
         mtu,

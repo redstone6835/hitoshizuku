@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
@@ -665,4 +666,28 @@ pub fn new_netbuf_pool(
         )?));
     }
     net::buf::NetBufPool::new(storages.into_boxed_slice()).map_err(|_| "DMA NetBuf pool 构造失败")
+}
+
+/// 在常驻内核中构造共享 DMA 网络 buffer pool。
+///
+/// `SharedNetBufPool` 的锁类型属于常驻 `net` crate；动态驱动不能自行构造，
+/// 否则模块侧的第三方锁 crate 实例会泄漏进 ELM ABI。
+#[kernel_symbols::export(
+    name = "general.dev.dma.new_shared_netbuf_pool",
+    contract = "kernel.general.dma-netbuf-pool@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+        | kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn new_shared_netbuf_pool(
+    context: DmaContext,
+    count: usize,
+    size: usize,
+    align: usize,
+    direction: DmaDirection,
+) -> Result<net::buf::SharedNetBufPool, &'static str> {
+    new_netbuf_pool(context, count, size, align, direction).map(|owner| Arc::new(Mutex::new(owner)))
 }

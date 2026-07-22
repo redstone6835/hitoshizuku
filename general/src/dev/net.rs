@@ -58,9 +58,24 @@ pub fn net_function(dev_name: &str) -> Arc<dyn DeviceFunction> {
 const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 #[derive(Clone, Copy)]
+enum RingInterruptControl {
+    Flags {
+        rx: usize,
+        tx: usize,
+    },
+    EventIdx {
+        rx_event: usize,
+        rx_used_idx: usize,
+        tx_event: usize,
+        tx_used_idx: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
 enum QueueIrqSource {
     Mmio { status: usize, acknowledge: usize },
     Pci { isr: usize },
+    PciMsix,
 }
 
 impl QueueIrqSource {
@@ -83,14 +98,14 @@ impl QueueIrqSource {
                 // Safety: 地址来自已校验的 VirtIO PCI ISR capability；读取即确认。
                 unsafe { read_volatile(isr as *const u8) as u32 }
             }
+            Self::PciMsix => 1,
         }
     }
 }
 
 struct ResidentQueueIrq {
     source: QueueIrqSource,
-    rx_avail_flags: usize,
-    tx_avail_flags: usize,
+    rings: RingInterruptControl,
     pending: AtomicBool,
     masked: AtomicBool,
     waker: Mutex<Option<Arc<dyn QueueWakeHandle>>>,
@@ -100,11 +115,10 @@ struct ResidentQueueIrq {
 }
 
 impl ResidentQueueIrq {
-    fn new(source: QueueIrqSource, rx_avail_flags: usize, tx_avail_flags: usize) -> Self {
+    fn new(source: QueueIrqSource, rings: RingInterruptControl) -> Self {
         Self {
             source,
-            rx_avail_flags,
-            tx_avail_flags,
+            rings,
             pending: AtomicBool::new(false),
             masked: AtomicBool::new(true),
             waker: Mutex::new(None),
@@ -115,16 +129,40 @@ impl ResidentQueueIrq {
     }
 
     fn set_ring_interrupts_masked(&self, masked: bool) {
-        let flags = if masked {
-            VIRTQ_AVAIL_F_NO_INTERRUPT
-        } else {
-            0
-        };
-        // Safety: 两个地址指向常驻 DMA allocation 中的 split-ring avail.flags，
-        // queue teardown 必须先注销 IRQ 并释放 host control 引用。
-        unsafe {
-            write_volatile(self.rx_avail_flags as *mut u16, flags);
-            write_volatile(self.tx_avail_flags as *mut u16, flags);
+        match self.rings {
+            RingInterruptControl::Flags { rx, tx } => {
+                let flags = if masked {
+                    VIRTQ_AVAIL_F_NO_INTERRUPT
+                } else {
+                    0
+                };
+                // Safety: 地址指向常驻 split-ring avail.flags，teardown 先注销 IRQ。
+                unsafe {
+                    write_volatile(rx as *mut u16, flags);
+                    write_volatile(tx as *mut u16, flags);
+                }
+            }
+            RingInterruptControl::EventIdx {
+                rx_event,
+                rx_used_idx,
+                tx_event,
+                tx_used_idx,
+            } => {
+                // Safety: 地址来自经过布局校验的 split ring。arm 发生在 worker 已确认
+                // queue 为空之后，因此当前 used.idx 就是下一个期望事件的基线。
+                unsafe {
+                    let rx = read_volatile(rx_used_idx as *const u16);
+                    let tx = read_volatile(tx_used_idx as *const u16);
+                    write_volatile(
+                        rx_event as *mut u16,
+                        if masked { rx.wrapping_sub(1) } else { rx },
+                    );
+                    write_volatile(
+                        tx_event as *mut u16,
+                        if masked { tx.wrapping_sub(1) } else { tx },
+                    );
+                }
+            }
         }
         fence(Ordering::SeqCst);
     }
@@ -215,8 +253,10 @@ impl NetQueueIrqBinding {
                     status: interrupt_status,
                     acknowledge: interrupt_acknowledge,
                 },
-                rx_avail_flags,
-                tx_avail_flags,
+                RingInterruptControl::Flags {
+                    rx: rx_avail_flags,
+                    tx: tx_avail_flags,
+                },
             )),
         }
     }
@@ -225,8 +265,85 @@ impl NetQueueIrqBinding {
         Self {
             inner: Arc::new(ResidentQueueIrq::new(
                 QueueIrqSource::Pci { isr: isr_status },
-                rx_avail_flags,
-                tx_avail_flags,
+                RingInterruptControl::Flags {
+                    rx: rx_avail_flags,
+                    tx: tx_avail_flags,
+                },
+            )),
+        }
+    }
+
+    fn virtio_mmio_event_idx(
+        rx_event: usize,
+        rx_used_idx: usize,
+        tx_event: usize,
+        tx_used_idx: usize,
+        interrupt_status: usize,
+        interrupt_acknowledge: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ResidentQueueIrq::new(
+                QueueIrqSource::Mmio {
+                    status: interrupt_status,
+                    acknowledge: interrupt_acknowledge,
+                },
+                RingInterruptControl::EventIdx {
+                    rx_event,
+                    rx_used_idx,
+                    tx_event,
+                    tx_used_idx,
+                },
+            )),
+        }
+    }
+
+    fn virtio_pci_event_idx(
+        rx_event: usize,
+        rx_used_idx: usize,
+        tx_event: usize,
+        tx_used_idx: usize,
+        isr_status: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ResidentQueueIrq::new(
+                QueueIrqSource::Pci { isr: isr_status },
+                RingInterruptControl::EventIdx {
+                    rx_event,
+                    rx_used_idx,
+                    tx_event,
+                    tx_used_idx,
+                },
+            )),
+        }
+    }
+
+    fn virtio_pci_msix(rx_avail_flags: usize, tx_avail_flags: usize) -> Self {
+        Self {
+            inner: Arc::new(ResidentQueueIrq::new(
+                QueueIrqSource::PciMsix,
+                RingInterruptControl::Flags {
+                    rx: rx_avail_flags,
+                    tx: tx_avail_flags,
+                },
+            )),
+        }
+    }
+
+    fn virtio_pci_msix_event_idx(
+        rx_event: usize,
+        rx_used_idx: usize,
+        tx_event: usize,
+        tx_used_idx: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ResidentQueueIrq::new(
+                QueueIrqSource::PciMsix,
+                RingInterruptControl::EventIdx {
+                    rx_event,
+                    rx_used_idx,
+                    tx_event,
+                    tx_used_idx,
+                },
             )),
         }
     }
@@ -263,6 +380,32 @@ pub fn virtio_mmio_queue_irq(
 }
 
 #[kernel_symbols::export(
+    name = "general.dev.net.virtio_mmio_queue_irq_event_idx",
+    contract = "kernel.general.net-queue-irq@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+        | kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn virtio_mmio_queue_irq_event_idx(
+    rx_event: usize,
+    rx_used_idx: usize,
+    tx_event: usize,
+    tx_used_idx: usize,
+    interrupt_status: usize,
+    interrupt_acknowledge: usize,
+) -> NetQueueIrqBinding {
+    NetQueueIrqBinding::virtio_mmio_event_idx(
+        rx_event,
+        rx_used_idx,
+        tx_event,
+        tx_used_idx,
+        interrupt_status,
+        interrupt_acknowledge,
+    )
+}
+
+#[kernel_symbols::export(
     name = "general.dev.net.virtio_pci_queue_irq",
     contract = "kernel.general.net-queue-irq@1",
     version = 1,
@@ -276,6 +419,62 @@ pub fn virtio_pci_queue_irq(
     isr_status: usize,
 ) -> NetQueueIrqBinding {
     NetQueueIrqBinding::virtio_pci(rx_avail_flags, tx_avail_flags, isr_status)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.net.virtio_pci_queue_irq_event_idx",
+    contract = "kernel.general.net-queue-irq@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+        | kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn virtio_pci_queue_irq_event_idx(
+    rx_event: usize,
+    rx_used_idx: usize,
+    tx_event: usize,
+    tx_used_idx: usize,
+    isr_status: usize,
+) -> NetQueueIrqBinding {
+    NetQueueIrqBinding::virtio_pci_event_idx(
+        rx_event,
+        rx_used_idx,
+        tx_event,
+        tx_used_idx,
+        isr_status,
+    )
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.net.virtio_pci_msix_queue_irq",
+    contract = "kernel.general.net-queue-irq@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+        | kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn virtio_pci_msix_queue_irq(
+    rx_avail_flags: usize,
+    tx_avail_flags: usize,
+) -> NetQueueIrqBinding {
+    NetQueueIrqBinding::virtio_pci_msix(rx_avail_flags, tx_avail_flags)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.net.virtio_pci_msix_queue_irq_event_idx",
+    contract = "kernel.general.net-queue-irq@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+        | kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn virtio_pci_msix_queue_irq_event_idx(
+    rx_event: usize,
+    rx_used_idx: usize,
+    tx_event: usize,
+    tx_used_idx: usize,
+) -> NetQueueIrqBinding {
+    NetQueueIrqBinding::virtio_pci_msix_event_idx(rx_event, rx_used_idx, tx_event, tx_used_idx)
 }
 
 #[kernel_symbols::export(
