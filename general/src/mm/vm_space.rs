@@ -65,6 +65,21 @@ static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSegmentPlan {
+    mapping: Range<usize>,
+    lazy_file: Range<usize>,
+    lazy_file_offset: u64,
+    fragment_pages: [usize; 2],
+    fragment_count: usize,
+}
+
+impl FileSegmentPlan {
+    fn fragments(&self) -> &[usize] {
+        &self.fragment_pages[..self.fragment_count]
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VmSpaceDiag {
     pub live: usize,
@@ -1348,82 +1363,118 @@ impl VmSpace {
         Ok(())
     }
 
-    /// 立即为一个 ELF 段分配并从文件按页填充。
+    /// 注册 ELF 文件段，并只立即填充不能直接映射文件的首尾碎片页。
     ///
-    /// loader 不能为了装载大可执行文件把整个 ELF 读进内核堆。这个入口只在
-    /// 当前页需要文件内容时读取最多一页，BSS 和页内尾部仍由零页分配保证清零。
+    /// 完整落在 `filesz` 内的页保留为 file-backed VMA，由硬件缺页按需读取；
+    /// BSS 完整页保留为匿名 VMA。这样短命编译器进程不会在 `execve` 时读取从未
+    /// 执行或访问的全部代码/数据，同时碎片页仍严格保证段前空洞与 BSS 尾部清零。
     pub fn commit_file_segment(
         &self,
         vaddr: usize,
         memsz: usize,
         file_offset: u64,
         file_size: usize,
-        file: &dyn FileLike,
+        file: Arc<dyn FileLike>,
         flags: VmFlags,
     ) -> Result<(), Errno> {
         if memsz == 0 {
             return Ok(());
         }
-        if file_size > memsz {
+        let page_size = page_size();
+        let plan = plan_file_segment(vaddr, memsz, file_offset, file_size, page_size)?;
+        let area_flags = flags.with(VmFlags::USER);
+
+        if plan.lazy_file.start >= plan.lazy_file.end {
+            self.map_anon(plan.mapping.clone(), area_flags)?;
+        } else {
+            if plan.mapping.start < plan.lazy_file.start {
+                self.map_anon(plan.mapping.start..plan.lazy_file.start, area_flags)?;
+            }
+            self.map_file(
+                plan.lazy_file.clone(),
+                Arc::clone(&file),
+                plan.lazy_file_offset,
+                area_flags,
+            )?;
+            if plan.lazy_file.end < plan.mapping.end {
+                self.map_anon(plan.lazy_file.end..plan.mapping.end, area_flags)?;
+            }
+        }
+
+        for &page_va in plan.fragments() {
+            self.commit_file_fragment_page(
+                page_va,
+                vaddr,
+                file_offset,
+                file_size,
+                file.as_ref(),
+                area_flags.with(VmFlags::ANON),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 填充 ELF 文件段中不能作为完整文件页延迟映射的首尾页。
+    fn commit_file_fragment_page(
+        &self,
+        page_va: usize,
+        vaddr: usize,
+        file_offset: u64,
+        file_size: usize,
+        file: &dyn FileLike,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
+        let file_end_vaddr = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
+        let page_end = page_va.checked_add(page_size).ok_or(Errno::EINVAL)?;
+        let copy_start_va = page_va.max(vaddr);
+        let copy_end_va = page_end.min(file_end_vaddr);
+        if copy_end_va <= copy_start_va {
             return Err(Errno::EINVAL);
         }
-        let virt_fn = allocator::KERNEL_ALLOCATOR
-            .load_phys_to_virt()
-            .ok_or(Errno::EINVAL)?;
 
-        let page_size = page_size();
-        let start = page_base(vaddr);
-        let end_unaligned = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
-        let end = align_up(end_unaligned, page_size).ok_or(Errno::EINVAL)?;
-        let file_end_vaddr = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
-        let area_flags = flags.with(VmFlags::USER).with(VmFlags::ANON);
-
-        self.map_anon(start..end, area_flags)?;
-
-        let mut pages = self.pages.lock();
-        let mut page_va = start;
-        while page_va < end {
-            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
-            let result = (|| {
-                let copy_start_va = page_va.max(vaddr);
-                let copy_end_va = (page_va + page_size).min(file_end_vaddr);
-                if copy_end_va <= copy_start_va {
-                    return Ok(());
+        let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+        let result = (|| {
+            let virt_fn = allocator::KERNEL_ALLOCATOR
+                .load_phys_to_virt()
+                .ok_or(Errno::EINVAL)?;
+            let seg_off = copy_start_va - vaddr;
+            let len = copy_end_va - copy_start_va;
+            let dst_off_in_page = copy_start_va - page_va;
+            let kva = virt_fn(paddr) + dst_off_in_page;
+            // Safety: paddr 来自一整页用户物理页分配；dst_off/len 均由该页与
+            // 文件字节区间的交集计算，构造的切片不会越过这页。
+            let dst = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
+            let mut done = 0usize;
+            while done < len {
+                let read_off = file_offset
+                    .checked_add(u64::try_from(seg_off + done).map_err(|_| Errno::EINVAL)?)
+                    .ok_or(Errno::EINVAL)?;
+                let n = file.read_at(read_off, &mut dst[done..])?;
+                if n == 0 {
+                    return Err(Errno::ENOEXEC);
                 }
-
-                let seg_off = copy_start_va - vaddr;
-                let len = copy_end_va - copy_start_va;
-                let dst_off_in_page = copy_start_va - page_va;
-                let kva = virt_fn(paddr) + dst_off_in_page;
-                let dst = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
-                let mut done = 0usize;
-                while done < len {
-                    let read_off = file_offset
-                        .checked_add((seg_off + done) as u64)
-                        .ok_or(Errno::EINVAL)?;
-                    let n = file.read_at(read_off, &mut dst[done..])?;
-                    if n == 0 {
-                        return Err(Errno::ENOEXEC);
-                    }
-                    done += n;
-                }
-                Ok(())
-            })();
-            if let Err(err) = result {
-                free_user_page(paddr);
-                return Err(err);
+                done += n;
             }
-
-            let page = ResidentPage::new_anon(paddr);
-            let access = access_for_new_page(area_flags, &page);
-            self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
-            pages.insert(page_va, PageMapping { page, access });
-            page_va += page_size;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            free_user_page(paddr);
+            return Err(err);
         }
+
+        let page = ResidentPage::new_anon(paddr);
+        let access = access_for_new_page(flags, &page);
+        let mut pages = self.pages.lock();
+        if pages.contains_key(&page_va) {
+            return Err(Errno::EEXIST);
+        }
+        self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))?;
+        pages.insert(page_va, PageMapping { page, access });
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.publish_new_user_range(start, end - start);
+        self.publish_new_user_range(page_va, page_size);
         Ok(())
     }
 
@@ -2000,6 +2051,59 @@ fn permits(flags: VmFlags, kind: FaultKind) -> bool {
     }
 }
 
+/// 把 ELF 文件段拆成完整文件页、匿名页和最多两个碎片页。
+fn plan_file_segment(
+    vaddr: usize,
+    memsz: usize,
+    file_offset: u64,
+    file_size: usize,
+    page_size: usize,
+) -> Result<FileSegmentPlan, Errno> {
+    if page_size == 0 || !page_size.is_power_of_two() || memsz == 0 || file_size > memsz {
+        return Err(Errno::EINVAL);
+    }
+    let mem_end = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
+    let file_end = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
+    file_offset
+        .checked_add(u64::try_from(file_size).map_err(|_| Errno::EINVAL)?)
+        .ok_or(Errno::EINVAL)?;
+
+    let mapping_start = vaddr & !(page_size - 1);
+    let mapping_end = align_up(mem_end, page_size).ok_or(Errno::EINVAL)?;
+    let full_file_start = align_up(vaddr, page_size).ok_or(Errno::EINVAL)?;
+    let full_file_end = file_end & !(page_size - 1);
+    let (lazy_file, lazy_file_offset) = if full_file_start < full_file_end {
+        let delta = u64::try_from(full_file_start - vaddr).map_err(|_| Errno::EINVAL)?;
+        let offset = file_offset.checked_add(delta).ok_or(Errno::EINVAL)?;
+        (full_file_start..full_file_end, offset)
+    } else {
+        (mapping_start..mapping_start, file_offset)
+    };
+
+    let mut fragment_pages = [0usize; 2];
+    let mut fragment_count = 0usize;
+    if file_size != 0 {
+        let first = mapping_start;
+        let last = (file_end - 1) & !(page_size - 1);
+        if !lazy_file.contains(&first) {
+            fragment_pages[fragment_count] = first;
+            fragment_count += 1;
+        }
+        if last != first && !lazy_file.contains(&last) {
+            fragment_pages[fragment_count] = last;
+            fragment_count += 1;
+        }
+    }
+
+    Ok(FileSegmentPlan {
+        mapping: mapping_start..mapping_end,
+        lazy_file,
+        lazy_file_offset,
+        fragment_pages,
+        fragment_count,
+    })
+}
+
 fn align_up(value: usize, align: usize) -> Option<usize> {
     Some(value.checked_add(align - 1)? & !(align - 1))
 }
@@ -2057,4 +2161,57 @@ pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
         .iter()
         .map(|a| (a.range.clone(), a.flags))
         .collect()
+}
+
+#[cfg(test)]
+mod file_segment_tests {
+    use super::plan_file_segment;
+
+    const PAGE_SIZE: usize = 0x1000;
+
+    #[test]
+    fn aligned_file_pages_remain_fully_lazy() {
+        let plan = plan_file_segment(0x4000, 0x3000, 0x8000, 0x3000, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x7000);
+        assert_eq!(plan.lazy_file, 0x4000..0x7000);
+        assert_eq!(plan.lazy_file_offset, 0x8000);
+        assert!(plan.fragments().is_empty());
+    }
+
+    #[test]
+    fn unaligned_file_and_bss_keep_only_edge_pages_eager() {
+        let plan = plan_file_segment(0x4103, 0x4000, 0x103, 0x2400, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x9000);
+        assert_eq!(plan.lazy_file, 0x5000..0x6000);
+        assert_eq!(plan.lazy_file_offset, 0x1000);
+        assert_eq!(plan.fragments(), &[0x4000, 0x6000]);
+    }
+
+    #[test]
+    fn short_unaligned_file_can_span_two_fragment_pages() {
+        let plan = plan_file_segment(0x4f00, 0x800, 0x2f00, 0x300, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x6000);
+        assert!(plan.lazy_file.is_empty());
+        assert_eq!(plan.fragments(), &[0x4000, 0x5000]);
+    }
+
+    #[test]
+    fn pure_bss_stays_lazy_anonymous() {
+        let plan = plan_file_segment(0x4103, 0x2800, 0, 0, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x7000);
+        assert!(plan.lazy_file.is_empty());
+        assert!(plan.fragments().is_empty());
+    }
+
+    #[test]
+    fn invalid_or_overflowing_segments_are_rejected() {
+        assert!(plan_file_segment(0x4000, 0x1000, 0, 0x1001, PAGE_SIZE).is_err());
+        assert!(plan_file_segment(usize::MAX - 1, 4, 0, 0, PAGE_SIZE).is_err());
+        assert!(plan_file_segment(0x4000, 0x1000, u64::MAX, 1, PAGE_SIZE).is_err());
+        assert!(plan_file_segment(0x4000, 0x1000, 0, 0, 3).is_err());
+    }
 }
