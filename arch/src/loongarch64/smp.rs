@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use general::TaskOps;
 use sched::arch_hooks::CpuControlOps;
 
+use super::asid_tracker::CurrentAsidTracker;
 use super::heap_vm::activate_kernel_page_table_for_secondary;
 use super::loader::{configure_local_timer, timer_hz};
 use super::specific::*;
@@ -53,6 +54,7 @@ static PHYSICAL_CPU_IDS: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(UNKNOWN_CPU_ID) }; MAX_CPUS];
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
 static STARTED_CPUS: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_LOGICAL_ASIDS: CurrentAsidTracker<MAX_CPUS> = CurrentAsidTracker::new();
 static AP_IDLE_TASKS: [AtomicPtr<sched::Task>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 static TLB_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -186,6 +188,20 @@ fn send_membarrier(logical_id: usize) -> bool {
 
 fn cpu_is_online(logical_id: usize) -> bool {
     logical_id < MAX_CPUS && ONLINE_CPUS.load(Ordering::Acquire) & (1 << logical_id) != 0
+}
+
+/// 发布当前 CPU 即将激活的逻辑 ASID；调用方随后必须完成全量本地 TLB 失效。
+pub(crate) fn publish_current_logical_asid(asid: usize) {
+    let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
+    CURRENT_LOGICAL_ASIDS.publish_before_full_flush(cpu, asid);
+}
+
+/// 在 PTE 更新后，仅保留当前仍运行目标逻辑 ASID 的历史 CPU。
+pub(crate) fn shootdown_targets_after_pte_update(
+    historically_active: &AtomicUsize,
+    target_asid: usize,
+) -> usize {
+    CURRENT_LOGICAL_ASIDS.target_mask_after_pte_update(historically_active, target_asid)
 }
 
 fn poll_urgent() {
@@ -344,8 +360,9 @@ fn wait_for_shootdown(
                 last_kick = now;
             }
             if now.wrapping_sub(last_warning) >= warning_ticks {
+                let target_logical_asid = CURRENT_LOGICAL_ASIDS.current(logical_id);
                 log::warning!(
-                    "[smp] shootdown 确认等待过长 kind={} asid={} address={:#x} source={} target={} targets={:#x} expected={} completed={} requested={} online={:#x}",
+                    "[smp] shootdown 确认等待过长 kind={} asid={} address={:#x} source={} target={} targets={:#x} expected={} completed={} requested={} online={:#x} target_logical_asid={:?} target_asid_matches={}",
                     kind,
                     asid,
                     address,
@@ -360,6 +377,8 @@ fn wait_for_shootdown(
                         _ => 0,
                     },
                     ONLINE_CPUS.load(Ordering::Acquire),
+                    target_logical_asid,
+                    target_logical_asid == Some(asid),
                 );
                 last_warning = now;
             }

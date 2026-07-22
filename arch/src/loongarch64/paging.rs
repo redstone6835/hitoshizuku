@@ -603,13 +603,14 @@ impl LoongArch64Paging {
 
     /// 仅在指定逻辑 CPU 集合上同步失效该 ASID 的 TLB。
     ///
-    /// 当前 CPU 始终执行本地失效；`targets` 只约束远端通知。调用方通常传入地址
-    /// 空间生命周期内单调增长的激活 CPU 位图，使从未运行过该地址空间的 CPU 不会
-    /// 阻塞页表更新。
+    /// 当前 CPU 始终执行本地失效；`targets` 只约束远端通知。调用方可以传入地址
+    /// 空间生命周期内的历史 CPU 位图，也可以排除已经切离且下次激活前必定执行
+    /// 完整本地失效的 CPU。
     ///
     /// # Safety
     ///
-    /// 调用者必须保证 `targets` 包含所有可能缓存过该 ASID translation 的 CPU。
+    /// 调用者必须保证 `targets` 包含所有仍可能在下一次完整本地失效前执行该 ASID
+    /// 的远端 CPU。
     #[inline]
     pub unsafe fn flush_tlb_with_asid_on_cpus(
         asid: usize,
