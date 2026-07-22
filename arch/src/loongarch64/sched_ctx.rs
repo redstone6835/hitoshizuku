@@ -232,6 +232,15 @@ pub(crate) fn idle_waiting() -> bool {
     idle_waiting_slot().load(Ordering::Acquire)
 }
 
+/// 重新发布当前 CPU 即将返回 `idle 0` 的等待标记。
+///
+/// idle 可能在 IPI handler 内被切走，之后又从旧 handler 恢复。恢复点仍位于
+/// 原来的 `idle 0` 之前，因此 handler 必须在返回前重新置位，封闭“恢复后收到
+/// 新 IPI、但等待标记已被首次 IPI 消费”的二次丢唤醒窗口。
+pub(crate) fn mark_idle_waiting() {
+    idle_waiting_slot().store(true, Ordering::Release);
+}
+
 /// 消费当前 CPU 的 idle 等待标记。IPI 处理器在切入调度前调用，避免标记
 /// 跨越上下文切换残留为真；idle_relax 返回时的 store(false) 仍保持幂等。
 pub(crate) fn take_idle_waiting() -> bool {
@@ -239,7 +248,7 @@ pub(crate) fn take_idle_waiting() -> bool {
 }
 
 fn loongarch64_idle_relax() {
-    idle_waiting_slot().store(true, Ordering::Release);
+    mark_idle_waiting();
     unsafe {
         // idle 任务运行在内核态，普通 trap/系统调用返回路径不会替它恢复
         // PRMD.PIE。进入 idle 等待窗口前必须临时打开 CRMD.IE，否则 timer

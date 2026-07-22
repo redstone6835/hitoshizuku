@@ -206,8 +206,29 @@ unsafe fn loongarch64_handle_exception_inner(
             } else {
                 false
             };
-            if from_user || preempt_idle {
+            if from_user {
                 sched::preempt_if_needed(now_ns);
+            } else if preempt_idle {
+                loop {
+                    // 该调用可能在 idle 被再次选中前长期不返回；每轮重新取时钟，
+                    // 避免后续请求用首次 IPI 的旧时间戳做调度记账。
+                    sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+
+                    // schedule_once 若切走 idle，本调用只会在 idle 再次成为
+                    // current 后返回。旧 trap frame 的恢复点仍可能位于原来的
+                    // `idle 0` 之前，必须重新发布标记并复查 need_resched；否则
+                    // 恢复后的新 IPI 会因标记已被首次 handler 消费而再次丢失。
+                    debug_assert!(sched::current_task_ref().is_idle_task());
+                    super::super::sched_ctx::mark_idle_waiting();
+                    if !sched::needs_resched_current() {
+                        break;
+                    }
+
+                    // 标记刚由本 handler 发布且本地中断仍关闭，消费必然成功。
+                    // 若复查发现新请求，先撤销“即将 idle”声明再安全调度一次。
+                    let consumed = super::super::sched_ctx::take_idle_waiting();
+                    debug_assert!(consumed);
+                }
             }
             return arg4;
         }
