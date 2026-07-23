@@ -320,6 +320,9 @@ pub enum WaitReason {
     Timer,
     Yield,
     Other,
+    ProcessExit,
+    Vfork,
+    BlockIo,
 }
 
 impl WaitReason {
@@ -333,6 +336,10 @@ impl WaitReason {
             4 => Self::Futex,
             5 => Self::Timer,
             6 => Self::Yield,
+            7 => Self::Other,
+            8 => Self::ProcessExit,
+            9 => Self::Vfork,
+            10 => Self::BlockIo,
             _ => Self::Other,
         }
     }
@@ -348,7 +355,34 @@ impl WaitReason {
             Self::Timer => profiling::Event::WaitTimer,
             Self::Yield => profiling::Event::WaitYield,
             Self::Other => profiling::Event::WaitOther,
+            Self::ProcessExit => profiling::Event::WaitProcessExit,
+            Self::Vfork => profiling::Event::WaitVfork,
+            Self::BlockIo => profiling::Event::WaitBlockIo,
         }
+    }
+}
+
+#[cfg(all(test, feature = "performance-profile"))]
+mod wait_reason_profile_tests {
+    use super::WaitReason;
+
+    #[test]
+    fn buildstorm_wait_reasons_map_to_dedicated_events() {
+        assert_eq!(
+            WaitReason::ProcessExit.profile_event(),
+            profiling::Event::WaitProcessExit
+        );
+        assert_eq!(
+            WaitReason::Vfork.profile_event(),
+            profiling::Event::WaitVfork
+        );
+        assert_eq!(
+            WaitReason::BlockIo.profile_event(),
+            profiling::Event::WaitBlockIo
+        );
+        assert_eq!(WaitReason::from_u8(8), WaitReason::ProcessExit);
+        assert_eq!(WaitReason::from_u8(9), WaitReason::Vfork);
+        assert_eq!(WaitReason::from_u8(10), WaitReason::BlockIo);
     }
 }
 
@@ -673,7 +707,7 @@ impl Task {
             root_pid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             tgid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             ptrace_traced: AtomicU8::new(0),
-            exit_waiters: WaitQueue::new(),
+            exit_waiters: WaitQueue::new_with_reason(WaitReason::ProcessExit),
             rel: Spinlock::new(Relations {
                 parent,
                 children: Vec::new(),
@@ -687,7 +721,7 @@ impl Task {
             signal: SignalState::new(),
             shared_signal: Spinlock::new(shared),
             exit_signal: AtomicI32::new(SignalNumber::SIGCHLD.raw() as i32),
-            vfork_done: WaitQueue::new(),
+            vfork_done: WaitQueue::new_with_reason(WaitReason::Vfork),
             vforking: AtomicBool::new(false),
             clear_child_tid: AtomicUsize::new(0),
             robust_list: Spinlock::new(RobustListState::default()),

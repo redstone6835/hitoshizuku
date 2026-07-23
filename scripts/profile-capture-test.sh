@@ -81,7 +81,12 @@ if PATH="$tmp/bin:$PATH" \
 fi
 
 grep -q 'filesystem) echo 0x6000000' "$root/scripts/profile-capture.sh"
-grep -q 'io) echo 0x1efff4000' "$root/scripts/profile-capture.sh"
+grep -q 'io) echo 0x9efff4000' "$root/scripts/profile-capture.sh"
+grep -q 'block) echo 0x9e0000000' "$root/scripts/profile-capture.sh"
+grep -q 'full) echo 0xfffffffff' "$root/scripts/profile-capture.sh"
+grep -q 'event_mask=${PROFILE_EVENT_MASK:-${preset:-0xfffffffff}}' "$root/scripts/profile-capture.sh"
+grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/buildstorm-profile-host.sh"
+grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/buildstorm-profile-guest.sh"
 
 PROFILE_CONTROL="$control" \
 PROFILE_STATS="$stats" \

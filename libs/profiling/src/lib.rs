@@ -96,6 +96,9 @@ pub enum Event {
     BlockDrain,
     BlockComplete,
     BlockWait,
+    WaitProcessExit,
+    WaitVfork,
+    WaitBlockIo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,7 +129,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 36] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -160,6 +163,9 @@ impl Event {
         Self::BlockDrain,
         Self::BlockComplete,
         Self::BlockWait,
+        Self::WaitProcessExit,
+        Self::WaitVfork,
+        Self::WaitBlockIo,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -197,6 +203,9 @@ impl Event {
             Self::BlockDrain => "block_drain",
             Self::BlockComplete => "block_complete",
             Self::BlockWait => "block_wait",
+            Self::WaitProcessExit => "wait_process_exit",
+            Self::WaitVfork => "wait_vfork",
+            Self::WaitBlockIo => "wait_block_io",
         }
     }
 
@@ -233,6 +242,9 @@ impl Event {
             | Self::WaitTimer
             | Self::WaitYield
             | Self::WaitOther
+            | Self::WaitProcessExit
+            | Self::WaitVfork
+            | Self::WaitBlockIo
             | Self::WakeupLatency => EventCategory::Wait,
             Self::VfsRead | Self::VfsWrite => EventCategory::Filesystem,
             Self::PageFault => EventCategory::Memory,
@@ -1956,6 +1968,18 @@ mod tests {
         assert_eq!(histogram_percentile(&timer.latency, 50), 1u64 << 32);
         set_event_mask(ALL_EVENT_MASK);
         stop();
+    }
+
+    #[test]
+    fn buildstorm_wait_events_are_appended_without_renumbering_existing_events() {
+        assert_eq!(Event::BlockWait as usize, 32);
+        assert_eq!(Event::WaitProcessExit as usize, 33);
+        assert_eq!(Event::WaitVfork as usize, 34);
+        assert_eq!(Event::WaitBlockIo as usize, 35);
+        assert_eq!(Event::ALL.len(), 36);
+        assert_eq!(Event::from_id(33), Some(Event::WaitProcessExit));
+        assert_eq!(Event::from_id(34), Some(Event::WaitVfork));
+        assert_eq!(Event::from_id(35), Some(Event::WaitBlockIo));
     }
 
     #[test]

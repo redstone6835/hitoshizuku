@@ -20,11 +20,11 @@ write_control() {
 
 preset_mask() {
     case "$1" in
-        io) echo 0x1efff4000 ;;
+        io) echo 0x9efff4000 ;;
         syscall) echo 0x1000000 ;;
         filesystem) echo 0x6000000 ;;
-        block) echo 0x1e0000000 ;;
-        full) echo 0x1ffffffff ;;
+        block) echo 0x9e0000000 ;;
+        full) echo 0xfffffffff ;;
         *)
             echo "profile capture: unknown PROFILE_PRESET=$1" >&2
             exit 2
@@ -133,7 +133,7 @@ start_capture() {
     if [ -n "${PROFILE_PRESET:-}" ]; then
         preset=$(preset_mask "$PROFILE_PRESET")
     fi
-    event_mask=${PROFILE_EVENT_MASK:-${preset:-0x1ffffffff}}
+    event_mask=${PROFILE_EVENT_MASK:-${preset:-0xfffffffff}}
     write_control freeze
     write_control reset
     write_control "events=$event_mask"

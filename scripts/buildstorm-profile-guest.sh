@@ -225,10 +225,12 @@ capture_controller() {
             fi
             echo "@@PROFILE_WINDOW_STOPPED ended=$ended token=$token"
             if [ "$ended" -eq 0 ]; then
-                terminate_group "$workload_pid" || {
-                    echo "profile runner: workload group survived window termination" >&2
-                    return 1
-                }
+                # A stopped task in uninterruptible I/O may outlive this first
+                # bounded SIGKILL sweep. The parent runner performs the final
+                # group check after reaping cargo, so do not strand the host at
+                # the post-snapshot handshake while that cleanup converges.
+                terminate_group "$workload_pid" ||
+                    echo "profile runner: workload group still draining after window termination" >&2
                 echo "PROFILE_STOP_SENT token=$token pid=$workload_pid"
             fi
             return 0
@@ -290,7 +292,7 @@ run_profile() {
     valid_token "$token" || usage
     capture=${PROFILE_CAPTURE:-1}
     case "$capture" in 0|1) ;; *) echo "profile runner: PROFILE_CAPTURE must be 0 or 1" >&2; exit 2 ;; esac
-    event_mask=${PROFILE_EVENT_MASK:-0x1ef000000}
+    event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
     valid_event_mask "$event_mask" || { echo "profile runner: invalid PROFILE_EVENT_MASK" >&2; exit 2; }
     sampling=${PROFILE_SAMPLING:-0}
     trace_enabled=${PROFILE_TRACE_ENABLED:-0}

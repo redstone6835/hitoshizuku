@@ -101,7 +101,7 @@ trace_enabled=${PROFILE_TRACE_ENABLED:-0}
 timing_shift=${PROFILE_TIMING_SHIFT:-8}
 timing_sampler=${PROFILE_TIMING_SAMPLER:-hashed-bernoulli-v1}
 capture=${PROFILE_CAPTURE:-1}
-event_mask=${PROFILE_EVENT_MASK:-0x1ef000000}
+event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
 case "$sampling:$trace_enabled" in
     0:0|0:1|1:0|1:1) ;;
     *) echo "PROFILE_SAMPLING and PROFILE_TRACE_ENABLED must be 0 or 1" >&2; exit 2 ;;

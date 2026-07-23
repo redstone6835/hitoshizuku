@@ -297,7 +297,7 @@ impl Bio {
         submitted_ns: u64,
         observer: Option<Arc<dyn BioCompletionObserver>>,
     ) -> (Self, Arc<Completion<BioResult>>) {
-        let completion = Completion::new();
+        let completion = Completion::new_with_reason(sched::WaitReason::BlockIo);
         let bio = Self {
             op,
             range,
