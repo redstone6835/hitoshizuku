@@ -91,6 +91,18 @@ wait_group_stopped() {
     done
 }
 
+resume_group() {
+    pgrp=$1
+    group_resume_attempts=0
+    while process_group_alive "$pgrp" && process_group_stopped "$pgrp"; do
+        kill -CONT "-$pgrp" 2>/dev/null || true
+        group_resume_attempts=$((group_resume_attempts + 1))
+        [ "$group_resume_attempts" -lt 200 ] || return 1
+        sleep 0.01
+    done
+    process_group_alive "$pgrp" && ! process_group_stopped "$pgrp"
+}
+
 terminate_group() {
     pgrp=$1
     kill -TERM "-$pgrp" 2>/dev/null || true
@@ -182,7 +194,11 @@ capture_controller() {
             if [ "$PROFILE_CAPTURE" -eq 1 ]; then
                 printf 'resume\n' >"${PROFILE_CONTROL:-/sys/kernel/profile_control}" || return 1
             fi
-            kill -CONT "-$workload_pid" 2>/dev/null || true
+            resume_group "$workload_pid" || {
+                terminate_group "$workload_pid" || true
+                echo "profile runner: workload group did not resume at window start" >&2
+                return 1
+            }
             echo "@@PROFILE_WINDOW_STARTED token=$token"
             while [ "$attempts" -gt 0 ] && [ -r "$owner" ] && [ "$(cat "$control" 2>/dev/null || true)" != stop ]; do
                 attempts=$((attempts - 1))

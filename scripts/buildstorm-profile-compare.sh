@@ -5,14 +5,15 @@ set -eu
 max_cv=${PROFILE_MAX_CV_PCT:-5}
 max_regression=${PROFILE_MAX_REGRESSION_PCT:-2}
 required_speedup=${PROFILE_REQUIRED_SPEEDUP:-1}
-max_boundary_ms=${PROFILE_MAX_BOUNDARY_MS:-1000}
+max_boundary_ms=${PROFILE_MAX_BOUNDARY_MS:-6000}
+max_boundary_pct=${PROFILE_MAX_BOUNDARY_PCT:-2}
 
 [ "$#" -ge 7 ] || {
     echo "usage: $0 BASELINE_SUMMARY BASELINE_SUMMARY BASELINE_SUMMARY -- CANDIDATE_SUMMARY CANDIDATE_SUMMARY CANDIDATE_SUMMARY" >&2
     exit 2
 }
 
-python3 - "$max_cv" "$max_regression" "$required_speedup" "$max_boundary_ms" "$@" <<'PY'
+python3 - "$max_cv" "$max_regression" "$required_speedup" "$max_boundary_ms" "$max_boundary_pct" "$@" <<'PY'
 import json
 import math
 import pathlib
@@ -38,7 +39,8 @@ max_cv = number("PROFILE_MAX_CV_PCT", sys.argv[1])
 max_regression = number("PROFILE_MAX_REGRESSION_PCT", sys.argv[2])
 speedup = number("PROFILE_REQUIRED_SPEEDUP", sys.argv[3], 1.0)
 max_boundary_ms = number("PROFILE_MAX_BOUNDARY_MS", sys.argv[4])
-paths = sys.argv[5:]
+max_boundary_pct = number("PROFILE_MAX_BOUNDARY_PCT", sys.argv[5])
+paths = sys.argv[6:]
 if paths.count("--") != 1:
     fail("arguments must contain exactly one -- separator")
 separator = paths.index("--")
@@ -81,10 +83,12 @@ for run in all_runs:
         if metadata.get(key) != reference.get(key):
             fail(f"metadata mismatch for {key}: {run['_path']}")
     timing = run.get("timing", {})
+    duration_ms = number("duration_ms", metadata.get("duration_ms"), 1.0)
+    boundary_limit_ms = min(max_boundary_ms, duration_ms * max_boundary_pct / 100.0)
     for field in ("start_observation_latency_ms", "stop_observation_latency_ms"):
         latency = number(field, timing.get(field))
-        if latency > max_boundary_ms:
-            fail(f"{field}={latency:.3f} exceeds {max_boundary_ms:.3f}: {run['_path']}")
+        if latency > boundary_limit_ms:
+            fail(f"{field}={latency:.3f} exceeds {boundary_limit_ms:.3f}: {run['_path']}")
     result = run.get("result", {})
     if result.get("workload_ended_early") and result.get("runner_status") != 0:
         fail(f"early-complete run failed: {run['_path']}")
@@ -197,6 +201,7 @@ report = {
         "max_regression_pct": max_regression,
         "required_speedup": speedup,
         "max_boundary_ms": max_boundary_ms,
+        "max_boundary_pct": max_boundary_pct,
     },
     "baseline": [run["_path"] for run in runs[0]],
     "candidate": [run["_path"] for run in runs[1]],

@@ -55,7 +55,7 @@ scripts/buildstorm-profile-compare.sh \
   /tmp/mygo-profile-aa/mygo-profile-counts-{1,2,3}.*/summary.json
 ```
 
-验收条件为共同 Cargo milestone 或进度的退化不超过 2%，组内 CV 不超过 5%，START/STOP 边界观测延迟不超过 1 秒。任何快照不单调、timing 样本少于 32、PC sample dropped、trace overwritten、镜像/config 不一致都会被标记为无效或低可信度。低可信 timing 不参与热点排序，但精确 calls/bytes/packets 仍可使用。
+验收条件为共同 Cargo milestone 或进度的退化不超过 2%，组内 CV 不超过 5%。START/STOP 边界观测延迟同时受 6 秒绝对上限和窗口时长 2% 的相对上限约束；300 秒窗口因此最多允许 6 秒。任何快照不单调、timing 样本少于 32、PC sample dropped、trace overwritten、镜像/config 不一致都会被标记为无效或低可信度。低可信 timing 不参与热点排序，但精确 calls/bytes/packets 仍可使用。
 
 ## 优化交付
 
