@@ -964,6 +964,12 @@ impl Task {
         self.group_exit_requested.load(Ordering::SeqCst)
     }
 
+    /// syscall/用户返回边界的无锁快速判定；发布端的 SeqCst store 已提供
+    /// Release 语义，这里只需 Acquire 即可观察线程组退出状态。
+    pub(crate) fn group_exit_boundary_pending(&self) -> bool {
+        self.group_exit_requested.load(Ordering::Acquire)
+    }
+
     /// 当前任务是否是线程组 leader。
     pub fn is_thread_group_leader(&self) -> bool {
         self.thread_group()

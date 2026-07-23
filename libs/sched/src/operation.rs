@@ -301,6 +301,11 @@ pub fn exit_group(code: i32) -> ! {
 
 /// 在目标线程自己的安全边界完成已经发布的 exit_group 请求。
 pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
+    // 正常 syscall/返回路径绝大多数没有协作退出请求；先读每任务原子标志，
+    // 避免为这条快路径获取 `rel` 锁并克隆线程组 Arc。
+    if !task.group_exit_boundary_pending() {
+        return false;
+    }
     let Some(status) = task.thread_group().group_exit_status() else {
         return false;
     };
