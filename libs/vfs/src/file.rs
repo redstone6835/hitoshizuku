@@ -1003,11 +1003,12 @@ impl ::mm::FileLike for File {
         Arc::as_ptr(&self.inode) as usize
     }
 
+    fn private_page_cache_key(&self) -> Option<usize> {
+        self.inode.private_page_cache_key()
+    }
+
     fn private_page_cache_generation(&self) -> Option<u64> {
-        (self.inode.kind() == crate::vfs::stat::FileType::Regular
-            && self.inode.ops.supports_private_page_cache())
-        .then(|| self.inode.private_page_cache_generation())
-        .flatten()
+        self.inode.private_page_cache_generation()
     }
 
     fn disable_private_page_cache(&self) {

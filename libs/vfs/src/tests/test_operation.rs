@@ -196,3 +196,19 @@ fn writable_shared_mapping_permanently_disables_private_cache() {
     assert_eq!(inode.private_page_cache_generation(), None);
     assert_eq!(inode.data_generation(), initial + 2);
 }
+
+#[ktest]
+fn private_page_cache_identity_is_unique_across_inode_lifetimes() {
+    let first = regular_inode();
+    let second = regular_inode();
+    let first_key = first.private_page_cache_key();
+    let second_key = second.private_page_cache_key();
+
+    assert!(first_key.is_some());
+    assert_ne!(first_key, second_key);
+
+    drop(first);
+    let replacement = regular_inode();
+    assert_ne!(first_key, replacement.private_page_cache_key());
+    assert_ne!(second_key, replacement.private_page_cache_key());
+}

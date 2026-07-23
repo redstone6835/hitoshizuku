@@ -116,6 +116,16 @@ pub struct InodeMeta {
 const STATE_LIVE: u8 = 0;
 const STATE_ORPHANED: u8 = 1;
 const STATE_EVICTED: u8 = 2;
+/// 私有文件页缓存身份；0 保留为“不可缓存”，耗尽后永久停止分配新身份。
+static NEXT_PRIVATE_PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn allocate_private_page_cache_id() -> usize {
+    NEXT_PRIVATE_PAGE_CACHE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or(0)
+}
 
 /// 根据文件系统实例标识符和超级块设备号推导 `stat(2)` 使用的 `st_dev` 值。
 ///
@@ -140,6 +150,9 @@ pub struct Inode {
     /// 全局唯一标识符，由文件系统实例 ID 和 inode 编号组成。在 Inode 创建时确定，
     /// 之后永远不会改变。
     pub(crate) id: InodeId,
+
+    /// 内核生命周期内不复用的私有文件页缓存身份。
+    private_page_cache_id: usize,
 
     /// 文件类型（普通文件、目录、符号链接、字符设备、块设备、FIFO 或套接字）。
     /// 在 Inode 创建时确定，之后永远不会改变。将文件类型作为顶层不可变字段而非
@@ -245,8 +258,17 @@ impl Inode {
         ops: Arc<dyn InodeOps + Send + Sync>,
         superblock: Weak<Superblock>,
     ) -> Arc<Self> {
+        // 只有显式支持稳定内容代际的普通文件才会进入全局私有页缓存。目录、设备
+        // 以及未实现该协议的文件不应争用全局 ID 分配原子的 cache line。
+        let private_page_cache_id =
+            if kind == FileType::Regular && ops.supports_private_page_cache() {
+                allocate_private_page_cache_id()
+            } else {
+                0
+            };
         Arc::new(Self {
             id,
+            private_page_cache_id,
             kind,
             rdev,
             blksize,
@@ -272,6 +294,11 @@ impl Inode {
     /// 返回该 Inode 的文件类型，无需获取任何锁。
     pub fn kind(&self) -> FileType {
         self.kind
+    }
+
+    /// 返回可跨打开文件描述复用、且不会因对象地址复用而冲突的缓存身份。
+    pub(crate) fn private_page_cache_key(&self) -> Option<usize> {
+        (self.private_page_cache_id != 0).then_some(self.private_page_cache_id)
     }
 
     /// 返回当前文件大小的无锁快照。
@@ -309,7 +336,8 @@ impl Inode {
     /// 两次读取 active 夹住 generation，覆盖写者在第一次检查后才开始的窗口；
     /// VM 在读取文件页之后还会再次验证同一代际，形成完整的乐观快照协议。
     pub(crate) fn private_page_cache_generation(&self) -> Option<u64> {
-        if self.private_page_cache_disabled.load(Ordering::Acquire)
+        if self.private_page_cache_id == 0
+            || self.private_page_cache_disabled.load(Ordering::Acquire)
             || self.data_mutations.load(Ordering::Acquire) != 0
         {
             return None;
@@ -332,7 +360,7 @@ impl Inode {
     }
 
     fn private_page_cache_supported(&self) -> bool {
-        self.kind == FileType::Regular && self.ops.supports_private_page_cache()
+        self.private_page_cache_id != 0
     }
 
     /// 在可能修改文件内容的 VFS 调用前建立发布 guard。失败路径也会推进代际，

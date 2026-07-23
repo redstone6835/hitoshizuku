@@ -2510,6 +2510,7 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
     let sched_diag = sched::scheduler_diag();
     let task_diag = sched::task_diag();
     let vm_diag = crate::mm::vm_space::vm_space_diag();
+    let private_file_cache_diag = crate::mm::vm_space::private_file_page_cache_diag();
     let file_diag = vfs::file::file_diag();
     let fdtable_diag = vfs::fdtable::fdtable_diag();
     let vfs_context_diag = vfs::vfs_context_diag();
@@ -2621,12 +2622,19 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
          VfsCtxDropped:  {:>8}\n\
          VmSpaceLive:    {:>8}\n\
          VmSpaceCreated: {:>8}\n\
-         VmSpaceDropped: {:>8}\n",
+         VmSpaceDropped: {:>8}\n\
+         PrivateFileCache:{:>8} kB\n\
+         PrivateCachePages:{:>7}\n\
+         PrivateCacheLimit:{:>7}\n\
+         PrivateCacheHits:  {:>7}\n\
+         PrivateCacheMisses:{:>6}\n\
+         PrivateCacheEvict:{:>7}\n\
+         PrivateCachePressureDrops:{:>3}\n",
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(mem_available),
         0usize, // TODO: 实现 Buffers（块设备缓冲区统计）
-        0usize, // TODO: 实现 Cached（页缓存统计）
+        0usize, // TODO: 汇总文件页缓存与块缓存后实现标准 Cached 字段
         0usize, // TODO: 实现 SwapCached
         kb(slab_bytes),
         0usize, // TODO: 实现 KernelStack（内核栈统计）
@@ -2704,6 +2712,13 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         vm_diag.live,
         vm_diag.created,
         vm_diag.dropped,
+        kb(private_file_cache_diag.pages.saturating_mul(page_size()),),
+        private_file_cache_diag.pages,
+        private_file_cache_diag.capacity,
+        private_file_cache_diag.hits,
+        private_file_cache_diag.misses,
+        private_file_cache_diag.evictions,
+        private_file_cache_diag.pressure_reclaims,
     );
     for class in slab_classes {
         let _ = write!(

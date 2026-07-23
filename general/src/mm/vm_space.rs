@@ -4,7 +4,7 @@
 //! general 层。arch 只提供页表机械动作，COW / `MAP_SHARED` / 脏页写回这些策略
 //! 都在这里处理，避免未来把 MM 逻辑散到具体架构里。
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -18,9 +18,24 @@ use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
+///
+/// BuildStorm 会反复执行体积较大的 rustc/链接器映像；适度预装可减少 TCG 下的
+/// 硬件缺页陷入，同时避免冷缓存首次缺页同步读取过多无关页面。
 const FILE_FAULT_AROUND_PAGES: usize = 16;
 /// 内容持续变化时最多尝试发布缓存快照的次数，随后退回不缓存读取保证前进性。
 const PRIVATE_FILE_CACHE_RETRIES: usize = 3;
+/// 私有干净文件页的强缓存上限；在 4 KiB 页配置下约为 512 MiB。
+///
+/// BuildStorm 的工具链和 crate 工作集明显超过 128 MiB；保留更大的有界热集可
+/// 避免在仍有数 GiB 空闲内存时反复从 ext4 重读同一页。物理页分配失败仍会按
+/// 批次回收，因此该预算不会阻塞匿名页和 COW 分配的前进性。
+const PRIVATE_FILE_CACHE_MAX_PAGES: usize = 131_072;
+/// 独立的私有文件页缓存分片数；32 个分片可覆盖 BuildStorm 的并行 rustc 缺页。
+const PRIVATE_FILE_CACHE_SHARD_COUNT: usize = 32;
+/// clock 淘汰在全局锁内最多检查的条目数，防止满缓存缺页形成 O(N) 长停顿。
+const PRIVATE_FILE_CACHE_EVICTION_SCAN_LIMIT: usize = 64;
+/// 物理页分配失败时每轮释放的缓存引用数。
+const PRIVATE_FILE_CACHE_RECLAIM_BATCH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileFaultAroundWindow {
@@ -147,10 +162,12 @@ fn covered_len(areas: &[VmArea], range: &Range<usize>) -> usize {
     total
 }
 
-type FilePageCache = Spinlock<BTreeMap<FilePageKey, Weak<ResidentPage>>>;
+type WeakFilePageCache = Spinlock<BTreeMap<FilePageKey, Weak<ResidentPage>>>;
+type PrivateFilePageCache = ShardedPrivateFilePageCache<PRIVATE_FILE_CACHE_SHARD_COUNT>;
 
-static PRIVATE_FILE_PAGES: FilePageCache = Spinlock::new(BTreeMap::new());
-static SHARED_FILE_PAGES: FilePageCache = Spinlock::new(BTreeMap::new());
+static PRIVATE_FILE_PAGES: PrivateFilePageCache =
+    ShardedPrivateFilePageCache::new(PRIVATE_FILE_CACHE_MAX_PAGES);
+static SHARED_FILE_PAGES: WeakFilePageCache = Spinlock::new(BTreeMap::new());
 static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
     Spinlock::new(BTreeMap::new());
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -195,6 +212,45 @@ struct FilePageKey {
     generation: u64,
 }
 
+struct PrivateFilePageCacheEntry {
+    page: Arc<ResidentPage>,
+    referenced: bool,
+}
+
+/// 单个私有文件页缓存分片。
+///
+/// `pages` 提供按文件代际和偏移查找，`clock` 实现 second-chance 淘汰。缓存只
+/// 持有固定数量的强引用，使短生命周期编译进程退出后仍可复用工具链和 crate 页，
+/// 同时避免长期构建把所有历史文件内容永久钉在内存中。
+struct PrivateFilePageCacheState {
+    pages: BTreeMap<FilePageKey, PrivateFilePageCacheEntry>,
+    clock: VecDeque<FilePageKey>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    pressure_reclaims: u64,
+}
+
+/// 有界的私有干净文件页强缓存。
+///
+/// 完整的文件身份、偏移和代际经过稳定混合后选择分片，使不同 rustc 进程的并行
+/// 缺页通常只竞争各自分片。容量按分片精确拆分，压力回收则轮换起始分片。
+struct ShardedPrivateFilePageCache<const SHARD_COUNT: usize> {
+    shards: [Spinlock<PrivateFilePageCacheState>; SHARD_COUNT],
+    capacity: usize,
+    reclaim_shard: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrivateFilePageCacheDiag {
+    pub pages: usize,
+    pub capacity: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub pressure_reclaims: u64,
+}
+
 impl FilePageKey {
     fn new(file: &Arc<dyn FileLike>, offset: u64, generation: u64) -> Self {
         Self {
@@ -203,6 +259,275 @@ impl FilePageKey {
             generation,
         }
     }
+
+    fn new_private(file_key: usize, offset: u64, generation: u64) -> Self {
+        Self {
+            file_key,
+            offset,
+            generation,
+        }
+    }
+
+    /// 对完整缓存身份做轻量、与平台无关的稳定混合，供强缓存选择分片。
+    ///
+    /// 这里故意只使用移位、旋转和异或：缺页路径会为每个候选页执行一次选片，
+    /// 在 LoongArch TCG 上避免几次 64 位乘法比更重的通用哈希更重要。
+    fn private_cache_hash(self) -> u64 {
+        let mut hash = self.file_key as u64;
+        // 缓存键的文件偏移按 4 KiB 页对齐；直接把页号放入低位，使同一大型
+        // 工具链映像的连续页也能分散到不同分片，而不是只按 inode 聚集。
+        let page_index = self.offset >> 12;
+        hash ^= self.offset ^ page_index ^ page_index.rotate_left(17);
+        hash ^= self.generation.rotate_left(37) ^ (self.generation >> 11);
+        hash ^= hash >> 29;
+        hash ^ (hash >> 17)
+    }
+}
+
+impl PrivateFilePageCacheState {
+    const fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            clock: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            pressure_reclaims: 0,
+        }
+    }
+
+    fn find(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+        let page = self.find_existing(key);
+        if page.is_some() {
+            self.hits = self.hits.saturating_add(1);
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+        page
+    }
+
+    fn find_existing(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+        let entry = self.pages.get_mut(&key)?;
+        entry.referenced = true;
+        Some(Arc::clone(&entry.page))
+    }
+
+    /// 插入一个此前不存在的条目，并返回需要在锁外释放的淘汰页。
+    fn insert(
+        &mut self,
+        key: FilePageKey,
+        page: &Arc<ResidentPage>,
+        capacity: usize,
+    ) -> Option<Arc<ResidentPage>> {
+        use alloc::collections::btree_map::Entry;
+
+        let Entry::Vacant(slot) = self.pages.entry(key) else {
+            return None;
+        };
+        slot.insert(PrivateFilePageCacheEntry {
+            page: Arc::clone(page),
+            // 插入本身不算跨地址空间复用；只有后续缓存命中才获得 second chance。
+            referenced: false,
+        });
+        self.clock.push_back(key);
+        (self.pages.len() > capacity)
+            .then(|| self.evict_one())
+            .flatten()
+    }
+
+    /// 清理一个未被近期访问的页。调用者必须在释放返回的 Arc 前放开缓存锁。
+    fn evict_one(&mut self) -> Option<Arc<ResidentPage>> {
+        // second chance 只近似表达近期复用。分片缺页锁内必须保持固定上界，
+        // 即使整个缓存都很热也不能扫描数万棵 BTree 节点。
+        let scans = self.clock.len().min(PRIVATE_FILE_CACHE_EVICTION_SCAN_LIMIT);
+        for _ in 0..scans {
+            let Some(key) = self.clock.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.pages.get_mut(&key) else {
+                // 仅用于容忍测试/恢复路径留下的旧 clock 节点。
+                continue;
+            };
+            if entry.referenced {
+                entry.referenced = false;
+                self.clock.push_back(key);
+                continue;
+            }
+            // `remove` 把 Arc 移到锁外；不要让 map entry 在锁守卫仍存活时析构。
+            return self.remove(key);
+        }
+
+        // 所有受检条目都获得了 second chance 时，固定淘汰下一个最老条目；
+        // 容量不变量和缺页前进性比精确 LRU 更重要。
+        self.evict_oldest()
+    }
+
+    /// 无视 reference 位移除最老条目，供容量兜底和内存压力回收使用。
+    fn evict_oldest(&mut self) -> Option<Arc<ResidentPage>> {
+        while let Some(key) = self.clock.pop_front() {
+            if let Some(page) = self.remove(key) {
+                return Some(page);
+            }
+        }
+        // clock 元数据若意外缺项，仍保证 map 不会永久失去可回收性。
+        let key = *self.pages.keys().next()?;
+        self.remove(key)
+    }
+
+    fn reclaim_oldest(&mut self) -> Option<Arc<ResidentPage>> {
+        let page = self.evict_oldest()?;
+        self.pressure_reclaims = self.pressure_reclaims.saturating_add(1);
+        Some(page)
+    }
+
+    fn remove(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+        let page = self.pages.remove(&key).map(|entry| entry.page)?;
+        self.evictions = self.evictions.saturating_add(1);
+        Some(page)
+    }
+
+    fn remove_if_same(
+        &mut self,
+        key: FilePageKey,
+        page: &ResidentPage,
+    ) -> Option<Arc<ResidentPage>> {
+        let same = self
+            .pages
+            .get(&key)
+            .is_some_and(|entry| core::ptr::eq(entry.page.as_ref(), page));
+        if !same {
+            return None;
+        }
+
+        // 代际校验失败会走这里主动撤销刚发布的候选。同步摘除 clock 节点，避免
+        // 文件反复变化时累积陈旧 key，最终让压力回收在分片锁内无界扫描。
+        self.clock.retain(|queued| *queued != key);
+        self.remove(key)
+    }
+}
+
+impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
+    const fn new(capacity: usize) -> Self {
+        assert!(SHARD_COUNT > 0);
+        assert!(SHARD_COUNT.is_power_of_two());
+        Self {
+            shards: [const { Spinlock::new(PrivateFilePageCacheState::new()) }; SHARD_COUNT],
+            capacity,
+            reclaim_shard: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn shard_index(&self, key: FilePageKey) -> usize {
+        (key.private_cache_hash() as usize) & (SHARD_COUNT - 1)
+    }
+
+    fn shard_capacity(&self, index: usize) -> usize {
+        self.capacity / SHARD_COUNT + usize::from(index < self.capacity % SHARD_COUNT)
+    }
+
+    fn find(&self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+        self.shards[self.shard_index(key)].lock().find(key)
+    }
+
+    /// 锁内只发布候选并摘取一个淘汰页，候选或淘汰页均在锁外析构。
+    fn publish(&self, key: FilePageKey, candidate: Arc<ResidentPage>) -> Arc<ResidentPage> {
+        let index = self.shard_index(key);
+        let (existing, retired) = {
+            let mut shard = self.shards[index].lock();
+            if let Some(existing) = shard.find_existing(key) {
+                (Some(existing), None)
+            } else {
+                let retired = shard.insert(key, &candidate, self.shard_capacity(index));
+                (None, retired)
+            }
+        };
+        drop(retired);
+        if let Some(existing) = existing {
+            drop(candidate);
+            existing
+        } else {
+            candidate
+        }
+    }
+
+    /// 仅移除仍指向指定候选的旧代际条目，避免并发发布覆盖后误删新页面。
+    fn remove_if_same(&self, key: FilePageKey, page: &ResidentPage) {
+        let index = self.shard_index(key);
+        let retired = self.shards[index].lock().remove_if_same(key, page);
+        drop(retired);
+    }
+
+    /// 从轮换的起始分片批量摘取缓存引用，并在所有分片锁之外统一析构。
+    fn reclaim(&self, limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+        let start = self.reclaim_shard.fetch_add(1, Ordering::Relaxed) % SHARD_COUNT;
+        let mut retired = Vec::new();
+        if retired.try_reserve_exact(limit).is_err() {
+            return self.reclaim_unbatched(start, limit);
+        }
+
+        for offset in 0..SHARD_COUNT {
+            let index = (start + offset) % SHARD_COUNT;
+            let mut shard = self.shards[index].lock();
+            while retired.len() < limit {
+                let Some(page) = shard.reclaim_oldest() else {
+                    break;
+                };
+                retired.push(page);
+            }
+            if retired.len() == limit {
+                break;
+            }
+        }
+        let reclaimed = retired.len();
+        drop(retired);
+        reclaimed
+    }
+
+    /// 仅在回收批次的临时 Vec 无法分配时使用；每次仍先释放锁再析构页面。
+    fn reclaim_unbatched(&self, start: usize, limit: usize) -> usize {
+        let mut reclaimed = 0usize;
+        for offset in 0..SHARD_COUNT {
+            let index = (start + offset) % SHARD_COUNT;
+            while reclaimed < limit {
+                let retired = self.shards[index].lock().reclaim_oldest();
+                let Some(retired) = retired else {
+                    break;
+                };
+                drop(retired);
+                reclaimed += 1;
+            }
+            if reclaimed == limit {
+                break;
+            }
+        }
+        reclaimed
+    }
+
+    fn diag(&self) -> PrivateFilePageCacheDiag {
+        let mut diag = PrivateFilePageCacheDiag {
+            capacity: self.capacity,
+            ..PrivateFilePageCacheDiag::default()
+        };
+        for shard in &self.shards {
+            let shard = shard.lock();
+            diag.pages = diag.pages.saturating_add(shard.pages.len());
+            diag.hits = diag.hits.saturating_add(shard.hits);
+            diag.misses = diag.misses.saturating_add(shard.misses);
+            diag.evictions = diag.evictions.saturating_add(shard.evictions);
+            diag.pressure_reclaims = diag
+                .pressure_reclaims
+                .saturating_add(shard.pressure_reclaims);
+        }
+        diag
+    }
+}
+
+pub(crate) fn private_file_page_cache_diag() -> PrivateFilePageCacheDiag {
+    PRIVATE_FILE_PAGES.diag()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -290,10 +615,7 @@ enum FaultAroundCommit {
 enum ResidentPageKind {
     Anon,
     SharedAnon,
-    PrivateFile {
-        cache_key: Option<FilePageKey>,
-        _file: Arc<dyn FileLike>,
-    },
+    PrivateFile,
     SharedFile {
         file: Arc<dyn FileLike>,
         offset: u64,
@@ -324,17 +646,10 @@ impl ResidentPage {
         })
     }
 
-    fn new_private_file(
-        paddr: usize,
-        cache_key: Option<FilePageKey>,
-        file: Arc<dyn FileLike>,
-    ) -> Arc<Self> {
+    fn new_private_file(paddr: usize) -> Arc<Self> {
         Arc::new(Self {
             paddr,
-            kind: ResidentPageKind::PrivateFile {
-                cache_key,
-                _file: file,
-            },
+            kind: ResidentPageKind::PrivateFile,
             dirty: AtomicBool::new(false),
         })
     }
@@ -368,7 +683,7 @@ impl ResidentPage {
     }
 
     fn is_private_file(&self) -> bool {
-        matches!(self.kind, ResidentPageKind::PrivateFile { .. })
+        matches!(self.kind, ResidentPageKind::PrivateFile)
     }
 
     fn is_sysv_shm(&self) -> bool {
@@ -415,12 +730,6 @@ impl ResidentPage {
 impl Drop for ResidentPage {
     fn drop(&mut self) {
         match &self.kind {
-            ResidentPageKind::PrivateFile {
-                cache_key: Some(key),
-                ..
-            } => {
-                remove_cached_file_page(&PRIVATE_FILE_PAGES, *key, self);
-            }
             ResidentPageKind::SharedFile { file, offset } => {
                 remove_cached_file_page(
                     &SHARED_FILE_PAGES,
@@ -1404,19 +1713,25 @@ impl VmSpace {
             return outcome;
         }
 
-        if allow_fault_around
-            && let Some(plan) = PrivateFileFaultAround::new(page, area_range, flags, &backing, kind)
-        {
-            let prepared = match plan.prepare() {
-                Ok(prepared) => prepared,
-                Err(err) => return fault_from_errno(err),
-            };
-            match self.commit_private_file_fault_around(&plan, prepared) {
-                FaultAroundCommit::Done(outcome) => return outcome,
-                FaultAroundCommit::Retry => {
-                    // VMA 在锁外 I/O 期间发生变化；只重试普通单页路径，避免在
-                    // 高频 mmap/mprotect 竞争下反复执行投机读取。
-                    return self.handle_fault_inner(addr, kind, publish_unchanged_mapping, false);
+        if allow_fault_around {
+            if let Some(plan) = PrivateFileFaultAround::new(page, area_range, flags, &backing, kind)
+            {
+                let prepared = match plan.prepare() {
+                    Ok(prepared) => prepared,
+                    Err(err) => return fault_from_errno(err),
+                };
+                match self.commit_private_file_fault_around(&plan, prepared) {
+                    FaultAroundCommit::Done(outcome) => return outcome,
+                    FaultAroundCommit::Retry => {
+                        // VMA 在锁外 I/O 期间发生变化；只重试普通单页路径，避免在
+                        // 高频 mmap/mprotect 竞争下反复执行投机读取。
+                        return self.handle_fault_inner(
+                            addr,
+                            kind,
+                            publish_unchanged_mapping,
+                            false,
+                        );
+                    }
                 }
             }
         }
@@ -2299,39 +2614,80 @@ fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Reside
 
 fn private_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
     for _ in 0..PRIVATE_FILE_CACHE_RETRIES {
-        let Some(generation) = file.private_page_cache_generation() else {
+        let (Some(file_key), Some(generation)) = (
+            file.private_page_cache_key(),
+            file.private_page_cache_generation(),
+        ) else {
             let paddr = load_file_page(&*file, file_off)?;
-            return Ok(ResidentPage::new_private_file(paddr, None, file));
+            return Ok(ResidentPage::new_private_file(paddr));
         };
-        let key = FilePageKey::new(&file, file_off, generation);
-        if let Some(page) = find_cached_file_page(&PRIVATE_FILE_PAGES, key) {
+        let key = FilePageKey::new_private(file_key, file_off, generation);
+        if let Some(page) = find_cached_private_file_page(&PRIVATE_FILE_PAGES, key) {
             if file.private_page_cache_generation() == Some(generation) {
                 return Ok(page);
             }
             continue;
         }
-        let paddr = load_file_page(&*file, file_off)?;
-        let page = ResidentPage::new_private_file(paddr, Some(key), Arc::clone(&file));
+        let paddr = match load_file_page(&*file, file_off) {
+            Ok(paddr) => paddr,
+            Err(err) => {
+                // truncate/write 可在读页期间改变 EOF。若代际已经变化，这次短读
+                // 只是乐观快照失效，应重试新代际；稳定代际的真实 I/O 错误才传播。
+                if file.private_page_cache_generation() != Some(generation) {
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+        let page = ResidentPage::new_private_file(paddr);
         if file.private_page_cache_generation() != Some(generation) {
             continue;
         }
-        let page = publish_cached_file_page(&PRIVATE_FILE_PAGES, key, page);
+        let page = publish_cached_private_file_page(&PRIVATE_FILE_PAGES, key, page);
         if file.private_page_cache_generation() == Some(generation) {
             return Ok(page);
         }
+        // 文件在发布窗口内发生写入时，已观察到的旧代际不应继续占据热缓存。
+        // 只有仍指向本次候选的条目才会被移除，避免误删并发线程发布的新页。
+        PRIVATE_FILE_PAGES.remove_if_same(key, &page);
     }
     let paddr = load_file_page(&*file, file_off)?;
-    Ok(ResidentPage::new_private_file(paddr, None, file))
+    Ok(ResidentPage::new_private_file(paddr))
 }
 
-fn find_cached_file_page(cache: &FilePageCache, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+fn find_cached_private_file_page<const SHARD_COUNT: usize>(
+    cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
+    key: FilePageKey,
+) -> Option<Arc<ResidentPage>> {
+    cache.find(key)
+}
+
+/// 并发缺页可能同时读出同一私有文件页。缓存锁内只发布强引用和选择淘汰者；
+/// 竞争失败的候选及淘汰页都在锁外析构，避免页析构/物理页释放扩大临界区。
+fn publish_cached_private_file_page<const SHARD_COUNT: usize>(
+    cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
+    key: FilePageKey,
+    candidate: Arc<ResidentPage>,
+) -> Arc<ResidentPage> {
+    cache.publish(key, candidate)
+}
+
+/// 在物理页压力下强制释放一批私有文件缓存引用。
+///
+/// 每个 Arc 都在缓存锁外析构；仍映射到进程的页会由对应 VMA 继续保活，已经只由
+/// 缓存持有的页则立即归还 buddy。返回移除的缓存条目数，而不是实际释放的物理页数。
+fn reclaim_private_file_cache_pages(limit: usize) -> usize {
+    PRIVATE_FILE_PAGES.reclaim(limit)
+}
+
+fn find_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey) -> Option<Arc<ResidentPage>> {
     cache.lock().get(&key).and_then(Weak::upgrade)
 }
 
 /// 并发缺页可能在锁外同时读出同一文件页；这里只允许一个候选进入缓存，
 /// 其它候选在释放缓存锁后析构，避免重复驻留和锁递归。
 fn publish_cached_file_page(
-    cache: &FilePageCache,
+    cache: &WeakFilePageCache,
     key: FilePageKey,
     candidate: Arc<ResidentPage>,
 ) -> Arc<ResidentPage> {
@@ -2345,7 +2701,7 @@ fn publish_cached_file_page(
     candidate
 }
 
-fn remove_cached_file_page(cache: &FilePageCache, key: FilePageKey, page: &ResidentPage) {
+fn remove_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey, page: &ResidentPage) {
     let mut pages = cache.lock();
     if pages
         .get(&key)
@@ -2533,6 +2889,24 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 fn alloc_zeroed_user_page() -> Option<usize> {
     let order = user_page_order()?;
     let size = page_size();
+    if let Some(paddr) = try_alloc_zeroed_user_page(order, size) {
+        return Some(paddr);
+    }
+
+    // 编译负载会把 8 GiB guest 推到很低的空闲页水位。强文件缓存必须是可回收
+    // 的性能层，而不能让匿名页/COW 因固定缓存预算提前 ENOMEM。分批释放后重试，
+    // 既避免一次丢掉整个热集，也保证持续压力最终可以清空缓存。
+    loop {
+        if reclaim_private_file_cache_pages(PRIVATE_FILE_CACHE_RECLAIM_BATCH) == 0 {
+            return None;
+        }
+        if let Some(paddr) = try_alloc_zeroed_user_page(order, size) {
+            return Some(paddr);
+        }
+    }
+}
+
+fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
     // 用户物理页必须进入 allocator registry；否则 fork/munmap/drop 路径无法被
     // allocator 审计发现泄漏或重复释放。
     let allocation = allocator::KERNEL_ALLOCATOR
@@ -2591,9 +2965,11 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::{
-        FILE_FAULT_AROUND_PAGES, FaultKind, FilePageCache, FilePageKey, PageAccess, ResidentPage,
-        VmFlags, access_for_private_file, file_fault_around_window, permits_file_fault_around,
-        plan_file_segment, publish_cached_file_page, read_file_bytes_exact, unmapped_prefix_len,
+        FILE_FAULT_AROUND_PAGES, FaultKind, FilePageKey, PageAccess, ResidentPage,
+        ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache, access_for_private_file,
+        file_fault_around_window, find_cached_private_file_page, permits_file_fault_around,
+        plan_file_segment, publish_cached_file_page, publish_cached_private_file_page,
+        read_file_bytes_exact, unmapped_prefix_len,
     };
     use errno::Errno;
     use mm::FileLike;
@@ -2822,7 +3198,7 @@ mod tests {
 
     #[test]
     fn concurrent_file_page_publish_keeps_first_candidate() {
-        let cache: FilePageCache = Spinlock::new(BTreeMap::new());
+        let cache: WeakFilePageCache = Spinlock::new(BTreeMap::new());
         let key = FilePageKey {
             file_key: 7,
             offset: 0x2000,
@@ -2837,5 +3213,215 @@ mod tests {
         assert!(Arc::ptr_eq(&published, &first));
         assert!(Arc::ptr_eq(&raced, &first));
         assert_eq!(cache.lock().len(), 1);
+    }
+
+    #[test]
+    fn private_file_cache_retains_pages_until_bounded_eviction() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        let keys = [cache_key(1), cache_key(2), cache_key(3)];
+        let first = ResidentPage::new_direct(0x1000);
+        let first_weak = Arc::downgrade(&first);
+
+        drop(publish_cached_private_file_page(&cache, keys[0], first));
+        assert!(first_weak.upgrade().is_some());
+        drop(publish_cached_private_file_page(
+            &cache,
+            keys[1],
+            ResidentPage::new_direct(0x2000),
+        ));
+        drop(publish_cached_private_file_page(
+            &cache,
+            keys[2],
+            ResidentPage::new_direct(0x3000),
+        ));
+
+        assert_eq!(cache.diag().pages, 2);
+        assert!(first_weak.upgrade().is_none());
+        assert!(find_cached_private_file_page(&cache, keys[1]).is_some());
+        assert!(find_cached_private_file_page(&cache, keys[2]).is_some());
+    }
+
+    #[test]
+    fn private_file_cache_clock_preserves_a_recent_hit() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        let keys = [cache_key(1), cache_key(2), cache_key(3), cache_key(4)];
+
+        for (index, key) in keys[..3].iter().enumerate() {
+            drop(publish_cached_private_file_page(
+                &cache,
+                *key,
+                ResidentPage::new_direct((index + 1) * PAGE_SIZE),
+            ));
+        }
+        // 第一次超限淘汰 key 1，并清除了其余条目的 reference 位。
+        drop(find_cached_private_file_page(&cache, keys[1]));
+        drop(publish_cached_private_file_page(
+            &cache,
+            keys[3],
+            ResidentPage::new_direct(4 * PAGE_SIZE),
+        ));
+
+        assert!(find_cached_private_file_page(&cache, keys[1]).is_some());
+        assert!(find_cached_private_file_page(&cache, keys[2]).is_none());
+        assert!(find_cached_private_file_page(&cache, keys[3]).is_some());
+        assert_eq!(cache.diag().pages, 2);
+    }
+
+    #[test]
+    fn private_file_cache_enforces_total_capacity_across_shards() {
+        let cache = ShardedPrivateFilePageCache::<4>::new(7);
+        for shard in 0..4 {
+            for ordinal in 0..4 {
+                let key = cache_key_for_shard(&cache, shard, ordinal);
+                drop(publish_cached_private_file_page(
+                    &cache,
+                    key,
+                    ResidentPage::new_direct((shard * 4 + ordinal + 1) * PAGE_SIZE),
+                ));
+            }
+        }
+
+        let diag = cache.diag();
+        assert_eq!(diag.capacity, 7);
+        assert_eq!(diag.pages, 7);
+        assert_eq!(diag.evictions, 9);
+        assert_eq!(cache.shards[0].lock().pages.len(), 2);
+        assert_eq!(cache.shards[1].lock().pages.len(), 2);
+        assert_eq!(cache.shards[2].lock().pages.len(), 2);
+        assert_eq!(cache.shards[3].lock().pages.len(), 1);
+    }
+
+    #[test]
+    fn private_file_cache_hash_uses_complete_stable_key() {
+        let cache = ShardedPrivateFilePageCache::<8>::new(16);
+        let key = FilePageKey {
+            file_key: 0x1234,
+            offset: 0x5678,
+            generation: 0x9abc,
+        };
+
+        assert_eq!(cache.shard_index(key), cache.shard_index(key));
+        assert_ne!(
+            key.private_cache_hash(),
+            FilePageKey {
+                file_key: key.file_key + 1,
+                ..key
+            }
+            .private_cache_hash()
+        );
+        assert_ne!(
+            key.private_cache_hash(),
+            FilePageKey {
+                offset: key.offset + 1,
+                ..key
+            }
+            .private_cache_hash()
+        );
+        assert_ne!(
+            key.private_cache_hash(),
+            FilePageKey {
+                generation: key.generation + 1,
+                ..key
+            }
+            .private_cache_hash()
+        );
+    }
+
+    #[test]
+    fn private_file_cache_stale_publish_removes_only_matching_page() {
+        let cache = ShardedPrivateFilePageCache::<2>::new(4);
+        let key = cache_key(41);
+        let first = ResidentPage::new_direct(0x1000);
+        let second = ResidentPage::new_direct(0x2000);
+        drop(publish_cached_private_file_page(
+            &cache,
+            key,
+            Arc::clone(&first),
+        ));
+
+        cache.remove_if_same(key, &second);
+        assert!(find_cached_private_file_page(&cache, key).is_some());
+        cache.remove_if_same(key, &first);
+        assert!(find_cached_private_file_page(&cache, key).is_none());
+        assert!(cache.shards[cache.shard_index(key)].lock().clock.is_empty());
+    }
+
+    #[test]
+    fn private_file_cache_repeated_stale_publish_keeps_clock_bounded() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        let key = cache_key(43);
+
+        for address in 1..=64 {
+            let page = ResidentPage::new_direct(address * PAGE_SIZE);
+            drop(publish_cached_private_file_page(
+                &cache,
+                key,
+                Arc::clone(&page),
+            ));
+            cache.remove_if_same(key, &page);
+        }
+
+        let shard = cache.shards[0].lock();
+        assert!(shard.pages.is_empty());
+        assert!(shard.clock.is_empty());
+    }
+
+    #[test]
+    fn private_file_cache_pressure_reclaim_rotates_shards() {
+        let cache = ShardedPrivateFilePageCache::<2>::new(4);
+        let keys = [
+            cache_key_for_shard(&cache, 0, 0),
+            cache_key_for_shard(&cache, 0, 1),
+            cache_key_for_shard(&cache, 1, 0),
+            cache_key_for_shard(&cache, 1, 1),
+        ];
+        for (index, key) in keys.iter().enumerate() {
+            drop(publish_cached_private_file_page(
+                &cache,
+                *key,
+                ResidentPage::new_direct((index + 1) * PAGE_SIZE),
+            ));
+        }
+
+        assert_eq!(cache.reclaim(1), 1);
+        assert_eq!(cache.shards[0].lock().pages.len(), 1);
+        assert_eq!(cache.shards[1].lock().pages.len(), 2);
+        assert_eq!(cache.reclaim(1), 1);
+        assert_eq!(cache.shards[0].lock().pages.len(), 1);
+        assert_eq!(cache.shards[1].lock().pages.len(), 1);
+
+        let diag = cache.diag();
+        assert_eq!(diag.pages, 2);
+        assert_eq!(diag.evictions, 2);
+        assert_eq!(diag.pressure_reclaims, 2);
+        assert!(find_cached_private_file_page(&cache, keys[0]).is_none());
+        assert!(find_cached_private_file_page(&cache, keys[2]).is_none());
+    }
+
+    fn cache_key(file_key: usize) -> FilePageKey {
+        FilePageKey {
+            file_key,
+            offset: 0,
+            generation: 1,
+        }
+    }
+
+    fn cache_key_for_shard<const SHARD_COUNT: usize>(
+        cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
+        shard: usize,
+        ordinal: usize,
+    ) -> FilePageKey {
+        let mut offset = ((shard * 64 + ordinal) as u64) << 32;
+        loop {
+            let key = FilePageKey {
+                file_key: 0x1000 + shard,
+                offset,
+                generation: ordinal as u64 + 1,
+            };
+            if cache.shard_index(key) == shard {
+                return key;
+            }
+            offset += PAGE_SIZE as u64;
+        }
     }
 }

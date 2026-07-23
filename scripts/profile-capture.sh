@@ -101,6 +101,9 @@ start_capture() {
 stop_capture() {
     case_id=$1
     exit_status=${2:-unknown}
+    # Interactive init shells may have printed a prompt while a background
+    # workload was running; keep the after markers parseable on their own lines.
+    printf '\n'
     write_control freeze
     metadata after "$case_id" "$exit_status"
     snapshot after "$case_id"
