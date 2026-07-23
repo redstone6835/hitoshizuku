@@ -190,10 +190,10 @@ fn cpu_is_online(logical_id: usize) -> bool {
     logical_id < MAX_CPUS && ONLINE_CPUS.load(Ordering::Acquire) & (1 << logical_id) != 0
 }
 
-/// 发布当前 CPU 即将激活的逻辑 ASID；调用方随后必须完成全量本地 TLB 失效。
+/// 发布当前 CPU 即将激活的逻辑 ASID；调用方随后必须完成 TLB 代际检查。
 pub(crate) fn publish_current_logical_asid(asid: usize) {
     let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
-    CURRENT_LOGICAL_ASIDS.publish_before_full_flush(cpu, asid);
+    CURRENT_LOGICAL_ASIDS.publish_before_activation(cpu, asid);
 }
 
 /// 在 PTE 更新后，仅保留当前仍运行目标逻辑 ASID 的历史 CPU。

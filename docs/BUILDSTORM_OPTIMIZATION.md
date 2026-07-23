@@ -60,3 +60,9 @@ scripts/buildstorm-profile-compare.sh \
 ## 优化交付
 
 只在两项 A/A 验证均通过后增加分类插桩或修改热路径。候选优化必须以三次 clean-overlay 运行复核；要求 2× 时设置 `PROFILE_REQUIRED_SPEEDUP=2` 运行比较脚本。阶段性成果需记录 summary、串口日志、内核哈希和提交 ID，并运行 `cargo fmt --all`、受影响 host 测试、完整 `make kernel-la` 与 QEMU 验证。
+
+## LoongArch ASID 阶段结果
+
+BuildStorm 在 300 秒内会创建约 4,000–4,500 个 `VmSpace`。旧切换路径即使硬件 ASID 不冲突，也在每次地址空间切换时执行全 TLB 失效。当前实现为存活地址空间分配独占硬件 ASID，并用地址空间 TLB 代际闭合 PTE 更新与并发激活竞态；仅首次使用、ASID 复用、共享 fallback 或错过 shootdown 时全刷。
+
+固定 300 秒 counts-only 三轮的 Cargo 64 milestone 为 `208.60s / 197.98s / 222.67s`，均值 `209.75s`、CV `4.82%`。相对既有 counts 基线均值 `239.02s` 下降 `12.25%`，比较脚本返回 `accepted: true`。同机单轮 before 为 `250.65s`，对应下降 `16.32%`；窗口末进度均值从 `82` 提升到 `92.67`。

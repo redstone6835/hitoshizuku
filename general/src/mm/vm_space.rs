@@ -800,7 +800,7 @@ impl PrivateFileFaultAround {
                 .fault_file_offset
                 .checked_add(u64::try_from(delta).map_err(|_| Errno::EINVAL)?)
                 .ok_or(Errno::EINVAL)?;
-            match private_file_page(Arc::clone(&self.file), file_offset) {
+            match private_file_page(&self.file, file_offset) {
                 Ok(page) => prepared.push(PreparedFilePage { vaddr, page }),
                 Err(err) if index == 0 => return Err(err),
                 Err(_) => break,
@@ -2130,7 +2130,9 @@ impl VmSpace {
             });
         let mut installed = 0usize;
         let mut map_error = None;
-        for candidate in prepared.iter().take(prefix_len) {
+        let mut candidates = prepared.into_iter();
+        let mut failed_candidate = None;
+        for candidate in candidates.by_ref().take(prefix_len) {
             let access = PageAccess::ReadOnly;
             if let Err(err) = self.map_page_no_flush(
                 candidate.vaddr,
@@ -2138,12 +2140,13 @@ impl VmSpace {
                 pte_flags_for(plan.flags, access),
             ) {
                 map_error = Some(err);
+                failed_candidate = Some(candidate);
                 break;
             }
             pages.insert(
                 candidate.vaddr,
                 PageMapping {
-                    page: Arc::clone(&candidate.page),
+                    page: candidate.page,
                     access,
                 },
             );
@@ -2153,14 +2156,17 @@ impl VmSpace {
         drop(pages);
         drop(set);
         // 未采用的投机页可能触发物理页回收，必须在 VMA/pages 锁外析构。
-        drop(prepared);
+        drop(failed_candidate);
+        drop(candidates);
 
         if installed != 0 {
             self.mapped_pages.store(mapped, Ordering::Release);
-            let len = installed
-                .checked_mul(page_size())
-                .expect("[mm] fault-around publish range overflow");
-            self.publish_new_user_range(plan.fault_page, len);
+            // 页表屏障会发布本轮写入的全部投机 PTE；当前 CPU 只有真正触发
+            // 硬件异常的 fault_page 必然缓存过旧的无效 translation。邻页若在
+            // 其它 CPU 上并发 fault，会在 resident/race 路径各自做本地定向
+            // 收敛。这里只失效 fault_page，避免 LoongArch 把多页范围退化为
+            // 清空当前 CPU 的全部 TLB（包括内核/global translation）。
+            self.publish_new_user_range(plan.fault_page, page_size());
             return FaultAroundCommit::Done(FaultOutcome::Fixed);
         }
         FaultAroundCommit::Done(fault_from_errno(map_error.unwrap_or(Errno::EINVAL)))
@@ -2187,7 +2193,7 @@ impl VmSpace {
                 if flags.has(VmFlags::SHARED) {
                     shared_file_page(file, file_off)
                 } else {
-                    private_file_page(file, file_off)
+                    private_file_page(&file, file_off)
                 }
             }
             VmBacking::Direct(base) => {
@@ -2612,13 +2618,13 @@ fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Reside
     Ok(publish_cached_file_page(&SHARED_FILE_PAGES, key, page))
 }
 
-fn private_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
+fn private_file_page(file: &Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
     for _ in 0..PRIVATE_FILE_CACHE_RETRIES {
         let (Some(file_key), Some(generation)) = (
             file.private_page_cache_key(),
             file.private_page_cache_generation(),
         ) else {
-            let paddr = load_file_page(&*file, file_off)?;
+            let paddr = load_file_page(file.as_ref(), file_off)?;
             return Ok(ResidentPage::new_private_file(paddr));
         };
         let key = FilePageKey::new_private(file_key, file_off, generation);
@@ -2628,7 +2634,7 @@ fn private_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Resid
             }
             continue;
         }
-        let paddr = match load_file_page(&*file, file_off) {
+        let paddr = match load_file_page(file.as_ref(), file_off) {
             Ok(paddr) => paddr,
             Err(err) => {
                 // truncate/write 可在读页期间改变 EOF。若代际已经变化，这次短读
@@ -2651,7 +2657,7 @@ fn private_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Resid
         // 只有仍指向本次候选的条目才会被移除，避免误删并发线程发布的新页。
         PRIVATE_FILE_PAGES.remove_if_same(key, &page);
     }
-    let paddr = load_file_page(&*file, file_off)?;
+    let paddr = load_file_page(file.as_ref(), file_off)?;
     Ok(ResidentPage::new_private_file(paddr))
 }
 

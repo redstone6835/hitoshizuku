@@ -10,12 +10,12 @@
 //! 1. 失效方先写 PTE，再执行 [`Ordering::SeqCst`] fence，之后读取历史激活位和
 //!    每 CPU 逻辑 ASID；
 //! 2. 切换方先发布历史激活位，再以 [`Ordering::SeqCst`] 写入逻辑 ASID，随后
-//!    `activate_with_asid_roots` 以 `dbar 0` 开始、安装页表根和硬件 ASID，并在
-//!    返回前完整失效本核 TLB；
+//!    读取地址空间 TLB 代际；若失效方的扫描早于本次发布，代际检查会要求在
+//!    进入用户态前完整失效本核 TLB，否则扫描会把本 CPU 纳入 shootdown；
 //! 3. 若扫描看到目标 ASID，目标 CPU 会收到 shootdown；若扫描仍看到旧 ASID，
-//!    则扫描在全序上早于新 ASID 发布，后续激活全刷必然覆盖本次 PTE 写；
+//!    则扫描在全序上早于新 ASID 发布，后续激活的代际检查必然覆盖本次 PTE 写；
 //! 4. 切离旧 ASID 时可以先发布新 ASID/0，因为调度器已经发布 next 为当前任务，
-//!    此后不会再访问 prev 的用户地址；切换完成前仍会执行完整本地失效。
+//!    此后不会再访问 prev 的用户地址；再次切回时由代际检查处理漏掉的更新。
 //!
 //! 因而不存在“扫描漏掉目标，同时目标的最后一次全刷又早于 PTE 写”的交错。
 
@@ -46,9 +46,9 @@ impl<const CPU_COUNT: usize> CurrentAsidTracker<CPU_COUNT> {
 
     /// 发布当前 CPU 即将激活的逻辑 ASID。
     ///
-    /// 调用方必须紧接着执行包含全屏障和完整本地 TLB 失效的地址空间激活，且在
-    /// 激活完成前不得执行新地址空间的用户访问。
-    pub(crate) fn publish_before_full_flush(&self, cpu: usize, asid: usize) {
+    /// 调用方必须紧接着执行包含全屏障和 TLB 代际检查的地址空间激活，且在激活
+    /// 完成前不得执行新地址空间的用户访问。
+    pub(crate) fn publish_before_activation(&self, cpu: usize, asid: usize) {
         self.slots
             .get(cpu)
             .expect("[arch][mm] logical CPU exceeds ASID tracker")
@@ -65,8 +65,8 @@ impl<const CPU_COUNT: usize> CurrentAsidTracker<CPU_COUNT> {
 
     /// 判断面向用户地址空间的同步失效是否已被目标 CPU 的切换覆盖。
     ///
-    /// CPU 在发布新逻辑 ASID 后不会再访问旧用户地址空间，并会在任何后续用户
-    /// 执行前完成一次全量本地 TLB 失效。因此 shootdown 已经发出后，即使目标核
+    /// CPU 在发布新逻辑 ASID 后不会再访问旧用户地址空间；任何后续切回都会通过
+    /// 地址空间 TLB 代际发现漏掉的更新并完成本地失效。因此 shootdown 已经发出后，即使目标核
     /// 因关中断或锁竞争尚未更新确认序号，只要观察到它已经切离目标 ASID，发起方
     /// 也无需继续同步等待。内核逻辑 ASID 0 的映射跨所有用户地址空间共享，不能
     /// 使用这个优化。
@@ -81,7 +81,7 @@ impl<const CPU_COUNT: usize> CurrentAsidTracker<CPU_COUNT> {
     ///
     /// fence 必须位于候选位图和 ASID 扫描之前，形成“PTE 写 → 扫描”顺序；候选
     /// 位图单调增长，即使本次读取漏掉刚开始激活的 CPU，后者也会在发布 ASID 后
-    /// 执行完整本地失效。
+    /// 读取更新后的 TLB 代际并按需完整失效。
     pub(crate) fn target_mask_after_pte_update(
         &self,
         historically_active: &AtomicUsize,
