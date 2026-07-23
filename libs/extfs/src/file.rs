@@ -15,7 +15,7 @@ use sched::mutex::Mutex;
 use vfs::dentry::SmallStr;
 use vfs::error::{VfsError, VfsResult};
 use vfs::file::{DirEntry, FileOps, PollEvents};
-use vfs::stat::FileType;
+use vfs::stat::{FileType, Timespec};
 use vfs::superblock::Superblock as VfsSuperblock;
 use vfs::sync::Spinlock;
 
@@ -25,7 +25,11 @@ use crate::layout::{
 };
 use crate::map_wr::BlockAllocState;
 use crate::state::{FsState, map_err};
-use crate::{extent_wr, inode::lock_raw, map_wr};
+use crate::{
+    extent_wr,
+    inode::{lock_raw, sync_vfs_meta, touch_content_times},
+    map_wr,
+};
 
 const I_BLOCK_BYTES: usize = 60;
 const MAP_CACHE_MAX_BLOCKS: u32 = 256 * 1024;
@@ -635,22 +639,22 @@ impl FileOps for ExtRegFileOps {
                 raw_guard.set_flags(flags);
                 raw_guard.set_size(new_size);
                 raw_guard.set_blocks_lo(new_blocks_lo);
-                // 先在 raw 锁下发布最新快照，保证并发写入按元数据
-                // 修改顺序进入版本化 writeback；真正的 block I/O 在释放
-                // raw Spinlock 后进行。
-                self.state.stage_inode_write(&raw_guard);
-                if let Some(inode) = self.sb.find_inode(self.ino as u64) {
-                    inode.set_size_and_blocks(new_size, new_blocks_lo as u64);
-                }
                 self.invalidate_map_cache();
             }
 
-            drop(raw_guard);
-            if metadata_changed {
-                // 若旧 owner 正在写同一 inode，本调用会等待或接管
-                // pending；返回成功前，最新快照已进入共享 block cache。
-                self.state.flush_inode_write(self.ino).map_err(map_err)?;
+            // 非空写即使没有改变尺寸或块映射，也必须更新 mtime/ctime。
+            touch_content_times(&mut raw_guard, Timespec::now());
+            // 先在 raw 锁下发布最新快照，保证并发写入按元数据修改顺序进入
+            // 版本化 writeback；真正的 block I/O 在释放 raw Spinlock 后进行。
+            self.state.stage_inode_write(&raw_guard);
+            if let Some(inode) = self.sb.find_inode(self.ino as u64) {
+                sync_vfs_meta(&inode, &raw_guard);
             }
+
+            drop(raw_guard);
+            // 若旧 owner 正在写同一 inode，本调用会等待或接管 pending；返回成功前，
+            // 最新尺寸、块映射和时间戳都已进入共享 block cache。
+            self.state.flush_inode_write(self.ino).map_err(map_err)?;
 
             Ok(written)
         }

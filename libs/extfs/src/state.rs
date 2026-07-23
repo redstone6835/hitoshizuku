@@ -17,7 +17,7 @@ use vfs::dentry::Dentry;
 use vfs::error::{VfsError, VfsResult};
 use vfs::inode::{Inode, InodeId, InodeMeta};
 use vfs::mount::MountFlags;
-use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
+use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat};
 use vfs::superblock::{
     FsDriver, FsDriverFlags, InodeCache, Superblock as VfsSuperblock, SuperblockOps,
 };
@@ -1941,16 +1941,15 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     };
 
     let sb = VfsSuperblock::new(|weak_sb| {
-        let now = Timespec::ZERO;
         let meta = InodeMeta {
             size: root_meta_on_disk.size,
             nlink: root_meta_on_disk.nlink as u32,
             mode: FileMode::new((root_meta_on_disk.mode & 0o7777) as u16),
             uid: Uid(root_meta_on_disk.uid),
             gid: Gid(root_meta_on_disk.gid),
-            atime: now,
-            mtime: now,
-            ctime: now,
+            atime: root_meta_on_disk.atime,
+            mtime: root_meta_on_disk.mtime,
+            ctime: root_meta_on_disk.ctime,
             blocks: root_meta_on_disk.blocks_512,
         };
         let ops = ExtInodeOps::new(Arc::clone(&state), EXT4_ROOT_INO, root_raw.clone());

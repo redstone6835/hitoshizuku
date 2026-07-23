@@ -7,6 +7,8 @@ use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use vfs::stat::Timespec;
+
 use crate::crc;
 use crate::layout::*;
 use crate::state::{BlockBackendError, FsState};
@@ -43,11 +45,33 @@ impl RawInode {
         self.bytes[4..8].copy_from_slice(&(v as u32).to_le_bytes());
         self.bytes[108..112].copy_from_slice(&((v >> 32) as u32).to_le_bytes());
     }
-    pub fn set_atime_sec(&mut self, v: i64) {
-        self.bytes[8..12].copy_from_slice(&(v as u32).to_le_bytes());
+    fn has_extra_time_field(&self, extra_offset: usize) -> bool {
+        if self.bytes.len() < 0x82 || self.bytes.len() < extra_offset + 4 {
+            return false;
+        }
+        let extra_isize = u16::from_le_bytes([self.bytes[0x80], self.bytes[0x81]]) as usize;
+        extra_offset + 4 <= 0x80 + extra_isize
     }
-    pub fn set_mtime_sec(&mut self, v: i64) {
-        self.bytes[16..20].copy_from_slice(&(v as u32).to_le_bytes());
+
+    fn set_time(&mut self, base_offset: usize, extra_offset: usize, value: Timespec) {
+        self.bytes[base_offset..base_offset + 4]
+            .copy_from_slice(&(value.secs as u32).to_le_bytes());
+        if self.has_extra_time_field(extra_offset) {
+            let base = value.secs as i32 as i64;
+            let epoch = (((value.secs as i128 - base as i128) >> 32) as u32) & 0x3;
+            let extra = (value.nsecs.min(999_999_999) << 2) | epoch;
+            self.bytes[extra_offset..extra_offset + 4].copy_from_slice(&extra.to_le_bytes());
+        }
+    }
+
+    pub fn set_atime(&mut self, value: Timespec) {
+        self.set_time(8, 0x8c, value);
+    }
+    pub fn set_ctime(&mut self, value: Timespec) {
+        self.set_time(12, 0x84, value);
+    }
+    pub fn set_mtime(&mut self, value: Timespec) {
+        self.set_time(16, 0x88, value);
     }
     pub fn nlink(&self) -> u16 {
         u16::from_le_bytes([self.bytes[26], self.bytes[27]])

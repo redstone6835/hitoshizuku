@@ -261,7 +261,9 @@ static TASK_CPU_STATE_OPS: sched::arch_hooks::TaskCpuStateOps =
 // 替换 VmSpace 的实现留在 kernel/hal 侧。
 
 const EXEC_PATH_MAX: usize = 4096;
-const EXEC_MAX_STRINGS: usize = 256;
+// Rust 链接器命令会携带数百个目标文件与静态库；最终可用空间仍由
+// EXEC_MAX_ARG_BYTES 和用户栈布局共同约束，这里不应提前卡在 256 项。
+const EXEC_MAX_STRINGS: usize = 4096;
 const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 
 const SIGFRAME_MAGIC: u64 = 0x4d59474f_53494746; // "MYGOSIGF"
