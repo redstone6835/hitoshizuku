@@ -227,7 +227,7 @@ fn positive_eviction_capability_is_independent_from_dev_id() {
 
 #[ktest]
 fn budget_eviction_preserves_externally_referenced_positive_dentry() {
-    const SHARD_BUDGET: usize = 1024;
+    const SHARD_BUDGET: usize = 8192;
 
     let sb = test_superblock(Box::new(PersistentSuperblockOps), None);
     let cache = DentryCache::new();

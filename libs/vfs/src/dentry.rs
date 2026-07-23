@@ -474,6 +474,17 @@ impl Dentry {
 /// 分片数量。必须是 2 的幂次以使位掩码选片高效。
 const N_SHARDS: usize = 16;
 const SHARD_MASK: usize = N_SHARDS - 1;
+const SHARD_BITS: u32 = N_SHARDS.trailing_zeros();
+
+/// 计算分片内的自然桶起点。
+///
+/// 哈希低 [`SHARD_BITS`] 位已经用于选择分片，桶索引必须继续使用其后的位；否则同一
+/// 分片的条目在容量为 `N` 时只能使用 `N / N_SHARDS` 个自然桶，造成系统性聚簇。
+#[inline]
+fn bucket_start(hash: usize, capacity: usize) -> usize {
+    debug_assert!(capacity.is_power_of_two());
+    (hash >> SHARD_BITS) & (capacity - 1)
+}
 
 /// 单个缓存分片：开放寻址哈希表。
 ///
@@ -500,7 +511,7 @@ struct DentryBucket {
 }
 
 /// 计算 (parent_ptr, name) 的完整 FNV-1a 哈希值。
-/// 返回值的高位用于选择分片，低位用于选择桶，避免重复计算。
+/// 返回值的低位用于选择分片，紧随其后的位用于选择分片内桶，避免重复计算。
 #[inline]
 fn dentry_hash(parent_ptr: usize, name: &str) -> usize {
     const FNV_OFFSET: u64 = 14695981039346656037;
@@ -527,7 +538,12 @@ const INITIAL_CAPACITY: usize = 32;
 const NON_POSITIVE_LIMIT_PER_SHARD: usize = 256;
 
 /// 单个分片允许保留的总缓存条目上限。
-const TOTAL_LIMIT_PER_SHARD: usize = 1024;
+///
+/// BuildStorm 会在一次冷构建中触碰数万条稳定的工具链/源码路径。过小的预算
+/// 会在每个分片达到上限后反复驱逐 ext4 正向项，使下一次路径解析退化为目录块
+/// 扫描和同步 I/O。每个分片预留 8K 项（总计约 128K 项）仍是有界的，同时足以
+/// 覆盖一轮构建的活跃工作集；负向项仍由 `NON_POSITIVE_LIMIT_PER_SHARD` 单独限流。
+const TOTAL_LIMIT_PER_SHARD: usize = 8192;
 
 impl DentryShard {
     const fn new_empty() -> Self {
@@ -557,7 +573,7 @@ impl DentryShard {
         if self.buckets.is_empty() {
             return None;
         }
-        let start = hash & self.mask();
+        let start = bucket_start(hash, self.capacity());
         for probe in 0..self.buckets.len() {
             let idx = (start + probe) & self.mask();
             match &self.buckets[idx] {
@@ -620,7 +636,7 @@ impl DentryShard {
             self.grow();
         }
 
-        let start = hash & self.mask();
+        let start = bucket_start(hash, self.capacity());
         for probe in 0..self.capacity() {
             let idx = (start + probe) & self.mask();
             match &self.buckets[idx] {
@@ -678,7 +694,7 @@ impl DentryShard {
             let natural = {
                 let b = self.buckets[i].as_ref().unwrap();
                 // 使用存储的 hash 字段，避免重新计算
-                b.hash & self.mask()
+                bucket_start(b.hash, self.capacity())
             };
             // 判断 natural 是否在环形区间 (empty, i] 内
             let in_range = if empty < i {
@@ -765,8 +781,33 @@ impl DentryShard {
         self.non_positive_count = 0;
         self.eviction_cursor = 0;
         for bucket in old_buckets.into_iter().flatten() {
-            // 使用存储的 hash 字段，避免重新计算
+            // 使用存储的 hash 字段，并由 insert 按新容量的 bucket_start 重新定位。
             let _ = self.insert(bucket.hash, bucket.parent_ptr, bucket.name, bucket.dentry);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dentry_shard_tests {
+    use alloc::collections::BTreeSet;
+
+    use super::{INITIAL_CAPACITY, SHARD_BITS, SHARD_MASK, bucket_start};
+
+    #[test]
+    fn bucket_start_uses_hash_bits_above_shard_selector() {
+        let shard = 7usize;
+
+        for capacity in [INITIAL_CAPACITY, INITIAL_CAPACITY * 8] {
+            let starts: BTreeSet<usize> = (0..capacity)
+                .map(|expected| {
+                    let hash = (expected << SHARD_BITS) | shard;
+                    assert_eq!(hash & SHARD_MASK, shard);
+                    bucket_start(hash, capacity)
+                })
+                .collect();
+
+            assert_eq!(starts.len(), capacity);
+            assert!(starts.into_iter().eq(0..capacity));
         }
     }
 }
