@@ -63,6 +63,20 @@ impl<const CPU_COUNT: usize> CurrentAsidTracker<CPU_COUNT> {
             .map(|slot| slot.0.load(Ordering::SeqCst))
     }
 
+    /// 判断面向用户地址空间的同步失效是否已被目标 CPU 的切换覆盖。
+    ///
+    /// CPU 在发布新逻辑 ASID 后不会再访问旧用户地址空间，并会在任何后续用户
+    /// 执行前完成一次全量本地 TLB 失效。因此 shootdown 已经发出后，即使目标核
+    /// 因关中断或锁竞争尚未更新确认序号，只要观察到它已经切离目标 ASID，发起方
+    /// 也无需继续同步等待。内核逻辑 ASID 0 的映射跨所有用户地址空间共享，不能
+    /// 使用这个优化。
+    pub(crate) fn user_shootdown_is_obsolete(&self, cpu: usize, target_asid: usize) -> bool {
+        target_asid != KERNEL_LOGICAL_ASID
+            && self
+                .current(cpu)
+                .is_some_and(|current_asid| current_asid != target_asid)
+    }
+
     /// 在 PTE 更新后筛出仍运行目标逻辑 ASID 的历史 CPU。
     ///
     /// fence 必须位于候选位图和 ASID 扫描之前，形成“PTE 写 → 扫描”顺序；候选

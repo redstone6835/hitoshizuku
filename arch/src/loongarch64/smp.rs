@@ -287,6 +287,7 @@ fn publish_shootdown(
     address: usize,
     action: u32,
     requested_targets: usize,
+    allow_switched_user_target: bool,
 ) {
     let source = LoongArch64MessageInterruptOps::current_cpu_id();
     let source_bit = 1usize << source;
@@ -317,7 +318,15 @@ fn publish_shootdown(
         };
     }
     send_action_to_mask(targets, action);
-    wait_for_shootdown(kind, action, asid, address, targets, &expected);
+    wait_for_shootdown(
+        kind,
+        action,
+        asid,
+        address,
+        targets,
+        &expected,
+        allow_switched_user_target,
+    );
 }
 
 fn wait_for_shootdown(
@@ -327,6 +336,7 @@ fn wait_for_shootdown(
     address: usize,
     targets: usize,
     expected: &[usize; MAX_CPUS],
+    allow_switched_user_target: bool,
 ) {
     let counter_hz = stable_counter_hz().max(1);
     let retry_ticks = (counter_hz / SHOOTDOWN_RETRY_DIVISOR).max(1);
@@ -345,6 +355,17 @@ fn wait_for_shootdown(
         loop {
             let observed = completed.load(Ordering::Acquire);
             if shootdown_sequence_reached(observed, expected[logical_id]) {
+                break;
+            }
+            // 目标 CPU 可能在请求发布后切离该用户 ASID。切换路径先发布新逻辑
+            // ASID，随后在任何用户访问前执行完整本地 invtlb；此时继续等待旧请求
+            // 的确认既无必要，也可能与目标核持有的普通内核锁形成永久锁环。
+            // 请求序号仍保持未完成，目标核下次进入 trap/切换边界时会统一消费，
+            // 这里不能替目标核写 completed，否则可能掩盖其它地址空间的请求。
+            if allow_switched_user_target
+                && kind == SHOOTDOWN_TLB
+                && CURRENT_LOGICAL_ASIDS.user_shootdown_is_obsolete(logical_id, asid)
+            {
                 break;
             }
             // 两个 CPU 可能同时发起 shootdown。在等待对端时主动消费本核请求，
@@ -408,6 +429,7 @@ pub(crate) fn flush_tlb_all_cpus(asid: usize, address: Option<usize>) {
         address.unwrap_or(ALL_ADDRESSES),
         ACTION_TLB_SHOOTDOWN,
         usize::MAX,
+        false,
     );
 }
 
@@ -418,6 +440,7 @@ pub(crate) fn flush_tlb_on_cpus(asid: usize, address: Option<usize>, targets: us
         address.unwrap_or(ALL_ADDRESSES),
         ACTION_TLB_SHOOTDOWN,
         targets,
+        true,
     );
 }
 
@@ -428,6 +451,7 @@ pub(crate) fn sync_icache_all_cpus() {
         ALL_ADDRESSES,
         ACTION_ICACHE_SYNC,
         usize::MAX,
+        false,
     );
 }
 

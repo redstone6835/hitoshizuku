@@ -7,8 +7,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ktest::ktest;
+use std::sync::Barrier;
+use std::thread;
 
 use crate::cred::{Credentials, Gid, Uid};
 use crate::dentry::{Dentry, DentryCache};
@@ -163,6 +166,23 @@ fn positive_child(sb: &Arc<Superblock>, name: &str, ino: u64) -> Arc<Dentry> {
     Dentry::new_positive(name, Some(Arc::clone(&sb.root_dentry)), inode)
 }
 
+fn directory_child(sb: &Arc<Superblock>, name: &str, ino: u64) -> Arc<Dentry> {
+    let inode = Inode::new(
+        InodeId {
+            fs_id: sb.fs_id,
+            ino,
+        },
+        FileType::Directory,
+        DevId::new(0, 0),
+        4096,
+        sb.dev_id,
+        inode_meta(FileType::Directory),
+        Arc::new(EmptyInodeOps),
+        Arc::downgrade(sb),
+    );
+    Dentry::new_positive(name, Some(Arc::clone(&sb.root_dentry)), inode)
+}
+
 fn shard_index(parent: &Arc<Dentry>, name: &str) -> usize {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
@@ -237,4 +257,185 @@ fn budget_eviction_preserves_externally_referenced_positive_dentry() {
         .filter(|name| cache.get(&sb.root_dentry, name).is_none())
         .count();
     assert_eq!(evicted, 1);
+}
+
+#[ktest]
+fn removed_directory_drops_cached_negative_children() {
+    let sb = test_superblock(Box::new(PersistentSuperblockOps), None);
+    let cache = DentryCache::new();
+    let directory = cache.insert(directory_child(&sb, "removed", 2));
+    drop(cache.insert(Dentry::new_negative(
+        "missing",
+        Some(Arc::clone(&directory)),
+    )));
+
+    assert_eq!(cache.len(), 2);
+    assert_eq!(Arc::strong_count(&directory), 3);
+
+    cache.invalidate_removed_directory(&directory);
+
+    assert!(directory.is_invalid());
+    assert_eq!(cache.len(), 0);
+    assert_eq!(Arc::strong_count(&directory), 1);
+}
+
+#[ktest]
+fn removed_directory_rejects_late_negative_child() {
+    let sb = test_superblock(Box::new(PersistentSuperblockOps), None);
+    let cache = DentryCache::new();
+    let directory = cache.insert(directory_child(&sb, "removed", 2));
+
+    cache.invalidate_removed_directory(&directory);
+    let late = cache.insert(Dentry::new_negative("late", Some(Arc::clone(&directory))));
+
+    assert!(late.is_negative());
+    assert!(cache.get(&directory, "late").is_none());
+    assert_eq!(cache.len(), 0);
+}
+
+#[ktest]
+fn removed_directory_serializes_concurrent_negative_insert() {
+    let sb = test_superblock(Box::new(PersistentSuperblockOps), None);
+    let cache = Arc::new(DentryCache::new());
+    let directory = cache.insert(directory_child(&sb, "removed", 2));
+    let ready = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let worker = {
+        let cache = Arc::clone(&cache);
+        let directory = Arc::clone(&directory);
+        let ready = Arc::clone(&ready);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            drop(cache.insert(Dentry::new_negative("racing", Some(Arc::clone(&directory)))));
+            ready.store(true, Ordering::Release);
+            while !stop.load(Ordering::Acquire) {
+                drop(cache.insert(Dentry::new_negative("racing", Some(Arc::clone(&directory)))));
+                thread::yield_now();
+            }
+            drop(cache.insert(Dentry::new_negative("after", Some(Arc::clone(&directory)))));
+        })
+    };
+
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    cache.invalidate_removed_directory(&directory);
+    stop.store(true, Ordering::Release);
+    worker.join().expect("negative insert worker must finish");
+
+    assert!(cache.get(&directory, "racing").is_none());
+    assert!(cache.get(&directory, "after").is_none());
+    assert_eq!(cache.len(), 0);
+}
+
+#[ktest]
+fn subtree_invalidation_serializes_rename_without_lock_inversion() {
+    let sb = test_superblock(Box::new(PersistentSuperblockOps), None);
+    let cache = Arc::new(DentryCache::new());
+    let directory = cache.insert(directory_child(&sb, "subtree", 2));
+    let child = cache.insert(positive_child(&sb, "child", 3));
+    cache.rename_dentry(&child, &directory, "child");
+    let start = Arc::new(Barrier::new(3));
+
+    let invalidate_worker = {
+        let cache = Arc::clone(&cache);
+        let directory = Arc::clone(&directory);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            cache.invalidate_subtree(&directory);
+        })
+    };
+    let rename_worker = {
+        let cache = Arc::clone(&cache);
+        let child = Arc::clone(&child);
+        let root = Arc::clone(&sb.root_dentry);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            cache.rename_dentry(&child, &root, "moved");
+        })
+    };
+
+    start.wait();
+    invalidate_worker
+        .join()
+        .expect("subtree invalidation worker must finish");
+    rename_worker.join().expect("rename worker must finish");
+
+    assert!(cache.get(&directory, "child").is_none());
+    let moved = cache.get(&sb.root_dentry, "moved");
+    assert!(moved.as_ref().is_none_or(|dentry| dentry.is_positive()));
+    assert_eq!(cache.len(), usize::from(moved.is_some()));
+}
+
+#[ktest]
+fn rename_to_invalid_parent_drops_stale_source_key() {
+    let sb = test_superblock(Box::new(PersistentSuperblockOps), None);
+    let cache = DentryCache::new();
+    let invalid_parent = cache.insert(directory_child(&sb, "gone", 2));
+    let source = cache.insert(positive_child(&sb, "source", 3));
+
+    cache.invalidate_removed_directory(&invalid_parent);
+    cache.rename_dentry(&source, &invalid_parent, "target");
+
+    assert!(source.is_invalid());
+    assert!(cache.get(&sb.root_dentry, "source").is_none());
+    assert!(cache.get(&invalid_parent, "target").is_none());
+    assert_eq!(cache.len(), 0);
+}
+
+#[ktest]
+fn positive_insert_waits_for_unrelated_invalidation() {
+    let sb = test_superblock(Box::new(DefaultSuperblockOps), Some(DevId::new(8, 1)));
+    let cache = Arc::new(DentryCache::new());
+    let ready = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let invalidation_worker = {
+        let cache = Arc::clone(&cache);
+        let ready = Arc::clone(&ready);
+        let release = Arc::clone(&release);
+        thread::spawn(move || cache.hold_invalidation_for_test(&ready, &release))
+    };
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+
+    let insert_worker = {
+        let cache = Arc::clone(&cache);
+        let child = positive_child(&sb, "tmpfs-like", 2);
+        let started = Arc::clone(&started);
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            started.store(true, Ordering::Release);
+            let inserted = cache.insert(child);
+            done.store(true, Ordering::Release);
+            inserted
+        })
+    };
+    while !started.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    for _ in 0..32 {
+        thread::yield_now();
+    }
+    assert!(!done.load(Ordering::Acquire));
+
+    release.store(true, Ordering::Release);
+    invalidation_worker
+        .join()
+        .expect("invalidation worker must finish");
+    let inserted = insert_worker.join().expect("positive insert must finish");
+
+    assert!(inserted.is_positive());
+    assert!(
+        cache
+            .get(&sb.root_dentry, "tmpfs-like")
+            .is_some_and(|cached| Arc::ptr_eq(&cached, &inserted))
+    );
+    assert_eq!(cache.len(), 1);
 }

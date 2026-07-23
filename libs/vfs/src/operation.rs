@@ -421,10 +421,9 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.rmdir(&parent_inode, name, &child_inode)?;
-    // rmdir 成功已经证明目录为空；此时全局扫描 dcache 子树只会反复检查不相关条目，
-    // 并在批量删树时退化为平方复杂度。负向子项无法再由命名空间抵达，逐出根键即可。
-    DCACHE.invalidate_dentry(&target.dentry);
-    target.dentry.invalidate();
+    // 常见空目录只逐出根键；若失败 lookup 留下负向子项，则一并清掉这些不可达引用，
+    // 否则它们会长期保活 nlink=0 的 inode，导致磁盘位图和目录计数无法回收。
+    DCACHE.invalidate_removed_directory(&target.dentry);
     retire_inode(child_inode);
     Ok(())
 }

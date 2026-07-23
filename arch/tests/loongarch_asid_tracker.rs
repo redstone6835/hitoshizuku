@@ -57,6 +57,19 @@ fn publishing_kernel_asid_removes_cpu_from_user_targets() {
 }
 
 #[test]
+fn switched_away_cpu_retires_only_user_shootdown_waits() {
+    let tracker = CurrentAsidTracker::<1>::new();
+
+    tracker.publish_before_full_flush(0, TARGET_ASID);
+    assert!(!tracker.user_shootdown_is_obsolete(0, TARGET_ASID));
+
+    tracker.publish_before_full_flush(0, TARGET_ASID + 1);
+    assert!(tracker.user_shootdown_is_obsolete(0, TARGET_ASID));
+    assert!(!tracker.user_shootdown_is_obsolete(0, KERNEL_LOGICAL_ASID));
+    assert!(!tracker.user_shootdown_is_obsolete(1, TARGET_ASID));
+}
+
+#[test]
 fn concurrent_switch_or_scan_always_covers_the_pte_update() {
     for _ in 0..128 {
         let tracker = Arc::new(CurrentAsidTracker::<1>::new());
