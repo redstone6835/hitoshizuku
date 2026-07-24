@@ -26,6 +26,12 @@ use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, us
 const FILE_FAULT_AROUND_PAGES: usize = 16;
 /// 内容持续变化时最多尝试发布缓存快照的次数，随后退回不缓存读取保证前进性。
 const PRIVATE_FILE_CACHE_RETRIES: usize = 3;
+/// 连续缓存缺失达到该阈值后，才值得为一次 VFS 读取准备 bounce buffer。
+const PRIVATE_FILE_BATCH_MIN_PAGES: usize = 4;
+/// 单次批量填页不超过 fault-around 窗口，避免扩大投机读取范围。
+const PRIVATE_FILE_BATCH_MAX_PAGES: usize = 16;
+/// 限制缺页栈外临时内存；LoongArch 当前 4 KiB 页下对应 16 页。
+const PRIVATE_FILE_BATCH_MAX_BYTES: usize = 64 * 1024;
 /// 私有干净文件页的强缓存上限；在 4 KiB 页配置下约为 512 MiB。
 ///
 /// BuildStorm 的工具链和 crate 工作集明显超过 128 MiB；保留更大的有界热集可
@@ -44,6 +50,13 @@ struct FileFaultAroundWindow {
     start: usize,
     end: usize,
     file_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrivateFileBatchPlan {
+    pages: usize,
+    buffer_len: usize,
+    read_len: usize,
 }
 
 impl FileFaultAroundWindow {
@@ -95,6 +108,53 @@ fn file_fault_around_window(
         end: fault_page.checked_add(len)?,
         file_offset,
     })
+}
+
+/// 计算连续私有文件 cache miss 的批量读取尺寸。
+///
+/// bounce buffer 保留完整页并预先清零，但只从文件读取 EOF 前的有效字节，
+/// 因而文件最后一个非整页的尾部仍保持 mmap 所需的零填充语义。
+fn private_file_batch_plan(
+    file_offset: u64,
+    file_size: u64,
+    window_pages: usize,
+    consecutive_misses: usize,
+    page_size: usize,
+) -> Option<PrivateFileBatchPlan> {
+    if page_size == 0 || !page_size.is_power_of_two() {
+        return None;
+    }
+    let remaining = file_size.checked_sub(file_offset)?;
+    if remaining == 0 {
+        return None;
+    }
+    let max_pages_by_bytes = PRIVATE_FILE_BATCH_MAX_BYTES / page_size;
+    let pages_cap = window_pages
+        .min(consecutive_misses)
+        .min(PRIVATE_FILE_BATCH_MAX_PAGES)
+        .min(max_pages_by_bytes);
+    if pages_cap < PRIVATE_FILE_BATCH_MIN_PAGES {
+        return None;
+    }
+
+    let page_size_u64 = u64::try_from(page_size).ok()?;
+    let pages_before_eof = remaining / page_size_u64 + u64::from(remaining % page_size_u64 != 0);
+    let pages = pages_cap.min(usize::try_from(pages_before_eof).unwrap_or(usize::MAX));
+    if pages < PRIVATE_FILE_BATCH_MIN_PAGES {
+        return None;
+    }
+    let buffer_len = pages.checked_mul(page_size)?;
+    let read_len = usize::try_from(remaining.min(u64::try_from(buffer_len).ok()?)).ok()?;
+    Some(PrivateFileBatchPlan {
+        pages,
+        buffer_len,
+        read_len,
+    })
+}
+
+fn private_file_batch_page_offset(base: u64, index: usize, page_size: usize) -> Option<u64> {
+    let delta = index.checked_mul(page_size)?;
+    base.checked_add(u64::try_from(delta).ok()?)
 }
 
 fn permits_file_fault_around(flags: VmFlags, kind: FaultKind) -> bool {
@@ -775,6 +835,12 @@ struct PreparedFilePage {
     page: Arc<ResidentPage>,
 }
 
+enum PreparedPrivateFileCacheRun {
+    Cached(Arc<ResidentPage>),
+    Batched(Vec<Arc<ResidentPage>>),
+    Fallback,
+}
+
 enum FaultAroundCommit {
     Done(FaultOutcome),
     Retry,
@@ -965,18 +1031,49 @@ impl PrivateFileFaultAround {
         let page_size = page_size();
         let pages = (self.end - self.fault_page) / page_size;
         let mut prepared = Vec::with_capacity(pages);
-        for index in 0..pages {
+        let mut index = 0usize;
+        while index < pages {
             let delta = index.checked_mul(page_size).ok_or(Errno::EINVAL)?;
             let vaddr = self.fault_page.checked_add(delta).ok_or(Errno::EINVAL)?;
             let file_offset = self
                 .fault_file_offset
                 .checked_add(u64::try_from(delta).map_err(|_| Errno::EINVAL)?)
                 .ok_or(Errno::EINVAL)?;
+
+            match prepare_private_file_cache_run(
+                &self.file,
+                file_offset,
+                pages - index,
+                page_size,
+                profile_phases,
+            ) {
+                PreparedPrivateFileCacheRun::Cached(page) => {
+                    prepared.push(PreparedFilePage { vaddr, page });
+                    index += 1;
+                    continue;
+                }
+                PreparedPrivateFileCacheRun::Batched(batch) => {
+                    let batch_len = batch.len();
+                    for (batch_index, page) in batch.into_iter().enumerate() {
+                        let batch_delta =
+                            batch_index.checked_mul(page_size).ok_or(Errno::EINVAL)?;
+                        let batch_vaddr = vaddr.checked_add(batch_delta).ok_or(Errno::EINVAL)?;
+                        prepared.push(PreparedFilePage {
+                            vaddr: batch_vaddr,
+                            page,
+                        });
+                    }
+                    index = index.checked_add(batch_len).ok_or(Errno::EINVAL)?;
+                    continue;
+                }
+                PreparedPrivateFileCacheRun::Fallback => {}
+            }
             match private_file_page(&self.file, file_offset, profile_phases) {
                 Ok(page) => prepared.push(PreparedFilePage { vaddr, page }),
                 Err(err) if index == 0 => return Err(err),
                 Err(_) => break,
             }
+            index += 1;
         }
         #[cfg(feature = "performance-profile")]
         record_fault_around_prepare(pages, prepared.len());
@@ -2838,6 +2935,160 @@ fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Reside
     Ok(publish_cached_file_page(&SHARED_FILE_PAGES, key, page))
 }
 
+/// 在 fault-around 准备阶段合并连续私有文件 cache miss。
+///
+/// 命中页直接返回，短 miss 前缀或任何乐观快照失败均交回原有逐页路径；因此本
+/// helper 不改变普通 fault 的错误和重试语义，只减少稳定只读文件的 VFS 调用数。
+fn prepare_private_file_cache_run(
+    file: &Arc<dyn FileLike>,
+    file_off: u64,
+    window_pages: usize,
+    page_size: usize,
+    profile_phases: bool,
+) -> PreparedPrivateFileCacheRun {
+    let (Some(file_key), Some(generation)) = (
+        file.private_page_cache_key(),
+        file.private_page_cache_generation(),
+    ) else {
+        return PreparedPrivateFileCacheRun::Fallback;
+    };
+    let file_size = file.size();
+    if file.private_page_cache_generation() != Some(generation) {
+        return PreparedPrivateFileCacheRun::Fallback;
+    }
+
+    let first_key = FilePageKey::new_private(file_key, file_off, generation);
+    if let Some(page) = find_cached_private_file_page(&PRIVATE_FILE_PAGES, first_key) {
+        return if file.private_page_cache_generation() == Some(generation) {
+            PreparedPrivateFileCacheRun::Cached(page)
+        } else {
+            PreparedPrivateFileCacheRun::Fallback
+        };
+    }
+    if file.private_page_cache_generation() != Some(generation) {
+        return PreparedPrivateFileCacheRun::Fallback;
+    }
+
+    let Some(probe_plan) =
+        private_file_batch_plan(file_off, file_size, window_pages, window_pages, page_size)
+    else {
+        return PreparedPrivateFileCacheRun::Fallback;
+    };
+    let mut consecutive_misses = 1usize;
+    while consecutive_misses < probe_plan.pages {
+        let Some(offset) = private_file_batch_page_offset(file_off, consecutive_misses, page_size)
+        else {
+            return PreparedPrivateFileCacheRun::Fallback;
+        };
+        let key = FilePageKey::new_private(file_key, offset, generation);
+        if find_cached_private_file_page(&PRIVATE_FILE_PAGES, key).is_some() {
+            break;
+        }
+        if file.private_page_cache_generation() != Some(generation) {
+            return PreparedPrivateFileCacheRun::Fallback;
+        }
+        consecutive_misses += 1;
+    }
+
+    let Some(plan) = private_file_batch_plan(
+        file_off,
+        file_size,
+        window_pages,
+        consecutive_misses,
+        page_size,
+    ) else {
+        return PreparedPrivateFileCacheRun::Fallback;
+    };
+    load_private_file_page_batch(
+        file,
+        file_key,
+        generation,
+        file_off,
+        page_size,
+        plan,
+        profile_phases,
+    )
+    .map_or(
+        PreparedPrivateFileCacheRun::Fallback,
+        PreparedPrivateFileCacheRun::Batched,
+    )
+}
+
+fn load_private_file_page_batch(
+    file: &Arc<dyn FileLike>,
+    file_key: usize,
+    generation: u64,
+    file_off: u64,
+    page_size: usize,
+    plan: PrivateFileBatchPlan,
+    profile_phases: bool,
+) -> Option<Vec<Arc<ResidentPage>>> {
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = profile_phases;
+    let mut bounce = Vec::new();
+    bounce.try_reserve_exact(plan.buffer_len).ok()?;
+    bounce.resize(plan.buffer_len, 0);
+
+    #[cfg(feature = "performance-profile")]
+    let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultCacheFill));
+    if file.private_page_cache_generation() != Some(generation) {
+        return None;
+    }
+    read_file_bytes_exact(file.as_ref(), file_off, &mut bounce[..plan.read_len]).ok()?;
+    if file.private_page_cache_generation() != Some(generation) {
+        return None;
+    }
+
+    let virt = allocator::KERNEL_ALLOCATOR.load_phys_to_virt()?;
+    let mut candidates = Vec::new();
+    candidates.try_reserve_exact(plan.pages).ok()?;
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(plan.pages).ok()?;
+    let mut published_candidates = Vec::new();
+    published_candidates.try_reserve_exact(plan.pages).ok()?;
+
+    for index in 0..plan.pages {
+        let offset = private_file_batch_page_offset(file_off, index, page_size)?;
+        let source_start = index.checked_mul(page_size)?;
+        let source_end = source_start.checked_add(page_size)?;
+        let paddr = alloc_zeroed_user_page()?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bounce[source_start..source_end].as_ptr(),
+                virt(paddr) as *mut u8,
+                page_size,
+            );
+        }
+        candidates.push((
+            FilePageKey::new_private(file_key, offset, generation),
+            ResidentPage::new_private_file(paddr),
+        ));
+    }
+    if file.private_page_cache_generation() != Some(generation) {
+        return None;
+    }
+
+    for (key, candidate) in candidates {
+        let candidate_ref = Arc::clone(&candidate);
+        let page = publish_cached_private_file_page(&PRIVATE_FILE_PAGES, key, candidate);
+        if Arc::ptr_eq(&page, &candidate_ref) {
+            published_candidates.push((key, candidate_ref));
+        }
+        pages.push(page);
+        if file.private_page_cache_generation() != Some(generation) {
+            rollback_private_file_page_batch(&published_candidates);
+            return None;
+        }
+    }
+    Some(pages)
+}
+
+fn rollback_private_file_page_batch(published: &[(FilePageKey, Arc<ResidentPage>)]) {
+    for (key, page) in published {
+        PRIVATE_FILE_PAGES.remove_if_same(*key, page);
+    }
+}
+
 fn private_file_page(
     file: &Arc<dyn FileLike>,
     file_off: u64,
@@ -3207,10 +3458,11 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::{
-        FILE_FAULT_AROUND_PAGES, FaultKind, FilePageKey, PageAccess, ResidentPage,
-        ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache, access_for_private_file,
-        file_fault_around_window, find_cached_private_file_page, permits_file_fault_around,
-        plan_file_segment, publish_cached_file_page, publish_cached_private_file_page,
+        FILE_FAULT_AROUND_PAGES, FaultKind, FilePageKey, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess,
+        ResidentPage, ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache,
+        access_for_private_file, file_fault_around_window, find_cached_private_file_page,
+        permits_file_fault_around, plan_file_segment, private_file_batch_page_offset,
+        private_file_batch_plan, publish_cached_file_page, publish_cached_private_file_page,
         read_file_bytes_exact, unmapped_prefix_len,
     };
     use errno::Errno;
@@ -3360,6 +3612,72 @@ mod tests {
             file_fault_around_window(0x2000, 0x1000, 0x8000, u64::MAX, u64::MAX, PAGE_SIZE,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn private_file_batch_caps_at_sixteen_pages() {
+        let plan = private_file_batch_plan(0, u64::MAX, 32, 32, PAGE_SIZE)
+            .expect("large miss prefix should batch");
+
+        assert_eq!(plan.pages, 16);
+        assert_eq!(plan.buffer_len, PRIVATE_FILE_BATCH_MAX_BYTES);
+        assert_eq!(plan.read_len, PRIVATE_FILE_BATCH_MAX_BYTES);
+    }
+
+    #[test]
+    fn private_file_batch_requires_four_consecutive_misses() {
+        assert!(private_file_batch_plan(0, u64::MAX, 16, 3, PAGE_SIZE).is_none());
+        assert_eq!(
+            private_file_batch_plan(0, u64::MAX, 16, 4, PAGE_SIZE)
+                .expect("four misses should batch")
+                .pages,
+            4
+        );
+    }
+
+    #[test]
+    fn private_file_batch_stops_at_partial_eof() {
+        let file_offset = 0x2000;
+        let remaining = 3 * PAGE_SIZE + 1;
+        let plan = private_file_batch_plan(
+            file_offset,
+            file_offset + remaining as u64,
+            16,
+            16,
+            PAGE_SIZE,
+        )
+        .expect("partial fourth page should remain batchable");
+
+        assert_eq!(plan.pages, 4);
+        assert_eq!(plan.buffer_len, 4 * PAGE_SIZE);
+        assert_eq!(plan.read_len, remaining);
+    }
+
+    #[test]
+    fn private_file_batch_rejects_short_eof_prefix() {
+        assert!(private_file_batch_plan(0, (3 * PAGE_SIZE) as u64, 16, 16, PAGE_SIZE).is_none());
+        assert!(private_file_batch_plan(0x4000, 0x4000, 16, 16, PAGE_SIZE).is_none());
+    }
+
+    #[test]
+    fn private_file_batch_obeys_sixty_four_kibibyte_limit() {
+        let large_page = 8192;
+        let plan = private_file_batch_plan(0, u64::MAX, 16, 16, large_page)
+            .expect("eight large pages fit the bounce limit");
+
+        assert_eq!(plan.pages, 8);
+        assert_eq!(plan.buffer_len, PRIVATE_FILE_BATCH_MAX_BYTES);
+        assert!(private_file_batch_plan(0, u64::MAX, 16, 16, 1 << 17).is_none());
+    }
+
+    #[test]
+    fn private_file_batch_page_offset_rejects_overflow() {
+        assert_eq!(
+            private_file_batch_page_offset(0x2000, 3, PAGE_SIZE),
+            Some(0x5000)
+        );
+        assert!(private_file_batch_page_offset(u64::MAX - 1, 1, PAGE_SIZE).is_none());
+        assert!(private_file_batch_page_offset(0, usize::MAX, PAGE_SIZE).is_none());
     }
 
     #[test]
