@@ -236,6 +236,170 @@ static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "performance-profile")]
+const HARDWARE_FAULT_BACKING_COUNT: usize = 5;
+#[cfg(feature = "performance-profile")]
+const HARDWARE_FAULT_ACCESS_COUNT: usize = 4;
+#[cfg(feature = "performance-profile")]
+const HARDWARE_FAULT_RESIDENCY_COUNT: usize = 2;
+
+/// 硬件用户缺页对应的 VMA backing 分类。
+#[cfg(feature = "performance-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum HardwareFaultBacking {
+    Anon = 0,
+    SharedAnon,
+    PrivateFile,
+    SharedFile,
+    Direct,
+}
+
+#[cfg(feature = "performance-profile")]
+impl HardwareFaultBacking {
+    pub(crate) const ALL: [Self; HARDWARE_FAULT_BACKING_COUNT] = [
+        Self::Anon,
+        Self::SharedAnon,
+        Self::PrivateFile,
+        Self::SharedFile,
+        Self::Direct,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Anon => "Anon",
+            Self::SharedAnon => "SharedAnon",
+            Self::PrivateFile => "PrivateFile",
+            Self::SharedFile => "SharedFile",
+            Self::Direct => "Direct",
+        }
+    }
+
+    fn from_vma(backing: &VmBacking, flags: VmFlags) -> Self {
+        match backing {
+            VmBacking::Anon { .. } => Self::Anon,
+            VmBacking::SharedAnon { .. } => Self::SharedAnon,
+            VmBacking::File { .. } if flags.has(VmFlags::SHARED) => Self::SharedFile,
+            VmBacking::File { .. } => Self::PrivateFile,
+            VmBacking::Direct(_) => Self::Direct,
+        }
+    }
+}
+
+/// 硬件缺页访问类型。LoongArch PPI 不携带读写取指信息，必须单列。
+#[cfg(feature = "performance-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum HardwareFaultAccess {
+    Load = 0,
+    Store,
+    Exec,
+    Privilege,
+}
+
+#[cfg(feature = "performance-profile")]
+impl HardwareFaultAccess {
+    pub(crate) const ALL: [Self; HARDWARE_FAULT_ACCESS_COUNT] =
+        [Self::Load, Self::Store, Self::Exec, Self::Privilege];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Load => "Load",
+            Self::Store => "Store",
+            Self::Exec => "Exec",
+            Self::Privilege => "Privilege",
+        }
+    }
+
+    const fn from_kind(kind: FaultKind) -> Self {
+        match kind {
+            FaultKind::Load | FaultKind::PermRead => Self::Load,
+            FaultKind::Store | FaultKind::PermWrite => Self::Store,
+            FaultKind::Exec | FaultKind::PermExec => Self::Exec,
+            FaultKind::Privilege => Self::Privilege,
+        }
+    }
+}
+
+/// `/proc/meminfo` 导出的硬件用户缺页累计快照。
+#[cfg(feature = "performance-profile")]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HardwareFaultDiag {
+    counts: [[[u64; HARDWARE_FAULT_RESIDENCY_COUNT]; HARDWARE_FAULT_ACCESS_COUNT];
+        HARDWARE_FAULT_BACKING_COUNT],
+}
+
+#[cfg(feature = "performance-profile")]
+impl HardwareFaultDiag {
+    pub(crate) fn count(
+        &self,
+        backing: HardwareFaultBacking,
+        access: HardwareFaultAccess,
+        resident: bool,
+    ) -> u64 {
+        self.counts[backing as usize][access as usize][usize::from(resident)]
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+#[repr(align(64))]
+struct HardwareFaultCpuCounters {
+    counts: [[[AtomicU64; HARDWARE_FAULT_RESIDENCY_COUNT]; HARDWARE_FAULT_ACCESS_COUNT];
+        HARDWARE_FAULT_BACKING_COUNT],
+}
+
+#[cfg(feature = "performance-profile")]
+impl HardwareFaultCpuCounters {
+    const fn new() -> Self {
+        Self {
+            counts: [const {
+                [const { [const { AtomicU64::new(0) }; HARDWARE_FAULT_RESIDENCY_COUNT] };
+                    HARDWARE_FAULT_ACCESS_COUNT]
+            }; HARDWARE_FAULT_BACKING_COUNT],
+        }
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+static HARDWARE_FAULT_COUNTERS: [HardwareFaultCpuCounters; sched::NR_CPUS] =
+    [const { HardwareFaultCpuCounters::new() }; sched::NR_CPUS];
+
+#[cfg(feature = "performance-profile")]
+#[inline]
+fn record_hardware_user_fault(
+    backing: HardwareFaultBacking,
+    access: HardwareFaultAccess,
+    resident: bool,
+) {
+    let cpu = sched::current_cpu_id().min(sched::NR_CPUS - 1);
+    let counter =
+        &HARDWARE_FAULT_COUNTERS[cpu].counts[backing as usize][access as usize][resident as usize];
+    // 缺页路径不会在本 CPU 上抢占或复入；用单写 relaxed load/store 避免 QEMU
+    // 为无竞争 fetch_add 模拟昂贵的原子 RMW，同时允许其它 CPU 读取累计快照。
+    let value = counter.load(Ordering::Relaxed);
+    counter.store(value.wrapping_add(1), Ordering::Relaxed);
+}
+
+#[cfg(feature = "performance-profile")]
+pub(crate) fn hardware_fault_diag() -> HardwareFaultDiag {
+    let mut diag = HardwareFaultDiag::default();
+    for counters in &HARDWARE_FAULT_COUNTERS {
+        for backing in HardwareFaultBacking::ALL {
+            for access in HardwareFaultAccess::ALL {
+                for resident in [false, true] {
+                    diag.counts[backing as usize][access as usize][resident as usize] = diag.counts
+                        [backing as usize][access as usize][resident as usize]
+                        .saturating_add(
+                            counters.counts[backing as usize][access as usize][resident as usize]
+                                .load(Ordering::Relaxed),
+                        );
+                }
+            }
+        }
+    }
+    diag
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FaultAroundDiag {
     pub windows: u64,
@@ -1934,12 +2098,34 @@ impl VmSpace {
 
     /// page-fault 分派进来的入口。按 VMA backing / 权限决定该做什么。
     pub fn handle_fault(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
-        self.handle_fault_inner(addr, kind, true, true, true)
+        self.handle_fault_inner(
+            addr,
+            kind,
+            true,
+            true,
+            true,
+            #[cfg(feature = "performance-profile")]
+            false,
+        )
+    }
+
+    /// 仅供真实用户态硬件 page-fault 分派使用；软件 prefault 不进入该统计。
+    #[cfg(feature = "performance-profile")]
+    pub fn handle_user_hardware_fault(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
+        self.handle_fault_inner(addr, kind, true, true, true, true)
     }
 
     /// 预解析用户页访问，但不把已驻留页当作硬件缓存了无效 translation。
     fn ensure_page_access(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
-        self.handle_fault_inner(addr, kind, false, false, false)
+        self.handle_fault_inner(
+            addr,
+            kind,
+            false,
+            false,
+            false,
+            #[cfg(feature = "performance-profile")]
+            false,
+        )
     }
 
     fn handle_fault_inner(
@@ -1949,6 +2135,7 @@ impl VmSpace {
         publish_unchanged_mapping: bool,
         allow_fault_around: bool,
         profile_phases: bool,
+        #[cfg(feature = "performance-profile")] profile_hardware_fault: bool,
     ) -> FaultOutcome {
         if user_pgd_ops().is_none() {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
@@ -1968,9 +2155,27 @@ impl VmSpace {
                 .backing
                 .clone();
             drop(set);
+            #[cfg(feature = "performance-profile")]
+            if profile_hardware_fault {
+                record_hardware_user_fault(
+                    HardwareFaultBacking::from_vma(&backing, flags),
+                    HardwareFaultAccess::from_kind(kind),
+                    false,
+                );
+            }
             return self.commit_fault_page(page, backing, flags, page, kind, profile_phases);
         };
+        #[cfg(feature = "performance-profile")]
+        let hardware_fault_backing = profile_hardware_fault
+            .then(|| HardwareFaultBacking::from_vma(&area.backing, area.flags));
+        #[cfg(feature = "performance-profile")]
+        let hardware_fault_access = HardwareFaultAccess::from_kind(kind);
         if !permits(area.flags, kind) {
+            #[cfg(feature = "performance-profile")]
+            if let Some(backing) = hardware_fault_backing {
+                let resident = self.pages.lock().contains_key(&page);
+                record_hardware_user_fault(backing, hardware_fault_access, resident);
+            }
             return FaultOutcome::Segv;
         }
         let backing = area.backing.clone();
@@ -1979,10 +2184,20 @@ impl VmSpace {
         let area_range = area.range.clone();
         drop(set);
 
-        if let Some(outcome) =
-            self.handle_resident_fault(page, flags, kind, publish_unchanged_mapping, profile_phases)
-        {
+        if let Some(outcome) = self.handle_resident_fault(
+            page,
+            flags,
+            kind,
+            publish_unchanged_mapping,
+            profile_phases,
+            #[cfg(feature = "performance-profile")]
+            hardware_fault_backing.map(|backing| (backing, hardware_fault_access)),
+        ) {
             return outcome;
+        }
+        #[cfg(feature = "performance-profile")]
+        if let Some(backing) = hardware_fault_backing {
+            record_hardware_user_fault(backing, hardware_fault_access, false);
         }
 
         if allow_fault_around {
@@ -2003,6 +2218,8 @@ impl VmSpace {
                             publish_unchanged_mapping,
                             false,
                             profile_phases,
+                            #[cfg(feature = "performance-profile")]
+                            false,
                         );
                     }
                 }
@@ -2589,6 +2806,10 @@ impl VmSpace {
         kind: FaultKind,
         publish_unchanged_mapping: bool,
         profile_phases: bool,
+        #[cfg(feature = "performance-profile")] hardware_fault: Option<(
+            HardwareFaultBacking,
+            HardwareFaultAccess,
+        )>,
     ) -> Option<FaultOutcome> {
         #[cfg(feature = "performance-profile")]
         let _profile =
@@ -2597,6 +2818,10 @@ impl VmSpace {
         let _ = profile_phases;
         let mut pages = self.pages.lock();
         let mapping = pages.get_mut(&page_va)?;
+        #[cfg(feature = "performance-profile")]
+        if let Some((backing, access)) = hardware_fault {
+            record_hardware_user_fault(backing, access, true);
+        }
         let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
         drop(pages);
         Some(self.finish_resident_fault(page_va, update, publish_unchanged_mapping))

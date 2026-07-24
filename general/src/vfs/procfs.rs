@@ -2512,6 +2512,8 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
     let vm_diag = crate::mm::vm_space::vm_space_diag();
     let private_file_cache_diag = crate::mm::vm_space::private_file_page_cache_diag();
     let fault_around_diag = crate::mm::vm_space::fault_around_diag();
+    #[cfg(feature = "performance-profile")]
+    let hardware_fault_diag = crate::mm::vm_space::hardware_fault_diag();
     let file_diag = vfs::file::file_diag();
     let fdtable_diag = vfs::fdtable::fdtable_diag();
     let vfs_context_diag = vfs::vfs_context_diag();
@@ -2763,6 +2765,20 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
             traps.other_fpu_saved,
             traps.other_lsx_saved,
         );
+        for backing in crate::mm::vm_space::HardwareFaultBacking::ALL {
+            for access in crate::mm::vm_space::HardwareFaultAccess::ALL {
+                let nonresident = hardware_fault_diag.count(backing, access, false);
+                let resident = hardware_fault_diag.count(backing, access, true);
+                let _ = writeln!(
+                    out,
+                    "HwUserFault{}{}: {:>8} resident {:>8}",
+                    backing.name(),
+                    access.name(),
+                    nonresident.saturating_add(resident),
+                    resident,
+                );
+            }
+        }
     }
     for class in slab_classes {
         let _ = write!(
