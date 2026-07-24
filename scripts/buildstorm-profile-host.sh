@@ -74,7 +74,7 @@ done
 [ "$poll_ms" -gt 0 ] || { echo "PROFILE_POLL_MS must be positive" >&2; exit 2; }
 case "$cpuset" in *[!0-9,-]*) echo "PROFILE_CPUSET has invalid syntax" >&2; exit 2 ;; esac
 case "$anchor" in
-    workload) ;;
+    workload|aws-object) ;;
     cargo:*)
         anchor_progress=${anchor#cargo:}
         case "$anchor_progress" in ''|*[!0-9]*) echo "invalid cargo stage anchor: $anchor" >&2; exit 2 ;; esac
@@ -89,7 +89,7 @@ case "$anchor" in
             END { exit !(ok && !bad) }
         ' || { echo "marker stage anchor must be at most 128 printable bytes" >&2; exit 2; }
         ;;
-    *) echo "PROFILE_STAGE_ANCHOR must be workload, cargo:N, or marker:TEXT" >&2; exit 2 ;;
+    *) echo "PROFILE_STAGE_ANCHOR must be workload, aws-object, cargo:N, or marker:TEXT" >&2; exit 2 ;;
 esac
 
 kernel=${PROFILE_KERNEL:-"$repo/kernel-la"}
@@ -418,6 +418,16 @@ workload_pid=$(printf '%s\n' "$marker" | sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p
 workload_start=$(printf '%s\n' "$marker" | sed -n 's/.* start_ticks=\([0-9][0-9]*\).*/\1/p')
 case "$workload_pid:$workload_start" in *[!0-9:]*|:|:*|*:) echo "profile host: malformed workload identity" >&2; exit 1 ;; esac
 
+# Arm guest filesystem stage watchers before opening Cargo's start gate. This
+# makes the first observed output artifact a reliable lower boundary instead
+# of racing host-side serial setup against an already-running workload.
+if [ "$anchor" = aws-object ]; then
+    send_line "/tmp/p/run.sh w $run_token aws-first-object &"
+    wait_for_fixed "@@PROFILE_STAGE_WATCH_READY name=aws-first-object token=$run_token" 10000 || {
+        echo "profile host: aws object stage watcher did not become ready" >&2; exit 1;
+    }
+fi
+
 # Cargo is born behind a guest-side gate. Open it before searching for an
 # anchor that requires workload output; workload/zero-warmup remains gated
 # until the measured window is fully prepared.
@@ -437,6 +447,10 @@ while [ -z "$anchor_ns" ]; do
     record_progress
     case "$anchor" in
         workload) anchor_ns=$(monotonic_ns) ;;
+        aws-object)
+            serial_after_workload_has "@@PROFILE_STAGE name=aws-first-object token=$run_token" &&
+                anchor_ns=$(monotonic_ns)
+            ;;
         cargo:*) [ -e "$run_dir/progress-$anchor_progress" ] && anchor_ns=$(monotonic_ns) ;;
         marker:*) serial_after_workload_has "$anchor_marker" && anchor_ns=$(monotonic_ns) ;;
     esac

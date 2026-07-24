@@ -5,7 +5,7 @@ set -u
 tool_mount=${PROFILE_TOOL_MOUNT:-/tmp/buildstorm-profile-tools}
 
 usage() {
-    echo "usage: $0 run <run-token> | go <run-token> | arm <run-token> | resume <run-token> | finish <run-token> | stop-token <run-token>" >&2
+    echo "usage: $0 run <run-token> | watch-stage <run-token> aws-first-object | go <run-token> | arm <run-token> | resume <run-token> | finish <run-token> | stop-token <run-token>" >&2
     exit 2
 }
 
@@ -125,7 +125,12 @@ terminate_group() {
 read_owner() {
     token=$1
     owner=/tmp/buildstorm-profile-owner-$token
-    read -r owner_pid owner_start owner_token <"$owner" 2>/dev/null || return 1
+    owner_record=$(cat "$owner" 2>/dev/null) || return 1
+    set -- $owner_record
+    [ "$#" -eq 3 ] || return 1
+    owner_pid=$1
+    owner_start=$2
+    owner_token=$3
     [ "$owner_token" = "$token" ] || return 1
     owned_process_group "$owner_pid" "$owner_start" || return 1
 }
@@ -153,6 +158,37 @@ release_workload() {
     fi
     : >"/mnt/run/buildstorm-profile-gate-$token"
     echo "@@PROFILE_GATE_OPENED token=$token"
+}
+
+watch_stage() {
+    [ "$#" -eq 2 ] || usage
+    token=$1
+    stage_name=$2
+    valid_token "$token" || usage
+    case "$stage_name" in
+        aws-first-object) ;;
+        *) usage ;;
+    esac
+    stage_root=${PROFILE_STAGE_ROOT:-/mnt}
+    case "$stage_root" in
+        /*) ;;
+        *) echo "profile runner: PROFILE_STAGE_ROOT must be absolute" >&2; return 2 ;;
+    esac
+    if ! read_owner "$token"; then
+        echo "@@PROFILE_STAGE_SKIPPED name=$stage_name reason=workload-ended token=$token"
+        return 0
+    fi
+    echo "@@PROFILE_STAGE_WATCH_READY name=$stage_name token=$token"
+    while read_owner "$token"; do
+        for object in "$stage_root"/work/tgoskits/target/debug/build/aws-lc-sys-*/out/*.o; do
+            [ -f "$object" ] || continue
+            relative=${object#"$stage_root"}
+            echo "@@PROFILE_STAGE name=$stage_name token=$token path=$relative"
+            return 0
+        done
+        sleep 0.05
+    done
+    echo "@@PROFILE_STAGE_SKIPPED name=$stage_name reason=workload-ended token=$token"
 }
 
 capture_controller() {
@@ -422,6 +458,7 @@ command=$1
 shift
 case "$command" in
     run) run_profile "$@" ;;
+    watch-stage|w) watch_stage "$@" ;;
     go|g) release_workload "$@" ;;
     arm|a) set_control start "$@" ;;
     resume|c) set_control resume "$@" ;;

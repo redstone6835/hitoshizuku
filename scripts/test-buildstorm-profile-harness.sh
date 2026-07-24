@@ -12,8 +12,12 @@ fixture=$(mktemp)
 summary_python=$(mktemp)
 summary_dir=$(mktemp -d)
 child_pid_file=$(mktemp)
+stage_root=$(mktemp -d)
+stage_watch_output=$(mktemp)
 group_pid=
-trap '[ -z "$group_pid" ] || kill -KILL "-$group_pid" 2>/dev/null || true; rm -f "$fixture" "$summary_python" "$child_pid_file" /tmp/buildstorm-profile-owner-fixture-mismatch /tmp/buildstorm-profile-owner-fixture-group; rm -rf "$summary_dir"' EXIT INT TERM
+stage_group_pid=
+stage_watch_pid=
+trap '[ -z "$stage_watch_pid" ] || kill -KILL "$stage_watch_pid" 2>/dev/null || true; [ -z "$stage_group_pid" ] || kill -KILL "-$stage_group_pid" 2>/dev/null || true; [ -z "$group_pid" ] || kill -KILL "-$group_pid" 2>/dev/null || true; rm -f "$fixture" "$summary_python" "$child_pid_file" "$stage_watch_output" /tmp/buildstorm-profile-owner-fixture-mismatch /tmp/buildstorm-profile-owner-fixture-group /tmp/buildstorm-profile-owner-fixture-stage; rm -rf "$summary_dir" "$stage_root"' EXIT INT TERM
 printf 'Compiling a\r    Building [====> ] 7/446\nnoise 63/446 then 64/446\r384/446\n440/446\r446/446\n' >"$fixture"
 actual=$("$host" --extract-progress <"$fixture")
 [ "$actual" = 446 ] || {
@@ -77,6 +81,10 @@ old-log-marker" "$host" >/dev/null 2>&1; then
     echo "validation fixture: multiline marker was accepted" >&2
     exit 1
 fi
+if PROFILE_DURATION_MS=1 PROFILE_STAGE_ANCHOR=aws-objects "$host" >/dev/null 2>&1; then
+    echo "validation fixture: invalid aws stage anchor was accepted" >&2
+    exit 1
+fi
 if PROFILE_CAPTURE=bad "$guest" run fixture-token >/dev/null 2>&1; then
     echo "validation fixture: guest accepted invalid capture mode" >&2
     exit 1
@@ -85,6 +93,62 @@ if PROFILE_EVENT_MASK='0x1;id' "$guest" run fixture-token >/dev/null 2>&1; then
     echo "validation fixture: guest accepted invalid event mask" >&2
     exit 1
 fi
+if "$guest" watch-stage fixture-token unknown-stage >/dev/null 2>&1; then
+    echo "validation fixture: guest accepted an unknown stage watcher" >&2
+    exit 1
+fi
+
+# The stage watcher must be ready before Cargo's gate opens, report exactly the
+# first aws-lc-sys object, and terminate if its owned workload disappears.
+setsid sleep 300 &
+stage_group_pid=$!
+stage_stat=$(cat "/proc/$stage_group_pid/stat")
+stage_rest=${stage_stat#*) }
+set -- $stage_rest
+stage_start=${20}
+printf '%s %s %s\n' "$stage_group_pid" "$stage_start" fixture-stage \
+    >/tmp/buildstorm-profile-owner-fixture-stage
+env PROFILE_STAGE_ROOT="$stage_root" timeout 5 "$guest" \
+    watch-stage fixture-stage aws-first-object >"$stage_watch_output" &
+stage_watch_pid=$!
+attempts=0
+while ! grep -q '^@@PROFILE_STAGE_WATCH_READY name=aws-first-object token=fixture-stage$' \
+    "$stage_watch_output" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.01
+done
+[ "$attempts" -lt 100 ] || { echo "stage fixture: watcher did not become ready" >&2; exit 1; }
+mkdir -p "$stage_root/work/tgoskits/target/debug/build/aws-lc-sys-fixture/out"
+: >"$stage_root/work/tgoskits/target/debug/build/aws-lc-sys-fixture/out/first.o"
+wait "$stage_watch_pid"
+stage_watch_pid=
+grep -q '^@@PROFILE_STAGE name=aws-first-object token=fixture-stage path=/work/tgoskits/target/debug/build/aws-lc-sys-fixture/out/first.o$' \
+    "$stage_watch_output" || { echo "stage fixture: first object marker is missing" >&2; exit 1; }
+[ "$(grep -c '^@@PROFILE_STAGE name=aws-first-object ' "$stage_watch_output")" -eq 1 ] || {
+    echo "stage fixture: object marker was not emitted exactly once" >&2
+    exit 1
+}
+rm -rf "$stage_root/work"
+: >"$stage_watch_output"
+env PROFILE_STAGE_ROOT="$stage_root" timeout 5 "$guest" \
+    watch-stage fixture-stage aws-first-object >"$stage_watch_output" &
+stage_watch_pid=$!
+attempts=0
+while ! grep -q '^@@PROFILE_STAGE_WATCH_READY name=aws-first-object token=fixture-stage$' \
+    "$stage_watch_output" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.01
+done
+[ "$attempts" -lt 100 ] || { echo "stage fixture: exit watcher did not become ready" >&2; exit 1; }
+rm -f /tmp/buildstorm-profile-owner-fixture-stage
+wait "$stage_watch_pid"
+stage_watch_pid=
+grep -q '^@@PROFILE_STAGE_SKIPPED name=aws-first-object reason=workload-ended token=fixture-stage$' \
+    "$stage_watch_output" || { echo "stage fixture: workload exit was not reported" >&2; exit 1; }
+kill -KILL "-$stage_group_pid" 2>/dev/null || true
+wait "$stage_group_pid" 2>/dev/null || true
+stage_group_pid=
+
 stop_output=$("$guest" stop 999999 1 fixture-no-owner)
 case "$stop_output" in
     'PROFILE_STOP_SKIPPED reason=missing-owner token=fixture-no-owner') ;;
