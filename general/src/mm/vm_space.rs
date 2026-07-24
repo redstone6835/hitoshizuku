@@ -3937,7 +3937,7 @@ mod tests {
 
     use super::{
         ANON_STORE_SHADOW_PAGES, AnonStoreShadowKey, AnonStoreShadowState, FILE_FAULT_AROUND_PAGES,
-        FilePageKey, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, ResidentPage,
+        FaultKind, FilePageKey, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, ResidentPage,
         ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache, access_for_private_file,
         file_fault_around_window, find_cached_private_file_page, observe_anon_store_shadow,
         permits_file_fault_around, plan_file_segment, private_file_batch_page_offset,
