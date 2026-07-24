@@ -1107,8 +1107,13 @@ impl Task {
     /// 但内核栈和 arch context 已不再需要，继续挂在 Task 上会让父进程 wait 前
     /// 每个 zombie 至少保留一段内核栈。
     pub(crate) fn retire_execution(&self) {
-        *self.ctx.lock() = None;
-        *self.kstack.lock() = None;
+        let ctx = self.ctx.lock().take();
+        let kstack = self.kstack.lock().take();
+
+        // 内核栈析构会解除堆映射并发起跨核 TLB 同步，不能在持有
+        // Task 自旋锁时执行，否则其它 CPU 可能因回收同一任务而无法响应同步。
+        drop(ctx);
+        drop(kstack);
     }
 
     /// 释放退出任务不再需要的上层扩展状态。
