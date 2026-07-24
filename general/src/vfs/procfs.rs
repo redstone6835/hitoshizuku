@@ -2511,6 +2511,7 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
     let task_diag = sched::task_diag();
     let vm_diag = crate::mm::vm_space::vm_space_diag();
     let private_file_cache_diag = crate::mm::vm_space::private_file_page_cache_diag();
+    let fault_around_diag = crate::mm::vm_space::fault_around_diag();
     let file_diag = vfs::file::file_diag();
     let fdtable_diag = vfs::fdtable::fdtable_diag();
     let vfs_context_diag = vfs::vfs_context_diag();
@@ -2629,7 +2630,13 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
          PrivateCacheHits:  {:>7}\n\
          PrivateCacheMisses:{:>6}\n\
          PrivateCacheEvict:{:>7}\n\
-         PrivateCachePressureDrops:{:>3}\n",
+         PrivateCachePressureDrops:{:>3}\n\
+         FaultAroundWindows:{:>8}\n\
+         FaultAroundRequested:{:>6}\n\
+         FaultAroundPrepared:{:>7}\n\
+         FaultAroundCommits:{:>8}\n\
+         FaultAroundInstalled:{:>6}\n\
+         FaultAroundRaced:{:>10}\n",
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(mem_available),
@@ -2719,6 +2726,12 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         private_file_cache_diag.misses,
         private_file_cache_diag.evictions,
         private_file_cache_diag.pressure_reclaims,
+        fault_around_diag.windows,
+        fault_around_diag.requested_pages,
+        fault_around_diag.prepared_pages,
+        fault_around_diag.commits,
+        fault_around_diag.installed_pages,
+        fault_around_diag.raced_commits,
     );
     for class in slab_classes {
         let _ = write!(

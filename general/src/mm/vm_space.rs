@@ -8,6 +8,8 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::Range;
+#[cfg(feature = "performance-profile")]
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use errno::Errno;
@@ -173,6 +175,104 @@ static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEnt
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FaultAroundDiag {
+    pub windows: u64,
+    pub requested_pages: u64,
+    pub prepared_pages: u64,
+    pub commits: u64,
+    pub installed_pages: u64,
+    pub raced_commits: u64,
+}
+
+#[cfg(feature = "performance-profile")]
+#[repr(align(64))]
+struct FaultAroundCpuCounters {
+    windows: AtomicU64,
+    requested_pages: AtomicU64,
+    prepared_pages: AtomicU64,
+    commits: AtomicU64,
+    installed_pages: AtomicU64,
+    raced_commits: AtomicU64,
+}
+
+#[cfg(feature = "performance-profile")]
+impl FaultAroundCpuCounters {
+    const fn new() -> Self {
+        Self {
+            windows: AtomicU64::new(0),
+            requested_pages: AtomicU64::new(0),
+            prepared_pages: AtomicU64::new(0),
+            commits: AtomicU64::new(0),
+            installed_pages: AtomicU64::new(0),
+            raced_commits: AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+static FAULT_AROUND_COUNTERS: [FaultAroundCpuCounters; sched::NR_CPUS] =
+    [const { FaultAroundCpuCounters::new() }; sched::NR_CPUS];
+
+#[cfg(feature = "performance-profile")]
+fn fault_around_cpu_counters() -> &'static FaultAroundCpuCounters {
+    &FAULT_AROUND_COUNTERS[sched::current_cpu_id().min(sched::NR_CPUS - 1)]
+}
+
+#[cfg(feature = "performance-profile")]
+#[inline]
+fn add_local_fault_around_counter(counter: &AtomicU64, delta: u64) {
+    // 当前内核不会在内核态抢占，fault-around 也不会从中断路径复入；因此每个
+    // CPU 槽只有本 CPU 单写。保留原子 load/store 允许其它 CPU 并发读取快照，
+    // 同时避免 LoongArch/QEMU 为无需竞争的 fetch_add 执行昂贵的原子 RMW。
+    let value = counter.load(Ordering::Relaxed);
+    counter.store(value.wrapping_add(delta), Ordering::Relaxed);
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_fault_around_prepare(requested: usize, prepared: usize) {
+    let counters = fault_around_cpu_counters();
+    add_local_fault_around_counter(&counters.windows, 1);
+    add_local_fault_around_counter(&counters.requested_pages, requested as u64);
+    add_local_fault_around_counter(&counters.prepared_pages, prepared as u64);
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_fault_around_commit(installed: usize, raced: bool) {
+    let counters = fault_around_cpu_counters();
+    add_local_fault_around_counter(&counters.commits, 1);
+    add_local_fault_around_counter(&counters.installed_pages, installed as u64);
+    if raced {
+        add_local_fault_around_counter(&counters.raced_commits, 1);
+    }
+}
+
+pub(crate) fn fault_around_diag() -> FaultAroundDiag {
+    let mut diag = FaultAroundDiag::default();
+    #[cfg(feature = "performance-profile")]
+    for counters in &FAULT_AROUND_COUNTERS {
+        diag.windows = diag
+            .windows
+            .saturating_add(counters.windows.load(Ordering::Relaxed));
+        diag.requested_pages = diag
+            .requested_pages
+            .saturating_add(counters.requested_pages.load(Ordering::Relaxed));
+        diag.prepared_pages = diag
+            .prepared_pages
+            .saturating_add(counters.prepared_pages.load(Ordering::Relaxed));
+        diag.commits = diag
+            .commits
+            .saturating_add(counters.commits.load(Ordering::Relaxed));
+        diag.installed_pages = diag
+            .installed_pages
+            .saturating_add(counters.installed_pages.load(Ordering::Relaxed));
+        diag.raced_commits = diag
+            .raced_commits
+            .saturating_add(counters.raced_commits.load(Ordering::Relaxed));
+    }
+    diag
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileSegmentPlan {
@@ -806,6 +906,8 @@ impl PrivateFileFaultAround {
                 Err(_) => break,
             }
         }
+        #[cfg(feature = "performance-profile")]
+        record_fault_around_prepare(pages, prepared.len());
         Ok(prepared)
     }
 
@@ -2098,6 +2200,8 @@ impl VmSpace {
         prepared: Vec<PreparedFilePage>,
     ) -> FaultAroundCommit {
         if prepared.is_empty() {
+            #[cfg(feature = "performance-profile")]
+            record_fault_around_commit(0, false);
             return FaultAroundCommit::Done(FaultOutcome::Segv);
         }
 
@@ -2120,6 +2224,8 @@ impl VmSpace {
             drop(prepared);
             // 另一 CPU 在本次 I/O 期间先发布了 PTE；当前 CPU 仍需收敛导致
             // 本次硬件 fault 的旧无效 translation。
+            #[cfg(feature = "performance-profile")]
+            record_fault_around_commit(0, true);
             self.publish_new_user_range(plan.fault_page, page_size());
             return FaultAroundCommit::Done(FaultOutcome::Fixed);
         }
@@ -2158,6 +2264,8 @@ impl VmSpace {
         // 未采用的投机页可能触发物理页回收，必须在 VMA/pages 锁外析构。
         drop(failed_candidate);
         drop(candidates);
+        #[cfg(feature = "performance-profile")]
+        record_fault_around_commit(installed, false);
 
         if installed != 0 {
             self.mapped_pages.store(mapped, Ordering::Release);
