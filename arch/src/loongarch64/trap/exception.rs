@@ -239,10 +239,9 @@ unsafe fn loongarch64_handle_exception_inner(
             // 无锁边界补做调度工作，避免本 CPU 重入锁后永久自旋。
             if !from_user {
                 sched::defer_timer_tick(now_ns);
-                if boot_cpu && general::elm_guard::active_cell() == 0 {
-                    super::super::vdso::run_net_poll_hook(now_ns);
-                    super::super::vdso::run_tty_poll_hook(now_ns);
-                }
+                // syscall 期间允许内核态中断嵌套，timer top-half 不能在这里
+                // 重入网络或 TTY poll；它们可能正由被打断的 syscall 持锁。
+                // deferred tick 会在下一个调度或用户态返回边界被消费。
                 return arg4;
             }
 
@@ -314,7 +313,19 @@ unsafe fn loongarch64_handle_exception_inner(
         // syscall 通过注入的 SyscallFrameOps 读 a7/a0-a5、写返回值、推 PC。
         // general::syscall::dispatch 本轮全部返 ENOSYS；ELF loader 那轮再逐条加 arm。
         // log::debug!("[trap] syscall id={} pc={:#x} from_user={}", tf.a7, arg0, from_user);
+        if from_user {
+            // 汇编入口已保存完整现场，内核态嵌套 trap 会继续使用当前
+            // 内核栈。在可能长时间阻塞或处理大数据的 syscall 期间恢复中断，
+            // 确保 timer、reschedule 和 TLB shootdown 不会被拖到 syscall 返回。
+            unsafe { LoongArch64InterruptOps::enable_interrupts() };
+        }
         general::syscall::dispatch(general::TrapFramePtr::new(arg4));
+        if from_user {
+            unsafe { LoongArch64InterruptOps::disable_interrupts() };
+            // 与中断关闭前可能刚发布的请求收口，避免 pending IPI
+            // 要等到下一次用户态 trap 才被确认。
+            super::super::smp::handle_ipi();
+        }
         // syscall 内部可能唤醒了其它任务或新建了子进程，并通过
         // request_resched() 标记当前 CPU 需要重调度。系统调用返回用户态前
         // 立即消费该标记，避免当前任务在同一时间片里连续启动 client，
