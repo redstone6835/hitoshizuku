@@ -475,6 +475,43 @@ struct MetricCounter {
     values: Histogram,
 }
 
+/// LoongArch 用户态陷阱入口的累计计数快照。
+///
+/// 这些计数不随 profiling 会话重置；调用方应对测量窗口前后的快照求差。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoongArchUserTrapSnapshot {
+    pub user_syscalls: u64,
+    pub user_other_traps: u64,
+    pub syscall_fpu_saved: u64,
+    pub syscall_lsx_saved: u64,
+    pub other_fpu_saved: u64,
+    pub other_lsx_saved: u64,
+}
+
+/// 每个槽只由对应 CPU 的陷阱入口写入；缓存行隔离避免不同 CPU 互相争用。
+#[repr(align(64))]
+struct LoongArchUserTrapCounters {
+    user_syscalls: AtomicU64,
+    user_other_traps: AtomicU64,
+    syscall_fpu_saved: AtomicU64,
+    syscall_lsx_saved: AtomicU64,
+    other_fpu_saved: AtomicU64,
+    other_lsx_saved: AtomicU64,
+}
+
+impl LoongArchUserTrapCounters {
+    const fn new() -> Self {
+        Self {
+            user_syscalls: AtomicU64::new(0),
+            user_other_traps: AtomicU64::new(0),
+            syscall_fpu_saved: AtomicU64::new(0),
+            syscall_lsx_saved: AtomicU64::new(0),
+            other_fpu_saved: AtomicU64::new(0),
+            other_lsx_saved: AtomicU64::new(0),
+        }
+    }
+}
+
 impl MetricCounter {
     const fn new() -> Self {
         Self {
@@ -559,6 +596,8 @@ static TRACE_SLOTS: [[TraceSlot; TRACE_SLOTS_PER_CPU]; MAX_CPUS] =
     [const { [const { TraceSlot::new() }; TRACE_SLOTS_PER_CPU] }; MAX_CPUS];
 static TRACE_HEADS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static OVERWRITTEN_TRACE_RECORDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static LOONGARCH_USER_TRAPS: [LoongArchUserTrapCounters; MAX_CPUS] =
+    [const { LoongArchUserTrapCounters::new() }; MAX_CPUS];
 
 static STATE: AtomicUsize = AtomicUsize::new(SessionState::Idle as usize);
 static SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -1387,6 +1426,64 @@ pub fn metric_snapshot(cpu: usize, metric: Metric) -> MetricSnapshot {
         max: counter.max.load(Ordering::Relaxed),
         values: counter.values.snapshot(),
     }
+}
+
+#[inline(always)]
+fn increment_raw(counter: &AtomicU64) {
+    // 每个槽只有对应 CPU 的陷阱入口写入，因而无需代价更高的原子 RMW。
+    let value = counter.load(Ordering::Relaxed);
+    counter.store(value.wrapping_add(1), Ordering::Relaxed);
+}
+
+/// 记录一次 LoongArch 用户态陷阱及入口实际保存的扩展寄存器状态。
+#[inline(always)]
+pub fn record_loongarch_user_trap(cpu: usize, syscall: bool, fpu_saved: bool, lsx_saved: bool) {
+    let Some(counters) = LOONGARCH_USER_TRAPS.get(cpu) else {
+        return;
+    };
+    if syscall {
+        increment_raw(&counters.user_syscalls);
+        if fpu_saved {
+            increment_raw(&counters.syscall_fpu_saved);
+        }
+        if lsx_saved {
+            increment_raw(&counters.syscall_lsx_saved);
+        }
+    } else {
+        increment_raw(&counters.user_other_traps);
+        if fpu_saved {
+            increment_raw(&counters.other_fpu_saved);
+        }
+        if lsx_saved {
+            increment_raw(&counters.other_lsx_saved);
+        }
+    }
+}
+
+/// 汇总所有 CPU 的 LoongArch 用户态陷阱累计计数。
+pub fn loongarch_user_trap_snapshot() -> LoongArchUserTrapSnapshot {
+    let mut snapshot = LoongArchUserTrapSnapshot::default();
+    for counters in &LOONGARCH_USER_TRAPS {
+        snapshot.user_syscalls = snapshot
+            .user_syscalls
+            .wrapping_add(counters.user_syscalls.load(Ordering::Relaxed));
+        snapshot.user_other_traps = snapshot
+            .user_other_traps
+            .wrapping_add(counters.user_other_traps.load(Ordering::Relaxed));
+        snapshot.syscall_fpu_saved = snapshot
+            .syscall_fpu_saved
+            .wrapping_add(counters.syscall_fpu_saved.load(Ordering::Relaxed));
+        snapshot.syscall_lsx_saved = snapshot
+            .syscall_lsx_saved
+            .wrapping_add(counters.syscall_lsx_saved.load(Ordering::Relaxed));
+        snapshot.other_fpu_saved = snapshot
+            .other_fpu_saved
+            .wrapping_add(counters.other_fpu_saved.load(Ordering::Relaxed));
+        snapshot.other_lsx_saved = snapshot
+            .other_lsx_saved
+            .wrapping_add(counters.other_lsx_saved.load(Ordering::Relaxed));
+    }
+    snapshot
 }
 
 pub const fn histogram_bucket(value: u64) -> usize {

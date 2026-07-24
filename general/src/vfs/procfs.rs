@@ -2745,6 +2745,25 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         fault_around_diag.raced_pages,
         fault_around_diag.map_failed_pages,
     );
+    #[cfg(feature = "performance-profile")]
+    {
+        let traps = profiling::loongarch_user_trap_snapshot();
+        let _ = write!(
+            out,
+            "ProfileLaUserSyscalls: {:>8}\n\
+             ProfileLaUserOtherTraps:{:>8}\n\
+             ProfileLaSysFpuSaved:  {:>8}\n\
+             ProfileLaSysLsxSaved:  {:>8}\n\
+             ProfileLaOtherFpuSaved:{:>8}\n\
+             ProfileLaOtherLsxSaved:{:>8}\n",
+            traps.user_syscalls,
+            traps.user_other_traps,
+            traps.syscall_fpu_saved,
+            traps.syscall_lsx_saved,
+            traps.other_fpu_saved,
+            traps.other_lsx_saved,
+        );
+    }
     for class in slab_classes {
         let _ = write!(
             out,

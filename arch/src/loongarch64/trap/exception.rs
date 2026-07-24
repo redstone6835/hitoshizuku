@@ -177,6 +177,16 @@ unsafe fn loongarch64_handle_exception_inner(
     let tf = unsafe { trap_frame_mut(arg4) };
     let from_user = (tf.status & CSR_PRMD_PPLV_MASK) != 0;
 
+    #[cfg(feature = "performance-profile")]
+    if from_user {
+        profiling::record_loongarch_user_trap(
+            LoongArch64MessageInterruptOps::current_cpu_id(),
+            ecode == ECODE_SYS,
+            tf.euen & FPU_SAVED != 0,
+            tf.euen & LSX_SAVED != 0,
+        );
+    }
+
     if ecode == ECODE_INT {
         // 对中断而言，最关键的信息是 IS 位域。与同步异常不同，中断通常不需要 BADV，
         // 且多数情况下 PC 只用于诊断，不决定恢复逻辑。
