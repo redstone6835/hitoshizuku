@@ -184,6 +184,12 @@ pub(crate) struct FaultAroundDiag {
     pub commits: u64,
     pub installed_pages: u64,
     pub raced_commits: u64,
+    pub collision_windows: u64,
+    pub duplicate_pages: u64,
+    pub discarded_unmapped_pages: u64,
+    pub vma_retry_pages: u64,
+    pub raced_pages: u64,
+    pub map_failed_pages: u64,
 }
 
 #[cfg(feature = "performance-profile")]
@@ -195,6 +201,12 @@ struct FaultAroundCpuCounters {
     commits: AtomicU64,
     installed_pages: AtomicU64,
     raced_commits: AtomicU64,
+    collision_windows: AtomicU64,
+    duplicate_pages: AtomicU64,
+    discarded_unmapped_pages: AtomicU64,
+    vma_retry_pages: AtomicU64,
+    raced_pages: AtomicU64,
+    map_failed_pages: AtomicU64,
 }
 
 #[cfg(feature = "performance-profile")]
@@ -207,6 +219,12 @@ impl FaultAroundCpuCounters {
             commits: AtomicU64::new(0),
             installed_pages: AtomicU64::new(0),
             raced_commits: AtomicU64::new(0),
+            collision_windows: AtomicU64::new(0),
+            duplicate_pages: AtomicU64::new(0),
+            discarded_unmapped_pages: AtomicU64::new(0),
+            vma_retry_pages: AtomicU64::new(0),
+            raced_pages: AtomicU64::new(0),
+            map_failed_pages: AtomicU64::new(0),
         }
     }
 }
@@ -248,6 +266,35 @@ fn record_fault_around_commit(installed: usize, raced: bool) {
     }
 }
 
+#[cfg(feature = "performance-profile")]
+fn record_fault_around_collision(duplicate: usize, discarded_unmapped: usize) {
+    let counters = fault_around_cpu_counters();
+    add_local_fault_around_counter(&counters.collision_windows, 1);
+    add_local_fault_around_counter(&counters.duplicate_pages, duplicate as u64);
+    add_local_fault_around_counter(
+        &counters.discarded_unmapped_pages,
+        discarded_unmapped as u64,
+    );
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_fault_around_vma_retry(prepared: usize) {
+    add_local_fault_around_counter(
+        &fault_around_cpu_counters().vma_retry_pages,
+        prepared as u64,
+    );
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_fault_around_raced_pages(prepared: usize) {
+    add_local_fault_around_counter(&fault_around_cpu_counters().raced_pages, prepared as u64);
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_fault_around_map_failed_pages(pages: usize) {
+    add_local_fault_around_counter(&fault_around_cpu_counters().map_failed_pages, pages as u64);
+}
+
 pub(crate) fn fault_around_diag() -> FaultAroundDiag {
     let mut diag = FaultAroundDiag::default();
     #[cfg(feature = "performance-profile")]
@@ -270,6 +317,24 @@ pub(crate) fn fault_around_diag() -> FaultAroundDiag {
         diag.raced_commits = diag
             .raced_commits
             .saturating_add(counters.raced_commits.load(Ordering::Relaxed));
+        diag.collision_windows = diag
+            .collision_windows
+            .saturating_add(counters.collision_windows.load(Ordering::Relaxed));
+        diag.duplicate_pages = diag
+            .duplicate_pages
+            .saturating_add(counters.duplicate_pages.load(Ordering::Relaxed));
+        diag.discarded_unmapped_pages = diag
+            .discarded_unmapped_pages
+            .saturating_add(counters.discarded_unmapped_pages.load(Ordering::Relaxed));
+        diag.vma_retry_pages = diag
+            .vma_retry_pages
+            .saturating_add(counters.vma_retry_pages.load(Ordering::Relaxed));
+        diag.raced_pages = diag
+            .raced_pages
+            .saturating_add(counters.raced_pages.load(Ordering::Relaxed));
+        diag.map_failed_pages = diag
+            .map_failed_pages
+            .saturating_add(counters.map_failed_pages.load(Ordering::Relaxed));
     }
     diag
 }
@@ -2207,11 +2272,15 @@ impl VmSpace {
 
         let set = self.vmas.lock();
         let Some(area) = set.find(plan.fault_page) else {
+            #[cfg(feature = "performance-profile")]
+            record_fault_around_vma_retry(prepared.len());
             drop(set);
             drop(prepared);
             return FaultAroundCommit::Retry;
         };
         if !plan.matches_area(area) {
+            #[cfg(feature = "performance-profile")]
+            record_fault_around_vma_retry(prepared.len());
             drop(set);
             drop(prepared);
             return FaultAroundCommit::Retry;
@@ -2219,6 +2288,8 @@ impl VmSpace {
 
         let mut pages = self.pages.lock();
         if pages.contains_key(&plan.fault_page) {
+            #[cfg(feature = "performance-profile")]
+            record_fault_around_raced_pages(prepared.len());
             drop(pages);
             drop(set);
             drop(prepared);
@@ -2230,10 +2301,22 @@ impl VmSpace {
             return FaultAroundCommit::Done(FaultOutcome::Fixed);
         }
 
+        #[cfg(feature = "performance-profile")]
+        let prepared_len = prepared.len();
         let prefix_len =
             unmapped_prefix_len(prepared.iter().map(|candidate| candidate.vaddr), |vaddr| {
                 pages.contains_key(&vaddr)
             });
+        #[cfg(feature = "performance-profile")]
+        if prefix_len != prepared_len {
+            let suffix_start = prepared[prefix_len].vaddr;
+            let suffix_end = prepared
+                .last()
+                .and_then(|candidate| candidate.vaddr.checked_add(page_size()))
+                .unwrap_or(suffix_start);
+            let duplicate = pages.range(suffix_start..suffix_end).count();
+            record_fault_around_collision(duplicate, prepared_len - prefix_len - duplicate);
+        }
         let mut installed = 0usize;
         let mut map_error = None;
         let mut candidates = prepared.into_iter();
@@ -2264,6 +2347,10 @@ impl VmSpace {
         // 未采用的投机页可能触发物理页回收，必须在 VMA/pages 锁外析构。
         drop(failed_candidate);
         drop(candidates);
+        #[cfg(feature = "performance-profile")]
+        if installed != prefix_len {
+            record_fault_around_map_failed_pages(prefix_len - installed);
+        }
         #[cfg(feature = "performance-profile")]
         record_fault_around_commit(installed, false);
 

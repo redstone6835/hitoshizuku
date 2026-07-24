@@ -2636,7 +2636,13 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
          FaultAroundPrepared:{:>7}\n\
          FaultAroundCommits:{:>8}\n\
          FaultAroundInstalled:{:>6}\n\
-         FaultAroundRaced:{:>10}\n",
+         FaultAroundRaced:{:>10}\n\
+         FaultAroundCollisionWindows:{:>1}\n\
+         FaultAroundDuplicatePages:{:>4}\n\
+         FaultAroundDiscardedUnmapped:{:>1}\n\
+         FaultAroundVmaRetryPages:{:>3}\n\
+         FaultAroundRacedPages:{:>7}\n\
+         FaultAroundMapFailedPages:{:>3}\n",
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(mem_available),
@@ -2732,6 +2738,12 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         fault_around_diag.commits,
         fault_around_diag.installed_pages,
         fault_around_diag.raced_commits,
+        fault_around_diag.collision_windows,
+        fault_around_diag.duplicate_pages,
+        fault_around_diag.discarded_unmapped_pages,
+        fault_around_diag.vma_retry_pages,
+        fault_around_diag.raced_pages,
+        fault_around_diag.map_failed_pages,
     );
     for class in slab_classes {
         let _ = write!(
