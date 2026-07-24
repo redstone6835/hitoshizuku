@@ -15,7 +15,7 @@ use core::any::Any;
 use core::mem::size_of;
 
 use errno::Errno;
-use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
+use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user, user_pgd_ops};
 use general::vfs::{
     Credentials, Dentry, FdTable, FileMode, Mount, MountNamespace, VfsContext, VfsLimits, VfsRoot,
     build_boot_vfs_parts,
@@ -196,13 +196,18 @@ static PRE_EXIT_HOOK: KernelPreExitHook = KernelPreExitHook;
 //
 // sched 在 schedule_once 切换到 next 前调此回调；本函数从 next 的 ext 表
 // 里找 TASKEXT_VM_SPACE payload，若在 → downcast 成 VmSpace 再 activate。
-// 没挂（纯 kthread 或 init）→ no-op。
+// 没挂（idle、纯 kthread 或 init）时必须切回内核页表，不能继续沿用
+// 上一个用户任务可能即将回收的 PGD。
 
 fn vm_on_switch(next: &Arc<Task>) {
     if let Some(payload) = next.ext_lookup(TASKEXT_VM_SPACE) {
         if let Ok(vm) = payload.downcast::<VmSpace>() {
             vm.activate();
+            return;
         }
+    }
+    if let Some(ops) = user_pgd_ops() {
+        unsafe { (ops.activate_kernel)() };
     }
 }
 
