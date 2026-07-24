@@ -378,9 +378,26 @@ impl FlowShard {
         control_sequence: u64,
         now_ns: u64,
     ) -> Result<FlowId, TcpBindError> {
-        let id = self
-            .tcp
-            .connect(local, remote, path, facade, control_sequence, now_ns)?;
+        let id = self.tcp.connect(
+            local,
+            remote,
+            path,
+            Arc::clone(&facade),
+            control_sequence,
+            now_ns,
+        )?;
+        // 回环 SYN 可能在内核消费本轮返回的命令元数据前完成握手。必须先发布
+        // 稳定的 facade 绑定，再允许握手唤醒向用户态暴露已连接状态。
+        facade.publish_binding(
+            OwnerRef::Flow {
+                shard: self.id,
+                flow: id,
+                generation: facade.generation(),
+            },
+            local,
+            Some(remote),
+            Some(path.route.interface),
+        );
         self.reschedule_tcp(id);
         Ok(id)
     }
