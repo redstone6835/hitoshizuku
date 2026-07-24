@@ -2049,6 +2049,32 @@ impl VmSpace {
         }
     }
 
+    /// 预先解析一段已注册用户 VMA 覆盖的全部页。
+    ///
+    /// 本函数不创建或扩展 VMA，只为区间相交页完成匿名分配、文件读入或 COW；
+    /// 适合在首次进入用户态前保证内核即将直接写入的少量页面已经驻留。
+    pub fn prefault_user_range(&self, range: Range<usize>, write: bool) -> Result<(), Errno> {
+        if range.start >= range.end {
+            return Ok(());
+        }
+        let page_size = page_size();
+        let end = align_up(range.end, page_size).ok_or(Errno::EFAULT)?;
+        let kind = if write {
+            FaultKind::Store
+        } else {
+            FaultKind::Load
+        };
+        let mut page = page_base(range.start);
+        while page < end {
+            match self.ensure_page_access(page, kind) {
+                FaultOutcome::Fixed => {}
+                FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
+            }
+            page = page.checked_add(page_size).ok_or(Errno::EFAULT)?;
+        }
+        Ok(())
+    }
+
     /// 从已经常驻的用户页原子读取一个 u32，不触发缺页或分配。
     ///
     /// 调用方应先在普通上下文中完成 fault-in。该接口只用于已经持有其它子系统

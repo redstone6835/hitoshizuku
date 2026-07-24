@@ -212,3 +212,22 @@ fn private_page_cache_identity_is_unique_across_inode_lifetimes() {
     assert_ne!(first_key, replacement.private_page_cache_key());
     assert_ne!(second_key, replacement.private_page_cache_key());
 }
+
+#[ktest]
+fn combined_write_metadata_update_keeps_atime_and_shares_timestamp() {
+    let inode = regular_inode();
+    let atime = Timespec {
+        secs: 123,
+        nsecs: 456,
+    };
+    inode.set_times(Some(atime), None);
+
+    inode.set_size_blocks_and_modified(8192, 16);
+
+    let stat = inode.stat().unwrap();
+    assert_eq!(inode.size(), 8192);
+    assert_eq!(stat.size, 8192);
+    assert_eq!(stat.blocks, 16);
+    assert_eq!(stat.atime, atime);
+    assert_eq!(stat.mtime, stat.ctime);
+}

@@ -536,6 +536,21 @@ impl Inode {
         self.cached_size.store(new_size, Ordering::Release);
     }
 
+    /// 同时发布常规写入后的大小、块数与修改时间。
+    ///
+    /// 文件系统已经完成数据写入后使用此入口，可把原本分散的三次元数据加锁和
+    /// 两次时钟读取合并为一次。`mtime` 与 `ctime` 取同一个时间点，`atime` 以及
+    /// 所有权、权限和链接计数保持不变。
+    pub fn set_size_blocks_and_modified(&self, new_size: u64, blocks: u64) {
+        let mut meta = self.meta.lock();
+        let now = Timespec::now();
+        meta.size = new_size;
+        meta.blocks = blocks;
+        meta.mtime = now;
+        meta.ctime = now;
+        self.cached_size.store(new_size, Ordering::Release);
+    }
+
     /// 设置硬链接计数。
     pub fn set_nlink(&self, new_nlink: u32) {
         let mut meta = self.meta.lock();
