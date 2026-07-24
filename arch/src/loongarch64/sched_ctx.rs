@@ -111,8 +111,12 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
 /// `prev` 和 `next` 必须指向两个**独立**的、已初始化过的 `KernelContext`
 /// 缓冲（`next` 可以是从未跑过的新线程——那种情况下 `ra` 指向 trampoline）。
 #[unsafe(naked)]
-unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
-    // LoongArch64 传参：$a0 = prev, $a1 = next
+unsafe extern "C" fn switch_context(
+    _prev: NonNull<u8>,
+    _next: NonNull<u8>,
+    _prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
+) {
+    // LoongArch64 传参：$a0 = prev, $a1 = next, $a2 = prev_on_cpu
     // 我们把 ra/sp/s0..s9 全部保存/恢复。fp ($r22) 在我们的命名里是 s9。
     core::arch::naked_asm!(
         // ── 保存 prev ────────────────────────────────────────────────
@@ -128,6 +132,10 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         "st.d  $r29, $a0, {s6_off}",
         "st.d  $r30, $a0, {s7_off}",
         "st.d  $r31, $a0, {s8_off}",
+
+        // 只有保存完整上下文后，远端 CPU 才能认领并恢复 prev。
+        "dbar 0",
+        "st.d  $zero, $a2, 0",
 
         // ── 恢复 next ────────────────────────────────────────────────
         "ld.d  $r1,  $a1, {ra_off}",

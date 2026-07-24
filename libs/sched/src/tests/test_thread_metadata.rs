@@ -23,7 +23,17 @@ unsafe fn init_test_context(
 ) {
 }
 
-unsafe extern "C" fn switch_test_context(_prev: NonNull<u8>, _next: NonNull<u8>) {}
+unsafe extern "C" fn switch_test_context(
+    _prev: NonNull<u8>,
+    _next: NonNull<u8>,
+    prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
+) {
+    unsafe {
+        prev_on_cpu
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release)
+    };
+}
 
 static TEST_ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     context_size: 16,
@@ -203,6 +213,26 @@ fn runqueue_pick_respects_cpu_affinity_mask() {
 
     assert!(rq.dequeue(&task0, 3));
     assert!(rq.dequeue(&task1, 3));
+}
+
+#[ktest]
+fn runqueue_reports_task_waiting_for_context_release() {
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(1).bits());
+    assert!(task.try_claim_cpu(0));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq.has_ownership_blocked(CpuMask::single_raw(1).bits()));
+    assert!(!rq.has_ownership_blocked(CpuMask::single_raw(0).bits()));
+
+    unsafe {
+        task.on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    assert!(!rq.has_ownership_blocked(CpuMask::single_raw(1).bits()));
+    assert!(rq.dequeue(&task, 2));
 }
 
 #[ktest]

@@ -610,6 +610,9 @@ pub struct Task {
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
     current_cpu: AtomicUsize,
+    /// 当前仍在执行或尚未完成上下文保存的 CPU，加一编码；零表示不在 CPU 上。
+    /// 该所有权只能在切换汇编保存完全部被调用者保存寄存器后释放。
+    on_cpu: AtomicUsize,
     /// CPU、调度域、拓扑代际和迁移状态的一致调度归属快照。
     placement: TaskPlacement,
     /// 硬 IRQ 延迟唤醒链表节点。queued 位合并同一任务的重复唤醒，额外 Arc
@@ -721,6 +724,7 @@ impl Task {
             sched_reset_on_fork: AtomicBool::new(false),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
+            on_cpu: AtomicUsize::new(0),
             placement: TaskPlacement::unbound(),
             deferred_wake_next: AtomicPtr::new(core::ptr::null_mut()),
             deferred_wake_queued: AtomicBool::new(false),
@@ -794,6 +798,26 @@ impl Task {
     /// 直接覆盖状态。仅供调度器内部在已经建立同步关系（持有 rq 锁或 CAS 成功）后使用。
     pub(crate) fn set_state(&self, new_state: TaskState) {
         self.state.store(new_state as u8, Ordering::Release);
+    }
+
+    /// 返回仍拥有本任务执行上下文的 CPU。即使任务已经进入 Runnable，保存动作
+    /// 完成前也必须继续报告 Some，防止另一 CPU 提前恢复同一份上下文。
+    pub fn running_cpu(&self) -> Option<usize> {
+        self.on_cpu.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    pub(crate) fn try_claim_cpu(&self, cpu_id: usize) -> bool {
+        let encoded = cpu_id
+            .checked_add(1)
+            .expect("[sched][task] cpu id encoding overflow");
+        self.on_cpu
+            .compare_exchange(0, encoded, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// 供架构上下文切换汇编在保存完寄存器后执行 release store。
+    pub(crate) fn on_cpu_slot(&self) -> NonNull<AtomicUsize> {
+        NonNull::from(&self.on_cpu)
     }
 
     /// CAS 状态，成功时返回 `true`。用于 wakeup 路径无锁切换。

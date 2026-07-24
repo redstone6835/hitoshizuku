@@ -282,6 +282,22 @@ impl Runqueue {
         class_load_locked(&inner, None, true)
     }
 
+    /// 是否存在已允许在目标 CPU 运行、但源 CPU 尚未完成上下文保存的就绪任务。
+    ///
+    /// 这种状态只应持续到源 CPU 的切换汇编释放执行所有权。目标 CPU 不能恢复
+    /// 该任务，也不能在消费一次迁移 IPI 后直接进入无期限硬件等待。
+    pub(crate) fn has_ownership_blocked(&self, cpu_mask: u64) -> bool {
+        let inner = self.inner.lock();
+        let blocked = |task: &Arc<Task>| {
+            task_can_enter_runqueue(task)
+                && task.cpu_affinity() & cpu_mask != 0
+                && task.running_cpu().is_some()
+        };
+        inner.fair_tree.values().any(blocked)
+            || inner.rt_tree.values().any(blocked)
+            || inner.deadline_tree.values().any(blocked)
+    }
+
     /// 对指定 CPU 许可位可迁移的就绪负载。
     ///
     /// 亲和性收窄后，任务可能短暂留在旧 CPU 的 rq 中；负载均衡只应选择
@@ -816,6 +832,9 @@ fn pick_fair_locked(
 
 fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
     (task.cpu_affinity() & cpu_mask) != 0
+        && task
+            .running_cpu()
+            .is_none_or(|cpu| cpu < u64::BITS as usize && (cpu_mask & (1u64 << cpu)) != 0)
 }
 
 fn task_can_enter_runqueue(task: &Arc<Task>) -> bool {
@@ -983,7 +1002,9 @@ fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Op
         .fair_tree
         .iter()
         .rev()
-        .find(|(_, task)| (task.cpu_affinity() & allowed_cpu_mask) != 0)
+        .find(|(_, task)| {
+            task.running_cpu().is_none() && (task.cpu_affinity() & allowed_cpu_mask) != 0
+        })
         .map(|(key, _)| *key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
@@ -997,7 +1018,9 @@ fn take_rt_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Opti
         .rt_tree
         .iter()
         .rev()
-        .find(|(_, task)| (task.cpu_affinity() & allowed_cpu_mask) != 0)
+        .find(|(_, task)| {
+            task.running_cpu().is_none() && (task.cpu_affinity() & allowed_cpu_mask) != 0
+        })
         .map(|(key, _)| *key)?;
     let task = inner.rt_tree.remove(&key)?;
     task.sched.set_on_rq(false);
@@ -1012,7 +1035,9 @@ fn take_deadline_migratable_locked(
         .deadline_tree
         .iter()
         .rev()
-        .find(|(_, task)| (task.cpu_affinity() & allowed_cpu_mask) != 0)
+        .find(|(_, task)| {
+            task.running_cpu().is_none() && (task.cpu_affinity() & allowed_cpu_mask) != 0
+        })
         .map(|(key, _)| *key)?;
     let task = inner.deadline_tree.remove(&key)?;
     task.sched.set_on_rq(false);

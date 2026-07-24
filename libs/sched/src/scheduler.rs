@@ -344,6 +344,10 @@ pub fn init() -> Arc<Task> {
     // 6) 登记为 CPU 0 的 current。其它核的 CpuSchedState 保持空槽，
     //    直到 AP 启动路径落地时各自 `adopt_current_context`。
     bind_task_to_cpu(&init_task, 0);
+    assert!(
+        init_task.try_claim_cpu(0),
+        "[sched][init] init task CPU ownership already claimed"
+    );
     SCHEDULER
         .cpu_or_boot(0)
         .runqueue()
@@ -1152,6 +1156,9 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
     }
     mark_cpu_online(cpu_id)?;
     bind_task_to_cpu(&task, cpu_id);
+    if !task.try_claim_cpu(cpu_id) {
+        return Err(errno::Errno::EBUSY);
+    }
     if task.arch_context().is_none() {
         task.adopt_current_context();
     }
@@ -1530,6 +1537,7 @@ fn enqueue_task_locked_with_hint(task: Arc<Task>, now_ns: u64, cpu_hint: usize) 
         .unwrap_or_else(CpuId::boot)
         .get();
     task.set_current_cpu(cpu_id);
+    bind_task_to_cpu(&task, cpu_id);
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
     if cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns) {
         cpu_state.request_resched();
@@ -2380,10 +2388,8 @@ pub fn schedule_once(now_ns: u64) {
 
     // 2. 挑下一个；pick_next 会把 prev 放回 tree（若仍 runnable）。若 prev 的
     //    亲和性已经排除本 CPU，此时它已稳定停在旧 rq，可通知目标 CPU 拉取。
-    let next = match cpu_state
-        .runqueue()
-        .pick_next_on(now_ns, CpuMask::single_raw(cpu_id).bits())
-    {
+    let cpu_mask = CpuMask::single_raw(cpu_id).bits();
+    let next = match cpu_state.runqueue().pick_next_on(now_ns, cpu_mask) {
         Some(t) => t,
         None => {
             // 队列空：回落到本核 idle。idle 未安装则保持 prev 不切。
@@ -2392,6 +2398,9 @@ pub fn schedule_once(now_ns: u64) {
                 return;
             };
             if Arc::ptr_eq(&idle, &prev) {
+                if cpu_state.runqueue().has_ownership_blocked(cpu_mask) {
+                    cpu_state.request_resched();
+                }
                 return;
             }
             assert!(
@@ -2403,12 +2412,25 @@ pub fn schedule_once(now_ns: u64) {
             idle
         }
     };
+    if cpu_state.runqueue().has_ownership_blocked(cpu_mask) {
+        // 迁移任务可能先进入目标 rq，源 CPU 随后才在切换汇编中释放执行所有权。
+        // 保留 resched 可让目标 idle 在这个极短窗口内重试，避免一次 IPI 被提前
+        // 消费后任务永久滞留在目标 rq。
+        cpu_state.request_resched();
+    }
     migrate_local_ineligible_or_request_balance(&prev, cpu_id);
 
     // 3. 自己被选回：继续跑即可。
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    assert!(
+        next.try_claim_cpu(cpu_id),
+        "[sched] selected task is still owned by cpu {:?}: pid={:?} target_cpu={}",
+        next.running_cpu(),
+        next.pid_root(),
+        cpu_id,
+    );
     prev.mark_rseq_event(crate::rseq::RseqEvent::Preempt);
     let account_now_ns = if now_ns == 0 {
         now_ns_internal()
@@ -2473,14 +2495,15 @@ pub fn schedule_once(now_ns: u64) {
 
     // 9. 切换。
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
+    let prev_on_cpu = prev.on_cpu_slot();
     unsafe {
         if final_prev {
             drop(next);
             retire_final_task(cpu_id, prev);
-            (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
+            (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx, prev_on_cpu);
             core::hint::unreachable_unchecked();
         } else {
-            (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
+            (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx, prev_on_cpu);
         }
     }
     // 被切回后正常返回。

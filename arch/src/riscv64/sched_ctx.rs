@@ -60,7 +60,11 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
+unsafe extern "C" fn switch_context(
+    _prev: NonNull<u8>,
+    _next: NonNull<u8>,
+    _prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
+) {
     core::arch::naked_asm!(
         // fast syscall 可在内部阻塞并切走，随后从同一内核调用点继续。递增 per-hart
         // 序号，使返回汇编能够判断硬件 FPR 是否可能已被其它任务替换。
@@ -82,6 +86,10 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         "sd s9,  {s9}(a0)",
         "sd s10, {s10}(a0)",
         "sd s11, {s11}(a0)",
+
+        // 只有保存完整上下文后，远端 CPU 才能认领并恢复 prev。
+        "fence rw, w",
+        "sd zero, 0(a2)",
 
         "ld ra,  {ra}(a1)",
         "ld sp,  {sp}(a1)",
