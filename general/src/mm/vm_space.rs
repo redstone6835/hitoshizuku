@@ -296,7 +296,10 @@ fn record_fault_around_map_failed_pages(pages: usize) {
 }
 
 pub(crate) fn fault_around_diag() -> FaultAroundDiag {
+    #[cfg(feature = "performance-profile")]
     let mut diag = FaultAroundDiag::default();
+    #[cfg(not(feature = "performance-profile"))]
+    let diag = FaultAroundDiag::default();
     #[cfg(feature = "performance-profile")]
     for counters in &FAULT_AROUND_COUNTERS {
         diag.windows = diag
@@ -954,7 +957,11 @@ impl PrivateFileFaultAround {
     /// 在不持有 VMA/pages 锁时分配并读取连续候选页。
     ///
     /// 故障页失败沿用普通 fault 的错误；邻页属于投机行为，首次失败即缩短窗口。
-    fn prepare(&self) -> Result<Vec<PreparedFilePage>, Errno> {
+    fn prepare(&self, profile_phases: bool) -> Result<Vec<PreparedFilePage>, Errno> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultPrepare));
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = profile_phases;
         let page_size = page_size();
         let pages = (self.end - self.fault_page) / page_size;
         let mut prepared = Vec::with_capacity(pages);
@@ -1830,12 +1837,12 @@ impl VmSpace {
 
     /// page-fault 分派进来的入口。按 VMA backing / 权限决定该做什么。
     pub fn handle_fault(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
-        self.handle_fault_inner(addr, kind, true, true)
+        self.handle_fault_inner(addr, kind, true, true, true)
     }
 
     /// 预解析用户页访问，但不把已驻留页当作硬件缓存了无效 translation。
     fn ensure_page_access(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
-        self.handle_fault_inner(addr, kind, false, false)
+        self.handle_fault_inner(addr, kind, false, false, false)
     }
 
     fn handle_fault_inner(
@@ -1844,6 +1851,7 @@ impl VmSpace {
         kind: FaultKind,
         publish_unchanged_mapping: bool,
         allow_fault_around: bool,
+        profile_phases: bool,
     ) -> FaultOutcome {
         if user_pgd_ops().is_none() {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
@@ -1863,7 +1871,7 @@ impl VmSpace {
                 .backing
                 .clone();
             drop(set);
-            return self.commit_fault_page(page, backing, flags, page, kind);
+            return self.commit_fault_page(page, backing, flags, page, kind, profile_phases);
         };
         if !permits(area.flags, kind) {
             return FaultOutcome::Segv;
@@ -1875,7 +1883,7 @@ impl VmSpace {
         drop(set);
 
         if let Some(outcome) =
-            self.handle_resident_fault(page, flags, kind, publish_unchanged_mapping)
+            self.handle_resident_fault(page, flags, kind, publish_unchanged_mapping, profile_phases)
         {
             return outcome;
         }
@@ -1883,11 +1891,11 @@ impl VmSpace {
         if allow_fault_around {
             if let Some(plan) = PrivateFileFaultAround::new(page, area_range, flags, &backing, kind)
             {
-                let prepared = match plan.prepare() {
+                let prepared = match plan.prepare(profile_phases) {
                     Ok(prepared) => prepared,
                     Err(err) => return fault_from_errno(err),
                 };
-                match self.commit_private_file_fault_around(&plan, prepared) {
+                match self.commit_private_file_fault_around(&plan, prepared, profile_phases) {
                     FaultAroundCommit::Done(outcome) => return outcome,
                     FaultAroundCommit::Retry => {
                         // VMA 在锁外 I/O 期间发生变化；只重试普通单页路径，避免在
@@ -1897,13 +1905,14 @@ impl VmSpace {
                             kind,
                             publish_unchanged_mapping,
                             false,
+                            profile_phases,
                         );
                     }
                 }
             }
         }
 
-        self.commit_fault_page(page, backing, flags, area_start, kind)
+        self.commit_fault_page(page, backing, flags, area_start, kind, profile_phases)
     }
 
     /// 取得从用户地址读取的一页内连续窗口。
@@ -2263,7 +2272,12 @@ impl VmSpace {
         &self,
         plan: &PrivateFileFaultAround,
         prepared: Vec<PreparedFilePage>,
+        profile_phases: bool,
     ) -> FaultAroundCommit {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultCommit));
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = profile_phases;
         if prepared.is_empty() {
             #[cfg(feature = "performance-profile")]
             record_fault_around_commit(0, false);
@@ -2374,7 +2388,12 @@ impl VmSpace {
         flags: VmFlags,
         area_start: usize,
         kind: FaultKind,
+        profile_phases: bool,
     ) -> FaultOutcome {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultSingle));
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = profile_phases;
         let page = match backing {
             VmBacking::Anon { .. } => alloc_zeroed_user_page()
                 .map(ResidentPage::new_anon)
@@ -2446,7 +2465,13 @@ impl VmSpace {
         flags: VmFlags,
         kind: FaultKind,
         publish_unchanged_mapping: bool,
+        profile_phases: bool,
     ) -> Option<FaultOutcome> {
+        #[cfg(feature = "performance-profile")]
+        let _profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = profile_phases;
         let mut pages = self.pages.lock();
         let mapping = pages.get_mut(&page_va)?;
         let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);

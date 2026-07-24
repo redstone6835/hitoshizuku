@@ -78,3 +78,9 @@ BuildStorm 在 300 秒内会创建约 4,000–4,500 个 `VmSpace`。旧切换路
 提交损失进一步拆成 VMA retry、真实 fault race、首碰撞后已存在的 PTE、碰撞后的空洞和页表失败，并要求静止增量满足 `Prepared = Installed + VmaRetryPages + RacedPages + DuplicatePages + DiscardedUnmapped + MapFailedPages`。60 秒诊断样本精确闭合为 `1606098 = 955798 + 0 + 192 + 643154 + 6954 + 0`；`55190/101533` 个窗口发生首碰撞，未安装页的 `98.90%` 已有 PTE，真正被连续前缀策略丢弃的空洞仅 `1.07%`。
 
 曾尝试在 prepare 前按首个 resident PTE 截窗；它把短样本的 collision/duplicate 降为 0，但没有改变每窗口实际安装页数，只省掉了热文件缓存命中。三轮 300 秒 Cargo 64 milestone 为 `223.97s / 208.94s / 217.62s`，均值 `216.84s`、CV `2.84%`，相对 ASID 基线均值 `209.75s` 稳定退化 `3.38%`，比较脚本返回 `accepted: false`；末进度均值也从 `92.67` 降到 `89.67`。该改动已回退。后续不得把 `Prepared - Installed` 直接视为等量 I/O 浪费，应转向不可避免的 PTE 安装、真实 cache miss 和 page-fault 分段耗时。
+
+## Page-fault 分段模型
+
+profiling event 36–39 追加为 `page_fault_resident`、`prepare`、`commit` 和 `single`，不改变既有 event ID。它们只在真实硬件 fault 路径记录；`ensure_page_access` 触发的软件 prefault 不进入分段。使用 `PROFILE_EVENT_MASK=0xf008000000` 可只开启总 page fault 与四个子阶段，四个子阶段彼此不嵌套，但 prepare/single 内仍包含 VFS/block 子调用。
+
+60 秒 counts-only 样本中，总 page fault 估算 on-CPU 为 `157.50s`；prepare `77.87s`（`49.4%`）、single `41.28s`（`26.2%`）、commit `9.97s`（`6.3%`）、resident `9.56s`（`6.1%`），未覆盖的 VMA 查找与分派约 `18.81s`。prepare 的 `94,934` 次调用完成 `1,544,952` 页，其中私有缓存 hit/miss 为 `1,272,520 / 66,473`。下一步应拆分 prepare 的 cache hit 查找和真实 miss 读页，不能把 PTE commit 当作当前第一热点。

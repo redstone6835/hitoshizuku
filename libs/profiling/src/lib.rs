@@ -99,6 +99,10 @@ pub enum Event {
     WaitProcessExit,
     WaitVfork,
     WaitBlockIo,
+    PageFaultResident,
+    PageFaultPrepare,
+    PageFaultCommit,
+    PageFaultSingle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +133,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 40] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -166,6 +170,10 @@ impl Event {
         Self::WaitProcessExit,
         Self::WaitVfork,
         Self::WaitBlockIo,
+        Self::PageFaultResident,
+        Self::PageFaultPrepare,
+        Self::PageFaultCommit,
+        Self::PageFaultSingle,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -206,6 +214,10 @@ impl Event {
             Self::WaitProcessExit => "wait_process_exit",
             Self::WaitVfork => "wait_vfork",
             Self::WaitBlockIo => "wait_block_io",
+            Self::PageFaultResident => "page_fault_resident",
+            Self::PageFaultPrepare => "page_fault_prepare",
+            Self::PageFaultCommit => "page_fault_commit",
+            Self::PageFaultSingle => "page_fault_single",
         }
     }
 
@@ -247,7 +259,11 @@ impl Event {
             | Self::WaitBlockIo
             | Self::WakeupLatency => EventCategory::Wait,
             Self::VfsRead | Self::VfsWrite => EventCategory::Filesystem,
-            Self::PageFault => EventCategory::Memory,
+            Self::PageFault
+            | Self::PageFaultResident
+            | Self::PageFaultPrepare
+            | Self::PageFaultCommit
+            | Self::PageFaultSingle => EventCategory::Memory,
             Self::IrqDispatch => EventCategory::Interrupt,
             Self::BlockSubmit | Self::BlockDrain | Self::BlockComplete | Self::BlockWait => {
                 EventCategory::Block
@@ -1976,7 +1992,13 @@ mod tests {
         assert_eq!(Event::WaitProcessExit as usize, 33);
         assert_eq!(Event::WaitVfork as usize, 34);
         assert_eq!(Event::WaitBlockIo as usize, 35);
-        assert_eq!(Event::ALL.len(), 36);
+        assert_eq!(Event::PageFaultResident as usize, 36);
+        assert_eq!(Event::PageFaultPrepare as usize, 37);
+        assert_eq!(Event::PageFaultCommit as usize, 38);
+        assert_eq!(Event::PageFaultSingle as usize, 39);
+        assert_eq!(Event::ALL.len(), 40);
+        assert_eq!(Event::from_id(36), Some(Event::PageFaultResident));
+        assert_eq!(Event::from_id(39), Some(Event::PageFaultSingle));
         assert_eq!(Event::from_id(33), Some(Event::WaitProcessExit));
         assert_eq!(Event::from_id(34), Some(Event::WaitVfork));
         assert_eq!(Event::from_id(35), Some(Event::WaitBlockIo));
