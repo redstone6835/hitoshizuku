@@ -2514,6 +2514,7 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
     let fault_around_diag = crate::mm::vm_space::fault_around_diag();
     #[cfg(feature = "performance-profile")]
     let hardware_fault_diag = crate::mm::vm_space::hardware_fault_diag();
+    let anon_store_shadow_diag = crate::mm::vm_space::anon_store_shadow_diag();
     let file_diag = vfs::file::file_diag();
     let fdtable_diag = vfs::fdtable::fdtable_diag();
     let vfs_context_diag = vfs::vfs_context_diag();
@@ -2644,7 +2645,11 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
          FaultAroundDiscardedUnmapped:{:>1}\n\
          FaultAroundVmaRetryPages:{:>3}\n\
          FaultAroundRacedPages:{:>7}\n\
-         FaultAroundMapFailedPages:{:>3}\n",
+         FaultAroundMapFailedPages:{:>3}\n\
+         AnonStoreShadowFaults:{:>6}\n\
+         AnonStoreShadowBatches:{:>5}\n\
+         AnonStoreShadowWouldSave:{:>3}\n\
+         AnonStoreShadowResets:{:>7}\n",
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(mem_available),
@@ -2746,6 +2751,10 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         fault_around_diag.vma_retry_pages,
         fault_around_diag.raced_pages,
         fault_around_diag.map_failed_pages,
+        anon_store_shadow_diag.faults,
+        anon_store_shadow_diag.simulated_batches,
+        anon_store_shadow_diag.would_save,
+        anon_store_shadow_diag.migration_interleave_resets,
     );
     #[cfg(feature = "performance-profile")]
     {

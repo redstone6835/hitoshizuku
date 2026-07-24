@@ -235,6 +235,9 @@ static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
 static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
 static DEFERRED_TIMER_TICK_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+/// 每 CPU current task 的发布代际，仅供低扰动性能影子模型识别调度插入。
+#[cfg(feature = "performance-profile")]
+static CURRENT_TASK_EPOCH: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────────────
 
@@ -248,6 +251,12 @@ fn cpu() -> usize {
 
 fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
     SCHEDULER.cpu_or_boot(cpu_id).publish_current(task);
+    #[cfg(feature = "performance-profile")]
+    {
+        let epoch = &CURRENT_TASK_EPOCH[cpu_id.min(NR_CPUS - 1)];
+        let value = epoch.load(Ordering::Relaxed);
+        epoch.store(value.wrapping_add(1), Ordering::Relaxed);
+    }
 }
 
 fn bind_task_to_cpu(task: &Task, cpu_id: usize) {
@@ -268,6 +277,15 @@ fn bind_task_to_cpu_on(scheduler: &crate::Scheduler, task: &Task, cpu_id: usize)
 #[kernel_symbols::export(name = "sched.scheduler.current_cpu_id", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_cpu_id() -> usize {
     cpu()
+}
+
+/// 当前 CPU 的 task 发布代际。
+///
+/// 每次 current task 发布后递增；per-CPU 单写允许影子性能模型用 relaxed 读取
+/// 判断窗口之间是否发生过调度、迁移或其它任务插入，而不在切换路径增加原子 RMW。
+#[cfg(feature = "performance-profile")]
+pub fn current_task_epoch() -> u64 {
+    CURRENT_TASK_EPOCH[cpu()].load(Ordering::Relaxed)
 }
 
 /// 当前纳秒时间戳。未注入时返回 0，表示"不推进虚拟时间"。

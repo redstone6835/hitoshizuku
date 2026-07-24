@@ -24,6 +24,11 @@ use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, us
 /// BuildStorm 会反复执行体积较大的 rustc/链接器映像；适度预装可减少 TCG 下的
 /// 硬件缺页陷入，同时避免冷缓存首次缺页同步读取过多无关页面。
 const FILE_FAULT_AROUND_PAGES: usize = 16;
+/// 匿名 Store fault-around 影子模型的最大前向页数。
+///
+/// 模型只观察真实 nonresident fault，绝不分配或安装额外页面。
+#[cfg(any(test, feature = "performance-profile"))]
+const ANON_STORE_SHADOW_PAGES: usize = 8;
 /// 内容持续变化时最多尝试发布缓存快照的次数，随后退回不缓存读取保证前进性。
 const PRIVATE_FILE_CACHE_RETRIES: usize = 3;
 /// 连续缓存缺失达到该阈值后，才值得为一次 VFS 读取准备 bounce buffer。
@@ -107,6 +112,82 @@ fn file_fault_around_window(
         start: fault_page,
         end: fault_page.checked_add(len)?,
         file_offset,
+    })
+}
+
+#[cfg(any(test, feature = "performance-profile"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnonStoreShadowKey {
+    task_id: u64,
+    task_epoch: u64,
+    vm_id: u64,
+    vma_end: usize,
+}
+
+#[cfg(any(test, feature = "performance-profile"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AnonStoreShadowState {
+    key: Option<AnonStoreShadowKey>,
+    window_start: usize,
+    window_end: usize,
+}
+
+#[cfg(any(test, feature = "performance-profile"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AnonStoreShadowObservation {
+    state: AnonStoreShadowState,
+    simulated_batch: bool,
+    would_save: bool,
+    reset: bool,
+}
+
+/// 在不改变映射的前提下推进一次匿名写 fault-around 影子窗口。
+///
+/// key 包含稳定 VmSpace id、task 发布代际和 VMA 末端。代际变化会主动丢弃
+/// 旧窗口，防止任务迁移后返回旧 CPU 或其它任务插入时复用陈旧状态。
+/// 这种重置会漏掉真实预装页跨调度仍然有效的收益，通常给出保守下界；但模型
+/// 没有 VMA 修改代际，也不模拟分配失败、并发 PTE 冲突和 `madvise` 回收，因此
+/// 同末端 unmap/remap 或重复 fault 仍可能造成少量向上偏差，不能视为严格下界。
+#[cfg(any(test, feature = "performance-profile"))]
+fn observe_anon_store_shadow(
+    state: AnonStoreShadowState,
+    key: AnonStoreShadowKey,
+    fault_page: usize,
+    page_size: usize,
+) -> Option<AnonStoreShadowObservation> {
+    if page_size == 0
+        || !page_size.is_power_of_two()
+        || fault_page % page_size != 0
+        || key.vma_end % page_size != 0
+        || fault_page >= key.vma_end
+    {
+        return None;
+    }
+
+    let reset = state.key.is_some_and(|old| old != key);
+    if !reset
+        && state.key == Some(key)
+        && fault_page >= state.window_start
+        && fault_page < state.window_end
+    {
+        return Some(AnonStoreShadowObservation {
+            state,
+            would_save: true,
+            ..AnonStoreShadowObservation::default()
+        });
+    }
+
+    let window_bytes = ANON_STORE_SHADOW_PAGES.checked_mul(page_size)?;
+    let window_end = fault_page.saturating_add(window_bytes).min(key.vma_end);
+    Some(AnonStoreShadowObservation {
+        state: AnonStoreShadowState {
+            key: Some(key),
+            window_start: fault_page,
+            window_end,
+        },
+        simulated_batch: true,
+        would_save: false,
+        reset,
     })
 }
 
@@ -235,6 +316,135 @@ static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEnt
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "performance-profile")]
+static VM_SPACE_PROFILE_ID_NEXT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AnonStoreShadowDiag {
+    pub faults: u64,
+    pub simulated_batches: u64,
+    pub would_save: u64,
+    pub migration_interleave_resets: u64,
+}
+
+#[cfg(feature = "performance-profile")]
+#[repr(align(64))]
+struct AnonStoreShadowCpu {
+    task_id: AtomicU64,
+    task_epoch: AtomicU64,
+    vm_id: AtomicU64,
+    vma_end: AtomicUsize,
+    window_start: AtomicUsize,
+    window_end: AtomicUsize,
+    faults: AtomicU64,
+    simulated_batches: AtomicU64,
+    would_save: AtomicU64,
+    migration_interleave_resets: AtomicU64,
+}
+
+#[cfg(feature = "performance-profile")]
+impl AnonStoreShadowCpu {
+    const fn new() -> Self {
+        Self {
+            task_id: AtomicU64::new(0),
+            task_epoch: AtomicU64::new(0),
+            vm_id: AtomicU64::new(0),
+            vma_end: AtomicUsize::new(0),
+            window_start: AtomicUsize::new(0),
+            window_end: AtomicUsize::new(0),
+            faults: AtomicU64::new(0),
+            simulated_batches: AtomicU64::new(0),
+            would_save: AtomicU64::new(0),
+            migration_interleave_resets: AtomicU64::new(0),
+        }
+    }
+
+    fn state(&self) -> AnonStoreShadowState {
+        let vm_id = self.vm_id.load(Ordering::Relaxed);
+        AnonStoreShadowState {
+            key: (vm_id != 0).then(|| AnonStoreShadowKey {
+                task_id: self.task_id.load(Ordering::Relaxed),
+                task_epoch: self.task_epoch.load(Ordering::Relaxed),
+                vm_id,
+                vma_end: self.vma_end.load(Ordering::Relaxed),
+            }),
+            window_start: self.window_start.load(Ordering::Relaxed),
+            window_end: self.window_end.load(Ordering::Relaxed),
+        }
+    }
+
+    fn store_state(&self, state: AnonStoreShadowState) {
+        let Some(key) = state.key else {
+            self.vm_id.store(0, Ordering::Relaxed);
+            return;
+        };
+        self.task_id.store(key.task_id, Ordering::Relaxed);
+        self.task_epoch.store(key.task_epoch, Ordering::Relaxed);
+        self.vma_end.store(key.vma_end, Ordering::Relaxed);
+        self.window_start
+            .store(state.window_start, Ordering::Relaxed);
+        self.window_end.store(state.window_end, Ordering::Relaxed);
+        self.vm_id.store(key.vm_id, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+static ANON_STORE_SHADOW_CPUS: [AnonStoreShadowCpu; sched::NR_CPUS] =
+    [const { AnonStoreShadowCpu::new() }; sched::NR_CPUS];
+
+#[cfg(feature = "performance-profile")]
+fn anon_store_shadow_cpu() -> &'static AnonStoreShadowCpu {
+    &ANON_STORE_SHADOW_CPUS[sched::current_cpu_id().min(sched::NR_CPUS - 1)]
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_anon_store_shadow_fault(vm_id: u64, fault_page: usize, vma_end: usize) {
+    let cpu = anon_store_shadow_cpu();
+    add_local_fault_around_counter(&cpu.faults, 1);
+    let key = AnonStoreShadowKey {
+        task_id: sched::current_task_id(),
+        task_epoch: sched::current_task_epoch(),
+        vm_id,
+        vma_end,
+    };
+    let Some(observation) = observe_anon_store_shadow(cpu.state(), key, fault_page, page_size())
+    else {
+        return;
+    };
+    if observation.simulated_batch {
+        add_local_fault_around_counter(&cpu.simulated_batches, 1);
+    }
+    if observation.would_save {
+        add_local_fault_around_counter(&cpu.would_save, 1);
+    }
+    if observation.reset {
+        add_local_fault_around_counter(&cpu.migration_interleave_resets, 1);
+    }
+    cpu.store_state(observation.state);
+}
+
+pub(crate) fn anon_store_shadow_diag() -> AnonStoreShadowDiag {
+    #[cfg(feature = "performance-profile")]
+    let mut diag = AnonStoreShadowDiag::default();
+    #[cfg(not(feature = "performance-profile"))]
+    let diag = AnonStoreShadowDiag::default();
+    #[cfg(feature = "performance-profile")]
+    for cpu in &ANON_STORE_SHADOW_CPUS {
+        diag.faults = diag
+            .faults
+            .saturating_add(cpu.faults.load(Ordering::Relaxed));
+        diag.simulated_batches = diag
+            .simulated_batches
+            .saturating_add(cpu.simulated_batches.load(Ordering::Relaxed));
+        diag.would_save = diag
+            .would_save
+            .saturating_add(cpu.would_save.load(Ordering::Relaxed));
+        diag.migration_interleave_resets = diag
+            .migration_interleave_resets
+            .saturating_add(cpu.migration_interleave_resets.load(Ordering::Relaxed));
+    }
+    diag
+}
 
 #[cfg(feature = "performance-profile")]
 const HARDWARE_FAULT_BACKING_COUNT: usize = 5;
@@ -1269,6 +1479,9 @@ pub struct VmSpace {
     membarrier_registration: AtomicUsize,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
     mapped_pages: AtomicUsize,
+    /// 性能影子模型使用的稳定地址空间身份；不参与任何映射决策。
+    #[cfg(feature = "performance-profile")]
+    profile_identity: u64,
 }
 
 // Safety: PgdHandle 是 arch opaque 句柄；VMA 与 resident page map 均由锁保护。
@@ -1295,6 +1508,8 @@ impl VmSpace {
             mlock_future: AtomicBool::new(false),
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_identity: VM_SPACE_PROFILE_ID_NEXT.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -2085,6 +2300,8 @@ impl VmSpace {
             // fork 创建独立 mm，按 Linux 语义不继承 expedited 注册状态。
             membarrier_registration: AtomicUsize::new(0),
             mapped_pages: AtomicUsize::new(mapped_pages),
+            #[cfg(feature = "performance-profile")]
+            profile_identity: VM_SPACE_PROFILE_ID_NEXT.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -2198,6 +2415,16 @@ impl VmSpace {
         #[cfg(feature = "performance-profile")]
         if let Some(backing) = hardware_fault_backing {
             record_hardware_user_fault(backing, hardware_fault_access, false);
+        }
+
+        #[cfg(feature = "performance-profile")]
+        if allow_fault_around
+            && matches!(kind, FaultKind::Store)
+            && matches!(&backing, VmBacking::Anon { .. })
+            && flags.contains_all(VmFlags::USER | VmFlags::WRITE | VmFlags::ANON)
+            && !flags.has(VmFlags::SHARED)
+        {
+            record_anon_store_shadow_fault(self.profile_identity, page, area_range.end);
         }
 
         if allow_fault_around {
@@ -3709,9 +3936,10 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::{
-        FILE_FAULT_AROUND_PAGES, FaultKind, FilePageKey, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess,
-        ResidentPage, ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache,
-        access_for_private_file, file_fault_around_window, find_cached_private_file_page,
+        ANON_STORE_SHADOW_PAGES, AnonStoreShadowKey, AnonStoreShadowState, FILE_FAULT_AROUND_PAGES,
+        FilePageKey, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, ResidentPage,
+        ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache, access_for_private_file,
+        file_fault_around_window, find_cached_private_file_page, observe_anon_store_shadow,
         permits_file_fault_around, plan_file_segment, private_file_batch_page_offset,
         private_file_batch_plan, publish_cached_file_page, publish_cached_private_file_page,
         read_file_bytes_exact, unmapped_prefix_len,
@@ -3816,6 +4044,104 @@ mod tests {
         assert_eq!(window.start, fault);
         assert_eq!(window.file_offset, 0x5000);
         assert_eq!(window.page_count(PAGE_SIZE), FILE_FAULT_AROUND_PAGES);
+    }
+
+    fn anon_shadow_key(task_id: u64, task_epoch: u64, vm_id: u64) -> AnonStoreShadowKey {
+        AnonStoreShadowKey {
+            task_id,
+            task_epoch,
+            vm_id,
+            vma_end: 0x40_0000,
+        }
+    }
+
+    #[test]
+    fn anon_store_shadow_opens_eight_page_window_and_counts_later_faults() {
+        let key = anon_shadow_key(7, 11, 13);
+        let first =
+            observe_anon_store_shadow(AnonStoreShadowState::default(), key, 0x4000, PAGE_SIZE)
+                .expect("valid first fault");
+        assert!(first.simulated_batch);
+        assert!(!first.would_save);
+        assert!(!first.reset);
+        assert_eq!(first.state.window_start, 0x4000);
+        assert_eq!(
+            first.state.window_end,
+            0x4000 + ANON_STORE_SHADOW_PAGES * PAGE_SIZE
+        );
+
+        let hit = observe_anon_store_shadow(first.state, key, 0x9000, PAGE_SIZE)
+            .expect("fault inside shadow window");
+        assert!(!hit.simulated_batch);
+        assert!(hit.would_save);
+        assert!(!hit.reset);
+        assert_eq!(hit.state, first.state);
+
+        let boundary = observe_anon_store_shadow(hit.state, key, first.state.window_end, PAGE_SIZE)
+            .expect("fault at exclusive boundary");
+        assert!(boundary.simulated_batch);
+        assert!(!boundary.would_save);
+    }
+
+    #[test]
+    fn anon_store_shadow_caps_window_at_vma_end() {
+        let fault = 0x8000;
+        let vma_end = fault + 3 * PAGE_SIZE;
+        let mut key = anon_shadow_key(7, 11, 13);
+        key.vma_end = vma_end;
+        let observed =
+            observe_anon_store_shadow(AnonStoreShadowState::default(), key, fault, PAGE_SIZE)
+                .expect("three-page VMA suffix");
+
+        assert_eq!(observed.state.window_end, vma_end);
+    }
+
+    #[test]
+    fn anon_store_shadow_resets_on_task_epoch_vm_or_vma_change() {
+        let key = anon_shadow_key(7, 11, 13);
+        let initial =
+            observe_anon_store_shadow(AnonStoreShadowState::default(), key, 0x4000, PAGE_SIZE)
+                .unwrap();
+
+        let changed = [
+            anon_shadow_key(8, 11, 13),
+            anon_shadow_key(7, 12, 13),
+            anon_shadow_key(7, 11, 14),
+            AnonStoreShadowKey {
+                vma_end: key.vma_end - PAGE_SIZE,
+                ..key
+            },
+        ];
+        for changed_key in changed {
+            let observed =
+                observe_anon_store_shadow(initial.state, changed_key, 0x5000, PAGE_SIZE).unwrap();
+            assert!(observed.reset);
+            assert!(observed.simulated_batch);
+            assert!(!observed.would_save);
+            assert_eq!(observed.state.key, Some(changed_key));
+        }
+    }
+
+    #[test]
+    fn anon_store_shadow_rejects_invalid_geometry() {
+        let key = anon_shadow_key(7, 11, 13);
+        let state = AnonStoreShadowState::default();
+        assert!(observe_anon_store_shadow(state, key, 0x4001, PAGE_SIZE).is_none());
+        assert!(observe_anon_store_shadow(state, key, key.vma_end, PAGE_SIZE).is_none());
+        assert!(observe_anon_store_shadow(state, key, 0x4000, 0).is_none());
+        assert!(observe_anon_store_shadow(state, key, 0x4000, 3).is_none());
+        assert!(
+            observe_anon_store_shadow(
+                state,
+                AnonStoreShadowKey {
+                    vma_end: key.vma_end + 1,
+                    ..key
+                },
+                0x4000,
+                PAGE_SIZE,
+            )
+            .is_none()
+        );
     }
 
     #[test]

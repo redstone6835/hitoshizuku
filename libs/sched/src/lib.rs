@@ -106,6 +106,8 @@ pub use sched_class::{
     DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass,
     SchedPolicy,
 };
+#[cfg(feature = "performance-profile")]
+pub use scheduler::current_task_epoch;
 pub use scheduler::{
     DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
     reserve_deadline_observer_id,
