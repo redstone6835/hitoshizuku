@@ -972,7 +972,7 @@ impl PrivateFileFaultAround {
                 .fault_file_offset
                 .checked_add(u64::try_from(delta).map_err(|_| Errno::EINVAL)?)
                 .ok_or(Errno::EINVAL)?;
-            match private_file_page(&self.file, file_offset) {
+            match private_file_page(&self.file, file_offset, profile_phases) {
                 Ok(page) => prepared.push(PreparedFilePage { vaddr, page }),
                 Err(err) if index == 0 => return Err(err),
                 Err(_) => break,
@@ -2407,7 +2407,7 @@ impl VmSpace {
                 if flags.has(VmFlags::SHARED) {
                     shared_file_page(file, file_off)
                 } else {
-                    private_file_page(&file, file_off)
+                    private_file_page(&file, file_off, profile_phases)
                 }
             }
             VmBacking::Direct(base) => {
@@ -2838,22 +2838,35 @@ fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Reside
     Ok(publish_cached_file_page(&SHARED_FILE_PAGES, key, page))
 }
 
-fn private_file_page(file: &Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
+fn private_file_page(
+    file: &Arc<dyn FileLike>,
+    file_off: u64,
+    profile_phases: bool,
+) -> Result<Arc<ResidentPage>, Errno> {
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = profile_phases;
     for _ in 0..PRIVATE_FILE_CACHE_RETRIES {
         let (Some(file_key), Some(generation)) = (
             file.private_page_cache_key(),
             file.private_page_cache_generation(),
         ) else {
+            #[cfg(feature = "performance-profile")]
+            let _profile =
+                profile_phases.then(|| profiling::scope(profiling::Event::PageFaultUncachedFill));
             let paddr = load_file_page(file.as_ref(), file_off)?;
             return Ok(ResidentPage::new_private_file(paddr));
         };
         let key = FilePageKey::new_private(file_key, file_off, generation);
-        if let Some(page) = find_cached_private_file_page(&PRIVATE_FILE_PAGES, key) {
+        let cached = find_cached_private_file_page(&PRIVATE_FILE_PAGES, key);
+        if let Some(page) = cached {
             if file.private_page_cache_generation() == Some(generation) {
                 return Ok(page);
             }
             continue;
         }
+        #[cfg(feature = "performance-profile")]
+        let _profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultCacheFill));
         let paddr = match load_file_page(file.as_ref(), file_off) {
             Ok(paddr) => paddr,
             Err(err) => {
@@ -2877,6 +2890,9 @@ fn private_file_page(file: &Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Resi
         // 只有仍指向本次候选的条目才会被移除，避免误删并发线程发布的新页。
         PRIVATE_FILE_PAGES.remove_if_same(key, &page);
     }
+    #[cfg(feature = "performance-profile")]
+    let _profile =
+        profile_phases.then(|| profiling::scope(profiling::Event::PageFaultUncachedFill));
     let paddr = load_file_page(file.as_ref(), file_off)?;
     Ok(ResidentPage::new_private_file(paddr))
 }

@@ -103,6 +103,8 @@ pub enum Event {
     PageFaultPrepare,
     PageFaultCommit,
     PageFaultSingle,
+    PageFaultCacheFill,
+    PageFaultUncachedFill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +135,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 42] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -174,6 +176,8 @@ impl Event {
         Self::PageFaultPrepare,
         Self::PageFaultCommit,
         Self::PageFaultSingle,
+        Self::PageFaultCacheFill,
+        Self::PageFaultUncachedFill,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -218,6 +222,8 @@ impl Event {
             Self::PageFaultPrepare => "page_fault_prepare",
             Self::PageFaultCommit => "page_fault_commit",
             Self::PageFaultSingle => "page_fault_single",
+            Self::PageFaultCacheFill => "page_fault_cache_fill",
+            Self::PageFaultUncachedFill => "page_fault_uncached_fill",
         }
     }
 
@@ -263,7 +269,9 @@ impl Event {
             | Self::PageFaultResident
             | Self::PageFaultPrepare
             | Self::PageFaultCommit
-            | Self::PageFaultSingle => EventCategory::Memory,
+            | Self::PageFaultSingle
+            | Self::PageFaultCacheFill
+            | Self::PageFaultUncachedFill => EventCategory::Memory,
             Self::IrqDispatch => EventCategory::Interrupt,
             Self::BlockSubmit | Self::BlockDrain | Self::BlockComplete | Self::BlockWait => {
                 EventCategory::Block
@@ -1996,9 +2004,12 @@ mod tests {
         assert_eq!(Event::PageFaultPrepare as usize, 37);
         assert_eq!(Event::PageFaultCommit as usize, 38);
         assert_eq!(Event::PageFaultSingle as usize, 39);
-        assert_eq!(Event::ALL.len(), 40);
+        assert_eq!(Event::PageFaultCacheFill as usize, 40);
+        assert_eq!(Event::PageFaultUncachedFill as usize, 41);
+        assert_eq!(Event::ALL.len(), 42);
         assert_eq!(Event::from_id(36), Some(Event::PageFaultResident));
         assert_eq!(Event::from_id(39), Some(Event::PageFaultSingle));
+        assert_eq!(Event::from_id(41), Some(Event::PageFaultUncachedFill));
         assert_eq!(Event::from_id(33), Some(Event::WaitProcessExit));
         assert_eq!(Event::from_id(34), Some(Event::WaitVfork));
         assert_eq!(Event::from_id(35), Some(Event::WaitBlockIo));

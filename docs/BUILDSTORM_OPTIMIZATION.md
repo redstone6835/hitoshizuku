@@ -84,3 +84,5 @@ BuildStorm 在 300 秒内会创建约 4,000–4,500 个 `VmSpace`。旧切换路
 profiling event 36–39 追加为 `page_fault_resident`、`prepare`、`commit` 和 `single`，不改变既有 event ID。它们只在真实硬件 fault 路径记录；`ensure_page_access` 触发的软件 prefault 不进入分段。使用 `PROFILE_EVENT_MASK=0xf008000000` 可只开启总 page fault 与四个子阶段，四个子阶段彼此不嵌套，但 prepare/single 内仍包含 VFS/block 子调用。
 
 60 秒 counts-only 样本中，总 page fault 估算 on-CPU 为 `157.50s`；prepare `77.87s`（`49.4%`）、single `41.28s`（`26.2%`）、commit `9.97s`（`6.3%`）、resident `9.56s`（`6.1%`），未覆盖的 VMA 查找与分派约 `18.81s`。prepare 的 `94,934` 次调用完成 `1,544,952` 页，其中私有缓存 hit/miss 为 `1,272,520 / 66,473`。下一步应拆分 prepare 的 cache hit 查找和真实 miss 读页，不能把 PTE commit 当作当前第一热点。
+
+event 40/41 继续区分有稳定代际缓存的 miss fill 和无 cache key 的 uncached fill。使用 `PROFILE_EVENT_MASK=0x30000000000`、`PROFILE_TIMING_SHIFT=8` 的 60 秒归因样本中，cache fill `59,621` 次，与 meminfo 的 `60,488` 次 miss 基本一致，估算 on-CPU `59.80s`、均值约 `1.00ms`；uncached fill `232,921` 次，估算 on-CPU `11.20s`、均值约 `48us`。两者约 `71.0s`，与上一轮 prepare `77.87s` 高度闭合，因此 lookup/循环本身不是主要杠杆，约 6 万次同步 cache-miss 读页才是。细粒度 scope 会显著降低该诊断内核吞吐，只能用于来源占比，不能与低扰动 counts-only 样本比较性能。
