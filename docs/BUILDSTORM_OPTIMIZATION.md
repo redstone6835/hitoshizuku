@@ -75,4 +75,6 @@ BuildStorm 在 300 秒内会创建约 4,000–4,500 个 `VmSpace`。旧切换路
 
 单轮 300 秒 counts-only 校验得到 `Windows=344570`、`Requested=Prepared=5450848`、`Commits=344570`、`Installed=3209466`、`Raced=14`：平均每个窗口准备 `15.82` 页、安装 `9.31` 页，`41.12%` 的 prepared 页未安装；没有 prepare 缩窗或 VMA retry，竞态也不足以解释差值。该轮 Cargo 64 milestone 为 `211.28s`，相对三轮 ASID 基线均值 `209.75s` 退化 `0.73%`，落在既有方差内。短窗口中最终的单写者原子 load/store 版本为进度 20、QEMU CPU `318.26s`，对旧 ASID 冒烟的进度 21、`321.88s` 未显示动态计数开销。300 秒窗口末进度 84 低于基线 91–94，因此后续优化仍须以三轮共同 milestone 验收，不能只比较单轮末进度。
 
-提交损失进一步拆成 VMA retry、真实 fault race、首碰撞后已存在的 PTE、碰撞后的空洞和页表失败，并要求静止增量满足 `Prepared = Installed + VmaRetryPages + RacedPages + DuplicatePages + DiscardedUnmapped + MapFailedPages`。60 秒诊断样本精确闭合为 `1606098 = 955798 + 0 + 192 + 643154 + 6954 + 0`；`55190/101533` 个窗口发生首碰撞，未安装页的 `98.90%` 已有 PTE，真正被连续前缀策略丢弃的空洞仅 `1.07%`。因此后续应在 prepare 前按首个 resident PTE 截窗，避免重复 cache lookup/Arc，而不是为极少空洞增加非连续 PTE 提交复杂度。
+提交损失进一步拆成 VMA retry、真实 fault race、首碰撞后已存在的 PTE、碰撞后的空洞和页表失败，并要求静止增量满足 `Prepared = Installed + VmaRetryPages + RacedPages + DuplicatePages + DiscardedUnmapped + MapFailedPages`。60 秒诊断样本精确闭合为 `1606098 = 955798 + 0 + 192 + 643154 + 6954 + 0`；`55190/101533` 个窗口发生首碰撞，未安装页的 `98.90%` 已有 PTE，真正被连续前缀策略丢弃的空洞仅 `1.07%`。
+
+曾尝试在 prepare 前按首个 resident PTE 截窗；它把短样本的 collision/duplicate 降为 0，但没有改变每窗口实际安装页数，只省掉了热文件缓存命中。三轮 300 秒 Cargo 64 milestone 为 `223.97s / 208.94s / 217.62s`，均值 `216.84s`、CV `2.84%`，相对 ASID 基线均值 `209.75s` 稳定退化 `3.38%`，比较脚本返回 `accepted: false`；末进度均值也从 `92.67` 降到 `89.67`。该改动已回退。后续不得把 `Prepared - Installed` 直接视为等量 I/O 浪费，应转向不可避免的 PTE 安装、真实 cache miss 和 page-fault 分段耗时。
