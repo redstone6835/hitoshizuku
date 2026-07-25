@@ -4,7 +4,7 @@
 
 最终目标是 `tg-xtask` 不超过 15 分钟、后续内核构建不超过 5 分钟，并以三次独立运行确认。所有对比使用固定容器 `zhouzhouyi/os-contest:20260510`、8 GiB 内存、8 个 QEMU vCPU、同一只读 raw 基准盘和每轮新建的 qcow2 overlay。不得复用 guest 的 `target/debug`，也不得在测量期间并发运行 Cargo、Make 或其他 QEMU。
 
-`scripts/buildstorm-profile-host.sh` 使用 guest gate 对齐窗口：工作负载进程组先停止，profile-on/off 都经过相同的 START/STOP 控制；停止时先冻结计数器并记录 host/QEMU 边界，再在窗口外导出快照。summary 同时记录 Cargo progress、QEMU CPU、主机 PSI、控制延迟和镜像哈希。
+`scripts/buildstorm-profile-host.sh` 使用 guest gate 对齐窗口：工作负载进程组先停止，profile-on/off 都经过相同的 START/STOP 控制；guest 与正式 init 一样先把 `/work/tgoskits/target` 挂为上限 5 GiB 的 tmpfs，并输出 `@@PROFILE_TARGET_FS` 标记，避免把 extfs 写回或损坏混入编译器/MM 数据。停止时先冻结计数器并记录 host/QEMU 边界，再在窗口外导出快照。summary 同时记录 Cargo progress、QEMU CPU、主机 PSI、控制延迟和镜像哈希。
 
 ## 构建固定内核
 
@@ -60,6 +60,12 @@ scripts/buildstorm-profile-compare.sh \
 ## 优化交付
 
 只在两项 A/A 验证均通过后增加分类插桩或修改热路径。候选优化必须以三次 clean-overlay 运行复核；要求 2× 时设置 `PROFILE_REQUIRED_SPEEDUP=2` 运行比较脚本。阶段性成果需记录 summary、串口日志、内核哈希和提交 ID，并运行 `cargo fmt --all`、受影响 host 测试、完整 `make kernel-la` 与 QEMU 验证。
+
+## tmpfs 模型校正
+
+旧 profile runner 只删除 `target/debug`，实际仍在 extfs 上构建，与正式 init 的 5 GiB tmpfs 路径不一致。修正后首次 `cargo:440` 诊断使用内核哈希 `204790961a43`，串口确认 `@@PROFILE_TARGET_FS type=tmpfs`；60 分钟上限触发时到达 `439/446`，因此不能作为验收样本，但可用于定位增长区间。相对 `0/446` 的里程碑为：`64=210.65s`、`128=660.99s`、`256=1919.86s`、`384=2710.57s`。最重的 `128→256` 单段耗时约 20 分 59 秒，后期进度条不是唯一瓶颈。
+
+在约 `258/446` 的只读现场中，8 个 QEMU vCPU 线程平均占用约 `74%–91%` 主机 CPU，guest runqueue 仍有 4 个待运行任务，并行存在 7 个 rustc/cc1，排除了整体调度停转。`aws-lc-sys` build script 当时已运行约 25 分钟；内核堆约 1.09 GiB，私有文件页缓存累计约 1610 万次 hit、7.7 万次 miss。下一轮应从 `cargo:384` 开始覆盖完整收敛段，并把 aws-lc C 构建和高频 resident fault 作为独立候选验证。
 
 ## LoongArch ASID 阶段结果
 

@@ -361,6 +361,30 @@ run_profile() {
         exit 1
     fi
 
+    # Match the contest init path exactly: BuildStorm writes all Cargo output
+    # to a bounded tmpfs.  Profiling ext4 here would mix filesystem writeback
+    # and recovery failures into the compiler/MM measurements and would no
+    # longer describe the workload used for scoring.
+    target_mount=/mnt/work/tgoskits/target
+    mkdir -p "$target_mount" || {
+        echo "profile runner: unable to create BuildStorm target mount" >&2
+        exit 1
+    }
+    if grep -q " $target_mount " /proc/mounts 2>/dev/null; then
+        if ! grep -q " $target_mount tmpfs " /proc/mounts 2>/dev/null; then
+            echo "profile runner: BuildStorm target is mounted on a non-tmpfs filesystem" >&2
+            exit 1
+        fi
+    elif ! mount -t tmpfs -o size=5G tmpfs "$target_mount"; then
+        echo "profile runner: unable to mount BuildStorm target tmpfs" >&2
+        exit 1
+    fi
+    grep -q " $target_mount tmpfs " /proc/mounts 2>/dev/null || {
+        echo "profile runner: BuildStorm target tmpfs verification failed" >&2
+        exit 1
+    }
+    echo "@@PROFILE_TARGET_FS type=tmpfs path=/work/tgoskits/target limit=5G"
+
     if [ "$capture" -eq 1 ]; then
         cp "$tool_mount/profile-capture.sh" /tmp/profile-capture.sh || exit 1
         chmod 755 /tmp/profile-capture.sh || exit 1

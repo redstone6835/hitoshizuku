@@ -8,6 +8,15 @@ guest=$repo/scripts/buildstorm-profile-guest.sh
 sh -n "$host"
 sh -n "$guest"
 
+grep -Fq 'mount -t tmpfs -o size=5G tmpfs "$target_mount"' "$guest" || {
+    echo "tmpfs fixture: profiling workload does not mount the official target tmpfs" >&2
+    exit 1
+}
+grep -Fq '@@PROFILE_TARGET_FS type=tmpfs path=/work/tgoskits/target limit=5G' "$guest" || {
+    echo "tmpfs fixture: profiling workload does not report its target filesystem" >&2
+    exit 1
+}
+
 fixture=$(mktemp)
 summary_python=$(mktemp)
 summary_dir=$(mktemp -d)
