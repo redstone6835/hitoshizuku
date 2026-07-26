@@ -24,17 +24,18 @@ use net::stack::{
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
-    NET_STACK_NETWORK_IP, NET_STACK_SHARD_TURN_STATUS_INVALID, NET_STACK_SHARD_TURN_STATUS_OK,
+    NET_STACK_NETWORK_IP, NET_STACK_SHARD_TURN_STATUS_BUSY, NET_STACK_SHARD_TURN_STATUS_INVALID,
+    NET_STACK_SHARD_TURN_STATUS_OK,
     NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
     NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
     NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
     NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NetStackEthernet,
-    NetStackControlPlane, NetStackShardTurn, NetStackHandle, NetStackLocalAddress,
-    NetStackNetwork,
+    NetStackControlPlane, NetStackHandle, NetStackLocalAddress, NetStackLocalTurn, NetStackNetwork,
+    NetStackShardTurn,
     NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackTcpOptions,
     NetStackTransport,
 };
-use net::{FlowShard, ShardId};
+use net::{FlowExecution, FlowExecutorKind, FlowShard, ShardId};
 use sched::sync::Spinlock;
 
 use allocator as _;
@@ -52,6 +53,8 @@ impl FlowShardSlot {
 
 static FLOW_SHARDS: [FlowShardSlot; sched::NR_CPUS] =
     [const { FlowShardSlot::new() }; sched::NR_CPUS];
+static FLOW_EXECUTIONS: [FlowExecution; sched::NR_CPUS] =
+    [const { FlowExecution::new() }; sched::NR_CPUS];
 static CONTROL_PLANE: Spinlock<Option<Arc<Spinlock<ManuallyDrop<NetStackControlPlane>>>>> =
     Spinlock::new(None);
 
@@ -1142,7 +1145,7 @@ fn parse_transport(
     }
 }
 
-fn initialize_flow_shards(boot: net::boot::NetStackBootConfig) -> bool {
+fn initialize_flow_shards(boot: net::boot::NetStackBootConfig, generation: u64) -> bool {
     let count = usize::from(boot.active_cpu_count());
     if count == 0 || count > sched::NR_CPUS {
         return false;
@@ -1156,6 +1159,9 @@ fn initialize_flow_shards(boot: net::boot::NetStackBootConfig) -> bool {
         unsafe { *slot.0.get() = None };
     }
     for index in 0..count {
+        if !FLOW_EXECUTIONS[index].install_generation(generation) {
+            return false;
+        }
         // Safety: 每个槽位在 generation 激活前只初始化一次。
         unsafe {
             *FLOW_SHARDS[index].0.get() = Some(ManuallyDrop::new(
@@ -1290,19 +1296,32 @@ fn drain_reassembly_command(
     true
 }
 
-fn dispatch_shard_turn(call: &mut NetStackShardTurn) -> bool {
+fn dispatch_shard_turn(call: &mut NetStackShardTurn) -> i32 {
     let index = usize::from(call.shard.0);
     if (!call.commands.is_empty() || !call.control_commands.is_empty())
         && (index != sched::current_cpu_id() || index >= FLOW_SHARDS.len())
     {
-        return false;
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
     }
     if !call.control_commands.is_empty() && call.shard != net::ShardId(0) {
-        return false;
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
     }
+    let lease = if call.commands.is_empty() {
+        None
+    } else {
+        let Some(lease) = FLOW_EXECUTIONS[index].try_acquire(
+            call.generation,
+            FlowExecutorKind::Worker,
+            sched::current_cpu_id(),
+        ) else {
+            FLOW_EXECUTIONS[index].mark_pending();
+            return NET_STACK_SHARD_TURN_STATUS_BUSY;
+        };
+        Some(lease)
+    };
     if !call.control_commands.is_empty() {
         let Some(control) = CONTROL_PLANE.lock().as_ref().cloned() else {
-            return false;
+            return NET_STACK_SHARD_TURN_STATUS_INVALID;
         };
         let mut control = control.lock();
         for index in 0..call.control_commands.len() {
@@ -1315,12 +1334,11 @@ fn dispatch_shard_turn(call: &mut NetStackShardTurn) -> bool {
     }
     if call.commands.is_empty() {
         call.committed = 1;
-        return true;
+        return NET_STACK_SHARD_TURN_STATUS_OK;
     }
-    // Safety: 上文已校验 owner CPU，且 pinned export 不可重入，因此这是本轮对
-    // shard 的唯一可变访问。
+    // Safety: 执行租约覆盖整个 shard turn，因此这是本轮对 shard 的唯一可变访问。
     let Some(shard) = (unsafe { &mut *FLOW_SHARDS[index].0.get() }).as_mut() else {
-        return false;
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
     };
     for index in 0..call.commands.len() {
         let command = call
@@ -1356,18 +1374,54 @@ fn dispatch_shard_turn(call: &mut NetStackShardTurn) -> bool {
             command => net::stack::dispatch_flow_shard_command(shard, command),
         };
         if !valid {
-            return false;
+            return NET_STACK_SHARD_TURN_STATUS_INVALID;
         }
     }
     if !net::stack::finalize_shard_turn_tx(shard, &mut call.commands, &mut call.tx_plans) {
-        return false;
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
     }
     call.committed = 1;
-    true
+    let _ = lease
+        .expect("非空 flow turn 必须持有执行租约")
+        .release_and_recheck();
+    NET_STACK_SHARD_TURN_STATUS_OK
+}
+
+fn dispatch_local_turn(turn: &mut NetStackLocalTurn) -> i32 {
+    let index = usize::from(turn.shard.0);
+    if index >= FLOW_SHARDS.len() || !turn.valid_header(turn.generation) {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    let Some(lease) = FLOW_EXECUTIONS[index].try_acquire(
+        turn.generation,
+        FlowExecutorKind::Syscall,
+        sched::current_cpu_id(),
+    ) else {
+        FLOW_EXECUTIONS[index].mark_pending();
+        return NET_STACK_SHARD_TURN_STATUS_BUSY;
+    };
+    // Safety: syscall 与 owner worker 竞争同一租约，因而同步调用期间只有当前任务
+    // 能修改这个 shard。turn 的命令所有权也只在本次调用期间借给动态模块。
+    let Some(shard) = (unsafe { &mut *FLOW_SHARDS[index].0.get() }).as_mut() else {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    };
+    let Some(command) = turn.command.as_mut() else {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    };
+    if !net::stack::dispatch_flow_shard_command(shard, command) {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    turn.committed = 1;
+    let _ = lease.release_and_recheck();
+    NET_STACK_SHARD_TURN_STATUS_OK
 }
 
 fn destroy_generation_state() {
-    for slot in &FLOW_SHARDS {
+    for (index, slot) in FLOW_SHARDS.iter().enumerate() {
+        assert!(
+            !FLOW_EXECUTIONS[index].snapshot().busy,
+            "销毁协议 generation 时仍有执行者持有 shard 租约"
+        );
         // Safety: quiesce 已在销毁 generation 前停止全部 owner 调用。
         let state = unsafe { (*slot.0.get()).take().map(|mut shard| ManuallyDrop::take(&mut shard)) };
         if let Some(state) = state {
@@ -1417,7 +1471,7 @@ impl ElmModule for NetStackElm {
         })
     }
 
-    fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
+    fn initialize(&mut self, context: &LifecycleContext) -> HookResult {
         if self.handle.is_some() {
             return Err(HookError::new(-16));
         }
@@ -1425,7 +1479,7 @@ impl ElmModule for NetStackElm {
         if boot.active_cpu_count() == 0 || usize::from(boot.active_cpu_count()) > sched::NR_CPUS {
             return Err(HookError::new(-22));
         }
-        if !initialize_flow_shards(boot) {
+        if !initialize_flow_shards(boot, context.generation().max(1)) {
             return Err(HookError::new(-12));
         }
         QUIESCED.store(false, Ordering::Release);
@@ -1437,11 +1491,21 @@ impl ElmModule for NetStackElm {
                 1,
             )
             .ok_or(HookError::new(-22))?;
-            NetStackRegistration::pinned(endpoint).ok_or(HookError::new(-22))?
+            let local_endpoint = PinnedNetStackShardTurnEndpoint::current(
+                "net.stack.local-turn",
+                "mygo.net.stack-local-turn@1",
+                1,
+            )
+            .ok_or(HookError::new(-22))?;
+            NetStackRegistration::pinned_with_local(endpoint, local_endpoint)
+                .ok_or(HookError::new(-22))?
         };
         #[cfg(feature = "elm-integrated")]
-        let registration =
-            NetStackRegistration::integrated(net_stack_shard_turn).ok_or(HookError::new(-22))?;
+        let registration = NetStackRegistration::integrated_with_local(
+            net_stack_shard_turn,
+            net_stack_local_turn,
+        )
+        .ok_or(HookError::new(-22))?;
         let handle = match net::stack::register_stack(registration) {
             Ok(handle) => handle,
             Err(error) => {
@@ -1486,11 +1550,27 @@ fn net_stack_shard_turn(turn: &mut net::stack::NetStackShardTurn) -> i32 {
     if QUIESCED.load(Ordering::Acquire)
         || turn.generation == 0
         || !turn.valid_header(turn.generation)
-        || !dispatch_shard_turn(turn)
     {
         return NET_STACK_SHARD_TURN_STATUS_INVALID;
     }
-    NET_STACK_SHARD_TURN_STATUS_OK
+    dispatch_shard_turn(turn)
+}
+
+#[elm::export(
+    name = "net.stack.local-turn",
+    contract = "mygo.net.stack-local-turn@1",
+    version = 1,
+    mode = "direct-pinned",
+    visibility = "private"
+)]
+fn net_stack_local_turn(turn: &mut net::stack::NetStackLocalTurn) -> i32 {
+    if QUIESCED.load(Ordering::Acquire)
+        || turn.generation == 0
+        || !turn.valid_header(turn.generation)
+    {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    dispatch_local_turn(turn)
 }
 
 #[cfg(not(feature = "elm-integrated"))]

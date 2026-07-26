@@ -7,9 +7,9 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use net::stack::{
-    NET_STACK_SHARD_TURN_RUST_ABI, NET_STACK_SHARD_TURN_STATUS_BUSY,
-    NET_STACK_SHARD_TURN_STATUS_OK, NetStackControlCommand,
-    NetStackEndpoint, NetStackFlowCommand, NetStackHandle, NetStackLifecycle,
+    NET_STACK_LOCAL_TURN_RUST_ABI, NET_STACK_SHARD_TURN_RUST_ABI, NET_STACK_SHARD_TURN_STATUS_BUSY,
+    NET_STACK_SHARD_TURN_STATUS_OK, NetStackControlCommand, NetStackEndpoint, NetStackFlowCommand,
+    NetStackHandle, NetStackLifecycle, NetStackLocalEndpoint, NetStackLocalTurn,
     NetStackRegisterError, NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration,
     NetStackRemoveError, NetStackShardTurn, NetStackSnapshot, NetStackState,
 };
@@ -69,6 +69,11 @@ enum StackCall {
     Pinned(Arc<PinnedStackCall>),
 }
 
+enum LocalStackCall {
+    Integrated(net::stack::IntegratedNetStackLocalTurn),
+    Pinned(Arc<PinnedStackCall>),
+}
+
 struct PinnedCallSlot {
     call: Spinlock<crate::elm::PinnedNativeCall>,
 }
@@ -92,10 +97,32 @@ impl Clone for StackCall {
     }
 }
 
+impl Clone for LocalStackCall {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Integrated(call) => Self::Integrated(*call),
+            Self::Pinned(call) => Self::Pinned(Arc::clone(call)),
+        }
+    }
+}
+
 impl StackCall {
     fn invoke(
         &self,
         turn: &mut NetStackShardTurn,
+        host_ranges: &[(usize, usize)],
+    ) -> Result<i32, i32> {
+        match self {
+            Self::Integrated(call) => Ok(call(turn)),
+            Self::Pinned(call) => call.invoke(turn, host_ranges),
+        }
+    }
+}
+
+impl LocalStackCall {
+    fn invoke(
+        &self,
+        turn: &mut NetStackLocalTurn,
         host_ranges: &[(usize, usize)],
     ) -> Result<i32, i32> {
         match self {
@@ -197,6 +224,58 @@ impl PinnedStackCall {
 impl ElmShardTurnClient {
     pub(crate) const fn new(id: net::ShardId) -> Self {
         Self { id }
+    }
+
+    pub(crate) fn invoke_local_turn(
+        &self,
+        command: NetStackFlowCommand,
+        extra_ranges: &[(usize, usize)],
+    ) -> Result<NetStackFlowCommand, (ShardTurnError, NetStackFlowCommand)> {
+        let (generation, call) = {
+            let broker = BROKER.lock();
+            let snapshot = broker.lifecycle.snapshot();
+            if snapshot.state != NetStackState::Active || !snapshot.ready {
+                return Err((ShardTurnError::StackUnavailable, command));
+            }
+            let Some(record) = broker.record.as_ref() else {
+                return Err((ShardTurnError::StackUnavailable, command));
+            };
+            let Some(call) = record.local_call.as_ref() else {
+                return Err((ShardTurnError::StackUnavailable, command));
+            };
+            (record.generation, call.clone())
+        };
+        if extra_ranges.len() > general::elm_guard::ELM_GUARD_MAX_HOST_RANGES {
+            return Err((ShardTurnError::CallFailed, command));
+        }
+        let mut turn = NetStackLocalTurn::new(generation, self.id, command);
+        #[cfg(feature = "performance-profile")]
+        let _profile_turn = profiling::scope(profiling::Event::NetStackLocalTurn);
+        if !claim_stack_call() {
+            return Err((
+                ShardTurnError::Busy,
+                turn.take_command()
+                    .expect("local turn 未执行时必须归还命令所有权"),
+            ));
+        }
+        let result = call.invoke(&mut turn, extra_ranges);
+        if matches!(result, Ok(NET_STACK_SHARD_TURN_STATUS_OK)) && turn.valid_committed(generation)
+        {
+            return Ok(turn
+                .take_command()
+                .expect("local turn 提交后必须保留命令槽"));
+        }
+        let error = if matches!(result, Ok(NET_STACK_SHARD_TURN_STATUS_BUSY)) && turn.committed == 0
+        {
+            ShardTurnError::Busy
+        } else {
+            ShardTurnError::CallFailed
+        };
+        Err((
+            error,
+            turn.take_command()
+                .expect("local turn 失败后必须归还命令所有权"),
+        ))
     }
 
     fn invoke_control(
@@ -368,10 +447,8 @@ impl ElmShardTurnClient {
 
     pub(crate) fn run_worker_turn(
         &self,
-        mut control_commands: Vec<NetStackControlCommand>,
-        mut commands: Vec<NetStackFlowCommand>,
-        mut control_batch: net::stack::NetStackCommandBatch<NetStackControlCommand>,
-        mut command_batch: net::stack::NetStackCommandBatch<NetStackFlowCommand>,
+        control_commands: net::stack::NetStackCommandBatch<NetStackControlCommand>,
+        mut commands: net::stack::NetStackCommandBatch<NetStackFlowCommand>,
         tx_plans: net::stack::TxPlanBatch,
         config: &net::control::ConfigSnapshot,
         now_ns: u64,
@@ -380,61 +457,58 @@ impl ElmShardTurnClient {
         inline_local_tcp: bool,
     ) -> ShardWorkerTurnOutput {
         let Some(config_range) = host_range(config) else {
-            return ShardWorkerTurnOutput::failed(
-                control_commands,
-                commands,
-                control_batch,
-                command_batch,
-                tx_plans,
-            );
+            return ShardWorkerTurnOutput::failed(control_commands, commands, tx_plans);
         };
-        commands.push(NetStackFlowCommand::RunDueTimers { now_ns });
-        commands.push(NetStackFlowCommand::RunNeighborTimers {
-            now_ns,
-            output: None,
-        });
-        commands.push(NetStackFlowCommand::TakeTcpOutputBatch {
-            output: Some(core::mem::take(tcp_output)),
-            inline_pool_installs: Some(core::mem::take(inline_pool_installs)),
-            needs_resume: None,
-            limit: 256,
-            resume_budget: 256,
-            inline_local_tcp,
-            config: config as *const _,
-            now_ns,
-        });
-        commands.push(NetStackFlowCommand::NextTimerDeadline { output: None });
-        commands.push(NetStackFlowCommand::Stats { output: None });
+        commands
+            .push(NetStackFlowCommand::RunDueTimers { now_ns })
+            .unwrap_or_else(|_| unreachable!("worker turn 已预留维护命令容量"));
+        commands
+            .push(NetStackFlowCommand::RunNeighborTimers {
+                now_ns,
+                output: None,
+            })
+            .unwrap_or_else(|_| unreachable!("worker turn 已预留维护命令容量"));
+        commands
+            .push(NetStackFlowCommand::TakeTcpOutputBatch {
+                output: Some(core::mem::take(tcp_output)),
+                inline_pool_installs: Some(core::mem::take(inline_pool_installs)),
+                needs_resume: None,
+                limit: 256,
+                resume_budget: 256,
+                inline_local_tcp,
+                config: config as *const _,
+                now_ns,
+            })
+            .unwrap_or_else(|_| unreachable!("worker turn 已预留维护命令容量"));
+        commands
+            .push(NetStackFlowCommand::NextTimerDeadline { output: None })
+            .unwrap_or_else(|_| unreachable!("worker turn 已预留维护命令容量"));
+        commands
+            .push(NetStackFlowCommand::Stats { output: None })
+            .unwrap_or_else(|_| unreachable!("worker turn 已预留维护命令容量"));
         if control_commands.len().saturating_add(commands.len())
             > net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY
         {
-            return ShardWorkerTurnOutput::failed(
-                control_commands,
-                commands,
-                control_batch,
-                command_batch,
-                tx_plans,
-            );
+            return ShardWorkerTurnOutput::failed(control_commands, commands, tx_plans);
         }
-        control_batch
-            .move_from_vec(&mut control_commands)
-            .unwrap_or_else(|_| unreachable!());
-        command_batch
-            .move_from_vec(&mut commands)
-            .unwrap_or_else(|_| unreachable!());
-        let (mut control_batch, mut command_batch, tx_plans, committed) = match self
-            .invoke_fixed_batches(control_batch, command_batch, tx_plans, &[config_range])
+        let (control_commands, mut commands, tx_plans, committed, retryable) = match self
+            .invoke_fixed_batches(control_commands, commands, tx_plans, &[config_range])
         {
-            Ok(batch) => (batch.control_commands, batch.commands, batch.tx_plans, true),
-            Err((_, batch)) => (
+            Ok(batch) => (
+                batch.control_commands,
+                batch.commands,
+                batch.tx_plans,
+                true,
+                false,
+            ),
+            Err((error, batch)) => (
                 batch.control_commands,
                 batch.commands,
                 batch.tx_plans,
                 false,
+                error == ShardTurnError::Busy,
             ),
         };
-        control_batch.drain_into_vec(&mut control_commands);
-        command_batch.drain_into_vec(&mut commands);
         let stats = match commands.pop() {
             Some(NetStackFlowCommand::Stats {
                 output: Some(stats),
@@ -471,14 +545,13 @@ impl ElmShardTurnClient {
         ShardWorkerTurnOutput {
             control_commands,
             commands,
-            control_batch,
-            command_batch,
             next_timer_deadline,
             neighbor_timers,
             blocked,
             stats,
             tx_plans,
             committed,
+            retryable,
         }
     }
 }
@@ -500,40 +573,34 @@ impl ShardTurnBatch {
 }
 
 pub(crate) struct ShardWorkerTurnOutput {
-    pub(crate) control_commands: Vec<NetStackControlCommand>,
-    pub(crate) commands: Vec<NetStackFlowCommand>,
-    pub(crate) control_batch: net::stack::NetStackCommandBatch<NetStackControlCommand>,
-    pub(crate) command_batch: net::stack::NetStackCommandBatch<NetStackFlowCommand>,
+    pub(crate) control_commands: net::stack::NetStackCommandBatch<NetStackControlCommand>,
+    pub(crate) commands: net::stack::NetStackCommandBatch<NetStackFlowCommand>,
     pub(crate) next_timer_deadline: Option<u64>,
     pub(crate) neighbor_timers: Option<net::stack::NeighborTimerOutput>,
     pub(crate) blocked: bool,
     pub(crate) stats: net::flow::FlowShardStats,
     pub(crate) tx_plans: net::stack::TxPlanBatch,
     pub(crate) committed: bool,
+    pub(crate) retryable: bool,
 }
 
 impl ShardWorkerTurnOutput {
     fn failed(
-        control_commands: Vec<NetStackControlCommand>,
-        commands: Vec<NetStackFlowCommand>,
-        mut control_batch: net::stack::NetStackCommandBatch<NetStackControlCommand>,
-        mut command_batch: net::stack::NetStackCommandBatch<NetStackFlowCommand>,
+        control_commands: net::stack::NetStackCommandBatch<NetStackControlCommand>,
+        commands: net::stack::NetStackCommandBatch<NetStackFlowCommand>,
         mut tx_plans: net::stack::TxPlanBatch,
     ) -> Self {
-        control_batch.clear();
-        command_batch.clear();
         tx_plans.clear();
         Self {
             control_commands,
             commands,
-            control_batch,
-            command_batch,
             next_timer_deadline: None,
             neighbor_timers: None,
             blocked: false,
             stats: net::flow::FlowShardStats::default(),
             tx_plans,
             committed: false,
+            retryable: false,
         }
     }
 }
@@ -605,6 +672,7 @@ impl ElmControlPlane {
 struct StackRecord {
     generation: u64,
     call: StackCall,
+    local_call: Option<LocalStackCall>,
 }
 
 struct KernelNetStackBroker {
@@ -649,6 +717,22 @@ impl KernelNetStackBroker {
             }
         }
     }
+
+    fn build_local_call(
+        endpoint: Option<&NetStackLocalEndpoint>,
+    ) -> Result<Option<LocalStackCall>, ()> {
+        match endpoint {
+            None => Ok(None),
+            Some(NetStackLocalEndpoint::Integrated(call)) if *call as usize != 0 => {
+                Ok(Some(LocalStackCall::Integrated(*call)))
+            }
+            Some(NetStackLocalEndpoint::Integrated(_)) => Err(()),
+            Some(NetStackLocalEndpoint::Pinned(endpoint)) => {
+                let call = PinnedStackCall::new(endpoint, NET_STACK_LOCAL_TURN_RUST_ABI)?;
+                Ok(Some(LocalStackCall::Pinned(Arc::new(call))))
+            }
+        }
+    }
 }
 
 impl NetStackRegistrar for KernelNetStackRegistrar {
@@ -675,10 +759,24 @@ impl NetStackRegistrar for KernelNetStackRegistrar {
                 });
             }
         };
+        let local_call = match KernelNetStackBroker::build_local_call(registration.local_endpoint())
+        {
+            Ok(call) => call,
+            Err(()) => {
+                return Err(NetStackRegisterError {
+                    kind: NetStackRegisterErrorKind::ResourceExhausted,
+                    registration,
+                });
+            }
+        };
         if let Err(kind) = broker.lifecycle.activate(handle, owner_cell, generation) {
             return Err(NetStackRegisterError { kind, registration });
         }
-        broker.record = Some(StackRecord { generation, call });
+        broker.record = Some(StackRecord {
+            generation,
+            call,
+            local_call,
+        });
         assert!(
             broker.lifecycle.mark_ready(handle),
             "新注册的 net.stack generation 必须可立即进入 shard turn"

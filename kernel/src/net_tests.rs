@@ -1159,6 +1159,11 @@ fn dhcp_rebind_deadline_stays_between_renew_and_expiry() {
 }
 
 #[ktest]
+fn pending_network_commands_preserve_overflow_and_retry_order() {
+    net_runtime::verify_pending_command_batch_overflow();
+}
+
+#[ktest]
 fn dhcp_waits_for_unconfigured_interface_egress() {
     let loopback = net::InterfaceId(1);
     let physical = net::InterfaceId(2);

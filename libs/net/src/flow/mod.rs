@@ -1,10 +1,12 @@
 //! 分片内流目录、dirty 调度和分层定时器。
 
+mod execution;
 mod reassembly;
 mod shard;
 mod table;
 mod timer;
 
+pub use execution::{FlowExecLease, FlowExecution, FlowExecutionSnapshot, FlowExecutorKind};
 pub use shard::{
     FlowShard, FlowShardStats, FlowTurnContext, MAX_PENDING_NEIGHBOR_PACKETS_PER_INTERFACE,
     MAX_PENDING_NEIGHBOR_PACKETS_PER_KEY, NeighborEnqueueOutput, NeighborTimerOutput,

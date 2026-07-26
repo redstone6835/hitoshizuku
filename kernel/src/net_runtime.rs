@@ -31,12 +31,15 @@ use net::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket};
 use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
 use net::runtime::WorkSignal;
-use net::stack::{NetStackControlCommand, NetStackFlowCommand, PendingNeighborTx, TxPlan};
+use net::stack::{
+    NetStackControlCommand, NetStackCooperativeTxResult, NetStackCooperativeUdpTx,
+    NetStackFlowCommand, NetStackLocalOutputBatch, PendingNeighborTx, TxPlan,
+};
 use net::transport::{LocalUdpIngressError, PreparedTcpTx, PreparedUdpTx, TcpPath};
 use net::{
     AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, ListenGroup,
     ListenGroupId, OwnerRef, ShardId, SocketCommand, SocketError, SocketFacade, SocketKind,
-    SocketRuntime, TransportProtocol,
+    SocketRuntime, SocketTxCause, TransportProtocol,
 };
 use sched::sync::Spinlock;
 
@@ -52,6 +55,53 @@ static PINNED_QUEUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WORKER_TASKS: Spinlock<Vec<Arc<sched::Task>>> = Spinlock::new(Vec::new());
 static REGISTRAR: KernelNetRegistrar = KernelNetRegistrar;
 static SOCKET_RUNTIME_ADAPTER: KernelSocketRuntime = KernelSocketRuntime;
+static COOPERATIVE_TX_ACTIVE: [AtomicBool; sched::NR_CPUS] =
+    [const { AtomicBool::new(false) }; sched::NR_CPUS];
+static COOPERATIVE_TX_SCRATCH: [Spinlock<Option<CooperativeTxScratch>>; sched::NR_CPUS] =
+    [const { Spinlock::new(None) }; sched::NR_CPUS];
+
+struct CooperativeTxScratch {
+    tcp: NetStackLocalOutputBatch<PreparedTcpTx>,
+    udp: NetStackLocalOutputBatch<NetStackCooperativeUdpTx>,
+}
+
+impl CooperativeTxScratch {
+    fn new() -> Self {
+        Self {
+            tcp: NetStackLocalOutputBatch::new(),
+            udp: NetStackLocalOutputBatch::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tcp.clear();
+        self.udp.clear();
+    }
+}
+
+struct CooperativeTxGuard {
+    cpu: usize,
+}
+
+impl CooperativeTxGuard {
+    fn try_enter() -> Option<Self> {
+        let cpu = sched::current_cpu_id();
+        if cpu >= sched::NR_CPUS
+            || COOPERATIVE_TX_ACTIVE[cpu]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(Self { cpu })
+    }
+}
+
+impl Drop for CooperativeTxGuard {
+    fn drop(&mut self) {
+        COOPERATIVE_TX_ACTIVE[self.cpu].store(false, Ordering::Release);
+    }
+}
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 static ARP_PROBE_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -2483,13 +2533,132 @@ enum TurnControlMeta {
     },
 }
 
+struct PendingCommandBatch<T> {
+    ready: net::stack::NetStackCommandBatch<T>,
+    deferred: VecDeque<T>,
+}
+
+impl<T> PendingCommandBatch<T> {
+    fn new() -> Self {
+        Self {
+            ready: net::stack::NetStackCommandBatch::new(),
+            deferred: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ready.len().saturating_add(self.deferred.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ready.is_empty() && self.deferred.is_empty()
+    }
+
+    fn push(&mut self, command: T) {
+        if let Err(command) = self.ready.push(command) {
+            self.deferred.push_back(command);
+        }
+    }
+
+    fn move_prefix_into(
+        &mut self,
+        target: &mut net::stack::NetStackCommandBatch<T>,
+        limit: usize,
+    ) -> Result<usize, ()> {
+        if !target.is_empty() {
+            return Err(());
+        }
+        let count = self
+            .len()
+            .min(limit)
+            .min(net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY);
+        let ready_count = self.ready.len().min(count);
+        self.ready.move_prefix_into(target, ready_count)?;
+        for _ in ready_count..count {
+            let command = self
+                .deferred
+                .pop_front()
+                .expect("延后命令数量必须与待执行计数一致");
+            target
+                .push(command)
+                .unwrap_or_else(|_| unreachable!("ELM 命令前缀容量已校验"));
+        }
+        Ok(count)
+    }
+
+    fn prepend_from(
+        &mut self,
+        prefix: net::stack::NetStackCommandBatch<T>,
+    ) -> net::stack::NetStackCommandBatch<T> {
+        let mut scratch = core::mem::replace(&mut self.ready, prefix);
+        let mut ready_tail = Vec::with_capacity(scratch.len());
+        scratch.drain_into_vec(&mut ready_tail);
+        let mut deferred = VecDeque::new();
+        for command in ready_tail {
+            if let Err(command) = self.ready.push(command) {
+                deferred.push_back(command);
+            }
+        }
+        deferred.append(&mut self.deferred);
+        self.deferred = deferred;
+        scratch
+    }
+}
+
+#[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+pub(crate) fn verify_pending_command_batch_overflow() {
+    let capacity = net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY;
+    let mut pending = PendingCommandBatch::new();
+    for value in 0..capacity + 9 {
+        pending.push(value);
+    }
+    assert_eq!(pending.len(), capacity + 9);
+
+    let first_count = capacity - 3;
+    let mut turn = net::stack::NetStackCommandBatch::new();
+    assert_eq!(
+        pending
+            .move_prefix_into(&mut turn, first_count)
+            .expect("首次命令前缀必须可移动"),
+        first_count
+    );
+    for index in 0..first_count {
+        assert_eq!(turn.take(index), Some(index));
+    }
+    turn.clear();
+
+    let mut retry = net::stack::NetStackCommandBatch::new();
+    retry
+        .push(capacity + 100)
+        .unwrap_or_else(|_| unreachable!());
+    retry
+        .push(capacity + 101)
+        .unwrap_or_else(|_| unreachable!());
+    let scratch = pending.prepend_from(retry);
+    assert!(scratch.is_empty());
+
+    let mut observed = Vec::new();
+    while !pending.is_empty() {
+        let mut turn = net::stack::NetStackCommandBatch::new();
+        let count = pending
+            .move_prefix_into(&mut turn, capacity)
+            .expect("后续命令前缀必须可移动");
+        for index in 0..count {
+            observed.push(turn.take(index).expect("已移动命令必须保持连续"));
+        }
+    }
+    let mut expected = alloc::vec![capacity + 100, capacity + 101];
+    expected.extend(first_count..capacity + 9);
+    assert_eq!(observed, expected);
+}
+
 struct TurnCommands(
-    Vec<NetStackFlowCommand>,
+    PendingCommandBatch<NetStackFlowCommand>,
     Option<net::stack::NetStackCommandBatch<NetStackFlowCommand>>,
 );
 
 struct TurnControlCommands(
-    Vec<NetStackControlCommand>,
+    PendingCommandBatch<NetStackControlCommand>,
     Option<net::stack::NetStackCommandBatch<NetStackControlCommand>>,
 );
 
@@ -2525,6 +2694,14 @@ pub fn start_workers() {
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
     let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();
+    for cpu in 0..sched::NR_CPUS {
+        if online & (1u64 << cpu) != 0 {
+            let mut slot = COOPERATIVE_TX_SCRATCH[cpu].lock();
+            if slot.is_none() {
+                *slot = Some(CooperativeTxScratch::new());
+            }
+        }
+    }
     // ELM 可按启动上限预建状态；host 只激活设备实际提供 queue pair 对应的前缀，
     // 避免单 RX queue 后继续做没有硬件并行收益的软件跨核分发。
     let mut protocol_cpus = (0..sched::NR_CPUS)
@@ -2589,14 +2766,14 @@ pub fn start_workers() {
                 local_ingress: VecDeque::with_capacity(128),
                 pending: core::array::from_fn(|_| None),
                 turn_control_commands: TurnControlCommands(
-                    Vec::with_capacity(net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY),
+                    PendingCommandBatch::new(),
                     Some(net::stack::NetStackCommandBatch::new()),
                 ),
                 turn_control_meta: Vec::with_capacity(
                     net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY,
                 ),
                 turn_commands: TurnCommands(
-                    Vec::with_capacity(net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY),
+                    PendingCommandBatch::new(),
                     Some(net::stack::NetStackCommandBatch::new()),
                 ),
                 turn_meta: Vec::with_capacity(net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY),
@@ -4615,32 +4792,39 @@ impl NetWorkerContext {
         config: &ConfigSnapshot,
         now_ns: u64,
     ) -> (Option<u64>, bool) {
-        let mut control_commands = core::mem::take(&mut self.turn_control_commands.0);
         let mut control_meta = core::mem::take(&mut self.turn_control_meta);
-        let mut commands = core::mem::take(&mut self.turn_commands.0);
         let mut meta = core::mem::take(&mut self.turn_meta);
-        debug_assert_eq!(control_commands.len(), control_meta.len());
-        debug_assert_eq!(commands.len(), meta.len());
+        debug_assert_eq!(self.turn_control_commands.0.len(), control_meta.len());
+        debug_assert_eq!(self.turn_commands.0.len(), meta.len());
         let input_capacity = net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY - 5;
-        let control_limit = control_commands.len().min(input_capacity);
-        let mut deferred_control_commands = control_commands.split_off(control_limit);
+        let control_limit = self.turn_control_commands.0.len().min(input_capacity);
         let mut deferred_control_meta = control_meta.split_off(control_limit);
-        let flow_limit = commands
+        let flow_limit = self
+            .turn_commands
+            .0
             .len()
-            .min(input_capacity.saturating_sub(control_commands.len()));
-        let mut deferred_commands = commands.split_off(flow_limit);
+            .min(input_capacity.saturating_sub(control_limit));
         let mut deferred_meta = meta.split_off(flow_limit);
-        let deferred = !deferred_control_commands.is_empty() || !deferred_commands.is_empty();
-        let control_batch = self
+        let deferred = self.turn_control_commands.0.len() > control_limit
+            || self.turn_commands.0.len() > flow_limit;
+        let mut control_commands = self
             .turn_control_commands
             .1
             .take()
             .expect("NetWorker control batch scratch 必须存在");
-        let command_batch = self
+        let mut commands = self
             .turn_commands
             .1
             .take()
             .expect("NetWorker command batch scratch 必须存在");
+        self.turn_control_commands
+            .0
+            .move_prefix_into(&mut control_commands, control_limit)
+            .unwrap_or_else(|_| unreachable!("control batch scratch 必须为空"));
+        self.turn_commands
+            .0
+            .move_prefix_into(&mut commands, flow_limit)
+            .unwrap_or_else(|_| unreachable!("command batch scratch 必须为空"));
         let tx_plans = self
             .turn_tx_plans
             .0
@@ -4649,8 +4833,6 @@ impl NetWorkerContext {
         let output = self.protocol.run_worker_turn(
             control_commands,
             commands,
-            control_batch,
-            command_batch,
             tx_plans,
             config,
             now_ns,
@@ -4678,12 +4860,28 @@ impl NetWorkerContext {
         }
         tx_plans.clear();
         self.turn_tx_plans.0 = Some(tx_plans);
-        self.turn_control_commands.1 = Some(output.control_batch);
-        self.turn_commands.1 = Some(output.command_batch);
         let turn_stats = output.stats;
         let neighbor_timers = output.neighbor_timers;
         let next_timer_deadline = output.next_timer_deadline;
         let blocked = output.blocked;
+        if output.retryable {
+            let control_scratch = self
+                .turn_control_commands
+                .0
+                .prepend_from(output.control_commands);
+            let command_scratch = self.turn_commands.0.prepend_from(output.commands);
+            self.turn_control_commands.1 = Some(control_scratch);
+            self.turn_commands.1 = Some(command_scratch);
+            let mut queued_control_meta = core::mem::take(&mut self.turn_control_meta);
+            control_meta.append(&mut deferred_control_meta);
+            control_meta.append(&mut queued_control_meta);
+            self.turn_control_meta = control_meta;
+            let mut queued_meta = core::mem::take(&mut self.turn_meta);
+            meta.append(&mut deferred_meta);
+            meta.append(&mut queued_meta);
+            self.turn_meta = meta;
+            return (None, true);
+        }
         let committed = output.committed
             && output.control_commands.len() == control_meta.len()
             && output.commands.len() == meta.len();
@@ -4691,7 +4889,10 @@ impl NetWorkerContext {
         let mut control_meta = control_meta;
         let mut control_deadline = None;
         if committed {
-            for (command, command_meta) in control_commands.drain(..).zip(control_meta.drain(..)) {
+            for (index, command_meta) in control_meta.drain(..).enumerate() {
+                let command = control_commands
+                    .take(index)
+                    .expect("提交的 control command 必须保持连续");
                 match (command, command_meta) {
                     (
                         NetStackControlCommand::RunDad {
@@ -5029,26 +5230,25 @@ impl NetWorkerContext {
                 }
             }
         } else {
-            for (command, command_meta) in control_commands.drain(..).zip(control_meta.drain(..)) {
+            for (index, command_meta) in control_meta.drain(..).enumerate() {
+                let command = control_commands
+                    .take(index)
+                    .expect("失败的 control command 必须归还所有权");
                 self.fail_turn_control_command(command, command_meta, config);
             }
         }
-        let mut queued_control_commands = core::mem::take(&mut self.turn_control_commands.0);
+        control_commands.clear();
+        self.turn_control_commands.1 = Some(control_commands);
         let mut queued_control_meta = core::mem::take(&mut self.turn_control_meta);
-        self.turn_control_commands.0 = control_commands;
-        self.turn_control_commands
-            .0
-            .append(&mut deferred_control_commands);
-        self.turn_control_commands
-            .0
-            .append(&mut queued_control_commands);
-        self.turn_control_meta = control_meta;
-        self.turn_control_meta.append(&mut deferred_control_meta);
+        self.turn_control_meta = deferred_control_meta;
         self.turn_control_meta.append(&mut queued_control_meta);
         let mut commands = output.commands;
         let mut meta = meta;
         if committed {
-            for (command, command_meta) in commands.drain(..).zip(meta.drain(..)) {
+            for (index, command_meta) in meta.drain(..).enumerate() {
+                let command = commands
+                    .take(index)
+                    .expect("提交的 flow command 必须保持连续");
                 match (command, command_meta) {
                     (
                         NetStackFlowCommand::ParsePacketBatch {
@@ -5605,17 +5805,17 @@ impl NetWorkerContext {
                 }
             }
         } else {
-            for (command, command_meta) in commands.drain(..).zip(meta.drain(..)) {
+            for (index, command_meta) in meta.drain(..).enumerate() {
+                let command = commands
+                    .take(index)
+                    .expect("失败的 flow command 必须归还所有权");
                 self.fail_turn_command(command, Some(command_meta));
             }
         }
-        let mut queued_commands = core::mem::take(&mut self.turn_commands.0);
+        commands.clear();
+        self.turn_commands.1 = Some(commands);
         let mut queued_meta = core::mem::take(&mut self.turn_meta);
-        self.turn_commands.0 = commands;
-        self.turn_commands.0.append(&mut deferred_commands);
-        self.turn_commands.0.append(&mut queued_commands);
-        self.turn_meta = meta;
-        self.turn_meta.append(&mut deferred_meta);
+        self.turn_meta = deferred_meta;
         self.turn_meta.append(&mut queued_meta);
         let continuation_pending =
             !self.turn_control_commands.0.is_empty() || !self.turn_commands.0.is_empty();

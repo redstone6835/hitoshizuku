@@ -28,7 +28,7 @@ use crate::transport::{
 use crate::tuning::PACKET_BATCH_CAPACITY;
 use crate::{
     Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, ListenGroup, ListenGroupId,
-    MulticastMembership, ShardId, SocketError, SocketFacade, SocketId, TcpTxLease,
+    MulticastMembership, ShardId, SocketError, SocketFacade, SocketId, SocketKind, TcpTxLease,
     TransportProtocol, UdpTxLease,
 };
 
@@ -37,11 +37,13 @@ static STACK_BOOT_CONFIG: Mutex<Option<NetStackBootConfig>> = Mutex::new(None);
 static STACK_REGISTRAR: Mutex<Option<&'static dyn NetStackRegistrar>> = Mutex::new(None);
 
 pub const NET_STACK_SHARD_TURN_RUST_ABI: &str = "fn(&mutnet::stack::NetStackShardTurn)->i32";
+pub const NET_STACK_LOCAL_TURN_RUST_ABI: &str = "fn(&mutnet::stack::NetStackLocalTurn)->i32";
 pub const NET_STACK_SHARD_TURN_STATUS_OK: i32 = 0;
 pub const NET_STACK_SHARD_TURN_STATUS_INVALID: i32 = -22;
 pub const NET_STACK_SHARD_TURN_STATUS_BUSY: i32 = -16;
 
 pub const NET_STACK_SHARD_TURN_COMMAND_CAPACITY: usize = 1024;
+pub const NET_STACK_LOCAL_TURN_EFFECT_CAPACITY: usize = 64;
 pub const NET_STACK_TX_HEADER_CAPACITY: usize = 128;
 pub const NET_STACK_TX_PLAN_CAPACITY: usize = 256;
 pub const TX_FRAGMENT_UDP: u8 = 3;
@@ -2125,6 +2127,80 @@ impl NetStackPacketParse {
 ///
 /// 该枚举只在与内核 build-bound 的 Rust ABI 调用中使用；拥有所有权的输入放在
 /// `Option` 中，ELM 仅在确认 generation 与 shard 后取走。
+pub struct NetStackLocalOutputBatch<T> {
+    slots: Box<[Option<T>]>,
+    len: u16,
+}
+
+impl<T> NetStackLocalOutputBatch<T> {
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(NET_STACK_LOCAL_TURN_EFFECT_CAPACITY);
+        slots.resize_with(NET_STACK_LOCAL_TURN_EFFECT_CAPACITY, || None);
+        Self {
+            slots: slots.into_boxed_slice(),
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn push(&mut self, value: T) -> Result<(), T> {
+        let index = self.len();
+        if index == self.slots.len() {
+            return Err(value);
+        }
+        self.slots[index] = Some(value);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn take(&mut self, index: usize) -> Option<T> {
+        (index < self.len())
+            .then(|| self.slots[index].take())
+            .flatten()
+    }
+
+    pub fn clear(&mut self) {
+        let len = self.len();
+        for slot in self.slots.iter_mut().take(len) {
+            *slot = None;
+        }
+        self.len = 0;
+    }
+
+    fn valid(&self) -> bool {
+        self.slots.len() == NET_STACK_LOCAL_TURN_EFFECT_CAPACITY
+            && self.len() <= self.slots.len()
+            && self.slots[..self.len()].iter().all(Option::is_some)
+            && self.slots[self.len()..].iter().all(Option::is_none)
+    }
+}
+
+impl<T> Default for NetStackLocalOutputBatch<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub enum NetStackCooperativeUdpTx {
+    Prepared(PreparedUdpTx),
+    Failed(SocketError, UdpTxLease),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetStackCooperativeTxResult {
+    pub kind: SocketKind,
+    pub processed: u16,
+    pub more_work: bool,
+    pub stats: FlowShardStats,
+}
+
 pub enum NetStackFlowCommand {
     Stats {
         output: Option<FlowShardStats>,
@@ -2204,6 +2280,18 @@ pub enum NetStackFlowCommand {
     DrainTcpSend {
         flow: FlowId,
         now_ns: u64,
+    },
+    CooperativeSocketTx {
+        flow: FlowId,
+        facade: Arc<SocketFacade>,
+        mark: u32,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        limit: u16,
+        inline_local: bool,
+        tcp_output: NetStackLocalOutputBatch<PreparedTcpTx>,
+        udp_output: NetStackLocalOutputBatch<NetStackCooperativeUdpTx>,
+        result: Option<NetStackCooperativeTxResult>,
     },
     TakeTcpOutputBatch {
         output: Option<Vec<PreparedTcpTx>>,
@@ -2322,6 +2410,47 @@ pub enum NetStackFlowCommand {
         now_ns: u64,
         output: Option<bool>,
     },
+}
+
+impl NetStackFlowCommand {
+    fn valid_local(&self, committed: bool) -> bool {
+        let Self::CooperativeSocketTx {
+            config,
+            limit,
+            tcp_output,
+            udp_output,
+            result,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if config.is_null()
+            || !config.is_aligned()
+            || *limit == 0
+            || usize::from(*limit) > NET_STACK_LOCAL_TURN_EFFECT_CAPACITY
+            || !tcp_output.valid()
+            || !udp_output.valid()
+        {
+            return false;
+        }
+        if !committed {
+            return result.is_none() && tcp_output.is_empty() && udp_output.is_empty();
+        }
+        let Some(result) = result else {
+            return false;
+        };
+        usize::from(result.processed) <= usize::from(*limit)
+            && match result.kind {
+                SocketKind::Stream => {
+                    tcp_output.len() <= usize::from(result.processed) && udp_output.is_empty()
+                }
+                SocketKind::Datagram => {
+                    udp_output.len() <= usize::from(result.processed) && tcp_output.is_empty()
+                }
+                SocketKind::Raw => false,
+            }
+    }
 }
 
 /// 常驻 host 对 ELM 全局网络控制面的同步操作。
@@ -3419,6 +3548,46 @@ impl<T> NetStackCommandBatch<T> {
         self.len = 0;
     }
 
+    /// 把队首的有限条目移动到另一个空批次，剩余条目保持原顺序。
+    pub fn move_prefix_into(&mut self, target: &mut Self, limit: usize) -> Result<usize, ()> {
+        if !target.is_empty() {
+            return Err(());
+        }
+        let count = self.len().min(limit).min(target.slots.len());
+        for index in 0..count {
+            let value = self.slots[index]
+                .take()
+                .expect("command batch 有效前缀必须连续");
+            target.push(value).unwrap_or_else(|_| unreachable!());
+        }
+        self.slots.rotate_left(count);
+        self.len -= count as u16;
+        Ok(count)
+    }
+
+    pub fn append_from(&mut self, source: &mut Self) -> Result<(), ()> {
+        if self.len().saturating_add(source.len()) > self.slots.len() {
+            return Err(());
+        }
+        let count = source.len();
+        for index in 0..count {
+            let value = source.slots[index]
+                .take()
+                .expect("command batch 有效前缀必须连续");
+            self.push(value).unwrap_or_else(|_| unreachable!());
+        }
+        source.slots.rotate_left(count);
+        source.len = 0;
+        Ok(())
+    }
+
+    /// 取走有效前缀中的指定条目，批次长度保持不变，供提交结果按索引消费。
+    pub fn take(&mut self, index: usize) -> Option<T> {
+        (index < self.len())
+            .then(|| self.slots[index].take())
+            .flatten()
+    }
+
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         (index < self.len())
             .then(|| self.slots[index].as_mut())
@@ -3445,6 +3614,7 @@ impl<T> NetStackCommandBatch<T> {
         self.slots.len() == NET_STACK_SHARD_TURN_COMMAND_CAPACITY
             && self.len() <= self.slots.len()
             && self.slots[..self.len()].iter().all(Option::is_some)
+            && self.slots[self.len()..].iter().all(Option::is_none)
     }
 }
 
@@ -3551,6 +3721,64 @@ impl NetStackShardTurn {
                 .saturating_add(self.commands.len())
                 <= NET_STACK_SHARD_TURN_COMMAND_CAPACITY
             && (self.control_commands.is_empty() || self.shard == ShardId(0))
+    }
+}
+
+/// cooperative syscall 使用的固定容量数据面调用帧。
+///
+/// 该调用帧只允许一个 flow command，因而一次 syscall attempt 不可能在 ABI 内拆成
+/// 多次 ELM 调用。命令及其返回值始终占用同一槽位，不经过动态批次转换。
+#[repr(C)]
+pub struct NetStackLocalTurn {
+    pub struct_size: u32,
+    pub generation: u64,
+    pub shard: ShardId,
+    pub committed: u8,
+    pub reserved: [u8; 5],
+    pub command: Option<NetStackFlowCommand>,
+}
+
+#[kernel_symbols::export]
+impl NetStackLocalTurn {
+    pub fn new(generation: u64, shard: ShardId, command: NetStackFlowCommand) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            generation,
+            shard,
+            committed: 0,
+            reserved: [0; 5],
+            command: Some(command),
+        }
+    }
+
+    #[kernel_symbols::export(
+        name = "net.stack.NetStackLocalTurn.valid_header",
+        contract = "kernel.net.stack-flow-state@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::NETWORK_STACK
+    )]
+    pub fn valid_header(&self, generation: u64) -> bool {
+        self.valid(generation, 0)
+    }
+
+    pub fn valid_committed(&self, generation: u64) -> bool {
+        self.valid(generation, 1)
+    }
+
+    pub fn take_command(&mut self) -> Option<NetStackFlowCommand> {
+        self.command.take()
+    }
+
+    fn valid(&self, generation: u64, committed: u8) -> bool {
+        self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.generation == generation
+            && self.generation != 0
+            && self.committed == committed
+            && self.reserved == [0; 5]
+            && self
+                .command
+                .as_ref()
+                .is_some_and(|command| command.valid_local(committed == 1))
     }
 }
 
@@ -3756,6 +3984,7 @@ pub fn dispatch_flow_shard_command(
         NetStackFlowCommand::DrainTcpSend { flow, now_ns } => {
             shard.drain_tcp_send(*flow, *now_ns);
         }
+        NetStackFlowCommand::CooperativeSocketTx { .. } => return false,
         NetStackFlowCommand::TakeTcpOutputBatch {
             output,
             inline_pool_installs,
@@ -4336,9 +4565,15 @@ impl PinnedNetStackShardTurnEndpoint {
 }
 
 pub type IntegratedNetStackShardTurn = fn(&mut NetStackShardTurn) -> i32;
+pub type IntegratedNetStackLocalTurn = fn(&mut NetStackLocalTurn) -> i32;
 
 pub enum NetStackEndpoint {
     Integrated(IntegratedNetStackShardTurn),
+    Pinned(PinnedNetStackShardTurnEndpoint),
+}
+
+pub enum NetStackLocalEndpoint {
+    Integrated(IntegratedNetStackLocalTurn),
     Pinned(PinnedNetStackShardTurnEndpoint),
 }
 
@@ -4346,6 +4581,7 @@ pub enum NetStackEndpoint {
 pub struct NetStackRegistration {
     handle: NetStackHandle,
     endpoint: NetStackEndpoint,
+    local_endpoint: Option<NetStackLocalEndpoint>,
 }
 
 #[kernel_symbols::export]
@@ -4357,6 +4593,22 @@ impl NetStackRegistration {
         Some(Self {
             handle: next_stack_handle(),
             endpoint: NetStackEndpoint::Integrated(call),
+            local_endpoint: None,
+        })
+    }
+
+    pub fn integrated_with_local(
+        call: IntegratedNetStackShardTurn,
+        local_call: IntegratedNetStackLocalTurn,
+    ) -> Option<Self> {
+        if elm_model::current_context().is_some() || call as usize == 0 || local_call as usize == 0
+        {
+            return None;
+        }
+        Some(Self {
+            handle: next_stack_handle(),
+            endpoint: NetStackEndpoint::Integrated(call),
+            local_endpoint: Some(NetStackLocalEndpoint::Integrated(local_call)),
         })
     }
 
@@ -4370,6 +4622,29 @@ impl NetStackRegistration {
         Some(Self {
             handle: next_stack_handle(),
             endpoint: NetStackEndpoint::Pinned(endpoint),
+            local_endpoint: None,
+        })
+    }
+
+    #[kernel_symbols::export(
+        name = "net.stack.NetStackRegistration.pinned_with_local",
+        contract = "kernel.net.stack-registration@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::NETWORK_STACK
+    )]
+    pub fn pinned_with_local(
+        endpoint: PinnedNetStackShardTurnEndpoint,
+        local_endpoint: PinnedNetStackShardTurnEndpoint,
+    ) -> Option<Self> {
+        if endpoint.owner_cell() != local_endpoint.owner_cell()
+            || endpoint.owner_generation() != local_endpoint.owner_generation()
+        {
+            return None;
+        }
+        Some(Self {
+            handle: next_stack_handle(),
+            endpoint: NetStackEndpoint::Pinned(endpoint),
+            local_endpoint: Some(NetStackLocalEndpoint::Pinned(local_endpoint)),
         })
     }
 
@@ -4395,12 +4670,33 @@ impl NetStackRegistration {
         &self.endpoint
     }
 
+    pub fn local_endpoint(&self) -> Option<&NetStackLocalEndpoint> {
+        self.local_endpoint.as_ref()
+    }
+
     fn valid_for_current_context(&self) -> bool {
-        match (&self.endpoint, elm_model::current_context()) {
-            (NetStackEndpoint::Integrated(_), None) => true,
-            (NetStackEndpoint::Pinned(endpoint), Some(context)) => {
+        match (
+            &self.endpoint,
+            &self.local_endpoint,
+            elm_model::current_context(),
+        ) {
+            (
+                NetStackEndpoint::Integrated(_),
+                None | Some(NetStackLocalEndpoint::Integrated(_)),
+                None,
+            ) => true,
+            (NetStackEndpoint::Pinned(endpoint), local_endpoint, Some(context)) => {
                 endpoint.owner_cell() == context.cell_id.0
                     && endpoint.owner_generation() == context.generation.0
+                    && local_endpoint
+                        .as_ref()
+                        .is_none_or(|local_endpoint| match local_endpoint {
+                            NetStackLocalEndpoint::Pinned(local_endpoint) => {
+                                local_endpoint.owner_cell() == context.cell_id.0
+                                    && local_endpoint.owner_generation() == context.generation.0
+                            }
+                            NetStackLocalEndpoint::Integrated(_) => false,
+                        })
             }
             _ => false,
         }
@@ -5126,6 +5422,70 @@ mod tests {
         assert!(!turn.valid_header(8));
         turn.reserved1[0] = 1;
         assert!(!turn.valid_header(7));
+    }
+
+    #[test]
+    fn local_turn_only_accepts_bounded_cooperative_command() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 91,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Stream,
+        ));
+        let config = core::ptr::NonNull::<ConfigSnapshot>::dangling().as_ptr();
+        let mut turn = NetStackLocalTurn::new(
+            9,
+            ShardId(0),
+            NetStackFlowCommand::CooperativeSocketTx {
+                flow: FlowId(1),
+                facade,
+                mark: 0,
+                config,
+                now_ns: 1,
+                limit: 8,
+                inline_local: false,
+                tcp_output: NetStackLocalOutputBatch::new(),
+                udp_output: NetStackLocalOutputBatch::new(),
+                result: None,
+            },
+        );
+        assert!(turn.valid_header(9));
+        let Some(NetStackFlowCommand::CooperativeSocketTx { result, .. }) = turn.command.as_mut()
+        else {
+            unreachable!();
+        };
+        *result = Some(NetStackCooperativeTxResult {
+            kind: SocketKind::Stream,
+            processed: 0,
+            more_work: false,
+            stats: FlowShardStats::default(),
+        });
+        turn.committed = 1;
+        assert!(turn.valid_committed(9));
+
+        let generic = NetStackLocalTurn::new(
+            9,
+            ShardId(0),
+            NetStackFlowCommand::RunDueTimers { now_ns: 1 },
+        );
+        assert!(!generic.valid_header(9));
+    }
+
+    #[test]
+    fn local_output_batch_has_fixed_capacity_and_reuses_slots() {
+        let mut batch = NetStackLocalOutputBatch::new();
+        for value in 0..NET_STACK_LOCAL_TURN_EFFECT_CAPACITY {
+            assert!(batch.push(value).is_ok());
+        }
+        assert!(batch.push(usize::MAX).is_err());
+        for index in 0..NET_STACK_LOCAL_TURN_EFFECT_CAPACITY {
+            assert_eq!(batch.take(index), Some(index));
+        }
+        batch.clear();
+        assert!(batch.is_empty());
+        assert!(batch.push(7).is_ok());
     }
 
     #[test]
