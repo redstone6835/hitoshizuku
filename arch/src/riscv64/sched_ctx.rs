@@ -11,7 +11,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
-use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
+use sched::arch_hooks::{
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry,
+};
 
 use crate::riscv64::specific::{
     HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id, kernel_timestamp_ns,
@@ -136,6 +138,10 @@ static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
     current_cpu_id,
 };
 
+static ARCH_DEADLINE_TIMER_OPS: ArchDeadlineTimerOps = ArchDeadlineTimerOps {
+    reprogram: super::time::rearm_local_timer,
+};
+
 /// # Safety
 ///
 /// `stack_top` 必须是当前任务的有效内核栈顶。
@@ -174,6 +180,7 @@ pub fn register() {
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
+        sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
         sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
         sched::arch_hooks::register_cpu_control(&super::smp::CPU_CONTROL_OPS);

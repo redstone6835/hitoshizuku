@@ -129,6 +129,7 @@ struct TimedSleeper {
 }
 
 static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
+static HAS_TIMED_SLEEPERS: AtomicBool = AtomicBool::new(false);
 
 /// 由调度定时器在指定 deadline 到期后定向通知的对象。
 pub trait DeadlineObserver: Send + Sync {
@@ -170,6 +171,7 @@ struct RealtimeItimer {
 }
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
+static HAS_REALTIME_ITIMERS: AtomicBool = AtomicBool::new(false);
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 
 const NSEC_PER_USEC: u64 = 1_000;
@@ -1582,6 +1584,7 @@ fn register_sleep_deadline_on_cpu(task: &Arc<Task>, deadline_ns: u64, cpu_id: us
                 task: Arc::downgrade(task),
             });
         }
+        HAS_TIMED_SLEEPERS.store(true, Ordering::Release);
     }
     true
 }
@@ -1600,7 +1603,7 @@ pub(crate) fn register_sleep_deadline_for_test(
 /// 返回 `true` 表示队列内容确实发生变化。已经由 timer 消费的登记项不再触发
 /// 冗余硬件重编程，缩短超时 syscall 的返回热路径。
 pub fn cancel_sleep_deadline(task: &Arc<Task>) -> bool {
-    let changed = {
+    let (changed, nonempty) = {
         let mut sleepers = TIMED_SLEEPERS.lock();
         let old_len = sleepers.len();
         sleepers.retain(|entry| {
@@ -1610,8 +1613,9 @@ pub fn cancel_sleep_deadline(task: &Arc<Task>) -> bool {
                 .as_ref()
                 .is_some_and(|queued| !Arc::ptr_eq(queued, task))
         });
-        sleepers.len() != old_len
+        (sleepers.len() != old_len, !sleepers.is_empty())
     };
+    HAS_TIMED_SLEEPERS.store(nonempty, Ordering::Release);
     if changed {
         reprogram_deadline_timer();
     }
@@ -1763,6 +1767,7 @@ pub fn set_realtime_itimer(
                 thread_group: Arc::downgrade(&tg),
             });
         }
+        HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
         old
     };
     reprogram_deadline_timer();
@@ -1770,24 +1775,32 @@ pub fn set_realtime_itimer(
 }
 
 fn earliest_deadline(cpu_id: usize) -> Option<u64> {
-    let sleeper_deadline = {
-        let mut sleepers = TIMED_SLEEPERS.lock();
-        sleepers.retain(|entry| entry.task.upgrade().is_some());
-        sleepers
-            .iter()
-            .filter(|entry| entry.cpu_id == cpu_id)
-            .map(|entry| entry.deadline_ns)
-            .min()
-    };
-    let itimer_deadline = {
-        let mut timers = REALTIME_ITIMERS.lock();
-        timers.retain(|entry| entry.thread_group.upgrade().is_some());
-        timers
-            .iter()
-            .filter(|entry| entry.cpu_id == cpu_id)
-            .map(|entry| entry.deadline_ns)
-            .min()
-    };
+    let sleeper_deadline = HAS_TIMED_SLEEPERS
+        .load(Ordering::Acquire)
+        .then(|| {
+            let mut sleepers = TIMED_SLEEPERS.lock();
+            sleepers.retain(|entry| entry.task.upgrade().is_some());
+            HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
+            sleepers
+                .iter()
+                .filter(|entry| entry.cpu_id == cpu_id)
+                .map(|entry| entry.deadline_ns)
+                .min()
+        })
+        .flatten();
+    let itimer_deadline = HAS_REALTIME_ITIMERS
+        .load(Ordering::Acquire)
+        .then(|| {
+            let mut timers = REALTIME_ITIMERS.lock();
+            timers.retain(|entry| entry.thread_group.upgrade().is_some());
+            HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
+            timers
+                .iter()
+                .filter(|entry| entry.cpu_id == cpu_id)
+                .map(|entry| entry.deadline_ns)
+                .min()
+        })
+        .flatten();
     match (sleeper_deadline, itimer_deadline) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
@@ -1800,15 +1813,24 @@ pub(crate) fn earliest_deadline_for_test(cpu_id: usize) -> Option<u64> {
     earliest_deadline(cpu_id)
 }
 
-/// 读取当前 CPU 的软件计时源，并据此重编程本地定时器。
+/// 合并调用方的临时截止时间与当前 CPU 的调度截止时间，并重编程本地定时器。
 ///
-/// 每个等待只由登记它的 CPU 驱动。这样不会在同一绝对时刻制造跨 CPU 定时器
-/// 惊群，也不需要由任意 CPU 抢占 deadline 后再迁移被唤醒任务。
-fn reprogram_deadline_timer() {
-    let deadline = earliest_deadline(cpu());
+/// 原生扩展等不会进入睡眠队列的受限执行区间可借此复用同一架构定时器契约。
+/// `None` 仅撤销调用方的临时约束，不会覆盖已经登记的睡眠或实时定时器。
+pub fn reprogram_current_deadline(external_deadline: Option<u64>) {
+    let scheduler_deadline = earliest_deadline(cpu());
+    let deadline = match (scheduler_deadline, external_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    };
     if let Some(ops) = arch_hooks::deadline_timer() {
         (ops.reprogram)(deadline);
     }
+}
+
+fn reprogram_deadline_timer() {
+    reprogram_current_deadline(None);
 }
 
 /// CPU 下线时把其尚未到期的软件计时器迁移到仍在线的 CPU。
@@ -1833,6 +1855,9 @@ fn migrate_deadline_owners(source_cpu: usize, target_cpu: usize) {
 }
 
 fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
+    if !HAS_TIMED_SLEEPERS.load(Ordering::Acquire) {
+        return None;
+    }
     let mut sleepers = TIMED_SLEEPERS.lock();
     let mut index = 0;
     while index < sleepers.len() {
@@ -1842,10 +1867,12 @@ fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
         };
         if sleepers[index].cpu_id == cpu_id && sleepers[index].deadline_ns <= now_ns {
             sleepers.swap_remove(index);
+            HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
             return Some(task);
         }
         index += 1;
     }
+    HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
     None
 }
 
@@ -1862,6 +1889,9 @@ fn wake_expired_sleepers(now_ns: u64, cpu_id: usize) -> bool {
 }
 
 fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
+    if !HAS_REALTIME_ITIMERS.load(Ordering::Acquire) {
+        return false;
+    }
     let expired = {
         let mut timers = REALTIME_ITIMERS.lock();
         let mut expired = Vec::new();
@@ -1894,6 +1924,7 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
             timers[idx].deadline_ns = next_deadline;
             idx += 1;
         }
+        HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
         expired
     };
 
@@ -2558,10 +2589,14 @@ fn on_timer_tick_inner(now_ns: u64) -> bool {
 }
 
 fn service_expired_timer_events(now_ns: u64, cpu_id: usize) -> bool {
+    let had_scheduler_deadline =
+        HAS_TIMED_SLEEPERS.load(Ordering::Acquire) || HAS_REALTIME_ITIMERS.load(Ordering::Acquire);
     fire_expired_deadline_observers(now_ns);
     let deadline_fired = wake_expired_sleepers(now_ns, cpu_id);
     let realtime_fired = fire_expired_realtime_itimers(now_ns, cpu_id);
-    reprogram_deadline_timer();
+    if had_scheduler_deadline {
+        reprogram_deadline_timer();
+    }
     deadline_fired || realtime_fired
 }
 
