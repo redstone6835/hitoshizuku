@@ -10,10 +10,54 @@ use ktest::ktest;
 
 use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqEvent, RseqRegistration,
-    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskState,
-    TaskUsage, ThreadGroup, supported_cpu_mask,
+    ArchContextOps, CpuMask, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS, ProcessGroup,
+    RobustListState, RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy,
+    Session, TASK_COMM_LEN, Task, TaskState, TaskUsage, ThreadGroup, supported_cpu_mask,
 };
+
+const TEST_EXECUTION_ACTION: u64 = 1;
+
+#[ktest]
+fn task_execution_scope_allows_each_action_once_and_resets_on_exit() {
+    let task = make_task();
+
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::OutsideScope
+    );
+    assert!(task.begin_execution_scope(ExecutionScopeKind::Syscall));
+    assert_eq!(
+        task.execution_scope_kind(),
+        Some(ExecutionScopeKind::Syscall)
+    );
+    assert!(!task.begin_execution_scope(ExecutionScopeKind::NetworkWorker));
+    assert!(!task.execution_action_claimed(TEST_EXECUTION_ACTION));
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::Claimed(ExecutionScopeKind::Syscall)
+    );
+    assert!(task.execution_action_claimed(TEST_EXECUTION_ACTION));
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::AlreadyClaimed(ExecutionScopeKind::Syscall)
+    );
+    assert_eq!(
+        task.end_execution_scope(ExecutionScopeKind::Syscall),
+        TEST_EXECUTION_ACTION
+    );
+    assert_eq!(task.execution_scope_kind(), None);
+    assert!(!task.execution_action_claimed(TEST_EXECUTION_ACTION));
+
+    assert!(task.begin_execution_scope(ExecutionScopeKind::NetworkWorker));
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::Claimed(ExecutionScopeKind::NetworkWorker)
+    );
+    assert_eq!(
+        task.end_execution_scope(ExecutionScopeKind::NetworkWorker),
+        TEST_EXECUTION_ACTION
+    );
+}
 
 unsafe fn init_test_context(
     _ctx: NonNull<u8>,

@@ -6,10 +6,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use net::stack::{
-    NET_STACK_SHARD_TURN_RUST_ABI, NET_STACK_SHARD_TURN_STATUS_OK, NetStackControlCommand,
+    NET_STACK_SHARD_TURN_RUST_ABI, NET_STACK_SHARD_TURN_STATUS_BUSY,
+    NET_STACK_SHARD_TURN_STATUS_OK, NetStackControlCommand,
     NetStackEndpoint, NetStackFlowCommand, NetStackHandle, NetStackLifecycle,
     NetStackRegisterError, NetStackRegisterErrorKind, NetStackRegistrar, NetStackRegistration,
     NetStackRemoveError, NetStackShardTurn, NetStackSnapshot, NetStackState,
@@ -17,29 +16,50 @@ use net::stack::{
 use sched::sync::Spinlock;
 
 static BROKER: Spinlock<KernelNetStackBroker> = Spinlock::new(KernelNetStackBroker::new());
-static WORKER_TURN_STACK_CALLS: [AtomicU32; sched::NR_CPUS] =
-    [const { AtomicU32::new(0) }; sched::NR_CPUS];
+pub(crate) const NET_STACK_EXECUTION_ACTION: u64 = 1;
 
-pub(crate) fn begin_worker_turn_stack_calls() {
-    let cpu = sched::current_cpu_id();
-    if cpu < sched::NR_CPUS {
-        WORKER_TURN_STACK_CALLS[cpu].store(0, Ordering::Release);
+#[cfg(feature = "performance-profile")]
+fn observe_duplicate_stack_request(kind: Option<sched::ExecutionScopeKind>) {
+    profiling::observe(profiling::Metric::NetStackDuplicateRequests, 1);
+    match kind {
+        Some(sched::ExecutionScopeKind::Syscall) => {
+            profiling::observe(profiling::Metric::NetStackDuplicateSyscall, 1);
+        }
+        Some(sched::ExecutionScopeKind::NetworkWorker) => {
+            profiling::observe(profiling::Metric::NetStackDuplicateWorker, 1);
+        }
+        None => {}
     }
 }
 
-pub(crate) fn finish_worker_turn_stack_calls() -> u32 {
-    let cpu = sched::current_cpu_id();
-    if cpu >= sched::NR_CPUS {
-        return 0;
+fn claim_stack_call() -> bool {
+    let claim = sched::current_task_fast().claim_execution_action(NET_STACK_EXECUTION_ACTION);
+    #[cfg(feature = "performance-profile")]
+    match claim {
+        sched::ExecutionActionClaim::Claimed(sched::ExecutionScopeKind::Syscall) => {
+            profiling::observe(profiling::Metric::NetStackSyscallCalls, 1);
+        }
+        sched::ExecutionActionClaim::Claimed(sched::ExecutionScopeKind::NetworkWorker) => {
+            profiling::observe(profiling::Metric::NetStackWorkerCalls, 1);
+        }
+        sched::ExecutionActionClaim::OutsideScope => {
+            profiling::observe(profiling::Metric::NetStackUnscopedCalls, 1);
+        }
+        sched::ExecutionActionClaim::AlreadyClaimed(kind) => {
+            observe_duplicate_stack_request(Some(kind));
+        }
     }
-    WORKER_TURN_STACK_CALLS[cpu].load(Ordering::Acquire)
+    !matches!(claim, sched::ExecutionActionClaim::AlreadyClaimed(_))
 }
 
-fn record_worker_turn_stack_call() {
-    let cpu = sched::current_cpu_id();
-    if cpu < sched::NR_CPUS {
-        WORKER_TURN_STACK_CALLS[cpu].fetch_add(1, Ordering::AcqRel);
+pub(crate) fn stack_call_budget_exhausted() -> bool {
+    let task = sched::current_task_fast();
+    let exhausted = task.execution_action_claimed(NET_STACK_EXECUTION_ACTION);
+    #[cfg(feature = "performance-profile")]
+    if exhausted {
+        observe_duplicate_stack_request(task.execution_scope_kind());
     }
+    exhausted
 }
 
 struct KernelNetStackRegistrar;
@@ -250,7 +270,6 @@ impl ElmShardTurnClient {
         tx_plans: net::stack::TxPlanBatch,
         extra_ranges: &[(usize, usize)],
     ) -> Result<ShardTurnBatch, (ShardTurnError, ShardTurnBatch)> {
-        record_worker_turn_stack_call();
         let (generation, call) = {
             let broker = BROKER.lock();
             let snapshot = broker.lifecycle.snapshot();
@@ -321,11 +340,17 @@ impl ElmShardTurnClient {
         range_count += 1;
         ranges[range_count..range_count + extra_ranges.len()].copy_from_slice(extra_ranges);
         range_count += extra_ranges.len();
+        if !claim_stack_call() {
+            return Err((ShardTurnError::Busy, ShardTurnBatch::from_call(flow)));
+        }
         let result = call.invoke(&mut flow, &ranges[..range_count]);
         let committed_valid = flow.valid_committed(generation);
         let valid = matches!(result, Ok(NET_STACK_SHARD_TURN_STATUS_OK)) && committed_valid;
         if valid {
             return Ok(ShardTurnBatch::from_call(flow));
+        }
+        if matches!(result, Ok(NET_STACK_SHARD_TURN_STATUS_BUSY)) && flow.committed == 0 {
+            return Err((ShardTurnError::Busy, ShardTurnBatch::from_call(flow)));
         }
         log::error!(
             "[net-stack] shard-turn failed: result={:?} generation={} shard={} committed={} committed_valid={} control={} flow={} ranges={}",
@@ -600,6 +625,7 @@ pub(crate) struct ElmControlPlane {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShardTurnError {
     StackUnavailable,
+    Busy,
     CallFailed,
 }
 

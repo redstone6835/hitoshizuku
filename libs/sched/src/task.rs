@@ -267,6 +267,32 @@ pub struct TaskUsage {
     pub involuntary_ctxt_switches: u64,
 }
 
+/// 当前任务正在执行的有界内核入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExecutionScopeKind {
+    Syscall = 1,
+    NetworkWorker = 2,
+}
+
+impl ExecutionScopeKind {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Syscall),
+            2 => Some(Self::NetworkWorker),
+            _ => None,
+        }
+    }
+}
+
+/// 在当前执行作用域内认领一次有界动作的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionActionClaim {
+    OutsideScope,
+    Claimed(ExecutionScopeKind),
+    AlreadyClaimed(ExecutionScopeKind),
+}
+
 impl TaskUsage {
     pub fn add_assign(&mut self, rhs: Self) {
         self.user_ns = self.user_ns.saturating_add(rhs.user_ns);
@@ -583,6 +609,10 @@ pub struct Task {
     cpu_runtime_ns: AtomicU64,
     /// 当前连续运行区间的起点加一；零表示任务当前不占用 CPU。
     running_since_ns: AtomicU64,
+    /// syscall 与网络 worker 共享的任务级执行作用域。任务迁移后状态仍随任务保留。
+    execution_scope: AtomicU8,
+    /// 当前作用域已经认领的有界动作；每一位只允许首次认领成功。
+    execution_actions: AtomicU64,
     /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
     exited_usage_ns: AtomicU64,
     /// 当前阻塞起点、被唤醒时刻和原因；只存在于剖析构建。
@@ -703,6 +733,8 @@ impl Task {
             start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
             cpu_runtime_ns: AtomicU64::new(0),
             running_since_ns: AtomicU64::new(0),
+            execution_scope: AtomicU8::new(0),
+            execution_actions: AtomicU64::new(0),
             exited_usage_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             wait_started_ns: AtomicU64::new(0),
@@ -759,6 +791,59 @@ impl Task {
 
     pub fn is_idle_task(&self) -> bool {
         self.kind() == TaskKind::Idle
+    }
+
+    /// 开始一个不能与本任务其它有界入口重叠的执行作用域。
+    pub fn begin_execution_scope(&self, kind: ExecutionScopeKind) -> bool {
+        if self
+            .execution_scope
+            .compare_exchange(0, kind as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.execution_actions.store(0, Ordering::Release);
+        true
+    }
+
+    /// 结束作用域并返回其中成功认领过的动作位。
+    pub fn end_execution_scope(&self, kind: ExecutionScopeKind) -> u64 {
+        let actions = self.execution_actions.swap(0, Ordering::AcqRel);
+        let previous = self.execution_scope.compare_exchange(
+            kind as u8,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(previous.is_ok(), "任务执行作用域必须由原入口结束");
+        actions
+    }
+
+    /// 原子认领当前作用域中的一个动作位。
+    pub fn claim_execution_action(&self, action: u64) -> ExecutionActionClaim {
+        assert!(action.is_power_of_two(), "执行动作必须只占一个位");
+        let Some(kind) = ExecutionScopeKind::from_raw(self.execution_scope.load(Ordering::Acquire))
+        else {
+            return ExecutionActionClaim::OutsideScope;
+        };
+        let previous = self.execution_actions.fetch_or(action, Ordering::AcqRel);
+        if previous & action == 0 {
+            ExecutionActionClaim::Claimed(kind)
+        } else {
+            ExecutionActionClaim::AlreadyClaimed(kind)
+        }
+    }
+
+    /// 查询当前作用域是否已经认领指定动作，不改变动作状态。
+    pub fn execution_action_claimed(&self, action: u64) -> bool {
+        assert!(action.is_power_of_two(), "执行动作必须只占一个位");
+        ExecutionScopeKind::from_raw(self.execution_scope.load(Ordering::Acquire)).is_some()
+            && self.execution_actions.load(Ordering::Acquire) & action != 0
+    }
+
+    /// 返回任务当前所处的有界内核入口；仅用于选择入口对应的收尾边界。
+    pub fn execution_scope_kind(&self) -> Option<ExecutionScopeKind> {
+        ExecutionScopeKind::from_raw(self.execution_scope.load(Ordering::Acquire))
     }
 
     /// 返回当前任务通过 `PR_GET_TIMERSLACK` 可见的定时器松弛量。

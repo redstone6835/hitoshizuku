@@ -39,6 +39,7 @@ static STACK_REGISTRAR: Mutex<Option<&'static dyn NetStackRegistrar>> = Mutex::n
 pub const NET_STACK_SHARD_TURN_RUST_ABI: &str = "fn(&mutnet::stack::NetStackShardTurn)->i32";
 pub const NET_STACK_SHARD_TURN_STATUS_OK: i32 = 0;
 pub const NET_STACK_SHARD_TURN_STATUS_INVALID: i32 = -22;
+pub const NET_STACK_SHARD_TURN_STATUS_BUSY: i32 = -16;
 
 pub const NET_STACK_SHARD_TURN_COMMAND_CAPACITY: usize = 1024;
 pub const NET_STACK_TX_HEADER_CAPACITY: usize = 128;

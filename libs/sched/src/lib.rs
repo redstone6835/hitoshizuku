@@ -144,9 +144,9 @@ pub use spawn::{
     reap_matching, reparent_to_init, spawn_child,
 };
 pub use task::{
-    DEFAULT_TIMER_SLACK_NS, ExitCode, RobustListState, RseqRegistration, SigAltStack,
-    TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS, TASKEXT_EXEC_ARGS,
-    TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
+    DEFAULT_TIMER_SLACK_NS, ExecutionActionClaim, ExecutionScopeKind, ExitCode, RobustListState,
+    RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS,
+    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
     TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
     TASKEXT_VM_SPACE, Task, TaskDiag, TaskExitAccountingHook, TaskExt, TaskExtCloneHook,
     TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason,

@@ -2820,7 +2820,11 @@ impl NetWorkerContext {
     fn run(&mut self) -> ! {
         self.runtime.started.store(true, Ordering::Release);
         loop {
-            crate::net_stack::begin_worker_turn_stack_calls();
+            let task = sched::current_task_fast();
+            assert!(
+                task.begin_execution_scope(sched::ExecutionScopeKind::NetworkWorker),
+                "NetWorker 不能嵌套进入执行作用域"
+            );
             #[cfg(feature = "performance-profile")]
             let profile_turn = profiling::scope(profiling::Event::NetProtocolTurn);
             let config = self.config.snapshot();
@@ -2859,10 +2863,11 @@ impl NetWorkerContext {
                 || self.runtime.finish_drain()
                 || !self.local_ingress.is_empty()
                 || self.local_queue_pending();
-            let stack_calls = crate::net_stack::finish_worker_turn_stack_calls();
+            let claimed_actions =
+                task.end_execution_scope(sched::ExecutionScopeKind::NetworkWorker);
             assert!(
-                stack_calls <= 1,
-                "NetWorker 单轮发起了 {stack_calls} 次 stack 数据面 ELM call"
+                claimed_actions & !crate::net_stack::NET_STACK_EXECUTION_ACTION == 0,
+                "NetWorker 单轮认领了未知的有界动作"
             );
             #[cfg(feature = "performance-profile")]
             drop(profile_turn);

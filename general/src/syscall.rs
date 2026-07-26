@@ -78,15 +78,44 @@ pub struct SyscallContext<'a> {
     task: Option<Arc<sched::Task>>,
     frame_finalized: bool,
     restart_disabled: bool,
+    execution_scope_active: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl SyscallContext<'_> {
+    fn new(nr: usize, args: [usize; 6], tf: TrapFramePtr, task: Arc<sched::Task>) -> Self {
+        assert!(
+            task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
+            "同一任务不能嵌套进入 syscall 执行作用域"
+        );
+        Self {
+            nr,
+            args,
+            tf,
+            task: Some(task),
+            frame_finalized: false,
+            restart_disabled: false,
+            execution_scope_active: true,
+            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    fn finish_execution_scope(&mut self) {
+        if !self.execution_scope_active {
+            return;
+        }
+        if let Some(task) = self.task.as_ref() {
+            let _ = task.end_execution_scope(sched::ExecutionScopeKind::Syscall);
+        }
+        self.execution_scope_active = false;
+    }
+
     pub fn task(&self) -> &Arc<sched::Task> {
         self.task.as_ref().expect("[syscall] task already released")
     }
 
     pub fn release_task_ref(&mut self) {
+        self.finish_execution_scope();
         self.task.take();
     }
 
@@ -112,6 +141,12 @@ impl SyscallContext<'_> {
     /// 查询当前系统调用是否禁止 `SA_RESTART` 自动重启。
     pub fn restart_disabled(&self) -> bool {
         self.restart_disabled
+    }
+}
+
+impl Drop for SyscallContext<'_> {
+    fn drop(&mut self) {
+        self.finish_execution_scope();
     }
 }
 
@@ -170,15 +205,7 @@ pub fn dispatch(tf: TrapFramePtr) {
     let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
 
     let task = sched::current_task();
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        restart_disabled: false,
-        _phantom: core::marker::PhantomData,
-    };
+    let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
@@ -303,15 +330,7 @@ where
         None
     };
 
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        restart_disabled: false,
-        _phantom: core::marker::PhantomData,
-    };
+    let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     #[cfg(feature = "performance-profile")]
     let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
