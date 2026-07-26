@@ -541,7 +541,7 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// signal/resched/frame rewrite 读取不完整状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
-    let (nr, args, original_satp, original_sepc, original_sp) = {
+    let (nr, args, original_satp, original_sepc, original_sp, original_switch_sequence) = {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (
             tf.a7,
@@ -549,6 +549,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
             tf.satp,
             tf.sepc,
             tf.sp,
+            tf.tval,
         )
     };
     general::syscall::dispatch_fast_with_frame(
@@ -576,14 +577,37 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         require_full_restore = true;
     }
     let fs = frame.status & SSTATUS_FS_MASK;
-    let unsupported_extension_state =
-        frame.status & SSTATUS_VS_MASK != 0 || !matches!(fs, 0 | SSTATUS_FS_CLEAN);
+    let vs = frame.status & SSTATUS_VS_MASK;
+    let switched =
+        crate::riscv64::specific::current_context_switch_sequence() != original_switch_sequence;
+    #[cfg(feature = "performance-profile")]
+    if switched {
+        profiling::observe(profiling::Metric::SyscallReturnAfterSwitch, 1);
+    }
+    let unsupported_extension_state = vs != 0 || !matches!(fs, 0 | SSTATUS_FS_CLEAN);
     if require_full_restore || unsupported_extension_state {
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(profiling::Metric::SyscallReturnFull, 1);
+            if fs != 0 {
+                profiling::observe(profiling::Metric::SyscallReturnFpuRestore, 1);
+            }
+            if vs != 0 {
+                profiling::observe(profiling::Metric::SyscallReturnVectorRestore, 1);
+            }
+        }
         // signal/exec/sigreturn、调度或扩展状态恢复会进入完整 resume；此时必须
         // 重建可信 kstack/satp 并净化用户可修改的 frame。普通 fast return 的
         // status 已由汇编掩码，且入口写入的 kstack/satp 未被改动，无需重复写。
         sanitize_user_return_frame(tf_ptr, (nr == SYS_RT_SIGRETURN).then_some(original_satp));
         return tf_ptr | 1;
+    }
+    #[cfg(feature = "performance-profile")]
+    {
+        profiling::observe(profiling::Metric::SyscallReturnFast, 1);
+        if switched && fs != 0 {
+            profiling::observe(profiling::Metric::SyscallReturnFpuRestore, 1);
+        }
     }
     tf_ptr
 }

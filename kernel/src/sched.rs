@@ -195,16 +195,22 @@ static PRE_EXIT_HOOK: KernelPreExitHook = KernelPreExitHook;
 // ── VmSwitchOps ──────────────────────────────────────────────────────────────
 //
 // sched 在 schedule_once 切换到 next 前调此回调；本函数从 next 的 ext 表
-// 里找 TASKEXT_VM_SPACE payload，若在 → downcast 成 VmSpace 再 activate。
+// 里找 TASKEXT_VM_SPACE payload，若在 -> downcast 成 VmSpace 再 activate。
 // 没挂（idle、纯 kthread 或 init）时必须切回内核页表，不能继续沿用
 // 上一个用户任务可能即将回收的 PGD。
 
 fn vm_on_switch(next: &Arc<Task>) {
-    if let Some(payload) = next.ext_lookup(TASKEXT_VM_SPACE) {
-        if let Ok(vm) = payload.downcast::<VmSpace>() {
+    let activated = next
+        .ext_with(TASKEXT_VM_SPACE, |payload| {
+            let Some(vm) = payload.downcast_ref::<VmSpace>() else {
+                return false;
+            };
             vm.activate();
-            return;
-        }
+            true
+        })
+        .unwrap_or(false);
+    if activated {
+        return;
     }
     if let Some(ops) = user_pgd_ops() {
         unsafe { (ops.activate_kernel)() };
@@ -224,6 +230,9 @@ const RSEQ_CPU_ID_START_OFFSET: usize = 0;
 const RSEQ_CPU_ID_OFFSET: usize = 4;
 
 fn publish_task_cpu_state(task: &Arc<Task>, cpu_id: usize) {
+    if !task.rseq_registered() {
+        return;
+    }
     let registration = task.rseq_registration();
     if !registration.registered {
         return;

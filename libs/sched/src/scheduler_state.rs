@@ -19,6 +19,49 @@ use crate::sched_class::SchedClass;
 use crate::sync::Spinlock;
 use crate::task::Task;
 
+const TARGETED_HANDOFF_PENDING: u8 = u8::MAX;
+
+/// 精确交接的来源。调度器只用它做诊断与合并，不改变对应事件的语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffReason {
+    SocketRead,
+    SocketReadContinuation,
+}
+
+/// 从唤醒点传到公共 syscall 返回边界的稳定任务身份。
+///
+/// 强引用保证任务对象在请求存续期间不会被复用；调度边界还会复查请求代际、
+/// CPU、队列成员、状态和执行所有权，避免依赖裸地址或可复用 tid。
+#[derive(Clone)]
+pub struct HandoffTarget {
+    pub(crate) task: Arc<Task>,
+    pub(crate) preferred_cpu: usize,
+    pub(crate) request_generation: u64,
+    pub(crate) reason: HandoffReason,
+    pub(crate) woke_from_sleep: bool,
+}
+
+impl HandoffTarget {
+    pub(crate) fn new(
+        task: Arc<Task>,
+        preferred_cpu: usize,
+        reason: HandoffReason,
+        woke_from_sleep: bool,
+    ) -> Self {
+        Self {
+            task,
+            preferred_cpu,
+            request_generation: 0,
+            reason,
+            woke_from_sleep,
+        }
+    }
+
+    pub fn preferred_cpu(&self) -> usize {
+        self.preferred_cpu
+    }
+}
+
 /// 单个 CPU 的完整调度运行状态。
 ///
 /// `Runqueue`、current、idle 和调度意图必须作为一个所有权单元存在。跨 CPU
@@ -33,6 +76,8 @@ pub struct CpuSchedState {
     need_resched: AtomicBool,
     need_balance: AtomicBool,
     post_syscall_handoff: AtomicU8,
+    targeted_handoff: Spinlock<Option<HandoffTarget>>,
+    targeted_handoff_generation: AtomicU64,
     enqueue_in_progress: AtomicUsize,
 }
 
@@ -48,6 +93,8 @@ impl CpuSchedState {
             need_resched: AtomicBool::new(false),
             need_balance: AtomicBool::new(false),
             post_syscall_handoff: AtomicU8::new(0),
+            targeted_handoff: Spinlock::new(None),
+            targeted_handoff_generation: AtomicU64::new(0),
             enqueue_in_progress: AtomicUsize::new(0),
         }
     }
@@ -141,14 +188,40 @@ impl CpuSchedState {
         }
     }
 
-    pub fn take_post_syscall_handoff(&self) -> u8 {
-        self.post_syscall_handoff.swap(0, Ordering::AcqRel)
+    pub fn take_post_syscall_handoff(&self) -> (u8, Option<HandoffTarget>) {
+        let state = self.post_syscall_handoff.swap(0, Ordering::AcqRel);
+        if state == TARGETED_HANDOFF_PENDING {
+            (0, self.targeted_handoff.lock().take())
+        } else {
+            (state, None)
+        }
+    }
+
+    pub fn request_targeted_handoff(&self, mut target: HandoffTarget) {
+        target.request_generation = self
+            .targeted_handoff_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let mut pending = self.targeted_handoff.lock();
+        if pending
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.task, &target.task))
+        {
+            self.post_syscall_handoff
+                .store(TARGETED_HANDOFF_PENDING, Ordering::Release);
+            return;
+        }
+        *pending = Some(target);
+        drop(pending);
+        self.post_syscall_handoff
+            .store(TARGETED_HANDOFF_PENDING, Ordering::Release);
     }
 
     pub fn clear_scheduling_requests(&self) {
         self.need_resched.store(false, Ordering::Release);
         self.need_balance.store(false, Ordering::Release);
         self.post_syscall_handoff.store(0, Ordering::Release);
+        self.targeted_handoff.lock().take();
     }
 
     pub(crate) fn begin_enqueue(&self) -> CpuEnqueueGuard<'_> {
@@ -205,6 +278,8 @@ pub struct Scheduler {
     deadline_admission: DeadlineAdmission,
     online: AtomicU64,
     active: AtomicU64,
+    /// 当前拓扑代际的无锁镜像。归属未变化时无需读取完整拓扑。
+    topology_generation: AtomicU64,
     topology: Spinlock<TopologyState>,
     domain_stats: Spinlock<[SchedDomainStats; MAX_SCHED_DOMAINS]>,
 }
@@ -266,6 +341,7 @@ impl Scheduler {
             deadline_admission: DeadlineAdmission::new(),
             online: AtomicU64::new(CpuMask::BOOT.bits()),
             active: AtomicU64::new(CpuMask::BOOT.bits()),
+            topology_generation: AtomicU64::new(1),
             topology: Spinlock::new(TopologyState {
                 topology: SchedTopology::bootstrap(),
                 generation: 1,
@@ -352,6 +428,10 @@ impl Scheduler {
         self.topology.lock().topology
     }
 
+    pub fn topology_generation(&self) -> u64 {
+        self.topology_generation.load(Ordering::Acquire)
+    }
+
     pub fn topology_snapshot(&self) -> TopologySnapshot {
         let state = *self.topology.lock();
         TopologySnapshot {
@@ -401,8 +481,12 @@ impl Scheduler {
 
     pub fn install_topology(&self, topology: SchedTopology) {
         let mut state = self.topology.lock();
+        let generation = state.generation.wrapping_add(1).max(1);
+        // 先发布新代际，让并发观察者在旧拓扑失效后进入带锁慢路径。
+        self.topology_generation
+            .store(generation, Ordering::Release);
         state.topology = topology;
-        state.generation = state.generation.wrapping_add(1).max(1);
+        state.generation = generation;
         drop(state);
         *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
     }

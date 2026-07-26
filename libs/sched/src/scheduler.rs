@@ -28,11 +28,12 @@ use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
 use crate::migration::MigrationContext;
 use crate::pid::PidNamespace;
+use crate::placement::PlacementState;
 use crate::runqueue::{Runqueue, RunqueueClassLoad};
 use crate::sched_class::{
     DEFAULT_RR_SLICE_NS, DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, SchedAttr, SchedClass,
 };
-use crate::scheduler_state::{SCHEDULER, TopologySnapshot};
+use crate::scheduler_state::{HandoffReason, HandoffTarget, SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
 use crate::task::Task;
@@ -121,6 +122,9 @@ pub struct SchedulerDiag {
 /// 再多轮只会放大 fork/daemon 一类短任务的 syscall 收尾开销；pthread
 /// 创建不走这里，线程会自然运行到 futex 等阻塞点再交给被唤醒者。
 const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 1;
+
+#[cfg(feature = "performance-profile")]
+static CONTEXT_SWITCH_STARTED: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 
 struct TimedSleeper {
     deadline_ns: u64,
@@ -257,6 +261,16 @@ fn bind_task_to_cpu(task: &Task, cpu_id: usize) {
 
 fn bind_task_to_cpu_on(scheduler: &crate::Scheduler, task: &Task, cpu_id: usize) {
     let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
+    let placement = task.placement();
+    if placement.state == PlacementState::Bound
+        && placement.cpu == Some(cpu)
+        && placement.topology_generation == scheduler.topology_generation()
+    {
+        if task.current_cpu() != cpu.get() {
+            task.set_current_cpu(cpu.get());
+        }
+        return;
+    }
     let snapshot = scheduler.topology_snapshot();
     let domain_id = snapshot
         .topology
@@ -1221,6 +1235,60 @@ pub fn request_post_syscall_handoff() {
     request_resched(cpu_id);
 }
 
+/// 为刚进入就绪队列的任务建立稳定交接目标。
+///
+/// 返回值可以短暂保存在事件源中，直到批次达到交接条件。公共调度边界会复查
+/// 任务的 CPU、队列成员、状态和执行所有权，拒绝已经迁移或再次阻塞的旧请求。
+pub fn enqueue_task_preferred_for_handoff(
+    task: Arc<Task>,
+    now_ns: u64,
+    reason: HandoffReason,
+    woke_from_sleep: bool,
+    request_reschedule: bool,
+) -> HandoffTarget {
+    let cpu_id =
+        enqueue_task_locked_with_preference(Arc::clone(&task), now_ns, true, request_reschedule);
+    if request_reschedule {
+        notify_resched(cpu_id);
+    }
+    HandoffTarget::new(task, cpu_id, reason, woke_from_sleep)
+}
+
+/// 保存当前任务作为后续 syscall 返回边界的交接目标。
+///
+/// 该接口只记录稳定任务身份，不改变任务状态或调度优先级。使用方可以在同一
+/// 生产者/消费者关系的后续 syscall 中请求交接，调度边界仍会复查任务是否处于
+/// 本 CPU 的公平就绪队列中。
+pub fn current_task_handoff_target(reason: HandoffReason) -> Option<HandoffTarget> {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let cpu_id = cpu();
+    let task = current_task_fast();
+    if task.state() != TaskState::Running || task.current_cpu() != cpu_id {
+        return None;
+    }
+    Some(HandoffTarget::new(task, cpu_id, reason, false))
+}
+
+/// 请求在公共 syscall 返回边界精确交给指定任务。
+///
+/// 同 CPU 请求保存完整目标并合并重复事件；跨 CPU 请求只通知目标 runqueue，
+/// 当前 CPU 不等待确认，也不会把远端任务拉回本地。
+pub fn request_post_syscall_handoff_to(target: HandoffTarget) {
+    if !INIT_READY.load(Ordering::Acquire) || target.preferred_cpu >= NR_CPUS {
+        return;
+    }
+    let target_cpu = target.preferred_cpu;
+    if target_cpu == cpu() {
+        let cpu_state = SCHEDULER.cpu_or_boot(target_cpu);
+        cpu_state.request_targeted_handoff(target);
+        cpu_state.request_resched();
+    } else {
+        request_resched(target_cpu);
+    }
+}
+
 /// 硬 IRQ 使用的无锁任务唤醒入口。
 ///
 /// IRQ 可能打断持有 topology 或 runqueue 普通自旋锁的路径，不能原地调用
@@ -1288,8 +1356,8 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     }
     let cpu_id = cpu();
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
-    let rounds = cpu_state.take_post_syscall_handoff();
-    if rounds == 0 {
+    let (rounds, target) = cpu_state.take_post_syscall_handoff();
+    if rounds == 0 && target.is_none() {
         return;
     }
 
@@ -1304,6 +1372,9 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     // syscall 返回后的父子任务交接是 clone/vfork 热路径；时间戳只需采样一次，
     // 避免有界循环里重复读取时钟。
     let handoff_now = now_ns_internal().max(now_ns);
+    if let Some(target) = target.as_ref() {
+        schedule_once_inner(handoff_now, Some(target));
+    }
     for _ in 0..rounds {
         if cpu_state.runqueue().nr_running() <= 1 {
             break;
@@ -2391,8 +2462,14 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
 )]
 pub fn schedule_once(now_ns: u64) {
-    drain_deferred_task_wakes();
+    schedule_once_inner(now_ns, None);
+}
+
+fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
+    #[cfg(feature = "performance-profile")]
+    let schedule_start = profiling::read_counter();
     let cpu_id = cpu();
+    drain_deferred_task_wakes();
     // 用户 syscall 进入 S-mode 后会保持本地中断关闭。若多个可运行任务持续在
     // 阻塞 syscall 与内核 worker 之间切换，CPU 可能长期不回 idle/user，硬件
     // timer 只能保持 pending。调度边界本身已经是无锁安全点，因此用单调时钟
@@ -2401,6 +2478,15 @@ pub fn schedule_once(now_ns: u64) {
     let timer_now_ns = now_ns_internal().max(now_ns).max(deferred_ns);
     service_expired_timer_events(timer_now_ns, cpu_id);
     cleanup_retired_tasks(cpu_id);
+    #[cfg(feature = "performance-profile")]
+    let pick_start = {
+        let now = profiling::read_counter();
+        profiling::observe(
+            profiling::Metric::SchedTimerCycles,
+            now.wrapping_sub(schedule_start),
+        );
+        now
+    };
 
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
 
@@ -2420,7 +2506,15 @@ pub fn schedule_once(now_ns: u64) {
     // 2. 挑下一个；pick_next 会把 prev 放回 tree（若仍 runnable）。若 prev 的
     //    亲和性已经排除本 CPU，此时它已稳定停在旧 rq，可通知目标 CPU 拉取。
     let cpu_mask = CpuMask::single_raw(cpu_id).bits();
-    let next = match cpu_state.runqueue().pick_next_on(now_ns, cpu_mask) {
+    let targeted = target.filter(|target| targeted_handoff_is_valid(target, cpu_id));
+    let picked = targeted
+        .and_then(|target| {
+            cpu_state
+                .runqueue()
+                .pick_target_on(&target.task, now_ns, cpu_mask)
+        })
+        .or_else(|| cpu_state.runqueue().pick_next_on(now_ns, cpu_mask));
+    let next = match picked {
         Some(t) => t,
         None => {
             // 队列空：回落到本核 idle。idle 未安装则保持 prev 不切。
@@ -2455,6 +2549,15 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    #[cfg(feature = "performance-profile")]
+    let prepare_start = {
+        let now = profiling::read_counter();
+        profiling::observe(
+            profiling::Metric::SchedPickCycles,
+            now.wrapping_sub(pick_start),
+        );
+        now
+    };
     assert!(
         next.try_claim_cpu(cpu_id),
         "[sched] selected task is still owned by cpu {:?}: pid={:?} target_cpu={}",
@@ -2487,6 +2590,15 @@ pub fn schedule_once(now_ns: u64) {
     next.account_switch_in(account_now_ns);
     prev.record_involuntary_context_switch();
     let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
+    #[cfg(feature = "performance-profile")]
+    let publish_start = {
+        let now = profiling::read_counter();
+        profiling::observe(
+            profiling::Metric::SchedPrepareAccountingCycles,
+            now.wrapping_sub(prepare_start),
+        );
+        now
+    };
 
     // 4. 发布下一任务为本 CPU current。
     //
@@ -2503,6 +2615,15 @@ pub fn schedule_once(now_ns: u64) {
     let next_ctx = next
         .arch_context()
         .expect("[sched] next task has no arch context");
+    #[cfg(feature = "performance-profile")]
+    let vm_start = {
+        let now = profiling::read_counter();
+        profiling::observe(
+            profiling::Metric::SchedPreparePublishCycles,
+            now.wrapping_sub(publish_start),
+        );
+        now
+    };
 
     // 6. 切换前先把"内核 trap 入口栈"指向 next 的内核栈顶。
     if let Some(top) = next.kernel_stack_top() {
@@ -2517,11 +2638,33 @@ pub fn schedule_once(now_ns: u64) {
     if let Some(sw) = crate::arch_hooks::vm_switch() {
         (sw.on_switch)(&next);
     }
+    #[cfg(feature = "performance-profile")]
+    let cpu_state_start = {
+        let now = profiling::read_counter();
+        profiling::observe(
+            profiling::Metric::SchedPrepareVmCycles,
+            now.wrapping_sub(vm_start),
+        );
+        now
+    };
 
     // 8. 发布用户态可观察的 CPU 状态。此时 next 的地址空间已经激活，且未
     //    进入 switch_context；回调不能影响调度决策，失败只会让用户态走保守路径。
     if let Some(cpu_state) = crate::arch_hooks::task_cpu_state() {
         (cpu_state.publish_current_cpu)(&next, cpu_id);
+    }
+    #[cfg(feature = "performance-profile")]
+    {
+        let now = profiling::read_counter();
+        profiling::observe(
+            profiling::Metric::SchedPrepareCpuStateCycles,
+            now.wrapping_sub(cpu_state_start),
+        );
+        profiling::observe(
+            profiling::Metric::SchedPrepareCycles,
+            now.wrapping_sub(prepare_start),
+        );
+        CONTEXT_SWITCH_STARTED[cpu_id].store(now, Ordering::Release);
     }
 
     // 9. 切换。
@@ -2537,7 +2680,36 @@ pub fn schedule_once(now_ns: u64) {
             (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx, prev_on_cpu);
         }
     }
+    #[cfg(feature = "performance-profile")]
+    {
+        let started = CONTEXT_SWITCH_STARTED[cpu_id].swap(0, Ordering::AcqRel);
+        if started != 0 {
+            profiling::observe(
+                profiling::Metric::SchedContextCycles,
+                profiling::read_counter().wrapping_sub(started),
+            );
+        }
+    }
     // 被切回后正常返回。
+}
+
+fn targeted_handoff_is_valid(target: &HandoffTarget, cpu_id: usize) -> bool {
+    let reason_valid = matches!(
+        (target.reason, target.woke_from_sleep),
+        (HandoffReason::SocketRead, true) | (HandoffReason::SocketReadContinuation, false)
+    );
+    target.request_generation != 0
+        && reason_valid
+        && target.preferred_cpu == cpu_id
+        && target.task.current_cpu() == cpu_id
+        && target.task.state() == TaskState::Runnable
+        && target.task.sched.on_rq()
+        && target.task.arch_context().is_some()
+        && target.task.running_cpu().is_none()
+        && target.task.cpu_affinity() & CpuMask::single_raw(cpu_id).bits() != 0
+        && target.task.sched.class() == SchedClass::Fair
+        && !target.task.signal.has_any_pending()
+        && target.task.shared_signal_pending_bits_quick() == 0
 }
 
 // ── 定时器 / 抢占 ─────────────────────────────────────────────────────────────

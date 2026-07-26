@@ -50,6 +50,7 @@ static TASK_LIVE: AtomicUsize = AtomicUsize::new(0);
 static TASK_CREATED: AtomicUsize = AtomicUsize::new(0);
 static TASK_DROPPED: AtomicUsize = AtomicUsize::new(0);
 static TASK_TRACKER: Spinlock<Vec<Weak<Task>>> = Spinlock::new(Vec::new());
+const RSEQ_REGISTERED: u8 = 1 << 7;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskDiag {
@@ -630,6 +631,14 @@ pub struct Task {
     wait_generation: AtomicU64,
     #[cfg(feature = "performance-profile")]
     profile_span_id: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_object: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_correlation: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_started_ns: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_kind: AtomicU8,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -750,6 +759,14 @@ impl Task {
             wait_generation: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             profile_span_id: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_object: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_correlation: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_started_ns: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_kind: AtomicU8::new(0),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
@@ -1409,19 +1426,31 @@ impl Task {
     }
 
     pub fn set_rseq_registration(&self, registration: RseqRegistration) {
-        self.rseq_events.store(0, Ordering::Release);
         self.rseq_cpu.store(usize::MAX, Ordering::Release);
         *self.rseq.lock() = registration;
+        self.rseq_events.store(
+            if registration.registered {
+                RSEQ_REGISTERED
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
     }
 
     pub fn clear_rseq_registration(&self) {
-        *self.rseq.lock() = RseqRegistration::default();
         self.rseq_events.store(0, Ordering::Release);
+        *self.rseq.lock() = RseqRegistration::default();
         self.rseq_cpu.store(usize::MAX, Ordering::Release);
     }
 
+    #[inline]
+    pub fn rseq_registered(&self) -> bool {
+        self.rseq_events.load(Ordering::Acquire) & RSEQ_REGISTERED != 0
+    }
+
     pub fn mark_rseq_event(&self, event: RseqEvent) {
-        if self.rseq_registration().registered {
+        if self.rseq_registered() {
             self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
         }
     }
@@ -1435,7 +1464,7 @@ impl Task {
     }
 
     pub fn publish_rseq_cpu(&self, cpu_id: usize) {
-        if !self.rseq_registration().registered {
+        if !self.rseq_registered() {
             return;
         }
         let previous = self.rseq_cpu.swap(cpu_id, Ordering::AcqRel);
@@ -1520,6 +1549,27 @@ impl Task {
                     now_ns.saturating_sub(encoded - 1),
                 );
             }
+            let correlation = self.profile_wake_correlation.swap(0, Ordering::AcqRel);
+            if correlation != 0 {
+                let object = self.profile_wake_object.swap(0, Ordering::AcqRel);
+                let started = self.profile_wake_started_ns.swap(0, Ordering::AcqRel);
+                let event = if self.profile_wake_kind.swap(0, Ordering::AcqRel) == 2 {
+                    profiling::Event::NetWriterRun
+                } else {
+                    profiling::Event::NetReceiverRun
+                };
+                if started != 0 {
+                    profiling::record_duration(event, now_ns.saturating_sub(started - 1));
+                }
+                profiling::trace_task_event_with_span(
+                    profiling::TraceKind::Point,
+                    event,
+                    self.pid_root_cached().unwrap_or(0) as u64,
+                    self.profile_span_id(),
+                    object,
+                    correlation,
+                );
+            }
         }
     }
 
@@ -1546,6 +1596,10 @@ impl Task {
             self.wait_trace_emitted.store(false, Ordering::Release);
             self.wait_generation
                 .store(profiling::generation(), Ordering::Release);
+            self.profile_wake_object.store(0, Ordering::Release);
+            self.profile_wake_correlation.store(0, Ordering::Release);
+            self.profile_wake_started_ns.store(0, Ordering::Release);
+            self.profile_wake_kind.store(0, Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
             self.wait_started_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -1576,6 +1630,21 @@ impl Task {
     #[cfg(feature = "performance-profile")]
     pub fn set_profile_span_id(&self, span_id: u64) {
         self.profile_span_id.store(span_id, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn set_profile_wake_cause(&self, kind: u8, object: u64, correlation: u64, now_ns: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.profile_wake_kind.store(kind, Ordering::Relaxed);
+            self.profile_wake_object.store(object, Ordering::Relaxed);
+            self.profile_wake_started_ns
+                .store(now_ns.saturating_add(1), Ordering::Relaxed);
+            self.profile_wake_correlation
+                .store(correlation, Ordering::Release);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = (kind, object, correlation, now_ns);
     }
 
     #[inline]
@@ -1890,6 +1959,23 @@ impl Task {
             .iter()
             .find(|e| e.key == key)
             .map(|e| Arc::clone(&e.payload))
+    }
+
+    /// 在扩展槽的借用期内访问 payload，避免只读热路径反复增减 Arc 引用计数。
+    pub fn ext_with<R>(
+        &self,
+        key: TaskExtKey,
+        visit: impl FnOnce(&(dyn Any + Send + Sync)) -> R,
+    ) -> Option<R> {
+        if let Some(slot) = self.hot_ext.slot(key) {
+            let guard = slot.lock();
+            return guard.as_deref().map(visit);
+        }
+        let guard = self.ext.lock();
+        guard
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| visit(entry.payload.as_ref()))
     }
 
     /// 移除并返回某个子系统状态。

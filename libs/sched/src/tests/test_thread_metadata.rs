@@ -3,7 +3,7 @@
 extern crate alloc;
 extern crate std;
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use core::ptr::NonNull;
 
 use ktest::ktest;
@@ -12,10 +12,28 @@ use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS, ProcessGroup,
     RobustListState, RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy,
-    Session, TASK_COMM_LEN, Task, TaskState, TaskUsage, ThreadGroup, supported_cpu_mask,
+    Session, TASK_COMM_LEN, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage, ThreadGroup,
+    supported_cpu_mask,
 };
 
 const TEST_EXECUTION_ACTION: u64 = 1;
+
+#[ktest]
+fn vm_space_extension_can_be_borrowed_without_arc_clone() {
+    let task = make_task();
+    let payload = Arc::new(42usize);
+    let erased: Arc<dyn core::any::Any + Send + Sync> = payload;
+
+    task.ext_install(TASKEXT_VM_SPACE, erased);
+    assert_eq!(
+        task.ext_with(TASKEXT_VM_SPACE, |value| {
+            value.downcast_ref::<usize>().copied()
+        }),
+        Some(Some(42))
+    );
+    assert!(task.ext_remove(TASKEXT_VM_SPACE).is_some());
+    assert!(task.ext_with(TASKEXT_VM_SPACE, |_| ()).is_none());
+}
 
 #[ktest]
 fn task_execution_scope_allows_each_action_once_and_resets_on_exit() {
@@ -159,6 +177,7 @@ fn robust_list_and_rseq_state_roundtrip() {
         registered: true,
     };
     task.set_rseq_registration(rseq);
+    assert!(task.rseq_registered());
     assert_eq!(task.rseq_registration(), rseq);
     task.mark_rseq_event(RseqEvent::Preempt);
     assert!(task.rseq_events().contains(RseqEvent::Preempt));
@@ -166,6 +185,7 @@ fn robust_list_and_rseq_state_roundtrip() {
     task.publish_rseq_cpu(1);
     assert!(task.rseq_events().contains(RseqEvent::Migrate));
     task.clear_rseq_registration();
+    assert!(!task.rseq_registered());
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
     assert!(task.rseq_events().is_empty());
 }
@@ -260,6 +280,45 @@ fn runqueue_pick_respects_cpu_affinity_mask() {
 }
 
 #[ktest]
+fn runqueue_exact_pick_selects_requested_fair_task() {
+    let first = make_task();
+    let target = make_task();
+    first.sched.store_vruntime(10);
+    target.sched.store_vruntime(1_000);
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&first), 1));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&target), 1));
+
+    let picked = rq
+        .pick_target_on(&target, 2, CpuMask::single_raw(0).bits())
+        .expect("精确目标仍满足普通公平类约束");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &target));
+    assert!(rq.dequeue(&target, 3));
+    assert!(rq.dequeue(&first, 3));
+}
+
+#[ktest]
+fn runqueue_exact_pick_yields_to_higher_class() {
+    let target = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&target), 1));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 1));
+
+    assert!(
+        rq.pick_target_on(&target, 2, CpuMask::single_raw(0).bits())
+            .is_none()
+    );
+    let picked = rq.pick_next(3).expect("实时任务应保持 class precedence");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &realtime));
+    assert!(rq.dequeue(&realtime, 4));
+    assert!(rq.dequeue(&target, 4));
+}
+
+#[ktest]
 fn runqueue_reports_task_waiting_for_context_release() {
     let task = make_task();
     task.set_cpu_affinity(CpuMask::single_raw(1).bits());
@@ -276,6 +335,24 @@ fn runqueue_reports_task_waiting_for_context_release() {
             .store(0, core::sync::atomic::Ordering::Release);
     }
     assert!(!rq.has_ownership_blocked(CpuMask::single_raw(1).bits()));
+    assert!(rq.dequeue(&task, 2));
+}
+
+#[ktest]
+fn runqueue_ignores_local_context_release_window() {
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    assert!(task.try_claim_cpu(0));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(!rq.has_ownership_blocked(CpuMask::single_raw(0).bits()));
+
+    unsafe {
+        task.on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
     assert!(rq.dequeue(&task, 2));
 }
 

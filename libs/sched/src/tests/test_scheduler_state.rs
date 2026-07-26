@@ -15,8 +15,8 @@ use crate::scheduler::{
     requeue_balance_task_on, take_deferred_timer_tick, task_runqueue_cpu_on,
 };
 use crate::{
-    CpuId, CpuMask, PlacementState, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass,
-    SchedDomain, SchedTopology, Scheduler, TaskState,
+    CpuId, CpuMask, HandoffReason, HandoffTarget, PlacementState, RunqueueClassLoad,
+    SCHED_CAPACITY_SCALE, SchedAttr, SchedClass, SchedDomain, SchedTopology, Scheduler, TaskState,
 };
 
 #[ktest]
@@ -46,9 +46,51 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     assert!(!cpu0.has_post_syscall_handoff());
     assert!(cpu1.needs_resched());
     assert!(cpu1.take_balance());
-    assert_eq!(cpu1.take_post_syscall_handoff(), 1);
+    let (rounds, target) = cpu1.take_post_syscall_handoff();
+    assert_eq!(rounds, 1);
+    assert!(target.is_none());
     assert!(cpu1.take_resched());
     assert!(!cpu1.needs_resched());
+}
+
+#[ktest]
+fn scheduler_state_merges_the_same_exact_handoff_target() {
+    let core = Scheduler::new();
+    let cpu1 = core.cpu(1).expect("cpu1 state");
+    let task = make_task();
+    let target = HandoffTarget::new(task, 1, HandoffReason::SocketRead, true);
+
+    cpu1.request_targeted_handoff(target.clone());
+    cpu1.request_targeted_handoff(target);
+
+    let (rounds, pending) = cpu1.take_post_syscall_handoff();
+    let pending = pending.expect("精确请求应保留");
+    assert_eq!(rounds, 0);
+    assert_eq!(pending.preferred_cpu(), 1);
+    assert_eq!(pending.request_generation, 1);
+    assert!(!cpu1.has_post_syscall_handoff());
+}
+
+#[ktest]
+fn scheduler_state_keeps_socket_consumer_continuation_identity() {
+    let core = Scheduler::new();
+    let cpu1 = core.cpu(1).expect("cpu1 state");
+    let task = make_task();
+    let target = HandoffTarget::new(
+        Arc::clone(&task),
+        1,
+        HandoffReason::SocketReadContinuation,
+        false,
+    );
+
+    cpu1.request_targeted_handoff(target);
+
+    let (rounds, pending) = cpu1.take_post_syscall_handoff();
+    let pending = pending.expect("消费者交接目标应保留");
+    assert_eq!(rounds, 0);
+    assert!(Arc::ptr_eq(&pending.task, &task));
+    assert_eq!(pending.reason, HandoffReason::SocketReadContinuation);
+    assert!(!pending.woke_from_sleep);
 }
 
 #[ktest]
@@ -67,6 +109,7 @@ fn deferred_timer_tick_coalesces_latest_timestamp_and_clears_on_take() {
 fn scheduler_state_installs_topology_and_online_cpu_together() {
     let core = Scheduler::new();
     let old_generation = core.topology_snapshot().generation;
+    assert_eq!(core.topology_generation(), old_generation);
     let local = SchedDomain::new(
         1,
         CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
@@ -82,6 +125,10 @@ fn scheduler_state_installs_topology_and_online_cpu_together() {
 
     assert_eq!(core.topology(), topology);
     assert!(core.topology_snapshot().generation > old_generation);
+    assert_eq!(
+        core.topology_generation(),
+        core.topology_snapshot().generation
+    );
     assert!(core.online_set().contains(CpuId::boot()));
     assert!(core.online_set().contains(CpuId::new(1).unwrap()));
     assert!(core.active_set().contains(CpuId::new(1).unwrap()));
