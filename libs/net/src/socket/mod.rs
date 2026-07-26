@@ -28,19 +28,23 @@ const UDP_BUFFER_BYTES: usize = 128 * 1024;
 const UDP_BUFFER_HARD_LIMIT: usize = 512 * 1024;
 const SOCKET_CHUNK_BYTES: usize = 4096;
 const MAX_DATAGRAM_CHUNKS: usize = 17;
+const LOCAL_DATAGRAM_BATCH_LIMIT: u16 = 4;
+const LOCAL_DATAGRAM_INLINE_BYTES: usize = 256;
 const MAX_UDP4_PAYLOAD: usize = 65_507;
 const MAX_UDP6_PAYLOAD: usize = 65_527;
 const TCP_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_BUFFER_HARD_LIMIT: usize = 1024 * 1024;
+const TCP_LOCAL_READ_BATCH_BYTES: usize = TCP_BUFFER_BYTES / 2;
 const TCP_INITIAL_CHUNKS: usize = 2;
 const TCP_KEEPIDLE_DEFAULT_NS: u64 = 7_200_000_000_000;
 const TCP_KEEPINTVL_DEFAULT_NS: u64 = 75_000_000_000;
 const TCP_KEEPCNT_DEFAULT: u16 = 9;
-
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(None);
 static SOCKET_REGISTRY: RwLock<Vec<Weak<SocketFacade>>> = RwLock::new(Vec::new());
 static DMA_TX_POOL_WAITERS: Mutex<VecDeque<DmaTxPoolWaiter>> = Mutex::new(VecDeque::new());
+static LOCAL_DATAGRAM_ROUTE_EPOCH: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_PACKET_OBSERVERS: AtomicU32 = AtomicU32::new(0);
 
 struct DmaTxPoolWaiter {
     pool_key: usize,
@@ -138,6 +142,75 @@ pub enum SocketError {
     NetworkDown,
 }
 
+/// 数据报入队时区分 socket 状态错误与外部复制源错误。
+pub enum DatagramCopyError<E> {
+    Socket(SocketError),
+    Copy(E),
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalDatagramRoute {
+    epoch: u64,
+    stack_generation: u64,
+    sender_generation: u32,
+    receiver_generation: u32,
+    destination: Endpoint,
+    source: Endpoint,
+    delivered_to: Endpoint,
+    interface: InterfaceId,
+    dont_route: bool,
+    confirm: bool,
+    mark: u32,
+    hop_limit: u8,
+    traffic_class: u8,
+    route_mtu: u32,
+    receiver: Arc<SocketFacade>,
+}
+
+pub(crate) fn invalidate_local_datagram_routes() {
+    LOCAL_DATAGRAM_ROUTE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn local_datagram_route_epoch() -> u64 {
+    LOCAL_DATAGRAM_ROUTE_EPOCH.load(Ordering::Acquire)
+}
+
+fn register_packet_observer(active: &AtomicBool, observers: &AtomicU32) -> bool {
+    if active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    let previous = observers.fetch_add(1, Ordering::AcqRel);
+    assert!(previous != u32::MAX, "packet observer 计数溢出");
+    true
+}
+
+fn unregister_packet_observer(active: &AtomicBool, observers: &AtomicU32) -> bool {
+    if !active.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    let previous = observers.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous != 0, "packet observer 计数下溢");
+    true
+}
+
+#[cfg(test)]
+fn facade_requires_packet_observation(facade: &SocketFacade) -> bool {
+    facade.kind == SocketKind::Raw
+        && !facade.closing.load(Ordering::Acquire)
+        && !facade.stack_detached.load(Ordering::Acquire)
+}
+
+pub(crate) fn local_transport_fast_path_eligible() -> bool {
+    packet_observers_allow_local_transport(&ACTIVE_PACKET_OBSERVERS)
+}
+
+fn packet_observers_allow_local_transport(observers: &AtomicU32) -> bool {
+    observers.load(Ordering::Acquire) == 0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MulticastMembership {
     pub group: IpAddr,
@@ -191,7 +264,7 @@ pub enum SocketCommand {
 
 pub trait SocketRuntime: Send + Sync {
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand>;
-    fn notify_tx(&self, facade: Arc<SocketFacade>);
+    fn notify_tx(&self, facade: Arc<SocketFacade>, cause: SocketTxCause);
     fn notify_lifecycle(&self, facade: Arc<SocketFacade>);
     fn update_multicast(
         &self,
@@ -200,6 +273,19 @@ pub trait SocketRuntime: Send + Sync {
         joined: bool,
     ) -> Result<(), SocketError>;
     fn interface_by_name(&self, name: &[u8]) -> Option<InterfaceId>;
+}
+
+/// 一次发送侧协议推进请求的直接触发原因。
+///
+/// 该类型随请求跨过 socket/runtime 边界，既用于保留调度语义，也用于判断同一
+/// syscall 内的第二次协议栈调用来自数据、状态还是排空竞态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SocketTxCause {
+    Datagram = 1,
+    StreamPayload = 2,
+    StreamState = 3,
+    DrainRecheck = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1202,6 +1288,14 @@ impl TxRing {
         self.queued.is_empty()
     }
 
+    fn next_destination(&self) -> Option<Endpoint> {
+        let slot = *self.queued.front()?;
+        self.entries[usize::from(slot)]
+            .as_ref()
+            .map(|entry| entry.destination)
+    }
+
+    #[cfg(test)]
     fn push(
         &mut self,
         payload: &[u8],
@@ -1209,78 +1303,115 @@ impl TxRing {
         dont_route: bool,
         confirm: bool,
     ) -> Result<(), SocketError> {
-        if let Some(pool) = self.dma_pool.as_ref().cloned() {
-            return self.push_dma(payload, destination, dont_route, confirm, pool);
+        match self.push_from(
+            payload.len(),
+            destination,
+            dont_route,
+            confirm,
+            &mut |offset, output| {
+                output.copy_from_slice(&payload[offset..offset + output.len()]);
+                Ok::<(), core::convert::Infallible>(())
+            },
+        ) {
+            Ok(()) => Ok(()),
+            Err(DatagramCopyError::Socket(error)) => Err(error),
+            Err(DatagramCopyError::Copy(error)) => match error {},
         }
-        let chunk_count = payload.len().div_ceil(SOCKET_CHUNK_BYTES);
+    }
+
+    fn push_from<E>(
+        &mut self,
+        payload_len: usize,
+        destination: Endpoint,
+        dont_route: bool,
+        confirm: bool,
+        copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<(), DatagramCopyError<E>> {
+        if let Some(pool) = self.dma_pool.as_ref().cloned() {
+            return self.push_dma_from(payload_len, destination, dont_route, confirm, pool, copy);
+        }
+        let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
         if chunk_count > MAX_DATAGRAM_CHUNKS
-            || self.used_bytes.saturating_add(payload.len()) > self.limit
+            || self.used_bytes.saturating_add(payload_len) > self.limit
             || self.free_slots.is_empty()
             || self.free_chunk_count() < chunk_count
         {
-            return Err(SocketError::WouldBlock);
+            return Err(DatagramCopyError::Socket(SocketError::WouldBlock));
         }
-        let slot = self.free_slots.pop().unwrap();
         let mut chunks = [0u8; MAX_DATAGRAM_CHUNKS];
         for chunk in chunks.iter_mut().take(chunk_count) {
             *chunk = self.take_free_chunk().expect("TX chunk 计数失配");
         }
         #[cfg(feature = "performance-profile")]
         let copy_start = profiling::read_counter();
-        for (part, chunk) in payload.chunks(SOCKET_CHUNK_BYTES).zip(chunks.iter()) {
+        let mut copied = 0usize;
+        for chunk in chunks.iter().take(chunk_count) {
+            let len = (payload_len - copied).min(SOCKET_CHUNK_BYTES);
             let offset = usize::from(*chunk) * SOCKET_CHUNK_BYTES;
-            self.arena[offset..offset + part.len()].copy_from_slice(part);
+            if let Err(error) = copy(copied, &mut self.arena[offset..offset + len]) {
+                for chunk in chunks.iter().take(chunk_count) {
+                    let index = usize::from(*chunk);
+                    self.free_chunks[index / 64] |= 1u64 << (index % 64);
+                }
+                return Err(DatagramCopyError::Copy(error));
+            }
+            copied += len;
         }
+        let slot = self.free_slots.pop().unwrap();
         let generation = self.generations[usize::from(slot)].wrapping_add(1).max(1);
         self.generations[usize::from(slot)] = generation;
         self.entries[usize::from(slot)] = Some(TxEntry {
             generation,
             chunks,
             chunk_count: chunk_count as u8,
-            len: payload.len() as u16,
+            len: payload_len as u16,
             destination,
             dont_route,
             confirm,
             dma_payload: None,
         });
         self.queued.push_back(slot);
-        self.used_bytes += payload.len();
+        self.used_bytes += payload_len;
         #[cfg(feature = "performance-profile")]
         {
-            record_payload_copy(copy_start, payload.len());
+            record_payload_copy(copy_start, payload_len);
             profiling::observe(profiling::Metric::UdpTxQueueDepth, self.queued.len() as u64);
         }
         Ok(())
     }
 
-    fn push_dma(
+    fn push_dma_from<E>(
         &mut self,
-        payload: &[u8],
+        payload_len: usize,
         destination: Endpoint,
         dont_route: bool,
         confirm: bool,
         pool: SharedNetBufPool,
-    ) -> Result<(), SocketError> {
-        let chunk_count = payload.len().div_ceil(SOCKET_CHUNK_BYTES);
+        copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<(), DatagramCopyError<E>> {
+        let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
         if chunk_count > MAX_DATAGRAM_CHUNKS
-            || self.used_bytes.saturating_add(payload.len()) > self.limit
+            || self.used_bytes.saturating_add(payload_len) > self.limit
             || self.free_slots.is_empty()
         {
-            return Err(SocketError::WouldBlock);
+            return Err(DatagramCopyError::Socket(SocketError::WouldBlock));
         }
         let mut leases: [Option<NetBufLease>; MAX_DATAGRAM_CHUNKS] = core::array::from_fn(|_| None);
         {
             let mut owner = pool.lock();
             owner.drain_remote();
-            for (index, part) in payload.chunks(SOCKET_CHUNK_BYTES).enumerate() {
+            let mut copied = 0usize;
+            for lease_slot in leases.iter_mut().take(chunk_count) {
+                let len = (payload_len - copied).min(SOCKET_CHUNK_BYTES);
                 let mut lease = owner
-                    .lease(0, part.len() as u16, PacketMetadata::default())
-                    .map_err(|_| SocketError::WouldBlock)?;
-                lease
+                    .lease(0, len as u16, PacketMetadata::default())
+                    .map_err(|_| DatagramCopyError::Socket(SocketError::WouldBlock))?;
+                let output = lease
                     .as_mut_slice()
-                    .map_err(|_| SocketError::Buffer)?
-                    .copy_from_slice(part);
-                leases[index] = Some(lease);
+                    .map_err(|_| DatagramCopyError::Socket(SocketError::Buffer))?;
+                copy(copied, output).map_err(DatagramCopyError::Copy)?;
+                copied += len;
+                *lease_slot = Some(lease);
             }
         }
         let mut chain = PacketChain::new();
@@ -1288,10 +1419,10 @@ impl TxRing {
             let chunk = lease
                 .into_chunk()
                 .and_then(|chunk| chunk.retain_pool(Arc::clone(&pool)))
-                .map_err(|_| SocketError::Buffer)?;
+                .map_err(|_| DatagramCopyError::Socket(SocketError::Buffer))?;
             chain
                 .push(PacketFragment::Shared(chunk))
-                .map_err(|_| SocketError::Buffer)?;
+                .map_err(|_| DatagramCopyError::Socket(SocketError::Buffer))?;
         }
         let slot = self.free_slots.pop().unwrap();
         let generation = self.generations[usize::from(slot)].wrapping_add(1).max(1);
@@ -1300,14 +1431,14 @@ impl TxRing {
             generation,
             chunks: [0; MAX_DATAGRAM_CHUNKS],
             chunk_count: 0,
-            len: payload.len() as u16,
+            len: payload_len as u16,
             destination,
             dont_route,
             confirm,
             dma_payload: Some(chain),
         });
         self.queued.push_back(slot);
-        self.used_bytes += payload.len();
+        self.used_bytes += payload_len;
         #[cfg(feature = "performance-profile")]
         profiling::observe(profiling::Metric::UdpTxQueueDepth, self.queued.len() as u64);
         Ok(())
@@ -1485,6 +1616,7 @@ struct LocalUdpDatagram {
 enum RxPayload {
     Packet(crate::transport::UdpDatagram),
     Local(LocalUdpDatagram),
+    Shared(PacketChain),
 }
 
 struct RxDatagram {
@@ -1498,6 +1630,288 @@ struct RxDatagram {
     rx_timestamp_ns: u64,
 }
 
+struct LocalDatagramSlot {
+    payload: [u8; LOCAL_DATAGRAM_INLINE_BYTES],
+    payload_len: u16,
+    source: Endpoint,
+    destination: Endpoint,
+    ingress_interface: InterfaceId,
+    hop_limit: u8,
+    traffic_class: u8,
+    rx_timestamp_ns: u64,
+    occupied: bool,
+}
+
+impl LocalDatagramSlot {
+    fn new() -> Self {
+        let unspecified = Endpoint {
+            addr: crate::IpAddr::V4(crate::Ipv4Addr::UNSPECIFIED),
+            port: 0,
+        };
+        Self {
+            payload: [0; LOCAL_DATAGRAM_INLINE_BYTES],
+            payload_len: 0,
+            source: unspecified,
+            destination: unspecified,
+            ingress_interface: InterfaceId(0),
+            hop_limit: 0,
+            traffic_class: 0,
+            rx_timestamp_ns: 0,
+            occupied: false,
+        }
+    }
+
+    fn push_from<E>(
+        &mut self,
+        payload_len: usize,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+        copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        debug_assert!(!self.occupied);
+        debug_assert!(payload_len <= self.payload.len());
+        copy(0, &mut self.payload[..payload_len])?;
+        self.payload_len = payload_len as u16;
+        self.source = source;
+        self.destination = destination;
+        self.ingress_interface = ingress_interface;
+        self.hop_limit = hop_limit;
+        self.traffic_class = traffic_class;
+        self.rx_timestamp_ns = rx_timestamp_ns;
+        self.occupied = true;
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.occupied = false;
+        self.payload_len = 0;
+    }
+}
+
+struct DatagramRx {
+    ring: RxRing,
+    local: Option<Box<LocalDatagramSlot>>,
+}
+
+impl DatagramRx {
+    fn new() -> Self {
+        Self {
+            ring: RxRing::new(),
+            local: None,
+        }
+    }
+
+    fn prepare_local_lane(&mut self) {
+        if self.local.is_none() {
+            self.local = Some(Box::new(LocalDatagramSlot::new()));
+        }
+    }
+
+    fn local_occupied(&self) -> bool {
+        self.local.as_ref().is_some_and(|slot| slot.occupied)
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.local_occupied() && self.ring.is_empty()
+    }
+
+    fn len(&self) -> u16 {
+        self.ring.len + u16::from(self.local_occupied())
+    }
+
+    fn local_bytes(&self) -> usize {
+        self.local
+            .as_ref()
+            .filter(|slot| slot.occupied)
+            .map_or(0, |slot| usize::from(slot.payload_len))
+    }
+
+    fn bytes(&self) -> usize {
+        self.ring.bytes + self.local_bytes()
+    }
+
+    fn front_len(&self) -> Option<usize> {
+        if let Some(slot) = self.local.as_ref().filter(|slot| slot.occupied) {
+            return Some(usize::from(slot.payload_len));
+        }
+        self.ring
+            .front()
+            .map(|datagram| usize::from(datagram.payload_len))
+    }
+
+    fn push(
+        &mut self,
+        datagram: crate::transport::UdpDatagram,
+    ) -> Result<(), crate::transport::UdpDatagram> {
+        if self
+            .bytes()
+            .saturating_add(usize::from(datagram.payload_len))
+            > self.ring.limit
+        {
+            return Err(datagram);
+        }
+        self.ring.push(datagram)
+    }
+
+    fn push_local_from<E>(
+        &mut self,
+        payload_len: usize,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+        copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<(), DatagramCopyError<E>> {
+        if self.ring.is_empty()
+            && payload_len <= LOCAL_DATAGRAM_INLINE_BYTES
+            && self.bytes().saturating_add(payload_len) <= self.ring.limit
+            && let Some(slot) = self.local.as_mut()
+            && !slot.occupied
+        {
+            #[cfg(feature = "performance-profile")]
+            let copy_start = profiling::read_counter();
+            slot.push_from(
+                payload_len,
+                source,
+                destination,
+                hop_limit,
+                traffic_class,
+                ingress_interface,
+                rx_timestamp_ns,
+                copy,
+            )
+            .map_err(DatagramCopyError::Copy)?;
+            #[cfg(feature = "performance-profile")]
+            record_payload_copy(copy_start, payload_len);
+            return Ok(());
+        }
+        if self.bytes().saturating_add(payload_len) > self.ring.limit {
+            #[cfg(feature = "performance-profile")]
+            self.ring.record_full_reject();
+            return Err(DatagramCopyError::Socket(SocketError::WouldBlock));
+        }
+        self.ring.push_local_from(
+            payload_len,
+            source,
+            destination,
+            hop_limit,
+            traffic_class,
+            ingress_interface,
+            rx_timestamp_ns,
+            copy,
+        )
+    }
+
+    fn push_local_shared(
+        &mut self,
+        payload: PacketChain,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+    ) -> Result<(), SocketError> {
+        let payload_len = payload.total_len();
+        if self.bytes().saturating_add(payload_len) > self.ring.limit {
+            #[cfg(feature = "performance-profile")]
+            self.ring.record_full_reject();
+            return Err(SocketError::WouldBlock);
+        }
+        self.ring.push_local_shared(
+            payload,
+            source,
+            destination,
+            hop_limit,
+            traffic_class,
+            ingress_interface,
+            rx_timestamp_ns,
+        )
+    }
+
+    fn can_push_local_len(&self, payload_len: usize) -> bool {
+        self.bytes().saturating_add(payload_len) <= self.ring.limit
+            && ((self.ring.is_empty()
+                && payload_len <= LOCAL_DATAGRAM_INLINE_BYTES
+                && self.local.as_ref().is_some_and(|slot| !slot.occupied))
+                || self.ring.can_push_local_len(payload_len))
+    }
+
+    fn front_local(&self) -> bool {
+        self.local_occupied()
+            || self.ring.front().is_some_and(|datagram| {
+                matches!(datagram.payload, RxPayload::Local(_) | RxPayload::Shared(_))
+            })
+    }
+
+    fn front_metadata(&self) -> Option<(usize, Endpoint, Endpoint, InterfaceId, u8, u8, u64)> {
+        if let Some(slot) = self.local.as_ref().filter(|slot| slot.occupied) {
+            return Some((
+                usize::from(slot.payload_len),
+                slot.source,
+                slot.destination,
+                slot.ingress_interface,
+                slot.hop_limit,
+                slot.traffic_class,
+                slot.rx_timestamp_ns,
+            ));
+        }
+        let datagram = self.ring.front()?;
+        Some((
+            usize::from(datagram.payload_len),
+            datagram.source,
+            datagram.destination,
+            datagram.ingress_interface,
+            datagram.hop_limit,
+            datagram.traffic_class,
+            datagram.rx_timestamp_ns,
+        ))
+    }
+
+    fn copy_front(&self, output: &mut [u8]) -> Result<(), SocketError> {
+        if let Some(slot) = self.local.as_ref().filter(|slot| slot.occupied) {
+            output.copy_from_slice(&slot.payload[..output.len()]);
+            return Ok(());
+        }
+        self.ring.copy_front(output)
+    }
+
+    fn copy_local_front_to<E>(
+        &self,
+        output_len: usize,
+        copy: &mut impl FnMut(usize, &[u8]) -> Result<(), E>,
+    ) -> Result<Option<usize>, DatagramCopyError<E>> {
+        if let Some(slot) = self.local.as_ref().filter(|slot| slot.occupied) {
+            let copied = output_len.min(usize::from(slot.payload_len));
+            copy(0, &slot.payload[..copied]).map_err(DatagramCopyError::Copy)?;
+            return Ok(Some(copied));
+        }
+        self.ring.copy_local_front_to(output_len, copy)
+    }
+
+    fn pop(&mut self) -> Option<()> {
+        if let Some(slot) = self.local.as_mut().filter(|slot| slot.occupied) {
+            slot.clear();
+            return Some(());
+        }
+        self.ring.pop().map(drop)
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.ring.set_limit(limit);
+    }
+
+    fn limit(&self) -> usize {
+        self.ring.limit
+    }
+}
+
 struct RxRing {
     entries: Box<[Option<RxDatagram>]>,
     head: u16,
@@ -1507,6 +1921,8 @@ struct RxRing {
     limit: usize,
     arena: Box<[u8]>,
     free_chunks: [u64; 2],
+    #[cfg(feature = "performance-profile")]
+    full_since_ns: u64,
 }
 
 impl RxRing {
@@ -1523,7 +1939,29 @@ impl RxRing {
             limit: UDP_BUFFER_BYTES,
             arena: alloc::vec![0; UDP_BUFFER_BYTES].into_boxed_slice(),
             free_chunks: [u64::MAX >> 32, 0],
+            #[cfg(feature = "performance-profile")]
+            full_since_ns: 0,
         }
+    }
+
+    #[cfg(feature = "performance-profile")]
+    fn record_full_reject(&mut self) {
+        profiling::observe(profiling::Metric::RxRingFullRejects, 1);
+        if self.full_since_ns == 0 {
+            self.full_since_ns = sched::now_ns_public().saturating_add(1);
+        }
+    }
+
+    #[cfg(feature = "performance-profile")]
+    fn finish_full_interval(&mut self) {
+        if self.full_since_ns == 0 {
+            return;
+        }
+        let started = core::mem::take(&mut self.full_since_ns);
+        profiling::observe(
+            profiling::Metric::RxRingFullDurationNs,
+            sched::now_ns_public().saturating_sub(started - 1),
+        );
     }
 
     fn is_empty(&self) -> bool {
@@ -1537,6 +1975,8 @@ impl RxRing {
         if usize::from(self.len) == self.entries.len()
             || self.bytes.saturating_add(usize::from(datagram.payload_len)) > self.limit
         {
+            #[cfg(feature = "performance-profile")]
+            self.record_full_reject();
             return Err(datagram);
         }
         self.bytes += usize::from(datagram.payload_len);
@@ -1557,24 +1997,26 @@ impl RxRing {
         Ok(())
     }
 
-    fn push_local(
+    fn push_local_from<E>(
         &mut self,
-        payload: &UdpTxLease,
+        payload_len: usize,
         source: Endpoint,
         destination: Endpoint,
         hop_limit: u8,
         traffic_class: u8,
         ingress_interface: InterfaceId,
         rx_timestamp_ns: u64,
-    ) -> Result<(), SocketError> {
-        let payload_len = usize::from(payload.len);
+        copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<(), DatagramCopyError<E>> {
         let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
         if usize::from(self.len) == self.entries.len()
             || self.bytes.saturating_add(payload_len) > self.limit
             || chunk_count > MAX_DATAGRAM_CHUNKS
             || self.free_chunk_count() < chunk_count
         {
-            return Err(SocketError::WouldBlock);
+            #[cfg(feature = "performance-profile")]
+            self.record_full_reject();
+            return Err(DatagramCopyError::Socket(SocketError::WouldBlock));
         }
         let mut chunks = [0u8; MAX_DATAGRAM_CHUNKS];
         let mut allocated = 0;
@@ -1587,13 +2029,13 @@ impl RxRing {
         for (index, chunk) in chunks.iter().take(chunk_count).enumerate() {
             let offset = index * SOCKET_CHUNK_BYTES;
             let len = (payload_len - offset).min(SOCKET_CHUNK_BYTES);
-            if let Err(error) = payload.copy_range(
+            if let Err(error) = copy(
                 offset,
                 &mut self.arena[usize::from(*chunk) * SOCKET_CHUNK_BYTES
                     ..usize::from(*chunk) * SOCKET_CHUNK_BYTES + len],
             ) {
                 self.release_chunks(&chunks, allocated);
-                return Err(error);
+                return Err(DatagramCopyError::Copy(error));
             }
         }
         self.bytes += payload_len;
@@ -1604,7 +2046,7 @@ impl RxRing {
             }),
             source,
             destination,
-            payload_len: payload.len,
+            payload_len: payload_len as u16,
             ingress_interface,
             hop_limit,
             traffic_class,
@@ -1618,6 +2060,54 @@ impl RxRing {
             profiling::observe(profiling::Metric::RxRingDepth, u64::from(self.len));
         }
         Ok(())
+    }
+
+    fn push_local_shared(
+        &mut self,
+        payload: PacketChain,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+    ) -> Result<(), SocketError> {
+        let payload_len = payload.total_len();
+        if payload_len > u16::MAX as usize
+            || usize::from(self.len) == self.entries.len()
+            || self.bytes.saturating_add(payload_len) > self.limit
+            || (0..payload.fragment_count())
+                .any(|index| !matches!(payload.fragment(index), Some(PacketFragment::Shared(_))))
+        {
+            #[cfg(feature = "performance-profile")]
+            self.record_full_reject();
+            return Err(SocketError::WouldBlock);
+        }
+        self.bytes += payload_len;
+        self.entries[usize::from(self.tail)] = Some(RxDatagram {
+            payload: RxPayload::Shared(payload),
+            source,
+            destination,
+            payload_len: payload_len as u16,
+            ingress_interface,
+            hop_limit,
+            traffic_class,
+            rx_timestamp_ns,
+        });
+        self.tail = (self.tail + 1) % self.entries.len() as u16;
+        self.len += 1;
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::RxRingDepth, u64::from(self.len));
+        Ok(())
+    }
+
+    /// 当前队列是否还能原子接收一个同等大小的本地数据报。
+    fn can_push_local_len(&self, payload_len: usize) -> bool {
+        let chunk_count = payload_len.div_ceil(SOCKET_CHUNK_BYTES);
+        usize::from(self.len) < self.entries.len()
+            && self.bytes.saturating_add(payload_len) <= self.limit
+            && chunk_count <= MAX_DATAGRAM_CHUNKS
+            && self.free_chunk_count() >= chunk_count
     }
 
     fn front(&self) -> Option<&RxDatagram> {
@@ -1648,12 +2138,62 @@ impl RxRing {
                 }
                 Ok(())
             }
+            RxPayload::Shared(payload) => payload
+                .copy_out(0, &mut output[..len])
+                .map_err(|_| SocketError::Buffer),
         };
         #[cfg(feature = "performance-profile")]
         if result.is_ok() {
             record_payload_copy(copy_start, len);
         }
         result
+    }
+
+    /// 把本地数据报直接复制到外部目标；非本地 payload 返回 `None` 交给通用路径。
+    fn copy_local_front_to<E>(
+        &self,
+        output_len: usize,
+        copy: &mut impl FnMut(usize, &[u8]) -> Result<(), E>,
+    ) -> Result<Option<usize>, DatagramCopyError<E>> {
+        let Some(datagram) = self.front() else {
+            return Ok(None);
+        };
+        let len = output_len.min(usize::from(datagram.payload_len));
+        match &datagram.payload {
+            RxPayload::Local(local) => {
+                let mut copied = 0usize;
+                for chunk in local.chunks.iter().take(usize::from(local.chunk_count)) {
+                    let part = (len - copied).min(SOCKET_CHUNK_BYTES);
+                    let offset = usize::from(*chunk) * SOCKET_CHUNK_BYTES;
+                    copy(copied, &self.arena[offset..offset + part])
+                        .map_err(DatagramCopyError::Copy)?;
+                    copied += part;
+                    if copied == len {
+                        break;
+                    }
+                }
+                Ok(Some(copied))
+            }
+            RxPayload::Shared(payload) => {
+                let mut copied = 0usize;
+                for index in 0..payload.fragment_count() {
+                    let Some(fragment) = payload.fragment(index) else {
+                        return Ok(None);
+                    };
+                    let bytes = fragment
+                        .as_slice()
+                        .map_err(|_| DatagramCopyError::Socket(SocketError::Buffer))?;
+                    let part = (len - copied).min(bytes.len());
+                    copy(copied, &bytes[..part]).map_err(DatagramCopyError::Copy)?;
+                    copied += part;
+                    if copied == len {
+                        break;
+                    }
+                }
+                Ok(Some(copied))
+            }
+            RxPayload::Packet(_) => Ok(None),
+        }
     }
 
     fn pop(&mut self) -> Option<RxDatagram> {
@@ -1675,6 +2215,8 @@ impl RxRing {
         {
             self.release_chunks(&local.chunks, usize::from(local.chunk_count));
         }
+        #[cfg(feature = "performance-profile")]
+        self.finish_full_interval();
         datagram
     }
 

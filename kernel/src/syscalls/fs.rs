@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ops::ControlFlow;
+use core::ops::{ControlFlow, Deref};
 
 use errno::Errno;
 use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
@@ -36,6 +36,19 @@ const AT_NO_AUTOMOUNT: usize = 0x800;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_STATX_FORCE_SYNC: usize = 0x2000;
 const AT_STATX_DONT_SYNC: usize = 0x4000;
+
+struct SocketAddressBuffer {
+    bytes: [u8; MAX_SOCKET_ADDR],
+    len: usize,
+}
+
+impl Deref for SocketAddressBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes[..self.len]
+    }
+}
 
 const F_OK: usize = 0;
 const X_OK: usize = 1;
@@ -1672,6 +1685,8 @@ pub(super) fn sys_getpeername(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 }
 
 pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    #[cfg(feature = "performance-profile")]
+    let lookup_profile = profiling::scope(profiling::Event::SysUdpLookup);
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
@@ -1684,12 +1699,74 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         Some(copy_sockaddr_from_user(ctx.args[4], ctx.args[5])?)
     };
+    if let Some(vm) = current_vm_space()
+        && let Some(file) = fdt.get_file(fd)
+        && let Some(socket) = file.downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        && usize::from(socket.sock_type()) == vfs_socket::SOCK_DGRAM
+    {
+        #[cfg(feature = "performance-profile")]
+        drop(lookup_profile);
+        vfs_socket::validate_send_flags(ctx.args[3])?;
+        if (ctx.args[3] & vfs_socket::MSG_OOB) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        // 最大 UDP 数据报即使从页尾开始也只覆盖 17 个 4 KiB 页；多留一个槽
+        // 兼容页粒度变化，并在取得 socket 自旋锁前完成全部 fault-in。
+        #[cfg(feature = "performance-profile")]
+        let pin_profile = profiling::scope(profiling::Event::SysUdpPin);
+        #[cfg(feature = "performance-profile")]
+        let pin_start = profiling::read_counter();
+        let windows = vm.pin_user_read_windows::<18>(ctx.args[1], len)?;
+        #[cfg(feature = "performance-profile")]
+        {
+            drop(pin_profile);
+            profiling::observe(
+                profiling::Metric::UdpUserPinCycles,
+                profiling::read_counter().wrapping_sub(pin_start),
+            );
+            profiling::observe(
+                profiling::Metric::UdpUserPinnedWindows,
+                windows.window_count() as u64,
+            );
+        }
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::SysSendSocket);
+        #[cfg(feature = "performance-profile")]
+        let mut user_copy_cycles = 0u64;
+        let opts = vfs::net_socket::InetSendOptions {
+            nonblocking: file.flags().nonblock || (ctx.args[3] & vfs_socket::MSG_DONTWAIT) != 0,
+            more: (ctx.args[3] & vfs_socket::MSG_MORE) != 0,
+            dont_route: (ctx.args[3] & vfs_socket::MSG_DONTROUTE) != 0,
+            confirm: (ctx.args[3] & vfs_socket::MSG_CONFIRM) != 0,
+            deadline_ns: None,
+        };
+        let result = socket.sendto_from(len, addr.as_deref(), opts, |offset, output| {
+            #[cfg(feature = "performance-profile")]
+            let copy_start = profiling::read_counter();
+            let result = windows.copy_into(offset, output);
+            #[cfg(feature = "performance-profile")]
+            {
+                user_copy_cycles = user_copy_cycles
+                    .saturating_add(profiling::read_counter().wrapping_sub(copy_start));
+            }
+            result
+        });
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(profiling::Metric::UdpUserCopyCycles, user_copy_cycles);
+            if let Ok(written) = result {
+                profile.set_bytes(written);
+            }
+        }
+        return result;
+    }
     if addr.is_none()
         && len != 0
-        && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
+        && let Some(file) = fdt.get_file(fd)
+        && let Some(socket) = inet_stream_file(&file)
     {
-        return send_inet_stream_from_user(&vm, &vfs_ctx, &fdt, fd, ctx.args[1], len, ctx.args[3]);
+        return send_inet_stream_file_from_user(&vm, &file, socket, ctx.args[1], len, ctx.args[3]);
     }
     if len <= COPY_CHUNK {
         let mut data = [0u8; COPY_CHUNK];
@@ -1718,17 +1795,55 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 }
 
 pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    #[cfg(feature = "performance-profile")]
+    let lookup_profile = profiling::scope(profiling::Event::SysUdpLookup);
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let len = ctx.args[2].min(MAX_SOCKET_IO);
     let want_addr = ctx.args[4] != 0 && ctx.args[5] != 0;
     let flags = ctx.args[3];
     if len != 0
-        && (flags & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
-        && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
+        && (flags
+            & (vfs_socket::MSG_PEEK
+                | vfs_socket::MSG_WAITALL
+                | vfs_socket::MSG_OOB
+                | vfs_socket::MSG_ERRQUEUE))
+            == 0
         && let Some(vm) = current_vm_space()
+        && let Some(file) = fdt.get_file(fd)
+        && let Some(socket) = file.downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        && usize::from(socket.sock_type()) == vfs_socket::SOCK_DGRAM
+        && let Some(received) = {
+            #[cfg(feature = "performance-profile")]
+            drop(lookup_profile);
+            recv_local_datagram_to_user(&vm, &file, socket, ctx.args[1], len, flags)?
+        }
     {
-        return recv_inet_stream_to_user(&vm, &fdt, fd, ctx.args[1], len, want_addr, flags, ctx);
+        if want_addr {
+            if let Some(remote) = received.remote {
+                let mut address = [0u8; MAX_SOCKET_ADDR];
+                let address_len =
+                    vfs::addr::encode_inet_sockaddr(&remote, socket.family(), &mut address)?;
+                copy_sockaddr_to_user(ctx.args[4], ctx.args[5], Some(&address[..address_len]))?;
+            } else {
+                copy_sockaddr_to_user(ctx.args[4], ctx.args[5], None)?;
+            }
+        }
+        return Ok(received.len);
+    }
+    if len != 0
+        && !want_addr
+        && (flags
+            & (vfs_socket::MSG_PEEK
+                | vfs_socket::MSG_WAITALL
+                | vfs_socket::MSG_OOB
+                | vfs_socket::MSG_ERRQUEUE))
+            == 0
+        && let Some(vm) = current_vm_space()
+        && let Some(file) = fdt.get_file(fd)
+        && let Some(socket) = inet_stream_file(&file)
+    {
+        return recv_inet_stream_file_to_user(&vm, &file, socket, ctx.args[1], len, flags);
     }
     if len <= COPY_CHUNK {
         let mut data = [0u8; COPY_CHUNK];
@@ -1737,6 +1852,65 @@ pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         let mut data = zeroed_vec(len)?;
         recv_socket_payload(&fdt, fd, ctx.args[1], &mut data, want_addr, ctx)
     }
+}
+
+fn recv_local_datagram_to_user(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+    flags: usize,
+) -> Result<Option<vfs::net_socket::InetRecvResult>, Errno> {
+    vfs_socket::validate_recv_flags(flags)?;
+    let opts = vfs::net_socket::InetRecvOptions {
+        nonblocking: file.flags().nonblock || (flags & vfs_socket::MSG_DONTWAIT) != 0,
+        peek: false,
+        wait_all: false,
+        trunc: (flags & vfs_socket::MSG_TRUNC) != 0,
+        defer_window_update: false,
+        deadline_ns: None,
+    };
+    #[cfg(feature = "performance-profile")]
+    let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+    #[cfg(feature = "performance-profile")]
+    let wait_profile = profiling::scope(profiling::Event::SysUdpWait);
+    let Some(datagram_len) = socket.wait_datagram_readable(opts)? else {
+        return Ok(None);
+    };
+    #[cfg(feature = "performance-profile")]
+    drop(wait_profile);
+    // 最大 UDP 数据报即使从页尾开始也只覆盖 17 个 4 KiB 页。等待完成后
+    // 再固定目标，避免阻塞接收期间长期保留用户页。
+    #[cfg(feature = "performance-profile")]
+    let pin_profile = profiling::scope(profiling::Event::SysUdpPin);
+    #[cfg(feature = "performance-profile")]
+    let pin_start = profiling::read_counter();
+    let windows = vm.pin_user_write_windows::<18>(user, len.min(datagram_len))?;
+    #[cfg(feature = "performance-profile")]
+    {
+        drop(pin_profile);
+        profiling::observe(
+            profiling::Metric::UdpUserWritePinCycles,
+            profiling::read_counter().wrapping_sub(pin_start),
+        );
+        profiling::observe(
+            profiling::Metric::UdpUserWritePinnedWindows,
+            windows.window_count() as u64,
+        );
+    }
+    #[cfg(feature = "performance-profile")]
+    let consume_profile = profiling::scope(profiling::Event::SysUdpConsume);
+    let received = socket.recv_local_datagram_from(len, windows.len(), opts, |offset, input| {
+        windows.copy_from(offset, input)
+    })?;
+    #[cfg(feature = "performance-profile")]
+    drop(consume_profile);
+    #[cfg(feature = "performance-profile")]
+    if let Some(received) = received {
+        profile.set_bytes(received.len.min(len));
+    }
+    Ok(received)
 }
 
 fn send_inet_stream_from_user(
@@ -1766,6 +1940,62 @@ fn send_inet_stream_from_user(
             Ok(Ok(result)) => result,
             Ok(Err(error)) if sent != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
                 return Ok(sent);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return if sent == 0 { Err(error) } else { Ok(sent) },
+        };
+        sent += written;
+        if written == 0 || written < window_len {
+            break;
+        }
+    }
+    Ok(sent)
+}
+
+fn send_inet_stream_file_from_user(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+    flags: usize,
+) -> Result<usize, Errno> {
+    vfs_socket::validate_send_flags(flags)?;
+    if (flags & vfs_socket::MSG_OOB) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    // 内部分页会临时设置 MSG_MORE；若后续用户页缺页失败或发送只完成一部分，
+    // 仍须发布已经接受的数据。应用显式传入 MSG_MORE 时则保留其 cork 语义。
+    let _batch = ((flags & vfs_socket::MSG_MORE) == 0).then(|| InetStreamWriteBatch { socket });
+    let nonblocking = file.flags().nonblock || (flags & vfs_socket::MSG_DONTWAIT) != 0;
+    let deadline_ns = socket.stream_send_deadline();
+    let mut sent = 0usize;
+    while sent < len {
+        let user_ptr = user.checked_add(sent).ok_or(Errno::EFAULT)?;
+        let remaining = len - sent;
+        let result = unsafe {
+            vm.with_user_read_slice(user_ptr, remaining, |data| {
+                let more = sent + data.len() < len || (flags & vfs_socket::MSG_MORE) != 0;
+                #[cfg(feature = "performance-profile")]
+                let mut profile = profiling::scope(profiling::Event::SysSendSocket);
+                let result = socket.send_stream_page(data, nonblocking, deadline_ns, more);
+                #[cfg(feature = "performance-profile")]
+                if let Ok(written) = result {
+                    profile.set_bytes(written);
+                }
+                result.map(|written| (written, data.len()))
+            })
+        };
+        let (written, window_len) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) if sent != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+                return Ok(sent);
+            }
+            Ok(Err(Errno::EPIPE)) => {
+                if (flags & vfs_socket::MSG_NOSIGNAL) == 0 {
+                    deliver_sigpipe();
+                }
+                return Err(Errno::EPIPE);
             }
             Ok(Err(error)) => return Err(error),
             Err(error) => return if sent == 0 { Err(error) } else { Ok(sent) },
@@ -1817,7 +2047,80 @@ fn send_inet_stream_iovecs_from_user(
     Ok(sent)
 }
 
-fn recv_inet_stream_to_user(
+fn recv_inet_stream_file_to_user(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+    flags: usize,
+) -> Result<usize, Errno> {
+    vfs_socket::validate_recv_flags(flags)?;
+    let _batch = InetStreamFileReceiveBatch { socket };
+    let nonblocking = file.flags().nonblock || (flags & vfs_socket::MSG_DONTWAIT) != 0;
+    let deadline_ns = socket.stream_recv_deadline();
+    let mut received = 0usize;
+    while received < len {
+        let user_ptr = user.checked_add(received).ok_or(Errno::EFAULT)?;
+        let remaining = len - received;
+        let result = unsafe {
+            vm.with_user_write_slice(user_ptr, remaining, |data| {
+                #[cfg(feature = "performance-profile")]
+                let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+                let more = received.saturating_add(data.len()) < len;
+                let result =
+                    socket.recv_stream_page(data, nonblocking || received != 0, deadline_ns, more);
+                #[cfg(feature = "performance-profile")]
+                if let Ok(copied) = result {
+                    profile.set_bytes(copied);
+                }
+                result.map(|copied| (copied, data.len()))
+            })
+        };
+        let (copied, window_len) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) if received != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+                break;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                return if received == 0 {
+                    Err(error)
+                } else {
+                    Ok(received)
+                };
+            }
+        };
+        received += copied;
+        if copied == 0 || copied < window_len {
+            break;
+        }
+    }
+    Ok(received)
+}
+
+struct InetStreamFileReceiveBatch<'a> {
+    socket: &'a vfs::net_socket::NetSocketFileOps,
+}
+
+impl Drop for InetStreamFileReceiveBatch<'_> {
+    fn drop(&mut self) {
+        self.socket.finish_stream_receive();
+    }
+}
+
+struct InetStreamFdReceiveBatch<'a> {
+    fdt: &'a vfs::fdtable::FdTable,
+    fd: Fd,
+}
+
+impl Drop for InetStreamFdReceiveBatch<'_> {
+    fn drop(&mut self) {
+        vfs_socket::finish_stream_receive(self.fdt, self.fd);
+    }
+}
+
+fn recv_inet_stream_windows(
     vm: &VmSpace,
     fdt: &vfs::fdtable::FdTable,
     fd: Fd,
@@ -1825,10 +2128,9 @@ fn recv_inet_stream_to_user(
     len: usize,
     want_addr: bool,
     flags: usize,
-    ctx: &SyscallContext<'_>,
+    address: &mut Option<Vec<u8>>,
 ) -> Result<usize, Errno> {
     let mut received = 0usize;
-    let mut address = None;
     while received < len {
         let user_ptr = user.checked_add(received).ok_or(Errno::EFAULT)?;
         let remaining = len - received;
@@ -1840,7 +2142,7 @@ fn recv_inet_stream_to_user(
                 }
                 #[cfg(feature = "performance-profile")]
                 let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
-                let result = vfs_socket::recv(
+                let result = vfs_socket::recv_deferred(
                     fdt,
                     fd,
                     data,
@@ -1871,15 +2173,12 @@ fn recv_inet_stream_to_user(
             }
         };
         if received == 0 {
-            address = output.address;
+            *address = output.address;
         }
         received += output.len;
         if output.len == 0 || output.len < window_len {
             break;
         }
-    }
-    if want_addr {
-        copy_sockaddr_to_user(ctx.args[4], ctx.args[5], address.as_deref())?;
     }
     Ok(received)
 }
@@ -1892,9 +2191,10 @@ fn recv_inet_stream_iovecs_to_user(
     iovcnt: usize,
     total: usize,
     flags: usize,
-    ctx: &SyscallContext<'_>,
 ) -> Result<usize, Errno> {
+    let _batch = InetStreamFdReceiveBatch { fdt, fd };
     let mut received = 0usize;
+    let mut address = None;
     for index in 0..iovcnt {
         let (base, len) = read_iovec(iov, index)?;
         let len = len.min(total.saturating_sub(received));
@@ -1906,7 +2206,7 @@ fn recv_inet_stream_iovecs_to_user(
         } else {
             flags | vfs_socket::MSG_DONTWAIT
         };
-        match recv_inet_stream_to_user(vm, fdt, fd, base, len, false, chunk_flags, ctx) {
+        match recv_inet_stream_windows(vm, fdt, fd, base, len, false, chunk_flags, &mut address) {
             Ok(copied) => {
                 received += copied;
                 if copied < len {
@@ -1980,9 +2280,15 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         && (hdr.name == 0 || hdr.namelen == 0)
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
+        && let Some(file) = fdt.get_file(fd)
+        && let Some(socket) = inet_stream_file(&file)
     {
         let total = iov_total_len_capped(hdr.iov, hdr.iovlen, MAX_SOCKET_IO)?;
         if total != 0 {
+            // 中间 iovec 会携带内部 MSG_MORE；任一后续 iovec 读取失败时也要发布
+            // 已接受的数据。调用者显式 MSG_MORE 时不改变其可见状态。
+            let _batch = ((ctx.args[2] & vfs_socket::MSG_MORE) == 0)
+                .then(|| InetStreamWriteBatch { socket });
             return send_inet_stream_iovecs_from_user(
                 &vm,
                 &vfs_ctx,
@@ -2078,7 +2384,6 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
             hdr.iovlen,
             total,
             ctx.args[2],
-            ctx,
         )?;
         hdr.controllen = 0;
         hdr.namelen = 0;
@@ -3536,7 +3841,109 @@ fn validate_openat2_flags(raw: usize) -> Result<(), Errno> {
 }
 
 fn write_from_user(file: &vfs::file::File, user: usize, len: usize) -> Result<usize, Errno> {
+    if len != 0
+        && let Some(vm) = current_vm_space()
+        && let Some(socket) = inet_stream_file(file)
+    {
+        return write_inet_stream_from_user(&vm, file, socket, user, len);
+    }
     write_from_user_at(file, user, len, None)
+}
+
+struct InetStreamWriteBatch<'a> {
+    socket: &'a vfs::net_socket::NetSocketFileOps,
+}
+
+impl Drop for InetStreamWriteBatch<'_> {
+    fn drop(&mut self) {
+        self.socket.finish_stream_send();
+    }
+}
+
+fn inet_stream_file(file: &vfs::file::File) -> Option<&vfs::net_socket::NetSocketFileOps> {
+    let socket = file.downcast_ops::<vfs::net_socket::NetSocketFileOps>()?;
+    (usize::from(socket.sock_type()) == vfs_socket::SOCK_STREAM).then_some(socket)
+}
+
+fn write_inet_stream_from_user(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    let _batch = InetStreamWriteBatch { socket };
+    write_inet_stream_windows(vm, file, socket, user, len)
+}
+
+fn write_inet_stream_windows(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    let mut written = 0usize;
+    while written < len {
+        let user_ptr = user.checked_add(written).ok_or(Errno::EFAULT)?;
+        let remaining = len - written;
+        let result = unsafe {
+            vm.with_user_read_slice(user_ptr, remaining, |data| {
+                socket
+                    .sendto(
+                        data,
+                        None,
+                        vfs::net_socket::InetSendOptions {
+                            nonblocking: file.flags().nonblock,
+                            more: true,
+                            dont_route: false,
+                            confirm: false,
+                            deadline_ns: None,
+                        },
+                    )
+                    .map(|accepted| (accepted, data.len()))
+            })
+        };
+        let (accepted, window_len) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(Errno::EAGAIN)) if written != 0 => return Ok(written),
+            Ok(Err(Errno::EAGAIN)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(Errno::EAGAIN)) => {
+                wait_for_file_readiness(file, PollEvents::POLLOUT)?;
+                continue;
+            }
+            Ok(Err(Errno::EPIPE)) if written == 0 => {
+                deliver_sigpipe();
+                return Err(Errno::EPIPE);
+            }
+            Ok(Err(error)) => {
+                return if written == 0 {
+                    Err(error)
+                } else {
+                    Ok(written)
+                };
+            }
+            Err(error) => {
+                return if written == 0 {
+                    Err(error)
+                } else {
+                    Ok(written)
+                };
+            }
+        };
+        if accepted == 0 {
+            return if written == 0 {
+                Err(Errno::EIO)
+            } else {
+                Ok(written)
+            };
+        }
+        written += accepted;
+        if accepted < window_len {
+            break;
+        }
+    }
+    Ok(written)
 }
 
 fn write_from_user_at(
@@ -3668,7 +4075,96 @@ fn read_to_user(
     let Some(vm) = current_vm_space() else {
         return read_to_user_fallback(file, user, len, offset);
     };
+    if offset.is_none()
+        && let Some(socket) = inet_stream_file(file)
+    {
+        return read_inet_stream_to_user(&vm, file, socket, user, len);
+    }
 
+    read_to_user_windows(&vm, file, user, len, offset)
+}
+
+struct InetStreamReceiveBatch<'a> {
+    socket: &'a vfs::net_socket::NetSocketFileOps,
+}
+
+impl Drop for InetStreamReceiveBatch<'_> {
+    fn drop(&mut self) {
+        self.socket.finish_stream_receive();
+    }
+}
+
+fn read_inet_stream_to_user(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    let _batch = InetStreamReceiveBatch { socket };
+    read_inet_stream_windows(vm, file, socket, user, len)
+}
+
+fn read_inet_stream_windows(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
+    user: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    let mut remaining = len;
+    let mut user_ptr = user;
+    let mut read = 0usize;
+    while remaining > 0 {
+        let chunk = remaining.min(COPY_CHUNK);
+        let result = unsafe {
+            vm.with_user_write_slice(user_ptr, chunk, |buf| {
+                socket
+                    .recvfrom(
+                        buf,
+                        vfs::net_socket::InetRecvOptions {
+                            nonblocking: file.flags().nonblock,
+                            peek: false,
+                            wait_all: false,
+                            trunc: false,
+                            defer_window_update: true,
+                            deadline_ns: None,
+                        },
+                    )
+                    .map(|output| (output.len, buf.len()))
+            })
+        };
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(Errno::EAGAIN)) if read > 0 => return Ok(read),
+            Ok(Err(Errno::EAGAIN)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(Errno::EAGAIN)) => {
+                wait_for_file_readiness(file, PollEvents::POLLIN)?;
+                continue;
+            }
+            Ok(Err(error)) => return if read > 0 { Ok(read) } else { Err(error) },
+            Err(error) => return if read > 0 { Ok(read) } else { Err(error) },
+        };
+        if n == 0 {
+            break;
+        }
+        read += n;
+        user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
+        remaining -= n;
+        if n < window_len {
+            break;
+        }
+    }
+    Ok(read)
+}
+
+fn read_to_user_windows(
+    vm: &VmSpace,
+    file: &vfs::file::File,
+    user: usize,
+    len: usize,
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
     let mut remaining = len;
     let mut user_ptr = user;
     let mut pos = offset.unwrap_or(0);
@@ -3889,6 +4385,27 @@ fn write_iovecs(
     iovcnt: usize,
     mut offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    if offset.is_none()
+        && let Some(vm) = current_vm_space()
+        && let Some(socket) = inet_stream_file(file)
+    {
+        let _batch = InetStreamWriteBatch { socket };
+        let mut total = 0usize;
+        for i in 0..iovcnt {
+            let (base, len) = read_iovec(iov, i)?;
+            match write_inet_stream_windows(&vm, file, socket, base, len) {
+                Ok(written) => {
+                    total = total.checked_add(written).ok_or(Errno::EINVAL)?;
+                    if written < len {
+                        break;
+                    }
+                }
+                Err(_) if total != 0 => return Ok(total),
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(total);
+    }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
@@ -3916,6 +4433,27 @@ fn read_iovecs(
     iovcnt: usize,
     mut offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    if offset.is_none()
+        && let Some(vm) = current_vm_space()
+        && let Some(socket) = inet_stream_file(file)
+    {
+        let _batch = InetStreamReceiveBatch { socket };
+        let mut total = 0usize;
+        for i in 0..iovcnt {
+            let (base, len) = read_iovec(iov, i)?;
+            match read_inet_stream_windows(&vm, file, socket, base, len) {
+                Ok(read) => {
+                    total = total.checked_add(read).ok_or(Errno::EINVAL)?;
+                    if read < len {
+                        break;
+                    }
+                }
+                Err(_) if total != 0 => return Ok(total),
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(total);
+    }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
@@ -4179,14 +4717,22 @@ fn copy_user_region(user: usize, len: usize) -> Result<Vec<u8>, Errno> {
     Ok(out)
 }
 
-fn copy_sockaddr_from_user(user: usize, len: usize) -> Result<Vec<u8>, Errno> {
+fn copy_sockaddr_from_user(user: usize, len: usize) -> Result<SocketAddressBuffer, Errno> {
     if len == 0 {
         return Err(Errno::EINVAL);
     }
     if len > MAX_SOCKET_ADDR {
         return Err(Errno::EINVAL);
     }
-    copy_user_region(user, len)
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut out = SocketAddressBuffer {
+        bytes: [0; MAX_SOCKET_ADDR],
+        len,
+    };
+    copy_from_user(user, &mut out.bytes[..len]).map_err(|e| e.as_errno())?;
+    Ok(out)
 }
 
 fn read_socklen_user(user: usize) -> Result<usize, Errno> {

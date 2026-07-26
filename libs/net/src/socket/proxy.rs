@@ -337,14 +337,39 @@ impl NetSocketProxy {
         )
     }
 
+    pub fn send_datagram_from<E>(
+        &self,
+        payload_len: usize,
+        destination: Option<Endpoint>,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        dont_route: bool,
+        confirm: bool,
+        copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<usize, super::DatagramCopyError<E>> {
+        self.ensure_backend()
+            .map_err(super::DatagramCopyError::Socket)?;
+        self.facade.send_datagram_from(
+            payload_len,
+            destination,
+            nonblocking,
+            deadline_ns,
+            dont_route,
+            confirm,
+            copy,
+        )
+    }
+
     pub fn send_stream(
         &self,
         payload: &[u8],
         nonblocking: bool,
         deadline_ns: Option<u64>,
+        more: bool,
     ) -> Result<usize, SocketError> {
         self.ensure_backend()?;
-        self.facade.send_stream(payload, nonblocking, deadline_ns)
+        self.facade
+            .send_stream(payload, nonblocking, deadline_ns, more)
     }
 
     pub fn recv(
@@ -360,17 +385,50 @@ impl NetSocketProxy {
             .recv(output, peek, truncate, nonblocking, deadline_ns)
     }
 
+    pub fn wait_datagram_readable(
+        &self,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<Option<usize>, SocketError> {
+        self.ensure_backend()?;
+        self.facade.wait_datagram_readable(nonblocking, deadline_ns)
+    }
+
+    pub fn recv_local_datagram_from<E>(
+        &self,
+        output_len: usize,
+        copy_capacity: usize,
+        report_original_len: bool,
+        copy: impl FnMut(usize, &[u8]) -> Result<(), E>,
+    ) -> Result<Option<super::UdpReceive>, super::DatagramCopyError<E>> {
+        self.ensure_backend()
+            .map_err(super::DatagramCopyError::Socket)?;
+        self.facade
+            .recv_local_datagram_from(output_len, copy_capacity, report_original_len, copy)
+    }
+
     pub fn recv_stream(
         &self,
         output: &mut [u8],
         peek: bool,
         wait_all: bool,
+        defer_window_update: bool,
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
         self.ensure_backend()?;
-        self.facade
-            .recv_stream(output, peek, wait_all, nonblocking, deadline_ns)
+        self.facade.recv_stream(
+            output,
+            peek,
+            wait_all,
+            defer_window_update,
+            nonblocking,
+            deadline_ns,
+        )
+    }
+
+    pub fn finish_stream_receive(&self) {
+        self.facade.finish_stream_receive();
     }
 
     pub fn close(&self) {

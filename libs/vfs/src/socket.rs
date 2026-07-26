@@ -958,6 +958,61 @@ pub fn recv(
     flags: usize,
     deadline_ns: Option<u64>,
 ) -> Result<RecvOutput, Errno> {
+    recv_inner(
+        fdt,
+        fd,
+        data,
+        control_len,
+        want_addr,
+        flags,
+        deadline_ns,
+        false,
+    )
+}
+
+/// 接收一个用户页窗口，但把 TCP 窗口发布推迟到外层 syscall 收尾。
+pub fn recv_deferred(
+    fdt: &FdTable,
+    fd: Fd,
+    data: &mut [u8],
+    control_len: usize,
+    want_addr: bool,
+    flags: usize,
+    deadline_ns: Option<u64>,
+) -> Result<RecvOutput, Errno> {
+    recv_inner(
+        fdt,
+        fd,
+        data,
+        control_len,
+        want_addr,
+        flags,
+        deadline_ns,
+        true,
+    )
+}
+
+pub fn finish_stream_receive(fdt: &FdTable, fd: Fd) {
+    let Ok(file) = file_from_fd(fdt, fd) else {
+        return;
+    };
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>()
+        && net_ops.sock_type() == crate::net_socket::SOCK_STREAM_PUB
+    {
+        net_ops.finish_stream_receive();
+    }
+}
+
+fn recv_inner(
+    fdt: &FdTable,
+    fd: Fd,
+    data: &mut [u8],
+    control_len: usize,
+    want_addr: bool,
+    flags: usize,
+    deadline_ns: Option<u64>,
+    defer_window_update: bool,
+) -> Result<RecvOutput, Errno> {
     validate_recv_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
 
@@ -1019,6 +1074,7 @@ pub fn recv(
                     && (flags & MSG_PEEK) == 0
                     && net_ops.sock_type() == crate::net_socket::SOCK_STREAM_PUB,
                 trunc: (flags & MSG_TRUNC) != 0,
+                defer_window_update,
                 deadline_ns,
             },
         )?;
@@ -1990,7 +2046,7 @@ fn netlink_setsockopt(level: i32, optname: i32, _value: &[u8]) -> Result<(), Err
     }
 }
 
-fn validate_send_flags(flags: usize) -> Result<(), Errno> {
+pub fn validate_send_flags(flags: usize) -> Result<(), Errno> {
     let allowed =
         MSG_DONTWAIT | MSG_NOSIGNAL | MSG_EOR | MSG_MORE | MSG_OOB | MSG_DONTROUTE | MSG_CONFIRM;
     if (flags & !allowed) != 0 {
@@ -1999,7 +2055,7 @@ fn validate_send_flags(flags: usize) -> Result<(), Errno> {
     Ok(())
 }
 
-fn validate_recv_flags(flags: usize) -> Result<(), Errno> {
+pub fn validate_recv_flags(flags: usize) -> Result<(), Errno> {
     let allowed = MSG_DONTWAIT
         | MSG_PEEK
         | MSG_CMSG_CLOEXEC
