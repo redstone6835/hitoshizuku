@@ -283,7 +283,17 @@ pub(crate) fn invoke_pinned_native<T>(
     host_ranges: &[(usize, usize)],
     deadline_ns: u64,
 ) -> Result<i32, i32> {
-    let plan = with_core(|core| core.prepare_pinned_native_call(call))?;
+    #[cfg(feature = "performance-profile")]
+    let prepare_start = profiling::read_counter();
+    let prepared = with_core(|core| core.prepare_pinned_native_call(call));
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedCallPrepareCycles,
+        profiling::read_counter().wrapping_sub(prepare_start),
+    );
+    let plan = prepared?;
+    #[cfg(feature = "performance-profile")]
+    let execution_start = profiling::read_counter();
     let status = native::invoke_pinned_export(
         plan.callee.cell,
         plan.callee.generation,
@@ -295,7 +305,20 @@ pub(crate) fn invoke_pinned_native<T>(
         plan.callee.allowed_actions,
         deadline_ns,
     );
-    with_core(|core| core.complete_pinned_native_call(plan, status))
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedCallExecutionCycles,
+        profiling::read_counter().wrapping_sub(execution_start),
+    );
+    #[cfg(feature = "performance-profile")]
+    let complete_start = profiling::read_counter();
+    let completed = with_core(|core| core.complete_pinned_native_call(plan, status));
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedCallCompleteCycles,
+        profiling::read_counter().wrapping_sub(complete_start),
+    );
+    completed
 }
 
 pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String> {

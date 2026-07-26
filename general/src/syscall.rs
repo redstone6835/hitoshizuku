@@ -194,6 +194,8 @@ pub fn dispatch(tf: TrapFramePtr) {
         None
     };
 
+    #[cfg(feature = "performance-profile")]
+    let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
@@ -201,9 +203,14 @@ pub fn dispatch(tf: TrapFramePtr) {
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+    #[cfg(feature = "performance-profile")]
+    drop(invoke_profile);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        #[cfg(feature = "performance-profile")]
+        let finalize_profile =
+            profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
         if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
@@ -214,6 +221,11 @@ pub fn dispatch(tf: TrapFramePtr) {
                 )
                 .is_ok();
                 if delivered {
+                    #[cfg(feature = "performance-profile")]
+                    drop(finalize_profile);
+                    #[cfg(feature = "performance-profile")]
+                    let _handoff_profile =
+                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
                 }
@@ -242,6 +254,11 @@ pub fn dispatch(tf: TrapFramePtr) {
             }
             _ => {}
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
+        #[cfg(feature = "performance-profile")]
+        let _handoff_profile =
+            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
         sched::run_post_syscall_handoff_lazy();
     }
     // syscall 是 libcbench/lmbench 的最热路径，默认不能格式化并写入每次调用。
@@ -296,6 +313,8 @@ where
         _phantom: core::marker::PhantomData,
     };
 
+    #[cfg(feature = "performance-profile")]
+    let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
@@ -303,9 +322,14 @@ where
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+    #[cfg(feature = "performance-profile")]
+    drop(invoke_profile);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        #[cfg(feature = "performance-profile")]
+        let finalize_profile =
+            profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
         if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
@@ -316,6 +340,11 @@ where
                 )
                 .is_ok();
                 if delivered {
+                    #[cfg(feature = "performance-profile")]
+                    drop(finalize_profile);
+                    #[cfg(feature = "performance-profile")]
+                    let _handoff_profile =
+                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
                 }
@@ -343,6 +372,11 @@ where
             }
             _ => {}
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
+        #[cfg(feature = "performance-profile")]
+        let _handoff_profile =
+            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
         sched::run_post_syscall_handoff_lazy();
     }
 }

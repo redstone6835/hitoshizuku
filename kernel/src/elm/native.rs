@@ -174,6 +174,7 @@ impl NativeInvocation {
                 context,
                 bounds,
                 extra_host_ranges,
+                false,
             )
         }
     }
@@ -194,6 +195,7 @@ unsafe fn invoke_on_native_stack<T>(
     context: *mut T,
     bounds: NativeExecutionBounds,
     extra_host_ranges: &[(usize, usize)],
+    observe_pinned_call: bool,
 ) -> i32 {
     let context_start = context as usize;
     let Some(context_end) = context_start.checked_add(core::mem::size_of::<T>()) else {
@@ -227,8 +229,18 @@ unsafe fn invoke_on_native_stack<T>(
     let Some(_domain) = guard.enter_domain(ElmExecutionDomain::ElmCode) else {
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
+    #[cfg(feature = "performance-profile")]
+    let body_start = observe_pinned_call.then(profiling::read_counter);
     // 安全性：调用方保证入口地址与上下文 ABI；架构调用门只使用本对象持有的隔离栈。
-    unsafe { arch::call_elm_native(address, context.cast::<u8>(), stack.top()) }
+    let status = unsafe { arch::call_elm_native(address, context.cast::<u8>(), stack.top()) };
+    #[cfg(feature = "performance-profile")]
+    if let Some(body_start) = body_start {
+        profiling::observe(
+            profiling::Metric::PinnedNativeBodyCycles,
+            profiling::read_counter().wrapping_sub(body_start),
+        );
+    }
+    status
 }
 
 impl Drop for NativeCallStack {
@@ -1453,23 +1465,41 @@ pub(crate) fn invoke_pinned_export<T>(
     if address < bounds.code_start || address >= bounds.code_end {
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     }
+    #[cfg(feature = "performance-profile")]
+    let accounting_begin_start = profiling::read_counter();
     let now_ns = sched::now_ns_public();
-    let Ok(accounting) = super::resource_accounting::begin_native_call(
+    let accounting = super::resource_accounting::begin_native_call(
         cell,
         ELM_NATIVE_STACK_TOTAL_SIZE as u64,
         requested_deadline_ns,
         now_ns,
-    ) else {
+    );
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedAccountingBeginCycles,
+        profiling::read_counter().wrapping_sub(accounting_begin_start),
+    );
+    let Ok(accounting) = accounting else {
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
-    let Some(guard) = ElmGuard::enter(
+    #[cfg(feature = "performance-profile")]
+    let guard_enter_start = profiling::read_counter();
+    let guard = ElmGuard::enter(
         cell.0,
         ELM_GUARD_PHASE_MANAGED_CALL,
         accounting.watchdog_deadline_ns(),
-    ) else {
+    );
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedGuardEnterCycles,
+        profiling::read_counter().wrapping_sub(guard_enter_start),
+    );
+    let Some(guard) = guard else {
         let _ = accounting.finish(sched::now_ns_public());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
+    #[cfg(feature = "performance-profile")]
+    let context_enter_start = profiling::read_counter();
     let context = ElmContext::new(
         cell,
         None,
@@ -1479,16 +1509,37 @@ pub(crate) fn invoke_pinned_export<T>(
         0,
     )
     .with_allowed_actions(allowed_actions);
-    let Some(_current) = try_enter_current_context(&context) else {
+    let current = try_enter_current_context(&context);
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedContextEnterCycles,
+        profiling::read_counter().wrapping_sub(context_enter_start),
+    );
+    let Some(_current) = current else {
         let _ = accounting.finish(sched::now_ns_public());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
+    #[cfg(feature = "performance-profile")]
+    let native_gate_start = profiling::read_counter();
     // Safety: Core 已校验 export 身份、exact-Rust ABI、代际和 RX 边界；frame 只在同步调用内借用。
-    let status =
-        unsafe { invoke_on_native_stack(&guard, &stack.0, address, frame, bounds, host_ranges) };
+    let status = unsafe {
+        invoke_on_native_stack(&guard, &stack.0, address, frame, bounds, host_ranges, true)
+    };
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedNativeGateCycles,
+        profiling::read_counter().wrapping_sub(native_gate_start),
+    );
     let aborted = guard.aborted();
     let abort_reason = guard.abort_reason();
+    #[cfg(feature = "performance-profile")]
+    let accounting_finish_start = profiling::read_counter();
     let accounting = accounting.finish(sched::now_ns_public());
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedAccountingFinishCycles,
+        profiling::read_counter().wrapping_sub(accounting_finish_start),
+    );
     if aborted || accounting.watchdog_expired {
         log::error!(
             "[elm] pinned native call aborted: cell={} reason={} cpu_time_ns={} watchdog_expired={} status={}",
