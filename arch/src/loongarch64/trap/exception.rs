@@ -212,10 +212,11 @@ unsafe fn loongarch64_handle_exception_inner(
             profiling::sample_pc(arg0, from_user);
             // LoongArch 的定时器中断通常需要软件显式写 TICLR 清 pending，否则在 `ertn`
             // 后会立即再次陷入，形成“看似无法返回”的中断风暴。
+            let clear_timer = 1usize;
             unsafe {
                 core::arch::asm!(
                     "csrwr {val}, {csr}",
-                    val = in(reg) 1usize,
+                    val = inout(reg) clear_timer => _,
                     csr = const CSR_TICLR,
                     options(nostack, preserves_flags)
                 );

@@ -607,6 +607,7 @@ pub(crate) fn configure_local_timer(timer_hz: usize) {
     const LIE_IPI: usize = 1 << 12;
     let lie_val = LIE_TIMER | LIE_IPI;
     let lie_mask = LIE_TIMER | LIE_IPI;
+    let clear_timer = 1usize;
     unsafe {
         core::arch::asm!(
             "csrxchg {val}, {mask}, {csr_ecfg}",
@@ -617,7 +618,7 @@ pub(crate) fn configure_local_timer(timer_hz: usize) {
         );
         core::arch::asm!(
             "csrwr {val}, {csr_ticlr}",
-            val = in(reg) 1usize,
+            val = inout(reg) clear_timer => _,
             csr_ticlr = const CSR_TICLR,
             options(nostack, preserves_flags)
         );
@@ -653,7 +654,7 @@ pub(crate) fn rearm_local_timer(deadline_ns: Option<u64>) {
     unsafe {
         core::arch::asm!(
             "csrwr {val}, {csr_tcfg}",
-            val = in(reg) tcfg_val,
+            val = inout(reg) tcfg_val => _,
             csr_tcfg = const CSR_TCFG,
             options(nostack, preserves_flags)
         );
