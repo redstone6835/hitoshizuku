@@ -15,7 +15,7 @@ use core::any::Any;
 use core::mem::size_of;
 
 use errno::Errno;
-use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user, user_pgd_ops};
+use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::vfs::{
     Credentials, Dentry, FdTable, FileMode, Mount, MountNamespace, VfsContext, VfsLimits, VfsRoot,
     build_boot_vfs_parts,
@@ -212,9 +212,11 @@ fn vm_on_switch(next: &Arc<Task>) {
     if activated {
         return;
     }
-    if let Some(ops) = user_pgd_ops() {
-        unsafe { (ops.activate_kernel)() };
-    }
+
+    // 内核线程和 idle 没有用户地址空间。RISC-V 若在这里保持上一个用户
+    // satp，旧 VmSpace 释放后其根页会被重新分配，内核随后会在悬空页表下
+    // 执行；所有架构统一在切换前恢复内核根。
+    hal::sched::activate_kernel_address_space();
 }
 
 static VM_SWITCH_OPS: VmSwitchOps = VmSwitchOps {

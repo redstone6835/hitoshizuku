@@ -26,8 +26,8 @@ use crate::rseq::RseqEvent;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
-    migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
-    root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
+    migrate_task, now_ns_public, online_cpu_mask, request_balance, request_post_syscall_handoff,
+    request_resched, root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
     supported_cpu_mask, task_runqueue_cpu,
 };
 use crate::signal::{
@@ -303,7 +303,10 @@ pub fn sched_yield() -> Result<(), Errno> {
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::SchedYield);
     current_task().record_voluntary_context_switch();
-    schedule_once(0);
+    // 主动让出仍然消耗了当前任务的实际 CPU 时间。传入 0 会跳过本次
+    // vruntime 记账，使持续运行的内核 worker 在多个任务之间反复让出时
+    // 永远保持过低的虚拟时间，最终饿死用户任务。
+    schedule_once(now_ns_public());
     Ok(())
 }
 

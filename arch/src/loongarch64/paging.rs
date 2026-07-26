@@ -110,6 +110,44 @@ const _: () = {
     assert!(PALEN <= 48);
 };
 
+/// 判断当前硬件地址空间是否已经与目标完全一致。
+///
+/// `CSR_ASID` 还包含硬件实现的 ASID 位宽等只读字段，比较前必须只保留实际 ASID 域。
+#[inline]
+const fn activation_state_matches(
+    current_pgdl: usize,
+    current_pgdh: usize,
+    current_asid: usize,
+    target_pgdl: usize,
+    target_pgdh: usize,
+    target_asid: usize,
+) -> bool {
+    current_pgdl == target_pgdl
+        && current_pgdh == target_pgdh
+        && asid_bits(current_asid) == asid_bits(target_asid)
+}
+
+// 编译期覆盖完全相同、每一项单独变化以及 ASID 高位被规范化的判定语义。
+const _: () = {
+    assert!(activation_state_matches(
+        0x1000,
+        0x2000,
+        0x00ff_0007,
+        0x1000,
+        0x2000,
+        0x0407,
+    ));
+    assert!(!activation_state_matches(
+        0x1000, 0x2000, 7, 0x3000, 0x2000, 7,
+    ));
+    assert!(!activation_state_matches(
+        0x1000, 0x2000, 7, 0x1000, 0x3000, 7,
+    ));
+    assert!(!activation_state_matches(
+        0x1000, 0x2000, 7, 0x1000, 0x2000, 8,
+    ));
+};
+
 /// 叶子映射权限的内部聚合表示。
 ///
 /// 仅在构造 PTE 时使用，避免接口层直接处理位操作。
@@ -439,16 +477,64 @@ impl LoongArch64Paging {
     /// - 正式页表准备好后切到 `DA=0, PG=1`，让普通虚拟地址走页表翻译；
     /// - 切换之后立即刷新 TLB，避免旧翻译继续被命中。
     ///
-    /// 另外，LoongArch64 把偶地址和奇地址空间页目录根拆成 `PGDL/PGDH` 两个 CSR。
-    /// 当前内核还没有实现双根策略，因此这里暂时写入同一个根。
+    /// 该兼容入口把低半区和高半区都绑定到同一个根。用户地址空间应调用
+    /// [`Self::activate_with_asid_roots`]，让私有用户根与全局内核根保持分离。
     #[inline]
     pub unsafe fn activate_with_asid(root: PhysPageTableRoot, asid: usize) {
+        unsafe { Self::activate_with_asid_roots(root, root, asid) };
+    }
+
+    /// 使用独立的低半区和高半区页表根激活地址空间。
+    ///
+    /// LoongArch64 根据虚拟地址最高有效位选择 `PGDL` 或 `PGDH`。用户上下文将
+    /// `low_root` 设为进程私有根、`high_root` 设为全局内核根，使运行期新增的内核堆
+    /// 映射立即出现在所有地址空间中，无需复制并维护每个用户 PGD 的高半区目录项。
+    ///
+    /// # Safety
+    ///
+    /// 两个根都必须指向遵循当前 `PWCL/PWCH` 配置的有效页表，`asid` 必须与
+    /// `low_root` 所属地址空间匹配。调用期间必须处于允许切换当前地址空间的边界。
+    #[inline]
+    pub unsafe fn activate_with_asid_roots(
+        low_root: PhysPageTableRoot,
+        high_root: PhysPageTableRoot,
+        asid: usize,
+    ) {
+        let pgdl = low_root.as_usize();
+        let pgdh = high_root.as_usize();
+        let asid_val = asid_bits(asid);
+        let current_pgdl: usize;
+        let current_pgdh: usize;
+        let current_asid: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrd {current_pgdl}, {csr_pgdl}",
+                "csrrd {current_pgdh}, {csr_pgdh}",
+                "csrrd {current_asid}, {csr_asid}",
+                current_pgdl = out(reg) current_pgdl,
+                current_pgdh = out(reg) current_pgdh,
+                current_asid = out(reg) current_asid,
+                csr_pgdl = const CSR_PGDL,
+                csr_pgdh = const CSR_PGDH,
+                csr_asid = const CSR_ASID,
+                options(nostack, preserves_flags)
+            );
+        }
+        if activation_state_matches(
+            current_pgdl,
+            current_pgdh,
+            current_asid,
+            pgdl,
+            pgdh,
+            asid_val,
+        ) {
+            // pthread 等同地址空间切换无需重复写 CSR，更不能承担一次全局 TLB 失效。
+            return;
+        }
+
         Self::page_table_barrier();
         // 注意：LoongArch 的 csrwr/csrxchg 会把旧 CSR 值写回 rd。
         // 因此每条写 CSR 指令都使用独立 rd 输入并声明为 inout，避免寄存器污染。
-        let pgdl = root.as_usize();
-        let pgdh = root.as_usize();
-        let asid_val = asid_bits(asid);
         let asid_mask = CSR_ASID_ASID_MASK;
         let pwcl = Self::page_walk_pwcl();
         let pwch = Self::page_walk_pwch();
@@ -456,7 +542,7 @@ impl LoongArch64Paging {
         let mut crmd: usize;
         unsafe {
             core::arch::asm!(
-                // 写入偶/奇地址空间页全局目录根。
+                // 分别写入低半区和高半区页全局目录根。
                 "csrwr {pgdl}, {csr_pgdl}",
                 "csrwr {pgdh}, {csr_pgdh}",
                 // 仅交换 CSR_ASID 的 ASID 域。
@@ -508,11 +594,57 @@ impl LoongArch64Paging {
     ///
     /// 调用者必须保证对应页表修改已完成，且该 ASID 与目标地址空间一致。
     ///
-    /// 当前 `heap_vm` 多数时候采用全局刷新，这是更保守的实现策略；如果以后把 VM
-    /// 粒度做细，这个接口也足够承载按 ASID、按虚拟地址的精确失效。
+    /// `heap_vm` 在撤销映射和收紧权限后采用该同步接口；新映射使用本核发布加缺页
+    /// 代次收敛，不在任意 allocator 调用方锁内等待远端 CPU。
     #[inline]
     pub unsafe fn flush_tlb_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
         crate::loongarch64::smp::flush_tlb_all_cpus(asid, vaddr.map(VirtAddr::as_usize));
+    }
+
+    /// 仅在指定逻辑 CPU 集合上同步失效该 ASID 的 TLB。
+    ///
+    /// 当前 CPU 始终执行本地失效；`targets` 只约束远端通知。调用方可以传入地址
+    /// 空间生命周期内的历史 CPU 位图，也可以排除已经切离且下次激活前必定执行
+    /// 完整本地失效的 CPU。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证 `targets` 包含所有仍可能在下一次完整本地失效前执行该 ASID
+    /// 的远端 CPU。
+    #[inline]
+    pub unsafe fn flush_tlb_with_asid_on_cpus(
+        asid: usize,
+        vaddr: Option<VirtAddr>,
+        targets: usize,
+    ) {
+        crate::loongarch64::smp::flush_tlb_on_cpus(asid, vaddr.map(VirtAddr::as_usize), targets);
+    }
+
+    /// 发布页表写并只失效当前 CPU 的目标用户 translation。
+    ///
+    /// `Some(vaddr)` 使用 ASID + 地址定向失效；`None` 保守清空当前 CPU 全部 TLB。
+    /// 本接口不通知远端 CPU，只能用于从无效 PTE 新建映射，或确认叶 PTE 已存在后
+    /// 收敛当前 CPU 缓存的旧无效 translation。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证页表写已经完成，且不能用本接口发布解除映射、权限变化或
+    /// 物理页替换。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_local_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
+        Self::page_table_barrier();
+        unsafe {
+            if let Some(addr) = vaddr {
+                core::arch::asm!(
+                    "invtlb 0x5, {asid}, {address}",
+                    asid = in(reg) asid_bits(asid),
+                    address = in(reg) addr.as_usize(),
+                    options(nostack)
+                );
+            } else {
+                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
+            }
+        }
     }
 
     /// 使用当前 CSR_ASID 同步刷新所有在线 CPU 的 TLB。

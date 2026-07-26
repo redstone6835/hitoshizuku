@@ -16,6 +16,7 @@
 //! 7. `abi`：平台 ABI 转换层，用于把 LoongArch64/Linux 风格的整数参数翻译为
 //!    内核内部的类型语义。
 pub mod abi;
+mod asid_tracker;
 mod boot;
 mod early_console;
 mod efi_stub;

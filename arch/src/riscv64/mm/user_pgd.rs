@@ -105,6 +105,9 @@ struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
     asid_tag: AtomicUsize,
+    /// 曾经激活过本地址空间的逻辑 CPU。位图在 PGD 生命周期内单调增长，
+    /// 保证已经缓存过该 ASID translation 的 hart 不会被后续 shootdown 遗漏。
+    active_cpus: AtomicUsize,
     needs_page_table_fence: AtomicBool,
     needs_asid_fence: AtomicBool,
 }
@@ -145,6 +148,7 @@ impl UserPgdInner {
             pgd_phys,
             pgd_virt,
             asid_tag: AtomicUsize::new(asid_tag),
+            active_cpus: AtomicUsize::new(0),
             needs_page_table_fence: AtomicBool::new(true),
             needs_asid_fence: AtomicBool::new(false),
         }))
@@ -242,13 +246,18 @@ unsafe fn drop_pgd(pgd: PgdHandle) {
 unsafe fn activate(pgd: PgdHandle) {
     let inner = unsafe { inner_ref(pgd) };
     let asid = inner.asid();
+    let cpu = crate::riscv64::specific::current_cpu_id();
+    let cpu_bit = 1usize
+        .checked_shl(cpu as u32)
+        .expect("[arch][mm] logical CPU exceeds active mask width");
+    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit == 0;
     let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::AcqRel);
     let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::AcqRel);
     unsafe {
         Riscv64Paging::activate_with_asid(
             PhysPageTableRoot::new(inner.pgd_phys()),
             asid,
-            needs_page_table_fence || needs_asid_fence,
+            first_activation || needs_page_table_fence || needs_asid_fence,
         );
     }
 }
@@ -270,27 +279,29 @@ fn allocate_page_table_page() -> Result<usize, general::MapError> {
         .map_err(|_| general::MapError::OutOfMemory)
 }
 
-fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
+fn flush_user_tlb_range(asid: usize, active_cpus: usize, vaddr: usize, len: usize) {
     if len == 0 {
         return;
     }
     let page_size = Riscv64Paging::PAGE_SIZE;
     const PAGE_THRESHOLD: usize = 64;
     let Some(end) = vaddr.checked_add(len) else {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
         return;
     };
     let aligned_start = vaddr & !(page_size - 1);
     let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
     if pages > PAGE_THRESHOLD {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
         return;
     }
     let mut va = aligned_start;
     while va < end {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };
+        unsafe {
+            Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, Some(VirtAddr::new(va)), active_cpus)
+        };
         let Some(next) = va.checked_add(page_size) else {
-            unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+            unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
             return;
         };
         va = next;
@@ -299,7 +310,6 @@ fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
 
 unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
     let inner = unsafe { inner_ref(pgd) };
-    inner.needs_page_table_fence.store(true, Ordering::Release);
     let root_virt = inner.pgd_virt();
     let read = flags.has(VmFlags::READ);
     let write = flags.has(VmFlags::WRITE);
@@ -319,17 +329,34 @@ unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFl
         allocate_page_table_page,
     )
     .expect("[arch][mm] map_user_pages: walk_and_map failed");
+    inner.needs_page_table_fence.store(true, Ordering::Release);
+}
+
+unsafe fn publish_new_mapping(pgd: PgdHandle, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // Safety: 由 UserPgdOps 契约保证 handle 与范围合法。
+    let inner = unsafe { inner_ref(pgd) };
+    let page_size = Riscv64Paging::PAGE_SIZE;
+    let aligned_start = vaddr & !(page_size - 1);
+    let targeted = vaddr
+        .checked_add(len)
+        .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
+    let address = targeted.then(|| VirtAddr::new(aligned_start));
+    // Safety: sfence.vma 同时排序先前 PTE store 并清除本 hart 的旧无效状态；
+    // needs_page_table_fence 保留为 true，使以后首次激活该 PGD 的其它 hart 仍会 fence。
+    unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
 }
 
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    inner.needs_page_table_fence.store(true, Ordering::Release);
     let _ = unmap_range_entries::<Riscv64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
+    inner.needs_page_table_fence.store(true, Ordering::Release);
 }
 
 unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
     let inner = unsafe { inner_ref(pgd) };
-    inner.needs_page_table_fence.store(true, Ordering::Release);
     let read = flags.has(VmFlags::READ);
     let write = flags.has(VmFlags::WRITE);
     let exec = flags.has(VmFlags::EXEC);
@@ -355,6 +382,7 @@ unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: Vm
         }
         va += Riscv64Paging::PAGE_SIZE;
     }
+    inner.needs_page_table_fence.store(true, Ordering::Release);
 }
 
 unsafe fn clone_for_fork_user_pages(
@@ -418,7 +446,8 @@ unsafe fn clone_for_fork_user_pages(
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    flush_user_tlb_range(inner.asid(), vaddr, len);
+    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
+    flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
     // 本次定向 fence 已覆盖相应页表修改，但不能消费新一代 ASID 的首次激活
     // 标记；后者要求 activate() 在安装该 ASID 时完成一次完整 ASID fence。
     inner.needs_page_table_fence.store(false, Ordering::Release);
@@ -442,6 +471,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map: map_user_pages,
+    publish_new_mapping,
     unmap: unmap_user_pages,
     protect: protect_user_pages,
     clone_for_fork: clone_for_fork_user_pages,

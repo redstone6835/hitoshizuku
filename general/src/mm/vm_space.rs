@@ -12,9 +12,98 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use errno::Errno;
 use mm::{FileLike, SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
+use sched::sync::Spinlock;
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
-use crate::mm::ops::{PgdHandle, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
+use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
+
+/// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
+const FILE_FAULT_AROUND_PAGES: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFaultAroundWindow {
+    start: usize,
+    end: usize,
+    file_offset: u64,
+}
+
+impl FileFaultAroundWindow {
+    #[cfg(test)]
+    fn page_count(self, page_size: usize) -> usize {
+        (self.end - self.start) / page_size
+    }
+}
+
+/// 计算从硬件故障页向高地址预装的只读文件窗口。
+///
+/// 窗口同时受最大页数、VMA 末端和文件 EOF 限制；文件最后一个非整页仍计入。
+fn file_fault_around_window(
+    fault_page: usize,
+    area_start: usize,
+    area_end: usize,
+    area_file_offset: u64,
+    file_size: u64,
+    page_size: usize,
+) -> Option<FileFaultAroundWindow> {
+    if page_size == 0
+        || !page_size.is_power_of_two()
+        || fault_page % page_size != 0
+        || area_start % page_size != 0
+        || area_end % page_size != 0
+        || fault_page < area_start
+        || fault_page >= area_end
+    {
+        return None;
+    }
+    let delta = fault_page.checked_sub(area_start)?;
+    let file_offset = area_file_offset.checked_add(u64::try_from(delta).ok()?)?;
+    if file_offset >= file_size {
+        return None;
+    }
+    let vma_pages = area_end.checked_sub(fault_page)? / page_size;
+    let page_size_u64 = u64::try_from(page_size).ok()?;
+    let file_bytes = file_size.checked_sub(file_offset)?;
+    let file_pages = file_bytes / page_size_u64 + u64::from(file_bytes % page_size_u64 != 0);
+    let pages = vma_pages
+        .min(usize::try_from(file_pages).ok()?)
+        .min(FILE_FAULT_AROUND_PAGES);
+    if pages == 0 {
+        return None;
+    }
+    let len = pages.checked_mul(page_size)?;
+    Some(FileFaultAroundWindow {
+        start: fault_page,
+        end: fault_page.checked_add(len)?,
+        file_offset,
+    })
+}
+
+fn permits_file_fault_around(flags: VmFlags, kind: FaultKind) -> bool {
+    let permits_access = match kind {
+        FaultKind::Load => flags.has(VmFlags::READ),
+        FaultKind::Exec => flags.has(VmFlags::EXEC),
+        _ => false,
+    };
+    permits_access
+        && !flags.has(VmFlags::WRITE)
+        && !flags.has(VmFlags::SHARED)
+        && !flags.has(VmFlags::GROWS_DOWN)
+}
+
+/// 返回并发映射出现前仍可安全安装的连续候选前缀长度。
+fn unmapped_prefix_len(
+    addresses: impl IntoIterator<Item = usize>,
+    mut is_mapped: impl FnMut(usize) -> bool,
+) -> usize {
+    let mut count = 0usize;
+    for address in addresses {
+        if is_mapped(address) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
 
 #[inline]
 fn vm_layout() -> &'static UserVmLayoutOps {
@@ -56,13 +145,28 @@ fn covered_len(areas: &[VmArea], range: &Range<usize>) -> usize {
     total
 }
 
-static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
-    spin::Mutex::new(BTreeMap::new());
-static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
-    spin::Mutex::new(BTreeMap::new());
+static SHARED_FILE_PAGES: Spinlock<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
+    Spinlock::new(BTreeMap::new());
+static SHARED_ANON_PAGES: Spinlock<BTreeMap<SharedAnonPageKey, SharedAnonPageEntry>> =
+    Spinlock::new(BTreeMap::new());
 static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSegmentPlan {
+    mapping: Range<usize>,
+    lazy_file: Range<usize>,
+    lazy_file_offset: u64,
+    fragment_pages: [usize; 2],
+    fragment_count: usize,
+}
+
+impl FileSegmentPlan {
+    fn fragments(&self) -> &[usize] {
+        &self.fragment_pages[..self.fragment_count]
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VmSpaceDiag {
@@ -155,6 +259,26 @@ impl PageAccess {
 struct PageMapping {
     page: Arc<ResidentPage>,
     access: PageAccess,
+}
+
+struct PrivateFileFaultAround {
+    fault_page: usize,
+    end: usize,
+    area_range: Range<usize>,
+    area_file_offset: u64,
+    fault_file_offset: u64,
+    flags: VmFlags,
+    file: Arc<dyn FileLike>,
+}
+
+struct PreparedFilePage {
+    vaddr: usize,
+    page: Arc<ResidentPage>,
+}
+
+enum FaultAroundCommit {
+    Done(FaultOutcome),
+    Retry,
 }
 
 enum ResidentPageKind {
@@ -416,10 +540,82 @@ impl<const N: usize> UserWriteWindows<N> {
     }
 }
 
+impl PrivateFileFaultAround {
+    /// 从锁外的 VMA 快照生成预装计划；`FileLike::size` 不在 VMA 锁内调用。
+    fn new(
+        fault_page: usize,
+        area_range: Range<usize>,
+        flags: VmFlags,
+        backing: &VmBacking,
+        kind: FaultKind,
+    ) -> Option<Self> {
+        if !permits_file_fault_around(flags, kind) {
+            return None;
+        }
+        let VmBacking::File { file, offset } = backing else {
+            return None;
+        };
+        let window = file_fault_around_window(
+            fault_page,
+            area_range.start,
+            area_range.end,
+            *offset,
+            file.size(),
+            page_size(),
+        )?;
+        Some(Self {
+            fault_page: window.start,
+            end: window.end,
+            area_range,
+            area_file_offset: *offset,
+            fault_file_offset: window.file_offset,
+            flags,
+            file: Arc::clone(file),
+        })
+    }
+
+    /// 在不持有 VMA/pages 锁时分配并读取连续候选页。
+    ///
+    /// 故障页失败沿用普通 fault 的错误；邻页属于投机行为，首次失败即缩短窗口。
+    fn prepare(&self) -> Result<Vec<PreparedFilePage>, Errno> {
+        let page_size = page_size();
+        let pages = (self.end - self.fault_page) / page_size;
+        let mut prepared = Vec::with_capacity(pages);
+        for index in 0..pages {
+            let delta = index.checked_mul(page_size).ok_or(Errno::EINVAL)?;
+            let vaddr = self.fault_page.checked_add(delta).ok_or(Errno::EINVAL)?;
+            let file_offset = self
+                .fault_file_offset
+                .checked_add(u64::try_from(delta).map_err(|_| Errno::EINVAL)?)
+                .ok_or(Errno::EINVAL)?;
+            match load_file_page(&*self.file, file_offset) {
+                Ok(paddr) => prepared.push(PreparedFilePage {
+                    vaddr,
+                    page: ResidentPage::new_private_file(paddr),
+                }),
+                Err(err) if index == 0 => return Err(err),
+                Err(_) => break,
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn matches_area(&self, area: &VmArea) -> bool {
+        if area.range != self.area_range || area.flags != self.flags {
+            return false;
+        }
+        matches!(
+            &area.backing,
+            VmBacking::File { file, offset }
+                if *offset == self.area_file_offset && Arc::ptr_eq(file, &self.file)
+        )
+    }
+}
+
 /// 进程地址空间。
 pub struct VmSpace {
-    vmas: spin::Mutex<VmaSet>,
-    pages: spin::Mutex<BTreeMap<usize, PageMapping>>,
+    vmas: Spinlock<VmaSet>,
+    pages: Spinlock<BTreeMap<usize, PageMapping>>,
     pgd: PgdHandle,
     brk_start: AtomicUsize,
     brk_current: AtomicUsize,
@@ -446,8 +642,8 @@ impl VmSpace {
         VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
-            vmas: spin::Mutex::new(VmaSet::new()),
-            pages: spin::Mutex::new(BTreeMap::new()),
+            vmas: Spinlock::new(VmaSet::new()),
+            pages: Spinlock::new(BTreeMap::new()),
             pgd,
             brk_start: AtomicUsize::new(layout.user_heap_base),
             brk_current: AtomicUsize::new(layout.user_heap_base),
@@ -882,7 +1078,7 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(range.start, range.end - range.start);
+        self.publish_new_user_range(range.start, range.end - range.start);
         Ok(())
     }
 
@@ -1214,8 +1410,8 @@ impl VmSpace {
         VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
-            vmas: spin::Mutex::new(cloned_set),
-            pages: spin::Mutex::new(child_pages),
+            vmas: Spinlock::new(cloned_set),
+            pages: Spinlock::new(child_pages),
             pgd: new_pgd,
             brk_start: AtomicUsize::new(self.brk_start.load(Ordering::Relaxed)),
             brk_current: AtomicUsize::new(self.current_brk()),
@@ -1237,6 +1433,21 @@ impl VmSpace {
 
     /// page-fault 分派进来的入口。按 VMA backing / 权限决定该做什么。
     pub fn handle_fault(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
+        self.handle_fault_inner(addr, kind, true, true)
+    }
+
+    /// 预解析用户页访问，但不把已驻留页当作硬件缓存了无效 translation。
+    fn ensure_page_access(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
+        self.handle_fault_inner(addr, kind, false, false)
+    }
+
+    fn handle_fault_inner(
+        &self,
+        addr: usize,
+        kind: FaultKind,
+        publish_unchanged_mapping: bool,
+        allow_fault_around: bool,
+    ) -> FaultOutcome {
         if user_pgd_ops().is_none() {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
         }
@@ -1263,10 +1474,30 @@ impl VmSpace {
         let backing = area.backing.clone();
         let flags = area.flags;
         let area_start = area.range.start;
+        let area_range = area.range.clone();
         drop(set);
 
-        if let Some(outcome) = self.handle_resident_fault(page, flags, kind) {
+        if let Some(outcome) =
+            self.handle_resident_fault(page, flags, kind, publish_unchanged_mapping)
+        {
             return outcome;
+        }
+
+        if allow_fault_around
+            && let Some(plan) = PrivateFileFaultAround::new(page, area_range, flags, &backing, kind)
+        {
+            let prepared = match plan.prepare() {
+                Ok(prepared) => prepared,
+                Err(err) => return fault_from_errno(err),
+            };
+            match self.commit_private_file_fault_around(&plan, prepared) {
+                FaultAroundCommit::Done(outcome) => return outcome,
+                FaultAroundCommit::Retry => {
+                    // VMA 在锁外 I/O 期间发生变化；只重试普通单页路径，避免在
+                    // 高频 mmap/mprotect 竞争下反复执行投机读取。
+                    return self.handle_fault_inner(addr, kind, publish_unchanged_mapping, false);
+                }
+            }
         }
 
         self.commit_fault_page(page, backing, flags, area_start, kind)
@@ -1423,7 +1654,7 @@ impl VmSpace {
         } else {
             FaultKind::Load
         };
-        match self.handle_fault(user, kind) {
+        match self.ensure_page_access(user, kind) {
             FaultOutcome::Fixed => self.with_user_atomic_u32(user, write, |_| ((), false)),
             FaultOutcome::Segv | FaultOutcome::Kernel(_) => Err(Errno::EFAULT),
         }
@@ -1580,86 +1811,122 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(start, end - start);
+        self.publish_new_user_range(start, end - start);
         Ok(())
     }
 
-    /// 立即为一个 ELF 段分配并从文件按页填充。
+    /// 注册 ELF 文件段，并只立即填充不能直接映射文件的首尾碎片页。
     ///
-    /// loader 不能为了装载大可执行文件把整个 ELF 读进内核堆。这个入口只在
-    /// 当前页需要文件内容时读取最多一页，BSS 和页内尾部仍由零页分配保证清零。
+    /// 完整落在 `filesz` 内的页保留为 file-backed VMA，由硬件缺页按需读取；
+    /// BSS 完整页保留为匿名 VMA。这样短命编译器进程不会在 `execve` 时读取从未
+    /// 执行或访问的全部代码/数据，同时碎片页仍严格保证段前空洞与 BSS 尾部清零。
     pub fn commit_file_segment(
         &self,
         vaddr: usize,
         memsz: usize,
         file_offset: u64,
         file_size: usize,
-        file: &dyn FileLike,
+        file: Arc<dyn FileLike>,
         flags: VmFlags,
     ) -> Result<(), Errno> {
         if memsz == 0 {
             return Ok(());
         }
-        if file_size > memsz {
+        let page_size = page_size();
+        let plan = plan_file_segment(vaddr, memsz, file_offset, file_size, page_size)?;
+        let area_flags = flags.with(VmFlags::USER);
+
+        if plan.lazy_file.start >= plan.lazy_file.end {
+            self.map_anon(plan.mapping.clone(), area_flags)?;
+        } else {
+            if plan.mapping.start < plan.lazy_file.start {
+                self.map_anon(plan.mapping.start..plan.lazy_file.start, area_flags)?;
+            }
+            self.map_file(
+                plan.lazy_file.clone(),
+                Arc::clone(&file),
+                plan.lazy_file_offset,
+                area_flags,
+            )?;
+            if plan.lazy_file.end < plan.mapping.end {
+                self.map_anon(plan.lazy_file.end..plan.mapping.end, area_flags)?;
+            }
+        }
+
+        for &page_va in plan.fragments() {
+            self.commit_file_fragment_page(
+                page_va,
+                vaddr,
+                file_offset,
+                file_size,
+                file.as_ref(),
+                area_flags.with(VmFlags::ANON),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 填充 ELF 文件段中不能作为完整文件页延迟映射的首尾页。
+    fn commit_file_fragment_page(
+        &self,
+        page_va: usize,
+        vaddr: usize,
+        file_offset: u64,
+        file_size: usize,
+        file: &dyn FileLike,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
+        let file_end_vaddr = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
+        let page_end = page_va.checked_add(page_size).ok_or(Errno::EINVAL)?;
+        let copy_start_va = page_va.max(vaddr);
+        let copy_end_va = page_end.min(file_end_vaddr);
+        if copy_end_va <= copy_start_va {
             return Err(Errno::EINVAL);
         }
-        let virt_fn = allocator::KERNEL_ALLOCATOR
-            .load_phys_to_virt()
-            .ok_or(Errno::EINVAL)?;
 
-        let page_size = page_size();
-        let start = page_base(vaddr);
-        let end_unaligned = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
-        let end = align_up(end_unaligned, page_size).ok_or(Errno::EINVAL)?;
-        let file_end_vaddr = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
-        let area_flags = flags.with(VmFlags::USER).with(VmFlags::ANON);
-
-        self.map_anon(start..end, area_flags)?;
-
-        let mut pages = self.pages.lock();
-        let mut page_va = start;
-        while page_va < end {
-            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
-            let result = (|| {
-                let copy_start_va = page_va.max(vaddr);
-                let copy_end_va = (page_va + page_size).min(file_end_vaddr);
-                if copy_end_va <= copy_start_va {
-                    return Ok(());
+        let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+        let result = (|| {
+            let virt_fn = allocator::KERNEL_ALLOCATOR
+                .load_phys_to_virt()
+                .ok_or(Errno::EINVAL)?;
+            let seg_off = copy_start_va - vaddr;
+            let len = copy_end_va - copy_start_va;
+            let dst_off_in_page = copy_start_va - page_va;
+            let kva = virt_fn(paddr) + dst_off_in_page;
+            // Safety: paddr 来自一整页用户物理页分配；dst_off/len 均由该页与
+            // 文件字节区间的交集计算，构造的切片不会越过这页。
+            let dst = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
+            let mut done = 0usize;
+            while done < len {
+                let read_off = file_offset
+                    .checked_add(u64::try_from(seg_off + done).map_err(|_| Errno::EINVAL)?)
+                    .ok_or(Errno::EINVAL)?;
+                let n = file.read_at(read_off, &mut dst[done..])?;
+                if n == 0 {
+                    return Err(Errno::ENOEXEC);
                 }
-
-                let seg_off = copy_start_va - vaddr;
-                let len = copy_end_va - copy_start_va;
-                let dst_off_in_page = copy_start_va - page_va;
-                let kva = virt_fn(paddr) + dst_off_in_page;
-                let dst = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
-                let mut done = 0usize;
-                while done < len {
-                    let read_off = file_offset
-                        .checked_add((seg_off + done) as u64)
-                        .ok_or(Errno::EINVAL)?;
-                    let n = file.read_at(read_off, &mut dst[done..])?;
-                    if n == 0 {
-                        return Err(Errno::ENOEXEC);
-                    }
-                    done += n;
-                }
-                Ok(())
-            })();
-            if let Err(err) = result {
-                free_user_page(paddr);
-                return Err(err);
+                done += n;
             }
-
-            let page = ResidentPage::new_anon(paddr);
-            let access = access_for_new_page(area_flags, &page);
-            self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
-            pages.insert(page_va, PageMapping { page, access });
-            page_va += page_size;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            free_user_page(paddr);
+            return Err(err);
         }
+
+        let page = ResidentPage::new_anon(paddr);
+        let access = access_for_new_page(flags, &page);
+        let mut pages = self.pages.lock();
+        if pages.contains_key(&page_va) {
+            return Err(Errno::EEXIST);
+        }
+        self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))?;
+        pages.insert(page_va, PageMapping { page, access });
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(start, end - start);
+        self.publish_new_user_range(page_va, page_size);
         Ok(())
     }
 
@@ -1683,7 +1950,7 @@ impl VmSpace {
         if max_len == 0 || user.checked_add(max_len - 1).is_none() {
             return Err(Errno::EFAULT);
         }
-        match self.handle_fault(user, kind) {
+        match self.ensure_page_access(user, kind) {
             FaultOutcome::Fixed => {}
             FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
         }
@@ -1763,6 +2030,85 @@ impl VmSpace {
         }))
     }
 
+    /// 提交已在锁外读好的只读私有文件页。
+    ///
+    /// 重新取得 VMA/pages 锁后先验证快照。并发 fault 若已经安装候选页，只提交
+    /// 该页之前的连续新页前缀，剩余候选在解锁后由 Arc 析构回收；因此不会覆盖
+    /// 现有 PTE，也能用一次 `publish_new_mapping` 发布完整前缀。
+    fn commit_private_file_fault_around(
+        &self,
+        plan: &PrivateFileFaultAround,
+        prepared: Vec<PreparedFilePage>,
+    ) -> FaultAroundCommit {
+        if prepared.is_empty() {
+            return FaultAroundCommit::Done(FaultOutcome::Segv);
+        }
+
+        let set = self.vmas.lock();
+        let Some(area) = set.find(plan.fault_page) else {
+            drop(set);
+            drop(prepared);
+            return FaultAroundCommit::Retry;
+        };
+        if !plan.matches_area(area) {
+            drop(set);
+            drop(prepared);
+            return FaultAroundCommit::Retry;
+        }
+
+        let mut pages = self.pages.lock();
+        if pages.contains_key(&plan.fault_page) {
+            drop(pages);
+            drop(set);
+            drop(prepared);
+            // 另一 CPU 在本次 I/O 期间先发布了 PTE；当前 CPU 仍需收敛导致
+            // 本次硬件 fault 的旧无效 translation。
+            self.publish_new_user_range(plan.fault_page, page_size());
+            return FaultAroundCommit::Done(FaultOutcome::Fixed);
+        }
+
+        let prefix_len =
+            unmapped_prefix_len(prepared.iter().map(|candidate| candidate.vaddr), |vaddr| {
+                pages.contains_key(&vaddr)
+            });
+        let mut installed = 0usize;
+        let mut map_error = None;
+        for candidate in prepared.iter().take(prefix_len) {
+            let access = PageAccess::ReadOnly;
+            if let Err(err) = self.map_page_no_flush(
+                candidate.vaddr,
+                candidate.page.paddr(),
+                pte_flags_for(plan.flags, access),
+            ) {
+                map_error = Some(err);
+                break;
+            }
+            pages.insert(
+                candidate.vaddr,
+                PageMapping {
+                    page: Arc::clone(&candidate.page),
+                    access,
+                },
+            );
+            installed += 1;
+        }
+        let mapped = pages.len();
+        drop(pages);
+        drop(set);
+        // 未采用的投机页可能触发物理页回收，必须在 VMA/pages 锁外析构。
+        drop(prepared);
+
+        if installed != 0 {
+            self.mapped_pages.store(mapped, Ordering::Release);
+            let len = installed
+                .checked_mul(page_size())
+                .expect("[mm] fault-around publish range overflow");
+            self.publish_new_user_range(plan.fault_page, len);
+            return FaultAroundCommit::Done(FaultOutcome::Fixed);
+        }
+        FaultAroundCommit::Done(fault_from_errno(map_error.unwrap_or(Errno::EINVAL)))
+    }
+
     fn commit_fault_page(
         &self,
         page_va: usize,
@@ -1812,7 +2158,7 @@ impl VmSpace {
         if let Some(mapping) = pages.get_mut(&page_va) {
             let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
             drop(pages);
-            return self.finish_resident_fault(page_va, update);
+            return self.finish_resident_fault(page_va, update, true);
         }
         if let Err(err) =
             self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
@@ -1824,7 +2170,7 @@ impl VmSpace {
         let mapped = pages.len();
         drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
-        self.invalidate_user_range(page_va, page_size());
+        self.publish_new_user_range(page_va, page_size());
         FaultOutcome::Fixed
     }
 
@@ -1833,22 +2179,28 @@ impl VmSpace {
         page_va: usize,
         flags: VmFlags,
         kind: FaultKind,
+        publish_unchanged_mapping: bool,
     ) -> Option<FaultOutcome> {
         let mut pages = self.pages.lock();
         let mapping = pages.get_mut(&page_va)?;
         let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
         drop(pages);
-        Some(self.finish_resident_fault(page_va, update))
+        Some(self.finish_resident_fault(page_va, update, publish_unchanged_mapping))
     }
 
     fn finish_resident_fault(
         &self,
         page_va: usize,
         update: (FaultOutcome, bool, Option<Arc<ResidentPage>>),
+        publish_unchanged_mapping: bool,
     ) -> FaultOutcome {
         let (outcome, invalidate, retired) = update;
         if invalidate {
             self.invalidate_user_range(page_va, page_size());
+        } else if publish_unchanged_mapping && matches!(outcome, FaultOutcome::Fixed) {
+            // 本核因旧无效 translation 进入缺页，但另一 CPU 可能已经安装了叶 PTE。
+            // 这里只需收敛当前 CPU；该分支没有替换任何旧有效映射。
+            self.publish_new_user_range(page_va, page_size());
         }
         // COW 的旧页必须活到所有 CPU 都完成 TLB 失效之后，避免远端仍通过旧
         // TLB 访问已回收的物理页。
@@ -1923,7 +2275,21 @@ impl VmSpace {
 
     fn invalidate_user_range(&self, vaddr: usize, len: usize) {
         if let Some(ops) = user_pgd_ops() {
-            unsafe { (ops.invalidate_range)(self.pgd, vaddr, len) };
+            // Safety: 调用方已经完成页表更新；ExistingMapping 要求同步所有历史
+            // 激活 CPU，防止旧有效 translation 越过权限或资源回收边界。
+            unsafe {
+                UserPteUpdate::ExistingMapping.publish(ops, self.pgd, vaddr, len);
+            }
+        }
+    }
+
+    fn publish_new_user_range(&self, vaddr: usize, len: usize) {
+        if let Some(ops) = user_pgd_ops() {
+            // Safety: 仅由确认原先没有叶 PTE 的建图路径或硬件缺页的无效缓存
+            // 收敛路径调用；不会替换仍可能被其它 CPU 使用的有效 translation。
+            unsafe {
+                UserPteUpdate::NewMapping.publish(ops, self.pgd, vaddr, len);
+            }
         }
     }
 
@@ -2275,6 +2641,59 @@ fn permits(flags: VmFlags, kind: FaultKind) -> bool {
     }
 }
 
+/// 把 ELF 文件段拆成完整文件页、匿名页和最多两个碎片页。
+fn plan_file_segment(
+    vaddr: usize,
+    memsz: usize,
+    file_offset: u64,
+    file_size: usize,
+    page_size: usize,
+) -> Result<FileSegmentPlan, Errno> {
+    if page_size == 0 || !page_size.is_power_of_two() || memsz == 0 || file_size > memsz {
+        return Err(Errno::EINVAL);
+    }
+    let mem_end = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
+    let file_end = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
+    file_offset
+        .checked_add(u64::try_from(file_size).map_err(|_| Errno::EINVAL)?)
+        .ok_or(Errno::EINVAL)?;
+
+    let mapping_start = vaddr & !(page_size - 1);
+    let mapping_end = align_up(mem_end, page_size).ok_or(Errno::EINVAL)?;
+    let full_file_start = align_up(vaddr, page_size).ok_or(Errno::EINVAL)?;
+    let full_file_end = file_end & !(page_size - 1);
+    let (lazy_file, lazy_file_offset) = if full_file_start < full_file_end {
+        let delta = u64::try_from(full_file_start - vaddr).map_err(|_| Errno::EINVAL)?;
+        let offset = file_offset.checked_add(delta).ok_or(Errno::EINVAL)?;
+        (full_file_start..full_file_end, offset)
+    } else {
+        (mapping_start..mapping_start, file_offset)
+    };
+
+    let mut fragment_pages = [0usize; 2];
+    let mut fragment_count = 0usize;
+    if file_size != 0 {
+        let first = mapping_start;
+        let last = (file_end - 1) & !(page_size - 1);
+        if !lazy_file.contains(&first) {
+            fragment_pages[fragment_count] = first;
+            fragment_count += 1;
+        }
+        if last != first && !lazy_file.contains(&last) {
+            fragment_pages[fragment_count] = last;
+            fragment_count += 1;
+        }
+    }
+
+    Ok(FileSegmentPlan {
+        mapping: mapping_start..mapping_end,
+        lazy_file,
+        lazy_file_offset,
+        fragment_pages,
+        fragment_count,
+    })
+}
+
 fn align_up(value: usize, align: usize) -> Option<usize> {
     Some(value.checked_add(align - 1)? & !(align - 1))
 }
@@ -2332,4 +2751,157 @@ pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
         .iter()
         .map(|a| (a.range.clone(), a.flags))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FILE_FAULT_AROUND_PAGES, FaultKind, VmFlags, file_fault_around_window,
+        permits_file_fault_around, plan_file_segment, unmapped_prefix_len,
+    };
+
+    const PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn aligned_file_pages_remain_fully_lazy() {
+        let plan = plan_file_segment(0x4000, 0x3000, 0x8000, 0x3000, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x7000);
+        assert_eq!(plan.lazy_file, 0x4000..0x7000);
+        assert_eq!(plan.lazy_file_offset, 0x8000);
+        assert!(plan.fragments().is_empty());
+    }
+
+    #[test]
+    fn unaligned_file_and_bss_keep_only_edge_pages_eager() {
+        let plan = plan_file_segment(0x4103, 0x4000, 0x103, 0x2400, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x9000);
+        assert_eq!(plan.lazy_file, 0x5000..0x6000);
+        assert_eq!(plan.lazy_file_offset, 0x1000);
+        assert_eq!(plan.fragments(), &[0x4000, 0x6000]);
+    }
+
+    #[test]
+    fn short_unaligned_file_can_span_two_fragment_pages() {
+        let plan = plan_file_segment(0x4f00, 0x800, 0x2f00, 0x300, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x6000);
+        assert!(plan.lazy_file.is_empty());
+        assert_eq!(plan.fragments(), &[0x4000, 0x5000]);
+    }
+
+    #[test]
+    fn pure_bss_stays_lazy_anonymous() {
+        let plan = plan_file_segment(0x4103, 0x2800, 0, 0, PAGE_SIZE).unwrap();
+
+        assert_eq!(plan.mapping, 0x4000..0x7000);
+        assert!(plan.lazy_file.is_empty());
+        assert!(plan.fragments().is_empty());
+    }
+
+    #[test]
+    fn invalid_or_overflowing_segments_are_rejected() {
+        assert!(plan_file_segment(0x4000, 0x1000, 0, 0x1001, PAGE_SIZE).is_err());
+        assert!(plan_file_segment(usize::MAX - 1, 4, 0, 0, PAGE_SIZE).is_err());
+        assert!(plan_file_segment(0x4000, 0x1000, u64::MAX, 1, PAGE_SIZE).is_err());
+        assert!(plan_file_segment(0x4000, 0x1000, 0, 0, 3).is_err());
+    }
+
+    #[test]
+    fn file_fault_around_caps_forward_window() {
+        let fault = 0x4000;
+        let window =
+            file_fault_around_window(fault, 0x1000, 0x40_0000, 0x2000, 0x80_0000, PAGE_SIZE)
+                .expect("valid file window");
+
+        assert_eq!(window.start, fault);
+        assert_eq!(window.file_offset, 0x5000);
+        assert_eq!(window.page_count(PAGE_SIZE), FILE_FAULT_AROUND_PAGES);
+    }
+
+    #[test]
+    fn file_fault_around_stops_at_vma_end() {
+        let fault = 0x8000;
+        let window = file_fault_around_window(
+            fault,
+            0x4000,
+            fault + 3 * PAGE_SIZE,
+            0,
+            0x20_0000,
+            PAGE_SIZE,
+        )
+        .expect("VMA contains three pages");
+
+        assert_eq!(window.end, fault + 3 * PAGE_SIZE);
+        assert_eq!(window.page_count(PAGE_SIZE), 3);
+    }
+
+    #[test]
+    fn file_fault_around_keeps_partial_eof_page() {
+        let fault = 0x2000;
+        let fault_file_offset = PAGE_SIZE as u64;
+        let window = file_fault_around_window(
+            fault,
+            0x1000,
+            0x20_0000,
+            0,
+            fault_file_offset + (2 * PAGE_SIZE) as u64 + 1,
+            PAGE_SIZE,
+        )
+        .expect("partial final page remains faultable");
+
+        assert_eq!(window.file_offset, fault_file_offset);
+        assert_eq!(window.page_count(PAGE_SIZE), 3);
+    }
+
+    #[test]
+    fn file_fault_around_rejects_eof_and_offset_overflow() {
+        assert!(
+            file_fault_around_window(0x3000, 0x1000, 0x8000, 0, (2 * PAGE_SIZE) as u64, PAGE_SIZE,)
+                .is_none()
+        );
+        assert!(
+            file_fault_around_window(0x2000, 0x1000, 0x8000, u64::MAX, u64::MAX, PAGE_SIZE,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_fault_around_only_accepts_private_read_faults() {
+        let read_only = VmFlags::EMPTY.with(VmFlags::READ);
+        let executable = read_only.with(VmFlags::EXEC);
+        assert!(permits_file_fault_around(read_only, FaultKind::Load));
+        assert!(permits_file_fault_around(executable, FaultKind::Exec));
+        assert!(!permits_file_fault_around(read_only, FaultKind::Exec));
+        assert!(!permits_file_fault_around(
+            read_only.with(VmFlags::WRITE),
+            FaultKind::Load
+        ));
+        assert!(!permits_file_fault_around(
+            read_only.with(VmFlags::SHARED),
+            FaultKind::Load
+        ));
+        assert!(!permits_file_fault_around(
+            read_only.with(VmFlags::GROWS_DOWN),
+            FaultKind::Load
+        ));
+        assert!(!permits_file_fault_around(read_only, FaultKind::Store));
+        assert!(!permits_file_fault_around(read_only, FaultKind::PermRead));
+    }
+
+    #[test]
+    fn file_fault_around_stops_before_concurrent_mapping() {
+        let candidates = [0x1000, 0x2000, 0x3000, 0x4000];
+
+        assert_eq!(
+            unmapped_prefix_len(candidates, |address| address == 0x3000),
+            2
+        );
+        assert_eq!(
+            unmapped_prefix_len(candidates, |address| address == 0x1000),
+            0
+        );
+        assert_eq!(unmapped_prefix_len(candidates, |_| false), candidates.len());
+    }
 }

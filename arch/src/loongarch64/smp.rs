@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use general::TaskOps;
 use sched::arch_hooks::CpuControlOps;
 
+use super::asid_tracker::CurrentAsidTracker;
 use super::heap_vm::activate_kernel_page_table_for_secondary;
 use super::loader::{configure_local_timer, timer_hz};
 use super::specific::*;
@@ -46,11 +47,14 @@ const IPI_MEMBARRIER: u32 = 1 << ACTION_MEMBARRIER;
 const SHOOTDOWN_TLB: usize = 1;
 const SHOOTDOWN_ICACHE: usize = 2;
 const ALL_ADDRESSES: usize = usize::MAX;
+const SHOOTDOWN_RETRY_DIVISOR: u64 = 100;
+const SHOOTDOWN_WARNING_SECONDS: u64 = 5;
 
 static PHYSICAL_CPU_IDS: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(UNKNOWN_CPU_ID) }; MAX_CPUS];
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
 static STARTED_CPUS: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_LOGICAL_ASIDS: CurrentAsidTracker<MAX_CPUS> = CurrentAsidTracker::new();
 static AP_IDLE_TASKS: [AtomicPtr<sched::Task>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 static TLB_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -186,9 +190,29 @@ fn cpu_is_online(logical_id: usize) -> bool {
     logical_id < MAX_CPUS && ONLINE_CPUS.load(Ordering::Acquire) & (1 << logical_id) != 0
 }
 
+/// 发布当前 CPU 即将激活的逻辑 ASID；调用方随后必须完成全量本地 TLB 失效。
+pub(crate) fn publish_current_logical_asid(asid: usize) {
+    let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
+    CURRENT_LOGICAL_ASIDS.publish_before_full_flush(cpu, asid);
+}
+
+/// 在 PTE 更新后，仅保留当前仍运行目标逻辑 ASID 的历史 CPU。
+pub(crate) fn shootdown_targets_after_pte_update(
+    historically_active: &AtomicUsize,
+    target_asid: usize,
+) -> usize {
+    CURRENT_LOGICAL_ASIDS.target_mask_after_pte_update(historically_active, target_asid)
+}
+
+fn poll_urgent() {
+    handle_shootdown_requests();
+    sched::handle_membarrier_ipi();
+}
+
 pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
     send_resched: send_reschedule,
     send_membarrier,
+    poll_urgent,
     is_online: cpu_is_online,
 };
 
@@ -216,6 +240,7 @@ pub(crate) fn handle_ipi() {
     }
     // request_resched() 在发送 IPI 前已经发布目标 CPU 的 need_resched。
     let _ = action & IPI_RESCHEDULE;
+    sched::acknowledge_resched_notification();
 }
 
 fn local_tlb_flush(asid: usize, address: usize) {
@@ -243,30 +268,38 @@ fn local_icache_sync() {
 pub(crate) fn handle_shootdown_requests() {
     let logical_id = LoongArch64MessageInterruptOps::current_cpu_id();
     loop {
-        let tlb_requested = TLB_REQUESTED[logical_id].load(Ordering::Acquire);
-        if TLB_COMPLETED[logical_id].load(Ordering::Relaxed) == tlb_requested {
+        let requested = TLB_REQUESTED[logical_id].load(Ordering::Acquire);
+        let completed = TLB_COMPLETED[logical_id].load(Ordering::Relaxed);
+        if shootdown_sequence_reached(completed, requested) {
             break;
         }
         local_tlb_flush(0, ALL_ADDRESSES);
-        TLB_COMPLETED[logical_id].store(tlb_requested, Ordering::Release);
+        TLB_COMPLETED[logical_id].store(requested, Ordering::Release);
+    }
+    loop {
+        let requested = ICACHE_REQUESTED[logical_id].load(Ordering::Acquire);
+        let completed = ICACHE_COMPLETED[logical_id].load(Ordering::Relaxed);
+        if shootdown_sequence_reached(completed, requested) {
+            break;
+        }
+        local_icache_sync();
+        ICACHE_COMPLETED[logical_id].store(requested, Ordering::Release);
         // flush 期间可能又有新 generation 到达，而 IOCSR 会把同类
         // IPI 合并成一个位。必须重读 requested 直到稳定，不能假设
         // 后续请求一定还会带来新的中断边沿。
     }
-    loop {
-        let icache_requested = ICACHE_REQUESTED[logical_id].load(Ordering::Acquire);
-        if ICACHE_COMPLETED[logical_id].load(Ordering::Relaxed) == icache_requested {
-            break;
-        }
-        local_icache_sync();
-        ICACHE_COMPLETED[logical_id].store(icache_requested, Ordering::Release);
-    }
 }
 
-fn publish_shootdown(kind: usize, asid: usize, address: usize, action: u32) {
+fn publish_shootdown(
+    kind: usize,
+    asid: usize,
+    address: usize,
+    action: u32,
+    requested_targets: usize,
+) {
     let source = LoongArch64MessageInterruptOps::current_cpu_id();
     let source_bit = 1usize << source;
-    let targets = ONLINE_CPUS.load(Ordering::Acquire) & !source_bit;
+    let targets = ONLINE_CPUS.load(Ordering::Acquire) & requested_targets & !source_bit;
 
     match kind {
         SHOOTDOWN_TLB => local_tlb_flush(asid, address),
@@ -293,12 +326,20 @@ fn publish_shootdown(kind: usize, asid: usize, address: usize, action: u32) {
         };
     }
     send_action_to_mask(targets, action);
-    wait_for_shootdown(kind, targets, &expected);
+    wait_for_shootdown(kind, action, asid, address, targets, &expected);
 }
 
-fn wait_for_shootdown(kind: usize, targets: usize, expected: &[usize; MAX_CPUS]) {
-    let started_at = stable_counter_raw();
-    let timeout_ticks = stable_counter_hz().max(1);
+fn wait_for_shootdown(
+    kind: usize,
+    action: u32,
+    asid: usize,
+    address: usize,
+    targets: usize,
+    expected: &[usize; MAX_CPUS],
+) {
+    let counter_hz = stable_counter_hz().max(1);
+    let retry_ticks = (counter_hz / SHOOTDOWN_RETRY_DIVISOR).max(1);
+    let warning_ticks = counter_hz.saturating_mul(SHOOTDOWN_WARNING_SECONDS);
     for logical_id in 0..MAX_CPUS {
         if targets & (1 << logical_id) == 0 {
             continue;
@@ -308,24 +349,47 @@ fn wait_for_shootdown(kind: usize, targets: usize, expected: &[usize; MAX_CPUS])
             SHOOTDOWN_ICACHE => &ICACHE_COMPLETED[logical_id],
             _ => return,
         };
-        while !shootdown_sequence_reached(completed.load(Ordering::Acquire), expected[logical_id]) {
+        let mut last_kick = stable_counter_raw();
+        let mut last_warning = last_kick;
+        loop {
+            let observed = completed.load(Ordering::Acquire);
+            if shootdown_sequence_reached(observed, expected[logical_id]) {
+                break;
+            }
             // 两个 CPU 可能同时发起 shootdown。在等待对端时主动消费本核请求，
             // 避免双方都处于关中断临界区时相互等待。
             handle_shootdown_requests();
-            if stable_counter_raw().wrapping_sub(started_at) >= timeout_ticks {
-                let observed = completed.load(Ordering::Acquire);
-                if shootdown_sequence_reached(observed, expected[logical_id]) {
-                    break;
+            let now = stable_counter_raw();
+            if now.wrapping_sub(last_kick) >= retry_ticks {
+                if let Some(physical_id) = physical_cpu_id(logical_id) {
+                    // IOCSR IPI 是同位合并通知。目标核长时间关中断或恰好清除同位
+                    // pending 时，序号仍是最终真值；重复敲门直到目标核发布确认。
+                    send_ipi_to_physical(physical_id, action);
                 }
-                panic!(
-                    "[smp] shootdown 确认超时 kind={} source={} target={} expected={} completed={} online={:#x}",
+                last_kick = now;
+            }
+            if now.wrapping_sub(last_warning) >= warning_ticks {
+                let target_logical_asid = CURRENT_LOGICAL_ASIDS.current(logical_id);
+                log::warning!(
+                    "[smp] shootdown 确认等待过长 kind={} asid={} address={:#x} source={} target={} targets={:#x} expected={} completed={} requested={} online={:#x} target_logical_asid={:?} target_asid_matches={}",
                     kind,
+                    asid,
+                    address,
                     LoongArch64MessageInterruptOps::current_cpu_id(),
                     logical_id,
+                    targets,
                     expected[logical_id],
-                    observed,
+                    completed.load(Ordering::Acquire),
+                    match kind {
+                        SHOOTDOWN_TLB => TLB_REQUESTED[logical_id].load(Ordering::Acquire),
+                        SHOOTDOWN_ICACHE => ICACHE_REQUESTED[logical_id].load(Ordering::Acquire),
+                        _ => 0,
+                    },
                     ONLINE_CPUS.load(Ordering::Acquire),
+                    target_logical_asid,
+                    target_logical_asid == Some(asid),
                 );
+                last_warning = now;
             }
             core::hint::spin_loop();
         }
@@ -352,11 +416,28 @@ pub(crate) fn flush_tlb_all_cpus(asid: usize, address: Option<usize>) {
         asid,
         address.unwrap_or(ALL_ADDRESSES),
         ACTION_TLB_SHOOTDOWN,
+        usize::MAX,
+    );
+}
+
+pub(crate) fn flush_tlb_on_cpus(asid: usize, address: Option<usize>, targets: usize) {
+    publish_shootdown(
+        SHOOTDOWN_TLB,
+        asid,
+        address.unwrap_or(ALL_ADDRESSES),
+        ACTION_TLB_SHOOTDOWN,
+        targets,
     );
 }
 
 pub(crate) fn sync_icache_all_cpus() {
-    publish_shootdown(SHOOTDOWN_ICACHE, 0, ALL_ADDRESSES, ACTION_ICACHE_SYNC);
+    publish_shootdown(
+        SHOOTDOWN_ICACHE,
+        0,
+        ALL_ADDRESSES,
+        ACTION_ICACHE_SYNC,
+        usize::MAX,
+    );
 }
 
 pub fn start_secondary_cpus() -> SecondaryCpuReport {

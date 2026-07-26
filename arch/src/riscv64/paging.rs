@@ -166,7 +166,7 @@ impl Riscv64Paging {
             // 所有地址空间都退化为 ASID 0，切根后必须冲刷该 ASID。新建/修改后
             // 尚未 fence 的页表同样需要一次 ASID 定向 fence 来排序 PTE store。
             if asid == 0 || needs_page_table_fence {
-                Self::flush_tlb_with_asid(asid, None);
+                Self::flush_tlb_local_with_asid(asid, None);
             }
         }
     }
@@ -195,6 +195,42 @@ impl Riscv64Paging {
     /// 必须在 S-mode 下调用。
     #[inline]
     pub unsafe fn flush_tlb_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
+        unsafe { Self::flush_tlb_local_with_asid(asid, vaddr) };
+        crate::riscv64::smp::remote_sfence_vma(Some(asid), vaddr.map(VirtAddr::as_usize));
+    }
+
+    /// 只刷新使用过目标用户地址空间的 CPU 集合。
+    ///
+    /// 本接口供用户 PGD 的活跃 CPU 跟踪使用。内核全局映射不得调用它，因为
+    /// Global translation 仍要求覆盖全部在线 hart。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_with_asid_on_cpus(
+        asid: usize,
+        vaddr: Option<VirtAddr>,
+        cpu_mask: usize,
+    ) {
+        let current = crate::riscv64::specific::current_cpu_id();
+        if current < usize::BITS as usize && cpu_mask & (1usize << current) != 0 {
+            unsafe { Self::flush_tlb_local_with_asid(asid, vaddr) };
+        }
+        crate::riscv64::smp::remote_sfence_vma_on(
+            cpu_mask,
+            Some(asid),
+            vaddr.map(VirtAddr::as_usize),
+        );
+    }
+
+    /// 排序先前页表写，并只失效当前 hart 的目标 ASID translation。
+    ///
+    /// 本接口不发 SBI RFENCE。调用者只有在确认不存在旧有效映射，或只是收敛
+    /// 当前 hart 缓存的无效 translation 时才能单独使用它。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 S-mode 下调用；解除映射、权限变化和物理页替换仍需使用同步多核
+    /// 失效接口。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_local_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
         unsafe {
             if let Some(addr) = vaddr {
                 core::arch::asm!(
@@ -211,7 +247,6 @@ impl Riscv64Paging {
                 );
             }
         }
-        crate::riscv64::smp::remote_sfence_vma(Some(asid), vaddr.map(VirtAddr::as_usize));
     }
 
     /// 使用当前 ASID 刷新 TLB。
@@ -238,6 +273,20 @@ impl Riscv64Paging {
     /// 调用方随后才能释放被解除映射的物理页或页表页。
     #[inline]
     pub unsafe fn flush_tlb_global(vaddr: Option<VirtAddr>) {
+        unsafe { Self::flush_tlb_global_local(vaddr) };
+        crate::riscv64::smp::remote_sfence_vma(None, vaddr.map(VirtAddr::as_usize));
+    }
+
+    /// 只在当前 hart 失效 Global translation。
+    ///
+    /// 该入口供需要把多个本地地址失效合并为一次 SBI range RFENCE 的架构内部
+    /// 路径使用。调用者必须自行保证所有相关远端 hart 在物理页复用前完成失效。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 S-mode 下调用。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_global_local(vaddr: Option<VirtAddr>) {
         unsafe {
             if let Some(addr) = vaddr {
                 core::arch::asm!(
@@ -249,7 +298,6 @@ impl Riscv64Paging {
                 core::arch::asm!("sfence.vma zero, zero", options(nostack));
             }
         }
-        crate::riscv64::smp::remote_sfence_vma(None, vaddr.map(VirtAddr::as_usize));
     }
 }
 

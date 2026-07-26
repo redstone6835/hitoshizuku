@@ -375,6 +375,19 @@ unsafe fn loongarch64_handle_exception_inner(
         ecode,
         ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX | ECODE_PPI
     ) {
+        // 新内核堆映射不在任意调用方锁内同步等待远端 CPU。若本核缓存了映射发布
+        // 前的无效 translation，先按页表映射代次做一次受限的本地收敛。权限异常
+        // 和同一代次重复故障不会进入该路径，仍按真正的内核错误处理。
+        if !from_user
+            && matches!(ecode, ECODE_PIL | ECODE_PIS | ECODE_PIF)
+            && super::super::heap_vm::recover_stale_kernel_heap_translation(
+                arg2,
+                ecode == ECODE_PIS,
+                ecode == ECODE_PIF,
+            )
+        {
+            return arg4;
+        }
         // 缺页族 → 统一走 general::mm::dispatch_page_fault。
         // 分派结果：
         //   Fixed                      → 重试指令，返回 arg4；

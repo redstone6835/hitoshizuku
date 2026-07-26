@@ -434,10 +434,41 @@ impl Runqueue {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
 
-        let fair_prev_addr = requeue_current_locked(&mut inner, now_ns);
+        let mut fair_prev_addr = None;
+        let mut kernel_idle = None;
+        if let Some(prev) = inner.current.take() {
+            if prev.is_idle_task() {
+                // 内核 idle task 由每 CPU idle 槽提供，不属于可排队的
+                // SCHED_IDLE 任务。把它每个 tick 插入再移出 BTreeMap 会在
+                // rq 锁内反复分配节点，并让多核空闲系统争用全局分配器。
+                prev.sched.set_on_rq(false);
+                kernel_idle = Some(prev);
+            } else if task_can_enter_runqueue(&prev)
+                && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
+            {
+                prev.set_state(TaskState::Runnable);
+                if prev.sched.policy() == SchedPolicy::Fair {
+                    fair_prev_addr = Some(task_addr(&prev));
+                }
+                enqueue_queued_locked(&mut inner, prev, now_ns);
+            } else {
+                if prev.arch_context().is_none()
+                    && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
+                {
+                    log::warning!(
+                        "[sched] drop current without arch context pid={:?} state={:?}",
+                        prev.pid_root(),
+                        prev.state(),
+                    );
+                    prev.set_state(TaskState::Dead);
+                }
+                prev.sched.set_on_rq(false);
+            }
+        }
 
         let preferred_fair_addr = inner.preferred_fair_addr.take();
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask);
+        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask)
+            .or(kernel_idle);
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
@@ -685,7 +716,11 @@ fn deadline_utilization(task: &Arc<Task>) -> u64 {
 fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
     let mut fair_prev_addr = None;
     if let Some(prev) = inner.current.take() {
-        if task_can_enter_runqueue(&prev)
+        if prev.is_idle_task() {
+            // kernel idle 由每 CPU idle 槽持有，targeted pick 时同样不能把它
+            // 塞回普通 SCHED_IDLE 队列。
+            prev.sched.set_on_rq(false);
+        } else if task_can_enter_runqueue(&prev)
             && matches!(prev.state(), TaskState::Running | TaskState::Runnable)
         {
             prev.set_state(TaskState::Runnable);

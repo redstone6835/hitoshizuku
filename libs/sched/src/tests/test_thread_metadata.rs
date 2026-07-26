@@ -604,6 +604,25 @@ fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
 }
 
 #[ktest]
+fn runqueue_kernel_idle_current_never_enters_idle_tree() {
+    let idle = make_task();
+    idle.mark_idle_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&idle));
+
+    for now in 1..=32 {
+        let current = rq.pick_next(now).expect("kernel idle task");
+        assert!(alloc::sync::Arc::ptr_eq(&current, &idle));
+        assert!(rq.snapshot_runnable().is_empty());
+        assert_eq!(rq.nr_running(), 1);
+    }
+
+    assert!(rq.dequeue(&idle, 33));
+}
+
+#[ktest]
 fn runqueue_wake_current_sleep_transition_does_not_duplicate_task() {
     let task = make_task();
     let rq = Runqueue::new();
