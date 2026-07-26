@@ -3841,12 +3841,6 @@ fn validate_openat2_flags(raw: usize) -> Result<(), Errno> {
 }
 
 fn write_from_user(file: &vfs::file::File, user: usize, len: usize) -> Result<usize, Errno> {
-    if len != 0
-        && let Some(vm) = current_vm_space()
-        && let Some(socket) = inet_stream_file(file)
-    {
-        return write_inet_stream_from_user(&vm, file, socket, user, len);
-    }
     write_from_user_at(file, user, len, None)
 }
 
@@ -3863,87 +3857,6 @@ impl Drop for InetStreamWriteBatch<'_> {
 fn inet_stream_file(file: &vfs::file::File) -> Option<&vfs::net_socket::NetSocketFileOps> {
     let socket = file.downcast_ops::<vfs::net_socket::NetSocketFileOps>()?;
     (usize::from(socket.sock_type()) == vfs_socket::SOCK_STREAM).then_some(socket)
-}
-
-fn write_inet_stream_from_user(
-    vm: &VmSpace,
-    file: &vfs::file::File,
-    socket: &vfs::net_socket::NetSocketFileOps,
-    user: usize,
-    len: usize,
-) -> Result<usize, Errno> {
-    let _batch = InetStreamWriteBatch { socket };
-    write_inet_stream_windows(vm, file, socket, user, len)
-}
-
-fn write_inet_stream_windows(
-    vm: &VmSpace,
-    file: &vfs::file::File,
-    socket: &vfs::net_socket::NetSocketFileOps,
-    user: usize,
-    len: usize,
-) -> Result<usize, Errno> {
-    let mut written = 0usize;
-    while written < len {
-        let user_ptr = user.checked_add(written).ok_or(Errno::EFAULT)?;
-        let remaining = len - written;
-        let result = unsafe {
-            vm.with_user_read_slice(user_ptr, remaining, |data| {
-                socket
-                    .sendto(
-                        data,
-                        None,
-                        vfs::net_socket::InetSendOptions {
-                            nonblocking: file.flags().nonblock,
-                            more: true,
-                            dont_route: false,
-                            confirm: false,
-                            deadline_ns: None,
-                        },
-                    )
-                    .map(|accepted| (accepted, data.len()))
-            })
-        };
-        let (accepted, window_len) = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(Errno::EAGAIN)) if written != 0 => return Ok(written),
-            Ok(Err(Errno::EAGAIN)) if file.flags().nonblock => return Err(Errno::EAGAIN),
-            Ok(Err(Errno::EAGAIN)) => {
-                wait_for_file_readiness(file, PollEvents::POLLOUT)?;
-                continue;
-            }
-            Ok(Err(Errno::EPIPE)) if written == 0 => {
-                deliver_sigpipe();
-                return Err(Errno::EPIPE);
-            }
-            Ok(Err(error)) => {
-                return if written == 0 {
-                    Err(error)
-                } else {
-                    Ok(written)
-                };
-            }
-            Err(error) => {
-                return if written == 0 {
-                    Err(error)
-                } else {
-                    Ok(written)
-                };
-            }
-        };
-        if accepted == 0 {
-            return if written == 0 {
-                Err(Errno::EIO)
-            } else {
-                Ok(written)
-            };
-        }
-        written += accepted;
-        if accepted < window_len {
-            break;
-        }
-    }
-    Ok(written)
 }
 
 fn write_from_user_at(
@@ -4075,87 +3988,7 @@ fn read_to_user(
     let Some(vm) = current_vm_space() else {
         return read_to_user_fallback(file, user, len, offset);
     };
-    if offset.is_none()
-        && let Some(socket) = inet_stream_file(file)
-    {
-        return read_inet_stream_to_user(&vm, file, socket, user, len);
-    }
-
     read_to_user_windows(&vm, file, user, len, offset)
-}
-
-struct InetStreamReceiveBatch<'a> {
-    socket: &'a vfs::net_socket::NetSocketFileOps,
-}
-
-impl Drop for InetStreamReceiveBatch<'_> {
-    fn drop(&mut self) {
-        self.socket.finish_stream_receive();
-    }
-}
-
-fn read_inet_stream_to_user(
-    vm: &VmSpace,
-    file: &vfs::file::File,
-    socket: &vfs::net_socket::NetSocketFileOps,
-    user: usize,
-    len: usize,
-) -> Result<usize, Errno> {
-    let _batch = InetStreamReceiveBatch { socket };
-    read_inet_stream_windows(vm, file, socket, user, len)
-}
-
-fn read_inet_stream_windows(
-    vm: &VmSpace,
-    file: &vfs::file::File,
-    socket: &vfs::net_socket::NetSocketFileOps,
-    user: usize,
-    len: usize,
-) -> Result<usize, Errno> {
-    let mut remaining = len;
-    let mut user_ptr = user;
-    let mut read = 0usize;
-    while remaining > 0 {
-        let chunk = remaining.min(COPY_CHUNK);
-        let result = unsafe {
-            vm.with_user_write_slice(user_ptr, chunk, |buf| {
-                socket
-                    .recvfrom(
-                        buf,
-                        vfs::net_socket::InetRecvOptions {
-                            nonblocking: file.flags().nonblock,
-                            peek: false,
-                            wait_all: false,
-                            trunc: false,
-                            defer_window_update: true,
-                            deadline_ns: None,
-                        },
-                    )
-                    .map(|output| (output.len, buf.len()))
-            })
-        };
-        let (n, window_len) = match result {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(Errno::EAGAIN)) if read > 0 => return Ok(read),
-            Ok(Err(Errno::EAGAIN)) if file.flags().nonblock => return Err(Errno::EAGAIN),
-            Ok(Err(Errno::EAGAIN)) => {
-                wait_for_file_readiness(file, PollEvents::POLLIN)?;
-                continue;
-            }
-            Ok(Err(error)) => return if read > 0 { Ok(read) } else { Err(error) },
-            Err(error) => return if read > 0 { Ok(read) } else { Err(error) },
-        };
-        if n == 0 {
-            break;
-        }
-        read += n;
-        user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
-        remaining -= n;
-        if n < window_len {
-            break;
-        }
-    }
-    Ok(read)
 }
 
 fn read_to_user_windows(
@@ -4385,27 +4218,6 @@ fn write_iovecs(
     iovcnt: usize,
     mut offset: Option<u64>,
 ) -> Result<usize, Errno> {
-    if offset.is_none()
-        && let Some(vm) = current_vm_space()
-        && let Some(socket) = inet_stream_file(file)
-    {
-        let _batch = InetStreamWriteBatch { socket };
-        let mut total = 0usize;
-        for i in 0..iovcnt {
-            let (base, len) = read_iovec(iov, i)?;
-            match write_inet_stream_windows(&vm, file, socket, base, len) {
-                Ok(written) => {
-                    total = total.checked_add(written).ok_or(Errno::EINVAL)?;
-                    if written < len {
-                        break;
-                    }
-                }
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error),
-            }
-        }
-        return Ok(total);
-    }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
@@ -4433,27 +4245,6 @@ fn read_iovecs(
     iovcnt: usize,
     mut offset: Option<u64>,
 ) -> Result<usize, Errno> {
-    if offset.is_none()
-        && let Some(vm) = current_vm_space()
-        && let Some(socket) = inet_stream_file(file)
-    {
-        let _batch = InetStreamReceiveBatch { socket };
-        let mut total = 0usize;
-        for i in 0..iovcnt {
-            let (base, len) = read_iovec(iov, i)?;
-            match read_inet_stream_windows(&vm, file, socket, base, len) {
-                Ok(read) => {
-                    total = total.checked_add(read).ok_or(Errno::EINVAL)?;
-                    if read < len {
-                        break;
-                    }
-                }
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error),
-            }
-        }
-        return Ok(total);
-    }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
