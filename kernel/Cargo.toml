@@ -9,6 +9,7 @@ block-bench = ["general/block-profile"]
 allocator-bench = []
 embedded-initramfs = []
 trace-task-lifecycle = ["sched/trace-task-lifecycle"]
+trace-syscall = ["general/trace-syscall"]
 performance-profile = [
     "dep:profiling",
     "arch/performance-profile",

@@ -161,6 +161,16 @@ pub fn current_kernel_stack_top() -> usize {
     unsafe { core::ptr::addr_of!((*ptr).kernel_stack_top).read_volatile() }
 }
 
+/// 读取当前 hart 已完成的内核任务切换序列。
+///
+/// 该值只用于判断一次 trap 处理期间是否失去过当前 hart 的执行所有权，不能作为
+/// 跨 hart 的全局顺序号。调用方必须保留入口值并只比较是否相等。
+#[inline]
+pub(crate) fn current_context_switch_sequence() -> usize {
+    let ptr = current_hart_ptr();
+    unsafe { core::ptr::addr_of!((*ptr).context_switch_seq).read_volatile() }
+}
+
 /// 更新当前 hart 上正在运行任务的内核栈顶。
 ///
 /// # Safety

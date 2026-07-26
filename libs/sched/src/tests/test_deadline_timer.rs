@@ -8,7 +8,7 @@ use super::test_thread_metadata::make_task;
 use crate::ArchDeadlineTimerOps;
 use crate::scheduler::{
     cancel_sleep_deadline, earliest_deadline_for_test, register_sleep_deadline,
-    register_sleep_deadline_for_test, set_realtime_itimer,
+    register_sleep_deadline_for_test, reprogram_current_deadline, set_realtime_itimer,
 };
 
 const NO_DEADLINE: u64 = u64::MAX;
@@ -29,6 +29,13 @@ fn deadline_timer_tracks_earliest_source_and_cancellation() {
     let second = make_task();
 
     assert!(register_sleep_deadline(&first, 300));
+    assert_eq!(LAST_DEADLINE.load(Ordering::Acquire), 300);
+
+    reprogram_current_deadline(Some(250));
+    assert_eq!(LAST_DEADLINE.load(Ordering::Acquire), 250);
+    reprogram_current_deadline(Some(350));
+    assert_eq!(LAST_DEADLINE.load(Ordering::Acquire), 300);
+    reprogram_current_deadline(None);
     assert_eq!(LAST_DEADLINE.load(Ordering::Acquire), 300);
 
     assert!(register_sleep_deadline_for_test(&second, 200, 1));

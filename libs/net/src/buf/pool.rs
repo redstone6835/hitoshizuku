@@ -1,6 +1,7 @@
 //! pinned buffer pool、generation 校验与跨 CPU 回收。
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec;
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
@@ -8,6 +9,7 @@ use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use spin::Mutex;
 
 use super::PacketMetadata;
 
@@ -377,6 +379,11 @@ pub struct NetBufPoolOwner {
     local_free: Box<[u16]>,
     local_len: usize,
 }
+
+/// queue worker、协议 worker 与 socket 共享的唯一 pool owner。
+///
+/// 锁只保护 lease/recycle 元数据，不覆盖 payload 复制或 DMA 提交。
+pub type SharedNetBufPool = Arc<Mutex<NetBufPoolOwner>>;
 
 unsafe impl Send for NetBufPoolOwner {}
 
@@ -776,6 +783,7 @@ impl NetBufLease {
             data_len: lease.data_len,
             capacity: lease.capacity,
             metadata: lease.metadata,
+            pool_owner: None,
         })
     }
 
@@ -834,6 +842,7 @@ pub struct ChunkRef {
     data_len: u16,
     capacity: u16,
     metadata: PacketMetadata,
+    pool_owner: Option<SharedNetBufPool>,
 }
 
 unsafe impl Send for ChunkRef {}
@@ -879,7 +888,39 @@ impl ChunkRef {
             data_len: self.data_len,
             capacity: self.capacity,
             metadata: self.metadata,
+            pool_owner: self.pool_owner.as_ref().map(Arc::clone),
         })
+    }
+
+    /// 让跨 worker 或 ELM 保留的 chunk 同时保活其 pool owner。
+    pub(crate) fn retain_pool(mut self, owner: SharedNetBufPool) -> Result<Self, NetBufPoolError> {
+        if owner.lock().pool_ptr != self.pool
+            || self
+                .pool_owner
+                .as_ref()
+                .is_some_and(|current| !Arc::ptr_eq(current, &owner))
+        {
+            return Err(NetBufPoolError::StaleIdentity);
+        }
+        self.pool_owner = Some(owner);
+        Ok(self)
+    }
+
+    /// pin 当前 chunk 的一个子区间。
+    pub fn slice(&self, offset: usize, len: usize) -> Result<Self, NetBufPoolError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(NetBufPoolError::InvalidRange)?;
+        if end > self.len() {
+            return Err(NetBufPoolError::InvalidRange);
+        }
+        let mut pinned = self.pin()?;
+        pinned.data_offset = pinned
+            .data_offset
+            .checked_add(offset as u16)
+            .ok_or(NetBufPoolError::InvalidRange)?;
+        pinned.data_len = len as u16;
+        Ok(pinned)
     }
 
     pub const fn len(&self) -> usize {

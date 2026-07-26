@@ -38,6 +38,20 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+/// 用户态 trap 中保存的 PIE 只能在 `ertn` 时恢复。调度若在此之前切走，下一任务
+/// 会继承当前 CPU 的关中断状态，因此必须在可能切换上下文的边界临时恢复中断。
+fn schedule_before_user_return(now_ns: u64) {
+    unsafe { LoongArch64InterruptOps::enable_interrupts() };
+    sched::schedule_once(now_ns);
+    unsafe { LoongArch64InterruptOps::disable_interrupts() };
+}
+
+fn preempt_before_user_return(now_ns: u64) {
+    unsafe { LoongArch64InterruptOps::enable_interrupts() };
+    sched::preempt_if_needed(now_ns);
+    unsafe { LoongArch64InterruptOps::disable_interrupts() };
+}
+
 fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
     if !from_user || !sched::is_ready() {
         return;
@@ -47,11 +61,11 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
         sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
-            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
-            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
         }
         _ => {}
     }
@@ -76,11 +90,11 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     }
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
-            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
-            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
         }
         _ => {}
     }
@@ -188,7 +202,7 @@ unsafe fn loongarch64_handle_exception_inner(
             let now_ns = super::super::specific::kernel_timestamp_ns();
             deliver_user_signals_before_return(arg4, from_user);
             if from_user {
-                sched::preempt_if_needed(now_ns);
+                preempt_before_user_return(now_ns);
             }
             return arg4;
         }
@@ -198,10 +212,11 @@ unsafe fn loongarch64_handle_exception_inner(
             profiling::sample_pc(arg0, from_user);
             // LoongArch 的定时器中断通常需要软件显式写 TICLR 清 pending，否则在 `ertn`
             // 后会立即再次陷入，形成“看似无法返回”的中断风暴。
+            let clear_timer = 1usize;
             unsafe {
                 core::arch::asm!(
                     "csrwr {val}, {csr}",
-                    val = in(reg) 1usize,
+                    val = inout(reg) clear_timer => _,
                     csr = const CSR_TICLR,
                     options(nostack, preserves_flags)
                 );
@@ -239,10 +254,9 @@ unsafe fn loongarch64_handle_exception_inner(
             // 无锁边界补做调度工作，避免本 CPU 重入锁后永久自旋。
             if !from_user {
                 sched::defer_timer_tick(now_ns);
-                if boot_cpu && general::elm_guard::active_cell() == 0 {
-                    super::super::vdso::run_net_poll_hook(now_ns);
-                    super::super::vdso::run_tty_poll_hook(now_ns);
-                }
+                // syscall 期间允许内核态中断嵌套，timer top-half 不能在这里
+                // 重入网络或 TTY poll；它们可能正由被打断的 syscall 持锁。
+                // deferred tick 会在下一个调度或用户态返回边界被消费。
                 return arg4;
             }
 
@@ -253,7 +267,7 @@ unsafe fn loongarch64_handle_exception_inner(
             // 短超时延迟。内核态中断已经在上方返回，此处是安全的用户态返回边界。
             let urgent_preempt = deadline_fired && sched::is_ready();
             if urgent_preempt {
-                sched::preempt_if_needed(now_ns);
+                preempt_before_user_return(now_ns);
             }
             if boot_cpu {
                 // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
@@ -268,7 +282,7 @@ unsafe fn loongarch64_handle_exception_inner(
             // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
             // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
             if !urgent_preempt {
-                sched::preempt_if_needed(now_ns);
+                preempt_before_user_return(now_ns);
             }
             return arg4;
         }
@@ -289,7 +303,7 @@ unsafe fn loongarch64_handle_exception_inner(
         deliver_user_signals_before_return(arg4, from_user);
         // 与 timer 分支一致，只在返回用户态前处理抢占请求。
         if from_user {
-            sched::preempt_if_needed(now_ns);
+            preempt_before_user_return(now_ns);
         }
         arg4
     } else if ecode == ECODE_SYS {
@@ -314,13 +328,25 @@ unsafe fn loongarch64_handle_exception_inner(
         // syscall 通过注入的 SyscallFrameOps 读 a7/a0-a5、写返回值、推 PC。
         // general::syscall::dispatch 本轮全部返 ENOSYS；ELF loader 那轮再逐条加 arm。
         // log::debug!("[trap] syscall id={} pc={:#x} from_user={}", tf.a7, arg0, from_user);
+        if from_user {
+            // 汇编入口已保存完整现场，内核态嵌套 trap 会继续使用当前
+            // 内核栈。在可能长时间阻塞或处理大数据的 syscall 期间恢复中断，
+            // 确保 timer、reschedule 和 TLB shootdown 不会被拖到 syscall 返回。
+            unsafe { LoongArch64InterruptOps::enable_interrupts() };
+        }
         general::syscall::dispatch(general::TrapFramePtr::new(arg4));
+        if from_user {
+            unsafe { LoongArch64InterruptOps::disable_interrupts() };
+            // 与中断关闭前可能刚发布的请求收口，避免 pending IPI
+            // 要等到下一次用户态 trap 才被确认。
+            super::super::smp::handle_ipi();
+        }
         // syscall 内部可能唤醒了其它任务或新建了子进程，并通过
         // request_resched() 标记当前 CPU 需要重调度。系统调用返回用户态前
         // 立即消费该标记，避免当前任务在同一时间片里连续启动 client，
         // 而刚 fork/唤醒的 server 只能等下一次 timer tick。
         if sched::needs_resched_current() {
-            sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+            preempt_before_user_return(super::super::specific::kernel_timestamp_ns());
         }
         arg4
     } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD) {

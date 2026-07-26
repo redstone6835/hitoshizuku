@@ -13481,22 +13481,33 @@ impl ElmCore {
         if self.cell_state(call.owner) != Some(ElmState::Active) {
             return Err(ELM_MGR_STATUS_BUSY);
         }
-        let export = self
-            .native_exports
-            .iter()
-            .find(|export| {
-                export.owner == call.owner
-                    && export.generation == call.generation
-                    && export.name == call.name
-                    && export.contract == call.contract
-                    && export.version == call.version
-                    && !native_export_is_managed(export.flags)
-                    && export.flags & elm_model::ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
-                    && export.rust_abi_hash == call.rust_abi_hash
-            })
-            .cloned()
-            .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
-        let bounds = export.bounds.ok_or(ELM_MGR_STATUS_INVALID)?;
+        let cached = *call.route.lock();
+        let route = if let Some(route) = cached {
+            route
+        } else {
+            let route = {
+                let export = self
+                    .native_exports
+                    .iter()
+                    .find(|export| {
+                        export.owner == call.owner
+                            && export.generation == call.generation
+                            && export.name == call.name
+                            && export.contract == call.contract
+                            && export.version == call.version
+                            && !native_export_is_managed(export.flags)
+                            && export.flags & elm_model::ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
+                            && export.rust_abi_hash == call.rust_abi_hash
+                    })
+                    .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
+                super::PinnedNativeRoute {
+                    address: export.address,
+                    bounds: export.bounds.ok_or(ELM_MGR_STATUS_INVALID)?,
+                }
+            };
+            *call.route.lock() = Some(route);
+            route
+        };
         let callee = self.reserve_cell_execution(call.owner)?;
         if callee.generation != call.generation {
             self.release_cell_execution(callee);
@@ -13504,8 +13515,8 @@ impl ElmCore {
         }
         Ok(PinnedNativeExecutionPlan {
             callee,
-            address: export.address,
-            bounds,
+            address: route.address,
+            bounds: route.bounds,
         })
     }
 

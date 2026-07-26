@@ -262,6 +262,15 @@ unsafe fn activate(pgd: PgdHandle) {
     }
 }
 
+unsafe fn activate_kernel() {
+    let root = crate::riscv64::heap_vm::kernel_page_table_root();
+    unsafe {
+        // ASID 0 专用于内核页表；activate_with_asid 会在切根后刷新
+        // 本地 ASID 0，避免 idle 沿用已经回收的用户 PGD。
+        Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root), 0, false);
+    }
+}
+
 fn allocate_page_table_page() -> Result<usize, general::MapError> {
     let request = allocator::PhysicalAllocRequest::new(allocator::PAGE_SIZE, allocator::PAGE_SIZE);
     allocator::KERNEL_ALLOCATOR
@@ -467,6 +476,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     protect: protect_user_pages,
     clone_for_fork: clone_for_fork_user_pages,
     activate,
+    activate_kernel,
     invalidate_range,
     count_mapped: count_mapped_pages,
 };

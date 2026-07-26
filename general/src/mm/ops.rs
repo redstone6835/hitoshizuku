@@ -193,6 +193,15 @@ pub struct UserPgdOps {
     /// 通常只在 `schedule_once` 切换 task 之后立刻调用。
     pub activate: unsafe fn(handle: PgdHandle),
 
+    /// 把当前 CPU 切回内核页表。
+    ///
+    /// idle 和纯内核线程没有用户 `VmSpace`，但不能继续沿用上一个
+    /// 用户任务的 PGD；该 PGD 可能在退出回收路径中立即释放。
+    ///
+    /// # Safety
+    /// 通常只在调度器已决定切向无用户地址空间任务时调用。
+    pub activate_kernel: unsafe fn(),
+
     /// 让 `[vaddr, vaddr+len)` 的 TLB 项失效。
     pub invalidate_range: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize),
 
@@ -345,6 +354,7 @@ mod tests {
     }
 
     unsafe fn ignore_handle(_: PgdHandle) {}
+    unsafe fn ignore_activate_kernel() {}
     unsafe fn ignore_map(_: PgdHandle, _: usize, _: usize, _: VmFlags) {}
     unsafe fn record_local(_: PgdHandle, _: usize, _: usize) {
         LOCAL_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
@@ -368,6 +378,7 @@ mod tests {
             protect: ignore_protect,
             clone_for_fork: ignore_clone,
             activate: ignore_handle,
+            activate_kernel: ignore_activate_kernel,
             invalidate_range: record_remote,
             count_mapped: count_none,
         }

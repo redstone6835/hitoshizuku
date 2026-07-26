@@ -8,7 +8,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::boot::NetDriverBootConfig;
-use crate::buf::{CompletionBatch, NetBufPoolOwner, PacketBatch, RxRefillBatch, TxBatch};
+use crate::buf::{
+    CompletionBatch, NetBufPoolOwner, PacketBatch, RxRefillBatch, SharedNetBufPool, TxBatch,
+};
 use crate::queue::{
     NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
     TxReclaimResult, TxSubmitResult,
@@ -48,8 +50,7 @@ pub struct QueueIrqStats {
     pub irq_unmask: u64,
 }
 
-pub const NET_QUEUE_CALL_ABI_VERSION: u16 = 1;
-pub const NET_QUEUE_CALL_RUST_ABI: &str = "fn(&mutnet::device::NetQueueCallV1)->i32";
+pub const NET_QUEUE_CALL_RUST_ABI: &str = "fn(&mutnet::device::NetQueueCall)->i32";
 pub const NET_QUEUE_CALL_STATUS_OK: i32 = 0;
 pub const NET_QUEUE_CALL_STATUS_INVALID: i32 = -22;
 
@@ -62,8 +63,7 @@ pub const NET_QUEUE_OP_QUIESCE: u32 = 6;
 
 /// host 与 driver ELM 间一次同步 queue batch 调用的固定帧。
 #[repr(C)]
-pub struct NetQueueCallV1 {
-    pub abi_version: u16,
+pub struct NetQueueCall {
     pub struct_size: u16,
     pub opcode: u32,
     pub queue_id: QueuePairId,
@@ -84,10 +84,9 @@ pub struct NetQueueCallV1 {
 }
 
 #[kernel_symbols::export]
-impl NetQueueCallV1 {
+impl NetQueueCall {
     pub fn new(opcode: u32, queue_id: QueuePairId) -> Self {
         Self {
-            abi_version: NET_QUEUE_CALL_ABI_VERSION,
             struct_size: core::mem::size_of::<Self>() as u16,
             opcode,
             queue_id,
@@ -133,14 +132,13 @@ impl NetQueueCallV1 {
     }
 
     #[kernel_symbols::export(
-        name = "net.device.NetQueueCallV1.valid",
+        name = "net.device.NetQueueCall.valid",
         contract = "kernel.net.queue-call-frame@1",
         version = 1,
         capabilities = kernel_symbols::capability::CORE_SAFE
     )]
     pub fn valid(&self, opcode: u32, queue_id: QueuePairId) -> bool {
-        self.abi_version == NET_QUEUE_CALL_ABI_VERSION
-            && self.struct_size as usize == core::mem::size_of::<Self>()
+        self.struct_size as usize == core::mem::size_of::<Self>()
             && self.opcode == opcode
             && self.queue_id == queue_id
             && self.reserved0 == 0
@@ -148,7 +146,7 @@ impl NetQueueCallV1 {
     }
 }
 
-/// 动态 ELM queue 的代际固定 export 描述；字符串已复制到常驻分配中。
+/// 固定到特定 ELM generation 的 queue export 描述；字符串已复制到常驻分配中。
 pub struct PinnedNetQueueEndpoint {
     owner_cell: u64,
     owner_generation: u64,
@@ -256,7 +254,8 @@ pub struct NetQueueRegistration {
     pub queue: NetQueueEndpoint,
     pub rx_pool: NetBufPoolOwner,
     pub tx_header_pool: NetBufPoolOwner,
-    pub tx_payload_pool: NetBufPoolOwner,
+    pub tx_payload_pool: SharedNetBufPool,
+    pub socket_tx_pool: SharedNetBufPool,
     pub irq: Arc<dyn QueueIrqControl>,
 }
 
@@ -277,10 +276,15 @@ impl NetQueueRegistration {
             queue: NetQueueEndpoint::Integrated(queue),
             rx_pool: crate::buf::NetBufPool::new_heap(rx_pool_count, rx_buffer_size)?,
             tx_header_pool: crate::buf::NetBufPool::new_heap(tx_header_pool_count, tx_header_size)?,
-            tx_payload_pool: crate::buf::NetBufPool::new_heap(
+            tx_payload_pool: Arc::new(Mutex::new(crate::buf::NetBufPool::new_heap(
                 tx_payload_pool_count,
                 tx_payload_size,
-            )?,
+            )?)),
+            socket_tx_pool: Arc::new(Mutex::new(crate::buf::NetBufPool::new_heap(
+                tx_payload_pool_count
+                    .saturating_mul(crate::tuning::SOCKET_TX_POOL_DEPTH_MULTIPLIER),
+                tx_payload_size,
+            )?)),
             irq: Arc::new(SoftwareQueueIrq::new()),
         })
     }
@@ -307,10 +311,15 @@ impl NetQueueRegistration {
             queue: NetQueueEndpoint::Pinned(endpoint),
             rx_pool: crate::buf::NetBufPool::new_heap(rx_pool_count, rx_buffer_size)?,
             tx_header_pool: crate::buf::NetBufPool::new_heap(tx_header_pool_count, tx_header_size)?,
-            tx_payload_pool: crate::buf::NetBufPool::new_heap(
+            tx_payload_pool: Arc::new(Mutex::new(crate::buf::NetBufPool::new_heap(
                 tx_payload_pool_count,
                 tx_payload_size,
-            )?,
+            )?)),
+            socket_tx_pool: Arc::new(Mutex::new(crate::buf::NetBufPool::new_heap(
+                tx_payload_pool_count
+                    .saturating_mul(crate::tuning::SOCKET_TX_POOL_DEPTH_MULTIPLIER),
+                tx_payload_size,
+            )?)),
             irq: Arc::new(SoftwareQueueIrq::new()),
         })
     }
@@ -526,6 +535,12 @@ pub fn install_net_runtime(
     Ok(())
 }
 
+#[kernel_symbols::export(
+    name = "net.device.boot_config",
+    contract = "kernel.net.driver-boot-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER
+)]
 pub fn boot_config() -> Option<NetDriverBootConfig> {
     *BOOT_CONFIG.lock()
 }
@@ -655,11 +670,11 @@ mod tests {
     #[test]
     fn queue_call_frame_rejects_stale_or_corrupt_prefix() {
         let queue = QueuePairId(3);
-        let mut frame = NetQueueCallV1::new(NET_QUEUE_OP_POLL_RX, queue);
+        let mut frame = NetQueueCall::new(NET_QUEUE_OP_POLL_RX, queue);
         assert!(frame.valid(NET_QUEUE_OP_POLL_RX, queue));
-        frame.abi_version = frame.abi_version.saturating_add(1);
+        frame.struct_size = frame.struct_size.saturating_add(1);
         assert!(!frame.valid(NET_QUEUE_OP_POLL_RX, queue));
-        frame.abi_version = NET_QUEUE_CALL_ABI_VERSION;
+        frame.struct_size = core::mem::size_of::<NetQueueCall>() as u16;
         frame.reserved1[0] = 1;
         assert!(!frame.valid(NET_QUEUE_OP_POLL_RX, queue));
     }
@@ -678,6 +693,7 @@ mod tests {
                     max_tx_descriptors: 1,
                     max_rx_batch: 32,
                     max_tx_batch: 32,
+                    tx_checksum: false,
                     udp_segmentation: false,
                     max_udp_segments: 0,
                 },

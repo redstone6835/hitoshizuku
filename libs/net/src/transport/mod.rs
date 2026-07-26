@@ -29,6 +29,7 @@ pub use tcp_engine::{
 };
 #[cfg(test)]
 pub use udp::build_udp_fragments;
+pub(crate) use udp::local_udp_payload_fits_route;
 pub use udp::{
     LocalUdpIngressError, PreparedUdpTx, UdpBindError, UdpDatagram, UdpEndpointInfo,
     UdpEndpointTable, UdpIngressError, UdpTxError, build_udp_packet, build_udp_packet_with_options,

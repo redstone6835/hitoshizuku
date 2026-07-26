@@ -342,6 +342,16 @@ unsafe fn activate(handle: PgdHandle) {
     }
 }
 
+unsafe fn activate_kernel() {
+    let root = super::super::heap_vm::KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    assert_ne!(root, 0, "[arch][mm] kernel page table is not ready");
+    unsafe {
+        // ASID 0 留给内核地址空间，让 idle 和纯内核线程不再持有上一个
+        // 用户任务可能已被回收的 PGD。
+        LoongArch64Paging::activate_with_asid(PhysPageTableRoot::new(root), 0);
+    }
+}
+
 unsafe fn invalidate_range(handle: PgdHandle, vaddr: usize, len: usize) {
     // Safety: 同上。
     let inner = unsafe { inner_ref(handle) };
@@ -374,6 +384,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     protect,
     clone_for_fork,
     activate,
+    activate_kernel,
     invalidate_range,
     count_mapped,
 };

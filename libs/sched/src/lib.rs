@@ -112,17 +112,19 @@ pub use scheduler::{
 };
 pub use scheduler::{
     NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask, balance_once,
-    current_cpu_id, current_task, current_task_cpu_time_ns, current_task_fast, current_task_id,
-    current_task_on, current_task_ref, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
-    enqueue_task_preferred, enqueue_task_with_hint, idle_task, init, init_task, install_idle,
-    is_cpu_active, is_cpu_online, is_ready, mark_cpu_online, migrate_task, needs_resched,
-    needs_resched_current, now_ns_public, offline_cpu, on_timer_tick, online_cpu_mask, pid_count,
-    preempt_if_needed, register_cpu, register_sleep_deadline, request_balance,
-    request_post_syscall_handoff, request_resched, root_pid_ns, run_post_syscall_handoff,
-    run_post_syscall_handoff_lazy, sched_rr_timeslice_ms, sched_rr_timeslice_ns,
-    sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag, set_realtime_itimer,
-    set_sched_rr_timeslice_ms, set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup,
-    spawn_idle_for, supported_cpu_mask,
+    current_cpu_id, current_task, current_task_cpu_time_ns, current_task_fast,
+    current_task_handoff_target, current_task_id, current_task_on, current_task_ref,
+    defer_task_wake, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
+    enqueue_task_deferred, enqueue_task_preferred, enqueue_task_preferred_for_handoff,
+    enqueue_task_with_hint, idle_task, init, init_task, install_idle, is_cpu_active, is_cpu_online,
+    is_ready, mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
+    offline_cpu, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
+    register_sleep_deadline, reprogram_current_deadline, request_balance,
+    request_post_syscall_handoff, request_post_syscall_handoff_to, request_resched, root_pid_ns,
+    run_post_syscall_handoff, run_post_syscall_handoff_lazy, sched_rr_timeslice_ms,
+    sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag,
+    set_realtime_itimer, set_sched_rr_timeslice_ms, set_sched_rt_period_us,
+    set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for, supported_cpu_mask,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
@@ -132,7 +134,9 @@ pub use scheduler::{
     current_sched_domain_id, install_sched_topology, sched_domain_stats, sched_topology,
     task_sched_placement,
 };
-pub use scheduler_state::{CpuSchedState, SchedDomainStats, Scheduler, TopologySnapshot};
+pub use scheduler_state::{
+    CpuSchedState, HandoffReason, HandoffTarget, SchedDomainStats, Scheduler, TopologySnapshot,
+};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
     SigSet, SignalNumber, SignalObserver, SignalState,
@@ -144,9 +148,9 @@ pub use spawn::{
     reap_matching, reparent_to_init, spawn_child,
 };
 pub use task::{
-    DEFAULT_TIMER_SLACK_NS, ExitCode, RobustListState, RseqRegistration, SigAltStack,
-    TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS, TASKEXT_EXEC_ARGS,
-    TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
+    DEFAULT_TIMER_SLACK_NS, ExecutionActionClaim, ExecutionScopeKind, ExitCode, RobustListState,
+    RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION, TASKEXT_EXEC_ACCESS,
+    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
     TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
     TASKEXT_VM_SPACE, Task, TaskDiag, TaskExitAccountingHook, TaskExt, TaskExtCloneHook,
     TaskExtExitHook, TaskExtKey, TaskKind, TaskPreExitHook, TaskState, TaskUsage, WaitReason,

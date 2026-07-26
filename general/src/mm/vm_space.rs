@@ -407,6 +407,139 @@ impl Drop for ResidentPage {
     }
 }
 
+/// 一组已经完成权限检查和缺页处理的只读用户页窗口。
+///
+/// 每个窗口持有 resident page 的强引用，因此调用方可以先在普通上下文中完成
+/// fault-in，再在不能触发缺页的子系统临界区内复制数据。窗口不会保存用户虚拟
+/// 地址，也不会在复制时重新获取地址空间锁。
+pub struct UserReadWindows<const N: usize> {
+    windows: [Option<UserReadWindow>; N],
+    count: usize,
+    len: usize,
+}
+
+/// 一组已经完成权限检查、COW 和缺页处理的可写用户页窗口。
+///
+/// 窗口持有 resident page 的强引用，允许调用方先在可缺页上下文中固定目标，
+/// 再在子系统短临界区内直接写入。成功写入的页面会立即标脏。
+pub struct UserWriteWindows<const N: usize> {
+    windows: [Option<UserWriteWindow>; N],
+    count: usize,
+    len: usize,
+}
+
+struct UserWriteWindow {
+    page: Arc<ResidentPage>,
+    address: usize,
+    len: usize,
+}
+
+struct UserReadWindow {
+    _page: Arc<ResidentPage>,
+    address: usize,
+    len: usize,
+}
+
+struct ResidentUserWindow {
+    page: Arc<ResidentPage>,
+    address: usize,
+    len: usize,
+}
+
+struct ResidentUserWindows<const N: usize> {
+    windows: [Option<ResidentUserWindow>; N],
+    count: usize,
+    len: usize,
+}
+
+impl<const N: usize> UserReadWindows<N> {
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn window_count(&self) -> usize {
+        self.count
+    }
+
+    /// 从已经固定的窗口复制数据；该操作不会触发缺页或访问用户页表。
+    pub fn copy_into(&self, offset: usize, output: &mut [u8]) -> Result<(), Errno> {
+        let end = offset.checked_add(output.len()).ok_or(Errno::EFAULT)?;
+        if end > self.len {
+            return Err(Errno::EFAULT);
+        }
+        let mut logical = 0usize;
+        let mut copied = 0usize;
+        for window in self.windows[..self.count].iter().flatten() {
+            let window_end = logical + window.len;
+            if offset >= window_end {
+                logical = window_end;
+                continue;
+            }
+            let start = offset.saturating_sub(logical);
+            let take = (window.len - start).min(output.len() - copied);
+            // Safety: address 来自仍由 `_page` 保活的 direct-map 页，范围在固定窗口内。
+            let input =
+                unsafe { core::slice::from_raw_parts((window.address + start) as *const u8, take) };
+            output[copied..copied + take].copy_from_slice(input);
+            copied += take;
+            logical = window_end;
+            if copied == output.len() {
+                return Ok(());
+            }
+        }
+        Err(Errno::EFAULT)
+    }
+}
+
+impl<const N: usize> UserWriteWindows<N> {
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn window_count(&self) -> usize {
+        self.count
+    }
+
+    /// 向已经固定的窗口写入数据；该操作不会触发缺页或访问用户页表。
+    pub fn copy_from(&self, offset: usize, input: &[u8]) -> Result<(), Errno> {
+        let end = offset.checked_add(input.len()).ok_or(Errno::EFAULT)?;
+        if end > self.len {
+            return Err(Errno::EFAULT);
+        }
+        let mut logical = 0usize;
+        let mut copied = 0usize;
+        for window in self.windows[..self.count].iter().flatten() {
+            let window_end = logical + window.len;
+            if offset >= window_end {
+                logical = window_end;
+                continue;
+            }
+            let start = offset.saturating_sub(logical);
+            let take = (window.len - start).min(input.len() - copied);
+            // Safety: address 来自仍由 `page` 保活的 direct-map 页，范围在固定窗口内。
+            let output = unsafe {
+                core::slice::from_raw_parts_mut((window.address + start) as *mut u8, take)
+            };
+            output.copy_from_slice(&input[copied..copied + take]);
+            window.page.mark_dirty();
+            copied += take;
+            logical = window_end;
+            if copied == input.len() {
+                return Ok(());
+            }
+        }
+        Err(Errno::EFAULT)
+    }
+}
+
 impl PrivateFileFaultAround {
     /// 从锁外的 VMA 快照生成预装计划；`FileLike::size` 不在 VMA 锁内调用。
     fn new(
@@ -1391,6 +1524,126 @@ impl VmSpace {
         Ok(f(slice))
     }
 
+    /// 固定覆盖给定范围的只读用户页，并在返回前完成全部权限检查和 fault-in。
+    ///
+    /// 固定窗口只保留到返回值析构为止，适合把用户复制与其它子系统的自旋锁分开。
+    pub fn pin_user_read_windows<const N: usize>(
+        &self,
+        user: usize,
+        len: usize,
+    ) -> Result<UserReadWindows<N>, Errno> {
+        if len == 0 {
+            return Ok(UserReadWindows {
+                windows: core::array::from_fn(|_| None),
+                count: 0,
+                len: 0,
+            });
+        }
+        if let Some(mut resident) =
+            self.try_pin_resident_windows::<N>(user, len, FaultKind::Load)?
+        {
+            return Ok(UserReadWindows {
+                windows: core::array::from_fn(|index| {
+                    resident.windows[index].take().map(|window| UserReadWindow {
+                        _page: window.page,
+                        address: window.address,
+                        len: window.len,
+                    })
+                }),
+                count: resident.count,
+                len: resident.len,
+            });
+        }
+        user.checked_add(len).ok_or(Errno::EFAULT)?;
+        let mut windows = core::array::from_fn(|_| None);
+        let mut copied = 0usize;
+        let mut count = 0usize;
+        while copied < len {
+            if count == N {
+                return Err(Errno::EFAULT);
+            }
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let (page, kernel_address, window_len) =
+                self.user_page_window(address, len - copied, FaultKind::Load)?;
+            if window_len == 0 {
+                return Err(Errno::EFAULT);
+            }
+            windows[count] = Some(UserReadWindow {
+                _page: page,
+                address: kernel_address,
+                len: window_len,
+            });
+            copied += window_len;
+            count += 1;
+        }
+        Ok(UserReadWindows {
+            windows,
+            count,
+            len,
+        })
+    }
+
+    /// 固定覆盖给定范围的可写用户页，并在返回前完成权限检查、COW 和 fault-in。
+    ///
+    /// 调用方应只在确认数据已经可读后固定窗口，避免阻塞等待期间长期保留用户页。
+    pub fn pin_user_write_windows<const N: usize>(
+        &self,
+        user: usize,
+        len: usize,
+    ) -> Result<UserWriteWindows<N>, Errno> {
+        if len == 0 {
+            return Ok(UserWriteWindows {
+                windows: core::array::from_fn(|_| None),
+                count: 0,
+                len: 0,
+            });
+        }
+        if let Some(mut resident) =
+            self.try_pin_resident_windows::<N>(user, len, FaultKind::Store)?
+        {
+            return Ok(UserWriteWindows {
+                windows: core::array::from_fn(|index| {
+                    resident.windows[index]
+                        .take()
+                        .map(|window| UserWriteWindow {
+                            page: window.page,
+                            address: window.address,
+                            len: window.len,
+                        })
+                }),
+                count: resident.count,
+                len: resident.len,
+            });
+        }
+        user.checked_add(len).ok_or(Errno::EFAULT)?;
+        let mut windows = core::array::from_fn(|_| None);
+        let mut copied = 0usize;
+        let mut count = 0usize;
+        while copied < len {
+            if count == N {
+                return Err(Errno::EFAULT);
+            }
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let (page, kernel_address, window_len) =
+                self.user_page_window(address, len - copied, FaultKind::Store)?;
+            if window_len == 0 {
+                return Err(Errno::EFAULT);
+            }
+            windows[count] = Some(UserWriteWindow {
+                page,
+                address: kernel_address,
+                len: window_len,
+            });
+            copied += window_len;
+            count += 1;
+        }
+        Ok(UserWriteWindows {
+            windows,
+            count,
+            len,
+        })
+    }
+
     /// 为用户态原子 u32 访问预先解析 lazy fault 和可选的 COW。
     ///
     /// 该操作可能分配和修改页表，只能在获取 futex 等子系统自旋锁之前调用。
@@ -1716,6 +1969,65 @@ impl VmSpace {
             .load_phys_to_virt()
             .ok_or(Errno::EFAULT)?;
         Ok((Arc::clone(&page), virt_fn(page.paddr()) + offset, len))
+    }
+
+    /// 在一次 VMA/pages 快照中固定已经常驻且权限就绪的用户页。
+    ///
+    /// 缺页、栈增长和写时复制都返回 `None`，由调用方进入完整 fault 路径。该
+    /// 快路径只合并重复的锁与映射查询，不放宽权限，也不缓存可能失效的页表状态。
+    fn try_pin_resident_windows<const N: usize>(
+        &self,
+        user: usize,
+        len: usize,
+        kind: FaultKind,
+    ) -> Result<Option<ResidentUserWindows<N>>, Errno> {
+        let end = user.checked_add(len).ok_or(Errno::EFAULT)?;
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        let set = self.vmas.lock();
+        let pages = self.pages.lock();
+        let mut windows = core::array::from_fn(|_| None);
+        let mut copied = 0usize;
+        let mut count = 0usize;
+        while copied < len {
+            if count == N {
+                return Err(Errno::EFAULT);
+            }
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let Some(area) = set.find(address) else {
+                return Ok(None);
+            };
+            if !permits(area.flags, kind) || address >= end {
+                return Ok(None);
+            }
+            let page_va = page_base(address);
+            let Some(mapping) = pages.get(&page_va) else {
+                return Ok(None);
+            };
+            if is_write_fault(kind) && !mapping.access.pte_writable() {
+                return Ok(None);
+            }
+            let offset = address - page_va;
+            let window_len = (len - copied)
+                .min(page_size() - offset)
+                .min(area.range.end - address);
+            if window_len == 0 {
+                return Ok(None);
+            }
+            windows[count] = Some(ResidentUserWindow {
+                page: Arc::clone(&mapping.page),
+                address: virt_fn(mapping.page.paddr()) + offset,
+                len: window_len,
+            });
+            copied += window_len;
+            count += 1;
+        }
+        Ok(Some(ResidentUserWindows {
+            windows,
+            count,
+            len,
+        }))
     }
 
     /// 提交已在锁外读好的只读私有文件页。

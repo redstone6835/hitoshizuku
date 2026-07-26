@@ -225,6 +225,12 @@ pub(crate) fn handle_ipi() {
     let action = iocsr_read32(IOCSR_IPI_STATUS);
     if action != 0 {
         iocsr_write32(IOCSR_IPI_CLEAR, action);
+        unsafe {
+            // 发送端先发布 shootdown 序号，再经 dbar 写 IOCSR。接收端
+            // 在观察并清除 IPI 后必须建立对称顺序，否则可能读到旧序号，
+            // 同时又把已合并的同类 IPI 清掉，导致远端永久少一次确认。
+            core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+        }
     }
     if action & (IPI_TLB_SHOOTDOWN | IPI_ICACHE_SYNC) != 0 {
         handle_shootdown_requests();
@@ -278,6 +284,9 @@ pub(crate) fn handle_shootdown_requests() {
         }
         local_icache_sync();
         ICACHE_COMPLETED[logical_id].store(requested, Ordering::Release);
+        // flush 期间可能又有新 generation 到达，而 IOCSR 会把同类
+        // IPI 合并成一个位。必须重读 requested 直到稳定，不能假设
+        // 后续请求一定还会带来新的中断边沿。
     }
 }
 

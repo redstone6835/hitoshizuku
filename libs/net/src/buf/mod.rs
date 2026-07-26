@@ -5,11 +5,11 @@ mod pool;
 
 pub use packet::{
     CompletionBatch, CompletionToken, PacketBatch, PacketChain, PacketFragment, PacketRangeError,
-    RxRefillBatch, TxBatch, TxPacket,
+    RxRefillBatch, TxBatch, TxChecksum, TxPacket,
 };
 pub use pool::{
     ChunkRef, NetBufGeneration, NetBufId, NetBufLease, NetBufPool, NetBufPoolError, NetBufPoolId,
-    NetBufPoolOwner, NetBufPoolStats, NetBufStorage, PoolGeneration,
+    NetBufPoolOwner, NetBufPoolStats, NetBufStorage, PoolGeneration, SharedNetBufPool,
 };
 
 use crate::{NetDeviceId, QueuePairId};
@@ -146,8 +146,24 @@ pub struct PacketMetadata {
     pub rss_generation: u32,
     pub frame_len: u32,
     pub checksums_validated: bool,
+    pub rx_pool_pressure: RxPoolPressure,
     pub layout: PacketLayout,
     pub drop_reason: DropReason,
+}
+
+/// 报文离开 queue stage 时原 RX pool 的 replacement reserve 状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RxPoolPressure {
+    /// loopback、重组或其它不受物理 RX descriptor reserve 约束的 backing。
+    #[default]
+    Unmanaged,
+    /// 普通 reserve 不低于 queue depth 的一半，可以长期 pin 大 payload。
+    Normal,
+    /// 普通 reserve 低于高水位，必须 compact 后立即归还 DMA page。
+    Low,
+    /// reserve 已进入 descriptor 紧急区，只允许立即归还 backing 的路径。
+    Emergency,
 }
 
 /// 报文在队列之间移动时保留的逻辑布局。
@@ -221,6 +237,7 @@ impl Default for PacketMetadata {
             rss_generation: 0,
             frame_len: 0,
             checksums_validated: false,
+            rx_pool_pressure: RxPoolPressure::Unmanaged,
             layout: PacketLayout::Plain,
             drop_reason: DropReason::None,
         }

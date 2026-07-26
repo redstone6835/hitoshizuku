@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 
 use crate::arch_hooks;
@@ -50,6 +50,7 @@ static TASK_LIVE: AtomicUsize = AtomicUsize::new(0);
 static TASK_CREATED: AtomicUsize = AtomicUsize::new(0);
 static TASK_DROPPED: AtomicUsize = AtomicUsize::new(0);
 static TASK_TRACKER: Spinlock<Vec<Weak<Task>>> = Spinlock::new(Vec::new());
+const RSEQ_REGISTERED: u8 = 1 << 7;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskDiag {
@@ -265,6 +266,32 @@ pub struct TaskUsage {
     pub majflt: u64,
     pub voluntary_ctxt_switches: u64,
     pub involuntary_ctxt_switches: u64,
+}
+
+/// 当前任务正在执行的有界内核入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExecutionScopeKind {
+    Syscall = 1,
+    NetworkWorker = 2,
+}
+
+impl ExecutionScopeKind {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Syscall),
+            2 => Some(Self::NetworkWorker),
+            _ => None,
+        }
+    }
+}
+
+/// 在当前执行作用域内认领一次有界动作的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionActionClaim {
+    OutsideScope,
+    Claimed(ExecutionScopeKind),
+    AlreadyClaimed(ExecutionScopeKind),
 }
 
 impl TaskUsage {
@@ -583,6 +610,10 @@ pub struct Task {
     cpu_runtime_ns: AtomicU64,
     /// 当前连续运行区间的起点加一；零表示任务当前不占用 CPU。
     running_since_ns: AtomicU64,
+    /// syscall 与网络 worker 共享的任务级执行作用域。任务迁移后状态仍随任务保留。
+    execution_scope: AtomicU8,
+    /// 当前作用域已经认领的有界动作；每一位只允许首次认领成功。
+    execution_actions: AtomicU64,
     /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
     exited_usage_ns: AtomicU64,
     /// 当前阻塞起点、被唤醒时刻和原因；只存在于剖析构建。
@@ -600,6 +631,14 @@ pub struct Task {
     wait_generation: AtomicU64,
     #[cfg(feature = "performance-profile")]
     profile_span_id: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_object: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_correlation: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_started_ns: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_wake_kind: AtomicU8,
     /// 已被本任务 reap 的子任务 usage 累计。
     child_usage: Spinlock<TaskUsage>,
     voluntary_ctxt_switches: AtomicU64,
@@ -610,8 +649,15 @@ pub struct Task {
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
     current_cpu: AtomicUsize,
+    /// 当前仍在执行或尚未完成上下文保存的 CPU，加一编码；零表示不在 CPU 上。
+    /// 该所有权只能在切换汇编保存完全部被调用者保存寄存器后释放。
+    on_cpu: AtomicUsize,
     /// CPU、调度域、拓扑代际和迁移状态的一致调度归属快照。
     placement: TaskPlacement,
+    /// 硬 IRQ 延迟唤醒链表节点。queued 位合并同一任务的重复唤醒，额外 Arc
+    /// 在安全调度边界消费前保持任务存活。
+    deferred_wake_next: AtomicPtr<Task>,
+    deferred_wake_queued: AtomicBool,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
     /// 当前任务允许的定时器松弛量，以及 `PR_SET_TIMERSLACK(0)` 使用的默认值。
@@ -696,6 +742,8 @@ impl Task {
             start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
             cpu_runtime_ns: AtomicU64::new(0),
             running_since_ns: AtomicU64::new(0),
+            execution_scope: AtomicU8::new(0),
+            execution_actions: AtomicU64::new(0),
             exited_usage_ns: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             wait_started_ns: AtomicU64::new(0),
@@ -711,13 +759,24 @@ impl Task {
             wait_generation: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             profile_span_id: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_object: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_correlation: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_started_ns: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_wake_kind: AtomicU8::new(0),
             child_usage: Spinlock::new(TaskUsage::default()),
             voluntary_ctxt_switches: AtomicU64::new(0),
             involuntary_ctxt_switches: AtomicU64::new(0),
             sched_reset_on_fork: AtomicBool::new(false),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
+            on_cpu: AtomicUsize::new(0),
             placement: TaskPlacement::unbound(),
+            deferred_wake_next: AtomicPtr::new(core::ptr::null_mut()),
+            deferred_wake_queued: AtomicBool::new(false),
             ioprio: AtomicU32::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
@@ -749,6 +808,59 @@ impl Task {
 
     pub fn is_idle_task(&self) -> bool {
         self.kind() == TaskKind::Idle
+    }
+
+    /// 开始一个不能与本任务其它有界入口重叠的执行作用域。
+    pub fn begin_execution_scope(&self, kind: ExecutionScopeKind) -> bool {
+        if self
+            .execution_scope
+            .compare_exchange(0, kind as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.execution_actions.store(0, Ordering::Release);
+        true
+    }
+
+    /// 结束作用域并返回其中成功认领过的动作位。
+    pub fn end_execution_scope(&self, kind: ExecutionScopeKind) -> u64 {
+        let actions = self.execution_actions.swap(0, Ordering::AcqRel);
+        let previous = self.execution_scope.compare_exchange(
+            kind as u8,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(previous.is_ok(), "任务执行作用域必须由原入口结束");
+        actions
+    }
+
+    /// 原子认领当前作用域中的一个动作位。
+    pub fn claim_execution_action(&self, action: u64) -> ExecutionActionClaim {
+        assert!(action.is_power_of_two(), "执行动作必须只占一个位");
+        let Some(kind) = ExecutionScopeKind::from_raw(self.execution_scope.load(Ordering::Acquire))
+        else {
+            return ExecutionActionClaim::OutsideScope;
+        };
+        let previous = self.execution_actions.fetch_or(action, Ordering::AcqRel);
+        if previous & action == 0 {
+            ExecutionActionClaim::Claimed(kind)
+        } else {
+            ExecutionActionClaim::AlreadyClaimed(kind)
+        }
+    }
+
+    /// 查询当前作用域是否已经认领指定动作，不改变动作状态。
+    pub fn execution_action_claimed(&self, action: u64) -> bool {
+        assert!(action.is_power_of_two(), "执行动作必须只占一个位");
+        ExecutionScopeKind::from_raw(self.execution_scope.load(Ordering::Acquire)).is_some()
+            && self.execution_actions.load(Ordering::Acquire) & action != 0
+    }
+
+    /// 返回任务当前所处的有界内核入口；仅用于选择入口对应的收尾边界。
+    pub fn execution_scope_kind(&self) -> Option<ExecutionScopeKind> {
+        ExecutionScopeKind::from_raw(self.execution_scope.load(Ordering::Acquire))
     }
 
     /// 返回当前任务通过 `PR_GET_TIMERSLACK` 可见的定时器松弛量。
@@ -788,6 +900,26 @@ impl Task {
     /// 直接覆盖状态。仅供调度器内部在已经建立同步关系（持有 rq 锁或 CAS 成功）后使用。
     pub(crate) fn set_state(&self, new_state: TaskState) {
         self.state.store(new_state as u8, Ordering::Release);
+    }
+
+    /// 返回仍拥有本任务执行上下文的 CPU。即使任务已经进入 Runnable，保存动作
+    /// 完成前也必须继续报告 Some，防止另一 CPU 提前恢复同一份上下文。
+    pub fn running_cpu(&self) -> Option<usize> {
+        self.on_cpu.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    pub(crate) fn try_claim_cpu(&self, cpu_id: usize) -> bool {
+        let encoded = cpu_id
+            .checked_add(1)
+            .expect("[sched][task] cpu id encoding overflow");
+        self.on_cpu
+            .compare_exchange(0, encoded, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// 供架构上下文切换汇编在保存完寄存器后执行 release store。
+    pub(crate) fn on_cpu_slot(&self) -> NonNull<AtomicUsize> {
+        NonNull::from(&self.on_cpu)
     }
 
     /// CAS 状态，成功时返回 `true`。用于 wakeup 路径无锁切换。
@@ -1101,8 +1233,13 @@ impl Task {
     /// 但内核栈和 arch context 已不再需要，继续挂在 Task 上会让父进程 wait 前
     /// 每个 zombie 至少保留一段内核栈。
     pub(crate) fn retire_execution(&self) {
-        *self.ctx.lock() = None;
-        *self.kstack.lock() = None;
+        let ctx = self.ctx.lock().take();
+        let kstack = self.kstack.lock().take();
+
+        // 内核栈析构会解除堆映射并发起跨核 TLB 同步，不能在持有
+        // Task 自旋锁时执行，否则其它 CPU 可能因回收同一任务而无法响应同步。
+        drop(ctx);
+        drop(kstack);
     }
 
     /// 释放退出任务不再需要的上层扩展状态。
@@ -1289,19 +1426,31 @@ impl Task {
     }
 
     pub fn set_rseq_registration(&self, registration: RseqRegistration) {
-        self.rseq_events.store(0, Ordering::Release);
         self.rseq_cpu.store(usize::MAX, Ordering::Release);
         *self.rseq.lock() = registration;
+        self.rseq_events.store(
+            if registration.registered {
+                RSEQ_REGISTERED
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
     }
 
     pub fn clear_rseq_registration(&self) {
-        *self.rseq.lock() = RseqRegistration::default();
         self.rseq_events.store(0, Ordering::Release);
+        *self.rseq.lock() = RseqRegistration::default();
         self.rseq_cpu.store(usize::MAX, Ordering::Release);
     }
 
+    #[inline]
+    pub fn rseq_registered(&self) -> bool {
+        self.rseq_events.load(Ordering::Acquire) & RSEQ_REGISTERED != 0
+    }
+
     pub fn mark_rseq_event(&self, event: RseqEvent) {
-        if self.rseq_registration().registered {
+        if self.rseq_registered() {
             self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
         }
     }
@@ -1315,7 +1464,7 @@ impl Task {
     }
 
     pub fn publish_rseq_cpu(&self, cpu_id: usize) {
-        if !self.rseq_registration().registered {
+        if !self.rseq_registered() {
             return;
         }
         let previous = self.rseq_cpu.swap(cpu_id, Ordering::AcqRel);
@@ -1400,6 +1549,27 @@ impl Task {
                     now_ns.saturating_sub(encoded - 1),
                 );
             }
+            let correlation = self.profile_wake_correlation.swap(0, Ordering::AcqRel);
+            if correlation != 0 {
+                let object = self.profile_wake_object.swap(0, Ordering::AcqRel);
+                let started = self.profile_wake_started_ns.swap(0, Ordering::AcqRel);
+                let event = if self.profile_wake_kind.swap(0, Ordering::AcqRel) == 2 {
+                    profiling::Event::NetWriterRun
+                } else {
+                    profiling::Event::NetReceiverRun
+                };
+                if started != 0 {
+                    profiling::record_duration(event, now_ns.saturating_sub(started - 1));
+                }
+                profiling::trace_task_event_with_span(
+                    profiling::TraceKind::Point,
+                    event,
+                    self.pid_root_cached().unwrap_or(0) as u64,
+                    self.profile_span_id(),
+                    object,
+                    correlation,
+                );
+            }
         }
     }
 
@@ -1426,6 +1596,10 @@ impl Task {
             self.wait_trace_emitted.store(false, Ordering::Release);
             self.wait_generation
                 .store(profiling::generation(), Ordering::Release);
+            self.profile_wake_object.store(0, Ordering::Release);
+            self.profile_wake_correlation.store(0, Ordering::Release);
+            self.profile_wake_started_ns.store(0, Ordering::Release);
+            self.profile_wake_kind.store(0, Ordering::Release);
             self.wakeup_ns.store(0, Ordering::Release);
             self.wait_started_ns
                 .store(now_ns.saturating_add(1), Ordering::Release);
@@ -1456,6 +1630,21 @@ impl Task {
     #[cfg(feature = "performance-profile")]
     pub fn set_profile_span_id(&self, span_id: u64) {
         self.profile_span_id.store(span_id, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn set_profile_wake_cause(&self, kind: u8, object: u64, correlation: u64, now_ns: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.profile_wake_kind.store(kind, Ordering::Relaxed);
+            self.profile_wake_object.store(object, Ordering::Relaxed);
+            self.profile_wake_started_ns
+                .store(now_ns.saturating_add(1), Ordering::Relaxed);
+            self.profile_wake_correlation
+                .store(correlation, Ordering::Release);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = (kind, object, correlation, now_ns);
     }
 
     #[inline]
@@ -1657,6 +1846,25 @@ impl Task {
         self.placement.snapshot()
     }
 
+    pub(crate) fn try_begin_deferred_wake(&self) -> bool {
+        self.deferred_wake_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn set_deferred_wake_next(&self, next: *mut Task) {
+        self.deferred_wake_next.store(next, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_deferred_wake_next(&self) -> *mut Task {
+        self.deferred_wake_next
+            .swap(core::ptr::null_mut(), Ordering::Relaxed)
+    }
+
+    pub(crate) fn finish_deferred_wake(&self) {
+        self.deferred_wake_queued.store(false, Ordering::Release);
+    }
+
     pub(crate) fn bind_placement(
         &self,
         cpu: crate::CpuId,
@@ -1751,6 +1959,23 @@ impl Task {
             .iter()
             .find(|e| e.key == key)
             .map(|e| Arc::clone(&e.payload))
+    }
+
+    /// 在扩展槽的借用期内访问 payload，避免只读热路径反复增减 Arc 引用计数。
+    pub fn ext_with<R>(
+        &self,
+        key: TaskExtKey,
+        visit: impl FnOnce(&(dyn Any + Send + Sync)) -> R,
+    ) -> Option<R> {
+        if let Some(slot) = self.hot_ext.slot(key) {
+            let guard = slot.lock();
+            return guard.as_deref().map(visit);
+        }
+        let guard = self.ext.lock();
+        guard
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| visit(entry.payload.as_ref()))
     }
 
     /// 移除并返回某个子系统状态。

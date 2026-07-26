@@ -24,8 +24,8 @@ use crate::stack::{
     NET_STACK_TCP_OPTION_SACK_PERMITTED, NET_STACK_TCP_OPTION_TIMESTAMP,
     NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP, NET_STACK_TRANSPORT_ICMP,
     NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED, NET_STACK_TRANSPORT_TCP,
-    NET_STACK_TRANSPORT_UDP, NetStackEthernetV1, NetStackNetworkV1, NetStackTcpOptionsV1,
-    NetStackTransportV1,
+    NET_STACK_TRANSPORT_UDP, NetStackEthernet, NetStackNetwork, NetStackTcpOptions,
+    NetStackTransport,
 };
 #[cfg(test)]
 use crate::transport::{TCP_PROTOCOL_NUMBER, parse_tcp_packet, parse_tcp_packet_trusted};
@@ -273,9 +273,9 @@ impl VectorFrontend {
     pub fn process_with_stack_sidecars(
         &self,
         input: &mut PacketBatch,
-        ethernet: &[NetStackEthernetV1],
-        network: &[NetStackNetworkV1],
-        transport: &[NetStackTransportV1],
+        ethernet: &[NetStackEthernet],
+        network: &[NetStackNetwork],
+        transport: &[NetStackTransport],
         output: &mut FrontendBatch,
     ) {
         assert_eq!(input.len(), ethernet.len());
@@ -528,7 +528,7 @@ impl VectorFrontend {
     }
 }
 
-fn apply_transport_sidecar(packet: &mut FrontendPacket, sidecar: NetStackTransportV1) {
+fn apply_transport_sidecar(packet: &mut FrontendPacket, sidecar: NetStackTransport) {
     match sidecar.outcome {
         NET_STACK_TRANSPORT_SKIPPED => {}
         NET_STACK_TRANSPORT_DROP => set_drop(packet, transport_drop_reason(sidecar.drop_reason)),
@@ -606,7 +606,7 @@ fn apply_transport_sidecar(packet: &mut FrontendPacket, sidecar: NetStackTranspo
     }
 }
 
-fn tcp_options(sidecar: NetStackTcpOptionsV1) -> TcpOptions {
+fn tcp_options(sidecar: NetStackTcpOptions) -> TcpOptions {
     let mut sack_blocks = [None; 4];
     for (index, block) in sack_blocks
         .iter_mut()
@@ -632,7 +632,7 @@ fn tcp_options(sidecar: NetStackTcpOptionsV1) -> TcpOptions {
     }
 }
 
-fn apply_network_sidecar(packet: &mut FrontendPacket, sidecar: NetStackNetworkV1) {
+fn apply_network_sidecar(packet: &mut FrontendPacket, sidecar: NetStackNetwork) {
     match sidecar.outcome {
         NET_STACK_NETWORK_SKIPPED => {}
         NET_STACK_NETWORK_DROP => set_drop(packet, network_drop_reason(sidecar.drop_reason)),
@@ -1099,6 +1099,37 @@ pub fn transport_checksum(
     Ok(checksum.finish())
 }
 
+/// 生成 CHECKSUM_PARTIAL 字段中预置的 pseudo-header 累加值。
+///
+/// 设备随后从 transport header 起累加至报文末尾并写回反码；这里返回的是未取反的
+/// folded sum，因此不会扫描 payload。
+pub fn partial_transport_checksum(
+    source: IpAddr,
+    destination: IpAddr,
+    len: usize,
+    protocol: u8,
+) -> Result<u16, NetBufPoolError> {
+    let mut checksum = InternetChecksum::new();
+    match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            let len = u16::try_from(len).map_err(|_| NetBufPoolError::InvalidRange)?;
+            checksum.add(&source.0);
+            checksum.add(&destination.0);
+            checksum.add(&[0, protocol]);
+            checksum.add(&len.to_be_bytes());
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            let len = u32::try_from(len).map_err(|_| NetBufPoolError::InvalidRange)?;
+            checksum.add(&source.0);
+            checksum.add(&destination.0);
+            checksum.add(&len.to_be_bytes());
+            checksum.add(&[0, 0, 0, protocol]);
+        }
+        _ => return Err(NetBufPoolError::InvalidRange),
+    }
+    Ok(!checksum.finish())
+}
+
 fn checksum_packet(
     chain: &PacketChain,
     offset: usize,
@@ -1215,6 +1246,49 @@ mod tests {
                 checksum.add(&bytes[split..len]);
                 assert_eq!(checksum.finish(), reference_checksum(&bytes[..len]));
             }
+        }
+    }
+
+    #[test]
+    fn partial_checksum_seed_matches_full_transport_checksum() {
+        let cases = [
+            (
+                IpAddr::V4(crate::Ipv4Addr::new(10, 0, 2, 15)),
+                IpAddr::V4(crate::Ipv4Addr::new(10, 0, 2, 2)),
+            ),
+            (
+                IpAddr::V6(crate::Ipv6Addr::LOCALHOST),
+                IpAddr::V6(crate::Ipv6Addr([
+                    0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ])),
+            ),
+        ];
+        for (source, destination) in cases {
+            let mut transport = alloc::vec![0u8; 8 + 257];
+            let transport_len = transport.len() as u16;
+            transport[0..2].copy_from_slice(&1000u16.to_be_bytes());
+            transport[2..4].copy_from_slice(&9000u16.to_be_bytes());
+            transport[4..6].copy_from_slice(&transport_len.to_be_bytes());
+            for (index, byte) in transport[8..].iter_mut().enumerate() {
+                *byte = index.wrapping_mul(17) as u8;
+            }
+            let seed = partial_transport_checksum(source, destination, transport.len(), 17)
+                .expect("地址族匹配");
+            transport[6..8].copy_from_slice(&seed.to_be_bytes());
+            let device_checksum = checksum_bytes(&transport);
+            transport[6..8].copy_from_slice(
+                &(if device_checksum == 0 {
+                    0xffff
+                } else {
+                    device_checksum
+                })
+                .to_be_bytes(),
+            );
+            let chain = PacketChain::from_owned(transport);
+            assert_eq!(
+                transport_checksum(&chain, 0, chain.total_len(), source, destination, 17),
+                Ok(0)
+            );
         }
     }
     use core::ptr::NonNull;
@@ -1413,7 +1487,7 @@ mod tests {
                 },
             )
             .unwrap_or_else(|_| unreachable!());
-        let ethernet = NetStackEthernetV1 {
+        let ethernet = NetStackEthernet {
             destination: [2; 6],
             source: [1; 6],
             ethertype: ETHERTYPE_IPV4,
@@ -1424,7 +1498,7 @@ mod tests {
         source[..4].copy_from_slice(&[10, 0, 2, 2]);
         let mut destination = [0; 16];
         destination[..4].copy_from_slice(&[10, 0, 2, 15]);
-        let network = NetStackNetworkV1 {
+        let network = NetStackNetwork {
             outcome: NET_STACK_NETWORK_IP,
             family: NET_STACK_ADDRESS_FAMILY_IPV4,
             next_header: IP_PROTOCOL_UDP,
@@ -1446,7 +1520,7 @@ mod tests {
             arp_target_mac: [0; 6],
             reserved1: [0; 8],
         };
-        let transport = NetStackTransportV1 {
+        let transport = NetStackTransport {
             outcome: NET_STACK_TRANSPORT_UDP,
             protocol: IP_PROTOCOL_UDP,
             drop_reason: 0,
@@ -1463,7 +1537,7 @@ mod tests {
             rss_hash: 123,
             tcp_sequence: 0,
             tcp_acknowledgement: 0,
-            tcp_options: NetStackTcpOptionsV1::empty(),
+            tcp_options: NetStackTcpOptions::empty(),
             reserved2: [0; 2],
         };
         let mut output = FrontendBatch::new();
@@ -1494,7 +1568,7 @@ mod tests {
         input
             .push(PacketChain::from_owned(frame), PacketMetadata::default())
             .unwrap_or_else(|_| unreachable!());
-        let ethernet = NetStackEthernetV1 {
+        let ethernet = NetStackEthernet {
             destination: [2; 6],
             source: [1; 6],
             ethertype: ETHERTYPE_IPV4,
@@ -1505,7 +1579,7 @@ mod tests {
         source[..4].copy_from_slice(&[10, 0, 2, 2]);
         let mut destination = [0; 16];
         destination[..4].copy_from_slice(&[10, 0, 2, 15]);
-        let network = NetStackNetworkV1 {
+        let network = NetStackNetwork {
             outcome: NET_STACK_NETWORK_IP,
             family: NET_STACK_ADDRESS_FAMILY_IPV4,
             next_header: TCP_PROTOCOL_NUMBER,
@@ -1527,7 +1601,7 @@ mod tests {
             arp_target_mac: [0; 6],
             reserved1: [0; 8],
         };
-        let transport = NetStackTransportV1 {
+        let transport = NetStackTransport {
             outcome: NET_STACK_TRANSPORT_TCP,
             protocol: TCP_PROTOCOL_NUMBER,
             source_port: 1000,
@@ -1539,12 +1613,12 @@ mod tests {
             payload_len: 0,
             rss_hash: 456,
             tcp_sequence: 123,
-            tcp_options: NetStackTcpOptionsV1 {
+            tcp_options: NetStackTcpOptions {
                 flags: NET_STACK_TCP_OPTION_MSS,
                 maximum_segment_size: 1460,
-                ..NetStackTcpOptionsV1::empty()
+                ..NetStackTcpOptions::empty()
             },
-            ..NetStackTransportV1::empty()
+            ..NetStackTransport::empty()
         };
         assert!(transport.valid(58, &network));
 

@@ -12,7 +12,7 @@ pub const MIXED_CPU: usize = MAX_CPUS;
 pub const CPU_SLOTS: usize = MAX_CPUS + 1;
 pub const HISTOGRAM_BUCKETS: usize = 64;
 pub const SAMPLE_SLOTS: usize = 4096;
-pub const TRACE_SLOTS_PER_CPU: usize = 1024;
+pub const TRACE_SLOTS_PER_CPU: usize = 16384;
 pub const TRACE_RECORD_BYTES: usize = 80;
 pub const TRACE_FORMAT_VERSION: usize = 2;
 const SAMPLE_PROBES: usize = 16;
@@ -84,6 +84,13 @@ pub enum Event {
     WaitOther,
     WakeupLatency,
     SyscallDispatch,
+    SyscallInvoke,
+    SyscallFinalize,
+    SyscallHandoff,
+    SysUdpLookup,
+    SysUdpWait,
+    SysUdpPin,
+    SysUdpConsume,
     VfsRead,
     VfsWrite,
     PageFault,
@@ -92,6 +99,15 @@ pub enum Event {
     BlockDrain,
     BlockComplete,
     BlockWait,
+    NetStackLocalTurn,
+    NetPeerRx,
+    NetReceiverRun,
+    NetTcpSequence,
+    NetTcpReceiveSequence,
+    NetTcpWindow,
+    NetTxWritable,
+    NetWriterRun,
+    NetStackRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,7 +138,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 49] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -148,6 +164,13 @@ impl Event {
         Self::WaitOther,
         Self::WakeupLatency,
         Self::SyscallDispatch,
+        Self::SyscallInvoke,
+        Self::SyscallFinalize,
+        Self::SyscallHandoff,
+        Self::SysUdpLookup,
+        Self::SysUdpWait,
+        Self::SysUdpPin,
+        Self::SysUdpConsume,
         Self::VfsRead,
         Self::VfsWrite,
         Self::PageFault,
@@ -156,6 +179,15 @@ impl Event {
         Self::BlockDrain,
         Self::BlockComplete,
         Self::BlockWait,
+        Self::NetStackLocalTurn,
+        Self::NetPeerRx,
+        Self::NetReceiverRun,
+        Self::NetTcpSequence,
+        Self::NetTcpReceiveSequence,
+        Self::NetTcpWindow,
+        Self::NetTxWritable,
+        Self::NetWriterRun,
+        Self::NetStackRequest,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -185,6 +217,13 @@ impl Event {
             Self::WaitOther => "wait_other",
             Self::WakeupLatency => "wakeup_latency",
             Self::SyscallDispatch => "syscall_dispatch",
+            Self::SyscallInvoke => "syscall_invoke",
+            Self::SyscallFinalize => "syscall_finalize",
+            Self::SyscallHandoff => "syscall_handoff",
+            Self::SysUdpLookup => "sys_udp_lookup",
+            Self::SysUdpWait => "sys_udp_wait",
+            Self::SysUdpPin => "sys_udp_pin",
+            Self::SysUdpConsume => "sys_udp_consume",
             Self::VfsRead => "vfs_read",
             Self::VfsWrite => "vfs_write",
             Self::PageFault => "page_fault",
@@ -193,6 +232,15 @@ impl Event {
             Self::BlockDrain => "block_drain",
             Self::BlockComplete => "block_complete",
             Self::BlockWait => "block_wait",
+            Self::NetStackLocalTurn => "net_stack_local_turn",
+            Self::NetPeerRx => "net_peer_rx",
+            Self::NetReceiverRun => "net_receiver_run",
+            Self::NetTcpSequence => "net_tcp_sequence",
+            Self::NetTcpReceiveSequence => "net_tcp_receive_sequence",
+            Self::NetTcpWindow => "net_tcp_window",
+            Self::NetTxWritable => "net_tx_writable",
+            Self::NetWriterRun => "net_writer_run",
+            Self::NetStackRequest => "net_stack_request",
         }
     }
 
@@ -210,7 +258,14 @@ impl Event {
             | Self::SysSendSocket
             | Self::SysRecvSocket
             | Self::SysRecvCopy
-            | Self::SyscallDispatch => EventCategory::Syscall,
+            | Self::SyscallDispatch
+            | Self::SyscallInvoke
+            | Self::SyscallFinalize
+            | Self::SyscallHandoff
+            | Self::SysUdpLookup
+            | Self::SysUdpWait
+            | Self::SysUdpPin
+            | Self::SysUdpConsume => EventCategory::Syscall,
             Self::NetProtocolTurn
             | Self::NetProtocolIngress
             | Self::NetTcpOutput
@@ -236,6 +291,15 @@ impl Event {
             Self::BlockSubmit | Self::BlockDrain | Self::BlockComplete | Self::BlockWait => {
                 EventCategory::Block
             }
+            Self::NetStackLocalTurn
+            | Self::NetPeerRx
+            | Self::NetReceiverRun
+            | Self::NetTcpSequence
+            | Self::NetTcpReceiveSequence
+            | Self::NetTcpWindow
+            | Self::NetTxWritable
+            | Self::NetWriterRun
+            | Self::NetStackRequest => EventCategory::Network,
         }
     }
 }
@@ -248,15 +312,17 @@ pub enum TraceKind {
     TaskBlock = 2,
     TaskWake = 3,
     TaskSpawn = 4,
+    Point = 5,
 }
 
 impl TraceKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scope,
         Self::SchedSwitch,
         Self::TaskBlock,
         Self::TaskWake,
         Self::TaskSpawn,
+        Self::Point,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -266,6 +332,7 @@ impl TraceKind {
             Self::TaskBlock => "task_block",
             Self::TaskWake => "task_wake",
             Self::TaskSpawn => "task_spawn",
+            Self::Point => "point",
         }
     }
 
@@ -276,6 +343,7 @@ impl TraceKind {
             2 => Some(Self::TaskBlock),
             3 => Some(Self::TaskWake),
             4 => Some(Self::TaskSpawn),
+            5 => Some(Self::Point),
             _ => None,
         }
     }
@@ -317,10 +385,146 @@ pub enum Metric {
     SocketEmptyWakeup,
     PayloadCopyBytes,
     PayloadCopyCycles,
+    NetStackWorkerCalls,
+    NetStackSyscallCalls,
+    NetStackDuplicateRequests,
+    NetStackUnscopedCalls,
+    NetStackCooperativeFallbacks,
+    NetStackCooperativeDataCalls,
+    NetStackCooperativeStateCalls,
+    NetStackCooperativeDataCycles,
+    NetStackCooperativeStateCycles,
+    PinnedCallPrepareCycles,
+    PinnedCallExecutionCycles,
+    PinnedCallCompleteCycles,
+    PinnedAccountingBeginCycles,
+    PinnedGuardEnterCycles,
+    PinnedContextEnterCycles,
+    PinnedNativeGateCycles,
+    PinnedNativeBodyCycles,
+    PinnedAccountingFinishCycles,
+    RxRingFullRejects,
+    RxRingFullDurationNs,
+    NetStackFallbackNested,
+    NetStackFallbackCallBudget,
+    NetStackFallbackOwner,
+    NetStackFallbackGeneration,
+    NetStackFallbackUnavailable,
+    NetStackFallbackNonLoopback,
+    NetStackFallbackTxPool,
+    NetStackFallbackScratch,
+    NetStackFallbackElmBusy,
+    NetStackFallbackElmFailed,
+    NetStackFallbackResult,
+    TcpSendAllowance,
+    TcpFlightBytes,
+    TcpPeerWindow,
+    TcpCongestionWindow,
+    TcpUnacknowledgedSegments,
+    TcpRetransmittedSegments,
+    TcpStreamUnsentBytes,
+    TcpBytesSent,
+    TcpBytesReceived,
+    NetStackDuplicateSyscall,
+    NetStackDuplicateWorker,
+    TcpTxNotifyPayload,
+    TcpTxNotifyState,
+    TcpTxNotifyDrainRecheck,
+    TcpTxWorkerContinuation,
+    NetStackFallbackDatagram,
+    NetStackFallbackTcpPayload,
+    NetStackFallbackTcpState,
+    NetStackFallbackDrainRecheck,
+    TcpSendBlockedBufferLimit,
+    TcpSendBlockedPool,
+    TcpSendPartialCapacity,
+    TcpLocalEffectAttempts,
+    TcpLocalEffectDeliveries,
+    TcpLocalEffectBytes,
+    TcpLocalPeerHintHits,
+    TcpLocalPeerHintMisses,
+    TcpLocalPeerHintInvalid,
+    TcpLocalEffectReceiveWindow,
+    TcpLocalEffectWindowRejects,
+    TcpLocalEffectRingRejects,
+    TcpLocalEffectBatchDeliveries,
+    TcpLocalEffectBatchBytes,
+    TcpLocalEffectCycles,
+    TcpLocalEffectLookupCycles,
+    TcpLocalEffectCommitCycles,
+    TcpLocalEffectAckCycles,
+    TcpLocalTurnProcessed,
+    TcpLocalTurnMoreWork,
+    TcpLocalRxBufferedBytes,
+    TcpLocalRxAvailableBytes,
+    TcpLocalHandoffFlush,
+    TcpLocalHandoffBatch,
+    TcpLocalHandoffPressure,
+    TcpReceiveWindowNotifications,
+    TcpUserSendPinCycles,
+    TcpUserSendPinnedWindows,
+    TcpUserReceivePinCycles,
+    TcpUserReceivePinnedWindows,
+    TcpLocalDirectAttempts,
+    TcpLocalDirectPolicyRejects,
+    TcpLocalDirectRouteMisses,
+    TcpLocalDirectWindowBlocks,
+    TcpLocalDirectDeliveries,
+    TcpLocalDirectBytes,
+    TcpLocalDirectCycles,
+    TcpLocalDirectReconcileBytes,
+    TcpLocalDirectReconcileCycles,
+    NetWorkerQueueCycles,
+    NetWorkerDispatchCycles,
+    NetWorkerIngressCycles,
+    NetWorkerProtocolCycles,
+    NetWorkerFinishCycles,
+    UdpUserPinCycles,
+    UdpUserPinnedWindows,
+    UdpUserCopyCycles,
+    UdpLocalRouteInstalls,
+    UdpLocalRouteMatches,
+    UdpLocalRouteDeliveries,
+    UdpLocalRouteInvalid,
+    UdpLocalRouteAbsent,
+    UdpLocalRouteReceiverRejects,
+    UdpLocalFallbackDatagrams,
+    UdpLocalDirectBytes,
+    UdpLocalDirectCycles,
+    UdpUserWritePinCycles,
+    UdpUserWritePinnedWindows,
+    UdpLocalDirectReceives,
+    UdpLocalDirectReceiveBytes,
+    UdpLocalDirectReceiveCycles,
+    UdpLocalReceiveCopyCycles,
+    UdpLocalReceivePopCycles,
+    UdpLocalReceiveReadinessCycles,
+    UdpLocalSendPublishCycles,
+    UdpLocalSharedReferences,
+    UdpLocalFanoutReceivers,
+    UdpLocalFanoutDrops,
+    UdpLocalSuppressedDatagrams,
+    SchedTimerCycles,
+    SchedPickCycles,
+    SchedPrepareCycles,
+    SchedContextCycles,
+    SchedPrepareAccountingCycles,
+    SchedPreparePublishCycles,
+    SchedPrepareVmCycles,
+    SchedPrepareCpuStateCycles,
+    SyscallReturnFast,
+    SyscallReturnFull,
+    SyscallReturnAfterSwitch,
+    SyscallReturnFpuRestore,
+    SyscallReturnVectorRestore,
+    UdpLocalConsumerTargets,
+    UdpLocalConsumerHandoffs,
+    TcpLocalConsumerTargets,
+    TcpLocalConsumerHandoffs,
 }
 
 impl Metric {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 146] = [
         Self::UdpTxQueueDepth,
         Self::IngressRingDepth,
         Self::DirtyDrainSockets,
@@ -331,6 +535,142 @@ impl Metric {
         Self::SocketEmptyWakeup,
         Self::PayloadCopyBytes,
         Self::PayloadCopyCycles,
+        Self::NetStackWorkerCalls,
+        Self::NetStackSyscallCalls,
+        Self::NetStackDuplicateRequests,
+        Self::NetStackUnscopedCalls,
+        Self::NetStackCooperativeFallbacks,
+        Self::NetStackCooperativeDataCalls,
+        Self::NetStackCooperativeStateCalls,
+        Self::NetStackCooperativeDataCycles,
+        Self::NetStackCooperativeStateCycles,
+        Self::PinnedCallPrepareCycles,
+        Self::PinnedCallExecutionCycles,
+        Self::PinnedCallCompleteCycles,
+        Self::PinnedAccountingBeginCycles,
+        Self::PinnedGuardEnterCycles,
+        Self::PinnedContextEnterCycles,
+        Self::PinnedNativeGateCycles,
+        Self::PinnedNativeBodyCycles,
+        Self::PinnedAccountingFinishCycles,
+        Self::RxRingFullRejects,
+        Self::RxRingFullDurationNs,
+        Self::NetStackFallbackNested,
+        Self::NetStackFallbackCallBudget,
+        Self::NetStackFallbackOwner,
+        Self::NetStackFallbackGeneration,
+        Self::NetStackFallbackUnavailable,
+        Self::NetStackFallbackNonLoopback,
+        Self::NetStackFallbackTxPool,
+        Self::NetStackFallbackScratch,
+        Self::NetStackFallbackElmBusy,
+        Self::NetStackFallbackElmFailed,
+        Self::NetStackFallbackResult,
+        Self::TcpSendAllowance,
+        Self::TcpFlightBytes,
+        Self::TcpPeerWindow,
+        Self::TcpCongestionWindow,
+        Self::TcpUnacknowledgedSegments,
+        Self::TcpRetransmittedSegments,
+        Self::TcpStreamUnsentBytes,
+        Self::TcpBytesSent,
+        Self::TcpBytesReceived,
+        Self::NetStackDuplicateSyscall,
+        Self::NetStackDuplicateWorker,
+        Self::TcpTxNotifyPayload,
+        Self::TcpTxNotifyState,
+        Self::TcpTxNotifyDrainRecheck,
+        Self::TcpTxWorkerContinuation,
+        Self::NetStackFallbackDatagram,
+        Self::NetStackFallbackTcpPayload,
+        Self::NetStackFallbackTcpState,
+        Self::NetStackFallbackDrainRecheck,
+        Self::TcpSendBlockedBufferLimit,
+        Self::TcpSendBlockedPool,
+        Self::TcpSendPartialCapacity,
+        Self::TcpLocalEffectAttempts,
+        Self::TcpLocalEffectDeliveries,
+        Self::TcpLocalEffectBytes,
+        Self::TcpLocalPeerHintHits,
+        Self::TcpLocalPeerHintMisses,
+        Self::TcpLocalPeerHintInvalid,
+        Self::TcpLocalEffectReceiveWindow,
+        Self::TcpLocalEffectWindowRejects,
+        Self::TcpLocalEffectRingRejects,
+        Self::TcpLocalEffectBatchDeliveries,
+        Self::TcpLocalEffectBatchBytes,
+        Self::TcpLocalEffectCycles,
+        Self::TcpLocalEffectLookupCycles,
+        Self::TcpLocalEffectCommitCycles,
+        Self::TcpLocalEffectAckCycles,
+        Self::TcpLocalTurnProcessed,
+        Self::TcpLocalTurnMoreWork,
+        Self::TcpLocalRxBufferedBytes,
+        Self::TcpLocalRxAvailableBytes,
+        Self::TcpLocalHandoffFlush,
+        Self::TcpLocalHandoffBatch,
+        Self::TcpLocalHandoffPressure,
+        Self::TcpReceiveWindowNotifications,
+        Self::TcpUserSendPinCycles,
+        Self::TcpUserSendPinnedWindows,
+        Self::TcpUserReceivePinCycles,
+        Self::TcpUserReceivePinnedWindows,
+        Self::TcpLocalDirectAttempts,
+        Self::TcpLocalDirectPolicyRejects,
+        Self::TcpLocalDirectRouteMisses,
+        Self::TcpLocalDirectWindowBlocks,
+        Self::TcpLocalDirectDeliveries,
+        Self::TcpLocalDirectBytes,
+        Self::TcpLocalDirectCycles,
+        Self::TcpLocalDirectReconcileBytes,
+        Self::TcpLocalDirectReconcileCycles,
+        Self::NetWorkerQueueCycles,
+        Self::NetWorkerDispatchCycles,
+        Self::NetWorkerIngressCycles,
+        Self::NetWorkerProtocolCycles,
+        Self::NetWorkerFinishCycles,
+        Self::UdpUserPinCycles,
+        Self::UdpUserPinnedWindows,
+        Self::UdpUserCopyCycles,
+        Self::UdpLocalRouteInstalls,
+        Self::UdpLocalRouteMatches,
+        Self::UdpLocalRouteDeliveries,
+        Self::UdpLocalRouteInvalid,
+        Self::UdpLocalRouteAbsent,
+        Self::UdpLocalRouteReceiverRejects,
+        Self::UdpLocalFallbackDatagrams,
+        Self::UdpLocalDirectBytes,
+        Self::UdpLocalDirectCycles,
+        Self::UdpUserWritePinCycles,
+        Self::UdpUserWritePinnedWindows,
+        Self::UdpLocalDirectReceives,
+        Self::UdpLocalDirectReceiveBytes,
+        Self::UdpLocalDirectReceiveCycles,
+        Self::UdpLocalReceiveCopyCycles,
+        Self::UdpLocalReceivePopCycles,
+        Self::UdpLocalReceiveReadinessCycles,
+        Self::UdpLocalSendPublishCycles,
+        Self::UdpLocalSharedReferences,
+        Self::UdpLocalFanoutReceivers,
+        Self::UdpLocalFanoutDrops,
+        Self::UdpLocalSuppressedDatagrams,
+        Self::SchedTimerCycles,
+        Self::SchedPickCycles,
+        Self::SchedPrepareCycles,
+        Self::SchedContextCycles,
+        Self::SchedPrepareAccountingCycles,
+        Self::SchedPreparePublishCycles,
+        Self::SchedPrepareVmCycles,
+        Self::SchedPrepareCpuStateCycles,
+        Self::SyscallReturnFast,
+        Self::SyscallReturnFull,
+        Self::SyscallReturnAfterSwitch,
+        Self::SyscallReturnFpuRestore,
+        Self::SyscallReturnVectorRestore,
+        Self::UdpLocalConsumerTargets,
+        Self::UdpLocalConsumerHandoffs,
+        Self::TcpLocalConsumerTargets,
+        Self::TcpLocalConsumerHandoffs,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -345,6 +685,142 @@ impl Metric {
             Self::SocketEmptyWakeup => "socket_empty_wakeup",
             Self::PayloadCopyBytes => "payload_copy_bytes",
             Self::PayloadCopyCycles => "payload_copy_cycles",
+            Self::NetStackWorkerCalls => "net_stack_worker_calls",
+            Self::NetStackSyscallCalls => "net_stack_syscall_calls",
+            Self::NetStackDuplicateRequests => "net_stack_duplicate_requests",
+            Self::NetStackUnscopedCalls => "net_stack_unscoped_calls",
+            Self::NetStackCooperativeFallbacks => "net_stack_cooperative_fallbacks",
+            Self::NetStackCooperativeDataCalls => "net_stack_cooperative_data_calls",
+            Self::NetStackCooperativeStateCalls => "net_stack_cooperative_state_calls",
+            Self::NetStackCooperativeDataCycles => "net_stack_cooperative_data_cycles",
+            Self::NetStackCooperativeStateCycles => "net_stack_cooperative_state_cycles",
+            Self::PinnedCallPrepareCycles => "pinned_call_prepare_cycles",
+            Self::PinnedCallExecutionCycles => "pinned_call_execution_cycles",
+            Self::PinnedCallCompleteCycles => "pinned_call_complete_cycles",
+            Self::PinnedAccountingBeginCycles => "pinned_accounting_begin_cycles",
+            Self::PinnedGuardEnterCycles => "pinned_guard_enter_cycles",
+            Self::PinnedContextEnterCycles => "pinned_context_enter_cycles",
+            Self::PinnedNativeGateCycles => "pinned_native_gate_cycles",
+            Self::PinnedNativeBodyCycles => "pinned_native_body_cycles",
+            Self::PinnedAccountingFinishCycles => "pinned_accounting_finish_cycles",
+            Self::RxRingFullRejects => "rx_ring_full_rejects",
+            Self::RxRingFullDurationNs => "rx_ring_full_duration_ns",
+            Self::NetStackFallbackNested => "net_stack_fallback_nested",
+            Self::NetStackFallbackCallBudget => "net_stack_fallback_call_budget",
+            Self::NetStackFallbackOwner => "net_stack_fallback_owner",
+            Self::NetStackFallbackGeneration => "net_stack_fallback_generation",
+            Self::NetStackFallbackUnavailable => "net_stack_fallback_unavailable",
+            Self::NetStackFallbackNonLoopback => "net_stack_fallback_non_loopback",
+            Self::NetStackFallbackTxPool => "net_stack_fallback_tx_pool",
+            Self::NetStackFallbackScratch => "net_stack_fallback_scratch",
+            Self::NetStackFallbackElmBusy => "net_stack_fallback_elm_busy",
+            Self::NetStackFallbackElmFailed => "net_stack_fallback_elm_failed",
+            Self::NetStackFallbackResult => "net_stack_fallback_result",
+            Self::TcpSendAllowance => "tcp_send_allowance",
+            Self::TcpFlightBytes => "tcp_flight_bytes",
+            Self::TcpPeerWindow => "tcp_peer_window",
+            Self::TcpCongestionWindow => "tcp_congestion_window",
+            Self::TcpUnacknowledgedSegments => "tcp_unacknowledged_segments",
+            Self::TcpRetransmittedSegments => "tcp_retransmitted_segments",
+            Self::TcpStreamUnsentBytes => "tcp_stream_unsent_bytes",
+            Self::TcpBytesSent => "tcp_bytes_sent",
+            Self::TcpBytesReceived => "tcp_bytes_received",
+            Self::NetStackDuplicateSyscall => "net_stack_duplicate_syscall",
+            Self::NetStackDuplicateWorker => "net_stack_duplicate_worker",
+            Self::TcpTxNotifyPayload => "tcp_tx_notify_payload",
+            Self::TcpTxNotifyState => "tcp_tx_notify_state",
+            Self::TcpTxNotifyDrainRecheck => "tcp_tx_notify_drain_recheck",
+            Self::TcpTxWorkerContinuation => "tcp_tx_worker_continuation",
+            Self::NetStackFallbackDatagram => "net_stack_fallback_datagram",
+            Self::NetStackFallbackTcpPayload => "net_stack_fallback_tcp_payload",
+            Self::NetStackFallbackTcpState => "net_stack_fallback_tcp_state",
+            Self::NetStackFallbackDrainRecheck => "net_stack_fallback_drain_recheck",
+            Self::TcpSendBlockedBufferLimit => "tcp_send_blocked_buffer_limit",
+            Self::TcpSendBlockedPool => "tcp_send_blocked_pool",
+            Self::TcpSendPartialCapacity => "tcp_send_partial_capacity",
+            Self::TcpLocalEffectAttempts => "tcp_local_effect_attempts",
+            Self::TcpLocalEffectDeliveries => "tcp_local_effect_deliveries",
+            Self::TcpLocalEffectBytes => "tcp_local_effect_bytes",
+            Self::TcpLocalPeerHintHits => "tcp_local_peer_hint_hits",
+            Self::TcpLocalPeerHintMisses => "tcp_local_peer_hint_misses",
+            Self::TcpLocalPeerHintInvalid => "tcp_local_peer_hint_invalid",
+            Self::TcpLocalEffectReceiveWindow => "tcp_local_effect_receive_window",
+            Self::TcpLocalEffectWindowRejects => "tcp_local_effect_window_rejects",
+            Self::TcpLocalEffectRingRejects => "tcp_local_effect_ring_rejects",
+            Self::TcpLocalEffectBatchDeliveries => "tcp_local_effect_batch_deliveries",
+            Self::TcpLocalEffectBatchBytes => "tcp_local_effect_batch_bytes",
+            Self::TcpLocalEffectCycles => "tcp_local_effect_cycles",
+            Self::TcpLocalEffectLookupCycles => "tcp_local_effect_lookup_cycles",
+            Self::TcpLocalEffectCommitCycles => "tcp_local_effect_commit_cycles",
+            Self::TcpLocalEffectAckCycles => "tcp_local_effect_ack_cycles",
+            Self::TcpLocalTurnProcessed => "tcp_local_turn_processed",
+            Self::TcpLocalTurnMoreWork => "tcp_local_turn_more_work",
+            Self::TcpLocalRxBufferedBytes => "tcp_local_rx_buffered_bytes",
+            Self::TcpLocalRxAvailableBytes => "tcp_local_rx_available_bytes",
+            Self::TcpLocalHandoffFlush => "tcp_local_handoff_flush",
+            Self::TcpLocalHandoffBatch => "tcp_local_handoff_batch",
+            Self::TcpLocalHandoffPressure => "tcp_local_handoff_pressure",
+            Self::TcpReceiveWindowNotifications => "tcp_receive_window_notifications",
+            Self::TcpUserSendPinCycles => "tcp_user_send_pin_cycles",
+            Self::TcpUserSendPinnedWindows => "tcp_user_send_pinned_windows",
+            Self::TcpUserReceivePinCycles => "tcp_user_receive_pin_cycles",
+            Self::TcpUserReceivePinnedWindows => "tcp_user_receive_pinned_windows",
+            Self::TcpLocalDirectAttempts => "tcp_local_direct_attempts",
+            Self::TcpLocalDirectPolicyRejects => "tcp_local_direct_policy_rejects",
+            Self::TcpLocalDirectRouteMisses => "tcp_local_direct_route_misses",
+            Self::TcpLocalDirectWindowBlocks => "tcp_local_direct_window_blocks",
+            Self::TcpLocalDirectDeliveries => "tcp_local_direct_deliveries",
+            Self::TcpLocalDirectBytes => "tcp_local_direct_bytes",
+            Self::TcpLocalDirectCycles => "tcp_local_direct_cycles",
+            Self::TcpLocalDirectReconcileBytes => "tcp_local_direct_reconcile_bytes",
+            Self::TcpLocalDirectReconcileCycles => "tcp_local_direct_reconcile_cycles",
+            Self::NetWorkerQueueCycles => "net_worker_queue_cycles",
+            Self::NetWorkerDispatchCycles => "net_worker_dispatch_cycles",
+            Self::NetWorkerIngressCycles => "net_worker_ingress_cycles",
+            Self::NetWorkerProtocolCycles => "net_worker_protocol_cycles",
+            Self::NetWorkerFinishCycles => "net_worker_finish_cycles",
+            Self::UdpUserPinCycles => "udp_user_pin_cycles",
+            Self::UdpUserPinnedWindows => "udp_user_pinned_windows",
+            Self::UdpUserCopyCycles => "udp_user_copy_cycles",
+            Self::UdpLocalRouteInstalls => "udp_local_route_installs",
+            Self::UdpLocalRouteMatches => "udp_local_route_matches",
+            Self::UdpLocalRouteDeliveries => "udp_local_route_deliveries",
+            Self::UdpLocalRouteInvalid => "udp_local_route_invalid",
+            Self::UdpLocalRouteAbsent => "udp_local_route_absent",
+            Self::UdpLocalRouteReceiverRejects => "udp_local_route_receiver_rejects",
+            Self::UdpLocalFallbackDatagrams => "udp_local_fallback_datagrams",
+            Self::UdpLocalDirectBytes => "udp_local_direct_bytes",
+            Self::UdpLocalDirectCycles => "udp_local_direct_cycles",
+            Self::UdpUserWritePinCycles => "udp_user_write_pin_cycles",
+            Self::UdpUserWritePinnedWindows => "udp_user_write_pinned_windows",
+            Self::UdpLocalDirectReceives => "udp_local_direct_receives",
+            Self::UdpLocalDirectReceiveBytes => "udp_local_direct_receive_bytes",
+            Self::UdpLocalDirectReceiveCycles => "udp_local_direct_receive_cycles",
+            Self::UdpLocalReceiveCopyCycles => "udp_local_receive_copy_cycles",
+            Self::UdpLocalReceivePopCycles => "udp_local_receive_pop_cycles",
+            Self::UdpLocalReceiveReadinessCycles => "udp_local_receive_readiness_cycles",
+            Self::UdpLocalSendPublishCycles => "udp_local_send_publish_cycles",
+            Self::UdpLocalSharedReferences => "udp_local_shared_references",
+            Self::UdpLocalFanoutReceivers => "udp_local_fanout_receivers",
+            Self::UdpLocalFanoutDrops => "udp_local_fanout_drops",
+            Self::UdpLocalSuppressedDatagrams => "udp_local_suppressed_datagrams",
+            Self::SchedTimerCycles => "sched_timer_cycles",
+            Self::SchedPickCycles => "sched_pick_cycles",
+            Self::SchedPrepareCycles => "sched_prepare_cycles",
+            Self::SchedContextCycles => "sched_context_cycles",
+            Self::SchedPrepareAccountingCycles => "sched_prepare_accounting_cycles",
+            Self::SchedPreparePublishCycles => "sched_prepare_publish_cycles",
+            Self::SchedPrepareVmCycles => "sched_prepare_vm_cycles",
+            Self::SchedPrepareCpuStateCycles => "sched_prepare_cpu_state_cycles",
+            Self::SyscallReturnFast => "syscall_return_fast",
+            Self::SyscallReturnFull => "syscall_return_full",
+            Self::SyscallReturnAfterSwitch => "syscall_return_after_switch",
+            Self::SyscallReturnFpuRestore => "syscall_return_fpu_restore",
+            Self::SyscallReturnVectorRestore => "syscall_return_vector_restore",
+            Self::UdpLocalConsumerTargets => "udp_local_consumer_targets",
+            Self::UdpLocalConsumerHandoffs => "udp_local_consumer_handoffs",
+            Self::TcpLocalConsumerTargets => "tcp_local_consumer_targets",
+            Self::TcpLocalConsumerHandoffs => "tcp_local_consumer_handoffs",
         }
     }
 }
@@ -532,6 +1008,7 @@ static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_SPAN_ID: AtomicUsize = AtomicUsize::new(0);
 static SET_CURRENT_SPAN_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn install(
     read_counter: fn() -> u64,
@@ -998,6 +1475,20 @@ pub fn trace_task_event_with_span(
         arg0,
         arg1,
     );
+}
+
+/// 分配一次剖析会话内可用于跨子系统关联的非零编号。
+pub fn next_correlation_id() -> u64 {
+    let mut id = NEXT_CORRELATION_ID.fetch_add(1, Ordering::AcqRel);
+    if id == 0 {
+        id = NEXT_CORRELATION_ID.fetch_add(1, Ordering::AcqRel);
+    }
+    id
+}
+
+/// 记录当前任务上的瞬时事件。`arg0` 和 `arg1` 由事件契约解释。
+pub fn trace_point(event: Event, arg0: u64, arg1: u64) {
+    trace_task_event(TraceKind::Point, event, current_task_id(), arg0, arg1);
 }
 
 /// 记录任务亲缘关系。生命周期记录不受 event mask 影响，否则仅启用 syscall
@@ -1611,6 +2102,33 @@ mod tests {
         assert_eq!(trace.task_id, 43);
         assert_eq!((trace.arg0, trace.arg1), (42, 43));
         set_event_mask(ALL_EVENT_MASK);
+        stop();
+    }
+
+    #[test]
+    fn point_trace_preserves_task_span_and_correlation() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        TEST_SPAN_ID.store(91, Ordering::Relaxed);
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
+        start();
+        let correlation = next_correlation_id();
+        trace_point(Event::NetPeerRx, 27, correlation);
+        freeze();
+
+        let trace = trace_record(1, 0).expect("point trace");
+        assert_eq!(trace.kind, TraceKind::Point);
+        assert_eq!(trace.event, Event::NetPeerRx);
+        assert_eq!(trace.task_id, 42);
+        assert_eq!(trace.span_id, 91);
+        assert_eq!((trace.arg0, trace.arg1), (27, correlation));
         stop();
     }
 

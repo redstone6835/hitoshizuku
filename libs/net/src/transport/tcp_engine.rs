@@ -7,13 +7,12 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::buf::{PacketChain, PacketMetadata};
+use crate::buf::{PacketChain, PacketMetadata, RxPoolPressure};
 use crate::control::RouteDecision;
 use crate::flow::{FlowKey, FlowTable, flow_hash64, rss_hash};
-#[cfg(test)]
-use crate::pipeline::transport_checksum;
 use crate::pipeline::{EthernetHeader, FrontendPacket, IpPacket};
-#[cfg(test)]
+use crate::pipeline::{partial_transport_checksum, transport_checksum};
+use crate::socket::{StreamRxCommit, StreamRxStorageKind};
 use crate::transport::TCP_PROTOCOL_NUMBER;
 use crate::transport::{
     TcpFlags, TcpPacket, TcpSackBlock, TcpSequence, TcpState, TcpStateMachine, TcpTransmit,
@@ -56,6 +55,9 @@ pub struct TcpPath {
 }
 
 pub struct PreparedTcpTx {
+    pub flow: FlowId,
+    pub flow_generation: u32,
+    pub facade_generation: u32,
     pub facade: Arc<SocketFacade>,
     pub payload: Option<TcpTxLease>,
     pub path: TcpPath,
@@ -70,6 +72,14 @@ pub struct PreparedTcpTx {
     pub parsed_options: crate::transport::TcpOptions,
     pub completion: u64,
     pub low_latency: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalTcpPeerHint {
+    flow: FlowId,
+    flow_generation: u32,
+    facade_generation: u32,
+    stack_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +107,10 @@ pub struct TcpEngineStats {
     pub fast_retransmit: u64,
     pub out_of_order: u64,
     pub paws_drop: u64,
+    pub rx_pinned_bytes: u64,
+    pub rx_compact_copy_bytes: u64,
+    pub loopback_shared_bytes: u64,
+    pub rx_pool_low_water_fallbacks: u64,
 }
 
 struct Listener {
@@ -125,9 +139,10 @@ enum IngressPayload<'a> {
     #[cfg(test)]
     Owned(Vec<u8>),
     Packet {
-        chain: &'a PacketChain,
+        chain: &'a mut PacketChain,
         offset: usize,
         len: usize,
+        pressure: RxPoolPressure,
     },
     Lease {
         lease: &'a TcpTxLease,
@@ -152,20 +167,27 @@ impl IngressPayload<'_> {
     }
 
     fn copy_to_socket(
-        &self,
+        &mut self,
         facade: &SocketFacade,
         payload_offset: usize,
-    ) -> Result<usize, SocketError> {
+    ) -> Result<StreamRxCommit, SocketError> {
         let len = self.len().saturating_sub(payload_offset);
         match self {
-            Self::Empty => Ok(0),
+            Self::Empty => Ok(StreamRxCommit {
+                len: 0,
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            }),
             #[cfg(test)]
-            Self::Owned(bytes) => facade.push_stream_rx(&bytes[payload_offset..]),
-            Self::Packet { chain, offset, .. } => {
-                facade.push_stream_rx_chain(chain, offset + payload_offset, len)
-            }
+            Self::Owned(bytes) => facade.push_stream_rx_compact(&bytes[payload_offset..]),
+            Self::Packet {
+                chain,
+                offset,
+                pressure,
+                ..
+            } => facade.push_stream_rx_packet(chain, *offset + payload_offset, len, *pressure),
             Self::Lease { lease, offset, .. } => {
-                facade.push_stream_rx_lease(lease, offset + payload_offset, len)
+                facade.push_stream_rx_lease(lease, *offset + payload_offset, len, true)
             }
         }
     }
@@ -175,7 +197,9 @@ impl IngressPayload<'_> {
             Self::Empty => Ok(Vec::new()),
             #[cfg(test)]
             Self::Owned(bytes) => Ok(bytes),
-            Self::Packet { chain, offset, len } => {
+            Self::Packet {
+                chain, offset, len, ..
+            } => {
                 let mut bytes = Vec::new();
                 bytes.resize(len, 0);
                 chain
@@ -363,6 +387,7 @@ struct TcpFlow {
     keepalive_probes: u8,
     last_advertised_window: u16,
     output_blocked: bool,
+    local_peer_hint: Option<LocalTcpPeerHint>,
 }
 
 impl TcpFlow {
@@ -427,7 +452,14 @@ impl TcpEndpointTable {
             return Err(TcpBindError::InvalidEndpoint);
         }
         let key = (local.addr, local.port, interface);
-        if self.listeners.contains_key(&key) {
+        // close() 先标记 ListenGroup，再把跨 shard 的清理工作排队。
+        // 允许新 listener 在这段过渡期替换旧条目，避免连续 close/bind/listen
+        // 时因为某个 shard 仍未消费 RemoveListener 而让整个安装事务失败。
+        if self
+            .listeners
+            .get(&key)
+            .is_some_and(|listener| !listener.group.is_closing())
+        {
             return Err(TcpBindError::Duplicate);
         }
         self.listeners.insert(key, Listener { group });
@@ -450,9 +482,13 @@ impl TcpEndpointTable {
         let pending: Vec<_> = (1..=4096)
             .map(FlowId)
             .filter(|id| {
-                self.flows
-                    .get(*id)
-                    .is_some_and(|flow| flow.listener_key.is_some_and(|key| keys.contains(&key)))
+                self.flows.get(*id).is_some_and(|flow| {
+                    flow.listener_key.is_some_and(|key| keys.contains(&key))
+                        || flow
+                            .accept_group
+                            .as_ref()
+                            .is_some_and(|listener| listener.id() == group)
+                })
             })
             .collect();
         for id in pending {
@@ -491,7 +527,7 @@ impl TcpEndpointTable {
         let iss = self.initial_sequence(key, now_ns);
         let mut machine = TcpStateMachine::new(iss, advertised_window(&facade, 0));
         let transmit = machine.active_open().unwrap();
-        let local_window_scale = choose_window_scale(facade.buffer_limits().1);
+        let local_window_scale = choose_window_scale(facade.receive_window_scale_limit());
         let initial_window = advertised_window(&facade, local_window_scale);
         let flow = TcpFlow {
             facade: Arc::clone(&facade),
@@ -528,6 +564,7 @@ impl TcpEndpointTable {
             keepalive_probes: 0,
             last_advertised_window: initial_window,
             output_blocked: false,
+            local_peer_hint: None,
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         let id = self
@@ -552,7 +589,7 @@ impl TcpEndpointTable {
     ) -> Result<(FlowId, PacketChain, PacketMetadata), (TcpIngressError, PacketChain, PacketMetadata)>
     {
         let metadata = packet.metadata;
-        let chain = packet.chain;
+        let mut chain = packet.chain;
         let Some(key) = packet.parsed.flow else {
             return Err((TcpIngressError::Malformed, chain, metadata));
         };
@@ -576,11 +613,13 @@ impl TcpEndpointTable {
             id,
             tcp,
             IngressPayload::Packet {
-                chain: &chain,
+                chain: &mut chain,
                 offset: payload_offset,
                 len: payload_len,
+                pressure: metadata.rx_pool_pressure,
             },
             now_ns,
+            true,
         );
         match result {
             Ok(()) => {
@@ -600,6 +639,358 @@ impl TcpEndpointTable {
         payload: Option<&TcpTxLease>,
         now_ns: u64,
     ) -> Result<FlowId, TcpIngressError> {
+        self.ingest_local_with_info(interface, path, key, tcp, payload, now_ns, true)
+    }
+
+    pub fn ingest_local_deferred_info(
+        &mut self,
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        tcp: TcpPacket,
+        payload: Option<&TcpTxLease>,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpIngressError> {
+        self.ingest_local_with_info(interface, path, key, tcp, payload, now_ns, false)
+    }
+
+    pub fn try_local_data_effect(
+        &mut self,
+        interface: InterfaceId,
+        work: &PreparedTcpTx,
+        now_ns: u64,
+    ) -> Result<Option<(FlowId, FlowId)>, TcpIngressError> {
+        #[cfg(feature = "performance-profile")]
+        let effect_start = profiling::read_counter();
+        if !crate::socket::local_transport_fast_path_eligible() {
+            return Ok(None);
+        }
+        let Some(payload) = work.payload.as_ref() else {
+            return Ok(None);
+        };
+        let payload_len = usize::from(payload.len);
+        if payload_len == 0
+            || work.flags.bits() & !(TcpFlags::ACK | TcpFlags::PSH).bits() != 0
+            || !work.flags.contains(TcpFlags::ACK)
+            || work.parsed_options.maximum_segment_size.is_some()
+            || work.parsed_options.window_scale.is_some()
+            || work.parsed_options.sack_permitted
+            || work.parsed_options.sack_blocks.iter().any(Option::is_some)
+        {
+            return Ok(None);
+        }
+
+        let source = Endpoint {
+            addr: work.path.route.source,
+            port: work.local_port,
+        };
+        if self.flows.generation(work.flow) != Some(work.flow_generation)
+            || work.facade.generation() != work.facade_generation
+            || work.facade.is_closing()
+        {
+            return Ok(None);
+        }
+        let sender_id = work.flow;
+        let Some(peer_key) = FlowKey::new(source, work.remote, TransportProtocol::Tcp) else {
+            return Ok(None);
+        };
+        let cached_peer = self
+            .flows
+            .get(sender_id)
+            .and_then(|sender| sender.local_peer_hint);
+        let peer_id = if let Some(hint) = cached_peer {
+            let valid = self.flows.generation(hint.flow) == Some(hint.flow_generation)
+                && self.flows.key(hint.flow) == Some(peer_key)
+                && self.flows.get(hint.flow).is_some_and(|peer| {
+                    peer.facade.generation() == hint.facade_generation
+                        && peer.facade.stack_generation() == hint.stack_generation
+                        && !peer.facade.is_closing()
+                });
+            if valid {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpLocalPeerHintHits, 1);
+                hint.flow
+            } else {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpLocalPeerHintInvalid, 1);
+                self.flows.get_mut(sender_id).unwrap().local_peer_hint = None;
+                let peer_hash = flow_hash64(rss_hash(&self.rss_key, &peer_key));
+                let Some(peer_id) = self.flows.find(&peer_key, peer_hash) else {
+                    return Ok(None);
+                };
+                peer_id
+            }
+        } else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpLocalPeerHintMisses, 1);
+            let peer_hash = flow_hash64(rss_hash(&self.rss_key, &peer_key));
+            let Some(peer_id) = self.flows.find(&peer_key, peer_hash) else {
+                return Ok(None);
+            };
+            peer_id
+        };
+        if sender_id == peer_id {
+            return Ok(None);
+        }
+
+        let segment = crate::transport::TcpSegment {
+            sequence: work.sequence,
+            acknowledgement: work.acknowledgement,
+            flags: work.flags,
+            window: work.window,
+            payload_len: payload.len.into(),
+        };
+        let payload_end = work.sequence + u32::from(payload.len);
+        let Some((peer_facade, peer_window, peer_timestamp_enabled, peer_hint)) =
+            self.flows.get(peer_id).and_then(|peer| {
+                let sender = self.flows.get(sender_id)?;
+                let peer_generation = self.flows.generation(peer_id)?;
+                (sender.local == source
+                    && sender.remote == work.remote
+                    && peer.local == work.remote
+                    && peer.remote == source
+                    && peer.path.route.interface == interface
+                    && sender.path.route.interface == interface
+                    && Arc::ptr_eq(&sender.facade, &work.facade)
+                    && sender.facade.stack_generation() == peer.facade.stack_generation()
+                    && !peer.facade.is_closing()
+                    && sender.machine.state() == TcpState::Established
+                    && sender
+                        .machine
+                        .send_unacknowledged()
+                        .before_or_equal(work.sequence)
+                    && payload_end.before_or_equal(sender.machine.send_next())
+                    && peer.machine.accepts_local_data(segment)
+                    && peer.timestamp_enabled == work.parsed_options.timestamp.is_some())
+                .then(|| {
+                    (
+                        Arc::clone(&peer.facade),
+                        u32::from(work.window) << peer.peer_window_scale,
+                        peer.timestamp_enabled,
+                        LocalTcpPeerHint {
+                            flow: peer_id,
+                            flow_generation: peer_generation,
+                            facade_generation: peer.facade.generation(),
+                            stack_generation: peer.facade.stack_generation(),
+                        },
+                    )
+                })
+            })
+        else {
+            return Ok(None);
+        };
+        self.flows.get_mut(sender_id).unwrap().local_peer_hint = Some(peer_hint);
+        let receive_window = peer_facade.stream_receive_window();
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(
+            profiling::Metric::TcpLocalEffectReceiveWindow,
+            receive_window as u64,
+        );
+        if payload_len > receive_window {
+            peer_facade.mark_local_stream_window_blocked();
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpLocalEffectWindowRejects, 1);
+            return Ok(None);
+        }
+        if peer_timestamp_enabled
+            && work.parsed_options.timestamp.is_some_and(|timestamp| {
+                self.flows.get(peer_id).is_some_and(|peer| {
+                    peer.timestamp_recent
+                        .is_some_and(|recent| (timestamp.value.wrapping_sub(recent) as i32) < 0)
+                })
+            })
+        {
+            return Ok(None);
+        }
+
+        #[cfg(feature = "performance-profile")]
+        let lookup_done = profiling::read_counter();
+        let commit = peer_facade
+            .push_stream_rx_lease(payload, 0, payload_len, work.flags.contains(TcpFlags::PSH))
+            .map_err(|_| {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpLocalEffectRingRejects, 1);
+                TcpIngressError::ReceiveBufferFull
+            })?;
+        self.record_rx_commit(commit);
+        #[cfg(feature = "performance-profile")]
+        let commit_done = profiling::read_counter();
+
+        let (peer_previous_ack, peer_current_ack, peer_wire_window) = {
+            let peer = self.flows.get_mut(peer_id).unwrap();
+            let (previous, current) = peer
+                .machine
+                .accept_local_data(segment)
+                .expect("本地 effect 在提交 payload 前已完整校验");
+            peer.peer_window = peer_window;
+            peer.timestamp_recent = work
+                .parsed_options
+                .timestamp
+                .map(|timestamp| timestamp.value)
+                .or(peer.timestamp_recent);
+            peer.ack_pending = 0;
+            peer.deadlines.delayed_ack = None;
+            peer.last_activity_ns = now_ns;
+            let wire_window = advertised_window(&peer.facade, peer.local_window_scale);
+            peer.last_advertised_window = wire_window;
+            (previous, current, wire_window)
+        };
+        let (sender_previous_ack, sender_current_ack) = {
+            let sender = self.flows.get_mut(sender_id).unwrap();
+            let acknowledged = sender
+                .machine
+                .accept_local_ack(payload_end)
+                .expect("本地 effect 的发送序列在提交 payload 前已完整校验");
+            sender.peer_window = u32::from(peer_wire_window) << sender.peer_window_scale;
+            if sender.timestamp_enabled {
+                sender.timestamp_recent = Some((now_ns / 1_000_000) as u32);
+            }
+            sender.last_activity_ns = now_ns;
+            acknowledged
+        };
+
+        if peer_current_ack.after(peer_previous_ack) {
+            self.acknowledge(peer_id, peer_previous_ack, peer_current_ack, now_ns);
+            self.drain_send_with_info(peer_id, now_ns, false);
+        }
+        self.acknowledge(sender_id, sender_previous_ack, sender_current_ack, now_ns);
+        self.drain_send_with_info(sender_id, now_ns, false);
+        if work.facade.stream_unsent_len() == 0
+            && !self
+                .output
+                .iter()
+                .any(|pending| pending.flow == sender_id && pending.payload.is_some())
+        {
+            work.facade.install_local_tcp_direct_peer(&peer_facade);
+        }
+        if peer_facade.stream_unsent_len() == 0
+            && !self
+                .output
+                .iter()
+                .any(|pending| pending.flow == peer_id && pending.payload.is_some())
+        {
+            peer_facade.install_local_tcp_direct_peer(&work.facade);
+        }
+        self.stats.delivered = self.stats.delivered.saturating_add(1);
+        #[cfg(feature = "performance-profile")]
+        {
+            let effect_done = profiling::read_counter();
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectLookupCycles,
+                lookup_done.wrapping_sub(effect_start),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectCommitCycles,
+                commit_done.wrapping_sub(lookup_done),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectAckCycles,
+                effect_done.wrapping_sub(commit_done),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectCycles,
+                effect_done.wrapping_sub(effect_start),
+            );
+        }
+        Ok(Some((sender_id, peer_id)))
+    }
+
+    /// 对 socket 直达 lane 已经交付的字节统一推进 TCP 序列空间。
+    ///
+    /// 数据在进入这里前已经由代际校验的 peer route 原子地提交到接收 ring；本函数
+    /// 只在 ELM owner turn 内更新双方状态机，不再构造报文或重复持有 payload。
+    pub fn reconcile_local_direct(
+        &mut self,
+        sender_id: FlowId,
+        mut bytes: u32,
+        now_ns: u64,
+    ) -> Option<(FlowId, FlowId)> {
+        if bytes == 0 {
+            return None;
+        }
+        let hint = self.flows.get(sender_id)?.local_peer_hint?;
+        let peer_id = hint.flow;
+        if sender_id == peer_id
+            || self.flows.generation(peer_id) != Some(hint.flow_generation)
+            || self.flows.get(peer_id).is_none_or(|peer| {
+                peer.facade.generation() != hint.facade_generation
+                    || peer.facade.stack_generation() != hint.stack_generation
+                    || peer.facade.is_closing()
+            })
+        {
+            return None;
+        }
+
+        while bytes != 0 {
+            let chunk = bytes;
+            let (sequence, acknowledgement) = {
+                let sender = self.flows.get(sender_id)?;
+                let peer = self.flows.get(peer_id)?;
+                if sender.machine.state() != TcpState::Established
+                    || peer.machine.state() != TcpState::Established
+                    || sender.machine.send_next() != peer.machine.receive_next()
+                {
+                    return None;
+                }
+                (
+                    sender.machine.send_next(),
+                    peer.machine.send_unacknowledged(),
+                )
+            };
+            let segment = crate::transport::TcpSegment {
+                sequence,
+                acknowledgement,
+                flags: TcpFlags::ACK | TcpFlags::PSH,
+                window: 0,
+                payload_len: chunk,
+            };
+            let reserved = self.flows.get_mut(sender_id)?.machine.reserve_send(chunk)?;
+            debug_assert_eq!(reserved, sequence);
+            let peer_wire_window = {
+                let peer = self.flows.get_mut(peer_id)?;
+                peer.machine.accept_local_data(segment)?;
+                peer.last_activity_ns = now_ns;
+                let window = advertised_window(&peer.facade, peer.local_window_scale);
+                peer.last_advertised_window = window;
+                window
+            };
+            let end = sequence + chunk;
+            let sender = self.flows.get_mut(sender_id)?;
+            let (previous, current) = sender.machine.accept_local_ack(end)?;
+            sender.peer_window = u32::from(peer_wire_window) << sender.peer_window_scale;
+            sender.last_activity_ns = now_ns;
+            sender.congestion.new_ack(
+                current.distance_from(previous),
+                sender.mss,
+                sender.machine.send_next(),
+            );
+            sender.deadlines.retransmit = None;
+            sender.deadlines.persist = None;
+            bytes -= chunk;
+        }
+        self.stats.delivered = self.stats.delivered.saturating_add(1);
+        Some((sender_id, peer_id))
+    }
+
+    pub fn local_peer_facade(&self, sender_id: FlowId) -> Option<(FlowId, Arc<SocketFacade>)> {
+        let hint = self.flows.get(sender_id)?.local_peer_hint?;
+        let peer = self.flows.get(hint.flow)?;
+        (self.flows.generation(hint.flow) == Some(hint.flow_generation)
+            && peer.facade.generation() == hint.facade_generation
+            && peer.facade.stack_generation() == hint.stack_generation)
+            .then(|| (hint.flow, Arc::clone(&peer.facade)))
+    }
+
+    fn ingest_local_with_info(
+        &mut self,
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        tcp: TcpPacket,
+        payload: Option<&TcpTxLease>,
+        now_ns: u64,
+        publish_info: bool,
+    ) -> Result<FlowId, TcpIngressError> {
         let payload_len = tcp.payload_len as usize;
         if payload
             .as_ref()
@@ -614,7 +1005,7 @@ impl TcpEndpointTable {
             offset: 0,
             len: payload_len,
         });
-        self.process_segment_inner(id, tcp, ingress, now_ns)?;
+        self.process_segment_inner(id, tcp, ingress, now_ns, publish_info)?;
         self.stats.delivered = self.stats.delivered.saturating_add(1);
         Ok(id)
     }
@@ -638,6 +1029,14 @@ impl TcpEndpointTable {
     }
 
     pub fn drain_send(&mut self, id: FlowId, now_ns: u64) -> bool {
+        self.drain_send_with_info(id, now_ns, true)
+    }
+
+    pub fn drain_send_deferred_info(&mut self, id: FlowId, now_ns: u64) -> bool {
+        self.drain_send_with_info(id, now_ns, false)
+    }
+
+    fn drain_send_with_info(&mut self, id: FlowId, now_ns: u64, publish_info: bool) -> bool {
         let mut queued = false;
         let mut queued_bytes = 0usize;
         let window_update = self.flows.get_mut(id).is_some_and(|flow| {
@@ -744,9 +1143,17 @@ impl TcpEndpointTable {
             && let Some(flow) = self.flows.get(id)
         {
             flow.facade.finish_stream_tx_batch(queued_bytes);
-            publish_tcp_info(flow);
+            if publish_info {
+                publish_tcp_info(flow);
+            }
         }
         queued
+    }
+
+    pub fn publish_tcp_info(&self, id: FlowId) {
+        if let Some(flow) = self.flows.get(id) {
+            publish_tcp_info(flow);
+        }
     }
 
     pub fn resume_output_blocked(&mut self, now_ns: u64, budget: usize) -> usize {
@@ -767,6 +1174,10 @@ impl TcpEndpointTable {
 
     pub fn has_output_blocked(&self) -> bool {
         !self.output_blocked.is_empty()
+    }
+
+    pub fn has_pending_output(&self) -> bool {
+        !self.output.is_empty()
     }
 
     fn mark_output_blocked(&mut self, id: FlowId) {
@@ -1042,7 +1453,7 @@ impl TcpEndpointTable {
         let mut machine = TcpStateMachine::new(iss, advertised_window(&child, 0));
         machine.listen();
         let output = machine.on_segment(tcp.segment());
-        let local_window_scale = choose_window_scale(child.buffer_limits().1);
+        let local_window_scale = choose_window_scale(child.receive_window_scale_limit());
         let initial_window = advertised_window(&child, local_window_scale);
         let flow = TcpFlow {
             facade: Arc::clone(&child),
@@ -1079,6 +1490,7 @@ impl TcpEndpointTable {
             keepalive_probes: 0,
             last_advertised_window: initial_window,
             output_blocked: false,
+            local_peer_hint: None,
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         let id = self.flows.insert_prehashed(key, hash, flow).map_err(|_| {
@@ -1112,7 +1524,7 @@ impl TcpEndpointTable {
         payload: Vec<u8>,
         now_ns: u64,
     ) -> Result<(), TcpIngressError> {
-        self.process_segment_inner(id, tcp, IngressPayload::Owned(payload), now_ns)
+        self.process_segment_inner(id, tcp, IngressPayload::Owned(payload), now_ns, true)
     }
 
     fn process_segment_inner(
@@ -1121,6 +1533,7 @@ impl TcpEndpointTable {
         tcp: TcpPacket,
         payload: IngressPayload<'_>,
         now_ns: u64,
+        publish_info: bool,
     ) -> Result<(), TcpIngressError> {
         let (state_before, peer_window_before) = self
             .flows
@@ -1202,7 +1615,7 @@ impl TcpEndpointTable {
         let current_una = self.flows.get(id).unwrap().machine.send_unacknowledged();
         if current_una.after(previous_una) {
             self.acknowledge(id, previous_una, current_una, now_ns);
-            self.drain_send(id, now_ns);
+            self.drain_send_with_info(id, now_ns, publish_info);
             self.maybe_send_fin(id, now_ns);
         } else if tcp.flags.contains(TcpFlags::ACK)
             && peer_window_increased
@@ -1211,7 +1624,7 @@ impl TcpEndpointTable {
                 TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
             )
         {
-            self.drain_send(id, now_ns);
+            self.drain_send_with_info(id, now_ns, publish_info);
         } else if tcp.flags.contains(TcpFlags::ACK)
             && payload.is_empty()
             && !peer_window_changed
@@ -1268,7 +1681,7 @@ impl TcpEndpointTable {
                 SocketError::ConnectionReset
             };
             self.reap(id, Some(error));
-        } else if let Some(flow) = self.flows.get(id) {
+        } else if publish_info && let Some(flow) = self.flows.get(id) {
             publish_tcp_info(flow);
         }
         Ok(())
@@ -1279,7 +1692,7 @@ impl TcpEndpointTable {
         id: FlowId,
         expected: TcpSequence,
         sequence: TcpSequence,
-        payload: IngressPayload<'_>,
+        mut payload: IngressPayload<'_>,
         now_ns: u64,
     ) -> Result<(), TcpIngressError> {
         let payload_start = sequence
@@ -1288,10 +1701,14 @@ impl TcpEndpointTable {
             .unwrap_or(0);
         if sequence.before_or_equal(expected) && payload_start < payload.len() {
             let accepted = payload.len() - payload_start;
+            let commit = {
+                let flow = self.flows.get_mut(id).unwrap();
+                payload
+                    .copy_to_socket(&flow.facade, payload_start)
+                    .map_err(|_| TcpIngressError::ReceiveBufferFull)?
+            };
+            self.record_rx_commit(commit);
             let flow = self.flows.get_mut(id).unwrap();
-            payload
-                .copy_to_socket(&flow.facade, payload_start)
-                .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
             if sequence.before(expected) {
                 flow.machine.advance_receive(accepted as u32);
             }
@@ -1360,9 +1777,35 @@ impl TcpEndpointTable {
             flow.facade
                 .push_stream_rx(accepted)
                 .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
+            self.stats.rx_compact_copy_bytes = self
+                .stats
+                .rx_compact_copy_bytes
+                .saturating_add(accepted.len() as u64);
             flow.machine.advance_receive(accepted.len() as u32);
         }
         Ok(())
+    }
+
+    fn record_rx_commit(&mut self, commit: StreamRxCommit) {
+        let len = commit.len as u64;
+        match commit.storage {
+            StreamRxStorageKind::Discarded => {}
+            StreamRxStorageKind::Compact => {
+                self.stats.rx_compact_copy_bytes =
+                    self.stats.rx_compact_copy_bytes.saturating_add(len);
+            }
+            StreamRxStorageKind::PhysicalPinned => {
+                self.stats.rx_pinned_bytes = self.stats.rx_pinned_bytes.saturating_add(len);
+            }
+            StreamRxStorageKind::LoopbackShared => {
+                self.stats.loopback_shared_bytes =
+                    self.stats.loopback_shared_bytes.saturating_add(len);
+            }
+        }
+        if commit.low_water_fallback {
+            self.stats.rx_pool_low_water_fallbacks =
+                self.stats.rx_pool_low_water_fallbacks.saturating_add(1);
+        }
     }
 
     fn acknowledge(
@@ -1427,7 +1870,6 @@ impl TcpEndpointTable {
             .map(|segment| segment.sent_ns.saturating_add(flow.rtt.rto_ns));
         flow.deadlines.persist = None;
         flow.persist_ns = PERSIST_INITIAL_NS;
-        publish_tcp_info(flow);
     }
 
     fn retransmit_first(&mut self, id: FlowId, now_ns: u64, fast: bool) {
@@ -1620,6 +2062,7 @@ impl TcpEndpointTable {
             }
             return;
         }
+        let flow_generation = self.flows.generation(id).unwrap();
         let flow = self.flows.get_mut(id).unwrap();
         let payload_len = payload.as_ref().map_or(0, |payload| payload.len);
         let sequence_len = u32::from(payload_len)
@@ -1658,6 +2101,9 @@ impl TcpEndpointTable {
         let completion = self.next_completion;
         self.next_completion = self.next_completion.wrapping_add(1).max(1);
         self.output.push_back(PreparedTcpTx {
+            flow: id,
+            flow_generation,
+            facade_generation: flow.facade.generation(),
             facade: Arc::clone(&flow.facade),
             payload,
             path: flow.path,
@@ -1673,9 +2119,6 @@ impl TcpEndpointTable {
             completion,
             low_latency,
         });
-        if low_latency {
-            publish_tcp_info(flow);
-        }
     }
 
     fn find_listener_key(
@@ -1963,6 +2406,58 @@ fn publish_tcp_info(flow: &TcpFlow) {
         flow.unacknowledged_segments,
         flow.retransmitted_segments,
     );
+    #[cfg(feature = "performance-profile")]
+    {
+        profiling::observe(
+            profiling::Metric::TcpSendAllowance,
+            u64::from(flow.send_allowance()),
+        );
+        profiling::observe(
+            profiling::Metric::TcpFlightBytes,
+            u64::from(flow.flight_bytes),
+        );
+        profiling::observe(
+            profiling::Metric::TcpPeerWindow,
+            u64::from(flow.peer_window),
+        );
+        profiling::observe(
+            profiling::Metric::TcpCongestionWindow,
+            u64::from(flow.congestion.cwnd),
+        );
+        profiling::observe(
+            profiling::Metric::TcpUnacknowledgedSegments,
+            u64::from(flow.unacknowledged_segments),
+        );
+        profiling::observe(
+            profiling::Metric::TcpRetransmittedSegments,
+            u64::from(flow.retransmitted_segments),
+        );
+        profiling::observe(
+            profiling::Metric::TcpStreamUnsentBytes,
+            flow.facade.stream_unsent_len() as u64,
+        );
+
+        if flow.facade.tcp_profile_trace_due() {
+            let socket = flow.facade.id().counter;
+            profiling::trace_point(
+                profiling::Event::NetTcpSequence,
+                socket,
+                (u64::from(flow.machine.send_unacknowledged().0) << 32)
+                    | u64::from(flow.machine.send_next().0),
+            );
+            profiling::trace_point(
+                profiling::Event::NetTcpReceiveSequence,
+                socket,
+                (u64::from(flow.machine.receive_next().0) << 32)
+                    | u64::from(flow.last_advertised_window),
+            );
+            profiling::trace_point(
+                profiling::Event::NetTcpWindow,
+                socket,
+                (u64::from(flow.peer_window) << 32) | u64::from(flow.congestion.cwnd),
+            );
+        }
+    }
 }
 
 fn path_mss(mtu: u32, address: IpAddr) -> u16 {
@@ -2079,48 +2574,10 @@ fn sip_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
     *v2 = v2.rotate_left(32);
 }
 
-#[cfg(not(test))]
 pub fn build_tcp_packet(
     mut payload: PacketChain,
     work: &PreparedTcpTx,
-) -> Result<PacketChain, PacketChain> {
-    let options_len = usize::from(work.options_len);
-    if options_len > work.options.len() || options_len % 4 != 0 {
-        return Err(payload);
-    }
-    let payload_len = payload.total_len();
-    let Some(input) = crate::stack::NetStackTxInputV1::tcp(
-        work.path.route.source,
-        work.remote.addr,
-        work.local_port,
-        work.remote.port,
-        work.path.source_mac,
-        work.path.destination_mac,
-        work.sequence.0,
-        work.acknowledgement.0,
-        work.flags.bits(),
-        work.window,
-        &work.options[..options_len],
-        payload_len as u32,
-    ) else {
-        return Err(payload);
-    };
-    let output = match crate::stack::build_tx_header(&payload, input) {
-        Ok(output) => output,
-        Err(_) => return Err(payload),
-    };
-    if payload.prepend_first_zeroed(output.header_len).is_err()
-        || payload.copy_in(0, output.header_bytes()).is_err()
-    {
-        return Err(payload);
-    }
-    Ok(payload)
-}
-
-#[cfg(test)]
-pub fn build_tcp_packet(
-    mut payload: PacketChain,
-    work: &PreparedTcpTx,
+    checksum_offload: bool,
 ) -> Result<PacketChain, PacketChain> {
     let options_len = usize::from(work.options_len);
     let tcp_header_len = 20 + options_len;
@@ -2169,16 +2626,28 @@ pub fn build_tcp_packet(
             {
                 return Err(payload);
             }
-            let checksum = match transport_checksum(
-                &payload,
-                34,
-                tcp_header_len + payload_len,
-                work.path.route.source,
-                work.remote.addr,
-                TCP_PROTOCOL_NUMBER,
-            ) {
-                Ok(checksum) => checksum,
-                Err(_) => return Err(payload),
+            let checksum = if checksum_offload {
+                let Ok(checksum) = partial_transport_checksum(
+                    work.path.route.source,
+                    work.remote.addr,
+                    tcp_header_len + payload_len,
+                    TCP_PROTOCOL_NUMBER,
+                ) else {
+                    return Err(payload);
+                };
+                checksum
+            } else {
+                match transport_checksum(
+                    &payload,
+                    34,
+                    tcp_header_len + payload_len,
+                    work.path.route.source,
+                    work.remote.addr,
+                    TCP_PROTOCOL_NUMBER,
+                ) {
+                    Ok(checksum) => checksum,
+                    Err(_) => return Err(payload),
+                }
             };
             if payload.copy_in(50, &checksum.to_be_bytes()).is_err() {
                 return Err(payload);
@@ -2203,16 +2672,28 @@ pub fn build_tcp_packet(
             {
                 return Err(payload);
             }
-            let checksum = match transport_checksum(
-                &payload,
-                54,
-                transport_len,
-                work.path.route.source,
-                work.remote.addr,
-                TCP_PROTOCOL_NUMBER,
-            ) {
-                Ok(checksum) => checksum,
-                Err(_) => return Err(payload),
+            let checksum = if checksum_offload {
+                let Ok(checksum) = partial_transport_checksum(
+                    work.path.route.source,
+                    work.remote.addr,
+                    transport_len,
+                    TCP_PROTOCOL_NUMBER,
+                ) else {
+                    return Err(payload);
+                };
+                checksum
+            } else {
+                match transport_checksum(
+                    &payload,
+                    54,
+                    transport_len,
+                    work.path.route.source,
+                    work.remote.addr,
+                    TCP_PROTOCOL_NUMBER,
+                ) {
+                    Ok(checksum) => checksum,
+                    Err(_) => return Err(payload),
+                }
             };
             if payload.copy_in(70, &checksum.to_be_bytes()).is_err() {
                 return Err(payload);
@@ -2223,55 +2704,6 @@ pub fn build_tcp_packet(
     Ok(payload)
 }
 
-#[cfg(not(test))]
-pub fn build_tcp_reset(
-    mut packet: PacketChain,
-    ethernet: EthernetHeader,
-    ip: IpPacket,
-    tcp: TcpPacket,
-) -> Result<PacketChain, PacketChain> {
-    if tcp.flags.contains(TcpFlags::RST) {
-        return Err(packet);
-    }
-    let (sequence, acknowledgement, flags) = if tcp.flags.contains(TcpFlags::ACK) {
-        (tcp.acknowledgement.0, 0, TcpFlags::RST)
-    } else {
-        (
-            0,
-            (tcp.sequence + tcp.sequence_len()).0,
-            TcpFlags::RST | TcpFlags::ACK,
-        )
-    };
-    let Some(mut input) = crate::stack::NetStackTxInputV1::tcp(
-        ip.destination,
-        ip.source,
-        tcp.destination_port,
-        tcp.source_port,
-        ethernet.destination,
-        ethernet.source,
-        sequence,
-        acknowledgement,
-        flags.bits(),
-        0,
-        &[],
-        0,
-    ) else {
-        return Err(packet);
-    };
-    input.payload_offset = 0;
-    let output = match crate::stack::build_tx_header(&packet, input) {
-        Ok(output) => output,
-        Err(_) => return Err(packet),
-    };
-    if packet.total_len() < usize::from(output.header_len)
-        || packet.copy_in(0, output.header_bytes()).is_err()
-    {
-        return Err(packet);
-    }
-    Ok(packet)
-}
-
-#[cfg(test)]
 pub fn build_tcp_reset(
     mut packet: PacketChain,
     ethernet: EthernetHeader,
@@ -2466,6 +2898,146 @@ mod tests {
             payload_offset: 0,
             payload_len,
             options: crate::transport::TcpOptions::default(),
+        }
+    }
+
+    struct LocalPair {
+        client: Arc<SocketFacade>,
+        server: Arc<SocketFacade>,
+        client_flow: FlowId,
+        server_flow: FlowId,
+    }
+
+    fn establish_local_pair(
+        table: &mut TcpEndpointTable,
+        receive_limit: Option<usize>,
+    ) -> LocalPair {
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_000,
+        };
+        let listener = facade(90);
+        let group = listen_group(&listener, 90, 1, 4);
+        table
+            .listen(server_endpoint, Some(InterfaceId(1)), group)
+            .unwrap();
+
+        let client = facade(91);
+        let client_flow = table
+            .connect(
+                client_endpoint,
+                server_endpoint,
+                path(client_endpoint.addr, server_endpoint.addr),
+                Arc::clone(&client),
+                1,
+                1_000,
+            )
+            .unwrap();
+        client.publish_binding(
+            OwnerRef::Flow {
+                shard: ShardId(0),
+                flow: client_flow,
+                generation: client.generation(),
+            },
+            client_endpoint,
+            Some(server_endpoint),
+            Some(InterfaceId(1)),
+        );
+
+        let syn = table.take_output().unwrap();
+        let server_key =
+            FlowKey::new(client_endpoint, server_endpoint, TransportProtocol::Tcp).unwrap();
+        let server_flow = table
+            .ingest_local(
+                InterfaceId(1),
+                path(server_endpoint.addr, client_endpoint.addr),
+                server_key,
+                packet(
+                    client_endpoint.port,
+                    server_endpoint.port,
+                    syn.sequence.0,
+                    syn.acknowledgement.0,
+                    syn.flags,
+                    0,
+                ),
+                None,
+                2_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        let client_key =
+            FlowKey::new(server_endpoint, client_endpoint, TransportProtocol::Tcp).unwrap();
+        table
+            .ingest_local(
+                InterfaceId(1),
+                path(client_endpoint.addr, server_endpoint.addr),
+                client_key,
+                packet(
+                    server_endpoint.port,
+                    client_endpoint.port,
+                    syn_ack.sequence.0,
+                    syn_ack.acknowledgement.0,
+                    syn_ack.flags,
+                    0,
+                ),
+                None,
+                3_000,
+            )
+            .unwrap();
+        let ack = table.take_output().unwrap();
+        table
+            .ingest_local(
+                InterfaceId(1),
+                path(server_endpoint.addr, client_endpoint.addr),
+                server_key,
+                packet(
+                    client_endpoint.port,
+                    server_endpoint.port,
+                    ack.sequence.0,
+                    ack.acknowledgement.0,
+                    ack.flags,
+                    0,
+                ),
+                None,
+                4_000,
+            )
+            .unwrap();
+        let server = listener.accept(true, None).unwrap();
+        if let Some(limit) = receive_limit {
+            server.set_buffer_limits(None, Some(limit));
+        }
+        assert_eq!(
+            server_flow,
+            match server.owner() {
+                OwnerRef::Flow { flow, .. } => flow,
+                _ => panic!("被动连接必须绑定 flow"),
+            }
+        );
+        LocalPair {
+            client,
+            server,
+            client_flow,
+            server_flow,
+        }
+    }
+
+    fn prepare_local_payload(
+        table: &mut TcpEndpointTable,
+        pair: &LocalPair,
+        payload: &[u8],
+        now_ns: u64,
+    ) -> PreparedTcpTx {
+        assert_eq!(pair.client.test_push_stream_tx(payload), payload.len());
+        assert!(table.drain_send(pair.client_flow, now_ns));
+        loop {
+            let work = table.take_output().expect("本地发送必须产生 TCP 输出");
+            if work.flow == pair.client_flow && work.payload.is_some() {
+                return work;
+            }
         }
     }
 
@@ -2744,11 +3316,61 @@ mod tests {
         let mut received = [0u8; 8];
         assert_eq!(
             facade
-                .recv_stream(&mut received, false, false, true, None)
+                .recv_stream(&mut received, false, false, false, true, None)
                 .unwrap(),
             5
         );
         assert_eq!(&received[..5], b"reply");
+    }
+
+    #[test]
+    fn deferred_tcp_info_keeps_send_accounting_at_the_protocol_boundary() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_001,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_001,
+        };
+        let facade = facade(42);
+        facade.set_tcp_nodelay(true);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        {
+            let state = table.flows.get_mut(flow).unwrap();
+            state.peer_window = u32::MAX;
+            state.congestion.cwnd = u32::MAX;
+        }
+
+        assert_eq!(facade.test_push_stream_tx(b"deferred info"), 13);
+        assert!(table.drain_send_deferred_info(flow, 20_000));
+        let data = table.take_output().unwrap();
+        assert_eq!(facade.tcp_info().bytes_sent, 13);
+        assert_eq!(facade.tcp_info().unacknowledged, 0);
+
+        table.publish_tcp_info(flow);
+        assert_eq!(facade.tcp_info().unacknowledged, 1);
+        table
+            .process_segment_inner(
+                flow,
+                packet(
+                    remote.port,
+                    local.port,
+                    501,
+                    data.sequence.0.wrapping_add(13),
+                    TcpFlags::ACK,
+                    0,
+                ),
+                IngressPayload::Owned(Vec::new()),
+                30_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(facade.tcp_info().unacknowledged, 1);
+
+        table.publish_tcp_info(flow);
+        assert_eq!(facade.tcp_info().unacknowledged, 0);
     }
 
     #[test]
@@ -2826,10 +3448,202 @@ mod tests {
             .unwrap();
         let mut output = [0u8; 64];
         assert_eq!(
-            child.recv_stream(&mut output, false, false, true, None),
+            child.recv_stream(&mut output, false, false, false, true, None),
             Ok(payload.len())
         );
         assert_eq!(&output[..payload.len()], payload);
+    }
+
+    #[test]
+    fn local_effect_reuses_generation_checked_peer_hint() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let first = prepare_local_payload(&mut table, &pair, b"first local payload", 10_000);
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &first, 11_000),
+            Ok(Some((pair.client_flow, pair.server_flow)))
+        );
+        assert!(
+            table
+                .flows
+                .get(pair.client_flow)
+                .unwrap()
+                .local_peer_hint
+                .is_some()
+        );
+
+        table.rss_key = [0xa5; 40];
+        let second = prepare_local_payload(&mut table, &pair, b"second local payload", 12_000);
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &second, 13_000),
+            Ok(Some((pair.client_flow, pair.server_flow)))
+        );
+    }
+
+    #[test]
+    fn local_direct_reconciliation_advances_both_sequence_spaces_once() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let first = prepare_local_payload(&mut table, &pair, b"route warmup", 10_000);
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &first, 11_000),
+            Ok(Some((pair.client_flow, pair.server_flow)))
+        );
+        let send_next = table
+            .flows
+            .get(pair.client_flow)
+            .unwrap()
+            .machine
+            .send_next();
+        let receive_next = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next();
+        assert_eq!(send_next, receive_next);
+
+        assert_eq!(
+            table.reconcile_local_direct(pair.client_flow, 32 * 1024, 12_000),
+            Some((pair.client_flow, pair.server_flow))
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.client_flow)
+                .unwrap()
+                .machine
+                .send_next(),
+            send_next + 32 * 1024
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            receive_next + 32 * 1024
+        );
+    }
+
+    #[test]
+    fn local_effect_rejects_stale_peer_generation() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let first = prepare_local_payload(&mut table, &pair, b"install hint", 10_000);
+        assert!(
+            table
+                .try_local_data_effect(InterfaceId(1), &first, 11_000)
+                .unwrap()
+                .is_some()
+        );
+        let pending = prepare_local_payload(&mut table, &pair, b"stale generation", 12_000);
+        assert!(table.flows.remove_id(pair.server_flow).is_some());
+
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &pending, 13_000),
+            Ok(None)
+        );
+        assert_eq!(
+            table.flows.get(pair.client_flow).unwrap().local_peer_hint,
+            None
+        );
+    }
+
+    #[test]
+    fn local_effect_rejects_reverse_tuple_mismatch() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let mut work = prepare_local_payload(&mut table, &pair, b"wrong tuple", 10_000);
+        work.remote.port = work.remote.port.wrapping_add(1);
+        let receive_next = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next();
+
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &work, 11_000),
+            Ok(None)
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            receive_next
+        );
+    }
+
+    #[test]
+    fn local_effect_rejects_unsupported_flags() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let mut work = prepare_local_payload(&mut table, &pair, b"unsupported flags", 10_000);
+        work.flags |= TcpFlags::FIN;
+
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &work, 11_000),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn local_effect_full_receiver_does_not_advance_sequence() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.client.set_tcp_nodelay(true);
+        {
+            let flow = table.flows.get_mut(pair.client_flow).unwrap();
+            flow.peer_window = u32::MAX;
+            flow.congestion.cwnd = u32::MAX;
+        }
+        let payload = alloc::vec![0x51; 32 * 1024 + 140];
+        assert_eq!(pair.client.test_push_stream_tx(&payload), payload.len());
+        assert!(table.drain_send(pair.client_flow, 10_000));
+        let mut output = Vec::new();
+        while let Some(work) = table.take_output() {
+            output.push(work);
+        }
+        let second = output.pop().unwrap();
+        let fill_len = output
+            .iter()
+            .map(|work| usize::from(work.payload.as_ref().unwrap().len))
+            .sum();
+        pair.server.set_buffer_limits(None, Some(fill_len));
+        for (index, work) in output.iter().enumerate() {
+            assert!(
+                table
+                    .try_local_data_effect(InterfaceId(1), work, 11_000 + index as u64)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(pair.server.stream_receive_window(), 0);
+        let receive_next = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next();
+
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &second, 13_000),
+            Ok(None)
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            receive_next
+        );
     }
 
     #[test]
@@ -3147,6 +3961,32 @@ mod tests {
     }
 
     #[test]
+    fn closing_listener_can_be_replaced_before_shard_drain() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9007,
+        };
+        let old_listener = facade(21);
+        let old_group = listen_group(&old_listener, 21, 2, 8);
+        let mut table = TcpEndpointTable::new_on_shard(ShardId(0), [1; 40], [2; 16]);
+        table
+            .listen(local, Some(InterfaceId(1)), Arc::clone(&old_group))
+            .unwrap();
+
+        old_group.close();
+        let new_listener = facade(22);
+        let new_group = listen_group(&new_listener, 22, 2, 8);
+        assert!(
+            table
+                .listen(local, Some(InterfaceId(1)), Arc::clone(&new_group))
+                .is_ok()
+        );
+
+        assert!(!table.close_listener(old_group.id()));
+        assert!(table.close_listener(new_group.id()));
+    }
+
+    #[test]
     fn overlapping_out_of_order_segments_are_merged_once() {
         let local = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -3192,7 +4032,7 @@ mod tests {
             .unwrap();
         let mut bytes = [0u8; 16];
         let len = facade
-            .recv_stream(&mut bytes, false, false, true, None)
+            .recv_stream(&mut bytes, false, false, false, true, None)
             .unwrap();
         assert_eq!(&bytes[..len], b"hello world");
         assert_eq!(table.flows.get(flow).unwrap().reassembly_bytes, 0);

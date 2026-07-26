@@ -342,6 +342,18 @@ pub fn rss_hash(key: &[u8; 40], flow: &FlowKey) -> u32 {
     toeplitz(key, &input[..len])
 }
 
+/// 为同一台主机内的双向传输选择共同 shard。
+///
+/// 物理收包仍使用方向相关的 RSS；只有明确的本地传输路径使用该哈希。
+pub fn local_transport_hash(key: &[u8; 40], flow: &FlowKey) -> u32 {
+    let reverse = FlowKey {
+        remote: flow.local,
+        local: flow.remote,
+        protocol: flow.protocol,
+    };
+    rss_hash(key, flow).min(rss_hash(key, &reverse))
+}
+
 pub fn fragment_rss_hash(
     key: &[u8; 40],
     interface: crate::InterfaceId,
@@ -452,6 +464,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rss_hash(&key, &flow), 0x51cc_c178);
+        let reverse = FlowKey {
+            remote: flow.local,
+            local: flow.remote,
+            protocol: flow.protocol,
+        };
+        assert_eq!(
+            local_transport_hash(&key, &flow),
+            local_transport_hash(&key, &reverse)
+        );
     }
 
     #[test]

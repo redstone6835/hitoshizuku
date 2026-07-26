@@ -59,6 +59,7 @@ pub struct NetQueueCaps {
     pub max_tx_descriptors: u8,
     pub max_rx_batch: u8,
     pub max_tx_batch: u8,
+    pub tx_checksum: bool,
     pub udp_segmentation: bool,
     pub max_udp_segments: u8,
 }
@@ -285,6 +286,7 @@ mod tests {
                 max_tx_descriptors: 2,
                 max_rx_batch: 32,
                 max_tx_batch: 32,
+                tx_checksum: false,
                 udp_segmentation: false,
                 max_udp_segments: 0,
             }
@@ -489,7 +491,7 @@ mod tests {
                 chain: PacketChain::from_lease(lease),
                 completion: CompletionToken(7),
                 low_latency: true,
-                checksums_validated: false,
+                checksum: crate::buf::TxChecksum::Complete,
                 layout: crate::buf::PacketLayout::Plain,
             })
             .is_ok()

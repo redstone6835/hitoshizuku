@@ -26,7 +26,7 @@
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// 新内核线程的入口函数签名。`arg` 通过 ABI 规定的第一个参数寄存器传入。
 pub type KernelEntry = unsafe extern "C" fn(arg: usize) -> !;
@@ -57,17 +57,24 @@ pub struct ArchContextOps {
     ///   活跃期间不被回收。
     pub init_kernel_context:
         unsafe fn(ctx: NonNull<u8>, stack_top: usize, entry: KernelEntry, arg: usize),
-    /// 切换内核上下文：把当前寄存器保存进 `prev`，从 `next` 恢复后跳走。
+    /// 切换内核上下文：把当前寄存器保存进 `prev`，释放 prev 的 CPU 所有权，
+    /// 再从 `next` 恢复后跳走。
     ///
     /// 必须 `extern "C"` —— 实现通常是 `#[naked]` 汇编，依赖确定的参数寄存器。
     ///
     /// # Safety
     /// - `prev`、`next` 必须都是之前由 [`init_kernel_context`] 初始化过的
     ///   缓冲，或当前线程用于"保存再回来"的合法缓冲；
+    /// - `prev_on_cpu` 指向 prev 任务的 `AtomicUsize` 所有权槽，保存完上下文后
+    ///   必须以 release 语义写零；
     /// - 调用方必须持有调度锁（避免同一 ctx 同时被两个核保存）；
     /// - 函数返回后，调用方看到的是被切出前的世界；如果 `next` 是从未跑过
     ///   的新线程，控制流将跳到其 entry，**不会返回**。
-    pub switch_context: unsafe extern "C" fn(prev: NonNull<u8>, next: NonNull<u8>),
+    pub switch_context: unsafe extern "C" fn(
+        prev: NonNull<u8>,
+        next: NonNull<u8>,
+        prev_on_cpu: NonNull<AtomicUsize>,
+    ),
 }
 
 // Safety: 仅包含 `usize` 与函数指针，全部 POD。

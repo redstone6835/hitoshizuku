@@ -78,15 +78,44 @@ pub struct SyscallContext<'a> {
     task: Option<Arc<sched::Task>>,
     frame_finalized: bool,
     restart_disabled: bool,
+    execution_scope_active: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl SyscallContext<'_> {
+    fn new(nr: usize, args: [usize; 6], tf: TrapFramePtr, task: Arc<sched::Task>) -> Self {
+        assert!(
+            task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
+            "同一任务不能嵌套进入 syscall 执行作用域"
+        );
+        Self {
+            nr,
+            args,
+            tf,
+            task: Some(task),
+            frame_finalized: false,
+            restart_disabled: false,
+            execution_scope_active: true,
+            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    fn finish_execution_scope(&mut self) {
+        if !self.execution_scope_active {
+            return;
+        }
+        if let Some(task) = self.task.as_ref() {
+            let _ = task.end_execution_scope(sched::ExecutionScopeKind::Syscall);
+        }
+        self.execution_scope_active = false;
+    }
+
     pub fn task(&self) -> &Arc<sched::Task> {
         self.task.as_ref().expect("[syscall] task already released")
     }
 
     pub fn release_task_ref(&mut self) {
+        self.finish_execution_scope();
         self.task.take();
     }
 
@@ -112,6 +141,12 @@ impl SyscallContext<'_> {
     /// 查询当前系统调用是否禁止 `SA_RESTART` 自动重启。
     pub fn restart_disabled(&self) -> bool {
         self.restart_disabled
+    }
+}
+
+impl Drop for SyscallContext<'_> {
+    fn drop(&mut self) {
+        self.finish_execution_scope();
     }
 }
 
@@ -170,15 +205,7 @@ pub fn dispatch(tf: TrapFramePtr) {
     let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
 
     let task = sched::current_task();
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        restart_disabled: false,
-        _phantom: core::marker::PhantomData,
-    };
+    let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
@@ -194,6 +221,8 @@ pub fn dispatch(tf: TrapFramePtr) {
         None
     };
 
+    #[cfg(feature = "performance-profile")]
+    let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
@@ -201,9 +230,14 @@ pub fn dispatch(tf: TrapFramePtr) {
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+    #[cfg(feature = "performance-profile")]
+    drop(invoke_profile);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        #[cfg(feature = "performance-profile")]
+        let finalize_profile =
+            profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
         if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
@@ -214,6 +248,11 @@ pub fn dispatch(tf: TrapFramePtr) {
                 )
                 .is_ok();
                 if delivered {
+                    #[cfg(feature = "performance-profile")]
+                    drop(finalize_profile);
+                    #[cfg(feature = "performance-profile")]
+                    let _handoff_profile =
+                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
                 }
@@ -242,6 +281,11 @@ pub fn dispatch(tf: TrapFramePtr) {
             }
             _ => {}
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
+        #[cfg(feature = "performance-profile")]
+        let _handoff_profile =
+            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
         sched::run_post_syscall_handoff_lazy();
     }
     // syscall 是 libcbench/lmbench 的最热路径，默认不能格式化并写入每次调用。
@@ -286,16 +330,10 @@ where
         None
     };
 
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        restart_disabled: false,
-        _phantom: core::marker::PhantomData,
-    };
+    let mut ctx = SyscallContext::new(nr, args, tf, task);
 
+    #[cfg(feature = "performance-profile")]
+    let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
@@ -303,9 +341,14 @@ where
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+    #[cfg(feature = "performance-profile")]
+    drop(invoke_profile);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        #[cfg(feature = "performance-profile")]
+        let finalize_profile =
+            profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
         if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
@@ -316,6 +359,11 @@ where
                 )
                 .is_ok();
                 if delivered {
+                    #[cfg(feature = "performance-profile")]
+                    drop(finalize_profile);
+                    #[cfg(feature = "performance-profile")]
+                    let _handoff_profile =
+                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
                 }
@@ -343,6 +391,11 @@ where
             }
             _ => {}
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
+        #[cfg(feature = "performance-profile")]
+        let _handoff_profile =
+            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
         sched::run_post_syscall_handoff_lazy();
     }
 }

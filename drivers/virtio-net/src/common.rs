@@ -6,11 +6,13 @@ use alloc::vec::Vec;
 
 use spin::mutex::Mutex;
 
-use general::dev::dma::{DmaContext, DmaDirection, new_netbuf_pool};
+use general::dev::dma::{
+    DmaContext, DmaDirection, new_netbuf_pool, new_shared_netbuf_pool,
+};
 use net::QueuePairId;
 use net::buf::{
     CompletionBatch, NetBufLease, NetBufPoolOwner, PacketBatch, PacketChain, PacketLayout,
-    PacketMetadata, RxRefillBatch, TxBatch, TxPacket,
+    PacketMetadata, RxRefillBatch, TxBatch, TxChecksum, TxPacket,
 };
 use net::device::{
     NET_QUEUE_CALL_STATUS_INVALID, NET_QUEUE_CALL_STATUS_OK, NET_QUEUE_OP_HAS_PENDING,
@@ -26,8 +28,8 @@ use net::queue::{
 };
 use virtio::virtio_mmio::VirtioMmioTransport;
 use virtio::{
-    SplitVirtQueue, VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTQ_DESC_F_WRITE, VirtioPciTransport,
-    VirtqDescUpdate,
+    SplitVirtQueue, VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTQ_DESC_F_WRITE, VIRTQ_USED_F_NO_NOTIFY,
+    VirtioPciTransport, VirtqDescUpdate, virtq_need_event,
 };
 
 const VIRTIO_NET_HEADER_LEN: u16 = 12;
@@ -38,11 +40,38 @@ const TX_HEADER_SIZE: usize = 256;
 const MAX_BATCH: usize = 32;
 const MAX_RX_REFILL_PER_CALL: usize = 4;
 const MAX_TX_DESCRIPTORS: usize = 18;
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+
+const fn virtio_tx_header(checksum: TxChecksum) -> [u8; VIRTIO_NET_HEADER_LEN as usize] {
+    let mut header = [0; VIRTIO_NET_HEADER_LEN as usize];
+    if let TxChecksum::Partial { start, offset } = checksum {
+        let start = start.to_le_bytes();
+        let offset = offset.to_le_bytes();
+        header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        header[6] = start[0];
+        header[7] = start[1];
+        header[8] = offset[0];
+        header[9] = offset[1];
+    }
+    header
+}
+
+const _: () = {
+    let header = virtio_tx_header(TxChecksum::Partial {
+        start: 0x1234,
+        offset: 0x5678,
+    });
+    assert!(header[0] == VIRTIO_NET_HDR_F_NEEDS_CSUM);
+    assert!(header[6] == 0x34 && header[7] == 0x12);
+    assert!(header[8] == 0x78 && header[9] == 0x56);
+};
 
 pub(crate) enum VirtioNetTransport {
     Mmio(Box<dyn VirtioMmioTransport>),
     Pci {
         transport: VirtioPciTransport,
+        rx_queue: u16,
+        tx_queue: u16,
         rx_notify: usize,
         tx_notify: usize,
     },
@@ -54,10 +83,17 @@ impl VirtioNetTransport {
             Self::Mmio(transport) => transport.notify_queue(u32::from(queue)),
             Self::Pci {
                 transport,
+                rx_queue,
+                tx_queue,
                 rx_notify,
                 tx_notify,
             } => {
-                let address = if queue == 0 { *rx_notify } else { *tx_notify };
+                let address = if queue == *rx_queue {
+                    *rx_notify
+                } else {
+                    debug_assert_eq!(queue, *tx_queue);
+                    *tx_notify
+                };
                 transport.notify_queue(address, queue);
             }
         }
@@ -78,23 +114,30 @@ struct PendingTx {
 }
 
 pub(crate) struct VirtioNetQueue {
+    id: QueuePairId,
     transport: VirtioNetTransport,
     rx: SplitVirtQueue,
     tx: SplitVirtQueue,
     rx_pending: Box<[Option<NetBufLease>]>,
     tx_pending: Box<[Option<PendingTx>]>,
+    event_idx: bool,
+    tx_checksum: bool,
     quiesced: bool,
 }
 
 impl VirtioNetQueue {
     pub(crate) fn new(
+        id: QueuePairId,
         transport: VirtioNetTransport,
         rx: SplitVirtQueue,
         tx: SplitVirtQueue,
+        event_idx: bool,
+        tx_checksum: bool,
     ) -> Self {
         let rx_size = usize::from(rx.queue_size());
         let tx_size = usize::from(tx.queue_size());
         Self {
+            id,
             transport,
             rx,
             tx,
@@ -106,17 +149,30 @@ impl VirtioNetQueue {
                 .map(|_| None)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            event_idx,
+            tx_checksum,
             quiesced: false,
         }
     }
 
-    pub(crate) const fn caps_value(queue_size: u16) -> NetQueueCaps {
+    fn notification_required(event_idx: bool, queue: &SplitVirtQueue, old: u16) -> bool {
+        if event_idx {
+            return queue
+                .avail_event()
+                .map(|event| virtq_need_event(event, queue.avail_idx(), old))
+                .unwrap_or(true);
+        }
+        queue.used_flags() & VIRTQ_USED_F_NO_NOTIFY == 0
+    }
+
+    pub(crate) const fn caps_value(queue_size: u16, tx_checksum: bool) -> NetQueueCaps {
         NetQueueCaps {
             queue_size,
             scatter_gather: true,
             max_tx_descriptors: MAX_TX_DESCRIPTORS as u8,
             max_rx_batch: MAX_BATCH as u8,
             max_tx_batch: MAX_BATCH as u8,
+            tx_checksum,
             udp_segmentation: false,
             max_udp_segments: 0,
         }
@@ -149,11 +205,11 @@ impl Drop for VirtioNetQueue {
 
 impl NetQueuePair for VirtioNetQueue {
     fn id(&self) -> QueuePairId {
-        QueuePairId(0)
+        self.id
     }
 
     fn caps(&self) -> NetQueueCaps {
-        Self::caps_value(self.rx.queue_size())
+        Self::caps_value(self.rx.queue_size(), self.tx_checksum)
     }
 
     fn refill_rx_batch(&mut self, batch: &mut RxRefillBatch) -> RxRefillResult {
@@ -222,6 +278,7 @@ impl NetQueuePair for VirtioNetQueue {
             slots[posted] = index;
             posted += 1;
         }
+        let old_avail = self.rx.avail_idx();
         if posted != 0 && self.rx.push_avail_many(&heads[..posted]).is_err() {
             for position in 0..posted {
                 let head = heads[position];
@@ -236,8 +293,8 @@ impl NetQueuePair for VirtioNetQueue {
                 fatal: Some(QueueFatalError::RingCorrupt),
             };
         }
-        if posted != 0 {
-            self.transport.notify(0);
+        if posted != 0 && Self::notification_required(self.event_idx, &self.rx, old_avail) {
+            self.transport.notify(self.id.0.saturating_mul(2));
         }
         RxRefillResult {
             posted: posted as u16,
@@ -438,7 +495,11 @@ impl NetQueuePair for VirtioNetQueue {
             };
             let fragment_count = candidate.chain.fragment_count();
             let descriptor_count = fragment_count + 1;
+            let checksum_valid = candidate
+                .checksum
+                .valid_for(self.tx_checksum, candidate.chain.total_len());
             if descriptor_count > MAX_TX_DESCRIPTORS
+                || !checksum_valid
                 || (0..fragment_count).any(|fragment| {
                     candidate
                         .chain
@@ -456,10 +517,10 @@ impl NetQueuePair for VirtioNetQueue {
             ) else {
                 break;
             };
-            header
+            let header_bytes = header
                 .as_mut_slice()
-                .expect("VirtIO-net TX header lease 范围有效")
-                .fill(0);
+                .expect("VirtIO-net TX header lease 范围有效");
+            header_bytes.copy_from_slice(&virtio_tx_header(candidate.checksum));
             if header.sync_for_device().is_err() {
                 break;
             }
@@ -545,6 +606,7 @@ impl NetQueuePair for VirtioNetQueue {
             descriptor_total = descriptor_total.saturating_add(descriptor_count as u16);
             byte_total = byte_total.saturating_add(frame_len);
         }
+        let old_avail = self.tx.avail_idx();
         if submitted != 0 && self.tx.push_avail_many(&heads[..submitted]).is_err() {
             for position in 0..submitted {
                 let head = heads[position];
@@ -561,8 +623,9 @@ impl NetQueuePair for VirtioNetQueue {
                 fatal: Some(QueueFatalError::RingCorrupt),
             };
         }
-        if submitted != 0 {
-            self.transport.notify(1);
+        if submitted != 0 && Self::notification_required(self.event_idx, &self.tx, old_avail) {
+            self.transport
+                .notify(self.id.0.saturating_mul(2).saturating_add(1));
         }
         TxSubmitResult {
             packets: submitted as u16,
@@ -631,7 +694,8 @@ impl NetQueuePair for SharedVirtioNetQueue {
 }
 
 struct ActiveDevice {
-    queue: Arc<Mutex<VirtioNetQueue>>,
+    queues: Box<[Arc<Mutex<VirtioNetQueue>>]>,
+    _control_queue: Option<SplitVirtQueue>,
     handle: Option<NetDeviceHandle>,
 }
 
@@ -655,55 +719,110 @@ pub(crate) fn install_active(
     mac_address: [u8; 6],
     mtu: u32,
 ) -> Result<NetDeviceHandle, NetDeviceRegisterErrorKind> {
-    let queue_size = usize::from(queue.rx.queue_size());
-    let queue = Arc::new(Mutex::new(queue));
-    let rx_pool = dma_pool(
+    install_active_queues(
+        alloc::vec![(queue, irq)],
+        None,
         context,
-        queue_size,
-        DMA_PAGE_SIZE,
-        DMA_PAGE_SIZE,
-        DmaDirection::FromDevice,
-    )?;
-    let tx_header_pool = dma_pool(
-        context,
-        queue_size,
-        TX_HEADER_SIZE,
-        64,
-        DmaDirection::ToDevice,
-    )?;
-    let tx_payload_pool = dma_pool(
-        context,
-        queue_size,
-        DMA_PAGE_SIZE,
-        DMA_PAGE_SIZE,
-        DmaDirection::ToDevice,
-    )?;
-    #[cfg(not(feature = "elm-integrated"))]
-    let endpoint = {
-        let caps = queue.lock().caps();
-        NetQueueEndpoint::Pinned(
-            PinnedNetQueueEndpoint::current(
-                "net.virtio.queue-call",
-                "mygo.net.queue-call@1",
-                1,
-                QueuePairId(0),
-                caps,
-                false,
-            )
-            .ok_or(NetDeviceRegisterErrorKind::InvalidRegistration)?,
+        mac_address,
+        mtu,
+    )
+}
+
+pub(crate) fn install_active_queues(
+    queues: Vec<(VirtioNetQueue, Arc<dyn QueueIrqControl>)>,
+    control_queue: Option<SplitVirtQueue>,
+    context: DmaContext,
+    mac_address: [u8; 6],
+    mtu: u32,
+) -> Result<NetDeviceHandle, NetDeviceRegisterErrorKind> {
+    if queues.is_empty()
+        || queues
+            .iter()
+            .enumerate()
+            .any(|(index, (queue, _))| queue.id() != QueuePairId(index as u16))
+    {
+        return Err(NetDeviceRegisterErrorKind::InvalidRegistration);
+    }
+    let mut active_queues = Vec::new();
+    let mut registrations = Vec::new();
+    active_queues
+        .try_reserve_exact(queues.len())
+        .map_err(|_| NetDeviceRegisterErrorKind::ResourceExhausted)?;
+    registrations
+        .try_reserve_exact(queues.len())
+        .map_err(|_| NetDeviceRegisterErrorKind::ResourceExhausted)?;
+    for (queue, irq) in queues {
+        let id = queue.id();
+        let queue_size = usize::from(queue.rx.queue_size());
+        let queue = Arc::new(Mutex::new(queue));
+        let rx_pool = dma_pool(
+            context,
+            queue_size,
+            DMA_PAGE_SIZE,
+            DMA_PAGE_SIZE,
+            DmaDirection::FromDevice,
+        )?;
+        let tx_header_pool = dma_pool(
+            context,
+            queue_size,
+            TX_HEADER_SIZE,
+            64,
+            DmaDirection::ToDevice,
+        )?;
+        let tx_payload_pool = new_shared_netbuf_pool(
+            context,
+            queue_size,
+            DMA_PAGE_SIZE,
+            DMA_PAGE_SIZE,
+            DmaDirection::ToDevice,
         )
-    };
-    #[cfg(feature = "elm-integrated")]
-    let endpoint = NetQueueEndpoint::Integrated(Box::new(SharedVirtioNetQueue {
-        inner: Arc::clone(&queue),
-    }));
+        .map_err(|_| NetDeviceRegisterErrorKind::ResourceExhausted)?;
+        let socket_tx_pool = new_shared_netbuf_pool(
+            context,
+            queue_size.saturating_mul(net::tuning::SOCKET_TX_POOL_DEPTH_MULTIPLIER),
+            DMA_PAGE_SIZE,
+            DMA_PAGE_SIZE,
+            DmaDirection::ToDevice,
+        )
+        .map_err(|_| NetDeviceRegisterErrorKind::ResourceExhausted)?;
+        #[cfg(not(feature = "elm-integrated"))]
+        let endpoint = {
+            let caps = queue.lock().caps();
+            NetQueueEndpoint::Pinned(
+                PinnedNetQueueEndpoint::current(
+                    "net.virtio.queue-call",
+                    "mygo.net.queue-call@1",
+                    1,
+                    id,
+                    caps,
+                    false,
+                )
+                .ok_or(NetDeviceRegisterErrorKind::InvalidRegistration)?,
+            )
+        };
+        #[cfg(feature = "elm-integrated")]
+        let endpoint = NetQueueEndpoint::Integrated(Box::new(SharedVirtioNetQueue {
+            inner: Arc::clone(&queue),
+        }));
+        registrations.push(NetQueueRegistration {
+            id,
+            queue: endpoint,
+            rx_pool,
+            tx_header_pool,
+            tx_payload_pool,
+            socket_tx_pool,
+            irq,
+        });
+        active_queues.push(queue);
+    }
     {
         let mut active = ACTIVE_DEVICE.lock();
         if active.is_some() {
             return Err(NetDeviceRegisterErrorKind::ResourceExhausted);
         }
         *active = Some(ActiveDevice {
-            queue: Arc::clone(&queue),
+            queues: active_queues.into_boxed_slice(),
+            _control_queue: control_queue,
             handle: None,
         });
     }
@@ -712,15 +831,7 @@ pub(crate) fn install_active(
         mac_address,
         mtu,
         true,
-        alloc::vec![NetQueueRegistration {
-            id: QueuePairId(0),
-            queue: endpoint,
-            rx_pool,
-            tx_header_pool,
-            tx_payload_pool,
-            irq,
-        }]
-        .into_boxed_slice(),
+        registrations.into_boxed_slice(),
     );
     match net::device::register_device(registration) {
         Ok(handle) => {
@@ -741,11 +852,12 @@ pub(crate) fn install_active(
 pub(crate) fn quiesce_active() -> Result<(), NetDeviceRemoveError> {
     let active = ACTIVE_DEVICE.lock();
     if let Some(active) = active.as_ref() {
-        active
-            .queue
-            .lock()
-            .quiesce()
-            .map_err(|_| NetDeviceRemoveError::Busy)?;
+        for queue in active.queues.iter() {
+            queue
+                .lock()
+                .quiesce()
+                .map_err(|_| NetDeviceRemoveError::Busy)?;
+        }
     }
     Ok(())
 }
@@ -784,15 +896,21 @@ pub(crate) fn remove_active_from_pnp() {
     mode = "direct-pinned",
     visibility = "private"
 )]
-fn virtio_net_queue_call(frame: &mut net::device::NetQueueCallV1) -> i32 {
-    if !frame.valid(frame.opcode, QueuePairId(0)) {
+fn virtio_net_queue_call(frame: &mut net::device::NetQueueCall) -> i32 {
+    if !frame.valid(frame.opcode, frame.queue_id) {
         return NET_QUEUE_CALL_STATUS_INVALID;
     }
     let active = ACTIVE_DEVICE.lock();
     let Some(active) = active.as_ref() else {
         return NET_QUEUE_CALL_STATUS_INVALID;
     };
-    let mut queue = active.queue.lock();
+    let Some(queue) = active.queues.get(frame.queue_id.0 as usize) else {
+        return NET_QUEUE_CALL_STATUS_INVALID;
+    };
+    let mut queue = queue.lock();
+    if queue.id() != frame.queue_id {
+        return NET_QUEUE_CALL_STATUS_INVALID;
+    }
     match frame.opcode {
         NET_QUEUE_OP_REFILL_RX => {
             let Some(batch) = (unsafe { frame.refill_batch.as_mut() }) else {
