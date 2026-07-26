@@ -1494,12 +1494,8 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                     .to_ne_bytes()
                     .to_vec(),
             ),
-            SO_SNDBUF => Ok((net_ops.proxy().buffer_limits().0 as i32)
-                .to_ne_bytes()
-                .to_vec()),
-            SO_RCVBUF => Ok((net_ops.proxy().buffer_limits().1 as i32)
-                .to_ne_bytes()
-                .to_vec()),
+            SO_SNDBUF => Ok(opts.sndbuf.to_ne_bytes().to_vec()),
+            SO_RCVBUF => Ok(opts.rcvbuf.to_ne_bytes().to_vec()),
             SO_REUSEADDR => Ok((opts.reuseaddr as i32).to_ne_bytes().to_vec()),
             SO_REUSEPORT => Ok((opts.reuseport as i32).to_ne_bytes().to_vec()),
             SO_BROADCAST => Ok((opts.broadcast as i32).to_ne_bytes().to_vec()),

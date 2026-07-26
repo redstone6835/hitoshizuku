@@ -56,6 +56,9 @@ pub const SOCK_STREAM_PUB: u16 = SOCK_STREAM;
 #[allow(dead_code)]
 pub const SOCK_DGRAM_PUB: u16 = SOCK_DGRAM;
 
+const TCP_DEFAULT_SEND_BUFFER: i32 = 16 * 1024;
+const TCP_DEFAULT_RECEIVE_BUFFER: i32 = 128 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct InetSendOptions {
     pub nonblocking: bool,
@@ -842,8 +845,10 @@ pub fn create_net_socket(
                 proxy,
                 nonblock,
                 SocketOptions {
-                    sndbuf: 256 * 1024,
-                    rcvbuf: 256 * 1024,
+                    // 默认可见值保持常见 Linux socket ABI 行为；facade 内部保留
+                    // 有界自动调节余量，显式 setsockopt 后两者会重新同步。
+                    sndbuf: TCP_DEFAULT_SEND_BUFFER,
+                    rcvbuf: TCP_DEFAULT_RECEIVE_BUFFER,
                     ..SocketOptions::default()
                 },
             ))
