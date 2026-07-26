@@ -511,6 +511,7 @@ impl ConfigStore {
             return Err(ConfigError::GenerationNotIncreasing);
         }
         *current = next;
+        crate::socket::invalidate_local_datagram_routes();
         Ok(())
     }
 
@@ -524,6 +525,7 @@ impl ConfigStore {
             return Err(ConfigError::GenerationNotIncreasing);
         }
         *current = next;
+        crate::socket::invalidate_local_datagram_routes();
         Ok(())
     }
 }

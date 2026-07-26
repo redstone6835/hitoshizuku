@@ -417,6 +417,9 @@ pub fn track_socket_facade(facade: &Arc<SocketFacade>, generation: u64) {
     });
     if !present {
         registry.push(Arc::downgrade(facade));
+        if facade.activate_packet_observer() {
+            invalidate_local_datagram_routes();
+        }
     }
     drop(registry);
 
@@ -2289,6 +2292,70 @@ fn wake_one_socket_waiter(queue: &WaitQueue) {
     queue.wake_one_default();
 }
 
+fn wake_one_socket_reader(queue: &WaitQueue, _socket: SocketId) {
+    if queue.len_hint() == 0 {
+        return;
+    }
+    #[cfg(feature = "performance-profile")]
+    {
+        record_socket_wakeup();
+        let correlation = profiling::next_correlation_id();
+        profiling::trace_point(profiling::Event::NetPeerRx, _socket.counter, correlation);
+        queue.wake_one_default_with_cause(1, _socket.counter, correlation);
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    queue.wake_one_default();
+}
+
+/// 唤醒本地接收者，并返回可在公共调度边界复查的稳定任务身份。
+///
+/// 任务只获得普通可运行资格，不提升调度优先级；跨 CPU 和通用网络路径仍使用
+/// 普通就绪资格。返回的目标可以保留到有界批次末尾，但不能改变目标优先级。
+fn wake_one_local_socket_reader(
+    queue: &WaitQueue,
+    _socket: SocketId,
+    request_reschedule: bool,
+) -> Option<sched::HandoffTarget> {
+    if queue.len_hint() == 0 {
+        return None;
+    }
+    let task = queue.wake_one_with(|_| {})?;
+    let now_ns = sched::now_ns_public();
+    #[cfg(feature = "performance-profile")]
+    {
+        record_socket_wakeup();
+        let correlation = profiling::next_correlation_id();
+        profiling::trace_point(profiling::Event::NetPeerRx, _socket.counter, correlation);
+        task.set_profile_wake_cause(1, _socket.counter, correlation, now_ns);
+    }
+    Some(sched::enqueue_task_preferred_for_handoff(
+        task,
+        now_ns,
+        sched::HandoffReason::SocketRead,
+        true,
+        request_reschedule,
+    ))
+}
+
+fn wake_one_socket_writer(queue: &WaitQueue, _socket: SocketId) {
+    if queue.len_hint() == 0 {
+        return;
+    }
+    #[cfg(feature = "performance-profile")]
+    {
+        record_socket_wakeup();
+        let correlation = profiling::next_correlation_id();
+        profiling::trace_point(
+            profiling::Event::NetTxWritable,
+            _socket.counter,
+            correlation,
+        );
+        queue.wake_one_default_with_cause(2, _socket.counter, correlation);
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    queue.wake_one_default();
+}
+
 pub struct UdpTxLease {
     facade: Arc<SocketFacade>,
     slot: u16,
@@ -2362,7 +2429,7 @@ impl UdpTxLease {
             .writable();
         if writable {
             self.facade.set_ready(Readiness::WRITABLE);
-            wake_one_socket_waiter(&self.facade.write_wait);
+            wake_one_socket_writer(&self.facade.write_wait, self.facade.id);
         } else {
             self.facade.clear_ready(Readiness::WRITABLE);
         }
@@ -2394,19 +2461,22 @@ pub struct SocketFacade {
     protocol: u8,
     stack_generation: AtomicU64,
     stack_detached: AtomicBool,
+    packet_observer_active: AtomicBool,
     generation: AtomicU32,
     owner: Mutex<OwnerRef>,
     local: Mutex<Option<Endpoint>>,
     peer: Mutex<Option<Endpoint>>,
+    local_datagram_route: Mutex<Option<LocalDatagramRoute>>,
     tx: Mutex<Option<TxRing>>,
-    rx: Mutex<Option<RxRing>>,
+    rx: Mutex<Option<DatagramRx>>,
     stream_tx: Mutex<StreamTxRing>,
     stream_rx: Mutex<StreamRxRing>,
     listen_group: Mutex<Option<Arc<ListenGroup>>>,
     readiness: AtomicU16,
     readiness_generation: AtomicU64,
-    observer: Mutex<Option<Weak<dyn ReadinessObserver>>>,
+    observer: Mutex<Option<Arc<dyn ReadinessObserver>>>,
     read_wait: WaitQueue,
+    local_read_handoff: Mutex<Option<sched::HandoffTarget>>,
     write_wait: WaitQueue,
     accept_wait: WaitQueue,
     state_wait: WaitQueue,
@@ -2416,6 +2486,7 @@ pub struct SocketFacade {
     control_result: Mutex<Option<(u64, Result<(), SocketError>)>>,
     tx_notified: AtomicBool,
     tx_generation: AtomicU64,
+    tx_completed_generation: AtomicU64,
     lifecycle_notified: AtomicBool,
     closing: AtomicBool,
     abortive_close: AtomicBool,
@@ -2450,6 +2521,8 @@ pub struct SocketFacade {
     tcp_total_retransmitted: AtomicU32,
     tcp_bytes_sent: AtomicU64,
     tcp_bytes_received: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    tcp_profile_updates: AtomicU64,
     raw_header_included: AtomicBool,
     free_bind: AtomicBool,
     v6_only: AtomicBool,
@@ -2535,12 +2608,14 @@ impl SocketFacade {
             protocol,
             stack_generation: AtomicU64::new(0),
             stack_detached: AtomicBool::new(false),
+            packet_observer_active: AtomicBool::new(false),
             generation: AtomicU32::new(1),
             owner: Mutex::new(OwnerRef::Unassigned),
             local: Mutex::new(None),
             peer: Mutex::new(None),
+            local_datagram_route: Mutex::new(None),
             tx: Mutex::new((kind != SocketKind::Stream).then(TxRing::new)),
-            rx: Mutex::new((kind != SocketKind::Stream).then(RxRing::new)),
+            rx: Mutex::new((kind != SocketKind::Stream).then(DatagramRx::new)),
             stream_tx: Mutex::new(StreamTxRing::new()),
             stream_rx: Mutex::new(StreamRxRing::new()),
             listen_group: Mutex::new(None),
@@ -2552,6 +2627,7 @@ impl SocketFacade {
             readiness_generation: AtomicU64::new(1),
             observer: Mutex::new(None),
             read_wait: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
+            local_read_handoff: Mutex::new(None),
             write_wait: WaitQueue::new_with_reason(sched::WaitReason::SocketWrite),
             accept_wait: WaitQueue::new_with_reason(sched::WaitReason::SocketRead),
             state_wait: WaitQueue::new_with_reason(sched::WaitReason::Poll),
@@ -2561,6 +2637,7 @@ impl SocketFacade {
             control_result: Mutex::new(None),
             tx_notified: AtomicBool::new(false),
             tx_generation: AtomicU64::new(0),
+            tx_completed_generation: AtomicU64::new(0),
             lifecycle_notified: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             abortive_close: AtomicBool::new(false),
@@ -2595,6 +2672,8 @@ impl SocketFacade {
             tcp_total_retransmitted: AtomicU32::new(0),
             tcp_bytes_sent: AtomicU64::new(0),
             tcp_bytes_received: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            tcp_profile_updates: AtomicU64::new(0),
             raw_header_included: AtomicBool::new(false),
             free_bind: AtomicBool::new(false),
             v6_only: AtomicBool::new(false),
@@ -2627,6 +2706,17 @@ impl SocketFacade {
 
     pub const fn protocol(&self) -> u8 {
         self.protocol
+    }
+
+    fn activate_packet_observer(&self) -> bool {
+        self.kind == SocketKind::Raw
+            && register_packet_observer(&self.packet_observer_active, &ACTIVE_PACKET_OBSERVERS)
+    }
+
+    fn deactivate_packet_observer(&self) {
+        if unregister_packet_observer(&self.packet_observer_active, &ACTIVE_PACKET_OBSERVERS) {
+            invalidate_local_datagram_routes();
+        }
     }
 
     /// 将 TCP 发送 ring 迁移到目标 queue 的稳定 payload pool。
@@ -2834,6 +2924,12 @@ impl SocketFacade {
         if self.stack_detached.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.deactivate_packet_observer();
+        self.clear_local_datagram_route();
+        self.local_read_handoff.lock().take();
+        if self.kind != SocketKind::Stream {
+            invalidate_local_datagram_routes();
+        }
         self.set_pending_error(SocketError::NetworkDown);
         self.update_ready(
             (Readiness::ERROR | Readiness::HANGUP | Readiness::READ_HANGUP).0,
@@ -2889,7 +2985,7 @@ impl SocketFacade {
     }
 
     pub fn set_observer(&self, observer: Weak<dyn ReadinessObserver>) {
-        *self.observer.lock() = Some(observer);
+        *self.observer.lock() = observer.upgrade();
     }
 
     pub fn add_poll_waiter(
@@ -3099,6 +3195,93 @@ impl SocketFacade {
         });
     }
 
+    pub(crate) fn install_local_datagram_route(&self, route: LocalDatagramRoute) {
+        if self.kind == SocketKind::Datagram && local_transport_fast_path_eligible() {
+            if let Ok(_resident) = enter_resident_allocation_scope() {
+                route
+                    .receiver
+                    .rx
+                    .lock()
+                    .as_mut()
+                    .expect("UDP facade 必须拥有 RX ring")
+                    .prepare_local_lane();
+            }
+            *self.local_datagram_route.lock() = Some(route);
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::UdpLocalRouteInstalls, 1);
+        }
+    }
+
+    pub(crate) fn remember_local_datagram_route(
+        &self,
+        receiver: Arc<SocketFacade>,
+        destination: Endpoint,
+        source: Endpoint,
+        delivered_to: Endpoint,
+        interface: InterfaceId,
+        dont_route: bool,
+        confirm: bool,
+        mark: u32,
+        hop_limit: u8,
+        traffic_class: u8,
+        route_mtu: u32,
+    ) {
+        let route = LocalDatagramRoute {
+            epoch: local_datagram_route_epoch(),
+            stack_generation: self.stack_generation(),
+            sender_generation: self.generation(),
+            receiver_generation: receiver.generation(),
+            destination,
+            source,
+            delivered_to,
+            interface,
+            dont_route,
+            confirm,
+            mark,
+            hop_limit,
+            traffic_class,
+            route_mtu,
+            receiver,
+        };
+        self.install_local_datagram_route(route);
+    }
+
+    fn clear_local_datagram_route(&self) {
+        self.local_datagram_route.lock().take();
+    }
+
+    fn local_datagram_route_matches(
+        &self,
+        route: &LocalDatagramRoute,
+        destination: Endpoint,
+        payload_len: usize,
+        dont_route: bool,
+        confirm: bool,
+    ) -> bool {
+        let epoch_matches = route.epoch == local_datagram_route_epoch();
+        #[cfg(test)]
+        let epoch_matches = epoch_matches || route.epoch == u64::MAX;
+        epoch_matches
+            && local_transport_fast_path_eligible()
+            && route.stack_generation == self.stack_generation()
+            && route.sender_generation == self.generation()
+            && route.receiver_generation == route.receiver.generation()
+            && route.receiver.stack_generation() == route.stack_generation
+            && !route.receiver.is_closing()
+            && route.destination == destination
+            && crate::transport::local_udp_payload_fits_route(
+                destination.addr,
+                payload_len,
+                route.route_mtu,
+            )
+            && route.dont_route == dont_route
+            && route.confirm == confirm
+            && route.mark == self.socket_mark()
+            && route.hop_limit == self.ip_hop_limit()
+            && route.traffic_class == self.ip_traffic_class()
+            && route.interface == self.interface().unwrap_or(route.interface)
+    }
+
     pub fn send(
         self: &Arc<Self>,
         payload: &[u8],
@@ -3118,33 +3301,135 @@ impl SocketFacade {
         dont_route: bool,
         confirm: bool,
     ) -> Result<usize, SocketError> {
-        self.ensure_stack_attached()?;
+        match self.send_datagram_from(
+            payload.len(),
+            destination,
+            nonblocking,
+            deadline_ns,
+            dont_route,
+            confirm,
+            |offset, output| {
+                output.copy_from_slice(&payload[offset..offset + output.len()]);
+                Ok::<(), core::convert::Infallible>(())
+            },
+        ) {
+            Ok(len) => Ok(len),
+            Err(DatagramCopyError::Socket(error)) => Err(error),
+            Err(DatagramCopyError::Copy(error)) => match error {},
+        }
+    }
+
+    /// 把外部复制源直接写入预留的数据报槽，避免在 syscall 层建立中间缓冲。
+    ///
+    /// copy 失败时槽位和 chunk 全部回滚，数据报不会对协议层或接收端可见。
+    pub fn send_datagram_from<E>(
+        self: &Arc<Self>,
+        payload_len: usize,
+        destination: Option<Endpoint>,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        dont_route: bool,
+        confirm: bool,
+        mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<usize, DatagramCopyError<E>> {
+        self.ensure_stack_attached()
+            .map_err(DatagramCopyError::Socket)?;
         if self.closing.load(Ordering::Acquire) {
-            return Err(SocketError::Closed);
+            return Err(DatagramCopyError::Socket(SocketError::Closed));
         }
         if self.write_shutdown.load(Ordering::Acquire) {
-            return Err(SocketError::WriteShutdown);
+            return Err(DatagramCopyError::Socket(SocketError::WriteShutdown));
         }
         let destination = destination
             .or_else(|| self.peer_endpoint())
-            .ok_or(SocketError::DestinationRequired)?;
+            .ok_or(DatagramCopyError::Socket(SocketError::DestinationRequired))?;
         let max_payload = match (self.kind, self.family) {
             (SocketKind::Raw, _) => u16::MAX as usize,
             (SocketKind::Datagram, AddressFamily::Ipv4) => MAX_UDP4_PAYLOAD,
             (SocketKind::Datagram, AddressFamily::Ipv6) => MAX_UDP6_PAYLOAD,
-            (SocketKind::Stream, _) => return Err(SocketError::InvalidState),
+            (SocketKind::Stream, _) => {
+                return Err(DatagramCopyError::Socket(SocketError::InvalidState));
+            }
         };
-        if payload.len() > max_payload {
-            return Err(SocketError::MessageTooLarge);
+        if payload_len > max_payload {
+            return Err(DatagramCopyError::Socket(SocketError::MessageTooLarge));
+        }
+        let cached_route = self.local_datagram_route.lock().clone();
+        if let Some(route) = cached_route {
+            if self.local_datagram_route_matches(
+                &route,
+                destination,
+                payload_len,
+                dont_route,
+                confirm,
+            ) {
+                #[cfg(feature = "performance-profile")]
+                let direct_start = profiling::read_counter();
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::UdpLocalRouteMatches, 1);
+                let direct_result = route.receiver.push_local_udp_from(
+                    payload_len,
+                    route.source,
+                    route.delivered_to,
+                    route.hop_limit,
+                    route.traffic_class,
+                    route.interface,
+                    sched::now_ns_public(),
+                    &mut copy,
+                );
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(
+                    profiling::Metric::UdpLocalDirectCycles,
+                    profiling::read_counter().wrapping_sub(direct_start),
+                );
+                match direct_result {
+                    Ok(()) => {
+                        #[cfg(feature = "performance-profile")]
+                        {
+                            profiling::observe(profiling::Metric::UdpLocalRouteDeliveries, 1);
+                            profiling::observe(
+                                profiling::Metric::UdpLocalDirectBytes,
+                                payload_len as u64,
+                            );
+                        }
+                        return Ok(payload_len);
+                    }
+                    Err(DatagramCopyError::Copy(error)) => {
+                        return Err(DatagramCopyError::Copy(error));
+                    }
+                    Err(DatagramCopyError::Socket(SocketError::WouldBlock)) => {
+                        #[cfg(feature = "performance-profile")]
+                        profiling::observe(profiling::Metric::UdpLocalRouteReceiverRejects, 1);
+                        route.receiver.request_local_udp_consumer_handoff();
+                        return Ok(payload_len);
+                    }
+                    Err(DatagramCopyError::Socket(_)) => {
+                        #[cfg(feature = "performance-profile")]
+                        profiling::observe(profiling::Metric::UdpLocalRouteReceiverRejects, 1);
+                    }
+                }
+            } else {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::UdpLocalRouteInvalid, 1);
+            }
+            self.clear_local_datagram_route();
+        } else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::UdpLocalRouteAbsent, 1);
         }
         loop {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::UdpLocalFallbackDatagrams, 1);
             let pushed = {
                 let mut tx_guard = self.tx.lock();
                 let tx = tx_guard.as_mut().expect("UDP facade 必须拥有 TX ring");
                 let was_empty = tx.is_empty();
-                match tx.push(payload, destination, dont_route, confirm) {
+                match tx.push_from(payload_len, destination, dont_route, confirm, &mut copy) {
                     Ok(()) => Ok(was_empty),
-                    Err(error) => Err((error, tx.exhausted_pool_key())),
+                    Err(DatagramCopyError::Socket(error)) => Err((error, tx.exhausted_pool_key())),
+                    Err(DatagramCopyError::Copy(error)) => {
+                        return Err(DatagramCopyError::Copy(error));
+                    }
                 }
             };
             let was_empty = match pushed {
@@ -3155,18 +3440,21 @@ impl SocketFacade {
                     }
                     self.refresh_tx_readiness();
                     if nonblocking {
-                        return Err(SocketError::WouldBlock);
+                        return Err(DatagramCopyError::Socket(SocketError::WouldBlock));
                     }
-                    self.wait_datagram_write(payload.len(), deadline_ns)?;
+                    self.wait_datagram_write(payload_len, deadline_ns)
+                        .map_err(DatagramCopyError::Socket)?;
                     continue;
                 }
-                Err((error, _)) => return Err(error),
+                Err((error, _)) => return Err(DatagramCopyError::Socket(error)),
             };
             self.refresh_tx_readiness();
             if was_empty && !self.tx_notified.swap(true, Ordering::AcqRel) {
-                socket_runtime()?.notify_tx(Arc::clone(self));
+                socket_runtime()
+                    .map_err(DatagramCopyError::Socket)?
+                    .notify_tx(Arc::clone(self), SocketTxCause::Datagram);
             }
-            return Ok(payload.len());
+            return Ok(payload_len);
         }
     }
 
@@ -3196,7 +3484,7 @@ impl SocketFacade {
         if pending && !self.tx_notified.swap(true, Ordering::AcqRel) {
             socket_runtime()
                 .expect("socket runtime 必须保持安装")
-                .notify_tx(Arc::clone(self));
+                .notify_tx(Arc::clone(self), SocketTxCause::DrainRecheck);
         }
     }
 
@@ -3210,19 +3498,29 @@ impl SocketFacade {
                 .is_empty()
     }
 
+    pub fn next_datagram_destination(&self) -> Option<Endpoint> {
+        matches!(self.kind, SocketKind::Datagram | SocketKind::Raw)
+            .then(|| self.tx.lock().as_ref().and_then(TxRing::next_destination))
+            .flatten()
+    }
+
     pub fn stream_tx_generation(&self) -> u64 {
         self.tx_generation.load(Ordering::Acquire)
     }
 
     pub fn finish_stream_tx_drain(self: &Arc<Self>, observed_generation: u64) {
+        self.tx_completed_generation
+            .store(observed_generation, Ordering::Release);
         self.tx_notified.store(false, Ordering::Release);
         fence(Ordering::SeqCst);
         if self.tx_generation.load(Ordering::Acquire) != observed_generation
             && !self.tx_notified.swap(true, Ordering::AcqRel)
         {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpTxNotifyDrainRecheck, 1);
             socket_runtime()
                 .expect("socket runtime 必须保持安装")
-                .notify_tx(Arc::clone(self));
+                .notify_tx(Arc::clone(self), SocketTxCause::DrainRecheck);
         }
     }
 
@@ -3233,7 +3531,7 @@ impl SocketFacade {
     pub fn set_tcp_nodelay(self: &Arc<Self>, enabled: bool) {
         let changed = self.tcp_nodelay.swap(enabled, Ordering::AcqRel) != enabled;
         if changed && enabled {
-            self.notify_stream_pending();
+            self.request_stream_recheck();
         }
     }
 
@@ -3244,7 +3542,7 @@ impl SocketFacade {
     pub fn set_tcp_cork(self: &Arc<Self>, enabled: bool) {
         let changed = self.tcp_cork.swap(enabled, Ordering::AcqRel) != enabled;
         if changed && !enabled {
-            self.notify_stream_pending();
+            self.request_stream_recheck();
         }
     }
 
@@ -3255,20 +3553,51 @@ impl SocketFacade {
     pub fn set_tcp_more(self: &Arc<Self>, enabled: bool) {
         let changed = self.tcp_more.swap(enabled, Ordering::AcqRel) != enabled;
         if changed && !enabled {
+            let generation = self.tx_generation.load(Ordering::Acquire);
+            let completed = self.tx_completed_generation.load(Ordering::Acquire);
+            let unsent = self.stream_unsent_len();
+            let send_mss = usize::try_from(self.tcp_send_mss.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX)
+                .max(1);
+            // 已完成的同一代大块数据只能等待 ACK/window 继续推进；清除 MSG_MORE
+            // 不会改变它的可发送性。只有小于 MSS 的尾包需要强制解除 cork。
+            if generation == completed && unsent != 0 && unsent < send_mss {
+                self.tx_generation.fetch_add(1, Ordering::Release);
+            }
             self.notify_stream_pending();
         }
     }
 
     fn notify_stream_pending(self: &Arc<Self>) {
-        if self.stream_unsent_len() == 0 {
-            return;
-        }
+        let _ = self.publish_stream_pending();
+    }
+
+    fn request_stream_recheck(self: &Arc<Self>) {
         self.tx_generation.fetch_add(1, Ordering::Release);
+        self.notify_stream_pending();
+    }
+
+    fn publish_stream_pending(self: &Arc<Self>) -> Result<(), SocketError> {
+        if self.stream_unsent_len() == 0 {
+            return Ok(());
+        }
+        if self.tx_generation.load(Ordering::Acquire)
+            == self.tx_completed_generation.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         if !self.tx_notified.swap(true, Ordering::AcqRel) {
-            if let Ok(runtime) = socket_runtime() {
-                runtime.notify_tx(Arc::clone(self));
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpTxNotifyPayload, 1);
+            match socket_runtime() {
+                Ok(runtime) => runtime.notify_tx(Arc::clone(self), SocketTxCause::StreamPayload),
+                Err(error) => {
+                    self.tx_notified.store(false, Ordering::Release);
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     }
 
     pub fn request_quick_ack(&self) {
@@ -3400,6 +3729,11 @@ impl SocketFacade {
         }
     }
 
+    #[cfg(feature = "performance-profile")]
+    pub(crate) fn tcp_profile_trace_due(&self) -> bool {
+        self.tcp_profile_updates.fetch_add(1, Ordering::Relaxed) & 0xff == 0
+    }
+
     pub fn set_tcp_keepcount(self: &Arc<Self>, value: u16) {
         self.tcp_keepcount.store(value.max(1), Ordering::Release);
         self.notify_tcp_state_change();
@@ -3409,18 +3743,51 @@ impl SocketFacade {
         self.receive_window_update.swap(false, Ordering::AcqRel)
     }
 
+    pub fn finish_stream_receive(self: &Arc<Self>) {
+        if self.receive_window_update.load(Ordering::Acquire) {
+            self.notify_tcp_state_change();
+        }
+    }
+
     fn notify_tcp_state_change(self: &Arc<Self>) {
+        self.notify_tcp_state_change_with_cause(SocketTxCause::StreamState);
+    }
+
+    fn notify_tcp_state_change_with_cause(self: &Arc<Self>, cause: SocketTxCause) {
         if matches!(self.owner(), OwnerRef::Flow { .. }) {
             self.tx_generation.fetch_add(1, Ordering::Release);
             if !self.tx_notified.swap(true, Ordering::AcqRel)
                 && let Ok(runtime) = socket_runtime()
             {
-                runtime.notify_tx(Arc::clone(self));
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpTxNotifyState, 1);
+                runtime.notify_tx(Arc::clone(self), cause);
             }
         }
     }
 
     pub fn send_stream(
+        self: &Arc<Self>,
+        payload: &[u8],
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+    ) -> Result<usize, SocketError> {
+        // 用户页可能被内存管理层拆成多个短借用窗口。more 为 true 时只积累发送数据，
+        // 最后一个窗口再统一发布；容量不足时提前发布，并把已接受的部分交还调用方。
+        self.tcp_more.store(more, Ordering::Release);
+        let result = self.send_stream_buffered(payload, nonblocking, deadline_ns);
+        if more {
+            return result;
+        }
+        let publish = self.publish_stream_pending();
+        match (result, publish) {
+            (Ok(accepted), Err(error)) if accepted == 0 => Err(error),
+            (result, _) => result,
+        }
+    }
+
+    fn send_stream_buffered(
         self: &Arc<Self>,
         payload: &[u8],
         nonblocking: bool,
@@ -3491,24 +3858,40 @@ impl SocketFacade {
             let copied = self.stream_tx.lock().push(&payload[accepted..]);
             if copied != 0 {
                 accepted += copied;
+                #[cfg(feature = "performance-profile")]
+                if accepted != payload.len() {
+                    profiling::observe(profiling::Metric::TcpSendPartialCapacity, 1);
+                }
                 self.refresh_tx_readiness();
                 self.tx_generation.fetch_add(1, Ordering::Release);
-                if !self.tx_notified.swap(true, Ordering::AcqRel) {
-                    match socket_runtime() {
-                        Ok(runtime) => runtime.notify_tx(Arc::clone(self)),
-                        Err(error) => {
-                            self.tx_notified.store(false, Ordering::Release);
-                            return if accepted == 0 {
-                                Err(error)
-                            } else {
-                                Ok(accepted)
-                            };
-                        }
-                    }
-                }
                 if accepted == payload.len() || nonblocking {
+                    if accepted != payload.len() {
+                        let _ = self.publish_stream_pending();
+                    }
                     return Ok(accepted);
                 }
+                match self.publish_stream_pending() {
+                    Ok(()) => {}
+                    Err(error) if accepted == 0 => return Err(error),
+                    Err(_) => return Ok(accepted),
+                }
+                // 阻塞流写入在没有信号、超时或连接错误时继续等待容量，行为与
+                // Linux TCP sendmsg 一致。协议调用预算耗尽后由 worker 继续推进，
+                // 当前任务只在可写通知到达后重试，不额外发起同步 ELM 调用。
+                continue;
+            }
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(
+                if self.stream_tx.lock().exhausted_pool_key().is_some() {
+                    profiling::Metric::TcpSendBlockedPool
+                } else {
+                    profiling::Metric::TcpSendBlockedBufferLimit
+                },
+                1,
+            );
+            match self.publish_stream_pending() {
+                Ok(()) => {}
+                Err(error) => return Err(error),
             }
             if copied == 0
                 && let Some(pool_key) = self.stream_tx.lock().exhausted_pool_key()
@@ -3551,6 +3934,8 @@ impl SocketFacade {
     pub(crate) fn finish_stream_tx_batch(&self, bytes: usize) {
         self.tcp_bytes_sent
             .fetch_add(bytes as u64, Ordering::Relaxed);
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::TcpBytesSent, bytes as u64);
         self.refresh_tx_readiness();
     }
 
@@ -3619,7 +4004,7 @@ impl SocketFacade {
         }
         if self.stream_is_writable() {
             if self.set_ready(Readiness::WRITABLE) {
-                wake_one_socket_waiter(&self.write_wait);
+                wake_one_socket_writer(&self.write_wait, self.id);
             }
         } else {
             self.clear_ready(Readiness::WRITABLE);
@@ -3661,7 +4046,7 @@ impl SocketFacade {
             (was_empty, copied)
         };
         debug_assert_eq!(copied, payload.len());
-        self.finish_stream_rx_commit(was_empty, copied);
+        self.finish_stream_rx_commit(was_empty, copied, false, true);
         Ok(StreamRxCommit {
             len: copied,
             storage: StreamRxStorageKind::Compact,
@@ -3712,7 +4097,7 @@ impl SocketFacade {
                 (was_empty, StreamRxStorageKind::Compact)
             }
         };
-        self.finish_stream_rx_commit(was_empty, len);
+        self.finish_stream_rx_commit(was_empty, len, false, true);
         Ok(StreamRxCommit {
             len,
             storage,
@@ -3725,6 +4110,7 @@ impl SocketFacade {
         lease: &TcpTxLease,
         offset: usize,
         len: usize,
+        flush: bool,
     ) -> Result<StreamRxCommit, SocketError> {
         if self.kind != SocketKind::Stream {
             return Err(SocketError::InvalidState);
@@ -3736,7 +4122,7 @@ impl SocketFacade {
                 low_water_fallback: false,
             });
         }
-        let (was_empty, storage) = {
+        let (was_empty, storage, buffered, available) = {
             let mut rx = self.stream_rx.lock();
             if rx.bytes.available() < len {
                 return Err(SocketError::WouldBlock);
@@ -3747,16 +4133,28 @@ impl SocketFacade {
                 .and_then(|chain| chain.pin_shared_range(offset, len).ok());
             if let Some(shared) = shared {
                 rx.bytes.push_shared_chain(shared)?;
-                (was_empty, StreamRxStorageKind::LoopbackShared)
+                (
+                    was_empty,
+                    StreamRxStorageKind::LoopbackShared,
+                    rx.bytes.len,
+                    rx.bytes.available(),
+                )
             } else {
                 let copied = rx.bytes.push_compact_with(len, |copied, output| {
                     lease.copy_range(offset + copied, output)
                 })?;
                 debug_assert_eq!(copied, len);
-                (was_empty, StreamRxStorageKind::Compact)
+                (
+                    was_empty,
+                    StreamRxStorageKind::Compact,
+                    rx.bytes.len,
+                    rx.bytes.available(),
+                )
             }
         };
-        self.finish_stream_rx_commit(was_empty, len);
+        let handoff_ready =
+            flush || buffered >= TCP_LOCAL_READ_BATCH_BYTES || available < SOCKET_CHUNK_BYTES;
+        self.finish_stream_rx_commit(was_empty, len, true, handoff_ready);
         Ok(StreamRxCommit {
             len,
             storage,
@@ -3764,12 +4162,35 @@ impl SocketFacade {
         })
     }
 
-    fn finish_stream_rx_commit(&self, was_empty: bool, len: usize) {
+    fn finish_stream_rx_commit(
+        &self,
+        was_empty: bool,
+        len: usize,
+        local: bool,
+        handoff_ready: bool,
+    ) {
         self.tcp_bytes_received
             .fetch_add(len as u64, Ordering::Relaxed);
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::TcpBytesReceived, len as u64);
         if was_empty && len != 0 {
             self.set_ready(Readiness::READABLE);
-            wake_one_socket_waiter(&self.read_wait);
+            if local {
+                let target = wake_one_local_socket_reader(&self.read_wait, self.id, handoff_ready);
+                if let Some(target) = target {
+                    if target.preferred_cpu() != sched::current_cpu_id() || handoff_ready {
+                        #[cfg(feature = "performance-profile")]
+                        profiling::observe(profiling::Metric::TcpLocalConsumerHandoffs, 1);
+                        sched::request_post_syscall_handoff_to(target);
+                    } else {
+                        *self.local_read_handoff.lock() = Some(target);
+                    }
+                }
+            } else {
+                wake_one_socket_reader(&self.read_wait, self.id);
+            }
+        } else if local && handoff_ready {
+            self.request_local_tcp_consumer_handoff();
         }
     }
 
@@ -3785,6 +4206,7 @@ impl SocketFacade {
         output: &mut [u8],
         peek: bool,
         wait_all: bool,
+        defer_window_update: bool,
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
@@ -3807,8 +4229,11 @@ impl SocketFacade {
             };
             total += copied;
             if copied != 0 && !peek {
+                self.remember_local_tcp_consumer();
                 self.receive_window_update.store(true, Ordering::Release);
-                self.notify_tcp_state_change();
+                if !defer_window_update {
+                    self.notify_tcp_state_change();
+                }
             }
             self.refresh_rx_readiness();
             if total != 0 && (!wait_all || total == output.len() || peek || eof) {
@@ -3853,7 +4278,7 @@ impl SocketFacade {
         };
         if was_empty {
             self.set_ready(Readiness::READABLE);
-            wake_one_socket_waiter(&self.read_wait);
+            wake_one_socket_reader(&self.read_wait, self.id);
         }
         Ok(())
     }
@@ -3868,17 +4293,55 @@ impl SocketFacade {
         ingress_interface: InterfaceId,
         rx_timestamp_ns: u64,
     ) -> Result<(), SocketError> {
+        if let Ok(Some(shared)) = payload.packet_chain() {
+            return self.push_local_udp_shared(
+                shared,
+                source,
+                destination,
+                hop_limit,
+                traffic_class,
+                ingress_interface,
+                rx_timestamp_ns,
+            );
+        }
+        match self.push_local_udp_from(
+            usize::from(payload.len),
+            source,
+            destination,
+            hop_limit,
+            traffic_class,
+            ingress_interface,
+            rx_timestamp_ns,
+            &mut |offset, output| payload.copy_range(offset, output),
+        ) {
+            Ok(()) => Ok(()),
+            Err(DatagramCopyError::Socket(error)) => Err(error),
+            Err(DatagramCopyError::Copy(error)) => Err(error),
+        }
+    }
+
+    fn push_local_udp_shared(
+        &self,
+        payload: PacketChain,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+    ) -> Result<(), SocketError> {
         if self.kind != SocketKind::Datagram {
             return Err(SocketError::InvalidState);
         }
         if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
             return Err(SocketError::Closed);
         }
-        let was_empty = {
+        let payload_len = payload.total_len();
+        let (was_empty, handoff_ready) = {
             let mut rx = self.rx.lock();
             let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
             let was_empty = rx.is_empty();
-            rx.push_local(
+            if let Err(error) = rx.push_local_shared(
                 payload,
                 source,
                 destination,
@@ -3886,14 +4349,171 @@ impl SocketFacade {
                 traffic_class,
                 ingress_interface,
                 rx_timestamp_ns,
-            )?;
-            was_empty
+            ) {
+                if error == SocketError::WouldBlock {
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::UdpLocalSharedReferences, 1);
+            let handoff_ready = payload_len <= SOCKET_CHUNK_BYTES
+                || rx.len() >= LOCAL_DATAGRAM_BATCH_LIMIT
+                || !rx.can_push_local_len(payload_len);
+            (was_empty, handoff_ready)
         };
-        if was_empty {
-            self.set_ready(Readiness::READABLE);
-            wake_one_socket_waiter(&self.read_wait);
-        }
+        self.finish_local_udp_push(was_empty, handoff_ready);
         Ok(())
+    }
+
+    fn push_local_udp_from<E>(
+        &self,
+        payload_len: usize,
+        source: Endpoint,
+        destination: Endpoint,
+        hop_limit: u8,
+        traffic_class: u8,
+        ingress_interface: InterfaceId,
+        rx_timestamp_ns: u64,
+        copy: &mut impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<(), DatagramCopyError<E>> {
+        if self.kind != SocketKind::Datagram {
+            return Err(DatagramCopyError::Socket(SocketError::InvalidState));
+        }
+        if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return Err(DatagramCopyError::Socket(SocketError::Closed));
+        }
+        let (was_empty, handoff_ready) = {
+            let mut rx = self.rx.lock();
+            let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
+            let was_empty = rx.is_empty();
+            if let Err(error) = rx.push_local_from(
+                payload_len,
+                source,
+                destination,
+                hop_limit,
+                traffic_class,
+                ingress_interface,
+                rx_timestamp_ns,
+                copy,
+            ) {
+                if matches!(error, DatagramCopyError::Socket(SocketError::WouldBlock)) {
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+            let handoff_ready = payload_len <= SOCKET_CHUNK_BYTES
+                || rx.len() >= LOCAL_DATAGRAM_BATCH_LIMIT
+                || !rx.can_push_local_len(payload_len);
+            (was_empty, handoff_ready)
+        };
+        self.finish_local_udp_push(was_empty, handoff_ready);
+        Ok(())
+    }
+
+    fn finish_local_udp_push(&self, was_empty: bool, handoff_ready: bool) {
+        #[cfg(feature = "performance-profile")]
+        let publish_start = was_empty.then(profiling::read_counter);
+        let deferred_target = if was_empty {
+            self.set_ready(Readiness::READABLE);
+            // 大数据报先保留精确消费者身份，达到 RX 批次边界时再请求调度。
+            // 跨 CPU 目标会在下面立即通知，只有同 CPU 才允许继续填充有界批次。
+            wake_one_local_socket_reader(&self.read_wait, self.id, handoff_ready)
+        } else {
+            None
+        };
+        let in_syscall = sched::is_ready()
+            && sched::current_task_fast().execution_scope_kind()
+                == Some(sched::ExecutionScopeKind::Syscall);
+        if handoff_ready && in_syscall {
+            if let Some(target) = deferred_target.or_else(|| self.local_read_handoff.lock().clone())
+            {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::UdpLocalConsumerHandoffs, 1);
+                sched::request_post_syscall_handoff_to(target);
+            }
+        } else if in_syscall && let Some(target) = deferred_target {
+            if target.preferred_cpu() != sched::current_cpu_id() {
+                // 远端任务已经具备运行资格，立即通知其 CPU，不能在 socket 中保留
+                // 可能先于当前 syscall 返回就已经运行过的任务身份。
+                sched::request_post_syscall_handoff_to(target);
+            } else {
+                // 大报文可以先唤醒、后续 datagram 才达到批次边界；仅同 CPU 情况
+                // 需要跨调用保留精确任务身份，小报文即时交接不进入 socket 槽锁。
+                *self.local_read_handoff.lock() = Some(target);
+            }
+        }
+        #[cfg(feature = "performance-profile")]
+        if let Some(start) = publish_start {
+            profiling::observe(
+                profiling::Metric::UdpLocalSendPublishCycles,
+                profiling::read_counter().wrapping_sub(start),
+            );
+        }
+    }
+
+    fn request_local_udp_consumer_handoff(&self) {
+        if !sched::is_ready()
+            || sched::current_task_fast().execution_scope_kind()
+                != Some(sched::ExecutionScopeKind::Syscall)
+        {
+            return;
+        }
+        let Some(target) = self.local_read_handoff.lock().clone() else {
+            return;
+        };
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::UdpLocalConsumerHandoffs, 1);
+        sched::request_post_syscall_handoff_to(target);
+    }
+
+    fn remember_local_udp_consumer(&self) {
+        if !sched::is_ready()
+            || sched::current_task_fast().execution_scope_kind()
+                != Some(sched::ExecutionScopeKind::Syscall)
+        {
+            return;
+        }
+        let Some(target) =
+            sched::current_task_handoff_target(sched::HandoffReason::SocketReadContinuation)
+        else {
+            return;
+        };
+        *self.local_read_handoff.lock() = Some(target);
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::UdpLocalConsumerTargets, 1);
+    }
+
+    fn request_local_tcp_consumer_handoff(&self) {
+        if !sched::is_ready()
+            || sched::current_task_fast().execution_scope_kind()
+                != Some(sched::ExecutionScopeKind::Syscall)
+        {
+            return;
+        }
+        let Some(target) = self.local_read_handoff.lock().clone() else {
+            return;
+        };
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::TcpLocalConsumerHandoffs, 1);
+        sched::request_post_syscall_handoff_to(target);
+    }
+
+    fn remember_local_tcp_consumer(&self) {
+        if !sched::is_ready()
+            || sched::current_task_fast().execution_scope_kind()
+                != Some(sched::ExecutionScopeKind::Syscall)
+        {
+            return;
+        }
+        let Some(target) =
+            sched::current_task_handoff_target(sched::HandoffReason::SocketReadContinuation)
+        else {
+            return;
+        };
+        *self.local_read_handoff.lock() = Some(target);
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::TcpLocalConsumerTargets, 1);
     }
 
     pub fn recv(
@@ -3942,6 +4562,141 @@ impl SocketFacade {
         }
     }
 
+    /// 等待至少一个 UDP 数据报可读，但不复制或消费它。
+    ///
+    /// 调用方可在本函数返回后 fault-in 用户目标页，再用
+    /// [`Self::recv_local_datagram_from`] 完成不会缺页的直接复制。共享 fd 的其它
+    /// reader 可能在两步之间消费数据，因此后一步仍必须允许返回 `None`。
+    pub fn wait_datagram_readable(
+        &self,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<Option<usize>, SocketError> {
+        self.ensure_stack_attached()?;
+        loop {
+            self.ensure_stack_attached()?;
+            if let Some(len) = self
+                .rx
+                .lock()
+                .as_ref()
+                .expect("UDP facade 必须拥有 RX ring")
+                .front_len()
+            {
+                return Ok(Some(len));
+            }
+            if self.read_shutdown.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if nonblocking {
+                return Err(SocketError::WouldBlock);
+            }
+            self.wait_read(deadline_ns)?;
+        }
+    }
+
+    /// 将队首本地 UDP 数据报直接复制到已经预校验的外部目标。
+    ///
+    /// 复制失败时数据报保持在队首；非本地 packet 或共享 fd 竞态导致队列为空时
+    /// 返回 `Ok(None)`，调用方必须回到通用接收路径。成功后才消费完整数据报。
+    pub fn recv_local_datagram_from<E>(
+        &self,
+        output_len: usize,
+        copy_capacity: usize,
+        report_original_len: bool,
+        mut copy: impl FnMut(usize, &[u8]) -> Result<(), E>,
+    ) -> Result<Option<UdpReceive>, DatagramCopyError<E>> {
+        self.ensure_stack_attached()
+            .map_err(DatagramCopyError::Socket)?;
+        #[cfg(feature = "performance-profile")]
+        let receive_start = profiling::read_counter();
+        let mut rx_guard = self.rx.lock();
+        let rx = rx_guard.as_mut().expect("UDP facade 必须拥有 RX ring");
+        let Some((
+            original_len,
+            source,
+            destination,
+            ingress_interface,
+            hop_limit,
+            traffic_class,
+            rx_timestamp_ns,
+        )) = rx.front_metadata()
+        else {
+            return Ok(None);
+        };
+        if !rx.front_local() {
+            return Ok(None);
+        }
+        // wait 与消费之间允许共享 fd 的其它 reader 先取走队首。若新队首需要
+        // 复制的字节超过此前固定的用户页容量，保持报文不动并回到通用路径。
+        if output_len.min(original_len) > copy_capacity {
+            return Ok(None);
+        }
+        #[cfg(feature = "performance-profile")]
+        let copy_start = profiling::read_counter();
+        let copied = rx
+            .copy_local_front_to(output_len, &mut copy)?
+            .expect("本地 payload 已在复制前确认");
+        #[cfg(feature = "performance-profile")]
+        {
+            let copy_end = profiling::read_counter();
+            record_payload_copy(copy_start, copied);
+            profiling::observe(
+                profiling::Metric::UdpLocalReceiveCopyCycles,
+                copy_end.wrapping_sub(copy_start),
+            );
+        }
+        let result = UdpReceive {
+            len: if report_original_len {
+                original_len
+            } else {
+                copied
+            },
+            original_len,
+            source,
+            destination,
+            ingress_interface,
+            hop_limit,
+            traffic_class,
+            rx_timestamp_ns,
+            truncated: copied < original_len,
+        };
+        #[cfg(feature = "performance-profile")]
+        let pop_start = profiling::read_counter();
+        rx.pop().expect("已复制的数据报必须仍在队首");
+        let empty = rx.is_empty();
+        drop(rx_guard);
+        self.remember_local_udp_consumer();
+        #[cfg(feature = "performance-profile")]
+        let readiness_start = {
+            let now = profiling::read_counter();
+            profiling::observe(
+                profiling::Metric::UdpLocalReceivePopCycles,
+                now.wrapping_sub(pop_start),
+            );
+            now
+        };
+        if empty {
+            self.refresh_rx_readiness();
+        } else {
+            wake_one_socket_waiter(&self.read_wait);
+        }
+        #[cfg(feature = "performance-profile")]
+        {
+            let receive_end = profiling::read_counter();
+            profiling::observe(
+                profiling::Metric::UdpLocalReceiveReadinessCycles,
+                receive_end.wrapping_sub(readiness_start),
+            );
+            profiling::observe(profiling::Metric::UdpLocalDirectReceives, 1);
+            profiling::observe(profiling::Metric::UdpLocalDirectReceiveBytes, copied as u64);
+            profiling::observe(
+                profiling::Metric::UdpLocalDirectReceiveCycles,
+                receive_end.wrapping_sub(receive_start),
+            );
+        }
+        Ok(Some(result))
+    }
+
     fn try_recv(
         &self,
         output: &mut [u8],
@@ -3950,10 +4705,18 @@ impl SocketFacade {
     ) -> Result<Option<UdpReceive>, SocketError> {
         let mut rx_guard = self.rx.lock();
         let rx = rx_guard.as_mut().expect("UDP facade 必须拥有 RX ring");
-        let Some(datagram) = rx.front() else {
+        let Some((
+            original_len,
+            source,
+            destination,
+            ingress_interface,
+            hop_limit,
+            traffic_class,
+            rx_timestamp_ns,
+        )) = rx.front_metadata()
+        else {
             return Ok(None);
         };
-        let original_len = usize::from(datagram.payload_len);
         let copied = original_len.min(output.len());
         rx.copy_front(&mut output[..copied])?;
         let result = UdpReceive {
@@ -3963,19 +4726,19 @@ impl SocketFacade {
                 copied
             },
             original_len,
-            source: datagram.source,
-            destination: datagram.destination,
-            ingress_interface: datagram.ingress_interface,
-            hop_limit: datagram.hop_limit,
-            traffic_class: datagram.traffic_class,
-            rx_timestamp_ns: datagram.rx_timestamp_ns,
+            source,
+            destination,
+            ingress_interface,
+            hop_limit,
+            traffic_class,
+            rx_timestamp_ns,
             truncated: copied < original_len,
         };
         if !peek {
-            let datagram = rx.pop().unwrap();
+            rx.pop().unwrap();
             let empty = rx.is_empty();
             drop(rx_guard);
-            drop(datagram);
+            self.local_read_handoff.lock().take();
             if empty {
                 self.refresh_rx_readiness();
             } else {
@@ -3992,13 +4755,12 @@ impl SocketFacade {
         }
         if read {
             self.read_shutdown.store(true, Ordering::Release);
+            self.local_read_handoff.lock().take();
             match self.kind {
                 SocketKind::Datagram | SocketKind::Raw => {
                     let mut rx = self.rx.lock();
                     let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
-                    while let Some(datagram) = rx.pop() {
-                        drop(datagram);
-                    }
+                    while rx.pop().is_some() {}
                 }
                 SocketKind::Stream => self.stream_rx.lock().bytes.clear(),
             }
@@ -4024,6 +4786,12 @@ impl SocketFacade {
     pub fn close(self: &Arc<Self>) {
         if self.closing.swap(true, Ordering::AcqRel) {
             return;
+        }
+        self.deactivate_packet_observer();
+        self.clear_local_datagram_route();
+        self.local_read_handoff.lock().take();
+        if self.kind != SocketKind::Stream {
+            invalidate_local_datagram_routes();
         }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.set_ready(Readiness::HANGUP | Readiness::READ_HANGUP);
@@ -4063,7 +4831,14 @@ impl SocketFacade {
         *self.control_result.lock() = Some((sequence, result));
         self.state_wait.wake_all();
         let (readiness, generation) = self.readiness();
-        if let Some(observer) = self.observer.lock().as_ref().and_then(Weak::upgrade) {
+        let observer = {
+            let observer = self.observer.lock();
+            observer
+                .as_ref()
+                .filter(|observer| observer.readiness_updates_required())
+                .cloned()
+        };
+        if let Some(observer) = observer {
             observer.readiness_changed(readiness, generation);
         }
     }
@@ -4090,6 +4865,10 @@ impl SocketFacade {
         peer: Option<Endpoint>,
         interface: Option<InterfaceId>,
     ) {
+        self.clear_local_datagram_route();
+        if self.kind != SocketKind::Stream {
+            invalidate_local_datagram_routes();
+        }
         *self.local.lock() = Some(local);
         *self.peer.lock() = peer;
         *self.interface.lock() = interface;
@@ -4375,7 +5154,7 @@ impl SocketFacade {
                     .lock()
                     .as_ref()
                     .expect("UDP facade 必须拥有 RX ring")
-                    .limit,
+                    .limit(),
             ),
             SocketKind::Stream => (
                 self.stream_tx.lock().bytes.limit(),
@@ -4447,7 +5226,7 @@ impl SocketFacade {
         };
         if reserved {
             if self.set_ready(Readiness::WRITABLE) {
-                wake_one_socket_waiter(&self.write_wait);
+                wake_one_socket_writer(&self.write_wait, self.id);
             }
         }
         reserved
@@ -4670,7 +5449,13 @@ impl SocketFacade {
                         .fetch_add(1, Ordering::AcqRel)
                         .wrapping_add(1)
                         .max(1);
-                    let observer = self.observer.lock().as_ref().and_then(Weak::upgrade);
+                    let observer = {
+                        let observer = self.observer.lock();
+                        observer
+                            .as_ref()
+                            .filter(|observer| observer.readiness_updates_required())
+                            .cloned()
+                    };
                     if let Some(observer) = observer {
                         observer.readiness_changed(Readiness(next), generation);
                     }
@@ -4679,6 +5464,12 @@ impl SocketFacade {
                 Err(observed) => current = observed,
             }
         }
+    }
+}
+
+impl Drop for SocketFacade {
+    fn drop(&mut self) {
+        self.deactivate_packet_observer();
     }
 }
 
@@ -4766,6 +5557,41 @@ mod tests {
         ))
     }
 
+    fn install_test_local_datagram_route(
+        sender: &Arc<SocketFacade>,
+        receiver: Arc<SocketFacade>,
+        destination: Endpoint,
+    ) {
+        receiver
+            .rx
+            .lock()
+            .as_mut()
+            .expect("UDP facade 必须拥有 RX ring")
+            .prepare_local_lane();
+        *sender.local_datagram_route.lock() = Some(LocalDatagramRoute {
+            // 并行单测会通过其它 socket 的 bind/close 推进全局 epoch；保留值只在
+            // cfg(test) 中有效，避免测试 helper 与无关用例共享可变时序。
+            epoch: u64::MAX,
+            stack_generation: sender.stack_generation(),
+            sender_generation: sender.generation(),
+            receiver_generation: receiver.generation(),
+            destination,
+            source: Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 8000,
+            },
+            delivered_to: destination,
+            interface: InterfaceId(1),
+            dont_route: false,
+            confirm: false,
+            mark: sender.socket_mark(),
+            hop_limit: sender.ip_hop_limit(),
+            traffic_class: sender.ip_traffic_class(),
+            route_mtu: u16::MAX as u32,
+            receiver,
+        });
+    }
+
     #[test]
     fn stream_facade_does_not_allocate_udp_rings() {
         let facade = Arc::new(SocketFacade::new(
@@ -4783,6 +5609,49 @@ mod tests {
             2 * SOCKET_CHUNK_BYTES
         );
         assert_eq!(facade.stream_rx.lock().bytes.allocated_capacity(), 0);
+    }
+
+    #[test]
+    fn raw_socket_observer_predicate_tracks_lifecycle() {
+        let raw = SocketFacade::new_with_protocol(
+            SocketId {
+                boot_nonce: 7,
+                counter: 90,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Raw,
+            17,
+        );
+        assert!(facade_requires_packet_observation(&raw));
+        raw.closing.store(true, Ordering::Release);
+        assert!(!facade_requires_packet_observation(&raw));
+
+        let datagram = SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 91,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Datagram,
+        );
+        assert!(!facade_requires_packet_observation(&datagram));
+    }
+
+    #[test]
+    fn packet_observer_registration_is_balanced_and_idempotent() {
+        let active = AtomicBool::new(false);
+        let observers = AtomicU32::new(0);
+
+        assert!(packet_observers_allow_local_transport(&observers));
+        assert!(register_packet_observer(&active, &observers));
+        assert!(!register_packet_observer(&active, &observers));
+        assert_eq!(observers.load(Ordering::Acquire), 1);
+        assert!(!packet_observers_allow_local_transport(&observers));
+
+        assert!(unregister_packet_observer(&active, &observers));
+        assert!(!unregister_packet_observer(&active, &observers));
+        assert_eq!(observers.load(Ordering::Acquire), 0);
+        assert!(packet_observers_allow_local_transport(&observers));
     }
 
     #[test]
@@ -4830,7 +5699,7 @@ mod tests {
         let mut output = alloc::vec![0; 1024];
         assert_eq!(
             facade
-                .recv_stream(&mut output, false, true, true, None)
+                .recv_stream(&mut output, false, true, false, true, None)
                 .unwrap(),
             output.len()
         );
@@ -4881,16 +5750,16 @@ mod tests {
         facade.publish_connection_error(SocketError::ConnectionReset);
         let mut output = [0u8; 8];
         assert_eq!(
-            facade.recv_stream(&mut output, false, false, true, None),
+            facade.recv_stream(&mut output, false, false, false, true, None),
             Ok(4)
         );
         assert_eq!(&output[..4], b"data");
         assert_eq!(
-            facade.recv_stream(&mut output, false, false, true, None),
+            facade.recv_stream(&mut output, false, false, false, true, None),
             Err(SocketError::ConnectionReset)
         );
         assert_eq!(
-            facade.recv_stream(&mut output, false, false, true, None),
+            facade.recv_stream(&mut output, false, false, false, true, None),
             Ok(0)
         );
     }
@@ -4930,6 +5799,522 @@ mod tests {
         let tx = tx.as_ref().unwrap();
         assert_eq!(tx.used_bytes, 0);
         assert_eq!(tx.free_chunk_count(), UDP_BUFFER_BYTES / SOCKET_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn udp_external_copy_failure_rolls_back_the_whole_datagram() {
+        let facade = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        let mut tx = facade.tx.lock();
+        let tx = tx.as_mut().unwrap();
+        let free_chunks = tx.free_chunk_count();
+        let free_slots = tx.free_slots.len();
+        let result = tx.push_from(
+            SOCKET_CHUNK_BYTES + 16,
+            destination,
+            false,
+            false,
+            &mut |offset, output| {
+                if offset != 0 {
+                    return Err(7u8);
+                }
+                output.fill(0x5a);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(DatagramCopyError::Copy(7))));
+        assert!(tx.is_empty());
+        assert_eq!(tx.used_bytes, 0);
+        assert_eq!(tx.free_chunk_count(), free_chunks);
+        assert_eq!(tx.free_slots.len(), free_slots);
+    }
+
+    #[test]
+    fn cached_local_datagram_bypasses_sender_tx_ring() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9000,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        let payload = alloc::vec![0x6d; SOCKET_CHUNK_BYTES + 19];
+
+        let result = sender.send_datagram_from(
+            payload.len(),
+            Some(destination),
+            true,
+            None,
+            false,
+            false,
+            |offset, output| {
+                output.copy_from_slice(&payload[offset..offset + output.len()]);
+                Ok::<(), u8>(())
+            },
+        );
+
+        assert!(matches!(result, Ok(written) if written == payload.len()));
+        assert!(sender.tx.lock().as_ref().unwrap().is_empty());
+        let mut output = alloc::vec![0; payload.len()];
+        {
+            let rx_guard = receiver.rx.lock();
+            let rx = rx_guard.as_ref().unwrap();
+            assert_eq!(rx.len(), 1);
+            assert_eq!(rx.bytes(), payload.len());
+            rx.copy_front(&mut output).unwrap();
+            assert_eq!(output, payload);
+        }
+
+        output.fill(0);
+        let received = receiver
+            .recv_local_datagram_from(output.len(), output.len(), false, |offset, input| {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                Ok::<(), u8>(())
+            })
+            .ok()
+            .flatten()
+            .expect("缓存直达的数据报必须使用本地存储");
+        assert_eq!(received.len, payload.len());
+        assert_eq!(output, payload);
+        assert!(receiver.rx.lock().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_local_route_falls_back_when_payload_exceeds_route_mtu() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9015,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        sender
+            .local_datagram_route
+            .lock()
+            .as_mut()
+            .expect("测试路由必须存在")
+            .route_mtu = 64;
+        sender.tx_notified.store(true, Ordering::Release);
+
+        assert_eq!(
+            sender.send(&[0x52; 64], Some(destination), true, None),
+            Ok(64)
+        );
+        assert!(sender.has_pending_datagram_tx());
+        assert!(receiver.rx.lock().as_ref().unwrap().is_empty());
+        assert!(sender.local_datagram_route.lock().is_none());
+    }
+
+    #[test]
+    fn small_local_datagram_uses_reusable_lane_without_rx_chunks() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9010,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        let payload = [0x61; 32];
+        let free_chunks = receiver.rx.lock().as_ref().unwrap().ring.free_chunk_count();
+
+        assert!(matches!(
+            sender.send_datagram_from(
+                payload.len(),
+                Some(destination),
+                true,
+                None,
+                false,
+                false,
+                |offset, output| {
+                    output.copy_from_slice(&payload[offset..offset + output.len()]);
+                    Ok::<(), u8>(())
+                },
+            ),
+            Ok(written) if written == payload.len()
+        ));
+        {
+            let rx = receiver.rx.lock();
+            let rx = rx.as_ref().unwrap();
+            assert!(rx.local_occupied());
+            assert!(rx.ring.is_empty());
+            assert_eq!(rx.ring.free_chunk_count(), free_chunks);
+        }
+
+        let mut output = [0; 32];
+        let received = receiver
+            .recv_local_datagram_from(output.len(), output.len(), false, |offset, input| {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                Ok::<(), u8>(())
+            })
+            .ok()
+            .flatten()
+            .expect("lane 中的数据报必须可读");
+        assert_eq!(received.len, payload.len());
+        assert_eq!(output, payload);
+        let rx = receiver.rx.lock();
+        let rx = rx.as_ref().unwrap();
+        assert!(rx.is_empty());
+        assert_eq!(rx.ring.free_chunk_count(), free_chunks);
+    }
+
+    #[test]
+    fn occupied_local_lane_keeps_order_before_ring_fallback() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9011,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+
+        for value in [0x21, 0x42] {
+            assert_eq!(
+                sender
+                    .send_datagram_from(
+                        1,
+                        Some(destination),
+                        true,
+                        None,
+                        false,
+                        false,
+                        |_, output| {
+                            output[0] = value;
+                            Ok::<(), u8>(())
+                        },
+                    )
+                    .ok()
+                    .expect("本地数据报必须写入成功"),
+                1
+            );
+        }
+        {
+            let rx = receiver.rx.lock();
+            let rx = rx.as_ref().unwrap();
+            assert!(rx.local_occupied());
+            assert_eq!(rx.ring.len, 1);
+        }
+
+        for expected in [0x21, 0x42] {
+            let mut output = [0];
+            receiver
+                .recv_local_datagram_from(1, 1, false, |_, input| {
+                    output.copy_from_slice(input);
+                    Ok::<(), u8>(())
+                })
+                .ok()
+                .flatten()
+                .expect("本地数据报必须按顺序可读");
+            assert_eq!(output, [expected]);
+        }
+        assert!(receiver.rx.lock().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_lane_copy_failure_keeps_the_datagram() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9012,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        assert_eq!(
+            sender
+                .send_datagram_from(
+                    1,
+                    Some(destination),
+                    true,
+                    None,
+                    false,
+                    false,
+                    |_, output| {
+                        output[0] = 0x73;
+                        Ok::<(), u8>(())
+                    },
+                )
+                .ok()
+                .expect("本地数据报必须写入成功"),
+            1
+        );
+
+        let failed = receiver.recv_local_datagram_from(1, 1, false, |_, _| Err(13u8));
+        assert!(matches!(failed, Err(DatagramCopyError::Copy(13))));
+        assert!(receiver.rx.lock().as_ref().unwrap().local_occupied());
+
+        let mut output = [0];
+        receiver
+            .recv_local_datagram_from(1, 1, false, |_, input| {
+                output.copy_from_slice(input);
+                Ok::<(), u8>(())
+            })
+            .ok()
+            .flatten()
+            .expect("复制失败后数据报必须仍在 lane 中");
+        assert_eq!(output, [0x73]);
+    }
+
+    #[test]
+    fn cached_local_datagram_copy_failure_rolls_back_receiver_ring() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9001,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        let (free_chunks, entries, bytes) = {
+            let rx = receiver.rx.lock();
+            let rx = rx.as_ref().unwrap();
+            (rx.ring.free_chunk_count(), rx.len(), rx.bytes())
+        };
+
+        let result = sender.send_datagram_from(
+            SOCKET_CHUNK_BYTES + 19,
+            Some(destination),
+            true,
+            None,
+            false,
+            false,
+            |offset, output| {
+                if offset != 0 {
+                    return Err(9u8);
+                }
+                output.fill(0x5a);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(DatagramCopyError::Copy(9))));
+        assert!(sender.tx.lock().as_ref().unwrap().is_empty());
+        let rx = receiver.rx.lock();
+        let rx = rx.as_ref().unwrap();
+        assert_eq!(rx.len(), entries);
+        assert_eq!(rx.bytes(), bytes);
+        assert_eq!(rx.ring.free_chunk_count(), free_chunks);
+    }
+
+    #[test]
+    fn local_datagram_receive_copy_failure_keeps_datagram_queued() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9002,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        let payload = alloc::vec![0x37; SOCKET_CHUNK_BYTES + 23];
+        assert!(matches!(
+            sender.send_datagram_from(
+                payload.len(),
+                Some(destination),
+                true,
+                None,
+                false,
+                false,
+                |offset, output| {
+                    output.copy_from_slice(&payload[offset..offset + output.len()]);
+                    Ok::<(), u8>(())
+                },
+            ),
+            Ok(written) if written == payload.len()
+        ));
+
+        let failed =
+            receiver.recv_local_datagram_from(payload.len(), payload.len(), false, |offset, _| {
+                if offset == 0 { Ok(()) } else { Err(11u8) }
+            });
+        assert!(matches!(failed, Err(DatagramCopyError::Copy(11))));
+        assert_eq!(receiver.rx.lock().as_ref().unwrap().len(), 1);
+
+        let mut output = alloc::vec![0; payload.len()];
+        let received = receiver
+            .recv_local_datagram_from(output.len(), output.len(), false, |offset, input| {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                Ok::<(), u8>(())
+            })
+            .ok()
+            .flatten()
+            .expect("复制失败后数据报必须保持在队首");
+        assert_eq!(received.len, payload.len());
+        assert_eq!(output, payload);
+        assert!(receiver.rx.lock().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_datagram_capacity_change_keeps_datagram_queued() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9007,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        let payload = [0x5a; 32];
+        assert_eq!(
+            sender.send(&payload, Some(destination), true, None),
+            Ok(payload.len())
+        );
+
+        let mut copied = false;
+        let result = receiver.recv_local_datagram_from(payload.len(), 1, false, |_, _| {
+            copied = true;
+            Ok::<(), u8>(())
+        });
+        assert!(matches!(result, Ok(None)));
+        assert!(!copied);
+        assert_eq!(receiver.rx.lock().as_ref().unwrap().len(), 1);
+
+        let mut output = [0; 32];
+        let received = receiver
+            .recv_local_datagram_from(output.len(), output.len(), false, |offset, input| {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                Ok::<(), u8>(())
+            })
+            .ok()
+            .flatten()
+            .expect("容量充足后队首数据报必须仍可读取");
+        assert_eq!(received.len, payload.len());
+        assert_eq!(output, payload);
+    }
+
+    #[test]
+    fn pooled_local_datagram_keeps_one_shared_reference_until_receive() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(2, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let sender = facade();
+        let receiver = facade();
+        sender.install_datagram_tx_pool(Arc::clone(&pool));
+        let source = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40000,
+        };
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9003,
+        };
+        let payload = alloc::vec![0x6b; 1024];
+        let lease = sender.test_udp_tx_lease(&payload, destination);
+        assert_eq!(pool.lock().available(), 1);
+
+        receiver
+            .push_local_udp(&lease, source, destination, 64, 0, InterfaceId(1), 123)
+            .unwrap();
+        lease.complete();
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 1);
+        assert!(matches!(
+            receiver
+                .rx
+                .lock()
+                .as_ref()
+                .unwrap()
+                .ring
+                .front()
+                .map(|datagram| &datagram.payload),
+            Some(RxPayload::Shared(_))
+        ));
+
+        let mut output = alloc::vec![0; payload.len()];
+        let received = receiver
+            .recv_local_datagram_from(output.len(), output.len(), false, |offset, input| {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                Ok::<(), u8>(())
+            })
+            .ok()
+            .flatten()
+            .expect("共享数据报必须可以完整读取");
+        assert_eq!(received.len, payload.len());
+        assert_eq!(received.source, source);
+        assert_eq!(received.destination, destination);
+        assert_eq!(received.ingress_interface, InterfaceId(1));
+        assert_eq!(received.hop_limit, 64);
+        assert_eq!(received.traffic_class, 0);
+        assert_eq!(received.rx_timestamp_ns, 123);
+        assert_eq!(output, payload);
+        pool.lock().drain_remote();
+        assert_eq!(pool.lock().available(), 2);
+    }
+
+    #[test]
+    fn stale_shared_datagram_returns_buffer_error_without_consuming() {
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(1, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        let sender = facade();
+        let receiver = facade();
+        sender.install_datagram_tx_pool(Arc::clone(&pool));
+        let source = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40003,
+        };
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9006,
+        };
+        let payload = sender.test_udp_tx_lease(&[0x63; 32], destination);
+        receiver
+            .push_local_udp(&payload, source, destination, 64, 0, InterfaceId(1), 1)
+            .unwrap();
+        payload.complete();
+        pool.lock().begin_dying();
+
+        let result = receiver.recv_local_datagram_from(32, 32, false, |_, _| Ok::<(), u8>(()));
+        assert!(matches!(
+            result,
+            Err(DatagramCopyError::Socket(SocketError::Buffer))
+        ));
+        assert_eq!(receiver.rx.lock().as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn closed_cached_receiver_falls_back_to_sender_queue() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9004,
+        };
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        receiver.close();
+        sender.tx_notified.store(true, Ordering::Release);
+
+        assert_eq!(sender.send(&[0x71], Some(destination), true, None), Ok(1));
+        assert!(sender.has_pending_datagram_tx());
+        assert!(receiver.rx.lock().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_cached_receiver_drops_datagram_without_worker_fallback() {
+        let sender = facade();
+        let receiver = facade();
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9005,
+        };
+        receiver.set_buffer_limits(None, Some(16 * 1024));
+        install_test_local_datagram_route(&sender, Arc::clone(&receiver), destination);
+        sender.tx_notified.store(true, Ordering::Release);
+        let payload = alloc::vec![0x27; SOCKET_CHUNK_BYTES];
+        for _ in 0..4 {
+            assert_eq!(
+                sender.send(&payload, Some(destination), true, None),
+                Ok(payload.len())
+            );
+        }
+        let before = receiver.rx.lock().as_ref().unwrap().bytes();
+        assert_eq!(before, 16 * 1024);
+
+        assert_eq!(
+            sender.send(&payload, Some(destination), true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(receiver.rx.lock().as_ref().unwrap().bytes(), before);
+        assert!(!sender.has_pending_datagram_tx());
+        assert_eq!(receiver.take_rx_overflow(), 1);
     }
 
     #[test]
@@ -5041,7 +6426,7 @@ mod tests {
         let lease = sender.take_stream_tx(payload.len()).unwrap();
 
         let commit = receiver
-            .push_stream_rx_lease(&lease, 0, payload.len())
+            .push_stream_rx_lease(&lease, 0, payload.len(), true)
             .unwrap();
         assert_eq!(commit.storage, StreamRxStorageKind::LoopbackShared);
         assert_eq!(sender.acknowledge_stream(payload.len()), payload.len());
@@ -5051,7 +6436,7 @@ mod tests {
         let mut output = alloc::vec![0; payload.len()];
         assert_eq!(
             receiver
-                .recv_stream(&mut output, false, true, true, None)
+                .recv_stream(&mut output, false, true, false, true, None)
                 .unwrap(),
             payload.len()
         );
@@ -5406,7 +6791,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_tcp_more_reschedules_buffered_stream_data() {
+    fn clearing_tcp_more_retags_a_completed_stream_tail() {
         let facade = Arc::new(SocketFacade::new(
             SocketId {
                 boot_nonce: 7,
@@ -5415,12 +6800,58 @@ mod tests {
             AddressFamily::Ipv4,
             SocketKind::Stream,
         ));
+        facade.update_tcp_info(1, 0, 0, 0, 1460, 0, 0, 0, 0);
         facade.set_tcp_more(true);
         assert_eq!(facade.test_push_stream_tx(b"pending"), 7);
-        let generation = facade.stream_tx_generation();
+        facade.tx_generation.store(7, Ordering::Release);
+        facade.tx_notified.store(true, Ordering::Release);
+        facade.finish_stream_tx_drain(7);
 
         facade.set_tcp_more(false);
 
-        assert_eq!(facade.stream_tx_generation(), generation + 1);
+        assert_eq!(facade.stream_tx_generation(), 8);
+    }
+
+    #[test]
+    fn clearing_tcp_more_does_not_republish_completed_full_segments() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 12,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        facade.update_tcp_info(1, 0, 0, 0, 1460, 0, 0, 0, 0);
+        facade.set_tcp_more(true);
+        assert_eq!(facade.test_push_stream_tx(&[1; 2048]), 2048);
+        facade.tx_generation.store(9, Ordering::Release);
+        facade.tx_notified.store(true, Ordering::Release);
+        facade.finish_stream_tx_drain(9);
+
+        facade.set_tcp_more(false);
+
+        assert_eq!(facade.stream_tx_generation(), 9);
+        assert!(!facade.tx_notified.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completed_stream_generation_does_not_publish_duplicate_work() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 1,
+                counter: 99,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        facade.tx_generation.store(7, Ordering::Release);
+        facade.tx_notified.store(true, Ordering::Release);
+
+        facade.finish_stream_tx_drain(7);
+
+        assert!(!facade.tx_notified.load(Ordering::Acquire));
+        assert_eq!(facade.stream_tx_generation(), 7);
+        assert_eq!(facade.tx_completed_generation.load(Ordering::Acquire), 7);
     }
 }

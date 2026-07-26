@@ -25,10 +25,20 @@ unsafe extern "C" fn udp_stress_writer(_arg: usize) -> ! {
         .as_ref()
         .cloned()
         .expect("UDP stress sender 未安装");
+    let task = sched::current_task_fast();
     for sequence in 0..256u32 {
-        sender
-            .send(&sequence.to_ne_bytes(), None, false, None)
-            .expect("UDP stress send");
+        assert!(
+            task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
+            "UDP stress writer 不能嵌套进入 syscall 执行作用域"
+        );
+        let result = sender.send(&sequence.to_ne_bytes(), None, false, None);
+        let claimed_actions = task.end_execution_scope(sched::ExecutionScopeKind::Syscall);
+        assert!(
+            claimed_actions & !crate::net_stack::NET_STACK_EXECUTION_ACTION == 0,
+            "UDP stress writer 认领了未知的有界动作"
+        );
+        sched::run_post_syscall_handoff_lazy();
+        result.expect("UDP stress send");
     }
     STRESS_WRITER_DONE.store(true, core::sync::atomic::Ordering::Release);
     sched::kthread_finish(sched::ExitCode(0));
@@ -44,9 +54,10 @@ unsafe extern "C" fn blocking_stream_writer(_arg: usize) -> ! {
         .map(|index| index.wrapping_mul(17) as u8)
         .collect::<alloc::vec::Vec<_>>();
     let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
-    let written = sender
+    let socket = sender
         .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
-        .expect("blocking TCP sender 缺少网络 socket ops")
+        .expect("blocking TCP sender 缺少网络 socket ops");
+    let written = socket
         .sendto(
             &payload,
             None,
@@ -59,6 +70,7 @@ unsafe extern "C" fn blocking_stream_writer(_arg: usize) -> ! {
             },
         )
         .expect("blocking TCP send 失败");
+    assert_eq!(written, payload.len(), "阻塞 TCP send 应等待并完成全部输入");
     BLOCKING_STREAM_WRITTEN.store(written, core::sync::atomic::Ordering::Release);
     sched::kthread_finish(sched::ExitCode(0));
 }
@@ -80,6 +92,7 @@ unsafe extern "C" fn blocking_detach_reader(_arg: usize) -> ! {
                 peek: false,
                 wait_all: false,
                 trunc: false,
+                defer_window_update: false,
                 deadline_ns: Some(sched::now_ns_public().saturating_add(5_000_000_000)),
             },
         );
@@ -390,6 +403,111 @@ fn net_stack_elm_persists_flow_shard_state() {
             &[],
         )
         .unwrap_or_else(|_| panic!("ELM shard 应提交 UDP close batch"));
+}
+
+#[ktest]
+fn net_stack_calls_are_bounded_by_task_execution_scope() {
+    let task = sched::current_task();
+    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(0));
+
+    assert!(task.begin_execution_scope(sched::ExecutionScopeKind::Syscall));
+    assert!(
+        shard
+            .invoke_turn(
+                alloc::vec![net::stack::NetStackFlowCommand::Stats { output: None }],
+                &[],
+            )
+            .is_ok(),
+        "syscall 作用域内首次协议栈调用必须成功"
+    );
+    let pending = match shard.invoke_turn(
+        alloc::vec![net::stack::NetStackFlowCommand::Stats { output: None }],
+        &[],
+    ) {
+        Err((crate::net_stack::ShardTurnError::Busy, mut commands)) => {
+            assert_eq!(commands.len(), 1);
+            commands.pop().expect("重复调用必须归还原命令")
+        }
+        _ => panic!("syscall 作用域内重复调用未返回可重试命令"),
+    };
+    assert_eq!(
+        task.end_execution_scope(sched::ExecutionScopeKind::Syscall),
+        crate::net_stack::NET_STACK_EXECUTION_ACTION
+    );
+
+    let interface = net::InterfaceId(91);
+    let config = net::control::ConfigSnapshot::new(
+        91,
+        alloc::vec![net::control::InterfaceSnapshot {
+            id: interface,
+            device: net::NetDeviceId(91),
+            mac_address: [0; 6],
+            mtu: 65_535,
+            running: true,
+            loopback: true,
+        }],
+        alloc::vec![net::control::AddressEntry {
+            interface,
+            address: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
+            prefix_len: 8,
+            primary: true,
+        }],
+        alloc::vec![],
+        alloc::vec![],
+    )
+    .expect("worker turn 测试配置必须有效");
+    let mut tcp_output = alloc::vec::Vec::new();
+    let mut pool_installs = alloc::vec::Vec::new();
+
+    assert!(task.begin_execution_scope(sched::ExecutionScopeKind::NetworkWorker));
+    let first = shard.run_worker_turn(
+        net::stack::NetStackCommandBatch::new(),
+        net::stack::NetStackCommandBatch::new(),
+        net::stack::TxPlanBatch::new(),
+        &config,
+        sched::now_ns_public(),
+        &mut tcp_output,
+        &mut pool_installs,
+        true,
+    );
+    assert!(first.committed);
+    assert!(!first.retryable);
+
+    let mut commands = net::stack::NetStackCommandBatch::new();
+    commands
+        .push(pending)
+        .unwrap_or_else(|_| panic!("待重试命令必须能够进入固定批次"));
+    let mut second = shard.run_worker_turn(
+        net::stack::NetStackCommandBatch::new(),
+        commands,
+        net::stack::TxPlanBatch::new(),
+        &config,
+        sched::now_ns_public(),
+        &mut tcp_output,
+        &mut pool_installs,
+        true,
+    );
+    assert!(!second.committed);
+    assert!(second.retryable);
+    assert_eq!(second.commands.len(), 1);
+    let pending = second
+        .commands
+        .take(0)
+        .expect("worker 重复调用必须保留可重试命令");
+    assert_eq!(
+        task.end_execution_scope(sched::ExecutionScopeKind::NetworkWorker),
+        crate::net_stack::NET_STACK_EXECUTION_ACTION
+    );
+
+    assert!(task.begin_execution_scope(sched::ExecutionScopeKind::Syscall));
+    assert!(
+        shard.invoke_turn(alloc::vec![pending], &[]).is_ok(),
+        "新执行作用域必须允许再次调用协议栈"
+    );
+    assert_eq!(
+        task.end_execution_scope(sched::ExecutionScopeKind::Syscall),
+        crate::net_stack::NET_STACK_EXECUTION_ACTION
+    );
 }
 
 #[ktest]
@@ -870,7 +988,13 @@ fn udp_blocking_reader_writer_stress() {
         assert_eq!(received.len, 4);
         assert_eq!(u32::from_ne_bytes(bytes), expected);
     }
-    assert!(STRESS_WRITER_DONE.load(core::sync::atomic::Ordering::Acquire));
+    while !STRESS_WRITER_DONE.load(core::sync::atomic::Ordering::Acquire) {
+        assert!(
+            sched::now_ns_public() < deadline,
+            "UDP stress writer 未在期限内完成"
+        );
+        let _ = sched::operation::sched_yield();
+    }
     *STRESS_SENDER.lock() = None;
     sender.close();
     receiver.close();

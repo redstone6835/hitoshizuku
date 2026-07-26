@@ -1491,6 +1491,43 @@ impl ProtocolRuntime {
         self.publish_work();
     }
 
+    fn publish_protocol_stats(&self, protocol_stats: net::flow::FlowShardStats) {
+        for egress in self.egress.lock().iter().filter_map(Option::as_ref) {
+            let stats = &egress.stats;
+            stats
+                .protocol_tcp_delivered
+                .store(protocol_stats.tcp_delivered, Ordering::Relaxed);
+            stats
+                .protocol_udp_delivered
+                .store(protocol_stats.udp_delivered, Ordering::Relaxed);
+            stats
+                .protocol_control_packets
+                .store(protocol_stats.control_packets, Ordering::Relaxed);
+            stats
+                .protocol_tx_formed
+                .store(protocol_stats.tx_formed, Ordering::Relaxed);
+            stats
+                .protocol_dirty_runs
+                .store(protocol_stats.dirty_runs, Ordering::Relaxed);
+            stats
+                .protocol_timer_expired
+                .store(protocol_stats.timer_expired, Ordering::Relaxed);
+            stats
+                .tcp_rx_pinned_bytes
+                .store(protocol_stats.tcp_rx_pinned_bytes, Ordering::Relaxed);
+            stats
+                .tcp_rx_compact_copy_bytes
+                .store(protocol_stats.tcp_rx_compact_copy_bytes, Ordering::Relaxed);
+            stats
+                .tcp_loopback_shared_bytes
+                .store(protocol_stats.tcp_loopback_shared_bytes, Ordering::Relaxed);
+            stats.tcp_rx_pool_low_water_fallbacks.store(
+                protocol_stats.tcp_rx_pool_low_water_fallbacks,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     fn finish_drain(&self) -> bool {
         self.work_signal.finish_drain(|| {
             !self.ingress.is_empty()
@@ -1500,6 +1537,19 @@ impl ProtocolRuntime {
                 || !self.queue_attach.is_empty()
                 || self.timer_fired.load(Ordering::Acquire)
         })
+    }
+}
+
+fn push_local_ingress(target: &ProtocolRuntime, mut work: IngressWork) {
+    loop {
+        match target.try_push(work) {
+            Ok(()) => return,
+            Err(pending) => {
+                work = pending;
+                target.publish_work();
+                let _ = sched::operation::sched_yield();
+            }
+        }
     }
 }
 
@@ -1533,6 +1583,26 @@ impl ProtocolCluster {
             | OwnerRef::Bound { .. }
             | OwnerRef::Listener { .. }
             | OwnerRef::Closed { .. } => self.coordinator(),
+        }
+    }
+
+    fn install_socket_tx_pool(&self, facade: &SocketFacade, interface: InterfaceId) -> bool {
+        let runtime = self.owner_target(facade.owner());
+        let Some(index) = runtime.egress_index(interface) else {
+            return false;
+        };
+        let Some(egress) = runtime.egress(index) else {
+            return false;
+        };
+        match facade.kind() {
+            SocketKind::Stream => {
+                facade.install_stream_tx_pool(Arc::clone(&egress.tx_payload_pool))
+            }
+            SocketKind::Datagram => {
+                facade.install_datagram_tx_pool(Arc::clone(&egress.tx_payload_pool));
+                true
+            }
+            SocketKind::Raw => false,
         }
     }
 
@@ -1615,6 +1685,316 @@ impl KernelSocketRuntime {
     fn publish_work(&self, runtime: &ProtocolRuntime) {
         runtime.publish_work();
     }
+
+    fn loopback_config(&self, facade: &SocketFacade) -> Option<(Arc<ConfigSnapshot>, InterfaceId)> {
+        let destination = match facade.kind() {
+            SocketKind::Stream => facade.peer_endpoint(),
+            SocketKind::Datagram => facade.next_datagram_destination(),
+            SocketKind::Raw => None,
+        }?;
+        if destination.addr.is_unspecified() || destination.addr.is_multicast() {
+            return None;
+        }
+        let store = CONFIG_STORE.lock().as_ref().cloned()?;
+        let config = store.snapshot();
+        let bound_source = facade
+            .local_endpoint()
+            .and_then(|endpoint| (!endpoint.addr.is_unspecified()).then_some(endpoint.addr));
+        let route = config
+            .route_with_source_policy(
+                destination.addr,
+                facade.socket_mark(),
+                bound_source,
+                facade.interface(),
+                facade.free_bind(),
+            )
+            .ok()?;
+        config
+            .interfaces
+            .iter()
+            .any(|interface| interface.id == route.interface && interface.loopback)
+            .then_some((config, route.interface))
+    }
+
+    fn take_cooperative_scratch(cpu: usize) -> Option<CooperativeTxScratch> {
+        COOPERATIVE_TX_SCRATCH.get(cpu)?.try_lock()?.take()
+    }
+
+    fn return_cooperative_scratch(cpu: usize, mut scratch: CooperativeTxScratch) {
+        scratch.clear();
+        let Some(slot) = COOPERATIVE_TX_SCRATCH.get(cpu) else {
+            return;
+        };
+        let mut slot = slot.lock();
+        if slot.is_none() {
+            *slot = Some(scratch);
+        }
+    }
+
+    fn reclaim_cooperative_command(cpu: usize, command: NetStackFlowCommand) {
+        if let NetStackFlowCommand::CooperativeSocketTx {
+            tcp_output,
+            udp_output,
+            ..
+        } = command
+        {
+            Self::return_cooperative_scratch(
+                cpu,
+                CooperativeTxScratch {
+                    tcp: tcp_output,
+                    udp: udp_output,
+                },
+            );
+        }
+    }
+
+    fn publish_local_tcp(&self, cluster: &ProtocolCluster, work: PreparedTcpTx) {
+        let source = Endpoint {
+            addr: work.path.route.source,
+            port: work.local_port,
+        };
+        let Some(key) = FlowKey::new(source, work.remote, TransportProtocol::Tcp) else {
+            work.facade.set_pending_error(SocketError::NetworkDown);
+            return;
+        };
+        let target = cluster.local_ingress_target(&key);
+        push_local_ingress(
+            &target,
+            IngressWork::LocalTcp {
+                interface: work.path.route.interface,
+                work,
+            },
+        );
+    }
+
+    fn publish_local_udp(&self, cluster: &ProtocolCluster, work: PreparedUdpTx) {
+        let source = Endpoint {
+            addr: work.route.source,
+            port: work.source_port,
+        };
+        let Some(key) = FlowKey::new(source, work.destination, TransportProtocol::Udp) else {
+            work.payload
+                .facade()
+                .set_pending_error(SocketError::NetworkDown);
+            return;
+        };
+        let target = cluster.local_ingress_target(&key);
+        push_local_ingress(
+            &target,
+            IngressWork::LocalUdp {
+                interface: work.route.interface,
+                work,
+            },
+        );
+    }
+
+    fn try_cooperative_tx(&self, facade: &Arc<SocketFacade>, cause: SocketTxCause) -> bool {
+        #[cfg(feature = "performance-profile")]
+        let profile_start = profiling::read_counter();
+        let Some(guard) = CooperativeTxGuard::try_enter() else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackNested, 1);
+            return false;
+        };
+        // 同一 syscall 或 worker turn 的后续工作直接保留给 owner worker，避免再次完成
+        // 路由查询、pool 安装和 ELM frame 准备后才发现本轮调用预算已经耗尽。
+        let call_budget_exhausted = crate::net_stack::stack_call_budget_exhausted();
+        #[cfg(feature = "performance-profile")]
+        profiling::trace_point(
+            profiling::Event::NetStackRequest,
+            facade.id().counter,
+            cause as u64 | (u64::from(call_budget_exhausted) << 8),
+        );
+        if call_budget_exhausted {
+            #[cfg(feature = "performance-profile")]
+            {
+                profiling::observe(profiling::Metric::NetStackFallbackCallBudget, 1);
+                profiling::observe(
+                    match cause {
+                        SocketTxCause::Datagram => profiling::Metric::NetStackFallbackDatagram,
+                        SocketTxCause::StreamPayload => {
+                            profiling::Metric::NetStackFallbackTcpPayload
+                        }
+                        SocketTxCause::StreamState => profiling::Metric::NetStackFallbackTcpState,
+                        SocketTxCause::DrainRecheck => {
+                            profiling::Metric::NetStackFallbackDrainRecheck
+                        }
+                    },
+                    1,
+                );
+            }
+            return false;
+        }
+        let OwnerRef::Flow {
+            shard,
+            flow,
+            generation,
+        } = facade.owner()
+        else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackOwner, 1);
+            return false;
+        };
+        if generation != facade.generation() {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackGeneration, 1);
+            return false;
+        }
+        let Some(cluster) = self.cluster() else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackUnavailable, 1);
+            return false;
+        };
+        let Some((config, interface)) = self.loopback_config(facade) else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackNonLoopback, 1);
+            return false;
+        };
+        if !cluster.install_socket_tx_pool(facade, interface) {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackTxPool, 1);
+            return false;
+        }
+        let Some(scratch) = Self::take_cooperative_scratch(guard.cpu) else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackScratch, 1);
+            return false;
+        };
+        #[cfg(feature = "performance-profile")]
+        let profile_data = match facade.kind() {
+            SocketKind::Stream => facade.stream_unsent_len() != 0,
+            SocketKind::Datagram => facade.has_pending_datagram_tx(),
+            SocketKind::Raw => false,
+        };
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(
+                if profile_data {
+                    profiling::Metric::NetStackCooperativeDataCalls
+                } else {
+                    profiling::Metric::NetStackCooperativeStateCalls
+                },
+                1,
+            );
+        }
+        let command = NetStackFlowCommand::CooperativeSocketTx {
+            flow,
+            facade: Arc::clone(facade),
+            mark: facade.socket_mark(),
+            config: Arc::as_ptr(&config),
+            now_ns: sched::now_ns_public(),
+            limit: net::stack::NET_STACK_LOCAL_TURN_EFFECT_CAPACITY as u16,
+            inline_local: cluster.shards.len() == 1,
+            tcp_output: scratch.tcp,
+            udp_output: scratch.udp,
+            result: None,
+        };
+        let config_start = Arc::as_ptr(&config) as usize;
+        let Some(config_end) = config_start.checked_add(core::mem::size_of::<ConfigSnapshot>())
+        else {
+            Self::reclaim_cooperative_command(guard.cpu, command);
+            return false;
+        };
+        let client = crate::net_stack::ElmShardTurnClient::new(shard);
+        let command = match client.invoke_local_turn(command, &[(config_start, config_end)]) {
+            Ok(command) => command,
+            Err((_error, command)) => {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(
+                    match _error {
+                        crate::net_stack::ShardTurnError::Busy => {
+                            profiling::Metric::NetStackFallbackElmBusy
+                        }
+                        crate::net_stack::ShardTurnError::StackUnavailable => {
+                            profiling::Metric::NetStackFallbackUnavailable
+                        }
+                        crate::net_stack::ShardTurnError::CallFailed => {
+                            profiling::Metric::NetStackFallbackElmFailed
+                        }
+                    },
+                    1,
+                );
+                Self::reclaim_cooperative_command(guard.cpu, command);
+                return false;
+            }
+        };
+        let NetStackFlowCommand::CooperativeSocketTx {
+            mut tcp_output,
+            mut udp_output,
+            result:
+                Some(NetStackCooperativeTxResult {
+                    more_work, stats, ..
+                }),
+            ..
+        } = command
+        else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::NetStackFallbackResult, 1);
+            Self::reclaim_cooperative_command(guard.cpu, command);
+            return false;
+        };
+        if let Some(runtime) = cluster.shard(shard) {
+            runtime.publish_protocol_stats(stats);
+        }
+        let tcp_count = tcp_output.len();
+        for index in 0..tcp_count {
+            let Some(work) = tcp_output.take(index) else {
+                continue;
+            };
+            self.publish_local_tcp(&cluster, work);
+        }
+        let udp_count = udp_output.len();
+        for index in 0..udp_count {
+            let Some(outcome) = udp_output.take(index) else {
+                continue;
+            };
+            match outcome {
+                NetStackCooperativeUdpTx::Prepared(work) => self.publish_local_udp(&cluster, work),
+                NetStackCooperativeUdpTx::Failed(error, payload) => {
+                    payload.facade().set_pending_error(error);
+                }
+            }
+        }
+        Self::return_cooperative_scratch(
+            guard.cpu,
+            CooperativeTxScratch {
+                tcp: tcp_output,
+                udp: udp_output,
+            },
+        );
+        if more_work {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpTxWorkerContinuation, 1);
+            let runtime = cluster.owner_target(facade.owner());
+            runtime
+                .dirty
+                .try_push(Arc::clone(facade))
+                .unwrap_or_else(|_| panic!("socket dirty queue 超出流表上限"));
+            self.publish_work(runtime);
+        } else {
+            match facade.kind() {
+                SocketKind::Stream => {
+                    // local turn 内同步产生的 ACK、窗口更新和状态推进已经由本轮处理。
+                    // 以返回后的 generation 作为完成水位，clear+fence recheck 仍会捕获
+                    // 此后与其它 CPU 并发发布的真实新工作。
+                    let satisfied_generation = facade.stream_tx_generation();
+                    facade.finish_stream_tx_drain(satisfied_generation);
+                }
+                SocketKind::Datagram => facade.finish_tx_drain(),
+                SocketKind::Raw => unreachable!("raw socket 不进入 cooperative turn"),
+            }
+        }
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(
+            if profile_data {
+                profiling::Metric::NetStackCooperativeDataCycles
+            } else {
+                profiling::Metric::NetStackCooperativeStateCycles
+            },
+            profiling::read_counter().wrapping_sub(profile_start),
+        );
+        true
+    }
 }
 
 impl SocketRuntime for KernelSocketRuntime {
@@ -1639,7 +2019,12 @@ impl SocketRuntime for KernelSocketRuntime {
         }
     }
 
-    fn notify_tx(&self, facade: Arc<SocketFacade>) {
+    fn notify_tx(&self, facade: Arc<SocketFacade>, cause: SocketTxCause) {
+        if self.try_cooperative_tx(&facade, cause) {
+            return;
+        }
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::NetStackCooperativeFallbacks, 1);
         let cluster = self.cluster().expect("socket runtime 尚未启动");
         let runtime = cluster.owner_target(facade.owner());
         runtime
@@ -4176,7 +4561,7 @@ impl NetWorkerContext {
         }
     }
 
-    fn dispatch_local_udp(&mut self, egress: usize, work: PreparedUdpTx) {
+    fn dispatch_local_udp(&mut self, _egress: usize, work: PreparedUdpTx) {
         let source = Endpoint {
             addr: work.route.source,
             port: work.source_port,
@@ -4192,12 +4577,7 @@ impl NetWorkerContext {
             self.local_ingress.push_back(ingress);
             return;
         }
-        if target.try_push(ingress).is_err() {
-            if let Some(egress) = self.runtime.egress(egress) {
-                egress.stats.drop_reasons[DropReason::IngressRingFull.index()]
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        push_local_ingress(&target, ingress);
     }
 
     fn publish_neighbor_work(&mut self, work: PendingNeighborTx) {
@@ -5328,10 +5708,11 @@ impl NetWorkerContext {
                         TurnCommandMeta::LocalUdp,
                     ) => match output {
                         Some(Ok(_)) => work.payload.complete(),
+                        Some(Err(LocalUdpIngressError::Suppressed)) => work.payload.complete(),
                         Some(Err(
                             LocalUdpIngressError::NoEndpoint | LocalUdpIngressError::Unsupported,
                         )) => self.queue_tx_plan(PendingNeighborTx::Udp(work)),
-                        Some(Err(LocalUdpIngressError::RingFull)) => {}
+                        Some(Err(LocalUdpIngressError::RingFull)) => work.payload.complete(),
                         None => work
                             .payload
                             .facade()
@@ -5832,40 +6213,7 @@ impl NetWorkerContext {
     }
 
     fn publish_protocol_stats(&self, protocol_stats: net::flow::FlowShardStats) {
-        for queue in &self.local_queues {
-            let stats = &queue.stats;
-            stats
-                .protocol_tcp_delivered
-                .store(protocol_stats.tcp_delivered, Ordering::Relaxed);
-            stats
-                .protocol_udp_delivered
-                .store(protocol_stats.udp_delivered, Ordering::Relaxed);
-            stats
-                .protocol_control_packets
-                .store(protocol_stats.control_packets, Ordering::Relaxed);
-            stats
-                .protocol_tx_formed
-                .store(protocol_stats.tx_formed, Ordering::Relaxed);
-            stats
-                .protocol_dirty_runs
-                .store(protocol_stats.dirty_runs, Ordering::Relaxed);
-            stats
-                .protocol_timer_expired
-                .store(protocol_stats.timer_expired, Ordering::Relaxed);
-            stats
-                .tcp_rx_pinned_bytes
-                .store(protocol_stats.tcp_rx_pinned_bytes, Ordering::Relaxed);
-            stats
-                .tcp_rx_compact_copy_bytes
-                .store(protocol_stats.tcp_rx_compact_copy_bytes, Ordering::Relaxed);
-            stats
-                .tcp_loopback_shared_bytes
-                .store(protocol_stats.tcp_loopback_shared_bytes, Ordering::Relaxed);
-            stats.tcp_rx_pool_low_water_fallbacks.store(
-                protocol_stats.tcp_rx_pool_low_water_fallbacks,
-                Ordering::Relaxed,
-            );
-        }
+        self.runtime.publish_protocol_stats(protocol_stats);
     }
 
     fn recycle_rx_batch_container(&mut self, egress: usize, batch: PacketBatch) {
@@ -6507,7 +6855,7 @@ impl NetWorkerContext {
         facade.install_stream_tx_pool(Arc::clone(&egress.tx_payload_pool));
     }
 
-    fn dispatch_local_tcp(&mut self, egress: usize, work: PreparedTcpTx) {
+    fn dispatch_local_tcp(&mut self, _egress: usize, work: PreparedTcpTx) {
         let source = Endpoint {
             addr: work.path.route.source,
             port: work.local_port,
@@ -6523,12 +6871,7 @@ impl NetWorkerContext {
             self.local_ingress.push_back(ingress);
             return;
         }
-        if target.try_push(ingress).is_err() {
-            if let Some(egress) = self.runtime.egress(egress) {
-                egress.stats.drop_reasons[DropReason::IngressRingFull.index()]
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        push_local_ingress(&target, ingress);
     }
 
     fn dispatch_egress(&mut self, target: usize, mut work: EgressWork) {

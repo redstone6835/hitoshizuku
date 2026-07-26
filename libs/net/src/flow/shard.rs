@@ -429,12 +429,37 @@ impl FlowShard {
         self.reschedule_tcp(flow);
     }
 
+    pub fn drain_tcp_send_deferred_info(&mut self, flow: FlowId, now_ns: u64) {
+        self.tcp.drain_send_deferred_info(flow, now_ns);
+        self.reschedule_tcp(flow);
+    }
+
+    pub fn publish_tcp_info(&self, flow: FlowId) {
+        self.tcp.publish_tcp_info(flow);
+    }
+
     pub fn take_tcp_output(&mut self) -> Option<PreparedTcpTx> {
         self.tcp.take_output()
     }
 
     pub fn tcp_facade(&self, flow: FlowId) -> Option<Arc<SocketFacade>> {
         self.tcp.facade(flow)
+    }
+
+    pub fn try_process_local_tcp_effect(
+        &mut self,
+        interface: InterfaceId,
+        work: &PreparedTcpTx,
+        now_ns: u64,
+    ) -> Result<Option<(FlowId, FlowId)>, TcpIngressError> {
+        let Some((sender, receiver)) = self.tcp.try_local_data_effect(interface, work, now_ns)?
+        else {
+            return Ok(None);
+        };
+        self.stats.tcp_delivered = self.stats.tcp_delivered.saturating_add(1);
+        self.reschedule_tcp(sender);
+        self.reschedule_tcp(receiver);
+        Ok(Some((sender, receiver)))
     }
 
     pub fn process_local_tcp(
@@ -454,6 +479,23 @@ impl FlowShard {
         Ok(flow)
     }
 
+    pub fn process_local_tcp_deferred_info(
+        &mut self,
+        interface: InterfaceId,
+        path: TcpPath,
+        key: FlowKey,
+        packet: TcpPacket,
+        payload: Option<&TcpTxLease>,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpIngressError> {
+        let flow = self
+            .tcp
+            .ingest_local_deferred_info(interface, path, key, packet, payload, now_ns)?;
+        self.stats.tcp_delivered = self.stats.tcp_delivered.saturating_add(1);
+        self.reschedule_tcp(flow);
+        Ok(flow)
+    }
+
     pub fn process_local_udp(
         &mut self,
         interface: InterfaceId,
@@ -462,6 +504,8 @@ impl FlowShard {
         payload: &UdpTxLease,
         hop_limit: u8,
         traffic_class: u8,
+        mark: u32,
+        route_mtu: u32,
         now_ns: u64,
     ) -> Result<FlowId, LocalUdpIngressError> {
         let flow = self.udp.ingest_local(
@@ -471,6 +515,8 @@ impl FlowShard {
             payload,
             hop_limit,
             traffic_class,
+            mark,
+            route_mtu,
             now_ns,
         )?;
         self.stats.udp_delivered = self.stats.udp_delivered.saturating_add(1);
@@ -1332,22 +1378,19 @@ impl FlowShard {
             .iter()
             .find(|interface| interface.id == route.interface)
             .expect("route 指向已验证的接口");
-        if destination.addr.is_multicast() && facade.multicast_loop() {
-            let mut bytes = alloc::vec![0; usize::from(payload.len)];
-            if payload.copy_out(&mut bytes).is_ok() {
-                let _ = self.udp.deliver_local_multicast(
-                    route.interface,
-                    Endpoint {
-                        addr: route.source,
-                        port: endpoint.local.port,
-                    },
-                    destination,
-                    &bytes,
-                    facade.multicast_hops(),
-                    facade.ip_traffic_class(),
-                    now_ns,
-                );
-            }
+        if destination.addr.is_multicast() && facade.multicast_loop() && !interface.loopback {
+            let _ = self.udp.deliver_local_multicast(
+                route.interface,
+                Endpoint {
+                    addr: route.source,
+                    port: endpoint.local.port,
+                },
+                destination,
+                &payload,
+                facade.multicast_hops(),
+                facade.ip_traffic_class(),
+                now_ns,
+            );
         }
         let (destination_mac, unresolved_neighbor) = if destination.addr.is_multicast() {
             (multicast_mac(destination.addr), None)
@@ -1382,6 +1425,7 @@ impl FlowShard {
                 facade.ip_hop_limit()
             },
             traffic_class: facade.ip_traffic_class(),
+            mark,
             completion: {
                 let completion = CompletionToken(self.next_completion);
                 self.next_completion = self.next_completion.wrapping_add(1).max(1);

@@ -3819,6 +3819,7 @@ fn process_local_tcp_work(
     work: &PreparedTcpTx,
     config: &ConfigSnapshot,
     now_ns: u64,
+    publish_info: bool,
 ) -> Result<FlowId, TcpIngressError> {
     let source = Endpoint {
         addr: work.path.route.source,
@@ -3856,7 +3857,18 @@ fn process_local_tcp_work(
             .map_or(0, |payload| u32::from(payload.len)),
         options: work.parsed_options,
     };
-    shard.process_local_tcp(interface, path, key, packet, work.payload.as_ref(), now_ns)
+    if publish_info {
+        shard.process_local_tcp(interface, path, key, packet, work.payload.as_ref(), now_ns)
+    } else {
+        shard.process_local_tcp_deferred_info(
+            interface,
+            path,
+            key,
+            packet,
+            work.payload.as_ref(),
+            now_ns,
+        )
+    }
 }
 
 #[kernel_symbols::export(
@@ -3984,7 +3996,215 @@ pub fn dispatch_flow_shard_command(
         NetStackFlowCommand::DrainTcpSend { flow, now_ns } => {
             shard.drain_tcp_send(*flow, *now_ns);
         }
-        NetStackFlowCommand::CooperativeSocketTx { .. } => return false,
+        NetStackFlowCommand::CooperativeSocketTx {
+            flow,
+            facade,
+            mark,
+            config,
+            now_ns,
+            limit,
+            inline_local,
+            tcp_output,
+            udp_output,
+            result,
+        } => {
+            if config.is_null()
+                || !config.is_aligned()
+                || *limit == 0
+                || usize::from(*limit) > NET_STACK_LOCAL_TURN_EFFECT_CAPACITY
+                || !tcp_output.is_empty()
+                || !udp_output.is_empty()
+                || result.is_some()
+            {
+                return false;
+            }
+            // Safety: config 只在同步 local turn 内借用，host 已登记完整只读范围。
+            let config = unsafe { &**config };
+            match facade.kind() {
+                SocketKind::Stream => {
+                    let Some(owner) = shard.tcp_facade(*flow) else {
+                        return false;
+                    };
+                    if !Arc::ptr_eq(&owner, facade) {
+                        return false;
+                    }
+                    let mut changed_flows = [None; NET_STACK_LOCAL_TURN_EFFECT_CAPACITY * 2 + 1];
+                    let mut changed_flow_count = 1usize;
+                    #[cfg(feature = "performance-profile")]
+                    let mut local_effect_deliveries = 0u64;
+                    #[cfg(feature = "performance-profile")]
+                    let mut local_effect_bytes = 0u64;
+                    changed_flows[0] = Some(*flow);
+                    shard.drain_tcp_send_deferred_info(*flow, *now_ns);
+                    let mut processed = 0usize;
+                    while processed < usize::from(*limit) {
+                        let Some(mut work) = shard.take_tcp_output() else {
+                            break;
+                        };
+                        processed += 1;
+                        if let Err(error) = shard.refresh_tcp_tx_path(&mut work, config, *now_ns) {
+                            work.facade.set_pending_error(error);
+                            continue;
+                        }
+                        let loopback = *inline_local
+                            && config.interfaces.iter().any(|interface| {
+                                interface.id == work.path.route.interface && interface.loopback
+                            });
+                        if loopback {
+                            #[cfg(feature = "performance-profile")]
+                            profiling::observe(profiling::Metric::TcpLocalEffectAttempts, 1);
+                            match shard.try_process_local_tcp_effect(
+                                work.path.route.interface,
+                                &work,
+                                *now_ns,
+                            ) {
+                                Ok(Some((sender, receiver))) => {
+                                    #[cfg(feature = "performance-profile")]
+                                    {
+                                        profiling::observe(
+                                            profiling::Metric::TcpLocalEffectDeliveries,
+                                            1,
+                                        );
+                                        profiling::observe(
+                                            profiling::Metric::TcpLocalEffectBytes,
+                                            work.payload
+                                                .as_ref()
+                                                .map_or(0, |payload| u64::from(payload.len)),
+                                        );
+                                        local_effect_deliveries += 1;
+                                        local_effect_bytes += work
+                                            .payload
+                                            .as_ref()
+                                            .map_or(0, |payload| u64::from(payload.len));
+                                    }
+                                    for flow in [sender, receiver] {
+                                        if !changed_flows[..changed_flow_count]
+                                            .contains(&Some(flow))
+                                        {
+                                            changed_flows[changed_flow_count] = Some(flow);
+                                            changed_flow_count += 1;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(_) => continue,
+                            }
+                            match process_local_tcp_work(
+                                shard,
+                                work.path.route.interface,
+                                &work,
+                                config,
+                                *now_ns,
+                                false,
+                            ) {
+                                Ok(peer_flow) => {
+                                    if !changed_flows[..changed_flow_count]
+                                        .contains(&Some(peer_flow))
+                                    {
+                                        changed_flows[changed_flow_count] = Some(peer_flow);
+                                        changed_flow_count += 1;
+                                    }
+                                    continue;
+                                }
+                                Err(TcpIngressError::NoEndpoint) => {}
+                                Err(_) => continue,
+                            }
+                        }
+                        tcp_output
+                            .push(work)
+                            .unwrap_or_else(|_| unreachable!("TCP cooperative 输出容量已校验"));
+                    }
+                    for flow in changed_flows[..changed_flow_count].iter().flatten() {
+                        shard.publish_tcp_info(*flow);
+                    }
+                    #[cfg(feature = "performance-profile")]
+                    if local_effect_deliveries != 0 {
+                        profiling::observe(
+                            profiling::Metric::TcpLocalEffectBatchDeliveries,
+                            local_effect_deliveries,
+                        );
+                        profiling::observe(
+                            profiling::Metric::TcpLocalEffectBatchBytes,
+                            local_effect_bytes,
+                        );
+                    }
+                    *result = Some(NetStackCooperativeTxResult {
+                        kind: SocketKind::Stream,
+                        processed: processed as u16,
+                        more_work: shard.has_blocked_tcp_output(),
+                        stats: shard.stats(),
+                    });
+                }
+                SocketKind::Datagram => {
+                    let mut processed = 0usize;
+                    while processed < usize::from(*limit) {
+                        let Some(payload) = facade.take_tx() else {
+                            break;
+                        };
+                        processed += 1;
+                        let outcome = match shard
+                            .prepare_udp_tx(*flow, payload, *mark, config, *now_ns)
+                        {
+                            Ok(work) => {
+                                let source = Endpoint {
+                                    addr: work.route.source,
+                                    port: work.source_port,
+                                };
+                                let loopback = *inline_local
+                                    && config.interfaces.iter().any(|interface| {
+                                        interface.id == work.route.interface && interface.loopback
+                                    });
+                                if loopback {
+                                    match shard.process_local_udp(
+                                        work.route.interface,
+                                        source,
+                                        work.destination,
+                                        &work.payload,
+                                        work.hop_limit,
+                                        work.traffic_class,
+                                        work.mark,
+                                        work.route.mtu,
+                                        *now_ns,
+                                    ) {
+                                        Ok(_) => {
+                                            work.payload.complete();
+                                            continue;
+                                        }
+                                        Err(LocalUdpIngressError::Suppressed) => {
+                                            work.payload.complete();
+                                            continue;
+                                        }
+                                        Err(LocalUdpIngressError::RingFull) => {
+                                            work.payload.complete();
+                                            continue;
+                                        }
+                                        Err(
+                                            LocalUdpIngressError::NoEndpoint
+                                            | LocalUdpIngressError::Unsupported,
+                                        ) => {}
+                                    }
+                                }
+                                NetStackCooperativeUdpTx::Prepared(work)
+                            }
+                            Err((error, payload)) => {
+                                NetStackCooperativeUdpTx::Failed(error, payload)
+                            }
+                        };
+                        udp_output
+                            .push(outcome)
+                            .unwrap_or_else(|_| unreachable!("UDP cooperative 输出容量已校验"));
+                    }
+                    *result = Some(NetStackCooperativeTxResult {
+                        kind: SocketKind::Datagram,
+                        processed: processed as u16,
+                        more_work: facade.has_pending_datagram_tx(),
+                        stats: shard.stats(),
+                    });
+                }
+                SocketKind::Raw => return false,
+            }
+        }
         NetStackFlowCommand::TakeTcpOutputBatch {
             output,
             inline_pool_installs,
@@ -4033,6 +4253,7 @@ pub fn dispatch_flow_shard_command(
                             &work,
                             config,
                             *now_ns,
+                            true,
                         ) {
                             Ok(flow) if passive_open => {
                                 if let Some(facade) = shard.tcp_facade(flow) {
@@ -4102,7 +4323,7 @@ pub fn dispatch_flow_shard_command(
             // Safety: config 只在同步 shard-turn 期间借用。
             let config = unsafe { &**config };
             *output = Some(process_local_tcp_work(
-                shard, *interface, work, config, *now_ns,
+                shard, *interface, work, config, *now_ns, true,
             ));
         }
         NetStackFlowCommand::ProcessLocalUdpWork {
@@ -4128,6 +4349,8 @@ pub fn dispatch_flow_shard_command(
                 &work.payload,
                 work.hop_limit,
                 work.traffic_class,
+                work.mark,
+                work.route.mtu,
                 *now_ns,
             ));
         }
@@ -4992,6 +5215,9 @@ mod tests {
         let source = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let destination = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let plan = build_tcp_tx_plan(PreparedTcpTx {
+            flow: FlowId(1),
+            flow_generation: 1,
+            facade_generation: 1,
             facade,
             payload: None,
             path: TcpPath {
@@ -5228,6 +5454,214 @@ mod tests {
         assert!(!needs_resume);
         assert!(listener.readiness().0.contains(crate::Readiness::READABLE));
         assert!(client.readiness().0.contains(crate::Readiness::WRITABLE));
+    }
+
+    #[test]
+    fn cooperative_loopback_handshake_finishes_inside_one_turn() {
+        let interface = InterfaceId(1);
+        let local_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let listener_endpoint = Endpoint {
+            addr: local_addr,
+            port: 9001,
+        };
+        let client_endpoint = Endpoint {
+            addr: local_addr,
+            port: 40_001,
+        };
+        let listener = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 1,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Stream,
+        ));
+        let group = ListenGroup::new(ListenGroupId(2), &listener, 2, 8);
+        listener.install_listen_group(Arc::clone(&group));
+        let client = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 2,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Stream,
+        ));
+        let config = ConfigSnapshot::new(
+            2,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: interface,
+                device: crate::NetDeviceId(1),
+                mac_address: [0; 6],
+                mtu: 65_535,
+                running: true,
+                loopback: true,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let path = crate::transport::TcpPath {
+            route: crate::control::RouteDecision {
+                interface,
+                source: client_endpoint.addr,
+                next_hop: listener_endpoint.addr,
+                mtu: 65_535,
+                table: 0,
+            },
+            source_mac: [0; 6],
+            destination_mac: [0; 6],
+            unresolved_neighbor: None,
+            config_generation: config.generation,
+        };
+        let mut shard = FlowShard::new(ShardId(0), [1; 40], 1, [2; 16], [3; 16], 0);
+        shard
+            .listen_tcp(listener_endpoint, Some(interface), group)
+            .unwrap();
+        let flow = shard
+            .connect_tcp(
+                client_endpoint,
+                listener_endpoint,
+                path,
+                Arc::clone(&client),
+                1,
+                1_000,
+            )
+            .unwrap();
+        let mut command = NetStackFlowCommand::CooperativeSocketTx {
+            flow,
+            facade: Arc::clone(&client),
+            mark: 0,
+            config: &config,
+            now_ns: 2_000,
+            limit: 8,
+            inline_local: true,
+            tcp_output: NetStackLocalOutputBatch::new(),
+            udp_output: NetStackLocalOutputBatch::new(),
+            result: None,
+        };
+
+        assert!(dispatch_flow_shard_command(&mut shard, &mut command));
+        let NetStackFlowCommand::CooperativeSocketTx {
+            tcp_output,
+            udp_output,
+            result:
+                Some(NetStackCooperativeTxResult {
+                    kind: SocketKind::Stream,
+                    processed,
+                    more_work,
+                    stats: _,
+                }),
+            ..
+        } = command
+        else {
+            panic!("cooperative TCP turn 未返回完整结果");
+        };
+        assert!(processed >= 3);
+        assert!(!more_work);
+        assert!(tcp_output.is_empty());
+        assert!(udp_output.is_empty());
+        assert!(listener.readiness().0.contains(crate::Readiness::READABLE));
+        assert!(client.readiness().0.contains(crate::Readiness::WRITABLE));
+
+        let server = listener.accept(true, None).unwrap();
+        let payload = b"one local effect delivers and acknowledges this payload";
+        assert_eq!(client.test_push_stream_tx(payload), payload.len());
+        let mut command = NetStackFlowCommand::CooperativeSocketTx {
+            flow,
+            facade: Arc::clone(&client),
+            mark: 0,
+            config: &config,
+            now_ns: 3_000,
+            limit: 8,
+            inline_local: true,
+            tcp_output: NetStackLocalOutputBatch::new(),
+            udp_output: NetStackLocalOutputBatch::new(),
+            result: None,
+        };
+
+        assert!(dispatch_flow_shard_command(&mut shard, &mut command));
+        let NetStackFlowCommand::CooperativeSocketTx {
+            tcp_output,
+            result: Some(result),
+            ..
+        } = command
+        else {
+            panic!("cooperative TCP 数据 turn 未返回完整结果");
+        };
+        assert_eq!(result.processed, 1);
+        assert!(tcp_output.is_empty());
+        assert_eq!(client.test_stream_tx_len(), 0);
+        let mut received = [0u8; 64];
+        assert_eq!(
+            server.recv_stream(&mut received, false, false, false, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(&received[..payload.len()], payload);
+    }
+
+    #[test]
+    fn unsupported_local_udp_keeps_prepared_work_for_packet_fallback() {
+        let interface = InterfaceId(1);
+        let source = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_004,
+        };
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9007,
+        };
+        let sender = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 6,
+                counter: 1,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Datagram,
+        ));
+        let bytes = [0x4d; 32];
+        let payload = sender.test_udp_tx_lease(&bytes, destination);
+        let work = PreparedUdpTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface,
+                source: source.addr,
+                next_hop: destination.addr,
+                mtu: 65_535,
+                table: 0,
+            },
+            destination,
+            source_port: source.port,
+            source_mac: [0; 6],
+            destination_mac: [0; 6],
+            unresolved_neighbor: None,
+            hop_limit: 64,
+            traffic_class: 7,
+            mark: 0,
+            completion: CompletionToken(1),
+        };
+        let mut shard = FlowShard::new(ShardId(0), [1; 40], 1, [2; 16], [3; 16], 0);
+        shard.bind_udp(destination, None, Some(interface)).unwrap();
+        let mut command = NetStackFlowCommand::ProcessLocalUdpWork {
+            interface,
+            work: Some(work),
+            now_ns: 1,
+            output: None,
+        };
+
+        assert!(dispatch_flow_shard_command(&mut shard, &mut command));
+        let NetStackFlowCommand::ProcessLocalUdpWork {
+            work: Some(work),
+            output: Some(Err(LocalUdpIngressError::Unsupported)),
+            ..
+        } = command
+        else {
+            panic!("不支持的本地接收者必须保留完整 packet fallback work");
+        };
+        let mut copied = [0; 32];
+        assert_eq!(work.payload.copy_out(&mut copied), Ok(bytes.len()));
+        assert_eq!(copied, bytes);
+        work.payload.complete();
     }
 
     #[test]
