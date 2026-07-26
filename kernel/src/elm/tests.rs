@@ -3976,12 +3976,14 @@ fn elm_native_panic_uses_controlled_recovery_exit() {
 #[ktest]
 fn elm_native_timeout_forces_controlled_exit() {
     let cell = ElmId(0x7002);
-    let result = super::native::test_call_native_entry(
+    let deadline = sched::now_ns_public().saturating_add(50_000_000);
+    let result = super::native::test_call_native_entry_with_deadline(
         test_native_entry_spins as usize,
         cell,
         Some(ELM_MGR_ID),
         Generation(3),
         ElmState::Active,
+        deadline,
     );
 
     assert!(result.is_err());

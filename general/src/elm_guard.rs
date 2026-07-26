@@ -294,6 +294,7 @@ pub struct ElmGuard {
     depth: usize,
     cell: u64,
     entry_cpu: usize,
+    deadline_armed: bool,
 }
 
 impl ElmGuard {
@@ -317,11 +318,16 @@ impl ElmGuard {
             .store(ElmExecutionDomain::Runtime as usize, Ordering::Release);
         frame.cell.store(cell, Ordering::Release);
         state.guard_depth.store(depth + 1, Ordering::Release);
+        let deadline_armed = deadline_ns != 0;
+        if deadline_armed {
+            sched::reprogram_current_deadline(Some(deadline_ns));
+        }
         Some(Self {
             state,
             depth,
             cell,
             entry_cpu: current_cpu_id(),
+            deadline_armed,
         })
     }
 
@@ -416,6 +422,14 @@ impl Drop for ElmGuard {
         }
         frame.clear();
         self.state.guard_depth.store(self.depth, Ordering::Release);
+        if self.deadline_armed {
+            let parent_deadline = self
+                .depth
+                .checked_sub(1)
+                .map(|depth| self.state.frames[depth].deadline_ns.load(Ordering::Acquire))
+                .filter(|deadline| *deadline != 0);
+            sched::reprogram_current_deadline(parent_deadline);
+        }
     }
 }
 

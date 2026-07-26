@@ -474,6 +474,7 @@ impl LoadedElmImage {
             generation,
             state,
             self.execution_bounds()?,
+            0,
         )
     }
 
@@ -1238,6 +1239,7 @@ fn call_optional_native_entry(
     generation: Generation,
     state: elm_model::ElmState,
     bounds: NativeExecutionBounds,
+    requested_deadline_ns: u64,
 ) -> ElmResult<()> {
     let Some(address) = address else {
         return Ok(());
@@ -1246,7 +1248,7 @@ fn call_optional_native_entry(
         log::error!("[elm] 原生模块入口为空 cell={}", cell.0);
         return Err(ElmError::InvalidTransition);
     }
-    let invocation = NativeInvocation::enter(cell, ELM_GUARD_PHASE_ENTRY, 0)?;
+    let invocation = NativeInvocation::enter(cell, ELM_GUARD_PHASE_ENTRY, requested_deadline_ns)?;
     let elm_context = ElmContext::new(
         cell,
         parent,
@@ -1317,6 +1319,18 @@ pub(crate) fn test_call_native_entry(
     generation: Generation,
     state: elm_model::ElmState,
 ) -> ElmResult<()> {
+    test_call_native_entry_with_deadline(address, cell, parent, generation, state, 0)
+}
+
+#[cfg(feature = "kernel-tests")]
+pub(crate) fn test_call_native_entry_with_deadline(
+    address: usize,
+    cell: ElmId,
+    parent: Option<ElmId>,
+    generation: Generation,
+    state: elm_model::ElmState,
+    requested_deadline_ns: u64,
+) -> ElmResult<()> {
     let _ = super::resource_accounting::register_cell(cell, elm_model::ElmResourceBudget::DEFAULT);
     let page_start = address & !(PAGE_SIZE - 1);
     let page_end = page_start
@@ -1334,6 +1348,7 @@ pub(crate) fn test_call_native_entry(
             image_start: page_start,
             image_end: page_end,
         },
+        requested_deadline_ns,
     )
 }
 

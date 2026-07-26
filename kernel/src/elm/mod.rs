@@ -66,8 +66,9 @@ fn notify_lifecycle_event(event: ElmLifecycleEvent) {
 
 /// 常驻内核 consumer 对一个 ELM exact-Rust export 的代际固定描述。
 ///
-/// 该对象只保存复制到常驻内存中的身份和 ABI 摘要；每次调用仍由 Core 重新校验 cell
-/// 状态、generation 和 export 路由，并取得 active-execution 引用。
+/// 该对象保存复制到常驻内存中的身份和 ABI 摘要，并在首次成功解析后缓存当前 generation
+/// 的不可变 export 路由；每次调用仍由 Core 重新校验 cell 状态和 generation，并取得
+/// active-execution 引用。
 pub(crate) struct PinnedNativeCall {
     owner: elm_model::ElmId,
     generation: elm_model::Generation,
@@ -76,6 +77,13 @@ pub(crate) struct PinnedNativeCall {
     version: u32,
     rust_abi_hash: [u8; 32],
     stack: native::PinnedNativeStack,
+    route: Spinlock<Option<PinnedNativeRoute>>,
+}
+
+#[derive(Clone, Copy)]
+struct PinnedNativeRoute {
+    address: usize,
+    bounds: native::NativeExecutionBounds,
 }
 
 impl PinnedNativeCall {
@@ -101,6 +109,7 @@ impl PinnedNativeCall {
             version,
             rust_abi_hash: elm_model::sha256(rust_abi.as_bytes()),
             stack,
+            route: Spinlock::new(None),
         })
     }
 }
