@@ -462,6 +462,23 @@ impl FlowShard {
         Ok(Some((sender, receiver)))
     }
 
+    pub fn reconcile_local_tcp_direct(
+        &mut self,
+        flow: FlowId,
+        bytes: u32,
+        now_ns: u64,
+    ) -> Option<(FlowId, FlowId)> {
+        let pair = self.tcp.reconcile_local_direct(flow, bytes, now_ns)?;
+        self.stats.tcp_delivered = self.stats.tcp_delivered.saturating_add(1);
+        self.reschedule_tcp(pair.0);
+        self.reschedule_tcp(pair.1);
+        Some(pair)
+    }
+
+    pub fn local_tcp_peer_facade(&self, flow: FlowId) -> Option<(FlowId, Arc<SocketFacade>)> {
+        self.tcp.local_peer_facade(flow)
+    }
+
     pub fn process_local_tcp(
         &mut self,
         interface: InterfaceId,

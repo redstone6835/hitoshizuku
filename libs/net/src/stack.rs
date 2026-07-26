@@ -2514,6 +2514,7 @@ pub enum NetStackControlCommand {
         remote: Endpoint,
         local: Endpoint,
         protocol: TransportProtocol,
+        local_transport: bool,
         output: Option<ShardId>,
     },
     NeighborOwner {
@@ -2699,10 +2700,16 @@ impl NetStackControlPlane {
         remote: Endpoint,
         local: Endpoint,
         protocol: TransportProtocol,
+        local_transport: bool,
     ) -> ShardId {
         let key = FlowKey::new(remote, local, protocol).expect("协议 flow 端点必须属于同一地址族");
         let shard_count = self.active_shards.load(Ordering::Acquire);
-        ShardId((crate::flow::rss_hash(&self.rss_key, &key) as usize % shard_count) as u16)
+        let hash = if local_transport {
+            crate::flow::local_transport_hash(&self.rss_key, &key)
+        } else {
+            crate::flow::rss_hash(&self.rss_key, &key)
+        };
+        ShardId((hash as usize % shard_count) as u16)
     }
 
     fn neighbor_owner(&self, key: NeighborKey) -> ShardId {
@@ -3425,8 +3432,11 @@ pub fn dispatch_control_plane_call(
             remote,
             local,
             protocol,
+            local_transport,
             output,
-        } => *output = Some(plane.flow_shard(*remote, *local, *protocol)),
+        } => {
+            *output = Some(plane.flow_shard(*remote, *local, *protocol, *local_transport));
+        }
         NetStackControlCommand::NeighborOwner { key, output } => {
             *output = Some(plane.neighbor_owner(*key));
         }
@@ -3871,6 +3881,56 @@ fn process_local_tcp_work(
     }
 }
 
+fn reconcile_local_tcp_direct(
+    shard: &mut FlowShard,
+    flow: FlowId,
+    now_ns: u64,
+    restore_on_failure: bool,
+) {
+    #[cfg(feature = "performance-profile")]
+    let reconcile_start = profiling::read_counter();
+    let Some(facade) = shard.tcp_facade(flow) else {
+        return;
+    };
+    let bytes = facade.take_local_tcp_direct_pending();
+    if bytes == 0 {
+        return;
+    }
+    if let Some((sender, receiver)) = shard.reconcile_local_tcp_direct(flow, bytes, now_ns) {
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(
+                profiling::Metric::TcpLocalDirectReconcileBytes,
+                u64::from(bytes),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalDirectReconcileCycles,
+                profiling::read_counter().wrapping_sub(reconcile_start),
+            );
+        }
+        shard.publish_tcp_info(sender);
+        shard.publish_tcp_info(receiver);
+    } else if restore_on_failure {
+        facade.restore_local_tcp_direct_pending(bytes);
+    }
+}
+
+fn reconcile_local_tcp_direct_pair(shard: &mut FlowShard, flow: FlowId, now_ns: u64) {
+    let peer = shard.local_tcp_peer_facade(flow);
+    reconcile_local_tcp_direct(shard, flow, now_ns, false);
+    let Some((peer_flow, peer_facade)) = peer else {
+        return;
+    };
+    let bytes = peer_facade.take_local_tcp_direct_pending();
+    if bytes == 0 {
+        return;
+    }
+    if let Some((sender, receiver)) = shard.reconcile_local_tcp_direct(peer_flow, bytes, now_ns) {
+        shard.publish_tcp_info(sender);
+        shard.publish_tcp_info(receiver);
+    }
+}
+
 #[kernel_symbols::export(
     name = "net.stack.dispatch_flow_shard_turn",
     contract = "kernel.net.stack-flow-state@1",
@@ -3985,15 +4045,23 @@ pub fn dispatch_flow_shard_command(
                 *now_ns,
             ));
         }
-        NetStackFlowCommand::CloseTcp { flow, now_ns } => shard.close_tcp(*flow, *now_ns),
-        NetStackFlowCommand::AbortTcp { flow, now_ns } => shard.abort_tcp(*flow, *now_ns),
+        NetStackFlowCommand::CloseTcp { flow, now_ns } => {
+            reconcile_local_tcp_direct_pair(shard, *flow, *now_ns);
+            shard.close_tcp(*flow, *now_ns);
+        }
+        NetStackFlowCommand::AbortTcp { flow, now_ns } => {
+            reconcile_local_tcp_direct_pair(shard, *flow, *now_ns);
+            shard.abort_tcp(*flow, *now_ns);
+        }
         NetStackFlowCommand::ShutdownTcpWrite { flow, now_ns } => {
+            reconcile_local_tcp_direct_pair(shard, *flow, *now_ns);
             shard.shutdown_tcp_write(*flow, *now_ns);
         }
         NetStackFlowCommand::CloseTcpListener { group, output } => {
             *output = Some(shard.close_tcp_listener(*group));
         }
         NetStackFlowCommand::DrainTcpSend { flow, now_ns } => {
+            reconcile_local_tcp_direct(shard, *flow, *now_ns, true);
             shard.drain_tcp_send(*flow, *now_ns);
         }
         NetStackFlowCommand::CooperativeSocketTx {
@@ -4035,6 +4103,34 @@ pub fn dispatch_flow_shard_command(
                     #[cfg(feature = "performance-profile")]
                     let mut local_effect_bytes = 0u64;
                     changed_flows[0] = Some(*flow);
+                    let direct_bytes = facade.take_local_tcp_direct_pending();
+                    if direct_bytes != 0 {
+                        #[cfg(feature = "performance-profile")]
+                        let reconcile_start = profiling::read_counter();
+                        if let Some((sender, receiver)) =
+                            shard.reconcile_local_tcp_direct(*flow, direct_bytes, *now_ns)
+                        {
+                            #[cfg(feature = "performance-profile")]
+                            {
+                                profiling::observe(
+                                    profiling::Metric::TcpLocalDirectReconcileBytes,
+                                    u64::from(direct_bytes),
+                                );
+                                profiling::observe(
+                                    profiling::Metric::TcpLocalDirectReconcileCycles,
+                                    profiling::read_counter().wrapping_sub(reconcile_start),
+                                );
+                            }
+                            for changed in [sender, receiver] {
+                                if !changed_flows[..changed_flow_count].contains(&Some(changed)) {
+                                    changed_flows[changed_flow_count] = Some(changed);
+                                    changed_flow_count += 1;
+                                }
+                            }
+                        } else {
+                            facade.restore_local_tcp_direct_pending(direct_bytes);
+                        }
+                    }
                     shard.drain_tcp_send_deferred_info(*flow, *now_ns);
                     let mut processed = 0usize;
                     while processed < usize::from(*limit) {
@@ -4119,6 +4215,8 @@ pub fn dispatch_flow_shard_command(
                         shard.publish_tcp_info(*flow);
                     }
                     #[cfg(feature = "performance-profile")]
+                    profiling::observe(profiling::Metric::TcpLocalTurnProcessed, processed as u64);
+                    #[cfg(feature = "performance-profile")]
                     if local_effect_deliveries != 0 {
                         profiling::observe(
                             profiling::Metric::TcpLocalEffectBatchDeliveries,
@@ -4135,6 +4233,10 @@ pub fn dispatch_flow_shard_command(
                         more_work: shard.has_blocked_tcp_output(),
                         stats: shard.stats(),
                     });
+                    #[cfg(feature = "performance-profile")]
+                    if result.as_ref().is_some_and(|result| result.more_work) {
+                        profiling::observe(profiling::Metric::TcpLocalTurnMoreWork, 1);
+                    }
                 }
                 SocketKind::Datagram => {
                     let mut processed = 0usize;
@@ -4235,6 +4337,7 @@ pub fn dispatch_flow_shard_command(
             let config = unsafe { &**config };
             let mut remaining_resume = usize::from(*resume_budget);
             let mut processed = 0usize;
+            let mut pending_local_info = None;
             while batch.len() < usize::from(*limit) && processed < usize::from(*limit) {
                 if let Some(mut work) = shard.take_tcp_output() {
                     processed += 1;
@@ -4247,6 +4350,23 @@ pub fn dispatch_flow_shard_command(
                     {
                         let passive_open = work.flags.contains(TcpFlags::SYN)
                             && !work.flags.contains(TcpFlags::ACK);
+                        match shard.try_process_local_tcp_effect(
+                            work.path.route.interface,
+                            &work,
+                            *now_ns,
+                        ) {
+                            Ok(Some(pair)) => {
+                                if pending_local_info.is_some_and(|previous| previous != pair) {
+                                    let (sender, receiver) = pending_local_info.take().unwrap();
+                                    shard.publish_tcp_info(sender);
+                                    shard.publish_tcp_info(receiver);
+                                }
+                                pending_local_info = Some(pair);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(_) => continue,
+                        }
                         match process_local_tcp_work(
                             shard,
                             work.path.route.interface,
@@ -4277,6 +4397,10 @@ pub fn dispatch_flow_shard_command(
                     break;
                 }
                 remaining_resume = remaining_resume.saturating_sub(resumed);
+            }
+            if let Some((sender, receiver)) = pending_local_info {
+                shard.publish_tcp_info(sender);
+                shard.publish_tcp_info(receiver);
             }
             let pending = shard.has_blocked_tcp_output();
             let exhausted = processed == usize::from(*limit)
@@ -4322,9 +4446,19 @@ pub fn dispatch_flow_shard_command(
             }
             // Safety: config 只在同步 shard-turn 期间借用。
             let config = unsafe { &**config };
-            *output = Some(process_local_tcp_work(
-                shard, *interface, work, config, *now_ns, true,
-            ));
+            *output = Some(
+                match shard.try_process_local_tcp_effect(*interface, work, *now_ns) {
+                    Ok(Some((sender, receiver))) => {
+                        shard.publish_tcp_info(sender);
+                        shard.publish_tcp_info(receiver);
+                        Ok(receiver)
+                    }
+                    Ok(None) => {
+                        process_local_tcp_work(shard, *interface, work, config, *now_ns, true)
+                    }
+                    Err(error) => Err(error),
+                },
+            );
         }
         NetStackFlowCommand::ProcessLocalUdpWork {
             interface,
@@ -5274,6 +5408,7 @@ mod tests {
                         port: port + 1024,
                     },
                     TransportProtocol::Tcp,
+                    false,
                 ),
                 ShardId(0)
             );

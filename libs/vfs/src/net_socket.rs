@@ -424,6 +424,19 @@ impl NetSocketFileOps {
             .map_err(map_socket_error)
     }
 
+    pub fn send_stream_from(
+        &self,
+        payload_len: usize,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+        copy: impl FnMut(usize, &mut [u8]),
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .send_stream_from(payload_len, nonblocking, deadline_ns, more, copy)
+            .map_err(map_socket_error)
+    }
+
     pub fn stream_send_deadline(&self) -> Option<u64> {
         self.send_deadline()
     }
@@ -473,6 +486,27 @@ impl NetSocketFileOps {
             rx_timestamp_ns: received.rx_timestamp_ns,
             msg_flags: usize::from(received.truncated) * 0x20,
         })
+    }
+
+    pub fn recv_stream_to(
+        &self,
+        output_len: usize,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        defer_window_update: bool,
+        copy: impl FnMut(usize, &[u8]),
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .recv_stream_to(
+                output_len,
+                false,
+                false,
+                defer_window_update,
+                nonblocking,
+                deadline_ns,
+                copy,
+            )
+            .map_err(map_socket_error)
     }
 
     /// 等待 UDP 数据报就绪但不消费，供 syscall 在等待结束后再固定用户目标页。

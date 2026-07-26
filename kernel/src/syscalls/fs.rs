@@ -1913,45 +1913,6 @@ fn recv_local_datagram_to_user(
     Ok(received)
 }
 
-fn send_inet_stream_from_user(
-    vm: &VmSpace,
-    vfs_ctx: &vfs::VfsContext,
-    fdt: &vfs::fdtable::FdTable,
-    fd: Fd,
-    user: usize,
-    len: usize,
-    flags: usize,
-) -> Result<usize, Errno> {
-    let mut sent = 0usize;
-    while sent < len {
-        let user_ptr = user.checked_add(sent).ok_or(Errno::EFAULT)?;
-        let remaining = len - sent;
-        let result = unsafe {
-            vm.with_user_read_slice(user_ptr, remaining, |data| {
-                let mut chunk_flags = flags;
-                if sent + data.len() < len {
-                    chunk_flags |= vfs_socket::MSG_MORE;
-                }
-                send_socket_payload(vfs_ctx, fdt, fd, data, None, chunk_flags)
-                    .map(|written| (written, data.len()))
-            })
-        };
-        let (written, window_len) = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) if sent != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
-                return Ok(sent);
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(error) => return if sent == 0 { Err(error) } else { Ok(sent) },
-        };
-        sent += written;
-        if written == 0 || written < window_len {
-            break;
-        }
-    }
-    Ok(sent)
-}
-
 fn send_inet_stream_file_from_user(
     vm: &VmSpace,
     file: &vfs::file::File,
@@ -1973,32 +1934,57 @@ fn send_inet_stream_file_from_user(
     while sent < len {
         let user_ptr = user.checked_add(sent).ok_or(Errno::EFAULT)?;
         let remaining = len - sent;
-        let result = unsafe {
-            vm.with_user_read_slice(user_ptr, remaining, |data| {
-                let more = sent + data.len() < len || (flags & vfs_socket::MSG_MORE) != 0;
-                #[cfg(feature = "performance-profile")]
-                let mut profile = profiling::scope(profiling::Event::SysSendSocket);
-                let result = socket.send_stream_page(data, nonblocking, deadline_ns, more);
-                #[cfg(feature = "performance-profile")]
-                if let Ok(written) = result {
-                    profile.set_bytes(written);
-                }
-                result.map(|written| (written, data.len()))
-            })
+        let window_target = remaining.min(MAX_SOCKET_IO);
+        #[cfg(feature = "performance-profile")]
+        let pin_start = profiling::read_counter();
+        // MAX_SOCKET_IO 为 256 KiB；任意未对齐范围最多覆盖 65 个 4 KiB 页。
+        // 一次固定后直接写入 socket ring，避免每页重复获取 TX 锁和更新 readiness。
+        let windows = match vm.pin_user_read_windows::<65>(user_ptr, window_target) {
+            Ok(windows) => windows,
+            Err(error) => return if sent == 0 { Err(error) } else { Ok(sent) },
         };
-        let (written, window_len) = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) if sent != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(
+                profiling::Metric::TcpUserSendPinCycles,
+                profiling::read_counter().wrapping_sub(pin_start),
+            );
+            profiling::observe(
+                profiling::Metric::TcpUserSendPinnedWindows,
+                windows.window_count() as u64,
+            );
+        }
+        let window_len = windows.len();
+        let more = sent + window_len < len || (flags & vfs_socket::MSG_MORE) != 0;
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::SysSendSocket);
+        let result = socket.send_stream_from(
+            window_len,
+            nonblocking,
+            deadline_ns,
+            more,
+            |offset, output| {
+                windows
+                    .copy_into(offset, output)
+                    .expect("固定的 TCP 发送窗口必须覆盖声明范围");
+            },
+        );
+        #[cfg(feature = "performance-profile")]
+        if let Ok(written) = result {
+            profile.set_bytes(written);
+        }
+        let written = match result {
+            Ok(written) => written,
+            Err(error) if sent != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
                 return Ok(sent);
             }
-            Ok(Err(Errno::EPIPE)) => {
+            Err(Errno::EPIPE) => {
                 if (flags & vfs_socket::MSG_NOSIGNAL) == 0 {
                     deliver_sigpipe();
                 }
                 return Err(Errno::EPIPE);
             }
-            Ok(Err(error)) => return Err(error),
-            Err(error) => return if sent == 0 { Err(error) } else { Ok(sent) },
+            Err(error) => return Err(error),
         };
         sent += written;
         if written == 0 || written < window_len {
@@ -2010,9 +1996,8 @@ fn send_inet_stream_file_from_user(
 
 fn send_inet_stream_iovecs_from_user(
     vm: &VmSpace,
-    vfs_ctx: &vfs::VfsContext,
-    fdt: &vfs::fdtable::FdTable,
-    fd: Fd,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
     iov: usize,
     iovcnt: usize,
     total: usize,
@@ -2030,7 +2015,7 @@ fn send_inet_stream_iovecs_from_user(
         } else {
             flags
         };
-        match send_inet_stream_from_user(vm, vfs_ctx, fdt, fd, base, len, chunk_flags) {
+        match send_inet_stream_file_from_user(vm, file, socket, base, len, chunk_flags) {
             Ok(written) => {
                 sent += written;
                 if written < len {
@@ -2063,26 +2048,11 @@ fn recv_inet_stream_file_to_user(
     while received < len {
         let user_ptr = user.checked_add(received).ok_or(Errno::EFAULT)?;
         let remaining = len - received;
-        let result = unsafe {
-            vm.with_user_write_slice(user_ptr, remaining, |data| {
-                #[cfg(feature = "performance-profile")]
-                let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
-                let more = received.saturating_add(data.len()) < len;
-                let result =
-                    socket.recv_stream_page(data, nonblocking || received != 0, deadline_ns, more);
-                #[cfg(feature = "performance-profile")]
-                if let Ok(copied) = result {
-                    profile.set_bytes(copied);
-                }
-                result.map(|copied| (copied, data.len()))
-            })
-        };
-        let (copied, window_len) = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) if received != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
-                break;
-            }
-            Ok(Err(error)) => return Err(error),
+        let window_target = remaining.min(MAX_SOCKET_IO);
+        #[cfg(feature = "performance-profile")]
+        let pin_start = profiling::read_counter();
+        let windows = match vm.pin_user_write_windows::<65>(user_ptr, window_target) {
+            Ok(windows) => windows,
             Err(error) => {
                 return if received == 0 {
                     Err(error)
@@ -2090,6 +2060,42 @@ fn recv_inet_stream_file_to_user(
                     Ok(received)
                 };
             }
+        };
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(
+                profiling::Metric::TcpUserReceivePinCycles,
+                profiling::read_counter().wrapping_sub(pin_start),
+            );
+            profiling::observe(
+                profiling::Metric::TcpUserReceivePinnedWindows,
+                windows.window_count() as u64,
+            );
+        }
+        let window_len = windows.len();
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+        let result = socket.recv_stream_to(
+            window_len,
+            nonblocking || received != 0,
+            deadline_ns,
+            true,
+            |offset, input| {
+                windows
+                    .copy_from(offset, input)
+                    .expect("固定的 TCP 接收窗口必须覆盖声明范围");
+            },
+        );
+        #[cfg(feature = "performance-profile")]
+        if let Ok(copied) = result {
+            profile.set_bytes(copied);
+        }
+        let copied = match result {
+            Ok(copied) => copied,
+            Err(error) if received != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
+                break;
+            }
+            Err(error) => return Err(error),
         };
         received += copied;
         if copied == 0 || copied < window_len {
@@ -2109,92 +2115,17 @@ impl Drop for InetStreamFileReceiveBatch<'_> {
     }
 }
 
-struct InetStreamFdReceiveBatch<'a> {
-    fdt: &'a vfs::fdtable::FdTable,
-    fd: Fd,
-}
-
-impl Drop for InetStreamFdReceiveBatch<'_> {
-    fn drop(&mut self) {
-        vfs_socket::finish_stream_receive(self.fdt, self.fd);
-    }
-}
-
-fn recv_inet_stream_windows(
-    vm: &VmSpace,
-    fdt: &vfs::fdtable::FdTable,
-    fd: Fd,
-    user: usize,
-    len: usize,
-    want_addr: bool,
-    flags: usize,
-    address: &mut Option<Vec<u8>>,
-) -> Result<usize, Errno> {
-    let mut received = 0usize;
-    while received < len {
-        let user_ptr = user.checked_add(received).ok_or(Errno::EFAULT)?;
-        let remaining = len - received;
-        let result = unsafe {
-            vm.with_user_write_slice(user_ptr, remaining, |data| {
-                let mut chunk_flags = flags;
-                if received != 0 {
-                    chunk_flags |= vfs_socket::MSG_DONTWAIT;
-                }
-                #[cfg(feature = "performance-profile")]
-                let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
-                let result = vfs_socket::recv_deferred(
-                    fdt,
-                    fd,
-                    data,
-                    0,
-                    want_addr && received == 0,
-                    chunk_flags,
-                    None,
-                );
-                #[cfg(feature = "performance-profile")]
-                if let Ok(output) = &result {
-                    profile.set_bytes(output.len);
-                }
-                result.map(|output| (output, data.len()))
-            })
-        };
-        let (output, window_len) = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) if received != 0 && matches!(error, Errno::EAGAIN | Errno::EINTR) => {
-                break;
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
-                return if received == 0 {
-                    Err(error)
-                } else {
-                    Ok(received)
-                };
-            }
-        };
-        if received == 0 {
-            *address = output.address;
-        }
-        received += output.len;
-        if output.len == 0 || output.len < window_len {
-            break;
-        }
-    }
-    Ok(received)
-}
-
 fn recv_inet_stream_iovecs_to_user(
     vm: &VmSpace,
-    fdt: &vfs::fdtable::FdTable,
-    fd: Fd,
+    file: &vfs::file::File,
+    socket: &vfs::net_socket::NetSocketFileOps,
     iov: usize,
     iovcnt: usize,
     total: usize,
     flags: usize,
 ) -> Result<usize, Errno> {
-    let _batch = InetStreamFdReceiveBatch { fdt, fd };
+    let _batch = InetStreamFileReceiveBatch { socket };
     let mut received = 0usize;
-    let mut address = None;
     for index in 0..iovcnt {
         let (base, len) = read_iovec(iov, index)?;
         let len = len.min(total.saturating_sub(received));
@@ -2206,7 +2137,7 @@ fn recv_inet_stream_iovecs_to_user(
         } else {
             flags | vfs_socket::MSG_DONTWAIT
         };
-        match recv_inet_stream_windows(vm, fdt, fd, base, len, false, chunk_flags, &mut address) {
+        match recv_inet_stream_file_to_user(vm, file, socket, base, len, chunk_flags) {
             Ok(copied) => {
                 received += copied;
                 if copied < len {
@@ -2291,9 +2222,8 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
                 .then(|| InetStreamWriteBatch { socket });
             return send_inet_stream_iovecs_from_user(
                 &vm,
-                &vfs_ctx,
-                &fdt,
-                fd,
+                &file,
+                socket,
                 hdr.iov,
                 hdr.iovlen,
                 total,
@@ -2375,11 +2305,13 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         && (ctx.args[2] & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
+        && let Some(file) = fdt.get_file(fd)
+        && let Some(socket) = inet_stream_file(&file)
     {
         let len = recv_inet_stream_iovecs_to_user(
             &vm,
-            &fdt,
-            fd,
+            &file,
+            socket,
             hdr.iov,
             hdr.iovlen,
             total,
@@ -3871,6 +3803,12 @@ fn write_from_user_at(
     let Some(vm) = current_vm_space() else {
         return write_from_user_at_fallback(file, user, len, offset);
     };
+    if offset.is_none()
+        && let Some(socket) = inet_stream_file(file)
+    {
+        let _batch = InetStreamWriteBatch { socket };
+        return send_inet_stream_file_from_user(&vm, file, socket, user, len, 0);
+    }
 
     let mut remaining = len;
     let mut user_ptr = user;
@@ -3988,6 +3926,12 @@ fn read_to_user(
     let Some(vm) = current_vm_space() else {
         return read_to_user_fallback(file, user, len, offset);
     };
+    if offset.is_none()
+        && let Some(socket) = inet_stream_file(file)
+    {
+        let _batch = InetStreamFileReceiveBatch { socket };
+        return recv_inet_stream_file_to_user(&vm, file, socket, user, len, 0);
+    }
     read_to_user_windows(&vm, file, user, len, offset)
 }
 

@@ -527,7 +527,7 @@ impl TcpEndpointTable {
         let iss = self.initial_sequence(key, now_ns);
         let mut machine = TcpStateMachine::new(iss, advertised_window(&facade, 0));
         let transmit = machine.active_open().unwrap();
-        let local_window_scale = choose_window_scale(facade.buffer_limits().1);
+        let local_window_scale = choose_window_scale(facade.receive_window_scale_limit());
         let initial_window = advertised_window(&facade, local_window_scale);
         let flow = TcpFlow {
             facade: Arc::clone(&facade),
@@ -660,6 +660,8 @@ impl TcpEndpointTable {
         work: &PreparedTcpTx,
         now_ns: u64,
     ) -> Result<Option<(FlowId, FlowId)>, TcpIngressError> {
+        #[cfg(feature = "performance-profile")]
+        let effect_start = profiling::read_counter();
         if !crate::socket::local_transport_fast_path_eligible() {
             return Ok(None);
         }
@@ -785,6 +787,7 @@ impl TcpEndpointTable {
             receive_window as u64,
         );
         if payload_len > receive_window {
+            peer_facade.mark_local_stream_window_blocked();
             #[cfg(feature = "performance-profile")]
             profiling::observe(profiling::Metric::TcpLocalEffectWindowRejects, 1);
             return Ok(None);
@@ -800,6 +803,8 @@ impl TcpEndpointTable {
             return Ok(None);
         }
 
+        #[cfg(feature = "performance-profile")]
+        let lookup_done = profiling::read_counter();
         let commit = peer_facade
             .push_stream_rx_lease(payload, 0, payload_len, work.flags.contains(TcpFlags::PSH))
             .map_err(|_| {
@@ -808,6 +813,8 @@ impl TcpEndpointTable {
                 TcpIngressError::ReceiveBufferFull
             })?;
         self.record_rx_commit(commit);
+        #[cfg(feature = "performance-profile")]
+        let commit_done = profiling::read_counter();
 
         let (peer_previous_ack, peer_current_ack, peer_wire_window) = {
             let peer = self.flows.get_mut(peer_id).unwrap();
@@ -848,8 +855,130 @@ impl TcpEndpointTable {
         }
         self.acknowledge(sender_id, sender_previous_ack, sender_current_ack, now_ns);
         self.drain_send_with_info(sender_id, now_ns, false);
+        if work.facade.stream_unsent_len() == 0
+            && !self
+                .output
+                .iter()
+                .any(|pending| pending.flow == sender_id && pending.payload.is_some())
+        {
+            work.facade.install_local_tcp_direct_peer(&peer_facade);
+        }
+        if peer_facade.stream_unsent_len() == 0
+            && !self
+                .output
+                .iter()
+                .any(|pending| pending.flow == peer_id && pending.payload.is_some())
+        {
+            peer_facade.install_local_tcp_direct_peer(&work.facade);
+        }
         self.stats.delivered = self.stats.delivered.saturating_add(1);
+        #[cfg(feature = "performance-profile")]
+        {
+            let effect_done = profiling::read_counter();
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectLookupCycles,
+                lookup_done.wrapping_sub(effect_start),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectCommitCycles,
+                commit_done.wrapping_sub(lookup_done),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectAckCycles,
+                effect_done.wrapping_sub(commit_done),
+            );
+            profiling::observe(
+                profiling::Metric::TcpLocalEffectCycles,
+                effect_done.wrapping_sub(effect_start),
+            );
+        }
         Ok(Some((sender_id, peer_id)))
+    }
+
+    /// 对 socket 直达 lane 已经交付的字节统一推进 TCP 序列空间。
+    ///
+    /// 数据在进入这里前已经由代际校验的 peer route 原子地提交到接收 ring；本函数
+    /// 只在 ELM owner turn 内更新双方状态机，不再构造报文或重复持有 payload。
+    pub fn reconcile_local_direct(
+        &mut self,
+        sender_id: FlowId,
+        mut bytes: u32,
+        now_ns: u64,
+    ) -> Option<(FlowId, FlowId)> {
+        if bytes == 0 {
+            return None;
+        }
+        let hint = self.flows.get(sender_id)?.local_peer_hint?;
+        let peer_id = hint.flow;
+        if sender_id == peer_id
+            || self.flows.generation(peer_id) != Some(hint.flow_generation)
+            || self.flows.get(peer_id).is_none_or(|peer| {
+                peer.facade.generation() != hint.facade_generation
+                    || peer.facade.stack_generation() != hint.stack_generation
+                    || peer.facade.is_closing()
+            })
+        {
+            return None;
+        }
+
+        while bytes != 0 {
+            let chunk = bytes;
+            let (sequence, acknowledgement) = {
+                let sender = self.flows.get(sender_id)?;
+                let peer = self.flows.get(peer_id)?;
+                if sender.machine.state() != TcpState::Established
+                    || peer.machine.state() != TcpState::Established
+                    || sender.machine.send_next() != peer.machine.receive_next()
+                {
+                    return None;
+                }
+                (
+                    sender.machine.send_next(),
+                    peer.machine.send_unacknowledged(),
+                )
+            };
+            let segment = crate::transport::TcpSegment {
+                sequence,
+                acknowledgement,
+                flags: TcpFlags::ACK | TcpFlags::PSH,
+                window: 0,
+                payload_len: chunk,
+            };
+            let reserved = self.flows.get_mut(sender_id)?.machine.reserve_send(chunk)?;
+            debug_assert_eq!(reserved, sequence);
+            let peer_wire_window = {
+                let peer = self.flows.get_mut(peer_id)?;
+                peer.machine.accept_local_data(segment)?;
+                peer.last_activity_ns = now_ns;
+                let window = advertised_window(&peer.facade, peer.local_window_scale);
+                peer.last_advertised_window = window;
+                window
+            };
+            let end = sequence + chunk;
+            let sender = self.flows.get_mut(sender_id)?;
+            let (previous, current) = sender.machine.accept_local_ack(end)?;
+            sender.peer_window = u32::from(peer_wire_window) << sender.peer_window_scale;
+            sender.last_activity_ns = now_ns;
+            sender.congestion.new_ack(
+                current.distance_from(previous),
+                sender.mss,
+                sender.machine.send_next(),
+            );
+            sender.deadlines.retransmit = None;
+            sender.deadlines.persist = None;
+            bytes -= chunk;
+        }
+        self.stats.delivered = self.stats.delivered.saturating_add(1);
+        Some((sender_id, peer_id))
+    }
+
+    pub fn local_peer_facade(&self, sender_id: FlowId) -> Option<(FlowId, Arc<SocketFacade>)> {
+        let hint = self.flows.get(sender_id)?.local_peer_hint?;
+        let peer = self.flows.get(hint.flow)?;
+        (self.flows.generation(hint.flow) == Some(hint.flow_generation)
+            && peer.facade.generation() == hint.facade_generation
+            && peer.facade.stack_generation() == hint.stack_generation)
+            .then(|| (hint.flow, Arc::clone(&peer.facade)))
     }
 
     fn ingest_local_with_info(
@@ -1324,7 +1453,7 @@ impl TcpEndpointTable {
         let mut machine = TcpStateMachine::new(iss, advertised_window(&child, 0));
         machine.listen();
         let output = machine.on_segment(tcp.segment());
-        let local_window_scale = choose_window_scale(child.buffer_limits().1);
+        let local_window_scale = choose_window_scale(child.receive_window_scale_limit());
         let initial_window = advertised_window(&child, local_window_scale);
         let flow = TcpFlow {
             facade: Arc::clone(&child),
@@ -3348,6 +3477,53 @@ mod tests {
         assert_eq!(
             table.try_local_data_effect(InterfaceId(1), &second, 13_000),
             Ok(Some((pair.client_flow, pair.server_flow)))
+        );
+    }
+
+    #[test]
+    fn local_direct_reconciliation_advances_both_sequence_spaces_once() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let first = prepare_local_payload(&mut table, &pair, b"route warmup", 10_000);
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &first, 11_000),
+            Ok(Some((pair.client_flow, pair.server_flow)))
+        );
+        let send_next = table
+            .flows
+            .get(pair.client_flow)
+            .unwrap()
+            .machine
+            .send_next();
+        let receive_next = table
+            .flows
+            .get(pair.server_flow)
+            .unwrap()
+            .machine
+            .receive_next();
+        assert_eq!(send_next, receive_next);
+
+        assert_eq!(
+            table.reconcile_local_direct(pair.client_flow, 32 * 1024, 12_000),
+            Some((pair.client_flow, pair.server_flow))
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.client_flow)
+                .unwrap()
+                .machine
+                .send_next(),
+            send_next + 32 * 1024
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            receive_next + 32 * 1024
         );
     }
 

@@ -14,6 +14,6 @@ pub use shard::{
 };
 pub use table::{
     DIRTY_CONTROL, DIRTY_INGRESS, DIRTY_ROUTE, DIRTY_TIMER, DIRTY_TX, FlowInsertError, FlowKey,
-    FlowTable, flow_hash64, fragment_rss_hash, rss_hash,
+    FlowTable, flow_hash64, fragment_rss_hash, local_transport_hash, rss_hash,
 };
 pub use timer::{TimerExpiry, TimerWheel};

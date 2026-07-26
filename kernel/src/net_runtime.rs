@@ -1576,6 +1576,10 @@ impl ProtocolCluster {
         self.ingress_target(Some(net::flow::rss_hash(&self.rss_key, key)))
     }
 
+    fn local_tcp_ingress_target(&self, key: &net::flow::FlowKey) -> &Arc<ProtocolRuntime> {
+        self.ingress_target(Some(net::flow::local_transport_hash(&self.rss_key, key)))
+    }
+
     fn owner_target(&self, owner: OwnerRef) -> &Arc<ProtocolRuntime> {
         match owner {
             OwnerRef::Flow { shard, .. } => self.shard(shard).unwrap_or_else(|| self.coordinator()),
@@ -1757,7 +1761,7 @@ impl KernelSocketRuntime {
             work.facade.set_pending_error(SocketError::NetworkDown);
             return;
         };
-        let target = cluster.local_ingress_target(&key);
+        let target = cluster.local_tcp_ingress_target(&key);
         push_local_ingress(
             &target,
             IngressWork::LocalTcp {
@@ -1789,6 +1793,9 @@ impl KernelSocketRuntime {
     }
 
     fn try_cooperative_tx(&self, facade: &Arc<SocketFacade>, cause: SocketTxCause) -> bool {
+        if cause == SocketTxCause::StreamLocalDirect {
+            return false;
+        }
         #[cfg(feature = "performance-profile")]
         let profile_start = profiling::read_counter();
         let Some(guard) = CooperativeTxGuard::try_enter() else {
@@ -1818,6 +1825,9 @@ impl KernelSocketRuntime {
                         SocketTxCause::StreamState => profiling::Metric::NetStackFallbackTcpState,
                         SocketTxCause::DrainRecheck => {
                             profiling::Metric::NetStackFallbackDrainRecheck
+                        }
+                        SocketTxCause::StreamLocalDirect => {
+                            profiling::Metric::NetStackFallbackTcpPayload
                         }
                     },
                     1,
@@ -1850,9 +1860,15 @@ impl KernelSocketRuntime {
             profiling::observe(profiling::Metric::NetStackFallbackNonLoopback, 1);
             return false;
         };
+        facade.prepare_local_stream_send();
         if !cluster.install_socket_tx_pool(facade, interface) {
             #[cfg(feature = "performance-profile")]
             profiling::observe(profiling::Metric::NetStackFallbackTxPool, 1);
+            return false;
+        }
+        if cause == SocketTxCause::StreamPayload && facade.local_stream_prefers_worker_batch() {
+            // 大块本地流量由 owner worker 在一次调度轮次内聚合 payload、ACK 和
+            // readiness；短消息继续走同步 local turn，避免请求/响应增加一次等待。
             return false;
         }
         let Some(scratch) = Self::take_cooperative_scratch(guard.cpu) else {
@@ -1884,7 +1900,7 @@ impl KernelSocketRuntime {
             config: Arc::as_ptr(&config),
             now_ns: sched::now_ns_public(),
             limit: net::stack::NET_STACK_LOCAL_TURN_EFFECT_CAPACITY as u16,
-            inline_local: cluster.shards.len() == 1,
+            inline_local: true,
             tcp_output: scratch.tcp,
             udp_output: scratch.udp,
             result: None,
@@ -2016,6 +2032,19 @@ impl SocketRuntime for KernelSocketRuntime {
                     let _ = sched::operation::sched_yield();
                 }
             }
+        }
+    }
+
+    fn prepare_stream_tx(&self, facade: &Arc<SocketFacade>) {
+        let Some(cluster) = self.cluster() else {
+            return;
+        };
+        let Some((_config, interface)) = self.loopback_config(facade) else {
+            return;
+        };
+        facade.prepare_local_stream_send();
+        if cluster.install_socket_tx_pool(facade, interface) {
+            facade.mark_local_stream_tx_prepared();
         }
     }
 
@@ -2698,6 +2727,7 @@ struct NetWorkerContext {
     protocol: crate::net_stack::ElmShardTurnClient,
     frontend_packets: Vec<FrontendPacket>,
     tcp_output: Vec<PreparedTcpTx>,
+    cooperative_scratch: Vec<CooperativeTxScratch>,
     inline_stream_pool_installs: Vec<(Arc<SocketFacade>, InterfaceId)>,
     local_ingress: VecDeque<IngressWork>,
     pending: [Option<IngressWork>; 32],
@@ -2745,6 +2775,10 @@ enum TurnCommandMeta {
     LocalUdp,
     PlanTx,
     StreamDirty {
+        facade: Arc<SocketFacade>,
+        generation: u64,
+    },
+    StreamDirtyLocal {
         facade: Arc<SocketFacade>,
         generation: u64,
     },
@@ -3147,6 +3181,7 @@ pub fn start_workers() {
                 protocol,
                 frontend_packets: Vec::with_capacity(32),
                 tcp_output: Vec::with_capacity(32),
+                cooperative_scratch: Vec::with_capacity(8),
                 inline_stream_pool_installs: Vec::with_capacity(4),
                 local_ingress: VecDeque::with_capacity(128),
                 pending: core::array::from_fn(|_| None),
@@ -3390,11 +3425,17 @@ impl NetWorkerContext {
             #[cfg(feature = "performance-profile")]
             let profile_turn = profiling::scope(profiling::Event::NetProtocolTurn);
             let config = self.config.snapshot();
+            #[cfg(feature = "performance-profile")]
+            let stage_start = profiling::read_counter();
             let attached = self.drain_queue_attachments(64);
             let mut queue_turns = self.pump_local_queues(&config);
+            #[cfg(feature = "performance-profile")]
+            let queue_done = profiling::read_counter();
             let lifecycle = self.drain_lifecycle(256, &config);
             let control = self.drain_control(256, &config);
             let dirty = self.drain_socket_tx(256, &config);
+            #[cfg(feature = "performance-profile")]
+            let dispatch_done = profiling::read_counter();
             let mut processed = 0usize;
             while processed < 128 {
                 let mut count = self.drain_local_ingress(128 - processed);
@@ -3407,6 +3448,8 @@ impl NetWorkerContext {
                 processed += count;
                 self.process_pending(count, &config);
             }
+            #[cfg(feature = "performance-profile")]
+            let ingress_done = profiling::read_counter();
             self.runtime.timer_fired.store(false, Ordering::Release);
             let now_ns = sched::now_ns_public();
             self.queue_autoconfig_turn(&config, now_ns);
@@ -3415,6 +3458,8 @@ impl NetWorkerContext {
             let (protocol_deadline, protocol_blocked) = self.execute_protocol_turn(&config, now_ns);
             queue_turns += self.pump_local_queues(&config);
             self.runtime.arm_timer(protocol_deadline);
+            #[cfg(feature = "performance-profile")]
+            let protocol_done = profiling::read_counter();
             let keep_running = processed == 128
                 || attached == 64
                 || lifecycle == 256
@@ -3427,12 +3472,36 @@ impl NetWorkerContext {
                 || self.local_queue_pending();
             let claimed_actions =
                 task.end_execution_scope(sched::ExecutionScopeKind::NetworkWorker);
+            #[cfg(feature = "performance-profile")]
+            let finish_done = profiling::read_counter();
             assert!(
                 claimed_actions & !crate::net_stack::NET_STACK_EXECUTION_ACTION == 0,
                 "NetWorker 单轮认领了未知的有界动作"
             );
             #[cfg(feature = "performance-profile")]
-            drop(profile_turn);
+            {
+                profiling::observe(
+                    profiling::Metric::NetWorkerQueueCycles,
+                    queue_done.wrapping_sub(stage_start),
+                );
+                profiling::observe(
+                    profiling::Metric::NetWorkerDispatchCycles,
+                    dispatch_done.wrapping_sub(queue_done),
+                );
+                profiling::observe(
+                    profiling::Metric::NetWorkerIngressCycles,
+                    ingress_done.wrapping_sub(dispatch_done),
+                );
+                profiling::observe(
+                    profiling::Metric::NetWorkerProtocolCycles,
+                    protocol_done.wrapping_sub(ingress_done),
+                );
+                profiling::observe(
+                    profiling::Metric::NetWorkerFinishCycles,
+                    finish_done.wrapping_sub(protocol_done),
+                );
+                drop(profile_turn);
+            }
             if keep_running {
                 let _ = sched::operation::sched_yield();
                 continue;
@@ -3848,6 +3917,7 @@ impl NetWorkerContext {
                                 remote: flow.remote,
                                 local: flow.local,
                                 protocol: flow.protocol,
+                                local_transport: false,
                                 output: None,
                             });
                         self.turn_control_meta
@@ -4294,6 +4364,7 @@ impl NetWorkerContext {
         local: Endpoint,
         peer: Endpoint,
         path: TcpPath,
+        local_transport: bool,
     ) {
         self.turn_control_commands
             .0
@@ -4301,6 +4372,7 @@ impl NetWorkerContext {
                 remote: peer,
                 local,
                 protocol: TransportProtocol::Tcp,
+                local_transport,
                 output: None,
             });
         self.turn_control_meta
@@ -4463,16 +4535,43 @@ impl NetWorkerContext {
             match facade.kind() {
                 SocketKind::Stream => {
                     let generation = facade.stream_tx_generation();
-                    self.turn_commands
-                        .0
-                        .push(NetStackFlowCommand::DrainTcpSend {
-                            flow,
-                            now_ns: sched::now_ns_public(),
-                        });
-                    self.turn_meta.push(TurnCommandMeta::StreamDirty {
-                        facade: Arc::clone(&facade),
-                        generation,
+                    let local_interface = facade.interface().filter(|interface| {
+                        config
+                            .interfaces
+                            .iter()
+                            .any(|candidate| candidate.id == *interface && candidate.loopback)
                     });
+                    if local_interface.is_some() {
+                        let scratch = self
+                            .cooperative_scratch
+                            .pop()
+                            .unwrap_or_else(CooperativeTxScratch::new);
+                        self.turn_commands
+                            .0
+                            .push(NetStackFlowCommand::CooperativeSocketTx {
+                                flow,
+                                facade: Arc::clone(&facade),
+                                mark: facade.socket_mark(),
+                                config: config as *const _,
+                                now_ns: sched::now_ns_public(),
+                                limit: net::stack::NET_STACK_LOCAL_TURN_EFFECT_CAPACITY as u16,
+                                inline_local: true,
+                                tcp_output: scratch.tcp,
+                                udp_output: scratch.udp,
+                                result: None,
+                            });
+                        self.turn_meta
+                            .push(TurnCommandMeta::StreamDirtyLocal { facade, generation });
+                    } else {
+                        self.turn_commands
+                            .0
+                            .push(NetStackFlowCommand::DrainTcpSend {
+                                flow,
+                                now_ns: sched::now_ns_public(),
+                            });
+                        self.turn_meta
+                            .push(TurnCommandMeta::StreamDirty { facade, generation });
+                    }
                 }
                 SocketKind::Datagram => {
                     self.queue_udp_socket_tx(&facade, flow, config, 32);
@@ -5218,7 +5317,7 @@ impl NetWorkerContext {
             now_ns,
             &mut self.tcp_output,
             &mut self.inline_stream_pool_installs,
-            self.cluster.shards.len() == 1,
+            true,
         );
         let mut pool_installs = core::mem::take(&mut self.inline_stream_pool_installs);
         for (facade, interface) in pool_installs.drain(..) {
@@ -5526,8 +5625,19 @@ impl NetWorkerContext {
                             match next {
                                 TcpReserveNext::Bind => facade.complete_control(sequence, Ok(())),
                                 TcpReserveNext::Connect { peer, path } => {
+                                    let local_transport =
+                                        config.interfaces.iter().any(|interface| {
+                                            interface.id == path.route.interface
+                                                && interface.loopback
+                                        });
                                     self.queue_tcp_connect_owner(
-                                        facade, sequence, generation, local, peer, path,
+                                        facade,
+                                        sequence,
+                                        generation,
+                                        local,
+                                        peer,
+                                        path,
+                                        local_transport,
                                     );
                                 }
                                 TcpReserveNext::Listen { backlog } => {
@@ -5767,6 +5877,38 @@ impl NetWorkerContext {
                         NetStackFlowCommand::DrainTcpSend { .. },
                         TurnCommandMeta::StreamDirty { facade, generation },
                     ) => facade.finish_stream_tx_drain(generation),
+                    (
+                        NetStackFlowCommand::CooperativeSocketTx {
+                            mut tcp_output,
+                            mut udp_output,
+                            result: Some(result),
+                            ..
+                        },
+                        TurnCommandMeta::StreamDirtyLocal { facade, generation },
+                    ) => {
+                        let tcp_count = tcp_output.len();
+                        for index in 0..tcp_count {
+                            if let Some(work) = tcp_output.take(index) {
+                                self.tcp_output.push(work);
+                            }
+                        }
+                        debug_assert!(udp_output.is_empty());
+                        udp_output.clear();
+                        tcp_output.clear();
+                        self.cooperative_scratch.push(CooperativeTxScratch {
+                            tcp: tcp_output,
+                            udp: udp_output,
+                        });
+                        if result.more_work {
+                            self.runtime
+                                .dirty
+                                .try_push(Arc::clone(&facade))
+                                .unwrap_or_else(|_| panic!("socket dirty queue 超出流表上限"));
+                            self.runtime.publish_work();
+                        } else {
+                            facade.finish_stream_tx_drain(generation);
+                        }
+                    }
                     (
                         NetStackFlowCommand::PrepareUdpTx {
                             output: Some(result),
@@ -6011,8 +6153,17 @@ impl NetWorkerContext {
                                 if local.addr.is_unspecified() {
                                     local.addr = path.route.source;
                                 }
+                                let local_transport = config.interfaces.iter().any(|interface| {
+                                    interface.id == path.route.interface && interface.loopback
+                                });
                                 self.queue_tcp_connect_owner(
-                                    facade, sequence, generation, local, peer, path,
+                                    facade,
+                                    sequence,
+                                    generation,
+                                    local,
+                                    peer,
+                                    path,
+                                    local_transport,
                                 );
                             }
                             OwnerRef::Closed { .. } => {
@@ -6452,10 +6603,46 @@ impl NetWorkerContext {
                         .set_pending_error(SocketError::NetworkUnreachable);
                 }
             }
+            NetStackFlowCommand::CooperativeSocketTx {
+                mut tcp_output,
+                mut udp_output,
+                ..
+            } => {
+                let tcp_count = tcp_output.len();
+                for index in 0..tcp_count {
+                    if let Some(work) = tcp_output.take(index) {
+                        work.facade.set_pending_error(SocketError::RuntimeBusy);
+                    }
+                }
+                let udp_count = udp_output.len();
+                for index in 0..udp_count {
+                    if let Some(outcome) = udp_output.take(index) {
+                        match outcome {
+                            NetStackCooperativeUdpTx::Prepared(work) => work
+                                .payload
+                                .facade()
+                                .set_pending_error(SocketError::RuntimeBusy),
+                            NetStackCooperativeUdpTx::Failed(_, payload) => {
+                                payload.facade().set_pending_error(SocketError::RuntimeBusy)
+                            }
+                        }
+                    }
+                }
+                tcp_output.clear();
+                udp_output.clear();
+                self.cooperative_scratch.push(CooperativeTxScratch {
+                    tcp: tcp_output,
+                    udp: udp_output,
+                });
+            }
             _ => {}
         }
         match meta {
             Some(TurnCommandMeta::StreamDirty { facade, generation }) => {
+                facade.finish_stream_tx_drain(generation);
+            }
+            Some(TurnCommandMeta::StreamDirtyLocal { facade, generation }) => {
+                facade.set_pending_error(SocketError::RuntimeBusy);
                 facade.finish_stream_tx_drain(generation);
             }
             Some(TurnCommandMeta::PlanTx) => {}
@@ -6856,13 +7043,14 @@ impl NetWorkerContext {
     }
 
     fn dispatch_local_tcp(&mut self, _egress: usize, work: PreparedTcpTx) {
+        work.facade.prepare_local_stream_send();
         let source = Endpoint {
             addr: work.path.route.source,
             port: work.local_port,
         };
         let key = FlowKey::new(source, work.remote, TransportProtocol::Tcp)
             .expect("TCP local transport tuple 必须有效");
-        let target = self.cluster.local_ingress_target(&key);
+        let target = self.cluster.local_tcp_ingress_target(&key);
         let ingress = IngressWork::LocalTcp {
             interface: work.path.route.interface,
             work,

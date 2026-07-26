@@ -285,7 +285,7 @@ pub(crate) fn register() -> Result<LoopbackHandle, LoopbackError> {
             true,
         )
         .ok_or(LoopbackError::Context)?;
-        NetQueueRegistration::pinned_heap(endpoint, 48, 4096, 256, 256, 256, 4096)
+        NetQueueRegistration::pinned_heap(endpoint, 48, 4096, 256, 256, 64, 65535)
             .map_err(|_| LoopbackError::Pool)?
     };
     #[cfg(feature = "elm-integrated")]
@@ -296,8 +296,8 @@ pub(crate) fn register() -> Result<LoopbackHandle, LoopbackError> {
             4096,
             256,
             256,
-            256,
-            4096,
+            64,
+            65535,
         )
         .map_err(|_| LoopbackError::Pool)?
     };

@@ -397,6 +397,19 @@ impl NetSocketProxy {
             .send_stream(payload, nonblocking, deadline_ns, more)
     }
 
+    pub fn send_stream_from(
+        &self,
+        payload_len: usize,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+        copy: impl FnMut(usize, &mut [u8]),
+    ) -> Result<usize, SocketError> {
+        self.ensure_backend()?;
+        self.facade
+            .send_stream_from(payload_len, nonblocking, deadline_ns, more, copy)
+    }
+
     pub fn recv(
         &self,
         output: &mut [u8],
@@ -449,6 +462,28 @@ impl NetSocketProxy {
             defer_window_update,
             nonblocking,
             deadline_ns,
+        )
+    }
+
+    pub fn recv_stream_to(
+        &self,
+        output_len: usize,
+        peek: bool,
+        wait_all: bool,
+        defer_window_update: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        copy: impl FnMut(usize, &[u8]),
+    ) -> Result<usize, SocketError> {
+        self.ensure_backend()?;
+        self.facade.recv_stream_to(
+            output_len,
+            peek,
+            wait_all,
+            defer_window_update,
+            nonblocking,
+            deadline_ns,
+            copy,
         )
     }
 

@@ -10,7 +10,9 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 
 use sched::{TaskState, WaitQueue};
 use spin::{Mutex, RwLock};
@@ -34,7 +36,15 @@ const MAX_UDP4_PAYLOAD: usize = 65_507;
 const MAX_UDP6_PAYLOAD: usize = 65_527;
 const TCP_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_BUFFER_HARD_LIMIT: usize = 1024 * 1024;
-const TCP_LOCAL_READ_BATCH_BYTES: usize = TCP_BUFFER_BYTES / 2;
+const TCP_LOCAL_AUTOTUNE_LIMIT: usize = 16 * 1024 * 1024;
+const TCP_LOCAL_READ_BATCH_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+const TCP_LOCAL_READ_BATCH_MIN_BYTES: usize = 1024 * 1024;
+const TCP_LOCAL_SHARED_READ_BATCH_BYTES: usize = 1024 * 1024;
+const TCP_LOCAL_IMMEDIATE_HANDOFF_BYTES: usize = SOCKET_CHUNK_BYTES;
+const TCP_LOCAL_PRESSURE_BYTES: usize = 64 * 1024;
+const TCP_LOCAL_DIRECT_RECONCILE_BYTES: u64 = 16 * 1024 * 1024;
+const TCP_LOCAL_DIRECT_RECONCILE_EVENTS: u32 = 16 * 1024;
+const TCP_LOCAL_DIRECT_COPY_BYTES: usize = 256 * 1024;
 const TCP_INITIAL_CHUNKS: usize = 2;
 const TCP_KEEPIDLE_DEFAULT_NS: u64 = 7_200_000_000_000;
 const TCP_KEEPINTVL_DEFAULT_NS: u64 = 75_000_000_000;
@@ -43,6 +53,12 @@ static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(None);
 static SOCKET_REGISTRY: RwLock<Vec<Weak<SocketFacade>>> = RwLock::new(Vec::new());
 static DMA_TX_POOL_WAITERS: Mutex<VecDeque<DmaTxPoolWaiter>> = Mutex::new(VecDeque::new());
+static LOCAL_TCP_BULK_SENDERS: AtomicUsize = AtomicUsize::new(0);
+
+fn local_tcp_read_batch_bytes() -> usize {
+    let senders = LOCAL_TCP_BULK_SENDERS.load(Ordering::Acquire).max(1);
+    (TCP_LOCAL_READ_BATCH_BUDGET_BYTES / senders).max(TCP_LOCAL_READ_BATCH_MIN_BYTES)
+}
 static LOCAL_DATAGRAM_ROUTE_EPOCH: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_PACKET_OBSERVERS: AtomicU32 = AtomicU32::new(0);
 
@@ -171,6 +187,13 @@ pub(crate) struct LocalDatagramRoute {
     receiver: Arc<SocketFacade>,
 }
 
+struct LocalTcpDirectRoute {
+    local_generation: u32,
+    peer_generation: u32,
+    stack_generation: u64,
+    peer: Weak<SocketFacade>,
+}
+
 pub(crate) fn invalidate_local_datagram_routes() {
     LOCAL_DATAGRAM_ROUTE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
@@ -268,6 +291,7 @@ pub enum SocketCommand {
 
 pub trait SocketRuntime: Send + Sync {
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand>;
+    fn prepare_stream_tx(&self, facade: &Arc<SocketFacade>);
     fn notify_tx(&self, facade: Arc<SocketFacade>, cause: SocketTxCause);
     fn notify_lifecycle(&self, facade: Arc<SocketFacade>);
     fn update_multicast(
@@ -290,6 +314,7 @@ pub enum SocketTxCause {
     StreamPayload = 2,
     StreamState = 3,
     DrainRecheck = 4,
+    StreamLocalDirect = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -558,10 +583,23 @@ impl DmaByteRing {
     }
 
     fn push(&mut self, absolute_tail: u64, input: &[u8]) -> usize {
-        let target = input.len().min(self.available());
+        self.push_with(absolute_tail, input.len(), &mut |offset, output| {
+            output.copy_from_slice(&input[offset..offset + output.len()]);
+        })
+    }
+
+    fn push_with(
+        &mut self,
+        absolute_tail: u64,
+        input_len: usize,
+        copy: &mut impl FnMut(usize, &mut [u8]),
+    ) -> usize {
+        let target = input_len.min(self.available());
         let mut copied = 0usize;
         while copied < target {
-            let appended = self.append_to_tail(&input[copied..target]);
+            let appended = self.append_to_tail_with(target - copied, |output| {
+                copy(copied, output);
+            });
             if appended != 0 {
                 copied += appended;
                 continue;
@@ -575,8 +613,10 @@ impl DmaByteRing {
             };
             drop(pool);
             let len = (target - copied).min(capacity);
-            lease.as_mut_slice().expect("socket TX DMA lease 范围有效")[..len]
-                .copy_from_slice(&input[copied..copied + len]);
+            copy(
+                copied,
+                &mut lease.as_mut_slice().expect("socket TX DMA lease 范围有效")[..len],
+            );
             lease
                 .set_data_range(0, len as u16)
                 .expect("socket TX DMA lease 收窄有效");
@@ -593,6 +633,12 @@ impl DmaByteRing {
     }
 
     fn append_to_tail(&mut self, input: &[u8]) -> usize {
+        self.append_to_tail_with(input.len(), |output| {
+            output.copy_from_slice(&input[..output.len()]);
+        })
+    }
+
+    fn append_to_tail_with(&mut self, input_len: usize, mut copy: impl FnMut(&mut [u8])) -> usize {
         let Some(tail) = self.chunks.back_mut() else {
             return 0;
         };
@@ -600,15 +646,17 @@ impl DmaByteRing {
             return 0;
         };
         let capacity = usize::from(lease.capacity());
-        let len = input.len().min(capacity.saturating_sub(tail.used));
+        let len = input_len.min(capacity.saturating_sub(tail.used));
         if len == 0 {
             return 0;
         }
         lease
             .set_data_range(0, capacity as u16)
             .expect("socket TX DMA lease 扩展有效");
-        lease.as_mut_slice().expect("socket TX DMA lease 范围有效")[tail.used..tail.used + len]
-            .copy_from_slice(&input[..len]);
+        copy(
+            &mut lease.as_mut_slice().expect("socket TX DMA lease 范围有效")
+                [tail.used..tail.used + len],
+        );
         tail.used += len;
         lease
             .set_data_range(0, tail.used as u16)
@@ -744,6 +792,13 @@ impl StreamBytes {
         }
     }
 
+    fn enable_local_autotune(&mut self) {
+        match self {
+            Self::Heap(bytes) => bytes.limit = TCP_LOCAL_AUTOTUNE_LIMIT,
+            Self::Dma(bytes) => bytes.limit = TCP_LOCAL_AUTOTUNE_LIMIT,
+        }
+    }
+
     #[cfg(test)]
     fn allocated_capacity(&self) -> usize {
         match self {
@@ -783,6 +838,7 @@ impl ByteRing {
         }
         let capacity = required
             .next_multiple_of(SOCKET_CHUNK_BYTES)
+            .max(self.arena.len().saturating_mul(2))
             .min(self.limit);
         let mut arena = alloc::vec![0; capacity].into_boxed_slice();
         self.copy_range(0, &mut arena[..self.len]);
@@ -791,7 +847,13 @@ impl ByteRing {
     }
 
     fn push(&mut self, input: &[u8]) -> usize {
-        let len = input.len().min(self.available());
+        self.push_with(input.len(), &mut |offset, output| {
+            output.copy_from_slice(&input[offset..offset + output.len()]);
+        })
+    }
+
+    fn push_with(&mut self, input_len: usize, copy: &mut impl FnMut(usize, &mut [u8])) -> usize {
+        let len = input_len.min(self.available());
         self.grow_for(len);
         if len == 0 {
             return 0;
@@ -800,8 +862,10 @@ impl ByteRing {
         let copy_start = profiling::read_counter();
         let tail = (self.head + self.len) % self.arena.len();
         let first = len.min(self.arena.len() - tail);
-        self.arena[tail..tail + first].copy_from_slice(&input[..first]);
-        self.arena[..len - first].copy_from_slice(&input[first..len]);
+        copy(0, &mut self.arena[tail..tail + first]);
+        if first != len {
+            copy(first, &mut self.arena[..len - first]);
+        }
         self.len += len;
         #[cfg(feature = "performance-profile")]
         record_payload_copy(copy_start, len);
@@ -824,6 +888,22 @@ impl ByteRing {
         output[first..].copy_from_slice(&self.arena[..output_len - first]);
         #[cfg(feature = "performance-profile")]
         record_payload_copy(copy_start, output_len);
+        true
+    }
+
+    fn visit_range(&self, offset: usize, len: usize, visit: &mut impl FnMut(&[u8])) -> bool {
+        if offset.saturating_add(len) > self.len {
+            return false;
+        }
+        if len == 0 {
+            return true;
+        }
+        let start = (self.head + offset) % self.arena.len();
+        let first = len.min(self.arena.len() - start);
+        visit(&self.arena[start..start + first]);
+        if first != len {
+            visit(&self.arena[..len - first]);
+        }
         true
     }
 
@@ -868,6 +948,15 @@ impl StreamTxRing {
         }
     }
 
+    fn push_with(&mut self, input_len: usize, copy: &mut impl FnMut(usize, &mut [u8])) -> usize {
+        match &mut self.bytes {
+            StreamBytes::Heap(bytes) => bytes.push_with(input_len, copy),
+            StreamBytes::Dma(bytes) => {
+                bytes.push_with(self.base + bytes.len as u64, input_len, copy)
+            }
+        }
+    }
+
     fn writable(&self) -> bool {
         self.bytes.writable()
     }
@@ -903,6 +992,10 @@ impl StreamTxRing {
         let start = self.base + self.sent as u64;
         self.sent += len;
         Some((start, len))
+    }
+
+    fn rewind_unsent(&mut self, len: usize) {
+        self.sent = self.sent.saturating_sub(len);
     }
 
     fn copy_absolute(&self, start: u64, output: &mut [u8]) -> bool {
@@ -972,6 +1065,7 @@ impl StreamTxRing {
 enum StreamRxChunkStorage {
     Shared(ChunkRef),
     Compact(Box<[u8]>),
+    Local,
 }
 
 struct StreamRxChunk {
@@ -987,6 +1081,7 @@ impl StreamRxChunk {
                 chunk.as_slice().map_err(|_| SocketError::Buffer)?
             }
             StreamRxChunkStorage::Compact(bytes) => bytes,
+            StreamRxChunkStorage::Local => return Err(SocketError::Buffer),
         };
         Ok(&bytes[self.consumed..self.len])
     }
@@ -994,6 +1089,7 @@ impl StreamRxChunk {
 
 struct StreamRxBytes {
     chunks: VecDeque<StreamRxChunk>,
+    local: Option<ByteRing>,
     len: usize,
     limit: usize,
 }
@@ -1002,6 +1098,7 @@ impl StreamRxBytes {
     fn new() -> Self {
         Self {
             chunks: VecDeque::with_capacity(TCP_INITIAL_CHUNKS),
+            local: None,
             len: 0,
             limit: TCP_BUFFER_BYTES,
         }
@@ -1067,29 +1164,95 @@ impl StreamRxBytes {
         Ok(len)
     }
 
+    fn push_local_with(&mut self, len: usize, copy: &mut impl FnMut(usize, &mut [u8])) -> usize {
+        let len = len.min(self.available());
+        if len == 0 {
+            return 0;
+        }
+        let local = self.local.get_or_insert_with(|| {
+            let mut ring = ByteRing::new();
+            ring.limit = self.limit;
+            ring.grow_for(
+                local_tcp_read_batch_bytes()
+                    .min(2 * TCP_LOCAL_READ_BATCH_MIN_BYTES)
+                    .min(self.limit),
+            );
+            ring
+        });
+        local.limit = self.limit;
+        let copied = local.push_with(len, copy);
+        if copied == 0 {
+            return 0;
+        }
+        if let Some(tail) = self.chunks.back_mut()
+            && matches!(tail.storage, StreamRxChunkStorage::Local)
+        {
+            tail.len += copied;
+        } else {
+            self.chunks.push_back(StreamRxChunk {
+                storage: StreamRxChunkStorage::Local,
+                consumed: 0,
+                len: copied,
+            });
+        }
+        self.len += copied;
+        copied
+    }
+
     fn copy_range(&self, offset: usize, output: &mut [u8]) -> bool {
-        if offset.saturating_add(output.len()) > self.len {
+        self.copy_range_with(offset, output.len(), &mut |copied, input| {
+            output[copied..copied + input.len()].copy_from_slice(input);
+        })
+    }
+
+    fn copy_range_with(
+        &self,
+        offset: usize,
+        output_len: usize,
+        copy: &mut impl FnMut(usize, &[u8]),
+    ) -> bool {
+        if offset.saturating_add(output_len) > self.len {
             return false;
         }
         let mut skipped = offset;
         let mut copied = 0usize;
+        let mut local_offset = 0usize;
         for chunk in &self.chunks {
-            let Ok(bytes) = chunk.bytes() else {
-                return false;
-            };
-            if skipped >= bytes.len() {
-                skipped -= bytes.len();
+            let chunk_len = chunk.len - chunk.consumed;
+            if skipped >= chunk_len {
+                skipped -= chunk_len;
+                if matches!(chunk.storage, StreamRxChunkStorage::Local) {
+                    local_offset += chunk_len;
+                }
                 continue;
             }
-            let len = (bytes.len() - skipped).min(output.len() - copied);
-            output[copied..copied + len].copy_from_slice(&bytes[skipped..skipped + len]);
-            copied += len;
+            let len = (chunk_len - skipped).min(output_len - copied);
+            if matches!(chunk.storage, StreamRxChunkStorage::Local) {
+                let Some(local) = self.local.as_ref() else {
+                    return false;
+                };
+                let mut visited = 0usize;
+                if !local.visit_range(local_offset + skipped, len, &mut |input| {
+                    copy(copied + visited, input);
+                    visited += input.len();
+                }) {
+                    return false;
+                }
+                copied += visited;
+                local_offset += chunk_len;
+            } else {
+                let Ok(bytes) = chunk.bytes() else {
+                    return false;
+                };
+                copy(copied, &bytes[skipped..skipped + len]);
+                copied += len;
+            }
             skipped = 0;
-            if copied == output.len() {
+            if copied == output_len {
                 return true;
             }
         }
-        copied == output.len()
+        copied == output_len
     }
 
     fn consume(&mut self, len: usize) -> usize {
@@ -1100,6 +1263,14 @@ impl StreamRxBytes {
             let available = front.len - front.consumed;
             let take = available.min(remaining);
             front.consumed += take;
+            if matches!(front.storage, StreamRxChunkStorage::Local) {
+                let consumed = self
+                    .local
+                    .as_mut()
+                    .expect("本地 RX 分段必须有环形存储")
+                    .consume(take);
+                debug_assert_eq!(consumed, take);
+            }
             remaining -= take;
             if front.consumed == front.len {
                 self.chunks.pop_front();
@@ -1111,11 +1282,24 @@ impl StreamRxBytes {
 
     fn clear(&mut self) {
         self.chunks.clear();
+        if let Some(local) = self.local.as_mut() {
+            local.clear();
+        }
         self.len = 0;
     }
 
     fn set_limit(&mut self, limit: usize) {
         self.limit = limit.clamp(16 * 1024, TCP_BUFFER_HARD_LIMIT);
+        if let Some(local) = self.local.as_mut() {
+            local.limit = self.limit;
+        }
+    }
+
+    fn enable_local_autotune(&mut self) {
+        self.limit = TCP_LOCAL_AUTOTUNE_LIMIT;
+        if let Some(local) = self.local.as_mut() {
+            local.limit = self.limit;
+        }
     }
 
     #[cfg(test)]
@@ -1125,8 +1309,10 @@ impl StreamRxBytes {
             .map(|chunk| match &chunk.storage {
                 StreamRxChunkStorage::Shared(chunk) => chunk.len(),
                 StreamRxChunkStorage::Compact(bytes) => bytes.len(),
+                StreamRxChunkStorage::Local => 0,
             })
-            .sum()
+            .sum::<usize>()
+            + self.local.as_ref().map_or(0, |local| local.arena.len())
     }
 }
 
@@ -2467,6 +2653,7 @@ pub struct SocketFacade {
     local: Mutex<Option<Endpoint>>,
     peer: Mutex<Option<Endpoint>>,
     local_datagram_route: Mutex<Option<LocalDatagramRoute>>,
+    local_tcp_direct_route: Mutex<Option<LocalTcpDirectRoute>>,
     tx: Mutex<Option<TxRing>>,
     rx: Mutex<Option<DatagramRx>>,
     stream_tx: Mutex<StreamTxRing>,
@@ -2521,6 +2708,14 @@ pub struct SocketFacade {
     tcp_total_retransmitted: AtomicU32,
     tcp_bytes_sent: AtomicU64,
     tcp_bytes_received: AtomicU64,
+    tcp_send_buffer_explicit: AtomicBool,
+    tcp_receive_buffer_explicit: AtomicBool,
+    local_tcp_tx_prepared: AtomicBool,
+    local_tcp_fast_path_active: AtomicBool,
+    local_tcp_window_blocked: AtomicBool,
+    local_tcp_direct_pending: AtomicU64,
+    local_tcp_direct_events: AtomicU32,
+    local_tcp_bulk_active: AtomicBool,
     #[cfg(feature = "performance-profile")]
     tcp_profile_updates: AtomicU64,
     raw_header_included: AtomicBool,
@@ -2614,6 +2809,7 @@ impl SocketFacade {
             local: Mutex::new(None),
             peer: Mutex::new(None),
             local_datagram_route: Mutex::new(None),
+            local_tcp_direct_route: Mutex::new(None),
             tx: Mutex::new((kind != SocketKind::Stream).then(TxRing::new)),
             rx: Mutex::new((kind != SocketKind::Stream).then(DatagramRx::new)),
             stream_tx: Mutex::new(StreamTxRing::new()),
@@ -2672,6 +2868,14 @@ impl SocketFacade {
             tcp_total_retransmitted: AtomicU32::new(0),
             tcp_bytes_sent: AtomicU64::new(0),
             tcp_bytes_received: AtomicU64::new(0),
+            tcp_send_buffer_explicit: AtomicBool::new(false),
+            tcp_receive_buffer_explicit: AtomicBool::new(false),
+            local_tcp_tx_prepared: AtomicBool::new(false),
+            local_tcp_fast_path_active: AtomicBool::new(false),
+            local_tcp_window_blocked: AtomicBool::new(false),
+            local_tcp_direct_pending: AtomicU64::new(0),
+            local_tcp_direct_events: AtomicU32::new(0),
+            local_tcp_bulk_active: AtomicBool::new(false),
             #[cfg(feature = "performance-profile")]
             tcp_profile_updates: AtomicU64::new(0),
             raw_header_included: AtomicBool::new(false),
@@ -2926,7 +3130,15 @@ impl SocketFacade {
         }
         self.deactivate_packet_observer();
         self.clear_local_datagram_route();
+        self.clear_local_tcp_direct_route();
+        self.local_tcp_direct_pending.store(0, Ordering::Release);
+        self.local_tcp_direct_events.store(0, Ordering::Release);
         self.local_read_handoff.lock().take();
+        self.local_tcp_tx_prepared.store(false, Ordering::Release);
+        self.local_tcp_fast_path_active
+            .store(false, Ordering::Release);
+        self.local_tcp_window_blocked
+            .store(false, Ordering::Release);
         if self.kind != SocketKind::Stream {
             invalidate_local_datagram_routes();
         }
@@ -3578,6 +3790,20 @@ impl SocketFacade {
     }
 
     fn publish_stream_pending(self: &Arc<Self>) -> Result<(), SocketError> {
+        let direct = self.try_deliver_local_tcp_direct();
+        let direct_reconcile =
+            direct != 0 && (self.local_tcp_direct_reconcile_due() || self.stream_unsent_len() != 0);
+        if direct_reconcile && !self.tx_notified.swap(true, Ordering::AcqRel) {
+            match socket_runtime() {
+                Ok(runtime) => {
+                    runtime.notify_tx(Arc::clone(self), SocketTxCause::StreamLocalDirect)
+                }
+                Err(error) => {
+                    self.tx_notified.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        }
         if self.stream_unsent_len() == 0 {
             return Ok(());
         }
@@ -3745,6 +3971,8 @@ impl SocketFacade {
 
     pub fn finish_stream_receive(self: &Arc<Self>) {
         if self.receive_window_update.load(Ordering::Acquire) {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpReceiveWindowNotifications, 1);
             self.notify_tcp_state_change();
         }
     }
@@ -3766,6 +3994,269 @@ impl SocketFacade {
         }
     }
 
+    /// 为已确认的本地 TCP 发送方向启用按需扩容。
+    ///
+    /// 这里只改变内部容量；用户通过 SO_SNDBUF 设置的上限始终优先。
+    pub fn prepare_local_stream_send(&self) {
+        if self.kind == SocketKind::Stream && !self.tcp_send_buffer_explicit.load(Ordering::Acquire)
+        {
+            self.stream_tx.lock().bytes.enable_local_autotune();
+        }
+    }
+
+    pub(crate) fn install_local_tcp_direct_peer(self: &Arc<Self>, peer: &Arc<SocketFacade>) {
+        if self.kind != SocketKind::Stream
+            || peer.kind != SocketKind::Stream
+            || self.stack_generation() == 0
+            || self.stack_generation() != peer.stack_generation()
+        {
+            return;
+        }
+        *self.local_tcp_direct_route.lock() = Some(LocalTcpDirectRoute {
+            local_generation: self.generation(),
+            peer_generation: peer.generation(),
+            stack_generation: self.stack_generation(),
+            peer: Arc::downgrade(peer),
+        });
+    }
+
+    fn clear_local_tcp_direct_route(&self) {
+        self.local_tcp_direct_route.lock().take();
+    }
+
+    fn mark_local_tcp_bulk_active(&self) {
+        if !self.local_tcp_bulk_active.swap(true, Ordering::AcqRel) {
+            LOCAL_TCP_BULK_SENDERS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn clear_local_tcp_bulk_active(&self) {
+        if self.local_tcp_bulk_active.swap(false, Ordering::AcqRel) {
+            LOCAL_TCP_BULK_SENDERS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn local_tcp_direct_peer(&self) -> Option<Arc<SocketFacade>> {
+        let route = self.local_tcp_direct_route.lock();
+        let route = route.as_ref()?;
+        let peer = route.peer.upgrade()?;
+        (route.local_generation == self.generation()
+            && route.peer_generation == peer.generation()
+            && route.stack_generation == self.stack_generation()
+            && route.stack_generation == peer.stack_generation()
+            && !self.is_closing()
+            && !peer.is_closing())
+        .then_some(peer)
+    }
+
+    fn try_deliver_local_tcp_direct(self: &Arc<Self>) -> usize {
+        #[cfg(feature = "performance-profile")]
+        let direct_start = profiling::read_counter();
+        #[cfg(feature = "performance-profile")]
+        profiling::observe(profiling::Metric::TcpLocalDirectAttempts, 1);
+        if self.tcp_cork()
+            || self.tcp_more()
+            || !self.local_tcp_tx_prepared.load(Ordering::Acquire)
+            || !local_transport_fast_path_eligible()
+        {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpLocalDirectPolicyRejects, 1);
+            return 0;
+        }
+        let Some(peer) = self.local_tcp_direct_peer() else {
+            #[cfg(feature = "performance-profile")]
+            profiling::observe(profiling::Metric::TcpLocalDirectRouteMisses, 1);
+            return 0;
+        };
+        let mut delivered = 0usize;
+        loop {
+            let available = peer.stream_receive_window();
+            let len = self
+                .stream_unsent_len()
+                .min(available)
+                .min(u16::MAX as usize);
+            if len == 0 {
+                if self.stream_unsent_len() != 0 {
+                    peer.mark_local_stream_window_blocked();
+                    #[cfg(feature = "performance-profile")]
+                    profiling::observe(profiling::Metric::TcpLocalDirectWindowBlocks, 1);
+                }
+                break;
+            }
+            let Some(lease) = self.take_stream_tx_deferred(len) else {
+                break;
+            };
+            let lease_len = usize::from(lease.len);
+            if peer
+                .push_stream_rx_lease(&lease, 0, lease_len, true)
+                .is_err()
+            {
+                self.stream_tx.lock().rewind_unsent(lease_len);
+                peer.mark_local_stream_window_blocked();
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpLocalDirectWindowBlocks, 1);
+                break;
+            }
+            self.finish_stream_tx_batch(lease_len);
+            self.acknowledge_stream(lease_len);
+            delivered += lease_len;
+        }
+        if delivered != 0 {
+            self.local_tcp_direct_pending
+                .fetch_add(delivered as u64, Ordering::AcqRel);
+            self.local_tcp_direct_events.fetch_add(1, Ordering::AcqRel);
+            #[cfg(feature = "performance-profile")]
+            {
+                profiling::observe(profiling::Metric::TcpLocalDirectDeliveries, 1);
+                profiling::observe(profiling::Metric::TcpLocalDirectBytes, delivered as u64);
+                profiling::observe(
+                    profiling::Metric::TcpLocalDirectCycles,
+                    profiling::read_counter().wrapping_sub(direct_start),
+                );
+            }
+        }
+        delivered
+    }
+
+    fn try_send_local_tcp_direct_from(
+        self: &Arc<Self>,
+        payload_len: usize,
+        copy: &mut impl FnMut(usize, &mut [u8]),
+    ) -> Result<Option<usize>, SocketError> {
+        if payload_len == 0
+            || payload_len > TCP_LOCAL_DIRECT_COPY_BYTES
+            || self.tcp_cork()
+            || self.tcp_more()
+            || self.stream_unsent_len() != 0
+            || !local_transport_fast_path_eligible()
+        {
+            return Ok(None);
+        }
+        let Some(peer) = self.local_tcp_direct_peer() else {
+            return Ok(None);
+        };
+        if payload_len > TCP_LOCAL_IMMEDIATE_HANDOFF_BYTES {
+            self.mark_local_tcp_bulk_active();
+        }
+        if peer.stream_receive_window() < payload_len {
+            peer.mark_local_stream_window_blocked();
+            return Ok(None);
+        }
+        #[cfg(feature = "performance-profile")]
+        let direct_start = profiling::read_counter();
+        match peer.push_stream_rx_local_from(payload_len, copy) {
+            Ok(_) => {}
+            Err(SocketError::WouldBlock) => {
+                peer.mark_local_stream_window_blocked();
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+        self.finish_stream_tx_batch(payload_len);
+        self.local_tcp_direct_pending
+            .fetch_add(payload_len as u64, Ordering::AcqRel);
+        self.local_tcp_direct_events.fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(profiling::Metric::TcpLocalDirectDeliveries, 1);
+            profiling::observe(profiling::Metric::TcpLocalDirectBytes, payload_len as u64);
+            profiling::observe(
+                profiling::Metric::TcpLocalDirectCycles,
+                profiling::read_counter().wrapping_sub(direct_start),
+            );
+        }
+        self.request_local_tcp_direct_reconcile(false)?;
+        Ok(Some(payload_len))
+    }
+
+    fn request_local_tcp_direct_reconcile(
+        self: &Arc<Self>,
+        force: bool,
+    ) -> Result<(), SocketError> {
+        if !force && !self.local_tcp_direct_reconcile_due() {
+            return Ok(());
+        }
+        if !self.tx_notified.swap(true, Ordering::AcqRel) {
+            match socket_runtime() {
+                Ok(runtime) => {
+                    runtime.notify_tx(Arc::clone(self), SocketTxCause::StreamLocalDirect)
+                }
+                Err(error) => {
+                    self.tx_notified.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn local_tcp_direct_reconcile_due(&self) -> bool {
+        self.local_tcp_direct_pending.load(Ordering::Acquire) >= TCP_LOCAL_DIRECT_RECONCILE_BYTES
+            || self.local_tcp_direct_events.load(Ordering::Acquire)
+                >= TCP_LOCAL_DIRECT_RECONCILE_EVENTS
+    }
+
+    pub(crate) fn take_local_tcp_direct_pending(&self) -> u32 {
+        let mut observed = self.local_tcp_direct_pending.load(Ordering::Acquire);
+        loop {
+            let taken = observed.min(u64::from(u32::MAX));
+            if taken == 0 {
+                return 0;
+            }
+            match self.local_tcp_direct_pending.compare_exchange_weak(
+                observed,
+                observed - taken,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.local_tcp_direct_events.store(0, Ordering::Release);
+                    return taken as u32;
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    pub(crate) fn restore_local_tcp_direct_pending(&self, bytes: u32) {
+        if bytes != 0 {
+            self.local_tcp_direct_pending
+                .fetch_add(u64::from(bytes), Ordering::AcqRel);
+        }
+    }
+
+    pub fn mark_local_stream_tx_prepared(&self) {
+        self.local_tcp_tx_prepared.store(true, Ordering::Release);
+    }
+
+    fn prepare_stream_tx_storage(self: &Arc<Self>) {
+        if self.kind != SocketKind::Stream || self.local_tcp_tx_prepared.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(runtime) = socket_runtime() {
+            runtime.prepare_stream_tx(self);
+        }
+    }
+
+    /// 连续流量交给 owner worker 聚合，短消息保留同步 local turn 的低延迟。
+    pub fn local_stream_prefers_worker_batch(&self) -> bool {
+        self.kind == SocketKind::Stream && self.stream_unsent_len() > SOCKET_CHUNK_BYTES
+    }
+
+    pub(crate) fn mark_local_stream_window_blocked(&self) {
+        self.local_tcp_fast_path_active
+            .store(true, Ordering::Release);
+        self.local_tcp_window_blocked.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn receive_window_scale_limit(&self) -> usize {
+        if self.tcp_receive_buffer_explicit.load(Ordering::Acquire) {
+            self.stream_rx.lock().bytes.limit
+        } else {
+            TCP_LOCAL_AUTOTUNE_LIMIT
+        }
+    }
+
     pub fn send_stream(
         self: &Arc<Self>,
         payload: &[u8],
@@ -3773,10 +4264,33 @@ impl SocketFacade {
         deadline_ns: Option<u64>,
         more: bool,
     ) -> Result<usize, SocketError> {
+        self.send_stream_from(
+            payload.len(),
+            nonblocking,
+            deadline_ns,
+            more,
+            |offset, output| {
+                output.copy_from_slice(&payload[offset..offset + output.len()]);
+            },
+        )
+    }
+
+    /// 从已固定、不会缺页的外部窗口批量复制 TCP 字节流。
+    ///
+    /// copy 可能在持有 socket TX 锁时调用，因此只能做有界内存复制，不能阻塞。
+    pub fn send_stream_from(
+        self: &Arc<Self>,
+        payload_len: usize,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+        mut copy: impl FnMut(usize, &mut [u8]),
+    ) -> Result<usize, SocketError> {
         // 用户页可能被内存管理层拆成多个短借用窗口。more 为 true 时只积累发送数据，
         // 最后一个窗口再统一发布；容量不足时提前发布，并把已接受的部分交还调用方。
         self.tcp_more.store(more, Ordering::Release);
-        let result = self.send_stream_buffered(payload, nonblocking, deadline_ns);
+        let result =
+            self.send_stream_buffered_from(payload_len, nonblocking, deadline_ns, &mut copy);
         if more {
             return result;
         }
@@ -3787,11 +4301,12 @@ impl SocketFacade {
         }
     }
 
-    fn send_stream_buffered(
+    fn send_stream_buffered_from(
         self: &Arc<Self>,
-        payload: &[u8],
+        payload_len: usize,
         nonblocking: bool,
         deadline_ns: Option<u64>,
+        copy: &mut impl FnMut(usize, &mut [u8]),
     ) -> Result<usize, SocketError> {
         self.ensure_stack_attached()?;
         if self.kind != SocketKind::Stream {
@@ -3812,9 +4327,15 @@ impl SocketFacade {
                 Err(SocketError::NotConnected)
             };
         }
-        if payload.is_empty() {
+        if payload_len == 0 {
             return Ok(0);
         }
+        if let Some(written) = self.try_send_local_tcp_direct_from(payload_len, copy)? {
+            return Ok(written);
+        }
+        // 本地流在第一次用户复制前安装共享 pool，避免先写 heap、发布时再迁移
+        // 整个发送窗口。非本地流保持原有的 egress 安装路径。
+        self.prepare_stream_tx_storage();
         let mut accepted = 0usize;
         loop {
             if let Some(error) = self.backend_error() {
@@ -3855,17 +4376,24 @@ impl SocketFacade {
                 };
             }
 
-            let copied = self.stream_tx.lock().push(&payload[accepted..]);
+            let copied = {
+                let base = accepted;
+                self.stream_tx
+                    .lock()
+                    .push_with(payload_len - accepted, &mut |offset, output| {
+                        copy(base + offset, output)
+                    })
+            };
             if copied != 0 {
                 accepted += copied;
                 #[cfg(feature = "performance-profile")]
-                if accepted != payload.len() {
+                if accepted != payload_len {
                     profiling::observe(profiling::Metric::TcpSendPartialCapacity, 1);
                 }
                 self.refresh_tx_readiness();
                 self.tx_generation.fetch_add(1, Ordering::Release);
-                if accepted == payload.len() || nonblocking {
-                    if accepted != payload.len() {
+                if accepted == payload_len || nonblocking {
+                    if accepted != payload_len {
                         let _ = self.publish_stream_pending();
                     }
                     return Ok(accepted);
@@ -4036,6 +4564,10 @@ impl SocketFacade {
                 low_water_fallback: false,
             });
         }
+        self.local_tcp_fast_path_active
+            .store(false, Ordering::Release);
+        self.local_tcp_window_blocked
+            .store(false, Ordering::Release);
         let (was_empty, copied) = {
             let mut rx = self.stream_rx.lock();
             if rx.bytes.available() < payload.len() {
@@ -4071,6 +4603,10 @@ impl SocketFacade {
                 low_water_fallback: false,
             });
         }
+        self.local_tcp_fast_path_active
+            .store(false, Ordering::Release);
+        self.local_tcp_window_blocked
+            .store(false, Ordering::Release);
         let should_pin =
             pressure == RxPoolPressure::Normal && len >= crate::tuning::TCP_RX_PIN_MIN_BYTES;
         let low_water_fallback =
@@ -4122,9 +4658,15 @@ impl SocketFacade {
                 low_water_fallback: false,
             });
         }
+        self.local_tcp_fast_path_active
+            .store(true, Ordering::Release);
         let (was_empty, storage, buffered, available) = {
             let mut rx = self.stream_rx.lock();
+            if !self.tcp_receive_buffer_explicit.load(Ordering::Acquire) {
+                rx.bytes.enable_local_autotune();
+            }
             if rx.bytes.available() < len {
+                self.local_tcp_window_blocked.store(true, Ordering::Release);
                 return Err(SocketError::WouldBlock);
             }
             let was_empty = rx.bytes.len == 0;
@@ -4152,12 +4694,91 @@ impl SocketFacade {
                 )
             }
         };
-        let handoff_ready =
-            flush || buffered >= TCP_LOCAL_READ_BATCH_BYTES || available < SOCKET_CHUNK_BYTES;
+        // PSH 是字节流的协议提示，不等价于 CPU 调度边界。阻塞的小消息接收者
+        // 立即交接；吞吐流则累计有界批次，避免每个 segment 都切换任务。
+        let handoff_ready = (was_empty && len <= TCP_LOCAL_IMMEDIATE_HANDOFF_BYTES)
+            || buffered >= TCP_LOCAL_SHARED_READ_BATCH_BYTES
+            || available < TCP_LOCAL_PRESSURE_BYTES;
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = flush;
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(profiling::Metric::TcpLocalRxBufferedBytes, buffered as u64);
+            profiling::observe(
+                profiling::Metric::TcpLocalRxAvailableBytes,
+                available as u64,
+            );
+            if flush {
+                profiling::observe(profiling::Metric::TcpLocalHandoffFlush, 1);
+            }
+            if buffered >= TCP_LOCAL_SHARED_READ_BATCH_BYTES {
+                profiling::observe(profiling::Metric::TcpLocalHandoffBatch, 1);
+            }
+            if available < TCP_LOCAL_PRESSURE_BYTES {
+                profiling::observe(profiling::Metric::TcpLocalHandoffPressure, 1);
+            }
+        }
         self.finish_stream_rx_commit(was_empty, len, true, handoff_ready);
         Ok(StreamRxCommit {
             len,
             storage,
+            low_water_fallback: false,
+        })
+    }
+
+    fn push_stream_rx_local_from(
+        &self,
+        len: usize,
+        copy: &mut impl FnMut(usize, &mut [u8]),
+    ) -> Result<StreamRxCommit, SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return Ok(StreamRxCommit {
+                len,
+                storage: StreamRxStorageKind::Discarded,
+                low_water_fallback: false,
+            });
+        }
+        self.local_tcp_fast_path_active
+            .store(true, Ordering::Release);
+        let (was_empty, buffered, available) = {
+            let mut rx = self.stream_rx.lock();
+            if !self.tcp_receive_buffer_explicit.load(Ordering::Acquire) {
+                rx.bytes.enable_local_autotune();
+            }
+            if rx.bytes.available() < len {
+                self.local_tcp_window_blocked.store(true, Ordering::Release);
+                return Err(SocketError::WouldBlock);
+            }
+            let was_empty = rx.bytes.len == 0;
+            let copied = rx.bytes.push_local_with(len, copy);
+            debug_assert_eq!(copied, len);
+            (was_empty, rx.bytes.len, rx.bytes.available())
+        };
+        let read_batch = local_tcp_read_batch_bytes();
+        let handoff_ready = (was_empty && len <= TCP_LOCAL_IMMEDIATE_HANDOFF_BYTES)
+            || buffered >= read_batch
+            || available < TCP_LOCAL_PRESSURE_BYTES;
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(profiling::Metric::TcpLocalRxBufferedBytes, buffered as u64);
+            profiling::observe(
+                profiling::Metric::TcpLocalRxAvailableBytes,
+                available as u64,
+            );
+            if buffered >= read_batch {
+                profiling::observe(profiling::Metric::TcpLocalHandoffBatch, 1);
+            }
+            if available < TCP_LOCAL_PRESSURE_BYTES {
+                profiling::observe(profiling::Metric::TcpLocalHandoffPressure, 1);
+            }
+        }
+        self.finish_stream_rx_commit(was_empty, len, true, handoff_ready);
+        Ok(StreamRxCommit {
+            len,
+            storage: StreamRxStorageKind::Compact,
             low_water_fallback: false,
         })
     }
@@ -4195,6 +4816,10 @@ impl SocketFacade {
     }
 
     pub fn publish_stream_eof(&self) {
+        self.local_tcp_fast_path_active
+            .store(false, Ordering::Release);
+        self.local_tcp_window_blocked
+            .store(false, Ordering::Release);
         self.stream_rx.lock().eof = true;
         self.set_ready(Readiness::READABLE | Readiness::READ_HANGUP);
         self.read_wait.wake_all();
@@ -4210,6 +4835,33 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
+        let output_len = output.len();
+        self.recv_stream_to(
+            output_len,
+            peek,
+            wait_all,
+            defer_window_update,
+            nonblocking,
+            deadline_ns,
+            |offset, input| {
+                output[offset..offset + input.len()].copy_from_slice(input);
+            },
+        )
+    }
+
+    /// 把 TCP 字节流批量复制到已固定、不会缺页的外部窗口。
+    ///
+    /// copy 在 RX 锁内执行，只能进行有界内存复制，不能阻塞。
+    pub fn recv_stream_to(
+        self: &Arc<Self>,
+        output_len: usize,
+        peek: bool,
+        wait_all: bool,
+        defer_window_update: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        mut copy: impl FnMut(usize, &[u8]),
+    ) -> Result<usize, SocketError> {
         self.ensure_stack_attached()?;
         let mut total = 0usize;
         loop {
@@ -4218,8 +4870,12 @@ impl SocketFacade {
             }
             let (copied, eof) = {
                 let mut rx = self.stream_rx.lock();
-                let copied = (output.len() - total).min(rx.bytes.len);
-                if copied != 0 && !rx.bytes.copy_range(0, &mut output[total..total + copied]) {
+                let copied = (output_len - total).min(rx.bytes.len);
+                if copied != 0
+                    && !rx.bytes.copy_range_with(0, copied, &mut |offset, input| {
+                        copy(total + offset, input);
+                    })
+                {
                     return Err(SocketError::Buffer);
                 }
                 if copied != 0 && !peek {
@@ -4230,13 +4886,18 @@ impl SocketFacade {
             total += copied;
             if copied != 0 && !peek {
                 self.remember_local_tcp_consumer();
-                self.receive_window_update.store(true, Ordering::Release);
-                if !defer_window_update {
-                    self.notify_tcp_state_change();
+                let local_fast_path = self.local_tcp_fast_path_active.load(Ordering::Acquire)
+                    && local_transport_fast_path_eligible();
+                let blocked = self.local_tcp_window_blocked.swap(false, Ordering::AcqRel);
+                if !local_fast_path || blocked {
+                    self.receive_window_update.store(true, Ordering::Release);
+                    if !defer_window_update {
+                        self.notify_tcp_state_change();
+                    }
                 }
             }
             self.refresh_rx_readiness();
-            if total != 0 && (!wait_all || total == output.len() || peek || eof) {
+            if total != 0 && (!wait_all || total == output_len || peek || eof) {
                 return Ok(total);
             }
             if total == 0
@@ -4756,6 +5417,10 @@ impl SocketFacade {
         if read {
             self.read_shutdown.store(true, Ordering::Release);
             self.local_read_handoff.lock().take();
+            self.local_tcp_fast_path_active
+                .store(false, Ordering::Release);
+            self.local_tcp_window_blocked
+                .store(false, Ordering::Release);
             match self.kind {
                 SocketKind::Datagram | SocketKind::Raw => {
                     let mut rx = self.rx.lock();
@@ -4769,6 +5434,7 @@ impl SocketFacade {
         }
         if write {
             self.write_shutdown.store(true, Ordering::Release);
+            self.clear_local_tcp_bulk_active();
             self.clear_ready(Readiness::WRITABLE);
             if self.kind == SocketKind::Stream
                 && let Ok(runtime) = socket_runtime()
@@ -4790,6 +5456,12 @@ impl SocketFacade {
         self.deactivate_packet_observer();
         self.clear_local_datagram_route();
         self.local_read_handoff.lock().take();
+        self.local_tcp_tx_prepared.store(false, Ordering::Release);
+        self.clear_local_tcp_bulk_active();
+        self.local_tcp_fast_path_active
+            .store(false, Ordering::Release);
+        self.local_tcp_window_blocked
+            .store(false, Ordering::Release);
         if self.kind != SocketKind::Stream {
             invalidate_local_datagram_routes();
         }
@@ -5118,6 +5790,9 @@ impl SocketFacade {
 
     pub fn set_buffer_limits(&self, send: Option<usize>, receive: Option<usize>) {
         if let Some(limit) = send {
+            if self.kind == SocketKind::Stream {
+                self.tcp_send_buffer_explicit.store(true, Ordering::Release);
+            }
             match self.kind {
                 SocketKind::Datagram | SocketKind::Raw => self
                     .tx
@@ -5130,6 +5805,10 @@ impl SocketFacade {
             self.refresh_tx_readiness();
         }
         if let Some(limit) = receive {
+            if self.kind == SocketKind::Stream {
+                self.tcp_receive_buffer_explicit
+                    .store(true, Ordering::Release);
+            }
             match self.kind {
                 SocketKind::Datagram | SocketKind::Raw => self
                     .rx
@@ -5469,6 +6148,7 @@ impl SocketFacade {
 
 impl Drop for SocketFacade {
     fn drop(&mut self) {
+        self.clear_local_tcp_bulk_active();
         self.deactivate_packet_observer();
     }
 }
@@ -5557,6 +6237,17 @@ mod tests {
         ))
     }
 
+    fn stream_facade(counter: u64) -> Arc<SocketFacade> {
+        Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ))
+    }
+
     fn install_test_local_datagram_route(
         sender: &Arc<SocketFacade>,
         receiver: Arc<SocketFacade>,
@@ -5609,6 +6300,162 @@ mod tests {
             2 * SOCKET_CHUNK_BYTES
         );
         assert_eq!(facade.stream_rx.lock().bytes.allocated_capacity(), 0);
+    }
+
+    #[test]
+    fn local_stream_autotune_preserves_explicit_buffer_limits() {
+        let automatic = stream_facade(60);
+        assert_eq!(
+            automatic.buffer_limits(),
+            (TCP_BUFFER_BYTES, TCP_BUFFER_BYTES)
+        );
+        automatic.prepare_local_stream_send();
+        assert_eq!(automatic.buffer_limits().0, TCP_LOCAL_AUTOTUNE_LIMIT);
+
+        let explicit = stream_facade(61);
+        explicit.set_buffer_limits(Some(32 * 1024), Some(48 * 1024));
+        explicit.prepare_local_stream_send();
+        assert_eq!(explicit.buffer_limits(), (32 * 1024, 48 * 1024));
+
+        let sender = stream_facade(62);
+        sender.prepare_local_stream_send();
+        let payload = alloc::vec![0x4a; 60 * 1024];
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        let lease = sender.take_stream_tx(payload.len()).unwrap();
+        automatic
+            .push_stream_rx_lease(&lease, 0, payload.len(), true)
+            .unwrap();
+        assert_eq!(automatic.buffer_limits().1, TCP_LOCAL_AUTOTUNE_LIMIT);
+        assert_eq!(explicit.buffer_limits().1, 48 * 1024);
+    }
+
+    #[test]
+    fn local_stream_window_updates_only_after_backpressure() {
+        let sender = stream_facade(63);
+        let receiver = stream_facade(64);
+        sender.prepare_local_stream_send();
+        receiver.set_buffer_limits(None, Some(16 * 1024));
+        let payload = alloc::vec![0x57; 16 * 1024];
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        let first = sender.take_stream_tx(payload.len()).unwrap();
+        receiver
+            .push_stream_rx_lease(&first, 0, payload.len(), true)
+            .unwrap();
+
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        let blocked = sender.take_stream_tx(payload.len()).unwrap();
+        assert_eq!(
+            receiver.push_stream_rx_lease(&blocked, 0, payload.len(), true),
+            Err(SocketError::WouldBlock)
+        );
+        assert!(receiver.local_tcp_window_blocked.load(Ordering::Acquire));
+
+        let mut output = [0u8; SOCKET_CHUNK_BYTES];
+        assert_eq!(
+            receiver.recv_stream(&mut output, false, false, true, true, None),
+            Ok(output.len())
+        );
+        assert!(receiver.receive_window_update.load(Ordering::Acquire));
+        assert!(!receiver.local_tcp_window_blocked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn uncongested_local_stream_consumption_skips_state_notification() {
+        let sender = stream_facade(65);
+        let receiver = stream_facade(66);
+        sender.prepare_local_stream_send();
+        let payload = [0x31; SOCKET_CHUNK_BYTES];
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        let lease = sender.take_stream_tx(payload.len()).unwrap();
+        receiver
+            .push_stream_rx_lease(&lease, 0, payload.len(), true)
+            .unwrap();
+
+        let mut output = [0u8; SOCKET_CHUNK_BYTES];
+        assert_eq!(
+            receiver.recv_stream(&mut output, false, false, true, true, None),
+            Ok(output.len())
+        );
+        assert_eq!(output, payload);
+        assert!(!receiver.receive_window_update.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn local_tcp_direct_lane_moves_shared_bytes_and_tracks_reconciliation() {
+        let sender = stream_facade(67);
+        let receiver = stream_facade(68);
+        sender.stack_generation.store(9, Ordering::Release);
+        receiver.stack_generation.store(9, Ordering::Release);
+        let pool = Arc::new(Mutex::new(
+            NetBufPool::new_heap(4, SOCKET_CHUNK_BYTES).unwrap(),
+        ));
+        assert!(sender.install_stream_tx_pool(pool));
+        sender.mark_local_stream_tx_prepared();
+        sender.install_local_tcp_direct_peer(&receiver);
+
+        let payload = alloc::vec![0x6a; 2 * SOCKET_CHUNK_BYTES];
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        assert_eq!(sender.try_deliver_local_tcp_direct(), payload.len());
+        assert_eq!(sender.stream_unsent_len(), 0);
+        assert_eq!(sender.take_local_tcp_direct_pending(), payload.len() as u32);
+
+        let mut output = alloc::vec![0; payload.len()];
+        assert_eq!(
+            receiver.recv_stream(&mut output, false, false, true, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(output, payload);
+    }
+
+    #[test]
+    fn local_tcp_user_window_copies_directly_without_sender_pool() {
+        let sender = stream_facade(69);
+        let receiver = stream_facade(70);
+        sender.stack_generation.store(10, Ordering::Release);
+        receiver.stack_generation.store(10, Ordering::Release);
+        sender.install_local_tcp_direct_peer(&receiver);
+
+        let payload = alloc::vec![0x4du8; 128 * 1024];
+        assert_eq!(
+            sender
+                .try_send_local_tcp_direct_from(payload.len(), &mut |offset, output| {
+                    output.copy_from_slice(&payload[offset..offset + output.len()]);
+                })
+                .unwrap(),
+            Some(payload.len())
+        );
+        assert_eq!(sender.test_stream_tx_len(), 0);
+        assert_eq!(sender.take_local_tcp_direct_pending(), payload.len() as u32);
+
+        let mut output = alloc::vec![0u8; payload.len()];
+        assert_eq!(
+            receiver.recv_stream(&mut output, false, false, true, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(output, payload);
+    }
+
+    #[test]
+    fn local_tcp_direct_copy_never_overtakes_buffered_stream_data() {
+        let sender = stream_facade(71);
+        let receiver = stream_facade(72);
+        sender.stack_generation.store(11, Ordering::Release);
+        receiver.stack_generation.store(11, Ordering::Release);
+        sender.install_local_tcp_direct_peer(&receiver);
+
+        let buffered = [0x31u8; 32];
+        assert_eq!(sender.test_push_stream_tx(&buffered), buffered.len());
+        let direct = [0x42u8; 16];
+        assert_eq!(
+            sender
+                .try_send_local_tcp_direct_from(direct.len(), &mut |offset, output| {
+                    output.copy_from_slice(&direct[offset..offset + output.len()]);
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(sender.test_stream_tx_len(), buffered.len());
+        assert_eq!(receiver.stream_rx.lock().bytes.len, 0);
     }
 
     #[test]
