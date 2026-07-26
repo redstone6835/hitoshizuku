@@ -113,6 +113,10 @@ impl core::ops::BitOr for Readiness {
 
 pub trait ReadinessObserver: Send + Sync {
     fn readiness_changed(&self, readiness: Readiness, generation: u64);
+
+    fn readiness_updates_required(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -24,7 +24,7 @@ struct ProxyState {
     readiness: AtomicU16,
     readiness_generation: AtomicU64,
     detached: AtomicBool,
-    observer: RwLock<Option<Weak<dyn ReadinessObserver>>>,
+    observer: RwLock<Option<Arc<dyn ReadinessObserver>>>,
     read_wait: WaitQueue,
     write_wait: WaitQueue,
     state_wait: WaitQueue,
@@ -71,21 +71,35 @@ impl ProxyState {
         self.readiness.store(readiness.raw(), Ordering::Release);
         self.readiness_generation
             .store(generation.max(current), Ordering::Release);
-        if readiness.contains(Readiness::READABLE) || readiness.contains(Readiness::ACCEPTABLE) {
+        if (readiness.contains(Readiness::READABLE) || readiness.contains(Readiness::ACCEPTABLE))
+            && self.read_wait.len_hint() != 0
+        {
             self.read_wait.wake_one_default();
         }
-        if readiness.contains(Readiness::WRITABLE) {
+        if readiness.contains(Readiness::WRITABLE) && self.write_wait.len_hint() != 0 {
             self.write_wait.wake_one_default();
         }
         if readiness.contains(Readiness::ERROR)
             || readiness.contains(Readiness::HANGUP)
             || readiness.contains(Readiness::READ_HANGUP)
         {
-            self.read_wait.wake_all();
-            self.write_wait.wake_all();
+            if self.read_wait.len_hint() != 0 {
+                self.read_wait.wake_all();
+            }
+            if self.write_wait.len_hint() != 0 {
+                self.write_wait.wake_all();
+            }
         }
-        self.state_wait.wake_all();
-        if let Some(observer) = self.observer.read().as_ref().and_then(Weak::upgrade) {
+        if self.state_wait.len_hint() != 0 {
+            self.state_wait.wake_all();
+        }
+        let observer = self
+            .observer
+            .read()
+            .as_ref()
+            .filter(|observer| observer.readiness_updates_required())
+            .cloned();
+        if let Some(observer) = observer {
             observer.readiness_changed(readiness, generation.max(current));
         }
     }
@@ -100,7 +114,7 @@ impl ProxyState {
         self.read_wait.wake_all();
         self.write_wait.wake_all();
         self.state_wait.wake_all();
-        if let Some(observer) = self.observer.read().as_ref().and_then(Weak::upgrade) {
+        if let Some(observer) = self.observer.read().as_ref().cloned() {
             observer.readiness_changed(readiness, generation);
         }
     }
@@ -109,6 +123,17 @@ impl ProxyState {
 impl ReadinessObserver for ProxyState {
     fn readiness_changed(&self, readiness: Readiness, generation: u64) {
         self.publish(readiness, generation);
+    }
+
+    fn readiness_updates_required(&self) -> bool {
+        self.read_wait.len_hint() != 0
+            || self.write_wait.len_hint() != 0
+            || self.state_wait.len_hint() != 0
+            || self
+                .observer
+                .read()
+                .as_ref()
+                .is_some_and(|observer| observer.readiness_updates_required())
     }
 }
 
@@ -463,9 +488,9 @@ impl NetSocketProxy {
     }
 
     pub fn set_observer(&self, observer: Weak<dyn ReadinessObserver>) {
-        *self.state.observer.write() = Some(observer);
+        *self.state.observer.write() = observer.upgrade();
         let (readiness, generation) = self.state.readiness();
-        if let Some(observer) = self.state.observer.read().as_ref().and_then(Weak::upgrade) {
+        if let Some(observer) = self.state.observer.read().as_ref().cloned() {
             observer.readiness_changed(readiness, generation);
         }
     }
@@ -673,6 +698,22 @@ impl NetSocketProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicU64};
+
+    struct ConditionalObserver {
+        enabled: AtomicBool,
+        calls: AtomicU64,
+    }
+
+    impl ReadinessObserver for ConditionalObserver {
+        fn readiness_changed(&self, _readiness: Readiness, _generation: u64) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn readiness_updates_required(&self) -> bool {
+            self.enabled.load(Ordering::Acquire)
+        }
+    }
 
     fn socket_id() -> SocketId {
         SocketId {
@@ -704,5 +745,25 @@ mod tests {
         observer.readiness_changed(Readiness::READABLE, 5);
 
         assert_eq!(state.readiness(), (Readiness::READABLE, 5));
+    }
+
+    #[test]
+    fn proxy_state_propagates_readiness_only_after_observer_is_armed() {
+        let state = ProxyState::new(socket_id(), Readiness::WRITABLE, 4, 9);
+        let concrete = Arc::new(ConditionalObserver {
+            enabled: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let observer: Arc<dyn ReadinessObserver> = concrete.clone();
+        *state.observer.write() = Some(observer);
+
+        assert!(!state.readiness_updates_required());
+        state.publish(Readiness::READABLE, 5);
+        assert_eq!(concrete.calls.load(Ordering::Acquire), 0);
+
+        concrete.enabled.store(true, Ordering::Release);
+        assert!(state.readiness_updates_required());
+        state.publish(Readiness::WRITABLE, 6);
+        assert_eq!(concrete.calls.load(Ordering::Acquire), 1);
     }
 }

@@ -4,7 +4,7 @@
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::file::PollEvents;
 use crate::sync::Spinlock;
@@ -26,6 +26,7 @@ pub struct PollSource {
     next_version: AtomicU64,
     next_subscription: AtomicU64,
     subscriptions: Spinlock<Vec<Subscription>>,
+    tracking: AtomicBool,
 }
 
 struct PollState {
@@ -48,11 +49,21 @@ impl PollSource {
             next_version: AtomicU64::new(1),
             next_subscription: AtomicU64::new(1),
             subscriptions: Spinlock::new(Vec::new()),
+            tracking: AtomicBool::new(false),
         }
     }
 
     pub const fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 一旦文件把本 source 暴露给 epoll，就持续跟踪后续 readiness 边沿。
+    pub fn enable_tracking(&self) {
+        self.tracking.store(true, Ordering::Release);
+    }
+
+    pub fn tracking_enabled(&self) -> bool {
+        self.tracking.load(Ordering::Acquire)
     }
 
     pub fn snapshot(&self) -> (PollEvents, u64) {

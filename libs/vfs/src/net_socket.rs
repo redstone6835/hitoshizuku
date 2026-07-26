@@ -189,6 +189,10 @@ impl net::ReadinessObserver for PollSource {
         }
         self.publish_versioned(events, generation);
     }
+
+    fn readiness_updates_required(&self) -> bool {
+        self.tracking_enabled()
+    }
 }
 
 impl NetSocketFileOps {
@@ -732,6 +736,13 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll_source(&self) -> Option<&PollSource> {
+        self.poll_source.enable_tracking();
+        let readiness = self.proxy.readiness();
+        net::ReadinessObserver::readiness_changed(
+            self.poll_source.as_ref(),
+            readiness.0,
+            readiness.1,
+        );
         Some(&self.poll_source)
     }
 
