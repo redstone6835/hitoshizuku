@@ -11,6 +11,10 @@ use ktest::ktest;
 struct EmptyInodeOps;
 
 impl InodeOps for EmptyInodeOps {
+    fn supports_private_page_cache(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _inode: &Inode, _name: &str) -> crate::error::VfsResult<Arc<Inode>> {
         Err(VfsError::NotFound)
     }
@@ -160,4 +164,70 @@ fn writable_access_rejects_exec_until_last_lease_drops() {
 
     let executable = inode.acquire_exec_access().unwrap();
     drop(executable);
+}
+
+#[ktest]
+fn inode_data_mutation_stays_unstable_until_last_guard_drops() {
+    let inode = regular_inode();
+    let initial = inode.data_generation();
+
+    let first = inode.begin_data_mutation();
+    let second = inode.begin_data_mutation();
+    assert_eq!(inode.private_page_cache_generation(), None);
+
+    drop(first);
+    assert_eq!(inode.private_page_cache_generation(), None);
+    drop(second);
+
+    assert_eq!(inode.data_generation(), initial + 2);
+    assert_eq!(inode.private_page_cache_generation(), Some(initial + 2));
+}
+
+#[ktest]
+fn writable_shared_mapping_permanently_disables_private_cache() {
+    let inode = regular_inode();
+    let initial = inode.data_generation();
+
+    inode.disable_private_page_cache();
+    assert_eq!(inode.private_page_cache_generation(), None);
+
+    let mutation = inode.begin_data_mutation();
+    drop(mutation);
+    assert_eq!(inode.private_page_cache_generation(), None);
+    assert_eq!(inode.data_generation(), initial + 2);
+}
+
+#[ktest]
+fn private_page_cache_identity_is_unique_across_inode_lifetimes() {
+    let first = regular_inode();
+    let second = regular_inode();
+    let first_key = first.private_page_cache_key();
+    let second_key = second.private_page_cache_key();
+
+    assert!(first_key.is_some());
+    assert_ne!(first_key, second_key);
+
+    drop(first);
+    let replacement = regular_inode();
+    assert_ne!(first_key, replacement.private_page_cache_key());
+    assert_ne!(second_key, replacement.private_page_cache_key());
+}
+
+#[ktest]
+fn combined_write_metadata_update_keeps_atime_and_shares_timestamp() {
+    let inode = regular_inode();
+    let atime = Timespec {
+        secs: 123,
+        nsecs: 456,
+    };
+    inode.set_times(Some(atime), None);
+
+    inode.set_size_blocks_and_modified(8192, 16);
+
+    let stat = inode.stat().unwrap();
+    assert_eq!(inode.size(), 8192);
+    assert_eq!(stat.size, 8192);
+    assert_eq!(stat.blocks, 16);
+    assert_eq!(stat.atime, atime);
+    assert_eq!(stat.mtime, stat.ctime);
 }

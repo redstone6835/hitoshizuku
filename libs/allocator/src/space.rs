@@ -22,7 +22,7 @@
 //! - 平台相关映射逻辑通过函数指针注入，不污染通用 allocator 代码。
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
+use crate::Mutex;
 
 use crate::boot::BootAllocator;
 use crate::buddy::{BuddyAllocError, BuddyAllocator, BuddyFreeError, PAGE_SIZE};

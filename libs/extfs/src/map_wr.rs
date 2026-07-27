@@ -79,18 +79,34 @@ pub(crate) fn ensure_block_for_write_with_scratch(
     zero_new_data: bool,
     scratch: &mut Vec<u8>,
 ) -> Result<BlockAllocState, BlockBackendError> {
+    ensure_block_for_write_with_scratch_count(state, i_block, logical, zero_new_data, scratch)
+        .map(|(block, _)| block)
+}
+
+/// 与 [`ensure_block_for_write_with_scratch`] 相同，并返回本次为间接映射新建的
+/// 索引块数量。数据块是否新分配仍由 [`BlockAllocState`] 表达。
+///
+/// `i_blocks` 必须同时统计数据块和间接索引块；把增量从分配点向上传递可避免
+/// 每次写入后重新遍历整棵映射树。
+pub(crate) fn ensure_block_for_write_with_scratch_count(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    zero_new_data: bool,
+    scratch: &mut Vec<u8>,
+) -> Result<(BlockAllocState, u32), BlockBackendError> {
     let p = ppb(state.ext_sb.block_size);
     if logical < DIRECT_COUNT {
         let cur = read_u32(i_block, logical);
         if cur != 0 {
-            return Ok(BlockAllocState::Existing(cur as u64));
+            return Ok((BlockAllocState::Existing(cur as u64), 0));
         }
         let new = alloc_mod::alloc_block(state)?;
         if zero_new_data {
             zero_block(state, new)?;
         }
         write_u32(i_block, logical, new as u32);
-        return Ok(BlockAllocState::NewlyAllocated(new));
+        return Ok((BlockAllocState::NewlyAllocated(new), 0));
     }
 
     let bs = state.ext_sb.block_size as usize;
@@ -101,18 +117,18 @@ pub(crate) fn ensure_block_for_write_with_scratch(
     let buf = scratch.as_mut_slice();
     let rem = logical - DIRECT_COUNT;
     if rem < p {
-        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, buf, zero_new_data)?;
-        return Ok(new_data);
+        return alloc_or_walk_l1(state, i_block, 12, rem, buf, zero_new_data);
     }
 
     let rem = rem - p;
     if rem < p * p {
         // 二级间接:先确保 L2 索引块存在,把它读到 buf
-        let l2 = ensure_indirect_slot(state, i_block, 13, buf)?;
+        let (l2, mut new_metadata) = ensure_indirect_slot(state, i_block, 13, buf)?;
         let mid_idx = rem / p;
         let mut mid = read_u32(buf, mid_idx);
         if mid == 0 {
             mid = alloc_mod::alloc_block(state)? as u32;
+            new_metadata += 1;
             // 新 mid 块逻辑上为零,直接写零到磁盘后续不再 read_block
             write_u32(buf, mid_idx, mid);
             state.write_block(l2, buf)?;
@@ -124,7 +140,7 @@ pub(crate) fn ensure_block_for_write_with_scratch(
         let inner = rem % p;
         let cur = read_u32(buf, inner);
         if cur != 0 {
-            return Ok(BlockAllocState::Existing(cur as u64));
+            return Ok((BlockAllocState::Existing(cur as u64), new_metadata));
         }
         let new = alloc_mod::alloc_block(state)?;
         if zero_new_data {
@@ -132,17 +148,18 @@ pub(crate) fn ensure_block_for_write_with_scratch(
         }
         write_u32(buf, inner, new as u32);
         state.write_block(mid as u64, buf)?;
-        return Ok(BlockAllocState::NewlyAllocated(new));
+        return Ok((BlockAllocState::NewlyAllocated(new), new_metadata));
     }
 
     // 三级间接
     let rem = rem - p * p;
     let a = p * p;
-    let l3 = ensure_indirect_slot(state, i_block, 14, buf)?;
+    let (l3, mut new_metadata) = ensure_indirect_slot(state, i_block, 14, buf)?;
     let top_idx = rem / a;
     let mut top = read_u32(buf, top_idx);
     if top == 0 {
         top = alloc_mod::alloc_block(state)? as u32;
+        new_metadata += 1;
         write_u32(buf, top_idx, top);
         state.write_block(l3, buf)?;
         cache_zero_block(state, top as u64, buf)?;
@@ -153,6 +170,7 @@ pub(crate) fn ensure_block_for_write_with_scratch(
     let mut mid = read_u32(buf, mid_idx);
     if mid == 0 {
         mid = alloc_mod::alloc_block(state)? as u32;
+        new_metadata += 1;
         write_u32(buf, mid_idx, mid);
         state.write_block(top as u64, buf)?;
         cache_zero_block(state, mid as u64, buf)?;
@@ -162,7 +180,7 @@ pub(crate) fn ensure_block_for_write_with_scratch(
     let inner = rem % p;
     let cur = read_u32(buf, inner);
     if cur != 0 {
-        return Ok(BlockAllocState::Existing(cur as u64));
+        return Ok((BlockAllocState::Existing(cur as u64), new_metadata));
     }
     let new = alloc_mod::alloc_block(state)?;
     if zero_new_data {
@@ -170,7 +188,7 @@ pub(crate) fn ensure_block_for_write_with_scratch(
     }
     write_u32(buf, inner, new as u32);
     state.write_block(mid as u64, buf)?;
-    Ok(BlockAllocState::NewlyAllocated(new))
+    Ok((BlockAllocState::NewlyAllocated(new), new_metadata))
 }
 
 /// 在间接块布局里写入一个既有数据块映射。
@@ -182,30 +200,31 @@ pub(crate) fn set_existing_block(
     i_block: &mut [u8],
     logical: u32,
     phys: u64,
-) -> Result<(), BlockBackendError> {
+) -> Result<u32, BlockBackendError> {
     let p = ppb(state.ext_sb.block_size);
     if logical < DIRECT_COUNT {
         write_u32(i_block, logical, phys as u32);
-        return Ok(());
+        return Ok(0);
     }
 
     let bs = state.ext_sb.block_size as usize;
     let mut buf = vec![0u8; bs];
     let rem = logical - DIRECT_COUNT;
     if rem < p {
-        let l1 = ensure_indirect_slot(state, i_block, 12, &mut buf)?;
+        let (l1, new_metadata) = ensure_indirect_slot(state, i_block, 12, &mut buf)?;
         write_u32(&mut buf, rem, phys as u32);
         state.write_block(l1, &buf)?;
-        return Ok(());
+        return Ok(new_metadata);
     }
 
     let rem = rem - p;
     if rem < p * p {
-        let l2 = ensure_indirect_slot(state, i_block, 13, &mut buf)?;
+        let (l2, mut new_metadata) = ensure_indirect_slot(state, i_block, 13, &mut buf)?;
         let mid_idx = rem / p;
         let mut mid = read_u32(&buf, mid_idx);
         if mid == 0 {
             mid = alloc_mod::alloc_block(state)? as u32;
+            new_metadata += 1;
             write_u32(&mut buf, mid_idx, mid);
             state.write_block(l2, &buf)?;
             cache_zero_block(state, mid as u64, &mut buf)?;
@@ -214,16 +233,17 @@ pub(crate) fn set_existing_block(
         }
         write_u32(&mut buf, rem % p, phys as u32);
         state.write_block(mid as u64, &buf)?;
-        return Ok(());
+        return Ok(new_metadata);
     }
 
     let rem = rem - p * p;
     let a = p * p;
-    let l3 = ensure_indirect_slot(state, i_block, 14, &mut buf)?;
+    let (l3, mut new_metadata) = ensure_indirect_slot(state, i_block, 14, &mut buf)?;
     let top_idx = rem / a;
     let mut top = read_u32(&buf, top_idx);
     if top == 0 {
         top = alloc_mod::alloc_block(state)? as u32;
+        new_metadata += 1;
         write_u32(&mut buf, top_idx, top);
         state.write_block(l3, &buf)?;
         cache_zero_block(state, top as u64, &mut buf)?;
@@ -234,6 +254,7 @@ pub(crate) fn set_existing_block(
     let mut mid = read_u32(&buf, mid_idx);
     if mid == 0 {
         mid = alloc_mod::alloc_block(state)? as u32;
+        new_metadata += 1;
         write_u32(&mut buf, mid_idx, mid);
         state.write_block(top as u64, &buf)?;
         cache_zero_block(state, mid as u64, &mut buf)?;
@@ -242,7 +263,7 @@ pub(crate) fn set_existing_block(
     }
     write_u32(&mut buf, rem % p, phys as u32);
     state.write_block(mid as u64, &buf)?;
-    Ok(())
+    Ok(new_metadata)
 }
 
 /// 处理一级间接块的分配/查找。`slot` 是 i_block 中索引(12 = 一级)。
@@ -254,11 +275,11 @@ fn alloc_or_walk_l1(
     inner: u32,
     buf: &mut [u8],
     zero_new_data: bool,
-) -> Result<BlockAllocState, BlockBackendError> {
-    let l1 = ensure_indirect_slot(state, i_block, slot, buf)?;
+) -> Result<(BlockAllocState, u32), BlockBackendError> {
+    let (l1, new_metadata) = ensure_indirect_slot(state, i_block, slot, buf)?;
     let cur = read_u32(buf, inner);
     if cur != 0 {
-        return Ok(BlockAllocState::Existing(cur as u64));
+        return Ok((BlockAllocState::Existing(cur as u64), new_metadata));
     }
     let new = alloc_mod::alloc_block(state)?;
     if zero_new_data {
@@ -266,7 +287,7 @@ fn alloc_or_walk_l1(
     }
     write_u32(buf, inner, new as u32);
     state.write_block(l1, buf)?;
-    Ok(BlockAllocState::NewlyAllocated(new))
+    Ok((BlockAllocState::NewlyAllocated(new), new_metadata))
 }
 
 /// 确保 i_block[slot] 指向一个存在的间接块。`buf` 出参为该间接块的内容。
@@ -276,11 +297,11 @@ fn ensure_indirect_slot(
     i_block: &mut [u8],
     slot: u32,
     buf: &mut [u8],
-) -> Result<u64, BlockBackendError> {
+) -> Result<(u64, u32), BlockBackendError> {
     let cur = read_u32(i_block, slot);
     if cur != 0 {
         state.read_block(cur as u64, buf)?;
-        return Ok(cur as u64);
+        return Ok((cur as u64, 0));
     }
     let new = alloc_mod::alloc_block(state)?;
     write_u32(i_block, slot, new as u32);
@@ -289,7 +310,7 @@ fn ensure_indirect_slot(
         *b = 0;
     }
     state.write_block(new, buf)?;
-    Ok(new)
+    Ok((new, 1))
 }
 
 fn zero_block(state: &FsState, block: u64) -> Result<(), BlockBackendError> {

@@ -152,7 +152,27 @@ pub struct UserPgdOps {
     ///
     /// # Safety
     /// `vaddr` 必须 4K 对齐；`paddr` 同；`flags` 必须含 [`VmFlags::USER`]。
-    pub map: unsafe fn(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags),
+    pub map: unsafe fn(
+        handle: PgdHandle,
+        vaddr: usize,
+        paddr: usize,
+        flags: VmFlags,
+    ) -> Result<(), crate::MapError>,
+
+    /// 从 `vaddr` 起连续安装一批基础页，物理页地址由 `paddrs` 逐页给出。
+    ///
+    /// 返回值中的 `mapped` 表示错误前已经生效的连续前缀。调用方必须为这部分
+    /// 页面建立 resident 所有权账本，不能因为批次后缀失败而直接释放它们。
+    ///
+    /// # Safety
+    /// `handle` 必须合法；`vaddr` 和所有 `paddrs` 必须按基础页对齐；目标叶
+    /// PTE 必须为空，`flags` 必须含 [`VmFlags::USER`]。
+    pub map_pages: unsafe fn(
+        handle: PgdHandle,
+        vaddr: usize,
+        paddrs: &[usize],
+        flags: VmFlags,
+    ) -> crate::MapBatchResult,
 
     /// 发布一段从“无叶 PTE”变为“有效叶 PTE”的新映射。
     ///
@@ -355,7 +375,25 @@ mod tests {
 
     unsafe fn ignore_handle(_: PgdHandle) {}
     unsafe fn ignore_activate_kernel() {}
-    unsafe fn ignore_map(_: PgdHandle, _: usize, _: usize, _: VmFlags) {}
+    unsafe fn ignore_map(
+        _: PgdHandle,
+        _: usize,
+        _: usize,
+        _: VmFlags,
+    ) -> Result<(), crate::MapError> {
+        Ok(())
+    }
+    unsafe fn ignore_map_pages(
+        _: PgdHandle,
+        _: usize,
+        paddrs: &[usize],
+        _: VmFlags,
+    ) -> crate::MapBatchResult {
+        crate::MapBatchResult {
+            mapped: paddrs.len(),
+            error: None,
+        }
+    }
     unsafe fn record_local(_: PgdHandle, _: usize, _: usize) {
         LOCAL_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
     }
@@ -373,6 +411,7 @@ mod tests {
             new_pgd_for_user: new_pgd,
             drop_pgd: ignore_handle,
             map: ignore_map,
+            map_pages: ignore_map_pages,
             publish_new_mapping: record_local,
             unmap: record_remote,
             protect: ignore_protect,

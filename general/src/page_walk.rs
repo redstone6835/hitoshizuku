@@ -25,11 +25,12 @@
 //! ```
 
 use crate::PagingArch;
+use core::sync::atomic::{Ordering, fence};
 
 /// 页表遍历过程中的错误类型。
 ///
 /// 此枚举覆盖了页表遍历、映射创建和解除映射过程中可能遇到的所有错误条件。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapError {
     /// 物理内存不足，无法分配中间页表页。
     OutOfMemory,
@@ -45,6 +46,32 @@ pub enum MapError {
     UnsupportedHugePage,
     /// 无效的权限组合（如只写不读）。
     InvalidPermission,
+}
+
+/// 连续基础页批量映射的结果。
+///
+/// 页表页分配或叶 PTE 冲突可能发生在批次中途；调用方必须先接管 `mapped`
+/// 个已经发布的页面，再处理 `error`。`error == None` 表示整批安装完成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapBatchResult {
+    pub mapped: usize,
+    pub error: Option<MapError>,
+}
+
+impl MapBatchResult {
+    const fn complete(mapped: usize) -> Self {
+        Self {
+            mapped,
+            error: None,
+        }
+    }
+
+    const fn failed(mapped: usize, error: MapError) -> Self {
+        Self {
+            mapped,
+            error: Some(error),
+        }
+    }
 }
 
 /// 在页表中查找覆盖 `vaddr` 的现有叶子页表项。
@@ -297,6 +324,9 @@ pub fn walk_and_map<P: PagingArch>(
 
             // 创建指向下一层的 PTE
             let new_pte = P::make_table_pte(new_table_paddr);
+            // 页表 walker 不受软件锁约束；必须先让新页表清零对其它 CPU 可见，
+            // 再发布指向它的有效 PTE。
+            fence(Ordering::Release);
             unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(new_pte)) };
 
             table_vaddr = new_table_vaddr;
@@ -320,9 +350,137 @@ pub fn walk_and_map<P: PagingArch>(
         P::make_leaf_pte_for_level(target_level, paddr, read, write, execute, user, global)
             .ok_or(MapError::InvalidPermission)?;
 
+    // 先发布调用方已经初始化的物理页内容，再使叶 PTE 有效。最终 TLB publish
+    // 负责完成本地无效 translation 收敛，但不能替代此处面向并发 walker 的顺序。
+    fence(Ordering::Release);
     unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(leaf_pte)) };
 
     Ok(())
+}
+
+/// 连续安装一批基础页叶 PTE，并复用同一叶页表内的中间层遍历结果。
+///
+/// `paddrs` 中的物理页可以不连续，但虚拟地址从 `vaddr` 起按基础页连续。
+/// 调用方必须保证所有数据页已经完成初始化，且映射写入由上层页表锁串行化。
+/// 本函数在首个叶 PTE 写入前只执行一次 Release 屏障；跨叶页表边界时只重新
+/// 遍历并按需分配中间页表，不重复发布已经初始化的数据页。
+#[allow(clippy::too_many_arguments)]
+pub fn walk_and_map_pages<P: PagingArch>(
+    root_vaddr: usize,
+    vaddr: usize,
+    paddrs: &[usize],
+    target_level: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+    user: bool,
+    global: bool,
+    phys_to_virt: fn(usize) -> usize,
+    alloc_page: fn() -> Result<usize, MapError>,
+) -> MapBatchResult {
+    if paddrs.is_empty() {
+        return MapBatchResult::complete(0);
+    }
+    if target_level >= P::LEVELS || P::leaf_page_size(target_level) != Some(P::PAGE_SIZE) {
+        return MapBatchResult::failed(0, MapError::UnsupportedLevel);
+    }
+    if !P::is_valid_leaf_perm(read, write, execute, user, global) {
+        return MapBatchResult::failed(0, MapError::InvalidPermission);
+    }
+    if vaddr % P::PAGE_SIZE != 0 {
+        return MapBatchResult::failed(0, MapError::Misaligned);
+    }
+    let Some(byte_len) = paddrs.len().checked_mul(P::PAGE_SIZE) else {
+        return MapBatchResult::failed(0, MapError::Misaligned);
+    };
+    let Some(end_vaddr) = vaddr.checked_add(byte_len) else {
+        return MapBatchResult::failed(0, MapError::Misaligned);
+    };
+    if !P::is_canonical_vaddr(vaddr)
+        || !P::is_canonical_vaddr(end_vaddr - 1)
+        || paddrs.iter().any(|paddr| paddr % P::PAGE_SIZE != 0)
+    {
+        return MapBatchResult::failed(0, MapError::Misaligned);
+    }
+
+    // 所有候选数据页均由调用方在进入本函数前初始化。一次 Release 即可让随后
+    // 发布的整批叶 PTE 对并发硬件 walker 保持“先数据、后映射”的顺序。
+    fence(Ordering::Release);
+
+    let mut mapped = 0usize;
+    let mut current_vaddr = vaddr;
+    let mut leaf_table_vaddr = 0usize;
+    let mut leaf_table_end = vaddr;
+
+    while mapped < paddrs.len() {
+        if current_vaddr >= leaf_table_end {
+            let mut table_vaddr = root_vaddr;
+            for level in 0..target_level {
+                let index = P::level_index(current_vaddr, level);
+                let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+                let pte_bits = unsafe { core::ptr::read_volatile(pte_ptr) };
+                let pte = P::pte_from_usize(pte_bits);
+
+                if !P::pte_is_valid(pte) {
+                    let new_table_paddr = match alloc_page() {
+                        Ok(paddr) => paddr,
+                        Err(error) => return MapBatchResult::failed(mapped, error),
+                    };
+                    let new_table_vaddr = phys_to_virt(new_table_paddr);
+                    // Safety: `alloc_page` 返回调用方独占的完整页表页，发布父 PTE
+                    // 之前没有其它 walker 能访问该页。
+                    unsafe {
+                        core::ptr::write_bytes(new_table_vaddr as *mut u8, 0, P::PAGE_SIZE);
+                    }
+                    let new_pte = P::make_table_pte(new_table_paddr);
+                    fence(Ordering::Release);
+                    // Safety: 上层页表锁保证当前路径没有并发写者。
+                    unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(new_pte)) };
+                    table_vaddr = new_table_vaddr;
+                } else if P::pte_is_leaf(pte) {
+                    return MapBatchResult::failed(mapped, MapError::AlreadyMapped);
+                } else {
+                    table_vaddr = phys_to_virt(P::pte_addr(pte));
+                }
+            }
+
+            leaf_table_vaddr = table_vaddr;
+            let entries_left = P::ENTRIES_PER_TABLE
+                .checked_sub(P::level_index(current_vaddr, target_level))
+                .unwrap_or(0);
+            let Some(span) = entries_left.checked_mul(P::PAGE_SIZE) else {
+                return MapBatchResult::failed(mapped, MapError::Misaligned);
+            };
+            let Some(end) = current_vaddr.checked_add(span) else {
+                return MapBatchResult::failed(mapped, MapError::Misaligned);
+            };
+            leaf_table_end = end.min(end_vaddr);
+        }
+
+        let index = P::level_index(current_vaddr, target_level);
+        let pte_ptr = (leaf_table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+        let old_pte = P::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) });
+        if P::pte_is_valid(old_pte) {
+            return MapBatchResult::failed(mapped, MapError::AlreadyMapped);
+        }
+        let Some(leaf_pte) = P::make_leaf_pte_for_level(
+            target_level,
+            paddrs[mapped],
+            read,
+            write,
+            execute,
+            user,
+            global,
+        ) else {
+            return MapBatchResult::failed(mapped, MapError::InvalidPermission);
+        };
+        // Safety: 目标叶 PTE 已验证为空，且上层页表锁排除了并发写入。
+        unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(leaf_pte)) };
+        mapped += 1;
+        current_vaddr += P::PAGE_SIZE;
+    }
+
+    MapBatchResult::complete(mapped)
 }
 
 /// 把目标层级下已经完全空闲的页表子树提升为一个大页叶子。

@@ -155,7 +155,7 @@ impl WaitQueue {
         // 检查条件，要么在这里之后看到 Sleeping/Uninterruptible。
         #[cfg(feature = "performance-profile")]
         task.begin_profile_wait(self.reason, crate::scheduler::now_ns_public());
-        task.set_state(state);
+        let _ = task.prepare_wait_state(state);
         entry
     }
 

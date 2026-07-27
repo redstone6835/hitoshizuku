@@ -66,6 +66,7 @@ static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
+    vfs::stat::install_realtime_clock(vdso::realtime_ns);
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
     #[cfg(feature = "performance-profile")]

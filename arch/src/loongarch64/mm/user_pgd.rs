@@ -11,20 +11,118 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use general::mm::{PgdHandle, UserPgdOps};
-use general::{PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, walk_and_map};
+use general::{
+    MapBatchResult, PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, walk_and_map,
+    walk_and_map_pages,
+};
 use mm::VmFlags;
 
 use crate::loongarch64::paging::LoongArch64Paging;
-use crate::loongarch64::specific::phys_to_virt;
+use crate::loongarch64::specific::{CSR_ASID_ASID_MASK, phys_to_virt};
 
-/// LoongArch64 ASID 单调发号；溢出后回到 1（0 留给内核）。
-static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
+const HARDWARE_ASID_COUNT: usize = CSR_ASID_ASID_MASK + 1;
+const FALLBACK_HARDWARE_ASID: usize = CSR_ASID_ASID_MASK;
+const EXCLUSIVE_ASID_COUNT: usize = FALLBACK_HARDWARE_ASID - 1;
+const ASID_WORD_BITS: usize = usize::BITS as usize;
+const ASID_WORDS: usize = (HARDWARE_ASID_COUNT + ASID_WORD_BITS - 1) / ASID_WORD_BITS;
+
+/// 0 留给内核，最后一个硬件 ASID 留给耗尽时的共享 fallback。
+static ALLOCATED_HARDWARE_ASIDS: [AtomicUsize; ASID_WORDS] =
+    [const { AtomicUsize::new(0) }; ASID_WORDS];
+static HARDWARE_ASID_GENERATIONS: [AtomicUsize; HARDWARE_ASID_COUNT] =
+    [const { AtomicUsize::new(0) }; HARDWARE_ASID_COUNT];
+static NEXT_ASID_HINT: AtomicUsize = AtomicUsize::new(0);
+static NEXT_FALLBACK_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+fn advance_nonzero(counter: &AtomicUsize) -> usize {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("[arch][mm] ASID/TLB generation exhausted");
+        match counter.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+const fn logical_asid(generation: usize, hardware_asid: usize) -> usize {
+    assert!(
+        generation <= (usize::MAX >> 10),
+        "[arch][mm] logical ASID generation exhausted"
+    );
+    (generation << 10) | hardware_asid
+}
+
+fn allocate_user_asid() -> (usize, bool) {
+    let start = NEXT_ASID_HINT.fetch_add(1, Ordering::Relaxed) % EXCLUSIVE_ASID_COUNT;
+    for offset in 0..EXCLUSIVE_ASID_COUNT {
+        let hardware_asid = 1 + (start + offset) % EXCLUSIVE_ASID_COUNT;
+        let word = hardware_asid / ASID_WORD_BITS;
+        let mask = 1usize << (hardware_asid % ASID_WORD_BITS);
+        let mut allocated = ALLOCATED_HARDWARE_ASIDS[word].load(Ordering::Relaxed);
+        loop {
+            if allocated & mask != 0 {
+                break;
+            }
+            match ALLOCATED_HARDWARE_ASIDS[word].compare_exchange_weak(
+                allocated,
+                allocated | mask,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let generation = advance_nonzero(&HARDWARE_ASID_GENERATIONS[hardware_asid]);
+                    return (logical_asid(generation, hardware_asid), true);
+                }
+                Err(observed) => allocated = observed,
+            }
+        }
+    }
+
+    let generation = advance_nonzero(&NEXT_FALLBACK_GENERATION);
+    (logical_asid(generation, FALLBACK_HARDWARE_ASID), false)
+}
+
+fn release_user_asid(asid: usize, exclusive: bool) {
+    if !exclusive {
+        return;
+    }
+    let hardware_asid = asid & CSR_ASID_ASID_MASK;
+    let word = hardware_asid / ASID_WORD_BITS;
+    let mask = 1usize << (hardware_asid % ASID_WORD_BITS);
+    let old = ALLOCATED_HARDWARE_ASIDS[word].fetch_and(!mask, Ordering::Release);
+    debug_assert_ne!(old & mask, 0, "[arch][mm] releasing an unallocated ASID");
+}
+
+const fn activation_requires_full_flush(
+    exclusive: bool,
+    observed_generation: usize,
+    current_generation: usize,
+) -> bool {
+    !exclusive || observed_generation != current_generation
+}
+
+const _: () = {
+    assert!(HARDWARE_ASID_COUNT == 1024);
+    assert!(FALLBACK_HARDWARE_ASID == 1023);
+    assert!(activation_requires_full_flush(true, 0, 1));
+    assert!(!activation_requires_full_flush(true, 7, 7));
+    assert!(activation_requires_full_flush(false, 7, 7));
+};
 
 /// arch 私有的 PGD 描述符。general 看到的只是它的 `NonNull<()>`，不解释字段。
 struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
     asid: usize,
+    exclusive_asid: bool,
+    /// 现有映射被替换、撤销或收紧时递增。切换方以此发现扫描开始前已经切离、
+    /// 因而没有收到 shootdown 的更新。
+    tlb_generation: AtomicUsize,
+    /// 每 CPU 最近完整同步到的本地址空间 TLB 代际。
+    cpu_tlb_generations: [AtomicUsize; sched::NR_CPUS],
     /// 曾经激活过本地址空间的逻辑 CPU。位图在 PGD 生命周期内单调增长，确保
     /// 已经缓存过该 ASID translation 的 CPU 不会被后续 shootdown 遗漏。
     active_cpus: AtomicUsize,
@@ -42,11 +140,14 @@ impl UserPgdInner {
         // Safety: 刚分配的物理页对应内核直映窗口，本次唯一写入者。
         unsafe { core::ptr::write_bytes(pgd_virt as *mut u8, 0, allocator::PAGE_SIZE) };
 
-        let asid = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
+        let (asid, exclusive_asid) = allocate_user_asid();
         Some(Box::new(Self {
             pgd_phys,
             pgd_virt,
             asid,
+            exclusive_asid,
+            tlb_generation: AtomicUsize::new(1),
+            cpu_tlb_generations: [const { AtomicUsize::new(0) }; sched::NR_CPUS],
             active_cpus: AtomicUsize::new(0),
         }))
     }
@@ -66,8 +167,12 @@ impl UserPgdInner {
 
 impl Drop for UserPgdInner {
     fn drop(&mut self) {
+        // VmSpace 的最后一个 Arc 只会在任务已切离或 exec 已激活新根后析构；
+        // 因此释放独占 slot 时没有 CPU 仍能用本 logical ASID 访问旧 PGDL。
+        // 各 CPU 上遗留的硬件 TLB 项由下一个 slot owner 的首次激活全刷清除。
         free_user_page_table_pages(self.pgd_virt);
         free_page_table_page(self.pgd_phys);
+        release_user_asid(self.asid, self.exclusive_asid);
     }
 }
 
@@ -185,7 +290,12 @@ unsafe fn drop_pgd(handle: PgdHandle) {
     unsafe { inner_from_handle_drop(handle) };
 }
 
-unsafe fn map(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
+unsafe fn map(
+    handle: PgdHandle,
+    vaddr: usize,
+    paddr: usize,
+    flags: VmFlags,
+) -> Result<(), general::MapError> {
     // Safety: 由 UserPgdOps 契约保证 handle 合法；vaddr / paddr 在用户半空间且 4K 对齐。
     let inner = unsafe { inner_ref(handle) };
     let read = flags.has(VmFlags::READ);
@@ -204,7 +314,29 @@ unsafe fn map(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
         phys_to_virt,
         allocate_page_table_page,
     )
-    .expect("[arch][mm] walk_and_map failed");
+}
+
+unsafe fn map_pages(
+    handle: PgdHandle,
+    vaddr: usize,
+    paddrs: &[usize],
+    flags: VmFlags,
+) -> MapBatchResult {
+    // Safety: 由 UserPgdOps 契约保证 handle、地址、权限和空目标 PTE 合法。
+    let inner = unsafe { inner_ref(handle) };
+    walk_and_map_pages::<LoongArch64Paging>(
+        inner.pgd_virt(),
+        vaddr,
+        paddrs,
+        LoongArch64Paging::LEVELS - 1,
+        flags.has(VmFlags::READ),
+        flags.has(VmFlags::WRITE),
+        flags.has(VmFlags::EXEC),
+        true,
+        false,
+        phys_to_virt,
+        allocate_page_table_page,
+    )
 }
 
 unsafe fn publish_new_mapping(handle: PgdHandle, vaddr: usize, len: usize) {
@@ -327,18 +459,26 @@ unsafe fn activate(handle: PgdHandle) {
         "[arch][mm] user address space activated before kernel PGDH"
     );
     let asid = inner.asid();
-    // 历史位和当前逻辑 ASID 都先于地址空间安装发布。失效方若看到本 ASID 就发送
-    // IPI；若仍看到旧值，则下面以 dbar 开始并以完整 invtlb 结束的激活覆盖该次
-    // PTE 更新。SeqCst 与失效方的 PTE-write→fence→scan 形成全序闭环。
+    // 历史位和当前逻辑 ASID 都先于代际读取发布。失效方若看到本 ASID 就发送
+    // IPI；若扫描早于本次发布，则下面的 SeqCst 代际读取会观察到更新并要求完整
+    // 本地失效。两侧与 PTE-write→generation→scan 形成全序闭环。
     inner.active_cpus.fetch_or(cpu_bit, Ordering::SeqCst);
     super::super::smp::publish_current_logical_asid(asid);
+    let generation = inner.tlb_generation.load(Ordering::SeqCst);
+    let observed_generation = inner.cpu_tlb_generations[cpu].load(Ordering::SeqCst);
+    let flush_tlb =
+        activation_requires_full_flush(inner.exclusive_asid, observed_generation, generation);
     // Safety: 两个根均在各自生命周期内有效；本函数只在调度器地址空间切换边界调用。
     unsafe {
-        LoongArch64Paging::activate_with_asid_roots(
+        LoongArch64Paging::activate_with_asid_roots_cached(
             PhysPageTableRoot::new(inner.pgd_phys()),
             PhysPageTableRoot::new(kernel_pgd),
             asid,
+            flush_tlb,
         );
+    }
+    if flush_tlb {
+        inner.cpu_tlb_generations[cpu].store(generation, Ordering::SeqCst);
     }
 }
 
@@ -353,9 +493,15 @@ unsafe fn activate_kernel() {
 }
 
 unsafe fn invalidate_range(handle: PgdHandle, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // Safety: 同上。
     let inner = unsafe { inner_ref(handle) };
     let asid = inner.asid();
+    // PTE 写发生在调用本回调之前。SeqCst 递增先于目标扫描，使并发激活要么
+    // 被扫描命中并收到 IPI，要么在进入用户态前观察到新代际并完整本地失效。
+    advance_nonzero(&inner.tlb_generation);
     let targets = super::super::smp::shootdown_targets_after_pte_update(&inner.active_cpus, asid);
     flush_user_tlb_range(asid, targets, vaddr, len);
 }
@@ -379,6 +525,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map,
+    map_pages,
     publish_new_mapping,
     unmap,
     protect,

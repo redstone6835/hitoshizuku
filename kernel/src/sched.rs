@@ -271,7 +271,9 @@ static TASK_CPU_STATE_OPS: sched::arch_hooks::TaskCpuStateOps =
 // 替换 VmSpace 的实现留在 kernel/hal 侧。
 
 const EXEC_PATH_MAX: usize = 4096;
-const EXEC_MAX_STRINGS: usize = 256;
+// Rust 链接器命令会携带数百个目标文件与静态库；最终可用空间仍由
+// EXEC_MAX_ARG_BYTES 和用户栈布局共同约束，这里不应提前卡在 256 项。
+const EXEC_MAX_STRINGS: usize = 4096;
 const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 
 const SIGFRAME_MAGIC: u64 = 0x4d59474f_53494746; // "MYGOSIGF"
@@ -894,6 +896,10 @@ pub fn boot_init() -> Arc<Task> {
 
     // 9. 建 init。sched::init 内部会 assert arch_hooks 已注入。
     let init = sched::init();
+
+    // allocator 的自旋锁可能与内核堆回收触发的全核 TLB shootdown 形成锁环。
+    // 调度器和架构紧急回调就绪后，让所有 allocator 竞争路径协作消费请求。
+    allocator::KERNEL_ALLOCATOR.bind_urgent_poll(sched::poll_urgent_work);
 
     // 10. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
     //    （理论上不会）就跳过——调度 / 信号路径不依赖 ext，仅 VFS syscall 受影响。

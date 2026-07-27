@@ -3577,7 +3577,11 @@ impl BlockDriver for RamBlockIo {
                     bio.complete(Err(BioIoError::MediaError));
                     return Ok(());
                 }
-                bio.buffer.as_mut_slice()[..want].copy_from_slice(&data[off..off + want]);
+                if !bio.buffer.copy_from_contiguous(&data[off..off + want]) {
+                    drop(data);
+                    bio.complete(Err(BioIoError::MediaError));
+                    return Ok(());
+                }
                 drop(data);
                 bio.complete(Ok(()));
             }
@@ -3588,7 +3592,11 @@ impl BlockDriver for RamBlockIo {
                     bio.complete(Err(BioIoError::MediaError));
                     return Ok(());
                 }
-                data[off..off + want].copy_from_slice(&bio.buffer.as_slice()[..want]);
+                if !bio.buffer.copy_to_contiguous(&mut data[off..off + want]) {
+                    drop(data);
+                    bio.complete(Err(BioIoError::MediaError));
+                    return Ok(());
+                }
                 drop(data);
                 bio.complete(Ok(()));
             }

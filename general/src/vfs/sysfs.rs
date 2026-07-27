@@ -2047,7 +2047,7 @@ fn render_profile_stats() -> String {
     let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "state={} enabled={} session={} generation={} active_writers={} counter_hz={} event_mask={:#x} sampling={} trace={} cpu_slots={} histogram_buckets={}",
+        "state={} enabled={} session={} generation={} active_writers={} counter_hz={} event_mask={:#x} sampling={} trace={} timing_shift={} effective_timing_shift={} timing_sampler={} cpu_slots={} histogram_buckets={}",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
@@ -2057,6 +2057,9 @@ fn render_profile_stats() -> String {
         session.event_mask,
         u8::from(session.sampling_enabled),
         u8::from(session.trace_enabled),
+        session.timing_shift,
+        profiling::effective_timing_shift(),
+        session.timing_sampler,
         profiling::CPU_SLOTS,
         profiling::HISTOGRAM_BUCKETS,
     );
@@ -2068,19 +2071,26 @@ fn render_profile_stats() -> String {
             }
             let _ = writeln!(
                 output,
-                "cpu={} event={} event_id={} category={} calls={} cycles={} bytes={} packets={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                "cpu={} event={} event_id={} category={} calls={} timed_samples={} sample_ratio={}/{} cycles={} bytes={} packets={} sampled_max_cycles={} sampled_wall_ns={} estimated_wall_ns={} mean_ns={} sampled_on_cpu_ns={} estimated_on_cpu_ns={} sampled_off_cpu_ns={} estimated_off_cpu_ns={} sampled_max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
                 ProfileCpuDisplay(cpu),
                 event.name(),
                 event as usize,
                 event.category().name(),
+                value.calls,
+                value.timed_samples,
+                value.timed_samples,
                 value.calls,
                 value.cycles,
                 value.bytes,
                 value.packets,
                 value.max_cycles,
                 value.wall_ns,
+                profiling::estimate_total(value.wall_ns, value.calls, value.timed_samples),
+                value.wall_ns.checked_div(value.timed_samples).unwrap_or(0),
                 value.on_cpu_ns,
+                profiling::estimate_total(value.on_cpu_ns, value.calls, value.timed_samples),
                 value.off_cpu_ns,
+                profiling::estimate_total(value.off_cpu_ns, value.calls, value.timed_samples),
                 value.max_latency_ns,
                 value.migrations,
                 profiling::histogram_percentile(&value.latency, 50),
@@ -2243,7 +2253,7 @@ fn render_profile_trace() -> String {
 fn render_profile_control() -> String {
     let session = profiling::session_info();
     format!(
-        "state={} enabled={} session={} generation={} active_writers={} event_mask={:#x} sampling={} trace={} commands=start,resume,freeze,stop,reset,events=<mask>,samples=0|1,trace=0|1\n",
+        "state={} enabled={} session={} generation={} active_writers={} event_mask={:#x} sampling={} trace={} timing_shift={} effective_timing_shift={} timing_sampler={} commands=start,resume,freeze,stop,reset,events=<mask>,samples=0|1,trace=0|1,timing_shift=0..16\n",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
@@ -2252,6 +2262,9 @@ fn render_profile_control() -> String {
         session.event_mask,
         u8::from(session.sampling_enabled),
         u8::from(session.trace_enabled),
+        session.timing_shift,
+        profiling::effective_timing_shift(),
+        session.timing_sampler,
     )
 }
 
@@ -2523,6 +2536,16 @@ impl FileOps for SysRegFileOps {
                     "1" | "on" => profiling::set_trace_enabled(true),
                     _ => return Err(VfsError::InvalidArgument),
                 }
+                return Ok(_buf.len());
+            }
+            if let Some(shift) = command.strip_prefix("timing_shift=") {
+                let shift = shift
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if shift > profiling::MAX_TIMING_SHIFT {
+                    return Err(VfsError::InvalidArgument);
+                }
+                profiling::set_timing_shift(shift);
                 return Ok(_buf.len());
             }
             match command {

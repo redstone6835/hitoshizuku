@@ -61,6 +61,9 @@ static TLB_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; 
 static TLB_COMPLETED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ICACHE_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ICACHE_COMPLETED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static TLB_SHOOTDOWN_ASID: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static TLB_SHOOTDOWN_ADDR: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 
 #[repr(C, align(16))]
 struct SecondaryStack([u8; AP_STACK_SIZE]);
@@ -193,7 +196,7 @@ fn cpu_is_online(logical_id: usize) -> bool {
 /// 发布当前 CPU 即将激活的逻辑 ASID；调用方随后必须完成全量本地 TLB 失效。
 pub(crate) fn publish_current_logical_asid(asid: usize) {
     let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
-    CURRENT_LOGICAL_ASIDS.publish_before_full_flush(cpu, asid);
+    CURRENT_LOGICAL_ASIDS.publish_before_activation(cpu, asid);
 }
 
 /// 在 PTE 更新后，仅保留当前仍运行目标逻辑 ASID 的历史 CPU。
@@ -247,7 +250,17 @@ fn local_tlb_flush(asid: usize, address: usize) {
     unsafe {
         core::arch::asm!("dbar 0", options(nostack, preserves_flags));
         if address == ALL_ADDRESSES {
-            core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
+            if asid == 0 {
+                // No ASID hint: flush everything
+                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
+            } else {
+                // ASID-specific full flush: invtlb 0x3 flushes all entries for asid
+                core::arch::asm!(
+                    "invtlb 0x3, {asid}, $zero",
+                    asid = in(reg) asid_bits(asid),
+                    options(nostack)
+                );
+            }
         } else {
             core::arch::asm!(
                 "invtlb 0x5, {asid}, {address}",
@@ -273,7 +286,11 @@ pub(crate) fn handle_shootdown_requests() {
         if shootdown_sequence_reached(completed, requested) {
             break;
         }
-        local_tlb_flush(0, ALL_ADDRESSES);
+        // Read asid/addr hint with Relaxed: worst case we use stale values
+        // which just means we over-flush, never under-flush.
+        let hint_asid = TLB_SHOOTDOWN_ASID[logical_id].load(Ordering::Relaxed);
+        let hint_addr = TLB_SHOOTDOWN_ADDR[logical_id].load(Ordering::Relaxed);
+        local_tlb_flush(hint_asid, hint_addr);
         TLB_COMPLETED[logical_id].store(requested, Ordering::Release);
     }
     loop {
@@ -316,9 +333,17 @@ fn publish_shootdown(
             continue;
         }
         expected[logical_id] = match kind {
-            SHOOTDOWN_TLB => TLB_REQUESTED[logical_id]
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1),
+            SHOOTDOWN_TLB => {
+                // Store shootdown parameters before bumping sequence.
+                // Targets use these for precise invtlb when possible.
+                // Under concurrent shootdowns the hint may be stale; targets
+                // fall back to invtlb 0x0 when asid==0 or addr==ALL_ADDRESSES.
+                TLB_SHOOTDOWN_ASID[logical_id].store(asid, Ordering::Relaxed);
+                TLB_SHOOTDOWN_ADDR[logical_id].store(address, Ordering::Relaxed);
+                TLB_REQUESTED[logical_id]
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1)
+            }
             SHOOTDOWN_ICACHE => ICACHE_REQUESTED[logical_id]
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1),

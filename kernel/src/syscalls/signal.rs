@@ -101,6 +101,9 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let mask = SigSet::from_raw(u64::from_le_bytes(raw));
     ctx.task().signal.save_blocked(mask);
     loop {
+        if ctx.task().group_exit_pending() {
+            break;
+        }
         let pending = sched::operation::sigpending()?;
         if pending.raw() != 0 {
             break;

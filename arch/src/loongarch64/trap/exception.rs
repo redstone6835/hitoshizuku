@@ -61,10 +61,12 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
         sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
+            drop(task);
             schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
+            drop(task);
             schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
         }
         _ => {}
@@ -90,10 +92,12 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     }
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
+            drop(task);
             schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
+            drop(task);
             schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
         }
         _ => {}
@@ -187,6 +191,16 @@ unsafe fn loongarch64_handle_exception_inner(
     let tf = unsafe { trap_frame_mut(arg4) };
     let from_user = (tf.status & CSR_PRMD_PPLV_MASK) != 0;
 
+    #[cfg(feature = "performance-profile")]
+    if from_user {
+        profiling::record_loongarch_user_trap(
+            LoongArch64MessageInterruptOps::current_cpu_id(),
+            ecode == ECODE_SYS,
+            tf.euen & FPU_SAVED != 0,
+            tf.euen & LSX_SAVED != 0,
+        );
+    }
+
     if ecode == ECODE_INT {
         // 对中断而言，最关键的信息是 IS 位域。与同步异常不同，中断通常不需要 BADV，
         // 且多数情况下 PC 只用于诊断，不决定恢复逻辑。
@@ -201,8 +215,44 @@ unsafe fn loongarch64_handle_exception_inner(
             super::super::smp::handle_ipi();
             let now_ns = super::super::specific::kernel_timestamp_ns();
             deliver_user_signals_before_return(arg4, from_user);
+            // IPI 在 idle 任务的内核态也可能是唯一一次 resched 通知。若只在
+            // from_user 时抢占，IPI 恰好落在 idle_entry 的 schedule_once 与
+            // 下一条 `idle 0` 之间时会被清掉，随后 CPU 进入 WFI，而已经入队的
+            // 任务再也没有事件把它唤醒。只有 idle_relax 已发布“安全等待”标记
+            // 时才在此处调度；标记未发布意味着 IPI 可能打断 schedule_once，
+            // 不能在中断上下文重入 runqueue。
+            let preempt_idle = if !from_user && super::super::sched_ctx::idle_waiting() {
+                // current_raw 是无锁的 per-CPU 发布槽；此处避免再次取得
+                // CpuSchedState.current 锁，也避免其它 kernel task 误触发。
+                // 确认 idle 后原子消费标记，防止它跨本次上下文切换残留。
+                sched::current_task_ref().is_idle_task()
+                    && super::super::sched_ctx::take_idle_waiting()
+            } else {
+                false
+            };
             if from_user {
                 preempt_before_user_return(now_ns);
+            } else if preempt_idle {
+                loop {
+                    // 该调用可能在 idle 被再次选中前长期不返回；每轮重新取时钟，
+                    // 避免后续请求用首次 IPI 的旧时间戳做调度记账。
+                    sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+
+                    // schedule_once 若切走 idle，本调用只会在 idle 再次成为
+                    // current 后返回。旧 trap frame 的恢复点仍可能位于原来的
+                    // `idle 0` 之前，必须重新发布标记并复查 need_resched；否则
+                    // 恢复后的新 IPI 会因标记已被首次 handler 消费而再次丢失。
+                    debug_assert!(sched::current_task_ref().is_idle_task());
+                    super::super::sched_ctx::mark_idle_waiting();
+                    if !sched::needs_resched_current() {
+                        break;
+                    }
+
+                    // 标记刚由本 handler 发布且本地中断仍关闭，消费必然成功。
+                    // 若复查发现新请求，先撤销“即将 idle”声明再安全调度一次。
+                    let consumed = super::super::sched_ctx::take_idle_waiting();
+                    debug_assert!(consumed);
+                }
             }
             return arg4;
         }

@@ -92,6 +92,9 @@ pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
     let Some(vm) = current_task_vm_space() else {
         return FaultOutcome::Kernel(KernelFaultReason::NoVmSpace);
     };
+    #[cfg(feature = "performance-profile")]
+    let outcome = vm.handle_user_hardware_fault(addr, kind);
+    #[cfg(not(feature = "performance-profile"))]
     let outcome = vm.handle_fault(addr, kind);
     outcome
 }

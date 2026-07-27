@@ -10,6 +10,15 @@
 //! 这些类型是 VFS 层与具体文件系统驱动之间的契约，也是用户空间 `stat`/`fstat`
 //! 系统调用的数据来源，因此其字段布局和语义必须与 POSIX 规范严格对齐。
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static REALTIME_CLOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// 安装 VFS 元数据使用的 Unix realtime 时钟。
+pub fn install_realtime_clock(clock: fn() -> u64) {
+    REALTIME_CLOCK.store(clock as usize, Ordering::Release);
+}
+
 /// 文件类型，对应 `stat.st_mode` 的高 4 位（`S_IFMT` 掩码部分）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -208,12 +217,15 @@ impl Timespec {
         }
     }
 
-    /// 获取当前时间戳（需要平台提供时钟源）。
-    ///
-    /// 注意：这是一个占位实现，实际内核需要从硬件时钟读取。
+    /// 获取当前 Unix realtime；平台尚未安装时钟时退回零时间戳。
     pub fn now() -> Self {
-        // TODO: 从实际时钟源读取
-        Self::ZERO
+        let raw = REALTIME_CLOCK.load(Ordering::Acquire);
+        if raw == 0 {
+            return Self::ZERO;
+        }
+        // Safety: install_realtime_clock 只会存入签名为 fn() -> u64 的函数指针。
+        let clock = unsafe { core::mem::transmute::<usize, fn() -> u64>(raw) };
+        Self::from_nanos(clock())
     }
 }
 

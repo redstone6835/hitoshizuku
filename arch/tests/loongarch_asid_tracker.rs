@@ -14,13 +14,13 @@ fn target_mask_keeps_only_current_matching_logical_asids() {
     let tracker = CurrentAsidTracker::<5>::new();
     let historical = AtomicUsize::new(0b1_1111);
 
-    tracker.publish_before_full_flush(0, TARGET_ASID);
-    tracker.publish_before_full_flush(1, KERNEL_LOGICAL_ASID);
-    tracker.publish_before_full_flush(2, TARGET_ASID + 1);
-    tracker.publish_before_full_flush(3, TARGET_ASID);
+    tracker.publish_before_activation(0, TARGET_ASID);
+    tracker.publish_before_activation(1, KERNEL_LOGICAL_ASID);
+    tracker.publish_before_activation(2, TARGET_ASID + 1);
+    tracker.publish_before_activation(3, TARGET_ASID);
     // 软件逻辑 ASID 不按 10 位硬件字段截断，避免把复用同一硬件 tag 的其它
     // 地址空间误当成本地址空间。
-    tracker.publish_before_full_flush(4, TARGET_ASID + (1 << 10));
+    tracker.publish_before_activation(4, TARGET_ASID + (1 << 10));
 
     assert_eq!(tracker.current(0), Some(TARGET_ASID));
     assert_eq!(tracker.current(4), Some(TARGET_ASID + (1 << 10)));
@@ -43,17 +43,30 @@ fn publishing_kernel_asid_removes_cpu_from_user_targets() {
     let tracker = CurrentAsidTracker::<1>::new();
     let historical = AtomicUsize::new(1);
 
-    tracker.publish_before_full_flush(0, TARGET_ASID);
+    tracker.publish_before_activation(0, TARGET_ASID);
     assert_eq!(
         tracker.target_mask_after_pte_update(&historical, TARGET_ASID),
         1
     );
 
-    tracker.publish_before_full_flush(0, KERNEL_LOGICAL_ASID);
+    tracker.publish_before_activation(0, KERNEL_LOGICAL_ASID);
     assert_eq!(
         tracker.target_mask_after_pte_update(&historical, TARGET_ASID),
         0
     );
+}
+
+#[test]
+fn switched_away_cpu_retires_only_user_shootdown_waits() {
+    let tracker = CurrentAsidTracker::<1>::new();
+
+    tracker.publish_before_activation(0, TARGET_ASID);
+    assert!(!tracker.user_shootdown_is_obsolete(0, TARGET_ASID));
+
+    tracker.publish_before_activation(0, TARGET_ASID + 1);
+    assert!(tracker.user_shootdown_is_obsolete(0, TARGET_ASID));
+    assert!(!tracker.user_shootdown_is_obsolete(0, KERNEL_LOGICAL_ASID));
+    assert!(!tracker.user_shootdown_is_obsolete(1, TARGET_ASID));
 }
 
 #[test]
@@ -70,7 +83,7 @@ fn concurrent_switch_or_scan_always_covers_the_pte_update() {
             let start = Arc::clone(&start);
             thread::spawn(move || {
                 start.wait();
-                tracker.publish_before_full_flush(0, TARGET_ASID);
+                tracker.publish_before_activation(0, TARGET_ASID);
                 // 模拟 activate_with_asid_roots 开头的 dbar：若扫描漏掉本 CPU，
                 // 随后的完整 invtlb 必须位于 PTE 发布之后。
                 fence(Ordering::SeqCst);

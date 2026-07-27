@@ -650,6 +650,7 @@ impl File {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         let _pos_guard = self.pos_lock.lock();
+        let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
         if flags.append {
             let n = self.ops.write_at(buf, u64::MAX)?;
             let new_eof = self.inode.size();
@@ -690,6 +691,31 @@ impl File {
         Ok(n)
     }
 
+    /// 从指定偏移精确初始化一组页面，不改变描述符的当前偏移量。
+    ///
+    /// 前 `valid_len` 字节必须来自文件，剩余页面尾部由底层实现清零。该接口供
+    /// VM 批量缺页路径使用，普通文件系统可以覆盖 [`FileOps::read_pages_at`]
+    /// 以避免中间缓冲和二次复制。
+    pub fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> VfsResult<()> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsRead);
+        if !self.flags().readable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        if !self.ops.is_seekable() {
+            return Err(crate::vfs::error::VfsError::IllegalSeek);
+        }
+        self.ops.read_pages_at(offset, pages, valid_len)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(valid_len);
+        Ok(())
+    }
+
     /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。
     #[kernel_symbols::export(
         name = "vfs.file.File.write_at",
@@ -707,6 +733,7 @@ impl File {
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
+        let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
         let n = self.ops.write_at(buf, offset)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
@@ -793,7 +820,9 @@ impl File {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         self.mount.check_writable()?;
-        self.inode.ops.truncate(&self.inode, size)
+        let _data_mutation = self.inode.begin_data_mutation();
+        self.inode.ops.truncate(&self.inode, size)?;
+        Ok(())
     }
 
     /// 按指定模式调整文件范围的底层存储。是否支持由具体文件系统决定。
@@ -811,7 +840,9 @@ impl File {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
         self.mount.check_writable()?;
-        self.ops.fallocate(mode, offset, len)
+        let _data_mutation = self.inode.begin_data_mutation();
+        self.ops.fallocate(mode, offset, len)?;
+        Ok(())
     }
 
     /// 将文件操作对象向下转型为具体驱动类型 `T`。
@@ -997,10 +1028,31 @@ impl ::mm::FileLike for File {
         Arc::as_ptr(&self.inode) as usize
     }
 
+    fn private_page_cache_key(&self) -> Option<usize> {
+        self.inode.private_page_cache_key()
+    }
+
+    fn private_page_cache_generation(&self) -> Option<u64> {
+        self.inode.private_page_cache_generation()
+    }
+
+    fn disable_private_page_cache(&self) {
+        self.inode.disable_private_page_cache();
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, errno::Errno> {
         // File::read_at 会检查 readable flag；loader / mmap 场景打开时必然带
         // O_RDONLY，返错说明文件描述符状态异常——映回 EIO。
         File::read_at(self, buf, offset).map_err(|_| errno::Errno::EIO)
+    }
+
+    fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> Result<(), errno::Errno> {
+        File::read_pages_at(self, offset, pages, valid_len).map_err(|error| error.to_errno())
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, errno::Errno> {
@@ -1033,6 +1085,18 @@ pub trait FileOps {
     /// 返回 `Ok(0)` 表示到达文件末尾（EOF）。不应修改文件的当前偏移量，
     /// 偏移量的推进由 [`File::read`] 统一处理。
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
+
+    /// 从 `offset` 起精确填充页面前 `valid_len` 字节，并把剩余尾部清零。
+    ///
+    /// 默认路径循环调用 [`Self::read_at`]；文件系统可覆盖它以直接填充调用方页。
+    fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> VfsResult<()> {
+        read_pages_at_default(self, offset, pages, valid_len)
+    }
 
     /// 在指定 `offset` 处写入 `buf`，返回实际写入字节数。
     ///
@@ -1167,4 +1231,60 @@ pub trait FileOps {
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
     fn as_any(&self) -> &dyn core::any::Any;
+}
+
+/// [`FileOps::read_pages_at`] 的通用精确读取实现。
+///
+/// 单独暴露此函数，便于文件系统在无法使用自身对齐快速路径时回退，同时避免
+/// 通过 trait 默认方法形成递归调用。
+pub fn read_pages_at_default<T: FileOps + ?Sized>(
+    ops: &T,
+    offset: u64,
+    pages: &mut [&mut [u8]],
+    valid_len: usize,
+) -> VfsResult<()> {
+    let mut capacity = 0usize;
+    for page in pages.iter() {
+        if page.is_empty() {
+            return Err(crate::vfs::error::VfsError::InvalidArgument);
+        }
+        capacity = capacity
+            .checked_add(page.len())
+            .ok_or(crate::vfs::error::VfsError::FileTooLarge)?;
+    }
+    if valid_len > capacity {
+        return Err(crate::vfs::error::VfsError::InvalidArgument);
+    }
+    let valid_len_u64 =
+        u64::try_from(valid_len).map_err(|_| crate::vfs::error::VfsError::FileTooLarge)?;
+    offset
+        .checked_add(valid_len_u64)
+        .ok_or(crate::vfs::error::VfsError::FileTooLarge)?;
+
+    let mut page_start = 0usize;
+    for page in pages.iter_mut() {
+        let tail_start = valid_len.saturating_sub(page_start).min(page.len());
+        page[tail_start..].fill(0);
+        page_start += page.len();
+    }
+
+    let mut remaining = valid_len;
+    let mut read_offset = offset;
+    for page in pages.iter_mut() {
+        let page_valid = remaining.min(page.len());
+        let mut done = 0usize;
+        while done < page_valid {
+            let count = ops.read_at(&mut page[done..page_valid], read_offset)?;
+            if count == 0 || count > page_valid - done {
+                return Err(crate::vfs::error::VfsError::Io);
+            }
+            done += count;
+            read_offset += count as u64;
+        }
+        remaining -= page_valid;
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
 }

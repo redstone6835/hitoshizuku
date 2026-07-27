@@ -53,6 +53,15 @@ impl AnonMergeDomain {
     pub(crate) fn can_merge(self, other: Self) -> bool {
         self.id == other.id || (!self.inherited && !other.inherited)
     }
+
+    /// 比较匿名映射的稳定来源身份。
+    ///
+    /// `fork` 只会封存合并策略，不改变来源；同一 VMA 的 split/clip 也保留 id。
+    /// 新建匿名映射即使暂时允许相邻合并，仍拥有不同 id，可用于缺页锁外准备后
+    /// 检测同地址 unmap/remap ABA。
+    pub fn same_snapshot_identity(self, other: Self) -> bool {
+        self.id == other.id
+    }
 }
 
 /// 共享匿名映射的稳定 backing 身份。

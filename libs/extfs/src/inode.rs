@@ -1,7 +1,7 @@
 //! ext2/3/4 inode 加载/写回 + VFS `InodeOps` 实现。
 //!
 //! 运行时每个 `Inode` 持有一个 `Spinlock<RawInode>`(完整磁盘字节),所有写
-//! 路径先改内存副本,调用 [`inode_wr::write_raw`] 落盘,最后同步到 VFS
+//! 路径先改内存副本,调用 [`FsState::publish_inode_write`] 发布,最后同步到 VFS
 //! [`vfs::inode::Inode`] 的镜像字段(`size`/`nlink`/...)。
 //!
 //! 写路径统一的"降级策略":改写 extent 文件时必须保留仍在文件尺寸内的
@@ -13,6 +13,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use vfs::cred::{Credentials, Gid, Uid};
 use vfs::error::{VfsError, VfsResult};
@@ -21,12 +22,35 @@ use vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use vfs::stat::{DevId, FileMode, FileType, Timespec};
 use vfs::sync::{Spinlock, SpinlockGuard};
 
-use crate::inode_wr::{RawInode, read_raw, write_raw};
+use crate::inode_wr::{RawInode, read_raw};
 use crate::layout::*;
 use crate::state::{BlockBackendError, FsState, map_err};
 use crate::{alloc_mod, dir_wr, extent_wr, map_wr};
 
 const I_BLOCK_BYTES: usize = 60;
+
+fn inode_has_extra_time_field(raw: &[u8], extra_offset: usize) -> bool {
+    if raw.len() < 0x82 || raw.len() < extra_offset + 4 {
+        return false;
+    }
+    let extra_isize = u16::from_le_bytes([raw[0x80], raw[0x81]]) as usize;
+    extra_offset + 4 <= 0x80 + extra_isize
+}
+
+fn parse_inode_time(raw: &[u8], base_offset: usize, extra_offset: usize) -> Timespec {
+    let base = i32::from_le_bytes(raw[base_offset..base_offset + 4].try_into().unwrap()) as i64;
+    if !inode_has_extra_time_field(raw, extra_offset) {
+        return Timespec {
+            secs: base,
+            nsecs: 0,
+        };
+    }
+    let extra = u32::from_le_bytes(raw[extra_offset..extra_offset + 4].try_into().unwrap());
+    Timespec {
+        secs: base + (((extra & 0x3) as i64) << 32),
+        nsecs: (extra >> 2).min(999_999_999),
+    }
+}
 
 /// on-disk inode 摘要(由 [`load_inode`] 返回)。
 #[derive(Debug, Clone)]
@@ -96,9 +120,6 @@ fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
     let mode = u16::from_le_bytes([raw[0], raw[1]]);
     let uid_lo = u16::from_le_bytes([raw[2], raw[3]]) as u32;
     let size_lo = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-    let atime_sec = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as i64;
-    let ctime_sec = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as i64;
-    let mtime_sec = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as i64;
     let gid_lo = u16::from_le_bytes([raw[24], raw[25]]) as u32;
     let nlink = u16::from_le_bytes([raw[26], raw[27]]);
     let blocks_lo = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
@@ -113,18 +134,9 @@ fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
         gid: (gid_hi << 16) | gid_lo,
         size: ((size_hi as u64) << 32) | size_lo as u64,
         nlink,
-        atime: Timespec {
-            secs: atime_sec,
-            nsecs: 0,
-        },
-        mtime: Timespec {
-            secs: mtime_sec,
-            nsecs: 0,
-        },
-        ctime: Timespec {
-            secs: ctime_sec,
-            nsecs: 0,
-        },
+        atime: parse_inode_time(raw, 8, 0x8c),
+        mtime: parse_inode_time(raw, 16, 0x88),
+        ctime: parse_inode_time(raw, 12, 0x84),
         flags,
         blocks_512: blocks_lo as u64,
         file_acl_hi,
@@ -160,6 +172,7 @@ pub(crate) fn lock_raw(raw: &Spinlock<RawInode>) -> SpinlockGuard<'_, RawInode> 
             return guard;
         }
         if sched::is_ready() {
+            sched::poll_urgent_work();
             sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
@@ -243,6 +256,12 @@ pub struct ExtInodeOps {
     /// superblock cache 中摘掉，因此打开文件不能再依赖 `sb.find_inode()` 找回
     /// 状态，否则会破坏 Linux 的 unlink-but-open 语义。
     pub(crate) raw: Arc<Spinlock<RawInode>>,
+    /// 普通文件块映射的 inode-local 代际。
+    ///
+    /// 多个打开句柄各自持有映射缓存；间接块内补洞时 `flags/size/i_block`
+    /// 可能都不变化，因此需要共享代际通知其它句柄丢弃旧映射。该代际只由
+    /// 本 inode 的映射修改推进，不受其它 inode 元数据写入影响。
+    mapping_generation: Arc<AtomicU64>,
     /// 命名 FIFO 的运行时数据通道。
     ///
     /// ext 磁盘格式只保存 FIFO inode 类型，缓冲区和打开端点属于内存态；同一
@@ -257,8 +276,14 @@ impl ExtInodeOps {
             state,
             ino,
             raw: Arc::new(Spinlock::new(RawInode::new(ino, bytes))),
+            mapping_generation: Arc::new(AtomicU64::new(0)),
             fifo: (kind == FileType::Fifo).then(vfs::pipe::new_fifo),
         }
+    }
+
+    #[inline]
+    fn bump_mapping_generation(&self) {
+        self.mapping_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn snapshot_meta(&self) -> InodeMetaDisk {
@@ -352,6 +377,10 @@ fn create_disk_inode(
 ) -> Result<RawInode, BlockBackendError> {
     let ino = alloc_mod::alloc_inode(state, is_dir)?;
     let mut raw = RawInode::new(ino, alloc::vec![0u8; state.ext_sb.inode_size as usize]);
+    // 若 inode_size >= 256，要先声明 extra 区域，再编码纳秒时间字段。
+    if state.ext_sb.inode_size >= 256 {
+        raw.bytes[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
+    }
     raw.set_mode(mode);
     raw.set_uid(uid);
     raw.set_gid(gid);
@@ -364,16 +393,24 @@ fn create_disk_inode(
     } else {
         raw.set_flags(0);
     }
-    // 若 inode_size >= 256,要设好 i_extra_isize(否则 csum 不对)
-    if state.ext_sb.inode_size >= 256 {
-        // linux 默认 32(至少覆盖 atime_extra/ctime_extra/...);我们用 32
-        raw.bytes[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
-    }
-    write_raw(state, &raw)?;
+    let now = Timespec::now();
+    raw.set_atime(now);
+    raw.set_mtime(now);
+    raw.set_ctime(now);
+    state.publish_inode_write(&raw)?;
     Ok(raw)
 }
 
-fn sync_vfs_meta(inode: &Inode, raw: &RawInode) {
+pub(crate) fn touch_content_times(raw: &mut RawInode, now: Timespec) {
+    raw.set_mtime(now);
+    raw.set_ctime(now);
+}
+
+fn touch_change_time(raw: &mut RawInode, now: Timespec) {
+    raw.set_ctime(now);
+}
+
+pub(crate) fn sync_vfs_meta(inode: &Inode, raw: &RawInode) {
     let meta = parse_inode_meta(&raw.bytes);
     inode.refresh_meta_from_fs(InodeMeta {
         size: meta.size,
@@ -425,6 +462,10 @@ fn clear_deleted_inode(raw: &mut RawInode) {
 }
 
 impl InodeOps for ExtInodeOps {
+    fn supports_private_page_cache(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, inode: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         let meta = self.snapshot_meta();
         if file_type_from_mode(meta.mode) != FileType::Directory {
@@ -480,8 +521,9 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&i_block);
         parent.set_flags(pflags);
         parent.set_size(new_size);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -532,7 +574,7 @@ impl InodeOps for ExtInodeOps {
         new_raw.i_block_mut()[0..4].copy_from_slice(&(block as u32).to_le_bytes());
         new_raw.set_size(self.state.ext_sb.block_size as u64);
         new_raw.set_blocks_lo((self.state.ext_sb.block_size / 512) as u32);
-        write_raw(&self.state, &new_raw).map_err(map_err)?;
+        self.state.publish_inode_write(&new_raw).map_err(map_err)?;
 
         // 父目录:插 entry + nlink++
         let mut parent = lock_raw(&self.raw);
@@ -555,8 +597,9 @@ impl InodeOps for ExtInodeOps {
         parent.set_size(new_size);
         let new_nl = parent.nlink() + 1;
         parent.set_nlink(new_nl);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -590,8 +633,9 @@ impl InodeOps for ExtInodeOps {
         }
         parent.i_block_mut().copy_from_slice(&pi_block);
         parent.set_flags(pflags);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -604,7 +648,8 @@ impl InodeOps for ExtInodeOps {
         let mut traw = lock_raw(&t_ops.raw);
         let nl = traw.nlink().saturating_sub(1);
         traw.set_nlink(nl);
-        write_raw(&self.state, &traw).map_err(map_err)?;
+        touch_change_time(&mut traw, Timespec::now());
+        self.state.publish_inode_write(&traw).map_err(map_err)?;
         sync_vfs_meta(&target, &traw);
         drop(traw);
         Ok(())
@@ -648,8 +693,9 @@ impl InodeOps for ExtInodeOps {
         parent.set_flags(pflags);
         let pn = parent.nlink().saturating_sub(1);
         parent.set_nlink(pn);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -657,7 +703,8 @@ impl InodeOps for ExtInodeOps {
         // 数据块和 inode 位图必须等最后一个打开引用释放时由 evict() 回收。
         let mut traw = lock_raw(&t_ops.raw);
         traw.set_nlink(0);
-        write_raw(&self.state, &traw).map_err(map_err)?;
+        touch_change_time(&mut traw, Timespec::now());
+        self.state.publish_inode_write(&traw).map_err(map_err)?;
         sync_vfs_meta(&target, &traw);
         drop(traw);
         Ok(())
@@ -702,7 +749,7 @@ impl InodeOps for ExtInodeOps {
             new_raw.i_block_mut()[0..4].copy_from_slice(&(block as u32).to_le_bytes());
             new_raw.set_blocks_lo((self.state.ext_sb.block_size / 512) as u32);
         }
-        write_raw(&self.state, &new_raw).map_err(map_err)?;
+        self.state.publish_inode_write(&new_raw).map_err(map_err)?;
 
         // 父目录插 entry
         let mut parent = lock_raw(&self.raw);
@@ -723,8 +770,9 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
         parent.set_size(new_size);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -762,7 +810,7 @@ impl InodeOps for ExtInodeOps {
         if let Some((old, new)) = encoded_device {
             new_raw.i_block_mut()[0..4].copy_from_slice(&old.to_le_bytes());
             new_raw.i_block_mut()[4..8].copy_from_slice(&new.to_le_bytes());
-            write_raw(&self.state, &new_raw).map_err(map_err)?;
+            self.state.publish_inode_write(&new_raw).map_err(map_err)?;
         }
 
         let mut parent = lock_raw(&self.raw);
@@ -783,8 +831,9 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&parent_block);
         parent.set_flags(parent_flags);
         parent.set_size(new_size);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
@@ -811,7 +860,8 @@ impl InodeOps for ExtInodeOps {
             let mut traw = lock_raw(&t_ops.raw);
             let new_nl = traw.nlink() + 1;
             traw.set_nlink(new_nl);
-            write_raw(&self.state, &traw).map_err(map_err)?;
+            touch_change_time(&mut traw, Timespec::now());
+            self.state.publish_inode_write(&traw).map_err(map_err)?;
         }
         sync_vfs_meta(target, &lock_raw(&t_ops.raw));
 
@@ -843,8 +893,9 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
         parent.set_size(new_size);
+        touch_content_times(&mut parent, Timespec::now());
         refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-        write_raw(&self.state, &parent).map_err(map_err)?;
+        self.state.publish_inode_write(&parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         Ok(())
     }
@@ -934,8 +985,9 @@ impl InodeOps for ExtInodeOps {
                 let nl = ndir.nlink() + 1;
                 ndir.set_nlink(nl);
             }
+            touch_content_times(&mut ndir, Timespec::now());
             refresh_blocks_lo(&self.state, &mut ndir).map_err(map_err)?;
-            write_raw(&self.state, &ndir).map_err(map_err)?;
+            self.state.publish_inode_write(&ndir).map_err(map_err)?;
             sync_vfs_meta(new_dir, &ndir);
         }
         // 从源目录移除 old_name 条目;跨目录时顺手减 nlink
@@ -975,8 +1027,9 @@ impl InodeOps for ExtInodeOps {
             }
             parent.i_block_mut().copy_from_slice(&ib);
             parent.set_flags(flags);
+            touch_content_times(&mut parent, Timespec::now());
             refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
-            write_raw(&self.state, &parent).map_err(map_err)?;
+            self.state.publish_inode_write(&parent).map_err(map_err)?;
             sync_vfs_meta(inode, &parent);
         }
 
@@ -996,6 +1049,15 @@ impl InodeOps for ExtInodeOps {
             dir_wr::update_dotdot(&self.state, tops.ino, tib.2, &tib.0, tib.1, new_dir_ops.ino)
                 .map_err(map_err)?;
         }
+        let target_ops = entry_target
+            .downcast_ops::<ExtInodeOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let mut target_raw = lock_raw(&target_ops.raw);
+        touch_change_time(&mut target_raw, Timespec::now());
+        self.state
+            .publish_inode_write(&target_raw)
+            .map_err(map_err)?;
+        sync_vfs_meta(&entry_target, &target_raw);
         Ok(())
     }
 
@@ -1055,10 +1117,12 @@ impl InodeOps for ExtInodeOps {
             }
             raw.i_block_mut().copy_from_slice(&ib);
             raw.set_flags(flags);
+            self.bump_mapping_generation();
         }
         // new_size > cur_size:不分配新块,读路径返回零;下次 write 触及再补。
         raw.set_size(new_size);
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        touch_content_times(&mut raw, Timespec::now());
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1072,12 +1136,13 @@ impl InodeOps for ExtInodeOps {
         self.check_writable()?;
         let mut raw = lock_raw(&self.raw);
         if let Some(ts) = atime {
-            raw.set_atime_sec(ts.secs);
+            raw.set_atime(ts);
         }
         if let Some(ts) = mtime {
-            raw.set_mtime_sec(ts.secs);
+            raw.set_mtime(ts);
         }
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        touch_change_time(&mut raw, Timespec::now());
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1087,7 +1152,8 @@ impl InodeOps for ExtInodeOps {
         let mut raw = lock_raw(&self.raw);
         let cur = raw.mode();
         raw.set_mode((cur & S_IFMT) | (mode.bits() & 0o7777));
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        touch_change_time(&mut raw, Timespec::now());
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1101,7 +1167,8 @@ impl InodeOps for ExtInodeOps {
         if let Some(g) = gid {
             raw.set_gid(g.0);
         }
-        write_raw(&self.state, &raw).map_err(map_err)?;
+        touch_change_time(&mut raw, Timespec::now());
+        self.state.publish_inode_write(&raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())
     }
@@ -1140,6 +1207,7 @@ impl InodeOps for ExtInodeOps {
                     sb,
                     self.ino,
                     Arc::clone(&self.raw),
+                    Arc::clone(&self.mapping_generation),
                 )))
             }
             FileType::Symlink => Ok(Box::new(crate::file::ExtRegFileOps::new_empty(
@@ -1147,6 +1215,7 @@ impl InodeOps for ExtInodeOps {
                 inode.superblock().ok_or(VfsError::InvalidArgument)?,
                 self.ino,
                 Arc::clone(&self.raw),
+                Arc::clone(&self.mapping_generation),
             ))),
             FileType::Fifo => vfs::pipe::open_fifo(
                 Arc::clone(self.fifo.as_ref().ok_or(VfsError::InvalidArgument)?),
@@ -1177,7 +1246,7 @@ impl InodeOps for ExtInodeOps {
             return;
         }
         clear_deleted_inode(&mut raw);
-        if write_raw(&self.state, &raw).is_err() {
+        if self.state.publish_inode_write(&raw).is_err() {
             return;
         }
         drop(raw);
@@ -1192,3 +1261,34 @@ impl InodeOps for ExtInodeOps {
 }
 
 // (inline helper 已通过 crate::file::ExtRegFileOps 的 read_at 路径按需装载)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inode_times_round_trip_extra_epoch_and_nanoseconds() {
+        let mut raw = RawInode::new(7, alloc::vec![0u8; 256]);
+        raw.bytes[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
+        let atime = Timespec {
+            secs: 2_500_000_000,
+            nsecs: 123_456_789,
+        };
+        let mtime = Timespec {
+            secs: (1i64 << 32) + 123,
+            nsecs: 987_654_321,
+        };
+        let ctime = Timespec {
+            secs: 2_000_000_000,
+            nsecs: 42,
+        };
+        raw.set_atime(atime);
+        raw.set_mtime(mtime);
+        raw.set_ctime(ctime);
+
+        let parsed = parse_inode_meta(&raw.bytes);
+        assert_eq!(parsed.atime, atime);
+        assert_eq!(parsed.mtime, mtime);
+        assert_eq!(parsed.ctime, ctime);
+    }
+}

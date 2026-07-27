@@ -23,6 +23,7 @@ mod efi_stub;
 mod elm_native;
 mod heap_vm;
 mod loader;
+mod mem;
 mod mm;
 mod paging;
 mod random_source;

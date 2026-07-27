@@ -587,7 +587,7 @@ pub enum VirtQueueError {
 /// split virtqueue 的块设备请求通常是 header/data/status 三段；网络队列最多使用
 /// 一个 VirtIO header 加 18 个 packet fragment。覆盖这两种规范上限后，正常 I/O
 /// 提交路径不需要临时堆分配；更长的非网络链仍可退化到 `Vec`。
-const INLINE_DESCRIPTOR_CHAIN: usize = 19;
+pub const INLINE_DESCRIPTOR_CHAIN: usize = 19;
 
 #[derive(Debug)]
 enum DescriptorChainStorage {

@@ -85,6 +85,11 @@ pub(crate) const EXT4_EXTENTS_FL: u32 = 0x00080000;
 pub(crate) const EXT4_INLINE_DATA_FL: u32 = 0x10000000;
 pub(crate) const EXT4_ENCRYPT_FL: u32 = 0x00000800;
 
+/// 块组描述符标志（`bg_flags`）。
+pub(crate) const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
+pub(crate) const EXT4_BG_BLOCK_UNINIT: u16 = 0x0002;
+pub(crate) const EXT4_BG_INODE_ZEROED: u16 = 0x0004;
+
 /// extent header magic
 pub(crate) const EXT4_EXT_MAGIC: u16 = 0xf30a;
 

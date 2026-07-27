@@ -224,7 +224,39 @@ static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
     idle_relax: loongarch64_idle_relax,
 };
 
+// 只有在 idle 任务已经离开调度器临界区、即将执行 `idle 0` 时置位。
+// IPI 处理器据此区分“安全唤醒窗口”和“恰好打断 schedule_once”两种情况，
+// 避免为了修复 idle 丢唤醒而在持有 runqueue 锁时重入调度器。
+static IDLE_WAITING: [AtomicBool; sched::NR_CPUS] =
+    [const { AtomicBool::new(false) }; sched::NR_CPUS];
+
+#[inline]
+fn idle_waiting_slot() -> &'static AtomicBool {
+    let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
+    &IDLE_WAITING[cpu.min(sched::NR_CPUS - 1)]
+}
+
+pub(crate) fn idle_waiting() -> bool {
+    idle_waiting_slot().load(Ordering::Acquire)
+}
+
+/// 重新发布当前 CPU 即将返回 `idle 0` 的等待标记。
+///
+/// idle 可能在 IPI handler 内被切走，之后又从旧 handler 恢复。恢复点仍位于
+/// 原来的 `idle 0` 之前，因此 handler 必须在返回前重新置位，封闭“恢复后收到
+/// 新 IPI、但等待标记已被首次 IPI 消费”的二次丢唤醒窗口。
+pub(crate) fn mark_idle_waiting() {
+    idle_waiting_slot().store(true, Ordering::Release);
+}
+
+/// 消费当前 CPU 的 idle 等待标记。IPI 处理器在切入调度前调用，避免标记
+/// 跨越上下文切换残留为真；idle_relax 返回时的 store(false) 仍保持幂等。
+pub(crate) fn take_idle_waiting() -> bool {
+    idle_waiting_slot().swap(false, Ordering::AcqRel)
+}
+
 fn loongarch64_idle_relax() {
+    mark_idle_waiting();
     unsafe {
         let timer_config: usize;
         core::arch::asm!(
@@ -243,17 +275,18 @@ fn loongarch64_idle_relax() {
         // PRMD.PIE。进入 idle 等待窗口前必须临时打开 CRMD.IE，否则 timer
         // interrupt 不能唤醒 timed sleepers，阻塞 read/select 会永久睡眠。
         LoongArch64InterruptOps::enable_interrupts();
-        if sched::needs_resched(arch_current_cpu_id()) {
-            LoongArch64InterruptOps::disable_interrupts();
-            return;
+        // 若 resched IPI 在 schedule_once 返回后、等待标记发布前到达，处理器
+        // 不会在内核态重入调度；这里的复查负责撤销即将发生的 WFI。
+        if !sched::needs_resched_current() {
+            core::arch::asm!("idle 0", options(nomem, nostack, preserves_flags));
         }
-        core::arch::asm!("idle 0", options(nomem, nostack, preserves_flags));
         LoongArch64InterruptOps::disable_interrupts();
         // QEMU LoongArch 可能在 IPI 唤醒 idle 后先续执行下一条指令，
         // 而不是立即进入 trap。此时 IPI 仍在 ESTAT 中 pending，必须在
         // 关中断后主动消费，否则 shootdown 确认会永久少一代。
         super::smp::handle_ipi();
     }
+    idle_waiting_slot().store(false, Ordering::Release);
 }
 
 /// 把 [`LoongArch64TaskOps::set_kernel_trap_stack`] 拉成裸 `unsafe fn` 指针，

@@ -500,6 +500,37 @@ impl LoongArch64Paging {
         high_root: PhysPageTableRoot,
         asid: usize,
     ) {
+        unsafe { Self::activate_with_asid_roots_inner(low_root, high_root, asid, true, false) };
+    }
+
+    /// 使用独立页表根激活地址空间，并由调用方决定是否需要完整本地 TLB 失效。
+    ///
+    /// 独占硬件 ASID 在没有错过页表更新时可以保留 TLB；ASID 首次使用、复用、
+    /// fallback 共享或激活期间可能漏掉 shootdown 时仍必须传入 `flush_tlb=true`。
+    ///
+    /// # Safety
+    ///
+    /// 除满足 [`Self::activate_with_asid_roots`] 的约束外，传入 `false` 时调用方
+    /// 必须保证当前 CPU 上该硬件 ASID 的缓存 translation 仍属于同一地址空间，
+    /// 且已经观察到所有会替换、撤销或收紧现有映射的页表更新。
+    #[inline]
+    pub(crate) unsafe fn activate_with_asid_roots_cached(
+        low_root: PhysPageTableRoot,
+        high_root: PhysPageTableRoot,
+        asid: usize,
+        flush_tlb: bool,
+    ) {
+        unsafe { Self::activate_with_asid_roots_inner(low_root, high_root, asid, flush_tlb, true) };
+    }
+
+    #[inline]
+    unsafe fn activate_with_asid_roots_inner(
+        low_root: PhysPageTableRoot,
+        high_root: PhysPageTableRoot,
+        asid: usize,
+        flush_tlb: bool,
+        flush_matching_state: bool,
+    ) {
         let pgdl = low_root.as_usize();
         let pgdh = high_root.as_usize();
         let asid_val = asid_bits(asid);
@@ -520,19 +551,29 @@ impl LoongArch64Paging {
                 options(nostack, preserves_flags)
             );
         }
-        if activation_state_matches(
+        let state_matches = activation_state_matches(
             current_pgdl,
             current_pgdh,
             current_asid,
             pgdl,
             pgdh,
             asid_val,
-        ) {
+        );
+        if state_matches && (!flush_tlb || !flush_matching_state) {
             // pthread 等同地址空间切换无需重复写 CSR，更不能承担一次全局 TLB 失效。
+            // 仍显式发布此前观察到的 PTE 写，避免代际协议依赖原子指令偶然提供的
+            // 硬件屏障语义。
+            Self::page_table_barrier();
             return;
         }
 
         Self::page_table_barrier();
+        if state_matches {
+            unsafe {
+                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
+            }
+            return;
+        }
         // 注意：LoongArch 的 csrwr/csrxchg 会把旧 CSR 值写回 rd。
         // 因此每条写 CSR 指令都使用独立 rd 输入并声明为 inout，避免寄存器污染。
         let asid_mask = CSR_ASID_ASID_MASK;
@@ -574,12 +615,13 @@ impl LoongArch64Paging {
             crmd = (crmd | Self::crmd_pg_mask()) & !Self::crmd_da_mask();
             core::arch::asm!(
                 "csrwr {crmd}, {csr_crmd}",
-                // 保守策略：全局刷新当前核 TLB。
-                "invtlb 0x0, $zero, $zero",
                 crmd = inout(reg) crmd => _,
                 csr_crmd = const CSR_CRMD,
                 options(nostack, preserves_flags)
             );
+            if flush_tlb {
+                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
+            }
         }
     }
 

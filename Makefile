@@ -15,6 +15,8 @@ FEATURES ?=
 CONFIG_FILE ?= .config
 INITRAMFS ?=
 INSTALL_MOD_PATH ?=
+KERNEL_MAP ?=
+KERNEL_PUBLISH_OUTPUT ?=
 
 empty :=
 space := $(empty) $(empty)
@@ -54,6 +56,7 @@ PACK_INITRAMFS := scripts/pack-initramfs.sh
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
 ACCT_TEST_SRC := userland/tests/acct.c
+LOONGARCH_SXE_TEST_SRC := userland/tests/loongarch_sxe.c
 INIT_KEYWAIT_SRC := userland/init-keywait.c
 
 ifeq ($(strip $(ARCH)),)
@@ -64,6 +67,23 @@ else ifeq ($(ARCH),$(RV_ARCH))
 SELECTED_ARCHES := $(RV_ARCH)
 else
 $(error ARCH 必须为 loongarch64 或 riscv64)
+endif
+
+ifneq ($(strip $(KERNEL_MAP)),)
+ifneq ($(words $(strip $(KERNEL_MAP))),1)
+$(error KERNEL_MAP 路径不能包含空白字符)
+endif
+KERNEL_MAP_ARCHES := $(sort \
+	$(if $(filter kernel-la _kernel-loongarch64 _compat-kernel-loongarch64,$(MAKECMDGOALS)),$(LA_ARCH)) \
+	$(if $(filter kernel-rv _kernel-riscv64 _compat-kernel-riscv64,$(MAKECMDGOALS)),$(RV_ARCH)) \
+	$(if $(filter kernel default,$(MAKECMDGOALS)),$(SELECTED_ARCHES)) \
+	$(if $(filter all,$(MAKECMDGOALS)),$(LA_ARCH) $(RV_ARCH)) \
+	$(if $(MAKECMDGOALS),,$(SELECTED_ARCHES)))
+ifneq ($(KERNEL_MAP_ARCHES),)
+ifneq ($(words $(KERNEL_MAP_ARCHES)),1)
+$(error KERNEL_MAP 要求一次只构建一个架构；请使用 kernel-la/kernel-rv 或设置 ARCH)
+endif
+endif
 endif
 
 ifneq ($(strip $(INITRAMFS)),)
@@ -129,10 +149,15 @@ _modules-riscv64: cargo-setup $(CONFIG_FILE) $(ELM_TOOL)
 define build_kernel
 	mkdir -p $(BUILD_DIR)/$(1)
 	ELM_BIND_MODULES=$(4) INITRAMFS=$(INITRAMFS) \
+		KERNEL_LINK_MAP="$(if $(strip $(KERNEL_MAP)),$(abspath $(KERNEL_MAP)))" \
+		KERNEL_LINK_OUTPUT="$(if $(strip $(KERNEL_MAP)),$(abspath $(BUILD_DIR)/$(1)/kernel))" \
+		KERNEL_LINK_SOURCE="$(if $(strip $(KERNEL_MAP)),$(abspath $(CARGO_TARGET_DIR)/$(2)/release/kernel))" \
+		KERNEL_LINK_TARGET="$(if $(strip $(KERNEL_MAP)),$(2))" \
+		KERNEL_LINK_ROOT_OUTPUT="$(if $(and $(strip $(KERNEL_MAP)),$(strip $(KERNEL_PUBLISH_OUTPUT))),$(abspath $(KERNEL_PUBLISH_OUTPUT)))" \
 		$(ELM_KERNEL_BUILD) $(BUILD_DIR)/$(1)/modules/modules.manifest \
 		$(BUILD_DIR)/$(1)/modules/integrated.archives \
 		cargo build -p kernel --target $(2) $(FEATURE_ARGS) --release
-	cp $(CARGO_TARGET_DIR)/$(2)/release/kernel $(BUILD_DIR)/$(1)/kernel
+	$(if $(strip $(KERNEL_MAP)),test -s $(BUILD_DIR)/$(1)/kernel,cp $(CARGO_TARGET_DIR)/$(2)/release/kernel $(BUILD_DIR)/$(1)/kernel)
 	@echo "kernel image: $(BUILD_DIR)/$(1)/kernel"
 endef
 
@@ -211,6 +236,19 @@ define build_smp_user_tests
 	fi
 endef
 
+define build_loongarch_sxe_tests
+	@if [ "$(1)" = "$(LA_ARCH)" ] && [ -n "$(filter lazy-sxe-tests,$(FEATURES))" ]; then \
+		rm -rf $(BUILD_DIR)/$(1)/lazy-sxe-user; \
+		mkdir -p $(BUILD_DIR)/$(1)/lazy-sxe-user $(2)/bin; \
+		$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror -mlsx -mno-lasx \
+			-fno-tree-vectorize -fno-tree-slp-vectorize \
+			$(LOONGARCH_SXE_TEST_SRC) \
+			-o $(BUILD_DIR)/$(1)/lazy-sxe-user/loongarch-sxe-test; \
+		$(3)strip $(BUILD_DIR)/$(1)/lazy-sxe-user/loongarch-sxe-test || true; \
+		install -m 0755 $(BUILD_DIR)/$(1)/lazy-sxe-user/loongarch-sxe-test $(2)/bin/; \
+	fi
+endef
+
 define prepare_compat_rootfs
 	$(MAKE) _busybox-$(1)
 	rm -rf $(2)
@@ -222,6 +260,7 @@ define prepare_compat_rootfs
 	rm -f $(2)/lib/elm/*
 	$(call build_elm_user_tools,$(1),$(2),$(5))
 	$(call build_smp_user_tests,$(1),$(2),$(5))
+	$(call build_loongarch_sxe_tests,$(1),$(2),$(5))
 	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
 	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
 		-exec install -m 0644 {} $(2)/lib/elm/ \;
@@ -230,8 +269,8 @@ endef
 
 kernel-la: _modules-loongarch64 $(PACK_INITRAMFS)
 	$(call prepare_compat_rootfs,$(LA_ARCH),$(LA_COMPAT_ROOTFS),$(LA_COMPAT_ROOTFS_SOURCE),$(LA_TARGET),$(LA_CROSS_COMPILE))
-	$(MAKE) _compat-kernel-loongarch64
-	cp $(BUILD_DIR)/$(LA_ARCH)/kernel $(LA_ROOT_KERNEL)
+	$(MAKE) _compat-kernel-loongarch64 $(if $(strip $(KERNEL_MAP)),KERNEL_PUBLISH_OUTPUT=$(abspath $(LA_ROOT_KERNEL)))
+	$(if $(strip $(KERNEL_MAP)),test -s $(LA_ROOT_KERNEL),cp $(BUILD_DIR)/$(LA_ARCH)/kernel $(LA_ROOT_KERNEL))
 
 _compat-kernel-loongarch64:
 	$(eval override INITRAMFS := $(abspath $(BUILD_DIR)/$(LA_ARCH)/compat-initramfs.cpio))
@@ -243,8 +282,8 @@ _compat-kernel-loongarch64:
 
 kernel-rv: _modules-riscv64 $(PACK_INITRAMFS)
 	$(call prepare_compat_rootfs,$(RV_ARCH),$(RV_COMPAT_ROOTFS),$(RV_COMPAT_ROOTFS_SOURCE),$(RV_TARGET),$(RV_CROSS_COMPILE))
-	$(MAKE) _compat-kernel-riscv64
-	cp $(BUILD_DIR)/$(RV_ARCH)/kernel $(RV_ROOT_KERNEL)
+	$(MAKE) _compat-kernel-riscv64 $(if $(strip $(KERNEL_MAP)),KERNEL_PUBLISH_OUTPUT=$(abspath $(RV_ROOT_KERNEL)))
+	$(if $(strip $(KERNEL_MAP)),test -s $(RV_ROOT_KERNEL),cp $(BUILD_DIR)/$(RV_ARCH)/kernel $(RV_ROOT_KERNEL))
 
 _compat-kernel-riscv64:
 	$(eval override INITRAMFS := $(abspath $(BUILD_DIR)/$(RV_ARCH)/compat-initramfs.cpio))
@@ -259,4 +298,5 @@ clean:
 	cargo clean
 	rm -rf $(BUILD_DIR)/loongarch64 $(BUILD_DIR)/riscv64 $(ELM_INTERFACE_ROOT) \
 		$(ELM_TOOL_TARGET)
-	rm -f $(LA_ROOT_KERNEL) $(RV_ROOT_KERNEL)
+	rm -f $(LA_ROOT_KERNEL) $(RV_ROOT_KERNEL) \
+		$(LA_ROOT_KERNEL).lock $(RV_ROOT_KERNEL).lock

@@ -9,7 +9,7 @@ use core::any::Any;
 use core::ops::ControlFlow;
 
 use errno::Errno;
-use sched::{Task, TaskState};
+use sched::Task;
 use vfs::cred::{Credentials, Gid, Uid};
 use vfs::dentry::Dentry;
 use vfs::error::{VfsError, VfsResult};
@@ -65,7 +65,7 @@ impl FileOps for PidfdFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        if matches!(self.task.state(), TaskState::Zombie | TaskState::Dead) {
+        if self.task.exit_event_ready() {
             interest.intersect(PollEvents::POLLIN)
         } else {
             PollEvents::default()
@@ -76,7 +76,7 @@ impl FileOps for PidfdFileOps {
         if !interest.has(PollEvents::POLLIN) {
             return false;
         }
-        if matches!(self.task.state(), TaskState::Zombie | TaskState::Dead) {
+        if self.task.exit_event_ready() {
             return false;
         }
         self.task.exit_waiters.enqueue(task);

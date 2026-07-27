@@ -15,6 +15,8 @@ pub const SAMPLE_SLOTS: usize = 4096;
 pub const TRACE_SLOTS_PER_CPU: usize = 16384;
 pub const TRACE_RECORD_BYTES: usize = 80;
 pub const TRACE_FORMAT_VERSION: usize = 2;
+pub const MAX_TIMING_SHIFT: usize = 16;
+pub const TIMING_SAMPLER: &str = "hashed-bernoulli-v1";
 const SAMPLE_PROBES: usize = 16;
 const TRACE_SLOT_INVALID: u64 = u64::MAX;
 
@@ -54,6 +56,8 @@ pub struct SessionInfo {
     pub event_mask: u64,
     pub sampling_enabled: bool,
     pub trace_enabled: bool,
+    pub timing_shift: usize,
+    pub timing_sampler: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +112,15 @@ pub enum Event {
     NetTxWritable,
     NetWriterRun,
     NetStackRequest,
+    WaitProcessExit,
+    WaitVfork,
+    WaitBlockIo,
+    PageFaultResident,
+    PageFaultPrepare,
+    PageFaultCommit,
+    PageFaultSingle,
+    PageFaultCacheFill,
+    PageFaultUncachedFill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +151,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 58] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -188,6 +201,15 @@ impl Event {
         Self::NetTxWritable,
         Self::NetWriterRun,
         Self::NetStackRequest,
+        Self::WaitProcessExit,
+        Self::WaitVfork,
+        Self::WaitBlockIo,
+        Self::PageFaultResident,
+        Self::PageFaultPrepare,
+        Self::PageFaultCommit,
+        Self::PageFaultSingle,
+        Self::PageFaultCacheFill,
+        Self::PageFaultUncachedFill,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -241,6 +263,15 @@ impl Event {
             Self::NetTxWritable => "net_tx_writable",
             Self::NetWriterRun => "net_writer_run",
             Self::NetStackRequest => "net_stack_request",
+            Self::WaitProcessExit => "wait_process_exit",
+            Self::WaitVfork => "wait_vfork",
+            Self::WaitBlockIo => "wait_block_io",
+            Self::PageFaultResident => "page_fault_resident",
+            Self::PageFaultPrepare => "page_fault_prepare",
+            Self::PageFaultCommit => "page_fault_commit",
+            Self::PageFaultSingle => "page_fault_single",
+            Self::PageFaultCacheFill => "page_fault_cache_fill",
+            Self::PageFaultUncachedFill => "page_fault_uncached_fill",
         }
     }
 
@@ -284,9 +315,18 @@ impl Event {
             | Self::WaitTimer
             | Self::WaitYield
             | Self::WaitOther
+            | Self::WaitProcessExit
+            | Self::WaitVfork
+            | Self::WaitBlockIo
             | Self::WakeupLatency => EventCategory::Wait,
             Self::VfsRead | Self::VfsWrite => EventCategory::Filesystem,
-            Self::PageFault => EventCategory::Memory,
+            Self::PageFault
+            | Self::PageFaultResident
+            | Self::PageFaultPrepare
+            | Self::PageFaultCommit
+            | Self::PageFaultSingle
+            | Self::PageFaultCacheFill
+            | Self::PageFaultUncachedFill => EventCategory::Memory,
             Self::IrqDispatch => EventCategory::Interrupt,
             Self::BlockSubmit | Self::BlockDrain | Self::BlockComplete | Self::BlockWait => {
                 EventCategory::Block
@@ -857,6 +897,7 @@ impl Histogram {
 
 struct Counter {
     calls: AtomicU64,
+    timed_samples: AtomicU64,
     cycles: AtomicU64,
     bytes: AtomicU64,
     packets: AtomicU64,
@@ -873,6 +914,7 @@ impl Counter {
     const fn new() -> Self {
         Self {
             calls: AtomicU64::new(0),
+            timed_samples: AtomicU64::new(0),
             cycles: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             packets: AtomicU64::new(0),
@@ -888,6 +930,7 @@ impl Counter {
 
     fn reset(&self) {
         self.calls.store(0, Ordering::Relaxed);
+        self.timed_samples.store(0, Ordering::Relaxed);
         self.cycles.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
         self.packets.store(0, Ordering::Relaxed);
@@ -906,6 +949,43 @@ struct MetricCounter {
     sum: AtomicU64,
     max: AtomicU64,
     values: Histogram,
+}
+
+/// LoongArch 用户态陷阱入口的累计计数快照。
+///
+/// 这些计数不随 profiling 会话重置；调用方应对测量窗口前后的快照求差。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoongArchUserTrapSnapshot {
+    pub user_syscalls: u64,
+    pub user_other_traps: u64,
+    pub syscall_fpu_saved: u64,
+    pub syscall_lsx_saved: u64,
+    pub other_fpu_saved: u64,
+    pub other_lsx_saved: u64,
+}
+
+/// 每个槽只由对应 CPU 的陷阱入口写入；缓存行隔离避免不同 CPU 互相争用。
+#[repr(align(64))]
+struct LoongArchUserTrapCounters {
+    user_syscalls: AtomicU64,
+    user_other_traps: AtomicU64,
+    syscall_fpu_saved: AtomicU64,
+    syscall_lsx_saved: AtomicU64,
+    other_fpu_saved: AtomicU64,
+    other_lsx_saved: AtomicU64,
+}
+
+impl LoongArchUserTrapCounters {
+    const fn new() -> Self {
+        Self {
+            user_syscalls: AtomicU64::new(0),
+            user_other_traps: AtomicU64::new(0),
+            syscall_fpu_saved: AtomicU64::new(0),
+            syscall_lsx_saved: AtomicU64::new(0),
+            other_fpu_saved: AtomicU64::new(0),
+            other_lsx_saved: AtomicU64::new(0),
+        }
+    }
 }
 
 impl MetricCounter {
@@ -992,6 +1072,8 @@ static TRACE_SLOTS: [[TraceSlot; TRACE_SLOTS_PER_CPU]; MAX_CPUS] =
     [const { [const { TraceSlot::new() }; TRACE_SLOTS_PER_CPU] }; MAX_CPUS];
 static TRACE_HEADS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static OVERWRITTEN_TRACE_RECORDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static LOONGARCH_USER_TRAPS: [LoongArchUserTrapCounters; MAX_CPUS] =
+    [const { LoongArchUserTrapCounters::new() }; MAX_CPUS];
 
 static STATE: AtomicUsize = AtomicUsize::new(SessionState::Idle as usize);
 static SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -1001,6 +1083,7 @@ static COUNTER_HZ: AtomicU64 = AtomicU64::new(0);
 static EVENT_MASK: AtomicU64 = AtomicU64::new(ALL_EVENT_MASK);
 static SAMPLING_ENABLED: AtomicUsize = AtomicUsize::new(1);
 static TRACE_ENABLED: AtomicUsize = AtomicUsize::new(1);
+static TIMING_SHIFT: AtomicUsize = AtomicUsize::new(0);
 static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_CPU_NS: AtomicUsize = AtomicUsize::new(0);
@@ -1058,6 +1141,8 @@ pub fn session_info() -> SessionInfo {
         event_mask: event_mask(),
         sampling_enabled: sampling_enabled(),
         trace_enabled: trace_enabled(),
+        timing_shift: timing_shift(),
+        timing_sampler: timing_sampler(),
     }
 }
 
@@ -1087,6 +1172,45 @@ pub fn trace_enabled() -> bool {
 
 pub fn set_trace_enabled(enabled: bool) {
     TRACE_ENABLED.store(usize::from(enabled), Ordering::Release);
+}
+
+pub fn timing_shift() -> usize {
+    TIMING_SHIFT.load(Ordering::Acquire)
+}
+
+pub fn effective_timing_shift() -> usize {
+    if trace_enabled() { 0 } else { timing_shift() }
+}
+
+pub fn set_timing_shift(shift: usize) {
+    TIMING_SHIFT.store(shift.min(MAX_TIMING_SHIFT), Ordering::Release);
+}
+
+pub const fn timing_sampler() -> &'static str {
+    TIMING_SAMPLER
+}
+
+fn timing_sample_hash(call_index: u64, cpu: usize, event: Event) -> u64 {
+    // 每个 CPU/event 构成独立且可复现的调用流。使用 SplitMix64 的终结混合，
+    // 避免固定步长抽样与循环调用序列产生相位锁定。
+    let stream = ((cpu as u64) << 32) | event as u64;
+    let mut value = call_index
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(stream.wrapping_mul(0xd1b5_4a32_d192_ed03));
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn timing_sample_selected(call_index: u64, cpu: usize, event: Event, shift: usize) -> bool {
+    shift == 0 || timing_sample_hash(call_index, cpu, event) >> (u64::BITS as usize - shift) == 0
+}
+
+fn call_is_timed(call_index: u64, cpu: usize, event: Event) -> bool {
+    if trace_enabled() {
+        return true;
+    }
+    timing_sample_selected(call_index, cpu, event, timing_shift())
 }
 
 fn freeze_internal(next_state: SessionState) {
@@ -1248,7 +1372,10 @@ impl Drop for SpanGuard {
 }
 
 pub fn enter_span() -> SpanGuard {
-    if !enabled() || installed_fn(&CURRENT_SPAN_ID) == 0 || installed_fn(&SET_CURRENT_SPAN_ID) == 0
+    if !enabled()
+        || !trace_enabled()
+        || installed_fn(&CURRENT_SPAN_ID) == 0
+        || installed_fn(&SET_CURRENT_SPAN_ID) == 0
     {
         return SpanGuard {
             previous: 0,
@@ -1278,6 +1405,7 @@ pub struct Scope {
     trace_arg0: u64,
     trace_arg1: u64,
     active: bool,
+    timed: bool,
     generation: u64,
     start_cpu: usize,
     start_task_id: u64,
@@ -1321,18 +1449,29 @@ impl Scope {
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        if !self.active || self.generation != generation() {
+        if !self.active {
+            return;
+        }
+        let Some(_guard) = begin_write(Some(self.generation)) else {
+            return;
+        };
+        let counter = &COUNTERS[self.start_cpu][self.event as usize];
+        if self.bytes != 0 {
+            counter.bytes.fetch_add(self.bytes, Ordering::Relaxed);
+        }
+        if self.packets != 0 {
+            counter.packets.fetch_add(self.packets, Ordering::Relaxed);
+        }
+        if !self.timed {
             return;
         }
         let on_cpu_ns = current_task_cpu_ns().saturating_sub(self.start_on_cpu_ns);
         let cycles = read_counter().wrapping_sub(self.start_cycles);
-        record_scope(
+        record_timed_scope(
             self.event,
             self.start_cycles,
             cycles,
             on_cpu_ns,
-            self.bytes,
-            self.packets,
             self.start_cpu,
             self.start_task_id,
             self.span_id,
@@ -1344,21 +1483,37 @@ impl Drop for Scope {
 }
 
 pub fn scope(event: Event) -> Scope {
-    let generation = generation();
-    let active = enabled() && event_enabled(event) && installed_fn(&READ_COUNTER) != 0;
+    let scope_generation = generation();
+    let start_cpu = current_cpu().min(MIXED_CPU);
+    let (active, call_index) = if event_enabled(event) {
+        if let Some(_guard) = begin_write(Some(scope_generation)) {
+            let call_index = COUNTERS[start_cpu][event as usize]
+                .calls
+                .fetch_add(1, Ordering::Relaxed);
+            (true, call_index)
+        } else {
+            (false, 0)
+        }
+    } else {
+        (false, 0)
+    };
+    let trace = active && trace_enabled();
+    let timed =
+        active && installed_fn(&READ_COUNTER) != 0 && call_is_timed(call_index, start_cpu, event);
     Scope {
         event,
-        start_cycles: if active { read_counter() } else { 0 },
-        start_on_cpu_ns: if active { current_task_cpu_ns() } else { 0 },
+        start_cycles: if timed { read_counter() } else { 0 },
+        start_on_cpu_ns: if timed { current_task_cpu_ns() } else { 0 },
         bytes: 0,
         packets: 0,
         trace_arg0: 0,
         trace_arg1: 0,
         active,
-        generation,
-        start_cpu: current_cpu(),
-        start_task_id: if active { current_task_id() } else { 0 },
-        span_id: if active { current_span_id() } else { 0 },
+        timed,
+        generation: scope_generation,
+        start_cpu,
+        start_task_id: if trace { current_task_id() } else { 0 },
+        span_id: if trace { current_span_id() } else { 0 },
     }
 }
 
@@ -1374,7 +1529,9 @@ fn cycles_to_ns(cycles: u64) -> u64 {
         .saturating_add(remainder.saturating_mul(1_000_000_000) / hz)
 }
 
-struct WriteGuard;
+struct WriteGuard {
+    generation: u64,
+}
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
@@ -1397,7 +1554,9 @@ fn begin_write(expected_generation: Option<u64>) -> Option<WriteGuard> {
         ACTIVE_WRITERS.fetch_sub(1, Ordering::Release);
         return None;
     }
-    Some(WriteGuard)
+    Some(WriteGuard {
+        generation: observed_generation,
+    })
 }
 
 fn trace_metadata(cpu: usize, kind: TraceKind, event: Event) -> u64 {
@@ -1519,13 +1678,11 @@ pub fn trace_task_spawn(parent_task_id: u64, child_task_id: u64) {
     );
 }
 
-fn record_scope(
+fn record_timed_scope(
     event: Event,
     start_cycles: u64,
     cycles: u64,
     on_cpu_ns: u64,
-    bytes: u64,
-    packets: u64,
     start_cpu: usize,
     task_id: u64,
     span_id: u64,
@@ -1533,34 +1690,22 @@ fn record_scope(
     trace_arg1: u64,
     scope_generation: u64,
 ) {
-    if !event_enabled(event) {
-        return;
+    let current_slot = current_cpu().min(MIXED_CPU);
+    let trace_cpu = current_slot.min(MAX_CPUS - 1);
+    let counter = &COUNTERS[start_cpu][event as usize];
+    if current_slot != start_cpu {
+        counter.migrations.fetch_add(1, Ordering::Relaxed);
     }
-    let Some(_guard) = begin_write(Some(scope_generation)) else {
-        return;
-    };
     let wall_ns = cycles_to_ns(cycles);
     let on_cpu_ns = on_cpu_ns.min(wall_ns);
-    let trace_cpu = current_cpu().min(MAX_CPUS - 1);
-    let cpu = if trace_cpu == start_cpu {
-        trace_cpu
-    } else {
-        MIXED_CPU
-    };
-    let counter = &COUNTERS[cpu][event as usize];
-    counter.calls.fetch_add(1, Ordering::Relaxed);
+    counter.timed_samples.fetch_add(1, Ordering::Relaxed);
     counter.cycles.fetch_add(cycles, Ordering::Relaxed);
-    counter.bytes.fetch_add(bytes, Ordering::Relaxed);
-    counter.packets.fetch_add(packets, Ordering::Relaxed);
     counter.max_cycles.fetch_max(cycles, Ordering::Relaxed);
     counter.wall_ns.fetch_add(wall_ns, Ordering::Relaxed);
     counter.on_cpu_ns.fetch_add(on_cpu_ns, Ordering::Relaxed);
     counter
         .off_cpu_ns
         .fetch_add(wall_ns.saturating_sub(on_cpu_ns), Ordering::Relaxed);
-    if cpu == MIXED_CPU {
-        counter.migrations.fetch_add(1, Ordering::Relaxed);
-    }
     counter.max_latency_ns.fetch_max(wall_ns, Ordering::Relaxed);
     counter.latency.observe(wall_ns);
     push_trace_record(
@@ -1613,12 +1758,13 @@ pub fn record_with_trace_args_and_span(
     if !event_enabled(event) {
         return;
     }
-    let Some(_guard) = begin_write(None) else {
+    let Some(guard) = begin_write(None) else {
         return;
     };
     let ns = cycles_to_ns(cycles);
     let counter = &COUNTERS[current_cpu()][event as usize];
     counter.calls.fetch_add(1, Ordering::Relaxed);
+    counter.timed_samples.fetch_add(1, Ordering::Relaxed);
     counter.cycles.fetch_add(cycles, Ordering::Relaxed);
     counter.bytes.fetch_add(bytes, Ordering::Relaxed);
     counter.packets.fetch_add(packets, Ordering::Relaxed);
@@ -1635,7 +1781,7 @@ pub fn record_with_trace_args_and_span(
             current_cpu(),
             end_cycles.wrapping_sub(cycles),
             cycles,
-            generation(),
+            guard.generation,
             current_task_id(),
             span_id,
             TraceKind::Scope,
@@ -1655,12 +1801,17 @@ pub fn record_duration_on_cpu(event: Event, duration_ns: u64, cpu: usize) {
     if !event_enabled(event) {
         return;
     }
-    let Some(_guard) = begin_write(None) else {
+    let record_generation = generation();
+    let Some(_guard) = begin_write(Some(record_generation)) else {
         return;
     };
     let cpu = cpu.min(MIXED_CPU);
     let counter = &COUNTERS[cpu][event as usize];
-    counter.calls.fetch_add(1, Ordering::Relaxed);
+    let call_index = counter.calls.fetch_add(1, Ordering::Relaxed);
+    if !call_is_timed(call_index, cpu, event) {
+        return;
+    }
+    counter.timed_samples.fetch_add(1, Ordering::Relaxed);
     counter.wall_ns.fetch_add(duration_ns, Ordering::Relaxed);
     counter.off_cpu_ns.fetch_add(duration_ns, Ordering::Relaxed);
     counter
@@ -1683,6 +1834,7 @@ pub fn observe(metric: Metric, value: u64) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub calls: u64,
+    pub timed_samples: u64,
     pub cycles: u64,
     pub bytes: u64,
     pub packets: u64,
@@ -1699,6 +1851,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             calls: 0,
+            timed_samples: 0,
             cycles: 0,
             bytes: 0,
             packets: 0,
@@ -1720,6 +1873,7 @@ pub fn snapshot(cpu: usize, event: Event) -> Snapshot {
     let counter = &COUNTERS[cpu][event as usize];
     Snapshot {
         calls: counter.calls.load(Ordering::Relaxed),
+        timed_samples: counter.timed_samples.load(Ordering::Relaxed),
         cycles: counter.cycles.load(Ordering::Relaxed),
         bytes: counter.bytes.load(Ordering::Relaxed),
         packets: counter.packets.load(Ordering::Relaxed),
@@ -1765,6 +1919,64 @@ pub fn metric_snapshot(cpu: usize, metric: Metric) -> MetricSnapshot {
     }
 }
 
+#[inline(always)]
+fn increment_raw(counter: &AtomicU64) {
+    // 每个槽只有对应 CPU 的陷阱入口写入，因而无需代价更高的原子 RMW。
+    let value = counter.load(Ordering::Relaxed);
+    counter.store(value.wrapping_add(1), Ordering::Relaxed);
+}
+
+/// 记录一次 LoongArch 用户态陷阱及入口实际保存的扩展寄存器状态。
+#[inline(always)]
+pub fn record_loongarch_user_trap(cpu: usize, syscall: bool, fpu_saved: bool, lsx_saved: bool) {
+    let Some(counters) = LOONGARCH_USER_TRAPS.get(cpu) else {
+        return;
+    };
+    if syscall {
+        increment_raw(&counters.user_syscalls);
+        if fpu_saved {
+            increment_raw(&counters.syscall_fpu_saved);
+        }
+        if lsx_saved {
+            increment_raw(&counters.syscall_lsx_saved);
+        }
+    } else {
+        increment_raw(&counters.user_other_traps);
+        if fpu_saved {
+            increment_raw(&counters.other_fpu_saved);
+        }
+        if lsx_saved {
+            increment_raw(&counters.other_lsx_saved);
+        }
+    }
+}
+
+/// 汇总所有 CPU 的 LoongArch 用户态陷阱累计计数。
+pub fn loongarch_user_trap_snapshot() -> LoongArchUserTrapSnapshot {
+    let mut snapshot = LoongArchUserTrapSnapshot::default();
+    for counters in &LOONGARCH_USER_TRAPS {
+        snapshot.user_syscalls = snapshot
+            .user_syscalls
+            .wrapping_add(counters.user_syscalls.load(Ordering::Relaxed));
+        snapshot.user_other_traps = snapshot
+            .user_other_traps
+            .wrapping_add(counters.user_other_traps.load(Ordering::Relaxed));
+        snapshot.syscall_fpu_saved = snapshot
+            .syscall_fpu_saved
+            .wrapping_add(counters.syscall_fpu_saved.load(Ordering::Relaxed));
+        snapshot.syscall_lsx_saved = snapshot
+            .syscall_lsx_saved
+            .wrapping_add(counters.syscall_lsx_saved.load(Ordering::Relaxed));
+        snapshot.other_fpu_saved = snapshot
+            .other_fpu_saved
+            .wrapping_add(counters.other_fpu_saved.load(Ordering::Relaxed));
+        snapshot.other_lsx_saved = snapshot
+            .other_lsx_saved
+            .wrapping_add(counters.other_lsx_saved.load(Ordering::Relaxed));
+    }
+    snapshot
+}
+
 pub const fn histogram_bucket(value: u64) -> usize {
     if value == 0 {
         return 0;
@@ -1791,6 +2003,17 @@ pub fn histogram_percentile(histogram: &[u64; HISTOGRAM_BUCKETS], percentile: u6
         }
     }
     1u64 << (HISTOGRAM_BUCKETS - 2)
+}
+
+pub fn estimate_total(sampled: u64, calls: u64, timed_samples: u64) -> u64 {
+    if timed_samples == 0 {
+        return 0;
+    }
+    let estimated = (sampled as u128)
+        .saturating_mul(calls as u128)
+        .checked_div(timed_samples as u128)
+        .unwrap_or(0);
+    estimated.min(u64::MAX as u128) as u64
 }
 
 /// 在 timer IRQ 中记录被打断的 PC。函数只执行有界原子探测。
@@ -1999,6 +2222,181 @@ mod tests {
     }
 
     #[test]
+    fn timing_sampling_keeps_exact_counts_and_trace_forces_full_timing() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
+        TEST_SPAN_ID.store(77, Ordering::Relaxed);
+        CLOCK.store(10, Ordering::Relaxed);
+        TASK_CPU_NS.store(100, Ordering::Relaxed);
+        set_trace_enabled(false);
+        set_timing_shift(2);
+        start();
+
+        let span = enter_span();
+        assert_eq!(span.id(), 0);
+        assert_eq!(current_span_id(), 77);
+        for _ in 0..256 {
+            drop(scope(Event::VfsRead).bytes(3).packets(1));
+        }
+        let sampled = snapshot(1, Event::VfsRead);
+        assert_eq!(sampled.calls, 256);
+        assert!((48..=80).contains(&sampled.timed_samples));
+        assert_eq!(sampled.cycles, sampled.timed_samples * 7);
+        assert_eq!(sampled.wall_ns, sampled.timed_samples * 7);
+        assert_eq!(sampled.on_cpu_ns, sampled.timed_samples * 3);
+        assert_eq!(sampled.bytes, 768);
+        assert_eq!(sampled.packets, 256);
+        assert_eq!(
+            CLOCK.load(Ordering::Relaxed),
+            10 + sampled.timed_samples * 14
+        );
+        assert_eq!(trace_window(1).next_sequence, 0);
+        for duration in 1..=256 {
+            record_duration(Event::WaitTimer, duration);
+        }
+        let waits = snapshot(1, Event::WaitTimer);
+        assert_eq!(waits.calls, 256);
+        assert!((48..=80).contains(&waits.timed_samples));
+        assert_eq!(waits.wall_ns, waits.off_cpu_ns);
+
+        set_trace_enabled(true);
+        set_timing_shift(MAX_TIMING_SHIFT);
+        start();
+        for _ in 0..3 {
+            drop(scope(Event::VfsRead));
+        }
+        let traced = snapshot(1, Event::VfsRead);
+        assert_eq!(traced.calls, 3);
+        assert_eq!(traced.timed_samples, 3);
+        assert_eq!(trace_window(1).next_sequence, 3);
+        let span = enter_span();
+        assert_ne!(span.id(), 0);
+        drop(span);
+        assert_eq!(current_span_id(), 77);
+
+        set_timing_shift(0);
+        set_trace_enabled(true);
+        stop();
+    }
+
+    #[test]
+    fn hashed_timing_sampling_has_expected_ratio_without_fixed_phase() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        set_trace_enabled(false);
+        set_timing_shift(4);
+
+        let selected = (0..65_536u64)
+            .filter(|call| timing_sample_selected(*call, 1, Event::VfsRead, 4))
+            .collect::<std::vec::Vec<_>>();
+        assert!((3_800..=4_400).contains(&selected.len()));
+        assert_ne!(selected.first().copied(), Some(0));
+        assert!(selected.iter().any(|call| call & 15 != 0));
+        assert!(selected.windows(2).any(|pair| pair[1] - pair[0] != 16));
+        assert_eq!(
+            selected,
+            (0..65_536u64)
+                .filter(|call| timing_sample_selected(*call, 1, Event::VfsRead, 4))
+                .collect::<std::vec::Vec<_>>()
+        );
+
+        let first_call_streams = Event::ALL
+            .iter()
+            .flat_map(|event| (0..MAX_CPUS).map(move |cpu| (cpu, *event)))
+            .filter(|(cpu, event)| timing_sample_selected(0, *cpu, *event, 4))
+            .count();
+        assert!(first_call_streams > 0);
+        assert!(first_call_streams < Event::ALL.len() * MAX_CPUS);
+        assert_eq!(timing_sampler(), "hashed-bernoulli-v1");
+
+        set_timing_shift(0);
+        set_trace_enabled(true);
+    }
+
+    #[test]
+    fn freeze_and_reset_wait_for_writers_without_crossing_generations() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
+        set_trace_enabled(false);
+        start();
+        let counter = &COUNTERS[1][Event::VfsWrite as usize];
+
+        let freeze_generation = generation();
+        let freeze_guard = begin_write(Some(freeze_generation)).expect("active freeze writer");
+        let (freeze_tx, freeze_rx) = std::sync::mpsc::channel();
+        let freeze_thread = std::thread::spawn(move || {
+            freeze();
+            freeze_tx.send(()).unwrap();
+        });
+        while state() != SessionState::Frozen || generation() == freeze_generation {
+            std::thread::yield_now();
+        }
+        assert_eq!(ACTIVE_WRITERS.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            freeze_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        counter.calls.fetch_add(1, Ordering::Relaxed);
+        counter.bytes.fetch_add(64, Ordering::Relaxed);
+        counter.packets.fetch_add(1, Ordering::Relaxed);
+        drop(freeze_guard);
+        freeze_thread.join().unwrap();
+        freeze_rx.recv().unwrap();
+        let frozen = snapshot(1, Event::VfsWrite);
+        assert_eq!((frozen.calls, frozen.bytes, frozen.packets), (1, 64, 1));
+
+        resume();
+        let old_session = session_id();
+        let old_generation = generation();
+        let reset_guard = begin_write(Some(old_generation)).expect("active reset writer");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reset_thread = std::thread::spawn(move || {
+            reset();
+            done_tx.send(()).unwrap();
+        });
+
+        while state() != SessionState::Frozen || generation() == old_generation {
+            std::thread::yield_now();
+        }
+        assert_eq!(ACTIVE_WRITERS.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        counter.calls.fetch_add(1, Ordering::Relaxed);
+        counter.bytes.fetch_add(4096, Ordering::Relaxed);
+        counter.packets.fetch_add(2, Ordering::Relaxed);
+        drop(reset_guard);
+        reset_thread.join().unwrap();
+        done_rx.recv().unwrap();
+
+        assert_eq!(state(), SessionState::Running);
+        assert!(session_id() > old_session);
+        assert_eq!(snapshot(1, Event::VfsWrite), Snapshot::default());
+        drop(scope(Event::VfsWrite).bytes(8).packets(1));
+        let fresh = snapshot(1, Event::VfsWrite);
+        assert_eq!((fresh.calls, fresh.bytes, fresh.packets), (1, 8, 1));
+
+        set_trace_enabled(true);
+        stop();
+    }
+
+    #[test]
     fn spans_are_inherited_restored_and_can_be_recorded_explicitly() {
         let _lock = TEST_LOCK.lock().unwrap();
         TEST_SPAN_ID.store(77, Ordering::Relaxed);
@@ -2159,7 +2557,7 @@ mod tests {
     }
 
     #[test]
-    fn migrated_scope_is_accounted_in_mixed_cpu_slot() {
+    fn migrated_scope_stays_with_start_cpu_and_counts_migration() {
         let _lock = TEST_LOCK.lock().unwrap();
         static CPU: AtomicUsize = AtomicUsize::new(0);
         fn changing_cpu() -> usize {
@@ -2179,7 +2577,11 @@ mod tests {
         let scope = scope(Event::NetProtocolTurn);
         CPU.store(1, Ordering::Relaxed);
         drop(scope);
-        assert_eq!(snapshot(MIXED_CPU, Event::NetProtocolTurn).migrations, 1);
+        let value = snapshot(0, Event::NetProtocolTurn);
+        assert_eq!(value.calls, 1);
+        assert_eq!(value.timed_samples, 1);
+        assert_eq!(value.migrations, 1);
+        assert_eq!(snapshot(MIXED_CPU, Event::NetProtocolTurn).calls, 0);
         stop();
     }
 
@@ -2205,6 +2607,28 @@ mod tests {
         assert_eq!(histogram_percentile(&timer.latency, 50), 1u64 << 32);
         set_event_mask(ALL_EVENT_MASK);
         stop();
+    }
+
+    #[test]
+    fn buildstorm_wait_events_are_appended_without_renumbering_existing_events() {
+        assert_eq!(Event::BlockWait as usize, 39);
+        assert_eq!(Event::NetStackRequest as usize, 48);
+        assert_eq!(Event::WaitProcessExit as usize, 49);
+        assert_eq!(Event::WaitVfork as usize, 50);
+        assert_eq!(Event::WaitBlockIo as usize, 51);
+        assert_eq!(Event::PageFaultResident as usize, 52);
+        assert_eq!(Event::PageFaultPrepare as usize, 53);
+        assert_eq!(Event::PageFaultCommit as usize, 54);
+        assert_eq!(Event::PageFaultSingle as usize, 55);
+        assert_eq!(Event::PageFaultCacheFill as usize, 56);
+        assert_eq!(Event::PageFaultUncachedFill as usize, 57);
+        assert_eq!(Event::ALL.len(), 58);
+        assert_eq!(Event::from_id(52), Some(Event::PageFaultResident));
+        assert_eq!(Event::from_id(55), Some(Event::PageFaultSingle));
+        assert_eq!(Event::from_id(57), Some(Event::PageFaultUncachedFill));
+        assert_eq!(Event::from_id(49), Some(Event::WaitProcessExit));
+        assert_eq!(Event::from_id(50), Some(Event::WaitVfork));
+        assert_eq!(Event::from_id(51), Some(Event::WaitBlockIo));
     }
 
     #[test]
