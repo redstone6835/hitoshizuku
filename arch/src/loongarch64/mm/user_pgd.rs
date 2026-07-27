@@ -336,7 +336,7 @@ unsafe fn map_pages(
         false,
         phys_to_virt,
         allocate_page_table_page,
-        false, // fresh_range=false: conservative, keep per-table fences
+        true, // fresh_range=true: pages are freshly allocated, skip intermediate fences
     )
 }
 
