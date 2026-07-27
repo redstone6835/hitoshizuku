@@ -350,6 +350,7 @@ unsafe fn map_user_page_batch(
         false,
         phys_to_virt,
         allocate_page_table_page,
+        true,
     );
     // 批次即使只安装了前缀，也可能发布新的中间页表；首次激活仍需 fence。
     inner.needs_page_table_fence.store(true, Ordering::Release);

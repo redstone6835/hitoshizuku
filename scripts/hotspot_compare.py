@@ -575,32 +575,38 @@ def normalize_counts(
 def build_comparison_table(
     mygo_norm: Dict[str, float],
     linux_counts: Dict[str, float],
+    third_counts: Optional[Dict[str, float]] = None,
 ) -> List[dict]:
     """
-    Merge MyGO and Linux per-function counts into a unified ranked table.
+    Merge MyGO, Linux, and optional third-system per-function counts.
 
     Returns a list of dicts sorted by mygo_norm_pct descending.
-    Each dict has keys:
-        rank, function, mygo_insns, linux_insns, ratio,
-        mygo_pct, linux_pct
     """
     all_fns = set(mygo_norm) | set(linux_counts)
+    if third_counts:
+        all_fns |= set(third_counts)
     mygo_total = sum(mygo_norm.values()) or 1.0
     linux_total = sum(linux_counts.values()) or 1.0
+    third_total = sum(third_counts.values()) if third_counts else 1.0
 
     rows = []
     for fn in all_fns:
         m = mygo_norm.get(fn, 0.0)
         l = linux_counts.get(fn, 0.0)
-        ratio = (m / l) if l > 0 else float("inf")
+        t = third_counts.get(fn, 0.0) if third_counts else None
+        ratio_linux = (m / l) if l > 0 else float("inf")
+        ratio_third = (m / t) if (t and t > 0) else (float("inf") if t == 0 else None)
         rows.append(
             {
                 "function": fn,
                 "mygo_insns": m,
                 "linux_insns": l,
-                "ratio": ratio,
+                "third_insns": t,
+                "ratio_linux": ratio_linux,
+                "ratio_third": ratio_third,
                 "mygo_pct": 100.0 * m / mygo_total,
                 "linux_pct": 100.0 * l / linux_total,
+                "third_pct": (100.0 * t / third_total) if t is not None else None,
             }
         )
 
@@ -610,28 +616,53 @@ def build_comparison_table(
     return rows
 
 
-def print_table(rows: List[dict], out) -> None:
-    """Print the comparison table to `out`."""
-    hdr = (
-        f"{'Rank':>4}  {'Function':<42}  {'MyGO-Insns':>10}  "
-        f"{'Linux-Insns':>11}  {'Ratio':>6}  {'MyGO%':>6}  {'Linux%':>6}"
-    )
+def print_table(rows: List[dict], out, third_label: str = "FreeBSD") -> None:
+    """Print the comparison table to `out`. Adds third column if rows contain third_insns."""
+    has_third = rows and rows[0].get("third_insns") is not None
+    if has_third:
+        hdr = (
+            f"{'Rank':>4}  {'Function':<42}  {'MyGO-Insns':>10}  "
+            f"{'Linux-Insns':>11}  {third_label+'-Insns':>14}  "
+            f"{'vs Linux':>8}  {'vs '+third_label:>10}  {'MyGO%':>6}  {'Linux%':>6}"
+        )
+    else:
+        hdr = (
+            f"{'Rank':>4}  {'Function':<42}  {'MyGO-Insns':>10}  "
+            f"{'Linux-Insns':>11}  {'Ratio':>6}  {'MyGO%':>6}  {'Linux%':>6}"
+        )
     sep = "-" * len(hdr)
     out.write(hdr + "\n")
     out.write(sep + "\n")
 
     for row in rows:
-        ratio_str = (
-            f"{row['ratio']:.2f}x" if row["ratio"] != float("inf") else "  inf"
-        )
-        out.write(
-            f"{row['rank']:>4}  {row['function']:<42}  "
-            f"{fmt_insns(row['mygo_insns']):>10}  "
-            f"{fmt_insns(row['linux_insns']):>11}  "
-            f"{ratio_str:>6}  "
-            f"{row['mygo_pct']:>5.1f}%  "
-            f"{row['linux_pct']:>5.1f}%\n"
-        )
+        if has_third:
+            rl = row["ratio_linux"]
+            rt = row["ratio_third"]
+            rl_s = f"{rl:.2f}x" if rl != float("inf") else "  inf"
+            rt_s = (f"{rt:.2f}x" if rt is not None and rt != float("inf")
+                    else ("  inf" if rt == float("inf") else "  n/a"))
+            t_insns = row["third_insns"] if row["third_insns"] is not None else 0.0
+            t_pct = row["third_pct"] if row["third_pct"] is not None else 0.0
+            out.write(
+                f"{row['rank']:>4}  {row['function']:<42}  "
+                f"{fmt_insns(row['mygo_insns']):>10}  "
+                f"{fmt_insns(row['linux_insns']):>11}  "
+                f"{fmt_insns(t_insns):>14}  "
+                f"{rl_s:>8}  {rt_s:>10}  "
+                f"{row['mygo_pct']:>5.1f}%  "
+                f"{row['linux_pct']:>5.1f}%\n"
+            )
+        else:
+            ratio = row.get("ratio_linux", row.get("ratio", float("inf")))
+            ratio_str = f"{ratio:.2f}x" if ratio != float("inf") else "  inf"
+            out.write(
+                f"{row['rank']:>4}  {row['function']:<42}  "
+                f"{fmt_insns(row['mygo_insns']):>10}  "
+                f"{fmt_insns(row['linux_insns']):>11}  "
+                f"{ratio_str:>6}  "
+                f"{row['mygo_pct']:>5.1f}%  "
+                f"{row['linux_pct']:>5.1f}%\n"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +753,13 @@ def main() -> None:
     parser.add_argument("--linux-elf", type=str, help="Linux ELF file for objdump")
     parser.add_argument("--mygo-map", type=str, help="MyGO symbol map (LLD or System.map)")
     parser.add_argument("--linux-map", type=str, help="Linux symbol map (LLD or System.map)")
+    # Third system (e.g. FreeBSD) — all optional
+    # FreeBSD nm output uses the same format as Linux System.map and is supported natively.
+    parser.add_argument("--third-summary", type=str, help="Third system summary.json (e.g. FreeBSD, optional)")
+    parser.add_argument("--third-histogram", type=str, help="Third system histogram JSON (optional)")
+    parser.add_argument("--third-elf", type=str, help="Third system ELF for objdump")
+    parser.add_argument("--third-map", type=str, help="Third system symbol map (nm format, same as Linux System.map)")
+    parser.add_argument("--third-label", type=str, default="FreeBSD", help="Label for third system (default: FreeBSD)")
     parser.add_argument("--top-n", type=int, default=20, help="Number of top functions to annotate (default: 20)")
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
 
@@ -797,6 +835,7 @@ def main() -> None:
     data_source = "unknown"
     mygo_counts: Dict[str, float] = {}
     linux_counts: Dict[str, float] = {}
+    third_counts: Optional[Dict[str, float]] = None
 
     if args.mygo_histogram and os.path.exists(args.mygo_histogram):
         print("Loading MyGO histogram...", file=sys.stderr)
@@ -820,12 +859,33 @@ def main() -> None:
         if data_source == "histogram":
             data_source = "mixed (MyGO=histogram, Linux=samples)"
 
+    # Load optional third system (e.g. FreeBSD)
+    third_label = getattr(args, "third_label", "FreeBSD")
+    third_st: Optional[SymbolTable] = None
+    if getattr(args, "third_summary", None):
+        third_summary = load_summary(args.third_summary)
+        third_map = getattr(args, "third_map", None)
+        if third_map and os.path.exists(third_map):
+            print(f"Loading {third_label} symbol table...", file=sys.stderr)
+            try:
+                third_st = SymbolTable.from_file(third_map)
+                print(f"  {third_label}: loaded {len(third_st._addrs)} symbols", file=sys.stderr)
+            except Exception as e:
+                print(f"  warning: could not load {third_label} symbol map: {e}", file=sys.stderr)
+        third_hist = getattr(args, "third_histogram", None)
+        if third_hist and os.path.exists(third_hist):
+            print(f"Loading {third_label} histogram...", file=sys.stderr)
+            third_counts_int = load_histogram(third_hist, third_st)
+            third_counts = {k: float(v) for k, v in third_counts_int.items()}
+        else:
+            third_counts = hotspot_proxy(third_summary)
+
     # Normalize MyGO counts
     mygo_norm = normalize_counts(mygo_counts, norm_factor)
 
     # Build comparison table
     print("Building comparison table...", file=sys.stderr)
-    rows = build_comparison_table(mygo_norm, linux_counts)
+    rows = build_comparison_table(mygo_norm, linux_counts, third_counts)
 
     # Open output
     out = sys.stdout
@@ -843,7 +903,7 @@ def main() -> None:
         out.write("\n")
 
         # Print table
-        print_table(rows, out)
+        print_table(rows, out, third_label=third_label)
         out.write("\n")
 
         # Invisible overhead analysis

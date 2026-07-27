@@ -38,7 +38,7 @@ const REFILL_BATCH: usize = 8;
 const BITMAP_WORDS: usize = 8;
 const INVALID_SLAB_NODE: usize = 0;
 const MAX_GROW_ATTEMPTS: usize = 3;
-const MAX_EMPTY_SLABS_PER_ZONE: usize = 1;
+const MAX_EMPTY_SLABS_PER_ZONE: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SlabStats {

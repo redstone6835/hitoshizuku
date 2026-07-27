@@ -336,6 +336,7 @@ unsafe fn map_pages(
         false,
         phys_to_virt,
         allocate_page_table_page,
+        true,
     )
 }
 
