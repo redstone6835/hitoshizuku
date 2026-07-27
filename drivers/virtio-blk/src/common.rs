@@ -10,15 +10,20 @@ use core::ops::{Deref, DerefMut};
 #[cfg(feature = "block-profile")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
+use general::dev::bio::{
+    BIO_MAX_BORROWED_SEGMENTS, Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError,
+};
 use general::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
-use general::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
+use general::dev::dma::{DmaBorrowedMapping, DmaBuffer, DmaContext, DmaDirection};
 use spin::mutex::{Mutex, MutexGuard};
 use virtio::{
-    DescriptorChain, SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
+    DescriptorChain, INLINE_DESCRIPTOR_CHAIN, SplitVirtQueue, VIRTIO_F_VERSION_1,
+    VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
 };
 
 use super::VIRTIO_BLK_SECTOR_SIZE;
+
+const _: () = assert!(BIO_MAX_BORROWED_SEGMENTS + 2 <= INLINE_DESCRIPTOR_CHAIN);
 
 /// 关闭本地中断后持有的互斥锁。
 ///
@@ -285,6 +290,8 @@ pub(super) struct VirtioBlkPendingRequest {
     pub bio: Bio,
     pub meta_dma: DmaBuffer,
     pub data_dma: Option<DmaBuffer>,
+    /// 数据 descriptor 直接指向 BIO 借用分段时保存的稳定映射。
+    pub direct_bio_mappings: Option<DirectBioMappings>,
     /// 设备完成时至少应写回的字节数，用于发现 used ring 短写。
     pub expected_device_write_len: u32,
     #[cfg(feature = "block-profile")]
@@ -419,10 +426,11 @@ impl VirtioBlkQueueCore {
         }
     }
 
-    pub fn mark_failed_and_take_pending(
-        &mut self,
-    ) -> alloc::vec::Vec<Option<VirtioBlkPendingRequest>> {
+    pub fn mark_failed(&mut self) {
         self.failed = true;
+    }
+
+    pub fn take_all_pending(&mut self) -> alloc::vec::Vec<Option<VirtioBlkPendingRequest>> {
         let mut failed = alloc::vec::Vec::new();
         core::mem::swap(&mut failed, &mut self.pending);
         failed
@@ -514,6 +522,8 @@ const STATUS_UNSUPP: u8 = 2;
 const WRITE_ZEROES_FLAG_UNMAP: u32 = 1;
 
 /// virtio-blk 设备能力位。
+const FEATURE_SIZE_MAX: u64 = 1 << 1;
+const FEATURE_SEG_MAX: u64 = 1 << 2;
 const FEATURE_RO: u64 = 1 << 5;
 const FEATURE_BLK_SIZE: u64 = 1 << 6;
 const FEATURE_FLUSH: u64 = 1 << 9;
@@ -525,6 +535,8 @@ const FEATURE_WRITE_ZEROES: u64 = 1 << 14;
 /// 传输层只读取设备 feature 并写回协商结果；具体哪些 feature 属于块协议能力，
 /// 统一在这里维护，避免 MMIO/PCI 路径出现不同的能力选择策略。
 const SUPPORTED_FEATURES: u64 = VIRTIO_F_VERSION_1
+    | FEATURE_SIZE_MAX
+    | FEATURE_SEG_MAX
     | FEATURE_RO
     | FEATURE_BLK_SIZE
     | FEATURE_FLUSH
@@ -533,6 +545,8 @@ const SUPPORTED_FEATURES: u64 = VIRTIO_F_VERSION_1
 
 /// virtio-blk 配置空间字段偏移，均相对于设备类型 config 起始地址。
 const CONFIG_CAPACITY_OFFSET: usize = 0x00;
+const CONFIG_SIZE_MAX_OFFSET: usize = 0x08;
+const CONFIG_SEG_MAX_OFFSET: usize = 0x0c;
 const CONFIG_BLK_SIZE_OFFSET: usize = 0x14;
 const CONFIG_MAX_DISCARD_SECTORS_OFFSET: usize = 0x28;
 const CONFIG_MAX_DISCARD_SEG_OFFSET: usize = 0x2c;
@@ -655,17 +669,22 @@ pub(super) struct VirtioBlkDeviceConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VirtioBlkConfigError {
     MissingCapacity,
+    MissingSizeMax,
+    MissingSegMax,
     MissingBlockSize,
     MissingDiscardLimits,
     MissingWriteZeroesLimits,
     MissingWriteZeroesUnmap,
     InvalidBlockSize,
+    InvalidSizeMax,
 }
 
 impl VirtioBlkConfigError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::MissingCapacity => "virtio-blk: device_cfg capacity is missing",
+            Self::MissingSizeMax => "virtio-blk: device_cfg size_max is missing",
+            Self::MissingSegMax => "virtio-blk: device_cfg seg_max is missing",
             Self::MissingBlockSize => "virtio-blk: device_cfg block size is missing",
             Self::MissingDiscardLimits => "virtio-blk: device_cfg discard limits are missing",
             Self::MissingWriteZeroesLimits => {
@@ -675,6 +694,7 @@ impl VirtioBlkConfigError {
                 "virtio-blk: device_cfg write-zeroes unmap flag is missing"
             }
             Self::InvalidBlockSize => "virtio-blk: invalid logical block size",
+            Self::InvalidSizeMax => "virtio-blk: invalid maximum DMA segment size",
         }
     }
 }
@@ -744,6 +764,10 @@ fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VirtioBlkCapabilities {
     pub features: VirtioBlkNegotiatedFeatures,
+    /// 一个普通数据 descriptor 允许的最大字节数。
+    pub max_data_segment_size: usize,
+    /// 一次普通读写请求允许的数据 descriptor 数量，不含 header/status。
+    pub max_data_segments: usize,
     pub discard: Option<VirtioBlkRangeOpLimits>,
     pub write_zeroes: Option<VirtioBlkRangeOpLimits>,
     pub write_zeroes_may_unmap: bool,
@@ -752,12 +776,16 @@ pub(super) struct VirtioBlkCapabilities {
 impl VirtioBlkCapabilities {
     pub const fn new(
         features: VirtioBlkNegotiatedFeatures,
+        max_data_segment_size: usize,
+        max_data_segments: usize,
         discard: Option<VirtioBlkRangeOpLimits>,
         write_zeroes: Option<VirtioBlkRangeOpLimits>,
         write_zeroes_may_unmap: bool,
     ) -> Self {
         Self {
             features,
+            max_data_segment_size,
+            max_data_segments,
             discard,
             write_zeroes,
             write_zeroes_may_unmap,
@@ -799,6 +827,26 @@ pub(super) fn read_device_config<R: VirtioBlkConfigReader>(
         .read_u64(CONFIG_CAPACITY_OFFSET)
         .ok_or(VirtioBlkConfigError::MissingCapacity)?;
     let negotiated_features = VirtioBlkNegotiatedFeatures::new(driver_features);
+    let max_data_segment_size = if negotiated_features.contains(FEATURE_SIZE_MAX) {
+        let size = reader
+            .read_u32(CONFIG_SIZE_MAX_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingSizeMax)? as usize;
+        if size == 0 {
+            return Err(VirtioBlkConfigError::InvalidSizeMax);
+        }
+        size
+    } else {
+        u32::MAX as usize
+    };
+    let max_data_segments = if negotiated_features.contains(FEATURE_SEG_MAX) {
+        // Linux 同样把设备返回的 0 收紧为 1，保证任何设备至少能承载一个数据段。
+        (reader
+            .read_u32(CONFIG_SEG_MAX_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingSegMax)? as usize)
+            .max(1)
+    } else {
+        1
+    };
     let logical_block_size = if negotiated_features.contains(FEATURE_BLK_SIZE) {
         reader
             .read_u32(CONFIG_BLK_SIZE_OFFSET)
@@ -852,6 +900,8 @@ pub(super) fn read_device_config<R: VirtioBlkConfigReader>(
     };
     let capabilities = VirtioBlkCapabilities::new(
         negotiated_features,
+        max_data_segment_size,
+        max_data_segments,
         discard,
         write_zeroes,
         write_zeroes_may_unmap,
@@ -876,9 +926,25 @@ pub(super) fn block_limits(
     if block_size == 0 {
         return Err("virtio-blk: block size is zero");
     }
-    let descriptor_limit = u32::MAX as usize;
-    let dma_limit = dma_context.constraints().max_segment_size;
-    let max_bytes = descriptor_limit.min(dma_limit);
+    // used ring 的总写回长度也是 u32，读请求还包含一个 status 字节。
+    let request_limit = (u32::MAX as usize).saturating_sub(1);
+    let constraints = dma_context.constraints();
+    let segment_limit = (u32::MAX as usize)
+        .min(constraints.max_segment_size)
+        .min(capabilities.max_data_segment_size);
+    let max_segments = if constraints.supports_scatter_gather {
+        constraints
+            .max_segments
+            .min(capabilities.max_data_segments)
+            .min(BIO_MAX_BORROWED_SEGMENTS)
+            .max(1)
+    } else {
+        1
+    };
+    let max_bytes = segment_limit
+        .checked_mul(max_segments)
+        .unwrap_or(usize::MAX)
+        .min(request_limit);
     if max_bytes < block_size as usize {
         return Err("virtio-blk: DMA segment is smaller than one logical block");
     }
@@ -886,6 +952,10 @@ pub(super) fn block_limits(
         NonZeroU32::new((max_bytes / block_size as usize).min(u32::MAX as usize) as u32);
     let limits = BlockLimits::new(max_blocks, max_blocks, NonZeroU32::new(1)).map(|limits| {
         limits
+            .with_data_segment_limits(
+                NonZeroU32::new(max_segments as u32),
+                NonZeroU32::new(segment_limit.min(u32::MAX as usize) as u32),
+            )
             .with_discard_limits(
                 capabilities
                     .discard
@@ -1214,22 +1284,89 @@ pub(super) struct VirtioBlkAllocatedRequest {
     pub head: u16,
     pub meta_dma: DmaBuffer,
     pub data_dma: Option<DmaBuffer>,
+    pub direct_bio_mappings: Option<DirectBioMappings>,
+}
+
+/// 一次 direct BIO 的内联非拥有 DMA 映射。
+///
+/// 映射与 BIO 一起保存在 pending 表中，保证 descriptor 发布、正常完成和错误回收
+/// 使用同一组地址与 cache ownership 句柄，不在完成阶段重新执行地址转换。
+pub(super) struct DirectBioMappings {
+    mappings: [Option<DmaBorrowedMapping>; BIO_MAX_BORROWED_SEGMENTS],
+    count: u8,
+}
+
+impl DirectBioMappings {
+    fn count(&self) -> usize {
+        usize::from(self.count)
+    }
+
+    fn get(&self, index: usize) -> Option<&DmaBorrowedMapping> {
+        self.mappings.get(index).and_then(Option::as_ref)
+    }
+
+    fn sync_for_device(&self) {
+        for index in 0..self.count() {
+            if let Some(mapping) = self.get(index) {
+                mapping.sync_for_device();
+            }
+        }
+    }
+
+    pub fn sync_for_cpu(&self) {
+        for index in 0..self.count() {
+            if let Some(mapping) = self.get(index) {
+                mapping.sync_for_cpu();
+            }
+        }
+    }
 }
 
 /// 为一次请求分配描述符链和 DMA 缓冲，并写入请求头。
 pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
     queue: &mut Q,
     plan: VirtioBlkRequestPlan,
+    bio: &Bio,
+    capabilities: VirtioBlkCapabilities,
 ) -> Result<VirtioBlkAllocatedRequest, SubmitError> {
-    if queue.split_queue().free_descriptor_count() < plan.descriptor_count {
+    let free_descriptors = queue.split_queue().free_descriptor_count();
+    if free_descriptors < plan.descriptor_count {
         return Err(SubmitError::QueueFull);
+    }
+    let dma_context = queue.split_queue().dma_context();
+    let direct_layout = direct_bio_layout_eligible(dma_context, plan, bio, capabilities);
+    let direct_descriptor_count = bio.buffer.segment_count().checked_add(2);
+    let direct_resources_available =
+        direct_layout && direct_descriptor_count.is_some_and(|count| free_descriptors >= count);
+    let direct_bio_mappings = if direct_resources_available {
+        plan.data_direction
+            .and_then(|direction| prepare_direct_bio_mappings(dma_context, bio, direction))
+    } else {
+        None
+    };
+    let direct_bio_segments = direct_bio_mappings.is_some();
+    let descriptor_count = if direct_bio_segments {
+        direct_descriptor_count.ok_or(SubmitError::InvalidRequest(BioReqError::TooLarge))?
+    } else {
+        plan.descriptor_count
+    };
+    if plan.has_data_descriptor()
+        && !direct_bio_segments
+        && plan.data_len > capabilities.max_data_segment_size
+    {
+        // 该请求只能由多段 direct SG 表达；descriptor 暂时不足时应报告队列忙，
+        // 其它不具备 direct 条件的请求则属于永久超出设备单段限制。
+        return Err(if direct_layout && !direct_resources_available {
+            SubmitError::QueueFull
+        } else {
+            SubmitError::InvalidRequest(BioReqError::TooLarge)
+        });
     }
     let chain = queue
         .split_queue()
-        .alloc_chain(plan.descriptor_count)
+        .alloc_chain(descriptor_count)
         .map_err(|_| SubmitError::QueueFull)?;
     let head = chain.head();
-    let dma_context = queue.split_queue().dma_context();
 
     let meta_dma = match queue.take_meta_dma() {
         Some(buffer) => buffer,
@@ -1247,16 +1384,18 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
         },
     };
     let meta = plan.meta();
+    // Safety: meta_dma 是本请求独占、按 VirtioBlkReqMeta 对齐且容量充足的 DMA 缓冲。
     unsafe {
         core::ptr::write(meta_dma.vaddr() as *mut VirtioBlkReqMeta, meta);
     }
     meta_dma.sync_for_device();
 
-    let data_dma = if plan.has_data_descriptor() {
+    let data_dma = if plan.has_data_descriptor() && !direct_bio_segments {
         let direction = match plan.data_direction {
             Some(direction) => direction,
             None => {
                 let _ = queue.split_queue().free_chain(chain);
+                meta_dma.sync_for_cpu();
                 queue.recycle_meta_dma(meta_dma);
                 return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
             }
@@ -1268,6 +1407,7 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
                 Ok(buffer) => Some(buffer),
                 Err(_) => {
                     let _ = queue.split_queue().free_chain(chain);
+                    meta_dma.sync_for_cpu();
                     queue.recycle_meta_dma(meta_dma);
                     return Err(SubmitError::OutOfMemory);
                 }
@@ -1282,6 +1422,54 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
         head,
         meta_dma,
         data_dma,
+        direct_bio_mappings,
+    })
+}
+
+fn direct_bio_layout_eligible(
+    dma_context: DmaContext,
+    plan: VirtioBlkRequestPlan,
+    bio: &Bio,
+    capabilities: VirtioBlkCapabilities,
+) -> bool {
+    if !plan.expects_bio_buffer() || !bio.buffer.is_borrowed_vectored() {
+        return false;
+    }
+    if plan.data_direction.is_none() {
+        return false;
+    }
+    let constraints = dma_context.constraints();
+    let segment_count = bio.buffer.segment_count();
+    if !constraints.supports_scatter_gather
+        || segment_count == 0
+        || segment_count > constraints.max_segments
+        || segment_count > capabilities.max_data_segments
+        || segment_count > BIO_MAX_BORROWED_SEGMENTS
+    {
+        return false;
+    }
+    (0..segment_count).all(|index| {
+        bio.buffer.segment(index).is_some_and(|segment| {
+            segment.len() <= capabilities.max_data_segment_size
+                && u32::try_from(segment.len()).is_ok()
+        })
+    })
+}
+
+fn prepare_direct_bio_mappings(
+    dma_context: DmaContext,
+    bio: &Bio,
+    direction: DmaDirection,
+) -> Option<DirectBioMappings> {
+    let segment_count = bio.buffer.segment_count();
+    let mut mappings = [None; BIO_MAX_BORROWED_SEGMENTS];
+    for (index, slot) in mappings.iter_mut().take(segment_count).enumerate() {
+        let segment = bio.buffer.segment(index)?;
+        *slot = Some(dma_context.map_borrowed(segment.vaddr(), segment.len(), direction)?);
+    }
+    Some(DirectBioMappings {
+        mappings,
+        count: segment_count as u8,
     })
 }
 
@@ -1290,6 +1478,11 @@ pub(super) fn free_allocated_request<Q: VirtioBlkDmaQueue>(
     queue: &mut Q,
     request: VirtioBlkAllocatedRequest,
 ) {
+    request.meta_dma.sync_for_cpu();
+    reclaim_request_payload_for_cpu(
+        request.data_dma.as_ref(),
+        request.direct_bio_mappings.as_ref(),
+    );
     let _ = queue.split_queue().free_chain(request.chain);
     queue.recycle_request_dma(request.meta_dma, request.data_dma);
 }
@@ -1311,11 +1504,19 @@ pub(super) fn write_data_payload(
             if bio.buffer.len() != plan.data_len {
                 return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
             }
-            dma.as_mut_slice()[..plan.data_len].copy_from_slice(bio.buffer.as_slice());
+            if !bio
+                .buffer
+                .copy_to_contiguous(&mut dma.as_mut_slice()[..plan.data_len])
+            {
+                return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
+            }
         }
-        VirtioBlkDataPayload::RangeSegment(segment) => unsafe {
-            core::ptr::write(dma.vaddr() as *mut VirtioBlkRangeSegment, segment);
-        },
+        VirtioBlkDataPayload::RangeSegment(segment) => {
+            // Safety: data_dma 按 VirtioBlkRangeSegment 对齐，且规划长度等于该结构体。
+            unsafe {
+                core::ptr::write(dma.vaddr() as *mut VirtioBlkRangeSegment, segment);
+            }
+        }
         _ => {}
     }
     dma.sync_for_device();
@@ -1327,7 +1528,19 @@ pub(super) fn write_allocated_request_descriptors<Q: VirtioBlkDmaQueue>(
     queue: &mut Q,
     request: &VirtioBlkAllocatedRequest,
     plan: VirtioBlkRequestPlan,
+    bio: &Bio,
 ) -> Result<(), SubmitError> {
+    if let Some(mappings) = request.direct_bio_mappings.as_ref() {
+        return write_direct_bio_descriptors(
+            queue.split_queue(),
+            &request.chain,
+            plan,
+            bio,
+            mappings,
+            request.meta_dma.dma_addr() as u64,
+            request.meta_dma.dma_addr() as u64 + req_status_offset(),
+        );
+    }
     let data_len = u32::try_from(plan.data_len)
         .map_err(|_| SubmitError::InvalidRequest(BioReqError::TooLarge))?;
     write_request_descriptors(
@@ -1339,6 +1552,120 @@ pub(super) fn write_allocated_request_descriptors<Q: VirtioBlkDmaQueue>(
         data_len,
         request.meta_dma.dma_addr() as u64 + req_status_offset(),
     )
+}
+
+fn write_direct_bio_descriptors(
+    queue: &mut SplitVirtQueue,
+    chain: &DescriptorChain,
+    plan: VirtioBlkRequestPlan,
+    bio: &Bio,
+    mappings: &DirectBioMappings,
+    header_dma: u64,
+    status_dma: u64,
+) -> Result<(), SubmitError> {
+    let segment_count = mappings.count();
+    let descriptor_count = segment_count
+        .checked_add(2)
+        .ok_or(SubmitError::InvalidRequest(BioReqError::TooLarge))?;
+    if segment_count == 0
+        || segment_count > BIO_MAX_BORROWED_SEGMENTS
+        || chain.len() != descriptor_count
+    {
+        return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
+    }
+    let data_flags = if plan.data_device_writable {
+        VIRTQ_DESC_F_WRITE
+    } else {
+        0
+    };
+    let empty = VirtqDescUpdate::new(0, 0, 0, 0, None);
+    let mut updates = [empty; BIO_MAX_BORROWED_SEGMENTS + 2];
+    let first_data = chain
+        .get(1)
+        .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?;
+    updates[0] = VirtqDescUpdate::new(
+        chain
+            .get(0)
+            .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?,
+        header_dma,
+        req_header_size(),
+        0,
+        Some(first_data),
+    );
+
+    for index in 0..segment_count {
+        let segment = bio
+            .buffer
+            .segment(index)
+            .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?;
+        let mapping = mappings
+            .get(index)
+            .ok_or(SubmitError::InvalidRequest(BioReqError::Misaligned))?;
+        let descriptor = chain
+            .get(index + 1)
+            .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?;
+        let next = chain
+            .get(index + 2)
+            .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?;
+        updates[index + 1] = VirtqDescUpdate::new(
+            descriptor,
+            mapping.dma_addr() as u64,
+            u32::try_from(segment.len())
+                .map_err(|_| SubmitError::InvalidRequest(BioReqError::TooLarge))?,
+            data_flags,
+            Some(next),
+        );
+    }
+    updates[descriptor_count - 1] = VirtqDescUpdate::new(
+        chain
+            .get(descriptor_count - 1)
+            .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?,
+        status_dma,
+        1,
+        VIRTQ_DESC_F_WRITE,
+        None,
+    );
+    mappings.sync_for_device();
+    queue
+        .write_descs(&updates[..descriptor_count])
+        .map_err(|_| SubmitError::QueueFull)
+}
+
+/// 把请求 payload 的 DMA ownership 归还给 CPU。
+///
+/// 正常完成、设备状态错误和未发布回滚都必须经过这里，之后缓冲区才能进入复用池
+/// 或随 BIO 返回上层。
+pub(super) fn reclaim_request_payload_for_cpu(
+    data_dma: Option<&DmaBuffer>,
+    direct_bio_mappings: Option<&DirectBioMappings>,
+) {
+    if let Some(mappings) = direct_bio_mappings {
+        mappings.sync_for_cpu();
+    }
+    if let Some(dma) = data_dma {
+        dma.sync_for_cpu();
+    }
+}
+
+/// 成功读请求把 staging DMA 内容复制回 BIO；direct SG 已原位写入，不需要复制。
+pub(super) fn copy_completed_read_payload(
+    bio: &mut Bio,
+    data_dma: Option<&DmaBuffer>,
+    direct_bio_mappings: Option<&DirectBioMappings>,
+) -> Result<(), BioIoError> {
+    if direct_bio_mappings.is_some() {
+        return Ok(());
+    }
+
+    let dma = data_dma.ok_or(BioIoError::Unavailable)?;
+    if dma.as_slice().len() < bio.buffer.len() {
+        return Err(BioIoError::Unavailable);
+    }
+    let len = bio.buffer.len();
+    if !bio.buffer.copy_from_contiguous(&dma.as_slice()[..len]) {
+        return Err(BioIoError::Unavailable);
+    }
+    Ok(())
 }
 
 /// 按 virtio-blk 协议写入一次请求的 split virtqueue 描述符链。

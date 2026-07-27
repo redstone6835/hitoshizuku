@@ -1097,7 +1097,11 @@ impl KernelMemorySubsystem {
         request: PhysicalAllocRequest,
     ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
         let request = request.validate().map_err(buddy_alloc_error_from_request)?;
-        let active = self.active.load(Ordering::Acquire);
+        // active is a one-way latch; Relaxed is safe here — the Release/Acquire
+        // pair at init already establishes happens-before, and allocate_physical
+        // is called on every page allocation, making Acquire overhead significant
+        // on LoongArch (dbar instruction).
+        let active = self.active.load(Ordering::Relaxed);
         let accounting_owner = if active {
             resolve_accounting_owner(request.accounting_owner())
         } else {
@@ -1280,8 +1284,11 @@ impl KernelMemorySubsystem {
     }
 
     pub fn allocate(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
+        // active is a one-way latch; Relaxed is safe after init establishes
+        // happens-before via the Release store. Avoids a dbar on every allocation
+        // on LoongArch while preserving the boot-phase fallback.
+        let active = self.active.load(Ordering::Relaxed);
         let request = request.validate()?;
-        let active = self.active.load(Ordering::Acquire);
         let accounting_owner = if active {
             resolve_accounting_owner(request.accounting_owner())
         } else {
@@ -1291,6 +1298,7 @@ impl KernelMemorySubsystem {
             return Err(AllocationError::OutOfMemory);
         }
         let request = request.with_accounting_owner(accounting_owner);
+
         if !active {
             let result = self.allocate_boot(request);
             if result.is_err() {

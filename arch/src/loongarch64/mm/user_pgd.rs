@@ -11,7 +11,10 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use general::mm::{PgdHandle, UserPgdOps};
-use general::{PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, walk_and_map};
+use general::{
+    MapBatchResult, PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, walk_and_map,
+    walk_and_map_pages,
+};
 use mm::VmFlags;
 
 use crate::loongarch64::paging::LoongArch64Paging;
@@ -287,7 +290,12 @@ unsafe fn drop_pgd(handle: PgdHandle) {
     unsafe { inner_from_handle_drop(handle) };
 }
 
-unsafe fn map(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
+unsafe fn map(
+    handle: PgdHandle,
+    vaddr: usize,
+    paddr: usize,
+    flags: VmFlags,
+) -> Result<(), general::MapError> {
     // Safety: 由 UserPgdOps 契约保证 handle 合法；vaddr / paddr 在用户半空间且 4K 对齐。
     let inner = unsafe { inner_ref(handle) };
     let read = flags.has(VmFlags::READ);
@@ -306,7 +314,29 @@ unsafe fn map(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
         phys_to_virt,
         allocate_page_table_page,
     )
-    .expect("[arch][mm] walk_and_map failed");
+}
+
+unsafe fn map_pages(
+    handle: PgdHandle,
+    vaddr: usize,
+    paddrs: &[usize],
+    flags: VmFlags,
+) -> MapBatchResult {
+    // Safety: 由 UserPgdOps 契约保证 handle、地址、权限和空目标 PTE 合法。
+    let inner = unsafe { inner_ref(handle) };
+    walk_and_map_pages::<LoongArch64Paging>(
+        inner.pgd_virt(),
+        vaddr,
+        paddrs,
+        LoongArch64Paging::LEVELS - 1,
+        flags.has(VmFlags::READ),
+        flags.has(VmFlags::WRITE),
+        flags.has(VmFlags::EXEC),
+        true,
+        false,
+        phys_to_virt,
+        allocate_page_table_page,
+    )
 }
 
 unsafe fn publish_new_mapping(handle: PgdHandle, vaddr: usize, len: usize) {
@@ -485,6 +515,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map,
+    map_pages,
     publish_new_mapping,
     unmap,
     protect,

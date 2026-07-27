@@ -247,6 +247,43 @@ fn forked_anon_does_not_merge_with_new_mapping() {
     assert_eq!(parent.len(), 2);
 }
 
+/// 缺页快照身份跨 fork 保持稳定，但 fresh mmap 必须得到不同身份。
+#[ktest]
+fn anon_snapshot_identity_survives_fork_and_rejects_fresh_mapping() {
+    let mut parent = VmaSet::new();
+    parent.insert(anon_area(0x1000, 0x4000)).unwrap();
+    let VmBacking::Anon {
+        merge_domain: before,
+    } = parent.find(0x1000).unwrap().backing.clone()
+    else {
+        panic!("parent backing must be private anonymous");
+    };
+
+    let child = parent.fork_clone_metadata();
+    let VmBacking::Anon {
+        merge_domain: parent_after,
+    } = parent.find(0x1000).unwrap().backing.clone()
+    else {
+        panic!("parent backing must remain private anonymous");
+    };
+    let VmBacking::Anon {
+        merge_domain: child_domain,
+    } = child.find(0x1000).unwrap().backing.clone()
+    else {
+        panic!("child backing must be private anonymous");
+    };
+    let VmBacking::Anon {
+        merge_domain: fresh,
+    } = VmBacking::anonymous()
+    else {
+        unreachable!();
+    };
+
+    assert!(before.same_snapshot_identity(parent_after));
+    assert!(before.same_snapshot_identity(child_domain));
+    assert!(!before.same_snapshot_identity(fresh));
+}
+
 /// 同一匿名区域分裂出的片段在 fork 后仍属于同一来源，可以重新合并。
 #[ktest]
 fn forked_anon_split_pieces_can_merge_again() {

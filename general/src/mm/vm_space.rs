@@ -8,13 +8,16 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::Range;
-#[cfg(feature = "performance-profile")]
-use core::sync::atomic::AtomicU64;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use errno::Errno;
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry as HashTableEntry;
+use mm::area::AnonMergeDomain;
 use mm::{FileLike, SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
 use sched::sync::Spinlock;
+use sched::{WaitQueue, WaitReason};
+use smallvec::SmallVec;
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
@@ -24,14 +27,18 @@ use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, us
 /// BuildStorm 会反复执行体积较大的 rustc/链接器映像；适度预装可减少 TCG 下的
 /// 硬件缺页陷入，同时避免冷缓存首次缺页同步读取过多无关页面。
 const FILE_FAULT_AROUND_PAGES: usize = 16;
+/// 私有匿名写缺页一次最多向高地址预映射的页数。
+///
+/// 生产路径先取 4 页，在顺序写陷阱收益和稀疏映射的投机内存之间折中。
+const ANON_STORE_FAULT_AROUND_PAGES: usize = 4;
 /// 匿名 Store fault-around 影子模型的最大前向页数。
 ///
 /// 模型只观察真实 nonresident fault，绝不分配或安装额外页面。
 #[cfg(any(test, feature = "performance-profile"))]
-const ANON_STORE_SHADOW_PAGES: usize = 8;
+const ANON_STORE_SHADOW_PAGES: usize = ANON_STORE_FAULT_AROUND_PAGES;
 /// 内容持续变化时最多尝试发布缓存快照的次数，随后退回不缓存读取保证前进性。
 const PRIVATE_FILE_CACHE_RETRIES: usize = 3;
-/// 连续缓存缺失达到该阈值后，才值得为一次 VFS 读取准备 bounce buffer。
+/// 连续缓存缺失达到该阈值后，才值得进入批量候选页填充路径。
 const PRIVATE_FILE_BATCH_MIN_PAGES: usize = 4;
 /// 单次批量填页不超过 fault-around 窗口，避免扩大投机读取范围。
 const PRIVATE_FILE_BATCH_MAX_PAGES: usize = 16;
@@ -45,6 +52,9 @@ const PRIVATE_FILE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const PRIVATE_FILE_CACHE_MAX_PAGES: usize = 131_072;
 /// 独立的私有文件页缓存分片数；32 个分片可覆盖 BuildStorm 的并行 rustc 缺页。
 const PRIVATE_FILE_CACHE_SHARD_COUNT: usize = 32;
+/// 共享加载等待表大小。与 Linux folio wait table 一样用固定哈希桶承载等待者，
+/// 避免为每个正在装载的文件页单独分配等待对象。
+const PRIVATE_FILE_LOAD_WAIT_BUCKETS: usize = 256;
 /// clock 淘汰在全局锁内最多检查的条目数，防止满缓存缺页形成 O(N) 长停顿。
 const PRIVATE_FILE_CACHE_EVICTION_SCAN_LIMIT: usize = 64;
 /// 物理页分配失败时每轮释放的缓存引用数。
@@ -113,6 +123,25 @@ fn file_fault_around_window(
         end: fault_page.checked_add(len)?,
         file_offset,
     })
+}
+
+fn anon_store_fault_around_end(
+    fault_page: usize,
+    area_range: &Range<usize>,
+    page_size: usize,
+) -> Option<usize> {
+    if page_size == 0
+        || !page_size.is_power_of_two()
+        || fault_page % page_size != 0
+        || area_range.start % page_size != 0
+        || area_range.end % page_size != 0
+        || !area_range.contains(&fault_page)
+    {
+        return None;
+    }
+    let max_len = ANON_STORE_FAULT_AROUND_PAGES.checked_mul(page_size)?;
+    let end = fault_page.saturating_add(max_len).min(area_range.end);
+    (end > fault_page).then_some(end)
 }
 
 #[cfg(any(test, feature = "performance-profile"))]
@@ -193,8 +222,8 @@ fn observe_anon_store_shadow(
 
 /// 计算连续私有文件 cache miss 的批量读取尺寸。
 ///
-/// bounce buffer 保留完整页并预先清零，但只从文件读取 EOF 前的有效字节，
-/// 因而文件最后一个非整页的尾部仍保持 mmap 所需的零填充语义。
+/// 每个候选物理页都直接作为文件读取目标；`buffer_len` 表示本轮最终页覆盖的总
+/// 字节数，`read_len` 只包含 EOF 前有效数据，最后一个非整页的尾部单独清零。
 fn private_file_batch_plan(
     file_offset: u64,
     file_size: u64,
@@ -238,6 +267,11 @@ fn private_file_batch_page_offset(base: u64, index: usize, page_size: usize) -> 
     base.checked_add(u64::try_from(delta).ok()?)
 }
 
+/// 只有批次首项对应真实 fault 页；后续投机邻页的失败只能截断 fault-around。
+const fn private_file_batch_error_is_fatal(page_index: usize) -> bool {
+    page_index == 0
+}
+
 fn permits_file_fault_around(flags: VmFlags, kind: FaultKind) -> bool {
     let permits_access = match kind {
         FaultKind::Load => flags.has(VmFlags::READ),
@@ -263,6 +297,41 @@ fn unmapped_prefix_len(
         count += 1;
     }
     count
+}
+
+fn same_backing_snapshot(current: &VmBacking, snapshot: &VmBacking) -> bool {
+    match (current, snapshot) {
+        (
+            VmBacking::Anon {
+                merge_domain: current,
+            },
+            VmBacking::Anon {
+                merge_domain: snapshot,
+            },
+        ) => current.same_snapshot_identity(*snapshot),
+        (
+            VmBacking::SharedAnon {
+                object: current_object,
+                offset: current_offset,
+            },
+            VmBacking::SharedAnon {
+                object: snapshot_object,
+                offset: snapshot_offset,
+            },
+        ) => Arc::ptr_eq(current_object, snapshot_object) && current_offset == snapshot_offset,
+        (
+            VmBacking::File {
+                file: current_file,
+                offset: current_offset,
+            },
+            VmBacking::File {
+                file: snapshot_file,
+                offset: snapshot_offset,
+            },
+        ) => Arc::ptr_eq(current_file, snapshot_file) && current_offset == snapshot_offset,
+        (VmBacking::Direct(current), VmBacking::Direct(snapshot)) => current == snapshot,
+        _ => false,
+    }
 }
 
 #[inline]
@@ -776,6 +845,170 @@ pub(crate) fn fault_around_diag() -> FaultAroundDiag {
     diag
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AnonFaultAroundDiag {
+    pub windows: u64,
+    pub requested_pages: u64,
+    pub prepared_pages: u64,
+    pub allocation_shortfall_pages: u64,
+    pub reserve_fallbacks: u64,
+    pub vma_retry_pages: u64,
+    pub raced_pages: u64,
+    pub invariant_failure_pages: u64,
+    pub collision_discarded_pages: u64,
+    pub map_discarded_pages: u64,
+    pub installed_pages: u64,
+    pub commits: u64,
+    pub partial_commits: u64,
+    pub map_failures: u64,
+}
+
+#[cfg(feature = "performance-profile")]
+#[repr(align(64))]
+struct AnonFaultAroundCpuCounters {
+    windows: AtomicU64,
+    requested_pages: AtomicU64,
+    prepared_pages: AtomicU64,
+    allocation_shortfall_pages: AtomicU64,
+    reserve_fallbacks: AtomicU64,
+    vma_retry_pages: AtomicU64,
+    raced_pages: AtomicU64,
+    invariant_failure_pages: AtomicU64,
+    collision_discarded_pages: AtomicU64,
+    map_discarded_pages: AtomicU64,
+    installed_pages: AtomicU64,
+    commits: AtomicU64,
+    partial_commits: AtomicU64,
+    map_failures: AtomicU64,
+}
+
+#[cfg(feature = "performance-profile")]
+impl AnonFaultAroundCpuCounters {
+    const fn new() -> Self {
+        Self {
+            windows: AtomicU64::new(0),
+            requested_pages: AtomicU64::new(0),
+            prepared_pages: AtomicU64::new(0),
+            allocation_shortfall_pages: AtomicU64::new(0),
+            reserve_fallbacks: AtomicU64::new(0),
+            vma_retry_pages: AtomicU64::new(0),
+            raced_pages: AtomicU64::new(0),
+            invariant_failure_pages: AtomicU64::new(0),
+            collision_discarded_pages: AtomicU64::new(0),
+            map_discarded_pages: AtomicU64::new(0),
+            installed_pages: AtomicU64::new(0),
+            commits: AtomicU64::new(0),
+            partial_commits: AtomicU64::new(0),
+            map_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+static ANON_FAULT_AROUND_COUNTERS: [AnonFaultAroundCpuCounters; sched::NR_CPUS] =
+    [const { AnonFaultAroundCpuCounters::new() }; sched::NR_CPUS];
+
+#[cfg(feature = "performance-profile")]
+fn anon_fault_around_cpu_counters() -> &'static AnonFaultAroundCpuCounters {
+    &ANON_FAULT_AROUND_COUNTERS[sched::current_cpu_id().min(sched::NR_CPUS - 1)]
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_anon_fault_around_prepare(requested: usize, prepared: usize, reserve_fallback: bool) {
+    let counters = anon_fault_around_cpu_counters();
+    add_local_fault_around_counter(&counters.windows, 1);
+    add_local_fault_around_counter(&counters.requested_pages, requested as u64);
+    add_local_fault_around_counter(&counters.prepared_pages, prepared as u64);
+    add_local_fault_around_counter(
+        &counters.allocation_shortfall_pages,
+        requested.saturating_sub(prepared) as u64,
+    );
+    if reserve_fallback {
+        add_local_fault_around_counter(&counters.reserve_fallbacks, 1);
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_anon_fault_around_discard(counter: &AtomicU64, pages: usize) {
+    add_local_fault_around_counter(counter, pages as u64);
+}
+
+#[cfg(feature = "performance-profile")]
+fn record_anon_fault_around_commit(
+    installed: usize,
+    collision_discarded: usize,
+    map_discarded: usize,
+    map_failed: bool,
+) {
+    let counters = anon_fault_around_cpu_counters();
+    add_local_fault_around_counter(&counters.commits, 1);
+    add_local_fault_around_counter(&counters.installed_pages, installed as u64);
+    add_local_fault_around_counter(
+        &counters.collision_discarded_pages,
+        collision_discarded as u64,
+    );
+    add_local_fault_around_counter(&counters.map_discarded_pages, map_discarded as u64);
+    if collision_discarded != 0 || map_discarded != 0 {
+        add_local_fault_around_counter(&counters.partial_commits, 1);
+    }
+    if map_failed {
+        add_local_fault_around_counter(&counters.map_failures, 1);
+    }
+}
+
+pub(crate) fn anon_fault_around_diag() -> AnonFaultAroundDiag {
+    #[cfg(feature = "performance-profile")]
+    let mut diag = AnonFaultAroundDiag::default();
+    #[cfg(not(feature = "performance-profile"))]
+    let diag = AnonFaultAroundDiag::default();
+    #[cfg(feature = "performance-profile")]
+    for counters in &ANON_FAULT_AROUND_COUNTERS {
+        diag.windows = diag
+            .windows
+            .saturating_add(counters.windows.load(Ordering::Relaxed));
+        diag.requested_pages = diag
+            .requested_pages
+            .saturating_add(counters.requested_pages.load(Ordering::Relaxed));
+        diag.prepared_pages = diag
+            .prepared_pages
+            .saturating_add(counters.prepared_pages.load(Ordering::Relaxed));
+        diag.allocation_shortfall_pages = diag
+            .allocation_shortfall_pages
+            .saturating_add(counters.allocation_shortfall_pages.load(Ordering::Relaxed));
+        diag.reserve_fallbacks = diag
+            .reserve_fallbacks
+            .saturating_add(counters.reserve_fallbacks.load(Ordering::Relaxed));
+        diag.vma_retry_pages = diag
+            .vma_retry_pages
+            .saturating_add(counters.vma_retry_pages.load(Ordering::Relaxed));
+        diag.raced_pages = diag
+            .raced_pages
+            .saturating_add(counters.raced_pages.load(Ordering::Relaxed));
+        diag.invariant_failure_pages = diag
+            .invariant_failure_pages
+            .saturating_add(counters.invariant_failure_pages.load(Ordering::Relaxed));
+        diag.collision_discarded_pages = diag
+            .collision_discarded_pages
+            .saturating_add(counters.collision_discarded_pages.load(Ordering::Relaxed));
+        diag.map_discarded_pages = diag
+            .map_discarded_pages
+            .saturating_add(counters.map_discarded_pages.load(Ordering::Relaxed));
+        diag.installed_pages = diag
+            .installed_pages
+            .saturating_add(counters.installed_pages.load(Ordering::Relaxed));
+        diag.commits = diag
+            .commits
+            .saturating_add(counters.commits.load(Ordering::Relaxed));
+        diag.partial_commits = diag
+            .partial_commits
+            .saturating_add(counters.partial_commits.load(Ordering::Relaxed));
+        diag.map_failures = diag
+            .map_failures
+            .saturating_add(counters.map_failures.load(Ordering::Relaxed));
+    }
+    diag
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileSegmentPlan {
     mapping: Range<usize>,
@@ -814,9 +1047,44 @@ struct FilePageKey {
     generation: u64,
 }
 
-struct PrivateFilePageCacheEntry {
+struct PrivateFilePageCacheReady {
     page: Arc<ResidentPage>,
     referenced: bool,
+}
+
+enum PrivateFilePageCacheEntry {
+    Loading {
+        id: u64,
+        waiters: usize,
+    },
+    Failed {
+        id: u64,
+        error: Errno,
+        remaining: usize,
+    },
+    Ready(PrivateFilePageCacheReady),
+}
+
+type PrivateFilePageTableEntry = (FilePageKey, PrivateFilePageCacheEntry);
+
+struct PrivateFilePageTable {
+    entries: HashTable<PrivateFilePageTableEntry>,
+}
+
+enum PrivateFilePageCacheClaim<'a, const SHARD_COUNT: usize> {
+    Ready(Arc<ResidentPage>),
+    Loading(PrivateFilePageLoadWait<'a, SHARD_COUNT>),
+    Failed(Errno),
+    Owner(u64),
+    Bypass,
+}
+
+enum PrivateFilePageCacheStateClaim {
+    Ready(Arc<ResidentPage>),
+    Loading(u64),
+    Failed(Errno),
+    Owner(u64),
+    Bypass,
 }
 
 /// 单个私有文件页缓存分片。
@@ -825,12 +1093,16 @@ struct PrivateFilePageCacheEntry {
 /// 持有固定数量的强引用，使短生命周期编译进程退出后仍可复用工具链和 crate 页，
 /// 同时避免长期构建把所有历史文件内容永久钉在内存中。
 struct PrivateFilePageCacheState {
-    pages: BTreeMap<FilePageKey, PrivateFilePageCacheEntry>,
+    pages: PrivateFilePageTable,
     clock: VecDeque<FilePageKey>,
+    ready_pages: usize,
     hits: u64,
     misses: u64,
     evictions: u64,
     pressure_reclaims: u64,
+    load_leaders: u64,
+    load_waiters: u64,
+    load_errors: u64,
 }
 
 /// 有界的私有干净文件页强缓存。
@@ -839,8 +1111,53 @@ struct PrivateFilePageCacheState {
 /// 缺页通常只竞争各自分片。容量按分片精确拆分，压力回收则轮换起始分片。
 struct ShardedPrivateFilePageCache<const SHARD_COUNT: usize> {
     shards: [Spinlock<PrivateFilePageCacheState>; SHARD_COUNT],
+    load_waits: [WaitQueue; PRIVATE_FILE_LOAD_WAIT_BUCKETS],
+    next_load_id: AtomicU64,
     capacity: usize,
     reclaim_shard: AtomicUsize,
+}
+
+/// 已在 `Loading.waiters` 中登记的栈上等待句柄。
+///
+/// 未调用 [`Self::wait`] 就离开作用域时会自动撤销登记；若 owner 已发布错误，
+/// 则同时消费对应 `Failed.remaining`，避免批量探测分支遗留失败条目。
+struct PrivateFilePageLoadWait<'a, const SHARD_COUNT: usize> {
+    cache: &'a ShardedPrivateFilePageCache<SHARD_COUNT>,
+    key: FilePageKey,
+    id: u64,
+    active: bool,
+}
+
+impl<const SHARD_COUNT: usize> PrivateFilePageLoadWait<'_, SHARD_COUNT> {
+    fn wait(mut self) -> Result<Option<Arc<ResidentPage>>, Errno> {
+        let result = self.cache.wait_for_load(self.key, self.id);
+        self.active = false;
+        result
+    }
+
+    #[cfg(test)]
+    fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl<const SHARD_COUNT: usize> Drop for PrivateFilePageLoadWait<'_, SHARD_COUNT> {
+    fn drop(&mut self) {
+        if self.active {
+            self.cache.cancel_load_waiter(self.key, self.id);
+        }
+    }
+}
+
+/// 分配全局唯一且永不复用的加载编号。
+///
+/// 计数耗尽后返回 `None` 并永久退回不缓存读取；不允许回绕，因此等待者对
+/// `(FilePageKey, load_id)` 的比较不存在 ABA。
+fn next_private_file_load_id(next: &AtomicU64) -> Option<u64> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    })
+    .ok()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -851,6 +1168,9 @@ pub(crate) struct PrivateFilePageCacheDiag {
     pub misses: u64,
     pub evictions: u64,
     pub pressure_reclaims: u64,
+    pub load_leaders: u64,
+    pub load_waiters: u64,
+    pub load_errors: u64,
 }
 
 impl FilePageKey {
@@ -874,6 +1194,7 @@ impl FilePageKey {
     ///
     /// 这里故意只使用移位、旋转和异或：缺页路径会为每个候选页执行一次选片，
     /// 在 LoongArch TCG 上避免几次 64 位乘法比更重的通用哈希更重要。
+    #[inline]
     fn private_cache_hash(self) -> u64 {
         let mut hash = self.file_key as u64;
         // 缓存键的文件偏移按 4 KiB 页对齐；直接把页号放入低位，使同一大型
@@ -884,20 +1205,121 @@ impl FilePageKey {
         hash ^= hash >> 29;
         hash ^ (hash >> 17)
     }
+
+    /// 为分片内 SwissTable 生成独立哈希。
+    ///
+    /// 分片已经消费了 `private_cache_hash` 的低位；再次直接使用同一哈希会让同一
+    /// 分片的所有初始 bucket 共享这些低位。这里在选片之后使用一次奇数乘法和旋转
+    /// avalanche，同时打散 bucket 与 7-bit control tag；选片热路径本身仍不做乘法。
+    #[inline]
+    fn private_table_hash(self) -> u64 {
+        let hash = self
+            .private_cache_hash()
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        hash ^ hash.rotate_right(29)
+    }
+}
+
+#[inline]
+fn private_file_page_table_entry_hash(entry: &PrivateFilePageTableEntry) -> u64 {
+    entry.0.private_table_hash()
+}
+
+impl PrivateFilePageTable {
+    const fn new() -> Self {
+        Self {
+            entries: HashTable::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    fn get(&self, key: &FilePageKey) -> Option<&PrivateFilePageCacheEntry> {
+        self.entries
+            .find(key.private_table_hash(), |entry| entry.0 == *key)
+            .map(|entry| &entry.1)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &FilePageKey) -> Option<&mut PrivateFilePageCacheEntry> {
+        self.entries
+            .find_mut(key.private_table_hash(), |entry| entry.0 == *key)
+            .map(|entry| &mut entry.1)
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &FilePageKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn remove(&mut self, key: &FilePageKey) -> Option<PrivateFilePageCacheEntry> {
+        let entry = self
+            .entries
+            .find_entry(key.private_table_hash(), |entry| entry.0 == *key)
+            .ok()?;
+        let ((_, value), _) = entry.remove();
+        Some(value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&FilePageKey, &PrivateFilePageCacheEntry)> {
+        self.entries.iter().map(|entry| (&entry.0, &entry.1))
+    }
+
+    #[inline]
+    fn insertion_needs_reserve(&self) -> bool {
+        self.entries.len() == self.entries.capacity()
+    }
+
+    fn try_reserve_one(&mut self) -> bool {
+        self.entries
+            .try_reserve(1, private_file_page_table_entry_hash)
+            .is_ok()
+    }
+
+    #[inline]
+    fn entry(&mut self, key: FilePageKey) -> HashTableEntry<'_, PrivateFilePageTableEntry> {
+        self.entries.entry(
+            key.private_table_hash(),
+            |entry| entry.0 == key,
+            private_file_page_table_entry_hash,
+        )
+    }
+
+    fn insert_unique(&mut self, key: FilePageKey, entry: PrivateFilePageCacheEntry) {
+        self.entries.insert_unique(
+            key.private_table_hash(),
+            (key, entry),
+            private_file_page_table_entry_hash,
+        );
+    }
 }
 
 impl PrivateFilePageCacheState {
     const fn new() -> Self {
         Self {
-            pages: BTreeMap::new(),
+            pages: PrivateFilePageTable::new(),
             clock: VecDeque::new(),
+            ready_pages: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
             pressure_reclaims: 0,
+            load_leaders: 0,
+            load_waiters: 0,
+            load_errors: 0,
         }
     }
 
+    #[cfg(test)]
     fn find(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
         let page = self.find_existing(key);
         if page.is_some() {
@@ -908,39 +1330,204 @@ impl PrivateFilePageCacheState {
         page
     }
 
+    #[cfg(test)]
     fn find_existing(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
-        let entry = self.pages.get_mut(&key)?;
+        let PrivateFilePageCacheEntry::Ready(entry) = self.pages.get_mut(&key)? else {
+            return None;
+        };
         entry.referenced = true;
         Some(Arc::clone(&entry.page))
     }
 
-    /// 插入一个此前不存在的条目，并返回需要在锁外释放的淘汰页。
-    fn insert(
+    fn claim_existing(&mut self, key: FilePageKey) -> Option<PrivateFilePageCacheStateClaim> {
+        let entry = self.pages.get_mut(&key)?;
+        Some(match entry {
+            PrivateFilePageCacheEntry::Ready(entry) => {
+                entry.referenced = true;
+                self.hits = self.hits.saturating_add(1);
+                PrivateFilePageCacheStateClaim::Ready(Arc::clone(&entry.page))
+            }
+            PrivateFilePageCacheEntry::Loading { id, waiters } => {
+                self.misses = self.misses.saturating_add(1);
+                let Some(next_waiters) = waiters.checked_add(1) else {
+                    return Some(PrivateFilePageCacheStateClaim::Failed(Errno::ENOMEM));
+                };
+                *waiters = next_waiters;
+                PrivateFilePageCacheStateClaim::Loading(*id)
+            }
+            PrivateFilePageCacheEntry::Failed { error, .. } => {
+                self.misses = self.misses.saturating_add(1);
+                PrivateFilePageCacheStateClaim::Failed(*error)
+            }
+        })
+    }
+
+    fn claim(
         &mut self,
         key: FilePageKey,
+        next_load_id: &AtomicU64,
+    ) -> PrivateFilePageCacheStateClaim {
+        // HashTable::entry 会为潜在插入执行一次 infallible reserve。仅在增长空间耗尽
+        // 时先做显式、可失败 reserve；已有条目仍可在 OOM 下正常命中或等待。
+        if self.pages.insertion_needs_reserve() {
+            if let Some(existing) = self.claim_existing(key) {
+                return existing;
+            }
+            self.misses = self.misses.saturating_add(1);
+            if !self.pages.try_reserve_one() {
+                return PrivateFilePageCacheStateClaim::Bypass;
+            }
+            let Some(id) = next_private_file_load_id(next_load_id) else {
+                return PrivateFilePageCacheStateClaim::Bypass;
+            };
+            self.pages
+                .insert_unique(key, PrivateFilePageCacheEntry::Loading { id, waiters: 0 });
+            self.load_leaders = self.load_leaders.saturating_add(1);
+            return PrivateFilePageCacheStateClaim::Owner(id);
+        }
+
+        match self.pages.entry(key) {
+            HashTableEntry::Occupied(mut slot) => match &mut slot.get_mut().1 {
+                PrivateFilePageCacheEntry::Ready(entry) => {
+                    entry.referenced = true;
+                    self.hits = self.hits.saturating_add(1);
+                    PrivateFilePageCacheStateClaim::Ready(Arc::clone(&entry.page))
+                }
+                PrivateFilePageCacheEntry::Loading { id, waiters } => {
+                    self.misses = self.misses.saturating_add(1);
+                    let Some(next_waiters) = waiters.checked_add(1) else {
+                        return PrivateFilePageCacheStateClaim::Failed(Errno::ENOMEM);
+                    };
+                    *waiters = next_waiters;
+                    PrivateFilePageCacheStateClaim::Loading(*id)
+                }
+                PrivateFilePageCacheEntry::Failed { error, .. } => {
+                    self.misses = self.misses.saturating_add(1);
+                    PrivateFilePageCacheStateClaim::Failed(*error)
+                }
+            },
+            HashTableEntry::Vacant(slot) => {
+                self.misses = self.misses.saturating_add(1);
+                let Some(id) = next_private_file_load_id(next_load_id) else {
+                    return PrivateFilePageCacheStateClaim::Bypass;
+                };
+                slot.insert((key, PrivateFilePageCacheEntry::Loading { id, waiters: 0 }));
+                self.load_leaders = self.load_leaders.saturating_add(1);
+                PrivateFilePageCacheStateClaim::Owner(id)
+            }
+        }
+    }
+
+    fn finish_load(
+        &mut self,
+        key: FilePageKey,
+        load_id: u64,
         page: &Arc<ResidentPage>,
         capacity: usize,
-    ) -> Option<Arc<ResidentPage>> {
-        use alloc::collections::btree_map::Entry;
-
-        let Entry::Vacant(slot) = self.pages.entry(key) else {
-            return None;
+    ) -> (bool, Option<Arc<ResidentPage>>) {
+        let Some(entry) = self.pages.get_mut(&key) else {
+            return (false, None);
         };
-        slot.insert(PrivateFilePageCacheEntry {
+        if !matches!(entry, PrivateFilePageCacheEntry::Loading { id, .. } if *id == load_id) {
+            return (false, None);
+        }
+        *entry = PrivateFilePageCacheEntry::Ready(PrivateFilePageCacheReady {
             page: Arc::clone(page),
-            // 插入本身不算跨地址空间复用；只有后续缓存命中才获得 second chance。
             referenced: false,
         });
+        self.ready_pages += 1;
         self.clock.push_back(key);
-        (self.pages.len() > capacity)
+        let retired = (self.ready_pages > capacity)
             .then(|| self.evict_one())
-            .flatten()
+            .flatten();
+        (true, retired)
+    }
+
+    fn abort_load(&mut self, key: FilePageKey, load_id: u64, error: Option<Errno>) -> bool {
+        let Some(entry) = self.pages.get_mut(&key) else {
+            return false;
+        };
+        let PrivateFilePageCacheEntry::Loading { id, waiters } = entry else {
+            return false;
+        };
+        if *id != load_id {
+            return false;
+        }
+        let waiters = *waiters;
+        if let Some(error) = error
+            && waiters != 0
+        {
+            *entry = PrivateFilePageCacheEntry::Failed {
+                id: load_id,
+                error,
+                remaining: waiters,
+            };
+        } else {
+            self.pages.remove(&key);
+        }
+        if error.is_some() {
+            self.load_errors = self.load_errors.saturating_add(1);
+        }
+        true
+    }
+
+    fn cancel_waiter(&mut self, key: FilePageKey, load_id: u64) {
+        let remove_failed = match self.pages.get_mut(&key) {
+            Some(PrivateFilePageCacheEntry::Loading { id, waiters }) if *id == load_id => {
+                debug_assert!(*waiters != 0);
+                *waiters = waiters.saturating_sub(1);
+                false
+            }
+            Some(PrivateFilePageCacheEntry::Failed { id, remaining, .. }) if *id == load_id => {
+                debug_assert!(*remaining != 0);
+                *remaining = remaining.saturating_sub(1);
+                *remaining == 0
+            }
+            _ => false,
+        };
+        if remove_failed {
+            self.pages.remove(&key);
+        }
+    }
+
+    fn load_pending(&self, key: FilePageKey, load_id: u64) -> bool {
+        matches!(
+            self.pages.get(&key),
+            Some(PrivateFilePageCacheEntry::Loading { id, .. }) if *id == load_id
+        )
+    }
+
+    fn consume_load_result(
+        &mut self,
+        key: FilePageKey,
+        load_id: u64,
+    ) -> Result<Option<Arc<ResidentPage>>, Errno> {
+        let mut remove_failed = false;
+        let result = match self.pages.get_mut(&key) {
+            Some(PrivateFilePageCacheEntry::Ready(entry)) => Ok(Some(Arc::clone(&entry.page))),
+            Some(PrivateFilePageCacheEntry::Failed {
+                id,
+                error,
+                remaining,
+            }) if *id == load_id => {
+                debug_assert!(*remaining != 0);
+                let error = *error;
+                *remaining = remaining.saturating_sub(1);
+                remove_failed = *remaining == 0;
+                Err(error)
+            }
+            _ => Ok(None),
+        };
+        if remove_failed {
+            self.pages.remove(&key);
+        }
+        result
     }
 
     /// 清理一个未被近期访问的页。调用者必须在释放返回的 Arc 前放开缓存锁。
     fn evict_one(&mut self) -> Option<Arc<ResidentPage>> {
         // second chance 只近似表达近期复用。分片缺页锁内必须保持固定上界，
-        // 即使整个缓存都很热也不能扫描数万棵 BTree 节点。
+        // 即使整个缓存都很热也不能扫描数万个缓存条目。
         let scans = self.clock.len().min(PRIVATE_FILE_CACHE_EVICTION_SCAN_LIMIT);
         for _ in 0..scans {
             let Some(key) = self.clock.pop_front() else {
@@ -950,13 +1537,16 @@ impl PrivateFilePageCacheState {
                 // 仅用于容忍测试/恢复路径留下的旧 clock 节点。
                 continue;
             };
+            let PrivateFilePageCacheEntry::Ready(entry) = entry else {
+                continue;
+            };
             if entry.referenced {
                 entry.referenced = false;
                 self.clock.push_back(key);
                 continue;
             }
             // `remove` 把 Arc 移到锁外；不要让 map entry 在锁守卫仍存活时析构。
-            return self.remove(key);
+            return self.remove_ready(key);
         }
 
         // 所有受检条目都获得了 second chance 时，固定淘汰下一个最老条目；
@@ -967,13 +1557,15 @@ impl PrivateFilePageCacheState {
     /// 无视 reference 位移除最老条目，供容量兜底和内存压力回收使用。
     fn evict_oldest(&mut self) -> Option<Arc<ResidentPage>> {
         while let Some(key) = self.clock.pop_front() {
-            if let Some(page) = self.remove(key) {
+            if let Some(page) = self.remove_ready(key) {
                 return Some(page);
             }
         }
         // clock 元数据若意外缺项，仍保证 map 不会永久失去可回收性。
-        let key = *self.pages.keys().next()?;
-        self.remove(key)
+        let key = self.pages.iter().find_map(|(key, entry)| {
+            matches!(entry, PrivateFilePageCacheEntry::Ready(_)).then_some(*key)
+        })?;
+        self.remove_ready(key)
     }
 
     fn reclaim_oldest(&mut self) -> Option<Arc<ResidentPage>> {
@@ -982,10 +1574,19 @@ impl PrivateFilePageCacheState {
         Some(page)
     }
 
-    fn remove(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
-        let page = self.pages.remove(&key).map(|entry| entry.page)?;
+    fn remove_ready(&mut self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
+        if !matches!(
+            self.pages.get(&key),
+            Some(PrivateFilePageCacheEntry::Ready(_))
+        ) {
+            return None;
+        }
+        let PrivateFilePageCacheEntry::Ready(entry) = self.pages.remove(&key)? else {
+            unreachable!("entry kind was checked while holding the cache shard lock");
+        };
+        self.ready_pages = self.ready_pages.saturating_sub(1);
         self.evictions = self.evictions.saturating_add(1);
-        Some(page)
+        Some(entry.page)
     }
 
     fn remove_if_same(
@@ -996,7 +1597,9 @@ impl PrivateFilePageCacheState {
         let same = self
             .pages
             .get(&key)
-            .is_some_and(|entry| core::ptr::eq(entry.page.as_ref(), page));
+            .is_some_and(|entry| {
+                matches!(entry, PrivateFilePageCacheEntry::Ready(entry) if core::ptr::eq(entry.page.as_ref(), page))
+            });
         if !same {
             return None;
         }
@@ -1004,7 +1607,7 @@ impl PrivateFilePageCacheState {
         // 代际校验失败会走这里主动撤销刚发布的候选。同步摘除 clock 节点，避免
         // 文件反复变化时累积陈旧 key，最终让压力回收在分片锁内无界扫描。
         self.clock.retain(|queued| *queued != key);
-        self.remove(key)
+        self.remove_ready(key)
     }
 }
 
@@ -1012,8 +1615,12 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
     const fn new(capacity: usize) -> Self {
         assert!(SHARD_COUNT > 0);
         assert!(SHARD_COUNT.is_power_of_two());
+        assert!(PRIVATE_FILE_LOAD_WAIT_BUCKETS.is_power_of_two());
         Self {
             shards: [const { Spinlock::new(PrivateFilePageCacheState::new()) }; SHARD_COUNT],
+            load_waits: [const { WaitQueue::new_with_reason(WaitReason::BlockIo) };
+                PRIVATE_FILE_LOAD_WAIT_BUCKETS],
+            next_load_id: AtomicU64::new(1),
             capacity,
             reclaim_shard: AtomicUsize::new(0),
         }
@@ -1028,29 +1635,104 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
         self.capacity / SHARD_COUNT + usize::from(index < self.capacity % SHARD_COUNT)
     }
 
+    #[cfg(test)]
     fn find(&self, key: FilePageKey) -> Option<Arc<ResidentPage>> {
         self.shards[self.shard_index(key)].lock().find(key)
     }
 
-    /// 锁内只发布候选并摘取一个淘汰页，候选或淘汰页均在锁外析构。
-    fn publish(&self, key: FilePageKey, candidate: Arc<ResidentPage>) -> Arc<ResidentPage> {
-        let index = self.shard_index(key);
-        let (existing, retired) = {
-            let mut shard = self.shards[index].lock();
-            if let Some(existing) = shard.find_existing(key) {
-                (Some(existing), None)
-            } else {
-                let retired = shard.insert(key, &candidate, self.shard_capacity(index));
-                (None, retired)
+    fn load_wait_index(&self, key: FilePageKey, load_id: u64) -> usize {
+        let hash =
+            key.private_cache_hash() ^ load_id.rotate_left(23) ^ (load_id >> 17) ^ (load_id << 7);
+        (hash as usize) & (PRIVATE_FILE_LOAD_WAIT_BUCKETS - 1)
+    }
+
+    fn claim(&self, key: FilePageKey) -> PrivateFilePageCacheClaim<'_, SHARD_COUNT> {
+        let claim = self.shards[self.shard_index(key)]
+            .lock()
+            .claim(key, &self.next_load_id);
+        match claim {
+            PrivateFilePageCacheStateClaim::Ready(page) => PrivateFilePageCacheClaim::Ready(page),
+            PrivateFilePageCacheStateClaim::Loading(id) => {
+                PrivateFilePageCacheClaim::Loading(PrivateFilePageLoadWait {
+                    cache: self,
+                    key,
+                    id,
+                    active: true,
+                })
             }
-        };
-        drop(retired);
-        if let Some(existing) = existing {
-            drop(candidate);
-            existing
-        } else {
-            candidate
+            PrivateFilePageCacheStateClaim::Failed(error) => {
+                PrivateFilePageCacheClaim::Failed(error)
+            }
+            PrivateFilePageCacheStateClaim::Owner(id) => PrivateFilePageCacheClaim::Owner(id),
+            PrivateFilePageCacheStateClaim::Bypass => PrivateFilePageCacheClaim::Bypass,
         }
+    }
+
+    fn finish_load(
+        &self,
+        key: FilePageKey,
+        load_id: u64,
+        page: Arc<ResidentPage>,
+    ) -> Option<Arc<ResidentPage>> {
+        let index = self.shard_index(key);
+        let (owned, retired) =
+            self.shards[index]
+                .lock()
+                .finish_load(key, load_id, &page, self.shard_capacity(index));
+        drop(retired);
+        if owned {
+            self.wake_load(key, load_id);
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    fn abort_load(&self, key: FilePageKey, load_id: u64, error: Option<Errno>) {
+        let index = self.shard_index(key);
+        let removed = self.shards[index].lock().abort_load(key, load_id, error);
+        if removed {
+            self.wake_load(key, load_id);
+        }
+    }
+
+    fn load_pending(&self, key: FilePageKey, load_id: u64) -> bool {
+        self.shards[self.shard_index(key)]
+            .lock()
+            .load_pending(key, load_id)
+    }
+
+    fn cancel_load_waiter(&self, key: FilePageKey, load_id: u64) {
+        self.shards[self.shard_index(key)]
+            .lock()
+            .cancel_waiter(key, load_id);
+    }
+
+    fn wait_for_load(
+        &self,
+        key: FilePageKey,
+        load_id: u64,
+    ) -> Result<Option<Arc<ResidentPage>>, Errno> {
+        {
+            let mut shard = self.shards[self.shard_index(key)].lock();
+            shard.load_waiters = shard.load_waiters.saturating_add(1);
+        }
+        let wait_queue = &self.load_waits[self.load_wait_index(key, load_id)];
+        if sched::is_ready() {
+            let task = sched::current_task();
+            wait_queue.wait_event(&task, || !self.load_pending(key, load_id));
+        } else {
+            while self.load_pending(key, load_id) {
+                core::hint::spin_loop();
+            }
+        }
+        self.shards[self.shard_index(key)]
+            .lock()
+            .consume_load_result(key, load_id)
+    }
+
+    fn wake_load(&self, key: FilePageKey, load_id: u64) {
+        self.load_waits[self.load_wait_index(key, load_id)].wake_all();
     }
 
     /// 仅移除仍指向指定候选的旧代际条目，避免并发发布覆盖后误删新页面。
@@ -1116,13 +1798,16 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
         };
         for shard in &self.shards {
             let shard = shard.lock();
-            diag.pages = diag.pages.saturating_add(shard.pages.len());
+            diag.pages = diag.pages.saturating_add(shard.ready_pages);
             diag.hits = diag.hits.saturating_add(shard.hits);
             diag.misses = diag.misses.saturating_add(shard.misses);
             diag.evictions = diag.evictions.saturating_add(shard.evictions);
             diag.pressure_reclaims = diag
                 .pressure_reclaims
                 .saturating_add(shard.pressure_reclaims);
+            diag.load_leaders = diag.load_leaders.saturating_add(shard.load_leaders);
+            diag.load_waiters = diag.load_waiters.saturating_add(shard.load_waiters);
+            diag.load_errors = diag.load_errors.saturating_add(shard.load_errors);
         }
         diag
     }
@@ -1209,9 +1894,39 @@ struct PreparedFilePage {
     page: Arc<ResidentPage>,
 }
 
+type PreparedFilePages = SmallVec<[PreparedFilePage; FILE_FAULT_AROUND_PAGES]>;
+type PrivateFilePageBatch = SmallVec<[Arc<ResidentPage>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+type PrivateFilePageLoadOwner = (FilePageKey, u64, u64);
+type PrivateFilePageLoadOwners = SmallVec<[PrivateFilePageLoadOwner; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+type PrivateFilePageCandidate = (FilePageKey, u64, Arc<ResidentPage>);
+type PrivateFilePageCandidates = SmallVec<[PrivateFilePageCandidate; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+type PublishedPrivateFilePages =
+    SmallVec<[(FilePageKey, Arc<ResidentPage>); PRIVATE_FILE_BATCH_MAX_PAGES]>;
+type PrivateFilePageTargets<'a> = SmallVec<[&'a mut [u8]; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+
+struct AnonStoreFaultAround {
+    fault_page: usize,
+    end: usize,
+    area_range: Range<usize>,
+    flags: VmFlags,
+    merge_domain: AnonMergeDomain,
+}
+
+struct PreparedAnonPage {
+    vaddr: usize,
+    page: Arc<ResidentPage>,
+}
+
 enum PreparedPrivateFileCacheRun {
     Cached(Arc<ResidentPage>),
-    Batched(Vec<Arc<ResidentPage>>),
+    Batched(PrivateFilePageBatch),
+    Error(Errno),
+    Fallback,
+}
+
+enum PrivateFilePageBatchLoad {
+    Cached(Arc<ResidentPage>),
+    Batched(PrivateFilePageBatch),
     Fallback,
 }
 
@@ -1397,14 +2112,17 @@ impl PrivateFileFaultAround {
     /// 在不持有 VMA/pages 锁时分配并读取连续候选页。
     ///
     /// 故障页失败沿用普通 fault 的错误；邻页属于投机行为，首次失败即缩短窗口。
-    fn prepare(&self, profile_phases: bool) -> Result<Vec<PreparedFilePage>, Errno> {
+    fn prepare(&self, profile_phases: bool) -> Result<PreparedFilePages, Errno> {
         #[cfg(feature = "performance-profile")]
         let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultPrepare));
         #[cfg(not(feature = "performance-profile"))]
         let _ = profile_phases;
         let page_size = page_size();
         let pages = (self.end - self.fault_page) / page_size;
-        let mut prepared = Vec::with_capacity(pages);
+        if pages > FILE_FAULT_AROUND_PAGES {
+            return Err(Errno::EINVAL);
+        }
+        let mut prepared = PreparedFilePages::new();
         let mut index = 0usize;
         while index < pages {
             let delta = index.checked_mul(page_size).ok_or(Errno::EINVAL)?;
@@ -1440,6 +2158,8 @@ impl PrivateFileFaultAround {
                     index = index.checked_add(batch_len).ok_or(Errno::EINVAL)?;
                     continue;
                 }
+                PreparedPrivateFileCacheRun::Error(err) if index == 0 => return Err(err),
+                PreparedPrivateFileCacheRun::Error(_) => break,
                 PreparedPrivateFileCacheRun::Fallback => {}
             }
             match private_file_page(&self.file, file_offset, profile_phases) {
@@ -1451,6 +2171,7 @@ impl PrivateFileFaultAround {
         }
         #[cfg(feature = "performance-profile")]
         record_fault_around_prepare(pages, prepared.len());
+        debug_assert!(!prepared.spilled());
         Ok(prepared)
     }
 
@@ -1463,6 +2184,86 @@ impl PrivateFileFaultAround {
             VmBacking::File { file, offset }
                 if *offset == self.area_file_offset && Arc::ptr_eq(file, &self.file)
         )
+    }
+}
+
+impl AnonStoreFaultAround {
+    fn new(
+        fault_page: usize,
+        area_range: Range<usize>,
+        flags: VmFlags,
+        backing: &VmBacking,
+        kind: FaultKind,
+    ) -> Option<Self> {
+        let VmBacking::Anon { merge_domain } = backing else {
+            return None;
+        };
+        if !matches!(kind, FaultKind::Store)
+            || !flags.contains_all(VmFlags::USER | VmFlags::WRITE | VmFlags::ANON)
+            || flags.has(VmFlags::SHARED)
+            || flags.has(VmFlags::GROWS_DOWN)
+        {
+            return None;
+        }
+        let end = anon_store_fault_around_end(fault_page, &area_range, page_size())?;
+        Some(Self {
+            fault_page,
+            end,
+            area_range,
+            flags,
+            merge_domain: *merge_domain,
+        })
+    }
+
+    /// 在 VMA/pages 锁外分配并清零候选页。
+    ///
+    /// 真实故障页分配失败保留 ENOMEM；投机邻页首次失败只缩短窗口。
+    fn prepare(&self) -> Result<Vec<PreparedAnonPage>, Errno> {
+        let page_size = page_size();
+        let requested = (self.end - self.fault_page) / page_size;
+        let mut prepared = Vec::new();
+        // 元数据分配失败不应把一次可退化的优化升级为内核 fault；空前缀会让
+        // 提交路径转回既有单页处理。
+        if prepared.try_reserve_exact(requested).is_err() {
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_prepare(requested, 0, true);
+            return Ok(prepared);
+        }
+        for index in 0..requested {
+            let delta = index.checked_mul(page_size).ok_or(Errno::EINVAL)?;
+            let vaddr = self.fault_page.checked_add(delta).ok_or(Errno::EINVAL)?;
+            let paddr = if index == 0 {
+                alloc_zeroed_user_page()
+            } else {
+                let order = user_page_order().ok_or(Errno::EINVAL)?;
+                try_alloc_zeroed_user_page(order, page_size)
+            };
+            let Some(paddr) = paddr else {
+                if index == 0 {
+                    #[cfg(feature = "performance-profile")]
+                    record_anon_fault_around_prepare(requested, 0, false);
+                    return Err(Errno::ENOMEM);
+                }
+                break;
+            };
+            prepared.push(PreparedAnonPage {
+                vaddr,
+                page: ResidentPage::new_anon(paddr),
+            });
+        }
+        #[cfg(feature = "performance-profile")]
+        record_anon_fault_around_prepare(requested, prepared.len(), false);
+        Ok(prepared)
+    }
+
+    fn matches_area(&self, area: &VmArea) -> bool {
+        area.range == self.area_range
+            && area.flags == self.flags
+            && matches!(
+                &area.backing,
+                VmBacking::Anon { merge_domain }
+                    if merge_domain.same_snapshot_identity(self.merge_domain)
+            )
     }
 }
 
@@ -1852,7 +2653,7 @@ impl VmSpace {
             flags: flags.with(VmFlags::ANON),
             backing,
         };
-        let removed_areas = {
+        let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
             let removed_areas = vmas.unmap_range(&range);
             if let Err(err) = vmas.insert(area) {
@@ -1860,10 +2661,13 @@ impl VmSpace {
                 Self::notify_file_unmapped(&removed_areas);
                 return Err(err);
             }
-            removed_areas
+            // VMA 替换和旧 resident/PTE 清理必须对 fault 提交呈现为同一事务。
+            // fault-around 也遵循 vmas -> pages，因此不会在新 VMA 可见后又被
+            // 本次旧映射清理误删。
+            let removed = self.unmap_page_mappings(range.clone())?;
+            (removed_areas, removed)
         };
         Self::notify_file_unmapped(&removed_areas);
-        let removed = self.unmap_page_mappings(range.clone())?;
         if !removed.is_empty() {
             self.invalidate_user_range(range.start, range.end - range.start);
         }
@@ -1889,7 +2693,7 @@ impl VmSpace {
             flags,
             backing: VmBacking::File { file, offset },
         };
-        let removed_areas = {
+        let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
             let removed_areas = vmas.unmap_range(&range);
             if let Err(err) = vmas.insert(area) {
@@ -1900,11 +2704,11 @@ impl VmSpace {
             if shared_writable {
                 mapped_file.disable_private_page_cache();
             }
-            removed_areas
+            let removed = self.unmap_page_mappings(range.clone())?;
+            (removed_areas, removed)
         };
         Self::notify_file_unmapped(&removed_areas);
         mapped_file.on_mapped();
-        let removed = self.unmap_page_mappings(range.clone())?;
         if !removed.is_empty() {
             self.invalidate_user_range(range.start, range.end - range.start);
         }
@@ -1946,8 +2750,8 @@ impl VmSpace {
             va += page_size;
         }
         let mapped = pages.len();
-        drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
         self.publish_new_user_range(range.start, range.end - range.start);
         Ok(())
     }
@@ -1956,9 +2760,13 @@ impl VmSpace {
     #[kernel_symbols::export(name = "general.mm.VmSpace.unmap", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
-        let removed_areas = self.vmas.lock().unmap_range(&range);
+        let (removed_areas, removed) = {
+            let mut vmas = self.vmas.lock();
+            let removed_areas = vmas.unmap_range(&range);
+            let removed = self.unmap_page_mappings(range.clone())?;
+            (removed_areas, removed)
+        };
         Self::notify_file_unmapped(&removed_areas);
-        let removed = self.unmap_page_mappings(range.clone())?;
         if !removed.is_empty() {
             self.invalidate_user_range(range.start, range.end - range.start);
         }
@@ -2021,7 +2829,7 @@ impl VmSpace {
             return Err(Errno::EINVAL);
         }
 
-        let (removed_target, mapped_tail) = {
+        let (removed_target, mapped_tail, removed_pages, moved_pages) = {
             let mut vmas = self.vmas.lock();
             if !vmas.contains_range(&old_range) {
                 return Err(Errno::ENOMEM);
@@ -2065,19 +2873,23 @@ impl VmSpace {
             } else {
                 Vec::new()
             };
-            (removed_target, mapped_tail)
+            let removed_pages = self.unmap_page_mappings(new_range.clone())?;
+            let moved_pages =
+                self.move_page_mappings_locked(&vmas, old_range.start, new_range.start, old_len)?;
+            (removed_target, mapped_tail, removed_pages, moved_pages)
         };
         Self::notify_file_unmapped(&removed_target);
         Self::notify_files_mapped(mapped_tail);
-        drop(removed_target);
-        prune_shared_anon_pages();
-
-        let removed_pages = self.unmap_page_mappings(new_range.clone())?;
         if !removed_pages.is_empty() {
             self.invalidate_user_range(new_range.start, new_range.end - new_range.start);
         }
+        if moved_pages {
+            self.invalidate_user_range(old_range.start, old_len);
+            self.invalidate_user_range(new_range.start, old_len);
+        }
         drop(removed_pages);
-        self.move_page_mappings(old_range.start, new_range.start, old_len)?;
+        drop(removed_target);
+        prune_shared_anon_pages();
         self.mmap_next.store(new_range.end, Ordering::Release);
         Ok(new_range.start)
     }
@@ -2164,8 +2976,14 @@ impl VmSpace {
 
     /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
     pub fn discard_resident_range(&self, range: Range<usize>) -> Result<(), Errno> {
-        self.contains_user_range(range.clone())?;
-        let removed = self.unmap_page_mappings(range.clone())?;
+        self.validate_range(&range)?;
+        let removed = {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+            self.unmap_page_mappings(range.clone())?
+        };
         if !removed.is_empty() {
             self.invalidate_user_range(range.start, range.end - range.start);
         }
@@ -2242,7 +3060,8 @@ impl VmSpace {
     pub fn fork(&self) -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let new_pgd = (ops.new_pgd_for_user)();
-        let cloned_set = self.vmas.lock().fork_clone_metadata();
+        let mut parent_set = self.vmas.lock();
+        let cloned_set = parent_set.fork_clone_metadata();
         let cloned_file_backings = Self::collect_file_backings(cloned_set.iter());
         let mut child_pages = BTreeMap::new();
         let mut child_maps = Vec::new();
@@ -2269,6 +3088,7 @@ impl VmSpace {
                 child_pages.insert(*va, child_mapping);
             }
         }
+        drop(parent_set);
         if !child_maps.is_empty() {
             self.flush_full_user_tlb();
         }
@@ -2280,7 +3100,8 @@ impl VmSpace {
                     *va,
                     page.paddr(),
                     pte_flags_for(*flags, *access).with(VmFlags::USER),
-                );
+                )
+                .expect("[mm] fork child map failed");
             }
         }
 
@@ -2366,11 +3187,11 @@ impl VmSpace {
             else {
                 return FaultOutcome::Segv;
             };
-            let backing = set
+            let grown_area = set
                 .find(page)
-                .expect("[mm] grow_down_to 成功后必须覆盖目标页")
-                .backing
-                .clone();
+                .expect("[mm] grow_down_to 成功后必须覆盖目标页");
+            let backing = grown_area.backing.clone();
+            let area_range = grown_area.range.clone();
             drop(set);
             #[cfg(feature = "performance-profile")]
             if profile_hardware_fault {
@@ -2380,7 +3201,25 @@ impl VmSpace {
                     false,
                 );
             }
-            return self.commit_fault_page(page, backing, flags, page, kind, profile_phases);
+            return match self.commit_fault_page(
+                page,
+                area_range,
+                backing,
+                flags,
+                kind,
+                profile_phases,
+            ) {
+                FaultAroundCommit::Done(outcome) => outcome,
+                FaultAroundCommit::Retry => self.handle_fault_inner(
+                    addr,
+                    kind,
+                    publish_unchanged_mapping,
+                    false,
+                    profile_phases,
+                    #[cfg(feature = "performance-profile")]
+                    false,
+                ),
+            };
         };
         #[cfg(feature = "performance-profile")]
         let hardware_fault_backing = profile_hardware_fault
@@ -2397,12 +3236,13 @@ impl VmSpace {
         }
         let backing = area.backing.clone();
         let flags = area.flags;
-        let area_start = area.range.start;
         let area_range = area.range.clone();
         drop(set);
 
-        if let Some(outcome) = self.handle_resident_fault(
+        match self.handle_resident_fault(
             page,
+            &area_range,
+            &backing,
             flags,
             kind,
             publish_unchanged_mapping,
@@ -2410,7 +3250,19 @@ impl VmSpace {
             #[cfg(feature = "performance-profile")]
             hardware_fault_backing.map(|backing| (backing, hardware_fault_access)),
         ) {
-            return outcome;
+            Ok(Some(outcome)) => return outcome,
+            Ok(None) => {}
+            Err(()) => {
+                return self.handle_fault_inner(
+                    addr,
+                    kind,
+                    publish_unchanged_mapping,
+                    false,
+                    profile_phases,
+                    #[cfg(feature = "performance-profile")]
+                    false,
+                );
+            }
         }
         #[cfg(feature = "performance-profile")]
         if let Some(backing) = hardware_fault_backing {
@@ -2423,12 +3275,36 @@ impl VmSpace {
             && matches!(&backing, VmBacking::Anon { .. })
             && flags.contains_all(VmFlags::USER | VmFlags::WRITE | VmFlags::ANON)
             && !flags.has(VmFlags::SHARED)
+            && !flags.has(VmFlags::GROWS_DOWN)
         {
             record_anon_store_shadow_fault(self.profile_identity, page, area_range.end);
         }
 
         if allow_fault_around {
-            if let Some(plan) = PrivateFileFaultAround::new(page, area_range, flags, &backing, kind)
+            if let Some(plan) =
+                AnonStoreFaultAround::new(page, area_range.clone(), flags, &backing, kind)
+            {
+                let prepared = match plan.prepare() {
+                    Ok(prepared) => prepared,
+                    Err(err) => return fault_from_errno(err),
+                };
+                match self.commit_anon_store_fault_around(&plan, prepared) {
+                    FaultAroundCommit::Done(outcome) => return outcome,
+                    FaultAroundCommit::Retry => {
+                        return self.handle_fault_inner(
+                            addr,
+                            kind,
+                            publish_unchanged_mapping,
+                            false,
+                            profile_phases,
+                            #[cfg(feature = "performance-profile")]
+                            false,
+                        );
+                    }
+                }
+            }
+            if let Some(plan) =
+                PrivateFileFaultAround::new(page, area_range.clone(), flags, &backing, kind)
             {
                 let prepared = match plan.prepare(profile_phases) {
                     Ok(prepared) => prepared,
@@ -2453,7 +3329,18 @@ impl VmSpace {
             }
         }
 
-        self.commit_fault_page(page, backing, flags, area_start, kind, profile_phases)
+        match self.commit_fault_page(page, area_range, backing, flags, kind, profile_phases) {
+            FaultAroundCommit::Done(outcome) => outcome,
+            FaultAroundCommit::Retry => self.handle_fault_inner(
+                addr,
+                kind,
+                publish_unchanged_mapping,
+                false,
+                profile_phases,
+                #[cfg(feature = "performance-profile")]
+                false,
+            ),
+        }
     }
 
     /// 取得从用户地址读取的一页内连续窗口。
@@ -2668,8 +3555,8 @@ impl VmSpace {
             page_va += page_size;
         }
         let mapped = pages.len();
-        drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
         self.publish_new_user_range(start, end - start);
         Ok(())
     }
@@ -2783,8 +3670,8 @@ impl VmSpace {
         self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))?;
         pages.insert(page_va, PageMapping { page, access });
         let mapped = pages.len();
-        drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
         self.publish_new_user_range(page_va, page_size);
         Ok(())
     }
@@ -2838,7 +3725,7 @@ impl VmSpace {
     fn commit_private_file_fault_around(
         &self,
         plan: &PrivateFileFaultAround,
-        prepared: Vec<PreparedFilePage>,
+        prepared: PreparedFilePages,
         profile_phases: bool,
     ) -> FaultAroundCommit {
         #[cfg(feature = "performance-profile")]
@@ -2898,21 +3785,19 @@ impl VmSpace {
             let duplicate = pages.range(suffix_start..suffix_end).count();
             record_fault_around_collision(duplicate, prepared_len - prefix_len - duplicate);
         }
-        let mut installed = 0usize;
-        let mut map_error = None;
+        debug_assert!(prefix_len <= FILE_FAULT_AROUND_PAGES);
+        let mut paddrs = [0usize; FILE_FAULT_AROUND_PAGES];
+        for (slot, candidate) in paddrs.iter_mut().zip(prepared.iter()).take(prefix_len) {
+            *slot = candidate.page.paddr();
+        }
+        let (installed, map_error) = self.map_pages_no_flush(
+            plan.fault_page,
+            &paddrs[..prefix_len],
+            pte_flags_for(plan.flags, PageAccess::ReadOnly),
+        );
         let mut candidates = prepared.into_iter();
-        let mut failed_candidate = None;
-        for candidate in candidates.by_ref().take(prefix_len) {
+        for candidate in candidates.by_ref().take(installed) {
             let access = PageAccess::ReadOnly;
-            if let Err(err) = self.map_page_no_flush(
-                candidate.vaddr,
-                candidate.page.paddr(),
-                pte_flags_for(plan.flags, access),
-            ) {
-                map_error = Some(err);
-                failed_candidate = Some(candidate);
-                break;
-            }
             pages.insert(
                 candidate.vaddr,
                 PageMapping {
@@ -2920,13 +3805,14 @@ impl VmSpace {
                     access,
                 },
             );
-            installed += 1;
         }
         let mapped = pages.len();
+        if installed != 0 {
+            self.mapped_pages.store(mapped, Ordering::Release);
+        }
         drop(pages);
         drop(set);
         // 未采用的投机页可能触发物理页回收，必须在 VMA/pages 锁外析构。
-        drop(failed_candidate);
         drop(candidates);
         #[cfg(feature = "performance-profile")]
         if installed != prefix_len {
@@ -2936,7 +3822,6 @@ impl VmSpace {
         record_fault_around_commit(installed, false);
 
         if installed != 0 {
-            self.mapped_pages.store(mapped, Ordering::Release);
             // 页表屏障会发布本轮写入的全部投机 PTE；当前 CPU 只有真正触发
             // 硬件异常的 fault_page 必然缓存过旧的无效 translation。邻页若在
             // 其它 CPU 上并发 fault，会在 resident/race 路径各自做本地定向
@@ -2948,50 +3833,223 @@ impl VmSpace {
         FaultAroundCommit::Done(fault_from_errno(map_error.unwrap_or(Errno::EINVAL)))
     }
 
+    /// 提交在锁外准备的私有匿名零页。
+    ///
+    /// 锁序保持 `vmas -> pages`。持锁后重验 VMA 快照，并以 resident
+    /// map 和真实叶 PTE 的首个冲突同时截断连续前缀，绝不覆盖已有映射。
+    fn commit_anon_store_fault_around(
+        &self,
+        plan: &AnonStoreFaultAround,
+        prepared: Vec<PreparedAnonPage>,
+    ) -> FaultAroundCommit {
+        if prepared.is_empty() {
+            return FaultAroundCommit::Retry;
+        }
+
+        let set = self.vmas.lock();
+        let Some(area) = set.find(plan.fault_page) else {
+            #[cfg(feature = "performance-profile")]
+            let discarded = prepared.len();
+            drop(set);
+            drop(prepared);
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_discard(
+                &anon_fault_around_cpu_counters().vma_retry_pages,
+                discarded,
+            );
+            return FaultAroundCommit::Retry;
+        };
+        if !plan.matches_area(area) {
+            #[cfg(feature = "performance-profile")]
+            let discarded = prepared.len();
+            drop(set);
+            drop(prepared);
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_discard(
+                &anon_fault_around_cpu_counters().vma_retry_pages,
+                discarded,
+            );
+            return FaultAroundCommit::Retry;
+        }
+
+        let Some(ops) = user_pgd_ops() else {
+            #[cfg(feature = "performance-profile")]
+            let discarded = prepared.len();
+            drop(set);
+            drop(prepared);
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_discard(
+                &anon_fault_around_cpu_counters().invariant_failure_pages,
+                discarded,
+            );
+            return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                KernelFaultReason::NotInitialized,
+            ));
+        };
+        let page_size = page_size();
+        let mut pages = self.pages.lock();
+        let fault_resident = pages.contains_key(&plan.fault_page);
+        let fault_present =
+            unsafe { (ops.count_mapped)(self.pgd, plan.fault_page, page_size) } != 0;
+        if fault_resident != fault_present {
+            #[cfg(feature = "performance-profile")]
+            let discarded = prepared.len();
+            drop(pages);
+            drop(set);
+            drop(prepared);
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_discard(
+                &anon_fault_around_cpu_counters().invariant_failure_pages,
+                discarded,
+            );
+            return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                KernelFaultReason::UncaughtKernelAccess,
+            ));
+        }
+        if fault_resident {
+            #[cfg(feature = "performance-profile")]
+            let discarded = prepared.len();
+            drop(pages);
+            drop(set);
+            drop(prepared);
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_discard(
+                &anon_fault_around_cpu_counters().raced_pages,
+                discarded,
+            );
+            self.publish_new_user_range(plan.fault_page, page_size);
+            return FaultAroundCommit::Done(FaultOutcome::Fixed);
+        }
+
+        // 对最多四页逐项闭合 resident 账本与真实叶 PTE。二者一致的首个已有
+        // 映射截断投机前缀；任何单边存在都表示生命周期不变量已破坏，必须
+        // fail-closed，不能让没有 Arc 保活的 PTE 继续访问。
+        let mut prefix_len = 0usize;
+        let mut invariant_failure = false;
+        for candidate in &prepared {
+            let resident = pages.contains_key(&candidate.vaddr);
+            let present = unsafe { (ops.count_mapped)(self.pgd, candidate.vaddr, page_size) } != 0;
+            if resident != present {
+                invariant_failure = true;
+                break;
+            }
+            if resident {
+                break;
+            }
+            prefix_len += 1;
+        }
+        if invariant_failure || prefix_len == 0 {
+            #[cfg(feature = "performance-profile")]
+            let discarded = prepared.len();
+            drop(pages);
+            drop(set);
+            drop(prepared);
+            #[cfg(feature = "performance-profile")]
+            record_anon_fault_around_discard(
+                &anon_fault_around_cpu_counters().invariant_failure_pages,
+                discarded,
+            );
+            return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                KernelFaultReason::UncaughtKernelAccess,
+            ));
+        }
+
+        #[cfg(feature = "performance-profile")]
+        let prepared_len = prepared.len();
+        debug_assert!(prefix_len <= ANON_STORE_FAULT_AROUND_PAGES);
+        let mut paddrs = [0usize; ANON_STORE_FAULT_AROUND_PAGES];
+        for (slot, candidate) in paddrs.iter_mut().zip(prepared.iter()).take(prefix_len) {
+            *slot = candidate.page.paddr();
+        }
+        let (installed, map_error) = self.map_pages_no_flush(
+            plan.fault_page,
+            &paddrs[..prefix_len],
+            pte_flags_for(plan.flags, PageAccess::Writable),
+        );
+        let mut candidates = prepared.into_iter();
+        for candidate in candidates.by_ref().take(installed) {
+            let access = PageAccess::Writable;
+            pages.insert(
+                candidate.vaddr,
+                PageMapping {
+                    page: candidate.page,
+                    access,
+                },
+            );
+        }
+        let mapped = pages.len();
+        if installed != 0 {
+            self.mapped_pages.store(mapped, Ordering::Release);
+        }
+        drop(pages);
+        drop(set);
+        // 未提交页的 Arc 析构会归还物理页，必须发生在 VMA/pages 锁外。
+        drop(candidates);
+        #[cfg(feature = "performance-profile")]
+        record_anon_fault_around_commit(
+            installed,
+            prepared_len - prefix_len,
+            prefix_len - installed,
+            map_error.is_some(),
+        );
+
+        if installed == 0 {
+            if matches!(map_error, Some(Errno::ENOMEM)) {
+                // 释放全部投机数据页后退回单页路径，让页表页分配在更低内存
+                // 压力下重试；不能把批量优化自身造成的临界 OOM 升级为 panic。
+                return FaultAroundCommit::Retry;
+            }
+            return FaultAroundCommit::Done(fault_from_errno(map_error.unwrap_or(Errno::EINVAL)));
+        }
+        // 一次屏障发布全部 PTE；仅 fault_page 必然在本 CPU 缓存了无效翻译。
+        self.publish_new_user_range(plan.fault_page, page_size);
+        FaultAroundCommit::Done(FaultOutcome::Fixed)
+    }
+
     fn commit_fault_page(
         &self,
         page_va: usize,
+        area_range: Range<usize>,
         backing: VmBacking,
         flags: VmFlags,
-        area_start: usize,
         kind: FaultKind,
         profile_phases: bool,
-    ) -> FaultOutcome {
+    ) -> FaultAroundCommit {
         #[cfg(feature = "performance-profile")]
         let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultSingle));
         #[cfg(not(feature = "performance-profile"))]
         let _ = profile_phases;
-        let page = match backing {
+        let page = match &backing {
             VmBacking::Anon { .. } => alloc_zeroed_user_page()
                 .map(ResidentPage::new_anon)
                 .ok_or(Errno::ENOMEM),
             VmBacking::SharedAnon { object, offset } => {
-                let object_off = offset + (page_va - area_start) as u64;
-                shared_anon_page(&object, object_off)
+                let object_off = offset + (page_va - area_range.start) as u64;
+                shared_anon_page(object, object_off)
             }
             VmBacking::File { file, offset } => {
-                let file_off = offset + (page_va - area_start) as u64;
+                let file_off = offset + (page_va - area_range.start) as u64;
                 if flags.has(VmFlags::SHARED) {
-                    shared_file_page(file, file_off)
+                    shared_file_page(Arc::clone(file), file_off)
                 } else {
-                    private_file_page(&file, file_off, profile_phases)
+                    private_file_page(file, file_off, profile_phases)
                 }
             }
             VmBacking::Direct(base) => {
-                let paddr = base + (page_va - area_start);
+                let paddr = base + (page_va - area_range.start);
                 Ok(ResidentPage::new_direct(paddr))
             }
         };
         let page = match page {
             Ok(page) => page,
-            Err(err) => return fault_from_errno(err),
+            Err(err) => return FaultAroundCommit::Done(fault_from_errno(err)),
         };
         let mut page = page;
         let mut access = access_for_new_page(flags, &page);
         if is_write_fault(kind) && matches!(access, PageAccess::Cow) {
             page = match clone_page_to_anon(&page) {
                 Ok(page) => page,
-                Err(err) => return fault_from_errno(err),
+                Err(err) => return FaultAroundCommit::Done(fault_from_errno(err)),
             };
             access = PageAccess::Writable;
         }
@@ -3006,29 +4064,70 @@ impl VmSpace {
             access = PageAccess::Writable;
         }
 
+        let set = self.vmas.lock();
+        let Some(area) = set.find(page_va) else {
+            drop(set);
+            drop(page);
+            return FaultAroundCommit::Retry;
+        };
+        if area.range != area_range
+            || area.flags != flags
+            || !same_backing_snapshot(&area.backing, &backing)
+        {
+            drop(set);
+            drop(page);
+            return FaultAroundCommit::Retry;
+        }
+
         let mut pages = self.pages.lock();
+        let pte_present = user_pgd_ops().is_some_and(|ops| {
+            (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
+        });
         if let Some(mapping) = pages.get_mut(&page_va) {
+            if !pte_present {
+                drop(pages);
+                drop(set);
+                drop(page);
+                return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                    KernelFaultReason::UncaughtKernelAccess,
+                ));
+            }
             let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
             drop(pages);
-            return self.finish_resident_fault(page_va, update, true);
+            drop(set);
+            drop(page);
+            return FaultAroundCommit::Done(self.finish_resident_fault(page_va, update, true));
+        }
+        if pte_present {
+            drop(pages);
+            drop(set);
+            drop(page);
+            return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                KernelFaultReason::UncaughtKernelAccess,
+            ));
         }
         if let Err(err) =
             self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
         {
             drop(pages);
-            return fault_from_errno(err);
+            drop(set);
+            drop(page);
+            return FaultAroundCommit::Done(fault_from_errno(err));
         }
         pages.insert(page_va, PageMapping { page, access });
         let mapped = pages.len();
-        drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
+        drop(set);
         self.publish_new_user_range(page_va, page_size());
-        FaultOutcome::Fixed
+        FaultAroundCommit::Done(FaultOutcome::Fixed)
     }
 
     fn handle_resident_fault(
         &self,
         page_va: usize,
+        area_range: &Range<usize>,
+        backing: &VmBacking,
         flags: VmFlags,
         kind: FaultKind,
         publish_unchanged_mapping: bool,
@@ -3037,21 +4136,50 @@ impl VmSpace {
             HardwareFaultBacking,
             HardwareFaultAccess,
         )>,
-    ) -> Option<FaultOutcome> {
+    ) -> Result<Option<FaultOutcome>, ()> {
         #[cfg(feature = "performance-profile")]
         let _profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
         #[cfg(not(feature = "performance-profile"))]
         let _ = profile_phases;
+        let set = self.vmas.lock();
+        let Some(area) = set.find(page_va) else {
+            return Err(());
+        };
+        if area.range != *area_range
+            || area.flags != flags
+            || !same_backing_snapshot(&area.backing, backing)
+        {
+            return Err(());
+        }
         let mut pages = self.pages.lock();
-        let mapping = pages.get_mut(&page_va)?;
+        let Some(mapping) = pages.get_mut(&page_va) else {
+            drop(pages);
+            drop(set);
+            return Ok(None);
+        };
+        let pte_present = user_pgd_ops().is_some_and(|ops| {
+            (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
+        });
+        if !pte_present {
+            drop(pages);
+            drop(set);
+            return Ok(Some(FaultOutcome::Kernel(
+                KernelFaultReason::UncaughtKernelAccess,
+            )));
+        }
         #[cfg(feature = "performance-profile")]
         if let Some((backing, access)) = hardware_fault {
             record_hardware_user_fault(backing, access, true);
         }
         let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
         drop(pages);
-        Some(self.finish_resident_fault(page_va, update, publish_unchanged_mapping))
+        drop(set);
+        Ok(Some(self.finish_resident_fault(
+            page_va,
+            update,
+            publish_unchanged_mapping,
+        )))
     }
 
     fn finish_resident_fault(
@@ -3124,10 +4252,25 @@ impl VmSpace {
 
     fn map_page_no_flush(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        unsafe {
-            (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
-        }
-        Ok(())
+        unsafe { (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER)) }
+            .map_err(errno_from_map_error)
+    }
+
+    /// 连续安装基础页叶 PTE，并返回已生效前缀及首个错误。
+    ///
+    /// 批量 arch 回调可能在页表页分配失败前已经发布一部分叶 PTE；调用方必须
+    /// 用返回的页数同步提交 resident 页所有权，不能回滚这些已可见映射。
+    fn map_pages_no_flush(
+        &self,
+        vaddr: usize,
+        paddrs: &[usize],
+        flags: VmFlags,
+    ) -> (usize, Option<Errno>) {
+        let Some(ops) = user_pgd_ops() else {
+            return (0, Some(Errno::EINVAL));
+        };
+        let result = unsafe { (ops.map_pages)(self.pgd, vaddr, paddrs, flags.with(VmFlags::USER)) };
+        (result.mapped, result.error.map(errno_from_map_error))
     }
 
     fn protect_page_no_flush(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
@@ -3176,7 +4319,8 @@ impl VmSpace {
         let page_size = page_size();
         unsafe {
             (ops.unmap)(self.pgd, vaddr, page_size);
-            (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
+            (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER))
+                .expect("[mm] replacement map failed after retaining page-table path");
         }
         Ok(())
     }
@@ -3193,20 +4337,21 @@ impl VmSpace {
             }
         }
         let mapped = pages.len();
-        drop(pages);
         self.mapped_pages.store(mapped, Ordering::Release);
+        drop(pages);
         Ok(removed)
     }
 
-    fn move_page_mappings(
+    /// 在调用方持有 VMA 锁时迁移 resident/PTE，保持元数据和页表事务一致。
+    fn move_page_mappings_locked(
         &self,
+        set: &VmaSet,
         old_start: usize,
         new_start: usize,
         len: usize,
-    ) -> Result<(), Errno> {
+    ) -> Result<bool, Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let old_range = old_start..old_start + len;
-        let set = self.vmas.lock();
         let mut pages = self.pages.lock();
         let keys: Vec<usize> = pages.range(old_range.clone()).map(|(va, _)| *va).collect();
         let mut moves = Vec::with_capacity(keys.len());
@@ -3225,19 +4370,15 @@ impl VmSpace {
             let mapping = pages.remove(&old_va).ok_or(Errno::ENOMEM)?;
             unsafe {
                 (ops.unmap)(self.pgd, old_va, page_size());
-                (ops.map)(self.pgd, new_va, paddr, flags.with(VmFlags::USER));
+                (ops.map)(self.pgd, new_va, paddr, flags.with(VmFlags::USER))
+                    .expect("[mm] mremap destination map failed");
             }
             pages.insert(new_va, mapping);
         }
         let mapped = pages.len();
-        drop(pages);
-        drop(set);
         self.mapped_pages.store(mapped, Ordering::Release);
-        if !keys.is_empty() {
-            self.invalidate_user_range(old_start, len);
-            self.invalidate_user_range(new_start, len);
-        }
-        Ok(())
+        drop(pages);
+        Ok(!keys.is_empty())
     }
 
     fn extend_mapping_in_place(
@@ -3415,8 +4556,8 @@ fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<Reside
 
 /// 在 fault-around 准备阶段合并连续私有文件 cache miss。
 ///
-/// 命中页直接返回，短 miss 前缀或任何乐观快照失败均交回原有逐页路径；因此本
-/// helper 不改变普通 fault 的错误和重试语义，只减少稳定只读文件的 VFS 调用数。
+/// 命中页直接返回，短 miss 前缀或任何乐观快照失败均交回原有逐页路径；候选窗口
+/// 只执行一次 claim 流，不再先逐页探测、随后为同一批 key 重走缓存查找。
 fn prepare_private_file_cache_run(
     file: &Arc<dyn FileLike>,
     file_off: u64,
@@ -3435,49 +4576,12 @@ fn prepare_private_file_cache_run(
         return PreparedPrivateFileCacheRun::Fallback;
     }
 
-    let first_key = FilePageKey::new_private(file_key, file_off, generation);
-    if let Some(page) = find_cached_private_file_page(&PRIVATE_FILE_PAGES, first_key) {
-        return if file.private_page_cache_generation() == Some(generation) {
-            PreparedPrivateFileCacheRun::Cached(page)
-        } else {
-            PreparedPrivateFileCacheRun::Fallback
-        };
-    }
-    if file.private_page_cache_generation() != Some(generation) {
-        return PreparedPrivateFileCacheRun::Fallback;
-    }
-
-    let Some(probe_plan) =
+    let Some(plan) =
         private_file_batch_plan(file_off, file_size, window_pages, window_pages, page_size)
     else {
         return PreparedPrivateFileCacheRun::Fallback;
     };
-    let mut consecutive_misses = 1usize;
-    while consecutive_misses < probe_plan.pages {
-        let Some(offset) = private_file_batch_page_offset(file_off, consecutive_misses, page_size)
-        else {
-            return PreparedPrivateFileCacheRun::Fallback;
-        };
-        let key = FilePageKey::new_private(file_key, offset, generation);
-        if find_cached_private_file_page(&PRIVATE_FILE_PAGES, key).is_some() {
-            break;
-        }
-        if file.private_page_cache_generation() != Some(generation) {
-            return PreparedPrivateFileCacheRun::Fallback;
-        }
-        consecutive_misses += 1;
-    }
-
-    let Some(plan) = private_file_batch_plan(
-        file_off,
-        file_size,
-        window_pages,
-        consecutive_misses,
-        page_size,
-    ) else {
-        return PreparedPrivateFileCacheRun::Fallback;
-    };
-    load_private_file_page_batch(
+    match load_private_file_page_batch(
         file,
         file_key,
         generation,
@@ -3485,11 +4589,12 @@ fn prepare_private_file_cache_run(
         page_size,
         plan,
         profile_phases,
-    )
-    .map_or(
-        PreparedPrivateFileCacheRun::Fallback,
-        PreparedPrivateFileCacheRun::Batched,
-    )
+    ) {
+        Ok(PrivateFilePageBatchLoad::Cached(page)) => PreparedPrivateFileCacheRun::Cached(page),
+        Ok(PrivateFilePageBatchLoad::Batched(batch)) => PreparedPrivateFileCacheRun::Batched(batch),
+        Ok(PrivateFilePageBatchLoad::Fallback) => PreparedPrivateFileCacheRun::Fallback,
+        Err(error) => PreparedPrivateFileCacheRun::Error(error),
+    }
 }
 
 fn load_private_file_page_batch(
@@ -3500,65 +4605,136 @@ fn load_private_file_page_batch(
     page_size: usize,
     plan: PrivateFileBatchPlan,
     profile_phases: bool,
-) -> Option<Vec<Arc<ResidentPage>>> {
+) -> Result<PrivateFilePageBatchLoad, Errno> {
     #[cfg(not(feature = "performance-profile"))]
     let _ = profile_phases;
-    let mut bounce = Vec::new();
-    bounce.try_reserve_exact(plan.buffer_len).ok()?;
-    bounce.resize(plan.buffer_len, 0);
-
     #[cfg(feature = "performance-profile")]
     let _profile = profile_phases.then(|| profiling::scope(profiling::Event::PageFaultCacheFill));
     if file.private_page_cache_generation() != Some(generation) {
-        return None;
-    }
-    read_file_bytes_exact(file.as_ref(), file_off, &mut bounce[..plan.read_len]).ok()?;
-    if file.private_page_cache_generation() != Some(generation) {
-        return None;
+        return Ok(PrivateFilePageBatchLoad::Fallback);
     }
 
-    let virt = allocator::KERNEL_ALLOCATOR.load_phys_to_virt()?;
-    let mut candidates = Vec::new();
-    candidates.try_reserve_exact(plan.pages).ok()?;
-    let mut pages = Vec::new();
-    pages.try_reserve_exact(plan.pages).ok()?;
-    let mut published_candidates = Vec::new();
-    published_candidates.try_reserve_exact(plan.pages).ok()?;
-
+    let Some(virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    };
+    if plan.pages > PRIVATE_FILE_BATCH_MAX_PAGES {
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
+    let mut owners = PrivateFilePageLoadOwners::new();
     for index in 0..plan.pages {
-        let offset = private_file_batch_page_offset(file_off, index, page_size)?;
-        let source_start = index.checked_mul(page_size)?;
-        let source_end = source_start.checked_add(page_size)?;
-        let paddr = alloc_zeroed_user_page()?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bounce[source_start..source_end].as_ptr(),
-                virt(paddr) as *mut u8,
-                page_size,
-            );
+        let Some(offset) = private_file_batch_page_offset(file_off, index, page_size) else {
+            abort_private_file_page_loads(&owners, None);
+            return Ok(PrivateFilePageBatchLoad::Fallback);
+        };
+        let key = FilePageKey::new_private(file_key, offset, generation);
+        match PRIVATE_FILE_PAGES.claim(key) {
+            PrivateFilePageCacheClaim::Ready(page) if index == 0 => {
+                abort_private_file_page_loads(&owners, None);
+                if file.private_page_cache_generation() != Some(generation) {
+                    return Ok(PrivateFilePageBatchLoad::Fallback);
+                }
+                return Ok(PrivateFilePageBatchLoad::Cached(page));
+            }
+            PrivateFilePageCacheClaim::Ready(_) | PrivateFilePageCacheClaim::Loading(_) => {
+                break;
+            }
+            PrivateFilePageCacheClaim::Failed(error)
+                if private_file_batch_error_is_fatal(index) =>
+            {
+                abort_private_file_page_loads(&owners, None);
+                return if file.private_page_cache_generation() == Some(generation) {
+                    Err(error)
+                } else {
+                    Ok(PrivateFilePageBatchLoad::Fallback)
+                };
+            }
+            PrivateFilePageCacheClaim::Failed(_) => break,
+            PrivateFilePageCacheClaim::Owner(load_id) => owners.push((key, offset, load_id)),
+            PrivateFilePageCacheClaim::Bypass => {
+                abort_private_file_page_loads(&owners, None);
+                return Ok(PrivateFilePageBatchLoad::Fallback);
+            }
         }
-        candidates.push((
-            FilePageKey::new_private(file_key, offset, generation),
-            ResidentPage::new_private_file(paddr),
-        ));
     }
+    if owners.len() < PRIVATE_FILE_BATCH_MIN_PAGES {
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
+    debug_assert!(!owners.spilled());
     if file.private_page_cache_generation() != Some(generation) {
-        return None;
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
     }
 
-    for (key, candidate) in candidates {
-        let candidate_ref = Arc::clone(&candidate);
-        let page = publish_cached_private_file_page(&PRIVATE_FILE_PAGES, key, candidate);
-        if Arc::ptr_eq(&page, &candidate_ref) {
-            published_candidates.push((key, candidate_ref));
+    let mut candidates = PrivateFilePageCandidates::new();
+    let mut pages = PrivateFilePageBatch::new();
+    let mut published_candidates = PublishedPrivateFilePages::new();
+
+    for (key, _, load_id) in &owners {
+        // Safety: 候选页在读满有效前缀并清零 EOF 尾部前不会进入 cache 或页表。
+        let Some(paddr) = (unsafe { alloc_uninitialized_user_page() }) else {
+            abort_private_file_page_loads(&owners, None);
+            return Ok(PrivateFilePageBatchLoad::Fallback);
+        };
+        let candidate = ResidentPage::new_private_file(paddr);
+        candidates.push((*key, *load_id, candidate));
+    }
+    debug_assert!(!candidates.spilled());
+    let Some(owner_capacity) = owners.len().checked_mul(page_size) else {
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    };
+    let valid_len = plan.read_len.min(owner_capacity);
+    if valid_len == 0 {
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
+    let mut targets = PrivateFilePageTargets::new();
+    for (_, _, candidate) in &candidates {
+        // Safety: 每个 candidate 持有不同的独占物理页；所有页在本次批量读取完成
+        // 前都只存在于本地内联批次，尚未进入 cache、resident map 或用户页表。
+        targets.push(unsafe {
+            core::slice::from_raw_parts_mut(virt(candidate.paddr()) as *mut u8, page_size)
+        });
+    }
+    debug_assert!(!targets.spilled());
+    let read_result = file.read_pages_at(file_off, targets.as_mut_slice(), valid_len);
+    drop(targets);
+    if let Err(error) = read_result {
+        if file.private_page_cache_generation() == Some(generation) {
+            abort_private_file_page_loads(&owners, Some(error));
+            return Err(error);
         }
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
+    if file.private_page_cache_generation() != Some(generation) {
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
+
+    let mut candidates = candidates.into_iter();
+    while let Some((key, load_id, candidate)) = candidates.next() {
+        let Some(page) = PRIVATE_FILE_PAGES.finish_load(key, load_id, candidate) else {
+            for (remaining_key, remaining_load_id, _) in candidates {
+                PRIVATE_FILE_PAGES.abort_load(remaining_key, remaining_load_id, None);
+            }
+            rollback_private_file_page_batch(&published_candidates);
+            return Ok(PrivateFilePageBatchLoad::Fallback);
+        };
+        published_candidates.push((key, Arc::clone(&page)));
         pages.push(page);
         if file.private_page_cache_generation() != Some(generation) {
+            for (remaining_key, remaining_load_id, _) in candidates {
+                PRIVATE_FILE_PAGES.abort_load(remaining_key, remaining_load_id, None);
+            }
             rollback_private_file_page_batch(&published_candidates);
-            return None;
+            return Ok(PrivateFilePageBatchLoad::Fallback);
         }
     }
-    Some(pages)
+    debug_assert!(!pages.spilled());
+    debug_assert!(!published_candidates.spilled());
+    Ok(PrivateFilePageBatchLoad::Batched(pages))
 }
 
 fn rollback_private_file_page_batch(published: &[(FilePageKey, Arc<ResidentPage>)]) {
@@ -3586,13 +4762,33 @@ fn private_file_page(
             return Ok(ResidentPage::new_private_file(paddr));
         };
         let key = FilePageKey::new_private(file_key, file_off, generation);
-        let cached = find_cached_private_file_page(&PRIVATE_FILE_PAGES, key);
-        if let Some(page) = cached {
-            if file.private_page_cache_generation() == Some(generation) {
-                return Ok(page);
+        let load = match PRIVATE_FILE_PAGES.claim(key) {
+            PrivateFilePageCacheClaim::Ready(page) => {
+                if file.private_page_cache_generation() == Some(generation) {
+                    return Ok(page);
+                }
+                continue;
             }
-            continue;
-        }
+            PrivateFilePageCacheClaim::Loading(load) => {
+                if file.private_page_cache_generation() != Some(generation) {
+                    continue;
+                }
+                match load.wait()? {
+                    Some(page) if file.private_page_cache_generation() == Some(generation) => {
+                        return Ok(page);
+                    }
+                    Some(_) | None => continue,
+                }
+            }
+            PrivateFilePageCacheClaim::Failed(error) => {
+                if file.private_page_cache_generation() == Some(generation) {
+                    return Err(error);
+                }
+                continue;
+            }
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            PrivateFilePageCacheClaim::Bypass => break,
+        };
         #[cfg(feature = "performance-profile")]
         let _profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultCacheFill));
@@ -3602,16 +4798,21 @@ fn private_file_page(
                 // truncate/write 可在读页期间改变 EOF。若代际已经变化，这次短读
                 // 只是乐观快照失效，应重试新代际；稳定代际的真实 I/O 错误才传播。
                 if file.private_page_cache_generation() != Some(generation) {
+                    PRIVATE_FILE_PAGES.abort_load(key, load, None);
                     continue;
                 }
+                PRIVATE_FILE_PAGES.abort_load(key, load, Some(err));
                 return Err(err);
             }
         };
         let page = ResidentPage::new_private_file(paddr);
         if file.private_page_cache_generation() != Some(generation) {
+            PRIVATE_FILE_PAGES.abort_load(key, load, None);
             continue;
         }
-        let page = publish_cached_private_file_page(&PRIVATE_FILE_PAGES, key, page);
+        let Some(page) = PRIVATE_FILE_PAGES.finish_load(key, load, page) else {
+            continue;
+        };
         if file.private_page_cache_generation() == Some(generation) {
             return Ok(page);
         }
@@ -3626,6 +4827,7 @@ fn private_file_page(
     Ok(ResidentPage::new_private_file(paddr))
 }
 
+#[cfg(test)]
 fn find_cached_private_file_page<const SHARD_COUNT: usize>(
     cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
     key: FilePageKey,
@@ -3633,14 +4835,34 @@ fn find_cached_private_file_page<const SHARD_COUNT: usize>(
     cache.find(key)
 }
 
-/// 并发缺页可能同时读出同一私有文件页。缓存锁内只发布强引用和选择淘汰者；
-/// 竞争失败的候选及淘汰页都在锁外析构，避免页析构/物理页释放扩大临界区。
+fn abort_private_file_page_loads(loads: &[(FilePageKey, u64, u64)], error: Option<Errno>) {
+    for (key, _, load_id) in loads {
+        PRIVATE_FILE_PAGES.abort_load(*key, *load_id, error);
+    }
+}
+
+#[cfg(test)]
 fn publish_cached_private_file_page<const SHARD_COUNT: usize>(
     cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
     key: FilePageKey,
     candidate: Arc<ResidentPage>,
 ) -> Arc<ResidentPage> {
-    cache.publish(key, candidate)
+    loop {
+        match cache.claim(key) {
+            PrivateFilePageCacheClaim::Ready(page) => return page,
+            PrivateFilePageCacheClaim::Loading(load) => match load.wait() {
+                Ok(Some(page)) => return page,
+                Ok(None) | Err(_) => continue,
+            },
+            PrivateFilePageCacheClaim::Failed(_) => continue,
+            PrivateFilePageCacheClaim::Owner(load_id) => {
+                if let Some(page) = cache.finish_load(key, load_id, Arc::clone(&candidate)) {
+                    return page;
+                }
+            }
+            PrivateFilePageCacheClaim::Bypass => return candidate,
+        }
+    }
 }
 
 /// 在物理页压力下强制释放一批私有文件缓存引用。
@@ -3724,15 +4946,17 @@ fn load_file_page(file: &dyn FileLike, file_off: u64) -> Result<usize, Errno> {
     if file_off >= file_size {
         return Err(Errno::EINVAL);
     }
-    let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+    // Safety: 本函数只在文件有效前缀和 EOF 尾部全部初始化成功后返回物理页。
+    let paddr = unsafe { alloc_uninitialized_user_page().ok_or(Errno::ENOMEM)? };
     let result = (|| {
         let virt = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EINVAL)?;
         let page_size = page_size();
         let len = (file_size - file_off).min(page_size as u64) as usize;
+        // Safety: paddr 是尚未发布的独占整页，直映地址覆盖 page_size 字节。
         let kbuf = unsafe { core::slice::from_raw_parts_mut(virt(paddr) as *mut u8, page_size) };
-        read_file_bytes_exact(file, file_off, &mut kbuf[..len])
+        read_file_page_exact(file, file_off, kbuf, len)
     })();
     if result.is_err() {
         free_user_page(paddr);
@@ -3758,12 +4982,31 @@ fn read_file_bytes_exact(file: &dyn FileLike, offset: u64, buf: &mut [u8]) -> Re
     Ok(())
 }
 
+/// 把一个尚未发布的文件页完整初始化：读取 EOF 前有效字节，只清零不可由文件
+/// 提供的尾部。完整页不做预清零，避免随后覆盖同一 4 KiB 的重复写流量。
+fn read_file_page_exact(
+    file: &dyn FileLike,
+    offset: u64,
+    page: &mut [u8],
+    valid_len: usize,
+) -> Result<(), Errno> {
+    if valid_len == 0 || valid_len > page.len() {
+        return Err(Errno::EINVAL);
+    }
+    read_file_bytes_exact(file, offset, &mut page[..valid_len])?;
+    page[valid_len..].fill(0);
+    Ok(())
+}
+
 fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno> {
-    let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+    // Safety: COW 在新页进入 resident ledger/PTE 前无条件覆盖完整用户页。
+    let paddr = unsafe { alloc_uninitialized_user_page().ok_or(Errno::ENOMEM)? };
     let result = (|| {
         let virt = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EINVAL)?;
+        // Safety: 源页由 ResidentPage 的 Arc 保活；目标页是未发布的独占分配，
+        // 两个物理页不重叠，且复制长度恰好等于页大小。
         unsafe {
             core::ptr::copy_nonoverlapping(
                 virt(source.paddr()) as *const u8,
@@ -3783,6 +5026,18 @@ fn fault_from_errno(err: Errno) -> FaultOutcome {
     match err {
         Errno::ENOMEM => FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess),
         _ => FaultOutcome::Segv,
+    }
+}
+
+fn errno_from_map_error(error: crate::MapError) -> Errno {
+    match error {
+        crate::MapError::OutOfMemory => Errno::ENOMEM,
+        crate::MapError::AlreadyMapped => Errno::EEXIST,
+        crate::MapError::NotMapped => Errno::EFAULT,
+        crate::MapError::Misaligned
+        | crate::MapError::UnsupportedLevel
+        | crate::MapError::UnsupportedHugePage
+        | crate::MapError::InvalidPermission => Errno::EINVAL,
     }
 }
 
@@ -3858,9 +5113,27 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 }
 
 fn alloc_zeroed_user_page() -> Option<usize> {
+    // Safety: 该页在返回前立即覆盖为全零，不会把旧物理页内容暴露给调用方。
+    let paddr = unsafe { alloc_uninitialized_user_page()? };
+    let Some(virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
+        free_user_page(paddr);
+        return None;
+    };
+    // Safety: 分配器保证该页至少覆盖 `page_size()` 字节，且当前没有映射发布。
+    unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, page_size()) };
+    Some(paddr)
+}
+
+/// 分配一个尚未清零、尚未发布的用户物理页。
+///
+/// # Safety
+///
+/// 调用方必须在把该页放入 resident ledger、文件 cache 或用户页表之前初始化完整
+/// 页面；失败路径必须归还物理页，不能让旧用户数据通过部分写入页泄露。
+unsafe fn alloc_uninitialized_user_page() -> Option<usize> {
     let order = user_page_order()?;
     let size = page_size();
-    if let Some(paddr) = try_alloc_zeroed_user_page(order, size) {
+    if let Some(paddr) = try_alloc_user_page(order, size) {
         return Some(paddr);
     }
 
@@ -3871,13 +5144,13 @@ fn alloc_zeroed_user_page() -> Option<usize> {
         if reclaim_private_file_cache_pages(PRIVATE_FILE_CACHE_RECLAIM_BATCH) == 0 {
             return None;
         }
-        if let Some(paddr) = try_alloc_zeroed_user_page(order, size) {
+        if let Some(paddr) = try_alloc_user_page(order, size) {
             return Some(paddr);
         }
     }
 }
 
-fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
+fn try_alloc_user_page(order: usize, size: usize) -> Option<usize> {
     // 用户物理页必须进入 allocator registry；否则 fork/munmap/drop 路径无法被
     // allocator 审计发现泄漏或重复释放。
     let allocation = allocator::KERNEL_ALLOCATOR
@@ -3886,16 +5159,23 @@ fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
             allocator::PAGE_SIZE,
         ))
         .ok()?;
-    let Some(virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
-        let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
-        return None;
-    };
     if allocation.order != order || allocation.size != size {
         let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
         return None;
     }
-    unsafe { core::ptr::write_bytes(virt(allocation.paddr) as *mut u8, 0, size) };
     Some(allocation.paddr)
+}
+
+/// 不触发文件缓存回收的零页分配，供可退化的匿名投机邻页使用。
+fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
+    let paddr = try_alloc_user_page(order, size)?;
+    let Some(virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
+        free_user_page(paddr);
+        return None;
+    };
+    // Safety: `try_alloc_user_page` 返回独占且尚未发布的完整物理页。
+    unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, size) };
+    Some(paddr)
 }
 
 fn free_user_page(paddr: usize) {
@@ -3934,18 +5214,22 @@ pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
 mod tests {
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
+    use core::sync::atomic::Ordering;
 
     use super::{
-        ANON_STORE_SHADOW_PAGES, AnonStoreShadowKey, AnonStoreShadowState, FILE_FAULT_AROUND_PAGES,
-        FaultKind, FilePageKey, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, ResidentPage,
-        ShardedPrivateFilePageCache, VmFlags, WeakFilePageCache, access_for_private_file,
+        ANON_STORE_FAULT_AROUND_PAGES, ANON_STORE_SHADOW_PAGES, AnonStoreShadowKey,
+        AnonStoreShadowState, FILE_FAULT_AROUND_PAGES, FaultKind, FilePageKey,
+        PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, PrivateFilePageCacheClaim,
+        PrivateFilePageCacheEntry, ResidentPage, ShardedPrivateFilePageCache, VmFlags,
+        WeakFilePageCache, access_for_private_file, anon_store_fault_around_end,
         file_fault_around_window, find_cached_private_file_page, observe_anon_store_shadow,
-        permits_file_fault_around, plan_file_segment, private_file_batch_page_offset,
-        private_file_batch_plan, publish_cached_file_page, publish_cached_private_file_page,
-        read_file_bytes_exact, unmapped_prefix_len,
+        permits_file_fault_around, plan_file_segment, private_file_batch_error_is_fatal,
+        private_file_batch_page_offset, private_file_batch_plan, publish_cached_file_page,
+        publish_cached_private_file_page, read_file_bytes_exact, read_file_page_exact,
+        same_backing_snapshot, unmapped_prefix_len,
     };
     use errno::Errno;
-    use mm::FileLike;
+    use mm::{FileLike, VmBacking};
     use sched::sync::Spinlock;
 
     const PAGE_SIZE: usize = 4096;
@@ -4056,7 +5340,7 @@ mod tests {
     }
 
     #[test]
-    fn anon_store_shadow_opens_eight_page_window_and_counts_later_faults() {
+    fn anon_store_shadow_opens_production_window_and_counts_later_faults() {
         let key = anon_shadow_key(7, 11, 13);
         let first =
             observe_anon_store_shadow(AnonStoreShadowState::default(), key, 0x4000, PAGE_SIZE)
@@ -4070,7 +5354,7 @@ mod tests {
             0x4000 + ANON_STORE_SHADOW_PAGES * PAGE_SIZE
         );
 
-        let hit = observe_anon_store_shadow(first.state, key, 0x9000, PAGE_SIZE)
+        let hit = observe_anon_store_shadow(first.state, key, 0x6000, PAGE_SIZE)
             .expect("fault inside shadow window");
         assert!(!hit.simulated_batch);
         assert!(hit.would_save);
@@ -4162,6 +5446,50 @@ mod tests {
     }
 
     #[test]
+    fn anon_store_fault_around_caps_forward_window_and_vma_tail() {
+        let fault = 0x8000;
+        let large = anon_store_fault_around_end(fault, &(0x1000..0x40_0000), PAGE_SIZE)
+            .expect("valid anonymous fault window");
+        assert_eq!(large, fault + ANON_STORE_FAULT_AROUND_PAGES * PAGE_SIZE);
+
+        let tail_end = fault + 2 * PAGE_SIZE;
+        assert_eq!(
+            anon_store_fault_around_end(fault, &(0x1000..tail_end), PAGE_SIZE),
+            Some(tail_end)
+        );
+    }
+
+    #[test]
+    fn anon_store_fault_around_rejects_invalid_geometry() {
+        assert_eq!(
+            anon_store_fault_around_end(0x8001, &(0x1000..0x20_000), PAGE_SIZE),
+            None
+        );
+        assert_eq!(
+            anon_store_fault_around_end(0x8000, &(0x1001..0x20_000), PAGE_SIZE),
+            None
+        );
+        assert_eq!(
+            anon_store_fault_around_end(0x20_000, &(0x1000..0x20_000), PAGE_SIZE),
+            None
+        );
+        assert_eq!(
+            anon_store_fault_around_end(0x8000, &(0x1000..0x20_000), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn anonymous_fault_snapshot_rejects_fresh_backing_aba() {
+        let original = VmBacking::anonymous();
+        let split_snapshot = original.clone();
+        let fresh = VmBacking::anonymous();
+
+        assert!(same_backing_snapshot(&original, &split_snapshot));
+        assert!(!same_backing_snapshot(&original, &fresh));
+    }
+
+    #[test]
     fn file_fault_around_keeps_partial_eof_page() {
         let fault = 0x2000;
         let fault_file_offset = PAGE_SIZE as u64;
@@ -4240,7 +5568,7 @@ mod tests {
     fn private_file_batch_obeys_sixty_four_kibibyte_limit() {
         let large_page = 8192;
         let plan = private_file_batch_plan(0, u64::MAX, 16, 16, large_page)
-            .expect("eight large pages fit the bounce limit");
+            .expect("eight large pages fit the batch byte limit");
 
         assert_eq!(plan.pages, 8);
         assert_eq!(plan.buffer_len, PRIVATE_FILE_BATCH_MAX_BYTES);
@@ -4255,6 +5583,14 @@ mod tests {
         );
         assert!(private_file_batch_page_offset(u64::MAX - 1, 1, PAGE_SIZE).is_none());
         assert!(private_file_batch_page_offset(0, usize::MAX, PAGE_SIZE).is_none());
+    }
+
+    #[test]
+    fn private_file_batch_only_propagates_fault_page_errors() {
+        assert!(private_file_batch_error_is_fatal(0));
+        for speculative_index in 1..16 {
+            assert!(!private_file_batch_error_is_fatal(speculative_index));
+        }
     }
 
     #[test]
@@ -4334,6 +5670,53 @@ mod tests {
     }
 
     #[test]
+    fn file_page_reader_zeroes_only_partial_eof_tail() {
+        let file = ChunkedFile {
+            bytes: b"0123456789abcdef",
+            max_chunk: 3,
+            eof_at: 16,
+        };
+        let mut output = [0xa5; 8];
+
+        read_file_page_exact(&file, 2, &mut output, 4).expect("partial page must initialize");
+
+        assert_eq!(&output, b"2345\0\0\0\0");
+    }
+
+    #[test]
+    fn file_page_reader_fills_full_page_without_tail() {
+        let file = ChunkedFile {
+            bytes: b"0123456789abcdef",
+            max_chunk: 3,
+            eof_at: 16,
+        };
+        let mut output = [0xa5; 8];
+
+        read_file_page_exact(&file, 4, &mut output, 8).expect("full page must initialize");
+
+        assert_eq!(&output, b"456789ab");
+    }
+
+    #[test]
+    fn file_page_reader_rejects_invalid_valid_length() {
+        let file = ChunkedFile {
+            bytes: b"0123456789abcdef",
+            max_chunk: 16,
+            eof_at: 16,
+        };
+        let mut output = [0xa5; 8];
+
+        assert_eq!(
+            read_file_page_exact(&file, 0, &mut output, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            read_file_page_exact(&file, 0, &mut output, 9),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
     fn concurrent_file_page_publish_keeps_first_candidate() {
         let cache: WeakFilePageCache = Spinlock::new(BTreeMap::new());
         let key = FilePageKey {
@@ -4350,6 +5733,101 @@ mod tests {
         assert!(Arc::ptr_eq(&published, &first));
         assert!(Arc::ptr_eq(&raced, &first));
         assert_eq!(cache.lock().len(), 1);
+    }
+
+    #[test]
+    fn private_file_cache_claim_allocates_ids_only_for_new_loads() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        let key = cache_key(51);
+        let load_id = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            _ => panic!("vacant key must create a load owner"),
+        };
+        let next_after_owner = cache.next_load_id.load(Ordering::Relaxed);
+
+        let waiter = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Loading(waiter) => waiter,
+            _ => panic!("second claim must observe the active load"),
+        };
+        assert_eq!(waiter.id(), load_id);
+        assert_eq!(cache.next_load_id.load(Ordering::Relaxed), next_after_owner);
+        drop(waiter);
+
+        let page = ResidentPage::new_direct(0x51000);
+        cache
+            .finish_load(key, load_id, Arc::clone(&page))
+            .expect("owner publishes ready page");
+        assert!(matches!(
+            cache.claim(key),
+            PrivateFilePageCacheClaim::Ready(_)
+        ));
+        assert_eq!(cache.next_load_id.load(Ordering::Relaxed), next_after_owner);
+    }
+
+    #[test]
+    fn private_file_cache_waiters_share_one_stable_load_error() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        let key = cache_key(53);
+        let load_id = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            _ => panic!("vacant key must create a load owner"),
+        };
+        let first = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Loading(waiter) => waiter,
+            _ => panic!("first waiter must register on active load"),
+        };
+        let second = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Loading(waiter) => waiter,
+            _ => panic!("second waiter must register on active load"),
+        };
+
+        cache.abort_load(key, load_id, Some(Errno::EIO));
+        assert!(matches!(first.wait(), Err(Errno::EIO)));
+        assert!(matches!(
+            cache.claim(key),
+            PrivateFilePageCacheClaim::Failed(Errno::EIO)
+        ));
+        assert!(matches!(second.wait(), Err(Errno::EIO)));
+        assert!(!cache.shards[0].lock().pages.contains_key(&key));
+        assert_eq!(cache.diag().load_errors, 1);
+    }
+
+    #[test]
+    fn private_file_cache_dropped_waiter_cancels_failed_result_slot() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        let key = cache_key(55);
+        let load_id = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            _ => panic!("vacant key must create a load owner"),
+        };
+        let waiter = match cache.claim(key) {
+            PrivateFilePageCacheClaim::Loading(waiter) => waiter,
+            _ => panic!("waiter must register on active load"),
+        };
+        cache.abort_load(key, load_id, Some(Errno::EIO));
+        assert!(matches!(
+            cache.shards[0].lock().pages.get(&key),
+            Some(PrivateFilePageCacheEntry::Failed { .. })
+        ));
+        drop(waiter);
+
+        assert!(!cache.shards[0].lock().pages.contains_key(&key));
+    }
+
+    #[test]
+    fn private_file_cache_load_ids_never_wrap_into_aba() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(2);
+        cache.next_load_id.store(u64::MAX, Ordering::Relaxed);
+        let key = cache_key(57);
+
+        assert!(matches!(
+            cache.claim(key),
+            PrivateFilePageCacheClaim::Bypass
+        ));
+        assert!(!matches!(
+            cache.shards[0].lock().pages.get(&key),
+            Some(PrivateFilePageCacheEntry::Loading { .. })
+        ));
     }
 
     #[test]
@@ -4462,6 +5940,50 @@ mod tests {
             }
             .private_cache_hash()
         );
+    }
+
+    #[test]
+    fn private_file_cache_table_hash_decorrelates_shard_bits() {
+        let cache = ShardedPrivateFilePageCache::<8>::new(16);
+        let mut hashes = [0u64; 8];
+        let mut found = 0usize;
+        for page_index in 0..1024u64 {
+            let key = FilePageKey {
+                file_key: 0x1234,
+                offset: page_index * PAGE_SIZE as u64,
+                generation: 7,
+            };
+            if cache.shard_index(key) != 3 {
+                continue;
+            }
+            hashes[found] = key.private_table_hash();
+            found += 1;
+            if found == hashes.len() {
+                break;
+            }
+        }
+        assert_eq!(found, hashes.len());
+
+        let distinct_bucket_prefixes = hashes
+            .iter()
+            .enumerate()
+            .filter(|(index, hash)| {
+                !hashes[..*index]
+                    .iter()
+                    .any(|seen| seen & 0xff == **hash & 0xff)
+            })
+            .count();
+        let distinct_control_tags = hashes
+            .iter()
+            .enumerate()
+            .filter(|(index, hash)| {
+                !hashes[..*index]
+                    .iter()
+                    .any(|seen| seen >> 57 == **hash >> 57)
+            })
+            .count();
+        assert!(distinct_bucket_prefixes >= 6);
+        assert!(distinct_control_tags >= 4);
     }
 
     #[test]

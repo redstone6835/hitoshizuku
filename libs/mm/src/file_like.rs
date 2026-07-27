@@ -41,6 +41,57 @@ pub trait FileLike: Send + Sync {
     /// 短读允许；EOF 时返 0。
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno>;
 
+    /// 从 `offset` 起精确初始化一组页面的前 `valid_len` 字节，并把其余尾部清零。
+    ///
+    /// 默认实现基于 [`Self::read_at`] 循环处理合法短读。若在填满有效区之前到达
+    /// EOF，则返回 `EIO`；实现方可以覆盖本方法，把文件数据直接读入 VM 持有的页。
+    fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> Result<(), Errno> {
+        let mut capacity = 0usize;
+        for page in pages.iter() {
+            if page.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            capacity = capacity.checked_add(page.len()).ok_or(Errno::EOVERFLOW)?;
+        }
+        if valid_len > capacity {
+            return Err(Errno::EINVAL);
+        }
+        let valid_len_u64 = u64::try_from(valid_len).map_err(|_| Errno::EOVERFLOW)?;
+        offset.checked_add(valid_len_u64).ok_or(Errno::EOVERFLOW)?;
+
+        let mut page_start = 0usize;
+        for page in pages.iter_mut() {
+            let tail_start = valid_len.saturating_sub(page_start).min(page.len());
+            page[tail_start..].fill(0);
+            page_start += page.len();
+        }
+
+        let mut remaining = valid_len;
+        let mut read_offset = offset;
+        for page in pages.iter_mut() {
+            let page_valid = remaining.min(page.len());
+            let mut done = 0usize;
+            while done < page_valid {
+                let count = self.read_at(read_offset, &mut page[done..page_valid])?;
+                if count == 0 || count > page_valid - done {
+                    return Err(Errno::EIO);
+                }
+                done += count;
+                read_offset += count as u64;
+            }
+            remaining -= page_valid;
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// 从 `offset` 处写最多 `buf.len()` 字节，返回实际写入字节数。
     /// 仅 `MAP_SHARED` 脏页回写路径调用。
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno>;
@@ -67,5 +118,85 @@ pub trait FileLike: Send + Sync {
     /// 识别 shm VMA，不依赖具体的 `general::ipc` 类型，保持依赖方向不反转。
     fn sysv_shm_id(&self) -> Option<i32> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileLike;
+    use errno::Errno;
+
+    struct ShortReader {
+        data: &'static [u8],
+        max_read: usize,
+    }
+
+    impl FileLike for ShortReader {
+        fn cache_key(&self) -> usize {
+            self.data.as_ptr() as usize
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+            let start = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+            if start >= self.data.len() {
+                return Ok(0);
+            }
+            let count = buf.len().min(self.max_read).min(self.data.len() - start);
+            buf[..count].copy_from_slice(&self.data[start..start + count]);
+            Ok(count)
+        }
+
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
+            Err(Errno::EROFS)
+        }
+
+        fn sync(&self) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn size(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    #[test]
+    fn read_pages_retries_short_reads_and_zeros_tail() {
+        let reader = ShortReader {
+            data: b"0123456789",
+            max_read: 2,
+        };
+        let mut first = [0xff; 4];
+        let mut second = [0xff; 4];
+        let mut pages: [&mut [u8]; 2] = [&mut first, &mut second];
+
+        reader
+            .read_pages_at(1, &mut pages, 6)
+            .expect("short reads must be retried");
+
+        assert_eq!(&first, b"1234");
+        assert_eq!(&second, &[b'5', b'6', 0, 0]);
+    }
+
+    #[test]
+    fn read_pages_rejects_early_eof_and_invalid_layout() {
+        let reader = ShortReader {
+            data: b"abc",
+            max_read: 2,
+        };
+        let mut page = [0xff; 4];
+        assert_eq!(
+            reader.read_pages_at(0, &mut [&mut page], 4),
+            Err(Errno::EIO)
+        );
+
+        let mut empty = [];
+        assert_eq!(
+            reader.read_pages_at(0, &mut [&mut empty], 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            reader.read_pages_at(u64::MAX, &mut [&mut page], 2),
+            Err(Errno::EOVERFLOW)
+        );
     }
 }

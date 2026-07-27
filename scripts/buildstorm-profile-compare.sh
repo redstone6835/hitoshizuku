@@ -69,17 +69,57 @@ stable_metadata = (
     "base_sha256",
     "qemu_version",
     "container_image",
+    "container_image_id",
+    "container_user",
     "cpuset",
+    "cpuset_identity",
     "duration_ms",
     "warmup_ms",
     "stage_anchor",
     "poll_ms",
     "host_sample_ms",
+    "host_clock_ticks_per_second",
+    "capture_enabled",
+    "event_mask",
+    "sampling_enabled",
+    "trace_enabled",
+    "timing_shift",
+    "timing_sampler",
+    "guest_boot_mode",
+    "guest_initramfs_sha256",
+    "guest_workload_device",
+    "guest_tools_device",
+    "qemu_machine",
+    "qemu_cpu",
+    "qemu_accel",
+    "qemu_name",
+    "qemu_debug_threads",
+    "memory_bytes",
+    "smp",
+    "target_tmpfs",
+    "cold_target",
+    "toolchain",
+    "workload_plan_sha256",
+    "workload_script_sha256",
+    "qemu_observer_enabled",
+    "observer_system",
+    "plugin_sha256",
+    "plugin_period_insns",
+    "plugin_stack_bytes",
+    "observer_proc_ms",
+    "symbol_manifest_required",
+    "symbol_manifest_target",
 )
-reference = all_runs[0]["metadata"]
+group_metadata = ("kernel_sha256", "symbol_manifest_sha256")
+reference = all_runs[0].get("metadata", {})
+for key in stable_metadata:
+    if key not in reference:
+        fail(f"missing metadata field {key}: {all_runs[0]['_path']}")
 for run in all_runs:
     metadata = run.get("metadata", {})
     for key in stable_metadata:
+        if key not in metadata:
+            fail(f"missing metadata field {key}: {run['_path']}")
         if metadata.get(key) != reference.get(key):
             fail(f"metadata mismatch for {key}: {run['_path']}")
     timing = run.get("timing", {})
@@ -90,17 +130,73 @@ for run in all_runs:
         if latency > boundary_limit_ms:
             fail(f"{field}={latency:.3f} exceeds {boundary_limit_ms:.3f}: {run['_path']}")
     result = run.get("result", {})
-    if result.get("workload_ended_early") and result.get("runner_status") != 0:
-        fail(f"early-complete run failed: {run['_path']}")
+    for field in ("deadline_stop_sent", "workload_ended_early", "runner_status",
+                  "runner_status_observed", "termination_mode", "stop_requested",
+                  "window_ended_before_stop", "quiescence_verified"):
+        if field not in result:
+            fail(f"missing result field {field}: {run['_path']}")
+    deadline_stop = result["deadline_stop_sent"]
+    runner_status = result["runner_status"]
+    runner_status_observed = result["runner_status_observed"]
+    termination_mode = result["termination_mode"]
+    for field in (
+        "deadline_stop_sent",
+        "workload_ended_early",
+        "runner_status_observed",
+        "stop_requested",
+        "window_ended_before_stop",
+        "quiescence_verified",
+    ):
+        if not isinstance(result[field], bool):
+            fail(f"{field} must be boolean: {run['_path']}")
+    if runner_status is not None and (
+        not isinstance(runner_status, int) or isinstance(runner_status, bool)
+    ):
+        fail(f"runner_status must be an integer or null: {run['_path']}")
+    if runner_status_observed != (runner_status is not None):
+        fail(f"runner status observation is inconsistent: {run['_path']}")
+    if termination_mode not in ("host-qemu-teardown", "guest-runner-complete"):
+        fail(f"unsupported termination mode: {run['_path']}")
+    if result["workload_ended_early"] == deadline_stop:
+        fail(f"inconsistent workload completion classification: {run['_path']}")
+    if deadline_stop:
+        host_teardown = termination_mode == "host-qemu-teardown"
+        observed_stop = (
+            termination_mode == "guest-runner-complete"
+            and runner_status_observed
+            and runner_status in (137, 143)
+        )
+        if not (host_teardown and not runner_status_observed or observed_stop):
+            fail(f"deadline-stopped run has inconsistent termination evidence: {run['_path']}")
+        if not result["stop_requested"] or result["window_ended_before_stop"]:
+            fail(f"deadline-stopped run has inconsistent stop markers: {run['_path']}")
+    elif (
+        termination_mode != "guest-runner-complete"
+        or not runner_status_observed
+        or runner_status != 0
+    ):
+        fail(f"early-complete run lacks a successful observed runner status: {run['_path']}")
+    elif not result["window_ended_before_stop"]:
+        fail(f"early-complete run has inconsistent stop markers: {run['_path']}")
+    if result["quiescence_verified"] is not True:
+        fail(f"run lacks verified process-group quiescence: {run['_path']}")
     profiling = run.get("profiling", {})
     if profiling.get("capture_started") and profiling.get("report_status") != "available":
         fail(f"capture has no valid report: {run['_path']}")
 
 for group in runs:
-    kernels = {run["metadata"].get("kernel_sha256") for run in group}
-    modes = {run["profiling"].get("mode") for run in group}
-    if len(kernels) != 1 or len(modes) != 1:
-        fail("kernel and profiling mode must be uniform inside each group")
+    for key in group_metadata:
+        values = set()
+        for run in group:
+            metadata = run.get("metadata", {})
+            if key not in metadata:
+                fail(f"missing metadata field {key}: {run['_path']}")
+            values.add(metadata[key])
+        if len(values) != 1:
+            fail(f"metadata field {key} must be uniform inside each group")
+    modes = {run.get("profiling", {}).get("mode") for run in group}
+    if len(modes) != 1:
+        fail("profiling mode must be uniform inside each group")
 
 
 def cv_pct(values):

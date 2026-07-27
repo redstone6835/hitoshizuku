@@ -138,6 +138,38 @@ pub(crate) fn read_blocks(
     backend.read_sectors(lba, sectors as u32, out)
 }
 
+/// 以 `sb.block_size` 为单位把连续块读入多个块对齐缓冲区。
+pub(crate) fn read_blocks_vectored(
+    backend: &dyn BlockBackend,
+    sb: &Superblock,
+    start_block: u64,
+    count: u32,
+    out: &mut [&mut [u8]],
+) -> Result<(), BlockBackendError> {
+    let sector_size = backend.sector_size() as u64;
+    let block_size = sb.block_size as u64;
+    if sector_size == 0 || block_size % sector_size != 0 {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    let per_block = block_size / sector_size;
+    let lba = start_block
+        .checked_mul(per_block)
+        .ok_or(BlockBackendError::OutOfRange)?;
+    let expected_bytes = (count as usize)
+        .checked_mul(sb.block_size as usize)
+        .ok_or(BlockBackendError::OutOfRange)?;
+    let mut actual_bytes = 0usize;
+    for buf in out.iter() {
+        actual_bytes = actual_bytes
+            .checked_add(buf.len())
+            .ok_or(BlockBackendError::OutOfRange)?;
+    }
+    if actual_bytes != expected_bytes {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    backend.read_sectors_vectored(lba, out)
+}
+
 /// 同上,写路径。
 pub(crate) fn write_blocks(
     backend: &dyn BlockBackend,

@@ -13,6 +13,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use vfs::cred::{Credentials, Gid, Uid};
 use vfs::error::{VfsError, VfsResult};
@@ -255,6 +256,12 @@ pub struct ExtInodeOps {
     /// superblock cache 中摘掉，因此打开文件不能再依赖 `sb.find_inode()` 找回
     /// 状态，否则会破坏 Linux 的 unlink-but-open 语义。
     pub(crate) raw: Arc<Spinlock<RawInode>>,
+    /// 普通文件块映射的 inode-local 代际。
+    ///
+    /// 多个打开句柄各自持有映射缓存；间接块内补洞时 `flags/size/i_block`
+    /// 可能都不变化，因此需要共享代际通知其它句柄丢弃旧映射。该代际只由
+    /// 本 inode 的映射修改推进，不受其它 inode 元数据写入影响。
+    mapping_generation: Arc<AtomicU64>,
     /// 命名 FIFO 的运行时数据通道。
     ///
     /// ext 磁盘格式只保存 FIFO inode 类型，缓冲区和打开端点属于内存态；同一
@@ -269,8 +276,14 @@ impl ExtInodeOps {
             state,
             ino,
             raw: Arc::new(Spinlock::new(RawInode::new(ino, bytes))),
+            mapping_generation: Arc::new(AtomicU64::new(0)),
             fifo: (kind == FileType::Fifo).then(vfs::pipe::new_fifo),
         }
+    }
+
+    #[inline]
+    fn bump_mapping_generation(&self) {
+        self.mapping_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn snapshot_meta(&self) -> InodeMetaDisk {
@@ -1104,6 +1117,7 @@ impl InodeOps for ExtInodeOps {
             }
             raw.i_block_mut().copy_from_slice(&ib);
             raw.set_flags(flags);
+            self.bump_mapping_generation();
         }
         // new_size > cur_size:不分配新块,读路径返回零;下次 write 触及再补。
         raw.set_size(new_size);
@@ -1193,6 +1207,7 @@ impl InodeOps for ExtInodeOps {
                     sb,
                     self.ino,
                     Arc::clone(&self.raw),
+                    Arc::clone(&self.mapping_generation),
                 )))
             }
             FileType::Symlink => Ok(Box::new(crate::file::ExtRegFileOps::new_empty(
@@ -1200,6 +1215,7 @@ impl InodeOps for ExtInodeOps {
                 inode.superblock().ok_or(VfsError::InvalidArgument)?,
                 self.ino,
                 Arc::clone(&self.raw),
+                Arc::clone(&self.mapping_generation),
             ))),
             FileType::Fifo => vfs::pipe::open_fifo(
                 Arc::clone(self.fifo.as_ref().ok_or(VfsError::InvalidArgument)?),

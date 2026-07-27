@@ -588,7 +588,10 @@ shutdown_after_tests() {
     poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || reboot -f >/dev/null 2>&1 || true
 }
 
-mount -t ext4 /dev/vd0 /mnt 2>/dev/null || true
+if ! grep -q ' /mnt ' /proc/mounts 2>/dev/null; then
+    mount -t ext4 /dev/vd0 /mnt 2>/dev/null || \
+        mount -t ext4 /dev/vda /mnt 2>/dev/null || true
+fi
 maybe_enter_shell
 setup_dynamic_linker
 echo "[init] mount testdisk OK (or skipped)"

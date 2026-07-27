@@ -277,6 +277,28 @@ impl BlockCache {
         true
     }
 
+    fn read_range_vectored(&mut self, start: u64, count: u32, out: &mut [&mut [u8]]) -> bool {
+        if vectored_block_count(out, self.block_size) != Some(count) {
+            return false;
+        }
+        for i in 0..count {
+            if !self.contains(start + i as u64) {
+                return false;
+            }
+        }
+
+        let mut block = start;
+        for buf in out.iter_mut() {
+            for block_out in buf.chunks_exact_mut(self.block_size) {
+                if !self.read(block, block_out) {
+                    return false;
+                }
+                block += 1;
+            }
+        }
+        true
+    }
+
     fn overlay_range(&mut self, start: u64, count: u32, out: &mut [u8]) {
         if out.len() != self.block_size * count as usize {
             return;
@@ -291,6 +313,23 @@ impl BlockCache {
             } else if let Some(pending) = self.pending_writebacks.get(&block) {
                 let off = i as usize * self.block_size;
                 out[off..off + self.block_size].copy_from_slice(&pending.data);
+            }
+        }
+    }
+
+    fn overlay_range_vectored(&mut self, start: u64, count: u32, out: &mut [&mut [u8]]) {
+        if vectored_block_count(out, self.block_size) != Some(count) {
+            return;
+        }
+
+        let mut block = start;
+        for buf in out.iter_mut() {
+            for block_out in buf.chunks_exact_mut(self.block_size) {
+                if self.contains(block) {
+                    let copied = self.read(block, block_out);
+                    debug_assert!(copied);
+                }
+                block += 1;
             }
         }
     }
@@ -838,6 +877,20 @@ impl BlockCache {
     }
 }
 
+fn vectored_block_count(bufs: &[&mut [u8]], block_size: usize) -> Option<u32> {
+    if block_size == 0 {
+        return None;
+    }
+    let mut count = 0usize;
+    for buf in bufs {
+        if buf.is_empty() || buf.len() % block_size != 0 {
+            return None;
+        }
+        count = count.checked_add(buf.len() / block_size)?;
+    }
+    u32::try_from(count).ok()
+}
+
 /// 块设备同步 I/O 错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockBackendError {
@@ -853,6 +906,51 @@ pub trait BlockBackend: Send + Sync {
     fn sector_size(&self) -> u32;
     fn sector_count(&self) -> u64;
     fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlockBackendError>;
+
+    /// 从连续扇区范围读取到多个缓冲区。
+    ///
+    /// 默认实现逐缓冲调用 [`Self::read_sectors`]；块设备可覆盖它以提交真正的
+    /// scatter/gather 请求。每个 slice 必须非空并按扇区大小对齐。
+    fn read_sectors_vectored(
+        &self,
+        lba: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> Result<(), BlockBackendError> {
+        let sector_size = self.sector_size() as usize;
+        if sector_size == 0 {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let mut total_sectors = 0u64;
+        for buf in bufs.iter() {
+            if buf.is_empty() || buf.len() % sector_size != 0 {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let sectors = u64::try_from(buf.len() / sector_size)
+                .map_err(|_| BlockBackendError::OutOfRange)?;
+            if sectors > u32::MAX as u64 {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            total_sectors = total_sectors
+                .checked_add(sectors)
+                .ok_or(BlockBackendError::OutOfRange)?;
+        }
+        let end = lba
+            .checked_add(total_sectors)
+            .ok_or(BlockBackendError::OutOfRange)?;
+        if end > self.sector_count() {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let mut current_lba = lba;
+        for buf in bufs.iter_mut() {
+            let sectors = (buf.len() / sector_size) as u32;
+            self.read_sectors(current_lba, sectors, buf)?;
+            current_lba += sectors as u64;
+        }
+        Ok(())
+    }
+
     fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlockBackendError>;
 }
 
@@ -938,7 +1036,6 @@ pub(crate) struct FsState {
     pub(crate) group_desc: Spinlock<alloc::vec::Vec<GroupDesc>>,
     pub(crate) group_counts: Spinlock<alloc::vec::Vec<GroupCounts>>,
     pub(crate) block_cache: Spinlock<BlockCache>,
-    block_cache_epoch: core::sync::atomic::AtomicU64,
     pub(crate) sb_free_blocks: core::sync::atomic::AtomicU64,
     pub(crate) sb_free_inodes: core::sync::atomic::AtomicU32,
     pub(crate) block_alloc_hint: core::sync::atomic::AtomicU64,
@@ -1190,6 +1287,69 @@ impl FsState {
         Ok(())
     }
 
+    /// 把连续块直接读入多个块对齐缓冲区，并保持与 write-back/direct write 一致。
+    ///
+    /// 与普通 coherent read 不同，本路径不会把后端结果插入 clean block cache；
+    /// 它只使用 cache 中已有的新版本覆盖对应目标块。
+    fn read_blocks_coherent_vectored(
+        &self,
+        start_block: u64,
+        count: u32,
+        out: &mut [&mut [u8]],
+    ) -> Result<(), BlockBackendError> {
+        let block_size = self.ext_sb.block_size as usize;
+        if vectored_block_count(out, block_size) != Some(count) {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        loop {
+            let coherence_stamp = {
+                let mut cache = self.block_cache.lock();
+                if cache.read_range_vectored(start_block, count, out) {
+                    break;
+                }
+                if cache.has_unreadable_direct_in_range(start_block, count) {
+                    drop(cache);
+                    Self::wait_for_writeback_progress();
+                    continue;
+                }
+                cache.coherence_stamp_in_range(start_block, count)
+            };
+
+            bgd::read_blocks_vectored(
+                self.backend.as_ref(),
+                &self.ext_sb,
+                start_block,
+                count,
+                out,
+            )?;
+            let mut cache = self.block_cache.lock();
+            if cache.coherence_stamp_in_range(start_block, count) != coherence_stamp {
+                if cache.read_range_vectored(start_block, count, out) {
+                    break;
+                }
+                let wait_direct = cache.has_unreadable_direct_in_range(start_block, count);
+                drop(cache);
+                if wait_direct {
+                    Self::wait_for_writeback_progress();
+                }
+                continue;
+            }
+            if cache.has_unreadable_direct_in_range(start_block, count) {
+                drop(cache);
+                Self::wait_for_writeback_progress();
+                continue;
+            }
+
+            cache.overlay_range_vectored(start_block, count, out);
+            break;
+        }
+        Ok(())
+    }
+
     /// 在 cache 内原地修改块的部分字节（partial write 快速路径）。
     /// 块必须已在 cache 中；若不在则返回 false，调用方回退到 read + modify + write。
     /// 成功时只需一次加锁、零次 memcpy 整块。
@@ -1259,7 +1419,6 @@ impl FsState {
                     if let Some(evicted) = evicted {
                         self.flush_one_evicted(&evicted)?;
                     }
-                    self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
                     return Ok(());
                 }
             }
@@ -1278,7 +1437,6 @@ impl FsState {
         if let Some(evicted) = evicted {
             self.flush_one_evicted(&evicted)?;
         }
-        self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1333,6 +1491,15 @@ impl FsState {
         self.read_blocks_coherent(start_block, count, out)
     }
 
+    pub(crate) fn read_data_blocks_vectored(
+        &self,
+        start_block: u64,
+        count: u32,
+        out: &mut [&mut [u8]],
+    ) -> Result<(), BlockBackendError> {
+        self.read_blocks_coherent_vectored(start_block, count, out)
+    }
+
     pub(crate) fn write_blocks(
         &self,
         start_block: u64,
@@ -1359,7 +1526,6 @@ impl FsState {
             }
         }
         self.flush_evicted(&mut evicted_list)?;
-        self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1728,11 +1894,6 @@ impl FsState {
         }
     }
 
-    #[inline]
-    pub(crate) fn io_epoch(&self) -> u64 {
-        self.block_cache_epoch.load(Ordering::Acquire)
-    }
-
     /// 定位一个 inode 号所在的块号与块内字节偏移。
     pub(crate) fn inode_location(&self, ino: u32) -> Result<(u64, u32), BlockBackendError> {
         if ino == 0 || ino > self.ext_sb.inodes_count {
@@ -1914,7 +2075,6 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         group_desc: Spinlock::new(group_desc),
         group_counts: Spinlock::new(group_counts),
         block_cache: Spinlock::new(BlockCache::new(block_size)),
-        block_cache_epoch: core::sync::atomic::AtomicU64::new(0),
         sb_free_blocks: core::sync::atomic::AtomicU64::new(free_blocks),
         sb_free_inodes: core::sync::atomic::AtomicU32::new(free_inodes),
         block_alloc_hint: core::sync::atomic::AtomicU64::new(0),
@@ -2353,7 +2513,6 @@ mod tests {
             group_desc: Spinlock::new(group_desc),
             group_counts: Spinlock::new(group_counts),
             block_cache: Spinlock::new(BlockCache::new(block_size)),
-            block_cache_epoch: AtomicU64::new(0),
             sb_free_blocks: AtomicU64::new(free_blocks),
             sb_free_inodes: core::sync::atomic::AtomicU32::new(16),
             block_alloc_hint: AtomicU64::new(0),
@@ -2650,6 +2809,44 @@ mod tests {
     }
 
     #[test]
+    fn vectored_data_read_skips_clean_cache_and_overlays_dirty_data() {
+        const BLOCK_SIZE: usize = 1024;
+        let backend = Arc::new(CountingBackend::new(64, 512));
+        backend.seed_block(8, BLOCK_SIZE, &vec![0x18; BLOCK_SIZE]);
+        backend.seed_block(9, BLOCK_SIZE, &vec![0x19; BLOCK_SIZE]);
+        let state = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE as u32, 32);
+        state
+            .write_data_block(9, &vec![0x99; BLOCK_SIZE])
+            .expect("publish newer cached block");
+
+        let mut first = vec![0u8; BLOCK_SIZE];
+        let mut second = vec![0u8; BLOCK_SIZE];
+        state
+            .read_data_blocks_vectored(8, 2, &mut [&mut first, &mut second])
+            .expect("scatter read");
+
+        assert_eq!(first, vec![0x18; BLOCK_SIZE]);
+        assert_eq!(second, vec![0x99; BLOCK_SIZE]);
+        {
+            let cache = state.block_cache.lock();
+            assert!(
+                !cache.contains(8),
+                "backend clean data must not enter cache"
+            );
+            assert!(cache.contains(9), "newer dirty data must remain visible");
+        }
+
+        let mut again_first = vec![0u8; BLOCK_SIZE];
+        let mut again_second = vec![0u8; BLOCK_SIZE];
+        state
+            .read_data_blocks_vectored(8, 2, &mut [&mut again_first, &mut again_second])
+            .expect("second scatter read");
+        assert_eq!(again_first, vec![0x18; BLOCK_SIZE]);
+        assert_eq!(again_second, vec![0x99; BLOCK_SIZE]);
+        assert_eq!(backend.reads(), vec![(16, 2), (18, 2), (16, 2), (18, 2)]);
+    }
+
+    #[test]
     fn failed_inode_writeback_is_retained_for_sync_retry() {
         const INO: u32 = 1;
         const BLOCK_SIZE: u32 = 1024;
@@ -2826,7 +3023,14 @@ mod tests {
         });
         sb.insert_inode(Arc::clone(&sb.root_inode));
 
-        let file = ExtRegFileOps::new(Arc::clone(&state), Arc::clone(&sb), INO, open_raw);
+        let mapping_generation = Arc::new(AtomicU64::new(0));
+        let file = ExtRegFileOps::new(
+            Arc::clone(&state),
+            Arc::clone(&sb),
+            INO,
+            Arc::clone(&open_raw),
+            Arc::clone(&mapping_generation),
+        );
         assert_eq!(file.write_at(b"test", 0).expect("write file"), 4);
         // 越过 direct 区域写入一个新块时，除了数据块还会新建一级间接块。
         // `i_blocks` 必须同时反映这两个文件系统块（1024B 块即 4 sectors）。
@@ -2836,13 +3040,81 @@ mod tests {
             1
         );
 
+        // 先把文件扩到另一个一级间接块槽位，再由第二个打开句柄缓存中间 hole。
+        // 随后第一个句柄在文件现有 size 内补洞：一级间接块号、flags 和 size
+        // 都不变化，只有 inode-local mapping generation 能让读句柄丢弃旧映射。
+        assert_eq!(
+            file.write_at(b"y", (20 * BLOCK_SIZE) as u64)
+                .expect("grow sparse indirect file"),
+            1
+        );
+        let reader = ExtRegFileOps::new(
+            Arc::clone(&state),
+            Arc::clone(&sb),
+            INO,
+            Arc::clone(&open_raw),
+            Arc::clone(&mapping_generation),
+        );
+        let mut hole = [0xffu8; 1];
+        assert_eq!(
+            reader
+                .read_at(&mut hole, (15 * BLOCK_SIZE) as u64)
+                .expect("cache indirect hole"),
+            1
+        );
+        assert_eq!(hole, [0]);
+        assert_eq!(reader.map_rebuilds(), 1);
+
+        // 其它 inode/元数据块写入不能再使本文件的映射缓存失效。
+        state
+            .write_block(50, &vec![0x5a; BLOCK_SIZE])
+            .expect("write unrelated filesystem block");
+        assert_eq!(
+            reader
+                .read_at(&mut hole, (15 * BLOCK_SIZE) as u64)
+                .expect("reuse mapping after unrelated write"),
+            1
+        );
+        assert_eq!(hole, [0]);
+        assert_eq!(reader.map_rebuilds(), 1);
+
+        assert_eq!(
+            file.write_at(b"z", (15 * BLOCK_SIZE) as u64)
+                .expect("fill cached indirect hole"),
+            1
+        );
+        assert_eq!(
+            reader
+                .read_at(&mut hole, (15 * BLOCK_SIZE) as u64)
+                .expect("read filled indirect hole"),
+            1
+        );
+        assert_eq!(&hole, b"z");
+        assert_eq!(reader.map_rebuilds(), 2);
+
+        let mut first_page = vec![0xffu8; 2 * BLOCK_SIZE];
+        let mut second_page = vec![0xffu8; 2 * BLOCK_SIZE];
+        reader
+            .read_pages_at(
+                (12 * BLOCK_SIZE) as u64,
+                &mut [&mut first_page, &mut second_page],
+                3 * BLOCK_SIZE + 1,
+            )
+            .expect("read mapped blocks, holes and partial tail");
+        assert_eq!(first_page[0], b'x');
+        assert!(first_page[1..].iter().all(|&byte| byte == 0));
+        assert!(second_page[..BLOCK_SIZE].iter().all(|&byte| byte == 0));
+        assert_eq!(second_page[BLOCK_SIZE], b'z');
+        assert!(second_page[BLOCK_SIZE + 1..].iter().all(|&byte| byte == 0));
+
         // 模拟 dentry 未缓存/被驱逐：不调用 sync，直接从 inode table 重建。
         // 新 size、块映射和数据必须已经对后续 lookup 可见。
         sb.remove_inode(INO as u64);
         drop(file);
         let (reloaded_meta, reloaded_raw) = load_inode(&state, INO).expect("reload inode");
-        assert_eq!(reloaded_meta.size, 12 * BLOCK_SIZE as u64 + 1);
-        assert_eq!(reloaded_meta.blocks_512, 6);
+        assert_eq!(reloaded_meta.size, 20 * BLOCK_SIZE as u64 + 1);
+        // 4 个数据块 + 1 个一级间接块，每个 1 KiB 块占 2 个 512B sector。
+        assert_eq!(reloaded_meta.blocks_512, 10);
         assert_ne!(&reloaded_raw[0x28..0x2c], &[0u8; 4]);
 
         let reloaded_file = ExtRegFileOps::new(
@@ -2850,6 +3122,7 @@ mod tests {
             Arc::clone(&sb),
             INO,
             Arc::new(Spinlock::new(RawInode::new(INO, reloaded_raw))),
+            Arc::new(AtomicU64::new(0)),
         );
         let mut actual = [0u8; 4];
         assert_eq!(
@@ -3071,6 +3344,38 @@ mod tests {
         let observed = reader.join().unwrap().expect("retry stale range read");
         assert_eq!(observed, vec![0x92; 4 * BLOCK_SIZE as usize]);
         assert_eq!(backend.reads(), vec![(4, 4), (4, 4)]);
+    }
+
+    #[test]
+    fn stale_vectored_read_retries_after_direct_completion() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        for block in 4..8 {
+            backend.seed_block(block, &vec![0x31; BLOCK_SIZE as usize]);
+        }
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut first = vec![0u8; 2 * BLOCK_SIZE as usize];
+            let mut second = vec![0u8; 2 * BLOCK_SIZE as usize];
+            let result =
+                reader_state.read_data_blocks_vectored(4, 4, &mut [&mut first, &mut second]);
+            result.map(|()| {
+                first.extend_from_slice(&second);
+                first
+            })
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_blocks(4, 4, &vec![0xa2; 4 * BLOCK_SIZE as usize])
+            .expect("complete direct write during scatter read");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("retry scatter read");
+        assert_eq!(observed, vec![0xa2; 4 * BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 2), (6, 2), (4, 2), (6, 2)]);
     }
 
     #[test]

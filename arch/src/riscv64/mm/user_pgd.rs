@@ -15,7 +15,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use general::mm::{PgdHandle, UserPgdOps};
 use general::{
-    PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, unmap_range_entries, walk_and_map,
+    MapBatchResult, PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, unmap_range_entries,
+    walk_and_map, walk_and_map_pages,
 };
 use mm::VmFlags;
 
@@ -299,14 +300,19 @@ fn flush_user_tlb_range(asid: usize, active_cpus: usize, vaddr: usize, len: usiz
     }
 }
 
-unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
+unsafe fn map_user_pages(
+    pgd: PgdHandle,
+    vaddr: usize,
+    paddr: usize,
+    flags: VmFlags,
+) -> Result<(), general::MapError> {
     let inner = unsafe { inner_ref(pgd) };
     let root_virt = inner.pgd_virt();
     let read = flags.has(VmFlags::READ);
     let write = flags.has(VmFlags::WRITE);
     let execute = flags.has(VmFlags::EXEC);
     let user = flags.has(VmFlags::USER);
-    walk_and_map::<Riscv64Paging>(
+    let result = walk_and_map::<Riscv64Paging>(
         root_virt,
         vaddr,
         paddr,
@@ -318,9 +324,36 @@ unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFl
         false,
         phys_to_virt,
         allocate_page_table_page,
-    )
-    .expect("[arch][mm] map_user_pages: walk_and_map failed");
+    );
+    // 即使中途 OOM，walk 也可能已经发布新的中间页表；首次激活仍须 fence。
     inner.needs_page_table_fence.store(true, Ordering::Release);
+    result
+}
+
+unsafe fn map_user_page_batch(
+    pgd: PgdHandle,
+    vaddr: usize,
+    paddrs: &[usize],
+    flags: VmFlags,
+) -> MapBatchResult {
+    // Safety: 由 UserPgdOps 契约保证 handle、地址、权限和空目标 PTE 合法。
+    let inner = unsafe { inner_ref(pgd) };
+    let result = walk_and_map_pages::<Riscv64Paging>(
+        inner.pgd_virt(),
+        vaddr,
+        paddrs,
+        Riscv64Paging::LEVELS - 1,
+        flags.has(VmFlags::READ),
+        flags.has(VmFlags::WRITE),
+        flags.has(VmFlags::EXEC),
+        flags.has(VmFlags::USER),
+        false,
+        phys_to_virt,
+        allocate_page_table_page,
+    );
+    // 批次即使只安装了前缀，也可能发布新的中间页表；首次激活仍需 fence。
+    inner.needs_page_table_fence.store(true, Ordering::Release);
+    result
 }
 
 unsafe fn publish_new_mapping(pgd: PgdHandle, vaddr: usize, len: usize) {
@@ -462,6 +495,7 @@ pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
     map: map_user_pages,
+    map_pages: map_user_page_batch,
     publish_new_mapping,
     unmap: unmap_user_pages,
     protect: protect_user_pages,

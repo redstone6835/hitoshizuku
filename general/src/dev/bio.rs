@@ -12,6 +12,12 @@ use core::ptr::NonNull;
 
 use crate::dev::completion::Completion;
 
+/// 同步借用 BIO 最多内联保存的分段数。
+///
+/// 16 个数据段加 virtio-blk 的 header/status 共 18 个 descriptor，仍落在
+/// split virtqueue 的 19 项内联链上，不会因为 fault-around 批量读额外分配。
+pub const BIO_MAX_BORROWED_SEGMENTS: usize = 16;
+
 // ── 块范围 ───────────────────────────────────────────────────────────────
 
 /// 一段连续逻辑块。
@@ -88,7 +94,7 @@ impl BorrowedBioBuffer {
     }
 
     fn as_slice(&self) -> &[u8] {
-        // SAFETY: 构造函数只接收有效 slice 指针和长度；同步 BIO 在完成前不会
+        // Safety: 构造函数只接收有效 slice 指针和长度；同步 BIO 在完成前不会
         // 释放调用者缓冲区，读写方向只限制是否允许可变访问。
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
@@ -97,7 +103,7 @@ impl BorrowedBioBuffer {
         if self.kind != BorrowedBioBufferKind::Read {
             return &mut [];
         }
-        // SAFETY: Read 借用缓冲来自 `&mut [u8]`，同步提交接口在 BIO 完成前
+        // Safety: Read 借用缓冲来自 `&mut [u8]`，同步提交接口在 BIO 完成前
         // 独占该借用；驱动只通过归还的 BIO 访问这段内存。
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
@@ -105,15 +111,100 @@ impl BorrowedBioBuffer {
     const fn len(&self) -> usize {
         self.len
     }
+}
 
-    fn ptr_addr(&self) -> usize {
+// Safety: 非拥有 BIO 缓冲只允许通过块层同步提交接口构造；该接口等待 BIO
+// 完成后才返回，因此 BIO 跨驱动队列移动时，调用者提供的 slice 仍然有效。
+unsafe impl Send for BorrowedBioBuffer {}
+
+/// BIO 中一个非拥有数据段的只读描述。
+#[derive(Clone, Copy, Debug)]
+pub struct BioBufferSegment {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl BioBufferSegment {
+    fn new(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            ptr: NonNull::new(ptr).unwrap_or_else(NonNull::dangling),
+            len,
+        }
+    }
+
+    /// 段的内核虚拟地址。
+    pub fn vaddr(self) -> usize {
         self.ptr.as_ptr() as usize
+    }
+
+    /// 段长度。
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    unsafe fn as_slice<'a>(self) -> &'a [u8] {
+        // Safety: 由调用方保证原始同步 BIO 借用仍然存活。
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
+        // Safety: 由调用方保证原始 Read 分段仍被同步 BIO 独占。
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-// SAFETY: 非拥有 BIO 缓冲只允许通过块层同步提交接口构造；该接口等待 BIO
-// 完成后才返回，因此 BIO 跨驱动队列移动时，调用者提供的 slice 仍然有效。
-unsafe impl Send for BorrowedBioBuffer {}
+/// 同步 BIO 使用的内联 scatter/gather 借用缓冲区。
+#[derive(Debug)]
+pub struct BorrowedBioSegments {
+    segments: [BioBufferSegment; BIO_MAX_BORROWED_SEGMENTS],
+    segment_count: u8,
+    total_len: usize,
+    kind: BorrowedBioBufferKind,
+    _not_static_owner: PhantomData<*mut [u8]>,
+}
+
+impl BorrowedBioSegments {
+    fn from_read(bufs: &mut [&mut [u8]]) -> Result<Self, BioReqError> {
+        if bufs.is_empty() {
+            return Err(BioReqError::BufferSizeMismatch);
+        }
+        if bufs.len() > BIO_MAX_BORROWED_SEGMENTS {
+            return Err(BioReqError::TooLarge);
+        }
+
+        let empty = BioBufferSegment::new(core::ptr::null_mut(), 0);
+        let mut segments = [empty; BIO_MAX_BORROWED_SEGMENTS];
+        let mut total_len = 0usize;
+        for (slot, buf) in segments.iter_mut().zip(bufs.iter_mut()) {
+            if buf.is_empty() {
+                return Err(BioReqError::BufferSizeMismatch);
+            }
+            total_len = total_len
+                .checked_add(buf.len())
+                .ok_or(BioReqError::TooLarge)?;
+            *slot = BioBufferSegment::new(buf.as_mut_ptr(), buf.len());
+        }
+
+        Ok(Self {
+            segments,
+            segment_count: bufs.len() as u8,
+            total_len,
+            kind: BorrowedBioBufferKind::Read,
+            _not_static_owner: PhantomData,
+        })
+    }
+
+    fn segment_count(&self) -> usize {
+        usize::from(self.segment_count)
+    }
+
+    fn segment(&self, index: usize) -> Option<BioBufferSegment> {
+        (index < self.segment_count()).then(|| self.segments[index])
+    }
+}
+
+// Safety: 与单段 BorrowedBioBuffer 相同，所有原始 slice 都由同步提交入口保活到完成。
+unsafe impl Send for BorrowedBioSegments {}
 
 /// Bio 的数据缓冲区。
 ///
@@ -125,6 +216,7 @@ unsafe impl Send for BorrowedBioBuffer {}
 pub enum BioBuffer {
     Owned(Box<[u8]>),
     Borrowed(BorrowedBioBuffer),
+    BorrowedSegments(BorrowedBioSegments),
     None,
 }
 
@@ -137,10 +229,15 @@ impl BioBuffer {
         BioBuffer::Borrowed(BorrowedBioBuffer::from_write(buf))
     }
 
+    pub(crate) fn borrowed_read_vectored(bufs: &mut [&mut [u8]]) -> Result<Self, BioReqError> {
+        BorrowedBioSegments::from_read(bufs).map(BioBuffer::BorrowedSegments)
+    }
+
     pub fn len(&self) -> usize {
         match self {
             BioBuffer::Owned(b) => b.len(),
             BioBuffer::Borrowed(b) => b.len(),
+            BioBuffer::BorrowedSegments(b) => b.total_len,
             BioBuffer::None => 0,
         }
     }
@@ -153,6 +250,7 @@ impl BioBuffer {
         match self {
             BioBuffer::Owned(b) => b,
             BioBuffer::Borrowed(b) => b.as_slice(),
+            BioBuffer::BorrowedSegments(_) => &[],
             BioBuffer::None => &[],
         }
     }
@@ -161,21 +259,136 @@ impl BioBuffer {
         match self {
             BioBuffer::Owned(b) => b,
             BioBuffer::Borrowed(b) => b.as_mut_slice(),
+            BioBuffer::BorrowedSegments(_) => &mut [],
             BioBuffer::None => &mut [],
         }
     }
 
-    pub(crate) fn ptr_addr(&self) -> Option<usize> {
+    /// 数据段数量。连续缓冲区返回 1，无数据 BIO 返回 0。
+    pub fn segment_count(&self) -> usize {
         match self {
-            BioBuffer::Owned(b) => Some(b.as_ptr() as usize),
-            BioBuffer::Borrowed(b) => Some(b.ptr_addr()),
-            BioBuffer::None => None,
+            BioBuffer::Owned(_) | BioBuffer::Borrowed(_) => 1,
+            BioBuffer::BorrowedSegments(b) => b.segment_count(),
+            BioBuffer::None => 0,
         }
+    }
+
+    /// 返回指定数据段；调用方不得让该描述逃逸出 BIO 生命周期。
+    pub fn segment(&self, index: usize) -> Option<BioBufferSegment> {
+        match self {
+            BioBuffer::Owned(b) if index == 0 => {
+                Some(BioBufferSegment::new(b.as_ptr() as *mut u8, b.len()))
+            }
+            BioBuffer::Borrowed(b) if index == 0 => {
+                Some(BioBufferSegment::new(b.ptr.as_ptr(), b.len))
+            }
+            BioBuffer::BorrowedSegments(b) => b.segment(index),
+            _ => None,
+        }
+    }
+
+    /// 是否为同步入口构造的多段借用缓冲区。
+    pub fn is_borrowed_vectored(&self) -> bool {
+        matches!(self, BioBuffer::BorrowedSegments(_))
+    }
+
+    /// 在指定数据段的共享视图上执行闭包。
+    pub fn with_segment<R>(&self, index: usize, visit: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let segment = self.segment(index)?;
+        // Safety: 返回的 slice 只在闭包调用期间存活，不会逃逸出当前 BIO 借用。
+        Some(visit(unsafe { segment.as_slice() }))
+    }
+
+    /// 在指定 Read 数据段的独占视图上执行闭包。
+    pub fn with_segment_mut<R>(
+        &mut self,
+        index: usize,
+        visit: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        if !matches!(
+            self,
+            BioBuffer::Owned(_)
+                | BioBuffer::Borrowed(BorrowedBioBuffer {
+                    kind: BorrowedBioBufferKind::Read,
+                    ..
+                })
+                | BioBuffer::BorrowedSegments(BorrowedBioSegments {
+                    kind: BorrowedBioBufferKind::Read,
+                    ..
+                })
+        ) {
+            return None;
+        }
+        let segment = self.segment(index)?;
+        // Safety: Read BIO 独占该段，且 slice 只在闭包调用期间存活。
+        Some(visit(unsafe { segment.as_mut_slice() }))
+    }
+
+    pub(crate) fn segments_aligned(&self, align: usize) -> bool {
+        (0..self.segment_count()).all(|index| {
+            self.segment(index)
+                .is_some_and(|segment| segment.vaddr().is_multiple_of(align))
+        })
+    }
+
+    /// 把一个连续源缓冲区 scatter 到 BIO 的所有数据段。
+    pub fn copy_from_contiguous(&mut self, src: &[u8]) -> bool {
+        if src.len() != self.len() {
+            return false;
+        }
+        match self {
+            BioBuffer::Owned(dst) => dst.copy_from_slice(src),
+            BioBuffer::Borrowed(dst) if dst.kind == BorrowedBioBufferKind::Read => {
+                dst.as_mut_slice().copy_from_slice(src)
+            }
+            BioBuffer::BorrowedSegments(dst) if dst.kind == BorrowedBioBufferKind::Read => {
+                let mut copied = 0usize;
+                for index in 0..dst.segment_count() {
+                    let segment = dst.segments[index];
+                    let end = copied + segment.len();
+                    // Safety: Read 分段由同步 BIO 独占，且本循环依次访问互不重叠的段。
+                    unsafe { segment.as_mut_slice() }.copy_from_slice(&src[copied..end]);
+                    copied = end;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// 把 BIO 的所有数据段 gather 到一个连续目标缓冲区。
+    pub fn copy_to_contiguous(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != self.len() {
+            return false;
+        }
+        match self {
+            BioBuffer::Owned(src) => dst.copy_from_slice(src),
+            BioBuffer::Borrowed(src) if src.kind == BorrowedBioBufferKind::Write => {
+                dst.copy_from_slice(src.as_slice())
+            }
+            BioBuffer::BorrowedSegments(src) if src.kind == BorrowedBioBufferKind::Write => {
+                let mut copied = 0usize;
+                for index in 0..src.segment_count() {
+                    let segment = src.segments[index];
+                    let end = copied + segment.len();
+                    // Safety: Write 分段在同步 BIO 完成前保持有效，本循环只读。
+                    dst[copied..end].copy_from_slice(unsafe { segment.as_slice() });
+                    copied = end;
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     pub(crate) fn accepts_op(&self, op: BioOp) -> bool {
         match self {
             BioBuffer::Borrowed(b) => matches!(
+                (b.kind, op),
+                (BorrowedBioBufferKind::Read, BioOp::Read)
+                    | (BorrowedBioBufferKind::Write, BioOp::Write)
+            ),
+            BioBuffer::BorrowedSegments(b) => matches!(
                 (b.kind, op),
                 (BorrowedBioBufferKind::Read, BioOp::Read)
                     | (BorrowedBioBufferKind::Write, BioOp::Write)
@@ -394,5 +607,51 @@ impl core::fmt::Debug for Bio {
             .field("block_size", &self.block_size)
             .field("fua", &self.fua)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::{BIO_MAX_BORROWED_SEGMENTS, BioBuffer, BioReqError};
+
+    const TEST_PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn borrowed_segments_fill_sixteen_pages_without_spilling() {
+        let mut pages = [[0u8; TEST_PAGE_SIZE]; BIO_MAX_BORROWED_SEGMENTS];
+        let mut refs = pages
+            .iter_mut()
+            .map(|page| &mut page[..])
+            .collect::<Vec<_>>();
+        let mut buffer = BioBuffer::borrowed_read_vectored(refs.as_mut_slice()).unwrap();
+        assert_eq!(buffer.segment_count(), BIO_MAX_BORROWED_SEGMENTS);
+        assert_eq!(buffer.len(), BIO_MAX_BORROWED_SEGMENTS * TEST_PAGE_SIZE);
+
+        let source = (0..buffer.len())
+            .map(|index| index.wrapping_mul(17) as u8)
+            .collect::<Vec<_>>();
+        assert!(buffer.copy_from_contiguous(&source));
+        drop(buffer);
+        drop(refs);
+
+        for (index, page) in pages.iter().enumerate() {
+            let start = index * TEST_PAGE_SIZE;
+            assert_eq!(page, &source[start..start + TEST_PAGE_SIZE]);
+        }
+    }
+
+    #[test]
+    fn borrowed_segments_reject_seventeen_pages() {
+        let mut pages = [[0u8; TEST_PAGE_SIZE]; BIO_MAX_BORROWED_SEGMENTS + 1];
+        let mut refs = pages
+            .iter_mut()
+            .map(|page| &mut page[..])
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            BioBuffer::borrowed_read_vectored(refs.as_mut_slice()),
+            Err(BioReqError::TooLarge)
+        ));
     }
 }
