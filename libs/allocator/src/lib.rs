@@ -1122,15 +1122,14 @@ impl KernelMemorySubsystem {
             return Ok(allocation);
         }
 
-        #[cfg(feature = "track-allocations")]
         {
             let record = physical_record_from_allocation(request, allocation, accounting_owner);
             match self.registry.register_result(&self.boot, record) {
-                Ok(()) => return Ok(allocation),
+                Ok(()) => Ok(allocation),
                 Err(err) => {
                     let _ = self.free_physical_raw(allocation);
                     release_accounting(accounting_owner, request.size);
-                    return Err(match err {
+                    Err(match err {
                         RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
                         RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
                         RegistryError::UnknownPointer => buddy::BuddyAllocError::InvalidAddress,
@@ -1138,11 +1137,10 @@ impl KernelMemorySubsystem {
                         RegistryError::MetadataOutOfMemory => {
                             buddy::BuddyAllocError::MetadataOutOfMemory
                         }
-                    });
+                    })
                 }
             }
         }
-        Ok(allocation)
     }
 
     pub fn free_physical(&self, allocation: PhysicalAllocation) -> bool {
@@ -1189,7 +1187,6 @@ impl KernelMemorySubsystem {
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
         if record.kind != AllocationKind::Physical {
-            #[cfg(feature = "track-allocations")]
             let _ = self.registry.register_result(&self.boot, record);
             return Err(PhysicalFreeError::InvalidRecordKind {
                 actual: record.kind,
@@ -1198,7 +1195,6 @@ impl KernelMemorySubsystem {
 
         let allocation = physical_allocation_from_record(record);
         if allocation.paddr != paddr {
-            #[cfg(feature = "track-allocations")]
             let _ = self.registry.register_result(&self.boot, record);
             return Err(PhysicalFreeError::AddressMismatch {
                 expected: allocation.paddr,
@@ -1212,7 +1208,6 @@ impl KernelMemorySubsystem {
                 Ok(())
             }
             Err(err) => {
-                #[cfg(feature = "track-allocations")]
                 let _ = self.registry.register_result(&self.boot, record);
                 Err(PhysicalFreeError::Buddy(err))
             }
@@ -1244,7 +1239,6 @@ impl KernelMemorySubsystem {
         if let Err(err) = validate_physical_free_record(record, allocation) {
             // 调用方传入的句柄和 registry 中活跃记录不一致，说明这不是一次合法的
             // 所有权释放。物理页仍由原记录持有，必须先恢复账本再返回类型化错误。
-            #[cfg(feature = "track-allocations")]
             let _ = self.registry.register_result(&self.boot, record);
             return Err(err);
         }
@@ -1257,7 +1251,6 @@ impl KernelMemorySubsystem {
             Err(err) => {
                 // buddy 拒绝释放时，物理页实际仍由调用方持有；必须恢复 registry
                 // 账本，否则下一次释放会变成未知指针，审计也会漏掉该页。
-                #[cfg(feature = "track-allocations")]
                 let _ = self.registry.register_result(&self.boot, record);
                 Err(PhysicalFreeError::Buddy(err))
             }
@@ -1690,7 +1683,6 @@ impl KernelMemorySubsystem {
                     Err(err) => {
                         // managed 对象可能因为仍有强句柄或根引用而拒绝释放。此时对象实际
                         // 仍然存活，registry 账本必须回滚，否则后续句柄释放后会变成悬空对象。
-                        #[cfg(feature = "track-allocations")]
                         if let Err(rollback_err) = self.registry.register_result(&self.boot, record)
                         {
                             panic!(
@@ -2053,7 +2045,6 @@ impl KernelMemorySubsystem {
             old_record.size,
             new_record.size,
         ) {
-            #[cfg(feature = "track-allocations")]
             let _ = self.registry.register_result(&self.boot, old_record);
             return false;
         }
