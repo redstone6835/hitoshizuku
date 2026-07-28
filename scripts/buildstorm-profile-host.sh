@@ -34,25 +34,26 @@ if [ "${1:-}" = "--extract-progress-after" ]; then
 fi
 
 repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-duration_arg=${1:-120}
+duration_arg=${1:-0}
 if [ -n "${PROFILE_DURATION_MS:-}" ]; then
     duration_ms=$PROFILE_DURATION_MS
 else
     duration_ms=$(awk -v value="$duration_arg" \
-        'BEGIN { if (value !~ /^[0-9]+([.][0-9]+)?$/ || value <= 0) exit 1; printf "%.0f\n", value * 1000 }') || {
-        echo "usage: $0 [positive-seconds]" >&2
+        'BEGIN { if (value !~ /^[0-9]+([.][0-9]+)?$/ || value < 0) exit 1; printf "%.0f\n", value * 1000 }') || {
+        echo "usage: $0 [non-negative-seconds]" >&2
         exit 2
     }
 fi
 case "$duration_ms" in
-    ''|*[!0-9]*|0) echo "PROFILE_DURATION_MS must be a positive integer" >&2; exit 2 ;;
+    ''|*[!0-9]*) echo "PROFILE_DURATION_MS must be a non-negative integer" >&2; exit 2 ;;
 esac
 
 warmup_ms=${PROFILE_WARMUP_MS:-0}
-stage_timeout_ms=${PROFILE_STAGE_TIMEOUT_MS:-900000}
-boot_timeout_ms=${PROFILE_BOOT_TIMEOUT_MS:-120000}
-done_timeout_ms=${PROFILE_DONE_TIMEOUT_MS:-30000}
-capture_start_timeout_ms=${PROFILE_CAPTURE_START_TIMEOUT_MS:-30000}
+stage_timeout_ms=${PROFILE_STAGE_TIMEOUT_MS:-0}
+boot_timeout_ms=${PROFILE_BOOT_TIMEOUT_MS:-0}
+done_timeout_ms=${PROFILE_DONE_TIMEOUT_MS:-0}
+capture_start_timeout_ms=${PROFILE_CAPTURE_START_TIMEOUT_MS:-0}
+controller_timeout_ms=${PROFILE_CONTROLLER_TIMEOUT_MS:-0}
 sample_ms=${PROFILE_HOST_SAMPLE_MS:-1000}
 poll_ms=${PROFILE_POLL_MS:-50}
 anchor=${PROFILE_STAGE_ANCHOR:-workload}
@@ -63,6 +64,7 @@ for pair in \
     "PROFILE_BOOT_TIMEOUT_MS:$boot_timeout_ms" \
     "PROFILE_DONE_TIMEOUT_MS:$done_timeout_ms" \
     "PROFILE_CAPTURE_START_TIMEOUT_MS:$capture_start_timeout_ms" \
+    "PROFILE_CONTROLLER_TIMEOUT_MS:$controller_timeout_ms" \
     "PROFILE_HOST_SAMPLE_MS:$sample_ms" \
     "PROFILE_POLL_MS:$poll_ms"
 do
@@ -306,8 +308,13 @@ send_line() {
 }
 
 deadline_after_ms() {
+    [ "$1" -eq 0 ] && return 0
     now=$(monotonic_ns)
     printf '%s\n' "$((now + $1 * 1000000))"
+}
+
+deadline_expired() {
+    [ -n "$1" ] && [ "$(monotonic_ns)" -ge "$1" ]
 }
 
 wait_for_fixed() {
@@ -315,14 +322,13 @@ wait_for_fixed() {
     timeout_ms=$2
     deadline=$(deadline_after_ms "$timeout_ms")
     while ! grep -Fq "$needle" "$run_dir/profile.serial.log" 2>/dev/null; do
-        [ "$(monotonic_ns)" -lt "$deadline" ] || return 1
+        deadline_expired "$deadline" && return 1
         sleep_ms 20
     done
 }
 
 report_controller_status() {
     send_line "/tmp/p/run.sh d $run_token" >/dev/null 2>&1 || return 0
-    wait_for_fixed "PROFILE_CONTROLLER_STATUS token=$run_token " 1000 || true
 }
 
 workload_finished() {
@@ -557,9 +563,9 @@ if [ "$observer_enabled" -eq 1 ]; then
 fi
 timeout 30 "$@" >/dev/null
 
-socket_deadline=$(deadline_after_ms 10000)
+socket_deadline=$(deadline_after_ms "$controller_timeout_ms")
 while [ ! -S "$run_dir/serial.sock" ] || [ ! -S "$run_dir/qmp.sock" ]; do
-    [ "$(monotonic_ns)" -lt "$socket_deadline" ] || {
+    deadline_expired "$socket_deadline" && {
         echo "profile host: QEMU sockets did not appear" >&2
         timeout 5 docker logs "$container" >&2 || true
         exit 1
@@ -618,14 +624,14 @@ if [ "$observer_enabled" -eq 1 ]; then
         --environment "plugin_sha256=$plugin_id"
     "$@" >"$run_dir/qemu-observer.stdout" 2>"$run_dir/qemu-observer.stderr" &
     observer_pid=$!
-    observer_deadline=$(deadline_after_ms 10000)
+    observer_deadline=$(deadline_after_ms "$controller_timeout_ms")
     while [ ! -s "$run_dir/qemu-observer.ready" ]; do
         kill -0 "$observer_pid" 2>/dev/null || {
             echo "profile host: QEMU observer exited during setup" >&2
             cat "$run_dir/qemu-observer.stderr" >&2 || true
             exit 1
         }
-        [ "$(monotonic_ns)" -lt "$observer_deadline" ] || {
+        deadline_expired "$observer_deadline" && {
             echo "profile host: QEMU observer setup timed out" >&2
             exit 1
         }
@@ -653,17 +659,17 @@ wait_for_fixed '[init] press Ctrl+C within 3 seconds' "$boot_timeout_ms" || {
 }
 sleep_ms 1500
 timeout 2 sh -c 'printf "\003" >"$1"' sh "$run_dir/serial.in"
-wait_for_fixed '[init] Ctrl+C detected, entering shell' 10000 || {
+wait_for_fixed '[init] Ctrl+C detected, entering shell' "$controller_timeout_ms" || {
     echo "profile host: failed to enter the init shell" >&2; exit 1;
 }
-wait_for_fixed '~ # ' 10000 || { echo "profile host: init shell prompt timed out" >&2; exit 1; }
+wait_for_fixed '~ # ' "$controller_timeout_ms" || { echo "profile host: init shell prompt timed out" >&2; exit 1; }
 sleep_ms 500
 
 serial_sync_attempts=0
 while [ "$serial_sync_attempts" -lt 3 ]; do
     serial_sync_attempts=$((serial_sync_attempts + 1))
     send_line "echo @\"\"@PROFILE_CONSOLE_SYNC token=$run_token"
-    if wait_for_fixed "@@PROFILE_CONSOLE_SYNC token=$run_token" 3000; then
+    if wait_for_fixed "@@PROFILE_CONSOLE_SYNC token=$run_token" "$controller_timeout_ms"; then
         break
     fi
 done
@@ -674,22 +680,22 @@ done
 }
 
 send_line 'grep -q " /mnt " /proc/mounts && mkdir -p /tmp/p && echo @""@PROFILE_SETUP_1'
-wait_for_fixed "@@PROFILE_SETUP_1" 10000 || {
+wait_for_fixed "@@PROFILE_SETUP_1" "$controller_timeout_ms" || {
     echo "profile host: workload disk was not mounted before the shell prompt" >&2
     exit 1
 }
 send_line "{ grep -q ' /tmp/p ' /proc/mounts || mount -t ext4 $tools_device /tmp/p; } && echo @\"\"@PROFILE_SETUP_2"
-wait_for_fixed "@@PROFILE_SETUP_2" 10000 || { echo "profile host: guest setup mount failed" >&2; exit 1; }
+wait_for_fixed "@@PROFILE_SETUP_2" "$controller_timeout_ms" || { echo "profile host: guest setup mount failed" >&2; exit 1; }
 send_line '. /tmp/p/config.env && echo @""@PROFILE_SETUP_3'
-wait_for_fixed "@@PROFILE_SETUP_3" 10000 || { echo "profile host: guest setup config failed" >&2; exit 1; }
+wait_for_fixed "@@PROFILE_SETUP_3" "$controller_timeout_ms" || { echo "profile host: guest setup config failed" >&2; exit 1; }
 send_line '/tmp/p/run.sh run "$PROFILE_RUN_TOKEN" &'
 
-marker_deadline=$(deadline_after_ms 60000)
+marker_deadline=$(deadline_after_ms "$controller_timeout_ms")
 while ! grep -q "@@PROFILE_WORKLOAD .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
     if grep -Eq 'profile runner:|mount: .*failed|PROFILE_RUNNER_DONE' "$run_dir/profile.serial.log" 2>/dev/null; then
         echo "profile host: guest setup failed" >&2; exit 1
     fi
-    [ "$(monotonic_ns)" -lt "$marker_deadline" ] || { echo "profile host: workload marker timed out" >&2; exit 1; }
+    deadline_expired "$marker_deadline" && { echo "profile host: workload marker timed out" >&2; exit 1; }
     sleep_ms 20
 done
 
@@ -701,11 +707,11 @@ case "$workload_log_offset" in ''|*[!0-9]*) echo "profile host: malformed worklo
 workload_pid=$(printf '%s\n' "$marker" | sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p')
 workload_start=$(printf '%s\n' "$marker" | sed -n 's/.* start_ticks=\([0-9][0-9]*\).*/\1/p')
 case "$workload_pid:$workload_start" in *[!0-9:]*|:|:*|*:) echo "profile host: malformed workload identity" >&2; exit 1 ;; esac
-wait_for_fixed "@@PROFILE_CONTROLLER_READY pid=$workload_pid start_ticks=$workload_start token=$run_token" 10000 || {
+wait_for_fixed "@@PROFILE_CONTROLLER_READY pid=$workload_pid start_ticks=$workload_start token=$run_token" "$controller_timeout_ms" || {
     echo "profile host: guest window controller did not become ready" >&2
     exit 1
 }
-wait_for_fixed "@@PROFILE_GATE_READY token=$run_token" 10000 || {
+wait_for_fixed "@@PROFILE_GATE_READY token=$run_token" "$controller_timeout_ms" || {
     echo "profile host: workload gate did not become ready" >&2
     exit 1
 }
@@ -715,7 +721,7 @@ wait_for_fixed "@@PROFILE_GATE_READY token=$run_token" 10000 || {
 # of racing host-side serial setup against an already-running workload.
 if [ "$anchor" = aws-object ]; then
     send_line "/tmp/p/run.sh w $run_token aws-first-object &"
-    wait_for_fixed "@@PROFILE_STAGE_WATCH_READY name=aws-first-object token=$run_token" 10000 || {
+    wait_for_fixed "@@PROFILE_STAGE_WATCH_READY name=aws-first-object token=$run_token" "$controller_timeout_ms" || {
         echo "profile host: aws object stage watcher did not become ready" >&2; exit 1;
     }
 fi
@@ -727,7 +733,7 @@ case "$anchor:$warmup_ms" in
     workload:0) ;;
     *)
         send_line "/tmp/p/run.sh g $run_token"
-        wait_for_fixed "@@PROFILE_GATE_OPENED token=$run_token" 10000 || {
+        wait_for_fixed "@@PROFILE_GATE_OPENED token=$run_token" "$controller_timeout_ms" || {
             echo "profile host: workload start gate timed out" >&2; exit 1;
         }
         ;;
@@ -747,7 +753,7 @@ while [ -z "$anchor_ns" ]; do
         marker:*) serial_after_workload_has "$anchor_marker" && anchor_ns=$(monotonic_ns) ;;
     esac
     if workload_finished; then break; fi
-    [ "$(monotonic_ns)" -lt "$anchor_deadline" ] || { echo "profile host: stage anchor timed out" >&2; exit 1; }
+    deadline_expired "$anchor_deadline" && { echo "profile host: stage anchor timed out" >&2; exit 1; }
     [ -n "$anchor_ns" ] || sleep_ms "$poll_ms"
 done
 printf '%s\n' "${anchor_ns:-0}" >"$run_dir/anchor-monotonic-ns"
@@ -775,7 +781,7 @@ if [ "$workload_ended" -eq 0 ]; then
             workload_ended=1
             break
         fi
-        [ "$(monotonic_ns)" -lt "$capture_deadline" ] || {
+        deadline_expired "$capture_deadline" && {
             report_controller_status
             echo "profile host: capture start timed out" >&2
             exit 1
@@ -807,15 +813,15 @@ sample_qemu_boundary start "$start_ns"
 start_observed_ns=$start_ns
 if [ "$workload_ended" -eq 0 ]; then
     send_line "/tmp/p/run.sh c $run_token"
-    wait_for_fixed "@@PROFILE_WINDOW_STARTED token=$run_token" 10000 || {
+    wait_for_fixed "@@PROFILE_WINDOW_STARTED token=$run_token" "$controller_timeout_ms" || {
         echo "profile host: workload window resume timed out" >&2; exit 1;
     }
-    wait_for_fixed "@@PROFILE_CARGO_EXEC token=$run_token" 10000 || {
+    wait_for_fixed "@@PROFILE_CARGO_EXEC token=$run_token" "$controller_timeout_ms" || {
         echo "profile host: cargo did not cross the start gate" >&2; exit 1;
     }
     start_observed_ns=$(monotonic_ns)
 fi
-deadline_ns=$((start_ns + duration_ms * 1000000))
+deadline_ns=$(deadline_after_ms "$duration_ms")
 next_sample_ns=$((start_ns + sample_ms * 1000000))
 while [ "$workload_ended" -eq 0 ]; do
     now_ns=$(monotonic_ns)
@@ -823,7 +829,7 @@ while [ "$workload_ended" -eq 0 ]; do
         workload_ended=1
         break
     fi
-    [ "$now_ns" -lt "$deadline_ns" ] || break
+    deadline_expired "$deadline_ns" && break
     record_progress
     if [ "$now_ns" -ge "$next_sample_ns" ]; then
         sample_host interval
@@ -859,7 +865,7 @@ if [ "$workload_ended" -eq 0 ]; then
     send_line "/tmp/p/run.sh z $run_token"
     stop_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_FROZEN .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
-        [ "$(monotonic_ns)" -lt "$stop_deadline" ] || {
+        deadline_expired "$stop_deadline" && {
             report_controller_status
             echo "profile host: window freeze timed out" >&2
             exit 1
@@ -869,7 +875,7 @@ if [ "$workload_ended" -eq 0 ]; then
 else
     stop_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_FROZEN .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
-        [ "$(monotonic_ns)" -lt "$stop_deadline" ] || break
+        deadline_expired "$stop_deadline" && break
         sleep_ms "$poll_ms"
     done
 fi
@@ -917,7 +923,7 @@ if [ "$frozen_observed" -eq 1 ]; then
     send_line "/tmp/p/run.sh k $run_token"
     snapshot_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_STOPPED .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
-        [ "$(monotonic_ns)" -lt "$snapshot_deadline" ] || {
+        deadline_expired "$snapshot_deadline" && {
             report_controller_status
             echo "profile host: window snapshot timed out" >&2
             exit 1
@@ -956,7 +962,7 @@ if [ "$actual_stop_sent" -eq 0 ]; then
     termination_mode=guest-runner-complete
     done_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "PROFILE_RUNNER_DONE .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
-        [ "$(monotonic_ns)" -lt "$done_deadline" ] || {
+        deadline_expired "$done_deadline" && {
             echo "profile host: natural runner completion timed out" >&2
             exit 1
         }
@@ -1090,7 +1096,8 @@ elif termination_mode == "guest-runner-complete":
 else:
     raise SystemExit(f"unsupported termination mode: {termination_mode}")
 summary = {
-    "schema": "mygo.buildstorm-profile.v2",
+    "schema": "mygo.buildstorm-profile",
+    "schema_version": 2,
     "run_dir": str(run_dir),
     "metadata": metadata,
     "timing": {

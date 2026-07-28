@@ -6,11 +6,12 @@ stats=${PROFILE_STATS:-/sys/kernel/profile_stats}
 samples=${PROFILE_SAMPLES:-/sys/kernel/profile_samples}
 catalog=${PROFILE_CATALOG:-/sys/kernel/profile_catalog}
 trace=${PROFILE_TRACE_FILE:-/sys/kernel/profile_trace}
+health=${PROFILE_HEALTH:-/sys/kernel/profile_health}
 
 usage() {
     echo "usage: $0 <start|stop|status|catalog> [case-id]" >&2
     echo "       $0 run <case-id> <command> [args...]" >&2
-    echo "       PROFILE_PRESET=io|syscall|filesystem|block|full PROFILE_TIMING_SHIFT=0..16" >&2
+    echo "       PROFILE_PRESET=io|syscall|filesystem|memory|scheduler|block|network|build|all|full PROFILE_TIMING_SHIFT=0..16" >&2
     exit 2
 }
 
@@ -18,13 +19,11 @@ write_control() {
     printf '%s\n' "$1" >"$control"
 }
 
-preset_mask() {
+preset_name() {
     case "$1" in
-        io) echo 0x9efff4000 ;;
-        syscall) echo 0x1000000 ;;
-        filesystem) echo 0x6000000 ;;
-        block) echo 0x9e0000000 ;;
-        full) echo 0xfffffffff ;;
+        io|syscall|filesystem|memory|scheduler|block|network|build|all|full)
+            printf '%s\n' "$1"
+            ;;
         *)
             echo "profile capture: unknown PROFILE_PRESET=$1" >&2
             exit 2
@@ -59,6 +58,11 @@ snapshot() {
         echo "@@PROFILE_TRACE_BEGIN phase=$phase case=$case_id"
         printf '%s\n' "$trace_snapshot"
         echo "@@PROFILE_TRACE_END phase=$phase case=$case_id"
+    fi
+    if [ -r "$health" ]; then
+        echo "@@PROFILE_HEALTH_BEGIN phase=$phase case=$case_id"
+        cat "$health"
+        echo "@@PROFILE_HEALTH_END phase=$phase case=$case_id"
     fi
 }
 
@@ -131,14 +135,19 @@ start_capture() {
     esac
     preset=
     if [ -n "${PROFILE_PRESET:-}" ]; then
-        preset=$(preset_mask "$PROFILE_PRESET")
+        preset=$(preset_name "$PROFILE_PRESET")
     fi
-    event_mask=${PROFILE_EVENT_MASK:-${preset:-0xfffffffff}}
     write_control freeze
     write_control reset
-    write_control "events=$event_mask"
-    write_control "samples=$sampling"
-    write_control "trace=$trace_enabled"
+    if [ -n "${PROFILE_EVENT_MASK:-}" ]; then
+        write_control "events=$PROFILE_EVENT_MASK"
+    elif [ -n "$preset" ]; then
+        write_control "preset=$preset"
+    fi
+    [ -z "${PROFILE_SAMPLING:-}" ] || \
+        write_control "samples=$PROFILE_SAMPLING"
+    [ -z "${PROFILE_TRACE_ENABLED:-}" ] || \
+        write_control "trace=$PROFILE_TRACE_ENABLED"
     write_control "timing_shift=$timing_shift"
     metadata before "$case_id"
     snapshot before "$case_id"

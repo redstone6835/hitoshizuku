@@ -32,6 +32,7 @@ PROFILE_CONTROL="$control" \
 PROFILE_STATS="$stats" \
 PROFILE_SAMPLES="$tmp/missing-samples" \
 PROFILE_TRACE_FILE="$trace" \
+PROFILE_HEALTH="$tmp/missing-health" \
 PROFILE_ARCH=riscv64 \
 PROFILE_CPU_ONLINE=0-1 \
 PROFILE_KERNEL_RELEASE=mygo \
@@ -64,7 +65,8 @@ printf 'token\n' | PATH="$tmp/bin:$PATH" \
     PROFILE_CONTROL="$control" \
     PROFILE_STATS="$stats" \
     PROFILE_SAMPLES="$tmp/missing-samples" \
-    PROFILE_TRACE_FILE="$trace" \
+PROFILE_TRACE_FILE="$trace" \
+PROFILE_HEALTH="$tmp/missing-health" \
     PROFILE_CMDLINE='' \
     "$root/scripts/profile-capture.sh" run stdin /bin/sh -c \
         'read value && [ "$value" = token ]' >"$output"
@@ -80,11 +82,10 @@ if PATH="$tmp/bin:$PATH" \
     exit 1
 fi
 
-grep -q 'filesystem) echo 0x6000000' "$root/scripts/profile-capture.sh"
-grep -q 'io) echo 0x9efff4000' "$root/scripts/profile-capture.sh"
-grep -q 'block) echo 0x9e0000000' "$root/scripts/profile-capture.sh"
-grep -q 'full) echo 0xfffffffff' "$root/scripts/profile-capture.sh"
-grep -q 'event_mask=${PROFILE_EVENT_MASK:-${preset:-0xfffffffff}}' "$root/scripts/profile-capture.sh"
+grep -q 'io|syscall|filesystem|memory|scheduler|block|network|build|all|full)' \
+    "$root/scripts/profile-capture.sh"
+grep -q 'write_control "preset=$preset"' "$root/scripts/profile-capture.sh"
+grep -q 'write_control "events=$PROFILE_EVENT_MASK"' "$root/scripts/profile-capture.sh"
 grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/buildstorm-profile-host.sh"
 grep -q 'event_mask=${PROFILE_EVENT_MASK:-0xfef000000}' "$root/scripts/buildstorm-profile-guest.sh"
 

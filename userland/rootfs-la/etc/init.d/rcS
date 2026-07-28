@@ -73,6 +73,12 @@ maybe_enter_shell() {
 GLIBC_BLACKLIST="unixbench libctest"
 MUSL_BLACKLIST="unixbench copy-file-range interuppts splice cagent buildstorm"
 BUILDSTORM_ENABLED=1
+TEST_MODE="$(cat /etc/mygo-test-mode 2>/dev/null || echo default)"
+TEST_WORKLOAD="$(cat /etc/mygo-test-workload 2>/dev/null || true)"
+PROFILE_WORKLOAD="$(cat /etc/mygo-profile-workload 2>/dev/null || true)"
+PROFILE_MODE="$(cat /etc/mygo-profile-mode 2>/dev/null || echo sample)"
+PROFILE_PRESET="$(cat /etc/mygo-profile-preset 2>/dev/null || echo all)"
+PROFILE_SAMPLE_HZ="$(cat /etc/mygo-profile-sample-hz 2>/dev/null || echo 250)"
 
 if [ -r /sys/kernel/cmdline ]; then
     for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
@@ -393,6 +399,10 @@ run_chroot_test_script() {
     libc_name="${dir##*/}"
     runner="$script"
     temporary_runner=""
+    temporary_rules=""
+    runner_arg1=""
+    runner_arg2=""
+    runner_arg3=""
 
     case "$script" in
         /mnt/*) ;;
@@ -423,6 +433,23 @@ run_chroot_test_script() {
         fi
         chmod 0755 "$temporary_runner" 2>/dev/null || true
         runner="$temporary_runner"
+    elif [ -n "$PROFILE_WORKLOAD" ] && [ "$name" = "$PROFILE_WORKLOAD" ] && \
+        [ -x /bin/profile-workload-guest ]; then
+        temporary_runner="/mnt/tmp/.mygo-profile-workload"
+        if ! cp /bin/profile-workload-guest "$temporary_runner"; then
+            echo "[init] failed to install workload profile runner"
+            cleanup_chroot_test_root
+            return 1
+        fi
+        chmod 0755 "$temporary_runner" 2>/dev/null || true
+        runner="$temporary_runner"
+        runner_arg1="${name%_testcode.sh}"
+        runner_arg2="${script#/mnt}"
+        if [ -r /etc/mygo-profile-phases ]; then
+            temporary_rules="/mnt/tmp/.mygo-profile-phases"
+            cp /etc/mygo-profile-phases "$temporary_rules" || return 1
+            runner_arg3="${temporary_rules#/mnt}"
+        fi
     fi
 
     inside_runner="${runner#/mnt}"
@@ -447,15 +474,53 @@ run_chroot_test_script() {
         PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
         HOME=/root
         unset LD_LIBRARY_PATH
-        export PATH HOME
-        cd "$1" && exec "$2" "$3"
-    ' sh "$inside_dir" "$chroot_shell" "$inside_runner"
+        PROFILE_MODE="$7"
+        PROFILE_PRESET="$8"
+        PROFILE_SAMPLE_HZ="$9"
+        export PATH HOME PROFILE_MODE PROFILE_PRESET PROFILE_SAMPLE_HZ
+        cd "$1" || exit 1
+        if [ -n "$4" ]; then
+            if [ -n "$6" ]; then exec "$2" "$3" "$4" "$5" "$6"; fi
+            exec "$2" "$3" "$4" "$5"
+        fi
+        exec "$2" "$3"
+    ' sh "$inside_dir" "$chroot_shell" "$inside_runner" \
+        "$runner_arg1" "$runner_arg2" "$runner_arg3" \
+        "$PROFILE_MODE" "$PROFILE_PRESET" "$PROFILE_SAMPLE_HZ"
     status=$?
 
     [ -n "$temporary_runner" ] && rm -f "$temporary_runner"
+    [ -n "$temporary_rules" ] && rm -f "$temporary_rules"
     cleanup_chroot_test_root
     echo "[init] $name chroot test exit=$status"
     return "$status"
+}
+
+run_direct_test_script() {
+    script="$1"
+    name="${script##*/}"
+    case_id="${name%_testcode.sh}"
+    phase_rules=""
+
+    if [ -n "$PROFILE_WORKLOAD" ] && [ "$name" = "$PROFILE_WORKLOAD" ] && \
+        [ -x /bin/profile-workload-guest ]; then
+        if [ -r /etc/mygo-profile-phases ]; then
+            phase_rules=/etc/mygo-profile-phases
+        fi
+        if [ -n "$phase_rules" ]; then
+            PROFILE_OUTPUT_ROOT=/mnt/work/mygo-profile \
+            PROFILE_MODE="$PROFILE_MODE" PROFILE_PRESET="$PROFILE_PRESET" \
+            PROFILE_SAMPLE_HZ="$PROFILE_SAMPLE_HZ" \
+                /bin/profile-workload-guest "$case_id" "$script" "$phase_rules"
+        else
+            PROFILE_OUTPUT_ROOT=/mnt/work/mygo-profile \
+            PROFILE_MODE="$PROFILE_MODE" PROFILE_PRESET="$PROFILE_PRESET" \
+            PROFILE_SAMPLE_HZ="$PROFILE_SAMPLE_HZ" \
+                /bin/profile-workload-guest "$case_id" "$script"
+        fi
+        return $?
+    fi
+    /bin/sh "$script"
 }
 
 run_test_script_file() {
@@ -465,6 +530,11 @@ run_test_script_file() {
     libc_name="${dir##*/}"
     oldpwd="$PWD"
     status=0
+
+    if [ "$TEST_MODE" = "single" ] && [ "$name" != "$TEST_WORKLOAD" ]; then
+        echo "[init] skip $libc_name/$name (single workload mode)"
+        return 0
+    fi
 
     case "$name" in
         buildstorm_testcode.sh)
@@ -509,7 +579,7 @@ run_test_script_file() {
                 ;;
             *)
                 cd "$dir" || return 0
-                /bin/sh "$script"
+                run_direct_test_script "$script"
                 ;;
         esac
         status=$?

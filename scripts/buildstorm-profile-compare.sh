@@ -57,7 +57,7 @@ def load(path_text):
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         fail(f"cannot read {path}: {error}")
-    if data.get("schema") != "mygo.buildstorm-profile.v2":
+    if data.get("schema") != "mygo.buildstorm-profile" or data.get("schema_version") != 2:
         fail(f"unsupported summary schema in {path}")
     data["_path"] = str(path)
     return data

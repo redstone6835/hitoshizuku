@@ -86,6 +86,8 @@ active && /^state=/ {
 active && /^cpu=/ && / first_sequence=/ {
     if (value("overwritten") + 0 != 0)
         fail("overwritten trace records for case=" case_id " phase=" phase " cpu=" value("cpu"))
+    if (value("dropped") + 0 != 0)
+        fail("dropped trace records for case=" case_id " phase=" phase " cpu=" value("cpu"))
     next
 }
 active && /^cpu=/ && / sequence=/ {

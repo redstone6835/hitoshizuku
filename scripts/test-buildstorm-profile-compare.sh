@@ -56,7 +56,8 @@ elif result_kind == "natural":
 else:
     raise SystemExit(f"unknown result fixture: {result_kind}")
 data = {
-    "schema": "mygo.buildstorm-profile.v2",
+    "schema": "mygo.buildstorm-profile",
+    "schema_version": 2,
     "metadata": {
         "base_sha256": "base", "kernel_sha256": kernel, "qemu_version": "qemu",
         "container_image": "image", "container_image_id": "sha256:image",

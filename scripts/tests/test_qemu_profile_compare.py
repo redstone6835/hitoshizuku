@@ -346,7 +346,8 @@ class CommandLineTests(unittest.TestCase):
             run_dir = Path(temporary) / "run"
             run_dir.mkdir()
             (run_dir / "summary.json").write_text(
-                json.dumps({"schema": "mygo.buildstorm-profile.v2"}), encoding="utf-8"
+                json.dumps({"schema": "mygo.buildstorm-profile", "schema_version": 2}),
+                encoding="utf-8",
             )
             observer = run_dir / "qemu-profile-summary.json"
             observer.write_text(

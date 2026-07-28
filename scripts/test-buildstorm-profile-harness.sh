@@ -618,7 +618,8 @@ python3 "$summary_python" "$summary_dir" workload 90 100 110 120 1 null unavaila
 python3 - "$summary_dir/summary.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
-assert data["schema"] == "mygo.buildstorm-profile.v2"
+assert data["schema"] == "mygo.buildstorm-profile"
+assert data["schema_version"] == 2
 assert data["timing"]["window_start_progress"] == 0
 assert data["timing"]["window_stop_progress"] == 64
 assert data["timing"]["start_observation_latency_ms"] == 0.000001

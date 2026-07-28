@@ -12,6 +12,13 @@ JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 BUILD_DIR := build
 CARGO_TARGET_DIR ?= target
 FEATURES ?=
+TEST_MODE ?= default
+TEST_WORKLOAD ?=
+PROFILE_MODE ?= sample
+PROFILE_PRESET ?= all
+PROFILE_SAMPLE_HZ ?= 250
+PROFILE_WORKLOAD ?=
+PROFILE_PHASE_RULES ?=
 CONFIG_FILE ?= .config
 INITRAMFS ?=
 INSTALL_MOD_PATH ?=
@@ -52,6 +59,7 @@ BUSYBOX_ARCHIVE := third/busybox-1.36.1.tar.gz
 ENSURE_BUSYBOX := scripts/ensure-busybox.sh
 BUSYBOX_SKELETON := userland/busybox-initramfs
 PACK_INITRAMFS := scripts/pack-initramfs.sh
+WORKLOAD_PROFILER := scripts/profile-workload-guest.sh
 
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
@@ -256,6 +264,20 @@ define prepare_compat_rootfs
 	cp -a $(BUILD_DIR)/$(1)/busybox-rootfs/. $(2)/
 	mkdir -p $(2)/etc $(2)/tmp
 	cp -a $(3)/etc/. $(2)/etc/
+	printf '%s\n' '$(TEST_MODE)' >$(2)/etc/mygo-test-mode
+	printf '%s\n' '$(TEST_WORKLOAD)' >$(2)/etc/mygo-test-workload
+	printf '%s\n' '$(PROFILE_MODE)' >$(2)/etc/mygo-profile-mode
+	printf '%s\n' '$(PROFILE_PRESET)' >$(2)/etc/mygo-profile-preset
+	printf '%s\n' '$(PROFILE_SAMPLE_HZ)' >$(2)/etc/mygo-profile-sample-hz
+	printf '%s\n' '$(PROFILE_WORKLOAD)' >$(2)/etc/mygo-profile-workload
+	@if [ -n "$(filter performance-profile,$(FEATURES))" ]; then \
+		install -m 0755 $(WORKLOAD_PROFILER) $(2)/bin/profile-workload-guest; \
+		if [ -n "$(PROFILE_PHASE_RULES)" ]; then \
+			install -m 0644 "$(PROFILE_PHASE_RULES)" $(2)/etc/mygo-profile-phases; \
+		else \
+			rm -f $(2)/etc/mygo-profile-phases; \
+		fi; \
+	fi
 	mkdir -p $(2)/lib/elm
 	rm -f $(2)/lib/elm/*
 	$(call build_elm_user_tools,$(1),$(2),$(5))
