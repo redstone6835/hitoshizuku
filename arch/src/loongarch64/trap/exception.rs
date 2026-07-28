@@ -465,6 +465,17 @@ unsafe fn loongarch64_handle_exception_inner(
                 }
                 arg4
             }
+            FaultOutcome::OutOfMemory => {
+                if sched::is_ready() {
+                    let me = sched::current_task();
+                    let pid = me.pid_root().unwrap_or(0);
+                    log::warning!("[trap][mm][oom] killing pid={} comm={:?}", pid, me.comm());
+                    let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
+                    drop(me);
+                    deliver_user_signals_before_return(arg4, from_user);
+                }
+                arg4
+            }
             FaultOutcome::Kernel(reason) => {
                 if !from_user
                     && let Some(recovery) =

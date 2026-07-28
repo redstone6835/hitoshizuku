@@ -44,6 +44,8 @@ pub enum FaultOutcome {
     Fixed,
     /// 应向当前线程投 `SIGSEGV`（或 `SIGBUS`）。
     Segv,
+    /// 用户缺页需要新物理页，但系统已无法满足分配。
+    OutOfMemory,
     /// 真内核 bug：无法恢复。
     Kernel(KernelFaultReason),
 }

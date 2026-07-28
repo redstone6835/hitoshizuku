@@ -1111,7 +1111,15 @@ impl KernelMemorySubsystem {
             return Err(buddy::BuddyAllocError::Fragmented);
         }
         let request = request.with_accounting_owner(accounting_owner);
-        let allocation = match self.allocate_physical_raw(request) {
+        let mut allocation = self.allocate_physical_raw(request);
+        if allocation.is_err() && active {
+            // 显式物理页与普通内核堆共享 buddy。用户页、页表页等 typed 请求在
+            // 宣告 OOM 前也必须归还 allocator 自身缓存，否则短生命周期堆对象
+            // 留下的空 slab/kheap range 会对物理页调用方表现成不可用内存。
+            let _ = self.reclaim_allocator_caches_for_retry();
+            allocation = self.allocate_physical_raw(request);
+        }
+        let allocation = match allocation {
             Ok(allocation) => allocation,
             Err(err) => {
                 release_accounting(accounting_owner, request.size);

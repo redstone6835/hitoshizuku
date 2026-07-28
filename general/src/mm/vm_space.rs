@@ -1029,14 +1029,17 @@ pub struct VmSpaceDiag {
     pub live: usize,
     pub created: usize,
     pub dropped: usize,
+    pub private_file_pressure_reclaims: u64,
 }
 
 #[kernel_symbols::export(name = "general.mm.vm_space_diag", contract = "kernel.mm.diagnostic@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn vm_space_diag() -> VmSpaceDiag {
+    let private_file_cache = private_file_page_cache_diag();
     VmSpaceDiag {
         live: VM_SPACE_LIVE.load(Ordering::Acquire),
         created: VM_SPACE_CREATED.load(Ordering::Acquire),
         dropped: VM_SPACE_DROPPED.load(Ordering::Acquire),
+        private_file_pressure_reclaims: private_file_cache.pressure_reclaims,
     }
 }
 
@@ -3629,7 +3632,9 @@ impl VmSpace {
         };
         match self.ensure_page_access(user, kind) {
             FaultOutcome::Fixed => self.with_user_atomic_u32(user, write, |_| ((), false)),
-            FaultOutcome::Segv | FaultOutcome::Kernel(_) => Err(Errno::EFAULT),
+            FaultOutcome::Segv | FaultOutcome::OutOfMemory | FaultOutcome::Kernel(_) => {
+                Err(Errno::EFAULT)
+            }
         }
     }
 
@@ -3652,7 +3657,9 @@ impl VmSpace {
         while page < end {
             match self.ensure_page_access(page, kind) {
                 FaultOutcome::Fixed => {}
-                FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
+                FaultOutcome::Segv | FaultOutcome::OutOfMemory | FaultOutcome::Kernel(_) => {
+                    return Err(Errno::EFAULT);
+                }
             }
             page = page.checked_add(page_size).ok_or(Errno::EFAULT)?;
         }
@@ -3951,7 +3958,9 @@ impl VmSpace {
         }
         match self.ensure_page_access(user, kind) {
             FaultOutcome::Fixed => {}
-            FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
+            FaultOutcome::Segv | FaultOutcome::OutOfMemory | FaultOutcome::Kernel(_) => {
+                return Err(Errno::EFAULT);
+            }
         }
 
         let page_va = page_base(user);
@@ -5336,7 +5345,7 @@ fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno>
 
 fn fault_from_errno(err: Errno) -> FaultOutcome {
     match err {
-        Errno::ENOMEM => FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess),
+        Errno::ENOMEM => FaultOutcome::OutOfMemory,
         _ => FaultOutcome::Segv,
     }
 }
@@ -5530,10 +5539,10 @@ mod tests {
 
     use super::{
         ANON_STORE_FAULT_AROUND_PAGES, ANON_STORE_SHADOW_PAGES, AnonStoreShadowKey,
-        AnonStoreShadowState, FILE_FAULT_AROUND_PAGES, FaultKind, FilePageKey,
+        AnonStoreShadowState, FILE_FAULT_AROUND_PAGES, FaultKind, FaultOutcome, FilePageKey,
         PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, PrivateFilePageCacheClaim,
         PrivateFilePageCacheEntry, ResidentPage, ShardedPrivateFilePageCache, VmFlags,
-        WeakFilePageCache, access_for_private_file, anon_store_fault_around_end,
+        WeakFilePageCache, access_for_private_file, anon_store_fault_around_end, fault_from_errno,
         file_fault_around_window, find_cached_private_file_page, observe_anon_store_shadow,
         permits_file_fault_around, plan_file_segment, private_file_batch_error_is_fatal,
         private_file_batch_page_offset, private_file_batch_plan, publish_cached_file_page,
@@ -5545,6 +5554,12 @@ mod tests {
     use sched::sync::Spinlock;
 
     const PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn user_page_allocation_failure_is_not_a_kernel_access_fault() {
+        assert_eq!(fault_from_errno(Errno::ENOMEM), FaultOutcome::OutOfMemory);
+        assert_eq!(fault_from_errno(Errno::EIO), FaultOutcome::Segv);
+    }
 
     struct ChunkedFile {
         bytes: &'static [u8],

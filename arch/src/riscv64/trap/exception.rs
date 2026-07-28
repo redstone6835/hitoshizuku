@@ -362,6 +362,37 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
             }
             finish_trap_return(tf_ptr, from_user)
         }
+        FaultOutcome::OutOfMemory => {
+            if sched::is_ready() {
+                let task = sched::current_task();
+                let pid = task.pid_root().unwrap_or(0);
+                let comm = task.comm();
+                let buddy = allocator::KERNEL_ALLOCATOR.buddy_stats();
+                let alloc = allocator::KERNEL_ALLOCATOR.layer_stats();
+                let vm = general::mm::vm_space_diag();
+                log::warning!(
+                    "[trap][mm][oom] pid={} comm={:?} free_pages={} allocated_pages={} reserved_pages={} alloc_failures={} physical_records={} small_records={} large_records={} kheap_cached_pages={} vm_live={} vm_created={} vm_dropped={} private_file_pressure_reclaims={}",
+                    pid,
+                    comm,
+                    buddy.free_pages,
+                    buddy.allocated_pages,
+                    buddy.reserved_pages,
+                    buddy.alloc_failures,
+                    alloc.registry.live_physical,
+                    alloc.registry.live_small,
+                    alloc.registry.live_large,
+                    alloc.kheap.cached_pages,
+                    vm.live,
+                    vm.created,
+                    vm.dropped,
+                    vm.private_file_pressure_reclaims,
+                );
+                let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
+                drop(task);
+                deliver_user_signals_before_return(tf_ptr, from_user);
+            }
+            finish_trap_return(tf_ptr, from_user)
+        }
         FaultOutcome::Kernel(reason) => {
             if !from_user
                 && let Some(recovered) =
