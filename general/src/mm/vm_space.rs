@@ -3384,36 +3384,35 @@ impl VmSpace {
             }
             return FaultOutcome::Segv;
         }
-        let backing = area.backing.clone();
         let flags = area.flags;
+        #[cfg(feature = "performance-profile")]
+        let resident_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
+        let mut pages = self.pages.lock();
+        let pte_present = user_pgd_ops()
+            .is_some_and(|ops| (unsafe { (ops.count_mapped)(self.pgd, page, page_size()) }) != 0);
+        if let Some(mapping) = pages.get_mut(&page) {
+            if !pte_present {
+                return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
+            }
+            #[cfg(feature = "performance-profile")]
+            if let Some(backing) = hardware_fault_backing {
+                record_hardware_user_fault(backing, hardware_fault_access, true);
+            }
+            let update = self.handle_resident_fault_locked(page, flags, kind, mapping);
+            drop(pages);
+            drop(set);
+            return self.finish_resident_fault(page, update, publish_unchanged_mapping);
+        }
+        if pte_present {
+            return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
+        }
+        drop(pages);
+        #[cfg(feature = "performance-profile")]
+        drop(resident_profile);
+        let backing = area.backing.clone();
         let area_range = area.range.clone();
         drop(set);
-
-        match self.handle_resident_fault(
-            page,
-            &area_range,
-            &backing,
-            flags,
-            kind,
-            publish_unchanged_mapping,
-            profile_phases,
-            #[cfg(feature = "performance-profile")]
-            hardware_fault_backing.map(|backing| (backing, hardware_fault_access)),
-        ) {
-            Ok(Some(outcome)) => return outcome,
-            Ok(None) => {}
-            Err(()) => {
-                return self.handle_fault_inner(
-                    addr,
-                    kind,
-                    publish_unchanged_mapping,
-                    false,
-                    profile_phases,
-                    #[cfg(feature = "performance-profile")]
-                    false,
-                );
-            }
-        }
         #[cfg(feature = "performance-profile")]
         if let Some(backing) = hardware_fault_backing {
             record_hardware_user_fault(backing, hardware_fault_access, false);
@@ -4456,65 +4455,6 @@ impl VmSpace {
         drop(set);
         self.publish_new_user_range(page_va, page_size());
         FaultAroundCommit::Done(FaultOutcome::Fixed)
-    }
-
-    fn handle_resident_fault(
-        &self,
-        page_va: usize,
-        area_range: &Range<usize>,
-        backing: &VmBacking,
-        flags: VmFlags,
-        kind: FaultKind,
-        publish_unchanged_mapping: bool,
-        profile_phases: bool,
-        #[cfg(feature = "performance-profile")] hardware_fault: Option<(
-            HardwareFaultBacking,
-            HardwareFaultAccess,
-        )>,
-    ) -> Result<Option<FaultOutcome>, ()> {
-        #[cfg(feature = "performance-profile")]
-        let _profile =
-            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
-        #[cfg(not(feature = "performance-profile"))]
-        let _ = profile_phases;
-        let set = self.vmas.lock();
-        let Some(area) = set.find(page_va) else {
-            return Err(());
-        };
-        if area.range != *area_range
-            || area.flags != flags
-            || !same_backing_snapshot(&area.backing, backing)
-        {
-            return Err(());
-        }
-        let mut pages = self.pages.lock();
-        let Some(mapping) = pages.get_mut(&page_va) else {
-            drop(pages);
-            drop(set);
-            return Ok(None);
-        };
-        let pte_present = user_pgd_ops().is_some_and(|ops| {
-            (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
-        });
-        if !pte_present {
-            drop(pages);
-            drop(set);
-            return Ok(Some(FaultOutcome::Kernel(
-                KernelFaultReason::UncaughtKernelAccess,
-            )));
-        }
-        #[cfg(feature = "performance-profile")]
-        if let Some((backing, access)) = hardware_fault {
-            record_hardware_user_fault(backing, access, true);
-        }
-        let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
-        drop(pages);
-        drop(set);
-        Ok(Some(self.finish_resident_fault(
-            page_va,
-            update,
-            publish_unchanged_mapping,
-        )))
     }
 
     fn finish_resident_fault(
