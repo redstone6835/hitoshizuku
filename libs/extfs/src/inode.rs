@@ -93,6 +93,10 @@ pub(crate) fn special_file_layout(kind: FileType) -> Option<(u16, u8)> {
     }
 }
 
+pub(crate) fn should_truncate_on_open(kind: FileType, opts: &OpenOptions) -> bool {
+    opts.truncate && kind == FileType::Regular
+}
+
 /// 按 ext2/3/4 的 `i_block[0..2]` 约定编码设备号。
 pub(crate) fn encode_special_device(dev: DevId) -> VfsResult<(u32, u32)> {
     if dev.major > 0x0fff || dev.minor > 0x0f_ffff {
@@ -1193,7 +1197,8 @@ impl InodeOps for ExtInodeOps {
         opts: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        if opts.truncate {
+        let initial_kind = file_type_from_mode(self.snapshot_meta().mode);
+        if should_truncate_on_open(initial_kind, opts) {
             self.truncate(inode, 0)?;
         }
         let (flags, size, i_block_owned) = self.snapshot_all();

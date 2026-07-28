@@ -5,6 +5,7 @@ extern crate std;
 use crate::inode;
 use ktest::ktest;
 use std::vec;
+use vfs::file::{AccessMode, OpenOptions};
 use vfs::stat::{DevId, FileType};
 
 /// S_IFREG (0x8000) 映射为 FileType::Regular。
@@ -74,4 +75,16 @@ fn special_device_encoding_roundtrips() {
     }
     assert!(inode::encode_special_device(DevId::new(0x1000, 0)).is_err());
     assert!(inode::encode_special_device(DevId::new(0, 0x10_0000)).is_err());
+}
+
+/// `O_TRUNC` 只截断普通文件，打开 FIFO 时必须保留其运行时数据通道。
+#[ktest]
+fn open_truncate_only_applies_to_regular_files() {
+    let opts = OpenOptions {
+        access: AccessMode::WriteOnly,
+        truncate: true,
+        ..OpenOptions::default()
+    };
+    assert!(inode::should_truncate_on_open(FileType::Regular, &opts));
+    assert!(!inode::should_truncate_on_open(FileType::Fifo, &opts));
 }
