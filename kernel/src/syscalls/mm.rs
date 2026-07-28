@@ -91,14 +91,28 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 if is_shared && (prot & PROT_WRITE) != 0 && !file.flags().writable() {
                     return Err(Errno::EACCES);
                 }
+                #[cfg(feature = "performance-profile")]
+                let profile_image = profile_file_mapping(&file, req_addr, offset);
                 let backing: Arc<dyn mm::FileLike> = file;
                 vm.map_fixed_file(req_addr..end, backing, offset, vm_flags.with(VmFlags::USER))?;
+                #[cfg(feature = "performance-profile")]
+                if let Some((image_id, load_base)) = profile_image {
+                    ctx.task()
+                        .register_profile_mapped_image(image_id, req_addr, end, load_base);
+                } else {
+                    ctx.task().clear_profile_mapped_images(req_addr, end);
+                }
             } else {
                 return Err(Errno::EBADF);
+            }
+            #[cfg(feature = "performance-profile")]
+            if anonymous {
+                ctx.task().clear_profile_mapped_images(req_addr, end);
             }
             return Ok(req_addr);
         }
         map_range(
+            ctx.task(),
             &vm,
             req_addr..end,
             anonymous,
@@ -114,6 +128,7 @@ pub(super) fn sys_mmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     for _ in 0..32 {
         let range = vm.alloc_mmap_range(len)?;
         match map_range(
+            ctx.task(),
             &vm,
             range.clone(),
             anonymous,
@@ -141,6 +156,8 @@ pub(super) fn sys_munmap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
     vm.unmap(addr..end)?;
+    #[cfg(feature = "performance-profile")]
+    ctx.task().clear_profile_mapped_images(addr, end);
     Ok(0)
 }
 
@@ -229,12 +246,22 @@ pub(super) fn sys_mremap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         None
     };
-    vm.mremap(
+    let mapped = vm.mremap(
         old_addr..old_end,
         new_len,
         (flags & MREMAP_MAYMOVE) != 0,
         fixed,
-    )
+    )?;
+    #[cfg(feature = "performance-profile")]
+    {
+        let mapped_end = mapped.checked_add(new_len).ok_or(Errno::EINVAL)?;
+        if mapped != old_addr {
+            ctx.task().clear_profile_mapped_images(mapped, mapped_end);
+        }
+        ctx.task()
+            .remap_profile_mapped_images(old_addr, old_end, mapped, mapped_end);
+    }
+    Ok(mapped)
 }
 
 pub(super) fn sys_swapon(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -413,6 +440,7 @@ fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
 }
 
 fn map_range(
+    task: &sched::Task,
     vm: &VmSpace,
     range: core::ops::Range<usize>,
     anonymous: bool,
@@ -423,6 +451,8 @@ fn map_range(
     prot: usize,
 ) -> Result<(), Errno> {
     if anonymous {
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = task;
         return vm.map_anon(range, flags);
     }
     if fd_raw < 0 {
@@ -438,8 +468,31 @@ fn map_range(
     if shared && (prot & PROT_WRITE) != 0 && !file.flags().writable() {
         return Err(Errno::EACCES);
     }
+    #[cfg(feature = "performance-profile")]
+    let profile_image = profile_file_mapping(&file, range.start, offset);
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = task;
+    let image_start = range.start;
+    let image_end = range.end;
     let backing: Arc<dyn mm::FileLike> = file;
-    vm.map_file(range, backing, offset, flags.with(VmFlags::USER))
+    vm.map_file(range, backing, offset, flags.with(VmFlags::USER))?;
+    #[cfg(feature = "performance-profile")]
+    if let Some((image_id, load_base)) = profile_image {
+        task.register_profile_mapped_image(image_id, image_start, image_end, load_base);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "performance-profile")]
+fn profile_file_mapping(
+    file: &Arc<vfs::file::File>,
+    start: usize,
+    offset: u64,
+) -> Option<(u64, usize)> {
+    let path = file.dentry().full_path(&file.mount().mount_root)?;
+    let offset = usize::try_from(offset).ok()?;
+    let load_base = start.checked_sub(offset)?;
+    Some((crate::sched::profile_image_id(&path), load_base))
 }
 
 fn prot_to_vm_flags(prot: usize) -> VmFlags {

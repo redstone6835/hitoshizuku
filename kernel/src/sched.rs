@@ -331,7 +331,7 @@ fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[
 }
 
 #[cfg(feature = "performance-profile")]
-fn profile_image_id(path: &str) -> u64 {
+pub(crate) fn profile_image_id(path: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in path.bytes() {
         hash ^= u64::from(byte);

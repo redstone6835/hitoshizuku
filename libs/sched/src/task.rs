@@ -52,6 +52,189 @@ static TASK_DROPPED: AtomicUsize = AtomicUsize::new(0);
 static TASK_TRACKER: Spinlock<Vec<Weak<Task>>> = Spinlock::new(Vec::new());
 const RSEQ_REGISTERED: u8 = 1 << 7;
 
+#[cfg(feature = "performance-profile")]
+const PROFILE_MAPPED_IMAGE_SLOTS: usize = 64;
+
+/// timer IRQ 可无锁读取的用户映像区间。奇数版本表示写入进行中，采样直接跳过。
+#[cfg(feature = "performance-profile")]
+struct ProfileMappedImage {
+    version: AtomicUsize,
+    image_id: AtomicU64,
+    start: AtomicUsize,
+    end: AtomicUsize,
+    load_base: AtomicUsize,
+}
+
+#[cfg(feature = "performance-profile")]
+impl ProfileMappedImage {
+    const fn new() -> Self {
+        Self {
+            version: AtomicUsize::new(0),
+            image_id: AtomicU64::new(0),
+            start: AtomicUsize::new(0),
+            end: AtomicUsize::new(0),
+            load_base: AtomicUsize::new(0),
+        }
+    }
+
+    fn read(&self) -> Option<(u64, usize, usize, usize)> {
+        let before = self.version.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return None;
+        }
+        let image_id = self.image_id.load(Ordering::Relaxed);
+        let start = self.start.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Relaxed);
+        let load_base = self.load_base.load(Ordering::Relaxed);
+        let after = self.version.load(Ordering::Acquire);
+        (before == after && image_id != 0 && start < end)
+            .then_some((image_id, start, end, load_base))
+    }
+
+    fn write(&self, image_id: u64, start: usize, end: usize, load_base: usize) {
+        let mut version = self.version.load(Ordering::Acquire) & !1;
+        loop {
+            match self.version.compare_exchange_weak(
+                version,
+                version.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => version = observed & !1,
+            }
+        }
+        self.image_id.store(image_id, Ordering::Relaxed);
+        self.start.store(start, Ordering::Relaxed);
+        self.end.store(end, Ordering::Relaxed);
+        self.load_base.store(load_base, Ordering::Relaxed);
+        self.version
+            .store(version.wrapping_add(2), Ordering::Release);
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+fn mapped_image_for_pc(slots: &[ProfileMappedImage], pc: usize) -> (u64, usize) {
+    for slot in slots {
+        let Some((image_id, start, end, load_base)) = slot.read() else {
+            continue;
+        };
+        if start <= pc && pc < end {
+            return (image_id, load_base);
+        }
+    }
+    (0, 0)
+}
+
+#[cfg(feature = "performance-profile")]
+fn clear_mapped_images(slots: &[ProfileMappedImage], start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    for (index, slot) in slots.iter().enumerate() {
+        let Some((image_id, mapped_start, mapped_end, load_base)) = slot.read() else {
+            continue;
+        };
+        if mapped_start >= end || start >= mapped_end {
+            continue;
+        }
+
+        let left = (mapped_start < start).then_some((mapped_start, start.min(mapped_end)));
+        let right = (end < mapped_end).then_some((end.max(mapped_start), mapped_end));
+        match (left, right) {
+            (None, None) => slot.write(0, 0, 0, 0),
+            (Some((left_start, left_end)), None) => {
+                slot.write(image_id, left_start, left_end, load_base);
+            }
+            (None, Some((right_start, right_end))) => {
+                slot.write(image_id, right_start, right_end, load_base);
+            }
+            (Some((left_start, left_end)), Some((right_start, right_end))) => {
+                let target = slots
+                    .iter()
+                    .enumerate()
+                    .find(|(candidate, item)| *candidate != index && item.read().is_none())
+                    .map(|(candidate, _)| candidate);
+                if let Some(target) = target {
+                    slot.write(image_id, left_start, left_end, load_base);
+                    slots[target].write(image_id, right_start, right_end, load_base);
+                } else if left_end - left_start >= right_end - right_start {
+                    slot.write(image_id, left_start, left_end, load_base);
+                } else {
+                    slot.write(image_id, right_start, right_end, load_base);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+fn register_mapped_image(
+    slots: &[ProfileMappedImage],
+    image_id: u64,
+    start: usize,
+    end: usize,
+    load_base: usize,
+) {
+    if image_id == 0 || start >= end || slots.is_empty() {
+        return;
+    }
+    clear_mapped_images(slots, start, end);
+    let mut target = None;
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.read().is_none() {
+            target = Some(index);
+            break;
+        }
+    }
+    let index = target.unwrap_or(image_id as usize % slots.len());
+    slots[index].write(image_id, start, end, load_base);
+}
+
+#[cfg(feature = "performance-profile")]
+fn remap_mapped_images(
+    slots: &[ProfileMappedImage],
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+) {
+    if old_start >= old_end || new_start >= new_end {
+        return;
+    }
+    let shift_right = new_start >= old_start;
+    let shift = new_start.abs_diff(old_start);
+    for slot in slots {
+        let Some((image_id, mapped_start, mapped_end, load_base)) = slot.read() else {
+            continue;
+        };
+        if mapped_start >= old_end || old_start >= mapped_end {
+            continue;
+        }
+        let relative_start = mapped_start.max(old_start) - old_start;
+        let relative_end = mapped_end.min(old_end) - old_start;
+        let Some(start) = new_start.checked_add(relative_start) else {
+            slot.write(0, 0, 0, 0);
+            continue;
+        };
+        let Some(mut end) = new_start.checked_add(relative_end) else {
+            slot.write(0, 0, 0, 0);
+            continue;
+        };
+        end = end.min(new_end);
+        let shifted_base = if shift_right {
+            load_base.checked_add(shift)
+        } else {
+            load_base.checked_sub(shift)
+        };
+        if start < end {
+            slot.write(image_id, start, end, shifted_base.unwrap_or(new_start));
+        } else {
+            slot.write(0, 0, 0, 0);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskDiag {
     pub live: usize,
@@ -683,6 +866,8 @@ pub struct Task {
     #[cfg(feature = "performance-profile")]
     profile_interpreter_image_end: AtomicUsize,
     #[cfg(feature = "performance-profile")]
+    profile_mapped_images: [ProfileMappedImage; PROFILE_MAPPED_IMAGE_SLOTS],
+    #[cfg(feature = "performance-profile")]
     profile_wake_object: AtomicU64,
     #[cfg(feature = "performance-profile")]
     profile_wake_correlation: AtomicU64,
@@ -825,6 +1010,9 @@ impl Task {
             profile_interpreter_image_base: AtomicUsize::new(0),
             #[cfg(feature = "performance-profile")]
             profile_interpreter_image_end: AtomicUsize::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_mapped_images: [const { ProfileMappedImage::new() };
+                PROFILE_MAPPED_IMAGE_SLOTS],
             #[cfg(feature = "performance-profile")]
             profile_wake_object: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
@@ -1914,10 +2102,18 @@ impl Task {
             parent.profile_main_image(),
             parent.profile_interpreter_image(),
         );
+        for slot in &parent.profile_mapped_images {
+            if let Some((image_id, start, end, load_base)) = slot.read() {
+                self.register_profile_mapped_image(image_id, start, end, load_base);
+            }
+        }
     }
 
     #[cfg(feature = "performance-profile")]
     pub fn set_profile_images(&self, main: (u64, usize, usize), interpreter: (u64, usize, usize)) {
+        for slot in &self.profile_mapped_images {
+            slot.write(0, 0, 0, 0);
+        }
         self.profile_main_image_id.store(main.0, Ordering::Release);
         self.profile_main_image_base
             .store(main.1, Ordering::Release);
@@ -1965,7 +2161,43 @@ impl Task {
         if interpreter.1 <= pc && pc < interpreter.2 {
             return (interpreter.0, interpreter.1);
         }
-        (0, 0)
+        mapped_image_for_pc(&self.profile_mapped_images, pc)
+    }
+
+    /// 登记 mmap 建立的文件映像区间。固定槽满时按 image id 稳定替换一个槽。
+    #[cfg(feature = "performance-profile")]
+    pub fn register_profile_mapped_image(
+        &self,
+        image_id: u64,
+        start: usize,
+        end: usize,
+        load_base: usize,
+    ) {
+        register_mapped_image(&self.profile_mapped_images, image_id, start, end, load_base);
+    }
+
+    /// 清除与被替换或解除映射范围相交的 profiling 映像，不触碰真实 VMA 语义。
+    #[cfg(feature = "performance-profile")]
+    pub fn clear_profile_mapped_images(&self, start: usize, end: usize) {
+        clear_mapped_images(&self.profile_mapped_images, start, end);
+    }
+
+    /// 同步 mremap 对 profiling 映像区间的移动或缩放。
+    #[cfg(feature = "performance-profile")]
+    pub fn remap_profile_mapped_images(
+        &self,
+        old_start: usize,
+        old_end: usize,
+        new_start: usize,
+        new_end: usize,
+    ) {
+        remap_mapped_images(
+            &self.profile_mapped_images,
+            old_start,
+            old_end,
+            new_start,
+            new_end,
+        );
     }
 
     #[inline]
@@ -2538,4 +2770,40 @@ pub fn register_exit_accounting_hook(hook: &'static dyn TaskExitAccountingHook) 
 
 fn exit_accounting_hook() -> Option<&'static dyn TaskExitAccountingHook> {
     *EXIT_ACCOUNTING_HOOK.lock()
+}
+
+#[cfg(all(test, feature = "performance-profile"))]
+mod profile_mapped_image_tests {
+    use super::{
+        ProfileMappedImage, clear_mapped_images, mapped_image_for_pc, register_mapped_image,
+        remap_mapped_images,
+    };
+
+    #[test]
+    fn mapped_image_registration_clear_and_remap_preserve_lookup() {
+        let slots = [const { ProfileMappedImage::new() }; 4];
+
+        register_mapped_image(&slots, 7, 0x1000, 0x3000, 0x1000);
+        assert_eq!(mapped_image_for_pc(&slots, 0x1800), (7, 0x1000));
+        assert_eq!(mapped_image_for_pc(&slots, 0x3000), (0, 0));
+
+        remap_mapped_images(&slots, 0x1000, 0x3000, 0x5000, 0x7000);
+        assert_eq!(mapped_image_for_pc(&slots, 0x1800), (0, 0));
+        assert_eq!(mapped_image_for_pc(&slots, 0x5800), (7, 0x5000));
+
+        clear_mapped_images(&slots, 0x5800, 0x5900);
+        assert_eq!(mapped_image_for_pc(&slots, 0x5800), (0, 0));
+        assert_eq!(mapped_image_for_pc(&slots, 0x5700), (7, 0x5000));
+        assert_eq!(mapped_image_for_pc(&slots, 0x5a00), (7, 0x5000));
+    }
+
+    #[test]
+    fn overlapping_registration_replaces_stale_mapping() {
+        let slots = [const { ProfileMappedImage::new() }; 4];
+        register_mapped_image(&slots, 11, 0x1000, 0x3000, 0x1000);
+        register_mapped_image(&slots, 13, 0x2000, 0x4000, 0x1800);
+
+        assert_eq!(mapped_image_for_pc(&slots, 0x1800), (11, 0x1000));
+        assert_eq!(mapped_image_for_pc(&slots, 0x2800), (13, 0x1800));
+    }
 }
