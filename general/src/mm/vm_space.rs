@@ -2507,6 +2507,8 @@ impl VmSpace {
 
     #[kernel_symbols::export(name = "general.mm.VmSpace.set_brk", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set_brk(&self, requested: usize) -> usize {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MmBrk).trace_args(requested as u64, 0);
         if requested == 0 {
             return self.current_brk();
         }
@@ -2725,6 +2727,9 @@ impl VmSpace {
     /// 注册一段匿名 VMA。不立即分配物理页。
     #[kernel_symbols::export(name = "general.mm.VmSpace.map_anon", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn map_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
+        #[cfg(feature = "performance-profile")]
+        let _profile =
+            profiling::scope(profiling::Event::MmMap).bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
@@ -2752,6 +2757,9 @@ impl VmSpace {
         offset: u64,
         flags: VmFlags,
     ) -> Result<(), Errno> {
+        #[cfg(feature = "performance-profile")]
+        let _profile =
+            profiling::scope(profiling::Event::MmMap).bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let flags = self.with_future_mlock(flags);
         let shared_writable = flags.contains_all(VmFlags::SHARED | VmFlags::WRITE);
@@ -2895,6 +2903,9 @@ impl VmSpace {
     /// 取消映射。同时把已 commit 的页表项摘掉；物理页由 resident page refcount 回收。
     #[kernel_symbols::export(name = "general.mm.VmSpace.unmap", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MmUnmap)
+            .bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
@@ -3033,6 +3044,9 @@ impl VmSpace {
     /// 修改权限。要求整个 range 已被 VMA 连续覆盖。
     #[kernel_symbols::export(name = "general.mm.VmSpace.mprotect", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MmProtect)
+            .bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let mut touched = false;
         {
@@ -4552,6 +4566,8 @@ impl VmSpace {
                 (FaultOutcome::Fixed, true, None)
             }
             PageAccess::Cow => {
+                #[cfg(feature = "performance-profile")]
+                profiling::record(profiling::Event::PageFaultCow, 0, page_size() as u64, 1);
                 let new_page = match clone_page_to_anon(&mapping.page) {
                     Ok(page) => page,
                     Err(err) => return (fault_from_errno(err), false, None),

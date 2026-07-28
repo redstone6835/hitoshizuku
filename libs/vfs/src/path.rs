@@ -276,6 +276,8 @@ pub fn lookup(
     path: &str,
     flags: LookupFlags,
 ) -> VfsResult<LookupResult> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::VfsLookup).bytes(path.len());
     if path.is_empty() {
         return Err(VfsError::NotFound);
     }

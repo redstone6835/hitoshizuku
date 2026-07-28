@@ -258,8 +258,6 @@ unsafe fn loongarch64_handle_exception_inner(
         }
         // 清除定时器中断标志（写 CSR_TICLR bit 0）
         if is & IS_TIMER_BIT != 0 {
-            #[cfg(feature = "performance-profile")]
-            profiling::sample_pc(arg0, from_user);
             // LoongArch 的定时器中断通常需要软件显式写 TICLR 清 pending，否则在 `ertn`
             // 后会立即再次陷入，形成“看似无法返回”的中断风暴。
             let clear_timer = 1usize;
@@ -278,6 +276,8 @@ unsafe fn loongarch64_handle_exception_inner(
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
+            #[cfg(feature = "performance-profile")]
+            profiling::sample_pc_at(arg0, from_user, now_ns);
             let _ = general::elm_guard::request_timeout_if_expired(now_ns);
             if !from_user
                 && let Some(recovery) = general::elm_guard::try_recover_requested_abort(tf.pc)

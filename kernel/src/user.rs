@@ -91,6 +91,10 @@ pub struct LoadedUserImage {
     pub entry_pc: usize,
     pub user_sp: usize,
     pub exec_path: String,
+    #[cfg(feature = "performance-profile")]
+    pub main_image_range: core::ops::Range<usize>,
+    #[cfg(feature = "performance-profile")]
+    pub interpreter_image: Option<(String, core::ops::Range<usize>)>,
     pub exec_access: Arc<ExecutableAccessSet>,
 }
 
@@ -110,6 +114,7 @@ struct LoadedInterpreter {
 struct LoadedImage {
     entry: usize,
     base: usize,
+    end: usize,
     phdr: usize,
     phent: usize,
     phnum: usize,
@@ -264,7 +269,8 @@ fn load_user_image_from_file_inner(
     let mut exec_access = Vec::new();
     exec_access.push(main_exec_access);
 
-    let interp_loaded = if let Some(interp) = exec_image.interpreter.as_deref() {
+    let interpreter_path = exec_image.interpreter.clone();
+    let interp_loaded = if let Some(interp) = interpreter_path.as_deref() {
         match load_interpreter_from_task_vfs(task, &exec_path, interp) {
             Ok(loaded_interpreter) => {
                 let LoadedInterpreter { mut bytes, access } = loaded_interpreter;
@@ -377,6 +383,11 @@ fn load_user_image_from_file_inner(
         entry_pc,
         user_sp,
         exec_path,
+        #[cfg(feature = "performance-profile")]
+        main_image_range: main_loaded.base..main_loaded.end,
+        #[cfg(feature = "performance-profile")]
+        interpreter_image: interpreter_path
+            .zip(interp_loaded.as_ref().map(|loaded| loaded.base..loaded.end)),
         exec_access: Arc::new(ExecutableAccessSet {
             leases: exec_access,
         }),
@@ -767,6 +778,7 @@ fn load_exec_image(
             .checked_add(img.entry)
             .ok_or(errno::Errno::ENOEXEC)?,
         base: load_bias,
+        end: max_segment_end,
         phdr: img
             .phdr_vaddr
             .and_then(|v| load_bias.checked_add(v))
@@ -1142,6 +1154,7 @@ fn load_image(
             .checked_add(img.entry())
             .ok_or(errno::Errno::ENOEXEC)?,
         base: load_bias,
+        end: max_segment_end,
         phdr: img
             .phdr_vaddr()
             .and_then(|v| load_bias.checked_add(v))

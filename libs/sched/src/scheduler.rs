@@ -547,6 +547,32 @@ pub fn current_task_id() -> u64 {
 }
 
 #[cfg(feature = "performance-profile")]
+pub fn current_profile_session_id() -> u64 {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return 0;
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，读取期间不会失效。
+    unsafe { &*ptr }.profile_session_id()
+}
+
+#[cfg(feature = "performance-profile")]
+pub fn current_profile_image(pc: usize) -> (u64, usize) {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return (0, 0);
+    }
+    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    if ptr.is_null() {
+        return (0, 0);
+    }
+    // Safety: 非空 raw current 由 CpuSchedState 持有强引用，读取期间不会失效。
+    unsafe { &*ptr }.profile_image_for_pc(pc)
+}
+
+#[cfg(feature = "performance-profile")]
 pub fn current_profile_span_id() -> u64 {
     if !INIT_READY.load(Ordering::Acquire) {
         return 0;
@@ -1941,11 +1967,14 @@ fn earliest_deadline(cpu_id: usize) -> Option<u64> {
                 .min()
         })
         .flatten();
-    match (sleeper_deadline, itimer_deadline) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
-    }
+    #[cfg(feature = "performance-profile")]
+    let profile_deadline = profiling::next_sample_deadline_ns(cpu_id, now_ns_internal());
+    #[cfg(not(feature = "performance-profile"))]
+    let profile_deadline = None;
+    [sleeper_deadline, itimer_deadline, profile_deadline]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 #[cfg(test)]
@@ -2469,6 +2498,15 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
 /// 只负责"是否需要唤醒"。`Uninterruptible` 任务不会被打断（Linux 语义）。
 #[kernel_symbols::export(name = "sched.scheduler.signal_wakeup", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[sched][signal] wake-enter target={:?} signal={:?} state={:?} on_rq={} running_cpu={:?}",
+        target.pid_root(),
+        info.sig,
+        target.state(),
+        target.sched.on_rq(),
+        target.running_cpu(),
+    );
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;
     }
@@ -2485,6 +2523,15 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.mark_profile_woken(now_ns_internal());
         enqueue_task(Arc::clone(target), now_ns_internal());
     }
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[sched][signal] wake-leave target={:?} signal={:?} state={:?} on_rq={} running_cpu={:?}",
+        target.pid_root(),
+        info.sig,
+        target.state(),
+        target.sched.on_rq(),
+        target.running_cpu(),
+    );
     // Running / Runnable：pending 位已经设好；下一轮 schedule 自然会检查。
     // Stopped：只有 SIGCONT 可以恢复；其它信号保持 pending。
     // Uninterruptible / Zombie / Dead：什么都不做。
@@ -2870,7 +2917,11 @@ fn service_expired_timer_events(now_ns: u64, cpu_id: usize) -> bool {
     fire_expired_deadline_observers(now_ns);
     let deadline_fired = wake_expired_sleepers(now_ns, cpu_id);
     let realtime_fired = fire_expired_realtime_itimers(now_ns, cpu_id);
-    if had_scheduler_deadline {
+    #[cfg(feature = "performance-profile")]
+    let profile_deadline = profiling::enabled() && profiling::sampling_enabled();
+    #[cfg(not(feature = "performance-profile"))]
+    let profile_deadline = false;
+    if had_scheduler_deadline || profile_deadline {
         reprogram_deadline_timer();
     }
     deadline_fired || realtime_fired
@@ -3006,7 +3057,7 @@ pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
     let _ = dequeue_for_state_change(task, now_ns_internal());
     task.mark_exited(code);
     #[cfg(feature = "trace-task-lifecycle")]
-    log::debug!(
+    log::info!(
         "[sched][exit] pid={:?} code={} on_rq={} state={:?}",
         task.pid_root(),
         code.0,

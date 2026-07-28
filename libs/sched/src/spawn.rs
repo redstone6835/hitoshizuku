@@ -37,6 +37,8 @@ pub enum SpawnKind {
 /// 任务暴露给调度器。
 #[kernel_symbols::export(name = "sched.spawn.spawn_child", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
 pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> Arc<Task> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::ProcessClone);
     let root_ns = root_pid_ns();
 
     let (tgroup, pgroup) = match kind {
@@ -61,6 +63,8 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
         Arc::clone(&pgroup),
     );
     child.inherit_timer_slack_from(parent);
+    #[cfg(feature = "performance-profile")]
+    child.inherit_profile_session_from(parent);
 
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_leader(&child);
@@ -94,8 +98,23 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
     }
 
     #[cfg(feature = "performance-profile")]
-    if let Some(parent_pid) = parent.pid_root() {
+    if let Some(parent_pid) = parent.pid_root_cached() {
         profiling::trace_task_spawn(parent_pid as u64, pid as u64);
+        let session = child.profile_session_id();
+        if session != 0 {
+            profiling::register_task(
+                session,
+                pid as u64,
+                parent_pid as u64,
+                child.tgid_cached().unwrap_or(pid) as u64,
+            );
+            profiling::record_task_images(
+                session,
+                pid as u64,
+                child.profile_main_image(),
+                child.profile_interpreter_image(),
+            );
+        }
     }
 
     #[cfg(feature = "trace-task-lifecycle")]
@@ -234,6 +253,8 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&pg),
     );
     child.inherit_timer_slack_from(parent);
+    #[cfg(feature = "performance-profile")]
+    child.inherit_profile_session_from(parent);
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
     if flags.has(CloneFlags::CLONE_VM) && !flags.has(CloneFlags::CLONE_VFORK) {
@@ -376,6 +397,13 @@ fn notify_task_parent(task: &Arc<Task>) {
     let Some(parent) = task.parent() else {
         return;
     };
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[sched][exit-notify] child={:?} parent={:?} child_state={:?}",
+        task.pid_root(),
+        parent.pid_root(),
+        task.state(),
+    );
     let exit_sig = task.exit_signal();
     if exit_sig > 0
         && let Some(sig) = SignalNumber::from_raw(exit_sig)
@@ -478,6 +506,13 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     }
 
     if group_terminated {
+        #[cfg(feature = "trace-task-lifecycle")]
+        log::info!(
+            "[sched][group-terminated] pid={:?} leader={} state={:?}",
+            task.pid_root(),
+            is_group_leader,
+            task.state(),
+        );
         notify_terminated_thread_group(&group);
     }
 }

@@ -80,6 +80,8 @@ fn main() -> ! {
             ::sched::set_current_profile_span_id,
             hal::time::stable_counter_hz(),
         );
+        profiling::install_task_session(::sched::current_profile_session_id);
+        profiling::install_task_image(::sched::current_profile_image);
     }
     let secondary_cpus = hal::sched::start_secondary_cpus();
     log::info!(

@@ -11,6 +11,7 @@ bench = false
 [features]
 block-profile = []
 trace-syscall = []
+trace-task-lifecycle = ["sched/trace-task-lifecycle"]
 performance-profile = ["dep:profiling", "sched/performance-profile"]
 
 [dependencies]

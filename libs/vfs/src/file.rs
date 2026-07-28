@@ -849,6 +849,8 @@ impl File {
     /// 函数返回枚举实际停止时的新游标值（可用于下次 `readdir` 的起始位置）。
     /// 游标语义由驱动自定义（通常为已枚举条目数；不同文件系统实现可能不同）。
     pub fn readdir(&self, sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::VfsGetdents);
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }

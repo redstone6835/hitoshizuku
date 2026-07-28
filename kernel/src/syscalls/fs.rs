@@ -2441,6 +2441,14 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let nfds = ctx.args[1];
     let timeout_user = ctx.args[2];
     let sigmask = read_direct_sigmask(ctx.args[3], ctx.args[4])?;
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][ppoll] enter pid={:?} nfds={} timeout_ptr={:#x} sigmask_ptr={:#x}",
+        ctx.task().pid_root(),
+        nfds,
+        timeout_user,
+        ctx.args[3],
+    );
 
     const POLLFD_SIZE: usize = 8;
     const MAX_POLLFDS: usize = 1024;
@@ -2531,6 +2539,14 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let exceptfds_user = ctx.args[3];
     let timeout_user = ctx.args[4];
     let sigmask = read_pselect_sigmask(ctx.args[5])?;
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][pselect] enter pid={:?} nfds={} timeout_ptr={:#x} sigmask_arg={:#x}",
+        ctx.task().pid_root(),
+        nfds,
+        timeout_user,
+        ctx.args[5],
+    );
 
     const MAX_SELECT_FDS: usize = 1024;
     if nfds > MAX_SELECT_FDS {

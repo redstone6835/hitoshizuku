@@ -28,7 +28,7 @@ use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
     migrate_task, now_ns_public, online_cpu_mask, request_balance, request_post_syscall_handoff,
     request_resched, root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
-    supported_cpu_mask, task_runqueue_cpu,
+    task_runqueue_cpu,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
@@ -471,7 +471,7 @@ pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
 }
 
 pub fn sched_getaffinity_for_task(task: &Arc<Task>) -> u64 {
-    task.cpu_affinity() & supported_cpu_mask()
+    task.cpu_affinity() & online_cpu_mask()
 }
 
 #[kernel_symbols::export(name = "sched.operation.sched_setaffinity", contract = "kernel.sched.process-control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
@@ -598,6 +598,8 @@ pub fn execve(request: ExecRequest) -> Result<(), Errno> {
 }
 
 pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Result<(), Errno> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::ProcessExec);
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
@@ -915,6 +917,13 @@ fn wait_common(
                     });
                 }
             } else if let Some((child, code)) = reap_matching(&me, pred) {
+                #[cfg(feature = "trace-task-lifecycle")]
+                log::info!(
+                    "[sched][wait] reap parent={:?} child={:?} target={:?}",
+                    me.pid_root(),
+                    child.pid_root(),
+                    target,
+                );
                 return Ok(WaitResult {
                     pid: child.pid_root().unwrap_or(0),
                     status: child_exit_status(&child, code),
@@ -984,9 +993,36 @@ fn wait_common(
             me.exit_waiters.finish_wait(&entry);
             continue;
         }
+        #[cfg(feature = "trace-task-lifecycle")]
+        {
+            log::info!(
+                "[sched][wait] block parent={:?} target={:?} children={}",
+                me.pid_root(),
+                target,
+                children.len(),
+            );
+            for child in children
+                .iter()
+                .filter(|child| matches_waitid(child, &target, &me))
+            {
+                log::info!(
+                    "[sched][wait] child={:?} state={:?} exit_ready={} threads={}",
+                    child.pid_root(),
+                    child.state(),
+                    child.exit_event_ready(),
+                    child.thread_group().snapshot().len(),
+                );
+            }
+        }
         drop(me);
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
+        #[cfg(feature = "trace-task-lifecycle")]
+        log::info!(
+            "[sched][wait] resume parent={:?} target={:?}",
+            me.pid_root(),
+            target
+        );
         me.exit_waiters.finish_wait(&entry);
         // 子退出和信号可能同时唤醒等待者。先回到循环顶部消费已可观察的
         // 子状态；只有仍无结果时，下一轮才按信号语义返回 EINTR。
@@ -1078,8 +1114,23 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
 }
 
 fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[sched][signal] group-deliver-enter target={:?} signal={:?} state={:?}",
+        target.pid_root(),
+        info.sig,
+        target.state(),
+    );
     if info.sig == SignalNumber::SIGKILL {
-        return terminate_thread_group_by_signal(target, info);
+        let delivered = terminate_thread_group_by_signal(target, info);
+        #[cfg(feature = "trace-task-lifecycle")]
+        log::info!(
+            "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered={}",
+            target.pid_root(),
+            info.sig,
+            delivered,
+        );
+        return delivered;
     }
 
     target.thread_group().shared_signal().deliver(info);
@@ -1089,6 +1140,12 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
             break;
         }
     }
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered=true",
+        target.pid_root(),
+        info.sig,
+    );
     true
 }
 

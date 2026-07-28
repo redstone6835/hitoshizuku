@@ -330,6 +330,31 @@ fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[
     task.ext_install(TASKEXT_EXEC_ENVP, Arc::new(envp.to_vec()));
 }
 
+#[cfg(feature = "performance-profile")]
+fn profile_image_id(path: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+#[cfg(feature = "performance-profile")]
+fn install_profile_images(task: &Arc<Task>, loaded: &crate::user::LoadedUserImage) {
+    let main = (
+        profile_image_id(&loaded.exec_path),
+        loaded.main_image_range.start,
+        loaded.main_image_range.end,
+    );
+    let interpreter = loaded
+        .interpreter_image
+        .as_ref()
+        .map(|(path, range)| (profile_image_id(path), range.start, range.end))
+        .unwrap_or((0, 0, 0));
+    task.set_profile_images(main, interpreter);
+}
+
 fn install_exec_access(task: &Arc<Task>, access: Arc<crate::user::ExecutableAccessSet>) {
     let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
     task.ext_install(TASKEXT_EXEC_ACCESS, access);
@@ -507,6 +532,8 @@ fn process_execve(
     arch::riscv64::vector::clear_for_task(task);
     loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
+    #[cfg(feature = "performance-profile")]
+    install_profile_images(task, &loaded);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }
@@ -543,6 +570,8 @@ fn process_spawn_user_process(
     child.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
     install_exec_access(child, Arc::clone(&loaded.exec_access));
     install_exec_metadata(child, &loaded.exec_path, argv, envp);
+    #[cfg(feature = "performance-profile")]
+    install_profile_images(child, &loaded);
     if let Some(fdt) = task_fdtable(child) {
         fdt.close_on_exec();
     }
@@ -985,6 +1014,8 @@ fn enter_loaded_user_image(
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
     install_exec_access(task, Arc::clone(&loaded.exec_access));
     install_exec_metadata(task, &exec_path, argv, envp);
+    #[cfg(feature = "performance-profile")]
+    install_profile_images(task, &loaded);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }

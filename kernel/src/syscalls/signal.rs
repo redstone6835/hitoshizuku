@@ -100,6 +100,12 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     copy_from_user(set_user, &mut raw).map_err(|e| e.as_errno())?;
     let mask = SigSet::from_raw(u64::from_le_bytes(raw));
     ctx.task().signal.save_blocked(mask);
+    #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+    log::info!(
+        "[syscall][sigsuspend] enter pid={:?} mask={:#x}",
+        ctx.task().pid_root(),
+        mask.raw(),
+    );
     // sigsuspend 即使遇到带 SA_RESTART 的 handler 也必须以 EINTR 结束；
     // 普通返回边界负责推进 PC 并建立 handler frame。
     ctx.disable_restart();
@@ -129,10 +135,20 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
                     .task()
                     .cas_state(TaskState::Runnable, TaskState::Running);
             }
+            #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+            log::info!(
+                "[syscall][sigsuspend] sleep-race-closed pid={:?}",
+                ctx.task().pid_root(),
+            );
             break;
         }
         sched::operation::sched_yield()?;
     }
+    #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+    log::info!(
+        "[syscall][sigsuspend] leave pid={:?}",
+        ctx.task().pid_root(),
+    );
     Err(Errno::EINTR)
 }
 
@@ -162,6 +178,13 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if these.0 == 0 {
         return Err(Errno::EINVAL);
     }
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][sigtimedwait] enter pid={:?} set={:#x} timeout_ptr={:#x}",
+        ctx.task().pid_root(),
+        these.raw(),
+        uts,
+    );
 
     // 2. 解析 timeout。NULL 表示永久等待；其它按 timespec 解释。
     let timeout_ns: Option<u64> = if uts == 0 {
@@ -191,7 +214,19 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
     }
 
     // 4. 没命中 → 让出调度等待，限时 timeout_ns。
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][sigtimedwait] sleep pid={:?} timeout_ns={:?}",
+        ctx.task().pid_root(),
+        timeout_ns,
+    );
     let got = sched::operation::sigtimedwait_wait(these, timeout_ns);
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][sigtimedwait] resume pid={:?} ready={}",
+        ctx.task().pid_root(),
+        got,
+    );
     if !got {
         return Err(Errno::EAGAIN);
     }

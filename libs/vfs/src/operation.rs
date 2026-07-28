@@ -176,6 +176,8 @@ pub fn openat_with_lookup_flags(
     mode: FileMode,
     extra_lookup_flags: LookupFlags,
 ) -> VfsResult<Fd> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::VfsOpen).bytes(path.len());
     let lookup_flags = {
         let mut f = extra_lookup_flags;
         if flags.nofollow {

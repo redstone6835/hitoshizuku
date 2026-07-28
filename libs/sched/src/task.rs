@@ -669,6 +669,20 @@ pub struct Task {
     #[cfg(feature = "performance-profile")]
     profile_span_id: AtomicU64,
     #[cfg(feature = "performance-profile")]
+    profile_session_id: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_main_image_id: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_main_image_base: AtomicUsize,
+    #[cfg(feature = "performance-profile")]
+    profile_main_image_end: AtomicUsize,
+    #[cfg(feature = "performance-profile")]
+    profile_interpreter_image_id: AtomicU64,
+    #[cfg(feature = "performance-profile")]
+    profile_interpreter_image_base: AtomicUsize,
+    #[cfg(feature = "performance-profile")]
+    profile_interpreter_image_end: AtomicUsize,
+    #[cfg(feature = "performance-profile")]
     profile_wake_object: AtomicU64,
     #[cfg(feature = "performance-profile")]
     profile_wake_correlation: AtomicU64,
@@ -797,6 +811,20 @@ impl Task {
             wait_generation: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
             profile_span_id: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_session_id: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_main_image_id: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_main_image_base: AtomicUsize::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_main_image_end: AtomicUsize::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_interpreter_image_id: AtomicU64::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_interpreter_image_base: AtomicUsize::new(0),
+            #[cfg(feature = "performance-profile")]
+            profile_interpreter_image_end: AtomicUsize::new(0),
             #[cfg(feature = "performance-profile")]
             profile_wake_object: AtomicU64::new(0),
             #[cfg(feature = "performance-profile")]
@@ -1187,6 +1215,10 @@ impl Task {
                 .store(EXIT_REASON_EXITED, Ordering::Release);
         }
         self.has_exit_code.store(1, Ordering::Release);
+        #[cfg(feature = "performance-profile")]
+        if let Some(pid) = self.pid_root_cached() {
+            profiling::record_task_exit(self.profile_session_id(), pid as u64, code.0);
+        }
         self.wait_stop_pending.store(0, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
         self.set_state(TaskState::Zombie);
@@ -1766,10 +1798,9 @@ impl Task {
         {
             let encoded = self.wakeup_ns.swap(0, Ordering::AcqRel);
             if encoded != 0 {
-                profiling::record_duration(
-                    profiling::Event::WakeupLatency,
-                    now_ns.saturating_sub(encoded - 1),
-                );
+                let latency_ns = now_ns.saturating_sub(encoded - 1);
+                profiling::record_duration(profiling::Event::WakeupLatency, latency_ns);
+                profiling::record_duration(profiling::Event::RunqueueLatency, latency_ns);
             }
             let correlation = self.profile_wake_correlation.swap(0, Ordering::AcqRel);
             if correlation != 0 {
@@ -1799,8 +1830,17 @@ impl Task {
     pub(crate) fn account_switch_out(&self, now_ns: u64) {
         let encoded = self.running_since_ns.swap(0, Ordering::AcqRel);
         if encoded != 0 {
-            self.cpu_runtime_ns
-                .fetch_add(now_ns.saturating_sub(encoded - 1), Ordering::AcqRel);
+            let charged = now_ns.saturating_sub(encoded - 1);
+            self.cpu_runtime_ns.fetch_add(charged, Ordering::AcqRel);
+            #[cfg(feature = "performance-profile")]
+            if let Some(pid) = self.pid_root_cached() {
+                profiling::record_task_runtime(
+                    self.profile_session_id(),
+                    pid as u64,
+                    self.current_cpu.load(Ordering::Acquire),
+                    charged,
+                );
+            }
         }
     }
 
@@ -1852,6 +1892,80 @@ impl Task {
     #[cfg(feature = "performance-profile")]
     pub fn set_profile_span_id(&self, span_id: u64) {
         self.profile_span_id.store(span_id, Ordering::Release);
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_session_id(&self) -> u64 {
+        self.profile_session_id.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub fn set_profile_session_id(&self, session_id: u64) {
+        self.profile_session_id.store(session_id, Ordering::Release);
+    }
+
+    #[inline]
+    #[cfg(feature = "performance-profile")]
+    pub(crate) fn inherit_profile_session_from(&self, parent: &Task) {
+        self.set_profile_session_id(parent.profile_session_id());
+        self.set_profile_images(
+            parent.profile_main_image(),
+            parent.profile_interpreter_image(),
+        );
+    }
+
+    #[cfg(feature = "performance-profile")]
+    pub fn set_profile_images(&self, main: (u64, usize, usize), interpreter: (u64, usize, usize)) {
+        self.profile_main_image_id.store(main.0, Ordering::Release);
+        self.profile_main_image_base
+            .store(main.1, Ordering::Release);
+        self.profile_main_image_end.store(main.2, Ordering::Release);
+        self.profile_interpreter_image_id
+            .store(interpreter.0, Ordering::Release);
+        self.profile_interpreter_image_base
+            .store(interpreter.1, Ordering::Release);
+        self.profile_interpreter_image_end
+            .store(interpreter.2, Ordering::Release);
+
+        let session = self.profile_session_id();
+        if session != 0
+            && let Some(pid) = self.pid_root_cached()
+        {
+            profiling::record_task_images(session, pid as u64, main, interpreter);
+        }
+    }
+
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_main_image(&self) -> (u64, usize, usize) {
+        (
+            self.profile_main_image_id.load(Ordering::Acquire),
+            self.profile_main_image_base.load(Ordering::Acquire),
+            self.profile_main_image_end.load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_interpreter_image(&self) -> (u64, usize, usize) {
+        (
+            self.profile_interpreter_image_id.load(Ordering::Acquire),
+            self.profile_interpreter_image_base.load(Ordering::Acquire),
+            self.profile_interpreter_image_end.load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_image_for_pc(&self, pc: usize) -> (u64, usize) {
+        let main = self.profile_main_image();
+        if main.1 <= pc && pc < main.2 {
+            return (main.0, main.1);
+        }
+        let interpreter = self.profile_interpreter_image();
+        if interpreter.1 <= pc && pc < interpreter.2 {
+            return (interpreter.0, interpreter.1);
+        }
+        (0, 0)
     }
 
     #[inline]
@@ -1957,11 +2071,19 @@ impl Task {
 
     pub fn record_voluntary_context_switch(&self) {
         self.voluntary_ctxt_switches.fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "performance-profile")]
+        if let Some(pid) = self.pid_root_cached() {
+            profiling::record_task_switch(self.profile_session_id(), pid as u64, true);
+        }
     }
 
     pub fn record_involuntary_context_switch(&self) {
         self.involuntary_ctxt_switches
             .fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "performance-profile")]
+        if let Some(pid) = self.pid_root_cached() {
+            profiling::record_task_switch(self.profile_session_id(), pid as u64, false);
+        }
     }
 
     pub fn sched_reset_on_fork(&self) -> bool {

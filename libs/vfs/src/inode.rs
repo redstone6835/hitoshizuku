@@ -482,6 +482,8 @@ impl Inode {
     /// 这样既减少了一次 `Weak::upgrade()` 的原子开销，也进一步缩短了 `stat` 热路径
     /// 上的依赖链。
     pub fn stat(&self) -> VfsResult<FileStat> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::VfsStat);
         let m = self.meta_snapshot();
         let size = i64::try_from(m.size).map_err(|_| VfsError::FileTooLarge)?;
         Ok(FileStat {
