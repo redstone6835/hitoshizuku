@@ -21,7 +21,8 @@
 //!   保证驱动私有状态（缓冲区、打开计数等）在最后一个引用消失时被正确清理。
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -390,6 +391,15 @@ pub struct File {
     /// 当前文件读写偏移量（字节）。
     pub(crate) pos: AtomicU64,
 
+    /// 指向此打开文件描述的 fd 数量。
+    ///
+    /// 该计数独立于 `Arc` 强引用：epoll watch、VMA 和内核临时引用都不属于
+    /// 用户可见 fd，不能参与“最后一个描述符已关闭”的判断。
+    fd_references: AtomicUsize,
+
+    /// 监听此打开文件描述最后一个 fd 关闭事件的对象。
+    description_close_observers: Spinlock<Vec<Weak<File>>>,
+
     /// 串行化会读取或推进共享偏移的操作。
     pos_lock: Spinlock<()>,
 
@@ -481,6 +491,8 @@ impl File {
             owner_pid: AtomicI32::new(0),
             owner_sig: AtomicI32::new(0),
             pos: AtomicU64::new(0),
+            fd_references: AtomicUsize::new(0),
+            description_close_observers: Spinlock::new(Vec::new()),
             pos_lock: Spinlock::new(()),
             cred,
             ops,
@@ -521,6 +533,49 @@ impl File {
     )]
     pub fn pos(&self) -> u64 {
         self.pos.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn acquire_fd_reference(&self) {
+        let previous = self.fd_references.fetch_add(1, Ordering::AcqRel);
+        assert!(previous != usize::MAX, "打开文件描述的 fd 引用计数已耗尽");
+    }
+
+    pub(crate) fn release_fd_reference(&self) -> bool {
+        let previous = self.fd_references.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "打开文件描述的 fd 引用计数下溢");
+        previous == 1
+    }
+
+    pub(crate) fn register_description_close_observer(&self, observer: &Arc<File>) {
+        let mut observers = self.description_close_observers.lock();
+        observers.retain(|weak| weak.upgrade().is_some());
+        if observers.iter().any(|weak| {
+            weak.upgrade()
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, observer))
+        }) {
+            return;
+        }
+        observers.push(Arc::downgrade(observer));
+    }
+
+    pub(crate) fn notify_description_closed(file: &Arc<File>) {
+        let observers = {
+            let mut registered = file.description_close_observers.lock();
+            let mut observers = Vec::new();
+            registered.retain(|weak| {
+                if let Some(observer) = weak.upgrade() {
+                    observers.push(observer);
+                    true
+                } else {
+                    false
+                }
+            });
+            observers
+        };
+        for observer in observers {
+            observer.on_file_description_closed(file);
+        }
     }
 
     /// 返回打开选项。

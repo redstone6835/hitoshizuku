@@ -12,7 +12,7 @@ use crate::epoll::{self, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EpollEvent};
 use crate::fdtable::{FdFlags, FdTable};
 use crate::file::PollEvents;
 use crate::limits::VfsLimits;
-use crate::{memfd, pipe};
+use crate::{eventfd, memfd, pipe};
 
 fn test_fdtable() -> FdTable {
     FdTable::new(&VfsLimits::default())
@@ -206,4 +206,72 @@ fn epoll_rotates_level_triggered_ready_files() {
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_ne!(first[0].data, second[0].data);
+}
+
+/// 子进程 exec 关闭继承的 CLOEXEC fd 时，父进程仍持有的打开文件描述不能被
+/// 误判为全局最后引用，也不能移除共享 epoll 实例中的 watch。
+#[ktest]
+fn epoll_watch_survives_forked_cloexec_close() {
+    let fdt = test_fdtable();
+    let cred = root_cred();
+    let epfd = epoll::create(&fdt, Arc::clone(&cred), true).unwrap();
+    let eventfd = eventfd::create(&fdt, cred, 0, false, true, true).unwrap();
+    epoll::ctl(
+        &fdt,
+        epfd,
+        EPOLL_CTL_ADD,
+        eventfd,
+        Some(EpollEvent {
+            events: PollEvents::POLLIN.raw() as u32,
+            data: 30,
+        }),
+    )
+    .unwrap();
+
+    let child = fdt.fork();
+    child.close_on_exec();
+
+    fdt.get_file(eventfd)
+        .unwrap()
+        .write(&1u64.to_ne_bytes())
+        .unwrap();
+    let ready = epoll::wait(&fdt, epfd, 1, 0).unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].data, 30);
+}
+
+/// fd 进入另一张描述符表后，epoll watch 应在全局最后一个 fd 关闭时移除，
+/// 不能依赖最后关闭者是否继承过创建 epoll 时的 FdTable 元数据。
+#[ktest]
+fn epoll_watch_tracks_last_fd_across_unrelated_tables() {
+    let owner = test_fdtable();
+    let receiver = test_fdtable();
+    let cred = root_cred();
+    let epfd = epoll::create(&owner, Arc::clone(&cred), false).unwrap();
+    let eventfd = eventfd::create(&owner, cred, 0, false, true, false).unwrap();
+    let event_file = owner.get_file(eventfd).unwrap();
+    epoll::ctl(
+        &owner,
+        epfd,
+        EPOLL_CTL_ADD,
+        eventfd,
+        Some(EpollEvent {
+            events: PollEvents::POLLIN.raw() as u32,
+            data: 31,
+        }),
+    )
+    .unwrap();
+    let received_fd = receiver
+        .alloc_fd(Arc::clone(&event_file), FdFlags::default())
+        .unwrap();
+
+    owner.close_fd(eventfd).unwrap();
+    event_file.write(&1u64.to_ne_bytes()).unwrap();
+    assert_eq!(epoll::wait(&owner, epfd, 1, 0).unwrap()[0].data, 31);
+    let mut counter = [0u8; 8];
+    event_file.read(&mut counter).unwrap();
+
+    receiver.close_fd(received_fd).unwrap();
+    event_file.write(&1u64.to_ne_bytes()).unwrap();
+    assert!(epoll::wait(&owner, epfd, 1, 0).unwrap().is_empty());
 }
