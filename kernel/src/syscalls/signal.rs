@@ -100,23 +100,39 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     copy_from_user(set_user, &mut raw).map_err(|e| e.as_errno())?;
     let mask = SigSet::from_raw(u64::from_le_bytes(raw));
     ctx.task().signal.save_blocked(mask);
+    // sigsuspend 即使遇到带 SA_RESTART 的 handler 也必须以 EINTR 结束；
+    // 普通返回边界负责推进 PC 并建立 handler frame。
+    ctx.disable_restart();
     loop {
-        if ctx.task().group_exit_pending() {
-            break;
-        }
-        let pending = sched::operation::sigpending()?;
-        if pending.raw() != 0 {
+        if ctx.task().group_exit_pending() || sched::operation::has_interrupting_signal(ctx.task())
+        {
             break;
         }
         if !ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping)
         {
+            sched::operation::sched_yield()?;
             continue;
+        }
+
+        // 信号可能在首次检查之后、睡眠状态发布之前到达。投递方此时看到的
+        // 仍是 Running，不会负责唤醒；发布 Sleeping 后必须二次检查，确保
+        // check-then-sleep 窗口内到达的信号不会永久丢失。
+        if ctx.task().group_exit_pending() || sched::operation::has_interrupting_signal(ctx.task())
+        {
+            if !ctx
+                .task()
+                .cas_state(TaskState::Sleeping, TaskState::Running)
+            {
+                let _ = ctx
+                    .task()
+                    .cas_state(TaskState::Runnable, TaskState::Running);
+            }
+            break;
         }
         sched::operation::sched_yield()?;
     }
-    ctx.task().signal.restore_blocked();
     Err(Errno::EINTR)
 }
 

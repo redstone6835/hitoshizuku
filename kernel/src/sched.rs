@@ -728,7 +728,10 @@ fn process_setup_signal_frame(
     let restorer = hal::user::sigreturn_entry_va();
 
     let saved = UserTrapFrame::from_context(user_ctx.as_usize());
-    let old_mask = task.signal.blocked_snapshot();
+    let old_mask = task
+        .signal
+        .take_sigsuspend_saved_blocked()
+        .unwrap_or_else(|| task.signal.blocked_snapshot());
     let trap_len = UserTrapFrame::encoded_len();
     let total = SIGFRAME_TRAP_OFF
         .checked_add(trap_len)

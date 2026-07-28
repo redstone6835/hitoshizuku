@@ -297,6 +297,7 @@ pub struct SignalState {
     pending_infos: Spinlock<Vec<SigInfo>>,
     blocked: AtomicU64,
     saved_blocked: AtomicU64,
+    sigsuspend_saved_blocked: AtomicBool,
     sigtimedwait_mask: AtomicU64,
     observers: SignalObservers,
 }
@@ -308,6 +309,7 @@ impl SignalState {
             pending_infos: Spinlock::new(Vec::new()),
             blocked: AtomicU64::new(0),
             saved_blocked: AtomicU64::new(0),
+            sigsuspend_saved_blocked: AtomicBool::new(false),
             sigtimedwait_mask: AtomicU64::new(0),
             observers: SignalObservers::new(),
         }
@@ -415,14 +417,28 @@ impl SignalState {
     pub fn save_blocked(&self, new_mask: SigSet) {
         let prev = self.blocked.load(Ordering::Acquire);
         self.saved_blocked.store(prev, Ordering::Release);
+        self.sigsuspend_saved_blocked.store(true, Ordering::Release);
         self.blocked
             .store(new_mask.sanitized().0, Ordering::Release);
     }
 
-    /// sigreturn 用：恢复保存的 mask。
+    /// signal frame 构造时取得 sigsuspend 调用前的 mask。
+    ///
+    /// 临时 mask 必须保持到 pending 信号被选中，否则该信号可能在 syscall
+    /// 返回边界重新变为 blocked。旧 mask 只由首个 handler frame 消费，随后
+    /// 通过 rt_sigreturn 从 frame 中恢复。
+    pub fn take_sigsuspend_saved_blocked(&self) -> Option<SigSet> {
+        self.sigsuspend_saved_blocked
+            .swap(false, Ordering::AcqRel)
+            .then(|| SigSet(self.saved_blocked.load(Ordering::Acquire)))
+    }
+
+    /// 放弃 sigsuspend 临时 mask 并立即恢复，供未建立 handler frame 的路径使用。
     pub fn restore_blocked(&self) {
         let saved = self.saved_blocked.load(Ordering::Acquire);
         self.blocked.store(saved, Ordering::Release);
+        self.sigsuspend_saved_blocked
+            .store(false, Ordering::Release);
     }
 }
 
