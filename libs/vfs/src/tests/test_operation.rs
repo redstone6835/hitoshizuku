@@ -5,6 +5,7 @@ use crate::cred::{CapSet, Capability, Credentials, Gid, Uid};
 use crate::error::VfsError;
 use crate::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use crate::operation::derive_create_attributes;
+use crate::path::symlink_target_path;
 use crate::stat::{DevId, FileMode, FileType, FsId, Timespec};
 use ktest::ktest;
 
@@ -211,6 +212,17 @@ fn private_page_cache_identity_is_unique_across_inode_lifetimes() {
     let replacement = regular_inode();
     assert_ne!(first_key, replacement.private_page_cache_key());
     assert_ne!(second_key, replacement.private_page_cache_key());
+}
+
+/// 链接跟随按 pathname 语义忽略首个 NUL 后的后端填充，避免把 NUL 送入 dentry。
+#[ktest]
+fn symlink_target_path_stops_at_first_nul() {
+    assert_eq!(
+        symlink_target_path("../lib/tool\0padding"),
+        Ok("../lib/tool")
+    );
+    assert_eq!(symlink_target_path("/usr/bin/tool"), Ok("/usr/bin/tool"));
+    assert_eq!(symlink_target_path("\0padding"), Err(VfsError::NotFound));
 }
 
 #[ktest]
