@@ -22,8 +22,8 @@
 //!   PGD[511] → PUD_kernel      PUD_identity[2] ─┐
 //!                              PUD_kernel[2]   ──┴→ PMD_ram（512×2MiB，RX/R/RW）
 //!                              PUD_identity[3] = 1G leaf → 0xC000_0000 (RW+NX)
-//!                              PUD_kernel[3]   = 1G leaf → 0xC000_0000 (RW+NX)
-//!                              PUD[* >= 4]     = 仅高端 DTB 所在 1GiB leaf（R+NX，临时）
+//!                              PUD_kernel[3..17] = 15 个 RAM 1G leaf（RW+NX）
+//!                              其它 PUD = 仅高端 DTB 所在 1GiB leaf（R+NX，临时）
 //! ```
 
 use core::arch::naked_asm;
@@ -71,6 +71,12 @@ const EARLY_DTB_NEXT_LEAF_THRESHOLD: usize = EARLY_DTB_LEAF_SIZE - EARLY_DTB_MAX
 
 /// 后续 1GiB RAM 区域（物理地址 0xC000_0000）的 PPN 高位部分。
 const RAM_UPPER_PPN_LUI: usize = 0x30000;
+/// 1 GiB 物理步长换算为 PTE PPN 字段后的增量：1 GiB >> 2。
+const PUD_PTE_STEP: usize = 0x1000_0000;
+/// 首个 1 GiB PMD 窗口之后，早期高半区需要补齐的 RAM PUD 数量。
+const EARLY_RAM_PUD_COUNT: usize =
+    (crate::riscv64::heap_vm::KERNEL_DIRECT_MAP_PHYS_END - 0xC000_0000) / EARLY_DTB_LEAF_SIZE;
+const _: () = assert!(EARLY_RAM_PUD_COUNT == 15);
 
 // ── 早期页表存储 ──────────────────────────────────────────────────────────────
 
@@ -143,11 +149,10 @@ pub unsafe extern "C" fn _start() {
         "sd t2, 16(t1)",
         "sd t2, 16(t3)",
 
-        // PUD[3] = 1G → PA 0xC000_0000，启动期数据/DTB 只需 RW+NX。
+        // identity 只保留启动实际需要的第二个 RAM 窗口。
         "lui t2, {ram_upper_ppn_lui}",
         "addi t2, t2, {pte_ram_rw_leaf}",
         "sd t2, 24(t1)",
-        "sd t2, 24(t3)",
 
         // QEMU 在大内存配置下会把 DTB 放到 4GiB 以上。loader 会先用
         // phys_to_virt 复制 DTB，因此在正式 direct map 建好前临时映射 DTB 所在
@@ -183,6 +188,22 @@ pub unsafe extern "C" fn _start() {
         "add t0, t3, t6",
         "sd t2, 0(t0)",
         "8:",
+
+        // buddy 初始化会在正式页表发布前写入高端 RAM 元数据，因此高半区必须先
+        // 覆盖完整的 16 GiB 启动内存上限。若 DTB 位于其中，RW+NX RAM 映射替换
+        // 上面的临时只读 leaf；超过该范围的 DTB 临时映射保持不变。
+        "lui t2, {ram_upper_ppn_lui}",
+        "addi t2, t2, {pte_ram_rw_leaf}",
+        "li t5, 3",
+        "li t6, {early_ram_pud_count}",
+        "9: slli t0, t5, 3",
+        "add t0, t3, t0",
+        "sd t2, 0(t0)",
+        "li t0, {pud_pte_step}",
+        "add t2, t2, t0",
+        "addi t5, t5, 1",
+        "addi t6, t6, -1",
+        "bnez t6, 9b",
 
         // 默认把 PA 0x8000_0000..0xC000_0000 建成 512 个 2MiB RW+NX leaf。
         "li t2, 0x20000000 + {pte_ram_rw_leaf}",
@@ -264,7 +285,9 @@ pub unsafe extern "C" fn _start() {
         pte_ram_rx_leaf = const PTE_RAM_RX_LEAF,
         pte_ram_r_leaf = const PTE_RAM_R_LEAF,
         pmd_pte_step = const PMD_PTE_STEP,
+        pud_pte_step = const PUD_PTE_STEP,
         early_dtb_next_leaf_threshold = const EARLY_DTB_NEXT_LEAF_THRESHOLD,
+        early_ram_pud_count = const EARLY_RAM_PUD_COUNT,
         ram_upper_ppn_lui = const RAM_UPPER_PPN_LUI,
         satp_mode = const (SATP_MODE_SV48 >> 60),
         va_hi32 = const VA_OFFSET_HI32,
