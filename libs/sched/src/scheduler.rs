@@ -413,11 +413,11 @@ pub fn init() -> Arc<Task> {
             )
             .is_ok()
     );
-    INIT_READY.store(true, Ordering::Release);
-
-    // 8) CPU 0 的 current 指向 init。
+    // 8) 先完整发布 CPU 0 的 current，再对外发布调度器就绪状态。timer 可能在任意
+    // 两条指令之间到来，若先设置 INIT_READY，早期观测路径会看到空 current。
     publish_current_task(0, Arc::clone(&init_task));
     init_task.account_switch_in(now_ns_internal());
+    INIT_READY.store(true, Ordering::Release);
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
@@ -492,18 +492,27 @@ pub fn current_task() -> Arc<Task> {
         .expect("[sched] current_task called before sched::init() on this CPU")
 }
 
-/// 当前 CPU 上正在执行的任务引用。
+/// 尝试借用当前 CPU 上正在执行的任务。
 ///
 /// 该接口不增加引用计数，也不加锁；调用方不能把返回引用保存到可能调度之后。
-pub fn current_task_ref() -> &'static Task {
+pub fn try_current_task_ref() -> Option<&'static Task> {
     let id = cpu();
     let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
-        panic!("[sched] current_task_ref called before sched::init() on this CPU");
+        return None;
     }
     // Safety: raw 指针由 `publish_current_task` 的 `Arc::into_raw` 产生，并由
     // CpuSchedState 的 raw current 槽位持有强引用。
-    unsafe { &*ptr }
+    Some(unsafe { &*ptr })
+}
+
+/// 当前 CPU 上必须存在的任务引用。
+///
+/// 启动期、中断早期等允许尚无 current 的观测路径应使用 [`try_current_task_ref`]。
+pub fn current_task_ref() -> &'static Task {
+    try_current_task_ref().unwrap_or_else(|| {
+        panic!("[sched] current_task_ref called before sched::init() on this CPU")
+    })
 }
 
 /// 当前 CPU 上正在执行的任务句柄，热路径版本。

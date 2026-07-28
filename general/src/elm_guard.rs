@@ -910,7 +910,7 @@ fn current_state_arc() -> Option<Arc<ElmTaskExecutionState>> {
 }
 
 fn current_state_ref() -> Option<&'static ElmTaskExecutionState> {
-    let raw = sched::current_task_ref().elm_execution_ptr();
+    let raw = sched::try_current_task_ref()?.elm_execution_ptr();
     if raw == 0 {
         return None;
     }

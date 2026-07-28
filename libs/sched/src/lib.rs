@@ -127,7 +127,7 @@ pub use scheduler::{
     sched_rr_timeslice_ms, sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us,
     schedule_once, scheduler_diag, set_realtime_itimer, set_sched_rr_timeslice_ms,
     set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for,
-    supported_cpu_mask,
+    supported_cpu_mask, try_current_task_ref,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
