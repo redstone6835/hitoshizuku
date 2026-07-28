@@ -284,6 +284,15 @@ pub trait SuperblockOps {
         false
     }
 
+    /// 最后一个挂载实例释放后，是否仍需保留整棵 dentry 树。
+    ///
+    /// 默认文件系统在最后一个 Mount 生命周期结束时清理缓存。像 devtmpfs 这类由
+    /// 内核全局单例持有、后续 mount 仍会复用同一 Superblock 的文件系统必须返回
+    /// `true`，否则一次完整卸载会让单例根目录永久失效。
+    fn retain_dentries_without_mounts(&self) -> bool {
+        false
+    }
+
     /// 返回 `&dyn Any`，用于向下转型到具体 FS 驱动的超级块操作类型。
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。

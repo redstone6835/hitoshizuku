@@ -37,6 +37,33 @@ use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::superblock::Superblock;
 use crate::vfs::sync::Spinlock;
 
+/// 同一 Superblock 可以同时出现在多个挂载点和多个 mount namespace 中。
+/// 这里按 Superblock 身份记录仍存活的 Mount 对象，避免卸载其中一个实例时破坏
+/// 其它 namespace 仍在使用的共享 dentry 树。
+static ACTIVE_SUPERBLOCK_MOUNTS: Spinlock<BTreeMap<usize, usize>> = Spinlock::new(BTreeMap::new());
+
+fn register_superblock_mount(superblock: &Arc<Superblock>) {
+    let key = Arc::as_ptr(superblock) as usize;
+    let mut active = ACTIVE_SUPERBLOCK_MOUNTS.lock();
+    let count = active.entry(key).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
+/// 解除一个 Mount 的生命周期引用；返回值表示它是否是最后一个实例。
+fn unregister_superblock_mount(superblock: &Arc<Superblock>) -> bool {
+    let key = Arc::as_ptr(superblock) as usize;
+    let mut active = ACTIVE_SUPERBLOCK_MOUNTS.lock();
+    let Some(count) = active.get_mut(&key) else {
+        return false;
+    };
+    if *count > 1 {
+        *count -= 1;
+        return false;
+    }
+    active.remove(&key);
+    true
+}
+
 fn join_abs_paths(prefix: &str, suffix: &str) -> alloc::string::String {
     if prefix == "/" {
         let mut out = alloc::string::String::with_capacity(1 + suffix.len());
@@ -225,6 +252,7 @@ impl Mount {
         flags: MountFlags,
         parent: Option<Weak<Mount>>,
     ) -> Arc<Self> {
+        register_superblock_mount(&superblock);
         Arc::new(Self {
             superblock,
             location: Spinlock::new(MountLocation { mountpoint, parent }),
@@ -302,6 +330,16 @@ impl Mount {
     }
 }
 
+impl Drop for Mount {
+    fn drop(&mut self) {
+        if unregister_superblock_mount(&self.superblock)
+            && !self.superblock.ops.retain_dentries_without_mounts()
+        {
+            DCACHE.invalidate_subtree(&self.mount_root);
+        }
+    }
+}
+
 /// 挂载命名空间内部数据，由单把 `Spinlock` 保护一致性。
 ///
 /// 合并 `mounts` 扁平列表与 `by_mountpoint`/`by_root` 索引到同一个锁下，
@@ -311,8 +349,8 @@ struct MountData {
     mounts: Vec<Arc<Mount>>,
     /// mountpoint Dentry 地址 → 覆盖在其上的 Mount 列表（后来的在后面）。
     by_mountpoint: BTreeMap<usize, Vec<Arc<Mount>>>,
-    /// mount_root Dentry 地址 → Mount。
-    by_root: BTreeMap<usize, Arc<Mount>>,
+    /// mount_root Dentry 地址 → 共享该根的 Mount 列表。
+    by_root: BTreeMap<usize, Vec<Arc<Mount>>>,
 }
 
 impl MountData {
@@ -325,7 +363,10 @@ impl MountData {
             .entry(mp_ptr)
             .or_default()
             .push(Arc::clone(mount));
-        self.by_root.insert(root_ptr, Arc::clone(mount));
+        self.by_root
+            .entry(root_ptr)
+            .or_default()
+            .push(Arc::clone(mount));
     }
 
     /// 将 mount 从索引中移除（不从 mounts 列表移除，调用方自行处理）。
@@ -338,7 +379,12 @@ impl MountData {
                 self.by_mountpoint.remove(&mp_ptr);
             }
         }
-        self.by_root.remove(&root_ptr);
+        if let Some(list) = self.by_root.get_mut(&root_ptr) {
+            list.retain(|m| !Arc::ptr_eq(m, mount));
+            if list.is_empty() {
+                self.by_root.remove(&root_ptr);
+            }
+        }
     }
 }
 
@@ -375,7 +421,7 @@ impl MountNamespace {
         let mut by_mp = BTreeMap::new();
         by_mp.insert(mp_ptr, alloc::vec![Arc::clone(&root_mount)]);
         let mut by_rt = BTreeMap::new();
-        by_rt.insert(root_ptr, Arc::clone(&root_mount));
+        by_rt.insert(root_ptr, alloc::vec![Arc::clone(&root_mount)]);
 
         Arc::new(Self {
             id,
@@ -489,7 +535,6 @@ impl MountNamespace {
             return Err(VfsError::DeviceBusy);
         }
 
-        let removed_roots: Vec<Arc<Dentry>>;
         if force {
             let mut to_remove: Vec<Arc<Mount>> = Vec::new();
             let mut queue: alloc::collections::VecDeque<Arc<Mount>> =
@@ -501,10 +546,6 @@ impl MountNamespace {
                 }
                 to_remove.push(m);
             }
-            removed_roots = to_remove
-                .iter()
-                .map(|mount| Arc::clone(&mount.mount_root))
-                .collect();
             let remove_ptrs: Vec<usize> =
                 to_remove.iter().map(|m| Arc::as_ptr(m) as usize).collect();
             data.mounts
@@ -513,7 +554,6 @@ impl MountNamespace {
                 data.index_remove(m);
             }
         } else {
-            removed_roots = alloc::vec![Arc::clone(&mount.mount_root)];
             data.index_remove(&mount);
             data.mounts.swap_remove(pos);
         }
@@ -525,10 +565,6 @@ impl MountNamespace {
             parent.remove_child(&mount);
         }
         drop(data);
-
-        for root in removed_roots {
-            DCACHE.invalidate_subtree(&root);
-        }
         Ok(())
     }
 
@@ -541,7 +577,11 @@ impl MountNamespace {
     /// O(log n) 通过 `by_root` 索引查找。
     pub fn find_mount_for_root(&self, mount_root: &Arc<Dentry>) -> Option<Arc<Mount>> {
         let root_ptr = Arc::as_ptr(mount_root) as usize;
-        self.data.lock().by_root.get(&root_ptr).cloned()
+        self.data
+            .lock()
+            .by_root
+            .get(&root_ptr)
+            .and_then(|mounts| mounts.last().cloned())
     }
 
     /// 若 `dentry` 是某个文件系统的根 Dentry（`mount_root`），返回对应的挂载点
@@ -557,7 +597,8 @@ impl MountNamespace {
             .lock()
             .by_root
             .get(&root_ptr)
-            .map(|m| Arc::clone(&m.location.lock().mountpoint))
+            .and_then(|mounts| mounts.last())
+            .map(|mount| Arc::clone(&mount.location.lock().mountpoint))
     }
 
     /// 查找覆盖在 `dentry` 上的最顶层挂载。
@@ -598,17 +639,13 @@ impl MountNamespace {
         // 第一遍：创建新 Mount 节点（location.parent 暂设 None，第二遍填）
         for old in data.mounts.iter() {
             let old_loc = old.location.lock();
-            let new_mount = Arc::new(Mount {
-                superblock: Arc::clone(&old.superblock),
-                location: Spinlock::new(MountLocation {
-                    mountpoint: Arc::clone(&old_loc.mountpoint),
-                    parent: None, // 第二遍填充
-                }),
-                mount_root: Arc::clone(&old.mount_root),
-                flags: AtomicU32::new(old.flags.load(Ordering::Relaxed)),
-                children: Spinlock::new(Vec::new()),
-                open_count: AtomicUsize::new(0),
-            });
+            let new_mount = Mount::new(
+                Arc::clone(&old.superblock),
+                Arc::clone(&old_loc.mountpoint),
+                Arc::clone(&old.mount_root),
+                MountFlags(old.flags.load(Ordering::Relaxed)),
+                None, // 第二遍填充
+            );
             drop(old_loc);
             old_to_new.insert(Arc::as_ptr(old) as usize, new_mount);
         }
@@ -664,7 +701,10 @@ impl MountNamespace {
                 .entry(mp_ptr)
                 .or_insert_with(Vec::new)
                 .push(Arc::clone(m));
-            by_rt.insert(root_ptr, Arc::clone(m));
+            by_rt
+                .entry(root_ptr)
+                .or_insert_with(Vec::new)
+                .push(Arc::clone(m));
         }
 
         let new_ns = Arc::new(MountNamespace {
@@ -751,7 +791,10 @@ impl MountNamespace {
                 .entry(mp_ptr)
                 .or_default()
                 .push(Arc::clone(&new_mount));
-            data.by_root.insert(root_ptr, Arc::clone(&new_mount));
+            data.by_root
+                .entry(root_ptr)
+                .or_default()
+                .push(Arc::clone(&new_mount));
         }
 
         // 6. 将旧根 mount 移到 put_old 下面，同步更新索引
@@ -769,7 +812,10 @@ impl MountNamespace {
                 .entry(mp_ptr)
                 .or_default()
                 .push(Arc::clone(&old_root_mount));
-            data.by_root.insert(root_ptr, Arc::clone(&old_root_mount));
+            data.by_root
+                .entry(root_ptr)
+                .or_default()
+                .push(Arc::clone(&old_root_mount));
         }
 
         // 7. 将旧根 mount 加入 new_mount 的 children

@@ -2795,6 +2795,10 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
         Ok(())
     }
 
+    fn retain_dentries_without_mounts(&self) -> bool {
+        true
+    }
+
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
         Ok(FsStat {
             fs_type: 0x444f4445, // "devt" 魔数
