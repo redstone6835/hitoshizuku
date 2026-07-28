@@ -377,6 +377,7 @@ pub fn walk_and_map_pages<P: PagingArch>(
     global: bool,
     phys_to_virt: fn(usize) -> usize,
     alloc_page: fn() -> Result<usize, MapError>,
+    fresh_range: bool,
 ) -> MapBatchResult {
     if paddrs.is_empty() {
         return MapBatchResult::complete(0);
@@ -433,7 +434,9 @@ pub fn walk_and_map_pages<P: PagingArch>(
                         core::ptr::write_bytes(new_table_vaddr as *mut u8, 0, P::PAGE_SIZE);
                     }
                     let new_pte = P::make_table_pte(new_table_paddr);
-                    fence(Ordering::Release);
+                    if !fresh_range {
+                        fence(Ordering::Release);
+                    }
                     // Safety: 上层页表锁保证当前路径没有并发写者。
                     unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(new_pte)) };
                     table_vaddr = new_table_vaddr;
@@ -455,6 +458,9 @@ pub fn walk_and_map_pages<P: PagingArch>(
                 return MapBatchResult::failed(mapped, MapError::Misaligned);
             };
             leaf_table_end = end.min(end_vaddr);
+            if fresh_range {
+                fence(Ordering::Release);
+            }
         }
 
         let index = P::level_index(current_vaddr, target_level);

@@ -94,6 +94,7 @@ struct VirtioBlkInner {
     capabilities: VirtioBlkCapabilities,
     queue: IrqSafeMutex<VirtioBlkQueueCore>,
     irq_count: AtomicUsize,
+    poll_irq_mark: AtomicUsize,
     #[cfg(feature = "block-profile")]
     profile: VirtioBlkProfile,
 }
@@ -233,6 +234,7 @@ impl VirtioBlkPci {
             capabilities,
             queue: IrqSafeMutex::new(queue),
             irq_count: AtomicUsize::new(0),
+            poll_irq_mark: AtomicUsize::new(0),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
         });
@@ -400,6 +402,10 @@ impl VirtioBlkPci {
         }
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
         self.poll();
+        self.inner.poll_irq_mark.store(
+            self.inner.irq_count.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         true
     }
 
@@ -476,7 +482,12 @@ impl VirtioBlkPciIo {
 impl BlockDriver for VirtioBlkPciIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
         // 先回收设备已发布的完成项，避免并发提交在中断合并时丢失进度。
-        self.driver.poll();
+        // Only poll if new IRQs arrived since last poll (IRQ-gated completion check)
+        let current_irq = self.driver.inner.irq_count.load(Ordering::Relaxed);
+        if current_irq != self.driver.inner.poll_irq_mark.load(Ordering::Relaxed) {
+            self.driver.inner.poll_irq_mark.store(current_irq, Ordering::Relaxed);
+            self.driver.poll();
+        }
         let mut queue = self.driver.inner.queue.lock();
         if queue.is_failed() {
             return Err((SubmitError::DeviceGone, bio));

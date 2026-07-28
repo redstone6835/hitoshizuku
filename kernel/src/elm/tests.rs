@@ -321,7 +321,8 @@ impl general::dev::pnp::PnpDriver for SyntheticDeviceDriver {
                 general::dev::pnp::PnpId::Dynamic {
                     bus,
                     contract,
-                    identity
+                    identity,
+                    ..
                 } if *bus == expected
                     && contract.as_ref() == "elm.synthetic.identity"
                     && identity.as_ref() == b"synthetic-device"

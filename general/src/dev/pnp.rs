@@ -196,7 +196,7 @@ impl From<FunctionProjectionNameAllocError> for PnpError {
 ///
 /// 该身份只描述设备在总线上的位置或固件节点，不包含 `/dev` 节点名。驱动匹配
 /// 应结合 [`PnpBusInfo`] 里的总线私有信息完成。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub enum PnpId {
     /// PCI/PCIe function，由 segment/bus/device/function 唯一定位。
     Pci {
@@ -222,6 +222,7 @@ pub enum PnpId {
     /// 总线可以在不修改 PnP 状态机的情况下加入设备树；具体语义由匹配该总线的
     /// 驱动或发现源负责。
     Dynamic {
+        fingerprint: u64,
         bus: BusType,
         contract: Box<str>,
         identity: Box<[u8]>,
@@ -353,15 +354,67 @@ impl Hash for PnpId {
                 name.as_ref().hash(state);
                 identity.hash(state);
             }
-            PnpId::Dynamic {
-                bus,
-                contract,
-                identity,
-            } => {
-                bus.hash(state);
-                contract.hash(state);
-                identity.hash(state);
+            PnpId::Dynamic { fingerprint, .. } => {
+                fingerprint.hash(state);
             }
+        }
+    }
+}
+
+impl PartialEq for PnpId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Pci {
+                    segment: sa,
+                    bus: ba,
+                    device: da,
+                    function: fa,
+                },
+                Self::Pci {
+                    segment: sb,
+                    bus: bb,
+                    device: db,
+                    function: fb,
+                },
+            ) => sa == sb && ba == bb && da == db && fa == fb,
+            (
+                Self::Usb {
+                    bus_id: bia,
+                    address: aa,
+                    interface: ia,
+                },
+                Self::Usb {
+                    bus_id: bib,
+                    address: ab,
+                    interface: ib,
+                },
+            ) => bia == bib && aa == ab && ia == ib,
+            (
+                Self::Platform {
+                    name: na,
+                    identity: ia,
+                },
+                Self::Platform {
+                    name: nb,
+                    identity: ib,
+                },
+            ) => na == nb && ia == ib,
+            (
+                Self::Dynamic {
+                    fingerprint: fa,
+                    bus: ba,
+                    contract: ca,
+                    identity: ia,
+                },
+                Self::Dynamic {
+                    fingerprint: fb,
+                    bus: bb,
+                    contract: cb,
+                    identity: ib,
+                },
+            ) => fa == fb && ba == bb && ca == cb && ia == ib,
+            _ => false,
         }
     }
 }
@@ -425,6 +478,7 @@ impl fmt::Display for PnpId {
                 bus,
                 contract,
                 identity,
+                ..
             } => write!(f, "dynamic:{}:{}:{:02x?}", bus.raw_id(), contract, identity),
         }
     }
@@ -446,7 +500,21 @@ impl PnpId {
             .try_reserve(identity.len())
             .map_err(|_| PnpError::OutOfMemory)?;
         identity_copy.extend_from_slice(identity);
+        let fingerprint: u64 = {
+            let mut h: u64 = 14695981039346656037u64; // FNV offset basis
+            let mix = |h: &mut u64, bytes: &[u8]| {
+                for &b in bytes {
+                    *h ^= b as u64;
+                    *h = h.wrapping_mul(1099511628211u64); // FNV prime
+                }
+            };
+            mix(&mut h, &bus.raw_id().to_le_bytes());
+            mix(&mut h, contract.as_bytes());
+            mix(&mut h, identity);
+            h
+        };
         Ok(Self::Dynamic {
+            fingerprint,
             bus,
             contract: contract_copy.into_boxed_str(),
             identity: identity_copy.into_boxed_slice(),

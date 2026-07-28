@@ -1130,21 +1130,23 @@ impl KernelMemorySubsystem {
             return Ok(allocation);
         }
 
-        let record = physical_record_from_allocation(request, allocation, accounting_owner);
-        match self.registry.register_result(&self.boot, record) {
-            Ok(()) => Ok(allocation),
-            Err(err) => {
-                let _ = self.free_physical_raw(allocation);
-                release_accounting(accounting_owner, request.size);
-                Err(match err {
-                    RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
-                    RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
-                    RegistryError::UnknownPointer => buddy::BuddyAllocError::InvalidAddress,
-                    RegistryError::DuplicatePointer => buddy::BuddyAllocError::BlockNotFree,
-                    RegistryError::MetadataOutOfMemory => {
-                        buddy::BuddyAllocError::MetadataOutOfMemory
-                    }
-                })
+        {
+            let record = physical_record_from_allocation(request, allocation, accounting_owner);
+            match self.registry.register_result(&self.boot, record) {
+                Ok(()) => Ok(allocation),
+                Err(err) => {
+                    let _ = self.free_physical_raw(allocation);
+                    release_accounting(accounting_owner, request.size);
+                    Err(match err {
+                        RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
+                        RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
+                        RegistryError::UnknownPointer => buddy::BuddyAllocError::InvalidAddress,
+                        RegistryError::DuplicatePointer => buddy::BuddyAllocError::BlockNotFree,
+                        RegistryError::MetadataOutOfMemory => {
+                            buddy::BuddyAllocError::MetadataOutOfMemory
+                        }
+                    })
+                }
             }
         }
     }
@@ -2054,29 +2056,32 @@ impl KernelMemorySubsystem {
             let _ = self.registry.register_result(&self.boot, old_record);
             return false;
         }
-        new_record = new_record.with_accounting_owner(old_record.accounting_owner());
-        let result = match self.registry.get_result(new_record.ptr) {
-            Ok(_) => self
-                .registry
-                .update_existing_result(new_record.ptr, new_record),
-            Err(RegistryError::UnknownPointer) => {
-                self.registry.register_result(&self.boot, new_record)
-            }
-            Err(err) => Err(err),
-        };
-
-        match result {
-            Ok(()) => true,
-            Err(_) => {
-                let _ = try_resize_accounting(
-                    old_record.accounting_owner(),
-                    new_record.size,
-                    old_record.size,
-                );
-                let _ = self.registry.register_result(&self.boot, old_record);
-                false
-            }
+        #[cfg(feature = "track-allocations")]
+        {
+            new_record = new_record.with_accounting_owner(old_record.accounting_owner());
+            let result = match self.registry.get_result(new_record.ptr) {
+                Ok(_) => self
+                    .registry
+                    .update_existing_result(new_record.ptr, new_record),
+                Err(RegistryError::UnknownPointer) => {
+                    self.registry.register_result(&self.boot, new_record)
+                }
+                Err(err) => Err(err),
+            };
+            return match result {
+                Ok(()) => true,
+                Err(_) => {
+                    let _ = try_resize_accounting(
+                        old_record.accounting_owner(),
+                        new_record.size,
+                        old_record.size,
+                    );
+                    let _ = self.registry.register_result(&self.boot, old_record);
+                    false
+                }
+            };
         }
+        true
     }
 
     fn ensure_default_managed(&self) -> Result<(), InitError> {

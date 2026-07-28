@@ -10,6 +10,7 @@ bench = false
 
 [features]
 ktest-kernel = ["ktest/kernel"]
+track-allocations = []
 
 [dependencies]
 log = { path = "../log" }
