@@ -8,8 +8,8 @@
 use alloc::vec;
 
 use crate::crc;
-use crate::layout::EXT4_EXTENTS_FL;
 use crate::layout::INCOMPAT_FILETYPE;
+use crate::layout::{EXT4_EXTENTS_FL, EXT4_INDEX_FL};
 use crate::state::{BlockBackendError, FsState};
 use crate::{extent_wr, map_wr};
 
@@ -42,6 +42,81 @@ fn dir_data_end(state: &FsState, block: &[u8]) -> Result<usize, BlockBackendErro
         return Err(BlockBackendError::Unsupported);
     }
     Ok(block.len() - DIR_TAIL_LEN)
+}
+
+/// 将 HTree 根块转换为普通线性目录块。
+///
+/// 索引根把 dx 元数据放在 `..` 的空闲区内，块尾也使用专用 dx checksum。
+/// 线性写路径不能把这段区域当成普通 slack。首次修改索引目录时清除索引并
+/// 重建标准 `..` 记录和目录 checksum tail，后续 Linux 与本驱动都会按线性目录
+/// 遍历全部已有叶块。
+fn convert_indexed_root_to_linear(
+    block: &mut [u8],
+    has_filetype: bool,
+    has_tail: bool,
+) -> Result<(), BlockBackendError> {
+    let data_end = if has_tail {
+        block
+            .len()
+            .checked_sub(DIR_TAIL_LEN)
+            .ok_or(BlockBackendError::OutOfRange)?
+    } else {
+        block.len()
+    };
+    if data_end < 24 {
+        return Err(BlockBackendError::OutOfRange);
+    }
+
+    let dot_rec = u16::from_le_bytes([block[4], block[5]]) as usize;
+    let dot_name_len = if has_filetype {
+        block[6] as usize
+    } else {
+        u16::from_le_bytes([block[6], block[7]]) as usize
+    };
+    let dotdot_name_len = if has_filetype {
+        block[18] as usize
+    } else {
+        u16::from_le_bytes([block[18], block[19]]) as usize
+    };
+    if dot_rec != 12
+        || dot_name_len != 1
+        || block[8] != b'.'
+        || dotdot_name_len != 2
+        || &block[20..22] != b".."
+        || u32::from_le_bytes(block[12..16].try_into().unwrap()) == 0
+    {
+        return Err(BlockBackendError::OutOfRange);
+    }
+
+    let dotdot_rec = data_end
+        .checked_sub(12)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or(BlockBackendError::OutOfRange)?;
+    block[16..18].copy_from_slice(&dotdot_rec.to_le_bytes());
+    block[22..data_end].fill(0);
+    Ok(())
+}
+
+fn demote_indexed_directory(
+    state: &FsState,
+    dir_ino: u32,
+    dir_generation: u32,
+    i_block: &[u8],
+    flags: &mut u32,
+) -> Result<(), BlockBackendError> {
+    if *flags & EXT4_INDEX_FL == 0 {
+        return Ok(());
+    }
+    let phys = crate::dir::resolve_block(state, i_block, *flags, 0)?
+        .ok_or(BlockBackendError::OutOfRange)?;
+    let mut block = vec![0u8; state.ext_sb.block_size as usize];
+    state.read_block(phys, &mut block)?;
+    let has_filetype = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
+    convert_indexed_root_to_linear(&mut block, has_filetype, needs_dir_tail(state))?;
+    finish_dir_block(state, dir_ino, dir_generation, &mut block)?;
+    state.write_block(phys, &block)?;
+    *flags &= !EXT4_INDEX_FL;
+    Ok(())
 }
 
 pub(crate) fn finish_dir_block(
@@ -183,6 +258,7 @@ pub(crate) fn insert_entry(
     file_type: u8,
     name: &str,
 ) -> Result<u64, BlockBackendError> {
+    demote_indexed_directory(state, dir_ino, dir_generation, i_block, flags)?;
     let bs = state.ext_sb.block_size as usize;
     let total_blocks = (size + bs as u64 - 1) / bs as u64;
     let has_filetype = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
@@ -239,16 +315,17 @@ pub(crate) fn remove_entry(
     dir_ino: u32,
     dir_generation: u32,
     i_block: &[u8],
-    flags: u32,
+    flags: &mut u32,
     size: u64,
     name: &str,
 ) -> Result<bool, BlockBackendError> {
+    demote_indexed_directory(state, dir_ino, dir_generation, i_block, flags)?;
     let bs = state.ext_sb.block_size as usize;
     let total_blocks = (size + bs as u64 - 1) / bs as u64;
     let has_filetype = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
     let mut buf = vec![0u8; bs];
     for lb in 0..total_blocks {
-        let phys = crate::dir::resolve_block(state, i_block, flags, lb as u32)?;
+        let phys = crate::dir::resolve_block(state, i_block, *flags, lb as u32)?;
         let p = match phys {
             Some(p) => p,
             None => continue,
@@ -339,12 +416,13 @@ pub(crate) fn update_dotdot(
     dir_ino: u32,
     dir_generation: u32,
     i_block: &[u8],
-    flags: u32,
+    flags: &mut u32,
     new_parent_ino: u32,
 ) -> Result<(), BlockBackendError> {
+    demote_indexed_directory(state, dir_ino, dir_generation, i_block, flags)?;
     let bs = state.ext_sb.block_size as usize;
     // 第一个逻辑块号(目录起始块)
-    let phys = crate::dir::resolve_block(state, i_block, flags, 0)?;
+    let phys = crate::dir::resolve_block(state, i_block, *flags, 0)?;
     let phys = match phys {
         Some(p) => p,
         None => return Err(BlockBackendError::OutOfRange),
@@ -371,4 +449,30 @@ pub(crate) fn update_dotdot(
     }
     // 没找到就不动(极少见 — 只发生在人为损坏目录)
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_root_is_converted_without_exposing_dx_payload_as_dirents() {
+        let mut block = make_init_dir_block(4096, 11, 2, true, false);
+        block[24..40].copy_from_slice(&[0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        block[4084..4096].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4]);
+
+        convert_indexed_root_to_linear(&mut block, true, true).unwrap();
+
+        assert_eq!(u16::from_le_bytes([block[16], block[17]]), 4072);
+        assert!(block[22..4084].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn indexed_root_conversion_rejects_non_root_blocks() {
+        let mut block = vec![0u8; 4096];
+        assert_eq!(
+            convert_indexed_root_to_linear(&mut block, true, true),
+            Err(BlockBackendError::OutOfRange)
+        );
+    }
 }

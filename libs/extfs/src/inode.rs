@@ -617,13 +617,13 @@ impl InodeOps for ExtInodeOps {
         // 1) 从父目录移除 entry
         let mut parent = lock_raw(&self.raw);
         let pi_block = copy_i_block(parent.i_block());
-        let pflags = parent.flags();
+        let mut pflags = parent.flags();
         let ok = dir_wr::remove_entry(
             &self.state,
             self.ino,
             parent.generation(),
             &pi_block,
-            pflags,
+            &mut pflags,
             parent.size(),
             name,
         )
@@ -678,13 +678,13 @@ impl InodeOps for ExtInodeOps {
         // 从父目录移除
         let mut parent = lock_raw(&self.raw);
         let pib = copy_i_block(parent.i_block());
-        let pflags = parent.flags();
+        let mut pflags = parent.flags();
         dir_wr::remove_entry(
             &self.state,
             self.ino,
             parent.generation(),
             &pib,
-            pflags,
+            &mut pflags,
             parent.size(),
             name,
         )
@@ -1000,7 +1000,7 @@ impl InodeOps for ExtInodeOps {
                 self.ino,
                 parent.generation(),
                 &ib,
-                flags,
+                &mut flags,
                 parent.size(),
                 old_name,
             )
@@ -1038,15 +1038,21 @@ impl InodeOps for ExtInodeOps {
             let tops = entry_target
                 .downcast_ops::<ExtInodeOps>()
                 .ok_or(VfsError::InvalidArgument)?;
-            let tib = {
-                let g = lock_raw(&tops.raw);
-                (
-                    copy_i_block(i_block_slice(&g.bytes)),
-                    g.flags(),
-                    g.generation(),
-                )
-            };
-            dir_wr::update_dotdot(&self.state, tops.ino, tib.2, &tib.0, tib.1, new_dir_ops.ino)
+            let mut target_raw = lock_raw(&tops.raw);
+            let tib = copy_i_block(target_raw.i_block());
+            let mut flags = target_raw.flags();
+            dir_wr::update_dotdot(
+                &self.state,
+                tops.ino,
+                target_raw.generation(),
+                &tib,
+                &mut flags,
+                new_dir_ops.ino,
+            )
+            .map_err(map_err)?;
+            target_raw.set_flags(flags);
+            self.state
+                .publish_inode_write(&target_raw)
                 .map_err(map_err)?;
         }
         let target_ops = entry_target

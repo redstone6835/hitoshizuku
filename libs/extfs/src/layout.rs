@@ -81,6 +81,7 @@ pub(crate) const RO_COMPAT_VERITY: u32 = 0x8000;
 pub(crate) const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x10000;
 
 /// Inode flags (i_flags)
+pub(crate) const EXT4_INDEX_FL: u32 = 0x00001000;
 pub(crate) const EXT4_EXTENTS_FL: u32 = 0x00080000;
 pub(crate) const EXT4_INLINE_DATA_FL: u32 = 0x10000000;
 pub(crate) const EXT4_ENCRYPT_FL: u32 = 0x00000800;
