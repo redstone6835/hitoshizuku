@@ -14,7 +14,26 @@
 use crate::riscv64::{time, vdso};
 use crate::trap::Riscv64MessageInterruptOps;
 use crate::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{Exception, Interrupt};
+
+/// 不可恢复异常只能由一个 hart 输出并触发关机，避免并发故障互相截断串口证据。
+static FATAL_TRAP_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+fn claim_fatal_trap_or_wait() {
+    let owner = crate::riscv64::specific::current_cpu_id().saturating_add(1);
+    if FATAL_TRAP_OWNER
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return;
+    }
+
+    unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)) };
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
+}
 
 /// 将 `TrapFrame` 指针转换为短生命周期共享引用。
 ///
@@ -400,6 +419,7 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
             {
                 return recovered;
             }
+            claim_fatal_trap_or_wait();
             let (pid, kind, state, comm) = if sched::is_ready() {
                 let task = sched::current_task();
                 (task.pid_root(), task.kind(), task.state(), task.comm())
@@ -442,6 +462,7 @@ fn handle_access_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
         return recovered;
     }
 
+    claim_fatal_trap_or_wait();
     let tf = unsafe { trap_frame_ref(tf_ptr) };
     log::error!(
         "[trap][access] UNHANDLED kernel access fault code={:#x} sepc={:#x} stval={:#x}",
@@ -476,6 +497,7 @@ fn handle_breakpoint(tf_ptr: usize, code: usize, from_user: bool) -> usize {
         return recovered;
     }
 
+    claim_fatal_trap_or_wait();
     let tf = unsafe { trap_frame_ref(tf_ptr) };
     log::error!(
         "[trap][breakpoint] kernel breakpoint sepc={:#x} stval={:#x}",
@@ -493,6 +515,7 @@ fn handle_unhandled_exception(tf_ptr: usize, code: usize, from_user: bool) -> us
         return recovered;
     }
 
+    claim_fatal_trap_or_wait();
     let exception = decode_exception(code);
     let tf = unsafe { trap_frame_ref(tf_ptr) };
     log::error!(
