@@ -296,17 +296,37 @@ fn flush_user_tlb_range(asid: usize, active_cpus: usize, vaddr: usize, len: usiz
         unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
         return;
     }
+    let Some(range_size) = pages.checked_mul(page_size) else {
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
+        return;
+    };
+    if aligned_start.checked_add(range_size).is_none() {
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
+        return;
+    }
+
+    // 本地 sfence.vma 只能按地址或整个 ASID 失效，因此仍按页执行。SBI RFENCE
+    // 原生接受连续范围，远端只需一次 M-mode 往返，避免把常见的多页 mprotect
+    // 和 munmap 放大为每页一次同步调用。
+    let current = crate::riscv64::specific::current_cpu_id();
+    let flush_local = current < usize::BITS as usize && active_cpus & (1usize << current) != 0;
     let mut va = aligned_start;
     while va < end {
-        unsafe {
-            Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, Some(VirtAddr::new(va)), active_cpus)
-        };
+        if flush_local {
+            unsafe { Riscv64Paging::flush_tlb_local_with_asid(asid, Some(VirtAddr::new(va))) };
+        }
         let Some(next) = va.checked_add(page_size) else {
             unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
             return;
         };
         va = next;
     }
+    crate::riscv64::smp::remote_sfence_vma_range_on(
+        active_cpus,
+        Some(asid),
+        aligned_start,
+        range_size,
+    );
 }
 
 unsafe fn map_user_pages(
