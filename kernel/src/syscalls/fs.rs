@@ -3237,6 +3237,45 @@ fn timeout_expired(deadline: Option<u64>) -> bool {
     deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
 }
 
+fn poll_recheck_deadline(
+    now: u64,
+    deadline: Option<u64>,
+    all_sources_registered: bool,
+) -> Option<u64> {
+    const POLL_RECHECK_NS: u64 = 10_000_000;
+    if all_sources_registered {
+        deadline
+    } else {
+        let quantum = now.saturating_add(POLL_RECHECK_NS);
+        Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
+    }
+}
+
+#[cfg(feature = "kernel-tests")]
+mod poll_deadline_tests {
+    use ktest::ktest;
+
+    use super::poll_recheck_deadline;
+
+    #[ktest]
+    fn registered_poll_sources_keep_the_original_deadline() {
+        assert_eq!(poll_recheck_deadline(100, None, true), None);
+        assert_eq!(
+            poll_recheck_deadline(100, Some(30_000_000), true),
+            Some(30_000_000)
+        );
+    }
+
+    #[ktest]
+    fn unregistered_poll_sources_use_a_bounded_recheck() {
+        assert_eq!(poll_recheck_deadline(100, None, false), Some(10_000_100));
+        assert_eq!(
+            poll_recheck_deadline(100, Some(5_000_000), false),
+            Some(5_000_000)
+        );
+    }
+}
+
 fn restore_current_task_after_wait(task: &Arc<sched::Task>) {
     if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
         let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
@@ -3247,7 +3286,6 @@ fn wait_on_poll_sources(
     sources: &[(Arc<vfs::file::File>, PollEvents)],
     deadline: Option<u64>,
 ) -> Result<(), Errno> {
-    const POLL_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
@@ -3260,17 +3298,16 @@ fn wait_on_poll_sources(
     let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
 
     let mut registered_waiter = false;
+    let mut all_sources_registered = !sources.is_empty();
     for (file, interest) in sources {
-        registered_waiter |= file.poll_add_waiter(&task, *interest);
+        let registered = file.poll_add_waiter(&task, *interest);
+        registered_waiter |= registered;
+        all_sources_registered &= registered;
     }
-    // 当前网络 waiter 仍是全局粗粒度唤醒，存在丢失精确事件的窗口。
-    // poll/select 不能因此永久睡眠；即使没有收到 waiter 唤醒，也按短
-    // 周期重新检查 fd readiness，直到原始 timeout 到期。
-    let recheck_deadline = {
-        let now = sched::now_ns_public();
-        let quantum = now.saturating_add(POLL_RECHECK_NS);
-        Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
-    };
+    // 完整注册 waiter 后，注册后的 readiness 复查已经闭合丢失唤醒窗口，直接
+    // 等待事件或原始超时。只有混入无 waiter 的设备时才按短周期兼容轮询。
+    let recheck_deadline =
+        poll_recheck_deadline(sched::now_ns_public(), deadline, all_sources_registered);
     let deadline_armed =
         recheck_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
 
