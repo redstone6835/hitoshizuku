@@ -24,7 +24,7 @@ def fixture(version: int = 3) -> bytes:
     sections = []
 
     event = bytearray(608)
-    put(event, 2, "H", 49)
+    put(event, 2, "H", 58)
     put(event, 8, "Q", 3)
     put(event, 48, "Q", 1_500_000)
     put(event, 56, "Q", 1_000_000)
@@ -112,6 +112,13 @@ def main() -> None:
         ]
         assert profile["header"]["sample_hz"] == 250
         assert profile["header"]["complete"]
+        assert ANALYZER.EVENT_NAMES[49:58] == [
+            "wait_process_exit", "wait_vfork", "wait_block_io", "page_fault_resident",
+            "page_fault_prepare", "page_fault_commit", "page_fault_single",
+            "page_fault_cache_fill", "page_fault_uncached_fill",
+        ]
+        assert ANALYZER.EVENT_NAMES[64] == "mm_protect"
+        assert len(ANALYZER.EVENT_NAMES) == 73
         assert profile["events"][0]["name"] == "vfs_lookup"
         assert profile["syscalls"][0]["phase"] == 4
         assert profile["samples"][0]["samples"] == 10

@@ -41,10 +41,13 @@ EVENT_NAMES = [
     "page_fault", "irq_dispatch", "block_submit", "block_drain", "block_complete",
     "block_wait", "net_stack_local_turn", "net_peer_rx", "net_receiver_run",
     "net_tcp_sequence", "net_tcp_receive_sequence", "net_tcp_window",
-    "net_tx_writable", "net_writer_run", "net_stack_request", "vfs_lookup",
-    "vfs_open", "vfs_getdents", "vfs_stat", "mm_map", "mm_unmap", "mm_protect",
-    "mm_brk", "page_fault_file", "page_fault_anon", "page_fault_cow",
-    "process_clone", "process_exec", "process_wait", "runqueue_latency",
+    "net_tx_writable", "net_writer_run", "net_stack_request",
+    "wait_process_exit", "wait_vfork", "wait_block_io", "page_fault_resident",
+    "page_fault_prepare", "page_fault_commit", "page_fault_single",
+    "page_fault_cache_fill", "page_fault_uncached_fill", "vfs_lookup", "vfs_open",
+    "vfs_getdents", "vfs_stat", "mm_map", "mm_unmap", "mm_protect", "mm_brk",
+    "page_fault_file", "page_fault_anon", "page_fault_cow", "process_clone",
+    "process_exec", "process_wait", "runqueue_latency",
 ]
 
 

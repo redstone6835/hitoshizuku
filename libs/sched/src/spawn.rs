@@ -29,6 +29,30 @@ pub enum SpawnKind {
     Thread,
 }
 
+#[cfg(feature = "performance-profile")]
+fn register_profile_child(parent: &Arc<Task>, child: &Arc<Task>, pid: crate::pid::PidT) {
+    let Some(parent_pid) = parent.pid_root_cached() else {
+        return;
+    };
+    profiling::trace_task_spawn(parent_pid as u64, pid as u64);
+    let session = child.profile_session_id();
+    if session == 0 {
+        return;
+    }
+    profiling::register_task(
+        session,
+        pid as u64,
+        parent_pid as u64,
+        child.tgid_cached().unwrap_or(pid) as u64,
+    );
+    profiling::record_task_images(
+        session,
+        pid as u64,
+        child.profile_main_image(),
+        child.profile_interpreter_image(),
+    );
+}
+
 // ── 简单 spawn（不带 CloneFlags） ────────────────────────────────────────────
 
 /// 从 `parent` 派生一个新任务：分配 pid、登记亲缘 / 组关系，但不入 runqueue。
@@ -98,24 +122,7 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
     }
 
     #[cfg(feature = "performance-profile")]
-    if let Some(parent_pid) = parent.pid_root_cached() {
-        profiling::trace_task_spawn(parent_pid as u64, pid as u64);
-        let session = child.profile_session_id();
-        if session != 0 {
-            profiling::register_task(
-                session,
-                pid as u64,
-                parent_pid as u64,
-                child.tgid_cached().unwrap_or(pid) as u64,
-            );
-            profiling::record_task_images(
-                session,
-                pid as u64,
-                child.profile_main_image(),
-                child.profile_interpreter_image(),
-            );
-        }
-    }
+    register_profile_child(parent, &child, pid);
 
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
@@ -361,9 +368,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     }
 
     #[cfg(feature = "performance-profile")]
-    if let Some(parent_pid) = real_parent.pid_root() {
-        profiling::trace_task_spawn(parent_pid as u64, pid as u64);
-    }
+    register_profile_child(&real_parent, &child, pid);
 
     // 10. ext clone hook：把上层注册的 VFS / fdtable 等子系统状态按 flags 拷贝。
     if let Some(hook) = ext_clone_hook() {
