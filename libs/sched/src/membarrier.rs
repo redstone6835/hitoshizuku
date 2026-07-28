@@ -40,6 +40,19 @@ impl CpuMembarrier {
         completed.store(target, Ordering::Release);
     }
 
+    fn pending(&self, cpu_id: usize) -> bool {
+        let Some(requested) = self.requested.get(cpu_id) else {
+            return false;
+        };
+        let Some(completed) = self.completed.get(cpu_id) else {
+            return false;
+        };
+        !sequence_reached(
+            completed.load(Ordering::Relaxed),
+            requested.load(Ordering::Acquire),
+        )
+    }
+
     fn synchronize_with(
         &self,
         source_cpu: usize,
@@ -108,6 +121,16 @@ const fn sequence_reached(completed: usize, expected: usize) -> bool {
 
 static CPU_MEMBARRIER: CpuMembarrier = CpuMembarrier::new();
 
+/// 判断指定 CPU 是否有尚未确认的 membarrier 请求。
+pub fn pending_on(cpu_id: usize) -> bool {
+    CPU_MEMBARRIER.pending(cpu_id)
+}
+
+/// 处理指定 CPU 的请求；架构已知逻辑 CPU ID 时使用该入口，避免重复查询。
+pub fn handle_ipi_on(cpu_id: usize) {
+    CPU_MEMBARRIER.service_cpu(cpu_id);
+}
+
 /// 让当前所有 active CPU 执行一次全内存屏障，并等待远端完成。
 pub fn synchronize_cpus() -> Result<(), Errno> {
     let source_cpu = crate::scheduler::current_cpu_id();
@@ -123,7 +146,7 @@ pub fn synchronize_cpus() -> Result<(), Errno> {
 
 /// 架构 IPI handler 调用：处理当前 CPU 尚未确认的 membarrier 请求。
 pub fn handle_ipi() {
-    CPU_MEMBARRIER.service_cpu(crate::scheduler::current_cpu_id());
+    handle_ipi_on(crate::scheduler::current_cpu_id());
 }
 
 #[cfg(test)]
@@ -152,6 +175,15 @@ mod tests {
         let completed = state.completed[1].load(Ordering::Acquire);
         assert!(sequence_reached(completed, first));
         assert!(sequence_reached(completed, second));
+    }
+
+    #[test]
+    fn pending_state_clears_after_service() {
+        let state = CpuMembarrier::new();
+        state.requested[2].store(1, Ordering::Release);
+        assert!(state.pending(2));
+        state.service_cpu(2);
+        assert!(!state.pending(2));
     }
 
     #[test]

@@ -235,6 +235,8 @@ pub struct CpuControlOps {
     pub send_resched: fn(cpu_id: usize),
     /// 向目标 CPU 发送 membarrier rendezvous IPI。返回 false 表示没有成功投递。
     pub send_membarrier: fn(cpu_id: usize) -> bool,
+    /// 当前 CPU 是否存在必须在自旋等待中协作处理的请求。
+    pub has_urgent_work: fn() -> bool,
     /// 在当前 CPU 上服务不能推迟到普通中断返回路径的架构请求。
     ///
     /// 调度器和依赖调度器的子系统会在自旋锁等待期间调用本钩子。回调可能运行在
@@ -270,7 +272,9 @@ pub fn cpu_control() -> Option<&'static CpuControlOps> {
 
 #[inline]
 fn dispatch_urgent_work(ops: Option<&CpuControlOps>) {
-    if let Some(ops) = ops {
+    if let Some(ops) = ops
+        && (ops.has_urgent_work)()
+    {
         (ops.poll_urgent)();
     }
 }
@@ -303,6 +307,12 @@ mod cpu_control_tests {
     fn no_membarrier(_: usize) -> bool {
         false
     }
+    fn urgent_work() -> bool {
+        true
+    }
+    fn no_urgent_work() -> bool {
+        false
+    }
     fn poll() {
         POLLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -313,6 +323,15 @@ mod cpu_control_tests {
     static TEST_OPS: CpuControlOps = CpuControlOps {
         send_resched: no_cpu_action,
         send_membarrier: no_membarrier,
+        has_urgent_work: urgent_work,
+        poll_urgent: poll,
+        is_online: offline,
+    };
+
+    static IDLE_TEST_OPS: CpuControlOps = CpuControlOps {
+        send_resched: no_cpu_action,
+        send_membarrier: no_membarrier,
+        has_urgent_work: no_urgent_work,
         poll_urgent: poll,
         is_online: offline,
     };
@@ -321,6 +340,8 @@ mod cpu_control_tests {
     fn urgent_dispatch_is_optional_and_invokes_registered_hook() {
         POLLS.store(0, Ordering::Relaxed);
         dispatch_urgent_work(None);
+        assert_eq!(POLLS.load(Ordering::Relaxed), 0);
+        dispatch_urgent_work(Some(&IDLE_TEST_OPS));
         assert_eq!(POLLS.load(Ordering::Relaxed), 0);
         dispatch_urgent_work(Some(&TEST_OPS));
         assert_eq!(POLLS.load(Ordering::Relaxed), 1);

@@ -16,7 +16,7 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-const URGENT_POLL_INTERVAL: usize = 64;
+const URGENT_POLL_INTERVAL: usize = 1024;
 
 #[inline]
 fn spin_until_unlocked(locked: &AtomicBool, mut poll_urgent: impl FnMut()) {

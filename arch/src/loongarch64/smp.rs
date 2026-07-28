@@ -209,12 +209,26 @@ pub(crate) fn shootdown_targets_after_pte_update(
 
 fn poll_urgent() {
     handle_shootdown_requests();
-    sched::handle_membarrier_ipi();
+    sched::handle_membarrier_ipi_on(LoongArch64MessageInterruptOps::current_cpu_id());
+}
+
+fn has_urgent_work() -> bool {
+    let cpu = LoongArch64MessageInterruptOps::current_cpu_id();
+    let tlb_pending = !shootdown_sequence_reached(
+        TLB_COMPLETED[cpu].load(Ordering::Relaxed),
+        TLB_REQUESTED[cpu].load(Ordering::Acquire),
+    );
+    let icache_pending = !shootdown_sequence_reached(
+        ICACHE_COMPLETED[cpu].load(Ordering::Relaxed),
+        ICACHE_REQUESTED[cpu].load(Ordering::Acquire),
+    );
+    tlb_pending || icache_pending || sched::membarrier_pending_on(cpu)
 }
 
 pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
     send_resched: send_reschedule,
     send_membarrier,
+    has_urgent_work,
     poll_urgent,
     is_online: cpu_is_online,
 };

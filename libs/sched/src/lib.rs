@@ -90,7 +90,10 @@ pub use cpu::{
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{GroupExitStatus, ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
-pub use membarrier::{handle_ipi as handle_membarrier_ipi, synchronize_cpus};
+pub use membarrier::{
+    handle_ipi as handle_membarrier_ipi, handle_ipi_on as handle_membarrier_ipi_on,
+    pending_on as membarrier_pending_on, synchronize_cpus,
+};
 pub use migration::MigrationContext;
 pub use operation::spawn_user_process;
 pub use pid::{PidNamespace, PidRegistry, PidT};
