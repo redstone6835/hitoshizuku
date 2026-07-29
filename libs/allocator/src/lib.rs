@@ -172,6 +172,8 @@ pub use request::{
     MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest,
     PhysicalAllocation, ReclaimPolicy, Zeroing,
 };
+#[cfg(feature = "performance-profile")]
+pub use slab::SlabProfileCounter;
 pub use slab::{
     MAX_CPUS, MAX_SMALL_SIZE, SLAB_SIZE_CLASS_COUNT, SlabAllocator as ZoneAllocator, SlabAudit,
     SlabAuditFlags, SlabClassStat, SlabReclaimStats, SlabStats,
@@ -1060,6 +1062,11 @@ impl KernelMemorySubsystem {
 
     pub fn registry_stats(&self) -> AllocationRegistryStats {
         self.registry.stats()
+    }
+
+    #[cfg(feature = "performance-profile")]
+    pub fn slab_profile_counter(&self, cpu: usize, counter: SlabProfileCounter) -> u64 {
+        self.slab.profile_counter(cpu, counter)
     }
 
     /// 返回指定外部所有者当前仍存活的 allocator 分配摘要。

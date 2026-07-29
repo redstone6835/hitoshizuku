@@ -461,6 +461,48 @@ fn slab_record_carries_private_backend_cookie() {
     assert_eq!(after.slab_live_records, before.slab_live_records);
 }
 
+/// 释放后的对象应只经过本 CPU magazine 完成下一次复用，不再往返全局 slab 位图。
+#[ktest]
+fn slab_magazine_reuses_recent_object_without_global_refill() {
+    KERNEL_ALLOCATOR
+        .reclaim(
+            AllocatorReclaimRequest::caches()
+                .with_kheap_cached_ranges(0)
+                .without_slab_empty_reclaim()
+                .without_physical_deferred_reclaim(),
+        )
+        .expect("quiesce slab magazines");
+    let before = KERNEL_ALLOCATOR.layer_stats().slab;
+
+    let first = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(MemoryDomain::Kernel, 64, 8))
+        .expect("allocate magazine seed");
+    let ptr = first.ptr;
+    KERNEL_ALLOCATOR
+        .deallocate(ptr)
+        .expect("return seed to local magazine");
+
+    let before_reuse = KERNEL_ALLOCATOR.layer_stats().slab;
+    let second = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(MemoryDomain::Kernel, 64, 8))
+        .expect("reuse local magazine object");
+    let after_reuse = KERNEL_ALLOCATOR.layer_stats().slab;
+    assert_eq!(second.ptr, ptr);
+    assert_eq!(after_reuse.cache_hits, before_reuse.cache_hits + 1);
+    assert_eq!(after_reuse.cache_refills, before_reuse.cache_refills);
+
+    KERNEL_ALLOCATOR
+        .deallocate(second.ptr)
+        .expect("deallocate reused magazine object");
+    let audit = KERNEL_ALLOCATOR.audit();
+    assert!(audit.is_consistent());
+    assert_eq!(
+        audit.slab_live_records,
+        KERNEL_ALLOCATOR.registry_stats().live_small
+    );
+    assert!(KERNEL_ALLOCATOR.layer_stats().slab.cache_hits > before.cache_hits);
+}
+
 /// slab cache 满桶时必须先 flush 旧 cached 对象，再把当前释放对象放回 cache。
 #[ktest]
 fn slab_cache_overflow_free_keeps_accounting_consistent() {
