@@ -488,7 +488,7 @@ impl AllocationRegistry {
                 return Err(RegistryError::InvalidRecord);
             }
         };
-        Ok(read_node(node_addr).record)
+        Ok(read_node_record(node_addr))
     }
 
     pub fn remove(&self, ptr: usize) -> Option<AllocationRecord> {
@@ -514,8 +514,9 @@ impl AllocationRegistry {
             }
             visited += 1;
 
-            let node = read_node(current);
-            if node.record.ptr == ptr {
+            let next = read_node_next(current);
+            if read_node_ptr(current) == ptr {
+                let record = read_node_record(current);
                 let old_chain_len = bucket_chain_len(&inner, bucket);
                 if old_chain_len == 0 {
                     note_chain_corruption_locked(&mut inner);
@@ -523,27 +524,23 @@ impl AllocationRegistry {
                     return Err(RegistryError::InvalidRecord);
                 }
                 if prev == 0 {
-                    set_bucket_head(&inner, bucket, node.next);
+                    set_bucket_head(&inner, bucket, next);
                 } else {
-                    let mut prev_node = read_node(prev);
-                    prev_node.next = node.next;
-                    write_node(prev, prev_node);
+                    write_node_next(prev, next);
                 }
                 set_bucket_chain_len(&inner, bucket, old_chain_len - 1);
                 note_chain_remove_locked(&mut inner, old_chain_len);
 
-                let mut recycled = node;
-                recycled.next = inner.free_nodes;
-                write_node(current, recycled);
+                write_node_next(current, inner.free_nodes);
                 inner.free_nodes = current;
                 inner.free_node_count += 1;
                 decrement_live_records_locked(&mut inner);
-                let idx = kind_index(node.record.kind);
+                let idx = kind_index(record.kind);
                 decrement_live_kind_locked(&mut inner, idx);
-                return Ok(node.record);
+                return Ok(record);
             }
             prev = current;
-            current = node.next;
+            current = next;
         }
         inner.remove_failures += 1;
         inner.double_free_attempts += 1;
@@ -608,9 +605,9 @@ impl AllocationRegistry {
             }
             visited += 1;
 
-            let mut node = read_node(current);
-            if node.record.ptr == ptr {
-                let old_record = node.record;
+            let next = read_node_next(current);
+            if read_node_ptr(current) == ptr {
+                let old_record = read_node_record(current);
                 let Some(new_record) = f(old_record) else {
                     return Ok((old_record, false));
                 };
@@ -622,11 +619,10 @@ impl AllocationRegistry {
                     decrement_live_kind_locked(&mut inner, kind_index(old_record.kind));
                     inner.live_by_kind[kind_index(new_record.kind)] += 1;
                 }
-                node.record = new_record;
-                write_node(current, node);
+                write_node_record(current, new_record);
                 return Ok((new_record, true));
             }
-            current = node.next;
+            current = next;
         }
         inner.lookup_misses += 1;
         Err(RegistryError::UnknownPointer)
@@ -857,9 +853,8 @@ fn audit_shard_locked(
             flags.insert(AllocationRegistryAuditFlags::FREE_LIST_LOOP);
             break;
         }
-        let node = read_node(current);
         scan.free_nodes += 1;
-        current = node.next;
+        current = read_node_next(current);
     }
 
     scan
@@ -868,7 +863,7 @@ fn audit_shard_locked(
 fn pop_free_node_locked(inner: &mut AllocationRegistryInner) -> usize {
     let node_addr = inner.free_nodes;
     if node_addr != 0 {
-        inner.free_nodes = read_node(node_addr).next;
+        inner.free_nodes = read_node_next(node_addr);
         decrement_free_node_count_locked(inner);
     }
     node_addr
@@ -877,7 +872,7 @@ fn pop_free_node_locked(inner: &mut AllocationRegistryInner) -> usize {
 fn pop_node_from_list(head: &mut usize, count: &mut usize) -> usize {
     let node_addr = *head;
     if node_addr != 0 {
-        *head = read_node(node_addr).next;
+        *head = read_node_next(node_addr);
         *count = count.saturating_sub(1);
     }
     node_addr
@@ -958,18 +953,16 @@ fn recycle_node_list_locked(inner: &mut AllocationRegistryInner, head: usize, co
     let mut visited = 0usize;
     while visited < count {
         visited += 1;
-        let node = read_node(tail);
-        if node.next == 0 {
+        let next = read_node_next(tail);
+        if next == 0 {
             break;
         }
-        tail = node.next;
+        tail = next;
     }
-    if visited != count || read_node(tail).next != 0 {
+    if visited != count || read_node_next(tail) != 0 {
         note_chain_corruption_locked(inner);
     }
-    let mut tail_node = read_node(tail);
-    tail_node.next = inner.free_nodes;
-    write_node(tail, tail_node);
+    write_node_next(tail, inner.free_nodes);
     inner.free_nodes = head;
     inner.free_node_count = inner.free_node_count.saturating_add(visited);
 }
@@ -1054,11 +1047,10 @@ fn find_node(mut head: usize, ptr: usize, limit: usize) -> Result<Option<usize>,
         }
         visited += 1;
 
-        let node = read_node(head);
-        if node.record.ptr == ptr {
+        if read_node_ptr(head) == ptr {
             return Ok(Some(head));
         }
-        head = node.next;
+        head = read_node_next(head);
     }
     Ok(None)
 }
@@ -1074,11 +1066,10 @@ fn find_node_and_chain_len(
             return Err(());
         }
         len += 1;
-        let node = read_node(head);
-        if node.record.ptr == ptr {
+        if read_node_ptr(head) == ptr {
             return Ok((Some(head), len));
         }
-        head = node.next;
+        head = read_node_next(head);
     }
     Ok((None, len))
 }
@@ -1095,6 +1086,31 @@ fn kind_index(kind: AllocationKind) -> usize {
 
 fn read_node(addr: usize) -> RegistryNode {
     unsafe { *(addr as *const RegistryNode) }
+}
+
+#[inline]
+fn read_node_ptr(addr: usize) -> usize {
+    unsafe { core::ptr::addr_of!((*(addr as *const RegistryNode)).record.ptr).read() }
+}
+
+#[inline]
+fn read_node_next(addr: usize) -> usize {
+    unsafe { core::ptr::addr_of!((*(addr as *const RegistryNode)).next).read() }
+}
+
+#[inline]
+fn read_node_record(addr: usize) -> AllocationRecord {
+    unsafe { core::ptr::addr_of!((*(addr as *const RegistryNode)).record).read() }
+}
+
+#[inline]
+fn write_node_next(addr: usize, next: usize) {
+    unsafe { core::ptr::addr_of_mut!((*(addr as *mut RegistryNode)).next).write(next) }
+}
+
+#[inline]
+fn write_node_record(addr: usize, record: AllocationRecord) {
+    unsafe { core::ptr::addr_of_mut!((*(addr as *mut RegistryNode)).record).write(record) }
 }
 
 fn write_node(addr: usize, node: RegistryNode) {
