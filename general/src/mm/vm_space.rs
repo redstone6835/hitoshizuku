@@ -3076,15 +3076,40 @@ impl VmSpace {
                     va += page_size;
                     continue;
                 };
-                let Some(mapping) = pages.get_mut(&va) else {
+                let Some(mapping) = pages.get(&va) else {
                     va += page_size;
                     continue;
                 };
                 let access = access_for_existing_page(area.flags, &mapping.page);
-                self.protect_page_no_flush(va, pte_flags_for(area.flags, access))?;
-                mapping.access = access;
+                let flags = pte_flags_for(area.flags, access);
+                let mut batch_end = va + page_size;
+                while batch_end < range.end {
+                    let Some(next_area) = set.find(batch_end) else {
+                        break;
+                    };
+                    let Some(next_mapping) = pages.get(&batch_end) else {
+                        break;
+                    };
+                    let next_access = access_for_existing_page(next_area.flags, &next_mapping.page);
+                    if next_access != access || pte_flags_for(next_area.flags, next_access) != flags
+                    {
+                        break;
+                    }
+                    batch_end += page_size;
+                }
+                self.protect_pages_no_flush(va, batch_end - va, flags)?;
+                #[cfg(feature = "performance-profile")]
+                profiling::record(
+                    profiling::Event::MmProtectBatch,
+                    0,
+                    (batch_end - va) as u64,
+                    ((batch_end - va) / page_size) as u64,
+                );
+                for (_, next_mapping) in pages.range_mut(va..batch_end) {
+                    next_mapping.access = access;
+                }
                 touched = true;
-                va += page_size;
+                va = batch_end;
             }
         }
         if touched {
@@ -4551,10 +4576,18 @@ impl VmSpace {
     }
 
     fn protect_page_no_flush(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        self.protect_pages_no_flush(vaddr, page_size(), flags)
+    }
+
+    fn protect_pages_no_flush(
+        &self,
+        vaddr: usize,
+        len: usize,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        let page_size = page_size();
         unsafe {
-            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
+            (ops.protect)(self.pgd, vaddr, len, flags.with(VmFlags::USER));
         }
         Ok(())
     }

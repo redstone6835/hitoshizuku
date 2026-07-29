@@ -553,6 +553,7 @@ struct SlabNode {
 
 struct ZoneState {
     slab_head: usize,
+    preferred_slab: usize,
     /// 回收空 slab 后留下的 SlabNode 元数据 freelist。
     ///
     /// metadata allocator 目前只支持分配、不支持归还；因此空 slab 被释放 backing
@@ -567,6 +568,7 @@ impl ZoneState {
     const fn new() -> Self {
         Self {
             slab_head: 0,
+            preferred_slab: 0,
             free_node_head: 0,
             free_node_count: 0,
             slab_count: 0,
@@ -596,17 +598,39 @@ impl ZoneState {
         // 一次 ZoneState 临界区同时取得当前请求和后续 magazine 补货，避免 miss 路径
         // 先分配一个对象、再重新拿锁补货。所有对象在 slab 中都保持 reserved 状态。
         let mut produced = 0;
+        // 同一批补货沿着 slab 链继续向前，不为每个对象重新从首个 slab 扫描。
+        let start = if self.preferred_slab != 0 {
+            self.preferred_slab
+        } else {
+            self.slab_head
+        };
+        let mut node_addr = start;
+        let mut wrapped = false;
 
         while produced < out.len() {
-            let mut node_addr = self.slab_head;
             let mut entry = None;
-            while node_addr != 0 {
-                let node = slab_node_mut(node_addr);
+            let mut selected = 0;
+            loop {
+                if node_addr == 0 {
+                    if !wrapped && start != self.slab_head {
+                        node_addr = self.slab_head;
+                        wrapped = true;
+                        continue;
+                    }
+                    break;
+                }
+                // 回绕后再次到达起始节点，说明整条链已经检查完毕。
+                if wrapped && node_addr == start {
+                    break;
+                }
+                let current = node_addr;
+                let node = slab_node_mut(current);
                 if let Some(ptr) = node.slab.allocate(obj_size) {
                     entry = Some(CacheEntry {
                         ptr,
-                        slab_node: node_addr,
+                        slab_node: current,
                     });
+                    selected = current;
                     break;
                 }
                 node_addr = node.next;
@@ -616,6 +640,19 @@ impl ZoneState {
             };
             out[produced] = entry;
             produced += 1;
+            // 当前 slab 还有空槽时继续使用它；耗尽后才转到下一个节点。
+            let node = slab_node(selected);
+            node_addr = if node.slab.allocated_objects < node.slab.total_objects {
+                selected
+            } else {
+                node.next
+            };
+            self.preferred_slab = if node_addr != 0 {
+                node_addr
+            } else {
+                // 当前节点耗尽后从链表头重新开始，下一批仍会覆盖整条链。
+                self.slab_head
+            };
         }
         produced
     }
@@ -625,6 +662,7 @@ impl ZoneState {
         let block_pages = node.slab.page_count as usize;
         node.next = self.slab_head;
         self.slab_head = node_addr;
+        self.preferred_slab = node_addr;
         self.slab_count += 1;
         self.stats.active_slabs = self.slab_count;
         self.stats.active_pages += block_pages;
@@ -733,6 +771,9 @@ impl ZoneState {
                 }
                 let node = slab_node_mut(current);
                 node.slab.active = false;
+                if self.preferred_slab == current {
+                    self.preferred_slab = next;
+                }
                 self.slab_count = self.slab_count.saturating_sub(1);
                 self.stats.active_slabs = self.slab_count;
                 self.stats.active_pages = self
@@ -1722,4 +1763,51 @@ fn pages_for_order(order: usize) -> Option<usize> {
         return None;
     }
     1usize.checked_shl(order as u32)
+}
+
+#[cfg(feature = "ktest-kernel")]
+mod tests {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
+
+    use super::*;
+    use crate::space::ArenaKind;
+
+    fn test_node(base_addr: usize, allocated: bool) -> Box<SlabNode> {
+        let mut slab = Slab::empty();
+        slab.init(base_addr, base_addr, 1, PAGE_SIZE);
+        if allocated {
+            assert_eq!(slab.allocate(PAGE_SIZE), Some(base_addr));
+        }
+        Box::new(SlabNode {
+            slab,
+            backing: BackedRange {
+                arena: ArenaKind::Kernel,
+                vaddr: base_addr,
+                paddr: base_addr,
+                size: PAGE_SIZE,
+                order: 0,
+            },
+            next: 0,
+        })
+    }
+
+    #[ktest::ktest]
+    fn allocate_batch_wraps_before_growing() {
+        let mut head = test_node(0x1000, false);
+        let mut preferred = test_node(0x2000, true);
+        let mut tail = test_node(0x3000, true);
+        head.next = (&mut *preferred as *mut SlabNode) as usize;
+        preferred.next = (&mut *tail as *mut SlabNode) as usize;
+
+        let mut state = ZoneState::new();
+        state.slab_head = (&mut *head as *mut SlabNode) as usize;
+        state.preferred_slab = (&mut *preferred as *mut SlabNode) as usize;
+        state.slab_count = 3;
+
+        let mut out = [CacheEntry::empty(); 1];
+        assert_eq!(state.allocate_batch(PAGE_SIZE, &mut out), 1);
+        assert_eq!(out[0].ptr, 0x1000);
+    }
 }

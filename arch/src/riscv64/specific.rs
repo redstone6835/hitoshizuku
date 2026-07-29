@@ -221,8 +221,15 @@ pub extern "C" fn riscv64_fatal_trap_shutdown() -> ! {
 
 #[inline]
 pub fn current_cpu_id() -> usize {
-    let ptr = current_hart_ptr();
-    let logical_id = unsafe { core::ptr::addr_of!((*ptr).logical_id).read_volatile() };
+    let logical_id: usize;
+    unsafe {
+        core::arch::asm!(
+            "ld {logical_id}, {offset}(tp)",
+            logical_id = out(reg) logical_id,
+            offset = const offset_of!(HartLocal, logical_id),
+            options(readonly, nostack, preserves_flags),
+        );
+    }
     debug_assert!(logical_id < sched::NR_CPUS);
     logical_id.min(sched::NR_CPUS - 1)
 }
