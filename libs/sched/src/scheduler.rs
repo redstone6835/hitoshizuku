@@ -3035,13 +3035,13 @@ pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
 
 fn service_idle_scheduler_requests(cpu_id: usize) {
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
-    // idle 循环本身每轮都会执行一次 schedule_once，因此这里只消费通知位，
-    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。若入队发生在本次
-    // 消费之后，生产者会重新置位并通过 IPI 关闭检查到 WFI 之间的竞态窗口。
+    // idle 循环本身每轮都会执行一次 schedule_once，因此先消费通知位，
+    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。随后无条件尝试从
+    // 远端繁忙队列拉取一个任务：该入口只在硬件等待返回后执行一次，不会在
+    // 空闲循环中忙轮询；成功拉取的任务会被紧随其后的 schedule_once 选中。
     let _ = cpu_state.take_resched();
-    if cpu_state.take_balance() {
-        let _ = balance_once(cpu_id);
-    }
+    let _ = cpu_state.take_balance();
+    let _ = balance_once(cpu_id);
 }
 
 // ── exit 辅助 ────────────────────────────────────────────────────────────────
