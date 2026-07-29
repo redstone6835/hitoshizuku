@@ -200,6 +200,9 @@ pub enum Event {
     SlabRefill,
     SlabFlush,
     SlabSlowPath,
+    /// 为已归档快照保留的事件编号，当前不再产生该事件。
+    MmProtectNoop,
+    MmProtectBatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,7 +233,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 81] = [
+    pub const ALL: [Self; 83] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -312,6 +315,8 @@ impl Event {
         Self::SlabRefill,
         Self::SlabFlush,
         Self::SlabSlowPath,
+        Self::MmProtectNoop,
+        Self::MmProtectBatch,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -397,6 +402,8 @@ impl Event {
             Self::SlabRefill => "slab_refill",
             Self::SlabFlush => "slab_flush",
             Self::SlabSlowPath => "slab_slow_path",
+            Self::MmProtectNoop => "mm_protect_noop",
+            Self::MmProtectBatch => "mm_protect_batch",
         }
     }
 
@@ -482,6 +489,7 @@ impl Event {
             | Self::UrgentSpinCheck
             | Self::UrgentPendingHit
             | Self::UrgentService => EventCategory::Scheduler,
+            Self::MmProtectNoop | Self::MmProtectBatch => EventCategory::Memory,
             Self::SlabCacheHit
             | Self::SlabCacheMiss
             | Self::SlabRefill
@@ -3584,7 +3592,9 @@ mod tests {
         assert_eq!(Event::RunqueueLatency as usize, 72);
         assert_eq!(Event::UrgentSpinCheck as usize, 73);
         assert_eq!(Event::SlabSlowPath as usize, 80);
-        assert_eq!(Event::ALL.len(), 81);
+        assert_eq!(Event::MmProtectNoop as usize, 81);
+        assert_eq!(Event::MmProtectBatch as usize, 82);
+        assert_eq!(Event::ALL.len(), 83);
         assert_eq!(Event::from_id(52), Some(Event::PageFaultResident));
         assert_eq!(Event::from_id(55), Some(Event::PageFaultSingle));
         assert_eq!(Event::from_id(57), Some(Event::PageFaultUncachedFill));

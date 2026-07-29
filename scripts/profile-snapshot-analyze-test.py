@@ -118,12 +118,14 @@ def main() -> None:
             "page_fault_cache_fill", "page_fault_uncached_fill",
         ]
         assert ANALYZER.EVENT_NAMES[64] == "mm_protect"
-        assert ANALYZER.EVENT_NAMES[73:] == [
+        assert ANALYZER.EVENT_NAMES[73:81] == [
             "urgent_spin_check", "urgent_pending_hit", "urgent_service",
             "slab_cache_hit", "slab_cache_miss", "slab_refill", "slab_flush",
             "slab_slow_path",
         ]
-        assert len(ANALYZER.EVENT_NAMES) == 81
+        assert ANALYZER.EVENT_NAMES[81] == "mm_protect_noop"
+        assert ANALYZER.EVENT_NAMES[82] == "mm_protect_batch"
+        assert len(ANALYZER.EVENT_NAMES) == 83
         assert profile["events"][0]["name"] == "vfs_lookup"
         assert profile["syscalls"][0]["phase"] == 4
         assert profile["samples"][0]["samples"] == 10
