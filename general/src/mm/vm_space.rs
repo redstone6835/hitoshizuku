@@ -1920,6 +1920,8 @@ struct PreparedAnonPage {
     page: Arc<ResidentPage>,
 }
 
+type PreparedAnonPages = SmallVec<[PreparedAnonPage; ANON_STORE_FAULT_AROUND_PAGES]>;
+
 enum PreparedPrivateFileCacheRun {
     Cached(Arc<ResidentPage>),
     Batched(PrivateFilePageBatch),
@@ -2354,10 +2356,10 @@ impl AnonStoreFaultAround {
     /// 在 VMA/pages 锁外分配并清零候选页。
     ///
     /// 真实故障页分配失败保留 ENOMEM；投机邻页首次失败只缩短窗口。
-    fn prepare(&self) -> Result<Vec<PreparedAnonPage>, Errno> {
+    fn prepare(&self) -> Result<PreparedAnonPages, Errno> {
         let page_size = page_size();
         let requested = (self.end - self.fault_page) / page_size;
-        let mut prepared = Vec::new();
+        let mut prepared = PreparedAnonPages::new();
         // 元数据分配失败不应把一次可退化的优化升级为内核 fault；空前缀会让
         // 提交路径转回既有单页处理。
         if prepared.try_reserve_exact(requested).is_err() {
@@ -3414,12 +3416,19 @@ impl VmSpace {
         let resident_profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
         let mut pages = self.pages.lock();
-        let pte_present = user_pgd_ops()
-            .is_some_and(|ops| (unsafe { (ops.count_mapped)(self.pgd, page, page_size()) }) != 0);
-        if let Some(mapping) = pages.get_mut(&page) {
-            if !pte_present {
+        // resident ledger 与叶 PTE 在同一组 VMA/pages 锁内提交和撤销，正常路径不需要
+        // 再为每次硬件缺页遍历一次页表。调试构建保留一致性检查以捕获实现错误。
+        #[cfg(debug_assertions)]
+        {
+            let pte_present = user_pgd_ops().is_some_and(|ops| {
+                (unsafe { (ops.count_mapped)(self.pgd, page, page_size()) }) != 0
+            });
+            if pte_present != pages.contains_key(&page) {
                 return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
             }
+        }
+        let mapping = pages.get_mut(&page);
+        if let Some(mapping) = mapping {
             #[cfg(feature = "performance-profile")]
             if let Some(backing) = hardware_fault_backing {
                 record_hardware_user_fault(backing, hardware_fault_access, true);
@@ -3428,9 +3437,6 @@ impl VmSpace {
             drop(pages);
             drop(set);
             return self.finish_resident_fault(page, update, publish_unchanged_mapping);
-        }
-        if pte_present {
-            return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
         }
         drop(pages);
         #[cfg(feature = "performance-profile")]
@@ -4199,7 +4205,7 @@ impl VmSpace {
     fn commit_anon_store_fault_around(
         &self,
         plan: &AnonStoreFaultAround,
-        prepared: Vec<PreparedAnonPage>,
+        prepared: PreparedAnonPages,
     ) -> FaultAroundCommit {
         if prepared.is_empty() {
             return FaultAroundCommit::Retry;
@@ -4248,8 +4254,11 @@ impl VmSpace {
         let page_size = page_size();
         let mut pages = self.pages.lock();
         let fault_resident = pages.contains_key(&plan.fault_page);
-        let fault_present =
-            unsafe { (ops.count_mapped)(self.pgd, plan.fault_page, page_size) } != 0;
+        let fault_present = if cfg!(debug_assertions) {
+            (unsafe { (ops.count_mapped)(self.pgd, plan.fault_page, page_size) }) != 0
+        } else {
+            fault_resident
+        };
         if fault_resident != fault_present {
             #[cfg(feature = "performance-profile")]
             let discarded = prepared.len();
@@ -4280,14 +4289,17 @@ impl VmSpace {
             return FaultAroundCommit::Done(FaultOutcome::Fixed);
         }
 
-        // 对最多四页逐项闭合 resident 账本与真实叶 PTE。二者一致的首个已有
-        // 映射截断投机前缀；任何单边存在都表示生命周期不变量已破坏，必须
-        // fail-closed，不能让没有 Arc 保活的 PTE 继续访问。
+        // resident ledger 在 VMA/pages 锁内与叶 PTE 同步提交，发布构建据此截断
+        // 投机前缀，避免每页重复遍历页表。调试构建仍核对真实 PTE 以捕获不变量破坏。
         let mut prefix_len = 0usize;
         let mut invariant_failure = false;
         for candidate in &prepared {
             let resident = pages.contains_key(&candidate.vaddr);
-            let present = unsafe { (ops.count_mapped)(self.pgd, candidate.vaddr, page_size) } != 0;
+            let present = if cfg!(debug_assertions) {
+                (unsafe { (ops.count_mapped)(self.pgd, candidate.vaddr, page_size) }) != 0
+            } else {
+                resident
+            };
             if resident != present {
                 invariant_failure = true;
                 break;
@@ -4439,9 +4451,14 @@ impl VmSpace {
         }
 
         let mut pages = self.pages.lock();
-        let pte_present = user_pgd_ops().is_some_and(|ops| {
-            (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
-        });
+        let resident = pages.contains_key(&page_va);
+        let pte_present = if cfg!(debug_assertions) {
+            user_pgd_ops().is_some_and(|ops| {
+                (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
+            })
+        } else {
+            resident
+        };
         if let Some(mapping) = pages.get_mut(&page_va) {
             if !pte_present {
                 drop(pages);
