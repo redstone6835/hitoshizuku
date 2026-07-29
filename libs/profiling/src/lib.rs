@@ -192,6 +192,14 @@ pub enum Event {
     ProcessExec,
     ProcessWait,
     RunqueueLatency,
+    UrgentSpinCheck,
+    UrgentPendingHit,
+    UrgentService,
+    SlabCacheHit,
+    SlabCacheMiss,
+    SlabRefill,
+    SlabFlush,
+    SlabSlowPath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,7 +230,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 73] = [
+    pub const ALL: [Self; 81] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -296,6 +304,14 @@ impl Event {
         Self::ProcessExec,
         Self::ProcessWait,
         Self::RunqueueLatency,
+        Self::UrgentSpinCheck,
+        Self::UrgentPendingHit,
+        Self::UrgentService,
+        Self::SlabCacheHit,
+        Self::SlabCacheMiss,
+        Self::SlabRefill,
+        Self::SlabFlush,
+        Self::SlabSlowPath,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -373,6 +389,14 @@ impl Event {
             Self::ProcessExec => "process_exec",
             Self::ProcessWait => "process_wait",
             Self::RunqueueLatency => "runqueue_latency",
+            Self::UrgentSpinCheck => "urgent_spin_check",
+            Self::UrgentPendingHit => "urgent_pending_hit",
+            Self::UrgentService => "urgent_service",
+            Self::SlabCacheHit => "slab_cache_hit",
+            Self::SlabCacheMiss => "slab_cache_miss",
+            Self::SlabRefill => "slab_refill",
+            Self::SlabFlush => "slab_flush",
+            Self::SlabSlowPath => "slab_slow_path",
         }
     }
 
@@ -454,8 +478,30 @@ impl Event {
             | Self::NetWriterRun
             | Self::NetStackRequest => EventCategory::Network,
             Self::ProcessClone | Self::ProcessExec | Self::ProcessWait => EventCategory::Syscall,
-            Self::RunqueueLatency => EventCategory::Scheduler,
+            Self::RunqueueLatency
+            | Self::UrgentSpinCheck
+            | Self::UrgentPendingHit
+            | Self::UrgentService => EventCategory::Scheduler,
+            Self::SlabCacheHit
+            | Self::SlabCacheMiss
+            | Self::SlabRefill
+            | Self::SlabFlush
+            | Self::SlabSlowPath => EventCategory::Memory,
         }
+    }
+
+    const fn is_external_counter(self) -> bool {
+        matches!(
+            self,
+            Self::UrgentSpinCheck
+                | Self::UrgentPendingHit
+                | Self::UrgentService
+                | Self::SlabCacheHit
+                | Self::SlabCacheMiss
+                | Self::SlabRefill
+                | Self::SlabFlush
+                | Self::SlabSlowPath
+        )
     }
 
     const fn in_preset(self, preset: Preset) -> bool {
@@ -1401,6 +1447,9 @@ static CURRENT_TASK_CPU_NS: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_SESSION: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_TASK_IMAGE: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_EVENT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_EVENT_BASELINES: [[AtomicU64; EVENT_COUNT]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; EVENT_COUNT] }; MAX_CPUS];
 static CURRENT_SPAN_ID: AtomicUsize = AtomicUsize::new(0);
 static SET_CURRENT_SPAN_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
@@ -1431,6 +1480,15 @@ pub fn install_task_session(current_task_session: fn() -> u64) {
 
 pub fn install_task_image(current_task_image: fn(usize) -> (u64, usize)) {
     CURRENT_TASK_IMAGE.store(current_task_image as usize, Ordering::Release);
+}
+
+/// 注册只读的外部热点计数器。provider 可在采样窗口起点和读取快照时调用。
+pub fn install_external_event_counter(provider: fn(usize, Event) -> u64) {
+    let address = provider as usize;
+    match EXTERNAL_EVENT_COUNTER.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(existing) => assert_eq!(existing, address, "profiling external counter replaced"),
+    }
 }
 
 pub fn set_workload_root(pid: u64) {
@@ -1713,6 +1771,19 @@ fn clear_session_data() {
     DROPPED_TASK_RECORDS.store(0, Ordering::Relaxed);
     CURRENT_PHASE.store(0, Ordering::Relaxed);
     WORKLOAD_ROOT_PID.store(0, Ordering::Relaxed);
+    let raw = EXTERNAL_EVENT_COUNTER.load(Ordering::Acquire);
+    if raw != 0 {
+        // Safety: 安装接口只接受静态函数地址，注册后不再撤销。
+        let provider = unsafe { core::mem::transmute::<usize, fn(usize, Event) -> u64>(raw) };
+        for cpu in 0..MAX_CPUS {
+            for event in Event::ALL {
+                if event.is_external_counter() {
+                    EXTERNAL_EVENT_BASELINES[cpu][event as usize]
+                        .store(provider(cpu, event), Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 pub fn reset() {
@@ -2440,6 +2511,28 @@ impl Default for Snapshot {
 pub fn snapshot(cpu: usize, event: Event) -> Snapshot {
     if cpu >= CPU_SLOTS {
         return Snapshot::default();
+    }
+    if event.is_external_counter() {
+        let raw = EXTERNAL_EVENT_COUNTER.load(Ordering::Acquire);
+        if raw == 0 {
+            return Snapshot::default();
+        }
+        // Safety: 安装接口只接受静态函数地址，注册后不再撤销。
+        let provider = unsafe { core::mem::transmute::<usize, fn(usize, Event) -> u64>(raw) };
+        let value = |cpu: usize| {
+            provider(cpu, event).saturating_sub(
+                EXTERNAL_EVENT_BASELINES[cpu][event as usize].load(Ordering::Relaxed),
+            )
+        };
+        let calls = if cpu == MIXED_CPU {
+            (0..MAX_CPUS).map(value).sum()
+        } else {
+            value(cpu)
+        };
+        return Snapshot {
+            calls,
+            ..Snapshot::default()
+        };
     }
     let counter = &COUNTERS[cpu][event as usize];
     Snapshot {
@@ -3489,7 +3582,9 @@ mod tests {
         assert_eq!(Event::PageFaultUncachedFill as usize, 57);
         assert_eq!(Event::VfsLookup as usize, 58);
         assert_eq!(Event::RunqueueLatency as usize, 72);
-        assert_eq!(Event::ALL.len(), 73);
+        assert_eq!(Event::UrgentSpinCheck as usize, 73);
+        assert_eq!(Event::SlabSlowPath as usize, 80);
+        assert_eq!(Event::ALL.len(), 81);
         assert_eq!(Event::from_id(52), Some(Event::PageFaultResident));
         assert_eq!(Event::from_id(55), Some(Event::PageFaultSingle));
         assert_eq!(Event::from_id(57), Some(Event::PageFaultUncachedFill));

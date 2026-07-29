@@ -47,7 +47,9 @@ EVENT_NAMES = [
     "page_fault_cache_fill", "page_fault_uncached_fill", "vfs_lookup", "vfs_open",
     "vfs_getdents", "vfs_stat", "mm_map", "mm_unmap", "mm_protect", "mm_brk",
     "page_fault_file", "page_fault_anon", "page_fault_cow", "process_clone",
-    "process_exec", "process_wait", "runqueue_latency",
+    "process_exec", "process_wait", "runqueue_latency", "urgent_spin_check",
+    "urgent_pending_hit", "urgent_service", "slab_cache_hit", "slab_cache_miss",
+    "slab_refill", "slab_flush", "slab_slow_path",
 ]
 
 
