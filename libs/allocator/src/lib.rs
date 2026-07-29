@@ -114,12 +114,27 @@ pub struct AllocatorRelax;
 pub(crate) type Mutex<T> = spin::mutex::Mutex<T, AllocatorRelax>;
 
 static URGENT_POLL_FN: AtomicUsize = AtomicUsize::new(0);
+static URGENT_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
+static URGENT_PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl RelaxStrategy for AllocatorRelax {
     #[inline]
     fn relax() {
-        let raw = URGENT_POLL_FN.load(Ordering::Acquire);
-        if raw != 0 {
+        let pending_ptr = URGENT_PENDING_PTR.load(Ordering::Acquire);
+        let pending_count = URGENT_PENDING_COUNT.load(Ordering::Relaxed);
+        if pending_ptr != 0 && pending_count != 0 {
+            let cpu = KERNEL_ALLOCATOR.current_cpu_id().min(pending_count - 1);
+            // Safety: bind_urgent_poll 保存的是静态 AtomicBool slice，长度单独发布。
+            let pending = unsafe { &*(pending_ptr as *const AtomicBool).add(cpu) };
+            if !pending.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+                return;
+            }
+            let raw = URGENT_POLL_FN.load(Ordering::Acquire);
+            if raw == 0 {
+                core::hint::spin_loop();
+                return;
+            }
             // Safety: `bind_urgent_poll` 只接受静态函数地址，注册后不再撤销。
             let poll = unsafe { core::mem::transmute::<usize, UrgentPollFn>(raw) };
             poll();
@@ -448,12 +463,36 @@ impl KernelMemorySubsystem {
     ///
     /// 该回调可能在任意 allocator 锁的等待路径执行，必须只使用原子状态或架构
     /// 指令，不能分配、阻塞或再次获取 allocator 锁。
-    pub fn bind_urgent_poll(&self, poll: UrgentPollFn) {
+    pub fn bind_urgent_poll(&self, pending: &'static [AtomicBool], poll: UrgentPollFn) {
+        assert!(
+            !pending.is_empty(),
+            "allocator urgent pending slice is empty"
+        );
         let address = poll as usize;
         match URGENT_POLL_FN.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
             Err(existing) => {
                 assert_eq!(existing, address, "allocator urgent poll hook replaced");
+            }
+        }
+        let pending_address = pending.as_ptr() as usize;
+        match URGENT_PENDING_PTR.compare_exchange(
+            0,
+            pending_address,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => URGENT_PENDING_COUNT.store(pending.len(), Ordering::Release),
+            Err(existing) => {
+                assert_eq!(
+                    existing, pending_address,
+                    "allocator urgent pending source replaced"
+                );
+                assert_eq!(
+                    URGENT_PENDING_COUNT.load(Ordering::Acquire),
+                    pending.len(),
+                    "allocator urgent pending length changed"
+                );
             }
         }
     }

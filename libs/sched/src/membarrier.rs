@@ -76,6 +76,7 @@ impl CpuMembarrier {
             expected[cpu_id] = self.requested[cpu_id]
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
+            arch_hooks::mark_urgent_work(cpu_id);
         }
 
         for cpu_id in 0..MAX_CPUS {

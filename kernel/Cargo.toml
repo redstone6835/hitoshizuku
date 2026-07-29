@@ -13,6 +13,7 @@ trace-signal-wait = []
 trace-syscall = ["general/trace-syscall"]
 performance-profile = [
     "dep:profiling",
+    "allocator/performance-profile",
     "arch/performance-profile",
     "general/performance-profile",
     "net/performance-profile",

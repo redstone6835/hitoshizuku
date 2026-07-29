@@ -63,6 +63,23 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
 #[global_allocator]
 static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
 
+#[cfg(feature = "performance-profile")]
+fn external_profile_counter(cpu: usize, event: profiling::Event) -> u64 {
+    let urgent = ::sched::arch_hooks::urgent_profile_counter(cpu, event);
+    let slab = match event {
+        profiling::Event::SlabCacheHit => Some(allocator::SlabProfileCounter::CacheHit),
+        profiling::Event::SlabCacheMiss => Some(allocator::SlabProfileCounter::CacheMiss),
+        profiling::Event::SlabRefill => Some(allocator::SlabProfileCounter::Refill),
+        profiling::Event::SlabFlush => Some(allocator::SlabProfileCounter::Flush),
+        profiling::Event::SlabSlowPath => Some(allocator::SlabProfileCounter::SlowPath),
+        _ => None,
+    }
+    .map_or(0, |counter| {
+        allocator::KERNEL_ALLOCATOR.slab_profile_counter(cpu, counter)
+    });
+    urgent.saturating_add(slab)
+}
+
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
@@ -82,6 +99,7 @@ fn main() -> ! {
         );
         profiling::install_task_session(::sched::current_profile_session_id);
         profiling::install_task_image(::sched::current_profile_image);
+        profiling::install_external_event_counter(external_profile_counter);
     }
     let secondary_cpus = hal::sched::start_secondary_cpus();
     log::info!(

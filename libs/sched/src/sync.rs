@@ -28,6 +28,16 @@ fn spin_until_unlocked(locked: &AtomicBool, mut poll_urgent: impl FnMut()) {
             poll_urgent();
         }
     }
+    #[cfg(feature = "performance-profile")]
+    {
+        let checks = spins / URGENT_POLL_INTERVAL;
+        if checks != 0 {
+            crate::arch_hooks::record_urgent_spin_checks(
+                crate::scheduler::current_cpu_id(),
+                checks,
+            );
+        }
+    }
 }
 
 pub struct SpinlockGuard<'a, T> {
@@ -79,7 +89,11 @@ impl<T> Spinlock<T> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            spin_until_unlocked(&self.locked, crate::poll_urgent_work);
+            spin_until_unlocked(&self.locked, || {
+                if crate::urgent_work_pending() {
+                    crate::poll_urgent_work();
+                }
+            });
         }
         SpinlockGuard {
             lock: self,

@@ -26,7 +26,9 @@
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+#[cfg(feature = "performance-profile")]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// 新内核线程的入口函数签名。`arg` 通过 ABI 规定的第一个参数寄存器传入。
 pub type KernelEntry = unsafe extern "C" fn(arg: usize) -> !;
@@ -253,6 +255,17 @@ unsafe impl Sync for CpuControlOps {}
 unsafe impl Send for CpuControlOps {}
 
 static CPU_CONTROL_OPS: AtomicPtr<CpuControlOps> = AtomicPtr::new(core::ptr::null_mut());
+static URGENT_PENDING: [AtomicBool; crate::cpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::cpu::MAX_CPUS];
+#[cfg(feature = "performance-profile")]
+static URGENT_SPIN_CHECKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+#[cfg(feature = "performance-profile")]
+static URGENT_PENDING_HITS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+#[cfg(feature = "performance-profile")]
+static URGENT_SERVICES: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
 
 /// 支持 SMP 的架构在接通 AP 和 reschedule IPI 后注册该接口。
 /// `send_resched` 只负责通知目标 CPU，实际切换仍在安全的调度边界完成。
@@ -270,13 +283,90 @@ pub fn cpu_control() -> Option<&'static CpuControlOps> {
     }
 }
 
+/// 在发布架构请求序号后标记目标 CPU。该位只用于跳过空检查，序号仍是完成真值。
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.mark_urgent_work",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+#[inline(never)]
+pub fn mark_urgent_work(cpu_id: usize) {
+    if let Some(pending) = URGENT_PENDING.get(cpu_id) {
+        pending.store(true, Ordering::Release);
+    }
+}
+
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.urgent_work_pending",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = 0
+)]
+#[inline(never)]
+pub fn urgent_work_pending() -> bool {
+    let cpu = crate::scheduler::current_cpu_id().min(crate::cpu::MAX_CPUS - 1);
+    URGENT_PENDING[cpu].load(Ordering::Acquire)
+}
+
+/// allocator 竞争路径直接读取这组稳定原子位，避免每次 relax 调用 sched/ELM。
+pub fn urgent_pending_slots() -> &'static [AtomicBool] {
+    &URGENT_PENDING
+}
+
 #[inline]
-fn dispatch_urgent_work(ops: Option<&CpuControlOps>) {
+fn take_urgent_work(cpu: usize) -> bool {
+    URGENT_PENDING
+        .get(cpu)
+        .is_some_and(|pending| pending.swap(false, Ordering::AcqRel))
+}
+
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.record_urgent_spin_checks",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+#[inline(never)]
+pub fn record_urgent_spin_checks(cpu: usize, checks: usize) {
+    #[cfg(feature = "performance-profile")]
+    if checks != 0
+        && let Some(counter) = URGENT_SPIN_CHECKS.get(cpu)
+    {
+        counter.fetch_add(checks as u64, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = (cpu, checks);
+}
+
+#[cfg(feature = "performance-profile")]
+pub fn urgent_profile_counter(cpu: usize, event: profiling::Event) -> u64 {
+    match event {
+        profiling::Event::UrgentSpinCheck => URGENT_SPIN_CHECKS
+            .get(cpu)
+            .map_or(0, |value| value.load(Ordering::Relaxed)),
+        profiling::Event::UrgentPendingHit => URGENT_PENDING_HITS
+            .get(cpu)
+            .map_or(0, |value| value.load(Ordering::Relaxed)),
+        profiling::Event::UrgentService => URGENT_SERVICES
+            .get(cpu)
+            .map_or(0, |value| value.load(Ordering::Relaxed)),
+        _ => 0,
+    }
+}
+
+#[inline]
+fn dispatch_urgent_work(ops: Option<&CpuControlOps>) -> bool {
     if let Some(ops) = ops
         && (ops.has_urgent_work)()
     {
         (ops.poll_urgent)();
+        return true;
     }
+    false
 }
 
 /// 在当前 CPU 上协作处理架构级紧急请求。
@@ -292,14 +382,32 @@ fn dispatch_urgent_work(ops: Option<&CpuControlOps>) {
 )]
 #[inline(never)]
 pub fn poll_urgent_work() {
-    dispatch_urgent_work(cpu_control());
+    let cpu = crate::scheduler::current_cpu_id().min(crate::cpu::MAX_CPUS - 1);
+    if !take_urgent_work(cpu) {
+        return;
+    }
+    #[cfg(feature = "performance-profile")]
+    URGENT_PENDING_HITS[cpu].fetch_add(1, Ordering::Relaxed);
+    let ops = cpu_control();
+    let serviced = dispatch_urgent_work(ops);
+    #[cfg(feature = "performance-profile")]
+    if serviced {
+        URGENT_SERVICES[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = serviced;
+    // 请求可能在 swap(false) 后到达；producer 会重新置位。这里额外复核序号，
+    // 覆盖清位和序号发布交错的窗口。
+    if ops.is_some_and(|ops| (ops.has_urgent_work)()) {
+        URGENT_PENDING[cpu].store(true, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
 mod cpu_control_tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{CpuControlOps, dispatch_urgent_work};
+    use super::{CpuControlOps, dispatch_urgent_work, mark_urgent_work, take_urgent_work};
 
     static POLLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -339,12 +447,21 @@ mod cpu_control_tests {
     #[test]
     fn urgent_dispatch_is_optional_and_invokes_registered_hook() {
         POLLS.store(0, Ordering::Relaxed);
-        dispatch_urgent_work(None);
+        assert!(!dispatch_urgent_work(None));
         assert_eq!(POLLS.load(Ordering::Relaxed), 0);
-        dispatch_urgent_work(Some(&IDLE_TEST_OPS));
+        assert!(!dispatch_urgent_work(Some(&IDLE_TEST_OPS)));
         assert_eq!(POLLS.load(Ordering::Relaxed), 0);
-        dispatch_urgent_work(Some(&TEST_OPS));
+        assert!(dispatch_urgent_work(Some(&TEST_OPS)));
         assert_eq!(POLLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn urgent_latch_is_consumed_once() {
+        let cpu = crate::cpu::MAX_CPUS - 1;
+        let _ = take_urgent_work(cpu);
+        mark_urgent_work(cpu);
+        assert!(take_urgent_work(cpu));
+        assert!(!take_urgent_work(cpu));
     }
 }
 

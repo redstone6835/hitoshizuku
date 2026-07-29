@@ -249,11 +249,8 @@ pub(crate) fn handle_ipi() {
             core::arch::asm!("dbar 0", options(nostack, preserves_flags));
         }
     }
-    if action & (IPI_TLB_SHOOTDOWN | IPI_ICACHE_SYNC) != 0 {
-        handle_shootdown_requests();
-    }
-    if action & IPI_MEMBARRIER != 0 {
-        sched::handle_membarrier_ipi();
+    if action & (IPI_TLB_SHOOTDOWN | IPI_ICACHE_SYNC | IPI_MEMBARRIER) != 0 {
+        sched::poll_urgent_work();
     }
     // request_resched() 在发送 IPI 前已经发布目标 CPU 的 need_resched。
     let _ = action & IPI_RESCHEDULE;
@@ -363,6 +360,7 @@ fn publish_shootdown(
                 .wrapping_add(1),
             _ => 0,
         };
+        sched::mark_urgent_work(logical_id);
     }
     send_action_to_mask(targets, action);
     wait_for_shootdown(kind, action, asid, address, targets, &expected);
