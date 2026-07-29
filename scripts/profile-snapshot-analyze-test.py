@@ -180,6 +180,23 @@ def main() -> None:
             "dropped=0", "dropped=1"
         ))
         assert not ANALYZER.parse_tcg_profile(tcg)["complete"]
+
+        # 地址数量超过单次 exec 参数预算时，符号化必须分批完成。
+        addr2line = root / "addr2line-fixture"
+        addr2line.write_text(
+            "#!/bin/sh\n"
+            "for address in \"$@\"; do\n"
+            "  case \"$address\" in -*) continue;; esac\n"
+            "  printf 'fixture_%s\\n' \"$address\"\n"
+            "  printf 'fixture.c:1\\n'\n"
+            "done\n",
+            encoding="utf-8",
+        )
+        addr2line.chmod(addr2line.stat().st_mode | 0o111)
+        addresses = list(range(600))
+        symbols = ANALYZER.symbolize(root / "fixture.elf", addresses, str(addr2line))
+        assert len(symbols) == len(addresses)
+        assert symbols[599].startswith("fixture_0x")
     print("profile-snapshot-analyze fixture: ok")
 
 
