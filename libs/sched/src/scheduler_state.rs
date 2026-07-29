@@ -252,8 +252,16 @@ impl CpuSchedState {
     }
 
     fn wait_for_enqueues(&self) {
+        // 等待期间必须协作处理 TLB shootdown / membarrier：入队方可能正阻塞在
+        // 一个需要本 CPU 应答 shootdown 才能推进的路径上，纯自旋会让双方互等，
+        // 表现为远端 CPU 报告 "shootdown 确认等待过长"。
+        let mut spins = 0usize;
         while self.enqueue_in_progress.load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(64) {
+                crate::poll_urgent_work();
+            }
         }
     }
 

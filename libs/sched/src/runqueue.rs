@@ -108,11 +108,45 @@ struct RqInner {
     rt_period_start_ns: u64,
     rt_runtime_used_ns: u64,
     rt_throttled: bool,
+    /// 本 rq 所属 CPU 编号，仅用于双重入队检测；`RQ_OWNER_NONE` 表示未回填。
+    owner_cpu: usize,
 }
 
 /// 单 CPU 运行队列。每个 online CPU 持有一份。
 pub(crate) struct Runqueue {
     inner: Spinlock<RqInner>,
+}
+
+/// 记录任务当前登记在哪个 CPU 的 rq 上，用于捕获双重入队。
+///
+/// 这是本次 SMP 修复的回归护栏：如果哪条路径绕过 `MIGRATING` 门禁把同一任务
+/// 挂到两个 rq 上，会在这里立刻 panic 并指出两个 CPU 编号，而不是等到两个核
+/// 各自切入同一份 arch context 后，在 `user_clone_entry` 里报出一个与根因相距
+/// 甚远的 "missing saved trap frame"。
+const RQ_OWNER_NONE: usize = usize::MAX;
+
+fn assert_rq_ownership_acquired(task: &Arc<Task>, owner_cpu: usize, site: &str) {
+    if owner_cpu == RQ_OWNER_NONE {
+        return;
+    }
+    let previous = task.rq_owner.swap(owner_cpu, core::sync::atomic::Ordering::AcqRel);
+    assert!(
+        previous == RQ_OWNER_NONE || previous == owner_cpu,
+        "[sched] double enqueue at {}: pid={:?} already queued on cpu{} while enqueuing on cpu{} \
+         state={:?} on_rq={} migrating={}",
+        site,
+        task.pid_root(),
+        previous,
+        owner_cpu,
+        task.state(),
+        task.sched.on_rq_state(),
+        task.sched.is_migrating(),
+    );
+}
+
+fn release_rq_ownership(task: &Arc<Task>) {
+    task.rq_owner
+        .store(RQ_OWNER_NONE, core::sync::atomic::Ordering::Release);
 }
 
 /// 运行队列中各调度类的可运行任务数。
@@ -200,8 +234,14 @@ impl Runqueue {
                 rt_period_start_ns: 0,
                 rt_runtime_used_ns: 0,
                 rt_throttled: false,
+                owner_cpu: RQ_OWNER_NONE,
             }),
         }
+    }
+
+    /// 回填本 rq 所属 CPU 编号，启用双重入队检测。
+    pub(crate) fn set_owner_cpu(&self, cpu_id: usize) {
+        self.inner.lock().owner_cpu = cpu_id;
     }
 
     /// 创建带有指定 RT bandwidth 的运行队列，仅供调度器初始化和测试使用。
@@ -227,6 +267,7 @@ impl Runqueue {
                 rt_period_start_ns: 0,
                 rt_runtime_used_ns: 0,
                 rt_throttled: false,
+                owner_cpu: RQ_OWNER_NONE,
             }),
         }
     }
@@ -320,6 +361,7 @@ impl Runqueue {
     pub(crate) fn set_current(&self, task: Arc<Task>) {
         let mut inner = self.inner.lock();
         if let Some(old) = inner.current.take() {
+            release_rq_ownership(&old);
             old.sched.set_on_rq(false);
         }
         prepare_running_locked(&mut inner, &task, 0);
@@ -348,12 +390,22 @@ impl Runqueue {
             // 睡眠准备与并发唤醒之间允许出现“任务仍是 current，但状态已是
             // Sleeping”的窗口。此时唤醒必须原地撤销睡眠，不能把同一任务同时
             // 放进 current 和就绪队列，否则下一次 pick 会留下重复队列节点。
+            //
+            // 任务作为 current 仍然归属本 rq，因此 on_rq 必须保持为真。此前
+            // 这里错误地清成 false：那会让紧随其后的一次远端唤醒通过
+            // `enqueue` 的 on_rq 门禁，把同一个任务挂进另一个 CPU 的就绪队列，
+            // 而它同时还是本 CPU 的 current——两个核随后各自切入同一份内核栈
+            // 和 arch context。
             task.set_state(TaskState::Running);
-            task.sched.set_on_rq(false);
+            task.sched.set_on_rq(true);
             return false;
         }
         if !task_can_enter_runqueue(&task) {
-            task.sched.set_on_rq(false);
+            // 迁移中的任务不属于本 rq，其 on_rq 状态由迁移方负责收尾；这里
+            // 只能拒绝入队，不能顺手清成 NONE 而破坏对方的事务。
+            if !task.sched.is_migrating() {
+                task.sched.set_on_rq(false);
+            }
             log::warning!(
                 "[sched] reject non-executable task enqueue pid={:?} state={:?}",
                 task.pid_root(),
@@ -361,6 +413,8 @@ impl Runqueue {
             );
             return false;
         }
+        // MIGRATING 也在此被拒绝：on_rq() 对迁移中的任务返回 true。调用方
+        // （enqueue_task_on_scheduler）应先等待迁移结束再重新定位归属 CPU。
         if task.sched.on_rq() {
             return false;
         }
@@ -372,7 +426,7 @@ impl Runqueue {
             // 真正 pick 时仍会复查状态、亲和性和 class，避免破坏长期公平性。
             inner.preferred_fair_addr = Some(task_addr(&task));
         }
-        enqueue_queued_locked(&mut inner, task, now_ns);
+        enqueue_queued_locked_at(&mut inner, task, now_ns, "enqueue");
         true
     }
 
@@ -386,6 +440,69 @@ impl Runqueue {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
         remove_queued_any_locked(&mut inner, task).is_some()
+    }
+
+    /// 为迁移事务从本 rq 摘除任务，并在同一临界区内发布 `MIGRATING`。
+    ///
+    /// 与 [`dequeue_queued`] 的区别只在最终 `on_rq` 状态：这里绝不允许出现
+    /// 短暂的 `NONE`，否则并发唤醒会在窗口内把任务重新入队到源 rq，最终让
+    /// 同一任务同时挂在源和目标两个 rq 上。
+    pub(crate) fn detach_queued_for_migration(&self, task: &Arc<Task>, now_ns: u64) -> bool {
+        let mut inner = self.inner.lock();
+        let _ = update_curr_locked(&mut inner, now_ns);
+        let Some(task) = remove_queued_any_locked(&mut inner, task) else {
+            return false;
+        };
+        task.sched.set_migrating();
+        true
+    }
+
+    /// 迁移事务的提交端：把任务放进本 rq 并结束 `MIGRATING` 状态。
+    ///
+    /// 普通 [`enqueue`] 会因为 `on_rq()` 在迁移期间为真而拒绝入队，因此提交
+    /// 路径必须走这个入口。返回是否真正入队；无论成功与否，任务都会离开
+    /// `MIGRATING` 状态。
+    pub(crate) fn enqueue_migrated(&self, task: Arc<Task>, now_ns: u64) -> bool {
+        let mut inner = self.inner.lock();
+        // 迁移事务的结束必须与入队发生在同一个 rq 临界区内：若先清 MIGRATING
+        // 再入队，中间窗口会让并发唤醒抢先把任务登记到同一个 rq，随后本次入队
+        // 被拒、调用方误判失败并回滚到源 rq，重新制造双 rq 登记。
+        let was_migrating = task.sched.is_migrating();
+        if !task_can_enter_runqueue(&task) {
+            if was_migrating {
+                task.sched.finish_migrating(false);
+            }
+            log::warning!(
+                "[sched] reject non-executable migrated task pid={:?} state={:?}",
+                task.pid_root(),
+                task.state(),
+            );
+            return false;
+        }
+        // 失败回滚路径可能在任务已经离开 MIGRATING 之后才走到这里；此时按普通
+        // 入队处理，并保持“已在 rq 上就不重复登记”的幂等语义。
+        if !was_migrating && task.sched.on_rq() {
+            return false;
+        }
+        // 迁移期间任务可能被 SIGSTOP / exit 改成 Stopped 或 Sleeping。绝不能
+        // 无条件写回 Runnable：那会把一个已经停止或正在退出的任务复活到目标
+        // rq 上，让 SIGSTOP 永远等不到它进入 Stopped。
+        let state = task.state();
+        if !matches!(state, TaskState::Runnable | TaskState::Running) {
+            if was_migrating {
+                task.sched.finish_migrating(false);
+            }
+            return false;
+        }
+        let _ = update_curr_locked(&mut inner, now_ns);
+        task.set_state(TaskState::Runnable);
+        if was_migrating {
+            task.sched.finish_migrating(true);
+        } else {
+            task.sched.set_on_rq(true);
+        }
+        enqueue_queued_locked_at(&mut inner, task, now_ns, "enqueue_migrated");
+        true
     }
 
     pub(crate) fn is_current(&self, task: &Arc<Task>) -> bool {
@@ -441,6 +558,7 @@ impl Runqueue {
                 // 内核 idle task 由每 CPU idle 槽提供，不属于可排队的
                 // SCHED_IDLE 任务。把它每个 tick 插入再移出 BTreeMap 会在
                 // rq 锁内反复分配节点，并让多核空闲系统争用全局分配器。
+                release_rq_ownership(&prev);
                 prev.sched.set_on_rq(false);
                 kernel_idle = Some(prev);
             } else if task_can_enter_runqueue(&prev)
@@ -450,7 +568,7 @@ impl Runqueue {
                 if prev.sched.policy() == SchedPolicy::Fair {
                     fair_prev_addr = Some(task_addr(&prev));
                 }
-                enqueue_queued_locked(&mut inner, prev, now_ns);
+                enqueue_queued_locked_at(&mut inner, prev, now_ns, "pick_next_requeue_prev");
             } else {
                 if prev.arch_context().is_none()
                     && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
@@ -462,13 +580,24 @@ impl Runqueue {
                     );
                     prev.set_state(TaskState::Dead);
                 }
+                release_rq_ownership(&prev);
                 prev.sched.set_on_rq(false);
             }
         }
 
         let preferred_fair_addr = inner.preferred_fair_addr.take();
+        // 被选中的任务从索引树移入 current 槽，仍归属本 rq，因此不释放归属标记。
         let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask)
             .or(kernel_idle);
+
+        if let Some(ref task) = picked {
+            // current 槽同样是"归属本 rq"。这里复查一次：若该任务此刻还被别的
+            // CPU 的 rq 记着，说明存在一条绕过入队门禁的双重登记路径——必须在
+            // 切入它的内核栈之前就地暴露，而不是等到 user_clone_entry 里报出
+            // "missing saved trap frame"。
+            assert_rq_ownership_acquired(task, inner.owner_cpu, "pick_next_current");
+        }
+
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
@@ -562,6 +691,12 @@ impl Runqueue {
     ///
     /// current 和 Idle 类任务由 CPU 生命周期代码单独处理；其余已排队任务
     /// 都从本 runqueue 摘除并清除 `on_rq`。
+    /// 排空 CPU 下线时需要迁移的队列任务，并把它们标记为迁移中。
+    ///
+    /// 排空后的任务归 CPU 下线流程独占，直到它被重新入队到目标 CPU 或回滚到
+    /// 源 CPU。因此这里和 load balance 一样发布 `MIGRATING`：下线过程中并发的
+    /// 唤醒必须等待事务落地，否则会把任务登记到某个活动 CPU 上，而下线流程
+    /// 随后又把同一任务放到它选定的目标 CPU，形成双 rq 登记。
     pub(crate) fn drain_queued(&self, now_ns: u64) -> Vec<Arc<Task>> {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
@@ -586,6 +721,9 @@ impl Runqueue {
             if let Some(task) = remove_deadline_throttled_locked(&mut inner, &task) {
                 drained.push(task);
             }
+        }
+        for task in drained.iter() {
+            task.sched.set_migrating();
         }
         drained
     }
@@ -643,7 +781,7 @@ impl Runqueue {
             owned.sched.set_on_rq(true);
             owned.set_state(TaskState::Runnable);
             let now = inner.last_update_ns;
-            enqueue_queued_locked(&mut inner, owned, now);
+            enqueue_queued_locked_at(&mut inner, owned, now, "update_sched_entity");
             return true;
         }
 
@@ -719,6 +857,7 @@ fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
         if prev.is_idle_task() {
             // kernel idle 由每 CPU idle 槽持有，targeted pick 时同样不能把它
             // 塞回普通 SCHED_IDLE 队列。
+            release_rq_ownership(&prev);
             prev.sched.set_on_rq(false);
         } else if task_can_enter_runqueue(&prev)
             && matches!(prev.state(), TaskState::Running | TaskState::Runnable)
@@ -727,7 +866,7 @@ fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
             if prev.sched.policy() == SchedPolicy::Fair {
                 fair_prev_addr = Some(task_addr(&prev));
             }
-            enqueue_queued_locked(inner, prev, now_ns);
+            enqueue_queued_locked_at(inner, prev, now_ns, "requeue_current");
         } else {
             if prev.arch_context().is_none()
                 && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
@@ -739,13 +878,16 @@ fn requeue_current_locked(inner: &mut RqInner, now_ns: u64) -> Option<usize> {
                 );
                 prev.set_state(TaskState::Dead);
             }
+            release_rq_ownership(&prev);
             prev.sched.set_on_rq(false);
         }
     }
     fair_prev_addr
 }
 
-fn enqueue_queued_locked(inner: &mut RqInner, task: Arc<Task>, now_ns: u64) {
+/// `site` 只用于双重入队断言的诊断信息，标识调用来源。
+fn enqueue_queued_locked_at(inner: &mut RqInner, task: Arc<Task>, now_ns: u64, site: &str) {
+    assert_rq_ownership_acquired(&task, inner.owner_cpu, site);
     match task.sched.policy() {
         SchedPolicy::Deadline => {
             let replenish_at = task.sched.deadline_replenish_ns();
@@ -944,6 +1086,8 @@ fn task_can_run_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
 
 fn discard_non_runnable_pick(task: &Arc<Task>) {
     let state = task.state();
+    // 已从索引摘出且不会放回 current，归属结束。
+    release_rq_ownership(task);
     task.sched.set_on_rq(false);
     if task.arch_context().is_none() && !matches!(state, TaskState::Zombie | TaskState::Dead) {
         // 已释放执行体的任务绝不能重新进入调度。这里把异常残留终结掉，
@@ -1010,6 +1154,7 @@ fn dequeue_locked(inner: &mut RqInner, task: &Arc<Task>) -> bool {
             if task.sched.policy() == SchedPolicy::Fair {
                 store_fair_lag_locked(inner, task);
             }
+            release_rq_ownership(task);
             task.sched.set_on_rq(false);
             inner.current = None;
             return true;
@@ -1044,6 +1189,7 @@ fn remove_fair_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     store_fair_lag_locked(inner, &task);
+    release_rq_ownership(&task);
     task.sched.set_on_rq(false);
     Some(task)
 }
@@ -1055,6 +1201,7 @@ fn remove_rt_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> 
         .find(|(_, value)| Arc::ptr_eq(value, task))
         .map(|(key, _)| *key)?;
     let task = inner.rt_tree.remove(&key)?;
+    release_rq_ownership(&task);
     task.sched.set_on_rq(false);
     Some(task)
 }
@@ -1066,6 +1213,7 @@ fn remove_deadline_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<T
         .find(|(_, value)| Arc::ptr_eq(value, task))
         .map(|(key, _)| *key)?;
     let task = inner.deadline_tree.remove(&key)?;
+    release_rq_ownership(&task);
     task.sched.set_on_rq(false);
     Some(task)
 }
@@ -1077,6 +1225,7 @@ fn remove_deadline_throttled_locked(inner: &mut RqInner, task: &Arc<Task>) -> Op
         .find(|(_, value)| Arc::ptr_eq(value, task))
         .map(|(key, _)| *key)?;
     let task = inner.deadline_throttled.remove(&key)?;
+    release_rq_ownership(&task);
     task.sched.set_on_rq(false);
     Some(task)
 }
@@ -1088,8 +1237,20 @@ fn remove_idle_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>
         .find(|(_, value)| Arc::ptr_eq(value, task))
         .map(|(key, _)| *key)?;
     let task = inner.idle_tree.remove(&key)?;
+    release_rq_ownership(&task);
     task.sched.set_on_rq(false);
     Some(task)
+}
+
+/// 迁移候选必须真正可运行。
+///
+/// 仅按亲和性筛选是不够的：正在被 SIGSTOP/exit 摘出的任务可能短暂仍在树里，
+/// 一旦被偷走，`enqueue_migrated` 会把它强行改回 Runnable，等于把一个已经
+/// Stopped 或 Zombie 的任务复活到另一个 CPU 上。
+fn migratable_candidate(task: &Arc<Task>, allowed_cpu_mask: u64) -> bool {
+    (task.cpu_affinity() & allowed_cpu_mask) != 0
+        && task.state() == TaskState::Runnable
+        && task.arch_context().is_some()
 }
 
 fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Option<Arc<Task>> {
@@ -1098,13 +1259,16 @@ fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Op
         .iter()
         .rev()
         .find(|(_, task)| {
-            task.running_cpu().is_none() && (task.cpu_affinity() & allowed_cpu_mask) != 0
+            task.running_cpu().is_none() && migratable_candidate(task, allowed_cpu_mask)
         })
         .map(|(key, _)| *key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     store_fair_lag_locked(inner, &task);
-    task.sched.set_on_rq(false);
+    // 迁移事务开始：任务已不在本 rq 索引中，但归属权归迁移方独占。绝不能置
+    // NONE，否则并发唤醒会把它重新塞回源 rq，造成双 rq 登记。
+    release_rq_ownership(&task);
+    task.sched.set_migrating();
     Some(task)
 }
 
@@ -1114,11 +1278,12 @@ fn take_rt_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Opti
         .iter()
         .rev()
         .find(|(_, task)| {
-            task.running_cpu().is_none() && (task.cpu_affinity() & allowed_cpu_mask) != 0
+            task.running_cpu().is_none() && migratable_candidate(task, allowed_cpu_mask)
         })
         .map(|(key, _)| *key)?;
     let task = inner.rt_tree.remove(&key)?;
-    task.sched.set_on_rq(false);
+    release_rq_ownership(&task);
+    task.sched.set_migrating();
     Some(task)
 }
 
@@ -1131,11 +1296,12 @@ fn take_deadline_migratable_locked(
         .iter()
         .rev()
         .find(|(_, task)| {
-            task.running_cpu().is_none() && (task.cpu_affinity() & allowed_cpu_mask) != 0
+            task.running_cpu().is_none() && migratable_candidate(task, allowed_cpu_mask)
         })
         .map(|(key, _)| *key)?;
     let task = inner.deadline_tree.remove(&key)?;
-    task.sched.set_on_rq(false);
+    release_rq_ownership(&task);
+    task.sched.set_migrating();
     Some(task)
 }
 
@@ -1203,6 +1369,7 @@ fn requeue_ready_deadline_locked(inner: &mut RqInner, now_ns: u64) -> bool {
             break;
         };
         if task.state() != TaskState::Runnable {
+            release_rq_ownership(&task);
             task.sched.set_on_rq(false);
             continue;
         }

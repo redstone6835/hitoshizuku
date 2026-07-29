@@ -22,6 +22,44 @@ extract_progress() {
     '
 }
 
+# 从 @@PROFILE_BUILD 行抽取"里程碑 -> 客机 uptime"时间线。
+#
+# 客机 runner 把 cargo 的 stdout/stderr 逐行转发为
+#   `@@PROFILE_BUILD <uptime_seconds> <原始行>`
+# 因此这里可以把每个 `Compiling N/446` 精确定位到时间轴，用来切分
+# "首个 Compiling 之前 / 之后"两个行为完全不同的阶段。
+extract_build_timeline() {
+    tr '\r' '\n' | awk '
+    {
+        # 两种形态都支持：带 @@PROFILE_BUILD <uptime> 前缀的转发行，以及
+        # cargo 直接继承串口 fd 时输出的原始行（此时无客机时间戳）。
+        if ($1 == "@@PROFILE_BUILD") stamp = $2; else stamp = "-"
+        line = $0
+        best = -1
+        while (match(line, /[0-9][0-9]*\/446/)) {
+            value = substr(line, RSTART, RLENGTH)
+            sub(/\/446$/, "", value)
+            suffix = substr(line, RSTART + RLENGTH, 1)
+            if (suffix !~ /[0-9]/ && value + 0 <= 446 && value + 0 > best) best = value + 0
+            line = substr(line, RSTART + RLENGTH)
+        }
+        if (best >= 0) {
+            if (!(best in seen)) { seen[best] = stamp; order[++n] = best }
+        }
+        if (first_build == "" && best >= 0) first_build = stamp
+    }
+    END {
+        if (first_build != "") printf "first_build_output %s\n", first_build
+        for (i = 1; i <= n; i++) printf "milestone %s %s\n", order[i], seen[order[i]]
+    }
+    '
+}
+
+if [ "${1:-}" = "--extract-build-timeline" ]; then
+    extract_build_timeline
+    exit 0
+fi
+
 if [ "${1:-}" = "--extract-progress" ]; then
     extract_progress
     exit 0

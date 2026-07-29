@@ -452,9 +452,19 @@ unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
         let me = sched::current_task();
         activate_task_vm(&me);
 
-        let payload = me
-            .ext_remove(TASKEXT_USER_TRAP_FRAME)
-            .expect("[sched][clone] user child missing saved trap frame");
+        // 子任务可能在"已入队、尚未首次运行"的窗口里被 exit_group / SIGKILL
+        // 杀掉。`exit_task` 只对"不是任何 CPU 的 current"的任务做扩展清理，而
+        // 排队中的新子任务恰好满足这个条件，于是它的 trap frame 会先被摘走。
+        // 这不是错误状态：任务已经被标记退出，正确处理是直接走内核线程退出
+        // 路径，而不是 panic，更不能带着空 frame 返回用户态。
+        let Some(payload) = me.ext_remove(TASKEXT_USER_TRAP_FRAME) else {
+            log::debug!(
+                "[sched][clone] child terminated before first user return: pid={:?} state={:?}",
+                me.pid_root(),
+                me.state(),
+            );
+            sched::kthread_finish(sched::ExitCode(0));
+        };
         let frame = payload
             .downcast::<UserTrapFrame>()
             .expect("[sched][clone] saved trap frame type mismatch");

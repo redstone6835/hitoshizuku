@@ -894,6 +894,11 @@ pub struct Task {
     /// 在安全调度边界消费前保持任务存活。
     deferred_wake_next: AtomicPtr<Task>,
     deferred_wake_queued: AtomicBool,
+    /// 当前登记本任务的 rq 所属 CPU；`usize::MAX` 表示不在任何 rq 上。
+    ///
+    /// 只在 rq 锁内更新，用于捕获"同一任务同时挂在两个 rq 上"的错误。参见
+    /// `crate::runqueue` 中的 `debug_assert_rq_ownership_acquired`。
+    pub(crate) rq_owner: AtomicUsize,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
     /// 当前任务允许的定时器松弛量，以及 `PR_SET_TIMERSLACK(0)` 使用的默认值。
@@ -1031,6 +1036,7 @@ impl Task {
             placement: TaskPlacement::unbound(),
             deferred_wake_next: AtomicPtr::new(core::ptr::null_mut()),
             deferred_wake_queued: AtomicBool::new(false),
+            rq_owner: AtomicUsize::new(usize::MAX),
             ioprio: AtomicU32::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
