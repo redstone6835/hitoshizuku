@@ -34,8 +34,8 @@ use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest, PhysicalAllocation}
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
-    MapError, PagingArch, PhysPageTableRoot, find_leaf, unmap_range_entries,
-    validate_range_permissions,
+    MapError, PagingArch, PhysPageTableRoot, find_leaf, replace_empty_table_with_leaf,
+    unmap_range_entries, validate_range_permissions,
 };
 use spin::Mutex;
 
@@ -1175,15 +1175,17 @@ fn page_table_is_empty(table_vaddr: usize) -> bool {
     true
 }
 
-fn free_page_table_page(paddr: usize) {
+fn free_page_table_page(paddr: usize) -> bool {
     if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_physical_addr(paddr) {
         log::error!(
             "[arch][heap_vm] failed to free page-table page paddr={:#x}: {:?}",
             paddr,
             err
         );
+        false
     } else {
         PAGE_TABLE_PAGES_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -1317,8 +1319,42 @@ fn map_range_with_policy(
     let mut current_paddr = paddr;
 
     while current_vaddr < end_vaddr {
-        if let Err(err) = walk_and_map_heap(root_vaddr, current_vaddr, current_paddr, target_level)
+        if let Err(mut err) =
+            walk_and_map_heap(root_vaddr, current_vaddr, current_paddr, target_level)
         {
+            // 基础页解除映射后会保留空的下级页表。大页映射遇到这种非叶项时，先验证
+            // 整棵子树为空，再将它提升为大页叶；存在活跃映射时仍按 AlreadyMapped 失败。
+            if matches!(err, MapError::AlreadyMapped)
+                && !matches!(page_policy, PagePolicy::BaseOnly)
+            {
+                match replace_empty_table_with_leaf::<Riscv64Paging>(
+                    root_vaddr,
+                    current_vaddr,
+                    current_paddr,
+                    target_level,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    phys_to_virt,
+                    free_page_table_page,
+                ) {
+                    Ok(reclaim_failures) => {
+                        if reclaim_failures != 0 {
+                            log::error!(
+                                "[arch][heap_vm] promoted empty page-table subtree with {} unreclaimed page(s): vaddr={:#x}",
+                                reclaim_failures,
+                                current_vaddr
+                            );
+                        }
+                        current_vaddr += page_size;
+                        current_paddr += page_size;
+                        continue;
+                    }
+                    Err(promote_err) => err = promote_err,
+                }
+            }
             let mapped_size = current_vaddr - vaddr;
             if mapped_size != 0 {
                 MAP_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
