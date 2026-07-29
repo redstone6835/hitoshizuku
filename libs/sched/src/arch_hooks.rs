@@ -183,6 +183,21 @@ pub fn time() -> Option<&'static ArchTimeOps> {
     }
 }
 
+/// 返回当前逻辑 CPU，未完成架构注册时使用 boot CPU。
+///
+/// 时间函数表由静态对象构成且只注册一次；这里直接读取函数表并调用 CPU 钩子，
+/// 避免调度热路径反复构造 `Option`。Relaxed 读取只负责取得单调发布的指针，
+/// 表内字段在程序装载时已经完成初始化。
+#[inline(always)]
+pub fn current_cpu_id_or_boot() -> usize {
+    let ptr = TIME_OPS.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        0
+    } else {
+        unsafe { ((*ptr).current_cpu_id)() }
+    }
+}
+
 // ── ArchDeadlineTimerOps ────────────────────────────────────────────────────
 
 /// 调度器软件截止时间到架构本地定时器的重编程契约。

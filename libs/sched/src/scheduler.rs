@@ -252,7 +252,7 @@ static CURRENT_TASK_EPOCH: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; 
 /// 当前 CPU id。arch_hooks 未注入时退化为 0（单核场景）。
 #[inline]
 fn cpu() -> usize {
-    let id = arch_hooks::time().map_or(0, |o| (o.current_cpu_id)());
+    let id = arch_hooks::current_cpu_id_or_boot();
     debug_assert!(id < NR_CPUS, "[sched] cpu id {} >= NR_CPUS", id);
     if id < NR_CPUS { id } else { 0 }
 }
