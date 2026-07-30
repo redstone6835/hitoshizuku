@@ -3053,10 +3053,22 @@ impl VmSpace {
         let mut touched = false;
         {
             let mut set = self.vmas.lock();
-            if !set.contains_range(&range) {
+            let single_area = set
+                .find(range.start)
+                .is_some_and(|area| range.end <= area.range.end);
+            if !single_area && !set.contains_range(&range) {
                 return Err(Errno::ENOMEM);
             }
-            if new_flags.has(VmFlags::WRITE) {
+            if new_flags.has(VmFlags::WRITE) && single_area {
+                let area = set
+                    .find(range.start)
+                    .expect("单 VMA 判定后区域必须仍然存在");
+                if area.flags.has(VmFlags::SHARED)
+                    && let VmBacking::File { file, .. } = &area.backing
+                {
+                    file.disable_private_page_cache();
+                }
+            } else if new_flags.has(VmFlags::WRITE) {
                 for area in set.iter_overlap(&range) {
                     if !area.flags.has(VmFlags::SHARED) {
                         continue;
@@ -3066,7 +3078,22 @@ impl VmSpace {
                     }
                 }
             }
-            set.protect_range(&range, new_flags.with(VmFlags::USER));
+            let protected_flags = new_flags.with(VmFlags::USER);
+            match set.protect_single_area(&range, protected_flags) {
+                Some(false) => {
+                    #[cfg(feature = "performance-profile")]
+                    profiling::record(
+                        profiling::Event::MmProtectNoop,
+                        0,
+                        range.end.saturating_sub(range.start) as u64,
+                        1,
+                    );
+                }
+                Some(true) => {}
+                None => {
+                    set.protect_range(&range, protected_flags);
+                }
+            }
 
             let mut pages = self.pages.lock();
             // 只遍历已经驻留的页，避免在动态链接器的大量稀疏 mprotect 范围中

@@ -330,6 +330,69 @@ impl VmaSet {
         out
     }
 
+    /// 当 `range` 完全位于单个 VMA 内时直接修改权限。
+    ///
+    /// 返回 `Some(true)` 表示发生了权限变化，`Some(false)` 表示权限本来就一致；跨
+    /// VMA 或范围无效时返回 `None`，由调用方继续使用通用范围更新路径。子区间最多
+    /// 原地分裂成三段，不构造摘取列表，也不进行全表重新插入。
+    pub fn protect_single_area(
+        &mut self,
+        range: &Range<usize>,
+        new_flags: VmFlags,
+    ) -> Option<bool> {
+        if range.start >= range.end {
+            return None;
+        }
+        let next = self
+            .areas
+            .partition_point(|area| area.range.start <= range.start);
+        let idx = next.checked_sub(1)?;
+        let area = self.areas.get(idx)?;
+        if !area.is_well_formed() || range.start < area.range.start || range.end > area.range.end {
+            return None;
+        };
+        let permissions = new_flags.permissions();
+        if area.flags.permissions() == permissions {
+            return Some(false);
+        }
+
+        let mut replacement = area.clone();
+        match (
+            range.start == replacement.range.start,
+            range.end == replacement.range.end,
+        ) {
+            (true, true) => {
+                replacement.flags = replacement.flags.with_permissions(permissions);
+                self.areas[idx] = replacement;
+                self.merge_around(idx);
+            }
+            (true, false) => {
+                let (mut protected, right) = replacement.split_at(range.end)?;
+                protected.flags = protected.flags.with_permissions(permissions);
+                self.areas[idx] = protected;
+                self.areas.insert(idx + 1, right);
+                self.merge_around(idx);
+            }
+            (false, true) => {
+                let (left, mut protected) = replacement.split_at(range.start)?;
+                protected.flags = protected.flags.with_permissions(permissions);
+                self.areas[idx] = left;
+                self.areas.insert(idx + 1, protected);
+                self.merge_around(idx + 1);
+            }
+            (false, false) => {
+                let (left, remainder) = replacement.split_at(range.start)?;
+                let (mut protected, right) = remainder.split_at(range.end)?;
+                protected.flags = protected.flags.with_permissions(permissions);
+                self.areas[idx] = left;
+                self.areas.insert(idx + 1, protected);
+                self.areas.insert(idx + 2, right);
+                self.merge_around(idx + 1);
+            }
+        }
+        Some(true)
+    }
+
     /// 修改 `range` 内全部 VMA 的非几何属性。跨边界时自动 split，backing 不变。
     pub fn update_flags_range(
         &mut self,
