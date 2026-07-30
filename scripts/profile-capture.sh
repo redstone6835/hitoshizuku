@@ -98,8 +98,8 @@ start_capture() {
     timing_shift=${PROFILE_TIMING_SHIFT:-8}
     leave_frozen=${PROFILE_LEAVE_FROZEN:-0}
     validate_case_id "$case_id"
-    if [ -n "${PROFILE_EVENT_MASK:-}" ] && [ -n "${PROFILE_PRESET:-}" ]; then
-        echo "profile capture: PROFILE_EVENT_MASK and PROFILE_PRESET are mutually exclusive" >&2
+    if { [ -n "${PROFILE_EVENT_MASK:-}" ] || [ -n "${PROFILE_EVENT_MASK_HIGH:-}" ]; } && [ -n "${PROFILE_PRESET:-}" ]; then
+        echo "profile capture: explicit event masks and PROFILE_PRESET are mutually exclusive" >&2
         exit 2
     fi
     case "$sampling" in
@@ -143,6 +143,9 @@ start_capture() {
         write_control "events=$PROFILE_EVENT_MASK"
     elif [ -n "$preset" ]; then
         write_control "preset=$preset"
+    fi
+    if [ -n "${PROFILE_EVENT_MASK_HIGH:-}" ]; then
+        write_control "events_high=$PROFILE_EVENT_MASK_HIGH"
     fi
     [ -z "${PROFILE_SAMPLING:-}" ] || \
         write_control "samples=$PROFILE_SAMPLING"

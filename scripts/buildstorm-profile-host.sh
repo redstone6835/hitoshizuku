@@ -134,6 +134,7 @@ timing_shift=${PROFILE_TIMING_SHIFT:-8}
 timing_sampler=${PROFILE_TIMING_SAMPLER:-hashed-bernoulli-v1}
 capture=${PROFILE_CAPTURE:-$default_capture}
 event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
+event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}
 case "$sampling:$trace_enabled" in
     0:0|0:1|1:0|1:1) ;;
     *) echo "PROFILE_SAMPLING and PROFILE_TRACE_ENABLED must be 0 or 1" >&2; exit 2 ;;
@@ -181,6 +182,11 @@ printf '%s\n' "$event_mask" | LC_ALL=C awk '
     NR != 1 { bad = 1 }
     END { exit !(ok && !bad) }
 ' || { echo "PROFILE_EVENT_MASK must be a 1-16 digit hexadecimal mask with a 0x prefix" >&2; exit 2; }
+printf '%s\n' "$event_mask_high" | LC_ALL=C awk '
+    NR == 1 && /^0x[0-9A-Fa-f]+$/ && length($0) >= 3 && length($0) <= 18 { ok = 1 }
+    NR != 1 { bad = 1 }
+    END { exit !(ok && !bad) }
+' || { echo "PROFILE_EVENT_MASK_HIGH must be a 1-16 digit hexadecimal mask with a 0x prefix" >&2; exit 2; }
 
 test -r "$kernel" || { echo "profile host: missing kernel: $kernel" >&2; exit 1; }
 if [ "$boot_mode" = linux ] || [ "$observer_enabled" -eq 1 ]; then
@@ -469,6 +475,7 @@ fi
     printf 'export PROFILE_BOOT_MODE=%s\n' "$boot_mode"
     printf 'export PROFILE_CAPTURE=%s\n' "$capture"
     printf 'export PROFILE_EVENT_MASK=%s\n' "$event_mask"
+    printf 'export PROFILE_EVENT_MASK_HIGH=%s\n' "$event_mask_high"
     printf 'export PROFILE_SAMPLING=%s\n' "$sampling"
     printf 'export PROFILE_TRACE_ENABLED=%s\n' "$trace_enabled"
     printf 'export PROFILE_TIMING_SHIFT=%s\n' "$timing_shift"
@@ -505,8 +512,8 @@ clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
     printf 'qemu_version=%s\ncontainer_image=%s\ncpuset=%s\n' "$qemu_version" "$container_image" "$cpuset"
     printf 'duration_ms=%s\nwarmup_ms=%s\nstage_anchor=%s\n' "$duration_ms" "$warmup_ms" "$anchor"
     printf 'capture_enabled=%s\n' "$capture"
-    printf 'event_mask=%s\nsampling_enabled=%s\ntrace_enabled=%s\ntiming_shift=%s\ntiming_sampler=%s\n' \
-        "$event_mask" "$sampling" "$trace_enabled" "$timing_shift" "$timing_sampler"
+    printf 'event_mask=%s\nevent_mask_high=%s\nsampling_enabled=%s\ntrace_enabled=%s\ntiming_shift=%s\ntiming_sampler=%s\n' \
+        "$event_mask" "$event_mask_high" "$sampling" "$trace_enabled" "$timing_shift" "$timing_sampler"
     printf 'poll_ms=%s\nhost_sample_ms=%s\n' "$poll_ms" "$sample_ms"
     printf 'host_clock_ticks_per_second=%s\n' "$clock_ticks"
     printf 'qemu_observer_enabled=%s\nobserver_system=%s\n' "$observer_enabled" "$observer_system"
