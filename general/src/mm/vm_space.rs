@@ -3069,49 +3069,49 @@ impl VmSpace {
             set.protect_range(&range, new_flags.with(VmFlags::USER));
 
             let mut pages = self.pages.lock();
-            // mprotect 会被动态链接器和 lmbench mmap/munmap 小测频繁调用。
-            // range 已按页对齐，直接逐页探测现有映射，避免先收集 key 到 Vec。
+            // 只遍历已经驻留的页，避免在动态链接器的大量稀疏 mprotect 范围中
+            // 对每个空洞页分别执行 VMA 与 BTreeMap 查找。
             let page_size = page_size();
-            let mut va = range.start;
-            while va < range.end {
+            let mut batch: Option<(usize, usize, PageAccess, VmFlags)> = None;
+            for (&va, mapping) in pages.range_mut(range.clone()) {
                 let Some(area) = set.find(va) else {
-                    va += page_size;
-                    continue;
-                };
-                let Some(mapping) = pages.get(&va) else {
-                    va += page_size;
                     continue;
                 };
                 let access = access_for_existing_page(area.flags, &mapping.page);
                 let flags = pte_flags_for(area.flags, access);
-                let mut batch_end = va + page_size;
-                while batch_end < range.end {
-                    let Some(next_area) = set.find(batch_end) else {
-                        break;
-                    };
-                    let Some(next_mapping) = pages.get(&batch_end) else {
-                        break;
-                    };
-                    let next_access = access_for_existing_page(next_area.flags, &next_mapping.page);
-                    if next_access != access || pte_flags_for(next_area.flags, next_access) != flags
-                    {
-                        break;
+                mapping.access = access;
+                if let Some((batch_start, batch_end, batch_access, batch_flags)) = batch {
+                    if va == batch_end && access == batch_access && flags == batch_flags {
+                        batch = Some((
+                            batch_start,
+                            batch_end + page_size,
+                            batch_access,
+                            batch_flags,
+                        ));
+                        continue;
                     }
-                    batch_end += page_size;
+                    self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
+                    #[cfg(feature = "performance-profile")]
+                    profiling::record(
+                        profiling::Event::MmProtectBatch,
+                        0,
+                        (batch_end - batch_start) as u64,
+                        ((batch_end - batch_start) / page_size) as u64,
+                    );
+                    touched = true;
                 }
-                self.protect_pages_no_flush(va, batch_end - va, flags)?;
+                batch = Some((va, va + page_size, access, flags));
+            }
+            if let Some((batch_start, batch_end, _, batch_flags)) = batch {
+                self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
                 #[cfg(feature = "performance-profile")]
                 profiling::record(
                     profiling::Event::MmProtectBatch,
                     0,
-                    (batch_end - va) as u64,
-                    ((batch_end - va) / page_size) as u64,
+                    (batch_end - batch_start) as u64,
+                    ((batch_end - batch_start) / page_size) as u64,
                 );
-                for (_, next_mapping) in pages.range_mut(va..batch_end) {
-                    next_mapping.access = access;
-                }
                 touched = true;
-                va = batch_end;
             }
         }
         if touched {
