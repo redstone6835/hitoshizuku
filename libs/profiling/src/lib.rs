@@ -200,9 +200,22 @@ pub enum Event {
     SlabRefill,
     SlabFlush,
     SlabSlowPath,
-    /// 为已归档快照保留的事件编号，当前不再产生该事件。
+    /// `mprotect` 请求区间的权限已经与 VMA 一致，无需修改元数据。
     MmProtectNoop,
     MmProtectBatch,
+    PageFaultDecode,
+    PageFaultTaskLookup,
+    PageFaultVmaLookup,
+    PageFaultPageLookup,
+    PageFaultNonresident,
+    MemZeroAnonPage,
+    MemZeroAllocatorSmall,
+    MemZeroAllocatorLarge,
+    MemCopyRealloc,
+    MemCopyCow,
+    AllocRegistryRegister,
+    AllocRegistryRemove,
+    AllocRegistryLookup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,7 +246,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 83] = [
+    pub const ALL: [Self; 96] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -317,6 +330,19 @@ impl Event {
         Self::SlabSlowPath,
         Self::MmProtectNoop,
         Self::MmProtectBatch,
+        Self::PageFaultDecode,
+        Self::PageFaultTaskLookup,
+        Self::PageFaultVmaLookup,
+        Self::PageFaultPageLookup,
+        Self::PageFaultNonresident,
+        Self::MemZeroAnonPage,
+        Self::MemZeroAllocatorSmall,
+        Self::MemZeroAllocatorLarge,
+        Self::MemCopyRealloc,
+        Self::MemCopyCow,
+        Self::AllocRegistryRegister,
+        Self::AllocRegistryRemove,
+        Self::AllocRegistryLookup,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -404,6 +430,19 @@ impl Event {
             Self::SlabSlowPath => "slab_slow_path",
             Self::MmProtectNoop => "mm_protect_noop",
             Self::MmProtectBatch => "mm_protect_batch",
+            Self::PageFaultDecode => "page_fault_decode",
+            Self::PageFaultTaskLookup => "page_fault_task_lookup",
+            Self::PageFaultVmaLookup => "page_fault_vma_lookup",
+            Self::PageFaultPageLookup => "page_fault_page_lookup",
+            Self::PageFaultNonresident => "page_fault_nonresident",
+            Self::MemZeroAnonPage => "mem_zero_anon_page",
+            Self::MemZeroAllocatorSmall => "mem_zero_allocator_small",
+            Self::MemZeroAllocatorLarge => "mem_zero_allocator_large",
+            Self::MemCopyRealloc => "mem_copy_realloc",
+            Self::MemCopyCow => "mem_copy_cow",
+            Self::AllocRegistryRegister => "alloc_registry_register",
+            Self::AllocRegistryRemove => "alloc_registry_remove",
+            Self::AllocRegistryLookup => "alloc_registry_lookup",
         }
     }
 
@@ -489,7 +528,21 @@ impl Event {
             | Self::UrgentSpinCheck
             | Self::UrgentPendingHit
             | Self::UrgentService => EventCategory::Scheduler,
-            Self::MmProtectNoop | Self::MmProtectBatch => EventCategory::Memory,
+            Self::MmProtectNoop
+            | Self::MmProtectBatch
+            | Self::PageFaultDecode
+            | Self::PageFaultTaskLookup
+            | Self::PageFaultVmaLookup
+            | Self::PageFaultPageLookup
+            | Self::PageFaultNonresident
+            | Self::MemZeroAnonPage
+            | Self::MemZeroAllocatorSmall
+            | Self::MemZeroAllocatorLarge
+            | Self::MemCopyRealloc
+            | Self::MemCopyCow
+            | Self::AllocRegistryRegister
+            | Self::AllocRegistryRemove
+            | Self::AllocRegistryLookup => EventCategory::Memory,
             Self::SlabCacheHit
             | Self::SlabCacheMiss
             | Self::SlabRefill
@@ -2004,9 +2057,14 @@ impl Drop for Scope {
 }
 
 pub fn scope(event: Event) -> Scope {
-    let scope_generation = generation();
-    let start_cpu = current_cpu().min(MIXED_CPU);
-    let (active, call_index) = if event_enabled(event) {
+    let selected = event_enabled(event);
+    let scope_generation = if selected { generation() } else { 0 };
+    let start_cpu = if selected {
+        current_cpu().min(MIXED_CPU)
+    } else {
+        0
+    };
+    let (active, call_index) = if selected {
         if let Some(_guard) = begin_write(Some(scope_generation)) {
             let call_index = COUNTERS[start_cpu][event as usize]
                 .calls
@@ -3594,7 +3652,9 @@ mod tests {
         assert_eq!(Event::SlabSlowPath as usize, 80);
         assert_eq!(Event::MmProtectNoop as usize, 81);
         assert_eq!(Event::MmProtectBatch as usize, 82);
-        assert_eq!(Event::ALL.len(), 83);
+        assert_eq!(Event::PageFaultDecode as usize, 83);
+        assert_eq!(Event::AllocRegistryLookup as usize, 95);
+        assert_eq!(Event::ALL.len(), 96);
         assert_eq!(Event::from_id(52), Some(Event::PageFaultResident));
         assert_eq!(Event::from_id(55), Some(Event::PageFaultSingle));
         assert_eq!(Event::from_id(57), Some(Event::PageFaultUncachedFill));

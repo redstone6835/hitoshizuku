@@ -337,6 +337,8 @@ impl AllocationRegistry {
         _boot: &BootAllocator,
         record: AllocationRecord,
     ) -> Result<(), RegistryError> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::AllocRegistryRegister);
         if record.ptr == 0 {
             let mut inner = self.shards[0].inner.lock();
             inner.insert_failures += 1;
@@ -469,6 +471,8 @@ impl AllocationRegistry {
     }
 
     pub fn get_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::AllocRegistryLookup);
         let hash = hash_ptr(ptr);
         let mut inner = self.shard_for_hash(hash).inner.lock();
         if !inner.initialized {
@@ -496,6 +500,8 @@ impl AllocationRegistry {
     }
 
     pub fn remove_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::AllocRegistryRemove);
         let hash = hash_ptr(ptr);
         let mut inner = self.shard_for_hash(hash).inner.lock();
         if !inner.initialized {

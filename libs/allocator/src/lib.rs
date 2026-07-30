@@ -1797,6 +1797,13 @@ impl KernelMemorySubsystem {
                         .checked_add(old_size)
                         .ok_or(AllocationError::InvalidLayout)?;
                     let len = request.size - old_size;
+                    #[cfg(feature = "performance-profile")]
+                    let _profile = match record.kind {
+                        AllocationKind::Small => {
+                            profiling::scope(profiling::Event::MemZeroAllocatorSmall).bytes(len)
+                        }
+                        _ => profiling::scope(profiling::Event::MemZeroAllocatorLarge).bytes(len),
+                    };
                     unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
                 }
                 return Ok(record);
@@ -1824,6 +1831,8 @@ impl KernelMemorySubsystem {
         let new_record =
             self.allocate(request.with_accounting_owner(old_record.accounting_owner()))?;
         let copy_len = old_record.size.min(new_record.size);
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyRealloc).bytes(copy_len);
         unsafe {
             core::ptr::copy_nonoverlapping(ptr as *const u8, new_record.ptr as *mut u8, copy_len);
         }
@@ -1896,6 +1905,9 @@ impl KernelMemorySubsystem {
                         }
                     };
                     if matches!(request.zeroing, Zeroing::Zeroed) {
+                        #[cfg(feature = "performance-profile")]
+                        let _profile = profiling::scope(profiling::Event::MemZeroAllocatorLarge)
+                            .bytes(request.size);
                         unsafe {
                             core::ptr::write_bytes(range.vaddr as *mut u8, 0, request.size);
                         }
@@ -1936,6 +1948,10 @@ impl KernelMemorySubsystem {
                             return Err(AllocationError::OutOfMemory);
                         }
                         if matches!(request.zeroing, Zeroing::Zeroed) {
+                            #[cfg(feature = "performance-profile")]
+                            let _profile =
+                                profiling::scope(profiling::Event::MemZeroAllocatorSmall)
+                                    .bytes(request.size);
                             unsafe {
                                 core::ptr::write_bytes(allocation.ptr as *mut u8, 0, request.size);
                             }
@@ -2664,6 +2680,8 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
 
         let old_size = realloc_copy_source_size(owner, layout.size());
         let copy_len = old_size.min(new_size);
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyRealloc).bytes(copy_len);
         unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
 
         if active {

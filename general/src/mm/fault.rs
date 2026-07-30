@@ -67,9 +67,13 @@ pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
         return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
     };
 
+    #[cfg(feature = "performance-profile")]
+    let decode_profile = profiling::scope(profiling::Event::PageFaultDecode);
     let from_user = (decoder.fault_from_user)(tf);
     let addr = (decoder.fault_addr)(tf);
     let kind = (decoder.fault_kind)(tf);
+    #[cfg(feature = "performance-profile")]
+    drop(decode_profile);
     #[cfg(feature = "performance-profile")]
     profile.set_trace_args(
         addr as u64,
@@ -115,6 +119,8 @@ const fn profile_fault_kind(kind: FaultKind) -> u64 {
 
 /// 从当前 task 的 ext 表里取 VmSpace 的 Arc。需要 sched 已就绪。
 fn current_task_vm_space() -> Option<Arc<VmSpace>> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::PageFaultTaskLookup);
     if !sched::is_ready() {
         return None;
     }

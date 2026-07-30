@@ -3383,8 +3383,14 @@ impl VmSpace {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
         }
         let page = page_base(addr);
+        #[cfg(feature = "performance-profile")]
+        let vma_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultVmaLookup));
         let set = self.vmas.lock();
-        let Some(area) = set.find(page) else {
+        let area = set.find(page);
+        #[cfg(feature = "performance-profile")]
+        drop(vma_profile);
+        let Some(area) = area else {
             drop(set);
             let mut set = self.vmas.lock();
             let Some((_added, flags)) = set.grow_down_to(page, vm_layout().max_grows_down_bytes)
@@ -3442,6 +3448,9 @@ impl VmSpace {
         #[cfg(feature = "performance-profile")]
         let resident_profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
+        #[cfg(feature = "performance-profile")]
+        let page_lookup_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultPageLookup));
         let mut pages = self.pages.lock();
         // resident ledger 与叶 PTE 在同一组 VMA/pages 锁内提交和撤销，正常路径不需要
         // 再为每次硬件缺页遍历一次页表。调试构建保留一致性检查以捕获实现错误。
@@ -3455,6 +3464,8 @@ impl VmSpace {
             }
         }
         let mapping = pages.get_mut(&page);
+        #[cfg(feature = "performance-profile")]
+        drop(page_lookup_profile);
         if let Some(mapping) = mapping {
             #[cfg(feature = "performance-profile")]
             if let Some(backing) = hardware_fault_backing {
@@ -3475,6 +3486,9 @@ impl VmSpace {
         if let Some(backing) = hardware_fault_backing {
             record_hardware_user_fault(backing, hardware_fault_access, false);
         }
+        #[cfg(feature = "performance-profile")]
+        let _nonresident_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultNonresident));
 
         #[cfg(feature = "performance-profile")]
         if allow_fault_around
@@ -5359,6 +5373,8 @@ fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno>
         let virt = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EINVAL)?;
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyCow).bytes(page_size());
         // Safety: 源页由 ResidentPage 的 Arc 保活；目标页是未发布的独占分配，
         // 两个物理页不重叠，且复制长度恰好等于页大小。
         unsafe {
@@ -5473,6 +5489,8 @@ fn alloc_zeroed_user_page() -> Option<usize> {
         free_user_page(paddr);
         return None;
     };
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(page_size());
     // Safety: 分配器保证该页至少覆盖 `page_size()` 字节，且当前没有映射发布。
     unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, page_size()) };
     Some(paddr)
@@ -5527,6 +5545,8 @@ fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
         free_user_page(paddr);
         return None;
     };
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(size);
     // Safety: `try_alloc_user_page` 返回独占且尚未发布的完整物理页。
     unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, size) };
     Some(paddr)
