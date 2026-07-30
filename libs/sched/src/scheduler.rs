@@ -2847,7 +2847,9 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
 fn targeted_handoff_is_valid(target: &HandoffTarget, cpu_id: usize) -> bool {
     let reason_valid = matches!(
         (target.reason, target.woke_from_sleep),
-        (HandoffReason::SocketRead, true) | (HandoffReason::SocketReadContinuation, false)
+        (HandoffReason::SocketRead, true)
+            | (HandoffReason::SocketReadContinuation, false)
+            | (HandoffReason::FutexWake, true)
     );
     target.request_generation != 0
         && reason_valid

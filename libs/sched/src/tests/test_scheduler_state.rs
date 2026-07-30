@@ -97,6 +97,23 @@ fn scheduler_state_keeps_socket_consumer_continuation_identity() {
 }
 
 #[ktest]
+fn scheduler_state_keeps_futex_wakeup_identity() {
+    let core = Scheduler::new();
+    let cpu1 = core.cpu(1).expect("cpu1 state");
+    let task = make_task();
+    let target = HandoffTarget::new(Arc::clone(&task), 1, HandoffReason::FutexWake, true);
+
+    cpu1.request_targeted_handoff(target);
+
+    let (rounds, pending) = cpu1.take_post_syscall_handoff();
+    let pending = pending.expect("futex 交接目标应保留");
+    assert_eq!(rounds, 0);
+    assert!(Arc::ptr_eq(&pending.task, &task));
+    assert_eq!(pending.reason, HandoffReason::FutexWake);
+    assert!(pending.woke_from_sleep);
+}
+
+#[ktest]
 fn reschedule_notification_can_be_rearmed_after_interrupt_ack() {
     let scheduler = Scheduler::new();
     let cpu = scheduler.cpu(0).expect("boot cpu state");
