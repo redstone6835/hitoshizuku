@@ -162,8 +162,92 @@ impl AllocationRegistryAuditFlags {
 
 #[derive(Clone, Copy)]
 struct RegistryNode {
-    record: AllocationRecord,
+    record: StoredAllocationRecord,
     next: usize,
+}
+
+/// registry 内部的紧凑分配记录。
+///
+/// `AllocationRecord` 为公开接口保留了易用的 `Option<usize>` 和完整 `usize` 字段，
+/// 直接嵌入链表节点会让每个节点达到 104 字节。allocator 产生的对齐和页尺寸都必然
+/// 是 2 的幂，order 也受 buddy 上限约束，因此内部只保存它们的指数和窄 order；
+/// 读取记录时再无损还原公开结构。这样不改变 registry 的查询、审计和错误语义，同时
+/// 显著减少注册、删除时触碰的 metadata cache line 数量。
+#[derive(Clone, Copy)]
+struct StoredAllocationRecord {
+    ptr: usize,
+    paddr: usize,
+    size: usize,
+    usable_size: usize,
+    accounting_owner: u64,
+    backend_cookie: usize,
+    kind: AllocationKind,
+    domain: MemoryDomain,
+    arena: Option<crate::request::AllocationArena>,
+    has_paddr: bool,
+    align_log2: u8,
+    order: u8,
+    page_size_log2: u8,
+}
+
+impl StoredAllocationRecord {
+    fn try_from_record(record: AllocationRecord) -> Result<Self, RegistryError> {
+        if record.ptr == 0 || !record.align.is_power_of_two() || !record.page_size.is_power_of_two()
+        {
+            return Err(RegistryError::InvalidRecord);
+        }
+        let order = u8::try_from(record.order).map_err(|_| RegistryError::InvalidRecord)?;
+        Ok(Self {
+            ptr: record.ptr,
+            paddr: record.paddr.unwrap_or(0),
+            size: record.size,
+            usable_size: record.usable_size,
+            accounting_owner: record.accounting_owner(),
+            backend_cookie: record.backend_cookie,
+            kind: record.kind,
+            domain: record.domain,
+            arena: record.arena,
+            has_paddr: record.paddr.is_some(),
+            align_log2: record.align.trailing_zeros() as u8,
+            order,
+            page_size_log2: record.page_size.trailing_zeros() as u8,
+        })
+    }
+
+    fn into_record(self) -> AllocationRecord {
+        let align = 1usize << self.align_log2;
+        let page_size = 1usize << self.page_size_log2;
+        let mut record = AllocationRecord::new(self.kind, self.domain, self.ptr)
+            .with_sizes(self.size, self.usable_size, align)
+            .with_accounting_owner(self.accounting_owner)
+            .with_backend_cookie(self.backend_cookie);
+        record.arena = self.arena;
+        if self.has_paddr {
+            record = record.with_physical(self.paddr, self.order as usize, page_size);
+        } else {
+            record.order = self.order as usize;
+            record.page_size = page_size;
+        }
+        record
+    }
+
+    const fn empty() -> Self {
+        Self {
+            ptr: 0,
+            paddr: 0,
+            size: 0,
+            usable_size: 0,
+            accounting_owner: 0,
+            backend_cookie: 0,
+            kind: AllocationKind::Boot,
+            domain: MemoryDomain::Kernel,
+            arena: None,
+            has_paddr: false,
+            align_log2: 0,
+            order: 0,
+            page_size_log2: crate::buddy::PAGE_SIZE.trailing_zeros() as u8,
+        }
+    }
 }
 
 struct AllocationRegistryInner {
@@ -347,6 +431,13 @@ impl AllocationRegistry {
 
         let hash = hash_ptr(record.ptr);
         let shard = self.shard_for_hash(hash);
+        let stored = match StoredAllocationRecord::try_from_record(record) {
+            Ok(stored) => stored,
+            Err(err) => {
+                shard.inner.lock().insert_failures += 1;
+                return Err(err);
+            }
+        };
         let mut pending_nodes = 0usize;
         let mut pending_node_count = 0usize;
         let mut pending_refill_count = 0usize;
@@ -411,7 +502,13 @@ impl AllocationRegistry {
                 recycle_node_list_locked(&mut inner, pending_nodes, pending_node_count);
             }
 
-            write_node(node_addr, RegistryNode { record, next: head });
+            write_node(
+                node_addr,
+                RegistryNode {
+                    record: stored,
+                    next: head,
+                },
+            );
             set_bucket_head(&inner, bucket, node_addr);
             if head != 0 {
                 inner.collisions += 1;
@@ -452,7 +549,7 @@ impl AllocationRegistry {
                         return None;
                     }
                     let node = read_node(current);
-                    let record = node.record;
+                    let record = node.record.into_record();
                     let usable = record.usable_size.max(record.size);
                     if usable != 0
                         && record
@@ -625,7 +722,14 @@ impl AllocationRegistry {
                     decrement_live_kind_locked(&mut inner, kind_index(old_record.kind));
                     inner.live_by_kind[kind_index(new_record.kind)] += 1;
                 }
-                write_node_record(current, new_record);
+                let stored = match StoredAllocationRecord::try_from_record(new_record) {
+                    Ok(stored) => stored,
+                    Err(err) => {
+                        inner.insert_failures += 1;
+                        return Err(err);
+                    }
+                };
+                write_node_record(current, stored);
                 return Ok((new_record, true));
             }
             current = next;
@@ -741,7 +845,7 @@ impl AllocationRegistry {
                         break;
                     }
                     let node = read_node(current);
-                    let record = node.record;
+                    let record = node.record.into_record();
                     if record.accounting_owner() == owner {
                         out.records = out.records.saturating_add(1);
                         out.requested_bytes = out.requested_bytes.saturating_add(record.size);
@@ -986,7 +1090,7 @@ fn alloc_node_batch() -> Option<(usize, usize)> {
         write_node(
             addr,
             RegistryNode {
-                record: AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, 0),
+                record: StoredAllocationRecord::empty(),
                 next: head,
             },
         );
@@ -1106,7 +1210,11 @@ fn read_node_next(addr: usize) -> usize {
 
 #[inline]
 fn read_node_record(addr: usize) -> AllocationRecord {
-    unsafe { core::ptr::addr_of!((*(addr as *const RegistryNode)).record).read() }
+    unsafe {
+        core::ptr::addr_of!((*(addr as *const RegistryNode)).record)
+            .read()
+            .into_record()
+    }
 }
 
 #[inline]
@@ -1115,12 +1223,63 @@ fn write_node_next(addr: usize, next: usize) {
 }
 
 #[inline]
-fn write_node_record(addr: usize, record: AllocationRecord) {
-    unsafe { core::ptr::addr_of_mut!((*(addr as *mut RegistryNode)).record).write(record) }
+fn write_node_record(addr: usize, stored: StoredAllocationRecord) {
+    unsafe { core::ptr::addr_of_mut!((*(addr as *mut RegistryNode)).record).write(stored) }
 }
 
 fn write_node(addr: usize, node: RegistryNode) {
     unsafe {
         (addr as *mut RegistryNode).write(node);
+    }
+}
+
+#[cfg(feature = "ktest-kernel")]
+mod compact_record_tests {
+    use super::*;
+    use crate::request::AllocationArena;
+    use ktest::ktest;
+
+    #[ktest]
+    fn compact_record_round_trips_all_fields() {
+        let original = AllocationRecord::new(
+            AllocationKind::Large,
+            MemoryDomain::Kernel,
+            0xffff_8000_1234_0000,
+        )
+        .with_arena(AllocationArena::Kernel)
+        .with_physical(0x2345_0000, 9, 2 * 1024 * 1024)
+        .with_sizes(123_457, 2 * 1024 * 1024, 64 * 1024)
+        .with_accounting_owner(0x1234_5678_9abc_def0)
+        .with_backend_cookie(0x55aa_aa55);
+
+        let stored = StoredAllocationRecord::try_from_record(original).expect("compact record");
+        assert_eq!(stored.into_record(), original);
+    }
+
+    #[ktest]
+    fn compact_record_rejects_noncanonical_layout() {
+        let bad_align = AllocationRecord::new(AllocationKind::Small, MemoryDomain::Kernel, 1)
+            .with_sizes(8, 8, 3);
+        assert!(matches!(
+            StoredAllocationRecord::try_from_record(bad_align),
+            Err(RegistryError::InvalidRecord)
+        ));
+
+        let mut bad_page =
+            AllocationRecord::new(AllocationKind::Physical, MemoryDomain::Physical, 2);
+        bad_page.page_size = 0;
+        assert!(matches!(
+            StoredAllocationRecord::try_from_record(bad_page),
+            Err(RegistryError::InvalidRecord)
+        ));
+    }
+
+    #[ktest]
+    fn compact_node_fits_one_cache_line_on_supported_targets() {
+        assert!(core::mem::size_of::<RegistryNode>() <= 64);
+        assert!(
+            core::mem::size_of::<RegistryNode>()
+                < core::mem::size_of::<AllocationRecord>() + core::mem::size_of::<usize>()
+        );
     }
 }
