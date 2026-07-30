@@ -12,7 +12,6 @@
 //! 未注入 ops 时返回 `Kernel(NotInitialized)`——启动早期误调时不要隐式 SIGSEGV。
 
 use alloc::sync::Arc;
-use core::any::Any;
 
 use crate::TrapFramePtr;
 use crate::mm::ops::{fault_decode_ops, user_pgd_ops};
@@ -119,8 +118,10 @@ fn current_task_vm_space() -> Option<Arc<VmSpace>> {
     if !sched::is_ready() {
         return None;
     }
-    let task = sched::current_task();
-    let payload: Arc<dyn Any + Send + Sync> = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    // 当前任务 raw 槽由调度器持有强引用；这里只在取得 VmSpace Arc 前短暂借用，
+    // 不跨越可能阻塞或调度的缺页处理过程。
+    let task = sched::current_task_ref();
+    let payload = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
 

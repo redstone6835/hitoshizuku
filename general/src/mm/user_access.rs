@@ -13,7 +13,6 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::any::Any;
 
 use mm::UserAccessError;
 
@@ -120,7 +119,9 @@ fn current_task_vm_space() -> Option<Arc<VmSpace>> {
     if !sched::is_ready() {
         return None;
     }
-    let task = sched::current_task();
-    let payload: Arc<dyn Any + Send + Sync> = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    // 只在复制 VmSpace Arc 前借用 current raw 槽，避免用户复制热路径为 Task
+    // 额外获取 owning current 锁和增减一次强引用。
+    let task = sched::current_task_ref();
+    let payload = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
