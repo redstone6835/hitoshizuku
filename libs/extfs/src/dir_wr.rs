@@ -154,10 +154,9 @@ fn write_entry(
     rec_len: u16,
     new_ino: u32,
     file_type: u8,
-    name: &str,
+    name_bytes: &[u8],
     has_filetype: bool,
 ) {
-    let name_bytes = name.as_bytes();
     dst.fill(0);
     dst[0..4].copy_from_slice(&new_ino.to_le_bytes());
     dst[4..6].copy_from_slice(&rec_len.to_le_bytes());
@@ -183,7 +182,7 @@ fn try_insert_in_block(
     data_end: usize,
     new_ino: u32,
     file_type: u8,
-    name: &str,
+    name: &[u8],
     has_filetype: bool,
 ) -> bool {
     let need = needed(name.len());
@@ -258,6 +257,32 @@ pub(crate) fn insert_entry(
     file_type: u8,
     name: &str,
 ) -> Result<u64, BlockBackendError> {
+    insert_entry_bytes(
+        state,
+        dir_ino,
+        dir_generation,
+        i_block,
+        flags,
+        size,
+        ino,
+        file_type,
+        name.as_bytes(),
+    )
+}
+
+/// 字节级 [`insert_entry`]:fast-commit 回放按日志原始字节写文件名。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_entry_bytes(
+    state: &FsState,
+    dir_ino: u32,
+    dir_generation: u32,
+    i_block: &mut [u8],
+    flags: &mut u32,
+    size: u64,
+    ino: u32,
+    file_type: u8,
+    name: &[u8],
+) -> Result<u64, BlockBackendError> {
     demote_indexed_directory(state, dir_ino, dir_generation, i_block, flags)?;
     let bs = state.ext_sb.block_size as usize;
     let total_blocks = (size + bs as u64 - 1) / bs as u64;
@@ -319,6 +344,27 @@ pub(crate) fn remove_entry(
     size: u64,
     name: &str,
 ) -> Result<bool, BlockBackendError> {
+    remove_entry_bytes(
+        state,
+        dir_ino,
+        dir_generation,
+        i_block,
+        flags,
+        size,
+        name.as_bytes(),
+    )
+}
+
+/// 字节级 [`remove_entry`]:fast-commit 回放按日志原始字节匹配文件名。
+pub(crate) fn remove_entry_bytes(
+    state: &FsState,
+    dir_ino: u32,
+    dir_generation: u32,
+    i_block: &[u8],
+    flags: &mut u32,
+    size: u64,
+    name: &[u8],
+) -> Result<bool, BlockBackendError> {
     demote_indexed_directory(state, dir_ino, dir_generation, i_block, flags)?;
     let bs = state.ext_sb.block_size as usize;
     let total_blocks = (size + bs as u64 - 1) / bs as u64;
@@ -341,7 +387,7 @@ pub(crate) fn remove_entry(
     Ok(false)
 }
 
-fn remove_in_block(block: &mut [u8], data_end: usize, name: &str, has_filetype: bool) -> bool {
+fn remove_in_block(block: &mut [u8], data_end: usize, name: &[u8], has_filetype: bool) -> bool {
     let mut off = 0usize;
     let mut prev: Option<usize> = None;
     while off + 8 <= data_end {
@@ -357,7 +403,7 @@ fn remove_in_block(block: &mut [u8], data_end: usize, name: &str, has_filetype: 
         }
         if ino != 0 && name_len == name.len() {
             let n = &block[off + 8..off + 8 + name_len];
-            if n == name.as_bytes() {
+            if n == name {
                 // 两种删法:若有 prev,把 prev 的 rec_len 加上本条;否则把 ino=0 置空
                 if let Some(p) = prev {
                     let prev_rec = u16::from_le_bytes([block[p + 4], block[p + 5]]) as usize;

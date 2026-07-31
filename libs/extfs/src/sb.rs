@@ -20,12 +20,16 @@ pub(crate) struct Superblock {
     pub blocks_count: u64,
     pub first_data_block: u32,
     pub block_size: u32,
+    /// s_log_cluster_size:BIGALLOC 时分配单元 = block_size << log_cluster_size。
+    pub log_cluster_size: u32,
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u32,
     pub desc_size: u32, // 块组描述符大小:32 或 64
     pub first_ino: u32,
     pub s_magic: u16,
+    /// s_state(挂载时快照;VALID_FS/ERROR_FS 管理见 alloc_mod)。
+    pub state: u16,
 
     pub feature_compat: u32,
     pub feature_incompat: u32,
@@ -46,9 +50,25 @@ pub(crate) struct Superblock {
     pub reserved_blocks_count: u64,
     pub free_inodes_count: u32,
 
-    /// ext4 orphan_file inode 号。当前写路径不维护 orphan_file,
-    /// 可写挂载时会把它占用的资源释放并清掉 superblock 指针。
+    /// ext4 orphan_file inode 号(COMPAT_ORPHAN_FILE 时有效)。
     pub orphan_file_inum: u32,
+    /// s_journal_inum:内部日志 inode 号(通常为 [`EXT4_JOURNAL_INO`])。
+    pub journal_inum: u32,
+    /// s_journal_dev:外部日志设备号(非 0 表示外部日志,本驱动不支持)。
+    pub journal_dev: u32,
+    /// s_last_orphan:旧式孤儿 inode 链表头。
+    pub last_orphan: u32,
+
+    /// casefold 文件名编码(s_encoding),非 casefold 文件系统为 0。
+    pub encoding: u16,
+
+    /// MMP 块位置与检查间隔(s_mmp_block / s_mmp_update_interval)。
+    pub mmp_block: u64,
+    pub mmp_update_interval: u16,
+
+    /// 因 ro_compat 语义必须退化为只读挂载(READONLY/BIGALLOC/
+    /// HAS_SNAPSHOT/SHARED_BLOCKS 或未知 ro_compat 位)。
+    pub force_read_only: bool,
 
     /// 总块组数。
     pub groups_count: u32,
@@ -76,6 +96,18 @@ fn le16(b: &[u8], off: usize) -> u16 {
 }
 fn le32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn le64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
 }
 
 fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
@@ -145,41 +177,70 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
         ExtKind::Ext2
     };
 
-    // 拒绝:未回放的日志要求先 clean umount / fsck
-    if feature_incompat & INCOMPAT_RECOVER != 0 {
-        return Err(BlockBackendError::OutOfRange);
-    }
-    // 日志设备本身不是文件系统
+    // 日志设备本身不是文件系统,永远拒绝。
     if feature_incompat & INCOMPAT_JOURNAL_DEV != 0 {
         return Err(BlockBackendError::OutOfRange);
     }
-    // 我们不支持的 incompat 位
-    const UNSUPPORTED_INCOMPAT: u32 = INCOMPAT_COMPRESSION
-        | INCOMPAT_META_BG
-        | INCOMPAT_MMP
-        | INCOMPAT_ENCRYPT
-        | INCOMPAT_CASEFOLD
-        | INCOMPAT_DIRDATA
-        | INCOMPAT_LARGEDIR;
+    // 连 Linux 也未实现的位(COMPRESSION/DIRDATA 是历史占位),
+    // 以及已被 64BIT/FLEX_BG 取代的 META_BG:与 Linux 一样无法处理,拒绝。
+    const UNSUPPORTED_INCOMPAT: u32 = INCOMPAT_COMPRESSION | INCOMPAT_META_BG | INCOMPAT_DIRDATA;
     if feature_incompat & UNSUPPORTED_INCOMPAT != 0 {
         return Err(BlockBackendError::Unsupported);
     }
-    // 支持位白名单:任何超出的位一律拒绝
+    // 支持位白名单:任何超出的位一律拒绝。
+    //
+    // - RECOVER:挂载时回放日志(见 [`crate::journal`]);
+    // - MMP:挂载时做 CLEAN 序列检查(见 state 模块);
+    // - ENCRYPT:可挂载,访问加密 inode 时再报错(与无密钥 Linux 一致);
+    // - CASEFOLD:可挂载,带 CASEFOLD 标志目录按 ASCII 大小写不敏感匹配
+    //   (完整 Unicode casefold 未实现);
+    // - LARGEDIR:读路径为线性扫描,天然兼容。
     const SUPPORTED_INCOMPAT: u32 = INCOMPAT_FILETYPE
+        | INCOMPAT_RECOVER
         | INCOMPAT_EXTENTS
         | INCOMPAT_64BIT
+        | INCOMPAT_MMP
         | INCOMPAT_FLEX_BG
         | INCOMPAT_EA_INODE
+        | INCOMPAT_CSUM_SEED
+        | INCOMPAT_LARGEDIR
         | INCOMPAT_INLINE_DATA
-        | INCOMPAT_CSUM_SEED;
-    if feature_incompat & !SUPPORTED_INCOMPAT != 0 && feature_incompat & UNSUPPORTED_INCOMPAT == 0 {
-        // 存在我们既不支持也不显式拒绝的位,保守拒绝
+        | INCOMPAT_ENCRYPT
+        | INCOMPAT_CASEFOLD;
+    if feature_incompat & !SUPPORTED_INCOMPAT != 0 {
         return Err(BlockBackendError::Unsupported);
     }
 
+    // ro_compat 门禁(对齐 Linux 语义):
+    // - 已知且只读/读写都安全:SPARSE_SUPER/LARGE_FILE/HUGE_FILE/GDT_CSUM/
+    //   DIR_NLINK/EXTRA_ISIZE/QUOTA/METADATA_CSUM/PROJECT/VERITY/ORPHAN_PRESENT;
+    // - 只允许只读挂载的语义位:READONLY/BIGALLOC(簇分配写路径不支持)/
+    //   HAS_SNAPSHOT(快照由外部维护)/SHARED_BLOCKS(共享块不可写);
+    // - 未知位:Linux 拒绝读写挂载,我们退化为只读。
+    const KNOWN_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
+        | RO_COMPAT_LARGE_FILE
+        | RO_COMPAT_BTREE_DIR
+        | RO_COMPAT_HUGE_FILE
+        | RO_COMPAT_GDT_CSUM
+        | RO_COMPAT_DIR_NLINK
+        | RO_COMPAT_EXTRA_ISIZE
+        | RO_COMPAT_HAS_SNAPSHOT
+        | RO_COMPAT_QUOTA
+        | RO_COMPAT_BIGALLOC
+        | RO_COMPAT_METADATA_CSUM
+        | RO_COMPAT_READONLY
+        | RO_COMPAT_PROJECT
+        | RO_COMPAT_SHARED_BLOCKS
+        | RO_COMPAT_VERITY
+        | RO_COMPAT_ORPHAN_PRESENT;
+    const FORCE_RO_COMPAT: u32 =
+        RO_COMPAT_READONLY | RO_COMPAT_BIGALLOC | RO_COMPAT_HAS_SNAPSHOT | RO_COMPAT_SHARED_BLOCKS;
+    let force_read_only =
+        feature_ro_compat & FORCE_RO_COMPAT != 0 || feature_ro_compat & !KNOWN_RO_COMPAT != 0;
+
     let metadata_csum = feature_ro_compat & RO_COMPAT_METADATA_CSUM != 0;
     let csum_seed = if feature_incompat & INCOMPAT_CSUM_SEED != 0 {
-        le32(sb, 0x270)
+        le32(sb, sb_off::CHECKSUM_SEED)
     } else if metadata_csum {
         crc::crc32c(&uuid)
     } else {
@@ -219,7 +280,14 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
     let reserved_blocks_count = ((reserved_blocks_hi as u64) << 32) | reserved_blocks_lo as u64;
     let free_blocks_count = ((free_blocks_hi as u64) << 32) | free_blocks_lo as u64;
     let free_inodes_count = le32(sb, 16);
-    let orphan_file_inum = le32(sb, 0x280);
+    let orphan_file_inum = le32(sb, sb_off::ORPHAN_FILE_INUM);
+    let journal_inum = le32(sb, sb_off::JOURNAL_INUM);
+    let journal_dev = le32(sb, sb_off::JOURNAL_DEV);
+    let last_orphan = le32(sb, sb_off::LAST_ORPHAN);
+    let encoding = le16(sb, sb_off::ENCODING);
+    let mmp_block = le64(sb, sb_off::MMP_BLOCK);
+    let mmp_update_interval = le16(sb, sb_off::MMP_UPDATE_INTERVAL);
+    let state = le16(sb, sb_off::STATE);
 
     Ok(Superblock {
         kind,
@@ -227,12 +295,14 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
         blocks_count,
         first_data_block,
         block_size,
+        log_cluster_size: le32(sb, 0x1c),
         blocks_per_group,
         inodes_per_group,
         inode_size,
         desc_size,
         first_ino,
         s_magic: magic,
+        state,
         feature_compat,
         feature_incompat,
         feature_ro_compat,
@@ -244,6 +314,13 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
         reserved_blocks_count,
         free_inodes_count,
         orphan_file_inum,
+        journal_inum,
+        journal_dev,
+        last_orphan,
+        encoding,
+        mmp_block,
+        mmp_update_interval,
+        force_read_only,
         groups_count,
     })
 }

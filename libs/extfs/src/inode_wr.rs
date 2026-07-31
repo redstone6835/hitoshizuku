@@ -82,6 +82,15 @@ impl RawInode {
     pub fn set_dtime(&mut self, v: u32) {
         self.bytes[20..24].copy_from_slice(&v.to_le_bytes());
     }
+    /// i_dtime:删除时间;旧式孤儿链表用它存放下一个孤儿 inode 号。
+    pub fn dtime(&self) -> u32 {
+        u32::from_le_bytes([
+            self.bytes[20],
+            self.bytes[21],
+            self.bytes[22],
+            self.bytes[23],
+        ])
+    }
     #[allow(dead_code)]
     pub fn uid(&self) -> u32 {
         let lo = u16::from_le_bytes([self.bytes[2], self.bytes[3]]) as u32;

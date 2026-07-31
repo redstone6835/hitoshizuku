@@ -12,11 +12,13 @@ use crate::state::{BlockBackendError, FsState};
 /// 读取一个符号链接的目标。
 ///
 /// `size` 是 i_size,`i_block` 是 60 字节 i_block 区。
+/// `csum_ctx = Some((ino, generation))` 时对 extent 节点块做 METADATA_CSUM 校验。
 pub(crate) fn read_link(
     state: &FsState,
     flags: u32,
     size: u64,
     i_block: &[u8],
+    csum_ctx: Option<(u32, u32)>,
 ) -> Result<String, BlockBackendError> {
     if size == 0 {
         return Ok(String::new());
@@ -31,7 +33,7 @@ pub(crate) fn read_link(
     let mut buf = vec![0u8; (total_blocks * block_size) as usize];
     for lb in 0..total_blocks {
         let phys = if flags & crate::layout::EXT4_EXTENTS_FL != 0 {
-            crate::extent::map_block(state, i_block, lb as u32)?
+            crate::extent::map_block(state, i_block, lb as u32, csum_ctx)?
         } else {
             crate::map::map_block(state, i_block, lb as u32)?
         };

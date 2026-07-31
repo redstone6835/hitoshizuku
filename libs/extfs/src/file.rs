@@ -23,7 +23,8 @@ use vfs::sync::Spinlock;
 
 use crate::inode_wr::RawInode;
 use crate::layout::{
-    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EXT4_INLINE_DATA_FL,
+    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EXT4_ENCRYPT_FL, EXT4_INLINE_DATA_FL,
+    EXT4_VERITY_FL,
 };
 use crate::map_wr::BlockAllocState;
 use crate::state::{FsState, map_err};
@@ -49,14 +50,16 @@ pub struct ExtDirFileOps {
 
 impl ExtDirFileOps {
     /// 生成打开目录时的快照:file_type 为 DT_UNKNOWN 时按目标 inode 的 i_mode 回填。
+    /// `csum_ctx = Some((ino, generation))` 时对目录叶块做 METADATA_CSUM 校验。
     pub(crate) fn new_with_state(
         state: &FsState,
         i_block: &[u8],
         flags: u32,
         size: u64,
+        csum_ctx: Option<(u32, u32)>,
     ) -> VfsResult<Self> {
         let mut snapshot = Vec::new();
-        crate::dir::visit_entries(state, i_block, flags, size, |e| {
+        crate::dir::visit_entries(state, i_block, flags, size, csum_ctx, |e| {
             let kind = match e.file_type {
                 DT_REG => FileType::Regular,
                 DT_DIR => FileType::Directory,
@@ -223,6 +226,14 @@ impl ExtRegFileOps {
         Self::new(state, sb, ino, raw, mapping_generation)
     }
 
+    /// extent 尾校验上下文:(ino, i_generation)。
+    #[inline]
+    fn csum_ctx(&self) -> Option<(u32, u32)> {
+        let generation = lock_raw(&self.raw).generation();
+        Some((self.ino, generation))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn map_ranges(
         &self,
         flags: u32,
@@ -231,6 +242,7 @@ impl ExtRegFileOps {
         generation: u64,
         first_lb: u32,
         lb_count: u32,
+        csum_ctx: Option<(u32, u32)>,
     ) -> Result<BlockRanges, crate::state::BlockBackendError> {
         if lb_count == 0 {
             return Ok(BlockRanges::new());
@@ -258,7 +270,7 @@ impl ExtRegFileOps {
             (first_lb, lb_count)
         };
         let mapped = if flags & crate::layout::EXT4_EXTENTS_FL != 0 {
-            crate::extent::map_contiguous(&self.state, i_block, map_start, map_count)?
+            crate::extent::map_contiguous(&self.state, i_block, map_start, map_count, csum_ctx)?
         } else {
             crate::map::map_contiguous(&self.state, i_block, map_start, map_count)?
         };
@@ -381,6 +393,10 @@ impl FileOps for ExtRegFileOps {
                 self.mapping_generation.load(Ordering::Acquire),
             )
         };
+        // fscrypt:无密钥时内容不可读(与 Linux 无密钥访问一致,报 EOPNOTSUPP)。
+        if flags & EXT4_ENCRYPT_FL != 0 {
+            return Err(VfsError::NotSupported);
+        }
         if offset >= size || buf.is_empty() {
             return Ok(0);
         }
@@ -430,6 +446,7 @@ impl FileOps for ExtRegFileOps {
                 mapping_generation,
                 first_lb,
                 map_lb_count,
+                self.csum_ctx(),
             )
             .map_err(map_err)?;
 
@@ -517,6 +534,7 @@ impl FileOps for ExtRegFileOps {
                 mapping_generation,
                 first_lb,
                 requested_blocks,
+                self.csum_ctx(),
             )
             .map_err(map_err)?;
 
@@ -587,6 +605,16 @@ impl FileOps for ExtRegFileOps {
         let _io = self.io_mu.lock();
         {
             let mut raw_guard = lock_raw(&self.raw);
+            {
+                let flags = raw_guard.flags();
+                // fscrypt:无密钥不可写;fs-verity:已启用校验的文件不可变(EROFS)。
+                if flags & EXT4_ENCRYPT_FL != 0 {
+                    return Err(VfsError::NotSupported);
+                }
+                if flags & EXT4_VERITY_FL != 0 {
+                    return Err(VfsError::ReadOnlyFilesystem);
+                }
+            }
             let old_size = raw_guard.size();
             let start = if offset == u64::MAX { old_size } else { offset };
             let end = start
@@ -804,7 +832,7 @@ impl FileOps for ExtRegFileOps {
             // 版本化 writeback；真正的 block I/O 在释放 raw Spinlock 后进行。
             self.state.stage_inode_write(&raw_guard);
             if let Some(inode) = self.sb.find_inode(self.ino as u64) {
-                sync_vfs_meta(&inode, &raw_guard);
+                sync_vfs_meta(&self.state, &inode, &raw_guard);
             }
 
             drop(raw_guard);
@@ -847,8 +875,9 @@ pub(crate) fn symlink_target(
     flags: u32,
     size: u64,
     i_block: &[u8],
+    csum_ctx: Option<(u32, u32)>,
 ) -> VfsResult<String> {
-    crate::symlink::read_link(state, flags, size, i_block).map_err(map_err)
+    crate::symlink::read_link(state, flags, size, i_block, csum_ctx).map_err(map_err)
 }
 
 /// 统一入口:根据 flags 选择 extent 原地追加或 indirect 分配。
