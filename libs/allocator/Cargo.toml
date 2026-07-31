@@ -11,10 +11,11 @@ bench = false
 [features]
 ktest-kernel = ["ktest/kernel"]
 track-allocations = []
-performance-profile = []
+performance-profile = ["dep:profiling"]
 
 [dependencies]
 log = { path = "../log" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 ktest = { path = "../ktest", optional = true }
 kernel-symbols = { path = "../kernel-symbols" }
+profiling = { path = "../profiling", optional = true }

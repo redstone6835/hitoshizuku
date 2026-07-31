@@ -50,7 +50,11 @@ EVENT_NAMES = [
     "process_exec", "process_wait", "runqueue_latency", "urgent_spin_check",
     "urgent_pending_hit", "urgent_service", "slab_cache_hit", "slab_cache_miss",
     "slab_refill", "slab_flush", "slab_slow_path", "mm_protect_noop",
-    "mm_protect_batch",
+    "mm_protect_batch", "page_fault_decode", "page_fault_task_lookup",
+    "page_fault_vma_lookup", "page_fault_page_lookup", "page_fault_nonresident",
+    "mem_zero_anon_page", "mem_zero_allocator_small", "mem_zero_allocator_large",
+    "mem_copy_realloc", "mem_copy_cow", "alloc_registry_register",
+    "alloc_registry_remove", "alloc_registry_lookup",
 ]
 
 

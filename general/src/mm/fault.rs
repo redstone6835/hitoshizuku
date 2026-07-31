@@ -12,7 +12,6 @@
 //! 未注入 ops 时返回 `Kernel(NotInitialized)`——启动早期误调时不要隐式 SIGSEGV。
 
 use alloc::sync::Arc;
-use core::any::Any;
 
 use crate::TrapFramePtr;
 use crate::mm::ops::{fault_decode_ops, user_pgd_ops};
@@ -68,9 +67,13 @@ pub fn dispatch_page_fault(tf: TrapFramePtr) -> FaultOutcome {
         return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
     };
 
+    #[cfg(feature = "performance-profile")]
+    let decode_profile = profiling::scope(profiling::Event::PageFaultDecode);
     let from_user = (decoder.fault_from_user)(tf);
     let addr = (decoder.fault_addr)(tf);
     let kind = (decoder.fault_kind)(tf);
+    #[cfg(feature = "performance-profile")]
+    drop(decode_profile);
     #[cfg(feature = "performance-profile")]
     profile.set_trace_args(
         addr as u64,
@@ -116,11 +119,15 @@ const fn profile_fault_kind(kind: FaultKind) -> u64 {
 
 /// 从当前 task 的 ext 表里取 VmSpace 的 Arc。需要 sched 已就绪。
 fn current_task_vm_space() -> Option<Arc<VmSpace>> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::PageFaultTaskLookup);
     if !sched::is_ready() {
         return None;
     }
-    let task = sched::current_task();
-    let payload: Arc<dyn Any + Send + Sync> = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    // 当前任务 raw 槽由调度器持有强引用；这里只在取得 VmSpace Arc 前短暂借用，
+    // 不跨越可能阻塞或调度的缺页处理过程。
+    let task = sched::current_task_ref();
+    let payload = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
 

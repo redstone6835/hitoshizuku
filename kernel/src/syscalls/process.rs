@@ -2841,15 +2841,29 @@ fn futex_wake_key_inner(key: FutexKey, count: usize, bitset: u32, trace: bool) -
 
 fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> usize {
     let mut woken = 0usize;
+    let now_ns = sched::now_ns_public();
+    let local_cpu = sched::current_cpu_id();
+    let allow_handoff = sched::current_task_ref().execution_scope_kind()
+        == Some(sched::ExecutionScopeKind::Syscall);
+    let mut handoff = None;
     for (waiter, state) in waiters {
         match state.mark_woken() {
             FUTEX_WAIT_SLEEPING => {
                 if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
                     #[cfg(feature = "performance-profile")]
-                    waiter.mark_profile_woken(sched::now_ns_public());
-                    // futex 唤醒属于短等待热路径，优先让被唤醒者尽快继续执行，
-                    // 避免 join / condvar / mutex 反复多等一个时间片。
-                    sched::enqueue_task_preferred(waiter, sched::now_ns_public());
+                    waiter.mark_profile_woken(now_ns);
+                    // 只对首个同核等待者保存精确交接目标；其余等待者仍按既有
+                    // preferred runqueue 规则入队，避免一次 WAKE 批次反复覆盖目标。
+                    let target = sched::enqueue_task_preferred_for_handoff(
+                        waiter,
+                        now_ns,
+                        sched::HandoffReason::FutexWake,
+                        true,
+                        true,
+                    );
+                    if allow_handoff && handoff.is_none() && target.preferred_cpu() == local_cpu {
+                        handoff = Some(target);
+                    }
                 }
                 woken += 1;
             }
@@ -2864,6 +2878,9 @@ fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> 
             }
             _ => {}
         }
+    }
+    if let Some(target) = handoff {
+        sched::request_post_syscall_handoff_to(target);
     }
     woken
 }

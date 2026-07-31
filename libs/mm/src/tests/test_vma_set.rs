@@ -139,6 +139,91 @@ fn contains_range_false_partial() {
     assert!(!vmas.contains_range(&(0x2000..0x4000)));
 }
 
+/// 精确权限更新应原地完成，并与新权限兼容的相邻区域合并。
+#[ktest]
+fn protect_single_area_updates_exact_range() {
+    let mut vmas = VmaSet::new();
+    let read_only = VmFlags::from_bits(VmFlags::READ | VmFlags::USER);
+    let mut left = anon_area(0x1000, 0x2000);
+    left.flags = read_only;
+    let mut right = anon_area(0x2000, 0x3000);
+    right.flags = read_only;
+    vmas.insert(left).unwrap();
+    vmas.insert(anon_area(0x3000, 0x4000)).unwrap();
+    vmas.insert(right).unwrap();
+    assert_eq!(vmas.len(), 2);
+
+    assert_eq!(
+        vmas.protect_single_area(
+            &(0x3000..0x4000),
+            VmFlags::from_bits(VmFlags::READ | VmFlags::USER)
+        ),
+        Some(true)
+    );
+    assert_eq!(vmas.len(), 1);
+    assert_eq!(vmas.find(0x1800).unwrap().range, 0x1000..0x4000);
+}
+
+/// 单个 VMA 内的中间子区间应直接分裂，三段 backing 偏移保持连续。
+#[ktest]
+fn protect_single_area_splits_inner_range() {
+    let object = Arc::new(SharedAnonObject::new());
+    let mut vmas = VmaSet::new();
+    vmas.insert(shared_anon_area(0x1000, 0x5000, object, 0x8000))
+        .unwrap();
+    let read_only = VmFlags::from_bits(VmFlags::READ | VmFlags::USER | VmFlags::SHARED);
+
+    assert_eq!(
+        vmas.protect_single_area(&(0x2000..0x4000), read_only),
+        Some(true)
+    );
+    assert_eq!(vmas.len(), 3);
+    assert!(vmas.find(0x1800).unwrap().flags.has(VmFlags::WRITE));
+    assert!(!vmas.find(0x2800).unwrap().flags.has(VmFlags::WRITE));
+    assert!(vmas.find(0x4800).unwrap().flags.has(VmFlags::WRITE));
+    for (addr, expected_offset) in [(0x1000, 0x8000), (0x2000, 0x9000), (0x4000, 0xb000)] {
+        let VmBacking::SharedAnon { offset, .. } = vmas.find(addr).unwrap().backing else {
+            panic!("backing must be shared anonymous");
+        };
+        assert_eq!(offset, expected_offset);
+    }
+}
+
+/// 权限未变化时不应分裂 VMA，调用方可据返回值记录 no-op。
+#[ktest]
+fn protect_single_area_reports_unchanged_permissions() {
+    let mut vmas = VmaSet::new();
+    vmas.insert(anon_area(0x1000, 0x4000)).unwrap();
+    let flags = vmas.find(0x2000).unwrap().flags;
+
+    assert_eq!(
+        vmas.protect_single_area(&(0x2000..0x3000), flags),
+        Some(false)
+    );
+    assert_eq!(vmas.len(), 1);
+    assert_eq!(vmas.find(0x2000).unwrap().range, 0x1000..0x4000);
+}
+
+/// 跨越两个 VMA 时必须保持集合不变并回退通用路径。
+#[ktest]
+fn protect_single_area_rejects_multiple_areas() {
+    let mut vmas = VmaSet::new();
+    let mut right = anon_area(0x3000, 0x5000);
+    right.flags = VmFlags::from_bits(VmFlags::READ | VmFlags::USER);
+    vmas.insert(anon_area(0x1000, 0x3000)).unwrap();
+    vmas.insert(right).unwrap();
+
+    assert_eq!(
+        vmas.protect_single_area(
+            &(0x2000..0x4000),
+            VmFlags::from_bits(VmFlags::READ | VmFlags::USER)
+        ),
+        None
+    );
+    assert!(vmas.find(0x2000).unwrap().flags.has(VmFlags::WRITE));
+    assert!(!vmas.find(0x4000).unwrap().flags.has(VmFlags::WRITE));
+}
+
 /// insert 内部调用 merge_neighbors，相邻同标志匿名区自动合并为一条。
 #[ktest]
 fn merge_neighbors_compatible() {

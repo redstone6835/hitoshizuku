@@ -1920,6 +1920,8 @@ struct PreparedAnonPage {
     page: Arc<ResidentPage>,
 }
 
+type PreparedAnonPages = SmallVec<[PreparedAnonPage; ANON_STORE_FAULT_AROUND_PAGES]>;
+
 enum PreparedPrivateFileCacheRun {
     Cached(Arc<ResidentPage>),
     Batched(PrivateFilePageBatch),
@@ -2354,10 +2356,10 @@ impl AnonStoreFaultAround {
     /// 在 VMA/pages 锁外分配并清零候选页。
     ///
     /// 真实故障页分配失败保留 ENOMEM；投机邻页首次失败只缩短窗口。
-    fn prepare(&self) -> Result<Vec<PreparedAnonPage>, Errno> {
+    fn prepare(&self) -> Result<PreparedAnonPages, Errno> {
         let page_size = page_size();
         let requested = (self.end - self.fault_page) / page_size;
-        let mut prepared = Vec::new();
+        let mut prepared = PreparedAnonPages::new();
         // 元数据分配失败不应把一次可退化的优化升级为内核 fault；空前缀会让
         // 提交路径转回既有单页处理。
         if prepared.try_reserve_exact(requested).is_err() {
@@ -3051,10 +3053,22 @@ impl VmSpace {
         let mut touched = false;
         {
             let mut set = self.vmas.lock();
-            if !set.contains_range(&range) {
+            let single_area = set
+                .find(range.start)
+                .is_some_and(|area| range.end <= area.range.end);
+            if !single_area && !set.contains_range(&range) {
                 return Err(Errno::ENOMEM);
             }
-            if new_flags.has(VmFlags::WRITE) {
+            if new_flags.has(VmFlags::WRITE) && single_area {
+                let area = set
+                    .find(range.start)
+                    .expect("单 VMA 判定后区域必须仍然存在");
+                if area.flags.has(VmFlags::SHARED)
+                    && let VmBacking::File { file, .. } = &area.backing
+                {
+                    file.disable_private_page_cache();
+                }
+            } else if new_flags.has(VmFlags::WRITE) {
                 for area in set.iter_overlap(&range) {
                     if !area.flags.has(VmFlags::SHARED) {
                         continue;
@@ -3064,52 +3078,67 @@ impl VmSpace {
                     }
                 }
             }
-            set.protect_range(&range, new_flags.with(VmFlags::USER));
+            let protected_flags = new_flags.with(VmFlags::USER);
+            match set.protect_single_area(&range, protected_flags) {
+                Some(false) => {
+                    #[cfg(feature = "performance-profile")]
+                    profiling::record(
+                        profiling::Event::MmProtectNoop,
+                        0,
+                        range.end.saturating_sub(range.start) as u64,
+                        1,
+                    );
+                }
+                Some(true) => {}
+                None => {
+                    set.protect_range(&range, protected_flags);
+                }
+            }
 
             let mut pages = self.pages.lock();
-            // mprotect 会被动态链接器和 lmbench mmap/munmap 小测频繁调用。
-            // range 已按页对齐，直接逐页探测现有映射，避免先收集 key 到 Vec。
+            // 只遍历已经驻留的页，避免在动态链接器的大量稀疏 mprotect 范围中
+            // 对每个空洞页分别执行 VMA 与 BTreeMap 查找。
             let page_size = page_size();
-            let mut va = range.start;
-            while va < range.end {
+            let mut batch: Option<(usize, usize, PageAccess, VmFlags)> = None;
+            for (&va, mapping) in pages.range_mut(range.clone()) {
                 let Some(area) = set.find(va) else {
-                    va += page_size;
-                    continue;
-                };
-                let Some(mapping) = pages.get(&va) else {
-                    va += page_size;
                     continue;
                 };
                 let access = access_for_existing_page(area.flags, &mapping.page);
                 let flags = pte_flags_for(area.flags, access);
-                let mut batch_end = va + page_size;
-                while batch_end < range.end {
-                    let Some(next_area) = set.find(batch_end) else {
-                        break;
-                    };
-                    let Some(next_mapping) = pages.get(&batch_end) else {
-                        break;
-                    };
-                    let next_access = access_for_existing_page(next_area.flags, &next_mapping.page);
-                    if next_access != access || pte_flags_for(next_area.flags, next_access) != flags
-                    {
-                        break;
+                mapping.access = access;
+                if let Some((batch_start, batch_end, batch_access, batch_flags)) = batch {
+                    if va == batch_end && access == batch_access && flags == batch_flags {
+                        batch = Some((
+                            batch_start,
+                            batch_end + page_size,
+                            batch_access,
+                            batch_flags,
+                        ));
+                        continue;
                     }
-                    batch_end += page_size;
+                    self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
+                    #[cfg(feature = "performance-profile")]
+                    profiling::record(
+                        profiling::Event::MmProtectBatch,
+                        0,
+                        (batch_end - batch_start) as u64,
+                        ((batch_end - batch_start) / page_size) as u64,
+                    );
+                    touched = true;
                 }
-                self.protect_pages_no_flush(va, batch_end - va, flags)?;
+                batch = Some((va, va + page_size, access, flags));
+            }
+            if let Some((batch_start, batch_end, _, batch_flags)) = batch {
+                self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
                 #[cfg(feature = "performance-profile")]
                 profiling::record(
                     profiling::Event::MmProtectBatch,
                     0,
-                    (batch_end - va) as u64,
-                    ((batch_end - va) / page_size) as u64,
+                    (batch_end - batch_start) as u64,
+                    ((batch_end - batch_start) / page_size) as u64,
                 );
-                for (_, next_mapping) in pages.range_mut(va..batch_end) {
-                    next_mapping.access = access;
-                }
                 touched = true;
-                va = batch_end;
             }
         }
         if touched {
@@ -3354,8 +3383,14 @@ impl VmSpace {
             return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
         }
         let page = page_base(addr);
+        #[cfg(feature = "performance-profile")]
+        let vma_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultVmaLookup));
         let set = self.vmas.lock();
-        let Some(area) = set.find(page) else {
+        let area = set.find(page);
+        #[cfg(feature = "performance-profile")]
+        drop(vma_profile);
+        let Some(area) = area else {
             drop(set);
             let mut set = self.vmas.lock();
             let Some((_added, flags)) = set.grow_down_to(page, vm_layout().max_grows_down_bytes)
@@ -3413,13 +3448,25 @@ impl VmSpace {
         #[cfg(feature = "performance-profile")]
         let resident_profile =
             profile_phases.then(|| profiling::scope(profiling::Event::PageFaultResident));
+        #[cfg(feature = "performance-profile")]
+        let page_lookup_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultPageLookup));
         let mut pages = self.pages.lock();
-        let pte_present = user_pgd_ops()
-            .is_some_and(|ops| (unsafe { (ops.count_mapped)(self.pgd, page, page_size()) }) != 0);
-        if let Some(mapping) = pages.get_mut(&page) {
-            if !pte_present {
+        // resident ledger 与叶 PTE 在同一组 VMA/pages 锁内提交和撤销，正常路径不需要
+        // 再为每次硬件缺页遍历一次页表。调试构建保留一致性检查以捕获实现错误。
+        #[cfg(debug_assertions)]
+        {
+            let pte_present = user_pgd_ops().is_some_and(|ops| {
+                (unsafe { (ops.count_mapped)(self.pgd, page, page_size()) }) != 0
+            });
+            if pte_present != pages.contains_key(&page) {
                 return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
             }
+        }
+        let mapping = pages.get_mut(&page);
+        #[cfg(feature = "performance-profile")]
+        drop(page_lookup_profile);
+        if let Some(mapping) = mapping {
             #[cfg(feature = "performance-profile")]
             if let Some(backing) = hardware_fault_backing {
                 record_hardware_user_fault(backing, hardware_fault_access, true);
@@ -3428,9 +3475,6 @@ impl VmSpace {
             drop(pages);
             drop(set);
             return self.finish_resident_fault(page, update, publish_unchanged_mapping);
-        }
-        if pte_present {
-            return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
         }
         drop(pages);
         #[cfg(feature = "performance-profile")]
@@ -3442,6 +3486,9 @@ impl VmSpace {
         if let Some(backing) = hardware_fault_backing {
             record_hardware_user_fault(backing, hardware_fault_access, false);
         }
+        #[cfg(feature = "performance-profile")]
+        let _nonresident_profile =
+            profile_phases.then(|| profiling::scope(profiling::Event::PageFaultNonresident));
 
         #[cfg(feature = "performance-profile")]
         if allow_fault_around
@@ -4199,7 +4246,7 @@ impl VmSpace {
     fn commit_anon_store_fault_around(
         &self,
         plan: &AnonStoreFaultAround,
-        prepared: Vec<PreparedAnonPage>,
+        prepared: PreparedAnonPages,
     ) -> FaultAroundCommit {
         if prepared.is_empty() {
             return FaultAroundCommit::Retry;
@@ -4248,8 +4295,11 @@ impl VmSpace {
         let page_size = page_size();
         let mut pages = self.pages.lock();
         let fault_resident = pages.contains_key(&plan.fault_page);
-        let fault_present =
-            unsafe { (ops.count_mapped)(self.pgd, plan.fault_page, page_size) } != 0;
+        let fault_present = if cfg!(debug_assertions) {
+            (unsafe { (ops.count_mapped)(self.pgd, plan.fault_page, page_size) }) != 0
+        } else {
+            fault_resident
+        };
         if fault_resident != fault_present {
             #[cfg(feature = "performance-profile")]
             let discarded = prepared.len();
@@ -4280,14 +4330,17 @@ impl VmSpace {
             return FaultAroundCommit::Done(FaultOutcome::Fixed);
         }
 
-        // 对最多四页逐项闭合 resident 账本与真实叶 PTE。二者一致的首个已有
-        // 映射截断投机前缀；任何单边存在都表示生命周期不变量已破坏，必须
-        // fail-closed，不能让没有 Arc 保活的 PTE 继续访问。
+        // resident ledger 在 VMA/pages 锁内与叶 PTE 同步提交，发布构建据此截断
+        // 投机前缀，避免每页重复遍历页表。调试构建仍核对真实 PTE 以捕获不变量破坏。
         let mut prefix_len = 0usize;
         let mut invariant_failure = false;
         for candidate in &prepared {
             let resident = pages.contains_key(&candidate.vaddr);
-            let present = unsafe { (ops.count_mapped)(self.pgd, candidate.vaddr, page_size) } != 0;
+            let present = if cfg!(debug_assertions) {
+                (unsafe { (ops.count_mapped)(self.pgd, candidate.vaddr, page_size) }) != 0
+            } else {
+                resident
+            };
             if resident != present {
                 invariant_failure = true;
                 break;
@@ -4439,9 +4492,14 @@ impl VmSpace {
         }
 
         let mut pages = self.pages.lock();
-        let pte_present = user_pgd_ops().is_some_and(|ops| {
-            (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
-        });
+        let resident = pages.contains_key(&page_va);
+        let pte_present = if cfg!(debug_assertions) {
+            user_pgd_ops().is_some_and(|ops| {
+                (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
+            })
+        } else {
+            resident
+        };
         if let Some(mapping) = pages.get_mut(&page_va) {
             if !pte_present {
                 drop(pages);
@@ -5315,6 +5373,8 @@ fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno>
         let virt = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EINVAL)?;
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyCow).bytes(page_size());
         // Safety: 源页由 ResidentPage 的 Arc 保活；目标页是未发布的独占分配，
         // 两个物理页不重叠，且复制长度恰好等于页大小。
         unsafe {
@@ -5429,6 +5489,8 @@ fn alloc_zeroed_user_page() -> Option<usize> {
         free_user_page(paddr);
         return None;
     };
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(page_size());
     // Safety: 分配器保证该页至少覆盖 `page_size()` 字节，且当前没有映射发布。
     unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, page_size()) };
     Some(paddr)
@@ -5483,6 +5545,8 @@ fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
         free_user_page(paddr);
         return None;
     };
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(size);
     // Safety: `try_alloc_user_page` 返回独占且尚未发布的完整物理页。
     unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, size) };
     Some(paddr)

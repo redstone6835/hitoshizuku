@@ -716,6 +716,8 @@ run_profile() {
     case "$capture" in 0|1) ;; *) echo "profile runner: PROFILE_CAPTURE must be 0 or 1" >&2; exit 2 ;; esac
     event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
     valid_event_mask "$event_mask" || { echo "profile runner: invalid PROFILE_EVENT_MASK" >&2; exit 2; }
+    event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}
+    valid_event_mask "$event_mask_high" || { echo "profile runner: invalid PROFILE_EVENT_MASK_HIGH" >&2; exit 2; }
     sampling=${PROFILE_SAMPLING:-0}
     trace_enabled=${PROFILE_TRACE_ENABLED:-0}
     case "$sampling:$trace_enabled" in 0:0|0:1|1:0|1:1) ;; *) echo "profile runner: sampling and trace flags must be 0 or 1" >&2; exit 2 ;; esac
@@ -789,6 +791,7 @@ run_profile() {
     fi
 
     export PROFILE_EVENT_MASK=$event_mask
+    export PROFILE_EVENT_MASK_HIGH=$event_mask_high
     export PROFILE_SAMPLING=$sampling
     export PROFILE_TRACE_ENABLED=$trace_enabled
     export PROFILE_TIMING_SHIFT=$timing_shift

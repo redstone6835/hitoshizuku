@@ -125,7 +125,9 @@ def main() -> None:
         ]
         assert ANALYZER.EVENT_NAMES[81] == "mm_protect_noop"
         assert ANALYZER.EVENT_NAMES[82] == "mm_protect_batch"
-        assert len(ANALYZER.EVENT_NAMES) == 83
+        assert ANALYZER.EVENT_NAMES[83] == "page_fault_decode"
+        assert ANALYZER.EVENT_NAMES[95] == "alloc_registry_lookup"
+        assert len(ANALYZER.EVENT_NAMES) == 96
         assert profile["events"][0]["name"] == "vfs_lookup"
         assert profile["syscalls"][0]["phase"] == 4
         assert profile["samples"][0]["samples"] == 10
