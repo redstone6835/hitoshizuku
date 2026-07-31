@@ -1,7 +1,0 @@
-ELM-LOCK-V1
-module=net.virtio
-version=0.1.0
-mode=m
-cargo_elm=0.1.0
-rustc=rustc 1.89.0-nightly (60dabef95 2025-05-19)
-profile	riscv64gc-unknown-none-elf	contest-2026	1	af7abf5a4751edd14bb76cc4527c99558040caa3343048120bdfbd65ed00c896	ab23ee77aa012a42acb67b8d8d3515c157b86dd378ae3ffa4f0e2f1a9d69ac4d	f9cc414f7e6435f867332e8177adc017f498124282a42a3316ecf8ad99b0fca1	cd71b1898bee658056a929ae02e465cd7546cc35df4c87b6a78456c20d9bb7c3

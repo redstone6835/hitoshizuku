@@ -22,6 +22,8 @@ userland/rootfs-la/lib/elm/
 userland/rootfs-rv/lib/elm/
 drivers/*/.elm/
 drivers/*/dist/
+drivers/*/.cargo/
+drivers/*/Elm.lock
 tests/elm/*/.cargo/
 tests/elm/*/.elm/
 tests/elm/*/dist/
