@@ -128,6 +128,17 @@ impl Drop for UartTxGuard<'_> {
     }
 }
 
+/// 接收侧临界区守卫。见 [`Uart16550::rx_lock`]。
+struct UartRxGuard<'a> {
+    lock: &'a AtomicUsize,
+}
+
+impl Drop for UartRxGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.store(0, Ordering::Release);
+    }
+}
+
 // ─────────────────────────── Uart16550 ────────────────────────────────────
 
 /// NS16550A 兼容 UART 驱动（内存映射 I/O）。
@@ -140,6 +151,13 @@ pub struct Uart16550 {
     tx: UartTxBuffer,
     /// RX 等待队列。硬件中断只负责唤醒，真正读取和行规程仍在 VFS/TTY 路径完成。
     rx_wait: WaitQueue,
+    /// 接收侧串行化锁。
+    ///
+    /// 读 RBR 是**破坏性**操作：一次读就把字节从硬件 FIFO 弹出。多核下若两个
+    /// 读者同时看到 LSR.DR=1 并各自读 RBR，同一串输入会被拆散到两个调用者
+    /// 手里，且顺序不可控——串口上就表现为字符换位（例如 `/tmp/p/run.sh`
+    /// 变成 `/tm/pp/run.sh`），进而让宿主侧发下来的命令执行失败。
+    rx_lock: AtomicUsize,
 }
 
 // Safety: MMIO 寄存器允许跨执行上下文访问，软件发送状态由 `UartTxBuffer` 串行化，
@@ -160,6 +178,7 @@ impl Uart16550 {
             clock_hz: Some(clock_hz),
             tx: UartTxBuffer::new(),
             rx_wait: WaitQueue::new(),
+            rx_lock: AtomicUsize::new(0),
         };
         uart.init(clock_hz, baud);
         uart
@@ -176,6 +195,7 @@ impl Uart16550 {
             clock_hz: None,
             tx: UartTxBuffer::new(),
             rx_wait: WaitQueue::new(),
+            rx_lock: AtomicUsize::new(0),
         };
         uart.attach_preconfigured();
         uart
@@ -208,6 +228,24 @@ impl Uart16550 {
     #[inline]
     fn line_status(&self) -> u8 {
         self.read_reg(REG_LSR)
+    }
+
+    /// 取得接收侧独占权。
+    ///
+    /// "检查 LSR.DR 再读 RBR"必须是原子的，否则两个读者会各自弹走一部分字节，
+    /// 造成输入乱序。中断上下文也可能进入这里，因此用自旋而不是睡眠锁；临界区
+    /// 只有几次 MMIO 访问，非常短。
+    fn lock_rx(&self) -> UartRxGuard<'_> {
+        while self
+            .rx_lock
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        UartRxGuard {
+            lock: &self.rx_lock,
+        }
     }
 
     #[inline]
@@ -266,6 +304,7 @@ impl Uart16550 {
     }
 
     fn discard_rx_fifo(&self) {
+        let _guard = self.lock_rx();
         self.write_reg(REG_FCR, FCR_ENABLE_FIFO | FCR_CLEAR_RX);
         // FCR 清空后再读掉残留的 Data Ready，覆盖实现存在延迟的 UART 变体。
         for _ in 0..FIFO_DEPTH {
@@ -294,6 +333,7 @@ impl Uart16550 {
             state.len = 0;
             self.write_reg(REG_FCR, FCR_ENABLE_FIFO | FCR_CLEAR_RXTX);
         }
+        let _guard = self.lock_rx();
         for _ in 0..FIFO_DEPTH {
             if self.line_status() & LSR_DR == 0 {
                 break;
@@ -409,6 +449,8 @@ impl CharDriver for Uart16550 {
             return Ok(0);
         }
 
+        // 部分写语义的调用方（write(2)）自己决定是否重试，这里返回 0 是合法的
+        // "本次未写入"。真正需要原子性的整条消息走 write_all。
         let Some(mut guard) = self.tx.try_lock() else {
             return Ok(0);
         };
@@ -420,6 +462,10 @@ impl CharDriver for Uart16550 {
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
+        // 整个"检查 DR + 弹出 RBR"序列必须在同一临界区内完成。此前这里完全没有
+        // 互斥：多核下两个读者同时看到 DR=1，各自读走一个字节，一行输入就被拆散
+        // 并乱序，宿主发给客机的命令因此损坏（`/tmp/p/` → `/tm/pp/`）。
+        let _guard = self.lock_rx();
         for (i, slot) in buf.iter_mut().enumerate() {
             let lsr = self.read_reg(REG_LSR);
             if lsr & LSR_DR == 0 {
@@ -509,25 +555,30 @@ impl CharDriver for Uart16550 {
     }
 
     fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
+        // 整条消息必须在**同一个临界区**内写完。
+        //
+        // 之前这里每轮循环都重新取一次 tx 锁：TX ring 写满时（BuildStorm 这类
+        // 高日志量负载下持续满）一条消息会被切成多段，另一个 CPU 的 write_all
+        // 正好在段间插入自己的字节，串口上就出现字符级交织——例如
+        // `/tmp/p/run.sh` 被打乱成 `/tm/pp/run.sh`。这会破坏宿主侧对串口的
+        // 解析，让"捕获超时"这类假故障看起来像内核问题。
+        //
+        // 持锁期间靠 service_tx_locked 自己排空硬件 FIFO 推进，不释放锁，
+        // 因此不存在与其它写者交错的窗口。
+        let mut guard = self.tx.lock();
+        let state = guard.state_mut();
         let mut remaining = buf;
         let mut retries = 0usize;
         while !remaining.is_empty() {
-            let written = {
-                let mut guard = self.tx.lock();
-                let state = guard.state_mut();
-                self.kick_tx_locked(state);
-                let count = Self::enqueue_bytes(state, remaining);
-                self.kick_tx_locked(state);
-                count
-            };
-
+            self.kick_tx_locked(state);
+            let written = Self::enqueue_bytes(state, remaining);
+            self.kick_tx_locked(state);
             remaining = &remaining[written..];
             if written == 0 {
                 retries += 1;
                 if retries > TX_SPIN_RETRY_LIMIT {
                     return Err(CharIoError::Timeout);
                 }
-                self.service_tx();
                 core::hint::spin_loop();
             } else {
                 retries = 0;

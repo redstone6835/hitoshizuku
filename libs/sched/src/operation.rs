@@ -516,7 +516,16 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
     };
 
     if let Some(target_cpu) = target {
-        if let Err(error) = migrate_task(task, target_cpu) {
+        // migrate_task 在持有 CPU_HOTPLUG_LOCK 时无法等待迁移事务，遇到迁移中的
+        // 任务只会返回 EBUSY。这里在锁外等它落地后重试一次，避免把一次正常的
+        // 并发负载均衡当成 setaffinity 失败。
+        crate::scheduler::wait_for_migration_to_settle(task);
+        let mut result = migrate_task(task, target_cpu);
+        if result.is_err() && task.sched.is_migrating() {
+            crate::scheduler::wait_for_migration_to_settle(task);
+            result = migrate_task(task, target_cpu);
+        }
+        if let Err(error) = result {
             if task.sched.policy() == SchedPolicy::Deadline {
                 task.set_cpu_affinity(old_affinity);
                 return Err(error);

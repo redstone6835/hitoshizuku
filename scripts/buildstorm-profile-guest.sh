@@ -814,8 +814,16 @@ run_profile() {
         echo "profile runner: workload gate is not a FIFO" >&2
         exit 1
     }
+    # cargo 的 `Compiling N/446` progress 走 **stderr**。此前这里没有做任何
+    # 重定向，于是串口日志里一行 Compiling 都没有——历史上所有 run 的 cargo
+    # 里程碑全是 N/A，根因就是这个，而不是之前推测的"ANSI 转义导致正则不匹配"。
+    #
+    # 仅靠 `2>&1` 继承还不够：`setsid` 会让子进程脱离控制终端，继承来的
+    # fd 未必仍指向串口。这里显式把 stdout/stderr 绑到 /dev/console，
+    # 保证 progress 一定落到串口日志上；同时不引入任何转发进程——转发进程
+    # 会被窗口起止的 SIGSTOP 组停止一起冻住，反而让 cargo 阻塞在管道上。
     setsid chroot /mnt /bin/bash -lc \
-        'gate=$1; token=$2; exec 9<>"$gate" || exit 1; echo "@@PROFILE_GATE_READY token=$token"; IFS= read -r gate_word <&9; [ "$gate_word" = go ] || exit 1; exec 9>&-; export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; echo "@@PROFILE_CARGO_EXEC token=$token"; exec cargo build -p tg-xtask' bash "$gate" "$token" &
+        'gate=$1; token=$2; exec 9<>"$gate" || exit 1; echo "@@PROFILE_GATE_READY token=$token"; IFS= read -r gate_word <&9; [ "$gate_word" = go ] || exit 1; exec 9>&-; export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; if [ -w /dev/console ]; then exec >/dev/console 2>&1; echo "@@PROFILE_BUILD_SINK sink=console"; else echo "@@PROFILE_BUILD_SINK sink=inherited"; exec 2>&1; fi; echo "@@PROFILE_CARGO_EXEC token=$token"; exec cargo build -p tg-xtask' bash "$gate" "$token" &
     workload_pid=$!
 
     attempts=0

@@ -24,6 +24,7 @@ use vfs::superblock::{
 use vfs::sync::Spinlock;
 
 use crate::bgd::{self, GroupDesc};
+use crate::crc;
 use crate::inode::{ExtInodeOps, load_inode};
 use crate::inode_wr::RawInode;
 use crate::layout::{EXT4_ROOT_INO, ExtKind};
@@ -1978,7 +1979,18 @@ impl FsDriver for ExtFsDriver {
         mount_impl(backend)
     }
 
-    fn kill_sb(&self, _sb: Arc<VfsSuperblock>) {}
+    fn kill_sb(&self, sb: Arc<VfsSuperblock>) {
+        let Some(ops) = sb.ops.as_any().downcast_ref::<ExtFsSuperblockOps>() else {
+            return;
+        };
+        let state = Arc::clone(&ops.state);
+        // 先转入只读阻止新写,再全量回写,最后写回 VALID_FS 标记干净卸载。
+        state
+            .read_only
+            .store(true, core::sync::atomic::Ordering::Release);
+        let _ = state.sync_all();
+        let _ = crate::alloc_mod::mark_clean_unmount(&state);
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -2017,8 +2029,21 @@ impl SuperblockOps for ExtFsSuperblockOps {
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
         self.state.sync_all().map_err(map_err)
     }
-    fn remount(&self, _sb: &Arc<VfsSuperblock>, _flags: MountFlags) -> VfsResult<()> {
-        // 只读驱动,remount 忽略写标志
+    fn remount(&self, _sb: &Arc<VfsSuperblock>, flags: MountFlags) -> VfsResult<()> {
+        use core::sync::atomic::Ordering;
+        if flags.has(MountFlags::RDONLY) {
+            // rw → ro:全量回写后标记干净卸载(与 Linux 行为一致)。
+            self.state.sync_all().map_err(map_err)?;
+            self.state.read_only.store(true, Ordering::Release);
+            crate::alloc_mod::mark_clean_unmount(&self.state).map_err(map_err)?;
+        } else {
+            if self.state.ext_sb.force_read_only {
+                // BIGALLOC/READONLY/SHARED_BLOCKS 等语义位不允许读写。
+                return Err(VfsError::ReadOnlyFilesystem);
+            }
+            self.state.read_only.store(false, Ordering::Release);
+            crate::alloc_mod::mark_mounted(&self.state, false).map_err(map_err)?;
+        }
         Ok(())
     }
     fn as_any(&self) -> &dyn Any {
@@ -2026,36 +2051,47 @@ impl SuperblockOps for ExtFsSuperblockOps {
     }
 }
 
-fn discard_orphan_file(state: &Arc<FsState>) -> Result<(), BlockBackendError> {
-    let ino = state.ext_sb.orphan_file_inum;
-    if ino == 0 || ino > state.ext_sb.inodes_count {
+/// MMP(多挂载保护)挂载时检查。
+///
+/// 与 Linux `ext4_multi_mount_protect` 的入口语义对齐,但不做运行时心跳
+/// (extfs 没有周期性写线程):仅接受 `EXT4_MMP_SEQ_CLEAN`(干净卸载)的
+/// MMP 块;`FSCK`(正被 fsck)或其它序列号一律拒绝,避免双挂载。
+fn mmp_check(backend: &dyn BlockBackend, sb: &ExtSb) -> Result<(), BlockBackendError> {
+    use crate::layout::*;
+
+    if sb.feature_incompat & INCOMPAT_MMP == 0 {
         return Ok(());
     }
-
-    let mut raw = crate::inode_wr::read_raw(state, ino)?;
-    let mut i_block = [0u8; 60];
-    i_block.copy_from_slice(raw.i_block());
-
-    // 当前内核没有 ext4 orphan_file 维护逻辑。若直接只清 superblock feature,
-    // 原 orphan file inode 会变成宿主 fsck 眼中的 unattached inode；因此挂载时
-    // 主动丢弃它占用的数据块和 inode 位图，再把 superblock 指针清零。
-    if raw.flags() & crate::layout::EXT4_EXTENTS_FL != 0 {
-        crate::extent_wr::free_tree(state, &i_block)?;
-    } else {
-        crate::map_wr::free_all_blocks(state, &mut i_block)?;
+    let mmp_block = sb.mmp_block;
+    if mmp_block == 0 || mmp_block >= sb.blocks_count {
+        return Err(BlockBackendError::OutOfRange);
     }
-
-    raw.bytes.fill(0);
-    // extfs 库层无法直接访问内核 realtime；写合法 epoch 秒即可避免
-    // e2fsck 把过小 dtime 误判为损坏 orphan 链。
-    raw.set_dtime(1_700_000_000);
-    crate::inode_wr::write_raw(state, &raw)?;
-    crate::alloc_mod::free_inode(state, ino, false)?;
-    Ok(())
+    let mut buf = vec![0u8; sb.block_size as usize];
+    bgd::read_blocks(backend, sb, mmp_block, 1, &mut buf)?;
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != EXT4_MMP_MAGIC {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    if sb.metadata_csum {
+        // ext4_mmp_csum:crc32c(csum_seed, mmp[..offsetof(mmp_checksum)])
+        let provided = u32::from_le_bytes([buf[1020], buf[1021], buf[1022], buf[1023]]);
+        let calculated = crc::update(sb.csum_seed, &buf[..1020]);
+        if provided != calculated {
+            return Err(BlockBackendError::OutOfRange);
+        }
+    }
+    let seq = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if seq == EXT4_MMP_SEQ_CLEAN {
+        return Ok(());
+    }
+    log::error!("[extfs] MMP: 序列号 {seq:#x} 非 CLEAN,可能正被 fsck 或其它节点挂载,拒绝挂载");
+    Err(BlockBackendError::Io)
 }
 
 fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     let ext_sb = sb::load(backend.as_ref()).map_err(map_err)?;
+    // MMP 检查:只读操作,先于一切写路径。
+    mmp_check(backend.as_ref(), &ext_sb).map_err(map_err)?;
     let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(map_err)?;
     let group_counts = group_desc
         .iter()
@@ -2069,6 +2105,8 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     let free_blocks = ext_sb.free_blocks_count;
     let free_inodes = ext_sb.free_inodes_count;
     let block_size = ext_sb.block_size;
+    let force_ro = ext_sb.force_read_only;
+    let needs_recovery = ext_sb.feature_incompat & crate::layout::INCOMPAT_RECOVER != 0;
     let state = Arc::new(FsState {
         backend: Arc::clone(&backend),
         ext_sb,
@@ -2082,13 +2120,40 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         alloc_group_dirty: Spinlock::new(vec![0u8; group_count]),
         alloc_sb_dirty: AtomicBool::new(false),
         inode_writeback: Spinlock::new(DirtyInodeState::new()),
-        read_only: core::sync::atomic::AtomicBool::new(false),
+        read_only: core::sync::atomic::AtomicBool::new(force_ro),
     });
 
-    // 当前驱动不维护 ext4 orphan_file。可写挂载后立即规范化 superblock，
-    // 同时清理旧镜像可能残留的 feature 位、s_last_orphan 和 s_orphan_file_inum。
-    discard_orphan_file(&state).map_err(map_err)?;
-    crate::alloc_mod::write_superblock(&state).map_err(map_err)?;
+    // 日志恢复(NEEDS_RECOVERY):回放已提交事务 + fast commit 区域,
+    // 复位日志头后清除主超级块的 RECOVER 位。
+    if needs_recovery {
+        if state.is_read_only() {
+            log::error!("[extfs] 文件系统需要日志恢复,但特性强制只读挂载,拒绝");
+            return Err(VfsError::NotSupported);
+        }
+        crate::journal::recover(&state).map_err(map_err)?;
+        crate::alloc_mod::patch_superblock(&state, |sb| {
+            let incompat = u32::from_le_bytes([
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT],
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT + 1],
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT + 2],
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT + 3],
+            ]) & !crate::layout::INCOMPAT_RECOVER;
+            sb[crate::layout::sb_off::FEATURE_INCOMPAT
+                ..crate::layout::sb_off::FEATURE_INCOMPAT + 4]
+                .copy_from_slice(&incompat.to_le_bytes());
+        })
+        .map_err(map_err)?;
+    }
+
+    // 孤儿 inode 清理(s_last_orphan 链表 + orphan file)。
+    if !state.is_read_only() {
+        crate::orphan::cleanup(&state).map_err(map_err)?;
+    }
+
+    // 挂载记账:清/置 VALID_FS、s_mnt_count+1、s_mtime。
+    crate::alloc_mod::mark_mounted(&state, state.is_read_only()).map_err(map_err)?;
+    // 恢复 + 孤儿清理 + 记账的结果先落盘,再开始对外服务。
+    state.sync_all().map_err(map_err)?;
 
     // 加载根 inode(2 号)
     let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(map_err)?;
@@ -2472,12 +2537,14 @@ mod tests {
             blocks_count,
             first_data_block: 0,
             block_size,
+            log_cluster_size: 0,
             blocks_per_group,
             inodes_per_group: 16,
             inode_size: 128,
             desc_size: 32,
             first_ino: 11,
             s_magic: 0xef53,
+            state: 0,
             feature_compat: 0,
             feature_incompat: 0,
             feature_ro_compat: 0,
@@ -2489,6 +2556,13 @@ mod tests {
             reserved_blocks_count: 4,
             free_inodes_count: 16,
             orphan_file_inum: 0,
+            journal_inum: 0,
+            journal_dev: 0,
+            last_orphan: 0,
+            encoding: 0,
+            mmp_block: 0,
+            mmp_update_interval: 0,
+            force_read_only: false,
             groups_count: 1,
         };
         let group_desc = vec![GroupDesc {

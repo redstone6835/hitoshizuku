@@ -334,6 +334,12 @@ pub fn init() -> Arc<Task> {
 
     SCHEDULER.install_topology(SchedTopology::with_cpu_domains());
 
+    // 给每个 per-CPU runqueue 回填自己的 CPU 编号，武装双重入队检测。
+    // Runqueue::new() 是 const fn、在静态数组里构造，拿不到自己的下标。
+    for (cpu_id, cpu_state) in SCHEDULER.cpus().iter().enumerate() {
+        cpu_state.runqueue().set_owner_cpu(cpu_id);
+    }
+
     // 1) 身份骨架：session / pgroup / thread_group 互指但未填 leader。
     let session = Session::new();
     let pgroup = ProcessGroup::new(&session);
@@ -1118,10 +1124,14 @@ pub(crate) fn offline_cpu_with_scheduler(
                     && !scheduler
                         .cpu_or_boot(item.target_cpu.get())
                         .runqueue()
-                        .enqueue(Arc::clone(&item.task), now_ns)
+                        .enqueue_migrated(Arc::clone(&item.task), now_ns)
                 {
                     item.task.rollback_migration(item.source);
                     return Err(errno::Errno::EIO);
+                }
+                if !item.was_queued && item.task.sched.is_migrating() {
+                    // 只在 deadline reservation 里、未排队的任务也必须结束事务。
+                    item.task.sched.finish_migrating(false);
                 }
                 Ok(())
             })
@@ -1189,10 +1199,11 @@ fn restore_drained_tasks(
     let _ = scheduler.activate_cpu(cpu);
     for task in tasks {
         let _ = refresh_task_placement(scheduler, task);
+        // drain_queued 把这些任务置为 MIGRATING，回滚必须经由提交入口收尾。
         let _ = scheduler
             .cpu_or_boot(cpu.get())
             .runqueue()
-            .enqueue(Arc::clone(task), now_ns);
+            .enqueue_migrated(Arc::clone(task), now_ns);
     }
 }
 
@@ -1213,7 +1224,9 @@ fn restore_prepared_tasks(
             let _ = scheduler
                 .cpu_or_boot(cpu.get())
                 .runqueue()
-                .enqueue(Arc::clone(&item.task), now_ns);
+                .enqueue_migrated(Arc::clone(&item.task), now_ns);
+        } else if item.task.sched.is_migrating() {
+            item.task.sched.finish_migrating(false);
         }
     }
 }
@@ -1233,7 +1246,9 @@ fn restore_unmoved_tasks(
             let _ = scheduler
                 .cpu_or_boot(cpu.get())
                 .runqueue()
-                .enqueue(Arc::clone(&item.task), now_ns);
+                .enqueue_migrated(Arc::clone(&item.task), now_ns);
+        } else if item.task.sched.is_migrating() {
+            item.task.sched.finish_migrating(false);
         }
     }
 }
@@ -1518,6 +1533,18 @@ pub(crate) fn activate_task_on_cpu(
         return Err(errno::Errno::EINVAL);
     }
 
+    // 本入口只服务尚未暴露给任何 runqueue 的新任务，因此不可能处于迁移中。
+    // 这一点必须成立：下面在 CPU_HOTPLUG_LOCK 内调用 enqueue_task_on_scheduler，
+    // 而后者会自旋等待 MIGRATING 退出；若真有迁移在进行，它需要同一把锁才能
+    // 收尾，就会形成死锁。
+    debug_assert!(
+        !task.sched.is_migrating(),
+        "[sched] activate_task_on_cpu on migrating task",
+    );
+    if task.sched.is_migrating() {
+        return Err(errno::Errno::EBUSY);
+    }
+
     let selected = {
         let _guard = CPU_HOTPLUG_LOCK.lock();
         let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
@@ -1582,6 +1609,48 @@ fn enqueue_task_locked_with_preference(
     request_reschedule: bool,
 ) -> usize {
     enqueue_task_on_scheduler(&SCHEDULER, task, now_ns, preferred, request_reschedule)
+}
+
+/// 等待任务离开迁移事务窗口。
+///
+/// 迁移中的任务已经从源 rq 摘除、尚未进入目标 rq，此时它的 placement 仍指向
+/// 源 CPU。任何按 placement 定位 rq 的路径（唤醒、入队、状态变更、属性更新）
+/// 若在这个窗口内动手，都会把任务写到错误的 rq 上，进而造成双 rq 登记——同一
+/// 份内核栈和 arch context 被两个 CPU 同时切入。
+///
+/// 迁移临界区只包含两次 rq 加锁和若干原子操作，不会睡眠也不会等待远端 CPU，
+/// 因此有界自旋是安全的。自旋期间轮询 urgent work，避免与 TLB shootdown 或
+/// membarrier 的同步发起方形成互等。
+/// 调用约束：**绝不能在持有 `CPU_HOTPLUG_LOCK` 时调用**。迁移事务需要该锁才能
+/// 收尾，在锁内等待会与 `balance_once` 形成死锁。锁内路径应改为返回 `EBUSY`，
+/// 由调用方在锁外重试。
+pub(crate) fn wait_for_migration_to_settle(task: &Task) {
+    // 迁移临界区是有界的（两次 rq 加锁），正常情况下几十次自旋内必然结束。
+    // 上界只用来把"迁移方漏掉某条收尾路径"这类 bug 变成一条可诊断的日志，
+    // 而不是让整个内核在这里静默死锁——SIGSTOP / exit / setaffinity 都会经过
+    // 这个等待点。
+    const MIGRATION_SETTLE_SPIN_LIMIT: usize = 1 << 22;
+    let mut spins = 0usize;
+    while task.sched.is_migrating() {
+        // 每轮都协作处理 shootdown / membarrier，而不是每 64 轮一次：迁移方
+        // 很可能正等本 CPU 应答一次 TLB shootdown 才能完成事务，两边互等时
+        // 延迟应答会直接变成死锁。
+        crate::poll_urgent_work();
+        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins >= MIGRATION_SETTLE_SPIN_LIMIT {
+            log::error!(
+                "[sched] migration failed to settle: pid={:?} placement={:?}; \
+                 forcing transaction end (this indicates a missing finish_migrating)",
+                task.pid_root(),
+                task.placement().cpu.map(CpuId::get),
+            );
+            // 强制结束事务，让调用方按"不在 rq 上"继续处理。宁可丢一次负载均衡
+            // 迁移，也不能让状态变更路径永久卡住。
+            task.sched.force_finish_migrating();
+            return;
+        }
+    }
 }
 
 pub(crate) fn enqueue_task_on_scheduler(
@@ -1650,6 +1719,10 @@ pub(crate) fn enqueue_task_on_scheduler(
     }
 
     for _ in 0..NR_CPUS {
+        // placement 是 rq 归属的唯一依据，但它在迁移窗口内指向源 CPU。必须等
+        // 事务落地后再读，否则会把任务入队到刚被摘空的源 rq，与目标 rq 形成
+        // 双登记。
+        wait_for_migration_to_settle(&task);
         let cpu_id = scheduler
             .deadline_admission()
             .reservation_of(&task)
@@ -1687,6 +1760,8 @@ fn enqueue_task_locked_with_hint(task: Arc<Task>, now_ns: u64, cpu_hint: usize) 
         task.sched.set_on_rq(false);
         return task.current_cpu().min(NR_CPUS - 1);
     }
+    // 与 enqueue_task_on_scheduler 同理：迁移窗口内的 placement 不可信。
+    wait_for_migration_to_settle(&task);
     if task.sched.on_rq() {
         return task.current_cpu().min(NR_CPUS - 1);
     }
@@ -2141,6 +2216,12 @@ fn migration_context(
     if task.state() == TaskState::Running {
         return Err(errno::Errno::EBUSY);
     }
+    // 此处已持有 CPU_HOTPLUG_LOCK；balance_once 在锁外置 MIGRATING，在锁内
+    // 清除，因此不能在锁内自旋等待——那会与 balance_once 相互死锁。若任务正处
+    // 于迁移中，直接返回 EBUSY，让调用方（setaffinity 等）在锁外自旋后重试。
+    if task.sched.is_migrating() {
+        return Err(errno::Errno::EBUSY);
+    }
     let _ = refresh_task_placement(&SCHEDULER, task);
     let mut source = task.placement();
     if source.state == crate::PlacementState::Unbound {
@@ -2174,10 +2255,16 @@ fn rollback_migration(task: &Arc<Task>, context: MigrationContext, requeue_sourc
     task.rollback_migration(context.source);
     let _ = refresh_task_placement(&SCHEDULER, task);
     if requeue_source {
+        // 任务此刻仍处于 MIGRATING，普通 enqueue 会被 on_rq 门禁拒绝并把它永久
+        // 留在迁移态，让所有唤醒方无限自旋。必须走迁移提交入口收尾。
         SCHEDULER
             .cpu_or_boot(context.source.cpu.map_or(0, CpuId::get))
             .runqueue()
-            .enqueue(Arc::clone(task), now_ns_internal());
+            .enqueue_migrated(Arc::clone(task), now_ns_internal());
+    } else if task.sched.is_migrating() {
+        // 没有重新入队的回滚路径同样必须结束事务，否则任务停在 MIGRATING 却
+        // 不在任何 rq 上，等待方永远等不到落地。
+        task.sched.finish_migrating(false);
     }
 }
 
@@ -2217,10 +2304,12 @@ fn attach_migrated_task_locked(
     }
     if !source_detached {
         let source_cpu = context.source.cpu.map_or(0, CpuId::get);
+        // 摘除与 MIGRATING 的发布必须在源 rq 的同一临界区内完成，否则中间会
+        // 出现 on_rq==NONE 的窗口，让并发唤醒把任务重新塞回源 rq。
         if !SCHEDULER
             .cpu_or_boot(source_cpu)
             .runqueue()
-            .dequeue_queued(task, now_ns_internal())
+            .detach_queued_for_migration(task, now_ns_internal())
         {
             rollback_migration(task, context, false);
             return Err(errno::Errno::EBUSY);
@@ -2234,7 +2323,7 @@ fn attach_migrated_task_locked(
     }
     let source_cpu = context.source.cpu.unwrap_or_else(CpuId::boot);
     let target_capacity = topology.topology.cpu_capacity(context.target_cpu);
-    SCHEDULER.deadline_admission().migrate(
+    let result = SCHEDULER.deadline_admission().migrate(
         task,
         source_cpu,
         context.target_cpu,
@@ -2248,14 +2337,23 @@ fn attach_migrated_task_locked(
             if !SCHEDULER
                 .cpu_or_boot(context.target_cpu.get())
                 .runqueue()
-                .enqueue(Arc::clone(task), now_ns_internal())
+                .enqueue_migrated(Arc::clone(task), now_ns_internal())
             {
                 rollback_migration(task, context, true);
                 return Err(errno::Errno::EIO);
             }
             Ok(())
         },
-    )?;
+    );
+    if let Err(error) = result {
+        // deadline_admission 的带宽检查可能在根本没调用闭包时就失败；此时任务
+        // 仍停在 MIGRATING 且不在任何 rq 上。必须显式回滚，否则每个等待它落地
+        // 的唤醒方都会永久自旋——SIGSTOP、exit、setaffinity 全部卡死。
+        if task.sched.is_migrating() {
+            rollback_migration(task, context, true);
+        }
+        return Err(error);
+    }
     request_resched(context.target_cpu.get());
     Ok(())
 }
@@ -2294,6 +2392,17 @@ pub fn balance_once(cpu_id: usize) -> bool {
     };
     let active = active_cpu_set();
     if !active.contains(local_cpu) {
+        return false;
+    }
+
+    // 便宜的前置检查：本 CPU 已经有活干就没必要偷。
+    //
+    // 下面的 domain stats 刷新 + 两次全 CPU 负载快照（其中一次还要取全局
+    // RUNQUEUE_SNAPSHOT_LOCK）是这个函数的绝大部分开销。实测在 BuildStorm
+    // 1200 s 窗口里，balance_once + update_domain_stats 合计吃掉约 9% 的内核
+    // 指令，其中大多数调用最后什么都没偷到——因为本核当时并不空闲。
+    // 先看一眼本地 runqueue 深度，能把绝大部分无收益的全局扫描挡在门外。
+    if SCHEDULER.cpu_or_boot(cpu_id).runqueue().nr_running() > 1 {
         return false;
     }
 
@@ -2373,11 +2482,22 @@ pub(crate) fn requeue_balance_task_on(
         let cpu_state = scheduler.cpu_or_boot(source_cpu);
         let _enqueue_guard = cpu_state.begin_enqueue();
         if scheduler.active_set().contains(source) {
-            if cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns) {
+            // task 可能带着 MIGRATING 状态进来（来自失败的 balance_once 回滚）；
+            // 普通 enqueue 的 on_rq 门禁会拒绝它，需要走提交入口。
+            let queued = if task.sched.is_migrating() {
+                cpu_state.runqueue().enqueue_migrated(Arc::clone(&task), now_ns)
+            } else {
+                cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
+            };
+            if queued {
                 cpu_state.request_resched();
             }
             return source_cpu;
         }
+    }
+    // 源 CPU 已下线；任务仍可能处于 MIGRATING，等它落地后交给通用入队路径。
+    if task.sched.is_migrating() {
+        task.sched.finish_migrating(false);
     }
     enqueue_task_on_scheduler(scheduler, task, now_ns, false, true)
 }
@@ -2910,6 +3030,7 @@ fn on_timer_tick_inner(now_ns: u64) -> bool {
     if SCHEDULER.cpu_or_boot(cpu_id).runqueue().tick(now_ns) {
         request_resched(cpu_id);
     }
+    request_periodic_balance(cpu_id, now_ns);
     fired
 }
 
@@ -2927,6 +3048,53 @@ fn service_expired_timer_events(now_ns: u64, cpu_id: usize) -> bool {
         reprogram_deadline_timer();
     }
     deadline_fired || realtime_fired
+}
+
+/// 周期性负载均衡的最小间隔。
+///
+/// 对应 Linux `scheduler_tick()` 里的 `trigger_load_balance()`，但节流更保守：
+/// `balance_once` 需要取全局 `RUNQUEUE_SNAPSHOT_LOCK` 并扫描所有 rq，若每个
+/// tick 都在每个 CPU 上执行，多核空闲系统会把这条全局串行路径变成新的瓶颈。
+/// 4 ms 实测过于激进：8 核每核每 4 ms 触发一次全 rq 扫描，光是 balance_once
+/// 自身就吃掉约 9% 的内核指令，而其中绝大多数调用并没有偷到任务。16 ms 与
+/// Linux 各级 sched domain 的 balance interval 量级相当，同时保留了把任务铺开
+/// 到所有核所需的频度（work-stealing 主要靠 idle 路径即时触发，tick 只是兜底）。
+const PERIODIC_BALANCE_INTERVAL_NS: u64 = 16_000_000;
+
+/// 每 CPU 的下一次允许均衡时间点。
+static NEXT_BALANCE_NS: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+
+/// 在 timer tick 上按间隔请求一次负载均衡。
+///
+/// 只在本 CPU 明显吃不满（runnable 不足以占满自己）时才请求：balance_once 的
+/// 拉取条件本身也要求源 CPU 更忙，所以繁忙 CPU 上的请求只会白跑一次全 rq 扫描。
+/// 真正的迁移动作留给安全调度边界（`preempt_if_needed` / idle 循环）消费
+/// `take_balance()`，本函数不在中断上下文里直接迁移任务。
+fn request_periodic_balance(cpu_id: usize, now_ns: u64) {
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    if cpu_state.runqueue().nr_running() > 1 {
+        return;
+    }
+    let slot = &NEXT_BALANCE_NS[cpu_id.min(NR_CPUS - 1)];
+    let next = slot.load(Ordering::Relaxed);
+    if now_ns < next {
+        return;
+    }
+    if slot
+        .compare_exchange(
+            next,
+            now_ns.saturating_add(PERIODIC_BALANCE_INTERVAL_NS),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    // 只置本地标志位，不发 IPI：请求的目标就是本 CPU，它马上就会走到自己的
+    // 调度边界。发自 IPI 只会在 idle 唤醒路径上制造额外往返。
+    cpu_state.request_balance();
+    cpu_state.request_resched();
 }
 
 /// 读取当前任务真实 CPU 时间的无分配回调。
@@ -3078,6 +3246,9 @@ pub(crate) fn dequeue_for_state_change_on(
     local_cpu: usize,
     now_ns: u64,
 ) -> bool {
+    // exit / stop / signal 路径必须看到稳定的 rq 归属，否则会去源 rq 摘一个
+    // 已经不在那里的任务，让它带着 Zombie 状态留在目标 rq 上。
+    wait_for_migration_to_settle(task);
     let Some(owner) = task_runqueue_cpu_on(scheduler, task) else {
         return false;
     };

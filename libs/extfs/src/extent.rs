@@ -62,22 +62,70 @@ fn parse_header(buf: &[u8]) -> Option<ExtHeader> {
     Some(ExtHeader { entries, depth })
 }
 
+/// extent 节点块尾部校验(`ext4_extent_tail`)。
+///
+/// tail 位于块内 `12 + eh_max * 12` 处,内容是
+/// `crc32c(csum_seed ‖ ino ‖ generation ‖ header+条目区)`。
+/// 与 Linux `ext4_extent_block_csum_verify` 一致:METADATA_CSUM 未启用时
+/// 直接通过;`csum_ctx` 为 `None` 时(写路径/恢复路径)跳过校验。
+fn verify_extent_tail(
+    state: &FsState,
+    block: &[u8],
+    csum_ctx: Option<(u32, u32)>,
+) -> Result<(), BlockBackendError> {
+    let Some((ino, generation)) = csum_ctx else {
+        return Ok(());
+    };
+    if !state.ext_sb.metadata_csum {
+        return Ok(());
+    }
+    if block.len() < EXT_HEADER_SIZE + 4 {
+        return Err(BlockBackendError::Io);
+    }
+    let max = u16::from_le_bytes([block[4], block[5]]) as usize;
+    let tail_off = EXT_HEADER_SIZE + max * EXT_ENTRY_SIZE;
+    if tail_off + 4 > block.len() {
+        return Err(BlockBackendError::Io);
+    }
+    let provided = u32::from_le_bytes([
+        block[tail_off],
+        block[tail_off + 1],
+        block[tail_off + 2],
+        block[tail_off + 3],
+    ]);
+    let mut seed = state.ext_sb.csum_seed;
+    seed = crate::crc::update(seed, &ino.to_le_bytes());
+    seed = crate::crc::update(seed, &generation.to_le_bytes());
+    let sum = crate::crc::update(seed, &block[..tail_off]);
+    if sum != provided {
+        return Err(BlockBackendError::Io);
+    }
+    Ok(())
+}
+
 /// 根据逻辑块号 `logical_block` 找对应的物理块号。若存在"洞",返回 `Ok(None)`。
 ///
 /// `root` 是 `inode.i_block[0..60]`(或任何内节点块的前 60 字节)的副本;
-/// 递归下钻时会从 `state` 按需读取子节点块。
+/// 递归下钻时会从 `state` 按需读取子节点块。`csum_ctx = Some((ino, generation))`
+/// 时对每个外部节点块做 `ext4_extent_tail` 校验(METADATA_CSUM)。
 #[inline]
 pub(crate) fn map_block(
     state: &FsState,
     root: &[u8],
     logical_block: u32,
+    csum_ctx: Option<(u32, u32)>,
 ) -> Result<Option<u64>, BlockBackendError> {
     let mut current: alloc::vec::Vec<u8> = alloc::vec::Vec::from(root);
+    let mut first = true;
     loop {
         let hdr = match parse_header(&current) {
             Some(h) => h,
             None => return Ok(None),
         };
+        if !first {
+            verify_extent_tail(state, &current, csum_ctx)?;
+        }
+        first = false;
         let p = current.as_ptr();
         if hdr.depth == 0 {
             for i in 0..hdr.entries as usize {
@@ -140,12 +188,17 @@ fn collect_extents(
     current: &[u8],
     start_lb: u32,
     end_lb: u32,
+    csum_ctx: Option<(u32, u32)>,
+    is_external: bool,
     out: &mut Vec<(u32, u32, u64)>,
 ) -> Result<(), BlockBackendError> {
     let hdr = match parse_header(current) {
         Some(h) => h,
         None => return Ok(()),
     };
+    if is_external {
+        verify_extent_tail(state, current, csum_ctx)?;
+    }
     let p = current.as_ptr();
     if hdr.depth == 0 {
         for i in 0..hdr.entries as usize {
@@ -201,10 +254,20 @@ fn collect_extents(
             let child = (ei_leaf_hi << 32) | ei_leaf_lo;
             let mut next = vec![0u8; block_size];
             state.read_block(child, &mut next)?;
-            collect_extents(state, &next, start_lb, end_lb, out)?;
+            collect_extents(state, &next, start_lb, end_lb, csum_ctx, true, out)?;
         }
     }
     Ok(())
+}
+
+// 保持向后兼容的便捷封装:不带校验的映射(写路径/恢复路径使用)。
+#[inline]
+pub(crate) fn map_block_unverified(
+    state: &FsState,
+    root: &[u8],
+    logical_block: u32,
+) -> Result<Option<u64>, BlockBackendError> {
+    map_block(state, root, logical_block, None)
 }
 
 pub(crate) fn map_contiguous(
@@ -212,12 +275,13 @@ pub(crate) fn map_contiguous(
     root: &[u8],
     start_lb: u32,
     count: u32,
+    csum_ctx: Option<(u32, u32)>,
 ) -> Result<Vec<(u32, u32, u64)>, BlockBackendError> {
     if count == 0 {
         return Ok(Vec::new());
     }
     let end_lb = start_lb.saturating_add(count);
     let mut result = Vec::new();
-    collect_extents(state, root, start_lb, end_lb, &mut result)?;
+    collect_extents(state, root, start_lb, end_lb, csum_ctx, false, &mut result)?;
     Ok(result)
 }

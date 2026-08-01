@@ -824,7 +824,12 @@ fn runqueue_wake_current_sleep_transition_does_not_duplicate_task() {
     assert!(!rq.enqueue(alloc::sync::Arc::clone(&task), 1));
     assert!(rq.is_current(&task));
     assert_eq!(task.state(), TaskState::Running);
-    assert!(!task.sched.on_rq());
+    // 唤醒把仍是 current 的任务拉回 Running 之后，它依然归属本 rq，因此
+    // on_rq 必须保持为 QUEUED。若这里清成 NONE，紧随其后的一次远端唤醒就能
+    // 通过 `enqueue` 的 on_rq 门禁，把同一个任务重复挂进第二个 rq。
+    assert!(task.sched.on_rq());
+    assert_eq!(task.sched.on_rq_state(), crate::eevdf::TASK_ON_RQ_QUEUED);
+    assert!(!task.sched.is_migrating());
     assert_eq!(rq.nr_running(), 1);
 
     let current = rq.pick_next(2).expect("current task");
@@ -848,7 +853,11 @@ fn runqueue_take_migratable_respects_cpu_affinity() {
         .take_migratable(CpuMask::single_raw(1).bits(), 2)
         .expect("cpu1 should pull an affinity-compatible task");
     assert!(alloc::sync::Arc::ptr_eq(&pulled, &cpu1));
-    assert!(!pulled.sched.on_rq());
+    // 摘出来的任务处于"已离开源 rq、尚未挂上目标 rq"的中间态：on_rq 记为
+    // MIGRATING 而不是 NONE，这样并发的唤醒者会等迁移落地而不是抢先入队。
+    assert!(pulled.sched.is_migrating());
+    assert_eq!(pulled.sched.on_rq_state(), crate::eevdf::TASK_ON_RQ_MIGRATING);
+    assert!(pulled.sched.on_rq());
     assert_eq!(rq.migratable_load(), 1);
     assert!(
         rq.take_migratable(CpuMask::single_raw(2).bits(), 3)
