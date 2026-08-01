@@ -316,7 +316,9 @@ fn e2fsprogs_cross_validate_journal_replay() {
     let mut bbm = read_block(&img, block_bitmap_blk);
     bbm[(created_blk / 8) as usize] |= 1u8 << (created_blk % 8);
 
-    // 4d) gdt 块:计数 -1/-1,重算位图 csum 与 gdt csum。
+    // 4d) gdt 块:新增一个常规文件会消耗一个数据块和一个 inode，
+    // 同时 inode table 的未使用尾部缩短一项。三项计数都必须随事务回放，
+    // 否则 e2fsck 会把新 inode 判为落在 unused-inodes 区域。
     let mut gdt_data = read_block(&img, gdt_blk);
     {
         let desc = &mut gdt_data[..64];
@@ -324,12 +326,17 @@ fn e2fsprogs_cross_validate_journal_replay() {
         let fb_hi = u16::from_le_bytes([desc[44], desc[45]]) as u32;
         let fi_lo = u16::from_le_bytes([desc[14], desc[15]]) as u32;
         let fi_hi = u16::from_le_bytes([desc[46], desc[47]]) as u32;
+        let iu_lo = u16::from_le_bytes([desc[28], desc[29]]) as u32;
+        let iu_hi = u16::from_le_bytes([desc[50], desc[51]]) as u32;
         let fb = ((fb_hi << 16) | fb_lo) - 1;
         let fi = ((fi_hi << 16) | fi_lo) - 1;
+        let iu = ((iu_hi << 16) | iu_lo) - 1;
         desc[12..14].copy_from_slice(&(fb as u16).to_le_bytes());
         desc[44..46].copy_from_slice(&((fb >> 16) as u16).to_le_bytes());
         desc[14..16].copy_from_slice(&(fi as u16).to_le_bytes());
         desc[46..48].copy_from_slice(&((fi >> 16) as u16).to_le_bytes());
+        desc[28..30].copy_from_slice(&(iu as u16).to_le_bytes());
+        desc[50..52].copy_from_slice(&((iu >> 16) as u16).to_le_bytes());
         let sb = read_range(&img, 1024, 1024);
         let bpg = rd32(&sb, 0x20) as usize;
         let ipg = rd32(&sb, 0x28) as usize;
