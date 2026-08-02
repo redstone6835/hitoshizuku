@@ -34,6 +34,26 @@ grep -Fq -- '--plugin-summary "$run_dir/qemu-observer-plugin-summary.json"' "$ho
     echo "observer fixture: host does not request plugin exit reconciliation" >&2
     exit 1
 }
+grep -Fq 'smp=${PROFILE_SMP:-12}' "$host" || {
+    echo "SMP fixture: host does not default to the LoongArch evaluation CPU count" >&2
+    exit 1
+}
+grep -Fq -- '-smp "$smp"' "$host" || {
+    echo "SMP fixture: QEMU does not use the configured CPU count" >&2
+    exit 1
+}
+grep -Fq -- '--vcpu-count "$smp"' "$host" || {
+    echo "SMP fixture: observer does not use the configured CPU count" >&2
+    exit 1
+}
+grep -Fq -- '--environment "smp=$smp"' "$host" || {
+    echo "SMP fixture: observer metadata does not use the configured CPU count" >&2
+    exit 1
+}
+if grep -Eq '(^|[^A-Za-z_])(smp=8|-smp 8|vcpu-count 8)([^0-9]|$)' "$host"; then
+    echo "SMP fixture: host still hard-codes an eight-CPU profile" >&2
+    exit 1
+fi
 grep -Fq 'rm -f "$stage/profile-capture.sh" "$stage/run.sh" "$stage/config.env"' "$host" || {
     echo "cleanup fixture: host leaves generated tool configuration behind" >&2
     exit 1

@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 mod snapshot;
 pub use snapshot::{BINARY_SCHEMA_VERSION, binary_snapshot_len, read_binary_snapshot};
 
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = 12;
 pub const MIXED_CPU: usize = MAX_CPUS;
 pub const CPU_SLOTS: usize = MAX_CPUS + 1;
 pub const HISTOGRAM_BUCKETS: usize = 64;

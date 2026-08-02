@@ -96,6 +96,7 @@ sample_ms=${PROFILE_HOST_SAMPLE_MS:-1000}
 poll_ms=${PROFILE_POLL_MS:-50}
 anchor=${PROFILE_STAGE_ANCHOR:-workload}
 cpuset=${PROFILE_CPUSET:-}
+smp=${PROFILE_SMP:-12}
 for pair in \
     "PROFILE_WARMUP_MS:$warmup_ms" \
     "PROFILE_STAGE_TIMEOUT_MS:$stage_timeout_ms" \
@@ -113,6 +114,8 @@ done
 [ "$sample_ms" -gt 0 ] || { echo "PROFILE_HOST_SAMPLE_MS must be positive" >&2; exit 2; }
 [ "$poll_ms" -gt 0 ] || { echo "PROFILE_POLL_MS must be positive" >&2; exit 2; }
 case "$cpuset" in *[!0-9,-]*) echo "PROFILE_CPUSET has invalid syntax" >&2; exit 2 ;; esac
+case "$smp" in ''|*[!0-9]*) echo "PROFILE_SMP must be a positive integer" >&2; exit 2 ;; esac
+[ "$smp" -gt 0 ] || { echo "PROFILE_SMP must be a positive integer" >&2; exit 2; }
 case "$anchor" in
     workload|aws-object) ;;
     cargo:*)
@@ -559,7 +562,7 @@ clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
     printf 'guest_workload_device=%s\nguest_tools_device=%s\n' "$workload_device" "$tools_device"
     printf 'qemu_machine=virt\nqemu_cpu=la464\nqemu_accel=tcg,thread=multi\n'
     printf 'qemu_name=buildstorm-profile\nqemu_debug_threads=on\n'
-    printf 'memory_bytes=8589934592\nsmp=8\ncpuset_identity=%s\n' "$cpuset_identity"
+    printf 'memory_bytes=8589934592\nsmp=%s\ncpuset_identity=%s\n' "$smp" "$cpuset_identity"
     printf 'target_tmpfs=size=5G\ncold_target=true\ntoolchain=nightly-2026-05-28\n'
     printf 'container_image_id=%s\nworkload_plan_sha256=%s\nworkload_script_sha256=%s\n' \
         "$container_image_id" "$workload_plan_id" "$workload_script_id"
@@ -583,7 +586,7 @@ set -- docker run -d --name "$container" --user "$host_uid:$host_gid"
 [ -z "$cpuset" ] || set -- "$@" --cpuset-cpus "$cpuset"
 set -- "$@" -v "$run_dir":/run -v "$base_dir":/base:ro "$container_image" \
     qemu-system-loongarch64 \
-    -machine virt -cpu la464 -accel tcg,thread=multi -m 8G -smp 8 \
+    -machine virt -cpu la464 -accel tcg,thread=multi -m 8G -smp "$smp" \
     -name guest=buildstorm-profile,debug-threads=on \
     -display none -monitor none -S -no-reboot -rtc base=utc \
     -serial unix:/run/serial.sock,server=on,wait=off \
@@ -633,7 +636,7 @@ if [ "$observer_enabled" -eq 1 ]; then
         --ready-file "$run_dir/qemu-observer.ready" \
         --system "$observer_system" \
         --workload buildstorm-tg-xtask \
-        --vcpu-count 8 \
+        --vcpu-count "$smp" \
         --proc-interval-ms "$observer_proc_ms" \
         --stack-interval-ms 0 \
         --stack-timeout-ms 5000 \
@@ -657,7 +660,7 @@ if [ "$observer_enabled" -eq 1 ]; then
         --environment qemu_name=buildstorm-profile \
         --environment qemu_debug_threads=on \
         --environment memory_bytes=8589934592 \
-        --environment smp=8 \
+        --environment "smp=$smp" \
         --environment "base_image_sha256=$base_id" \
         --environment "cpuset=$cpuset_identity" \
         --environment target_tmpfs=size=5G \

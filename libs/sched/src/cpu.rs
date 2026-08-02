@@ -15,7 +15,7 @@ static PLACEMENT_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
 ///
 /// 这里是调度器的固定容量，不表示所有 CPU 都已经上线；在线状态由
 /// scheduler 运行期维护。固定容量让 per-CPU 数组可以静态分配，避免热路径分配。
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = 12;
 
 /// 启动 CPU。空亲和性在调度器内部不能存在，必要时统一退回到该 CPU。
 pub const BOOT_CPU_ID: usize = 0;

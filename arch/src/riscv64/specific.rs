@@ -20,7 +20,7 @@ pub use crate::riscv64::trap_frame::*;
 // 初始化各自的 HartLocal 并写入 tp。
 
 /// 支持的最大 hart 数。SMP 唤醒时不得超过此值。
-pub const MAX_HARTS: usize = 8;
+pub const MAX_HARTS: usize = 12;
 
 /// 每个 hart 的本地数据，通过 tp 寄存器寻址。
 #[repr(C)]
