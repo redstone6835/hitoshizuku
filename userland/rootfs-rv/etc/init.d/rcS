@@ -70,10 +70,9 @@ maybe_enter_shell() {
     rm -f "$key_file"
 }
 
-# 两套 libc 测试环境分别持有策略。glibc 暂不运行 libctest；musl 不运行依赖
-# CAgent 需要完整根环境；BuildStorm 默认启用，可通过 buildstorm=0 临时关闭。
-GLIBC_BLACKLIST="unixbench libctest"
-MUSL_BLACKLIST="unixbench copy-file-range interuppts splice cagent buildstorm"
+# 默认不跳过测试；需要临时跳过时，可通过内核命令行黑名单参数显式配置。
+GLIBC_BLACKLIST=""
+MUSL_BLACKLIST=""
 BUILDSTORM_ENABLED=1
 TEST_MODE="$(cat /etc/mygo-test-mode 2>/dev/null || echo default)"
 TEST_WORKLOAD="$(cat /etc/mygo-test-workload 2>/dev/null || true)"
