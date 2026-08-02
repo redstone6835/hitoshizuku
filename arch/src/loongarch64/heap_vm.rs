@@ -966,7 +966,7 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
     // 页表锁必须先释放：目标 CPU 可能正等待另一条需要该锁的 allocator 路径。
     // PTE 已清除但物理页和虚拟区间尚未回收，等待远端确认期间不存在复用竞态。
     unsafe {
-        LoongArch64Paging::flush_tlb(None);
+        LoongArch64Paging::flush_tlb_global();
     }
 
     // log::debug!(
@@ -1024,7 +1024,7 @@ pub fn protect_kernel_heap_range(
     }
 
     unsafe {
-        LoongArch64Paging::flush_tlb(None);
+        LoongArch64Paging::flush_tlb_global();
     }
     true
 }

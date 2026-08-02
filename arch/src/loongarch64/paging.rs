@@ -643,6 +643,20 @@ impl LoongArch64Paging {
         crate::loongarch64::smp::flush_tlb_all_cpus(asid, vaddr.map(VirtAddr::as_usize));
     }
 
+    /// 同步失效所有在线 CPU 上的全局转换缓存。
+    ///
+    /// 内核高半区映射不能继承当前用户任务的 ASID；无论调用时正在运行哪个用户
+    /// 地址空间，都必须用逻辑 ASID 0 触发完整全局失效并等待全部在线 CPU 确认。
+    /// 为避免把全局语义误降成按地址的 ASID 定向失效，这里保守地总是清空全部 TLB。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证相关内核页表写入已经完成，并且等待期间旧映射不会被提前复用。
+    #[inline]
+    pub unsafe fn flush_tlb_global() {
+        crate::loongarch64::smp::flush_tlb_all_cpus(super::asid_tracker::KERNEL_LOGICAL_ASID, None);
+    }
+
     /// 仅在指定逻辑 CPU 集合上同步失效该 ASID 的 TLB。
     ///
     /// 当前 CPU 始终执行本地失效；`targets` 只约束远端通知。调用方可以传入地址

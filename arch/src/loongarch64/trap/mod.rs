@@ -17,6 +17,7 @@ use core::arch::naked_asm;
 use crate::*;
 
 pub const ESTAT_IS_MASK: usize = 0x7fff;
+const CRMD_IE_MASK: usize = 1 << CSR_CRMD_IE_OFFSET;
 
 #[inline]
 /// 把 DMW1 高半区地址还原为物理地址。
@@ -115,8 +116,11 @@ pub unsafe extern "C" fn __loongarch_tlb_refill_entry() {
 
         // 4 级页表遍历：Dir3 -> Dir2 -> Dir1 -> PTE。
         "lddir $r12, $r12, 3",
+        "beqz $r12, .L_tlb_refill_invalid",
         "lddir $r12, $r12, 2",
+        "beqz $r12, .L_tlb_refill_invalid",
         "lddir $r12, $r12, 1",
+        "beqz $r12, .L_tlb_refill_invalid",
 
         // 从当前 $r12 指向的 PTE 页的物理地址处加载一对页表项（PTE0 和 PTE1），
         // 并将其填充到 TLB 中，完成 TLB 重填。
@@ -124,12 +128,23 @@ pub unsafe extern "C" fn __loongarch_tlb_refill_entry() {
         "ldpte $r12, 1",
         "tlbfill",
 
+        ".L_tlb_refill_return:",
         // 恢复 $r12 寄存器的值并返回。
         "csrrd $r12, {csr_tlbrsave}",
         "ertn",
 
+        // 空目录表示该地址没有可供 TLB 重填的页表路径。安装一个无效的匹配项，
+        // 让重试转入普通 PIF/PIL/PIS 异常，而不是继续从物理地址 0 读取伪 PTE。
+        ".L_tlb_refill_invalid:",
+        "csrwr $r0, {csr_tlbrelo0}",
+        "csrwr $r0, {csr_tlbrelo1}",
+        "tlbfill",
+        "b .L_tlb_refill_return",
+
         csr_pgd = const CSR_PGD,
         csr_tlbrsave = const CSR_TLBRSAVE,
+        csr_tlbrelo0 = const CSR_TLBRELO0,
+        csr_tlbrelo1 = const CSR_TLBRELO1,
     )
 }
 
@@ -339,6 +354,10 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
 
         // 开始恢复寄存器状态，准备继续执行用户态程序。
         "or $r31, $r4, $r0",
+        // PRMD 会在恢复通用寄存器前发布。先关闭当前中断，防止嵌套异常
+        // 将尚在内核恢复桩中的现场误判为用户态并覆盖外层 TrapFrame。
+        "ori $r12, $r0, {crmd_ie_mask}",
+        "csrxchg $r0, $r12, {csr_crmd}",
         "bl {handle_shootdown}",
 
         // 恢复程序计数器和状态寄存器的值。
@@ -489,6 +508,7 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         report = sym loongarch64_handle_exception,
         handle_shootdown = sym crate::loongarch64::smp::handle_shootdown_requests,
         frame_size = const FRAME_SIZE,
+        csr_crmd = const CSR_CRMD,
         csr_prmd = const CSR_PRMD,
         csr_euen = const CSR_EUEN,
         csr_llbctl = const CSR_LLBCTL,
@@ -498,6 +518,7 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         csr_ks0 = const CSR_KS0,
         csr_ks1 = const CSR_KS1,
         prmd_pplv_mask = const CSR_PRMD_PPLV_MASK,
+        crmd_ie_mask = const CRMD_IE_MASK,
         euen_fpe = const EUEN_FPE,
         euen_sxe = const EUEN_SXE,
         fpu_saved = const FPU_SAVED,

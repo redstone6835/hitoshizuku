@@ -12,6 +12,7 @@ use super::heap_vm::activate_kernel_page_table_for_secondary;
 use super::loader::{configure_local_timer, timer_hz};
 use super::specific::*;
 use super::task::LoongArch64TaskOps;
+use super::tlb_shootdown::{PendingTlbFlush, TlbFlushOp};
 use super::trap::{
     LoongArch64InterruptOps, LoongArch64MessageInterruptOps, install_exception_entry,
 };
@@ -61,9 +62,8 @@ static TLB_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; 
 static TLB_COMPLETED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ICACHE_REQUESTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ICACHE_COMPLETED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
-static TLB_SHOOTDOWN_ASID: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
-static TLB_SHOOTDOWN_ADDR: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
+static PENDING_TLB_FLUSH: [PendingTlbFlush; MAX_CPUS] =
+    [const { PendingTlbFlush::new() }; MAX_CPUS];
 
 #[repr(C, align(16))]
 struct SecondaryStack([u8; AP_STACK_SIZE]);
@@ -257,28 +257,48 @@ pub(crate) fn handle_ipi() {
     sched::acknowledge_resched_notification();
 }
 
-fn local_tlb_flush(asid: usize, address: usize) {
+fn tlb_flush_operation(asid: usize, address: usize) -> TlbFlushOp {
+    if address == ALL_ADDRESSES {
+        if asid == 0 {
+            TlbFlushOp::All
+        } else {
+            TlbFlushOp::Asid {
+                hardware_asid: asid_bits(asid),
+            }
+        }
+    } else {
+        TlbFlushOp::Page {
+            hardware_asid: asid_bits(asid),
+            address,
+        }
+    }
+}
+
+fn local_tlb_flush(operation: TlbFlushOp) {
     unsafe {
         core::arch::asm!("dbar 0", options(nostack, preserves_flags));
-        if address == ALL_ADDRESSES {
-            if asid == 0 {
-                // No ASID hint: flush everything
+        match operation {
+            TlbFlushOp::All => {
                 core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
-            } else {
-                // ASID-specific full flush: invtlb 0x3 flushes all entries for asid
+            }
+            TlbFlushOp::Asid { hardware_asid } => {
                 core::arch::asm!(
                     "invtlb 0x3, {asid}, $zero",
-                    asid = in(reg) asid_bits(asid),
+                    asid = in(reg) hardware_asid,
                     options(nostack)
                 );
             }
-        } else {
-            core::arch::asm!(
-                "invtlb 0x5, {asid}, {address}",
-                asid = in(reg) asid_bits(asid),
-                address = in(reg) address,
-                options(nostack)
-            );
+            TlbFlushOp::Page {
+                hardware_asid,
+                address,
+            } => {
+                core::arch::asm!(
+                    "invtlb 0x5, {asid}, {address}",
+                    asid = in(reg) hardware_asid,
+                    address = in(reg) address,
+                    options(nostack)
+                );
+            }
         }
     }
 }
@@ -297,11 +317,12 @@ pub(crate) fn handle_shootdown_requests() {
         if shootdown_sequence_reached(completed, requested) {
             break;
         }
-        // Read asid/addr hint with Relaxed: worst case we use stale values
-        // which just means we over-flush, never under-flush.
-        let hint_asid = TLB_SHOOTDOWN_ASID[logical_id].load(Ordering::Relaxed);
-        let hint_addr = TLB_SHOOTDOWN_ADDR[logical_id].load(Ordering::Relaxed);
-        local_tlb_flush(hint_asid, hint_addr);
+        // 描述符可能被早于代次增长到达的刷新请求消费；后续代次
+        // 因而保守执行一次全局刷新。
+        let operation = PENDING_TLB_FLUSH[logical_id]
+            .take()
+            .unwrap_or(TlbFlushOp::All);
+        local_tlb_flush(operation);
         TLB_COMPLETED[logical_id].store(requested, Ordering::Release);
     }
     loop {
@@ -312,7 +333,7 @@ pub(crate) fn handle_shootdown_requests() {
         }
         local_icache_sync();
         ICACHE_COMPLETED[logical_id].store(requested, Ordering::Release);
-        // flush 期间可能又有新 generation 到达，而 IOCSR 会把同类
+        // 刷新期间可能又有新代次到达，而 IOCSR 会把同类
         // IPI 合并成一个位。必须重读 requested 直到稳定，不能假设
         // 后续请求一定还会带来新的中断边沿。
     }
@@ -324,13 +345,15 @@ fn publish_shootdown(
     address: usize,
     action: u32,
     requested_targets: usize,
+    allow_switched_user_target: bool,
 ) {
     let source = LoongArch64MessageInterruptOps::current_cpu_id();
     let source_bit = 1usize << source;
     let targets = ONLINE_CPUS.load(Ordering::Acquire) & requested_targets & !source_bit;
+    let operation = tlb_flush_operation(asid, address);
 
     match kind {
-        SHOOTDOWN_TLB => local_tlb_flush(asid, address),
+        SHOOTDOWN_TLB => local_tlb_flush(operation),
         SHOOTDOWN_ICACHE => local_icache_sync(),
         _ => return,
     }
@@ -345,12 +368,9 @@ fn publish_shootdown(
         }
         expected[logical_id] = match kind {
             SHOOTDOWN_TLB => {
-                // Store shootdown parameters before bumping sequence.
-                // Targets use these for precise invtlb when possible.
-                // Under concurrent shootdowns the hint may be stale; targets
-                // fall back to invtlb 0x0 when asid==0 or addr==ALL_ADDRESSES.
-                TLB_SHOOTDOWN_ASID[logical_id].store(asid, Ordering::Relaxed);
-                TLB_SHOOTDOWN_ADDR[logical_id].store(address, Ordering::Relaxed);
+                // 在发布代次前聚合可由一次远端刷新覆盖的全部请求。不同页或
+                // ASID 会扩大刷新范围，任何代次都不能覆盖另一代次的精确描述符。
+                PENDING_TLB_FLUSH[logical_id].merge(operation);
                 TLB_REQUESTED[logical_id]
                     .fetch_add(1, Ordering::AcqRel)
                     .wrapping_add(1)
@@ -363,7 +383,15 @@ fn publish_shootdown(
         sched::mark_urgent_work(logical_id);
     }
     send_action_to_mask(targets, action);
-    wait_for_shootdown(kind, action, asid, address, targets, &expected);
+    wait_for_shootdown(
+        kind,
+        action,
+        asid,
+        address,
+        targets,
+        &expected,
+        allow_switched_user_target,
+    );
 }
 
 fn wait_for_shootdown(
@@ -373,6 +401,7 @@ fn wait_for_shootdown(
     address: usize,
     targets: usize,
     expected: &[usize; MAX_CPUS],
+    allow_switched_user_target: bool,
 ) {
     let counter_hz = stable_counter_hz().max(1);
     let retry_ticks = (counter_hz / SHOOTDOWN_RETRY_DIVISOR).max(1);
@@ -391,6 +420,17 @@ fn wait_for_shootdown(
         loop {
             let observed = completed.load(Ordering::Acquire);
             if shootdown_sequence_reached(observed, expected[logical_id]) {
+                break;
+            }
+            // 用户地址空间的目标 CPU 可能在请求发布后已经切离该 ASID。切换路径先
+            // 发布新逻辑 ASID，再在任何后续用户访问前完成完整本地 TLB 失效；此时
+            // 等待旧请求的确认既不增加安全性，也可能与目标 CPU 持有的内核锁形成
+            // 永久等待环。不能替目标 CPU 写入完成计数，因为那里还可能合并了其它
+            // 地址空间的请求，仍由目标 CPU 在下一个可处理中断边界统一消费。
+            if allow_switched_user_target
+                && kind == SHOOTDOWN_TLB
+                && CURRENT_LOGICAL_ASIDS.user_shootdown_is_obsolete(logical_id, asid)
+            {
                 break;
             }
             // 两个 CPU 可能同时发起 shootdown。在等待对端时主动消费本核请求，
@@ -454,6 +494,9 @@ pub(crate) fn flush_tlb_all_cpus(asid: usize, address: Option<usize>) {
         address.unwrap_or(ALL_ADDRESSES),
         ACTION_TLB_SHOOTDOWN,
         usize::MAX,
+        // 即使目标集合是全部在线 CPU，非零 ASID 仍只代表某个用户地址空间。
+        // 已切离该地址空间的 CPU 会在后续重新激活前按代际完成完整本地失效。
+        asid != super::asid_tracker::KERNEL_LOGICAL_ASID,
     );
 }
 
@@ -464,6 +507,7 @@ pub(crate) fn flush_tlb_on_cpus(asid: usize, address: Option<usize>, targets: us
         address.unwrap_or(ALL_ADDRESSES),
         ACTION_TLB_SHOOTDOWN,
         targets,
+        true,
     );
 }
 
@@ -474,6 +518,7 @@ pub(crate) fn sync_icache_all_cpus() {
         ALL_ADDRESSES,
         ACTION_ICACHE_SYNC,
         usize::MAX,
+        false,
     );
 }
 

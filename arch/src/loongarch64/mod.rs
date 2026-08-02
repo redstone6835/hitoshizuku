@@ -32,6 +32,7 @@ mod smp;
 mod specific;
 mod syscall;
 mod task;
+mod tlb_shootdown;
 mod trap;
 pub mod vdso;
 
