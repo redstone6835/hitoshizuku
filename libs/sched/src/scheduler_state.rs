@@ -26,7 +26,6 @@ const TARGETED_HANDOFF_PENDING: u8 = u8::MAX;
 pub enum HandoffReason {
     SocketRead,
     SocketReadContinuation,
-    FutexWake,
 }
 
 /// 从唤醒点传到公共 syscall 返回边界的稳定任务身份。

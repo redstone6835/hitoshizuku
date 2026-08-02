@@ -2617,16 +2617,18 @@ fn futex_cmd(futex_op: u32) -> u32 {
 
 #[cfg(feature = "trace-task-lifecycle")]
 fn trace_futex_task(task: &Task) -> bool {
-    let comm = task.comm();
-    if comm.starts_with(b"tg-xtask")
-        || comm.starts_with(b"tokio")
-        || comm.starts_with(b"futures-timer")
+    #[cfg(feature = "performance-profile")]
     {
-        return true;
+        // 诊断范围由 profile_control 的 root=<pid> 定义，并随子进程继承；
+        // 不依赖特定程序名，任意工作负载都能得到同样的 futex 因果链。
+        let session = task.profile_session_id();
+        session != 0 && session == profiling::session_id()
     }
-    task.thread_group()
-        .leader()
-        .is_some_and(|leader| leader.comm().starts_with(b"tg-xtask"))
+    #[cfg(not(feature = "performance-profile"))]
+    {
+        let _ = task;
+        false
+    }
 }
 
 fn task_vm_space_for_futex(task: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
@@ -2842,28 +2844,16 @@ fn futex_wake_key_inner(key: FutexKey, count: usize, bitset: u32, trace: bool) -
 fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> usize {
     let mut woken = 0usize;
     let now_ns = sched::now_ns_public();
-    let local_cpu = sched::current_cpu_id();
-    let allow_handoff = sched::current_task_ref().execution_scope_kind()
-        == Some(sched::ExecutionScopeKind::Syscall);
-    let mut handoff = None;
     for (waiter, state) in waiters {
         match state.mark_woken() {
             FUTEX_WAIT_SLEEPING => {
                 if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
                     #[cfg(feature = "performance-profile")]
                     waiter.mark_profile_woken(now_ns);
-                    // 只对首个同核等待者保存精确交接目标；其余等待者仍按既有
-                    // preferred runqueue 规则入队，避免一次 WAKE 批次反复覆盖目标。
-                    let target = sched::enqueue_task_preferred_for_handoff(
-                        waiter,
-                        now_ns,
-                        sched::HandoffReason::FutexWake,
-                        true,
-                        true,
-                    );
-                    if allow_handoff && handoff.is_none() && target.preferred_cpu() == local_cpu {
-                        handoff = Some(target);
-                    }
+                    // futex 唤醒可以跨越任意用户态同步原语；只按常规首选队列入队，
+                    // 不依赖当前 syscall 的返回边界完成交接，避免唤醒者与等待者的
+                    // 执行边界不重合时延迟调度。
+                    sched::enqueue_task_preferred(waiter, now_ns);
                 }
                 woken += 1;
             }
@@ -2878,9 +2868,6 @@ fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> 
             }
             _ => {}
         }
-    }
-    if let Some(target) = handoff {
-        sched::request_post_syscall_handoff_to(target);
     }
     woken
 }
