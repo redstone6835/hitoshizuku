@@ -22,15 +22,74 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::pid::{PID_INVALID, PidT};
 use crate::rlimit::Rlimits;
-use crate::signal::SharedSignal;
+use crate::signal::{SharedSignal, SignalNumber};
 use crate::sync::Spinlock;
 use crate::task::{Task, TaskUsage};
 
 // ── ThreadGroup ─────────────────────────────────────────────────────────────
+
+const GROUP_EXIT_PRESENT: u64 = 1 << 63;
+const GROUP_EXIT_SIGNALED: u64 = 1 << 62;
+const GROUP_EXIT_CORE_DUMPED: u64 = 1 << 61;
+
+/// 线程组整体退出的权威状态。
+///
+/// 该状态只能由第一个 `exit_group` / 致命组信号请求发布，
+/// 后续成员均使用它退出，父进程也以它生成 wait status。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupExitStatus {
+    Exited(i32),
+    Signaled {
+        signal: SignalNumber,
+        core_dumped: bool,
+    },
+}
+
+impl GroupExitStatus {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Exited(code) => code,
+            Self::Signaled { signal, .. } => signal.raw() as i32,
+        }
+    }
+
+    fn encode(self) -> u64 {
+        match self {
+            Self::Exited(code) => GROUP_EXIT_PRESENT | u64::from(code as u32),
+            Self::Signaled {
+                signal,
+                core_dumped,
+            } => {
+                GROUP_EXIT_PRESENT
+                    | GROUP_EXIT_SIGNALED
+                    | if core_dumped {
+                        GROUP_EXIT_CORE_DUMPED
+                    } else {
+                        0
+                    }
+                    | u64::from(signal.raw() as u32)
+            }
+        }
+    }
+
+    fn decode(encoded: u64) -> Option<Self> {
+        if encoded & GROUP_EXIT_PRESENT == 0 {
+            return None;
+        }
+        if encoded & GROUP_EXIT_SIGNALED == 0 {
+            return Some(Self::Exited((encoded as u32) as i32));
+        }
+        let signal = SignalNumber::from_raw((encoded as u32) as i32)?;
+        Some(Self::Signaled {
+            signal,
+            core_dumped: encoded & GROUP_EXIT_CORE_DUMPED != 0,
+        })
+    }
+}
 
 /// 线程组：共享同一 address space / fd table 的任务集合。
 pub struct ThreadGroup {
@@ -50,6 +109,12 @@ pub struct ThreadGroup {
     acct_live_members: AtomicUsize,
     /// 防止并发退出路径重复输出同一条 acct 记录。
     acct_emitted: AtomicBool,
+    /// 线程组已开始整体退出；置位后不再接纳新的 CLONE_THREAD 成员。
+    closing: AtomicBool,
+    /// 所有已接纳成员均已进入 Zombie/Dead，leader 此后才可被父进程回收。
+    terminated: AtomicBool,
+    /// 协作式组退出请求；编码同时保存普通退出或信号退出原因。
+    group_exit: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -64,6 +129,9 @@ impl ThreadGroup {
             exited_usage: Spinlock::new(TaskUsage::default()),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
+            group_exit: AtomicU64::new(0),
         })
     }
 
@@ -81,6 +149,9 @@ impl ThreadGroup {
             exited_usage: Spinlock::new(TaskUsage::default()),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
+            group_exit: AtomicU64::new(0),
         })
     }
 
@@ -95,7 +166,11 @@ impl ThreadGroup {
         self.leader.lock().upgrade()
     }
 
-    pub fn add_member(&self, task: &Arc<Task>) {
+    /// 尝试接纳一个成员。整体退出与成员登记通过 `members` 锁排序：
+    ///
+    /// - 若登记先完成，随后退出路径的 snapshot 必然包含该成员；
+    /// - 若退出先发布，登记会被拒绝，避免 leader 可回收后又出现新线程。
+    pub fn try_add_member(&self, task: &Arc<Task>) -> bool {
         if self.tgid() == PID_INVALID {
             if let Some(leader) = self.leader() {
                 if let Some(pid) = leader.pid_root() {
@@ -105,17 +180,35 @@ impl ThreadGroup {
                 self.set_tgid(pid);
             }
         }
-        self.members.lock().push(Arc::downgrade(task));
+        let mut members = self.members.lock();
+        if self.closing.load(Ordering::Acquire) || self.terminated.load(Ordering::Acquire) {
+            return false;
+        }
+        members.push(Arc::downgrade(task));
         self.acct_live_members.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    pub fn add_member(&self, task: &Arc<Task>) {
+        assert!(
+            self.try_add_member(task),
+            "[sched][group] adding member to closing thread group"
+        );
     }
 
     /// 移除一个成员，同时顺带清理已死的 Weak。
-    pub fn remove_member(&self, task: &Arc<Task>) {
+    pub fn remove_member(&self, task: &Arc<Task>) -> bool {
         let mut members = self.members.lock();
+        let mut removed = false;
         members.retain(|w| match w.upgrade() {
-            Some(t) => !Arc::ptr_eq(&t, task),
+            Some(t) if Arc::ptr_eq(&t, task) => {
+                removed = true;
+                false
+            }
+            Some(_) => true,
             None => false,
         });
+        removed
     }
 
     /// 列出当前线程组的活成员快照。
@@ -172,6 +265,86 @@ impl ThreadGroup {
             .is_ok()
     }
 
+    /// 禁止新成员加入；调用方随后必须在成员锁之后取得 snapshot 并逐一唤醒。
+    fn begin_group_exit(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+
+    /// 发布线程组退出请求。并发请求遵循 first-wins。
+    fn request_group_status(&self, status: GroupExitStatus) -> GroupExitStatus {
+        let encoded = status.encode();
+        self.begin_group_exit();
+        let selected =
+            match self
+                .group_exit
+                .compare_exchange(0, encoded, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => encoded,
+                Err(existing) => existing,
+            };
+        GroupExitStatus::decode(selected).expect("published group-exit status must decode")
+    }
+
+    /// 发布 `exit_group` 退出码并返回最终采用的退出码。
+    pub fn request_group_exit(&self, code: i32) -> i32 {
+        self.request_group_status(GroupExitStatus::Exited(code))
+            .exit_code()
+    }
+
+    /// 发布致命信号退出原因并返回最终采用的组状态。
+    pub fn request_group_signal(&self, signal: SignalNumber, core_dumped: bool) -> GroupExitStatus {
+        self.request_group_status(GroupExitStatus::Signaled {
+            signal,
+            core_dumped,
+        })
+    }
+
+    /// 返回已经发布的线程组退出状态。
+    pub fn group_exit_status(&self) -> Option<GroupExitStatus> {
+        GroupExitStatus::decode(self.group_exit.load(Ordering::Acquire))
+    }
+
+    /// 返回已经发布的线程组退出码。
+    pub fn group_exit_code(&self) -> Option<i32> {
+        self.group_exit_status().map(GroupExitStatus::exit_code)
+    }
+
+    /// 在成员完成各自的退出前清理后，尝试发布“线程组已经完全终止”。
+    ///
+    /// 该判断与成员加入共用 `members` 锁，因此一旦成功便不会再有新成员出现。
+    /// leader 可能较早进入 Zombie；最终转换必须再次唤醒其 pidfd 等等待者。
+    pub fn mark_terminated_if_all_members_terminal(&self) -> bool {
+        let became_terminated = {
+            let mut members = self.members.lock();
+            let mut all_terminal = true;
+            members.retain(|weak| {
+                let Some(task) = weak.upgrade() else {
+                    return false;
+                };
+                if !matches!(
+                    task.state(),
+                    crate::TaskState::Zombie | crate::TaskState::Dead
+                ) {
+                    all_terminal = false;
+                }
+                true
+            });
+            all_terminal
+                && self
+                    .terminated
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+        };
+        if became_terminated && let Some(leader) = self.leader() {
+            leader.exit_waiters.wake_all();
+        }
+        became_terminated
+    }
+
+    pub fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+
     pub fn set_tgid(&self, pid: PidT) {
         if pid <= PID_INVALID {
             return;
@@ -199,6 +372,9 @@ impl Default for ThreadGroup {
             exited_usage: Spinlock::new(TaskUsage::default()),
             acct_live_members: AtomicUsize::new(0),
             acct_emitted: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
+            group_exit: AtomicU64::new(0),
         }
     }
 }
@@ -348,5 +524,42 @@ impl Session {
                 debug_assert_eq!(prev, pid, "[sched][group] SID changed after publication");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GroupExitStatus, ThreadGroup};
+    use crate::SignalNumber;
+
+    #[test]
+    fn group_exit_request_is_first_writer_wins() {
+        let group = ThreadGroup::new();
+        assert_eq!(group.group_exit_code(), None);
+
+        assert_eq!(group.request_group_exit(-17), -17);
+        assert_eq!(group.request_group_exit(23), -17);
+
+        assert_eq!(group.group_exit_code(), Some(-17));
+    }
+
+    #[test]
+    fn signal_and_exit_requests_share_one_first_writer_slot() {
+        let exit_first = ThreadGroup::new();
+        assert_eq!(exit_first.request_group_exit(42), 42);
+        assert_eq!(
+            exit_first.request_group_signal(SignalNumber::SIGKILL, false),
+            GroupExitStatus::Exited(42)
+        );
+
+        let signal_first = ThreadGroup::new();
+        assert_eq!(
+            signal_first.request_group_signal(SignalNumber::SIGKILL, false),
+            GroupExitStatus::Signaled {
+                signal: SignalNumber::SIGKILL,
+                core_dumped: false,
+            }
+        );
+        assert_eq!(signal_first.request_group_exit(42), 9);
     }
 }

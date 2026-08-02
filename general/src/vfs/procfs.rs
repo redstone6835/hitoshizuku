@@ -71,6 +71,7 @@ const SYS_SCHED_RT_RUNTIME_INO: u64 = 25;
 const SYS_SCHED_RR_TIMESLICE_INO: u64 = 26;
 const SYS_PIPE_MAX_SIZE_INO: u64 = 27;
 const SYS_TAINTED_INO: u64 = 28;
+const TASK_SNAPSHOT_INO: u64 = 29;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -219,6 +220,7 @@ enum RootFileKind {
     Devices,
     Pnp,
     DeviceFunctions,
+    TaskSnapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -377,6 +379,20 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         (
             "device-functions",
             mk_root_file(DEVICE_FUNCTIONS_INO, RootFileKind::DeviceFunctions),
+        ),
+        (
+            "task-snapshot",
+            mk_inode(
+                fs_id,
+                weak_sb,
+                TASK_SNAPSHOT_INO,
+                FileType::Regular,
+                0o400,
+                1,
+                Arc::new(ProcRegularInodeOps {
+                    kind: ProcFileKind::Root(RootFileKind::TaskSnapshot),
+                }),
+            ),
         ),
         ("self", self_inode),
         ("thread-self", thread_self_inode),
@@ -1741,7 +1757,16 @@ impl InodeOps for ProcRegularInodeOps {
             let task = lookup_task(pid).ok_or(VfsError::NotFound)?;
             ensure_task_access(&task)?;
         }
-        Ok(Box::new(ProcRegularFile { kind: self.kind }))
+        let snapshot = match self.kind {
+            ProcFileKind::Root(RootFileKind::TaskSnapshot) => {
+                Some(render_task_snapshot()?.into_boxed_slice())
+            }
+            _ => None,
+        };
+        Ok(Box::new(ProcRegularFile {
+            kind: self.kind,
+            snapshot,
+        }))
     }
 
     fn truncate(&self, _: &Inode, size: u64) -> VfsResult<()> {
@@ -1776,12 +1801,16 @@ impl InodeOps for ProcRegularInodeOps {
 
 struct ProcRegularFile {
     kind: ProcFileKind,
+    snapshot: Option<Box<[u8]>>,
 }
 
 impl FileOps for ProcRegularFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         if let ProcFileKind::Root(RootFileKind::MemInfo) = self.kind {
             return read_meminfo_at(buf, offset);
+        }
+        if let Some(snapshot) = &self.snapshot {
+            return slice_bytes(buf, offset, snapshot);
         }
         let content = render_proc_file(self.kind)?;
         slice_bytes(buf, offset, &content)
@@ -1877,6 +1906,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::Devices => render_devices().into_bytes(),
             RootFileKind::Pnp => render_pnp().into_bytes(),
             RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
+            RootFileKind::TaskSnapshot => return render_task_snapshot(),
         }),
         ProcFileKind::Task { pid, kind } => {
             let task = lookup_task(pid).ok_or(VfsError::NotFound)?;
@@ -1968,6 +1998,61 @@ fn lookup_task(pid: PidT) -> Option<Arc<Task>> {
 
 fn ensure_task_exists(pid: PidT) -> VfsResult<Arc<Task>> {
     lookup_task(pid).ok_or(VfsError::NotFound)
+}
+
+/// 在一次打开操作中固定任务组状态，供控制面验证 STOP/late-fork 边界。
+///
+/// 这里刻意不调用 `render_task_stat`：后者还会遍历 VMA，任务 teardown 时
+/// 可能长时间等待地址空间锁。快照只读取 PID registry、关系、进程组和原子
+/// 状态字段，调用方应把它视为一致性检查而不是完整的 proc ABI。
+fn render_task_snapshot() -> VfsResult<Vec<u8>> {
+    let mut tasks = Vec::new();
+    if sched::is_ready() {
+        for (pid, weak) in sched::root_pid_ns().registry().snapshot() {
+            if let Some(task) = weak.upgrade() {
+                tasks.push((pid, task));
+            }
+        }
+    }
+    tasks.sort_unstable_by_key(|(pid, _)| *pid);
+
+    let mut out = String::new();
+    out.try_reserve(72usize.saturating_add(tasks.len().saturating_mul(112)))
+        .map_err(|_| VfsError::NoSpace)?;
+    out.push_str("# mygo.task-snapshot.v1 pid ppid tgid pgrp state start_ticks comm\n");
+    for (pid, task) in tasks {
+        let ppid = task
+            .parent()
+            .and_then(|parent| parent.tgid_cached().or_else(|| parent.pid_root_cached()))
+            .unwrap_or(0);
+        let tgid = task
+            .tgid_cached()
+            .or_else(|| task.pid_root_cached())
+            .unwrap_or(pid);
+        let pgrp = task.process_group().pgid();
+        let state = task_state_char(task.state());
+        let start_ticks = proc_cpu_ticks(task.start_time_ns());
+        write!(
+            out,
+            "{pid}\t{ppid}\t{tgid}\t{pgrp}\t{state}\t{start_ticks}\t"
+        )
+        .map_err(|_| VfsError::NoSpace)?;
+        let raw_comm = task.comm();
+        let mut comm_empty = true;
+        for byte in raw_comm.iter().copied().take_while(|byte| *byte != 0) {
+            if byte.is_ascii_graphic() && !matches!(byte, b'|' | b'=') {
+                out.push(byte as char);
+            } else {
+                out.push('_');
+            }
+            comm_empty = false;
+        }
+        if comm_empty {
+            out.push_str("unknown");
+        }
+        out.push('\n');
+    }
+    Ok(out.into_bytes())
 }
 
 fn snapshot_root_processes() -> Vec<PidT> {
@@ -2510,6 +2595,12 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
     let sched_diag = sched::scheduler_diag();
     let task_diag = sched::task_diag();
     let vm_diag = crate::mm::vm_space::vm_space_diag();
+    let private_file_cache_diag = crate::mm::vm_space::private_file_page_cache_diag();
+    let fault_around_diag = crate::mm::vm_space::fault_around_diag();
+    let anon_fault_around_diag = crate::mm::vm_space::anon_fault_around_diag();
+    #[cfg(feature = "performance-profile")]
+    let hardware_fault_diag = crate::mm::vm_space::hardware_fault_diag();
+    let anon_store_shadow_diag = crate::mm::vm_space::anon_store_shadow_diag();
     let file_diag = vfs::file::file_diag();
     let fdtable_diag = vfs::fdtable::fdtable_diag();
     let vfs_context_diag = vfs::vfs_context_diag();
@@ -2621,12 +2712,52 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
          VfsCtxDropped:  {:>8}\n\
          VmSpaceLive:    {:>8}\n\
          VmSpaceCreated: {:>8}\n\
-         VmSpaceDropped: {:>8}\n",
+         VmSpaceDropped: {:>8}\n\
+         PrivateFileCache:{:>8} kB\n\
+         PrivateCachePages:{:>7}\n\
+         PrivateCacheLimit:{:>7}\n\
+         PrivateCacheHits:  {:>7}\n\
+         PrivateCacheMisses:{:>6}\n\
+         PrivateCacheEvict:{:>7}\n\
+         PrivateCachePressureDrops:{:>3}\n\
+         PrivateCacheLoadLeaders:{:>6}\n\
+         PrivateCacheLoadWaiters:{:>6}\n\
+         PrivateCacheLoadErrors:{:>7}\n\
+         FaultAroundWindows:{:>8}\n\
+         FaultAroundRequested:{:>6}\n\
+         FaultAroundPrepared:{:>7}\n\
+         FaultAroundCommits:{:>8}\n\
+         FaultAroundInstalled:{:>6}\n\
+         FaultAroundRaced:{:>10}\n\
+         FaultAroundCollisionWindows:{:>1}\n\
+         FaultAroundDuplicatePages:{:>4}\n\
+         FaultAroundDiscardedUnmapped:{:>1}\n\
+         FaultAroundVmaRetryPages:{:>3}\n\
+         FaultAroundRacedPages:{:>7}\n\
+         FaultAroundMapFailedPages:{:>3}\n\
+         AnonFaultWindows:     {:>8}\n\
+         AnonFaultRequested:   {:>8}\n\
+         AnonFaultPrepared:    {:>8}\n\
+         AnonFaultAllocShort:  {:>8}\n\
+         AnonFaultReserveFallback:{:>4}\n\
+         AnonFaultVmaRetryPages:{:>6}\n\
+         AnonFaultRacedPages:  {:>8}\n\
+         AnonFaultInvariantPages:{:>6}\n\
+         AnonFaultCollisionDiscard:{:>3}\n\
+         AnonFaultMapDiscard:  {:>8}\n\
+         AnonFaultInstalled:   {:>8}\n\
+         AnonFaultCommits:     {:>8}\n\
+         AnonFaultPartial:     {:>8}\n\
+         AnonFaultMapFailures: {:>8}\n\
+         AnonStoreShadowFaults:{:>6}\n\
+         AnonStoreShadowBatches:{:>5}\n\
+         AnonStoreShadowWouldSave:{:>3}\n\
+         AnonStoreShadowResets:{:>7}\n",
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(mem_available),
         0usize, // TODO: 实现 Buffers（块设备缓冲区统计）
-        0usize, // TODO: 实现 Cached（页缓存统计）
+        0usize, // TODO: 汇总文件页缓存与块缓存后实现标准 Cached 字段
         0usize, // TODO: 实现 SwapCached
         kb(slab_bytes),
         0usize, // TODO: 实现 KernelStack（内核栈统计）
@@ -2704,7 +2835,80 @@ fn render_meminfo_into(buf: &mut [u8]) -> usize {
         vm_diag.live,
         vm_diag.created,
         vm_diag.dropped,
+        kb(private_file_cache_diag.pages.saturating_mul(page_size()),),
+        private_file_cache_diag.pages,
+        private_file_cache_diag.capacity,
+        private_file_cache_diag.hits,
+        private_file_cache_diag.misses,
+        private_file_cache_diag.evictions,
+        private_file_cache_diag.pressure_reclaims,
+        private_file_cache_diag.load_leaders,
+        private_file_cache_diag.load_waiters,
+        private_file_cache_diag.load_errors,
+        fault_around_diag.windows,
+        fault_around_diag.requested_pages,
+        fault_around_diag.prepared_pages,
+        fault_around_diag.commits,
+        fault_around_diag.installed_pages,
+        fault_around_diag.raced_commits,
+        fault_around_diag.collision_windows,
+        fault_around_diag.duplicate_pages,
+        fault_around_diag.discarded_unmapped_pages,
+        fault_around_diag.vma_retry_pages,
+        fault_around_diag.raced_pages,
+        fault_around_diag.map_failed_pages,
+        anon_fault_around_diag.windows,
+        anon_fault_around_diag.requested_pages,
+        anon_fault_around_diag.prepared_pages,
+        anon_fault_around_diag.allocation_shortfall_pages,
+        anon_fault_around_diag.reserve_fallbacks,
+        anon_fault_around_diag.vma_retry_pages,
+        anon_fault_around_diag.raced_pages,
+        anon_fault_around_diag.invariant_failure_pages,
+        anon_fault_around_diag.collision_discarded_pages,
+        anon_fault_around_diag.map_discarded_pages,
+        anon_fault_around_diag.installed_pages,
+        anon_fault_around_diag.commits,
+        anon_fault_around_diag.partial_commits,
+        anon_fault_around_diag.map_failures,
+        anon_store_shadow_diag.faults,
+        anon_store_shadow_diag.simulated_batches,
+        anon_store_shadow_diag.would_save,
+        anon_store_shadow_diag.migration_interleave_resets,
     );
+    #[cfg(feature = "performance-profile")]
+    {
+        let traps = profiling::loongarch_user_trap_snapshot();
+        let _ = write!(
+            out,
+            "ProfileLaUserSyscalls: {:>8}\n\
+             ProfileLaUserOtherTraps:{:>8}\n\
+             ProfileLaSysFpuSaved:  {:>8}\n\
+             ProfileLaSysLsxSaved:  {:>8}\n\
+             ProfileLaOtherFpuSaved:{:>8}\n\
+             ProfileLaOtherLsxSaved:{:>8}\n",
+            traps.user_syscalls,
+            traps.user_other_traps,
+            traps.syscall_fpu_saved,
+            traps.syscall_lsx_saved,
+            traps.other_fpu_saved,
+            traps.other_lsx_saved,
+        );
+        for backing in crate::mm::vm_space::HardwareFaultBacking::ALL {
+            for access in crate::mm::vm_space::HardwareFaultAccess::ALL {
+                let nonresident = hardware_fault_diag.count(backing, access, false);
+                let resident = hardware_fault_diag.count(backing, access, true);
+                let _ = writeln!(
+                    out,
+                    "HwUserFault{}{}: {:>8} resident {:>8}",
+                    backing.name(),
+                    access.name(),
+                    nonresident.saturating_add(resident),
+                    resident,
+                );
+            }
+        }
+    }
     for class in slab_classes {
         let _ = write!(
             out,

@@ -7,7 +7,7 @@
 
 use alloc::sync::Arc;
 
-use crate::dev::bio::{BioError, BlockRange};
+use crate::dev::bio::{BIO_MAX_BORROWED_SEGMENTS, BioError, BlockRange};
 use crate::dev::block::BlockDevice;
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
 
@@ -203,6 +203,43 @@ impl extfs::BlockBackend for FsBlockAdapter {
         Ok(())
     }
 
+    fn read_sectors_vectored(
+        &self,
+        lba: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> Result<(), extfs::BlockBackendError> {
+        let bps = self.sector_size_bytes() as usize;
+        let (want, blocks) =
+            checked_vectored_io_len(bufs, bps).ok_or(extfs::BlockBackendError::OutOfRange)?;
+        let end_lba = lba
+            .checked_add(blocks as u64)
+            .ok_or(extfs::BlockBackendError::OutOfRange)?;
+        if end_lba > self.sector_count_total() {
+            return Err(extfs::BlockBackendError::OutOfRange);
+        }
+        if want == 0 {
+            return Ok(());
+        }
+
+        let mut next_lba = lba;
+        for chunk in bufs.chunks_mut(BIO_MAX_BORROWED_SEGMENTS) {
+            let (_, chunk_blocks) =
+                checked_vectored_io_len(chunk, bps).ok_or(extfs::BlockBackendError::OutOfRange)?;
+            let range = BlockRange {
+                lba: next_lba,
+                blocks: chunk_blocks,
+            };
+            self.dev
+                .submit_bio_wait_borrowed_read_vectored(range, chunk)
+                .map_err(|_| extfs::BlockBackendError::Io)?;
+            next_lba = next_lba
+                .checked_add(u64::from(chunk_blocks))
+                .ok_or(extfs::BlockBackendError::OutOfRange)?;
+        }
+        debug_assert_eq!(next_lba, lba + u64::from(blocks));
+        Ok(())
+    }
+
     fn write_sectors(
         &self,
         lba: u64,
@@ -219,5 +256,43 @@ impl extfs::BlockBackend for FsBlockAdapter {
             .submit_bio_wait_borrowed_write(range, &buf[..want])
             .map_err(|_| extfs::BlockBackendError::Io)?;
         Ok(())
+    }
+}
+
+fn checked_vectored_io_len(bufs: &[&mut [u8]], bytes_per_sector: usize) -> Option<(usize, u32)> {
+    if bytes_per_sector == 0 {
+        return None;
+    }
+    let mut bytes = 0usize;
+    for buf in bufs {
+        if buf.is_empty() || buf.len() % bytes_per_sector != 0 {
+            return None;
+        }
+        bytes = bytes.checked_add(buf.len())?;
+    }
+    let blocks = bytes / bytes_per_sector;
+    Some((bytes, u32::try_from(blocks).ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_vectored_io_len;
+
+    #[test]
+    fn vectored_layout_counts_one_contiguous_request() {
+        let mut first = [0u8; 4096];
+        let mut second = [0u8; 8192];
+        assert_eq!(
+            checked_vectored_io_len(&[&mut first, &mut second], 512),
+            Some((12 * 1024, 24))
+        );
+    }
+
+    #[test]
+    fn vectored_layout_rejects_empty_or_misaligned_slices() {
+        let mut empty = [];
+        let mut misaligned = [0u8; 513];
+        assert_eq!(checked_vectored_io_len(&[&mut empty], 512), None);
+        assert_eq!(checked_vectored_io_len(&[&mut misaligned], 512), None);
     }
 }

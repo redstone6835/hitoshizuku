@@ -1882,7 +1882,13 @@ fn exact_kernel_api_rlibs(
             }
             let value = fs::read_to_string(&marker_path)
                 .map_err(|error| format!("读取 {} 失败: {error}", marker_path.display()))?;
-            if parse_cargo_fingerprint(value.trim())? != *expected {
+            // Cargo 会在被中断或并发构建后留下空的、截断的旧 marker。这里遍历的
+            // 是候选目录，格式无效只说明该候选不可用；活动构建图给出的 expected
+            // 以及最终唯一 rlib 匹配仍按原规则严格校验。
+            let Ok(observed) = parse_cargo_fingerprint(value.trim()) else {
+                continue;
+            };
+            if observed != *expected {
                 continue;
             }
             let rlib = deps.join(format!("lib{}-{suffix}.rlib", spec.name));
@@ -2852,6 +2858,8 @@ mod tests {
             parse_cargo_fingerprint("86b5aa5283fc3f80").unwrap(),
             9_241_382_601_345_381_766
         );
+        assert!(parse_cargo_fingerprint("").is_err());
+        assert!(parse_cargo_fingerprint("86b5aa52").is_err());
         assert!(valid_metadata_file("vfs", "libvfs-bcc06a6bb214de4e.rlib"));
         assert!(!valid_metadata_file(
             "vfs",
@@ -2924,17 +2932,20 @@ mod tests {
             "vfs.file.File.mount",
             "vfs.file.File.dentry",
             "general.vfs.namespace_path",
-            "net.stack.NetStackCallV1.valid",
-            "net.stack.NetStackSocketCallV1.valid",
-            "net.stack.NetStackSocketRequestV1.valid_header",
-            "net.stack.PinnedNetStackEndpoint.current",
+            "net.stack.NetStackShardTurn.valid_header",
+            "net.stack.PinnedNetStackShardTurnEndpoint.current",
             "net.stack.NetStackRegistration.pinned",
             "net.stack.boot_config",
             "net.stack.register_stack",
             "net.stack.begin_remove",
-            "net.stack.create_socket_table",
-            "net.stack.destroy_socket_table",
-            "net.stack.dispatch_socket_table_call",
+            "net.stack.create_control_plane",
+            "net.stack.destroy_control_plane",
+            "net.stack.dispatch_control_plane_call",
+            "net.stack.create_flow_shard",
+            "net.stack.destroy_flow_shard",
+            "net.stack.dispatch_flow_shard_turn",
+            "net.device.NetQueueCall.valid",
+            "net.device.PinnedNetQueueEndpoint.current",
             "net.device.register_device",
             "net.device.begin_remove",
             "net.buf.PacketBatch.push",
@@ -2950,14 +2961,17 @@ mod tests {
                 .all(|symbol| !forbidden_protocol_engine_reference(symbol))
         );
         for api_path in [
-            "net.stack.PinnedNetStackEndpoint.current",
+            "net.stack.PinnedNetStackShardTurnEndpoint.current",
             "net.stack.NetStackRegistration.pinned",
             "net.stack.boot_config",
             "net.stack.register_stack",
             "net.stack.begin_remove",
-            "net.stack.create_socket_table",
-            "net.stack.destroy_socket_table",
-            "net.stack.dispatch_socket_table_call",
+            "net.stack.create_control_plane",
+            "net.stack.destroy_control_plane",
+            "net.stack.dispatch_control_plane_call",
+            "net.stack.create_flow_shard",
+            "net.stack.destroy_flow_shard",
+            "net.stack.dispatch_flow_shard_turn",
         ] {
             let symbol = symbols
                 .iter()

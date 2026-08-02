@@ -140,7 +140,7 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
     let task = Arc::clone(ctx.task());
     #[cfg(feature = "trace-task-lifecycle")]
-    log::debug!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
+    log::info!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
     ctx.release_task_ref();
     drop(task);
     sched::operation::exit(code);
@@ -149,8 +149,8 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
     let task = Arc::clone(ctx.task());
-    #[cfg(feature = "trace-task-lifecycle")]
-    log::debug!(
+    #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+    log::info!(
         "[syscall][exit_group] pid={:?} code={}",
         task.pid_root(),
         code
@@ -173,11 +173,24 @@ fn release_exit_files(task: &Arc<Task>) {
             .and_then(|leader| leader.pid_root())
             .or_else(|| task.pid_root())
             .unwrap_or(0);
-        if fdtable_has_other_live_owner(task, &fdt) {
+        let shared = fdtable_has_other_live_owner(task, &fdt);
+        #[cfg(feature = "trace-task-lifecycle")]
+        log::info!(
+            "[syscall][exit-cleanup] files pid={:?} fds={} shared={}",
+            task.pid_root(),
+            fdt.len(),
+            shared,
+        );
+        if shared {
             fdt.release_all_record_locks_for_owner(owner_pid);
         } else {
             fdt.close_all_for_owner(owner_pid);
         }
+        #[cfg(feature = "trace-task-lifecycle")]
+        log::info!(
+            "[syscall][exit-cleanup] files-done pid={:?}",
+            task.pid_root(),
+        );
     }
     let _ = task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
 }
@@ -213,7 +226,7 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let flags = CloneFlags::from_raw(raw_flags);
     #[cfg(feature = "trace-task-lifecycle")]
-    log::debug!(
+    log::info!(
         "[syscall][clone] flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
         regs.flags,
         regs.stack,
@@ -286,7 +299,7 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     #[cfg(feature = "trace-task-lifecycle")]
-    log::debug!(
+    log::info!(
         "[syscall][clone3] flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
         args.flags.raw(),
         args.stack,
@@ -422,12 +435,28 @@ fn halt_after_power_request() -> ! {
 }
 
 pub(super) fn sys_wait4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::ProcessWait);
     let pid = ctx.args[0] as i32;
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[syscall][wait4] enter parent={:?} target={} options={:#x}",
+        ctx.task().pid_root(),
+        pid,
+        ctx.args[2],
+    );
     let status_user = ctx.args[1];
     let options = WaitOptions::from_raw(ctx.args[2] as u32);
     let rusage_user = ctx.args[3];
 
     let result = sched::operation::wait4(pid, options)?;
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][wait4] leave parent={:?} target={} result={}",
+        ctx.task().pid_root(),
+        pid,
+        result.pid,
+    );
     if status_user != 0 {
         copy_to_user(status_user, &result.status.raw().to_le_bytes()).map_err(|e| e.as_errno())?;
     }
@@ -438,6 +467,8 @@ pub(super) fn sys_wait4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 }
 
 pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::ProcessWait);
     const P_ALL: usize = 0;
     const P_PID: usize = 1;
     const P_PGID: usize = 2;
@@ -522,7 +553,21 @@ pub(super) fn sys_sched_yield(_ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 pub(super) fn sys_kill(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let sig = signal_arg(ctx.args[1])?;
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[syscall][kill] enter sender={:?} target={} signal={:?}",
+        ctx.task().pid_root(),
+        pid,
+        sig,
+    );
     sched::operation::kill(pid, sig)?;
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[syscall][kill] leave sender={:?} target={} signal={:?}",
+        ctx.task().pid_root(),
+        pid,
+        sig,
+    );
     Ok(0)
 }
 
@@ -2570,6 +2615,22 @@ fn futex_cmd(futex_op: u32) -> u32 {
     futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
 }
 
+#[cfg(feature = "trace-task-lifecycle")]
+fn trace_futex_task(task: &Task) -> bool {
+    #[cfg(feature = "performance-profile")]
+    {
+        // 诊断范围由 profile_control 的 root=<pid> 定义，并随子进程继承；
+        // 不依赖特定程序名，任意工作负载都能得到同样的 futex 因果链。
+        let session = task.profile_session_id();
+        session != 0 && session == profiling::session_id()
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    {
+        let _ = task;
+        false
+    }
+}
+
 fn task_vm_space_for_futex(task: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
     let payload = task
         .ext_lookup(sched::TASKEXT_VM_SPACE)
@@ -2728,11 +2789,25 @@ fn pi_propagate_from(waiter: &Arc<Task>) {
 }
 
 fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
+    futex_wake_key_inner(key, count, bitset, false)
+}
+
+fn futex_wake_key_inner(key: FutexKey, count: usize, bitset: u32, trace: bool) -> usize {
+    #[cfg(not(feature = "trace-task-lifecycle"))]
+    let _ = trace;
     let waiters = {
         let mut table = FUTEX_TABLE.lock();
         let Some(bucket) = table.get_mut(&key) else {
+            #[cfg(feature = "trace-task-lifecycle")]
+            if trace {
+                log::info!("[syscall][futex] wake-bucket-miss key={key:?}");
+            }
             return 0;
         };
+        #[cfg(feature = "trace-task-lifecycle")]
+        let initial_len = bucket.waiters.len();
+        #[cfg(feature = "trace-task-lifecycle")]
+        let mut dead = 0usize;
         let mut waiters = Vec::new();
         let mut idx = 0;
         while idx < bucket.waiters.len() && waiters.len() < count {
@@ -2740,10 +2815,23 @@ fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
                 let waiter = bucket.waiters.remove(idx);
                 if let Some(task) = waiter.task.upgrade() {
                     waiters.push((task, waiter.state));
+                } else {
+                    #[cfg(feature = "trace-task-lifecycle")]
+                    {
+                        dead += 1;
+                    }
                 }
             } else {
                 idx += 1;
             }
+        }
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace {
+            log::info!(
+                "[syscall][futex] wake-bucket key={key:?} before={initial_len} selected={} dead={dead} remain={}",
+                waiters.len(),
+                bucket.waiters.len(),
+            );
         }
         if bucket.waiters.is_empty() {
             table.remove(&key);
@@ -2755,15 +2843,17 @@ fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
 
 fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> usize {
     let mut woken = 0usize;
+    let now_ns = sched::now_ns_public();
     for (waiter, state) in waiters {
         match state.mark_woken() {
             FUTEX_WAIT_SLEEPING => {
                 if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
                     #[cfg(feature = "performance-profile")]
-                    waiter.mark_profile_woken(sched::now_ns_public());
-                    // futex 唤醒属于短等待热路径，优先让被唤醒者尽快继续执行，
-                    // 避免 join / condvar / mutex 反复多等一个时间片。
-                    sched::enqueue_task_preferred(waiter, sched::now_ns_public());
+                    waiter.mark_profile_woken(now_ns);
+                    // futex 唤醒可以跨越任意用户态同步原语；只按常规首选队列入队，
+                    // 不依赖当前 syscall 的返回边界完成交接，避免唤醒者与等待者的
+                    // 执行边界不重合时延迟调度。
+                    sched::enqueue_task_preferred(waiter, now_ns);
                 }
                 woken += 1;
             }
@@ -2871,16 +2961,37 @@ fn futex_enqueue_waiter_if_equal(
     waiter: FutexWaiter,
 ) -> Result<(), Errno> {
     let mut table = FUTEX_TABLE.lock();
-    if vm.read_user_u32_nofault(uaddr)? != expected {
+    let observed = vm.read_user_u32_nofault(uaddr)?;
+    if observed != expected {
+        #[cfg(feature = "trace-task-lifecycle")]
+        if waiter
+            .task
+            .upgrade()
+            .as_ref()
+            .is_some_and(|task| trace_futex_task(task))
+        {
+            log::info!(
+                "[syscall][futex] enqueue-recheck key={key:?} expected={expected} observed={observed}"
+            );
+        }
         return Err(Errno::EAGAIN);
     }
-    table
-        .entry(key)
-        .or_insert(FutexBucket {
-            waiters: Vec::new(),
-        })
-        .waiters
-        .push(waiter);
+    let bucket = table.entry(key).or_insert(FutexBucket {
+        waiters: Vec::new(),
+    });
+    #[cfg(feature = "trace-task-lifecycle")]
+    if waiter
+        .task
+        .upgrade()
+        .as_ref()
+        .is_some_and(|task| trace_futex_task(task))
+    {
+        log::info!(
+            "[syscall][futex] enqueue key={key:?} expected={expected} observed={observed} before={}",
+            bucket.waiters.len(),
+        );
+    }
+    bucket.waiters.push(waiter);
     Ok(())
 }
 
@@ -3687,9 +3798,19 @@ fn clear_child_tid_and_wake(task: &Arc<Task>) {
         return;
     }
     let zero = 0u32;
-    let _ = copy_to_user(tid_addr, &zero.to_ne_bytes());
+    let written = copy_to_user(tid_addr, &zero.to_ne_bytes()).is_ok();
     task.set_clear_child_tid(0);
-    let _ = futex_wake_addr(task, tid_addr, 1);
+    let woken = futex_wake_addr(task, tid_addr, 1);
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[syscall][clear-child-tid] pid={:?} addr={:#x} written={} woken={}",
+        task.pid_root(),
+        tid_addr,
+        written,
+        woken,
+    );
+    #[cfg(not(feature = "trace-task-lifecycle"))]
+    let _ = (written, woken);
 }
 
 pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3701,6 +3822,21 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let val3 = ctx.args[5] as u32;
     let cmd = futex_cmd(futex_op);
     let private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
+
+    #[cfg(feature = "trace-task-lifecycle")]
+    if trace_futex_task(ctx.task()) {
+        log::info!(
+            "[syscall][futex] enter pid={:?} comm={:?} cmd={} private={} addr={:#x} val={} addr2={:#x} val3={}",
+            ctx.task().pid_root(),
+            ctx.task().comm(),
+            cmd,
+            private,
+            uaddr,
+            val,
+            uaddr2,
+            val3,
+        );
+    }
 
     if uaddr % 4 != 0 {
         return Err(Errno::EINVAL);
@@ -3728,11 +3864,32 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 futex_wait_deadline(futex_op, cmd, timeout)?,
             )
         }
-        FUTEX_WAKE => Ok(futex_wake_key(
-            futex_key(ctx.task(), uaddr, private)?,
-            val as usize,
-            FUTEX_BITSET_MATCH_ANY,
-        )),
+        FUTEX_WAKE => {
+            let key = futex_key(ctx.task(), uaddr, private)?;
+            let traced = {
+                #[cfg(feature = "trace-task-lifecycle")]
+                {
+                    trace_futex_task(ctx.task())
+                }
+                #[cfg(not(feature = "trace-task-lifecycle"))]
+                {
+                    false
+                }
+            };
+            let woken = futex_wake_key_inner(key, val as usize, FUTEX_BITSET_MATCH_ANY, traced);
+            #[cfg(feature = "trace-task-lifecycle")]
+            if trace_futex_task(ctx.task()) {
+                log::info!(
+                    "[syscall][futex] wake pid={:?} addr={:#x} key={:?} requested={} woken={}",
+                    ctx.task().pid_root(),
+                    uaddr,
+                    key,
+                    val,
+                    woken,
+                );
+            }
+            Ok(woken)
+        }
         FUTEX_WAKE_BITSET => {
             if val3 == 0 {
                 return Err(Errno::EINVAL);
@@ -4380,6 +4537,17 @@ fn futex_wait(
     bitset: u32,
     deadline_ns: Option<u64>,
 ) -> Result<usize, Errno> {
+    #[cfg(feature = "trace-task-lifecycle")]
+    if trace_futex_task(task) {
+        log::info!(
+            "[syscall][futex] wait pid={:?} addr={:#x} expected={} bitset={:#x} deadline={:?}",
+            task.pid_root(),
+            uaddr,
+            expected,
+            bitset,
+            deadline_ns,
+        );
+    }
     let me = Arc::clone(task);
     let wait_state = Arc::new(FutexWaitState::new());
     let vm = task_vm_space_for_futex(task)?;
@@ -4428,6 +4596,13 @@ fn futex_wait(
             .read_user_u32_nofault(uaddr)
             .map_or(true, |cur| cur != expected)
         {
+            #[cfg(feature = "trace-task-lifecycle")]
+            if trace_futex_task(task) {
+                log::info!(
+                    "[syscall][futex] waiter-value-changed pid={:?} key={key:?}",
+                    task.pid_root(),
+                );
+            }
             futex_remove_waiter(key, &me);
             restore_current_task_after_sleep(task);
             if deadline_ns.is_some() {
@@ -4731,8 +4906,15 @@ pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
     if task.is_kernel_task() {
         return;
     }
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!("[syscall][exit-cleanup] begin pid={:?}", task.pid_root(),);
     let _ = sched::cancel_sleep_deadline(task);
     release_exit_files(task);
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[syscall][exit-cleanup] futex-begin pid={:?}",
+        task.pid_root(),
+    );
     let current = sched::current_task();
     if Arc::ptr_eq(&current, task) {
         cleanup_task_before_exit_in_active_vm(task);
@@ -4770,6 +4952,11 @@ fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
     pi_release_owned_futexes(task);
     exit_robust_list(task);
     clear_child_tid_and_wake(task);
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::info!(
+        "[syscall][exit-cleanup] futex-done pid={:?}",
+        task.pid_root(),
+    );
 }
 
 fn kcmp_arc<T>(left: &Arc<T>, right: &Arc<T>) -> usize {

@@ -59,6 +59,7 @@ impl LoopbackQueue {
             max_tx_descriptors: 18,
             max_rx_batch: 32,
             max_tx_batch: 32,
+            tx_checksum: false,
             udp_segmentation: true,
             max_udp_segments: 16,
         }
@@ -212,6 +213,15 @@ impl NetQueuePair for LoopbackQueue {
             {
                 break;
             }
+            let Some(candidate) = batch.packet(index) else {
+                continue;
+            };
+            if !candidate
+                .checksum
+                .valid_for(false, candidate.chain.total_len())
+            {
+                break;
+            }
             let Some(packet) = batch.take(index) else {
                 continue;
             };
@@ -228,7 +238,7 @@ impl NetQueuePair for LoopbackQueue {
             self.packets[self.packet_tail] = Some(packet.chain);
             self.metadata[self.packet_tail] = Some(PacketMetadata {
                 frame_len: logical_bytes,
-                checksums_validated: packet.checksums_validated,
+                checksums_validated: false,
                 layout: packet.layout,
                 ..PacketMetadata::default()
             });
@@ -275,7 +285,7 @@ pub(crate) fn register() -> Result<LoopbackHandle, LoopbackError> {
             true,
         )
         .ok_or(LoopbackError::Context)?;
-        NetQueueRegistration::pinned_heap(endpoint, 48, 4096, 256, 256, 256, 4096)
+        NetQueueRegistration::pinned_heap(endpoint, 48, 4096, 256, 256, 64, 65535)
             .map_err(|_| LoopbackError::Pool)?
     };
     #[cfg(feature = "elm-integrated")]
@@ -286,8 +296,8 @@ pub(crate) fn register() -> Result<LoopbackHandle, LoopbackError> {
             4096,
             256,
             256,
-            256,
-            4096,
+            64,
+            65535,
         )
         .map_err(|_| LoopbackError::Pool)?
     };
@@ -345,7 +355,7 @@ pub(crate) fn destroy_queue() {
     mode = "direct-pinned",
     visibility = "private"
 )]
-fn loopback_queue_call(frame: &mut net::device::NetQueueCallV1) -> i32 {
+fn loopback_queue_call(frame: &mut net::device::NetQueueCall) -> i32 {
     if !frame.valid(frame.opcode, QueuePairId(0)) {
         return NET_QUEUE_CALL_STATUS_INVALID;
     }

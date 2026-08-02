@@ -47,10 +47,11 @@
 //! 这使得 dcache 仍然是“加速层”而不是“命名空间真相来源”：当缓存预算耗尽时，
 //! 新条目可以选择不缓存，但不会影响命名空间语义的正确性。
 
+use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crate::vfs::inode::Inode;
 use crate::vfs::mount::Mount;
@@ -341,10 +342,17 @@ impl Dentry {
     /// 对没有持久化后端的文件系统（tmpfs / ramfs / devtmpfs），驱逐 positive
     /// Dentry 等同于删除文件——Superblock 的 inode_cache 持有的是 Weak 引用，
     /// Dentry 是 Inode 的唯一强引用持有者。一旦驱逐，inode 被 drop，文件数据
-    /// 永久丢失。
-    pub fn is_evictable(&self) -> bool {
+    /// 永久丢失。是否能安全重建由具体文件系统显式声明，不能用
+    /// `dev_id` 推断；后者只描述 `stat(2)` 的设备号来源。
+    ///
+    /// 正向项只有在缓存是唯一强引用时才可驱逐，避免让挂载点、当前
+    /// 工作目录或正在路径遍历中的 Dentry 与重建后的新对象失联。
+    pub fn is_evictable(self: &Arc<Self>) -> bool {
         if self.state_flag.load(Ordering::Acquire) != STATE_POSITIVE {
             return true;
+        }
+        if Arc::strong_count(self) != 1 {
+            return false;
         }
         let Some(inode) = self.inode.as_ref() else {
             return true;
@@ -352,7 +360,7 @@ impl Dentry {
         let Some(sb) = inode.superblock() else {
             return true;
         };
-        sb.dev_id.is_some()
+        sb.ops.can_evict_positive_dentry()
     }
 
     /// 将 Dentry 标记为失效（文件被删除时调用）。
@@ -466,6 +474,17 @@ impl Dentry {
 /// 分片数量。必须是 2 的幂次以使位掩码选片高效。
 const N_SHARDS: usize = 16;
 const SHARD_MASK: usize = N_SHARDS - 1;
+const SHARD_BITS: u32 = N_SHARDS.trailing_zeros();
+
+/// 计算分片内的自然桶起点。
+///
+/// 哈希低 [`SHARD_BITS`] 位已经用于选择分片，桶索引必须继续使用其后的位；否则同一
+/// 分片的条目在容量为 `N` 时只能使用 `N / N_SHARDS` 个自然桶，造成系统性聚簇。
+#[inline]
+fn bucket_start(hash: usize, capacity: usize) -> usize {
+    debug_assert!(capacity.is_power_of_two());
+    (hash >> SHARD_BITS) & (capacity - 1)
+}
 
 /// 单个缓存分片：开放寻址哈希表。
 ///
@@ -492,7 +511,7 @@ struct DentryBucket {
 }
 
 /// 计算 (parent_ptr, name) 的完整 FNV-1a 哈希值。
-/// 返回值的高位用于选择分片，低位用于选择桶，避免重复计算。
+/// 返回值的低位用于选择分片，紧随其后的位用于选择分片内桶，避免重复计算。
 #[inline]
 fn dentry_hash(parent_ptr: usize, name: &str) -> usize {
     const FNV_OFFSET: u64 = 14695981039346656037;
@@ -519,7 +538,12 @@ const INITIAL_CAPACITY: usize = 32;
 const NON_POSITIVE_LIMIT_PER_SHARD: usize = 256;
 
 /// 单个分片允许保留的总缓存条目上限。
-const TOTAL_LIMIT_PER_SHARD: usize = 1024;
+///
+/// BuildStorm 会在一次冷构建中触碰数万条稳定的工具链/源码路径。过小的预算
+/// 会在每个分片达到上限后反复驱逐 ext4 正向项，使下一次路径解析退化为目录块
+/// 扫描和同步 I/O。每个分片预留 8K 项（总计约 128K 项）仍是有界的，同时足以
+/// 覆盖一轮构建的活跃工作集；负向项仍由 `NON_POSITIVE_LIMIT_PER_SHARD` 单独限流。
+const TOTAL_LIMIT_PER_SHARD: usize = 8192;
 
 impl DentryShard {
     const fn new_empty() -> Self {
@@ -549,7 +573,7 @@ impl DentryShard {
         if self.buckets.is_empty() {
             return None;
         }
-        let start = hash & self.mask();
+        let start = bucket_start(hash, self.capacity());
         for probe in 0..self.buckets.len() {
             let idx = (start + probe) & self.mask();
             match &self.buckets[idx] {
@@ -612,7 +636,7 @@ impl DentryShard {
             self.grow();
         }
 
-        let start = hash & self.mask();
+        let start = bucket_start(hash, self.capacity());
         for probe in 0..self.capacity() {
             let idx = (start + probe) & self.mask();
             match &self.buckets[idx] {
@@ -670,7 +694,7 @@ impl DentryShard {
             let natural = {
                 let b = self.buckets[i].as_ref().unwrap();
                 // 使用存储的 hash 字段，避免重新计算
-                b.hash & self.mask()
+                bucket_start(b.hash, self.capacity())
             };
             // 判断 natural 是否在环形区间 (empty, i] 内
             let in_range = if empty < i {
@@ -712,10 +736,12 @@ impl DentryShard {
         }
     }
 
-    /// 机会式驱逐一个无效或负向条目，优先驱逐已经失效的缓存项。
+    /// 机会式驱逐一个无效或负向条目。
     fn evict_one_non_positive(&mut self) -> Option<Arc<Dentry>> {
-        self.evict_from_cursor(|dentry| dentry.is_invalid())
-            .or_else(|| self.evict_from_cursor(|dentry| dentry.is_negative()))
+        if self.non_positive_count == 0 {
+            return None;
+        }
+        self.evict_from_cursor(|dentry| !dentry.is_positive())
     }
 
     fn evict_one_any(&mut self) -> Option<Arc<Dentry>> {
@@ -755,8 +781,33 @@ impl DentryShard {
         self.non_positive_count = 0;
         self.eviction_cursor = 0;
         for bucket in old_buckets.into_iter().flatten() {
-            // 使用存储的 hash 字段，避免重新计算
+            // 使用存储的 hash 字段，并由 insert 按新容量的 bucket_start 重新定位。
             let _ = self.insert(bucket.hash, bucket.parent_ptr, bucket.name, bucket.dentry);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dentry_shard_tests {
+    use alloc::collections::BTreeSet;
+
+    use super::{INITIAL_CAPACITY, SHARD_BITS, SHARD_MASK, bucket_start};
+
+    #[test]
+    fn bucket_start_uses_hash_bits_above_shard_selector() {
+        let shard = 7usize;
+
+        for capacity in [INITIAL_CAPACITY, INITIAL_CAPACITY * 8] {
+            let starts: BTreeSet<usize> = (0..capacity)
+                .map(|expected| {
+                    let hash = (expected << SHARD_BITS) | shard;
+                    assert_eq!(hash & SHARD_MASK, shard);
+                    bucket_start(hash, capacity)
+                })
+                .collect();
+
+            assert_eq!(starts.len(), capacity);
+            assert!(starts.into_iter().eq(0..capacity));
         }
     }
 }
@@ -815,6 +866,10 @@ macro_rules! spinlock_array_16 {
 /// 显式维护接口来保持缓存与命名空间的一致性。
 pub struct DentryCache {
     shards: [Spinlock<DentryShard>; N_SHARDS],
+    /// 子树失效与 rename 的慢路径串行锁。
+    invalidation_lock: Spinlock<()>,
+    /// 为 true 时负向 insert 不缓存、正向 insert 等待，防止扫描后重新出现后代。
+    invalidation_active: AtomicBool,
     /// 全局条目计数器，用于快速实现 len() 和 is_empty()。
     total_count: AtomicUsize,
 }
@@ -824,8 +879,23 @@ impl DentryCache {
     pub const fn new() -> Self {
         Self {
             shards: spinlock_array_16!(DentryShard::new_empty()),
+            invalidation_lock: Spinlock::new(()),
+            invalidation_active: AtomicBool::new(false),
             total_count: AtomicUsize::new(0),
         }
+    }
+
+    /// 关闭新的缓存插入，并等待所有已经通过 active 复查的分片写者退出。
+    fn begin_invalidation(&self) {
+        self.invalidation_active.store(true, Ordering::SeqCst);
+        for shard_lock in self.shards.iter() {
+            let guard = shard_lock.lock();
+            drop(guard);
+        }
+    }
+
+    fn end_invalidation(&self) {
+        self.invalidation_active.store(false, Ordering::Release);
     }
 
     /// 调整 rename 操作后的全局计数器。
@@ -897,22 +967,44 @@ impl DentryCache {
     /// 不会影响语义正确性。
     pub fn insert(&self, dentry: Arc<Dentry>) -> Arc<Dentry> {
         let incoming_positive = dentry.is_positive();
-        let (parent_ptr, name) = {
-            let meta = dentry.meta.lock();
-            let parent_ptr = meta
-                .parent_cloned()
-                .as_ref()
-                .map(|parent| Arc::as_ptr(parent) as usize)
-                .unwrap_or(0);
-            (parent_ptr, meta.name_cloned())
-        };
-        let hash = dentry_hash(parent_ptr, name.as_str());
-        let idx = hash & SHARD_MASK;
+        'retry: loop {
+            let (parent, parent_ptr, name) = {
+                let meta = dentry.meta.lock();
+                let parent = meta.parent_cloned();
+                let parent_ptr = parent
+                    .as_ref()
+                    .map(|parent| Arc::as_ptr(parent) as usize)
+                    .unwrap_or(0);
+                (parent, parent_ptr, meta.name_cloned())
+            };
+            if parent.as_ref().is_some_and(|parent| parent.is_invalid()) {
+                return dentry;
+            }
+            // 负向项在失效期间可以安全地不缓存；正向项可能是 tmpfs inode 的唯一
+            // 强引用，必须等待慢路径结束后重试。
+            if self.invalidation_active.load(Ordering::Acquire) {
+                if incoming_positive {
+                    drop(self.invalidation_lock.lock());
+                    continue 'retry;
+                }
+                return dentry;
+            }
+            let hash = dentry_hash(parent_ptr, name.as_str());
+            let idx = hash & SHARD_MASK;
 
-        let mut replaced_non_positive = None;
-        let mut total_delta: isize = 0;
-        let result = {
+            let mut replaced_non_positive = None;
             let mut shard = self.shards[idx].lock();
+            if parent.as_ref().is_some_and(|parent| parent.is_invalid()) {
+                return dentry;
+            }
+            if self.invalidation_active.load(Ordering::Acquire) {
+                drop(shard);
+                if incoming_positive {
+                    drop(self.invalidation_lock.lock());
+                    continue 'retry;
+                }
+                return dentry;
+            }
             if let Some(existing) = shard.get(hash, parent_ptr, name.as_str()) {
                 if existing.is_positive() || !incoming_positive {
                     return Arc::clone(existing);
@@ -921,14 +1013,14 @@ impl DentryCache {
             } else {
                 if !incoming_positive && shard.non_positive_count >= NON_POSITIVE_LIMIT_PER_SHARD {
                     if shard.evict_one_non_positive().is_some() {
-                        total_delta -= 1;
+                        self.total_count.fetch_sub(1, Ordering::Relaxed);
                     } else {
                         return Arc::clone(&dentry);
                     }
                 }
                 if shard.count >= TOTAL_LIMIT_PER_SHARD {
                     if shard.evict_one_any().is_some() {
-                        total_delta -= 1;
+                        self.total_count.fetch_sub(1, Ordering::Relaxed);
                     } else {
                         return Arc::clone(&dentry);
                     }
@@ -937,27 +1029,16 @@ impl DentryCache {
 
             let is_new = shard.insert(hash, parent_ptr, name, Arc::clone(&dentry));
             if is_new {
-                total_delta += 1;
+                self.total_count.fetch_add(1, Ordering::Relaxed);
             }
-            Arc::clone(&dentry)
-        };
+            drop(shard);
 
-        match total_delta.cmp(&0) {
-            core::cmp::Ordering::Greater => {
-                self.total_count
-                    .fetch_add(total_delta as usize, Ordering::Relaxed);
+            if let Some(existing) = replaced_non_positive {
+                existing.invalidate();
             }
-            core::cmp::Ordering::Less => {
-                self.total_count
-                    .fetch_sub((-total_delta) as usize, Ordering::Relaxed);
-            }
-            core::cmp::Ordering::Equal => {}
+            self.debug_verify_count();
+            return Arc::clone(&dentry);
         }
-        if let Some(existing) = replaced_non_positive {
-            existing.invalidate();
-        }
-        self.debug_verify_count();
-        result
     }
 
     /// 驱逐（invalidate）指定 Dentry 在缓存中的条目。
@@ -995,14 +1076,29 @@ impl DentryCache {
         self.debug_verify_count();
     }
 
-    /// 驱逐并失效整棵 dentry 子树。
+    /// 逐出已经由 `rmdir` 从命名空间摘除的目录。
     ///
-    /// 与 `invalidate_dentry()` 的区别在于：此方法会同时删除 `root` 自身及其所有后代的
-    /// 缓存键，并把这些旧节点全部标记为 `INVALID`，防止外部仍持有旧 `Arc` 时继续把
-    /// 已删除/已卸载的命名空间对象当成有效路径继续遍历。
-    pub fn invalidate_subtree(&self, root: &Arc<Dentry>) {
-        let mut removed: Vec<Arc<Dentry>> = Vec::new();
-        let mut removed_count = 0usize;
+    /// 空目录仍可能挂着失败 lookup 产生的负向子项；这些子项通过 `parent` 强引用
+    /// 保活目录 Dentry，进而让 nlink=0 的持久化 inode 永远无法进入 `evict`。
+    /// 普通批量删树没有这类子项，先走 O(1) 根键逐出；仅当仍有额外 Dentry 引用时
+    /// 才扫描并失效直接子项，避免把常见 `rmdir` 重新退化为平方复杂度。rmdir 已由
+    /// 文件系统确认目录为空，因此缓存中不会存在可达的正向后代。
+    pub fn invalidate_removed_directory(&self, dentry: &Arc<Dentry>) {
+        let _invalidation_guard = self.invalidation_lock.lock();
+        self.begin_invalidation();
+        self.invalidate_dentry(dentry);
+        dentry.invalidate();
+        if Arc::strong_count(dentry) > 1 {
+            self.invalidate_direct_children(dentry);
+        }
+        self.debug_verify_count();
+        self.end_invalidation();
+    }
+
+    /// 移除以 `parent` 为直接父节点的缓存项，不在分片锁内读取 dentry meta。
+    fn invalidate_direct_children(&self, parent: &Arc<Dentry>) {
+        let parent_ptr = Arc::as_ptr(parent) as usize;
+        let mut removed = Vec::new();
 
         for shard_lock in self.shards.iter() {
             let mut shard = shard_lock.lock();
@@ -1010,23 +1106,81 @@ impl DentryCache {
             while idx < shard.capacity() {
                 let should_remove = shard.buckets[idx]
                     .as_ref()
-                    .is_some_and(|bucket| bucket.dentry.is_descendant_of(root));
+                    .is_some_and(|bucket| bucket.parent_ptr == parent_ptr);
                 if should_remove {
                     removed.push(shard.remove_at(idx));
-                    removed_count += 1;
                 } else {
                     idx += 1;
                 }
             }
         }
 
-        if removed_count != 0 {
-            self.total_count.fetch_sub(removed_count, Ordering::Relaxed);
+        if !removed.is_empty() {
+            self.total_count.fetch_sub(removed.len(), Ordering::Relaxed);
         }
-        for dentry in removed {
+        for child in removed {
+            child.invalidate();
+        }
+    }
+
+    /// 驱逐并失效整棵 dentry 子树。
+    ///
+    /// 与 `invalidate_dentry()` 的区别在于：此方法会同时删除 `root` 自身及其所有后代的
+    /// 缓存键，并把这些旧节点全部标记为 `INVALID`，防止外部仍持有旧 `Arc` 时继续把
+    /// 已删除/已卸载的命名空间对象当成有效路径继续遍历。
+    pub fn invalidate_subtree(&self, root: &Arc<Dentry>) {
+        let _invalidation_guard = self.invalidation_lock.lock();
+        self.begin_invalidation();
+
+        // 先在分片锁内只克隆 Arc，再在锁外遍历 parent 链。rename 统一先拿
+        // invalidation_lock，因此这里既能得到稳定位置，也不会形成 shard -> meta
+        // 与 rename 的 meta -> shard 锁序反转。
+        let mut candidates = Vec::new();
+        for shard_lock in self.shards.iter() {
+            let shard = shard_lock.lock();
+            candidates.extend(
+                shard
+                    .buckets
+                    .iter()
+                    .flatten()
+                    .map(|bucket| Arc::clone(&bucket.dentry)),
+            );
+        }
+        let descendants: Vec<Arc<Dentry>> = candidates
+            .into_iter()
+            .filter(|dentry| dentry.is_descendant_of(root))
+            .collect();
+        let descendant_ptrs: BTreeSet<usize> = descendants
+            .iter()
+            .map(|dentry| Arc::as_ptr(dentry) as usize)
+            .collect();
+
+        let mut removed: Vec<Arc<Dentry>> = Vec::new();
+        for shard_lock in self.shards.iter() {
+            let mut shard = shard_lock.lock();
+            let mut idx = 0usize;
+            while idx < shard.capacity() {
+                let should_remove = shard.buckets[idx].as_ref().is_some_and(|bucket| {
+                    descendant_ptrs.contains(&(Arc::as_ptr(&bucket.dentry) as usize))
+                });
+                if should_remove {
+                    removed.push(shard.remove_at(idx));
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+
+        if !removed.is_empty() {
+            self.total_count.fetch_sub(removed.len(), Ordering::Relaxed);
+        }
+        // invalidate_dentry 可能并发先移除某个候选；仍要让快照中的全部后代失效。
+        root.invalidate();
+        for dentry in descendants {
             dentry.invalidate();
         }
         self.debug_verify_count();
+        self.end_invalidation();
     }
 
     /// 在 rename 后原子更新缓存键和 dentry 的定位信息。
@@ -1040,9 +1194,17 @@ impl DentryCache {
     /// 因而并发路径解析要么看到旧映射，要么看到已经更新完成的新映射；
     /// 不会再观察到”新键指向旧 parent/name”的撕裂状态或短暂的”不存在”窗口。
     ///
-    /// 锁顺序统一为 `dentry.meta -> shard(s)`，与 `insert`/`invalidate_dentry`
-    /// 保持一致，避免锁序反转导致的死锁。
+    /// 内部锁顺序统一为 `invalidation_lock -> dentry.meta -> shard(s)`；子树扫描
+    /// 读取 parent 链时已经持有同一把慢路径锁，且不会同时持有 shard 锁。
     pub fn rename_dentry(&self, dentry: &Arc<Dentry>, new_parent: &Arc<Dentry>, new_name: &str) {
+        let _invalidation_guard = self.invalidation_lock.lock();
+        if dentry.is_invalid() || new_parent.is_invalid() {
+            // 后端 rename 已经成功，不能让旧键继续命中原路径。目标目录同时失效时
+            // 不再建立新键，但仍须逐出并失效 source。
+            self.invalidate_dentry(dentry);
+            dentry.invalidate();
+            return;
+        }
         assert_valid_dentry_name(new_name, false);
         let new_ptr = Arc::as_ptr(new_parent) as usize;
         let new_name_small = SmallStr::new(new_name);
@@ -1128,6 +1290,18 @@ impl DentryCache {
     /// **重要**：此值仅用于统计、trace、debug 输出，不得用于任何内核正确性逻辑。
     pub fn is_empty(&self) -> bool {
         self.total_count.load(Ordering::Relaxed) == 0
+    }
+
+    /// 在宿主并发测试中保持失效窗口，验证正向插入的等待语义。
+    #[cfg(test)]
+    pub(crate) fn hold_invalidation_for_test(&self, ready: &AtomicBool, release: &AtomicBool) {
+        let _invalidation_guard = self.invalidation_lock.lock();
+        self.begin_invalidation();
+        ready.store(true, Ordering::Release);
+        while !release.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        self.end_invalidation();
     }
 }
 

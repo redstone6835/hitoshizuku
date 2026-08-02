@@ -89,18 +89,23 @@ fn send_membarrier(logical_id: usize) -> bool {
 }
 
 fn poll_urgent() {
-    sched::handle_membarrier_ipi();
+    sched::handle_membarrier_ipi_on(crate::riscv64::specific::current_cpu_id());
+}
+
+fn has_urgent_work() -> bool {
+    sched::membarrier_pending_on(crate::riscv64::specific::current_cpu_id())
 }
 
 pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
     send_resched: send_reschedule,
     send_membarrier,
+    has_urgent_work,
     poll_urgent,
     is_online: cpu_is_online,
 };
 
 pub(crate) fn handle_ipi() {
-    sched::handle_membarrier_ipi();
+    sched::poll_urgent_work();
     // request_resched() 在发送 IPI 前已发布目标 CPU 的 need_resched；trap 返回路径
     // 会在安全边界消费该标志。RFENCE 由 OpenSBI 同步执行，不进入 S-mode handler。
     sched::acknowledge_resched_notification();

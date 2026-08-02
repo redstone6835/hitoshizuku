@@ -740,7 +740,6 @@ pub fn create(fdt: &FdTable, cred: Arc<Credentials>, cloexec: bool) -> Result<Fd
     let fd = fdt
         .alloc_fd(Arc::clone(&file), flags)
         .map_err(|e| e.to_errno())?;
-    fdt.register_close_observer(&file);
     Ok(fd)
 }
 
@@ -774,6 +773,7 @@ pub fn ctl(
                 return Err(Errno::EINVAL);
             }
         }
+        target.register_description_close_observer(&epoll_file);
     }
     match op {
         EPOLL_CTL_ADD => ops.ctl_add(fd, target, event.ok_or(Errno::EINVAL)?),

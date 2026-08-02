@@ -6,11 +6,12 @@ stats=${PROFILE_STATS:-/sys/kernel/profile_stats}
 samples=${PROFILE_SAMPLES:-/sys/kernel/profile_samples}
 catalog=${PROFILE_CATALOG:-/sys/kernel/profile_catalog}
 trace=${PROFILE_TRACE_FILE:-/sys/kernel/profile_trace}
+health=${PROFILE_HEALTH:-/sys/kernel/profile_health}
 
 usage() {
     echo "usage: $0 <start|stop|status|catalog> [case-id]" >&2
     echo "       $0 run <case-id> <command> [args...]" >&2
-    echo "       PROFILE_PRESET=io|syscall|filesystem|block|full" >&2
+    echo "       PROFILE_PRESET=io|syscall|filesystem|memory|scheduler|block|network|build|all|full PROFILE_TIMING_SHIFT=0..16" >&2
     exit 2
 }
 
@@ -18,15 +19,22 @@ write_control() {
     printf '%s\n' "$1" >"$control"
 }
 
-preset_mask() {
+preset_name() {
     case "$1" in
-        io) echo 0x1e3ff4000 ;;
-        syscall) echo 0x1000000 ;;
-        filesystem) echo 0x3000000 ;;
-        block) echo 0x1e0000000 ;;
-        full) echo 0x1ffffffff ;;
+        io|syscall|filesystem|memory|scheduler|block|network|build|all|full)
+            printf '%s\n' "$1"
+            ;;
         *)
             echo "profile capture: unknown PROFILE_PRESET=$1" >&2
+            exit 2
+            ;;
+    esac
+}
+
+validate_case_id() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_.-]*)
+            echo "profile capture: case id may contain only letters, digits, '.', '_' and '-'" >&2
             exit 2
             ;;
     esac
@@ -35,18 +43,26 @@ preset_mask() {
 snapshot() {
     phase=$1
     case_id=$2
+    stats_snapshot=$(cat "$stats")
     echo "@@PROFILE_STATS_BEGIN phase=$phase case=$case_id"
-    cat "$stats"
+    printf '%s\n' "$stats_snapshot"
     echo "@@PROFILE_STATS_END phase=$phase case=$case_id"
     if [ -r "$samples" ]; then
+        samples_snapshot=$(cat "$samples")
         echo "@@PROFILE_SAMPLES_BEGIN phase=$phase case=$case_id"
-        cat "$samples"
+        printf '%s\n' "$samples_snapshot"
         echo "@@PROFILE_SAMPLES_END phase=$phase case=$case_id"
     fi
     if [ -r "$trace" ]; then
+        trace_snapshot=$(cat "$trace")
         echo "@@PROFILE_TRACE_BEGIN phase=$phase case=$case_id"
-        cat "$trace"
+        printf '%s\n' "$trace_snapshot"
         echo "@@PROFILE_TRACE_END phase=$phase case=$case_id"
+    fi
+    if [ -r "$health" ]; then
+        echo "@@PROFILE_HEALTH_BEGIN phase=$phase case=$case_id"
+        cat "$health"
+        echo "@@PROFILE_HEALTH_END phase=$phase case=$case_id"
     fi
 }
 
@@ -68,40 +84,95 @@ metadata() {
     echo "workload=${PROFILE_WORKLOAD:-unknown}"
     echo "workload_exit_status=$exit_status"
     echo "cmdline=$cmdline"
+    if [ -n "${PROFILE_TIMING_SAMPLER:-}" ]; then
+        echo "timing_sampler=$PROFILE_TIMING_SAMPLER"
+    fi
     echo "control=$(cat "$control")"
     echo "@@PROFILE_META_END phase=$phase case=$case_id"
 }
 
 start_capture() {
     case_id=$1
-    if [ -n "${PROFILE_EVENT_MASK:-}" ] && [ -n "${PROFILE_PRESET:-}" ]; then
-        echo "profile capture: PROFILE_EVENT_MASK and PROFILE_PRESET are mutually exclusive" >&2
+    sampling=${PROFILE_SAMPLING:-0}
+    trace_enabled=${PROFILE_TRACE_ENABLED:-0}
+    timing_shift=${PROFILE_TIMING_SHIFT:-8}
+    leave_frozen=${PROFILE_LEAVE_FROZEN:-0}
+    validate_case_id "$case_id"
+    if { [ -n "${PROFILE_EVENT_MASK:-}" ] || [ -n "${PROFILE_EVENT_MASK_HIGH:-}" ]; } && [ -n "${PROFILE_PRESET:-}" ]; then
+        echo "profile capture: explicit event masks and PROFILE_PRESET are mutually exclusive" >&2
         exit 2
     fi
+    case "$sampling" in
+        0|1) ;;
+        *)
+            echo "profile capture: PROFILE_SAMPLING must be 0 or 1" >&2
+            exit 2
+            ;;
+    esac
+    case "$trace_enabled" in
+        0|1) ;;
+        *)
+            echo "profile capture: PROFILE_TRACE_ENABLED must be 0 or 1" >&2
+            exit 2
+            ;;
+    esac
+    case "$timing_shift" in
+        ''|*[!0-9]*)
+            echo "profile capture: PROFILE_TIMING_SHIFT must be an integer from 0 to 16" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$timing_shift" -gt 16 ]; then
+        echo "profile capture: PROFILE_TIMING_SHIFT must be an integer from 0 to 16" >&2
+        exit 2
+    fi
+    case "$leave_frozen" in
+        0|1) ;;
+        *)
+            echo "profile capture: PROFILE_LEAVE_FROZEN must be 0 or 1" >&2
+            exit 2
+            ;;
+    esac
     preset=
     if [ -n "${PROFILE_PRESET:-}" ]; then
-        preset=$(preset_mask "$PROFILE_PRESET")
+        preset=$(preset_name "$PROFILE_PRESET")
     fi
     write_control freeze
     write_control reset
     if [ -n "${PROFILE_EVENT_MASK:-}" ]; then
         write_control "events=$PROFILE_EVENT_MASK"
     elif [ -n "$preset" ]; then
-        write_control "events=$preset"
+        write_control "preset=$preset"
+    fi
+    if [ -n "${PROFILE_EVENT_MASK_HIGH:-}" ]; then
+        write_control "events_high=$PROFILE_EVENT_MASK_HIGH"
     fi
     [ -z "${PROFILE_SAMPLING:-}" ] || \
         write_control "samples=$PROFILE_SAMPLING"
     [ -z "${PROFILE_TRACE_ENABLED:-}" ] || \
         write_control "trace=$PROFILE_TRACE_ENABLED"
+    write_control "timing_shift=$timing_shift"
     metadata before "$case_id"
     snapshot before "$case_id"
-    write_control resume
+    [ "$leave_frozen" -eq 1 ] || write_control resume
 }
 
 stop_capture() {
     case_id=$1
     exit_status=${2:-unknown}
-    write_control freeze
+    already_frozen=${PROFILE_ALREADY_FROZEN:-0}
+    validate_case_id "$case_id"
+    case "$already_frozen" in
+        0|1) ;;
+        *)
+            echo "profile capture: PROFILE_ALREADY_FROZEN must be 0 or 1" >&2
+            exit 2
+            ;;
+    esac
+    # Interactive init shells may have printed a prompt while a background
+    # workload was running; keep the after markers parseable on their own lines.
+    printf '\n'
+    [ "$already_frozen" -eq 1 ] || write_control freeze
     metadata after "$case_id" "$exit_status"
     snapshot after "$case_id"
 }

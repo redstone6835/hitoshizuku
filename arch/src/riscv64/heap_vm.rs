@@ -16,7 +16,7 @@
 //!   PUD[0]:    kernel heap（1GiB，按需映射 4K / 2M 页）
 //!   PUD[1]:    kernel heap（1GiB，按需映射 4K / 2M 页）
 //!   PUD[2]:    kernel code direct map（1GiB，512×2MiB，PA 0x8000_0000 起）
-//!   PUD[3]:    kernel direct map 扩展（1GiB leaf，PA 0xC000_0000 起）
+//!   PUD[3..17]: kernel direct map 扩展（15 个 1GiB leaf）
 //!
 //! PGD[510] (0xFFFF_FF00_0000_0000 .. 0xFFFF_FF80_0000_0000)
 //!   PUD[0]:    MMIO 直接映射（1GiB leaf，PA 0x0..0x4000_0000）
@@ -34,8 +34,8 @@ use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest, PhysicalAllocation}
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
-    MapError, PagingArch, PhysPageTableRoot, find_leaf, unmap_range_entries,
-    validate_range_permissions,
+    MapError, PagingArch, PhysPageTableRoot, find_leaf, replace_empty_table_with_leaf,
+    unmap_range_entries, validate_range_permissions,
 };
 use spin::Mutex;
 
@@ -82,10 +82,14 @@ pub const MMIO_VIRT_BASE: usize = 0xFFFF_FF00_0000_0000;
 
 /// 内核 direct map 覆盖物理 RAM 的基址和大小（QEMU virt 默认从 0x80000000 开始）。
 const KERNEL_PHYS_BASE: usize = 0x8000_0000;
-const KERNEL_DIRECT_MAP_SIZE: usize = 0x4000_0000; // 1 GiB
-/// 当前正式页表实际覆盖的 RAM 物理范围：PUD[2] + PUD[3]，共 2 GiB。
+const KERNEL_DIRECT_MAP_WINDOW_SIZE: usize = 0x4000_0000; // 1 GiB
+const KERNEL_DIRECT_MAP_PUD_START: usize = 2;
+/// 正式页表覆盖的 RAM 物理范围：从 PUD[2] 连续映射 16 个 1 GiB 窗口。
+/// 这覆盖 QEMU 16 GiB 配置（扣除起始物理地址后的可用 RAM）并保留首窗的 W^X 细分。
+const KERNEL_DIRECT_MAP_PUD_COUNT: usize = 16;
 pub const KERNEL_DIRECT_MAP_PHYS_START: usize = KERNEL_PHYS_BASE;
-pub const KERNEL_DIRECT_MAP_PHYS_END: usize = KERNEL_PHYS_BASE + 2 * KERNEL_DIRECT_MAP_SIZE;
+pub const KERNEL_DIRECT_MAP_PHYS_END: usize =
+    KERNEL_PHYS_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
 const HEAP_PMD_SIZE: usize = 2 * 1024 * 1024;
 const HEAP_PUD_SIZE: usize = 1024 * 1024 * 1024;
 const PTE_VALID: usize = 1 << 0;
@@ -604,12 +608,20 @@ fn locate_early_page_tables() -> EarlyPageTableLayout {
             && !Riscv64Paging::pte_is_leaf(lower_direct_map),
         "[arch][heap_vm] early PUD[2] is not the expected PMD table"
     );
-    let upper_direct_map = Riscv64Pte(unsafe { core::ptr::read_volatile(pud_kernel.add(3)) });
-    assert!(
-        Riscv64Paging::pte_is_valid(upper_direct_map)
-            && Riscv64Paging::pte_is_leaf(upper_direct_map),
-        "[arch][heap_vm] early PUD[3] is not the expected 1 GiB leaf"
-    );
+    for index in (KERNEL_DIRECT_MAP_PUD_START + 1)
+        ..(KERNEL_DIRECT_MAP_PUD_START + KERNEL_DIRECT_MAP_PUD_COUNT)
+    {
+        let upper_direct_map =
+            Riscv64Pte(unsafe { core::ptr::read_volatile(pud_kernel.add(index)) });
+        let expected_paddr = KERNEL_PHYS_BASE
+            + (index - KERNEL_DIRECT_MAP_PUD_START) * KERNEL_DIRECT_MAP_WINDOW_SIZE;
+        assert!(
+            Riscv64Paging::pte_is_valid(upper_direct_map)
+                && Riscv64Paging::pte_is_leaf(upper_direct_map)
+                && Riscv64Paging::pte_addr(upper_direct_map) == expected_paddr,
+            "[arch][heap_vm] early PUD[{index}] is not the expected 1 GiB RAM leaf"
+        );
+    }
 
     let mmio_pgd = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd.add(510)) });
     assert!(
@@ -636,8 +648,8 @@ fn build_direct_map_pmd() -> PhysicalAllocation {
         fn erodata();
     }
 
-    let direct_map_entries = KERNEL_DIRECT_MAP_SIZE / HEAP_PMD_SIZE;
-    let direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_SIZE;
+    let direct_map_entries = KERNEL_DIRECT_MAP_WINDOW_SIZE / HEAP_PMD_SIZE;
+    let direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_WINDOW_SIZE;
     let text_start = stext as usize;
     let text_end = etext as usize;
     let rodata_end = erodata as usize;
@@ -710,23 +722,32 @@ fn publish_kernel_page_tables(
 ) {
     let direct_map_pte = Riscv64Paging::make_table_pte(direct_map_pmd_paddr);
     let mmio_pgd_pte = Riscv64Paging::make_table_pte(mmio_pud_paddr);
-    let upper_ram_paddr = KERNEL_PHYS_BASE + KERNEL_DIRECT_MAP_SIZE;
-    let upper_ram_leaf =
-        Riscv64Paging::make_leaf_pte(upper_ram_paddr, true, true, false, false, true);
 
     unsafe {
         // 子页表初始化必须先于父 PTE 发布对硬件 page walker 可见。
         core::arch::asm!("fence w, w");
         // boot 可能为 4GiB 以上 DTB 临时安装 PUD leaf。DTB 已复制到
-        // 内核缓冲区，正式 direct map 只保留 PUD[2..3]，其余高端 leaf 必须清掉。
-        for index in 4..Riscv64Paging::ENTRIES_PER_TABLE {
+        // 内核缓冲区，正式 direct map 只保留 PUD[2..17]，其余高端临时 leaf 必须清掉。
+        for index in (KERNEL_DIRECT_MAP_PUD_START + KERNEL_DIRECT_MAP_PUD_COUNT)
+            ..Riscv64Paging::ENTRIES_PER_TABLE
+        {
             core::ptr::write_volatile(layout.pud_kernel.add(index), 0);
         }
         core::ptr::write_volatile(layout.pgd.add(510), mmio_pgd_pte.bits());
-        // PUD[3] 不包含内核代码，启动完成后收敛为 RW+NX。
-        core::ptr::write_volatile(layout.pud_kernel.add(3), upper_ram_leaf.bits());
+        // 首窗包含内核代码，使用 PMD 细分；其余窗口使用 1 GiB RW+NX 叶项。
+        for index in (KERNEL_DIRECT_MAP_PUD_START + 1)
+            ..(KERNEL_DIRECT_MAP_PUD_START + KERNEL_DIRECT_MAP_PUD_COUNT)
+        {
+            let paddr = KERNEL_PHYS_BASE
+                + (index - KERNEL_DIRECT_MAP_PUD_START) * KERNEL_DIRECT_MAP_WINDOW_SIZE;
+            let leaf = Riscv64Paging::make_leaf_pte(paddr, true, true, false, false, true);
+            core::ptr::write_volatile(layout.pud_kernel.add(index), leaf.bits());
+        }
         // 最后替换当前正在执行代码所属的 PUD[2]。
-        core::ptr::write_volatile(layout.pud_kernel.add(2), direct_map_pte.bits());
+        core::ptr::write_volatile(
+            layout.pud_kernel.add(KERNEL_DIRECT_MAP_PUD_START),
+            direct_map_pte.bits(),
+        );
 
         // 确保 PTE store 到达内存后再刷 TLB/page-walk cache 和指令流。
         core::arch::asm!("fence rw, rw");
@@ -771,7 +792,7 @@ pub fn init_kernel_page_table() {
     publish_kernel_page_tables(&layout, direct_map_pmd.paddr, mmio_pud.paddr);
     log::info!(
         "[arch][heap_vm] PUD[2] converted to {} x 2MiB leaves; PUD[0..1] reserved for heap",
-        KERNEL_DIRECT_MAP_SIZE / HEAP_PMD_SIZE
+        KERNEL_DIRECT_MAP_WINDOW_SIZE / HEAP_PMD_SIZE
     );
 
     KERNEL_PAGE_TABLE_ROOT.store(layout.root_paddr, Ordering::Release);
@@ -942,8 +963,9 @@ fn verify_kernel_segments(root_paddr: usize) {
 
     let text_start = stext as usize;
     let text_leaf_start = text_start & !(HEAP_PMD_SIZE - 1);
-    let first_direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_SIZE;
-    let full_direct_map_end = first_direct_map_end + 1024 * 1024 * 1024;
+    let first_direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_WINDOW_SIZE;
+    let full_direct_map_end =
+        KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
     assert!(
         KERNEL_VIRT_BASE <= text_leaf_start
             && text_start < etext as usize
@@ -1009,7 +1031,7 @@ fn verify_kernel_segments(root_paddr: usize) {
         KERNEL_VA_OFFSET,
     );
     check_range(
-        "PUD[3] upper direct map",
+        "高端 direct map",
         first_direct_map_end,
         full_direct_map_end,
         true,
@@ -1153,15 +1175,17 @@ fn page_table_is_empty(table_vaddr: usize) -> bool {
     true
 }
 
-fn free_page_table_page(paddr: usize) {
+fn free_page_table_page(paddr: usize) -> bool {
     if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_physical_addr(paddr) {
         log::error!(
             "[arch][heap_vm] failed to free page-table page paddr={:#x}: {:?}",
             paddr,
             err
         );
+        false
     } else {
         PAGE_TABLE_PAGES_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -1295,8 +1319,42 @@ fn map_range_with_policy(
     let mut current_paddr = paddr;
 
     while current_vaddr < end_vaddr {
-        if let Err(err) = walk_and_map_heap(root_vaddr, current_vaddr, current_paddr, target_level)
+        if let Err(mut err) =
+            walk_and_map_heap(root_vaddr, current_vaddr, current_paddr, target_level)
         {
+            // 基础页解除映射后会保留空的下级页表。大页映射遇到这种非叶项时，先验证
+            // 整棵子树为空，再将它提升为大页叶；存在活跃映射时仍按 AlreadyMapped 失败。
+            if matches!(err, MapError::AlreadyMapped)
+                && !matches!(page_policy, PagePolicy::BaseOnly)
+            {
+                match replace_empty_table_with_leaf::<Riscv64Paging>(
+                    root_vaddr,
+                    current_vaddr,
+                    current_paddr,
+                    target_level,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    phys_to_virt,
+                    free_page_table_page,
+                ) {
+                    Ok(reclaim_failures) => {
+                        if reclaim_failures != 0 {
+                            log::error!(
+                                "[arch][heap_vm] promoted empty page-table subtree with {} unreclaimed page(s): vaddr={:#x}",
+                                reclaim_failures,
+                                current_vaddr
+                            );
+                        }
+                        current_vaddr += page_size;
+                        current_paddr += page_size;
+                        continue;
+                    }
+                    Err(promote_err) => err = promote_err,
+                }
+            }
             let mapped_size = current_vaddr - vaddr;
             if mapped_size != 0 {
                 MAP_ROLLBACKS.fetch_add(1, Ordering::Relaxed);

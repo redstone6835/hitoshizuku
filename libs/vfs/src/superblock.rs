@@ -275,6 +275,24 @@ pub trait SuperblockOps {
     /// 为空，因为"存储"就是内存本身。
     fn write_inode(&self, inode: &Arc<Inode>) -> VfsResult<()>;
 
+    /// 是否允许缓存层驱逐仍为正向的 Dentry。
+    ///
+    /// 默认保持 `false`：tmpfs、devtmpfs 等内存文件系统可能只由
+    /// Dentry 强引用保活 Inode，驱逐会导致文件内容永久丢失。能够从
+    /// 持久化后端完整重建 Inode 语义的文件系统应显式返回 `true`。
+    fn can_evict_positive_dentry(&self) -> bool {
+        false
+    }
+
+    /// 最后一个挂载实例释放后，是否仍需保留整棵 dentry 树。
+    ///
+    /// 默认文件系统在最后一个 Mount 生命周期结束时清理缓存。像 devtmpfs 这类由
+    /// 内核全局单例持有、后续 mount 仍会复用同一 Superblock 的文件系统必须返回
+    /// `true`，否则一次完整卸载会让单例根目录永久失效。
+    fn retain_dentries_without_mounts(&self) -> bool {
+        false
+    }
+
     /// 返回 `&dyn Any`，用于向下转型到具体 FS 驱动的超级块操作类型。
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。

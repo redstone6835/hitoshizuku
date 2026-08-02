@@ -36,5 +36,9 @@ make kernel-la
 make kernel-rv
 ```
 
+LoongArch64 的 lazy FP/LSX 上下文专项回归可通过
+`make kernel-la FEATURES="lazy-sxe-tests"` 嵌入；启动后输出 5 项 TAP 结果，覆盖
+syscall/yield、FP→LSX、fork 与 exec 边界。
+
 `make kernel-la` 和 `make kernel-rv` 会依次安装 BusyBox、架构配置、`elmctl` 以及
 所选 ELM 镜像，生成 `build/<arch>/compat-initramfs.cpio`，再将其嵌入对应内核。

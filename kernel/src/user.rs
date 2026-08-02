@@ -91,6 +91,10 @@ pub struct LoadedUserImage {
     pub entry_pc: usize,
     pub user_sp: usize,
     pub exec_path: String,
+    #[cfg(feature = "performance-profile")]
+    pub main_image_range: core::ops::Range<usize>,
+    #[cfg(feature = "performance-profile")]
+    pub interpreter_image: Option<(String, core::ops::Range<usize>)>,
     pub exec_access: Arc<ExecutableAccessSet>,
 }
 
@@ -110,6 +114,7 @@ struct LoadedInterpreter {
 struct LoadedImage {
     entry: usize,
     base: usize,
+    end: usize,
     phdr: usize,
     phent: usize,
     phnum: usize,
@@ -264,7 +269,8 @@ fn load_user_image_from_file_inner(
     let mut exec_access = Vec::new();
     exec_access.push(main_exec_access);
 
-    let interp_loaded = if let Some(interp) = exec_image.interpreter.as_deref() {
+    let interpreter_path = exec_image.interpreter.clone();
+    let interp_loaded = if let Some(interp) = interpreter_path.as_deref() {
         match load_interpreter_from_task_vfs(task, &exec_path, interp) {
             Ok(loaded_interpreter) => {
                 let LoadedInterpreter { mut bytes, access } = loaded_interpreter;
@@ -281,6 +287,14 @@ fn load_user_image_from_file_inner(
     } else {
         None
     };
+    let entry_pc = interp_loaded
+        .as_ref()
+        .map(|interp| interp.entry)
+        .unwrap_or(main_loaded.entry);
+    let at_base = interp_loaded
+        .as_ref()
+        .map(|interp| interp.base)
+        .unwrap_or(0);
 
     let stack_top = hal::user::default_stack_top();
     let stack_size = hal::user::default_stack_size();
@@ -292,7 +306,27 @@ fn load_user_image_from_file_inner(
         .with(VmFlags::WRITE)
         .with(VmFlags::USER)
         .with(VmFlags::GROWS_DOWN);
-    vm.commit_segment(stack_bottom, stack_size, 0, &[], stack_flags)?;
+    let creds = task.credentials();
+    // 规划与写入复用同一套游标运算，避免估算误差让直接用户地址写越过预驻留页。
+    let planned_user_sp = layout_user_stack(
+        StackLayoutMode::Plan,
+        stack_top,
+        &main_loaded,
+        at_base,
+        &exec_path,
+        argv,
+        envp,
+        creds.uid.0,
+        creds.euid.0,
+        creds.gid.0,
+        creds.egid.0,
+        hal::user::vdso_base(),
+    )?;
+    if planned_user_sp < stack_bottom || planned_user_sp >= stack_top {
+        return Err(errno::Errno::EINVAL);
+    }
+    vm.map_anon(stack_bottom..stack_top, stack_flags)?;
+    vm.prefault_user_range(planned_user_sp..stack_top, true)?;
 
     // Map vDSO code page from the synthesized ELF image, then attach the shared
     // data page as a direct read-only mapping for user-space fast paths.
@@ -326,16 +360,8 @@ fn load_user_image_from_file_inner(
     // RISC-V: 设置 SUM 位允许 S-mode 访问 U=1 的用户页面
     unsafe { hal::user::enable_sum() };
 
-    let entry_pc = interp_loaded
-        .as_ref()
-        .map(|interp| interp.entry)
-        .unwrap_or(main_loaded.entry);
-    let at_base = interp_loaded
-        .as_ref()
-        .map(|interp| interp.base)
-        .unwrap_or(0);
-    let creds = task.credentials();
     let user_sp = layout_user_stack(
+        StackLayoutMode::Write,
         stack_top,
         &main_loaded,
         at_base,
@@ -348,19 +374,40 @@ fn load_user_image_from_file_inner(
         creds.egid.0,
         hal::user::vdso_base(),
     )?;
+    if user_sp != planned_user_sp {
+        return Err(errno::Errno::EIO);
+    }
 
     Ok(LoadedUserImage {
         vm,
         entry_pc,
         user_sp,
         exec_path,
+        #[cfg(feature = "performance-profile")]
+        main_image_range: main_loaded.base..main_loaded.end,
+        #[cfg(feature = "performance-profile")]
+        interpreter_image: interpreter_path
+            .zip(interp_loaded.as_ref().map(|loaded| loaded.base..loaded.end)),
         exec_access: Arc::new(ExecutableAccessSet {
             leases: exec_access,
         }),
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StackLayoutMode {
+    Plan,
+    Write,
+}
+
+impl StackLayoutMode {
+    fn writes(self) -> bool {
+        self == Self::Write
+    }
+}
+
 fn layout_user_stack(
+    mode: StackLayoutMode,
     stack_top: usize,
     main: &LoadedImage,
     at_base: usize,
@@ -403,28 +450,32 @@ fn layout_user_stack(
     let mut sp = stack_top;
     let mut argv_ptrs = Vec::new();
     let mut envp_ptrs = Vec::new();
-    let execfn_ptr = push_user_string(&mut sp, path.as_bytes());
+    let execfn_ptr = push_user_string(mode, &mut sp, path.as_bytes());
 
     if argv.is_empty() {
         argv_ptrs.push(execfn_ptr);
     } else {
         for arg in argv.iter().rev() {
-            let ptr = push_user_string(&mut sp, arg.as_bytes());
+            let ptr = push_user_string(mode, &mut sp, arg.as_bytes());
             argv_ptrs.push(ptr);
         }
         argv_ptrs.reverse();
     }
     for env in envp.iter().rev() {
-        let ptr = push_user_string(&mut sp, env.as_bytes());
+        let ptr = push_user_string(mode, &mut sp, env.as_bytes());
         envp_ptrs.push(ptr);
     }
     envp_ptrs.reverse();
 
     sp -= 16;
     let random_ptr = sp;
-    unsafe {
-        core::ptr::write_unaligned(random_ptr as *mut u64, 0x6d79676f5f726e64);
-        core::ptr::write_unaligned((random_ptr + 8) as *mut u64, 0xfedcba9876543210);
+    if mode.writes() {
+        unsafe {
+            // Safety: Plan 阶段计算出的完整内容区间已预驻留且可写，两个 u64
+            // 都位于该区间内；写入阶段已经激活目标用户页表。
+            core::ptr::write_unaligned(random_ptr as *mut u64, 0x6d79676f5f726e64);
+            core::ptr::write_unaligned((random_ptr + 8) as *mut u64, 0xfedcba9876543210);
+        }
     }
 
     sp &= !0xf;
@@ -452,43 +503,68 @@ fn layout_user_stack(
     let stack_slots = 1 + argv_ptrs.len() + 1 + envp_ptrs.len() + 1 + auxv.len() * 2;
     if stack_slots % 2 != 0 {
         sp -= 8;
-        unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+        if mode.writes() {
+            // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+            unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+        }
     }
 
     for (key, value) in auxv.iter().rev() {
         sp -= 16;
-        unsafe {
-            core::ptr::write_unaligned(sp as *mut u64, *key as u64);
-            core::ptr::write_unaligned((sp + 8) as *mut u64, *value as u64);
+        if mode.writes() {
+            unsafe {
+                // Safety: sp 与 sp + 8 均由共享布局游标产生，位于已预驻留区间。
+                core::ptr::write_unaligned(sp as *mut u64, *key as u64);
+                core::ptr::write_unaligned((sp + 8) as *mut u64, *value as u64);
+            }
         }
     }
 
     sp -= 8;
-    unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    if mode.writes() {
+        // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+        unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    }
     for ptr in envp_ptrs.iter().rev() {
         sp -= 8;
-        unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        if mode.writes() {
+            // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+            unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        }
     }
 
     sp -= 8;
-    unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    if mode.writes() {
+        // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+        unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    }
     for ptr in argv_ptrs.iter().rev() {
         sp -= 8;
-        unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        if mode.writes() {
+            // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+            unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        }
     }
 
     sp -= 8;
-    unsafe { core::ptr::write_unaligned(sp as *mut u64, argc as u64) };
+    if mode.writes() {
+        // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+        unsafe { core::ptr::write_unaligned(sp as *mut u64, argc as u64) };
+    }
 
     Ok(sp)
 }
 
-fn push_user_string(sp: &mut usize, bytes: &[u8]) -> usize {
+fn push_user_string(mode: StackLayoutMode, sp: &mut usize, bytes: &[u8]) -> usize {
     *sp -= bytes.len() + 1;
     let ptr = *sp;
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        core::ptr::write((ptr + bytes.len()) as *mut u8, 0);
+    if mode.writes() {
+        unsafe {
+            // Safety: ptr..ptr+len+1 由 Plan 阶段同一游标计算并已预驻留；源切片
+            // 有 bytes.len() 字节，末尾 NUL 仍位于对应字符串保留区间内。
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            core::ptr::write((ptr + bytes.len()) as *mut u8, 0);
+        }
     }
     ptr
 }
@@ -702,6 +778,7 @@ fn load_exec_image(
             .checked_add(img.entry)
             .ok_or(errno::Errno::ENOEXEC)?,
         base: load_bias,
+        end: max_segment_end,
         phdr: img
             .phdr_vaddr
             .and_then(|v| load_bias.checked_add(v))
@@ -1077,6 +1154,7 @@ fn load_image(
             .checked_add(img.entry())
             .ok_or(errno::Errno::ENOEXEC)?,
         base: load_bias,
+        end: max_segment_end,
         phdr: img
             .phdr_vaddr()
             .and_then(|v| load_bias.checked_add(v))

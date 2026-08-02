@@ -8,7 +8,8 @@ extern crate std;
 
 use crate::ids::Uid;
 use crate::signal::{
-    SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigSet, SignalNumber,
+    SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
+    SignalNumber, SignalState,
 };
 use ktest::ktest;
 
@@ -97,6 +98,35 @@ fn sigset_intersection() {
 fn sigset_raw_roundtrip() {
     let s = SigSet::from_raw(0xdead_beef);
     assert_eq!(s.raw(), 0xdead_beef);
+}
+
+/// sigsuspend 的旧 mask 只交给首个 handler frame，不能被嵌套投递重复消费。
+#[ktest]
+fn sigsuspend_saved_mask_is_consumed_once() {
+    let state = SignalState::new();
+    let original = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    let temporary = SigSet::EMPTY.with(SignalNumber::SIGUSR2);
+    state.block(original, SigProcMaskHow::SetMask);
+
+    state.save_blocked(temporary);
+
+    assert_eq!(state.blocked_snapshot(), temporary);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), Some(original));
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
+}
+
+/// 未建立 handler frame 时显式恢复会同时清除待消费标记。
+#[ktest]
+fn sigsuspend_explicit_restore_clears_saved_mask() {
+    let state = SignalState::new();
+    let original = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    state.block(original, SigProcMaskHow::SetMask);
+    state.save_blocked(SigSet::EMPTY);
+
+    state.restore_blocked();
+
+    assert_eq!(state.blocked_snapshot(), original);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
 }
 
 /// 信号编号 1..=64 为合法，构造成功。

@@ -6,7 +6,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use ktest::ktest;
 
 use super::test_thread_metadata::make_task;
-use crate::{TaskState, WaitQueue};
+use crate::{TaskState, WaitQueue, WaitReason};
+
+#[ktest]
+fn buildstorm_wait_reasons_keep_existing_ids_stable() {
+    assert_eq!(WaitReason::Other as u8, 7);
+    assert_eq!(WaitReason::ProcessExit as u8, 8);
+    assert_eq!(WaitReason::Vfork as u8, 9);
+    assert_eq!(WaitReason::BlockIo as u8, 10);
+}
 
 #[ktest]
 fn prepare_to_wait_registers_before_returning_sleeping_task() {

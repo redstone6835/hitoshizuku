@@ -13,7 +13,7 @@ use core::num::NonZeroU32;
 
 use vfs::sync::Spinlock;
 
-use crate::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
+use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
     BlockGeometry, BlockLimits,
@@ -311,7 +311,7 @@ impl BlockDriver for LoopDriver {
         let result = match bio.op {
             BioOp::Read => match self.begin_io(BioOp::Read, &bio) {
                 Ok(target) => {
-                    let result = read_exact_from_backing(&target, bio.buffer.as_mut_slice());
+                    let result = read_bio_from_backing(&target, &mut bio.buffer);
                     self.finish_io();
                     result
                 }
@@ -319,7 +319,7 @@ impl BlockDriver for LoopDriver {
             },
             BioOp::Write => match self.begin_io(BioOp::Write, &bio) {
                 Ok(target) => {
-                    let result = write_exact_to_backing(&target, bio.buffer.as_slice());
+                    let result = write_bio_to_backing(&target, &bio.buffer);
                     self.finish_io();
                     result
                 }
@@ -491,12 +491,51 @@ fn compute_capacity_for(
     Ok(capacity)
 }
 
-fn read_exact_from_backing(target: &LoopIoTarget, buf: &mut [u8]) -> Result<(), BioIoError> {
+fn read_bio_from_backing(target: &LoopIoTarget, buffer: &mut BioBuffer) -> Result<(), BioIoError> {
+    let mut relative = 0usize;
+    for index in 0..buffer.segment_count() {
+        let len = buffer
+            .segment(index)
+            .map(|segment| segment.len())
+            .ok_or(BioIoError::MediaError)?;
+        buffer
+            .with_segment_mut(index, |segment| {
+                read_exact_from_backing(target, relative, segment)
+            })
+            .ok_or(BioIoError::MediaError)??;
+        relative = relative.checked_add(len).ok_or(BioIoError::MediaError)?;
+    }
+    Ok(())
+}
+
+fn write_bio_to_backing(target: &LoopIoTarget, buffer: &BioBuffer) -> Result<(), BioIoError> {
+    let mut relative = 0usize;
+    for index in 0..buffer.segment_count() {
+        let len = buffer
+            .segment(index)
+            .map(|segment| segment.len())
+            .ok_or(BioIoError::MediaError)?;
+        buffer
+            .with_segment(index, |segment| {
+                write_exact_to_backing(target, relative, segment)
+            })
+            .ok_or(BioIoError::MediaError)??;
+        relative = relative.checked_add(len).ok_or(BioIoError::MediaError)?;
+    }
+    Ok(())
+}
+
+fn read_exact_from_backing(
+    target: &LoopIoTarget,
+    relative: usize,
+    buf: &mut [u8],
+) -> Result<(), BioIoError> {
     let mut done = 0usize;
     while done < buf.len() {
         let offset = target
             .file_offset
-            .checked_add(done as u64)
+            .checked_add(relative as u64)
+            .and_then(|offset| offset.checked_add(done as u64))
             .ok_or(BioIoError::MediaError)?;
         let n = target
             .backing
@@ -513,13 +552,18 @@ fn read_exact_from_backing(target: &LoopIoTarget, buf: &mut [u8]) -> Result<(), 
     Ok(())
 }
 
-fn write_exact_to_backing(target: &LoopIoTarget, buf: &[u8]) -> Result<(), BioIoError> {
+fn write_exact_to_backing(
+    target: &LoopIoTarget,
+    relative: usize,
+    buf: &[u8],
+) -> Result<(), BioIoError> {
     if target.read_only {
         return Err(BioIoError::ReadOnly);
     }
     let end = target
         .capacity_offset
-        .checked_add(buf.len() as u64)
+        .checked_add(relative as u64)
+        .and_then(|offset| offset.checked_add(buf.len() as u64))
         .ok_or(BioIoError::MediaError)?;
     if end > target.capacity_bytes {
         return Err(BioIoError::MediaError);
@@ -529,7 +573,8 @@ fn write_exact_to_backing(target: &LoopIoTarget, buf: &[u8]) -> Result<(), BioIo
     while done < buf.len() {
         let offset = target
             .file_offset
-            .checked_add(done as u64)
+            .checked_add(relative as u64)
+            .and_then(|offset| offset.checked_add(done as u64))
             .ok_or(BioIoError::MediaError)?;
         let n = target
             .backing

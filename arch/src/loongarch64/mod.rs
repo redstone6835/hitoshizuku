@@ -23,6 +23,7 @@ mod efi_stub;
 mod elm_native;
 mod heap_vm;
 mod loader;
+mod mem;
 mod mm;
 mod paging;
 mod random_source;
@@ -31,6 +32,7 @@ mod smp;
 mod specific;
 mod syscall;
 mod task;
+mod tlb_shootdown;
 mod trap;
 pub mod vdso;
 

@@ -102,7 +102,46 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
+use spin::relax::RelaxStrategy;
+
+/// allocator 内部锁竞争时的架构紧急工作轮询器。
+///
+/// 内核堆回收会在释放 allocator 锁后同步等待全核 TLB 失效；另一 CPU 若正等待
+/// allocator 锁且本地中断暂时关闭，纯自旋会形成锁环。自定义 relax 在每次竞争
+/// 迭代处理一次已注册的无分配回调，使 shootdown 可以完成。
+pub struct AllocatorRelax;
+
+pub(crate) type Mutex<T> = spin::mutex::Mutex<T, AllocatorRelax>;
+
+static URGENT_POLL_FN: AtomicUsize = AtomicUsize::new(0);
+static URGENT_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
+static URGENT_PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl RelaxStrategy for AllocatorRelax {
+    #[inline]
+    fn relax() {
+        let pending_ptr = URGENT_PENDING_PTR.load(Ordering::Acquire);
+        let pending_count = URGENT_PENDING_COUNT.load(Ordering::Relaxed);
+        if pending_ptr != 0 && pending_count != 0 {
+            let cpu = KERNEL_ALLOCATOR.current_cpu_id().min(pending_count - 1);
+            // Safety: bind_urgent_poll 保存的是静态 AtomicBool slice，长度单独发布。
+            let pending = unsafe { &*(pending_ptr as *const AtomicBool).add(cpu) };
+            if !pending.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+                return;
+            }
+            let raw = URGENT_POLL_FN.load(Ordering::Acquire);
+            if raw == 0 {
+                core::hint::spin_loop();
+                return;
+            }
+            // Safety: `bind_urgent_poll` 只接受静态函数地址，注册后不再撤销。
+            let poll = unsafe { core::mem::transmute::<usize, UrgentPollFn>(raw) };
+            poll();
+        }
+        core::hint::spin_loop();
+    }
+}
 
 const OWNED_ALLOCATION_LOCK_COUNT: usize = 64;
 static OWNED_ALLOCATION_LOCKS: [Mutex<()>; OWNED_ALLOCATION_LOCK_COUNT] =
@@ -148,6 +187,8 @@ pub use request::{
     MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest,
     PhysicalAllocation, ReclaimPolicy, Zeroing,
 };
+#[cfg(feature = "performance-profile")]
+pub use slab::SlabProfileCounter;
 pub use slab::{
     MAX_CPUS, MAX_SMALL_SIZE, SLAB_SIZE_CLASS_COUNT, SlabAllocator as ZoneAllocator, SlabAudit,
     SlabAuditFlags, SlabClassStat, SlabReclaimStats, SlabStats,
@@ -167,6 +208,7 @@ pub type MappedRange = BackedRange;
 pub type PhysToVirtFn = fn(paddr: usize) -> usize;
 pub type VirtToPhysFn = fn(vaddr: usize) -> usize;
 pub type CpuIdFn = fn() -> usize;
+pub type UrgentPollFn = fn();
 pub type GcEnterCriticalFn = fn() -> usize;
 pub type GcLeaveCriticalFn = fn(state: usize);
 pub type ManagedGcMoveCallbackFn = fn(old_ptr: usize, new_record: AllocationRecord) -> bool;
@@ -415,6 +457,44 @@ impl KernelMemorySubsystem {
 
     pub fn bind_cpu_id(&self, cpu_id_fn: CpuIdFn) {
         self.cpu_id_fn.store(cpu_id_fn as usize, Ordering::Release);
+    }
+
+    /// 注册 allocator 自旋锁竞争时使用的无分配紧急工作回调。
+    ///
+    /// 该回调可能在任意 allocator 锁的等待路径执行，必须只使用原子状态或架构
+    /// 指令，不能分配、阻塞或再次获取 allocator 锁。
+    pub fn bind_urgent_poll(&self, pending: &'static [AtomicBool], poll: UrgentPollFn) {
+        assert!(
+            !pending.is_empty(),
+            "allocator urgent pending slice is empty"
+        );
+        let address = poll as usize;
+        match URGENT_POLL_FN.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {}
+            Err(existing) => {
+                assert_eq!(existing, address, "allocator urgent poll hook replaced");
+            }
+        }
+        let pending_address = pending.as_ptr() as usize;
+        match URGENT_PENDING_PTR.compare_exchange(
+            0,
+            pending_address,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => URGENT_PENDING_COUNT.store(pending.len(), Ordering::Release),
+            Err(existing) => {
+                assert_eq!(
+                    existing, pending_address,
+                    "allocator urgent pending source replaced"
+                );
+                assert_eq!(
+                    URGENT_PENDING_COUNT.load(Ordering::Acquire),
+                    pending.len(),
+                    "allocator urgent pending length changed"
+                );
+            }
+        }
     }
 
     pub fn bind_gc_critical_section(&self, enter: GcEnterCriticalFn, leave: GcLeaveCriticalFn) {
@@ -1023,6 +1103,11 @@ impl KernelMemorySubsystem {
         self.registry.stats()
     }
 
+    #[cfg(feature = "performance-profile")]
+    pub fn slab_profile_counter(&self, cpu: usize, counter: SlabProfileCounter) -> u64 {
+        self.slab.profile_counter(cpu, counter)
+    }
+
     /// 返回指定外部所有者当前仍存活的 allocator 分配摘要。
     pub fn owner_allocation_stats(&self, owner: u64) -> AllocationOwnerStats {
         self.registry.owner_stats(owner)
@@ -1058,7 +1143,11 @@ impl KernelMemorySubsystem {
         request: PhysicalAllocRequest,
     ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
         let request = request.validate().map_err(buddy_alloc_error_from_request)?;
-        let active = self.active.load(Ordering::Acquire);
+        // active is a one-way latch; Relaxed is safe here — the Release/Acquire
+        // pair at init already establishes happens-before, and allocate_physical
+        // is called on every page allocation, making Acquire overhead significant
+        // on LoongArch (dbar instruction).
+        let active = self.active.load(Ordering::Relaxed);
         let accounting_owner = if active {
             resolve_accounting_owner(request.accounting_owner())
         } else {
@@ -1068,7 +1157,15 @@ impl KernelMemorySubsystem {
             return Err(buddy::BuddyAllocError::Fragmented);
         }
         let request = request.with_accounting_owner(accounting_owner);
-        let allocation = match self.allocate_physical_raw(request) {
+        let mut allocation = self.allocate_physical_raw(request);
+        if allocation.is_err() && active {
+            // 显式物理页与普通内核堆共享 buddy。用户页、页表页等 typed 请求在
+            // 宣告 OOM 前也必须归还 allocator 自身缓存，否则短生命周期堆对象
+            // 留下的空 slab/kheap range 会对物理页调用方表现成不可用内存。
+            let _ = self.reclaim_allocator_caches_for_retry();
+            allocation = self.allocate_physical_raw(request);
+        }
+        let allocation = match allocation {
             Ok(allocation) => allocation,
             Err(err) => {
                 release_accounting(accounting_owner, request.size);
@@ -1079,21 +1176,23 @@ impl KernelMemorySubsystem {
             return Ok(allocation);
         }
 
-        let record = physical_record_from_allocation(request, allocation, accounting_owner);
-        match self.registry.register_result(&self.boot, record) {
-            Ok(()) => Ok(allocation),
-            Err(err) => {
-                let _ = self.free_physical_raw(allocation);
-                release_accounting(accounting_owner, request.size);
-                Err(match err {
-                    RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
-                    RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
-                    RegistryError::UnknownPointer => buddy::BuddyAllocError::InvalidAddress,
-                    RegistryError::DuplicatePointer => buddy::BuddyAllocError::BlockNotFree,
-                    RegistryError::MetadataOutOfMemory => {
-                        buddy::BuddyAllocError::MetadataOutOfMemory
-                    }
-                })
+        {
+            let record = physical_record_from_allocation(request, allocation, accounting_owner);
+            match self.registry.register_result(&self.boot, record) {
+                Ok(()) => Ok(allocation),
+                Err(err) => {
+                    let _ = self.free_physical_raw(allocation);
+                    release_accounting(accounting_owner, request.size);
+                    Err(match err {
+                        RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
+                        RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
+                        RegistryError::UnknownPointer => buddy::BuddyAllocError::InvalidAddress,
+                        RegistryError::DuplicatePointer => buddy::BuddyAllocError::BlockNotFree,
+                        RegistryError::MetadataOutOfMemory => {
+                            buddy::BuddyAllocError::MetadataOutOfMemory
+                        }
+                    })
+                }
             }
         }
     }
@@ -1241,8 +1340,11 @@ impl KernelMemorySubsystem {
     }
 
     pub fn allocate(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
+        // active is a one-way latch; Relaxed is safe after init establishes
+        // happens-before via the Release store. Avoids a dbar on every allocation
+        // on LoongArch while preserving the boot-phase fallback.
+        let active = self.active.load(Ordering::Relaxed);
         let request = request.validate()?;
-        let active = self.active.load(Ordering::Acquire);
         let accounting_owner = if active {
             resolve_accounting_owner(request.accounting_owner())
         } else {
@@ -1252,6 +1354,7 @@ impl KernelMemorySubsystem {
             return Err(AllocationError::OutOfMemory);
         }
         let request = request.with_accounting_owner(accounting_owner);
+
         if !active {
             let result = self.allocate_boot(request);
             if result.is_err() {
@@ -1694,6 +1797,13 @@ impl KernelMemorySubsystem {
                         .checked_add(old_size)
                         .ok_or(AllocationError::InvalidLayout)?;
                     let len = request.size - old_size;
+                    #[cfg(feature = "performance-profile")]
+                    let _profile = match record.kind {
+                        AllocationKind::Small => {
+                            profiling::scope(profiling::Event::MemZeroAllocatorSmall).bytes(len)
+                        }
+                        _ => profiling::scope(profiling::Event::MemZeroAllocatorLarge).bytes(len),
+                    };
                     unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
                 }
                 return Ok(record);
@@ -1721,6 +1831,8 @@ impl KernelMemorySubsystem {
         let new_record =
             self.allocate(request.with_accounting_owner(old_record.accounting_owner()))?;
         let copy_len = old_record.size.min(new_record.size);
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyRealloc).bytes(copy_len);
         unsafe {
             core::ptr::copy_nonoverlapping(ptr as *const u8, new_record.ptr as *mut u8, copy_len);
         }
@@ -1793,6 +1905,9 @@ impl KernelMemorySubsystem {
                         }
                     };
                     if matches!(request.zeroing, Zeroing::Zeroed) {
+                        #[cfg(feature = "performance-profile")]
+                        let _profile = profiling::scope(profiling::Event::MemZeroAllocatorLarge)
+                            .bytes(request.size);
                         unsafe {
                             core::ptr::write_bytes(range.vaddr as *mut u8, 0, request.size);
                         }
@@ -1833,6 +1948,10 @@ impl KernelMemorySubsystem {
                             return Err(AllocationError::OutOfMemory);
                         }
                         if matches!(request.zeroing, Zeroing::Zeroed) {
+                            #[cfg(feature = "performance-profile")]
+                            let _profile =
+                                profiling::scope(profiling::Event::MemZeroAllocatorSmall)
+                                    .bytes(request.size);
                             unsafe {
                                 core::ptr::write_bytes(allocation.ptr as *mut u8, 0, request.size);
                             }
@@ -1999,29 +2118,32 @@ impl KernelMemorySubsystem {
             let _ = self.registry.register_result(&self.boot, old_record);
             return false;
         }
-        new_record = new_record.with_accounting_owner(old_record.accounting_owner());
-        let result = match self.registry.get_result(new_record.ptr) {
-            Ok(_) => self
-                .registry
-                .update_existing_result(new_record.ptr, new_record),
-            Err(RegistryError::UnknownPointer) => {
-                self.registry.register_result(&self.boot, new_record)
-            }
-            Err(err) => Err(err),
-        };
-
-        match result {
-            Ok(()) => true,
-            Err(_) => {
-                let _ = try_resize_accounting(
-                    old_record.accounting_owner(),
-                    new_record.size,
-                    old_record.size,
-                );
-                let _ = self.registry.register_result(&self.boot, old_record);
-                false
-            }
+        #[cfg(feature = "track-allocations")]
+        {
+            new_record = new_record.with_accounting_owner(old_record.accounting_owner());
+            let result = match self.registry.get_result(new_record.ptr) {
+                Ok(_) => self
+                    .registry
+                    .update_existing_result(new_record.ptr, new_record),
+                Err(RegistryError::UnknownPointer) => {
+                    self.registry.register_result(&self.boot, new_record)
+                }
+                Err(err) => Err(err),
+            };
+            return match result {
+                Ok(()) => true,
+                Err(_) => {
+                    let _ = try_resize_accounting(
+                        old_record.accounting_owner(),
+                        new_record.size,
+                        old_record.size,
+                    );
+                    let _ = self.registry.register_result(&self.boot, old_record);
+                    false
+                }
+            };
         }
+        true
     }
 
     fn ensure_default_managed(&self) -> Result<(), InitError> {
@@ -2558,6 +2680,8 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
 
         let old_size = realloc_copy_source_size(owner, layout.size());
         let copy_len = old_size.min(new_size);
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyRealloc).bytes(copy_len);
         unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
 
         if active {

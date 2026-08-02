@@ -195,15 +195,22 @@ static PRE_EXIT_HOOK: KernelPreExitHook = KernelPreExitHook;
 // ── VmSwitchOps ──────────────────────────────────────────────────────────────
 //
 // sched 在 schedule_once 切换到 next 前调此回调；本函数从 next 的 ext 表
-// 里找 TASKEXT_VM_SPACE payload，若在 → downcast 成 VmSpace 再 activate。
-// 没挂（纯 kthread 或 init）→ no-op。
+// 里找 TASKEXT_VM_SPACE payload，若在 -> downcast 成 VmSpace 再 activate。
+// 没挂（idle、纯 kthread 或 init）时必须切回内核页表，不能继续沿用
+// 上一个用户任务可能即将回收的 PGD。
 
 fn vm_on_switch(next: &Arc<Task>) {
-    if let Some(payload) = next.ext_lookup(TASKEXT_VM_SPACE) {
-        if let Ok(vm) = payload.downcast::<VmSpace>() {
+    let activated = next
+        .ext_with(TASKEXT_VM_SPACE, |payload| {
+            let Some(vm) = payload.downcast_ref::<VmSpace>() else {
+                return false;
+            };
             vm.activate();
-            return;
-        }
+            true
+        })
+        .unwrap_or(false);
+    if activated {
+        return;
     }
 
     // 内核线程和 idle 没有用户地址空间。RISC-V 若在这里保持上一个用户
@@ -225,6 +232,9 @@ const RSEQ_CPU_ID_START_OFFSET: usize = 0;
 const RSEQ_CPU_ID_OFFSET: usize = 4;
 
 fn publish_task_cpu_state(task: &Arc<Task>, cpu_id: usize) {
+    if !task.rseq_registered() {
+        return;
+    }
     let registration = task.rseq_registration();
     if !registration.registered {
         return;
@@ -261,7 +271,9 @@ static TASK_CPU_STATE_OPS: sched::arch_hooks::TaskCpuStateOps =
 // 替换 VmSpace 的实现留在 kernel/hal 侧。
 
 const EXEC_PATH_MAX: usize = 4096;
-const EXEC_MAX_STRINGS: usize = 256;
+// Rust 链接器命令会携带数百个目标文件与静态库；最终可用空间仍由
+// EXEC_MAX_ARG_BYTES 和用户栈布局共同约束，这里不应提前卡在 256 项。
+const EXEC_MAX_STRINGS: usize = 4096;
 const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 
 const SIGFRAME_MAGIC: u64 = 0x4d59474f_53494746; // "MYGOSIGF"
@@ -316,6 +328,31 @@ fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[
 
     let _ = task.ext_remove(TASKEXT_EXEC_ENVP);
     task.ext_install(TASKEXT_EXEC_ENVP, Arc::new(envp.to_vec()));
+}
+
+#[cfg(feature = "performance-profile")]
+pub(crate) fn profile_image_id(path: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+#[cfg(feature = "performance-profile")]
+fn install_profile_images(task: &Arc<Task>, loaded: &crate::user::LoadedUserImage) {
+    let main = (
+        profile_image_id(&loaded.exec_path),
+        loaded.main_image_range.start,
+        loaded.main_image_range.end,
+    );
+    let interpreter = loaded
+        .interpreter_image
+        .as_ref()
+        .map(|(path, range)| (profile_image_id(path), range.start, range.end))
+        .unwrap_or((0, 0, 0));
+    task.set_profile_images(main, interpreter);
 }
 
 fn install_exec_access(task: &Arc<Task>, access: Arc<crate::user::ExecutableAccessSet>) {
@@ -415,9 +452,19 @@ unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
         let me = sched::current_task();
         activate_task_vm(&me);
 
-        let payload = me
-            .ext_remove(TASKEXT_USER_TRAP_FRAME)
-            .expect("[sched][clone] user child missing saved trap frame");
+        // 子任务可能在"已入队、尚未首次运行"的窗口里被 exit_group / SIGKILL
+        // 杀掉。`exit_task` 只对"不是任何 CPU 的 current"的任务做扩展清理，而
+        // 排队中的新子任务恰好满足这个条件，于是它的 trap frame 会先被摘走。
+        // 这不是错误状态：任务已经被标记退出，正确处理是直接走内核线程退出
+        // 路径，而不是 panic，更不能带着空 frame 返回用户态。
+        let Some(payload) = me.ext_remove(TASKEXT_USER_TRAP_FRAME) else {
+            log::debug!(
+                "[sched][clone] child terminated before first user return: pid={:?} state={:?}",
+                me.pid_root(),
+                me.state(),
+            );
+            sched::kthread_finish(sched::ExitCode(0));
+        };
         let frame = payload
             .downcast::<UserTrapFrame>()
             .expect("[sched][clone] saved trap frame type mismatch");
@@ -495,6 +542,8 @@ fn process_execve(
     arch::riscv64::vector::clear_for_task(task);
     loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
+    #[cfg(feature = "performance-profile")]
+    install_profile_images(task, &loaded);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }
@@ -531,6 +580,8 @@ fn process_spawn_user_process(
     child.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
     install_exec_access(child, Arc::clone(&loaded.exec_access));
     install_exec_metadata(child, &loaded.exec_path, argv, envp);
+    #[cfg(feature = "performance-profile")]
+    install_profile_images(child, &loaded);
     if let Some(fdt) = task_fdtable(child) {
         fdt.close_on_exec();
     }
@@ -716,7 +767,10 @@ fn process_setup_signal_frame(
     let restorer = hal::user::sigreturn_entry_va();
 
     let saved = UserTrapFrame::from_context(user_ctx.as_usize());
-    let old_mask = task.signal.blocked_snapshot();
+    let old_mask = task
+        .signal
+        .take_sigsuspend_saved_blocked()
+        .unwrap_or_else(|| task.signal.blocked_snapshot());
     let trap_len = UserTrapFrame::encoded_len();
     let total = SIGFRAME_TRAP_OFF
         .checked_add(trap_len)
@@ -885,6 +939,11 @@ pub fn boot_init() -> Arc<Task> {
     // 9. 建 init。sched::init 内部会 assert arch_hooks 已注入。
     let init = sched::init();
 
+    // allocator 的自旋锁可能与内核堆回收触发的全核 TLB shootdown 形成锁环。
+    // 调度器和架构紧急回调就绪后，让所有 allocator 竞争路径协作消费请求。
+    allocator::KERNEL_ALLOCATOR
+        .bind_urgent_poll(sched::urgent_pending_slots(), sched::poll_urgent_work);
+
     // 10. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
     //    （理论上不会）就跳过——调度 / 信号路径不依赖 ext，仅 VFS syscall 受影响。
     if let Some(parts) = BOOT_VFS_PARTS.lock().take() {
@@ -966,6 +1025,8 @@ fn enter_loaded_user_image(
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
     install_exec_access(task, Arc::clone(&loaded.exec_access));
     install_exec_metadata(task, &exec_path, argv, envp);
+    #[cfg(feature = "performance-profile")]
+    install_profile_images(task, &loaded);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }

@@ -153,9 +153,24 @@ impl WaitQueue {
             });
         // 状态切换与登记由同一把锁序列化。waker 要么先完成且调用方随后重新
         // 检查条件，要么在这里之后看到 Sleeping/Uninterruptible。
+        #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+        let before = task.state();
         #[cfg(feature = "performance-profile")]
         task.begin_profile_wait(self.reason, crate::scheduler::now_ns_public());
-        task.set_state(state);
+        let prepared = task.prepare_wait_state(state);
+        #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+        if self.reason == WaitReason::ProcessExit {
+            log::info!(
+                "[sched][wait-queue] prepare pid={:?} before={:?} after={:?} prepared={} queued={}",
+                task.pid_root(),
+                before,
+                task.state(),
+                prepared,
+                waiters.len(),
+            );
+        }
+        #[cfg(not(all(feature = "performance-profile", feature = "trace-task-lifecycle")))]
+        let _ = prepared;
         entry
     }
 
@@ -279,6 +294,49 @@ impl WaitQueue {
         self.wake_one(default_wake)
     }
 
+    /// 使用默认调度器入口唤醒一个等待者，并在剖析构建中携带事件源关联号。
+    pub fn wake_one_default_with_cause(
+        &self,
+        kind: u8,
+        object: u64,
+        correlation: u64,
+    ) -> Option<Arc<Task>> {
+        let picked = {
+            let mut w = self.waiters.lock();
+            let initial_len = w.len();
+            let mut picked = None;
+            for _ in 0..initial_len {
+                let Some(entry) = w.pop_front() else {
+                    break;
+                };
+                let Some(task) = entry.task() else {
+                    continue;
+                };
+                let state = task.state();
+                if state != TaskState::Sleeping && state != TaskState::Uninterruptible {
+                    w.push_back(entry);
+                    continue;
+                }
+                if entry.mark_woken() {
+                    picked = Some(task);
+                    break;
+                }
+            }
+            picked
+        };
+        if let Some(ref task) = picked {
+            task.set_profile_wake_cause(
+                kind,
+                object,
+                correlation,
+                crate::scheduler::now_ns_public(),
+            );
+            transition_to_runnable(task);
+            default_wake(task);
+        }
+        picked
+    }
+
     /// 带回调的全量唤醒。
     pub fn wake_all_with(&self, wake: impl Fn(&Arc<Task>)) {
         let tasks: VecDeque<Arc<Task>> = {
@@ -293,7 +351,23 @@ impl WaitQueue {
                 .collect()
         };
         for task in tasks {
-            transition_to_runnable(&task);
+            #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+            let before = task.state();
+            let transitioned = transition_to_runnable(&task);
+            #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+            if self.reason == WaitReason::ProcessExit {
+                log::info!(
+                    "[sched][wait-queue] wake pid={:?} before={:?} after={:?} transitioned={} on_rq={} running_cpu={:?}",
+                    task.pid_root(),
+                    before,
+                    task.state(),
+                    transitioned,
+                    task.sched.on_rq(),
+                    task.running_cpu(),
+                );
+            }
+            #[cfg(not(all(feature = "performance-profile", feature = "trace-task-lifecycle")))]
+            let _ = transitioned;
             wake(&task);
         }
     }
@@ -372,7 +446,7 @@ impl Default for WaitQueue {
 
 /// 把 Sleeping / Uninterruptible 切回 Runnable。CAS 失败说明任务已经
 /// 处于其他状态（例如刚被另一路径唤醒），跳过即可。
-fn transition_to_runnable(task: &Arc<Task>) {
+fn transition_to_runnable(task: &Arc<Task>) -> bool {
     let transitioned = task.cas_state(TaskState::Sleeping, TaskState::Runnable)
         || task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
     #[cfg(feature = "performance-profile")]
@@ -381,6 +455,7 @@ fn transition_to_runnable(task: &Arc<Task>) {
     }
     #[cfg(not(feature = "performance-profile"))]
     let _ = transitioned;
+    transitioned
 }
 
 fn transition_from_wait(task: &Arc<Task>) {

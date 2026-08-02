@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use sched::WaitQueue;
+use sched::{WaitQueue, WaitReason};
 use vfs::sync::Spinlock;
 
 /// 通用完成变量。
@@ -25,16 +25,26 @@ pub struct Completion<T> {
 
 impl<T> Completion<T> {
     pub const fn new_detached() -> Self {
+        Self::new_detached_with_reason(WaitReason::Other)
+    }
+
+    /// 创建带剖析等待原因的非共享完成变量。
+    pub const fn new_detached_with_reason(reason: WaitReason) -> Self {
         Self {
             done: AtomicBool::new(false),
             result: Spinlock::new(None),
             waker: Spinlock::new(None),
-            wait_queue: WaitQueue::new(),
+            wait_queue: WaitQueue::new_with_reason(reason),
         }
     }
 
     pub fn new() -> Arc<Self> {
         Arc::new(Self::new_detached())
+    }
+
+    /// 创建带剖析等待原因的共享完成变量。
+    pub fn new_with_reason(reason: WaitReason) -> Arc<Self> {
+        Arc::new(Self::new_detached_with_reason(reason))
     }
 
     pub fn is_done(&self) -> bool {

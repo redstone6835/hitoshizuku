@@ -66,8 +66,9 @@ fn notify_lifecycle_event(event: ElmLifecycleEvent) {
 
 /// 常驻内核 consumer 对一个 ELM exact-Rust export 的代际固定描述。
 ///
-/// 该对象只保存复制到常驻内存中的身份和 ABI 摘要；每次调用仍由 Core 重新校验 cell
-/// 状态、generation 和 export 路由，并取得 active-execution 引用。
+/// 该对象保存复制到常驻内存中的身份和 ABI 摘要，并在首次成功解析后缓存当前 generation
+/// 的不可变 export 路由；每次调用仍由 Core 重新校验 cell 状态和 generation，并取得
+/// active-execution 引用。
 pub(crate) struct PinnedNativeCall {
     owner: elm_model::ElmId,
     generation: elm_model::Generation,
@@ -76,6 +77,13 @@ pub(crate) struct PinnedNativeCall {
     version: u32,
     rust_abi_hash: [u8; 32],
     stack: native::PinnedNativeStack,
+    route: Spinlock<Option<PinnedNativeRoute>>,
+}
+
+#[derive(Clone, Copy)]
+struct PinnedNativeRoute {
+    address: usize,
+    bounds: native::NativeExecutionBounds,
 }
 
 impl PinnedNativeCall {
@@ -101,6 +109,7 @@ impl PinnedNativeCall {
             version,
             rust_abi_hash: elm_model::sha256(rust_abi.as_bytes()),
             stack,
+            route: Spinlock::new(None),
         })
     }
 }
@@ -283,7 +292,17 @@ pub(crate) fn invoke_pinned_native<T>(
     host_ranges: &[(usize, usize)],
     deadline_ns: u64,
 ) -> Result<i32, i32> {
-    let plan = with_core(|core| core.prepare_pinned_native_call(call))?;
+    #[cfg(feature = "performance-profile")]
+    let prepare_start = profiling::read_counter();
+    let prepared = with_core(|core| core.prepare_pinned_native_call(call));
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedCallPrepareCycles,
+        profiling::read_counter().wrapping_sub(prepare_start),
+    );
+    let plan = prepared?;
+    #[cfg(feature = "performance-profile")]
+    let execution_start = profiling::read_counter();
     let status = native::invoke_pinned_export(
         plan.callee.cell,
         plan.callee.generation,
@@ -295,7 +314,20 @@ pub(crate) fn invoke_pinned_native<T>(
         plan.callee.allowed_actions,
         deadline_ns,
     );
-    with_core(|core| core.complete_pinned_native_call(plan, status))
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedCallExecutionCycles,
+        profiling::read_counter().wrapping_sub(execution_start),
+    );
+    #[cfg(feature = "performance-profile")]
+    let complete_start = profiling::read_counter();
+    let completed = with_core(|core| core.complete_pinned_native_call(plan, status));
+    #[cfg(feature = "performance-profile")]
+    profiling::observe(
+        profiling::Metric::PinnedCallCompleteCycles,
+        profiling::read_counter().wrapping_sub(complete_start),
+    );
+    completed
 }
 
 pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String> {

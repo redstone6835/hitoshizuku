@@ -15,7 +15,7 @@
 //!   父子进程共享 `File` 对象（即共享偏移量）；`clone(CLONE_FILES)` 则共享同
 //!   一个 `FdTable` 引用，此时需要在整张表上加锁，此处暂不支持（留待扩展）。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -114,12 +114,52 @@ struct FdEntry {
     file: Arc<File>,
     /// 该描述符的标志（目前只有 CLOEXEC）。
     flags: FdFlags,
+    fd_reference_live: bool,
 }
 
 struct RemovedFd {
     fd: u32,
     entry: FdEntry,
     last_file_reference: bool,
+}
+
+impl FdEntry {
+    fn new(file: Arc<File>, flags: FdFlags) -> Self {
+        file.acquire_fd_reference();
+        Self {
+            file,
+            flags,
+            fd_reference_live: true,
+        }
+    }
+
+    fn release_fd_reference(&mut self) -> bool {
+        if !self.fd_reference_live {
+            return false;
+        }
+        self.fd_reference_live = false;
+        self.file.release_fd_reference()
+    }
+}
+
+impl Drop for FdEntry {
+    fn drop(&mut self) {
+        if self.fd_reference_live {
+            let _ = self.file.release_fd_reference();
+            self.fd_reference_live = false;
+        }
+    }
+}
+
+impl RemovedFd {
+    fn new(fd: u32, mut entry: FdEntry) -> Self {
+        let last_file_reference = entry.release_fd_reference();
+        Self {
+            fd,
+            entry,
+            last_file_reference,
+        }
+    }
 }
 
 fn notify_fd_closed(fd: u32, entry: &FdEntry) {
@@ -151,8 +191,6 @@ struct FdTableInner {
     hard_limit: u32,
     /// fd 分配位图：第 i 位为 1 表示 fd=i 已被占用。
     bitmap: Vec<u64>,
-    /// 观察本 fdtable 中 fd 关闭/替换事件的文件（典型是 epoll fd）。
-    close_observers: Vec<Weak<File>>,
 }
 
 impl FdTableInner {
@@ -163,7 +201,6 @@ impl FdTableInner {
             limit,
             hard_limit,
             bitmap: alloc::vec![0u64; bitmap_words(hard_limit)],
-            close_observers: Vec::new(),
         }
     }
 
@@ -237,23 +274,6 @@ impl FdTableInner {
         self.entries.get_mut(fd as usize).and_then(|e| e.as_mut())
     }
 
-    fn contains_file(&self, file: &Arc<File>) -> bool {
-        for (i, &word) in self.bitmap.iter().enumerate() {
-            let mut w = word;
-            while w != 0 {
-                let bit = w.trailing_zeros();
-                let fd = i as u32 * 64 + bit;
-                w &= w - 1;
-                if let Some(entry) = self.get(fd)
-                    && Arc::ptr_eq(&entry.file, file)
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// O(1) 插入条目，返回旧条目（若有）。
     #[inline]
     fn insert(&mut self, fd: u32, entry: FdEntry) -> Option<FdEntry> {
@@ -315,23 +335,8 @@ impl FdTable {
         if fd >= inner.limit {
             return Err(VfsError::TooManyOpenFiles);
         }
-        inner.insert(fd, FdEntry { file, flags });
+        inner.insert(fd, FdEntry::new(file, flags));
         Ok(Fd(fd))
-    }
-
-    pub fn register_close_observer(&self, file: &Arc<File>) {
-        let mut inner = self.inner.lock();
-        inner
-            .close_observers
-            .retain(|weak| weak.upgrade().is_some());
-        if inner.close_observers.iter().any(|weak| {
-            weak.upgrade()
-                .as_ref()
-                .is_some_and(|queued| Arc::ptr_eq(queued, file))
-        }) {
-            return;
-        }
-        inner.close_observers.push(Arc::downgrade(file));
     }
 
     fn notify_fd_closed(&self, removed: &RemovedFd) {
@@ -339,22 +344,7 @@ impl FdTable {
         if !removed.last_file_reference {
             return;
         }
-        let observers = {
-            let mut inner = self.inner.lock();
-            let mut observers = Vec::new();
-            inner.close_observers.retain(|weak| {
-                if let Some(file) = weak.upgrade() {
-                    observers.push(file);
-                    true
-                } else {
-                    false
-                }
-            });
-            observers
-        };
-        for observer in observers {
-            observer.on_file_description_closed(&removed.entry.file);
-        }
+        File::notify_description_closed(&removed.entry.file);
     }
 
     fn release_record_locks_for_removed(removed: &RemovedFd, owner_pid: i32) {
@@ -370,12 +360,8 @@ impl FdTable {
             if fd >= inner.limit {
                 return Err(VfsError::BadFileDescriptor);
             }
-            let old = inner.insert(fd, FdEntry { file, flags });
-            old.map(|entry| RemovedFd {
-                fd,
-                last_file_reference: !inner.contains_file(&entry.file),
-                entry,
-            })
+            let old = inner.insert(fd, FdEntry::new(file, flags));
+            old.map(|entry| RemovedFd::new(fd, entry))
         };
         if let Some(old) = old.as_ref() {
             self.notify_fd_closed(old);
@@ -402,12 +388,8 @@ impl FdTable {
             if fd >= inner.limit {
                 return Err(VfsError::BadFileDescriptor);
             }
-            let old = inner.insert(fd, FdEntry { file, flags });
-            old.map(|entry| RemovedFd {
-                fd,
-                last_file_reference: !inner.contains_file(&entry.file),
-                entry,
-            })
+            let old = inner.insert(fd, FdEntry::new(file, flags));
+            old.map(|entry| RemovedFd::new(fd, entry))
         };
         if let Some(old) = old.as_ref() {
             Self::release_record_locks_for_removed(old, owner_pid);
@@ -422,11 +404,7 @@ impl FdTable {
         let removed = {
             let mut inner = self.inner.lock();
             let removed = inner.remove(fd.0);
-            removed.map(|entry| RemovedFd {
-                fd: fd.0,
-                last_file_reference: !inner.contains_file(&entry.file),
-                entry,
-            })
+            removed.map(|entry| RemovedFd::new(fd.0, entry))
         };
         let Some(removed) = removed else {
             return Err(VfsError::BadFileDescriptor);
@@ -441,11 +419,7 @@ impl FdTable {
         let removed = {
             let mut inner = self.inner.lock();
             let removed = inner.remove(fd.0);
-            removed.map(|entry| RemovedFd {
-                fd: fd.0,
-                last_file_reference: !inner.contains_file(&entry.file),
-                entry,
-            })
+            removed.map(|entry| RemovedFd::new(fd.0, entry))
         };
         let Some(removed) = removed else {
             return Err(VfsError::BadFileDescriptor);
@@ -499,7 +473,7 @@ impl FdTable {
         if new_fd >= inner.limit {
             return Err(VfsError::TooManyOpenFiles);
         }
-        inner.insert(new_fd, FdEntry { file, flags });
+        inner.insert(new_fd, FdEntry::new(file, flags));
         Ok(Fd(new_fd))
     }
 
@@ -521,12 +495,8 @@ impl FdTable {
                 .get(old_fd.0)
                 .map(|e| Arc::clone(&e.file))
                 .ok_or(VfsError::BadFileDescriptor)?;
-            let old = inner.insert(new_fd.0, FdEntry { file, flags });
-            old.map(|entry| RemovedFd {
-                fd: new_fd.0,
-                last_file_reference: !inner.contains_file(&entry.file),
-                entry,
-            })
+            let old = inner.insert(new_fd.0, FdEntry::new(file, flags));
+            old.map(|entry| RemovedFd::new(new_fd.0, entry))
         };
         if let Some(replaced) = replaced.as_ref() {
             self.notify_fd_closed(replaced);
@@ -559,12 +529,8 @@ impl FdTable {
                 .get(old_fd.0)
                 .map(|e| Arc::clone(&e.file))
                 .ok_or(VfsError::BadFileDescriptor)?;
-            let old = inner.insert(new_fd.0, FdEntry { file, flags });
-            old.map(|entry| RemovedFd {
-                fd: new_fd.0,
-                last_file_reference: !inner.contains_file(&entry.file),
-                entry,
-            })
+            let old = inner.insert(new_fd.0, FdEntry::new(file, flags));
+            old.map(|entry| RemovedFd::new(new_fd.0, entry))
         };
         if let Some(replaced) = replaced.as_ref() {
             Self::release_record_locks_for_removed(replaced, owner_pid);
@@ -638,12 +604,7 @@ impl FdTable {
                             .get(fd)
                             .is_some_and(|entry| entry.flags.has(FdFlags::CLOEXEC));
                         if should_remove && let Some(removed) = inner.remove(fd) {
-                            let last_file_reference = !inner.contains_file(&removed.file);
-                            batch_buf[batch_count] = Some(RemovedFd {
-                                fd,
-                                entry: removed,
-                                last_file_reference,
-                            });
+                            batch_buf[batch_count] = Some(RemovedFd::new(fd, removed));
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -766,12 +727,7 @@ impl FdTable {
                             continue;
                         }
                         if let Some(removed) = inner.remove(fd) {
-                            let last_file_reference = !inner.contains_file(&removed.file);
-                            batch_buf[batch_count] = Some(RemovedFd {
-                                fd,
-                                entry: removed,
-                                last_file_reference,
-                            });
+                            batch_buf[batch_count] = Some(RemovedFd::new(fd, removed));
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -826,12 +782,7 @@ impl FdTable {
                             continue;
                         }
                         if let Some(removed) = inner.remove(fd) {
-                            let last_file_reference = !inner.contains_file(&removed.file);
-                            batch_buf[batch_count] = Some(RemovedFd {
-                                fd,
-                                entry: removed,
-                                last_file_reference,
-                            });
+                            batch_buf[batch_count] = Some(RemovedFd::new(fd, removed));
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -885,12 +836,7 @@ impl FdTable {
                         let fd = word_idx as u32 * 64 + bit;
                         word &= word - 1;
                         if let Some(removed) = inner.remove(fd) {
-                            let last_file_reference = !inner.contains_file(&removed.file);
-                            batch_buf[batch_count] = Some(RemovedFd {
-                                fd,
-                                entry: removed,
-                                last_file_reference,
-                            });
+                            batch_buf[batch_count] = Some(RemovedFd::new(fd, removed));
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -923,10 +869,8 @@ impl FdTable {
             .entries
             .iter()
             .map(|opt| {
-                opt.as_ref().map(|e| FdEntry {
-                    file: Arc::clone(&e.file),
-                    flags: e.flags,
-                })
+                opt.as_ref()
+                    .map(|e| FdEntry::new(Arc::clone(&e.file), e.flags))
             })
             .collect();
         FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
@@ -938,7 +882,6 @@ impl FdTable {
                 limit: inner.limit,
                 hard_limit: inner.hard_limit,
                 bitmap: inner.bitmap.clone(),
-                close_observers: inner.close_observers.clone(),
             }),
         }
     }
@@ -946,6 +889,18 @@ impl FdTable {
 
 impl Drop for FdTable {
     fn drop(&mut self) {
+        let entries = {
+            let mut inner = self.inner.lock();
+            inner.count = 0;
+            inner.bitmap.fill(0);
+            core::mem::take(&mut inner.entries)
+        };
+        for (fd, entry) in entries.into_iter().enumerate() {
+            if let Some(entry) = entry {
+                let removed = RemovedFd::new(fd as u32, entry);
+                self.notify_fd_closed(&removed);
+            }
+        }
         FDTABLE_DROPPED.fetch_add(1, Ordering::Relaxed);
         FDTABLE_LIVE.fetch_sub(1, Ordering::Relaxed);
     }

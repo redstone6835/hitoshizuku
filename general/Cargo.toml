@@ -11,7 +11,8 @@ bench = false
 [features]
 block-profile = []
 trace-syscall = []
-performance-profile = ["dep:profiling"]
+trace-task-lifecycle = ["sched/trace-task-lifecycle"]
+performance-profile = ["dep:profiling", "sched/performance-profile"]
 
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false }
@@ -21,12 +22,14 @@ elm_model = { package = "elm", path = "../libs/elm" }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
+hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 log = { path = "../libs/log" }
 kernel-symbols = { path = "../libs/kernel-symbols" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
+smallvec = { version = "1.15.1", default-features = false, features = ["const_generics"] }
 socket = { path = "../libs/socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 vfs = { path = "../libs/vfs" }

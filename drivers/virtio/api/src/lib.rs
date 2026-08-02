@@ -96,6 +96,8 @@ pub const VIRTIO_STATUS_FAILED: u8 = 128;
 
 /// 所有 modern VirtIO 设备都必须支持的基础 feature。
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// split virtqueue event suppression。
+pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
 /// reset 后等待 status 清零的默认自旋上限。
 pub const VIRTIO_PCI_RESET_SPIN_LIMIT: u32 = 1_000_000;
 
@@ -585,7 +587,7 @@ pub enum VirtQueueError {
 /// split virtqueue 的块设备请求通常是 header/data/status 三段；网络队列最多使用
 /// 一个 VirtIO header 加 18 个 packet fragment。覆盖这两种规范上限后，正常 I/O
 /// 提交路径不需要临时堆分配；更长的非网络链仍可退化到 `Vec`。
-const INLINE_DESCRIPTOR_CHAIN: usize = 19;
+pub const INLINE_DESCRIPTOR_CHAIN: usize = 19;
 
 #[derive(Debug)]
 enum DescriptorChainStorage {
@@ -823,6 +825,16 @@ impl SplitVirtQueue {
     /// 返回 split ring 的 `avail.flags` 常驻地址，供常驻 IRQ top-half 抑制中断。
     pub const fn avail_flags_addr(&self) -> usize {
         self.avail.vaddr()
+    }
+
+    /// EVENT_IDX 模式下驱动写入的 `used_event` 地址。
+    pub fn used_event_addr(&self) -> Result<usize, VirtQueueError> {
+        Ok(self.used_event_ptr()? as usize)
+    }
+
+    /// EVENT_IDX adapter 读取设备 `used.idx` 的地址。
+    pub const fn used_idx_addr(&self) -> usize {
+        self.used.vaddr() + mem::size_of::<u16>()
     }
 
     pub fn desc_len(&self) -> usize {
@@ -1271,7 +1283,7 @@ impl SplitVirtQueue {
         (self.used.vaddr() + mem::size_of::<u16>()) as *mut u16
     }
 
-    fn avail_idx(&self) -> u16 {
+    pub fn avail_idx(&self) -> u16 {
         unsafe { read_volatile(self.avail_idx_ptr().cast_const()) }
     }
 
@@ -1332,6 +1344,11 @@ impl SplitVirtQueue {
             .ok_or(VirtQueueError::LayoutOverflow)?;
         ptr_at(self.used.vaddr(), offset)
     }
+}
+
+/// VirtIO 1.2 `vring_need_event()` 的 wrapping index 判定。
+pub const fn virtq_need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
 }
 
 /// 根据设备上报的最大队列大小选择 split virtqueue 实际大小。

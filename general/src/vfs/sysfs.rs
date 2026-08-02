@@ -72,6 +72,10 @@ const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
 const KERNEL_PROFILE_CATALOG_INO: u64 = 29;
 #[cfg(feature = "performance-profile")]
 const KERNEL_PROFILE_TRACE_INO: u64 = 73;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_SNAPSHOT_INO: u64 = 74;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_HEALTH_INO: u64 = 75;
 const KERNEL_ELM_DIR_INO: u64 = 80;
 const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
@@ -1526,6 +1530,10 @@ enum SysRegFile {
     ProfileCatalog,
     #[cfg(feature = "performance-profile")]
     ProfileTrace,
+    #[cfg(feature = "performance-profile")]
+    ProfileSnapshot,
+    #[cfg(feature = "performance-profile")]
+    ProfileHealth,
     Elm {
         slot: ElmSysfsSlot,
     },
@@ -2047,18 +2055,26 @@ fn render_profile_stats() -> String {
     let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "state={} enabled={} session={} generation={} active_writers={} counter_hz={} event_mask={:#x} sampling={} trace={} cpu_slots={} histogram_buckets={}",
+        "state={} enabled={} session={} generation={} phase={} active_writers={} counter_hz={} event_mask={:#x} event_mask_high={:#x} sampling={} sample_hz={} trace={} timing_shift={} effective_timing_shift={} timing_sampler={} cpu_slots={} histogram_buckets={} syscall_slots={} errno_slots={}",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
         session.generation,
+        session.phase,
         session.active_writers,
         session.counter_hz,
         session.event_mask,
+        session.event_mask_high,
         u8::from(session.sampling_enabled),
+        session.sample_hz,
         u8::from(session.trace_enabled),
+        session.timing_shift,
+        profiling::effective_timing_shift(),
+        session.timing_sampler,
         profiling::CPU_SLOTS,
         profiling::HISTOGRAM_BUCKETS,
+        profiling::SYSCALL_SLOTS,
+        profiling::ERRNO_SLOTS,
     );
     for cpu in 0..profiling::CPU_SLOTS {
         for event in profiling::Event::ALL {
@@ -2068,19 +2084,26 @@ fn render_profile_stats() -> String {
             }
             let _ = writeln!(
                 output,
-                "cpu={} event={} event_id={} category={} calls={} cycles={} bytes={} packets={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                "cpu={} event={} event_id={} category={} calls={} timed_samples={} sample_ratio={}/{} cycles={} bytes={} packets={} sampled_max_cycles={} sampled_wall_ns={} estimated_wall_ns={} mean_ns={} sampled_on_cpu_ns={} estimated_on_cpu_ns={} sampled_off_cpu_ns={} estimated_off_cpu_ns={} sampled_max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
                 ProfileCpuDisplay(cpu),
                 event.name(),
                 event as usize,
                 event.category().name(),
+                value.calls,
+                value.timed_samples,
+                value.timed_samples,
                 value.calls,
                 value.cycles,
                 value.bytes,
                 value.packets,
                 value.max_cycles,
                 value.wall_ns,
+                profiling::estimate_total(value.wall_ns, value.calls, value.timed_samples),
+                value.wall_ns.checked_div(value.timed_samples).unwrap_or(0),
                 value.on_cpu_ns,
+                profiling::estimate_total(value.on_cpu_ns, value.calls, value.timed_samples),
                 value.off_cpu_ns,
+                profiling::estimate_total(value.off_cpu_ns, value.calls, value.timed_samples),
                 value.max_latency_ns,
                 value.migrations,
                 profiling::histogram_percentile(&value.latency, 50),
@@ -2109,6 +2132,69 @@ fn render_profile_stats() -> String {
             );
         }
     }
+    for phase in 0..profiling::MAX_PHASES {
+        for nr in 0..profiling::SYSCALL_SLOTS {
+            let Some(value) = profiling::syscall_snapshot(phase, nr) else {
+                continue;
+            };
+            let timing = value.timing;
+            let _ = writeln!(
+                output,
+                "phase={} syscall={} calls={} success={} errors={} cycles={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                phase,
+                nr,
+                timing.calls,
+                value.success,
+                value.errors,
+                timing.cycles,
+                timing.max_cycles,
+                timing.wall_ns,
+                timing.on_cpu_ns,
+                timing.off_cpu_ns,
+                timing.max_latency_ns,
+                timing.migrations,
+                profiling::histogram_percentile(&timing.latency, 50),
+                profiling::histogram_percentile(&timing.latency, 95),
+                profiling::histogram_percentile(&timing.latency, 99),
+                HistogramDisplay(&timing.latency),
+            );
+        }
+    }
+    for slot in 0..profiling::ERRNO_SLOTS {
+        let Some(value) = profiling::errno_snapshot(slot) else {
+            continue;
+        };
+        let _ = writeln!(
+            output,
+            "phase={} syscall={} errno={} count={}",
+            value.phase, value.nr, value.errno, value.count,
+        );
+    }
+    for slot in 0..profiling::TASK_SLOTS {
+        let Some(value) = profiling::task_snapshot(slot) else {
+            continue;
+        };
+        let _ = writeln!(
+            output,
+            "task session={} pid={} tgid={} ppid={} runtime_ns={} voluntary_switches={} involuntary_switches={} migrations={} exited={} exit_code={}",
+            value.session,
+            value.pid,
+            value.tgid,
+            value.ppid,
+            value.runtime_ns,
+            value.voluntary_switches,
+            value.involuntary_switches,
+            value.migrations,
+            u8::from(value.exited),
+            value.exit_code,
+        );
+    }
+    let _ = writeln!(
+        output,
+        "health dropped_errno_records={} dropped_task_records={}",
+        profiling::dropped_errno_records(),
+        profiling::dropped_task_records(),
+    );
     output
 }
 
@@ -2149,12 +2235,13 @@ fn render_profile_samples() -> String {
     let session = profiling::session_info();
     let _ = writeln!(
         output,
-        "state={} enabled={} session={} generation={} sampling={} slots_per_cpu={}",
+        "state={} enabled={} session={} generation={} sampling={} sample_hz={} aggregation=image_pc slots_per_cpu={}",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
         session.generation,
         u8::from(session.sampling_enabled),
+        session.sample_hz,
         profiling::SAMPLE_SLOTS,
     );
     for cpu in 0..profiling::MAX_CPUS {
@@ -2170,11 +2257,12 @@ fn render_profile_samples() -> String {
             };
             let _ = writeln!(
                 output,
-                "cpu={} task={} mode={} pc={:#x} samples={}",
+                "cpu={} task=0 mode={} pc={:#x} image={:#x} load_base={:#x} samples={}",
                 cpu,
-                sample.task_id,
                 if sample.from_user { "user" } else { "kernel" },
                 sample.pc,
+                sample.image_id,
+                sample.load_base,
                 sample.samples,
             );
         }
@@ -2205,12 +2293,13 @@ fn render_profile_trace() -> String {
         let window = profiling::trace_window(cpu);
         let _ = writeln!(
             output,
-            "cpu={} first_sequence={} next_sequence={} retained={} overwritten={}",
+            "cpu={} first_sequence={} next_sequence={} retained={} overwritten={} dropped={}",
             cpu,
             window.first_sequence,
             window.next_sequence,
             window.next_sequence.saturating_sub(window.first_sequence),
             window.overwritten,
+            window.dropped,
         );
         for sequence in window.first_sequence..window.next_sequence {
             let Some(record) = profiling::trace_record(cpu, sequence) else {
@@ -2243,15 +2332,22 @@ fn render_profile_trace() -> String {
 fn render_profile_control() -> String {
     let session = profiling::session_info();
     format!(
-        "state={} enabled={} session={} generation={} active_writers={} event_mask={:#x} sampling={} trace={} commands=start,resume,freeze,stop,reset,events=<mask>,samples=0|1,trace=0|1\n",
+        "state={} enabled={} session={} generation={} phase={} workload_root={} active_writers={} event_mask={:#x} event_mask_high={:#x} sampling={} sample_hz={} trace={} timing_shift={} effective_timing_shift={} timing_sampler={} commands=start,resume,freeze,stop,reset,preset=<name>,events=<mask>,events_high=<mask>,root=<pid>,phase=<0..31>,samples=0|1,sample_hz=<50..1000>,trace=0|1,timing_shift=0..16\n",
         session.state.name(),
         u8::from(profiling::enabled()),
         session.session_id,
         session.generation,
+        session.phase,
+        profiling::workload_root(),
         session.active_writers,
         session.event_mask,
+        session.event_mask_high,
         u8::from(session.sampling_enabled),
+        session.sample_hz,
         u8::from(session.trace_enabled),
+        session.timing_shift,
+        profiling::effective_timing_shift(),
+        session.timing_sampler,
     )
 }
 
@@ -2259,14 +2355,40 @@ fn render_profile_control() -> String {
 fn render_profile_catalog() -> String {
     use alloc::fmt::Write;
     let mut output = String::new();
-    for event in profiling::Event::ALL {
+    for preset in [
+        profiling::Preset::Io,
+        profiling::Preset::Syscall,
+        profiling::Preset::Filesystem,
+        profiling::Preset::Memory,
+        profiling::Preset::Scheduler,
+        profiling::Preset::Block,
+        profiling::Preset::Network,
+        profiling::Preset::Build,
+        profiling::Preset::All,
+    ] {
         let _ = writeln!(
             output,
-            "kind=event id={} name={} category={} mask={:#x}",
-            event as usize,
+            "kind=preset name={} mask={:#x} mask_high={:#x}",
+            preset.name(),
+            profiling::preset_event_mask(preset),
+            profiling::preset_event_mask_high(preset),
+        );
+    }
+    for event in profiling::Event::ALL {
+        let id = event as usize;
+        let (word, mask) = if id < u64::BITS as usize {
+            (0, 1u64 << id)
+        } else {
+            (1, 1u64 << (id - u64::BITS as usize))
+        };
+        let _ = writeln!(
+            output,
+            "kind=event id={} name={} category={} mask_word={} mask={:#x}",
+            id,
             event.name(),
             event.category().name(),
-            1u64 << event as usize,
+            word,
+            mask,
         );
     }
     for metric in profiling::Metric::ALL {
@@ -2285,6 +2407,44 @@ fn render_profile_catalog() -> String {
             kind.name(),
         );
     }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_health() -> String {
+    use alloc::fmt::Write;
+    let session = profiling::session_info();
+    let mut output = String::new();
+    let dropped_samples = (0..profiling::MAX_CPUS)
+        .map(profiling::dropped_samples)
+        .sum::<u64>();
+    let dropped_trace = (0..profiling::MAX_CPUS)
+        .map(|cpu| profiling::trace_window(cpu).overwritten)
+        .sum::<u64>();
+    let valid = session.state == profiling::SessionState::Frozen && session.active_writers == 0;
+    let samples_complete = dropped_samples == 0;
+    let trace_complete = dropped_trace == 0;
+    let errno_complete = profiling::dropped_errno_records() == 0;
+    let tasks_complete = profiling::dropped_task_records() == 0;
+    let complete = samples_complete && trace_complete && errno_complete && tasks_complete;
+    let _ = writeln!(
+        output,
+        "valid={} complete={} samples_complete={} trace_complete={} errno_complete={} tasks_complete={} state={} active_writers={} dropped_samples={} dropped_trace={} dropped_errno_records={} dropped_task_records={} schema_version={} snapshot_bytes={}",
+        u8::from(valid),
+        u8::from(complete),
+        u8::from(samples_complete),
+        u8::from(trace_complete),
+        u8::from(errno_complete),
+        u8::from(tasks_complete),
+        session.state.name(),
+        session.active_writers,
+        dropped_samples,
+        dropped_trace,
+        profiling::dropped_errno_records(),
+        profiling::dropped_task_records(),
+        profiling::BINARY_SCHEMA_VERSION,
+        profiling::binary_snapshot_len(),
+    );
     output
 }
 
@@ -2332,6 +2492,10 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::ProfileCatalog => render_profile_catalog(),
         #[cfg(feature = "performance-profile")]
         SysRegFile::ProfileTrace => render_profile_trace(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileSnapshot => String::new(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileHealth => render_profile_health(),
         SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
@@ -2488,6 +2652,13 @@ impl FileOps for SysDirFile {
 
 impl FileOps for SysRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        if matches!(self.kind, SysRegFile::ProfileSnapshot) {
+            if profiling::state() != profiling::SessionState::Frozen {
+                return Err(VfsError::InvalidArgument);
+            }
+            return Ok(profiling::read_binary_snapshot(buf, offset));
+        }
         if let Some(snapshot) = self.snapshot.as_deref() {
             return read_bytes_at(buf, offset, snapshot);
         }
@@ -2509,12 +2680,70 @@ impl FileOps for SysRegFileOps {
                 profiling::set_event_mask(mask);
                 return Ok(_buf.len());
             }
+            if let Some(mask) = command.strip_prefix("events_high=") {
+                let mask = mask.strip_prefix("0x").unwrap_or(mask);
+                let mask = u64::from_str_radix(mask, 16).map_err(|_| VfsError::InvalidArgument)?;
+                profiling::set_event_masks(profiling::event_mask(), mask);
+                return Ok(_buf.len());
+            }
+            if let Some(name) = command.strip_prefix("preset=") {
+                let preset = profiling::Preset::from_name(name).ok_or(VfsError::InvalidArgument)?;
+                profiling::set_event_preset(preset);
+                return Ok(_buf.len());
+            }
+            if let Some(value) = command.strip_prefix("phase=") {
+                let phase = value
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if !profiling::set_phase(phase) {
+                    return Err(VfsError::InvalidArgument);
+                }
+                return Ok(_buf.len());
+            }
+            if let Some(value) = command.strip_prefix("root=") {
+                let pid = value
+                    .parse::<i32>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                let task = sched::root_pid_ns()
+                    .registry()
+                    .lookup(pid)
+                    .and_then(|task| task.upgrade())
+                    .ok_or(VfsError::NotFound)?;
+                task.set_profile_session_id(profiling::session_id());
+                profiling::register_task(
+                    profiling::session_id(),
+                    pid as u64,
+                    task.parent()
+                        .and_then(|parent| parent.pid_root_cached())
+                        .unwrap_or(0) as u64,
+                    task.tgid_cached().unwrap_or(pid) as u64,
+                );
+                profiling::record_task_images(
+                    profiling::session_id(),
+                    pid as u64,
+                    task.profile_main_image(),
+                    task.profile_interpreter_image(),
+                );
+                profiling::set_workload_root(pid as u64);
+                return Ok(_buf.len());
+            }
             if let Some(enabled) = command.strip_prefix("samples=") {
                 match enabled {
                     "0" | "off" => profiling::set_sampling_enabled(false),
                     "1" | "on" => profiling::set_sampling_enabled(true),
                     _ => return Err(VfsError::InvalidArgument),
                 }
+                sched::reprogram_current_deadline(None);
+                return Ok(_buf.len());
+            }
+            if let Some(value) = command.strip_prefix("sample_hz=") {
+                let hz = value
+                    .parse::<u64>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if !profiling::set_sample_hz(hz) {
+                    return Err(VfsError::InvalidArgument);
+                }
+                sched::reprogram_current_deadline(None);
                 return Ok(_buf.len());
             }
             if let Some(enabled) = command.strip_prefix("trace=") {
@@ -2525,6 +2754,16 @@ impl FileOps for SysRegFileOps {
                 }
                 return Ok(_buf.len());
             }
+            if let Some(shift) = command.strip_prefix("timing_shift=") {
+                let shift = shift
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if shift > profiling::MAX_TIMING_SHIFT {
+                    return Err(VfsError::InvalidArgument);
+                }
+                profiling::set_timing_shift(shift);
+                return Ok(_buf.len());
+            }
             match command {
                 "start" => profiling::start(),
                 "1" | "enable" | "resume" => profiling::resume(),
@@ -2533,6 +2772,7 @@ impl FileOps for SysRegFileOps {
                 "reset" => profiling::reset(),
                 _ => return Err(VfsError::InvalidArgument),
             }
+            sched::reprogram_current_deadline(None);
             return Ok(_buf.len());
         }
         Err(VfsError::ReadOnlyFilesystem)
@@ -3094,6 +3334,12 @@ impl SysDirInodeOps {
                 "profile_catalog" => mk_reg(KERNEL_PROFILE_CATALOG_INO, SysRegFile::ProfileCatalog),
                 #[cfg(feature = "performance-profile")]
                 "profile_trace" => mk_reg(KERNEL_PROFILE_TRACE_INO, SysRegFile::ProfileTrace),
+                #[cfg(feature = "performance-profile")]
+                "profile_snapshot" => {
+                    mk_reg(KERNEL_PROFILE_SNAPSHOT_INO, SysRegFile::ProfileSnapshot)
+                }
+                #[cfg(feature = "performance-profile")]
+                "profile_health" => mk_reg(KERNEL_PROFILE_HEALTH_INO, SysRegFile::ProfileHealth),
                 "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
@@ -3703,6 +3949,18 @@ impl SysDirInodeOps {
                 ),
                 #[cfg(feature = "performance-profile")]
                 mk_dir_entry(KERNEL_PROFILE_TRACE_INO, "profile_trace", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_SNAPSHOT_INO,
+                    "profile_snapshot",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_HEALTH_INO,
+                    "profile_health",
+                    FileType::Regular,
+                ),
                 mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),
             ],
             SysDirKind::KernelElm => {

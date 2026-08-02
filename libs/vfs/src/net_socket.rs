@@ -56,6 +56,9 @@ pub const SOCK_STREAM_PUB: u16 = SOCK_STREAM;
 #[allow(dead_code)]
 pub const SOCK_DGRAM_PUB: u16 = SOCK_DGRAM;
 
+const TCP_DEFAULT_SEND_BUFFER: i32 = 16 * 1024;
+const TCP_DEFAULT_RECEIVE_BUFFER: i32 = 128 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct InetSendOptions {
     pub nonblocking: bool,
@@ -71,6 +74,7 @@ pub struct InetRecvOptions {
     pub peek: bool,
     pub wait_all: bool,
     pub trunc: bool,
+    pub defer_window_update: bool,
     pub deadline_ns: Option<u64>,
 }
 
@@ -188,6 +192,10 @@ impl net::ReadinessObserver for PollSource {
         }
         self.publish_versioned(events, generation);
     }
+
+    fn readiness_updates_required(&self) -> bool {
+        self.tracking_enabled()
+    }
 }
 
 impl NetSocketFileOps {
@@ -203,6 +211,20 @@ impl NetSocketFileOps {
             net::SocketKind::Datagram => SOCK_DGRAM,
             net::SocketKind::Stream => SOCK_STREAM,
             net::SocketKind::Raw => SOCK_RAW,
+        }
+    }
+
+    /// 结束由 syscall 用户页窗口组成的一次流发送，并发布此前接受的全部数据。
+    pub fn finish_stream_send(&self) {
+        if self.sock_type() == SOCK_STREAM {
+            self.proxy.set_tcp_more(false);
+        }
+    }
+
+    /// 结束由 syscall 用户页窗口组成的一次流接收，并发布累计的窗口变化。
+    pub fn finish_stream_receive(&self) {
+        if self.sock_type() == SOCK_STREAM {
+            self.proxy.finish_stream_receive();
         }
     }
 
@@ -315,10 +337,9 @@ impl NetSocketFileOps {
                 return Err(Errno::EISCONN);
             }
             let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
-            self.proxy.set_tcp_more(opts.more);
             return self
                 .proxy
-                .send_stream(data, opts.nonblocking, deadline)
+                .send_stream(data, opts.nonblocking, deadline, opts.more)
                 .map_err(map_socket_error);
         }
         if opts.more {
@@ -348,14 +369,97 @@ impl NetSocketFileOps {
             .map_err(map_socket_error)
     }
 
+    /// 直接把外部复制源写入 UDP 发送槽；复制错误保持原 errno，且不会提交半个数据报。
+    pub fn sendto_from(
+        &self,
+        payload_len: usize,
+        sockaddr: Option<&[u8]>,
+        opts: InetSendOptions,
+        copy: impl FnMut(usize, &mut [u8]) -> Result<(), Errno>,
+    ) -> Result<usize, Errno> {
+        self.ensure_backend()?;
+        if self.sock_type() != SOCK_DGRAM {
+            return Err(Errno::EINVAL);
+        }
+        if opts.more {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.ensure_bound()?;
+        let destination = sockaddr
+            .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family()))
+            .transpose()?;
+        let socket_options = self.options.lock().clone();
+        if destination.is_some_and(
+            |endpoint| matches!(endpoint.addr, net::IpAddr::V4(address) if address.is_broadcast()),
+        ) && !socket_options.broadcast
+        {
+            return Err(Errno::EACCES);
+        }
+        let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
+        self.proxy
+            .send_datagram_from(
+                payload_len,
+                destination,
+                opts.nonblocking,
+                deadline,
+                opts.dont_route || socket_options.dont_route,
+                opts.confirm,
+                copy,
+            )
+            .map_err(|error| match error {
+                net::DatagramCopyError::Socket(error) => map_socket_error(error),
+                net::DatagramCopyError::Copy(error) => error,
+            })
+    }
+
+    pub fn send_stream_page(
+        &self,
+        data: &[u8],
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .send_stream(data, nonblocking, deadline_ns, more)
+            .map_err(map_socket_error)
+    }
+
+    pub fn send_stream_from(
+        &self,
+        payload_len: usize,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+        copy: impl FnMut(usize, &mut [u8]),
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .send_stream_from(payload_len, nonblocking, deadline_ns, more, copy)
+            .map_err(map_socket_error)
+    }
+
+    pub fn stream_send_deadline(&self) -> Option<u64> {
+        self.send_deadline()
+    }
+
     pub fn recvfrom(&self, buf: &mut [u8], opts: InetRecvOptions) -> Result<InetRecvResult, Errno> {
         self.ensure_backend()?;
         let deadline = opts.deadline_ns.or_else(|| self.recv_deadline());
         if self.sock_type() == SOCK_STREAM {
-            let len = self
+            let result = self
                 .proxy
-                .recv_stream(buf, opts.peek, opts.wait_all, opts.nonblocking, deadline)
-                .map_err(map_socket_error)?;
+                .recv_stream(
+                    buf,
+                    opts.peek,
+                    opts.wait_all,
+                    opts.defer_window_update,
+                    opts.nonblocking,
+                    deadline,
+                )
+                .map_err(map_socket_error);
+            if !opts.defer_window_update {
+                self.proxy.finish_stream_receive();
+            }
+            let len = result?;
             return Ok(InetRecvResult {
                 len,
                 remote: self.proxy.peer_endpoint(),
@@ -382,6 +486,87 @@ impl NetSocketFileOps {
             rx_timestamp_ns: received.rx_timestamp_ns,
             msg_flags: usize::from(received.truncated) * 0x20,
         })
+    }
+
+    pub fn recv_stream_to(
+        &self,
+        output_len: usize,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        defer_window_update: bool,
+        copy: impl FnMut(usize, &[u8]),
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .recv_stream_to(
+                output_len,
+                false,
+                false,
+                defer_window_update,
+                nonblocking,
+                deadline_ns,
+                copy,
+            )
+            .map_err(map_socket_error)
+    }
+
+    /// 等待 UDP 数据报就绪但不消费，供 syscall 在等待结束后再固定用户目标页。
+    pub fn wait_datagram_readable(&self, opts: InetRecvOptions) -> Result<Option<usize>, Errno> {
+        self.ensure_backend()?;
+        if self.sock_type() != SOCK_DGRAM {
+            return Err(Errno::EINVAL);
+        }
+        self.ensure_bound()?;
+        let deadline = opts.deadline_ns.or_else(|| self.recv_deadline());
+        self.proxy
+            .wait_datagram_readable(opts.nonblocking, deadline)
+            .map_err(map_socket_error)
+    }
+
+    /// 将队首本地 UDP 数据报直接复制到外部目标；非本地数据返回 `None`。
+    pub fn recv_local_datagram_from(
+        &self,
+        output_len: usize,
+        copy_capacity: usize,
+        opts: InetRecvOptions,
+        copy: impl FnMut(usize, &[u8]) -> Result<(), Errno>,
+    ) -> Result<Option<InetRecvResult>, Errno> {
+        self.ensure_backend()?;
+        if self.sock_type() != SOCK_DGRAM || opts.peek || opts.wait_all {
+            return Ok(None);
+        }
+        let received = self
+            .proxy
+            .recv_local_datagram_from(output_len, copy_capacity, opts.trunc, copy)
+            .map_err(|error| match error {
+                net::DatagramCopyError::Socket(error) => map_socket_error(error),
+                net::DatagramCopyError::Copy(error) => error,
+            })?;
+        Ok(received.map(|received| InetRecvResult {
+            len: received.len,
+            remote: Some(received.source),
+            local: Some(received.destination),
+            interface_id: Some(net::NetDeviceId(received.ingress_interface.0)),
+            hop_limit: Some(received.hop_limit),
+            traffic_class: Some(received.traffic_class),
+            rx_timestamp_ns: received.rx_timestamp_ns,
+            msg_flags: usize::from(received.truncated) * 0x20,
+        }))
+    }
+
+    pub fn recv_stream_page(
+        &self,
+        buf: &mut [u8],
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        more: bool,
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .recv_stream(buf, false, false, more, nonblocking, deadline_ns)
+            .map_err(map_socket_error)
+    }
+
+    pub fn stream_recv_deadline(&self) -> Option<u64> {
+        self.recv_deadline()
     }
 
     pub fn getsockname(&self, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -511,6 +696,7 @@ impl FileOps for NetSocketFileOps {
                 peek: false,
                 wait_all: false,
                 trunc: false,
+                defer_window_update: false,
                 deadline_ns: None,
             },
         )
@@ -587,6 +773,13 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll_source(&self) -> Option<&PollSource> {
+        self.poll_source.enable_tracking();
+        let readiness = self.proxy.readiness();
+        net::ReadinessObserver::readiness_changed(
+            self.poll_source.as_ref(),
+            readiness.0,
+            readiness.1,
+        );
         Some(&self.poll_source)
     }
 
@@ -644,7 +837,7 @@ pub fn create_net_socket(
     nonblock: bool,
 ) -> Result<NetSocketFileOps, Errno> {
     let stack = net::stack::stack_snapshot();
-    if stack.state != net::stack::NetStackState::Active || !stack.probed {
+    if stack.state != net::stack::NetStackState::Active || !stack.ready {
         return Err(Errno::EAFNOSUPPORT);
     }
     let stack_instance = stack.handle.ok_or(Errno::EAFNOSUPPORT)?.0;
@@ -686,8 +879,10 @@ pub fn create_net_socket(
                 proxy,
                 nonblock,
                 SocketOptions {
-                    sndbuf: 256 * 1024,
-                    rcvbuf: 256 * 1024,
+                    // 默认可见值保持常见 Linux socket ABI 行为；facade 内部保留
+                    // 有界自动调节余量，显式 setsockopt 后两者会重新同步。
+                    sndbuf: TCP_DEFAULT_SEND_BUFFER,
+                    rcvbuf: TCP_DEFAULT_RECEIVE_BUFFER,
                     ..SocketOptions::default()
                 },
             ))

@@ -183,6 +183,31 @@ pub fn rearm_periodic_timer() -> u64 {
     now
 }
 
+/// 按绝对纳秒截止时间重编程当前 CPU 的本地 timer。
+///
+/// 临时截止时间不会晚于常规调度 tick；撤销临时约束时从当前时刻恢复一个完整周期。
+pub fn rearm_local_timer(deadline_ns: Option<u64>) {
+    let period = TIMER_PERIOD_TICKS.load(Ordering::Relaxed).max(1);
+    let now_ticks = stable_counter_raw();
+    let now_ns = stable_counter_to_ns(now_ticks);
+    let deadline_ticks = deadline_ns.map_or_else(
+        || now_ticks.saturating_add(period),
+        |deadline_ns| {
+            let delta_ns = deadline_ns.saturating_sub(now_ns);
+            let hz = stable_counter_hz().max(1) as u128;
+            let delta_ticks = if delta_ns == 0 {
+                1
+            } else {
+                ((delta_ns as u128 * hz).saturating_add(999_999_999) / 1_000_000_000)
+                    .clamp(1, period as u128) as u64
+            };
+            now_ticks.saturating_add(delta_ticks)
+        },
+    );
+    NEXT_TIMER_DEADLINES[current_timer_cpu()].store(deadline_ticks, Ordering::Release);
+    arm_timer_at(deadline_ticks);
+}
+
 #[inline]
 fn current_timer_cpu() -> usize {
     crate::riscv64::specific::current_cpu_id().min(sched::NR_CPUS - 1)

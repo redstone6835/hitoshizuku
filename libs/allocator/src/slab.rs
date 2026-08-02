@@ -19,7 +19,7 @@ use core::alloc::Layout;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use spin::mutex::Mutex;
+use crate::Mutex;
 
 use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::request::AllocationRecord;
@@ -33,12 +33,23 @@ const SIZE_CLASSES: [usize; 14] = [
 ];
 const SIZE_CLASS_COUNT: usize = SIZE_CLASSES.len();
 pub const SLAB_SIZE_CLASS_COUNT: usize = SIZE_CLASS_COUNT;
-const CACHE_CAPACITY: usize = 32;
-const REFILL_BATCH: usize = 8;
+const CACHE_CAPACITY: usize = 64;
+const REFILL_BATCH: usize = 32;
+const FLUSH_BATCH: usize = CACHE_CAPACITY / 2;
 const BITMAP_WORDS: usize = 8;
 const INVALID_SLAB_NODE: usize = 0;
 const MAX_GROW_ATTEMPTS: usize = 3;
-const MAX_EMPTY_SLABS_PER_ZONE: usize = 1;
+const MAX_EMPTY_SLABS_PER_ZONE: usize = 4;
+
+#[cfg(feature = "performance-profile")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlabProfileCounter {
+    CacheHit,
+    CacheMiss,
+    Refill,
+    Flush,
+    SlowPath,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SlabStats {
@@ -76,8 +87,7 @@ pub struct SlabClassStat {
 
 /// 每 CPU 缓存中的一个槽位。
 ///
-/// 除了对象指针本身，还记录其所属 slab 节点，以便缓存命中时能快速把状态从“cached”
-/// 切回“allocated”。
+/// 除了对象指针本身，还记录其所属 slab 节点，使批量 flush 能直接回到原 slab。
 #[derive(Clone, Copy)]
 struct CacheEntry {
     ptr: usize,
@@ -99,6 +109,7 @@ impl CacheEntry {
 struct PerCpuCacheState {
     entries: [CacheEntry; CACHE_CAPACITY],
     count: usize,
+    stats: PerCpuCacheStats,
 }
 
 impl PerCpuCacheState {
@@ -106,10 +117,11 @@ impl PerCpuCacheState {
         Self {
             entries: [CacheEntry::empty(); CACHE_CAPACITY],
             count: 0,
+            stats: PerCpuCacheStats::new(),
         }
     }
 
-    fn pop(&mut self) -> Option<CacheEntry> {
+    fn pop_entry(&mut self) -> Option<CacheEntry> {
         if self.count == 0 {
             return None;
         }
@@ -117,6 +129,19 @@ impl PerCpuCacheState {
         let entry = self.entries[self.count];
         self.entries[self.count] = CacheEntry::empty();
         Some(entry)
+    }
+
+    fn pop_for_alloc(&mut self) -> Option<CacheEntry> {
+        self.stats.alloc_requests = self.stats.alloc_requests.saturating_add(1);
+        let entry = self.pop_entry();
+        if entry.is_some() {
+            self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+            self.stats.successful_allocations = self.stats.successful_allocations.saturating_add(1);
+        } else {
+            self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
+            self.stats.note_slow_path();
+        }
+        entry
     }
 
     fn push(&mut self, entry: CacheEntry) -> bool {
@@ -128,7 +153,20 @@ impl PerCpuCacheState {
         true
     }
 
-    fn push_or_drain_half(&mut self, entry: CacheEntry, drained: &mut [CacheEntry]) -> usize {
+    fn push_for_free(
+        &mut self,
+        entry: CacheEntry,
+        drained: &mut [CacheEntry],
+        used_hint: bool,
+    ) -> usize {
+        self.stats.free_requests = self.stats.free_requests.saturating_add(1);
+        self.stats.successful_frees = self.stats.successful_frees.saturating_add(1);
+        if used_hint {
+            self.stats.fast_free_hits = self.stats.fast_free_hits.saturating_add(1);
+        } else {
+            self.stats.fast_free_fallbacks = self.stats.fast_free_fallbacks.saturating_add(1);
+            self.stats.note_slow_path();
+        }
         // free 热路径最常见的情况是 cache 还有空间。把“检查容量”和“push”合并到一次
         // cache 锁内，只有满桶时才排出一批对象交给 slab state 做真实释放；腾出空间后
         // 立即放入当前对象，避免满桶慢路径二次获取 cache 锁。
@@ -138,7 +176,7 @@ impl PerCpuCacheState {
 
         let mut drained_count = 0usize;
         for slot in drained.iter_mut() {
-            let Some(entry) = self.pop() else {
+            let Some(entry) = self.pop_entry() else {
                 break;
             };
             *slot = entry;
@@ -147,19 +185,91 @@ impl PerCpuCacheState {
         if !self.push(entry) {
             panic!("[alloc][invariant] slab cache remained full after drain");
         }
+        self.stats.flushes = self.stats.flushes.saturating_add(1);
         drained_count
+    }
+
+    fn push_refill(&mut self, entries: &[CacheEntry], overflow: &mut [CacheEntry]) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+        self.stats.refills = self.stats.refills.saturating_add(1);
+        let mut overflow_count = 0usize;
+        for &entry in entries {
+            if !self.push(entry) {
+                overflow[overflow_count] = entry;
+                overflow_count += 1;
+            }
+        }
+        if overflow_count != 0 {
+            self.stats.flushes = self.stats.flushes.saturating_add(1);
+        }
+        overflow_count
+    }
+
+    fn note_slow_allocation(&mut self) {
+        self.stats.successful_allocations = self.stats.successful_allocations.saturating_add(1);
     }
 
     fn drain_into(&mut self, out: &mut [CacheEntry]) -> usize {
         let mut drained = 0usize;
         for slot in out {
-            let Some(entry) = self.pop() else {
+            let Some(entry) = self.pop_entry() else {
                 break;
             };
             *slot = entry;
             drained += 1;
         }
         drained
+    }
+
+    fn contains_ptr(&self, ptr: usize) -> bool {
+        self.entries[..self.count]
+            .iter()
+            .any(|entry| entry.ptr == ptr)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PerCpuCacheStats {
+    alloc_requests: u64,
+    successful_allocations: u64,
+    free_requests: u64,
+    successful_frees: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    refills: u64,
+    flushes: u64,
+    fast_free_hits: u64,
+    fast_free_fallbacks: u64,
+    #[cfg(feature = "performance-profile")]
+    slow_paths: u64,
+}
+
+impl PerCpuCacheStats {
+    const fn new() -> Self {
+        Self {
+            alloc_requests: 0,
+            successful_allocations: 0,
+            free_requests: 0,
+            successful_frees: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            refills: 0,
+            flushes: 0,
+            fast_free_hits: 0,
+            fast_free_fallbacks: 0,
+            #[cfg(feature = "performance-profile")]
+            slow_paths: 0,
+        }
+    }
+
+    #[inline]
+    fn note_slow_path(&mut self) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.slow_paths = self.slow_paths.saturating_add(1);
+        }
     }
 }
 
@@ -279,18 +389,16 @@ impl SlabAllocation {
     }
 }
 
-#[derive(Clone, Copy)]
 /// 单个 slab 的运行时状态。
 ///
-/// 一个 slab 对应一批连续页和固定大小对象槽，`alloc_bitmap`/`cache_bitmap` 共同描述
-/// 每个槽当前是空闲、已分配还是暂存在 per-CPU cache 中。
+/// 一个 slab 对应一批连续页和固定大小对象槽。进入 magazine 的对象继续保持 alloc 位，
+/// 只有批量 flush 才把它们变回空槽，因此 alloc/free 命中不需要同步共享位图。
 struct Slab {
     base_addr: usize,
     paddr: usize,
     page_count: u16,
     total_objects: u16,
     allocated_objects: u16,
-    cached_objects: u16,
     /// 下次位图扫描的起点。
     ///
     /// slab 对象通常按低地址递增分配；如果每次 cache miss 都从 0 开始扫描，活跃 slab
@@ -298,7 +406,6 @@ struct Slab {
     /// 继续，并在 flush 释放真实空槽时回退到被释放槽位。
     next_free_hint: u16,
     alloc_bitmap: [u64; BITMAP_WORDS],
-    cache_bitmap: [u64; BITMAP_WORDS],
     active: bool,
 }
 
@@ -310,10 +417,8 @@ impl Slab {
             page_count: 0,
             total_objects: 0,
             allocated_objects: 0,
-            cached_objects: 0,
             next_free_hint: 0,
             alloc_bitmap: [0; BITMAP_WORDS],
-            cache_bitmap: [0; BITMAP_WORDS],
             active: false,
         }
     }
@@ -341,10 +446,8 @@ impl Slab {
         self.page_count = page_count as u16;
         self.total_objects = total_objects as u16;
         self.allocated_objects = 0;
-        self.cached_objects = 0;
         self.next_free_hint = 0;
         self.alloc_bitmap = [0; BITMAP_WORDS];
-        self.cache_bitmap = [0; BITMAP_WORDS];
         self.active = total_objects > 0;
     }
 
@@ -378,9 +481,9 @@ impl Slab {
         (idx < self.total_objects as usize).then_some(idx)
     }
 
-    fn allocate(&mut self, obj_size: usize, cached: bool) -> Option<usize> {
-        // slab 内部的分配只是位图扫描，不做任何跨 slab 策略判断。`cached=true` 时，
-        // 对象会以“已占用但暂存在 per-CPU cache”的状态返回给上层缓存补货逻辑。
+    fn allocate(&mut self, obj_size: usize) -> Option<usize> {
+        // slab 内部只在批量补货路径扫描和修改位图。分配给调用者或暂存在 magazine
+        // 对 slab 来说都是保留状态，两者的转换完全发生在 CPU 本地 cache 中。
         if !self.active || self.allocated_objects >= self.total_objects {
             return None;
         }
@@ -391,78 +494,43 @@ impl Slab {
         };
 
         self.set_alloc_bit(idx, true);
-        self.set_cache_bit(idx, cached);
         self.allocated_objects += 1;
-        if cached {
-            self.cached_objects += 1;
-        }
         self.next_free_hint = next_hint_after(idx, self.total_objects as usize) as u16;
         Some(self.base_addr + idx * obj_size)
     }
 
-    fn stage_cached_free(&mut self, ptr: usize, obj_size: usize) -> bool {
-        // staged free 不会立刻把对象变回真正空槽，而是先打上 cache 位，表示这个对象被
-        // 回收到本地 cache，可供同 CPU 后续快速复用。
+    fn is_allocated_object(&self, ptr: usize, obj_size: usize) -> bool {
         let Some(idx) = self.object_index(ptr, obj_size) else {
             return false;
         };
-        if !self.alloc_bit(idx) || self.cache_bit(idx) {
-            return false;
-        }
-        self.set_cache_bit(idx, true);
-        self.cached_objects += 1;
-        true
+        self.alloc_bit(idx)
     }
 
-    fn commit_cache_alloc(&mut self, ptr: usize, obj_size: usize) -> bool {
-        // per-CPU cache 命中时，对象其实一直处于“allocated + cached”状态。这里把
-        // cache 位清掉，完成从“缓存持有”到“重新借出给调用者”的语义切换。
+    fn release_reserved(&mut self, ptr: usize, obj_size: usize) -> bool {
+        // magazine flush 才会真正释放对象槽。此时持有 ZoneState 锁，可以直接修改
+        // 普通位图和 slab 计数，不需要任何原子读改写。
         let Some(idx) = self.object_index(ptr, obj_size) else {
             return false;
         };
-        if !self.alloc_bit(idx) || !self.cache_bit(idx) {
+        if !self.alloc_bit(idx) {
             return false;
         }
-        self.set_cache_bit(idx, false);
-        self.cached_objects = self.cached_objects.saturating_sub(1);
-        true
-    }
-
-    fn flush_cached(&mut self, ptr: usize, obj_size: usize) -> bool {
-        // flush 是把 cache 中的对象真正还回 slab，自此该槽重新可分配。因此 alloc 位和
-        // cache 位都要被清掉，计数也要同步回退。
-        let Some(idx) = self.object_index(ptr, obj_size) else {
-            return false;
-        };
-        if !self.alloc_bit(idx) || !self.cache_bit(idx) {
-            return false;
-        }
-        self.set_cache_bit(idx, false);
         self.set_alloc_bit(idx, false);
         self.allocated_objects = self.allocated_objects.saturating_sub(1);
-        self.cached_objects = self.cached_objects.saturating_sub(1);
         self.next_free_hint = idx.min(self.next_free_hint as usize) as u16;
         true
     }
 
     fn is_empty(&self) -> bool {
-        self.active && self.allocated_objects == 0 && self.cached_objects == 0
+        self.active && self.allocated_objects == 0
     }
 
     fn alloc_bit(&self, idx: usize) -> bool {
         bit_is_set(&self.alloc_bitmap, idx)
     }
 
-    fn cache_bit(&self, idx: usize) -> bool {
-        bit_is_set(&self.cache_bitmap, idx)
-    }
-
     fn set_alloc_bit(&mut self, idx: usize, set: bool) {
         set_bit(&mut self.alloc_bitmap, idx, set);
-    }
-
-    fn set_cache_bit(&mut self, idx: usize, set: bool) {
-        set_bit(&mut self.cache_bitmap, idx, set);
     }
 
     fn find_free_slot(&self) -> Option<usize> {
@@ -485,6 +553,7 @@ struct SlabNode {
 
 struct ZoneState {
     slab_head: usize,
+    preferred_slab: usize,
     /// 回收空 slab 后留下的 SlabNode 元数据 freelist。
     ///
     /// metadata allocator 目前只支持分配、不支持归还；因此空 slab 被释放 backing
@@ -499,6 +568,7 @@ impl ZoneState {
     const fn new() -> Self {
         Self {
             slab_head: 0,
+            preferred_slab: 0,
             free_node_head: 0,
             free_node_count: 0,
             slab_count: 0,
@@ -524,46 +594,43 @@ impl ZoneState {
         }
     }
 
-    fn on_alloc(&mut self, obj_size: usize) {
-        self.stats.active_objects += 1;
-        self.stats.active_bytes += obj_size;
-    }
-
-    fn on_free(&mut self, obj_size: usize) {
-        self.stats.active_objects = self.stats.active_objects.saturating_sub(1);
-        self.stats.active_bytes = self.stats.active_bytes.saturating_sub(obj_size);
-    }
-
-    fn try_allocate_user_object(&mut self, obj_size: usize) -> Option<SlabAllocation> {
-        let mut node_addr = self.slab_head;
-        while node_addr != 0 {
-            let node = slab_node_mut(node_addr);
-            if let Some(ptr) = node.slab.allocate(obj_size, false) {
-                self.on_alloc(obj_size);
-                return Some(SlabAllocation {
-                    ptr,
-                    slab_node: node_addr,
-                });
-            }
-            node_addr = node.next;
-        }
-        None
-    }
-
-    fn allocate_cached_batch(&mut self, obj_size: usize, out: &mut [CacheEntry]) -> usize {
-        // 批量补货的目标是提前准备一组 cached 对象，降低后续热路径反复拿全局锁的次数。
+    fn allocate_batch(&mut self, obj_size: usize, out: &mut [CacheEntry]) -> usize {
+        // 一次 ZoneState 临界区同时取得当前请求和后续 magazine 补货，避免 miss 路径
+        // 先分配一个对象、再重新拿锁补货。所有对象在 slab 中都保持 reserved 状态。
         let mut produced = 0;
+        // 同一批补货沿着 slab 链继续向前，不为每个对象重新从首个 slab 扫描。
+        let start = if self.preferred_slab != 0 {
+            self.preferred_slab
+        } else {
+            self.slab_head
+        };
+        let mut node_addr = start;
+        let mut wrapped = false;
 
         while produced < out.len() {
-            let mut node_addr = self.slab_head;
             let mut entry = None;
-            while node_addr != 0 {
-                let node = slab_node_mut(node_addr);
-                if let Some(ptr) = node.slab.allocate(obj_size, true) {
+            let mut selected = 0;
+            loop {
+                if node_addr == 0 {
+                    if !wrapped && start != self.slab_head {
+                        node_addr = self.slab_head;
+                        wrapped = true;
+                        continue;
+                    }
+                    break;
+                }
+                // 回绕后再次到达起始节点，说明整条链已经检查完毕。
+                if wrapped && node_addr == start {
+                    break;
+                }
+                let current = node_addr;
+                let node = slab_node_mut(current);
+                if let Some(ptr) = node.slab.allocate(obj_size) {
                     entry = Some(CacheEntry {
                         ptr,
-                        slab_node: node_addr,
+                        slab_node: current,
                     });
+                    selected = current;
                     break;
                 }
                 node_addr = node.next;
@@ -573,9 +640,19 @@ impl ZoneState {
             };
             out[produced] = entry;
             produced += 1;
-        }
-        if produced > 0 {
-            self.stats.cache_refills += 1;
+            // 当前 slab 还有空槽时继续使用它；耗尽后才转到下一个节点。
+            let node = slab_node(selected);
+            node_addr = if node.slab.allocated_objects < node.slab.total_objects {
+                selected
+            } else {
+                node.next
+            };
+            self.preferred_slab = if node_addr != 0 {
+                node_addr
+            } else {
+                // 当前节点耗尽后从链表头重新开始，下一批仍会覆盖整条链。
+                self.slab_head
+            };
         }
         produced
     }
@@ -585,6 +662,7 @@ impl ZoneState {
         let block_pages = node.slab.page_count as usize;
         node.next = self.slab_head;
         self.slab_head = node_addr;
+        self.preferred_slab = node_addr;
         self.slab_count += 1;
         self.stats.active_slabs = self.slab_count;
         self.stats.active_pages += block_pages;
@@ -612,71 +690,19 @@ impl ZoneState {
         self.stats.free_slab_nodes = self.free_node_count;
     }
 
-    fn stage_cached_free(&mut self, ptr: usize, obj_size: usize) -> Option<usize> {
-        // ZoneState 级别的 staged free 负责在本 zone 的所有 slab 中定位归属对象，并把
-        // “用户已释放”的事实同步到统计信息上；位图状态细节仍由具体 slab 执行。
-        self.stage_cached_free_scanning(ptr, obj_size, true)
-    }
-
-    fn stage_cached_free_scanning(
-        &mut self,
-        ptr: usize,
-        obj_size: usize,
-        count_invalid: bool,
-    ) -> Option<usize> {
+    fn find_allocated_node(&mut self, ptr: usize, obj_size: usize) -> Option<usize> {
+        // 没有 registry cookie 的兼容路径才扫描 slab 链；找到后对象继续保持 reserved，
+        // 实际位图释放延迟到 magazine 批量 flush。
         let mut node_addr = self.slab_head;
         while node_addr != 0 {
-            let node = slab_node_mut(node_addr);
-            if node.slab.stage_cached_free(ptr, obj_size) {
-                self.on_free(obj_size);
+            let node = slab_node(node_addr);
+            if node.slab.is_allocated_object(ptr, obj_size) {
                 return Some(node_addr);
             }
             node_addr = node.next;
         }
-        if count_invalid {
-            self.stats.invalid_frees += 1;
-        }
+        self.stats.invalid_frees += 1;
         None
-    }
-
-    fn stage_cached_free_at_node(
-        &mut self,
-        ptr: usize,
-        obj_size: usize,
-        node_addr: usize,
-    ) -> Option<usize> {
-        // registry record 已经记住所属 slab node 时，释放路径可以直接回到目标 slab。
-        // 这个 cookie 与 per-CPU cache entry 中的 slab node 属于同一类内部不变量：它只能
-        // 由 allocator 自己写入 registry，外部 crate 无法伪造。SlabNode 元数据只复用不
-        // 释放，因此过期 cookie 最多命中一个已复用节点；对象边界和状态校验失败后会回退
-        // 到慢速扫描路径，不会把错误对象直接释放。
-        if node_addr == INVALID_SLAB_NODE {
-            return None;
-        }
-        if slab_node_mut(node_addr)
-            .slab
-            .stage_cached_free(ptr, obj_size)
-        {
-            self.on_free(obj_size);
-            return Some(node_addr);
-        }
-        None
-    }
-
-    fn commit_cache_alloc(&mut self, entry: CacheEntry, obj_size: usize) -> bool {
-        // cache entry 里保存了对象所属 slab 节点，因此命中后可以直接回到原 slab 撤销
-        // cache 标记，而无需再次全表搜索。
-        if entry.slab_node == INVALID_SLAB_NODE {
-            return false;
-        }
-        if slab_node_mut(entry.slab_node)
-            .slab
-            .commit_cache_alloc(entry.ptr, obj_size)
-        {
-            self.on_alloc(obj_size);
-            return true;
-        }
-        false
     }
 
     fn flush_cached_entries(&mut self, entries: &[CacheEntry], obj_size: usize) -> SlabFlushResult {
@@ -690,13 +716,14 @@ impl ZoneState {
                 continue;
             }
             let slab = &mut slab_node_mut(entry.slab_node).slab;
-            if slab.flush_cached(entry.ptr, obj_size) {
+            if !slab.active {
+                self.stats.invalid_frees += 1;
+                continue;
+            }
+            if slab.release_reserved(entry.ptr, obj_size) {
                 flushed += 1;
                 made_empty |= slab.is_empty();
             }
-        }
-        if flushed > 0 {
-            self.stats.cache_flushes += 1;
         }
         SlabFlushResult {
             flushed,
@@ -744,6 +771,9 @@ impl ZoneState {
                 }
                 let node = slab_node_mut(current);
                 node.slab.active = false;
+                if self.preferred_slab == current {
+                    self.preferred_slab = next;
+                }
                 self.slab_count = self.slab_count.saturating_sub(1);
                 self.stats.active_slabs = self.slab_count;
                 self.stats.active_pages = self
@@ -795,9 +825,7 @@ impl ZoneState {
 
         if audit.scanned_slabs != self.slab_count
             || audit.scanned_slabs != self.stats.active_slabs
-            || audit.scanned_active_objects != self.stats.active_objects
             || audit.scanned_active_pages != self.stats.active_pages
-            || audit.scanned_active_bytes != self.stats.active_bytes
             || audit.scanned_free_nodes != self.free_node_count
             || audit.scanned_free_nodes != self.stats.free_slab_nodes
         {
@@ -805,6 +833,27 @@ impl ZoneState {
         }
 
         audit
+    }
+
+    fn contains_active_node(&self, node_addr: usize) -> bool {
+        let mut current = self.slab_head;
+        let mut visited = 0usize;
+        while current != 0 && visited < self.slab_count {
+            if current == node_addr {
+                return true;
+            }
+            current = slab_node(current).next;
+            visited += 1;
+        }
+        false
+    }
+
+    fn cached_entry_is_reserved(&self, entry: CacheEntry, obj_size: usize) -> bool {
+        entry.slab_node != INVALID_SLAB_NODE
+            && self.contains_active_node(entry.slab_node)
+            && slab_node(entry.slab_node)
+                .slab
+                .is_allocated_object(entry.ptr, obj_size)
     }
 }
 
@@ -883,46 +932,28 @@ impl Zone {
         phys: &Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> SlabAllocation {
-        // Zone 的热路径是三段式：
-        // 1. 先看 per-CPU cache；
-        // 2. miss 后再看全局 slab 状态；
-        // 3. 成功后顺便为本地 cache 批量补货。
+        // Zone 的热路径只获取一次 CPU 本地 cache 锁。命中时直接返回 entry；miss
+        // 才进入 ZoneState，一次批量取得当前对象和后续 magazine 补货。
         let cache = &self.caches[cpu];
-
-        // 第一步：尝试从本地缓存获取（短暂持有 cache 锁）
         let cache_entry = {
             let mut cache_guard = cache.inner.lock();
-            cache_guard.pop()
-        }; // cache lock released here
-
-        // 第二步：现在只持有 state 锁
-        let mut state = self.state.lock();
-        state.stats.alloc_requests += 1;
-
-        // 尝试使用缓存的条目
+            cache_guard.pop_for_alloc()
+        };
         if let Some(entry) = cache_entry {
-            if state.commit_cache_alloc(entry, self.size_class) {
-                state.stats.cache_hits += 1;
-                return SlabAllocation {
-                    ptr: entry.ptr,
-                    slab_node: entry.slab_node,
-                };
-            }
-            state.stats.invalid_frees += 1;
-            panic!(
-                "[alloc][invariant] slab cache entry invalid class={} cpu={} ptr={:#x}",
-                self.size_class, cpu, entry.ptr,
-            );
+            return SlabAllocation {
+                ptr: entry.ptr,
+                slab_node: entry.slab_node,
+            };
         }
 
-        state.stats.cache_misses += 1;
-        let allocation = if let Some(allocation) = state.try_allocate_user_object(self.size_class) {
-            drop(state);
-            allocation
-        } else {
-            drop(state);
+        let mut batch = [CacheEntry::empty(); REFILL_BATCH + 1];
+        let mut produced = {
+            let mut state = self.state.lock();
+            state.allocate_batch(self.size_class, &mut batch)
+        };
+        if produced == 0 {
             let mut grow_attempts = 0;
-            loop {
+            while produced == 0 {
                 if grow_attempts >= MAX_GROW_ATTEMPTS {
                     let mut state = self.state.lock();
                     state.stats.grow_failures += 1;
@@ -930,12 +961,10 @@ impl Zone {
                     self.reclaim_empty_slabs(Some((phys, vmem)));
                     return SlabAllocation::null();
                 }
-
                 let reusable_node = {
                     let mut state = self.state.lock();
                     state.pop_reusable_slab_node()
                 };
-
                 match allocate_slab_node(
                     self.size_class,
                     self.pages_per_slab,
@@ -946,9 +975,7 @@ impl Zone {
                     Ok(node_addr) => {
                         let mut state = self.state.lock();
                         state.insert_slab_node(node_addr);
-                        if let Some(allocation) = state.try_allocate_user_object(self.size_class) {
-                            break allocation;
-                        }
+                        produced = state.allocate_batch(self.size_class, &mut batch);
                     }
                     Err(err) => {
                         let mut state = self.state.lock();
@@ -961,47 +988,29 @@ impl Zone {
                 }
                 grow_attempts += 1;
             }
-        };
-
-        // 第三步：为缓存补货（重新获取 cache 锁）
-        let cache_slots = {
-            let cache_guard = cache.inner.lock();
-            CACHE_CAPACITY
-                .saturating_sub(cache_guard.count)
-                .min(REFILL_BATCH)
-        };
-
-        if cache_slots > 0 {
-            let mut refill = [CacheEntry::empty(); REFILL_BATCH];
-            let produced = {
-                let mut state = self.state.lock();
-                state.allocate_cached_batch(self.size_class, &mut refill[..cache_slots])
-            };
-
-            // 重新获取 cache 锁以推入条目
-            let mut overflow = [CacheEntry::empty(); REFILL_BATCH];
-            let mut overflow_count = 0usize;
-            {
-                let mut cache_guard = cache.inner.lock();
-                for entry in refill.into_iter().take(produced) {
-                    if !cache_guard.push(entry) {
-                        overflow[overflow_count] = entry;
-                        overflow_count += 1;
-                    }
-                }
-            }
-            if overflow_count > 0 {
-                let mut state = self.state.lock();
-                let flush =
-                    state.flush_cached_entries(&overflow[..overflow_count], self.size_class);
-                drop(state);
-                if flush.made_empty {
-                    self.reclaim_empty_slabs(Some((phys, vmem)));
-                }
-            }
         }
 
-        allocation
+        let current = batch[0];
+        let mut overflow = [CacheEntry::empty(); REFILL_BATCH];
+        let overflow_count = {
+            let mut cache_guard = cache.inner.lock();
+            let overflow_count = cache_guard.push_refill(&batch[1..produced], &mut overflow);
+            cache_guard.note_slow_allocation();
+            overflow_count
+        };
+        if overflow_count != 0 {
+            let flush = {
+                let mut state = self.state.lock();
+                state.flush_cached_entries(&overflow[..overflow_count], self.size_class)
+            };
+            if flush.made_empty {
+                self.reclaim_empty_slabs(Some((phys, vmem)));
+            }
+        }
+        SlabAllocation {
+            ptr: current.ptr,
+            slab_node: current.slab_node,
+        }
     }
 
     fn free(
@@ -1010,31 +1019,28 @@ impl Zone {
         cpu: usize,
         backing: Option<(&Mutex<BuddyAllocator>, &KernelAddressSpace)>,
     ) -> bool {
-        // 释放时优先回收到本地 cache；只有 cache 太满时，才把部分 cached 对象真正
-        // 冲刷回 slab 位图状态，从而尽量让热对象停留在本地 CPU。
+        // 没有 registry cookie 的兼容路径先在 ZoneState 中定位对象；正常 GlobalAlloc
+        // 释放走 free_with_hint，不进入这段扫描。
+        if self.ptr_is_cached(ptr) {
+            self.state.lock().stats.invalid_frees += 1;
+            return false;
+        }
         let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); CACHE_CAPACITY / 2];
+        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
         let mut should_reclaim = false;
-
-        let staged = {
+        let slab_node = {
             let mut state = self.state.lock();
-            state.stats.free_requests += 1;
-            state.stage_cached_free(ptr, self.size_class)
+            state.find_allocated_node(ptr, self.size_class)
         };
-
-        let Some(slab_node) = staged else {
-            if should_reclaim {
-                self.reclaim_empty_slabs(backing);
-            }
+        let Some(slab_node) = slab_node else {
             return false;
         };
-
         let entry = CacheEntry { ptr, slab_node };
         let drained_count = {
             let mut cache_guard = cache.inner.lock();
-            cache_guard.push_or_drain_half(entry, &mut drained)
+            cache_guard.push_for_free(entry, &mut drained, false)
         };
-        if drained_count > 0 {
+        if drained_count != 0 {
             let mut state = self.state.lock();
             should_reclaim |= state
                 .flush_cached_entries(&drained[..drained_count], self.size_class)
@@ -1057,38 +1063,20 @@ impl Zone {
             return self.free(ptr, cpu, backing);
         }
 
+        // backend cookie 由 allocator registry 生成且 SlabNode 只复用不释放；正常释放
+        // 可以直接把 entry 放入本地 magazine，不读取 slab 元数据。
         let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); CACHE_CAPACITY / 2];
+        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
         let mut should_reclaim = false;
-
-        let staged = {
-            let mut state = self.state.lock();
-            state.stats.free_requests += 1;
-            match state.stage_cached_free_at_node(ptr, self.size_class, slab_node_hint) {
-                Some(node) => {
-                    state.stats.fast_free_hits += 1;
-                    Some(node)
-                }
-                None => {
-                    state.stats.fast_free_fallbacks += 1;
-                    state.stage_cached_free_scanning(ptr, self.size_class, true)
-                }
-            }
+        let entry = CacheEntry {
+            ptr,
+            slab_node: slab_node_hint,
         };
-
-        let Some(slab_node) = staged else {
-            if should_reclaim {
-                self.reclaim_empty_slabs(backing);
-            }
-            return false;
-        };
-
-        let entry = CacheEntry { ptr, slab_node };
         let drained_count = {
             let mut cache_guard = cache.inner.lock();
-            cache_guard.push_or_drain_half(entry, &mut drained)
+            cache_guard.push_for_free(entry, &mut drained, true)
         };
-        if drained_count > 0 {
+        if drained_count != 0 {
             let mut state = self.state.lock();
             should_reclaim |= state
                 .flush_cached_entries(&drained[..drained_count], self.size_class)
@@ -1106,7 +1094,11 @@ impl Zone {
             let mut drained = [CacheEntry::empty(); CACHE_CAPACITY];
             let drained_count = {
                 let mut cache = self.caches[cpu].inner.lock();
-                cache.drain_into(&mut drained)
+                let drained_count = cache.drain_into(&mut drained);
+                if drained_count != 0 {
+                    cache.stats.flushes = cache.stats.flushes.saturating_add(1);
+                }
+                drained_count
             };
             if drained_count == 0 {
                 continue;
@@ -1150,10 +1142,41 @@ impl Zone {
     }
 
     fn snapshot(&self) -> SlabStats {
-        self.state.lock().stats
+        let mut out = self.state.lock().stats;
+        out.alloc_requests = 0;
+        out.free_requests = 0;
+        out.cache_hits = 0;
+        out.cache_misses = 0;
+        out.cache_refills = 0;
+        out.cache_flushes = 0;
+        out.fast_free_hits = 0;
+        out.fast_free_fallbacks = 0;
+        let mut successful_allocations = 0u64;
+        let mut successful_frees = 0u64;
+        for cache in &self.caches {
+            let stats = cache.inner.lock().stats;
+            out.alloc_requests = out.alloc_requests.saturating_add(stats.alloc_requests);
+            out.free_requests = out.free_requests.saturating_add(stats.free_requests);
+            successful_allocations =
+                successful_allocations.saturating_add(stats.successful_allocations);
+            successful_frees = successful_frees.saturating_add(stats.successful_frees);
+            out.cache_hits = out.cache_hits.saturating_add(stats.cache_hits);
+            out.cache_misses = out.cache_misses.saturating_add(stats.cache_misses);
+            out.cache_refills = out.cache_refills.saturating_add(stats.refills);
+            out.cache_flushes = out.cache_flushes.saturating_add(stats.flushes);
+            out.fast_free_hits = out.fast_free_hits.saturating_add(stats.fast_free_hits);
+            out.fast_free_fallbacks = out
+                .fast_free_fallbacks
+                .saturating_add(stats.fast_free_fallbacks);
+        }
+        // 请求计数保留失败尝试用于诊断；存量只能由成功的生命周期事件推导。
+        out.active_objects = successful_allocations.saturating_sub(successful_frees);
+        out.active_bytes = (out.active_objects as usize).saturating_mul(self.size_class);
+        out
     }
 
     fn class_stat(&self) -> SlabClassStat {
+        let stats = self.snapshot();
         let state = self.state.lock();
         let mut empty_slabs = 0usize;
         let mut empty_pages = 0usize;
@@ -1168,8 +1191,8 @@ impl Zone {
         }
         SlabClassStat {
             size_class: self.size_class,
-            active_objects: state.stats.active_objects,
-            active_bytes: state.stats.active_bytes,
+            active_objects: stats.active_objects,
+            active_bytes: stats.active_bytes,
             active_slabs: state.stats.active_slabs,
             active_pages: state.stats.active_pages,
             empty_slabs,
@@ -1194,8 +1217,67 @@ impl Zone {
         false
     }
 
+    fn ptr_is_cached(&self, ptr: usize) -> bool {
+        self.caches
+            .iter()
+            .any(|cache| cache.inner.lock().contains_ptr(ptr))
+    }
+
     fn audit(&self) -> SlabAudit {
-        self.state.lock().audit(self.size_class)
+        let mut latest = SlabAudit::default();
+        for _ in 0..4 {
+            latest = self.audit_once();
+            if latest.is_consistent() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        latest
+    }
+
+    fn audit_once(&self) -> SlabAudit {
+        // 同时固定全部 magazine，保证 entry 和普通计数来自同一时点。refill/flush 在
+        // cache 与共享状态之间交接时可能留下极短窗口，audit() 会对此做有限重试。
+        let caches = self.caches.each_ref().map(|cache| cache.inner.lock());
+        let state = self.state.lock();
+        let mut audit = state.audit(self.size_class);
+        let mut cached = 0usize;
+        let mut successful_allocations = 0u64;
+        let mut successful_frees = 0u64;
+        for (cpu, cache) in caches.iter().enumerate() {
+            successful_allocations =
+                successful_allocations.saturating_add(cache.stats.successful_allocations);
+            successful_frees = successful_frees.saturating_add(cache.stats.successful_frees);
+            for (slot, &entry) in cache.entries[..cache.count].iter().enumerate() {
+                let duplicate_local = cache.entries[..slot]
+                    .iter()
+                    .any(|previous| previous.ptr == entry.ptr);
+                let duplicate_remote = caches[..cpu].iter().any(|previous| {
+                    previous.entries[..previous.count]
+                        .iter()
+                        .any(|candidate| candidate.ptr == entry.ptr)
+                });
+                let duplicate = duplicate_local || duplicate_remote;
+                if !duplicate && state.cached_entry_is_reserved(entry, self.size_class) {
+                    cached += 1;
+                } else {
+                    audit.flags.insert(SlabAuditFlags::CACHE_WITHOUT_ALLOC);
+                }
+            }
+        }
+        audit.scanned_cached_objects = cached as u64;
+        audit.scanned_active_objects = audit.scanned_active_objects.saturating_sub(cached as u64);
+        audit.scanned_active_bytes = audit
+            .scanned_active_bytes
+            .saturating_sub(cached.saturating_mul(self.size_class));
+        let active_objects = successful_allocations.saturating_sub(successful_frees);
+        let active_bytes = (active_objects as usize).saturating_mul(self.size_class);
+        if audit.scanned_active_objects != active_objects
+            || audit.scanned_active_bytes != active_bytes
+        {
+            audit.flags.insert(SlabAuditFlags::STATS_MISMATCH);
+        }
+        audit
     }
 }
 
@@ -1379,6 +1461,26 @@ impl SlabAllocator {
         core::array::from_fn(|idx| self.zones[idx].class_stat())
     }
 
+    #[cfg(feature = "performance-profile")]
+    pub fn profile_counter(&self, cpu: usize, counter: SlabProfileCounter) -> u64 {
+        if cpu >= MAX_CPUS {
+            return 0;
+        }
+        self.zones
+            .iter()
+            .map(|zone| {
+                let stats = zone.caches[cpu].inner.lock().stats;
+                match counter {
+                    SlabProfileCounter::CacheHit => stats.cache_hits,
+                    SlabProfileCounter::CacheMiss => stats.cache_misses,
+                    SlabProfileCounter::Refill => stats.refills,
+                    SlabProfileCounter::Flush => stats.flushes,
+                    SlabProfileCounter::SlowPath => stats.slow_paths,
+                }
+            })
+            .sum()
+    }
+
     pub fn reclaim(
         &self,
         flush_cpu_caches: bool,
@@ -1486,8 +1588,7 @@ fn slab_node_mut(addr: usize) -> &'static mut SlabNode {
 
 #[inline]
 fn bit_is_set(bits: &[u64; BITMAP_WORDS], idx: usize) -> bool {
-    // slab 的分配态和缓存态都压在位图里。热点路径直接操作 bit，是为了把每次对象状态
-    // 切换控制在非常低的常数开销内。
+    // slab 只在 refill/flush 批次修改位图，热点 magazine 命中不进入这里。
     let word = idx / 64;
     if word >= BITMAP_WORDS {
         return false;
@@ -1498,8 +1599,7 @@ fn bit_is_set(bits: &[u64; BITMAP_WORDS], idx: usize) -> bool {
 
 #[inline]
 fn set_bit(bits: &mut [u64; BITMAP_WORDS], idx: usize, set: bool) {
-    // 所有对象槽位状态迁移最终都会收敛到“某一位设为 1 或清为 0”。把它集中到这里，
-    // 可以保证 alloc/cache 两套位图操作拥有一致的边界检查与写入语义。
+    // 所有对象槽位状态迁移最终都会收敛到“某一位设为 1 或清为 0”。
     let word = idx / 64;
     if word >= BITMAP_WORDS {
         return;
@@ -1513,7 +1613,7 @@ fn set_bit(bits: &mut [u64; BITMAP_WORDS], idx: usize, set: bool) {
 }
 
 fn audit_slab(node: &SlabNode, obj_size: usize, audit: &mut SlabAudit) {
-    let slab = node.slab;
+    let slab = &node.slab;
     let total = slab.total_objects as usize;
     let page_count = slab.page_count as usize;
     let expected_objects = page_count
@@ -1538,33 +1638,20 @@ fn audit_slab(node: &SlabNode, obj_size: usize, audit: &mut SlabAudit) {
     }
 
     let allocated = count_set_bits_in_range(&slab.alloc_bitmap, total);
-    let cached = count_set_bits_in_range(&slab.cache_bitmap, total);
     if allocated != slab.allocated_objects as usize {
         audit.flags.insert(SlabAuditFlags::OBJECT_COUNT_MISMATCH);
     }
-    if cached != slab.cached_objects as usize {
-        audit.flags.insert(SlabAuditFlags::CACHE_COUNT_MISMATCH);
-    }
-    if cached > allocated
-        || has_cache_bits_without_alloc(&slab.alloc_bitmap, &slab.cache_bitmap, total)
-    {
-        audit.flags.insert(SlabAuditFlags::CACHE_WITHOUT_ALLOC);
-    }
-    if has_bits_outside_range(&slab.alloc_bitmap, total)
-        || has_bits_outside_range(&slab.cache_bitmap, total)
-    {
+    if has_bits_outside_range(&slab.alloc_bitmap, total) {
         audit.flags.insert(SlabAuditFlags::UNUSED_BITS_SET);
     }
 
-    let active_objects = allocated.saturating_sub(cached);
     audit.scanned_active_objects = audit
         .scanned_active_objects
-        .saturating_add(active_objects as u64);
-    audit.scanned_cached_objects = audit.scanned_cached_objects.saturating_add(cached as u64);
+        .saturating_add(allocated as u64);
     audit.scanned_active_pages = audit.scanned_active_pages.saturating_add(page_count);
     audit.scanned_active_bytes = audit
         .scanned_active_bytes
-        .saturating_add(active_objects.saturating_mul(obj_size));
+        .saturating_add(allocated.saturating_mul(obj_size));
 }
 
 fn count_set_bits_in_range(bits: &[u64; BITMAP_WORDS], end: usize) -> usize {
@@ -1595,27 +1682,6 @@ fn has_bits_outside_range(bits: &[u64; BITMAP_WORDS], end: usize) -> bool {
             bit_range_mask(0, (end - word_start).min(64))
         };
         if bits[word] & !valid_mask != 0 {
-            return true;
-        }
-        word += 1;
-    }
-    false
-}
-
-fn has_cache_bits_without_alloc(
-    alloc_bits: &[u64; BITMAP_WORDS],
-    cache_bits: &[u64; BITMAP_WORDS],
-    end: usize,
-) -> bool {
-    let end = end.min(BITMAP_WORDS * 64);
-    let mut word = 0usize;
-    while word < BITMAP_WORDS {
-        let word_start = word * 64;
-        if word_start >= end {
-            break;
-        }
-        let valid_mask = bit_range_mask(0, (end - word_start).min(64));
-        if (cache_bits[word] & valid_mask) & !(alloc_bits[word] & valid_mask) != 0 {
             return true;
         }
         word += 1;
@@ -1697,4 +1763,51 @@ fn pages_for_order(order: usize) -> Option<usize> {
         return None;
     }
     1usize.checked_shl(order as u32)
+}
+
+#[cfg(feature = "ktest-kernel")]
+mod tests {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
+
+    use super::*;
+    use crate::space::ArenaKind;
+
+    fn test_node(base_addr: usize, allocated: bool) -> Box<SlabNode> {
+        let mut slab = Slab::empty();
+        slab.init(base_addr, base_addr, 1, PAGE_SIZE);
+        if allocated {
+            assert_eq!(slab.allocate(PAGE_SIZE), Some(base_addr));
+        }
+        Box::new(SlabNode {
+            slab,
+            backing: BackedRange {
+                arena: ArenaKind::Kernel,
+                vaddr: base_addr,
+                paddr: base_addr,
+                size: PAGE_SIZE,
+                order: 0,
+            },
+            next: 0,
+        })
+    }
+
+    #[ktest::ktest]
+    fn allocate_batch_wraps_before_growing() {
+        let mut head = test_node(0x1000, false);
+        let mut preferred = test_node(0x2000, true);
+        let mut tail = test_node(0x3000, true);
+        head.next = (&mut *preferred as *mut SlabNode) as usize;
+        preferred.next = (&mut *tail as *mut SlabNode) as usize;
+
+        let mut state = ZoneState::new();
+        state.slab_head = (&mut *head as *mut SlabNode) as usize;
+        state.preferred_slab = (&mut *preferred as *mut SlabNode) as usize;
+        state.slab_count = 3;
+
+        let mut out = [CacheEntry::empty(); 1];
+        assert_eq!(state.allocate_batch(PAGE_SIZE, &mut out), 1);
+        assert_eq!(out[0].ptr, 0x1000);
+    }
 }

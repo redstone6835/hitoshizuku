@@ -17,13 +17,14 @@ use vfs::dentry::Dentry;
 use vfs::error::{VfsError, VfsResult};
 use vfs::inode::{Inode, InodeId, InodeMeta};
 use vfs::mount::MountFlags;
-use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
+use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat};
 use vfs::superblock::{
     FsDriver, FsDriverFlags, InodeCache, Superblock as VfsSuperblock, SuperblockOps,
 };
 use vfs::sync::Spinlock;
 
 use crate::bgd::{self, GroupDesc};
+use crate::crc;
 use crate::inode::{ExtInodeOps, load_inode};
 use crate::inode_wr::RawInode;
 use crate::layout::{EXT4_ROOT_INO, ExtKind};
@@ -40,10 +41,27 @@ struct BlockCacheSlot {
     version: u64,
 }
 
+#[derive(Clone)]
 struct DirtyBlockSnapshot {
     block: u64,
     data: Vec<u8>,
     version: u64,
+}
+
+enum PartialWriteOutcome {
+    Wait,
+    Retry,
+    Done(Option<DirtyBlockSnapshot>),
+}
+
+struct PendingBlockWriteback {
+    data: Vec<u8>,
+    version: u64,
+    /// `true` 表示恰有一个调用方负责把当前块写回后端。
+    ///
+    /// 同一物理块的新版本只替换 `data/version`，不能再启动第二个并行 I/O；
+    /// 原 owner 完成旧版本后会继续 drain 最新版本，避免旧写后到覆盖新写。
+    in_flight: bool,
 }
 
 /// O(log n) 块缓存：BTreeMap 索引 + Clock eviction。
@@ -53,15 +71,36 @@ pub(crate) struct BlockCache {
     index: BTreeMap<u64, usize>,
     /// Clock eviction 指针（循环扫描）。
     hand: usize,
+    capacity: usize,
     block_size: usize,
     write_seq: u64,
+    /// 已落盘快照从 active/pending 消失，或 cache 失效时推进的序号。
+    ///
+    /// 普通 dirty 发布不推进：它仍可由 overlay 覆盖后端旧读。
+    coherence_epoch: u64,
+    coherence_seq: u64,
+    /// 每个物理块最近一次“可见快照消失/失效”的序号。
+    coherence_stamps: BTreeMap<u64, u64>,
+    /// 被驱逐的脏块在锁外写回期间仍须可读，不能让并发读回退到旧磁盘内容。
+    ///
+    /// 同一块的新驱逐会覆盖可见 pending 版本；旧写回完成时必须比较版本，不能误删新值。
+    pending_writebacks: BTreeMap<u64, PendingBlockWriteback>,
+    /// 正在锁外执行的 range direct write，记录每块所属的写入版本。
+    ///
+    /// 直写期间的新 dirty 版本可以进入 cache/pending，但不得先于直写落盘。
+    active_direct_writes: BTreeMap<u64, u64>,
 }
 
 impl BlockCache {
     fn new(block_size: u32) -> Self {
+        Self::with_capacity(block_size, BLOCK_CACHE_CAP)
+    }
+
+    fn with_capacity(block_size: u32, capacity: usize) -> Self {
         let bs = block_size as usize;
-        let mut slots = Vec::with_capacity(BLOCK_CACHE_CAP);
-        for _ in 0..BLOCK_CACHE_CAP {
+        let capacity = capacity.max(1);
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
             slots.push(BlockCacheSlot {
                 block: 0,
                 data: vec![0u8; bs],
@@ -75,9 +114,41 @@ impl BlockCache {
             slots,
             index: BTreeMap::new(),
             hand: 0,
+            capacity,
             block_size: bs,
             write_seq: 0,
+            coherence_epoch: 0,
+            coherence_seq: 0,
+            coherence_stamps: BTreeMap::new(),
+            pending_writebacks: BTreeMap::new(),
+            active_direct_writes: BTreeMap::new(),
         }
+    }
+
+    fn mark_coherence_change(&mut self, block: u64) {
+        self.coherence_seq = self.coherence_seq.wrapping_add(1);
+        if self.coherence_seq == 0 {
+            // 0 作为“该块从未记录”的 stamp；回绕时清空旧时代并从 1 重新开始。
+            // epoch 使读者仍能识别因清表恢复为 0 的目标 stamp；再次 ABA 需要 2^128 次事件。
+            self.coherence_stamps.clear();
+            self.coherence_epoch = self.coherence_epoch.wrapping_add(1);
+            self.coherence_seq = 1;
+        }
+        self.coherence_stamps.insert(block, self.coherence_seq);
+    }
+
+    fn coherence_stamp_in_range(&self, start: u64, count: u32) -> (u64, u64) {
+        if count == 0 {
+            return (self.coherence_epoch, 0);
+        }
+        let end = start.saturating_add(count as u64);
+        let max_seq = self
+            .coherence_stamps
+            .range(start..end)
+            .map(|(_, &stamp)| stamp)
+            .max()
+            .unwrap_or(0);
+        (self.coherence_epoch, max_seq)
     }
 
     fn next_version(&mut self) -> u64 {
@@ -98,6 +169,10 @@ impl BlockCache {
             out.copy_from_slice(&slot.data);
             return true;
         }
+        if let Some(pending) = self.pending_writebacks.get(&block) {
+            out.copy_from_slice(&pending.data);
+            return true;
+        }
         false
     }
 
@@ -108,20 +183,44 @@ impl BlockCache {
             return false;
         }
         if let Some(&idx) = self.index.get(&block) {
+            let version = self.next_version();
             let slot = &mut self.slots[idx];
             slot.data[offset..offset + src.len()].copy_from_slice(src);
             slot.referenced = true;
             slot.dirty = true;
-            slot.version = {
-                self.write_seq = self.write_seq.wrapping_add(1);
-                if self.write_seq == 0 {
-                    self.write_seq = 1;
-                }
-                self.write_seq
-            };
+            slot.version = version;
             return true;
         }
         false
+    }
+
+    /// cache miss 的整块读完成后，在同一把 cache 锁下重新合并部分写。
+    ///
+    /// 不同 inode 可能位于同一 inode-table 块。若在后端读与整块插入之间
+    /// 另一 owner 已更新该块，必须在锁内叠加到最新 cache/pending 上，
+    /// 不能用旧的后端快照覆盖它。
+    fn merge_partial_after_read(
+        &mut self,
+        block: u64,
+        offset: usize,
+        src: &[u8],
+        base: &mut [u8],
+        read_stamp: (u64, u64),
+    ) -> PartialWriteOutcome {
+        if self.modify_inplace(block, offset, src) {
+            return PartialWriteOutcome::Done(None);
+        }
+        if let Some(pending) = self.pending_writebacks.get(&block) {
+            base.copy_from_slice(&pending.data);
+        } else if self.has_active_direct(block) {
+            return PartialWriteOutcome::Wait;
+        } else if self.coherence_stamp_in_range(block, 1) != read_stamp {
+            // backend read 返回后，更新版本可能已写盘并从
+            // active/pending 消失。此时 base 仍是旧版，必须重读。
+            return PartialWriteOutcome::Retry;
+        }
+        base[offset..offset + src.len()].copy_from_slice(src);
+        PartialWriteOutcome::Done(self.insert_wb(block, base))
     }
 
     /// 在 cache 内原地读取指定块的部分字节到输出缓冲区。
@@ -136,27 +235,23 @@ impl BlockCache {
             dst.copy_from_slice(&slot.data[offset..offset + dst.len()]);
             return true;
         }
+        if let Some(pending) = self.pending_writebacks.get(&block) {
+            dst.copy_from_slice(&pending.data[offset..offset + dst.len()]);
+            return true;
+        }
         false
     }
 
     fn contains(&self, block: u64) -> bool {
-        self.index.contains_key(&block)
+        self.index.contains_key(&block) || self.pending_writebacks.contains_key(&block)
     }
 
     fn invalidate(&mut self, block: u64) {
+        self.mark_coherence_change(block);
         if let Some(&idx) = self.index.get(&block) {
             self.slots[idx].occupied = false;
             self.slots[idx].dirty = false;
             self.index.remove(&block);
-        }
-    }
-
-    fn update_if_present(&mut self, block: u64, data: &[u8]) {
-        if let Some(&idx) = self.index.get(&block) {
-            let slot = &mut self.slots[idx];
-            slot.data.copy_from_slice(data);
-            slot.referenced = true;
-            slot.dirty = false;
         }
     }
 
@@ -165,17 +260,42 @@ impl BlockCache {
             return false;
         }
         for i in 0..count {
-            if !self.index.contains_key(&(start + i as u64)) {
+            if !self.contains(start + i as u64) {
                 return false;
             }
         }
         for i in 0..count {
             let block = start + i as u64;
-            let idx = self.index[&block];
-            let slot = &mut self.slots[idx];
-            slot.referenced = true;
             let off = i as usize * self.block_size;
-            out[off..off + self.block_size].copy_from_slice(&slot.data);
+            if let Some(&idx) = self.index.get(&block) {
+                let slot = &mut self.slots[idx];
+                slot.referenced = true;
+                out[off..off + self.block_size].copy_from_slice(&slot.data);
+            } else if let Some(pending) = self.pending_writebacks.get(&block) {
+                out[off..off + self.block_size].copy_from_slice(&pending.data);
+            }
+        }
+        true
+    }
+
+    fn read_range_vectored(&mut self, start: u64, count: u32, out: &mut [&mut [u8]]) -> bool {
+        if vectored_block_count(out, self.block_size) != Some(count) {
+            return false;
+        }
+        for i in 0..count {
+            if !self.contains(start + i as u64) {
+                return false;
+            }
+        }
+
+        let mut block = start;
+        for buf in out.iter_mut() {
+            for block_out in buf.chunks_exact_mut(self.block_size) {
+                if !self.read(block, block_out) {
+                    return false;
+                }
+                block += 1;
+            }
         }
         true
     }
@@ -191,12 +311,253 @@ impl BlockCache {
                 slot.referenced = true;
                 let off = i as usize * self.block_size;
                 out[off..off + self.block_size].copy_from_slice(&slot.data);
+            } else if let Some(pending) = self.pending_writebacks.get(&block) {
+                let off = i as usize * self.block_size;
+                out[off..off + self.block_size].copy_from_slice(&pending.data);
             }
         }
     }
 
-    /// Write-back 插入：标记 dirty，驱逐时不做 I/O，返回被驱逐脏块的 (block, data)。
-    fn insert_wb(&mut self, block: u64, data: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn overlay_range_vectored(&mut self, start: u64, count: u32, out: &mut [&mut [u8]]) {
+        if vectored_block_count(out, self.block_size) != Some(count) {
+            return;
+        }
+
+        let mut block = start;
+        for buf in out.iter_mut() {
+            for block_out in buf.chunks_exact_mut(self.block_size) {
+                if self.contains(block) {
+                    let copied = self.read(block, block_out);
+                    debug_assert!(copied);
+                }
+                block += 1;
+            }
+        }
+    }
+
+    fn has_active_direct(&self, block: u64) -> bool {
+        self.active_direct_writes.contains_key(&block)
+    }
+
+    fn has_active_direct_writes(&self) -> bool {
+        !self.active_direct_writes.is_empty()
+    }
+
+    fn has_active_direct_in_range(&self, start: u64, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let end = start.saturating_add(count as u64);
+        self.active_direct_writes.range(start..end).next().is_some()
+    }
+
+    /// 范围内若有直写块尚无 cache/pending 快照，读者必须等直写完成。
+    fn has_unreadable_direct_in_range(&self, start: u64, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let end = start.saturating_add(count as u64);
+        self.active_direct_writes
+            .range(start..end)
+            .any(|(&block, _)| !self.contains(block))
+    }
+
+    /// 在同一 cache 锁内为 range direct write 占位，并以直写数据取代旧 dirty 版本。
+    ///
+    /// 返回 `None` 表示范围内仍有 pending 或另一个 active direct owner。
+    fn begin_direct_write(&mut self, start: u64, count: u32, data: &[u8]) -> Option<u64> {
+        if count == 0 || data.len() != self.block_size * count as usize {
+            return None;
+        }
+        if self.has_pending_in_range(start, count) || self.has_active_direct_in_range(start, count)
+        {
+            return None;
+        }
+
+        let version = self.next_version();
+        for i in 0..count {
+            let block = start + i as u64;
+            self.active_direct_writes.insert(block, version);
+            if let Some(&idx) = self.index.get(&block) {
+                let off = i as usize * self.block_size;
+                let slot = &mut self.slots[idx];
+                slot.data.copy_from_slice(&data[off..off + self.block_size]);
+                slot.referenced = true;
+                // I/O 成功前保持 dirty；失败时即可由 sync 重试。
+                slot.dirty = true;
+                slot.version = version;
+            }
+        }
+        Some(version)
+    }
+
+    /// 结束 range direct write。只清理本 owner 的版本，不能把并发新写标 clean。
+    fn finish_direct_write(
+        &mut self,
+        start: u64,
+        count: u32,
+        version: u64,
+        data: &[u8],
+        succeeded: bool,
+    ) {
+        for i in 0..count {
+            let block = start + i as u64;
+            if self.active_direct_writes.get(&block).copied() != Some(version) {
+                continue;
+            }
+            self.active_direct_writes.remove(&block);
+            self.mark_coherence_change(block);
+
+            if succeeded {
+                self.mark_clean(block, version);
+                let remove_pending = self
+                    .pending_writebacks
+                    .get(&block)
+                    .is_some_and(|pending| pending.version == version);
+                if remove_pending {
+                    self.pending_writebacks.remove(&block);
+                }
+                continue;
+            }
+
+            let slot_version = self.index.get(&block).map(|&idx| self.slots[idx].version);
+            let pending_version = self
+                .pending_writebacks
+                .get(&block)
+                .map(|pending| pending.version);
+            if slot_version.is_some_and(|current| current != version)
+                || pending_version.is_some_and(|current| current != version)
+            {
+                continue;
+            }
+            if slot_version == Some(version) {
+                // begin_direct_write 已把直写数据留在 dirty slot 内。
+                continue;
+            }
+            if let Some(pending) = self.pending_writebacks.get_mut(&block) {
+                if pending.version == version {
+                    pending.in_flight = false;
+                    continue;
+                }
+            }
+            let off = i as usize * self.block_size;
+            self.pending_writebacks.insert(
+                block,
+                PendingBlockWriteback {
+                    data: data[off..off + self.block_size].to_vec(),
+                    version,
+                    in_flight: false,
+                },
+            );
+        }
+    }
+
+    /// 发布一个刚被驱逐的 dirty 快照，并在该块没有 owner 时取得写回所有权。
+    fn remember_pending(&mut self, snapshot: DirtyBlockSnapshot) -> Option<DirtyBlockSnapshot> {
+        use alloc::collections::btree_map::Entry;
+
+        let direct_active = self.has_active_direct(snapshot.block);
+        match self.pending_writebacks.entry(snapshot.block) {
+            Entry::Vacant(entry) => {
+                entry.insert(PendingBlockWriteback {
+                    data: snapshot.data.clone(),
+                    version: snapshot.version,
+                    in_flight: !direct_active,
+                });
+                (!direct_active).then_some(snapshot)
+            }
+            Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                // snapshot 在同一 cache 锁内刚产生，时序上必然新于 pending；
+                // 版本号回绕后不能再用数值大小判断新旧。
+                pending.data = snapshot.data;
+                pending.version = snapshot.version;
+                if pending.in_flight || direct_active {
+                    None
+                } else {
+                    pending.in_flight = true;
+                    Some(DirtyBlockSnapshot {
+                        block: snapshot.block,
+                        data: pending.data.clone(),
+                        version: pending.version,
+                    })
+                }
+            }
+        }
+    }
+
+    /// 当前 owner 成功写完一个版本。若期间出现更新，继续返回最新版本给同一 owner。
+    fn complete_pending(&mut self, block: u64, version: u64) -> Option<DirtyBlockSnapshot> {
+        let Some(pending) = self.pending_writebacks.get(&block) else {
+            return None;
+        };
+        if pending.version == version {
+            self.pending_writebacks.remove(&block);
+            self.mark_coherence_change(block);
+            return None;
+        }
+        Some(DirtyBlockSnapshot {
+            block,
+            data: pending.data.clone(),
+            version: pending.version,
+        })
+    }
+
+    /// 后端写失败时释放 owner，但保留最新数据，供后续写入或 sync 重试。
+    fn fail_pending(&mut self, block: u64) {
+        if let Some(pending) = self.pending_writebacks.get_mut(&block) {
+            pending.in_flight = false;
+        }
+    }
+
+    /// 取得一个当前无人负责的 pending 块。
+    fn claim_pending(&mut self) -> Option<DirtyBlockSnapshot> {
+        let block = self
+            .pending_writebacks
+            .iter()
+            .find_map(|(&block, pending)| {
+                (!pending.in_flight && !self.has_active_direct(block)).then_some(block)
+            })?;
+        let pending = self.pending_writebacks.get_mut(&block)?;
+        pending.in_flight = true;
+        Some(DirtyBlockSnapshot {
+            block,
+            data: pending.data.clone(),
+            version: pending.version,
+        })
+    }
+
+    fn claim_pending_in_range(&mut self, start: u64, count: u32) -> Option<DirtyBlockSnapshot> {
+        let end = start.saturating_add(count as u64);
+        let block = self
+            .pending_writebacks
+            .range(start..end)
+            .find_map(|(&block, pending)| {
+                (!pending.in_flight && !self.has_active_direct(block)).then_some(block)
+            })?;
+        let pending = self.pending_writebacks.get_mut(&block)?;
+        pending.in_flight = true;
+        Some(DirtyBlockSnapshot {
+            block,
+            data: pending.data.clone(),
+            version: pending.version,
+        })
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending_writebacks.is_empty()
+    }
+
+    fn has_pending_in_range(&self, start: u64, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let end = start.saturating_add(count as u64);
+        self.pending_writebacks.range(start..end).next().is_some()
+    }
+
+    /// Write-back 插入：标记 dirty，驱逐时不做 I/O，并登记被驱逐脏块的可读快照。
+    fn insert_wb(&mut self, block: u64, data: &[u8]) -> Option<DirtyBlockSnapshot> {
         if data.len() != self.block_size {
             return None;
         }
@@ -211,7 +572,7 @@ impl BlockCache {
             return None;
         }
         // 未满：直接 push
-        if self.slots.len() < BLOCK_CACHE_CAP {
+        if self.slots.len() < self.capacity {
             let idx = self.slots.len();
             self.slots.push(BlockCacheSlot {
                 block,
@@ -226,7 +587,7 @@ impl BlockCache {
         }
         // 已满：Clock eviction，优先驱逐 clean 块
         let cap = self.slots.len();
-        let mut evicted: Option<(u64, Vec<u8>)> = None;
+        let mut evicted: Option<DirtyBlockSnapshot> = None;
         let mut steps = 0usize;
         loop {
             let i = self.hand;
@@ -248,7 +609,11 @@ impl BlockCache {
                 if steps > cap * 2 {
                     let old_block = slot.block;
                     if slot.dirty {
-                        evicted = Some((old_block, slot.data.clone()));
+                        evicted = Some(DirtyBlockSnapshot {
+                            block: old_block,
+                            data: slot.data.clone(),
+                            version: slot.version,
+                        });
                     }
                     self.index.remove(&old_block);
                     slot.block = block;
@@ -257,14 +622,18 @@ impl BlockCache {
                     slot.dirty = true;
                     slot.version = version;
                     self.index.insert(block, i);
-                    return evicted;
+                    return evicted.and_then(|snapshot| self.remember_pending(snapshot));
                 }
                 continue;
             }
             // 可驱逐
             let old_block = slot.block;
             if slot.dirty {
-                evicted = Some((old_block, slot.data.clone()));
+                evicted = Some(DirtyBlockSnapshot {
+                    block: old_block,
+                    data: slot.data.clone(),
+                    version: slot.version,
+                });
             }
             self.index.remove(&old_block);
             slot.block = block;
@@ -273,7 +642,7 @@ impl BlockCache {
             slot.dirty = true;
             slot.version = version;
             self.index.insert(block, i);
-            return evicted;
+            return evicted.and_then(|snapshot| self.remember_pending(snapshot));
         }
     }
 
@@ -318,7 +687,7 @@ impl BlockCache {
             return Ok(());
         }
         // 未满：直接 push
-        if self.slots.len() < BLOCK_CACHE_CAP {
+        if self.slots.len() < self.capacity {
             let idx = self.slots.len();
             self.slots.push(BlockCacheSlot {
                 block,
@@ -407,7 +776,7 @@ impl BlockCache {
             }
             return true;
         }
-        if self.slots.len() < BLOCK_CACHE_CAP {
+        if self.slots.len() < self.capacity {
             let idx = self.slots.len();
             let version = if dirty { self.next_version() } else { 0 };
             self.slots.push(BlockCacheSlot {
@@ -484,6 +853,10 @@ impl BlockCache {
             return;
         }
         let end = start.saturating_add(count as u64);
+        // 即使范围当前未缓存，也要使并发 backend read 的旧结果失效。
+        for block in start..end {
+            self.mark_coherence_change(block);
+        }
         // 收集需要移除的 block 号（避免在借用 self.index 时修改它）
         let to_remove: Vec<u64> = self.index.range(start..end).map(|(&b, _)| b).collect();
         for block in to_remove {
@@ -494,7 +867,29 @@ impl BlockCache {
                 slot.dirty = false;
             }
         }
+        let pending_to_remove: Vec<u64> = self
+            .pending_writebacks
+            .range(start..end)
+            .map(|(&block, _)| block)
+            .collect();
+        for block in pending_to_remove {
+            self.pending_writebacks.remove(&block);
+        }
     }
+}
+
+fn vectored_block_count(bufs: &[&mut [u8]], block_size: usize) -> Option<u32> {
+    if block_size == 0 {
+        return None;
+    }
+    let mut count = 0usize;
+    for buf in bufs {
+        if buf.is_empty() || buf.len() % block_size != 0 {
+            return None;
+        }
+        count = count.checked_add(buf.len() / block_size)?;
+    }
+    u32::try_from(count).ok()
 }
 
 /// 块设备同步 I/O 错误。
@@ -512,6 +907,51 @@ pub trait BlockBackend: Send + Sync {
     fn sector_size(&self) -> u32;
     fn sector_count(&self) -> u64;
     fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlockBackendError>;
+
+    /// 从连续扇区范围读取到多个缓冲区。
+    ///
+    /// 默认实现逐缓冲调用 [`Self::read_sectors`]；块设备可覆盖它以提交真正的
+    /// scatter/gather 请求。每个 slice 必须非空并按扇区大小对齐。
+    fn read_sectors_vectored(
+        &self,
+        lba: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> Result<(), BlockBackendError> {
+        let sector_size = self.sector_size() as usize;
+        if sector_size == 0 {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let mut total_sectors = 0u64;
+        for buf in bufs.iter() {
+            if buf.is_empty() || buf.len() % sector_size != 0 {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let sectors = u64::try_from(buf.len() / sector_size)
+                .map_err(|_| BlockBackendError::OutOfRange)?;
+            if sectors > u32::MAX as u64 {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            total_sectors = total_sectors
+                .checked_add(sectors)
+                .ok_or(BlockBackendError::OutOfRange)?;
+        }
+        let end = lba
+            .checked_add(total_sectors)
+            .ok_or(BlockBackendError::OutOfRange)?;
+        if end > self.sector_count() {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let mut current_lba = lba;
+        for buf in bufs.iter_mut() {
+            let sectors = (buf.len() / sector_size) as u32;
+            self.read_sectors(current_lba, sectors, buf)?;
+            current_lba += sectors as u64;
+        }
+        Ok(())
+    }
+
     fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlockBackendError>;
 }
 
@@ -525,6 +965,71 @@ pub(crate) struct GroupCounts {
     pub used_dirs: u32,
 }
 
+struct PendingInodeWriteback {
+    raw: RawInode,
+    version: u64,
+    in_flight: bool,
+}
+
+struct DirtyInodeState {
+    seq: u64,
+    pending: BTreeMap<u32, PendingInodeWriteback>,
+}
+
+enum InodeWritebackClaim {
+    Clean,
+    Busy,
+    Owner { raw: RawInode, version: u64 },
+}
+
+impl DirtyInodeState {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn next_version(&mut self) -> u64 {
+        self.seq = self.seq.wrapping_add(1);
+        if self.seq == 0 {
+            self.seq = 1;
+        }
+        self.seq
+    }
+
+    fn stage(&mut self, raw: &RawInode) -> u64 {
+        let version = self.next_version();
+        let in_flight = self
+            .pending
+            .get(&raw.ino)
+            .is_some_and(|pending| pending.in_flight);
+        self.pending.insert(
+            raw.ino,
+            PendingInodeWriteback {
+                raw: raw.clone(),
+                version,
+                in_flight,
+            },
+        );
+        version
+    }
+
+    fn claim(&mut self, ino: u32) -> InodeWritebackClaim {
+        let Some(pending) = self.pending.get_mut(&ino) else {
+            return InodeWritebackClaim::Clean;
+        };
+        if pending.in_flight {
+            return InodeWritebackClaim::Busy;
+        }
+        pending.in_flight = true;
+        InodeWritebackClaim::Owner {
+            raw: pending.raw.clone(),
+            version: pending.version,
+        }
+    }
+}
+
 /// 已挂载 ext FS 的共享状态。
 pub(crate) struct FsState {
     pub(crate) backend: Arc<dyn BlockBackend>,
@@ -532,14 +1037,13 @@ pub(crate) struct FsState {
     pub(crate) group_desc: Spinlock<alloc::vec::Vec<GroupDesc>>,
     pub(crate) group_counts: Spinlock<alloc::vec::Vec<GroupCounts>>,
     pub(crate) block_cache: Spinlock<BlockCache>,
-    block_cache_epoch: core::sync::atomic::AtomicU64,
     pub(crate) sb_free_blocks: core::sync::atomic::AtomicU64,
     pub(crate) sb_free_inodes: core::sync::atomic::AtomicU32,
     pub(crate) block_alloc_hint: core::sync::atomic::AtomicU64,
     pub(crate) inode_alloc_hint: core::sync::atomic::AtomicU32,
     pub(crate) alloc_group_dirty: Spinlock<alloc::vec::Vec<u8>>,
     pub(crate) alloc_sb_dirty: AtomicBool,
-    pub(crate) dirty_inodes: Spinlock<alloc::vec::Vec<Arc<Spinlock<RawInode>>>>,
+    inode_writeback: Spinlock<DirtyInodeState>,
     /// 只读挂载标志(由驱动 flags 或 remount 控制)。
     pub(crate) read_only: core::sync::atomic::AtomicBool,
 }
@@ -612,6 +1116,39 @@ impl FsState {
         Ok(())
     }
 
+    /// 对应位图进入共享块缓存后，清除块组的惰性初始化标志。
+    pub(crate) fn clear_group_flags(
+        &self,
+        group: u32,
+        flags: u16,
+    ) -> Result<(), BlockBackendError> {
+        {
+            let mut descs = self.group_desc.lock();
+            let desc = descs
+                .get_mut(group as usize)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            desc.flags &= !flags;
+        }
+        self.mark_group_dirty(group)
+    }
+
+    /// inode 分配推进高水位后收缩 `bg_itable_unused`。释放 inode 时不再增大该值，
+    /// 因为对应 inode 表项已经完成过初始化。
+    pub(crate) fn record_inode_table_use(
+        &self,
+        group: u32,
+        trailing_unused: u32,
+    ) -> Result<(), BlockBackendError> {
+        {
+            let mut descs = self.group_desc.lock();
+            let desc = descs
+                .get_mut(group as usize)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            desc.itable_unused_count = desc.itable_unused_count.min(trailing_unused);
+        }
+        self.mark_group_dirty(group)
+    }
+
     fn mark_group_dirty(&self, group: u32) -> Result<(), BlockBackendError> {
         let mut dirty = self.alloc_group_dirty.lock();
         let slot = dirty
@@ -676,19 +1213,140 @@ impl FsState {
         if out.len() != self.ext_sb.block_size as usize {
             return Err(BlockBackendError::OutOfRange);
         }
-        {
-            let mut cache = self.block_cache.lock();
-            if cache.read(block, out) {
-                return Ok(());
-            }
+        self.read_blocks_coherent(block, 1, out)
+    }
+
+    /// 在不持 cache Spinlock 的情况下执行后端读，并用 range-local stamp 防止旧读回填。
+    fn read_blocks_coherent(
+        &self,
+        start_block: u64,
+        count: u32,
+        out: &mut [u8],
+    ) -> Result<(), BlockBackendError> {
+        let bs = self.ext_sb.block_size as usize;
+        if out.len() != bs * count as usize {
+            return Err(BlockBackendError::OutOfRange);
         }
-        let epoch = self.block_cache_epoch.load(Ordering::Acquire);
-        bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, block, 1, out)?;
-        if self.block_cache_epoch.load(Ordering::Acquire) == epoch {
-            let mut cache = self.block_cache.lock();
-            if !cache.read(block, out) {
-                cache.try_insert_clean(block, out);
+        const MAX_CHUNK_BLOCKS: u32 = 128;
+        let mut off = 0usize;
+        let mut remaining = count;
+        let mut block = start_block;
+        while remaining > 0 {
+            let n = remaining.min(MAX_CHUNK_BLOCKS);
+            let chunk_bytes = bs * n as usize;
+            let chunk = &mut out[off..off + chunk_bytes];
+            loop {
+                let coherence_stamp = {
+                    let mut cache = self.block_cache.lock();
+                    if cache.read_range(block, n, chunk) {
+                        break;
+                    }
+                    if cache.has_unreadable_direct_in_range(block, n) {
+                        drop(cache);
+                        Self::wait_for_writeback_progress();
+                        continue;
+                    }
+                    cache.coherence_stamp_in_range(block, n)
+                };
+
+                bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, block, n, chunk)?;
+                let mut cache = self.block_cache.lock();
+                if cache.coherence_stamp_in_range(block, n) != coherence_stamp {
+                    // 写入可能已经落盘并从 active/pending 消失；仅 overlay
+                    // 不足以证明 miss 部分仍是新数据，必须丢弃本次后端结果。
+                    if cache.read_range(block, n, chunk) {
+                        break;
+                    }
+                    let wait_direct = cache.has_unreadable_direct_in_range(block, n);
+                    drop(cache);
+                    if wait_direct {
+                        Self::wait_for_writeback_progress();
+                    }
+                    continue;
+                }
+                if cache.has_unreadable_direct_in_range(block, n) {
+                    drop(cache);
+                    Self::wait_for_writeback_progress();
+                    continue;
+                }
+
+                cache.overlay_range(block, n, chunk);
+                for i in 0..n {
+                    let cur_block = block + i as u64;
+                    let start = bs * i as usize;
+                    let end = start + bs;
+                    if !cache.contains(cur_block) && !cache.has_active_direct(cur_block) {
+                        cache.try_insert_clean(cur_block, &chunk[start..end]);
+                    }
+                }
+                break;
             }
+            off += chunk_bytes;
+            block += n as u64;
+            remaining -= n;
+        }
+        Ok(())
+    }
+
+    /// 把连续块直接读入多个块对齐缓冲区，并保持与 write-back/direct write 一致。
+    ///
+    /// 与普通 coherent read 不同，本路径不会把后端结果插入 clean block cache；
+    /// 它只使用 cache 中已有的新版本覆盖对应目标块。
+    fn read_blocks_coherent_vectored(
+        &self,
+        start_block: u64,
+        count: u32,
+        out: &mut [&mut [u8]],
+    ) -> Result<(), BlockBackendError> {
+        let block_size = self.ext_sb.block_size as usize;
+        if vectored_block_count(out, block_size) != Some(count) {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        loop {
+            let coherence_stamp = {
+                let mut cache = self.block_cache.lock();
+                if cache.read_range_vectored(start_block, count, out) {
+                    break;
+                }
+                if cache.has_unreadable_direct_in_range(start_block, count) {
+                    drop(cache);
+                    Self::wait_for_writeback_progress();
+                    continue;
+                }
+                cache.coherence_stamp_in_range(start_block, count)
+            };
+
+            bgd::read_blocks_vectored(
+                self.backend.as_ref(),
+                &self.ext_sb,
+                start_block,
+                count,
+                out,
+            )?;
+            let mut cache = self.block_cache.lock();
+            if cache.coherence_stamp_in_range(start_block, count) != coherence_stamp {
+                if cache.read_range_vectored(start_block, count, out) {
+                    break;
+                }
+                let wait_direct = cache.has_unreadable_direct_in_range(start_block, count);
+                drop(cache);
+                if wait_direct {
+                    Self::wait_for_writeback_progress();
+                }
+                continue;
+            }
+            if cache.has_unreadable_direct_in_range(start_block, count) {
+                drop(cache);
+                Self::wait_for_writeback_progress();
+                continue;
+            }
+
+            cache.overlay_range_vectored(start_block, count, out);
+            break;
         }
         Ok(())
     }
@@ -700,17 +1358,33 @@ impl FsState {
     #[inline]
     pub(crate) fn modify_block_partial(&self, block: u64, offset: usize, src: &[u8]) -> bool {
         let mut cache = self.block_cache.lock();
-        cache.modify_inplace(block, offset, src)
+        let modified = cache.modify_inplace(block, offset, src);
+        modified
     }
 
     /// 丢弃一段数据块缓存。释放块前必须清理 dirty cache，避免块被重新分配后
     /// 旧文件的延迟写回覆盖新文件数据。
-    pub(crate) fn discard_cached_blocks(&self, start_block: u64, count: u32) {
+    pub(crate) fn discard_cached_blocks(
+        &self,
+        start_block: u64,
+        count: u32,
+    ) -> Result<(), BlockBackendError> {
         if count == 0 {
-            return;
+            return Ok(());
         }
-        let mut cache = self.block_cache.lock();
-        cache.invalidate_range(start_block, count);
+        loop {
+            self.flush_pending_range(start_block, count)?;
+            let mut cache = self.block_cache.lock();
+            if cache.has_pending_in_range(start_block, count)
+                || cache.has_active_direct_in_range(start_block, count)
+            {
+                drop(cache);
+                Self::wait_for_writeback_progress();
+                continue;
+            }
+            cache.invalidate_range(start_block, count);
+            return Ok(());
+        }
     }
 
     /// 修改块内部分字节。cache miss 时只读一次整块，之后转为 write-back dirty。
@@ -731,10 +1405,25 @@ impl FsState {
             return Ok(());
         }
 
-        let mut data = vec![0u8; self.ext_sb.block_size as usize];
-        self.read_block(block, &mut data)?;
-        data[offset..offset + src.len()].copy_from_slice(src);
-        self.write_block(block, &data)
+        loop {
+            let read_stamp = self.block_cache.lock().coherence_stamp_in_range(block, 1);
+            let mut data = vec![0u8; self.ext_sb.block_size as usize];
+            self.read_block(block, &mut data)?;
+            let outcome = self
+                .block_cache
+                .lock()
+                .merge_partial_after_read(block, offset, src, &mut data, read_stamp);
+            match outcome {
+                PartialWriteOutcome::Wait => Self::wait_for_writeback_progress(),
+                PartialWriteOutcome::Retry => continue,
+                PartialWriteOutcome::Done(evicted) => {
+                    if let Some(evicted) = evicted {
+                        self.flush_one_evicted(&evicted)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// 以块为单位写入（write-back：只更新 cache，延迟落盘）。
@@ -746,10 +1435,9 @@ impl FsState {
             let mut cache = self.block_cache.lock();
             cache.insert_wb(block, data)
         };
-        if let Some((old_block, old_data)) = evicted {
-            bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, old_block, 1, &old_data)?;
+        if let Some(evicted) = evicted {
+            self.flush_one_evicted(&evicted)?;
         }
-        self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -767,8 +1455,8 @@ impl FsState {
             let mut cache = self.block_cache.lock();
             cache.insert_wb(block, data)
         };
-        if let Some((old_block, old_data)) = evicted {
-            bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, old_block, 1, &old_data)?;
+        if let Some(evicted) = evicted {
+            self.flush_one_evicted(&evicted)?;
         }
         Ok(())
     }
@@ -787,48 +1475,7 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        if count == 1 {
-            return self.read_block(start_block, out);
-        }
-        // 分批读取，每批不超过 MAX_CHUNK_BLOCKS，避免超出 VirtIO 队列限制
-        const MAX_CHUNK_BLOCKS: u32 = 128; // 128×4KB=512KB，VirtIO 256 descriptor 安全范围内
-        let mut off = 0usize;
-        let mut remaining = count;
-        let mut block = start_block;
-        while remaining > 0 {
-            let n = remaining.min(MAX_CHUNK_BLOCKS);
-            let chunk_bytes = bs * n as usize;
-            {
-                let mut cache = self.block_cache.lock();
-                if cache.read_range(block, n, &mut out[off..off + chunk_bytes]) {
-                    off += chunk_bytes;
-                    block += n as u64;
-                    remaining -= n;
-                    continue;
-                }
-            }
-
-            bgd::read_blocks(
-                self.backend.as_ref(),
-                &self.ext_sb,
-                block,
-                n,
-                &mut out[off..off + chunk_bytes],
-            )?;
-            let mut cache = self.block_cache.lock();
-            for i in 0..n {
-                let cur_block = block + i as u64;
-                let start = off + bs * i as usize;
-                let end = start + bs;
-                if !cache.contains(cur_block) {
-                    cache.try_insert_clean(cur_block, &out[start..end]);
-                }
-            }
-            off += chunk_bytes;
-            block += n as u64;
-            remaining -= n;
-        }
-        Ok(())
+        self.read_blocks_coherent(start_block, count, out)
     }
 
     pub(crate) fn read_data_blocks(
@@ -842,43 +1489,16 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        {
-            let mut cache = self.block_cache.lock();
-            if cache.read_range(start_block, count, out) {
-                return Ok(());
-            }
-        }
-        const MAX_CHUNK_BLOCKS: u32 = 128;
-        let mut off = 0usize;
-        let mut remaining = count;
-        let mut block = start_block;
-        while remaining > 0 {
-            let n = remaining.min(MAX_CHUNK_BLOCKS);
-            let chunk_bytes = bs * n as usize;
-            bgd::read_blocks(
-                self.backend.as_ref(),
-                &self.ext_sb,
-                block,
-                n,
-                &mut out[off..off + chunk_bytes],
-            )?;
-            {
-                let mut cache = self.block_cache.lock();
-                cache.overlay_range(block, n, &mut out[off..off + chunk_bytes]);
-                for i in 0..n {
-                    let cur_block = block + i as u64;
-                    let start = off + bs * i as usize;
-                    let end = start + bs;
-                    if !cache.contains(cur_block) {
-                        cache.try_insert_clean(cur_block, &out[start..end]);
-                    }
-                }
-            }
-            off += chunk_bytes;
-            block += n as u64;
-            remaining -= n;
-        }
-        Ok(())
+        self.read_blocks_coherent(start_block, count, out)
+    }
+
+    pub(crate) fn read_data_blocks_vectored(
+        &self,
+        start_block: u64,
+        count: u32,
+        out: &mut [&mut [u8]],
+    ) -> Result<(), BlockBackendError> {
+        self.read_blocks_coherent_vectored(start_block, count, out)
     }
 
     pub(crate) fn write_blocks(
@@ -895,7 +1515,7 @@ impl FsState {
             return Ok(());
         }
         let bs = self.ext_sb.block_size as usize;
-        let mut evicted_list: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut evicted_list: Vec<DirtyBlockSnapshot> = Vec::new();
         {
             let mut cache = self.block_cache.lock();
             for i in 0..count {
@@ -907,7 +1527,6 @@ impl FsState {
             }
         }
         self.flush_evicted(&mut evicted_list)?;
-        self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -926,23 +1545,36 @@ impl FsState {
             return Ok(());
         }
         if count >= 4 {
-            let bs = self.ext_sb.block_size as usize;
-            bgd::write_blocks(
+            // 等待旧 victim 后，在同一 cache 锁内注册 direct owner。这个占位
+            // 关闭了“检查 pending”到“发起 I/O”之间的窗口。
+            let version = loop {
+                self.flush_pending_range(start_block, count)?;
+                let mut cache = self.block_cache.lock();
+                if let Some(version) = cache.begin_direct_write(start_block, count, data) {
+                    break version;
+                }
+                drop(cache);
+                Self::wait_for_writeback_progress();
+            };
+
+            let result = bgd::write_blocks(
                 self.backend.as_ref(),
                 &self.ext_sb,
                 start_block,
                 count,
                 data,
-            )?;
-            let mut cache = self.block_cache.lock();
-            for i in 0..count {
-                let off = bs * i as usize;
-                cache.update_if_present(start_block + i as u64, &data[off..off + bs]);
-            }
-            return Ok(());
+            );
+            self.block_cache.lock().finish_direct_write(
+                start_block,
+                count,
+                version,
+                data,
+                result.is_ok(),
+            );
+            return result;
         }
         let bs = self.ext_sb.block_size as usize;
-        let mut evicted_list: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut evicted_list: Vec<DirtyBlockSnapshot> = Vec::new();
         {
             let mut cache = self.block_cache.lock();
             for i in 0..count as usize {
@@ -957,89 +1589,59 @@ impl FsState {
         Ok(())
     }
 
-    fn flush_evicted(&self, list: &mut Vec<(u64, Vec<u8>)>) -> Result<(), BlockBackendError> {
-        if list.is_empty() {
-            return Ok(());
-        }
-        if list.len() == 1 {
-            let (blk, ref data) = list[0];
-            return bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, blk, 1, data);
-        }
-        list.sort_unstable_by_key(|(blk, _)| *blk);
-        let bs = self.ext_sb.block_size as usize;
-        let mut i = 0;
-        while i < list.len() {
-            let run_start = list[i].0;
-            let mut run_end = run_start;
-            let mut j = i + 1;
-            while j < list.len() && list[j].0 == run_end + 1 {
-                run_end = list[j].0;
-                j += 1;
+    fn flush_one_evicted(&self, snapshot: &DirtyBlockSnapshot) -> Result<(), BlockBackendError> {
+        let mut current = snapshot.clone();
+        loop {
+            if let Err(err) = bgd::write_blocks(
+                self.backend.as_ref(),
+                &self.ext_sb,
+                current.block,
+                1,
+                &current.data,
+            ) {
+                self.block_cache.lock().fail_pending(current.block);
+                return Err(err);
             }
-            let run_count = (j - i) as u32;
-            if run_count == 1 {
-                bgd::write_blocks(
-                    self.backend.as_ref(),
-                    &self.ext_sb,
-                    run_start,
-                    1,
-                    &list[i].1,
-                )?;
-            } else {
-                let mut merged = Vec::with_capacity(bs * run_count as usize);
-                for k in i..j {
-                    merged.extend_from_slice(&list[k].1);
-                }
-                bgd::write_blocks(
-                    self.backend.as_ref(),
-                    &self.ext_sb,
-                    run_start,
-                    run_count,
-                    &merged,
-                )?;
+            let next = self
+                .block_cache
+                .lock()
+                .complete_pending(current.block, current.version);
+            match next {
+                Some(snapshot) => current = snapshot,
+                None => return Ok(()),
             }
-            i = j;
         }
-        Ok(())
     }
 
-    pub(crate) fn flush_dirty_blocks(&self) -> Result<(), BlockBackendError> {
-        loop {
-            let mut pending = {
-                let cache = self.block_cache.lock();
-                cache.dirty_snapshots()
-            };
-            if pending.is_empty() {
-                return Ok(());
-            }
-
-            pending.sort_unstable_by_key(|snap| snap.block);
-
-            const MAX_FLUSH_RUN_BLOCKS: usize = 128;
-            let bs = self.ext_sb.block_size as usize;
+    fn flush_evicted(&self, list: &mut Vec<DirtyBlockSnapshot>) -> Result<(), BlockBackendError> {
+        let mut queue = core::mem::take(list);
+        let bs = self.ext_sb.block_size as usize;
+        const MAX_FLUSH_RUN_BLOCKS: usize = 128;
+        while !queue.is_empty() {
+            queue.sort_unstable_by_key(|snapshot| snapshot.block);
+            let mut followups: Vec<DirtyBlockSnapshot> = Vec::new();
             let mut i = 0usize;
-            while i < pending.len() {
-                let run_start = pending[i].block;
+            while i < queue.len() {
+                let run_start = queue[i].block;
                 let mut j = i + 1;
-                while j < pending.len()
-                    && pending[j].block == pending[j - 1].block + 1
+                while j < queue.len()
+                    && queue[j].block == queue[j - 1].block + 1
                     && j - i < MAX_FLUSH_RUN_BLOCKS
                 {
                     j += 1;
                 }
-
-                if j == i + 1 {
+                let result = if j == i + 1 {
                     bgd::write_blocks(
                         self.backend.as_ref(),
                         &self.ext_sb,
                         run_start,
                         1,
-                        &pending[i].data,
-                    )?;
+                        &queue[i].data,
+                    )
                 } else {
                     let mut merged = Vec::with_capacity(bs * (j - i));
-                    for snap in &pending[i..j] {
-                        merged.extend_from_slice(&snap.data);
+                    for snapshot in &queue[i..j] {
+                        merged.extend_from_slice(&snapshot.data);
                     }
                     bgd::write_blocks(
                         self.backend.as_ref(),
@@ -1047,21 +1649,126 @@ impl FsState {
                         run_start,
                         (j - i) as u32,
                         &merged,
-                    )?;
+                    )
+                };
+                if let Err(err) = result {
+                    let mut cache = self.block_cache.lock();
+                    for snapshot in &queue[i..] {
+                        cache.fail_pending(snapshot.block);
+                    }
+                    for snapshot in &followups {
+                        cache.fail_pending(snapshot.block);
+                    }
+                    return Err(err);
                 }
-
-                let mut cache = self.block_cache.lock();
-                for snap in &pending[i..j] {
-                    cache.mark_clean(snap.block, snap.version);
+                {
+                    let mut cache = self.block_cache.lock();
+                    for snapshot in &queue[i..j] {
+                        if let Some(next) = cache.complete_pending(snapshot.block, snapshot.version)
+                        {
+                            followups.push(next);
+                        }
+                    }
                 }
                 i = j;
             }
-            break;
+            queue = followups;
         }
         Ok(())
     }
 
+    fn wait_for_writeback_progress() {
+        if sched::is_ready() {
+            sched::poll_urgent_work();
+            sched::schedule_once(sched::now_ns_public());
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn flush_pending_writebacks(&self) -> Result<(), BlockBackendError> {
+        loop {
+            let (snapshot, has_pending) = {
+                let mut cache = self.block_cache.lock();
+                let snapshot = cache.claim_pending();
+                let has_pending = cache.has_pending();
+                (snapshot, has_pending)
+            };
+            if let Some(snapshot) = snapshot {
+                self.flush_one_evicted(&snapshot)?;
+                continue;
+            }
+            if !has_pending {
+                return Ok(());
+            }
+            // 其余 pending 正由别的 owner 写盘；sync 必须等它完成，不能假成功。
+            Self::wait_for_writeback_progress();
+        }
+    }
+
+    fn flush_pending_range(&self, start: u64, count: u32) -> Result<(), BlockBackendError> {
+        loop {
+            let (snapshot, has_pending) = {
+                let mut cache = self.block_cache.lock();
+                let snapshot = cache.claim_pending_in_range(start, count);
+                let has_pending = cache.has_pending_in_range(start, count);
+                (snapshot, has_pending)
+            };
+            if let Some(snapshot) = snapshot {
+                self.flush_one_evicted(&snapshot)?;
+                continue;
+            }
+            if !has_pending {
+                return Ok(());
+            }
+            Self::wait_for_writeback_progress();
+        }
+    }
+
+    pub(crate) fn flush_dirty_blocks(&self) -> Result<(), BlockBackendError> {
+        loop {
+            // 先接管此前失败、无人负责的 victim；若另一个 owner 仍在 I/O，等待其完成。
+            self.flush_pending_writebacks()?;
+
+            let (snapshots, mut owners, quiescent) = {
+                let mut cache = self.block_cache.lock();
+                let snapshots = cache.dirty_snapshots();
+                let owners = snapshots
+                    .iter()
+                    .filter_map(|snapshot| cache.remember_pending(snapshot.clone()))
+                    .collect::<Vec<_>>();
+                let quiescent = snapshots.is_empty()
+                    && !cache.has_pending()
+                    && !cache.has_active_direct_writes();
+                (snapshots, owners, quiescent)
+            };
+            if snapshots.is_empty() {
+                if quiescent {
+                    return Ok(());
+                }
+                // pending 可能在首次 flush 与本次快照之间刚发布，或仍有
+                // direct owner 在锁外 I/O；两种情况都不能把 sync 误报为完成。
+                Self::wait_for_writeback_progress();
+                continue;
+            }
+            self.flush_evicted(&mut owners)?;
+            self.flush_pending_writebacks()?;
+            {
+                let mut cache = self.block_cache.lock();
+                for snapshot in &snapshots {
+                    cache.mark_clean(snapshot.block, snapshot.version);
+                }
+            }
+            // 写回期间若同一块又被修改，version 不匹配会保留 dirty；重扫直到稳定。
+        }
+    }
+
     pub(crate) fn flush_alloc_metadata(&self) -> Result<(), BlockBackendError> {
+        // 第一次先排空普通脏块，缩短全局分配锁的持有时间。随后取得分配锁并再次
+        // 排空：此前进行中的 bitmap 修改至此已经发布，锁内快照的 flags/counts
+        // 与落盘 bitmap 属于同一状态，sync 返回时也不会遗漏刚被摘走的 dirty 位。
+        self.flush_dirty_blocks()?;
+        let _alloc = crate::alloc_mod::lock_alloc();
         self.flush_dirty_blocks()?;
         let dirty_groups = {
             let mut dirty = self.alloc_group_dirty.lock();
@@ -1100,56 +1807,92 @@ impl FsState {
         Ok(())
     }
 
-    pub(crate) fn sync_all(&self) -> Result<(), BlockBackendError> {
-        self.flush_dirty_inodes()?;
-        self.flush_alloc_metadata()?;
-        Ok(())
+    /// 发布 inode 最新原始快照，不在此锁内做任何块 I/O。
+    ///
+    /// 同一 inode 若正有 owner 写回，新版本只替换 pending 快照；旧 owner
+    /// 完成后会检查版本并继续 drain，不会误删新版本。
+    pub(crate) fn stage_inode_write(&self, raw: &RawInode) -> u64 {
+        self.inode_writeback.lock().stage(raw)
     }
 
-    pub(crate) fn mark_inode_dirty(&self, raw: &Arc<Spinlock<RawInode>>) {
-        let mut dirty = self.dirty_inodes.lock();
-        if dirty.iter().any(|entry| Arc::ptr_eq(entry, raw)) {
-            return;
-        }
-        dirty.push(Arc::clone(raw));
+    /// 将运行时 inode 变更纳入统一的按 ino 版本化写回。
+    ///
+    /// 普通 inode 操作必须走此接口，不能直接调用底层 `write_raw`，
+    /// 否则会越过同 ino owner，让旧快照后到覆盖新的 size/nlink。
+    pub(crate) fn publish_inode_write(&self, raw: &RawInode) -> Result<(), BlockBackendError> {
+        self.stage_inode_write(raw);
+        self.flush_inode_write(raw.ino)
     }
 
-    pub(crate) fn flush_dirty_inodes(&self) -> Result<(), BlockBackendError> {
-        let pending = {
-            let mut dirty = self.dirty_inodes.lock();
-            if dirty.is_empty() {
-                return Ok(());
-            }
-            core::mem::take(&mut *dirty)
-        };
-
-        for (idx, raw) in pending.iter().enumerate() {
-            let snapshot = loop {
-                if let Some(guard) = raw.try_lock() {
-                    break guard.clone();
-                }
-                if sched::is_ready() {
-                    sched::schedule_once(sched::now_ns_public());
-                } else {
-                    core::hint::spin_loop();
-                }
-            };
-            if let Err(err) = crate::inode_wr::write_raw(self, &snapshot) {
-                let mut dirty = self.dirty_inodes.lock();
-                for pending_raw in &pending[idx..] {
-                    if !dirty.iter().any(|entry| Arc::ptr_eq(entry, pending_raw)) {
-                        dirty.push(Arc::clone(pending_raw));
-                    }
+    fn drain_inode_writeback(
+        &self,
+        ino: u32,
+        mut raw: RawInode,
+        mut version: u64,
+    ) -> Result<(), BlockBackendError> {
+        loop {
+            if let Err(err) = crate::inode_wr::write_raw(self, &raw) {
+                // 失败时保留当前最新快照，仅释放 owner，供后续
+                // write 协助或 sync 重试。
+                let mut state = self.inode_writeback.lock();
+                if let Some(pending) = state.pending.get_mut(&ino) {
+                    pending.in_flight = false;
                 }
                 return Err(err);
             }
+
+            let mut state = self.inode_writeback.lock();
+            let Some(pending) = state.pending.get(&ino) else {
+                return Ok(());
+            };
+            if pending.version == version {
+                state.pending.remove(&ino);
+                return Ok(());
+            }
+
+            // 写回期间出现了更新快照：当前 owner 保持 in_flight，
+            // 在锁外继续写最新版本。
+            raw = pending.raw.clone();
+            version = pending.version;
         }
-        Ok(())
     }
 
-    #[inline]
-    pub(crate) fn io_epoch(&self) -> u64 {
-        self.block_cache_epoch.load(Ordering::Acquire)
+    /// 等待或协助将指定 inode 的最新 pending 快照发布到 block cache。
+    pub(crate) fn flush_inode_write(&self, ino: u32) -> Result<(), BlockBackendError> {
+        loop {
+            let claim = self.inode_writeback.lock().claim(ino);
+            match claim {
+                InodeWritebackClaim::Clean => return Ok(()),
+                InodeWritebackClaim::Busy => Self::wait_for_writeback_progress(),
+                InodeWritebackClaim::Owner { raw, version } => {
+                    return self.drain_inode_writeback(ino, raw, version);
+                }
+            }
+        }
+    }
+
+    fn flush_pending_inode_writes(&self) -> Result<(), BlockBackendError> {
+        loop {
+            let ino = self.inode_writeback.lock().pending.keys().next().copied();
+            let Some(ino) = ino else {
+                return Ok(());
+            };
+            self.flush_inode_write(ino)?;
+        }
+    }
+
+    pub(crate) fn sync_all(&self) -> Result<(), BlockBackendError> {
+        loop {
+            self.flush_pending_inode_writes()?;
+            let staged_seq = self.inode_writeback.lock().seq;
+            self.flush_alloc_metadata()?;
+            let state = self.inode_writeback.lock();
+            if state.pending.is_empty() && state.seq == staged_seq {
+                return Ok(());
+            }
+            // block cache 写回期间若又发布了 inode 快照，重扫直到
+            // pending 和版本化块缓存在同一轮中都稳定。
+        }
     }
 
     /// 定位一个 inode 号所在的块号与块内字节偏移。
@@ -1236,7 +1979,18 @@ impl FsDriver for ExtFsDriver {
         mount_impl(backend)
     }
 
-    fn kill_sb(&self, _sb: Arc<VfsSuperblock>) {}
+    fn kill_sb(&self, sb: Arc<VfsSuperblock>) {
+        let Some(ops) = sb.ops.as_any().downcast_ref::<ExtFsSuperblockOps>() else {
+            return;
+        };
+        let state = Arc::clone(&ops.state);
+        // 先转入只读阻止新写,再全量回写,最后写回 VALID_FS 标记干净卸载。
+        state
+            .read_only
+            .store(true, core::sync::atomic::Ordering::Release);
+        let _ = state.sync_all();
+        let _ = crate::alloc_mod::mark_clean_unmount(&state);
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -1254,6 +2008,9 @@ impl SuperblockOps for ExtFsSuperblockOps {
     fn write_inode(&self, _inode: &Arc<Inode>) -> VfsResult<()> {
         Ok(())
     }
+    fn can_evict_positive_dentry(&self) -> bool {
+        true
+    }
     fn statfs(&self, sb: &Arc<VfsSuperblock>) -> VfsResult<FsStat> {
         let s = &self.state.ext_sb;
         let (free_blocks, avail_blocks, free_inodes) = self.state.statfs_counts();
@@ -1270,11 +2027,23 @@ impl SuperblockOps for ExtFsSuperblockOps {
         })
     }
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
-        self.state.flush_dirty_inodes().map_err(map_err)?;
-        self.state.flush_alloc_metadata().map_err(map_err)
+        self.state.sync_all().map_err(map_err)
     }
-    fn remount(&self, _sb: &Arc<VfsSuperblock>, _flags: MountFlags) -> VfsResult<()> {
-        // 只读驱动,remount 忽略写标志
+    fn remount(&self, _sb: &Arc<VfsSuperblock>, flags: MountFlags) -> VfsResult<()> {
+        use core::sync::atomic::Ordering;
+        if flags.has(MountFlags::RDONLY) {
+            // rw → ro:全量回写后标记干净卸载(与 Linux 行为一致)。
+            self.state.sync_all().map_err(map_err)?;
+            self.state.read_only.store(true, Ordering::Release);
+            crate::alloc_mod::mark_clean_unmount(&self.state).map_err(map_err)?;
+        } else {
+            if self.state.ext_sb.force_read_only {
+                // BIGALLOC/READONLY/SHARED_BLOCKS 等语义位不允许读写。
+                return Err(VfsError::ReadOnlyFilesystem);
+            }
+            self.state.read_only.store(false, Ordering::Release);
+            crate::alloc_mod::mark_mounted(&self.state, false).map_err(map_err)?;
+        }
         Ok(())
     }
     fn as_any(&self) -> &dyn Any {
@@ -1282,36 +2051,47 @@ impl SuperblockOps for ExtFsSuperblockOps {
     }
 }
 
-fn discard_orphan_file(state: &Arc<FsState>) -> Result<(), BlockBackendError> {
-    let ino = state.ext_sb.orphan_file_inum;
-    if ino == 0 || ino > state.ext_sb.inodes_count {
+/// MMP(多挂载保护)挂载时检查。
+///
+/// 与 Linux `ext4_multi_mount_protect` 的入口语义对齐,但不做运行时心跳
+/// (extfs 没有周期性写线程):仅接受 `EXT4_MMP_SEQ_CLEAN`(干净卸载)的
+/// MMP 块;`FSCK`(正被 fsck)或其它序列号一律拒绝,避免双挂载。
+fn mmp_check(backend: &dyn BlockBackend, sb: &ExtSb) -> Result<(), BlockBackendError> {
+    use crate::layout::*;
+
+    if sb.feature_incompat & INCOMPAT_MMP == 0 {
         return Ok(());
     }
-
-    let mut raw = crate::inode_wr::read_raw(state, ino)?;
-    let mut i_block = [0u8; 60];
-    i_block.copy_from_slice(raw.i_block());
-
-    // 当前内核没有 ext4 orphan_file 维护逻辑。若直接只清 superblock feature,
-    // 原 orphan file inode 会变成宿主 fsck 眼中的 unattached inode；因此挂载时
-    // 主动丢弃它占用的数据块和 inode 位图，再把 superblock 指针清零。
-    if raw.flags() & crate::layout::EXT4_EXTENTS_FL != 0 {
-        crate::extent_wr::free_tree(state, &i_block)?;
-    } else {
-        crate::map_wr::free_all_blocks(state, &mut i_block)?;
+    let mmp_block = sb.mmp_block;
+    if mmp_block == 0 || mmp_block >= sb.blocks_count {
+        return Err(BlockBackendError::OutOfRange);
     }
-
-    raw.bytes.fill(0);
-    // extfs 库层无法直接访问内核 realtime；写合法 epoch 秒即可避免
-    // e2fsck 把过小 dtime 误判为损坏 orphan 链。
-    raw.set_dtime(1_700_000_000);
-    crate::inode_wr::write_raw(state, &raw)?;
-    crate::alloc_mod::free_inode(state, ino, false)?;
-    Ok(())
+    let mut buf = vec![0u8; sb.block_size as usize];
+    bgd::read_blocks(backend, sb, mmp_block, 1, &mut buf)?;
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != EXT4_MMP_MAGIC {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    if sb.metadata_csum {
+        // ext4_mmp_csum:crc32c(csum_seed, mmp[..offsetof(mmp_checksum)])
+        let provided = u32::from_le_bytes([buf[1020], buf[1021], buf[1022], buf[1023]]);
+        let calculated = crc::update(sb.csum_seed, &buf[..1020]);
+        if provided != calculated {
+            return Err(BlockBackendError::OutOfRange);
+        }
+    }
+    let seq = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if seq == EXT4_MMP_SEQ_CLEAN {
+        return Ok(());
+    }
+    log::error!("[extfs] MMP: 序列号 {seq:#x} 非 CLEAN,可能正被 fsck 或其它节点挂载,拒绝挂载");
+    Err(BlockBackendError::Io)
 }
 
 fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     let ext_sb = sb::load(backend.as_ref()).map_err(map_err)?;
+    // MMP 检查:只读操作,先于一切写路径。
+    mmp_check(backend.as_ref(), &ext_sb).map_err(map_err)?;
     let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(map_err)?;
     let group_counts = group_desc
         .iter()
@@ -1325,27 +2105,55 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     let free_blocks = ext_sb.free_blocks_count;
     let free_inodes = ext_sb.free_inodes_count;
     let block_size = ext_sb.block_size;
+    let force_ro = ext_sb.force_read_only;
+    let needs_recovery = ext_sb.feature_incompat & crate::layout::INCOMPAT_RECOVER != 0;
     let state = Arc::new(FsState {
         backend: Arc::clone(&backend),
         ext_sb,
         group_desc: Spinlock::new(group_desc),
         group_counts: Spinlock::new(group_counts),
         block_cache: Spinlock::new(BlockCache::new(block_size)),
-        block_cache_epoch: core::sync::atomic::AtomicU64::new(0),
         sb_free_blocks: core::sync::atomic::AtomicU64::new(free_blocks),
         sb_free_inodes: core::sync::atomic::AtomicU32::new(free_inodes),
         block_alloc_hint: core::sync::atomic::AtomicU64::new(0),
         inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
         alloc_group_dirty: Spinlock::new(vec![0u8; group_count]),
         alloc_sb_dirty: AtomicBool::new(false),
-        dirty_inodes: Spinlock::new(Vec::new()),
-        read_only: core::sync::atomic::AtomicBool::new(false),
+        inode_writeback: Spinlock::new(DirtyInodeState::new()),
+        read_only: core::sync::atomic::AtomicBool::new(force_ro),
     });
 
-    // 当前驱动不维护 ext4 orphan_file。可写挂载后立即规范化 superblock，
-    // 同时清理旧镜像可能残留的 feature 位、s_last_orphan 和 s_orphan_file_inum。
-    discard_orphan_file(&state).map_err(map_err)?;
-    crate::alloc_mod::write_superblock(&state).map_err(map_err)?;
+    // 日志恢复(NEEDS_RECOVERY):回放已提交事务 + fast commit 区域,
+    // 复位日志头后清除主超级块的 RECOVER 位。
+    if needs_recovery {
+        if state.is_read_only() {
+            log::error!("[extfs] 文件系统需要日志恢复,但特性强制只读挂载,拒绝");
+            return Err(VfsError::NotSupported);
+        }
+        crate::journal::recover(&state).map_err(map_err)?;
+        crate::alloc_mod::patch_superblock(&state, |sb| {
+            let incompat = u32::from_le_bytes([
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT],
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT + 1],
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT + 2],
+                sb[crate::layout::sb_off::FEATURE_INCOMPAT + 3],
+            ]) & !crate::layout::INCOMPAT_RECOVER;
+            sb[crate::layout::sb_off::FEATURE_INCOMPAT
+                ..crate::layout::sb_off::FEATURE_INCOMPAT + 4]
+                .copy_from_slice(&incompat.to_le_bytes());
+        })
+        .map_err(map_err)?;
+    }
+
+    // 孤儿 inode 清理(s_last_orphan 链表 + orphan file)。
+    if !state.is_read_only() {
+        crate::orphan::cleanup(&state).map_err(map_err)?;
+    }
+
+    // 挂载记账:清/置 VALID_FS、s_mnt_count+1、s_mtime。
+    crate::alloc_mod::mark_mounted(&state, state.is_read_only()).map_err(map_err)?;
+    // 恢复 + 孤儿清理 + 记账的结果先落盘,再开始对外服务。
+    state.sync_all().map_err(map_err)?;
 
     // 加载根 inode(2 号)
     let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(map_err)?;
@@ -1358,16 +2166,15 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     };
 
     let sb = VfsSuperblock::new(|weak_sb| {
-        let now = Timespec::ZERO;
         let meta = InodeMeta {
             size: root_meta_on_disk.size,
             nlink: root_meta_on_disk.nlink as u32,
             mode: FileMode::new((root_meta_on_disk.mode & 0o7777) as u16),
             uid: Uid(root_meta_on_disk.uid),
             gid: Gid(root_meta_on_disk.gid),
-            atime: now,
-            mtime: now,
-            ctime: now,
+            atime: root_meta_on_disk.atime,
+            mtime: root_meta_on_disk.mtime,
+            ctime: root_meta_on_disk.ctime,
             blocks: root_meta_on_disk.blocks_512,
         };
         let ops = ExtInodeOps::new(Arc::clone(&state), EXT4_ROOT_INO, root_raw.clone());
@@ -1421,12 +2228,22 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
+    use std::sync::{Condvar, Mutex as StdMutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     use crate::bgd::GroupDesc;
-    use crate::file::read_aligned_blocks;
-    use crate::layout::ExtKind;
+    use crate::file::{ExtRegFileOps, read_aligned_blocks};
+    use crate::inode::{ExtInodeOps, load_inode};
+    use crate::inode_wr::{RawInode, write_raw};
+    use crate::layout::{EXT4_EXTENTS_FL, ExtKind, S_IFREG};
     use crate::map_wr::{self, BlockAllocState};
     use crate::sb::Superblock;
+    use vfs::dentry::Dentry;
+    use vfs::file::FileOps;
+    use vfs::inode::{Inode, InodeId, InodeMeta};
+    use vfs::stat::{DevId, FileMode, FileType, FsId, Timespec};
+    use vfs::superblock::{InodeCache, Superblock as VfsSuperblock};
 
     struct CountingBackend {
         data: Spinlock<Vec<u8>>,
@@ -1510,8 +2327,205 @@ mod tests {
         }
     }
 
-    fn alloc_test_state(
-        backend: Arc<CountingBackend>,
+    struct BlockingBackend {
+        data: StdMutex<Vec<u8>>,
+        sector_size: u32,
+        block_size: u32,
+        gate_block: u64,
+        write_started: (StdMutex<bool>, Condvar),
+        release_write: (StdMutex<bool>, Condvar),
+        read_gate_block: StdMutex<Option<u64>>,
+        read_started: (StdMutex<bool>, Condvar),
+        release_read: (StdMutex<bool>, Condvar),
+        reads: StdMutex<Vec<(u64, u32)>>,
+        writes: StdMutex<Vec<(u64, u32)>>,
+        fail_read_block: StdMutex<Option<u64>>,
+        fail_block: StdMutex<Option<u64>>,
+    }
+
+    impl BlockingBackend {
+        fn new(block_count: usize, block_size: u32, gate_block: u64) -> Self {
+            let sector_size = 512;
+            Self {
+                data: StdMutex::new(vec![0; block_count * block_size as usize]),
+                sector_size,
+                block_size,
+                gate_block,
+                write_started: (StdMutex::new(false), Condvar::new()),
+                release_write: (StdMutex::new(false), Condvar::new()),
+                read_gate_block: StdMutex::new(None),
+                read_started: (StdMutex::new(false), Condvar::new()),
+                release_read: (StdMutex::new(false), Condvar::new()),
+                reads: StdMutex::new(Vec::new()),
+                writes: StdMutex::new(Vec::new()),
+                fail_read_block: StdMutex::new(None),
+                fail_block: StdMutex::new(None),
+            }
+        }
+
+        fn seed_block(&self, block: u64, data: &[u8]) {
+            let start = block as usize * self.block_size as usize;
+            self.data.lock().unwrap()[start..start + data.len()].copy_from_slice(data);
+        }
+
+        fn block_data(&self, block: u64) -> Vec<u8> {
+            let start = block as usize * self.block_size as usize;
+            let end = start + self.block_size as usize;
+            self.data.lock().unwrap()[start..end].to_vec()
+        }
+
+        fn wait_for_gate(&self) {
+            let (lock, cv) = &self.write_started;
+            let mut started = lock.lock().unwrap();
+            while !*started {
+                started = cv.wait(started).unwrap();
+            }
+        }
+
+        fn release_gate(&self) {
+            let (lock, cv) = &self.release_write;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+
+        fn gate_read(&self, block: u64) {
+            *self.read_gate_block.lock().unwrap() = Some(block);
+            *self.read_started.0.lock().unwrap() = false;
+            *self.release_read.0.lock().unwrap() = false;
+        }
+
+        fn wait_for_read_gate(&self) {
+            let (lock, cv) = &self.read_started;
+            let mut started = lock.lock().unwrap();
+            while !*started {
+                started = cv.wait(started).unwrap();
+            }
+        }
+
+        fn release_read_gate(&self) {
+            let (lock, cv) = &self.release_read;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+
+        fn reads(&self) -> Vec<(u64, u32)> {
+            self.reads.lock().unwrap().clone()
+        }
+
+        fn writes(&self) -> Vec<(u64, u32)> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn fail_block(&self, block: u64) {
+            *self.fail_block.lock().unwrap() = Some(block);
+        }
+
+        fn fail_read_block(&self, block: u64) {
+            *self.fail_read_block.lock().unwrap() = Some(block);
+        }
+
+        fn clear_read_failure(&self) {
+            *self.fail_read_block.lock().unwrap() = None;
+        }
+
+        fn clear_failure(&self) {
+            *self.fail_block.lock().unwrap() = None;
+        }
+    }
+
+    impl BlockBackend for BlockingBackend {
+        fn sector_size(&self) -> u32 {
+            self.sector_size
+        }
+
+        fn sector_count(&self) -> u64 {
+            (self.data.lock().unwrap().len() / self.sector_size as usize) as u64
+        }
+
+        fn read_sectors(
+            &self,
+            lba: u64,
+            count: u32,
+            buf: &mut [u8],
+        ) -> Result<(), BlockBackendError> {
+            let len = self.sector_size as usize * count as usize;
+            let start = lba as usize * self.sector_size as usize;
+            let end = start
+                .checked_add(len)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            if buf.len() < len || end > self.data.lock().unwrap().len() {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let first_block = start / self.block_size as usize;
+            if self
+                .fail_read_block
+                .lock()
+                .unwrap()
+                .is_some_and(|block| block == first_block as u64)
+            {
+                return Err(BlockBackendError::Io);
+            }
+            {
+                let data = self.data.lock().unwrap();
+                buf[..len].copy_from_slice(&data[start..end]);
+            }
+            self.reads
+                .lock()
+                .unwrap()
+                .push((first_block as u64, len as u32 / self.block_size));
+            if self.read_gate_block.lock().unwrap().as_ref() == Some(&(first_block as u64)) {
+                let (lock, cv) = &self.read_started;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                let (release_lock, release_cv) = &self.release_read;
+                let mut released = release_lock.lock().unwrap();
+                while !*released {
+                    released = release_cv.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        }
+
+        fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlockBackendError> {
+            let len = self.sector_size as usize * count as usize;
+            let start = lba as usize * self.sector_size as usize;
+            let end = start
+                .checked_add(len)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            if buf.len() < len || end > self.data.lock().unwrap().len() {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let first_block = start / self.block_size as usize;
+            if first_block as u64 == self.gate_block {
+                let (lock, cv) = &self.write_started;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                let (release_lock, release_cv) = &self.release_write;
+                let mut released = release_lock.lock().unwrap();
+                while !*released {
+                    released = release_cv.wait(released).unwrap();
+                }
+            }
+            if self
+                .fail_block
+                .lock()
+                .unwrap()
+                .is_some_and(|b| b == first_block as u64)
+            {
+                return Err(BlockBackendError::Io);
+            }
+            let mut data = self.data.lock().unwrap();
+            data[start..end].copy_from_slice(&buf[..len]);
+            self.writes
+                .lock()
+                .unwrap()
+                .push((first_block as u64, len as u32 / self.block_size));
+            Ok(())
+        }
+    }
+
+    fn alloc_test_state<B: BlockBackend + 'static>(
+        backend: Arc<B>,
         block_size: u32,
         blocks_count: u64,
     ) -> FsState {
@@ -1523,12 +2537,14 @@ mod tests {
             blocks_count,
             first_data_block: 0,
             block_size,
+            log_cluster_size: 0,
             blocks_per_group,
             inodes_per_group: 16,
             inode_size: 128,
             desc_size: 32,
             first_ino: 11,
             s_magic: 0xef53,
+            state: 0,
             feature_compat: 0,
             feature_incompat: 0,
             feature_ro_compat: 0,
@@ -1540,6 +2556,13 @@ mod tests {
             reserved_blocks_count: 4,
             free_inodes_count: 16,
             orphan_file_inum: 0,
+            journal_inum: 0,
+            journal_dev: 0,
+            last_orphan: 0,
+            encoding: 0,
+            mmp_block: 0,
+            mmp_update_interval: 0,
+            force_read_only: false,
             groups_count: 1,
         };
         let group_desc = vec![GroupDesc {
@@ -1550,6 +2573,7 @@ mod tests {
             free_blocks_count: free_blocks.min(u32::MAX as u64) as u32,
             free_inodes_count: 16,
             used_dirs_count: 1,
+            itable_unused_count: 0,
         }];
         let group_counts = vec![GroupCounts {
             free_blocks: free_blocks.min(u32::MAX as u64) as u32,
@@ -1563,16 +2587,1021 @@ mod tests {
             group_desc: Spinlock::new(group_desc),
             group_counts: Spinlock::new(group_counts),
             block_cache: Spinlock::new(BlockCache::new(block_size)),
-            block_cache_epoch: AtomicU64::new(0),
             sb_free_blocks: AtomicU64::new(free_blocks),
             sb_free_inodes: core::sync::atomic::AtomicU32::new(16),
             block_alloc_hint: AtomicU64::new(0),
             inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
             alloc_group_dirty: Spinlock::new(vec![0; 1]),
             alloc_sb_dirty: AtomicBool::new(false),
-            dirty_inodes: Spinlock::new(Vec::new()),
+            inode_writeback: Spinlock::new(DirtyInodeState::new()),
             read_only: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn pending_writeback_completion_is_versioned() {
+        const BLOCK_SIZE: usize = 64;
+        let mut cache = BlockCache::with_capacity(BLOCK_SIZE as u32, 1);
+        let first = vec![0x11; BLOCK_SIZE];
+        let second = vec![0x22; BLOCK_SIZE];
+        let third = vec![0x33; BLOCK_SIZE];
+
+        assert!(cache.insert_wb(10, &first).is_none());
+        let old = cache.insert_wb(11, &second).expect("evict first");
+        assert_eq!(old.block, 10);
+        let newer = cache.insert_wb(10, &third).expect("evict second");
+        assert_eq!(newer.block, 11);
+        // block 10 已有 owner；新版本只更新 pending，不得启动第二个并行 I/O。
+        assert!(cache.insert_wb(12, &vec![0x44; BLOCK_SIZE]).is_none());
+
+        let mut out = vec![0; BLOCK_SIZE];
+        assert!(cache.read(10, &mut out));
+        assert_eq!(out, third);
+
+        // 旧版本完成不能移除同一块更新的 pending 快照。
+        let latest = cache
+            .complete_pending(old.block, old.version)
+            .expect("old owner must continue with latest version");
+        assert!(cache.read(10, &mut out));
+        assert_eq!(out, third);
+
+        assert!(
+            cache
+                .complete_pending(latest.block, latest.version)
+                .is_none()
+        );
+        assert!(!cache.read(10, &mut out));
+    }
+
+    #[test]
+    fn coherence_stamp_wrap_changes_epoch_and_prevents_zero_aba() {
+        let mut cache = BlockCache::with_capacity(64, 1);
+        cache.coherence_epoch = 7;
+        cache.coherence_seq = u64::MAX - 1;
+        let before = cache.coherence_stamp_in_range(7, 1);
+        assert_eq!(before, (7, 0));
+
+        cache.mark_coherence_change(7);
+        assert_eq!(cache.coherence_stamp_in_range(7, 1), (7, u64::MAX));
+        // 无关块的下一个事件触发回绕清表，目标块的 max_seq 再次为 0。
+        cache.mark_coherence_change(9);
+
+        assert_eq!(cache.coherence_epoch, 8);
+        assert_eq!(cache.coherence_seq, 1);
+        assert_eq!(cache.coherence_stamp_in_range(7, 1), (8, 0));
+        assert_ne!(cache.coherence_stamp_in_range(7, 1), before);
+        assert_eq!(cache.coherence_stamp_in_range(9, 1), (8, 1));
+        assert_eq!(cache.coherence_stamps.len(), 1);
+    }
+
+    #[test]
+    fn stale_partial_base_retries_after_newer_version_disappears() {
+        const BLOCK_SIZE: usize = 64;
+        const INODE_TABLE_BLOCK: u64 = 3;
+
+        let mut cache = BlockCache::with_capacity(BLOCK_SIZE as u32, 1);
+        assert!(cache.try_insert_clean(9, &vec![0x90; BLOCK_SIZE]));
+
+        // 模拟 backend 返回旧 inode-table D0，但 cache 已满，
+        // read 路径无法把 clean 快照插入。
+        let read_stamp = cache.coherence_stamp_in_range(INODE_TABLE_BLOCK, 1);
+        let mut stale_base = vec![0u8; BLOCK_SIZE];
+        assert!(!cache.try_insert_clean(INODE_TABLE_BLOCK, &stale_base));
+
+        // 另一 inode 的 partial write 发布 D1，随后被驱逐并完成写盘，
+        // 因而 merge 时 index/pending 都已不可见，只有 stamp 能证明 D0 过期。
+        let mut newer = vec![0u8; BLOCK_SIZE];
+        newer[32..36].copy_from_slice(&[2, 2, 2, 2]);
+        assert!(cache.insert_wb(INODE_TABLE_BLOCK, &newer).is_none());
+        let written = cache
+            .insert_wb(10, &vec![0xa0; BLOCK_SIZE])
+            .expect("evict newer inode-table version");
+        assert_eq!(written.block, INODE_TABLE_BLOCK);
+        assert!(
+            cache
+                .complete_pending(written.block, written.version)
+                .is_none()
+        );
+
+        assert!(matches!(
+            cache.merge_partial_after_read(
+                INODE_TABLE_BLOCK,
+                0,
+                &[1, 1, 1, 1],
+                &mut stale_base,
+                read_stamp,
+            ),
+            PartialWriteOutcome::Retry
+        ));
+
+        // 重读后的 base 已包含 D1；再合并本 inode 的字节时，
+        // 两个 inode 区域都必须保留。
+        let retry_stamp = cache.coherence_stamp_in_range(INODE_TABLE_BLOCK, 1);
+        let mut retry_base = newer;
+        assert!(matches!(
+            cache.merge_partial_after_read(
+                INODE_TABLE_BLOCK,
+                0,
+                &[1, 1, 1, 1],
+                &mut retry_base,
+                retry_stamp,
+            ),
+            PartialWriteOutcome::Done(_)
+        ));
+        let mut merged = vec![0u8; BLOCK_SIZE];
+        assert!(cache.read(INODE_TABLE_BLOCK, &mut merged));
+        assert_eq!(&merged[0..4], &[1, 1, 1, 1]);
+        assert_eq!(&merged[32..36], &[2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn wrapped_snapshot_replaces_pending_without_numeric_comparison() {
+        const BLOCK_SIZE: usize = 64;
+        let mut cache = BlockCache::with_capacity(BLOCK_SIZE as u32, 1);
+        cache.pending_writebacks.insert(
+            10,
+            PendingBlockWriteback {
+                data: vec![0x11; BLOCK_SIZE],
+                version: u64::MAX,
+                in_flight: true,
+            },
+        );
+        cache.write_seq = u64::MAX;
+        let wrapped_version = cache.next_version();
+        assert_eq!(wrapped_version, 1);
+
+        assert!(
+            cache
+                .remember_pending(DirtyBlockSnapshot {
+                    block: 10,
+                    data: vec![0x82; BLOCK_SIZE],
+                    version: wrapped_version,
+                })
+                .is_none()
+        );
+        let pending = &cache.pending_writebacks[&10];
+        assert_eq!(pending.version, 1);
+        assert_eq!(pending.data, vec![0x82; BLOCK_SIZE]);
+    }
+
+    #[test]
+    fn pending_writeback_is_visible_during_blocked_eviction() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(16, BLOCK_SIZE, 0));
+        let old = vec![0u8; BLOCK_SIZE as usize];
+        let fresh = vec![0xa5u8; BLOCK_SIZE as usize];
+        backend.seed_block(0, &old);
+
+        let base = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 16);
+        let state = Arc::new(FsState {
+            block_cache: Spinlock::new(BlockCache::with_capacity(BLOCK_SIZE, 1)),
+            ..base
+        });
+        state.write_block(0, &fresh).expect("seed dirty victim");
+
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            let data = vec![0x5a; BLOCK_SIZE as usize];
+            writer_state.write_block(1, &data)
+        });
+        backend.wait_for_gate();
+
+        let mut observed = vec![0u8; BLOCK_SIZE as usize];
+        state
+            .read_block(0, &mut observed)
+            .expect("read pending victim");
+        assert_eq!(observed, fresh);
+
+        backend.release_gate();
+        writer.join().unwrap().expect("flush evicted victim");
+        let mut persisted = vec![0u8; BLOCK_SIZE as usize];
+        state
+            .read_block(0, &mut persisted)
+            .expect("read persisted victim");
+        assert_eq!(persisted, fresh);
+    }
+
+    #[test]
+    fn pending_writeback_serializes_newer_version_of_same_block() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(16, BLOCK_SIZE, 0));
+        let first = vec![0x31u8; BLOCK_SIZE as usize];
+        let latest = vec![0x72u8; BLOCK_SIZE as usize];
+        let base = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 16);
+        let state = Arc::new(FsState {
+            block_cache: Spinlock::new(BlockCache::with_capacity(BLOCK_SIZE, 1)),
+            ..base
+        });
+
+        state.write_block(0, &first).expect("seed first version");
+        let writer_state = Arc::clone(&state);
+        let first_owner =
+            thread::spawn(move || writer_state.write_block(1, &vec![0x11; BLOCK_SIZE as usize]));
+        backend.wait_for_gate();
+
+        // 在 v1 写盘被阻塞时重新装入 block 0，并再次驱逐为 v2。v2 只能排队给
+        // 原 owner，不能启动一个可能先完成的第二 I/O。
+        state
+            .write_block(0, &latest)
+            .expect("publish latest version");
+        state
+            .write_block(2, &vec![0x22; BLOCK_SIZE as usize])
+            .expect("evict latest version");
+
+        backend.release_gate();
+        first_owner.join().unwrap().expect("drain both versions");
+        assert_eq!(backend.block_data(0), latest);
+        assert!(!state.block_cache.lock().has_pending());
+    }
+
+    #[test]
+    fn failed_pending_writeback_remains_readable() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(10_000, BLOCK_SIZE, u64::MAX));
+        backend.fail_block(0);
+        let old = vec![0u8; BLOCK_SIZE as usize];
+        let fresh = vec![0x7cu8; BLOCK_SIZE as usize];
+        backend.seed_block(0, &old);
+
+        let state = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 10_000);
+        let mut cache = BlockCache::with_capacity(BLOCK_SIZE, 1);
+        assert!(cache.insert_wb(0, &fresh).is_none());
+        let evicted = cache
+            .insert_wb(1, &vec![0x44; BLOCK_SIZE as usize])
+            .expect("evict failed victim");
+        let state = Arc::new(FsState {
+            block_cache: Spinlock::new(cache),
+            ..state
+        });
+
+        assert!(state.flush_one_evicted(&evicted).is_err());
+        let mut observed = vec![0u8; BLOCK_SIZE as usize];
+        state
+            .read_block(0, &mut observed)
+            .expect("read failed pending victim");
+        assert_eq!(observed, fresh);
+
+        backend.clear_failure();
+        state
+            .flush_dirty_blocks()
+            .expect("sync retries failed pending victim");
+        assert!(!state.block_cache.lock().has_pending());
+        let mut persisted = vec![0u8; BLOCK_SIZE as usize];
+        state
+            .read_block(0, &mut persisted)
+            .expect("read retried victim");
+        assert_eq!(persisted, fresh);
+    }
+
+    #[test]
+    fn mixed_range_read_overlays_pending_writeback() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(CountingBackend::new(64, 512));
+        let fresh = vec![0x6du8; BLOCK_SIZE as usize];
+        let state = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32);
+        let mut cache = BlockCache::with_capacity(BLOCK_SIZE, 1);
+        assert!(cache.insert_wb(0, &fresh).is_none());
+        assert!(
+            cache
+                .insert_wb(2, &vec![0x22; BLOCK_SIZE as usize])
+                .is_some()
+        );
+        let state = FsState {
+            block_cache: Spinlock::new(cache),
+            ..state
+        };
+
+        let mut observed = vec![0u8; 2 * BLOCK_SIZE as usize];
+        state
+            .read_blocks(0, 2, &mut observed)
+            .expect("read mixed cached range");
+        assert_eq!(&observed[..BLOCK_SIZE as usize], fresh.as_slice());
+        assert_eq!(
+            &observed[BLOCK_SIZE as usize..],
+            vec![0; BLOCK_SIZE as usize]
+        );
+    }
+
+    #[test]
+    fn vectored_data_read_skips_clean_cache_and_overlays_dirty_data() {
+        const BLOCK_SIZE: usize = 1024;
+        let backend = Arc::new(CountingBackend::new(64, 512));
+        backend.seed_block(8, BLOCK_SIZE, &vec![0x18; BLOCK_SIZE]);
+        backend.seed_block(9, BLOCK_SIZE, &vec![0x19; BLOCK_SIZE]);
+        let state = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE as u32, 32);
+        state
+            .write_data_block(9, &vec![0x99; BLOCK_SIZE])
+            .expect("publish newer cached block");
+
+        let mut first = vec![0u8; BLOCK_SIZE];
+        let mut second = vec![0u8; BLOCK_SIZE];
+        state
+            .read_data_blocks_vectored(8, 2, &mut [&mut first, &mut second])
+            .expect("scatter read");
+
+        assert_eq!(first, vec![0x18; BLOCK_SIZE]);
+        assert_eq!(second, vec![0x99; BLOCK_SIZE]);
+        {
+            let cache = state.block_cache.lock();
+            assert!(
+                !cache.contains(8),
+                "backend clean data must not enter cache"
+            );
+            assert!(cache.contains(9), "newer dirty data must remain visible");
+        }
+
+        let mut again_first = vec![0u8; BLOCK_SIZE];
+        let mut again_second = vec![0u8; BLOCK_SIZE];
+        state
+            .read_data_blocks_vectored(8, 2, &mut [&mut again_first, &mut again_second])
+            .expect("second scatter read");
+        assert_eq!(again_first, vec![0x18; BLOCK_SIZE]);
+        assert_eq!(again_second, vec![0x99; BLOCK_SIZE]);
+        assert_eq!(backend.reads(), vec![(16, 2), (18, 2), (16, 2), (18, 2)]);
+    }
+
+    #[test]
+    fn failed_inode_writeback_is_retained_for_sync_retry() {
+        const INO: u32 = 1;
+        const BLOCK_SIZE: u32 = 1024;
+        const INODE_TABLE_BLOCK: u64 = 3;
+
+        let backend = Arc::new(BlockingBackend::new(64, BLOCK_SIZE, u64::MAX));
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 64));
+        let mut raw = RawInode::new(INO, vec![0u8; 128]);
+        raw.set_mode(S_IFREG | 0o644);
+        raw.set_nlink(1);
+        raw.set_size(123);
+
+        let version = state.stage_inode_write(&raw);
+        backend.fail_read_block(INODE_TABLE_BLOCK);
+        assert_eq!(state.flush_inode_write(INO), Err(BlockBackendError::Io));
+        {
+            let writeback = state.inode_writeback.lock();
+            let pending = writeback
+                .pending
+                .get(&INO)
+                .expect("failed inode snapshot must remain pending");
+            assert_eq!(pending.version, version);
+            assert_eq!(pending.raw.size(), 123);
+            assert!(!pending.in_flight);
+        }
+
+        backend.clear_read_failure();
+        state.sync_all().expect("sync retries pending inode");
+        assert!(state.inode_writeback.lock().pending.is_empty());
+        state
+            .discard_cached_blocks(INODE_TABLE_BLOCK, 1)
+            .expect("drop clean inode-table cache");
+        let (reloaded, _) = load_inode(&state, INO).expect("reload persisted inode");
+        assert_eq!(reloaded.size, 123);
+    }
+
+    #[test]
+    fn newer_inode_snapshot_survives_blocked_old_owner() {
+        const INO: u32 = 1;
+        const BLOCK_SIZE: u32 = 1024;
+        const INODE_TABLE_BLOCK: u64 = 3;
+
+        let backend = Arc::new(BlockingBackend::new(64, BLOCK_SIZE, u64::MAX));
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 64));
+        backend.gate_read(INODE_TABLE_BLOCK);
+
+        let mut old = RawInode::new(INO, vec![0u8; 128]);
+        old.set_mode(S_IFREG | 0o644);
+        old.set_nlink(1);
+        old.set_size(11);
+        let old_version = state.stage_inode_write(&old);
+
+        let owner_state = Arc::clone(&state);
+        let owner = thread::spawn(move || owner_state.flush_inode_write(INO));
+        backend.wait_for_read_gate();
+
+        let mut latest = old.clone();
+        latest.set_nlink(2);
+        latest.set_size(29);
+        let publisher_state = Arc::clone(&state);
+        let publisher = thread::spawn(move || publisher_state.publish_inode_write(&latest));
+
+        let mut latest_version = None;
+        for _ in 0..10_000 {
+            let writeback = state.inode_writeback.lock();
+            if let Some(pending) = writeback.pending.get(&INO) {
+                if pending.version != old_version
+                    && pending.raw.size() == 29
+                    && pending.raw.nlink() == 2
+                {
+                    assert!(pending.in_flight);
+                    latest_version = Some(pending.version);
+                    break;
+                }
+            }
+            drop(writeback);
+            thread::yield_now();
+        }
+        if latest_version.is_none() {
+            backend.release_read_gate();
+            let _ = owner.join();
+            let _ = publisher.join();
+            panic!("direct-style publisher did not replace the old snapshot");
+        }
+
+        backend.release_read_gate();
+        owner
+            .join()
+            .unwrap()
+            .expect("old owner drains latest version");
+        publisher
+            .join()
+            .unwrap()
+            .expect("publisher waits for latest version");
+        assert!(state.inode_writeback.lock().pending.is_empty());
+        let (cached, _) = load_inode(&state, INO).expect("reload latest cached inode");
+        assert_eq!(cached.size, 29);
+        assert_eq!(cached.nlink, 2);
+
+        state.flush_dirty_blocks().expect("persist latest inode");
+        state
+            .discard_cached_blocks(INODE_TABLE_BLOCK, 1)
+            .expect("drop clean inode-table cache");
+        let (persisted, _) = load_inode(&state, INO).expect("reload latest persisted inode");
+        assert_eq!(persisted.size, 29);
+        assert_eq!(persisted.nlink, 2);
+    }
+
+    #[test]
+    fn file_write_publishes_inode_metadata_before_sync() {
+        const INO: u32 = 1;
+        const BLOCK_SIZE: usize = 1024;
+
+        let backend = Arc::new(CountingBackend::new(128, 512));
+        let mut bitmap = vec![0u8; BLOCK_SIZE];
+        // 块 0..=3 分别留给引导区/位图/inode table，首个数据块为 4。
+        bitmap[0] = 0b0000_1111;
+        backend.seed_block(1, BLOCK_SIZE, &bitmap);
+        let state = Arc::new(alloc_test_state(
+            Arc::clone(&backend),
+            BLOCK_SIZE as u32,
+            64,
+        ));
+
+        let mut raw = RawInode::new(INO, vec![0u8; 128]);
+        raw.set_mode(S_IFREG | 0o644);
+        raw.set_nlink(1);
+        write_raw(&state, &raw).expect("seed inode");
+        state.flush_dirty_blocks().expect("persist seed inode");
+
+        let inode_ops = ExtInodeOps::new(Arc::clone(&state), INO, raw.bytes.clone());
+        let open_raw = Arc::clone(&inode_ops.raw);
+        let fs_id = FsId::new(99);
+        let state_for_sb = Arc::clone(&state);
+        let sb = VfsSuperblock::new(move |weak_sb| {
+            let inode = Inode::new(
+                InodeId {
+                    fs_id,
+                    ino: INO as u64,
+                },
+                FileType::Regular,
+                DevId::new(0, 0),
+                BLOCK_SIZE as u32,
+                Some(DevId::new(8, 1)),
+                InodeMeta {
+                    size: 0,
+                    nlink: 1,
+                    mode: FileMode::new(0o644),
+                    uid: Uid(0),
+                    gid: Gid(0),
+                    atime: Timespec::ZERO,
+                    mtime: Timespec::ZERO,
+                    ctime: Timespec::ZERO,
+                    blocks: 0,
+                },
+                Arc::new(inode_ops),
+                weak_sb.clone(),
+            );
+            let root_dentry = Dentry::new_positive("", None, Arc::clone(&inode));
+            VfsSuperblock {
+                fs_type: "ext2-test",
+                fs_id,
+                dev_id: Some(DevId::new(8, 1)),
+                block_size: BLOCK_SIZE as u32,
+                name_max: 255,
+                root_inode: inode,
+                root_dentry,
+                inode_cache: InodeCache::new(),
+                ops: Box::new(ExtFsSuperblockOps {
+                    state: Arc::clone(&state_for_sb),
+                }),
+                self_weak: weak_sb,
+            }
+        });
+        sb.insert_inode(Arc::clone(&sb.root_inode));
+
+        let mapping_generation = Arc::new(AtomicU64::new(0));
+        let file = ExtRegFileOps::new(
+            Arc::clone(&state),
+            Arc::clone(&sb),
+            INO,
+            Arc::clone(&open_raw),
+            Arc::clone(&mapping_generation),
+        );
+        assert_eq!(file.write_at(b"test", 0).expect("write file"), 4);
+        // 越过 direct 区域写入一个新块时，除了数据块还会新建一级间接块。
+        // `i_blocks` 必须同时反映这两个文件系统块（1024B 块即 4 sectors）。
+        assert_eq!(
+            file.write_at(b"x", (12 * BLOCK_SIZE) as u64)
+                .expect("write through indirect block"),
+            1
+        );
+
+        // 先把文件扩到另一个一级间接块槽位，再由第二个打开句柄缓存中间 hole。
+        // 随后第一个句柄在文件现有 size 内补洞：一级间接块号、flags 和 size
+        // 都不变化，只有 inode-local mapping generation 能让读句柄丢弃旧映射。
+        assert_eq!(
+            file.write_at(b"y", (20 * BLOCK_SIZE) as u64)
+                .expect("grow sparse indirect file"),
+            1
+        );
+        let reader = ExtRegFileOps::new(
+            Arc::clone(&state),
+            Arc::clone(&sb),
+            INO,
+            Arc::clone(&open_raw),
+            Arc::clone(&mapping_generation),
+        );
+        let mut hole = [0xffu8; 1];
+        assert_eq!(
+            reader
+                .read_at(&mut hole, (15 * BLOCK_SIZE) as u64)
+                .expect("cache indirect hole"),
+            1
+        );
+        assert_eq!(hole, [0]);
+        assert_eq!(reader.map_rebuilds(), 1);
+
+        // 其它 inode/元数据块写入不能再使本文件的映射缓存失效。
+        state
+            .write_block(50, &vec![0x5a; BLOCK_SIZE])
+            .expect("write unrelated filesystem block");
+        assert_eq!(
+            reader
+                .read_at(&mut hole, (15 * BLOCK_SIZE) as u64)
+                .expect("reuse mapping after unrelated write"),
+            1
+        );
+        assert_eq!(hole, [0]);
+        assert_eq!(reader.map_rebuilds(), 1);
+
+        assert_eq!(
+            file.write_at(b"z", (15 * BLOCK_SIZE) as u64)
+                .expect("fill cached indirect hole"),
+            1
+        );
+        assert_eq!(
+            reader
+                .read_at(&mut hole, (15 * BLOCK_SIZE) as u64)
+                .expect("read filled indirect hole"),
+            1
+        );
+        assert_eq!(&hole, b"z");
+        assert_eq!(reader.map_rebuilds(), 2);
+
+        let mut first_page = vec![0xffu8; 2 * BLOCK_SIZE];
+        let mut second_page = vec![0xffu8; 2 * BLOCK_SIZE];
+        reader
+            .read_pages_at(
+                (12 * BLOCK_SIZE) as u64,
+                &mut [&mut first_page, &mut second_page],
+                3 * BLOCK_SIZE + 1,
+            )
+            .expect("read mapped blocks, holes and partial tail");
+        assert_eq!(first_page[0], b'x');
+        assert!(first_page[1..].iter().all(|&byte| byte == 0));
+        assert!(second_page[..BLOCK_SIZE].iter().all(|&byte| byte == 0));
+        assert_eq!(second_page[BLOCK_SIZE], b'z');
+        assert!(second_page[BLOCK_SIZE + 1..].iter().all(|&byte| byte == 0));
+
+        // 模拟 dentry 未缓存/被驱逐：不调用 sync，直接从 inode table 重建。
+        // 新 size、块映射和数据必须已经对后续 lookup 可见。
+        sb.remove_inode(INO as u64);
+        drop(file);
+        let (reloaded_meta, reloaded_raw) = load_inode(&state, INO).expect("reload inode");
+        assert_eq!(reloaded_meta.size, 20 * BLOCK_SIZE as u64 + 1);
+        // 4 个数据块 + 1 个一级间接块，每个 1 KiB 块占 2 个 512B sector。
+        assert_eq!(reloaded_meta.blocks_512, 10);
+        assert_ne!(&reloaded_raw[0x28..0x2c], &[0u8; 4]);
+
+        let reloaded_file = ExtRegFileOps::new(
+            Arc::clone(&state),
+            Arc::clone(&sb),
+            INO,
+            Arc::new(Spinlock::new(RawInode::new(INO, reloaded_raw))),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut actual = [0u8; 4];
+        assert_eq!(
+            reloaded_file
+                .read_at(&mut actual, 0)
+                .expect("read reloaded file"),
+            4
+        );
+        assert_eq!(&actual, b"test");
+    }
+
+    #[test]
+    fn direct_write_waits_for_older_pending_victim() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, 4));
+        let base = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32);
+        let state = Arc::new(FsState {
+            block_cache: Spinlock::new(BlockCache::with_capacity(BLOCK_SIZE, 1)),
+            ..base
+        });
+        let old = vec![0x19; BLOCK_SIZE as usize];
+        let direct = vec![0x73; 4 * BLOCK_SIZE as usize];
+        state
+            .write_data_block(4, &old)
+            .expect("publish old dirty block");
+
+        let victim_state = Arc::clone(&state);
+        let victim = thread::spawn(move || {
+            victim_state.write_data_block(12, &vec![0x2a; BLOCK_SIZE as usize])
+        });
+        backend.wait_for_gate();
+
+        let direct_state = Arc::clone(&state);
+        let direct_data = direct.clone();
+        let writer = thread::spawn(move || direct_state.write_data_blocks(4, 4, &direct_data));
+        for _ in 0..100 {
+            thread::yield_now();
+        }
+        assert!(
+            !state.block_cache.lock().has_active_direct_in_range(4, 4),
+            "direct owner must not pass the in-flight old victim"
+        );
+
+        backend.release_gate();
+        victim.join().unwrap().expect("flush old victim");
+        writer.join().unwrap().expect("write direct range");
+        assert_eq!(backend.writes(), vec![(4, 1), (4, 4)]);
+        for block in 4..8 {
+            assert_eq!(backend.block_data(block), vec![0x73; BLOCK_SIZE as usize]);
+        }
+    }
+
+    #[test]
+    fn concurrent_update_survives_older_direct_completion() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, 4));
+        let base = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32);
+        let state = Arc::new(FsState {
+            block_cache: Spinlock::new(BlockCache::with_capacity(BLOCK_SIZE, 1)),
+            ..base
+        });
+        let direct = vec![0x31; 4 * BLOCK_SIZE as usize];
+        let latest = vec![0x72; BLOCK_SIZE as usize];
+
+        let writer_state = Arc::clone(&state);
+        let direct_data = direct.clone();
+        let writer = thread::spawn(move || writer_state.write_data_blocks(4, 4, &direct_data));
+        backend.wait_for_gate();
+        state
+            .write_data_block(4, &latest)
+            .expect("publish update while direct I/O is active");
+
+        backend.release_gate();
+        writer.join().unwrap().expect("finish older direct write");
+        let mut observed = vec![0; BLOCK_SIZE as usize];
+        state
+            .read_block(4, &mut observed)
+            .expect("read concurrent update");
+        assert_eq!(observed, latest);
+        {
+            let cache = state.block_cache.lock();
+            let idx = cache.index[&4];
+            assert!(
+                cache.slots[idx].dirty,
+                "old direct completion must not mark the newer cache version clean"
+            );
+        }
+
+        state
+            .flush_dirty_blocks()
+            .expect("persist concurrent update");
+        assert_eq!(backend.block_data(4), latest);
+    }
+
+    #[test]
+    fn discard_waits_for_active_direct_write() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, 4));
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+        let direct = vec![0x55; 4 * BLOCK_SIZE as usize];
+
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || writer_state.write_data_blocks(4, 4, &direct));
+        backend.wait_for_gate();
+        assert!(state.block_cache.lock().has_active_direct_in_range(4, 4));
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let discard_state = Arc::clone(&state);
+        let discard = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = discard_state.discard_cached_blocks(4, 4);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "discard/free must not pass an active direct owner"
+        );
+
+        backend.release_gate();
+        writer.join().unwrap().expect("finish direct write");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("discard should resume after direct completion")
+            .expect("discard range");
+        discard.join().unwrap();
+        assert!(!state.block_cache.lock().has_active_direct_in_range(4, 4));
+    }
+
+    #[test]
+    fn stale_single_block_read_retries_after_direct_completion() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        backend.seed_block(4, &vec![0x11; BLOCK_SIZE as usize]);
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; BLOCK_SIZE as usize];
+            reader_state.read_block(4, &mut out).map(|()| out)
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_blocks(4, 4, &vec![0x88; 4 * BLOCK_SIZE as usize])
+            .expect("complete direct write during stale read");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("retry stale read");
+        assert_eq!(observed, vec![0x88; BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 1), (4, 1)]);
+    }
+
+    #[test]
+    fn backend_read_waits_for_direct_that_is_still_in_flight() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, 4));
+        backend.seed_block(4, &vec![0x17; BLOCK_SIZE as usize]);
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let (read_done_tx, read_done_rx) = mpsc::channel();
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; BLOCK_SIZE as usize];
+            let result = reader_state.read_block(4, &mut out).map(|()| out);
+            read_done_tx.send(result).unwrap();
+        });
+        // reader 已从后端复制旧数据，但尚未回到 cache 锁内验证。
+        backend.wait_for_read_gate();
+
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            writer_state.write_data_blocks(4, 4, &vec![0x9b; 4 * BLOCK_SIZE as usize])
+        });
+        // direct owner 已注册，但后端写仍被阻塞，coherence stamp 尚未推进。
+        backend.wait_for_gate();
+        backend.release_read_gate();
+        assert!(
+            read_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "reader must discard old backend data while direct I/O remains active"
+        );
+
+        backend.release_gate();
+        writer.join().unwrap().expect("finish direct write");
+        let observed = read_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader should retry after direct completion")
+            .expect("retry in-flight direct read");
+        reader.join().unwrap();
+        assert_eq!(observed, vec![0x9b; BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 1), (4, 1)]);
+    }
+
+    #[test]
+    fn stale_batch_read_retries_after_direct_completion() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        for block in 4..8 {
+            backend.seed_block(block, &vec![0x21; BLOCK_SIZE as usize]);
+        }
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; 4 * BLOCK_SIZE as usize];
+            reader_state.read_data_blocks(4, 4, &mut out).map(|()| out)
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_blocks(4, 4, &vec![0x92; 4 * BLOCK_SIZE as usize])
+            .expect("complete direct write during stale range read");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("retry stale range read");
+        assert_eq!(observed, vec![0x92; 4 * BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 4), (4, 4)]);
+    }
+
+    #[test]
+    fn stale_vectored_read_retries_after_direct_completion() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        for block in 4..8 {
+            backend.seed_block(block, &vec![0x31; BLOCK_SIZE as usize]);
+        }
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut first = vec![0u8; 2 * BLOCK_SIZE as usize];
+            let mut second = vec![0u8; 2 * BLOCK_SIZE as usize];
+            let result =
+                reader_state.read_data_blocks_vectored(4, 4, &mut [&mut first, &mut second]);
+            result.map(|()| {
+                first.extend_from_slice(&second);
+                first
+            })
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_blocks(4, 4, &vec![0xa2; 4 * BLOCK_SIZE as usize])
+            .expect("complete direct write during scatter read");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("retry scatter read");
+        assert_eq!(observed, vec![0xa2; 4 * BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 2), (6, 2), (4, 2), (6, 2)]);
+    }
+
+    #[test]
+    fn unrelated_dirty_write_does_not_retry_backend_read() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        backend.seed_block(4, &vec![0x41; BLOCK_SIZE as usize]);
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; BLOCK_SIZE as usize];
+            reader_state.read_block(4, &mut out).map(|()| out)
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_block(20, &vec![0xa6; BLOCK_SIZE as usize])
+            .expect("publish unrelated dirty block");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("finish original read");
+        assert_eq!(observed, vec![0x41; BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 1)]);
+    }
+
+    #[test]
+    fn unrelated_pending_completion_does_not_retry_backend_read() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        backend.seed_block(4, &vec![0x43; BLOCK_SIZE as usize]);
+        backend.gate_read(4);
+        let base = alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32);
+        let state = Arc::new(FsState {
+            block_cache: Spinlock::new(BlockCache::with_capacity(BLOCK_SIZE, 1)),
+            ..base
+        });
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; BLOCK_SIZE as usize];
+            reader_state.read_block(4, &mut out).map(|()| out)
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_block(20, &vec![0xa1; BLOCK_SIZE as usize])
+            .expect("publish unrelated victim");
+        state
+            .write_data_block(21, &vec![0xa2; BLOCK_SIZE as usize])
+            .expect("complete unrelated pending writeback");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("finish original read");
+        assert_eq!(observed, vec![0x43; BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 1)]);
+        assert_eq!(backend.writes(), vec![(20, 1)]);
+    }
+
+    #[test]
+    fn unrelated_direct_completion_does_not_retry_backend_read() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        backend.seed_block(4, &vec![0x45; BLOCK_SIZE as usize]);
+        backend.gate_read(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; BLOCK_SIZE as usize];
+            reader_state.read_block(4, &mut out).map(|()| out)
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_blocks(20, 4, &vec![0xb4; 4 * BLOCK_SIZE as usize])
+            .expect("complete unrelated direct write");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("finish original read");
+        assert_eq!(observed, vec![0x45; BLOCK_SIZE as usize]);
+        assert_eq!(backend.reads(), vec![(4, 1)]);
+        assert_eq!(backend.writes(), vec![(20, 4)]);
+    }
+
+    #[test]
+    fn wrapped_write_version_preserves_concurrent_direct_update() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, 4));
+        backend.fail_block(4);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+        state.block_cache.lock().write_seq = u64::MAX - 1;
+
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            writer_state.write_data_blocks(4, 4, &vec![0x51; 4 * BLOCK_SIZE as usize])
+        });
+        backend.wait_for_gate();
+        let latest = vec![0xd2; BLOCK_SIZE as usize];
+        state
+            .write_data_block(4, &latest)
+            .expect("publish version 1 after direct version MAX");
+
+        backend.release_gate();
+        assert_eq!(writer.join().unwrap(), Err(BlockBackendError::Io));
+        {
+            let cache = state.block_cache.lock();
+            assert_eq!(cache.write_seq, 1);
+            assert!(!cache.pending_writebacks.contains_key(&4));
+            let idx = cache.index[&4];
+            assert_eq!(cache.slots[idx].version, 1);
+            assert!(cache.slots[idx].dirty);
+        }
+
+        let mut observed = vec![0; BLOCK_SIZE as usize];
+        state
+            .read_block(4, &mut observed)
+            .expect("read wrapped concurrent update");
+        assert_eq!(observed, latest);
+        backend.clear_failure();
+        state
+            .flush_dirty_blocks()
+            .expect("persist wrapped concurrent update");
+        assert_eq!(backend.block_data(4), latest);
+    }
+
+    #[test]
+    fn sync_waits_for_active_direct_write() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, 4));
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            writer_state.write_data_blocks(4, 4, &vec![0xc3; 4 * BLOCK_SIZE as usize])
+        });
+        backend.wait_for_gate();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let sync_state = Arc::clone(&state);
+        let syncer = thread::spawn(move || {
+            done_tx.send(sync_state.flush_dirty_blocks()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "sync must not report success while direct I/O is active"
+        );
+
+        backend.release_gate();
+        writer.join().unwrap().expect("finish direct write");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sync should resume")
+            .expect("sync direct write");
+        syncer.join().unwrap();
     }
 
     #[test]
@@ -1602,6 +3631,85 @@ mod tests {
         let writes = backend.writes();
         assert!(writes.contains(&(2, 2)));
         assert!(!writes.contains(&(8, 2)));
+    }
+
+    #[test]
+    fn indirect_allocation_reports_only_new_index_blocks() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(CountingBackend::new(4096, 512));
+        let mut bitmap = vec![0u8; BLOCK_SIZE as usize];
+        bitmap[0] = 0b0000_1111;
+        backend.seed_block(1, BLOCK_SIZE as usize, &bitmap);
+
+        let state = alloc_test_state(backend, BLOCK_SIZE, 2048);
+        let mut i_block = [0u8; 60];
+        let mut scratch = Vec::new();
+
+        let (first_l1, first_l1_indexes) = map_wr::ensure_block_for_write_with_scratch_count(
+            &state,
+            &mut i_block,
+            12,
+            false,
+            &mut scratch,
+        )
+        .expect("allocate first L1 data block");
+        assert_eq!(first_l1, BlockAllocState::NewlyAllocated(5));
+        assert_eq!(first_l1_indexes, 1);
+
+        let (_, next_l1_indexes) = map_wr::ensure_block_for_write_with_scratch_count(
+            &state,
+            &mut i_block,
+            13,
+            false,
+            &mut scratch,
+        )
+        .expect("reuse L1 index block");
+        assert_eq!(next_l1_indexes, 0);
+
+        let (first_l2, first_l2_indexes) = map_wr::ensure_block_for_write_with_scratch_count(
+            &state,
+            &mut i_block,
+            12 + BLOCK_SIZE / 4,
+            false,
+            &mut scratch,
+        )
+        .expect("allocate first L2 data block");
+        assert_eq!(first_l2, BlockAllocState::NewlyAllocated(9));
+        assert_eq!(first_l2_indexes, 2);
+        assert_eq!(map_wr::count_all_blocks(&state, &i_block), Ok(6));
+    }
+
+    #[test]
+    fn extent_demotion_reports_new_indirect_indexes() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(CountingBackend::new(4096, 512));
+        let mut bitmap = vec![0u8; BLOCK_SIZE as usize];
+        for bit in 0..24usize {
+            bitmap[bit / 8] |= 1 << (bit % 8);
+        }
+        backend.seed_block(1, BLOCK_SIZE as usize, &bitmap);
+
+        let state = alloc_test_state(backend, BLOCK_SIZE, 2048);
+        let mut i_block = [0u8; 60];
+        crate::extent_wr::init_empty_root(&mut i_block);
+        for (logical, physical) in [(0, 20), (12, 21), (24, 22), (36, 23)] {
+            assert!(crate::extent_wr::try_append_leaf(
+                &mut i_block,
+                logical,
+                physical,
+                1
+            ));
+        }
+        let mut flags = EXT4_EXTENTS_FL;
+
+        let (converted, new_indexes) =
+            crate::extent_wr::demote_preserve_if_extent_count(&state, &mut flags, &mut i_block)
+                .expect("demote extent mappings");
+
+        assert!(converted);
+        assert_eq!(new_indexes, 1);
+        assert_eq!(flags & EXT4_EXTENTS_FL, 0);
+        assert_eq!(map_wr::count_all_blocks(&state, &i_block), Ok(5));
     }
 
     #[test]

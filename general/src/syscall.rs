@@ -78,15 +78,44 @@ pub struct SyscallContext<'a> {
     task: Option<Arc<sched::Task>>,
     frame_finalized: bool,
     restart_disabled: bool,
+    execution_scope_active: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl SyscallContext<'_> {
+    fn new(nr: usize, args: [usize; 6], tf: TrapFramePtr, task: Arc<sched::Task>) -> Self {
+        assert!(
+            task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
+            "同一任务不能嵌套进入 syscall 执行作用域"
+        );
+        Self {
+            nr,
+            args,
+            tf,
+            task: Some(task),
+            frame_finalized: false,
+            restart_disabled: false,
+            execution_scope_active: true,
+            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    fn finish_execution_scope(&mut self) {
+        if !self.execution_scope_active {
+            return;
+        }
+        if let Some(task) = self.task.as_ref() {
+            let _ = task.end_execution_scope(sched::ExecutionScopeKind::Syscall);
+        }
+        self.execution_scope_active = false;
+    }
+
     pub fn task(&self) -> &Arc<sched::Task> {
         self.task.as_ref().expect("[syscall] task already released")
     }
 
     pub fn release_task_ref(&mut self) {
+        self.finish_execution_scope();
         self.task.take();
     }
 
@@ -115,6 +144,12 @@ impl SyscallContext<'_> {
     }
 }
 
+impl Drop for SyscallContext<'_> {
+    fn drop(&mut self) {
+        self.finish_execution_scope();
+    }
+}
+
 /// 标准 syscall 函数签名。
 pub type SyscallFn = fn(&mut SyscallContext<'_>) -> Result<usize, Errno>;
 
@@ -123,6 +158,12 @@ pub const SYSCALL_TABLE_LEN: usize = 512;
 
 static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] =
     [const { AtomicUsize::new(0) }; SYSCALL_TABLE_LEN];
+
+#[cfg(feature = "trace-task-lifecycle")]
+fn trace_signal_boundary(nr: usize) -> bool {
+    // LoongArch 与 RISC-V 均采用 asm-generic 的 kill 系统调用号。
+    nr == 129
+}
 
 /// 在启动期注册一个 syscall 号 → fn 的映射。重复注册会 panic（防止表条目被
 /// 静默覆盖）。
@@ -144,6 +185,17 @@ pub fn registered_count() -> usize {
         .iter()
         .filter(|e| e.load(Ordering::Acquire) != 0)
         .count()
+}
+
+/// syscall 实现已经返回，此时深层调用栈中的 VmSpace/File 等临时 Arc 均已析构；
+/// 在这个边界消费 exit_group 请求，避免远程废弃另一个线程的 Rust 栈。
+fn complete_group_exit_at_boundary(ctx: &mut SyscallContext<'_>) {
+    if !sched::operation::complete_group_exit_if_requested(ctx.task()) {
+        return;
+    }
+    ctx.release_task_ref();
+    sched::schedule_once(0);
+    panic!("[syscall] group-exit task scheduled back unexpectedly");
 }
 
 // ── 3. 主分发 ────────────────────────────────────────────────────────────────
@@ -168,17 +220,11 @@ pub fn dispatch(tf: TrapFramePtr) {
     let _span = profiling::enter_span();
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
+    #[cfg(feature = "performance-profile")]
+    let mut syscall_profile = profiling::syscall_scope(nr);
 
     let task = sched::current_task();
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        restart_disabled: false,
-        _phantom: core::marker::PhantomData,
-    };
+    let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
@@ -194,6 +240,8 @@ pub fn dispatch(tf: TrapFramePtr) {
         None
     };
 
+    #[cfg(feature = "performance-profile")]
+    let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
@@ -201,9 +249,27 @@ pub fn dispatch(tf: TrapFramePtr) {
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+    #[cfg(feature = "trace-task-lifecycle")]
+    if trace_signal_boundary(nr) {
+        log::info!(
+            "[syscall][signal-boundary] invoke-done pid={:?} nr={} ret={}",
+            ctx.task().pid_root(),
+            nr,
+            ret,
+        );
+    }
+    #[cfg(feature = "performance-profile")]
+    syscall_profile.set_result(ret);
+    #[cfg(feature = "performance-profile")]
+    drop(invoke_profile);
+
+    complete_group_exit_at_boundary(&mut ctx);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        #[cfg(feature = "performance-profile")]
+        let finalize_profile =
+            profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
         if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
@@ -214,6 +280,11 @@ pub fn dispatch(tf: TrapFramePtr) {
                 )
                 .is_ok();
                 if delivered {
+                    #[cfg(feature = "performance-profile")]
+                    drop(finalize_profile);
+                    #[cfg(feature = "performance-profile")]
+                    let _handoff_profile =
+                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
                 }
@@ -223,11 +294,29 @@ pub fn dispatch(tf: TrapFramePtr) {
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
 
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace_signal_boundary(nr) {
+            log::info!(
+                "[syscall][signal-boundary] frame-done pid={:?} nr={}",
+                ctx.task().pid_root(),
+                nr,
+            );
+        }
+
         let task = ctx.task();
         if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
             let _ = sched::operation::deliver_pending_signals_for_task(
                 &task,
                 sched::UserContextRef::new(tf.as_usize()),
+            );
+        }
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace_signal_boundary(nr) {
+            log::info!(
+                "[syscall][signal-boundary] signals-done pid={:?} nr={} state={:?}",
+                task.pid_root(),
+                nr,
+                task.state(),
             );
         }
 
@@ -242,7 +331,20 @@ pub fn dispatch(tf: TrapFramePtr) {
             }
             _ => {}
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
+        #[cfg(feature = "performance-profile")]
+        let _handoff_profile =
+            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
         sched::run_post_syscall_handoff_lazy();
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace_signal_boundary(nr) {
+            log::info!(
+                "[syscall][signal-boundary] handoff-done pid={:?} nr={}",
+                ctx.task().pid_root(),
+                nr,
+            );
+        }
     }
     // syscall 是 libcbench/lmbench 的最热路径，默认不能格式化并写入每次调用。
     // 需要单步追踪时临时打开下面的编译期开关即可。
@@ -274,6 +376,8 @@ where
     let _span = profiling::enter_span();
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::SyscallDispatch).trace_args(nr as u64, 0);
+    #[cfg(feature = "performance-profile")]
+    let mut syscall_profile = profiling::syscall_scope(nr);
 
     let entry = if nr < SYSCALL_TABLE_LEN {
         let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
@@ -286,16 +390,10 @@ where
         None
     };
 
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        restart_disabled: false,
-        _phantom: core::marker::PhantomData,
-    };
+    let mut ctx = SyscallContext::new(nr, args, tf, task);
 
+    #[cfg(feature = "performance-profile")]
+    let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
@@ -303,9 +401,27 @@ where
         },
         None => -(Errno::ENOSYS.as_i32() as isize),
     };
+    #[cfg(feature = "trace-task-lifecycle")]
+    if trace_signal_boundary(nr) {
+        log::info!(
+            "[syscall][signal-boundary] invoke-done pid={:?} nr={} ret={}",
+            ctx.task().pid_root(),
+            nr,
+            ret,
+        );
+    }
+    #[cfg(feature = "performance-profile")]
+    syscall_profile.set_result(ret);
+    #[cfg(feature = "performance-profile")]
+    drop(invoke_profile);
+
+    complete_group_exit_at_boundary(&mut ctx);
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        #[cfg(feature = "performance-profile")]
+        let finalize_profile =
+            profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
         if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
@@ -316,6 +432,11 @@ where
                 )
                 .is_ok();
                 if delivered {
+                    #[cfg(feature = "performance-profile")]
+                    drop(finalize_profile);
+                    #[cfg(feature = "performance-profile")]
+                    let _handoff_profile =
+                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
                     return;
                 }
@@ -324,11 +445,29 @@ where
 
         finish(tf, ret);
 
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace_signal_boundary(nr) {
+            log::info!(
+                "[syscall][signal-boundary] frame-done pid={:?} nr={}",
+                ctx.task().pid_root(),
+                nr,
+            );
+        }
+
         let task = ctx.task();
         if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
             let _ = sched::operation::deliver_pending_signals_for_task(
                 task,
                 sched::UserContextRef::new(tf.as_usize()),
+            );
+        }
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace_signal_boundary(nr) {
+            log::info!(
+                "[syscall][signal-boundary] signals-done pid={:?} nr={} state={:?}",
+                task.pid_root(),
+                nr,
+                task.state(),
             );
         }
 
@@ -343,6 +482,19 @@ where
             }
             _ => {}
         }
+        #[cfg(feature = "performance-profile")]
+        drop(finalize_profile);
+        #[cfg(feature = "performance-profile")]
+        let _handoff_profile =
+            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
         sched::run_post_syscall_handoff_lazy();
+        #[cfg(feature = "trace-task-lifecycle")]
+        if trace_signal_boundary(nr) {
+            log::info!(
+                "[syscall][signal-boundary] handoff-done pid={:?} nr={}",
+                ctx.task().pid_root(),
+                nr,
+            );
+        }
     }
 }

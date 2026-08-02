@@ -11,7 +11,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
-use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
+use sched::arch_hooks::{
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry,
+};
 
 use crate::riscv64::specific::{
     HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id, kernel_timestamp_ns,
@@ -60,7 +62,11 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
+unsafe extern "C" fn switch_context(
+    _prev: NonNull<u8>,
+    _next: NonNull<u8>,
+    _prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
+) {
     core::arch::naked_asm!(
         // fast syscall 可在内部阻塞并切走，随后从同一内核调用点继续。递增 per-hart
         // 序号，使返回汇编能够判断硬件 FPR 是否可能已被其它任务替换。
@@ -82,6 +88,10 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         "sd s9,  {s9}(a0)",
         "sd s10, {s10}(a0)",
         "sd s11, {s11}(a0)",
+
+        // 只有保存完整上下文后，远端 CPU 才能认领并恢复 prev。
+        "fence rw, w",
+        "sd zero, 0(a2)",
 
         "ld ra,  {ra}(a1)",
         "ld sp,  {sp}(a1)",
@@ -128,6 +138,10 @@ static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
     current_cpu_id,
 };
 
+static ARCH_DEADLINE_TIMER_OPS: ArchDeadlineTimerOps = ArchDeadlineTimerOps {
+    reprogram: super::time::rearm_local_timer,
+};
+
 /// # Safety
 ///
 /// `stack_top` 必须是当前任务的有效内核栈顶。
@@ -166,6 +180,7 @@ pub fn register() {
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
+        sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
         sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
         sched::arch_hooks::register_cpu_control(&super::smp::CPU_CONTROL_OPS);

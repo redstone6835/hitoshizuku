@@ -43,12 +43,25 @@ pub struct NetDriverBootConfig {
     active_cpu_count: u8,
 }
 
+#[kernel_symbols::export]
 impl NetDriverBootConfig {
-    pub const fn rss_key(&self) -> &[u8; 40] {
+    #[kernel_symbols::export(
+        name = "net.boot.NetDriverBootConfig.rss_key",
+        contract = "kernel.net.driver-boot-config@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
+    pub fn rss_key(&self) -> &[u8; 40] {
         &self.rss_key
     }
 
-    pub const fn active_cpu_count(&self) -> u8 {
+    #[kernel_symbols::export(
+        name = "net.boot.NetDriverBootConfig.active_cpu_count",
+        contract = "kernel.net.driver-boot-config@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER
+    )]
+    pub fn active_cpu_count(&self) -> u8 {
         self.active_cpu_count
     }
 }

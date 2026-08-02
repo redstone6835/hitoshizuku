@@ -23,12 +23,13 @@ use super::common::{
     IrqSafeMutex, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest,
     VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore,
     VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
-    free_allocated_request, negotiate_supported_features, read_device_config, status_to_result,
+    copy_completed_read_payload, free_allocated_request, negotiate_supported_features,
+    read_device_config, reclaim_request_payload_for_cpu, status_to_result,
     validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
     write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
-use general::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
+use general::dev::bio::{BIO_MAX_BORROWED_SEGMENTS, Bio, BioIoError, BioOp, SubmitError};
 use general::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
@@ -52,6 +53,7 @@ use virtio::{SplitVirtQueue, choose_split_queue_size};
 
 const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x74726976; // "virt"
 const VIRTIO_MMIO_DEVICE_ID_BLOCK: u32 = 2;
+const VIRTIO_MMIO_RESET_SPIN_LIMIT: u32 = 1_000_000;
 
 // MMIO 寄存器偏移
 const MMIO_MAGIC: usize = 0x000;
@@ -223,6 +225,11 @@ impl VirtioBlk {
             transport.write_status(VIRTIO_STATUS_FAILED);
             return Err("VirtIO queue size is too small");
         }
+        let dma_context = dma_context.with_scatter_gather(
+            usize::from(queue_size.saturating_sub(2))
+                .min(capabilities.max_data_segments)
+                .min(BIO_MAX_BORROWED_SEGMENTS),
+        );
         let split_queue = if is_legacy {
             SplitVirtQueue::new_legacy_in(dma_context, queue_size)
         } else {
@@ -264,6 +271,11 @@ impl VirtioBlk {
 
     fn complete_failed_requests(pending: Vec<Option<VirtioBlkPendingRequest>>, error: BioIoError) {
         for pending in pending.into_iter().flatten() {
+            pending.meta_dma.sync_for_cpu();
+            reclaim_request_payload_for_cpu(
+                pending.data_dma.as_ref(),
+                pending.direct_bio_mappings.as_ref(),
+            );
             pending.bio.complete(Err(error));
         }
     }
@@ -279,13 +291,26 @@ impl VirtioBlk {
         reason: &'static str,
     ) -> Vec<Option<VirtioBlkPendingRequest>> {
         log::printk!("[virtio-mmio-blk] queue failed: {}", reason);
-        self.inner.transport.add_status(VIRTIO_STATUS_FAILED);
-        queue.mark_failed_and_take_pending()
+        queue.mark_failed();
+        // 借用页可能仍是设备的 DMA 目标。fatal queue 路径必须观察到 device reset
+        // 完成后才能把 pending BIO 归还给调用方；坏设备不响应 reset 时宁可停在此处，
+        // 也不能制造 DMA-after-free。
+        self.inner.transport.write_status(0);
+        for _ in 0..VIRTIO_MMIO_RESET_SPIN_LIMIT {
+            if self.inner.transport.read_status() == 0 {
+                return queue.take_all_pending();
+            }
+            core::hint::spin_loop();
+        }
+        panic!("virtio-mmio-blk: device reset timed out after fatal queue error")
     }
 
     /// 轮询并处理已完成的请求
     pub fn poll(&self) {
         let mut queue = self.inner.queue.lock();
+        if queue.is_failed() {
+            return;
+        }
 
         loop {
             #[cfg(feature = "block-profile")]
@@ -343,6 +368,7 @@ impl VirtioBlk {
                 mut bio,
                 meta_dma,
                 mut data_dma,
+                direct_bio_mappings,
                 expected_device_write_len,
                 #[cfg(feature = "block-profile")]
                 profile_published_ns,
@@ -381,35 +407,28 @@ impl VirtioBlk {
                 let failed =
                     self.fail_queue_locked(&mut queue, "completed descriptor chain corrupt");
                 drop(queue);
+                reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
                 bio.complete(Err(BioIoError::Unavailable));
                 Self::complete_failed_requests(failed, BioIoError::Unavailable);
                 return;
             }
 
-            let copy_read_data = result.is_ok() && bio.op == BioOp::Read;
-            if !copy_read_data && let Some(dma) = data_dma.take() {
-                queue.recycle_data_dma(dma);
-            }
-
-            // 大块顺序读的回拷放到队列锁外,避免 L1/L5 1MiB 请求长时间阻塞提交路径。
+            // 大块顺序读的数据同步/回拷放到队列锁外，避免长时间阻塞提交路径。
             drop(queue);
-            if copy_read_data {
-                if let Some(dma) = data_dma.as_ref() {
-                    let buf = bio.buffer.as_mut_slice();
-                    if dma.as_slice().len() < buf.len() {
-                        result = Err(BioIoError::Unavailable);
-                    } else {
-                        dma.sync_for_cpu();
-                        buf.copy_from_slice(&dma.as_slice()[..buf.len()]);
-                    }
-                } else {
-                    result = Err(BioIoError::Unavailable);
+            reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
+            if result.is_ok() && bio.op == BioOp::Read {
+                if let Err(error) = copy_completed_read_payload(
+                    &mut bio,
+                    data_dma.as_ref(),
+                    direct_bio_mappings.as_ref(),
+                ) {
+                    result = Err(error);
                 }
-                if let Some(dma) = data_dma.take() {
-                    queue = self.inner.queue.lock();
-                    queue.recycle_data_dma(dma);
-                    drop(queue);
-                }
+            }
+            if let Some(dma) = data_dma.take() {
+                queue = self.inner.queue.lock();
+                queue.recycle_data_dma(dma);
+                drop(queue);
             }
 
             // 释放 queue 锁后再 complete bio——避免 completion 路径
@@ -533,10 +552,11 @@ impl BlockDriver for VirtioBlkIo {
         if let Err(err) = validate_bio_buffer_for_plan(plan, &bio) {
             return Err((err, bio));
         }
-        let mut request = match allocate_request(&mut *queue, plan) {
-            Ok(request) => request,
-            Err(err) => return Err((err, bio)),
-        };
+        let mut request =
+            match allocate_request(&mut *queue, plan, &bio, self.driver.inner.capabilities) {
+                Ok(request) => request,
+                Err(err) => return Err((err, bio)),
+            };
 
         if request.data_dma.is_some() {
             // 大块顺序写和 range payload 初始化放到队列锁外，避免阻塞完成路径。
@@ -554,7 +574,7 @@ impl BlockDriver for VirtioBlkIo {
         }
 
         // 描述符链形状由 virtio-blk 公共层统一维护，MMIO 传输层只负责发布 head。
-        if let Err(err) = write_allocated_request_descriptors(&mut *queue, &request, plan) {
+        if let Err(err) = write_allocated_request_descriptors(&mut *queue, &request, plan, &bio) {
             free_allocated_request(&mut *queue, request);
             return Err((err, bio));
         }
@@ -571,11 +591,13 @@ impl BlockDriver for VirtioBlkIo {
             head: head_idx,
             meta_dma,
             data_dma,
+            direct_bio_mappings,
         } = request;
         let pending = VirtioBlkPendingRequest {
             bio,
             meta_dma,
             data_dma,
+            direct_bio_mappings,
             expected_device_write_len,
             #[cfg(feature = "block-profile")]
             profile_published_ns: 0,
@@ -587,8 +609,11 @@ impl BlockDriver for VirtioBlkIo {
                 bio,
                 meta_dma,
                 data_dma,
+                direct_bio_mappings,
                 ..
             } = pending;
+            meta_dma.sync_for_cpu();
+            reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
             let _ = queue.split_queue_mut().free_chain(chain);
             queue.recycle_request_dma(meta_dma, data_dma);
             return Err((SubmitError::QueueFull, bio));
@@ -613,8 +638,11 @@ impl BlockDriver for VirtioBlkIo {
                 bio,
                 meta_dma,
                 data_dma,
+                direct_bio_mappings,
                 ..
             } = pending;
+            meta_dma.sync_for_cpu();
+            reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
             let _ = queue.split_queue_mut().free_chain(chain);
             queue.recycle_meta_dma(meta_dma);
             if let Some(data_dma) = data_dma {
@@ -631,8 +659,9 @@ impl BlockDriver for VirtioBlkIo {
             0
         };
 
-        // 通知设备
-        drop(queue);
+        // publish 与 notify 保持在同一 queue guard 内，避免 fatal reset 与陈旧 notify
+        // 交错；IrqSafeMutex 同时阻止本 CPU 的完成中断重入。
+        // Safety: notify_addr 来自已校验的 virtio-mmio 寄存器窗口，写入值是当前队列号。
         unsafe {
             write_volatile(
                 self.driver.inner.notify_addr as *mut u32,
@@ -646,9 +675,9 @@ impl BlockDriver for VirtioBlkIo {
                 .inner
                 .profile
                 .record_publish_to_notify(notified_ns.saturating_sub(profile_published_ns));
-            let mut queue = self.driver.inner.queue.lock();
             let _ = queue.set_pending_profile_notified_ns(head_idx, notified_ns);
         }
+        drop(queue);
         Ok(())
     }
 

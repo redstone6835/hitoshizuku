@@ -5,15 +5,16 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 #[cfg(not(feature = "elm-integrated"))]
-use net::stack::PinnedNetStackEndpoint;
+use net::stack::PinnedNetStackShardTurnEndpoint;
 use net::stack::{
-    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6, NET_STACK_CALL_STATUS_BUSY,
-    NET_STACK_CALL_STATUS_INVALID, NET_STACK_CALL_STATUS_OK, NET_STACK_DROP_IPV4_CHECKSUM,
+    NET_STACK_ADDRESS_FAMILY_IPV4, NET_STACK_ADDRESS_FAMILY_IPV6,
+    NET_STACK_DROP_IPV4_CHECKSUM,
     NET_STACK_DROP_IPV6_EXTENSION_LIMIT, NET_STACK_DROP_MALFORMED_ARP,
     NET_STACK_DROP_MALFORMED_IPV4, NET_STACK_DROP_MALFORMED_IPV6, NET_STACK_DROP_MALFORMED_TCP,
     NET_STACK_DROP_MALFORMED_UDP, NET_STACK_DROP_NOT_LOCAL, NET_STACK_DROP_TCP_CHECKSUM,
@@ -23,35 +24,42 @@ use net::stack::{
     NET_STACK_ETHERNET_VLAN_UNSUPPORTED, NET_STACK_NETWORK_ARP, NET_STACK_NETWORK_DROP,
     NET_STACK_NETWORK_FLAG_FRAGMENT, NET_STACK_NETWORK_FLAG_IPV6_PROBLEM,
     NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS, NET_STACK_NETWORK_FLAG_SUPPRESS_MULTICAST,
-    NET_STACK_NETWORK_IP, NET_STACK_OP_FLOW_CALL, NET_STACK_OP_PROBE, NET_STACK_OP_QUIESCE,
-    NET_STACK_OP_TX_FRAGMENT_HEADER, NET_STACK_OP_TX_HEADER, NET_STACK_OP_WORKER_TURN,
-    NET_STACK_SOCKET_OP_PROBE, NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
+    NET_STACK_NETWORK_IP, NET_STACK_SHARD_TURN_STATUS_BUSY, NET_STACK_SHARD_TURN_STATUS_INVALID,
+    NET_STACK_SHARD_TURN_STATUS_OK,
+    NET_STACK_TCP_OPTION_MSS, NET_STACK_TCP_OPTION_SACK_PERMITTED,
     NET_STACK_TCP_OPTION_TIMESTAMP, NET_STACK_TCP_OPTION_WINDOW_SCALE, NET_STACK_TRANSPORT_DROP,
     NET_STACK_TRANSPORT_ICMP, NET_STACK_TRANSPORT_RAW, NET_STACK_TRANSPORT_SKIPPED,
-    NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NET_STACK_TX_HEADER_ABI_VERSION,
-    NET_STACK_TX_HEADER_CAPACITY, NET_STACK_TX_RAW_FRAGMENT, NET_STACK_TX_TCP,
-    NET_STACK_TX_UDP, NET_STACK_TX_UDP_FRAGMENT, NetStackEthernetV1,
-    NetStackControlPlane, NetStackFlowCallV1, NetStackHandle, NetStackLocalAddressV1,
-    NetStackNetworkV1,
-    NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackTcpOptionsV1,
-    NetStackTransportV1, NetStackTxFragmentHeaderV1, NetStackTxFragmentInputV1,
-    NetStackTxHeaderV1, NetStackTxInputV1,
+    NET_STACK_TRANSPORT_TCP, NET_STACK_TRANSPORT_UDP, NetStackEthernet,
+    NetStackControlPlane, NetStackHandle, NetStackLocalAddress, NetStackLocalTurn, NetStackNetwork,
+    NetStackShardTurn,
+    NetStackRegisterErrorKind, NetStackRegistration, NetStackRemoveError, NetStackTcpOptions,
+    NetStackTransport,
 };
-use net::{FlowShard, ShardId};
+use net::{FlowExecution, FlowExecutorKind, FlowShard, ShardId};
 use sched::sync::Spinlock;
 
 use allocator as _;
 
 static QUIESCED: AtomicBool = AtomicBool::new(false);
-static FLOW_SHARDS: Spinlock<Vec<Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>>>> =
-    Spinlock::new(Vec::new());
+struct FlowShardSlot(UnsafeCell<Option<ManuallyDrop<FlowShard>>>);
+
+unsafe impl Sync for FlowShardSlot {}
+
+impl FlowShardSlot {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+}
+
+static FLOW_SHARDS: [FlowShardSlot; sched::NR_CPUS] =
+    [const { FlowShardSlot::new() }; sched::NR_CPUS];
+static FLOW_EXECUTIONS: [FlowExecution; sched::NR_CPUS] =
+    [const { FlowExecution::new() }; sched::NR_CPUS];
 static CONTROL_PLANE: Spinlock<Option<Arc<Spinlock<ManuallyDrop<NetStackControlPlane>>>>> =
     Spinlock::new(None);
-static SOCKET_TABLE: Spinlock<Option<ManuallyDrop<net::stack::NetStackSocketTable>>> =
-    Spinlock::new(None);
 
-const fn empty_ethernet() -> NetStackEthernetV1 {
-    NetStackEthernetV1 {
+const fn empty_ethernet() -> NetStackEthernet {
+    NetStackEthernet {
         destination: [0; 6],
         source: [0; 6],
         ethertype: 0,
@@ -60,7 +68,7 @@ const fn empty_ethernet() -> NetStackEthernetV1 {
     }
 }
 
-fn ethernet_is_empty(sidecar: &NetStackEthernetV1) -> bool {
+fn ethernet_is_empty(sidecar: &NetStackEthernet) -> bool {
     sidecar.destination == [0; 6]
         && sidecar.source == [0; 6]
         && sidecar.ethertype == 0
@@ -68,9 +76,8 @@ fn ethernet_is_empty(sidecar: &NetStackEthernetV1) -> bool {
         && sidecar.reserved == [0; 5]
 }
 
-fn worker_turn_header_valid(turn: &net::stack::NetStackWorkerTurnV1, generation: u64) -> bool {
-    turn.abi_version == net::stack::NET_STACK_WORKER_TURN_ABI_VERSION
-        && turn.struct_size as usize == core::mem::size_of::<net::stack::NetStackWorkerTurnV1>()
+fn packet_parse_header_valid(turn: &net::stack::NetStackPacketParse, generation: u64) -> bool {
+    turn.struct_size as usize == core::mem::size_of::<net::stack::NetStackPacketParse>()
         && turn.generation == generation
         && turn.config_generation != 0
         && !turn.input.is_null()
@@ -82,8 +89,8 @@ fn worker_turn_header_valid(turn: &net::stack::NetStackWorkerTurnV1, generation:
         && turn.reserved1 == [0; 2]
 }
 
-const fn empty_network() -> NetStackNetworkV1 {
-    NetStackNetworkV1 {
+const fn empty_network() -> NetStackNetwork {
+    NetStackNetwork {
         outcome: 0,
         family: 0,
         next_header: 0,
@@ -107,19 +114,19 @@ const fn empty_network() -> NetStackNetworkV1 {
     }
 }
 
-fn network_is_empty(sidecar: &NetStackNetworkV1) -> bool {
+fn network_is_empty(sidecar: &NetStackNetwork) -> bool {
     *sidecar == empty_network()
 }
 
-const fn network_drop(reason: u8) -> NetStackNetworkV1 {
-    NetStackNetworkV1 {
+const fn network_drop(reason: u8) -> NetStackNetwork {
+    NetStackNetwork {
         outcome: NET_STACK_NETWORK_DROP,
         drop_reason: reason,
         ..empty_network()
     }
 }
 
-fn address_projection_valid(address: &NetStackLocalAddressV1) -> bool {
+fn address_projection_valid(address: &NetStackLocalAddress) -> bool {
     address.interface != 0
         && matches!(
             (address.family, address.prefix_len),
@@ -130,7 +137,7 @@ fn address_projection_valid(address: &NetStackLocalAddressV1) -> bool {
         && address.reserved1 == [0; 8]
 }
 
-fn packet_inputs_valid(turn: &net::stack::NetStackWorkerTurnV1) -> bool {
+fn packet_inputs_valid(turn: &net::stack::NetStackPacketParse) -> bool {
     let count = usize::from(turn.input_count);
     turn.packet_inputs[..count].iter().all(|facts| {
         matches!(facts.present, 0 | 1)
@@ -146,127 +153,159 @@ fn packet_inputs_valid(turn: &net::stack::NetStackWorkerTurnV1) -> bool {
                     && facts.rss_hash_present == 0))
     }) && turn.packet_inputs[count..]
         .iter()
-        .all(|facts| *facts == net::stack::NetStackPacketInputV1::empty())
+        .all(|facts| *facts == net::stack::NetStackPacketInput::empty())
 }
 
-fn tx_input_valid(input: &NetStackTxInputV1) -> bool {
-    if !matches!(
-        input.family,
-        NET_STACK_ADDRESS_FAMILY_IPV4 | NET_STACK_ADDRESS_FAMILY_IPV6
-    ) || input.destination_port == 0
-        || input.reserved0 != [0; 3]
-        || input.reserved1 != [0; 2]
-        || (input.family == NET_STACK_ADDRESS_FAMILY_IPV4
-            && (input.source[4..] != [0; 12] || input.destination[4..] != [0; 12]))
-    {
-        return false;
-    }
-    let transport_len = match input.kind {
-        NET_STACK_TX_UDP => {
-            let tcp_empty = input.tcp_flags == 0
-                && input.tcp_window == 0
-                && input.tcp_options_len == 0
-                && input.tcp_sequence == 0
-                && input.tcp_acknowledgement == 0
-                && input.tcp_options == [0; 40];
-            tcp_empty
-                .then(|| input.payload_len.checked_add(8))
-                .flatten()
-        }
-        NET_STACK_TX_TCP => {
-            let options_len = usize::from(input.tcp_options_len);
-            if input.source_port == 0
-                || input.tcp_flags & !0x01ff != 0
-                || options_len > input.tcp_options.len()
-                || options_len % 4 != 0
-                || input.tcp_options[options_len..] != [0; 40][options_len..]
-            {
-                None
-            } else {
-                input
-                    .payload_len
-                    .checked_add(20 + u32::from(input.tcp_options_len))
-            }
-        }
-        _ => None,
+fn new_packet_parse(
+    generation: u64,
+    config_generation: u64,
+    interface: u32,
+    local_addresses: &[NetStackLocalAddress],
+    rss_key: [u8; 40],
+    rss_generation: u32,
+    input: &net::buf::PacketBatch,
+) -> net::stack::NetStackPacketParse {
+    let turn = net::stack::NetStackPacketParse {
+        struct_size: core::mem::size_of::<net::stack::NetStackPacketParse>() as u16,
+        generation,
+        config_generation,
+        input,
+        local_addresses: local_addresses.as_ptr(),
+        interface,
+        local_address_count: local_addresses.len() as u32,
+        rss_key,
+        rss_generation,
+        input_count: input.len() as u8,
+        committed: 0,
+        reserved0: [0; 6],
+        packet_inputs: net::stack::packet_batch_inputs(input),
+        ethernet: [empty_ethernet(); net::tuning::PACKET_BATCH_CAPACITY],
+        network: [empty_network(); net::tuning::PACKET_BATCH_CAPACITY],
+        transport: [empty_transport(); net::tuning::PACKET_BATCH_CAPACITY],
+        reserved1: [0; 2],
     };
-    transport_len.is_some_and(|transport_len| {
-        transport_len <= u32::from(u16::MAX)
-            && (input.family != NET_STACK_ADDRESS_FAMILY_IPV4
-                || transport_len <= u32::from(u16::MAX - 20))
-    })
+    turn
 }
 
-fn tx_header_frame_valid(frame: &NetStackTxHeaderV1, generation: u64) -> bool {
-    frame.abi_version == NET_STACK_TX_HEADER_ABI_VERSION
-        && frame.struct_size as usize == core::mem::size_of::<NetStackTxHeaderV1>()
-        && frame.generation == generation
-        && !frame.payload.is_null()
-        && frame.payload.is_aligned()
-        && tx_input_valid(&frame.input)
-        && frame.committed == 0
-        && frame.reserved0 == 0
-        && frame.header_len == 0
-        && frame.header == [0; NET_STACK_TX_HEADER_CAPACITY]
-        && frame.reserved1 == [0; 2]
+fn packet_parse_committed(
+    turn: &net::stack::NetStackPacketParse,
+    input: &net::buf::PacketBatch,
+) -> bool {
+    turn.committed == turn.input_count
+        && input.len() == usize::from(turn.input_count)
+        && packet_inputs_valid(turn)
 }
 
-fn tx_fragment_input_valid(input: &NetStackTxFragmentInputV1) -> bool {
-    if input.reserved != [0; 2]
-        || input.mtu == 0
-        || input.identification == 0
-        || !matches!(
-            input.family,
-            NET_STACK_ADDRESS_FAMILY_IPV4 | NET_STACK_ADDRESS_FAMILY_IPV6
-        )
-        || (input.family == NET_STACK_ADDRESS_FAMILY_IPV4
-            && (input.source[4..] != [0; 12] || input.destination[4..] != [0; 12]))
+fn packet_parse_sidecars(
+    turn: &net::stack::NetStackPacketParse,
+) -> (
+    &[NetStackEthernet],
+    &[NetStackNetwork],
+    &[NetStackTransport],
+) {
+    let count = usize::from(turn.input_count);
+    (
+        &turn.ethernet[..count],
+        &turn.network[..count],
+        &turn.transport[..count],
+    )
+}
+
+fn parse_packet_batch(turn: &mut net::stack::NetStackPacketParse) -> bool {
+    if !packet_parse_header_valid(turn, turn.generation) || turn.committed != 0 {
+        return false;
+    }
+    // Safety: shard-turn 在调用此函数前已校验 host 持有的报文批次和地址投影；
+    // 两个借用都会在同步调用返回前结束。
+    let input = unsafe { &*turn.input };
+    let Ok(address_count) = usize::try_from(turn.local_address_count) else {
+        return false;
+    };
+    let Some(address_bytes) =
+        address_count.checked_mul(core::mem::size_of::<NetStackLocalAddress>())
+    else {
+        return false;
+    };
+    let address_pointer = turn.local_addresses;
+    if address_bytes > isize::MAX as usize || !address_pointer.is_aligned() {
+        return false;
+    }
+    // Safety: 上文已校验长度和对齐，且地址投影只在解析当前有界批次时借用。
+    let addresses = unsafe { core::slice::from_raw_parts(address_pointer, address_count) };
+    let rss_key = turn.rss_key;
+    let rss_generation = turn.rss_generation;
+    if input.len() != usize::from(turn.input_count)
+        || !packet_inputs_valid(turn)
+        || !addresses.iter().all(address_projection_valid)
     {
         return false;
     }
-    match input.kind {
-        NET_STACK_TX_UDP_FRAGMENT => {
-            input.source_port != 0
-                && input.destination_port != 0
-                && input.raw_header_len == 0
-                && input.raw_flags == 0
-                && input.fragment_offset <= input.payload_len
-                && input.fragment_offset % 8 == 0
-                && input.payload_len <= u32::from(u16::MAX - 8)
+    for index in 0..usize::from(turn.input_count) {
+        if !ethernet_is_empty(&turn.ethernet[index])
+            || !network_is_empty(&turn.network[index])
+            || !transport_is_empty(&turn.transport[index])
+        {
+            return false;
         }
-        NET_STACK_TX_RAW_FRAGMENT => {
-            input.family == NET_STACK_ADDRESS_FAMILY_IPV4
-                && input.source_port == 0
-                && input.destination_port == 0
-                && input.fragment_offset % 8 == 0
-                && (input.raw_header_len == 0
-                    || ((20..=60).contains(&input.raw_header_len)
-                        && input.raw_header_len % 4 == 0
-                        && u32::from(input.raw_header_len) <= input.payload_len))
-        }
-        _ => false,
+        let mut header = [0u8; 14];
+        let sidecar = if !input.copy_packet_out(index, 0, &mut header) {
+            NetStackEthernet {
+                status: NET_STACK_ETHERNET_TRUNCATED,
+                ..empty_ethernet()
+            }
+        } else {
+            let ethertype = u16::from_be_bytes([header[12], header[13]]);
+            let status = match ethertype {
+                0x0800 | 0x0806 | 0x86dd => NET_STACK_ETHERNET_ACCEPTED,
+                0x8100 | 0x88a8 => NET_STACK_ETHERNET_VLAN_UNSUPPORTED,
+                _ => NET_STACK_ETHERNET_UNSUPPORTED,
+            };
+            NetStackEthernet {
+                destination: header[0..6].try_into().unwrap(),
+                source: header[6..12].try_into().unwrap(),
+                ethertype,
+                status,
+                reserved: [0; 5],
+            }
+        };
+        let network = if sidecar.status != NET_STACK_ETHERNET_ACCEPTED {
+            NetStackNetwork {
+                outcome: net::stack::NET_STACK_NETWORK_SKIPPED,
+                ..empty_network()
+            }
+        } else {
+            let facts = turn.packet_inputs[index];
+            match sidecar.ethertype {
+                0x0806 => parse_arp(input, index, turn.interface, addresses),
+                0x0800 => parse_ipv4(
+                    input,
+                    index,
+                    turn.interface,
+                    addresses,
+                    facts.frame_len,
+                    facts.checksums_validated != 0,
+                ),
+                0x86dd => parse_ipv6(input, index, turn.interface, addresses, facts.frame_len),
+                _ => return false,
+            }
+        };
+        let transport = parse_transport(
+            input,
+            index,
+            &network,
+            turn.packet_inputs[index],
+            &rss_key,
+            rss_generation,
+        );
+        turn.ethernet[index] = sidecar;
+        turn.network[index] = network;
+        turn.transport[index] = transport;
+        turn.committed = (index + 1) as u8;
     }
+    true
 }
 
-fn tx_fragment_frame_valid(frame: &NetStackTxFragmentHeaderV1, generation: u64) -> bool {
-    frame.abi_version == NET_STACK_TX_HEADER_ABI_VERSION
-        && frame.struct_size as usize == core::mem::size_of::<NetStackTxFragmentHeaderV1>()
-        && frame.generation == generation
-        && !frame.payload.is_null()
-        && frame.payload.is_aligned()
-        && tx_fragment_input_valid(&frame.input)
-        && frame.committed == 0
-        && frame.more_fragments == 0
-        && frame.reserved0 == [0; 2]
-        && frame.header_len == 0
-        && frame.header == [0; NET_STACK_TX_HEADER_CAPACITY]
-        && frame.payload_offset == 0
-        && frame.payload_len == 0
-        && frame.next_fragment_offset == 0
-        && frame.reserved1 == [0; 2]
-}
-
-fn is_local_ipv4(interface: u32, addresses: &[NetStackLocalAddressV1], address: [u8; 4]) -> bool {
+fn is_local_ipv4(interface: u32, addresses: &[NetStackLocalAddress], address: [u8; 4]) -> bool {
     if address == [255; 4] || (224..=239).contains(&address[0]) {
         return true;
     }
@@ -287,7 +326,7 @@ fn is_local_ipv4(interface: u32, addresses: &[NetStackLocalAddressV1], address: 
     })
 }
 
-fn is_local_ipv6(interface: u32, addresses: &[NetStackLocalAddressV1], address: [u8; 16]) -> bool {
+fn is_local_ipv6(interface: u32, addresses: &[NetStackLocalAddress], address: [u8; 16]) -> bool {
     address[0] == 0xff
         || addresses.iter().any(|entry| {
             entry.interface == interface
@@ -315,8 +354,8 @@ fn parse_arp(
     input: &net::buf::PacketBatch,
     index: usize,
     interface: u32,
-    addresses: &[NetStackLocalAddressV1],
-) -> NetStackNetworkV1 {
+    addresses: &[NetStackLocalAddress],
+) -> NetStackNetwork {
     let mut bytes = [0u8; 28];
     if !input.copy_packet_out(index, 14, &mut bytes)
         || u16::from_be_bytes([bytes[0], bytes[1]]) != 1
@@ -338,7 +377,7 @@ fn parse_arp(
     source[..4].copy_from_slice(&bytes[14..18]);
     let mut destination = [0; 16];
     destination[..4].copy_from_slice(&target_ip);
-    NetStackNetworkV1 {
+    NetStackNetwork {
         outcome: NET_STACK_NETWORK_ARP,
         family: NET_STACK_ADDRESS_FAMILY_IPV4,
         arp_operation: operation,
@@ -354,10 +393,10 @@ fn parse_ipv4(
     input: &net::buf::PacketBatch,
     index: usize,
     interface: u32,
-    addresses: &[NetStackLocalAddressV1],
+    addresses: &[NetStackLocalAddress],
     frame_len: u32,
     checksums_validated: bool,
-) -> NetStackNetworkV1 {
+) -> NetStackNetwork {
     let mut base = [0u8; 20];
     if !input.copy_packet_out(index, 14, &mut base) || base[0] >> 4 != 4 {
         return network_drop(NET_STACK_DROP_MALFORMED_IPV4);
@@ -391,7 +430,7 @@ fn parse_ipv4(
     let fragment_offset = fragment_field & 0x1fff;
     let more = fragment_field & 0x2000 != 0;
     let fragmented = fragment_offset != 0 || more;
-    NetStackNetworkV1 {
+    NetStackNetwork {
         outcome: NET_STACK_NETWORK_IP,
         family: NET_STACK_ADDRESS_FAMILY_IPV4,
         next_header: base[9],
@@ -486,9 +525,9 @@ fn parse_ipv6(
     input: &net::buf::PacketBatch,
     index: usize,
     interface: u32,
-    addresses: &[NetStackLocalAddressV1],
+    addresses: &[NetStackLocalAddress],
     frame_len: u32,
-) -> NetStackNetworkV1 {
+) -> NetStackNetwork {
     let mut base = [0u8; 40];
     if !input.copy_packet_out(index, 14, &mut base) || base[0] >> 4 != 6 {
         return network_drop(NET_STACK_DROP_MALFORMED_IPV6);
@@ -585,7 +624,7 @@ fn parse_ipv6(
             flags |= NET_STACK_NETWORK_FLAG_MORE_FRAGMENTS;
         }
     }
-    NetStackNetworkV1 {
+    NetStackNetwork {
         outcome: NET_STACK_NETWORK_IP,
         family: NET_STACK_ADDRESS_FAMILY_IPV6,
         next_header,
@@ -604,8 +643,8 @@ fn parse_ipv6(
     }
 }
 
-const fn empty_transport() -> NetStackTransportV1 {
-    NetStackTransportV1 {
+const fn empty_transport() -> NetStackTransport {
+    NetStackTransport {
         outcome: 0,
         protocol: 0,
         drop_reason: 0,
@@ -622,7 +661,7 @@ const fn empty_transport() -> NetStackTransportV1 {
         rss_hash: 0,
         tcp_sequence: 0,
         tcp_acknowledgement: 0,
-        tcp_options: NetStackTcpOptionsV1 {
+        tcp_options: NetStackTcpOptions {
             flags: 0,
             window_scale: 0,
             sack_count: 0,
@@ -638,19 +677,19 @@ const fn empty_transport() -> NetStackTransportV1 {
     }
 }
 
-fn transport_is_empty(sidecar: &NetStackTransportV1) -> bool {
+fn transport_is_empty(sidecar: &NetStackTransport) -> bool {
     *sidecar == empty_transport()
 }
 
-const fn transport_skipped() -> NetStackTransportV1 {
-    NetStackTransportV1 {
+const fn transport_skipped() -> NetStackTransport {
+    NetStackTransport {
         outcome: NET_STACK_TRANSPORT_SKIPPED,
         ..empty_transport()
     }
 }
 
-const fn transport_drop(reason: u8) -> NetStackTransportV1 {
-    NetStackTransportV1 {
+const fn transport_drop(reason: u8) -> NetStackTransport {
+    NetStackTransport {
         outcome: NET_STACK_TRANSPORT_DROP,
         drop_reason: reason,
         ..empty_transport()
@@ -719,378 +758,10 @@ fn checksum_packet_range(
     true
 }
 
-fn checksum_chain_range(
-    payload: &net::buf::PacketChain,
-    offset: usize,
-    len: usize,
-    checksum: &mut InternetChecksum,
-) -> bool {
-    let mut copied = 0usize;
-    let mut buffer = [0u8; 128];
-    while copied < len {
-        let chunk = (len - copied).min(buffer.len());
-        if payload
-            .copy_out(offset + copied, &mut buffer[..chunk])
-            .is_err()
-        {
-            return false;
-        }
-        checksum.add(&buffer[..chunk]);
-        copied += chunk;
-    }
-    true
-}
-
-fn tx_transport_checksum(
-    payload: &net::buf::PacketChain,
-    input: &NetStackTxInputV1,
-    protocol: u8,
-    transport_header: &[u8],
-) -> Option<u16> {
-    let transport_len = transport_header
-        .len()
-        .checked_add(input.payload_len as usize)?;
-    let mut checksum = InternetChecksum::new();
-    match input.family {
-        NET_STACK_ADDRESS_FAMILY_IPV4 => {
-            let len = u16::try_from(transport_len).ok()?;
-            checksum.add(&input.source[..4]);
-            checksum.add(&input.destination[..4]);
-            checksum.add(&[0, protocol]);
-            checksum.add(&len.to_be_bytes());
-        }
-        NET_STACK_ADDRESS_FAMILY_IPV6 => {
-            let len = u32::try_from(transport_len).ok()?;
-            checksum.add(&input.source);
-            checksum.add(&input.destination);
-            checksum.add(&len.to_be_bytes());
-            checksum.add(&[0, 0, 0, protocol]);
-        }
-        _ => return None,
-    }
-    checksum.add(transport_header);
-    checksum_chain_range(
-        payload,
-        input.payload_offset as usize,
-        input.payload_len as usize,
-        &mut checksum,
-    )
-    .then(|| checksum.finish())
-}
-
-fn build_tx_header(
-    payload: &net::buf::PacketChain,
-    input: &NetStackTxInputV1,
-) -> Option<(u16, [u8; NET_STACK_TX_HEADER_CAPACITY])> {
-    if !tx_input_valid(input)
-        || input
-            .payload_offset
-            .checked_add(input.payload_len)
-            .is_none_or(|end| end > payload.total_len() as u32)
-    {
-        return None;
-    }
-    let ip_header_len = if input.family == NET_STACK_ADDRESS_FAMILY_IPV4 {
-        20usize
-    } else {
-        40usize
-    };
-    let transport_header_len = if input.kind == NET_STACK_TX_UDP {
-        8usize
-    } else {
-        20 + usize::from(input.tcp_options_len)
-    };
-    let header_len = 14 + ip_header_len + transport_header_len;
-    let mut header = [0u8; NET_STACK_TX_HEADER_CAPACITY];
-    header[..6].copy_from_slice(&input.destination_mac);
-    header[6..12].copy_from_slice(&input.source_mac);
-    let protocol = if input.kind == NET_STACK_TX_UDP {
-        17
-    } else {
-        6
-    };
-    let transport_offset = 14 + ip_header_len;
-
-    match input.family {
-        NET_STACK_ADDRESS_FAMILY_IPV4 => {
-            header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            let total_len = ip_header_len
-                .checked_add(transport_header_len)?
-                .checked_add(input.payload_len as usize)?;
-            let total_len = u16::try_from(total_len).ok()?;
-            header[14] = 0x45;
-            header[15] = input.traffic_class;
-            header[16..18].copy_from_slice(&total_len.to_be_bytes());
-            header[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
-            header[22] = input.hop_limit;
-            header[23] = protocol;
-            header[26..30].copy_from_slice(&input.source[..4]);
-            header[30..34].copy_from_slice(&input.destination[..4]);
-            let ip_checksum = checksum(&header[14..34]);
-            header[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
-        }
-        NET_STACK_ADDRESS_FAMILY_IPV6 => {
-            header[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
-            header[14..18].copy_from_slice(
-                &(0x6000_0000u32 | (u32::from(input.traffic_class) << 20)).to_be_bytes(),
-            );
-            let transport_len = transport_header_len.checked_add(input.payload_len as usize)?;
-            header[18..20].copy_from_slice(&u16::try_from(transport_len).ok()?.to_be_bytes());
-            header[20] = protocol;
-            header[21] = input.hop_limit;
-            header[22..38].copy_from_slice(&input.source);
-            header[38..54].copy_from_slice(&input.destination);
-        }
-        _ => return None,
-    }
-
-    if input.kind == NET_STACK_TX_UDP {
-        let udp_len = u16::try_from(8usize.checked_add(input.payload_len as usize)?).ok()?;
-        let udp = &mut header[transport_offset..transport_offset + 8];
-        udp[..2].copy_from_slice(&input.source_port.to_be_bytes());
-        udp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
-        udp[4..6].copy_from_slice(&udp_len.to_be_bytes());
-        let mut checksum_header = [0u8; 8];
-        checksum_header.copy_from_slice(udp);
-        let checksum = tx_transport_checksum(payload, input, protocol, &checksum_header)?;
-        udp[6..8].copy_from_slice(&(if checksum == 0 { 0xffff } else { checksum }).to_be_bytes());
-    } else {
-        let tcp = &mut header[transport_offset..transport_offset + transport_header_len];
-        tcp[..2].copy_from_slice(&input.source_port.to_be_bytes());
-        tcp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
-        tcp[4..8].copy_from_slice(&input.tcp_sequence.to_be_bytes());
-        tcp[8..12].copy_from_slice(&input.tcp_acknowledgement.to_be_bytes());
-        tcp[12] = ((transport_header_len / 4) as u8) << 4 | u8::from(input.tcp_flags & 0x100 != 0);
-        tcp[13] = input.tcp_flags as u8;
-        tcp[14..16].copy_from_slice(&input.tcp_window.to_be_bytes());
-        tcp[20..].copy_from_slice(&input.tcp_options[..usize::from(input.tcp_options_len)]);
-        let mut checksum_header = [0u8; 60];
-        checksum_header[..transport_header_len].copy_from_slice(tcp);
-        let checksum = tx_transport_checksum(
-            payload,
-            input,
-            protocol,
-            &checksum_header[..transport_header_len],
-        )?;
-        tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
-    }
-    Some((header_len as u16, header))
-}
-
-fn fragment_udp_checksum(
-    payload: &net::buf::PacketChain,
-    input: &NetStackTxFragmentInputV1,
-    header: &[u8; 8],
-) -> Option<u16> {
-    let total_len = 8usize.checked_add(input.payload_len as usize)?;
-    let mut checksum = InternetChecksum::new();
-    match input.family {
-        NET_STACK_ADDRESS_FAMILY_IPV4 => {
-            let length = u16::try_from(total_len).ok()?;
-            checksum.add(&input.source[..4]);
-            checksum.add(&input.destination[..4]);
-            checksum.add(&[0, 17]);
-            checksum.add(&length.to_be_bytes());
-        }
-        NET_STACK_ADDRESS_FAMILY_IPV6 => {
-            let length = u32::try_from(total_len).ok()?;
-            checksum.add(&input.source);
-            checksum.add(&input.destination);
-            checksum.add(&length.to_be_bytes());
-            checksum.add(&[0, 0, 0, 17]);
-        }
-        _ => return None,
-    }
-    checksum.add(header);
-    checksum_chain_range(payload, 0, input.payload_len as usize, &mut checksum)
-        .then(|| checksum.finish())
-}
-
-fn build_tx_fragment_header(
-    payload: &net::buf::PacketChain,
-    input: &NetStackTxFragmentInputV1,
-) -> Option<(
-    u16,
-    [u8; NET_STACK_TX_HEADER_CAPACITY],
-    u32,
-    u32,
-    u32,
-    bool,
-)> {
-    if !tx_fragment_input_valid(input) || input.payload_len as usize > payload.total_len() {
-        return None;
-    }
-    let mut header = [0u8; NET_STACK_TX_HEADER_CAPACITY];
-    header[..6].copy_from_slice(&input.destination_mac);
-    header[6..12].copy_from_slice(&input.source_mac);
-    match input.kind {
-        NET_STACK_TX_UDP_FRAGMENT => {
-            let datagram_len = 8usize.checked_add(input.payload_len as usize)?;
-            let (_ip_header_len, _fragment_header_len, fragment_capacity) = match input.family {
-                NET_STACK_ADDRESS_FAMILY_IPV4 => (
-                    20usize,
-                    0usize,
-                    (input.mtu as usize).checked_sub(20)? & !7,
-                ),
-                NET_STACK_ADDRESS_FAMILY_IPV6 => (
-                    40usize,
-                    8usize,
-                    (input.mtu as usize).checked_sub(48)? & !7,
-                ),
-                _ => return None,
-            };
-            if fragment_capacity < 8 {
-                return None;
-            }
-            let datagram_offset = if input.fragment_offset == 0 {
-                0usize
-            } else {
-                8usize.checked_add(input.fragment_offset as usize)?
-            };
-            if datagram_offset >= datagram_len {
-                return None;
-            }
-            let chunk_len = fragment_capacity.min(datagram_len - datagram_offset);
-            let first = input.fragment_offset == 0;
-            let payload_offset = input.fragment_offset;
-            let payload_len = chunk_len.checked_sub(if first { 8 } else { 0 })? as u32;
-            let next_offset = payload_offset.checked_add(payload_len)?;
-            let more = next_offset < input.payload_len;
-            let fragment_field = (datagram_offset / 8) as u16;
-            match input.family {
-                NET_STACK_ADDRESS_FAMILY_IPV4 => {
-                    header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-                    header[14] = 0x45;
-                    header[15] = input.traffic_class;
-                    header[16..18]
-                        .copy_from_slice(&u16::try_from(20 + chunk_len).ok()?.to_be_bytes());
-                    header[18..20].copy_from_slice(&(input.identification as u16).to_be_bytes());
-                    header[20..22].copy_from_slice(
-                        &(fragment_field | if more { 0x2000 } else { 0 }).to_be_bytes(),
-                    );
-                    header[22] = input.hop_limit;
-                    header[23] = 17;
-                    header[26..30].copy_from_slice(&input.source[..4]);
-                    header[30..34].copy_from_slice(&input.destination[..4]);
-                    let checksum = checksum(&header[14..34]);
-                    header[24..26].copy_from_slice(&checksum.to_be_bytes());
-                    if first {
-                        let udp = &mut header[34..42];
-                        udp[..2].copy_from_slice(&input.source_port.to_be_bytes());
-                        udp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
-                        udp[4..6].copy_from_slice(&u16::try_from(datagram_len).ok()?.to_be_bytes());
-                        let mut checksum_header = [0u8; 8];
-                        checksum_header.copy_from_slice(udp);
-                        let value = fragment_udp_checksum(payload, input, &checksum_header)?;
-                        udp[6..8].copy_from_slice(&(if value == 0 { 0xffff } else { value }).to_be_bytes());
-                    }
-                    Some((
-                        (34 + if first { 8 } else { 0 }) as u16,
-                        header,
-                        payload_offset,
-                        payload_len,
-                        next_offset,
-                        more,
-                    ))
-                }
-                NET_STACK_ADDRESS_FAMILY_IPV6 => {
-                    header[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
-                    header[14..18].copy_from_slice(
-                        &(0x6000_0000u32 | (u32::from(input.traffic_class) << 20)).to_be_bytes(),
-                    );
-                    let ipv6_payload_len = 8usize + chunk_len;
-                    header[18..20].copy_from_slice(&u16::try_from(ipv6_payload_len).ok()?.to_be_bytes());
-                    header[20] = 44;
-                    header[21] = input.hop_limit;
-                    header[22..38].copy_from_slice(&input.source);
-                    header[38..54].copy_from_slice(&input.destination);
-                    header[54] = 17;
-                    header[56..58].copy_from_slice(
-                        &(((fragment_field) << 3) | u16::from(more)).to_be_bytes(),
-                    );
-                    header[58..62].copy_from_slice(&input.identification.to_be_bytes());
-                    if first {
-                        let udp = &mut header[62..70];
-                        udp[..2].copy_from_slice(&input.source_port.to_be_bytes());
-                        udp[2..4].copy_from_slice(&input.destination_port.to_be_bytes());
-                        udp[4..6].copy_from_slice(&u16::try_from(datagram_len).ok()?.to_be_bytes());
-                        let mut checksum_header = [0u8; 8];
-                        checksum_header.copy_from_slice(udp);
-                        let value = fragment_udp_checksum(payload, input, &checksum_header)?;
-                        udp[6..8].copy_from_slice(&(if value == 0 { 0xffff } else { value }).to_be_bytes());
-                    }
-                    Some((
-                        (62 + if first { 8 } else { 0 }) as u16,
-                        header,
-                        payload_offset,
-                        payload_len,
-                        next_offset,
-                        more,
-                    ))
-                }
-                _ => None,
-            }
-        }
-        NET_STACK_TX_RAW_FRAGMENT => {
-            if payload.total_len() != input.payload_len as usize || payload.total_len() < 20 {
-                return None;
-            }
-            let mut ip = [0u8; 60];
-            payload.copy_out(0, &mut ip[..20]).ok()?;
-            let header_len = usize::from(ip[0] & 0x0f) * 4;
-            if ip[0] >> 4 != 4
-                || !(20..=60).contains(&header_len)
-                || header_len % 4 != 0
-                || input.raw_header_len != 0 && usize::from(input.raw_header_len) != header_len
-            {
-                return None;
-            }
-            payload.copy_out(0, &mut ip[..header_len]).ok()?;
-            let body_len = payload.total_len().checked_sub(header_len)?;
-            let capacity = (input.mtu as usize).checked_sub(header_len)? & !7;
-            if capacity < 8 || input.fragment_offset as usize >= body_len {
-                return None;
-            }
-            let chunk_len = capacity.min(body_len - input.fragment_offset as usize);
-            let more = input.fragment_offset as usize + chunk_len < body_len;
-            let flags = u16::from_be_bytes([ip[6], ip[7]]);
-            if flags & 0x4000 != 0 {
-                return None;
-            }
-            ip[2..4].copy_from_slice(&u16::try_from(header_len + chunk_len).ok()?.to_be_bytes());
-            ip[6..8].copy_from_slice(
-                &((flags & 0x8000)
-                    | ((input.fragment_offset / 8) as u16)
-                    | if more { 0x2000 } else { 0 })
-                    .to_be_bytes(),
-            );
-            if ip[12..16] == [0; 4] {
-                ip[12..16].copy_from_slice(&input.source[..4]);
-            }
-            ip[16..20].copy_from_slice(&input.destination[..4]);
-            ip[10..12].fill(0);
-            let ip_checksum = checksum(&ip[..header_len]);
-            ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-            header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            header[14..14 + header_len].copy_from_slice(&ip[..header_len]);
-            let next_offset = input.fragment_offset.saturating_add(chunk_len as u32);
-            Some((
-                (14 + header_len) as u16,
-                header,
-                header_len as u32 + input.fragment_offset,
-                chunk_len as u32,
-                next_offset,
-                more,
-            ))
-        }
-        _ => None,
-    }
-}
-
 fn transport_checksum_valid(
     input: &net::buf::PacketBatch,
     index: usize,
-    network: &NetStackNetworkV1,
+    network: &NetStackNetwork,
     protocol: u8,
     len: usize,
 ) -> bool {
@@ -1128,7 +799,7 @@ fn transport_checksum_valid(
 fn icmpv4_checksum_valid(
     input: &net::buf::PacketBatch,
     index: usize,
-    network: &NetStackNetworkV1,
+    network: &NetStackNetwork,
 ) -> bool {
     let mut checksum = InternetChecksum::new();
     checksum_packet_range(
@@ -1143,8 +814,8 @@ fn icmpv4_checksum_valid(
 fn flow_hash(
     rss_key: &[u8; 40],
     rss_generation: u32,
-    facts: net::stack::NetStackPacketInputV1,
-    network: &NetStackNetworkV1,
+    facts: net::stack::NetStackPacketInput,
+    network: &NetStackNetwork,
     source_port: u16,
     destination_port: u16,
 ) -> Option<u32> {
@@ -1201,13 +872,13 @@ fn parse_tcp_options(
     index: usize,
     offset: usize,
     header_len: usize,
-) -> Result<NetStackTcpOptionsV1, u8> {
+) -> Result<NetStackTcpOptions, u8> {
     let options_len = header_len - 20;
     let mut bytes = [0u8; 40];
     if !input.copy_packet_out(index, offset, &mut bytes[..options_len]) {
         return Err(NET_STACK_DROP_MALFORMED_TCP);
     }
-    let mut parsed = NetStackTcpOptionsV1::empty();
+    let mut parsed = NetStackTcpOptions::empty();
     let mut sack_seen = false;
     let mut cursor = 0usize;
     while cursor < options_len {
@@ -1289,11 +960,11 @@ fn parse_tcp_options(
 fn parse_tcp(
     input: &net::buf::PacketBatch,
     index: usize,
-    network: &NetStackNetworkV1,
-    facts: net::stack::NetStackPacketInputV1,
+    network: &NetStackNetwork,
+    facts: net::stack::NetStackPacketInput,
     rss_key: &[u8; 40],
     rss_generation: u32,
-) -> NetStackTransportV1 {
+) -> NetStackTransport {
     if network.payload_len < 20 {
         return transport_drop(NET_STACK_DROP_MALFORMED_TCP);
     }
@@ -1334,7 +1005,7 @@ fn parse_tcp(
     ) else {
         return transport_drop(NET_STACK_DROP_MALFORMED_TCP);
     };
-    NetStackTransportV1 {
+    NetStackTransport {
         outcome: NET_STACK_TRANSPORT_TCP,
         protocol: 6,
         source_port,
@@ -1356,11 +1027,11 @@ fn parse_tcp(
 fn parse_udp(
     input: &net::buf::PacketBatch,
     index: usize,
-    network: &NetStackNetworkV1,
-    facts: net::stack::NetStackPacketInputV1,
+    network: &NetStackNetwork,
+    facts: net::stack::NetStackPacketInput,
     rss_key: &[u8; 40],
     rss_generation: u32,
-) -> NetStackTransportV1 {
+) -> NetStackTransport {
     if network.payload_len < 8 {
         return transport_drop(NET_STACK_DROP_MALFORMED_UDP);
     }
@@ -1394,7 +1065,7 @@ fn parse_udp(
     ) else {
         return transport_drop(NET_STACK_DROP_MALFORMED_UDP);
     };
-    NetStackTransportV1 {
+    NetStackTransport {
         outcome: NET_STACK_TRANSPORT_UDP,
         protocol: 17,
         source_port,
@@ -1410,9 +1081,9 @@ fn parse_udp(
 fn parse_icmp(
     input: &net::buf::PacketBatch,
     index: usize,
-    network: &NetStackNetworkV1,
-    facts: net::stack::NetStackPacketInputV1,
-) -> NetStackTransportV1 {
+    network: &NetStackNetwork,
+    facts: net::stack::NetStackPacketInput,
+) -> NetStackTransport {
     if network.payload_len < 8 {
         return transport_drop(if network.family == NET_STACK_ADDRESS_FAMILY_IPV6 {
             NET_STACK_DROP_MALFORMED_IPV6
@@ -1435,7 +1106,7 @@ fn parse_icmp(
     if !checksum_valid {
         return transport_drop(NET_STACK_DROP_UNSUPPORTED_IP_PROTOCOL);
     }
-    NetStackTransportV1 {
+    NetStackTransport {
         outcome: NET_STACK_TRANSPORT_ICMP,
         protocol: network.next_header,
         payload_offset: network.payload_offset,
@@ -1447,11 +1118,11 @@ fn parse_icmp(
 fn parse_transport(
     input: &net::buf::PacketBatch,
     index: usize,
-    network: &NetStackNetworkV1,
-    facts: net::stack::NetStackPacketInputV1,
+    network: &NetStackNetwork,
+    facts: net::stack::NetStackPacketInput,
     rss_key: &[u8; 40],
     rss_generation: u32,
-) -> NetStackTransportV1 {
+) -> NetStackTransport {
     if network.outcome != NET_STACK_NETWORK_IP
         || network.flags & (NET_STACK_NETWORK_FLAG_FRAGMENT | NET_STACK_NETWORK_FLAG_IPV6_PROBLEM)
             != 0
@@ -1464,7 +1135,7 @@ fn parse_transport(
         (NET_STACK_ADDRESS_FAMILY_IPV4, 1) | (NET_STACK_ADDRESS_FAMILY_IPV6, 58) => {
             parse_icmp(input, index, network, facts)
         }
-        _ => NetStackTransportV1 {
+        _ => NetStackTransport {
             outcome: NET_STACK_TRANSPORT_RAW,
             protocol: network.next_header,
             payload_offset: network.payload_offset,
@@ -1474,82 +1145,288 @@ fn parse_transport(
     }
 }
 
-fn initialize_flow_shards(boot: net::boot::NetStackBootConfig) -> bool {
+fn initialize_flow_shards(boot: net::boot::NetStackBootConfig, generation: u64) -> bool {
     let count = usize::from(boot.active_cpu_count());
     if count == 0 || count > sched::NR_CPUS {
         return false;
     }
     let now_ns = sched::now_ns_public();
-    let shards = (0..count)
-        .map(|index| {
-            Some(Arc::new(Spinlock::new(ManuallyDrop::new(
+    if count > FLOW_SHARDS.len() {
+        return false;
+    }
+    for slot in &FLOW_SHARDS {
+        // Safety: 初始化发生在发布任何 stack 调用之前。
+        unsafe { *slot.0.get() = None };
+    }
+    for index in 0..count {
+        if !FLOW_EXECUTIONS[index].install_generation(generation) {
+            return false;
+        }
+        // Safety: 每个槽位在 generation 激活前只初始化一次。
+        unsafe {
+            *FLOW_SHARDS[index].0.get() = Some(ManuallyDrop::new(
                 net::stack::create_flow_shard(ShardId(index as u16), boot, now_ns),
-            ))))
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+    }
     *CONTROL_PLANE.lock() = Some(Arc::new(Spinlock::new(ManuallyDrop::new(
         net::stack::create_control_plane(count, *boot.rss_key(), boot.hash_seed()),
     ))));
-    *FLOW_SHARDS.lock() = shards;
     true
 }
 
-fn flow_shard(id: ShardId) -> Option<Arc<Spinlock<ManuallyDrop<FlowShard>>>> {
-    FLOW_SHARDS
-        .lock()
-        .get(usize::from(id.0))
-        .and_then(Option::as_ref)
-        .cloned()
-}
-
-fn dispatch_flow_call(call: &mut NetStackFlowCallV1) -> bool {
-    if let net::stack::NetStackFlowCommand::Control { command } = &mut call.command {
-        let Some(control) = CONTROL_PLANE.lock().as_ref().cloned() else {
-            return false;
-        };
-        net::stack::dispatch_control_plane_call(&mut control.lock(), command);
-        call.committed = 1;
-        return true;
+#[inline(never)]
+fn parse_packet_batch_command(
+    generation: u64,
+    input: &mut Option<net::buf::PacketBatch>,
+    interface: net::InterfaceId,
+    config: *const net::control::ConfigSnapshot,
+    output: &mut Option<net::pipeline::FrontendBatch>,
+) -> bool {
+    if output.is_some() || config.is_null() || !config.is_aligned() || interface.0 == 0 {
+        return false;
     }
-    let Some(shard) = flow_shard(call.shard) else {
+    let Some(mut input_batch) = input.take() else {
         return false;
     };
-    net::stack::dispatch_flow_shard_call(&mut shard.lock(), call)
-}
-
-fn initialize_socket_table(boot: net::boot::NetStackBootConfig, generation: u64) -> bool {
-    let boot_nonce = u64::from_le_bytes(
-        boot.generation_nonce()[..8]
-            .try_into()
-            .expect("generation nonce 长度固定"),
+    // Safety: config 位于同步 shard-turn 登记的 host 地址范围内。
+    let config = unsafe { &*config };
+    let local_addresses = config.stack_local_addresses();
+    let Some(boot) = net::stack::boot_config() else {
+        *input = Some(input_batch);
+        return false;
+    };
+    let mut rss_generation_bytes = [0; 4];
+    rss_generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
+    let rss_generation = u32::from_le_bytes(rss_generation_bytes).max(1);
+    let rss_key = *boot.rss_key();
+    let mut turn = new_packet_parse(
+        generation,
+        config.generation,
+        interface.0,
+        &local_addresses,
+        rss_key,
+        rss_generation,
+        &input_batch,
     );
-    let Some(table) = net::stack::create_socket_table(boot_nonce, generation) else {
-        return false;
-    };
-    let mut slot = SOCKET_TABLE.lock();
-    if slot.is_some() {
-        net::stack::destroy_socket_table(table);
+    if !parse_packet_batch(&mut turn) || !packet_parse_committed(&turn, &input_batch) {
+        *input = Some(input_batch);
         return false;
     }
-    *slot = Some(ManuallyDrop::new(table));
+    let (ethernet, network, transport) = packet_parse_sidecars(&turn);
+    let Some(frontend) = net::stack::parse_frontend_packet_batch(
+        &mut input_batch,
+        ethernet,
+        network,
+        transport,
+    ) else {
+        *input = Some(input_batch);
+        return false;
+    };
+    *input = Some(input_batch);
+    *output = Some(frontend);
     true
+}
+
+#[inline(never)]
+fn drain_reassembly_command(
+    shard: &mut FlowShard,
+    generation: u64,
+    interface: net::InterfaceId,
+    config: *const net::control::ConfigSnapshot,
+    packets: &mut Vec<net::pipeline::FrontendPacket>,
+    errors: &mut Vec<(
+        net::InterfaceId,
+        net::transport::ControlErrorTarget,
+        net::transport::TransportControlError,
+        u64,
+    )>,
+) -> bool {
+    if config.is_null() || !config.is_aligned() || interface.0 == 0 {
+        return false;
+    }
+    // Safety: config 位于同步 shard-turn 登记的 host 地址范围内。
+    let config = unsafe { &*config };
+    let local_addresses = config.stack_local_addresses();
+    let Some(boot) = net::stack::boot_config() else {
+        return false;
+    };
+    let mut rss_generation_bytes = [0; 4];
+    rss_generation_bytes.copy_from_slice(&boot.generation_nonce()[..4]);
+    let rss_generation = u32::from_le_bytes(rss_generation_bytes).max(1);
+    let rss_key = *boot.rss_key();
+    for _ in 0..net::stack::NET_STACK_SHARD_TURN_COMMAND_CAPACITY {
+        let Some(input) = net::stack::flow_shard_take_reassembled_input(shard) else {
+            break;
+        };
+        let mut turn = new_packet_parse(
+            generation,
+            config.generation,
+            interface.0,
+            &local_addresses,
+            rss_key,
+            rss_generation,
+            &input,
+        );
+        if !parse_packet_batch(&mut turn) || !packet_parse_committed(&turn, &input) {
+            drop(input);
+            continue;
+        }
+        let (ethernet, network, transport) = packet_parse_sidecars(&turn);
+        let _ = net::stack::flow_shard_parse_reassembled_batch(
+            shard,
+            input,
+            ethernet,
+            network,
+            transport,
+        );
+        while let Some(packet) = net::stack::flow_shard_take_reassembled(shard) {
+            packets.push(packet);
+        }
+        while let Some(error) = net::stack::flow_shard_take_forwarded_error(shard) {
+            errors.push(error);
+        }
+    }
+    while let Some(packet) = net::stack::flow_shard_take_reassembled(shard) {
+        packets.push(packet);
+    }
+    while let Some(error) = net::stack::flow_shard_take_forwarded_error(shard) {
+        errors.push(error);
+    }
+    true
+}
+
+fn dispatch_shard_turn(call: &mut NetStackShardTurn) -> i32 {
+    let index = usize::from(call.shard.0);
+    if (!call.commands.is_empty() || !call.control_commands.is_empty())
+        && (index != sched::current_cpu_id() || index >= FLOW_SHARDS.len())
+    {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    if !call.control_commands.is_empty() && call.shard != net::ShardId(0) {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    let lease = if call.commands.is_empty() {
+        None
+    } else {
+        let Some(lease) = FLOW_EXECUTIONS[index].try_acquire(
+            call.generation,
+            FlowExecutorKind::Worker,
+            sched::current_cpu_id(),
+        ) else {
+            FLOW_EXECUTIONS[index].mark_pending();
+            return NET_STACK_SHARD_TURN_STATUS_BUSY;
+        };
+        Some(lease)
+    };
+    if !call.control_commands.is_empty() {
+        let Some(control) = CONTROL_PLANE.lock().as_ref().cloned() else {
+            return NET_STACK_SHARD_TURN_STATUS_INVALID;
+        };
+        let mut control = control.lock();
+        for index in 0..call.control_commands.len() {
+            let command = call
+                .control_commands
+                .get_mut(index)
+                .expect("control command batch 索引有效");
+            net::stack::dispatch_control_plane_call(&mut control, command);
+        }
+    }
+    if call.commands.is_empty() {
+        call.committed = 1;
+        return NET_STACK_SHARD_TURN_STATUS_OK;
+    }
+    // Safety: 执行租约覆盖整个 shard turn，因此这是本轮对 shard 的唯一可变访问。
+    let Some(shard) = (unsafe { &mut *FLOW_SHARDS[index].0.get() }).as_mut() else {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    };
+    for index in 0..call.commands.len() {
+        let command = call
+            .commands
+            .get_mut(index)
+            .expect("flow command batch 索引有效");
+        let valid = match command {
+            net::stack::NetStackFlowCommand::ParsePacketBatch {
+                input,
+                interface,
+                config,
+                output,
+            } => parse_packet_batch_command(
+                call.generation,
+                input,
+                *interface,
+                *config,
+                output,
+            ),
+            net::stack::NetStackFlowCommand::DrainReassembly {
+                interface,
+                config,
+                packets,
+                errors,
+            } => drain_reassembly_command(
+                shard,
+                call.generation,
+                *interface,
+                *config,
+                packets,
+                errors,
+            ),
+            command => net::stack::dispatch_flow_shard_command(shard, command),
+        };
+        if !valid {
+            return NET_STACK_SHARD_TURN_STATUS_INVALID;
+        }
+    }
+    if !net::stack::finalize_shard_turn_tx(shard, &mut call.commands, &mut call.tx_plans) {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    call.committed = 1;
+    let _ = lease
+        .expect("非空 flow turn 必须持有执行租约")
+        .release_and_recheck();
+    NET_STACK_SHARD_TURN_STATUS_OK
+}
+
+fn dispatch_local_turn(turn: &mut NetStackLocalTurn) -> i32 {
+    let index = usize::from(turn.shard.0);
+    if index >= FLOW_SHARDS.len() || !turn.valid_header(turn.generation) {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    let Some(lease) = FLOW_EXECUTIONS[index].try_acquire(
+        turn.generation,
+        FlowExecutorKind::Syscall,
+        sched::current_cpu_id(),
+    ) else {
+        FLOW_EXECUTIONS[index].mark_pending();
+        return NET_STACK_SHARD_TURN_STATUS_BUSY;
+    };
+    // Safety: syscall 与 owner worker 竞争同一租约，因而同步调用期间只有当前任务
+    // 能修改这个 shard。turn 的命令所有权也只在本次调用期间借给动态模块。
+    let Some(shard) = (unsafe { &mut *FLOW_SHARDS[index].0.get() }).as_mut() else {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    };
+    let Some(command) = turn.command.as_mut() else {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    };
+    if !net::stack::dispatch_flow_shard_command(shard, command) {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
+    }
+    turn.committed = 1;
+    let _ = lease.release_and_recheck();
+    NET_STACK_SHARD_TURN_STATUS_OK
 }
 
 fn destroy_generation_state() {
-    if let Some(mut table) = SOCKET_TABLE.lock().take() {
-        // Safety: 套接字表只在这里从 ManuallyDrop 中取出一次，随后交给受
-        // capability 约束的宿主析构函数。
-        let state = unsafe { ManuallyDrop::take(&mut table) };
-        net::stack::destroy_socket_table(state);
-    }
-    let shards = core::mem::take(&mut *FLOW_SHARDS.lock());
-    for shard in shards.into_iter().flatten() {
-        let mut guard = shard.lock();
-        // Safety: 每个 shard 只在这里从 ManuallyDrop 中取出一次，随后交给受
-        // capability 约束的宿主析构函数。
-        let state = unsafe { ManuallyDrop::take(&mut guard) };
-        drop(guard);
-        net::stack::destroy_flow_shard(state);
+    for (index, slot) in FLOW_SHARDS.iter().enumerate() {
+        assert!(
+            !FLOW_EXECUTIONS[index].snapshot().busy,
+            "销毁协议 generation 时仍有执行者持有 shard 租约"
+        );
+        // Safety: quiesce 已在销毁 generation 前停止全部 owner 调用。
+        let state = unsafe { (*slot.0.get()).take().map(|mut shard| ManuallyDrop::take(&mut shard)) };
+        if let Some(state) = state {
+            net::stack::destroy_flow_shard(state);
+        }
     }
     if let Some(control) = CONTROL_PLANE.lock().take() {
         let mut guard = control.lock();
@@ -1594,7 +1471,7 @@ impl ElmModule for NetStackElm {
         })
     }
 
-    fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
+    fn initialize(&mut self, context: &LifecycleContext) -> HookResult {
         if self.handle.is_some() {
             return Err(HookError::new(-16));
         }
@@ -1602,38 +1479,33 @@ impl ElmModule for NetStackElm {
         if boot.active_cpu_count() == 0 || usize::from(boot.active_cpu_count()) > sched::NR_CPUS {
             return Err(HookError::new(-22));
         }
-        if !initialize_flow_shards(boot) {
+        if !initialize_flow_shards(boot, context.generation().max(1)) {
             return Err(HookError::new(-12));
         }
         QUIESCED.store(false, Ordering::Release);
         #[cfg(not(feature = "elm-integrated"))]
-        let (registration, generation) = {
-            let endpoint =
-                PinnedNetStackEndpoint::current("net.stack.call", "mygo.net.stack-call@1", 1)
-                    .ok_or(HookError::new(-22))?;
-            let generation = endpoint.owner_generation();
-            let socket_endpoint = PinnedNetStackEndpoint::current(
-                "net.stack.socket",
-                "mygo.net.stack-socket-call@1",
+        let registration = {
+            let endpoint = PinnedNetStackShardTurnEndpoint::current(
+                "net.stack.shard-turn",
+                "mygo.net.stack-shard-turn@1",
                 1,
             )
             .ok_or(HookError::new(-22))?;
-            (
-                NetStackRegistration::pinned(endpoint, socket_endpoint)
-                    .ok_or(HookError::new(-22))?,
-                generation,
+            let local_endpoint = PinnedNetStackShardTurnEndpoint::current(
+                "net.stack.local-turn",
+                "mygo.net.stack-local-turn@1",
+                1,
             )
+            .ok_or(HookError::new(-22))?;
+            NetStackRegistration::pinned_with_local(endpoint, local_endpoint)
+                .ok_or(HookError::new(-22))?
         };
         #[cfg(feature = "elm-integrated")]
-        let (registration, generation) = (
-            NetStackRegistration::integrated(net_stack_call, net_stack_socket_call)
-                .ok_or(HookError::new(-22))?,
-            1,
-        );
-        if !initialize_socket_table(boot, generation) {
-            destroy_generation_state();
-            return Err(HookError::new(-12));
-        }
+        let registration = NetStackRegistration::integrated_with_local(
+            net_stack_shard_turn,
+            net_stack_local_turn,
+        )
+        .ok_or(HookError::new(-22))?;
         let handle = match net::stack::register_stack(registration) {
             Ok(handle) => handle,
             Err(error) => {
@@ -1668,244 +1540,37 @@ impl ElmModule for NetStackElm {
 }
 
 #[elm::export(
-    name = "net.stack.call",
-    contract = "mygo.net.stack-call@1",
+    name = "net.stack.shard-turn",
+    contract = "mygo.net.stack-shard-turn@1",
     version = 1,
     mode = "direct-pinned",
     visibility = "private"
 )]
-fn net_stack_call(frame: &mut net::stack::NetStackCallV1) -> i32 {
-    if !frame.valid(frame.opcode, frame.generation) || frame.generation == 0 {
-        return NET_STACK_CALL_STATUS_INVALID;
+fn net_stack_shard_turn(turn: &mut net::stack::NetStackShardTurn) -> i32 {
+    if QUIESCED.load(Ordering::Acquire)
+        || turn.generation == 0
+        || !turn.valid_header(turn.generation)
+    {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
     }
-    match frame.opcode {
-        NET_STACK_OP_PROBE => {
-            let quiesced = QUIESCED.load(Ordering::Acquire);
-            frame.ready = u8::from(!quiesced);
-            frame.quiesced = u8::from(quiesced);
-        }
-        NET_STACK_OP_WORKER_TURN => {
-            if QUIESCED.load(Ordering::Acquire) {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 已把 worker-turn 帧声明为本次 pinned call 的可访问范围；
-            // 指针只在同步调用期间借用，ELM 不保存它。
-            let turn = unsafe { &mut *frame.worker_turn };
-            if !worker_turn_header_valid(turn, frame.generation) || turn.committed != 0 {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 同时声明了只读 PacketBatch 外壳范围，实际 fragment backing
-            // 只会由受能力约束的 copy_packet_out 内核符号读取。
-            let input = unsafe { &*turn.input };
-            let Ok(address_count) = usize::try_from(turn.local_address_count) else {
-                return NET_STACK_CALL_STATUS_INVALID;
-            };
-            let Some(address_bytes) =
-                address_count.checked_mul(core::mem::size_of::<NetStackLocalAddressV1>())
-            else {
-                return NET_STACK_CALL_STATUS_INVALID;
-            };
-            let address_pointer = turn.local_addresses;
-            if address_bytes > isize::MAX as usize || !address_pointer.is_aligned() {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 已把地址投影声明为本次 pinned call 的只读范围；长度和对齐
-            // 已在上面校验，slice 只在同步调用期间借用，ELM 不保存它。
-            let addresses = unsafe { core::slice::from_raw_parts(address_pointer, address_count) };
-            let rss_key = turn.rss_key;
-            let rss_generation = turn.rss_generation;
-            if input.len() != usize::from(turn.input_count)
-                || !packet_inputs_valid(turn)
-                || !addresses.iter().all(address_projection_valid)
-            {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            for index in 0..usize::from(turn.input_count) {
-                if !ethernet_is_empty(&turn.ethernet[index])
-                    || !network_is_empty(&turn.network[index])
-                    || !transport_is_empty(&turn.transport[index])
-                {
-                    return NET_STACK_CALL_STATUS_INVALID;
-                }
-                let mut header = [0u8; 14];
-                let sidecar = if !input.copy_packet_out(index, 0, &mut header) {
-                    NetStackEthernetV1 {
-                        status: NET_STACK_ETHERNET_TRUNCATED,
-                        ..empty_ethernet()
-                    }
-                } else {
-                    let ethertype = u16::from_be_bytes([header[12], header[13]]);
-                    let status = match ethertype {
-                        0x0800 | 0x0806 | 0x86dd => NET_STACK_ETHERNET_ACCEPTED,
-                        0x8100 | 0x88a8 => NET_STACK_ETHERNET_VLAN_UNSUPPORTED,
-                        _ => NET_STACK_ETHERNET_UNSUPPORTED,
-                    };
-                    NetStackEthernetV1 {
-                        destination: header[0..6].try_into().unwrap(),
-                        source: header[6..12].try_into().unwrap(),
-                        ethertype,
-                        status,
-                        reserved: [0; 5],
-                    }
-                };
-                let network = if sidecar.status != NET_STACK_ETHERNET_ACCEPTED {
-                    NetStackNetworkV1 {
-                        outcome: net::stack::NET_STACK_NETWORK_SKIPPED,
-                        ..empty_network()
-                    }
-                } else {
-                    let facts = turn.packet_inputs[index];
-                    match sidecar.ethertype {
-                        0x0806 => parse_arp(input, index, turn.interface, addresses),
-                        0x0800 => parse_ipv4(
-                            input,
-                            index,
-                            turn.interface,
-                            addresses,
-                            facts.frame_len,
-                            facts.checksums_validated != 0,
-                        ),
-                        0x86dd => {
-                            parse_ipv6(input, index, turn.interface, addresses, facts.frame_len)
-                        }
-                        _ => return NET_STACK_CALL_STATUS_INVALID,
-                    }
-                };
-                let transport = parse_transport(
-                    input,
-                    index,
-                    &network,
-                    turn.packet_inputs[index],
-                    &rss_key,
-                    rss_generation,
-                );
-                turn.ethernet[index] = sidecar;
-                turn.network[index] = network;
-                turn.transport[index] = transport;
-                turn.committed = (index + 1) as u8;
-            }
-        }
-        NET_STACK_OP_TX_HEADER => {
-            if QUIESCED.load(Ordering::Acquire) {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 已把 TX 帧声明为本次 pinned call 的可访问范围；指针只在
-            // 同步调用期间借用，ELM 不保存它。
-            let output = unsafe { &mut *frame.tx_header };
-            if !tx_header_frame_valid(output, frame.generation) {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 同时声明了只读 PacketChain 外壳范围，payload backing 只会
-            // 由受能力约束的 copy_out 内核符号读取。
-            let payload = unsafe { &*output.payload };
-            let Some((header_len, header)) = build_tx_header(payload, &output.input) else {
-                return NET_STACK_CALL_STATUS_INVALID;
-            };
-            output.header_len = header_len;
-            output.header = header;
-            output.committed = 1;
-        }
-        NET_STACK_OP_TX_FRAGMENT_HEADER => {
-            if QUIESCED.load(Ordering::Acquire) || frame.reserved1[0] == 0 {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            let output_pointer =
-                frame.reserved1[0] as usize as *mut NetStackTxFragmentHeaderV1;
-            if !output_pointer.is_aligned() {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 将分片输出帧声明为本次 pinned call 的可访问范围；
-            // 指针只在同步调用期间借用，ELM 不保存它。
-            let output = unsafe { &mut *output_pointer };
-            if !tx_fragment_frame_valid(output, frame.generation) {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 同时声明了只读 PacketChain 外壳范围，payload backing 只会
-            // 由受能力约束的 copy_out 内核符号读取。
-            let payload = unsafe { &*output.payload };
-            let Some((header_len, header, payload_offset, payload_len, next_offset, more)) =
-                build_tx_fragment_header(payload, &output.input)
-            else {
-                return NET_STACK_CALL_STATUS_INVALID;
-            };
-            output.header_len = header_len;
-            output.header = header;
-            output.payload_offset = payload_offset;
-            output.payload_len = payload_len;
-            output.next_fragment_offset = if more { next_offset } else { 0 };
-            output.more_fragments = u8::from(more);
-            output.committed = 1;
-        }
-        NET_STACK_OP_FLOW_CALL => {
-            if QUIESCED.load(Ordering::Acquire) || frame.reserved1[0] == 0 {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            let call_pointer = frame.reserved1[0] as usize as *mut NetStackFlowCallV1;
-            if !call_pointer.is_aligned() {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: host 将 state-call 帧声明为本次 pinned call 的可写范围；ELM
-            // 只在同步调用期间访问并按 Option 所有权协议取放值。
-            let call = unsafe { &mut *call_pointer };
-            if !call.valid_header(frame.generation) || !dispatch_flow_call(call) {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-        }
-        NET_STACK_OP_QUIESCE => {
-            QUIESCED.store(true, Ordering::Release);
-            frame.ready = 0;
-            frame.quiesced = 1;
-        }
-        _ => return NET_STACK_CALL_STATUS_INVALID,
-    }
-    NET_STACK_CALL_STATUS_OK
+    dispatch_shard_turn(turn)
 }
 
 #[elm::export(
-    name = "net.stack.socket",
-    contract = "mygo.net.stack-socket-call@1",
+    name = "net.stack.local-turn",
+    contract = "mygo.net.stack-local-turn@1",
     version = 1,
     mode = "direct-pinned",
     visibility = "private"
 )]
-fn net_stack_socket_call(frame: &mut net::stack::NetStackSocketCallV1) -> i32 {
-    let request_pointer = frame.request;
-    if !frame.valid(frame.opcode, frame.stack_generation, request_pointer) || frame.committed != 0 {
-        return NET_STACK_CALL_STATUS_INVALID;
+fn net_stack_local_turn(turn: &mut net::stack::NetStackLocalTurn) -> i32 {
+    if QUIESCED.load(Ordering::Acquire)
+        || turn.generation == 0
+        || !turn.valid_header(turn.generation)
+    {
+        return NET_STACK_SHARD_TURN_STATUS_INVALID;
     }
-    match frame.opcode {
-        NET_STACK_SOCKET_OP_PROBE => {
-            let quiesced = QUIESCED.load(Ordering::Acquire);
-            frame.ready = u8::from(!quiesced);
-            frame.quiesced = u8::from(quiesced);
-            frame.committed = 1;
-        }
-        _ => {
-            if request_pointer.is_null() || !request_pointer.is_aligned() {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            // Safety: 宿主将请求声明为本次 pinned call 的可写范围；指针只在
-            // 同步调用期间使用，ELM 不保存它。
-            let request = unsafe { &mut *request_pointer };
-            // socket 操作可能在宿主 control/lifecycle 队列回压时让出 CPU。此时同核
-            // 后续调用不能自旋等待，否则持锁任务无法恢复；由宿主退出 ELM 后重试。
-            let Some(mut table) = SOCKET_TABLE.try_lock() else {
-                return NET_STACK_CALL_STATUS_BUSY;
-            };
-            let Some(table) = table.as_mut() else {
-                return NET_STACK_CALL_STATUS_INVALID;
-            };
-            if !net::stack::dispatch_socket_table_call(
-                table,
-                request,
-                QUIESCED.load(Ordering::Acquire),
-            ) {
-                return NET_STACK_CALL_STATUS_INVALID;
-            }
-            frame.committed = 1;
-        }
-    }
-    NET_STACK_CALL_STATUS_OK
+    dispatch_local_turn(turn)
 }
 
 #[cfg(not(feature = "elm-integrated"))]

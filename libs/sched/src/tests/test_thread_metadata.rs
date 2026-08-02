@@ -3,17 +3,79 @@
 extern crate alloc;
 extern crate std;
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use core::ptr::NonNull;
 
 use ktest::ktest;
 
 use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqEvent, RseqRegistration,
-    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, TaskState,
-    TaskUsage, ThreadGroup, supported_cpu_mask,
+    ArchContextOps, CpuMask, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS, ProcessGroup,
+    RobustListState, RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy,
+    Session, SignalNumber, TASK_COMM_LEN, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage,
+    ThreadGroup, supported_cpu_mask,
 };
+
+const TEST_EXECUTION_ACTION: u64 = 1;
+
+#[ktest]
+fn vm_space_extension_can_be_borrowed_without_arc_clone() {
+    let task = make_task();
+    let payload = Arc::new(42usize);
+    let erased: Arc<dyn core::any::Any + Send + Sync> = payload;
+
+    task.ext_install(TASKEXT_VM_SPACE, erased);
+    assert_eq!(
+        task.ext_with(TASKEXT_VM_SPACE, |value| {
+            value.downcast_ref::<usize>().copied()
+        }),
+        Some(Some(42))
+    );
+    assert!(task.ext_remove(TASKEXT_VM_SPACE).is_some());
+    assert!(task.ext_with(TASKEXT_VM_SPACE, |_| ()).is_none());
+}
+
+#[ktest]
+fn task_execution_scope_allows_each_action_once_and_resets_on_exit() {
+    let task = make_task();
+
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::OutsideScope
+    );
+    assert!(task.begin_execution_scope(ExecutionScopeKind::Syscall));
+    assert_eq!(
+        task.execution_scope_kind(),
+        Some(ExecutionScopeKind::Syscall)
+    );
+    assert!(!task.begin_execution_scope(ExecutionScopeKind::NetworkWorker));
+    assert!(!task.execution_action_claimed(TEST_EXECUTION_ACTION));
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::Claimed(ExecutionScopeKind::Syscall)
+    );
+    assert!(task.execution_action_claimed(TEST_EXECUTION_ACTION));
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::AlreadyClaimed(ExecutionScopeKind::Syscall)
+    );
+    assert_eq!(
+        task.end_execution_scope(ExecutionScopeKind::Syscall),
+        TEST_EXECUTION_ACTION
+    );
+    assert_eq!(task.execution_scope_kind(), None);
+    assert!(!task.execution_action_claimed(TEST_EXECUTION_ACTION));
+
+    assert!(task.begin_execution_scope(ExecutionScopeKind::NetworkWorker));
+    assert_eq!(
+        task.claim_execution_action(TEST_EXECUTION_ACTION),
+        ExecutionActionClaim::Claimed(ExecutionScopeKind::NetworkWorker)
+    );
+    assert_eq!(
+        task.end_execution_scope(ExecutionScopeKind::NetworkWorker),
+        TEST_EXECUTION_ACTION
+    );
+}
 
 unsafe fn init_test_context(
     _ctx: NonNull<u8>,
@@ -23,7 +85,17 @@ unsafe fn init_test_context(
 ) {
 }
 
-unsafe extern "C" fn switch_test_context(_prev: NonNull<u8>, _next: NonNull<u8>) {}
+unsafe extern "C" fn switch_test_context(
+    _prev: NonNull<u8>,
+    _next: NonNull<u8>,
+    prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
+) {
+    unsafe {
+        prev_on_cpu
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release)
+    };
+}
 
 static TEST_ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     context_size: 16,
@@ -39,6 +111,16 @@ pub(super) fn make_task() -> alloc::sync::Arc<Task> {
     session.register_group(&pg);
     let tg = ThreadGroup::new();
     let task = Task::new(SchedParams::default_fair(), Weak::new(), tg, pg);
+    task.adopt_current_context();
+    task
+}
+
+fn make_task_in_group(group: Arc<ThreadGroup>) -> Arc<Task> {
+    crate::arch_hooks::register(&TEST_ARCH_CONTEXT_OPS);
+    let session = Session::new();
+    let pg = ProcessGroup::new(&session);
+    session.register_group(&pg);
+    let task = Task::new(SchedParams::default_fair(), Weak::new(), group, pg);
     task.adopt_current_context();
     task
 }
@@ -87,6 +169,188 @@ fn thread_group_accounting_waits_for_last_member_and_aggregates_usage() {
 }
 
 #[ktest]
+fn thread_group_leader_becomes_waitable_only_after_last_member() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    assert!(group.try_add_member(&leader));
+    assert!(group.try_add_member(&worker));
+
+    leader.set_state(TaskState::Zombie);
+    assert!(!group.mark_terminated_if_all_members_terminal());
+    assert!(!leader.is_waitable_zombie());
+
+    let pidfd_waiter = make_task();
+    let wait_entry = leader
+        .exit_waiters
+        .prepare_to_wait(&pidfd_waiter, TaskState::Sleeping);
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+
+    assert!(group.is_terminated());
+    assert!(leader.is_waitable_zombie());
+    assert_eq!(pidfd_waiter.state(), TaskState::Runnable);
+    leader.exit_waiters.finish_wait(&wait_entry);
+
+    let late = make_task_in_group(Arc::clone(&group));
+    assert!(!group.try_add_member(&late));
+}
+
+#[ktest]
+fn reap_delays_thread_group_leader_until_group_termination() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+
+    leader.set_state(TaskState::Zombie);
+    assert!(!group.mark_terminated_if_all_members_terminal());
+    assert!(parent.reap_matching(|_| true).is_none());
+
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("leader must become reapable after the final member exits");
+    assert!(Arc::ptr_eq(&reaped, &leader));
+    assert_eq!(leader.state(), TaskState::Dead);
+}
+
+#[ktest]
+fn leader_parent_notification_is_deferred_until_worker_exit() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    leader.reparent_to(&parent);
+    worker.reparent_to(&parent);
+    parent.add_child(Arc::clone(&leader));
+
+    crate::spawn::exit_task(&leader, crate::ExitCode(19));
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(!leader.is_waitable_zombie());
+    assert_eq!(parent.shared_signal().pending_len_hint(), 0);
+    assert!(parent.reap_matching(|_| true).is_none());
+
+    worker.set_exit_signal(0);
+    crate::spawn::exit_task(&worker, crate::ExitCode(19));
+    assert_eq!(worker.state(), TaskState::Dead);
+    assert!(leader.is_waitable_zombie());
+    assert_eq!(parent.shared_signal().pending_len_hint(), 1);
+}
+
+#[ktest]
+fn late_exit_group_status_overrides_leader_raw_exit_for_parent_wait() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+
+    leader.mark_exited(crate::ExitCode(7));
+    assert_eq!(group.request_group_exit(42), 42);
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("parent must reap the terminated leader");
+    assert_eq!(reaped.exit_code(), Some(crate::ExitCode(42)));
+    let status = reaped.exit_wait_status().expect("leader wait status");
+    assert!(status.wifexited());
+    assert_eq!(status.wexitstatus(), 42);
+}
+
+#[ktest]
+fn late_sigkill_status_overrides_leader_raw_exit_for_parent_wait() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+
+    leader.mark_exited(crate::ExitCode(7));
+    let _ = group.request_group_signal(SignalNumber::SIGKILL, false);
+    worker.set_state(TaskState::Dead);
+    assert!(group.mark_terminated_if_all_members_terminal());
+
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("parent must reap the SIGKILL-terminated leader");
+    assert_eq!(reaped.exit_code(), Some(crate::ExitCode(9)));
+    let status = reaped.exit_wait_status().expect("leader wait status");
+    assert!(status.wifsignaled());
+    assert_eq!(status.wtermsig(), SignalNumber::SIGKILL.raw() as i32);
+    assert!(!status.wcoredump());
+}
+
+#[ktest]
+fn group_exit_sleep_commit_is_cancelled_after_precheck_window() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.set_state(TaskState::Running);
+
+    assert!(!task.group_exit_pending());
+    assert_eq!(group.request_group_exit(33), 33);
+    task.publish_group_exit_wakeup();
+    assert!(!task.cas_state(TaskState::Running, TaskState::Sleeping));
+    assert_eq!(task.state(), TaskState::Running);
+
+    let queue = crate::WaitQueue::new();
+    let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
+    assert_eq!(task.state(), TaskState::Running);
+    queue.finish_wait(&entry);
+    assert_eq!(task.state(), TaskState::Running);
+
+    // 反向时序：睡眠已提交后才发布请求，调度入口必须
+    // 撤销它，覆盖未通过 WaitQueue 的直接睡眠路径。
+    let late_group = ThreadGroup::new();
+    let late_task = make_task_in_group(Arc::clone(&late_group));
+    late_group.set_leader(&late_task);
+    late_group.add_member(&late_task);
+    late_task.set_state(TaskState::Running);
+    assert!(late_task.cas_state(TaskState::Running, TaskState::Sleeping));
+    assert_eq!(late_group.request_group_exit(34), 34);
+    late_task.publish_group_exit_wakeup();
+    assert!(late_task.abort_group_exit_sleep());
+    assert_eq!(late_task.state(), TaskState::Running);
+}
+
+#[ktest]
+fn fatal_group_resume_does_not_publish_continued_event() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.set_state(TaskState::Running);
+    assert!(task.mark_stopped(SignalNumber::SIGSTOP));
+    assert_eq!(task.state(), TaskState::Stopped);
+
+    let _ = group.request_group_signal(SignalNumber::SIGKILL, false);
+    task.publish_group_exit_wakeup();
+    assert!(task.resume_for_fatal_exit());
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert!(task.wait_continued_status(false).is_none());
+    assert!(task.wait_stopped_status(false).is_none());
+}
+
+#[ktest]
 fn robust_list_and_rseq_state_roundtrip() {
     let task = make_task();
     task.set_robust_list(0x1000, 24);
@@ -105,6 +369,7 @@ fn robust_list_and_rseq_state_roundtrip() {
         registered: true,
     };
     task.set_rseq_registration(rseq);
+    assert!(task.rseq_registered());
     assert_eq!(task.rseq_registration(), rseq);
     task.mark_rseq_event(RseqEvent::Preempt);
     assert!(task.rseq_events().contains(RseqEvent::Preempt));
@@ -112,6 +377,7 @@ fn robust_list_and_rseq_state_roundtrip() {
     task.publish_rseq_cpu(1);
     assert!(task.rseq_events().contains(RseqEvent::Migrate));
     task.clear_rseq_registration();
+    assert!(!task.rseq_registered());
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
     assert!(task.rseq_events().is_empty());
 }
@@ -203,6 +469,83 @@ fn runqueue_pick_respects_cpu_affinity_mask() {
 
     assert!(rq.dequeue(&task0, 3));
     assert!(rq.dequeue(&task1, 3));
+}
+
+#[ktest]
+fn runqueue_exact_pick_selects_requested_fair_task() {
+    let first = make_task();
+    let target = make_task();
+    first.sched.store_vruntime(10);
+    target.sched.store_vruntime(1_000);
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&first), 1));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&target), 1));
+
+    let picked = rq
+        .pick_target_on(&target, 2, CpuMask::single_raw(0).bits())
+        .expect("精确目标仍满足普通公平类约束");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &target));
+    assert!(rq.dequeue(&target, 3));
+    assert!(rq.dequeue(&first, 3));
+}
+
+#[ktest]
+fn runqueue_exact_pick_yields_to_higher_class() {
+    let target = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&target), 1));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&realtime), 1));
+
+    assert!(
+        rq.pick_target_on(&target, 2, CpuMask::single_raw(0).bits())
+            .is_none()
+    );
+    let picked = rq.pick_next(3).expect("实时任务应保持 class precedence");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &realtime));
+    assert!(rq.dequeue(&realtime, 4));
+    assert!(rq.dequeue(&target, 4));
+}
+
+#[ktest]
+fn runqueue_reports_task_waiting_for_context_release() {
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(1).bits());
+    assert!(task.try_claim_cpu(0));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq.has_ownership_blocked(CpuMask::single_raw(1).bits()));
+    assert!(!rq.has_ownership_blocked(CpuMask::single_raw(0).bits()));
+
+    unsafe {
+        task.on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    assert!(!rq.has_ownership_blocked(CpuMask::single_raw(1).bits()));
+    assert!(rq.dequeue(&task, 2));
+}
+
+#[ktest]
+fn runqueue_ignores_local_context_release_window() {
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    assert!(task.try_claim_cpu(0));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(!rq.has_ownership_blocked(CpuMask::single_raw(0).bits()));
+
+    unsafe {
+        task.on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    assert!(rq.dequeue(&task, 2));
 }
 
 #[ktest]
@@ -481,7 +824,12 @@ fn runqueue_wake_current_sleep_transition_does_not_duplicate_task() {
     assert!(!rq.enqueue(alloc::sync::Arc::clone(&task), 1));
     assert!(rq.is_current(&task));
     assert_eq!(task.state(), TaskState::Running);
-    assert!(!task.sched.on_rq());
+    // 唤醒把仍是 current 的任务拉回 Running 之后，它依然归属本 rq，因此
+    // on_rq 必须保持为 QUEUED。若这里清成 NONE，紧随其后的一次远端唤醒就能
+    // 通过 `enqueue` 的 on_rq 门禁，把同一个任务重复挂进第二个 rq。
+    assert!(task.sched.on_rq());
+    assert_eq!(task.sched.on_rq_state(), crate::eevdf::TASK_ON_RQ_QUEUED);
+    assert!(!task.sched.is_migrating());
     assert_eq!(rq.nr_running(), 1);
 
     let current = rq.pick_next(2).expect("current task");
@@ -505,7 +853,11 @@ fn runqueue_take_migratable_respects_cpu_affinity() {
         .take_migratable(CpuMask::single_raw(1).bits(), 2)
         .expect("cpu1 should pull an affinity-compatible task");
     assert!(alloc::sync::Arc::ptr_eq(&pulled, &cpu1));
-    assert!(!pulled.sched.on_rq());
+    // 摘出来的任务处于"已离开源 rq、尚未挂上目标 rq"的中间态：on_rq 记为
+    // MIGRATING 而不是 NONE，这样并发的唤醒者会等迁移落地而不是抢先入队。
+    assert!(pulled.sched.is_migrating());
+    assert_eq!(pulled.sched.on_rq_state(), crate::eevdf::TASK_ON_RQ_MIGRATING);
+    assert!(pulled.sched.on_rq());
     assert_eq!(rq.migratable_load(), 1);
     assert!(
         rq.take_migratable(CpuMask::single_raw(2).bits(), 3)

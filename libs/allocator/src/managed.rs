@@ -15,7 +15,7 @@ use core::alloc::Layout;
 use core::ptr::write_bytes;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 
-use spin::mutex::Mutex;
+use crate::Mutex;
 
 use crate::error::{AllocationError, DeallocationError, ManagedHandleError};
 use crate::gc::{

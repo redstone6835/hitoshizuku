@@ -100,20 +100,55 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     copy_from_user(set_user, &mut raw).map_err(|e| e.as_errno())?;
     let mask = SigSet::from_raw(u64::from_le_bytes(raw));
     ctx.task().signal.save_blocked(mask);
+    #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+    log::info!(
+        "[syscall][sigsuspend] enter pid={:?} mask={:#x}",
+        ctx.task().pid_root(),
+        mask.raw(),
+    );
+    // sigsuspend 即使遇到带 SA_RESTART 的 handler 也必须以 EINTR 结束；
+    // 普通返回边界负责推进 PC 并建立 handler frame。
+    ctx.disable_restart();
     loop {
-        let pending = sched::operation::sigpending()?;
-        if pending.raw() != 0 {
+        if ctx.task().group_exit_pending() || sched::operation::has_interrupting_signal(ctx.task())
+        {
             break;
         }
         if !ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping)
         {
+            sched::operation::sched_yield()?;
             continue;
+        }
+
+        // 信号可能在首次检查之后、睡眠状态发布之前到达。投递方此时看到的
+        // 仍是 Running，不会负责唤醒；发布 Sleeping 后必须二次检查，确保
+        // check-then-sleep 窗口内到达的信号不会永久丢失。
+        if ctx.task().group_exit_pending() || sched::operation::has_interrupting_signal(ctx.task())
+        {
+            if !ctx
+                .task()
+                .cas_state(TaskState::Sleeping, TaskState::Running)
+            {
+                let _ = ctx
+                    .task()
+                    .cas_state(TaskState::Runnable, TaskState::Running);
+            }
+            #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+            log::info!(
+                "[syscall][sigsuspend] sleep-race-closed pid={:?}",
+                ctx.task().pid_root(),
+            );
+            break;
         }
         sched::operation::sched_yield()?;
     }
-    ctx.task().signal.restore_blocked();
+    #[cfg(any(feature = "trace-task-lifecycle", feature = "trace-signal-wait"))]
+    log::info!(
+        "[syscall][sigsuspend] leave pid={:?}",
+        ctx.task().pid_root(),
+    );
     Err(Errno::EINTR)
 }
 
@@ -143,6 +178,13 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if these.0 == 0 {
         return Err(Errno::EINVAL);
     }
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][sigtimedwait] enter pid={:?} set={:#x} timeout_ptr={:#x}",
+        ctx.task().pid_root(),
+        these.raw(),
+        uts,
+    );
 
     // 2. 解析 timeout。NULL 表示永久等待；其它按 timespec 解释。
     let timeout_ns: Option<u64> = if uts == 0 {
@@ -172,7 +214,19 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
     }
 
     // 4. 没命中 → 让出调度等待，限时 timeout_ns。
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][sigtimedwait] sleep pid={:?} timeout_ns={:?}",
+        ctx.task().pid_root(),
+        timeout_ns,
+    );
     let got = sched::operation::sigtimedwait_wait(these, timeout_ns);
+    #[cfg(feature = "trace-signal-wait")]
+    log::info!(
+        "[syscall][sigtimedwait] resume pid={:?} ready={}",
+        ctx.task().pid_root(),
+        got,
+    );
     if !got {
         return Err(Errno::EAGAIN);
     }

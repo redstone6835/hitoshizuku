@@ -176,6 +176,8 @@ pub fn openat_with_lookup_flags(
     mode: FileMode,
     extra_lookup_flags: LookupFlags,
 ) -> VfsResult<Fd> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::VfsOpen).bytes(path.len());
     let lookup_flags = {
         let mut f = extra_lookup_flags;
         if flags.nofollow {
@@ -270,8 +272,14 @@ pub fn openat_with_lookup_flags(
         None
     };
 
+    // guard 覆盖驱动 open 内可能重复执行的 O_TRUNC；即使失败也发布新代际，
+    // 防止已产生部分副作用的文件页进入私有缓存。
+    let truncates_data =
+        flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular;
+    let _data_mutation = truncates_data.then(|| inode.begin_data_mutation());
+
     // ── O_TRUNC ──
-    if flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular {
+    if truncates_data {
         inode.ops.truncate(&inode, 0)?;
     }
 
@@ -415,10 +423,9 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.rmdir(&parent_inode, name, &child_inode)?;
-    // rmdir 成功已经证明目录为空；此时全局扫描 dcache 子树只会反复检查不相关条目，
-    // 并在批量删树时退化为平方复杂度。负向子项无法再由命名空间抵达，逐出根键即可。
-    DCACHE.invalidate_dentry(&target.dentry);
-    target.dentry.invalidate();
+    // 常见空目录只逐出根键；若失败 lookup 留下负向子项，则一并清掉这些不可达引用，
+    // 否则它们会长期保活 nlink=0 的 inode，导致磁盘位图和目录计数无法回收。
+    DCACHE.invalidate_removed_directory(&target.dentry);
     retire_inode(child_inode);
     Ok(())
 }
@@ -1008,7 +1015,9 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
     } else {
         None
     };
-    inode.ops.truncate(&inode, size)
+    let _data_mutation = inode.begin_data_mutation();
+    inode.ops.truncate(&inode, size)?;
+    Ok(())
 }
 
 // ── utimes ────────────────────────────────────────────────────────────────────

@@ -4,13 +4,18 @@
 //! 以及按调度域做任务放置和负载均衡的选择规则。面向用户态的 ABI 编码在
 //! syscall 兼容层完成，这里只保留内核内部的稳定模型。
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use errno::Errno;
+
+/// 平局打破计数器：当多个 CPU 利用率相同时轮询选择，避免所有新任务
+/// 集中到编号最小的 CPU 上。
+static PLACEMENT_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
 
 /// 当前构建支持的最大 CPU 数。
 ///
 /// 这里是调度器的固定容量，不表示所有 CPU 都已经上线；在线状态由
 /// scheduler 运行期维护。固定容量让 per-CPU 数组可以静态分配，避免热路径分配。
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = 12;
 
 /// 启动 CPU。空亲和性在调度器内部不能存在，必要时统一退回到该 CPU。
 pub const BOOT_CPU_ID: usize = 0;
@@ -558,19 +563,53 @@ fn choose_least_loaded<F>(topology: SchedTopology, mask: CpuMask, load_of: &mut 
 where
     F: FnMut(CpuId) -> usize,
 {
-    let mut best = None;
-    let mut best_load = usize::MAX;
-    let mut best_capacity = 1u64;
+    // Two-pass: first find minimum utilization, then pick a CPU at that minimum
+    // via round-robin to avoid always returning the lowest-numbered idle CPU.
+    let mut min_load = usize::MAX;
+    let mut min_capacity = 1u64;
+    let mut tie_count = 0usize;
+
     for cpu in mask.iter() {
         let load = load_of(cpu);
         let capacity = topology.cpu_capacity(cpu);
-        let less_utilized = (load as u128).saturating_mul(best_capacity as u128)
-            < (best_load as u128).saturating_mul(capacity as u128);
-        if best.is_none() || less_utilized {
-            best = Some(cpu);
-            best_load = load;
-            best_capacity = capacity;
+        let less = (load as u128).saturating_mul(min_capacity as u128)
+            < (min_load as u128).saturating_mul(capacity as u128);
+        let equal = !less
+            && tie_count > 0
+            && (load as u128).saturating_mul(min_capacity as u128)
+                == (min_load as u128).saturating_mul(capacity as u128);
+        if tie_count == 0 || less {
+            min_load = load;
+            min_capacity = capacity;
+            tie_count = 1;
+        } else if equal {
+            tie_count += 1;
         }
     }
-    best
+    if tie_count == 0 {
+        return None;
+    }
+
+    // If only one candidate, or no contention, skip atomic.
+    let target_rank = if tie_count > 1 {
+        PLACEMENT_ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) % tie_count
+    } else {
+        0
+    };
+
+    let mut rank = 0usize;
+    for cpu in mask.iter() {
+        let load = load_of(cpu);
+        let capacity = topology.cpu_capacity(cpu);
+        let is_min = (load as u128).saturating_mul(min_capacity as u128)
+            == (min_load as u128).saturating_mul(capacity as u128);
+        if is_min {
+            if rank == target_rank {
+                return Some(cpu);
+            }
+            rank += 1;
+        }
+    }
+    // Fallback: first candidate
+    mask.iter().next()
 }

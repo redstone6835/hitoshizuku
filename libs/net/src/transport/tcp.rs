@@ -432,6 +432,47 @@ impl TcpStateMachine {
         true
     }
 
+    pub(crate) fn accepts_local_data(&self, segment: TcpSegment) -> bool {
+        let allowed_flags = (TcpFlags::ACK | TcpFlags::PSH).bits();
+        self.state == TcpState::Established
+            && segment.payload_len != 0
+            && segment.flags.contains(TcpFlags::ACK)
+            && segment.flags.bits() & !allowed_flags == 0
+            && segment.sequence == self.receive_next
+            && self
+                .send_unacknowledged
+                .before_or_equal(segment.acknowledgement)
+            && segment.acknowledgement.before_or_equal(self.send_next)
+    }
+
+    pub(crate) fn accept_local_data(
+        &mut self,
+        segment: TcpSegment,
+    ) -> Option<(TcpSequence, TcpSequence)> {
+        if !self.accepts_local_data(segment) {
+            return None;
+        }
+        let previous = self.send_unacknowledged;
+        self.send_unacknowledged = segment.acknowledgement;
+        self.receive_next += segment.payload_len;
+        Some((previous, self.send_unacknowledged))
+    }
+
+    pub(crate) fn accept_local_ack(
+        &mut self,
+        acknowledgement: TcpSequence,
+    ) -> Option<(TcpSequence, TcpSequence)> {
+        if self.state != TcpState::Established
+            || !self.send_unacknowledged.before_or_equal(acknowledgement)
+            || !acknowledgement.before_or_equal(self.send_next)
+        {
+            return None;
+        }
+        let previous = self.send_unacknowledged;
+        self.send_unacknowledged = acknowledgement;
+        Some((previous, acknowledgement))
+    }
+
     pub fn expire_time_wait(&mut self) -> bool {
         if self.state != TcpState::TimeWait {
             return false;

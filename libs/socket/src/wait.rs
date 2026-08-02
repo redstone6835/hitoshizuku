@@ -78,10 +78,7 @@ pub(crate) fn wake_task(task: &Arc<Task>) {
 
 /// 检查任务是否有待处理的非阻塞信号。
 fn has_pending_signal(task: &Arc<Task>) -> bool {
-    let blocked = task.signal.blocked_snapshot().raw();
-    let pending =
-        task.signal.pending_snapshot().raw() | task.shared_signal().pending_snapshot().raw();
-    (pending & !blocked) != 0
+    sched::operation::has_interrupting_signal(task)
 }
 
 /// 检查超时截止时间是否已过期。

@@ -14,7 +14,26 @@
 use crate::riscv64::{time, vdso};
 use crate::trap::Riscv64MessageInterruptOps;
 use crate::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{Exception, Interrupt};
+
+/// 不可恢复异常只能由一个 hart 输出并触发关机，避免并发故障互相截断串口证据。
+static FATAL_TRAP_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+fn claim_fatal_trap_or_wait() {
+    let owner = crate::riscv64::specific::current_cpu_id().saturating_add(1);
+    if FATAL_TRAP_OWNER
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return;
+    }
+
+    unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)) };
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
+}
 
 /// 将 `TrapFrame` 指针转换为短生命周期共享引用。
 ///
@@ -45,10 +64,12 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
         sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}
@@ -73,10 +94,12 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     }
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
+            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}
@@ -260,15 +283,15 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
     let interrupt = decode_interrupt(cause);
 
     if code == IRQ_S_TIMER {
-        #[cfg(feature = "performance-profile")]
-        {
-            let pc = unsafe { trap_frame_ref(tf_ptr) }.sepc;
-            profiling::sample_pc(pc, from_user);
-        }
         // Timer 必须先重装 compare，否则 sret 后会立刻再次陷入。
         let now_ticks = time::rearm_periodic_timer();
         general::dev::irq::record_timer_interrupt();
         let now_ns = time::stable_counter_to_ns(now_ticks);
+        #[cfg(feature = "performance-profile")]
+        {
+            let pc = unsafe { trap_frame_ref(tf_ptr) }.sepc;
+            profiling::sample_pc_at(pc, from_user, now_ns);
+        }
         let _ = general::elm_guard::request_timeout_if_expired(now_ns);
         if !from_user {
             let sepc = unsafe { trap_frame_ref(tf_ptr) }.sepc;
@@ -358,6 +381,37 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
             }
             finish_trap_return(tf_ptr, from_user)
         }
+        FaultOutcome::OutOfMemory => {
+            if sched::is_ready() {
+                let task = sched::current_task();
+                let pid = task.pid_root().unwrap_or(0);
+                let comm = task.comm();
+                let buddy = allocator::KERNEL_ALLOCATOR.buddy_stats();
+                let alloc = allocator::KERNEL_ALLOCATOR.layer_stats();
+                let vm = general::mm::vm_space_diag();
+                log::warning!(
+                    "[trap][mm][oom] pid={} comm={:?} free_pages={} allocated_pages={} reserved_pages={} alloc_failures={} physical_records={} small_records={} large_records={} kheap_cached_pages={} vm_live={} vm_created={} vm_dropped={} private_file_pressure_reclaims={}",
+                    pid,
+                    comm,
+                    buddy.free_pages,
+                    buddy.allocated_pages,
+                    buddy.reserved_pages,
+                    buddy.alloc_failures,
+                    alloc.registry.live_physical,
+                    alloc.registry.live_small,
+                    alloc.registry.live_large,
+                    alloc.kheap.cached_pages,
+                    vm.live,
+                    vm.created,
+                    vm.dropped,
+                    vm.private_file_pressure_reclaims,
+                );
+                let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
+                drop(task);
+                deliver_user_signals_before_return(tf_ptr, from_user);
+            }
+            finish_trap_return(tf_ptr, from_user)
+        }
         FaultOutcome::Kernel(reason) => {
             if !from_user
                 && let Some(recovered) =
@@ -365,6 +419,7 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
             {
                 return recovered;
             }
+            claim_fatal_trap_or_wait();
             let (pid, kind, state, comm) = if sched::is_ready() {
                 let task = sched::current_task();
                 (task.pid_root(), task.kind(), task.state(), task.comm())
@@ -407,6 +462,7 @@ fn handle_access_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
         return recovered;
     }
 
+    claim_fatal_trap_or_wait();
     let tf = unsafe { trap_frame_ref(tf_ptr) };
     log::error!(
         "[trap][access] UNHANDLED kernel access fault code={:#x} sepc={:#x} stval={:#x}",
@@ -441,6 +497,7 @@ fn handle_breakpoint(tf_ptr: usize, code: usize, from_user: bool) -> usize {
         return recovered;
     }
 
+    claim_fatal_trap_or_wait();
     let tf = unsafe { trap_frame_ref(tf_ptr) };
     log::error!(
         "[trap][breakpoint] kernel breakpoint sepc={:#x} stval={:#x}",
@@ -458,6 +515,7 @@ fn handle_unhandled_exception(tf_ptr: usize, code: usize, from_user: bool) -> us
         return recovered;
     }
 
+    claim_fatal_trap_or_wait();
     let exception = decode_exception(code);
     let tf = unsafe { trap_frame_ref(tf_ptr) };
     log::error!(
@@ -541,7 +599,7 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// signal/resched/frame rewrite 读取不完整状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
-    let (nr, args, original_satp, original_sepc, original_sp) = {
+    let (nr, args, original_satp, original_sepc, original_sp, original_switch_sequence) = {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (
             tf.a7,
@@ -549,6 +607,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
             tf.satp,
             tf.sepc,
             tf.sp,
+            tf.tval,
         )
     };
     general::syscall::dispatch_fast_with_frame(
@@ -576,14 +635,37 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         require_full_restore = true;
     }
     let fs = frame.status & SSTATUS_FS_MASK;
-    let unsupported_extension_state =
-        frame.status & SSTATUS_VS_MASK != 0 || !matches!(fs, 0 | SSTATUS_FS_CLEAN);
+    let vs = frame.status & SSTATUS_VS_MASK;
+    let switched =
+        crate::riscv64::specific::current_context_switch_sequence() != original_switch_sequence;
+    #[cfg(feature = "performance-profile")]
+    if switched {
+        profiling::observe(profiling::Metric::SyscallReturnAfterSwitch, 1);
+    }
+    let unsupported_extension_state = vs != 0 || !matches!(fs, 0 | SSTATUS_FS_CLEAN);
     if require_full_restore || unsupported_extension_state {
+        #[cfg(feature = "performance-profile")]
+        {
+            profiling::observe(profiling::Metric::SyscallReturnFull, 1);
+            if fs != 0 {
+                profiling::observe(profiling::Metric::SyscallReturnFpuRestore, 1);
+            }
+            if vs != 0 {
+                profiling::observe(profiling::Metric::SyscallReturnVectorRestore, 1);
+            }
+        }
         // signal/exec/sigreturn、调度或扩展状态恢复会进入完整 resume；此时必须
         // 重建可信 kstack/satp 并净化用户可修改的 frame。普通 fast return 的
         // status 已由汇编掩码，且入口写入的 kstack/satp 未被改动，无需重复写。
         sanitize_user_return_frame(tf_ptr, (nr == SYS_RT_SIGRETURN).then_some(original_satp));
         return tf_ptr | 1;
+    }
+    #[cfg(feature = "performance-profile")]
+    {
+        profiling::observe(profiling::Metric::SyscallReturnFast, 1);
+        if switched && fs != 0 {
+            profiling::observe(profiling::Metric::SyscallReturnFpuRestore, 1);
+        }
     }
     tf_ptr
 }

@@ -1,7 +1,0 @@
-ELM-LOCK-V1
-module=platform.loongson-irq
-version=0.1.0
-mode=y
-cargo_elm=0.1.0
-rustc=rustc 1.89.0-nightly (60dabef95 2025-05-19)
-profile	loongarch64-unknown-none	contest-2026	1	0556fd70a3eba0bf6c41c1bb4ca127b3b8e1d20a9eb379e3f226821ca5794af5	59f5f6412aa0e049db1f8b17fdafe5a49f1f04c21ce04933370a5875cf362d3f	f9cc414f7e6435f867332e8177adc017f498124282a42a3316ecf8ad99b0fca1	4a8d9578677fac3f62d2c3fffe737119e14a91d46160261666b128a304d27baa

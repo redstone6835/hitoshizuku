@@ -117,6 +117,8 @@ pub struct BlockLimits {
     max_blocks_per_io: Option<NonZeroU32>,
     optimal_blocks_per_io: Option<NonZeroU32>,
     buffer_alignment: Option<NonZeroU32>,
+    max_data_segments: Option<NonZeroU32>,
+    max_data_segment_size: Option<NonZeroU32>,
     discard: Option<BlockRangeLimits>,
     write_zeroes: Option<BlockRangeLimits>,
 }
@@ -179,6 +181,8 @@ impl BlockLimits {
             max_blocks_per_io,
             optimal_blocks_per_io,
             buffer_alignment,
+            max_data_segments: None,
+            max_data_segment_size: None,
             discard: None,
             write_zeroes: None,
         })
@@ -189,6 +193,8 @@ impl BlockLimits {
             max_blocks_per_io: None,
             optimal_blocks_per_io: None,
             buffer_alignment: None,
+            max_data_segments: None,
+            max_data_segment_size: None,
             discard: None,
             write_zeroes: None,
         }
@@ -204,6 +210,17 @@ impl BlockLimits {
         self
     }
 
+    /// 设置普通读写 BIO 的 scatter/gather 布局限制。
+    pub const fn with_data_segment_limits(
+        mut self,
+        max_segments: Option<NonZeroU32>,
+        max_segment_size: Option<NonZeroU32>,
+    ) -> Self {
+        self.max_data_segments = max_segments;
+        self.max_data_segment_size = max_segment_size;
+        self
+    }
+
     pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
         self.max_blocks_per_io
     }
@@ -214,6 +231,34 @@ impl BlockLimits {
 
     pub const fn buffer_alignment(&self) -> Option<NonZeroU32> {
         self.buffer_alignment
+    }
+
+    /// 设备 direct SG 路径最多允许的数据段数。
+    pub const fn max_data_segments(&self) -> Option<NonZeroU32> {
+        self.max_data_segments
+    }
+
+    /// 单个设备数据段允许的最大字节数。
+    pub const fn max_data_segment_size(&self) -> Option<NonZeroU32> {
+        self.max_data_segment_size
+    }
+
+    fn accepts_data_layout(&self, buffer: &BioBuffer) -> bool {
+        let (Some(max_segments), Some(max_segment_size)) =
+            (self.max_data_segments, self.max_data_segment_size)
+        else {
+            return true;
+        };
+        let max_segments = max_segments.get() as usize;
+        let max_segment_size = max_segment_size.get() as usize;
+        let direct = buffer.segment_count() <= max_segments
+            && (0..buffer.segment_count()).all(|index| {
+                buffer
+                    .segment(index)
+                    .is_some_and(|segment| segment.len() <= max_segment_size)
+            });
+        // 不满足设备 direct SG 布局时，驱动仍可把整个 BIO gather 到一个 staging 段。
+        direct || buffer.len() <= max_segment_size
     }
 
     pub const fn discard_limits(&self) -> Option<BlockRangeLimits> {
@@ -987,6 +1032,20 @@ impl BlockDevice {
             .map(|_| ())
     }
 
+    /// 同步读取到多个调用者提供的缓冲区。
+    ///
+    /// 分段描述内联保存在 BIO 中；支持 SG 的驱动可以把各段直接映射为设备
+    /// descriptor，不支持时仍可在驱动内部回退到单个 staging buffer。
+    pub fn submit_bio_wait_borrowed_read_vectored(
+        self: &Arc<Self>,
+        range: BlockRange,
+        bufs: &mut [&mut [u8]],
+    ) -> Result<(), BioError> {
+        let buffer = BioBuffer::borrowed_read_vectored(bufs)
+            .map_err(|error| BioError::Submit(SubmitError::InvalidRequest(error)))?;
+        self.submit_bio_wait(BioOp::Read, range, buffer).map(|_| ())
+    }
+
     /// 同步写入调用者提供的缓冲区。
     ///
     /// 借用缓冲只在本次同步提交期间有效；函数返回后驱动不得再保存或访问该指针。
@@ -1151,11 +1210,14 @@ impl BlockDevice {
                     BioReqError::BufferSizeMismatch,
                 )));
             }
+            if !self.limits.accepts_data_layout(buffer) {
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::TooLarge,
+                )));
+            }
             if let Some(alignment) = self.limits.buffer_alignment() {
                 let align = alignment.get() as usize;
-                if let Some(addr) = buffer.ptr_addr()
-                    && !addr.is_multiple_of(align)
-                {
+                if !buffer.segments_aligned(align) {
                     return Err(BioError::Submit(SubmitError::InvalidRequest(
                         BioReqError::Misaligned,
                     )));
@@ -1203,5 +1265,49 @@ impl Future for BioFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.completion.poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+    use core::num::NonZeroU32;
+
+    use super::BlockLimits;
+    use crate::dev::bio::{BIO_MAX_BORROWED_SEGMENTS, BioBuffer};
+
+    const TEST_PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn segmented_layout_accepts_direct_or_single_bounce() {
+        let mut pages = [[0u8; TEST_PAGE_SIZE]; BIO_MAX_BORROWED_SEGMENTS];
+        let mut refs = pages
+            .iter_mut()
+            .map(|page| &mut page[..])
+            .collect::<Vec<_>>();
+        let buffer = BioBuffer::borrowed_read_vectored(refs.as_mut_slice()).unwrap();
+
+        let bounce_only = BlockLimits::unrestricted().with_data_segment_limits(
+            NonZeroU32::new(1),
+            NonZeroU32::new((BIO_MAX_BORROWED_SEGMENTS * TEST_PAGE_SIZE) as u32),
+        );
+        assert!(bounce_only.accepts_data_layout(&buffer));
+
+        let direct = BlockLimits::unrestricted().with_data_segment_limits(
+            NonZeroU32::new(BIO_MAX_BORROWED_SEGMENTS as u32),
+            NonZeroU32::new(TEST_PAGE_SIZE as u32),
+        );
+        assert!(direct.accepts_data_layout(&buffer));
+    }
+
+    #[test]
+    fn segmented_layout_rejects_oversized_scalar_without_bounce() {
+        let limits = BlockLimits::unrestricted().with_data_segment_limits(
+            NonZeroU32::new(BIO_MAX_BORROWED_SEGMENTS as u32),
+            NonZeroU32::new(TEST_PAGE_SIZE as u32),
+        );
+        let mut scalar = [0u8; BIO_MAX_BORROWED_SEGMENTS * TEST_PAGE_SIZE];
+        let buffer = BioBuffer::borrowed_read(&mut scalar);
+        assert!(!limits.accepts_data_layout(&buffer));
     }
 }

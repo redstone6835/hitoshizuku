@@ -81,7 +81,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = user_sp;
         tf.a0 = arg0;
         tf.status = PRMD_USER_IE;
-        tf.euen = EUEN_FPE | EUEN_SXE;
+        tf.euen = 0;
     }
 
     fn set_user_trap_frame_args(
@@ -122,6 +122,7 @@ const PRMD_PPLV_USER: usize = CSR_PRMD_PPLV_PLV3;
 const PRMD_PIE_ENABLED: usize = 1 << 2;
 const PRMD_USER_IE: usize = PRMD_PPLV_USER | PRMD_PIE_ENABLED;
 const PRMD_KERNEL_IE: usize = CSR_PRMD_PPLV_PLV0 | PRMD_PIE_ENABLED;
+const CRMD_IE_MASK: usize = 1 << CSR_CRMD_IE_OFFSET;
 
 impl Default for TrapFrame {
     fn default() -> Self {
@@ -174,6 +175,10 @@ impl Default for TrapFrame {
 unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
     use core::arch::naked_asm;
     naked_asm!(
+        // 在恢复寄存器前发布 PRMD，使 `ertn` 能返回请求的特权级。整个窗口内
+        // 保持中断屏蔽，否则该例程仍在内核栈执行时的中断会被误判为用户态陷入。
+        "ori $r12, $r0, {crmd_ie_mask}",
+        "csrxchg $r0, $r12, {csr_crmd}",
         "or $r31, $r4, $zero",
         "bl {handle_shootdown}",
 
@@ -332,6 +337,8 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
 
         status_off = const STATUS_OFFSET,
         pc_off = const PC_OFFSET,
+        csr_crmd = const CSR_CRMD,
+        crmd_ie_mask = const CRMD_IE_MASK,
         euen_off = const EUEN_OFFSET,
         llbctl_off = const LLBCTL_OFFSET,
         ra_off = const RA_OFFSET,

@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
@@ -179,6 +180,64 @@ impl DmaContext {
         self.constraints
     }
 
+    /// 由具体设备驱动确认 scatter/gather descriptor 能力后设置段数上限。
+    ///
+    /// `supports_scatter_gather == false` 表示总线尚未启用 SG，设备驱动可以用
+    /// 自己的协议上限激活它；若总线已经显式声明 SG 能力，则只能与现有上限取
+    /// 交集，不能覆盖 IOMMU、桥或 mapper 给出的更严格限制。
+    pub const fn with_scatter_gather(mut self, max_segments: usize) -> Self {
+        let requested = if max_segments == 0 { 1 } else { max_segments };
+        let effective = if self.constraints.supports_scatter_gather {
+            let existing = if self.constraints.max_segments == 0 {
+                1
+            } else {
+                self.constraints.max_segments
+            };
+            if existing < requested {
+                existing
+            } else {
+                requested
+            }
+        } else {
+            requested
+        };
+        self.constraints.max_segments = effective;
+        self.constraints.supports_scatter_gather = effective > 1;
+        self
+    }
+
+    /// 为调用者持有的稳定内核虚拟区间生成非拥有 DMA 映射。
+    ///
+    /// 当前 mapper 契约是无状态的物理地址投影；因此这里不创建需要显式 unmap 的
+    /// IOMMU 映射。地址转换、设备窗口与单段长度全部由既有 mapper/constraints
+    /// 校验，虚拟区间跨物理不连续页时直接返回 `None`，由驱动走 bounce fallback。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaContext.map_borrowed",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn map_borrowed(
+        self,
+        vaddr: usize,
+        len: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBorrowedMapping> {
+        let paddr = borrowed_range_paddr(vaddr, len)?;
+        let region = DmaSyncRegion {
+            paddr,
+            vaddr,
+            len,
+            direction,
+        };
+        let dma_addr = self.mapper.phys_to_dma(region, self.constraints)?;
+        Some(DmaBorrowedMapping {
+            dma_addr,
+            sync: self.sync_handle(region),
+        })
+    }
+
     pub(crate) const fn sync_handle(self, region: DmaSyncRegion) -> DmaSyncHandle {
         DmaSyncHandle {
             mapper: self.mapper,
@@ -195,9 +254,73 @@ pub(crate) struct DmaSyncHandle {
 }
 
 impl DmaSyncHandle {
-    pub(crate) fn sync_for_device(self) {
+    pub(crate) fn sync_for_device(&self) {
         self.mapper.sync_for_device(self.region);
     }
+
+    pub(crate) fn sync_for_cpu(&self) {
+        self.mapper.sync_for_cpu(self.region);
+    }
+}
+
+/// 非拥有 DMA 段的设备地址与 cache 同步句柄。
+#[derive(Clone, Copy)]
+pub struct DmaBorrowedMapping {
+    dma_addr: usize,
+    sync: DmaSyncHandle,
+}
+
+#[kernel_symbols::export]
+impl DmaBorrowedMapping {
+    pub const fn dma_addr(&self) -> usize {
+        self.dma_addr
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBorrowedMapping.sync_for_device",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn sync_for_device(&self) {
+        self.sync.sync_for_device();
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBorrowedMapping.sync_for_cpu",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn sync_for_cpu(&self) {
+        self.sync.sync_for_cpu();
+    }
+}
+
+fn borrowed_range_paddr(vaddr: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let end = vaddr.checked_add(len)?;
+    let base = KERNEL_ALLOCATOR.virtual_to_physical(vaddr)?;
+    let mut current = vaddr;
+    while current < end {
+        let offset = current - vaddr;
+        if KERNEL_ALLOCATOR.virtual_to_physical(current)? != base.checked_add(offset)? {
+            return None;
+        }
+        let page_left = PAGE_SIZE - current % PAGE_SIZE;
+        let chunk_end = current.checked_add(page_left.min(end - current))?;
+        let last = chunk_end - 1;
+        let last_offset = last - vaddr;
+        if KERNEL_ALLOCATOR.virtual_to_physical(last)? != base.checked_add(last_offset)? {
+            return None;
+        }
+        current = chunk_end;
+    }
+    Some(base)
 }
 
 #[derive(Clone, Copy)]
@@ -665,4 +788,28 @@ pub fn new_netbuf_pool(
         )?));
     }
     net::buf::NetBufPool::new(storages.into_boxed_slice()).map_err(|_| "DMA NetBuf pool 构造失败")
+}
+
+/// 在常驻内核中构造共享 DMA 网络 buffer pool。
+///
+/// `SharedNetBufPool` 的锁类型属于常驻 `net` crate；动态驱动不能自行构造，
+/// 否则模块侧的第三方锁 crate 实例会泄漏进 ELM ABI。
+#[kernel_symbols::export(
+    name = "general.dev.dma.new_shared_netbuf_pool",
+    contract = "kernel.general.dma-netbuf-pool@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+        | kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn new_shared_netbuf_pool(
+    context: DmaContext,
+    count: usize,
+    size: usize,
+    align: usize,
+    direction: DmaDirection,
+) -> Result<net::buf::SharedNetBufPool, &'static str> {
+    new_netbuf_pool(context, count, size, align, direction).map(|owner| Arc::new(Mutex::new(owner)))
 }

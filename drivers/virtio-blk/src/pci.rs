@@ -31,12 +31,13 @@ use super::common::{
     IrqSafeMutex, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest,
     VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore,
     VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
-    free_allocated_request, negotiate_supported_features, read_device_config, status_to_result,
+    copy_completed_read_payload, free_allocated_request, negotiate_supported_features,
+    read_device_config, reclaim_request_payload_for_cpu, status_to_result,
     validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
     write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
-use general::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
+use general::dev::bio::{BIO_MAX_BORROWED_SEGMENTS, Bio, BioIoError, BioOp, SubmitError};
 use general::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
@@ -93,6 +94,7 @@ struct VirtioBlkInner {
     capabilities: VirtioBlkCapabilities,
     queue: IrqSafeMutex<VirtioBlkQueueCore>,
     irq_count: AtomicUsize,
+    poll_irq_mark: AtomicUsize,
     #[cfg(feature = "block-profile")]
     profile: VirtioBlkProfile,
 }
@@ -196,7 +198,11 @@ impl VirtioBlkPci {
         }
         transport.set_selected_queue_size(qsz);
 
-        let dma_context = pci.dma_context();
+        let dma_context = pci.dma_context().with_scatter_gather(
+            usize::from(qsz.saturating_sub(2))
+                .min(capabilities.max_data_segments)
+                .min(BIO_MAX_BORROWED_SEGMENTS),
+        );
         let split_queue = SplitVirtQueue::new_in(dma_context, qsz)
             .map_err(|_| "virtio-pci: queue allocation failed")?;
 
@@ -228,6 +234,7 @@ impl VirtioBlkPci {
             capabilities,
             queue: IrqSafeMutex::new(queue),
             irq_count: AtomicUsize::new(0),
+            poll_irq_mark: AtomicUsize::new(0),
             #[cfg(feature = "block-profile")]
             profile: VirtioBlkProfile::new(),
         });
@@ -237,6 +244,11 @@ impl VirtioBlkPci {
 
     fn complete_failed_requests(pending: Vec<Option<VirtioBlkPendingRequest>>, error: BioIoError) {
         for pending in pending.into_iter().flatten() {
+            pending.meta_dma.sync_for_cpu();
+            reclaim_request_payload_for_cpu(
+                pending.data_dma.as_ref(),
+                pending.direct_bio_mappings.as_ref(),
+            );
             pending.bio.complete(Err(error));
         }
     }
@@ -252,15 +264,19 @@ impl VirtioBlkPci {
         reason: &'static str,
     ) -> Vec<Option<VirtioBlkPendingRequest>> {
         log::printk!("[virtio-pci-blk] queue failed: {}", reason);
-        self.inner
-            .transport
-            .set_status(self.inner.transport.status() | VIRTIO_STATUS_FAILED);
-        queue.mark_failed_and_take_pending()
+        queue.mark_failed();
+        if !self.inner.transport.reset_wait(VIRTIO_PCI_RESET_SPIN_LIMIT) {
+            panic!("virtio-pci-blk: device reset timed out after fatal queue error");
+        }
+        queue.take_all_pending()
     }
 
     /// 轮询并处理已完成的请求。与 MMIO 版对称。
     pub fn poll(&self) {
         let mut queue = self.inner.queue.lock();
+        if queue.is_failed() {
+            return;
+        }
         loop {
             #[cfg(feature = "block-profile")]
             let profile_poll_start = queue
@@ -331,34 +347,33 @@ impl VirtioBlkPci {
                     let failed =
                         self.fail_queue_locked(&mut queue, "completed descriptor chain corrupt");
                     drop(queue);
+                    reclaim_request_payload_for_cpu(
+                        pending.data_dma.as_ref(),
+                        pending.direct_bio_mappings.as_ref(),
+                    );
                     pending.bio.complete(Err(BioIoError::Unavailable));
                     Self::complete_failed_requests(failed, BioIoError::Unavailable);
                     return;
                 }
 
-                let copy_read_data = result.is_ok() && pending.bio.op == BioOp::Read;
-                if !copy_read_data && let Some(data_dma) = pending.data_dma.take() {
-                    queue.recycle_data_dma(data_dma);
-                }
-
                 drop(queue);
-                if copy_read_data {
-                    if let Some(data_dma) = pending.data_dma.as_ref() {
-                        let buf = pending.bio.buffer.as_mut_slice();
-                        if data_dma.as_slice().len() < buf.len() {
-                            result = Err(BioIoError::Unavailable);
-                        } else {
-                            data_dma.sync_for_cpu();
-                            buf.copy_from_slice(&data_dma.as_slice()[..buf.len()]);
-                        }
-                    } else {
-                        result = Err(BioIoError::Unavailable);
+                reclaim_request_payload_for_cpu(
+                    pending.data_dma.as_ref(),
+                    pending.direct_bio_mappings.as_ref(),
+                );
+                if result.is_ok() && pending.bio.op == BioOp::Read {
+                    if let Err(error) = copy_completed_read_payload(
+                        &mut pending.bio,
+                        pending.data_dma.as_ref(),
+                        pending.direct_bio_mappings.as_ref(),
+                    ) {
+                        result = Err(error);
                     }
-                    if let Some(data_dma) = pending.data_dma.take() {
-                        queue = self.inner.queue.lock();
-                        queue.recycle_data_dma(data_dma);
-                        drop(queue);
-                    }
+                }
+                if let Some(data_dma) = pending.data_dma.take() {
+                    queue = self.inner.queue.lock();
+                    queue.recycle_data_dma(data_dma);
+                    drop(queue);
                 }
 
                 pending.bio.complete(result);
@@ -387,6 +402,10 @@ impl VirtioBlkPci {
         }
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
         self.poll();
+        self.inner.poll_irq_mark.store(
+            self.inner.irq_count.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         true
     }
 
@@ -463,7 +482,12 @@ impl VirtioBlkPciIo {
 impl BlockDriver for VirtioBlkPciIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
         // 先回收设备已发布的完成项，避免并发提交在中断合并时丢失进度。
-        self.driver.poll();
+        // Only poll if new IRQs arrived since last poll (IRQ-gated completion check)
+        let current_irq = self.driver.inner.irq_count.load(Ordering::Relaxed);
+        if current_irq != self.driver.inner.poll_irq_mark.load(Ordering::Relaxed) {
+            self.driver.inner.poll_irq_mark.store(current_irq, Ordering::Relaxed);
+            self.driver.poll();
+        }
         let mut queue = self.driver.inner.queue.lock();
         if queue.is_failed() {
             return Err((SubmitError::DeviceGone, bio));
@@ -483,10 +507,11 @@ impl BlockDriver for VirtioBlkPciIo {
         if let Err(err) = validate_bio_buffer_for_plan(plan, &bio) {
             return Err((err, bio));
         }
-        let mut request = match allocate_request(&mut *queue, plan) {
-            Ok(request) => request,
-            Err(err) => return Err((err, bio)),
-        };
+        let mut request =
+            match allocate_request(&mut *queue, plan, &bio, self.driver.inner.capabilities) {
+                Ok(request) => request,
+                Err(err) => return Err((err, bio)),
+            };
 
         if request.data_dma.is_some() {
             // 大块顺序写和 range payload 初始化放到队列锁外，避免阻塞完成路径。
@@ -504,7 +529,7 @@ impl BlockDriver for VirtioBlkPciIo {
         }
 
         // 描述符链形状由 virtio-blk 公共层统一维护，PCI 传输层只负责 queue notify。
-        if let Err(err) = write_allocated_request_descriptors(&mut *queue, &request, plan) {
+        if let Err(err) = write_allocated_request_descriptors(&mut *queue, &request, plan, &bio) {
             free_allocated_request(&mut *queue, request);
             return Err((err, bio));
         }
@@ -521,11 +546,13 @@ impl BlockDriver for VirtioBlkPciIo {
             head: head_idx,
             meta_dma,
             data_dma,
+            direct_bio_mappings,
         } = request;
         let pending = VirtioBlkPendingRequest {
             bio,
             meta_dma,
             data_dma,
+            direct_bio_mappings,
             expected_device_write_len,
             #[cfg(feature = "block-profile")]
             profile_published_ns: 0,
@@ -537,8 +564,11 @@ impl BlockDriver for VirtioBlkPciIo {
                 bio,
                 meta_dma,
                 data_dma,
+                direct_bio_mappings,
                 ..
             } = pending;
+            meta_dma.sync_for_cpu();
+            reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
             let _ = queue.split_queue_mut().free_chain(chain);
             queue.recycle_request_dma(meta_dma, data_dma);
             return Err((SubmitError::QueueFull, bio));
@@ -563,8 +593,11 @@ impl BlockDriver for VirtioBlkPciIo {
                 bio,
                 meta_dma,
                 data_dma,
+                direct_bio_mappings,
                 ..
             } = pending;
+            meta_dma.sync_for_cpu();
+            reclaim_request_payload_for_cpu(data_dma.as_ref(), direct_bio_mappings.as_ref());
             let _ = queue.split_queue_mut().free_chain(chain);
             queue.recycle_meta_dma(meta_dma);
             if let Some(data_dma) = data_dma {
@@ -580,7 +613,7 @@ impl BlockDriver for VirtioBlkPciIo {
         } else {
             0
         };
-        drop(queue);
+        // 与 MMIO 路径相同，publish/notify 不跨 queue lock 边界。
         self.notify_queue();
         #[cfg(feature = "block-profile")]
         if profile_sample {
@@ -589,9 +622,9 @@ impl BlockDriver for VirtioBlkPciIo {
                 .inner
                 .profile
                 .record_publish_to_notify(notified_ns.saturating_sub(profile_published_ns));
-            let mut queue = self.driver.inner.queue.lock();
             let _ = queue.set_pending_profile_notified_ns(head_idx, notified_ns);
         }
+        drop(queue);
         Ok(())
     }
 

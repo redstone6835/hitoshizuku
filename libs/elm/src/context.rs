@@ -22,7 +22,7 @@ pub const ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION: u16 = 1;
 /// 后备按 CPU 上下文栈可区分的最大 CPU 数。
 ///
 /// 正式任务级后端不受此值限制；未注册 CPU resolver 时统一使用 CPU 0。
-pub const ELM_CONTEXT_MAX_CPUS: usize = 8;
+pub const ELM_CONTEXT_MAX_CPUS: usize = 12;
 /// 单个 CPU 后备上下文栈允许的最大嵌套深度。
 pub const ELM_CONTEXT_MAX_DEPTH: usize = 16;
 
