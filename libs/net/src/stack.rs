@@ -2258,6 +2258,7 @@ pub enum NetStackFlowCommand {
         path: TcpPath,
         facade: Arc<SocketFacade>,
         control_sequence: u64,
+        local_transport: bool,
         now_ns: u64,
         output: Option<Result<FlowId, TcpBindError>>,
     },
@@ -4033,6 +4034,7 @@ pub fn dispatch_flow_shard_command(
             path,
             facade,
             control_sequence,
+            local_transport,
             now_ns,
             output,
         } => {
@@ -4042,6 +4044,7 @@ pub fn dispatch_flow_shard_command(
                 *path,
                 Arc::clone(facade),
                 *control_sequence,
+                *local_transport,
                 *now_ns,
             ));
         }
@@ -5558,6 +5561,7 @@ mod tests {
                 path,
                 Arc::clone(&client),
                 1,
+                true,
                 1_000,
             )
             .unwrap();
@@ -5660,6 +5664,7 @@ mod tests {
                 path,
                 Arc::clone(&client),
                 1,
+                true,
                 1_000,
             )
             .unwrap();

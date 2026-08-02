@@ -1027,6 +1027,7 @@ enum ControlWork {
         local: Endpoint,
         peer: Endpoint,
         path: TcpPath,
+        local_transport: bool,
     },
     InstallListener {
         transaction: Arc<ListenerInstall>,
@@ -2937,6 +2938,7 @@ enum TurnControlMeta {
         local: Endpoint,
         peer: Endpoint,
         path: TcpPath,
+        local_transport: bool,
     },
     AllocateListener {
         facade: Arc<SocketFacade>,
@@ -3702,6 +3704,7 @@ impl NetWorkerContext {
                     local,
                     peer,
                     path,
+                    local_transport,
                 } => {
                     if facade.generation() == generation {
                         let interface = path.route.interface;
@@ -3712,6 +3715,7 @@ impl NetWorkerContext {
                             path,
                             facade: Arc::clone(&facade),
                             control_sequence: sequence,
+                            local_transport,
                             now_ns: sched::now_ns_public(),
                             output: None,
                         });
@@ -4383,6 +4387,7 @@ impl NetWorkerContext {
                 local,
                 peer,
                 path,
+                local_transport,
             });
     }
 
@@ -5667,6 +5672,7 @@ impl NetWorkerContext {
                             local,
                             peer,
                             path,
+                            local_transport,
                         },
                     ) => {
                         if self
@@ -5680,6 +5686,7 @@ impl NetWorkerContext {
                                     local,
                                     peer,
                                     path,
+                                    local_transport,
                                 },
                             )
                             .is_err()

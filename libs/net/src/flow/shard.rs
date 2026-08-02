@@ -376,6 +376,7 @@ impl FlowShard {
         path: TcpPath,
         facade: Arc<SocketFacade>,
         control_sequence: u64,
+        local_transport: bool,
         now_ns: u64,
     ) -> Result<FlowId, TcpBindError> {
         let id = self.tcp.connect(
@@ -384,6 +385,7 @@ impl FlowShard {
             path,
             Arc::clone(&facade),
             control_sequence,
+            local_transport,
             now_ns,
         )?;
         // 回环 SYN 可能在内核消费本轮返回的命令元数据前完成握手。必须先发布

@@ -191,6 +191,8 @@ struct LocalTcpDirectRoute {
     local_generation: u32,
     peer_generation: u32,
     stack_generation: u64,
+    local_owner: OwnerRef,
+    peer_owner: OwnerRef,
     peer: Weak<SocketFacade>,
 }
 
@@ -992,6 +994,13 @@ impl StreamTxRing {
         let start = self.base + self.sent as u64;
         self.sent += len;
         Some((start, len))
+    }
+
+    fn take_unsent_without_inflight(&mut self, max_len: usize) -> Option<(u64, usize)> {
+        if self.sent != 0 {
+            return None;
+        }
+        self.take_unsent(max_len)
     }
 
     fn rewind_unsent(&mut self, len: usize) {
@@ -3102,6 +3111,12 @@ impl SocketFacade {
         self.stack_generation.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_set_stack_generation(&self, generation: u64) {
+        assert_ne!(generation, 0);
+        self.stack_generation.store(generation, Ordering::Release);
+    }
+
     pub(crate) fn inherit_stack_generation(&self, parent: &Self) {
         let generation = parent.stack_generation();
         if generation != 0 {
@@ -4005,22 +4020,32 @@ impl SocketFacade {
     }
 
     pub(crate) fn install_local_tcp_direct_peer(self: &Arc<Self>, peer: &Arc<SocketFacade>) {
+        let local_owner = self.owner();
+        let peer_owner = peer.owner();
         if self.kind != SocketKind::Stream
             || peer.kind != SocketKind::Stream
             || self.stack_generation() == 0
             || self.stack_generation() != peer.stack_generation()
+            || !matches!(local_owner, OwnerRef::Flow { .. })
+            || !matches!(peer_owner, OwnerRef::Flow { .. })
         {
             return;
         }
-        *self.local_tcp_direct_route.lock() = Some(LocalTcpDirectRoute {
+        let mut route = self.local_tcp_direct_route.lock();
+        if self.stream_tx.lock().bytes.len() != 0 {
+            return;
+        }
+        *route = Some(LocalTcpDirectRoute {
             local_generation: self.generation(),
             peer_generation: peer.generation(),
             stack_generation: self.stack_generation(),
+            local_owner,
+            peer_owner,
             peer: Arc::downgrade(peer),
         });
     }
 
-    fn clear_local_tcp_direct_route(&self) {
+    pub(crate) fn clear_local_tcp_direct_route(&self) {
         self.local_tcp_direct_route.lock().take();
     }
 
@@ -4036,14 +4061,17 @@ impl SocketFacade {
         }
     }
 
-    fn local_tcp_direct_peer(&self) -> Option<Arc<SocketFacade>> {
-        let route = self.local_tcp_direct_route.lock();
-        let route = route.as_ref()?;
+    fn local_tcp_direct_peer_for_route(
+        &self,
+        route: &LocalTcpDirectRoute,
+    ) -> Option<Arc<SocketFacade>> {
         let peer = route.peer.upgrade()?;
         (route.local_generation == self.generation()
             && route.peer_generation == peer.generation()
             && route.stack_generation == self.stack_generation()
             && route.stack_generation == peer.stack_generation()
+            && route.local_owner == self.owner()
+            && route.peer_owner == peer.owner()
             && !self.is_closing()
             && !peer.is_closing())
         .then_some(peer)
@@ -4063,7 +4091,11 @@ impl SocketFacade {
             profiling::observe(profiling::Metric::TcpLocalDirectPolicyRejects, 1);
             return 0;
         }
-        let Some(peer) = self.local_tcp_direct_peer() else {
+        let route = self.local_tcp_direct_route.lock();
+        let Some(peer) = route
+            .as_ref()
+            .and_then(|route| self.local_tcp_direct_peer_for_route(route))
+        else {
             #[cfg(feature = "performance-profile")]
             profiling::observe(profiling::Metric::TcpLocalDirectRouteMisses, 1);
             return 0;
@@ -4071,11 +4103,8 @@ impl SocketFacade {
         let mut delivered = 0usize;
         loop {
             let available = peer.stream_receive_window();
-            let len = self
-                .stream_unsent_len()
-                .min(available)
-                .min(u16::MAX as usize);
-            if len == 0 {
+            let max_len = available.min(u16::MAX as usize);
+            if max_len == 0 {
                 if self.stream_unsent_len() != 0 {
                     peer.mark_local_stream_window_blocked();
                     #[cfg(feature = "performance-profile")]
@@ -4083,7 +4112,7 @@ impl SocketFacade {
                 }
                 break;
             }
-            let Some(lease) = self.take_stream_tx_deferred(len) else {
+            let Some(lease) = self.take_stream_tx_direct_deferred(max_len) else {
                 break;
             };
             let lease_len = usize::from(lease.len);
@@ -4127,14 +4156,20 @@ impl SocketFacade {
             || payload_len > TCP_LOCAL_DIRECT_COPY_BYTES
             || self.tcp_cork()
             || self.tcp_more()
-            || self.stream_unsent_len() != 0
             || !local_transport_fast_path_eligible()
         {
             return Ok(None);
         }
-        let Some(peer) = self.local_tcp_direct_peer() else {
+        let route = self.local_tcp_direct_route.lock();
+        let Some(peer) = route
+            .as_ref()
+            .and_then(|route| self.local_tcp_direct_peer_for_route(route))
+        else {
             return Ok(None);
         };
+        if self.stream_tx.lock().bytes.len() != 0 {
+            return Ok(None);
+        }
         if payload_len > TCP_LOCAL_IMMEDIATE_HANDOFF_BYTES {
             self.mark_local_tcp_bulk_active();
         }
@@ -4452,6 +4487,18 @@ impl SocketFacade {
 
     pub(crate) fn take_stream_tx_deferred(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
         let (start, len) = self.stream_tx.lock().take_unsent(max_len)?;
+        Some(TcpTxLease {
+            facade: Arc::clone(self),
+            start,
+            len: len as u16,
+        })
+    }
+
+    fn take_stream_tx_direct_deferred(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
+        let (start, len) = self
+            .stream_tx
+            .lock()
+            .take_unsent_without_inflight(max_len)?;
         Some(TcpTxLease {
             facade: Arc::clone(self),
             start,
@@ -4816,6 +4863,7 @@ impl SocketFacade {
     }
 
     pub fn publish_stream_eof(&self) {
+        self.clear_local_tcp_direct_route();
         self.local_tcp_fast_path_active
             .store(false, Ordering::Release);
         self.local_tcp_window_blocked
@@ -5434,6 +5482,7 @@ impl SocketFacade {
         }
         if write {
             self.write_shutdown.store(true, Ordering::Release);
+            self.clear_local_tcp_direct_route();
             self.clear_local_tcp_bulk_active();
             self.clear_ready(Readiness::WRITABLE);
             if self.kind == SocketKind::Stream
@@ -5455,6 +5504,7 @@ impl SocketFacade {
         }
         self.deactivate_packet_observer();
         self.clear_local_datagram_route();
+        self.clear_local_tcp_direct_route();
         self.local_read_handoff.lock().take();
         self.local_tcp_tx_prepared.store(false, Ordering::Release);
         self.clear_local_tcp_bulk_active();
@@ -5563,6 +5613,7 @@ impl SocketFacade {
     pub fn publish_connection_error(&self, error: SocketError) {
         self.connect_pending.store(false, Ordering::Release);
         self.stream_connected.store(false, Ordering::Release);
+        self.clear_local_tcp_direct_route();
         self.stream_rx.lock().eof = true;
         self.set_pending_error(error);
         self.set_ready(
@@ -5578,6 +5629,7 @@ impl SocketFacade {
     }
 
     pub fn publish_closed(&self) {
+        self.clear_local_tcp_direct_route();
         *self.owner.lock() = OwnerRef::Closed {
             generation: self.generation(),
         };
@@ -6248,6 +6300,23 @@ mod tests {
         ))
     }
 
+    fn install_test_local_tcp_direct_pair(
+        sender: &Arc<SocketFacade>,
+        receiver: &Arc<SocketFacade>,
+    ) {
+        *sender.owner.lock() = OwnerRef::Flow {
+            shard: ShardId(0),
+            flow: FlowId(1),
+            generation: sender.generation(),
+        };
+        *receiver.owner.lock() = OwnerRef::Flow {
+            shard: ShardId(0),
+            flow: FlowId(2),
+            generation: receiver.generation(),
+        };
+        sender.install_local_tcp_direct_peer(receiver);
+    }
+
     fn install_test_local_datagram_route(
         sender: &Arc<SocketFacade>,
         receiver: Arc<SocketFacade>,
@@ -6391,7 +6460,7 @@ mod tests {
         ));
         assert!(sender.install_stream_tx_pool(pool));
         sender.mark_local_stream_tx_prepared();
-        sender.install_local_tcp_direct_peer(&receiver);
+        install_test_local_tcp_direct_pair(&sender, &receiver);
 
         let payload = alloc::vec![0x6a; 2 * SOCKET_CHUNK_BYTES];
         assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
@@ -6413,7 +6482,7 @@ mod tests {
         let receiver = stream_facade(70);
         sender.stack_generation.store(10, Ordering::Release);
         receiver.stack_generation.store(10, Ordering::Release);
-        sender.install_local_tcp_direct_peer(&receiver);
+        install_test_local_tcp_direct_pair(&sender, &receiver);
 
         let payload = alloc::vec![0x4du8; 128 * 1024];
         assert_eq!(
@@ -6441,7 +6510,7 @@ mod tests {
         let receiver = stream_facade(72);
         sender.stack_generation.store(11, Ordering::Release);
         receiver.stack_generation.store(11, Ordering::Release);
-        sender.install_local_tcp_direct_peer(&receiver);
+        install_test_local_tcp_direct_pair(&sender, &receiver);
 
         let buffered = [0x31u8; 32];
         assert_eq!(sender.test_push_stream_tx(&buffered), buffered.len());

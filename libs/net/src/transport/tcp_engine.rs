@@ -387,6 +387,7 @@ struct TcpFlow {
     keepalive_probes: u8,
     last_advertised_window: u16,
     output_blocked: bool,
+    local_transport: bool,
     local_peer_hint: Option<LocalTcpPeerHint>,
 }
 
@@ -519,6 +520,7 @@ impl TcpEndpointTable {
         path: TcpPath,
         facade: Arc<SocketFacade>,
         control_sequence: u64,
+        local_transport: bool,
         now_ns: u64,
     ) -> Result<FlowId, TcpBindError> {
         let key = FlowKey::new(remote, local, TransportProtocol::Tcp)
@@ -564,6 +566,7 @@ impl TcpEndpointTable {
             keepalive_probes: 0,
             last_advertised_window: initial_window,
             output_blocked: false,
+            local_transport,
             local_peer_hint: None,
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
@@ -596,7 +599,7 @@ impl TcpEndpointTable {
         let Some(tcp) = packet.parsed.tcp else {
             return Err((TcpIngressError::Malformed, chain, metadata));
         };
-        let id = match self.ingress_flow(interface, path, key, tcp, now_ns) {
+        let id = match self.ingress_flow(interface, path, key, tcp, now_ns, false) {
             Ok(id) => id,
             Err(error) => return Err((error, chain, metadata)),
         };
@@ -749,6 +752,8 @@ impl TcpEndpointTable {
                     && sender.remote == work.remote
                     && peer.local == work.remote
                     && peer.remote == source
+                    && !sender.accept_reserved
+                    && !peer.accept_reserved
                     && peer.path.route.interface == interface
                     && sender.path.route.interface == interface
                     && Arc::ptr_eq(&sender.facade, &work.facade)
@@ -999,7 +1004,7 @@ impl TcpEndpointTable {
         {
             return Err(TcpIngressError::Malformed);
         }
-        let id = self.ingress_flow(interface, path, key, tcp, now_ns)?;
+        let id = self.ingress_flow(interface, path, key, tcp, now_ns, true)?;
         let ingress = payload.map_or(IngressPayload::Empty, |payload| IngressPayload::Lease {
             lease: payload,
             offset: 0,
@@ -1017,12 +1022,13 @@ impl TcpEndpointTable {
         key: FlowKey,
         tcp: TcpPacket,
         now_ns: u64,
+        local_transport: bool,
     ) -> Result<FlowId, TcpIngressError> {
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         match self.flows.find(&key, hash) {
             Some(id) => Ok(id),
             None if tcp.flags.contains(TcpFlags::SYN) && !tcp.flags.contains(TcpFlags::ACK) => {
-                self.accept_syn(interface, path, key, tcp, now_ns)
+                self.accept_syn(interface, path, key, tcp, now_ns, local_transport)
             }
             None => Err(TcpIngressError::NoEndpoint),
         }
@@ -1191,6 +1197,7 @@ impl TcpEndpointTable {
     }
 
     pub fn close_flow(&mut self, id: FlowId, now_ns: u64) -> bool {
+        self.quiesce_local_pair(id, now_ns);
         let Some(flow) = self.flows.get_mut(id) else {
             return false;
         };
@@ -1201,6 +1208,7 @@ impl TcpEndpointTable {
     }
 
     pub fn abort_flow(&mut self, id: FlowId, now_ns: u64) -> bool {
+        self.quiesce_local_pair(id, now_ns);
         let Some(flow) = self.flows.get(id) else {
             return false;
         };
@@ -1429,6 +1437,7 @@ impl TcpEndpointTable {
         key: FlowKey,
         tcp: TcpPacket,
         now_ns: u64,
+        local_transport: bool,
     ) -> Result<FlowId, TcpIngressError> {
         let listener_key = self
             .find_listener_key(key.local, interface)
@@ -1490,6 +1499,7 @@ impl TcpEndpointTable {
             keepalive_probes: 0,
             last_advertised_window: initial_window,
             output_blocked: false,
+            local_transport,
             local_peer_hint: None,
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
@@ -1535,6 +1545,9 @@ impl TcpEndpointTable {
         now_ns: u64,
         publish_info: bool,
     ) -> Result<(), TcpIngressError> {
+        if tcp.flags.intersects(TcpFlags::FIN | TcpFlags::RST) {
+            self.quiesce_local_pair(id, now_ns);
+        }
         let (state_before, peer_window_before) = self
             .flows
             .get(id)
@@ -1938,6 +1951,121 @@ impl TcpEndpointTable {
         self.queue_transmit(id, transmit, payload, now_ns, true, false);
     }
 
+    fn install_established_local_pair(&mut self, id: FlowId) {
+        let Some(flow_generation) = self.flows.generation(id) else {
+            return;
+        };
+        let Some(flow) = self.flows.get(id) else {
+            return;
+        };
+        if !flow.local_transport
+            || flow.machine.state() != TcpState::Established
+            || flow.accept_reserved
+            || flow.facade.is_closing()
+        {
+            return;
+        }
+        let Some(peer_key) = FlowKey::new(flow.local, flow.remote, TransportProtocol::Tcp) else {
+            return;
+        };
+        let interface = flow.path.route.interface;
+        let facade = Arc::clone(&flow.facade);
+        let facade_generation = facade.generation();
+        let stack_generation = facade.stack_generation();
+        if stack_generation == 0 {
+            return;
+        }
+
+        let peer_hash = flow_hash64(rss_hash(&self.rss_key, &peer_key));
+        let Some(peer_id) = self.flows.find(&peer_key, peer_hash) else {
+            return;
+        };
+        if peer_id == id {
+            return;
+        }
+        let Some(peer_flow_generation) = self.flows.generation(peer_id) else {
+            return;
+        };
+        let Some(peer) = self.flows.get(peer_id) else {
+            return;
+        };
+        if !peer.local_transport
+            || peer.machine.state() != TcpState::Established
+            || peer.accept_reserved
+            || peer.path.route.interface != interface
+            || peer.local != peer_key.local
+            || peer.remote != peer_key.remote
+            || peer.facade.is_closing()
+            || peer.facade.stack_generation() != stack_generation
+        {
+            return;
+        }
+        let peer_facade = Arc::clone(&peer.facade);
+        let peer_facade_generation = peer_facade.generation();
+        let facade_ready = facade.stream_unsent_len() == 0
+            && !self
+                .output
+                .iter()
+                .any(|pending| pending.flow == id && pending.payload.is_some());
+        let peer_facade_ready = peer_facade.stream_unsent_len() == 0
+            && !self
+                .output
+                .iter()
+                .any(|pending| pending.flow == peer_id && pending.payload.is_some());
+
+        self.flows.get_mut(id).unwrap().local_peer_hint = Some(LocalTcpPeerHint {
+            flow: peer_id,
+            flow_generation: peer_flow_generation,
+            facade_generation: peer_facade_generation,
+            stack_generation,
+        });
+        self.flows.get_mut(peer_id).unwrap().local_peer_hint = Some(LocalTcpPeerHint {
+            flow: id,
+            flow_generation,
+            facade_generation,
+            stack_generation,
+        });
+        if facade_ready {
+            facade.install_local_tcp_direct_peer(&peer_facade);
+        }
+        if peer_facade_ready {
+            peer_facade.install_local_tcp_direct_peer(&facade);
+        }
+    }
+
+    fn quiesce_local_pair(&mut self, id: FlowId, now_ns: u64) {
+        let Some(facade) = self.flows.get(id).map(|flow| Arc::clone(&flow.facade)) else {
+            return;
+        };
+        let Some((peer_id, peer_facade)) = self.local_peer_facade(id) else {
+            facade.clear_local_tcp_direct_route();
+            return;
+        };
+        facade.clear_local_tcp_direct_route();
+        peer_facade.clear_local_tcp_direct_route();
+        let now_ns = now_ns.max(
+            self.flows
+                .get(id)
+                .map_or(0, |flow| flow.last_activity_ns)
+                .max(
+                    self.flows
+                        .get(peer_id)
+                        .map_or(0, |flow| flow.last_activity_ns),
+                ),
+        );
+        for (flow_id, flow_facade) in [(id, facade), (peer_id, peer_facade)] {
+            let bytes = flow_facade.take_local_tcp_direct_pending();
+            if bytes == 0 {
+                continue;
+            }
+            assert!(
+                self.reconcile_local_direct(flow_id, bytes, now_ns)
+                    .is_some(),
+                "本地 TCP route 失效前必须结算已交付字节"
+            );
+        }
+    }
+
     fn on_established(&mut self, id: FlowId, now_ns: u64) -> bool {
         let flow = self.flows.get_mut(id).unwrap();
         flow.listener_key.take();
@@ -1980,6 +2108,7 @@ impl TcpEndpointTable {
         }
         self.stats.established = self.stats.established.saturating_add(1);
         publish_tcp_info(self.flows.get(id).unwrap());
+        self.install_established_local_pair(id);
         true
     }
 
@@ -2145,6 +2274,7 @@ impl TcpEndpointTable {
     }
 
     fn reap(&mut self, id: FlowId, error: Option<SocketError>) {
+        self.quiesce_local_pair(id, 0);
         let Some(key) = self.flows.key(id) else {
             return;
         };
@@ -2902,6 +3032,7 @@ mod tests {
     }
 
     struct LocalPair {
+        listener: Arc<SocketFacade>,
         client: Arc<SocketFacade>,
         server: Arc<SocketFacade>,
         client_flow: FlowId,
@@ -2912,6 +3043,14 @@ mod tests {
         table: &mut TcpEndpointTable,
         receive_limit: Option<usize>,
     ) -> LocalPair {
+        establish_local_pair_with_defer(table, receive_limit, 0)
+    }
+
+    fn establish_local_pair_with_defer(
+        table: &mut TcpEndpointTable,
+        receive_limit: Option<usize>,
+        defer_accept_ns: u64,
+    ) -> LocalPair {
         let server_endpoint = Endpoint {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 9_100,
@@ -2921,12 +3060,15 @@ mod tests {
             port: 41_000,
         };
         let listener = facade(90);
+        listener.test_set_stack_generation(1);
+        listener.set_tcp_defer_accept_ns(defer_accept_ns);
         let group = listen_group(&listener, 90, 1, 4);
         table
             .listen(server_endpoint, Some(InterfaceId(1)), group)
             .unwrap();
 
         let client = facade(91);
+        client.test_set_stack_generation(1);
         let client_flow = table
             .connect(
                 client_endpoint,
@@ -2934,6 +3076,7 @@ mod tests {
                 path(client_endpoint.addr, server_endpoint.addr),
                 Arc::clone(&client),
                 1,
+                true,
                 1_000,
             )
             .unwrap();
@@ -3006,7 +3149,11 @@ mod tests {
                 4_000,
             )
             .unwrap();
-        let server = listener.accept(true, None).unwrap();
+        let server = if defer_accept_ns == 0 {
+            listener.accept(true, None).unwrap()
+        } else {
+            Arc::clone(&table.flows.get(server_flow).unwrap().facade)
+        };
         if let Some(limit) = receive_limit {
             server.set_buffer_limits(None, Some(limit));
         }
@@ -3018,11 +3165,60 @@ mod tests {
             }
         );
         LocalPair {
+            listener,
             client,
             server,
             client_flow,
             server_flow,
         }
+    }
+
+    fn ingest_prepared_local_work(
+        table: &mut TcpEndpointTable,
+        work: &PreparedTcpTx,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpIngressError> {
+        let source = Endpoint {
+            addr: work.path.route.source,
+            port: work.local_port,
+        };
+        let key = FlowKey::new(source, work.remote, TransportProtocol::Tcp).unwrap();
+        let ingress_path = TcpPath {
+            route: RouteDecision {
+                interface: work.path.route.interface,
+                source: work.remote.addr,
+                next_hop: source.addr,
+                mtu: work.path.route.mtu,
+                table: work.path.route.table,
+            },
+            source_mac: work.path.destination_mac,
+            destination_mac: work.path.source_mac,
+            unresolved_neighbor: None,
+            config_generation: work.path.config_generation,
+        };
+        table.ingest_local(
+            work.path.route.interface,
+            ingress_path,
+            key,
+            TcpPacket {
+                source_port: work.local_port,
+                destination_port: work.remote.port,
+                sequence: work.sequence,
+                acknowledgement: work.acknowledgement,
+                flags: work.flags,
+                window: work.window,
+                urgent_pointer: 0,
+                header_len: 20 + u16::from(work.options_len),
+                payload_offset: 0,
+                payload_len: work
+                    .payload
+                    .as_ref()
+                    .map_or(0, |payload| u32::from(payload.len)),
+                options: work.parsed_options,
+            },
+            work.payload.as_ref(),
+            now_ns,
+        )
     }
 
     fn prepare_local_payload(
@@ -3054,6 +3250,7 @@ mod tests {
                 path(local.addr, remote.addr),
                 Arc::clone(facade),
                 7,
+                false,
                 1_000,
             )
             .unwrap();
@@ -3101,6 +3298,7 @@ mod tests {
                 key,
                 packet(remote.port, local.port, 700, 0, TcpFlags::SYN, 0),
                 now_ns,
+                false,
             )
             .unwrap();
         let syn_ack = table.take_output().unwrap();
@@ -3241,6 +3439,7 @@ mod tests {
                 path(local.addr, remote.addr),
                 Arc::clone(&facade),
                 7,
+                false,
                 1_000,
             )
             .unwrap();
@@ -3452,6 +3651,130 @@ mod tests {
             Ok(payload.len())
         );
         assert_eq!(&output[..payload.len()], payload);
+    }
+
+    #[test]
+    fn local_handshake_installs_direct_route_before_first_payload() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let payload = alloc::vec![0x5a; usize::from(DEFAULT_IPV4_MSS) * 2 + 73];
+
+        assert_eq!(
+            pair.client.send_stream(&payload, true, None, false),
+            Ok(payload.len())
+        );
+        let mut received = alloc::vec![0; payload.len()];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut received, true, false, false, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn local_direct_route_does_not_overtake_dequeued_payload() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let first = prepare_local_payload(&mut table, &pair, b"first buffered payload", 10_000);
+        assert!(first.payload.is_some());
+        assert_eq!(pair.client.stream_unsent_len(), 0);
+
+        let second = b"second direct payload";
+        assert_eq!(
+            pair.client.send_stream(second, true, None, false),
+            Ok(second.len())
+        );
+        let mut received = [0u8; 64];
+        assert_eq!(
+            pair.server
+                .recv_stream(&mut received, false, false, false, true, None),
+            Err(SocketError::WouldBlock)
+        );
+        assert_eq!(pair.client.stream_unsent_len(), second.len());
+    }
+
+    #[test]
+    fn reaped_local_peer_invalidates_direct_route() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        table.reap(pair.server_flow, None);
+
+        let payload = b"payload after peer reap";
+        assert_eq!(
+            pair.client.send_stream(payload, true, None, false),
+            Ok(payload.len())
+        );
+        assert_eq!(pair.client.stream_unsent_len(), payload.len());
+    }
+
+    #[test]
+    fn local_fin_disables_direct_route_for_half_closed_reverse_send() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        assert!(table.shutdown_write(pair.client_flow, 10_000));
+        let fin = table.take_output().unwrap();
+        assert!(fin.flags.contains(TcpFlags::FIN));
+        ingest_prepared_local_work(&mut table, &fin, 11_000).unwrap();
+        assert_eq!(
+            table.flows.get(pair.server_flow).unwrap().machine.state(),
+            TcpState::CloseWait
+        );
+
+        let payload = b"reverse payload after fin";
+        assert_eq!(
+            pair.server.send_stream(payload, true, None, false),
+            Ok(payload.len())
+        );
+        assert_eq!(pair.server.stream_unsent_len(), payload.len());
+    }
+
+    #[test]
+    fn local_shutdown_sequences_fin_after_pending_direct_payload() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let sequence = table
+            .flows
+            .get(pair.client_flow)
+            .unwrap()
+            .machine
+            .send_next();
+        let payload = b"payload before local shutdown";
+        assert_eq!(
+            pair.client.send_stream(payload, true, None, false),
+            Ok(payload.len())
+        );
+
+        assert!(table.shutdown_write(pair.client_flow, 10_000));
+        let fin = table.take_output().unwrap();
+        assert!(fin.flags.contains(TcpFlags::FIN));
+        assert_eq!(fin.sequence, sequence + payload.len() as u32);
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            sequence + payload.len() as u32
+        );
+    }
+
+    #[test]
+    fn deferred_accept_first_payload_uses_promoting_ingress_path() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair_with_defer(&mut table, None, 1_000_000_000);
+        assert!(matches!(
+            pair.listener.accept(true, None),
+            Err(SocketError::WouldBlock)
+        ));
+        let first = prepare_local_payload(&mut table, &pair, b"deferred accept payload", 10_000);
+        assert_eq!(
+            table.try_local_data_effect(InterfaceId(1), &first, 11_000),
+            Ok(None)
+        );
+        ingest_prepared_local_work(&mut table, &first, 12_000).unwrap();
+        assert!(pair.listener.accept(true, None).is_ok());
     }
 
     #[test]
@@ -3816,6 +4139,7 @@ mod tests {
                 key,
                 syn,
                 1_000,
+                false,
             )
             .unwrap();
         let syn_ack = table.take_output().unwrap();
@@ -3869,6 +4193,7 @@ mod tests {
                 key,
                 packet(remote.port, local.port, 900, 0, TcpFlags::SYN, 0),
                 1_000,
+                false,
             )
             .unwrap();
         let syn_ack = table.take_output().unwrap();
@@ -4057,6 +4382,7 @@ mod tests {
                 path(local.addr, remote.addr),
                 Arc::clone(&facade),
                 9,
+                false,
                 0,
             )
             .unwrap();
@@ -4089,6 +4415,7 @@ mod tests {
                 path(local.addr, remote.addr),
                 Arc::clone(&facade),
                 10,
+                false,
                 0,
             )
             .unwrap();
@@ -4251,6 +4578,7 @@ mod tests {
                     key,
                     packet(remote.port, local.port, 700, 0, TcpFlags::SYN, 0),
                     1_000 + u64::from(index),
+                    false,
                 )
                 .unwrap();
             let syn_ack = table.take_output().unwrap();
