@@ -374,10 +374,36 @@ unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
     let user = flags.has(VmFlags::USER);
     let mut va = vaddr & !(LoongArch64Paging::PAGE_SIZE - 1);
     let end = vaddr.saturating_add(len);
+    let base_level = LoongArch64Paging::LEVELS - 1;
+    let mut leaf_table_vaddr = 0usize;
+    let mut leaf_table_end = va;
     while va < end {
-        if let Ok((level, pte_ptr, old_pte)) =
-            find_leaf::<LoongArch64Paging>(inner.pgd_virt(), va, phys_to_virt)
-        {
+        let cached = if leaf_table_vaddr != 0 && va < leaf_table_end {
+            let index = LoongArch64Paging::level_index(va, base_level);
+            let pte_ptr = (leaf_table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+            let old_pte =
+                LoongArch64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) });
+            (LoongArch64Paging::pte_is_valid(old_pte) && LoongArch64Paging::pte_is_leaf(old_pte))
+                .then_some((base_level, pte_ptr, old_pte))
+        } else {
+            None
+        };
+        if let Ok((level, pte_ptr, old_pte)) = cached.ok_or(()).or_else(|_| {
+            let found = find_leaf::<LoongArch64Paging>(inner.pgd_virt(), va, phys_to_virt)
+                .map_err(|_| ())?;
+            if found.0 == base_level {
+                let index = LoongArch64Paging::level_index(va, base_level);
+                leaf_table_vaddr = found.1 as usize - index * core::mem::size_of::<usize>();
+                let entries_left = LoongArch64Paging::ENTRIES_PER_TABLE - index;
+                leaf_table_end = va
+                    .saturating_add(entries_left * LoongArch64Paging::PAGE_SIZE)
+                    .min(end);
+            } else {
+                leaf_table_vaddr = 0;
+                leaf_table_end = va;
+            }
+            Ok::<_, ()>(found)
+        }) {
             let old_flags = LoongArch64Paging::pte_flags(old_pte);
             let new_pte = LoongArch64Paging::make_leaf_pte_for_level(
                 level,
