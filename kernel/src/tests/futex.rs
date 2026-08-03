@@ -15,6 +15,19 @@ fn waiter(task: &Arc<Task>) -> FutexWaiter {
 }
 
 #[ktest]
+fn futex_wait_state_rearms_after_non_futex_wakeup() {
+    let state = FutexWaitState::new();
+
+    assert!(state.mark_sleeping());
+    assert!(state.rearm_after_non_futex_wakeup());
+    assert!(state.mark_sleeping());
+
+    assert_eq!(state.mark_woken(), FUTEX_WAIT_SLEEPING);
+    assert!(!state.rearm_after_non_futex_wakeup());
+    assert!(state.is_woken());
+}
+
+#[ktest]
 fn futex_wait_requeue_and_user_rmw_are_atomic() {
     let task = sched::current_task();
     let saved_vm = task.ext_remove(sched::TASKEXT_VM_SPACE);
