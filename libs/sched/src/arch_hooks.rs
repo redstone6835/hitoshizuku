@@ -139,6 +139,85 @@ pub fn ops_or_panic() -> &'static ArchContextOps {
     ops().expect("[sched] ArchContextOps not registered — arch init missing")
 }
 
+// ── ArchLocalInterruptOps ───────────────────────────────────────────────────
+
+/// 调度边界所需的本地中断状态操作。
+///
+/// `schedule_once_inner` 的调用栈属于当前任务，可能随任务迁移到另一 CPU 后再恢复。
+/// 因此保存值只能包含可在同架构其它 CPU 上恢复的中断使能状态，不能携带 CPU 私有指针。
+#[repr(C)]
+pub struct ArchLocalInterruptOps {
+    /// 保存当前中断使能状态并关闭本地可屏蔽中断。
+    pub save_and_disable: fn() -> usize,
+    /// 在当前 CPU 恢复先前保存的中断使能状态。
+    pub restore: fn(state: usize),
+}
+
+// Safety: 仅包含函数指针，不含需要额外维护的共享状态。
+unsafe impl Sync for ArchLocalInterruptOps {}
+unsafe impl Send for ArchLocalInterruptOps {}
+
+static LOCAL_INTERRUPT_OPS: AtomicPtr<ArchLocalInterruptOps> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// 注入调度边界使用的本地中断状态操作。
+pub fn register_local_interrupt(ops: &'static ArchLocalInterruptOps) {
+    register_once(
+        &LOCAL_INTERRUPT_OPS,
+        ops as *const _ as *mut _,
+        "ArchLocalInterruptOps",
+    );
+}
+
+fn local_interrupt() -> Option<&'static ArchLocalInterruptOps> {
+    let ptr = LOCAL_INTERRUPT_OPS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: register_local_interrupt 只接受静态函数表，注册后指针永久有效。
+        Some(unsafe { &*(ptr as *const ArchLocalInterruptOps) })
+    }
+}
+
+/// 把中断状态与当前任务的调度调用栈绑定，在任务恢复执行时自动还原。
+#[must_use]
+pub(crate) struct LocalInterruptGuard {
+    state: usize,
+    restore: Option<fn(usize)>,
+}
+
+impl LocalInterruptGuard {
+    fn new() -> Self {
+        Self::with_ops(local_interrupt())
+    }
+
+    fn with_ops(ops: Option<&ArchLocalInterruptOps>) -> Self {
+        match ops {
+            Some(ops) => Self {
+                state: (ops.save_and_disable)(),
+                restore: Some(ops.restore),
+            },
+            None => Self {
+                state: 0,
+                restore: None,
+            },
+        }
+    }
+}
+
+impl Drop for LocalInterruptGuard {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore {
+            restore(self.state);
+        }
+    }
+}
+
+/// 关闭本地中断并返回随当前任务调用栈保存的恢复保护器。
+pub(crate) fn disable_local_interrupts() -> LocalInterruptGuard {
+    LocalInterruptGuard::new()
+}
+
 // ── ArchTimeOps ──────────────────────────────────────────────────────────────
 //
 // 时间戳源 + 当前 CPU id。两件事都被调度核心高频访问（tick 推进虚拟时间、
@@ -477,6 +556,57 @@ mod cpu_control_tests {
         mark_urgent_work(cpu);
         assert!(take_urgent_work(cpu));
         assert!(!take_urgent_work(cpu));
+    }
+}
+
+#[cfg(test)]
+mod local_interrupt_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{ArchLocalInterruptOps, LocalInterruptGuard};
+
+    const SAVED_STATE: usize = 0x4;
+
+    static SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RESTORED_STATE: AtomicUsize = AtomicUsize::new(0);
+
+    fn save_and_disable() -> usize {
+        SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
+        SAVED_STATE
+    }
+
+    fn restore(state: usize) {
+        RESTORE_CALLS.fetch_add(1, Ordering::Relaxed);
+        RESTORED_STATE.store(state, Ordering::Relaxed);
+    }
+
+    static TEST_OPS: ArchLocalInterruptOps = ArchLocalInterruptOps {
+        save_and_disable,
+        restore,
+    };
+
+    #[test]
+    fn guard_restores_saved_state_and_is_optional() {
+        SAVE_CALLS.store(0, Ordering::Relaxed);
+        RESTORE_CALLS.store(0, Ordering::Relaxed);
+        RESTORED_STATE.store(0, Ordering::Relaxed);
+
+        {
+            let _guard = LocalInterruptGuard::with_ops(Some(&TEST_OPS));
+            assert_eq!(SAVE_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(RESTORE_CALLS.load(Ordering::Relaxed), 0);
+        }
+
+        assert_eq!(RESTORE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(RESTORED_STATE.load(Ordering::Relaxed), SAVED_STATE);
+
+        {
+            let _guard = LocalInterruptGuard::with_ops(None);
+        }
+
+        assert_eq!(SAVE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(RESTORE_CALLS.load(Ordering::Relaxed), 1);
     }
 }
 
