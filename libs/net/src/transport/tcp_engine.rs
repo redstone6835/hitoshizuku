@@ -1128,14 +1128,20 @@ impl TcpEndpointTable {
                 break;
             };
             queued_bytes = queued_bytes.saturating_add(usize::from(payload.len));
-            unsent_hint = Some(unsent.saturating_sub(usize::from(payload.len)));
+            let remaining_unsent = unsent.saturating_sub(usize::from(payload.len));
+            unsent_hint = Some(remaining_unsent);
             let Some(sequence) = flow.machine.reserve_send(u32::from(payload.len)) else {
                 break;
+            };
+            let flags = if remaining_unsent == 0 {
+                TcpFlags::ACK | TcpFlags::PSH
+            } else {
+                TcpFlags::ACK
             };
             let transmit = TcpTransmit {
                 sequence,
                 acknowledgement: flow.machine.receive_next(),
-                flags: TcpFlags::ACK | TcpFlags::PSH,
+                flags,
                 window: advertised_window(&flow.facade, flow.local_window_scale),
             };
             self.queue_transmit(id, transmit, Some(payload), now_ns, false, true);
@@ -4003,6 +4009,38 @@ mod tests {
         assert_eq!(table.resume_output_blocked(40_000, 1), 1);
         assert_eq!(facade.stream_unsent_len(), 0);
         assert!(!table.has_output_blocked());
+    }
+
+    #[test]
+    fn stream_send_marks_only_the_batch_tail_with_psh() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_014,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_014,
+        };
+        let facade = facade(14);
+        facade.set_tcp_maxseg(536);
+        facade.set_tcp_nodelay(true);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        {
+            let state = table.flows.get_mut(flow).unwrap();
+            state.peer_window = u32::MAX;
+            state.congestion.cwnd = u32::MAX;
+        }
+        let payload = alloc::vec![0x5a; 536 * 3 + 17];
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+
+        assert!(table.drain_send(flow, 20_000));
+        let flags =
+            core::iter::from_fn(|| table.take_output().map(|work| work.flags)).collect::<Vec<_>>();
+
+        assert_eq!(flags.len(), 4);
+        assert_eq!(&flags[..3], &[TcpFlags::ACK; 3]);
+        assert_eq!(flags[3], TcpFlags::ACK | TcpFlags::PSH);
     }
 
     #[test]
