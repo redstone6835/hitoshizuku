@@ -2578,6 +2578,17 @@ impl FutexWaitState {
             .is_ok()
     }
 
+    fn rearm_after_non_futex_wakeup(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FUTEX_WAIT_SLEEPING,
+                FUTEX_WAIT_ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn mark_woken(&self) -> u8 {
         self.state.swap(FUTEX_WAIT_WOKEN, Ordering::AcqRel)
     }
@@ -3362,6 +3373,7 @@ fn pi_wait_registered(
             continue;
         }
         sched::operation::sched_yield()?;
+        let _ = wait_state.rearm_after_non_futex_wakeup();
         restore_current_task_after_sleep(task);
     }
 }
@@ -3623,6 +3635,7 @@ fn futex_wait_requeue_pi(
             continue;
         }
         sched::operation::sched_yield()?;
+        let _ = wait_state.rearm_after_non_futex_wakeup();
         restore_current_task_after_sleep(task);
     }
 }
@@ -4073,6 +4086,9 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
             return Ok(index);
         }
         sched::operation::sched_yield()?;
+        for entry in &entries {
+            let _ = entry.wait_state.rearm_after_non_futex_wakeup();
+        }
         if deadline.is_some() {
             sched::cancel_sleep_deadline(ctx.task());
         }
@@ -4642,6 +4658,7 @@ fn futex_wait(
             return Ok(0);
         }
         sched::operation::sched_yield()?;
+        let _ = wait_state.rearm_after_non_futex_wakeup();
         if wait_state.is_woken() {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);

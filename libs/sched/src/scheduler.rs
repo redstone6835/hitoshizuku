@@ -2725,6 +2725,9 @@ pub fn schedule_once(now_ns: u64) {
 }
 
 fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
+    // 保护器保存在当前任务自己的调用栈上。任务被切回（即使迁移到另一 CPU）后，
+    // 会恢复它进入本次调度前的中断状态，而不是继承此前运行任务留下的硬件状态。
+    let _local_interrupt_guard = arch_hooks::disable_local_interrupts();
     #[cfg(feature = "performance-profile")]
     let schedule_start = profiling::read_counter();
     // LoongArch syscall 路径可能在本地中断暂时关闭时主动调度。即使本次仍选回

@@ -4843,22 +4843,20 @@ impl SocketFacade {
         profiling::observe(profiling::Metric::TcpBytesReceived, len as u64);
         if was_empty && len != 0 {
             self.set_ready(Readiness::READABLE);
-            if local {
-                let target = wake_one_local_socket_reader(&self.read_wait, self.id, handoff_ready);
-                if let Some(target) = target {
-                    if target.preferred_cpu() != sched::current_cpu_id() || handoff_ready {
-                        #[cfg(feature = "performance-profile")]
-                        profiling::observe(profiling::Metric::TcpLocalConsumerHandoffs, 1);
-                        sched::request_post_syscall_handoff_to(target);
-                    } else {
-                        *self.local_read_handoff.lock() = Some(target);
-                    }
-                }
-            } else {
-                wake_one_socket_reader(&self.read_wait, self.id);
+        }
+        if local {
+            if !handoff_ready {
+                return;
             }
-        } else if local && handoff_ready {
-            self.request_local_tcp_consumer_handoff();
+            if let Some(target) = wake_one_local_socket_reader(&self.read_wait, self.id, true) {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpLocalConsumerHandoffs, 1);
+                sched::request_post_syscall_handoff_to(target);
+            } else {
+                self.request_local_tcp_consumer_handoff();
+            }
+        } else if was_empty && len != 0 {
+            wake_one_socket_reader(&self.read_wait, self.id);
         }
     }
 
@@ -6298,6 +6296,37 @@ mod tests {
             AddressFamily::Ipv4,
             SocketKind::Stream,
         ))
+    }
+
+    fn sleeping_task() -> Arc<sched::Task> {
+        let session = sched::Session::new();
+        let process_group = sched::ProcessGroup::new(&session);
+        session.register_group(&process_group);
+        sched::Task::new(
+            sched::SchedParams::default_fair(),
+            Weak::new(),
+            sched::ThreadGroup::new(),
+            process_group,
+        )
+    }
+
+    #[test]
+    fn local_stream_defers_reader_wakeup_until_tail_commit() {
+        let facade = stream_facade(2);
+        let task = sleeping_task();
+        let entry = facade.read_wait.prepare_to_wait(&task, TaskState::Sleeping);
+
+        facade.finish_stream_rx_commit(true, 1024, true, false);
+
+        assert_eq!(task.state(), TaskState::Sleeping);
+        assert_eq!(facade.read_wait.len_hint(), 1);
+        assert!(facade.readiness().0.contains(Readiness::READABLE));
+
+        facade.finish_stream_rx_commit(false, 1024, true, true);
+
+        assert_eq!(task.state(), TaskState::Runnable);
+        assert_eq!(facade.read_wait.len_hint(), 0);
+        facade.read_wait.finish_wait(&entry);
     }
 
     fn install_test_local_tcp_direct_pair(

@@ -52,7 +52,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
 use sched::arch_hooks::{
-    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry,
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchLocalInterruptOps, ArchTimeOps,
+    ArchTrapOps, KernelEntry,
 };
 
 use super::specific::{CSR_TCFG, kernel_timestamp_ns};
@@ -199,6 +200,25 @@ static ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     switch_context,
 };
 
+fn save_and_disable_local_interrupts() -> usize {
+    unsafe {
+        let state = LoongArch64InterruptOps::save_interrupt_state();
+        LoongArch64InterruptOps::disable_interrupts();
+        state
+    }
+}
+
+fn restore_local_interrupts(state: usize) {
+    unsafe {
+        LoongArch64InterruptOps::restore_interrupt_state(state);
+    }
+}
+
+static ARCH_LOCAL_INTERRUPT_OPS: ArchLocalInterruptOps = ArchLocalInterruptOps {
+    save_and_disable: save_and_disable_local_interrupts,
+    restore: restore_local_interrupts,
+};
+
 /// 时间戳 + 当前 CPU id 契约。`now_ns` 接 rdtime 扫频后的单调纳秒源；
 /// `current_cpu_id` 读 CSR_CPUID 的 coreid 位域。
 static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
@@ -310,6 +330,7 @@ pub fn register() {
         .is_ok()
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
+        sched::arch_hooks::register_local_interrupt(&ARCH_LOCAL_INTERRUPT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);

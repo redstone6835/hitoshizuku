@@ -574,7 +574,11 @@ fn arch_hwcap() -> usize {
     {
         arch::riscv64::vector::user_hwcap()
     }
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::user_hwcap()
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     {
         0
     }

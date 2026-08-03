@@ -38,15 +38,15 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
-/// 用户态 trap 中保存的 PIE 只能在 `ertn` 时恢复。调度若在此之前切走，下一任务
-/// 会继承当前 CPU 的关中断状态，因此必须在可能切换上下文的边界临时恢复中断。
-fn schedule_before_user_return(now_ns: u64) {
+/// trap 中保存的 PIE 只能在 `ertn` 时恢复。调度若在此之前切走，下一任务会继承
+/// 当前 CPU 的关中断状态，因此必须在可能切换上下文的边界临时恢复中断。
+fn schedule_from_trap(now_ns: u64) {
     unsafe { LoongArch64InterruptOps::enable_interrupts() };
     sched::schedule_once(now_ns);
     unsafe { LoongArch64InterruptOps::disable_interrupts() };
 }
 
-fn preempt_before_user_return(now_ns: u64) {
+fn preempt_from_trap(now_ns: u64) {
     unsafe { LoongArch64InterruptOps::enable_interrupts() };
     sched::preempt_if_needed(now_ns);
     unsafe { LoongArch64InterruptOps::disable_interrupts() };
@@ -62,12 +62,12 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
             drop(task);
-            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
+            schedule_from_trap(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
             drop(task);
-            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
+            schedule_from_trap(super::super::specific::kernel_timestamp_ns());
         }
         _ => {}
     }
@@ -93,12 +93,12 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
             drop(task);
-            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
+            schedule_from_trap(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
             drop(task);
-            schedule_before_user_return(super::super::specific::kernel_timestamp_ns());
+            schedule_from_trap(super::super::specific::kernel_timestamp_ns());
         }
         _ => {}
     }
@@ -231,12 +231,12 @@ unsafe fn loongarch64_handle_exception_inner(
                 false
             };
             if from_user {
-                preempt_before_user_return(now_ns);
+                preempt_from_trap(now_ns);
             } else if preempt_idle {
                 loop {
                     // 该调用可能在 idle 被再次选中前长期不返回；每轮重新取时钟，
                     // 避免后续请求用首次 IPI 的旧时间戳做调度记账。
-                    sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+                    preempt_from_trap(super::super::specific::kernel_timestamp_ns());
 
                     // schedule_once 若切走 idle，本调用只会在 idle 再次成为
                     // current 后返回。旧 trap frame 的恢复点仍可能位于原来的
@@ -317,7 +317,7 @@ unsafe fn loongarch64_handle_exception_inner(
             // 短超时延迟。内核态中断已经在上方返回，此处是安全的用户态返回边界。
             let urgent_preempt = deadline_fired && sched::is_ready();
             if urgent_preempt {
-                preempt_before_user_return(now_ns);
+                preempt_from_trap(now_ns);
             }
             if boot_cpu {
                 // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
@@ -332,7 +332,7 @@ unsafe fn loongarch64_handle_exception_inner(
             // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
             // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
             if !urgent_preempt {
-                preempt_before_user_return(now_ns);
+                preempt_from_trap(now_ns);
             }
             return arg4;
         }
@@ -353,7 +353,7 @@ unsafe fn loongarch64_handle_exception_inner(
         deliver_user_signals_before_return(arg4, from_user);
         // 与 timer 分支一致，只在返回用户态前处理抢占请求。
         if from_user {
-            preempt_before_user_return(now_ns);
+            preempt_from_trap(now_ns);
         }
         arg4
     } else if ecode == ECODE_SYS {
@@ -396,7 +396,7 @@ unsafe fn loongarch64_handle_exception_inner(
         // 立即消费该标记，避免当前任务在同一时间片里连续启动 client，
         // 而刚 fork/唤醒的 server 只能等下一次 timer tick。
         if sched::needs_resched_current() {
-            preempt_before_user_return(super::super::specific::kernel_timestamp_ns());
+            preempt_from_trap(super::super::specific::kernel_timestamp_ns());
         }
         arg4
     } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD) {
