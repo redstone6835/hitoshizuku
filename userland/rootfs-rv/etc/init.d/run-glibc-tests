@@ -38,7 +38,12 @@ if ! awk '
         next
     }
     {
-        if ($0 ~ /echo "testcase cagent .* reject/) {
+        if ($0 ~ /echo "testcase cagent .* (reject|fail)/) {
+            print "        if [ -r \"$output_file\" ]; then"
+            print "            echo \"[init] CAgent 失败输出: $test_name\""
+            print "            cat \"$output_file\""
+            print "            echo"
+            print "        fi"
             print "        : > \"$CAGENT_FAILURE_FILE\""
         }
         print
