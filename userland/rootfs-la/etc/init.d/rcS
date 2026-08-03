@@ -409,17 +409,8 @@ run_chroot_test_script() {
         echo "[init] $name chroot setup failed"
         return 1
     fi
-    if [ "$name" = "cagent_testcode.sh" ]; then
-        temporary_runner="/mnt/tmp/.shiori-run-cagent-tests"
-        if ! cp /etc/init.d/run-glibc-tests "$temporary_runner"; then
-            echo "[init] failed to install CAgent chroot runner"
-            rm -f "$temporary_runner"
-            cleanup_chroot_test_root
-            return 1
-        fi
-        chmod 0755 "$temporary_runner" 2>/dev/null || true
-        runner="$temporary_runner"
-    elif [ -n "$PROFILE_WORKLOAD" ] && [ "$name" = "$PROFILE_WORKLOAD" ] && \
+    if [ "$name" != "cagent_testcode.sh" ] && \
+        [ -n "$PROFILE_WORKLOAD" ] && [ "$name" = "$PROFILE_WORKLOAD" ] && \
         [ -x /bin/profile-workload-guest ]; then
         temporary_runner="/mnt/tmp/.mygo-profile-workload"
         if ! cp /bin/profile-workload-guest "$temporary_runner"; then
@@ -444,7 +435,6 @@ run_chroot_test_script() {
     if [ "$name" = "cagent_testcode.sh" ]; then
         if [ ! -x /mnt/bin/bash ]; then
             echo "[init] $name chroot requires /bin/bash"
-            rm -f "$temporary_runner"
             cleanup_chroot_test_root
             return 1
         fi
