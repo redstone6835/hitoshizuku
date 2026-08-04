@@ -29,7 +29,13 @@ mod msi;
 mod pci;
 
 #[cfg(feature = "alloc")]
+mod specifier;
+
+#[cfg(feature = "alloc")]
 mod tree;
+
+#[cfg(feature = "alloc")]
+mod wide;
 
 pub use error::{ChosenError, Error, PropertyError};
 pub use flat::{
@@ -57,10 +63,16 @@ pub use pci::{
 };
 
 #[cfg(feature = "alloc")]
+pub use specifier::{IdMap, IdMapEntry, IdMapError, NamedPhandleArgs, PhandleArgs, SpecifierError};
+
+#[cfg(feature = "alloc")]
 pub use tree::{
     AddressError, AddressRange, ChosenStdout, NodeId, NodeStatus, RangeMapping, RegEntry, Tree,
     TreeError,
 };
+
+#[cfg(feature = "alloc")]
+pub use wide::{CellAddressError, CellAddressRange, CellRangeMapping, CellRegEntry, CellValue};
 
 #[cfg(test)]
 mod tests;

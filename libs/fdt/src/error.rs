@@ -18,7 +18,7 @@ pub enum Error {
     },
     /// 魔数不是 `0xd00dfeed`。
     BadMagic(u32),
-    /// 版本早于 v2，或最低兼容版本高于本解析器支持的 v17。
+    /// 版本为零，或最低兼容版本高于本解析器支持的 v17。
     UnsupportedVersion {
         /// DTB 声明的版本。
         version: u32,

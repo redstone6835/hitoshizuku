@@ -13,6 +13,7 @@ const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 
+const V1_HEADER_SIZE: usize = 28;
 const V2_HEADER_SIZE: usize = 32;
 const V3_HEADER_SIZE: usize = 36;
 const V17_HEADER_SIZE: usize = 40;
@@ -38,7 +39,7 @@ pub struct Header {
     /// 生成方声明的最低兼容版本。
     pub last_compatible_version: u32,
     /// v2 起提供的启动 CPU 物理编号。
-    pub boot_cpuid_phys: u32,
+    pub boot_cpuid_phys: Option<u32>,
     /// v3 起显式提供的 strings block 长度。
     pub size_dt_strings: Option<u32>,
     /// v17 起显式提供的 structure block 长度。
@@ -79,14 +80,14 @@ impl fmt::Debug for Fdt<'_> {
 impl<'a> Fdt<'a> {
     /// 校验并借用一份完整 FDT blob。
     ///
-    /// 支持 libfdt 的完整只读格式版本 v2..=v17，以及声明
+    /// 支持完整只读格式版本 v1..=v17，以及声明
     /// `last_comp_version <= 17` 的未来兼容版本。兼容处理包括 v16 以前的完整
     /// 路径节点名和长度至少为 8 的属性值 8-byte 对齐规则。传入切片可以在
     /// `total_size` 后带有其他数据；[`Self::as_bytes`] 只返回 FDT 自身。
     pub fn parse(input: &'a [u8]) -> Result<Self, Error> {
         if input.len() < 4 {
             return Err(Error::TruncatedHeader {
-                needed: V2_HEADER_SIZE,
+                needed: V1_HEADER_SIZE,
                 available: input.len(),
             });
         }
@@ -96,14 +97,14 @@ impl<'a> Fdt<'a> {
         }
         if input.len() < 28 {
             return Err(Error::TruncatedHeader {
-                needed: V2_HEADER_SIZE,
+                needed: V1_HEADER_SIZE,
                 available: input.len(),
             });
         }
 
         let version = read_u32(input, 20).expect("base header was checked");
         let last_compatible_version = read_u32(input, 24).expect("base header was checked");
-        if version < 2 || last_compatible_version > 17 {
+        if version == 0 || last_compatible_version > 17 {
             return Err(Error::UnsupportedVersion {
                 version,
                 last_compatible: last_compatible_version,
@@ -138,7 +139,8 @@ impl<'a> Fdt<'a> {
         let off_dt_struct = read_u32(bytes, 8).expect("versioned header was checked");
         let off_dt_strings = read_u32(bytes, 12).expect("versioned header was checked");
         let off_mem_rsvmap = read_u32(bytes, 16).expect("versioned header was checked");
-        let boot_cpuid_phys = read_u32(bytes, 28).expect("v2 header was checked");
+        let boot_cpuid_phys =
+            (version >= 2).then(|| read_u32(bytes, 28).expect("v2 header was checked"));
         let size_dt_strings =
             (version >= 3).then(|| read_u32(bytes, 32).expect("v3 header was checked"));
         let size_dt_struct =
@@ -230,7 +232,7 @@ impl<'a> Fdt<'a> {
             let (root, _) = validate_structure(structure, strings, version, true)?;
             (structure, region, root)
         } else {
-            // v2..v16 do not encode a structure size. Bound token scanning at the
+            // v1..v16 do not encode a structure size. Bound token scanning at the
             // next known block (if any), then use the first complete FDT_END as
             // the actual structure extent. This is how complete old blobs can
             // still be read when v3+ blocks are not in canonical order.

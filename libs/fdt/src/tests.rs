@@ -77,6 +77,7 @@ fn assemble(
     reservations: &[(u64, u64)],
 ) -> Vec<u8> {
     let header_size = match version {
+        1 => 28,
         2 => 32,
         3..=16 => 36,
         _ => 40,
@@ -104,7 +105,9 @@ fn assemble(
     set_u32(&mut blob, 16, reserve_offset as u32);
     set_u32(&mut blob, 20, version);
     set_u32(&mut blob, 24, if version >= 17 { 16 } else { 1 });
-    set_u32(&mut blob, 28, 7);
+    if version >= 2 {
+        set_u32(&mut blob, 28, 7);
+    }
     if version >= 3 {
         set_u32(&mut blob, 32, strings.len() as u32);
     }
@@ -146,13 +149,15 @@ fn cells(values: &[u32]) -> Vec<u8> {
 
 #[test]
 fn parses_every_complete_read_only_version() {
-    for version in 2..=18 {
+    for version in 1..=18 {
         let blob = basic_blob(version);
         let fdt = Fdt::parse(&blob).unwrap_or_else(|error| panic!("v{version}: {error:?}"));
         assert_eq!(fdt.header().version, version);
         assert_eq!(
             fdt.header().size(),
-            if version == 2 {
+            if version == 1 {
+                28
+            } else if version == 2 {
                 32
             } else if version < 17 {
                 36
@@ -160,7 +165,7 @@ fn parses_every_complete_read_only_version() {
                 40
             }
         );
-        assert_eq!(fdt.header().boot_cpuid_phys, 7);
+        assert_eq!(fdt.header().boot_cpuid_phys, (version >= 2).then_some(7));
         assert_eq!(fdt.root().name(), "");
         assert_eq!(fdt.find_node("/soc").unwrap().name(), "soc");
         assert!(fdt.find_node("soc").is_none());
@@ -400,10 +405,11 @@ fn rejects_header_and_version_errors() {
     assert!(matches!(Fdt::parse(&blob), Err(Error::BadMagic(0))));
 
     let mut blob = basic_blob(17);
-    set_u32(&mut blob, 20, 1);
+    set_u32(&mut blob, 20, 0);
+    set_u32(&mut blob, 24, 0);
     assert!(matches!(
         Fdt::parse(&blob),
-        Err(Error::UnsupportedVersion { version: 1, .. })
+        Err(Error::UnsupportedVersion { version: 0, .. })
     ));
 
     let mut blob = basic_blob(18);
@@ -668,7 +674,7 @@ fn parses_dtc_generated_legacy_and_modern_blobs_when_dtc_is_available() {
     };
 };
 "#;
-    for version in [2u32, 3, 16, 17] {
+    for version in [1u32, 2, 3, 16, 17] {
         let mut child = Command::new("dtc")
             .args(["-q", "-I", "dts", "-O", "dtb", "-V"])
             .arg(version.to_string())
@@ -1316,6 +1322,57 @@ fn memory_ranges_retain_four_cell_u128_values() {
             alignment: None,
             alloc_ranges: Vec::new(),
         }
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn arbitrary_width_reg_and_ranges_have_a_lossless_path() {
+    use crate::{AddressError, CellValue, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.property("#address-cells", &cells(&[5]));
+    builder.property("#size-cells", &cells(&[5]));
+    builder.begin("bus");
+    builder.property("#address-cells", &cells(&[5]));
+    builder.property("#size-cells", &cells(&[5]));
+    builder.property(
+        "ranges",
+        &cells(&[
+            1, 0, 0, 0, 0, // child base
+            2, 0, 0, 0, 0, // parent base
+            0, 0, 0, 0, 0x1000, // size
+        ]),
+    );
+    builder.begin("device@20");
+    builder.property(
+        "reg",
+        &cells(&[
+            1, 0, 0, 0, 0x20, // address
+            0, 0, 0, 0, 0x40, // size
+        ]),
+    );
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let device = tree.find_node("/bus/device@20").unwrap();
+
+    assert!(matches!(
+        tree.reg(device),
+        Err(AddressError::UnsupportedCellCount { count: 5, .. })
+    ));
+    let raw = tree.reg_cells(device).unwrap();
+    assert_eq!(raw[0].address.cells(), &[1, 0, 0, 0, 0x20]);
+    assert_eq!(raw[0].size.as_ref().unwrap().to_u128(), Some(0x40));
+
+    let translated = tree.translated_reg_cells(device).unwrap();
+    assert_eq!(
+        translated[0].address,
+        CellValue::from_cells(&[2, 0, 0, 0, 0x20])
     );
 }
 
@@ -2025,6 +2082,90 @@ fn malformed_msi_parent_rejects_the_complete_property() {
             required_cells: 2,
         })
     );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn generic_provider_specifiers_preserve_holes_names_and_widths() {
+    use crate::{SpecifierError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("clock");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("#clock-cells", &cells(&[2]));
+    builder.end_node();
+    builder.begin("device");
+    builder.property("clocks", &cells(&[1, 10, 20, 0, 1, 30, 40]));
+    builder.property("clock-names", b"core\0unused\0bus\0");
+    builder.end_node();
+    builder.begin("bad-device");
+    builder.property("clocks", &cells(&[1, 10, 20, 1, 30, 40]));
+    builder.property("clock-names", b"only-one\0");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let clock = tree.find_node("/clock").unwrap();
+    let device = tree.find_node("/device").unwrap();
+
+    let clocks = tree.clocks(device).unwrap().unwrap();
+    assert_eq!(clocks.len(), 3);
+    assert_eq!(clocks[0].name.as_deref(), Some("core"));
+    assert_eq!(clocks[0].specifier.provider, Some(clock));
+    assert_eq!(clocks[0].specifier.args, vec![10, 20]);
+    assert!(clocks[1].specifier.is_empty());
+    assert_eq!(clocks[2].specifier.args, vec![30, 40]);
+
+    let bad = tree.find_node("/bad-device").unwrap();
+    assert!(matches!(
+        tree.clocks(bad),
+        Err(SpecifierError::NameCountMismatch {
+            names: 1,
+            entries: 2,
+            ..
+        })
+    ));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn generic_iommu_map_is_atomic_and_variable_width() {
+    use crate::{IdMapError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("iommu");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("#iommu-cells", &cells(&[2]));
+    builder.end_node();
+    builder.begin("host");
+    builder.property("iommu-map-mask", &cells(&[0xffff]));
+    builder.property("iommu-map", &cells(&[0x100, 1, 7, 8, 0x20]));
+    builder.end_node();
+    builder.begin("bad-host");
+    builder.property("iommu-map", &cells(&[0, 1, 7]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let iommu = tree.find_node("/iommu").unwrap();
+    let host = tree.find_node("/host").unwrap();
+
+    let map = tree.iommu_map(host).unwrap().unwrap();
+    assert_eq!(map.mask, 0xffff);
+    assert_eq!(map.entries.len(), 1);
+    assert_eq!(map.entries[0].provider, iommu);
+    assert_eq!(map.entries[0].output_base, vec![7, 8]);
+    assert_eq!(map.entries[0].length, 0x20);
+
+    let bad = tree.find_node("/bad-host").unwrap();
+    assert!(matches!(
+        tree.iommu_map(bad),
+        Err(IdMapError::IncompleteEntry { entry: 0, .. })
+    ));
 }
 
 #[cfg(feature = "alloc")]
