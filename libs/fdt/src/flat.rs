@@ -85,6 +85,18 @@ impl<'a> Fdt<'a> {
     /// 路径节点名和长度至少为 8 的属性值 8-byte 对齐规则。传入切片可以在
     /// `total_size` 后带有其他数据；[`Self::as_bytes`] 只返回 FDT 自身。
     pub fn parse(input: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_with_padding_policy(input, false)
+    }
+
+    /// 按 DTSpec 的规范化要求解析，并额外拒绝非零结构对齐 padding。
+    ///
+    /// Linux/libfdt 与部分固件会保留未清零的 padding，因此普通 [`Self::parse`]
+    /// 为兼容性忽略这些字节；需要验证可复现、规范化输入的工具可使用本接口。
+    pub fn parse_strict(input: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_with_padding_policy(input, true)
+    }
+
+    fn parse_with_padding_policy(input: &'a [u8], strict_padding: bool) -> Result<Self, Error> {
         if input.len() < 4 {
             return Err(Error::TruncatedHeader {
                 needed: V1_HEADER_SIZE,
@@ -229,7 +241,7 @@ impl<'a> Fdt<'a> {
                 structure_size,
                 total_size,
             )?;
-            let (root, _) = validate_structure(structure, strings, version, true)?;
+            let (root, _) = validate_structure(structure, strings, version, true, strict_padding)?;
             (structure, region, root)
         } else {
             // v1..v16 do not encode a structure size. Bound token scanning at the
@@ -258,7 +270,8 @@ impl<'a> Fdt<'a> {
                     size: 0,
                     total_size,
                 })?;
-            let (root, used) = validate_structure(candidate, strings, version, false)?;
+            let (root, used) =
+                validate_structure(candidate, strings, version, false, strict_padding)?;
             let structure = &candidate[..used];
             let region = Region::new("structure block", structure_start, structure_start + used);
             for fixed in fixed_regions {
@@ -953,6 +966,7 @@ fn checked_block<'a>(
 
 fn validate_reservations(bytes: &[u8], offset: u32, total_size: u32) -> Result<usize, Error> {
     let mut cursor = offset as usize;
+    let mut index = 0usize;
     loop {
         let end = cursor
             .checked_add(16)
@@ -966,9 +980,46 @@ fn validate_reservations(bytes: &[u8], offset: u32, total_size: u32) -> Result<u
         if address == 0 && size == 0 {
             return Ok(cursor);
         }
+        if size != 0 && address.checked_add(size - 1).is_none() {
+            return Err(Error::InvalidReservationRange {
+                entry: index,
+                address,
+                size,
+            });
+        }
+        let mut previous_cursor = offset as usize;
+        for previous in 0..index {
+            let previous_entry = &bytes[previous_cursor..previous_cursor + 16];
+            let previous_address = u64::from_be_bytes(previous_entry[..8].try_into().unwrap());
+            let previous_size = u64::from_be_bytes(previous_entry[8..].try_into().unwrap());
+            if reservation_ranges_overlap(previous_address, previous_size, address, size) {
+                return Err(Error::OverlappingReservations {
+                    first: previous,
+                    second: index,
+                });
+            }
+            previous_cursor += 16;
+        }
+        index += 1;
         if cursor > total_size as usize {
             return Err(Error::MissingReservationTerminator { offset });
         }
+    }
+}
+
+fn reservation_ranges_overlap(
+    first_address: u64,
+    first_size: u64,
+    second_address: u64,
+    second_size: u64,
+) -> bool {
+    if first_size == 0 || second_size == 0 {
+        return false;
+    }
+    if first_address <= second_address {
+        second_address - first_address < first_size
+    } else {
+        first_address - second_address < second_size
     }
 }
 
@@ -977,6 +1028,7 @@ fn validate_structure(
     strings: &[u8],
     version: u32,
     validate_trailing: bool,
+    validate_padding: bool,
 ) -> Result<(usize, usize), Error> {
     let mut cursor = 0usize;
     let mut depth = 0usize;
@@ -1008,9 +1060,12 @@ fn validate_structure(
                 let after_nul = name_end + 1;
                 let next =
                     align_up(after_nul, 4).ok_or(Error::TruncatedStructure { offset: cursor })?;
-                structure
+                let padding = structure
                     .get(after_nul..next)
                     .ok_or(Error::TruncatedStructure { offset: cursor })?;
+                if validate_padding {
+                    validate_zero_padding(padding, after_nul)?;
+                }
 
                 if root_offset.is_none() {
                     let valid_root = if version < 16 {
@@ -1083,12 +1138,16 @@ fn validate_structure(
                         offset: token_offset,
                         length: Some(length),
                     })?;
-                    structure
-                        .get(cursor..aligned)
-                        .ok_or(Error::TruncatedProperty {
-                            offset: token_offset,
-                            length: Some(length),
-                        })?;
+                    let padding =
+                        structure
+                            .get(cursor..aligned)
+                            .ok_or(Error::TruncatedProperty {
+                                offset: token_offset,
+                                length: Some(length),
+                            })?;
+                    if validate_padding {
+                        validate_zero_padding(padding, cursor)?;
+                    }
                     cursor = aligned;
                 }
                 let value_end =
@@ -1108,12 +1167,15 @@ fn validate_structure(
                     offset: token_offset,
                     length: Some(length),
                 })?;
-                structure
+                let padding = structure
                     .get(value_end..next)
                     .ok_or(Error::TruncatedProperty {
                         offset: token_offset,
                         length: Some(length),
                     })?;
+                if validate_padding {
+                    validate_zero_padding(padding, value_end)?;
+                }
                 cursor = next;
 
                 let name_start = name_offset as usize;
@@ -1142,8 +1204,11 @@ fn validate_structure(
                         offset: token_offset,
                     });
                 }
-                if validate_trailing {
-                    validate_structure_trailing(structure, cursor)?;
+                if validate_trailing && cursor != structure.len() {
+                    return Err(Error::TrailingStructureData {
+                        offset: cursor,
+                        length: structure.len() - cursor,
+                    });
                 }
                 let root = root_offset.ok_or(Error::InvalidTokenOrder {
                     offset: token_offset,
@@ -1167,27 +1232,6 @@ fn validate_structure(
             };
         }
     }
-}
-
-fn validate_structure_trailing(structure: &[u8], mut cursor: usize) -> Result<(), Error> {
-    while cursor < structure.len() {
-        let remaining = structure.len() - cursor;
-        if remaining < 4 {
-            if structure[cursor..].iter().all(|&byte| byte == 0) {
-                return Ok(());
-            }
-            return Err(Error::NonZeroPadding { offset: cursor });
-        }
-        let token = read_u32(structure, cursor).expect("four trailing bytes were checked");
-        if token != 0 && token != FDT_NOP {
-            return Err(Error::InvalidTrailingToken {
-                offset: cursor,
-                token,
-            });
-        }
-        cursor += 4;
-    }
-    Ok(())
 }
 
 fn validate_node_name(raw: &[u8], version: u32, depth: usize) -> Result<(), ()> {
@@ -1221,21 +1265,56 @@ fn validate_node_name(raw: &[u8], version: u32, depth: usize) -> Result<(), ()> 
 }
 
 fn valid_node_component(name: &[u8]) -> bool {
-    !name.is_empty()
-        && name.iter().all(|&byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b',' | b'.' | b'_' | b'+' | b'-' | b'@')
-        })
-        && name.iter().filter(|&&byte| byte == b'@').count() <= 1
-        && !name.starts_with(b"@")
-        && !name.ends_with(b"@")
+    let mut components = name.split(|&byte| byte == b'@');
+    let Some(node_name) = components.next() else {
+        return false;
+    };
+    let unit_address = components.next();
+    if components.next().is_some()
+        || node_name.is_empty()
+        || node_name.len() > 31
+        || (!node_name[0].is_ascii_alphabetic() && !is_overlay_metadata_node_name(node_name))
+        || !node_name
+            .iter()
+            .all(|&byte| valid_node_name_character(byte))
+    {
+        return false;
+    }
+    unit_address.is_none_or(|unit_address| {
+        !unit_address.is_empty()
+            && unit_address
+                .iter()
+                .all(|&byte| valid_node_name_character(byte))
+    })
+}
+
+fn is_overlay_metadata_node_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"__symbols__" | b"__fixups__" | b"__local_fixups__" | b"__overlay__"
+    )
+}
+
+fn valid_node_name_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b',' | b'.' | b'_' | b'+' | b'-')
 }
 
 fn valid_property_name(name: &[u8]) -> bool {
     !name.is_empty()
+        && name.len() <= 31
         && name.iter().all(|&byte| {
             byte.is_ascii_alphanumeric()
-                || matches!(byte, b',' | b'.' | b'_' | b'+' | b'*' | b'?' | b'#' | b'-')
+                || matches!(byte, b',' | b'.' | b'_' | b'+' | b'?' | b'#' | b'-')
         })
+}
+
+fn validate_zero_padding(padding: &[u8], start: usize) -> Result<(), Error> {
+    if let Some(relative) = padding.iter().position(|&byte| byte != 0) {
+        return Err(Error::NonZeroPadding {
+            offset: start + relative,
+        });
+    }
+    Ok(())
 }
 
 fn property_at<'a>(

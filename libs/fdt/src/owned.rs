@@ -267,7 +267,7 @@ impl OwnedTree {
         write_header_u32(&mut blob, 32, to_u32(strings.len())?)?;
         write_header_u32(&mut blob, 36, to_u32(structure.len())?)?;
 
-        let parsed = Fdt::parse(&blob).map_err(OwnedTreeError::InvalidOutput)?;
+        let parsed = Fdt::parse_strict(&blob).map_err(OwnedTreeError::InvalidOutput)?;
         Tree::from_fdt(parsed).map_err(OwnedTreeError::InvalidTree)?;
         Ok(blob)
     }

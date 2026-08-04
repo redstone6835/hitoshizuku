@@ -76,12 +76,15 @@ pub use overlay::OverlayError;
 
 #[cfg(feature = "alloc")]
 pub use pci::{
-    PciAddressSpace, PciError, PciInterruptMap, PciInterruptMapEntry, PciMsiMap, PciMsiMapEntry,
-    PciRange,
+    PciAddressSpace, PciError, PciInterruptMap, PciInterruptMapEntry, PciInterruptRoute, PciMsiMap,
+    PciMsiMapEntry, PciRange,
 };
 
 #[cfg(feature = "alloc")]
-pub use specifier::{IdMap, IdMapEntry, IdMapError, NamedPhandleArgs, PhandleArgs, SpecifierError};
+pub use specifier::{
+    IdMap, IdMapEntry, IdMapError, IdMapMatch, IdMapTranslationError, MappedId, NamedPhandleArgs,
+    PhandleArgs, SpecifierError,
+};
 
 #[cfg(feature = "alloc")]
 pub use tree::{

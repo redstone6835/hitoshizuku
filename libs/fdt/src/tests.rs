@@ -213,15 +213,10 @@ fn legacy_property_values_use_eight_byte_alignment() {
     // Root header occupies 8 bytes; the legacy property data begins at +24,
     // with four alignment bytes immediately before it.
     nonzero_padding[structure_offset + 20] = 1;
-    assert_eq!(
-        Fdt::parse(&nonzero_padding)
-            .unwrap()
-            .root()
-            .property("wide")
-            .unwrap()
-            .value(),
-        &[1, 2, 3, 4, 5, 6, 7, 8]
-    );
+    assert!(matches!(
+        Fdt::parse_strict(&nonzero_padding),
+        Err(Error::NonZeroPadding { .. })
+    ));
 }
 
 #[test]
@@ -242,8 +237,7 @@ fn modern_property_does_not_apply_legacy_alignment() {
         &[1, 2, 3, 4, 5, 6, 7, 8]
     );
 
-    // libfdt 仅按对齐跳过 token 间隙，不要求填充内容为零。QEMU 生成的
-    // DTB 会在重用缓冲区时保留这些字节。
+    // DTSpec 要求 token 间隙必须清零；libfdt 的历史宽松行为不改变规范输入约束。
     let mut builder = StructureBuilder::new(17);
     builder.begin("");
     builder.property("compatible", b"qemu\0");
@@ -258,15 +252,10 @@ fn modern_property_does_not_apply_legacy_alignment() {
         .encoded_structure_range();
     let structure_offset = get_u32(&blob, 8) as usize;
     blob[structure_offset + encoded.end - 1] = b'x';
-    assert_eq!(
-        Fdt::parse(&blob)
-            .unwrap()
-            .root()
-            .property("compatible")
-            .unwrap()
-            .as_str(),
-        Ok("qemu")
-    );
+    assert!(matches!(
+        Fdt::parse_strict(&blob),
+        Err(Error::NonZeroPadding { .. })
+    ));
 }
 
 #[test]
@@ -648,7 +637,10 @@ fn rejects_misaligned_overlapping_and_unterminated_blocks() {
     }
     assert!(matches!(
         Fdt::parse(&unterminated),
-        Err(Error::MissingReservationTerminator { .. }) | Err(Error::TruncatedReservation { .. })
+        Err(Error::MissingReservationTerminator { .. })
+            | Err(Error::TruncatedReservation { .. })
+            | Err(Error::OverlappingReservations { .. })
+            | Err(Error::InvalidReservationRange { .. })
     ));
 }
 
@@ -662,7 +654,7 @@ fn rejects_bad_structure_order_and_names() {
     builder.end_node();
     let (structure, strings) = builder.end();
     assert!(matches!(
-        Fdt::parse(&assemble(17, structure, strings, &[])),
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
         Err(Error::PropertyAfterChild { .. })
     ));
 
@@ -671,7 +663,7 @@ fn rejects_bad_structure_order_and_names() {
     builder.end_node();
     let (structure, strings) = builder.end();
     assert!(matches!(
-        Fdt::parse(&assemble(17, structure, strings, &[])),
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
         Err(Error::InvalidRootName { .. })
     ));
 
@@ -682,8 +674,50 @@ fn rejects_bad_structure_order_and_names() {
     builder.end_node();
     let (structure, strings) = builder.end();
     assert!(matches!(
-        Fdt::parse(&assemble(15, structure, strings, &[])),
+        Fdt::parse_strict(&assemble(15, structure, strings, &[])),
         Err(Error::InvalidNodeName { .. })
+    ));
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("abcdefghijklmnopqrstuvwxyzabcdef");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
+        Err(Error::InvalidNodeName { .. })
+    ));
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.property("abcdefghijklmnopqrstuvwxyzabcdef", &[]);
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
+        Err(Error::InvalidPropertyName { .. })
+    ));
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("1device@0");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
+        Err(Error::InvalidNodeName { .. })
+    ));
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.property("star*property", &[]);
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
+        Err(Error::InvalidPropertyName { .. })
     ));
 }
 
@@ -703,6 +737,116 @@ fn accepts_nops_between_root_end_node_and_end() {
         fdt.nodes().map(|node| node.name()).collect::<Vec<_>>(),
         vec!["", "child"]
     );
+}
+
+#[test]
+fn fdt_end_is_the_exact_end_of_the_declared_structure_block() {
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.end_node();
+    let (mut structure, strings) = builder.end();
+    structure.extend_from_slice(&[0; 4]);
+    let blob = assemble(17, structure, strings, &[]);
+    assert!(matches!(
+        Fdt::parse(&blob),
+        Err(Error::TrailingStructureData { length: 4, .. })
+    ));
+}
+
+#[test]
+fn memory_reservation_entries_must_not_overlap() {
+    let overlapping = assemble(
+        17,
+        {
+            let mut builder = StructureBuilder::new(17);
+            builder.begin("");
+            builder.end_node();
+            builder.end().0
+        },
+        Vec::new(),
+        &[(0x1000, 0x100), (0x1080, 0x100)],
+    );
+    assert!(matches!(
+        Fdt::parse(&overlapping),
+        Err(Error::OverlappingReservations {
+            first: 0,
+            second: 1,
+        })
+    ));
+
+    let adjacent = assemble(
+        17,
+        {
+            let mut builder = StructureBuilder::new(17);
+            builder.begin("");
+            builder.end_node();
+            builder.end().0
+        },
+        Vec::new(),
+        &[(0x1000, 0x100), (0x1100, 0x100)],
+    );
+    assert!(Fdt::parse(&adjacent).is_ok());
+
+    let wrapping = assemble(
+        17,
+        {
+            let mut builder = StructureBuilder::new(17);
+            builder.begin("");
+            builder.end_node();
+            builder.end().0
+        },
+        Vec::new(),
+        &[(u64::MAX, 2)],
+    );
+    assert!(matches!(
+        Fdt::parse(&wrapping),
+        Err(Error::InvalidReservationRange {
+            entry: 0,
+            address: u64::MAX,
+            size: 2,
+        })
+    ));
+}
+
+#[test]
+fn structure_alignment_padding_must_be_zero() {
+    let mut node_builder = StructureBuilder::new(17);
+    node_builder.begin("");
+    let node_start = node_builder.structure.len();
+    node_builder.begin("ab");
+    node_builder.structure[node_start + 7] = 0x7f;
+    node_builder.end_node();
+    node_builder.end_node();
+    let (structure, strings) = node_builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
+        Err(Error::NonZeroPadding { .. })
+    ));
+
+    let mut property_builder = StructureBuilder::new(17);
+    property_builder.begin("");
+    let property_start = property_builder.structure.len();
+    property_builder.property("byte", &[0xaa]);
+    property_builder.structure[property_start + 13] = 0x55;
+    property_builder.end_node();
+    let (structure, strings) = property_builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(17, structure, strings, &[])),
+        Err(Error::NonZeroPadding { .. })
+    ));
+
+    let mut legacy_builder = StructureBuilder::new(15);
+    legacy_builder.begin("/");
+    let property_start = legacy_builder.structure.len();
+    legacy_builder.property("wide", &[0; 8]);
+    // FDT_PROP token + len/nameoff 后从 20 对齐到 24，四个旧格式 padding 字节。
+    legacy_builder.structure[property_start + 12] = 0x33;
+    legacy_builder.end_node();
+    let (structure, strings) = legacy_builder.end();
+    assert!(matches!(
+        Fdt::parse_strict(&assemble(15, structure, strings, &[])),
+        Err(Error::NonZeroPadding { .. })
+    ));
 }
 
 #[test]
@@ -835,6 +979,37 @@ fn duplicate_node_and_property_names_are_rejected() {
     ));
 }
 
+#[cfg(feature = "alloc")]
+#[test]
+fn unitless_child_names_must_not_collide_with_parent_properties() {
+    use crate::{Tree, TreeError};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.property("mailbox", &[]);
+    builder.begin("mailbox");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    assert!(Fdt::parse(&blob).is_ok());
+    assert!(matches!(
+        Tree::parse(&blob),
+        Err(TreeError::InvalidFdt(
+            Error::NodePropertyNameConflict { .. }
+        ))
+    ));
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.property("mailbox", &[]);
+    builder.begin("mailbox@0");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    assert!(Tree::parse(&assemble(17, structure, strings, &[])).is_ok());
+}
+
 #[test]
 fn parses_dtc_generated_legacy_and_modern_blobs_when_dtc_is_available() {
     use std::{
@@ -853,7 +1028,7 @@ fn parses_dtc_generated_legacy_and_modern_blobs_when_dtc_is_available() {
     #size-cells = <1>;
     soc {
         compatible = "simple-bus";
-        star*property;
+        question?property;
     };
 };
 "#;
@@ -880,7 +1055,7 @@ fn parses_dtc_generated_legacy_and_modern_blobs_when_dtc_is_available() {
         assert_eq!(
             fdt.find_node("/soc")
                 .unwrap()
-                .property("star*property")
+                .property("question?property")
                 .unwrap()
                 .as_bool(),
             Ok(true)
@@ -1002,7 +1177,7 @@ fn deeply_nested_tree_builds_paths_on_demand() {
     use crate::Tree;
 
     const DEPTH: usize = 1_500;
-    const NAME: &str = "node-with-thirty-one-characters-x";
+    const NAME: &str = "node-with-thirty-one-char-value";
 
     let mut builder = StructureBuilder::new(17);
     builder.begin("");
@@ -2034,6 +2209,77 @@ fn interrupt_maps_recursively_translate_addresses_masks_and_extended_entries() {
 
 #[cfg(feature = "alloc")]
 #[test]
+fn interrupt_map_pass_thru_preserves_selected_child_bits() {
+    use crate::{InterruptError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("intc");
+    builder.property("phandle", &cells(&[3]));
+    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#interrupt-cells", &cells(&[3]));
+    builder.property("interrupt-controller", &[]);
+    builder.end_node();
+    builder.begin("nexus");
+    builder.property("phandle", &cells(&[2]));
+    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#interrupt-cells", &cells(&[2]));
+    builder.property("interrupt-map-mask", &cells(&[u32::MAX, 0]));
+    builder.property("interrupt-map-pass-thru", &cells(&[0, 0xff]));
+    builder.property("interrupt-map", &cells(&[0x10, 0, 3, 0x20, 4, 0x99]));
+    builder.end_node();
+    builder.begin("device");
+    builder.property("interrupts-extended", &cells(&[2, 0x10, 1]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let intc = tree.find_node("/intc").unwrap();
+    let device = tree.find_node("/device").unwrap();
+    let decoded = tree.interrupts(device).unwrap().unwrap();
+
+    assert_eq!(decoded[0].provider, intc);
+    assert_eq!(decoded[0].cells, vec![0x20, 1, 0x99]);
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("intc");
+    builder.property("phandle", &cells(&[3]));
+    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#interrupt-cells", &cells(&[3]));
+    builder.property("interrupt-controller", &[]);
+    builder.end_node();
+    builder.begin("nexus");
+    builder.property("phandle", &cells(&[2]));
+    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#interrupt-cells", &cells(&[2]));
+    builder.property("interrupt-map-pass-thru", &cells(&[0xff]));
+    builder.property("interrupt-map", &cells(&[0x10, 0, 3, 0x20, 4, 0x99]));
+    builder.end_node();
+    builder.begin("device");
+    builder.property("interrupts-extended", &cells(&[2, 0x10, 1]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let nexus = tree.find_node("/nexus").unwrap();
+    let device = tree.find_node("/device").unwrap();
+    assert_eq!(
+        tree.interrupts(device),
+        Err(InterruptError::IncompleteEntry {
+            node: nexus,
+            property: "interrupt-map-pass-thru",
+            entry: 0,
+            remaining_cells: 1,
+            required_cells: 2,
+        })
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
 fn interrupt_nexus_without_map_walks_to_a_real_controller_or_fails() {
     use crate::{InterruptError, Tree};
 
@@ -2281,10 +2527,14 @@ fn generic_provider_specifiers_preserve_holes_names_and_widths() {
     builder.begin("device");
     builder.property("clocks", &cells(&[1, 10, 20, 0, 1, 30, 40]));
     builder.property("clock-names", b"core\0unused\0bus\0");
+    builder.property("memory-region", &cells(&[1, 0]));
+    builder.property("memory-region-names", b"buffer\0unused\0");
     builder.end_node();
     builder.begin("bad-device");
     builder.property("clocks", &cells(&[1, 10, 20, 1, 30, 40]));
     builder.property("clock-names", b"only-one\0");
+    builder.property("memory-region", &cells(&[1, 0]));
+    builder.property("memory-region-names", b"only-one\0");
     builder.end_node();
     builder.end_node();
     let (structure, strings) = builder.end();
@@ -2301,9 +2551,25 @@ fn generic_provider_specifiers_preserve_holes_names_and_widths() {
     assert!(clocks[1].specifier.is_empty());
     assert_eq!(clocks[2].specifier.args, vec![30, 40]);
 
+    let memory_regions = tree.named_memory_regions(device).unwrap().unwrap();
+    assert_eq!(memory_regions.len(), 2);
+    assert_eq!(memory_regions[0].name.as_deref(), Some("buffer"));
+    assert_eq!(memory_regions[0].specifier.provider, Some(clock));
+    assert!(memory_regions[0].specifier.args.is_empty());
+    assert_eq!(memory_regions[1].name.as_deref(), Some("unused"));
+    assert!(memory_regions[1].specifier.is_empty());
+
     let bad = tree.find_node("/bad-device").unwrap();
     assert!(matches!(
         tree.clocks(bad),
+        Err(SpecifierError::NameCountMismatch {
+            names: 1,
+            entries: 2,
+            ..
+        })
+    ));
+    assert!(matches!(
+        tree.named_memory_regions(bad),
         Err(SpecifierError::NameCountMismatch {
             names: 1,
             entries: 2,
@@ -2314,40 +2580,296 @@ fn generic_provider_specifiers_preserve_holes_names_and_widths() {
 
 #[cfg(feature = "alloc")]
 #[test]
-fn generic_iommu_map_is_atomic_and_variable_width() {
-    use crate::{IdMapError, Tree};
+fn generic_nexus_maps_recursively_across_widths_and_skips_disabled_targets() {
+    use crate::Tree;
 
     let mut builder = StructureBuilder::new(17);
     builder.begin("");
-    builder.begin("iommu");
-    builder.property("phandle", &cells(&[1]));
-    builder.property("#iommu-cells", &cells(&[2]));
+    builder.begin("final-clock");
+    builder.property("phandle", &cells(&[4]));
+    builder.property("#clock-cells", &cells(&[3]));
     builder.end_node();
-    builder.begin("host");
-    builder.property("iommu-map-mask", &cells(&[0xffff]));
-    builder.property("iommu-map", &cells(&[0x100, 1, 7, 8, 0x20]));
+    builder.begin("disabled-clock");
+    builder.property("phandle", &cells(&[5]));
+    builder.property("#clock-cells", &cells(&[3]));
+    builder.property("status", b"disabled\0");
     builder.end_node();
-    builder.begin("bad-host");
-    builder.property("iommu-map", &cells(&[0, 1, 7]));
+    builder.begin("second-nexus");
+    builder.property("phandle", &cells(&[3]));
+    builder.property("#clock-cells", &cells(&[1]));
+    builder.property("clock-map-mask", &cells(&[0xf0]));
+    builder.property("clock-map-pass-thru", &cells(&[0x0f]));
+    builder.property(
+        "clock-map",
+        &cells(&[
+            0xb0, 5, 0xdead, 0xbeef, 0xcafe, 0xb0, 4, 0x1200, 0x34, 0x5678, 0xc0, 4, 1, 2, 3,
+        ]),
+    );
+    builder.end_node();
+    builder.begin("first-nexus");
+    builder.property("phandle", &cells(&[2]));
+    builder.property("#clock-cells", &cells(&[2]));
+    builder.property("clock-map-mask", &cells(&[0xf0, u32::MAX]));
+    builder.property("clock-map-pass-thru", &cells(&[0x0f, 0]));
+    builder.property("clock-map", &cells(&[0xa0, 0x25, 3, 0xb0]));
+    builder.end_node();
+    builder.begin("default-modifiers-nexus");
+    builder.property("phandle", &cells(&[6]));
+    builder.property("#clock-cells", &cells(&[1]));
+    builder.property("clock-map", &cells(&[7, 4, 9, 8, 7]));
+    builder.end_node();
+    builder.begin("device");
+    builder.property("clocks", &cells(&[2, 0xa5, 0x25, 0, 6, 7]));
+    builder.property("clock-names", b"core\0unused\0aux\0");
     builder.end_node();
     builder.end_node();
     let (structure, strings) = builder.end();
     let blob = assemble(17, structure, strings, &[]);
     let tree = Tree::parse(&blob).unwrap();
-    let iommu = tree.find_node("/iommu").unwrap();
-    let host = tree.find_node("/host").unwrap();
+    let device = tree.find_node("/device").unwrap();
+    let final_clock = tree.find_node("/final-clock").unwrap();
 
-    let map = tree.iommu_map(host).unwrap().unwrap();
-    assert_eq!(map.mask, 0xffff);
-    assert_eq!(map.entries.len(), 1);
-    assert_eq!(map.entries[0].provider, iommu);
-    assert_eq!(map.entries[0].output_base, vec![7, 8]);
-    assert_eq!(map.entries[0].length, 0x20);
+    let direct = tree
+        .phandle_array(device, "clocks", "#clock-cells")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        direct[0].provider,
+        Some(tree.find_node("/first-nexus").unwrap())
+    );
+    assert_eq!(direct[0].args, vec![0xa5, 0x25]);
+    let resolved = tree.resolve_phandle_args_map(&direct[0], "clock").unwrap();
+    assert_eq!(resolved.provider, Some(final_clock));
+    assert_eq!(resolved.phandle, 4);
+    assert_eq!(resolved.args, vec![0x1205, 0x34, 0x5678]);
+
+    let clocks = tree.clocks(device).unwrap().unwrap();
+    assert_eq!(clocks.len(), 3);
+    assert_eq!(clocks[0].name.as_deref(), Some("core"));
+    assert_eq!(clocks[0].specifier, resolved);
+    assert_eq!(clocks[1].name.as_deref(), Some("unused"));
+    assert!(clocks[1].specifier.is_empty());
+    assert_eq!(clocks[2].name.as_deref(), Some("aux"));
+    assert_eq!(clocks[2].specifier.provider, Some(final_clock));
+    assert_eq!(clocks[2].specifier.args, vec![9, 8, 7]);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn generic_nexus_rejects_bad_suffix_modifier_and_cycles_atomically() {
+    use crate::{PropertyError, SpecifierError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("clock");
+    builder.property("phandle", &cells(&[3]));
+    builder.property("#clock-cells", &cells(&[1]));
+    builder.end_node();
+    builder.begin("bad-suffix");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("#clock-cells", &cells(&[1]));
+    builder.property("clock-map", &cells(&[0, 3, 10, 1, 3]));
+    builder.end_node();
+    builder.begin("bad-mask");
+    builder.property("phandle", &cells(&[2]));
+    builder.property("#clock-cells", &cells(&[2]));
+    builder.property("clock-map-mask", &cells(&[u32::MAX]));
+    builder.property("clock-map", &cells(&[1, 2, 3, 10]));
+    builder.end_node();
+    builder.begin("cycle-a");
+    builder.property("phandle", &cells(&[4]));
+    builder.property("#clock-cells", &cells(&[1]));
+    builder.property("clock-map", &cells(&[0, 5, 0]));
+    builder.end_node();
+    builder.begin("cycle-b");
+    builder.property("phandle", &cells(&[5]));
+    builder.property("#clock-cells", &cells(&[1]));
+    builder.property("clock-map", &cells(&[0, 4, 0]));
+    builder.end_node();
+    builder.begin("bad-suffix-device");
+    builder.property("clocks", &cells(&[1, 0]));
+    builder.end_node();
+    builder.begin("bad-mask-device");
+    builder.property("clocks", &cells(&[2, 1, 2]));
+    builder.end_node();
+    builder.begin("cycle-device");
+    builder.property("clocks", &cells(&[4, 0]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let bad_suffix = tree.find_node("/bad-suffix").unwrap();
+    let bad_mask = tree.find_node("/bad-mask").unwrap();
+    let cycle_a = tree.find_node("/cycle-a").unwrap();
+
+    assert_eq!(
+        tree.clocks(tree.find_node("/bad-suffix-device").unwrap()),
+        Err(SpecifierError::IncompleteEntry {
+            node: bad_suffix,
+            property: "clock-map".into(),
+            entry: 1,
+            remaining_cells: 2,
+            required_cells: 3,
+        })
+    );
+    assert_eq!(
+        tree.clocks(tree.find_node("/bad-mask-device").unwrap()),
+        Err(SpecifierError::InvalidProperty {
+            node: bad_mask,
+            property: "clock-map-mask".into(),
+            error: PropertyError::InvalidLength {
+                actual: 4,
+                expected: Some(8),
+            },
+        })
+    );
+    assert_eq!(
+        tree.clocks(tree.find_node("/cycle-device").unwrap()),
+        Err(SpecifierError::MapCycle {
+            nexus: cycle_a,
+            property: "clock-map".into(),
+        })
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn generic_iommu_map_preserves_entries_and_translates_only_unambiguous_widths() {
+    use crate::{IdMapError, IdMapTranslationError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("iommu-zero");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("#iommu-cells", &cells(&[0]));
+    builder.end_node();
+    builder.begin("iommu-one");
+    builder.property("phandle", &cells(&[2]));
+    builder.property("#iommu-cells", &cells(&[1]));
+    builder.end_node();
+    builder.begin("iommu-wide");
+    builder.property("phandle", &cells(&[3]));
+    builder.property("#iommu-cells", &cells(&[2]));
+    builder.end_node();
+    builder.begin("legacy-iommu");
+    builder.property("phandle", &cells(&[4]));
+    builder.end_node();
+    builder.begin("zero-host");
+    builder.property("iommu-map-mask", &cells(&[0xffff]));
+    builder.property("iommu-map", &cells(&[0x100, 1, 0x20]));
+    builder.end_node();
+    builder.begin("one-host");
+    builder.property("iommu-map", &cells(&[0x200, 2, u32::MAX - 1, 3]));
+    builder.end_node();
+    builder.begin("wide-single-host");
+    builder.property("iommu-map", &cells(&[0x300, 3, 7, 8, 1]));
+    builder.end_node();
+    builder.begin("wide-range-host");
+    builder.property("iommu-map-mask", &cells(&[0xffff]));
+    builder.property("iommu-map", &cells(&[0x400, 3, u32::MAX, u32::MAX, 0x20]));
+    builder.end_node();
+    builder.begin("legacy-host");
+    builder.property("iommu-map", &cells(&[0, 4, 0x40, 2]));
+    builder.end_node();
+    builder.begin("bad-host");
+    builder.property("iommu-map", &cells(&[0, 3, 7]));
+    builder.end_node();
+    builder.begin("empty-host");
+    builder.property("iommu-map", &[]);
+    builder.end_node();
+    builder.begin("input-overflow-host");
+    builder.property("iommu-map", &cells(&[u32::MAX, 2, 0, 2]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let iommu_zero = tree.find_node("/iommu-zero").unwrap();
+    let iommu_one = tree.find_node("/iommu-one").unwrap();
+    let iommu_wide = tree.find_node("/iommu-wide").unwrap();
+
+    let zero = tree
+        .iommu_map(tree.find_node("/zero-host").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(zero.mask, 0xffff);
+    assert_eq!(zero.entries[0].provider, iommu_zero);
+    assert!(zero.entries[0].output_base.is_empty());
+    assert_eq!(zero.entries[0].length, 0x20);
+    let zero_mapped = zero.map_id(0xabcd_011f).unwrap().unwrap();
+    assert_eq!(zero_mapped.provider, iommu_zero);
+    assert_eq!(zero_mapped.provider_phandle, 1);
+    assert!(zero_mapped.args.is_empty());
+    assert_eq!(zero.map_id(0x120), Ok(None));
+
+    let one = tree
+        .iommu_map(tree.find_node("/one-host").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.map_id(0x201).unwrap().unwrap().args, vec![u32::MAX]);
+    assert_eq!(
+        one.map_id(0x202),
+        Err(IdMapTranslationError::OutputOverflow {
+            provider: iommu_one,
+            provider_phandle: 2,
+            output_base: u32::MAX - 1,
+            offset: 2,
+        })
+    );
+
+    let wide_single = tree
+        .iommu_map(tree.find_node("/wide-single-host").unwrap())
+        .unwrap()
+        .unwrap();
+    let wide_single_mapped = wide_single.map_id(0x300).unwrap().unwrap();
+    assert_eq!(wide_single_mapped.provider, iommu_wide);
+    assert_eq!(wide_single_mapped.args, vec![7, 8]);
+
+    let wide_range = tree
+        .iommu_map(tree.find_node("/wide-range-host").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(wide_range.entries[0].output_base, vec![u32::MAX; 2]);
+    let matched = wide_range.match_id(0xabcd_0410).unwrap();
+    assert_eq!(matched.entry, &wide_range.entries[0]);
+    assert_eq!(matched.offset, 0x10);
+    assert_eq!(
+        wide_range.map_id(0xabcd_0410),
+        Err(IdMapTranslationError::AmbiguousMultiCellRange {
+            provider: iommu_wide,
+            provider_phandle: 3,
+            cells: 2,
+            length: 0x20,
+            offset: 0x10,
+        })
+    );
+
+    let legacy = tree
+        .iommu_map(tree.find_node("/legacy-host").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy.entries[0].output_base, vec![0x40]);
+    assert_eq!(legacy.map_id(1).unwrap().unwrap().args, vec![0x41]);
 
     let bad = tree.find_node("/bad-host").unwrap();
     assert!(matches!(
         tree.iommu_map(bad),
         Err(IdMapError::IncompleteEntry { entry: 0, .. })
+    ));
+    assert!(matches!(
+        tree.iommu_map(tree.find_node("/empty-host").unwrap()),
+        Err(IdMapError::IncompleteEntry {
+            entry: 0,
+            remaining_cells: 0,
+            required_cells: 3,
+            ..
+        })
+    ));
+    let overflow = tree.find_node("/input-overflow-host").unwrap();
+    assert!(matches!(
+        tree.iommu_map(overflow),
+        Err(IdMapError::InvalidRange { entry: 0, .. })
     ));
 }
 
@@ -2395,6 +2917,80 @@ fn graph_binding_resolves_direct_and_ports_container_endpoints() {
 
 #[cfg(feature = "alloc")]
 #[test]
+fn graph_remote_must_be_an_endpoint_below_a_port() {
+    use crate::{GraphError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("display");
+    builder.begin("port");
+    builder.begin("endpoint");
+    builder.property("remote-endpoint", &cells(&[20]));
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    builder.begin("endpoint@20");
+    builder.property("phandle", &cells(&[20]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let display = tree.find_node("/display").unwrap();
+
+    assert!(matches!(
+        tree.graph_endpoints(display),
+        Err(GraphError::RemoteIsNotEndpoint { .. })
+    ));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn graph_remote_back_reference_cannot_point_to_a_third_endpoint() {
+    use crate::{GraphError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("display");
+    builder.begin("port");
+    builder.begin("endpoint");
+    builder.property("phandle", &cells(&[10]));
+    builder.property("remote-endpoint", &cells(&[20]));
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    builder.begin("bridge");
+    builder.begin("port");
+    builder.begin("endpoint@0");
+    builder.property("phandle", &cells(&[20]));
+    builder.property("remote-endpoint", &cells(&[30]));
+    builder.end_node();
+    builder.begin("endpoint@1");
+    builder.property("phandle", &cells(&[30]));
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let display = tree.find_node("/display").unwrap();
+    let endpoint = tree.find_node("/display/port/endpoint").unwrap();
+    let remote = tree.find_node("/bridge/port/endpoint@0").unwrap();
+    let target = tree.find_node("/bridge/port/endpoint@1").unwrap();
+
+    assert_eq!(
+        tree.graph_endpoints(display),
+        Err(GraphError::RemoteBackReferenceMismatch {
+            node: endpoint,
+            remote,
+            target,
+        })
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
 fn pci_bindings_preserve_masks_widths_and_parent_identity() {
     use crate::{PciAddressSpace, Tree};
 
@@ -2410,9 +3006,9 @@ fn pci_bindings_preserve_masks_widths_and_parent_identity() {
     builder.end_node();
     builder.begin("pci-intc-nexus");
     builder.property("phandle", &cells(&[3]));
-    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#address-cells", &cells(&[3]));
     builder.property("#interrupt-cells", &cells(&[1]));
-    builder.property("interrupt-map", &cells(&[5, 1, 9]));
+    builder.property("interrupt-map", &cells(&[0, 0, 0, 1, 1, 9]));
     builder.end_node();
     builder.begin("msi");
     builder.property("phandle", &cells(&[2]));
@@ -2431,7 +3027,8 @@ fn pci_bindings_preserve_masks_widths_and_parent_identity() {
         "ranges",
         &cells(&[0x4300_0000, 0, 0x4000_0000, 0, 0x4000_0000, 0, 0x0100_0000]),
     );
-    builder.property("interrupt-map", &cells(&[0, 0, 0, 1, 3, 5]));
+    builder.property("interrupt-map-pass-thru", &cells(&[0, 0, 0, 0x7]));
+    builder.property("interrupt-map", &cells(&[0, 0, 0, 1, 3, 0, 0, 0, 5]));
     builder.property("msi-map-mask", &cells(&[0xffff]));
     builder.property(
         "msi-map",
@@ -2459,8 +3056,15 @@ fn pci_bindings_preserve_masks_widths_and_parent_identity() {
 
     let irq = tree.pci_interrupt_map(host).unwrap().unwrap();
     assert_eq!(irq.mask, vec![u32::MAX; 4]);
-    assert_eq!(irq.entries[0].parent_phandle, 1);
-    assert_eq!(irq.entries[0].parent_specifier, vec![9]);
+    assert_eq!(irq.pass_thru, vec![0, 0, 0, 0x7]);
+    assert_eq!(irq.entries[0].parent_phandle, 3);
+    assert_eq!(irq.entries[0].parent_specifier, vec![5]);
+    let route = tree
+        .resolve_pci_interrupt(&irq, &[0, 0, 0], &[1])
+        .unwrap()
+        .expect("pass-thru key must resolve through the direct parent nexus");
+    assert_eq!(route.provider_phandle, 1);
+    assert_eq!(route.specifier, vec![9]);
 
     let msi = tree.pci_msi_map(host).unwrap().unwrap();
     assert_eq!(msi.mask, 0xffff);

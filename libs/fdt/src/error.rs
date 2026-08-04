@@ -78,6 +78,22 @@ pub enum Error {
         /// entry 的文件内偏移。
         offset: usize,
     },
+    /// memory reservation block 中两个非空区域重叠。
+    OverlappingReservations {
+        /// 较早条目的序号。
+        first: usize,
+        /// 较晚条目的序号。
+        second: usize,
+    },
+    /// memory reservation entry 的最后一个字节越过 64-bit 地址空间。
+    InvalidReservationRange {
+        /// entry 序号。
+        entry: usize,
+        /// 起始物理地址。
+        address: u64,
+        /// 区域长度。
+        size: u64,
+    },
     /// 结构块在需要数据的位置结束。
     TruncatedStructure {
         /// 结构块内偏移。
@@ -116,6 +132,11 @@ pub enum Error {
     DuplicateNodeName {
         /// 后一个重复节点的结构块内偏移。
         offset: usize,
+    },
+    /// 无 unit-address 的子节点名与父节点上的属性名冲突。
+    NodePropertyNameConflict {
+        /// 冲突子节点的结构块内偏移。
+        node_offset: usize,
     },
     /// 节点名缺少 NUL 终止符。
     UnterminatedNodeName {
@@ -160,9 +181,9 @@ pub enum Error {
         /// 后一个重复属性的结构块内偏移。
         offset: usize,
     },
-    /// v17 声明的 structure block 在最终 token 后含非零尾部字节。
+    /// 结构块中的对齐 padding 含非零字节。
     NonZeroPadding {
-        /// 第一个非零字节的结构块内偏移。
+        /// 第一个非零 padding 字节的结构块内偏移。
         offset: usize,
     },
     /// 根节点结束后缺少 `FDT_END`。
@@ -170,12 +191,12 @@ pub enum Error {
         /// 扫描停止处的结构块内偏移。
         offset: usize,
     },
-    /// v17 声明的结构块在 `FDT_END` 后含非 NOP token。
-    InvalidTrailingToken {
-        /// 结构块内偏移。
+    /// `FDT_END` 之后仍有被 `size_dt_struct` 纳入 structure block 的字节。
+    TrailingStructureData {
+        /// `FDT_END` 后第一个字节的结构块内偏移。
         offset: usize,
-        /// token 值。
-        token: u32,
+        /// 多余字节数。
+        length: usize,
     },
 }
 

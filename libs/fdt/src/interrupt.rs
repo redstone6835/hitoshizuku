@@ -399,6 +399,22 @@ impl Tree<'_> {
                 mask
             }
         };
+        let pass_thru = match node.property("interrupt-map-pass-thru") {
+            None => vec![0; key_cells],
+            Some(property) => {
+                let pass_thru = property_cells(nexus, "interrupt-map-pass-thru", property)?;
+                if pass_thru.len() != key_cells {
+                    return Err(InterruptError::IncompleteEntry {
+                        node: nexus,
+                        property: "interrupt-map-pass-thru",
+                        entry: 0,
+                        remaining_cells: pass_thru.len(),
+                        required_cells: key_cells,
+                    });
+                }
+                pass_thru
+            }
+        };
         let mut match_key = Vec::with_capacity(key_cells);
         match_key.extend_from_slice(address);
         match_key.extend_from_slice(specifier);
@@ -452,10 +468,20 @@ impl Tree<'_> {
                 .zip(&mask)
                 .all(|((&actual, &expected), &mask)| (actual ^ expected) & mask == 0);
             if selected.is_none() && matches && self.interrupt_parent_available(parent)? {
+                let mut parent_key = Vec::with_capacity(variable);
+                parent_key.extend_from_slice(parent_address);
+                parent_key.extend_from_slice(parent_specifier);
+                for (index, value) in parent_key.iter_mut().enumerate() {
+                    let Some((&child, &pass)) = match_key.get(index).zip(pass_thru.get(index))
+                    else {
+                        break;
+                    };
+                    *value = (*value & !pass) | (child & pass);
+                }
                 selected = Some(MapTranslation {
                     provider: parent,
-                    address: parent_address.to_vec(),
-                    specifier: parent_specifier.to_vec(),
+                    address: parent_key[..parent_address_cells].to_vec(),
+                    specifier: parent_key[parent_address_cells..].to_vec(),
                 });
             }
             entry += 1;

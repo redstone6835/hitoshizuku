@@ -35,6 +35,12 @@ pub enum GraphError {
         node: NodeId,
         remote: NodeId,
     },
+    /// 远端 endpoint 声明了 `remote-endpoint`，但没有指回本 endpoint。
+    RemoteBackReferenceMismatch {
+        node: NodeId,
+        remote: NodeId,
+        target: NodeId,
+    },
 }
 
 impl fmt::Display for GraphError {
@@ -93,14 +99,13 @@ impl Tree<'_> {
                                     node: endpoint,
                                     phandle,
                                 })?;
-                        let remote_view =
-                            self.node(remote).ok_or(GraphError::InvalidNode(remote))?;
-                        if remote_view.base_name_bytes() != b"endpoint" {
+                        if !is_graph_endpoint(self, remote) {
                             return Err(GraphError::RemoteIsNotEndpoint {
                                 node: endpoint,
                                 remote,
                             });
                         }
+                        validate_remote_back_reference(self, endpoint, remote)?;
                         (Some(remote), Some(phandle))
                     }
                 };
@@ -117,6 +122,47 @@ impl Tree<'_> {
         }
         Ok(endpoints)
     }
+}
+
+fn validate_remote_back_reference(
+    tree: &Tree<'_>,
+    endpoint: NodeId,
+    remote: NodeId,
+) -> Result<(), GraphError> {
+    let remote_view = tree.node(remote).ok_or(GraphError::InvalidNode(remote))?;
+    let Some(property) = remote_view.property("remote-endpoint") else {
+        return Ok(());
+    };
+    let phandle = property
+        .as_u32()
+        .map_err(|error| GraphError::InvalidProperty {
+            node: remote,
+            property: "remote-endpoint",
+            error,
+        })?;
+    let target = tree
+        .node_by_phandle(phandle)
+        .ok_or(GraphError::UnknownRemote {
+            node: remote,
+            phandle,
+        })?;
+    if target != endpoint {
+        return Err(GraphError::RemoteBackReferenceMismatch {
+            node: endpoint,
+            remote,
+            target,
+        });
+    }
+    Ok(())
+}
+
+fn is_graph_endpoint(tree: &Tree<'_>, node: NodeId) -> bool {
+    tree.node(node)
+        .is_some_and(|node| node.base_name_bytes() == b"endpoint")
+        && tree
+            .parent(node)
+            .and_then(|port| tree.node(port))
+            .is_some_and(|port| port.base_name_bytes() == b"port")
 }
 
 fn graph_reg(tree: &Tree<'_>, node: NodeId) -> Result<Option<u32>, GraphError> {

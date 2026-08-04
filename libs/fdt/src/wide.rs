@@ -62,6 +62,9 @@ impl CellValue {
     }
 
     /// 按数值比较，忽略前导零和编码宽度。
+    ///
+    /// [`Self`] 的 `Eq` 有意保留原始编码宽度，因此不实现 `Ord`；需要数值顺序的
+    /// 调用方必须显式使用本方法，避免把不同编码宽度的值误当作同一个映射键。
     pub fn numeric_cmp(&self, other: &Self) -> Ordering {
         let left = self.significant_cells();
         let right = other.significant_cells();
@@ -127,18 +130,6 @@ impl CellValue {
             cells.drain(..leading);
         }
         Self { cells }
-    }
-}
-
-impl PartialOrd for CellValue {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CellValue {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.numeric_cmp(other)
     }
 }
 
@@ -512,6 +503,7 @@ mod tests {
     fn arbitrary_precision_arithmetic_ignores_leading_zero_width() {
         let wide = CellValue::from_cells(&[0, 1, 0, 0, 0]);
         let narrow = CellValue::from_cells(&[1, 0, 0, 0]);
+        assert_ne!(wide, narrow, "原始 cell 宽度属于无损表示的一部分");
         assert_eq!(wide.numeric_cmp(&narrow), Ordering::Equal);
         assert_eq!(wide.to_u128(), Some(1u128 << 96));
 

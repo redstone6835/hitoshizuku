@@ -48,12 +48,24 @@ pub struct PciInterruptMapEntry {
     pub parent_specifier: Vec<u32>,
 }
 
+/// PCI child key 经 host map 与后续 interrupt nexus 递归翻译后的最终路由。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciInterruptRoute {
+    pub provider: NodeId,
+    pub provider_phandle: u32,
+    pub address: Vec<u32>,
+    pub specifier: Vec<u32>,
+}
+
 /// 已规范化的 PCI interrupt-map；缺失 mask 时按 Linux 语义全一填充。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PciInterruptMap {
+    pub host: NodeId,
     pub child_address_cells: usize,
     pub child_interrupt_cells: usize,
     pub mask: Vec<u32>,
+    /// `interrupt-map-pass-thru`；缺失时按规范填充全零。
+    pub pass_thru: Vec<u32>,
     pub entries: Vec<PciInterruptMapEntry>,
 }
 
@@ -117,6 +129,13 @@ pub enum PciError {
         property: &'static str,
         entry: usize,
         value: u128,
+    },
+    InvalidInterruptKey {
+        node: NodeId,
+        address_expected: usize,
+        address_actual: usize,
+        interrupt_expected: usize,
+        interrupt_actual: usize,
     },
     Overflow {
         node: NodeId,
@@ -278,6 +297,22 @@ impl Tree<'_> {
                 values
             }
         };
+        let pass_thru = match node.property("interrupt-map-pass-thru") {
+            None => vec![0; key_cells],
+            Some(property) => {
+                let values = property_cells(host, "interrupt-map-pass-thru", property)?;
+                if values.len() != key_cells {
+                    return Err(PciError::IncompleteEntry {
+                        node: host,
+                        property: "interrupt-map-pass-thru",
+                        entry: 0,
+                        remaining_cells: values.len(),
+                        required_cells: key_cells,
+                    });
+                }
+                values
+            }
+        };
         let mut entries = Vec::new();
         let mut offset = 0usize;
         let mut entry = 0usize;
@@ -322,30 +357,96 @@ impl Tree<'_> {
                 entry += 1;
                 continue;
             }
-            let translated =
-                self.translate_interrupt_route(parent, parent_address, parent_specifier)?;
-            let parent_phandle =
+            entries.push(PciInterruptMapEntry {
+                child_address,
+                child_interrupt,
+                parent,
+                parent_phandle: phandle,
+                parent_address,
+                parent_specifier,
+            });
+            entry += 1;
+        }
+        Ok(Some(PciInterruptMap {
+            host,
+            child_address_cells,
+            child_interrupt_cells,
+            mask,
+            pass_thru,
+            entries,
+        }))
+    }
+
+    /// 用实际 PCI child address/interrupt key 选择 map 行，并递归解析到最终 IRQ 域。
+    ///
+    /// `interrupt-map-pass-thru` 必须在直接父 nexus 的 key 上生效，因此不能在只解码
+    /// map 表时提前折叠父链。该接口严格按 `mask -> pass-thru -> parent nexus` 顺序
+    /// 完成运行时翻译。
+    pub fn resolve_pci_interrupt(
+        &self,
+        map: &PciInterruptMap,
+        child_address: &[u32],
+        child_interrupt: &[u32],
+    ) -> Result<Option<PciInterruptRoute>, PciError> {
+        self.node(map.host).ok_or(PciError::InvalidNode(map.host))?;
+        if child_address.len() != map.child_address_cells
+            || child_interrupt.len() != map.child_interrupt_cells
+        {
+            return Err(PciError::InvalidInterruptKey {
+                node: map.host,
+                address_expected: map.child_address_cells,
+                address_actual: child_address.len(),
+                interrupt_expected: map.child_interrupt_cells,
+                interrupt_actual: child_interrupt.len(),
+            });
+        }
+
+        let mut child_key = Vec::with_capacity(child_address.len() + child_interrupt.len());
+        child_key.extend_from_slice(child_address);
+        child_key.extend_from_slice(child_interrupt);
+        for entry in &map.entries {
+            let matches = child_key
+                .iter()
+                .zip(entry.child_address.iter().chain(&entry.child_interrupt))
+                .zip(&map.mask)
+                .all(|((&actual, &expected), &mask)| (actual ^ expected) & mask == 0);
+            if !matches {
+                continue;
+            }
+
+            let mut parent_key =
+                Vec::with_capacity(entry.parent_address.len() + entry.parent_specifier.len());
+            parent_key.extend_from_slice(&entry.parent_address);
+            parent_key.extend_from_slice(&entry.parent_specifier);
+            for (index, value) in parent_key.iter_mut().enumerate() {
+                let Some((&child, &pass)) = child_key.get(index).zip(map.pass_thru.get(index))
+                else {
+                    break;
+                };
+                *value = (*value & !pass) | (child & pass);
+            }
+            let parent_address_cells = entry.parent_address.len();
+            let translated = self
+                .translate_interrupt_route(
+                    entry.parent,
+                    parent_key[..parent_address_cells].to_vec(),
+                    parent_key[parent_address_cells..].to_vec(),
+                )
+                .map_err(PciError::InvalidInterrupt)?;
+            let provider_phandle =
                 self.phandle(translated.provider)
                     .ok_or(PciError::MissingRequired {
                         node: translated.provider,
                         property: "phandle",
                     })?;
-            entries.push(PciInterruptMapEntry {
-                child_address,
-                child_interrupt,
-                parent: translated.provider,
-                parent_phandle,
-                parent_address: translated.address,
-                parent_specifier: translated.specifier,
-            });
-            entry += 1;
+            return Ok(Some(PciInterruptRoute {
+                provider: translated.provider,
+                provider_phandle,
+                address: translated.address,
+                specifier: translated.specifier,
+            }));
         }
-        Ok(Some(PciInterruptMap {
-            child_address_cells,
-            child_interrupt_cells,
-            mask,
-            entries,
-        }))
+        Ok(None)
     }
 
     /// 解码 PCI host `msi-map[-mask]`，并保留 target `#msi-cells` 宽度。

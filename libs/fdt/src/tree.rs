@@ -828,6 +828,11 @@ impl<'a> Tree<'a> {
                         offset: child.structure_offset(),
                     }));
                 }
+                if !child.name_bytes().contains(&b'@') && properties.contains(child.name_bytes()) {
+                    return Err(TreeError::InvalidFdt(Error::NodePropertyNameConflict {
+                        node_offset: child.structure_offset(),
+                    }));
+                }
 
                 if self.fdt.header().version < 16 {
                     let parent_path = record.node.raw_name_bytes();

@@ -78,11 +78,10 @@ impl OwnedTree {
         }
 
         merge_overlay_symbols(&mut candidate, &overlay, &fragment_targets)?;
-        for reservation in overlay.reservations {
-            if !candidate.reservations.contains(&reservation) {
-                candidate.reservations.push(reservation);
-            }
-        }
+        // Linux/libfdt overlay 只合并 fragment 与 symbol 元数据；dtbo 自身的
+        // memory reservation block 不属于 overlay 语义，fdtoverlay 会忽略它。
+        // 保留 base reservations，避免把工具链可应用的 overlay 错误扩展成新保留区，
+        // 或因 overlay reservation 与 base 重叠而产生非 Linux 的失败。
         candidate.to_dtb().map_err(OverlayError::InvalidOutput)?;
         *self = candidate;
         Ok(())

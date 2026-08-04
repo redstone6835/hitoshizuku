@@ -5,6 +5,7 @@
 //! 抽象；具体子系统只负责解释 `args` 的含义。
 
 use alloc::{
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -76,6 +77,21 @@ pub enum SpecifierError {
         names: usize,
         entries: usize,
     },
+    ArgumentCountMismatch {
+        provider: NodeId,
+        property: String,
+        expected: usize,
+        actual: usize,
+    },
+    NoMatchingMap {
+        nexus: NodeId,
+        property: String,
+        args: Vec<u32>,
+    },
+    MapCycle {
+        nexus: NodeId,
+        property: String,
+    },
 }
 
 impl fmt::Display for SpecifierError {
@@ -99,6 +115,110 @@ pub struct IdMapEntry {
 pub struct IdMap {
     pub mask: u32,
     pub entries: Vec<IdMapEntry>,
+}
+
+/// requester ID 经 [`IdMap`] 翻译后的 provider specifier。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MappedId {
+    pub provider: NodeId,
+    pub provider_phandle: u32,
+    pub args: Vec<u32>,
+}
+
+/// [`IdMap`] 中命中的原始条目及 requester ID 在区间内的偏移。
+///
+/// 该视图不解释 provider specifier 的 cell 编码，因而可用于实现
+/// binding 自己定义的区间翻译规则。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdMapMatch<'a> {
+    pub entry: &'a IdMapEntry,
+    pub offset: u32,
+}
+
+/// requester-ID 命中后的 provider specifier 翻译错误。
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdMapTranslationError {
+    /// 单 cell specifier 加上区间偏移后溢出。
+    OutputOverflow {
+        provider: NodeId,
+        provider_phandle: u32,
+        output_base: u32,
+        offset: u32,
+    },
+    /// 多 cell specifier 的区间算术没有通用 DTSpec 语义。
+    AmbiguousMultiCellRange {
+        provider: NodeId,
+        provider_phandle: u32,
+        cells: usize,
+        length: u32,
+        offset: u32,
+    },
+}
+
+impl fmt::Display for IdMapTranslationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FDT ID map translation error: {self:?}")
+    }
+}
+
+impl IdMap {
+    /// 先应用 `*-map-mask`，再按半开区间查找第一个命中项。
+    ///
+    /// 返回值保留原始 [`IdMapEntry`] 及偏移，不猜测 provider
+    /// specifier 的编码。无匹配项返回 `None`。
+    pub fn match_id(&self, id: u32) -> Option<IdMapMatch<'_>> {
+        let id = id & self.mask;
+        self.entries.iter().find_map(|entry| {
+            let offset = id.checked_sub(entry.input_base)?;
+            if offset >= entry.length {
+                return None;
+            }
+            Some(IdMapMatch { entry, offset })
+        })
+    }
+
+    /// 按通用、无歧义的 cell 语义翻译 requester ID。
+    ///
+    /// 0-cell provider 对整个命中区间都返回空参数；单 cell
+    /// provider 使用 checked addition；多 cell provider 仅在 `length == 1`
+    /// 时原样返回。多 cell 区间没有通用的算术定义，调用方应改用
+    /// [`Self::match_id`] 并按具体 binding 解释。
+    ///
+    /// 无匹配项返回 `Ok(None)`；该接口不内置 Linux `of_map_id()`
+    /// 的 filter 或 bypass 策略。
+    pub fn map_id(&self, id: u32) -> Result<Option<MappedId>, IdMapTranslationError> {
+        let Some(matched) = self.match_id(id) else {
+            return Ok(None);
+        };
+        let entry = matched.entry;
+        let args = match entry.output_base.as_slice() {
+            [] => Vec::new(),
+            &[output_base] => alloc::vec![output_base.checked_add(matched.offset).ok_or(
+                IdMapTranslationError::OutputOverflow {
+                    provider: entry.provider,
+                    provider_phandle: entry.provider_phandle,
+                    output_base,
+                    offset: matched.offset,
+                },
+            )?],
+            _ if entry.length == 1 => entry.output_base.clone(),
+            output_base => {
+                return Err(IdMapTranslationError::AmbiguousMultiCellRange {
+                    provider: entry.provider,
+                    provider_phandle: entry.provider_phandle,
+                    cells: output_base.len(),
+                    length: entry.length,
+                    offset: matched.offset,
+                });
+            }
+        };
+        Ok(Some(MappedId {
+            provider: entry.provider,
+            provider_phandle: entry.provider_phandle,
+            args,
+        }))
+    }
 }
 
 /// ID map 解码错误。
@@ -192,6 +312,204 @@ impl Tree<'_> {
         let Some(entries) = self.phandle_array(node, property, cells_property)? else {
             return Ok(None);
         };
+        self.attach_names(node, names_property, entries).map(Some)
+    }
+
+    /// 原子解码 phandle-array，并按 DTSpec nexus `<stem>-map` 递归翻译。
+    ///
+    /// provider 的参数宽度由 `#<stem>-cells` 声明。phandle 0 空槽保持为空，
+    /// 不参与 nexus 翻译。
+    pub fn mapped_phandle_array(
+        &self,
+        node: NodeId,
+        property: &str,
+        stem: &str,
+    ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        let cells_property = format!("#{stem}-cells");
+        let Some(entries) = self.phandle_array(node, property, &cells_property)? else {
+            return Ok(None);
+        };
+        entries
+            .iter()
+            .map(|entry| self.resolve_phandle_args_map(entry, stem))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    /// 解码并递归翻译 phandle-array，同时严格关联可选名称列表。
+    pub fn named_mapped_phandle_array(
+        &self,
+        node: NodeId,
+        property: &str,
+        stem: &str,
+        names_property: &str,
+    ) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
+        let Some(entries) = self.mapped_phandle_array(node, property, stem)? else {
+            return Ok(None);
+        };
+        self.attach_names(node, names_property, entries).map(Some)
+    }
+
+    /// 将单个 provider specifier 递归解析到不再声明 `<stem>-map` 的最终节点。
+    ///
+    /// 每一级 nexus map 都会先完整校验，再选择第一个匹配且可用的父
+    /// provider；因此坏的未匹配行或表尾也会令整个解析原子失败。
+    pub fn resolve_phandle_args_map(
+        &self,
+        specifier: &PhandleArgs,
+        stem: &str,
+    ) -> Result<PhandleArgs, SpecifierError> {
+        let Some(_) = specifier.provider else {
+            return Ok(specifier.clone());
+        };
+
+        let cells_property = format!("#{stem}-cells");
+        let map_property = format!("{stem}-map");
+        let mask_property = format!("{stem}-map-mask");
+        let pass_property = format!("{stem}-map-pass-thru");
+        let mut current = specifier.clone();
+        let mut visited = Vec::new();
+
+        loop {
+            let provider = current
+                .provider
+                .expect("a nexus translation cannot turn into an empty slot");
+            let cells = provider_cells(self, provider, &cells_property, None)?;
+            if current.args.len() != cells {
+                return Err(SpecifierError::ArgumentCountMismatch {
+                    provider,
+                    property: cells_property.clone(),
+                    expected: cells,
+                    actual: current.args.len(),
+                });
+            }
+            if visited.contains(&provider) {
+                return Err(SpecifierError::MapCycle {
+                    nexus: provider,
+                    property: map_property.clone(),
+                });
+            }
+            visited.push(provider);
+
+            let view = self
+                .node(provider)
+                .ok_or(SpecifierError::InvalidNode(provider))?;
+            let Some(property) = view.property(&map_property) else {
+                return Ok(current);
+            };
+            let values = property
+                .cells()
+                .map(|cells| cells.collect::<Vec<_>>())
+                .map_err(|error| SpecifierError::InvalidProperty {
+                    node: provider,
+                    property: map_property.clone(),
+                    error,
+                })?;
+            let mask = map_modifier(self, provider, &mask_property, cells, u32::MAX)?;
+            let pass = map_modifier(self, provider, &pass_property, cells, 0)?;
+
+            let mut matched = None;
+            let mut offset = 0usize;
+            let mut entry = 0usize;
+            while offset < values.len() {
+                let minimum = cells
+                    .checked_add(1)
+                    .ok_or(SpecifierError::CellCountOverflow {
+                        provider,
+                        property: cells_property.clone(),
+                        count: u32::MAX,
+                    })?;
+                if values.len() - offset < minimum {
+                    return Err(SpecifierError::IncompleteEntry {
+                        node: provider,
+                        property: map_property.clone(),
+                        entry,
+                        remaining_cells: values.len() - offset,
+                        required_cells: minimum,
+                    });
+                }
+
+                let child = &values[offset..offset + cells];
+                let phandle = values[offset + cells];
+                let parent =
+                    self.node_by_phandle(phandle)
+                        .ok_or(SpecifierError::UnknownPhandle {
+                            node: provider,
+                            property: map_property.clone(),
+                            entry,
+                            phandle,
+                        })?;
+                let parent_cells = provider_cells(self, parent, &cells_property, None)?;
+                let row_cells =
+                    minimum
+                        .checked_add(parent_cells)
+                        .ok_or(SpecifierError::CellCountOverflow {
+                            provider: parent,
+                            property: cells_property.clone(),
+                            count: u32::MAX,
+                        })?;
+                if values.len() - offset < row_cells {
+                    return Err(SpecifierError::IncompleteEntry {
+                        node: provider,
+                        property: map_property.clone(),
+                        entry,
+                        remaining_cells: values.len() - offset,
+                        required_cells: row_cells,
+                    });
+                }
+                let parent_args = &values[offset + minimum..offset + minimum + parent_cells];
+                let parent_is_available = provider_available(self, parent)?;
+                let is_match = matched.is_none()
+                    && parent_is_available
+                    && child
+                        .iter()
+                        .zip(&current.args)
+                        .zip(&mask)
+                        .all(|((&mapped, &actual), &mask)| (mapped ^ actual) & mask == 0);
+                if is_match {
+                    let mut args = parent_args.to_vec();
+                    for index in 0..core::cmp::min(cells, parent_cells) {
+                        args[index] =
+                            (args[index] & !pass[index]) | (current.args[index] & pass[index]);
+                    }
+                    matched = Some(PhandleArgs {
+                        provider: Some(parent),
+                        phandle,
+                        args,
+                    });
+                }
+
+                offset += row_cells;
+                entry += 1;
+            }
+
+            current = matched.ok_or_else(|| SpecifierError::NoMatchingMap {
+                nexus: provider,
+                property: map_property.clone(),
+                args: current.args.clone(),
+            })?;
+        }
+    }
+
+    /// 解码 phandle-only 列表，并严格关联可选的 `*-names` 字符串列表。
+    pub fn named_phandle_list(
+        &self,
+        node: NodeId,
+        property: &str,
+        names_property: &str,
+    ) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
+        let Some(entries) = self.phandle_list(node, property)? else {
+            return Ok(None);
+        };
+        self.attach_names(node, names_property, entries).map(Some)
+    }
+
+    fn attach_names(
+        &self,
+        node: NodeId,
+        names_property: &str,
+        entries: Vec<PhandleArgs>,
+    ) -> Result<Vec<NamedPhandleArgs>, SpecifierError> {
         let view = self.node(node).ok_or(SpecifierError::InvalidNode(node))?;
         let names = view
             .property(names_property)
@@ -216,41 +534,39 @@ impl Tree<'_> {
                 entries: entries.len(),
             });
         }
-        Ok(Some(
-            entries
-                .into_iter()
-                .enumerate()
-                .map(|(index, specifier)| NamedPhandleArgs {
-                    name: names.as_ref().map(|names| names[index].clone()),
-                    specifier,
-                })
-                .collect(),
-        ))
+        Ok(entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, specifier)| NamedPhandleArgs {
+                name: names.as_ref().map(|names| names[index].clone()),
+                specifier,
+            })
+            .collect())
     }
 
     /// `clocks` / `clock-names`。
     pub fn clocks(&self, node: NodeId) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
-        self.named_phandle_array(node, "clocks", "#clock-cells", "clock-names")
+        self.named_mapped_phandle_array(node, "clocks", "clock", "clock-names")
     }
 
     /// `resets` / `reset-names`。
     pub fn resets(&self, node: NodeId) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
-        self.named_phandle_array(node, "resets", "#reset-cells", "reset-names")
+        self.named_mapped_phandle_array(node, "resets", "reset", "reset-names")
     }
 
     /// `phys` / `phy-names`。
     pub fn phys(&self, node: NodeId) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
-        self.named_phandle_array(node, "phys", "#phy-cells", "phy-names")
+        self.named_mapped_phandle_array(node, "phys", "phy", "phy-names")
     }
 
     /// `dmas` / `dma-names`。
     pub fn dmas(&self, node: NodeId) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
-        self.named_phandle_array(node, "dmas", "#dma-cells", "dma-names")
+        self.named_mapped_phandle_array(node, "dmas", "dma", "dma-names")
     }
 
     /// `mboxes` / `mbox-names`。
     pub fn mboxes(&self, node: NodeId) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
-        self.named_phandle_array(node, "mboxes", "#mbox-cells", "mbox-names")
+        self.named_mapped_phandle_array(node, "mboxes", "mbox", "mbox-names")
     }
 
     /// `io-channels` / `io-channel-names`。
@@ -258,27 +574,27 @@ impl Tree<'_> {
         &self,
         node: NodeId,
     ) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
-        self.named_phandle_array(node, "io-channels", "#io-channel-cells", "io-channel-names")
+        self.named_mapped_phandle_array(node, "io-channels", "io-channel", "io-channel-names")
     }
 
     /// `iommus`。
     pub fn iommus(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, "iommus", "#iommu-cells")
+        self.mapped_phandle_array(node, "iommus", "iommu")
     }
 
     /// `power-domains`。
     pub fn power_domains(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, "power-domains", "#power-domain-cells")
+        self.mapped_phandle_array(node, "power-domains", "power-domain")
     }
 
     /// `interconnects`。
     pub fn interconnects(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, "interconnects", "#interconnect-cells")
+        self.mapped_phandle_array(node, "interconnects", "interconnect")
     }
 
     /// `pwms`。
     pub fn pwms(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, "pwms", "#pwm-cells")
+        self.mapped_phandle_array(node, "pwms", "pwm")
     }
 
     /// `thermal-sensors`。
@@ -286,12 +602,12 @@ impl Tree<'_> {
         &self,
         node: NodeId,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, "thermal-sensors", "#thermal-sensor-cells")
+        self.mapped_phandle_array(node, "thermal-sensors", "thermal-sensor")
     }
 
     /// `sound-dai`。
     pub fn sound_dais(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, "sound-dai", "#sound-dai-cells")
+        self.mapped_phandle_array(node, "sound-dai", "sound-dai")
     }
 
     /// `memory-region` phandle-only 列表。
@@ -299,9 +615,25 @@ impl Tree<'_> {
         self.phandle_list(node, "memory-region")
     }
 
+    /// `memory-region` / `memory-region-names`。
+    pub fn named_memory_regions(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
+        self.named_phandle_list(node, "memory-region", "memory-region-names")
+    }
+
     /// `nvmem-cells` phandle-only 列表。
     pub fn nvmem_cells(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
         self.phandle_list(node, "nvmem-cells")
+    }
+
+    /// `nvmem-cells` / `nvmem-cell-names`。
+    pub fn named_nvmem_cells(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
+        self.named_phandle_list(node, "nvmem-cells", "nvmem-cell-names")
     }
 
     /// `operating-points-v2` phandle-only 列表。
@@ -326,15 +658,19 @@ impl Tree<'_> {
         node: NodeId,
         property: &str,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
-        self.phandle_array(node, property, "#gpio-cells")
+        self.mapped_phandle_array(node, property, "gpio")
     }
 
     /// 解码 `iommu-map[-mask]`。
     pub fn iommu_map(&self, node: NodeId) -> Result<Option<IdMap>, IdMapError> {
-        self.id_map(node, "iommu-map", "#iommu-cells", "iommu-map-mask", None)
+        self.id_map(node, "iommu-map", "#iommu-cells", "iommu-map-mask", Some(1))
     }
 
-    /// 原子解码 Linux `of_map_id()` 形式的通用 ID map。
+    /// 原子解码 requester-ID map。
+    ///
+    /// 每项采用 `<input-base phandle output-specifier... length>`，输出宽度由目标
+    /// provider 的 `cells_property` 决定。单 cell 表与 Linux `of_map_id()` 的四-cell
+    /// ABI 完全一致；多 cell 表按最新 dt-schema 无损保留。空属性和不完整尾项均非法。
     pub fn id_map(
         &self,
         node: NodeId,
@@ -369,6 +705,15 @@ impl Tree<'_> {
         let mut entries = Vec::new();
         let mut offset = 0usize;
         let mut entry = 0usize;
+        if values.is_empty() {
+            return Err(IdMapError::IncompleteEntry {
+                node,
+                property: map_property.to_string(),
+                entry: 0,
+                remaining_cells: 0,
+                required_cells: 3,
+            });
+        }
         while offset < values.len() {
             if values.len() - offset < 2 {
                 return Err(IdMapError::IncompleteEntry {
@@ -491,6 +836,62 @@ impl Tree<'_> {
         }
         Ok(Some(entries))
     }
+}
+
+fn map_modifier(
+    tree: &Tree<'_>,
+    node: NodeId,
+    property_name: &str,
+    cells: usize,
+    default: u32,
+) -> Result<Vec<u32>, SpecifierError> {
+    let view = tree.node(node).ok_or(SpecifierError::InvalidNode(node))?;
+    let Some(property) = view.property(property_name) else {
+        return Ok(alloc::vec![default; cells]);
+    };
+    let values = property
+        .cells()
+        .map(|cells| cells.collect::<Vec<_>>())
+        .map_err(|error| SpecifierError::InvalidProperty {
+            node,
+            property: property_name.to_string(),
+            error,
+        })?;
+    if values.len() != cells {
+        let expected = cells
+            .checked_mul(4)
+            .ok_or(SpecifierError::CellCountOverflow {
+                provider: node,
+                property: property_name.to_string(),
+                count: u32::try_from(cells).unwrap_or(u32::MAX),
+            })?;
+        return Err(SpecifierError::InvalidProperty {
+            node,
+            property: property_name.to_string(),
+            error: PropertyError::InvalidLength {
+                actual: property.value().len(),
+                expected: Some(expected),
+            },
+        });
+    }
+    Ok(values)
+}
+
+fn provider_available(tree: &Tree<'_>, provider: NodeId) -> Result<bool, SpecifierError> {
+    let view = tree
+        .node(provider)
+        .ok_or(SpecifierError::InvalidNode(provider))?;
+    let Some(property) = view.property("status") else {
+        return Ok(true);
+    };
+    let status = property
+        .as_str()
+        .map_err(|error| SpecifierError::InvalidProperty {
+            node: provider,
+            property: "status".to_string(),
+            error,
+        })?;
+    Ok(matches!(status, "ok" | "okay"))
 }
 
 fn provider_cells(
