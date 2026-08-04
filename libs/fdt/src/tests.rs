@@ -3087,6 +3087,48 @@ fn pci_bindings_preserve_masks_widths_and_parent_identity() {
 
 #[cfg(feature = "alloc")]
 #[test]
+fn pci_interrupt_map_accepts_qemu_loongarch_legacy_cells() {
+    use crate::Tree;
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("pch-pic");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("compatible", b"loongson,pch-pic-1.0\0");
+    builder.property("interrupt-controller", &[]);
+    builder.property("#interrupt-cells", &cells(&[2]));
+    builder.end_node();
+    builder.begin("pcie");
+    builder.property("#address-cells", &cells(&[3]));
+    builder.property("interrupt-map-mask", &cells(&[0x1800, 0, 0, 7]));
+    builder.property(
+        "interrupt-map",
+        &cells(&[0, 0, 0, 1, 1, 0x10, 0x800, 0, 0, 2, 1, 0x11]),
+    );
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let host = tree.find_node("/pcie").unwrap();
+    let pic = tree.find_node("/pch-pic").unwrap();
+
+    let map = tree.pci_interrupt_map(host).unwrap().unwrap();
+    assert_eq!(map.child_interrupt_cells, 1);
+    assert_eq!(map.entries.len(), 2);
+    assert_eq!(map.entries[0].parent, pic);
+    assert_eq!(map.entries[0].parent_specifier, vec![0x10]);
+    let route = tree
+        .resolve_pci_interrupt(&map, &[0x800, 0, 0], &[2])
+        .unwrap()
+        .unwrap();
+    assert_eq!(route.provider, pic);
+    assert_eq!(route.provider_phandle, 1);
+    assert_eq!(route.specifier, vec![0x11]);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
 fn msi_map_can_cover_the_last_requester_id() {
     use crate::Tree;
 

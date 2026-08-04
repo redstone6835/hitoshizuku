@@ -13,6 +13,7 @@ const PCI_SPACE_MEM64: u32 = 0x0300_0000;
 const PCI_PREFETCHABLE: u32 = 0x4000_0000;
 const PCI_RELOCATABLE: u32 = 0x8000_0000;
 const PCI_ALIASED: u32 = 0x2000_0000;
+const COMPAT_LOONGSON_PCH_PIC: &str = "loongson,pch-pic-1.0";
 
 /// PCI child address 的空间类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,7 +267,9 @@ impl Tree<'_> {
             return Ok(None);
         };
         let child_address_cells = self.exact_cell_count(host, "#address-cells", 3)?;
-        let child_interrupt_cells = required_count(self, host, "#interrupt-cells")?;
+        // PCI child interrupt specifier 按 binding 固定为一个 cell。Linux 与现有
+        // QEMU LoongArch 固件允许 host 在提供 interrupt-map 时省略这项推荐声明。
+        let child_interrupt_cells = optional_count(self, host, "#interrupt-cells", 1)?;
         let key_cells = child_address_cells
             .checked_add(child_interrupt_cells)
             .ok_or(PciError::Overflow {
@@ -281,6 +284,12 @@ impl Tree<'_> {
         })?;
         let values = property_cells(host, "interrupt-map", property)?;
         require_remaining(host, "interrupt-map", 0, values.len(), fixed)?;
+        let legacy_loongson_map = is_legacy_loongson_pci_interrupt_map(
+            self,
+            &values,
+            child_address_cells,
+            child_interrupt_cells,
+        );
         let mask = match node.property("interrupt-map-mask") {
             None => vec![u32::MAX; key_cells],
             Some(mask) => {
@@ -334,7 +343,11 @@ impl Tree<'_> {
                 })?;
             // Linux compatibility: absent parent #address-cells means zero in interrupt-map.
             let parent_address_cells = optional_count(self, parent, "#address-cells", 0)?;
-            let parent_interrupt_cells = required_count(self, parent, "#interrupt-cells")?;
+            let parent_interrupt_cells = if legacy_loongson_map {
+                1
+            } else {
+                required_count(self, parent, "#interrupt-cells")?
+            };
             let variable = parent_address_cells
                 .checked_add(parent_interrupt_cells)
                 .ok_or(PciError::Overflow {
@@ -426,24 +439,40 @@ impl Tree<'_> {
                 *value = (*value & !pass) | (child & pass);
             }
             let parent_address_cells = entry.parent_address.len();
-            let translated = self
-                .translate_interrupt_route(
+            let (provider, address, specifier) = if is_legacy_loongson_pch_pic_parent(
+                self,
+                entry.parent,
+                parent_address_cells,
+                parent_key.len() - parent_address_cells,
+            ) {
+                (
                     entry.parent,
                     parent_key[..parent_address_cells].to_vec(),
                     parent_key[parent_address_cells..].to_vec(),
                 )
-                .map_err(PciError::InvalidInterrupt)?;
-            let provider_phandle =
-                self.phandle(translated.provider)
-                    .ok_or(PciError::MissingRequired {
-                        node: translated.provider,
-                        property: "phandle",
-                    })?;
+            } else {
+                let translated = self
+                    .translate_interrupt_route(
+                        entry.parent,
+                        parent_key[..parent_address_cells].to_vec(),
+                        parent_key[parent_address_cells..].to_vec(),
+                    )
+                    .map_err(PciError::InvalidInterrupt)?;
+                (
+                    translated.provider,
+                    translated.address,
+                    translated.specifier,
+                )
+            };
+            let provider_phandle = self.phandle(provider).ok_or(PciError::MissingRequired {
+                node: provider,
+                property: "phandle",
+            })?;
             return Ok(Some(PciInterruptRoute {
-                provider: translated.provider,
+                provider,
                 provider_phandle,
-                address: translated.address,
-                specifier: translated.specifier,
+                address,
+                specifier,
             }));
         }
         Ok(None)
@@ -582,6 +611,61 @@ impl Tree<'_> {
             })?;
         Ok(matches!(status, "ok" | "okay"))
     }
+}
+
+/// 兼容 QEMU LoongArch 长期生成的 PCI interrupt-map：host 省略
+/// `#interrupt-cells`，且指向声明为两 cell 的 PCH PIC 时只编码 source cell。
+/// 只有整张表都严格符合这一已知布局才启用兼容路径，标准两 cell 表仍按声明解析。
+fn is_legacy_loongson_pci_interrupt_map(
+    tree: &Tree<'_>,
+    values: &[u32],
+    child_address_cells: usize,
+    child_interrupt_cells: usize,
+) -> bool {
+    let Some(key_cells) = child_address_cells.checked_add(child_interrupt_cells) else {
+        return false;
+    };
+    let Some(stride) = key_cells.checked_add(2) else {
+        return false;
+    };
+    if values.is_empty() || !values.len().is_multiple_of(stride) {
+        return false;
+    }
+    values.chunks_exact(stride).all(|row| {
+        let Some(parent) = tree.node_by_phandle(row[key_cells]) else {
+            return false;
+        };
+        is_legacy_loongson_pch_pic_parent(tree, parent, 0, 1)
+    })
+}
+
+fn is_legacy_loongson_pch_pic_parent(
+    tree: &Tree<'_>,
+    parent: NodeId,
+    encoded_address_cells: usize,
+    encoded_interrupt_cells: usize,
+) -> bool {
+    if encoded_address_cells != 0
+        || encoded_interrupt_cells != 1
+        || optional_count(tree, parent, "#address-cells", 0) != Ok(0)
+        || required_count(tree, parent, "#interrupt-cells") != Ok(2)
+    {
+        return false;
+    }
+    let Some(node) = tree.node(parent) else {
+        return false;
+    };
+    if node.property("interrupt-map").is_some()
+        || node
+            .property("interrupt-controller")
+            .and_then(|property| property.as_bool().ok())
+            != Some(true)
+    {
+        return false;
+    }
+    node.property("compatible")
+        .and_then(|property| property.as_string_list().ok())
+        .is_some_and(|mut values| values.any(|value| value == COMPAT_LOONGSON_PCH_PIC))
 }
 
 fn property_cells(

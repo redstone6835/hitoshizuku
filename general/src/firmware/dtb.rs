@@ -2965,6 +2965,62 @@ mod tests {
     }
 
     #[test]
+    fn qemu_loongarch_legacy_pci_interrupt_map_remains_bootable() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[2]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.begin_node("pch-pic@10000000");
+        builder.property("compatible", b"loongson,pch-pic-1.0\0");
+        builder.property("phandle", &cells(&[0x8003]));
+        builder.property("interrupt-controller", &[]);
+        builder.property("#interrupt-cells", &cells(&[2]));
+        builder.property("reg", &cells(&[0, 0x1000_0000, 0, 0x400]));
+        builder.end_node();
+        builder.begin_node("msi@2ff00000");
+        builder.property("compatible", b"loongson,pch-msi-1.0\0");
+        builder.property("phandle", &cells(&[0x8004]));
+        builder.property("interrupt-controller", &[]);
+        builder.property("reg", &cells(&[0, 0x2ff0_0000, 0, 8]));
+        builder.end_node();
+        builder.begin_node("pcie@20000000");
+        builder.property("compatible", b"pci-host-ecam-generic\0");
+        builder.property("device_type", b"pci\0");
+        builder.property("#address-cells", &cells(&[3]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.property("bus-range", &cells(&[0, 0x7f]));
+        builder.property("reg", &cells(&[0, 0x2000_0000, 0, 0x0800_0000]));
+        builder.property(
+            "ranges",
+            &cells(&[0x0200_0000, 0, 0x4000_0000, 0, 0x4000_0000, 0, 0x4000_0000]),
+        );
+        builder.property("interrupt-map-mask", &cells(&[0x1800, 0, 0, 7]));
+        builder.property(
+            "interrupt-map",
+            &cells(&[0, 0, 0, 1, 0x8003, 0x10, 0x800, 0, 0, 2, 0x8003, 0x11]),
+        );
+        builder.property("msi-map", &cells(&[0, 0x8004, 0, 0x10000]));
+        builder.property("dma-coherent", &[]);
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        let host = &firmware.pcie_hosts[0];
+        assert_eq!(host.interrupt_cells, 1);
+        assert_eq!(host.interrupt_map.len(), 2);
+        assert_eq!(host.interrupt_map[0].parent, 0x8003);
+        assert_eq!(
+            host.interrupt_map[0]
+                .resolved
+                .as_ref()
+                .map(|route| route.parent_specifier.as_ref()),
+            Some([0x10].as_slice())
+        );
+        assert_eq!(host.msi_map.len(), 1);
+        assert_eq!(host.msi_map[0].msi_specifier.as_ref(), &[0]);
+    }
+
+    #[test]
     fn malformed_pci_msi_parent_is_not_partially_exposed() {
         let mut builder = DtbBuilder::new();
         builder.begin_node("");
