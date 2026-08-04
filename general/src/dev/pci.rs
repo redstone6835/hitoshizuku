@@ -33,7 +33,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 use vfs::sync::Spinlock;
 
-use super::dma::{DmaBouncePolicy, DmaConstraints, DmaContext};
+use super::dma::{DmaBouncePolicy, DmaConstraints, DmaContext, DmaWindow};
 use super::irq::IrqLine;
 use super::msi;
 use super::pnp::{
@@ -145,6 +145,125 @@ pub struct PciHostBridgeWindow {
     pub size: usize,
 }
 
+/// host bridge `iommu-map` 的一项固件无关 requester-ID 映射。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciRequesterIdMapEntry {
+    pub input_base: u32,
+    pub provider_path: Box<str>,
+    pub provider_phandle: u32,
+    pub output_base: Box<[u32]>,
+    pub length: u32,
+}
+
+/// 已规范化的 PCI requester-ID -> IOMMU stream-ID 映射。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciRequesterIdMap {
+    pub mask: u32,
+    pub entries: Vec<PciRequesterIdMapEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciRequesterIdMapMatch<'a> {
+    pub entry: &'a PciRequesterIdMapEntry,
+    pub offset: u32,
+}
+
+/// requester-ID 映射后的稳定借用视图。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciMappedRequesterId<'a> {
+    pub provider_path: &'a str,
+    pub provider_phandle: u32,
+    pub args: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PciRequesterIdMapError {
+    OutputOverflow {
+        provider_phandle: u32,
+        output_base: u32,
+        offset: u32,
+    },
+    AmbiguousMultiCellRange {
+        provider_phandle: u32,
+        cells: usize,
+        length: u32,
+        offset: u32,
+    },
+}
+
+impl PciRequesterIdMap {
+    pub fn match_id(&self, requester_id: u32) -> Option<PciRequesterIdMapMatch<'_>> {
+        let requester_id = requester_id & self.mask;
+        self.entries.iter().find_map(|entry| {
+            let offset = requester_id.checked_sub(entry.input_base)?;
+            if offset >= entry.length {
+                return None;
+            }
+            Some(PciRequesterIdMapMatch { entry, offset })
+        })
+    }
+
+    pub fn map_id(
+        &self,
+        requester_id: u32,
+    ) -> Result<Option<PciMappedRequesterId<'_>>, PciRequesterIdMapError> {
+        let Some(matched) = self.match_id(requester_id) else {
+            return Ok(None);
+        };
+        let entry = matched.entry;
+        let args = match entry.output_base.as_ref() {
+            [] => Vec::new(),
+            &[output_base] => Vec::from([output_base.checked_add(matched.offset).ok_or(
+                PciRequesterIdMapError::OutputOverflow {
+                    provider_phandle: entry.provider_phandle,
+                    output_base,
+                    offset: matched.offset,
+                },
+            )?]),
+            _ if entry.length == 1 => entry.output_base.to_vec(),
+            output_base => {
+                return Err(PciRequesterIdMapError::AmbiguousMultiCellRange {
+                    provider_phandle: entry.provider_phandle,
+                    cells: output_base.len(),
+                    length: entry.length,
+                    offset: matched.offset,
+                });
+            }
+        };
+        Ok(Some(PciMappedRequesterId {
+            provider_path: &entry.provider_path,
+            provider_phandle: entry.provider_phandle,
+            args,
+        }))
+    }
+}
+
+/// host bridge 的有效 DMA 策略。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PciHostDmaInfo {
+    /// `None` 表示沿用平台默认映射；`Some([])` 表示固件显式 identity。
+    pub windows: Option<Vec<DmaWindow>>,
+    /// 只包含可用 provider 的 requester-ID 映射。
+    pub iommu_map: Option<PciRequesterIdMap>,
+    /// 固件地址宽度或拓扑无法安全投影到当前内核 DMA 抽象。
+    pub unsupported: bool,
+    /// DT 中按 BDF 描述的 function 级覆盖。
+    pub functions: Vec<PciFunctionDmaInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciFunctionDmaInfo {
+    pub firmware_path: Box<str>,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub coherent: bool,
+    pub windows: Option<Vec<DmaWindow>>,
+    /// 可用 direct `iommus` provider 路径；非空时当前实现 fail closed。
+    pub iommu_providers: Vec<Box<str>>,
+    pub unsupported: bool,
+}
+
 /// PCI host bridge 的标准化描述。
 ///
 /// 该结构是设备层认识 host bridge 的统一入口：ECAM 范围、bus-range、地址窗口、
@@ -160,6 +279,7 @@ pub struct PciHostBridgeInfo {
     pub ecam_phys: usize,
     pub ecam_size: usize,
     pub dma_coherent: bool,
+    pub dma: PciHostDmaInfo,
     pub windows: Vec<PciHostBridgeWindow>,
     pub irq_route_count: usize,
     pub msi_route_count: usize,
@@ -194,7 +314,17 @@ pub enum PciHostBridgeError {
 struct PciHostBridgeRegistration {
     handle: PciHostBridgeHandle,
     info: PciHostBridgeInfo,
+    fallback_dma_context: DmaContext,
+    function_dma_contexts: Vec<PciFunctionDmaRegistration>,
     pnp: Option<Arc<PnpDevice>>,
+}
+
+struct PciFunctionDmaRegistration {
+    bus: u8,
+    device: u8,
+    function: u8,
+    context: DmaContext,
+    iommu_required: bool,
 }
 
 struct PciHostBridgeRegistry {
@@ -247,6 +377,25 @@ pub fn register_host_bridge(
     }) {
         return Err(PciHostBridgeError::AlreadyRegistered);
     }
+    let fallback_dma_context = pci_host_fallback_dma_context(&info)?;
+    let function_dma_contexts = info
+        .dma
+        .functions
+        .iter()
+        .map(|function| {
+            Ok(PciFunctionDmaRegistration {
+                bus: function.bus,
+                device: function.device,
+                function: function.function,
+                context: pci_dma_context(
+                    function.coherent,
+                    function.windows.as_ref(),
+                    function.unsupported,
+                )?,
+                iommu_required: !function.iommu_providers.is_empty(),
+            })
+        })
+        .collect::<Result<Vec<_>, PciHostBridgeError>>()?;
     registry
         .bridges
         .try_reserve(1)
@@ -256,9 +405,13 @@ pub fn register_host_bridge(
     // host bridge 句柄可能被启动期回滚或热移除路径保存；编号只增长不复用，
     // 旧句柄就不会误注销后来重新登记的同一 domain/bus-range。
     let handle = PciHostBridgeHandle { id };
-    registry
-        .bridges
-        .push(PciHostBridgeRegistration { handle, info, pnp });
+    registry.bridges.push(PciHostBridgeRegistration {
+        handle,
+        info,
+        fallback_dma_context,
+        function_dma_contexts,
+        pnp,
+    });
     drop(registry);
     if super::elm_lifecycle::track_pci_host_bridge(handle).is_err() {
         let _ = unregister_host_bridge(handle);
@@ -357,6 +510,106 @@ fn host_bridge_pnp_for(segment: u16, bus: u8) -> Option<Arc<PnpDevice>> {
         .iter()
         .find(|bridge| pci_host_bridge_covers(bridge, segment, bus))
         .and_then(|bridge| bridge.pnp.as_ref().map(Arc::clone))
+}
+
+fn host_bridge_dma_context_for_bdf(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Option<DmaContext> {
+    let registry = PCI_HOST_BRIDGES.lock();
+    let bridge = registry
+        .bridges
+        .iter()
+        .find(|bridge| pci_host_bridge_covers(bridge, segment, bus))?;
+    let context = bridge.fallback_dma_context;
+    let function_context = bridge
+        .function_dma_contexts
+        .iter()
+        .find(|entry| entry.bus == bus && entry.device == device && entry.function == function);
+    let context = function_context.map_or(context, |entry| entry.context);
+    if function_context.is_some_and(|entry| entry.iommu_required) {
+        return Some(DmaContext::blocked(context.constraints()));
+    }
+    let requester_id = (u32::from(bus) << 8) | (u32::from(device) << 3) | u32::from(function);
+    if bridge
+        .info
+        .dma
+        .iommu_map
+        .as_ref()
+        .and_then(|map| map.match_id(requester_id))
+        .is_some()
+    {
+        // IOMMU domain 建立/撤销尚未进入 DmaMapper 契约；只阻断真正命中 map 的 BDF，
+        // 未命中或仅指向 disabled provider 的 function 继续使用 dma-ranges fallback。
+        return Some(DmaContext::blocked(context.constraints()));
+    }
+    Some(context)
+}
+
+fn pci_host_fallback_dma_context(
+    info: &PciHostBridgeInfo,
+) -> Result<DmaContext, PciHostBridgeError> {
+    pci_dma_context(
+        info.dma_coherent,
+        info.dma.windows.as_ref(),
+        info.dma.unsupported,
+    )
+}
+
+fn pci_dma_context(
+    coherent: bool,
+    windows: Option<&Vec<DmaWindow>>,
+    unsupported: bool,
+) -> Result<DmaContext, PciHostBridgeError> {
+    let constraints = DmaConstraints {
+        address_mask: usize::MAX,
+        max_segment_size: usize::MAX,
+        max_segments: 1,
+        coherent,
+        supports_scatter_gather: false,
+        bounce: DmaBouncePolicy::Disabled,
+    };
+    if unsupported {
+        return Ok(DmaContext::blocked(constraints));
+    }
+    let Some(windows) = windows else {
+        return Ok(DmaContext::with_constraints(constraints));
+    };
+    if windows.is_empty() {
+        return Ok(DmaContext::with_constraints(constraints));
+    }
+    if !valid_dma_windows(windows) {
+        return Err(PciHostBridgeError::Invalid);
+    }
+    // 已返回给驱动的 DmaContext 可能活过 host registry 项；启动固件窗口只安装一次，
+    // 因而提升为内核全生命周期切片，避免热移除后出现悬垂 mapper。
+    let windows: &'static [DmaWindow] = Box::leak(windows.clone().into_boxed_slice());
+    Ok(DmaContext::with_windows(constraints, windows))
+}
+
+fn valid_dma_windows(windows: &[DmaWindow]) -> bool {
+    for (index, window) in windows.iter().enumerate() {
+        if window.size == 0
+            || window.cpu_start.checked_add(window.size).is_none()
+            || window.dma_start.checked_add(window.size).is_none()
+        {
+            return false;
+        }
+        for previous in &windows[..index] {
+            let Some(previous_end) = previous.cpu_start.checked_add(previous.size) else {
+                return false;
+            };
+            let Some(window_end) = window.cpu_start.checked_add(window.size) else {
+                return false;
+            };
+            if previous.cpu_start < window_end && window.cpu_start < previous_end {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 const fn pci_bus_ranges_overlap(a_start: u8, a_end: u8, b_start: u8, b_end: u8) -> bool {
@@ -1009,9 +1262,8 @@ impl PciDevice {
 
     /// 返回该 PCI function 的 DMA 上下文。
     ///
-    /// DMA 能力来自设备所在 host bridge，而不是全局静态假设。当前固件只提供
-    /// coherent 属性时，地址窗口仍采用 identity 兼容策略；后续接入 `dma-ranges`
-    /// 或 IOMMU 后只需要在这里构造更精确的 constraints/mapper。
+    /// DMA 能力来自设备所在 host bridge，而不是全局静态假设。`dma-ranges` 已转换
+    /// 为 per-host 窗口；命中尚未建立 domain 的 IOMMU requester map 时 fail closed。
     #[kernel_symbols::export(
         name = "general.dev.pci.PciDevice.dma_context",
         contract = "kernel.general.pci-device@1",
@@ -1019,20 +1271,11 @@ impl PciDevice {
         capabilities = kernel_symbols::capability::DEVICE_DMA
     )]
     pub fn dma_context(&self) -> DmaContext {
-        let Some((segment, bus, _, _)) = self.bdf() else {
+        let Some((segment, bus, device, function)) = self.bdf() else {
             return DmaContext::default_coherent();
         };
-        let Some(host) = host_bridge_for_bus(segment, bus) else {
-            return DmaContext::default_coherent();
-        };
-        DmaContext::with_constraints(DmaConstraints {
-            address_mask: usize::MAX,
-            max_segment_size: usize::MAX,
-            max_segments: 1,
-            coherent: host.info.dma_coherent,
-            supports_scatter_gather: false,
-            bounce: DmaBouncePolicy::Disabled,
-        })
+        host_bridge_dma_context_for_bdf(segment, bus, device, function)
+            .unwrap_or_else(|| DmaContext::blocked(DmaConstraints::coherent_identity()))
     }
 
     fn bdf(&self) -> Option<(u16, u8, u8, u8)> {
@@ -2033,6 +2276,67 @@ pub fn direct_pci_new_unregistered(
     function: u8,
 ) -> Option<PciDevice> {
     PciDevice::new_unregistered(segment, bus, device, function)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn requester_id_map_applies_mask_range_and_output_offset() {
+        let map = PciRequesterIdMap {
+            mask: 0xffff,
+            entries: vec![PciRequesterIdMapEntry {
+                input_base: 0x100,
+                provider_path: "/iommu".into(),
+                provider_phandle: 7,
+                output_base: vec![0x40].into_boxed_slice(),
+                length: 0x20,
+            }],
+        };
+        assert_eq!(
+            map.map_id(0xabcd_0110),
+            Ok(Some(PciMappedRequesterId {
+                provider_path: "/iommu",
+                provider_phandle: 7,
+                args: vec![0x50],
+            }))
+        );
+        assert_eq!(map.map_id(0x120), Ok(None));
+
+        let zero_cell = PciRequesterIdMap {
+            mask: u32::MAX,
+            entries: vec![PciRequesterIdMapEntry {
+                input_base: 0x200,
+                provider_path: "/zero-iommu".into(),
+                provider_phandle: 8,
+                output_base: Box::new([]),
+                length: 2,
+            }],
+        };
+        assert_eq!(
+            zero_cell.map_id(0x201).unwrap().unwrap().args,
+            Vec::<u32>::new()
+        );
+
+        let multi_cell = PciRequesterIdMap {
+            mask: u32::MAX,
+            entries: vec![PciRequesterIdMapEntry {
+                input_base: 0x300,
+                provider_path: "/wide-iommu".into(),
+                provider_phandle: 9,
+                output_base: vec![1, 2].into_boxed_slice(),
+                length: 2,
+            }],
+        };
+        assert!(multi_cell.match_id(0x301).is_some());
+        assert!(matches!(
+            multi_cell.map_id(0x301),
+            Err(PciRequesterIdMapError::AmbiguousMultiCellRange { .. })
+        ));
+    }
 }
 
 #[doc(hidden)]

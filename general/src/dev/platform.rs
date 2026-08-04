@@ -9,7 +9,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use crate::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext};
+use crate::dev::dma::DmaContext;
+#[cfg(test)]
+use crate::dev::dma::{DmaBouncePolicy, DmaConstraints};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine};
 use crate::dev::pnp::{
     BusType, PNP_DEVICES, PNP_DRIVERS, PlatformIdentity, PlatformIdentityIrqAttributes,
@@ -17,6 +19,7 @@ use crate::dev::pnp::{
     PlatformIdentityMatchId, PlatformIdentityResource, PnpBusInfo, PnpDevice, PnpError, PnpId,
     PnpState,
 };
+use crate::firmware::dtb::{DtbPlatformBindings, DtbProviderReference};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceMatchId {
@@ -348,6 +351,13 @@ pub struct PlatformDeviceInfo {
     pub resources: Vec<DeviceResource>,
     pub properties: DeviceProperties,
     pub fw_properties: Vec<FirmwareProperty>,
+    /// 枚举阶段已按固件父链固化的 per-device DMA 上下文。
+    pub dma: DmaContext,
+    /// DT 来源设备的规范化 provider、DMA/IOMMU 与 graph binding。
+    ///
+    /// ACPI 等其它固件来源保持 `None`。驱动应优先消费这里的 typed 关系，仅在
+    /// 尚未纳入标准解码的 vendor binding 上读取 `fw_properties` 原始字节。
+    pub dtb_bindings: Option<DtbPlatformBindings>,
 }
 
 #[kernel_symbols::export]
@@ -438,14 +448,7 @@ impl PlatformDeviceInfo {
         capabilities = kernel_symbols::capability::DEVICE_DMA
     )]
     pub fn dma_context(&self) -> DmaContext {
-        DmaContext::with_constraints(DmaConstraints {
-            address_mask: usize::MAX,
-            max_segment_size: usize::MAX,
-            max_segments: 1,
-            coherent: self.bool_property("dma-coherent"),
-            supports_scatter_gather: false,
-            bounce: DmaBouncePolicy::Disabled,
-        })
+        self.dma
     }
 
     #[kernel_symbols::export(
@@ -605,6 +608,24 @@ impl PlatformDeviceInfo {
             .iter()
             .find(|property| property.name.as_ref() == name)
             .map(FirmwareProperty::raw_value)
+    }
+
+    /// 按原始属性名遍历规范化 DT provider 引用。
+    pub fn dtb_references(&self, property: &str) -> impl Iterator<Item = &DtbProviderReference> {
+        self.dtb_bindings
+            .iter()
+            .flat_map(|bindings| bindings.references.iter())
+            .filter(move |reference| reference.property.as_ref() == property)
+    }
+
+    /// 按 `*-names` 名称查找一个规范化 DT provider 引用。
+    pub fn dtb_reference_by_name(
+        &self,
+        property: &str,
+        name: &str,
+    ) -> Option<&DtbProviderReference> {
+        self.dtb_references(property)
+            .find(|reference| reference.name.as_deref() == Some(name))
     }
 
     #[kernel_symbols::export(
@@ -768,6 +789,42 @@ mod tests {
         assert!(core::mem::size_of::<FirmwareProperty>() <= 4 * core::mem::size_of::<usize>());
     }
 
+    #[test]
+    fn drivers_can_query_normalized_dtb_references_without_slicing_properties() {
+        let mut info = platform_info(Vec::new());
+        info.dtb_bindings = Some(DtbPlatformBindings {
+            references: vec![
+                DtbProviderReference {
+                    property: "clocks".into(),
+                    name: Some("core".into()),
+                    provider: None,
+                    provider_path: None,
+                    provider_available: None,
+                    phandle: 0,
+                    args: Vec::new().into_boxed_slice(),
+                },
+                DtbProviderReference {
+                    property: "reset-gpios".into(),
+                    name: None,
+                    provider: None,
+                    provider_path: None,
+                    provider_available: None,
+                    phandle: 0,
+                    args: Vec::new().into_boxed_slice(),
+                },
+            ],
+            ..DtbPlatformBindings::default()
+        });
+
+        let clock = info
+            .dtb_reference_by_name("clocks", "core")
+            .expect("named reference must be directly queryable");
+        assert_eq!(clock.property.as_ref(), "clocks");
+        assert_eq!(clock.phandle, 0);
+        assert_eq!(info.dtb_references("reset-gpios").count(), 1);
+        assert_eq!(info.dtb_references("resets").count(), 0);
+    }
+
     fn firmware_property(name: &str, raw_value: &[u8]) -> FirmwareProperty {
         FirmwareProperty::new(name.into(), raw_value.into())
     }
@@ -781,6 +838,15 @@ mod tests {
             resources: Vec::new(),
             properties: DeviceProperties::default(),
             fw_properties,
+            dma: DmaContext::with_constraints(DmaConstraints {
+                address_mask: usize::MAX,
+                max_segment_size: usize::MAX,
+                max_segments: 1,
+                coherent: false,
+                supports_scatter_gather: false,
+                bounce: DmaBouncePolicy::Disabled,
+            }),
+            dtb_bindings: None,
         }
     }
 }

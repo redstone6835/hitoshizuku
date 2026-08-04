@@ -27,6 +27,7 @@ use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
 use acpi::{AcpiTable, AmlHandler, Handle, Handler, PhysicalMapping};
 
 use allocator::KERNEL_ALLOCATOR;
+use general::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext};
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, IrqPolarity, IrqResourceAttributes,
     IrqSharing, IrqTrigger, PlatformDeviceInfo, PlatformProbeStatus,
@@ -430,6 +431,8 @@ pub fn kernel_start_init(context: &StartContext) {
                 stdout: stdout_phys == Some(port.phys_addr),
             },
             fw_properties: Vec::new(),
+            dma: acpi_platform_dma_context(),
+            dtb_bindings: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -446,6 +449,8 @@ pub fn kernel_start_init(context: &StartContext) {
             resources: device.resources.clone(),
             properties: DeviceProperties::default(),
             fw_properties: Vec::new(),
+            dma: acpi_platform_dma_context(),
+            dtb_bindings: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -508,6 +513,17 @@ pub fn kernel_start_init(context: &StartContext) {
     }
 
     printk!("[kernel-start][acpi] kernel initialization complete, jumping to main entry");
+}
+
+fn acpi_platform_dma_context() -> DmaContext {
+    DmaContext::with_constraints(DmaConstraints {
+        address_mask: usize::MAX,
+        max_segment_size: usize::MAX,
+        max_segments: 1,
+        coherent: false,
+        supports_scatter_gather: false,
+        bounce: DmaBouncePolicy::Disabled,
+    })
 }
 
 fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {

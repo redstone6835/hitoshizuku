@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use spin::mutex::Mutex;
@@ -144,6 +145,18 @@ static LEGACY_GLOBAL_DMA_MAPPER: LegacyGlobalDmaMapper = LegacyGlobalDmaMapper;
 pub struct DmaContext {
     constraints: DmaConstraints,
     mapper: &'static dyn DmaMapper,
+    windows: Option<&'static [DmaWindow]>,
+    blocked: bool,
+}
+
+impl fmt::Debug for DmaContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmaContext")
+            .field("constraints", &self.constraints)
+            .field("window_count", &self.windows.map_or(0, <[DmaWindow]>::len))
+            .field("blocked", &self.blocked)
+            .finish_non_exhaustive()
+    }
 }
 
 #[kernel_symbols::export]
@@ -152,6 +165,8 @@ impl DmaContext {
         Self {
             constraints,
             mapper,
+            windows: None,
+            blocked: false,
         }
     }
 
@@ -161,6 +176,33 @@ impl DmaContext {
     /// 执行平台地址转换/cache 同步，地址位宽、coherent 等能力来自设备或桥。
     pub const fn with_constraints(constraints: DmaConstraints) -> Self {
         Self::new(constraints, &LEGACY_GLOBAL_DMA_MAPPER)
+    }
+
+    /// 使用一组固件已规范化的 CPU-physical -> device-DMA 窗口。
+    ///
+    /// `windows` 必须在设备上下文可能被使用期间保持有效；启动固件描述通常具有
+    /// 内核全生命周期。空 `dma-ranges` 的 identity 语义应使用
+    /// [`Self::with_constraints`]，空窗口切片在本接口中表示没有可达地址。
+    pub const fn with_windows(constraints: DmaConstraints, windows: &'static [DmaWindow]) -> Self {
+        Self {
+            constraints,
+            mapper: &LEGACY_GLOBAL_DMA_MAPPER,
+            windows: Some(windows),
+            blocked: false,
+        }
+    }
+
+    /// 构造一个保留同步能力、但拒绝生成任何设备地址的上下文。
+    ///
+    /// 固件要求 IOMMU 或声明了当前内核不能安全表达的地址转换时，总线层使用该
+    /// fail-closed 上下文，避免静默退化成 identity DMA。
+    pub const fn blocked(constraints: DmaConstraints) -> Self {
+        Self {
+            constraints,
+            mapper: &LEGACY_GLOBAL_DMA_MAPPER,
+            windows: None,
+            blocked: true,
+        }
     }
 
     #[kernel_symbols::export(
@@ -231,7 +273,7 @@ impl DmaContext {
             len,
             direction,
         };
-        let dma_addr = self.mapper.phys_to_dma(region, self.constraints)?;
+        let dma_addr = self.map_region(region)?;
         Some(DmaBorrowedMapping {
             dma_addr,
             sync: self.sync_handle(region),
@@ -243,6 +285,22 @@ impl DmaContext {
             mapper: self.mapper,
             region,
         }
+    }
+
+    fn map_region(self, region: DmaSyncRegion) -> Option<usize> {
+        if self.blocked {
+            return None;
+        }
+        if let Some(windows) = self.windows {
+            let dma_addr = windows
+                .iter()
+                .find_map(|window| window.translate(region.paddr, region.len))?;
+            return self
+                .constraints
+                .accepts_dma_addr(dma_addr, region.len)
+                .then_some(dma_addr);
+        }
+        self.mapper.phys_to_dma(region, self.constraints)
     }
 }
 
@@ -470,7 +528,7 @@ impl DmaBuffer {
             len: alloc_len,
             direction,
         };
-        let Some(dma_addr) = context.mapper.phys_to_dma(region, context.constraints()) else {
+        let Some(dma_addr) = context.map_region(region) else {
             let _ = KERNEL_ALLOCATOR.free_physical(allocation);
             return Err("DMA buffer is outside device DMA constraints");
         };
@@ -812,4 +870,54 @@ pub fn new_shared_netbuf_pool(
     direction: DmaDirection,
 ) -> Result<net::buf::SharedNetBufPool, &'static str> {
     new_netbuf_pool(context, count, size, align, direction).map(|owner| Arc::new(Mutex::new(owner)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static WINDOWS: [DmaWindow; 2] = [
+        DmaWindow {
+            cpu_start: 0x1000,
+            dma_start: 0x8000,
+            size: 0x100,
+        },
+        DmaWindow {
+            cpu_start: 0x3000,
+            dma_start: 0x20,
+            size: 0x80,
+        },
+    ];
+
+    fn constraints() -> DmaConstraints {
+        DmaConstraints {
+            address_mask: usize::MAX,
+            max_segment_size: usize::MAX,
+            max_segments: 1,
+            coherent: true,
+            supports_scatter_gather: false,
+            bounce: DmaBouncePolicy::Disabled,
+        }
+    }
+
+    fn region(paddr: usize, len: usize) -> DmaSyncRegion {
+        DmaSyncRegion {
+            paddr,
+            vaddr: 0,
+            len,
+            direction: DmaDirection::Bidirectional,
+        }
+    }
+
+    #[test]
+    fn windowed_and_blocked_contexts_never_fall_back_to_identity() {
+        let context = DmaContext::with_windows(constraints(), &WINDOWS);
+        assert_eq!(context.map_region(region(0x1020, 0x20)), Some(0x8020));
+        assert_eq!(context.map_region(region(0x3070, 0x10)), Some(0x90));
+        assert_eq!(context.map_region(region(0x10f0, 0x20)), None);
+        assert_eq!(context.map_region(region(0x2000, 0x10)), None);
+
+        let blocked = DmaContext::blocked(constraints());
+        assert_eq!(blocked.map_region(region(0x1000, 0x10)), None);
+    }
 }

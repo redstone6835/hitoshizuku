@@ -13,6 +13,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 
 use allocator::{KERNEL_ALLOCATOR, MemorySegment};
 use general::dev::block::BlockDevice;
+use general::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext, DmaWindow};
 use general::dev::enumerate::DEVICES;
 use general::dev::pci::pci_scan_and_register_summary;
 use general::dev::platform::{
@@ -447,18 +448,24 @@ pub fn kernel_start_init(context: &StartContext) {
         attached_platform_edges
     );
 
-    // 小步骤 5.3 然后尝试使用标准化后的 PCIe host bridge 描述完成 ECAM 安装、
-    // virtio-pci 驱动注册、BAR 分配以及总线扫描。
-    if let Some(host) = pcie_hosts.first() {
-        if pcie_hosts.len() > 1 {
-            printk!(
-                "[kernel-start][dtb] multiple pcie hosts found ({}); using first ECAM host {}",
-                pcie_hosts.len(),
-                host.path
-            );
-        }
+    // 小步骤 5.3 为每个标准化 PCIe host bridge 分别安装 ECAM/IRQ/MSI 路由、
+    // BAR 窗口并扫描其 segment。配置空间回调按 segment+bus-range 分派，多个 host
+    // 不会再互相覆盖全局 ECAM 状态。
+    if pcie_hosts.is_empty() {
+        printk!("[kernel-start][dtb] no pcie node in DTB; skipping PCI init");
+    }
+    for host in &pcie_hosts {
         let host_pnp = registered_platform_node(&registered_platform_nodes, &host.path);
-        pci::register_pci_host_bridge(host, host_pnp);
+        if !pci::register_pci_host_bridge(host, host_pnp) {
+            printk!(
+                "[kernel-start][dtb] skipping unusable PCI host {} domain={} bus=[{:#x},{:#x}]",
+                host.path,
+                host.domain,
+                host.bus_start,
+                host.bus_end
+            );
+            continue;
+        }
         printk!(
             "[kernel-start][dtb] pcie ECAM {} domain={} phys={:#x} size={:#x} bus=[{:#x},{:#x}] ranges={} msi-map={} msi-parent={} dma-coherent={}",
             host.path,
@@ -472,17 +479,29 @@ pub fn kernel_start_init(context: &StartContext) {
             host.msi_parents.len(),
             host.dma_coherent as usize
         );
-        pci::install_ecam(
+        if !pci::install_ecam(
+            host.domain,
             host.ecam_phys as u64,
             host.ecam_size as u64,
             host.bus_start,
             host.bus_end,
             context.address.device_mmio_to_virt,
-        );
+        ) {
+            printk!(
+                "[kernel-start][dtb] rejected overlapping or unrepresentable PCI ECAM {}",
+                host.path
+            );
+            continue;
+        }
         if pci::install_irq_routing(host.domain, host) {
             printk!(
                 "[kernel-start][dtb] installed PCI IRQ routing: {} map entries",
-                host.interrupt_map.len()
+                pci::usable_irq_route_count(host)
+            );
+        } else if !host.interrupt_map.is_empty() {
+            printk!(
+                "[kernel-start][dtb] rejected PCI IRQ routing for {}: unsupported pass-thru or unresolved nexus",
+                host.path
             );
         }
         if pci::install_msi_routing(host.domain, host) {
@@ -496,15 +515,16 @@ pub fn kernel_start_init(context: &StartContext) {
 
         let summary = pci_scan_and_register_summary(host.domain, host.bus_start, host.bus_end);
         printk!(
-            "[kernel-start][dtb] pci scan registered={} bound={} no-driver={} deferred={} failed={}",
+            "[kernel-start][dtb] pci scan domain={} bus=[{:#x},{:#x}] registered={} bound={} no-driver={} deferred={} failed={}",
+            host.domain,
+            host.bus_start,
+            host.bus_end,
             summary.registered,
             summary.bound,
             summary.no_driver,
             summary.deferred,
             summary.failed
         );
-    } else {
-        printk!("[kernel-start][dtb] no pcie node in DTB; skipping PCI init");
     }
 
     // 小步骤 5.4 再决定根文件系统的来源。优先级是外部/内建 initramfs，其次才是
@@ -707,7 +727,39 @@ fn platform_device_info_from_dtb(
             stdout: first_phys == stdout_phys,
         },
         fw_properties,
+        dma: platform_dma_context(&device.bindings.effective_dma),
+        dtb_bindings: Some(device.bindings.clone()),
     }
+}
+
+fn platform_dma_context(dma: &firmware_dtb::DtbEffectiveDmaInfo) -> DmaContext {
+    let constraints = DmaConstraints {
+        address_mask: usize::MAX,
+        max_segment_size: usize::MAX,
+        max_segments: 1,
+        coherent: dma.coherent,
+        supports_scatter_gather: false,
+        bounce: DmaBouncePolicy::Disabled,
+    };
+    if dma.iommu_required || dma.unsupported {
+        return DmaContext::blocked(constraints);
+    }
+    let Some(windows) = dma.windows.as_ref() else {
+        return DmaContext::with_constraints(constraints);
+    };
+    if windows.is_empty() {
+        return DmaContext::with_constraints(constraints);
+    }
+    let windows: Vec<DmaWindow> = windows
+        .iter()
+        .map(|window| DmaWindow {
+            cpu_start: window.cpu_start,
+            dma_start: window.dma_start,
+            size: window.size,
+        })
+        .collect();
+    let windows: &'static [DmaWindow] = Box::leak(windows.into_boxed_slice());
+    DmaContext::with_windows(constraints, windows)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

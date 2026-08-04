@@ -4,26 +4,34 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use general::dev::dma::DmaWindow;
 use general::dev::irq::{self, IrqLine};
 use general::dev::msi;
 use general::dev::pci::{
     PCI_DEVICES_PER_BUS, PCI_EXTENDED_CONFIG_SPACE_SIZE, PCI_FUNCTIONS_PER_DEVICE, PciConfigAccess,
-    PciConfigError, PciDevice, PciHostAddressSpace, PciHostBridgeError, PciHostBridgeInfo,
-    PciHostBridgeWindow, pci_scan_raw, register_host_bridge, set_pci_config_access,
+    PciConfigError, PciDevice, PciFunctionDmaInfo, PciHostAddressSpace, PciHostBridgeError,
+    PciHostBridgeInfo, PciHostBridgeWindow, PciHostDmaInfo, PciRequesterIdMap,
+    PciRequesterIdMapEntry, pci_scan_raw, register_host_bridge, set_pci_config_access,
 };
 use general::dev::pnp::PnpDevice;
 use general::firmware::dtb::{DtbPciAddressSpace, DtbPciRangeInfo, DtbPcieHostInfo};
 use vfs::sync::Spinlock;
 
-/// ECAM 全局状态:base(虚拟地址)+ 总线范围。
-///
-/// `ECAM_VBASE == 0` 表示尚未初始化,config access 函数会安全地返回默认值。
-static ECAM_VBASE: AtomicU64 = AtomicU64::new(0);
-static ECAM_SIZE: AtomicU64 = AtomicU64::new(0);
-static BUS_START: AtomicU32 = AtomicU32::new(0);
-static BUS_END: AtomicU32 = AtomicU32::new(0);
+/// 一段按 PCI segment 与 bus-range 索引的 ECAM 窗口。
+#[derive(Clone, Copy)]
+struct PciEcamRegion {
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
+    vbase: usize,
+    size: usize,
+}
+
+/// DT 可以描述多个互不重叠的 host bridge；配置空间回调必须按每次访问携带的
+/// segment/bus 选择 ECAM，而不能让后安装的 host 覆盖前一个全局 base。
+static PCI_ECAM_REGIONS: Spinlock<Vec<PciEcamRegion>> = Spinlock::new(Vec::new());
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 struct PciIrqRoute {
@@ -42,7 +50,7 @@ struct PciIrqRouting {
     routes: Vec<PciIrqRoute>,
 }
 
-static PCI_IRQ_ROUTING: Spinlock<Option<PciIrqRouting>> = Spinlock::new(None);
+static PCI_IRQ_ROUTING: Spinlock<Vec<PciIrqRouting>> = Spinlock::new(Vec::new());
 
 enum PciMsiRoute {
     Mapped {
@@ -64,10 +72,14 @@ struct PciMsiRouting {
     routes: Vec<PciMsiRoute>,
 }
 
-static PCI_MSI_ROUTING: Spinlock<Option<PciMsiRouting>> = Spinlock::new(None);
+static PCI_MSI_ROUTING: Spinlock<Vec<PciMsiRouting>> = Spinlock::new(Vec::new());
 
-pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<PnpDevice>>) {
+pub(crate) fn register_pci_host_bridge(
+    host: &DtbPcieHostInfo,
+    pnp: Option<Arc<PnpDevice>>,
+) -> bool {
     let msi_route_count = msi_route_count(host);
+    let irq_route_count = usable_irq_route_count(host);
     let info = PciHostBridgeInfo {
         name: host.name.clone(),
         firmware_path: Some(host.path.clone()),
@@ -76,29 +88,121 @@ pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<P
         bus_end: host.bus_end,
         ecam_phys: host.ecam_phys,
         ecam_size: host.ecam_size,
-        dma_coherent: host.dma_coherent,
+        dma_coherent: host.effective_dma.coherent,
+        dma: pci_host_dma_info(host),
         windows: host.ranges.iter().map(pci_host_window).collect(),
-        irq_route_count: host.interrupt_map.len(),
+        irq_route_count,
         msi_route_count,
     };
     match register_host_bridge(info, pnp) {
-        Ok(handle) => log::printk!(
-            "[kernel-start][dtb] registered PCI host bridge {} handle={} windows={} irq-routes={} msi-routes={}",
-            host.path,
-            handle.id(),
-            host.ranges.len(),
-            host.interrupt_map.len(),
-            msi_route_count
-        ),
-        Err(PciHostBridgeError::AlreadyRegistered) => log::debug!(
-            "[kernel-start][dtb] PCI host bridge domain {} already registered",
-            host.domain
-        ),
-        Err(err) => log::printk!(
-            "[kernel-start][dtb] failed to register PCI host bridge {}: {:?}",
-            host.path,
-            err
-        ),
+        Ok(handle) => {
+            log::printk!(
+                "[kernel-start][dtb] registered PCI host bridge {} handle={} windows={} irq-routes={} msi-routes={}",
+                host.path,
+                handle.id(),
+                host.ranges.len(),
+                irq_route_count,
+                msi_route_count
+            );
+            true
+        }
+        Err(PciHostBridgeError::AlreadyRegistered) => {
+            log::printk!(
+                "[kernel-start][dtb] PCI host bridge domain {} bus=[{:#x},{:#x}] already registered",
+                host.domain,
+                host.bus_start,
+                host.bus_end
+            );
+            false
+        }
+        Err(err) => {
+            log::printk!(
+                "[kernel-start][dtb] failed to register PCI host bridge {}: {:?}",
+                host.path,
+                err
+            );
+            false
+        }
+    }
+}
+
+fn pci_host_dma_info(host: &DtbPcieHostInfo) -> PciHostDmaInfo {
+    let windows = host.effective_dma.windows.as_ref().map(|windows| {
+        windows
+            .iter()
+            .map(|window| DmaWindow {
+                cpu_start: window.cpu_start,
+                dma_start: window.dma_start,
+                size: window.size,
+            })
+            .collect()
+    });
+    let unsupported = host.effective_dma.unsupported || host.effective_dma.iommu_required;
+    let iommu_map = host.iommu_map.as_ref().and_then(|map| {
+        let entries = map
+            .entries
+            .iter()
+            .filter(|entry| entry.provider_available)
+            .map(|entry| PciRequesterIdMapEntry {
+                input_base: entry.input_base,
+                provider_path: entry.provider_path.clone(),
+                provider_phandle: entry.provider_phandle,
+                output_base: entry.output_base.clone(),
+                length: entry.length,
+            })
+            .collect::<Vec<_>>();
+        (!entries.is_empty()).then_some(PciRequesterIdMap {
+            mask: map.mask,
+            entries,
+        })
+    });
+    let functions = host
+        .children
+        .iter()
+        .map(|child| {
+            let child_windows = child
+                .bindings
+                .effective_dma
+                .windows
+                .as_ref()
+                .map(|windows| {
+                    windows
+                        .iter()
+                        .map(|window| DmaWindow {
+                            cpu_start: window.cpu_start,
+                            dma_start: window.dma_start,
+                            size: window.size,
+                        })
+                        .collect()
+                });
+            let iommu_providers = child
+                .bindings
+                .references
+                .iter()
+                .filter(|reference| {
+                    reference.property.as_ref() == "iommus"
+                        && reference.provider_available == Some(true)
+                })
+                .filter_map(|reference| reference.provider_path.clone())
+                .collect();
+            PciFunctionDmaInfo {
+                firmware_path: child.path.clone(),
+                bus: child.bus,
+                device: child.device,
+                function: child.function,
+                coherent: child.bindings.effective_dma.coherent,
+                windows: child_windows,
+                iommu_providers,
+                unsupported: child.bindings.effective_dma.unsupported
+                    || child.bindings.effective_dma.iommu_required,
+            }
+        })
+        .collect();
+    PciHostDmaInfo {
+        windows,
+        iommu_map,
+        unsupported,
+        functions,
     }
 }
 
@@ -121,87 +225,91 @@ fn pci_host_window(range: &DtbPciRangeInfo) -> PciHostBridgeWindow {
 /// 未安装 ECAM 与 BDF/offset 越界属于不同错误：前者表示平台初始化顺序错误，
 /// 后者表示调用方访问了当前 host bridge 不覆盖的 function 或寄存器。
 #[inline]
-fn ecam_addr(bus: u8, device: u8, function: u8, offset: u16) -> Result<usize, PciConfigError> {
-    let base = ECAM_VBASE.load(Ordering::Acquire);
-    if base == 0 {
-        return Err(PciConfigError::Uninitialized);
-    }
-    let size = ECAM_SIZE.load(Ordering::Acquire);
-    let start = BUS_START.load(Ordering::Acquire) as u8;
-    let end = BUS_END.load(Ordering::Acquire) as u8;
-    if bus < start
-        || bus > end
-        || device >= PCI_DEVICES_PER_BUS
+fn ecam_addr(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Result<usize, PciConfigError> {
+    if device >= PCI_DEVICES_PER_BUS
         || function >= PCI_FUNCTIONS_PER_DEVICE
         || offset >= PCI_EXTENDED_CONFIG_SPACE_SIZE
     {
         return Err(PciConfigError::InvalidOffset);
     }
-    let rel_bus = (bus - start) as u64;
-    let off = (rel_bus << 20) | ((device as u64) << 15) | ((function as u64) << 12) | offset as u64;
-    if off >= size {
+    let regions = PCI_ECAM_REGIONS.lock();
+    if regions.is_empty() {
+        return Err(PciConfigError::Uninitialized);
+    }
+    let region = regions
+        .iter()
+        .copied()
+        .find(|region| {
+            region.segment == segment && bus >= region.bus_start && bus <= region.bus_end
+        })
+        .ok_or(PciConfigError::InvalidOffset)?;
+    drop(regions);
+
+    let rel_bus = usize::from(bus - region.bus_start);
+    let off = (rel_bus << 20)
+        | (usize::from(device) << 15)
+        | (usize::from(function) << 12)
+        | usize::from(offset);
+    if off >= region.size {
         return Err(PciConfigError::InvalidOffset);
     }
-    Ok((base + off) as usize)
+    region
+        .vbase
+        .checked_add(off)
+        .ok_or(PciConfigError::InvalidOffset)
 }
 
-fn ecam_read_u8(_seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u8, PciConfigError> {
-    let a = ecam_addr(bus, dev, func, offset)?;
+fn ecam_read_u8(seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u8, PciConfigError> {
+    let a = ecam_addr(seg, bus, dev, func, offset)?;
     Ok(unsafe { core::ptr::read_volatile(a as *const u8) })
 }
-fn ecam_read_u16(
-    _seg: u16,
-    bus: u8,
-    dev: u8,
-    func: u8,
-    offset: u16,
-) -> Result<u16, PciConfigError> {
-    let a = ecam_addr(bus, dev, func, offset)?;
+fn ecam_read_u16(seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u16, PciConfigError> {
+    let a = ecam_addr(seg, bus, dev, func, offset)?;
     Ok(unsafe { core::ptr::read_volatile(a as *const u16) })
 }
-fn ecam_read_u32(
-    _seg: u16,
-    bus: u8,
-    dev: u8,
-    func: u8,
-    offset: u16,
-) -> Result<u32, PciConfigError> {
-    let a = ecam_addr(bus, dev, func, offset)?;
+fn ecam_read_u32(seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u32, PciConfigError> {
+    let a = ecam_addr(seg, bus, dev, func, offset)?;
     Ok(unsafe { core::ptr::read_volatile(a as *const u32) })
 }
 fn ecam_write_u8(
-    _seg: u16,
+    seg: u16,
     bus: u8,
     dev: u8,
     func: u8,
     offset: u16,
     v: u8,
 ) -> Result<(), PciConfigError> {
-    let a = ecam_addr(bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset)?;
     unsafe { core::ptr::write_volatile(a as *mut u8, v) };
     Ok(())
 }
 fn ecam_write_u16(
-    _seg: u16,
+    seg: u16,
     bus: u8,
     dev: u8,
     func: u8,
     offset: u16,
     v: u16,
 ) -> Result<(), PciConfigError> {
-    let a = ecam_addr(bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset)?;
     unsafe { core::ptr::write_volatile(a as *mut u16, v) };
     Ok(())
 }
 fn ecam_write_u32(
-    _seg: u16,
+    seg: u16,
     bus: u8,
     dev: u8,
     func: u8,
     offset: u16,
     v: u32,
 ) -> Result<(), PciConfigError> {
-    let a = ecam_addr(bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset)?;
     unsafe { core::ptr::write_volatile(a as *mut u32, v) };
     Ok(())
 }
@@ -272,11 +380,10 @@ fn resolve_pci_irq(
     _interrupt_line: Option<u8>,
 ) -> Option<IrqLine> {
     let interrupt_pin = interrupt_pin?;
-    let routing = PCI_IRQ_ROUTING.lock();
-    let routing = routing.as_ref()?;
-    if segment != routing.segment || bus < routing.bus_start || bus > routing.bus_end {
-        return None;
-    }
+    let routings = PCI_IRQ_ROUTING.lock();
+    let routing = routings.iter().find(|routing| {
+        segment == routing.segment && bus >= routing.bus_start && bus <= routing.bus_end
+    })?;
     let key = pci_child_interrupt_key(
         bus,
         device,
@@ -297,11 +404,10 @@ fn pci_requester_id(bus: u8, device: u8, function: u8) -> u32 {
 }
 
 fn resolve_pci_msi(segment: u16, bus: u8, device: u8, function: u8) -> Option<msi::MsiHandle> {
-    let routing = PCI_MSI_ROUTING.lock();
-    let routing = routing.as_ref()?;
-    if segment != routing.segment || bus < routing.bus_start || bus > routing.bus_end {
-        return None;
-    }
+    let routings = PCI_MSI_ROUTING.lock();
+    let routing = routings.iter().find(|routing| {
+        segment == routing.segment && bus >= routing.bus_start && bus <= routing.bus_end
+    })?;
     let requester = pci_requester_id(bus, device, function);
     routing.routes.iter().find_map(|route| match route {
         PciMsiRoute::Mapped {
@@ -328,6 +434,8 @@ fn resolve_pci_msi(segment: u16, bus: u8, device: u8, function: u8) -> Option<ms
 }
 
 pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool {
+    // 重装或失败都只撤销同一 host 的旧表，不能影响其它 segment/bus-range。
+    remove_irq_routing(segment, host.bus_start, host.bus_end);
     let expected = match host.address_cells.checked_add(host.interrupt_cells) {
         Some(expected) if expected != 0 => expected,
         _ => return false,
@@ -338,13 +446,23 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
     if mask.len() != expected || host.interrupt_map.is_empty() {
         return false;
     }
+    if let Some(pass_thru) = host.interrupt_map_pass_thru.as_ref()
+        && (pass_thru.len() != expected || pass_thru.iter().any(|&cell| cell != 0))
+    {
+        // 当前 routing cache 只保存静态 parent specifier，不能在每个运行时 BDF
+        // 上重新合成 pass-thru 位；非零位必须拒绝，避免静默路由到错误 IRQ。
+        return false;
+    }
 
     let mut routes = Vec::new();
     for entry in &host.interrupt_map {
+        let Some(resolved) = entry.resolved.as_ref() else {
+            return false;
+        };
         if entry.child_address.len() != host.address_cells
             || entry.child_interrupt.len() != host.interrupt_cells
             || entry.child_address.len() + entry.child_interrupt.len() != expected
-            || entry.parent_specifier.is_empty()
+            || resolved.parent_specifier.is_empty()
         {
             return false;
         }
@@ -353,15 +471,15 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
         child_key.extend_from_slice(&entry.child_interrupt);
         routes.push(PciIrqRoute {
             child_key: child_key.into_boxed_slice(),
-            parent: entry.parent,
-            parent_specifier: entry.parent_specifier.clone(),
+            parent: resolved.parent,
+            parent_specifier: resolved.parent_specifier.clone(),
         });
     }
     if routes.is_empty() {
         return false;
     }
 
-    *PCI_IRQ_ROUTING.lock() = Some(PciIrqRouting {
+    PCI_IRQ_ROUTING.lock().push(PciIrqRouting {
         segment,
         bus_start: host.bus_start,
         bus_end: host.bus_end,
@@ -374,6 +492,7 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
 }
 
 pub(crate) fn install_msi_routing(segment: u16, host: &DtbPcieHostInfo) -> bool {
+    remove_msi_routing(segment, host.bus_start, host.bus_end);
     let mut routes = Vec::new();
     if host.msi_map_present {
         for entry in &host.msi_map {
@@ -402,7 +521,7 @@ pub(crate) fn install_msi_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
     if routes.is_empty() {
         return false;
     }
-    *PCI_MSI_ROUTING.lock() = Some(PciMsiRouting {
+    PCI_MSI_ROUTING.lock().push(PciMsiRouting {
         segment,
         bus_start: host.bus_start,
         bus_end: host.bus_end,
@@ -410,6 +529,29 @@ pub(crate) fn install_msi_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
         routes,
     });
     true
+}
+
+fn pci_bus_ranges_overlap(
+    first_start: u8,
+    first_end: u8,
+    second_start: u8,
+    second_end: u8,
+) -> bool {
+    first_start <= second_end && second_start <= first_end
+}
+
+fn remove_irq_routing(segment: u16, bus_start: u8, bus_end: u8) {
+    PCI_IRQ_ROUTING.lock().retain(|routing| {
+        routing.segment != segment
+            || !pci_bus_ranges_overlap(routing.bus_start, routing.bus_end, bus_start, bus_end)
+    });
+}
+
+fn remove_msi_routing(segment: u16, bus_start: u8, bus_end: u8) {
+    PCI_MSI_ROUTING.lock().retain(|routing| {
+        routing.segment != segment
+            || !pci_bus_ranges_overlap(routing.bus_start, routing.bus_end, bus_start, bus_end)
+    });
 }
 
 pub(crate) fn msi_route_count(host: &DtbPcieHostInfo) -> usize {
@@ -420,20 +562,64 @@ pub(crate) fn msi_route_count(host: &DtbPcieHostInfo) -> usize {
     }
 }
 
+pub(crate) fn usable_irq_route_count(host: &DtbPcieHostInfo) -> usize {
+    let pass_thru_supported = host
+        .interrupt_map_pass_thru
+        .as_ref()
+        .is_none_or(|pass_thru| pass_thru.iter().all(|&cell| cell == 0));
+    if !pass_thru_supported {
+        return 0;
+    }
+    host.interrupt_map
+        .iter()
+        .filter(|entry| entry.resolved.is_some())
+        .count()
+}
+
 /// 装载 ECAM 访问。`phys_base` 是物理地址,`device_mmio_to_virt` 负责转虚拟。
 /// 成功返回 `true`。重复调用会覆盖。
 pub(crate) fn install_ecam(
+    segment: u16,
     phys_base: u64,
     size: u64,
     bus_start: u8,
     bus_end: u8,
     device_mmio_to_virt: fn(usize) -> usize,
 ) -> bool {
-    let vbase = device_mmio_to_virt(phys_base as usize) as u64;
-    ECAM_VBASE.store(vbase, Ordering::Release);
-    ECAM_SIZE.store(size, Ordering::Release);
-    BUS_START.store(bus_start as u32, Ordering::Release);
-    BUS_END.store(bus_end as u32, Ordering::Release);
+    let Ok(phys_base) = usize::try_from(phys_base) else {
+        return false;
+    };
+    let Ok(size) = usize::try_from(size) else {
+        return false;
+    };
+    if size == 0 || bus_start > bus_end {
+        return false;
+    }
+    let vbase = device_mmio_to_virt(phys_base);
+    if vbase.checked_add(size - 1).is_none() {
+        return false;
+    }
+    let candidate = PciEcamRegion {
+        segment,
+        bus_start,
+        bus_end,
+        vbase,
+        size,
+    };
+    let mut regions = PCI_ECAM_REGIONS.lock();
+    if let Some(existing) = regions.iter_mut().find(|region| {
+        region.segment == segment
+            && pci_bus_ranges_overlap(region.bus_start, region.bus_end, bus_start, bus_end)
+    }) {
+        if existing.bus_start != bus_start || existing.bus_end != bus_end {
+            return false;
+        }
+        *existing = candidate;
+    } else {
+        regions.push(candidate);
+    }
+    drop(regions);
+
     DEVICE_MMIO_TO_VIRT.store(device_mmio_to_virt as usize, Ordering::Release);
     if !INITIALIZED.swap(true, Ordering::AcqRel) {
         set_pci_config_access(PciConfigAccess {
