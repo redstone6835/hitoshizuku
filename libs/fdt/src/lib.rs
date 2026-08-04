@@ -26,6 +26,12 @@ mod memory;
 mod msi;
 
 #[cfg(feature = "alloc")]
+mod owned;
+
+#[cfg(feature = "alloc")]
+mod overlay;
+
+#[cfg(feature = "alloc")]
 mod pci;
 
 #[cfg(feature = "alloc")]
@@ -55,6 +61,12 @@ pub use memory::{
 
 #[cfg(feature = "alloc")]
 pub use msi::{MsiError, MsiParent};
+
+#[cfg(feature = "alloc")]
+pub use owned::{OwnedNode, OwnedProperty, OwnedTree, OwnedTreeError};
+
+#[cfg(feature = "alloc")]
+pub use overlay::OverlayError;
 
 #[cfg(feature = "alloc")]
 pub use pci::{

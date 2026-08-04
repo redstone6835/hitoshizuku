@@ -394,6 +394,189 @@ fn parse_uses_declared_total_size_only() {
     assert_eq!(Fdt::parse(&blob).unwrap().as_bytes().len(), declared);
 }
 
+#[cfg(feature = "alloc")]
+#[test]
+fn owned_tree_round_trips_legacy_input_as_canonical_v17() {
+    use crate::{OwnedNode, OwnedTree};
+
+    let blob = basic_blob(1);
+    let mut owned = OwnedTree::from_fdt(Fdt::parse(&blob).unwrap()).unwrap();
+    owned
+        .find_node_mut("/soc")
+        .unwrap()
+        .set_property("enabled", Vec::new());
+    let mut child = OwnedNode::new("device@10");
+    child.set_property("reg", cells(&[0x10, 0x20]));
+    owned.find_node_mut("/soc").unwrap().children.push(child);
+
+    let encoded = owned.to_dtb().unwrap();
+    let reparsed = Fdt::parse(&encoded).unwrap();
+    assert_eq!(reparsed.header().version, 17);
+    assert_eq!(
+        reparsed.reservations().collect::<Vec<_>>(),
+        owned.reservations
+    );
+    assert!(
+        reparsed
+            .find_node("/soc")
+            .unwrap()
+            .property("enabled")
+            .is_some()
+    );
+    assert_eq!(
+        reparsed
+            .find_node("/soc/device@10")
+            .unwrap()
+            .property("reg")
+            .unwrap()
+            .value(),
+        cells(&[0x10, 0x20])
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn dtc_overlay_applies_external_and_local_fixups_atomically() {
+    use crate::{OverlayError, OwnedTree};
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    if Command::new("dtc").arg("--version").output().is_err() {
+        return;
+    }
+    let compile = |source: &[u8]| {
+        let mut child = Command::new("dtc")
+            .args(["-q", "-@", "-I", "dts", "-O", "dtb", "-o", "-", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(source).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "dtc: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let base_blob = compile(
+        br#"/dts-v1/;
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    clock: clock@1000 {
+        compatible = "fixed-clock";
+        #clock-cells = <1>;
+        reg = <0x1000 0x100>;
+    };
+    target: bus@2000 {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges = <0 0x2000 0x100>;
+        status = "disabled";
+    };
+};
+"#,
+    );
+    let overlay_blob = compile(
+        br#"/dts-v1/;
+/plugin/;
+/ {
+    fragment@0 {
+        target = <&target>;
+        __overlay__ {
+            status = "okay";
+            newdev: device@10 {
+                reg = <0x10 0x10>;
+                clocks = <&clock 3>;
+            };
+            consumer@20 {
+                reg = <0x20 0x10>;
+                link = <&newdev>;
+            };
+        };
+    };
+};
+"#,
+    );
+
+    let mut base = OwnedTree::parse(&base_blob).unwrap();
+    base.apply_overlay(Fdt::parse(&overlay_blob).unwrap())
+        .unwrap();
+    let encoded = base.to_dtb().unwrap();
+    let parsed = Fdt::parse(&encoded).unwrap();
+    let clock_phandle = parsed
+        .find_node("/clock@1000")
+        .unwrap()
+        .property("phandle")
+        .unwrap()
+        .as_u32()
+        .unwrap();
+    let device = parsed.find_node("/bus@2000/device@10").unwrap();
+    let device_phandle = device.property("phandle").unwrap().as_u32().unwrap();
+    assert_eq!(
+        parsed
+            .find_node("/bus@2000")
+            .unwrap()
+            .property("status")
+            .unwrap()
+            .as_str(),
+        Ok("okay")
+    );
+    assert_eq!(
+        device
+            .property("clocks")
+            .unwrap()
+            .cells()
+            .unwrap()
+            .collect::<Vec<_>>(),
+        vec![clock_phandle, 3]
+    );
+    assert_eq!(
+        parsed
+            .find_node("/bus@2000/consumer@20")
+            .unwrap()
+            .property("link")
+            .unwrap()
+            .as_u32(),
+        Ok(device_phandle)
+    );
+    assert_eq!(
+        parsed
+            .find_node("/__symbols__")
+            .unwrap()
+            .property("newdev")
+            .unwrap()
+            .as_str(),
+        Ok("/bus@2000/device@10")
+    );
+
+    let bad_overlay = compile(
+        br#"/dts-v1/;
+/plugin/;
+/ {
+    fragment@0 {
+        target = <&missing_from_base>;
+        __overlay__ { marker; };
+    };
+};
+"#,
+    );
+    let mut unchanged = OwnedTree::parse(&base_blob).unwrap();
+    let snapshot = unchanged.clone();
+    assert!(matches!(
+        unchanged.apply_overlay(Fdt::parse(&bad_overlay).unwrap()),
+        Err(OverlayError::UnknownSymbol(_))
+    ));
+    assert_eq!(unchanged, snapshot);
+}
+
 #[test]
 fn rejects_header_and_version_errors() {
     assert!(matches!(
