@@ -20,6 +20,9 @@ mod property;
 mod interrupt;
 
 #[cfg(feature = "alloc")]
+mod graph;
+
+#[cfg(feature = "alloc")]
 mod memory;
 
 #[cfg(feature = "alloc")]
@@ -52,6 +55,9 @@ pub use property::{Cells, StringList, decode_cells};
 
 #[cfg(feature = "alloc")]
 pub use interrupt::{InterruptError, InterruptSpecifier};
+
+#[cfg(feature = "alloc")]
+pub use graph::{GraphEndpoint, GraphError};
 
 #[cfg(feature = "alloc")]
 pub use memory::{

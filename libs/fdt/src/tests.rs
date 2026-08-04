@@ -2353,6 +2353,48 @@ fn generic_iommu_map_is_atomic_and_variable_width() {
 
 #[cfg(feature = "alloc")]
 #[test]
+fn graph_binding_resolves_direct_and_ports_container_endpoints() {
+    use crate::Tree;
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("display");
+    builder.begin("ports");
+    builder.begin("port@1");
+    builder.property("reg", &cells(&[1]));
+    builder.begin("endpoint@2");
+    builder.property("reg", &cells(&[2]));
+    builder.property("phandle", &cells(&[10]));
+    builder.property("remote-endpoint", &cells(&[20]));
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    builder.begin("bridge");
+    builder.begin("port");
+    builder.begin("endpoint");
+    builder.property("phandle", &cells(&[20]));
+    builder.property("remote-endpoint", &cells(&[10]));
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let display = tree.find_node("/display").unwrap();
+    let bridge_endpoint = tree.find_node("/bridge/port/endpoint").unwrap();
+
+    let endpoints = tree.graph_endpoints(display).unwrap();
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0].port_id, Some(1));
+    assert_eq!(endpoints[0].endpoint_id, Some(2));
+    assert_eq!(endpoints[0].remote, Some(bridge_endpoint));
+    assert_eq!(endpoints[0].remote_phandle, Some(20));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
 fn pci_bindings_preserve_masks_widths_and_parent_identity() {
     use crate::{PciAddressSpace, Tree};
 

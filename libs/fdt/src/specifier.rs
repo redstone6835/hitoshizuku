@@ -4,7 +4,10 @@
 //! `phandle + provider #*-cells` 编码。这里提供一次完整校验、原子返回的公共
 //! 抽象；具体子系统只负责解释 `args` 的含义。
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::fmt;
 
 use crate::{NodeId, PropertyError, Tree};
@@ -42,34 +45,34 @@ pub enum SpecifierError {
     InvalidNode(NodeId),
     InvalidProperty {
         node: NodeId,
-        property: &'static str,
+        property: String,
         error: PropertyError,
     },
     UnknownPhandle {
         node: NodeId,
-        property: &'static str,
+        property: String,
         entry: usize,
         phandle: u32,
     },
     MissingProviderCells {
         provider: NodeId,
-        property: &'static str,
+        property: String,
     },
     CellCountOverflow {
         provider: NodeId,
-        property: &'static str,
+        property: String,
         count: u32,
     },
     IncompleteEntry {
         node: NodeId,
-        property: &'static str,
+        property: String,
         entry: usize,
         remaining_cells: usize,
         required_cells: usize,
     },
     NameCountMismatch {
         node: NodeId,
-        property: &'static str,
+        property: String,
         names: usize,
         entries: usize,
     },
@@ -105,34 +108,34 @@ pub enum IdMapError {
     InvalidNode(NodeId),
     InvalidProperty {
         node: NodeId,
-        property: &'static str,
+        property: String,
         error: PropertyError,
     },
     UnknownPhandle {
         node: NodeId,
-        property: &'static str,
+        property: String,
         entry: usize,
         phandle: u32,
     },
     MissingProviderCells {
         provider: NodeId,
-        property: &'static str,
+        property: String,
     },
     CellCountOverflow {
         provider: NodeId,
-        property: &'static str,
+        property: String,
         count: u32,
     },
     IncompleteEntry {
         node: NodeId,
-        property: &'static str,
+        property: String,
         entry: usize,
         remaining_cells: usize,
         required_cells: usize,
     },
     InvalidRange {
         node: NodeId,
-        property: &'static str,
+        property: String,
         entry: usize,
         input_base: u32,
         length: u32,
@@ -151,8 +154,8 @@ impl Tree<'_> {
     pub fn phandle_array(
         &self,
         node: NodeId,
-        property: &'static str,
-        cells_property: &'static str,
+        property: &str,
+        cells_property: &str,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
         self.phandle_array_inner(node, property, cells_property, None)
     }
@@ -161,8 +164,8 @@ impl Tree<'_> {
     pub fn phandle_array_with_default(
         &self,
         node: NodeId,
-        property: &'static str,
-        cells_property: &'static str,
+        property: &str,
+        cells_property: &str,
         default_cells: u32,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
         self.phandle_array_inner(node, property, cells_property, Some(default_cells))
@@ -173,7 +176,7 @@ impl Tree<'_> {
     pub fn phandle_list(
         &self,
         node: NodeId,
-        property: &'static str,
+        property: &str,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
         self.phandle_array_inner(node, property, "", Some(0))
     }
@@ -182,9 +185,9 @@ impl Tree<'_> {
     pub fn named_phandle_array(
         &self,
         node: NodeId,
-        property: &'static str,
-        cells_property: &'static str,
-        names_property: &'static str,
+        property: &str,
+        cells_property: &str,
+        names_property: &str,
     ) -> Result<Option<Vec<NamedPhandleArgs>>, SpecifierError> {
         let Some(entries) = self.phandle_array(node, property, cells_property)? else {
             return Ok(None);
@@ -198,7 +201,7 @@ impl Tree<'_> {
                     .map(|names| names.map(String::from).collect::<Vec<_>>())
                     .map_err(|error| SpecifierError::InvalidProperty {
                         node,
-                        property: names_property,
+                        property: names_property.to_string(),
                         error,
                     })
             })
@@ -208,7 +211,7 @@ impl Tree<'_> {
         {
             return Err(SpecifierError::NameCountMismatch {
                 node,
-                property: names_property,
+                property: names_property.to_string(),
                 names: names.len(),
                 entries: entries.len(),
             });
@@ -278,11 +281,50 @@ impl Tree<'_> {
         self.phandle_array(node, "pwms", "#pwm-cells")
     }
 
+    /// `thermal-sensors`。
+    pub fn thermal_sensors(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        self.phandle_array(node, "thermal-sensors", "#thermal-sensor-cells")
+    }
+
+    /// `sound-dai`。
+    pub fn sound_dais(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        self.phandle_array(node, "sound-dai", "#sound-dai-cells")
+    }
+
+    /// `memory-region` phandle-only 列表。
+    pub fn memory_regions(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        self.phandle_list(node, "memory-region")
+    }
+
+    /// `nvmem-cells` phandle-only 列表。
+    pub fn nvmem_cells(&self, node: NodeId) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        self.phandle_list(node, "nvmem-cells")
+    }
+
+    /// `operating-points-v2` phandle-only 列表。
+    pub fn operating_points(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        self.phandle_list(node, "operating-points-v2")
+    }
+
+    /// `interrupt-affinity` phandle-only 列表。
+    pub fn interrupt_affinity(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
+        self.phandle_list(node, "interrupt-affinity")
+    }
+
     /// 解码任意 `*-gpios` 属性。
     pub fn gpios(
         &self,
         node: NodeId,
-        property: &'static str,
+        property: &str,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
         self.phandle_array(node, property, "#gpio-cells")
     }
@@ -296,9 +338,9 @@ impl Tree<'_> {
     pub fn id_map(
         &self,
         node: NodeId,
-        map_property: &'static str,
-        cells_property: &'static str,
-        mask_property: &'static str,
+        map_property: &str,
+        cells_property: &str,
+        mask_property: &str,
         default_cells: Option<u32>,
     ) -> Result<Option<IdMap>, IdMapError> {
         let view = self.node(node).ok_or(IdMapError::InvalidNode(node))?;
@@ -310,7 +352,7 @@ impl Tree<'_> {
             .map(|cells| cells.collect::<Vec<_>>())
             .map_err(|error| IdMapError::InvalidProperty {
                 node,
-                property: map_property,
+                property: map_property.to_string(),
                 error,
             })?;
         let mask = match view.property(mask_property) {
@@ -319,7 +361,7 @@ impl Tree<'_> {
                 .as_u32()
                 .map_err(|error| IdMapError::InvalidProperty {
                     node,
-                    property: mask_property,
+                    property: mask_property.to_string(),
                     error,
                 })?,
         };
@@ -331,7 +373,7 @@ impl Tree<'_> {
             if values.len() - offset < 2 {
                 return Err(IdMapError::IncompleteEntry {
                     node,
-                    property: map_property,
+                    property: map_property.to_string(),
                     entry,
                     remaining_cells: values.len() - offset,
                     required_cells: 2,
@@ -344,7 +386,7 @@ impl Tree<'_> {
                 .node_by_phandle(phandle)
                 .ok_or(IdMapError::UnknownPhandle {
                     node,
-                    property: map_property,
+                    property: map_property.to_string(),
                     entry,
                     phandle,
                 })?;
@@ -353,7 +395,7 @@ impl Tree<'_> {
             if values.len() - offset < required {
                 return Err(IdMapError::IncompleteEntry {
                     node,
-                    property: map_property,
+                    property: map_property.to_string(),
                     entry,
                     remaining_cells: values.len() - offset,
                     required_cells: required,
@@ -369,7 +411,7 @@ impl Tree<'_> {
             {
                 return Err(IdMapError::InvalidRange {
                     node,
-                    property: map_property,
+                    property: map_property.to_string(),
                     entry,
                     input_base,
                     length,
@@ -390,8 +432,8 @@ impl Tree<'_> {
     fn phandle_array_inner(
         &self,
         node: NodeId,
-        property_name: &'static str,
-        cells_property: &'static str,
+        property_name: &str,
+        cells_property: &str,
         default_cells: Option<u32>,
     ) -> Result<Option<Vec<PhandleArgs>>, SpecifierError> {
         let view = self.node(node).ok_or(SpecifierError::InvalidNode(node))?;
@@ -403,7 +445,7 @@ impl Tree<'_> {
             .map(|cells| cells.collect::<Vec<_>>())
             .map_err(|error| SpecifierError::InvalidProperty {
                 node,
-                property: property_name,
+                property: property_name.to_string(),
                 error,
             })?;
         let mut entries = Vec::new();
@@ -425,7 +467,7 @@ impl Tree<'_> {
                 .node_by_phandle(phandle)
                 .ok_or(SpecifierError::UnknownPhandle {
                     node,
-                    property: property_name,
+                    property: property_name.to_string(),
                     entry,
                     phandle,
                 })?;
@@ -433,7 +475,7 @@ impl Tree<'_> {
             if values.len() - offset < cells {
                 return Err(SpecifierError::IncompleteEntry {
                     node,
-                    property: property_name,
+                    property: property_name.to_string(),
                     entry,
                     remaining_cells: values.len() - offset,
                     required_cells: cells,
@@ -454,7 +496,7 @@ impl Tree<'_> {
 fn provider_cells(
     tree: &Tree<'_>,
     provider: NodeId,
-    property_name: &'static str,
+    property_name: &str,
     default: Option<u32>,
 ) -> Result<usize, SpecifierError> {
     let view = tree
@@ -465,17 +507,17 @@ fn provider_cells(
             .as_u32()
             .map_err(|error| SpecifierError::InvalidProperty {
                 node: provider,
-                property: property_name,
+                property: property_name.to_string(),
                 error,
             })?,
         None => default.ok_or(SpecifierError::MissingProviderCells {
             provider,
-            property: property_name,
+            property: property_name.to_string(),
         })?,
     };
     usize::try_from(count).map_err(|_| SpecifierError::CellCountOverflow {
         provider,
-        property: property_name,
+        property: property_name.to_string(),
         count,
     })
 }
@@ -483,7 +525,7 @@ fn provider_cells(
 fn provider_cells_id_map(
     tree: &Tree<'_>,
     provider: NodeId,
-    property_name: &'static str,
+    property_name: &str,
     default: Option<u32>,
 ) -> Result<usize, IdMapError> {
     let view = tree
@@ -494,17 +536,17 @@ fn provider_cells_id_map(
             .as_u32()
             .map_err(|error| IdMapError::InvalidProperty {
                 node: provider,
-                property: property_name,
+                property: property_name.to_string(),
                 error,
             })?,
         None => default.ok_or(IdMapError::MissingProviderCells {
             provider,
-            property: property_name,
+            property: property_name.to_string(),
         })?,
     };
     usize::try_from(count).map_err(|_| IdMapError::CellCountOverflow {
         provider,
-        property: property_name,
+        property: property_name.to_string(),
         count,
     })
 }
