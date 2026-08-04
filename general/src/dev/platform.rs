@@ -210,19 +210,128 @@ pub struct DeviceProperties {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FirmwarePropertyValue {
-    Bool,
-    U32(u32),
-    U32List(Box<[u32]>),
-    StringList(Box<[Box<str>]>),
-    Bytes(Box<[u8]>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirmwareProperty {
     pub name: Box<str>,
-    pub value: FirmwarePropertyValue,
+    /// 固件属性的权威原始值。任何 typed view 都只能从这里派生，不能替代它。
+    raw_value: Box<[u8]>,
 }
+
+impl FirmwareProperty {
+    /// 保存完整固件属性。typed view 在调用方按 binding 请求时无分配解码。
+    pub fn new(name: Box<str>, raw_value: Box<[u8]>) -> Self {
+        Self { name, raw_value }
+    }
+
+    pub fn raw_value(&self) -> &[u8] {
+        &self.raw_value
+    }
+
+    pub fn as_bool(&self) -> bool {
+        self.raw_value.is_empty()
+    }
+
+    pub fn as_u32(&self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.raw_value.as_ref().try_into().ok()?))
+    }
+
+    pub fn as_u32_list(&self) -> Option<FirmwareU32List<'_>> {
+        FirmwareU32List::new(&self.raw_value)
+    }
+
+    pub fn as_string_list(&self) -> Option<FirmwareStringList<'_>> {
+        FirmwareStringList::new(&self.raw_value)
+    }
+}
+
+/// 大端 32-bit cell 列表的无分配借用视图。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareU32List<'a> {
+    raw: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> FirmwareU32List<'a> {
+    fn new(raw: &'a [u8]) -> Option<Self> {
+        raw.len()
+            .is_multiple_of(4)
+            .then_some(Self { raw, cursor: 0 })
+    }
+
+    pub fn get(self, index: usize) -> Option<u32> {
+        self.into_iter().nth(index)
+    }
+}
+
+impl Iterator for FirmwareU32List<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let end = self.cursor.checked_add(4)?;
+        let cell: [u8; 4] = self.raw.get(self.cursor..end)?.try_into().ok()?;
+        self.cursor = end;
+        Some(u32::from_be_bytes(cell))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.raw.len() - self.cursor) / 4;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for FirmwareU32List<'_> {}
+impl core::iter::FusedIterator for FirmwareU32List<'_> {}
+
+/// NUL 分隔 UTF-8 字符串列表的无分配借用视图。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareStringList<'a> {
+    raw: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> FirmwareStringList<'a> {
+    fn new(raw: &'a [u8]) -> Option<Self> {
+        if !raw.is_empty() && raw.last() != Some(&0) {
+            return None;
+        }
+        let mut cursor = 0;
+        while cursor < raw.len() {
+            let relative_end = raw[cursor..].iter().position(|&byte| byte == 0)?;
+            core::str::from_utf8(&raw[cursor..cursor + relative_end]).ok()?;
+            cursor += relative_end + 1;
+        }
+        Some(Self { raw, cursor: 0 })
+    }
+
+    pub fn get(self, index: usize) -> Option<&'a str> {
+        self.into_iter().nth(index)
+    }
+}
+
+impl<'a> Iterator for FirmwareStringList<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor == self.raw.len() {
+            return None;
+        }
+        let relative_end = self.raw[self.cursor..].iter().position(|&byte| byte == 0)?;
+        let value =
+            core::str::from_utf8(&self.raw[self.cursor..self.cursor + relative_end]).ok()?;
+        self.cursor += relative_end + 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.raw[self.cursor..]
+            .iter()
+            .filter(|&&byte| byte == 0)
+            .count();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for FirmwareStringList<'_> {}
+impl core::iter::FusedIterator for FirmwareStringList<'_> {}
 
 #[derive(Debug)]
 pub struct PlatformDeviceInfo {
@@ -444,13 +553,7 @@ impl PlatformDeviceInfo {
         self.fw_properties
             .iter()
             .find(|property| property.name.as_ref() == name)
-            .and_then(|property| match property.value {
-                FirmwarePropertyValue::U32(value) => Some(value),
-                FirmwarePropertyValue::Bool
-                | FirmwarePropertyValue::U32List(_)
-                | FirmwarePropertyValue::StringList(_)
-                | FirmwarePropertyValue::Bytes(_) => None,
-            })
+            .and_then(FirmwareProperty::as_u32)
     }
 
     #[kernel_symbols::export(
@@ -459,17 +562,11 @@ impl PlatformDeviceInfo {
         version = 1,
         capabilities = kernel_symbols::capability::DEVICE_RESOURCE
     )]
-    pub fn u32_list_property(&self, name: &str) -> Option<&[u32]> {
+    pub fn u32_list_property(&self, name: &str) -> Option<FirmwareU32List<'_>> {
         self.fw_properties
             .iter()
             .find(|property| property.name.as_ref() == name)
-            .and_then(|property| match &property.value {
-                FirmwarePropertyValue::U32List(values) => Some(values.as_ref()),
-                FirmwarePropertyValue::Bool
-                | FirmwarePropertyValue::U32(_)
-                | FirmwarePropertyValue::StringList(_)
-                | FirmwarePropertyValue::Bytes(_) => None,
-            })
+            .and_then(FirmwareProperty::as_u32_list)
     }
 
     #[kernel_symbols::export(
@@ -479,9 +576,9 @@ impl PlatformDeviceInfo {
         capabilities = kernel_symbols::capability::DEVICE_RESOURCE
     )]
     pub fn bool_property(&self, name: &str) -> bool {
-        self.fw_properties.iter().any(|property| {
-            property.name.as_ref() == name && matches!(property.value, FirmwarePropertyValue::Bool)
-        })
+        self.fw_properties
+            .iter()
+            .any(|property| property.name.as_ref() == name && property.as_bool())
     }
 
     #[kernel_symbols::export(
@@ -490,17 +587,11 @@ impl PlatformDeviceInfo {
         version = 1,
         capabilities = kernel_symbols::capability::DEVICE_RESOURCE
     )]
-    pub fn string_list_property(&self, name: &str) -> Option<&[Box<str>]> {
+    pub fn string_list_property(&self, name: &str) -> Option<FirmwareStringList<'_>> {
         self.fw_properties
             .iter()
             .find(|property| property.name.as_ref() == name)
-            .and_then(|property| match &property.value {
-                FirmwarePropertyValue::StringList(values) => Some(values.as_ref()),
-                FirmwarePropertyValue::Bool
-                | FirmwarePropertyValue::U32(_)
-                | FirmwarePropertyValue::U32List(_)
-                | FirmwarePropertyValue::Bytes(_) => None,
-            })
+            .and_then(FirmwareProperty::as_string_list)
     }
 
     #[kernel_symbols::export(
@@ -513,13 +604,7 @@ impl PlatformDeviceInfo {
         self.fw_properties
             .iter()
             .find(|property| property.name.as_ref() == name)
-            .and_then(|property| match &property.value {
-                FirmwarePropertyValue::Bytes(values) => Some(values.as_ref()),
-                FirmwarePropertyValue::Bool
-                | FirmwarePropertyValue::U32(_)
-                | FirmwarePropertyValue::U32List(_)
-                | FirmwarePropertyValue::StringList(_) => None,
-            })
+            .map(FirmwareProperty::raw_value)
     }
 
     #[kernel_symbols::export(
@@ -529,19 +614,17 @@ impl PlatformDeviceInfo {
         capabilities = kernel_symbols::capability::DEVICE_RESOURCE
     )]
     pub fn mmio_by_name(&self, names: &[&str]) -> Option<(usize, usize)> {
-        let reg_names = self.string_list_property("reg-names")?;
-        let mut mmio_index = 0usize;
+        let mut reg_names = self.string_list_property("reg-names")?;
         for resource in &self.resources {
             let DeviceResource::Mmio { phys, size } = resource else {
                 continue;
             };
             let matched = reg_names
-                .get(mmio_index)
-                .is_some_and(|reg_name| names.iter().any(|name| reg_name.as_ref() == *name));
+                .next()
+                .is_some_and(|reg_name| names.contains(&reg_name));
             if matched {
                 return Some((*phys, *size));
             }
-            mmio_index += 1;
         }
         None
     }
@@ -616,6 +699,89 @@ pub enum PlatformProbeStatus {
 impl PlatformRegistration {
     pub const fn bound(&self) -> bool {
         matches!(self.status, PlatformProbeStatus::Bound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn firmware_properties_keep_raw_values_and_decode_by_requested_binding() {
+        let info = platform_info(vec![
+            firmware_property("cell", &0x1234_5678u32.to_be_bytes()),
+            firmware_property("strings", b"ns16550a\0uart\0"),
+            firmware_property("opaque", &[0xaa, 0xbb, 0xcc]),
+            firmware_property("flag", &[]),
+        ]);
+
+        assert_eq!(
+            info.bytes_property("cell"),
+            Some(0x1234_5678u32.to_be_bytes().as_slice())
+        );
+        assert_eq!(info.u32_property("cell"), Some(0x1234_5678));
+        assert_eq!(
+            info.u32_list_property("cell")
+                .map(|values| values.collect::<Vec<_>>()),
+            Some(vec![0x1234_5678])
+        );
+
+        assert_eq!(
+            info.bytes_property("strings"),
+            Some(b"ns16550a\0uart\0".as_slice())
+        );
+        let strings = info
+            .string_list_property("strings")
+            .expect("NUL 结尾的合法字符串列表应可显式解码");
+        assert_eq!(strings.len(), 2);
+        assert_eq!(strings.get(0), Some("ns16550a"));
+        assert_eq!(strings.get(1), Some("uart"));
+
+        assert_eq!(
+            info.bytes_property("opaque"),
+            Some([0xaa, 0xbb, 0xcc].as_slice())
+        );
+        assert_eq!(info.u32_property("opaque"), None);
+        assert_eq!(info.u32_list_property("opaque"), None);
+
+        assert_eq!(info.bytes_property("flag"), Some([].as_slice()));
+        assert!(info.bool_property("flag"));
+        assert_eq!(info.u32_property("flag"), None);
+        assert_eq!(info.u32_list_property("flag").map(Iterator::count), Some(0));
+        assert_eq!(
+            info.string_list_property("flag").map(Iterator::count),
+            Some(0)
+        );
+        assert!(!info.bool_property("cell"));
+    }
+
+    #[test]
+    fn large_zero_property_keeps_constant_size_borrowed_views() {
+        let raw = vec![0; 1024 * 1024].into_boxed_slice();
+        let property = FirmwareProperty::new("large".into(), raw);
+
+        assert_eq!(property.raw_value().len(), 1024 * 1024);
+        assert_eq!(property.as_u32_list().unwrap().len(), 256 * 1024);
+        assert_eq!(property.as_string_list().unwrap().len(), 1024 * 1024);
+        assert!(core::mem::size_of::<FirmwareProperty>() <= 4 * core::mem::size_of::<usize>());
+    }
+
+    fn firmware_property(name: &str, raw_value: &[u8]) -> FirmwareProperty {
+        FirmwareProperty::new(name.into(), raw_value.into())
+    }
+
+    fn platform_info(fw_properties: Vec<FirmwareProperty>) -> PlatformDeviceInfo {
+        PlatformDeviceInfo {
+            fw_name: "test".into(),
+            fw_path: None,
+            fw_parent_path: None,
+            ids: Vec::new(),
+            resources: Vec::new(),
+            properties: DeviceProperties::default(),
+            fw_properties,
+        }
     }
 }
 

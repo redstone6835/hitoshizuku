@@ -44,26 +44,33 @@ struct PciIrqRouting {
 
 static PCI_IRQ_ROUTING: Spinlock<Option<PciIrqRouting>> = Spinlock::new(None);
 
-struct PciMsiRoute {
-    requester_base: u32,
-    controller: u32,
-    msi_base: u32,
-    length: u32,
+enum PciMsiRoute {
+    Mapped {
+        requester_base: u32,
+        controller: u32,
+        msi_specifier: Box<[u32]>,
+        length: u32,
+    },
+    Identity {
+        controller: u32,
+    },
 }
 
 struct PciMsiRouting {
     segment: u16,
     bus_start: u8,
     bus_end: u8,
+    mask: u32,
     routes: Vec<PciMsiRoute>,
 }
 
 static PCI_MSI_ROUTING: Spinlock<Option<PciMsiRouting>> = Spinlock::new(None);
 
 pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<PnpDevice>>) {
+    let msi_route_count = msi_route_count(host);
     let info = PciHostBridgeInfo {
-        name: host.name.into(),
-        firmware_path: Some(host.path.into()),
+        name: host.name.clone(),
+        firmware_path: Some(host.path.clone()),
         domain: host.domain,
         bus_start: host.bus_start,
         bus_end: host.bus_end,
@@ -72,7 +79,7 @@ pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<P
         dma_coherent: host.dma_coherent,
         windows: host.ranges.iter().map(pci_host_window).collect(),
         irq_route_count: host.interrupt_map.len(),
-        msi_route_count: host.msi_map.len(),
+        msi_route_count,
     };
     match register_host_bridge(info, pnp) {
         Ok(handle) => log::printk!(
@@ -81,7 +88,7 @@ pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<P
             handle.id(),
             host.ranges.len(),
             host.interrupt_map.len(),
-            host.msi_map.len()
+            msi_route_count
         ),
         Err(PciHostBridgeError::AlreadyRegistered) => log::debug!(
             "[kernel-start][dtb] PCI host bridge domain {} already registered",
@@ -296,13 +303,27 @@ fn resolve_pci_msi(segment: u16, bus: u8, device: u8, function: u8) -> Option<ms
         return None;
     }
     let requester = pci_requester_id(bus, device, function);
-    routing.routes.iter().find_map(|route| {
-        let offset = requester.checked_sub(route.requester_base)?;
-        if offset >= route.length {
-            return None;
+    routing.routes.iter().find_map(|route| match route {
+        PciMsiRoute::Mapped {
+            requester_base,
+            controller,
+            msi_specifier,
+            length,
+        } => {
+            let offset = (requester & routing.mask).checked_sub(*requester_base)?;
+            if offset >= *length {
+                return None;
+            }
+            // 当前 MSI domain API 使用单个输出 ID；多 cell binding 已由 FDT 层
+            // 无损保留，但在 domain API 扩展前必须 fail closed，不能丢弃后续 cell。
+            let [msi_base] = msi_specifier.as_ref() else {
+                return None;
+            };
+            let mapped = msi_base.checked_add(offset)?;
+            msi::allocate_msi(*controller, mapped).ok()
         }
-        let mapped = route.msi_base.checked_add(offset)?;
-        msi::allocate_msi(route.controller, mapped).ok()
+        // Linux 把缺失或为零的 #msi-cells 定义为 requester ID 的 1:1 翻译。
+        PciMsiRoute::Identity { controller } => msi::allocate_msi(*controller, requester).ok(),
     })
 }
 
@@ -325,7 +346,7 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
             || entry.child_address.len() + entry.child_interrupt.len() != expected
             || entry.parent_specifier.is_empty()
         {
-            continue;
+            return false;
         }
         let mut child_key = Vec::new();
         child_key.extend_from_slice(&entry.child_address);
@@ -354,16 +375,29 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
 
 pub(crate) fn install_msi_routing(segment: u16, host: &DtbPcieHostInfo) -> bool {
     let mut routes = Vec::new();
-    for entry in &host.msi_map {
-        if entry.length == 0 {
-            continue;
+    if host.msi_map_present {
+        for entry in &host.msi_map {
+            if entry.length == 0 || entry.msi_specifier.is_empty() {
+                return false;
+            }
+            routes.push(PciMsiRoute::Mapped {
+                requester_base: entry.requester_base,
+                controller: entry.controller,
+                msi_specifier: entry.msi_specifier.clone(),
+                length: entry.length,
+            });
         }
-        routes.push(PciMsiRoute {
-            requester_base: entry.requester_base,
-            controller: entry.controller,
-            msi_base: entry.msi_base,
-            length: entry.length,
-        });
+    } else {
+        for parent in &host.msi_parents {
+            // PCI 只有零-cell msi-parent 定义了 RID 的 1:1 翻译。其它宽度需要
+            // 额外的总线关系 binding；在支持该 binding 前不能猜测或丢 cell。
+            if !parent.msi_specifier.is_empty() {
+                return false;
+            }
+            routes.push(PciMsiRoute::Identity {
+                controller: parent.controller,
+            });
+        }
     }
     if routes.is_empty() {
         return false;
@@ -372,9 +406,18 @@ pub(crate) fn install_msi_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
         segment,
         bus_start: host.bus_start,
         bus_end: host.bus_end,
+        mask: host.msi_map_mask,
         routes,
     });
     true
+}
+
+pub(crate) fn msi_route_count(host: &DtbPcieHostInfo) -> usize {
+    if host.msi_map_present {
+        host.msi_map.len()
+    } else {
+        host.msi_parents.len()
+    }
 }
 
 /// 装载 ECAM 访问。`phys_base` 是物理地址,`device_mmio_to_virt` 负责转虚拟。

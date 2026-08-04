@@ -15,6 +15,7 @@ performance-profile = ["dep:profiling"]
 general = { path = "../general" }
 allocator = { path = "../libs/allocator" }
 efi = { path = "../libs/efi" }
+fdt = { path = "../libs/fdt", features = ["alloc"] }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
 profiling = { path = "../libs/profiling", optional = true }

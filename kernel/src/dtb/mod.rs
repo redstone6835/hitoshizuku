@@ -3,19 +3,21 @@
 //! 本模块负责解析启动上下文中的 DTB，完成内存管理、设备发现与注册、
 //! 文件系统挂载以及控制台绑定等核心启动流程。
 //!
-//! 驱动对象采用静态生命周期，通过 `Box::leak` 分配，因为内核启动阶段
-//! 创建的资源将伴随系统整个生命周期，无需释放。
+//! 固件解析结果拥有路径与属性数据；设备模型在注册时接管或复制这些值，
+//! 不通过泄漏分配伪造静态生命周期。
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{Ordering, compiler_fence};
 
-use allocator::KERNEL_ALLOCATOR;
+use allocator::{KERNEL_ALLOCATOR, MemorySegment};
 use general::dev::block::BlockDevice;
 use general::dev::enumerate::DEVICES;
 use general::dev::pci::pci_scan_and_register_summary;
 use general::dev::platform::{
-    DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, FirmwarePropertyValue,
-    PlatformDeviceInfo, PlatformProbeStatus, register_and_probe_platform_device,
+    DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, PlatformDeviceInfo,
+    PlatformProbeStatus, register_and_probe_platform_device,
 };
 use general::dev::pnp::DevInitContext;
 use general::dev::pnp::PnpDevice;
@@ -29,7 +31,7 @@ use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
-use general::{StartContext, StartFirmware};
+use general::{StartBootProtocol, StartContext, StartFirmware, StartNoMapSupport, StartPhysRange};
 use log::printk;
 
 use crate::start;
@@ -61,14 +63,19 @@ pub fn kernel_start_init(context: &StartContext) {
             err
         )
     });
+    general::vfs::sysfs::install_device_tree(&dtb).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][dtb] failed to install /sys/firmware Device Tree view: {:?}",
+            err
+        )
+    });
     let firmware_dtb::DtbFirmwareInfo {
         root_compatible,
         cpu_count,
         cpus,
-        mut memory_segments,
-        reserved_segments,
+        memory,
         external_initramfs_range,
-        rng_seed,
+        mut rng_seed,
         stdout_serial,
         power_controls,
         serial_ports,
@@ -76,32 +83,172 @@ pub fn kernel_start_init(context: &StartContext) {
         pcie_hosts,
     } = firmware;
 
+    // 启动协议决定 RAM 的权威来源：UEFI 必须忽略 DT `/memory`，而直接启动
+    // 才使用 DT memory 节点并与架构加载器的白名单求交。chosen 的 kdump 限制
+    // 对两种来源都生效。
+    let boot_memory_segments = context.memory.boot_map.usable_segments();
+    let mut base_memory = if matches!(context.boot.protocol, StartBootProtocol::Efi) {
+        boot_memory_segments.unwrap_or_else(|| {
+            panic!("[kernel-start][dtb] UEFI DT boot requires a usable GetMemoryMap snapshot")
+        })
+    } else {
+        let described = firmware_dtb::described_memory_segments(&memory)
+            .unwrap_or_else(|err| panic!("[kernel-start][dtb] invalid DT memory range: {:?}", err));
+        if let Some(boot_segments) = boot_memory_segments {
+            if described.is_empty() {
+                panic!("[kernel-start][dtb] non-UEFI DT boot is missing usable /memory nodes");
+            }
+            start::intersect_memory_segments(&described, &boot_segments).unwrap_or_else(|| {
+                panic!(
+                    "[kernel-start][dtb] DTB memory description does not overlap usable boot memory"
+                )
+            })
+        } else if described.is_empty() {
+            panic!("[kernel-start][dtb] DT boot has neither /memory nor a UEFI memory map");
+        } else {
+            described
+        }
+    };
+    base_memory = firmware_dtb::apply_chosen_usable_ranges(base_memory, &memory)
+        .unwrap_or_else(|err| panic!("[kernel-start][dtb] invalid chosen memory limit: {:?}", err));
+    if base_memory.is_empty() {
+        panic!("[kernel-start][dtb] chosen memory limits leave no usable RAM");
+    }
+
+    // 动态 reserved-memory 必须在内核镜像和外部 initramfs 之后分配；否则一个
+    // 合法的 `size` 请求可能覆盖尚未交给 buddy 的启动对象。
+    let kernel_image = context.memory.kernel_image;
+    let mut kernel_reserved = Vec::new();
+    let mut additional_reserved = Vec::new();
+    let kernel_segment = MemorySegment {
+        start: kernel_image.start,
+        size: kernel_image.end - kernel_image.start,
+    };
+    kernel_reserved.push((kernel_image.start, kernel_image.end));
+    additional_reserved.push(kernel_segment);
+    if let Some((start, end)) = external_initramfs_range {
+        if end <= start {
+            panic!("[kernel-start][dtb] invalid external initramfs range");
+        }
+        kernel_reserved.push((start, end));
+        additional_reserved.push(MemorySegment {
+            start,
+            size: end - start,
+        });
+        printk!(
+            "[kernel-start][dtb] external initramfs reserved: phys={:#x}..{:#x} ({} bytes)",
+            start,
+            end,
+            end - start
+        );
+    }
+
+    let mut memory_layout =
+        firmware_dtb::resolve_memory_layout(&memory, base_memory, &additional_reserved)
+            .unwrap_or_else(|err| panic!("[kernel-start][dtb] invalid memory layout: {:?}", err));
+    let no_map_support = context.allocator.map(|ops| ops.no_map);
+    if let Some(granule) = no_map_support.and_then(StartNoMapSupport::granule) {
+        firmware_dtb::apply_no_map_granule(&mut memory_layout, granule, &additional_reserved)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "[kernel-start][dtb] no-map cannot be enforced at architecture granule: {:?}",
+                    err
+                )
+            });
+    }
+    let firmware_dtb::DtbMemoryLayout {
+        usable_segments: memory_segments,
+        reserved_segments,
+        reserved_memory,
+        no_map_segments,
+    } = memory_layout;
+    if memory_segments.is_empty() {
+        panic!("[kernel-start][dtb] DT reservations consume all usable memory");
+    }
+    if matches!(context.boot.protocol, StartBootProtocol::Efi) {
+        let efi_map = context
+            .memory
+            .boot_map
+            .regions()
+            .expect("UEFI DT boot map was required above");
+        firmware_dtb::validate_uefi_reserved_memory(&reserved_memory, efi_map).unwrap_or_else(
+            |err| {
+                panic!(
+                    "[kernel-start][dtb] UEFI map does not protect static reserved-memory: {:?}",
+                    err
+                )
+            },
+        );
+    }
+    let reserved_memory_count = reserved_memory.len();
+    general::firmware::dtb::install_reserved_memory(reserved_memory).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][dtb] failed to install reserved-memory snapshot: {:?}",
+            err
+        )
+    });
+
+    let no_map_count = no_map_segments.len();
+    let no_map_ranges: Vec<StartPhysRange> = no_map_segments
+        .into_iter()
+        .map(|segment| StartPhysRange::new(segment.start, segment.end()))
+        .collect();
+    match no_map_support {
+        Some(StartNoMapSupport::Enforced { granule, prepare }) => {
+            if granule == 0 || !granule.is_power_of_two() {
+                panic!("[kernel-start][dtb] architecture published an invalid no-map granule");
+            }
+            prepare(&no_map_ranges).unwrap_or_else(|err| {
+                panic!(
+                    "[kernel-start][dtb] architecture could not enforce DT no-map ranges: {:?}",
+                    err
+                )
+            });
+        }
+        Some(StartNoMapSupport::ReservedOnly { mechanism, .. }) if !no_map_ranges.is_empty() => {
+            printk!(
+                "[kernel-start][dtb] no-map ranges are excluded from the physical allocator, but fixed direct aliases remain available: {}",
+                mechanism
+            );
+        }
+        Some(StartNoMapSupport::Unsupported { mechanism }) if !no_map_ranges.is_empty() => {
+            panic!(
+                "[kernel-start][dtb] DT declares no-map memory but architecture cannot enforce it: {}",
+                mechanism
+            );
+        }
+        Some(StartNoMapSupport::None)
+        | Some(StartNoMapSupport::ReservedOnly { .. })
+        | Some(StartNoMapSupport::Unsupported { .. }) => {}
+        None if !no_map_ranges.is_empty() => {
+            panic!(
+                "[kernel-start][dtb] DT declares no-map memory without an architecture capability"
+            );
+        }
+        None => {}
+    }
+
     printk!(
-        "[kernel-start][dtb] firmware parsed: root-compatible={} cpu={} memory={} reserved={} serial={} platform={} pcie-host={}",
-        root_compatible.first().copied().unwrap_or("<none>"),
+        "[kernel-start][dtb] firmware parsed: root-compatible={} cpu={} memory={} reserved={} reserved-nodes={} no-map={} serial={} platform={} pcie-host={}",
+        root_compatible
+            .first()
+            .map(|value| value.as_ref())
+            .unwrap_or("<none>"),
         cpu_count,
         memory_segments.len(),
         reserved_segments.len(),
+        reserved_memory_count,
+        no_map_count,
         serial_ports.len(),
         platform_devices.len(),
         pcie_hosts.len()
     );
 
-    // 如果引导器额外提供了可用内存图，这里再做一次交叉过滤。
-    if let Some(boot_segments) = context.memory.boot_map.usable_segments() {
-        memory_segments = start::intersect_memory_segments(&memory_segments, &boot_segments)
-            .unwrap_or_else(|| {
-                panic!(
-                    "[kernel-start][dtb] DTB memory description does not overlap usable boot memory"
-                )
-            });
-    }
-
     // 步骤 2 把刚刚解析好的电源控制信息安装到固件抽象层。这样内核后续无论是
     // 正常关机、重启还是错误路径上的兜底退出，都能通过统一接口回到本平台提供的
     // syscon 寄存器写入方案，而不需要再次接触 DTB 原始节点。
 
-    general::firmware::power::install(power_controls, context.address.phys_to_virt);
+    general::firmware::power::install(power_controls, context.address.device_mmio_to_virt);
 
     // 步骤 3 初始化分层分配器。这个阶段会消费上面整理好的内存段、内核镜像占用区
     // 以及可选的外部 initramfs 范围。这里先建立物理地址与虚拟地址转换关系，再
@@ -114,19 +261,6 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // 小步骤 3.2 然后整理启动早期必须避开的保留区，包括内核镜像本身以及可选的
     // 外部 initramfs 地址范围。
-    let kernel_image = context.memory.kernel_image;
-    let mut kernel_reserved = Vec::new();
-    kernel_reserved.push((kernel_image.start, kernel_image.end));
-    if let Some((start, end)) = external_initramfs_range {
-        kernel_reserved.push((start, end));
-        printk!(
-            "[kernel-start][dtb] external initramfs reserved: phys={:#x}..{:#x} ({} bytes)",
-            start,
-            end,
-            end - start
-        );
-    }
-
     // 小步骤 3.3 先初始化物理页分配器，使之后的页级资源请求可以建立在 DTB 解析出的
     // 可用 RAM 之上。
     KERNEL_ALLOCATOR
@@ -232,6 +366,9 @@ pub fn kernel_start_init(context: &StartContext) {
             ),
         rng_seed.as_deref(),
     );
+    if let Some(seed) = rng_seed.as_deref_mut() {
+        wipe_secret(seed);
+    }
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
@@ -259,8 +396,8 @@ pub fn kernel_start_init(context: &StartContext) {
             if let Some(pnp_device) = outcome.device {
                 remember_registered_platform_node(
                     &mut registered_platform_nodes,
-                    device.path,
-                    device.parent_path,
+                    &device.path,
+                    device.parent_path.as_deref(),
                     pnp_device,
                 );
             }
@@ -293,8 +430,8 @@ pub fn kernel_start_init(context: &StartContext) {
         if let Some(pnp_device) = outcome.device {
             remember_registered_platform_node(
                 &mut registered_platform_nodes,
-                device.path,
-                device.parent_path,
+                &device.path,
+                device.parent_path.as_deref(),
                 pnp_device,
             );
         }
@@ -320,10 +457,10 @@ pub fn kernel_start_init(context: &StartContext) {
                 host.path
             );
         }
-        let host_pnp = registered_platform_node(&registered_platform_nodes, host.path);
+        let host_pnp = registered_platform_node(&registered_platform_nodes, &host.path);
         pci::register_pci_host_bridge(host, host_pnp);
         printk!(
-            "[kernel-start][dtb] pcie ECAM {} domain={} phys={:#x} size={:#x} bus=[{:#x},{:#x}] ranges={} msi-map={} dma-coherent={}",
+            "[kernel-start][dtb] pcie ECAM {} domain={} phys={:#x} size={:#x} bus=[{:#x},{:#x}] ranges={} msi-map={} msi-parent={} dma-coherent={}",
             host.path,
             host.domain,
             host.ecam_phys,
@@ -332,6 +469,7 @@ pub fn kernel_start_init(context: &StartContext) {
             host.bus_end,
             host.ranges.len(),
             host.msi_map.len(),
+            host.msi_parents.len(),
             host.dma_coherent as usize
         );
         pci::install_ecam(
@@ -349,8 +487,8 @@ pub fn kernel_start_init(context: &StartContext) {
         }
         if pci::install_msi_routing(host.domain, host) {
             printk!(
-                "[kernel-start][dtb] installed PCI MSI routing: {} map entries",
-                host.msi_map.len()
+                "[kernel-start][dtb] installed PCI MSI routing: {} route(s)",
+                pci::msi_route_count(host)
             );
         }
 
@@ -454,7 +592,7 @@ pub fn kernel_start_init(context: &StartContext) {
             port.name
         );
         Some(crate::device_init::BootConsoleSelector::FirmwareName(
-            alloc::string::String::from(port.name),
+            alloc::string::String::from(port.name.as_ref()),
         ))
     } else {
         None
@@ -471,6 +609,15 @@ pub fn kernel_start_init(context: &StartContext) {
     }
 
     printk!("[kernel-start][dtb] kernel initialization complete, jumping to main entry");
+}
+
+fn wipe_secret(bytes: &mut [u8]) {
+    for byte in bytes {
+        // Safety: byte 来自独占可变切片，指针有效且按 u8 对齐；volatile 写避免
+        // 编译器把释放前的秘密擦除当作无可观察副作用删除。
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
 }
 
 fn mount_tmpfs_superblock() -> Arc<Superblock> {
@@ -517,7 +664,7 @@ fn platform_device_info_from_dtb(
     let ids = device
         .compatible
         .iter()
-        .map(|compatible| DeviceMatchId::DtbCompatible((*compatible).into()))
+        .map(|compatible| DeviceMatchId::DtbCompatible(compatible.clone()))
         .collect();
     let mut resources: Vec<DeviceResource> = device
         .reg_ranges
@@ -534,45 +681,22 @@ fn platform_device_info_from_dtb(
     let fw_properties = device
         .properties
         .iter()
-        .map(|property| FirmwareProperty {
-            name: property.name.into(),
-            value: match &property.value {
-                firmware_dtb::DtbPropertyValue::Bool => FirmwarePropertyValue::Bool,
-                firmware_dtb::DtbPropertyValue::U32(value) => FirmwarePropertyValue::U32(*value),
-                firmware_dtb::DtbPropertyValue::U32List(values) => {
-                    FirmwarePropertyValue::U32List(values.clone())
-                }
-                firmware_dtb::DtbPropertyValue::StringList(values) => {
-                    FirmwarePropertyValue::StringList(
-                        values.iter().map(|value| (*value).into()).collect(),
-                    )
-                }
-                firmware_dtb::DtbPropertyValue::Bytes(values) => {
-                    FirmwarePropertyValue::Bytes(values.clone())
-                }
-            },
-        })
-        .collect();
+        .map(|property| FirmwareProperty::new(property.name.clone(), property.value.clone()))
+        .collect::<Vec<_>>();
+    let baud = fw_properties
+        .iter()
+        .find(|property| property.name.as_ref() == "current-speed")
+        .and_then(FirmwareProperty::as_u32);
 
     PlatformDeviceInfo {
-        fw_name: device.name.into(),
-        fw_path: Some(device.path.into()),
-        fw_parent_path: device.parent_path.map(Into::into),
+        fw_name: device.name.clone(),
+        fw_path: Some(device.path.clone()),
+        fw_parent_path: device.parent_path.clone(),
         ids,
         resources,
         properties: DeviceProperties {
             clock_hz: device.clock_hz,
-            baud: device
-                .properties
-                .iter()
-                .find_map(|property| match &property.value {
-                    firmware_dtb::DtbPropertyValue::U32(value)
-                        if property.name == "current-speed" =>
-                    {
-                        Some(*value)
-                    }
-                    _ => None,
-                }),
+            baud,
             fw_phandle: device.phandle,
             fw_interrupt_parent: device.interrupt_parent,
             interrupt_controller: device.interrupt_controller,
@@ -600,37 +724,37 @@ struct PlatformRegisterOutcome {
 }
 
 struct RegisteredPlatformNode {
-    path: &'static str,
-    parent_path: Option<&'static str>,
+    path: Box<str>,
+    parent_path: Option<Box<str>>,
     device: Arc<PnpDevice>,
 }
 
 fn remember_registered_platform_node(
     nodes: &mut Vec<RegisteredPlatformNode>,
-    path: &'static str,
-    parent_path: Option<&'static str>,
+    path: &str,
+    parent_path: Option<&str>,
     device: Arc<PnpDevice>,
 ) {
     if nodes
         .iter()
-        .any(|node| node.path == path && Arc::ptr_eq(&node.device, &device))
+        .any(|node| node.path.as_ref() == path && Arc::ptr_eq(&node.device, &device))
     {
         return;
     }
     nodes.push(RegisteredPlatformNode {
-        path,
-        parent_path,
+        path: path.into(),
+        parent_path: parent_path.map(Into::into),
         device,
     });
 }
 
 fn registered_platform_node(
     nodes: &[RegisteredPlatformNode],
-    path: &'static str,
+    path: &str,
 ) -> Option<Arc<PnpDevice>> {
     nodes
         .iter()
-        .find(|node| node.path == path)
+        .find(|node| node.path.as_ref() == path)
         .map(|node| Arc::clone(&node.device))
 }
 
@@ -693,12 +817,12 @@ fn register_platform_device_status(
 fn attach_platform_topology(nodes: &[RegisteredPlatformNode]) -> usize {
     let mut attached = 0usize;
     for child in nodes {
-        let Some(parent_path) = child.parent_path else {
+        let Some(parent_path) = child.parent_path.as_deref() else {
             continue;
         };
         let Some(parent) = nodes
             .iter()
-            .find(|candidate| candidate.path == parent_path)
+            .find(|candidate| candidate.path.as_ref() == parent_path)
             .map(|candidate| Arc::clone(&candidate.device))
         else {
             continue;

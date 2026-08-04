@@ -34,25 +34,29 @@ use crate::riscv64::sbi;
 use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns, phys_to_virt, virt_to_phys};
 use crate::riscv64::time;
 use crate::riscv64::trap;
-use general::dtb::Dtb;
+use fdt::{Fdt, Tree};
 use general::{
     StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartBootProtocol,
     StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
-    StartMemoryRegionKind, StartPhysRange,
+    StartMemoryRegionKind, StartNoMapSupport, StartPhysRange,
 };
 
 // ── DTB 访问 ──────────────────────────────────────────────────────────────────
 
-/// DTB 快照缓冲区容量（4 MiB），仅当 DTB 在 MMIO 区域时使用。
-const DTB_BUF_SIZE: usize = 4096 * 1024;
+/// MMU 开启前复制 DTB 的固定缓冲区容量（4 MiB）。
+pub(super) const DTB_BUF_SIZE: usize = 4096 * 1024;
 
-/// DTB 快照的有效长度，0 表示使用零拷贝路径。
+/// DTB 快照的有效长度，0 表示尚未发布。
 static DTB_VALID_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// DTB 快照缓冲区的 Sync 包装（UnsafeCell 本身非 Sync）。
-struct DtbBuffer(UnsafeCell<[u8; DTB_BUF_SIZE]>);
+#[repr(align(4096))]
+pub(super) struct DtbBuffer(UnsafeCell<[u8; DTB_BUF_SIZE]>);
+// Safety: DTB_BUFFER 只由 boot hart 在 satp=0 时写入一次；Rust 代码发布长度后
+// 只读访问。该 NOLOAD 区域位于 sbss 之前，不会被 clear_bss() 擦除。
 unsafe impl Sync for DtbBuffer {}
-static DTB_BUFFER: DtbBuffer = DtbBuffer(UnsafeCell::new([0u8; DTB_BUF_SIZE]));
+#[unsafe(link_section = ".bss.prepage")]
+pub(super) static DTB_BUFFER: DtbBuffer = DtbBuffer(UnsafeCell::new([0u8; DTB_BUF_SIZE]));
 
 /// DTB 中的 RAM 最终会与此启动映射求交集。这样在动态 direct map 落地前，
 /// 物理分配器不会拿到当前页表无法访问的 4 GiB 以上页面。
@@ -66,48 +70,39 @@ static RISCV_BOOT_MEMORY_MAP: [StartMemoryRegion; 1] = [StartMemoryRegion::new(
 )];
 
 /// 返回内核 DTB 视图（始终从内核缓冲区读取）。
-fn kernel_dtb() -> Option<Dtb<'static>> {
+fn kernel_dtb() -> Option<Fdt<'static>> {
     let len = DTB_VALID_LEN.load(Ordering::Acquire);
     if len == 0 {
         return None;
     }
+    // Safety: 有效长度只会在完整 DTB 已复制到固定容量缓冲区后发布，并且发布后
+    // 缓冲区保持只读；len 不会超过 DTB_BUF_SIZE。
     let slice = unsafe { core::slice::from_raw_parts(DTB_BUFFER.0.get().cast::<u8>(), len) };
-    Dtb::from_bytes(slice)
+    Fdt::parse(slice).ok()
 }
 
-/// 将固件提供的 DTB 拷贝到内核静态缓冲区。
+/// 校验并发布启动汇编已经复制的 DTB。
 ///
-/// 所有地址范围统一走拷贝路径，不保留零拷贝引用——DTB 原址在 buddy
-/// allocator 接管后会被覆盖，零拷贝会导致 `&str`/`&[u8]` 引用失效。
-fn store_kernel_dtb(dtb_paddr: usize) -> Result<Dtb<'static>, &'static str> {
+/// 复制发生在 MMU 开启前，所以无需为固件原址创建任何临时页表映射。
+fn store_kernel_dtb(dtb_paddr: usize, snapshot_len: usize) -> Result<Fdt<'static>, &'static str> {
     if dtb_paddr == 0 {
         return Err("missing DTB address");
     }
-
-    // 0x4000_0000..0x8000_0000：不在任何映射内
-    if dtb_paddr >= 0x4000_0000 && dtb_paddr < 0x8000_0000 {
-        return Err("DTB at unsupported address (not in identity map or RAM)");
+    if !(32..=DTB_BUF_SIZE).contains(&snapshot_len) {
+        return Err("invalid early DTB snapshot length");
     }
-
-    let vaddr = if dtb_paddr >= 0x8000_0000 {
-        phys_to_virt(dtb_paddr)
-    } else {
-        dtb_paddr // MMIO 区域走 identity mapping
-    };
-
-    let fw_dtb = unsafe { Dtb::from_ptr(vaddr) }.ok_or("invalid DTB magic")?;
-    let bytes = fw_dtb.as_bytes();
-    if bytes.len() > DTB_BUF_SIZE {
-        return Err("DTB too large for kernel buffer");
+    // Safety: 启动汇编在 satp=0 时已按同一上限复制 snapshot_len 字节；
+    // 目标区域属于内核镜像且不在 clear_bss() 的范围内。
+    let bytes =
+        unsafe { core::slice::from_raw_parts(DTB_BUFFER.0.get().cast::<u8>(), snapshot_len) };
+    let fdt = Fdt::parse(bytes).map_err(|error| {
+        log::error!("[loader] early DTB validation failed: {:?}", error);
+        "invalid early DTB snapshot"
+    })?;
+    if fdt.as_bytes().len() != snapshot_len {
+        return Err("early DTB snapshot length mismatch");
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            DTB_BUFFER.0.get().cast::<u8>(),
-            bytes.len(),
-        );
-    }
-    DTB_VALID_LEN.store(bytes.len(), Ordering::Release);
+    DTB_VALID_LEN.store(snapshot_len, Ordering::Release);
     kernel_dtb().ok_or("DTB copy verification failed")
 }
 
@@ -165,14 +160,11 @@ fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
 // ── ISA 扩展检测 ──────────────────────────────────────────────────────────────
 
 /// 从 DTB 的 `/cpus/cpu@*` 节点解析 `riscv,isa` 属性，检测硬件扩展支持。
-fn detect_isa_extensions(dtb: &Dtb<'_>) {
+fn detect_isa_extensions(dtb: &Fdt<'_>) {
     use crate::riscv64::specific::{CBO_BLOCK_SIZE, HAS_ZICBOZ};
     use core::sync::atomic::Ordering;
 
-    let root = match dtb.root() {
-        Some(r) => r,
-        None => return,
-    };
+    let root = dtb.root();
     let cpus = match root.find_child("cpus") {
         Some(c) => c,
         None => return,
@@ -228,132 +220,50 @@ fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
 }
 
-fn read_cells(value: &[u8], cells: usize) -> Option<usize> {
-    if cells == 0 || cells > 2 || value.len() < cells * 4 {
-        return None;
-    }
-    let mut result = 0u64;
-    for chunk in value[..cells * 4].chunks_exact(4) {
-        result = (result << 32) | u32::from_be_bytes(chunk.try_into().ok()?) as u64;
-    }
-    usize::try_from(result).ok()
-}
-
-fn dtb_cstr(value: &[u8]) -> &[u8] {
-    let end = value
-        .iter()
-        .position(|&byte| byte == 0 || byte == b':')
-        .unwrap_or(value.len());
-    &value[..end]
-}
-
-fn find_dtb_node_by_absolute_path<'a>(
-    dtb: &Dtb<'a>,
-    path: &[u8],
-) -> Option<(general::dtb::DtbNode<'a>, general::dtb::DtbNode<'a>, bool)> {
-    if path.first().copied() != Some(b'/') {
-        return None;
-    }
-
-    let root = dtb.root()?;
-    let mut parent = root;
-    let mut current = root;
-    let mut depth = 0usize;
-    for component in path[1..].split(|&byte| byte == b'/') {
-        if component.is_empty() {
-            continue;
-        }
-        parent = current;
-        current = current
-            .children()
-            .find(|child| child.name_bytes() == component)?;
-        depth += 1;
-    }
-    Some((parent, current, depth == 1))
-}
-
-fn dtb_compatible_contains(node: general::dtb::DtbNode<'_>, expected: &[u8]) -> bool {
-    node.find_property("compatible").is_some_and(|property| {
-        property
-            .value()
-            .split(|&byte| byte == 0)
-            .any(|value| value == expected)
-    })
-}
-
-/// 在完整 platform parser 接管前，仅解析 early console 所需的 stdout-path 与首个 reg。
-/// 对带非空 bus `ranges` 的复杂地址转换保持 QEMU fallback，避免在 arch 重复通用解析器。
-fn configure_early_console_from_dtb(dtb: &Dtb<'static>) {
-    let Some(root) = dtb.root() else {
+/// 通过共享 FDT 树语义解析 chosen 控制台和完整普通总线地址翻译。
+fn configure_early_console_from_dtb(dtb: &Fdt<'static>) {
+    let Ok(tree) = Tree::from_fdt(*dtb) else {
+        log::warning!("[loader] failed to index DTB for early console");
         return;
     };
-    let Some(chosen) = root.find_child("chosen") else {
+    let Ok(Some(stdout)) = tree.chosen_stdout() else {
         return;
     };
-    let Some(stdout) = chosen.find_property("stdout-path") else {
+    let Some(serial) = tree.node(stdout.node) else {
         return;
     };
-
-    let mut path = dtb_cstr(stdout.value());
-    if path.first().copied() != Some(b'/') {
-        let Some(alias_name) = core::str::from_utf8(path).ok() else {
-            return;
-        };
-        let Some(aliases) = root.find_child("aliases") else {
-            return;
-        };
-        let Some(alias) = aliases.find_property(alias_name) else {
-            return;
-        };
-        path = dtb_cstr(alias.value());
-    }
-
-    let Some((parent, serial, parent_is_root)) = find_dtb_node_by_absolute_path(dtb, path) else {
-        return;
-    };
-    if !dtb_compatible_contains(serial, b"ns16550a")
-        && !dtb_compatible_contains(serial, b"ns16550")
-        && !dtb_compatible_contains(serial, b"uart16550")
+    if !serial.is_compatible("ns16550a")
+        && !serial.is_compatible("ns16550")
+        && !serial.is_compatible("uart16550")
     {
         log::warning!("[loader] DTB stdout is not NS16550-compatible; keeping QEMU fallback");
         return;
     }
-    // 根节点的 reg 已经是 CPU 物理地址；子总线只有空 ranges 才明确表示恒等映射。
-    // 缺失 ranges 表示地址不可向父总线转换，非空 ranges 则需要完整 cell 翻译。
-    if !parent_is_root
-        && !parent
-            .find_property("ranges")
-            .is_some_and(|ranges| ranges.value().is_empty())
-    {
-        log::warning!(
-            "[loader] early console bus needs address translation; keeping QEMU fallback"
-        );
-        return;
-    }
-
-    let address_cells = parent
-        .find_property("#address-cells")
-        .and_then(|prop| read_be_u32_prop(prop.value()))
-        .map(|value| value as usize)
-        .unwrap_or(2);
-    let Some(reg) = serial.find_property("reg") else {
+    let Ok(ranges) = tree.translated_reg(stdout.node) else {
+        log::warning!("[loader] failed to translate DTB stdout reg; keeping QEMU fallback");
         return;
     };
-    let Some(phys_base) = read_cells(reg.value(), address_cells) else {
+    let Some(range) = ranges.first() else {
+        return;
+    };
+    let Ok(phys_base) = usize::try_from(range.address) else {
         return;
     };
     if early_console::configure_physical_base(phys_base) {
-        log::info!("[loader] early console relocated from DTB to {phys_base:#x}");
+        log::info!(
+            "[loader] early console relocated from DTB {} to {phys_base:#x}",
+            stdout.path
+        );
     } else {
         log::warning!("[loader] DTB stdout UART {phys_base:#x} is outside the early MMIO window");
     }
 }
 
 /// 解析 RISC-V DTB 的 timebase-frequency，并启动周期性 S-mode timer。
-fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
+fn configure_timer_from_dtb(dtb: &Fdt<'_>) {
     let hz = dtb
         .root()
-        .and_then(|root| root.find_child("cpus"))
+        .find_child("cpus")
         .and_then(|cpus| {
             cpus.find_property("timebase-frequency")
                 .and_then(|prop| read_be_u32_prop(prop.value()))
@@ -436,7 +346,11 @@ fn sync_icache() {
 ///
 /// 仅由引导汇编调用一次，不得重入。
 #[unsafe(no_mangle)]
-pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
+pub extern "C" fn __kernel_arch_loader(
+    hart_id: usize,
+    dtb_addr: usize,
+    dtb_snapshot_len: usize,
+) -> ! {
     // 安装异常向量，使后续 panic 能输出 backtrace 而非直接挂死
     unsafe { trap::install_exception_entry() };
 
@@ -495,7 +409,8 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
     }
 
     // 快照 DTB 到内核缓冲区
-    let dtb = store_kernel_dtb(dtb_addr).unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
+    let dtb = store_kernel_dtb(dtb_addr, dtb_snapshot_len)
+        .unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
     log::info!("[loader] DTB: {} bytes", dtb.as_bytes().len());
     log::info!(
         "[loader] usable RAM handoff constrained to direct map {:#x}..{:#x}",
@@ -548,6 +463,10 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 validate_kernel_heap_range: validate_kernel_heap,
                 sync_icache,
                 init_kernel_page_table: heap_vm::init_kernel_page_table,
+                no_map: StartNoMapSupport::Enforced {
+                    granule: heap_vm::NO_MAP_GRANULE,
+                    prepare: heap_vm::prepare_no_map,
+                },
             }),
         };
 

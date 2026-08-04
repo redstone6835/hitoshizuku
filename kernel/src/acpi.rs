@@ -3,6 +3,7 @@
 //! 当前 ACPI 的实现只是一个最小的 AIGC 实现，因为工程目前的重心不在于 ACPI，而
 //! 在于 DTB。在决赛的时候可能会对 ACPI 的实现进行充分完善。
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -230,7 +231,7 @@ struct FirmwareSerialDevice {
 
 #[derive(Clone)]
 struct FirmwareMmioDevice {
-    name: &'static str,
+    name: Box<str>,
     phys_addr: usize,
     resources: Vec<DeviceResource>,
 }
@@ -272,7 +273,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // ── 阶段 2：安装电源控制入口 ───────────────────────────────────────────
 
-    general::firmware::power::install(power_controls, context.address.phys_to_virt);
+    general::firmware::power::install(power_controls, context.address.device_mmio_to_virt);
 
     // ── 阶段 3：初始化分层内存分配器 ───────────────────────────────────────
 
@@ -406,12 +407,12 @@ pub fn kernel_start_init(context: &StartContext) {
     let stdout_phys = console_serial_port_phys;
     let mut platform_bound = 0usize;
     for device in &serial_devices {
-        let port = device.port;
+        let port = device.port.clone();
         let mut ids = Vec::new();
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0500.into()));
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
         let info = PlatformDeviceInfo {
-            fw_name: port.name.into(),
+            fw_name: port.name.clone(),
             fw_path: None,
             fw_parent_path: None,
             ids,
@@ -438,7 +439,7 @@ pub fn kernel_start_init(context: &StartContext) {
         let mut ids = Vec::new();
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_VIRTIO_MMIO.into()));
         let info = PlatformDeviceInfo {
-            fw_name: device.name.into(),
+            fw_name: device.name.clone(),
             fw_path: None,
             fw_parent_path: None,
             ids,
@@ -490,7 +491,7 @@ pub fn kernel_start_init(context: &StartContext) {
             device.port.name
         );
         Some(crate::device_init::BootConsoleSelector::FirmwareName(
-            String::from(device.port.name),
+            String::from(device.port.name.as_ref()),
         ))
     } else {
         None
@@ -602,7 +603,7 @@ fn discover_acpi_namespace_devices(
             continue;
         };
 
-        let name = alloc::format!("{}", path).leak();
+        let name: Box<str> = alloc::format!("{}", path).into();
         if is_serial {
             if !serial_devices
                 .iter()
@@ -1288,7 +1289,7 @@ fn serial_device_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<Firm
     let baud = spcr.baud_rate().map(|baud| baud.get());
     let phys_addr = base_address.address as usize;
     let name = spcr_namespace_name(&spcr)
-        .unwrap_or_else(|| alloc::format!("serial@{:#x}", phys_addr).leak());
+        .unwrap_or_else(|| alloc::format!("serial@{:#x}", phys_addr).into());
 
     if let Some(clock_hz) = clock_hz {
         printk!(
@@ -1335,13 +1336,13 @@ fn spcr_interface_is_16550_compatible(interface: SpcrInterfaceType) -> bool {
     )
 }
 
-fn spcr_namespace_name(spcr: &Spcr) -> Option<&'static str> {
+fn spcr_namespace_name(spcr: &Spcr) -> Option<Box<str>> {
     let name = spcr.namespace_string().ok()?;
     let name = name.trim_matches('\0').trim();
     if name.is_empty() || name == "." {
         return None;
     }
-    Some(name.to_string().leak())
+    Some(name.into())
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {

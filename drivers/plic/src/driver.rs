@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use vfs::sync::Spinlock;
 
 use crate::dev::irq::{self, IrqDomain, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::platform::{FirmwarePropertyValue, PlatformDeviceInfo};
+use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory,
@@ -229,20 +229,7 @@ impl PnpDriver for PlicDriver {
             .properties
             .fw_phandle
             .ok_or_else(|| PnpError::missing(PnpResourceKind::FirmwareBus, "plic phandle"))?;
-        let ndev = info
-            .fw_properties
-            .iter()
-            .find_map(|p| {
-                if p.name.as_ref() == "riscv,ndev" {
-                    match &p.value {
-                        FirmwarePropertyValue::U32(v) => Some(*v),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0x5f); // 默认 95 源（QEMU virt）
+        let ndev = info.u32_property("riscv,ndev").unwrap_or(0x5f); // 默认 95 源（QEMU virt）
         let Some((phys, _size)) = info.first_mmio() else {
             return Err(PnpError::missing(PnpResourceKind::Mmio, "plic reg missing"));
         };

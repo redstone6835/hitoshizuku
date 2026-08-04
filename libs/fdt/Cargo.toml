@@ -1,0 +1,13 @@
+[package]
+name = "fdt"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = true
+doctest = false
+bench = false
+
+[features]
+default = []
+alloc = []

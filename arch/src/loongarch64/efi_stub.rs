@@ -69,6 +69,14 @@ static EFI_MMAP_EXITED_BOOT_SERVICES: AtomicBool = AtomicBool::new(false);
 #[unsafe(link_section = ".data")]
 static EFI_IMAGE_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// 返回本内核是否经由自身的 PE/COFF EFI stub 进入。
+///
+/// 真正的 UEFI 加载会传入非空 image handle；QEMU `-kernel` 使用的 EFI 兼容
+/// 配置表交接不会经过 [`efi_pe_entry`]，因此该值保持为零。
+pub(crate) fn entered_via_efi_stub() -> bool {
+    EFI_IMAGE_HANDLE.load(Ordering::Acquire) != 0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EfiMemoryMapSource {
     /// 该内存映射是在成功执行 `ExitBootServices` 之后取得的。

@@ -17,12 +17,12 @@ use core::{fmt, fmt::Write};
 use super::efi_stub;
 use crate::*;
 use efi::*;
-use general::dtb::Dtb;
+use fdt::Fdt;
 use general::firmware::{self, FirmwareTableMapping};
 use general::{
     StartAcpiTables, StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo,
-    StartBootProtocol, StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
-    StartMemoryRegionKind, StartPhysRange,
+    StartBootProtocol, StartContext, StartFirmware, StartFirmwareSource, StartMemory,
+    StartMemoryMap, StartMemoryRegion, StartMemoryRegionKind, StartNoMapSupport, StartPhysRange,
 };
 use log::printk;
 
@@ -47,6 +47,102 @@ const EMPTY_BOOT_MEMORY_REGION: StartMemoryRegion = StartMemoryRegion::new(
     StartMemoryRegionKind::Reserved,
     0,
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootProtocolSelectionError {
+    AcpiWithoutCompletedHandoff,
+    EfiStubWithoutCompletedHandoff,
+}
+
+impl BootProtocolSelectionError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::AcpiWithoutCompletedHandoff => {
+                "[loader] ACPI handoff requires a post-ExitBootServices EFI memory map"
+            }
+            Self::EfiStubWithoutCompletedHandoff => {
+                "[loader] EFI stub did not complete ExitBootServices; refusing unsafe DT /memory fallback"
+            }
+        }
+    }
+}
+
+/// 根据固件来源与 EFI 交接能力选择内核看到的有效启动协议。
+///
+/// 原始 `$a0` 标志只用于诊断：只有完成 ExitBootServices 后的 EFI 内存图才是
+/// RAM 权威来源；其他情况仅允许未经过本内核 EFI stub 的 DTB 兼容交接退化为直启。
+const fn select_effective_boot_protocol(
+    _reported_efi_boot: bool,
+    entered_via_efi_stub: bool,
+    memory_map_source: Option<efi_stub::EfiMemoryMapSource>,
+    firmware_source: StartFirmwareSource,
+) -> Result<StartBootProtocol, BootProtocolSelectionError> {
+    if matches!(
+        memory_map_source,
+        Some(efi_stub::EfiMemoryMapSource::BootServicesExited)
+    ) {
+        return Ok(StartBootProtocol::Efi);
+    }
+    match firmware_source {
+        StartFirmwareSource::Acpi => Err(BootProtocolSelectionError::AcpiWithoutCompletedHandoff),
+        StartFirmwareSource::Dtb if entered_via_efi_stub => {
+            Err(BootProtocolSelectionError::EfiStubWithoutCompletedHandoff)
+        }
+        StartFirmwareSource::Dtb => Ok(StartBootProtocol::Direct),
+    }
+}
+
+const _: () = {
+    assert!(matches!(
+        select_effective_boot_protocol(
+            false,
+            false,
+            Some(efi_stub::EfiMemoryMapSource::BootServicesExited),
+            StartFirmwareSource::Dtb,
+        ),
+        Ok(StartBootProtocol::Efi)
+    ));
+    assert!(matches!(
+        select_effective_boot_protocol(
+            true,
+            true,
+            Some(efi_stub::EfiMemoryMapSource::BootServicesExited),
+            StartFirmwareSource::Acpi,
+        ),
+        Ok(StartBootProtocol::Efi)
+    ));
+    assert!(matches!(
+        select_effective_boot_protocol(true, false, None, StartFirmwareSource::Dtb),
+        Ok(StartBootProtocol::Direct)
+    ));
+    assert!(matches!(
+        select_effective_boot_protocol(
+            true,
+            false,
+            Some(efi_stub::EfiMemoryMapSource::BootServicesActive),
+            StartFirmwareSource::Dtb,
+        ),
+        Ok(StartBootProtocol::Direct)
+    ));
+    assert!(matches!(
+        select_effective_boot_protocol(
+            true,
+            true,
+            Some(efi_stub::EfiMemoryMapSource::BootServicesActive),
+            StartFirmwareSource::Dtb,
+        ),
+        Err(BootProtocolSelectionError::EfiStubWithoutCompletedHandoff)
+    ));
+    assert!(matches!(
+        select_effective_boot_protocol(
+            false,
+            false,
+            Some(efi_stub::EfiMemoryMapSource::BootServicesActive),
+            StartFirmwareSource::Acpi,
+        ),
+        Err(BootProtocolSelectionError::AcpiWithoutCompletedHandoff)
+    ));
+};
 
 // ─────────────────────── 固件状态与缓冲区 ─────────────────────────────
 
@@ -156,15 +252,36 @@ fn kernel_command_line() -> Option<&'static [u8]> {
 }
 
 /// 返回当前存储的 DTB 视图，如果未存储或长度为零则返回 `None`。
-fn kernel_dtb() -> Option<Dtb<'static>> {
+fn kernel_dtb() -> Option<Fdt<'static>> {
     let len = KERNEL_FIRMWARE_STATE.dtb_valid_len.load(Ordering::Acquire);
     if len == 0 {
         return None;
     }
+    // Safety: dtb_valid_len 只在完整快照复制完成后以 Release 发布；Acquire 读取到
+    // 非零长度后，固定缓冲区在内核生命周期内保持只读，且长度受容量约束。
     let slice = unsafe {
         core::slice::from_raw_parts(addr_of!(KERNEL_FIRMWARE_BUFFERS.dtb).cast::<u8>(), len)
     };
-    Dtb::from_bytes(slice)
+    Fdt::parse(slice).ok()
+}
+
+/// 从固件虚拟地址取得受快照容量限制的 DTB 字节。
+fn firmware_dtb_bytes(vaddr: usize) -> Result<&'static [u8], &'static str> {
+    // Safety: EFI 配置表保证 vaddr 指向至少包含 magic/totalsize 的 FDT 前缀；
+    // 完整视图只在 totalsize 通过固定容量检查后构造。
+    let prefix = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 8) };
+    let magic = u32::from_be_bytes(prefix[..4].try_into().map_err(|_| "truncated DTB prefix")?);
+    if magic != fdt::DTB_MAGIC {
+        return Err("[loader][dtb] invalid DTB magic");
+    }
+    let total_size =
+        u32::from_be_bytes(prefix[4..8].try_into().map_err(|_| "truncated DTB size")?) as usize;
+    if total_size < 32 || total_size > DTB_BUF_SIZE {
+        return Err("[loader][dtb] DTB size is outside the snapshot range");
+    }
+    // Safety: EFI/FDT 交接保证声明的 totalsize 范围可读，且长度已限制在静态
+    // 快照缓冲区容量内。
+    Ok(unsafe { core::slice::from_raw_parts(vaddr as *const u8, total_size) })
 }
 
 /// 返回当前有效的 ACPI 映射表切片。
@@ -227,6 +344,18 @@ fn snapshot_boot_memory_regions(
         );
         return Err("[loader] EFI memory descriptor size is smaller than the UEFI baseline");
     }
+    if !snapshot
+        .bytes
+        .len()
+        .is_multiple_of(snapshot.descriptor_size)
+    {
+        printk!(
+            "[loader] EFI memory map has a partial descriptor: bytes={} descriptor_size={}",
+            snapshot.bytes.len(),
+            snapshot.descriptor_size,
+        );
+        return Err("[loader] EFI memory map length is not descriptor-aligned");
+    }
 
     BOOT_MEMORY_REGION_COUNT.store(0, Ordering::Release);
     let mut count = 0usize;
@@ -244,8 +373,13 @@ fn snapshot_boot_memory_regions(
             continue;
         }
 
-        let start = descriptor.physical_start as usize;
-        let size = (descriptor.number_of_pages as usize).saturating_mul(4096);
+        let start = usize::try_from(descriptor.physical_start)
+            .map_err(|_| "[loader] EFI memory descriptor start exceeds physical address width")?;
+        let pages = usize::try_from(descriptor.number_of_pages)
+            .map_err(|_| "[loader] EFI memory descriptor page count exceeds address width")?;
+        let size = pages
+            .checked_mul(4096)
+            .ok_or("[loader] EFI memory descriptor page count overflowed")?;
         let end = start
             .checked_add(size)
             .ok_or("[loader] EFI memory descriptor range overflowed")?;
@@ -264,11 +398,14 @@ fn snapshot_boot_memory_regions(
             addr_of_mut!(BOOT_MEMORY_REGIONS)
                 .cast::<StartMemoryRegion>()
                 .add(count)
-                .write(StartMemoryRegion::new(
-                    StartPhysRange::new(start, end),
-                    classify_efi_memory_type(descriptor.type_, snapshot.source),
-                    descriptor.attribute,
-                ));
+                .write(
+                    StartMemoryRegion::new(
+                        StartPhysRange::new(start, end),
+                        classify_efi_memory_type(descriptor.type_, snapshot.source),
+                        descriptor.attribute,
+                    )
+                    .with_source_type(descriptor.type_),
+                );
         }
         count += 1;
     }
@@ -340,13 +477,14 @@ unsafe fn erase_original_cmdline(src: *mut u8, len: usize, saved: *const u8, sav
 /// 从指定的物理地址拷贝 DTB 到内核缓冲区，并返回 DTB 视图。
 ///
 /// 成功时打印拷贝信息，失败时返回错误描述。
-fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Dtb<'static>, &'static str> {
+fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Fdt<'static>, &'static str> {
     if fdt_addr == 0 {
         return Err("[loader][dtb] missing DTB address");
     }
 
     let fdt_addr = reset_to_virt(fdt_addr);
-    let fw_dtb = unsafe { Dtb::from_ptr(fdt_addr) }.ok_or("[loader][dtb] invalid DTB")?;
+    let fw_bytes = firmware_dtb_bytes(fdt_addr)?;
+    let fw_dtb = Fdt::parse(fw_bytes).map_err(|_| "[loader][dtb] invalid DTB layout")?;
     let dtb_bytes = fw_dtb.as_bytes();
     let dtb_size = dtb_bytes.len();
     if dtb_size > DTB_BUF_SIZE {
@@ -359,6 +497,8 @@ fn store_kernel_dtb_from_address(fdt_addr: usize) -> Result<Dtb<'static>, &'stat
         return Err("[loader][dtb] DTB too large");
     }
 
+    // Safety: 源 DTB 已通过 Fdt::parse 且长度不超过目标静态缓冲区；该复制发生在
+    // 单线程启动阶段，发布有效长度前没有读者，源地址与内核缓冲区不重叠。
     unsafe {
         core::ptr::copy_nonoverlapping(
             dtb_bytes.as_ptr(),
@@ -1013,7 +1153,10 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
 
         if let Some(rsdp) = acpi_rsdp {
             // ACPI 路径需要 EFI 内存映射来获取可用物理内存，否则无法初始化分配器
-            if efi_stub::memory_map_snapshot().is_some() {
+            if matches!(
+                efi_stub::memory_map_snapshot().map(|snapshot| snapshot.source),
+                Some(efi_stub::EfiMemoryMapSource::BootServicesExited)
+            ) {
                 let rsdp_phys = snapshot_acpi_tables(rsdp as usize).unwrap_or_else(|err| {
                     panic!("[loader] failed to snapshot ACPI tables: {}", err)
                 });
@@ -1029,7 +1172,9 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
                     rsdp_phys,
                 );
             } else {
-                panic!("[loader] ACPI tables discovered but EFI memory map is unavailable");
+                panic!(
+                    "[loader] ACPI tables discovered but ExitBootServices did not produce a usable memory map"
+                );
             }
         } else if let Some(fdt) = fdt {
             store_kernel_dtb_from_address(fdt as usize)
@@ -1073,7 +1218,9 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         // 内核映像占用的物理地址范围（从虚拟地址反推物理地址）
         let kernel_phys_start = virt_to_phys(skernel as *const () as usize);
         let kernel_phys_end = virt_to_phys(ekernel as *const () as usize);
-        let boot_map = if let Some(snapshot) = efi_stub::memory_map_snapshot() {
+        let memory_map_snapshot = efi_stub::memory_map_snapshot();
+        let memory_map_source = memory_map_snapshot.map(|snapshot| snapshot.source);
+        let boot_map = if let Some(snapshot) = memory_map_snapshot {
             let regions = snapshot_boot_memory_regions(snapshot).unwrap_or_else(|err| {
                 panic!("[loader] failed to normalize EFI memory map: {}", err)
             });
@@ -1099,6 +1246,43 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             panic!("[loader] expected exactly one firmware source to be selected");
         }
 
+        // QEMU 的 LoongArch `-kernel` 直启路径会把 $a0 置为 1，并通过一个
+        // EFI 兼容系统表暴露 FDT 配置表，但该伪交接没有 Boot Services，因而
+        // 无法提供 GetMemoryMap。只有 ExitBootServices 成功后取得的内存图才是 RAM
+        // 权威来源；BootServicesActive 图只能在非 stub DT 直启中作为额外白名单。
+        let reported_efi_boot = EFI_BOOT.load(Ordering::Acquire) == 1;
+        let entered_via_efi_stub = efi_stub::entered_via_efi_stub();
+        let firmware_source = if acpi_enabled {
+            StartFirmwareSource::Acpi
+        } else {
+            StartFirmwareSource::Dtb
+        };
+        let boot_protocol = select_effective_boot_protocol(
+            reported_efi_boot,
+            entered_via_efi_stub,
+            memory_map_source,
+            firmware_source,
+        )
+        .unwrap_or_else(|err| panic!("{}", err.message()));
+        match memory_map_source {
+            Some(efi_stub::EfiMemoryMapSource::BootServicesExited) if !reported_efi_boot => {
+                printk!(
+                    "[loader] post-ExitBootServices EFI memory map is present without the EFI boot flag; treating the handoff as EFI"
+                );
+            }
+            Some(efi_stub::EfiMemoryMapSource::BootServicesActive) => {
+                printk!(
+                    "[loader] EFI memory map is observation-only because Boot Services remain active; treating DTB handoff as direct and constraining DT /memory with the observed map"
+                );
+            }
+            None if reported_efi_boot => {
+                printk!(
+                    "[loader] EFI-compatible DTB handoff has no GetMemoryMap snapshot; treating boot as direct and using DT /memory"
+                );
+            }
+            Some(efi_stub::EfiMemoryMapSource::BootServicesExited) | None => {}
+        }
+
         let firmware = if acpi_enabled {
             if acpi_rsdp_for_state == 0 {
                 panic!("[loader] ACPI selected but RSDP snapshot is missing");
@@ -1116,11 +1300,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         let context = StartContext {
             boot: StartBootInfo {
                 architecture: StartArchitecture::new("loongarch64"),
-                protocol: if EFI_BOOT.load(Ordering::Acquire) == 1 {
-                    StartBootProtocol::Efi
-                } else {
-                    StartBootProtocol::Direct
-                },
+                protocol: boot_protocol,
                 boot_cpu_id: LoongArch64MessageInterruptOps::current_cpu_id(),
                 command_line: kernel_command_line(),
             },
@@ -1142,6 +1322,10 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
                 validate_kernel_heap_range,
                 sync_icache,
                 init_kernel_page_table,
+                no_map: StartNoMapSupport::ReservedOnly {
+                    granule: allocator::PAGE_SIZE,
+                    mechanism: "LoongArch DMW0/DMW1 fixed windows cannot remove individual aliases",
+                },
             }),
         };
         context

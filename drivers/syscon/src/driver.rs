@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::dev::platform::{FirmwarePropertyValue, PlatformDeviceInfo};
+use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
     PnpError, PnpId, PnpResourceKind, register_driver_factory, unregister_driver,
@@ -364,22 +364,12 @@ fn usize_property(info: &PlatformDeviceInfo, name: &str) -> Option<usize> {
 }
 
 fn u64_property(info: &PlatformDeviceInfo, name: &str) -> Option<u64> {
-    info.fw_properties
-        .iter()
-        .find(|property| property.name.as_ref() == name)
-        .and_then(|property| match &property.value {
-            FirmwarePropertyValue::U32(value) => Some(u64::from(*value)),
-            FirmwarePropertyValue::U32List(values) if values.len() == 1 => {
-                Some(u64::from(values[0]))
-            }
-            FirmwarePropertyValue::U32List(values) if values.len() == 2 => {
-                Some((u64::from(values[0]) << 32) | u64::from(values[1]))
-            }
-            FirmwarePropertyValue::Bool
-            | FirmwarePropertyValue::U32List(_)
-            | FirmwarePropertyValue::StringList(_)
-            | FirmwarePropertyValue::Bytes(_) => None,
-        })
+    let values = info.u32_list_property(name)?;
+    match values.len() {
+        1 => Some(u64::from(values.get(0)?)),
+        2 => Some((u64::from(values.get(0)?) << 32) | u64::from(values.get(1)?)),
+        _ => None,
+    }
 }
 
 fn map_syscon_error(err: SysconError) -> PnpError {

@@ -22,6 +22,7 @@ elm_model = { package = "elm", path = "../libs/elm" }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
+fdt = { path = "../libs/fdt", features = ["alloc"] }
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 log = { path = "../libs/log" }
 kernel-symbols = { path = "../libs/kernel-symbols" }

@@ -15,15 +15,18 @@
 //!       └─ jr VA ─────────────────►└─ jr __kernel_arch_loader ───►
 //! ```
 //!
-//! 早期页表布局（4 × 4KiB）：
+//! 早期页表布局（5 × 4KiB）：
 //!
 //! ```text
 //!   PGD[0]   → PUD_identity    PUD_identity[0] = 1G leaf → 0x0 (MMIO, RW+NX)
 //!   PGD[511] → PUD_kernel      PUD_identity[2] ─┐
-//!                              PUD_kernel[2]   ──┴→ PMD_ram（512×2MiB，RX/R/RW）
-//!                              PUD_identity[3] = 1G leaf → 0xC000_0000 (RW+NX)
-//!                              PUD_kernel[3..17] = 15 个 RAM 1G leaf（RW+NX）
-//!                              其它 PUD = 仅高端 DTB 所在 1GiB leaf（R+NX，临时）
+//!                              PUD_kernel[2]   ──┴→ PMD_kernel
+//!                                                   内部使用 2MiB leaves，末边界拆到 4KiB
+//!                              PUD_kernel[3..] = invalid
+//!
+//! DTB 在开启 MMU 前已复制到内核保留缓冲区，因此无需为不可信的
+//! 固件物理位置建立宽范围临时映射。解析 DTB 后，`prepare_no_map()` 才会在
+//! buddy 初始化前发布完整 RAM 直映，并精确留出 `no-map` 空洞。
 //! ```
 
 use core::arch::naked_asm;
@@ -61,31 +64,15 @@ const PTE_NONLEAF_V: usize = 0x01;
 
 /// 2 MiB 物理步长换算为 PTE PPN 字段后的增量：2MiB >> 2。
 const PMD_PTE_STEP: usize = 0x8_0000;
-/// loader 的 DTB 固定缓冲区上限；早期临时 leaf 至少要覆盖这么多字节。
-const EARLY_DTB_MAX_SIZE: usize = 2 * 1024 * 1024;
-/// 高端 DTB 临时映射使用 1 GiB PUD leaf，当前逻辑最多补映射相邻的一个 leaf。
-const EARLY_DTB_LEAF_SIZE: usize = 1 << 30;
-const _: () = assert!(EARLY_DTB_MAX_SIZE <= EARLY_DTB_LEAF_SIZE);
-/// DTB 在 leaf 内的偏移大于该值时，还需要映射下一个 leaf。
-const EARLY_DTB_NEXT_LEAF_THRESHOLD: usize = EARLY_DTB_LEAF_SIZE - EARLY_DTB_MAX_SIZE;
-
-/// 后续 1GiB RAM 区域（物理地址 0xC000_0000）的 PPN 高位部分。
-const RAM_UPPER_PPN_LUI: usize = 0x30000;
-/// 1 GiB 物理步长换算为 PTE PPN 字段后的增量：1 GiB >> 2。
-const PUD_PTE_STEP: usize = 0x1000_0000;
-/// 首个 1 GiB PMD 窗口之后，早期高半区需要补齐的 RAM PUD 数量。
-const EARLY_RAM_PUD_COUNT: usize =
-    (crate::riscv64::heap_vm::KERNEL_DIRECT_MAP_PHYS_END - 0xC000_0000) / EARLY_DTB_LEAF_SIZE;
-const _: () = assert!(EARLY_RAM_PUD_COUNT == 15);
 
 // ── 早期页表存储 ──────────────────────────────────────────────────────────────
 
-/// 早期启动页表——PGD、identity PUD、kernel PUD、共享 RAM PMD。
+/// 早期启动页表——PGD、identity PUD、kernel PUD、共享 RAM PMD 和末边界 PTE。
 #[repr(C, align(4096))]
-struct EarlyPageTable([u64; 512 * 4]);
+struct EarlyPageTable([u64; 512 * 5]);
 
 #[unsafe(link_section = ".data.prepage")]
-static EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 4]);
+static EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 5]);
 
 // ── _start ────────────────────────────────────────────────────────────────────
 
@@ -104,10 +91,61 @@ pub unsafe extern "C" fn _start() {
         "mv s0, a0",
         "mv s1, a1",
 
-        // ── 防御性屏障：关中断 + 清 sscratch ──
-        // 避免页表构建期间意外 trap 误入 from_user 路径
+        // 在解引用任何固件指针前先关中断并清 sscratch，避免异常
+        // 在尚无向量和栈的物理启动阶段误入 from_user 路径。
         "csrci sstatus, 2",
         "csrw sscratch, zero",
+
+        // satp=0 时可直接读固件物理地址。先校验固定头部，再把精确
+        // totalsize 复制到不会被 clear_bss() 清理的内核保留区。
+        "beqz s1, 99f",
+        "lbu t0, 0(s1)",
+        "li t1, 0xd0",
+        "bne t0, t1, 99f",
+        "lbu t0, 1(s1)",
+        "li t1, 0x0d",
+        "bne t0, t1, 99f",
+        "lbu t0, 2(s1)",
+        "li t1, 0xfe",
+        "bne t0, t1, 99f",
+        "lbu t0, 3(s1)",
+        "li t1, 0xed",
+        "bne t0, t1, 99f",
+        "lbu s2, 4(s1)",
+        "slli s2, s2, 24",
+        "lbu t0, 5(s1)",
+        "slli t0, t0, 16",
+        "or s2, s2, t0",
+        "lbu t0, 6(s1)",
+        "slli t0, t0, 8",
+        "or s2, s2, t0",
+        "lbu t0, 7(s1)",
+        "or s2, s2, t0",
+        "li t0, 32",
+        "bltu s2, t0, 99f",
+        "li t0, {dtb_buffer_size}",
+        "bltu t0, s2, 99f",
+        "add t0, s1, s2",
+        "bltu t0, s1, 99f",
+        "la t0, {dtb_buffer}",
+        "mv t1, s1",
+        "mv t2, s2",
+        "li t3, 4",
+        "bltu t2, t3, 11f",
+        "10: lw t4, 0(t1)",
+        "sw t4, 0(t0)",
+        "addi t1, t1, 4",
+        "addi t0, t0, 4",
+        "addi t2, t2, -4",
+        "bgeu t2, t3, 10b",
+        "11: beqz t2, 13f",
+        "12: lbu t4, 0(t1)",
+        "sb t4, 0(t0)",
+        "addi t1, t1, 1",
+        "addi t0, t0, 1",
+        "addi t2, t2, -1",
+        "bnez t2, 12b",
+        "13:",
 
         // ── 构建 Sv48 最小页表 ──
         // la 是 PC-relative，VMA 差值 == PA 差值，物理空间有效
@@ -118,10 +156,12 @@ pub unsafe extern "C" fn _start() {
         "add t3, t0, t3",           // t3 = PUD_kernel  (t0 + 8K)
         "lui t4, 0x3",
         "add t4, t0, t4",           // t4 = PMD_ram     (t0 + 12K)
+        "lui s3, 0x4",
+        "add s3, t0, s3",           // s3 = PTE_tail    (t0 + 16K)
 
-        // 清零 16KiB（.data 段不保证零初始化）
+        // 清零 20KiB（.data 段不保证零初始化）
         "mv t5, t0",
-        "lui t6, 0x4",
+        "lui t6, 0x5",
         "add t6, t0, t6",
         "2: sd zero, 0(t5)",
         "addi t5, t5, 8",
@@ -149,72 +189,52 @@ pub unsafe extern "C" fn _start() {
         "sd t2, 16(t1)",
         "sd t2, 16(t3)",
 
-        // identity 只保留启动实际需要的第二个 RAM 窗口。
-        "lui t2, {ram_upper_ppn_lui}",
-        "addi t2, t2, {pte_ram_rw_leaf}",
-        "sd t2, 24(t1)",
-
-        // QEMU 在大内存配置下会把 DTB 放到 4GiB 以上。loader 会先用
-        // phys_to_virt 复制 DTB，因此在正式 direct map 建好前临时映射 DTB 所在
-        // 1GiB leaf。该映射只读、不可执行，且 heap_vm 发布正式页表时会清除。
-        "srli t5, s1, 39",
-        "bnez t5, 99f",           // 当前早期 PGD 只覆盖低 512GiB PA
-        "srli t5, s1, 30",        // DTB 所在 1GiB leaf 索引
-        "li t6, 4",
-        "bltu t5, t6, 8f",        // PA < 4GiB 已由上述固定映射覆盖
-        "srli t2, s1, 30",
-        "slli t2, t2, 28",        // 1GiB-aligned PA >> 2（PTE PPN 字段）
-        "ori t2, t2, {pte_ram_r_leaf}",
-        "slli t6, t5, 3",
-        "add t0, t1, t6",
-        "sd t2, 0(t0)",
-        "add t0, t3, t6",
-        "sd t2, 0(t0)",
-
-        // DTB 缓冲区最大 2MiB；若起点过于靠近 1GiB 边界，同时映射
-        // 下一个 leaf。跨越当前 512GiB 早期窗口时无法安全继续。
-        "li t6, 0x3fffffff",
-        "and t6, s1, t6",
-        "li t0, {early_dtb_next_leaf_threshold}",
-        "bleu t6, t0, 8f",
-        "li t6, 511",
-        "beq t5, t6, 99f",
-        "addi t5, t5, 1",
-        "li t6, 0x10000000",      // 1GiB >> 2
-        "add t2, t2, t6",
-        "slli t6, t5, 3",
-        "add t0, t1, t6",
-        "sd t2, 0(t0)",
-        "add t0, t3, t6",
-        "sd t2, 0(t0)",
-        "8:",
-
-        // buddy 初始化会在正式页表发布前写入高端 RAM 元数据，因此高半区必须先
-        // 覆盖完整的 16 GiB 启动内存上限。若 DTB 位于其中，RW+NX RAM 映射替换
-        // 上面的临时只读 leaf；超过该范围的 DTB 临时映射保持不变。
-        "lui t2, {ram_upper_ppn_lui}",
-        "addi t2, t2, {pte_ram_rw_leaf}",
-        "li t5, 3",
-        "li t6, {early_ram_pud_count}",
-        "9: slli t0, t5, 3",
-        "add t0, t3, t0",
-        "sd t2, 0(t0)",
-        "li t0, {pud_pte_step}",
-        "add t2, t2, t0",
-        "addi t5, t5, 1",
-        "addi t6, t6, -1",
-        "bnez t6, 9b",
-
-        // 默认把 PA 0x8000_0000..0xC000_0000 建成 512 个 2MiB RW+NX leaf。
-        "li t2, 0x20000000 + {pte_ram_rw_leaf}",
-        "mv t5, t4",
-        "li t6, 512",
-        "3: sd t2, 0(t5)",
-        "addi t5, t5, 8",
-        "li t0, {pmd_pte_step}",
-        "add t2, t2, t0",
-        "addi t6, t6, -1",
-        "bnez t6, 3b",
+        // 仅为内核镜像 [skernel, ekernel) 建立 2MiB leaves。合法 DT 中的
+        // no-map 不得与正在执行的镜像重叠，因此解析 DTB 之前不映射
+        // 其它 RAM。
+        "la t0, {skernel}",
+        "li t1, 0x80000000",
+        "sub t0, t0, t1",
+        "srli t0, t0, 21",        // 首个 leaf 索引
+        "la t2, {ekernel}",
+        "sub t2, t2, t1",
+        "mv t3, t2",
+        "srli t2, t2, 21",        // 完整 2MiB leaf 的排他索引
+        "li t5, 0x20000000 + {pte_ram_rw_leaf}",
+        "slli t6, t0, 19",        // leaf index * (2MiB >> 2)
+        "add t5, t5, t6",
+        "3: bgeu t0, t2, 14f",
+        "slli t6, t0, 3",
+        "add t6, t4, t6",
+        "sd t5, 0(t6)",
+        "li t6, {pmd_pte_step}",
+        "add t5, t5, t6",
+        "addi t0, t0, 1",
+        "j 3b",
+        "14:",
+        // ekernel 不在 2MiB 边界时，最后一个区块用 4KiB PTE 只覆盖
+        // 真实内核尾部，不把同一大页内未知的 no-map 邻域提前映射。
+        "li t5, 0x1fffff",
+        "and t3, t3, t5",         // ekernel 在末区块内的字节数
+        "beqz t3, 15f",
+        "srli t5, s3, 2",
+        "ori t5, t5, {pte_nonleaf_v}",
+        "slli t6, t2, 3",
+        "add t6, t4, t6",
+        "sd t5, 0(t6)",
+        "srli t3, t3, 12",        // linker 保证 ekernel 4KiB 对齐
+        "li t5, 0x20000000 + {pte_ram_rw_leaf}",
+        "slli t6, t2, 19",
+        "add t5, t5, t6",
+        "mv t0, s3",
+        "16: beqz t3, 15f",
+        "sd t5, 0(t0)",
+        "addi t0, t0, 8",
+        "li t6, 0x400",            // 4KiB >> 2
+        "add t5, t5, t6",
+        "addi t3, t3, -1",
+        "j 16b",
+        "15:",
 
         // text 所在 2MiB leaves 改成 RX。链接脚本保证 etext 2MiB 对齐。
         "la t0, {stext}",
@@ -276,6 +296,10 @@ pub unsafe extern "C" fn _start() {
 
         virt_entry = sym _start_virtualized,
         early_pt = sym EARLY_PT,
+        dtb_buffer = sym crate::riscv64::loader::DTB_BUFFER,
+        dtb_buffer_size = const crate::riscv64::loader::DTB_BUF_SIZE,
+        skernel = sym skernel,
+        ekernel = sym ekernel,
         stext = sym stext,
         etext = sym etext,
         erodata = sym erodata,
@@ -285,16 +309,14 @@ pub unsafe extern "C" fn _start() {
         pte_ram_rx_leaf = const PTE_RAM_RX_LEAF,
         pte_ram_r_leaf = const PTE_RAM_R_LEAF,
         pmd_pte_step = const PMD_PTE_STEP,
-        pud_pte_step = const PUD_PTE_STEP,
-        early_dtb_next_leaf_threshold = const EARLY_DTB_NEXT_LEAF_THRESHOLD,
-        early_ram_pud_count = const EARLY_RAM_PUD_COUNT,
-        ram_upper_ppn_lui = const RAM_UPPER_PPN_LUI,
         satp_mode = const (SATP_MODE_SV48 >> 60),
         va_hi32 = const VA_OFFSET_HI32,
     )
 }
 
 unsafe extern "C" {
+    fn skernel();
+    fn ekernel();
     fn stext();
     fn etext();
     fn erodata();
@@ -323,9 +345,10 @@ unsafe extern "C" fn _start_virtualized() {
         "mv a1, s1",
         "la t0, pre_boot_init",
         "jalr t0",
-        // __kernel_arch_loader(hartid, dtb_paddr) — 不返回
+        // __kernel_arch_loader(hartid, dtb_paddr, dtb_size) — 不返回
         "mv a0, s0",
         "mv a1, s1",
+        "mv a2, s2",
         "la t0, __kernel_arch_loader",
         "jr t0",
     )

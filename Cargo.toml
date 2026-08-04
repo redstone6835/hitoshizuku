@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "libs/fdt",
     "libs/ktest",
     "libs/ktest/ktest-mock",
     "libs/errno",

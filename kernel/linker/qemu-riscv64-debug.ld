@@ -83,6 +83,9 @@ SECTIONS
      *   [sbss, ebss)         — BSS，由 clear_bss() 清零
      */
     .bss (NOLOAD) : AT(ADDR(.bss) - LOAD_OFFSET) {
+        /* MMU 开启前复制的 DTB；位于 sbss 前，避免 clear_bss() 擦除。 */
+        *(.bss.prepage .bss.prepage.*)
+        . = ALIGN(4K);
         PROVIDE(sheap = .);
         *(.bss.heap)
         . += 0x04000000;

@@ -115,8 +115,13 @@ fn firmware_bus_descriptor(info: &PlatformDeviceInfo) -> Result<FirmwareBusDescr
             crate::dev::pnp::PnpResourceKind::FirmwareBus,
             "parent #address-cells missing",
         ))?;
+    let range_cells: Vec<u32> = info
+        .u32_list_property(PROP_RANGES)
+        .into_iter()
+        .flatten()
+        .collect();
     let ranges = parse_ranges(
-        info.u32_list_property(PROP_RANGES).unwrap_or(&[]),
+        &range_cells,
         child_address_cells as usize,
         parent_address_cells as usize,
         child_size_cells as usize,
