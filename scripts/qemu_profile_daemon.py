@@ -36,7 +36,6 @@ GDB_FRAME_RE = re.compile(r"^#([0-9]+)\s+(.*)$")
 GDB_ADDRESS_RE = re.compile(r"^(0x[0-9a-fA-F]+)\s+in\s+(.*)$")
 VCPU_COMM_RE = re.compile(r"^CPU\s+([0-9]+)/(?:TCG|KVM)$")
 QEMU_SYSTEM_BINARY = "qemu-system-loongarch64"
-QEMU_SYSTEM_COMM = QEMU_SYSTEM_BINARY[:15]
 PLUGIN_MAGIC = b"MYGOBS1\0"
 PLUGIN_HEADER = struct.Struct("<8sHHIII12QII")
 PLUGIN_VERSION = 1
@@ -372,6 +371,7 @@ class PluginExitVcpu:
 class PluginExitSummary:
     """经过严格结构校验的 plugin atexit summary。"""
 
+    counter_granularity: str
     period_insns: int
     stack_bytes: int
     vcpus: tuple[PluginExitVcpu, ...]
@@ -397,6 +397,7 @@ def load_plugin_exit_summary(
         raise ProfileError(f"cannot read plugin exit summary {path}: {error}") from error
     if not isinstance(value, dict) or set(value) != {
         "schema",
+        "counter_granularity",
         "period_insns",
         "stack_bytes",
         "vcpus",
@@ -404,6 +405,8 @@ def load_plugin_exit_summary(
         raise ProfileError("plugin exit summary has invalid top-level fields")
     if value["schema"] != "mygo.qemu-observer-plugin.v1":
         raise ProfileError("plugin exit summary has invalid schema")
+    if value["counter_granularity"] != "translation-block":
+        raise ProfileError("plugin exit summary has invalid counter granularity")
     period_insns = _nonnegative_json_int("plugin exit period_insns", value["period_insns"])
     stack_bytes = _nonnegative_json_int("plugin exit stack_bytes", value["stack_bytes"])
     if period_insns != expected_period_insns or period_insns == 0:
@@ -435,6 +438,7 @@ def load_plugin_exit_summary(
     if set(by_cpu) != set(range(expected_vcpus)):
         raise ProfileError("plugin exit summary does not contain exact vCPU ids")
     return PluginExitSummary(
+        counter_granularity=value["counter_granularity"],
         period_insns=period_insns,
         stack_bytes=stack_bytes,
         vcpus=tuple(by_cpu[cpu] for cpu in range(expected_vcpus)),
@@ -609,7 +613,11 @@ class QemuProcessIdentity:
     cmdline_sha256: str | None
 
 
-def read_qemu_fallback_identity(pid: int, proc_root: Path = Path("/proc")) -> QemuProcessIdentity:
+def read_qemu_fallback_identity(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+    expected_binary: str = QEMU_SYSTEM_BINARY,
+) -> QemuProcessIdentity:
     """在 proc exe magic link 受限时，用严格的 comm/cmdline 证据确认 QEMU。"""
 
     process = proc_root / str(pid)
@@ -620,9 +628,10 @@ def read_qemu_fallback_identity(pid: int, proc_root: Path = Path("/proc")) -> Qe
         raise ProfileError(f"cannot read fallback identity for QEMU pid {pid}: {error}") from error
     arguments = cmdline.rstrip(b"\0").split(b"\0") if cmdline else []
     argv0 = arguments[0].decode("utf-8", errors="replace") if arguments else ""
-    if comm != QEMU_SYSTEM_COMM or Path(argv0).name != QEMU_SYSTEM_BINARY:
+    expected_comm = expected_binary[:15]
+    if comm != expected_comm or Path(argv0).name != expected_binary:
         raise ProfileError(
-            f"pid {pid} comm/cmdline is not {QEMU_SYSTEM_BINARY}: comm={comm!r} argv0={argv0!r}"
+            f"pid {pid} comm/cmdline is not {expected_binary}: comm={comm!r} argv0={argv0!r}"
         )
     return QemuProcessIdentity(
         method="proc-comm-cmdline",
@@ -635,7 +644,11 @@ def read_qemu_fallback_identity(pid: int, proc_root: Path = Path("/proc")) -> Qe
     )
 
 
-def read_qemu_process_identity(pid: int, proc_root: Path = Path("/proc")) -> QemuProcessIdentity:
+def read_qemu_process_identity(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+    expected_binary: str = QEMU_SYSTEM_BINARY,
+) -> QemuProcessIdentity:
     """优先读取 exe inode；仅权限拒绝时退回可复核的 proc 文本证据。"""
 
     executable = proc_root / str(pid) / "exe"
@@ -645,10 +658,10 @@ def read_qemu_process_identity(pid: int, proc_root: Path = Path("/proc")) -> Qem
     except OSError as error:
         if error.errno not in {errno.EACCES, errno.EPERM}:
             raise ProfileError(f"cannot identify QEMU pid {pid}: {error}") from error
-        return read_qemu_fallback_identity(pid, proc_root)
+        return read_qemu_fallback_identity(pid, proc_root, expected_binary)
     name = Path(target.removesuffix(" (deleted)")).name
-    if name != QEMU_SYSTEM_BINARY:
-        raise ProfileError(f"pid {pid} executable is not {QEMU_SYSTEM_BINARY}: {target}")
+    if name != expected_binary:
+        raise ProfileError(f"pid {pid} executable is not {expected_binary}: {target}")
     return QemuProcessIdentity(
         method="proc-exe-dev-inode",
         executable=target,
@@ -927,6 +940,7 @@ class CaptureState:
     plugin_samples: int = 0
     plugin_records: int = 0
     plugin_invalid: int = 0
+    plugin_unsymbolized: int = 0
     plugin_sequence_gaps: int = 0
     plugin_top_symbolized: int = 0
     plugin_first: dict[int, PluginRecord] = dataclasses.field(default_factory=dict)
@@ -967,7 +981,10 @@ class ProfileDaemon:
         self.serial_offset = 0
         self.timeline = SerialTimeline(args.stage_patterns)
         self.qemu_identity = self._read_proc_stat(args.qemu_pid)
-        self.qemu_process_identity = read_qemu_process_identity(args.qemu_pid)
+        self.qemu_process_identity = read_qemu_process_identity(
+            args.qemu_pid,
+            expected_binary=args.qemu_binary,
+        )
         self.clock_ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
         self.page_size = os.sysconf("SC_PAGE_SIZE")
         self.symbol_sha256 = sha256_file(args.symbol_file) if args.symbol_file else None
@@ -988,8 +1005,12 @@ class ProfileDaemon:
         if current.start_ticks != self.qemu_identity.start_ticks:
             raise ProfileError("QEMU pid was reused")
         initial = self.qemu_process_identity
+        expected_binary = getattr(self.args, "qemu_binary", QEMU_SYSTEM_BINARY)
         if initial.method == "proc-comm-cmdline":
-            identity = read_qemu_fallback_identity(self.args.qemu_pid)
+            identity = read_qemu_fallback_identity(
+                self.args.qemu_pid,
+                expected_binary=expected_binary,
+            )
             if (
                 identity.comm,
                 identity.argv0,
@@ -997,7 +1018,10 @@ class ProfileDaemon:
             ) != (initial.comm, initial.argv0, initial.cmdline_sha256):
                 raise ProfileError("QEMU fallback process identity changed")
         else:
-            identity = read_qemu_process_identity(self.args.qemu_pid)
+            identity = read_qemu_process_identity(
+                self.args.qemu_pid,
+                expected_binary=expected_binary,
+            )
             if identity.method != initial.method or (identity.device, identity.inode) != (
                 initial.device,
                 initial.inode,
@@ -1484,7 +1508,7 @@ class ProfileDaemon:
                 capture.frames += len(frames)
                 capture.symbolized_frames += len(frames)
             else:
-                capture.plugin_invalid += 1
+                capture.plugin_unsymbolized += 1
             self.writer.write(
                 "plugin_stack_sample",
                 received_ns,
@@ -1797,7 +1821,7 @@ class ProfileDaemon:
                 })
         stack_samples = capture.stack_attempts + capture.plugin_samples
         stack_successes = (
-            capture.stack_successes + capture.plugin_samples - capture.plugin_invalid
+            capture.stack_successes + capture.plugin_samples - capture.plugin_unsymbolized
         )
         return {
             "schema": SCHEMA,
@@ -1824,6 +1848,7 @@ class ProfileDaemon:
                 "plugin_samples": capture.plugin_samples,
                 "plugin_records": capture.plugin_records,
                 "plugin_invalid": capture.plugin_invalid,
+                "plugin_unsymbolized": capture.plugin_unsymbolized,
                 "plugin_active_vcpus": active_plugin_cpus,
                 "plugin_observed_vcpus": observed_plugin_cpus,
                 "plugin_unobserved_vcpus": unobserved_plugin_cpus,
@@ -2044,6 +2069,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     capture = subparsers.add_parser("capture", help="run the profiling daemon")
     capture.add_argument("--qemu-pid", type=positive_int, required=True)
+    capture.add_argument(
+        "--qemu-binary",
+        choices=("qemu-system-riscv64", "qemu-system-loongarch64"),
+        default=QEMU_SYSTEM_BINARY,
+    )
     capture.add_argument("--qmp-socket", type=Path)
     capture.add_argument("--gdb-socket", type=Path)
     capture.add_argument("--plugin-socket", type=Path)

@@ -299,6 +299,82 @@ fn late_sigkill_status_overrides_leader_raw_exit_for_parent_wait() {
 }
 
 #[ktest]
+fn default_sigterm_terminates_the_complete_thread_group() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+    leader.set_state(TaskState::Running);
+    worker.set_state(TaskState::Running);
+
+    crate::operation::apply_default_action_for_task(
+        &leader,
+        crate::SigInfo {
+            sig: SignalNumber::SIGTERM,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: crate::Uid::ROOT,
+            raw: None,
+        },
+    );
+
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(worker.group_exit_boundary_pending());
+    assert!(parent.reap_matching(|_| true).is_none());
+
+    assert!(crate::operation::complete_group_exit_if_requested(&worker));
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("parent must reap the SIGTERM-terminated leader");
+    let status = reaped.exit_wait_status().expect("leader wait status");
+    assert!(status.wifsignaled());
+    assert_eq!(status.wtermsig(), SignalNumber::SIGTERM.raw() as i32);
+    assert!(!status.wcoredump());
+}
+
+#[ktest]
+fn default_sigsegv_terminates_the_complete_thread_group_with_core_status() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    parent.add_child(Arc::clone(&leader));
+    leader.set_state(TaskState::Running);
+    worker.set_state(TaskState::Running);
+
+    crate::operation::apply_default_action_for_task(
+        &leader,
+        crate::SigInfo {
+            sig: SignalNumber::SIGSEGV,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: crate::Uid::ROOT,
+            raw: None,
+        },
+    );
+
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(worker.group_exit_boundary_pending());
+    assert!(parent.reap_matching(|_| true).is_none());
+
+    assert!(crate::operation::complete_group_exit_if_requested(&worker));
+    let reaped = parent
+        .reap_matching(|task| Arc::ptr_eq(task, &leader))
+        .expect("parent must reap the SIGSEGV-terminated leader");
+    let status = reaped.exit_wait_status().expect("leader wait status");
+    assert!(status.wifsignaled());
+    assert_eq!(status.wtermsig(), SignalNumber::SIGSEGV.raw() as i32);
+    assert!(status.wcoredump());
+}
+
+#[ktest]
 fn group_exit_sleep_commit_is_cancelled_after_precheck_window() {
     let group = ThreadGroup::new();
     let task = make_task_in_group(Arc::clone(&group));

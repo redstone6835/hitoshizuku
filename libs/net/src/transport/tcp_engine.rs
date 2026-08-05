@@ -900,6 +900,29 @@ impl TcpEndpointTable {
         Ok(Some((sender_id, peer_id)))
     }
 
+    /// 查找仍由流表持有的本地 TCP 对端。
+    ///
+    /// `SocketFacade::close()` 会在 ELM 处理关闭命令前递增 facade 代际，
+    /// 但已经交付到接收环形缓冲区的数据仍必须结算。这里以流代际、反向四元组
+    /// 和协议栈代际确认身份，不使用只适合发送快速路径的 facade 状态。
+    fn local_peer_flow_id(&self, sender_id: FlowId) -> Option<FlowId> {
+        let sender = self.flows.get(sender_id)?;
+        let hint = sender.local_peer_hint?;
+        let peer_id = hint.flow;
+        if sender_id == peer_id || self.flows.generation(peer_id) != Some(hint.flow_generation) {
+            return None;
+        }
+        let peer = self.flows.get(peer_id)?;
+        (sender.local_transport
+            && peer.local_transport
+            && sender.local == peer.remote
+            && sender.remote == peer.local
+            && sender.path.route.interface == peer.path.route.interface
+            && sender.facade.stack_generation() == hint.stack_generation
+            && peer.facade.stack_generation() == hint.stack_generation)
+            .then_some(peer_id)
+    }
+
     /// 对 socket 直达 lane 已经交付的字节统一推进 TCP 序列空间。
     ///
     /// 数据在进入这里前已经由代际校验的 peer route 原子地提交到接收 ring；本函数
@@ -913,18 +936,7 @@ impl TcpEndpointTable {
         if bytes == 0 {
             return None;
         }
-        let hint = self.flows.get(sender_id)?.local_peer_hint?;
-        let peer_id = hint.flow;
-        if sender_id == peer_id
-            || self.flows.generation(peer_id) != Some(hint.flow_generation)
-            || self.flows.get(peer_id).is_none_or(|peer| {
-                peer.facade.generation() != hint.facade_generation
-                    || peer.facade.stack_generation() != hint.stack_generation
-                    || peer.facade.is_closing()
-            })
-        {
-            return None;
-        }
+        let peer_id = self.local_peer_flow_id(sender_id)?;
 
         while bytes != 0 {
             let chunk = bytes;
@@ -978,12 +990,9 @@ impl TcpEndpointTable {
     }
 
     pub fn local_peer_facade(&self, sender_id: FlowId) -> Option<(FlowId, Arc<SocketFacade>)> {
-        let hint = self.flows.get(sender_id)?.local_peer_hint?;
-        let peer = self.flows.get(hint.flow)?;
-        (self.flows.generation(hint.flow) == Some(hint.flow_generation)
-            && peer.facade.generation() == hint.facade_generation
-            && peer.facade.stack_generation() == hint.stack_generation)
-            .then(|| (hint.flow, Arc::clone(&peer.facade)))
+        let peer_id = self.local_peer_flow_id(sender_id)?;
+        let peer = self.flows.get(peer_id)?;
+        Some((peer_id, Arc::clone(&peer.facade)))
     }
 
     fn ingest_local_with_info(
@@ -3755,6 +3764,44 @@ mod tests {
         let fin = table.take_output().unwrap();
         assert!(fin.flags.contains(TcpFlags::FIN));
         assert_eq!(fin.sequence, sequence + payload.len() as u32);
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            sequence + payload.len() as u32
+        );
+    }
+
+    #[test]
+    fn closing_local_receiver_reconciles_pending_direct_payload() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let sequence = table
+            .flows
+            .get(pair.client_flow)
+            .unwrap()
+            .machine
+            .send_next();
+        let payload = b"payload before local receiver close";
+        assert_eq!(
+            pair.client.send_stream(payload, true, None, false),
+            Ok(payload.len())
+        );
+
+        pair.server.close();
+        assert!(table.close_flow(pair.server_flow, 10_000));
+        assert_eq!(
+            table
+                .flows
+                .get(pair.client_flow)
+                .unwrap()
+                .machine
+                .send_next(),
+            sequence + payload.len() as u32
+        );
         assert_eq!(
             table
                 .flows

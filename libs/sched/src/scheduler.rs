@@ -2397,11 +2397,10 @@ pub fn balance_once(cpu_id: usize) -> bool {
 
     // 便宜的前置检查：本 CPU 已经有活干就没必要偷。
     //
-    // 下面的 domain stats 刷新 + 两次全 CPU 负载快照（其中一次还要取全局
-    // RUNQUEUE_SNAPSHOT_LOCK）是这个函数的绝大部分开销。实测在 BuildStorm
-    // 1200 s 窗口里，balance_once + update_domain_stats 合计吃掉约 9% 的内核
-    // 指令，其中大多数调用最后什么都没偷到——因为本核当时并不空闲。
-    // 先看一眼本地 runqueue 深度，能把绝大部分无收益的全局扫描挡在门外。
+    // 下面的亲和性敏感全 CPU 负载快照需要取全局 RUNQUEUE_SNAPSHOT_LOCK，是
+    // 这个函数的主要开销。域统计只供诊断查询使用，不能让每次迁移尝试都
+    // 重复构建一份不会参与本次决策的聚合统计。
+    // 先计算本地 runqueue 深度，能把绝大部分无收益的全局扫描挡在门外。
     if SCHEDULER.cpu_or_boot(cpu_id).runqueue().nr_running() > 1 {
         return false;
     }
@@ -2409,9 +2408,6 @@ pub fn balance_once(cpu_id: usize) -> bool {
     let topology_snapshot = SCHEDULER.topology_snapshot();
     let topology = topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
-    let domain_loads = collect_class_load_snapshot_for(&SCHEDULER, active);
-    SCHEDULER.update_domain_stats(topology_snapshot, domain_loads.loads());
-
     let load_snapshot = {
         let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
         RunqueueClassLoadSnapshot::collect(active, |cpu| {

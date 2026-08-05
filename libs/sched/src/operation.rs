@@ -1086,6 +1086,15 @@ fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
 }
 
 fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
+    let current = current_task();
+    terminate_thread_group_by_signal_from(target, info, &current)
+}
+
+fn terminate_thread_group_by_signal_from(
+    target: &Arc<Task>,
+    info: SigInfo,
+    current: &Arc<Task>,
+) -> bool {
     if target.is_kernel_task() {
         return false;
     }
@@ -1097,7 +1106,6 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
     let _ = group.request_group_signal(info.sig, core_dumped);
     let members = group.snapshot();
     let mut terminated = false;
-    let current = current_task();
     let mut need_handoff = false;
 
     for member in members.iter() {
@@ -1110,7 +1118,7 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
         // 不在发送者上下文直接 exit 目标任务。目标恢复自己的
         // 阻塞调用栈，再在 syscall/用户返回边界消费权威组状态。
         crate::scheduler::group_exit_wakeup(member);
-        if !Arc::ptr_eq(member, &current) {
+        if !Arc::ptr_eq(member, current) {
             need_handoff = true;
         }
         terminated = true;
@@ -1463,7 +1471,7 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
                             .dequeue_one_in(sig.bit())
                             .or_else(|| task.shared_signal().dequeue_one_in(sig.bit()))
                             .unwrap_or_else(|| make_siginfo(sig));
-                        apply_default_action(info);
+                        apply_default_action_for_task(task, info);
                     }
                     return true;
                 }
@@ -1741,7 +1749,7 @@ pub fn deliver_pending_signals_for_task(
     use crate::signal::SigHandler;
     match action.handler {
         SigHandler::Default => {
-            apply_default_action(info);
+            apply_default_action_for_task(me, info);
             None
         }
         SigHandler::Ignore => None,
@@ -1776,26 +1784,32 @@ pub fn setup_user_signal_frame_for_task(
     task.mark_rseq_event(RseqEvent::Signal);
     if (ops.prepare_user_return)(task, user_ctx).is_err() {
         task.clear_rseq_registration();
-        apply_default_action(SigInfo {
-            sig: SignalNumber::SIGSEGV,
-            code: 0,
-            sender_pid: 0,
-            sender_uid: crate::ids::Uid::ROOT,
-            raw: None,
-        });
+        apply_default_action_for_task(
+            task,
+            SigInfo {
+                sig: SignalNumber::SIGSEGV,
+                code: 0,
+                sender_pid: 0,
+                sender_uid: crate::ids::Uid::ROOT,
+                raw: None,
+            },
+        );
         return Err(Errno::EFAULT);
     }
     match (ops.setup_signal_frame)(task, info, action, user_ctx) {
         Ok(()) => Ok(()),
         Err(Errno::ENOSYS) => Err(Errno::ENOSYS),
         Err(error) => {
-            apply_default_action(SigInfo {
-                sig: SignalNumber::SIGSEGV,
-                code: 0,
-                sender_pid: 0,
-                sender_uid: crate::ids::Uid::ROOT,
-                raw: None,
-            });
+            apply_default_action_for_task(
+                task,
+                SigInfo {
+                    sig: SignalNumber::SIGSEGV,
+                    code: 0,
+                    sender_pid: 0,
+                    sender_uid: crate::ids::Uid::ROOT,
+                    raw: None,
+                },
+            );
             Err(error)
         }
     }
@@ -1818,36 +1832,36 @@ pub fn prepare_user_return_for_task(
     let result = (ops.prepare_user_return)(task, user_ctx);
     if result.is_err() {
         task.clear_rseq_registration();
-        apply_default_action(SigInfo {
-            sig: SignalNumber::SIGSEGV,
-            code: 0,
-            sender_pid: 0,
-            sender_uid: crate::ids::Uid::ROOT,
-            raw: None,
-        });
+        apply_default_action_for_task(
+            task,
+            SigInfo {
+                sig: SignalNumber::SIGSEGV,
+                code: 0,
+                sender_pid: 0,
+                sender_uid: crate::ids::Uid::ROOT,
+                raw: None,
+            },
+        );
     }
     result
 }
 
 pub fn apply_default_action(info: SigInfo) {
+    let task = current_task();
+    apply_default_action_for_task(&task, info);
+}
+
+pub(crate) fn apply_default_action_for_task(task: &Arc<Task>, info: SigInfo) {
     match default_action(info.sig) {
-        DefaultAction::Term => {
-            let me = current_task();
-            me.mark_signaled_exit(info.sig, false);
-            exit_task(&me, ExitCode(info.sig.raw() as i32));
-        }
-        DefaultAction::Core => {
-            let me = current_task();
-            me.mark_signaled_exit(info.sig, true);
-            exit_task(&me, ExitCode(info.sig.raw() as i32));
+        DefaultAction::Term | DefaultAction::Core => {
+            let _ = terminate_thread_group_by_signal_from(task, info, task);
+            let _ = complete_group_exit_if_requested(task);
         }
         DefaultAction::Stop => {
-            let me = current_task();
-            let _ = mark_task_stopped(&me, info.sig);
+            let _ = mark_task_stopped(task, info.sig);
         }
         DefaultAction::Cont => {
-            let me = current_task();
-            let _ = continue_task(&me);
+            let _ = continue_task(task);
         }
         DefaultAction::Ign => {}
     }

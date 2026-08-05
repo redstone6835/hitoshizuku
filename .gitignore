@@ -34,3 +34,4 @@ tests/elm/*/rust-toolchain.toml
 !vendor/**
 __pycache__/
 kernel-la.lock
+kernel-rv.lock

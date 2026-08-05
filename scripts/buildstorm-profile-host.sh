@@ -22,6 +22,25 @@ extract_progress() {
     '
 }
 
+serial_has_ordered() {
+    awk -v first="$1" -v second="$2" '
+    {
+        remainder = $0
+        if (!seen_first) {
+            position = index(remainder, first)
+            if (!position) next
+            seen_first = 1
+            remainder = substr(remainder, position + length(first))
+        }
+        if (index(remainder, second)) {
+            seen_second = 1
+            exit
+        }
+    }
+    END { exit !seen_second }
+    '
+}
+
 # 从 @@PROFILE_BUILD 行抽取"里程碑 -> 客机 uptime"时间线。
 #
 # 客机 runner 把 cargo 的 stdout/stderr 逐行转发为
@@ -71,8 +90,21 @@ if [ "${1:-}" = "--extract-progress-after" ]; then
     exit 0
 fi
 
+if [ "${1:-}" = "--serial-has-ordered" ]; then
+    [ "$#" -eq 3 ] && [ -n "$2" ] && [ -n "$3" ] || exit 2
+    serial_has_ordered "$2" "$3"
+    exit $?
+fi
+
 repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-duration_arg=${1:-0}
+print_config=0
+if [ "${1:-}" = "--print-config" ]; then
+    [ "$#" -eq 1 ] || { echo "usage: $0 [non-negative-seconds] | --print-config" >&2; exit 2; }
+    print_config=1
+    duration_arg=0
+else
+    duration_arg=${1:-0}
+fi
 if [ -n "${PROFILE_DURATION_MS:-}" ]; then
     duration_ms=$PROFILE_DURATION_MS
 else
@@ -89,19 +121,78 @@ esac
 warmup_ms=${PROFILE_WARMUP_MS:-0}
 stage_timeout_ms=${PROFILE_STAGE_TIMEOUT_MS:-0}
 boot_timeout_ms=${PROFILE_BOOT_TIMEOUT_MS:-0}
-done_timeout_ms=${PROFILE_DONE_TIMEOUT_MS:-0}
+done_timeout_requested_ms=${PROFILE_DONE_TIMEOUT_MS:-0}
 capture_start_timeout_ms=${PROFILE_CAPTURE_START_TIMEOUT_MS:-0}
 controller_timeout_ms=${PROFILE_CONTROLLER_TIMEOUT_MS:-0}
 sample_ms=${PROFILE_HOST_SAMPLE_MS:-1000}
 poll_ms=${PROFILE_POLL_MS:-50}
 anchor=${PROFILE_STAGE_ANCHOR:-workload}
 cpuset=${PROFILE_CPUSET:-}
-smp=${PROFILE_SMP:-12}
+arch=${PROFILE_ARCH:-loongarch64}
+target_fs=${PROFILE_TARGET_FS:-extfs}
+case "$target_fs" in
+    extfs|tmpfs) ;;
+    *) echo "PROFILE_TARGET_FS must be extfs or tmpfs" >&2; exit 2 ;;
+esac
+case "$arch" in
+    riscv64)
+        qemu_binary=qemu-system-riscv64
+        kernel_name=kernel-rv
+        qemu_cpu=default
+        qemu_bios=default
+        block_device=virtio-blk-device
+        block_device_x0=virtio-blk-device,drive=x0,bus=virtio-mmio-bus.1
+        block_device_x1=virtio-blk-device,drive=x1,bus=virtio-mmio-bus.0
+        workload_target=riscv64gc-unknown-linux-musl
+        default_smp=8
+        default_memory=16G
+        default_base=$repo/build/sdcard-rv.img
+        default_linux_kernel=$repo/build/linux-riscv64/vmlinux
+        default_linux_map=$repo/build/linux-riscv64/System.map
+        ;;
+    loongarch64)
+        qemu_binary=qemu-system-loongarch64
+        kernel_name=kernel-la
+        qemu_cpu=la464
+        qemu_bios=none
+        block_device=virtio-blk-pci
+        block_device_x0=virtio-blk-pci,drive=x0
+        block_device_x1=virtio-blk-pci,drive=x1
+        workload_target=loongarch64-unknown-linux-musl
+        default_smp=12
+        default_memory=36G
+        default_base=$repo/build/sdcard-la.img
+        default_linux_kernel=$repo/build/linux/vmlinux
+        default_linux_map=$repo/build/linux/System.map
+        ;;
+    *) echo "PROFILE_ARCH must be riscv64 or loongarch64" >&2; exit 2 ;;
+esac
+smp=${PROFILE_SMP:-$default_smp}
+memory=${PROFILE_MEMORY:-$default_memory}
+memory_value=${memory%?}
+memory_unit=${memory#"$memory_value"}
+case "$memory_value" in
+    ''|*[!0-9]*|0|0[0-9]*)
+        echo "PROFILE_MEMORY must be a positive integer followed by G or M" >&2
+        exit 2
+        ;;
+esac
+case "$memory_unit" in
+    G|M) ;;
+    *)
+        echo "PROFILE_MEMORY must be a positive integer followed by G or M" >&2
+        exit 2
+        ;;
+esac
+case "$memory_unit" in
+    G) memory_bytes=$((memory_value * 1024 * 1024 * 1024)) ;;
+    M) memory_bytes=$((memory_value * 1024 * 1024)) ;;
+esac
 for pair in \
     "PROFILE_WARMUP_MS:$warmup_ms" \
     "PROFILE_STAGE_TIMEOUT_MS:$stage_timeout_ms" \
     "PROFILE_BOOT_TIMEOUT_MS:$boot_timeout_ms" \
-    "PROFILE_DONE_TIMEOUT_MS:$done_timeout_ms" \
+    "PROFILE_DONE_TIMEOUT_MS:$done_timeout_requested_ms" \
     "PROFILE_CAPTURE_START_TIMEOUT_MS:$capture_start_timeout_ms" \
     "PROFILE_CONTROLLER_TIMEOUT_MS:$controller_timeout_ms" \
     "PROFILE_HOST_SAMPLE_MS:$sample_ms" \
@@ -111,6 +202,8 @@ do
     value=${pair#*:}
     case "$value" in ''|*[!0-9]*) echo "$name must be a non-negative integer" >&2; exit 2 ;; esac
 done
+done_timeout_ms=$done_timeout_requested_ms
+[ "$done_timeout_ms" -ne 0 ] || done_timeout_ms=300000
 [ "$sample_ms" -gt 0 ] || { echo "PROFILE_HOST_SAMPLE_MS must be positive" >&2; exit 2; }
 [ "$poll_ms" -gt 0 ] || { echo "PROFILE_POLL_MS must be positive" >&2; exit 2; }
 case "$cpuset" in *[!0-9,-]*) echo "PROFILE_CPUSET has invalid syntax" >&2; exit 2 ;; esac
@@ -138,15 +231,15 @@ esac
 boot_mode=${PROFILE_BOOT_MODE:-mygo}
 case "$boot_mode" in
     mygo)
-        default_kernel=$repo/kernel-la
+        default_kernel=$repo/$kernel_name
         default_map=
         default_capture=1
         workload_device=/dev/vd0
         tools_device=/dev/vd1
         ;;
     linux)
-        default_kernel=$repo/build/linux/vmlinux
-        default_map=$repo/build/linux/System.map
+        default_kernel=$default_linux_kernel
+        default_map=$default_linux_map
         default_capture=0
         workload_device=/dev/vda
         tools_device=/dev/vdb
@@ -154,10 +247,10 @@ case "$boot_mode" in
     *) echo "PROFILE_BOOT_MODE must be mygo or linux" >&2; exit 2 ;;
 esac
 kernel=${PROFILE_KERNEL:-"$default_kernel"}
-linux_initramfs=${PROFILE_LINUX_INITRAMFS:-"$repo/build/loongarch64/compat-initramfs.cpio"}
-base=${PROFILE_BASE_IMAGE:-"$repo/../oskernel2026-mygo-network-cagent/build/sdcard-la-pub.img"}
+linux_initramfs=${PROFILE_LINUX_INITRAMFS:-"$repo/build/$arch/compat-initramfs.cpio"}
+base=${PROFILE_BASE_IMAGE:-"$default_base"}
 container_image=${PROFILE_CONTAINER_IMAGE:-zhouzhouyi/os-contest:20260510}
-label=${PROFILE_LABEL:-"${boot_mode}-host${duration_ms}ms"}
+label=${PROFILE_LABEL:-"${arch}-${boot_mode}-host${duration_ms}ms"}
 observer_enabled=${PROFILE_QEMU_OBSERVER:-0}
 observer_system=${PROFILE_SYSTEM:-$boot_mode}
 observer_plugin=${PROFILE_QEMU_PLUGIN:-"$repo/build/qemu-plugins/buildstorm_observer.so"}
@@ -165,7 +258,7 @@ observer_map=${PROFILE_SYMBOL_MAP:-"$default_map"}
 observer_manifest=${PROFILE_SYMBOL_MANIFEST:-"$observer_map.manifest"}
 observer_period=${PROFILE_PLUGIN_PERIOD_INSNS:-50000000}
 observer_stack_bytes=${PROFILE_PLUGIN_STACK_BYTES:-1024}
-observer_histogram=${PROFILE_HISTOGRAM:-1}
+observer_histogram=${PROFILE_HISTOGRAM:-0}
 observer_proc_ms=${PROFILE_OBSERVER_PROC_MS:-1000}
 observer_require_valid=${PROFILE_OBSERVER_REQUIRE_VALID:-1}
 observer_require_manifest=${PROFILE_REQUIRE_SYMBOL_MANIFEST:-1}
@@ -176,6 +269,32 @@ timing_sampler=${PROFILE_TIMING_SAMPLER:-hashed-bernoulli-v1}
 capture=${PROFILE_CAPTURE:-$default_capture}
 event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
 event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}
+
+if [ "$print_config" -eq 1 ]; then
+    cat <<EOF
+schema=mygo.buildstorm-profile-config.v1
+arch=$arch
+boot_mode=$boot_mode
+qemu_binary=$qemu_binary
+kernel_name=$kernel_name
+kernel=$kernel
+base_image=$base
+machine=virt
+cpu=$qemu_cpu
+bios=$qemu_bios
+memory=$memory
+smp=$smp
+block_device=$block_device
+workload_block_device=$block_device_x0
+tools_block_device=$block_device_x1
+workload_device=$workload_device
+tools_device=$tools_device
+target_fs=$target_fs
+histogram_enabled=$observer_histogram
+done_timeout_ms=$done_timeout_ms
+EOF
+    exit 0
+fi
 case "$sampling:$trace_enabled" in
     0:0|0:1|1:0|1:1) ;;
     *) echo "PROFILE_SAMPLING and PROFILE_TRACE_ENABLED must be 0 or 1" >&2; exit 2 ;;
@@ -247,7 +366,7 @@ if [ "$observer_enabled" -eq 1 ]; then
         }
     fi
 fi
-for command in docker id ln mkfs.ext4 socat timeout python3 sha256sum setsid sudo; do
+for command in docker id ln mkfs.ext4 socat timeout python3 sha256sum setsid; do
     command -v "$command" >/dev/null 2>&1 || { echo "profile host: $command is required" >&2; exit 1; }
 done
 
@@ -351,13 +470,62 @@ send_line() {
         echo "profile host: refusing unsafe or oversized serial command" >&2
         return 2
     }
-    timeout 2 sh -c 'printf "%s\n" "$1" >"$2"' sh "$line" "$run_dir/serial.in"
+    timeout 5 python3 "$repo/scripts/serial_line_writer.py" "$run_dir/serial.in" "$line"
 }
 
 deadline_after_ms() {
     [ "$1" -eq 0 ] && return 0
     now=$(monotonic_ns)
     printf '%s\n' "$((now + $1 * 1000000))"
+}
+
+window_deadline_ns() {
+    window_start_ns=$1
+    window_duration_ms=$2
+    [ "$window_duration_ms" -eq 0 ] && return 0
+    printf '%s\n' "$((window_start_ns + window_duration_ms * 1000000))"
+}
+
+classify_window_state() {
+    window_observed_ns=$1
+    window_scheduled_deadline_ns=$2
+    window_workload_done=$3
+    if [ -n "$window_scheduled_deadline_ns" ] && \
+        [ "$window_observed_ns" -ge "$window_scheduled_deadline_ns" ]; then
+        window_state=deadline
+    elif [ "$window_workload_done" -eq 1 ]; then
+        window_state=natural
+    else
+        window_state=running
+    fi
+}
+
+classify_termination() {
+    deadline_stop_sent=$1
+    case "$deadline_stop_sent" in
+        0)
+            termination_mode=guest-runner-complete
+            runner_status_required=1
+            ;;
+        1)
+            termination_mode=host-qemu-teardown
+            runner_status_required=0
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+select_container_user() {
+    container_uid=$1
+    container_gid=$2
+    container_user_flag=1
+    case "$3" in
+        *name=rootless*)
+            container_uid=0
+            container_gid=0
+            container_user_flag=0
+            ;;
+    esac
 }
 
 deadline_expired() {
@@ -370,6 +538,18 @@ wait_for_fixed() {
     deadline=$(deadline_after_ms "$timeout_ms")
     while ! grep -Fq "$needle" "$run_dir/profile.serial.log" 2>/dev/null; do
         deadline_expired "$deadline" && return 1
+        sleep_ms 20
+    done
+}
+
+wait_for_ordered() {
+    ordered_first=$1
+    ordered_second=$2
+    ordered_timeout_ms=$3
+    ordered_deadline=$(deadline_after_ms "$ordered_timeout_ms")
+    while ! serial_has_ordered "$ordered_first" "$ordered_second" \
+        <"$run_dir/profile.serial.log" 2>/dev/null; do
+        deadline_expired "$ordered_deadline" && return 1
         sleep_ms 20
     done
 }
@@ -460,8 +640,8 @@ printf 'milestone\tmonotonic_ns\n' >"$run_dir/progress.tsv"
 printf 'monotonic_ns\tphase\tprogress\tqemu_utime_ticks\tqemu_stime_ticks\tload1\tload5\tload15\trunnable_total\tlast_pid\tcpu_some_avg10\tcpu_some_total\tio_some_avg10\tio_some_total\tio_full_avg10\tio_full_total\tmemory_some_avg10\tmemory_some_total\tmemory_full_avg10\tmemory_full_total\n' >"$run_dir/host-samples.tsv"
 printf 'monotonic_ns\tphase\tqemu_utime_ticks\tqemu_stime_ticks\n' >"$run_dir/qemu-cpu-boundaries.tsv"
 
-cp "$kernel" "$run_dir/kernel-la"
-kernel_id=$(sha256sum "$run_dir/kernel-la" | awk '{print $1}')
+cp "$kernel" "$run_dir/$kernel_name"
+kernel_id=$(sha256sum "$run_dir/$kernel_name" | awk '{print $1}')
 if [ -r "$linux_initramfs" ]; then
     initramfs_id=$(sha256sum "$linux_initramfs" | awk '{print $1}')
 else
@@ -477,12 +657,12 @@ fi
 base_id=$(sha256sum "$base" | awk '{print $1}')
 cp "$repo/scripts/profile-capture.sh" "$stage/profile-capture.sh"
 cp "$repo/scripts/buildstorm-profile-guest.sh" "$stage/run.sh"
-cat >"$run_dir/workload-plan.txt" <<'EOF'
-schema=mygo.buildstorm-workload.v1
-command=cargo build -p tg-xtask
+PROFILE_ARCH=$arch PROFILE_TARGET_FS=$target_fs "$stage/run.sh" plan \
+    >"$run_dir/workload-plan.txt"
+cat >>"$run_dir/workload-plan.txt" <<EOF
 cwd=/work/tgoskits
-target=/work/tgoskits/target
-target_setup=remove-and-mount-tmpfs:size=5G
+target_dir=/work/tgoskits/target
+target_setup=remove-target/$workload_target
 network=offline
 EOF
 workload_plan_id=$(sha256sum "$run_dir/workload-plan.txt" | awk '{print $1}')
@@ -514,6 +694,8 @@ else
 fi
 {
     printf 'export PROFILE_BOOT_MODE=%s\n' "$boot_mode"
+    printf 'export PROFILE_ARCH=%s\n' "$arch"
+    printf 'export PROFILE_TARGET_FS=%s\n' "$target_fs"
     printf 'export PROFILE_CAPTURE=%s\n' "$capture"
     printf 'export PROFILE_EVENT_MASK=%s\n' "$event_mask"
     printf 'export PROFILE_EVENT_MASK_HIGH=%s\n' "$event_mask_high"
@@ -531,10 +713,12 @@ chmod 0755 "$stage/profile-capture.sh" "$stage/run.sh"
 truncate -s 16M "$run_dir/tools.ext4"
 mkfs.ext4 -q -d "$stage" "$run_dir/tools.ext4"
 
-qemu_version=$(timeout 30 docker run --rm "$container_image" qemu-system-loongarch64 --version | head -n 1 | tr '\t\r\n' '   ')
+qemu_version=$(timeout 30 docker run --rm "$container_image" "$qemu_binary" --version | head -n 1 | tr '\t\r\n' '   ')
 container_image_id=$(timeout 10 docker image inspect --format '{{.Id}}' "$container_image")
 host_uid=$(id -u)
 host_gid=$(id -g)
+docker_security_options=$(timeout 10 docker info --format '{{json .SecurityOptions}}')
+select_container_user "$host_uid" "$host_gid" "$docker_security_options"
 case "$container_image_id" in
     sha256:*) container_digest=${container_image_id#sha256:} ;;
     *) echo "profile host: invalid container image identity: $container_image_id" >&2; exit 1 ;;
@@ -550,8 +734,10 @@ if [ -n "$cpuset" ]; then cpuset_identity=$cpuset; else cpuset_identity=unrestri
 clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
 {
     printf 'kernel_sha256=%s\nbase_sha256=%s\n' "$kernel_id" "$base_id"
-    printf 'qemu_version=%s\ncontainer_image=%s\ncpuset=%s\n' "$qemu_version" "$container_image" "$cpuset"
-    printf 'duration_ms=%s\nwarmup_ms=%s\nstage_anchor=%s\n' "$duration_ms" "$warmup_ms" "$anchor"
+    printf 'arch=%s\nqemu_binary=%s\nqemu_version=%s\ncontainer_image=%s\ncpuset=%s\n' \
+        "$arch" "$qemu_binary" "$qemu_version" "$container_image" "$cpuset"
+    printf 'duration_ms=%s\nwarmup_ms=%s\nstage_anchor=%s\ndone_timeout_ms=%s\n' \
+        "$duration_ms" "$warmup_ms" "$anchor" "$done_timeout_ms"
     printf 'capture_enabled=%s\n' "$capture"
     printf 'event_mask=%s\nevent_mask_high=%s\nsampling_enabled=%s\ntrace_enabled=%s\ntiming_shift=%s\ntiming_sampler=%s\n' \
         "$event_mask" "$event_mask_high" "$sampling" "$trace_enabled" "$timing_shift" "$timing_sampler"
@@ -560,42 +746,50 @@ clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
     printf 'qemu_observer_enabled=%s\nobserver_system=%s\n' "$observer_enabled" "$observer_system"
     printf 'guest_boot_mode=%s\nguest_initramfs_sha256=%s\n' "$boot_mode" "$initramfs_id"
     printf 'guest_workload_device=%s\nguest_tools_device=%s\n' "$workload_device" "$tools_device"
-    printf 'qemu_machine=virt\nqemu_cpu=la464\nqemu_accel=tcg,thread=multi\n'
+    printf 'qemu_machine=virt\nqemu_cpu=%s\nqemu_bios=%s\nqemu_accel=tcg,thread=multi\n' \
+        "$qemu_cpu" "$qemu_bios"
     printf 'qemu_name=buildstorm-profile\nqemu_debug_threads=on\n'
-    printf 'memory_bytes=8589934592\nsmp=%s\ncpuset_identity=%s\n' "$smp" "$cpuset_identity"
-    printf 'target_tmpfs=size=5G\ncold_target=true\ntoolchain=nightly-2026-05-28\n'
+    printf 'memory=%s\nmemory_bytes=%s\nsmp=%s\ncpuset_identity=%s\n' \
+        "$memory" "$memory_bytes" "$smp" "$cpuset_identity"
+    printf 'target_fs=%s\ntarget_triple=%s\ncold_target=true\ntoolchain=nightly-2026-05-28\n' \
+        "$target_fs" "$workload_target"
     printf 'container_image_id=%s\nworkload_plan_sha256=%s\nworkload_script_sha256=%s\n' \
         "$container_image_id" "$workload_plan_id" "$workload_script_id"
-    printf 'plugin_sha256=%s\nplugin_period_insns=%s\nplugin_stack_bytes=%s\nobserver_proc_ms=%s\n' \
-        "$plugin_id" "$observer_period" "$observer_stack_bytes" "$observer_proc_ms"
-    printf 'container_user=%s:%s\n' "$host_uid" "$host_gid"
+    printf 'plugin_sha256=%s\nplugin_period_insns=%s\nplugin_stack_bytes=%s\nobserver_proc_ms=%s\nhistogram_enabled=%s\n' \
+        "$plugin_id" "$observer_period" "$observer_stack_bytes" "$observer_proc_ms" \
+        "$observer_histogram"
+    printf 'container_user=%s:%s\n' "$container_uid" "$container_gid"
     printf 'symbol_manifest_required=%s\nsymbol_manifest_target=%s\nsymbol_manifest_sha256=%s\n' \
         "$observer_require_manifest" "$manifest_target" "$manifest_id"
 } >"$run_dir/metadata.env"
 
 base_dir=$(dirname "$base")
 base_name=$(basename "$base")
-set -- docker run --rm --user "$host_uid:$host_gid"
+set -- docker run --rm
+[ "$container_user_flag" -eq 0 ] || set -- "$@" --user "$container_uid:$container_gid"
 [ -z "$cpuset" ] || set -- "$@" --cpuset-cpus "$cpuset"
 set -- "$@" -v "$run_dir":/run -v "$base_dir":/base:ro "$container_image" \
     qemu-img create -f qcow2 -F raw -b "/base/$base_name" /run/run.qcow2
 timeout 60 "$@" >/dev/null
 
 mkfifo "$run_dir/serial.in"
-set -- docker run -d --name "$container" --user "$host_uid:$host_gid"
+set -- docker run -d --name "$container"
+[ "$container_user_flag" -eq 0 ] || set -- "$@" --user "$container_uid:$container_gid"
 [ -z "$cpuset" ] || set -- "$@" --cpuset-cpus "$cpuset"
 set -- "$@" -v "$run_dir":/run -v "$base_dir":/base:ro "$container_image" \
-    qemu-system-loongarch64 \
-    -machine virt -cpu la464 -accel tcg,thread=multi -m 8G -smp "$smp" \
+    "$qemu_binary" \
+    -machine virt -accel tcg,thread=multi -m "$memory" -smp "$smp" \
     -name guest=buildstorm-profile,debug-threads=on \
     -display none -monitor none -S -no-reboot -rtc base=utc \
     -serial unix:/run/serial.sock,server=on,wait=off \
     -qmp unix:/run/qmp.sock,server=on,wait=off \
-    -kernel /run/kernel-la \
+    -kernel "/run/$kernel_name" \
     -drive if=none,id=x0,file=/run/run.qcow2,format=qcow2 \
-    -device virtio-blk-pci,drive=x0 \
+    -device "$block_device_x0" \
     -drive if=none,id=x1,file=/run/tools.ext4,format=raw \
-    -device virtio-blk-pci,drive=x1
+    -device "$block_device_x1"
+[ "$qemu_cpu" = default ] || set -- "$@" -cpu "$qemu_cpu"
+[ "$qemu_bios" = none ] || set -- "$@" -bios "$qemu_bios"
 if [ "$boot_mode" = linux ]; then
     set -- "$@" \
         -initrd /run/linux-initramfs.cpio \
@@ -621,12 +815,14 @@ while [ ! -S "$run_dir/serial.sock" ] || [ ! -S "$run_dir/qmp.sock" ]; do
     sleep_ms 20
 done
 
-qemu_pid=$(timeout 5 docker top "$container" -eo pid,comm,args | awk 'NR > 1 && $2 != "tini" && /qemu-system-loongarch64/ { print $1; exit }')
+qemu_pid=$(timeout 5 docker top "$container" -eo pid,comm,args | \
+    awk -v qemu="$qemu_binary" 'NR > 1 && $2 != "tini" && index($0, qemu) { print $1; exit }')
 case "$qemu_pid" in ''|*[!0-9]*) echo "profile host: unable to resolve QEMU host PID" >&2; exit 1 ;; esac
 
 if [ "$observer_enabled" -eq 1 ]; then
     set -- python3 "$repo/scripts/qemu_profile_daemon.py" capture \
         --qemu-pid "$qemu_pid" \
+        --qemu-binary "$qemu_binary" \
         --plugin-socket "$runtime_socket_root/qemu-observer.sock" \
         --plugin-summary "$run_dir/qemu-observer-plugin-summary.json" \
         --serial-log "$run_dir/profile.serial.log" \
@@ -635,7 +831,7 @@ if [ "$observer_enabled" -eq 1 ]; then
         --control-socket "$runtime_socket_root/qemu-observer-control.sock" \
         --ready-file "$run_dir/qemu-observer.ready" \
         --system "$observer_system" \
-        --workload buildstorm-tg-xtask \
+        --workload buildstorm-arceos-helloworld \
         --vcpu-count "$smp" \
         --proc-interval-ms "$observer_proc_ms" \
         --stack-interval-ms 0 \
@@ -647,28 +843,34 @@ if [ "$observer_enabled" -eq 1 ]; then
         --plugin-stack-bytes "$observer_stack_bytes"
     if [ -r "$run_dir/kernel.map.manifest" ]; then
         set -- "$@" \
-            --kernel-image "$run_dir/kernel-la" \
+            --kernel-image "$run_dir/$kernel_name" \
             --symbol-manifest "$run_dir/kernel.map.manifest"
     fi
     set -- "$@" \
         --environment "container_image_id=$container_image_id" \
-        --environment "container_user=$host_uid:$host_gid" \
+        --environment "container_user=$container_uid:$container_gid" \
+        --environment "arch=$arch" \
+        --environment "qemu_binary=$qemu_binary" \
         --environment "qemu_version=$qemu_version" \
         --environment qemu_machine=virt \
-        --environment qemu_cpu=la464 \
+        --environment "qemu_cpu=$qemu_cpu" \
+        --environment "qemu_bios=$qemu_bios" \
         --environment qemu_accel=tcg,thread=multi \
         --environment qemu_name=buildstorm-profile \
         --environment qemu_debug_threads=on \
-        --environment memory_bytes=8589934592 \
+        --environment "memory=$memory" \
+        --environment "memory_bytes=$memory_bytes" \
         --environment "smp=$smp" \
         --environment "base_image_sha256=$base_id" \
         --environment "cpuset=$cpuset_identity" \
-        --environment target_tmpfs=size=5G \
+        --environment "target_fs=$target_fs" \
+        --environment "target_triple=$workload_target" \
         --environment "workload_plan_sha256=$workload_plan_id" \
         --environment "workload_script_sha256=$workload_script_id" \
         --environment "guest_initramfs_sha256=$initramfs_id" \
         --environment cold_target=true \
         --environment toolchain=nightly-2026-05-28 \
+        --environment "histogram_enabled=$observer_histogram" \
         --environment "plugin_sha256=$plugin_id"
     "$@" >"$run_dir/qemu-observer.stdout" 2>"$run_dir/qemu-observer.stderr" &
     observer_pid=$!
@@ -691,7 +893,7 @@ setsid sh -c '
     run_dir=$1
     runtime_socket_root=$2
     while :; do cat "$run_dir/serial.in"; done |
-        sudo -n socat STDIO "UNIX-CONNECT:$runtime_socket_root/serial.sock" |
+        socat STDIO "UNIX-CONNECT:$runtime_socket_root/serial.sock" |
         tee "$run_dir/profile.serial.log" >/dev/null
 ' sh "$run_dir" "$runtime_socket_root" &
 logger_pid=$!
@@ -700,7 +902,7 @@ logger_pid=$!
     sleep_ms 100
     printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"cont"}'
     sleep_ms 300
-} | timeout 10 sudo -n socat - "UNIX-CONNECT:$runtime_socket_root/qmp.sock" >"$run_dir/qmp.log"
+} | timeout 10 socat - "UNIX-CONNECT:$runtime_socket_root/qmp.sock" >"$run_dir/qmp.log"
 
 wait_for_fixed '[init] press Ctrl+C within 3 seconds' "$boot_timeout_ms" || {
     echo "profile host: init interrupt prompt timed out" >&2; exit 1;
@@ -717,25 +919,25 @@ serial_sync_attempts=0
 while [ "$serial_sync_attempts" -lt 3 ]; do
     serial_sync_attempts=$((serial_sync_attempts + 1))
     send_line "echo @\"\"@PROFILE_CONSOLE_SYNC token=$run_token"
-    if wait_for_fixed "@@PROFILE_CONSOLE_SYNC token=$run_token" "$controller_timeout_ms"; then
+    if wait_for_ordered "@@PROFILE_CONSOLE_SYNC token=$run_token" '~ # ' "$controller_timeout_ms"; then
         break
     fi
 done
-[ "$serial_sync_attempts" -le 3 ] &&
-    grep -Fq "@@PROFILE_CONSOLE_SYNC token=$run_token" "$run_dir/profile.serial.log" || {
+serial_has_ordered "@@PROFILE_CONSOLE_SYNC token=$run_token" '~ # ' \
+    <"$run_dir/profile.serial.log" || {
     echo "profile host: interactive console synchronization failed" >&2
     exit 1
 }
 
 send_line 'grep -q " /mnt " /proc/mounts && mkdir -p /tmp/p && echo @""@PROFILE_SETUP_1'
-wait_for_fixed "@@PROFILE_SETUP_1" "$controller_timeout_ms" || {
+wait_for_ordered "@@PROFILE_SETUP_1" '~ # ' "$controller_timeout_ms" || {
     echo "profile host: workload disk was not mounted before the shell prompt" >&2
     exit 1
 }
 send_line "{ grep -q ' /tmp/p ' /proc/mounts || mount -t ext4 $tools_device /tmp/p; } && echo @\"\"@PROFILE_SETUP_2"
-wait_for_fixed "@@PROFILE_SETUP_2" "$controller_timeout_ms" || { echo "profile host: guest setup mount failed" >&2; exit 1; }
+wait_for_ordered "@@PROFILE_SETUP_2" '~ # ' "$controller_timeout_ms" || { echo "profile host: guest setup mount failed" >&2; exit 1; }
 send_line '. /tmp/p/config.env && echo @""@PROFILE_SETUP_3'
-wait_for_fixed "@@PROFILE_SETUP_3" "$controller_timeout_ms" || { echo "profile host: guest setup config failed" >&2; exit 1; }
+wait_for_ordered "@@PROFILE_SETUP_3" '~ # ' "$controller_timeout_ms" || { echo "profile host: guest setup config failed" >&2; exit 1; }
 send_line '/tmp/p/run.sh run "$PROFILE_RUN_TOKEN" &'
 
 marker_deadline=$(deadline_after_ms "$controller_timeout_ms")
@@ -869,15 +1071,17 @@ if [ "$workload_ended" -eq 0 ]; then
     }
     start_observed_ns=$(monotonic_ns)
 fi
-deadline_ns=$(deadline_after_ms "$duration_ms")
+deadline_ns=$(window_deadline_ns "$start_ns" "$duration_ms")
 next_sample_ns=$((start_ns + sample_ms * 1000000))
 while [ "$workload_ended" -eq 0 ]; do
+    workload_done=0
+    workload_finished && workload_done=1
     now_ns=$(monotonic_ns)
-    if workload_finished; then
-        workload_ended=1
-        break
-    fi
-    deadline_expired "$deadline_ns" && break
+    classify_window_state "$now_ns" "$deadline_ns" "$workload_done"
+    case "$window_state" in
+        deadline) break ;;
+        natural) workload_ended=1; break ;;
+    esac
     record_progress
     if [ "$now_ns" -ge "$next_sample_ns" ]; then
         sample_host interval
@@ -989,10 +1193,6 @@ elif [ "$stop_sent" -eq 1 ]; then
     echo "profile host: missing frozen-window state after stop request" >&2
     exit 1
 fi
-actual_stop_sent=0
-if [ "$stop_sent" -eq 1 ] && [ "$frozen_ended" -eq 0 ]; then
-    actual_stop_sent=1
-fi
 stop_command_sent_ns=$(monotonic_ns)
 sample_host poststop
 printf '%s\n' "$stop_request_ns" >"$run_dir/host-stop-request-ns"
@@ -1002,8 +1202,8 @@ printf '%s\n' "$stop_command_sent_ns" >"$run_dir/host-stop-command-complete-ns"
 
 runner_status=null
 runner_status_observed=0
-termination_mode=host-qemu-teardown
-if [ "$actual_stop_sent" -eq 0 ]; then
+classify_termination "$stop_sent" || exit 1
+if [ "$runner_status_required" -eq 1 ]; then
     # A naturally completed workload remains valid only when the guest runner
     # reports its final status. Deadline runs already have a verified stopped
     # snapshot, so their teardown must not depend on guest task reaping.
@@ -1047,7 +1247,7 @@ set +e
     printf '%s\n' '{"execute":"qmp_capabilities"}'
     sleep_ms 100
     printf '%s\n' '{"execute":"quit"}'
-} | timeout 10 sudo -n socat - "UNIX-CONNECT:$runtime_socket_root/qmp.sock" \
+} | timeout 10 socat - "UNIX-CONNECT:$runtime_socket_root/qmp.sock" \
     >"$run_dir/qmp-shutdown.log"
 qmp_shutdown_status=$?
 set -e
@@ -1102,7 +1302,7 @@ PY
     )
 fi
 
-python3 - "$run_dir" "$anchor" "$anchor_ns" "$start_ns" "$stop_ns" "$done_ns" "$actual_stop_sent" "$runner_status" "$profile_report_status" "$capture_started" "$window_progress" "$stop_progress" "$start_observed_ns" "$stop_request_ns" "$stop_command_sent_ns" "$capture_stop_observed_ns" "$stop_sent" "$frozen_ended" "$frozen_quiescence_verified" "$runner_status_observed" "$termination_mode" "$frozen_quiescence_method" "$measurement_stop_ns" "$observer_histogram" <<'PY'
+python3 - "$run_dir" "$anchor" "$anchor_ns" "$start_ns" "$stop_ns" "$done_ns" "$deadline_stop_sent" "$runner_status" "$profile_report_status" "$capture_started" "$window_progress" "$stop_progress" "$start_observed_ns" "$stop_request_ns" "$stop_command_sent_ns" "$capture_stop_observed_ns" "$stop_sent" "$frozen_ended" "$frozen_quiescence_verified" "$runner_status_observed" "$termination_mode" "$frozen_quiescence_method" "$measurement_stop_ns" "$observer_histogram" <<'PY'
 import csv, json, pathlib, sys
 run_dir = pathlib.Path(sys.argv[1])
 metadata = {}
@@ -1132,6 +1332,27 @@ observer_enabled = metadata.get("qemu_observer_enabled") == "1"
 observer_summary = None
 if observer_enabled:
     observer_summary = json.loads((run_dir / "qemu-profile-summary.json").read_text())
+observer_capture = observer_summary.get("capture") if observer_summary else None
+window_start_ns = int(sys.argv[4])
+measurement_stop_ns = int(sys.argv[23])
+duration_ms = int(metadata["duration_ms"])
+scheduled_deadline_ns = (
+    window_start_ns + duration_ms * 1_000_000 if duration_ms > 0 else None
+)
+stop_requested = bool(int(sys.argv[17]))
+deadline_observation_latency_ms = (
+    (int(sys.argv[14]) - scheduled_deadline_ns) / 1_000_000
+    if stop_requested and scheduled_deadline_ns is not None
+    else None
+)
+observer_start_lead_latency_ms = (
+    (window_start_ns - int(observer_capture["start_monotonic_ns"])) / 1_000_000
+    if observer_capture else None
+)
+observer_stop_lag_latency_ms = (
+    (int(observer_capture["stop_monotonic_ns"]) - measurement_stop_ns) / 1_000_000
+    if observer_capture else None
+)
 runner_status = None if sys.argv[8] == "null" else int(sys.argv[8])
 runner_status_observed = bool(int(sys.argv[20]))
 termination_mode = sys.argv[21]
@@ -1151,16 +1372,20 @@ summary = {
     "timing": {
         "stage_anchor": sys.argv[2],
         "anchor_monotonic_ns": int(sys.argv[3] or 0),
-        "window_start_monotonic_ns": int(sys.argv[4]),
+        "window_start_monotonic_ns": window_start_ns,
         "window_start_progress": int(sys.argv[11]),
         "window_stop_progress": int(sys.argv[12]),
         "window_start_observed_monotonic_ns": int(sys.argv[13]),
         "start_observation_latency_ms": (int(sys.argv[13]) - int(sys.argv[4])) / 1_000_000,
         "stop_request_monotonic_ns": int(sys.argv[14]),
-        "measurement_stop_monotonic_ns": int(sys.argv[23]),
+        "scheduled_deadline_monotonic_ns": scheduled_deadline_ns,
+        "deadline_observation_latency_ms": deadline_observation_latency_ms,
+        "measurement_stop_monotonic_ns": measurement_stop_ns,
         "stop_monotonic_ns": int(sys.argv[5]),
         "stop_observation_latency_ms": (int(sys.argv[5]) - int(sys.argv[14])) / 1_000_000,
         "quiescence_observation_latency_ms": (int(sys.argv[5]) - int(sys.argv[23])) / 1_000_000,
+        "observer_start_lead_latency_ms": observer_start_lead_latency_ms,
+        "observer_stop_lag_latency_ms": observer_stop_lag_latency_ms,
         "done_monotonic_ns": int(sys.argv[6]),
         "stop_command_complete_monotonic_ns": int(sys.argv[15]),
         "capture_stop_observed_monotonic_ns": int(sys.argv[16]),
@@ -1174,7 +1399,7 @@ summary = {
         "runner_status": runner_status,
         "runner_status_observed": runner_status_observed,
         "termination_mode": termination_mode,
-        "stop_requested": bool(int(sys.argv[17])),
+        "stop_requested": stop_requested,
         "window_ended_before_stop": bool(int(sys.argv[18])),
         "quiescence_verified": bool(int(sys.argv[19])),
         "quiescence_method": sys.argv[22],
@@ -1207,6 +1432,7 @@ summary = {
         "summary": "qemu-profile-summary.json" if observer_enabled else None,
         "events": "qemu-profile.jsonl" if observer_enabled else None,
         "quality": observer_summary["quality"] if observer_summary else None,
+        "capture": observer_capture,
         "guest_instructions": observer_summary["guest_instructions"] if observer_summary else None,
         "histogram": "histogram.json" if (observer_enabled and bool(int(sys.argv[24]))) else None,
     },
@@ -1218,7 +1444,7 @@ elapsed_ns=$((measurement_stop_ns - start_ns))
 normal_exit=1
 printf 'PROFILE_HOST_DONE run_dir=%s elapsed_ms=%d.%06d status=%s status_observed=%s termination=%s stopped=%s observer_valid=%s\n' \
     "$run_dir" "$((elapsed_ns / 1000000))" "$((elapsed_ns % 1000000))" \
-    "$runner_status" "$runner_status_observed" "$termination_mode" "$actual_stop_sent" "$observer_quality_valid"
+    "$runner_status" "$runner_status_observed" "$termination_mode" "$deadline_stop_sent" "$observer_quality_valid"
 if [ "$observer_enabled" -eq 1 ] && [ "$observer_require_valid" -eq 1 ] && \
     [ "$observer_quality_valid" -ne 1 ]; then
     echo "profile host: QEMU observer quality gate failed" >&2
