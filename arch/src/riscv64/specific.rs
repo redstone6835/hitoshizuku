@@ -319,42 +319,124 @@ pub fn current_cpu_id() -> usize {
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// 硬件是否支持 Zicboz（cbo.zero 指令）。由 loader DTB 解析设置。
-pub static HAS_ZICBOZ: AtomicBool = AtomicBool::new(false);
+pub(crate) static HAS_ZICBOZ: AtomicBool = AtomicBool::new(false);
 
-/// cbo.zero 操作的 cache block 大小（字节）。Zicboz spec 默认 64。
-pub static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(64);
+/// cbo.zero 操作的 cache block 大小（字节）；0 表示尚未完成全 hart 校验。
+pub(crate) static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-/// 高效清零一页内存。
+/// 使用 Zicboz 连续清零 16 个 cache block，并返回下一块地址。
 ///
-/// 如果硬件支持 Zicboz，使用 `cbo.zero` 逐 cache block 清零（跳过 read-for-ownership）；
-/// 否则 fallback 到 sd 批量写零。
+/// Linux `clear_page` 采用同样的 16 块展开，避免每个 cache block 都执行一次
+/// 地址计算和循环分支。
+#[inline(always)]
+unsafe fn cbo_zero_16(mut addr: usize, block_size: usize) -> usize {
+    // Safety: 调用方保证从 addr 开始的 16 个 cache block 均在独占可写范围内。
+    unsafe {
+        core::arch::asm!(
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+            "add {addr}, {addr}, {block_size}",
+            addr = inout(reg) addr,
+            block_size = in(reg) block_size,
+            options(nostack, preserves_flags),
+        );
+    }
+    addr
+}
+
+/// 高效清零一段完整页面内存。
+///
+/// 如果所有 hart 都支持 Zicboz，使用 `cbo.zero` 跳过 read-for-ownership；
+/// 否则使用八路展开的普通 `sd`。loader 在发布能力位前已经验证所有启用 hart
+/// 的 cache block 大小一致、合法且不超过基础页，因此热路径不重复做除法校验。
 ///
 /// # Safety
 ///
-/// `vaddr` 必须是有效的、已映射的、页对齐的虚拟地址，且 `len` 是 8 的倍数。
+/// `vaddr` 必须是有效的、已映射的、基础页对齐虚拟地址，`len` 必须是基础页
+/// 大小的整数倍，且 `[vaddr, vaddr + len)` 不得回绕。
 #[inline]
 pub unsafe fn zero_memory_fast(vaddr: usize, len: usize) {
-    if HAS_ZICBOZ.load(core::sync::atomic::Ordering::Relaxed) {
+    let end = vaddr + len;
+    if HAS_ZICBOZ.load(core::sync::atomic::Ordering::Acquire) {
         let block_size = CBO_BLOCK_SIZE.load(core::sync::atomic::Ordering::Relaxed);
-        let mut offset = 0;
-        while offset < len {
+        debug_assert!(block_size.is_power_of_two());
+        debug_assert!(block_size <= allocator::PAGE_SIZE);
+        debug_assert_eq!(vaddr % block_size, 0);
+        debug_assert_eq!(len % allocator::PAGE_SIZE, 0);
+        let batch_size = block_size * 16;
+        let mut addr = vaddr;
+        while end - addr >= batch_size {
+            // Safety: 本轮 16 个 cache block 全部落在独占范围内。
+            addr = unsafe { cbo_zero_16(addr, block_size) };
+        }
+        while addr < end {
+            // Safety: loader 不变量与基础页对齐契约保证完整 cache block 未越界。
             unsafe {
-                // cbo.zero rs1 编码：imm[11:0]=0x004, funct3=010, rd=x0, opcode=0x0F
                 core::arch::asm!(
-                    ".insn i 0x0F, 0x2, x0, {addr}, 0x004",
-                    addr = in(reg) vaddr + offset,
-                    options(nostack, preserves_flags)
+                    ".insn i 0x0f, 0x2, x0, {addr}, 0x004",
+                    addr = in(reg) addr,
+                    options(nostack, preserves_flags),
                 );
             }
-            offset += block_size;
+            addr += block_size;
         }
-    } else {
-        // 回退方案：sd 批量写零
-        let mut ptr = vaddr as *mut u64;
-        let end = (vaddr + len) as *mut u64;
-        while ptr < end {
-            unsafe { core::ptr::write_volatile(ptr, 0) };
-            ptr = unsafe { ptr.add(1) };
+        return;
+    }
+
+    // 显式汇编防止编译器把展开循环重新收缩为通用 memset。
+    let mut ptr = vaddr as *mut u64;
+    while end - ptr as usize >= 64 {
+        // Safety: 循环条件保证 8 个 u64 存储都位于调用方提供的可写范围内。
+        unsafe {
+            core::arch::asm!(
+                "sd zero, 0({ptr})",
+                "sd zero, 8({ptr})",
+                "sd zero, 16({ptr})",
+                "sd zero, 24({ptr})",
+                "sd zero, 32({ptr})",
+                "sd zero, 40({ptr})",
+                "sd zero, 48({ptr})",
+                "sd zero, 56({ptr})",
+                "addi {ptr}, {ptr}, 64",
+                ptr = inout(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    while (ptr as usize) < end {
+        // Safety: 剩余范围按 u64 对齐且长度是 8 的倍数。
+        unsafe {
+            core::ptr::write_volatile(ptr, 0);
+            ptr = ptr.add(1);
         }
     }
 }
