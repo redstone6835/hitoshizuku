@@ -67,6 +67,8 @@ runs = tuple([load(path) for path in group] for group in groups)
 all_runs = runs[0] + runs[1]
 stable_metadata = (
     "base_sha256",
+    "arch",
+    "qemu_binary",
     "qemu_version",
     "container_image",
     "container_image_id",
@@ -74,6 +76,7 @@ stable_metadata = (
     "cpuset",
     "cpuset_identity",
     "duration_ms",
+    "done_timeout_ms",
     "warmup_ms",
     "stage_anchor",
     "poll_ms",
@@ -81,6 +84,7 @@ stable_metadata = (
     "host_clock_ticks_per_second",
     "capture_enabled",
     "event_mask",
+    "event_mask_high",
     "sampling_enabled",
     "trace_enabled",
     "timing_shift",
@@ -91,12 +95,15 @@ stable_metadata = (
     "guest_tools_device",
     "qemu_machine",
     "qemu_cpu",
+    "qemu_bios",
     "qemu_accel",
     "qemu_name",
     "qemu_debug_threads",
+    "memory",
     "memory_bytes",
     "smp",
-    "target_tmpfs",
+    "target_fs",
+    "target_triple",
     "cold_target",
     "toolchain",
     "workload_plan_sha256",
@@ -123,12 +130,54 @@ for run in all_runs:
         if metadata.get(key) != reference.get(key):
             fail(f"metadata mismatch for {key}: {run['_path']}")
     timing = run.get("timing", {})
-    duration_ms = number("duration_ms", metadata.get("duration_ms"), 1.0)
-    boundary_limit_ms = min(max_boundary_ms, duration_ms * max_boundary_pct / 100.0)
-    for field in ("start_observation_latency_ms", "stop_observation_latency_ms"):
-        latency = number(field, timing.get(field))
-        if latency > boundary_limit_ms:
-            fail(f"{field}={latency:.3f} exceeds {boundary_limit_ms:.3f}: {run['_path']}")
+    configured_duration_ms = number("duration_ms", metadata.get("duration_ms"))
+    if configured_duration_ms == 0:
+        window_duration_ms = number("elapsed_ms", timing.get("elapsed_ms"), 1.0)
+    else:
+        window_duration_ms = configured_duration_ms
+    boundary_limit_ms = min(
+        max_boundary_ms,
+        window_duration_ms * max_boundary_pct / 100.0,
+    )
+    window_start_ns = number("window_start_monotonic_ns", timing.get("window_start_monotonic_ns"))
+    window_start_observed_ns = number(
+        "window_start_observed_monotonic_ns",
+        timing.get("window_start_observed_monotonic_ns"),
+    )
+    stop_request_ns = number(
+        "stop_request_monotonic_ns", timing.get("stop_request_monotonic_ns")
+    )
+    measurement_stop_ns = number(
+        "measurement_stop_monotonic_ns", timing.get("measurement_stop_monotonic_ns")
+    )
+    stop_ns = number("stop_monotonic_ns", timing.get("stop_monotonic_ns"))
+    if not window_start_ns <= window_start_observed_ns <= stop_request_ns:
+        fail(f"window timestamp ordering is inconsistent: {run['_path']}")
+    if not stop_request_ns <= measurement_stop_ns <= stop_ns:
+        fail(f"stop timestamp ordering is inconsistent: {run['_path']}")
+    calculated_latencies = {
+        "start_observation_latency_ms":
+            (window_start_observed_ns - window_start_ns) / 1_000_000,
+        "stop_observation_latency_ms": (stop_ns - stop_request_ns) / 1_000_000,
+        "quiescence_observation_latency_ms":
+            (stop_ns - measurement_stop_ns) / 1_000_000,
+        "elapsed_ms": (measurement_stop_ns - window_start_ns) / 1_000_000,
+    }
+    for field, calculated in calculated_latencies.items():
+        recorded = number(field, timing.get(field), 1.0 if field == "elapsed_ms" else 0.0)
+        if not math.isclose(recorded, calculated, abs_tol=1e-6):
+            fail(f"{field} is inconsistent: {run['_path']}")
+        if field in ("start_observation_latency_ms", "stop_observation_latency_ms") \
+                and recorded > boundary_limit_ms:
+            fail(f"{field}={recorded:.3f} exceeds {boundary_limit_ms:.3f}: {run['_path']}")
+    scheduled_deadline_ns = timing.get("scheduled_deadline_monotonic_ns")
+    expected_deadline_ns = (
+        window_start_ns + configured_duration_ms * 1_000_000
+        if configured_duration_ms > 0
+        else None
+    )
+    if scheduled_deadline_ns != expected_deadline_ns:
+        fail(f"scheduled deadline is inconsistent: {run['_path']}")
     result = run.get("result", {})
     for field in ("deadline_stop_sent", "workload_ended_early", "runner_status",
                   "runner_status_observed", "termination_mode", "stop_requested",
@@ -160,6 +209,20 @@ for run in all_runs:
     if result["workload_ended_early"] == deadline_stop:
         fail(f"inconsistent workload completion classification: {run['_path']}")
     if deadline_stop:
+        deadline_latency = number(
+            "deadline_observation_latency_ms",
+            timing.get("deadline_observation_latency_ms"),
+        )
+        if measurement_stop_ns != stop_request_ns:
+            fail(f"deadline measurement boundary is inconsistent: {run['_path']}")
+        expected_deadline_latency = (stop_request_ns - scheduled_deadline_ns) / 1_000_000
+        if not math.isclose(deadline_latency, expected_deadline_latency, abs_tol=1e-6):
+            fail(f"deadline_observation_latency_ms is inconsistent: {run['_path']}")
+        if deadline_latency > boundary_limit_ms:
+            fail(
+                f"deadline_observation_latency_ms={deadline_latency:.3f} "
+                f"exceeds {boundary_limit_ms:.3f}: {run['_path']}"
+            )
         host_teardown = termination_mode == "host-qemu-teardown"
         observed_stop = (
             termination_mode == "guest-runner-complete"
@@ -168,7 +231,7 @@ for run in all_runs:
         )
         if not (host_teardown and not runner_status_observed or observed_stop):
             fail(f"deadline-stopped run has inconsistent termination evidence: {run['_path']}")
-        if not result["stop_requested"] or result["window_ended_before_stop"]:
+        if not result["stop_requested"]:
             fail(f"deadline-stopped run has inconsistent stop markers: {run['_path']}")
     elif (
         termination_mode != "guest-runner-complete"
@@ -178,8 +241,33 @@ for run in all_runs:
         fail(f"early-complete run lacks a successful observed runner status: {run['_path']}")
     elif not result["window_ended_before_stop"]:
         fail(f"early-complete run has inconsistent stop markers: {run['_path']}")
+    elif timing.get("deadline_observation_latency_ms") is not None:
+        fail(f"natural completion cannot claim deadline observation latency: {run['_path']}")
+    elif measurement_stop_ns != stop_ns:
+        fail(f"natural measurement boundary is inconsistent: {run['_path']}")
     if result["quiescence_verified"] is not True:
         fail(f"run lacks verified process-group quiescence: {run['_path']}")
+    if metadata.get("qemu_observer_enabled") == "1":
+        observer = run.get("qemu_observer")
+        capture = observer.get("capture") if isinstance(observer, dict) else None
+        if not isinstance(capture, dict):
+            fail(f"QEMU observer capture boundary is missing: {run['_path']}")
+        observer_start_ns = number(
+            "observer start_monotonic_ns", capture.get("start_monotonic_ns")
+        )
+        observer_stop_ns = number(
+            "observer stop_monotonic_ns", capture.get("stop_monotonic_ns")
+        )
+        observer_latencies = {
+            "observer_start_lead_latency_ms": (window_start_ns - observer_start_ns) / 1_000_000,
+            "observer_stop_lag_latency_ms": (observer_stop_ns - measurement_stop_ns) / 1_000_000,
+        }
+        for field, calculated in observer_latencies.items():
+            recorded = number(field, timing.get(field))
+            if not math.isclose(recorded, calculated, abs_tol=1e-6):
+                fail(f"{field} is inconsistent: {run['_path']}")
+            if recorded > boundary_limit_ms:
+                fail(f"{field}={recorded:.3f} exceeds {boundary_limit_ms:.3f}: {run['_path']}")
     profiling = run.get("profiling", {})
     if profiling.get("capture_started") and profiling.get("report_status") != "available":
         fail(f"capture has no valid report: {run['_path']}")
