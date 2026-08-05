@@ -4853,7 +4853,7 @@ impl ElmCore {
             PreparedAsyncProviderWork::Handled => true,
             PreparedAsyncProviderWork::External(plan) => {
                 let result = execute_provider_call_plan(&plan.call);
-                self.complete_async_provider_execution(plan, result, sched::now_ns_public())
+                self.complete_async_provider_execution(plan, result, sched::now_ns_direct())
             }
         }
     }
@@ -4957,7 +4957,7 @@ impl ElmCore {
                 status,
                 reply,
                 blockers,
-                sched::now_ns_public(),
+                sched::now_ns_direct(),
             );
             return PreparedAsyncProviderWork::Handled;
         }
@@ -10300,7 +10300,7 @@ impl ElmCore {
             push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_RESOURCES);
             return;
         }
-        let now_ns = sched::now_ns_public();
+        let now_ns = sched::now_ns_direct();
         for cell in &self.cells {
             if !super::resource_accounting::registered(cell.id)
                 || super::resource_accounting::registered_budget(cell.id)
@@ -10399,7 +10399,7 @@ impl ElmCore {
 
     fn check_health_executions(&self, records: &mut Vec<ElmCoreHealthRecord>) {
         let start = records.len();
-        let now_ns = sched::now_ns_public();
+        let now_ns = sched::now_ns_direct();
         for cell in &self.cells {
             if cell.exclusive_execution && cell.active_executions != 1
                 || !cell.exclusive_execution && cell.active_executions == u32::MAX
@@ -10763,7 +10763,7 @@ impl ElmCore {
                     active.provider_epoch,
                     active.started_at_ns,
                     active.deadline_ns,
-                    sched::now_ns_public().saturating_sub(active.started_at_ns),
+                    sched::now_ns_direct().saturating_sub(active.started_at_ns),
                 )
                 .as_str(),
             );
@@ -10999,7 +10999,7 @@ impl ElmCore {
     }
 
     fn sysfs_executions_text(&self) -> String {
-        let now_ns = sched::now_ns_public();
+        let now_ns = sched::now_ns_direct();
         let mut out = format!(
             "active_provider_executions={}\nqueued_provider_jobs={}\nrunning_provider_jobs={}\nretained_provider_results={}\n",
             self.active_provider_executions.len(),
@@ -11073,7 +11073,7 @@ impl ElmCore {
     }
 
     fn sysfs_resource_accounting_text(&self) -> String {
-        let now_ns = sched::now_ns_public();
+        let now_ns = sched::now_ns_direct();
         let mut out = format!("status=ok\ncells={}\n", self.cells.len());
         for cell in &self.cells {
             let usage = super::resource_accounting::snapshot(cell.id, now_ns);
@@ -13597,7 +13597,7 @@ impl ElmCore {
                 binding: binding.map(|edge| edge.id),
                 lease,
                 provider_epoch: provider.backend_epoch,
-                started_at_ns: sched::now_ns_public(),
+                started_at_ns: sched::now_ns_direct(),
                 deadline_ns,
             });
         Ok(ProviderExecutionReservation {
@@ -15571,7 +15571,7 @@ impl ElmCore {
     }
 
     pub(crate) fn cell_resource_usage(&self, id: ElmId) -> ElmResourceUsage {
-        let accounted = super::resource_accounting::snapshot(id, sched::now_ns_public());
+        let accounted = super::resource_accounting::snapshot(id, sched::now_ns_direct());
         let provider_ports = self
             .providers
             .iter()
@@ -16092,7 +16092,7 @@ impl ElmCore {
         };
         let record = ElmRuntimeTraceRecord::new(
             sequence,
-            sched::now_ns_public(),
+            sched::now_ns_direct(),
             kind,
             action,
             status,
@@ -17340,7 +17340,7 @@ pub(crate) fn run_one_async_provider_job_unlocked(now_ns: u64) -> bool {
         PreparedAsyncProviderWork::Handled => true,
         PreparedAsyncProviderWork::External(plan) => {
             let result = execute_provider_call_plan(&plan.call);
-            let finish_ns = sched::now_ns_public();
+            let finish_ns = sched::now_ns_direct();
             with_core(|core| core.complete_async_provider_execution(plan, result, finish_ns));
             true
         }

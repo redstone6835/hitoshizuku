@@ -249,10 +249,10 @@ fn vfs_lookup_invoke(frame: ElmCallFrame) -> ElmReplyFrame {
 }
 
 fn current_vfs_context() -> Option<Arc<VfsContext>> {
-    if !sched::is_ready() {
+    if !sched::is_ready_direct() {
         return None;
     }
-    let payload = sched::current_task().ext_lookup(sched::TASKEXT_VFS_CONTEXT)?;
+    let payload = sched::current_task_direct().ext_lookup(sched::TASKEXT_VFS_CONTEXT)?;
     payload.downcast::<VfsContext>().ok()
 }
 

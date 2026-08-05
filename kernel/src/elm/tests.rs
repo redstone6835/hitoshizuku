@@ -102,7 +102,7 @@ fn elm_runtime_namespace_registry_resolves_declared_namespace() {
 
 #[ktest]
 fn elm_kernel_memory_allocator_enforces_exact_owner() {
-    let before = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_public());
+    let before = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_direct());
     let request = allocator::MemoryRequest::new(allocator::MemoryDomain::Kernel, 64, 16)
         .with_zeroing(allocator::Zeroing::Zeroed);
     let record = allocator::KERNEL_ALLOCATOR
@@ -142,7 +142,7 @@ fn elm_kernel_memory_allocator_enforces_exact_owner() {
     allocator::KERNEL_ALLOCATOR
         .deallocate_owned(ELM_MGR_ID.0, grown.ptr)
         .expect("同一 owner 释放应成功");
-    let after = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_public());
+    let after = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_direct());
     assert_eq!(after.dynamic_alloc_bytes, before.dynamic_alloc_bytes);
     assert!(after.peak_dynamic_alloc_bytes >= before.peak_dynamic_alloc_bytes);
 }
@@ -3977,7 +3977,7 @@ fn elm_native_panic_uses_controlled_recovery_exit() {
 #[ktest]
 fn elm_native_timeout_forces_controlled_exit() {
     let cell = ElmId(0x7002);
-    let deadline = sched::now_ns_public().saturating_add(50_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(50_000_000);
     let result = super::native::test_call_native_entry_with_deadline(
         test_native_entry_spins as usize,
         cell,
@@ -4046,16 +4046,16 @@ fn elm_native_fault_recovers_on_secondary_cpu() {
     )
     .expect("无法在辅助 CPU 启动 ELM fault 测试线程");
 
-    let deadline = sched::now_ns_public().saturating_add(2_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(2_000_000_000);
     while matches!(SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire), 0 | 10)
-        && sched::now_ns_public() < deadline
+        && sched::now_ns_direct() < deadline
     {
         core::hint::spin_loop();
     }
-    let cleanup_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let cleanup_deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     while (task.state() != sched::TaskState::Dead
         || sched::current_task_on(1).is_some_and(|current| Arc::ptr_eq(&current, &task)))
-        && sched::now_ns_public() < cleanup_deadline
+        && sched::now_ns_direct() < cleanup_deadline
     {
         core::hint::spin_loop();
     }
@@ -4273,7 +4273,7 @@ fn elm_mgr_loads_eki_declarative_topology() {
         detach_plan.affected_dependents,
         detach_plan.affected_extensions,
     );
-    let resources = super::resource_accounting::snapshot(ElmId(cell_id), sched::now_ns_public());
+    let resources = super::resource_accounting::snapshot(ElmId(cell_id), sched::now_ns_direct());
     assert_eq!(
         (
             resources.dynamic_alloc_bytes,
@@ -4507,7 +4507,7 @@ fn elm_provider_async_core_completes_and_releases_lease_on_poll() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1_000, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4548,7 +4548,7 @@ fn elm_provider_async_cancel_queued_job_releases_lease() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit = core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 0, 0), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
 
@@ -4577,7 +4577,7 @@ fn elm_provider_async_running_job_is_observable_and_cancelable() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1_000, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4651,7 +4651,7 @@ fn elm_provider_async_running_timeout_is_retained_until_poll() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4690,7 +4690,7 @@ fn elm_provider_async_queued_timeout_is_retained_until_poll() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4722,7 +4722,7 @@ fn elm_provider_async_queue_full_rejects_without_holding_lease() {
     core.init_builtin_mgr().unwrap();
     let (action, bind_response) = bind_mgr_action_provider(&mut core);
     let payload = action_invoke_payload(&ElmActionInvokeRequest::new(action));
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
 
     for call_id in 0..ELM_PROVIDER_ASYNC_QUEUE_LIMIT {
         let frame = ElmCallFrame::new(
@@ -5790,7 +5790,7 @@ fn elm_mgr_channel_dispatches_async_provider_queue_flow() {
     }
     assert!(found);
 
-    assert!(core.run_one_async_provider_job_at(sched::now_ns_public().saturating_add(100_000)));
+    assert!(core.run_one_async_provider_job_at(sched::now_ns_direct().saturating_add(100_000)));
     let poll_payload = provider_async_poll_payload(&ElmProviderAsyncPollRequest::new(ticket_id));
     let poll_response = dispatch_mgr_call_on_core(
         &mut core,

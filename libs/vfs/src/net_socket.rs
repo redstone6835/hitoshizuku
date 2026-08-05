@@ -46,7 +46,7 @@ pub fn packet_realtime_ns(monotonic_ns: u64) -> u64 {
     NET_REALTIME_CLOCK
         .lock()
         .map(|clock| {
-            let now_monotonic = sched::now_ns_public();
+            let now_monotonic = sched::now_ns_direct();
             clock().saturating_sub(now_monotonic.saturating_sub(monotonic_ns))
         })
         .unwrap_or(monotonic_ns)
@@ -805,7 +805,7 @@ impl FileOps for NetSocketFileOps {
             && options.linger_enabled
             && options.linger_seconds != 0)
             .then(|| {
-                sched::now_ns_public()
+                sched::now_ns_direct()
                     .saturating_add(u64::from(options.linger_seconds).saturating_mul(1_000_000_000))
             });
         self.proxy.close_with_deadline(deadline);
@@ -920,7 +920,7 @@ fn unspecified(family: u16) -> net::IpAddr {
 }
 
 fn timeout_deadline(timeout_ns: u64) -> Option<u64> {
-    (timeout_ns != 0).then(|| sched::now_ns_public().saturating_add(timeout_ns))
+    (timeout_ns != 0).then(|| sched::now_ns_direct().saturating_add(timeout_ns))
 }
 
 pub(crate) fn map_socket_error_public(error: net::SocketError) -> Errno {

@@ -1604,7 +1604,7 @@ pub(super) fn sys_epoll_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_epoll_pwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let timeout_base_ns = sched::now_ns_public();
+    let timeout_base_ns = sched::now_ns_direct();
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
     let maxevents = ctx.args[2] as i32;
@@ -3127,7 +3127,7 @@ pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 }
 
 pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let timeout_base_ns = sched::now_ns_public();
+    let timeout_base_ns = sched::now_ns_direct();
     let epfd = fd_arg(ctx.args[0])?;
     let events_user = ctx.args[1];
     let maxevents = ctx.args[2] as i32;
@@ -3227,14 +3227,14 @@ pub(super) fn sys_file_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, E
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
-        Some(sched::now_ns_public().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
+        Some(sched::now_ns_direct().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
     } else {
         None
     }
 }
 
 fn timeout_expired(deadline: Option<u64>) -> bool {
-    deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
+    deadline.is_some_and(|dl| sched::now_ns_direct() >= dl)
 }
 
 fn poll_recheck_deadline(
@@ -3286,7 +3286,7 @@ fn wait_on_poll_sources(
     sources: &[(Arc<vfs::file::File>, PollEvents)],
     deadline: Option<u64>,
 ) -> Result<(), Errno> {
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
     }
@@ -3307,7 +3307,7 @@ fn wait_on_poll_sources(
     // 完整注册 waiter 后，注册后的 readiness 复查已经闭合丢失唤醒窗口，直接
     // 等待事件或原始超时。只有混入无 waiter 的设备时才按短周期兼容轮询。
     let recheck_deadline =
-        poll_recheck_deadline(sched::now_ns_public(), deadline, all_sources_registered);
+        poll_recheck_deadline(sched::now_ns_direct(), deadline, all_sources_registered);
     let deadline_armed =
         recheck_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
 
@@ -3342,8 +3342,8 @@ fn wait_on_poll_sources(
     }
 
     drop(task);
-    sched::schedule_once(sched::now_ns_public());
-    let task = sched::current_task();
+    sched::schedule_once(sched::now_ns_direct());
+    let task = sched::current_task_direct();
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
@@ -3370,7 +3370,7 @@ impl TemporarySigmask {
                 old: SigSet::EMPTY,
             };
         };
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         let old = task.signal.block(mask, SigProcMaskHow::SetMask);
         Self {
             task: Some(task),
@@ -4108,10 +4108,10 @@ fn file_read_user_chunk(
 }
 
 fn current_vm_space() -> Option<Arc<VmSpace>> {
-    if !sched::is_ready() {
+    if !sched::is_ready_direct() {
         return None;
     }
-    sched::current_task()
+    sched::current_task_direct()
         .ext_lookup(sched::TASKEXT_VM_SPACE)?
         .downcast::<VmSpace>()
         .ok()
@@ -4265,7 +4265,7 @@ fn read_iovecs(
 
 fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Result<(), Errno> {
     const IO_RECHECK_NS: u64 = 10_000_000;
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
     }
@@ -4281,7 +4281,7 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
     // waiter 时也必须定期重检 readiness，否则阻塞 read/write 可能永久睡眠；
     // 直接忙等又会饿死 QEMU/设备后端的输入投递。
     let recheck_deadline = {
-        let now = sched::now_ns_public();
+        let now = sched::now_ns_direct();
         let quantum = now.saturating_add(IO_RECHECK_NS);
         deadline.map_or(quantum, |dl| dl.min(quantum))
     };
@@ -4319,8 +4319,8 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
 
     let task = if registered || deadline_armed {
         drop(task);
-        sched::schedule_once(sched::now_ns_public());
-        let task = sched::current_task();
+        sched::schedule_once(sched::now_ns_direct());
+        let task = sched::current_task_direct();
         if registered {
             file.poll_remove_waiter(&task);
         }
@@ -4333,7 +4333,7 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         restore_current_task_after_wait(&task);
         drop(task);
         sched::operation::sched_yield()?;
-        sched::current_task()
+        sched::current_task_direct()
     };
 
     if has_unblocked_signal(&task) {
@@ -4350,7 +4350,7 @@ fn has_unblocked_signal(task: &Arc<sched::Task>) -> bool {
 }
 
 fn deliver_sigpipe() {
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     let creds = task.credentials();
     let info = sched::SigInfo {
         sig: sched::SignalNumber::SIGPIPE,
@@ -5077,5 +5077,5 @@ fn read_socket_timeout_deadline(user: usize) -> Result<Option<u64>, Errno> {
     let delta_ns = (sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(nsec as u64);
-    Ok(Some(sched::now_ns_public().saturating_add(delta_ns)))
+    Ok(Some(sched::now_ns_direct().saturating_add(delta_ns)))
 }

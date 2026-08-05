@@ -2466,18 +2466,18 @@ fn run_block_overhead_diagnosis(tag: &str, dev: &Arc<BlockDevice>) {
         n
     );
 
-    // B2: 2x now_ns_public — 同步路径每次 I/O 都至少调 2 次
+    // B2: 2x now_ns_direct — 同步路径每次 I/O 都至少调 2 次
     let t0 = hal::time::monotonic_ns();
     let mut sink = 0u64;
     for _ in 0..n {
-        let a = sched::now_ns_public();
-        let b = sched::now_ns_public();
+        let a = sched::now_ns_direct();
+        let b = sched::now_ns_direct();
         sink = sink.wrapping_add(a ^ b);
     }
     core::hint::black_box(sink);
     let dt_now2 = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][{}][DIAG]   2x now_ns_public:         {} ns/op (n={})",
+        "[bench][{}][DIAG]   2x now_ns_direct:         {} ns/op (n={})",
         tag,
         dt_now2 / n,
         n

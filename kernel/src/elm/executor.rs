@@ -135,7 +135,7 @@ unsafe extern "C" fn provider_worker(cpu_id: usize) -> ! {
         let mut budget = 0usize;
         loop {
             PROVIDER_WORKER_BUSY[cpu_id].store(true, Ordering::Release);
-            let handled = super::core::run_one_async_provider_job_unlocked(sched::now_ns_public());
+            let handled = super::core::run_one_async_provider_job_unlocked(sched::now_ns_direct());
             PROVIDER_WORKER_BUSY[cpu_id].store(false, Ordering::Release);
             if !handled {
                 break;
@@ -146,11 +146,11 @@ unsafe extern "C" fn provider_worker(cpu_id: usize) -> ! {
                 // 内核线程不会走用户态 trap 返回的抢占收尾；有界主动调度既
                 // 响应 need_resched，也让同一 CPU 上的用户任务及时获得机会。
                 budget = 0;
-                sched::schedule_once(sched::now_ns_public());
+                sched::schedule_once(sched::now_ns_direct());
             }
         }
 
-        let current = sched::current_task();
+        let current = sched::current_task_direct();
         PROVIDER_WORKER_WAITS[cpu_id].fetch_add(1, Ordering::Relaxed);
         PROVIDER_WORK_QUEUE.wait_event(&current, || {
             super::core::with_core(|core| core.has_provider_async_work())

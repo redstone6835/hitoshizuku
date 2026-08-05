@@ -287,7 +287,7 @@ impl NativeCallPermit {
 impl Drop for NativeCallPermit {
     fn drop(&mut self) {
         if !self.finished {
-            let now_ns = sched::now_ns_public();
+            let now_ns = sched::now_ns_direct();
             let _ = finish_native_call(
                 self.cell,
                 self.stack_bytes,

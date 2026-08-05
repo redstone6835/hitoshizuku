@@ -104,7 +104,7 @@ pub fn flock(file: &Arc<File>, exclusive: bool, nonblock: bool) -> Result<(), Er
     } else {
         LockKind::Shared
     };
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
 
     loop {
         let wait = {
@@ -141,7 +141,7 @@ pub fn flock(file: &Arc<File>, exclusive: bool, nonblock: bool) -> Result<(), Er
             return Err(Errno::EINTR);
         }
 
-        sched::schedule_once(sched::now_ns_public());
+        sched::schedule_once(sched::now_ns_direct());
         waiters.finish_wait(&entry);
     }
 }

@@ -1987,7 +1987,7 @@ fn parse_fd_component(name: &str) -> Option<u32> {
 }
 
 fn lookup_task(pid: PidT) -> Option<Arc<Task>> {
-    if !sched::is_ready() || pid <= 0 {
+    if !sched::is_ready_direct() || pid <= 0 {
         return None;
     }
     sched::root_pid_ns()
@@ -2007,7 +2007,7 @@ fn ensure_task_exists(pid: PidT) -> VfsResult<Arc<Task>> {
 /// 状态字段，调用方应把它视为一致性检查而不是完整的 proc ABI。
 fn render_task_snapshot() -> VfsResult<Vec<u8>> {
     let mut tasks = Vec::new();
-    if sched::is_ready() {
+    if sched::is_ready_direct() {
         for (pid, weak) in sched::root_pid_ns().registry().snapshot() {
             if let Some(task) = weak.upgrade() {
                 tasks.push((pid, task));
@@ -2056,7 +2056,7 @@ fn render_task_snapshot() -> VfsResult<Vec<u8>> {
 }
 
 fn snapshot_root_processes() -> Vec<PidT> {
-    if !sched::is_ready() {
+    if !sched::is_ready_direct() {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -2084,10 +2084,10 @@ fn snapshot_thread_ids(leader_pid: PidT) -> VfsResult<Vec<PidT>> {
 }
 
 fn current_tgid_tid() -> VfsResult<(PidT, PidT)> {
-    if !sched::is_ready() {
+    if !sched::is_ready_direct() {
         return Err(VfsError::NotFound);
     }
-    let me = sched::current_task();
+    let me = sched::current_task_direct();
     let tid = me.pid_root().ok_or(VfsError::NotFound)?;
     let tgid = task_leader_pid(&me).unwrap_or(tid);
     Ok((tgid, tid))
@@ -2180,10 +2180,10 @@ fn uid_sets_match(me: &SchedCredentials, target: &SchedCredentials) -> bool {
 }
 
 fn can_inspect_task(task: &Arc<Task>) -> bool {
-    if !sched::is_ready() {
+    if !sched::is_ready_direct() {
         return true;
     }
-    let me = sched::current_task();
+    let me = sched::current_task_direct();
     if Arc::ptr_eq(&me, task) {
         return true;
     }
@@ -2329,7 +2329,7 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let num_threads = task_thread_count(task);
     let (vsize, rss_bytes, _) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
-    let usage = task.usage_snapshot(sched::now_ns_public());
+    let usage = task.usage_snapshot(sched::now_ns_direct());
     let child_usage = task.child_usage_snapshot();
     let utime = proc_cpu_ticks(usage.user_ns);
     let stime = proc_cpu_ticks(usage.system_ns);
@@ -2965,7 +2965,7 @@ impl core::fmt::Write for FixedBuf<'_> {
 }
 
 fn render_uptime() -> String {
-    let ns = sched::now_ns_public();
+    let ns = sched::now_ns_direct();
     let secs = ns / 1_000_000_000;
     // 第二个字段是累计 idle 时间。调度器尚未导出 per-CPU idle accounting，
     // 因此只报告可证明的系统运行时间，idle 兼容字段保持 0。
@@ -2982,7 +2982,7 @@ fn render_stat() -> String {
     let mut processes = 0usize;
     let mut running = 0usize;
     let mut blocked = 0usize;
-    if sched::is_ready() {
+    if sched::is_ready_direct() {
         for (_, weak) in sched::root_pid_ns().registry().snapshot() {
             let Some(task) = weak.upgrade() else {
                 continue;

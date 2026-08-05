@@ -60,15 +60,15 @@ impl<T> Completion<T> {
         }
         // Completion<T> 当前是单消费者原语；T 不要求 Clone，不能把同一结果发给多个 waiter。
         self.wait_queue.wake_one_with(|task| {
-            if sched::is_ready() && task.state() == sched::TaskState::Runnable {
-                sched::enqueue_task(Arc::clone(task), sched::now_ns_public());
+            if sched::is_ready_direct() && task.state() == sched::TaskState::Runnable {
+                sched::enqueue_task(Arc::clone(task), sched::now_ns_direct());
             }
         });
     }
 
     /// 同步阻塞等待结果。调度器就绪时用 WaitQueue 让出 CPU；否则 spin。
     pub fn wait(&self) -> T {
-        if sched::is_ready() {
+        if sched::is_ready_direct() {
             self.wait_blocking()
         } else {
             self.wait_spinning()
@@ -114,7 +114,7 @@ impl<T> Completion<T> {
                     return result;
                 }
             }
-            let task = sched::current_task();
+            let task = sched::current_task_direct();
             let entry = self
                 .wait_queue
                 .prepare_to_wait(&task, sched::TaskState::Sleeping);
@@ -125,7 +125,7 @@ impl<T> Completion<T> {
                 }
             }
             drop(task);
-            sched::schedule_once(sched::now_ns_public());
+            sched::schedule_once(sched::now_ns_direct());
             self.wait_queue.finish_wait(&entry);
         }
     }
