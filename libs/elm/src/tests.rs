@@ -3938,6 +3938,49 @@ fn current_context_policy_check_uses_entered_snapshot() {
 }
 
 #[test]
+fn fallback_current_context_suspension_is_nested_and_restores_outer() {
+    assert!(crate::current_context().is_none());
+    let outer = crate::ElmContext::new(
+        crate::ElmId(43),
+        Some(crate::ELM_MGR_BUILTIN_ID),
+        crate::Generation(8),
+        crate::ElmState::Active,
+        crate::ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let inner = crate::ElmContext::new(
+        crate::ElmId(44),
+        Some(crate::ElmId(43)),
+        crate::Generation(2),
+        crate::ElmState::Active,
+        crate::ElmLifecyclePhase::Resume,
+        0,
+    );
+
+    let outer_guard = crate::enter_current_context(&outer).expect("外层测试上下文必须可进入");
+    assert_eq!(crate::current_cell(), Some(crate::ElmId(43)));
+    {
+        let _suspension = crate::suspend_current_context().expect("暂停边界必须可进入");
+        assert!(crate::current_context().is_none());
+        {
+            let _nested_suspension =
+                crate::suspend_current_context().expect("嵌套暂停边界必须可进入");
+            assert!(crate::current_context().is_none());
+        }
+        assert!(crate::current_context().is_none());
+        {
+            let _inner_guard =
+                crate::enter_current_context(&inner).expect("暂停边界内显式上下文必须可进入");
+            assert_eq!(crate::current_cell(), Some(crate::ElmId(44)));
+        }
+        assert!(crate::current_context().is_none());
+    }
+    assert_eq!(crate::current_cell(), Some(crate::ElmId(43)));
+    drop(outer_guard);
+    assert!(crate::current_context().is_none());
+}
+
+#[test]
 fn manager_api_descriptor_is_available_from_elm_root() {
     let record = crate::ElmMgrApiDescriptor::new(
         1,
