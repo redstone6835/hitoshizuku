@@ -184,8 +184,8 @@ impl Errno {
         }
     }
 
-    #[kernel_symbols::export(name = "errno.Errno.as_i32", contract = "kernel.errno.conversion@1", version = 1, capabilities = kernel_symbols::capability::CORE_SAFE)]
-    pub fn as_i32(self) -> i32 {
+    #[inline]
+    pub const fn as_i32_direct(self) -> i32 {
         match self {
             Errno::ESUCCESS => 0,
             Errno::EPERM => 1,
@@ -269,6 +269,11 @@ impl Errno {
             Errno::ENOTRECOVERABLE => 131,
             Errno::Other(code) => code,
         }
+    }
+
+    #[kernel_symbols::export(name = "errno.Errno.as_i32", contract = "kernel.errno.conversion@1", version = 1, capabilities = kernel_symbols::capability::CORE_SAFE)]
+    pub fn as_i32(self) -> i32 {
+        self.as_i32_direct()
     }
 
     pub fn as_usize(self) -> usize {

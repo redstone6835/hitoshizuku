@@ -312,10 +312,16 @@ fn now_ns_internal() -> u64 {
     arch_hooks::time().map_or(0, |o| (o.now_ns)())
 }
 
+/// 内核内部时间戳入口，不经过 ELM 导出路由。
+#[inline]
+pub fn now_ns_direct() -> u64 {
+    now_ns_internal()
+}
+
 /// 对外导出的时间戳访问器。上层 idle / main loop 要喂 `schedule_once` 用。
 #[kernel_symbols::export(name = "sched.scheduler.now_ns_public", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn now_ns_public() -> u64 {
-    now_ns_internal()
+    now_ns_direct()
 }
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
@@ -489,13 +495,19 @@ pub fn pid_count() -> usize {
 ///
 /// [`init`] 之后，在 CPU 0 上必然非空。AP 启动路径落地前，其它 CPU 调用此
 /// 函数会 panic（目前不会发生，因为只有 CPU 0 跑代码）。
-#[kernel_symbols::export(name = "sched.scheduler.current_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
-pub fn current_task() -> Arc<Task> {
+#[inline]
+pub fn current_task_direct() -> Arc<Task> {
     let id = cpu();
     SCHEDULER
         .cpu_or_boot(id)
         .current()
         .expect("[sched] current_task called before sched::init() on this CPU")
+}
+
+/// ELM 模块使用的当前任务导出入口。
+#[kernel_symbols::export(name = "sched.scheduler.current_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn current_task() -> Arc<Task> {
+    current_task_direct()
 }
 
 /// 尝试借用当前 CPU 上正在执行的任务。
@@ -524,12 +536,12 @@ pub fn current_task_ref() -> &'static Task {
 /// 当前 CPU 上正在执行的任务句柄，热路径版本。
 ///
 /// 与 [`current_task`] 语义相同，但不进入 owning current 锁。
-#[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
-pub fn current_task_fast() -> Arc<Task> {
+#[inline]
+pub fn current_task_fast_direct() -> Arc<Task> {
     let id = cpu();
     let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
-        panic!("[sched] current_task_fast called before sched::init() on this CPU");
+        panic!("[sched] current_task_fast_direct called before sched::init() on this CPU");
     }
     // Safety: raw 指针由 `Arc::into_raw` 发布且槽位强引用仍有效；先增加强引用，
     // 再用 `from_raw` 接管新增的这一份。
@@ -537,6 +549,12 @@ pub fn current_task_fast() -> Arc<Task> {
         Arc::increment_strong_count(ptr);
         Arc::from_raw(ptr)
     }
+}
+
+/// ELM 模块使用的当前任务导出入口。
+#[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn current_task_fast() -> Arc<Task> {
+    current_task_fast_direct()
 }
 
 /// 当前 CPU task 的根 namespace tid；启动早期没有 current 时返回 0。
@@ -670,9 +688,15 @@ pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
 }
 
 /// 是否已完成 init（避免有人在早期路径误调 current_task）。
+#[inline]
+pub fn is_ready_direct() -> bool {
+    INIT_READY.load(Ordering::Acquire)
+}
+
+/// ELM 模块使用的调度器就绪状态导出入口。
 #[kernel_symbols::export(name = "sched.scheduler.is_ready", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_ready() -> bool {
-    INIT_READY.load(Ordering::Acquire)
+    is_ready_direct()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.online_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]

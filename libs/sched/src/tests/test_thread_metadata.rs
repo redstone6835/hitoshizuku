@@ -444,10 +444,18 @@ fn robust_list_and_rseq_state_roundtrip() {
         signature: 0x5305_5305,
         registered: true,
     };
+    assert_eq!(task.rseq_registration_if_registered(), None);
     task.set_rseq_registration(rseq);
     assert!(task.rseq_registered());
     assert_eq!(task.rseq_registration(), rseq);
+    assert_eq!(task.rseq_registration_if_registered(), Some(rseq));
+    assert_eq!(task.pending_rseq_work(), None);
     task.mark_rseq_event(RseqEvent::Preempt);
+    let (pending_registration, pending_events) = task
+        .pending_rseq_work()
+        .expect("已注册且存在事件时必须返回 rseq 工作");
+    assert_eq!(pending_registration, rseq);
+    assert!(pending_events.contains(RseqEvent::Preempt));
     assert!(task.rseq_events().contains(RseqEvent::Preempt));
     task.publish_rseq_cpu(0);
     task.publish_rseq_cpu(1);
@@ -455,6 +463,7 @@ fn robust_list_and_rseq_state_roundtrip() {
     task.clear_rseq_registration();
     assert!(!task.rseq_registered());
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
+    assert_eq!(task.rseq_registration_if_registered(), None);
     assert!(task.rseq_events().is_empty());
 }
 

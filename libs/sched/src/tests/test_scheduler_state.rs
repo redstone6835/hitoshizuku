@@ -20,6 +20,11 @@ use crate::{
 };
 
 #[ktest]
+fn direct_ready_query_matches_exported_query() {
+    assert_eq!(crate::is_ready_direct(), crate::is_ready());
+}
+
+#[ktest]
 fn scheduler_state_bootstraps_root_and_boot_cpu() {
     let core = Scheduler::new();
 

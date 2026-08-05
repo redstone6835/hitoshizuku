@@ -119,6 +119,13 @@ impl SyscallContext<'_> {
         self.task.take();
     }
 
+    fn take_task_ref(&mut self) -> Arc<sched::Task> {
+        self.finish_execution_scope();
+        self.task
+            .take()
+            .expect("[syscall] task already released")
+    }
+
     /// 标记当前 syscall 已经完整重写 trap frame。dispatch 不再写 syscall
     /// 返回值、不推进 PC，也不在本次返回前投递 signal frame。
     pub fn finalize_frame(&mut self) {
@@ -210,9 +217,9 @@ pub fn dispatch(tf: TrapFramePtr) {
     let args = (ops.sys_args)(tf);
 
     // 取 current task；sched::init 之前不应触发用户 syscall，但安全起见做防御。
-    if !sched::is_ready() {
+    if !sched::is_ready_direct() {
         log::debug!("[syscall] dispatch before sched ready, nr={}", nr);
-        (ops.set_sys_ret)(tf, -(Errno::ENOSYS.as_i32() as isize));
+        (ops.set_sys_ret)(tf, -(Errno::ENOSYS.as_i32_direct() as isize));
         (ops.advance_pc)(tf);
         return;
     }
@@ -223,7 +230,7 @@ pub fn dispatch(tf: TrapFramePtr) {
     #[cfg(feature = "performance-profile")]
     let mut syscall_profile = profiling::syscall_scope(nr);
 
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
@@ -245,9 +252,9 @@ pub fn dispatch(tf: TrapFramePtr) {
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
-            Err(e) => -(e.as_i32() as isize),
+            Err(e) => -(e.as_i32_direct() as isize),
         },
-        None => -(Errno::ENOSYS.as_i32() as isize),
+        None => -(Errno::ENOSYS.as_i32_direct() as isize),
     };
     #[cfg(feature = "trace-task-lifecycle")]
     if trace_signal_boundary(nr) {
@@ -270,7 +277,7 @@ pub fn dispatch(tf: TrapFramePtr) {
         #[cfg(feature = "performance-profile")]
         let finalize_profile =
             profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
-        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
+        if ret == -(Errno::EINTR.as_i32_direct() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
                     ctx.task(),
@@ -285,7 +292,7 @@ pub fn dispatch(tf: TrapFramePtr) {
                     #[cfg(feature = "performance-profile")]
                     let _handoff_profile =
                         profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
-                    sched::run_post_syscall_handoff(sched::now_ns_public());
+                    sched::run_post_syscall_handoff(sched::now_ns_direct());
                     return;
                 }
             }
@@ -358,7 +365,7 @@ pub fn dispatch(tf: TrapFramePtr) {
 #[inline]
 pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
     let Some(ops) = frame_ops() else { return };
-    dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
+    let _ = dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
     });
@@ -367,11 +374,11 @@ pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
 /// arch 快速 syscall 路径用。调用方直接提供 trap frame 写回逻辑，避免热路径
 /// 每次通过 `frame_ops()` 全局表做原子加载和间接调用。
 #[inline]
-pub fn dispatch_fast_with_frame<F>(tf: TrapFramePtr, nr: usize, args: [usize; 6], mut finish: F)
+pub fn dispatch_fast_with_frame<F>(tf: TrapFramePtr, nr: usize, args: [usize; 6], mut finish: F) -> Arc<sched::Task>
 where
     F: FnMut(TrapFramePtr, isize),
 {
-    let task = sched::current_task_fast();
+    let task = sched::current_task_fast_direct();
     #[cfg(feature = "performance-profile")]
     let _span = profiling::enter_span();
     #[cfg(feature = "performance-profile")]
@@ -397,9 +404,9 @@ where
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
-            Err(e) => -(e.as_i32() as isize),
+            Err(e) => -(e.as_i32_direct() as isize),
         },
-        None => -(Errno::ENOSYS.as_i32() as isize),
+        None => -(Errno::ENOSYS.as_i32_direct() as isize),
     };
     #[cfg(feature = "trace-task-lifecycle")]
     if trace_signal_boundary(nr) {
@@ -422,7 +429,7 @@ where
         #[cfg(feature = "performance-profile")]
         let finalize_profile =
             profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
-        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
+        if ret == -(Errno::EINTR.as_i32_direct() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
                     ctx.task(),
@@ -437,8 +444,8 @@ where
                     #[cfg(feature = "performance-profile")]
                     let _handoff_profile =
                         profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
-                    sched::run_post_syscall_handoff(sched::now_ns_public());
-                    return;
+                    sched::run_post_syscall_handoff(sched::now_ns_direct());
+                    return ctx.take_task_ref();
                 }
             }
         }
@@ -497,4 +504,5 @@ where
             );
         }
     }
+    ctx.take_task_ref()
 }

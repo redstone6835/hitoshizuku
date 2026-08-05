@@ -55,13 +55,16 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+fn prepare_user_state_for_task(tf_ptr: usize, task: &alloc::sync::Arc<sched::Task>) {
+    let _ = sched::operation::prepare_user_return_for_task(task, sched::UserContextRef::new(tf_ptr));
+}
+
 fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
-    if !from_user || !sched::is_ready() {
+    if !from_user || !sched::is_ready_direct() {
         return;
     }
-    let task = sched::current_task();
-    let _ =
-        sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
+    let task = sched::current_task_fast_direct();
+    prepare_user_state_for_task(tf_ptr, &task);
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
             drop(task);
@@ -82,7 +85,7 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
 /// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。
 fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     prepare_user_state_before_return(tf_ptr, from_user);
-    if !from_user || !sched::is_ready() {
+    if !from_user || !sched::is_ready_direct() {
         return;
     }
     let task = sched::current_task();
@@ -610,7 +613,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
             tf.tval,
         )
     };
-    general::syscall::dispatch_fast_with_frame(
+    let task = general::syscall::dispatch_fast_with_frame(
         general::TrapFramePtr::new(tf_ptr),
         nr,
         args,
@@ -626,7 +629,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         sched::preempt_if_needed(kernel_timestamp_ns());
         require_full_restore = true;
     }
-    prepare_user_state_before_return(tf_ptr, true);
+    prepare_user_state_for_task(tf_ptr, &task);
 
     let frame = unsafe { trap_frame_ref(tf_ptr) };
     // signal delivery、exec/sigreturn 或其它上下文重写都会改变 PC/SP。最小返回不会

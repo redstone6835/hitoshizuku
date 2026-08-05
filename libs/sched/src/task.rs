@@ -1873,6 +1873,31 @@ impl Task {
         *self.rseq.lock()
     }
 
+    /// 仅在任务已注册 rseq 时获取完整注册信息。
+    ///
+    /// 未注册是绝大多数程序的返回用户态热路径，先检查无锁发布位可以避免
+    /// 每次系统调用都获取 rseq 自旋锁。
+    pub fn rseq_registration_if_registered(&self) -> Option<RseqRegistration> {
+        if !self.rseq_registered() {
+            return None;
+        }
+        let registration = *self.rseq.lock();
+        registration.registered.then_some(registration)
+    }
+
+    /// 仅在存在待处理事件时读取 rseq 注册信息。
+    ///
+    /// glibc 通常会长期注册 rseq，但绝大多数用户态返回没有抢占、迁移或信号
+    /// 事件。先读取无锁事件位，避免每次系统调用返回都获取注册信息锁。
+    pub fn pending_rseq_work(&self) -> Option<(RseqRegistration, RseqEvents)> {
+        let events = self.rseq_events();
+        if events.is_empty() {
+            return None;
+        }
+        self.rseq_registration_if_registered()
+            .map(|registration| (registration, events))
+    }
+
     pub fn set_rseq_registration(&self, registration: RseqRegistration) {
         self.rseq_cpu.store(usize::MAX, Ordering::Release);
         *self.rseq.lock() = registration;
