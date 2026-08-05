@@ -45,7 +45,20 @@ esac
 
 "$root/scripts/profile-tcg-validate.sh" "$report" riscv64 2
 sed 's/dropped=0/dropped=1/' "$report" >"$work/dropped.txt"
-"$root/scripts/profile-tcg-validate.sh" "$work/dropped.txt" riscv64 2
+if ! "$root/scripts/profile-tcg-validate.sh" "$work/dropped.txt" riscv64 2; then
+    echo "tcg profile smoke: generic validator rejected an incomplete report" >&2
+    exit 1
+fi
+
+sed 's/windowed=0 start_pc=0x0 stop_pc=0x0 start_events=0 stop_events=0 active_at_exit=0/windowed=1 start_pc=0x1000 stop_pc=0x2000 start_events=1 stop_events=1 active_at_exit=0/' \
+    "$report" >"$work/windowed.txt"
+"$root/scripts/profile-tcg-validate.sh" "$work/windowed.txt" riscv64 2 0x1000 0x2000
+sed 's/dropped=0/dropped=1/' "$work/windowed.txt" >"$work/windowed-dropped.txt"
+if "$root/scripts/profile-tcg-validate.sh" \
+    "$work/windowed-dropped.txt" riscv64 2 0x1000 0x2000; then
+    echo "tcg profile smoke: strict window validator accepted dropped counters" >&2
+    exit 1
+fi
 
 python3 - "$root/scripts/profile-snapshot-analyze.py" "$report" <<'PY'
 import importlib.util

@@ -800,7 +800,7 @@ pub struct Task {
     pub signal: SignalState,
     /// 与同 thread-group 共享的 sigaction + shared pending。
     /// CLONE_SIGHAND 时 `Arc::clone`，否则 fork 时深拷一份。
-    shared_signal: Spinlock<Arc<SharedSignal>>,
+    shared_signal: Arc<SharedSignal>,
     /// 退出时给父发的信号号码（默认 SIGCHLD=17）；clone 低 8 位指定。
     /// 值 0 表示"不发信号"（CLONE_THREAD 等情况）。
     exit_signal: AtomicI32,
@@ -931,8 +931,8 @@ impl Task {
     /// 调用方负责在返回 `Arc` 之后把它登记进父的 `children` 与组成员表。
     ///
     /// `creds` / `shared_signal` 默认从 `thread_group` 复制：thread group 内
-    /// 必然共享 shared_signal。调用方若需覆盖（如 CLONE_SIGHAND），可随后
-    /// 调 [`Task::install_shared_signal`] 替换。
+    /// 必然共享 shared_signal；新进程需要不同共享状态时应在创建任务前构造
+    /// 对应的 `ThreadGroup`。
     pub fn new(
         params: SchedParams,
         parent: Weak<Task>,
@@ -969,7 +969,7 @@ impl Task {
             ctx: Spinlock::new(None),
             creds: Spinlock::new(Arc::new(Credentials::root())),
             signal: SignalState::new(),
-            shared_signal: Spinlock::new(shared),
+            shared_signal: shared,
             exit_signal: AtomicI32::new(SignalNumber::SIGCHLD.raw() as i32),
             vfork_done: WaitQueue::new_with_reason(WaitReason::Vfork),
             vforking: AtomicBool::new(false),
@@ -1050,6 +1050,7 @@ impl Task {
         task
     }
 
+    #[inline]
     pub fn state(&self) -> TaskState {
         TaskState::from_u8(self.state.load(Ordering::Acquire))
     }
@@ -1792,6 +1793,7 @@ impl Task {
         }
     }
 
+    #[inline]
     pub fn tgid_cached(&self) -> Option<PidT> {
         let pid = self.tgid_cache.load(Ordering::Acquire);
         if pid > crate::pid::PID_INVALID {
@@ -1822,16 +1824,12 @@ impl Task {
 
     /// 取本任务当前的 SharedSignal（thread-group 共享部分）。
     pub fn shared_signal(&self) -> Arc<SharedSignal> {
-        Arc::clone(&self.shared_signal.lock())
+        Arc::clone(&self.shared_signal)
     }
 
+    #[inline]
     pub fn shared_signal_pending_bits_quick(&self) -> u64 {
-        self.shared_signal.lock().pending_snapshot().raw()
-    }
-
-    /// 替换 SharedSignal —— 仅供 spawn 时根据 CLONE_SIGHAND 设定使用。
-    pub fn install_shared_signal(&self, shared: Arc<SharedSignal>) {
-        *self.shared_signal.lock() = shared;
+        self.shared_signal.pending_snapshot().raw()
     }
 
     /// exit 时给父发的信号号码（0 表示不发）。

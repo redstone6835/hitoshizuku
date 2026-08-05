@@ -247,6 +247,20 @@ fn dtb_cstr(value: &[u8]) -> &[u8] {
     &value[..end]
 }
 
+/// 返回 `/chosen/bootargs` 的稳定 DTB 快照，不包含末尾 NUL。
+fn command_line_from_dtb(dtb: &Dtb<'static>) -> Option<&'static [u8]> {
+    let value = dtb
+        .root()?
+        .find_child("chosen")?
+        .find_property("bootargs")?
+        .value();
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(value.len());
+    (end != 0).then_some(&value[..end])
+}
+
 fn find_dtb_node_by_absolute_path<'a>(
     dtb: &Dtb<'a>,
     path: &[u8],
@@ -528,7 +542,7 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 architecture: StartArchitecture::new("riscv64"),
                 protocol: StartBootProtocol::Direct,
                 boot_cpu_id: hart_id,
-                command_line: None,
+                command_line: command_line_from_dtb(&dtb),
             },
             firmware: StartFirmware::Dtb(dtb),
             memory: StartMemory {

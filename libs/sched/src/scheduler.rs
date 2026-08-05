@@ -526,6 +526,12 @@ pub fn current_task_ref() -> &'static Task {
 /// 与 [`current_task`] 语义相同，但不进入 owning current 锁。
 #[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_fast() -> Arc<Task> {
+    current_task_fast_internal()
+}
+
+/// 内核常驻代码使用的 current 快入口，不经过 ELM 导出包装。
+#[inline]
+pub fn current_task_fast_internal() -> Arc<Task> {
     let id = cpu();
     let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
@@ -672,6 +678,12 @@ pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
 /// 是否已完成 init（避免有人在早期路径误调 current_task）。
 #[kernel_symbols::export(name = "sched.scheduler.is_ready", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_ready() -> bool {
+    is_ready_internal()
+}
+
+/// 内核常驻代码使用的初始化状态快入口，不经过 ELM 导出包装。
+#[inline]
+pub fn is_ready_internal() -> bool {
     INIT_READY.load(Ordering::Acquire)
 }
 
@@ -1284,6 +1296,7 @@ pub fn needs_resched(cpu_id: usize) -> bool {
         .is_some_and(|cpu_state| cpu_state.needs_resched())
 }
 
+#[inline]
 pub fn needs_resched_current() -> bool {
     if !INIT_READY.load(Ordering::Acquire) {
         return false;
@@ -1488,8 +1501,8 @@ pub fn run_post_syscall_handoff_lazy() {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
-    drain_deferred_timer_tick();
     let cpu_id = cpu();
+    drain_deferred_timer_tick_on(cpu_id);
     if !SCHEDULER.cpu_or_boot(cpu_id).has_post_syscall_handoff() {
         return;
     }
@@ -2993,7 +3006,12 @@ pub fn defer_timer_tick(now_ns: u64) {
 
 /// 在不持有调度器内部锁的边界消费本 CPU 延迟的 timer tick。
 pub fn drain_deferred_timer_tick() {
-    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    drain_deferred_timer_tick_on(cpu());
+}
+
+#[inline]
+fn drain_deferred_timer_tick_on(cpu_id: usize) {
+    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id]);
     if now_ns != 0 {
         let _ = on_timer_tick_inner(now_ns);
     }
@@ -3018,7 +3036,11 @@ pub(crate) fn record_deferred_timer_tick(slot: &AtomicU64, now_ns: u64) {
 }
 
 pub(crate) fn take_deferred_timer_tick(slot: &AtomicU64) -> u64 {
-    slot.swap(0, Ordering::AcqRel)
+    if slot.load(Ordering::Acquire) == 0 {
+        0
+    } else {
+        slot.swap(0, Ordering::AcqRel)
+    }
 }
 
 fn on_timer_tick_inner(now_ns: u64) -> bool {

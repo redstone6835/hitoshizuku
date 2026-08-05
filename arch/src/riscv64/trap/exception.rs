@@ -14,6 +14,7 @@
 use crate::riscv64::{time, vdso};
 use crate::trap::Riscv64MessageInterruptOps;
 use crate::*;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{Exception, Interrupt};
 
@@ -55,11 +56,7 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
-fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
-    if !from_user || !sched::is_ready() {
-        return;
-    }
-    let task = sched::current_task();
+fn prepare_user_state_for_task(tf_ptr: usize, task: Arc<sched::Task>) {
     let _ =
         sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
@@ -76,16 +73,23 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
     }
 }
 
+fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready_internal() {
+        return;
+    }
+    prepare_user_state_for_task(tf_ptr, sched::current_task_fast_internal());
+}
+
 /// 在从用户态 trap 返回前投递异步信号。
 ///
 /// syscall 返回路径已经在 `general::syscall::dispatch` 中带 trap-frame context
 /// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。
 fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     prepare_user_state_before_return(tf_ptr, from_user);
-    if !from_user || !sched::is_ready() {
+    if !from_user || !sched::is_ready_internal() {
         return;
     }
-    let task = sched::current_task();
+    let task = sched::current_task_fast_internal();
     if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
         let _ = sched::operation::deliver_pending_signals_for_task(
             &task,
@@ -610,7 +614,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
             tf.tval,
         )
     };
-    general::syscall::dispatch_fast_with_frame(
+    let task = general::syscall::dispatch_fast_with_frame(
         general::TrapFramePtr::new(tf_ptr),
         nr,
         args,
@@ -626,7 +630,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         sched::preempt_if_needed(kernel_timestamp_ns());
         require_full_restore = true;
     }
-    prepare_user_state_before_return(tf_ptr, true);
+    prepare_user_state_for_task(tf_ptr, task);
 
     let frame = unsafe { trap_frame_ref(tf_ptr) };
     // signal delivery、exec/sigreturn 或其它上下文重写都会改变 PC/SP。最小返回不会

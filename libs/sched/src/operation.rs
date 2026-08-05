@@ -306,6 +306,12 @@ pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     if !task.group_exit_boundary_pending() {
         return false;
     }
+    complete_group_exit_slow(task)
+}
+
+#[cold]
+#[inline(never)]
+fn complete_group_exit_slow(task: &Arc<Task>) -> bool {
     let Some(status) = task.thread_group().group_exit_status() else {
         return false;
     };
@@ -1816,6 +1822,7 @@ pub fn setup_user_signal_frame_for_task(
 }
 
 /// 在即将恢复用户态时处理依赖当前 trap frame 的线程状态。
+#[inline]
 pub fn prepare_user_return_for_task(
     task: &Arc<Task>,
     user_ctx: UserContextRef,
@@ -1823,6 +1830,17 @@ pub fn prepare_user_return_for_task(
     if task.is_kernel_task() || user_ctx.is_none() {
         return Ok(());
     }
+    // 当前返回工作只有 group-exit 与 rseq；两者都由任务原子位发布。没有工作时
+    // 不读取 ProcessImageOps，也不进入带大栈帧的 rseq/退出处理。
+    if !task.group_exit_boundary_pending() && task.rseq_events().is_empty() {
+        return Ok(());
+    }
+    prepare_user_return_slow(task, user_ctx)
+}
+
+#[cold]
+#[inline(never)]
+fn prepare_user_return_slow(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno> {
     if complete_group_exit_if_requested(task) {
         return Ok(());
     }

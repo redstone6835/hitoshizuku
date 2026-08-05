@@ -201,6 +201,9 @@ pub(super) fn sys_write(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let buf = ctx.args[1];
     let len = ctx.args[2];
     let file = file_for_fd(fd)?;
+    if len != 0 {
+        ensure_network_execution_scope_for_file(ctx, &file);
+    }
     write_from_user(&file, buf, len)
 }
 
@@ -209,6 +212,9 @@ pub(super) fn sys_read(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let buf = ctx.args[1];
     let len = ctx.args[2];
     let file = file_for_fd(fd)?;
+    if len != 0 {
+        ensure_network_execution_scope_for_file(ctx, &file);
+    }
     read_to_user(&file, buf, len, None)
 }
 
@@ -238,7 +244,7 @@ pub(super) fn sys_writev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    write_iovecs(&file, iov, iovcnt, None)
+    write_iovecs(ctx, &file, iov, iovcnt, None)
 }
 
 pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -249,7 +255,7 @@ pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    read_iovecs(&file, iov, iovcnt, None)
+    read_iovecs(ctx, &file, iov, iovcnt, None)
 }
 
 pub(super) fn sys_close(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1251,6 +1257,7 @@ pub(super) fn sys_sendfile(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     while total < count {
         let chunk = (count - total).min(buf.len());
         let n = if use_file_offset {
+            ensure_network_execution_scope_for_file(ctx, &in_file);
             in_file.read(&mut buf[..chunk]).map_err(|e| e.to_errno())?
         } else {
             in_file
@@ -1261,6 +1268,7 @@ pub(super) fn sys_sendfile(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
             break;
         }
         let mut written = 0usize;
+        ensure_network_execution_scope_for_file(ctx, &out_file);
         while written < n {
             let w = out_file.write(&buf[written..n]).map_err(|e| e.to_errno())?;
             if w == 0 {
@@ -1314,6 +1322,7 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
     while total < len {
         let chunk = (len - total).min(buf.len());
         let n = if use_in_file_offset {
+            ensure_network_execution_scope_for_file(ctx, &in_file);
             in_file.read(&mut buf[..chunk]).map_err(|e| e.to_errno())?
         } else {
             in_file
@@ -1324,6 +1333,9 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
             break;
         }
         let mut written = 0usize;
+        if use_out_file_offset {
+            ensure_network_execution_scope_for_file(ctx, &out_file);
+        }
         while written < n {
             let w = if use_out_file_offset {
                 out_file.write(&buf[written..n]).map_err(|e| e.to_errno())?
@@ -1625,14 +1637,16 @@ pub(super) fn sys_epoll_pwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     Ok(ready.len())
 }
 
-pub(super) fn sys_socket(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_socket(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    ctx.ensure_network_execution_scope();
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let fd = vfs_socket::socket(&vfs_ctx, &fdt, _ctx.args[0], _ctx.args[1], _ctx.args[2])?;
+    let fd = vfs_socket::socket(&vfs_ctx, &fdt, ctx.args[0], ctx.args[1], ctx.args[2])?;
     Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_socketpair(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    ctx.ensure_network_execution_scope();
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let (a, b) = vfs_socket::socketpair(&vfs_ctx, &fdt, ctx.args[0], ctx.args[1], ctx.args[2])?;
@@ -1647,6 +1661,7 @@ pub(super) fn sys_bind(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let addr = copy_sockaddr_from_user(ctx.args[1], ctx.args[2])?;
+    ctx.ensure_network_execution_scope();
     vfs_socket::bind(&vfs_ctx, &fdt, fd, &addr)?;
     Ok(0)
 }
@@ -1655,6 +1670,7 @@ pub(super) fn sys_listen(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let backlog = (ctx.args[1] as i32).max(0) as usize;
+    ctx.ensure_network_execution_scope();
     vfs_socket::listen(&fdt, fd, backlog)?;
     Ok(0)
 }
@@ -1672,6 +1688,7 @@ pub(super) fn sys_connect(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let addr = copy_sockaddr_from_user(ctx.args[1], ctx.args[2])?;
+    ctx.ensure_network_execution_scope();
     vfs_socket::connect(&vfs_ctx, &fdt, fd, &addr)?;
     Ok(0)
 }
@@ -1699,6 +1716,7 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     } else {
         Some(copy_sockaddr_from_user(ctx.args[4], ctx.args[5])?)
     };
+    ctx.ensure_network_execution_scope();
     if let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)
         && let Some(socket) = file.downcast_ops::<vfs::net_socket::NetSocketFileOps>()
@@ -1802,6 +1820,7 @@ pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let len = ctx.args[2].min(MAX_SOCKET_IO);
     let want_addr = ctx.args[4] != 0 && ctx.args[5] != 0;
     let flags = ctx.args[3];
+    ctx.ensure_network_execution_scope();
     if len != 0
         && (flags
             & (vfs_socket::MSG_PEEK
@@ -2206,6 +2225,7 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let hdr = read_msghdr(ctx.args[1])?;
+    ctx.ensure_network_execution_scope();
     if hdr.iovlen <= 1024
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
@@ -2263,6 +2283,9 @@ pub(super) fn sys_sendmmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let msgvec_user = ctx.args[1];
     let vlen = ctx.args[2].min(1024);
     let flags = ctx.args[3];
+    if vlen != 0 {
+        ctx.ensure_network_execution_scope();
+    }
     let mut sent_count = 0usize;
     for index in 0..vlen {
         let user = msgvec_ptr(msgvec_user, index)?;
@@ -2297,6 +2320,7 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let mut hdr = read_msghdr(ctx.args[1])?;
+    ctx.ensure_network_execution_scope();
     let total = iov_total_len_capped(hdr.iov, hdr.iovlen, MAX_SOCKET_IO)?;
     if hdr.iovlen <= 1024
         && hdr.controllen == 0
@@ -2360,6 +2384,9 @@ pub(super) fn sys_recvmmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let vlen = ctx.args[2].min(1024);
     let flags = ctx.args[3];
     let deadline = read_socket_timeout_deadline(ctx.args[4])?;
+    if vlen != 0 {
+        ctx.ensure_network_execution_scope();
+    }
     let mut recv_count = 0usize;
     for index in 0..vlen {
         let user = msgvec_ptr(msgvec_user, index)?;
@@ -2417,6 +2444,7 @@ pub(super) fn sys_setsockopt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let value = copy_user_region(ctx.args[3], ctx.args[4])?;
+    ctx.ensure_network_execution_scope();
     vfs_socket::setsockopt(&fdt, fd, ctx.args[1] as i32, ctx.args[2] as i32, &value)?;
     Ok(0)
 }
@@ -2424,6 +2452,7 @@ pub(super) fn sys_setsockopt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 pub(super) fn sys_getsockopt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
+    ctx.ensure_network_execution_scope();
     let value = vfs_socket::getsockopt(&fdt, fd, ctx.args[1] as i32, ctx.args[2] as i32)?;
     copy_optval_to_user(ctx.args[3], ctx.args[4], &value)?;
     Ok(0)
@@ -2432,6 +2461,7 @@ pub(super) fn sys_getsockopt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 pub(super) fn sys_shutdown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
+    ctx.ensure_network_execution_scope();
     vfs_socket::shutdown(&fdt, fd, ctx.args[1])?;
     Ok(0)
 }
@@ -2784,7 +2814,7 @@ pub(super) fn sys_preadv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let offset = nonnegative_split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
-    read_iovecs(&file, iov, iovcnt, Some(offset))
+    read_iovecs(ctx, &file, iov, iovcnt, Some(offset))
 }
 
 pub(super) fn sys_pwritev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2796,7 +2826,7 @@ pub(super) fn sys_pwritev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     }
     let offset = nonnegative_split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
-    write_iovecs(&file, iov, iovcnt, Some(offset))
+    write_iovecs(ctx, &file, iov, iovcnt, Some(offset))
 }
 
 pub(super) fn sys_vmsplice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2811,7 +2841,7 @@ pub(super) fn sys_vmsplice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    write_iovecs(&file, iov, iovcnt, None)
+    write_iovecs(ctx, &file, iov, iovcnt, None)
 }
 
 pub(super) fn sys_splice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2829,6 +2859,7 @@ pub(super) fn sys_splice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut in_off = read_optional_offset(off_in_user)?;
     let mut out_off = read_optional_offset(off_out_user)?;
     let copied = copy_between_files(
+        ctx,
         &in_file,
         &out_file,
         len,
@@ -2854,6 +2885,7 @@ pub(super) fn sys_tee(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut in_off = Some(in_file.pos());
     let mut out_off = None;
     copy_between_files(
+        ctx,
         &in_file,
         &out_file,
         len,
@@ -2975,7 +3007,7 @@ pub(super) fn sys_preadv2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     }
     let offset = split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
-    read_iovecs(&file, iov, iovcnt, offset)
+    read_iovecs(ctx, &file, iov, iovcnt, offset)
 }
 
 pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2995,7 +3027,7 @@ pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         split_offset_arg(ctx.args[3], ctx.args[4])?
     };
     let file = file_for_fd(fd)?;
-    let written = write_iovecs(&file, iov, iovcnt, offset)?;
+    let written = write_iovecs(ctx, &file, iov, iovcnt, offset)?;
     if (flags & (RWF_DSYNC | RWF_SYNC)) != 0 {
         file.sync().map_err(|e| e.to_errno())?;
     }
@@ -3613,6 +3645,15 @@ fn file_for_fd(fd: Fd) -> Result<Arc<vfs::file::File>, Errno> {
     fdt.get_file(fd).ok_or(Errno::EBADF)
 }
 
+fn ensure_network_execution_scope_for_file(ctx: &mut SyscallContext<'_>, file: &vfs::file::File) {
+    if file
+        .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
+        .is_some()
+    {
+        ctx.ensure_network_execution_scope();
+    }
+}
+
 fn synthetic_readlink_target(
     ctx: &SyscallContext<'_>,
     path: &str,
@@ -4137,6 +4178,7 @@ fn write_optional_offset(user: usize, off: Option<u64>) -> Result<(), Errno> {
 }
 
 fn copy_between_files(
+    ctx: &mut SyscallContext<'_>,
     input: &vfs::file::File,
     output: &vfs::file::File,
     len: usize,
@@ -4152,7 +4194,10 @@ fn copy_between_files(
         let nread = loop {
             let result = match *in_off {
                 Some(pos) => input.read_at(&mut tmp[..chunk], pos),
-                None => input.read(&mut tmp[..chunk]),
+                None => {
+                    ensure_network_execution_scope_for_file(ctx, input);
+                    input.read(&mut tmp[..chunk])
+                }
             };
             match result {
                 Ok(n) => break n,
@@ -4173,7 +4218,10 @@ fn copy_between_files(
             let write_pos = out_off.map(|pos| pos.saturating_add(written_this_chunk as u64));
             let nwritten = match write_pos {
                 Some(pos) => output.write_at(slice, pos),
-                None => output.write(slice),
+                None => {
+                    ensure_network_execution_scope_for_file(ctx, output);
+                    output.write(slice)
+                }
             };
             match nwritten {
                 Ok(0) => return Ok(total),
@@ -4210,6 +4258,7 @@ fn copy_between_files(
 }
 
 fn write_iovecs(
+    ctx: &mut SyscallContext<'_>,
     file: &vfs::file::File,
     iov: usize,
     iovcnt: usize,
@@ -4219,6 +4268,9 @@ fn write_iovecs(
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
         let current_offset = offset;
+        if len != 0 && current_offset.is_none() {
+            ensure_network_execution_scope_for_file(ctx, file);
+        }
         match write_from_user_at(file, base, len, current_offset) {
             Ok(n) => {
                 total = total.checked_add(n).ok_or(Errno::EINVAL)?;
@@ -4237,6 +4289,7 @@ fn write_iovecs(
 }
 
 fn read_iovecs(
+    ctx: &mut SyscallContext<'_>,
     file: &vfs::file::File,
     iov: usize,
     iovcnt: usize,
@@ -4246,6 +4299,9 @@ fn read_iovecs(
     for i in 0..iovcnt {
         let (base, len) = read_iovec(iov, i)?;
         let current_offset = offset;
+        if len != 0 && current_offset.is_none() {
+            ensure_network_execution_scope_for_file(ctx, file);
+        }
         match read_to_user(file, base, len, current_offset) {
             Ok(n) => {
                 total = total.checked_add(n).ok_or(Errno::EINVAL)?;
@@ -4629,6 +4685,7 @@ fn accept_common(ctx: &mut SyscallContext<'_>, flags: usize) -> Result<usize, Er
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
+    ctx.ensure_network_execution_scope();
     let (new_fd, addr) = vfs_socket::accept(&vfs_ctx, &fdt, fd, flags)?;
     if ctx.args[1] != 0 && ctx.args[2] != 0 {
         copy_sockaddr_to_user(ctx.args[1], ctx.args[2], addr.as_deref())?;
@@ -4639,6 +4696,7 @@ fn accept_common(ctx: &mut SyscallContext<'_>, flags: usize) -> Result<usize, Er
 fn getsockname_common(ctx: &mut SyscallContext<'_>, peer: bool) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
+    ctx.ensure_network_execution_scope();
     let raw = if peer {
         vfs_socket::getpeername(&fdt, fd)?
     } else {

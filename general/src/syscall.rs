@@ -84,10 +84,6 @@ pub struct SyscallContext<'a> {
 
 impl SyscallContext<'_> {
     fn new(nr: usize, args: [usize; 6], tf: TrapFramePtr, task: Arc<sched::Task>) -> Self {
-        assert!(
-            task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
-            "同一任务不能嵌套进入 syscall 执行作用域"
-        );
         Self {
             nr,
             args,
@@ -95,9 +91,26 @@ impl SyscallContext<'_> {
             task: Some(task),
             frame_finalized: false,
             restart_disabled: false,
-            execution_scope_active: true,
+            execution_scope_active: false,
             _phantom: core::marker::PhantomData,
         }
+    }
+
+    /// 在当前 syscall 第一次进入网络协议栈前建立有界执行作用域。
+    ///
+    /// 普通 syscall 不消费网络栈调用预算，因此不应为它们修改任务上的原子状态。
+    /// 网络 syscall 可以经过多个通用文件 I/O 分支，本方法保持幂等，由首次确认
+    /// `NetSocketFileOps` 的分支负责调用，最终仍由 context 的 RAII 边界统一结束。
+    pub fn ensure_network_execution_scope(&mut self) {
+        if self.execution_scope_active {
+            return;
+        }
+        assert!(
+            self.task()
+                .begin_execution_scope(sched::ExecutionScopeKind::Syscall),
+            "同一任务不能嵌套进入 syscall 执行作用域"
+        );
+        self.execution_scope_active = true;
     }
 
     fn finish_execution_scope(&mut self) {
@@ -110,6 +123,7 @@ impl SyscallContext<'_> {
         self.execution_scope_active = false;
     }
 
+    #[inline(always)]
     pub fn task(&self) -> &Arc<sched::Task> {
         self.task.as_ref().expect("[syscall] task already released")
     }
@@ -117,6 +131,14 @@ impl SyscallContext<'_> {
     pub fn release_task_ref(&mut self) {
         self.finish_execution_scope();
         self.task.take();
+    }
+
+    #[inline]
+    fn take_task_ref(&mut self) -> Arc<sched::Task> {
+        self.finish_execution_scope();
+        self.task
+            .take()
+            .expect("[syscall] task already released before return")
     }
 
     /// 标记当前 syscall 已经完整重写 trap frame。dispatch 不再写 syscall
@@ -189,6 +211,7 @@ pub fn registered_count() -> usize {
 
 /// syscall 实现已经返回，此时深层调用栈中的 VmSpace/File 等临时 Arc 均已析构；
 /// 在这个边界消费 exit_group 请求，避免远程废弃另一个线程的 Rust 栈。
+#[inline]
 fn complete_group_exit_at_boundary(ctx: &mut SyscallContext<'_>) {
     if !sched::operation::complete_group_exit_if_requested(ctx.task()) {
         return;
@@ -358,20 +381,25 @@ pub fn dispatch(tf: TrapFramePtr) {
 #[inline]
 pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
     let Some(ops) = frame_ops() else { return };
-    dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
+    drop(dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
-    });
+    }));
 }
 
 /// arch 快速 syscall 路径用。调用方直接提供 trap frame 写回逻辑，避免热路径
 /// 每次通过 `frame_ops()` 全局表做原子加载和间接调用。
 #[inline]
-pub fn dispatch_fast_with_frame<F>(tf: TrapFramePtr, nr: usize, args: [usize; 6], mut finish: F)
+pub fn dispatch_fast_with_frame<F>(
+    tf: TrapFramePtr,
+    nr: usize,
+    args: [usize; 6],
+    mut finish: F,
+) -> Arc<sched::Task>
 where
     F: FnMut(TrapFramePtr, isize),
 {
-    let task = sched::current_task_fast();
+    let task = sched::current_task_fast_internal();
     #[cfg(feature = "performance-profile")]
     let _span = profiling::enter_span();
     #[cfg(feature = "performance-profile")]
@@ -422,7 +450,7 @@ where
         #[cfg(feature = "performance-profile")]
         let finalize_profile =
             profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
-        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
+        if ret == -(Errno::EINTR.as_i32_internal() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
                     ctx.task(),
@@ -438,7 +466,7 @@ where
                     let _handoff_profile =
                         profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
-                    return;
+                    return ctx.take_task_ref();
                 }
             }
         }
@@ -497,4 +525,5 @@ where
             );
         }
     }
+    ctx.take_task_ref()
 }

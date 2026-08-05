@@ -366,6 +366,7 @@ impl SignalState {
     }
 
     /// 是否有 pending 信号（不限 these 集合）。
+    #[inline]
     pub fn has_any_pending(&self) -> bool {
         self.pending_bits.load(Ordering::Acquire) != 0
     }

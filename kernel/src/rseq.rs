@@ -73,9 +73,22 @@ pub(crate) fn prepare_user_return(task: &Arc<Task>, user_ctx: UserContextRef) ->
     if user_ctx.is_none() {
         return Err(Errno::ENOSYS);
     }
-    let registration = task.rseq_registration();
     let events = task.rseq_events();
-    if !registration.registered || events.is_empty() {
+    if events.is_empty() {
+        return Ok(());
+    }
+    prepare_user_return_slow(task, user_ctx, events)
+}
+
+#[cold]
+#[inline(never)]
+fn prepare_user_return_slow(
+    task: &Arc<Task>,
+    user_ctx: UserContextRef,
+    events: sched::RseqEvents,
+) -> Result<(), Errno> {
+    let registration = task.rseq_registration();
+    if !registration.registered {
         return Ok(());
     }
 
