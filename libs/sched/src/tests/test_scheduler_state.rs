@@ -9,15 +9,74 @@ use super::std::thread;
 use ktest::ktest;
 
 use super::test_thread_metadata::make_task;
+use crate::ids::Uid;
 use crate::scheduler::{
     cpu_ready_for_activation, dequeue_for_state_change_on, enqueue_task_on_scheduler,
     offline_cpu_with_scheduler, record_deferred_timer_tick, refresh_task_placement,
     requeue_balance_task_on, take_deferred_timer_tick, task_runqueue_cpu_on,
 };
 use crate::{
-    CpuId, CpuMask, HandoffReason, HandoffTarget, PlacementState, RunqueueClassLoad,
-    SCHED_CAPACITY_SCALE, SchedAttr, SchedClass, SchedDomain, SchedTopology, Scheduler, TaskState,
+    BorrowedCurrentTask, CpuId, CpuMask, HandoffReason, HandoffTarget, PlacementState,
+    RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass, SchedDomain, SchedTopology,
+    Scheduler, SigInfo, SigProcMaskHow, SigSet, SignalNumber, TaskState,
 };
+
+#[ktest]
+fn borrowed_current_does_not_change_strong_count() {
+    let task = make_task();
+    let raw_owner = Arc::into_raw(Arc::clone(&task));
+    let before = Arc::strong_count(&task);
+    // Safety: raw_owner 是模拟 current_raw 槽持有的有效 Arc 裸指针。
+    let borrowed = unsafe { BorrowedCurrentTask::from_current_raw(raw_owner) };
+
+    assert!(!core::mem::needs_drop::<BorrowedCurrentTask>());
+    assert_eq!(Arc::strong_count(&task), before);
+    let promoted = borrowed.to_arc();
+    assert_eq!(Arc::strong_count(&task), before + 1);
+    drop(promoted);
+    drop(borrowed);
+    assert_eq!(Arc::strong_count(&task), before);
+
+    // Safety: raw_owner 由上面的 Arc::into_raw 产生，尚未被消费。
+    unsafe { drop(Arc::from_raw(raw_owner)) };
+}
+
+#[ktest]
+fn borrowed_current_survives_raw_slot_replacement_with_prev_owner() {
+    let task = make_task();
+    let raw_owner = Arc::into_raw(Arc::clone(&task));
+    // Safety: raw_owner 是模拟 current_raw 槽持有的有效 Arc 裸指针。
+    let borrowed = unsafe { BorrowedCurrentTask::from_current_raw(raw_owner) };
+    let suspended_stack_prev = Arc::clone(&task);
+
+    // 模拟调度器 publish next 时释放旧 current_raw；暂停栈上的 prev Arc 继续托底。
+    unsafe { drop(Arc::from_raw(raw_owner)) };
+    drop(task);
+    assert!(Arc::ptr_eq(borrowed.as_arc(), &suspended_stack_prev));
+    let promoted = borrowed.to_arc();
+    assert!(Arc::ptr_eq(&promoted, &suspended_stack_prev));
+}
+
+#[ktest]
+fn blocked_signal_does_not_request_user_return_work() {
+    let task = make_task();
+    let blocked = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    task.signal.block(blocked, SigProcMaskHow::SetMask);
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert!(!task.has_deliverable_signal());
+    assert!(!task.user_return_work_pending_relaxed());
+
+    task.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
+    assert!(task.has_deliverable_signal());
+    assert!(task.user_return_work_pending_relaxed());
+}
 
 #[ktest]
 fn scheduler_state_bootstraps_root_and_boot_cpu() {

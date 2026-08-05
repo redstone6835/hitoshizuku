@@ -1779,7 +1779,8 @@ impl Task {
 
     /// 任务在根 ns 中的 pid 快照。热路径使用，避免只读查询进入亲缘锁。
     pub fn pid_root_cached(&self) -> Option<PidT> {
-        let pid = self.root_pid_cache.load(Ordering::Acquire);
+        // PID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
+        let pid = self.root_pid_cache.load(Ordering::Relaxed);
         if pid > crate::pid::PID_INVALID {
             Some(pid)
         } else {
@@ -1795,7 +1796,8 @@ impl Task {
 
     #[inline]
     pub fn tgid_cached(&self) -> Option<PidT> {
-        let pid = self.tgid_cache.load(Ordering::Acquire);
+        // TGID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
+        let pid = self.tgid_cache.load(Ordering::Relaxed);
         if pid > crate::pid::PID_INVALID {
             Some(pid)
         } else {
@@ -1830,6 +1832,15 @@ impl Task {
     #[inline]
     pub fn shared_signal_pending_bits_quick(&self) -> u64 {
         self.shared_signal.pending_snapshot().raw()
+    }
+
+    /// 当前任务是否存在未被 signal mask 屏蔽的待投递信号。
+    #[inline]
+    pub fn has_deliverable_signal(&self) -> bool {
+        let blocked = self.signal.blocked_snapshot().raw();
+        let pending = self.signal.pending_snapshot().raw();
+        let shared = self.shared_signal.pending_snapshot().raw();
+        (pending | shared) & !blocked != 0
     }
 
     /// exit 时给父发的信号号码（0 表示不发）。
@@ -1903,6 +1914,27 @@ impl Task {
 
     pub fn rseq_events(&self) -> RseqEvents {
         RseqEvents::from_bits(self.rseq_events.load(Ordering::Acquire))
+    }
+
+    /// Linux `thread_info.flags` 风格的用户返回工作预检。
+    ///
+    /// 这里只判断是否可能有工作，不消费任何 payload。远端发布与队列内容的
+    /// 可见性仍由随后各慢路径的 Acquire/锁保证；并发发生在本次预检之后的工作
+    /// 会通过 signal/resched 通知或下一次 trap 边界再次观察。
+    #[inline(always)]
+    pub fn user_return_work_pending_relaxed(&self) -> bool {
+        let state = self.state.load(Ordering::Relaxed);
+        let pending = self.signal.pending_bits_relaxed();
+        let shared = self.shared_signal.pending_bits_relaxed();
+        let deliverable = if pending | shared == 0 {
+            false
+        } else {
+            (pending | shared) & !self.signal.blocked_bits_relaxed() != 0
+        };
+        self.group_exit_requested.load(Ordering::Relaxed)
+            || deliverable
+            || self.rseq_events.load(Ordering::Relaxed) & 0x7 != 0
+            || state >= TaskState::Stopped as u8
     }
 
     pub fn clear_rseq_events(&self, events: RseqEvents) {

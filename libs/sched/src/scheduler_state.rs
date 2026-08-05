@@ -124,7 +124,7 @@ impl CpuSchedState {
     }
 
     /// 同时发布 owning current 槽和无锁热路径指针。
-    pub fn publish_current(&self, task: Arc<Task>) {
+    pub fn publish_current(&self, task: Arc<Task>) -> *mut Task {
         let raw = Arc::into_raw(Arc::clone(&task)) as *mut Task;
         *self.current.lock() = Some(task);
         let old = self.current_raw.swap(raw, Ordering::AcqRel);
@@ -133,6 +133,7 @@ impl CpuSchedState {
             // 释放槽位此前持有的一份强引用。
             unsafe { drop(Arc::from_raw(old)) };
         }
+        raw
     }
 
     pub fn idle(&self) -> Option<Arc<Task>> {
@@ -154,6 +155,13 @@ impl CpuSchedState {
 
     pub fn needs_resched(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
+    }
+
+    /// 当前 CPU 返回用户态前的无栅栏工作预检。
+    #[inline(always)]
+    pub(crate) fn user_return_work_pending_relaxed(&self) -> bool {
+        self.need_resched.load(Ordering::Relaxed)
+            || self.post_syscall_handoff.load(Ordering::Relaxed) != 0
     }
 
     pub fn request_resched(&self) {

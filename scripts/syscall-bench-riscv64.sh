@@ -3,14 +3,14 @@
 set -eu
 
 usage() {
-    echo "usage: $0 <timing|profile> [mygo|linux|both]" >&2
+    echo "usage: $0 <timing|profile|trace> [mygo|linux|both]" >&2
     exit 2
 }
 
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
 mode=$1
 systems=${2:-both}
-case "$mode" in timing|profile) ;; *) usage ;; esac
+case "$mode" in timing|profile|trace) ;; *) usage ;; esac
 case "$systems" in mygo|linux|both) ;; *) usage ;; esac
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
@@ -20,22 +20,33 @@ memory=${SYSCALL_BENCH_MEMORY:-1G}
 accel=${SYSCALL_BENCH_ACCEL:-tcg,thread=single}
 timeout_seconds=${SYSCALL_BENCH_TIMEOUT:-600}
 table_bits=${SYSCALL_BENCH_TABLE_BITS:-20}
-if [ "$mode" = profile ]; then
-    iterations=${SYSCALL_BENCH_ITERATIONS:-2000000}
-    repeats=${SYSCALL_BENCH_REPEATS:-1}
-    benchmark_case=${SYSCALL_BENCH_CASE:-getpid}
-    warmup=${SYSCALL_BENCH_WARMUP:-100000}
-else
-    iterations=${SYSCALL_BENCH_ITERATIONS:-1000000}
-    repeats=${SYSCALL_BENCH_REPEATS:-5}
-    benchmark_case=${SYSCALL_BENCH_CASE:-all}
-    warmup=${SYSCALL_BENCH_WARMUP:-100000}
-fi
+max_instructions=${SYSCALL_BENCH_MAX_INSTRUCTIONS:-100000}
+case "$mode" in
+    profile)
+        iterations=${SYSCALL_BENCH_ITERATIONS:-2000000}
+        repeats=${SYSCALL_BENCH_REPEATS:-1}
+        benchmark_case=${SYSCALL_BENCH_CASE:-getpid}
+        warmup=${SYSCALL_BENCH_WARMUP:-100000}
+        ;;
+    trace)
+        iterations=${SYSCALL_BENCH_ITERATIONS:-1}
+        repeats=${SYSCALL_BENCH_REPEATS:-1}
+        benchmark_case=${SYSCALL_BENCH_CASE:-getpid}
+        warmup=${SYSCALL_BENCH_WARMUP:-0}
+        ;;
+    timing)
+        iterations=${SYSCALL_BENCH_ITERATIONS:-1000000}
+        repeats=${SYSCALL_BENCH_REPEATS:-5}
+        benchmark_case=${SYSCALL_BENCH_CASE:-all}
+        warmup=${SYSCALL_BENCH_WARMUP:-100000}
+        ;;
+esac
 
 for pair in \
     "SYSCALL_BENCH_SMP:$smp" \
     "SYSCALL_BENCH_TIMEOUT:$timeout_seconds" \
     "SYSCALL_BENCH_TABLE_BITS:$table_bits" \
+    "SYSCALL_BENCH_MAX_INSTRUCTIONS:$max_instructions" \
     "SYSCALL_BENCH_ITERATIONS:$iterations" \
     "SYSCALL_BENCH_REPEATS:$repeats" \
     "SYSCALL_BENCH_WARMUP:$warmup"
@@ -47,18 +58,29 @@ done
 [ "$smp" -gt 0 ] && [ "$timeout_seconds" -gt 0 ] && [ "$iterations" -gt 0 ] && \
     [ "$repeats" -gt 0 ] || usage
 [ "$table_bits" -ge 12 ] && [ "$table_bits" -le 23 ] || usage
+[ "$max_instructions" -ge 1 ] && [ "$max_instructions" -le 10000000 ] || usage
 case "$benchmark_case" in ''|*[!A-Za-z0-9_]* ) echo "invalid syscall case" >&2; exit 2 ;; esac
-if [ "$mode" = profile ]; then
+if [ "$mode" = profile ] || [ "$mode" = trace ]; then
     [ "$smp" -eq 1 ] || {
-        echo "profile mode requires SYSCALL_BENCH_SMP=1" >&2
+        echo "$mode mode requires SYSCALL_BENCH_SMP=1" >&2
         exit 2
     }
     [ "$repeats" -eq 1 ] || {
-        echo "profile mode requires SYSCALL_BENCH_REPEATS=1" >&2
+        echo "$mode mode requires SYSCALL_BENCH_REPEATS=1" >&2
         exit 2
     }
     [ "$benchmark_case" != all ] || {
-        echo "profile mode requires one syscall case, not all" >&2
+        echo "$mode mode requires one syscall case, not all" >&2
+        exit 2
+    }
+fi
+if [ "$mode" = trace ]; then
+    [ "$systems" = both ] || {
+        echo "trace mode requires both systems" >&2
+        exit 2
+    }
+    [ "$iterations" -eq 1 ] && [ "$warmup" -eq 0 ] || {
+        echo "trace mode requires iterations=1 and warmup=0" >&2
         exit 2
     }
 fi
@@ -157,8 +179,14 @@ benchmark_symbols_relative=$artifacts_relative/syscall-bench.elf
 plugin_relative=
 profile_start_pc=
 profile_stop_pc=
-if [ "$mode" = profile ]; then
-    plugin_relative=$output_relative/mygo-tcg-profile.so
+if [ "$mode" = profile ] || [ "$mode" = trace ]; then
+    if [ "$mode" = profile ]; then
+        plugin_relative=$output_relative/mygo-tcg-profile.so
+        plugin_source=tools/qemu-plugins/mygo-tcg-profile.c
+    else
+        plugin_relative=$output_relative/mygo-tcg-instruction-trace.so
+        plugin_source=tools/qemu-plugins/mygo-tcg-instruction-trace.c
+    fi
     profile_symbols=$(docker run --rm -v "$root":/work -w /work "$image" \
         riscv64-linux-gnu-nm -n "/work/$benchmark_symbols_relative")
     profile_start_pc=$(printf '%s\n' "$profile_symbols" |
@@ -178,8 +206,8 @@ if [ "$mode" = profile ]; then
         cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared \
             -I/opt/qemu-bin-10.0.2/include \
             $(pkg-config --cflags glib-2.0) \
-            tools/qemu-plugins/mygo-tcg-profile.c -o "$1"
-    ' build-plugin "/work/$plugin_relative"
+            "$1" -o "$2"
+    ' build-plugin "/work/$plugin_source" "/work/$plugin_relative"
 fi
 
 set -- docker run --rm -v "$root":/work -w /work "$image" \
@@ -202,13 +230,21 @@ set -- docker run --rm -v "$root":/work -w /work "$image" \
 if [ "$mode" = profile ]; then
     set -- "$@" --profile-plugin "/work/$plugin_relative" \
         --profile-start-pc "$profile_start_pc" --profile-stop-pc "$profile_stop_pc"
+elif [ "$mode" = trace ]; then
+    set -- "$@" --trace-plugin "/work/$plugin_relative" \
+        --trace-max-instructions "$max_instructions" \
+        --profile-start-pc "$profile_start_pc" --profile-stop-pc "$profile_stop_pc"
 fi
 "$@"
 
 run_system() {
     system=$1
     serial_relative=$output_relative/$system.serial.log
-    profile_relative=$output_relative/$system.tcg-profile.txt
+    case "$mode" in
+        profile) auxiliary_relative=$output_relative/$system.tcg-profile.txt ;;
+        trace) auxiliary_relative=$output_relative/$system.instruction-trace.txt ;;
+        timing) auxiliary_relative=$output_relative/$system.unused ;;
+    esac
     case "$system" in
         mygo) kernel_relative=$mygo_kernel_relative ;;
         linux) kernel_relative=$linux_image_relative ;;
@@ -223,7 +259,7 @@ run_system() {
         kernel=$3
         initramfs=$4
         serial=$5
-        profile=$6
+        auxiliary=$6
         plugin=$7
         smp=$8
         memory=$9
@@ -237,6 +273,8 @@ run_system() {
         table_bits=$7
         profile_start_pc=$8
         profile_stop_pc=$9
+        shift 9
+        max_instructions=$1
 
         set -- qemu-system-riscv64 \
             -machine virt -global virtio-mmio.force-legacy=false \
@@ -250,28 +288,32 @@ run_system() {
                 -append "syscall_bench_iterations=$iterations syscall_bench_repeats=$repeats syscall_bench_case=$benchmark_case syscall_bench_warmup=$warmup"
         fi
         if [ "$mode" = profile ]; then
-            set -- "$@" -plugin "file=$plugin,output=$profile,table_bits=$table_bits,start_pc=$profile_start_pc,stop_pc=$profile_stop_pc"
+            set -- "$@" -plugin "file=$plugin,output=$auxiliary,table_bits=$table_bits,start_pc=$profile_start_pc,stop_pc=$profile_stop_pc"
+        elif [ "$mode" = trace ]; then
+            set -- "$@" -plugin "file=$plugin,output=$auxiliary,max_instructions=$max_instructions,start_pc=$profile_start_pc,stop_pc=$profile_stop_pc"
         fi
         timeout -k 10 "$timeout_seconds" "$@" >"$serial" 2>&1
     ' run-qemu "$system" "$mode" "/work/$kernel_relative" \
-        "/work/$initramfs_relative" "/work/$serial_relative" "/work/$profile_relative" \
+        "/work/$initramfs_relative" "/work/$serial_relative" "/work/$auxiliary_relative" \
         "/work/$plugin_relative" "$smp" "$memory" "$accel" "$timeout_seconds" \
         "$iterations" "$repeats" "$benchmark_case" "$warmup" "$table_bits" \
-        "$profile_start_pc" "$profile_stop_pc"
+        "$profile_start_pc" "$profile_stop_pc" "$max_instructions"
 
     if [ "$mode" = profile ]; then
         docker run --rm -v "$root":/work -w /work "$image" \
-            scripts/profile-tcg-validate.sh "/work/$profile_relative" riscv64 1 \
+            scripts/profile-tcg-validate.sh "/work/$auxiliary_relative" riscv64 1 \
             "$profile_start_pc" "$profile_stop_pc"
     fi
     case "$system" in
         mygo)
             serial_option=--mygo-serial
             profile_option=--mygo-profile
+            trace_option=--mygo-trace
             ;;
         linux)
             serial_option=--linux-serial
             profile_option=--linux-profile
+            trace_option=--linux-trace
             ;;
     esac
     set -- docker run --rm -v "$root":/work -w /work "$image" \
@@ -279,7 +321,9 @@ run_system() {
         --metadata "/work/$metadata_relative" --validate-only --record-system "$system" \
         "$serial_option" "/work/$serial_relative"
     if [ "$mode" = profile ]; then
-        set -- "$@" "$profile_option" "/work/$profile_relative"
+        set -- "$@" "$profile_option" "/work/$auxiliary_relative"
+    elif [ "$mode" = trace ]; then
+        set -- "$@" "$trace_option" "/work/$auxiliary_relative"
     fi
     "$@"
     if [ "$mode" = timing ]; then
@@ -312,8 +356,23 @@ if [ "$systems" = both ]; then
         set -- "$@" \
             --mygo-profile "/work/$output_relative/mygo.tcg-profile.txt" \
             --linux-profile "/work/$output_relative/linux.tcg-profile.txt"
+    elif [ "$mode" = trace ]; then
+        set -- "$@" \
+            --mygo-trace "/work/$output_relative/mygo.instruction-trace.txt" \
+            --linux-trace "/work/$output_relative/linux.instruction-trace.txt"
     fi
     "$@"
+    if [ "$mode" = trace ]; then
+        docker run --rm -v "$root":/work -w /work "$image" \
+            python3 scripts/syscall-instruction-compare.py \
+            --mygo-trace "/work/$output_relative/mygo.instruction-trace.txt" \
+            --linux-trace "/work/$output_relative/linux.instruction-trace.txt" \
+            --benchmark-elf "/work/$benchmark_symbols_relative" \
+            --mygo-kernel "/work/$mygo_kernel_relative" \
+            --linux-vmlinux "/work/$linux_symbols_relative" \
+            --mygo-output "/work/$output_relative/mygo.instruction-sequence.tsv" \
+            --linux-output "/work/$output_relative/linux.instruction-sequence.tsv"
+    fi
 fi
 
 echo "[syscall-bench] 输出目录：$output"

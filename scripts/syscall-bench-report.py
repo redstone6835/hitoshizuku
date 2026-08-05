@@ -24,6 +24,8 @@ SINT = re.compile(r"^-?[0-9]+$")
 DECIMAL_NS = re.compile(r"^[0-9]+\.[0-9]{3}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 CASE_NAME = re.compile(r"^[A-Za-z0-9_]+$")
+HEX = re.compile(r"^0x[0-9a-f]+$")
+HEX_BYTES = re.compile(r"^[0-9a-f]+$")
 METADATA_SCHEMA = "mygo.syscall-bench-run.v1"
 MYGO_EXTERNAL_INITRAMFS_MARKER = "root source selected: external initramfs"
 
@@ -483,6 +485,8 @@ def required_artifact_names(mode: str) -> set[str]:
     }
     if mode == "profile":
         names.add("profile_plugin")
+    elif mode == "trace":
+        names.add("trace_plugin")
     return names
 
 
@@ -498,20 +502,25 @@ def artifact_arguments(args: argparse.Namespace) -> dict[str, Path | None]:
         "initramfs": args.initramfs,
         "benchmark_elf": args.benchmark_elf,
         "profile_plugin": args.profile_plugin,
+        "trace_plugin": args.trace_plugin,
     }
 
 
-def validate_profile_parameters(parameters: dict[str, Any]) -> None:
+def validate_window_parameters(parameters: dict[str, Any], mode: str) -> None:
     if parameters["smp"] != 1:
-        raise ValueError("profile 模式必须使用 SMP=1")
+        raise ValueError(f"{mode} 模式必须使用 SMP=1")
     if parameters["repeats"] != 1:
-        raise ValueError("profile 模式必须使用 repeats=1")
+        raise ValueError(f"{mode} 模式必须使用 repeats=1")
     if parameters["case"] == "all":
-        raise ValueError("profile 模式必须指定单个 syscall case")
+        raise ValueError(f"{mode} 模式必须指定单个 syscall case")
     start_pc = int(parameters["profile_start_pc"], 0)
     stop_pc = int(parameters["profile_stop_pc"], 0)
     if start_pc == stop_pc:
-        raise ValueError("profile start/stop PC 必须不同")
+        raise ValueError(f"{mode} start/stop PC 必须不同")
+    if mode == "trace" and (
+        parameters["iterations"] != 1 or parameters["warmup"] != 0
+    ):
+        raise ValueError("trace 模式必须使用 iterations=1 且 warmup=0")
 
 
 def build_metadata(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
@@ -549,19 +558,29 @@ def build_metadata(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
         "case": args.case,
         "warmup": args.warmup,
         "table_bits": args.table_bits,
-        "profile_start_pc": args.profile_start_pc if args.mode == "profile" else None,
-        "profile_stop_pc": args.profile_stop_pc if args.mode == "profile" else None,
+        "profile_start_pc": (
+            args.profile_start_pc if args.mode in ("profile", "trace") else None
+        ),
+        "profile_stop_pc": (
+            args.profile_stop_pc if args.mode in ("profile", "trace") else None
+        ),
         "container_image": args.container_image,
     }
-    if args.mode == "profile":
+    if args.mode == "trace":
+        if args.trace_max_instructions is None or not (
+            1 <= args.trace_max_instructions <= 10_000_000
+        ):
+            raise ValueError("trace_max_instructions 超出范围")
+        parameters["trace_max_instructions"] = args.trace_max_instructions
+    if args.mode in ("profile", "trace"):
         if args.profile_start_pc is None or args.profile_stop_pc is None:
-            raise ValueError("profile 模式缺少 start/stop PC")
+            raise ValueError(f"{args.mode} 模式缺少 start/stop PC")
         try:
             parameters["profile_start_pc"] = f"0x{int(args.profile_start_pc, 0):x}"
             parameters["profile_stop_pc"] = f"0x{int(args.profile_stop_pc, 0):x}"
         except ValueError as error:
-            raise ValueError("profile start/stop PC 非法") from error
-        validate_profile_parameters(parameters)
+            raise ValueError(f"{args.mode} start/stop PC 非法") from error
+        validate_window_parameters(parameters, args.mode)
 
     artifacts = {
         name: metadata_artifact(supplied[name], repo_root)  # type: ignore[arg-type]
@@ -653,6 +672,8 @@ def load_and_verify_metadata(
         "profile_stop_pc",
         "container_image",
     }
+    if args.mode == "trace":
+        parameter_fields.add("trace_max_instructions")
     if not isinstance(parameters, dict) or set(parameters) != parameter_fields:
         raise ValueError(f"{path}: parameters 字段不正确")
     if (
@@ -668,6 +689,12 @@ def load_and_verify_metadata(
     for name in ("smp", "timeout_seconds", "iterations", "repeats", "warmup", "table_bits"):
         if not isinstance(parameters[name], int) or isinstance(parameters[name], bool):
             raise ValueError(f"{path}: parameters.{name} 类型非法")
+    if args.mode == "trace" and (
+        not isinstance(parameters["trace_max_instructions"], int)
+        or isinstance(parameters["trace_max_instructions"], bool)
+        or not 1 <= parameters["trace_max_instructions"] <= 10_000_000
+    ):
+        raise ValueError(f"{path}: parameters.trace_max_instructions 非法")
     if (
         parameters["smp"] < 1
         or parameters["timeout_seconds"] < 1
@@ -677,12 +704,12 @@ def load_and_verify_metadata(
         or not 12 <= parameters["table_bits"] <= 23
     ):
         raise ValueError(f"{path}: parameters 数值超出范围")
-    if args.mode == "profile":
+    if args.mode in ("profile", "trace"):
         if not isinstance(parameters["profile_start_pc"], str) or not isinstance(
             parameters["profile_stop_pc"], str
         ):
-            raise ValueError(f"{path}: profile marker 类型非法")
-        validate_profile_parameters(parameters)
+            raise ValueError(f"{path}: {args.mode} marker 类型非法")
+        validate_window_parameters(parameters, args.mode)
     elif parameters["profile_start_pc"] is not None or parameters["profile_stop_pc"] is not None:
         raise ValueError(f"{path}: timing 元数据包含 profile marker")
 
@@ -756,6 +783,8 @@ def load_and_verify_metadata(
     expected_result_names = {"serial"}
     if args.mode == "profile":
         expected_result_names.add("profile")
+    elif args.mode == "trace":
+        expected_result_names.add("trace")
     resolved_results: dict[str, dict[str, Path]] = {}
     run_directory = path.resolve(strict=True).parent
     for system, result in results.items():
@@ -774,9 +803,11 @@ def load_and_verify_metadata(
                 or value["size"] < 1
             ):
                 raise ValueError(f"{path}: results.{system}.{kind} 值非法")
-            expected_name = (
-                f"{system}.serial.log" if kind == "serial" else f"{system}.tcg-profile.txt"
-            )
+            expected_name = {
+                "serial": f"{system}.serial.log",
+                "profile": f"{system}.tcg-profile.txt",
+                "trace": f"{system}.instruction-trace.txt",
+            }[kind]
             candidate = (repo_root / value["path"]).resolve(strict=True)
             if candidate != (run_directory / expected_name).resolve(strict=True):
                 raise ValueError(f"{path}: results.{system}.{kind} 路径非法")
@@ -797,7 +828,7 @@ def record_result_metadata(
     repo_root: Path,
     system: str,
     serial: Path,
-    profile: Path | None,
+    auxiliary: Path | None,
 ) -> None:
     allowed_systems = {
         "mygo": {"mygo"},
@@ -808,15 +839,135 @@ def record_result_metadata(
         raise ValueError(f"不能为本次运行记录 {system} 结果")
     value = {"serial": metadata_artifact(serial, repo_root)}
     if metadata["mode"] == "profile":
-        if profile is None:
+        if auxiliary is None:
             raise ValueError(f"记录 {system} 结果时缺少 TCG profile")
-        value["profile"] = metadata_artifact(profile, repo_root)
-    elif profile is not None:
-        raise ValueError("timing 结果不能包含 TCG profile")
+        value["profile"] = metadata_artifact(auxiliary, repo_root)
+    elif metadata["mode"] == "trace":
+        if auxiliary is None:
+            raise ValueError(f"记录 {system} 结果时缺少指令轨迹")
+        value["trace"] = metadata_artifact(auxiliary, repo_root)
+    elif auxiliary is not None:
+        raise ValueError("timing 结果不能包含跟踪产物")
     metadata["results"][system] = value
     metadata.pop("_resolved", None)
     metadata.pop("_resolved_results", None)
     write_metadata(metadata_path, metadata)
+
+
+def parse_instruction_trace(
+    path: Path, expected_start: str, expected_stop: str, expected_maximum: int
+) -> int:
+    header_fields = {
+        "version",
+        "target",
+        "configured_vcpus",
+        "start_pc",
+        "stop_pc",
+        "max_instructions",
+    }
+    instruction_fields = {
+        "sequence",
+        "cpu",
+        "pc",
+        "size",
+        "bytes",
+        "disas_hex",
+    }
+    footer_fields = {
+        "instructions",
+        "dropped",
+        "translation_failures",
+        "start_events",
+        "stop_events",
+        "active_at_exit",
+    }
+    lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
+    if len(lines) < 3 or any(not line or line != line.strip() for line in lines):
+        raise ValueError(f"{path}: 指令轨迹存在空行或首尾空白")
+    header = parse_fields(lines[0], "MYGO_INSN_TRACE", header_fields)
+    footer = parse_fields(lines[-1], "TRACE_DONE", footer_fields)
+    if header["version"] != "1" or header["target"] != "riscv64":
+        raise ValueError(f"{path}: 指令轨迹版本或目标架构错误")
+    if uint(header, "configured_vcpus", "MYGO_INSN_TRACE") != 1:
+        raise ValueError(f"{path}: 指令轨迹不是单核运行")
+    for name, expected_marker in (
+        ("start_pc", expected_start),
+        ("stop_pc", expected_stop),
+    ):
+        if not HEX.fullmatch(header[name]) or int(header[name], 16) != int(
+            expected_marker, 0
+        ):
+            raise ValueError(f"{path}: {name} 与运行元数据不一致")
+    maximum = uint(header, "max_instructions", "MYGO_INSN_TRACE")
+    if maximum != expected_maximum:
+        raise ValueError(f"{path}: max_instructions 与运行元数据不一致")
+
+    instruction_count = len(lines) - 2
+    if instruction_count < 1 or instruction_count > maximum:
+        raise ValueError(f"{path}: 指令记录数量非法: {instruction_count}")
+    executed: list[tuple[int, str]] = []
+    for sequence, line in enumerate(lines[1:-1]):
+        values = parse_fields(line, "INSN", instruction_fields)
+        if uint(values, "sequence", "INSN") != sequence:
+            raise ValueError(f"{path}: INSN sequence 在 {sequence} 处不连续")
+        if uint(values, "cpu", "INSN") != 0:
+            raise ValueError(f"{path}: INSN cpu 不是 0")
+        if not HEX.fullmatch(values["pc"]) or int(values["pc"], 16) >= 1 << 64:
+            raise ValueError(f"{path}: INSN pc 非法")
+        size = uint(values, "size", "INSN")
+        raw = values["bytes"]
+        if size not in (2, 4) or len(raw) != size * 2 or not HEX_BYTES.fullmatch(raw):
+            raise ValueError(f"{path}: INSN bytes/size 非法")
+        encoded_disassembly = values["disas_hex"]
+        if (
+            len(encoded_disassembly) % 2 != 0
+            or not HEX_BYTES.fullmatch(encoded_disassembly)
+        ):
+            raise ValueError(f"{path}: INSN disas_hex 非法")
+        disassembly = bytes.fromhex(encoded_disassembly).decode("utf-8", errors="strict")
+        if any(character in disassembly for character in ("\x00", "\n", "\r")):
+            raise ValueError(f"{path}: INSN 反汇编文本包含控制字符")
+        mnemonic_words = disassembly.split()
+        if not mnemonic_words:
+            raise ValueError(f"{path}: INSN 反汇编文本为空")
+        executed.append((int(values["pc"], 16), mnemonic_words[0]))
+
+    spaces: list[str] = []
+    for pc, _ in executed:
+        space = "kernel" if pc & (1 << 63) else "user"
+        if not spaces or spaces[-1] != space:
+            spaces.append(space)
+    if spaces != ["user", "kernel", "user"]:
+        raise ValueError(f"{path}: 权限态轨迹不是 user -> kernel -> user: {spaces}")
+    if sum(mnemonic == "ecall" for _, mnemonic in executed) != 1:
+        raise ValueError(f"{path}: 指令轨迹必须恰好包含一个 ecall")
+    if sum(mnemonic == "sret" for _, mnemonic in executed) != 1:
+        raise ValueError(f"{path}: 指令轨迹必须恰好包含一个 sret")
+    first_kernel = next(
+        index for index, value in enumerate(executed) if value[0] & (1 << 63)
+    )
+    last_kernel = len(executed) - 1 - next(
+        index for index, value in enumerate(reversed(executed)) if value[0] & (1 << 63)
+    )
+    if executed[first_kernel - 1][1] != "ecall" or executed[last_kernel][1] != "sret":
+        raise ValueError(f"{path}: ecall/sret 不在唯一内核区段的边界")
+    entry_pc = executed[first_kernel][0]
+    if sum(pc == entry_pc for pc, _ in executed) != 1:
+        raise ValueError(f"{path}: 内核入口 PC 重复执行，疑似发生嵌套 trap")
+
+    if uint(footer, "instructions", "TRACE_DONE") != instruction_count:
+        raise ValueError(f"{path}: TRACE_DONE instructions 与记录数量不一致")
+    strict_footer = {
+        "dropped": 0,
+        "translation_failures": 0,
+        "start_events": 1,
+        "stop_events": 1,
+        "active_at_exit": 0,
+    }
+    for name, expected_value in strict_footer.items():
+        if uint(footer, name, "TRACE_DONE") != expected_value:
+            raise ValueError(f"{path}: TRACE_DONE {name} 不是 {expected_value}")
+    return instruction_count
 
 
 def load_symbols(kernel: Path, nm: str) -> tuple[list[int], list[Symbol]]:
@@ -948,7 +1099,7 @@ def print_hotspots(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("timing", "profile"), required=True)
+    parser.add_argument("--mode", choices=("timing", "profile", "trace"), required=True)
     parser.add_argument("--metadata", type=Path)
     parser.add_argument("--write-metadata", type=Path)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -959,6 +1110,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--linux-serial", type=Path)
     parser.add_argument("--mygo-profile", type=Path)
     parser.add_argument("--linux-profile", type=Path)
+    parser.add_argument("--mygo-trace", type=Path)
+    parser.add_argument("--linux-trace", type=Path)
     parser.add_argument("--mygo-kernel", type=Path)
     parser.add_argument("--mygo-map", type=Path)
     parser.add_argument("--mygo-manifest", type=Path)
@@ -969,6 +1122,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initramfs", type=Path)
     parser.add_argument("--benchmark-elf", type=Path)
     parser.add_argument("--profile-plugin", type=Path)
+    parser.add_argument("--trace-plugin", type=Path)
+    parser.add_argument("--trace-max-instructions", type=int)
     parser.add_argument("--smp", type=int)
     parser.add_argument("--memory")
     parser.add_argument("--accel")
@@ -993,7 +1148,14 @@ def run(args: argparse.Namespace) -> int:
     repo_root = args.repo_root.resolve(strict=True)
     if args.write_metadata:
         if args.metadata or args.record_system or any(
-            (args.mygo_serial, args.linux_serial, args.mygo_profile, args.linux_profile)
+            (
+                args.mygo_serial,
+                args.linux_serial,
+                args.mygo_profile,
+                args.linux_profile,
+                args.mygo_trace,
+                args.linux_trace,
+            )
         ):
             raise ValueError("--write-metadata 不能与结果输入同时使用")
         metadata = build_metadata(args, repo_root)
@@ -1012,6 +1174,8 @@ def run(args: argparse.Namespace) -> int:
         "linux serial": (args.linux_serial, run_directory / "linux.serial.log"),
         "mygo profile": (args.mygo_profile, run_directory / "mygo.tcg-profile.txt"),
         "linux profile": (args.linux_profile, run_directory / "linux.tcg-profile.txt"),
+        "mygo trace": (args.mygo_trace, run_directory / "mygo.instruction-trace.txt"),
+        "linux trace": (args.linux_trace, run_directory / "linux.instruction-trace.txt"),
     }
     for label, (supplied, expected) in result_paths.items():
         if supplied is not None and supplied.resolve(strict=True) != expected.resolve(strict=True):
@@ -1034,8 +1198,8 @@ def run(args: argparse.Namespace) -> int:
         validate_pair(mygo, linux)
 
     if args.mode == "timing":
-        if args.mygo_profile or args.linux_profile:
-            raise ValueError("timing 模式不接受 TCG profile")
+        if any((args.mygo_profile, args.linux_profile, args.mygo_trace, args.linux_trace)):
+            raise ValueError("timing 模式不接受跟踪产物")
         if args.record_system:
             selected = mygo if args.record_system == "mygo" else linux
             if selected is None:
@@ -1054,6 +1218,41 @@ def run(args: argparse.Namespace) -> int:
             print_timing(mygo, linux)
         return 0
 
+    if args.mode == "trace":
+        if args.mygo_profile or args.linux_profile:
+            raise ValueError("trace 模式不接受 TCG profile")
+        trace_paths = {"mygo": args.mygo_trace, "linux": args.linux_trace}
+        counts: dict[str, int] = {}
+        for system, trace_path in trace_paths.items():
+            if trace_path is not None:
+                counts[system] = parse_instruction_trace(
+                    trace_path,
+                    parameters["profile_start_pc"],
+                    parameters["profile_stop_pc"],
+                    parameters["trace_max_instructions"],
+                )
+        if args.record_system:
+            selected = mygo if args.record_system == "mygo" else linux
+            if selected is None:
+                raise ValueError(f"记录 {args.record_system} 时缺少对应串口日志")
+            record_result_metadata(
+                args.metadata,
+                metadata,
+                repo_root,
+                args.record_system,
+                selected.path,
+                trace_paths[args.record_system],
+            )
+        if args.validate_only:
+            return 0
+        if not counts:
+            raise ValueError("trace 报告至少需要一份指令轨迹")
+        for system, count in counts.items():
+            print(f"{system} 单次 syscall 动态指令记录={count}")
+        return 0
+
+    if args.mygo_trace or args.linux_trace:
+        raise ValueError("profile 模式不接受指令轨迹")
     if parameters["smp"] != 1 or parameters["repeats"] != 1 or parameters["case"] == "all":
         raise ValueError("profile 元数据违反单核、单轮、单 case 约束")
     profile_paths = {"mygo": args.mygo_profile, "linux": args.linux_profile}

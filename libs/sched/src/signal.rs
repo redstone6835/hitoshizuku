@@ -322,8 +322,12 @@ impl SignalState {
 
     /// 把一条信号投到本 task 的 pending。
     pub fn deliver(&self, info: SigInfo) {
-        self.pending_bits.fetch_or(info.sig.bit(), Ordering::AcqRel);
-        self.pending_infos.lock().push(info);
+        let mut queue = self.pending_infos.lock();
+        queue.push(info);
+        let pending = self.pending_bits.load(Ordering::Relaxed);
+        self.pending_bits
+            .store(pending | info.sig.bit(), Ordering::Release);
+        drop(queue);
         self.observers.notify();
     }
 
@@ -336,8 +340,9 @@ impl SignalState {
         // 若该信号已经没有其它实例，则清掉位图。
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.pending_bits.load(Ordering::Relaxed);
             self.pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
         drop(queue);
         self.observers.notify();
@@ -352,8 +357,9 @@ impl SignalState {
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.pending_bits.load(Ordering::Relaxed);
             self.pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
         drop(queue);
         self.observers.notify();
@@ -369,6 +375,18 @@ impl SignalState {
     #[inline]
     pub fn has_any_pending(&self) -> bool {
         self.pending_bits.load(Ordering::Acquire) != 0
+    }
+
+    /// 用户返回热路径读取原始 pending 位；只用于组成可投递工作预检。
+    #[inline(always)]
+    pub(crate) fn pending_bits_relaxed(&self) -> u64 {
+        self.pending_bits.load(Ordering::Relaxed)
+    }
+
+    /// 用户返回热路径读取 blocked mask；真正消费仍由队列锁串行化。
+    #[inline(always)]
+    pub(crate) fn blocked_bits_relaxed(&self) -> u64 {
+        self.blocked.load(Ordering::Relaxed)
     }
 
     /// 是否存在至少一条可投递信号（未屏蔽）。
@@ -553,9 +571,12 @@ impl SharedSignal {
 
     /// 投一条信号到 tg 的共享 pending。
     pub fn deliver(&self, info: SigInfo) {
+        let mut queue = self.shared_pending_infos.lock();
+        queue.push(info);
+        let pending = self.shared_pending_bits.load(Ordering::Relaxed);
         self.shared_pending_bits
-            .fetch_or(info.sig.bit(), Ordering::AcqRel);
-        self.shared_pending_infos.lock().push(info);
+            .store(pending | info.sig.bit(), Ordering::Release);
+        drop(queue);
         self.observers.notify();
     }
 
@@ -566,8 +587,9 @@ impl SharedSignal {
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.shared_pending_bits.load(Ordering::Relaxed);
             self.shared_pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
         drop(queue);
         self.observers.notify();
@@ -585,8 +607,9 @@ impl SharedSignal {
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.shared_pending_bits.load(Ordering::Relaxed);
             self.shared_pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
         drop(queue);
         self.observers.notify();
@@ -600,6 +623,12 @@ impl SharedSignal {
 
     pub fn pending_snapshot(&self) -> SigSet {
         SigSet(self.shared_pending_bits.load(Ordering::Acquire))
+    }
+
+    /// 用户返回热路径读取原始共享 pending 位；只用于组成可投递工作预检。
+    #[inline(always)]
+    pub(crate) fn pending_bits_relaxed(&self) -> u64 {
+        self.shared_pending_bits.load(Ordering::Relaxed)
     }
 
     pub fn pending_len_hint(&self) -> usize {

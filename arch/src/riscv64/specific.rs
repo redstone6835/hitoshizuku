@@ -21,6 +21,9 @@ pub use crate::riscv64::trap_frame::*;
 
 /// 支持的最大 hart 数。SMP 唤醒时不得超过此值。
 pub const MAX_HARTS: usize = 12;
+/// context-switch token 的 hart 编码步长；低 4 位保留 logical hart id。
+pub const CONTEXT_SWITCH_TOKEN_STRIDE: usize = 16;
+const _: () = assert!(MAX_HARTS <= CONTEXT_SWITCH_TOKEN_STRIDE);
 
 /// 每个 hart 的本地数据，通过 tp 寄存器寻址。
 #[repr(C)]
@@ -41,9 +44,15 @@ pub struct HartLocal {
     /// 仅标记 trap 入口/返回的脆弱汇编窗口：0=稳定，1=窗口内，2=已进入 fatal。
     /// Rust handler 执行前必须清零，避免调度切换期间产生伪嵌套。
     pub trap_entry_state: usize,
-    /// 每次内核任务上下文切换递增。syscall fast return 用它判断 live FPU
-    /// 寄存器是否仍属于入口时的任务；仅由当前 hart 在关中断调度路径写入。
+    /// 每次内核任务上下文切换按固定步长递增，低位编码 logical hart id。
+    /// syscall fast return 用它判断 live FPU 是否仍属于入口任务；跨 hart 迁移时
+    /// token 也必然变化。仅由当前 hart 在关中断调度路径写入。
     pub context_switch_seq: usize,
+    /// 调度器 current 槽所持 `Arc<Task>` 的裸指针镜像。
+    ///
+    /// 与 Linux 的 `tp -> current/thread_info` 相同，只允许当前 hart 借用；
+    /// 跨执行边界持有时必须在 sched 层显式提升为拥有型 `Arc`。
+    pub current_task: usize,
 }
 /// 最终 return-to-user 窗口使用的紧急栈可用大小。
 ///
@@ -63,6 +72,7 @@ pub const HART_LOCAL_TRAP_ENTRY_T5_OFF: usize = offset_of!(HartLocal, trap_entry
 pub const HART_LOCAL_TRAP_ENTRY_T6_OFF: usize = offset_of!(HartLocal, trap_entry_t6);
 pub const HART_LOCAL_TRAP_ENTRY_STATE_OFF: usize = offset_of!(HartLocal, trap_entry_state);
 pub const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF: usize = offset_of!(HartLocal, context_switch_seq);
+pub const HART_LOCAL_CURRENT_TASK_OFF: usize = offset_of!(HartLocal, current_task);
 
 /// 全部 hart 的紧急栈（静态分配，按 hart index 索引）。低地址端第一页仅作缓冲。
 #[repr(C, align(4096))]
@@ -93,6 +103,7 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
         trap_entry_t6: 0,
         trap_entry_state: 0,
         context_switch_seq: 0,
+        current_task: 0,
     };
     [EMPTY; MAX_HARTS]
 };
@@ -134,7 +145,8 @@ pub(crate) unsafe fn init_secondary_hart_local(
             trap_entry_t5: 0,
             trap_entry_t6: 0,
             trap_entry_state: 0,
-            context_switch_seq: 0,
+            context_switch_seq: logical_id,
+            current_task: 0,
         });
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
@@ -166,9 +178,28 @@ pub fn current_kernel_stack_top() -> usize {
 /// 该值只用于判断一次 trap 处理期间是否失去过当前 hart 的执行所有权，不能作为
 /// 跨 hart 的全局顺序号。调用方必须保留入口值并只比较是否相等。
 #[inline]
+#[cfg(feature = "performance-profile")]
 pub(crate) fn current_context_switch_sequence() -> usize {
     let ptr = current_hart_ptr();
     unsafe { core::ptr::addr_of!((*ptr).context_switch_seq).read_volatile() }
+}
+
+/// 读取当前 hart 的 borrowed-current 裸指针。
+#[inline(always)]
+pub(crate) fn current_task_ptr() -> *const sched::Task {
+    let ptr = current_hart_ptr();
+    unsafe { core::ptr::addr_of!((*ptr).current_task).read_volatile() as *const sched::Task }
+}
+
+/// 更新当前 hart 的 borrowed-current 裸指针。
+///
+/// # Safety
+/// `task_ptr` 必须指向调度器 current 槽仍持有强引用的任务，且只能由当前 hart
+/// 在发布 next 的调度路径调用。
+#[inline(always)]
+pub(crate) unsafe fn set_current_task_ptr(task_ptr: usize) {
+    let ptr = current_hart_ptr();
+    unsafe { core::ptr::addr_of_mut!((*ptr).current_task).write_volatile(task_ptr) };
 }
 
 /// 更新当前 hart 上正在运行任务的内核栈顶。
@@ -231,7 +262,9 @@ pub fn current_cpu_id() -> usize {
         );
     }
     debug_assert!(logical_id < sched::NR_CPUS);
-    logical_id.min(sched::NR_CPUS - 1)
+    // logical_id 只在 boot/AP 初始化阶段写入固定 HartLocal，运行期与 Linux 的
+    // thread_info.cpu 一样视为可信 per-CPU 字段。
+    logical_id
 }
 
 // ── ISA 扩展能力检测 ──────────────────────────────────────────────────────────

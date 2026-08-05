@@ -141,7 +141,8 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = Arc::clone(ctx.task());
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
-    ctx.release_task_ref();
+    // Safety: sched::operation::exit 不返回，不会再访问本 syscall context。
+    unsafe { ctx.release_task_ref() };
     drop(task);
     sched::operation::exit(code);
 }
@@ -155,7 +156,8 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         task.pid_root(),
         code
     );
-    ctx.release_task_ref();
+    // Safety: sched::operation::exit_group 不返回，不会再访问本 syscall context。
+    unsafe { ctx.release_task_ref() };
     drop(task);
     sched::operation::exit_group(code);
 }
