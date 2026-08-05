@@ -9,7 +9,7 @@ use core::ops::ControlFlow;
 use errno::Errno;
 #[cfg(not(test))]
 use sched::current_task;
-use sched::{Task, now_ns_direct};
+use sched::{Task, now_ns_public};
 use socket::{
     HandleIdentity, PeerIdentity, Readiness, ReceiveOptions, SendOptions, Socket as CoreSocket,
     SocketError, SocketHandle, SocketLinger, SocketShutdown, SocketTimeval, SocketType,
@@ -933,7 +933,7 @@ pub fn send(
 
 #[cfg(not(test))]
 fn deliver_inet_sigpipe() {
-    let task = sched::current_task_direct();
+    let task = sched::current_task();
     let credentials = task.credentials();
     let info = sched::SigInfo {
         sig: sched::SignalNumber::SIGPIPE,
@@ -2358,7 +2358,7 @@ fn socket_timeval_deadline(value: Option<SocketTimeval>) -> Option<u64> {
     let delta = secs
         .saturating_mul(1_000_000_000)
         .saturating_add(micros.saturating_mul(1_000));
-    Some(now_ns_direct().saturating_add(delta))
+    Some(now_ns_public().saturating_add(delta))
 }
 
 fn clamp_i32(value: usize) -> i32 {

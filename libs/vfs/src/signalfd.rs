@@ -29,8 +29,8 @@ struct SignalfdShared {
 
 impl SignalfdFileOps {
     pub fn new(mask: SigSet) -> Self {
-        let owner = if sched::is_ready_direct() {
-            Some(sched::current_task_direct())
+        let owner = if sched::is_ready() {
+            Some(sched::current_task())
         } else {
             None
         };

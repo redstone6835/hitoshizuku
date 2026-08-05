@@ -1722,8 +1722,8 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
             shard.load_waiters = shard.load_waiters.saturating_add(1);
         }
         let wait_queue = &self.load_waits[self.load_wait_index(key, load_id)];
-        if sched::is_ready_direct() {
-            let task = sched::current_task_direct();
+        if sched::is_ready() {
+            let task = sched::current_task();
             wait_queue.wait_event(&task, || !self.load_pending(key, load_id));
         } else {
             while self.load_pending(key, load_id) {

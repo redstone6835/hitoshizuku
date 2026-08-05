@@ -510,7 +510,7 @@ impl BioCompletionObserver for BlockIoStats {
             return;
         }
 
-        let elapsed_ns = sched::now_ns_direct().saturating_sub(submitted_ns);
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
         let sectors =
             (range.blocks as u64).saturating_mul((block_size.get() as u64).max(512) / 512);
         match op {
@@ -818,7 +818,7 @@ impl BlockDevice {
         self.validate_bio(op, range, &buffer)?;
         #[cfg(feature = "performance-profile")]
         let (profile_arg0, profile_arg1) = profile_block_args(op, range);
-        let submitted_ns = sched::now_ns_direct();
+        let submitted_ns = sched::now_ns_public();
         let (bio, completion) = Bio::new_shared_with_observer(
             op,
             range,
@@ -863,11 +863,11 @@ impl BlockDevice {
                 }
                 core::hint::spin_loop();
             }
-            if sched::is_ready_direct() {
+            if sched::is_ready() {
                 if completion.is_done() {
                     break;
                 }
-                sched::schedule_once(sched::now_ns_direct());
+                sched::schedule_once(sched::now_ns_public());
             } else {
                 core::hint::spin_loop();
             }
@@ -882,7 +882,7 @@ impl BlockDevice {
             profile_arg1,
         );
         let result = completion.wait();
-        let elapsed_ns = sched::now_ns_direct().saturating_sub(submitted_ns);
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
         if result.is_ok() {
             self.io_stats.record_complete(
                 op,
@@ -908,15 +908,15 @@ impl BlockDevice {
     ) -> Result<(Bio, BlockSubmitProfile), BioError> {
         #[cfg(feature = "performance-profile")]
         let (profile_arg0, profile_arg1) = profile_block_args(op, range);
-        let total_start = sched::now_ns_direct();
+        let total_start = sched::now_ns_public();
         let mut profile = BlockSubmitProfile::default();
 
-        let t0 = sched::now_ns_direct();
+        let t0 = sched::now_ns_public();
         self.validate_bio(op, range, &buffer)?;
-        profile.validate_ns = sched::now_ns_direct().saturating_sub(t0);
+        profile.validate_ns = sched::now_ns_public().saturating_sub(t0);
 
-        let submitted_ns = sched::now_ns_direct();
-        let t0 = sched::now_ns_direct();
+        let submitted_ns = sched::now_ns_public();
+        let t0 = sched::now_ns_public();
         let (bio, completion) = Bio::new_shared_with_observer(
             op,
             range,
@@ -925,10 +925,10 @@ impl BlockDevice {
             submitted_ns,
             None,
         );
-        profile.build_bio_ns = sched::now_ns_direct().saturating_sub(t0);
+        profile.build_bio_ns = sched::now_ns_public().saturating_sub(t0);
 
         self.io_stats.begin(op);
-        let t0 = sched::now_ns_direct();
+        let t0 = sched::now_ns_public();
         let queue_result = {
             #[cfg(feature = "performance-profile")]
             let _submit_profile = profiling::scope(profiling::Event::BlockSubmit)
@@ -936,12 +936,12 @@ impl BlockDevice {
             self.driver.queue_bio(bio)
         };
         if let Err((err, _bio)) = queue_result {
-            profile.queue_ns = sched::now_ns_direct().saturating_sub(t0);
+            profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
             self.io_stats.cancel(op);
-            profile.total_ns = sched::now_ns_direct().saturating_sub(total_start);
+            profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
             return Err(BioError::Submit(err));
         }
-        profile.queue_ns = sched::now_ns_direct().saturating_sub(t0);
+        profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
 
         #[cfg(feature = "performance-profile")]
         let _wait_profile =
@@ -951,7 +951,7 @@ impl BlockDevice {
         let mut profile_drain_cycles = 0u64;
         while !completion.is_done() {
             for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
-                let t0 = sched::now_ns_direct();
+                let t0 = sched::now_ns_public();
                 #[cfg(feature = "performance-profile")]
                 let drain_start = profiling::read_counter();
                 self.driver.drain();
@@ -962,7 +962,7 @@ impl BlockDevice {
                 }
                 profile.drain_ns = profile
                     .drain_ns
-                    .saturating_add(sched::now_ns_direct().saturating_sub(t0));
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
                 profile.drain_calls = profile.drain_calls.saturating_add(1);
                 if completion.is_done() {
                     break;
@@ -970,15 +970,15 @@ impl BlockDevice {
                 core::hint::spin_loop();
                 profile.spin_calls = profile.spin_calls.saturating_add(1);
             }
-            if sched::is_ready_direct() {
+            if sched::is_ready() {
                 if completion.is_done() {
                     break;
                 }
-                let t0 = sched::now_ns_direct();
-                sched::schedule_once(sched::now_ns_direct());
+                let t0 = sched::now_ns_public();
+                sched::schedule_once(sched::now_ns_public());
                 profile.schedule_ns = profile
                     .schedule_ns
-                    .saturating_add(sched::now_ns_direct().saturating_sub(t0));
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
                 profile.schedule_calls = profile.schedule_calls.saturating_add(1);
             } else {
                 core::hint::spin_loop();
@@ -996,12 +996,12 @@ impl BlockDevice {
             profile_arg1,
         );
 
-        let t0 = sched::now_ns_direct();
+        let t0 = sched::now_ns_public();
         let result = completion.wait();
-        profile.completion_take_ns = sched::now_ns_direct().saturating_sub(t0);
+        profile.completion_take_ns = sched::now_ns_public().saturating_sub(t0);
 
-        let elapsed_ns = sched::now_ns_direct().saturating_sub(submitted_ns);
-        let t0 = sched::now_ns_direct();
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        let t0 = sched::now_ns_public();
         if result.is_ok() {
             self.io_stats.record_complete(
                 op,
@@ -1012,8 +1012,8 @@ impl BlockDevice {
         } else {
             self.io_stats.cancel(op);
         }
-        profile.stats_ns = sched::now_ns_direct().saturating_sub(t0);
-        profile.total_ns = sched::now_ns_direct().saturating_sub(total_start);
+        profile.stats_ns = sched::now_ns_public().saturating_sub(t0);
+        profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
 
         result.map(|bio| (bio, profile))
     }
@@ -1070,7 +1070,7 @@ impl BlockDevice {
         #[cfg(feature = "performance-profile")]
         let (profile_arg0, profile_arg1) = profile_block_args(op, range);
         let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
-        let submitted_ns = sched::now_ns_direct();
+        let submitted_ns = sched::now_ns_public();
         let (bio, completion) = Bio::new_shared_with_observer(
             op,
             range,

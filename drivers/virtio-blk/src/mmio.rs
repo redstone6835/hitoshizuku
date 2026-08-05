@@ -316,14 +316,14 @@ impl VirtioBlk {
             #[cfg(feature = "block-profile")]
             let profile_poll_start = queue
                 .sampled_pending_published_ns()
-                .map(|_| sched::now_ns_direct());
+                .map(|_| sched::now_ns_public());
             let used = match queue.split_queue_mut().pop_used() {
                 Ok(Some(used)) => {
                     #[cfg(feature = "block-profile")]
                     if let Some(start) = profile_poll_start {
                         self.inner
                             .profile
-                            .record_used_poll_cost(sched::now_ns_direct().saturating_sub(start));
+                            .record_used_poll_cost(sched::now_ns_public().saturating_sub(start));
                     }
                     used
                 }
@@ -332,11 +332,11 @@ impl VirtioBlk {
                     if let Some(published_ns) = queue.sampled_pending_published_ns() {
                         if let Some(start) = profile_poll_start {
                             self.inner.profile.record_empty_poll_cost(
-                                sched::now_ns_direct().saturating_sub(start),
+                                sched::now_ns_public().saturating_sub(start),
                             );
                         }
                         self.inner.profile.record_empty_poll_since_publish(
-                            sched::now_ns_direct().saturating_sub(published_ns),
+                            sched::now_ns_public().saturating_sub(published_ns),
                         );
                     }
                     break;
@@ -377,7 +377,7 @@ impl VirtioBlk {
             } = pending;
             #[cfg(feature = "block-profile")]
             if profile_published_ns != 0 {
-                let now = sched::now_ns_direct();
+                let now = sched::now_ns_public();
                 self.inner
                     .profile
                     .record_publish_to_used(now.saturating_sub(profile_published_ns));
@@ -652,7 +652,7 @@ impl BlockDriver for VirtioBlkIo {
         }
         #[cfg(feature = "block-profile")]
         let profile_published_ns = if profile_sample {
-            let ns = sched::now_ns_direct();
+            let ns = sched::now_ns_public();
             queue.set_pending_profile_published_ns(head_idx, ns);
             ns
         } else {
@@ -670,7 +670,7 @@ impl BlockDriver for VirtioBlkIo {
         }
         #[cfg(feature = "block-profile")]
         if profile_sample {
-            let notified_ns = sched::now_ns_direct();
+            let notified_ns = sched::now_ns_public();
             self.driver
                 .inner
                 .profile

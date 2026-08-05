@@ -488,12 +488,12 @@ impl RandomCore {
             return Ok(false);
         }
 
-        if sched::is_ready_direct() {
+        if sched::is_ready() {
             loop {
                 if self.is_secure_ready() {
                     return Ok(true);
                 }
-                let task = sched::current_task_direct();
+                let task = sched::current_task();
                 if sched::operation::has_interrupting_signal(&task) {
                     return Err(CharIoError::Interrupted);
                 }
@@ -505,8 +505,8 @@ impl RandomCore {
                     return Ok(true);
                 }
                 drop(task);
-                sched::schedule_once(sched::now_ns_direct());
-                let task = sched::current_task_direct();
+                sched::schedule_once(sched::now_ns_public());
+                let task = sched::current_task();
                 self.entropy_wait.finish_wait(&entry);
                 if sched::operation::has_interrupting_signal(&task) {
                     return Err(CharIoError::Interrupted);

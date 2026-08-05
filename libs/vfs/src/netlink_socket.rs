@@ -148,10 +148,10 @@ impl NetlinkSocketFileOps {
             if nonblocking || self.nonblock.load(Ordering::Relaxed) {
                 return Err(Errno::EAGAIN);
             }
-            if deadline_ns.is_some_and(|deadline| sched::now_ns_direct() >= deadline) {
+            if deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
                 return Err(Errno::EAGAIN);
             }
-            let task = sched::current_task_direct();
+            let task = sched::current_task();
             if sched::operation::has_interrupting_signal(&task) {
                 return Err(Errno::EINTR);
             }
@@ -168,14 +168,14 @@ impl NetlinkSocketFileOps {
                 self.wait_queue.finish_wait(&entry);
                 continue;
             }
-            if deadline_ns.is_some_and(|dl| sched::now_ns_direct() >= dl) {
+            if deadline_ns.is_some_and(|dl| sched::now_ns_public() >= dl) {
                 if armed {
                     sched::cancel_sleep_deadline(&task);
                 }
                 self.wait_queue.finish_wait(&entry);
                 return Err(Errno::EAGAIN);
             }
-            sched::schedule_once(sched::now_ns_direct());
+            sched::schedule_once(sched::now_ns_public());
             if armed {
                 sched::cancel_sleep_deadline(&task);
             }
@@ -215,7 +215,7 @@ impl FileOps for NetlinkSocketFileOps {
             if self.nonblock.load(Ordering::Relaxed) {
                 return Err(VfsError::WouldBlock);
             }
-            let task = sched::current_task_direct();
+            let task = sched::current_task();
             if sched::operation::has_interrupting_signal(&task) {
                 return Err(VfsError::Interrupted);
             }
@@ -226,7 +226,7 @@ impl FileOps for NetlinkSocketFileOps {
                 self.wait_queue.finish_wait(&entry);
                 continue;
             }
-            sched::schedule_once(sched::now_ns_direct());
+            sched::schedule_once(sched::now_ns_public());
             self.wait_queue.finish_wait(&entry);
         }
     }

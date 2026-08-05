@@ -203,7 +203,7 @@ pub fn getlk(file: &File, owner_pid: i32, req: RecordLockRequest) -> Option<Reco
 pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) -> Result<(), Errno> {
     let key = LockKey::from_file(file);
     let owner = RecordOwner { pid: owner_pid };
-    let task = sched::current_task_direct();
+    let task = sched::current_task();
 
     loop {
         let (wait_entry, wake) = {
@@ -261,7 +261,7 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
             return Err(Errno::EINTR);
         }
 
-        sched::schedule_once(sched::now_ns_direct());
+        sched::schedule_once(sched::now_ns_public());
         waiters.finish_wait(&entry);
         PENDING_LOCKS.lock().remove(&owner.pid);
     }

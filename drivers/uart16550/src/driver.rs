@@ -356,13 +356,13 @@ impl Uart16550 {
         if duration_ms == 0 {
             return Ok(());
         }
-        let start = sched::now_ns_direct();
+        let start = sched::now_ns_public();
         if start == 0 {
             return Err(ControlError::Busy);
         }
         let deadline = start.saturating_add((duration_ms as u64).saturating_mul(NS_PER_MS));
-        while sched::now_ns_direct() < deadline {
-            if sched::is_ready_direct() {
+        while sched::now_ns_public() < deadline {
+            if sched::is_ready() {
                 sched::schedule_once(0);
             } else {
                 core::hint::spin_loop();

@@ -2150,7 +2150,7 @@ impl RxRing {
     fn record_full_reject(&mut self) {
         profiling::observe(profiling::Metric::RxRingFullRejects, 1);
         if self.full_since_ns == 0 {
-            self.full_since_ns = sched::now_ns_direct().saturating_add(1);
+            self.full_since_ns = sched::now_ns_public().saturating_add(1);
         }
     }
 
@@ -2162,7 +2162,7 @@ impl RxRing {
         let started = core::mem::take(&mut self.full_since_ns);
         profiling::observe(
             profiling::Metric::RxRingFullDurationNs,
-            sched::now_ns_direct().saturating_sub(started - 1),
+            sched::now_ns_public().saturating_sub(started - 1),
         );
     }
 
@@ -2515,7 +2515,7 @@ fn wake_one_local_socket_reader(
         return None;
     }
     let task = queue.wake_one_with(|_| {})?;
-    let now_ns = sched::now_ns_direct();
+    let now_ns = sched::now_ns_public();
     #[cfg(feature = "performance-profile")]
     {
         record_socket_wakeup();
@@ -3601,7 +3601,7 @@ impl SocketFacade {
                     route.hop_limit,
                     route.traffic_class,
                     route.interface,
-                    sched::now_ns_direct(),
+                    sched::now_ns_public(),
                     &mut copy,
                 );
                 #[cfg(feature = "performance-profile")]
@@ -5129,7 +5129,7 @@ impl SocketFacade {
         } else {
             None
         };
-        let in_syscall = sched::is_ready_direct()
+        let in_syscall = sched::is_ready()
             && sched::current_task_fast().execution_scope_kind()
                 == Some(sched::ExecutionScopeKind::Syscall);
         if handoff_ready && in_syscall {
@@ -5160,7 +5160,7 @@ impl SocketFacade {
     }
 
     fn request_local_udp_consumer_handoff(&self) {
-        if !sched::is_ready_direct()
+        if !sched::is_ready()
             || sched::current_task_fast().execution_scope_kind()
                 != Some(sched::ExecutionScopeKind::Syscall)
         {
@@ -5175,7 +5175,7 @@ impl SocketFacade {
     }
 
     fn remember_local_udp_consumer(&self) {
-        if !sched::is_ready_direct()
+        if !sched::is_ready()
             || sched::current_task_fast().execution_scope_kind()
                 != Some(sched::ExecutionScopeKind::Syscall)
         {
@@ -5192,7 +5192,7 @@ impl SocketFacade {
     }
 
     fn request_local_tcp_consumer_handoff(&self) {
-        if !sched::is_ready_direct()
+        if !sched::is_ready()
             || sched::current_task_fast().execution_scope_kind()
                 != Some(sched::ExecutionScopeKind::Syscall)
         {
@@ -5207,7 +5207,7 @@ impl SocketFacade {
     }
 
     fn remember_local_tcp_consumer(&self) {
-        if !sched::is_ready_direct()
+        if !sched::is_ready()
             || sched::current_task_fast().execution_scope_kind()
                 != Some(sched::ExecutionScopeKind::Syscall)
         {
@@ -5639,10 +5639,10 @@ impl SocketFacade {
             if matches!(self.owner(), OwnerRef::Closed { .. }) {
                 return Ok(());
             }
-            if sched::now_ns_direct() >= deadline_ns {
+            if sched::now_ns_public() >= deadline_ns {
                 return Err(SocketError::TimedOut);
             }
-            let task = sched::current_task_direct();
+            let task = sched::current_task();
             let entry = self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
             if matches!(self.owner(), OwnerRef::Closed { .. }) {
                 self.state_wait.finish_wait(&entry);
@@ -5654,8 +5654,8 @@ impl SocketFacade {
             }
             let armed = sched::register_sleep_deadline(&task, deadline_ns);
             drop(task);
-            sched::schedule_once(sched::now_ns_direct());
-            let task = sched::current_task_direct();
+            sched::schedule_once(sched::now_ns_public());
+            let task = sched::current_task();
             self.state_wait.finish_wait(&entry);
             if armed {
                 sched::cancel_sleep_deadline(&task);
@@ -6034,7 +6034,7 @@ impl SocketFacade {
             if let Some(result) = self.take_control_result(sequence) {
                 return result;
             }
-            let task = sched::current_task_direct();
+            let task = sched::current_task();
             let entry = self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
             if let Err(error) = self.ensure_stack_attached() {
                 self.state_wait.finish_wait(&entry);
@@ -6049,7 +6049,7 @@ impl SocketFacade {
                 return Err(SocketError::Interrupted);
             }
             drop(task);
-            sched::schedule_once(sched::now_ns_direct());
+            sched::schedule_once(sched::now_ns_public());
             self.state_wait.finish_wait(&entry);
         }
     }
@@ -6114,7 +6114,7 @@ impl SocketFacade {
         // 无锁边界推进 ITIMER_REAL，避免 alarm 被高频 socket wait 饿死。
         sched::drain_deferred_timer_tick();
         self.ensure_stack_attached()?;
-        let task = sched::current_task_direct();
+        let task = sched::current_task();
         let entry = queue.prepare_to_wait(&task, TaskState::Sleeping);
         if let Err(error) = self.ensure_stack_attached() {
             queue.finish_wait(&entry);
@@ -6128,15 +6128,15 @@ impl SocketFacade {
             queue.finish_wait(&entry);
             return Ok(());
         }
-        if deadline_ns.is_some_and(|deadline| sched::now_ns_direct() >= deadline) {
+        if deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
             queue.finish_wait(&entry);
             return Err(SocketError::TimedOut);
         }
         let armed =
             deadline_ns.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
         drop(task);
-        sched::schedule_once(sched::now_ns_direct());
-        let task = sched::current_task_direct();
+        sched::schedule_once(sched::now_ns_public());
+        let task = sched::current_task();
         queue.finish_wait(&entry);
         if armed {
             sched::cancel_sleep_deadline(&task);
@@ -6145,7 +6145,7 @@ impl SocketFacade {
         if sched::operation::has_interrupting_signal(&task) {
             return Err(SocketError::Interrupted);
         }
-        if deadline_ns.is_some_and(|deadline| sched::now_ns_direct() >= deadline) {
+        if deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
             return Err(SocketError::TimedOut);
         }
         Ok(())

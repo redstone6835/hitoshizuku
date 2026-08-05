@@ -185,7 +185,7 @@ impl TimerfdShared {
                 .compare_exchange(registration, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                let now_ns = sched::now_ns_direct();
+                let now_ns = sched::now_ns_public();
                 if let Some(next) = self.deadline_expired(0, now_ns) {
                     self.arm(Some(next), now_ns);
                 }
@@ -232,7 +232,7 @@ impl FileOps for TimerfdFileOps {
         }
         let value = {
             let mut state = self.shared.state.lock();
-            Self::refresh_locked(&mut state, sched::now_ns_direct());
+            Self::refresh_locked(&mut state, sched::now_ns_public());
             if state.expirations == 0 {
                 return Err(VfsError::WouldBlock);
             }
@@ -241,7 +241,7 @@ impl FileOps for TimerfdFileOps {
             value
         };
         buf[..8].copy_from_slice(&value.to_ne_bytes());
-        self.shared.publish_readiness(sched::now_ns_direct());
+        self.shared.publish_readiness(sched::now_ns_public());
         Ok(8)
     }
 
@@ -262,7 +262,7 @@ impl FileOps for TimerfdFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        self.shared.publish_readiness(sched::now_ns_direct());
+        self.shared.publish_readiness(sched::now_ns_public());
         self.shared.poll_source.snapshot().0.intersect(interest)
     }
 
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn expiry_publishes_readiness_without_epoll_scanning() {
         let timer = TimerfdFileOps::new(1);
-        let now = sched::now_ns_direct();
+        let now = sched::now_ns_public();
         timer.set_deadline(now, Some(now.saturating_add(10)), 0);
         assert!(timer.shared.poll_source.snapshot().0.is_empty());
         let registration = timer.shared.registration.load(Ordering::Acquire);

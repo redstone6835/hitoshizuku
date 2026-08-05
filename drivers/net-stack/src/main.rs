@@ -1150,7 +1150,7 @@ fn initialize_flow_shards(boot: net::boot::NetStackBootConfig, generation: u64) 
     if count == 0 || count > sched::NR_CPUS {
         return false;
     }
-    let now_ns = sched::now_ns_direct();
+    let now_ns = sched::now_ns_public();
     if count > FLOW_SHARDS.len() {
         return false;
     }

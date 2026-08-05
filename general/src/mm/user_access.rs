@@ -116,7 +116,7 @@ pub fn copy_cstr_from_user(user: usize, max: usize) -> Result<String, UserAccess
 }
 
 fn current_task_vm_space() -> Option<Arc<VmSpace>> {
-    if !sched::is_ready_direct() {
+    if !sched::is_ready() {
         return None;
     }
     // 只在复制 VmSpace Arc 前借用 current raw 槽，避免用户复制热路径为 Task

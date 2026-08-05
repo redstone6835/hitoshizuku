@@ -399,7 +399,7 @@ impl TmpfsPagePool {
     }
 
     fn current_shard() -> usize {
-        if sched::is_ready_direct() {
+        if sched::is_ready() {
             sched::current_cpu_id().min(sched::NR_CPUS - 1)
         } else {
             0

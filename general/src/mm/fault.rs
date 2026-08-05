@@ -121,7 +121,7 @@ const fn profile_fault_kind(kind: FaultKind) -> u64 {
 fn current_task_vm_space() -> Option<Arc<VmSpace>> {
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::PageFaultTaskLookup);
-    if !sched::is_ready_direct() {
+    if !sched::is_ready() {
         return None;
     }
     // 当前任务 raw 槽由调度器持有强引用；这里只在取得 VmSpace Arc 前短暂借用，

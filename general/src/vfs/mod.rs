@@ -37,19 +37,19 @@ const DEV_DIR_MODE: FileMode = FileMode::new(0o755);
 ///
 /// 没有装载或当前不在 sched 调度的语境（启动早期）时返回 None。
 pub fn current_vfs_context() -> Option<Arc<VfsContext>> {
-    if !sched::is_ready_direct() {
+    if !sched::is_ready() {
         return None;
     }
-    let payload = sched::current_task_direct().ext_lookup(sched::TASKEXT_VFS_CONTEXT)?;
+    let payload = sched::current_task().ext_lookup(sched::TASKEXT_VFS_CONTEXT)?;
     payload.downcast::<VfsContext>().ok()
 }
 
 /// 取当前任务的 [`FdTable`]。语义同上。
 pub fn current_fdtable() -> Option<Arc<FdTable>> {
-    if !sched::is_ready_direct() {
+    if !sched::is_ready() {
         return None;
     }
-    let payload = sched::current_task_direct().ext_lookup(sched::TASKEXT_VFS_FDTABLE)?;
+    let payload = sched::current_task().ext_lookup(sched::TASKEXT_VFS_FDTABLE)?;
     payload.downcast::<FdTable>().ok()
 }
 

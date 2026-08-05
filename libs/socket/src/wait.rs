@@ -8,7 +8,7 @@ use alloc::sync::{Arc, Weak};
 use sched::sync::Spinlock;
 use sched::{
     Task, TaskState, WaitQueue, WaitQueueEntry, WaitReason, cancel_sleep_deadline, current_task,
-    enqueue_task, is_ready, now_ns_direct, register_sleep_deadline, schedule_once,
+    enqueue_task, is_ready, now_ns_public, register_sleep_deadline, schedule_once,
 };
 
 use crate::types::SocketError;
@@ -72,7 +72,7 @@ impl SocketWaitQueue {
 /// 唤醒等待队列中的一个任务(将其重新入调度器就绪队列)。
 pub(crate) fn wake_task(task: &Arc<Task>) {
     if is_ready() && task.state() == TaskState::Runnable {
-        enqueue_task(Arc::clone(task), now_ns_direct());
+        enqueue_task(Arc::clone(task), now_ns_public());
     }
 }
 
@@ -83,7 +83,7 @@ fn has_pending_signal(task: &Arc<Task>) -> bool {
 
 /// 检查超时截止时间是否已过期。
 fn deadline_expired(deadline: Option<u64>) -> bool {
-    deadline.is_some_and(|dl| now_ns_direct() >= dl)
+    deadline.is_some_and(|dl| now_ns_public() >= dl)
 }
 
 /// 条件等待:阻塞当前任务直到 `predicate` 返回 false、超时或收到信号。
@@ -122,7 +122,7 @@ pub(crate) fn wait_while(
             queue.finish_wait(&entry);
             return Err(SocketError::TemporaryUnavailable);
         }
-        schedule_once(now_ns_direct());
+        schedule_once(now_ns_public());
         if deadline_armed {
             cancel_sleep_deadline(&task);
         }

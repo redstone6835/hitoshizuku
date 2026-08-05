@@ -479,7 +479,7 @@ impl EpollFileOps {
             let armed =
                 deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
             drop(task);
-            sched::schedule_once(sched::now_ns_direct());
+            sched::schedule_once(sched::now_ns_public());
             let task = current_task();
             self.core.waiters.finish_wait(&entry);
             if armed {
@@ -667,14 +667,14 @@ impl FileOps for EpollFileOps {
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
-        Some(sched::now_ns_direct().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
+        Some(sched::now_ns_public().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
     } else {
         None
     }
 }
 
 fn timeout_expired(deadline: Option<u64>) -> bool {
-    deadline.is_some_and(|dl| sched::now_ns_direct() >= dl)
+    deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
 }
 
 #[cfg(test)]

@@ -1393,7 +1393,7 @@ pub(crate) fn timeout_to_deadline(timeout: Option<SocketTimeval>) -> Option<u64>
     let nanos = (timeout.secs as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add((timeout.micros as u64).saturating_mul(1_000));
-    Some(sched::now_ns_direct().saturating_add(nanos))
+    Some(sched::now_ns_public().saturating_add(nanos))
 }
 
 pub(crate) fn effective_recv_deadline(
