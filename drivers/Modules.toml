@@ -26,6 +26,49 @@ targets = "riscv64gc-unknown-none-elf"
 after = "platform.firmware-bus"
 
 [[modules]]
+name = "platform.riscv-aia"
+path = "riscv-aia"
+config = "CONFIG_RISCV_AIA"
+prompt = "RISC-V AIA APLIC/IMSIC 驱动"
+default = "y"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.riscv-pmu"
+path = "riscv-pmu"
+config = "CONFIG_RISCV_PMU"
+prompt = "RISC-V 固件 PMU 映射驱动"
+default = "y"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.riscv-iommu"
+path = "riscv-iommu"
+config = "CONFIG_RISCV_IOMMU"
+prompt = "RISC-V IOMMU 1.0 驱动"
+default = "y"
+targets = "riscv64gc-unknown-none-elf"
+after = "platform.firmware-bus,platform.plic,platform.riscv-aia"
+
+[[modules]]
+name = "platform.dt-providers"
+path = "dt-providers"
+config = "CONFIG_DT_PROVIDERS"
+prompt = "标准 Device Tree 固定 provider 驱动"
+default = "y"
+after = "platform.firmware-bus"
+
+[[modules]]
+name = "platform.pci-host-ecam"
+path = "pci-host-ecam"
+config = "CONFIG_PCI_HOST_ECAM"
+prompt = "Generic PCI CAM/ECAM host bridge 驱动"
+default = "y"
+after = "platform.firmware-bus,platform.loongson-irq,platform.plic,platform.riscv-aia,platform.riscv-iommu"
+
+[[modules]]
 name = "platform.syscon"
 path = "syscon"
 config = "CONFIG_SYSCON"
@@ -49,7 +92,7 @@ config = "CONFIG_GOLDFISH_RTC"
 prompt = "Goldfish RTC 驱动"
 default = "y"
 targets = "riscv64gc-unknown-none-elf"
-after = "platform.plic"
+after = "platform.plic,platform.riscv-aia"
 
 [[modules]]
 name = "platform.fw-cfg"
@@ -73,7 +116,7 @@ path = "uart16550"
 config = "CONFIG_UART16550"
 prompt = "NS16550A UART 驱动"
 default = "y"
-after = "platform.firmware-bus,platform.loongson-irq,platform.plic"
+after = "platform.firmware-bus,platform.loongson-irq,platform.plic,platform.riscv-aia"
 
 [[modules]]
 name = "kernel.random"
