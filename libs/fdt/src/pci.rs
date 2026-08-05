@@ -269,7 +269,11 @@ impl Tree<'_> {
         let child_address_cells = self.exact_cell_count(host, "#address-cells", 3)?;
         // PCI child interrupt specifier 按 binding 固定为一个 cell。Linux 与现有
         // QEMU LoongArch 固件允许 host 在提供 interrupt-map 时省略这项推荐声明。
-        let child_interrupt_cells = optional_count(self, host, "#interrupt-cells", 1)?;
+        let child_interrupt_cells = if node.property("#interrupt-cells").is_some() {
+            self.exact_cell_count(host, "#interrupt-cells", 1)?
+        } else {
+            1
+        };
         let key_cells = child_address_cells
             .checked_add(child_interrupt_cells)
             .ok_or(PciError::Overflow {
@@ -402,6 +406,14 @@ impl Tree<'_> {
         child_interrupt: &[u32],
     ) -> Result<Option<PciInterruptRoute>, PciError> {
         self.node(map.host).ok_or(PciError::InvalidNode(map.host))?;
+        let key_cells = map
+            .child_address_cells
+            .checked_add(map.child_interrupt_cells)
+            .ok_or(PciError::Overflow {
+                node: map.host,
+                property: "interrupt-map",
+                entry: 0,
+            })?;
         if child_address.len() != map.child_address_cells
             || child_interrupt.len() != map.child_interrupt_cells
         {
@@ -413,8 +425,27 @@ impl Tree<'_> {
                 interrupt_actual: child_interrupt.len(),
             });
         }
+        validate_runtime_map_width(map.host, "interrupt-map-mask", map.mask.len(), key_cells)?;
+        validate_runtime_map_width(
+            map.host,
+            "interrupt-map-pass-thru",
+            map.pass_thru.len(),
+            key_cells,
+        )?;
+        for (index, entry) in map.entries.iter().enumerate() {
+            let encoded_key_cells = entry
+                .child_address
+                .len()
+                .checked_add(entry.child_interrupt.len())
+                .ok_or(PciError::Overflow {
+                    node: map.host,
+                    property: "interrupt-map",
+                    entry: index,
+                })?;
+            validate_runtime_map_entry_width(map.host, index, encoded_key_cells, key_cells)?;
+        }
 
-        let mut child_key = Vec::with_capacity(child_address.len() + child_interrupt.len());
+        let mut child_key = Vec::with_capacity(key_cells);
         child_key.extend_from_slice(child_address);
         child_key.extend_from_slice(child_interrupt);
         for entry in &map.entries {
@@ -681,6 +712,42 @@ fn property_cells(
             property: property_name,
             error,
         })
+}
+
+fn validate_runtime_map_width(
+    node: NodeId,
+    property: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<(), PciError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(PciError::IncompleteEntry {
+        node,
+        property,
+        entry: 0,
+        remaining_cells: actual,
+        required_cells: expected,
+    })
+}
+
+fn validate_runtime_map_entry_width(
+    node: NodeId,
+    entry: usize,
+    actual: usize,
+    expected: usize,
+) -> Result<(), PciError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(PciError::IncompleteEntry {
+        node,
+        property: "interrupt-map",
+        entry,
+        remaining_cells: actual,
+        required_cells: expected,
+    })
 }
 
 fn required_count(

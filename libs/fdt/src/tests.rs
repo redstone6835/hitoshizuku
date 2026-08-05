@@ -376,6 +376,128 @@ fn chosen_stdout_is_available_without_allocation() {
 }
 
 #[test]
+fn chosen_bootargs_is_strict_and_supports_legacy_chosen_name() {
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("chosen@0");
+    builder.property("bootargs", b"console=ttyS0 root=/dev/vda\0");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+
+    assert_eq!(
+        Fdt::parse(&blob).unwrap().chosen_bootargs(),
+        Ok(Some("console=ttyS0 root=/dev/vda"))
+    );
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("chosen");
+    builder.property("bootargs", b"missing-nul");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    assert_eq!(
+        Fdt::parse(&blob).unwrap().chosen_bootargs(),
+        Err(PropertyError::MissingNul)
+    );
+}
+
+#[test]
+fn riscv_cpu_binding_prefers_split_isa_and_decodes_cache_blocks() {
+    use crate::{RiscvCpuBinding, RiscvIsaSource};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("cpus");
+    builder.begin("cpu@0");
+    builder.property("riscv,isa-base", b"rv64i\0");
+    builder.property(
+        "riscv,isa-extensions",
+        b"i\0m\0a\0v\0zicbom\0zicboz\0zicbop\0sstc\0",
+    );
+    // legacy 字符串故意不含 V，用于证明新 binding 优先。
+    builder.property("riscv,isa", b"rv64imac_zicboz\0");
+    builder.property("mmu-type", b"riscv,sv57\0");
+    builder.property("riscv,cbom-block-size", &64u32.to_be_bytes());
+    builder.property("riscv,cboz-block-size", &128u32.to_be_bytes());
+    builder.property("riscv,cbop-block-size", &32u32.to_be_bytes());
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let fdt = Fdt::parse(&blob).unwrap();
+    let binding = RiscvCpuBinding::parse(fdt.find_node("/cpus/cpu@0").unwrap()).unwrap();
+
+    assert_eq!(binding.isa_source(), RiscvIsaSource::Split);
+    assert_eq!(binding.isa_base(), "rv64i");
+    assert!(binding.has_isa_extension("v"));
+    assert!(binding.has_isa_extension("zicbom"));
+    assert!(binding.has_isa_extension("zicboz"));
+    assert!(binding.has_isa_extension("zicbop"));
+    assert!(binding.has_isa_extension("sstc"));
+    assert_eq!(binding.mmu_type(), "riscv,sv57");
+    assert_eq!(binding.cbom_block_size(), Some(64));
+    assert_eq!(binding.cboz_block_size(), Some(128));
+    assert_eq!(binding.cbop_block_size(), Some(32));
+}
+
+#[test]
+fn riscv_cpu_binding_falls_back_to_versioned_legacy_isa() {
+    use crate::{RiscvCpuBinding, RiscvIsaSource};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("cpu@0");
+    builder.property(
+        "riscv,isa",
+        b"rv64imafdcv_zicbom1p0_zicboz1p0_zicbop1p0_sstc1p0\0",
+    );
+    builder.property("mmu-type", b"riscv,sv48\0");
+    builder.property("riscv,cbom-block-size", &64u32.to_be_bytes());
+    builder.property("riscv,cboz-block-size", &64u32.to_be_bytes());
+    builder.property("riscv,cbop-block-size", &64u32.to_be_bytes());
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let fdt = Fdt::parse(&blob).unwrap();
+    let binding = RiscvCpuBinding::parse(fdt.find_node("/cpu@0").unwrap()).unwrap();
+
+    assert_eq!(binding.isa_source(), RiscvIsaSource::Legacy);
+    assert_eq!(binding.isa_base(), "rv64i");
+    assert!(binding.has_isa_extension("v"));
+    assert!(binding.has_isa_extension("zicbom"));
+    assert!(binding.has_isa_extension("zicboz"));
+    assert!(binding.has_isa_extension("zicbop"));
+    assert!(binding.has_isa_extension("sstc"));
+}
+
+#[test]
+fn riscv_cpu_binding_rejects_partial_split_isa() {
+    use crate::{RiscvCpuBinding, RiscvCpuError};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("cpu@0");
+    builder.property("riscv,isa-base", b"rv64i\0");
+    builder.property("mmu-type", b"riscv,sv48\0");
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let fdt = Fdt::parse(&blob).unwrap();
+
+    assert_eq!(
+        RiscvCpuBinding::parse(fdt.find_node("/cpu@0").unwrap()).unwrap_err(),
+        RiscvCpuError::IncompleteIsaPair
+    );
+}
+
+#[test]
 fn parse_uses_declared_total_size_only() {
     let mut blob = basic_blob(17);
     let declared = blob.len();
@@ -2772,6 +2894,9 @@ fn generic_iommu_map_preserves_entries_and_translates_only_unambiguous_widths() 
     builder.begin("legacy-host");
     builder.property("iommu-map", &cells(&[0, 4, 0x40, 2]));
     builder.end_node();
+    builder.begin("empty-range-host");
+    builder.property("iommu-map", &cells(&[0, 2, 0, 0, 1, 2, 1, 2]));
+    builder.end_node();
     builder.begin("bad-host");
     builder.property("iommu-map", &cells(&[0, 3, 7]));
     builder.end_node();
@@ -2851,6 +2976,16 @@ fn generic_iommu_map_preserves_entries_and_translates_only_unambiguous_widths() 
         .unwrap();
     assert_eq!(legacy.entries[0].output_base, vec![0x40]);
     assert_eq!(legacy.map_id(1).unwrap().unwrap().args, vec![0x41]);
+
+    let empty_range = tree
+        .iommu_map(tree.find_node("/empty-range-host").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty_range.entries.len(), 2);
+    assert_eq!(empty_range.entries[0].length, 0);
+    assert_eq!(empty_range.map_id(0), Ok(None));
+    assert_eq!(empty_range.map_id(1).unwrap().unwrap().args, vec![1]);
+    assert_eq!(empty_range.map_id(2).unwrap().unwrap().args, vec![2]);
 
     let bad = tree.find_node("/bad-host").unwrap();
     assert!(matches!(
@@ -3012,7 +3147,8 @@ fn pci_bindings_preserve_masks_widths_and_parent_identity() {
     builder.end_node();
     builder.begin("msi");
     builder.property("phandle", &cells(&[2]));
-    // Modern msi-map entries preserve the target's two-cell output specifier.
+    // 非标准的两 cell MSI 表仍由底层解析器无损保留，但通用 PCI MSI
+    // 运行时只接受 binding 定义的零或一 cell 格式。
     builder.property("#msi-cells", &cells(&[2]));
     builder.end_node();
     builder.begin("msi-zero");
@@ -3083,6 +3219,106 @@ fn pci_bindings_preserve_masks_widths_and_parent_identity() {
     let zero = tree.pci_msi_map(zero).unwrap().unwrap();
     assert_eq!(zero.entries.len(), 1);
     assert!(zero.entries[0].msi_specifier.is_empty());
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn pci_host_rejects_nonstandard_child_interrupt_width() {
+    use crate::{PciError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("intc");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#interrupt-cells", &cells(&[1]));
+    builder.property("interrupt-controller", &[]);
+    builder.end_node();
+    builder.begin("pcie");
+    builder.property("#address-cells", &cells(&[3]));
+    builder.property("#interrupt-cells", &cells(&[2]));
+    builder.property("interrupt-map", &cells(&[0, 0, 0, 1, 2, 1, 9]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let host = tree.find_node("/pcie").unwrap();
+
+    assert_eq!(
+        tree.pci_interrupt_map(host),
+        Err(PciError::InvalidCellCount {
+            node: host,
+            property: "#interrupt-cells",
+            expected: Some(1),
+            actual: 2,
+        })
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn pci_interrupt_resolver_revalidates_public_map_widths() {
+    use crate::{PciError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("intc");
+    builder.property("phandle", &cells(&[1]));
+    builder.property("#address-cells", &cells(&[0]));
+    builder.property("#interrupt-cells", &cells(&[1]));
+    builder.property("interrupt-controller", &[]);
+    builder.end_node();
+    builder.begin("pcie");
+    builder.property("#address-cells", &cells(&[3]));
+    builder.property("#interrupt-cells", &cells(&[1]));
+    builder.property("interrupt-map", &cells(&[0, 0, 0, 1, 1, 9]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let host = tree.find_node("/pcie").unwrap();
+    let map = tree.pci_interrupt_map(host).unwrap().unwrap();
+
+    let mut malformed = map.clone();
+    malformed.mask.pop();
+    assert_eq!(
+        tree.resolve_pci_interrupt(&malformed, &[0, 0, 0], &[1]),
+        Err(PciError::IncompleteEntry {
+            node: host,
+            property: "interrupt-map-mask",
+            entry: 0,
+            remaining_cells: 3,
+            required_cells: 4,
+        })
+    );
+
+    let mut malformed = map.clone();
+    malformed.pass_thru.pop();
+    assert_eq!(
+        tree.resolve_pci_interrupt(&malformed, &[0, 0, 0], &[1]),
+        Err(PciError::IncompleteEntry {
+            node: host,
+            property: "interrupt-map-pass-thru",
+            entry: 0,
+            remaining_cells: 3,
+            required_cells: 4,
+        })
+    );
+
+    let mut malformed = map;
+    malformed.entries[0].child_address.pop();
+    assert_eq!(
+        tree.resolve_pci_interrupt(&malformed, &[0, 0, 0], &[1]),
+        Err(PciError::IncompleteEntry {
+            node: host,
+            property: "interrupt-map",
+            entry: 0,
+            remaining_cells: 3,
+            required_cells: 4,
+        })
+    );
 }
 
 #[cfg(feature = "alloc")]
@@ -3243,12 +3479,11 @@ fn pci_interrupt_map_bounds_declared_width_before_allocating_mask() {
 
     assert_eq!(
         tree.pci_interrupt_map(host),
-        Err(PciError::IncompleteEntry {
+        Err(PciError::InvalidCellCount {
             node: host,
-            property: "interrupt-map",
-            entry: 0,
-            remaining_cells: 0,
-            required_cells: u32::MAX as usize + 4,
+            property: "#interrupt-cells",
+            expected: Some(1),
+            actual: u32::MAX,
         })
     );
 }
@@ -3292,6 +3527,152 @@ fn malformed_pci_range_suffix_rejects_the_complete_property() {
             entry: 1,
             remaining_cells: 1,
             required_cells: 6,
+        })
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn numa_binding_preserves_assignments_inheritance_memory_and_symmetric_distance() {
+    use crate::{NUMA_LOCAL_DISTANCE, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.property("#address-cells", &cells(&[1]));
+    builder.property("#size-cells", &cells(&[1]));
+    builder.begin("distance-map");
+    builder.property("compatible", b"numa-distance-map-v1\0");
+    builder.property(
+        "distance-matrix",
+        &cells(&[1, 1, NUMA_LOCAL_DISTANCE, 1, 2, 20, 2, 2, 10]),
+    );
+    builder.end_node();
+    builder.begin("memory@1000");
+    builder.property("device_type", b"memory\0");
+    builder.property("reg", &cells(&[0x1000, 0x2000]));
+    builder.property("numa-node-id", &cells(&[1]));
+    builder.end_node();
+    builder.begin("soc");
+    builder.property("numa-node-id", &cells(&[2]));
+    builder.begin("device@0");
+    builder.end_node();
+    builder.begin("disabled@1");
+    builder.property("status", b"disabled\0");
+    builder.property("numa-node-id", &cells(&[9]));
+    builder.end_node();
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+
+    let memory_node = tree.find_node("/memory@1000").unwrap();
+    let device = tree.find_node("/soc/device@0").unwrap();
+    let numa = tree.numa_description().unwrap();
+    assert_eq!(tree.effective_numa_node_id(device), Ok(Some(2)));
+    assert!(
+        numa.assignments
+            .iter()
+            .any(|entry| entry.node == memory_node && entry.node_id == 1)
+    );
+    assert!(!numa.assignments.iter().any(|entry| entry.node_id == 9));
+    assert_eq!(numa.distance(1, 2), Some(20));
+    assert_eq!(numa.distance(2, 1), Some(20));
+    assert_eq!(numa.distance(7, 7), Some(NUMA_LOCAL_DISTANCE));
+    assert_eq!(numa.distance(1, 7), None);
+    assert_eq!(
+        tree.memory_description().unwrap().memory_banks[0].numa_node_id,
+        Some(1)
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn numa_distance_map_rejects_asymmetric_pairs() {
+    use crate::{NumaError, Tree};
+
+    let mut builder = StructureBuilder::new(17);
+    builder.begin("");
+    builder.begin("distance-map");
+    builder.property("compatible", b"numa-distance-map-v1\0");
+    builder.property("distance-matrix", &cells(&[0, 1, 20, 1, 0, 30]));
+    builder.end_node();
+    builder.end_node();
+    let (structure, strings) = builder.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let map = tree.find_node("/distance-map").unwrap();
+
+    assert_eq!(
+        tree.numa_description(),
+        Err(NumaError::AsymmetricDistance {
+            node: map,
+            from: 1,
+            to: 0,
+            forward: 30,
+            reverse: 20,
+        })
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn numa_distance_map_requires_normative_root_name_and_order() {
+    use crate::{NumaError, Tree};
+
+    let mut nested = StructureBuilder::new(17);
+    nested.begin("");
+    nested.begin("container");
+    nested.begin("distance-map");
+    nested.property("compatible", b"numa-distance-map-v1\0");
+    nested.property("distance-matrix", &cells(&[0, 0, 10]));
+    nested.end_node();
+    nested.end_node();
+    nested.end_node();
+    let (structure, strings) = nested.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let map = tree.find_node("/container/distance-map").unwrap();
+    assert_eq!(
+        tree.numa_description(),
+        Err(NumaError::DistanceMapOutsideRoot { node: map })
+    );
+
+    let mut named = StructureBuilder::new(17);
+    named.begin("");
+    named.begin("distance-map@0");
+    named.property("compatible", b"numa-distance-map-v1\0");
+    named.property("distance-matrix", &cells(&[0, 0, 10]));
+    named.end_node();
+    named.end_node();
+    let (structure, strings) = named.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let map = tree.find_node("/distance-map@0").unwrap();
+    assert_eq!(
+        tree.numa_description(),
+        Err(NumaError::InvalidDistanceMapName { node: map })
+    );
+
+    let mut unordered = StructureBuilder::new(17);
+    unordered.begin("");
+    unordered.begin("distance-map");
+    unordered.property("compatible", b"numa-distance-map-v1\0");
+    unordered.property("distance-matrix", &cells(&[1, 1, 10, 0, 0, 10]));
+    unordered.end_node();
+    unordered.end_node();
+    let (structure, strings) = unordered.end();
+    let blob = assemble(17, structure, strings, &[]);
+    let tree = Tree::parse(&blob).unwrap();
+    let map = tree.find_node("/distance-map").unwrap();
+    assert_eq!(
+        tree.numa_description(),
+        Err(NumaError::UnorderedDistance {
+            node: map,
+            previous_from: 1,
+            previous_to: 1,
+            from: 0,
+            to: 0,
         })
     );
 }

@@ -670,7 +670,8 @@ impl Tree<'_> {
     ///
     /// 每项采用 `<input-base phandle output-specifier... length>`，输出宽度由目标
     /// provider 的 `cells_property` 决定。单 cell 表与 Linux `of_map_id()` 的四-cell
-    /// ABI 完全一致；多 cell 表按最新 dt-schema 无损保留。空属性和不完整尾项均非法。
+    /// ABI 完全一致；多 cell 表按最新 dt-schema 无损保留。零长度项作为
+    /// 空区间保留且永不命中；空属性和不完整尾项仍非法。
     pub fn id_map(
         &self,
         node: NodeId,
@@ -751,8 +752,7 @@ impl Tree<'_> {
             let length = values[offset];
             offset += 1;
             if input_base & !mask != 0
-                || length == 0
-                || input_base.checked_add(length - 1).is_none()
+                || (length != 0 && input_base.checked_add(length - 1).is_none())
             {
                 return Err(IdMapError::InvalidRange {
                     node,

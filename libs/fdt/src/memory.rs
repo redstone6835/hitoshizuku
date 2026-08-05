@@ -45,6 +45,8 @@ pub struct MemoryBank {
     pub node: NodeId,
     /// `linux,usable-memory`（若存在）或 `reg` 翻译到根地址空间后的范围。
     pub ranges: Vec<PhysicalRange>,
+    /// 节点直接声明的 NUMA node ID；缺失时由启动策略决定默认归属。
+    pub numa_node_id: Option<u32>,
     /// 节点是否带有合法的空值 `hotpluggable` 属性。
     pub hotpluggable: bool,
 }
@@ -279,10 +281,23 @@ impl Tree<'_> {
                 });
             };
             let ranges = self.physical_ranges(node_id, property)?;
+            let numa_node_id = node
+                .property("numa-node-id")
+                .map(|property| {
+                    property
+                        .as_u32()
+                        .map_err(|error| MemoryError::InvalidProperty {
+                            node: node_id,
+                            property: "numa-node-id",
+                            error,
+                        })
+                })
+                .transpose()?;
             let hotpluggable = self.boolean_property(node_id, "hotpluggable")?;
             banks.push(MemoryBank {
                 node: node_id,
                 ranges,
+                numa_node_id,
                 hotpluggable,
             });
         }

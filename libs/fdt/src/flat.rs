@@ -420,6 +420,24 @@ impl<'a> Fdt<'a> {
             options,
         }))
     }
+
+    /// 零分配解码 `/chosen/bootargs`。
+    ///
+    /// 同时兼容历史固件的 `/chosen@0` 节点名。属性缺失时返回
+    /// `Ok(None)`；属性存在但不是单个 NUL 结尾 UTF-8 字符串时显式
+    /// 报错，避免启动参数被静默丢弃。
+    pub fn chosen_bootargs(&self) -> Result<Option<&'a str>, PropertyError> {
+        let Some(chosen) = self
+            .find_node("/chosen")
+            .or_else(|| self.find_node("/chosen@0"))
+        else {
+            return Ok(None);
+        };
+        chosen
+            .property("bootargs")
+            .map(|property| property.as_str())
+            .transpose()
+    }
 }
 
 fn find_path_child<'a>(node: Node<'a>, component: &str) -> Option<Node<'a>> {

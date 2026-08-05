@@ -15,6 +15,7 @@ extern crate std;
 mod error;
 mod flat;
 mod property;
+mod riscv;
 
 #[cfg(feature = "alloc")]
 mod interrupt;
@@ -27,6 +28,9 @@ mod memory;
 
 #[cfg(feature = "alloc")]
 mod msi;
+
+#[cfg(feature = "alloc")]
+mod numa;
 
 #[cfg(feature = "alloc")]
 mod owned;
@@ -52,6 +56,7 @@ pub use flat::{
     ReserveEntry,
 };
 pub use property::{Cells, StringList, decode_cells};
+pub use riscv::{RiscvCpuBinding, RiscvCpuError, RiscvIsaSource};
 
 #[cfg(feature = "alloc")]
 pub use interrupt::{InterruptError, InterruptSpecifier};
@@ -67,6 +72,9 @@ pub use memory::{
 
 #[cfg(feature = "alloc")]
 pub use msi::{MsiError, MsiParent};
+
+#[cfg(feature = "alloc")]
+pub use numa::{NUMA_LOCAL_DISTANCE, NumaDescription, NumaDistance, NumaError, NumaNodeAssignment};
 
 #[cfg(feature = "alloc")]
 pub use owned::{OwnedNode, OwnedProperty, OwnedTree, OwnedTreeError};
