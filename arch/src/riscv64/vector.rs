@@ -66,8 +66,9 @@ pub fn user_hwcap() -> usize {
     }
 }
 
-pub fn detect_vector_from_isa(isa: &[u8]) {
-    if !contains_single_letter_extension(isa, b'v') {
+/// 根据所有可用 hart 的 ISA 交集探测并发布用户态 V 能力。
+pub fn detect_vector_support(supported: bool) {
+    if !supported {
         return;
     }
 
@@ -85,26 +86,6 @@ pub fn detect_vector_from_isa(isa: &[u8]) {
     VECTOR_VLENB.store(vlenb, Ordering::Release);
     HAS_VECTOR.store(true, Ordering::Release);
     log::info!("[loader] ISA: V detected, vlenb={}", vlenb);
-}
-
-fn contains_single_letter_extension(isa: &[u8], ext: u8) -> bool {
-    let isa_len = isa.iter().position(|&b| b == 0).unwrap_or(isa.len());
-    let isa = &isa[..isa_len];
-    let base_start = if isa.len() >= 4 && isa[..4].eq_ignore_ascii_case(b"rv64") {
-        4
-    } else if isa.len() >= 4 && isa[..4].eq_ignore_ascii_case(b"rv32") {
-        4
-    } else {
-        0
-    };
-    let first_underscore = isa.iter().position(|&b| b == b'_').unwrap_or(isa.len());
-    isa[base_start..first_underscore]
-        .iter()
-        .any(|b| b.eq_ignore_ascii_case(&ext))
-        || first_underscore < isa.len()
-            && isa[first_underscore + 1..]
-                .split(|&b| b == b'_')
-                .any(|chunk| chunk.len() == 1 && chunk[0].eq_ignore_ascii_case(&ext))
 }
 
 fn read_vlenb() -> usize {

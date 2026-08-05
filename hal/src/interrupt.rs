@@ -49,3 +49,99 @@ pub fn restore_local(state: usize) {
         arch::riscv64::trap::Riscv64InterruptOps::restore_interrupt_state(state);
     }
 }
+
+/// 常驻架构层 IMSIC 配置的代次句柄。
+#[cfg(target_arch = "riscv64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RiscvImsicHandle(u64);
+
+#[cfg(target_arch = "riscv64")]
+impl RiscvImsicHandle {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// 安装 IMSIC identity 上限和可用逻辑 CPU 集合。
+#[cfg(target_arch = "riscv64")]
+#[kernel_symbols::export(
+    name = "hal.interrupt.riscv_imsic_install",
+    contract = "kernel.hal.riscv-imsic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn riscv_imsic_install(num_ids: u32, cpu_mask: u64) -> Option<RiscvImsicHandle> {
+    arch::riscv64::aia::install_imsic_config(num_ids, cpu_mask).map(RiscvImsicHandle)
+}
+
+/// 撤销一代 IMSIC CSR 配置。
+#[cfg(target_arch = "riscv64")]
+#[kernel_symbols::export(
+    name = "hal.interrupt.riscv_imsic_uninstall",
+    contract = "kernel.hal.riscv-imsic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn riscv_imsic_uninstall(handle: RiscvImsicHandle) -> bool {
+    arch::riscv64::aia::uninstall_imsic_config(handle.0)
+}
+
+/// 更新目标 interrupt file 的 identity enable 位。
+#[cfg(target_arch = "riscv64")]
+#[kernel_symbols::export(
+    name = "hal.interrupt.riscv_imsic_set_identity_enabled",
+    contract = "kernel.hal.riscv-imsic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn riscv_imsic_set_identity_enabled(
+    handle: RiscvImsicHandle,
+    cpu: usize,
+    id: u32,
+    enabled: bool,
+) -> bool {
+    arch::riscv64::aia::set_imsic_identity_enabled(handle.0, cpu, id, enabled)
+}
+
+/// 清除目标 interrupt file 上可能残留的 pending identity。
+#[cfg(target_arch = "riscv64")]
+#[kernel_symbols::export(
+    name = "hal.interrupt.riscv_imsic_clear_identity",
+    contract = "kernel.hal.riscv-imsic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn riscv_imsic_clear_identity(handle: RiscvImsicHandle, cpu: usize, id: u32) -> bool {
+    arch::riscv64::aia::clear_imsic_identity(handle.0, cpu, id)
+}
+
+/// 立即同步当前 hart 的 IMSIC 间接 CSR。
+#[cfg(target_arch = "riscv64")]
+#[kernel_symbols::export(
+    name = "hal.interrupt.riscv_imsic_sync_current",
+    contract = "kernel.hal.riscv-imsic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn riscv_imsic_sync_current() {
+    arch::riscv64::aia::sync_current_cpu();
+}
+
+/// claim/complete 当前 hart 的最高优先级 IMSIC identity。
+#[cfg(target_arch = "riscv64")]
+#[kernel_symbols::export(
+    name = "hal.interrupt.riscv_imsic_claim",
+    contract = "kernel.hal.riscv-imsic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::HAL_CONTROL,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn riscv_imsic_claim() -> Option<u32> {
+    arch::riscv64::aia::claim_imsic_identity()
+}

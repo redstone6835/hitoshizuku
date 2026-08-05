@@ -14,6 +14,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 use core::{fmt, fmt::Write};
 
+use super::early_console::configure_early_console;
 use super::efi_stub;
 use crate::*;
 use efi::*;
@@ -282,6 +283,25 @@ fn firmware_dtb_bytes(vaddr: usize) -> Result<&'static [u8], &'static str> {
     // Safety: EFI/FDT 交接保证声明的 totalsize 范围可读，且长度已限制在静态
     // 快照缓冲区容量内。
     Ok(unsafe { core::slice::from_raw_parts(vaddr as *const u8, total_size) })
+}
+
+/// 在堆初始化之前从 EFI 配置表借用 FDT，仅用于选择最早期控制台。
+///
+/// 该视图不会被保存；正式固件选择仍在退出 Boot Services 前完成私有快照。
+fn early_firmware_dtb() -> Option<Fdt<'static>> {
+    let raw_system_table = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
+    if raw_system_table == 0 {
+        return None;
+    }
+    let canonical_system_table = reset_to_virt(raw_system_table);
+    // Safety: DMW 已由入口汇编建立；`from_ptr` 会校验 EFI system table 头部、
+    // 对齐和签名，失败时不解引用其配置表。
+    let view = unsafe { EfiSystemTableView::from_ptr(canonical_system_table) }?;
+    // Safety: system table 已通过上面的完整视图校验；EFI 配置表在退出 Boot
+    // Services 前保持可读，这里只提取标准 FDT GUID 对应的指针。
+    let raw_fdt = unsafe { view.table().find_fdt() }? as usize;
+    let bytes = firmware_dtb_bytes(reset_to_virt(raw_fdt)).ok()?;
+    Fdt::parse(bytes).ok()
 }
 
 /// 返回当前有效的 ACPI 映射表切片。
@@ -852,10 +872,38 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 因此必须在 MMU 和 DMW 窗口稳定后安装。
     unsafe { install_exception_entry() };
 
+    // BSS、DMW 和临时栈此时已经可用，但堆尚未建立。先从 EFI 配置表借用 FDT，
+    // 用零分配解析器配置 chosen 16550；任何异常都完整回退到传统 QEMU 参数。
+    let early_console = configure_early_console(early_firmware_dtb());
+
     e_print(format_args!(
         "[{:6}.{:06}] [boot] Entering kernel loader...\n",
         0, 0
     ));
+    e_print(format_args!(
+        "[{:6}.{:06}] [boot] early console: source={} phys={:#x} clock={} baud={} reg-offset={:#x} reg-shift={} reg-io-width={} endian={:?}{}\n",
+        0,
+        0,
+        early_console.source.name(),
+        early_console.config.phys_base,
+        early_console.config.clock_hz,
+        early_console.config.baud,
+        early_console.config.reg_offset,
+        early_console.config.reg_shift,
+        early_console.config.io_width.bytes(),
+        early_console.config.endian,
+        if early_console.dt_error.is_some() {
+            " (DT rejected)"
+        } else {
+            ""
+        },
+    ));
+    if let Some(error) = early_console.dt_error {
+        e_print(format_args!(
+            "[{:6}.{:06}] [boot] early console DT fallback reason: {:?}\n",
+            0, 0, error
+        ));
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 1.1：通过 CPUCFG 读取稳定计时器频率
@@ -1283,6 +1331,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             Some(efi_stub::EfiMemoryMapSource::BootServicesExited) | None => {}
         }
 
+        let mut dtb_command_line = None;
         let firmware = if acpi_enabled {
             if acpi_rsdp_for_state == 0 {
                 panic!("[loader] ACPI selected but RSDP snapshot is missing");
@@ -1292,17 +1341,29 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
                 mappings: kernel_acpi_mappings(),
             })
         } else {
-            StartFirmware::Dtb(
-                kernel_dtb()
-                    .unwrap_or_else(|| panic!("[loader] DTB selected but snapshot missing")),
-            )
+            let dtb = kernel_dtb()
+                .unwrap_or_else(|| panic!("[loader] DTB selected but snapshot missing"));
+            dtb_command_line = dtb
+                .chosen_bootargs()
+                .unwrap_or_else(|error| panic!("[loader] invalid /chosen/bootargs: {:?}", error))
+                .map(str::as_bytes);
+            StartFirmware::Dtb(dtb)
         };
+        let command_line = kernel_command_line().or(dtb_command_line);
+        if kernel_command_line().is_none()
+            && let Some(command_line) = dtb_command_line
+        {
+            printk!(
+                "[loader] command line from DTB: {}",
+                core::str::from_utf8(command_line).unwrap_or("<invalid UTF-8>")
+            );
+        }
         let context = StartContext {
             boot: StartBootInfo {
                 architecture: StartArchitecture::new("loongarch64"),
                 protocol: boot_protocol,
                 boot_cpu_id: LoongArch64MessageInterruptOps::current_cpu_id(),
-                command_line: kernel_command_line(),
+                command_line,
             },
             firmware,
             memory: StartMemory {

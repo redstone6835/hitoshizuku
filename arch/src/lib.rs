@@ -5,6 +5,12 @@
 #![no_std]
 extern crate alloc;
 
+// 两个架构共享零分配的 16550 DT 配置解析；源码暂保留在原 LoongArch 路径，
+// 避免启动期解析语义分叉。
+#[cfg(any(test, target_arch = "riscv64", target_arch = "loongarch64"))]
+#[path = "loongarch64/early_console_config.rs"]
+pub(crate) mod early_console_config;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]

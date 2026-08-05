@@ -34,7 +34,10 @@ use crate::riscv64::sbi;
 use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns, phys_to_virt, virt_to_phys};
 use crate::riscv64::time;
 use crate::riscv64::trap;
-use fdt::{Fdt, Tree};
+use fdt::{
+    AddressError as FdtAddressError, Fdt, Node, NodeId, PropertyError as FdtPropertyError,
+    RiscvCpuBinding, RiscvCpuError, RiscvIsaSource, Tree, TreeError,
+};
 use general::{
     StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartBootProtocol,
     StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
@@ -159,60 +162,345 @@ fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
 
 // ── ISA 扩展检测 ──────────────────────────────────────────────────────────────
 
-/// 从 DTB 的 `/cpus/cpu@*` 节点解析 `riscv,isa` 属性，检测硬件扩展支持。
-fn detect_isa_extensions(dtb: &Fdt<'_>) {
-    use crate::riscv64::specific::{CBO_BLOCK_SIZE, HAS_ZICBOZ};
-    use core::sync::atomic::Ordering;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheBlockKind {
+    Management,
+    Zero,
+    Prefetch,
+}
 
-    let root = dtb.root();
-    let cpus = match root.find_child("cpus") {
-        Some(c) => c,
-        None => return,
-    };
-    // 取第一个 cpu 节点的 riscv,isa 属性
-    for cpu_node in cpus.children() {
-        if !cpu_node.base_name_bytes().starts_with(b"cpu") {
-            continue;
+impl CacheBlockKind {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Management => "zicbom",
+            Self::Zero => "zicboz",
+            Self::Prefetch => "zicbop",
         }
-        if let Some(isa_prop) = cpu_node.find_property("riscv,isa") {
-            let isa_bytes = isa_prop.value();
-            // riscv,isa 值是以 NUL 结尾的字符串
-            if contains_extension(isa_bytes, b"zicboz") {
-                HAS_ZICBOZ.store(true, Ordering::Release);
-                log::info!("[loader] ISA: Zicboz detected");
-            }
-            if contains_extension(isa_bytes, b"sstc") {
-                crate::riscv64::time::set_sstc_available(true);
-                log::info!("[loader] ISA: Sstc detected; timer uses stimecmp");
-            }
-            crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
-            // 检查 riscv,cboz-block-size（如果有）
-            if let Some(bs_prop) = cpu_node.find_property("riscv,cboz-block-size") {
-                let val = bs_prop.value();
-                if val.len() >= 4 {
-                    let bs = u32::from_be_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    if bs.is_power_of_two() && bs >= 16 {
-                        CBO_BLOCK_SIZE.store(bs, Ordering::Release);
-                    }
-                }
-            }
-            break; // 只需检测一个 hart，假设所有 hart 同构
+    }
+
+    const fn property(self) -> &'static str {
+        match self {
+            Self::Management => "riscv,cbom-block-size",
+            Self::Zero => "riscv,cboz-block-size",
+            Self::Prefetch => "riscv,cbop-block-size",
         }
     }
 }
 
-/// 检查 ISA 字符串中是否包含指定扩展名（不区分大小写）。
-fn contains_extension(isa: &[u8], ext: &[u8]) -> bool {
-    // ISA 字符串格式："rv64imafdc_zicboz_zicbom..."
-    // 扩展由 '_' 分隔（multi-letter extensions）
-    let isa_len = isa.iter().position(|&b| b == 0).unwrap_or(isa.len());
-    let isa = &isa[..isa_len];
-    for chunk in isa.split(|&b| b == b'_') {
-        if chunk.eq_ignore_ascii_case(ext) {
-            return true;
+#[derive(Clone, Copy, Debug)]
+struct RiscvHartFeatures {
+    isa_source: RiscvIsaSource,
+    mmu_type: &'static str,
+    cbom_block_size: Option<usize>,
+    cboz_block_size: Option<usize>,
+    cbop_block_size: Option<usize>,
+    sstc: bool,
+    vector: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RiscvPlatformFeatures {
+    harts: usize,
+    split_isa_harts: usize,
+    cbom_block_size: Option<usize>,
+    cboz_block_size: Option<usize>,
+    cbop_block_size: Option<usize>,
+    sstc: bool,
+    vector: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RiscvCpuConfigError {
+    InvalidTree(TreeError),
+    MissingCpus,
+    NoAvailableCpus,
+    MissingBootHart {
+        hart_id: usize,
+    },
+    InvalidDeviceType {
+        node: NodeId,
+        error: FdtPropertyError,
+    },
+    InvalidReg {
+        node: NodeId,
+        error: FdtAddressError,
+    },
+    InvalidRegCount {
+        node: NodeId,
+        entries: usize,
+    },
+    HartIdOverflow {
+        node: NodeId,
+    },
+    InvalidBinding {
+        node: NodeId,
+        error: RiscvCpuError,
+    },
+    UnsupportedIsaBase {
+        node: NodeId,
+    },
+    UnsupportedMmuType {
+        node: NodeId,
+        mmu_type: &'static str,
+    },
+    MissingCacheBlockSize {
+        node: NodeId,
+        property: &'static str,
+        extension: &'static str,
+    },
+    UnexpectedCacheBlockSize {
+        node: NodeId,
+        property: &'static str,
+        extension: &'static str,
+    },
+    InvalidCacheBlockSize {
+        node: NodeId,
+        property: &'static str,
+        size: u32,
+    },
+    HeterogeneousCacheBlockSize {
+        property: &'static str,
+        first: usize,
+        other: usize,
+    },
+}
+
+/// 严格解码所有可用 hart，只发布能在全 CPU 调度上安全使用的能力交集。
+fn configure_cpu_features_from_dtb(
+    dtb: &Fdt<'static>,
+    boot_hart_id: usize,
+) -> Result<(), RiscvCpuConfigError> {
+    use crate::riscv64::specific::{
+        CBO_BLOCK_SIZE, CBOM_BLOCK_SIZE, CBOP_BLOCK_SIZE, HAS_ZICBOM, HAS_ZICBOP, HAS_ZICBOZ,
+    };
+
+    let tree = Tree::from_fdt(*dtb).map_err(RiscvCpuConfigError::InvalidTree)?;
+    let cpus = tree
+        .find_node("/cpus")
+        .ok_or(RiscvCpuConfigError::MissingCpus)?;
+    let children = tree
+        .children(cpus)
+        .ok_or(RiscvCpuConfigError::MissingCpus)?;
+    let mut aggregate: Option<RiscvPlatformFeatures> = None;
+    let mut boot_mmu_type = None;
+
+    for &node_id in children {
+        let node = tree
+            .node(node_id)
+            .expect("Tree child NodeId must remain valid");
+        if !is_riscv_cpu_node(node_id, node)?
+            || !tree
+                .is_available(node_id)
+                .map_err(RiscvCpuConfigError::InvalidTree)?
+        {
+            continue;
         }
+        let hart_id = cpu_hart_id(&tree, node_id)?;
+        let features = riscv_hart_features(node_id, node)?;
+        if hart_id == boot_hart_id as u64 {
+            boot_mmu_type = Some(features.mmu_type);
+        }
+        merge_platform_features(&mut aggregate, features)?;
     }
-    false
+
+    let aggregate = aggregate.ok_or(RiscvCpuConfigError::NoAvailableCpus)?;
+    let boot_mmu_type = boot_mmu_type.ok_or(RiscvCpuConfigError::MissingBootHart {
+        hart_id: boot_hart_id,
+    })?;
+
+    CBOM_BLOCK_SIZE.store(aggregate.cbom_block_size.unwrap_or(0), Ordering::Relaxed);
+    CBOP_BLOCK_SIZE.store(aggregate.cbop_block_size.unwrap_or(0), Ordering::Relaxed);
+    CBO_BLOCK_SIZE.store(aggregate.cboz_block_size.unwrap_or(0), Ordering::Relaxed);
+    HAS_ZICBOM.store(aggregate.cbom_block_size.is_some(), Ordering::Release);
+    HAS_ZICBOP.store(aggregate.cbop_block_size.is_some(), Ordering::Release);
+    HAS_ZICBOZ.store(aggregate.cboz_block_size.is_some(), Ordering::Release);
+    time::set_sstc_available(aggregate.sstc);
+    crate::riscv64::vector::detect_vector_support(aggregate.vector);
+
+    log::info!(
+        "[loader] DT CPU binding: harts={} split-isa={} legacy-isa={} mmu={} kernel-mmu=Sv48 cbom={} cboz={} cbop={} sstc={}",
+        aggregate.harts,
+        aggregate.split_isa_harts,
+        aggregate.harts - aggregate.split_isa_harts,
+        boot_mmu_type,
+        aggregate.cbom_block_size.unwrap_or(0),
+        aggregate.cboz_block_size.unwrap_or(0),
+        aggregate.cbop_block_size.unwrap_or(0),
+        aggregate.sstc as usize,
+    );
+    Ok(())
+}
+
+fn is_riscv_cpu_node(node_id: NodeId, node: Node<'static>) -> Result<bool, RiscvCpuConfigError> {
+    let device_type = node
+        .property("device_type")
+        .map(|property| {
+            property
+                .as_str()
+                .map_err(|error| RiscvCpuConfigError::InvalidDeviceType {
+                    node: node_id,
+                    error,
+                })
+        })
+        .transpose()?;
+    Ok(node.base_name_bytes() == b"cpu" || device_type == Some("cpu"))
+}
+
+fn cpu_hart_id(tree: &Tree<'static>, node: NodeId) -> Result<u64, RiscvCpuConfigError> {
+    let entries = tree
+        .reg(node)
+        .map_err(|error| RiscvCpuConfigError::InvalidReg { node, error })?;
+    if entries.len() != 1 {
+        return Err(RiscvCpuConfigError::InvalidRegCount {
+            node,
+            entries: entries.len(),
+        });
+    }
+    u64::try_from(entries[0].address).map_err(|_| RiscvCpuConfigError::HartIdOverflow { node })
+}
+
+fn riscv_hart_features(
+    node_id: NodeId,
+    node: Node<'static>,
+) -> Result<RiscvHartFeatures, RiscvCpuConfigError> {
+    let binding =
+        RiscvCpuBinding::parse(node).map_err(|error| RiscvCpuConfigError::InvalidBinding {
+            node: node_id,
+            error,
+        })?;
+    if binding.isa_base() != "rv64i" {
+        return Err(RiscvCpuConfigError::UnsupportedIsaBase { node: node_id });
+    }
+    // RISC-V privileged spec 要求 Sv57 实现同时实现 Sv48；Sv39/none 则
+    // 无法承载已由启动汇编激活的四级 Sv48 页表。
+    if !matches!(binding.mmu_type(), "riscv,sv48" | "riscv,sv57") {
+        return Err(RiscvCpuConfigError::UnsupportedMmuType {
+            node: node_id,
+            mmu_type: binding.mmu_type(),
+        });
+    }
+
+    Ok(RiscvHartFeatures {
+        isa_source: binding.isa_source(),
+        mmu_type: binding.mmu_type(),
+        cbom_block_size: validate_cache_block(
+            node_id,
+            &binding,
+            CacheBlockKind::Management,
+            binding.cbom_block_size(),
+        )?,
+        cboz_block_size: validate_cache_block(
+            node_id,
+            &binding,
+            CacheBlockKind::Zero,
+            binding.cboz_block_size(),
+        )?,
+        cbop_block_size: validate_cache_block(
+            node_id,
+            &binding,
+            CacheBlockKind::Prefetch,
+            binding.cbop_block_size(),
+        )?,
+        sstc: binding.has_isa_extension("sstc"),
+        vector: binding.has_isa_extension("v"),
+    })
+}
+
+fn validate_cache_block(
+    node: NodeId,
+    binding: &RiscvCpuBinding<'_>,
+    kind: CacheBlockKind,
+    declared: Option<u32>,
+) -> Result<Option<usize>, RiscvCpuConfigError> {
+    let extension = kind.extension();
+    let supported = binding.has_isa_extension(extension);
+    let size = match (supported, declared) {
+        (false, None) => return Ok(None),
+        (false, Some(_)) => {
+            return Err(RiscvCpuConfigError::UnexpectedCacheBlockSize {
+                node,
+                property: kind.property(),
+                extension,
+            });
+        }
+        (true, None) => {
+            return Err(RiscvCpuConfigError::MissingCacheBlockSize {
+                node,
+                property: kind.property(),
+                extension,
+            });
+        }
+        (true, Some(size)) => size,
+    };
+    let native = size as usize;
+    let valid = native.is_power_of_two()
+        && (!matches!(kind, CacheBlockKind::Zero)
+            || native <= allocator::PAGE_SIZE && allocator::PAGE_SIZE.is_multiple_of(native));
+    if !valid {
+        return Err(RiscvCpuConfigError::InvalidCacheBlockSize {
+            node,
+            property: kind.property(),
+            size,
+        });
+    }
+    Ok(Some(native))
+}
+
+fn merge_platform_features(
+    aggregate: &mut Option<RiscvPlatformFeatures>,
+    hart: RiscvHartFeatures,
+) -> Result<(), RiscvCpuConfigError> {
+    let Some(current) = aggregate.as_mut() else {
+        *aggregate = Some(RiscvPlatformFeatures {
+            harts: 1,
+            split_isa_harts: usize::from(hart.isa_source == RiscvIsaSource::Split),
+            cbom_block_size: hart.cbom_block_size,
+            cboz_block_size: hart.cboz_block_size,
+            cbop_block_size: hart.cbop_block_size,
+            sstc: hart.sstc,
+            vector: hart.vector,
+        });
+        return Ok(());
+    };
+
+    current.harts += 1;
+    current.split_isa_harts += usize::from(hart.isa_source == RiscvIsaSource::Split);
+    current.cbom_block_size = intersect_cache_block_sizes(
+        CacheBlockKind::Management,
+        current.cbom_block_size,
+        hart.cbom_block_size,
+    )?;
+    current.cboz_block_size = intersect_cache_block_sizes(
+        CacheBlockKind::Zero,
+        current.cboz_block_size,
+        hart.cboz_block_size,
+    )?;
+    current.cbop_block_size = intersect_cache_block_sizes(
+        CacheBlockKind::Prefetch,
+        current.cbop_block_size,
+        hart.cbop_block_size,
+    )?;
+    current.sstc &= hart.sstc;
+    current.vector &= hart.vector;
+    Ok(())
+}
+
+fn intersect_cache_block_sizes(
+    kind: CacheBlockKind,
+    first: Option<usize>,
+    other: Option<usize>,
+) -> Result<Option<usize>, RiscvCpuConfigError> {
+    match (first, other) {
+        (Some(first), Some(other)) if first != other => {
+            Err(RiscvCpuConfigError::HeterogeneousCacheBlockSize {
+                property: kind.property(),
+                first,
+                other,
+            })
+        }
+        (Some(first), Some(_)) => Ok(Some(first)),
+        _ => Ok(None),
+    }
 }
 
 /// 读取 DTB 属性开头的大端 `u32`；不足 4 字节时返回 `None`。
@@ -220,42 +508,23 @@ fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
 }
 
-/// 通过共享 FDT 树语义解析 chosen 控制台和完整普通总线地址翻译。
+/// 解析 chosen 控制台的完整 16550 binding，并切换最早期输出配置。
 fn configure_early_console_from_dtb(dtb: &Fdt<'static>) {
-    let Ok(tree) = Tree::from_fdt(*dtb) else {
-        log::warning!("[loader] failed to index DTB for early console");
-        return;
-    };
-    let Ok(Some(stdout)) = tree.chosen_stdout() else {
-        return;
-    };
-    let Some(serial) = tree.node(stdout.node) else {
-        return;
-    };
-    if !serial.is_compatible("ns16550a")
-        && !serial.is_compatible("ns16550")
-        && !serial.is_compatible("uart16550")
-    {
-        log::warning!("[loader] DTB stdout is not NS16550-compatible; keeping QEMU fallback");
-        return;
-    }
-    let Ok(ranges) = tree.translated_reg(stdout.node) else {
-        log::warning!("[loader] failed to translate DTB stdout reg; keeping QEMU fallback");
-        return;
-    };
-    let Some(range) = ranges.first() else {
-        return;
-    };
-    let Ok(phys_base) = usize::try_from(range.address) else {
-        return;
-    };
-    if early_console::configure_physical_base(phys_base) {
-        log::info!(
-            "[loader] early console relocated from DTB {} to {phys_base:#x}",
-            stdout.path
-        );
-    } else {
-        log::warning!("[loader] DTB stdout UART {phys_base:#x} is outside the early MMIO window");
+    match early_console::configure_from_dtb(*dtb) {
+        Ok(config) => log::info!(
+            "[loader] early console from DTB: base={:#x} clock={} baud={} offset={:#x} shift={} width={} endian={:?}",
+            config.phys_base,
+            config.clock_hz,
+            config.baud,
+            config.reg_offset,
+            config.reg_shift,
+            config.io_width.bytes(),
+            config.endian,
+        ),
+        Err(error) => log::warning!(
+            "[loader] DTB early console config rejected: {:?}; keeping QEMU fallback",
+            error
+        ),
     }
 }
 
@@ -375,8 +644,17 @@ pub extern "C" fn __kernel_arch_loader(
     );
 
     let sbi_info = sbi::init();
+    let pmu_counters = if sbi_info.pmu_available {
+        sbi::install_pmu_backend().unwrap_or_else(|error| {
+            panic!("[loader] failed to install SBI PMU backend: {:?}", error)
+        });
+        let counters = sbi::pmu_num_counters();
+        counters.is_ok().then_some(counters.value)
+    } else {
+        None
+    };
     log::info!(
-        "[loader] SBI: base={} spec={:?} impl={:?}/{:?} srst={} hsm={} ipi={} rfence={}",
+        "[loader] SBI: base={} spec={:?} impl={:?}/{:?} srst={} hsm={} ipi={} rfence={} pmu={} counters={:?}",
         sbi_info.base_available,
         sbi_info.spec_version,
         sbi_info.implementation_id,
@@ -385,6 +663,8 @@ pub extern "C" fn __kernel_arch_loader(
         sbi_info.hsm_available,
         sbi_info.ipi_available,
         sbi_info.rfence_available,
+        sbi_info.pmu_available,
+        pmu_counters,
     );
 
     // 初始化引导期分配器
@@ -417,11 +697,20 @@ pub extern "C" fn __kernel_arch_loader(
         heap_vm::KERNEL_DIRECT_MAP_PHYS_START,
         heap_vm::KERNEL_DIRECT_MAP_PHYS_END
     );
+    let command_line_text = dtb
+        .chosen_bootargs()
+        .unwrap_or_else(|error| panic!("[loader] invalid /chosen/bootargs: {:?}", error));
+    if let Some(command_line) = command_line_text {
+        log::info!("[loader] command line from DTB: {}", command_line);
+    }
+    let command_line = command_line_text.map(str::as_bytes);
 
     configure_early_console_from_dtb(&dtb);
 
-    // 检测 ISA 扩展（Zicboz 等）
-    detect_isa_extensions(&dtb);
+    // 页表、timer 和可迁移用户任务都依赖全 hart 能力；任一 CPU 的
+    // binding 不兼容当前 Sv48 实现时立即 fail closed。
+    configure_cpu_features_from_dtb(&dtb, hart_id)
+        .unwrap_or_else(|error| panic!("[loader] invalid RISC-V CPU DT binding: {:?}", error));
 
     // 启动 S-mode 周期 timer。sleep/调度 tick 依赖该中断推进。
     configure_timer_from_dtb(&dtb);
@@ -443,7 +732,7 @@ pub extern "C" fn __kernel_arch_loader(
                 architecture: StartArchitecture::new("riscv64"),
                 protocol: StartBootProtocol::Direct,
                 boot_cpu_id: hart_id,
-                command_line: None,
+                command_line,
             },
             firmware: StartFirmware::Dtb(dtb),
             memory: StartMemory {

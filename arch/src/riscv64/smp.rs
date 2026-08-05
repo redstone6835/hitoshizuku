@@ -64,6 +64,18 @@ fn send_software_ipi(logical_id: usize) -> bool {
     ret.is_ok()
 }
 
+/// 请求目标 hart 在下一个安全的中断边界同步常驻 AIA CSR 状态。
+pub(super) fn request_aia_sync(logical_id: usize) -> bool {
+    if logical_id == crate::riscv64::specific::current_cpu_id() {
+        super::aia::sync_current_cpu();
+        true
+    } else if cpu_is_online(logical_id) {
+        send_software_ipi(logical_id)
+    } else {
+        false
+    }
+}
+
 fn send_reschedule(logical_id: usize) {
     if !send_software_ipi(logical_id) {
         let hart_id = physical_hart_id(logical_id).unwrap_or(UNKNOWN_HART_ID);
@@ -105,6 +117,7 @@ pub(crate) static CPU_CONTROL_OPS: CpuControlOps = CpuControlOps {
 };
 
 pub(crate) fn handle_ipi() {
+    super::aia::sync_current_cpu();
     sched::poll_urgent_work();
     // request_resched() 在发送 IPI 前已发布目标 CPU 的 need_resched；trap 返回路径
     // 会在安全边界消费该标志。RFENCE 由 OpenSBI 同步执行，不进入 S-mode handler。
@@ -363,6 +376,7 @@ unsafe extern "C" fn secondary_main(hart_id: usize, logical_id: usize) -> ! {
         super::trap::install_exception_entry();
     }
     time::init_periodic_timer(time::timer_hz());
+    super::aia::sync_current_cpu();
     unsafe {
         Riscv64MessageInterruptOps::set_message_interrupt_enable_bits(super::specific::SIE_SSIE)
     };

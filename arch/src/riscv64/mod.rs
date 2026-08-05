@@ -41,6 +41,7 @@ pub mod task;
 
 // ── 平台服务 ──────────────────────────────────────────────────────────────────
 
+pub mod aia;
 pub mod early_console;
 pub mod sbi;
 pub mod specific;
