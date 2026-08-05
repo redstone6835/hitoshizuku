@@ -625,6 +625,29 @@ fn runqueue_ignores_local_context_release_window() {
 }
 
 #[ktest]
+fn runqueue_does_not_pick_task_before_context_release() {
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    assert!(task.try_claim_cpu(0));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq
+        .pick_next_on(2, CpuMask::single_raw(0).bits())
+        .is_none());
+
+    unsafe {
+        task.on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    let picked = rq
+        .pick_next_on(3, CpuMask::single_raw(0).bits())
+        .expect("任务释放上下文后应可被选中");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &task));
+}
+
+#[ktest]
 fn runqueue_migratable_load_excludes_idle_class() {
     let fair = make_task();
     let idle = make_task();
