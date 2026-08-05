@@ -18,6 +18,12 @@ use crate::error::VmemError;
 const INVALID_TAG: usize = usize::MAX;
 /// 空闲链表的桶数 (按大小的 log2 分桶)
 const VMEM_FREELISTS: usize = 32;
+/// 已分配标签的地址索引桶数。
+///
+/// 分配态标签不会出现在 free list 中，因此复用其 free 链字段构建固定桶哈希索引，
+/// 避免释放时从整个地址有序段列表线性寻找标签。固定数组不需要动态元数据，也不会
+/// 在 allocator 热路径递归进入内核堆。
+const VMEM_ALLOC_LOOKUP_BUCKETS: usize = 64;
 /// boundary tag 按批补货，避免每次区间切分都进入 metadata allocator。
 const VMEM_TAG_REFILL: usize = 64;
 
@@ -136,6 +142,10 @@ pub struct VmemStats {
     pub overlap_failures: u64,
     /// 元数据分配失败次数
     pub metadata_failures: u64,
+    /// 释放地址索引累计检查的标签数
+    pub free_lookup_steps: u64,
+    /// 单次释放地址索引检查的最大标签数
+    pub max_free_lookup_steps: usize,
 }
 
 impl VmemStats {
@@ -160,6 +170,8 @@ impl VmemStats {
             invalid_free_failures: 0,
             overlap_failures: 0,
             metadata_failures: 0,
+            free_lookup_steps: 0,
+            max_free_lookup_steps: 0,
         }
     }
 }
@@ -196,6 +208,8 @@ pub struct VmemArena {
     seg_list_head: usize,
     /// 按大小分桶的空闲链表头
     free_lists: [usize; VMEM_FREELISTS],
+    /// 已分配标签的按地址哈希索引头。allocated tag 复用 free_next/free_prev 作为链指针。
+    allocated_lookup: [usize; VMEM_ALLOC_LOOKUP_BUCKETS],
     /// 分配策略
     policy: VmemAllocPolicy,
     /// 统计信息
@@ -214,6 +228,7 @@ impl VmemArena {
             tag_free_head: INVALID_TAG,
             seg_list_head: INVALID_TAG,
             free_lists: [INVALID_TAG; VMEM_FREELISTS],
+            allocated_lookup: [INVALID_TAG; VMEM_ALLOC_LOOKUP_BUCKETS],
             policy: VmemAllocPolicy::BestFit,
             stats: VmemStats::new(),
             initialized: false,
@@ -258,6 +273,9 @@ impl VmemArena {
         // 重置空闲链表
         for i in 0..VMEM_FREELISTS {
             self.free_lists[i] = INVALID_TAG;
+        }
+        for i in 0..VMEM_ALLOC_LOOKUP_BUCKETS {
+            self.allocated_lookup[i] = INVALID_TAG;
         }
 
         self.initialized = true;
@@ -386,6 +404,77 @@ impl VmemArena {
         cleared.free_prev = INVALID_TAG;
         cleared.free_next = INVALID_TAG;
         write_tag(tag_idx, cleared);
+    }
+
+    #[inline]
+    fn allocated_lookup_bucket(&self, addr: usize) -> usize {
+        // 先去掉 quantum 内必为零的低位，再做 SplitMix64 终结混合，避免大对象或固定
+        // 间隔分配把相邻地址集中到同一个固定桶。桶数是 2 的幂，所以最终可用位掩码。
+        let mut value = (addr >> self.quantum_shift) as u64;
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value as usize) & (VMEM_ALLOC_LOOKUP_BUCKETS - 1)
+    }
+
+    fn add_to_allocated_lookup(&mut self, tag_idx: usize) {
+        let mut tag = read_tag(tag_idx);
+        let bucket = self.allocated_lookup_bucket(tag.base);
+        tag.free_prev = INVALID_TAG;
+        tag.free_next = self.allocated_lookup[bucket];
+        write_tag(tag_idx, tag);
+
+        if tag.free_next != INVALID_TAG {
+            let mut head = read_tag(tag.free_next);
+            head.free_prev = tag_idx;
+            write_tag(tag.free_next, head);
+        }
+        self.allocated_lookup[bucket] = tag_idx;
+    }
+
+    fn remove_from_allocated_lookup(&mut self, tag_idx: usize) {
+        let tag = read_tag(tag_idx);
+        let bucket = self.allocated_lookup_bucket(tag.base);
+        let prev = tag.free_prev;
+        let next = tag.free_next;
+
+        if prev != INVALID_TAG {
+            let mut prev_tag = read_tag(prev);
+            prev_tag.free_next = next;
+            write_tag(prev, prev_tag);
+        } else {
+            self.allocated_lookup[bucket] = next;
+        }
+        if next != INVALID_TAG {
+            let mut next_tag = read_tag(next);
+            next_tag.free_prev = prev;
+            write_tag(next, next_tag);
+        }
+
+        let mut cleared = tag;
+        cleared.free_prev = INVALID_TAG;
+        cleared.free_next = INVALID_TAG;
+        write_tag(tag_idx, cleared);
+    }
+
+    fn find_allocated_tag(&mut self, addr: usize) -> usize {
+        let mut idx = self.allocated_lookup[self.allocated_lookup_bucket(addr)];
+        let mut steps = 0usize;
+        while idx != INVALID_TAG {
+            steps += 1;
+            let tag = read_tag(idx);
+            if tag.base == addr && tag.bt_type == BtType::Allocated {
+                self.stats.free_lookup_steps += steps as u64;
+                self.stats.max_free_lookup_steps = self.stats.max_free_lookup_steps.max(steps);
+                return idx;
+            }
+            idx = tag.free_next;
+        }
+        self.stats.free_lookup_steps += steps as u64;
+        self.stats.max_free_lookup_steps = self.stats.max_free_lookup_steps.max(steps);
+        INVALID_TAG
     }
 
     /// 在段列表中 `after` 标签之后插入新标签
@@ -973,6 +1062,7 @@ impl VmemArena {
         let mut allocated = read_tag(tag_idx);
         allocated.bt_type = BtType::Allocated;
         write_tag(tag_idx, allocated);
+        self.add_to_allocated_lookup(tag_idx);
         self.stats.allocated_size += allocated.size;
         self.stats.free_size = self.stats.free_size.saturating_sub(allocated.size);
 
@@ -1000,15 +1090,8 @@ impl VmemArena {
         self.stats.free_count += 1;
         VMEM_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // 在段列表中查找对应标签
-        let mut idx = self.seg_list_head;
-        while idx != INVALID_TAG {
-            let tag = read_tag(idx);
-            if tag.base == addr && tag.bt_type == BtType::Allocated {
-                break;
-            }
-            idx = tag.seg_next;
-        }
+        // allocated tag 通过独立地址索引定位，避免遍历包含 span/free 标签的段列表。
+        let mut idx = self.find_allocated_tag(addr);
 
         if idx == INVALID_TAG {
             self.stats.invalid_free_failures += 1;
@@ -1024,7 +1107,10 @@ impl VmemArena {
                 actual: tag_size,
             });
         }
+        self.remove_from_allocated_lookup(idx);
         current.bt_type = BtType::Free;
+        current.free_prev = INVALID_TAG;
+        current.free_next = INVALID_TAG;
         write_tag(idx, current);
         self.stats.allocated_size = self.stats.allocated_size.saturating_sub(tag_size);
         self.stats.free_size += tag_size;
@@ -1093,6 +1179,31 @@ impl VmemArena {
         }
         false
     }
+
+    #[cfg(test)]
+    fn init_with_tag_storage_for_test(
+        &mut self,
+        name: &[u8],
+        base: usize,
+        size: usize,
+        quantum: usize,
+        policy: VmemAllocPolicy,
+        tags: &mut [BoundaryTag],
+    ) {
+        assert!(self.init(name, 0, 0, quantum, policy));
+
+        let mut head = INVALID_TAG;
+        for tag in tags.iter_mut().rev() {
+            *tag = BoundaryTag::empty();
+            tag.free_next = head;
+            head = tag as *mut BoundaryTag as usize;
+        }
+        self.tag_free_head = head;
+        self.stats.free_tags = tags.len();
+        self.stats.tags_allocated = tags.len();
+        self.add_span_result(base, size)
+            .expect("test tag storage must initialize the arena");
+    }
 }
 
 #[inline]
@@ -1138,3 +1249,112 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 /// 全局 vmem 操作计数器
 pub static VMEM_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static VMEM_FREE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TAGS: usize = 256;
+    const ALLOCATIONS: usize = 160;
+
+    #[test]
+    fn free_lookup_stays_bounded_after_many_segment_splits() {
+        let mut tags = [BoundaryTag::empty(); TAGS];
+        let mut arena = VmemArena::new();
+        arena.init_with_tag_storage_for_test(
+            b"free_lookup",
+            0x1000_0000,
+            0x20_0000,
+            VMEM_DEFAULT_QUANTUM,
+            VmemAllocPolicy::FirstFit,
+            &mut tags,
+        );
+
+        let mut allocations = [0usize; ALLOCATIONS];
+        for allocation in &mut allocations {
+            *allocation = arena
+                .alloc_result(VMEM_DEFAULT_QUANTUM, VMEM_DEFAULT_QUANTUM)
+                .expect("allocate a distinct segment");
+        }
+
+        let mut bucket_counts = [0usize; VMEM_ALLOC_LOOKUP_BUCKETS];
+        for &allocation in &allocations {
+            bucket_counts[arena.allocated_lookup_bucket(allocation)] += 1;
+        }
+        let collision_bucket = bucket_counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, count)| *count)
+            .map(|(bucket, _)| bucket)
+            .expect("lookup table has buckets");
+        let mut collision_chain = [0usize; ALLOCATIONS];
+        let mut collision_count = 0usize;
+        for &allocation in &allocations {
+            if arena.allocated_lookup_bucket(allocation) == collision_bucket {
+                collision_chain[collision_count] = allocation;
+                collision_count += 1;
+            }
+        }
+        assert!(collision_count >= 3);
+
+        // 插入顺序与桶链顺序相反：最后一项是链头，第一项是链尾。
+        let tail = collision_chain[0];
+        let middle = collision_chain[collision_count / 2];
+        let head = collision_chain[collision_count - 1];
+        let before_mismatch = arena.stats();
+        assert_eq!(
+            arena.free_result(middle, VMEM_DEFAULT_QUANTUM * 2),
+            Err(VmemError::SizeMismatch {
+                expected: VMEM_DEFAULT_QUANTUM * 2,
+                actual: VMEM_DEFAULT_QUANTUM,
+            })
+        );
+        let after_mismatch = arena.stats();
+        assert_eq!(
+            after_mismatch.allocated_size,
+            before_mismatch.allocated_size
+        );
+        assert_eq!(after_mismatch.free_size, before_mismatch.free_size);
+        assert!(arena.is_allocated(middle));
+
+        arena
+            .free_result(middle, VMEM_DEFAULT_QUANTUM)
+            .expect("remove a bucket-chain middle node");
+        arena
+            .free_result(tail, VMEM_DEFAULT_QUANTUM)
+            .expect("remove a bucket-chain tail node");
+        arena
+            .free_result(head, VMEM_DEFAULT_QUANTUM)
+            .expect("remove a bucket-chain head node");
+
+        for &allocation in &allocations {
+            if allocation != middle && allocation != tail && allocation != head {
+                arena
+                    .free_result(allocation, VMEM_DEFAULT_QUANTUM)
+                    .expect("remaining indexed allocation stays reachable");
+            }
+        }
+
+        let stats = arena.stats();
+        assert!(stats.max_free_lookup_steps <= 8);
+        assert_eq!(stats.allocated_size, 0);
+        assert_eq!(stats.free_size, stats.total_size);
+        assert_eq!(stats.free_segments, 1);
+
+        let before_double_free = arena.stats();
+        assert_eq!(
+            arena.free_result(middle, VMEM_DEFAULT_QUANTUM),
+            Err(VmemError::NotAllocated)
+        );
+        let after_double_free = arena.stats();
+        assert_eq!(
+            after_double_free.allocated_size,
+            before_double_free.allocated_size
+        );
+        assert_eq!(after_double_free.free_size, before_double_free.free_size);
+        assert_eq!(
+            after_double_free.free_segments,
+            before_double_free.free_segments
+        );
+    }
+}
