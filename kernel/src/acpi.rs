@@ -418,9 +418,11 @@ pub fn kernel_start_init(context: &StartContext) {
             fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
+            irq_names: Vec::new(),
             properties: DeviceProperties {
                 clock_hz: port.clock_hz,
                 baud: port.baud,
+                numa_node_id: None,
                 fw_phandle: None,
                 fw_interrupt_parent: None,
                 interrupt_controller: false,
@@ -433,6 +435,8 @@ pub fn kernel_start_init(context: &StartContext) {
             fw_properties: Vec::new(),
             dma: acpi_platform_dma_context(),
             dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;
@@ -447,10 +451,13 @@ pub fn kernel_start_init(context: &StartContext) {
             fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
+            irq_names: Vec::new(),
             properties: DeviceProperties::default(),
             fw_properties: Vec::new(),
             dma: acpi_platform_dma_context(),
             dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         };
         if register_platform_device(info, "acpi") {
             platform_bound += 1;

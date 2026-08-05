@@ -6,8 +6,9 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::str;
+use core::{fmt, str};
 use spin::Mutex as SpinMutex;
 
 use fdt::{
@@ -21,11 +22,18 @@ use super::power::{
 };
 
 mod memory;
+mod reserved;
 
 pub use memory::{
-    DtbMemoryLayout, DtbMemoryLayoutError, DtbResolvedReservedMemory, DtbUefiReservationError,
-    apply_chosen_usable_ranges, apply_no_map_granule, described_memory_segments,
-    resolve_memory_layout, validate_uefi_reserved_memory,
+    DtbMemoryLayout, DtbMemoryLayoutError, DtbNumaMemoryLayout, DtbResolvedReservedMemory,
+    DtbUefiReservationError, apply_chosen_usable_ranges, apply_no_map_granule,
+    described_memory_segments, resolve_memory_layout, split_numa_memory_segments,
+    validate_uefi_reserved_memory,
+};
+pub use reserved::{
+    DtbReservedDmaAllocation, DtbReservedMemoryDescriptor, DtbReservedMemoryError,
+    DtbReservedMemoryHandle, DtbReservedMemoryRuntimeSnapshot, acquire_memory_region_by_index,
+    acquire_memory_region_by_name, reserved_memory_runtime_snapshot,
 };
 
 /// 启动阶段解析出的 reserved-memory 运行期快照安装错误。
@@ -33,10 +41,171 @@ pub use memory::{
 pub enum DtbReservedMemoryInstallError {
     /// 已经安装了内容不同的快照。
     AlreadyInstalled,
+    /// 运行期租用表拒绝了有歧义或重叠的保留区。
+    InvalidRuntime(DtbReservedMemoryError),
 }
 
 static RESERVED_MEMORY_SNAPSHOT: SpinMutex<Option<Box<[DtbResolvedReservedMemory]>>> =
     SpinMutex::new(None);
+
+/// 启动 DT 全节点图安装错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbNodeGraphInstallError {
+    AlreadyInstalled,
+}
+
+/// 开始 live 节点图事务时的错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbNodeGraphUpdateError {
+    NotInstalled,
+    BaselineMismatch,
+    Busy,
+}
+
+struct DtbNodeGraphState {
+    generation: u64,
+    update_generation: Option<u64>,
+    nodes: Option<Box<[DtbNodeInfo]>>,
+}
+
+static NODE_GRAPH_SNAPSHOT: SpinMutex<DtbNodeGraphState> = SpinMutex::new(DtbNodeGraphState {
+    generation: 0,
+    update_generation: None,
+    nodes: None,
+});
+
+/// 已准备、尚未提交的 live 节点图更新。
+///
+/// guard 存活期间读者继续看到旧快照；未调用 [`DtbNodeGraphUpdate::commit`] 就释放
+/// guard 会取消事务，使 overlay 的其它准备步骤可以直接用 `?` 回滚。
+pub struct DtbNodeGraphUpdate {
+    generation: u64,
+    active: bool,
+}
+
+/// live 节点图提交结果。
+pub struct DtbNodeGraphCommit {
+    pub previous: Box<[DtbNodeInfo]>,
+    pub generation: u64,
+}
+
+/// 安装启动 DT 的完整拥有型节点图。
+pub fn install_node_graph(nodes: Vec<DtbNodeInfo>) -> Result<(), DtbNodeGraphInstallError> {
+    let candidate = nodes.into_boxed_slice();
+    let mut installed = NODE_GRAPH_SNAPSHOT.lock();
+    if let Some(current) = installed.nodes.as_ref() {
+        if current.as_ref() == candidate.as_ref() {
+            return Ok(());
+        }
+        return Err(DtbNodeGraphInstallError::AlreadyInstalled);
+    }
+    installed.generation = 1;
+    installed.nodes = Some(candidate);
+    Ok(())
+}
+
+/// 返回当前 live 节点图 generation。
+pub fn node_graph_generation() -> Option<u64> {
+    let state = NODE_GRAPH_SNAPSHOT.lock();
+    state.nodes.as_ref().map(|_| state.generation)
+}
+
+/// 为给定 generation 准备一次 live 节点图更新。
+///
+/// 准备阶段不隐藏旧图，也不持锁跨越驱动 probe；同一时刻只允许一个更新者。
+pub fn begin_node_graph_update(
+    expected_generation: u64,
+) -> Result<DtbNodeGraphUpdate, DtbNodeGraphUpdateError> {
+    let mut state = NODE_GRAPH_SNAPSHOT.lock();
+    if state.nodes.is_none() {
+        return Err(DtbNodeGraphUpdateError::NotInstalled);
+    }
+    if state.generation != expected_generation {
+        return Err(DtbNodeGraphUpdateError::BaselineMismatch);
+    }
+    if state.update_generation.is_some() {
+        return Err(DtbNodeGraphUpdateError::Busy);
+    }
+    state.update_generation = Some(expected_generation);
+    Ok(DtbNodeGraphUpdate {
+        generation: expected_generation,
+        active: true,
+    })
+}
+
+impl DtbNodeGraphUpdate {
+    /// 原子提交已经完整验证并预分配的候选图。
+    ///
+    /// 合法 guard 独占当前 generation 的写权限，因此交换本身没有可恢复错误。旧图
+    /// 返回给调用方并在锁外释放，避免大树析构阻塞固件读者。
+    pub fn commit(mut self, nodes: Box<[DtbNodeInfo]>) -> DtbNodeGraphCommit {
+        let mut state = NODE_GRAPH_SNAPSHOT.lock();
+        assert_eq!(state.update_generation, Some(self.generation));
+        assert_eq!(state.generation, self.generation);
+        let previous = state
+            .nodes
+            .replace(nodes)
+            .expect("prepared node graph update must retain its baseline");
+        state.generation = state.generation.wrapping_add(1);
+        if state.generation == 0 {
+            state.generation = 1;
+        }
+        state.update_generation = None;
+        let generation = state.generation;
+        self.active = false;
+        drop(state);
+        DtbNodeGraphCommit {
+            previous,
+            generation,
+        }
+    }
+}
+
+impl Drop for DtbNodeGraphUpdate {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = NODE_GRAPH_SNAPSHOT.lock();
+        if state.update_generation == Some(self.generation) {
+            state.update_generation = None;
+        }
+    }
+}
+
+/// 返回所有 DT 节点的稳定拥有型快照，供总线 ELM 枚举专用子节点。
+#[kernel_symbols::export(
+    name = "general.firmware.dtb.node_graph_snapshot",
+    contract = "kernel.general.dtb-node-graph@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn node_graph_snapshot() -> Vec<DtbNodeInfo> {
+    NODE_GRAPH_SNAPSHOT
+        .lock()
+        .nodes
+        .as_deref()
+        .map_or_else(Vec::new, |nodes| nodes.to_vec())
+}
+
+/// 按绝对路径查询一个 DT 节点。
+#[kernel_symbols::export(
+    name = "general.firmware.dtb.node_by_path",
+    contract = "kernel.general.dtb-node-graph@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn node_by_path(path: &str) -> Option<DtbNodeInfo> {
+    NODE_GRAPH_SNAPSHOT
+        .lock()
+        .nodes
+        .as_deref()
+        .and_then(|nodes| nodes.iter().find(|node| node.path.as_ref() == path))
+        .cloned()
+}
 
 /// 安装一次性 reserved-memory 运行期快照。
 pub fn install_reserved_memory(
@@ -50,6 +219,8 @@ pub fn install_reserved_memory(
         }
         return Err(DtbReservedMemoryInstallError::AlreadyInstalled);
     }
+    reserved::install_reserved_memory_runtime(&candidate)
+        .map_err(DtbReservedMemoryInstallError::InvalidRuntime)?;
     *installed = Some(candidate);
     Ok(())
 }
@@ -86,6 +257,7 @@ const COMPAT_NS16550: &[u8] = b"ns16550";
 const COMPAT_NS16550A: &[u8] = b"ns16550a";
 const COMPAT_PCI_ECAM: &[u8] = b"pci-host-ecam-generic";
 const COMPAT_PCIE_ECAM: &[u8] = b"pcie-host-ecam-generic";
+const COMPAT_PCI_CAM: &[u8] = b"pci-host-cam-generic";
 const COMPAT_SIMPLE_BUS: &[u8] = b"simple-bus";
 const COMPAT_SIMPLE_MFD: &[u8] = b"simple-mfd";
 const COMPAT_SIMPLE_PM_BUS: &[u8] = b"simple-pm-bus";
@@ -129,8 +301,22 @@ pub struct DtbMmioRangeInfo {
     pub size: usize,
 }
 
+/// 一个无损保留、可选择投影为本机 MMIO 的 `reg` 条目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbRegEntry {
+    pub address: DtbCellValue,
+    /// `#size-cells == 0` 时保持 `None`。
+    pub size: Option<DtbCellValue>,
+    /// 普通总线地址成功翻译到根地址空间时保留完整宽度结果。
+    pub translated_address: Option<DtbCellValue>,
+    /// 仅当地址、非零 size 和区间都能由本机 `usize` 完整表示时存在。
+    pub mmio: Option<DtbMmioRangeInfo>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DtbInterruptInfo {
+    /// `interrupt-names` 中与该 specifier 同索引的稳定名称。
+    pub name: Option<Box<str>>,
     /// interrupt provider 在索引树中的稳定编号。
     pub provider: NodeId,
     /// provider 的绝对路径；在临时索引树销毁后仍可用于稳定识别。
@@ -201,9 +387,9 @@ pub struct DtbEffectiveDmaInfo {
     pub coherent: bool,
     /// `None` 表示没有固件窗口约束；`Some([])` 表示显式 identity。
     pub windows: Option<Vec<DtbDmaWindow>>,
-    /// 可用的直接 `iommus` 或无法由通用总线安全求值的 requester map 要求隔离域。
+    /// 非空的直接 `iommus` 或无法由通用总线安全求值的 requester map 要求隔离域。
     pub iommu_required: bool,
-    /// 标准 DT 关系存在，但当前内核地址宽度/总线抽象无法安全表示。
+    /// 标准 DT 关系存在，但 provider 不可用或当前内核无法安全表示/求值。
     pub unsupported: bool,
 }
 
@@ -346,12 +532,15 @@ pub struct DtbPlatformDeviceInfo {
     pub path: Box<str>,
     pub parent_path: Option<Box<str>>,
     pub phandle: Option<u32>,
+    /// 沿 DT 父链解析出的有效 NUMA node ID。
+    pub numa_node_id: Option<u32>,
     pub interrupt_parent: Option<u32>,
     pub address_cells: usize,
     pub size_cells: usize,
     pub parent_address_cells: usize,
     pub parent_size_cells: usize,
     pub compatible: Vec<Box<str>>,
+    pub reg_entries: Vec<DtbRegEntry>,
     pub reg_ranges: Vec<DtbMmioRangeInfo>,
     pub interrupts: Vec<DtbInterruptInfo>,
     pub interrupt_controller: bool,
@@ -360,12 +549,133 @@ pub struct DtbPlatformDeviceInfo {
     pub properties: Vec<DtbDeviceProperty>,
 }
 
+/// 一份可由 PCI host ELM 在实际 BDF/INTx key 上重复求值的拥有型 DT 路由快照。
+///
+/// 快照与产生它的 overlay candidate 绑定，不依赖全局 live tree；blob 中的
+/// `/chosen` 启动 seed 已在构造时移除。私有字段防止 ELM 伪造宽度或替换 blob。
+#[derive(Clone)]
+struct DtbPciInterruptResolverInner {
+    blob: Arc<[u8]>,
+    host_path: Box<str>,
+    child_address_cells: usize,
+    child_interrupt_cells: usize,
+}
+
+pub struct DtbPciInterruptResolver {
+    inner: Arc<DtbPciInterruptResolverInner>,
+}
+
+impl DtbPciInterruptResolver {
+    fn new(
+        blob: Arc<[u8]>,
+        host_path: Box<str>,
+        child_address_cells: usize,
+        child_interrupt_cells: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DtbPciInterruptResolverInner {
+                blob,
+                host_path,
+                child_address_cells,
+                child_interrupt_cells,
+            }),
+        }
+    }
+}
+
+#[kernel_symbols::export]
+impl DtbPciInterruptResolver {
+    /// 为 ELM 路由表复制一个共享同代 blob 的拥有型 resolver。
+    #[kernel_symbols::export(
+        name = "general.firmware.dtb.DtbPciInterruptResolver.clone_owned",
+        contract = "kernel.general.dtb-pci-interrupt@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn clone_owned(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl Clone for DtbPciInterruptResolver {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl fmt::Debug for DtbPciInterruptResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DtbPciInterruptResolver")
+            .field("host_path", &self.inner.host_path)
+            .field("child_address_cells", &self.inner.child_address_cells)
+            .field("child_interrupt_cells", &self.inner.child_interrupt_cells)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for DtbPciInterruptResolver {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+            || (self.inner.host_path == other.inner.host_path
+                && self.inner.child_address_cells == other.inner.child_address_cells
+                && self.inner.child_interrupt_cells == other.inner.child_interrupt_cells
+                && (Arc::ptr_eq(&self.inner.blob, &other.inner.blob)
+                    || self.inner.blob.as_ref() == other.inner.blob.as_ref()))
+    }
+}
+
+impl Eq for DtbPciInterruptResolver {}
+
+#[kernel_symbols::export]
+impl Drop for DtbPciInterruptResolver {
+    #[kernel_symbols::export(
+        name = "general.firmware.dtb.DtbPciInterruptResolver.drop",
+        contract = "kernel.general.dtb-pci-interrupt@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    fn drop(&mut self) {
+        // 字段 drop glue 在常驻内核中释放 Arc，ELM 不直接接触 blob 所有权。
+    }
+}
+
+/// 对拥有型 PCI interrupt resolver 求值时的稳定错误边界。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbPciInterruptResolveError {
+    /// resolver 内部的去敏 FDT 已损坏或无法重新建立索引。
+    InvalidSnapshot,
+    /// 快照中不存在 resolver 构造时记录的 host 路径。
+    MissingHost,
+    /// 调用方提供的 child key 宽度与 PCI host binding 不一致。
+    InvalidKey {
+        /// host 声明的 child address cell 数。
+        address_expected: usize,
+        /// 调用方提供的 child address cell 数。
+        address_actual: usize,
+        /// host 声明的 child interrupt cell 数。
+        interrupt_expected: usize,
+        /// 调用方提供的 child interrupt cell 数。
+        interrupt_actual: usize,
+    },
+    /// 快照重新解析出的 host 宽度与 resolver 元数据不一致。
+    ResolverMismatch,
+    /// PCI interrupt-map 或后续 interrupt nexus 无法完成规范翻译。
+    InvalidMap,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DtbPcieHostInfo {
     pub name: Box<str>,
     pub path: Box<str>,
+    /// 沿 host 父链继承后的 NUMA 分配亲和节点。
+    pub numa_node_id: Option<u32>,
     pub ecam_phys: usize,
     pub ecam_size: usize,
+    pub config_space: DtbPciConfigSpace,
     pub domain: u16,
     pub bus_start: u8,
     pub bus_end: u8,
@@ -376,6 +686,8 @@ pub struct DtbPcieHostInfo {
     pub interrupt_map_mask: Option<Box<[u32]>>,
     /// 原始 `interrupt-map-pass-thru`；缺失与显式全零必须可区分。
     pub interrupt_map_pass_thru: Option<Box<[u32]>>,
+    /// 与该 host 所属 DT generation 绑定的动态 INTx 路由解析器。
+    pub interrupt_resolver: Option<DtbPciInterruptResolver>,
     pub interrupt_map: Vec<DtbPciInterruptMapEntry>,
     pub msi_map_present: bool,
     pub msi_map_mask: u32,
@@ -390,12 +702,28 @@ pub struct DtbPcieHostInfo {
     pub children: Vec<DtbPciChildInfo>,
 }
 
+/// Generic PCI host 的标准配置空间布局。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbPciConfigSpace {
+    /// Conventional PCI CAM：每条 bus 占 64 KiB，每个 function 暴露 256 bytes。
+    Cam,
+    /// PCIe ECAM：每条 bus 占 1 MiB，每个 function 暴露 4 KiB。
+    Ecam,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DtbPciChildInfo {
+    pub name: Box<str>,
     pub path: Box<str>,
+    pub parent_path: Option<Box<str>>,
+    pub phandle: Option<u32>,
     pub bus: u8,
     pub device: u8,
     pub function: u8,
+    pub compatible: Vec<Box<str>>,
+    pub reg_entries: Vec<DtbRegEntry>,
+    pub interrupts: Vec<DtbInterruptInfo>,
+    pub properties: Vec<DtbDeviceProperty>,
     pub bindings: DtbPlatformBindings,
 }
 
@@ -441,7 +769,7 @@ pub struct DtbPciInterruptMapEntry {
     pub parent: u32,
     pub parent_address: Box<[u32]>,
     pub parent_specifier: Box<[u32]>,
-    /// pass-thru 全零时可在启动期安全折叠出的最终 IRQ 域。
+    /// pass-thru 全零时预先折叠出的最终 IRQ 域；非零时必须动态求值并保持 `None`。
     pub resolved: Option<DtbPciInterruptRoute>,
 }
 
@@ -452,11 +780,95 @@ pub struct DtbPciInterruptRoute {
     pub parent_specifier: Box<[u32]>,
 }
 
+/// 在实际 PCI child address/interrupt key 上执行完整 interrupt-map 翻译。
+///
+/// 每次调用只借用 resolver 内不可变的去敏快照，重新建立 FDT 索引并递归应用所有
+/// nexus map。任何快照、宽度或 map 错误均显式失败，调用方不得回退到未翻译 IRQ。
+#[kernel_symbols::export(
+    name = "general.firmware.dtb.resolve_pci_interrupt",
+    contract = "kernel.general.dtb-pci-interrupt@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn resolve_pci_interrupt(
+    resolver: &DtbPciInterruptResolver,
+    child_address: &[u32],
+    child_interrupt: &[u32],
+) -> Result<Option<DtbPciInterruptRoute>, DtbPciInterruptResolveError> {
+    let inner = resolver.inner.as_ref();
+    if child_address.len() != inner.child_address_cells
+        || child_interrupt.len() != inner.child_interrupt_cells
+    {
+        return Err(DtbPciInterruptResolveError::InvalidKey {
+            address_expected: inner.child_address_cells,
+            address_actual: child_address.len(),
+            interrupt_expected: inner.child_interrupt_cells,
+            interrupt_actual: child_interrupt.len(),
+        });
+    }
+
+    let fdt = Fdt::parse(inner.blob.as_ref())
+        .map_err(|_| DtbPciInterruptResolveError::InvalidSnapshot)?;
+    let tree = Tree::from_fdt(fdt).map_err(|_| DtbPciInterruptResolveError::InvalidSnapshot)?;
+    let host = tree
+        .find_node(&inner.host_path)
+        .ok_or(DtbPciInterruptResolveError::MissingHost)?;
+    let Some(map) = tree
+        .pci_interrupt_map(host)
+        .map_err(|_| DtbPciInterruptResolveError::InvalidMap)?
+    else {
+        return Ok(None);
+    };
+    if map.child_address_cells != inner.child_address_cells
+        || map.child_interrupt_cells != inner.child_interrupt_cells
+    {
+        return Err(DtbPciInterruptResolveError::ResolverMismatch);
+    }
+    tree.resolve_pci_interrupt(&map, child_address, child_interrupt)
+        .map(|route| {
+            route.map(|route| DtbPciInterruptRoute {
+                parent: route.provider_phandle,
+                parent_address: route.address.into_boxed_slice(),
+                parent_specifier: route.specifier.into_boxed_slice(),
+            })
+        })
+        .map_err(|_| DtbPciInterruptResolveError::InvalidMap)
+}
+
+/// 一棵已索引 DT 中任意节点的拥有型规范化快照。
+///
+/// 该层不把 I2C chip-select、SPI 地址或 PCI phys.hi 强行伪装为 platform MMIO；
+/// 总线 ELM 可以按 `path`/`parent_path` 恢复拓扑，再消费原始属性、无损 `reg` 和
+/// 已切分 provider binding。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbNodeInfo {
+    pub node: NodeId,
+    pub name: Box<str>,
+    pub path: Box<str>,
+    pub parent_path: Option<Box<str>>,
+    pub phandle: Option<u32>,
+    /// 沿父链继承后的有效 NUMA node ID。
+    pub numa_node_id: Option<u32>,
+    pub enabled: bool,
+    pub compatible: Vec<Box<str>>,
+    pub address_cells: usize,
+    pub size_cells: usize,
+    pub parent_address_cells: usize,
+    pub parent_size_cells: usize,
+    pub interrupt_controller: bool,
+    pub reg_entries: Vec<DtbRegEntry>,
+    pub interrupts: Vec<DtbInterruptInfo>,
+    pub bindings: DtbPlatformBindings,
+    pub properties: Vec<DtbDeviceProperty>,
+}
+
 #[derive(Debug)]
 pub struct DtbFirmwareInfo {
     pub root_compatible: Vec<Box<str>>,
     pub cpu_count: usize,
     pub cpus: Vec<DtbCpuInfo>,
+    pub numa: DtbNumaInfo,
     /// 无损的 DT 内存来源与保留请求；启动协议策略在内核入口统一解析。
     pub memory: MemoryDescription,
     pub external_initramfs_range: Option<(usize, usize)>,
@@ -464,6 +876,7 @@ pub struct DtbFirmwareInfo {
     pub stdout_serial: Option<SerialPortInfo>,
     pub power_controls: PowerControlInfo,
     pub serial_ports: Vec<SerialPortInfo>,
+    pub nodes: Vec<DtbNodeInfo>,
     pub platform_devices: Vec<DtbPlatformDeviceInfo>,
     pub pcie_hosts: Vec<DtbPcieHostInfo>,
 }
@@ -473,16 +886,65 @@ pub struct DtbCpuInfo {
     pub logical_id: u32,
     pub reg: u64,
     pub phandle: Option<u32>,
+    pub numa_node_id: Option<u32>,
+    pub interrupt_controller_phandles: Box<[u32]>,
     pub compatible: Vec<Box<str>>,
     pub socket_id: Option<u32>,
+    pub cluster_path: Box<[u32]>,
     pub core_id: Option<u32>,
     pub thread_id: Option<u32>,
+    pub capacity_dmips_mhz: Option<u32>,
+}
+
+/// 一个 DT 节点直接声明的 NUMA 归属。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbNumaAssignment {
+    pub path: Box<str>,
+    pub node_id: u32,
+}
+
+/// NUMA 节点之间的一条固件距离。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DtbNumaDistance {
+    pub from: u32,
+    pub to: u32,
+    pub distance: u32,
+}
+
+/// 与临时 FDT 索引解耦的 NUMA 固件快照。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DtbNumaInfo {
+    pub assignments: Vec<DtbNumaAssignment>,
+    pub distances: Vec<DtbNumaDistance>,
+}
+
+impl DtbNumaInfo {
+    pub fn node_id_for_path(&self, path: &str) -> Option<u32> {
+        self.assignments
+            .iter()
+            .find(|assignment| assignment.path.as_ref() == path)
+            .map(|assignment| assignment.node_id)
+    }
+
+    pub fn distance(&self, from: u32, to: u32) -> Option<u32> {
+        self.distances
+            .iter()
+            .find(|entry| entry.from == from && entry.to == to)
+            .or_else(|| {
+                self.distances
+                    .iter()
+                    .find(|entry| entry.from == to && entry.to == from)
+            })
+            .map(|entry| entry.distance)
+            .or_else(|| (from == to).then_some(fdt::NUMA_LOCAL_DISTANCE))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DtbFirmwareError {
     InvalidTree,
     InvalidMemory(fdt::MemoryError),
+    InvalidNuma(fdt::NumaError),
     InvalidAddress(fdt::AddressError),
     InvalidInterrupt(fdt::InterruptError),
     InvalidMsi(fdt::MsiError),
@@ -507,6 +969,13 @@ pub enum DtbFirmwareError {
     },
 }
 
+/// 从任意生命周期的 DTB 字节建立固件摘要时的分层错误。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DtbFirmwareBlobError {
+    InvalidFdt(fdt::Error),
+    InvalidFirmware(DtbFirmwareError),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AddressRange {
     start: usize,
@@ -523,25 +992,46 @@ enum DtbAddressError {
     Overflow,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DtbCpuMapEntry {
     cpu: u32,
     socket_id: Option<u32>,
+    cluster_path: Box<[u32]>,
     core_id: Option<u32>,
     thread_id: Option<u32>,
 }
 
-struct DtbTree {
-    tree: Tree<'static>,
-    enabled: Vec<bool>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DtbCpuMapNodeKind {
+    Socket,
+    Cluster,
+    Core,
+    Thread,
 }
 
-pub fn parse(dtb: Fdt<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
-    let tree = DtbTree::new(dtb)?;
+struct DtbCpuMapWork {
+    node: NodeId,
+    kind: DtbCpuMapNodeKind,
+    socket_id: Option<u32>,
+    cluster_path: Vec<u32>,
+    core_id: Option<u32>,
+    thread_id: Option<u32>,
+}
+
+struct DtbTree<'a> {
+    tree: Tree<'a>,
+    enabled: Vec<bool>,
+    pci_interrupt_blob: Arc<[u8]>,
+}
+
+pub fn parse(dtb: Fdt<'_>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
+    let pci_interrupt_blob = sanitized_pci_interrupt_blob(dtb)?;
+    let tree = DtbTree::new(dtb, pci_interrupt_blob)?;
 
     let root_compatible = tree.root_compatible();
-    let cpu_count = tree.cpu_count();
-    let cpus = tree.cpus();
+    let cpus = tree.cpus()?;
+    let numa = tree.numa()?;
+    let cpu_count = cpus.len().max(1);
     let stdout_serial = tree.stdout_serial();
     let power_controls = tree.power_controls();
     let external_initramfs_range = tree.external_initramfs_range();
@@ -550,24 +1040,96 @@ pub fn parse(dtb: Fdt<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
         .tree
         .memory_description()
         .map_err(DtbFirmwareError::InvalidMemory)?;
+    let nodes = tree.firmware_nodes()?;
 
     Ok(DtbFirmwareInfo {
         root_compatible,
         cpu_count,
         cpus,
+        numa,
         memory,
         external_initramfs_range,
         rng_seed,
         stdout_serial,
         power_controls,
         serial_ports: tree.serial_ports(),
+        nodes,
         platform_devices: tree.platform_devices()?,
         pcie_hosts: tree.pcie_hosts()?,
     })
 }
 
-impl DtbTree {
-    fn new(dtb: Fdt<'static>) -> Result<Self, DtbFirmwareError> {
+/// 解析由调用方临时持有的完整 DTB blob。
+pub fn parse_blob(blob: &[u8]) -> Result<DtbFirmwareInfo, DtbFirmwareBlobError> {
+    let dtb = Fdt::parse(blob).map_err(DtbFirmwareBlobError::InvalidFdt)?;
+    parse(dtb).map_err(DtbFirmwareBlobError::InvalidFirmware)
+}
+
+fn sanitized_pci_interrupt_blob(dtb: Fdt<'_>) -> Result<Arc<[u8]>, DtbFirmwareError> {
+    const FDT_NOP_BYTES: [u8; 4] = 4u32.to_be_bytes();
+
+    let mut blob = dtb.as_bytes().to_vec();
+    let secret_records = dtb
+        .root()
+        .children()
+        .filter(|node| matches!(node.name(), "chosen" | "chosen@0"))
+        .flat_map(|chosen| {
+            chosen
+                .properties()
+                .filter(|property| matches!(property.name(), "rng-seed" | "kaslr-seed"))
+                .map(|property| property.encoded_structure_range())
+        })
+        .collect::<Vec<_>>();
+    let structure_start = dtb.header().off_dt_struct as usize;
+    for encoded in secret_records {
+        let start = structure_start
+            .checked_add(encoded.start)
+            .ok_or(DtbFirmwareError::InvalidTree)?;
+        let end = structure_start
+            .checked_add(encoded.end)
+            .ok_or(DtbFirmwareError::InvalidTree)?;
+        let record = blob
+            .get_mut(start..end)
+            .ok_or(DtbFirmwareError::InvalidTree)?;
+        if !record.len().is_multiple_of(4) {
+            return Err(DtbFirmwareError::InvalidTree);
+        }
+        for token in record.chunks_exact_mut(4) {
+            token.copy_from_slice(&FDT_NOP_BYTES);
+        }
+    }
+    Fdt::parse(&blob).map_err(|_| DtbFirmwareError::InvalidTree)?;
+    Ok(blob.into())
+}
+
+impl<'a> DtbTree<'a> {
+    fn numa(&self) -> Result<DtbNumaInfo, DtbFirmwareError> {
+        let description = self
+            .tree
+            .numa_description()
+            .map_err(DtbFirmwareError::InvalidNuma)?;
+        Ok(DtbNumaInfo {
+            assignments: description
+                .assignments
+                .into_iter()
+                .map(|assignment| DtbNumaAssignment {
+                    path: self.path(assignment.node).into_boxed_str(),
+                    node_id: assignment.node_id,
+                })
+                .collect(),
+            distances: description
+                .distances
+                .into_iter()
+                .map(|distance| DtbNumaDistance {
+                    from: distance.from,
+                    to: distance.to,
+                    distance: distance.distance,
+                })
+                .collect(),
+        })
+    }
+
+    fn new(dtb: Fdt<'a>, pci_interrupt_blob: Arc<[u8]>) -> Result<Self, DtbFirmwareError> {
         let tree = Tree::from_fdt(dtb).map_err(|_| DtbFirmwareError::InvalidTree)?;
         let mut enabled = Vec::with_capacity(tree.len());
         for node_id in tree.node_ids() {
@@ -579,78 +1141,380 @@ impl DtbTree {
                 .map_err(|_| DtbFirmwareError::InvalidTree)?;
             enabled.push(parent_enabled && local_enabled);
         }
-        Ok(Self { tree, enabled })
+        Ok(Self {
+            tree,
+            enabled,
+            pci_interrupt_blob,
+        })
     }
 
     fn root_compatible(&self) -> Vec<Box<str>> {
         compatible_strings(self.node(self.tree.root_id()))
     }
 
-    fn cpu_count(&self) -> usize {
-        self.cpu_node_ids().count().max(1)
+    fn firmware_nodes(&self) -> Result<Vec<DtbNodeInfo>, DtbFirmwareError> {
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve(self.tree.len())
+            .map_err(|_| DtbFirmwareError::InvalidTree)?;
+        for node_id in self.tree.node_ids() {
+            let enabled = self.is_enabled(node_id);
+            let node = self.node(node_id);
+            let compatible = if enabled {
+                self.compatible_strings_strict(node_id)?
+            } else {
+                compatible_strings(node)
+            };
+            let interrupt_controller =
+                if enabled {
+                    match node.property("interrupt-controller") {
+                        None => false,
+                        Some(property) => property.as_bool().map_err(|error| {
+                            DtbFirmwareError::InvalidProperty {
+                                node: node_id,
+                                property: "interrupt-controller",
+                                error,
+                            }
+                        })?,
+                    }
+                } else {
+                    false
+                };
+            let under_pci = enabled && self.is_under_pci_host(node_id)?;
+            let reg_entries = if enabled {
+                // `reg` 的元组布局由所属总线 binding 决定；graph port、I2C/SPI
+                // 子节点等不一定使用普通地址+size 格式。全节点图保留原始属性，
+                // 只有能按普通总线无损解码的节点才附加结构化投影。
+                self.normalized_reg_entries(node_id, !under_pci)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let interrupts = if enabled {
+                self.normalized_interrupts(node_id)?
+            } else {
+                Vec::new()
+            };
+            let bindings = if enabled {
+                self.platform_bindings(
+                    node_id,
+                    if under_pci {
+                        DmaChildAddressKind::Pci
+                    } else {
+                        DmaChildAddressKind::Generic
+                    },
+                )?
+            } else {
+                DtbPlatformBindings::default()
+            };
+            let parent = self.tree.parent(node_id);
+            nodes.push(DtbNodeInfo {
+                node: node_id,
+                name: self.node_name_or_path(node_id),
+                path: self.path(node_id).into_boxed_str(),
+                parent_path: parent.map(|parent| self.path(parent).into_boxed_str()),
+                phandle: self.tree.phandle(node_id),
+                numa_node_id: self
+                    .tree
+                    .effective_numa_node_id(node_id)
+                    .map_err(DtbFirmwareError::InvalidNuma)?,
+                enabled,
+                compatible,
+                address_cells: self.cell_count(node_id, "#address-cells", 2)?,
+                size_cells: self.cell_count(node_id, "#size-cells", 1)?,
+                parent_address_cells: parent
+                    .map(|parent| self.cell_count(parent, "#address-cells", 2))
+                    .transpose()?
+                    .unwrap_or(0),
+                parent_size_cells: parent
+                    .map(|parent| self.cell_count(parent, "#size-cells", 1))
+                    .transpose()?
+                    .unwrap_or(0),
+                interrupt_controller,
+                reg_entries,
+                interrupts,
+                bindings,
+                properties: raw_properties(node),
+            });
+        }
+        Ok(nodes)
     }
 
-    fn cpus(&self) -> Vec<DtbCpuInfo> {
+    fn cpus(&self) -> Result<Vec<DtbCpuInfo>, DtbFirmwareError> {
         let topology = self.cpu_map_entries();
+        let mut capacities = Vec::new();
+        for node_id in self.all_cpu_node_ids() {
+            let capacity =
+                match self.node(node_id).property("capacity-dmips-mhz") {
+                    Some(property) => Some(property.as_u32().map_err(|error| {
+                        DtbFirmwareError::InvalidProperty {
+                            node: node_id,
+                            property: "capacity-dmips-mhz",
+                            error,
+                        }
+                    })?),
+                    None => None,
+                };
+            capacities.push((node_id, capacity));
+        }
+        // Linux binding 规定 capacity-dmips-mhz 是 all-or-nothing；缺失或零值时
+        // 整机统一退回默认容量，避免只给部分 CPU 加权。
+        let use_firmware_capacity = !capacities.is_empty()
+            && capacities
+                .iter()
+                .all(|(_, capacity)| capacity.is_some_and(|value| value != 0));
         let mut cpus = Vec::new();
         for node_id in self.cpu_node_ids() {
             let node = self.node(node_id);
             let phandle = self.tree.phandle(node_id);
-            let topology = phandle
-                .and_then(|phandle| topology.iter().find(|entry| entry.cpu == phandle).copied());
+            let topology =
+                phandle.and_then(|phandle| topology.iter().find(|entry| entry.cpu == phandle));
             let logical_id = u32::try_from(cpus.len()).unwrap_or(u32::MAX);
             cpus.push(DtbCpuInfo {
                 logical_id,
-                reg: self.read_cpu_reg(node_id).unwrap_or(u64::from(logical_id)),
+                reg: self.read_cpu_reg(node_id)?,
                 phandle,
+                numa_node_id: self
+                    .tree
+                    .numa_node_id(node_id)
+                    .map_err(DtbFirmwareError::InvalidNuma)?,
+                interrupt_controller_phandles: self.cpu_interrupt_controller_phandles(node_id)?,
                 compatible: compatible_strings(node),
                 socket_id: topology.and_then(|entry| entry.socket_id),
+                cluster_path: topology
+                    .map(|entry| entry.cluster_path.clone())
+                    .unwrap_or_default(),
                 core_id: topology.and_then(|entry| entry.core_id),
                 thread_id: topology.and_then(|entry| entry.thread_id),
+                capacity_dmips_mhz: use_firmware_capacity.then(|| {
+                    capacities
+                        .iter()
+                        .find(|(cpu, _)| *cpu == node_id)
+                        .and_then(|(_, capacity)| *capacity)
+                        .expect("complete CPU capacity table must contain every CPU node")
+                }),
             });
         }
-        cpus
+        Ok(cpus)
+    }
+
+    fn cpu_interrupt_controller_phandles(
+        &self,
+        cpu: NodeId,
+    ) -> Result<Box<[u32]>, DtbFirmwareError> {
+        let mut providers = Vec::new();
+        for &child in self.children(cpu) {
+            if !self.is_enabled(child) {
+                continue;
+            }
+            let Some(property) = self.node(child).property("interrupt-controller") else {
+                continue;
+            };
+            property
+                .as_bool()
+                .map_err(|error| DtbFirmwareError::InvalidProperty {
+                    node: child,
+                    property: "interrupt-controller",
+                    error,
+                })?;
+            let phandle = self
+                .tree
+                .phandle(child)
+                .ok_or(DtbFirmwareError::InvalidValue {
+                    node: child,
+                    property: "phandle",
+                })?;
+            if providers.contains(&phandle) {
+                return Err(DtbFirmwareError::InvalidValue {
+                    node: child,
+                    property: "phandle",
+                });
+            }
+            providers.push(phandle);
+        }
+        Ok(providers.into_boxed_slice())
     }
 
     fn cpu_map_entries(&self) -> Vec<DtbCpuMapEntry> {
         let Some(cpus_id) = self.cpus_node_id() else {
             return Vec::new();
         };
-        let Some(root_id) = self.children(cpus_id).iter().copied().find(|&node_id| {
-            self.is_enabled(node_id) && self.node(node_id).base_name_bytes() == b"cpu-map"
-        }) else {
+        let mut roots = self
+            .children(cpus_id)
+            .iter()
+            .copied()
+            .filter(|&node_id| self.node(node_id).name() == "cpu-map");
+        let Some(root_id) = roots.next() else {
             return Vec::new();
         };
+        if roots.next().is_some()
+            || !self.is_enabled(root_id)
+            || self.node(root_id).property("cpu").is_some()
+        {
+            return Vec::new();
+        }
 
         let mut entries = Vec::new();
+        let Some(root_children) = self.cpu_map_children(root_id, None) else {
+            return Vec::new();
+        };
+        if root_children.is_empty() {
+            return Vec::new();
+        }
         let mut stack = Vec::new();
-        stack.push((root_id, None, None, None));
-        while let Some((node_id, socket_id, core_id, thread_id)) = stack.pop() {
-            let node = self.node(node_id);
-            let name = node.name();
-            let socket_id = indexed_name_suffix(name, "socket").or(socket_id);
-            let core_id = indexed_name_suffix(name, "core").or(core_id);
-            let thread_id = indexed_name_suffix(name, "thread").or(thread_id);
+        for (node, kind, id) in root_children.into_iter().rev() {
+            let (socket_id, cluster_path) = match kind {
+                DtbCpuMapNodeKind::Socket => (Some(id), Vec::new()),
+                DtbCpuMapNodeKind::Cluster => (None, alloc::vec![id]),
+                DtbCpuMapNodeKind::Core | DtbCpuMapNodeKind::Thread => return Vec::new(),
+            };
+            stack.push(DtbCpuMapWork {
+                node,
+                kind,
+                socket_id,
+                cluster_path,
+                core_id: None,
+                thread_id: None,
+            });
+        }
 
-            if let Some(cpu) = node
-                .find_property("cpu")
-                .and_then(|prop| read_be_u32_prop(prop.value()))
-            {
-                entries.push(DtbCpuMapEntry {
-                    cpu,
-                    socket_id,
-                    core_id,
-                    thread_id,
-                });
+        while let Some(work) = stack.pop() {
+            let cpu_property = self.node(work.node).property("cpu");
+            let cpu = cpu_property.and_then(|property| property.as_u32().ok());
+            if cpu_property.is_some() && cpu.is_none() {
+                return Vec::new();
             }
+            let Some(children) = self.cpu_map_children(work.node, Some(work.kind)) else {
+                return Vec::new();
+            };
 
-            for child in self.children(node_id).iter().rev() {
-                if self.is_enabled(*child) {
-                    stack.push((*child, socket_id, core_id, thread_id));
+            match work.kind {
+                DtbCpuMapNodeKind::Socket | DtbCpuMapNodeKind::Cluster => {
+                    if cpu.is_some() || children.is_empty() {
+                        return Vec::new();
+                    }
+                    for (node, kind, id) in children.into_iter().rev() {
+                        let mut cluster_path = work.cluster_path.clone();
+                        let mut core_id = work.core_id;
+                        match kind {
+                            DtbCpuMapNodeKind::Cluster => cluster_path.push(id),
+                            DtbCpuMapNodeKind::Core => core_id = Some(id),
+                            DtbCpuMapNodeKind::Socket | DtbCpuMapNodeKind::Thread => {
+                                return Vec::new();
+                            }
+                        }
+                        stack.push(DtbCpuMapWork {
+                            node,
+                            kind,
+                            socket_id: work.socket_id,
+                            cluster_path,
+                            core_id,
+                            thread_id: None,
+                        });
+                    }
+                }
+                DtbCpuMapNodeKind::Core => match (cpu, children.is_empty()) {
+                    (Some(cpu), true) => entries.push(DtbCpuMapEntry {
+                        cpu,
+                        socket_id: work.socket_id,
+                        cluster_path: work.cluster_path.into_boxed_slice(),
+                        core_id: work.core_id,
+                        thread_id: None,
+                    }),
+                    (None, false) => {
+                        for (node, kind, id) in children.into_iter().rev() {
+                            if kind != DtbCpuMapNodeKind::Thread {
+                                return Vec::new();
+                            }
+                            stack.push(DtbCpuMapWork {
+                                node,
+                                kind,
+                                socket_id: work.socket_id,
+                                cluster_path: work.cluster_path.clone(),
+                                core_id: work.core_id,
+                                thread_id: Some(id),
+                            });
+                        }
+                    }
+                    _ => return Vec::new(),
+                },
+                DtbCpuMapNodeKind::Thread => {
+                    let (Some(cpu), true) = (cpu, children.is_empty()) else {
+                        return Vec::new();
+                    };
+                    entries.push(DtbCpuMapEntry {
+                        cpu,
+                        socket_id: work.socket_id,
+                        cluster_path: work.cluster_path.into_boxed_slice(),
+                        core_id: work.core_id,
+                        thread_id: work.thread_id,
+                    });
                 }
             }
         }
+
+        let all_cpus: Vec<NodeId> = self.all_cpu_node_ids().collect();
+        if entries.len() != all_cpus.len() {
+            return Vec::new();
+        }
+        let mut seen = Vec::new();
+        for entry in &entries {
+            if seen.contains(&entry.cpu) {
+                return Vec::new();
+            }
+            let Some(target) = self.tree.node_by_phandle(entry.cpu) else {
+                return Vec::new();
+            };
+            if self.tree.parent(target) != Some(cpus_id) || !self.node_is_cpu(target) {
+                return Vec::new();
+            }
+            seen.push(entry.cpu);
+        }
+        if all_cpus.iter().any(|cpu| {
+            self.tree
+                .phandle(*cpu)
+                .is_none_or(|phandle| !seen.contains(&phandle))
+        }) {
+            return Vec::new();
+        }
         entries
+    }
+
+    fn cpu_map_children(
+        &self,
+        node_id: NodeId,
+        parent: Option<DtbCpuMapNodeKind>,
+    ) -> Option<Vec<(NodeId, DtbCpuMapNodeKind, u32)>> {
+        let mut children = Vec::new();
+        for &child in self.children(node_id) {
+            let (kind, id) = cpu_map_node_name(self.node(child).name())?;
+            let allowed = match parent {
+                None => matches!(kind, DtbCpuMapNodeKind::Socket | DtbCpuMapNodeKind::Cluster),
+                Some(DtbCpuMapNodeKind::Socket | DtbCpuMapNodeKind::Cluster) => {
+                    matches!(kind, DtbCpuMapNodeKind::Cluster | DtbCpuMapNodeKind::Core)
+                }
+                Some(DtbCpuMapNodeKind::Core) => kind == DtbCpuMapNodeKind::Thread,
+                Some(DtbCpuMapNodeKind::Thread) => false,
+            };
+            if !allowed
+                || children
+                    .first()
+                    .is_some_and(|(_, first_kind, _)| *first_kind != kind)
+            {
+                return None;
+            }
+            children.push((child, kind, id));
+        }
+        let mut ids: Vec<u32> = children.iter().map(|(_, _, id)| *id).collect();
+        ids.sort_unstable();
+        if ids
+            .iter()
+            .enumerate()
+            .any(|(expected, id)| *id != expected as u32)
+        {
+            return None;
+        }
+        Some(children)
     }
 
     fn stdout_serial(&self) -> Option<SerialPortInfo> {
@@ -787,27 +1651,9 @@ impl DtbTree {
                         })?
                 }
             };
-            let reg_ranges = self
-                .strict_reg_ranges(node_id)?
-                .into_iter()
-                .map(|range| DtbMmioRangeInfo {
-                    phys_addr: range.start,
-                    size: range.size,
-                })
-                .collect();
-            let interrupts = self
-                .tree
-                .interrupts(node_id)
-                .map_err(DtbFirmwareError::InvalidInterrupt)?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|interrupt| DtbInterruptInfo {
-                    provider: interrupt.provider,
-                    provider_path: self.path(interrupt.provider).into_boxed_str(),
-                    parent: interrupt.phandle,
-                    specifier: interrupt.cells.into_boxed_slice(),
-                })
-                .collect::<Vec<_>>();
+            let reg_entries = self.normalized_reg_entries(node_id, true)?;
+            let reg_ranges = reg_entries.iter().filter_map(|entry| entry.mmio).collect();
+            let interrupts = self.normalized_interrupts(node_id)?;
             let interrupt_parent = interrupts
                 .first()
                 .and_then(|interrupt| interrupt.parent)
@@ -825,6 +1671,10 @@ impl DtbTree {
                     .parent(node_id)
                     .map(|parent| self.path(parent).into_boxed_str()),
                 phandle: self.tree.phandle(node_id),
+                numa_node_id: self
+                    .tree
+                    .effective_numa_node_id(node_id)
+                    .map_err(DtbFirmwareError::InvalidNuma)?,
                 interrupt_parent,
                 address_cells: self.cell_count(node_id, "#address-cells", 2)?,
                 size_cells: self.cell_count(node_id, "#size-cells", 1)?,
@@ -841,6 +1691,7 @@ impl DtbTree {
                     .transpose()?
                     .unwrap_or(0),
                 compatible,
+                reg_entries,
                 reg_ranges,
                 interrupts,
                 interrupt_controller,
@@ -1141,7 +1992,12 @@ impl DtbTree {
     ) -> Result<DtbEffectiveDmaInfo, DtbFirmwareError> {
         let coherent = self.dma_is_coherent(device)?;
         let direct_iommu_required = references.iter().any(|reference| {
-            reference.property.as_ref() == "iommus" && reference.provider_available == Some(true)
+            reference.property.as_ref() == "iommus" && reference.provider.is_some()
+        });
+        let direct_iommu_unavailable = references.iter().any(|reference| {
+            reference.property.as_ref() == "iommus"
+                && reference.provider.is_some()
+                && reference.provider_available != Some(true)
         });
         let generic_map_required = self.validate_dma_parent_iommu_maps(start, address_kind)?;
         let (windows, window_unsupported) = self.effective_dma_windows(start, address_kind)?;
@@ -1149,7 +2005,7 @@ impl DtbTree {
             coherent,
             windows,
             iommu_required: direct_iommu_required || generic_map_required,
-            unsupported: window_unsupported || generic_map_required,
+            unsupported: direct_iommu_unavailable || window_unsupported || generic_map_required,
         })
     }
 
@@ -1253,7 +2109,10 @@ impl DtbTree {
             visited.push(bus);
             let node = self.node(bus);
             let Some(property) = node.property("dma-ranges") else {
-                return Ok((saw_identity.then(Vec::new), false));
+                // `dma-ranges` 约束由最近一个声明该属性的 DMA parent 提供；普通
+                // 中间总线省略属性时继续向上查找，不能把祖先窗口误判为无限制。
+                current = self.dma_parent(bus)?;
+                continue;
             };
             // 先严格校验 boolean/tuple 编码；空属性表示本级 identity，继续寻找上级
             // 非空窗口并与其组合。
@@ -1352,10 +2211,20 @@ impl DtbTree {
                 continue;
             }
             result.push(DtbPciChildInfo {
+                name: self.node_name_or_path(node_id),
                 path: self.path(node_id).into_boxed_str(),
+                parent_path: self
+                    .tree
+                    .parent(node_id)
+                    .map(|parent| self.path(parent).into_boxed_str()),
+                phandle: self.tree.phandle(node_id),
                 bus,
                 device,
                 function,
+                compatible: self.compatible_strings_strict(node_id)?,
+                reg_entries: self.normalized_reg_entries(node_id, false)?,
+                interrupts: self.normalized_interrupts(node_id)?,
+                properties: raw_properties(node),
                 bindings: self.platform_bindings(node_id, DmaChildAddressKind::Pci)?,
             });
         }
@@ -1369,18 +2238,29 @@ impl DtbTree {
             if !self.is_enabled(node_id) {
                 continue;
             }
-            let node = self.node(node_id);
             let compatible = self.compatible_strings_strict(node_id)?;
-            if !compatible.iter().any(|value| {
-                value.as_bytes() == COMPAT_PCI_ECAM || value.as_bytes() == COMPAT_PCIE_ECAM
-            }) {
+            let Some(config_space) = compatible.iter().find_map(|value| {
+                if value.as_bytes() == COMPAT_PCI_CAM {
+                    Some(DtbPciConfigSpace::Cam)
+                } else if value.as_bytes() == COMPAT_PCI_ECAM
+                    || value.as_bytes() == COMPAT_PCIE_ECAM
+                {
+                    Some(DtbPciConfigSpace::Ecam)
+                } else {
+                    None
+                }
+            }) else {
                 continue;
-            }
+            };
 
             let (ecam_phys, ecam_size) = self.pci_config_range(node_id)?;
             let (bus_start, bus_end) = self.pci_bus_range(node_id)?;
+            let bytes_per_bus = match config_space {
+                DtbPciConfigSpace::Cam => 1 << 16,
+                DtbPciConfigSpace::Ecam => 1 << 20,
+            };
             let required_ecam = (usize::from(bus_end) - usize::from(bus_start) + 1)
-                .checked_mul(1 << 20)
+                .checked_mul(bytes_per_bus)
                 .ok_or_else(|| pci_overflow(node_id, "reg", 0))?;
             if ecam_size < required_ecam {
                 return Err(DtbFirmwareError::InvalidPci(fdt::PciError::InvalidValue {
@@ -1450,17 +2330,27 @@ impl DtbTree {
                 .as_ref()
                 .map(|map| map.mask.clone().into_boxed_slice());
             let interrupt_map_pass_thru = interrupt_map.as_ref().and_then(|map| {
-                node.property("interrupt-map-pass-thru")
+                self.node(node_id)
+                    .property("interrupt-map-pass-thru")
                     .map(|_| map.pass_thru.clone().into_boxed_slice())
+            });
+            let host_path = self.path(node_id).into_boxed_str();
+            let interrupt_resolver = interrupt_map.as_ref().map(|map| {
+                DtbPciInterruptResolver::new(
+                    Arc::clone(&self.pci_interrupt_blob),
+                    host_path.clone(),
+                    map.child_address_cells,
+                    map.child_interrupt_cells,
+                )
             });
             let interrupt_map = match interrupt_map {
                 None => Vec::new(),
                 Some(map) => {
-                    let can_resolve = map.pass_thru.iter().all(|&cell| cell == 0);
+                    let can_resolve_statically = map.pass_thru.iter().all(|&cell| cell == 0);
                     map.entries
                         .iter()
                         .map(|entry| {
-                            let resolved = if can_resolve {
+                            let resolved = if can_resolve_statically {
                                 self.tree
                                     .resolve_pci_interrupt(
                                         &map,
@@ -1558,9 +2448,14 @@ impl DtbTree {
             let children = self.pci_children(node_id, bus_start, bus_end)?;
             hosts.push(DtbPcieHostInfo {
                 name: self.node_name_or_path(node_id),
-                path: self.path(node_id).into_boxed_str(),
+                path: host_path,
+                numa_node_id: self
+                    .tree
+                    .effective_numa_node_id(node_id)
+                    .map_err(DtbFirmwareError::InvalidNuma)?,
                 ecam_phys,
                 ecam_size,
+                config_space,
                 domain,
                 bus_start,
                 bus_end,
@@ -1570,6 +2465,7 @@ impl DtbTree {
                 ranges,
                 interrupt_map_mask,
                 interrupt_map_pass_thru,
+                interrupt_resolver,
                 interrupt_map,
                 msi_map_present,
                 msi_map_mask,
@@ -1604,60 +2500,109 @@ impl DtbTree {
             })
     }
 
+    fn normalized_reg_entries(
+        &self,
+        node_id: NodeId,
+        translate: bool,
+    ) -> Result<Vec<DtbRegEntry>, DtbFirmwareError> {
+        let entries = self
+            .tree
+            .reg_cells(node_id)
+            .map_err(DtbFirmwareError::InvalidCellAddress)?;
+        let parent = self.tree.parent(node_id);
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                let translated = if translate {
+                    parent.and_then(|parent| {
+                        self.tree
+                            .translate_address_cells(parent, &entry.address, entry.size.as_ref())
+                            .ok()
+                    })
+                } else {
+                    None
+                };
+                let mmio =
+                    translated
+                        .as_ref()
+                        .zip(entry.size.as_ref())
+                        .and_then(|(address, size)| {
+                            let phys_addr = cell_value_to_usize(address)?;
+                            let size = cell_value_to_usize(size)?;
+                            if size == 0 || phys_addr.checked_add(size).is_none() {
+                                return None;
+                            }
+                            Some(DtbMmioRangeInfo { phys_addr, size })
+                        });
+                DtbRegEntry {
+                    address: map_cell_value(entry.address),
+                    size: entry.size.map(map_cell_value),
+                    translated_address: translated.map(map_cell_value),
+                    mmio,
+                }
+            })
+            .collect())
+    }
+
+    fn normalized_interrupts(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<DtbInterruptInfo>, DtbFirmwareError> {
+        let interrupts = self
+            .tree
+            .interrupts(node_id)
+            .map_err(DtbFirmwareError::InvalidInterrupt)?
+            .unwrap_or_default();
+        let names = self
+            .node(node_id)
+            .property("interrupt-names")
+            .map(|property| {
+                property
+                    .as_string_list()
+                    .map(|names| names.map(Box::<str>::from).collect::<Vec<_>>())
+                    .map_err(|error| DtbFirmwareError::InvalidProperty {
+                        node: node_id,
+                        property: "interrupt-names",
+                        error,
+                    })
+            })
+            .transpose()?;
+        if names
+            .as_ref()
+            .is_some_and(|names| names.len() != interrupts.len())
+        {
+            return Err(DtbFirmwareError::InvalidValue {
+                node: node_id,
+                property: "interrupt-names",
+            });
+        }
+        Ok(interrupts
+            .into_iter()
+            .enumerate()
+            .map(|(index, interrupt)| DtbInterruptInfo {
+                name: names.as_ref().map(|names| names[index].clone()),
+                provider: interrupt.provider,
+                provider_path: self.path(interrupt.provider).into_boxed_str(),
+                parent: interrupt.phandle,
+                specifier: interrupt.cells.into_boxed_slice(),
+            })
+            .collect())
+    }
+
     fn is_under_pci_host(&self, node_id: NodeId) -> Result<bool, DtbFirmwareError> {
         let mut current = self.tree.parent(node_id);
         while let Some(parent) = current {
             let compatible = self.compatible_strings_strict(parent)?;
             if compatible.iter().any(|value| {
-                value.as_bytes() == COMPAT_PCI_ECAM || value.as_bytes() == COMPAT_PCIE_ECAM
+                value.as_bytes() == COMPAT_PCI_ECAM
+                    || value.as_bytes() == COMPAT_PCIE_ECAM
+                    || value.as_bytes() == COMPAT_PCI_CAM
             }) {
                 return Ok(true);
             }
             current = self.tree.parent(parent);
         }
         Ok(false)
-    }
-
-    fn strict_reg_ranges(&self, node_id: NodeId) -> Result<Vec<AddressRange>, DtbFirmwareError> {
-        let node = self.node(node_id);
-        if node.property("reg").is_none() {
-            return Ok(Vec::new());
-        }
-        self.tree
-            .translated_reg(node_id)
-            .map_err(DtbFirmwareError::InvalidAddress)?
-            .into_iter()
-            .map(|range| {
-                let size = range.size.ok_or(DtbFirmwareError::InvalidValue {
-                    node: node_id,
-                    property: "reg",
-                })?;
-                if size == 0 {
-                    return Err(DtbFirmwareError::InvalidValue {
-                        node: node_id,
-                        property: "reg",
-                    });
-                }
-                let start = usize::try_from(range.address).map_err(|_| {
-                    DtbFirmwareError::NativeAddressOverflow {
-                        node: node_id,
-                        property: "reg",
-                    }
-                })?;
-                let size =
-                    usize::try_from(size).map_err(|_| DtbFirmwareError::NativeAddressOverflow {
-                        node: node_id,
-                        property: "reg",
-                    })?;
-                start
-                    .checked_add(size)
-                    .ok_or(DtbFirmwareError::NativeAddressOverflow {
-                        node: node_id,
-                        property: "reg",
-                    })?;
-                Ok(AddressRange { start, size })
-            })
-            .collect()
     }
 
     fn optional_u32(
@@ -1850,12 +2795,17 @@ impl DtbTree {
     }
 
     fn cpu_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.all_cpu_node_ids()
+            .filter(|&node_id| self.is_enabled(node_id))
+    }
+
+    fn all_cpu_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.cpus_node_id()
             .and_then(|cpus_id| self.tree.children(cpus_id))
             .into_iter()
             .flatten()
             .copied()
-            .filter(|&node_id| self.is_enabled(node_id) && self.node_is_cpu(node_id))
+            .filter(|&node_id| self.node_is_cpu(node_id))
     }
 
     fn node_is_serial(&self, node_id: NodeId) -> bool {
@@ -1867,7 +2817,9 @@ impl DtbTree {
 
     fn node_is_pcie_host(&self, node_id: NodeId) -> bool {
         let node = self.node(node_id);
-        compatible_contains(node, COMPAT_PCI_ECAM) || compatible_contains(node, COMPAT_PCIE_ECAM)
+        compatible_contains(node, COMPAT_PCI_ECAM)
+            || compatible_contains(node, COMPAT_PCIE_ECAM)
+            || compatible_contains(node, COMPAT_PCI_CAM)
     }
 
     fn node_name_or_path(&self, node_id: NodeId) -> Box<str> {
@@ -1880,13 +2832,13 @@ impl DtbTree {
     }
 
     #[inline]
-    fn node(&self, node_id: NodeId) -> Node<'static> {
+    fn node(&self, node_id: NodeId) -> Node<'a> {
         self.tree
             .node(node_id)
             .expect("fdt::Tree node id must remain valid")
     }
 
-    fn chosen_node(&self) -> Option<Node<'static>> {
+    fn chosen_node(&self) -> Option<Node<'a>> {
         self.tree
             .find_node("/chosen")
             .or_else(|| self.tree.find_node("/chosen@0"))
@@ -1931,9 +2883,21 @@ impl DtbTree {
         }
     }
 
-    fn read_cpu_reg(&self, node_id: NodeId) -> Option<u64> {
-        let reg = self.tree.reg(node_id).ok()?;
-        u64::try_from(reg.first()?.address).ok()
+    fn read_cpu_reg(&self, node_id: NodeId) -> Result<u64, DtbFirmwareError> {
+        let reg = self
+            .tree
+            .reg(node_id)
+            .map_err(DtbFirmwareError::InvalidAddress)?;
+        let [reg] = reg.as_slice() else {
+            return Err(DtbFirmwareError::InvalidValue {
+                node: node_id,
+                property: "reg",
+            });
+        };
+        u64::try_from(reg.address).map_err(|_| DtbFirmwareError::InvalidValue {
+            node: node_id,
+            property: "reg",
+        })
     }
 }
 
@@ -2040,7 +3004,7 @@ fn map_fdt_address_error(error: FdtAddressError) -> DtbAddressError {
     }
 }
 
-fn compatible_contains(node: Node<'static>, compatible: &[u8]) -> bool {
+fn compatible_contains(node: Node<'_>, compatible: &[u8]) -> bool {
     let Some(prop) = node.find_property("compatible") else {
         return false;
     };
@@ -2060,7 +3024,7 @@ fn is_default_platform_bus(compatible: &[Box<str>]) -> bool {
     })
 }
 
-fn compatible_strings(node: Node<'static>) -> Vec<Box<str>> {
+fn compatible_strings(node: Node<'_>) -> Vec<Box<str>> {
     let Some(prop) = node.find_property("compatible") else {
         return Vec::new();
     };
@@ -2071,13 +3035,13 @@ fn compatible_strings(node: Node<'static>) -> Vec<Box<str>> {
         .collect()
 }
 
-fn property_first_string_eq(node: Node<'static>, name: &str, expected: &str) -> bool {
+fn property_first_string_eq(node: Node<'_>, name: &str, expected: &str) -> bool {
     node.find_property(name)
         .and_then(|prop| parse_dtb_string(prop.value()))
         == Some(expected)
 }
 
-fn parse_dtb_string(value: &'static [u8]) -> Option<&'static str> {
+fn parse_dtb_string(value: &[u8]) -> Option<&str> {
     let end = value
         .iter()
         .position(|&byte| byte == 0)
@@ -2085,15 +3049,15 @@ fn parse_dtb_string(value: &'static [u8]) -> Option<&'static str> {
     str::from_utf8(value.get(..end)?).ok()
 }
 
-fn read_clock_hz(node: Node<'static>) -> Option<u32> {
+fn read_clock_hz(node: Node<'_>) -> Option<u32> {
     read_be_u32_prop(node.find_property("clock-frequency")?.value())
 }
 
-fn read_current_speed(node: Node<'static>) -> Option<u32> {
+fn read_current_speed(node: Node<'_>) -> Option<u32> {
     read_be_u32_prop(node.find_property("current-speed")?.value())
 }
 
-fn raw_properties(node: Node<'static>) -> Vec<DtbDeviceProperty> {
+fn raw_properties(node: Node<'_>) -> Vec<DtbDeviceProperty> {
     node.properties()
         .map(|property| DtbDeviceProperty {
             name: property.name().into(),
@@ -2108,6 +3072,17 @@ fn indexed_name_suffix(name: &str, prefix: &str) -> Option<u32> {
         return None;
     }
     suffix.parse().ok()
+}
+
+fn cpu_map_node_name(name: &str) -> Option<(DtbCpuMapNodeKind, u32)> {
+    [
+        ("socket", DtbCpuMapNodeKind::Socket),
+        ("cluster", DtbCpuMapNodeKind::Cluster),
+        ("core", DtbCpuMapNodeKind::Core),
+        ("thread", DtbCpuMapNodeKind::Thread),
+    ]
+    .into_iter()
+    .find_map(|(prefix, kind)| indexed_name_suffix(name, prefix).map(|id| (kind, id)))
 }
 
 fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
@@ -2159,6 +3134,60 @@ mod tests {
     const FDT_END_NODE: u32 = 2;
     const FDT_PROP: u32 = 3;
     const FDT_END: u32 = 9;
+    static NODE_GRAPH_TEST_LOCK: SpinMutex<()> = SpinMutex::new(());
+
+    struct NodeGraphStateReset(DtbNodeGraphState);
+
+    impl NodeGraphStateReset {
+        fn take() -> Self {
+            let mut state = NODE_GRAPH_SNAPSHOT.lock();
+            Self(core::mem::replace(
+                &mut *state,
+                DtbNodeGraphState {
+                    generation: 0,
+                    update_generation: None,
+                    nodes: None,
+                },
+            ))
+        }
+    }
+
+    impl Drop for NodeGraphStateReset {
+        fn drop(&mut self) {
+            let mut state = NODE_GRAPH_SNAPSHOT.lock();
+            core::mem::swap(&mut *state, &mut self.0);
+        }
+    }
+
+    #[test]
+    fn live_node_graph_update_checks_generation_and_aborts_without_publication() {
+        let _lock = NODE_GRAPH_TEST_LOCK.lock();
+        let _reset = NodeGraphStateReset::take();
+        let initial = parse_test_firmware().nodes;
+        install_node_graph(initial.clone()).unwrap();
+        let generation = node_graph_generation().unwrap();
+
+        let update = begin_node_graph_update(generation).unwrap();
+        assert!(matches!(
+            begin_node_graph_update(generation),
+            Err(DtbNodeGraphUpdateError::Busy)
+        ));
+        drop(update);
+        assert_eq!(node_graph_snapshot(), initial);
+
+        let mut candidate = initial.clone();
+        candidate[0].enabled = !candidate[0].enabled;
+        let committed = begin_node_graph_update(generation)
+            .unwrap()
+            .commit(candidate.clone().into_boxed_slice());
+        assert_eq!(committed.previous.as_ref(), initial.as_slice());
+        assert_ne!(committed.generation, generation);
+        assert_eq!(node_graph_snapshot(), candidate);
+        assert!(matches!(
+            begin_node_graph_update(generation),
+            Err(DtbNodeGraphUpdateError::BaselineMismatch)
+        ));
+    }
 
     struct DtbBuilder {
         structure: Vec<u8>,
@@ -2260,6 +3289,7 @@ mod tests {
         builder.property("compatible", b"riscv,cpu-intc\0");
         builder.property("interrupt-controller", &[]);
         builder.property("#interrupt-cells", &cells(&[1]));
+        builder.property("phandle", &cells(&[1]));
         builder.end_node();
 
         builder.end_node();
@@ -2275,6 +3305,270 @@ mod tests {
                 .iter()
                 .all(|device| !device.path.starts_with("/cpus/"))
         );
+    }
+
+    #[test]
+    fn cpu_reg_is_required_single_and_representable() {
+        let mut missing = cpu_tree_builder();
+        missing.begin_node("cpu@0");
+        missing.property("device_type", b"cpu\0");
+        missing.property("phandle", &cells(&[10]));
+        missing.end_node();
+        finish_cpu_tree(&mut missing);
+        assert!(matches!(
+            parse_test_firmware_result(missing),
+            Err(DtbFirmwareError::InvalidValue {
+                property: "reg",
+                ..
+            })
+        ));
+
+        let mut multiple = cpu_tree_builder();
+        multiple.begin_node("cpu@0");
+        multiple.property("device_type", b"cpu\0");
+        multiple.property("reg", &cells(&[0, 1]));
+        multiple.property("phandle", &cells(&[10]));
+        multiple.end_node();
+        finish_cpu_tree(&mut multiple);
+        assert!(matches!(
+            parse_test_firmware_result(multiple),
+            Err(DtbFirmwareError::InvalidValue {
+                property: "reg",
+                ..
+            })
+        ));
+
+        let mut wide = DtbBuilder::new();
+        wide.begin_node("");
+        wide.property("#address-cells", &cells(&[2]));
+        wide.property("#size-cells", &cells(&[2]));
+        wide.begin_node("cpus");
+        wide.property("#address-cells", &cells(&[3]));
+        wide.property("#size-cells", &cells(&[0]));
+        wide.begin_node("cpu@10000000000000000");
+        wide.property("device_type", b"cpu\0");
+        wide.property("reg", &cells(&[1, 0, 0]));
+        wide.end_node();
+        finish_cpu_tree(&mut wide);
+        assert!(matches!(
+            parse_test_firmware_result(wide),
+            Err(DtbFirmwareError::InvalidValue {
+                property: "reg",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cpu_map_preserves_scoped_nested_clusters_capacity_and_cpu_intc() {
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu-map");
+
+        builder.begin_node("cluster0");
+        builder.begin_node("cluster0");
+        builder.begin_node("core0");
+        builder.begin_node("thread0");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        builder.begin_node("thread1");
+        builder.property("cpu", &cells(&[11]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+
+        builder.begin_node("cluster1");
+        builder.begin_node("cluster0");
+        builder.begin_node("core0");
+        builder.property("cpu", &cells(&[12]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+
+        builder.end_node();
+        add_test_cpu(&mut builder, 0, 10, Some(512), &[100]);
+        add_test_cpu(&mut builder, 1, 11, Some(512), &[101, 102]);
+        add_test_cpu(&mut builder, 2, 12, Some(1024), &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.cpus.len(), 3);
+        assert_eq!(firmware.cpus[0].cluster_path.as_ref(), &[0, 0]);
+        assert_eq!(firmware.cpus[1].cluster_path.as_ref(), &[0, 0]);
+        assert_eq!(firmware.cpus[2].cluster_path.as_ref(), &[1, 0]);
+        assert_eq!(firmware.cpus[0].core_id, Some(0));
+        assert_eq!(firmware.cpus[2].core_id, Some(0));
+        assert_eq!(firmware.cpus[0].thread_id, Some(0));
+        assert_eq!(firmware.cpus[1].thread_id, Some(1));
+        assert_eq!(firmware.cpus[2].thread_id, None);
+        assert_eq!(firmware.cpus[0].capacity_dmips_mhz, Some(512));
+        assert_eq!(firmware.cpus[2].capacity_dmips_mhz, Some(1024));
+        assert_eq!(
+            firmware.cpus[0].interrupt_controller_phandles.as_ref(),
+            &[100]
+        );
+        assert_eq!(
+            firmware.cpus[1].interrupt_controller_phandles.as_ref(),
+            &[101, 102]
+        );
+    }
+
+    #[test]
+    fn cpu_map_supports_arbitrary_cluster_depth() {
+        const DEPTH: usize = 32;
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu-map");
+        for _ in 0..DEPTH {
+            builder.begin_node("cluster0");
+        }
+        builder.begin_node("core0");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        for _ in 0..DEPTH {
+            builder.end_node();
+        }
+        builder.end_node();
+        add_test_cpu(&mut builder, 0, 10, None, &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.cpus[0].cluster_path.len(), DEPTH);
+        assert!(
+            firmware.cpus[0]
+                .cluster_path
+                .iter()
+                .all(|cluster| *cluster == 0)
+        );
+    }
+
+    #[test]
+    fn cpu_map_accepts_socket_with_direct_cores() {
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu-map");
+        builder.begin_node("socket0");
+        builder.begin_node("core0");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        add_test_cpu(&mut builder, 0, 10, None, &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.cpus[0].socket_id, Some(0));
+        assert!(firmware.cpus[0].cluster_path.is_empty());
+        assert_eq!(firmware.cpus[0].core_id, Some(0));
+    }
+
+    #[test]
+    fn malformed_cpu_reference_does_not_become_an_absent_property() {
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu-map");
+        builder.begin_node("cluster0");
+        builder.begin_node("core0");
+        builder.property("cpu", &[0, 10]);
+        builder.begin_node("thread0");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        add_test_cpu(&mut builder, 0, 10, None, &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert!(firmware.cpus[0].cluster_path.is_empty());
+        assert!(firmware.cpus[0].core_id.is_none());
+        assert!(firmware.cpus[0].thread_id.is_none());
+    }
+
+    #[test]
+    fn invalid_cpu_map_is_ignored_atomically() {
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu-map");
+        builder.begin_node("cluster0");
+        builder.begin_node("core0");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        builder.end_node();
+        // sibling 编号不连续；即使所有 CPU 都被引用，也必须丢弃整张 map。
+        builder.begin_node("cluster2");
+        builder.begin_node("core0");
+        builder.property("cpu", &cells(&[11]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        add_test_cpu(&mut builder, 0, 10, None, &[]);
+        add_test_cpu(&mut builder, 1, 11, None, &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert!(firmware.cpus.iter().all(|cpu| {
+            cpu.socket_id.is_none()
+                && cpu.cluster_path.is_empty()
+                && cpu.core_id.is_none()
+                && cpu.thread_id.is_none()
+        }));
+    }
+
+    #[test]
+    fn duplicate_cpu_map_reference_is_ignored_atomically() {
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu-map");
+        builder.begin_node("cluster0");
+        builder.begin_node("core0");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        builder.begin_node("core1");
+        builder.property("cpu", &cells(&[10]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        add_test_cpu(&mut builder, 0, 10, None, &[]);
+        add_test_cpu(&mut builder, 1, 11, None, &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert!(firmware.cpus.iter().all(|cpu| cpu.core_id.is_none()));
+    }
+
+    #[test]
+    fn partial_cpu_capacity_falls_back_for_every_cpu() {
+        let mut builder = cpu_tree_builder();
+        add_test_cpu(&mut builder, 0, 10, Some(512), &[]);
+        add_test_cpu(&mut builder, 1, 11, None, &[]);
+        finish_cpu_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        assert!(
+            firmware
+                .cpus
+                .iter()
+                .all(|cpu| cpu.capacity_dmips_mhz.is_none())
+        );
+    }
+
+    #[test]
+    fn cpu_interrupt_controller_requires_a_phandle() {
+        let mut builder = cpu_tree_builder();
+        builder.begin_node("cpu@0");
+        builder.property("device_type", b"cpu\0");
+        builder.property("reg", &cells(&[0]));
+        builder.property("phandle", &cells(&[10]));
+        builder.begin_node("interrupt-controller");
+        builder.property("interrupt-controller", &[]);
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.end_node();
+        builder.end_node();
+        finish_cpu_tree(&mut builder);
+
+        assert!(matches!(
+            parse_test_firmware_result(builder),
+            Err(DtbFirmwareError::InvalidValue {
+                property: "phandle",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2318,6 +3612,16 @@ mod tests {
                 .iter()
                 .all(|device| device.path.as_ref() != "/soc/i2c@1000/sensor@50")
         );
+        let sensor = firmware
+            .nodes
+            .iter()
+            .find(|node| node.path.as_ref() == "/soc/i2c@1000/sensor@50")
+            .expect("specialized bus child must remain in the complete node graph");
+        assert_eq!(sensor.compatible.len(), 1);
+        assert_eq!(sensor.compatible[0].as_ref(), "vendor,sensor");
+        assert_eq!(sensor.reg_entries[0].address.cells(), &[0x50]);
+        assert_eq!(sensor.reg_entries[0].size, None);
+        assert_eq!(sensor.reg_entries[0].mmio, None);
     }
 
     #[test]
@@ -2340,13 +3644,21 @@ mod tests {
         builder.end_node();
         builder.end_node();
 
-        let bytes: &'static [u8] = Box::leak(builder.finish().into_boxed_slice());
-        assert!(matches!(
-            parse(Fdt::parse(bytes).unwrap()),
-            Err(DtbFirmwareError::InvalidAddress(
-                fdt::AddressError::MissingRanges(_)
-            ))
-        ));
+        let firmware = parse_test_firmware_from(builder);
+        let device = firmware
+            .platform_devices
+            .iter()
+            .find(|device| device.path.as_ref() == "/soc/device@1000")
+            .expect("untranslated child must remain visible to the firmware graph");
+        assert!(device.reg_ranges.is_empty());
+        assert_eq!(device.reg_entries.len(), 1);
+        assert_eq!(device.reg_entries[0].address.cells(), &[0x1000]);
+        assert_eq!(
+            device.reg_entries[0].size.as_ref().map(DtbCellValue::cells),
+            Some([0x100].as_slice())
+        );
+        assert_eq!(device.reg_entries[0].translated_address, None);
+        assert_eq!(device.reg_entries[0].mmio, None);
     }
 
     #[test]
@@ -2383,6 +3695,100 @@ mod tests {
 
         let firmware = parse(Fdt::parse(bytes).unwrap()).unwrap();
         assert!(firmware.memory.memory_banks.is_empty());
+    }
+
+    #[test]
+    fn numa_topology_survives_normalization_and_splits_allocator_segments() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[1]));
+        builder.property("#size-cells", &cells(&[1]));
+        builder.begin_node("distance-map");
+        builder.property("compatible", b"numa-distance-map-v1\0");
+        builder.property(
+            "distance-matrix",
+            &cells(&[0, 0, 10, 0, 1, 20, 1, 0, 20, 1, 1, 10]),
+        );
+        builder.end_node();
+        for (start, node_id) in [(0x1000, 0), (0x3000, 1)] {
+            builder.begin_node(if node_id == 0 {
+                "memory@1000"
+            } else {
+                "memory@3000"
+            });
+            builder.property("device_type", b"memory\0");
+            builder.property("reg", &cells(&[start, 0x2000]));
+            builder.property("numa-node-id", &cells(&[node_id]));
+            builder.end_node();
+        }
+        builder.begin_node("soc");
+        builder.property("compatible", b"simple-bus\0");
+        builder.property("ranges", &[]);
+        builder.property("numa-node-id", &cells(&[1]));
+        builder.begin_node("device");
+        builder.property("compatible", b"test,device\0");
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.numa.distance(1, 0), Some(20));
+        assert_eq!(firmware.numa.node_id_for_path("/memory@3000"), Some(1));
+        assert_eq!(
+            firmware
+                .platform_devices
+                .iter()
+                .find(|device| device.path.as_ref() == "/soc/device")
+                .and_then(|device| device.numa_node_id),
+            Some(1)
+        );
+
+        let merged = described_memory_segments(&firmware.memory).unwrap();
+        assert_eq!(merged.len(), 1);
+        let layout = split_numa_memory_segments(&firmware.memory, merged).unwrap();
+        assert_eq!(
+            layout.usable_segments,
+            vec![
+                MemorySegment {
+                    start: 0x1000,
+                    size: 0x2000,
+                },
+                MemorySegment {
+                    start: 0x3000,
+                    size: 0x2000,
+                },
+            ]
+        );
+        assert_eq!(layout.numa_ranges.len(), 2);
+        assert_eq!(layout.numa_ranges[0].node_id, 0);
+        assert_eq!(layout.numa_ranges[1].node_id, 1);
+    }
+
+    #[test]
+    fn conflicting_memory_numa_nodes_fail_before_allocator_init() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[1]));
+        builder.property("#size-cells", &cells(&[1]));
+        for (name, start, node_id) in [("memory@1000", 0x1000, 0), ("memory@2000", 0x2000, 1)] {
+            builder.begin_node(name);
+            builder.property("device_type", b"memory\0");
+            builder.property("reg", &cells(&[start, 0x2000]));
+            builder.property("numa-node-id", &cells(&[node_id]));
+            builder.end_node();
+        }
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        let memory = described_memory_segments(&firmware.memory).unwrap();
+        assert!(matches!(
+            split_numa_memory_segments(&firmware.memory, memory),
+            Err(DtbMemoryLayoutError::ConflictingNumaRange {
+                first: 0,
+                second: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2902,6 +4308,7 @@ mod tests {
         let host = &firmware.pcie_hosts[0];
         assert_eq!((host.bus_start, host.bus_end), (0, 0xff));
         assert_eq!(host.ecam_size, 0x1000_0000);
+        assert_eq!(host.config_space, DtbPciConfigSpace::Ecam);
         assert_eq!(host.ranges.len(), 1);
         assert_eq!(host.ranges[0].phys_hi, 0x4300_0000);
         assert!(host.ranges[0].memory_64);
@@ -2910,6 +4317,7 @@ mod tests {
             host.interrupt_map_pass_thru.as_deref(),
             Some([0, 0, 0, 0].as_slice())
         );
+        assert!(host.interrupt_resolver.is_some());
         assert_eq!(host.interrupt_map.len(), 1);
         assert_eq!(host.interrupt_map[0].parent, 0x47);
         assert_eq!(
@@ -2918,6 +4326,14 @@ mod tests {
                 .as_ref()
                 .map(|route| (route.parent, route.parent_specifier.as_ref())),
             Some((0x47, [9].as_slice()))
+        );
+        let route =
+            resolve_pci_interrupt(host.interrupt_resolver.as_ref().unwrap(), &[0, 0, 0], &[1])
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (route.parent, route.parent_specifier.as_ref()),
+            (0x47, [9].as_slice())
         );
         assert!(!host.msi_map_present);
         assert_eq!(host.msi_parents.len(), 2);
@@ -2962,6 +4378,134 @@ mod tests {
                 .as_slice()
             )
         );
+    }
+
+    #[test]
+    fn pci_interrupt_resolver_applies_actual_pass_thru_bits_and_scrubs_boot_secrets() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[2]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.begin_node("chosen");
+        builder.property("rng-seed", &[1, 2, 3, 4]);
+        builder.property("kaslr-seed", &[5, 6, 7, 8]);
+        builder.end_node();
+        builder.begin_node("intc");
+        builder.property("phandle", &cells(&[1]));
+        builder.property("#address-cells", &cells(&[0]));
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.property("interrupt-controller", &[]);
+        builder.end_node();
+        builder.begin_node("pci-intc-nexus");
+        builder.property("phandle", &cells(&[3]));
+        builder.property("#address-cells", &cells(&[3]));
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.property("interrupt-map-mask", &cells(&[0, 0, 0, 7]));
+        builder.property(
+            "interrupt-map",
+            &cells(&[0, 0, 0, 1, 1, 0x31, 0, 0, 0, 2, 1, 0x32]),
+        );
+        builder.end_node();
+        builder.begin_node("pcie@30000000");
+        builder.property("compatible", b"pci-host-ecam-generic\0");
+        builder.property("#address-cells", &cells(&[3]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.property("bus-range", &cells(&[0, 0]));
+        builder.property("reg", &cells(&[0, 0x3000_0000, 0, 0x10_0000]));
+        builder.property(
+            "ranges",
+            &cells(&[0x0200_0000, 0, 0, 0, 0x4000_0000, 0, 0x1000]),
+        );
+        builder.property("interrupt-map-mask", &cells(&[0, 0, 0, 0]));
+        builder.property("interrupt-map-pass-thru", &cells(&[0, 0, 0, 7]));
+        builder.property("interrupt-map", &cells(&[0, 0, 0, 0, 3, 0, 0, 0, 0]));
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.rng_seed.as_deref(), Some([1, 2, 3, 4].as_slice()));
+        let host = &firmware.pcie_hosts[0];
+        let resolver = host.interrupt_resolver.as_ref().unwrap();
+        assert_eq!(
+            host.interrupt_map_pass_thru.as_deref(),
+            Some([0, 0, 0, 7].as_slice())
+        );
+        assert!(host.interrupt_map[0].resolved.is_none());
+
+        let first = resolve_pci_interrupt(resolver, &[0x0000_1100, 0, 0], &[1])
+            .unwrap()
+            .unwrap();
+        let second = resolve_pci_interrupt(resolver, &[0x0000_1100, 0, 0], &[2])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (first.parent, first.parent_specifier.as_ref()),
+            (1, [0x31].as_slice())
+        );
+        assert_eq!(
+            (second.parent, second.parent_specifier.as_ref()),
+            (1, [0x32].as_slice())
+        );
+
+        let snapshot = Fdt::parse(resolver.inner.blob.as_ref()).unwrap();
+        let chosen = snapshot
+            .root()
+            .children()
+            .find(|node| node.name() == "chosen")
+            .unwrap();
+        assert!(chosen.find_property("rng-seed").is_none());
+        assert!(chosen.find_property("kaslr-seed").is_none());
+        assert!(matches!(
+            resolve_pci_interrupt(resolver, &[0, 0], &[1]),
+            Err(DtbPciInterruptResolveError::InvalidKey { .. })
+        ));
+        assert_eq!(
+            resolve_pci_interrupt(resolver, &[0, 0, 0], &[3]),
+            Err(DtbPciInterruptResolveError::InvalidMap)
+        );
+
+        let mut malformed = resolver.clone();
+        Arc::make_mut(&mut malformed.inner).blob = Arc::from(vec![0u8; 4].into_boxed_slice());
+        assert_eq!(
+            resolve_pci_interrupt(&malformed, &[0, 0, 0], &[1]),
+            Err(DtbPciInterruptResolveError::InvalidSnapshot)
+        );
+        let mut missing = resolver.clone();
+        Arc::make_mut(&mut missing.inner).host_path = "/missing-pcie".into();
+        assert_eq!(
+            resolve_pci_interrupt(&missing, &[0, 0, 0], &[1]),
+            Err(DtbPciInterruptResolveError::MissingHost)
+        );
+    }
+
+    #[test]
+    fn generic_pci_cam_uses_sixty_four_kib_per_bus() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[2]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.begin_node("pci@30000000");
+        builder.property("compatible", b"pci-host-cam-generic\0");
+        builder.property("#address-cells", &cells(&[3]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.property("bus-range", &cells(&[0, 1]));
+        builder.property("reg", &cells(&[0, 0x3000_0000, 0, 0x0002_0000]));
+        builder.property(
+            "ranges",
+            &cells(&[0x0200_0000, 0, 0x4000_0000, 0, 0x4000_0000, 0, 0x1000_0000]),
+        );
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.pcie_hosts.len(), 1);
+        let host = &firmware.pcie_hosts[0];
+        assert_eq!(host.config_space, DtbPciConfigSpace::Cam);
+        assert_eq!(host.bus_start, 0);
+        assert_eq!(host.bus_end, 1);
+        assert_eq!(host.ecam_size, 0x0002_0000);
     }
 
     #[test]
@@ -3098,6 +4642,8 @@ mod tests {
             .unwrap();
         assert_eq!(explicit.dma_ranges, Some(Vec::new()));
         assert_eq!(explicit.iommu_map, None);
+        assert_eq!(explicit.interrupt_map_pass_thru, None);
+        assert!(explicit.interrupt_resolver.is_none());
         let absent = firmware
             .pcie_hosts
             .iter()
@@ -3106,6 +4652,7 @@ mod tests {
         assert_eq!(absent.dma_ranges, None);
         assert_eq!(absent.iommu_map, None);
         assert_eq!(absent.interrupt_map_pass_thru, None);
+        assert!(absent.interrupt_resolver.is_none());
     }
 
     #[test]
@@ -3246,6 +4793,7 @@ mod tests {
         builder.property("pinctrl-1", &cells(&[0x10]));
         builder.property("interrupt-parent", &cells(&[0x10]));
         builder.property("interrupts", &cells(&[0x55]));
+        builder.property("interrupt-names", b"event\0");
         builder.property(
             "dma-ranges",
             &cells(&[0, 1, 2, 3, 4, 0x8000_0000, 0, 0, 0x1000]),
@@ -3358,7 +4906,186 @@ mod tests {
             Some("/soc/remote-device/port/endpoint")
         );
         assert_eq!(device.interrupts.len(), 1);
+        assert_eq!(device.interrupts[0].name.as_deref(), Some("event"));
         assert_eq!(device.interrupts[0].provider_path.as_ref(), "/soc/provider");
+    }
+
+    #[test]
+    fn interrupt_names_are_validated_atomically() {
+        let build = |names: &[u8]| {
+            let mut builder = DtbBuilder::new();
+            builder.begin_node("");
+            builder.property("#address-cells", &cells(&[1]));
+            builder.property("#size-cells", &cells(&[1]));
+            builder.begin_node("soc");
+            builder.property("compatible", b"simple-bus\0");
+            builder.property("#address-cells", &cells(&[1]));
+            builder.property("#size-cells", &cells(&[1]));
+            builder.property("ranges", &[]);
+            builder.begin_node("intc");
+            builder.property("phandle", &cells(&[1]));
+            builder.property("interrupt-controller", &[]);
+            builder.property("#interrupt-cells", &cells(&[1]));
+            builder.end_node();
+            builder.begin_node("device");
+            builder.property("compatible", b"test,named-irqs\0");
+            builder.property("interrupt-parent", &cells(&[1]));
+            builder.property("interrupts", &cells(&[3, 4]));
+            builder.property("interrupt-names", names);
+            builder.end_node();
+            builder.end_node();
+            builder.end_node();
+            parse_test_firmware_result(builder)
+        };
+
+        let firmware = build(b"rx\0tx\0").expect("matching names must parse");
+        let device = firmware
+            .platform_devices
+            .iter()
+            .find(|device| device.path.as_ref() == "/soc/device")
+            .unwrap();
+        assert_eq!(device.interrupts[0].name.as_deref(), Some("rx"));
+        assert_eq!(device.interrupts[1].name.as_deref(), Some("tx"));
+
+        assert!(matches!(
+            build(b"only-one\0"),
+            Err(DtbFirmwareError::InvalidValue {
+                property: "interrupt-names",
+                ..
+            })
+        ));
+        assert!(matches!(
+            build(b"unterminated"),
+            Err(DtbFirmwareError::InvalidProperty {
+                property: "interrupt-names",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn effective_dma_inherits_window_across_bus_without_dma_ranges() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[1]));
+        builder.property("#size-cells", &cells(&[1]));
+
+        builder.begin_node("soc");
+        builder.property("compatible", b"simple-bus\0");
+        builder.property("#address-cells", &cells(&[1]));
+        builder.property("#size-cells", &cells(&[1]));
+        builder.property("ranges", &[]);
+        builder.property("dma-ranges", &cells(&[0, 0x8000_0000, 0x1000]));
+
+        builder.begin_node("bridge");
+        builder.property("compatible", b"simple-bus\0");
+        builder.property("#address-cells", &cells(&[1]));
+        builder.property("#size-cells", &cells(&[1]));
+        builder.property("ranges", &[]);
+
+        builder.begin_node("device");
+        builder.property("compatible", b"test,inherited-dma-window\0");
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        let device = firmware
+            .platform_devices
+            .iter()
+            .find(|device| device.path.as_ref() == "/soc/bridge/device")
+            .expect("nested DMA consumer must be populated");
+        assert_eq!(
+            device.bindings.effective_dma.windows.as_deref(),
+            Some(
+                [DtbDmaWindow {
+                    cpu_start: 0x8000_0000,
+                    dma_start: 0,
+                    size: 0x1000,
+                }]
+                .as_slice()
+            )
+        );
+        assert!(!device.bindings.effective_dma.unsupported);
+    }
+
+    #[test]
+    fn wide_or_sizeless_reg_is_preserved_without_native_mmio_projection() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[2]));
+        builder.property("#size-cells", &cells(&[1]));
+        builder.begin_node("wide-bus");
+        builder.property("compatible", b"simple-bus\0");
+        builder.property("#address-cells", &cells(&[5]));
+        builder.property("#size-cells", &cells(&[0]));
+        builder.begin_node("device");
+        builder.property("compatible", b"test,wide-register\0");
+        builder.property("reg", &cells(&[1, 2, 3, 4, 5]));
+        builder.end_node();
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        let device = firmware
+            .platform_devices
+            .iter()
+            .find(|device| device.path.as_ref() == "/wide-bus/device")
+            .expect("wide register device must remain discoverable");
+        assert!(device.reg_ranges.is_empty());
+        assert_eq!(device.reg_entries.len(), 1);
+        assert_eq!(device.reg_entries[0].address.cells(), &[1, 2, 3, 4, 5]);
+        assert_eq!(device.reg_entries[0].size, None);
+        assert_eq!(device.reg_entries[0].translated_address, None);
+        assert_eq!(device.reg_entries[0].mmio, None);
+    }
+
+    #[test]
+    fn unavailable_direct_iommu_provider_blocks_dma_but_empty_slot_does_not() {
+        let mut builder = basic_platform_tree();
+        builder.begin_node("iommu");
+        builder.property("phandle", &cells(&[1]));
+        builder.property("#iommu-cells", &cells(&[1]));
+        builder.property("status", b"disabled\0");
+        builder.end_node();
+        builder.begin_node("blocked-device");
+        builder.property("compatible", b"test,blocked-iommu\0");
+        builder.property("iommus", &cells(&[1, 7]));
+        builder.end_node();
+        builder.begin_node("empty-slot-device");
+        builder.property("compatible", b"test,empty-iommu-slot\0");
+        builder.property("iommus", &cells(&[0]));
+        builder.end_node();
+        finish_basic_platform_tree(&mut builder);
+
+        let firmware = parse_test_firmware_from(builder);
+        let blocked = firmware
+            .platform_devices
+            .iter()
+            .find(|device| device.path.as_ref() == "/soc/blocked-device")
+            .expect("disabled-IOMMU consumer must be populated");
+        let reference = blocked
+            .bindings
+            .references
+            .iter()
+            .find(|reference| reference.property.as_ref() == "iommus")
+            .expect("direct IOMMU reference must be preserved");
+        assert_eq!(reference.provider_available, Some(false));
+        assert!(blocked.bindings.effective_dma.iommu_required);
+        assert!(blocked.bindings.effective_dma.unsupported);
+
+        let empty = firmware
+            .platform_devices
+            .iter()
+            .find(|device| device.path.as_ref() == "/soc/empty-slot-device")
+            .expect("empty-slot consumer must be populated");
+        assert_eq!(
+            empty.bindings.references[0].provider_available, None,
+            "phandle 0 must remain an empty slot"
+        );
+        assert!(!empty.bindings.effective_dma.iommu_required);
+        assert!(!empty.bindings.effective_dma.unsupported);
     }
 
     #[test]
@@ -3657,22 +5384,63 @@ mod tests {
     }
 
     fn parse_test_firmware() -> DtbFirmwareInfo {
-        let bytes: &'static [u8] = Box::leak(semantic_blob().into_boxed_slice());
-        parse(Fdt::parse(bytes).expect("test DTB must be valid"))
+        let bytes = semantic_blob();
+        parse(Fdt::parse(&bytes).expect("test DTB must be valid"))
             .expect("test DTB must produce firmware information")
     }
 
     fn parse_test_firmware_from(builder: DtbBuilder) -> DtbFirmwareInfo {
-        let bytes: &'static [u8] = Box::leak(builder.finish().into_boxed_slice());
-        parse(Fdt::parse(bytes).expect("test DTB must be valid"))
+        let bytes = builder.finish();
+        parse(Fdt::parse(&bytes).expect("test DTB must be valid"))
             .expect("test DTB must produce firmware information")
     }
 
     fn parse_test_firmware_result(
         builder: DtbBuilder,
     ) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
-        let bytes: &'static [u8] = Box::leak(builder.finish().into_boxed_slice());
-        parse(Fdt::parse(bytes).expect("test DTB must be valid"))
+        let bytes = builder.finish();
+        parse(Fdt::parse(&bytes).expect("test DTB must be valid"))
+    }
+
+    fn cpu_tree_builder() -> DtbBuilder {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[2]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.begin_node("cpus");
+        builder.property("#address-cells", &cells(&[1]));
+        builder.property("#size-cells", &cells(&[0]));
+        builder
+    }
+
+    fn add_test_cpu(
+        builder: &mut DtbBuilder,
+        reg: u32,
+        phandle: u32,
+        capacity: Option<u32>,
+        interrupt_controllers: &[u32],
+    ) {
+        builder.begin_node(&alloc::format!("cpu@{reg:x}"));
+        builder.property("device_type", b"cpu\0");
+        builder.property("compatible", b"test,cpu\0");
+        builder.property("reg", &cells(&[reg]));
+        builder.property("phandle", &cells(&[phandle]));
+        if let Some(capacity) = capacity {
+            builder.property("capacity-dmips-mhz", &cells(&[capacity]));
+        }
+        for (index, phandle) in interrupt_controllers.iter().copied().enumerate() {
+            builder.begin_node(&alloc::format!("interrupt-controller{index}"));
+            builder.property("interrupt-controller", &[]);
+            builder.property("#interrupt-cells", &cells(&[1]));
+            builder.property("phandle", &cells(&[phandle]));
+            builder.end_node();
+        }
+        builder.end_node();
+    }
+
+    fn finish_cpu_tree(builder: &mut DtbBuilder) {
+        builder.end_node();
+        builder.end_node();
     }
 
     fn basic_platform_tree() -> DtbBuilder {

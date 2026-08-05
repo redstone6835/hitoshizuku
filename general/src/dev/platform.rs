@@ -12,6 +12,7 @@ use core::any::Any;
 use crate::dev::dma::DmaContext;
 #[cfg(test)]
 use crate::dev::dma::{DmaBouncePolicy, DmaConstraints};
+use crate::dev::dt_provider::{self, DtbProviderError, DtbResourceLease};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine};
 use crate::dev::pnp::{
     BusType, PNP_DEVICES, PNP_DRIVERS, PlatformIdentity, PlatformIdentityIrqAttributes,
@@ -19,7 +20,9 @@ use crate::dev::pnp::{
     PlatformIdentityMatchId, PlatformIdentityResource, PnpBusInfo, PnpDevice, PnpError, PnpId,
     PnpState,
 };
-use crate::firmware::dtb::{DtbPlatformBindings, DtbProviderReference};
+use crate::firmware::dtb::{
+    DtbNodeInfo, DtbPcieHostInfo, DtbPlatformBindings, DtbProviderReference,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceMatchId {
@@ -193,6 +196,8 @@ pub enum PlatformIrqRegistrationError {
 pub struct DeviceProperties {
     pub clock_hz: Option<u32>,
     pub baud: Option<u32>,
+    /// 固件描述的 NUMA node ID；没有拓扑信息时保持 `None`。
+    pub numa_node_id: Option<u32>,
     /// 固件节点 phandle。DTB interrupt-controller driver 用它注册 IRQ domain；
     /// 没有 phandle 的固件来源保持 `None`。
     pub fw_phandle: Option<u32>,
@@ -349,6 +354,10 @@ pub struct PlatformDeviceInfo {
     pub fw_parent_path: Option<Box<str>>,
     pub ids: Vec<DeviceMatchId>,
     pub resources: Vec<DeviceResource>,
+    /// 与 IRQ 资源按声明顺序一一对应的 `interrupt-names`。
+    ///
+    /// ACPI 或未声明名称的 DT 节点使用空槽；查询接口不会从原始属性重新解析。
+    pub irq_names: Vec<Option<Box<str>>>,
     pub properties: DeviceProperties,
     pub fw_properties: Vec<FirmwareProperty>,
     /// 枚举阶段已按固件父链固化的 per-device DMA 上下文。
@@ -358,6 +367,17 @@ pub struct PlatformDeviceInfo {
     /// ACPI 等其它固件来源保持 `None`。驱动应优先消费这里的 typed 关系，仅在
     /// 尚未纳入标准解码的 vendor binding 上读取 `fw_properties` 原始字节。
     pub dtb_bindings: Option<DtbPlatformBindings>,
+    /// 与该 platform 节点同路径的规范化 DT PCI host 描述。
+    ///
+    /// 只有 `pci-host-*-generic` 节点设置该字段；ELM 驱动不需要重新切片原始
+    /// `ranges`、`interrupt-map`、`msi-map` 或 DMA/IOMMU 属性。
+    pub dtb_pcie_host: Option<DtbPcieHostInfo>,
+    /// 由该 platform 节点负责枚举的 DT 子树快照。
+    ///
+    /// 快照包含节点自身，以及不属于任何更深层 platform 设备的后代。专用总线
+    /// controller 因而能在 live overlay 提交前枚举候选 I2C/SPI/MDIO 子设备，
+    /// 不必回读仍指向旧 generation 的全局节点图。
+    pub dtb_owned_nodes: Option<Arc<[DtbNodeInfo]>>,
 }
 
 #[kernel_symbols::export]
@@ -370,6 +390,28 @@ impl PlatformDeviceInfo {
     )]
     pub fn has_id(&self, expected: &str) -> bool {
         self.ids.iter().any(|id| id.matches_str(expected))
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.dtb_pcie_host",
+        contract = "kernel.general.platform-device@2",
+        version = 2,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+            | kernel_symbols::capability::DEVICE_RESOURCE
+    )]
+    pub fn dtb_pcie_host(&self) -> Option<&DtbPcieHostInfo> {
+        self.dtb_pcie_host.as_ref()
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.dtb_owned_nodes",
+        contract = "kernel.general.platform-device@3",
+        version = 3,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+            | kernel_symbols::capability::DEVICE_RESOURCE
+    )]
+    pub fn dtb_owned_nodes(&self) -> Option<&[DtbNodeInfo]> {
+        self.dtb_owned_nodes.as_deref()
     }
 
     #[kernel_symbols::export(
@@ -417,6 +459,21 @@ impl PlatformDeviceInfo {
         self.irq_resources().nth(index)
     }
 
+    /// 按 `interrupt-names` 中的稳定名称返回 IRQ 资源。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.irq_by_name",
+        contract = "kernel.general.platform-device@2",
+        version = 2,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
+    pub fn irq_by_name(&self, name: &str) -> Option<FirmwareIrqResource<'_>> {
+        let index = self
+            .irq_names
+            .iter()
+            .position(|candidate| candidate.as_deref() == Some(name))?;
+        self.irq_at(index)
+    }
+
     #[kernel_symbols::export(
         name = "general.dev.platform.PlatformDeviceInfo.has_irq_resource",
         contract = "kernel.general.platform-device@1",
@@ -448,7 +505,7 @@ impl PlatformDeviceInfo {
         capabilities = kernel_symbols::capability::DEVICE_DMA
     )]
     pub fn dma_context(&self) -> DmaContext {
-        self.dma
+        self.dma.clone()
     }
 
     #[kernel_symbols::export(
@@ -460,6 +517,21 @@ impl PlatformDeviceInfo {
     pub fn resolve_irq_line_at(&self, index: usize) -> Result<IrqLine, PlatformIrqResolveError> {
         let irq = self
             .irq_at(index)
+            .ok_or(PlatformIrqResolveError::NoResource)?;
+        irq.resolve_line()
+            .ok_or(PlatformIrqResolveError::Unresolved)
+    }
+
+    /// 按 `interrupt-names` 名称翻译 IRQ domain。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.resolve_irq_line_by_name",
+        contract = "kernel.general.platform-device@2",
+        version = 2,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
+    pub fn resolve_irq_line_by_name(&self, name: &str) -> Result<IrqLine, PlatformIrqResolveError> {
+        let irq = self
+            .irq_by_name(name)
             .ok_or(PlatformIrqResolveError::NoResource)?;
         irq.resolve_line()
             .ok_or(PlatformIrqResolveError::Unresolved)
@@ -506,6 +578,30 @@ impl PlatformDeviceInfo {
     ) -> Result<IrqHandle, PlatformIrqRegistrationError> {
         let irq_resource = self
             .irq_at(index)
+            .ok_or(PlatformIrqRegistrationError::NoResource)?;
+        let line = irq_resource
+            .resolve_line()
+            .ok_or(PlatformIrqRegistrationError::Unresolved)?;
+        register_firmware_irq_handler(irq_resource, line, handler)
+    }
+
+    /// 使用 `interrupt-names` 指定的固件 IRQ 资源注册 handler。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.register_irq_handler_by_name",
+        contract = "kernel.general.platform-device@2",
+        version = 2,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 3u64
+    )]
+    pub fn register_irq_handler_by_name(
+        &self,
+        name: &str,
+        handler: Arc<dyn IrqHandler>,
+    ) -> Result<IrqHandle, PlatformIrqRegistrationError> {
+        let irq_resource = self
+            .irq_by_name(name)
             .ok_or(PlatformIrqRegistrationError::NoResource)?;
         let line = irq_resource
             .resolve_line()
@@ -626,6 +722,47 @@ impl PlatformDeviceInfo {
     ) -> Option<&DtbProviderReference> {
         self.dtb_references(property)
             .find(|reference| reference.name.as_deref() == Some(name))
+    }
+
+    /// 按同名属性中的声明顺序获取一个 provider 资源。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.acquire_dtb_resource_at",
+        contract = "kernel.general.platform-device@2",
+        version = 2,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn acquire_dtb_resource_at(
+        &self,
+        property: &str,
+        index: usize,
+    ) -> Result<DtbResourceLease, DtbProviderError> {
+        let reference = self
+            .dtb_references(property)
+            .nth(index)
+            .ok_or(DtbProviderError::Invalid)?;
+        dt_provider::acquire_reference(reference)
+    }
+
+    /// 按标准 `*-names` 中的名字获取 provider 资源。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.acquire_named_dtb_resource",
+        contract = "kernel.general.platform-device@2",
+        version = 2,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn acquire_named_dtb_resource(
+        &self,
+        property: &str,
+        name: &str,
+    ) -> Result<DtbResourceLease, DtbProviderError> {
+        let reference = self
+            .dtb_reference_by_name(property, name)
+            .ok_or(DtbProviderError::Invalid)?;
+        dt_provider::acquire_reference(reference)
     }
 
     #[kernel_symbols::export(
@@ -825,6 +962,23 @@ mod tests {
         assert_eq!(info.dtb_references("resets").count(), 0);
     }
 
+    #[test]
+    fn drivers_can_select_interrupts_by_binding_name() {
+        let mut info = platform_info(Vec::new());
+        info.resources = vec![
+            DeviceResource::mmio(0x1000, 0x100),
+            DeviceResource::irq(Some(7), vec![3].into_boxed_slice()),
+            DeviceResource::irq(Some(7), vec![4].into_boxed_slice()),
+        ];
+        info.irq_names = vec![Some("rx".into()), Some("tx".into())];
+
+        let rx = info.irq_by_name("rx").expect("rx IRQ must be named");
+        let tx = info.irq_by_name("tx").expect("tx IRQ must be named");
+        assert_eq!((rx.controller(), rx.cells()), (Some(7), [3].as_slice()));
+        assert_eq!((tx.controller(), tx.cells()), (Some(7), [4].as_slice()));
+        assert!(info.irq_by_name("error").is_none());
+    }
+
     fn firmware_property(name: &str, raw_value: &[u8]) -> FirmwareProperty {
         FirmwareProperty::new(name.into(), raw_value.into())
     }
@@ -836,6 +990,7 @@ mod tests {
             fw_parent_path: None,
             ids: Vec::new(),
             resources: Vec::new(),
+            irq_names: Vec::new(),
             properties: DeviceProperties::default(),
             fw_properties,
             dma: DmaContext::with_constraints(DmaConstraints {
@@ -847,6 +1002,8 @@ mod tests {
                 bounce: DmaBouncePolicy::Disabled,
             }),
             dtb_bindings: None,
+            dtb_pcie_host: None,
+            dtb_owned_nodes: None,
         }
     }
 }
@@ -872,6 +1029,17 @@ pub fn register_and_probe_platform_device(
     let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev))?;
     let dev = registration.device;
     let inserted = registration.inserted;
+    if inserted
+        && let Some(resource) = dev
+            .info
+            .as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .and_then(|info| info.dma.claim_iommu_pnp_resource("platform-iommu-consumer"))
+        && let Err(error) = dev.own_bus_resource(resource)
+    {
+        PNP_DEVICES.remove_exact(&dev);
+        return Err(error);
+    }
 
     match dev.state() {
         PnpState::Bound => {

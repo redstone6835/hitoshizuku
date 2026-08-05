@@ -68,6 +68,21 @@ pub struct MemorySegment {
     pub size: usize,
 }
 
+/// 一段物理内存的 NUMA 归属。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumaMemoryRange {
+    pub range: MemorySegment,
+    pub node_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuddyNumaError {
+    NotInitialized,
+    InvalidRange,
+    ConflictingRange,
+    SegmentBoundaryMismatch,
+}
+
 impl MemorySegment {
     pub const fn end(self) -> usize {
         self.start.saturating_add(self.size)
@@ -306,6 +321,7 @@ struct BuddySegment {
     total_pages: usize,
     max_order: usize,
     fl_type: usize,
+    numa_node_id: Option<u32>,
 }
 
 impl BuddySegment {
@@ -315,6 +331,7 @@ impl BuddySegment {
             total_pages: 0,
             max_order: 0,
             fl_type: VM_FREELIST_DEFAULT,
+            numa_node_id: None,
         }
     }
 }
@@ -521,6 +538,7 @@ impl BuddyAllocator {
                     total_pages,
                     max_order: max_order_for_pages(total_pages),
                     fl_type,
+                    numa_node_id: None,
                 };
                 self.stats.total_pages = self
                     .stats
@@ -690,6 +708,9 @@ impl BuddyAllocator {
             MemoryPlacement::ExactPhys(addr) => self.alloc_pages_exact(addr, order)?,
             MemoryPlacement::LowMem => self
                 .alloc_pages_from_zone(order, VM_FREELIST_DMA)
+                .ok_or(BuddyAllocError::Fragmented)?,
+            MemoryPlacement::NumaNode(node_id) => self
+                .alloc_pages_from_numa(order, node_id)
                 .ok_or(BuddyAllocError::Fragmented)?,
             MemoryPlacement::Any => self.alloc_pages(order).ok_or(BuddyAllocError::Fragmented)?,
         };
@@ -1574,6 +1595,40 @@ impl BuddyAllocator {
     }
 
     fn alloc_from_zone(&mut self, order: usize, fl_type: usize) -> Option<usize> {
+        self.alloc_from_zone_matching(order, fl_type, None)
+    }
+
+    fn alloc_pages_from_numa(&mut self, order: usize, node_id: u32) -> Option<usize> {
+        if !self.initialized || order > MAX_TRACKED_ORDER {
+            return None;
+        }
+
+        self.stats.alloc_requests += 1;
+        if let Some(addr) = self.alloc_from_zone_matching(order, VM_FREELIST_DEFAULT, Some(node_id))
+        {
+            return Some(addr);
+        }
+        if order > 0 && self.reclaim_deferred_order0() != 0 {
+            if let Some(addr) =
+                self.alloc_from_zone_matching(order, VM_FREELIST_DEFAULT, Some(node_id))
+            {
+                return Some(addr);
+            }
+        }
+        if let Some(addr) = self.alloc_from_zone_matching(order, VM_FREELIST_DMA, Some(node_id)) {
+            return Some(addr);
+        }
+
+        self.stats.alloc_failures += 1;
+        None
+    }
+
+    fn alloc_from_zone_matching(
+        &mut self,
+        order: usize,
+        fl_type: usize,
+        numa_node_id: Option<u32>,
+    ) -> Option<usize> {
         for current_order in order..=MAX_TRACKED_ORDER {
             let mut node_addr = self.free_head(fl_type, current_order);
             let mut visited = 0usize;
@@ -1586,6 +1641,14 @@ impl BuddyAllocator {
                 visited += 1;
 
                 let next = node_ref(node_addr).free_next;
+                let matches_numa = numa_node_id.is_none_or(|expected| {
+                    self.segment(node_ref(node_addr).seg_idx as usize)
+                        .is_some_and(|segment| segment.numa_node_id == Some(expected))
+                });
+                if !matches_numa {
+                    node_addr = next;
+                    continue;
+                }
                 if let Some(result) = self.allocate_from_free_node(node_addr, order) {
                     return Some(result);
                 }
@@ -1593,6 +1656,64 @@ impl BuddyAllocator {
             }
         }
         None
+    }
+
+    /// 在初始化完成、开放普通分配前安装 NUMA 物理范围。
+    ///
+    /// 每个 buddy segment 必须完整落在零或一个输入范围内；调用方需在 NUMA bank
+    /// 边界预先切分启动内存段，避免一个伙伴段跨越两个节点。
+    pub fn install_numa_ranges(
+        &mut self,
+        ranges: &[NumaMemoryRange],
+    ) -> Result<(), BuddyNumaError> {
+        if !self.initialized {
+            return Err(BuddyNumaError::NotInitialized);
+        }
+        for (index, range) in ranges.iter().enumerate() {
+            let normalized = normalize_segment(range.range);
+            if normalized.size == 0 || normalized != range.range {
+                return Err(BuddyNumaError::InvalidRange);
+            }
+            for other in &ranges[..index] {
+                let overlap =
+                    range.range.start < other.range.end() && other.range.start < range.range.end();
+                if overlap && range.node_id != other.node_id {
+                    return Err(BuddyNumaError::ConflictingRange);
+                }
+            }
+        }
+
+        for index in 0..self.segment_count {
+            let segment = *self
+                .segment(index)
+                .ok_or(BuddyNumaError::SegmentBoundaryMismatch)?;
+            let mut matched = None;
+            for range in ranges {
+                let overlaps = segment.range.start < range.range.end()
+                    && range.range.start < segment.range.end();
+                if !overlaps {
+                    continue;
+                }
+                if range.range.start > segment.range.start
+                    || range.range.end() < segment.range.end()
+                {
+                    return Err(BuddyNumaError::SegmentBoundaryMismatch);
+                }
+                if matched.is_some_and(|node_id| node_id != range.node_id) {
+                    return Err(BuddyNumaError::ConflictingRange);
+                }
+                matched = Some(range.node_id);
+            }
+            self.segment_mut(index)
+                .ok_or(BuddyNumaError::SegmentBoundaryMismatch)?
+                .numa_node_id = matched;
+        }
+        Ok(())
+    }
+
+    pub fn numa_node_for_addr(&self, addr: usize) -> Option<u32> {
+        let (segment, _) = self.page_location(addr)?;
+        self.segment(segment)?.numa_node_id
     }
 
     fn allocate_from_free_node(&mut self, node_addr: usize, target_order: usize) -> Option<usize> {
@@ -1968,6 +2089,14 @@ impl BuddyAllocator {
             return None;
         }
         Some(unsafe { &*self.segments.add(index) })
+    }
+
+    fn segment_mut(&mut self, index: usize) -> Option<&mut BuddySegment> {
+        if index >= self.segment_count {
+            return None;
+        }
+        // Safety: `&mut self` 保证 segment 表在本次访问期间没有其它别名写入。
+        Some(unsafe { &mut *self.segments.add(index) })
     }
 
     fn page_location(&self, addr: usize) -> Option<(usize, usize)> {

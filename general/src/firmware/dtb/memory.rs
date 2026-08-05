@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use allocator::MemorySegment;
+use allocator::{MemorySegment, NumaMemoryRange, PAGE_SIZE};
 use fdt::{MemoryDescription, NodeId, PhysicalRange, ReservedMemory, ReservedMemoryPlacement};
 
 use crate::StartMemoryRegion;
@@ -35,6 +35,13 @@ pub struct DtbMemoryLayout {
     pub reserved_memory: Vec<DtbResolvedReservedMemory>,
     /// 必须从架构标准线性映射中排除的物理范围。
     pub no_map_segments: Vec<MemorySegment>,
+}
+
+/// 按 NUMA bank 边界切分、可直接交给 buddy 的物理内存布局。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbNumaMemoryLayout {
+    pub usable_segments: Vec<MemorySegment>,
+    pub numa_ranges: Vec<NumaMemoryRange>,
 }
 
 /// DT 内存描述无法转换为当前平台启动布局的原因。
@@ -73,6 +80,12 @@ pub enum DtbMemoryLayoutError {
         range: MemorySegment,
         protected: MemorySegment,
     },
+    /// 两个重叠 memory bank 对同一物理范围声明了不同 NUMA node。
+    ConflictingNumaRange {
+        range: MemorySegment,
+        first: u32,
+        second: u32,
+    },
 }
 
 /// UEFI 内存图没有按 DTSpec 标注静态 reserved-memory 的错误。
@@ -100,6 +113,90 @@ pub fn described_memory_segments(
         }
     }
     normalize_checked(segments)
+}
+
+/// 把最终可用 RAM 按 DT NUMA bank 边界切分，并生成 allocator 标签。
+///
+/// buddy 会继续按 DMA zone 边界切分，但不会跨输入 segment 合并；因此这里必须先
+/// 保留每个 NUMA 边界，确保一个 buddy segment 永远只属于零或一个节点。
+pub fn split_numa_memory_segments(
+    description: &MemoryDescription,
+    usable_segments: Vec<MemorySegment>,
+) -> Result<DtbNumaMemoryLayout, DtbMemoryLayoutError> {
+    let mut tagged = Vec::new();
+    for bank in &description.memory_banks {
+        let Some(node_id) = bank.numa_node_id else {
+            continue;
+        };
+        for &range in &bank.ranges {
+            let native = native_range(range, Some(bank.node), "memory numa-node-id")?;
+            if let Some(range) = page_normalized_segment(native)? {
+                tagged.push(NumaMemoryRange { range, node_id });
+            }
+        }
+    }
+    for index in 0..tagged.len() {
+        for other in &tagged[..index] {
+            if segments_overlap(tagged[index].range, other.range)
+                && tagged[index].node_id != other.node_id
+            {
+                let overlap_start = tagged[index].range.start.max(other.range.start);
+                let overlap_end = tagged[index].range.end().min(other.range.end());
+                return Err(DtbMemoryLayoutError::ConflictingNumaRange {
+                    range: MemorySegment {
+                        start: overlap_start,
+                        size: overlap_end - overlap_start,
+                    },
+                    first: other.node_id,
+                    second: tagged[index].node_id,
+                });
+            }
+        }
+    }
+
+    let mut split = Vec::new();
+    let mut numa_ranges = Vec::new();
+    for segment in usable_segments {
+        let Some(segment) = page_normalized_segment(segment)? else {
+            continue;
+        };
+        let mut boundaries = Vec::from([segment.start, segment.end()]);
+        for range in &tagged {
+            let start = segment.start.max(range.range.start);
+            let end = segment.end().min(range.range.end());
+            if start < end {
+                boundaries.push(start);
+                boundaries.push(end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for pair in boundaries.windows(2) {
+            let range = MemorySegment {
+                start: pair[0],
+                size: pair[1] - pair[0],
+            };
+            if range.size == 0 {
+                continue;
+            }
+            let node_id = tagged
+                .iter()
+                .find(|tagged| {
+                    tagged.range.start <= range.start && tagged.range.end() >= range.end()
+                })
+                .map(|tagged| tagged.node_id);
+            split.push(range);
+            if let Some(node_id) = node_id {
+                numa_ranges.push(NumaMemoryRange { range, node_id });
+            }
+        }
+    }
+
+    Ok(DtbNumaMemoryLayout {
+        usable_segments: split,
+        numa_ranges,
+    })
 }
 
 /// 把 `/chosen/linux,usable-memory-range` 应用到已有 RAM 来源。
@@ -357,6 +454,32 @@ fn native_range(
         .checked_add(size)
         .ok_or(DtbMemoryLayoutError::RangeOverflow { node, property })?;
     Ok(MemorySegment { start, size })
+}
+
+fn page_normalized_segment(
+    segment: MemorySegment,
+) -> Result<Option<MemorySegment>, DtbMemoryLayoutError> {
+    let end =
+        segment
+            .start
+            .checked_add(segment.size)
+            .ok_or(DtbMemoryLayoutError::RangeOverflow {
+                node: None,
+                property: "NUMA memory range",
+            })?;
+    let start = segment
+        .start
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value & !(PAGE_SIZE - 1))
+        .ok_or(DtbMemoryLayoutError::RangeOverflow {
+            node: None,
+            property: "NUMA memory range",
+        })?;
+    let end = end & !(PAGE_SIZE - 1);
+    Ok((start < end).then_some(MemorySegment {
+        start,
+        size: end - start,
+    }))
 }
 
 fn segments_overlap(left: MemorySegment, right: MemorySegment) -> bool {

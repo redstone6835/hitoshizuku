@@ -157,7 +157,8 @@ use slab::SlabAllocator;
 
 pub use buddy::{
     BuddyAllocError as PhysicalAllocError, BuddyAllocator as PhysicalAllocator, BuddyAudit,
-    BuddyAuditFlags, BuddyReclaimStats, BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
+    BuddyAuditFlags, BuddyNumaError, BuddyReclaimStats, BuddySnapshot, BuddyStats, MemorySegment,
+    NumaMemoryRange, PAGE_SIZE,
 };
 pub use error::{
     AddressSpaceError, AllocationError, DeallocationError, InitError, ManagedHandleError,
@@ -605,6 +606,16 @@ impl KernelMemorySubsystem {
                 })
             }
         }
+    }
+
+    /// 给已经初始化的物理段安装 NUMA 标签。
+    pub fn install_numa_ranges(&self, ranges: &[NumaMemoryRange]) -> Result<(), BuddyNumaError> {
+        self.phys.lock().install_numa_ranges(ranges)
+    }
+
+    /// 查询一个已管理物理地址所属的 NUMA node。
+    pub fn physical_numa_node(&self, paddr: usize) -> Option<u32> {
+        self.phys.lock().numa_node_for_addr(paddr)
     }
 
     pub fn init_kheap(&self) {

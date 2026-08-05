@@ -15,7 +15,7 @@ use allocator::{KERNEL_ALLOCATOR, MemorySegment};
 use general::dev::block::BlockDevice;
 use general::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext, DmaWindow};
 use general::dev::enumerate::DEVICES;
-use general::dev::pci::pci_scan_and_register_summary;
+use general::dev::iommu::{self, IommuAttachment, IommuRequester};
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, PlatformDeviceInfo,
     PlatformProbeStatus, register_and_probe_platform_device,
@@ -37,7 +37,7 @@ use log::printk;
 
 use crate::start;
 
-mod pci;
+mod live;
 
 /// DTB 启动路径的主入口。
 ///
@@ -64,6 +64,7 @@ pub fn kernel_start_init(context: &StartContext) {
             err
         )
     });
+    let immutable_live_state = live::ImmutableDtbState::from_firmware(&firmware);
     general::vfs::sysfs::install_device_tree(&dtb).unwrap_or_else(|err| {
         panic!(
             "[kernel-start][dtb] failed to install /sys/firmware Device Tree view: {:?}",
@@ -74,15 +75,25 @@ pub fn kernel_start_init(context: &StartContext) {
         root_compatible,
         cpu_count,
         cpus,
+        numa,
         memory,
         external_initramfs_range,
         mut rng_seed,
         stdout_serial,
         power_controls,
         serial_ports,
+        mut nodes,
         platform_devices,
         pcie_hosts,
     } = firmware;
+    live::scrub_boot_node_graph(&mut nodes);
+    let node_count = nodes.len();
+    general::firmware::dtb::install_node_graph(nodes.clone()).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][dtb] failed to install normalized node graph: {:?}",
+            err
+        )
+    });
 
     // 启动协议决定 RAM 的权威来源：UEFI 必须忽略 DT `/memory`，而直接启动
     // 才使用 DT memory 节点并与架构加载器的白名单求交。chosen 的 kdump 限制
@@ -158,11 +169,15 @@ pub fn kernel_start_init(context: &StartContext) {
             });
     }
     let firmware_dtb::DtbMemoryLayout {
-        usable_segments: memory_segments,
+        usable_segments,
         reserved_segments,
         reserved_memory,
         no_map_segments,
     } = memory_layout;
+    let numa_memory_layout = firmware_dtb::split_numa_memory_segments(&memory, usable_segments)
+        .unwrap_or_else(|err| panic!("[kernel-start][dtb] invalid NUMA memory layout: {:?}", err));
+    let memory_segments = numa_memory_layout.usable_segments;
+    let numa_memory_ranges = numa_memory_layout.numa_ranges;
     if memory_segments.is_empty() {
         panic!("[kernel-start][dtb] DT reservations consume all usable memory");
     }
@@ -230,7 +245,7 @@ pub fn kernel_start_init(context: &StartContext) {
     }
 
     printk!(
-        "[kernel-start][dtb] firmware parsed: root-compatible={} cpu={} memory={} reserved={} reserved-nodes={} no-map={} serial={} platform={} pcie-host={}",
+        "[kernel-start][dtb] firmware parsed: root-compatible={} cpu={} memory={} reserved={} reserved-nodes={} no-map={} serial={} nodes={} platform={} pcie-host={}",
         root_compatible
             .first()
             .map(|value| value.as_ref())
@@ -241,6 +256,7 @@ pub fn kernel_start_init(context: &StartContext) {
         reserved_memory_count,
         no_map_count,
         serial_ports.len(),
+        node_count,
         platform_devices.len(),
         pcie_hosts.len()
     );
@@ -269,6 +285,14 @@ pub fn kernel_start_init(context: &StartContext) {
         .unwrap_or_else(|err| {
             panic!(
                 "[kernel-start][dtb] failed to init physical allocator: {:?}",
+                err
+            )
+        });
+    KERNEL_ALLOCATOR
+        .install_numa_ranges(&numa_memory_ranges)
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][dtb] failed to install allocator NUMA ranges: {:?}",
                 err
             )
         });
@@ -305,24 +329,61 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
+    let cpu_numa_topology: Vec<general::dev::cpu::CpuNumaEntry> = cpus
+        .iter()
+        .filter_map(|cpu| {
+            cpu.numa_node_id
+                .map(|node_id| general::dev::cpu::CpuNumaEntry {
+                    logical_id: cpu.logical_id,
+                    node_id,
+                })
+        })
+        .collect();
+    let cpu_numa_nodes: Vec<u32> = cpu_numa_topology
+        .iter()
+        .map(|entry: &general::dev::cpu::CpuNumaEntry| entry.node_id)
+        .collect();
     let cpu_topology: Vec<_> = cpus
         .into_iter()
         .map(|cpu| general::dev::cpu::CpuTopologyEntry {
             logical_id: cpu.logical_id,
             reg: cpu.reg,
             phandle: cpu.phandle,
+            interrupt_controller_phandles: cpu.interrupt_controller_phandles,
             compatible: cpu
                 .compatible
                 .into_iter()
                 .map(|compatible| compatible.into())
                 .collect(),
             socket_id: cpu.socket_id,
+            cluster_path: cpu.cluster_path,
             core_id: cpu.core_id,
             thread_id: cpu.thread_id,
+            capacity_dmips_mhz: cpu.capacity_dmips_mhz,
         })
         .collect();
     let cpu_topology_count = cpu_topology.len();
     general::dev::cpu::install_topology(cpu_topology);
+    general::dev::cpu::install_numa_topology(cpu_numa_topology);
+    general::dev::numa::install_topology(
+        cpu_numa_nodes,
+        numa.distances
+            .into_iter()
+            .map(|distance| general::dev::numa::NumaDistance {
+                from: distance.from,
+                to: distance.to,
+                distance: distance.distance,
+            })
+            .collect(),
+        numa_memory_ranges
+            .into_iter()
+            .map(|range| general::dev::numa::NumaMemoryRange {
+                start: range.range.start,
+                size: range.range.size,
+                node_id: range.node_id,
+            })
+            .collect(),
+    );
     printk!(
         "[kernel-start][dtb] installed CPU topology: {} CPU node(s)",
         cpu_topology_count
@@ -374,70 +435,65 @@ pub fn kernel_start_init(context: &StartContext) {
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
     let mut registered_platform_nodes = Vec::new();
-    // 中断控制器先注册，普通 platform 设备后注册。控制器之间仍可能存在
-    // `interrupt-parent` 级联关系，例如 PCH PIC → EIOINTC → CPUIC；因此这里对
-    // controller 节点做有限多轮重试，使父 domain 晚于子节点出现在 DTB 文本中
-    // 时也能最终完成绑定。
-    let mut pending_controllers: Vec<usize> = platform_devices
-        .iter()
-        .enumerate()
-        .filter_map(|(index, device)| device.interrupt_controller.then_some(index))
-        .collect();
-    let max_controller_passes = pending_controllers.len();
-    for _ in 0..max_controller_passes {
-        if pending_controllers.is_empty() {
-            break;
-        }
-        let before = pending_controllers.len();
-        let mut retry = Vec::new();
-        for index in pending_controllers {
-            let device = &platform_devices[index];
-            let info = platform_device_info_from_dtb(device, stdout_phys);
-            let outcome = register_platform_device_status(info, "dtb", false);
-            if let Some(pnp_device) = outcome.device {
-                remember_registered_platform_node(
-                    &mut registered_platform_nodes,
-                    &device.path,
-                    device.parent_path.as_deref(),
-                    pnp_device,
-                );
+    // 先建立中断 domain，再建立被其它节点引用的 provider，最后才是普通
+    // consumer。每一层都允许有限多轮重试，因此 DT 文本顺序不会成为驱动绑定
+    // 的隐式约束，provider 之间的级联也能由精确 deferred dependency 解开。
+    for priority in 0..=2 {
+        let mut pending: Vec<usize> = platform_devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, device)| {
+                (platform_probe_priority(device, &platform_devices) == priority).then_some(index)
+            })
+            .collect();
+        let max_passes = pending.len();
+        for _ in 0..max_passes {
+            if pending.is_empty() {
+                break;
             }
-            match outcome.status {
-                PlatformRegisterStatus::Bound => platform_bound += 1,
-                PlatformRegisterStatus::Unbound => {}
-                PlatformRegisterStatus::Deferred | PlatformRegisterStatus::Failed => {
-                    retry.push(index)
+            let before = pending.len();
+            let mut retry = Vec::new();
+            for index in pending {
+                let device = &platform_devices[index];
+                let pcie_host = pcie_hosts
+                    .iter()
+                    .find(|host| host.path.as_ref() == device.path.as_ref());
+                let info = platform_device_info_from_dtb(
+                    device,
+                    stdout_phys,
+                    pcie_host,
+                    &nodes,
+                    &platform_devices,
+                );
+                let outcome = register_platform_device_status(info, "dtb", priority == 2);
+                if let Some(pnp_device) = outcome.device {
+                    remember_registered_platform_node(
+                        &mut registered_platform_nodes,
+                        &device.path,
+                        device.parent_path.as_deref(),
+                        pnp_device,
+                    );
+                }
+                match outcome.status {
+                    PlatformRegisterStatus::Bound => platform_bound += 1,
+                    PlatformRegisterStatus::Unbound => {}
+                    PlatformRegisterStatus::Deferred | PlatformRegisterStatus::Failed => {
+                        retry.push(index)
+                    }
                 }
             }
+            if retry.len() == before {
+                pending = retry;
+                break;
+            }
+            pending = retry;
         }
-        if retry.len() == before {
-            pending_controllers = retry;
-            break;
-        }
-        pending_controllers = retry;
-    }
-    if !pending_controllers.is_empty() {
-        log::debug!(
-            "[kernel-start][dtb] {} interrupt-controller node(s) remained unbound after dependency retries",
-            pending_controllers.len()
-        );
-    }
-    for device in &platform_devices {
-        if device.interrupt_controller {
-            continue;
-        }
-        let info = platform_device_info_from_dtb(device, stdout_phys);
-        let outcome = register_platform_device_status(info, "dtb", true);
-        if let Some(pnp_device) = outcome.device {
-            remember_registered_platform_node(
-                &mut registered_platform_nodes,
-                &device.path,
-                device.parent_path.as_deref(),
-                pnp_device,
+        if !pending.is_empty() {
+            log::debug!(
+                "[kernel-start][dtb] {} priority-{} platform node(s) remained unbound after dependency retries",
+                pending.len(),
+                priority
             );
-        }
-        if outcome.status == PlatformRegisterStatus::Bound {
-            platform_bound += 1;
         }
     }
     let attached_platform_edges = attach_platform_topology(&registered_platform_nodes);
@@ -448,84 +504,24 @@ pub fn kernel_start_init(context: &StartContext) {
         attached_platform_edges
     );
 
-    // 小步骤 5.3 为每个标准化 PCIe host bridge 分别安装 ECAM/IRQ/MSI 路由、
-    // BAR 窗口并扫描其 segment。配置空间回调按 segment+bus-range 分派，多个 host
-    // 不会再互相覆盖全局 ECAM 状态。
+    // PCI host 与其它 platform 设备走同一条 PnP/ELM probe 路径；启动层只确认
+    // 固件是否提供候选节点，不再直接安装 ECAM、分配 BAR 或扫描 endpoint。
     if pcie_hosts.is_empty() {
-        printk!("[kernel-start][dtb] no pcie node in DTB; skipping PCI init");
+        printk!("[kernel-start][dtb] no pcie node in DTB");
     }
-    for host in &pcie_hosts {
-        let host_pnp = registered_platform_node(&registered_platform_nodes, &host.path);
-        if !pci::register_pci_host_bridge(host, host_pnp) {
-            printk!(
-                "[kernel-start][dtb] skipping unusable PCI host {} domain={} bus=[{:#x},{:#x}]",
-                host.path,
-                host.domain,
-                host.bus_start,
-                host.bus_end
-            );
-            continue;
-        }
-        printk!(
-            "[kernel-start][dtb] pcie ECAM {} domain={} phys={:#x} size={:#x} bus=[{:#x},{:#x}] ranges={} msi-map={} msi-parent={} dma-coherent={}",
-            host.path,
-            host.domain,
-            host.ecam_phys,
-            host.ecam_size,
-            host.bus_start,
-            host.bus_end,
-            host.ranges.len(),
-            host.msi_map.len(),
-            host.msi_parents.len(),
-            host.dma_coherent as usize
-        );
-        if !pci::install_ecam(
-            host.domain,
-            host.ecam_phys as u64,
-            host.ecam_size as u64,
-            host.bus_start,
-            host.bus_end,
-            context.address.device_mmio_to_virt,
-        ) {
-            printk!(
-                "[kernel-start][dtb] rejected overlapping or unrepresentable PCI ECAM {}",
-                host.path
-            );
-            continue;
-        }
-        if pci::install_irq_routing(host.domain, host) {
-            printk!(
-                "[kernel-start][dtb] installed PCI IRQ routing: {} map entries",
-                pci::usable_irq_route_count(host)
-            );
-        } else if !host.interrupt_map.is_empty() {
-            printk!(
-                "[kernel-start][dtb] rejected PCI IRQ routing for {}: unsupported pass-thru or unresolved nexus",
-                host.path
-            );
-        }
-        if pci::install_msi_routing(host.domain, host) {
-            printk!(
-                "[kernel-start][dtb] installed PCI MSI routing: {} route(s)",
-                pci::msi_route_count(host)
-            );
-        }
-
-        pci::assign_bars(host);
-
-        let summary = pci_scan_and_register_summary(host.domain, host.bus_start, host.bus_end);
-        printk!(
-            "[kernel-start][dtb] pci scan domain={} bus=[{:#x},{:#x}] registered={} bound={} no-driver={} deferred={} failed={}",
-            host.domain,
-            host.bus_start,
-            host.bus_end,
-            summary.registered,
-            summary.bound,
-            summary.no_driver,
-            summary.deferred,
-            summary.failed
-        );
-    }
+    live::install(
+        immutable_live_state,
+        platform_devices,
+        pcie_hosts,
+        registered_platform_nodes,
+        stdout_phys,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "[kernel-start][dtb] failed to install live DT overlay coordinator: {}",
+            error
+        )
+    });
 
     // 小步骤 5.4 再决定根文件系统的来源。优先级是外部/内建 initramfs，其次才是
     // 已经注册好的块设备根盘。
@@ -680,6 +676,9 @@ fn mount_first_block_root() -> Result<(Arc<Superblock>, &'static str), &'static 
 fn platform_device_info_from_dtb(
     device: &firmware_dtb::DtbPlatformDeviceInfo,
     stdout_phys: Option<usize>,
+    pcie_host: Option<&firmware_dtb::DtbPcieHostInfo>,
+    nodes: &[firmware_dtb::DtbNodeInfo],
+    platform_devices: &[firmware_dtb::DtbPlatformDeviceInfo],
 ) -> PlatformDeviceInfo {
     let ids = device
         .compatible
@@ -697,6 +696,11 @@ fn platform_device_info_from_dtb(
             .iter()
             .map(|irq| DeviceResource::irq(irq.parent, irq.specifier.clone())),
     );
+    let irq_names = device
+        .interrupts
+        .iter()
+        .map(|irq| irq.name.clone())
+        .collect();
     let first_phys = device.reg_ranges.first().map(|range| range.phys_addr);
     let fw_properties = device
         .properties
@@ -714,9 +718,11 @@ fn platform_device_info_from_dtb(
         fw_parent_path: device.parent_path.clone(),
         ids,
         resources,
+        irq_names,
         properties: DeviceProperties {
             clock_hz: device.clock_hz,
             baud,
+            numa_node_id: device.numa_node_id,
             fw_phandle: device.phandle,
             fw_interrupt_parent: device.interrupt_parent,
             interrupt_controller: device.interrupt_controller,
@@ -727,12 +733,47 @@ fn platform_device_info_from_dtb(
             stdout: first_phys == stdout_phys,
         },
         fw_properties,
-        dma: platform_dma_context(&device.bindings.effective_dma),
+        dma: platform_dma_context(device),
         dtb_bindings: Some(device.bindings.clone()),
+        dtb_pcie_host: pcie_host.cloned(),
+        dtb_owned_nodes: Some(Arc::from(
+            nodes
+                .iter()
+                .filter(|node| {
+                    platform_owns_node(device.path.as_ref(), node.path.as_ref(), platform_devices)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )),
     }
 }
 
-fn platform_dma_context(dma: &firmware_dtb::DtbEffectiveDmaInfo) -> DmaContext {
+pub(super) fn platform_owns_node(
+    owner_path: &str,
+    node_path: &str,
+    platform_devices: &[firmware_dtb::DtbPlatformDeviceInfo],
+) -> bool {
+    if !path_is_in(node_path, owner_path) {
+        return false;
+    }
+    !platform_devices.iter().any(|nested| {
+        nested.path.as_ref() != owner_path
+            && path_is_in(nested.path.as_ref(), owner_path)
+            && path_is_in(node_path, nested.path.as_ref())
+    })
+}
+
+fn path_is_in(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn platform_dma_context(device: &firmware_dtb::DtbPlatformDeviceInfo) -> DmaContext {
+    let dma = &device.bindings.effective_dma;
+    let prefer_numa = |context: DmaContext| context.with_preferred_numa_node(device.numa_node_id);
     let constraints = DmaConstraints {
         address_mask: usize::MAX,
         max_segment_size: usize::MAX,
@@ -741,14 +782,43 @@ fn platform_dma_context(dma: &firmware_dtb::DtbEffectiveDmaInfo) -> DmaContext {
         supports_scatter_gather: false,
         bounce: DmaBouncePolicy::Disabled,
     };
-    if dma.iommu_required || dma.unsupported {
-        return DmaContext::blocked(constraints);
+    if dma.unsupported {
+        return prefer_numa(DmaContext::blocked(constraints));
+    }
+
+    let attachments: Vec<IommuAttachment> = device
+        .bindings
+        .references
+        .iter()
+        .filter(|reference| {
+            reference.property.as_ref() == "iommus" && reference.provider_available == Some(true)
+        })
+        .map(|reference| IommuAttachment::new(reference.phandle, reference.args.clone()))
+        .collect();
+    if !attachments.is_empty() {
+        let requester = IommuRequester::platform(platform_requester_id(device));
+        return match iommu::lazy_iommu_context(constraints, requester, attachments) {
+            Ok(context) => prefer_numa(context),
+            Err(error) => {
+                log::error!(
+                    "[kernel-start][dtb] invalid IOMMU attachment for {}: {:?}",
+                    device.path,
+                    error
+                );
+                prefer_numa(DmaContext::blocked(constraints))
+            }
+        };
+    }
+    if dma.iommu_required {
+        // 这里只会剩下需要总线 requester ID 的 generic iommu-map。在专用总线
+        // 把 ID 交给 IOMMU 层之前必须 fail closed，不能猜测 identity DMA。
+        return prefer_numa(DmaContext::blocked(constraints));
     }
     let Some(windows) = dma.windows.as_ref() else {
-        return DmaContext::with_constraints(constraints);
+        return prefer_numa(DmaContext::with_constraints(constraints));
     };
     if windows.is_empty() {
-        return DmaContext::with_constraints(constraints);
+        return prefer_numa(DmaContext::with_constraints(constraints));
     }
     let windows: Vec<DmaWindow> = windows
         .iter()
@@ -758,8 +828,67 @@ fn platform_dma_context(dma: &firmware_dtb::DtbEffectiveDmaInfo) -> DmaContext {
             size: window.size,
         })
         .collect();
-    let windows: &'static [DmaWindow] = Box::leak(windows.into_boxed_slice());
-    DmaContext::with_windows(constraints, windows)
+    prefer_numa(DmaContext::with_owned_windows(
+        constraints,
+        Arc::from(windows.into_boxed_slice()),
+    ))
+}
+
+fn platform_requester_id(device: &firmware_dtb::DtbPlatformDeviceInfo) -> u64 {
+    if let Some(phandle) = device.phandle {
+        return u64::from(phandle);
+    }
+
+    // phandle 不是 platform 节点的必选属性。对这类 consumer 使用拥有型绝对路径
+    // 的稳定 FNV-1a 身份，并置顶位与 32-bit phandle 命名空间分离。
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in device.path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (1u64 << 63) | (hash & !(1u64 << 63))
+}
+
+pub(super) fn platform_probe_priority(
+    device: &firmware_dtb::DtbPlatformDeviceInfo,
+    devices: &[firmware_dtb::DtbPlatformDeviceInfo],
+) -> u8 {
+    if device.interrupt_controller {
+        return 0;
+    }
+    let referenced = devices.iter().any(|consumer| {
+        consumer.bindings.references.iter().any(|reference| {
+            reference.provider_available == Some(true)
+                && (reference.provider_path.as_deref() == Some(device.path.as_ref())
+                    || device
+                        .phandle
+                        .is_some_and(|phandle| reference.phandle == phandle))
+        })
+    });
+    let declares_provider = device.properties.iter().any(|property| {
+        matches!(
+            property.name.as_ref(),
+            "#clock-cells"
+                | "#reset-cells"
+                | "#dma-cells"
+                | "#iommu-cells"
+                | "#phy-cells"
+                | "#power-domain-cells"
+                | "#interconnect-cells"
+                | "#pwm-cells"
+                | "#mbox-cells"
+                | "#io-channel-cells"
+                | "#thermal-sensor-cells"
+                | "#sound-dai-cells"
+                | "#msi-cells"
+                | "#gpio-cells"
+        )
+    });
+    if referenced || declares_provider {
+        1
+    } else {
+        2
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,16 +927,6 @@ fn remember_registered_platform_node(
         parent_path: parent_path.map(Into::into),
         device,
     });
-}
-
-fn registered_platform_node(
-    nodes: &[RegisteredPlatformNode],
-    path: &str,
-) -> Option<Arc<PnpDevice>> {
-    nodes
-        .iter()
-        .find(|node| node.path.as_ref() == path)
-        .map(|node| Arc::clone(&node.device))
 }
 
 fn register_platform_device_status(
