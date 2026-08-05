@@ -5,8 +5,8 @@ use core::ptr::read_volatile;
 
 use general::dev::irq::{self, IrqError, IrqHandle};
 use general::dev::net::{
-    NetQueueIrqBinding, net_function, queue_irq_control, queue_irq_handler,
-    virtio_mmio_queue_irq, virtio_mmio_queue_irq_event_idx,
+    NetQueueIrqBinding, net_function, queue_irq_control, queue_irq_handler, virtio_mmio_queue_irq,
+    virtio_mmio_queue_irq_event_idx,
 };
 use general::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use general::dev::pnp::{
@@ -14,11 +14,11 @@ use general::dev::pnp::{
     PnpDriver, PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
 use virtio::virtio_mmio::{
-    VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
-    VirtioMmioTransport, detect as detect_virtio_mmio,
+    VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1,
+    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED,
+    VIRTIO_STATUS_FEATURES_OK, VirtioMmioTransport, detect as detect_virtio_mmio,
 };
-use virtio::{SplitVirtQueue, choose_split_queue_size};
+use virtio::{SplitVirtQueue, access_platform_compatible, choose_split_queue_size};
 
 use super::common::{VirtioNetQueue, VirtioNetTransport, install_active};
 
@@ -37,8 +37,11 @@ const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
 const REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
-const OPTIONAL_FEATURES: u64 =
-    VIRTIO_NET_F_CSUM | VIRTIO_NET_F_MTU | VIRTIO_NET_F_STATUS | VIRTIO_F_RING_EVENT_IDX;
+const OPTIONAL_FEATURES: u64 = VIRTIO_NET_F_CSUM
+    | VIRTIO_NET_F_MTU
+    | VIRTIO_NET_F_STATUS
+    | VIRTIO_F_RING_EVENT_IDX
+    | VIRTIO_F_ACCESS_PLATFORM;
 
 fn read_mac(base: usize) -> [u8; 6] {
     let mut mac = [0u8; 6];
@@ -60,7 +63,7 @@ fn read_mtu(base: usize, features: u64) -> u32 {
 
 fn setup_queue(
     transport: &dyn VirtioMmioTransport,
-    context: general::dev::dma::DmaContext,
+    context: &general::dev::dma::DmaContext,
     index: u16,
 ) -> Result<SplitVirtQueue, &'static str> {
     transport.select_queue(index);
@@ -74,7 +77,7 @@ fn setup_queue(
         return Err("VirtIO-net MMIO queue 过小");
     }
     transport.write_queue_size(u32::from(size));
-    let queue = SplitVirtQueue::new_in(context, size)
+    let queue = SplitVirtQueue::new_in(context.clone(), size)
         .map_err(|_| "VirtIO-net MMIO queue DMA 分配失败")?;
     transport.configure_queue_addresses(
         queue.desc_dma_addr() as u64,
@@ -101,6 +104,10 @@ fn probe_queue(
         transport.add_status(VIRTIO_STATUS_FAILED);
         return Err("VirtIO-net 缺少 VERSION_1、MAC 或 MRG_RXBUF feature");
     }
+    if !access_platform_compatible(offered, context.requires_access_platform()) {
+        transport.add_status(VIRTIO_STATUS_FAILED);
+        return Err("VirtIO-net MMIO device cannot honor platform DMA/IOMMU addresses");
+    }
     let accepted = REQUIRED_FEATURES | (offered & OPTIONAL_FEATURES);
     transport.write_driver_features(accepted);
     transport.add_status(VIRTIO_STATUS_FEATURES_OK);
@@ -110,8 +117,8 @@ fn probe_queue(
     }
     let mac = read_mac(base);
     let mtu = read_mtu(base, accepted);
-    let rx = setup_queue(transport.as_ref(), context, 0)?;
-    let tx = setup_queue(transport.as_ref(), context, 1)?;
+    let rx = setup_queue(transport.as_ref(), &context, 0)?;
+    let tx = setup_queue(transport.as_ref(), &context, 1)?;
     let event_idx = accepted & VIRTIO_F_RING_EVENT_IDX != 0;
     let tx_checksum = accepted & VIRTIO_NET_F_CSUM != 0;
     let irq = if event_idx {
@@ -243,10 +250,11 @@ impl PnpDriver for VirtioMmioNetDriver {
             .first_mmio()
             .ok_or_else(|| PnpError::missing(PnpResourceKind::Mmio, "virtio-net MMIO missing"))?;
         let base = (self.device_mmio_to_virt)(physical);
-        let (queue, irq_binding, mac, mtu) = probe_queue(base, info.dma_context()).map_err(|error| {
-            log::error!("[virtio-net] MMIO probe 失败: {}", error);
-            PnpError::hardware_failure("virtio-net MMIO init failed")
-        })?;
+        let (queue, irq_binding, mac, mtu) =
+            probe_queue(base, info.dma_context()).map_err(|error| {
+                log::error!("[virtio-net] MMIO probe 失败: {}", error);
+                PnpError::hardware_failure("virtio-net MMIO init failed")
+            })?;
         let irq_handle = register_irq(info, &irq_binding)?;
         if let Err(kind) = install_active(
             queue,
@@ -254,8 +262,7 @@ impl PnpDriver for VirtioMmioNetDriver {
             queue_irq_control(&irq_binding),
             mac,
             mtu,
-        )
-        {
+        ) {
             let _ = irq::unregister_irq_handler(irq_handle);
             log::error!("[virtio-net] 注册网络设备失败: {:?}", kind);
             return Err(PnpError::registration_failed(
@@ -267,26 +274,44 @@ impl PnpDriver for VirtioMmioNetDriver {
             irq_handle,
             "virtio-net-mmio-irq",
         )) {
-            super::common::remove_active_from_pnp();
+            let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             let _ = irq::unregister_irq_handler(irq_handle);
             return Err(error);
         }
         if let Err(error) = dev.register_function(net_function("eth0")) {
-            super::common::remove_active_from_pnp();
+            let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);
         }
         log::printk!(
             "[virtio-net] MMIO attached eth0 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mtu
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
+            mtu
         );
         Ok(())
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
-        super::common::remove_active_from_pnp();
+        if let Err(error) = self.try_remove(dev) {
+            log::error!(
+                "[virtio-net] MMIO remove failed for {}: {:?}",
+                dev.name,
+                error
+            );
+        }
+    }
+
+    fn try_remove(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        super::common::remove_active_from_pnp()
+            .map_err(|_| PnpError::hardware_failure("virtio-net MMIO remove failed"))?;
         log::printk!("[virtio-net] MMIO removed {}", dev.name);
+        Ok(())
     }
 }
 
