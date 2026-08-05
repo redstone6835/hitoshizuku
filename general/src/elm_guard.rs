@@ -181,15 +181,23 @@ impl ElmTaskExecutionState {
         }
     }
 
-    fn push_context(&self, context: ElmCurrentContext) -> Option<u64> {
+    fn push_context_entry(&self, context: Option<ElmCurrentContext>) -> Option<u64> {
         let mut stack = self.contexts.lock();
         if stack.depth >= ELM_CONTEXT_MAX_DEPTH {
             return None;
         }
         let depth = stack.depth;
-        stack.entries[depth] = Some(context);
+        stack.entries[depth] = context;
         stack.depth = depth + 1;
         Some((depth + 1) as u64)
+    }
+
+    fn push_context(&self, context: ElmCurrentContext) -> Option<u64> {
+        self.push_context_entry(Some(context))
+    }
+
+    fn suspend_context(&self) -> Option<u64> {
+        self.push_context_entry(None)
     }
 
     fn pop_context(&self, token: u64) {
@@ -928,6 +936,18 @@ fn task_context_leave(token: u64) {
     }
 }
 
+fn task_context_suspend() -> Option<u64> {
+    // suspend 只能遮蔽已经存在的任务上下文栈，不能为了建立空边界分配新的
+    // task extension；调用方在本来就没有 ELM owner 时应直接保持常驻路径。
+    current_state_ref()?.suspend_context()
+}
+
+fn task_context_resume(token: u64) {
+    if let Some(state) = current_state_ref() {
+        state.pop_context(token);
+    }
+}
+
 fn task_current_context() -> Option<ElmCurrentContext> {
     current_state_ref()?.current_context()
 }
@@ -935,6 +955,8 @@ fn task_current_context() -> Option<ElmCurrentContext> {
 static TASK_CONTEXT_OPS: ElmCurrentContextOps = ElmCurrentContextOps {
     enter: task_context_enter,
     leave: task_context_leave,
+    suspend: task_context_suspend,
+    resume: task_context_resume,
     current: task_current_context,
 };
 
@@ -954,4 +976,66 @@ fn current_cpu_id() -> usize {
 
 const fn fault_slot(cpu_id: usize, index: usize) -> usize {
     cpu_id * ELM_GUARD_FAULT_RING_PER_CPU + index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ContextStackGuard<'a> {
+        state: &'a ElmTaskExecutionState,
+        token: u64,
+    }
+
+    impl Drop for ContextStackGuard<'_> {
+        fn drop(&mut self) {
+            self.state.pop_context(self.token);
+        }
+    }
+
+    fn test_context(cell: u64, generation: u64) -> ElmCurrentContext {
+        ElmCurrentContext {
+            cell_id: elm_model::ElmId(cell),
+            parent_id: None,
+            generation: elm_model::Generation(generation),
+            state: elm_model::ElmState::Active,
+            phase: elm_model::ElmLifecyclePhase::Initialize,
+            kind: elm_model::ElmKind::Driver,
+            flags: 0,
+            allowed_actions: u32::MAX,
+        }
+    }
+
+    #[test]
+    fn task_context_suspension_marker_restores_outer_on_guard_drop() {
+        let state = ElmTaskExecutionState::new();
+        let outer = test_context(0x7101, 3);
+        let outer_guard = ContextStackGuard {
+            token: state.push_context(outer).unwrap(),
+            state: &state,
+        };
+        assert_eq!(state.current_context(), Some(outer));
+
+        {
+            let _suspension = ContextStackGuard {
+                token: state.suspend_context().unwrap(),
+                state: &state,
+            };
+            assert!(state.current_context().is_none());
+
+            let inner = test_context(0x7102, 9);
+            {
+                let _inner_guard = ContextStackGuard {
+                    token: state.push_context(inner).unwrap(),
+                    state: &state,
+                };
+                assert_eq!(state.current_context(), Some(inner));
+            }
+            assert!(state.current_context().is_none());
+        }
+
+        assert_eq!(state.current_context(), Some(outer));
+        drop(outer_guard);
+        assert!(state.current_context().is_none());
+    }
 }
