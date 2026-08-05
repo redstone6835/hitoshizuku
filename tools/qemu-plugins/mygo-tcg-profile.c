@@ -32,6 +32,7 @@ struct hot_count {
 struct vcpu_counters {
     uint64_t blocks;
     uint64_t instructions;
+    uint64_t active;
 };
 
 struct report_row {
@@ -50,10 +51,15 @@ static atomic_uint_fast64_t occupied_slots;
 static atomic_uint_fast64_t dropped_blocks;
 static atomic_uint_fast64_t collision_probes;
 static atomic_uint_fast64_t max_probe;
+static atomic_uint_fast64_t start_events;
+static atomic_uint_fast64_t stop_events;
 static char *output_path;
 static char target_name[64];
 static int configured_vcpus;
 static unsigned int configured_table_bits;
+static uint64_t profile_start_pc;
+static uint64_t profile_stop_pc;
+static bool windowed;
 
 static uint64_t mix64(uint64_t value)
 {
@@ -135,6 +141,52 @@ static bool parse_table_bits(const char *value, unsigned int *result)
     return true;
 }
 
+static bool parse_u64(const char *value, uint64_t *result)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 0);
+    if (errno != 0 || !value[0] || !end || *end) {
+        return false;
+    }
+    *result = (uint64_t)parsed;
+    return true;
+}
+
+static void start_window(unsigned int vcpu_index, void *userdata)
+{
+    (void)userdata;
+    qemu_plugin_u64_set(counter_entry(offsetof(struct vcpu_counters, active)),
+                        vcpu_index, 1);
+    atomic_fetch_add_explicit(&start_events, 1, memory_order_relaxed);
+}
+
+static void stop_window(unsigned int vcpu_index, void *userdata)
+{
+    (void)userdata;
+    qemu_plugin_u64_set(counter_entry(offsetof(struct vcpu_counters, active)),
+                        vcpu_index, 0);
+    atomic_fetch_add_explicit(&stop_events, 1, memory_order_relaxed);
+}
+
+static void record_windowed_block(unsigned int vcpu_index, void *userdata)
+{
+    uintptr_t packed = (uintptr_t)userdata - 1;
+    size_t index = (size_t)(packed >> 16);
+    uint64_t instruction_count = packed & UINT64_C(0xffff);
+    size_t offset = hot_offset(index);
+
+    qemu_plugin_u64_add(counter_entry(offset + offsetof(struct hot_count, blocks)),
+                        vcpu_index, 1);
+    qemu_plugin_u64_add(
+        counter_entry(offset + offsetof(struct hot_count, instructions)),
+        vcpu_index, instruction_count);
+    qemu_plugin_u64_add(counter_entry(offsetof(struct vcpu_counters, blocks)),
+                        vcpu_index, 1);
+    qemu_plugin_u64_add(counter_entry(offsetof(struct vcpu_counters, instructions)),
+                        vcpu_index, instruction_count);
+}
+
 static void translate_block(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     (void)id;
@@ -174,6 +226,28 @@ static void translate_block(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t offset = hot_offset(index);
     uint64_t instruction_count = qemu_plugin_tb_n_insns(tb);
     atomic_fetch_add_explicit(&translated_blocks, 1, memory_order_relaxed);
+    if (windowed) {
+        if (pc == profile_start_pc) {
+            qemu_plugin_register_vcpu_tb_exec_cb(tb, start_window,
+                                                 QEMU_PLUGIN_CB_NO_REGS, NULL);
+            return;
+        }
+        if (pc == profile_stop_pc) {
+            qemu_plugin_register_vcpu_tb_exec_cb(tb, stop_window,
+                                                 QEMU_PLUGIN_CB_NO_REGS, NULL);
+            return;
+        }
+        if (instruction_count > UINT16_MAX) {
+            atomic_fetch_add_explicit(&dropped_blocks, 1, memory_order_relaxed);
+            return;
+        }
+        uintptr_t packed = ((uintptr_t)index << 16) | (uintptr_t)instruction_count;
+        qemu_plugin_register_vcpu_tb_exec_cond_cb(
+            tb, record_windowed_block, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_COND_NE,
+            counter_entry(offsetof(struct vcpu_counters, active)), 0,
+            (void *)(packed + 1));
+        return;
+    }
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_ADD_U64,
         counter_entry(offset + offsetof(struct hot_count, blocks)), 1);
@@ -266,6 +340,7 @@ static void write_report(qemu_plugin_id_t id, void *userdata)
 
     uint64_t total_blocks = 0;
     uint64_t total_instructions = 0;
+    uint64_t active_at_exit = 0;
     unsigned int active_vcpus = 0;
     for (unsigned int cpu = 0; cpu < (unsigned int)configured_vcpus; ++cpu) {
         uint64_t blocks = qemu_plugin_u64_get(
@@ -274,6 +349,8 @@ static void write_report(qemu_plugin_id_t id, void *userdata)
             counter_entry(offsetof(struct vcpu_counters, instructions)), cpu);
         total_blocks += blocks;
         total_instructions += instructions;
+        active_at_exit += qemu_plugin_u64_get(
+            counter_entry(offsetof(struct vcpu_counters, active)), cpu);
         if (blocks || instructions) {
             ++active_vcpus;
         }
@@ -281,6 +358,7 @@ static void write_report(qemu_plugin_id_t id, void *userdata)
 
     struct report_row *rows = calloc(MAX_REPORT_ROWS, sizeof(*rows));
     size_t count = 0;
+    uint64_t omitted_hotspots = 0;
     if (!rows) {
         atomic_fetch_add_explicit(&dropped_blocks, 1, memory_order_relaxed);
     } else {
@@ -301,20 +379,27 @@ static void write_report(qemu_plugin_id_t id, void *userdata)
                 rows[count] = row;
                 heap_sift_up(rows, count);
                 ++count;
-            } else if (row_is_lower_priority(&rows[0], &row)) {
-                rows[0] = row;
-                heap_sift_down(rows, count, 0);
+            } else {
+                /* 报告截断同样是不完整采样，必须通过 dropped 使消费者失败。 */
+                ++omitted_hotspots;
+                if (row_is_lower_priority(&rows[0], &row)) {
+                    rows[0] = row;
+                    heap_sift_down(rows, count, 0);
+                }
             }
         }
         qsort(rows, count, sizeof(*rows), compare_rows);
     }
 
-    uint64_t dropped = atomic_load_explicit(&dropped_blocks, memory_order_relaxed);
+    uint64_t dropped =
+        atomic_load_explicit(&dropped_blocks, memory_order_relaxed) + omitted_hotspots;
     fprintf(output,
             "MYGO_TCG_PROFILE version=2 target=%s configured_vcpus=%d active_vcpus=%u "
             "table_bits=%u table_slots=%zu table_probes=%u counter_bytes_per_vcpu=%zu "
             "translated_blocks=%llu occupied_slots=%llu dropped=%llu collision_probes=%llu "
-            "max_probe=%llu total_blocks=%llu total_instructions=%llu reported_hotspots=%zu\n",
+            "max_probe=%llu total_blocks=%llu total_instructions=%llu reported_hotspots=%zu "
+            "windowed=%u start_pc=0x%llx stop_pc=0x%llx start_events=%llu "
+            "stop_events=%llu active_at_exit=%llu\n",
             target_name, configured_vcpus, active_vcpus, configured_table_bits, table_slots,
             TABLE_PROBES, counter_bytes_per_vcpu,
             (unsigned long long)atomic_load_explicit(&translated_blocks, memory_order_relaxed),
@@ -322,7 +407,12 @@ static void write_report(qemu_plugin_id_t id, void *userdata)
             (unsigned long long)dropped,
             (unsigned long long)atomic_load_explicit(&collision_probes, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&max_probe, memory_order_relaxed),
-            (unsigned long long)total_blocks, (unsigned long long)total_instructions, count);
+            (unsigned long long)total_blocks, (unsigned long long)total_instructions, count,
+            windowed ? 1U : 0U, (unsigned long long)profile_start_pc,
+            (unsigned long long)profile_stop_pc,
+            (unsigned long long)atomic_load_explicit(&start_events, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&stop_events, memory_order_relaxed),
+            (unsigned long long)active_at_exit);
     for (unsigned int cpu = 0; cpu < (unsigned int)configured_vcpus; ++cpu) {
         uint64_t blocks = qemu_plugin_u64_get(
             counter_entry(offsetof(struct vcpu_counters, blocks)), cpu);
@@ -354,6 +444,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return 1;
     }
     unsigned int table_bits = DEFAULT_TABLE_BITS;
+    bool have_start_pc = false;
+    bool have_stop_pc = false;
     snprintf(target_name, sizeof(target_name), "%s", info->target_name);
     configured_vcpus = info->system.smp_vcpus;
     for (int index = 0; index < argc; ++index) {
@@ -364,12 +456,25 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             }
         } else if (strncmp(argv[index], "table_bits=", 11) == 0 &&
                    parse_table_bits(argv[index] + 11, &table_bits)) {
+        } else if (strncmp(argv[index], "start_pc=", 9) == 0 && !have_start_pc &&
+                   parse_u64(argv[index] + 9, &profile_start_pc)) {
+            have_start_pc = true;
+        } else if (strncmp(argv[index], "stop_pc=", 8) == 0 && !have_stop_pc &&
+                   parse_u64(argv[index] + 8, &profile_stop_pc)) {
+            have_stop_pc = true;
         } else {
             fprintf(stderr, "mygo tcg profile: invalid option: %s\n", argv[index]);
             release_resources();
             return 1;
         }
     }
+    if (have_start_pc != have_stop_pc ||
+        (have_start_pc && profile_start_pc == profile_stop_pc)) {
+        fprintf(stderr, "mygo tcg profile: start_pc/stop_pc must be a distinct pair\n");
+        release_resources();
+        return 1;
+    }
+    windowed = have_start_pc;
     if (!configure_table(table_bits)) {
         fprintf(stderr, "mygo tcg profile: cannot allocate %u-bit hot table\n", table_bits);
         release_resources();

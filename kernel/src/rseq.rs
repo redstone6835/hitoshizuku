@@ -76,7 +76,17 @@ pub(crate) fn prepare_user_return(task: &Arc<Task>, user_ctx: UserContextRef) ->
     let Some((registration, events)) = task.pending_rseq_work() else {
         return Ok(());
     };
+    prepare_user_return_slow(task, user_ctx, registration, events)
+}
 
+#[cold]
+#[inline(never)]
+fn prepare_user_return_slow(
+    task: &Arc<Task>,
+    user_ctx: UserContextRef,
+    registration: sched::RseqRegistration,
+    events: sched::RseqEvents,
+) -> Result<(), Errno> {
     let cs_ptr_addr = registration
         .ptr
         .checked_add(RSEQ_CS_PTR_OFFSET)

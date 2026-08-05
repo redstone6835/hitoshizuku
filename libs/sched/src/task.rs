@@ -932,7 +932,8 @@ impl Task {
     /// 调用方负责在返回 `Arc` 之后把它登记进父的 `children` 与组成员表。
     ///
     /// `creds` / `shared_signal` 默认从 `thread_group` 复制：thread group 内
-    /// 必然共享 shared_signal。不同共享策略由调用方创建不同的 ThreadGroup。
+    /// 必然共享 shared_signal；新进程需要不同共享状态时应在创建任务前构造
+    /// 对应的 `ThreadGroup`。
     pub fn new(
         params: SchedParams,
         parent: Weak<Task>,
@@ -1050,6 +1051,7 @@ impl Task {
         task
     }
 
+    #[inline]
     pub fn state(&self) -> TaskState {
         TaskState::from_u8(self.state.load(Ordering::Acquire))
     }
@@ -1079,8 +1081,7 @@ impl Task {
             return false;
         }
         self.execution_actions.store(0, Ordering::Relaxed);
-        self.execution_scope
-            .store(kind as u8, Ordering::Relaxed);
+        self.execution_scope.store(kind as u8, Ordering::Relaxed);
         true
     }
 
@@ -1343,6 +1344,7 @@ impl Task {
     pub(crate) fn publish_group_exit_wakeup(&self) {
         if self.is_user_task() {
             self.group_exit_requested.store(true, Ordering::SeqCst);
+            self.signal.mark_user_return_work();
         }
     }
 
@@ -1500,6 +1502,8 @@ impl Task {
                 }
             }
         }
+
+        self.signal.mark_user_return_work();
 
         self.wait_stop_sig
             .store(sig.raw() as i32, Ordering::Release);
@@ -1776,7 +1780,8 @@ impl Task {
 
     /// 任务在根 ns 中的 pid 快照。热路径使用，避免只读查询进入亲缘锁。
     pub fn pid_root_cached(&self) -> Option<PidT> {
-        let pid = self.root_pid_cache.load(Ordering::Acquire);
+        // PID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
+        let pid = self.root_pid_cache.load(Ordering::Relaxed);
         if pid > crate::pid::PID_INVALID {
             Some(pid)
         } else {
@@ -1790,8 +1795,10 @@ impl Task {
         }
     }
 
+    #[inline]
     pub fn tgid_cached(&self) -> Option<PidT> {
-        let pid = self.tgid_cache.load(Ordering::Acquire);
+        // TGID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
+        let pid = self.tgid_cache.load(Ordering::Relaxed);
         if pid > crate::pid::PID_INVALID {
             Some(pid)
         } else {
@@ -1823,8 +1830,18 @@ impl Task {
         Arc::clone(&self.shared_signal)
     }
 
+    #[inline]
     pub fn shared_signal_pending_bits_quick(&self) -> u64 {
         self.shared_signal.pending_snapshot().raw()
+    }
+
+    /// 当前任务是否存在未被 signal mask 屏蔽的待投递信号。
+    #[inline]
+    pub fn has_deliverable_signal(&self) -> bool {
+        let blocked = self.signal.blocked_snapshot().raw();
+        let pending = self.signal.pending_snapshot().raw();
+        let shared = self.shared_signal.pending_snapshot().raw();
+        (pending | shared) & !blocked != 0
     }
 
     /// exit 时给父发的信号号码（0 表示不发）。
@@ -1918,11 +1935,57 @@ impl Task {
     pub fn mark_rseq_event(&self, event: RseqEvent) {
         if self.rseq_registered() {
             self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
+            self.signal.mark_user_return_work();
         }
     }
 
     pub fn rseq_events(&self) -> RseqEvents {
         RseqEvents::from_bits(self.rseq_events.load(Ordering::Acquire))
+    }
+
+    /// 发布本任务存在返回用户态前必须处理的工作。
+    #[inline]
+    pub(crate) fn mark_user_return_work(&self) {
+        self.signal.mark_user_return_work();
+    }
+
+    /// Linux `thread_info.flags` 风格的无工作热路径读取。
+    #[inline(always)]
+    pub fn user_return_work_hint_relaxed(&self) -> bool {
+        self.signal.user_return_work_pending_relaxed()
+    }
+
+    /// 慢路径进入时与任务工作生产者建立 Acquire/Release 同步。
+    #[inline]
+    pub fn user_return_work_hint_acquire(&self) -> bool {
+        self.signal.user_return_work_pending_acquire()
+    }
+
+    /// 重新扫描任务返回工作的权威状态。
+    #[inline]
+    fn user_return_work_authoritative(&self) -> bool {
+        self.group_exit_boundary_pending()
+            || self.has_deliverable_signal()
+            || !self.rseq_events().is_empty()
+            || matches!(
+                self.state(),
+                TaskState::Stopped | TaskState::Continued | TaskState::Zombie | TaskState::Dead
+            )
+    }
+
+    /// 清除并重建任务级粘性 hint。
+    ///
+    /// 本函数只允许在返回用户态慢路径调用。先用 AcqRel swap 清零，再读取权威
+    /// 状态；并发生产者若发生在 swap 前，其 Release 与 swap 配对，若发生在
+    /// swap 后则会留下新的 true，因此不会出现永久漏工作。
+    #[inline]
+    pub fn refresh_user_return_work_hint(&self) -> bool {
+        let _ = self.signal.take_user_return_work();
+        let pending = self.user_return_work_authoritative();
+        if pending {
+            self.signal.mark_user_return_work();
+        }
+        pending || self.signal.user_return_work_pending_acquire()
     }
 
     pub fn clear_rseq_events(&self, events: RseqEvents) {

@@ -113,27 +113,27 @@ pub use sched_class::{
 #[cfg(feature = "performance-profile")]
 pub use scheduler::current_task_epoch;
 pub use scheduler::{
-    DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
-    reserve_deadline_observer_id,
-};
-pub use scheduler::{
-    NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask, balance_once,
-    current_cpu_id, current_task, current_task_cpu_time_ns, current_task_direct, current_task_fast,
-    current_task_fast_direct, current_task_handoff_target, current_task_id, current_task_on,
-    current_task_ref,
-    defer_task_wake, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
+    BorrowedCurrentTask, NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask,
+    balance_once, borrow_current_task_internal, current_cpu_id, current_task,
+    current_task_cpu_time_ns, current_task_direct, current_task_fast, current_task_fast_direct,
+    current_task_fast_internal, current_task_handoff_target, current_task_id, current_task_on,
+    current_task_ref, defer_task_wake, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
     enqueue_task_deferred, enqueue_task_preferred, enqueue_task_preferred_for_handoff,
     enqueue_task_with_hint, group_exit_wakeup, idle_task, init, init_task, install_idle,
-    is_cpu_active, is_cpu_online, is_ready, is_ready_direct, mark_cpu_online, migrate_task,
-    needs_resched, needs_resched_current, now_ns_direct, now_ns_public, offline_cpu, on_timer_tick,
-    online_cpu_mask, pid_count,
-    preempt_if_needed, register_cpu, register_sleep_deadline, reprogram_current_deadline,
-    request_balance, request_post_syscall_handoff, request_post_syscall_handoff_to,
-    request_resched, root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy,
-    sched_rr_timeslice_ms, sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us,
-    schedule_once, scheduler_diag, set_realtime_itimer, set_sched_rr_timeslice_ms,
-    set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for,
-    supported_cpu_mask, try_current_task_ref,
+    is_cpu_active, is_cpu_online, is_ready, is_ready_direct, is_ready_internal, mark_cpu_online,
+    migrate_task, needs_resched, needs_resched_current, now_ns_direct, now_ns_public, offline_cpu,
+    on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, refresh_user_return_work_on,
+    register_cpu, register_sleep_deadline, reprogram_current_deadline, request_balance,
+    request_post_syscall_handoff, request_post_syscall_handoff_to, request_resched, root_pid_ns,
+    run_post_syscall_handoff, run_post_syscall_handoff_lazy, sched_rr_timeslice_ms,
+    sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag,
+    set_realtime_itimer, set_sched_rr_timeslice_ms, set_sched_rt_period_us,
+    set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for, supported_cpu_mask,
+    try_current_task_ref, user_return_work_pending_on,
+};
+pub use scheduler::{
+    DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
+    reserve_deadline_observer_id,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};

@@ -56,27 +56,95 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
 }
 
 fn prepare_user_state_for_task(tf_ptr: usize, task: &alloc::sync::Arc<sched::Task>) {
-    let _ = sched::operation::prepare_user_return_for_task(task, sched::UserContextRef::new(tf_ptr));
-}
-
-fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
-    if !from_user || !sched::is_ready_direct() {
-        return;
-    }
-    let task = sched::current_task_fast_direct();
-    prepare_user_state_for_task(tf_ptr, &task);
+    let _ =
+        sched::operation::prepare_user_return_for_task(task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
-            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
-            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}
     }
+}
+
+/// Linux `exit_to_user_mode_loop()` 对应的 RISC-V syscall 返回慢路径。
+///
+/// 热路径只对 task/CPU 两个粘性 hint 做 relaxed 预检；到这里以后使用 Acquire、
+/// 锁和 RMW 消费权威状态，并在可能产生新工作的步骤之间复查。普通无信号、无调度
+/// syscall 不会调用本函数。
+#[cold]
+#[inline(never)]
+fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched::Task>) -> bool {
+    let mut require_full_restore = false;
+    loop {
+        let task_work = task.user_return_work_hint_acquire();
+        let cpu_work = crate::riscv64::specific::current_cpu_user_return_work_pending_acquire();
+        if !task_work && !cpu_work {
+            break;
+        }
+
+        if sched::operation::complete_group_exit_if_requested(task) {
+            sched::schedule_once(kernel_timestamp_ns());
+            panic!("[trap][syscall] group-exit task scheduled back unexpectedly");
+        }
+
+        if cpu_work {
+            // 与 Linux exit_to_user_mode_loop() 相同，先处理调度工作；任务即使在
+            // 此处迁移，后续 task hint 仍随 Task 保留，CPU hint 则由新 HartLocal
+            // 指向新 CPU 的稳定聚合字。
+            require_full_restore = true;
+            sched::run_post_syscall_handoff_lazy();
+            if sched::needs_resched_current() {
+                sched::preempt_if_needed(kernel_timestamp_ns());
+            }
+        }
+
+        if task.has_deliverable_signal() {
+            // 用户 handler 会改写 SP 和 callee-saved GPR；即使本次是 Ignore/Default，
+            // 信号路径也是冷路径，保守使用完整恢复不会影响普通 syscall。
+            require_full_restore = true;
+            let _ = sched::operation::deliver_pending_signals_for_task(
+                task,
+                sched::UserContextRef::new(tf_ptr),
+            );
+        }
+
+        if matches!(
+            task.state(),
+            sched::TaskState::Stopped
+                | sched::TaskState::Continued
+                | sched::TaskState::Zombie
+                | sched::TaskState::Dead
+        ) {
+            require_full_restore = true;
+        }
+        prepare_user_state_for_task(tf_ptr, task);
+
+        // 先清粘性 hint，再以 Acquire 重新读取权威字段。生产者若与清除并发，
+        // 要么被 swap 获取，要么在 swap 后留下新的 true，不会永久漏工作。
+        let task_pending = task.refresh_user_return_work_hint();
+        let cpu_pending =
+            sched::refresh_user_return_work_on(crate::riscv64::specific::current_cpu_id());
+        // task/CPU 是两个独立聚合字。先复查 CPU，最后再复查不一定伴随 IPI 的
+        // task hint，避免它在两次 refresh 之间置位却被本轮错误跳过。
+        let cpu_rearmed = crate::riscv64::specific::current_cpu_user_return_work_pending_acquire();
+        let task_rearmed = task.user_return_work_hint_acquire();
+        if !task_pending && !cpu_pending && !cpu_rearmed && !task_rearmed {
+            break;
+        }
+    }
+    require_full_restore
+}
+
+fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready_internal() {
+        return;
+    }
+    let task = sched::borrow_current_task_internal();
+    prepare_user_state_for_task(tf_ptr, task.as_arc());
 }
 
 /// 在从用户态 trap 返回前投递异步信号。
@@ -85,24 +153,22 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
 /// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。
 fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     prepare_user_state_before_return(tf_ptr, from_user);
-    if !from_user || !sched::is_ready_direct() {
+    if !from_user || !sched::is_ready_internal() {
         return;
     }
-    let task = sched::current_task();
+    let task = sched::borrow_current_task_internal();
     if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
         let _ = sched::operation::deliver_pending_signals_for_task(
-            &task,
+            task.as_arc(),
             sched::UserContextRef::new(tf_ptr),
         );
     }
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
-            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
-            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}
@@ -121,13 +187,6 @@ fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
 
 // Linux RISC-V64 syscall ABI 中会整体替换当前用户上下文的调用。
 const SYS_RT_SIGRETURN: usize = 139;
-const SYS_EXECVE: usize = 221;
-const SYS_EXECVEAT: usize = 281;
-
-#[inline]
-fn rewrites_user_frame(nr: usize) -> bool {
-    matches!(nr, SYS_RT_SIGRETURN | SYS_EXECVE | SYS_EXECVEAT)
-}
 
 /// 对即将返回 U-mode 的架构上下文做最后一道防御性净化。
 ///
@@ -602,43 +661,38 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// signal/resched/frame rewrite 读取不完整状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
-    let (nr, args, original_satp, original_sepc, original_sp, original_switch_sequence) = {
-        let tf = unsafe { trap_frame_ref(tf_ptr) };
-        (
-            tf.a7,
-            [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5],
-            tf.satp,
-            tf.sepc,
-            tf.sp,
-            tf.tval,
-        )
+    let task = unsafe {
+        sched::BorrowedCurrentTask::from_current_raw(crate::riscv64::specific::current_task_ptr())
     };
-    let task = general::syscall::dispatch_fast_with_frame(
+    let (nr, args, original_satp) = {
+        let tf = unsafe { trap_frame_ref(tf_ptr) };
+        (tf.a7, [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5], tf.satp)
+    };
+    #[cfg(feature = "performance-profile")]
+    let original_switch_sequence = unsafe { trap_frame_ref(tf_ptr) }.tval;
+    let dispatch_outcome = general::syscall::dispatch_fast_with_frame(
         general::TrapFramePtr::new(tf_ptr),
         nr,
         args,
+        task.as_arc(),
         |tf, ret| {
             let frame = unsafe { trap_frame_mut(tf.as_usize()) };
             frame.a0 = ret as usize;
             frame.sepc = frame.sepc.wrapping_add(4);
         },
     );
+    let mut require_full_restore = dispatch_outcome.requires_full_restore();
 
-    let mut require_full_restore = rewrites_user_frame(nr);
-    if sched::needs_resched_current() {
-        sched::preempt_if_needed(kernel_timestamp_ns());
-        require_full_restore = true;
+    let task_work = task.user_return_work_hint_relaxed();
+    let cpu_work = crate::riscv64::specific::current_cpu_user_return_work_pending_relaxed();
+    if task_work || cpu_work {
+        require_full_restore |= finish_fast_syscall_return_work(tf_ptr, task.as_arc());
     }
-    prepare_user_state_for_task(tf_ptr, &task);
 
     let frame = unsafe { trap_frame_ref(tf_ptr) };
-    // signal delivery、exec/sigreturn 或其它上下文重写都会改变 PC/SP。最小返回不会
-    // 恢复 s0-s10，因此只有仍保持普通 syscall 收尾形态时才可使用。
-    if frame.sepc != original_sepc.wrapping_add(4) || frame.sp != original_sp {
-        require_full_restore = true;
-    }
     let fs = frame.status & SSTATUS_FS_MASK;
     let vs = frame.status & SSTATUS_VS_MASK;
+    #[cfg(feature = "performance-profile")]
     let switched =
         crate::riscv64::specific::current_context_switch_sequence() != original_switch_sequence;
     #[cfg(feature = "performance-profile")]

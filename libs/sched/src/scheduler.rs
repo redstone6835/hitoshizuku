@@ -18,6 +18,8 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
@@ -258,7 +260,16 @@ fn cpu() -> usize {
 }
 
 fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
-    SCHEDULER.cpu_or_boot(cpu_id).publish_current(task);
+    debug_assert_eq!(cpu_id, cpu(), "publishing current task for a remote CPU");
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let task_ptr = cpu_state.publish_current(task) as usize;
+    let cpu_work_ptr = cpu_state.user_return_work_ptr() as usize;
+    if let Some(trap) = arch_hooks::trap() {
+        // Safety: publish_current 已经让 current/current_raw 持有 task，且该函数
+        // 只在正在完成切换的本 CPU 上发布架构本地指针。CpuSchedState 位于静态
+        // Scheduler 中，其 user_return_work 地址在内核运行期保持稳定。
+        unsafe { (trap.set_current_task)(task_ptr, cpu_work_ptr) };
+    }
     #[cfg(feature = "performance-profile")]
     {
         let epoch = &CURRENT_TASK_EPOCH[cpu_id.min(NR_CPUS - 1)];
@@ -533,15 +544,83 @@ pub fn current_task_ref() -> &'static Task {
     })
 }
 
+/// 当前执行栈对调度器 current 槽中 `Arc<Task>` 的非拥有型视图。
+///
+/// 这等价于 Linux/C 热路径中的 borrowed `current`：构造和析构都不修改强引用
+/// 计数。句柄可以随所属内核栈整体阻塞、迁移和恢复，但不可异步移交给另一执行
+/// 栈或被其它 CPU 并发访问；若对象需要进入等待队列、异步工作或其它拥有型容器，
+/// 调用方必须通过 [`BorrowedCurrentTask::to_arc`] 显式提升。持有借用期间禁止对
+/// 该 Task 使用 `Arc::get_mut/make_mut/try_unwrap/into_inner` 等唯一所有权 API。
+pub struct BorrowedCurrentTask {
+    task: ManuallyDrop<Arc<Task>>,
+    _not_send_or_sync: PhantomData<*mut ()>,
+}
+
+impl BorrowedCurrentTask {
+    /// 从调度器已经持有强引用的 current 裸指针创建借用句柄。
+    ///
+    /// # Safety
+    /// - `ptr` 必须由本 CPU current 槽中的 `Arc::into_raw` 指针镜像得到；
+    /// - 当前内核执行栈结束前，调度器必须持续保证该任务至少有一份强引用；
+    /// - 返回值不得异步移交给另一执行栈或保存到并发上下文。
+    #[inline(always)]
+    pub unsafe fn from_current_raw(ptr: *const Task) -> Self {
+        debug_assert!(!ptr.is_null(), "[sched] borrowed current pointer is null");
+        Self {
+            // Safety: 调用方保证 ptr 来自 current 槽持有的 Arc。ManuallyDrop
+            // 只构造 Arc 的借用视图，绝不会消费该槽拥有的强引用。
+            task: ManuallyDrop::new(unsafe { Arc::from_raw(ptr) }),
+            _not_send_or_sync: PhantomData,
+        }
+    }
+
+    /// 以现有 syscall/调度接口使用的 `&Arc<Task>` 形式借用 current。
+    #[inline(always)]
+    pub fn as_arc(&self) -> &Arc<Task> {
+        &self.task
+    }
+
+    /// 只有跨当前同步执行边界时才取得一份真正拥有的强引用。
+    #[inline]
+    pub fn to_arc(&self) -> Arc<Task> {
+        Arc::clone(self.as_arc())
+    }
+}
+
+impl core::ops::Deref for BorrowedCurrentTask {
+    type Target = Task;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.as_arc()
+    }
+}
+
+/// 通过通用 per-CPU current 槽借用当前任务。
+#[inline]
+pub fn borrow_current_task_internal() -> BorrowedCurrentTask {
+    let id = cpu();
+    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
+    // Safety: current_raw 指向槽位持有的 Arc；句柄不可跨 CPU，当前执行栈在
+    // 调度切走期间本身也持有任务生命周期，恢复后仍回到同一任务。
+    unsafe { BorrowedCurrentTask::from_current_raw(ptr) }
+}
+
 /// 当前 CPU 上正在执行的任务句柄，热路径版本。
 ///
 /// 与 [`current_task`] 语义相同，但不进入 owning current 锁。
+#[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn current_task_fast() -> Arc<Task> {
+    current_task_fast_internal()
+}
+
+/// 内核常驻代码使用的 current 快入口，不经过 ELM 导出包装。
 #[inline]
-pub fn current_task_fast_direct() -> Arc<Task> {
+pub fn current_task_fast_internal() -> Arc<Task> {
     let id = cpu();
     let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
-        panic!("[sched] current_task_fast_direct called before sched::init() on this CPU");
+        panic!("[sched] current_task_fast called before sched::init() on this CPU");
     }
     // Safety: raw 指针由 `Arc::into_raw` 发布且槽位强引用仍有效；先增加强引用，
     // 再用 `from_raw` 接管新增的这一份。
@@ -551,10 +630,10 @@ pub fn current_task_fast_direct() -> Arc<Task> {
     }
 }
 
-/// ELM 模块使用的当前任务导出入口。
-#[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
-pub fn current_task_fast() -> Arc<Task> {
-    current_task_fast_direct()
+/// 兼容现有内核直调入口。
+#[inline]
+pub fn current_task_fast_direct() -> Arc<Task> {
+    current_task_fast_internal()
 }
 
 /// 当前 CPU task 的根 namespace tid；启动早期没有 current 时返回 0。
@@ -687,16 +766,22 @@ pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
     SCHEDULER.cpu(cpu_id)?.idle()
 }
 
-/// 是否已完成 init（避免有人在早期路径误调 current_task）。
-#[inline]
-pub fn is_ready_direct() -> bool {
-    INIT_READY.load(Ordering::Acquire)
-}
-
 /// ELM 模块使用的调度器就绪状态导出入口。
 #[kernel_symbols::export(name = "sched.scheduler.is_ready", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_ready() -> bool {
-    is_ready_direct()
+    is_ready_internal()
+}
+
+/// 内核常驻代码使用的初始化状态快入口，不经过 ELM 导出包装。
+#[inline]
+pub fn is_ready_internal() -> bool {
+    INIT_READY.load(Ordering::Acquire)
+}
+
+/// 兼容现有内核直调入口。
+#[inline]
+pub fn is_ready_direct() -> bool {
+    is_ready_internal()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.online_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
@@ -1282,7 +1367,7 @@ fn restore_unmoved_tasks(
 /// AP 完成 per-CPU 栈、trap、页表和本地数据初始化后调用。
 /// 本 CPU idle task，最后进入 [`cpu_start_scheduling`]。
 pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Errno> {
-    if CpuId::new(cpu_id).is_none() {
+    if CpuId::new(cpu_id).is_none() || cpu_id != cpu() {
         return Err(errno::Errno::EINVAL);
     }
     mark_cpu_online(cpu_id)?;
@@ -1308,11 +1393,44 @@ pub fn needs_resched(cpu_id: usize) -> bool {
         .is_some_and(|cpu_state| cpu_state.needs_resched())
 }
 
+#[inline]
 pub fn needs_resched_current() -> bool {
     if !INIT_READY.load(Ordering::Acquire) {
         return false;
     }
     SCHEDULER.cpu_or_boot(cpu()).needs_resched()
+}
+
+/// RISC-V 返回用户态热路径对本 CPU 调度工作的无栅栏预检。
+///
+/// `cpu_id` 来自架构本地 HartLocal，非零结果只能用于决定进入慢路径；真正消费
+/// timer/handoff/resched 时仍使用原有 Acquire/RMW 接口。
+#[inline(always)]
+pub fn user_return_work_pending_on(cpu_id: usize) -> bool {
+    if cpu_id >= NR_CPUS {
+        return true;
+    }
+    SCHEDULER
+        .cpu_or_boot(cpu_id)
+        .user_return_work_pending_relaxed()
+}
+
+/// 清除并重建指定 CPU 的返回工作 hint。
+///
+/// AcqRel swap 与生产者的 Release fetch_or 配对。并发生产若发生在 swap 前，后续
+/// Acquire 权威复查可见；若发生在 swap 后，生产者留下的 true 不会被覆盖。
+pub fn refresh_user_return_work_on(cpu_id: usize) -> bool {
+    if cpu_id >= NR_CPUS {
+        return true;
+    }
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let _ = cpu_state.take_user_return_work();
+    let pending = DEFERRED_TIMER_TICK_NS[cpu_id].load(Ordering::Acquire) != 0
+        || cpu_state.user_return_work_authoritative();
+    if pending {
+        cpu_state.mark_user_return_work();
+    }
+    pending || cpu_state.user_return_work_pending_acquire()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.request_resched", contract = "kernel.sched.control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
@@ -1512,8 +1630,8 @@ pub fn run_post_syscall_handoff_lazy() {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
-    drain_deferred_timer_tick();
     let cpu_id = cpu();
+    drain_deferred_timer_tick_on(cpu_id);
     if !SCHEDULER.cpu_or_boot(cpu_id).has_post_syscall_handoff() {
         return;
     }
@@ -2212,15 +2330,7 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
         sender_uid: Uid::ROOT,
         raw: None,
     };
-    tg.shared_signal().deliver(info);
-    for task in tg.snapshot() {
-        if !task.signal.blocked_snapshot().has(SignalNumber::SIGALRM)
-            || task.signal.sigtimedwait_wants(SignalNumber::SIGALRM)
-        {
-            signal_wakeup(&task, &info);
-            break;
-        }
-    }
+    deliver_shared_signal_to_group(tg, info);
 }
 
 fn migration_context(
@@ -2632,6 +2742,28 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
 
 // ── 信号唤醒 ─────────────────────────────────────────────────────────────────
 
+/// 向线程组发布共享信号，并为所有用户成员设置任务级返回工作 hint。
+///
+/// 共享 pending 最终只会被一个成员消费。发布与成员修改 blocked mask 没有共同
+/// 锁，因此不能用发布时的 mask 快照筛掉 hint；给全部用户成员置位可封闭并发
+/// unblock 窗口。硬件唤醒仍只发送给第一个当前可投递候选，避免 IPI 风暴。
+pub(crate) fn deliver_shared_signal_to_group(tg: &Arc<ThreadGroup>, info: SigInfo) {
+    tg.shared_signal().deliver(info);
+    let mut woke = false;
+    for task in tg.snapshot() {
+        if task.is_kernel_task() {
+            continue;
+        }
+        task.mark_user_return_work();
+        let eligible = !task.signal.blocked_snapshot().has(info.sig)
+            || task.signal.sigtimedwait_wants(info.sig);
+        if !woke && eligible {
+            signal_wakeup(&task, &info);
+            woke = true;
+        }
+    }
+}
+
 /// 把一条信号投给 `target`，并在可行时把它从 Sleeping 拉回 Runnable。
 ///
 /// 调用方已经把 `info` 放进了 target 的 per-task 或共享 pending 队列，这里
@@ -2647,6 +2779,7 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.sched.on_rq(),
         target.running_cpu(),
     );
+    target.mark_user_return_work();
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;
     }
@@ -2663,6 +2796,14 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.mark_profile_woken(now_ns_internal());
         enqueue_task(Arc::clone(target), now_ns_internal());
     }
+    if let Some(target_cpu) = target.running_cpu() {
+        let target_cpu = target_cpu.min(NR_CPUS - 1);
+        if target_cpu != cpu() {
+            // signal 可能在目标返回用户态的最后一次 flags 读取之后发布；与 Linux
+            // 的 task-work kick 相同，用 resched IPI 封闭这个最终检查窗口。
+            request_resched(target_cpu);
+        }
+    }
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[sched][signal] wake-leave target={:?} signal={:?} state={:?} on_rq={} running_cpu={:?}",
@@ -2672,7 +2813,7 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.sched.on_rq(),
         target.running_cpu(),
     );
-    // Running / Runnable：pending 位已经设好；下一轮 schedule 自然会检查。
+    // Running：远端执行者已收到 resched IPI；Runnable 会在恢复内核栈后检查。
     // Stopped：只有 SIGCONT 可以恢复；其它信号保持 pending。
     // Uninterruptible / Zombie / Dead：什么都不做。
 }
@@ -2699,6 +2840,12 @@ pub fn group_exit_wakeup(target: &Arc<Task>) {
 pub(crate) fn mark_task_stopped(task: &Arc<Task>, sig: SignalNumber) -> bool {
     let removed = dequeue_for_state_change(task, now_ns_internal());
     let stopped = task.mark_stopped(sig);
+    if stopped
+        && let Some(target_cpu) = task.running_cpu()
+        && target_cpu != cpu()
+    {
+        request_resched(target_cpu.min(NR_CPUS - 1));
+    }
     log::debug!(
         "[sched][signal] stop pid={:?} sig={} on_rq={} state={:?}",
         task.pid_root(),
@@ -3011,13 +3158,20 @@ fn targeted_handoff_is_valid(target: &HandoffTarget, cpu_id: usize) -> bool {
 /// 记录一次发生在内核临界区中的 timer tick，等待下一处安全调度边界处理。
 pub fn defer_timer_tick(now_ns: u64) {
     if INIT_READY.load(Ordering::Acquire) {
-        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()], now_ns);
+        let cpu_id = cpu();
+        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id], now_ns);
+        SCHEDULER.cpu_or_boot(cpu_id).mark_user_return_work();
     }
 }
 
 /// 在不持有调度器内部锁的边界消费本 CPU 延迟的 timer tick。
 pub fn drain_deferred_timer_tick() {
-    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    drain_deferred_timer_tick_on(cpu());
+}
+
+#[inline]
+fn drain_deferred_timer_tick_on(cpu_id: usize) {
+    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id]);
     if now_ns != 0 {
         let _ = on_timer_tick_inner(now_ns);
     }
@@ -3042,7 +3196,11 @@ pub(crate) fn record_deferred_timer_tick(slot: &AtomicU64, now_ns: u64) {
 }
 
 pub(crate) fn take_deferred_timer_tick(slot: &AtomicU64) -> u64 {
-    slot.swap(0, Ordering::AcqRel)
+    if slot.load(Ordering::Acquire) == 0 {
+        0
+    } else {
+        slot.swap(0, Ordering::AcqRel)
+    }
 }
 
 fn on_timer_tick_inner(now_ns: u64) -> bool {

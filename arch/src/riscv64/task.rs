@@ -180,6 +180,13 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
 
         // 写 sepc
         "ld t0, {sepc_off}(s11)",
+        // 清除可能由被打断上下文留下的 LR reservation；若 SC 意外成功，写回的
+        // 仍是原 sepc 值，因此 TrapFrame 内容保持不变。
+        "addi t1, s11, {sepc_off}",
+        ".option push",
+        ".option arch, +zalrsc",
+        "sc.d zero, t0, (t1)",
+        ".option pop",
         "csrw {sepc}, t0",
 
         // kstack_top 是由 arch trap 入口或内核上下文构造代码写入的可信返回类型标记：

@@ -12,8 +12,8 @@ use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS, ProcessGroup,
     RobustListState, RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy,
-    Session, SignalNumber, TASK_COMM_LEN, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage,
-    ThreadGroup, supported_cpu_mask,
+    Session, SigInfo, SigProcMaskHow, SigSet, SignalNumber, TASK_COMM_LEN, TASKEXT_VM_SPACE, Task,
+    TaskState, TaskUsage, ThreadGroup, Uid, supported_cpu_mask,
 };
 
 const TEST_EXECUTION_ACTION: u64 = 1;
@@ -166,6 +166,71 @@ fn thread_group_accounting_waits_for_last_member_and_aggregates_usage() {
     );
     assert!(group.try_claim_acct_record());
     assert!(!group.try_claim_acct_record());
+}
+
+#[ktest]
+fn shared_signal_marks_all_members_and_unblock_rearms_delivery() {
+    let group = ThreadGroup::new();
+    let first = make_task_in_group(Arc::clone(&group));
+    let second = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&first);
+    group.add_member(&first);
+    group.add_member(&second);
+
+    let blocked = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    first.signal.block(blocked, SigProcMaskHow::SetMask);
+    second.signal.block(blocked, SigProcMaskHow::SetMask);
+    assert!(!first.refresh_user_return_work_hint());
+    assert!(!second.refresh_user_return_work_hint());
+
+    crate::scheduler::deliver_shared_signal_to_group(
+        &group,
+        SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: Uid::ROOT,
+            raw: None,
+        },
+    );
+    assert!(first.user_return_work_hint_relaxed());
+    assert!(second.user_return_work_hint_relaxed());
+    assert!(!first.refresh_user_return_work_hint());
+    assert!(!second.refresh_user_return_work_hint());
+
+    first.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
+    assert!(first.user_return_work_hint_relaxed());
+    assert!(first.refresh_user_return_work_hint());
+}
+
+#[ktest]
+fn member_joining_after_shared_signal_inherits_return_work_hint() {
+    let group = ThreadGroup::new();
+    crate::scheduler::deliver_shared_signal_to_group(
+        &group,
+        SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: Uid::ROOT,
+            raw: None,
+        },
+    );
+
+    let late = make_task_in_group(Arc::clone(&group));
+    late.signal.block(
+        SigSet::EMPTY.with(SignalNumber::SIGUSR1),
+        SigProcMaskHow::SetMask,
+    );
+    assert!(!late.refresh_user_return_work_hint());
+    assert!(!late.user_return_work_hint_relaxed());
+    group.add_member(&late);
+    assert!(!late.has_deliverable_signal());
+    assert!(late.user_return_work_hint_relaxed());
+
+    late.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
+    assert!(late.has_deliverable_signal());
+    assert!(late.refresh_user_return_work_hint());
 }
 
 #[ktest]
