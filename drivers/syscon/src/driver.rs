@@ -14,7 +14,7 @@ use crate::dev::pnp::{
 };
 use crate::dev::syscon::{self, SysconAccessWidth, SysconDevice, SysconError};
 use crate::firmware::power::{
-    PowerAccessWidth, PowerControlMethod, PowerRegister, PowerRegisterSpace,
+    self, PowerAccessWidth, PowerControlMethod, PowerError, PowerRegister, PowerRegisterSpace,
 };
 
 const COMPAT_SYSCON: &str = "syscon";
@@ -191,6 +191,7 @@ impl PnpDriver for SysconPlatformDriver {
             reg_shift,
             width,
         ));
+        dev.reserve_owned_resources(1)?;
         let handle = syscon::register(syscon).map_err(map_syscon_error)?;
         if let Err(err) = dev.own_resource(syscon::pnp_resource(handle, "platform-syscon")) {
             let _ = syscon::unregister(handle);
@@ -299,13 +300,21 @@ impl PnpDriver for SysconPowerDriver {
             value,
         };
 
-        match action {
+        // 动态 handler 一经登记就会立即成为全局入口；先为其 PnP 所有权预留槽位，
+        // 避免登记成功后因资源 Vec 扩容失败而留下无法随 ELM 撤销的半安装状态。
+        dev.reserve_owned_resources(1)?;
+        let handle = match action {
             SysconPowerAction::Shutdown => {
-                crate::firmware::power::install_shutdown(method, self.device_mmio_to_virt)
+                power::register_shutdown(method, self.device_mmio_to_virt)
             }
-            SysconPowerAction::Reboot => {
-                crate::firmware::power::install_reboot(method, self.device_mmio_to_virt)
-            }
+            SysconPowerAction::Reboot => power::register_reboot(method, self.device_mmio_to_virt),
+        }
+        .map_err(map_power_error)?;
+        if let Err(error) =
+            dev.own_resource(power::pnp_resource(handle, "platform-syscon-power-control"))
+        {
+            let _ = power::unregister(handle);
+            return Err(error);
         }
 
         dev.set_driver_data(Arc::new(SysconPowerBinding {
@@ -383,6 +392,19 @@ fn map_syscon_error(err: SysconError) -> PnpError {
         SysconError::NotFound => {
             PnpError::dependency(crate::dev::pnp::PnpDependency::Other("syscon-registry"))
         }
+    }
+}
+
+fn map_power_error(err: PowerError) -> PnpError {
+    match err {
+        PowerError::OutOfMemory => PnpError::OutOfMemory,
+        PowerError::UnsupportedAddressSpace(_) | PowerError::InvalidRegister => {
+            PnpError::malformed(
+                PnpResourceKind::Other("power-control"),
+                "invalid power method",
+            )
+        }
+        PowerError::NotInstalled | PowerError::NotFound => PnpError::ProbeFailed,
     }
 }
 
