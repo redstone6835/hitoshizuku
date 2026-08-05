@@ -44,12 +44,13 @@ const PRIVATE_FILE_BATCH_MIN_PAGES: usize = 4;
 const PRIVATE_FILE_BATCH_MAX_PAGES: usize = 16;
 /// 限制缺页栈外临时内存；LoongArch 当前 4 KiB 页下对应 16 页。
 const PRIVATE_FILE_BATCH_MAX_BYTES: usize = 64 * 1024;
-/// 私有干净文件页的强缓存上限；在 4 KiB 页配置下约为 512 MiB。
+/// 私有干净文件页的强缓存上限；在 4 KiB 页配置下约为 1 GiB。
 ///
-/// BuildStorm 的工具链和 crate 工作集明显超过 128 MiB；保留更大的有界热集可
-/// 避免在仍有数 GiB 空闲内存时反复从 ext4 重读同一页。物理页分配失败仍会按
-/// 批次回收，因此该预算不会阻塞匿名页和 COW 分配的前进性。
-const PRIVATE_FILE_CACHE_MAX_PAGES: usize = 131_072;
+/// BuildStorm 的完整样本会填满 512 MiB 缓存并在构建结束前触发数万次淘汰；
+/// 保留 1 GiB 的有界热集可覆盖当前工具链工作集，避免仍有数 GiB 空闲内存时
+/// 从 ext4 重读刚淘汰的页。物理页分配失败仍会按批次回收，因此该预算不会阻塞
+/// 匿名页和 COW 分配的前进性。
+const PRIVATE_FILE_CACHE_MAX_PAGES: usize = 262_144;
 /// 独立的私有文件页缓存分片数；32 个分片可覆盖 BuildStorm 的并行 rustc 缺页。
 const PRIVATE_FILE_CACHE_SHARD_COUNT: usize = 32;
 /// 共享加载等待表大小。与 Linux folio wait table 一样用固定哈希桶承载等待者，
