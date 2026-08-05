@@ -1,0 +1,9 @@
+[package]
+name = "platform-riscv-aia-host-tests"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

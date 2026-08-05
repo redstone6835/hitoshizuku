@@ -30,6 +30,8 @@ members = [
 ]
 exclude = [
     "drivers/cfi-flash",
+    "drivers/dt-providers",
+    "drivers/dt-providers/host-tests",
     "drivers/firmware-bus",
     "drivers/fw-cfg",
     "drivers/goldfish-rtc",
@@ -38,7 +40,11 @@ exclude = [
     "drivers/net-stack",
     "drivers/ls7a-rtc",
     "drivers/plic",
+    "drivers/pci-host-ecam",
     "drivers/random",
+    "drivers/riscv-aia",
+    "drivers/riscv-iommu",
+    "drivers/riscv-pmu",
     "drivers/syscon",
     "drivers/uart16550",
     "drivers/virtio",

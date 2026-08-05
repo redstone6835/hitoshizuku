@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod driver;
+mod eio_layout;
 
 use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 use general::dev::pnp::{DriverHandle, PnpError, unregister_driver};

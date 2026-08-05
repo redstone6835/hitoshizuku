@@ -25,6 +25,7 @@ use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDependency, PnpDevice,
     PnpDriver, PnpError, PnpId, PnpResourceKind, register_driver_factory, unregister_driver,
 };
+use crate::eio_layout::EioIntcIocsrWindow;
 
 const COMPAT_LOONGSON_CPUIC: &str = "loongson,cpu-interrupt-controller";
 const COMPAT_LOONGSON_EIOINTC: &str = "loongson,ls2k2000-eiointc";
@@ -46,12 +47,6 @@ const EIOINTC_PACKED_FIELDS_PER_REG: u32 = 4;
 const EIOINTC_PACKED_FIELD_BITS: u32 = 8;
 const EIOINTC_NODEMAP_GROUP_STRIDE_BITS: u32 = 2;
 const EIOINTC_NODEMAP_MIRROR_SHIFT: u32 = 16;
-const EIOINTC_REG_NODEMAP: usize = 0x14a0;
-const EIOINTC_REG_IPMAP: usize = 0x14c0;
-const EIOINTC_REG_ENABLE: usize = 0x1600;
-const EIOINTC_REG_BOUNCE: usize = 0x1680;
-const EIOINTC_REG_ISR: usize = 0x1800;
-const EIOINTC_REG_ROUTE: usize = 0x1c00;
 const EIOINTC_DEFAULT_ROUTE_CPU: u8 = 1;
 const EIOINTC_PROP_ROUTE_CPU: &str = "loongson,eiointc-route-cpu";
 
@@ -66,6 +61,8 @@ const PCH_PIC_REG_AUTO_CTRL1: usize = 0xe0;
 const PCH_PIC_REG_ROUTE: usize = 0x100;
 const PCH_PIC_REG_HTVEC: usize = 0x200;
 const PCH_PIC_REG_POL: usize = 0x3e0;
+/// 覆盖最后一个 polarity 寄存器（offset 0x3e4，32-bit）的最小 MMIO 窗口。
+const PCH_PIC_REQUIRED_MMIO_SIZE: usize = PCH_PIC_REG_POL + 2 * core::mem::size_of::<u32>();
 const PCH_PIC_DEFAULT_ROUTE_TARGET: u8 = 1;
 const PCH_PIC_PROP_BASE_VECTOR: &str = "loongson,pic-base-vec";
 const PCH_PIC_PROP_ROUTE_TARGET: &str = "loongson,pic-route-target";
@@ -130,6 +127,7 @@ impl PnpDriver for LoongsonCpuIrqDriver {
             PnpResourceKind::IrqDomain,
             "cpuic phandle missing",
         ))?;
+        dev.reserve_owned_resources(1)?;
         let handle = irq::register_irq_domain(controller, Arc::new(LoongsonCpuIrqDomain))
             .map_err(map_irq_error)?;
         if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
@@ -186,11 +184,16 @@ impl EioIntcRouteConfig {
 struct EioIntc {
     controller: u32,
     route: EioIntcRouteConfig,
+    registers: EioIntcIocsrWindow,
 }
 
 impl EioIntc {
-    fn new(controller: u32, route: EioIntcRouteConfig) -> Self {
-        Self { controller, route }
+    fn new(controller: u32, route: EioIntcRouteConfig, registers: EioIntcIocsrWindow) -> Self {
+        Self {
+            controller,
+            route,
+            registers,
+        }
     }
 
     fn initialize(&self) -> Result<(), PnpError> {
@@ -207,19 +210,16 @@ impl EioIntc {
         for reg in
             0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG / EIOINTC_PACKED_FIELDS_PER_REG
         {
-            iocsr_write32(EIOINTC_REG_IPMAP + reg as usize * 4, ipmap)?;
+            iocsr_write32(self.registers.ipmap(reg), ipmap)?;
         }
 
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG {
-            iocsr_write32(
-                EIOINTC_REG_NODEMAP + reg as usize * 4,
-                self.route.nodemap_value(reg),
-            )?;
+            iocsr_write32(self.registers.nodemap(reg), self.route.nodemap_value(reg))?;
         }
 
         let route = self.route.route_value();
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_PACKED_FIELDS_PER_REG {
-            iocsr_write32(EIOINTC_REG_ROUTE + reg as usize * 4, route)?;
+            iocsr_write32(self.registers.route(reg), route)?;
         }
         Ok(())
     }
@@ -227,16 +227,15 @@ impl EioIntc {
     fn set_all_vectors_enabled(&self, enabled: bool) -> Result<(), PnpError> {
         let value = if enabled { u32::MAX } else { 0 };
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG {
-            let offset = reg as usize * 4;
-            iocsr_write32(EIOINTC_REG_ENABLE + offset, value)?;
-            iocsr_write32(EIOINTC_REG_BOUNCE + offset, 0)?;
+            iocsr_write32(self.registers.enable(reg), value)?;
+            iocsr_write32(self.registers.bounce(reg), 0)?;
         }
         Ok(())
     }
 
     fn clear_pending(&self) -> Result<(), PnpError> {
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_ISR {
-            iocsr_write64(EIOINTC_REG_ISR + reg as usize * 8, u64::MAX)?;
+            iocsr_write64(self.registers.isr64(reg), u64::MAX)?;
         }
         Ok(())
     }
@@ -247,7 +246,7 @@ impl EioIntc {
         }
         let reg = hwirq / EIOINTC_VECTOR_BITS_PER_REG;
         let bit = hwirq % EIOINTC_VECTOR_BITS_PER_REG;
-        let offset = EIOINTC_REG_ENABLE + reg as usize * 4;
+        let offset = self.registers.enable(reg);
         let Some(mut value) = irq::iocsr_read32(offset) else {
             return false;
         };
@@ -262,7 +261,7 @@ impl EioIntc {
     fn dispatch_pending(&self) -> IrqStatus {
         let mut handled = false;
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_ISR {
-            let offset = EIOINTC_REG_ISR + reg as usize * 8;
+            let offset = self.registers.isr64(reg);
             let Some(mut pending) = irq::iocsr_read64(offset) else {
                 continue;
             };
@@ -384,16 +383,32 @@ impl PnpDriver for EioIntcDriver {
         let route = EioIntcRouteConfig::from_platform(parent_hwi, info).ok_or(
             PnpError::malformed(PnpResourceKind::IrqDomain, "invalid eiointc route"),
         )?;
-        let intc = Arc::new(EioIntc::new(controller, route));
-        intc.initialize()?;
-        let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
-        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
-            domain,
-            "loongson-eiointc-domain",
-        )) {
-            let _ = irq::unregister_irq_domain(domain);
-            return Err(err);
+        // 该 binding 的 `reg` 是 IOCSR 寄存器编号窗口。platform core 只负责保留
+        // DT `reg` tuple，因此这里不做 phys_to_virt，而是由 EIOINTC 布局解释地址。
+        let mut iocsr_resources = info.mmio_resources();
+        let (iocsr_base, iocsr_size) = iocsr_resources.next().ok_or(PnpError::missing(
+            PnpResourceKind::Mmio,
+            "eiointc IOCSR reg missing",
+        ))?;
+        if iocsr_resources.next().is_some() {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Mmio,
+                "eiointc requires exactly one IOCSR reg window",
+            ));
         }
+        let registers = EioIntcIocsrWindow::new(iocsr_base, iocsr_size).map_err(|_| {
+            PnpError::malformed(PnpResourceKind::Mmio, "invalid eiointc IOCSR reg window")
+        })?;
+        if registers.uses_qemu_legacy_route_extension() {
+            log::warning!(
+                "[loongson-eiointc] DT IOCSR window {:#x}+{:#x} omits route table; using QEMU legacy adjacent route extension",
+                registers.base(),
+                registers.declared_size()
+            );
+        }
+        let intc = Arc::new(EioIntc::new(controller, route, registers));
+        intc.initialize()?;
+        dev.reserve_owned_resources(2)?;
         let handler: Arc<dyn IrqHandler> = Arc::new(EioIntcIrqHandler {
             intc: Arc::clone(&intc),
         });
@@ -408,6 +423,16 @@ impl PnpDriver for EioIntcDriver {
             "loongson-eiointc-parent",
         )) {
             let _ = irq::unregister_irq_handler(parent_irq);
+            return Err(err);
+        }
+        // IRQ domain 登记会同步唤醒 deferred consumer；必须等父级级联 handler
+        // 已经可用后再发布 provider，避免 consumer 提前打开子中断却无人分发。
+        let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
+        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
+            domain,
+            "loongson-eiointc-domain",
+        )) {
+            let _ = irq::unregister_irq_domain(domain);
             return Err(err);
         }
         Ok(())
@@ -784,13 +809,31 @@ impl PnpDriver for PchPicDriver {
                 PnpResourceKind::IrqDomain,
                 "pch-pic interrupt-parent missing",
             ))?;
-        let Some((phys, _size)) = info.first_mmio() else {
+        let Some((phys, size)) = info.first_mmio() else {
             return Err(PnpError::missing(
                 PnpResourceKind::Mmio,
                 "pch-pic reg missing",
             ));
         };
+        if !phys.is_multiple_of(core::mem::align_of::<u32>())
+            || size < PCH_PIC_REQUIRED_MMIO_SIZE
+            || phys.checked_add(size).is_none()
+        {
+            return Err(PnpError::malformed(
+                PnpResourceKind::Mmio,
+                "pch-pic reg window is truncated or misaligned",
+            ));
+        }
         let base_vector = info.u32_property(PCH_PIC_PROP_BASE_VECTOR).unwrap_or(0);
+        if base_vector
+            .checked_add(PCH_PIC_IRQ_COUNT - 1)
+            .is_none_or(|last| last > u8::MAX as u32)
+        {
+            return Err(PnpError::malformed(
+                PnpResourceKind::IrqDomain,
+                "pch-pic vector range exceeds the hardware table",
+            ));
+        }
         let route_target = PchPicRouteTarget::from_platform(info).ok_or(PnpError::malformed(
             PnpResourceKind::IrqDomain,
             "invalid pch-pic route target",
@@ -803,6 +846,7 @@ impl PnpDriver for PchPicDriver {
             route_target,
         ));
         pic.reset();
+        dev.reserve_owned_resources(1)?;
         let domain = irq::register_irq_domain(
             controller,
             Arc::new(PchPicDomain {
@@ -990,6 +1034,7 @@ impl PnpDriver for PchMsiDriver {
             vector_count,
             allocated,
         ));
+        dev.reserve_owned_resources(1)?;
         let handle = msi::register_msi_controller(controller, msi).map_err(map_msi_error)?;
         if let Err(err) = dev.own_resource(msi::controller_pnp_resource(
             handle,

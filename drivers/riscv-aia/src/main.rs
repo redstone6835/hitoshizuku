@@ -5,16 +5,16 @@ extern crate alloc;
 
 mod config;
 mod driver;
+mod vector;
 
+use allocator as _;
 use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 use general::dev::pnp::{DriverHandle, PnpError, unregister_driver};
 
-use allocator as _;
-
 pub(crate) use general::dev;
 
-struct PlicElm {
-    drivers: [Option<DriverHandle>; 1],
+struct RiscvAiaElm {
+    drivers: [Option<DriverHandle>; 2],
 }
 
 fn unregister_drivers<const N: usize>(drivers: &mut [Option<DriverHandle>; N]) -> HookResult {
@@ -36,16 +36,18 @@ fn unregister_drivers<const N: usize>(drivers: &mut [Option<DriverHandle>; N]) -
 }
 
 #[elm::module]
-impl ElmModule for PlicElm {
+impl ElmModule for RiscvAiaElm {
     fn create(_context: &LifecycleContext) -> Result<Self, HookError> {
-        Ok(Self { drivers: [None] })
+        Ok(Self { drivers: [None; 2] })
     }
 
     fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
         if self.drivers.iter().any(Option::is_some) {
             return Err(HookError::new(-16));
         }
-        self.drivers[0] = Some(driver::register_builtin_driver().map_err(|_| HookError::new(-19))?);
+        self.drivers = driver::register_builtin_drivers()
+            .map_err(|_| HookError::new(-19))?
+            .map(Some);
         Ok(())
     }
 
