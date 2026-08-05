@@ -77,7 +77,6 @@ fn realtime_source_id(phys: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ls7aRtcError {
     RegisterWindowTooSmall,
-    AlarmUnsupported,
     CounterDisabled,
     UnstableRead,
     InvalidDate,
@@ -89,6 +88,8 @@ pub struct Ls7aRtc {
     size: usize,
     pm_base: Option<usize>,
     alarm_irq_available: AtomicBool,
+    alarm_enabled: AtomicBool,
+    alarm_match: AtomicU32,
     fix_year_offset: AtomicU32,
     pm_lock: Spinlock<()>,
 }
@@ -100,6 +101,8 @@ impl Ls7aRtc {
             size,
             pm_base,
             alarm_irq_available: AtomicBool::new(false),
+            alarm_enabled: AtomicBool::new(false),
+            alarm_match: AtomicU32::new(0),
             fix_year_offset: AtomicU32::new(0),
             pm_lock: Spinlock::new(()),
         }
@@ -159,7 +162,13 @@ impl Ls7aRtc {
     fn read_alarm_datetime(&self) -> Result<RtcAlarm, Ls7aRtcError> {
         self.ensure_alarm_register_window()?;
         let fix_year = self.ensure_fix_year()?;
-        let raw = self.read32(TOY_MATCH0_REG)?;
+        let hardware_raw = self.read32(TOY_MATCH0_REG)?;
+        let raw = if hardware_raw != 0 {
+            self.alarm_match.store(hardware_raw, Ordering::Release);
+            hardware_raw
+        } else {
+            self.alarm_match.load(Ordering::Acquire)
+        };
 
         let second = (raw >> MATCH_SECOND_SHIFT) & MATCH_SECOND_MASK;
         let minute = (raw >> MATCH_MINUTE_SHIFT) & MATCH_MINUTE_MASK;
@@ -180,7 +189,7 @@ impl Ls7aRtc {
                 self.pm_read32(pm_base, PM1_STS_REG)? & PM_RTC_BIT != 0,
             )
         } else {
-            (false, false)
+            (self.alarm_enabled.load(Ordering::Acquire), false)
         };
         Ok(RtcAlarm {
             time,
@@ -192,36 +201,48 @@ impl Ls7aRtc {
     fn write_alarm_datetime(&self, alarm: RtcAlarm) -> Result<(), Ls7aRtcError> {
         self.ensure_alarm_register_window()?;
         let raw = self.encode_alarm_match(alarm.time)?;
-        self.write32(TOY_MATCH0_REG, raw)?;
-        if alarm.enabled || self.pm_base.is_some() {
-            self.set_alarm_enabled(alarm.enabled)?;
+        self.alarm_match.store(raw, Ordering::Release);
+        if self.pm_base.is_some() {
+            self.write32(TOY_MATCH0_REG, raw)?;
         }
-        Ok(())
+        self.set_alarm_enabled(alarm.enabled)
     }
 
     fn set_alarm_enabled(&self, enabled: bool) -> Result<(), Ls7aRtcError> {
-        let pm_base = self.ensure_alarm_irq_resources()?;
-        let _guard = self.pm_lock.lock();
-        // PM1_STS 是 write-one-to-clear。设置 enable 前先清旧 pending，避免
-        // 用户刚写入的新 alarm 立即继承上一次事件状态。
-        self.pm_write32(pm_base, PM1_STS_REG, PM_RTC_BIT)?;
-        let mut enable = self.pm_read32(pm_base, PM1_EN_REG)?;
-        if enabled {
-            enable |= PM_RTC_BIT;
+        self.ensure_alarm_register_window()?;
+        if let Some(pm_base) = self.pm_base {
+            let _guard = self.pm_lock.lock();
+            // PM1_STS 是 write-one-to-clear。设置 enable 前先清旧 pending，避免
+            // 用户刚写入的新 alarm 立即继承上一次事件状态。
+            self.pm_write32(pm_base, PM1_STS_REG, PM_RTC_BIT)?;
+            let mut value = self.pm_read32(pm_base, PM1_EN_REG)?;
+            if enabled {
+                value |= PM_RTC_BIT;
+            } else {
+                value &= !PM_RTC_BIT;
+            }
+            self.pm_write32(pm_base, PM1_EN_REG, value)?;
         } else {
-            enable &= !PM_RTC_BIT;
+            // DT 直连 IRQ 没有独立 enable 位。保留用户设置的 match 值，并用
+            // TOY_MATCH0 是否为 0 表达启停，避免访问固件没有声明的 PM 窗口。
+            let raw = if enabled {
+                self.alarm_match.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            self.write32(TOY_MATCH0_REG, raw)?;
         }
-        self.pm_write32(pm_base, PM1_EN_REG, enable)
+        self.alarm_enabled.store(enabled, Ordering::Release);
+        Ok(())
     }
 
     fn acknowledge_alarm_irq(&self) -> Result<bool, Ls7aRtcError> {
-        let pm_base = self.ensure_alarm_irq_resources()?;
-        let _guard = self.pm_lock.lock();
-        let status = self.pm_read32(pm_base, PM1_STS_REG)?;
-        if status & PM_RTC_BIT == 0 {
-            return Ok(false);
-        }
-        self.pm_write32(pm_base, PM1_STS_REG, PM_RTC_BIT)?;
+        self.ensure_alarm_register_window()?;
+        // DT 路径使用 RTC 控制器自己的 IRQ，而不是 ACPI fixed event。Linux 的
+        // platform ISR 同样只清零 TOY_MATCH0；PM1_STS/PM1_EN 属于独立的 ACPI
+        // fixed-event/wakeup 语义，不能在直连 IRQ handler 中无条件访问。
+        self.write32(TOY_MATCH0_REG, 0)?;
+        self.alarm_enabled.store(false, Ordering::Release);
         Ok(true)
     }
 
@@ -240,17 +261,12 @@ impl Ls7aRtc {
         Ok(())
     }
 
-    fn ensure_alarm_irq_resources(&self) -> Result<usize, Ls7aRtcError> {
-        self.ensure_alarm_register_window()?;
-        self.pm_base.ok_or(Ls7aRtcError::AlarmUnsupported)
-    }
-
     fn alarm_supported(&self) -> bool {
         self.size == 0 || self.size >= MIN_ALARM_REG_SIZE
     }
 
     fn alarm_irq_supported(&self) -> bool {
-        self.alarm_supported() && self.pm_base.is_some()
+        self.alarm_supported()
     }
 
     fn ensure_fix_year(&self) -> Result<u32, Ls7aRtcError> {
@@ -392,7 +408,6 @@ impl RtcDriver for Ls7aRtc {
 
 fn map_ls7a_rtc_error(err: Ls7aRtcError) -> RtcError {
     match err {
-        Ls7aRtcError::AlarmUnsupported => RtcError::Unsupported,
         Ls7aRtcError::RegisterWindowTooSmall
         | Ls7aRtcError::InvalidDate
         | Ls7aRtcError::Overflow => RtcError::Invalid,
@@ -686,8 +701,8 @@ fn firmware_pm_mmio(info: &PlatformDeviceInfo) -> Option<(usize, usize)> {
 
 fn second_mmio(info: &PlatformDeviceInfo) -> Option<(usize, usize)> {
     // 固件如果声明了额外 MMIO resource，第一段仍是 RTC TOY 窗口，第二段才作为
-    // alarm enable/status 所需的 PM 窗口。没有该资源时驱动只声明无需 PM 的能力，
-    // 不从 TOY 地址反推 PM 基址，避免访问固件未授权的 MMIO 区域。
+    // alarm enable/status 所需的 PM 窗口。固件只声明 RTC 子窗口时不能从地址
+    // 反推 PM 基址；QEMU LoongArch 的相邻区域并未映射，越界访问会产生总线异常。
     info.mmio_at(1)
 }
 

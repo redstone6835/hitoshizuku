@@ -1,26 +1,38 @@
 //! Google Goldfish RTC platform ELM 驱动。
 //!
 //! QEMU RISC-V virt 机器通过 `google,goldfish-rtc` DTB 节点提供真实墙钟时间。
-//! 本驱动只声明 RTC class 已经稳定需要的读/写时间能力，并在 probe 时把硬件时间
-//! 安装为内核 realtime source；alarm IRQ 暂不声明，避免未使用能力影响平台中断路径。
+//! 本驱动实现时间读写、alarm 编程和固件 IRQ 资源接入，并在 probe 时把硬件时间
+//! 安装为内核 realtime source。IRQ 事件统一交给 RTC class 聚合，不在驱动中解释
+//! `/dev/rtc*` 的 ioctl 或阻塞读取语义。
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::dev::platform::PlatformDeviceInfo;
+use crate::dev::irq::{self, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
-    PnpError, PnpId, PnpResourceKind, RealtimeClockSource, register_driver_factory,
+    BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDependency, PnpDevice,
+    PnpDriver, PnpError, PnpId, PnpResourceKind, RealtimeClockSource, register_driver_factory,
 };
-use crate::dev::rtc::{RtcDateTime, RtcDevice, RtcDriver, RtcError, RtcFeatures, RtcFunction};
+use crate::dev::rtc::{
+    RtcAlarm, RtcDateTime, RtcDevice, RtcDriver, RtcError, RtcFeatures, RtcFunction, RtcIrqData,
+    RtcIrqFlags,
+};
 
 const COMPAT_GOLDFISH_RTC: &str = "google,goldfish-rtc";
 
 const RTC_TIME_LOW: usize = 0x00;
 const RTC_TIME_HIGH: usize = 0x04;
+const RTC_ALARM_LOW: usize = 0x08;
+const RTC_ALARM_HIGH: usize = 0x0c;
+const RTC_IRQ_ENABLED: usize = 0x10;
+const RTC_CLEAR_ALARM: usize = 0x14;
+const RTC_ALARM_STATUS: usize = 0x18;
+const RTC_CLEAR_INTERRUPT: usize = 0x1c;
 const RTC_MIN_SIZE: usize = RTC_TIME_HIGH + core::mem::size_of::<u32>();
+const RTC_ALARM_MIN_SIZE: usize = RTC_CLEAR_INTERRUPT + core::mem::size_of::<u32>();
 const NO_REALTIME_SOURCE: usize = 0;
 
 fn realtime_source_id(phys: usize) -> usize {
@@ -30,17 +42,23 @@ fn realtime_source_id(phys: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GoldfishRtcError {
     RegisterWindowTooSmall,
+    AlarmUnsupported,
     InvalidDate,
 }
 
 struct GoldfishRtc {
     base: usize,
     size: usize,
+    alarm_irq_available: AtomicBool,
 }
 
 impl GoldfishRtc {
     const fn new(base: usize, size: usize) -> Self {
-        Self { base, size }
+        Self {
+            base,
+            size,
+            alarm_irq_available: AtomicBool::new(false),
+        }
     }
 
     fn ensure_register_window(&self) -> Result<(), GoldfishRtcError> {
@@ -82,6 +100,84 @@ impl GoldfishRtc {
         self.write32(RTC_TIME_LOW, ns as u32);
         Ok(())
     }
+
+    fn ensure_alarm_register_window(&self) -> Result<(), GoldfishRtcError> {
+        if self.size < RTC_ALARM_MIN_SIZE {
+            return Err(GoldfishRtcError::AlarmUnsupported);
+        }
+        Ok(())
+    }
+
+    fn read_alarm_datetime(&self) -> Result<RtcAlarm, GoldfishRtcError> {
+        self.ensure_alarm_register_window()?;
+        // 与时间寄存器相同，先读 low 会锁存对应 high。
+        let low = self.read32(RTC_ALARM_LOW) as u64;
+        let high = self.read32(RTC_ALARM_HIGH) as u64;
+        let time = RtcDateTime::from_unix_time_ns((high << 32) | low)
+            .ok_or(GoldfishRtcError::InvalidDate)?;
+        Ok(RtcAlarm {
+            time,
+            enabled: self.read32(RTC_ALARM_STATUS) != 0,
+            pending: false,
+        })
+    }
+
+    fn write_alarm_datetime(&self, alarm: RtcAlarm) -> Result<(), GoldfishRtcError> {
+        self.ensure_alarm_register_window()?;
+        if alarm.enabled {
+            let ns = alarm
+                .time
+                .unix_time_ns()
+                .ok_or(GoldfishRtcError::InvalidDate)?;
+            // QEMU Goldfish RTC 按 high -> low 提交新的 alarm 时间；low 写入同时
+            // 激活比较器，最后再打开 IRQ 门控。
+            self.write32(RTC_ALARM_HIGH, (ns >> 32) as u32);
+            self.write32(RTC_ALARM_LOW, ns as u32);
+            self.write32(RTC_IRQ_ENABLED, 1);
+        } else {
+            self.write32(RTC_IRQ_ENABLED, 0);
+            if self.read32(RTC_ALARM_STATUS) != 0 {
+                self.write32(RTC_CLEAR_ALARM, 1);
+            }
+            // CLEAR_ALARM 停止 comparator；已经锁存到 IRQ 线的 pending 状态需要
+            // 通过独立寄存器确认，避免下一次启用 alarm 时继承旧事件。
+            self.write32(RTC_CLEAR_INTERRUPT, 1);
+        }
+        Ok(())
+    }
+
+    fn set_alarm_enabled(&self, enabled: bool) -> Result<(), GoldfishRtcError> {
+        self.ensure_alarm_register_window()?;
+        self.write32(RTC_IRQ_ENABLED, u32::from(enabled));
+        if !enabled {
+            // 关闭门控不会自动撤销已经锁存到 IRQ 线的事件；显式确认旧中断，
+            // 避免稍后重新启用时立即上报一个过期 alarm。
+            self.write32(RTC_CLEAR_INTERRUPT, 1);
+        }
+        Ok(())
+    }
+
+    fn clear_alarm(&self) -> Result<(), GoldfishRtcError> {
+        self.ensure_alarm_register_window()?;
+        self.write32(RTC_IRQ_ENABLED, 0);
+        self.write32(RTC_CLEAR_ALARM, 1);
+        self.write32(RTC_CLEAR_INTERRUPT, 1);
+        Ok(())
+    }
+
+    fn acknowledge_alarm_irq(&self) -> Result<(), GoldfishRtcError> {
+        self.ensure_alarm_register_window()?;
+        self.write32(RTC_CLEAR_INTERRUPT, 1);
+        Ok(())
+    }
+
+    fn set_alarm_irq_available(&self, available: bool) {
+        self.alarm_irq_available.store(available, Ordering::Release);
+    }
+
+    fn alarm_irq_available(&self) -> bool {
+        self.alarm_irq_available.load(Ordering::Acquire)
+    }
 }
 
 impl RtcDriver for GoldfishRtc {
@@ -93,8 +189,32 @@ impl RtcDriver for GoldfishRtc {
         self.write_datetime(time).map_err(map_goldfish_rtc_error)
     }
 
+    fn read_alarm(&self) -> Result<RtcAlarm, RtcError> {
+        self.read_alarm_datetime().map_err(map_goldfish_rtc_error)
+    }
+
+    fn set_alarm(&self, alarm: RtcAlarm) -> Result<(), RtcError> {
+        self.write_alarm_datetime(alarm)
+            .map_err(map_goldfish_rtc_error)
+    }
+
+    fn set_alarm_irq_enabled(&self, enabled: bool) -> Result<(), RtcError> {
+        if !self.alarm_irq_available() {
+            return Err(RtcError::Unsupported);
+        }
+        self.set_alarm_enabled(enabled)
+            .map_err(map_goldfish_rtc_error)
+    }
+
     fn features(&self) -> RtcFeatures {
-        RtcFeatures::READ_TIME.with(RtcFeatures::SET_TIME)
+        let mut features = RtcFeatures::READ_TIME.with(RtcFeatures::SET_TIME);
+        if self.size >= RTC_ALARM_MIN_SIZE {
+            features = features.with(RtcFeatures::ALARM);
+        }
+        if self.size >= RTC_ALARM_MIN_SIZE && self.alarm_irq_available() {
+            features = features.with(RtcFeatures::ALARM_IRQ);
+        }
+        features
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -105,12 +225,33 @@ impl RtcDriver for GoldfishRtc {
 fn map_goldfish_rtc_error(err: GoldfishRtcError) -> RtcError {
     match err {
         GoldfishRtcError::RegisterWindowTooSmall => RtcError::Io,
+        GoldfishRtcError::AlarmUnsupported => RtcError::Unsupported,
         GoldfishRtcError::InvalidDate => RtcError::Invalid,
     }
 }
 
 struct GoldfishRtcBinding {
+    rtc: Arc<GoldfishRtc>,
     rtc_dev: Arc<RtcDevice>,
+}
+
+struct GoldfishRtcIrqHandler {
+    rtc: Arc<GoldfishRtc>,
+    rtc_dev: Weak<RtcDevice>,
+}
+
+impl IrqHandler for GoldfishRtcIrqHandler {
+    fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
+        match self.rtc.acknowledge_alarm_irq() {
+            Ok(()) => {
+                if let Some(rtc_dev) = self.rtc_dev.upgrade() {
+                    let _ = rtc_dev.record_irq(RtcIrqData::new(1, RtcIrqFlags::ALARM));
+                }
+                IrqStatus::Handled
+            }
+            Err(_) => IrqStatus::Unhandled,
+        }
+    }
 }
 
 pub struct GoldfishRtcPlatformDriver {
@@ -216,6 +357,49 @@ impl GoldfishRtcPlatformDriver {
             );
         }
     }
+
+    fn register_alarm_irq_handler(
+        &self,
+        rtc: &Arc<GoldfishRtc>,
+        rtc_dev: &Arc<RtcDevice>,
+        info: &PlatformDeviceInfo,
+    ) -> Result<Option<IrqHandle>, PnpError> {
+        if rtc.size < RTC_ALARM_MIN_SIZE {
+            return Ok(None);
+        }
+        let handler: Arc<dyn IrqHandler> = Arc::new(GoldfishRtcIrqHandler {
+            rtc: Arc::clone(rtc),
+            rtc_dev: Arc::downgrade(rtc_dev),
+        });
+        match info.register_first_irq_handler(handler) {
+            Ok(handle) => {
+                rtc.set_alarm_irq_available(true);
+                Ok(Some(handle))
+            }
+            Err(PlatformIrqRegistrationError::NoResource) => Ok(None),
+            Err(PlatformIrqRegistrationError::Unresolved) => {
+                Err(PnpError::dependency(first_irq_dependency(info)))
+            }
+            Err(PlatformIrqRegistrationError::RegistrationFailed { err, .. }) => match err {
+                irq::IrqError::OutOfMemory => Err(PnpError::OutOfMemory),
+                irq::IrqError::AlreadyRegistered => Err(PnpError::registration_failed(
+                    PnpResourceKind::Irq,
+                    "goldfish rtc alarm irq already registered",
+                )),
+                irq::IrqError::NotFound => Err(PnpError::registration_failed(
+                    PnpResourceKind::Irq,
+                    "goldfish rtc alarm irq line not found",
+                )),
+            },
+        }
+    }
+}
+
+fn first_irq_dependency(info: &PlatformDeviceInfo) -> PnpDependency {
+    info.irq_resources()
+        .find_map(|irq| irq.controller())
+        .map(PnpDependency::IrqController)
+        .unwrap_or(PnpDependency::DefaultIrqDomain)
 }
 
 impl PnpDriver for GoldfishRtcPlatformDriver {
@@ -264,12 +448,28 @@ impl PnpDriver for GoldfishRtcPlatformDriver {
             PnpError::hardware_failure("rtc initial time read failed")
         })?;
 
-        let rtc_driver: Arc<dyn RtcDriver> = rtc;
+        let rtc_driver: Arc<dyn RtcDriver> = rtc.clone();
         let rtc_projection_name = RtcDevice::alloc_stable_projection_name(&dev.name)?;
         let rtc_dev = Arc::new(RtcDevice::new(rtc_projection_name, rtc_driver));
         dev.register_function(RtcFunction::new_arc(Arc::clone(&rtc_dev)))?;
+        let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, info)?;
+        if let Some(handle) = irq_handle
+            && let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
+                handle,
+                "platform-goldfish-rtc-alarm",
+            ))
+        {
+            rtc.set_alarm_irq_available(false);
+            let _ = irq::unregister_irq_handler(handle);
+            return Err(err);
+        }
         self.install_realtime_clock(dev, phys, realtime_ns);
-        dev.set_driver_data(Arc::new(GoldfishRtcBinding { rtc_dev }));
+        dev.set_driver_data(Arc::new(GoldfishRtcBinding { rtc, rtc_dev }));
+        log::printk!(
+            "[platform-goldfish-rtc] alarm support={} irq={}",
+            (size >= RTC_ALARM_MIN_SIZE) as usize,
+            irq_handle.is_some() as usize
+        );
         Ok(())
     }
 
@@ -282,6 +482,8 @@ impl PnpDriver for GoldfishRtcPlatformDriver {
         if let Some(data) = dev.take_driver_data()
             && let Ok(binding) = data.downcast::<GoldfishRtcBinding>()
         {
+            binding.rtc.set_alarm_irq_available(false);
+            let _ = binding.rtc.clear_alarm();
             binding.rtc_dev.mark_gone();
         }
         log::printk!("[platform-goldfish-rtc] removed {}", dev.id);
