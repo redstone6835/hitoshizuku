@@ -800,7 +800,8 @@ pub struct Task {
     pub signal: SignalState,
     /// 与同 thread-group 共享的 sigaction + shared pending。
     /// CLONE_SIGHAND 时 `Arc::clone`，否则 fork 时深拷一份。
-    shared_signal: Spinlock<Arc<SharedSignal>>,
+    /// 任务创建后只读该 Arc，SharedSignal 内部状态自行同步。
+    shared_signal: Arc<SharedSignal>,
     /// 退出时给父发的信号号码（默认 SIGCHLD=17）；clone 低 8 位指定。
     /// 值 0 表示"不发信号"（CLONE_THREAD 等情况）。
     exit_signal: AtomicI32,
@@ -931,8 +932,7 @@ impl Task {
     /// 调用方负责在返回 `Arc` 之后把它登记进父的 `children` 与组成员表。
     ///
     /// `creds` / `shared_signal` 默认从 `thread_group` 复制：thread group 内
-    /// 必然共享 shared_signal。调用方若需覆盖（如 CLONE_SIGHAND），可随后
-    /// 调 [`Task::install_shared_signal`] 替换。
+    /// 必然共享 shared_signal。不同共享策略由调用方创建不同的 ThreadGroup。
     pub fn new(
         params: SchedParams,
         parent: Weak<Task>,
@@ -969,7 +969,7 @@ impl Task {
             ctx: Spinlock::new(None),
             creds: Spinlock::new(Arc::new(Credentials::root())),
             signal: SignalState::new(),
-            shared_signal: Spinlock::new(shared),
+            shared_signal: shared,
             exit_signal: AtomicI32::new(SignalNumber::SIGCHLD.raw() as i32),
             vfork_done: WaitQueue::new_with_reason(WaitReason::Vfork),
             vforking: AtomicBool::new(false),
@@ -1072,27 +1072,25 @@ impl Task {
 
     /// 开始一个不能与本任务其它有界入口重叠的执行作用域。
     pub fn begin_execution_scope(&self, kind: ExecutionScopeKind) -> bool {
-        if self
-            .execution_scope
-            .compare_exchange(0, kind as u8, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        // 调度器保证同一任务的执行上下文只由一个 CPU 持有；这里的原子字段用于
+        // 中断边界观测和嵌套校验，不承担多 CPU 所有权仲裁。避免在每次 syscall
+        // 入口执行 LR/SC，可以显著降低 RISC-V 模拟器中的固定开销。
+        if self.execution_scope.load(Ordering::Relaxed) != 0 {
             return false;
         }
-        self.execution_actions.store(0, Ordering::Release);
+        self.execution_actions.store(0, Ordering::Relaxed);
+        self.execution_scope
+            .store(kind as u8, Ordering::Relaxed);
         true
     }
 
     /// 结束作用域并返回其中成功认领过的动作位。
     pub fn end_execution_scope(&self, kind: ExecutionScopeKind) -> u64 {
-        let actions = self.execution_actions.swap(0, Ordering::AcqRel);
-        let previous = self.execution_scope.compare_exchange(
-            kind as u8,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        assert!(previous.is_ok(), "任务执行作用域必须由原入口结束");
+        let previous = self.execution_scope.load(Ordering::Relaxed);
+        assert_eq!(previous, kind as u8, "任务执行作用域必须由原入口结束");
+        let actions = self.execution_actions.load(Ordering::Relaxed);
+        self.execution_actions.store(0, Ordering::Relaxed);
+        self.execution_scope.store(0, Ordering::Relaxed);
         actions
     }
 
@@ -1822,16 +1820,11 @@ impl Task {
 
     /// 取本任务当前的 SharedSignal（thread-group 共享部分）。
     pub fn shared_signal(&self) -> Arc<SharedSignal> {
-        Arc::clone(&self.shared_signal.lock())
+        Arc::clone(&self.shared_signal)
     }
 
     pub fn shared_signal_pending_bits_quick(&self) -> u64 {
-        self.shared_signal.lock().pending_snapshot().raw()
-    }
-
-    /// 替换 SharedSignal —— 仅供 spawn 时根据 CLONE_SIGHAND 设定使用。
-    pub fn install_shared_signal(&self, shared: Arc<SharedSignal>) {
-        *self.shared_signal.lock() = shared;
+        self.shared_signal.pending_snapshot().raw()
     }
 
     /// exit 时给父发的信号号码（0 表示不发）。
