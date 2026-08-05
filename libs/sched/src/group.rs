@@ -186,6 +186,14 @@ impl ThreadGroup {
         }
         members.push(Arc::downgrade(task));
         self.acct_live_members.fetch_add(1, Ordering::Release);
+        drop(members);
+
+        // shared pending 可能在本成员加入前已经发布。发布方与成员登记都经过
+        // members 锁排序：若 snapshot 先发生，这里能看到 pending；若登记先
+        // 发生，发布方 snapshot 会覆盖本任务。屏蔽状态变化自身也会重新置 hint。
+        if task.is_user_task() && task.shared_signal_pending_bits_quick() != 0 {
+            task.mark_user_return_work();
+        }
         true
     }
 

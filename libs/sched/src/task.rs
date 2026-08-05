@@ -1346,6 +1346,7 @@ impl Task {
     pub(crate) fn publish_group_exit_wakeup(&self) {
         if self.is_user_task() {
             self.group_exit_requested.store(true, Ordering::SeqCst);
+            self.signal.mark_user_return_work();
         }
     }
 
@@ -1503,6 +1504,8 @@ impl Task {
                 }
             }
         }
+
+        self.signal.mark_user_return_work();
 
         self.wait_stop_sig
             .store(sig.raw() as i32, Ordering::Release);
@@ -1909,6 +1912,7 @@ impl Task {
     pub fn mark_rseq_event(&self, event: RseqEvent) {
         if self.rseq_registered() {
             self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
+            self.signal.mark_user_return_work();
         }
     }
 
@@ -1916,25 +1920,49 @@ impl Task {
         RseqEvents::from_bits(self.rseq_events.load(Ordering::Acquire))
     }
 
-    /// Linux `thread_info.flags` 风格的用户返回工作预检。
-    ///
-    /// 这里只判断是否可能有工作，不消费任何 payload。远端发布与队列内容的
-    /// 可见性仍由随后各慢路径的 Acquire/锁保证；并发发生在本次预检之后的工作
-    /// 会通过 signal/resched 通知或下一次 trap 边界再次观察。
+    /// 发布本任务存在返回用户态前必须处理的工作。
+    #[inline]
+    pub(crate) fn mark_user_return_work(&self) {
+        self.signal.mark_user_return_work();
+    }
+
+    /// Linux `thread_info.flags` 风格的无工作热路径读取。
     #[inline(always)]
-    pub fn user_return_work_pending_relaxed(&self) -> bool {
-        let state = self.state.load(Ordering::Relaxed);
-        let pending = self.signal.pending_bits_relaxed();
-        let shared = self.shared_signal.pending_bits_relaxed();
-        let deliverable = if pending | shared == 0 {
-            false
-        } else {
-            (pending | shared) & !self.signal.blocked_bits_relaxed() != 0
-        };
-        self.group_exit_requested.load(Ordering::Relaxed)
-            || deliverable
-            || self.rseq_events.load(Ordering::Relaxed) & 0x7 != 0
-            || state >= TaskState::Stopped as u8
+    pub fn user_return_work_hint_relaxed(&self) -> bool {
+        self.signal.user_return_work_pending_relaxed()
+    }
+
+    /// 慢路径进入时与任务工作生产者建立 Acquire/Release 同步。
+    #[inline]
+    pub fn user_return_work_hint_acquire(&self) -> bool {
+        self.signal.user_return_work_pending_acquire()
+    }
+
+    /// 重新扫描任务返回工作的权威状态。
+    #[inline]
+    fn user_return_work_authoritative(&self) -> bool {
+        self.group_exit_boundary_pending()
+            || self.has_deliverable_signal()
+            || !self.rseq_events().is_empty()
+            || matches!(
+                self.state(),
+                TaskState::Stopped | TaskState::Continued | TaskState::Zombie | TaskState::Dead
+            )
+    }
+
+    /// 清除并重建任务级粘性 hint。
+    ///
+    /// 本函数只允许在返回用户态慢路径调用。先用 AcqRel swap 清零，再读取权威
+    /// 状态；并发生产者若发生在 swap 前，其 Release 与 swap 配对，若发生在
+    /// swap 后则会留下新的 true，因此不会出现永久漏工作。
+    #[inline]
+    pub fn refresh_user_return_work_hint(&self) -> bool {
+        let _ = self.signal.take_user_return_work();
+        let pending = self.user_return_work_authoritative();
+        if pending {
+            self.signal.mark_user_return_work();
+        }
+        pending || self.signal.user_return_work_pending_acquire()
     }
 
     pub fn clear_rseq_events(&self, events: RseqEvents) {

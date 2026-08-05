@@ -626,12 +626,13 @@ pub struct ArchTrapOps {
     /// `stack_top` 必须落在当前线程（即即将运行的 next）持有的内核栈范围内，
     /// 且按当前架构 ABI 对齐。本函数只写硬件寄存器，不做范围检查。
     pub set_kernel_trap_stack: unsafe fn(stack_top: usize),
-    /// 把架构本地的 borrowed-current 指针更新为调度器刚发布的任务。
+    /// 把架构本地 borrowed-current 与 CPU 返回工作 hint 更新为刚发布的任务。
     ///
     /// # Safety
-    /// `task_ptr` 必须来自仍由调度器 current 槽持有强引用的 `Arc<Task>`，并且
-    /// 只能为正在执行发布操作的本 CPU 更新本地状态。
-    pub set_current_task: unsafe fn(task_ptr: usize),
+    /// `task_ptr` 必须来自仍由调度器 current 槽持有强引用的 `Arc<Task>`；
+    /// `cpu_work_ptr` 必须指向生命周期覆盖内核运行期的 `AtomicU32`。本函数只能
+    /// 为正在执行发布操作的本 CPU 更新本地状态。
+    pub set_current_task: unsafe fn(task_ptr: usize, cpu_work_ptr: usize),
 }
 
 // Safety: 仅函数指针。

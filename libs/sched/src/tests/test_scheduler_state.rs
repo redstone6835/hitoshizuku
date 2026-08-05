@@ -58,7 +58,7 @@ fn borrowed_current_survives_raw_slot_replacement_with_prev_owner() {
 }
 
 #[ktest]
-fn blocked_signal_does_not_request_user_return_work() {
+fn blocked_signal_hint_is_cleared_and_rearmed_on_unblock() {
     let task = make_task();
     let blocked = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
     task.signal.block(blocked, SigProcMaskHow::SetMask);
@@ -71,11 +71,58 @@ fn blocked_signal_does_not_request_user_return_work() {
     });
 
     assert!(!task.has_deliverable_signal());
-    assert!(!task.user_return_work_pending_relaxed());
+    assert!(task.user_return_work_hint_relaxed());
+    assert!(!task.refresh_user_return_work_hint());
+    assert!(!task.user_return_work_hint_relaxed());
 
     task.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
     assert!(task.has_deliverable_signal());
-    assert!(task.user_return_work_pending_relaxed());
+    assert!(task.user_return_work_hint_relaxed());
+    assert!(task.refresh_user_return_work_hint());
+}
+
+#[ktest]
+fn task_work_hint_preserves_publish_after_clear() {
+    let task = make_task();
+    task.mark_user_return_work();
+    assert!(task.signal.take_user_return_work());
+
+    let producer = Arc::clone(&task);
+    let barrier = Arc::new(Barrier::new(2));
+    let producer_barrier = Arc::clone(&barrier);
+    let handle = thread::spawn(move || {
+        producer_barrier.wait();
+        producer.mark_user_return_work();
+    });
+    barrier.wait();
+    handle.join().expect("producer thread");
+
+    assert!(task.user_return_work_hint_acquire());
+}
+
+#[ktest]
+fn cpu_work_hint_preserves_publish_after_clear() {
+    let scheduler = Arc::new(Scheduler::new());
+    let cpu = scheduler.cpu(0).expect("boot cpu state");
+    cpu.request_resched();
+    assert!(cpu.take_user_return_work());
+    assert!(cpu.take_resched());
+
+    let producer_scheduler = Arc::clone(&scheduler);
+    let barrier = Arc::new(Barrier::new(2));
+    let producer_barrier = Arc::clone(&barrier);
+    let handle = thread::spawn(move || {
+        producer_barrier.wait();
+        producer_scheduler
+            .cpu(0)
+            .expect("boot cpu state")
+            .request_resched();
+    });
+    barrier.wait();
+    handle.join().expect("producer thread");
+
+    assert!(cpu.user_return_work_pending_acquire());
+    assert!(cpu.needs_resched());
 }
 
 #[ktest]
@@ -103,9 +150,11 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     cpu1.request_post_syscall_handoff(1);
 
     assert!(!cpu0.needs_resched());
+    assert!(!cpu0.user_return_work_pending_relaxed());
     assert!(!cpu0.take_balance());
     assert!(!cpu0.has_post_syscall_handoff());
     assert!(cpu1.needs_resched());
+    assert!(cpu1.user_return_work_pending_relaxed());
     assert!(cpu1.take_balance());
     let (rounds, target) = cpu1.take_post_syscall_handoff();
     assert_eq!(rounds, 1);
@@ -113,6 +162,8 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     assert!(cpu1.take_resched());
     assert!(cpu1.claim_resched_notification());
     assert!(!cpu1.needs_resched());
+    assert!(cpu1.take_user_return_work());
+    assert!(!cpu1.user_return_work_authoritative());
 }
 
 #[ktest]

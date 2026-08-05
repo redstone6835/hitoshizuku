@@ -152,9 +152,10 @@ unsafe fn set_kernel_trap_stack_raw(stack_top: usize) {
 }
 
 /// # Safety
-/// `task_ptr` 必须由调度器已发布且仍持有强引用的 current task 提供。
-unsafe fn set_current_task_raw(task_ptr: usize) {
-    unsafe { crate::riscv64::specific::set_current_task_ptr(task_ptr) };
+/// `task_ptr` 必须由调度器已发布且仍持有强引用的 current task 提供；
+/// `cpu_work_ptr` 必须指向稳定的 CpuSchedState 返回工作 hint。
+unsafe fn set_current_task_raw(task_ptr: usize, cpu_work_ptr: usize) {
+    unsafe { crate::riscv64::specific::set_current_task_ptr(task_ptr, cpu_work_ptr) };
 }
 
 static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {

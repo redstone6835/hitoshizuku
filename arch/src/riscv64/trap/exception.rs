@@ -72,17 +72,16 @@ fn prepare_user_state_for_task(tf_ptr: usize, task: &alloc::sync::Arc<sched::Tas
 
 /// Linux `exit_to_user_mode_loop()` 对应的 RISC-V syscall 返回慢路径。
 ///
-/// 热路径只对权威原子字段做 relaxed 预检；到这里以后继续使用现有 Acquire、锁和
-/// RMW 消费接口，并在可能产生新工作的步骤之间复查。普通无信号、无调度 syscall
-/// 不会调用本函数。
+/// 热路径只对 task/CPU 两个粘性 hint 做 relaxed 预检；到这里以后使用 Acquire、
+/// 锁和 RMW 消费权威状态，并在可能产生新工作的步骤之间复查。普通无信号、无调度
+/// syscall 不会调用本函数。
 #[cold]
 #[inline(never)]
 fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched::Task>) -> bool {
     let mut require_full_restore = false;
     loop {
-        let cpu_id = crate::riscv64::specific::current_cpu_id();
-        let task_work = task.user_return_work_pending_relaxed();
-        let cpu_work = sched::user_return_work_pending_on(cpu_id);
+        let task_work = task.user_return_work_hint_acquire();
+        let cpu_work = crate::riscv64::specific::current_cpu_user_return_work_pending_acquire();
         if !task_work && !cpu_work {
             break;
         }
@@ -90,6 +89,17 @@ fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched:
         if sched::operation::complete_group_exit_if_requested(task) {
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][syscall] group-exit task scheduled back unexpectedly");
+        }
+
+        if cpu_work {
+            // 与 Linux exit_to_user_mode_loop() 相同，先处理调度工作；任务即使在
+            // 此处迁移，后续 task hint 仍随 Task 保留，CPU hint 则由新 HartLocal
+            // 指向新 CPU 的稳定聚合字。
+            require_full_restore = true;
+            sched::run_post_syscall_handoff_lazy();
+            if sched::needs_resched_current() {
+                sched::preempt_if_needed(kernel_timestamp_ns());
+            }
         }
 
         if task.has_deliverable_signal() {
@@ -113,15 +123,17 @@ fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched:
         }
         prepare_user_state_for_task(tf_ptr, task);
 
-        if cpu_work {
-            // clone/vfork handoff 先消费延迟 tick，可能在内部切换；随后重新读取
-            // resched。循环末尾会像 Linux exit_to_user_mode_loop() 一样重新读取
-            // 全部工作位，覆盖慢路径自身新产生的 signal/rseq/work。
-            require_full_restore = true;
-            sched::run_post_syscall_handoff_lazy();
-            if sched::needs_resched_current() {
-                sched::preempt_if_needed(kernel_timestamp_ns());
-            }
+        // 先清粘性 hint，再以 Acquire 重新读取权威字段。生产者若与清除并发，
+        // 要么被 swap 获取，要么在 swap 后留下新的 true，不会永久漏工作。
+        let task_pending = task.refresh_user_return_work_hint();
+        let cpu_pending =
+            sched::refresh_user_return_work_on(crate::riscv64::specific::current_cpu_id());
+        // task/CPU 是两个独立聚合字。先复查 CPU，最后再复查不一定伴随 IPI 的
+        // task hint，避免它在两次 refresh 之间置位却被本轮错误跳过。
+        let cpu_rearmed = crate::riscv64::specific::current_cpu_user_return_work_pending_acquire();
+        let task_rearmed = task.user_return_work_hint_acquire();
+        if !task_pending && !cpu_pending && !cpu_rearmed && !task_rearmed {
+            break;
         }
     }
     require_full_restore
@@ -671,9 +683,9 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
     );
     let mut require_full_restore = dispatch_outcome.requires_full_restore();
 
-    let task_work = task.user_return_work_pending_relaxed();
-    let cpu_id = crate::riscv64::specific::current_cpu_id();
-    if task_work || sched::user_return_work_pending_on(cpu_id) {
+    let task_work = task.user_return_work_hint_relaxed();
+    let cpu_work = crate::riscv64::specific::current_cpu_user_return_work_pending_relaxed();
+    if task_work || cpu_work {
         require_full_restore |= finish_fast_syscall_return_work(tf_ptr, task.as_arc());
     }
 

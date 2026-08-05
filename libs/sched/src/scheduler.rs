@@ -260,11 +260,15 @@ fn cpu() -> usize {
 }
 
 fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
-    let task_ptr = SCHEDULER.cpu_or_boot(cpu_id).publish_current(task) as usize;
+    debug_assert_eq!(cpu_id, cpu(), "publishing current task for a remote CPU");
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let task_ptr = cpu_state.publish_current(task) as usize;
+    let cpu_work_ptr = cpu_state.user_return_work_ptr() as usize;
     if let Some(trap) = arch_hooks::trap() {
         // Safety: publish_current 已经让 current/current_raw 持有 task，且该函数
-        // 只在正在完成切换的本 CPU 上发布架构本地指针。
-        unsafe { (trap.set_current_task)(task_ptr) };
+        // 只在正在完成切换的本 CPU 上发布架构本地指针。CpuSchedState 位于静态
+        // Scheduler 中，其 user_return_work 地址在内核运行期保持稳定。
+        unsafe { (trap.set_current_task)(task_ptr, cpu_work_ptr) };
     }
     #[cfg(feature = "performance-profile")]
     {
@@ -1382,10 +1386,27 @@ pub fn user_return_work_pending_on(cpu_id: usize) -> bool {
     if cpu_id >= NR_CPUS {
         return true;
     }
-    DEFERRED_TIMER_TICK_NS[cpu_id].load(Ordering::Relaxed) != 0
-        || SCHEDULER
-            .cpu_or_boot(cpu_id)
-            .user_return_work_pending_relaxed()
+    SCHEDULER
+        .cpu_or_boot(cpu_id)
+        .user_return_work_pending_relaxed()
+}
+
+/// 清除并重建指定 CPU 的返回工作 hint。
+///
+/// AcqRel swap 与生产者的 Release fetch_or 配对。并发生产若发生在 swap 前，后续
+/// Acquire 权威复查可见；若发生在 swap 后，生产者留下的 true 不会被覆盖。
+pub fn refresh_user_return_work_on(cpu_id: usize) -> bool {
+    if cpu_id >= NR_CPUS {
+        return true;
+    }
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let _ = cpu_state.take_user_return_work();
+    let pending = DEFERRED_TIMER_TICK_NS[cpu_id].load(Ordering::Acquire) != 0
+        || cpu_state.user_return_work_authoritative();
+    if pending {
+        cpu_state.mark_user_return_work();
+    }
+    pending || cpu_state.user_return_work_pending_acquire()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.request_resched", contract = "kernel.sched.control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
@@ -2285,15 +2306,7 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
         sender_uid: Uid::ROOT,
         raw: None,
     };
-    tg.shared_signal().deliver(info);
-    for task in tg.snapshot() {
-        if !task.signal.blocked_snapshot().has(SignalNumber::SIGALRM)
-            || task.signal.sigtimedwait_wants(SignalNumber::SIGALRM)
-        {
-            signal_wakeup(&task, &info);
-            break;
-        }
-    }
+    deliver_shared_signal_to_group(tg, info);
 }
 
 fn migration_context(
@@ -2705,6 +2718,28 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
 
 // ── 信号唤醒 ─────────────────────────────────────────────────────────────────
 
+/// 向线程组发布共享信号，并为所有用户成员设置任务级返回工作 hint。
+///
+/// 共享 pending 最终只会被一个成员消费。发布与成员修改 blocked mask 没有共同
+/// 锁，因此不能用发布时的 mask 快照筛掉 hint；给全部用户成员置位可封闭并发
+/// unblock 窗口。硬件唤醒仍只发送给第一个当前可投递候选，避免 IPI 风暴。
+pub(crate) fn deliver_shared_signal_to_group(tg: &Arc<ThreadGroup>, info: SigInfo) {
+    tg.shared_signal().deliver(info);
+    let mut woke = false;
+    for task in tg.snapshot() {
+        if task.is_kernel_task() {
+            continue;
+        }
+        task.mark_user_return_work();
+        let eligible = !task.signal.blocked_snapshot().has(info.sig)
+            || task.signal.sigtimedwait_wants(info.sig);
+        if !woke && eligible {
+            signal_wakeup(&task, &info);
+            woke = true;
+        }
+    }
+}
+
 /// 把一条信号投给 `target`，并在可行时把它从 Sleeping 拉回 Runnable。
 ///
 /// 调用方已经把 `info` 放进了 target 的 per-task 或共享 pending 队列，这里
@@ -2720,6 +2755,7 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.sched.on_rq(),
         target.running_cpu(),
     );
+    target.mark_user_return_work();
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;
     }
@@ -2780,6 +2816,12 @@ pub fn group_exit_wakeup(target: &Arc<Task>) {
 pub(crate) fn mark_task_stopped(task: &Arc<Task>, sig: SignalNumber) -> bool {
     let removed = dequeue_for_state_change(task, now_ns_internal());
     let stopped = task.mark_stopped(sig);
+    if stopped
+        && let Some(target_cpu) = task.running_cpu()
+        && target_cpu != cpu()
+    {
+        request_resched(target_cpu.min(NR_CPUS - 1));
+    }
     log::debug!(
         "[sched][signal] stop pid={:?} sig={} on_rq={} state={:?}",
         task.pid_root(),
@@ -3092,7 +3134,9 @@ fn targeted_handoff_is_valid(target: &HandoffTarget, cpu_id: usize) -> bool {
 /// 记录一次发生在内核临界区中的 timer tick，等待下一处安全调度边界处理。
 pub fn defer_timer_tick(now_ns: u64) {
     if INIT_READY.load(Ordering::Acquire) {
-        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()], now_ns);
+        let cpu_id = cpu();
+        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id], now_ns);
+        SCHEDULER.cpu_or_boot(cpu_id).mark_user_return_work();
     }
 }
 

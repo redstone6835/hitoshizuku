@@ -5,7 +5,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::ids::Uid;
 use crate::pid::PidT;
@@ -299,6 +299,11 @@ pub struct SignalState {
     saved_blocked: AtomicU64,
     sigsuspend_saved_blocked: AtomicBool,
     sigtimedwait_mask: AtomicU64,
+    /// Linux `thread_info.flags` 风格的粘性返回工作提示。
+    ///
+    /// 该位只决定是否进入慢路径，不替代 pending 队列等权威状态。生产者在发布
+    /// payload 后置位；消费者只在慢路径中清零并重新扫描权威状态。
+    user_return_work: AtomicU32,
     observers: SignalObservers,
 }
 
@@ -311,8 +316,38 @@ impl SignalState {
             saved_blocked: AtomicU64::new(0),
             sigsuspend_saved_blocked: AtomicBool::new(false),
             sigtimedwait_mask: AtomicU64::new(0),
+            user_return_work: AtomicU32::new(0),
             observers: SignalObservers::new(),
         }
+    }
+
+    /// 发布本任务存在返回用户态前必须处理的工作。
+    #[inline]
+    pub(crate) fn mark_user_return_work(&self) {
+        #[cfg(any(target_arch = "riscv64", test))]
+        self.user_return_work.fetch_or(1, Ordering::Release);
+    }
+
+    /// 普通 trap/syscall 返回热路径的无栅栏提示读取。
+    #[inline(always)]
+    pub(crate) fn user_return_work_pending_relaxed(&self) -> bool {
+        self.user_return_work.load(Ordering::Relaxed) != 0
+    }
+
+    /// 慢路径进入时与生产者的 Release 发布建立同步。
+    #[inline]
+    pub(crate) fn user_return_work_pending_acquire(&self) -> bool {
+        self.user_return_work.load(Ordering::Acquire) != 0
+    }
+
+    /// 清除粘性提示并取得清除前状态。
+    ///
+    /// 生产者的 Release fetch_or 形成 release sequence。AcqRel swap 若清除了
+    /// 多个生产者合并后的位，就同步观察这些生产者此前发布的权威状态；若生产者
+    /// 发生在 swap 后，它留下的非零值不会被本次消费者覆盖。
+    #[inline]
+    pub(crate) fn take_user_return_work(&self) -> bool {
+        self.user_return_work.swap(0, Ordering::AcqRel) != 0
     }
 
     /// 订阅当前任务的 pending 信号变化。
@@ -328,6 +363,7 @@ impl SignalState {
         self.pending_bits
             .store(pending | info.sig.bit(), Ordering::Release);
         drop(queue);
+        self.mark_user_return_work();
         self.observers.notify();
     }
 
@@ -377,18 +413,6 @@ impl SignalState {
         self.pending_bits.load(Ordering::Acquire) != 0
     }
 
-    /// 用户返回热路径读取原始 pending 位；只用于组成可投递工作预检。
-    #[inline(always)]
-    pub(crate) fn pending_bits_relaxed(&self) -> u64 {
-        self.pending_bits.load(Ordering::Relaxed)
-    }
-
-    /// 用户返回热路径读取 blocked mask；真正消费仍由队列锁串行化。
-    #[inline(always)]
-    pub(crate) fn blocked_bits_relaxed(&self) -> u64 {
-        self.blocked.load(Ordering::Relaxed)
-    }
-
     /// 是否存在至少一条可投递信号（未屏蔽）。
     pub fn has_deliverable(&self) -> bool {
         let pending = self.pending_bits.load(Ordering::Acquire);
@@ -429,6 +453,7 @@ impl SignalState {
             SigProcMaskHow::SetMask => set.0,
         };
         self.blocked.store(next, Ordering::Release);
+        self.mark_user_return_work();
         SigSet(prev)
     }
 
@@ -439,6 +464,7 @@ impl SignalState {
         self.sigsuspend_saved_blocked.store(true, Ordering::Release);
         self.blocked
             .store(new_mask.sanitized().0, Ordering::Release);
+        self.mark_user_return_work();
     }
 
     /// signal frame 构造时取得 sigsuspend 调用前的 mask。
@@ -458,6 +484,7 @@ impl SignalState {
         self.blocked.store(saved, Ordering::Release);
         self.sigsuspend_saved_blocked
             .store(false, Ordering::Release);
+        self.mark_user_return_work();
     }
 }
 
@@ -570,7 +597,7 @@ impl SharedSignal {
     }
 
     /// 投一条信号到 tg 的共享 pending。
-    pub fn deliver(&self, info: SigInfo) {
+    pub(crate) fn deliver(&self, info: SigInfo) {
         let mut queue = self.shared_pending_infos.lock();
         queue.push(info);
         let pending = self.shared_pending_bits.load(Ordering::Relaxed);
@@ -623,12 +650,6 @@ impl SharedSignal {
 
     pub fn pending_snapshot(&self) -> SigSet {
         SigSet(self.shared_pending_bits.load(Ordering::Acquire))
-    }
-
-    /// 用户返回热路径读取原始共享 pending 位；只用于组成可投递工作预检。
-    #[inline(always)]
-    pub(crate) fn pending_bits_relaxed(&self) -> u64 {
-        self.shared_pending_bits.load(Ordering::Relaxed)
     }
 
     pub fn pending_len_hint(&self) -> usize {

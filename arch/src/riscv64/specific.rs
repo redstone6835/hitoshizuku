@@ -5,6 +5,7 @@
 //! 对外接口不变。HartLocal（per-hart 数据）因跨模块性质保留在此处。
 
 use core::mem::offset_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // 子模块重导出
 pub use crate::riscv64::addr::*;
@@ -53,6 +54,8 @@ pub struct HartLocal {
     /// 与 Linux 的 `tp -> current/thread_info` 相同，只允许当前 hart 借用；
     /// 跨执行边界持有时必须在 sched 层显式提升为拥有型 `Arc`。
     pub current_task: usize,
+    /// 当前 CpuSchedState 中聚合返回工作 hint 的稳定地址。
+    pub cpu_user_return_work: usize,
 }
 /// 最终 return-to-user 窗口使用的紧急栈可用大小。
 ///
@@ -73,6 +76,7 @@ pub const HART_LOCAL_TRAP_ENTRY_T6_OFF: usize = offset_of!(HartLocal, trap_entry
 pub const HART_LOCAL_TRAP_ENTRY_STATE_OFF: usize = offset_of!(HartLocal, trap_entry_state);
 pub const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF: usize = offset_of!(HartLocal, context_switch_seq);
 pub const HART_LOCAL_CURRENT_TASK_OFF: usize = offset_of!(HartLocal, current_task);
+pub const HART_LOCAL_CPU_USER_RETURN_WORK_OFF: usize = offset_of!(HartLocal, cpu_user_return_work);
 
 /// 全部 hart 的紧急栈（静态分配，按 hart index 索引）。低地址端第一页仅作缓冲。
 #[repr(C, align(4096))]
@@ -104,6 +108,7 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
         trap_entry_state: 0,
         context_switch_seq: 0,
         current_task: 0,
+        cpu_user_return_work: 0,
     };
     [EMPTY; MAX_HARTS]
 };
@@ -147,6 +152,7 @@ pub(crate) unsafe fn init_secondary_hart_local(
             trap_entry_state: 0,
             context_switch_seq: logical_id,
             current_task: 0,
+            cpu_user_return_work: 0,
         });
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
@@ -191,15 +197,56 @@ pub(crate) fn current_task_ptr() -> *const sched::Task {
     unsafe { core::ptr::addr_of!((*ptr).current_task).read_volatile() as *const sched::Task }
 }
 
+#[inline(always)]
+fn current_cpu_user_return_work_ptr() -> *const AtomicU32 {
+    let ptr: usize;
+    // Safety: tp 始终指向当前 hart 的 HartLocal；固定偏移落在其中已由调度发布
+    // 路径写入的 usize 槽。直接以 tp 为基址可避免编译器额外生成一次 mv。
+    unsafe {
+        core::arch::asm!(
+            "ld {ptr}, {offset}(tp)",
+            ptr = out(reg) ptr,
+            offset = const HART_LOCAL_CPU_USER_RETURN_WORK_OFF,
+            options(nostack, readonly),
+        );
+    }
+    ptr as *const AtomicU32
+}
+
+/// 普通 syscall 返回热路径读取本 CPU 聚合工作 hint。
+#[inline(always)]
+pub(crate) fn current_cpu_user_return_work_pending_relaxed() -> bool {
+    let ptr = current_cpu_user_return_work_ptr();
+    debug_assert!(!ptr.is_null(), "CPU user-return work pointer is null");
+    // Safety: publish_current_task 在任务进入用户态前安装指向静态 CpuSchedState
+    // AtomicU32 的非空地址，且该对象在内核运行期不会移动或释放。
+    unsafe { (*ptr).load(Ordering::Relaxed) != 0 }
+}
+
+/// 返回慢路径与 CPU 工作生产者建立 Acquire/Release 同步。
+#[inline]
+pub(crate) fn current_cpu_user_return_work_pending_acquire() -> bool {
+    let ptr = current_cpu_user_return_work_ptr();
+    debug_assert!(!ptr.is_null(), "CPU user-return work pointer is null");
+    // Safety: 与 relaxed 读取相同，ptr 指向内核运行期稳定的 AtomicU32；Acquire
+    // 只用于和返回工作生产者的 Release 发布建立同步。
+    unsafe { (*ptr).load(Ordering::Acquire) != 0 }
+}
+
 /// 更新当前 hart 的 borrowed-current 裸指针。
 ///
 /// # Safety
-/// `task_ptr` 必须指向调度器 current 槽仍持有强引用的任务，且只能由当前 hart
-/// 在发布 next 的调度路径调用。
+/// `task_ptr` 必须指向调度器 current 槽仍持有强引用的任务；`cpu_work_ptr` 必须
+/// 指向静态 CpuSchedState 内的 AtomicU32。只能由当前 hart 在发布 next 时调用。
 #[inline(always)]
-pub(crate) unsafe fn set_current_task_ptr(task_ptr: usize) {
+pub(crate) unsafe fn set_current_task_ptr(task_ptr: usize, cpu_work_ptr: usize) {
     let ptr = current_hart_ptr();
-    unsafe { core::ptr::addr_of_mut!((*ptr).current_task).write_volatile(task_ptr) };
+    // Safety: 调用方保证当前 hart 独占写自己的 HartLocal，两个值均已由调度器
+    // 发布且生命周期覆盖 next 的整个运行区间。
+    unsafe {
+        core::ptr::addr_of_mut!((*ptr).current_task).write_volatile(task_ptr);
+        core::ptr::addr_of_mut!((*ptr).cpu_user_return_work).write_volatile(cpu_work_ptr);
+    }
 }
 
 /// 更新当前 hart 上正在运行任务的内核栈顶。

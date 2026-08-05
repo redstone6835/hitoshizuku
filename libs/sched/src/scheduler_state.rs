@@ -8,7 +8,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::cpu::{
     CpuId, CpuMask, MAX_CPUS, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedTopology,
@@ -74,6 +76,10 @@ pub struct CpuSchedState {
     retired: Spinlock<Vec<Arc<Task>>>,
     retired_nonempty: AtomicBool,
     need_resched: AtomicBool,
+    /// 本 CPU 存在返回用户态前必须处理的调度工作。
+    ///
+    /// 这是 Linux TIF 风格的粘性提示，不替代 need_resched/handoff 等权威字段。
+    user_return_work: AtomicU32,
     resched_notification_pending: AtomicBool,
     need_balance: AtomicBool,
     post_syscall_handoff: AtomicU8,
@@ -92,6 +98,7 @@ impl CpuSchedState {
             retired: Spinlock::new(Vec::new()),
             retired_nonempty: AtomicBool::new(false),
             need_resched: AtomicBool::new(false),
+            user_return_work: AtomicU32::new(0),
             resched_notification_pending: AtomicBool::new(false),
             need_balance: AtomicBool::new(false),
             post_syscall_handoff: AtomicU8::new(0),
@@ -157,15 +164,44 @@ impl CpuSchedState {
         self.need_resched.load(Ordering::Acquire)
     }
 
-    /// 当前 CPU 返回用户态前的无栅栏工作预检。
+    /// 返回可供架构 HartLocal 缓存的稳定 hint 地址。
+    #[inline]
+    pub(crate) fn user_return_work_ptr(&self) -> *const AtomicU32 {
+        &self.user_return_work
+    }
+
+    /// 当前 CPU 返回用户态前的无栅栏 hint 读取。
     #[inline(always)]
     pub(crate) fn user_return_work_pending_relaxed(&self) -> bool {
-        self.need_resched.load(Ordering::Relaxed)
-            || self.post_syscall_handoff.load(Ordering::Relaxed) != 0
+        self.user_return_work.load(Ordering::Relaxed) != 0
+    }
+
+    /// 慢路径与 CPU 工作生产者建立 Acquire/Release 同步。
+    #[inline]
+    pub(crate) fn user_return_work_pending_acquire(&self) -> bool {
+        self.user_return_work.load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    pub(crate) fn mark_user_return_work(&self) {
+        #[cfg(any(target_arch = "riscv64", test))]
+        self.user_return_work.fetch_or(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn take_user_return_work(&self) -> bool {
+        self.user_return_work.swap(0, Ordering::AcqRel) != 0
+    }
+
+    #[inline]
+    pub(crate) fn user_return_work_authoritative(&self) -> bool {
+        self.need_resched.load(Ordering::Acquire)
+            || self.post_syscall_handoff.load(Ordering::Acquire) != 0
     }
 
     pub fn request_resched(&self) {
         self.need_resched.store(true, Ordering::Release);
+        self.mark_user_return_work();
     }
 
     /// 尝试取得一次远端调度通知的发送权。
@@ -203,6 +239,7 @@ impl CpuSchedState {
         let mut old = self.post_syscall_handoff.load(Ordering::Acquire);
         loop {
             if old >= rounds {
+                self.mark_user_return_work();
                 return;
             }
             match self.post_syscall_handoff.compare_exchange_weak(
@@ -211,7 +248,10 @@ impl CpuSchedState {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    self.mark_user_return_work();
+                    return;
+                }
                 Err(actual) => old = actual,
             }
         }
@@ -238,15 +278,23 @@ impl CpuSchedState {
         {
             self.post_syscall_handoff
                 .store(TARGETED_HANDOFF_PENDING, Ordering::Release);
+            self.mark_user_return_work();
             return;
         }
         *pending = Some(target);
         drop(pending);
         self.post_syscall_handoff
             .store(TARGETED_HANDOFF_PENDING, Ordering::Release);
+        self.mark_user_return_work();
     }
 
-    pub fn clear_scheduling_requests(&self) {
+    /// 清理已静止、即将下线 CPU 的调度请求。
+    ///
+    /// 调用方必须先禁止新任务进入该 CPU，并摘除 current/idle。此接口不是并发
+    /// 消费协议。聚合 hint 故意保留：deferred timer payload 位于调度器外部，CPU
+    /// 重新上线后的第一次返回慢路径会统一复查并清掉可能的陈旧提示。
+    pub(crate) fn clear_scheduling_requests(&self) {
+        debug_assert!(self.current_raw.load(Ordering::Acquire).is_null());
         self.need_resched.store(false, Ordering::Release);
         self.clear_resched_notification();
         self.need_balance.store(false, Ordering::Release);

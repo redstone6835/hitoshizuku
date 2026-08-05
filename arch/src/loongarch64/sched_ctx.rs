@@ -321,7 +321,7 @@ unsafe fn set_kernel_trap_stack_raw(stack_top: usize) {
 }
 
 /// LoongArch64 暂不使用 borrowed-current 架构槽，保留契约以维持通用调度层布局。
-unsafe fn set_current_task_raw(_task_ptr: usize) {}
+unsafe fn set_current_task_raw(_task_ptr: usize, _cpu_work_ptr: usize) {}
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 

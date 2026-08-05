@@ -25,10 +25,10 @@ use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::rseq::RseqEvent;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
-    migrate_task, now_ns_public, online_cpu_mask, request_balance, request_post_syscall_handoff,
-    request_resched, root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
-    task_runqueue_cpu,
+    NR_CPUS, continue_task, current_cpu_id, current_task, deliver_shared_signal_to_group,
+    enqueue_task_deferred, mark_task_stopped, migrate_task, now_ns_public, online_cpu_mask,
+    request_balance, request_post_syscall_handoff, request_resched, root_pid_ns, runqueue_of,
+    schedule_once, select_cpu_for_mask, signal_wakeup, task_runqueue_cpu,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
@@ -1086,11 +1086,6 @@ fn make_siginfo_with_code(sig: SignalNumber, code: i32) -> SigInfo {
     }
 }
 
-fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
-    task.is_user_task()
-        && (!task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig))
-}
-
 fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
     let current = current_task();
     terminate_thread_group_by_signal_from(target, info, &current)
@@ -1156,13 +1151,7 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
         return delivered;
     }
 
-    target.thread_group().shared_signal().deliver(info);
-    for m in target.thread_group().snapshot() {
-        if should_wake_for_signal(&m, info.sig) {
-            signal_wakeup(&m, &info);
-            break;
-        }
-    }
+    deliver_shared_signal_to_group(&target.thread_group(), info);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered=true",
