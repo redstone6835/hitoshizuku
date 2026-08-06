@@ -37,6 +37,79 @@ fn vm_space_extension_can_be_borrowed_without_arc_clone() {
 }
 
 #[ktest]
+fn existing_extension_can_be_replaced_without_changing_its_slot() {
+    const COLD_KEY: u64 = 0x7fff_0001;
+    let task = make_task();
+    task.ext_install(TASKEXT_VM_SPACE, Arc::new(10usize));
+    task.ext_install(COLD_KEY, Arc::new(20usize));
+
+    let old_hot = task
+        .ext_replace(TASKEXT_VM_SPACE, Arc::new(11usize))
+        .expect("hot 扩展槽应已存在");
+    let old_cold = task
+        .ext_replace(COLD_KEY, Arc::new(21usize))
+        .expect("cold 扩展槽应已存在");
+
+    assert_eq!(old_hot.downcast_ref::<usize>(), Some(&10));
+    assert_eq!(old_cold.downcast_ref::<usize>(), Some(&20));
+    assert_eq!(
+        task.ext_with(TASKEXT_VM_SPACE, |value| value
+            .downcast_ref::<usize>()
+            .copied()),
+        Some(Some(11))
+    );
+    assert_eq!(
+        task.ext_with(COLD_KEY, |value| value.downcast_ref::<usize>().copied()),
+        Some(Some(21))
+    );
+}
+
+#[ktest]
+fn replacing_missing_extension_returns_payload_without_installing_it() {
+    const MISSING_KEY: u64 = 0x7fff_0002;
+    let task = make_task();
+    let replacement: Arc<dyn core::any::Any + Send + Sync> = Arc::new(30usize);
+
+    let returned = match task.ext_replace(MISSING_KEY, replacement) {
+        Ok(_) => panic!("缺失扩展槽不得在 replace 中隐式分配"),
+        Err(payload) => payload,
+    };
+
+    assert_eq!(returned.downcast_ref::<usize>(), Some(&30));
+    assert!(task.ext_lookup(MISSING_KEY).is_none());
+}
+
+#[ktest]
+fn extension_identity_check_rejects_replaced_payload() {
+    const KEY: u64 = 0x7fff_0003;
+    let task = make_task();
+    let observed: Arc<dyn core::any::Any + Send + Sync> = Arc::new(40usize);
+    task.ext_install(KEY, Arc::clone(&observed));
+
+    assert!(task.ext_is_current(KEY, &observed));
+    task.ext_replace(KEY, Arc::new(41usize))
+        .expect("待重验扩展槽应已存在");
+    assert!(!task.ext_is_current(KEY, &observed));
+}
+
+#[ktest]
+fn taking_robust_list_clears_registration_before_cleanup() {
+    let task = make_task();
+    task.set_robust_list(0x1234, 24);
+
+    let taken = task.take_robust_list();
+
+    assert_eq!(
+        taken,
+        RobustListState {
+            head: 0x1234,
+            len: 24
+        }
+    );
+    assert_eq!(task.robust_list(), RobustListState::default());
+}
+
+#[ktest]
 fn task_execution_scope_allows_each_action_once_and_resets_on_exit() {
     let task = make_task();
 
@@ -254,6 +327,54 @@ fn transitioning_publication_waits_for_active_signal_consumer() {
         .expect("consumer 退出后应完成发布");
     publisher.join().expect("发布线程不得 panic");
     assert_eq!(group.exec_phase(), ExecPhase::Transitioning);
+}
+
+#[ktest]
+fn transitioning_waits_for_complete_signal_consumption() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.add_member(&task);
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let consumer_task = Arc::clone(&task);
+    let consumer = std::thread::spawn(move || {
+        consumer_task
+            .consume_pending_signal(|info| {
+                assert_eq!(info.sig, SignalNumber::SIGUSR1);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .expect("Running 阶段应消费 pending signal");
+    });
+    entered_rx.recv().expect("consumer 应进入完整消费区间");
+
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let publisher_group = Arc::clone(&group);
+    let publisher = std::thread::spawn(move || {
+        publisher_group
+            .lock_exec()
+            .set_phase(ExecPhase::Transitioning);
+        published_tx.send(()).unwrap();
+    });
+    assert!(
+        published_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "signal action 完成前不得发布 Transitioning"
+    );
+    release_tx.send(()).unwrap();
+    published_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("完整消费结束后应完成 Transitioning 发布");
+    consumer.join().unwrap();
+    publisher.join().unwrap();
 }
 
 #[ktest]
@@ -626,6 +747,23 @@ fn pi_donation_preserves_base_update_until_last_waiter_leaves() {
     let restored = task.pi_remove_donation(9);
     assert_eq!(restored.policy, SchedPolicy::Fair);
     assert_eq!(restored.nice, 3);
+}
+
+#[ktest]
+fn deferred_pi_update_reads_latest_effective_attr() {
+    let task = make_task();
+    task.set_sched_attr(SchedAttr::fair(7, 0));
+    let _ = task.pi_add_donation(11, SchedAttr::rt_fifo(50));
+    task.request_deferred_pi_update();
+
+    let _ = task.pi_remove_donation(11);
+
+    let effective = task
+        .take_deferred_pi_effective_attr()
+        .expect("延迟 PI 更新应保留待处理标记");
+    assert_eq!(effective.policy, SchedPolicy::Fair);
+    assert_eq!(effective.nice, 7);
+    assert!(task.take_deferred_pi_effective_attr().is_none());
 }
 
 #[ktest]
@@ -1063,7 +1201,10 @@ fn runqueue_take_migratable_respects_cpu_affinity() {
     // 摘出来的任务处于"已离开源 rq、尚未挂上目标 rq"的中间态：on_rq 记为
     // MIGRATING 而不是 NONE，这样并发的唤醒者会等迁移落地而不是抢先入队。
     assert!(pulled.sched.is_migrating());
-    assert_eq!(pulled.sched.on_rq_state(), crate::eevdf::TASK_ON_RQ_MIGRATING);
+    assert_eq!(
+        pulled.sched.on_rq_state(),
+        crate::eevdf::TASK_ON_RQ_MIGRATING
+    );
     assert!(pulled.sched.on_rq());
     assert_eq!(rq.migratable_load(), 1);
     assert!(

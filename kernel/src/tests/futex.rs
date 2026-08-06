@@ -28,6 +28,61 @@ fn futex_wait_state_rearms_after_non_futex_wakeup() {
 }
 
 #[ktest]
+fn exec_cleanup_uses_bounded_scratch_and_clears_user_registrations() {
+    let task = sched::current_task();
+    let saved_vm = task.ext_remove(sched::TASKEXT_VM_SPACE);
+    let saved_robust = task.robust_list();
+    let saved_clear_child_tid = task.clear_child_tid();
+    let vm = Arc::new(VmSpace::new());
+    task.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
+    let page_size = general::mm::page_size();
+    vm.map_anon(
+        PROBE..PROBE + page_size,
+        VmFlags::EMPTY
+            .with(VmFlags::READ)
+            .with(VmFlags::WRITE)
+            .with(VmFlags::USER),
+    )
+    .expect("exec cleanup 测试映射失败");
+
+    let node = PROBE + 0x40;
+    let robust_word = node + 8;
+    let clear_child_tid = PROBE + 0x80;
+    copy_to_user(PROBE, &node.to_ne_bytes()).expect("写 robust head.next 失败");
+    copy_to_user(PROBE + 8, &(8isize).to_ne_bytes()).expect("写 futex offset 失败");
+    copy_to_user(PROBE + 16, &0usize.to_ne_bytes()).expect("写 list_op_pending 失败");
+    copy_to_user(node, &node.to_ne_bytes()).expect("写 robust 环节点失败");
+    write_user_u32(
+        robust_word,
+        task.pid_root().expect("当前任务没有 pid") as u32,
+    )
+    .expect("写 robust futex 失败");
+    write_user_u32(clear_child_tid, 99).expect("写 clear_child_tid 失败");
+    task.set_robust_list(PROBE, ROBUST_LIST_HEAD_SIZE);
+    task.set_clear_child_tid(clear_child_tid);
+    let mut scratch = ExecCleanupScratch::prepare().expect("预分配 exec cleanup scratch 失败");
+
+    cleanup_task_for_exec(&task, &mut scratch);
+
+    assert_eq!(task.robust_list(), sched::RobustListState::default());
+    assert_eq!(task.clear_child_tid(), 0);
+    assert_eq!(read_user_u32(clear_child_tid), Ok(0));
+    assert_eq!(
+        read_user_u32(robust_word).unwrap() & FUTEX_OWNER_DIED,
+        FUTEX_OWNER_DIED
+    );
+
+    task.set_robust_list(saved_robust.head, saved_robust.len);
+    task.set_clear_child_tid(saved_clear_child_tid);
+    vm.unmap(PROBE..PROBE + page_size)
+        .expect("清理 exec cleanup 测试映射失败");
+    task.ext_remove(sched::TASKEXT_VM_SPACE);
+    if let Some(saved_vm) = saved_vm {
+        task.ext_install(sched::TASKEXT_VM_SPACE, saved_vm);
+    }
+}
+
+#[ktest]
 fn futex_wait_requeue_and_user_rmw_are_atomic() {
     let task = sched::current_task();
     let saved_vm = task.ext_remove(sched::TASKEXT_VM_SPACE);

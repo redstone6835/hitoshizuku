@@ -14,6 +14,8 @@ mod process;
 mod signal;
 mod syslog;
 
+pub(crate) use process::{ExecCleanupScratch, cleanup_task_for_exec};
+
 use alloc::sync::Arc;
 use general::syscall::register_syscall;
 use sched::Task;

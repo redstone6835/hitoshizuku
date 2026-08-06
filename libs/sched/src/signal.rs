@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::ids::Uid;
 use crate::pid::PidT;
-use crate::sync::Spinlock;
+use crate::sync::{Spinlock, SpinlockGuard};
 
 /// 支持的最大信号数（含 0 号无效位，实际可用 1..=NSIG-1）。
 pub const NSIG: usize = 65;
@@ -453,17 +453,35 @@ impl Default for SignalState {
 /// ThreadGroup 共享的信号表：sigaction + 进程级 pending。
 pub struct SharedSignal {
     /// 信号处理表可由 `CLONE_SIGHAND` 跨线程组共享。
-    actions: Arc<Spinlock<[SigAction; NSIG]>>,
+    actions: Spinlock<Arc<SharedActionTable>>,
+    /// 共享表的变更门；exec 在 PONR 前持有它，阻止 disposition 写入竞争。
+    actions_gate: Arc<Spinlock<()>>,
     /// pending 队列只属于当前线程组，不能随 `CLONE_SIGHAND` 共享。
     shared_pending_bits: AtomicU64,
     shared_pending_infos: Spinlock<Vec<SigInfo>>,
     observers: SignalObservers,
 }
 
+struct SharedActionTable {
+    actions: Spinlock<[SigAction; NSIG]>,
+    generation: AtomicU64,
+}
+
+/// prepare 阶段构造完成、可在 exec 提交时直接发布的 disposition 表。
+pub struct PreparedSignalActions {
+    source: Arc<SharedActionTable>,
+    source_generation: u64,
+    replacement: Arc<SharedActionTable>,
+}
+
 impl SharedSignal {
     pub fn new() -> Self {
         Self {
-            actions: Arc::new(Spinlock::new([SigAction::default_new(); NSIG])),
+            actions: Spinlock::new(Arc::new(SharedActionTable {
+                actions: Spinlock::new([SigAction::default_new(); NSIG]),
+                generation: AtomicU64::new(0),
+            })),
+            actions_gate: Arc::new(Spinlock::new(())),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
             observers: SignalObservers::new(),
@@ -472,9 +490,14 @@ impl SharedSignal {
 
     /// 深拷一份（不 CLONE_SIGHAND 时）；pending 不复制。
     pub fn fork_copy(&self) -> Self {
-        let actions_copy = *self.actions.lock();
+        let actions = Arc::clone(&self.actions.lock());
+        let actions_copy = *actions.actions.lock();
         Self {
-            actions: Arc::new(Spinlock::new(actions_copy)),
+            actions: Spinlock::new(Arc::new(SharedActionTable {
+                actions: Spinlock::new(actions_copy),
+                generation: AtomicU64::new(0),
+            })),
+            actions_gate: Arc::new(Spinlock::new(())),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
             observers: SignalObservers::new(),
@@ -487,7 +510,8 @@ impl SharedSignal {
     /// `CLONE_THREAD` 才应直接复用同一个 [`SharedSignal`]。
     pub fn clone_sighand(&self) -> Self {
         Self {
-            actions: Arc::clone(&self.actions),
+            actions: Spinlock::new(Arc::clone(&self.actions.lock())),
+            actions_gate: Arc::clone(&self.actions_gate),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
             observers: SignalObservers::new(),
@@ -508,31 +532,40 @@ impl SharedSignal {
     }
 
     pub fn get_action(&self, sig: SignalNumber) -> SigAction {
-        self.actions.lock()[sig.as_usize()]
+        let actions = self.actions.lock();
+        actions.actions.lock()[sig.as_usize()]
     }
 
     /// 写 sigaction；SIGKILL/SIGSTOP 不允许改——调用方负责拒绝。
     pub fn set_action(&self, sig: SignalNumber, new: SigAction) -> SigAction {
-        let mut guard = self.actions.lock();
+        let _gate = self.actions_gate.lock();
+        let actions = self.actions.lock();
+        let mut guard = actions.actions.lock();
         let old = guard[sig.as_usize()];
         guard[sig.as_usize()] = new;
+        actions.generation.fetch_add(1, Ordering::AcqRel);
         old
     }
 
     /// execve 时按 POSIX 重置信号处理：所有 caught 信号恢复为 SIG_DFL，
     /// SIG_IGN 保持（除 SIGCHLD 特殊情况）。SIGKILL/SIGSTOP 不可改，跳过。
     pub fn reset_handlers_for_exec(&self) {
-        self.reset_caught_handlers();
+        let prepared = self.prepare_actions_for_exec();
+        self.install_actions_for_exec(&prepared);
     }
 
-    fn reset_caught_handlers(&self) {
-        let mut guard = self.actions.lock();
-        for sig_idx in 0..guard.len() {
+    /// 在不改变旧表的前提下预构造 exec 后的私有 disposition。
+    pub fn prepare_actions_for_exec(&self) -> PreparedSignalActions {
+        let _gate = self.actions_gate.lock();
+        let current = self.actions.lock();
+        let source_generation = current.generation.load(Ordering::Acquire);
+        let mut prepared = *current.actions.lock();
+        for sig_idx in 0..prepared.len() {
             let sig = SignalNumber::from_raw(sig_idx as i32);
-            let action = guard[sig_idx];
+            let action = prepared[sig_idx];
             match action.handler {
                 SigHandler::Handler(_) => {
-                    guard[sig_idx] = SigAction {
+                    prepared[sig_idx] = SigAction {
                         handler: SigHandler::Default,
                         flags: SigActionFlags(0),
                         mask: SigSet(0),
@@ -548,6 +581,34 @@ impl SharedSignal {
             }
             let _ = sig;
         }
+        PreparedSignalActions {
+            source: Arc::clone(&current),
+            source_generation,
+            replacement: Arc::new(SharedActionTable {
+                actions: Spinlock::new(prepared),
+                generation: AtomicU64::new(source_generation.wrapping_add(1)),
+            }),
+        }
+    }
+
+    /// 无分配发布 prepare 阶段构造的私有 disposition，pending 队列保持原位。
+    /// 来源表或代际变化时返回 false，调用方必须把它视为提交失败。
+    pub fn install_actions_for_exec(&self, prepared: &PreparedSignalActions) -> bool {
+        let lease = self.lock_actions_for_exec();
+        lease.install(prepared)
+    }
+
+    pub fn lock_actions_for_exec(&self) -> SignalActionsLease<'_> {
+        SignalActionsLease {
+            signal: self,
+            _gate: self.actions_gate.lock(),
+        }
+    }
+
+    /// 返回当前 disposition 表代际；只读取共享原子，不分配。
+    pub fn actions_generation(&self) -> u64 {
+        let _gate = self.actions_gate.lock();
+        self.actions.lock().generation.load(Ordering::Acquire)
     }
 
     /// 投一条信号到 tg 的共享 pending。
@@ -574,10 +635,6 @@ impl SharedSignal {
     }
 
     /// sigtimedwait 用：从 tg 共享 pending 里取出一条属于 `these` 集合的信号。
-    /// 不受调用线程当前 blocked mask 过滤。
-    ///
-    /// `these` 的含义是"调用方想要消费的信号集"——通常在
-    /// `rt_sigtimedwait(uthese, ...)` 中由用户态直接传入。
     pub(crate) fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
         let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
@@ -603,6 +660,35 @@ impl SharedSignal {
 
     pub fn pending_len_hint(&self) -> usize {
         self.shared_pending_infos.lock().len()
+    }
+}
+
+pub struct SignalActionsLease<'a> {
+    signal: &'a SharedSignal,
+    _gate: SpinlockGuard<'a, ()>,
+}
+
+impl SignalActionsLease<'_> {
+    pub fn is_current(&self, prepared: &PreparedSignalActions) -> bool {
+        let current = self.signal.actions.lock();
+        Arc::ptr_eq(&current, &prepared.source)
+            && current.generation.load(Ordering::Acquire) == prepared.source_generation
+    }
+
+    pub fn install(&self, prepared: &PreparedSignalActions) -> bool {
+        if !self.is_current(prepared) {
+            return false;
+        }
+        *self.signal.actions.lock() = Arc::clone(&prepared.replacement);
+        true
+    }
+}
+
+impl PreparedSignalActions {
+    /// 检查 prepare 时观察的 disposition 表仍是当前表。
+    pub fn is_current(&self, shared: &SharedSignal) -> bool {
+        let lease = shared.lock_actions_for_exec();
+        lease.is_current(self)
     }
 }
 

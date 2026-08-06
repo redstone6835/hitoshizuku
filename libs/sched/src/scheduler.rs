@@ -1415,6 +1415,12 @@ pub fn defer_task_wake(task: &Arc<Task>) {
     request_resched(target);
 }
 
+/// 把 PI 有效属性更新推迟到安全调度边界，供不可分配的清理路径使用。
+pub fn defer_pi_effective_update(task: &Arc<Task>) {
+    task.request_deferred_pi_update();
+    defer_task_wake(task);
+}
+
 fn drain_deferred_task_wakes() {
     let mut raw = DEFERRED_TASK_WAKES[cpu()].swap(core::ptr::null_mut(), Ordering::AcqRel);
     while !raw.is_null() {
@@ -1423,6 +1429,9 @@ fn drain_deferred_task_wakes() {
         let task = unsafe { Arc::from_raw(raw) };
         raw = task.take_deferred_wake_next();
         task.finish_deferred_wake();
+        if let Some(attr) = task.take_deferred_pi_effective_attr() {
+            let _ = crate::operation::pi_apply_effective_attr(&task, attr);
+        }
         if task.arch_context().is_some()
             && matches!(
                 task.state(),

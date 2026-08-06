@@ -175,6 +175,10 @@ impl ThreadGroupExecGuard<'_> {
         self.group.exec_generation()
     }
 
+    pub fn has_only_member(&self, task: &Arc<Task>) -> bool {
+        self.group.has_only_member_locked(task)
+    }
+
     pub fn advance_generation(&mut self) -> u64 {
         let next = self
             .generation()
@@ -263,6 +267,8 @@ impl ThreadGroup {
     /// - 若登记先完成，随后退出路径的 snapshot 必然包含该成员；
     /// - 若退出先发布，登记会被拒绝，避免 leader 可回收后又出现新线程。
     pub fn try_add_member(&self, task: &Arc<Task>) -> bool {
+        // 与 exec 共用同一把锁，避免 exec 重验后又插入兄弟线程。
+        let _exec = self.exec_lock.lock();
         if self.tgid() == PID_INVALID {
             if let Some(leader) = self.leader() {
                 if let Some(pid) = leader.pid_root() {
@@ -273,7 +279,10 @@ impl ThreadGroup {
             }
         }
         let mut members = self.members.lock();
-        if self.closing.load(Ordering::Acquire) || self.terminated.load(Ordering::Acquire) {
+        if self.exec_phase() != ExecPhase::Running
+            || self.closing.load(Ordering::Acquire)
+            || self.terminated.load(Ordering::Acquire)
+        {
             return false;
         }
         task.publish_user_abi_kind(self.user_abi_kind());
@@ -308,6 +317,25 @@ impl ThreadGroup {
     pub fn snapshot(&self) -> Vec<Arc<Task>> {
         let members = self.members.lock();
         members.iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    fn has_only_member_locked(&self, task: &Arc<Task>) -> bool {
+        let members = self.members.lock();
+        let mut found = false;
+        for member in members.iter().filter_map(Weak::upgrade) {
+            if Arc::ptr_eq(&member, task) {
+                found = true;
+            } else {
+                return false;
+            }
+        }
+        found
+    }
+
+    /// 判断当前线程组是否只有指定任务；检查与成员加入通过 exec 锁串行化。
+    pub fn has_only_member(&self, task: &Arc<Task>) -> bool {
+        let _exec = self.exec_lock.lock();
+        self.has_only_member_locked(task)
     }
 
     pub fn shared_signal(&self) -> &Arc<SharedSignal> {

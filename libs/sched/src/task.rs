@@ -896,6 +896,8 @@ pub struct Task {
     /// 在安全调度边界消费前保持任务存活。
     deferred_wake_next: AtomicPtr<Task>,
     deferred_wake_queued: AtomicBool,
+    /// 需要在安全调度边界重新应用的 PI 有效属性。
+    deferred_pi_update: AtomicBool,
     /// 当前登记本任务的 rq 所属 CPU；`usize::MAX` 表示不在任何 rq 上。
     ///
     /// 只在 rq 锁内更新，用于捕获"同一任务同时挂在两个 rq 上"的错误。参见
@@ -1040,6 +1042,7 @@ impl Task {
             placement: TaskPlacement::unbound(),
             deferred_wake_next: AtomicPtr::new(core::ptr::null_mut()),
             deferred_wake_queued: AtomicBool::new(false),
+            deferred_pi_update: AtomicBool::new(false),
             rq_owner: AtomicUsize::new(usize::MAX),
             ioprio: AtomicU32::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
@@ -1346,13 +1349,21 @@ impl Task {
         Arc::clone(&self.rel.lock().thread_group)
     }
 
-    pub(crate) fn dequeue_pending_signal(&self) -> Option<SigInfo> {
+    /// 取出并完整处理一条 signal，期间阻止 exec 发布 `Transitioning`。
+    ///
+    /// disposition 读取、默认动作和用户 frame 构造都必须在 `consume` 返回前完成；
+    /// producer 不取得 consumer 锁，仍可并发追加 pending。
+    pub(crate) fn consume_pending_signal<R>(
+        &self,
+        consume: impl FnOnce(SigInfo) -> R,
+    ) -> Option<R> {
         let group = self.thread_group();
         let _consumer = group.lock_signal_consumer()?;
-        self.signal.dequeue_one().or_else(|| {
+        let info = self.signal.dequeue_one().or_else(|| {
             self.shared_signal()
                 .dequeue_one(self.signal.blocked_snapshot().raw())
-        })
+        })?;
+        Some(consume(info))
     }
 
     pub(crate) fn dequeue_pending_signal_in(&self, these: SigSet) -> Option<SigInfo> {
@@ -1907,6 +1918,11 @@ impl Task {
         *self.robust_list.lock() = RobustListState { head, len };
     }
 
+    /// 原子取走 robust futex 登记；后续清理即使早退也不会遗留旧用户指针。
+    pub fn take_robust_list(&self) -> RobustListState {
+        core::mem::take(&mut *self.robust_list.lock())
+    }
+
     pub fn rseq_registration(&self) -> RseqRegistration {
         *self.rseq.lock()
     }
@@ -2422,6 +2438,40 @@ impl Task {
         pi.effective()
     }
 
+    /// 在不可回退的 exec 清理阶段登记 donation；不会因容量不足而分配。
+    pub fn pi_try_add_donation(&self, token: usize, attr: SchedAttr) -> Option<SchedAttr> {
+        let mut pi = self.pi.lock();
+        if let Some(existing) = pi.donations.iter_mut().find(|d| d.token == token) {
+            existing.attr = attr.normalized();
+        } else {
+            if pi.donations.len() == pi.donations.capacity() {
+                return None;
+            }
+            pi.donations.push(PiDonation {
+                token,
+                attr: attr.normalized(),
+            });
+        }
+        Some(pi.effective())
+    }
+
+    /// 仅更新已登记的 donation；exec 退出清理使用它避免在不可回退阶段扩容。
+    pub fn pi_update_existing_donation(
+        &self,
+        token: usize,
+        attr: Option<SchedAttr>,
+    ) -> SchedAttr {
+        let mut pi = self.pi.lock();
+        if let Some(attr) = attr {
+            if let Some(existing) = pi.donations.iter_mut().find(|d| d.token == token) {
+                existing.attr = attr.normalized();
+            }
+        } else {
+            pi.donations.retain(|donation| donation.token != token);
+        }
+        pi.effective()
+    }
+
     /// 移除一个 PI waiter 的 donation，返回 owner 恢复后的有效属性。
     pub fn pi_remove_donation(&self, token: usize) -> SchedAttr {
         let mut pi = self.pi.lock();
@@ -2483,6 +2533,16 @@ impl Task {
 
     pub(crate) fn finish_deferred_wake(&self) {
         self.deferred_wake_queued.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn request_deferred_pi_update(&self) {
+        self.deferred_pi_update.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_deferred_pi_effective_attr(&self) -> Option<SchedAttr> {
+        self.deferred_pi_update
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.pi_effective_attr())
     }
 
     pub(crate) fn bind_placement(
@@ -2569,6 +2629,40 @@ impl Task {
         }
     }
 
+    /// 原地替换一个已经存在的扩展槽，返回旧 payload。
+    ///
+    /// 与 [`Task::ext_install`] 不同，本接口绝不新增条目，因而可用于 exec 的
+    /// point-of-no-return 之后。槽不存在时原样返回待安装 payload。
+    pub fn ext_replace(
+        &self,
+        key: TaskExtKey,
+        payload: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, Arc<dyn Any + Send + Sync>> {
+        let execution_ptr = if key == TASKEXT_ELM_EXECUTION {
+            Arc::as_ptr(&payload) as *const () as usize
+        } else {
+            0
+        };
+        let replaced = if let Some(slot) = self.hot_ext.slot(key) {
+            let mut guard = slot.lock();
+            let Some(current) = guard.as_mut() else {
+                return Err(payload);
+            };
+            core::mem::replace(current, payload)
+        } else {
+            let mut ext = self.ext.lock();
+            let Some(entry) = ext.iter_mut().find(|entry| entry.key == key) else {
+                return Err(payload);
+            };
+            core::mem::replace(&mut entry.payload, payload)
+        };
+        if execution_ptr != 0 {
+            self.elm_execution_ptr
+                .store(execution_ptr, Ordering::Release);
+        }
+        Ok(replaced)
+    }
+
     /// 查询某个子系统状态；不存在返回 `None`。
     pub fn ext_lookup(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
         if let Some(payload) = self.hot_ext.lookup(key) {
@@ -2579,6 +2673,12 @@ impl Task {
             .iter()
             .find(|e| e.key == key)
             .map(|e| Arc::clone(&e.payload))
+    }
+
+    /// 判断扩展槽是否仍持有调用方观察到的同一个 payload。
+    pub fn ext_is_current(&self, key: TaskExtKey, observed: &Arc<dyn Any + Send + Sync>) -> bool {
+        self.ext_lookup(key)
+            .is_some_and(|current| Arc::ptr_eq(&current, observed))
     }
 
     /// 在扩展槽的借用期内访问 payload，避免只读热路径反复增减 Arc 引用计数。

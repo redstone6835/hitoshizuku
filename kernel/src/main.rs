@@ -18,6 +18,7 @@ mod bench;
 mod device_init;
 mod dtb;
 mod elm;
+mod exec;
 mod initramfs;
 mod integrated_components;
 mod net_runtime;

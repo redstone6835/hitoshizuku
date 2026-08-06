@@ -223,3 +223,74 @@ fn clone_sighand_shares_actions_without_sharing_pending() {
     assert!(parent.pending_snapshot().has(SignalNumber::SIGUSR2));
     assert!(!child.pending_snapshot().has(SignalNumber::SIGUSR2));
 }
+
+/// exec 必须脱离 CLONE_SIGHAND 共享表，同时保留当前线程组的 pending 队列。
+#[ktest]
+fn prepared_exec_actions_detach_shared_sighand_without_moving_pending() {
+    let process = SharedSignal::new();
+    let sharing_process = process.clone_sighand();
+    process.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            ..SigAction::default_new()
+        },
+    );
+    process.set_action(
+        SignalNumber::SIGUSR2,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+    process.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+
+    let prepared = process.prepare_actions_for_exec();
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234),
+        "prepare 不得提前改变旧 disposition"
+    );
+    process.install_actions_for_exec(&prepared);
+
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Default
+    );
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+    assert_eq!(
+        sharing_process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234),
+        "exec 不得重置另一个 CLONE_SIGHAND 线程组"
+    );
+    assert!(process.pending_snapshot().has(SignalNumber::SIGTERM));
+}
+
+/// exec prepare 后的 sigaction 修改必须使安装失败，不能覆盖新动作。
+#[ktest]
+fn prepared_exec_actions_reject_stale_disposition_generation() {
+    let process = SharedSignal::new();
+    let prepared = process.prepare_actions_for_exec();
+    process.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+
+    assert!(!process.install_actions_for_exec(&prepared));
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Ignore
+    );
+}

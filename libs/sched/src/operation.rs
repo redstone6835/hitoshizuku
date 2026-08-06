@@ -612,9 +612,6 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
-    me.clear_rseq_registration();
-    me.clear_sigaltstack();
-    me.shared_signal().reset_handlers_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);
         // vfork 父进程到这里已经可以继续运行，但不要立刻抢占刚 exec 完成的
@@ -1735,34 +1732,36 @@ pub fn deliver_pending_signals_for_task(
     if me.is_kernel_task() {
         return None;
     }
-    let info = me.dequeue_pending_signal()?;
-    if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
-        let _ = mark_task_stopped(me, info.sig);
-        return None;
-    }
-    let action = me.shared_signal().get_action(info.sig);
-    use crate::signal::SigHandler;
-    match action.handler {
-        SigHandler::Default => {
-            apply_default_action_for_task(me, info);
-            None
+    me.consume_pending_signal(|info| {
+        if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            let _ = mark_task_stopped(me, info.sig);
+            return None;
         }
-        SigHandler::Ignore => None,
-        SigHandler::Handler(_) => {
-            if process_image_ops().is_none() {
-                me.signal.deliver(info);
-                return Some(info);
+        let action = me.shared_signal().get_action(info.sig);
+        use crate::signal::SigHandler;
+        match action.handler {
+            SigHandler::Default => {
+                apply_default_action_for_task(me, info);
+                None
             }
-            match setup_user_signal_frame_for_task(me, info, action, user_ctx) {
-                Ok(()) => None,
-                Err(Errno::ENOSYS) => {
+            SigHandler::Ignore => None,
+            SigHandler::Handler(_) => {
+                if process_image_ops().is_none() {
                     me.signal.deliver(info);
-                    Some(info)
+                    return Some(info);
                 }
-                Err(_) => None,
+                match setup_user_signal_frame_for_task(me, info, action, user_ctx) {
+                    Ok(()) => None,
+                    Err(Errno::ENOSYS) => {
+                        me.signal.deliver(info);
+                        Some(info)
+                    }
+                    Err(_) => None,
+                }
             }
         }
-    }
+    })
+    .flatten()
 }
 
 /// 在保存 signal frame 前先应用 rseq 的 SIGNAL 事件。
