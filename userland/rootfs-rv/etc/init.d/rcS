@@ -26,6 +26,40 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+if [ -x /bin/mm-fault-bench ]; then
+    mm_bench_args="$(cat /etc/mygo-mm-bench-args 2>/dev/null || true)"
+    # shellcheck disable=SC2086
+    set -- $mm_bench_args
+    mm_bench_case="${1:-anon-write}"
+    mm_bench_pages="${2:-1}"
+    mm_bench_threads="${3:-1}"
+    mm_bench_repeats="${4:-1}"
+    for cmdline_file in /proc/cmdline /sys/kernel/cmdline; do
+        [ -r "$cmdline_file" ] || continue
+        for cmdline_arg in $(cat "$cmdline_file" 2>/dev/null); do
+            case "$cmdline_arg" in
+                mm_bench_case=*) mm_bench_case="${cmdline_arg#*=}" ;;
+                mm_bench_pages=*) mm_bench_pages="${cmdline_arg#*=}" ;;
+                mm_bench_threads=*) mm_bench_threads="${cmdline_arg#*=}" ;;
+                mm_bench_repeats=*) mm_bench_repeats="${cmdline_arg#*=}" ;;
+            esac
+        done
+    done
+    mm_bench_args="$mm_bench_case $mm_bench_pages $mm_bench_threads $mm_bench_repeats"
+    echo "[init][mm-bench] start args=$mm_bench_args"
+    # 参数只允许 benchmark 自身接受的枚举与十进制整数。
+    # shellcheck disable=SC2086
+    /bin/mm-fault-bench $mm_bench_args
+    mm_bench_status=$?
+    echo "[init][mm-bench] exit=$mm_bench_status"
+    echo "MM_FAULT_GUEST_DONE status=$mm_bench_status"
+    sync || true
+    poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || \
+        reboot -f >/dev/null 2>&1 || true
+    echo "[init][mm-bench] shutdown failed"
+    exec /bin/sh -i
+fi
+
 if [ -x /bin/syscall-bench ]; then
     syscall_bench_args="$(cat /etc/mygo-syscall-bench-args 2>/dev/null || true)"
     # shellcheck disable=SC2086

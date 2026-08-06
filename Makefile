@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := kernel
 
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
-	kernel-la kernel-rv syscall-bench-rv all clean cargo-setup \
+	kernel-la kernel-rv syscall-bench-rv mm-bench-rv all clean cargo-setup \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -18,6 +18,10 @@ SYSCALL_BENCH_ITERATIONS ?= 1000000
 SYSCALL_BENCH_REPEATS ?= 5
 SYSCALL_BENCH_CASE ?= all
 SYSCALL_BENCH_WARMUP ?= 100000
+MM_BENCH_CASE ?= anon-write
+MM_BENCH_PAGES ?= 1
+MM_BENCH_THREADS ?= 1
+MM_BENCH_REPEATS ?= 1
 PROFILE_MODE ?= sample
 PROFILE_PRESET ?= all
 PROFILE_SAMPLE_HZ ?= 250
@@ -69,6 +73,7 @@ ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
 ACCT_TEST_SRC := userland/tests/acct.c
 SYSCALL_BENCH_SRC := userland/tests/syscall_bench.c
+MM_BENCH_SRC := userland/tests/mm_fault_bench.c
 LOONGARCH_SXE_TEST_SRC := userland/tests/loongarch_sxe.c
 INIT_KEYWAIT_SRC := userland/init-keywait.c
 
@@ -278,6 +283,22 @@ define build_syscall_benchmark
 	fi
 endef
 
+define build_mm_benchmark
+	@if [ "$(1)" = "$(RV_ARCH)" ] && [ "$(TEST_MODE)" = "mm-bench" ]; then \
+		rm -rf $(BUILD_DIR)/$(1)/mm-bench; \
+		mkdir -p $(BUILD_DIR)/$(1)/mm-bench $(2)/bin; \
+		$(3)gcc -std=c11 -static -fno-pie -no-pie -O2 -Wall -Wextra -Werror -pthread \
+			$(MM_BENCH_SRC) -o $(BUILD_DIR)/$(1)/mm-bench/mm-fault-bench.elf; \
+		install -m 0755 $(BUILD_DIR)/$(1)/mm-bench/mm-fault-bench.elf \
+			$(2)/bin/mm-fault-bench; \
+		$(3)strip $(2)/bin/mm-fault-bench || true; \
+		printf '%s %s %s %s\n' \
+			'$(MM_BENCH_CASE)' '$(MM_BENCH_PAGES)' \
+			'$(MM_BENCH_THREADS)' '$(MM_BENCH_REPEATS)' \
+			>$(2)/etc/mygo-mm-bench-args; \
+	fi
+endef
+
 define prepare_compat_rootfs
 	$(MAKE) _busybox-$(1)
 	rm -rf $(2)
@@ -305,6 +326,7 @@ define prepare_compat_rootfs
 	$(call build_smp_user_tests,$(1),$(2),$(5))
 	$(call build_loongarch_sxe_tests,$(1),$(2),$(5))
 	$(call build_syscall_benchmark,$(1),$(2),$(5))
+	$(call build_mm_benchmark,$(1),$(2),$(5))
 	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
 	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
 		-exec install -m 0644 {} $(2)/lib/elm/ \;
@@ -326,6 +348,12 @@ _compat-kernel-loongarch64:
 
 syscall-bench-rv:
 	$(MAKE) kernel-rv TEST_MODE=syscall-bench \
+		KERNEL_MAP=$(abspath $(BUILD_DIR)/$(RV_ARCH)/kernel.map)
+
+mm-bench-rv:
+	$(MAKE) kernel-rv TEST_MODE=mm-bench \
+		MM_BENCH_CASE='$(MM_BENCH_CASE)' MM_BENCH_PAGES='$(MM_BENCH_PAGES)' \
+		MM_BENCH_THREADS='$(MM_BENCH_THREADS)' MM_BENCH_REPEATS='$(MM_BENCH_REPEATS)' \
 		KERNEL_MAP=$(abspath $(BUILD_DIR)/$(RV_ARCH)/kernel.map)
 
 kernel-rv: _modules-riscv64 $(PACK_INITRAMFS)

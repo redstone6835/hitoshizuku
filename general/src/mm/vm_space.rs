@@ -5493,7 +5493,7 @@ fn alloc_zeroed_user_page() -> Option<usize> {
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(page_size());
     // Safety: 分配器保证该页至少覆盖 `page_size()` 字节，且当前没有映射发布。
-    unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, page_size()) };
+    unsafe { zero_unpublished_user_pages(virt(paddr), page_size()) };
     Some(paddr)
 }
 
@@ -5549,8 +5549,22 @@ fn try_alloc_zeroed_user_page(order: usize, size: usize) -> Option<usize> {
     #[cfg(feature = "performance-profile")]
     let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(size);
     // Safety: `try_alloc_user_page` 返回独占且尚未发布的完整物理页。
-    unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, size) };
+    unsafe { zero_unpublished_user_pages(virt(paddr), size) };
     Some(paddr)
+}
+
+/// 清零尚未发布到 resident ledger 或用户页表的完整页面。
+///
+/// 正常内核路径总是在创建 [`VmSpace`] 前注册 arch MM ops；保留通用回退是为了
+/// 让 host 单元测试和早期 smoketest 不依赖具体 ISA。
+unsafe fn zero_unpublished_user_pages(vaddr: usize, len: usize) {
+    if let Some(ops) = user_pgd_ops() {
+        // Safety: 调用方保证该 direct-map 范围独占、可写且覆盖完整用户页。
+        unsafe { (ops.zero_user_pages)(vaddr, len) };
+    } else {
+        // Safety: 与上面的 arch 回调共享同一范围契约。
+        unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, len) };
+    }
 }
 
 fn free_user_page(paddr: usize) {
