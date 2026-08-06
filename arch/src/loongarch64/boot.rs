@@ -24,6 +24,20 @@ pub static CMDLINE_PTR: AtomicUsize = AtomicUsize::new(0);
 /// EFI 系统表地址。
 pub static EFI_SYSTEM_TABLE_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// 返回 `_start` 保存的完整启动寄存器参数（架构归一化）。
+///
+/// 三个字段恰好对应 `$a0/$a1/$a2`：`pre_boot_init` 已把原始值存入
+/// [`EFI_BOOT`] / [`CMDLINE_PTR`] / [`EFI_SYSTEM_TABLE_PTR`]。协议抽象层
+/// （`crate::boot_protocol`）只消费此视图做识别与决策，不触碰早期控制台等已由
+/// 各 atomic 驱动的子系统。
+pub(crate) fn boot_registers() -> crate::boot_protocol::BootRegisters {
+    crate::boot_protocol::BootRegisters::new(
+        EFI_BOOT.load(Ordering::Acquire),
+        CMDLINE_PTR.load(Ordering::Acquire),
+        EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire),
+    )
+}
+
 /// # 内核入口点
 ///
 /// 该函数是 LoongArch64 架构的内核入口点，按照 LoongArch64 的启动约定执行。

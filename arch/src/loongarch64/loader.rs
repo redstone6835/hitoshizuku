@@ -16,6 +16,7 @@ use core::{fmt, fmt::Write};
 
 use super::early_console::configure_early_console;
 use super::efi_stub;
+use crate::boot_protocol::{EfiMemoryMapSource, FirmwareSnapshot};
 use crate::*;
 use efi::*;
 use fdt::Fdt;
@@ -65,6 +66,93 @@ impl BootProtocolSelectionError {
                 "[loader] EFI stub did not complete ExitBootServices; refusing unsafe DT /memory fallback"
             }
         }
+    }
+}
+
+/// 由 loader 持有的固件快照引擎。
+///
+/// 实现 [`FirmwareSnapshot`]，把启动协议适配器所需的快照原语桥接到 loader 私有
+/// 的静态缓冲区和 efi_stub 调用。适配器只定义"该做什么"，本引擎负责"怎么做"。
+struct LoaderFirmwareSnapshot {
+    /// EFI 系统表指针（可能为 0）。
+    system_table: *mut EfiSystemTable,
+    /// 最近一次从配置表读取的 FDT 物理地址。
+    fdt_paddr: Option<usize>,
+    /// 最近一次从配置表读取的 RSDP 物理地址。
+    rsdp: Option<usize>,
+    /// 退出 Boot Services 后取得的内存映射来源。
+    memory_map_source: Option<EfiMemoryMapSource>,
+}
+
+impl LoaderFirmwareSnapshot {
+    /// 从 EFI 配置表采集 RSDP / FDT 指针。
+    fn collect_config_tables(&mut self) {
+        if self.system_table.is_null() {
+            return;
+        }
+        // Safety: system table 已在调用点通过 EfiSystemTableView 完整校验。
+        let st = unsafe { &*self.system_table };
+        self.rsdp = unsafe { st.find_acpi_rsdp() }.map(|p| p as usize);
+        self.fdt_paddr = unsafe { st.find_fdt() }.map(|p| p as usize);
+    }
+}
+
+impl FirmwareSnapshot for LoaderFirmwareSnapshot {
+    fn snapshot_dtb_from_paddr(&mut self, paddr: usize) -> Result<(), &'static str> {
+        store_kernel_dtb_from_address(paddr).map(|_| ())
+    }
+
+    fn exit_efi_boot_services(&mut self) -> Option<EfiMemoryMapSource> {
+        if self.system_table.is_null() {
+            return None;
+        }
+        let st = self.system_table;
+        let result = efi_stub::exit_boot_services_with_memory_map_snapshot(st);
+        let source = if result.is_ok() {
+            Some(efi_stub::EfiMemoryMapSource::BootServicesExited)
+        } else if result.err() == Some(status_unsupported()) {
+            match efi_stub::snapshot_memory_map(st) {
+                Ok(()) => Some(efi_stub::EfiMemoryMapSource::BootServicesActive),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        self.memory_map_source = source.map(map_memory_source);
+        self.memory_map_source
+    }
+
+    fn snapshot_acpi_from_rsdp(&mut self, rsdp_paddr: usize) -> Result<usize, &'static str> {
+        snapshot_acpi_tables(rsdp_paddr)
+    }
+
+    fn efi_acpi_rsdp(&self) -> Option<usize> {
+        self.rsdp
+    }
+
+    fn efi_fdt_paddr(&self) -> Option<usize> {
+        self.fdt_paddr
+    }
+
+    fn select_firmware_source(&self, source: StartFirmwareSource) {
+        let (acpi, dtb) = match source {
+            StartFirmwareSource::Acpi => (true, false),
+            StartFirmwareSource::Dtb => (false, true),
+        };
+        KERNEL_FIRMWARE_STATE
+            .acpi_enabled
+            .store(acpi, Ordering::Release);
+        KERNEL_FIRMWARE_STATE
+            .dtb_enabled
+            .store(dtb, Ordering::Release);
+    }
+}
+
+/// 把 efi_stub 的内存映射来源映射到 boot_protocol 的等价类型。
+fn map_memory_source(source: efi_stub::EfiMemoryMapSource) -> EfiMemoryMapSource {
+    match source {
+        efi_stub::EfiMemoryMapSource::BootServicesExited => EfiMemoryMapSource::BootServicesExited,
+        efi_stub::EfiMemoryMapSource::BootServicesActive => EfiMemoryMapSource::BootServicesActive,
     }
 }
 
@@ -289,6 +377,15 @@ fn firmware_dtb_bytes(vaddr: usize) -> Result<&'static [u8], &'static str> {
 ///
 /// 该视图不会被保存；正式固件选择仍在退出 Boot Services 前完成私有快照。
 fn early_firmware_dtb() -> Option<Fdt<'static>> {
+    let (fdt, _) = early_firmware_dtb_with_addr()?;
+    Some(fdt)
+}
+
+/// 从 EFI 配置表取 FDT 视图及其物理地址。
+///
+/// 返回 `(解析视图, 物理地址)`。物理地址用于 Linux 直启路径把配置表暴露的 FDT
+/// 快照进内核 DTB 缓冲区（`store_kernel_dtb_from_address` 需要物理地址）。
+fn early_firmware_dtb_with_addr() -> Option<(Fdt<'static>, usize)> {
     let raw_system_table = EFI_SYSTEM_TABLE_PTR.load(Ordering::Acquire);
     if raw_system_table == 0 {
         return None;
@@ -301,7 +398,7 @@ fn early_firmware_dtb() -> Option<Fdt<'static>> {
     // Services 前保持可读，这里只提取标准 FDT GUID 对应的指针。
     let raw_fdt = unsafe { view.table().find_fdt() }? as usize;
     let bytes = firmware_dtb_bytes(reset_to_virt(raw_fdt)).ok()?;
-    Fdt::parse(bytes).ok()
+    Fdt::parse(bytes).ok().map(|fdt| (fdt, raw_fdt))
 }
 
 /// 返回当前有效的 ACPI 映射表切片。
@@ -1180,80 +1277,40 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 若 EFI 内存映射快照可用，后续 `StartMemoryMap` 将携带归一化后的平台区域；
     // 若无，则仅允许那些本身不依赖独立启动内存映射的固件路径继续。
     KERNEL_FIRMWARE_STATE.reset_selection();
+    // 构造固件快照引擎并执行启动协议适配器快照。
+    //
+    // 引擎持有 EFI 系统表，从配置表采集 RSDP / FDT 指针；适配器（EFI 或
+    // Linux 直启）依据 `_start` 原始参数决定固件来源并驱动快照。快照产生的
+    // 状态（acpi/dtb 使能、内存映射）落在 KERNEL_FIRMWARE_STATE 与 efi_stub，
+    // 供步骤 4 构造 StartContext 读取。
+    let dispatcher =
+        crate::boot_protocol::BootProtocolDispatcher::new(crate::loongarch64::boot_registers());
+    let mut snapshot_engine = LoaderFirmwareSnapshot {
+        system_table: fw_table.unwrap_or(core::ptr::null_mut()),
+        fdt_paddr: None,
+        rsdp: None,
+        memory_map_source: None,
+    };
+    snapshot_engine.collect_config_tables();
+    let firmware_handoff = dispatcher
+        .dispatch(&mut snapshot_engine)
+        .unwrap_or_else(|err| panic!("[loader] firmware handoff failed: {}", err));
     let mut acpi_rsdp_for_state = 0usize;
-    if let Some(fw_table) = fw_table {
-        let acpi_rsdp = unsafe { (*fw_table).find_acpi_rsdp() };
-        let fdt = unsafe { (*fw_table).find_fdt() };
-        match efi_stub::exit_boot_services_with_memory_map_snapshot(fw_table) {
-            Ok(()) => {
-                printk!("[loader] EFI Boot Services exited after extracting system table data")
-            }
-            Err(status) if status == status_unsupported() => {
-                match efi_stub::snapshot_memory_map(fw_table) {
-                    Ok(()) => printk!(
-                        "[loader] EFI ExitBootServices hook unavailable; captured EFI memory map without exiting Boot Services"
-                    ),
-                    Err(map_status) if acpi_rsdp.is_some() => panic!(
-                        "[loader] ACPI tables discovered but EFI memory map snapshot failed without ExitBootServices: {} ({:#x})",
-                        status_name(map_status),
-                        map_status,
-                    ),
-                    Err(map_status) => {
-                        printk!(
-                            "[loader] EFI ExitBootServices hook unavailable and EFI memory map snapshot failed: {} ({:#x}); continuing without EFI memory map",
-                            status_name(map_status),
-                            map_status,
-                        );
-                    }
-                }
-            }
-            Err(status) => panic!(
-                "[loader] failed to exit EFI Boot Services: {} ({:#x})",
-                status_name(status),
-                status
-            ),
+    match firmware_handoff.source {
+        StartFirmwareSource::Acpi => {
+            acpi_rsdp_for_state = firmware_handoff.acpi_rsdp;
+            printk!(
+                "[loader] firmware selection: ACPI enabled via {} adapter, RSDP={:#x}",
+                firmware_handoff.adapter.name(),
+                acpi_rsdp_for_state,
+            );
         }
-
-        if let Some(rsdp) = acpi_rsdp {
-            // ACPI 路径需要 EFI 内存映射来获取可用物理内存，否则无法初始化分配器
-            if matches!(
-                efi_stub::memory_map_snapshot().map(|snapshot| snapshot.source),
-                Some(efi_stub::EfiMemoryMapSource::BootServicesExited)
-            ) {
-                let rsdp_phys = snapshot_acpi_tables(rsdp as usize).unwrap_or_else(|err| {
-                    panic!("[loader] failed to snapshot ACPI tables: {}", err)
-                });
-                acpi_rsdp_for_state = rsdp_phys;
-                KERNEL_FIRMWARE_STATE
-                    .acpi_enabled
-                    .store(true, Ordering::Release);
-                KERNEL_FIRMWARE_STATE
-                    .dtb_enabled
-                    .store(false, Ordering::Release);
-                printk!(
-                    "[loader] firmware selection: ACPI enabled, RSDP={:#x}; DTB ignored",
-                    rsdp_phys,
-                );
-            } else {
-                panic!(
-                    "[loader] ACPI tables discovered but ExitBootServices did not produce a usable memory map"
-                );
-            }
-        } else if let Some(fdt) = fdt {
-            store_kernel_dtb_from_address(fdt as usize)
-                .unwrap_or_else(|err| panic!("[loader] failed to snapshot EFI DTB: {}", err));
-            KERNEL_FIRMWARE_STATE
-                .dtb_enabled
-                .store(true, Ordering::Release);
-            KERNEL_FIRMWARE_STATE
-                .acpi_enabled
-                .store(false, Ordering::Release);
-            printk!("[loader] firmware selection: DTB enabled from EFI configuration table");
-        } else {
-            panic!("[loader] firmware selection failed: neither ACPI nor DTB found");
+        StartFirmwareSource::Dtb => {
+            printk!(
+                "[loader] firmware selection: DTB enabled via {} adapter",
+                firmware_handoff.adapter.name(),
+            );
         }
-    } else {
-        panic!("[loader] EFI system table unavailable; cannot discover ACPI or DTB");
     }
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 4：构造启动上下文 (StartContext) 并跳转到内核主函数
@@ -1320,6 +1377,11 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         } else {
             StartFirmwareSource::Dtb
         };
+        // 用启动协议抽象层复核识别结果并输出诊断。`BootProtocolDispatcher` 依据
+        // `_start` 原始参数（EFI 系统表指针 / efi_boot 标志）做协议分类；这里
+        // 与 EFI 交接能力校验结合，得到最终有效协议。协议识别结果已由前面的
+        // 固件快照段（BootProtocolDispatcher）完成并打印；这里用
+        // `select_effective_boot_protocol` 结合 EFI 交接能力校验，得到最终协议。
         let boot_protocol = select_effective_boot_protocol(
             reported_efi_boot,
             entered_via_efi_stub,
