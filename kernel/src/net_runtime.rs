@@ -668,8 +668,8 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
             return Err(NetDeviceRemoveError::Busy);
         };
         let invalidation = cluster.invalidate_interface(interface);
-        let invalidation_deadline = sched::now_ns_public().saturating_add(5_000_000_000);
-        while !invalidation.done() && sched::now_ns_public() < invalidation_deadline {
+        let invalidation_deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
+        while !invalidation.done() && sched::now_ns_direct() < invalidation_deadline {
             let _ = sched::operation::sched_yield();
         }
         if !invalidation.done() {
@@ -679,8 +679,8 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
         for task in control.tasks.lock().iter() {
             let _ = sched::activate_task(task);
         }
-        let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
-        while !control.done.load(Ordering::Acquire) && sched::now_ns_public() < deadline {
+        let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
+        while !control.done.load(Ordering::Acquire) && sched::now_ns_direct() < deadline {
             let _ = sched::operation::sched_yield();
         }
         if !control.done.load(Ordering::Acquire) {
@@ -1899,7 +1899,7 @@ impl KernelSocketRuntime {
             facade: Arc::clone(facade),
             mark: facade.socket_mark(),
             config: Arc::as_ptr(&config),
-            now_ns: sched::now_ns_public(),
+            now_ns: sched::now_ns_direct(),
             limit: net::stack::NET_STACK_LOCAL_TURN_EFFECT_CAPACITY as u16,
             inline_local: true,
             tcp_output: scratch.tcp,
@@ -3152,7 +3152,7 @@ pub fn start_workers() {
         "net.stack 有效 shard 数配置失败"
     );
     assert!(
-        control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_public()),
+        control_plane.initialize_autoconfig(&config.snapshot(), sched::now_ns_direct()),
         "net.stack 自动配置状态初始化失败"
     );
     let runtimes = protocol_cpus
@@ -3244,13 +3244,13 @@ pub fn start_workers() {
         sched::activate_task_with_cpu_hint(&task, cpu)
             .unwrap_or_else(|error| panic!("NetWorker 启动失败: {:?}", error));
     }
-    let startup_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let startup_deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     while runtimes
         .iter()
         .any(|runtime| !runtime.started.load(Ordering::Acquire))
     {
         assert!(
-            sched::now_ns_public() < startup_deadline,
+            sched::now_ns_direct() < startup_deadline,
             "协议 worker 未在 1 秒内进入主循环"
         );
         // 这里只需把 CPU 交给刚激活的协议 worker。把启动线程送入 timed-sleeper
@@ -3453,7 +3453,7 @@ impl NetWorkerContext {
             #[cfg(feature = "performance-profile")]
             let ingress_done = profiling::read_counter();
             self.runtime.timer_fired.store(false, Ordering::Release);
-            let now_ns = sched::now_ns_public();
+            let now_ns = sched::now_ns_direct();
             self.queue_autoconfig_turn(&config, now_ns);
             #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
             self.queue_udp_probe_observers();
@@ -3716,7 +3716,7 @@ impl NetWorkerContext {
                             facade: Arc::clone(&facade),
                             control_sequence: sequence,
                             local_transport,
-                            now_ns: sched::now_ns_public(),
+                            now_ns: sched::now_ns_direct(),
                             output: None,
                         });
                         self.turn_meta.push(TurnCommandMeta::ConnectTcp {
@@ -3840,7 +3840,7 @@ impl NetWorkerContext {
                         .0
                         .push(NetStackFlowCommand::EnqueueNeighbor {
                             work: Some(work),
-                            now_ns: sched::now_ns_public(),
+                            now_ns: sched::now_ns_direct(),
                             interface_limit: self.neighbor_interface_limit(),
                             output: None,
                         });
@@ -4220,7 +4220,7 @@ impl NetWorkerContext {
                     bound_source,
                     interface: interface.or_else(|| facade.interface()),
                     config: config as *const _,
-                    now_ns: sched::now_ns_public(),
+                    now_ns: sched::now_ns_direct(),
                     free_bind: options.free_bind,
                     output: None,
                 });
@@ -4558,7 +4558,7 @@ impl NetWorkerContext {
                                 facade: Arc::clone(&facade),
                                 mark: facade.socket_mark(),
                                 config: config as *const _,
-                                now_ns: sched::now_ns_public(),
+                                now_ns: sched::now_ns_direct(),
                                 limit: net::stack::NET_STACK_LOCAL_TURN_EFFECT_CAPACITY as u16,
                                 inline_local: true,
                                 tcp_output: scratch.tcp,
@@ -4572,7 +4572,7 @@ impl NetWorkerContext {
                             .0
                             .push(NetStackFlowCommand::DrainTcpSend {
                                 flow,
-                                now_ns: sched::now_ns_public(),
+                                now_ns: sched::now_ns_direct(),
                             });
                         self.turn_meta
                             .push(TurnCommandMeta::StreamDirty { facade, generation });
@@ -4612,7 +4612,7 @@ impl NetWorkerContext {
                     payload: Some(payload),
                     mark: facade.socket_mark(),
                     config: config as *const _,
-                    now_ns: sched::now_ns_public(),
+                    now_ns: sched::now_ns_direct(),
                     output: None,
                 });
             self.turn_meta.push(TurnCommandMeta::UdpTx {
@@ -4648,7 +4648,7 @@ impl NetWorkerContext {
                     payload: Some(payload),
                     mark: facade.socket_mark(),
                     config: config as *const _,
-                    now_ns: sched::now_ns_public(),
+                    now_ns: sched::now_ns_direct(),
                     output: None,
                 });
             self.turn_meta.push(TurnCommandMeta::RawTx {
@@ -5126,12 +5126,12 @@ impl NetWorkerContext {
                         if facade.is_abortive_close() {
                             self.turn_commands.0.push(NetStackFlowCommand::AbortTcp {
                                 flow,
-                                now_ns: sched::now_ns_public(),
+                                now_ns: sched::now_ns_direct(),
                             });
                         } else {
                             self.turn_commands.0.push(NetStackFlowCommand::CloseTcp {
                                 flow,
-                                now_ns: sched::now_ns_public(),
+                                now_ns: sched::now_ns_direct(),
                             });
                         }
                         self.turn_meta.push(TurnCommandMeta::TcpLifecycle {
@@ -5143,7 +5143,7 @@ impl NetWorkerContext {
                             .0
                             .push(NetStackFlowCommand::ShutdownTcpWrite {
                                 flow,
-                                now_ns: sched::now_ns_public(),
+                                now_ns: sched::now_ns_direct(),
                             });
                         self.turn_meta.push(TurnCommandMeta::TcpLifecycle {
                             facade: Arc::clone(&facade),
@@ -6832,7 +6832,7 @@ impl NetWorkerContext {
                             interface,
                             work: Some(work),
                             config: config as *const _,
-                            now_ns: sched::now_ns_public(),
+                            now_ns: sched::now_ns_direct(),
                             output: None,
                         });
                     self.turn_meta.push(TurnCommandMeta::LocalTcp);
@@ -6847,7 +6847,7 @@ impl NetWorkerContext {
                         .push(NetStackFlowCommand::ProcessLocalUdpWork {
                             interface,
                             work: Some(work),
-                            now_ns: sched::now_ns_public(),
+                            now_ns: sched::now_ns_direct(),
                             output: None,
                         });
                     self.turn_meta.push(TurnCommandMeta::LocalUdp);
@@ -6891,7 +6891,7 @@ impl NetWorkerContext {
             .push(NetStackControlCommand::HandleDhcpPacket {
                 interface,
                 packet: Some(packet),
-                now_ns: sched::now_ns_public(),
+                now_ns: sched::now_ns_direct(),
                 output: None,
             });
         self.turn_control_meta.push(TurnControlMeta::DhcpPacket {
@@ -6916,7 +6916,7 @@ impl NetWorkerContext {
                 interface,
                 local_mac,
                 config: config as *const _,
-                now_ns: sched::now_ns_public(),
+                now_ns: sched::now_ns_direct(),
                 output: None,
                 drop_counts: [0; DropReason::COUNT],
                 stats: None,
@@ -7002,7 +7002,7 @@ impl NetWorkerContext {
         let Some((key, mac_address)) = observed else {
             return;
         };
-        let now_ns = packet.metadata.rx_timestamp_ns.max(sched::now_ns_public());
+        let now_ns = packet.metadata.rx_timestamp_ns.max(sched::now_ns_direct());
         let _ = self.cluster.publish_control(
             ShardId(0),
             ControlWork::NeighborObservedOwner {
@@ -7180,7 +7180,7 @@ impl NetWorkerContext {
                 payload: Some(payload),
                 mark: 0,
                 config: config as *const _,
-                now_ns: sched::now_ns_public(),
+                now_ns: sched::now_ns_direct(),
                 output: None,
             });
         self.turn_meta
@@ -7236,7 +7236,7 @@ impl NetWorkerContext {
                 payload: Some(payload),
                 mark: 0,
                 config: config as *const _,
-                now_ns: sched::now_ns_public(),
+                now_ns: sched::now_ns_direct(),
                 output: None,
             });
         self.turn_meta
@@ -7282,9 +7282,9 @@ impl NetWorkerContext {
     }
 
     fn sleep_until_work(&mut self) {
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Other, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Other, sched::now_ns_direct());
         if !self.runtime.work_signal.begin_sleep() {
             self.runtime.work_signal.end_sleep();
             #[cfg(feature = "performance-profile")]
@@ -7321,7 +7321,7 @@ impl NetWorkerContext {
             return;
         }
         drop(task);
-        sched::schedule_once(sched::now_ns_public());
+        sched::schedule_once(sched::now_ns_direct());
         self.runtime.work_signal.end_sleep();
     }
 }
@@ -7619,12 +7619,12 @@ impl WorkerContext {
         self.prepare_physical_udp_probe();
         self.drain_egress();
         self.reclaim_tx();
-        let turn_start = sched::now_ns_public();
+        let turn_start = sched::now_ns_direct();
         let mut packet_budget = 128u16;
         let mut byte_budget = 256 * 1024u32;
         while packet_budget != 0
             && byte_budget != 0
-            && sched::now_ns_public().saturating_sub(turn_start) < 200_000
+            && sched::now_ns_direct().saturating_sub(turn_start) < 200_000
         {
             let result = self.poll_rx_once(RxBudget {
                 packets: packet_budget.min(32),
@@ -7642,7 +7642,7 @@ impl WorkerContext {
         if byte_budget == 0 {
             self.stats.budget_byte.fetch_add(1, Ordering::Relaxed);
         }
-        if sched::now_ns_public().saturating_sub(turn_start) >= 200_000 {
+        if sched::now_ns_direct().saturating_sub(turn_start) >= 200_000 {
             self.stats.budget_time.fetch_add(1, Ordering::Relaxed);
         }
         self.drain_egress();
@@ -8023,7 +8023,7 @@ impl WorkerContext {
     }
 
     fn complete_rx_metadata(&mut self) {
-        let timestamp = sched::now_ns_public();
+        let timestamp = sched::now_ns_direct();
         let pressure = if self.local_mac == [0; 6] {
             RxPoolPressure::Unmanaged
         } else {

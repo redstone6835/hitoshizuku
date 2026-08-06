@@ -32,8 +32,8 @@ fn wait_for_request_or_timeout() {
         return;
     }
 
-    let task = sched::current_task();
-    let now = sched::now_ns_public();
+    let task = sched::current_task_direct();
+    let now = sched::now_ns_direct();
     let deadline = now.saturating_add(TTY_POLLER_FALLBACK_INTERVAL_NS);
 
     // TTY 行规程会触碰 VFS/TTY 锁，必须在进程上下文运行。hook 只做原子置位，

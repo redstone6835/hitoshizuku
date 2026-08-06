@@ -1092,7 +1092,7 @@ fn flush_kernel_tlb_all() {
     TLB_GLOBAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
 }
 
-fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, range_size: usize) {
+fn execute_kernel_tlb_flush_plan_local(plan: &KernelTlbFlushPlan) {
     if plan.global {
         unsafe { Riscv64Paging::flush_tlb_global_local(None) };
         TLB_GLOBAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -1102,7 +1102,10 @@ fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, 
             TLB_ADDRESS_FLUSHES.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
 
+fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, range_size: usize) {
+    execute_kernel_tlb_flush_plan_local(plan);
     // 本地 sfence 需要逐 leaf 执行，但 SBI RFENCE 原生接受连续范围。把原先最多
     // 64 次 M-mode 往返合并为一次，同时仍在返回前等待所有远端 hart 完成失效。
     crate::riscv64::smp::remote_sfence_vma_range_on(usize::MAX, None, range_start, range_size);
@@ -1400,7 +1403,7 @@ fn map_range_with_policy(
         LARGE_PAGE_MAPS.fetch_add(size / page_size, Ordering::Relaxed);
     }
     let plan = uniform_kernel_tlb_flush_plan(vaddr, size, page_size);
-    execute_kernel_tlb_flush_plan(&plan, vaddr, size);
+    execute_kernel_tlb_flush_plan_local(&plan);
     Ok(())
 }
 

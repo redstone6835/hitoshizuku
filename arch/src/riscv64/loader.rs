@@ -164,7 +164,7 @@ fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
 
 // ── ISA 扩展检测 ──────────────────────────────────────────────────────────────
 
-/// 从 DTB 的 `/cpus/cpu@*` 节点解析 `riscv,isa` 属性，检测硬件扩展支持。
+/// 从 DTB 的 `/cpus/cpu@*` 节点解析所有启用 hart 共同支持的 ISA 扩展。
 fn detect_isa_extensions(dtb: &Dtb<'_>) {
     use crate::riscv64::specific::{CBO_BLOCK_SIZE, HAS_ZICBOZ};
     use core::sync::atomic::Ordering;
@@ -177,36 +177,90 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
         Some(c) => c,
         None => return,
     };
-    // 取第一个 cpu 节点的 riscv,isa 属性
+    let mut enabled_harts = 0usize;
+    let mut first_isa_processed = false;
+    let mut common_cboz_block_size = None;
+    let mut zicboz_common = true;
     for cpu_node in cpus.children() {
-        if !cpu_node.base_name_bytes().starts_with(b"cpu") {
+        if cpu_node.base_name_bytes() != b"cpu" || !cpu_node_enabled(cpu_node) {
             continue;
         }
-        if let Some(isa_prop) = cpu_node.find_property("riscv,isa") {
-            let isa_bytes = isa_prop.value();
-            // riscv,isa 值是以 NUL 结尾的字符串
-            if contains_extension(isa_bytes, b"zicboz") {
-                HAS_ZICBOZ.store(true, Ordering::Release);
-                log::info!("[loader] ISA: Zicboz detected");
-            }
-            if contains_extension(isa_bytes, b"sstc") {
-                crate::riscv64::time::set_sstc_available(true);
-                log::info!("[loader] ISA: Sstc detected; timer uses stimecmp");
-            }
-            crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
-            // 检查 riscv,cboz-block-size（如果有）
-            if let Some(bs_prop) = cpu_node.find_property("riscv,cboz-block-size") {
-                let val = bs_prop.value();
-                if val.len() >= 4 {
-                    let bs = u32::from_be_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    if bs.is_power_of_two() && bs >= 16 {
-                        CBO_BLOCK_SIZE.store(bs, Ordering::Release);
-                    }
+        enabled_harts += 1;
+        if !first_isa_processed {
+            first_isa_processed = true;
+            if let Some(isa_prop) = cpu_node.find_property("riscv,isa") {
+                let isa_bytes = isa_prop.value();
+                if contains_extension(isa_bytes, b"sstc") {
+                    crate::riscv64::time::set_sstc_available(true);
+                    log::info!("[loader] ISA: Sstc detected; timer uses stimecmp");
                 }
+                crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
             }
-            break; // 只需检测一个 hart，假设所有 hart 同构
+        }
+
+        if !cpu_has_extension(cpu_node, b"zicboz") {
+            zicboz_common = false;
+            continue;
+        }
+        let Some(block_size) = cpu_node
+            .find_property("riscv,cboz-block-size")
+            .and_then(|property| read_be_u32_prop(property.value()))
+            .map(|value| value as usize)
+        else {
+            zicboz_common = false;
+            continue;
+        };
+        if !block_size.is_power_of_two() || block_size < 16 || block_size > allocator::PAGE_SIZE {
+            zicboz_common = false;
+            continue;
+        }
+        match common_cboz_block_size {
+            None => common_cboz_block_size = Some(block_size),
+            Some(expected) if expected == block_size => {}
+            Some(_) => zicboz_common = false,
         }
     }
+
+    if enabled_harts != 0 && zicboz_common {
+        if let Some(block_size) = common_cboz_block_size {
+            // 先发布尺寸，HAS_ZICBOZ 的 Release store 最后开放快路径。
+            CBO_BLOCK_SIZE.store(block_size, Ordering::Relaxed);
+            HAS_ZICBOZ.store(true, Ordering::Release);
+            log::info!(
+                "[loader] ISA: Zicboz detected on {} harts, block_size={}",
+                enabled_harts,
+                block_size
+            );
+        }
+    }
+}
+
+fn cpu_node_enabled(node: general::dtb::DtbNode<'_>) -> bool {
+    let Some(status) = node.find_property("status") else {
+        return true;
+    };
+    let value = status.value();
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(value.len());
+    matches!(&value[..end], b"okay" | b"ok")
+}
+
+fn cpu_has_extension(node: general::dtb::DtbNode<'_>, extension: &[u8]) -> bool {
+    if node
+        .find_property("riscv,isa-extensions")
+        .is_some_and(|property| {
+            property
+                .value()
+                .split(|&byte| byte == 0)
+                .any(|entry| entry.eq_ignore_ascii_case(extension))
+        })
+    {
+        return true;
+    }
+    node.find_property("riscv,isa")
+        .is_some_and(|property| contains_extension(property.value(), extension))
 }
 
 /// 检查 ISA 字符串中是否包含指定扩展名（不区分大小写）。
@@ -245,6 +299,20 @@ fn dtb_cstr(value: &[u8]) -> &[u8] {
         .position(|&byte| byte == 0 || byte == b':')
         .unwrap_or(value.len());
     &value[..end]
+}
+
+/// 返回 `/chosen/bootargs` 的稳定 DTB 快照，不包含末尾 NUL。
+fn command_line_from_dtb(dtb: &Dtb<'static>) -> Option<&'static [u8]> {
+    let value = dtb
+        .root()?
+        .find_child("chosen")?
+        .find_property("bootargs")?
+        .value();
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(value.len());
+    (end != 0).then_some(&value[..end])
 }
 
 fn find_dtb_node_by_absolute_path<'a>(
@@ -528,7 +596,7 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 architecture: StartArchitecture::new("riscv64"),
                 protocol: StartBootProtocol::Direct,
                 boot_cpu_id: hart_id,
-                command_line: None,
+                command_line: command_line_from_dtb(&dtb),
             },
             firmware: StartFirmware::Dtb(dtb),
             memory: StartMemory {

@@ -551,9 +551,11 @@ impl Runqueue {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
 
+        let mut prev_addr = None;
         let mut fair_prev_addr = None;
         let mut kernel_idle = None;
         if let Some(prev) = inner.current.take() {
+            prev_addr = Some(task_addr(&prev));
             if prev.is_idle_task() {
                 // 内核 idle task 由每 CPU idle 槽提供，不属于可排队的
                 // SCHED_IDLE 任务。把它每个 tick 插入再移出 BTreeMap 会在
@@ -587,8 +589,14 @@ impl Runqueue {
 
         let preferred_fair_addr = inner.preferred_fair_addr.take();
         // 被选中的任务从索引树移入 current 槽，仍归属本 rq，因此不释放归属标记。
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask)
-            .or(kernel_idle);
+        let picked = pick_queued_locked(
+            &mut inner,
+            prev_addr,
+            fair_prev_addr,
+            preferred_fair_addr,
+            cpu_mask,
+        )
+        .or(kernel_idle);
 
         if let Some(ref task) = picked {
             // current 槽同样是"归属本 rq"。这里复查一次：若该任务此刻还被别的
@@ -956,13 +964,19 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
 
 fn pick_queued_locked(
     inner: &mut RqInner,
+    prev_addr: Option<usize>,
     mut fair_prev_addr: Option<usize>,
     mut preferred_fair_addr: Option<usize>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     loop {
-        let task =
-            pick_queued_candidate_locked(inner, fair_prev_addr, preferred_fair_addr, cpu_mask)?;
+        let task = pick_queued_candidate_locked(
+            inner,
+            prev_addr,
+            fair_prev_addr,
+            preferred_fair_addr,
+            cpu_mask,
+        )?;
         if task_can_run_on(&task, cpu_mask) {
             return Some(task);
         }
@@ -978,6 +992,7 @@ fn pick_queued_locked(
 
 fn pick_queued_candidate_locked(
     inner: &mut RqInner,
+    prev_addr: Option<usize>,
     fair_prev_addr: Option<usize>,
     preferred_fair_addr: Option<usize>,
     cpu_mask: u64,
@@ -985,7 +1000,7 @@ fn pick_queued_candidate_locked(
     if let Some(key) = inner
         .deadline_tree
         .iter()
-        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .find(|(_, task)| task_pickable_on(task, cpu_mask, prev_addr))
         .map(|(key, _)| *key)
     {
         return inner.deadline_tree.remove(&key);
@@ -994,25 +1009,33 @@ fn pick_queued_candidate_locked(
         .rt_tree
         .iter()
         .find(|(_, task)| {
-            task_allowed_on(task, cpu_mask) && (!inner.rt_throttled || task.pi_is_boosted())
+            task_pickable_on(task, cpu_mask, prev_addr)
+                && (!inner.rt_throttled || task.pi_is_boosted())
         })
         .map(|(key, _)| *key)
     {
         return inner.rt_tree.remove(&key);
     }
-    if let Some(task) = pick_fair_locked(inner, fair_prev_addr, preferred_fair_addr, cpu_mask) {
+    if let Some(task) = pick_fair_locked(
+        inner,
+        prev_addr,
+        fair_prev_addr,
+        preferred_fair_addr,
+        cpu_mask,
+    ) {
         return Some(task);
     }
     let key = inner
         .idle_tree
         .iter()
-        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .find(|(_, task)| task_pickable_on(task, cpu_mask, prev_addr))
         .map(|(key, _)| *key)?;
     inner.idle_tree.remove(&key)
 }
 
 fn pick_fair_locked(
     inner: &mut RqInner,
+    prev_addr: Option<usize>,
     skip_addr: Option<usize>,
     preferred_addr: Option<usize>,
     cpu_mask: u64,
@@ -1028,7 +1051,7 @@ fn pick_fair_locked(
     // 扫描 BTreeMap；这里一次遍历同时收集候选，减少 lmbench syscall/context
     // switch 热路径里的锁内扫描成本。
     for (key, task) in inner.fair_tree.iter() {
-        if !task_allowed_on(task, cpu_mask) {
+        if !task_pickable_on(task, cpu_mask, prev_addr) {
             continue;
         }
 
@@ -1072,6 +1095,13 @@ fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
         && task
             .running_cpu()
             .is_none_or(|cpu| cpu < u64::BITS as usize && (cpu_mask & (1u64 << cpu)) != 0)
+}
+
+fn task_pickable_on(task: &Arc<Task>, cpu_mask: u64, prev_addr: Option<usize>) -> bool {
+    task_allowed_on(task, cpu_mask)
+        && task
+            .running_cpu()
+            .is_none_or(|_| prev_addr == Some(task_addr(task)))
 }
 
 fn task_can_enter_runqueue(task: &Arc<Task>) -> bool {
