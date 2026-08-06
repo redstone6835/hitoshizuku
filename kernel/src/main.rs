@@ -102,6 +102,7 @@ fn main() -> ! {
         profiling::install_external_event_counter(external_profile_counter);
     }
     let secondary_cpus = hal::sched::start_secondary_cpus();
+    sched::install_firmware_topology();
     log::info!(
         "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
         secondary_cpus.detected,

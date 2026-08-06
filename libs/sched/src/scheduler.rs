@@ -2485,7 +2485,9 @@ pub(crate) fn requeue_balance_task_on(
             // task 可能带着 MIGRATING 状态进来（来自失败的 balance_once 回滚）；
             // 普通 enqueue 的 on_rq 门禁会拒绝它，需要走提交入口。
             let queued = if task.sched.is_migrating() {
-                cpu_state.runqueue().enqueue_migrated(Arc::clone(&task), now_ns)
+                cpu_state
+                    .runqueue()
+                    .enqueue_migrated(Arc::clone(&task), now_ns)
             } else {
                 cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
             };

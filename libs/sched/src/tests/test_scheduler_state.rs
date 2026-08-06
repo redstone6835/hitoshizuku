@@ -294,6 +294,37 @@ fn scheduler_state_aggregates_load_for_nested_domains() {
 }
 
 #[ktest]
+fn scheduler_state_sums_active_heterogeneous_cpu_capacities() {
+    let scheduler = Scheduler::new();
+    let pair = SchedDomain::with_capacity(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+        1408,
+    )
+    .expect("pair domain");
+    let slow = SchedDomain::with_capacity(2, CpuMask::single_raw(0), 2, Some(1), 384)
+        .expect("slow cpu leaf");
+    let fast = SchedDomain::with_capacity(3, CpuMask::single_raw(1), 2, Some(1), 1024)
+        .expect("fast cpu leaf");
+    let topology = SchedTopology::from_domains(&[SchedDomain::root(), pair, slow, fast])
+        .expect("heterogeneous topology");
+    scheduler.install_topology(topology);
+    scheduler.register_cpu(CpuId::new(1).expect("cpu1"));
+
+    let cpu_loads = [RunqueueClassLoad::default(); crate::NR_CPUS];
+    let both_active = scheduler.topology_snapshot();
+    scheduler.update_domain_stats(both_active, &cpu_loads);
+    assert_eq!(scheduler.domain_stats(1).unwrap().capacity, 1408);
+
+    assert!(scheduler.deactivate_cpu(CpuId::new(1).expect("cpu1")));
+    let boot_only = scheduler.topology_snapshot();
+    scheduler.update_domain_stats(boot_only, &cpu_loads);
+    assert_eq!(scheduler.domain_stats(1).unwrap().capacity, 384);
+}
+
+#[ktest]
 fn cpu_offline_drains_queued_tasks_to_active_cpu() {
     let scheduler = two_cpu_scheduler();
     let task = make_task();

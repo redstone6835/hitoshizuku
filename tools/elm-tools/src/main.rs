@@ -35,8 +35,7 @@ use kernel_interface::{
     KernelInterfaceManifest, emit_kernel_symbol_probe, export_kernel_interface,
 };
 use project::{
-    ElmBuildMode, ElmProjectDependency, ElmProjectManifest,
-    KernelInterfaceBundle,
+    ElmBuildMode, ElmProjectDependency, ElmProjectManifest, KernelInterfaceBundle,
     activate_kernel_interface, cargo_build, cargo_build_integrated, cargo_check, cargo_test,
     diagnose_project, scaffold_project, selected_kernel_interfaces, sync_framework,
 };
@@ -201,7 +200,9 @@ fn usage() {
     eprintln!(
         "  build-set <Modules.toml> --config <.config> --target <triple> --output <directory> [--features <a,b>]"
     );
-    eprintln!("  configure-set <Modules.toml> --config <.config> --mode <config|oldconfig|defconfig>");
+    eprintln!(
+        "  configure-set <Modules.toml> --config <.config> --mode <config|oldconfig|defconfig>"
+    );
     eprintln!("  inspect <file.eki>");
     eprintln!("  image-bundle <out.eki> --variant <profile-manifest> <image.eki> <priority> [...]");
 }

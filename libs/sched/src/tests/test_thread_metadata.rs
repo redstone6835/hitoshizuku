@@ -856,7 +856,10 @@ fn runqueue_take_migratable_respects_cpu_affinity() {
     // 摘出来的任务处于"已离开源 rq、尚未挂上目标 rq"的中间态：on_rq 记为
     // MIGRATING 而不是 NONE，这样并发的唤醒者会等迁移落地而不是抢先入队。
     assert!(pulled.sched.is_migrating());
-    assert_eq!(pulled.sched.on_rq_state(), crate::eevdf::TASK_ON_RQ_MIGRATING);
+    assert_eq!(
+        pulled.sched.on_rq_state(),
+        crate::eevdf::TASK_ON_RQ_MIGRATING
+    );
     assert!(pulled.sched.on_rq());
     assert_eq!(rq.migratable_load(), 1);
     assert!(

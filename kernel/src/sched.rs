@@ -907,6 +907,365 @@ static PROCESS_IMAGE_OPS: ProcessImageOps = ProcessImageOps {
     setup_signal_frame: process_setup_signal_frame,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FirmwareSchedGroupKey {
+    Socket(u32),
+    Cluster {
+        socket_id: Option<u32>,
+        path: Vec<u32>,
+    },
+    Core {
+        socket_id: Option<u32>,
+        cluster_path: Vec<u32>,
+        core_id: u32,
+    },
+    Cpu(u32),
+}
+
+struct FirmwareSchedGroup {
+    key: FirmwareSchedGroupKey,
+    parent: Option<FirmwareSchedGroupKey>,
+    mask: sched::CpuMask,
+    depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FirmwareSchedDomain {
+    span: sched::CpuMask,
+    parent: Option<usize>,
+    level: u8,
+    capacity: u64,
+}
+
+fn add_firmware_sched_group(
+    groups: &mut Vec<FirmwareSchedGroup>,
+    key: FirmwareSchedGroupKey,
+    parent: Option<FirmwareSchedGroupKey>,
+    cpu: sched::CpuId,
+    depth: usize,
+) -> Result<(), Errno> {
+    if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+        if group.parent != parent || group.depth != depth {
+            return Err(Errno::EINVAL);
+        }
+        group.mask = group.mask.union(cpu.mask());
+        return Ok(());
+    }
+    groups.push(FirmwareSchedGroup {
+        key,
+        parent,
+        mask: cpu.mask(),
+        depth,
+    });
+    Ok(())
+}
+
+fn firmware_cpu_capacities(
+    cpus: &[(sched::CpuId, &general::dev::cpu::CpuTopologyEntry)],
+) -> Vec<(sched::CpuId, u64)> {
+    let complete = !cpus.is_empty()
+        && cpus
+            .iter()
+            .all(|(_, cpu)| cpu.capacity_dmips_mhz.is_some_and(|capacity| capacity != 0));
+    let maximum = complete
+        .then(|| {
+            cpus.iter()
+                .filter_map(|(_, cpu)| cpu.capacity_dmips_mhz)
+                .max()
+                .unwrap_or(1)
+        })
+        .unwrap_or(1);
+    cpus.iter()
+        .map(|(cpu_id, cpu)| {
+            let capacity = if complete {
+                u64::from(cpu.capacity_dmips_mhz.unwrap_or(maximum))
+                    .saturating_mul(sched::SCHED_CAPACITY_SCALE)
+                    / u64::from(maximum)
+            } else {
+                sched::SCHED_CAPACITY_SCALE
+            };
+            (*cpu_id, capacity.max(1))
+        })
+        .collect()
+}
+
+fn firmware_domain_capacity(
+    span: sched::CpuMask,
+    capacities: &[(sched::CpuId, u64)],
+) -> Result<u64, Errno> {
+    let mut total = 0u64;
+    for cpu in span.iter() {
+        let capacity = capacities
+            .iter()
+            .find(|(candidate, _)| *candidate == cpu)
+            .map(|(_, capacity)| *capacity)
+            .ok_or(Errno::EINVAL)?;
+        total = total.checked_add(capacity).ok_or(Errno::EOVERFLOW)?;
+    }
+    (total != 0).then_some(total).ok_or(Errno::EINVAL)
+}
+
+/// 把固件 CPU socket/cluster/core/thread 关系转换成调度器的稳定层级域。
+///
+/// cluster 编号按完整 ancestry 解释；不同父 cluster 下的同名 `coreN` 不会合并。
+/// thread 由每 CPU 叶域表达。连续单子树产生的相同 span 会折叠，因此任意深度的
+/// cluster 链不会耗尽调度器固定域表。
+fn firmware_sched_topology_from(
+    entries: &[general::dev::cpu::CpuTopologyEntry],
+) -> Result<Option<sched::SchedTopology>, Errno> {
+    let mut cpus = Vec::new();
+    let mut firmware_mask = sched::CpuMask::EMPTY;
+    for cpu in entries {
+        let logical_id = usize::try_from(cpu.logical_id).map_err(|_| Errno::EINVAL)?;
+        let Some(cpu_id) = sched::CpuId::new(logical_id) else {
+            // 架构启动路径同样只启动 MAX_CPUS 个 CPU；固件多余节点不应让已支持
+            // CPU 的拓扑整体失效。
+            continue;
+        };
+        if firmware_mask.contains(cpu_id) {
+            return Err(Errno::EINVAL);
+        }
+        firmware_mask = firmware_mask.union(cpu_id.mask());
+        cpus.push((cpu_id, cpu));
+    }
+    if cpus.is_empty() {
+        return Ok(None);
+    }
+    let has_hierarchy = cpus.iter().any(|(_, cpu)| {
+        cpu.socket_id.is_some()
+            || !cpu.cluster_path.is_empty()
+            || cpu.core_id.is_some()
+            || cpu.thread_id.is_some()
+    });
+    let has_capacity = cpus
+        .iter()
+        .all(|(_, cpu)| cpu.capacity_dmips_mhz.is_some_and(|capacity| capacity != 0));
+    if !has_hierarchy && !has_capacity {
+        return Ok(None);
+    }
+
+    let capacities = firmware_cpu_capacities(&cpus);
+    let mut groups = Vec::new();
+    for (cpu_id, cpu) in &cpus {
+        let mut parent = None;
+        let mut depth = 0usize;
+
+        if let Some(socket_id) = cpu.socket_id {
+            depth += 1;
+            let key = FirmwareSchedGroupKey::Socket(socket_id);
+            add_firmware_sched_group(&mut groups, key.clone(), parent.clone(), *cpu_id, depth)?;
+            parent = Some(key);
+        }
+
+        for cluster_depth in 1..=cpu.cluster_path.len() {
+            depth += 1;
+            let key = FirmwareSchedGroupKey::Cluster {
+                socket_id: cpu.socket_id,
+                path: cpu.cluster_path[..cluster_depth].to_vec(),
+            };
+            add_firmware_sched_group(&mut groups, key.clone(), parent.clone(), *cpu_id, depth)?;
+            parent = Some(key);
+        }
+
+        if let Some(core_id) = cpu.core_id {
+            depth += 1;
+            let key = FirmwareSchedGroupKey::Core {
+                socket_id: cpu.socket_id,
+                cluster_path: cpu.cluster_path.to_vec(),
+                core_id,
+            };
+            add_firmware_sched_group(&mut groups, key.clone(), parent.clone(), *cpu_id, depth)?;
+            parent = Some(key);
+        }
+
+        depth += 1;
+        add_firmware_sched_group(
+            &mut groups,
+            FirmwareSchedGroupKey::Cpu(cpu.logical_id),
+            parent,
+            *cpu_id,
+            depth,
+        )?;
+    }
+
+    groups.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    let mut resolved: Vec<(FirmwareSchedGroupKey, Option<usize>)> = Vec::new();
+    let mut built: Vec<FirmwareSchedDomain> = Vec::new();
+    for group in groups {
+        let parent = match group.parent.as_ref() {
+            Some(parent_key) => resolved
+                .iter()
+                .find(|(key, _)| key == parent_key)
+                .map(|(_, domain)| *domain)
+                .ok_or(Errno::EINVAL)?,
+            None => None,
+        };
+        let duplicate_parent_span = parent.is_some_and(|parent| built[parent].span == group.mask);
+        let domain = if group.mask == firmware_mask || duplicate_parent_span {
+            parent
+        } else {
+            if built.len() + 1 >= sched::MAX_SCHED_DOMAINS {
+                return Err(Errno::E2BIG);
+            }
+            let level = parent
+                .map(|parent| built[parent].level)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(Errno::E2BIG)?;
+            let domain = built.len();
+            built.push(FirmwareSchedDomain {
+                span: group.mask,
+                parent,
+                level,
+                capacity: firmware_domain_capacity(group.mask, &capacities)?,
+            });
+            Some(domain)
+        };
+        resolved.push((group.key, domain));
+    }
+
+    let mut domains = Vec::with_capacity(built.len() + 1);
+    domains.push(sched::SchedDomain::root());
+    for domain in built {
+        let id = domains.len();
+        let parent = domain.parent.map_or(0, |parent| parent + 1);
+        domains.push(sched::SchedDomain::with_capacity(
+            id,
+            domain.span,
+            domain.level,
+            Some(parent),
+            domain.capacity,
+        )?);
+    }
+    sched::SchedTopology::from_domains(&domains).map(Some)
+}
+
+fn firmware_sched_topology() -> Result<Option<sched::SchedTopology>, Errno> {
+    firmware_sched_topology_from(&general::dev::cpu::snapshot_topology())
+}
+
+#[cfg(feature = "kernel-tests")]
+mod firmware_topology_tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use general::dev::cpu::CpuTopologyEntry;
+    use ktest::ktest;
+
+    use super::firmware_sched_topology_from;
+
+    fn cpu(
+        logical_id: u32,
+        cluster_path: &[u32],
+        core_id: Option<u32>,
+        thread_id: Option<u32>,
+        capacity: Option<u32>,
+    ) -> CpuTopologyEntry {
+        CpuTopologyEntry {
+            logical_id,
+            reg: u64::from(logical_id),
+            phandle: Some(logical_id + 1),
+            interrupt_controller_phandles: Vec::new().into_boxed_slice(),
+            compatible: Vec::new(),
+            socket_id: None,
+            cluster_path: cluster_path.to_vec().into_boxed_slice(),
+            core_id,
+            thread_id,
+            capacity_dmips_mhz: capacity,
+        }
+    }
+
+    #[ktest]
+    fn nested_cluster_local_core_ids_remain_scoped() {
+        let entries = vec![
+            cpu(0, &[0], Some(0), Some(0), None),
+            cpu(1, &[0], Some(0), Some(1), None),
+            cpu(2, &[1], Some(0), Some(0), None),
+            cpu(3, &[1], Some(0), Some(1), None),
+        ];
+        let topology = firmware_sched_topology_from(&entries)
+            .expect("valid firmware topology")
+            .expect("firmware topology present");
+
+        let cpu0 = sched::CpuId::new(0).unwrap();
+        let cpu2 = sched::CpuId::new(2).unwrap();
+        let leaf0 = topology.domain_for_cpu(cpu0).unwrap();
+        let leaf2 = topology.domain_for_cpu(cpu2).unwrap();
+        let near0 = topology.domain(leaf0.parent().unwrap()).unwrap();
+        let near2 = topology.domain(leaf2.parent().unwrap()).unwrap();
+        assert_eq!(near0.span().bits(), 0b0011);
+        assert_eq!(near2.span().bits(), 0b1100);
+        assert_ne!(near0.id(), near2.id());
+    }
+
+    #[ktest]
+    fn firmware_capacity_is_normalized_and_used() {
+        let entries = vec![
+            cpu(0, &[], None, None, Some(1)),
+            cpu(1, &[], None, None, Some(2)),
+        ];
+        let topology = firmware_sched_topology_from(&entries)
+            .expect("valid capacities")
+            .expect("capacity topology present");
+
+        assert_eq!(
+            topology.cpu_capacity(sched::CpuId::new(0).unwrap()),
+            sched::SCHED_CAPACITY_SCALE / 2
+        );
+        assert_eq!(
+            topology.cpu_capacity(sched::CpuId::new(1).unwrap()),
+            sched::SCHED_CAPACITY_SCALE
+        );
+    }
+
+    #[ktest]
+    fn firmware_topology_ignores_cpu_ids_beyond_kernel_capacity() {
+        let entries = vec![
+            cpu(0, &[0], Some(0), None, None),
+            cpu(1, &[0], Some(1), None, None),
+            cpu(sched::NR_CPUS as u32, &[1], Some(0), None, None),
+        ];
+        let topology = firmware_sched_topology_from(&entries)
+            .expect("unsupported firmware CPUs must be cropped")
+            .expect("supported topology present");
+
+        assert!(
+            topology
+                .domain_for_cpu(sched::CpuId::new(0).unwrap())
+                .is_some()
+        );
+        assert!(
+            topology
+                .domain_for_cpu(sched::CpuId::new(1).unwrap())
+                .is_some()
+        );
+    }
+}
+
+/// 在架构层完成 boot CPU 优先的 logical-id 重排后安装固件调度拓扑。
+pub fn install_firmware_topology() {
+    match firmware_sched_topology() {
+        Ok(Some(topology)) => {
+            let domains = topology.len();
+            sched::scheduler_state::SCHEDULER.install_topology(topology);
+            log::info!(
+                "[sched][boot] installed firmware CPU topology: domains={}",
+                domains
+            );
+        }
+        Ok(None) => log::info!("[sched][boot] no firmware CPU topology; using Root->Cpu"),
+        Err(error) => log::warning!(
+            "[sched][boot] invalid firmware CPU topology ({:?}); using Root->Cpu",
+            error
+        ),
+    }
+}
+
 /// 启动期入口：注入 arch hook → 注册 ext clone hook → 建 init →
 /// 给 init 装 VfsContext + FdTable → 启动 CPU 0 的 idle 内核线程。
 pub fn boot_init() -> Arc<Task> {
