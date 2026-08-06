@@ -509,7 +509,35 @@ fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
 }
 
 /// 解析 chosen 控制台的完整 16550 binding，并切换最早期输出配置。
+///
+/// 优先级：`/chosen/bootargs` 中的显式 `earlycon=` → `/chosen/stdout-path`。
+/// cmdline 优先是因为直启场景下它表达用户明确意图；DT stdout-path 作为回退。
 fn configure_early_console_from_dtb(dtb: &Fdt<'static>) {
+    // 先尝试 bootargs 中的显式 earlycon=。
+    let cmdline_earlycon =
+        dtb.chosen_bootargs().ok().flatten().and_then(|bootargs| {
+            general::cmdline::Cmdline::new(bootargs.as_bytes()).find("earlycon")
+        });
+    if let Some(value) = cmdline_earlycon {
+        match early_console::configure_from_cmdline(value) {
+            Ok(config) => {
+                log::info!(
+                    "[loader] early console from cmdline earlycon=: base={:#x} clock={} baud={} width={} endian={:?}",
+                    config.phys_base,
+                    config.clock_hz,
+                    config.baud,
+                    config.io_width.bytes(),
+                    config.endian,
+                );
+                return;
+            }
+            Err(error) => log::warning!(
+                "[loader] cmdline earlycon= rejected: {:?}; falling back to DTB stdout-path",
+                error
+            ),
+        }
+    }
+
     match early_console::configure_from_dtb(*dtb) {
         Ok(config) => log::info!(
             "[loader] early console from DTB: base={:#x} clock={} baud={} offset={:#x} shift={} width={} endian={:?}",

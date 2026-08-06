@@ -11,7 +11,7 @@ use fdt::Fdt;
 
 use crate::early_console_config::{
     EarlyUartConfig, EarlyUartConfigError, FALLBACK_EARLY_UART_CONFIG, RegisterEndian,
-    RegisterIoWidth, early_uart_config_from_fdt,
+    RegisterIoWidth, early_uart_config_from_cmdline, early_uart_config_from_fdt,
 };
 
 const DMW0_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
@@ -52,6 +52,7 @@ static UART_STATE: AtomicUsize = AtomicUsize::new(UART_STATE_UNINITIALIZED);
 pub(crate) enum EarlyConsoleSource {
     Fallback = 0,
     DeviceTree = 1,
+    CommandLine = 2,
 }
 
 impl EarlyConsoleSource {
@@ -59,6 +60,7 @@ impl EarlyConsoleSource {
         match self {
             Self::Fallback => "fallback",
             Self::DeviceTree => "dtb",
+            Self::CommandLine => "cmdline",
         }
     }
 }
@@ -71,8 +73,39 @@ pub(crate) struct EarlyConsoleSelection {
     pub(crate) dt_error: Option<EarlyUartConfigError>,
 }
 
-/// 在第一次输出前尝试采用 DT 控制台；失败时原子保留兜底配置。
-pub(crate) fn configure_early_console(dtb: Option<Fdt<'_>>) -> EarlyConsoleSelection {
+/// 在第一次输出前尝试采用启动控制台；失败时原子保留兜底配置。
+///
+/// 优先级：显式 `earlycon=` 命令行参数 → DT `/chosen/stdout-path` → fallback。
+/// cmdline 优先是因为它在 u-boot 等无 EFI 的直启路径下是唯一可靠的定位来源
+/// （DT 可能尚不可达）；DT 解析失败记录原因后仍回退 fallback，绝不半解析。
+pub(crate) fn configure_early_console(
+    dtb: Option<Fdt<'_>>,
+    cmdline_earlycon: Option<&str>,
+) -> EarlyConsoleSelection {
+    // ── 第 1 优先级：显式 earlycon= 命令行参数 ──────────────────────────
+    if let Some(value) = cmdline_earlycon {
+        match early_uart_config_from_cmdline(value, FALLBACK_EARLY_UART_CONFIG.clock_hz) {
+            Ok(config) if config_fits_uncached_window(config) => {
+                return commit_selection(config, EarlyConsoleSource::CommandLine, None);
+            }
+            Ok(_) => {
+                return commit_selection(
+                    FALLBACK_EARLY_UART_CONFIG,
+                    EarlyConsoleSource::Fallback,
+                    Some(EarlyUartConfigError::AddressOutOfWindow),
+                );
+            }
+            Err(error) => {
+                return commit_selection(
+                    FALLBACK_EARLY_UART_CONFIG,
+                    EarlyConsoleSource::Fallback,
+                    Some(error),
+                );
+            }
+        }
+    }
+
+    // ── 第 2 优先级：DT stdout-path（EFI 配置表路径）────────────────────
     let (candidate, source, dt_error) = match dtb {
         Some(dtb) => match early_uart_config_from_fdt(dtb) {
             Ok(config) if config_fits_uncached_window(config) => {
@@ -95,7 +128,15 @@ pub(crate) fn configure_early_console(dtb: Option<Fdt<'_>>) -> EarlyConsoleSelec
             None,
         ),
     };
+    commit_selection(candidate, source, dt_error)
+}
 
+/// 若 UART 尚未初始化则原子发布配置；否则保留已发布的配置。
+fn commit_selection(
+    candidate: EarlyUartConfig,
+    source: EarlyConsoleSource,
+    dt_error: Option<EarlyUartConfigError>,
+) -> EarlyConsoleSelection {
     if UART_STATE.load(Ordering::Acquire) == UART_STATE_UNINITIALIZED {
         store_config(candidate, source);
         EarlyConsoleSelection {
@@ -134,6 +175,9 @@ fn store_config(config: EarlyUartConfig, source: EarlyConsoleSource) {
 fn load_source() -> EarlyConsoleSource {
     match UART_SOURCE.load(Ordering::Acquire) {
         value if value == EarlyConsoleSource::DeviceTree as usize => EarlyConsoleSource::DeviceTree,
+        value if value == EarlyConsoleSource::CommandLine as usize => {
+            EarlyConsoleSource::CommandLine
+        }
         _ => EarlyConsoleSource::Fallback,
     }
 }

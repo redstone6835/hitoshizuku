@@ -872,9 +872,26 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     // 因此必须在 MMU 和 DMW 窗口稳定后安装。
     unsafe { install_exception_entry() };
 
-    // BSS、DMW 和临时栈此时已经可用，但堆尚未建立。先从 EFI 配置表借用 FDT，
-    // 用零分配解析器配置 chosen 16550；任何异常都完整回退到传统 QEMU 参数。
-    let early_console = configure_early_console(early_firmware_dtb());
+    // BSS、DMW 和临时栈此时已经可用，但堆尚未建立。先从 `_start` 传入的命令行
+    // 解析显式 `earlycon=`（u-boot 直启路径的唯一可靠定位来源），再从 EFI 配置表
+    // 借用 FDT 作为 DT 候选；两个来源都用零分配解析器配置 chosen 16550，任何异常
+    // 都完整回退到传统 QEMU 参数。
+    //
+    // 注意：QEMU 直启路径下 CMDLINE_PTR 可能是 0，但 0 此时仍是有效地址（映射到
+    // DMW1 基址，即物理地址 0），因此这里不把 0 当作“无命令行”——与
+    // `store_kernel_command_line` 的约定一致。地址无效时读到空字节，find 自然
+    // 返回 None，安全回退。
+    let cmdline_earlycon = {
+        let raw = CMDLINE_PTR.load(Ordering::Acquire);
+        let cmd = unsafe {
+            general::cmdline::Cmdline::from_raw_until_nul(
+                reset_to_virt(raw) as *const u8,
+                CMDLINE_BUF_SIZE,
+            )
+        };
+        cmd.find("earlycon")
+    };
+    let early_console = configure_early_console(early_firmware_dtb(), cmdline_earlycon);
 
     e_print(format_args!(
         "[{:6}.{:06}] [boot] Entering kernel loader...\n",
@@ -900,7 +917,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
     ));
     if let Some(error) = early_console.dt_error {
         e_print(format_args!(
-            "[{:6}.{:06}] [boot] early console DT fallback reason: {:?}\n",
+            "[{:6}.{:06}] [boot] early console candidate rejected: {:?}\n",
             0, 0, error
         ));
     }
@@ -961,19 +978,17 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
 
         // 步骤 1.1b：配置定时器中断，使其按配置频率产生中断。
         // 默认 100 Hz；命令行 `timer_hz=N` 可覆盖。
+        //
+        // 与 earlycon 解析相同：CMDLINE_PTR 为 0 时仍是有效地址（QEMU 直启把
+        // cmdline 放在物理地址 0），因此不把 0 当作“无命令行”，一律尝试解析。
         let timer_hz = {
             let mut hz = DEFAULT_TIMER_HZ;
             let raw = CMDLINE_PTR.load(Ordering::Acquire);
-            if raw != 0 {
-                let cmd = unsafe {
-                    general::cmdline::Cmdline::from_raw_until_nul(
-                        reset_to_virt(raw) as *const u8,
-                        4096,
-                    )
-                };
-                if let Some(val) = cmd.find("timer_hz").and_then(|v| v.parse().ok()) {
-                    hz = val;
-                }
+            let cmd = unsafe {
+                general::cmdline::Cmdline::from_raw_until_nul(reset_to_virt(raw) as *const u8, 4096)
+            };
+            if let Some(val) = cmd.find("timer_hz").and_then(|v| v.parse().ok()) {
+                hz = val;
             }
             hz.max(1).min(10000)
         };

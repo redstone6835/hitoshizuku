@@ -351,6 +351,45 @@ impl LogBuffer {
         self.clear_locked();
     }
 
+    /// 一次性消费当前所有未读日志，逐条调用 `visit`，并推进 `read_pos`。
+    ///
+    /// 与 [`Self::read_all`] 的区别：`read_all` 不推进消费位置（可重复读，dmesg
+    /// 语义），本方法在回调全部返回后把 `read_pos` 推进到 `write_pos`，保证正式
+    /// console 注册后回放启动早期日志不会被重复输出。若写入端追平（未读区间
+    /// 超过容量），丢弃最旧条目后从当前写入位置开始。
+    ///
+    /// 返回实际回放的条目数。
+    pub fn replay_ready<F>(&self, mut visit: F) -> usize
+    where
+        F: FnMut(LogLevel, u64, &str),
+    {
+        let Some(_lock) = self.try_lock() else {
+            return 0;
+        };
+        let mut pos = self.read_pos.load(Ordering::Acquire);
+        let end_pos = self.write_pos.load(Ordering::Acquire);
+        if end_pos.saturating_sub(pos) > LOG_BUFFER_SIZE {
+            pos = end_pos;
+        }
+        let mut count = 0usize;
+        while pos < end_pos {
+            let Some(entry) = self.parse_entry_at(pos, end_pos) else {
+                break;
+            };
+            let msg_start = pos + LogEntry::header_size();
+            let message = self.read_message_string(msg_start, entry.header.len as usize);
+            visit(
+                LogLevel::from_u8(entry.header.level),
+                entry.header.timestamp,
+                &message,
+            );
+            pos += entry.total_size;
+            count += 1;
+        }
+        self.read_pos.store(pos, Ordering::Release);
+        count
+    }
+
     pub fn unread_len(&self) -> usize {
         let read_pos = self.read_pos.load(Ordering::Acquire);
         let write_pos = self.write_pos.load(Ordering::Acquire);
@@ -590,6 +629,17 @@ pub fn bind_log_sink(sink: &'static LogSink) {
 /// 清除全局日志 sink
 pub fn clear_log_sink() {
     LOGGER.clear_sink();
+}
+
+/// 一次性回放全局日志缓冲区中尚未输出的条目，并推进消费位置。
+///
+/// 供正式 console 注册后调用，把 console 就绪前进入 ring buffer 的早期启动日志
+/// 全部输出一遍（一条不丢），此后新日志只走 sink。返回回放的条目数。
+pub fn replay_ready_logs<F>(visit: F) -> usize
+where
+    F: FnMut(LogLevel, u64, &str),
+{
+    LOGGER.replay_ready(visit)
 }
 
 /// 设置当前 sink 输出级别。

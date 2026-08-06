@@ -183,6 +183,8 @@ fn activate_console(
     }
     general::console::register_console(device);
     log::bind_log_sink(&CONSOLE_LOG_SINK);
+    // 回放 console 就绪前进入 ring buffer 的早期日志（一条不丢）。
+    replay_buffered_logs_to_console();
     if stash_for_boot_init {
         crate::sched::stash_boot_console_name(String::from("/dev/console"));
     }
@@ -200,6 +202,23 @@ fn task_fdtable(task: &Arc<Task>) -> Option<Arc<FdTable>> {
 fn write_log_record_to_console(record: &LogRecord<'_>) {
     let line = crate::start::format_log_record_line(record);
     general::console::console_write(line.as_bytes());
+}
+
+/// 回放 console 就绪前进入日志环形缓冲区的早期启动日志。
+///
+/// 启动早期没有 sink，所有日志仍写入 ring buffer；此处把未输出条目按与
+/// 实时日志一致的格式写向已注册的 console，保证启动过程一条日志都不丢。
+/// 消费语义保证回放后新日志不会被重复输出。
+fn replay_buffered_logs_to_console() {
+    log::replay_ready_logs(|level, timestamp, message| {
+        let record = log::LogRecord {
+            timestamp,
+            level,
+            seq: 0,
+            message,
+        };
+        write_log_record_to_console(&record);
+    });
 }
 
 /// 注册启动期核心文件系统驱动。

@@ -11,7 +11,7 @@ use fdt::Fdt;
 
 use crate::early_console_config::{
     EarlyUartConfig, EarlyUartConfigError, RegisterEndian, RegisterIoWidth,
-    early_uart_config_from_fdt,
+    early_uart_config_from_cmdline, early_uart_config_from_fdt,
 };
 
 const EARLY_MMIO_PHYS_END: usize = 0x4000_0000;
@@ -64,6 +64,37 @@ pub(crate) fn configure_from_dtb(dtb: Fdt<'_>) -> Result<EarlyUartConfig, EarlyU
         .ok_or(EarlyUartConfigError::AddressOverflow)?;
     if config.phys_base == 0 || end > EARLY_MMIO_PHYS_END {
         return Err(EarlyUartConfigError::AddressOverflow);
+    }
+
+    while UART_STATE.load(Ordering::Acquire) == UART_STATE_INITIALIZING {
+        core::hint::spin_loop();
+    }
+    UART_CLOCK_HZ.store(config.clock_hz as usize, Ordering::Relaxed);
+    UART_BAUD.store(config.baud as usize, Ordering::Relaxed);
+    UART_REG_OFFSET.store(config.reg_offset, Ordering::Relaxed);
+    UART_REG_SHIFT.store(config.reg_shift as usize, Ordering::Relaxed);
+    UART_IO_WIDTH.store(config.io_width.bytes(), Ordering::Relaxed);
+    UART_ENDIAN.store(config.endian as usize, Ordering::Relaxed);
+    UART_PHYS_BASE.store(config.phys_base, Ordering::Relaxed);
+    UART_BASE.store(config.phys_base, Ordering::Release);
+    UART_STATE.store(UART_STATE_UNINITIALIZED, Ordering::Release);
+    Ok(config)
+}
+
+/// 采用显式 `earlycon=` 命令行参数指定的 16550 控制台。
+///
+/// 优先级高于 [`configure_from_dtb`]：u-boot 等直启路径下 bootargs 是唯一可靠
+/// 的定位来源。RISC-V 早期 identity leaf 只覆盖 0..[`EARLY_MMIO_PHYS_END`]，
+/// 因此超出窗口的地址在此拒绝，避免发布后输出不可达。
+pub(crate) fn configure_from_cmdline(value: &str) -> Result<EarlyUartConfig, EarlyUartConfigError> {
+    let config = early_uart_config_from_cmdline(value, FALLBACK_EARLY_UART_CONFIG.clock_hz)?;
+    let end = config
+        .register_offset(REG_LSR)
+        .and_then(|offset| offset.checked_add(config.io_width.bytes()))
+        .and_then(|span| config.phys_base.checked_add(span))
+        .ok_or(EarlyUartConfigError::AddressOverflow)?;
+    if config.phys_base == 0 || end > EARLY_MMIO_PHYS_END {
+        return Err(EarlyUartConfigError::AddressOutOfWindow);
     }
 
     while UART_STATE.load(Ordering::Acquire) == UART_STATE_INITIALIZING {

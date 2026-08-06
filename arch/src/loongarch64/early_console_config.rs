@@ -105,6 +105,14 @@ pub(crate) enum EarlyUartConfigError {
     ConflictingEndian,
     MisalignedRegister,
     RegisterWindowTooSmall,
+    /// `earlycon=` 参数缺少访问方式段（io/mmio/mmio32/mmio32be）。
+    MissingAccessWidth,
+    /// `earlycon=` 参数缺少地址段，或地址段不是合法十六进制。
+    InvalidAddress,
+    /// `earlycon=` 地址解析后为空地址。
+    ZeroAddress,
+    /// `earlycon=` 地址超出当前早期映射窗口。
+    AddressOutOfWindow,
 }
 
 /// 从完整校验的 FDT 中零分配解析启动控制台。
@@ -200,6 +208,87 @@ pub(crate) fn early_uart_config_from_fdt(
     {
         return Err(EarlyUartConfigError::RegisterWindowTooSmall);
     }
+    Ok(config)
+}
+
+/// 从 Linux 风格 `earlycon=` 命令行参数零分配构造启动控制台配置。
+///
+/// 支持语法（与 Linux `drivers/tty/serial/earlycon.c` 的 `uart`/`uart8250`
+/// 入口一致）：
+///
+/// ```text
+/// earlycon=uart[,options],<io|mmio|mmio32|mmio32be>,<addr>[,baud]
+/// earlycon=uart8250[,options],<io|mmio|mmio32|mmio32be>,<addr>[,baud]
+/// ```
+///
+/// `options` 段按 Linux 语义保留但不参与地址/宽度解析；`<addr>` 为十六进制
+/// 物理地址（可带 `0x` 前缀），可选 `<baud>` 默认 115200。时钟频率取自调用方
+/// 传入的 `fallback_clock_hz`——启动早期 DT/ACPI 尚未解析，cmdline 是唯一
+/// 可用的控制台定位来源，波特率换算按该频率计算 divisor。
+///
+/// 返回的配置不包含 `reg-offset`/`reg-shift`（cmdline 无此表达），与 fallback
+/// 一致为 0；宽度/字节序由访问方式段决定。所有算术与对齐在发布前校验。
+pub(crate) fn early_uart_config_from_cmdline(
+    value: &str,
+    fallback_clock_hz: u32,
+) -> Result<EarlyUartConfig, EarlyUartConfigError> {
+    let mut parts = value.split(',');
+    let driver = parts.next().unwrap_or("");
+    if driver != "uart" && driver != "uart8250" {
+        return Err(EarlyUartConfigError::UnsupportedUart);
+    }
+    // 可选 `options` 段：Linux 允许 `uart[8250],<options>,...`，本实现不消费
+    // options 内容，只保证访问方式段能正确定位。
+    let access = parts
+        .next()
+        .ok_or(EarlyUartConfigError::MissingAccessWidth)?;
+    let (io_width, endian) = match access {
+        "io" | "mmio" => (RegisterIoWidth::U8, RegisterEndian::Little),
+        "mmio32" => (RegisterIoWidth::U32, RegisterEndian::Little),
+        "mmio32be" => (RegisterIoWidth::U32, RegisterEndian::Big),
+        // 该段必须是访问方式关键字；出现任何其它内容都视为缺少合法 access 段。
+        _ => return Err(EarlyUartConfigError::MissingAccessWidth),
+    };
+    let address_text = parts.next().ok_or(EarlyUartConfigError::InvalidAddress)?;
+    let phys_base = usize::from_str_radix(address_text.trim_start_matches("0x"), 16)
+        .map_err(|_| EarlyUartConfigError::InvalidAddress)?;
+    if phys_base == 0 {
+        return Err(EarlyUartConfigError::ZeroAddress);
+    }
+    let baud = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(115_200);
+    if baud == 0 || fallback_clock_hz == 0 {
+        return Err(EarlyUartConfigError::InvalidBaud);
+    }
+
+    let config = EarlyUartConfig {
+        phys_base,
+        clock_hz: fallback_clock_hz,
+        baud,
+        reg_offset: 0,
+        reg_shift: 0,
+        io_width,
+        endian,
+    };
+    if config.divisor().is_none() {
+        return Err(EarlyUartConfigError::InvalidBaud);
+    }
+    if !config.phys_base.is_multiple_of(io_width.bytes()) {
+        return Err(EarlyUartConfigError::MisalignedRegister);
+    }
+    let last_offset = config
+        .register_offset(UART_LSR_REGISTER)
+        .ok_or(EarlyUartConfigError::AddressOverflow)?;
+    let span = last_offset
+        .checked_add(io_width.bytes())
+        .ok_or(EarlyUartConfigError::AddressOverflow)?;
+    config
+        .phys_base
+        .checked_add(span)
+        .ok_or(EarlyUartConfigError::AddressOverflow)?;
     Ok(config)
 }
 
@@ -859,6 +948,75 @@ mod tests {
         assert_eq!(
             early_uart_config_from_fdt(Fdt::parse(&blob).unwrap()),
             Err(EarlyUartConfigError::ConflictingEndian)
+        );
+    }
+
+    #[test]
+    fn cmdline_mmio32_address_and_default_baud_are_decoded() {
+        let config =
+            early_uart_config_from_cmdline("uart8250,mmio32,0x1fe20000", 100_000_000).unwrap();
+        assert_eq!(config.phys_base, 0x1fe2_0000);
+        assert_eq!(config.clock_hz, 100_000_000);
+        assert_eq!(config.baud, 115_200);
+        assert_eq!(config.reg_offset, 0);
+        assert_eq!(config.reg_shift, 0);
+        assert_eq!(config.io_width, RegisterIoWidth::U32);
+        assert_eq!(config.endian, RegisterEndian::Little);
+        assert_eq!(config.divisor(), Some(54));
+    }
+
+    #[test]
+    fn cmdline_explicit_baud_overrides_default() {
+        let config =
+            early_uart_config_from_cmdline("uart,mmio,0x1fe20000,230400", 100_000_000).unwrap();
+        assert_eq!(config.baud, 230_400);
+        assert_eq!(config.io_width, RegisterIoWidth::U8);
+        assert_eq!(config.divisor(), Some(27));
+    }
+
+    #[test]
+    fn cmdline_mmio32be_sets_big_endian() {
+        let config =
+            early_uart_config_from_cmdline("uart8250,mmio32be,0x1fe20000", 100_000_000).unwrap();
+        assert_eq!(config.io_width, RegisterIoWidth::U32);
+        assert_eq!(config.endian, RegisterEndian::Big);
+    }
+
+    #[test]
+    fn cmdline_address_without_0x_prefix_is_accepted() {
+        let config = early_uart_config_from_cmdline("uart,mmio,1fe20000", 100_000_000).unwrap();
+        assert_eq!(config.phys_base, 0x1fe2_0000);
+    }
+
+    #[test]
+    fn cmdline_malformed_values_fail_strictly() {
+        assert_eq!(
+            early_uart_config_from_cmdline("ns16550a,mmio32,0x1fe20000", 100_000_000),
+            Err(EarlyUartConfigError::UnsupportedUart)
+        );
+        assert_eq!(
+            early_uart_config_from_cmdline("uart8250,0x1fe20000", 100_000_000),
+            Err(EarlyUartConfigError::MissingAccessWidth)
+        );
+        assert_eq!(
+            early_uart_config_from_cmdline("uart8250,mmio32", 100_000_000),
+            Err(EarlyUartConfigError::InvalidAddress)
+        );
+        assert_eq!(
+            early_uart_config_from_cmdline("uart8250,mmio32,xyz", 100_000_000),
+            Err(EarlyUartConfigError::InvalidAddress)
+        );
+        assert_eq!(
+            early_uart_config_from_cmdline("uart8250,mmio32,0x0", 100_000_000),
+            Err(EarlyUartConfigError::ZeroAddress)
+        );
+        assert_eq!(
+            early_uart_config_from_cmdline("uart8250,mmio32,0x1fe20000,0", 100_000_000),
+            Err(EarlyUartConfigError::InvalidBaud)
+        );
+        assert_eq!(
+            early_uart_config_from_cmdline("uart8250,mmio16,0x1fe20000", 100_000_000),
+            Err(EarlyUartConfigError::MissingAccessWidth)
         );
     }
 }
