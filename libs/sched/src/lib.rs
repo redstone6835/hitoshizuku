@@ -44,6 +44,9 @@
 //! 7. `WaitQueue::waiters` —— 等待者列表。
 //! 8. `SignalState::pending_infos` —— per-task 信号队列。
 //!
+//! exec 提交另有固定锁序：`ThreadGroup::exec_lock` → signal consumer lock →
+//! pending queue lock。信号 producer 只取得 pending queue lock。
+//!
 //! 调用可能触发唤醒 / 分配的函数前必须释放所有 rq 锁。
 //!
 //! 依赖 `alloc` 的 `Arc` / `Vec` / `BTreeMap`；不做堆外分配。原子操作必须
@@ -88,13 +91,17 @@ pub use cpu::{
     SchedTopology,
 };
 pub use eevdf::{SchedEntity, SchedParams, Weight};
-pub use group::{GroupExitStatus, ProcessGroup, Session, ThreadGroup};
+pub use group::{
+    GroupExitStatus, ProcessGroup, ProcessPersonalityState, Session, ThreadGroup,
+    ThreadGroupExecGuard,
+};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
 pub use membarrier::{
     handle_ipi as handle_membarrier_ipi, handle_ipi_on as handle_membarrier_ipi_on,
     pending_on as membarrier_pending_on, synchronize_cpus,
 };
 pub use migration::MigrationContext;
+pub use native_abi::{ExecPhase, UserAbiKind};
 pub use operation::spawn_user_process;
 pub use pid::{PidNamespace, PidRegistry, PidT};
 pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};

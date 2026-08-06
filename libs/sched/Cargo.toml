@@ -16,6 +16,7 @@ performance-profile = ["dep:profiling"]
 errno = { path = "../errno" }
 kernel-symbols = { path = "../kernel-symbols" }
 log = { path = "../log" }
+native-abi = { path = "../native-abi" }
 profiling = { path = "../profiling", optional = true }
 
 [dev-dependencies]

@@ -328,7 +328,7 @@ impl SignalState {
     }
 
     /// 取出一条当前未被 block 的信号；无匹配返回 None。
-    pub fn dequeue_one(&self) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one(&self) -> Option<SigInfo> {
         let blocked = self.blocked.load(Ordering::Acquire);
         let mut queue = self.pending_infos.lock();
         let idx = queue.iter().position(|i| (blocked & i.sig.bit()) == 0)?;
@@ -346,7 +346,7 @@ impl SignalState {
 
     /// sigtimedwait 用：从 per-task pending 里取出一条属于 `these` 集合的信号。
     /// sigtimedwait 显式等待调用方给定集合，不再受当前 blocked mask 过滤。
-    pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
         let mut queue = self.pending_infos.lock();
         let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
         let info = queue.swap_remove(idx);
@@ -559,7 +559,7 @@ impl SharedSignal {
     }
 
     /// 取出一条与 per-task `blocked` 不冲突的信号。
-    pub fn dequeue_one(&self, blocked: u64) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one(&self, blocked: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
         let idx = queue.iter().position(|i| (blocked & i.sig.bit()) == 0)?;
         let info = queue.swap_remove(idx);
@@ -578,7 +578,7 @@ impl SharedSignal {
     ///
     /// `these` 的含义是"调用方想要消费的信号集"——通常在
     /// `rt_sigtimedwait(uthese, ...)` 中由用户态直接传入。
-    pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
         let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
         let info = queue.swap_remove(idx);

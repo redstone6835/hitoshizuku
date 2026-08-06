@@ -41,7 +41,7 @@ use crate::pid::{PidNamespace, PidT};
 use crate::placement::{PlacementSnapshot, TaskPlacement};
 use crate::rseq::{RseqEvent, RseqEvents};
 use crate::sched_class::{RT_PRIO_MAX, SchedAttr, SchedPolicy};
-use crate::signal::{SharedSignal, SignalNumber, SignalState};
+use crate::signal::{SharedSignal, SigInfo, SigSet, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
 use crate::wait_flags::WaitStatus;
@@ -773,6 +773,8 @@ pub struct Task {
     /// 用户任务和内核任务的生命周期域不同。该字段用于把内核线程从 POSIX
     /// signal/exit_group/wait 模型中隔离出去。
     kind: AtomicU8,
+    /// 从线程组权威 personality 派生的 trap 热路径缓存。
+    user_abi_kind: AtomicU8,
     state: AtomicU8,
     /// 发送者已对本成员发布协作组退出。与睡眠状态使用
     /// SeqCst 握手，覆盖“waker 先观察到 Running”的提交窗口。
@@ -940,11 +942,13 @@ impl Task {
         process_group: Arc<ProcessGroup>,
     ) -> Arc<Self> {
         let shared = Arc::clone(thread_group.shared_signal());
+        let user_abi_kind = thread_group.user_abi_kind();
         TASK_CREATED.fetch_add(1, Ordering::Relaxed);
         TASK_LIVE.fetch_add(1, Ordering::Relaxed);
         let task = Arc::new(Self {
             sched: SchedEntity::new(params),
             kind: AtomicU8::new(TaskKind::User as u8),
+            user_abi_kind: AtomicU8::new(user_abi_kind as u8),
             state: AtomicU8::new(TaskState::New as u8),
             group_exit_requested: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
@@ -1056,6 +1060,15 @@ impl Task {
 
     pub fn kind(&self) -> TaskKind {
         TaskKind::from_u8(self.kind.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    pub fn user_abi_kind(&self) -> native_abi::UserAbiKind {
+        native_abi::UserAbiKind::from_raw(self.user_abi_kind.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn publish_user_abi_kind(&self, kind: native_abi::UserAbiKind) {
+        self.user_abi_kind.store(kind as u8, Ordering::Release);
     }
 
     pub fn is_user_task(&self) -> bool {
@@ -1331,6 +1344,31 @@ impl Task {
 
     pub fn thread_group(&self) -> Arc<ThreadGroup> {
         Arc::clone(&self.rel.lock().thread_group)
+    }
+
+    pub(crate) fn dequeue_pending_signal(&self) -> Option<SigInfo> {
+        let group = self.thread_group();
+        let _consumer = group.lock_signal_consumer()?;
+        self.signal.dequeue_one().or_else(|| {
+            self.shared_signal()
+                .dequeue_one(self.signal.blocked_snapshot().raw())
+        })
+    }
+
+    pub(crate) fn dequeue_pending_signal_in(&self, these: SigSet) -> Option<SigInfo> {
+        let group = self.thread_group();
+        let _consumer = group.lock_signal_consumer()?;
+        self.signal
+            .dequeue_one_in(these.raw())
+            .or_else(|| self.shared_signal().dequeue_one_in(these.raw()))
+    }
+
+    pub(crate) fn has_pending_signal_in(&self, these: SigSet) -> bool {
+        let group = self.thread_group();
+        let Some(_consumer) = group.lock_signal_consumer() else {
+            return false;
+        };
+        self.signal.has_pending_in(these.raw()) || self.shared_signal().has_pending_in(these.raw())
     }
 
     /// 当前用户任务是否需要协作退出线程组。

@@ -1443,6 +1443,10 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
     if task.group_exit_pending() {
         return true;
     }
+    let group = task.thread_group();
+    let Some(consumer) = group.lock_signal_consumer() else {
+        return false;
+    };
     let blocked = task.signal.blocked_snapshot().raw();
     let pending = (task.signal.pending_snapshot().raw()
         | task.shared_signal().pending_snapshot().raw())
@@ -1471,6 +1475,7 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
                             .dequeue_one_in(sig.bit())
                             .or_else(|| task.shared_signal().dequeue_one_in(sig.bit()))
                             .unwrap_or_else(|| make_siginfo(sig));
+                        drop(consumer);
                         apply_default_action_for_task(task, info);
                     }
                     return true;
@@ -1508,10 +1513,7 @@ pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
             continue;
         }
 
-        let info = me
-            .signal
-            .dequeue_one_in(sig.bit())
-            .or_else(|| me.shared_signal().dequeue_one_in(sig.bit()))?;
+        let info = me.dequeue_pending_signal_in(SigSet::from_raw(sig.bit()))?;
         return Some((info, action));
     }
 
@@ -1524,16 +1526,12 @@ pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
 /// 不匹配 `these` 的 pending 会保留在原队列中，等待常规投递或其它 sigwait。
 pub fn sigtimedwait_poll(these: SigSet) -> Option<SigInfo> {
     let me = current_task();
-    // 先 per-task（更及时），再 tg-shared。
-    if let Some(info) = me.signal.dequeue_one_in(these.0) {
-        return Some(info);
-    }
-    me.shared_signal().dequeue_one_in(these.0)
+    me.dequeue_pending_signal_in(these)
 }
 
 fn sigtimedwait_pending(these: SigSet) -> bool {
     let me = current_task();
-    me.signal.has_pending_in(these.0) || me.shared_signal().has_pending_in(these.0)
+    me.has_pending_signal_in(these)
 }
 
 fn finish_current_signal_wait(me: &Arc<Task>) {
@@ -1737,10 +1735,7 @@ pub fn deliver_pending_signals_for_task(
     if me.is_kernel_task() {
         return None;
     }
-    let info = me.signal.dequeue_one().or_else(|| {
-        me.shared_signal()
-            .dequeue_one(me.signal.blocked_snapshot().raw())
-    })?;
+    let info = me.dequeue_pending_signal()?;
     if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
         let _ = mark_task_stopped(me, info.sig);
         return None;

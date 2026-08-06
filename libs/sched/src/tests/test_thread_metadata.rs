@@ -10,10 +10,11 @@ use ktest::ktest;
 
 use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS, ProcessGroup,
-    RobustListState, RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy,
-    Session, SignalNumber, TASK_COMM_LEN, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage,
-    ThreadGroup, supported_cpu_mask,
+    ArchContextOps, CpuMask, ExecPhase, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS,
+    ProcessGroup, ProcessPersonalityState, RobustListState, RseqEvent, RseqRegistration, SchedAttr,
+    SchedClass, SchedParams, SchedPolicy, Session, SigInfo, SigSet, SignalNumber, TASK_COMM_LEN,
+    TASKEXT_VM_SPACE, Task, TaskState, TaskUsage, ThreadGroup, Uid, UserAbiKind,
+    supported_cpu_mask,
 };
 
 const TEST_EXECUTION_ACTION: u64 = 1;
@@ -123,6 +124,136 @@ fn make_task_in_group(group: Arc<ThreadGroup>) -> Arc<Task> {
     let task = Task::new(SchedParams::default_fair(), Weak::new(), group, pg);
     task.adopt_current_context();
     task
+}
+
+#[ktest]
+fn new_thread_group_is_tomori_without_native_payload() {
+    let group = ThreadGroup::new();
+
+    assert_eq!(group.user_abi_kind(), UserAbiKind::TomoriLinux);
+    assert_eq!(group.exec_phase(), ExecPhase::Running);
+    assert_eq!(group.exec_generation(), 0);
+    assert!(group.native_personality_payload().is_none());
+}
+
+#[ktest]
+fn personality_publication_updates_existing_and_late_thread_caches() {
+    let group = ThreadGroup::new();
+    let first = make_task_in_group(Arc::clone(&group));
+    let second = make_task_in_group(Arc::clone(&group));
+    group.add_member(&first);
+    group.add_member(&second);
+    assert_eq!(first.user_abi_kind(), UserAbiKind::TomoriLinux);
+    assert_eq!(second.user_abi_kind(), UserAbiKind::TomoriLinux);
+
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(0x5a5a_u32);
+    {
+        let mut exec = group.lock_exec();
+        exec.set_phase(ExecPhase::Transitioning);
+        exec.install_personality(ProcessPersonalityState::MygoNative(Arc::clone(&payload)));
+        assert_eq!(exec.advance_generation(), 1);
+        exec.set_phase(ExecPhase::Running);
+    }
+
+    assert_eq!(first.user_abi_kind(), UserAbiKind::MygoNative);
+    assert_eq!(second.user_abi_kind(), UserAbiKind::MygoNative);
+    assert_eq!(group.exec_generation(), 1);
+    let installed = group
+        .native_personality_payload()
+        .expect("Native personality 应持有进程级 payload");
+    assert!(Arc::ptr_eq(&installed, &payload));
+
+    let late = make_task_in_group(Arc::clone(&group));
+    group.add_member(&late);
+    assert_eq!(late.user_abi_kind(), UserAbiKind::MygoNative);
+}
+
+#[ktest]
+fn transitioning_keeps_signal_producers_live_and_pauses_consumers() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.add_member(&task);
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    group.lock_exec().set_phase(ExecPhase::Transitioning);
+
+    task.shared_signal().deliver(SigInfo {
+        sig: SignalNumber::SIGUSR2,
+        code: 0,
+        sender_pid: 2,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    assert!(
+        task.dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit()
+        ))
+        .is_none(),
+        "Transitioning 期间 consumer 不得出队"
+    );
+    assert!(task.signal.has_pending_in(SignalNumber::SIGUSR1.bit()));
+    assert!(
+        task.shared_signal()
+            .has_pending_in(SignalNumber::SIGUSR2.bit())
+    );
+
+    group.lock_exec().set_phase(ExecPhase::Running);
+    let first = task
+        .dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit(),
+        ))
+        .expect("恢复 Running 后应消费 per-task pending");
+    let second = task
+        .dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit(),
+        ))
+        .expect("恢复 Running 后应消费 shared pending");
+    assert_eq!(first.sig, SignalNumber::SIGUSR1);
+    assert_eq!(second.sig, SignalNumber::SIGUSR2);
+    assert!(
+        task.dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit()
+        ))
+        .is_none(),
+        "两条 pending 各消费一次后队列应为空"
+    );
+}
+
+#[ktest]
+fn transitioning_publication_waits_for_active_signal_consumer() {
+    let group = ThreadGroup::new();
+    let consumer = group
+        .lock_signal_consumer()
+        .expect("Running 阶段应允许 consumer 进入");
+    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let publisher_group = Arc::clone(&group);
+    let publisher = std::thread::spawn(move || {
+        attempting_tx.send(()).expect("应通知发布线程已启动");
+        publisher_group
+            .lock_exec()
+            .set_phase(ExecPhase::Transitioning);
+        published_tx.send(()).expect("应通知 Transitioning 已发布");
+    });
+
+    attempting_rx.recv().expect("发布线程应启动");
+    assert!(
+        published_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "活动 consumer 退出前不得发布 Transitioning"
+    );
+    drop(consumer);
+    published_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("consumer 退出后应完成发布");
+    publisher.join().expect("发布线程不得 panic");
+    assert_eq!(group.exec_phase(), ExecPhase::Transitioning);
 }
 
 #[ktest]

@@ -22,12 +22,15 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use core::any::Any;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+use native_abi::{ExecPhase, UserAbiKind};
 
 use crate::pid::{PID_INVALID, PidT};
 use crate::rlimit::Rlimits;
 use crate::signal::{SharedSignal, SignalNumber};
-use crate::sync::Spinlock;
+use crate::sync::{Spinlock, SpinlockGuard};
 use crate::task::{Task, TaskUsage};
 
 // ── ThreadGroup ─────────────────────────────────────────────────────────────
@@ -35,6 +38,24 @@ use crate::task::{Task, TaskUsage};
 const GROUP_EXIT_PRESENT: u64 = 1 << 63;
 const GROUP_EXIT_SIGNALED: u64 = 1 << 62;
 const GROUP_EXIT_CORE_DUMPED: u64 = 1 << 61;
+
+/// 线程组权威的用户态 personality。
+///
+/// Native payload 由上层内核定义，sched 只负责其进程级所有权与原子发布。
+#[derive(Clone)]
+pub enum ProcessPersonalityState {
+    TomoriLinux,
+    MygoNative(Arc<dyn Any + Send + Sync>),
+}
+
+impl ProcessPersonalityState {
+    pub fn user_abi_kind(&self) -> UserAbiKind {
+        match self {
+            Self::TomoriLinux => UserAbiKind::TomoriLinux,
+            Self::MygoNative(_) => UserAbiKind::MygoNative,
+        }
+    }
+}
 
 /// 线程组整体退出的权威状态。
 ///
@@ -115,6 +136,65 @@ pub struct ThreadGroup {
     terminated: AtomicBool,
     /// 协作式组退出请求；编码同时保存普通退出或信号退出原因。
     group_exit: AtomicU64,
+    /// 串行化同一线程组的 exec prepare/revalidate/commit。
+    exec_lock: Spinlock<()>,
+    /// 每次成功安装新映像后推进，供 prepare 阶段做乐观快照。
+    exec_generation: AtomicU64,
+    /// 信号 consumer 与 exec 提交路径共享的阶段判定。
+    exec_phase: AtomicU8,
+    /// 把 consumer 的 phase 检查与实际出队组成同一个临界区。
+    signal_consumer_lock: Spinlock<()>,
+    /// 线程组权威 personality 的无锁 discriminator。
+    user_abi_kind: AtomicU8,
+    /// 进程级 personality payload；Tomori 默认态不分配 Native 状态。
+    personality: Spinlock<ProcessPersonalityState>,
+}
+
+/// 持有线程组 exec 锁时可修改的状态视图。
+pub struct ThreadGroupExecGuard<'a> {
+    group: &'a ThreadGroup,
+    _lock: SpinlockGuard<'a, ()>,
+}
+
+/// signal consumer 的短临界区；producer 不取得此锁。
+pub(crate) struct SignalConsumerGuard<'a> {
+    _lock: SpinlockGuard<'a, ()>,
+}
+
+impl ThreadGroupExecGuard<'_> {
+    pub fn phase(&self) -> ExecPhase {
+        self.group.exec_phase()
+    }
+
+    pub fn set_phase(&mut self, phase: ExecPhase) {
+        let _consumer = self.group.signal_consumer_lock.lock();
+        self.group.exec_phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.group.exec_generation()
+    }
+
+    pub fn advance_generation(&mut self) -> u64 {
+        let next = self
+            .generation()
+            .checked_add(1)
+            .expect("线程组 exec generation 已耗尽");
+        self.group.exec_generation.store(next, Ordering::Release);
+        next
+    }
+
+    pub fn install_personality(&mut self, personality: ProcessPersonalityState) {
+        let kind = personality.user_abi_kind();
+        let members = self.group.members.lock();
+        *self.group.personality.lock() = personality;
+        self.group
+            .user_abi_kind
+            .store(kind as u8, Ordering::Release);
+        for member in members.iter().filter_map(Weak::upgrade) {
+            member.publish_user_abi_kind(kind);
+        }
+    }
 }
 
 impl ThreadGroup {
@@ -132,6 +212,12 @@ impl ThreadGroup {
             closing: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             group_exit: AtomicU64::new(0),
+            exec_lock: Spinlock::new(()),
+            exec_generation: AtomicU64::new(0),
+            exec_phase: AtomicU8::new(ExecPhase::Running as u8),
+            signal_consumer_lock: Spinlock::new(()),
+            user_abi_kind: AtomicU8::new(UserAbiKind::TomoriLinux as u8),
+            personality: Spinlock::new(ProcessPersonalityState::TomoriLinux),
         })
     }
 
@@ -152,6 +238,12 @@ impl ThreadGroup {
             closing: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             group_exit: AtomicU64::new(0),
+            exec_lock: Spinlock::new(()),
+            exec_generation: AtomicU64::new(0),
+            exec_phase: AtomicU8::new(ExecPhase::Running as u8),
+            signal_consumer_lock: Spinlock::new(()),
+            user_abi_kind: AtomicU8::new(UserAbiKind::TomoriLinux as u8),
+            personality: Spinlock::new(ProcessPersonalityState::TomoriLinux),
         })
     }
 
@@ -184,6 +276,7 @@ impl ThreadGroup {
         if self.closing.load(Ordering::Acquire) || self.terminated.load(Ordering::Acquire) {
             return false;
         }
+        task.publish_user_abi_kind(self.user_abi_kind());
         members.push(Arc::downgrade(task));
         self.acct_live_members.fetch_add(1, Ordering::Release);
         true
@@ -219,6 +312,37 @@ impl ThreadGroup {
 
     pub fn shared_signal(&self) -> &Arc<SharedSignal> {
         &self.shared_signal
+    }
+
+    pub fn lock_exec(&self) -> ThreadGroupExecGuard<'_> {
+        ThreadGroupExecGuard {
+            group: self,
+            _lock: self.exec_lock.lock(),
+        }
+    }
+
+    pub fn exec_generation(&self) -> u64 {
+        self.exec_generation.load(Ordering::Acquire)
+    }
+
+    pub fn exec_phase(&self) -> ExecPhase {
+        ExecPhase::from_raw(self.exec_phase.load(Ordering::Acquire))
+    }
+
+    pub fn user_abi_kind(&self) -> UserAbiKind {
+        UserAbiKind::from_raw(self.user_abi_kind.load(Ordering::Acquire))
+    }
+
+    pub fn native_personality_payload(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        match &*self.personality.lock() {
+            ProcessPersonalityState::TomoriLinux => None,
+            ProcessPersonalityState::MygoNative(payload) => Some(Arc::clone(payload)),
+        }
+    }
+
+    pub(crate) fn lock_signal_consumer(&self) -> Option<SignalConsumerGuard<'_>> {
+        let lock = self.signal_consumer_lock.lock();
+        (self.exec_phase() == ExecPhase::Running).then_some(SignalConsumerGuard { _lock: lock })
     }
 
     /// 访问 rlimit 表。锁顺序与 `shared_signal`/`members` 平行，不嵌套。
@@ -375,6 +499,12 @@ impl Default for ThreadGroup {
             closing: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             group_exit: AtomicU64::new(0),
+            exec_lock: Spinlock::new(()),
+            exec_generation: AtomicU64::new(0),
+            exec_phase: AtomicU8::new(ExecPhase::Running as u8),
+            signal_consumer_lock: Spinlock::new(()),
+            user_abi_kind: AtomicU8::new(UserAbiKind::TomoriLinux as u8),
+            personality: Spinlock::new(ProcessPersonalityState::TomoriLinux),
         }
     }
 }
