@@ -1,0 +1,17 @@
+[package]
+name = "soyo"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[lib]
+test = true
+doctest = false
+bench = false
+
+[features]
+test-support = []
+
+[dependencies]
+native-abi = { path = "../native-abi" }
+sha2 = { version = "0.10.9", default-features = false }

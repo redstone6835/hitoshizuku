@@ -61,10 +61,12 @@ log = { path = "../libs/log" }
 allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
 mm = { path = "../libs/mm" }
+native-abi = { path = "../libs/native-abi" }
 net = { path = "../libs/net" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 socket = { path = "../libs/socket" }
+soyo = { path = "../libs/soyo" }
 vfs = { path = "../libs/vfs" }
 
 [build-dependencies]
