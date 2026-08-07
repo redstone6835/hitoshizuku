@@ -23,8 +23,21 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 use errno::Errno;
 
-use crate::sync::Spinlock;
+use crate::sync::{Spinlock, SpinlockGuard};
 use crate::task::Task;
+
+static PROCESS_IDENTITY_LOCK: Spinlock<()> = Spinlock::new(());
+
+/// 串行化 PID 所有权与父子关系的跨任务迁移。
+pub(crate) struct ProcessIdentityGuard {
+    _guard: SpinlockGuard<'static, ()>,
+}
+
+pub(crate) fn lock_process_identity() -> ProcessIdentityGuard {
+    ProcessIdentityGuard {
+        _guard: PROCESS_IDENTITY_LOCK.lock(),
+    }
+}
 
 /// Linux `pid_t` 等价物。0 与负值由调用方（syscall 层）保留给特殊语义。
 pub type PidT = i32;
@@ -192,10 +205,66 @@ impl PidRegistry {
         Some(slot.task.clone())
     }
 
+    /// 判断指定 pid 当前是否仍由给定任务占用。
+    pub(crate) fn is_owned_by_in(
+        &self,
+        _identity: &ProcessIdentityGuard,
+        pid: PidT,
+        task: &Arc<Task>,
+    ) -> bool {
+        if pid <= PID_INVALID {
+            return false;
+        }
+        let inner = self.inner.lock();
+        let Some(slot) = inner.slots.get(pid as usize) else {
+            return false;
+        };
+        slot.occupied
+            && slot
+                .task
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, task))
+    }
+
+    /// 在不改变 pid generation 和占用状态的前提下替换任务所有者。
+    pub(crate) fn replace_owner_in(
+        &self,
+        _identity: &ProcessIdentityGuard,
+        pid: PidT,
+        expected: &Arc<Task>,
+        replacement: &Arc<Task>,
+    ) -> bool {
+        if pid <= PID_INVALID {
+            return false;
+        }
+        let mut inner = self.inner.lock();
+        let Some(slot) = inner.slots.get_mut(pid as usize) else {
+            return false;
+        };
+        if !slot.occupied
+            || !slot
+                .task
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, expected))
+        {
+            return false;
+        }
+        slot.task = Arc::downgrade(replacement);
+        true
+    }
+
     /// 归还 pid。调用点：父 reap zombie 子时。
     /// 在 slot 归还到自由链表前，Weak 也被清空——下次 allocate 重用时不会
     /// 看到陈旧任务。
     pub fn release(&self, pid: PidT) {
+        self.release_inner(pid);
+    }
+
+    pub(crate) fn release_in(&self, _identity: &ProcessIdentityGuard, pid: PidT) {
+        self.release_inner(pid);
+    }
+
+    fn release_inner(&self, pid: PidT) {
         if pid <= PID_INVALID {
             return;
         }
@@ -239,6 +308,27 @@ impl PidRegistry {
             out.push((idx as PidT, slot.task.clone()));
         }
         out
+    }
+
+    /// 取得当前 namespace 中仍可升级的任务强引用；所有输出容量都可失败。
+    ///
+    /// exec 的 PONR 前资源准备使用此入口，避免在不可回退阶段通过普通 `Vec`
+    /// 分配触发内核 allocation-error。
+    pub fn try_snapshot_tasks(
+        &self,
+    ) -> Result<Vec<Arc<Task>>, alloc::collections::TryReserveError> {
+        let inner = self.inner.lock();
+        let mut out = Vec::new();
+        out.try_reserve(inner.slots.len().saturating_sub(1))?;
+        for (idx, slot) in inner.slots.iter().enumerate() {
+            if idx == 0 || !slot.occupied {
+                continue;
+            }
+            if let Some(task) = slot.task.upgrade() {
+                out.push(task);
+            }
+        }
+        Ok(out)
     }
 }
 

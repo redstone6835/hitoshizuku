@@ -3114,11 +3114,20 @@ pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let pid_file = fdt.get_file(pidfd).ok_or(Errno::EBADF)?;
-    let target = pidfd::task_from_file(&pid_file).ok_or(Errno::EINVAL)?;
-    if !task_may_access(ctx.task(), &target) {
+    let target_group = pidfd::group_from_file(&pid_file).ok_or(Errno::EINVAL)?;
+    let target = target_group
+        .with_running_leader(|leader| (task_may_access(ctx.task(), leader), task_fdtable(leader)))
+        .ok_or_else(|| {
+            if target_group.is_terminated() {
+                Errno::ESRCH
+            } else {
+                Errno::EAGAIN
+            }
+        })?;
+    if !target.0 {
         return Err(Errno::EPERM);
     }
-    let target_fdt = task_fdtable(&target).ok_or(Errno::EBADF)?;
+    let target_fdt = target.1.ok_or(Errno::EBADF)?;
     let file = target_fdt.get_file(targetfd).ok_or(Errno::EBADF)?;
     let new_fd = fdt
         .alloc_fd(file, FdFlags::CLOEXEC)

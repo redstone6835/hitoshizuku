@@ -195,8 +195,27 @@ fn release_exit_files(task: &Arc<Task>) {
     let _ = task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
 }
 
-fn fdtable_has_other_live_owner(task: &Arc<Task>, fdt: &Arc<vfs::fdtable::FdTable>) -> bool {
-    for other in sched::operation::all_tasks_snapshot() {
+pub(crate) fn fdtable_has_other_live_owner(
+    task: &Arc<Task>,
+    fdt: &Arc<vfs::fdtable::FdTable>,
+) -> bool {
+    try_fdtable_has_other_live_owner(task, fdt).unwrap_or(true)
+}
+
+pub(crate) fn try_fdtable_has_other_live_owner(
+    task: &Arc<Task>,
+    fdt: &Arc<vfs::fdtable::FdTable>,
+) -> Result<bool, Errno> {
+    let tasks = sched::operation::try_all_tasks_snapshot().map_err(|_| Errno::ENOMEM)?;
+    Ok(fdtable_has_other_live_owner_in(task, fdt, tasks.iter()))
+}
+
+pub(crate) fn fdtable_has_other_live_owner_in<'a>(
+    task: &Arc<Task>,
+    fdt: &Arc<vfs::fdtable::FdTable>,
+    tasks: impl IntoIterator<Item = &'a Arc<Task>>,
+) -> bool {
+    for other in tasks {
         if Arc::ptr_eq(&other, task) || other.is_kernel_task() {
             continue;
         }
@@ -255,9 +274,13 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if flags.has(CloneFlags::CLONE_PIDFD) && flags.has(CloneFlags::CLONE_PARENT_SETTID) {
         return Err(Errno::EINVAL);
     }
-    let outcome =
-        sched::operation::clone_with_context_outcome(args, UserContextRef::new(ctx.tf.as_usize()))?;
-    install_clone_pidfd(args, Arc::clone(&outcome.child))?;
+    let prepared =
+        sched::operation::prepare_clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
+    let installed_pidfd = install_clone_pidfd(args, prepared.child())?;
+    let outcome = prepared.activate()?;
+    if let Some(installed) = installed_pidfd {
+        installed.commit();
+    }
     Ok(outcome.pid as usize)
 }
 
@@ -313,26 +336,55 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         // TODO(threading): cgroup 需要成员状态与迁移事务；当前阶段不把 fd 当作占位接受。
         return Err(Errno::EOPNOTSUPP);
     }
-    let outcome =
-        sched::operation::clone_with_context_outcome(args, UserContextRef::new(ctx.tf.as_usize()))?;
-    install_clone_pidfd(args, Arc::clone(&outcome.child))?;
+    let prepared =
+        sched::operation::prepare_clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
+    let installed_pidfd = install_clone_pidfd(args, prepared.child())?;
+    let outcome = prepared.activate()?;
+    if let Some(installed) = installed_pidfd {
+        installed.commit();
+    }
     Ok(outcome.pid as usize)
 }
 
-fn install_clone_pidfd(args: CloneArgs, child: Arc<Task>) -> Result<(), Errno> {
+struct InstalledClonePidfd {
+    fdt: Arc<vfs::fdtable::FdTable>,
+    fd: Option<Fd>,
+}
+
+impl InstalledClonePidfd {
+    fn commit(mut self) {
+        self.fd.take();
+    }
+}
+
+impl Drop for InstalledClonePidfd {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            let _ = self.fdt.close_fd(fd);
+        }
+    }
+}
+
+fn install_clone_pidfd(
+    args: CloneArgs,
+    child: &Arc<Task>,
+) -> Result<Option<InstalledClonePidfd>, Errno> {
     if !args.flags.has(CloneFlags::CLONE_PIDFD) {
-        return Ok(());
+        return Ok(None);
     }
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
         .map(|ctx| ctx.cred())
         .ok_or(Errno::ENOSYS)?;
-    let fd = pidfd::create(&fdt, cred, child, false)?;
+    let fd = pidfd::create(&fdt, cred, child.thread_group(), false)?;
+    let installed = InstalledClonePidfd {
+        fdt: Arc::clone(&fdt),
+        fd: Some(fd),
+    };
     if let Err(err) = copy_to_user(args.pidfd, &(fd.as_raw() as i32).to_le_bytes()) {
-        let _ = fdt.close_fd(fd);
         return Err(err.as_errno());
     }
-    Ok(())
+    Ok(Some(installed))
 }
 
 fn prepare_clone3_set_tid(args: &mut CloneArgs, task: &Arc<Task>) -> Result<(), Errno> {
@@ -499,11 +551,11 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
             let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
             let nonblock_pidfd = file.flags().nonblock;
-            let task = pidfd::task_from_file(&file).ok_or(Errno::EINVAL)?;
+            let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
             if nonblock_pidfd && !options.has(WaitOptions::WNOHANG) {
                 let probe_options = WaitOptions::from_raw(options.raw() | WaitOptions::WNOHANG);
                 let probe =
-                    sched::operation::waitid(WaitId::Pidfd(Arc::clone(&task)), probe_options)?;
+                    sched::operation::waitid(WaitId::Pidfd(Arc::clone(&group)), probe_options)?;
                 if probe.pid == 0 {
                     return Err(Errno::EAGAIN);
                 }
@@ -522,7 +574,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 }
                 return Ok(0);
             }
-            WaitId::Pidfd(task)
+            WaitId::Pidfd(group)
         }
         _ => return Err(Errno::EINVAL),
     };
@@ -3778,9 +3830,10 @@ fn pi_owner_died_key(
         if let Some((next, donation, state)) = handoff {
             if deferred {
                 if let Some(donation) = donation {
-                    if !pi_handoffs.iter().any(|handoff| {
-                        handoff.token == token && Arc::ptr_eq(&handoff.task, &next)
-                    }) {
+                    if !pi_handoffs
+                        .iter()
+                        .any(|handoff| handoff.token == token && Arc::ptr_eq(&handoff.task, &next))
+                    {
                         if pi_handoffs.len() == pi_handoffs.capacity() {
                             *pi_handoff_overflow = true;
                             log::emergency!(
@@ -4806,11 +4859,12 @@ pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     }
     let task = lookup_task_for_thread_syscall(pid, ctx.task())?;
     require_task_access(ctx.task(), &task)?;
+    let group = pidfd::group_for_process_pid(pid, &task)?;
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
         .map(|ctx| ctx.cred())
         .ok_or(Errno::ENOSYS)?;
-    let fd = pidfd::create(&fdt, cred, task, (flags & PIDFD_NONBLOCK) != 0)?;
+    let fd = pidfd::create(&fdt, cred, group, (flags & PIDFD_NONBLOCK) != 0)?;
     Ok(fd.as_raw() as usize)
 }
 
@@ -5449,11 +5503,7 @@ fn handle_robust_node(
         }
     }
     let new = (cur & !FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
-    if vm
-        .compare_exchange_user_u32_nofault(uaddr, cur, new)
-        .ok()
-        == Some(cur)
-    {
+    if vm.compare_exchange_user_u32_nofault(uaddr, cur, new).ok() == Some(cur) {
         if deferred_wake {
             let _ = futex_wake_addr_one_deferred(task, uaddr);
         } else {

@@ -32,6 +32,7 @@ use crate::rlimit::Rlimits;
 use crate::signal::{SharedSignal, SignalNumber};
 use crate::sync::{Spinlock, SpinlockGuard};
 use crate::task::{Task, TaskUsage};
+use crate::wait::WaitQueue;
 
 // ── ThreadGroup ─────────────────────────────────────────────────────────────
 
@@ -112,6 +113,85 @@ impl GroupExitStatus {
     }
 }
 
+/// 订阅稳定进程身份的终止事件；实现方不得在回调中反向进入进程身份事务。
+pub trait ProcessExitObserver: Send + Sync {
+    fn process_exited(&self);
+}
+
+struct ProcessExitSubscription {
+    id: u64,
+    observer: Weak<dyn ProcessExitObserver>,
+}
+
+struct ProcessExitObservers {
+    has_entries: AtomicBool,
+    next_id: AtomicU64,
+    entries: Spinlock<Vec<ProcessExitSubscription>>,
+}
+
+impl ProcessExitObservers {
+    fn new() -> Self {
+        Self {
+            has_entries: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            entries: Spinlock::new(Vec::new()),
+        }
+    }
+
+    fn subscribe(&self, observer: Weak<dyn ProcessExitObserver>) -> Option<u64> {
+        let mut entries = self.entries.lock();
+        if entries.try_reserve(1).is_err() {
+            return None;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "process-exit observer id 已耗尽");
+        entries.push(ProcessExitSubscription { id, observer });
+        self.has_entries.store(true, Ordering::Release);
+        Some(id)
+    }
+
+    fn unsubscribe(&self, id: u64) -> bool {
+        let mut entries = self.entries.lock();
+        let old_len = entries.len();
+        entries.retain(|entry| entry.id != id);
+        if entries.is_empty() {
+            self.has_entries.store(false, Ordering::Release);
+        }
+        entries.len() != old_len
+    }
+
+    fn notify(&self) {
+        if !self.has_entries.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            entries.retain(|entry| entry.observer.strong_count() != 0);
+            if entries.is_empty() {
+                self.has_entries.store(false, Ordering::Release);
+                return;
+            }
+        }
+        let mut after = 0u64;
+        loop {
+            let next = {
+                let entries = self.entries.lock();
+                let index = entries.partition_point(|entry| entry.id <= after);
+                entries
+                    .get(index)
+                    .map(|entry| (entry.id, entry.observer.clone()))
+            };
+            let Some((id, observer)) = next else {
+                break;
+            };
+            after = id;
+            if let Some(observer) = observer.upgrade() {
+                observer.process_exited();
+            }
+        }
+    }
+}
+
 /// 线程组：共享同一 address space / fd table 的任务集合。
 pub struct ThreadGroup {
     /// 稳定 TGID。首次分配 leader pid 后写入；leader 退出/reap 后不改变。
@@ -144,6 +224,10 @@ pub struct ThreadGroup {
     exec_phase: AtomicU8,
     /// 把 consumer 的 phase 检查与实际出队组成同一个临界区。
     signal_consumer_lock: Spinlock<()>,
+    /// 进程级 pidfd / wait 观察者队列。它不绑定某一个可被 exec 替换的 Task。
+    process_exit_waiters: WaitQueue,
+    /// pidfd/epoll 等非任务等待者的弱订阅表；无订阅时退出路径只读一个原子位。
+    process_exit_observers: ProcessExitObservers,
     /// 线程组权威 personality 的无锁 discriminator。
     user_abi_kind: AtomicU8,
     /// 进程级 personality payload；Tomori 默认态不分配 Native 状态。
@@ -177,6 +261,21 @@ impl ThreadGroupExecGuard<'_> {
 
     pub fn has_only_member(&self, task: &Arc<Task>) -> bool {
         self.group.has_only_member_locked(task)
+    }
+
+    pub(crate) fn try_add_member(&self, task: &Arc<Task>) -> bool {
+        self.group.try_add_member_locked(task)
+    }
+
+    /// 构造受 exec 锁保护的成员快照，允许调用方在 PONR 前传播分配失败。
+    pub fn try_member_snapshot(
+        &self,
+    ) -> Result<Vec<Arc<Task>>, alloc::collections::TryReserveError> {
+        let members = self.group.members.lock();
+        let mut snapshot = Vec::new();
+        snapshot.try_reserve(members.len())?;
+        snapshot.extend(members.iter().filter_map(Weak::upgrade));
+        Ok(snapshot)
     }
 
     pub fn advance_generation(&mut self) -> u64 {
@@ -220,6 +319,8 @@ impl ThreadGroup {
             exec_generation: AtomicU64::new(0),
             exec_phase: AtomicU8::new(ExecPhase::Running as u8),
             signal_consumer_lock: Spinlock::new(()),
+            process_exit_waiters: WaitQueue::new(),
+            process_exit_observers: ProcessExitObservers::new(),
             user_abi_kind: AtomicU8::new(UserAbiKind::TomoriLinux as u8),
             personality: Spinlock::new(ProcessPersonalityState::TomoriLinux),
         })
@@ -246,13 +347,24 @@ impl ThreadGroup {
             exec_generation: AtomicU64::new(0),
             exec_phase: AtomicU8::new(ExecPhase::Running as u8),
             signal_consumer_lock: Spinlock::new(()),
+            process_exit_waiters: WaitQueue::new(),
+            process_exit_observers: ProcessExitObservers::new(),
             user_abi_kind: AtomicU8::new(UserAbiKind::TomoriLinux as u8),
             personality: Spinlock::new(ProcessPersonalityState::TomoriLinux),
         })
     }
 
     pub fn set_leader(&self, leader: &Arc<Task>) {
-        if let Some(pid) = leader.pid_root() {
+        let identity = crate::pid::lock_process_identity();
+        self.set_leader_in(&identity, leader);
+    }
+
+    pub(crate) fn set_leader_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+        leader: &Arc<Task>,
+    ) {
+        if let Some(pid) = leader.pid_root_in(_identity) {
             self.set_tgid(pid);
         }
         *self.leader.lock() = Arc::downgrade(leader);
@@ -262,13 +374,26 @@ impl ThreadGroup {
         self.leader.lock().upgrade()
     }
 
+    /// 在进程仍处于 Running 时，以稳定身份访问当前 leader。
+    ///
+    /// 临界区按 `exec_lock -> PROCESS_IDENTITY_LOCK` 排序，保证检查期间既不能开始
+    /// exec 资源清理，也不能把进程身份迁移给另一个 Task。回调必须保持短小，
+    /// 不得阻塞，也不得再次进入进程身份事务。
+    pub fn with_running_leader<R>(&self, inspect: impl FnOnce(&Arc<Task>) -> R) -> Option<R> {
+        let _exec = self.exec_lock.lock();
+        if self.exec_phase() != ExecPhase::Running {
+            return None;
+        }
+        let _identity = crate::pid::lock_process_identity();
+        let leader = self.leader.lock().upgrade()?;
+        Some(inspect(&leader))
+    }
+
     /// 尝试接纳一个成员。整体退出与成员登记通过 `members` 锁排序：
     ///
     /// - 若登记先完成，随后退出路径的 snapshot 必然包含该成员；
     /// - 若退出先发布，登记会被拒绝，避免 leader 可回收后又出现新线程。
-    pub fn try_add_member(&self, task: &Arc<Task>) -> bool {
-        // 与 exec 共用同一把锁，避免 exec 重验后又插入兄弟线程。
-        let _exec = self.exec_lock.lock();
+    fn try_add_member_locked(&self, task: &Arc<Task>) -> bool {
         if self.tgid() == PID_INVALID {
             if let Some(leader) = self.leader() {
                 if let Some(pid) = leader.pid_root() {
@@ -289,6 +414,12 @@ impl ThreadGroup {
         members.push(Arc::downgrade(task));
         self.acct_live_members.fetch_add(1, Ordering::Release);
         true
+    }
+
+    pub fn try_add_member(&self, task: &Arc<Task>) -> bool {
+        // 与 exec 共用同一把锁，避免 exec 重验后又插入兄弟线程。
+        let _exec = self.exec_lock.lock();
+        self.try_add_member_locked(task)
     }
 
     pub fn add_member(&self, task: &Arc<Task>) {
@@ -338,6 +469,23 @@ impl ThreadGroup {
         self.has_only_member_locked(task)
     }
 
+    /// 判断线程组是否恰好只保留 exec 执行者与待替换的旧 leader。
+    pub(crate) fn has_only_exec_members(&self, executor: &Arc<Task>, leader: &Arc<Task>) -> bool {
+        let members = self.members.lock();
+        let mut saw_executor = false;
+        let mut saw_leader = false;
+        for member in members.iter().filter_map(Weak::upgrade) {
+            if Arc::ptr_eq(&member, executor) {
+                saw_executor = true;
+            } else if Arc::ptr_eq(&member, leader) {
+                saw_leader = true;
+            } else {
+                return false;
+            }
+        }
+        saw_executor && saw_leader
+    }
+
     pub fn shared_signal(&self) -> &Arc<SharedSignal> {
         &self.shared_signal
     }
@@ -347,6 +495,12 @@ impl ThreadGroup {
             group: self,
             _lock: self.exec_lock.lock(),
         }
+    }
+
+    /// fork/clone 从读取父进程状态到完成子任务登记期间持有此 guard。
+    pub(crate) fn lock_for_clone(&self) -> Option<ThreadGroupExecGuard<'_>> {
+        let guard = self.lock_exec();
+        (guard.phase() == ExecPhase::Running).then_some(guard)
     }
 
     pub fn exec_generation(&self) -> u64 {
@@ -490,11 +644,39 @@ impl ThreadGroup {
         if became_terminated && let Some(leader) = self.leader() {
             leader.exit_waiters.wake_all();
         }
+        if became_terminated {
+            self.process_exit_waiters.wake_all();
+            self.process_exit_observers.notify();
+        }
         became_terminated
     }
 
     pub fn is_terminated(&self) -> bool {
         self.terminated.load(Ordering::Acquire)
+    }
+
+    /// 返回稳定的进程级退出观察队列，调用方不得将其替换为某个 Task 的队列。
+    pub fn process_exit_waiters(&self) -> &WaitQueue {
+        &self.process_exit_waiters
+    }
+
+    /// 订阅进程终止事件；订阅与终止并发时允许幂等补发，但不会漏失事件。
+    pub fn try_subscribe_process_exit(
+        &self,
+        observer: Weak<dyn ProcessExitObserver>,
+    ) -> Option<u64> {
+        let id = self.process_exit_observers.subscribe(observer.clone())?;
+        if self.is_terminated()
+            && let Some(observer) = observer.upgrade()
+        {
+            observer.process_exited();
+        }
+        Some(id)
+    }
+
+    /// 取消进程终止事件订阅，返回该 ID 是否仍在订阅表中。
+    pub fn unsubscribe_process_exit(&self, id: u64) -> bool {
+        self.process_exit_observers.unsubscribe(id)
     }
 
     pub fn set_tgid(&self, pid: PidT) {
@@ -531,6 +713,8 @@ impl Default for ThreadGroup {
             exec_generation: AtomicU64::new(0),
             exec_phase: AtomicU8::new(ExecPhase::Running as u8),
             signal_consumer_lock: Spinlock::new(()),
+            process_exit_waiters: WaitQueue::new(),
+            process_exit_observers: ProcessExitObservers::new(),
             user_abi_kind: AtomicU8::new(UserAbiKind::TomoriLinux as u8),
             personality: Spinlock::new(ProcessPersonalityState::TomoriLinux),
         }
@@ -613,7 +797,8 @@ impl ProcessGroup {
 pub struct Session {
     /// 稳定 SID。首次设置有 pid 的 session leader 时写入。
     sid: AtomicI32,
-    leader: Spinlock<Weak<Task>>,
+    /// 会话 leader 绑定线程组身份；线程组内 exec 替换 leader 时无需搬运引用。
+    leader: Spinlock<Weak<ThreadGroup>>,
     groups: Spinlock<Vec<Weak<ProcessGroup>>>,
 }
 
@@ -630,11 +815,14 @@ impl Session {
         if let Some(pid) = leader.pid_root() {
             self.set_sid(pid);
         }
-        *self.leader.lock() = Arc::downgrade(leader);
+        *self.leader.lock() = Arc::downgrade(&leader.thread_group());
     }
 
     pub fn leader(&self) -> Option<Arc<Task>> {
-        self.leader.lock().upgrade()
+        self.leader
+            .lock()
+            .upgrade()
+            .and_then(|group| group.leader())
     }
 
     pub fn register_group(&self, pg: &Arc<ProcessGroup>) {
@@ -687,8 +875,21 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupExitStatus, ThreadGroup};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{GroupExitStatus, ProcessExitObserver, ThreadGroup};
     use crate::SignalNumber;
+
+    struct CountingExitObserver {
+        calls: AtomicUsize,
+    }
+
+    impl ProcessExitObserver for CountingExitObserver {
+        fn process_exited(&self) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn group_exit_request_is_first_writer_wins() {
@@ -719,5 +920,22 @@ mod tests {
             }
         );
         assert_eq!(signal_first.request_group_exit(42), 9);
+    }
+
+    #[test]
+    fn cancelled_process_exit_subscription_is_not_notified() {
+        let group = ThreadGroup::new();
+        let observer = Arc::new(CountingExitObserver {
+            calls: AtomicUsize::new(0),
+        });
+        let erased: Arc<dyn ProcessExitObserver> = observer.clone();
+        let subscription = group
+            .try_subscribe_process_exit(Arc::downgrade(&erased))
+            .expect("订阅进程退出事件");
+
+        group.unsubscribe_process_exit(subscription);
+        assert!(group.mark_terminated_if_all_members_terminal());
+
+        assert_eq!(observer.calls.load(Ordering::Relaxed), 0);
     }
 }

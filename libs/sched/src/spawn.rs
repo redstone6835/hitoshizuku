@@ -215,10 +215,20 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let flags = args.flags;
     let root_ns = root_pid_ns();
     let parent_tg = parent.thread_group();
+    let Some(parent_exec) = parent_tg.lock_for_clone() else {
+        let rejected = Task::new(
+            params,
+            Arc::downgrade(parent),
+            Arc::clone(&parent_tg),
+            parent.process_group(),
+        );
+        rejected.set_state(TaskState::Dead);
+        return rejected;
+    };
 
     // 1. 决定 thread group：CLONE_THREAD 共享，否则新建。
     let new_tg = if flags.has(CloneFlags::CLONE_THREAD) {
-        parent_tg
+        Arc::clone(&parent_tg)
     } else {
         // CLONE_SIGHAND 只共享 handler 表；独立线程组必须拥有自己的
         // 进程级 pending 队列。CLONE_THREAD 才复用完整 SharedSignal。
@@ -246,7 +256,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let pg = parent.process_group();
 
     // 3. 父选择：CLONE_PARENT → 新任务的父等于 parent.parent；否则 parent。
-    let real_parent = if flags.has(CloneFlags::CLONE_PARENT) {
+    let mut real_parent = if flags.has(CloneFlags::CLONE_PARENT) {
         parent.parent().unwrap_or_else(init_task)
     } else {
         Arc::clone(parent)
@@ -315,7 +325,12 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     if !flags.has(CloneFlags::CLONE_THREAD) {
         new_tg.set_leader(&child);
     }
-    if !new_tg.try_add_member(&child) {
+    let member_added = if flags.has(CloneFlags::CLONE_THREAD) {
+        parent_exec.try_add_member(&child)
+    } else {
+        new_tg.try_add_member(&child)
+    };
+    if !member_added {
         child.set_state(TaskState::Dead);
         return child;
     }
@@ -323,7 +338,24 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
 
     // 8. 父登记（亲缘图保活）。CLONE_THREAD 线程不进入普通 child/wait 模型。
     if !flags.has(CloneFlags::CLONE_THREAD) {
-        real_parent.add_child(Arc::clone(&child));
+        let identity = crate::pid::lock_process_identity();
+        // CLONE_PARENT 的 real_parent 可能属于另一个线程组；等待身份事务后
+        // 必须重新读取，不能继续使用 exec 前缓存的旧 leader。
+        if flags.has(CloneFlags::CLONE_PARENT) {
+            real_parent = parent
+                .parent_in(&identity)
+                .filter(|candidate| {
+                    !matches!(candidate.state(), TaskState::Zombie | TaskState::Dead)
+                })
+                .unwrap_or_else(init_task);
+        }
+        if real_parent.try_reserve_children_for_exec(1).is_err() {
+            drop(identity);
+            abort_new_task(&child);
+            return child;
+        }
+        child.reparent_to_in(&identity, &real_parent);
+        real_parent.add_child_in(&identity, Arc::clone(&child));
     }
 
     // 9. 分配 pid（根 ns 一次；多 ns 留待后续）。
@@ -452,13 +484,18 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 
     let group = task.thread_group();
     let is_group_leader = task.is_thread_group_leader();
+    let preserve_exec_identity = task.exec_sibling_exit_preserves_identity();
 
     task.cleanup_before_exit();
     crate::scheduler::deadline_admission().release(task);
 
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
     //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。
-    let children = task.snapshot_children();
+    let children = if preserve_exec_identity {
+        Vec::new()
+    } else {
+        task.snapshot_children()
+    };
     if !children.is_empty() {
         let init = init_task();
         if !Arc::ptr_eq(&init, task) {
@@ -498,13 +535,17 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     // CLONE_THREAD 成员的 exit_signal 为 0，直接释放独立 TID；线程组 leader
     // 必须保留 Zombie/PID，直到所有成员终止后才允许父进程观察和回收。
     let exit_sig = task.exit_signal();
-    if exit_sig == 0 {
+    if preserve_exec_identity {
+        // 非 leader 执行 exec 时，旧 leader 先停止执行并释放线程资源，但保持
+        // Zombie、PID、父侧 child 项和组成员资格，直到身份迁移完整成功。
+    } else if exit_sig == 0 {
         for (ns, pid) in task.pid_namespaces_snapshot() {
             ns.registry().release(pid);
         }
         group.remove_member(task);
         task.process_group().remove_member(task);
         task.set_state(TaskState::Dead);
+        task.exit_waiters.wake_all();
     } else if !is_group_leader {
         // 非 leader 若显式携带退出信号，仍保持逐任务通知语义。
         notify_task_parent(task);

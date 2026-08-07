@@ -70,7 +70,7 @@ fn descriptor_snapshot_preserves_fd_flags_and_file_identity() {
         .install_fd(Fd::from_raw(7), Arc::clone(&read_end), FdFlags::CLOEXEC)
         .unwrap();
 
-    let snapshot = table.snapshot_descriptors();
+    let snapshot = table.snapshot_descriptors().expect("描述符快照分配应成功");
     let descriptors = snapshot.descriptors();
 
     assert_eq!(descriptors.len(), 4);
@@ -97,7 +97,7 @@ fn descriptor_snapshot_detects_shared_table_mutation() {
     table
         .install_fd(Fd::STDIN, read_end, FdFlags::default())
         .unwrap();
-    let snapshot = table.snapshot_descriptors();
+    let snapshot = table.snapshot_descriptors().expect("快照应成功");
     let shared = Arc::clone(&table);
 
     shared.set_fd_flags(Fd::STDIN, FdFlags::CLOEXEC).unwrap();
@@ -111,21 +111,21 @@ fn descriptor_generation_tracks_entry_lifecycle() {
     let table = FdTable::new_default();
     let (read_end, _) = pipe_files();
 
-    let before_install = table.snapshot_descriptors();
+    let before_install = table.snapshot_descriptors().expect("快照应成功");
     table
         .install_fd(Fd::STDIN, read_end, FdFlags::default())
         .unwrap();
     assert!(!table.is_generation_current(before_install.generation()));
 
-    let before_dup = table.snapshot_descriptors();
+    let before_dup = table.snapshot_descriptors().expect("快照应成功");
     let duplicate = table.dup_fd(Fd::STDIN).unwrap();
     assert!(!table.is_generation_current(before_dup.generation()));
 
-    let before_close = table.snapshot_descriptors();
+    let before_close = table.snapshot_descriptors().expect("快照应成功");
     table.close_fd(duplicate).unwrap();
     assert!(!table.is_generation_current(before_close.generation()));
 
-    let after_close = table.snapshot_descriptors();
+    let after_close = table.snapshot_descriptors().expect("快照应成功");
     assert!(table.close_fd(duplicate).is_err());
     assert!(table.is_generation_current(after_close.generation()));
 }
@@ -142,29 +142,35 @@ fn descriptor_generation_tracks_bulk_exec_mutations() {
         .install_fd(Fd::STDOUT, write_end, FdFlags::default())
         .unwrap();
 
-    let before_cloexec = table.snapshot_descriptors();
+    let before_cloexec = table.snapshot_descriptors().expect("快照应成功");
     table.close_range(0, 1, true);
     assert!(!table.is_generation_current(before_cloexec.generation()));
 
-    let after_cloexec = table.snapshot_descriptors();
+    let after_cloexec = table.snapshot_descriptors().expect("快照应成功");
     table.close_range(0, 1, true);
     assert!(table.is_generation_current(after_cloexec.generation()));
 
     table.close_on_exec();
     assert!(!table.is_generation_current(after_cloexec.generation()));
-    assert!(table.snapshot_descriptors().descriptors().is_empty());
+    assert!(
+        table
+            .snapshot_descriptors()
+            .expect("快照应成功")
+            .descriptors()
+            .is_empty()
+    );
 }
 
 /// exec 副本会继承 fdtable 的软硬限制，因此限制变化也必须使旧快照失效。
 #[ktest]
 fn descriptor_generation_tracks_limit_changes() {
     let table = FdTable::new_default();
-    let before_change = table.snapshot_descriptors();
+    let before_change = table.snapshot_descriptors().expect("快照应成功");
 
     table.set_limits(128, 256).unwrap();
 
     assert!(!table.is_generation_current(before_change.generation()));
-    let after_change = table.snapshot_descriptors();
+    let after_change = table.snapshot_descriptors().expect("快照应成功");
     table.set_limits(128, 256).unwrap();
     assert!(table.is_generation_current(after_change.generation()));
 }
@@ -177,7 +183,10 @@ fn generation_lease_blocks_mutation_until_commit_releases_it() {
     table
         .install_fd(Fd::STDIN, read_end, FdFlags::default())
         .unwrap();
-    let generation = table.snapshot_descriptors().generation();
+    let generation = table
+        .snapshot_descriptors()
+        .expect("快照应成功")
+        .generation();
     let lease = table
         .lock_generation(generation)
         .expect("当前代际应能取得发布租约");
@@ -215,13 +224,20 @@ fn fork_for_exec_filters_descriptors_without_mutating_source() {
     table
         .install_fd(Fd::STDOUT, Arc::clone(&write_end), FdFlags::CLOEXEC)
         .unwrap();
-    let source = table.snapshot_descriptors();
+    let source = table.snapshot_descriptors().expect("快照应成功");
 
     let prepared = table.fork_for_exec().expect("exec fdtable 预构造应成功");
 
     assert!(table.is_generation_current(source.generation()));
-    assert_eq!(table.snapshot_descriptors().descriptors().len(), 2);
-    let inherited = prepared.snapshot_descriptors();
+    assert_eq!(
+        table
+            .snapshot_descriptors()
+            .expect("快照应成功")
+            .descriptors()
+            .len(),
+        2
+    );
+    let inherited = prepared.snapshot_descriptors().expect("快照应成功");
     assert_eq!(inherited.descriptors().len(), 1);
     assert_eq!(inherited.descriptors()[0].fd(), Fd::STDIN);
     assert!(Arc::ptr_eq(inherited.descriptors()[0].file(), &read_end));
@@ -245,7 +261,9 @@ fn fork_for_exec_preserves_high_fd_after_hard_limit_lowering() {
 
     assert!(table.get_file(high).is_some());
     assert!(prepared.get_file(high).is_some());
-    assert!(prepared
-        .install_fd(Fd::from_raw(50), read_end, FdFlags::default())
-        .is_err());
+    assert!(
+        prepared
+            .install_fd(Fd::from_raw(50), read_end, FdFlags::default())
+            .is_err()
+    );
 }

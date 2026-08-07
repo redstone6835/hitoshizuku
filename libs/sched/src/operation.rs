@@ -17,7 +17,7 @@ use errno::Errno;
 use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::cpu::{CpuId, CpuMask};
 use crate::eevdf::SchedParams;
-use crate::group::{GroupExitStatus, ProcessGroup, Session};
+use crate::group::{GroupExitStatus, ProcessGroup, Session, ThreadGroup};
 use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
@@ -322,6 +322,151 @@ pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     true
 }
 
+/// 要求 exec 发起者之外的线程在自己的安全边界退出。
+pub fn request_exec_sibling_exit(target: &Arc<Task>, preserve_leader_identity: bool) {
+    crate::scheduler::exec_sibling_exit_wakeup(target, preserve_leader_identity);
+}
+
+/// 在目标线程自己的 syscall/用户返回边界完成 exec 协作退出。
+pub fn complete_exec_sibling_exit_if_requested(task: &Arc<Task>) -> bool {
+    if !task.exec_sibling_exit_boundary_pending() {
+        return false;
+    }
+    match task.state() {
+        // 保留 leader 身份的 exec 退出必须停在 Zombie，直到执行线程完成 PID、
+        // 父子关系和 children 的事务迁移；提前置 Dead 会让失败回滚无处可收。
+        TaskState::Zombie => {}
+        TaskState::Dead => {}
+        _ => exit_task(task, ExitCode(0)),
+    }
+    true
+}
+
+/// 在请求旧 leader 退出前预留身份迁移所需的 children 容量。
+pub fn prepare_exec_leader_identity(
+    executor: &Arc<Task>,
+    old_leader: &Arc<Task>,
+) -> Result<(), Errno> {
+    if Arc::ptr_eq(executor, old_leader) {
+        return Err(Errno::EINVAL);
+    }
+    let group = executor.thread_group();
+    if !Arc::ptr_eq(&group, &old_leader.thread_group())
+        || !group
+            .leader()
+            .is_some_and(|leader| Arc::ptr_eq(&leader, old_leader))
+    {
+        return Err(Errno::EBUSY);
+    }
+    executor
+        .try_reserve_children_for_exec(old_leader.child_count())
+        .map_err(|_| Errno::ENOMEM)
+}
+
+/// 非 leader 线程执行 exec 后，接管已经停止的旧 leader 进程身份。
+pub fn adopt_exec_leader_identity(
+    executor: &Arc<Task>,
+    old_leader: &Arc<Task>,
+) -> Result<(), Errno> {
+    let identity = crate::pid::lock_process_identity();
+    if Arc::ptr_eq(executor, old_leader) {
+        return Err(Errno::EINVAL);
+    }
+    let group = executor.thread_group();
+    if !Arc::ptr_eq(&group, &old_leader.thread_group())
+        || old_leader.state() != TaskState::Zombie
+        || !old_leader.exec_sibling_exit_preserves_identity()
+        || !group.has_only_exec_members(executor, old_leader)
+        || !group
+            .leader()
+            .is_some_and(|leader| Arc::ptr_eq(&leader, old_leader))
+    {
+        return Err(Errno::EBUSY);
+    }
+
+    let parent = old_leader.parent_in(&identity);
+    if parent
+        .as_ref()
+        .is_some_and(|parent| !parent.has_child(old_leader))
+        || old_leader.pid_root_in(&identity).is_none()
+        || executor.pid_root_in(&identity).is_none()
+        || !old_leader.pid_registrations_owned_by_self_in(&identity)
+        || !executor.pid_registrations_owned_by_self_in(&identity)
+    {
+        return Err(Errno::EAGAIN);
+    }
+    if !executor.children_capacity_for_exec(old_leader.child_count()) {
+        return Err(Errno::ENOMEM);
+    }
+
+    let leader_registrations = old_leader.take_pid_registrations_for_exec_in(&identity);
+    let executor_registrations = executor.take_pid_registrations_for_exec_in(&identity);
+    let mut replaced = 0;
+    for (namespace, pid) in leader_registrations.iter() {
+        if !namespace
+            .registry()
+            .replace_owner_in(&identity, *pid, old_leader, executor)
+        {
+            for (rollback_namespace, rollback_pid) in leader_registrations[..replaced].iter() {
+                let restored = rollback_namespace.registry().replace_owner_in(
+                    &identity,
+                    *rollback_pid,
+                    executor,
+                    old_leader,
+                );
+                debug_assert!(restored, "exec leader PID owner 回滚失败");
+            }
+            old_leader.install_pid_registrations_for_exec_in(&identity, leader_registrations);
+            executor.install_pid_registrations_for_exec_in(&identity, executor_registrations);
+            return Err(Errno::EAGAIN);
+        }
+        replaced += 1;
+    }
+
+    if let Some(parent) = parent.as_ref() {
+        if !parent.replace_child_for_exec_in(&identity, old_leader, executor) {
+            for (namespace, pid) in leader_registrations.iter() {
+                let restored = namespace
+                    .registry()
+                    .replace_owner_in(&identity, *pid, executor, old_leader);
+                debug_assert!(restored, "exec leader PID owner 回滚失败");
+            }
+            old_leader.install_pid_registrations_for_exec_in(&identity, leader_registrations);
+            executor.install_pid_registrations_for_exec_in(&identity, executor_registrations);
+            return Err(Errno::EAGAIN);
+        }
+        executor.reparent_to_in(&identity, parent);
+    } else {
+        executor.clear_parent_for_exec_in(&identity);
+    }
+    old_leader.clear_parent_for_exec_in(&identity);
+
+    for (namespace, pid) in executor_registrations.iter() {
+        namespace.registry().release_in(&identity, *pid);
+    }
+    executor.install_pid_registrations_for_exec_in(&identity, leader_registrations);
+    if let Some(leader_pid) = executor.pid_root_in(&identity) {
+        executor.set_tgid_cache(leader_pid);
+    }
+
+    let children = old_leader.take_children_for_exec_in(&identity);
+    for child in children.iter() {
+        child.reparent_to_in(&identity, executor);
+    }
+    executor.append_children_for_exec_in(&identity, children);
+
+    executor.set_exit_signal(old_leader.exit_signal());
+    old_leader.set_exit_signal(0);
+    group.set_leader_in(&identity, executor);
+    let removed = group.remove_member(old_leader);
+    debug_assert!(removed, "exec leader 身份迁移后旧 leader 应仍在成员表中");
+    old_leader.process_group().remove_member(old_leader);
+    old_leader.set_state(TaskState::Dead);
+    old_leader.exit_waiters.wake_all();
+    old_leader.clear_exec_sibling_exit_request();
+    Ok(())
+}
+
 // ── 调度器相关 ────────────────────────────────────────────────────────────────
 
 #[kernel_symbols::export(name = "sched.operation.sched_yield", contract = "kernel.sched.process-control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
@@ -462,6 +607,11 @@ pub fn all_tasks_snapshot() -> Vec<Arc<Task>> {
         .into_iter()
         .filter_map(|(_, weak)| weak.upgrade())
         .collect()
+}
+
+/// 为 PONR 前资源准备提供可失败的全局任务快照。
+pub fn try_all_tasks_snapshot() -> Result<Vec<Arc<Task>>, alloc::collections::TryReserveError> {
+    root_pid_ns().registry().try_snapshot_tasks()
 }
 
 #[kernel_symbols::export(name = "sched.operation.sched_getaffinity", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
@@ -667,10 +817,98 @@ pub struct CloneOutcome {
     pub child: Arc<Task>,
 }
 
-pub fn clone_with_context_outcome(
+/// 已完成任务图和用户上下文构造、但尚未进入运行队列的 clone 事务。
+///
+/// syscall personality 可在 [`Self::activate`] 前完成 pidfd 等可失败输出；若
+/// 提前返回，`Drop` 会回滚尚未对调度器可见的 child。
+pub struct PreparedClone {
+    parent: Option<Arc<Task>>,
+    child: Option<Arc<Task>>,
+    pid: PidT,
+    args: CloneArgs,
+}
+
+impl PreparedClone {
+    fn from_parts(parent: Arc<Task>, child: Arc<Task>, pid: PidT, args: CloneArgs) -> Self {
+        Self {
+            parent: Some(parent),
+            child: Some(child),
+            pid,
+            args,
+        }
+    }
+
+    pub fn pid(&self) -> PidT {
+        self.pid
+    }
+
+    pub fn child(&self) -> &Arc<Task> {
+        self.child.as_ref().expect("prepared clone child 已被消费")
+    }
+
+    /// 发布 child 并完成 vfork / 调度交接语义。
+    pub fn activate(mut self) -> Result<CloneOutcome, Errno> {
+        let child = self.child.take().expect("prepared clone 只能激活一次");
+        let parent = self.parent.take().expect("prepared clone 缺少父任务");
+        if let Err(err) = activate_task(&child) {
+            abort_new_task(&child);
+            return Err(err);
+        }
+
+        if self.args.flags.has(CloneFlags::CLONE_VFORK) {
+            let child_wait = Arc::downgrade(&child);
+            drop(parent);
+            loop {
+                let Some(wait_child) = child_wait.upgrade() else {
+                    break;
+                };
+                if !wait_child.is_vforking() {
+                    break;
+                }
+                let parent = current_task();
+                if parent.group_exit_pending() {
+                    break;
+                }
+                let entry = wait_child
+                    .vfork_done
+                    .prepare_to_wait(&parent, TaskState::Sleeping);
+                if !wait_child.is_vforking() || parent.group_exit_pending() {
+                    wait_child.vfork_done.finish_wait(&entry);
+                    break;
+                }
+                drop(wait_child);
+                drop(parent);
+                schedule_once(crate::scheduler::now_ns_public());
+                if let Some(wait_child) = child_wait.upgrade() {
+                    wait_child.vfork_done.finish_wait(&entry);
+                }
+            }
+        } else if !self.args.flags.has(CloneFlags::CLONE_THREAD) {
+            // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
+            // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
+            // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
+            request_post_syscall_handoff();
+        }
+
+        Ok(CloneOutcome {
+            pid: self.pid,
+            child,
+        })
+    }
+}
+
+impl Drop for PreparedClone {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            abort_new_task(&child);
+        }
+    }
+}
+
+pub fn prepare_clone_with_context(
     args: CloneArgs,
     user_ctx: UserContextRef,
-) -> Result<CloneOutcome, Errno> {
+) -> Result<PreparedClone, Errno> {
     validate_clone_args(args)?;
     let parent = current_task();
     let params = SchedParams::default_fair();
@@ -696,52 +934,15 @@ pub fn clone_with_context_outcome(
         abort_new_task(&child);
         return Err(err);
     }
-    if let Err(err) = activate_task(&child) {
-        abort_new_task(&child);
-        return Err(err);
-    }
 
-    if args.flags.has(CloneFlags::CLONE_VFORK) {
-        let child_wait = Arc::downgrade(&child);
-        drop(parent);
-        loop {
-            let Some(wait_child) = child_wait.upgrade() else {
-                break;
-            };
-            if !wait_child.is_vforking() {
-                break;
-            }
-            let parent = current_task();
-            if parent.group_exit_pending() {
-                break;
-            }
-            let entry = wait_child
-                .vfork_done
-                .prepare_to_wait(&parent, TaskState::Sleeping);
-            if !wait_child.is_vforking() || parent.group_exit_pending() {
-                wait_child.vfork_done.finish_wait(&entry);
-                break;
-            }
-            drop(wait_child);
-            drop(parent);
-            schedule_once(crate::scheduler::now_ns_public());
-            if let Some(wait_child) = child_wait.upgrade() {
-                wait_child.vfork_done.finish_wait(&entry);
-            }
-        }
-    } else if !args.flags.has(CloneFlags::CLONE_THREAD) {
-        // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
-        // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
-        // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
-        request_post_syscall_handoff();
-    } else {
-        // pthread 创建后，父线程通常会立即 join/futex 等待，或继续批量创建
-        // 其它线程。强制在每次 clone 返回后切给子线程会把 create 串行化，
-        // 使 libcbench 的 pthread 创建项异常变慢；让父线程自然运行到阻塞点，
-        // 再由 futex/preferred 入队把子线程调度起来即可。
-    }
+    Ok(PreparedClone::from_parts(parent, child, pid, args))
+}
 
-    Ok(CloneOutcome { pid, child })
+pub fn clone_with_context_outcome(
+    args: CloneArgs,
+    user_ctx: UserContextRef,
+) -> Result<CloneOutcome, Errno> {
+    prepare_clone_with_context(args, user_ctx)?.activate()
 }
 
 pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
@@ -799,8 +1000,10 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
     // pthread_create() 会复用 clone_args 缓冲，把该字段填成 TID 地址但不置
     // CLONE_PIDFD；Linux 对这种无效字段是忽略而不是返回 EINVAL，否则用户态
     // 不会 fallback 到传统 clone，线程创建会直接失败。
-    if flags.has(CloneFlags::CLONE_PIDFD) && args.pidfd == 0 {
-        return Err(Errno::EINVAL);
+    if flags.has(CloneFlags::CLONE_PIDFD) {
+        if args.pidfd == 0 || flags.has(CloneFlags::CLONE_THREAD) {
+            return Err(Errno::EINVAL);
+        }
     }
     if args.exit_signal > 64 {
         return Err(Errno::EINVAL);
@@ -836,7 +1039,7 @@ fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> boo
         WaitId::Pid(pid) => child.pid_root() == Some(*pid),
         WaitId::Pgid(pgid) => child.process_group().pgid() == *pgid,
         WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &parent.process_group()),
-        WaitId::Pidfd(task) => Arc::ptr_eq(child, task),
+        WaitId::Pidfd(group) => Arc::ptr_eq(&child.thread_group(), group),
     }
 }
 
@@ -1096,8 +1299,15 @@ fn terminate_thread_group_by_signal_from(
         return false;
     }
 
+    terminate_thread_group_identity_by_signal_from(&target.thread_group(), info, current)
+}
+
+fn terminate_thread_group_identity_by_signal_from(
+    group: &Arc<ThreadGroup>,
+    info: SigInfo,
+    current: &Arc<Task>,
+) -> bool {
     let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
-    let group = target.thread_group();
     // 与 CLONE_THREAD 登记通过 members 锁排序：先登记者会进入本次 snapshot，
     // 后到者被拒绝，避免 SIGKILL 之后仍产生未收到终止请求的新线程。
     let _ = group.request_group_signal(info.sig, core_dumped);
@@ -1127,6 +1337,22 @@ fn terminate_thread_group_by_signal_from(
     terminated
 }
 
+fn deliver_to_thread_group_identity(group: &Arc<ThreadGroup>, info: SigInfo) -> bool {
+    if info.sig == SignalNumber::SIGKILL {
+        let current = current_task();
+        return terminate_thread_group_identity_by_signal_from(group, info, &current);
+    }
+
+    group.shared_signal().deliver(info);
+    for member in group.snapshot() {
+        if should_wake_for_signal(&member, info.sig) {
+            signal_wakeup(&member, &info);
+            break;
+        }
+    }
+    true
+}
+
 fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
@@ -1135,32 +1361,41 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
         info.sig,
         target.state(),
     );
-    if info.sig == SignalNumber::SIGKILL {
-        let delivered = terminate_thread_group_by_signal(target, info);
-        #[cfg(feature = "trace-task-lifecycle")]
-        log::info!(
-            "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered={}",
-            target.pid_root(),
-            info.sig,
-            delivered,
-        );
-        return delivered;
+    if target.is_kernel_task() {
+        return false;
     }
-
-    target.thread_group().shared_signal().deliver(info);
-    for m in target.thread_group().snapshot() {
-        if should_wake_for_signal(&m, info.sig) {
-            signal_wakeup(&m, &info);
-            break;
-        }
-    }
+    let delivered = deliver_to_thread_group_identity(&target.thread_group(), info);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
-        "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered=true",
+        "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered={}",
         target.pid_root(),
         info.sig,
+        delivered,
     );
-    true
+    delivered
+}
+
+fn check_pidfd_group_permission(group: &Arc<ThreadGroup>) -> Result<(), Errno> {
+    if group.is_terminated() {
+        return Err(Errno::ESRCH);
+    }
+    let target = group.leader().ok_or(Errno::ESRCH)?;
+    check_kill_permission(&target)
+}
+
+/// pidfd 的普通信号入口：直接使用稳定线程组身份，禁止经由可重用的 TGID 回查。
+pub fn pidfd_kill(group: &Arc<ThreadGroup>, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    check_pidfd_group_permission(group)?;
+    let Some(sig) = sig else { return Ok(()) };
+    let _ = deliver_to_thread_group_identity(group, make_siginfo(sig));
+    Ok(())
+}
+
+/// pidfd 的排队信号入口，保留用户提供的 siginfo，同时绑定稳定线程组身份。
+pub fn pidfd_queueinfo(group: &Arc<ThreadGroup>, info: SigInfo) -> Result<(), Errno> {
+    check_pidfd_group_permission(group)?;
+    let _ = deliver_to_thread_group_identity(group, info);
+    Ok(())
 }
 
 /// `kill(pid, sig)`：按 POSIX pid 语义投递信号。
@@ -1817,7 +2052,7 @@ pub fn prepare_user_return_for_task(
     if task.is_kernel_task() || user_ctx.is_none() {
         return Ok(());
     }
-    if complete_group_exit_if_requested(task) {
+    if complete_exec_sibling_exit_if_requested(task) || complete_group_exit_if_requested(task) {
         return Ok(());
     }
     let Some(ops) = process_image_ops() else {
@@ -2368,5 +2603,67 @@ pub mod smoketest {
             runqueue().nr_running(),
             crate::scheduler::pid_count(),
         );
+    }
+}
+
+#[cfg(test)]
+mod pidfd_signal_tests {
+    use alloc::sync::Weak;
+
+    use super::*;
+
+    #[test]
+    fn process_signal_delivery_uses_stable_thread_group_identity() {
+        let group = crate::ThreadGroup::new();
+        let info = SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 7,
+            sender_uid: Uid(0),
+            raw: None,
+        };
+
+        assert!(deliver_to_thread_group_identity(&group, info));
+        assert!(
+            group
+                .shared_signal()
+                .pending_snapshot()
+                .has(SignalNumber::SIGUSR1)
+        );
+    }
+
+    #[test]
+    fn dropping_prepared_clone_rolls_back_unactivated_child() {
+        let session = crate::Session::new();
+        let process_group = crate::ProcessGroup::new(&session);
+        session.register_group(&process_group);
+        let parent = Task::new(
+            SchedParams::default_fair(),
+            Weak::new(),
+            crate::ThreadGroup::new(),
+            Arc::clone(&process_group),
+        );
+        let child_group = crate::ThreadGroup::new();
+        let child = Task::new(
+            SchedParams::default_fair(),
+            Arc::downgrade(&parent),
+            Arc::clone(&child_group),
+            Arc::clone(&process_group),
+        );
+        child_group.set_leader(&child);
+        child_group.add_member(&child);
+        process_group.add_member(&child);
+        parent.add_child(Arc::clone(&child));
+
+        drop(PreparedClone::from_parts(
+            Arc::clone(&parent),
+            Arc::clone(&child),
+            7,
+            CloneArgs::fork_default(),
+        ));
+
+        assert_eq!(child.state(), TaskState::Dead);
+        assert!(parent.snapshot_children().is_empty());
+        assert!(child_group.snapshot().is_empty());
     }
 }

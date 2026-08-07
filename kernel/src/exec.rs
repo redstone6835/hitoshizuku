@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use errno::Errno;
-use general::mm::{copy_cstr_from_user, copy_from_user, VmSpace};
+use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user};
 use general::vfs::{FdTable, VfsContext};
 use hal::user_context::UserTrapFrame;
 use native_abi::ExecPhase;
@@ -14,12 +14,11 @@ use native_abi::UserAbiKind;
 use sched::group::{ProcessPersonalityState, ThreadGroupExecGuard};
 use sched::process_ops::{ExecPath, ExecRequest, UserContextRef};
 use sched::{
-    PreparedSignalActions, SharedSignal, Task, TASKEXT_EXEC_ACCESS, TASKEXT_EXEC_ARGS,
-    TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
-    TASKEXT_VM_SPACE,
+    PreparedSignalActions, SharedSignal, TASKEXT_EXEC_ACCESS, TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP,
+    TASKEXT_EXEC_PATH, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
 
-use crate::syscalls::{cleanup_task_for_exec, ExecCleanupScratch};
+use crate::syscalls::{ExecCleanupScratch, cleanup_task_for_exec};
 use crate::user::{ExecutableAccessSet, LoadedUserImage};
 
 const EXEC_PATH_MAX: usize = 4096;
@@ -130,6 +129,14 @@ fn revalidate_before_ponr(
     revalidate_resources()
 }
 
+fn abort_exec_transition_before_ponr(
+    guard: &mut ThreadGroupExecGuard<'_>,
+    error: Errno,
+) -> Result<(), Errno> {
+    guard.set_phase(ExecPhase::Running);
+    Err(error)
+}
+
 /// 驱动 PONR 后的固定安装序列，并集中执行失败策略和最终发布。
 fn drive_install_steps<E>(
     guard: &mut ThreadGroupExecGuard<'_>,
@@ -141,8 +148,112 @@ fn drive_install_steps<E>(
             return Err(error);
         }
     }
+    Ok(())
+}
+
+/// 在全部安装步骤与 PI handoff 完成后发布新一代映像。
+fn finish_exec_commit(
+    guard: &mut ThreadGroupExecGuard<'_>,
+    handoffs_applied: bool,
+) -> Result<(), Errno> {
+    if !handoffs_applied {
+        guard.set_phase(ExecPhase::Terminating);
+        return Err(Errno::ENOMEM);
+    }
     guard.advance_generation();
     guard.set_phase(ExecPhase::Running);
+    Ok(())
+}
+
+fn release_before_diverging<T, R>(resources: T, next: impl FnOnce() -> R) -> R {
+    drop(resources);
+    next()
+}
+
+struct PlannedExecThreadTransition {
+    siblings: Vec<Arc<Task>>,
+    replaced_leader: Option<Arc<Task>>,
+}
+
+fn plan_exec_thread_transition(
+    guard: &ThreadGroupExecGuard<'_>,
+    task: &Arc<Task>,
+    source_abi: UserAbiKind,
+    target_abi: UserAbiKind,
+) -> Result<PlannedExecThreadTransition, Errno> {
+    if task.thread_group().group_exit_status().is_some() {
+        return Err(Errno::EBUSY);
+    }
+    if source_abi != UserAbiKind::TomoriLinux || target_abi != UserAbiKind::TomoriLinux {
+        if !guard.has_only_member(task) {
+            return Err(Errno::EBUSY);
+        }
+        return Ok(PlannedExecThreadTransition {
+            siblings: Vec::new(),
+            replaced_leader: None,
+        });
+    }
+
+    let mut siblings = guard.try_member_snapshot().map_err(|_| Errno::ENOMEM)?;
+    if !siblings.iter().any(|member| Arc::ptr_eq(member, task)) {
+        return Err(Errno::EAGAIN);
+    }
+    siblings.retain(|member| !Arc::ptr_eq(member, task));
+    let leader = task.thread_group().leader().ok_or(Errno::EAGAIN)?;
+    let replaced_leader = if Arc::ptr_eq(&leader, task) {
+        None
+    } else if siblings.iter().any(|sibling| Arc::ptr_eq(sibling, &leader)) {
+        Some(leader)
+    } else {
+        return Err(Errno::EAGAIN);
+    };
+    if let Some(old_leader) = replaced_leader.as_ref() {
+        sched::operation::prepare_exec_leader_identity(task, old_leader)?;
+    }
+    Ok(PlannedExecThreadTransition {
+        siblings,
+        replaced_leader,
+    })
+}
+
+fn complete_exec_thread_transition(
+    task: &Arc<Task>,
+    transition: PlannedExecThreadTransition,
+) -> Result<(), Errno> {
+    for sibling in transition.siblings.iter() {
+        let preserve_leader_identity = transition
+            .replaced_leader
+            .as_ref()
+            .is_some_and(|leader| Arc::ptr_eq(leader, sibling));
+        sched::operation::request_exec_sibling_exit(sibling, preserve_leader_identity);
+    }
+    for sibling in transition.siblings.iter() {
+        let preserve_leader_identity = transition
+            .replaced_leader
+            .as_ref()
+            .is_some_and(|leader| Arc::ptr_eq(leader, sibling));
+        sibling.exit_waiters.wait_event(task, || {
+            matches!(
+                sibling.state(),
+                sched::TaskState::Zombie | sched::TaskState::Dead
+            ) && sibling.running_cpu().is_none()
+                && sibling.exit_extensions_cleanup_complete()
+        });
+        if sibling.state() == sched::TaskState::Zombie {
+            let _ = sched::operation::complete_exec_sibling_exit_if_requested(sibling);
+        }
+        let expected = if preserve_leader_identity {
+            sched::TaskState::Zombie
+        } else {
+            sched::TaskState::Dead
+        };
+        if sibling.state() != expected {
+            return Err(Errno::EAGAIN);
+        }
+    }
+    if let Some(old_leader) = transition.replaced_leader.as_ref() {
+        sched::operation::adopt_exec_leader_identity(task, old_leader)?;
+    }
     Ok(())
 }
 
@@ -416,6 +527,17 @@ fn terminate_after_ponr(task: &Arc<Task>, error: Errno) -> ! {
     sched::operation::exit_group(127)
 }
 
+fn terminate_commit_after_ponr(
+    task: &Arc<Task>,
+    error: Errno,
+    prepared: PreparedExec,
+    fdtable_source: Option<(Arc<FdTable>, u64)>,
+) -> ! {
+    release_before_diverging((prepared, fdtable_source), || {
+        terminate_after_ponr(task, error)
+    })
+}
+
 /// 重验并原子发布一个已经完成全部可失败工作的映像替换事务。
 pub(crate) fn commit_exec(
     task: &Arc<Task>,
@@ -427,49 +549,145 @@ pub(crate) fn commit_exec(
     }
     let group = task.thread_group();
     let mut guard = group.lock_exec();
-    let _vfs_lease = prepared
-        .observed
-        .vfs_context
-        .as_ref()
-        .map(|context| context.lock_for_exec());
     revalidate_before_ponr(&mut guard, prepared.observed.exec_generation, || {
         prepared.observed.revalidate(task)
     })?;
 
+    let target_abi = prepared.personality.state.user_abi_kind();
+    let thread_transition =
+        plan_exec_thread_transition(&guard, task, prepared.observed.source_abi, target_abi)?;
+    let dethreaded = !thread_transition.siblings.is_empty();
+
+    // owner 判断必须在 Transitioning 和兄弟线程退出之前完成。此时 exec guard
+    // 仍阻止本线程组 clone；若任务快照分配失败，旧映像仍可安全返回 ENOMEM。
+    let private_fdtable_source = match prepared.observed.fdtable.as_ref() {
+        Some(observed) => {
+            !crate::syscalls::try_fdtable_has_other_live_owner(task, &observed.table)?
+        }
+        None => false,
+    };
+
+    // Transitioning 阻止新线程加入并冻结 signal consumer。等待兄弟线程时不能
+    // 持有 exec/VFS/signal/FdTable 锁，否则目标线程的退出清理可能永久阻塞。
+    guard.set_phase(ExecPhase::Transitioning);
+    drop(guard);
+    if let Err(error) = complete_exec_thread_transition(task, thread_transition) {
+        let mut failure_guard = group.lock_exec();
+        failure_guard.set_phase(ExecPhase::Terminating);
+        drop(failure_guard);
+        drop(group);
+        terminate_commit_after_ponr(task, error, prepared, None);
+    }
+
+    let mut guard = group.lock_exec();
+    if group.group_exit_status().is_some() {
+        guard.set_phase(ExecPhase::Terminating);
+        drop(guard);
+        drop(group);
+        terminate_commit_after_ponr(task, Errno::EBUSY, prepared, None);
+    }
+    let only_member = guard.has_only_member(task);
+    if guard.phase() != ExecPhase::Transitioning
+        || guard.generation() != prepared.observed.exec_generation
+        || !only_member
+    {
+        if !dethreaded && guard.phase() == ExecPhase::Transitioning && only_member {
+            return abort_exec_transition_before_ponr(&mut guard, Errno::EAGAIN);
+        }
+        guard.set_phase(ExecPhase::Terminating);
+        drop(guard);
+        drop(group);
+        terminate_commit_after_ponr(task, Errno::EAGAIN, prepared, None);
+    }
+
+    let vfs_source = prepared.observed.vfs_context.clone();
+    let vfs_lease = vfs_source.as_ref().map(|context| context.lock_for_exec());
+    if let Err(error) = prepared.observed.revalidate(task) {
+        if !dethreaded {
+            return abort_exec_transition_before_ponr(&mut guard, error);
+        }
+        guard.set_phase(ExecPhase::Terminating);
+        drop(vfs_lease);
+        drop(guard);
+        drop(vfs_source);
+        drop(group);
+        terminate_commit_after_ponr(task, error, prepared, None);
+    }
+
     // 共享 FdTable 可由其它任务并发修改。代际匹配后把表锁持有到资源指针交换，
     // 使最后一次重验与发布之间没有 TOCTOU 窗口。
-    let fdtable_source = prepared
+    let fdtable_lease_source = prepared
         .observed
         .fdtable
         .as_ref()
         .map(|observed| (Arc::clone(&observed.table), observed.generation));
-    let private_fdtable_source = prepared.observed.fdtable.as_ref().is_some_and(|observed| {
-        // 此时强引用包括任务扩展、快照和下方的 source clone；其它 CLONE_FILES
-        // 持有者会留下额外引用。
-        Arc::strong_count(&observed.table) == 3
-    });
-    let mut fdtable_lease = match fdtable_source.as_ref() {
-        Some((table, generation)) => Some(table.lock_generation(*generation).ok_or(Errno::EAGAIN)?),
-        None => None,
-    };
-    let signal_actions_lease = prepared.observed.shared_signal.lock_actions_for_exec();
+    let fdtable_source = fdtable_lease_source.clone();
+    let mut fdtable_lease = fdtable_lease_source
+        .as_ref()
+        .and_then(|(table, generation)| table.lock_generation(*generation));
+    if fdtable_lease_source.is_some() && fdtable_lease.is_none() {
+        if !dethreaded {
+            return abort_exec_transition_before_ponr(&mut guard, Errno::EAGAIN);
+        }
+        guard.set_phase(ExecPhase::Terminating);
+        drop(fdtable_lease);
+        drop(vfs_lease);
+        drop(guard);
+        drop(vfs_source);
+        drop(fdtable_lease_source);
+        drop(group);
+        terminate_commit_after_ponr(task, Errno::EAGAIN, prepared, fdtable_source);
+    }
+    let signal_source = Arc::clone(&prepared.observed.shared_signal);
+    let signal_actions_lease = signal_source.lock_actions_for_exec();
     if !signal_actions_lease.is_current(&prepared.resources.signal_actions) {
-        return Err(Errno::EAGAIN);
+        if !dethreaded {
+            return abort_exec_transition_before_ponr(&mut guard, Errno::EAGAIN);
+        }
+        guard.set_phase(ExecPhase::Terminating);
+        drop(fdtable_lease);
+        drop(signal_actions_lease);
+        drop(vfs_lease);
+        drop(guard);
+        drop(signal_source);
+        drop(vfs_source);
+        drop(fdtable_lease_source);
+        drop(group);
+        terminate_commit_after_ponr(task, Errno::EAGAIN, prepared, fdtable_source);
     }
     match (fdtable_source.as_ref(), task_fdtable(task)) {
         (Some((observed, _)), Some(current)) if Arc::ptr_eq(observed, &current) => {}
         (None, None) => {}
-        _ => return Err(Errno::EAGAIN),
+        _ => {
+            if !dethreaded {
+                return abort_exec_transition_before_ponr(&mut guard, Errno::EAGAIN);
+            }
+            guard.set_phase(ExecPhase::Terminating);
+            drop(fdtable_lease);
+            drop(signal_actions_lease);
+            drop(vfs_lease);
+            drop(guard);
+            drop(signal_source);
+            drop(vfs_source);
+            drop(fdtable_lease_source);
+            drop(group);
+            terminate_commit_after_ponr(task, Errno::EAGAIN, prepared, fdtable_source);
+        }
     }
 
-    // Transitioning 先冻结 signal consumer；旧地址空间清理仍在这里保持激活，
-    // 完成后才进入不可回退的映像安装序列。
-    guard.set_phase(ExecPhase::Transitioning);
+    // 旧地址空间清理仍在这里保持激活，完成后才进入映像安装序列。
     cleanup_task_for_exec(task, &mut prepared.cleanup);
     if prepared.cleanup.has_pi_handoff_overflow() {
-        drop(fdtable_lease.take());
+        guard.set_phase(ExecPhase::Terminating);
+        drop(fdtable_lease);
+        drop(signal_actions_lease);
+        drop(vfs_lease);
         drop(guard);
-        terminate_after_ponr(task, Errno::ENOMEM);
+        drop(signal_source);
+        drop(vfs_source);
+        drop(fdtable_lease_source);
+        drop(group);
+        terminate_commit_after_ponr(task, Errno::ENOMEM, prepared, fdtable_source);
     }
 
     // 这是最后一个可失败检查之后的发布点；从这里开始绝不返回旧映像。
@@ -530,14 +748,26 @@ pub(crate) fn commit_exec(
         let _ = prepared.cleanup.apply_pi_handoffs();
         // exit_group 不返回，必须显式释放仍锁住源 fdtable 的租约；否则退出清理
         // 会再次获取同一把锁而永久自锁。
-        drop(fdtable_lease.take());
+        drop(fdtable_lease);
+        drop(signal_actions_lease);
+        drop(vfs_lease);
         drop(guard);
-        terminate_after_ponr(task, error);
+        drop(signal_source);
+        drop(vfs_source);
+        drop(fdtable_lease_source);
+        drop(group);
+        terminate_commit_after_ponr(task, error, prepared, fdtable_source);
     }
-    if !prepared.cleanup.apply_pi_handoffs() {
-        drop(fdtable_lease.take());
+    if let Err(error) = finish_exec_commit(&mut guard, prepared.cleanup.apply_pi_handoffs()) {
+        drop(fdtable_lease);
+        drop(signal_actions_lease);
+        drop(vfs_lease);
         drop(guard);
-        terminate_after_ponr(task, Errno::ENOMEM);
+        drop(signal_source);
+        drop(vfs_source);
+        drop(fdtable_lease_source);
+        drop(group);
+        terminate_commit_after_ponr(task, error, prepared, fdtable_source);
     }
     if private_fdtable_source {
         if let Some((source, _)) = fdtable_source.as_ref() {

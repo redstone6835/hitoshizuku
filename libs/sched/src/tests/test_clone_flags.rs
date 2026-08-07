@@ -92,3 +92,22 @@ fn clear_sighand_conflicts_with_shared_sighand() {
         Err(Errno::EINVAL)
     );
 }
+
+/// 当前 pidfd 只代表稳定的进程身份，不能把线程 TID 静默提升为进程 pidfd。
+#[ktest]
+fn process_pidfd_rejects_clone_thread() {
+    let mut args = CloneArgs::fork_default();
+    args.flags = CloneFlags::from_raw(
+        CloneFlags::CLONE_PIDFD
+            | CloneFlags::CLONE_THREAD
+            | CloneFlags::CLONE_SIGHAND
+            | CloneFlags::CLONE_VM,
+    );
+    args.pidfd = 0x1000;
+    args.exit_signal = 0;
+
+    assert_eq!(
+        crate::operation::validate_clone_args(args),
+        Err(Errno::EINVAL)
+    );
+}

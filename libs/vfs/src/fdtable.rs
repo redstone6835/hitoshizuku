@@ -732,9 +732,12 @@ impl FdTable {
     ///
     /// 条目按 fd 升序返回。快照创建完成后，调用方应在进入不可回退阶段前使用
     /// [`FdTable::is_generation_current`] 重验代际。
-    pub fn snapshot_descriptors(&self) -> FdTableSnapshot {
+    pub fn snapshot_descriptors(&self) -> VfsResult<FdTableSnapshot> {
         let inner = self.inner.lock();
-        let mut descriptors = Vec::with_capacity(inner.count);
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(inner.count)
+            .map_err(|_| VfsError::OutOfMemory)?;
         for (i, &word) in inner.bitmap.iter().enumerate() {
             let mut remaining = word;
             while remaining != 0 {
@@ -750,10 +753,10 @@ impl FdTable {
                 }
             }
         }
-        FdTableSnapshot {
+        Ok(FdTableSnapshot {
             generation: inner.generation,
             descriptors,
-        }
+        })
     }
 
     /// 判断给定快照代际是否仍对应当前 fdtable 状态。

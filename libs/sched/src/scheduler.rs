@@ -237,6 +237,8 @@ static SCHED_RR_TIMESLICE_MS: AtomicI32 =
 
 /// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
 static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
+/// init 的稳定进程身份；非 leader exec 后通过线程组 leader 动态解析。
+static INIT_THREAD_GROUP: AtomicPtr<ThreadGroup> = AtomicPtr::new(core::ptr::null_mut());
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
 static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
@@ -398,12 +400,23 @@ pub fn init() -> Arc<Task> {
 
     // 7) 发布全局锚点。AtomicPtr 持有的强引用与内核同寿命，不参与常规回收。
     let init_ptr = Arc::into_raw(Arc::clone(&init_task)).cast_mut();
+    let init_group_ptr = Arc::into_raw(Arc::clone(&tgroup)).cast_mut();
     let root_ptr = Arc::into_raw(Arc::clone(&root_ns)).cast_mut();
     assert!(
         INIT_TASK
             .compare_exchange(
                 core::ptr::null_mut(),
                 init_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
+    assert!(
+        INIT_THREAD_GROUP
+            .compare_exchange(
+                core::ptr::null_mut(),
+                init_group_ptr,
                 Ordering::Release,
                 Ordering::Relaxed,
             )
@@ -443,7 +456,19 @@ pub fn init_task() -> Arc<Task> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] init_task() called before sched::init()"
     );
-    clone_global_arc(&INIT_TASK, "[sched] INIT_TASK flag set but slot empty")
+    let group = clone_global_arc(
+        &INIT_THREAD_GROUP,
+        "[sched] INIT_THREAD_GROUP flag set but slot empty",
+    );
+    group
+        .leader()
+        .or_else(|| {
+            Some(clone_global_arc(
+                &INIT_TASK,
+                "[sched] INIT_TASK flag set but slot empty",
+            ))
+        })
+        .expect("[sched] init thread group leader missing")
 }
 
 /// 当前 CPU 的 runqueue。
@@ -2490,7 +2515,9 @@ pub(crate) fn requeue_balance_task_on(
             // task 可能带着 MIGRATING 状态进来（来自失败的 balance_once 回滚）；
             // 普通 enqueue 的 on_rq 门禁会拒绝它，需要走提交入口。
             let queued = if task.sched.is_migrating() {
-                cpu_state.runqueue().enqueue_migrated(Arc::clone(&task), now_ns)
+                cpu_state
+                    .runqueue()
+                    .enqueue_migrated(Arc::clone(&task), now_ns)
             } else {
                 cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
             };
@@ -2669,6 +2696,16 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
 /// 到达安全边界。
 pub fn group_exit_wakeup(target: &Arc<Task>) {
     target.publish_group_exit_wakeup();
+    forced_exit_wakeup(target);
+}
+
+/// 唤醒被 exec 发起者要求自行退出的兄弟线程。
+pub fn exec_sibling_exit_wakeup(target: &Arc<Task>, preserve_leader_identity: bool) {
+    target.publish_exec_sibling_exit_wakeup(preserve_leader_identity);
+    forced_exit_wakeup(target);
+}
+
+fn forced_exit_wakeup(target: &Arc<Task>) {
     let resumed = target.resume_for_fatal_exit()
         || target.cas_state(TaskState::Sleeping, TaskState::Runnable)
         || target.cas_state(TaskState::Uninterruptible, TaskState::Runnable);

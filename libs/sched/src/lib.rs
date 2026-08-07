@@ -92,8 +92,8 @@ pub use cpu::{
 };
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{
-    GroupExitStatus, ProcessGroup, ProcessPersonalityState, Session, ThreadGroup,
-    ThreadGroupExecGuard,
+    GroupExitStatus, ProcessExitObserver, ProcessGroup, ProcessPersonalityState, Session,
+    ThreadGroup, ThreadGroupExecGuard,
 };
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
 pub use membarrier::{
