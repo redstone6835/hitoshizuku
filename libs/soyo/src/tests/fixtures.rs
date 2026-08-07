@@ -119,7 +119,7 @@ pub fn minimal_soyo() -> Vec<u8> {
     put_u64(&mut bytes, 632, 64 * 1024);
     put_u64(&mut bytes, 632 + 0x08, 4096);
     put_u32(&mut bytes, 632 + 0x38, 16);
-    put_u32(&mut bytes, 632 + 0x3c, 192);
+    put_u32(&mut bytes, 632 + 0x3c, 4096);
 
     bytes[4096..4100].copy_from_slice(&[0x73, 0x00, 0x00, 0x00]);
     rehash(&mut bytes);

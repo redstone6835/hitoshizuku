@@ -1,6 +1,7 @@
 use crate::{
     ResourceKind, SliceSoyoReader, SoyoError, SoyoReadAt, SoyoReadError, SoyoReadLimits,
-    SoyoTargetPolicy, read_soyo, registry::RelocationKind, validate_soyo,
+    SoyoRuntimeLayoutInput, SoyoTargetPolicy, plan_mapped_segments, plan_runtime_layout, read_soyo,
+    registry::RelocationKind, validate_soyo,
 };
 
 use core::cell::RefCell;
@@ -51,6 +52,72 @@ fn valid_relocation_is_decoded_from_a_complete_image() {
     assert_eq!(metadata.relocations.len(), 1);
     assert_eq!(metadata.relocations[0].target_segment_index, 1);
     assert_eq!(metadata.relocations[0].source_segment_index, u32::MAX);
+}
+
+#[test]
+fn mapped_segments_are_rebased_without_mapping_tls_template() {
+    let bytes = extended_soyo();
+    let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
+        .expect("合法 SOYO 应通过解析");
+
+    let mapped = plan_mapped_segments(&metadata, 0x0040_0000).expect("应生成映射计划");
+    assert_eq!(mapped.len(), 2);
+    assert_eq!(mapped[0].virtual_start, 0x0040_0000);
+    assert_eq!(mapped[1].virtual_start, 0x0040_1000);
+    assert_eq!(mapped[1].memory_size, 4096);
+}
+
+#[test]
+fn runtime_layout_keeps_start_info_tls_guard_and_stack_disjoint() {
+    let layout = plan_runtime_layout(SoyoRuntimeLayoutInput {
+        image_base: 0x0040_0000,
+        image_virtual_size: 0x2000,
+        stack_top: 0x8000_0000,
+        stack_size: 0x1_0000,
+        stack_guard_size: 0x2000,
+        tls_memory_size: 0x1780,
+        tls_alignment: 0x100,
+        start_info_size: 304,
+        user_lower_bound: 0x1000,
+    })
+    .expect("合法运行时布局应完成规划");
+
+    assert_eq!(layout.image, 0x0040_0000..0x0040_2000);
+    assert_eq!(layout.stack, 0x7fff_0000..0x8000_0000);
+    assert_eq!(layout.guard, 0x7ffe_e000..0x7fff_0000);
+    assert_eq!(layout.tls, Some(0x7ffe_c000..0x7ffe_e000));
+    assert_eq!(layout.initial_tls_size, 0x1800);
+    assert_eq!(layout.start_info, 0x7ffe_b000..0x7ffe_c000);
+}
+
+#[test]
+fn runtime_layout_rejects_underflow_and_image_overlap() {
+    let base = SoyoRuntimeLayoutInput {
+        image_base: 0x0040_0000,
+        image_virtual_size: 0x2000,
+        stack_top: 0x20_000,
+        stack_size: 0x1_0000,
+        stack_guard_size: 0x2000,
+        tls_memory_size: 0,
+        tls_alignment: 0,
+        start_info_size: 304,
+        user_lower_bound: 0x10_000,
+    };
+    assert_eq!(
+        plan_runtime_layout(base),
+        Err(SoyoError::Malformed(crate::MalformedKind::Range))
+    );
+
+    assert_eq!(
+        plan_runtime_layout(SoyoRuntimeLayoutInput {
+            image_base: 0x7ffe_d000,
+            image_virtual_size: 0x3000,
+            stack_top: 0x8000_0000,
+            user_lower_bound: 0x1000,
+            ..base
+        }),
+        Err(SoyoError::Malformed(crate::MalformedKind::Range))
+    );
 }
 
 #[test]

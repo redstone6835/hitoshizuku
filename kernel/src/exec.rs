@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use errno::Errno;
-use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user};
+use general::TaskOps;
+use general::mm::{VmSpace, copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user};
 use general::vfs::{FdTable, VfsContext};
 use hal::user_context::UserTrapFrame;
 use native_abi::ExecPhase;
@@ -19,7 +20,7 @@ use sched::{
 };
 
 use crate::syscalls::{ExecCleanupScratch, cleanup_task_for_exec};
-use crate::user::{ExecutableAccessSet, LoadedUserImage};
+use crate::user::{ExecutableAccessSet, LoadedExecutionImage, LoadedUserImage};
 
 const EXEC_PATH_MAX: usize = 4096;
 const EXEC_MAX_STRINGS: usize = 4096;
@@ -29,6 +30,7 @@ const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 pub(crate) struct PreparedImage {
     vm: Arc<VmSpace>,
     exec_access: Arc<ExecutableAccessSet>,
+    sync_icache: bool,
     #[cfg(feature = "performance-profile")]
     main_profile: (u64, usize, usize),
     #[cfg(feature = "performance-profile")]
@@ -43,6 +45,7 @@ pub(crate) struct PreparedPersonality {
 /// 已按目标 personality 规则构造完毕的进程资源。
 pub(crate) struct PreparedResources {
     fdtable: Option<Arc<FdTable>>,
+    detach_vfs: bool,
     signal_actions: PreparedSignalActions,
 }
 
@@ -58,6 +61,23 @@ pub(crate) struct PreparedStartup {
 pub(crate) struct PreparedInitialThread {
     frame: UserTrapFrame,
     kernel_stack_top: usize,
+}
+
+struct PreparedLoad {
+    vm: Arc<VmSpace>,
+    exec_access: Arc<ExecutableAccessSet>,
+    sync_icache: bool,
+    personality: ProcessPersonalityState,
+    fdtable: Option<Arc<FdTable>>,
+    detach_vfs: bool,
+    exec_path: String,
+    argv: Vec<String>,
+    envp: Vec<String>,
+    frame: UserTrapFrame,
+    #[cfg(feature = "performance-profile")]
+    main_profile: (u64, usize, usize),
+    #[cfg(feature = "performance-profile")]
+    interpreter_profile: (u64, usize, usize),
 }
 
 struct ObservedFdTable {
@@ -281,10 +301,14 @@ fn read_user_usize(user: usize) -> Result<usize, Errno> {
     Ok(usize::from_ne_bytes(raw))
 }
 
-fn collect_user_string_array(
+fn copy_user_cstring_bytes(user: usize, max: usize) -> Result<Vec<u8>, Errno> {
+    copy_cstr_bytes_from_user(user, max).map_err(|error| error.as_errno())
+}
+
+fn collect_user_byte_string_array(
     table_user: usize,
     used_bytes: &mut usize,
-) -> Result<Vec<String>, Errno> {
+) -> Result<Vec<Vec<u8>>, Errno> {
     let mut strings = Vec::new();
     if table_user == 0 {
         return Ok(strings);
@@ -306,8 +330,7 @@ fn collect_user_string_array(
         if remaining == 0 {
             return Err(Errno::EINVAL);
         }
-        let value =
-            copy_cstr_from_user(string_user, remaining).map_err(|error| error.as_errno())?;
+        let value = copy_user_cstring_bytes(string_user, remaining)?;
         *used_bytes = used_bytes
             .checked_add(value.len() + 1)
             .ok_or(Errno::EINVAL)?;
@@ -329,6 +352,23 @@ fn prepare_comm(path: &str) -> [u8; sched::TASK_COMM_LEN] {
     let length = name.len().min(sched::TASK_COMM_LEN - 1);
     comm[..length].copy_from_slice(&name[..length]);
     comm
+}
+
+pub(crate) fn prepare_native_initial_frame(
+    entry_pc: usize,
+    user_sp: usize,
+    start_info_address: usize,
+    start_info_size: usize,
+    image_base: usize,
+    tls_base: usize,
+    kernel_stack_top: usize,
+) -> UserTrapFrame {
+    let mut frame = UserTrapFrame::init_user(entry_pc, user_sp, start_info_address);
+    frame.set_args(start_info_address, start_info_size, image_base);
+    frame.set_tls(tls_base);
+    frame.set_ra(0);
+    frame.set_kernel_stack_top(kernel_stack_top);
+    frame
 }
 
 fn same_optional_arc<T>(current: Option<Arc<T>>, observed: &Option<Arc<T>>) -> bool {
@@ -420,13 +460,13 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
         }
     };
     let mut used_bytes = path.len().checked_add(1).ok_or(Errno::EINVAL)?;
-    let argv = collect_user_string_array(request.argv_user, &mut used_bytes)?;
-    let envp = collect_user_string_array(request.envp_user, &mut used_bytes)?;
+    let argv = collect_user_byte_string_array(request.argv_user, &mut used_bytes)?;
+    let envp = collect_user_byte_string_array(request.envp_user, &mut used_bytes)?;
 
     let load_result = if let Some(file) = file {
-        crate::user::load_user_image_from_file(task, file, &path, &argv, &envp)
+        crate::user::load_execution_image_from_file(task, file, &path, argv, envp)
     } else {
-        crate::user::load_user_image_from_path(task, &path, &argv, &envp)
+        crate::user::load_execution_image_from_path(task, &path, argv, envp)
     };
     if let Some(vm) = old_vm.as_ref() {
         vm.activate();
@@ -443,63 +483,141 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
         }
     };
 
-    let prepared_fdtable = observed
-        .fdtable
-        .as_ref()
-        .map(|entry| entry.table.fork_for_exec().map(Arc::new))
-        .transpose()
-        .map_err(|error| error.to_errno())?;
-    let cleanup = ExecCleanupScratch::prepare()?;
     let kernel_stack_top = task.ensure_kernel_stack();
-    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
-    frame.set_kernel_stack_top(kernel_stack_top);
-    let LoadedUserImage {
-        vm,
-        exec_path,
-        exec_access,
-        #[cfg(feature = "performance-profile")]
-        main_image_range,
-        #[cfg(feature = "performance-profile")]
-        interpreter_image,
-        ..
-    } = loaded;
-    let comm = prepare_comm(&exec_path);
-    #[cfg(feature = "performance-profile")]
-    let main_profile = (
-        crate::sched::profile_image_id(&exec_path),
-        main_image_range.start,
-        main_image_range.end,
-    );
-    #[cfg(feature = "performance-profile")]
-    let interpreter_profile = interpreter_image
-        .as_ref()
-        .map(|(path, range)| (crate::sched::profile_image_id(path), range.start, range.end))
-        .unwrap_or((0, 0, 0));
+    let loaded = match loaded {
+        LoadedExecutionImage::Tomori { image, argv, envp } => {
+            let prepared_fdtable = observed
+                .fdtable
+                .as_ref()
+                .map(|entry| entry.table.fork_for_exec().map(Arc::new))
+                .transpose()
+                .map_err(|error| error.to_errno())?;
+            let mut frame = UserTrapFrame::init_user(image.entry_pc, image.user_sp, 0);
+            frame.set_kernel_stack_top(kernel_stack_top);
+            let LoadedUserImage {
+                vm,
+                exec_path,
+                exec_access,
+                #[cfg(feature = "performance-profile")]
+                main_image_range,
+                #[cfg(feature = "performance-profile")]
+                interpreter_image,
+                ..
+            } = image;
+            #[cfg(feature = "performance-profile")]
+            let main_profile = (
+                crate::sched::profile_image_id(&exec_path),
+                main_image_range.start,
+                main_image_range.end,
+            );
+            #[cfg(feature = "performance-profile")]
+            let interpreter_profile = interpreter_image
+                .as_ref()
+                .map(|(path, range)| (crate::sched::profile_image_id(path), range.start, range.end))
+                .unwrap_or((0, 0, 0));
+            PreparedLoad {
+                vm,
+                exec_access,
+                sync_icache: false,
+                personality: ProcessPersonalityState::TomoriLinux,
+                fdtable: prepared_fdtable,
+                detach_vfs: false,
+                exec_path,
+                argv,
+                envp,
+                frame,
+                #[cfg(feature = "performance-profile")]
+                main_profile,
+                #[cfg(feature = "performance-profile")]
+                interpreter_profile,
+            }
+        }
+        LoadedExecutionImage::MygoNative {
+            image,
+            exec_path,
+            exec_access,
+            argv,
+            envp,
+        } => {
+            let descriptors = observed
+                .fdtable
+                .as_ref()
+                .map(|entry| {
+                    let snapshot = entry
+                        .table
+                        .snapshot_descriptors()
+                        .map_err(|error| error.to_errno())?;
+                    if snapshot.generation() != entry.generation {
+                        return Err(Errno::EAGAIN);
+                    }
+                    Ok(snapshot)
+                })
+                .transpose()?;
+            let image =
+                crate::soyo::prepare_soyo_runtime(image, &argv, &envp, descriptors.as_ref())?;
+            let frame = prepare_native_initial_frame(
+                image.entry_pc,
+                image.user_sp,
+                image.start_info_address,
+                image.start_info_size,
+                image.image_base,
+                image.tls_base,
+                kernel_stack_top,
+            );
+            #[cfg(feature = "performance-profile")]
+            let main_profile = (
+                crate::sched::profile_image_id(&exec_path),
+                image.image_base,
+                image.image_end,
+            );
+            let personality: Arc<dyn core::any::Any + Send + Sync> = image.personality;
+            PreparedLoad {
+                vm: image.vm,
+                exec_access,
+                sync_icache: true,
+                personality: ProcessPersonalityState::MygoNative(personality),
+                fdtable: None,
+                detach_vfs: true,
+                exec_path,
+                argv: Vec::new(),
+                envp: Vec::new(),
+                frame,
+                #[cfg(feature = "performance-profile")]
+                main_profile,
+                #[cfg(feature = "performance-profile")]
+                interpreter_profile: (0, 0, 0),
+            }
+        }
+    };
+    let cleanup = ExecCleanupScratch::prepare()?;
+    let comm = prepare_comm(&loaded.exec_path);
 
     Ok(PreparedExec {
         image: PreparedImage {
-            vm,
-            exec_access,
+            vm: loaded.vm,
+            exec_access: loaded.exec_access,
+            sync_icache: loaded.sync_icache,
             #[cfg(feature = "performance-profile")]
-            main_profile,
+            main_profile: loaded.main_profile,
             #[cfg(feature = "performance-profile")]
-            interpreter_profile,
+            interpreter_profile: loaded.interpreter_profile,
         },
         personality: PreparedPersonality {
-            state: ProcessPersonalityState::TomoriLinux,
+            state: loaded.personality,
         },
         resources: PreparedResources {
-            fdtable: prepared_fdtable,
+            fdtable: loaded.fdtable,
+            detach_vfs: loaded.detach_vfs,
             signal_actions: observed.shared_signal.prepare_actions_for_exec(),
         },
         startup: PreparedStartup {
-            exec_path: Arc::new(exec_path),
-            argv: Arc::new(argv),
-            envp: Arc::new(envp),
+            exec_path: Arc::new(loaded.exec_path),
+            argv: Arc::new(loaded.argv),
+            envp: Arc::new(loaded.envp),
             comm,
         },
         initial_thread: PreparedInitialThread {
-            frame,
+            frame: loaded.frame,
             kernel_stack_top,
         },
         cleanup,
@@ -566,6 +684,12 @@ pub(crate) fn commit_exec(
         }
         None => false,
     };
+    if target_abi == UserAbiKind::MygoNative
+        && prepared.observed.fdtable.is_some()
+        && !private_fdtable_source
+    {
+        return Err(Errno::EBUSY);
+    }
 
     // Transitioning 阻止新线程加入并冻结 signal consumer。等待兄弟线程时不能
     // 持有 exec/VFS/signal/FdTable 锁，否则目标线程的退出清理可能永久阻塞。
@@ -697,12 +821,18 @@ pub(crate) fn commit_exec(
                 if let Some(fdtable) = prepared.resources.fdtable.as_ref() {
                     fdtable.activate_fd_references();
                     replace_required_extension(task, TASKEXT_VFS_FDTABLE, fdtable)?;
+                } else if prepared.resources.detach_vfs {
+                    let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
+                    let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
                 }
                 drop(fdtable_lease.take());
             }
             InstallStep::AddressSpace => {
                 replace_required_extension(task, TASKEXT_VM_SPACE, &prepared.image.vm)?;
                 prepared.image.vm.activate();
+                if prepared.image.sync_icache {
+                    arch::CurrentTaskOps::sync_icache();
+                }
             }
             InstallStep::ExecutableAccess => {
                 replace_required_extension(task, TASKEXT_EXEC_ACCESS, &prepared.image.exec_access)?;
@@ -769,7 +899,7 @@ pub(crate) fn commit_exec(
         drop(group);
         terminate_commit_after_ponr(task, error, prepared, fdtable_source);
     }
-    if private_fdtable_source {
+    if private_fdtable_source && prepared.resources.fdtable.is_some() {
         if let Some((source, _)) = fdtable_source.as_ref() {
             source.suppress_drop_notifications_for_exec();
         }

@@ -17,6 +17,8 @@ pub enum UserAccessError {
     /// 长度超过调用方允许的上限（例如 `copy_cstr_from_user` 的 `max`）。
     /// 等价于 Linux `-EINVAL` 或 `-ENAMETOOLONG`（调用方决定）。
     TooLong,
+    /// 内核无法为复制结果分配缓冲区。等价于 `-ENOMEM`。
+    OutOfMemory,
 }
 
 impl UserAccessError {
@@ -26,6 +28,20 @@ impl UserAccessError {
             UserAccessError::Fault => Errno::EFAULT,
             UserAccessError::Misaligned => Errno::EINVAL,
             UserAccessError::TooLong => Errno::EINVAL,
+            UserAccessError::OutOfMemory => Errno::ENOMEM,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserAccessError;
+
+    #[test]
+    fn allocation_failure_maps_to_enomem() {
+        assert_eq!(
+            UserAccessError::OutOfMemory.as_errno(),
+            errno::Errno::ENOMEM
+        );
     }
 }

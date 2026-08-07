@@ -2,9 +2,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, AbiImportRecord, CapabilityRequirementRecord,
-    IncompatibleKind, MalformedKind, NativeAbiError, NativeAbiPolicy, ObjectInterface, OperationId,
-    RequirementId, Rights, UnsupportedKind, VmMapFlags, VmProtections, bind_native_abi, operation,
-    requirement, status, wire,
+    IncompatibleKind, InitialHandleRecord, MalformedKind, NativeAbiError, NativeAbiPolicy,
+    NativeHandle, ObjectInterface, OperationId, RequirementId, Rights, StartInfoBuildError,
+    StartInfoInput, TargetArch, UnsupportedKind, VmMapFlags, VmProtections, bind_native_abi,
+    build_start_info, operation, requirement, status, wire,
 };
 
 #[derive(Clone, Copy)]
@@ -120,6 +121,9 @@ fn requirement_registry_limits_interface_and_granted_rights() {
     assert_eq!(clock.id as u32, 6);
     assert_eq!(clock.interface, ObjectInterface::Clock);
     assert_eq!(clock.max_rights, Rights::READ);
+    assert_eq!(RequirementId::from_raw(4), Some(RequirementId::Stdout));
+    assert_eq!(RequirementId::from_raw(0), None);
+    assert_eq!(RequirementId::from_raw(7), None);
 }
 
 #[test]
@@ -150,6 +154,183 @@ fn native_startup_wire_layout_is_frozen() {
     assert_eq!(wire::initial_handle::REQUIREMENT_ID, 0x00);
     assert_eq!(wire::initial_handle::GRANTED_RIGHTS, 0x10);
     assert_eq!(wire::initial_handle::RESERVED, 0x18);
+}
+
+#[test]
+fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
+    let argv = alloc::vec![b"prog".to_vec(), alloc::vec![0xff, b'a', b'r', b'g']];
+    let env = alloc::vec![alloc::vec![], b"A=B".to_vec()];
+    let handles = [
+        InitialHandleRecord {
+            requirement_id: RequirementId::SelfProcess,
+            object_interface: ObjectInterface::Process,
+            handle: NativeHandle::from_parts(1, 1),
+            granted_rights: Rights::TERMINATE_SELF,
+        },
+        InitialHandleRecord {
+            requirement_id: RequirementId::Stdout,
+            object_interface: ObjectInterface::Stream,
+            handle: NativeHandle::from_parts(2, 3),
+            granted_rights: Rights::WRITE,
+        },
+    ];
+    let random_seed = core::array::from_fn(|index| index as u8 + 1);
+
+    let image = build_start_info(StartInfoInput {
+        target_arch: TargetArch::Riscv64,
+        enabled_features: 0x11,
+        image_base: 0x4000_0000,
+        initial_tls_base: 0x7fff_0000,
+        initial_tls_size: 0x1000,
+        initial_thread_pointer: 0x7fff_0000,
+        argv: &argv,
+        env: &env,
+        initial_handles: &handles,
+        call_slot_count: 3,
+        random_seed,
+        runtime_flags: 1,
+        max_size: 4096,
+    })
+    .expect("合法 StartInfo 应完成编码");
+    let bytes = image.as_bytes();
+
+    assert_eq!(bytes.len(), 304);
+    assert_eq!(&bytes[0x00..0x04], b"syst");
+    assert_eq!(u16::from_le_bytes(bytes[0x04..0x06].try_into().unwrap()), 1);
+    assert_eq!(
+        u16::from_le_bytes(bytes[0x06..0x08].try_into().unwrap()),
+        192
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x08..0x0c].try_into().unwrap()),
+        304
+    );
+    assert_eq!(u16::from_le_bytes(bytes[0x10..0x12].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes(bytes[0x12..0x14].try_into().unwrap()), 1);
+    assert_eq!(
+        u64::from_le_bytes(bytes[0x18..0x20].try_into().unwrap()),
+        0x11
+    );
+    assert_eq!(
+        u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()),
+        0x4000_0000
+    );
+    assert_eq!(
+        u64::from_le_bytes(bytes[0x30..0x38].try_into().unwrap()),
+        0x7fff_0000
+    );
+    assert_eq!(u32::from_le_bytes(bytes[0x48..0x4c].try_into().unwrap()), 2);
+    assert_eq!(u32::from_le_bytes(bytes[0x4c..0x50].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x50..0x54].try_into().unwrap()),
+        192
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x54..0x58].try_into().unwrap()),
+        208
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x58..0x5c].try_into().unwrap()),
+        288
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x5c..0x60].try_into().unwrap()),
+        15
+    );
+    assert_eq!(u32::from_le_bytes(bytes[0x60..0x64].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x68..0x6c].try_into().unwrap()),
+        224
+    );
+    assert_eq!(u32::from_le_bytes(bytes[0x6c..0x70].try_into().unwrap()), 3);
+    assert_eq!(&bytes[0x70..0x90], &random_seed);
+
+    assert_eq!(&bytes[288..293], b"prog\0");
+    assert_eq!(&bytes[293..298], &[0xff, b'a', b'r', b'g', 0]);
+    assert_eq!(&bytes[298..303], b"\0A=B\0");
+    assert_eq!(bytes[303], 0);
+    assert_eq!(u32::from_le_bytes(bytes[192..196].try_into().unwrap()), 288);
+    assert_eq!(u32::from_le_bytes(bytes[196..200].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(bytes[200..204].try_into().unwrap()), 293);
+    assert_eq!(u32::from_le_bytes(bytes[204..208].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(bytes[208..212].try_into().unwrap()), 298);
+    assert_eq!(u32::from_le_bytes(bytes[212..216].try_into().unwrap()), 0);
+
+    assert_eq!(u32::from_le_bytes(bytes[224..228].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes(bytes[228..230].try_into().unwrap()), 1);
+    assert_eq!(
+        u64::from_le_bytes(bytes[232..240].try_into().unwrap()),
+        0x0000_0001_0000_0001
+    );
+    assert_eq!(
+        u64::from_le_bytes(bytes[240..248].try_into().unwrap()),
+        1 << 4
+    );
+    assert_eq!(u32::from_le_bytes(bytes[256..260].try_into().unwrap()), 4);
+    assert_eq!(
+        u64::from_le_bytes(bytes[264..272].try_into().unwrap()),
+        0x0000_0002_0000_0003
+    );
+    assert_eq!(
+        u64::from_le_bytes(bytes[272..280].try_into().unwrap()),
+        1 << 1
+    );
+}
+
+#[test]
+fn start_info_builder_rejects_oversize_or_noncanonical_input() {
+    let argv = alloc::vec![alloc::vec![b'x'; 193]];
+    let no_handles = [];
+    let input = StartInfoInput {
+        target_arch: TargetArch::LoongArch64,
+        enabled_features: 0,
+        image_base: 0x4000_0000,
+        initial_tls_base: 0,
+        initial_tls_size: 0,
+        initial_thread_pointer: 0,
+        argv: &argv,
+        env: &[],
+        initial_handles: &no_handles,
+        call_slot_count: 0,
+        random_seed: [1; 32],
+        runtime_flags: 0,
+        max_size: 192,
+    };
+    assert_eq!(build_start_info(input), Err(StartInfoBuildError::TooLarge));
+
+    let with_nul = alloc::vec![b"bad\0arg".to_vec()];
+    assert_eq!(
+        build_start_info(StartInfoInput {
+            argv: &with_nul,
+            max_size: 4096,
+            ..input
+        }),
+        Err(StartInfoBuildError::InvalidInput)
+    );
+
+    let duplicate = [
+        InitialHandleRecord {
+            requirement_id: RequirementId::Stdout,
+            object_interface: ObjectInterface::Stream,
+            handle: NativeHandle::from_parts(1, 1),
+            granted_rights: Rights::WRITE,
+        },
+        InitialHandleRecord {
+            requirement_id: RequirementId::Stdout,
+            object_interface: ObjectInterface::Stream,
+            handle: NativeHandle::from_parts(1, 2),
+            granted_rights: Rights::WRITE,
+        },
+    ];
+    assert_eq!(
+        build_start_info(StartInfoInput {
+            argv: &[],
+            initial_handles: &duplicate,
+            max_size: 4096,
+            ..input
+        }),
+        Err(StartInfoBuildError::InvalidInput)
+    );
 }
 
 #[test]

@@ -21,6 +21,8 @@ mod elm;
 mod exec;
 mod initramfs;
 mod integrated_components;
+#[path = "native_abi/mod.rs"]
+mod native_runtime;
 mod net_runtime;
 mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -28,6 +30,7 @@ mod net_tests;
 mod panic;
 mod rseq;
 mod sched;
+mod soyo;
 mod start;
 mod stdio;
 mod syscalls;
@@ -151,6 +154,7 @@ fn main() -> ! {
 
     #[cfg(any(
         feature = "kernel-tests",
+        feature = "soyo-tests",
         feature = "network-tests",
         feature = "allocator-tests",
         feature = "smp-tests"

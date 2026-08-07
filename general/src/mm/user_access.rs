@@ -99,17 +99,29 @@ pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
 }
 
 /// 从用户地址读一段 NUL 结尾的 C 字符串，最多 `max` 字节（不含 NUL）。
-#[kernel_symbols::export(name = "general.mm.user_access.copy_cstr_from_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
-pub fn copy_cstr_from_user(user: usize, max: usize) -> Result<String, UserAccessError> {
+#[kernel_symbols::export(name = "general.mm.user_access.copy_cstr_bytes_from_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
+pub fn copy_cstr_bytes_from_user(user: usize, max: usize) -> Result<Vec<u8>, UserAccessError> {
     let Some(ops) = user_access_ops() else {
         return Err(UserAccessError::Fault);
     };
     // 第一步 strnlen，确认实际长度 / 是否超限。
     // Safety: arch 端实现 fixup。
     let len = unsafe { (ops.strnlen_user)(user, max)? };
-    let mut buf: Vec<u8> = alloc::vec![0u8; len];
-    // Safety: 同 copy_from_user。
-    unsafe { (ops.copy_from_user)(buf.as_mut_ptr(), user, len)? };
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| UserAccessError::OutOfMemory)?;
+    bytes.resize(len, 0);
+    // Safety: 长度由同一组 arch user-copy ops 的 strnlen_user 给出，目标缓冲有效；
+    // 用户态在两次访问之间发生变化时仍由架构 fixup 转换为 UserAccessError。
+    unsafe { (ops.copy_from_user)(bytes.as_mut_ptr(), user, len)? };
+    Ok(bytes)
+}
+
+/// 从用户地址读取 UTF-8 C 字符串，最多 `max` 字节（不含 NUL）。
+#[kernel_symbols::export(name = "general.mm.user_access.copy_cstr_from_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
+pub fn copy_cstr_from_user(user: usize, max: usize) -> Result<String, UserAccessError> {
+    let buf = copy_cstr_bytes_from_user(user, max)?;
     // 用户态可能在 strnlen 之后写入非 UTF-8 字节；这里转换失败回 Fault 而非
     // 自定义错误码——上层只关心"读到了"vs"读不到"。
     String::from_utf8(buf).map_err(|_| UserAccessError::Fault)

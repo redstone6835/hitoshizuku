@@ -1,7 +1,13 @@
 //! 内核生成的 Native ABI 启动区固定线格式。
 
 pub const START_INFO_SIZE: usize = 192;
+pub const STRING_REF_SIZE: usize = 8;
 pub const INITIAL_HANDLE_SIZE: usize = 32;
+
+pub mod string_ref {
+    pub const OFFSET: usize = 0x00;
+    pub const LENGTH: usize = 0x04;
+}
 
 pub mod start_info {
     pub const MAGIC: usize = 0x00;

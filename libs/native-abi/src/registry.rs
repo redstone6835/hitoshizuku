@@ -107,6 +107,20 @@ pub enum RequirementId {
     MonotonicClock = 6,
 }
 
+impl RequirementId {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::SelfProcess),
+            2 => Some(Self::CurrentAddressSpace),
+            3 => Some(Self::Stdin),
+            4 => Some(Self::Stdout),
+            5 => Some(Self::Stderr),
+            6 => Some(Self::MonotonicClock),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequirementSpec {
     pub id: RequirementId,

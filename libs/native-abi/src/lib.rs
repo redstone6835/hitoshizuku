@@ -9,6 +9,7 @@ mod error;
 mod handle;
 mod model;
 pub mod registry;
+mod start_info;
 pub mod status;
 pub mod wire;
 
@@ -28,6 +29,9 @@ pub use registry::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, OPERATIONS, ObjectInterface, OperationId, OperationSpec,
     PAGE_SIZE, REQUIREMENTS, RequirementId, RequirementSpec, Rights, TargetArch, VmMapFlags,
     VmProtections, operation, operation_by_id, requirement, requirement_by_id,
+};
+pub use start_info::{
+    InitialHandleRecord, StartInfoBuildError, StartInfoImage, StartInfoInput, build_start_info,
 };
 
 #[cfg(test)]

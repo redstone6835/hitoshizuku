@@ -57,6 +57,42 @@ pub struct LoadedUserImage {
     pub exec_access: Arc<ExecutableAccessSet>,
 }
 
+/// exec 探测完成后交给事务层的映像类型。
+pub(crate) enum LoadedExecutionImage {
+    Tomori {
+        image: LoadedUserImage,
+        argv: Vec<String>,
+        envp: Vec<String>,
+    },
+    MygoNative {
+        image: crate::soyo::LoadedSoyoImage,
+        exec_path: String,
+        exec_access: Arc<ExecutableAccessSet>,
+        argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableFormat {
+    Soyo,
+    Elf,
+    Script,
+    Unknown,
+}
+
+pub(crate) fn detect_executable_format(prefix: &[u8]) -> ExecutableFormat {
+    if prefix.starts_with(&soyo::registry::SOYO_MAGIC) {
+        ExecutableFormat::Soyo
+    } else if prefix.starts_with(b"\x7fELF") {
+        ExecutableFormat::Elf
+    } else if prefix.starts_with(b"#!") {
+        ExecutableFormat::Script
+    } else {
+        ExecutableFormat::Unknown
+    }
+}
+
 /// 一次成功执行映像持有的全部 inode 执行租约。
 ///
 /// 主程序和内核装载的动态解释器都保存在同一个集合中。任务 fork 时共享该集合，
@@ -67,6 +103,12 @@ pub struct ExecutableAccessSet {
 
 struct LoadedInterpreter {
     bytes: Vec<u8>,
+    access: InodeExecAccess,
+}
+
+struct PreparedExecutableFile {
+    file: Arc<File>,
+    prefix: Vec<u8>,
     access: InodeExecAccess,
 }
 
@@ -115,6 +157,47 @@ pub fn load_user_image_from_file(
     load_user_image_from_file_inner(task, file, exec_path, argv, envp, 0)
 }
 
+pub(crate) fn load_execution_image_from_path(
+    task: &Arc<Task>,
+    path: &str,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Result<LoadedExecutionImage, errno::Errno> {
+    let file = open_file_from_task_vfs(task, path)?;
+    load_execution_image_from_file(task, file, path, argv, envp)
+}
+
+pub(crate) fn load_execution_image_from_file(
+    task: &Arc<Task>,
+    file: Arc<File>,
+    exec_path: &str,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Result<LoadedExecutionImage, errno::Errno> {
+    let prepared = prepare_executable_file(task, file)?;
+    match detect_executable_format(&prepared.prefix) {
+        ExecutableFormat::Soyo => {
+            let image = crate::soyo::load_soyo_image_from_file(Arc::clone(&prepared.file))?;
+            return Ok(LoadedExecutionImage::MygoNative {
+                image,
+                exec_path: String::from(exec_path),
+                exec_access: Arc::new(ExecutableAccessSet {
+                    leases: alloc::vec![prepared.access],
+                }),
+                argv,
+                envp,
+            });
+        }
+        ExecutableFormat::Elf | ExecutableFormat::Script => {}
+        ExecutableFormat::Unknown => return Err(errno::Errno::ENOEXEC),
+    }
+
+    let argv = byte_strings_to_text(argv)?;
+    let envp = byte_strings_to_text(envp)?;
+    let image = load_tomori_image_from_prepared(task, prepared, exec_path, &argv, &envp, 0)?;
+    Ok(LoadedExecutionImage::Tomori { image, argv, envp })
+}
+
 fn load_user_image_from_path_inner(
     task: &Arc<Task>,
     path: &str,
@@ -140,8 +223,16 @@ fn load_user_image_from_file_inner(
     envp: &[String],
     shebang_depth: usize,
 ) -> Result<LoadedUserImage, errno::Errno> {
+    let prepared = prepare_executable_file(task, file)?;
+    load_tomori_image_from_prepared(task, prepared, path, argv, envp, shebang_depth)
+}
+
+fn prepare_executable_file(
+    task: &Arc<Task>,
+    file: Arc<File>,
+) -> Result<PreparedExecutableFile, errno::Errno> {
     check_exec_permission(task, &file)?;
-    let main_exec_access = file
+    let access = file
         .inode()
         .acquire_exec_access()
         .map_err(|error| error.to_errno())?;
@@ -153,6 +244,26 @@ fn load_user_image_from_file_inner(
             .map_err(|error| error.to_errno())?
     };
     let prefix = load_elf_prefix_from_file(&file)?;
+    Ok(PreparedExecutableFile {
+        file,
+        prefix,
+        access,
+    })
+}
+
+fn load_tomori_image_from_prepared(
+    task: &Arc<Task>,
+    prepared: PreparedExecutableFile,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    shebang_depth: usize,
+) -> Result<LoadedUserImage, errno::Errno> {
+    let PreparedExecutableFile {
+        file,
+        prefix,
+        access: main_exec_access,
+    } = prepared;
     if prefix.starts_with(b"#!") {
         let script = parse_shebang(path, argv, &prefix, shebang_depth)?;
         let mut loaded = load_user_image_from_path_inner(
@@ -167,6 +278,9 @@ fn load_user_image_from_file_inner(
             .leases
             .push(main_exec_access);
         return Ok(loaded);
+    }
+    if !prefix.starts_with(b"\x7fELF") {
+        return Err(errno::Errno::ENOEXEC);
     }
 
     let exec_image = match load_exec_image_from_file(&file) {
@@ -335,6 +449,17 @@ fn load_user_image_from_file_inner(
             leases: exec_access,
         }),
     })
+}
+
+fn byte_strings_to_text(values: Vec<Vec<u8>>) -> Result<Vec<String>, errno::Errno> {
+    let mut strings = Vec::new();
+    strings
+        .try_reserve_exact(values.len())
+        .map_err(|_| errno::Errno::ENOMEM)?;
+    for value in values {
+        strings.push(String::from_utf8(value).map_err(|_| errno::Errno::EFAULT)?);
+    }
+    Ok(strings)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -892,12 +1017,16 @@ fn load_elf_prefix_from_file(file: &File) -> Result<Vec<u8>, errno::Errno> {
     read_small_file_range(file, 0, len)
 }
 
-fn file_size(file: &File) -> Result<u64, errno::Errno> {
+pub(crate) fn file_size(file: &File) -> Result<u64, errno::Errno> {
     let size = file.stat().map_err(|e| e.to_errno())?.size;
     u64::try_from(size).map_err(|_| errno::Errno::EFBIG)
 }
 
-fn read_exact_file(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), errno::Errno> {
+pub(crate) fn read_exact_file(
+    file: &File,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), errno::Errno> {
     let mut done = 0usize;
     while done < buf.len() {
         let read_off = offset
