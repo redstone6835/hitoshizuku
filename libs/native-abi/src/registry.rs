@@ -97,6 +97,39 @@ impl BitOrAssign for Rights {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RightSpec {
+    pub name: &'static str,
+    pub right: Rights,
+}
+
+pub const RIGHTS: [RightSpec; 5] = [
+    RightSpec {
+        name: "READ",
+        right: Rights::READ,
+    },
+    RightSpec {
+        name: "WRITE",
+        right: Rights::WRITE,
+    },
+    RightSpec {
+        name: "DUPLICATE",
+        right: Rights::DUPLICATE,
+    },
+    RightSpec {
+        name: "MAP",
+        right: Rights::MAP,
+    },
+    RightSpec {
+        name: "TERMINATE_SELF",
+        right: Rights::TERMINATE_SELF,
+    },
+];
+
+pub fn right_by_name(name: &str) -> Option<RightSpec> {
+    RIGHTS.iter().copied().find(|spec| spec.name == name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RequirementId {
     SelfProcess = 1,

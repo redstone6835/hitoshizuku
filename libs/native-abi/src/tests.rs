@@ -124,6 +124,8 @@ fn requirement_registry_limits_interface_and_granted_rights() {
     assert_eq!(RequirementId::from_raw(4), Some(RequirementId::Stdout));
     assert_eq!(RequirementId::from_raw(0), None);
     assert_eq!(RequirementId::from_raw(7), None);
+    assert_eq!(crate::right_by_name("WRITE").unwrap().right, Rights::WRITE);
+    assert!(crate::right_by_name("UNKNOWN").is_none());
 }
 
 #[test]
