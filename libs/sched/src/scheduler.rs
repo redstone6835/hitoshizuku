@@ -2811,9 +2811,11 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
     // 恢复阻塞调用栈并返回 syscall 安全边界。
     let _ = prev.abort_group_exit_sleep();
 
-    // 在调度边界消费当前任务的 pending signal。默认 Term/Core 会把 prev 标成
-    // Zombie；后续 pick_next 看到它不再 runnable，就不会放回 runqueue。
-    if prev.state() == TaskState::Running
+    // Tomori 在调度边界消费当前任务的 pending signal。Native 必须保留
+    // 到调用或用户返回的安全边界，避免在深层调度栈中执行外部控制。
+    // 默认 Term/Core 会把 prev 标成 Zombie；后续 pick_next 不再将它放回 runqueue。
+    if prev.user_abi_kind() == crate::UserAbiKind::TomoriLinux
+        && prev.state() == TaskState::Running
         && (prev.signal.has_any_pending() || prev.shared_signal_pending_bits_quick() != 0)
     {
         let _ = crate::operation::deliver_pending_signals();

@@ -457,6 +457,7 @@ pub struct TaskUsage {
 pub enum ExecutionScopeKind {
     Syscall = 1,
     NetworkWorker = 2,
+    NativeCall = 3,
 }
 
 impl ExecutionScopeKind {
@@ -464,6 +465,7 @@ impl ExecutionScopeKind {
         match raw {
             1 => Some(Self::Syscall),
             2 => Some(Self::NetworkWorker),
+            3 => Some(Self::NativeCall),
             _ => None,
         }
     }

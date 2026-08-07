@@ -84,6 +84,21 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
         return;
     }
     let task = sched::current_task();
+    if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+        match sched::operation::consume_native_external_control_for_task(&task) {
+            sched::NativeExternalControl::Continue => {}
+            sched::NativeExternalControl::Reschedule => {
+                drop(task);
+                schedule_from_trap(super::super::specific::kernel_timestamp_ns());
+            }
+            sched::NativeExternalControl::Terminate => {
+                drop(task);
+                schedule_from_trap(super::super::specific::kernel_timestamp_ns());
+                panic!("[trap][native] terminal task scheduled back unexpectedly");
+            }
+        }
+        return;
+    }
     if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
         let _ = sched::operation::deliver_pending_signals_for_task(
             &task,

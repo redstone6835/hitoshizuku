@@ -129,6 +129,35 @@ fn sigsuspend_explicit_restore_clears_saved_mask() {
     assert_eq!(state.take_sigsuspend_saved_blocked(), None);
 }
 
+/// Native exec 丢弃 Tomori 的线程级屏蔽/等待状态，但保留已经 pending 的信号。
+#[ktest]
+fn native_exec_reset_clears_masks_and_keeps_pending() {
+    let state = SignalState::new();
+    let pending = SignalNumber::SIGUSR1;
+    state.block(SigSet::EMPTY.with(pending), SigProcMaskHow::SetMask);
+    state.save_blocked(SigSet::EMPTY.with(SignalNumber::SIGUSR2));
+    state.begin_sigtimedwait(SigSet::EMPTY.with(SignalNumber::SIGTERM));
+    state.deliver(SigInfo {
+        sig: pending,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    state.reset_for_native_exec();
+
+    assert_eq!(state.blocked_snapshot(), SigSet::EMPTY);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
+    assert!(!state.sigtimedwait_wants(SignalNumber::SIGTERM));
+    assert!(state.pending_snapshot().has(pending));
+
+    // saved_blocked 也必须归零，遗留的清理调用不能恢复旧 Tomori mask。
+    state.restore_blocked();
+    assert_eq!(state.blocked_snapshot(), SigSet::EMPTY);
+    assert_eq!(state.dequeue_one().map(|info| info.sig), Some(pending));
+}
+
 /// 信号编号 1..=64 为合法，构造成功。
 #[ktest]
 fn signal_number_from_raw_valid() {

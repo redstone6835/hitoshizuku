@@ -86,6 +86,21 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
         return;
     }
     let task = sched::current_task();
+    if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+        match sched::operation::consume_native_external_control_for_task(&task) {
+            sched::NativeExternalControl::Continue => {}
+            sched::NativeExternalControl::Reschedule => {
+                drop(task);
+                sched::schedule_once(kernel_timestamp_ns());
+            }
+            sched::NativeExternalControl::Terminate => {
+                drop(task);
+                sched::schedule_once(kernel_timestamp_ns());
+                panic!("[trap][native] terminal task scheduled back unexpectedly");
+            }
+        }
+        return;
+    }
     if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
         let _ = sched::operation::deliver_pending_signals_for_task(
             &task,
@@ -610,7 +625,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
             tf.tval,
         )
     };
-    general::syscall::dispatch_fast_with_frame(
+    let dispatch_kind = general::syscall::dispatch_fast_with_frame(
         general::TrapFramePtr::new(tf_ptr),
         nr,
         args,
@@ -621,7 +636,10 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         },
     );
 
-    let mut require_full_restore = rewrites_user_frame(nr);
+    let mut require_full_restore = matches!(
+        dispatch_kind,
+        general::syscall::FastDispatchOutcome::MygoNative
+    ) || rewrites_user_frame(nr);
     if sched::needs_resched_current() {
         sched::preempt_if_needed(kernel_timestamp_ns());
         require_full_restore = true;

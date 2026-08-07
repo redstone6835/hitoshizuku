@@ -862,6 +862,7 @@ pub fn boot_init() -> Arc<Task> {
     // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
+    crate::native_runtime::register();
 
     init
 }

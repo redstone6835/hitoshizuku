@@ -636,6 +636,12 @@ fn replace_required_extension<T: core::any::Any + Send + Sync>(
         .map_err(|_| Errno::EIO)
 }
 
+fn reset_signal_state_for_exec(task: &Arc<Task>, target_abi: UserAbiKind) {
+    if target_abi == UserAbiKind::MygoNative {
+        task.signal.reset_for_native_exec();
+    }
+}
+
 fn terminate_after_ponr(task: &Arc<Task>, error: Errno) -> ! {
     log::emergency!(
         "[exec] post-PONR install failure: pid={:?} err={:?}",
@@ -860,6 +866,7 @@ pub(crate) fn commit_exec(
                 arch::riscv64::vector::clear_for_task(task);
                 task.clear_rseq_registration();
                 task.clear_sigaltstack();
+                reset_signal_state_for_exec(task, target_abi);
                 if !signal_actions_lease.install(&prepared.resources.signal_actions) {
                     return Err(Errno::EIO);
                 }

@@ -26,6 +26,7 @@ hashbrown = { version = "0.17.1", default-features = false, features = ["inline-
 log = { path = "../libs/log" }
 kernel-symbols = { path = "../libs/kernel-symbols" }
 mm = { path = "../libs/mm" }
+native-abi = { path = "../libs/native-abi" }
 net = { path = "../libs/net" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }

@@ -134,6 +134,8 @@ fn status_and_vm_flag_registries_preserve_wire_values() {
     assert_eq!(status::HANDLE_STALE, 0x0300_0002);
     assert_eq!(status::SECURITY_RIGHTS_DENIED, 0x0400_0001);
     assert_eq!(status::IO_WOULD_BLOCK, 0x0500_0002);
+    assert_eq!(status::IO_CLOSED, 0x0500_0003);
+    assert_eq!(status::IO_ERROR, 0x0500_0004);
     assert_eq!(status::VM_ADDRESS_CONFLICT, 0x0600_0002);
     assert_eq!(VmProtections::READ.bits(), 1);
     assert_eq!(VmProtections::WRITE.bits(), 2);

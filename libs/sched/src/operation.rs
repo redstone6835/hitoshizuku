@@ -1946,6 +1946,50 @@ pub fn rlimits_snapshot() -> Rlimits {
 
 // ── 信号投递在内核边界的默认动作处理 ─────────────────────────────────────────
 
+/// Native 用户返回边界消费外部进程控制后的调度决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeExternalControl {
+    /// 可以继续完成当前 Native call 或返回用户态。
+    Continue,
+    /// 任务已停止或刚被继续，需要先经过一次调度边界。
+    Reschedule,
+    /// 任务已经进入线程组退出，禁止返回用户态。
+    Terminate,
+}
+
+/// 在 Native 安全边界消费一条外部进程控制事件。
+///
+/// Native 不暴露 Unix signal frame。显式忽略仍然保留；默认动作和异常残留的
+/// Linux handler 都按内核默认动作执行，确保不会把 Linux 用户上下文带入 Native。
+pub fn consume_native_external_control_for_task(task: &Arc<Task>) -> NativeExternalControl {
+    if complete_group_exit_if_requested(task) {
+        return NativeExternalControl::Terminate;
+    }
+
+    let _ = task.consume_pending_signal(|info| {
+        if task.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            let _ = mark_task_stopped(task, info.sig);
+            return;
+        }
+        let action = task.shared_signal().get_action(info.sig);
+        match action.handler {
+            SigHandler::Ignore => {}
+            SigHandler::Default | SigHandler::Handler(_) => {
+                apply_default_action_for_task(task, info);
+            }
+        }
+    });
+
+    if complete_group_exit_if_requested(task) {
+        return NativeExternalControl::Terminate;
+    }
+    match task.state() {
+        TaskState::Zombie | TaskState::Dead => NativeExternalControl::Terminate,
+        TaskState::Stopped | TaskState::Continued => NativeExternalControl::Reschedule,
+        _ => NativeExternalControl::Continue,
+    }
+}
+
 /// 消费当前任务的一条可投递信号；若其 action 是 Default，按 [`default_action`]
 /// 施加副作用（Term 立刻走 exit）。如果 action 是 Handler（用户态），暂时
 /// 返回 Some 供上层组装 sigframe（本实现暂无 userspace 不会触发）。
@@ -1965,6 +2009,10 @@ pub fn deliver_pending_signals_for_task(
     user_ctx: UserContextRef,
 ) -> Option<SigInfo> {
     if me.is_kernel_task() {
+        return None;
+    }
+    if me.user_abi_kind() == crate::UserAbiKind::MygoNative {
+        let _ = consume_native_external_control_for_task(me);
         return None;
     }
     me.consume_pending_signal(|info| {

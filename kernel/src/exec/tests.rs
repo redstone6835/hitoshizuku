@@ -5,15 +5,17 @@ use errno::Errno;
 use ktest::ktest;
 use native_abi::{ExecPhase, UserAbiKind};
 use sched::{
-    ProcessGroup, SchedParams, Session, TASKEXT_EXEC_ACCESS, TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP,
-    TASKEXT_EXEC_PATH, TASKEXT_VFS_FDTABLE, Task, ThreadGroup,
+    NativeExternalControl, ProcessGroup, ProcessPersonalityState, SchedParams, Session, SigAction,
+    SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber, TASKEXT_EXEC_ACCESS,
+    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_VFS_FDTABLE, Task,
+    ThreadGroup, Uid,
 };
 use vfs::fdtable::FdTable;
 
 use super::{
     ExecSnapshot, INSTALL_STEPS, abort_exec_transition_before_ponr, drive_install_steps,
     finish_exec_commit, plan_exec_thread_transition, release_before_diverging,
-    revalidate_before_ponr,
+    reset_signal_state_for_exec, revalidate_before_ponr,
 };
 
 struct DropProbe<'a>(&'a Cell<usize>);
@@ -231,6 +233,60 @@ fn cross_personality_exec_rejects_a_multithreaded_process() {
     );
 
     assert_eq!(result.err(), Some(Errno::EBUSY));
+}
+
+#[ktest]
+fn native_exec_makes_blocked_pending_signal_consumable() {
+    let task = make_task();
+    let group = task.thread_group();
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.shared_signal().set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Ignore,
+            mask: SigSet::EMPTY,
+            flags: SigActionFlags(0),
+            restorer: 0,
+        },
+    );
+    task.signal.block(
+        SigSet::EMPTY.with(SignalNumber::SIGUSR1),
+        SigProcMaskHow::SetMask,
+    );
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    let mut guard = group.lock_exec();
+    guard.set_phase(ExecPhase::Transitioning);
+    guard.install_personality(ProcessPersonalityState::MygoNative(payload));
+    reset_signal_state_for_exec(&task, UserAbiKind::MygoNative);
+    assert!(task.signal.has_any_pending());
+    guard.set_phase(ExecPhase::Running);
+    drop(guard);
+
+    assert_eq!(
+        sched::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Continue
+    );
+    assert!(!task.signal.has_any_pending());
+}
+
+#[ktest]
+fn tomori_exec_keeps_the_thread_signal_mask() {
+    let task = make_task();
+    let blocked = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    task.signal.block(blocked, SigProcMaskHow::SetMask);
+
+    reset_signal_state_for_exec(&task, UserAbiKind::TomoriLinux);
+
+    assert_eq!(task.signal.blocked_snapshot(), blocked);
 }
 
 #[ktest]

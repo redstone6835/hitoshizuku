@@ -102,7 +102,7 @@ pub use membarrier::{
 };
 pub use migration::MigrationContext;
 pub use native_abi::{ExecPhase, UserAbiKind};
-pub use operation::spawn_user_process;
+pub use operation::{NativeExternalControl, spawn_user_process};
 pub use pid::{PidNamespace, PidRegistry, PidT};
 pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};
 pub use process_ops::{

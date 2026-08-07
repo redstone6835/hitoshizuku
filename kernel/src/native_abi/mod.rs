@@ -13,6 +13,11 @@ use sched::sync::Spinlock;
 use soyo::SoyoMetadata;
 use vfs::fdtable::{FdFlags, FdTableSnapshot};
 
+use self::dispatch::dispatch_native_call;
+
+mod dispatch;
+mod operations;
+
 /// Native handle 可引用的内核对象。
 #[derive(Clone)]
 pub(crate) enum KernelNativeObject {
@@ -29,6 +34,10 @@ pub(crate) struct NativeProcessState {
     pub(crate) build_id: [u8; 32],
     pub(crate) content_hash: [u8; 32],
     pub(crate) image_base: usize,
+}
+
+pub(crate) fn register() {
+    general::syscall::register_native_dispatcher(dispatch_native_call);
 }
 
 pub(crate) fn prepare_native_process_state(
@@ -116,3 +125,6 @@ fn stream_supports(file: &File, rights: Rights) -> bool {
     (!Rights::READ.is_subset_of(rights) || file.flags().readable())
         && (!Rights::WRITE.is_subset_of(rights) || file.flags().writable())
 }
+
+#[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
+mod tests;

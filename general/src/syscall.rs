@@ -2,8 +2,8 @@
 //!
 //! 本模块负责两件事：
 //!
-//! 1. **arch 注入契约 [`SyscallFrameOps`]**：从 trap frame 取号、读参、写返回、
-//!    推进 PC 的 4 个回调。这是 arch 唯一对 syscall 子系统的耦合点。
+//! 1. **arch 注入契约 [`SyscallFrameOps`]**：从 trap frame 提取 Linux syscall 或
+//!    Native call、写回对应返回值并推进 PC。这是 arch 唯一对调用分发的耦合点。
 //! 2. **表驱动分发**：[`SYSCALL_TABLE`] 是 `[Option<SyscallFn>; SYSCALL_TABLE_LEN]`，
 //!    [`register_syscall`] 由 kernel 启动期填表，[`dispatch`] 在 trap 进来时
 //!    构造 [`SyscallContext`] 并调用对应条目。
@@ -29,6 +29,49 @@ use crate::TrapFramePtr;
 
 // ── 1. arch 注入契约 ─────────────────────────────────────────────────────────
 
+/// 从用户 trap frame 提取的 MyGO Native 调用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCallFrame {
+    pub slot: u64,
+    pub object_handle: u64,
+    pub args: [u64; 5],
+    pub reserved_arg: u64,
+}
+
+/// 写回用户 trap frame 的 MyGO Native 调用结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCallReturn {
+    pub status: u32,
+    pub value0: u64,
+    pub value1: u64,
+}
+
+/// kernel Native dispatcher 完成一次调用后的控制流决定。
+pub enum NativeCallOutcome {
+    Return(NativeCallReturn),
+    ExitGroup(i32),
+    /// 阻塞调用观察到外部进程控制，必须先在安全边界处理；存活后重试原调用。
+    RetryExternalControl,
+}
+
+/// kernel 在启动期注册的 MyGO Native 调用入口。
+pub type NativeDispatchFn = fn(&Arc<sched::Task>, NativeCallFrame) -> NativeCallOutcome;
+
+impl NativeCallReturn {
+    /// 失败结果不允许携带未定义值，避免泄漏架构现场或形成调用方依赖。
+    pub const fn canonicalized(self) -> Self {
+        if self.status == 0 {
+            self
+        } else {
+            Self {
+                status: self.status,
+                value0: 0,
+                value1: 0,
+            }
+        }
+    }
+}
+
 /// arch 提供的 trap-frame 字段访问契约。
 #[repr(C)]
 pub struct SyscallFrameOps {
@@ -38,6 +81,10 @@ pub struct SyscallFrameOps {
     pub sys_args: fn(TrapFramePtr) -> [usize; 6],
     /// 写返回值（通常进 a0 / rax）。负数即 -errno。
     pub set_sys_ret: fn(TrapFramePtr, isize),
+    /// 按当前架构的 MyGO Native ABI 提取调用寄存器。
+    pub native_call: fn(TrapFramePtr) -> NativeCallFrame,
+    /// 写回 status/value0/value1；失败结果必须清零两个 value。
+    pub set_native_ret: fn(TrapFramePtr, NativeCallReturn),
     /// 把 PC 跨过 syscall 指令本身，步长由架构 ABI 决定。
     pub advance_pc: fn(TrapFramePtr),
 }
@@ -46,6 +93,7 @@ unsafe impl Sync for SyscallFrameOps {}
 unsafe impl Send for SyscallFrameOps {}
 
 static FRAME_OPS: AtomicPtr<SyscallFrameOps> = AtomicPtr::new(core::ptr::null_mut());
+static NATIVE_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_frame_ops(ops: &'static SyscallFrameOps) {
     FRAME_OPS.store(ops as *const _ as *mut _, Ordering::Release);
@@ -63,6 +111,23 @@ pub fn frame_ops() -> Option<&'static SyscallFrameOps> {
 
 pub fn frame_ops_registered() -> bool {
     frame_ops().is_some()
+}
+
+pub fn register_native_dispatcher(dispatch: NativeDispatchFn) {
+    let old = NATIVE_DISPATCHER.compare_exchange(
+        0,
+        dispatch as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    assert!(old.is_ok(), "Native dispatcher 只能注册一次");
+}
+
+fn native_dispatcher() -> NativeDispatchFn {
+    let raw = NATIVE_DISPATCHER.load(Ordering::Acquire);
+    assert_ne!(raw, 0, "MyGO Native task 缺少已注册 dispatcher");
+    // Safety: register_native_dispatcher 只写入 NativeDispatchFn，且发布后不再修改。
+    unsafe { core::mem::transmute::<usize, NativeDispatchFn>(raw) }
 }
 
 // ── 2. SyscallContext + 表 ───────────────────────────────────────────────────
@@ -206,16 +271,99 @@ pub fn dispatch(tf: TrapFramePtr) {
     let Some(ops) = frame_ops() else {
         return;
     };
-    let nr = (ops.sys_nr)(tf);
-    let args = (ops.sys_args)(tf);
 
     // 取 current task；sched::init 之前不应触发用户 syscall，但安全起见做防御。
     if !sched::is_ready() {
+        let nr = (ops.sys_nr)(tf);
         log::debug!("[syscall] dispatch before sched ready, nr={}", nr);
         (ops.set_sys_ret)(tf, -(Errno::ENOSYS.as_i32() as isize));
         (ops.advance_pc)(tf);
         return;
     }
+
+    dispatch_for_task_with_ops(tf, ops, sched::current_task());
+}
+
+/// 对明确给定的任务执行 personality 分流。正常 trap 使用 [`dispatch`]；该入口也让
+/// 内核测试能够以真实 Task 验证两种 personality 不会进入对方的分发表。
+#[doc(hidden)]
+pub fn dispatch_for_task(tf: TrapFramePtr, task: Arc<sched::Task>) {
+    let Some(ops) = frame_ops() else {
+        return;
+    };
+    dispatch_for_task_with_ops(tf, ops, task);
+}
+
+fn dispatch_for_task_with_ops(
+    tf: TrapFramePtr,
+    ops: &'static SyscallFrameOps,
+    task: Arc<sched::Task>,
+) {
+    if task.user_abi_kind() == native_abi::UserAbiKind::MygoNative {
+        dispatch_native_for_task(tf, ops, task);
+    } else {
+        dispatch_tomori_for_task(tf, ops, task);
+    }
+}
+
+fn dispatch_native_for_task(
+    tf: TrapFramePtr,
+    ops: &'static SyscallFrameOps,
+    task: Arc<sched::Task>,
+) {
+    loop {
+        assert!(
+            task.begin_execution_scope(sched::ExecutionScopeKind::NativeCall),
+            "同一任务不能嵌套进入 Native call 执行作用域"
+        );
+        let outcome = native_dispatcher()(&task, (ops.native_call)(tf));
+        let _ = task.end_execution_scope(sched::ExecutionScopeKind::NativeCall);
+
+        match outcome {
+            NativeCallOutcome::Return(result) => {
+                if !complete_native_external_control_at_boundary(&task) {
+                    drop(task);
+                    sched::schedule_once(0);
+                    panic!("[native] terminal task scheduled back unexpectedly");
+                }
+                (ops.set_native_ret)(tf, result);
+                (ops.advance_pc)(tf);
+                return;
+            }
+            NativeCallOutcome::RetryExternalControl => {
+                if !complete_native_external_control_at_boundary(&task) {
+                    drop(task);
+                    sched::schedule_once(0);
+                    panic!("[native] terminal task scheduled back unexpectedly");
+                }
+            }
+            NativeCallOutcome::ExitGroup(code) => {
+                drop(task);
+                sched::operation::exit_group(code);
+            }
+        }
+    }
+}
+
+fn complete_native_external_control_at_boundary(task: &Arc<sched::Task>) -> bool {
+    loop {
+        match sched::operation::consume_native_external_control_for_task(task) {
+            sched::NativeExternalControl::Continue => return true,
+            sched::NativeExternalControl::Reschedule => {
+                sched::schedule_once(sched::now_ns_public());
+            }
+            sched::NativeExternalControl::Terminate => return false,
+        }
+    }
+}
+
+fn dispatch_tomori_for_task(
+    tf: TrapFramePtr,
+    ops: &'static SyscallFrameOps,
+    task: Arc<sched::Task>,
+) {
+    let nr = (ops.sys_nr)(tf);
+    let args = (ops.sys_args)(tf);
     #[cfg(feature = "performance-profile")]
     let _span = profiling::enter_span();
     #[cfg(feature = "performance-profile")]
@@ -223,7 +371,6 @@ pub fn dispatch(tf: TrapFramePtr) {
     #[cfg(feature = "performance-profile")]
     let mut syscall_profile = profiling::syscall_scope(nr);
 
-    let task = sched::current_task();
     let mut ctx = SyscallContext::new(nr, args, tf, task);
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
@@ -358,20 +505,38 @@ pub fn dispatch(tf: TrapFramePtr) {
 #[inline]
 pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
     let Some(ops) = frame_ops() else { return };
-    dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
+    let _ = dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastDispatchOutcome {
+    TomoriLinux,
+    MygoNative,
+}
+
 /// arch 快速 syscall 路径用。调用方直接提供 trap frame 写回逻辑，避免热路径
 /// 每次通过 `frame_ops()` 全局表做原子加载和间接调用。
 #[inline]
-pub fn dispatch_fast_with_frame<F>(tf: TrapFramePtr, nr: usize, args: [usize; 6], mut finish: F)
+pub fn dispatch_fast_with_frame<F>(
+    tf: TrapFramePtr,
+    nr: usize,
+    args: [usize; 6],
+    mut finish: F,
+) -> FastDispatchOutcome
 where
     F: FnMut(TrapFramePtr, isize),
 {
     let task = sched::current_task_fast();
+    if task.user_abi_kind() == native_abi::UserAbiKind::MygoNative {
+        let Some(ops) = frame_ops() else {
+            return FastDispatchOutcome::MygoNative;
+        };
+        dispatch_native_for_task(tf, ops, task);
+        return FastDispatchOutcome::MygoNative;
+    }
     #[cfg(feature = "performance-profile")]
     let _span = profiling::enter_span();
     #[cfg(feature = "performance-profile")]
@@ -438,7 +603,7 @@ where
                     let _handoff_profile =
                         profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
                     sched::run_post_syscall_handoff(sched::now_ns_public());
-                    return;
+                    return FastDispatchOutcome::TomoriLinux;
                 }
             }
         }
@@ -497,4 +662,5 @@ where
             );
         }
     }
+    FastDispatchOutcome::TomoriLinux
 }

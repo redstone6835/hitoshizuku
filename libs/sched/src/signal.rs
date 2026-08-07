@@ -440,6 +440,17 @@ impl SignalState {
         self.sigsuspend_saved_blocked
             .store(false, Ordering::Release);
     }
+
+    /// 进入 Native personality 前丢弃 Tomori 的线程级信号等待状态。
+    ///
+    /// pending 队列属于 personality-neutral 的进程控制状态，必须跨 exec 保留。
+    pub fn reset_for_native_exec(&self) {
+        self.blocked.store(0, Ordering::Release);
+        self.saved_blocked.store(0, Ordering::Release);
+        self.sigsuspend_saved_blocked
+            .store(false, Ordering::Release);
+        self.sigtimedwait_mask.store(0, Ordering::Release);
+    }
 }
 
 impl Default for SignalState {

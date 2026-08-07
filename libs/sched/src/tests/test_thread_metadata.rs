@@ -13,10 +13,11 @@ use ktest::ktest;
 use crate::runqueue::Runqueue;
 use crate::{
     ArchContextOps, CpuMask, ExecPhase, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS,
-    PidNamespace, ProcessGroup, ProcessPersonalityState, RobustListState, RseqEvent,
-    RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, SigInfo, SigSet,
-    SignalNumber, TASK_COMM_LEN, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage,
-    ThreadGroup, Uid, UserAbiKind, WaitId, supported_cpu_mask,
+    NativeExternalControl, PidNamespace, ProcessGroup, ProcessPersonalityState, RobustListState,
+    RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy, Session,
+    SigAction, SigActionFlags, SigHandler, SigInfo, SigSet, SignalNumber, TASK_COMM_LEN,
+    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage, ThreadGroup, Uid,
+    UserAbiKind, UserContextRef, WaitId, supported_cpu_mask,
 };
 
 const TEST_EXECUTION_ACTION: u64 = 1;
@@ -308,6 +309,140 @@ fn personality_publication_updates_existing_and_late_thread_caches() {
     let late = make_task_in_group(Arc::clone(&group));
     group.add_member(&late);
     assert_eq!(late.user_abi_kind(), UserAbiKind::MygoNative);
+}
+
+#[ktest]
+fn native_external_control_consumes_ignored_signal_without_user_frame() {
+    let task = make_native_control_task();
+    task.shared_signal().set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Ignore,
+            mask: SigSet::EMPTY,
+            flags: SigActionFlags(0),
+            restorer: 0,
+        },
+    );
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Continue
+    );
+    assert!(!task.signal.has_any_pending());
+    assert_eq!(task.state(), TaskState::Running);
+}
+
+#[ktest]
+fn native_external_control_applies_default_terminate_at_safe_boundary() {
+    let task = make_native_control_task();
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Terminate
+    );
+    assert_eq!(task.state(), TaskState::Zombie);
+}
+
+#[ktest]
+fn generic_signal_delivery_cannot_build_a_linux_frame_for_native() {
+    let task = make_native_control_task();
+    task.shared_signal().set_action(
+        SignalNumber::SIGTERM,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            mask: SigSet::EMPTY,
+            flags: SigActionFlags(0),
+            restorer: 0,
+        },
+    );
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert!(
+        crate::operation::deliver_pending_signals_for_task(&task, UserContextRef::new(0x4000),)
+            .is_none()
+    );
+    assert_eq!(task.state(), TaskState::Zombie);
+}
+
+#[ktest]
+fn native_external_control_reports_stop_and_continue_as_reschedule() {
+    let task = make_native_control_task();
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGSTOP,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Reschedule
+    );
+    assert_eq!(task.state(), TaskState::Stopped);
+
+    let continued = SigInfo {
+        sig: SignalNumber::SIGCONT,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    };
+    task.shared_signal().deliver(continued);
+    crate::signal_wakeup(&task, &continued);
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Continue
+    );
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(task.shared_signal().pending_len_hint(), 0);
+}
+
+#[ktest]
+fn native_external_control_completes_published_group_exit() {
+    let task = make_native_control_task();
+    assert_eq!(task.thread_group().request_group_exit(73), 73);
+    task.publish_group_exit_wakeup();
+
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Terminate
+    );
+    assert_eq!(task.state(), TaskState::Zombie);
+}
+
+fn make_native_control_task() -> Arc<Task> {
+    let task = make_task();
+    let group = task.thread_group();
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.set_state(TaskState::Running);
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    let mut exec = group.lock_exec();
+    exec.set_phase(ExecPhase::Transitioning);
+    exec.install_personality(ProcessPersonalityState::MygoNative(payload));
+    exec.set_phase(ExecPhase::Running);
+    drop(exec);
+    task
 }
 
 #[ktest]
