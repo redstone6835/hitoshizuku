@@ -836,6 +836,9 @@ pub(crate) fn commit_exec(
             InstallStep::AddressSpace => {
                 replace_required_extension(task, TASKEXT_VM_SPACE, &prepared.image.vm)?;
                 prepared.image.vm.activate();
+                // frame 在 pure prepare 中构造，此时旧地址空间仍保持激活；提交新 VM
+                // 后必须刷新架构地址空间令牌，避免返回路径重新装回旧页表。
+                prepared.initial_thread.frame.set_current_address_space();
                 if prepared.image.sync_icache {
                     arch::CurrentTaskOps::sync_icache();
                 }

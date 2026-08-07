@@ -434,7 +434,9 @@ fn start_random_seed() -> Result<[u8; 32], Errno> {
     while filled < seed.len() {
         let produced = fill_random(
             &mut seed[filled..],
-            RandomReadMode::Secure { blocking: true },
+            // 架构启动熵会播种 CSPRNG，但未必具备可计量的安全熵；exec 不能因此
+            // 永久等待 secure-ready。StartInfo 只要求每次使用非固定启动随机种子。
+            RandomReadMode::Insecure,
         )
         .map_err(|_| Errno::EIO)?;
         if produced == 0 || produced > seed.len() - filled {
