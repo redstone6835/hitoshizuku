@@ -2,6 +2,7 @@
 
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
 	kernel-la kernel-rv all clean cargo-setup \
+	native-hello-la native-hello-rv \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -12,6 +13,7 @@ JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 BUILD_DIR := build
 CARGO_TARGET_DIR ?= target
 FEATURES ?=
+NATIVE_EXAMPLES ?=
 TEST_MODE ?= default
 TEST_WORKLOAD ?=
 PROFILE_MODE ?= sample
@@ -24,6 +26,21 @@ INITRAMFS ?=
 INSTALL_MOD_PATH ?=
 KERNEL_MAP ?=
 KERNEL_PUBLISH_OUTPUT ?=
+
+UNKNOWN_NATIVE_EXAMPLES := $(filter-out hello,$(NATIVE_EXAMPLES))
+ifneq ($(strip $(UNKNOWN_NATIVE_EXAMPLES)),)
+$(error NATIVE_EXAMPLES 包含未知示例: $(UNKNOWN_NATIVE_EXAMPLES))
+endif
+
+ifneq ($(filter hello,$(NATIVE_EXAMPLES)),)
+define install_native_examples
+	$(MAKE) -C native ARCH=$(1) hello
+	install -m 0755 $(BUILD_DIR)/$(1)/native/hello.soyo $(2)/bin/soyo-hello
+endef
+else
+define install_native_examples
+endef
+endif
 
 empty :=
 space := $(empty) $(empty)
@@ -283,6 +300,7 @@ define prepare_compat_rootfs
 	$(call build_elm_user_tools,$(1),$(2),$(5))
 	$(call build_smp_user_tests,$(1),$(2),$(5))
 	$(call build_loongarch_sxe_tests,$(1),$(2),$(5))
+	$(call install_native_examples,$(1),$(2))
 	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
 	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
 		-exec install -m 0644 {} $(2)/lib/elm/ \;
@@ -315,6 +333,12 @@ _compat-kernel-riscv64:
 	$(call build_kernel,$(RV_ARCH),$(RV_TARGET),$(RV_CROSS_COMPILE),1)
 
 all: kernel-la kernel-rv
+
+native-hello-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) hello
+
+native-hello-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) hello
 
 clean:
 	cargo clean

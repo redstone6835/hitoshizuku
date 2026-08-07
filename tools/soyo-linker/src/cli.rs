@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use native_abi::TargetArch;
 
+use crate::bindings::generate_c_header;
 use crate::contract::parse_manifest;
 use crate::elf::MAX_OBJECT_FILE_SIZE;
 use crate::link::{InputObject, LinkRequest, apply_relocations, build_link_image};
@@ -19,13 +20,15 @@ SOYO 直接静态链接器
 
 用法:
   soyo-ld --target <riscv64|loongarch64> --manifest <app.json> -o <app.soyo> <ELF ET_REL>...
+  soyo-ld --target <riscv64|loongarch64> --manifest <app.json> --emit-c-header <path>
 
 选项:
-  --target <arch>     输出目标架构
-  --manifest <path>  程序 ABI 与 capability 契约
-  -o <path>           输出 SOYO 文件
-  -h, --help          显示帮助
-  --version           显示版本
+  --target <arch>          输出目标架构
+  --manifest <path>       程序 ABI 与 capability 契约
+  --emit-c-header <path>  生成程序专属 C ABI binding
+  -o <path>                输出 SOYO 文件
+  -h, --help               显示帮助
+  --version                显示版本
 ";
 
 const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
@@ -34,11 +37,18 @@ const MAX_OBJECT_SIZE: u64 = MAX_OBJECT_FILE_SIZE as u64;
 const MAX_TOTAL_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
-struct Options {
+struct LinkOptions {
     target: TargetArch,
     manifest: PathBuf,
     output: PathBuf,
     objects: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct HeaderOptions {
+    target: TargetArch,
+    manifest: PathBuf,
+    output: PathBuf,
 }
 
 struct OpenObject {
@@ -50,7 +60,8 @@ struct OpenObject {
 enum Action {
     Help,
     Version,
-    Link(Options),
+    Link(LinkOptions),
+    EmitCHeader(HeaderOptions),
 }
 
 #[derive(Debug)]
@@ -98,6 +109,13 @@ pub fn main_entry() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Ok(Action::EmitCHeader(options)) => match emit_c_header(options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("soyo-ld: {error}");
+                ExitCode::from(1)
+            }
+        },
         Err(error) => {
             eprintln!("soyo-ld: {error}");
             if error.usage {
@@ -114,6 +132,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
     let mut target = None;
     let mut manifest = None;
     let mut output = None;
+    let mut c_header = None;
     let mut objects = Vec::new();
     let mut positional_only = false;
     let mut arguments = arguments.into_iter();
@@ -154,6 +173,14 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
                 )?;
                 continue;
             }
+            if argument == "--emit-c-header" {
+                set_once(
+                    &mut c_header,
+                    PathBuf::from(next_value(&mut arguments, "--emit-c-header")?),
+                    "--emit-c-header",
+                )?;
+                continue;
+            }
             if argument.to_string_lossy().starts_with('-') {
                 return Err(CliError::usage(format!(
                     "未知选项 {}",
@@ -166,6 +193,18 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
 
     let target = target.ok_or_else(|| CliError::usage("缺少 --target"))?;
     let manifest = manifest.ok_or_else(|| CliError::usage("缺少 --manifest"))?;
+    if let Some(c_header) = c_header {
+        if output.is_some() || !objects.is_empty() {
+            return Err(CliError::usage(
+                "--emit-c-header 不能与 -o 或对象输入同时使用",
+            ));
+        }
+        return Ok(Action::EmitCHeader(HeaderOptions {
+            target,
+            manifest,
+            output: c_header,
+        }));
+    }
     let output = output.ok_or_else(|| CliError::usage("缺少 -o"))?;
     if objects.is_empty() {
         return Err(CliError::usage("缺少 ELF ET_REL 输入对象"));
@@ -175,7 +214,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
             "对象数量超过 {MAX_OBJECT_COUNT} 个上限"
         )));
     }
-    Ok(Action::Link(Options {
+    Ok(Action::Link(LinkOptions {
         target,
         manifest,
         output,
@@ -210,7 +249,7 @@ fn parse_target(value: OsString) -> Result<TargetArch, CliError> {
     }
 }
 
-fn link(options: Options) -> Result<(), CliError> {
+fn link(options: LinkOptions) -> Result<(), CliError> {
     let manifest_source = read_manifest(&options.manifest)?;
     let contract = parse_manifest(&manifest_source)
         .map_err(|error| CliError::operation(format!("manifest 无效: {error}")))?;
@@ -226,7 +265,15 @@ fn link(options: Options) -> Result<(), CliError> {
         .map_err(|error| CliError::operation(format!("重定位失败: {error}")))?;
     let output = encode_soyo(&image, &contract)
         .map_err(|error| CliError::operation(format!("SOYO 编码失败: {error}")))?;
-    write_atomic(&options.output, &output)
+    write_atomic(&options.output, &output, true)
+}
+
+fn emit_c_header(options: HeaderOptions) -> Result<(), CliError> {
+    let manifest_source = read_manifest(&options.manifest)?;
+    let contract = parse_manifest(&manifest_source)
+        .map_err(|error| CliError::operation(format!("manifest 无效: {error}")))?;
+    let output = generate_c_header(options.target, &contract);
+    write_atomic(&options.output, &output, false)
 }
 
 fn read_manifest(path: &Path) -> Result<String, CliError> {
@@ -336,7 +383,7 @@ fn read_bounded(
     Ok(bytes)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+fn write_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<(), CliError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -349,7 +396,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o755))
+            let mode = if executable { 0o755 } else { 0o644 };
+            file.set_permissions(fs::Permissions::from_mode(mode))
                 .map_err(|error| CliError::operation(format!("设置输出权限失败: {error}")))?;
         }
         file.sync_all()

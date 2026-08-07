@@ -1,5 +1,6 @@
 //! SOYO 静态链接器核心。
 
+pub mod bindings;
 pub mod cli;
 pub mod contract;
 pub mod elf;

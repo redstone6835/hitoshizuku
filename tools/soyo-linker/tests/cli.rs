@@ -58,6 +58,60 @@ fn usage_error_has_exit_code_two() {
 }
 
 #[test]
+fn header_only_mode_writes_generated_binding_without_objects() {
+    let directory = temp_dir();
+    let manifest = directory.join("app.json");
+    let header = directory.join("mygo_program.h");
+    fs::write(&manifest, VALID_MANIFEST).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soyo-ld"))
+        .args(["--target", "riscv64", "--manifest"])
+        .arg(&manifest)
+        .args(["--emit-c-header"])
+        .arg(&header)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "header-only 失败: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated = String::from_utf8(fs::read(&header).unwrap()).unwrap();
+    assert!(generated.contains("#define MYGO_SLOT_PROCESS_EXIT 0u\n"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn header_only_mode_rejects_link_output_without_partial_header() {
+    let directory = temp_dir();
+    let manifest = directory.join("app.json");
+    let header = directory.join("mygo_program.h");
+    let output_path = directory.join("app.soyo");
+    fs::write(&manifest, VALID_MANIFEST).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soyo-ld"))
+        .args(["--target", "riscv64", "--manifest"])
+        .arg(&manifest)
+        .args(["--emit-c-header"])
+        .arg(&header)
+        .args(["-o"])
+        .arg(&output_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("--emit-c-header 不能与 -o 或对象输入同时使用")
+    );
+    assert!(!header.exists());
+    assert!(!output_path.exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn input_failure_does_not_replace_existing_output() {
     let directory = temp_dir();
     let manifest = directory.join("app.json");
