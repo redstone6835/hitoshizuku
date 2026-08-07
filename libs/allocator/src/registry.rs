@@ -3,11 +3,11 @@
 //! 这个模块维护“用户指针 -> 分配记录”的映射，用来支持以下关键能力：
 //!
 //! - `deallocate(ptr)` 时根据裸指针找回分配来源与布局信息；
-//! - `realloc` 时判断对象是 boot/small/large/managed/physical 哪一路分配；
+//! - `realloc` 时判断对象是 boot/small/large/physical 哪一路分配；
 //! - 统计和调试时追踪当前活跃分配。
 //!
 //! 从设计上看，它是整个 allocator 的“账本”。真正的内存页由 buddy、slab、
-//! kernel heap 或 managed allocator 持有，而注册表负责记账、查账和销账。
+//! kernel heap 持有，而注册表负责记账、查账和销账。
 //!
 //! 实现采用固定桶数组 + 单向链表节点的哈希表形式，强调三点：
 //!
@@ -54,7 +54,6 @@ pub struct AllocationRegistryStats {
     pub live_boot: usize,
     pub live_small: usize,
     pub live_large: usize,
-    pub live_managed: usize,
     pub live_physical: usize,
 }
 
@@ -73,7 +72,6 @@ pub struct AllocationRegistryAudit {
     pub scanned_live_boot: usize,
     pub scanned_live_small: usize,
     pub scanned_live_large: usize,
-    pub scanned_live_managed: usize,
     pub scanned_live_physical: usize,
     pub scanned_max_chain_len: usize,
 }
@@ -92,7 +90,7 @@ pub struct AllocationRegistrySnapshot {
 /// 指定外部所有者仍存活的分配记录摘要。
 ///
 /// 该快照直接扫描 allocator registry，不分配内存，也不暴露对象地址。它用于在 ELM
-/// 退役被资源账本阻塞时区分普通堆对象、大对象、受管对象和显式物理页泄漏。
+/// 退役被资源账本阻塞时区分普通堆对象、大对象和显式物理页泄漏。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllocationOwnerStats {
     pub records: usize,
@@ -101,7 +99,6 @@ pub struct AllocationOwnerStats {
     pub boot_records: usize,
     pub small_records: usize,
     pub large_records: usize,
-    pub managed_records: usize,
     pub physical_records: usize,
     pub largest_requested_bytes: usize,
     pub largest_usable_bytes: usize,
@@ -278,7 +275,7 @@ struct AllocationRegistryInner {
     /// alloc/free 热路径只标记失效；stats/audit 等冷路径读取前再扫描桶长数组，
     /// 避免稀疏哈希表在 `max_chain_len == 1` 时每次释放都持锁遍历整个 shard。
     max_chain_len_dirty: bool,
-    live_by_kind: [usize; 5],
+    live_by_kind: [usize; 4],
     initializing: bool,
     initialized: bool,
 }
@@ -304,7 +301,7 @@ impl AllocationRegistryInner {
             chain_corruptions: 0,
             max_chain_len: 0,
             max_chain_len_dirty: false,
-            live_by_kind: [0; 5],
+            live_by_kind: [0; 4],
             initializing: false,
             initialized: false,
         }
@@ -313,7 +310,7 @@ impl AllocationRegistryInner {
 
 struct RegistryShard {
     /// 每个 shard 独立加锁。跨指针迁移通过 remove + register 两阶段完成，不同时持有
-    /// 两个 shard 锁，避免未来 managed compact / realloc 路径出现锁顺序问题。
+    /// 两个 shard 锁，避免未来 realloc 路径出现锁顺序问题。
     inner: Mutex<AllocationRegistryInner>,
 }
 
@@ -409,7 +406,7 @@ impl AllocationRegistry {
             inner.chain_corruptions = 0;
             inner.max_chain_len = 0;
             inner.max_chain_len_dirty = false;
-            inner.live_by_kind = [0; 5];
+            inner.live_by_kind = [0; 4];
             inner.initializing = false;
             inner.initialized = true;
         }
@@ -789,7 +786,6 @@ impl AllocationRegistry {
             out.scanned_live_boot += scanned.live_by_kind[kind_index(AllocationKind::Boot)];
             out.scanned_live_small += scanned.live_by_kind[kind_index(AllocationKind::Small)];
             out.scanned_live_large += scanned.live_by_kind[kind_index(AllocationKind::Large)];
-            out.scanned_live_managed += scanned.live_by_kind[kind_index(AllocationKind::Managed)];
             out.scanned_live_physical += scanned.live_by_kind[kind_index(AllocationKind::Physical)];
             out.scanned_max_chain_len = out.scanned_max_chain_len.max(scanned.max_chain_len);
 
@@ -866,9 +862,6 @@ impl AllocationRegistry {
                             AllocationKind::Large => {
                                 out.large_records = out.large_records.saturating_add(1)
                             }
-                            AllocationKind::Managed => {
-                                out.managed_records = out.managed_records.saturating_add(1)
-                            }
                             AllocationKind::Physical => {
                                 out.physical_records = out.physical_records.saturating_add(1)
                             }
@@ -906,7 +899,6 @@ fn accumulate_stats_locked(out: &mut AllocationRegistryStats, inner: &Allocation
     out.live_boot += inner.live_by_kind[kind_index(AllocationKind::Boot)];
     out.live_small += inner.live_by_kind[kind_index(AllocationKind::Small)];
     out.live_large += inner.live_by_kind[kind_index(AllocationKind::Large)];
-    out.live_managed += inner.live_by_kind[kind_index(AllocationKind::Managed)];
     out.live_physical += inner.live_by_kind[kind_index(AllocationKind::Physical)];
 }
 
@@ -914,7 +906,7 @@ fn accumulate_stats_locked(out: &mut AllocationRegistryStats, inner: &Allocation
 struct RegistryShardScan {
     live_records: usize,
     free_nodes: usize,
-    live_by_kind: [usize; 5],
+    live_by_kind: [usize; 4],
     max_chain_len: usize,
 }
 
@@ -1189,8 +1181,7 @@ fn kind_index(kind: AllocationKind) -> usize {
         AllocationKind::Boot => 0,
         AllocationKind::Small => 1,
         AllocationKind::Large => 2,
-        AllocationKind::Managed => 3,
-        AllocationKind::Physical => 4,
+        AllocationKind::Physical => 3,
     }
 }
 

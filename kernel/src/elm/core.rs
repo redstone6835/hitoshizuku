@@ -11080,7 +11080,7 @@ impl ElmCore {
             let allocations = allocator::KERNEL_ALLOCATOR.owner_allocation_stats(cell.id.0);
             out.push_str(
                 format!(
-                    "cell={} dynamic_alloc_bytes={} peak_dynamic_alloc_bytes={} max_dynamic_alloc_bytes={} native_stack_bytes={} active_native_calls={} cpu_time_ns_total={} cpu_time_ns_period={} cpu_call_overruns={} cpu_period_overruns={} quota_denials={} accounting_errors={} live_allocs={} alloc_requested_bytes={} alloc_usable_bytes={} alloc_boot={} alloc_small={} alloc_large={} alloc_managed={} alloc_physical={} alloc_largest={} alloc_largest_usable={} alloc_scan_errors={}\n",
+                    "cell={} dynamic_alloc_bytes={} peak_dynamic_alloc_bytes={} max_dynamic_alloc_bytes={} native_stack_bytes={} active_native_calls={} cpu_time_ns_total={} cpu_time_ns_period={} cpu_call_overruns={} cpu_period_overruns={} quota_denials={} accounting_errors={} live_allocs={} alloc_requested_bytes={} alloc_usable_bytes={} alloc_boot={} alloc_small={} alloc_large={} alloc_physical={} alloc_largest={} alloc_largest_usable={} alloc_scan_errors={}\n",
                     cell.id.0,
                     usage.dynamic_alloc_bytes,
                     usage.peak_dynamic_alloc_bytes,
@@ -11099,7 +11099,6 @@ impl ElmCore {
                     allocations.boot_records,
                     allocations.small_records,
                     allocations.large_records,
-                    allocations.managed_records,
                     allocations.physical_records,
                     allocations.largest_requested_bytes,
                     allocations.largest_usable_bytes,

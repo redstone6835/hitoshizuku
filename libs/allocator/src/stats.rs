@@ -1,25 +1,22 @@
 //! 分配器统计与总览视图。
 //!
-//! allocator 实际上由多层组成：boot、buddy、vmem、slab、kernel heap、managed。
+//! allocator 实际上由多层组成：boot、buddy、vmem、slab、kernel heap。
 //! 单看某一层的统计数字通常是不够的，因为问题往往发生在层与层的交界处。例如：
 //!
 //! - 物理页还有很多，但内核虚拟地址空间已经耗尽；
 //! - slab 命中率很好，但大对象路径失败；
-//! - managed 区域未启用，却仍有上层代码误以为可用。
 //!
 //! 这个模块负责把分散的统计数据组织成较高层的视图，使内核日志和自检代码能够用
 //! 一套统一格式描述当前内存状态。
 use crate::boot::BootStats;
 use crate::buddy::{BuddyAudit, BuddyReclaimStats, BuddyStats, PAGE_SIZE};
-use crate::gc::{GcCollectionKind, GcPhase};
 use crate::kheap::{KernelHeapAudit, KernelHeapReclaimStats, KernelHeapStats};
-use crate::managed::{ManagedAudit, ManagedStats};
 use crate::metadata::MetadataStats;
 use crate::registry::{AllocationRegistryAudit, AllocationRegistryStats};
 use crate::slab::{SlabAudit, SlabReclaimStats, SlabStats};
 use crate::space::AddressSpaceStats;
 
-pub const ALLOCATOR_API_VERSION: u32 = 1;
+pub const ALLOCATOR_API_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocatorCapabilities {
@@ -28,9 +25,6 @@ pub struct AllocatorCapabilities {
     pub max_small_size: usize,
     pub max_cpus: usize,
     pub page_size: usize,
-    pub default_managed_heap_order: usize,
-    pub large_managed_heap_order: usize,
-    pub managed_enabled: bool,
 }
 
 impl AllocatorCapabilities {
@@ -42,8 +36,8 @@ impl AllocatorCapabilities {
 /// allocator 对外能力集合。
 ///
 /// 这个位图面向未来 LKM/外部子系统：调用方可以先读取 capability，再决定是否使用
-/// typed physical API、完整结构审计、cache reclaim 或 managed GC 接口，避免靠内核版本号
-/// 和日志字符串做脆弱判断。
+/// typed physical API、完整结构审计或 cache reclaim 接口，避免靠内核版本号和日志字符串
+/// 做脆弱判断。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocatorCapabilityFlags(u64);
 
@@ -56,14 +50,8 @@ impl AllocatorCapabilityFlags {
     pub const SLAB_STRUCTURE_AUDIT: Self = Self(1 << 5);
     pub const KHEAP_STRUCTURE_AUDIT: Self = Self(1 << 6);
     pub const BUDDY_STRUCTURE_AUDIT: Self = Self(1 << 7);
-    pub const MANAGED_STRUCTURE_AUDIT: Self = Self(1 << 8);
-    pub const MANAGED_REFERENCE_AUDIT: Self = Self(1 << 9);
     pub const CACHE_RECLAIM: Self = Self(1 << 10);
     pub const HOTSPOT_SUMMARY: Self = Self(1 << 11);
-    pub const MANAGED_GC: Self = Self(1 << 12);
-    pub const RELOCATION_OBSERVER: Self = Self(1 << 13);
-    pub const EXACT_ROOT_PROVIDER: Self = Self(1 << 14);
-    pub const GC_CRITICAL_SECTION_HOOKS: Self = Self(1 << 15);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -79,14 +67,8 @@ impl AllocatorCapabilityFlags {
                 | Self::SLAB_STRUCTURE_AUDIT.0
                 | Self::KHEAP_STRUCTURE_AUDIT.0
                 | Self::BUDDY_STRUCTURE_AUDIT.0
-                | Self::MANAGED_STRUCTURE_AUDIT.0
-                | Self::MANAGED_REFERENCE_AUDIT.0
                 | Self::CACHE_RECLAIM.0
-                | Self::HOTSPOT_SUMMARY.0
-                | Self::MANAGED_GC.0
-                | Self::RELOCATION_OBSERVER.0
-                | Self::EXACT_ROOT_PROVIDER.0
-                | Self::GC_CRITICAL_SECTION_HOOKS.0,
+                | Self::HOTSPOT_SUMMARY.0,
         )
     }
 
@@ -209,8 +191,6 @@ pub struct AllocatorAudit {
     pub slab_structure_scanned: bool,
     pub kheap_structure: KernelHeapAudit,
     pub kheap_structure_scanned: bool,
-    pub managed_structure: ManagedAudit,
-    pub managed_structure_scanned: bool,
     pub registry_live_records: usize,
     pub registry_kind_records: usize,
     pub registry_boot_records: usize,
@@ -225,8 +205,6 @@ pub struct AllocatorAudit {
     pub kheap_live_records: usize,
     pub kheap_active_bytes: usize,
     pub kheap_page_bytes: usize,
-    pub managed_active_objects: u64,
-    pub managed_live_records: usize,
 }
 
 impl AllocatorAudit {
@@ -236,7 +214,6 @@ impl AllocatorAudit {
             && (!self.phys_structure_scanned || self.phys_structure.is_consistent())
             && (!self.slab_structure_scanned || self.slab_structure.is_consistent())
             && (!self.kheap_structure_scanned || self.kheap_structure.is_consistent())
-            && (!self.managed_structure_scanned || self.managed_structure.is_consistent())
     }
 }
 
@@ -257,13 +234,11 @@ impl AllocatorAuditFlags {
     pub const SLAB_BACKING_OVERCOMMIT: Self = Self(1 << 3);
     pub const KHEAP_RECORD_MISMATCH: Self = Self(1 << 4);
     pub const KHEAP_PAGE_ACCOUNTING_MISMATCH: Self = Self(1 << 5);
-    pub const MANAGED_RECORD_MISMATCH: Self = Self(1 << 6);
     pub const REGISTRY_STRUCTURE_MISMATCH: Self = Self(1 << 7);
     pub const PHYS_STRUCTURE_MISMATCH: Self = Self(1 << 8);
     pub const PHYS_PAGE_ACCOUNTING_MISMATCH: Self = Self(1 << 9);
     pub const SLAB_STRUCTURE_MISMATCH: Self = Self(1 << 10);
     pub const KHEAP_STRUCTURE_MISMATCH: Self = Self(1 << 11);
-    pub const MANAGED_STRUCTURE_MISMATCH: Self = Self(1 << 12);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -298,9 +273,6 @@ pub struct MemoryOverview {
     pub kernel_vmem_total: usize,
     pub kernel_vmem_allocated: usize,
     pub kernel_vmem_free: usize,
-    pub managed_vmem_total: usize,
-    pub managed_vmem_allocated: usize,
-    pub managed_vmem_free: usize,
     pub kernel_heap_used: usize,
     pub kernel_heap_free: usize,
     pub boot_used: usize,
@@ -316,7 +288,6 @@ pub struct AllocatorLayerStats {
     pub slab: SlabStats,
     pub metadata: MetadataStats,
     pub registry: AllocationRegistryStats,
-    pub managed: ManagedStats,
 }
 
 /// allocator 热点摘要。
@@ -352,7 +323,6 @@ pub struct AllocatorHotspotSummary {
     pub kheap_cache_pressure_releases: u64,
     pub kernel_vmem_largest_free_percent: u8,
     pub kernel_vmem_free_segments: usize,
-    pub managed_fragmentation_per_mille: u16,
     pub pressure_level: u8,
 }
 
@@ -360,7 +330,7 @@ pub fn build_audit(
     layers: &AllocatorLayerStats,
     registry_structure: AllocationRegistryAudit,
 ) -> AllocatorAudit {
-    build_audit_inner(layers, Some(registry_structure), None, None, None, None)
+    build_audit_inner(layers, Some(registry_structure), None, None, None)
 }
 
 pub fn build_audit_with_structures(
@@ -369,7 +339,6 @@ pub fn build_audit_with_structures(
     phys_structure: BuddyAudit,
     slab_structure: SlabAudit,
     kheap_structure: KernelHeapAudit,
-    managed_structure: ManagedAudit,
 ) -> AllocatorAudit {
     build_audit_inner(
         layers,
@@ -377,12 +346,11 @@ pub fn build_audit_with_structures(
         Some(phys_structure),
         Some(slab_structure),
         Some(kheap_structure),
-        Some(managed_structure),
     )
 }
 
 pub fn build_counter_audit(layers: &AllocatorLayerStats) -> AllocatorAudit {
-    build_audit_inner(layers, None, None, None, None, None)
+    build_audit_inner(layers, None, None, None, None)
 }
 
 fn build_audit_inner(
@@ -391,14 +359,12 @@ fn build_audit_inner(
     phys_structure: Option<BuddyAudit>,
     slab_structure: Option<SlabAudit>,
     kheap_structure: Option<KernelHeapAudit>,
-    managed_structure: Option<ManagedAudit>,
 ) -> AllocatorAudit {
     let registry_kind_records = layers
         .registry
         .live_boot
         .saturating_add(layers.registry.live_small)
         .saturating_add(layers.registry.live_large)
-        .saturating_add(layers.registry.live_managed)
         .saturating_add(layers.registry.live_physical);
     let registry_nodes_accounted = layers
         .registry
@@ -453,7 +419,6 @@ fn build_audit_inner(
             || registry_structure.scanned_live_boot != layers.registry.live_boot
             || registry_structure.scanned_live_small != layers.registry.live_small
             || registry_structure.scanned_live_large != layers.registry.live_large
-            || registry_structure.scanned_live_managed != layers.registry.live_managed
             || registry_structure.scanned_live_physical != layers.registry.live_physical
             || registry_structure.scanned_max_chain_len > layers.registry.max_chain_len
         {
@@ -495,32 +460,6 @@ fn build_audit_inner(
             flags.insert(AllocatorAuditFlags::KHEAP_STRUCTURE_MISMATCH);
         }
     }
-    if layers.managed.active_objects != layers.registry.live_managed as u64 {
-        flags.insert(AllocatorAuditFlags::MANAGED_RECORD_MISMATCH);
-    }
-    if let Some(managed_structure) = managed_structure {
-        if !managed_structure.is_consistent()
-            || managed_structure.scanned_active_objects != layers.managed.active_objects
-            || managed_structure.scanned_active_objects
-                != layers.managed.gc.object_table_entries as u64
-            || managed_structure.scanned_active_bytes != layers.managed.active_bytes
-            || managed_structure.scanned_young_objects != layers.managed.gc.young_gen_objects
-            || managed_structure.scanned_old_objects != layers.managed.gc.old_gen_objects
-            || managed_structure.scanned_strong_handle_slots
-                != layers.managed.gc.strong_handle_slots
-            || managed_structure.scanned_weak_handle_slots != layers.managed.gc.weak_handle_slots
-            || managed_structure.scanned_pinned_handle_slots
-                != layers.managed.gc.pinned_handle_slots
-            || managed_structure.scanned_automatic_root_entries
-                != layers.managed.gc.automatic_root_entries
-            || managed_structure.scanned_pending_finalizers != layers.managed.gc.pending_finalizers
-            || managed_structure.scanned_dirty_cards != layers.managed.gc.dirty_cards
-            || managed_structure.scanned_remembered_objects != layers.managed.gc.remembered_objects
-        {
-            flags.insert(AllocatorAuditFlags::MANAGED_STRUCTURE_MISMATCH);
-        }
-    }
-
     AllocatorAudit {
         flags,
         registry_structure: registry_structure.unwrap_or_default(),
@@ -531,8 +470,6 @@ fn build_audit_inner(
         slab_structure_scanned: slab_structure.is_some(),
         kheap_structure: kheap_structure.unwrap_or_default(),
         kheap_structure_scanned: kheap_structure.is_some(),
-        managed_structure: managed_structure.unwrap_or_default(),
-        managed_structure_scanned: managed_structure.is_some(),
         registry_live_records: layers.registry.live_records,
         registry_kind_records,
         registry_boot_records: layers.registry.live_boot,
@@ -547,8 +484,6 @@ fn build_audit_inner(
         kheap_live_records: layers.registry.live_large,
         kheap_active_bytes: layers.kheap.active_bytes,
         kheap_page_bytes,
-        managed_active_objects: layers.managed.active_objects,
-        managed_live_records: layers.registry.live_managed,
     }
 }
 
@@ -626,8 +561,7 @@ pub fn build_hotspot_summary(layers: &AllocatorLayerStats) -> AllocatorHotspotSu
         kheap_cache_pressure_releases: layers.kheap.cache_pressure_releases,
         kernel_vmem_largest_free_percent,
         kernel_vmem_free_segments: layers.address_space.kernel.free_segments,
-        managed_fragmentation_per_mille: layers.managed.gc.fragmentation_ratio.min(1000) as u16,
-        pressure_level: pressure_level(layers.phys, layers.address_space, layers.managed),
+        pressure_level: pressure_level(layers.phys),
     }
 }
 
@@ -637,7 +571,6 @@ pub fn build_overview(
     address_space: AddressSpaceStats,
     kheap: KernelHeapStats,
     slab: SlabStats,
-    managed: ManagedStats,
 ) -> MemoryOverview {
     let free_physical = pages_to_bytes(phys.free_pages);
     let kernel_heap_used = kheap.active_bytes.saturating_add(slab.active_bytes);
@@ -652,27 +585,23 @@ pub fn build_overview(
         kernel_vmem_total: address_space.kernel.total_size,
         kernel_vmem_allocated: address_space.kernel.allocated_size,
         kernel_vmem_free: address_space.kernel.free_size,
-        managed_vmem_total: address_space.managed.total_size,
-        managed_vmem_allocated: address_space.managed.allocated_size,
-        managed_vmem_free: address_space.managed.free_size,
         kernel_heap_used,
         kernel_heap_free: address_space.kernel.free_size,
         boot_used: boot.used_bytes,
         boot_free: boot.free_bytes,
-        pressure_level: pressure_level(phys, address_space, managed),
+        pressure_level: pressure_level(phys),
     }
 }
 
 pub fn build_overview_from_layers(boot: BootStats, layers: &AllocatorLayerStats) -> MemoryOverview {
     // 诊断路径已经需要完整 layer snapshot；从同一份快照派生 overview 可以避免重复读取
-    // phys/vmem/slab/kheap/managed，也让日志中总览和分层数据对应同一个采样窗口。
+    // phys/vmem/slab/kheap，也让日志中总览和分层数据对应同一个采样窗口。
     build_overview(
         boot,
         layers.phys,
         layers.address_space,
         layers.kheap,
         layers.slab,
-        layers.managed,
     )
 }
 
@@ -681,33 +610,8 @@ fn pages_to_bytes(pages: usize) -> usize {
     pages.saturating_mul(PAGE_SIZE)
 }
 
-pub fn pressure_level(
-    phys: BuddyStats,
-    address_space: AddressSpaceStats,
-    managed: ManagedStats,
-) -> u8 {
-    let phys_pressure = physical_pressure_level(phys);
-    let mut managed_pressure = 0u8;
-    if managed.enabled {
-        let managed_free_percent = if address_space.managed.total_size == 0 {
-            100
-        } else {
-            (address_space.managed.free_size * 100) / address_space.managed.total_size
-        };
-        let object_load = if managed.gc.object_table_capacity == 0 {
-            0
-        } else {
-            (managed.gc.object_table_entries * 100) / managed.gc.object_table_capacity
-        };
-        if managed_free_percent < 5 || object_load >= 95 {
-            managed_pressure = 3;
-        } else if managed_free_percent < 10 || object_load >= 85 {
-            managed_pressure = 2;
-        } else if managed_free_percent < 25 || object_load >= 70 {
-            managed_pressure = 1;
-        }
-    }
-    phys_pressure.max(managed_pressure)
+pub fn pressure_level(phys: BuddyStats) -> u8 {
+    physical_pressure_level(phys)
 }
 
 fn physical_pressure_level(phys: BuddyStats) -> u8 {
@@ -750,7 +654,6 @@ pub fn format_diagnostic(
     phys_structure: &BuddyAudit,
     slab_structure: &SlabAudit,
     kheap_structure: &KernelHeapAudit,
-    managed_structure: &ManagedAudit,
 ) -> usize {
     format_diagnostic_inner(
         buf,
@@ -760,7 +663,6 @@ pub fn format_diagnostic(
         Some(*phys_structure),
         Some(*slab_structure),
         Some(*kheap_structure),
-        Some(*managed_structure),
     )
 }
 
@@ -769,7 +671,7 @@ pub fn format_diagnostic_counters(
     overview: &MemoryOverview,
     layers: &AllocatorLayerStats,
 ) -> usize {
-    format_diagnostic_inner(buf, overview, layers, None, None, None, None, None)
+    format_diagnostic_inner(buf, overview, layers, None, None, None, None)
 }
 
 fn format_diagnostic_inner(
@@ -780,7 +682,6 @@ fn format_diagnostic_inner(
     phys_structure: Option<BuddyAudit>,
     slab_structure: Option<SlabAudit>,
     kheap_structure: Option<KernelHeapAudit>,
-    managed_structure: Option<ManagedAudit>,
 ) -> usize {
     let mut pos = 0usize;
     pos += write_str(buf, pos, b"Phys: total=");
@@ -807,10 +708,6 @@ fn format_diagnostic_inner(
     pos += write_usize(buf, pos, overview.kernel_vmem_allocated / 1024);
     pos += write_str(buf, pos, b"/");
     pos += write_usize(buf, pos, overview.kernel_vmem_total / 1024);
-    pos += write_str(buf, pos, b"K managed=");
-    pos += write_usize(buf, pos, overview.managed_vmem_allocated / 1024);
-    pos += write_str(buf, pos, b"/");
-    pos += write_usize(buf, pos, overview.managed_vmem_total / 1024);
     pos += write_str(buf, pos, b"K largest=");
     pos += write_usize(
         buf,
@@ -945,23 +842,20 @@ fn format_diagnostic_inner(
         phys_structure,
         slab_structure,
         kheap_structure,
-        managed_structure,
     ) {
         (
             Some(registry_structure),
             Some(phys_structure),
             Some(slab_structure),
             Some(kheap_structure),
-            Some(managed_structure),
         ) => build_audit_with_structures(
             layers,
             registry_structure,
             phys_structure,
             slab_structure,
             kheap_structure,
-            managed_structure,
         ),
-        (Some(registry_structure), _, _, _, _) => build_audit(layers, registry_structure),
+        (Some(registry_structure), _, _, _) => build_audit(layers, registry_structure),
         _ => build_counter_audit(layers),
     };
     pos += write_str(buf, pos, b"\nAudit: ok=");
@@ -1054,42 +948,6 @@ fn format_diagnostic_inner(
     } else {
         pos += write_str(buf, pos, b"skip");
     }
-    pos += write_str(buf, pos, b" managed_struct=");
-    if audit.managed_structure_scanned {
-        pos += write_usize(buf, pos, audit.managed_structure.flags.bits() as usize);
-    } else {
-        pos += write_str(buf, pos, b"skip");
-    }
-    pos += write_str(buf, pos, b" managed_scan=");
-    if audit.managed_structure_scanned {
-        pos += write_u64(buf, pos, audit.managed_structure.scanned_active_objects);
-        pos += write_str(buf, pos, b"/");
-        pos += write_usize(buf, pos, audit.managed_structure.scanned_active_bytes);
-    } else {
-        pos += write_str(buf, pos, b"skip");
-    }
-    pos += write_str(buf, pos, b" managed_refs=");
-    if audit.managed_structure_scanned {
-        pos += write_usize(
-            buf,
-            pos,
-            audit.managed_structure.scanned_strong_reference_slots,
-        );
-        pos += write_str(buf, pos, b"/");
-        pos += write_usize(
-            buf,
-            pos,
-            audit.managed_structure.scanned_weak_reference_slots,
-        );
-        pos += write_str(buf, pos, b"/");
-        pos += write_usize(
-            buf,
-            pos,
-            audit.managed_structure.scanned_stale_weak_reference_slots,
-        );
-    } else {
-        pos += write_str(buf, pos, b"skip");
-    }
     pos += write_str(buf, pos, b" slab=");
     pos += write_u64(buf, pos, audit.slab_active_objects);
     pos += write_str(buf, pos, b"/");
@@ -1098,83 +956,8 @@ fn format_diagnostic_inner(
     pos += write_u64(buf, pos, audit.kheap_active_allocs);
     pos += write_str(buf, pos, b"/");
     pos += write_usize(buf, pos, audit.kheap_live_records);
-    pos += write_str(buf, pos, b" managed=");
-    pos += write_u64(buf, pos, audit.managed_active_objects);
-    pos += write_str(buf, pos, b"/");
-    pos += write_usize(buf, pos, audit.managed_live_records);
-    pos += write_str(buf, pos, b"\nGC: enabled=");
-    pos += write_usize(buf, pos, layers.managed.enabled as usize);
-    pos += write_str(buf, pos, b" major=");
-    pos += write_u64(buf, pos, layers.managed.gc.major_gc_count);
-    pos += write_str(buf, pos, b" minor=");
-    pos += write_u64(buf, pos, layers.managed.gc.minor_gc_count);
-    pos += write_str(buf, pos, b" phase=");
-    pos += write_str(
-        buf,
-        pos,
-        gc_phase_code(
-            layers
-                .managed
-                .gc_control
-                .map_or(GcPhase::Idle, |snapshot| snapshot.phase),
-        ),
-    );
-    pos += write_str(buf, pos, b" kind=");
-    pos += write_str(
-        buf,
-        pos,
-        gc_kind_name(layers.managed.gc.last_collection_kind),
-    );
-    pos += write_str(buf, pos, b" objects=");
-    pos += write_usize(buf, pos, layers.managed.gc.object_table_entries);
-    pos += write_str(buf, pos, b"/");
-    pos += write_usize(buf, pos, layers.managed.gc.object_table_capacity);
-    pos += write_str(buf, pos, b" y/o=");
-    pos += write_u64(buf, pos, layers.managed.gc.young_gen_objects);
-    pos += write_str(buf, pos, b"/");
-    pos += write_u64(buf, pos, layers.managed.gc.old_gen_objects);
-    pos += write_str(buf, pos, b" wb=");
-    pos += write_u64(buf, pos, layers.managed.gc.write_barrier_count);
-    pos += write_str(buf, pos, b" cards=");
-    pos += write_usize(buf, pos, layers.managed.gc.dirty_cards);
-    pos += write_str(buf, pos, b" rem=");
-    pos += write_usize(buf, pos, layers.managed.gc.remembered_objects);
-    pos += write_str(buf, pos, b" inc=");
-    pos += write_u64(buf, pos, layers.managed.gc.incremental_mark_steps);
-    pos += write_str(buf, pos, b" moved=");
-    pos += write_u64(buf, pos, layers.managed.gc.objects_compacted);
-    pos += write_str(buf, pos, b" handles=");
-    pos += write_usize(buf, pos, layers.managed.gc.strong_handle_slots);
-    pos += write_str(buf, pos, b"/");
-    pos += write_usize(buf, pos, layers.managed.gc.weak_handle_slots);
-    pos += write_str(buf, pos, b"/");
-    pos += write_usize(buf, pos, layers.managed.gc.pinned_handle_slots);
-    pos += write_str(buf, pos, b" pending_fin=");
-    pos += write_usize(buf, pos, layers.managed.gc.pending_finalizers);
     pos += write_str(buf, pos, b"\n");
     pos.min(buf.len())
-}
-
-fn gc_phase_code(phase: GcPhase) -> &'static [u8] {
-    match phase {
-        GcPhase::Idle => b"idle",
-        GcPhase::RootScan => b"roots",
-        GcPhase::InitialMark => b"init",
-        GcPhase::MarkPropagate => b"mark",
-        GcPhase::Remark => b"remark",
-        GcPhase::Sweep => b"sweep",
-        GcPhase::Compact => b"compact",
-        GcPhase::Finalize => b"fin",
-    }
-}
-
-fn gc_kind_name(kind: GcCollectionKind) -> &'static [u8] {
-    match kind {
-        GcCollectionKind::None => b"none",
-        GcCollectionKind::IncrementalMark => b"inc",
-        GcCollectionKind::Minor => b"minor",
-        GcCollectionKind::Major => b"major",
-    }
 }
 
 fn write_str(buf: &mut [u8], pos: usize, s: &[u8]) -> usize {

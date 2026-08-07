@@ -10,7 +10,6 @@
 //! - `vmem` / `space` 管理虚拟地址区间与映射协调；
 //! - `slab` 处理高频小对象；
 //! - `kheap` 处理大对象与页级对齐分配；
-//! - `managed` / `gc` 为受管对象提供可选的自动回收能力；
 //! - `registry` / `metadata` 负责内部记账与自举支持。
 //!
 //! 因为它是分层系统，所以这里最重要的不是某一个算法，而是层之间的调用顺序、
@@ -20,9 +19,8 @@
 //! TODO(alloc-stabilization): 本轮收口后仍需继续完成以下事项：
 //! 1. 把 `loongarch64-unknown-none` QEMU allocator-bench 的关键 ns/op 数据纳入持续
 //!    回归，避免后续优化只看单次日志；
-//! 2. 为 managed GC 增加 stop-the-world 引用图验证，补齐对象字段级一致性检查；
-//! 3. 引入多核压力测试，验证 registry shard、slab per-CPU cache 和回收路径无竞态；
-//! 4. 评估 NUMA/per-CPU page cache、自定义 arena/policy 注册等扩展 API 是否需要进入
+//! 2. 引入多核压力测试，验证 registry shard、slab per-CPU cache 和回收路径无竞态；
+//! 3. 评估 NUMA/per-CPU page cache、自定义 arena/policy 注册等扩展 API 是否需要进入
 //!    对外稳定接口。
 //!
 //! # 锁顺序 (Lock Ordering)
@@ -30,15 +28,13 @@
 //! 为防止死锁，必须严格按照以下顺序获取锁：
 //!
 //! 1. `init_lock` — 初始化专用，正常运行期间绝不持有
-//! 2. `vmem` arena 锁 (direct_map, kernel, managed) — 虚拟地址空间
+//! 2. `vmem` arena 锁 (direct_map, kernel) — 虚拟地址空间
 //! 3. `metadata.inner` — 元数据分配器状态
 //! 4. `phys` (BuddyAllocator) — 物理内存分配器
 //! 5. `registry.shard.inner` — 分片分配注册表
 //! 6. `slab.state` — Slab 分配器状态
 //! 7. `slab.cache.inner` — Per-CPU 缓存
 //! 8. `kheap.inner` — 大对象分配器
-//! 9. `managed.gc` — 垃圾回收器
-//! 10. `managed.exact_root_registry` — 动态精确根槽注册表
 //!
 //! ## 关键规则
 //!
@@ -85,11 +81,9 @@ mod buddy;
 #[path = "kernel_symbols.rs"]
 mod direct_symbols;
 mod error;
-mod gc;
 #[doc(hidden)]
 pub use direct_symbols::catalog_anchor as kernel_symbol_catalog_anchor;
 mod kheap;
-mod managed;
 mod metadata;
 mod registry;
 mod request;
@@ -150,7 +144,6 @@ static OWNED_ALLOCATION_LOCKS: [Mutex<()>; OWNED_ALLOCATION_LOCK_COUNT] =
 use boot::BootAllocator;
 use buddy::BuddyAllocator;
 use kheap::KernelHeap;
-use managed::ManagedAllocator as ManagedRuntime;
 use metadata::MetadataAllocator;
 use registry::AllocationRegistry;
 use slab::SlabAllocator;
@@ -160,22 +153,12 @@ pub use buddy::{
     BuddyAuditFlags, BuddyReclaimStats, BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
 };
 pub use error::{
-    AddressSpaceError, AllocationError, DeallocationError, InitError, ManagedHandleError,
-    OwnedAllocationError, OwnershipError, PhysicalFreeError, RegistryError, VmemError,
-};
-pub use gc::{
-    FinalizerFn, GcCell, GcCollectionKind, GcControlSnapshot, GcHandle, GcMode, GcObjectHeader,
-    GcPhase, GcRef, GcRefSlot, GcRootFrame, GcRootHandle, GcStats, GcWeakHandle, GcWeakRef,
-    GcWeakRefSlot, RootType, TRACE_FLAG_HAS_FINALIZER, TRACE_FLAG_HAS_WEAK_REFS,
-    TRACE_FLAG_PINNED_LAYOUT, TraceDescriptor,
+    AddressSpaceError, AllocationError, DeallocationError, InitError, OwnedAllocationError,
+    OwnershipError, PhysicalFreeError, RegistryError, VmemError,
 };
 pub use kheap::{
     KernelHeap as LargeObjectAllocator, KernelHeapAudit, KernelHeapAuditFlags,
     KernelHeapReclaimStats, KernelHeapStats,
-};
-pub use managed::{
-    DEFAULT_MANAGED_HEAP_ORDER, ExactRootProviderFn, LARGE_MANAGED_HEAP_ORDER, ManagedAllocator,
-    ManagedAudit, ManagedAuditFlags, ManagedFailurePolicy, ManagedHeapConfig, ManagedStats,
 };
 pub use metadata::MetadataStats;
 pub use registry::{
@@ -183,9 +166,9 @@ pub use registry::{
     AllocationRegistrySnapshot, AllocationRegistryStats,
 };
 pub use request::{
-    AllocationArena, AllocationKind, AllocationRecord, AllocationRequestError, ManagedAllocFlags,
-    MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest,
-    PhysicalAllocation, ReclaimPolicy, Zeroing,
+    AllocationArena, AllocationKind, AllocationRecord, AllocationRequestError, MemoryDomain,
+    MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest, PhysicalAllocation,
+    ReclaimPolicy, Zeroing,
 };
 #[cfg(feature = "performance-profile")]
 pub use slab::SlabProfileCounter;
@@ -209,9 +192,6 @@ pub type PhysToVirtFn = fn(paddr: usize) -> usize;
 pub type VirtToPhysFn = fn(vaddr: usize) -> usize;
 pub type CpuIdFn = fn() -> usize;
 pub type UrgentPollFn = fn();
-pub type GcEnterCriticalFn = fn() -> usize;
-pub type GcLeaveCriticalFn = fn(state: usize);
-pub type ManagedGcMoveCallbackFn = fn(old_ptr: usize, new_record: AllocationRecord) -> bool;
 pub type KernelHeapRegionFn = fn() -> (usize, usize);
 pub type MapKernelHeapRangeFn =
     fn(vaddr: usize, paddr: usize, size: usize, page_policy: PagePolicy) -> bool;
@@ -297,9 +277,6 @@ pub struct AllocStats {
     pub vmem_used_bytes: usize,
     pub active_small_allocs: u64,
     pub active_large_allocs: u64,
-    pub active_managed_allocs: u64,
-    pub active_managed_bytes: usize,
-    pub managed_enabled: bool,
 }
 
 pub struct KernelMemorySubsystem {
@@ -308,7 +285,6 @@ pub struct KernelMemorySubsystem {
     vmem: KernelAddressSpace,
     kheap: KernelHeap,
     slab: SlabAllocator,
-    managed: ManagedRuntime,
     metadata: MetadataAllocator,
     registry: AllocationRegistry,
     init_lock: Mutex<()>,
@@ -326,7 +302,6 @@ pub struct KernelMemorySubsystem {
     total_bytes_freed: AtomicU64,
     oom_count: AtomicU64,
     ownership_failures: AtomicU64,
-    managed_growth_order: AtomicUsize,
 }
 
 pub type KernelAllocator = KernelMemorySubsystem;
@@ -426,7 +401,6 @@ impl KernelMemorySubsystem {
             vmem: KernelAddressSpace::new(),
             kheap: KernelHeap::new(),
             slab: SlabAllocator::new(),
-            managed: ManagedRuntime::new(),
             metadata: MetadataAllocator::new(),
             registry: AllocationRegistry::new(),
             init_lock: Mutex::new(()),
@@ -444,7 +418,6 @@ impl KernelMemorySubsystem {
             total_bytes_freed: AtomicU64::new(0),
             oom_count: AtomicU64::new(0),
             ownership_failures: AtomicU64::new(0),
-            managed_growth_order: AtomicUsize::new(DEFAULT_MANAGED_HEAP_ORDER),
         }
     }
 
@@ -495,26 +468,6 @@ impl KernelMemorySubsystem {
                 );
             }
         }
-    }
-
-    pub fn bind_gc_critical_section(&self, enter: GcEnterCriticalFn, leave: GcLeaveCriticalFn) {
-        self.managed.bind_gc_critical_section(enter, leave);
-    }
-
-    pub fn register_gc_exact_root_slot(
-        &self,
-        slot: &'static AtomicUsize,
-        root_type: RootType,
-    ) -> bool {
-        self.managed.register_exact_root_slot(slot, root_type)
-    }
-
-    pub fn unregister_gc_exact_root_slot(&self, slot: &'static AtomicUsize) -> bool {
-        self.managed.unregister_exact_root_slot(slot)
-    }
-
-    pub fn bind_gc_exact_root_provider(&self, provider: ExactRootProviderFn) {
-        self.managed.register_exact_root_provider(provider);
     }
 
     pub fn bind_kernel_heap_ops(
@@ -617,117 +570,6 @@ impl KernelMemorySubsystem {
         self.slab.init(cpu_count);
     }
 
-    pub fn init_managed(
-        &self,
-        order: usize,
-        mode: GcMode,
-        free_callback: fn(ptr: usize, size: usize),
-        timestamp_ns: Option<fn() -> u64>,
-    ) -> Result<BackedRange, InitError> {
-        let _guard = self.init_lock.lock();
-        self.init_managed_locked(ManagedHeapConfig {
-            order,
-            mode,
-            failure_policy: ManagedFailurePolicy::ReturnError,
-            external_free_callback: Some(free_callback),
-            timestamp_ns,
-        })
-    }
-
-    pub fn init_managed_with_config(
-        &self,
-        config: ManagedHeapConfig,
-    ) -> Result<BackedRange, InitError> {
-        let _guard = self.init_lock.lock();
-        self.init_managed_locked(config)
-    }
-
-    fn init_managed_locked(&self, config: ManagedHeapConfig) -> Result<BackedRange, InitError> {
-        if self.managed.is_enabled() {
-            return Err(InitError::ManagedAlreadyInitialized);
-        }
-        let mode = config.mode;
-
-        let range = self
-            .vmem
-            .init_managed_heap(config.order, &self.phys)
-            .map_err(|err| match err {
-                AddressSpaceError::ManagedUnavailable => InitError::ManagedAlreadyInitialized,
-                _ => InitError::ManagedRegionUnavailable,
-            })?;
-
-        self.managed.init(
-            range.vaddr,
-            range.size,
-            mode,
-            &self.vmem as *const KernelAddressSpace,
-            managed_gc_reclaim,
-            config.external_free_callback,
-            config.timestamp_ns,
-        );
-        self.managed.bind_relocation_observer(managed_gc_retarget);
-        self.managed_growth_order
-            .store(config.order, Ordering::Release);
-        log::info!(
-            "[alloc][managed] default heap enabled base={:#x} size={} order={} mode={:?} failure_policy={:?}",
-            range.vaddr,
-            range.size,
-            config.order,
-            mode,
-            config.failure_policy,
-        );
-        Ok(range)
-    }
-
-    fn grow_managed_locked(&self, order: usize) -> Result<BackedRange, InitError> {
-        let managed = self.managed.stats();
-        let expected_base = managed.heap_start.saturating_add(managed.heap_size);
-        let range = self
-            .vmem
-            .grow_managed_heap_contiguous(expected_base, order, &self.phys)
-            .map_err(|err| match err {
-                AddressSpaceError::MetadataOutOfMemory => InitError::MetadataOutOfMemory,
-                _ => InitError::ManagedRegionUnavailable,
-            })?;
-        if !self.managed.extend_heap_contiguous(range.vaddr, range.size) {
-            panic!(
-                "[alloc][managed][invariant] heap growth not contiguous base={:#x} size={}",
-                range.vaddr, range.size,
-            );
-        }
-        log::info!(
-            "[alloc][managed] heap expanded base={:#x} size={} order={}",
-            range.vaddr,
-            range.size,
-            order,
-        );
-        Ok(range)
-    }
-
-    fn maybe_grow_managed(&self) -> Result<(), InitError> {
-        if !self.managed.is_enabled() {
-            return self.ensure_default_managed();
-        }
-
-        let _guard = self.init_lock.lock();
-        if !self.managed.is_enabled() {
-            return self.ensure_default_managed();
-        }
-
-        let order = self.managed_growth_order.load(Ordering::Acquire);
-        self.grow_managed_locked(order).map(|_| ())
-    }
-
-    pub fn init_gc(
-        &self,
-        order: usize,
-        mode: GcMode,
-        free_callback: fn(ptr: usize, size: usize),
-        timestamp_ns: Option<fn() -> u64>,
-    ) -> Result<BackedRange, InitError> {
-        self.init_managed(order, mode, free_callback, timestamp_ns)
-    }
-
     pub fn activate_global(&self) -> Result<(), InitError> {
         let _guard = self.init_lock.lock();
         if !self.boot.is_initialized() {
@@ -802,7 +644,7 @@ impl KernelMemorySubsystem {
     /// 返回 allocator 对外稳定能力快照。
     ///
     /// 该接口不扫描内部结构、不分配内存，适合 LKM/外部子系统在初始化时判断当前内核是否
-    /// 支持 typed physical API、结构审计、cache reclaim、managed GC 等能力。功能新增时
+    /// 支持 typed physical API、结构审计、cache reclaim 等能力。功能新增时
     /// 应增加 capability bit；破坏性 ABI 变化才递增 [`ALLOCATOR_API_VERSION`]。
     pub fn capabilities(&self) -> AllocatorCapabilities {
         AllocatorCapabilities {
@@ -811,9 +653,6 @@ impl KernelMemorySubsystem {
             max_small_size: MAX_SMALL_SIZE,
             max_cpus: MAX_CPUS,
             page_size: PAGE_SIZE,
-            default_managed_heap_order: DEFAULT_MANAGED_HEAP_ORDER,
-            large_managed_heap_order: LARGE_MANAGED_HEAP_ORDER,
-            managed_enabled: self.managed.is_enabled(),
         }
     }
 
@@ -822,7 +661,6 @@ impl KernelMemorySubsystem {
         let address_space = self.vmem.snapshot();
         let slab = self.slab.snapshot();
         let kheap = self.kheap.snapshot();
-        let managed = self.managed.stats();
         AllocStats {
             total_allocs: self.total_allocs.load(Ordering::Acquire),
             total_deallocs: self.total_deallocs.load(Ordering::Acquire),
@@ -835,9 +673,6 @@ impl KernelMemorySubsystem {
             vmem_used_bytes: address_space.kernel.allocated_size,
             active_small_allocs: slab.active_objects,
             active_large_allocs: kheap.active_allocs,
-            active_managed_allocs: managed.active_objects,
-            active_managed_bytes: managed.active_bytes,
-            managed_enabled: managed.enabled,
         }
     }
 
@@ -847,8 +682,7 @@ impl KernelMemorySubsystem {
         let address_space = self.address_space_stats();
         let kheap = self.kheap.snapshot();
         let slab = self.slab.snapshot();
-        let managed = self.managed.stats();
-        stats::build_overview(boot, phys, address_space, kheap, slab, managed)
+        stats::build_overview(boot, phys, address_space, kheap, slab)
     }
 
     pub fn layer_stats(&self) -> stats::AllocatorLayerStats {
@@ -874,7 +708,6 @@ impl KernelMemorySubsystem {
             slab: self.slab.snapshot(),
             metadata: self.metadata.stats(),
             registry,
-            managed: self.managed.stats(),
         }
     }
 
@@ -917,7 +750,6 @@ impl KernelMemorySubsystem {
                 let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
                 let slab_audit = self.slab.audit();
                 let kheap_audit = self.kheap.audit();
-                let managed_audit = self.managed.audit();
                 stats::format_diagnostic(
                     buf,
                     &overview,
@@ -926,7 +758,6 @@ impl KernelMemorySubsystem {
                     &phys_snapshot.audit,
                     &slab_audit,
                     &kheap_audit,
-                    &managed_audit,
                 )
             }
             AllocatorAuditScope::CountersOnly => {
@@ -950,7 +781,7 @@ impl KernelMemorySubsystem {
     /// 返回 allocator 分层账本的一致性审计快照。
     ///
     /// 这个接口只读取统计信息，不扫描对象内容，也不会修复状态；它用于测试、benchmark 和
-    /// 故障日志确认 registry 与 slab/kheap/managed 等后端的计数是否仍然一致。并发运行时
+    /// 故障日志确认 registry 与 slab/kheap 等后端的计数是否仍然一致。并发运行时
     /// 可能观察到短暂中间态，严格断言应在没有其它 CPU 同时 alloc/free 的自检阶段执行。
     pub fn audit(&self) -> AllocatorAudit {
         self.audit_with_scope(AllocatorAuditScope::FullRegistry)
@@ -971,14 +802,12 @@ impl KernelMemorySubsystem {
                 );
                 let slab_audit = self.slab.audit();
                 let kheap_audit = self.kheap.audit();
-                let managed_audit = self.managed.audit();
                 stats::build_audit_with_structures(
                     &layers,
                     registry_snapshot.audit,
                     phys_snapshot.audit,
                     slab_audit,
                     kheap_audit,
-                    managed_audit,
                 )
             }
             AllocatorAuditScope::CountersOnly => {
@@ -1016,14 +845,6 @@ impl KernelMemorySubsystem {
     /// 没有错阶、坏槽位或统计漂移。
     pub fn kheap_audit(&self) -> KernelHeapAudit {
         self.kheap.audit()
-    }
-
-    /// 返回 managed/GC 对象表、句柄表、根表和卡表的一致性审计结果。
-    ///
-    /// 该接口只做保守结构扫描，不递归追踪对象字段引用图；完整图校验需要未来在
-    /// stop-the-world 安全点内加入 fault-safe 字段读取。
-    pub fn managed_audit(&self) -> ManagedAudit {
-        self.managed.audit()
     }
 
     pub fn reclaim(
@@ -1073,10 +894,6 @@ impl KernelMemorySubsystem {
 
     pub fn large_allocator(&self) -> &KernelHeap {
         &self.kheap
-    }
-
-    pub fn managed_allocator(&self) -> &ManagedRuntime {
-        &self.managed
     }
 
     pub fn buddy_stats(&self) -> BuddyStats {
@@ -1132,10 +949,6 @@ impl KernelMemorySubsystem {
 
     pub fn metadata_stats(&self) -> MetadataStats {
         self.metadata.stats()
-    }
-
-    pub fn managed_stats(&self) -> ManagedStats {
-        self.managed.stats()
     }
 
     pub fn allocate_physical(
@@ -1367,25 +1180,9 @@ impl KernelMemorySubsystem {
         if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
             match request.reclaim {
                 ReclaimPolicy::NoReclaim => {}
-                ReclaimPolicy::TryManagedGc => {
-                    if self.managed.is_enabled() {
-                        let pressure = self.pressure_level();
-                        self.managed.collect_on_pressure(pressure);
-                        allocation = self.allocate_active_once(request);
-                    }
-                }
                 ReclaimPolicy::TryAllocatorReclaim => {
-                    let reclaimed = self.reclaim_allocator_caches_for_retry();
-                    if reclaimed.reclaimed_bytes() != 0 && self.managed.is_enabled() {
-                        let pressure = self.pressure_level();
-                        self.managed.collect_on_pressure(pressure);
-                    }
+                    self.reclaim_allocator_caches_for_retry();
                     allocation = self.allocate_active_once(request);
-                    if allocation.is_err() && self.managed.is_enabled() {
-                        let pressure = self.pressure_level();
-                        self.managed.collect_on_pressure(pressure);
-                        allocation = self.allocate_active_once(request);
-                    }
                 }
             }
         }
@@ -1394,33 +1191,6 @@ impl KernelMemorySubsystem {
             Err(err) => {
                 release_accounting(accounting_owner, request.size);
                 Err(err)
-            }
-        }
-    }
-
-    pub fn allocate_managed(
-        &self,
-        layout: Layout,
-        flags: ManagedAllocFlags,
-    ) -> Result<AllocationRecord, AllocationError> {
-        self.allocate(
-            MemoryRequest::for_managed_layout(layout)
-                .with_managed_flags(flags)
-                .with_zeroing(Zeroing::Zeroed),
-        )
-    }
-
-    pub fn allocate_managed_handle(
-        &self,
-        layout: Layout,
-        flags: ManagedAllocFlags,
-    ) -> Result<GcHandle, AllocationError> {
-        let record = self.allocate_managed(layout, flags)?;
-        match self.managed.create_handle(record.ptr) {
-            Some(handle) => Ok(handle),
-            None => {
-                let _ = self.deallocate(record.ptr);
-                Err(AllocationError::OutOfMemory)
             }
         }
     }
@@ -1731,23 +1501,6 @@ impl KernelMemorySubsystem {
                 }
                 Ok(())
             }
-            AllocationKind::Managed => {
-                match self.managed.free(ptr, &self.vmem) {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        // managed 对象可能因为仍有强句柄或根引用而拒绝释放。此时对象实际
-                        // 仍然存活，registry 账本必须回滚，否则后续句柄释放后会变成悬空对象。
-                        if let Err(rollback_err) = self.registry.register_result(&self.boot, record)
-                        {
-                            panic!(
-                                "[alloc][invariant] managed deallocate rollback failed: ptr={:#x} err={:?} rollback={:?}",
-                                ptr, err, rollback_err
-                            );
-                        }
-                        Err(err)
-                    }
-                }
-            }
             AllocationKind::Physical => {
                 let allocation = physical_allocation_from_record(record);
                 match self.try_free_physical_raw(allocation) {
@@ -1768,8 +1521,8 @@ impl KernelMemorySubsystem {
     /// 调整一个普通内核分配的大小，并返回更新后的分配记录。
     ///
     /// 这是给内核其它子系统使用的安全 resize API。它只支持 `Kernel` 域中由
-    /// slab/kheap 管理的对象；受管对象迁移必须走 GC 句柄语义，物理页也应使用
-    /// `allocate_physical/free_physical` 明确表达所有权。
+    /// slab/kheap 管理的对象；物理页应使用 `allocate_physical/free_physical` 明确表达
+    /// 所有权。
     ///
     /// 和 `GlobalAlloc::realloc` 不同，这里不要求调用方提供旧 `Layout`，复制长度
     /// 直接来自 allocator 注册表中的真实记录，避免外部 API 误传旧尺寸导致越界复制。
@@ -1981,43 +1734,6 @@ impl KernelMemorySubsystem {
                     alloc_large()
                 }
             }
-            MemoryDomain::Managed => {
-                if let Err(err) = self.ensure_default_managed() {
-                    return Err(match err {
-                        InitError::MetadataOutOfMemory | InitError::ManagedRegionUnavailable => {
-                            AllocationError::OutOfMemory
-                        }
-                        _ => AllocationError::NotInitialized,
-                    });
-                }
-                let layout = request.layout()?;
-                let record =
-                    match self
-                        .managed
-                        .alloc(layout, &self.vmem, request.managed, request.zeroing)
-                    {
-                        Ok(record) => record,
-                        Err(AllocationError::AddressSpace(
-                            AddressSpaceError::OutOfVirtualAddressSpace,
-                        )) => {
-                            if self.maybe_grow_managed().is_err() {
-                                return Err(AllocationError::OutOfMemory);
-                            }
-                            self.managed.alloc(
-                                layout,
-                                &self.vmem,
-                                request.managed,
-                                request.zeroing,
-                            )?
-                        }
-                        Err(err) => return Err(err),
-                    }
-                    .with_accounting_owner(request.accounting_owner().unwrap_or(0));
-                self.register_allocation(record, || {
-                    let _ = self.managed.free(record.ptr, &self.vmem);
-                })?;
-                Ok(record)
-            }
             MemoryDomain::Physical => {
                 let physical_request = PhysicalAllocRequest::new(request.size, request.align)
                     .with_page_policy(request.page_policy)
@@ -2064,100 +1780,6 @@ impl KernelMemorySubsystem {
             Some(f) => f(),
             None => 0,
         }
-    }
-
-    fn reclaim_managed_from_gc(&self, header_addr: usize, _size: usize) {
-        if let Some(ptr) = self.managed.reclaim_from_gc(header_addr, &self.vmem) {
-            if let Some(record) = self.registry.remove(ptr) {
-                release_accounting(record.accounting_owner(), record.size);
-            }
-        }
-    }
-
-    fn retarget_managed_registry(&self, old_ptr: usize, mut new_record: AllocationRecord) -> bool {
-        if old_ptr == 0 || new_record.ptr == 0 {
-            return false;
-        }
-        if old_ptr == new_record.ptr {
-            let Ok(old_record) = self.registry.get_result(old_ptr) else {
-                return false;
-            };
-            if !try_resize_accounting(
-                old_record.accounting_owner(),
-                old_record.size,
-                new_record.size,
-            ) {
-                return false;
-            }
-            new_record = new_record.with_accounting_owner(old_record.accounting_owner());
-            if self
-                .registry
-                .update_existing_result(old_ptr, new_record)
-                .is_ok()
-            {
-                return true;
-            }
-            let _ = try_resize_accounting(
-                old_record.accounting_owner(),
-                new_record.size,
-                old_record.size,
-            );
-            return false;
-        }
-
-        let old_record = match self.registry.remove_result(old_ptr) {
-            Ok(record) => record,
-            Err(_) => return false,
-        };
-
-        if !try_resize_accounting(
-            old_record.accounting_owner(),
-            old_record.size,
-            new_record.size,
-        ) {
-            let _ = self.registry.register_result(&self.boot, old_record);
-            return false;
-        }
-        #[cfg(feature = "track-allocations")]
-        {
-            new_record = new_record.with_accounting_owner(old_record.accounting_owner());
-            let result = match self.registry.get_result(new_record.ptr) {
-                Ok(_) => self
-                    .registry
-                    .update_existing_result(new_record.ptr, new_record),
-                Err(RegistryError::UnknownPointer) => {
-                    self.registry.register_result(&self.boot, new_record)
-                }
-                Err(err) => Err(err),
-            };
-            return match result {
-                Ok(()) => true,
-                Err(_) => {
-                    let _ = try_resize_accounting(
-                        old_record.accounting_owner(),
-                        new_record.size,
-                        old_record.size,
-                    );
-                    let _ = self.registry.register_result(&self.boot, old_record);
-                    false
-                }
-            };
-        }
-        true
-    }
-
-    fn ensure_default_managed(&self) -> Result<(), InitError> {
-        if self.managed.is_enabled() {
-            return Ok(());
-        }
-
-        let _guard = self.init_lock.lock();
-        if self.managed.is_enabled() {
-            return Ok(());
-        }
-
-        let config = ManagedHeapConfig::default_kernel();
-        self.init_managed_locked(config).map(|_| ())
     }
 
     fn allocate_internal_metadata(&self, layout: Layout) -> *mut u8 {
@@ -2253,7 +1875,6 @@ impl KernelMemorySubsystem {
             AllocationKind::Large => {
                 !is_small(new_layout) && KernelHeap::required_order_for(new_layout) == record.order
             }
-            AllocationKind::Managed => false,
             AllocationKind::Boot | AllocationKind::Physical => false,
         }
     }
@@ -2381,24 +2002,6 @@ impl KernelMemorySubsystem {
                 Ok(())
             }
             Err(RegistryError::DuplicatePointer) => {
-                // 防御性清理：若旧记录对应的对象已不在 GC 对象表中，可安全移除
-                let can_remove = match record.kind {
-                    AllocationKind::Managed => {
-                        let gc = self.managed.gc.lock();
-                        gc.find_object_by_object_addr(record.ptr).is_none()
-                    }
-                    _ => false,
-                };
-                if can_remove {
-                    if let Some(stale) = self.registry.remove(record.ptr) {
-                        release_accounting(stale.accounting_owner(), stale.size);
-                    }
-                    // 重试插入
-                    if self.registry.register_result(&self.boot, record).is_ok() {
-                        return Ok(());
-                    }
-                }
-                // 无法清除则回滚
                 rollback();
                 Err(allocation_error_from_registry(
                     RegistryError::DuplicatePointer,
@@ -2526,14 +2129,6 @@ fn realloc_copy_source_size(record: AllocationRecord, fallback_layout_size: usiz
     } else {
         record.size
     }
-}
-
-fn managed_gc_reclaim(ptr: usize, size: usize) {
-    KERNEL_ALLOCATOR.reclaim_managed_from_gc(ptr, size);
-}
-
-fn managed_gc_retarget(old_ptr: usize, new_record: AllocationRecord) -> bool {
-    KERNEL_ALLOCATOR.retarget_managed_registry(old_ptr, new_record)
 }
 
 pub(crate) fn alloc_internal_metadata(layout: Layout) -> *mut u8 {
@@ -2693,7 +2288,7 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
                     });
                     self.record_global_dealloc_stats(layout);
                 }
-                AllocationKind::Managed | AllocationKind::Physical => {
+                AllocationKind::Physical => {
                     self.record_ownership_failure();
                     unsafe { self.dealloc(new_ptr, new_layout) };
                     return null_mut();

@@ -8,8 +8,6 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use crate::boot::BootAllocator;
 use crate::buddy::{DEFERRED_ORDER0_COALESCE_TARGET, DEFERRED_ORDER0_MIN_FREE_PERCENT};
-use crate::error::DeallocationError;
-use crate::gc::GcObjectHeader;
 use crate::registry::AllocationRegistry;
 use crate::request::{
     AllocationKind, AllocationRecord, MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy,
@@ -17,36 +15,17 @@ use crate::request::{
 };
 use crate::{
     ALLOCATOR_API_VERSION, AllocationError, AllocationRegistryAuditFlags, AllocatorAuditFlags,
-    AllocatorAuditScope, AllocatorCapabilityFlags, AllocatorReclaimRequest, BuddyAuditFlags, GcRef,
-    GcRefSlot, GcWeakRef, GcWeakRefSlot, KERNEL_ALLOCATOR, KernelHeapAuditFlags, ManagedAllocFlags,
-    ManagedAuditFlags, PAGE_SIZE, PhysicalAllocation, PhysicalFreeError, SlabAuditFlags,
-    TraceDescriptor,
+    AllocatorAuditScope, AllocatorCapabilityFlags, AllocatorReclaimRequest, BuddyAuditFlags,
+    KERNEL_ALLOCATOR, KernelHeapAuditFlags, PAGE_SIZE, PhysicalAllocation, PhysicalFreeError,
+    SlabAuditFlags,
 };
 use ktest::ktest;
 
-#[allow(dead_code)]
-#[repr(C)]
-struct ManagedAuditLeaf {
-    word: usize,
-}
-
-#[allow(dead_code)]
-#[repr(C)]
-struct ManagedAuditNode {
-    strong: GcRef<ManagedAuditLeaf>,
-    weak: GcWeakRef<ManagedAuditLeaf>,
-}
-
-const MANAGED_AUDIT_STRONG_OFFSET: usize = 0;
-const MANAGED_AUDIT_WEAK_OFFSET: usize = core::mem::size_of::<GcRef<ManagedAuditLeaf>>();
-static MANAGED_AUDIT_STRONG_OFFSETS: [usize; 1] = [MANAGED_AUDIT_STRONG_OFFSET];
-static MANAGED_AUDIT_WEAK_OFFSETS: [usize; 1] = [MANAGED_AUDIT_WEAK_OFFSET];
-static MANAGED_AUDIT_NODE_DESCRIPTOR: TraceDescriptor = TraceDescriptor::exact_layout(
-    core::mem::size_of::<ManagedAuditNode>(),
-    core::mem::align_of::<ManagedAuditNode>(),
-    &MANAGED_AUDIT_STRONG_OFFSETS,
-)
-.with_weak_references(&MANAGED_AUDIT_WEAK_OFFSETS);
+const _: () = assert!(
+    AllocatorCapabilityFlags::stable_kernel().bits()
+        & ((1 << 8) | (1 << 9) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15))
+        == 0
+);
 
 /// 分配 8 字节小对象，验证指针非空且走 slab 路径。
 #[ktest]
@@ -1087,8 +1066,6 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     assert_eq!(before.slab_structure.flags, SlabAuditFlags::empty());
     assert!(before.kheap_structure_scanned);
     assert_eq!(before.kheap_structure.flags, KernelHeapAuditFlags::empty());
-    assert!(before.managed_structure_scanned);
-    assert_eq!(before.managed_structure.flags, ManagedAuditFlags::empty());
     assert_eq!(
         before.slab_structure.scanned_active_objects,
         before.slab_active_objects
@@ -1111,7 +1088,6 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     assert!(during.phys_structure_scanned);
     assert!(during.slab_structure_scanned);
     assert!(during.kheap_structure_scanned);
-    assert!(during.managed_structure_scanned);
     assert_eq!(
         during.registry_structure.scanned_live_records,
         during.registry_live_records
@@ -1176,16 +1152,7 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     );
     assert_eq!(during.slab_structure.flags, SlabAuditFlags::empty());
     assert_eq!(during.kheap_structure.flags, KernelHeapAuditFlags::empty());
-    assert_eq!(during.managed_structure.flags, ManagedAuditFlags::empty());
     assert_eq!(during.kheap_active_bytes, during.kheap_page_bytes);
-    assert_eq!(
-        during.managed_structure.scanned_active_objects,
-        during.managed_active_objects
-    );
-    assert_eq!(
-        during.managed_structure.scanned_active_bytes,
-        KERNEL_ALLOCATOR.managed_stats().active_bytes
-    );
 
     KERNEL_ALLOCATOR
         .deallocate(small.ptr)
@@ -1200,7 +1167,6 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     assert!(after.phys_structure_scanned);
     assert!(after.slab_structure_scanned);
     assert!(after.kheap_structure_scanned);
-    assert!(after.managed_structure_scanned);
     assert_eq!(after.registry_live_records, before.registry_live_records);
     assert_eq!(after.slab_active_objects, before.slab_active_objects);
     assert_eq!(after.slab_live_records, before.slab_live_records);
@@ -1222,7 +1188,6 @@ fn allocator_counter_audit_skips_registry_scan() {
     assert!(full.phys_structure_scanned);
     assert!(full.slab_structure_scanned);
     assert!(full.kheap_structure_scanned);
-    assert!(full.managed_structure_scanned);
 
     let counters = KERNEL_ALLOCATOR.audit_counters();
     assert!(counters.is_consistent());
@@ -1239,9 +1204,6 @@ fn allocator_counter_audit_skips_registry_scan() {
     assert!(!counters.kheap_structure_scanned);
     assert_eq!(counters.kheap_structure.flags.bits(), 0);
     assert_eq!(counters.kheap_structure.scanned_cached_ranges, 0);
-    assert!(!counters.managed_structure_scanned);
-    assert_eq!(counters.managed_structure.flags.bits(), 0);
-    assert_eq!(counters.managed_structure.scanned_active_objects, 0);
     assert_eq!(counters.registry_live_records, full.registry_live_records);
     assert_eq!(
         counters.registry_nodes_accounted,
@@ -1255,7 +1217,6 @@ fn allocator_counter_audit_skips_registry_scan() {
     assert!(scoped_full.phys_structure_scanned);
     assert!(scoped_full.slab_structure_scanned);
     assert!(scoped_full.kheap_structure_scanned);
-    assert!(scoped_full.managed_structure_scanned);
     assert_eq!(
         scoped_full.registry_live_records,
         full.registry_live_records
@@ -1278,8 +1239,6 @@ fn allocator_diagnostic_reports_audit_snapshot() {
     assert!(text.contains("phys_struct=0"));
     assert!(text.contains("slab_struct=0"));
     assert!(text.contains("kheap_struct=0"));
-    assert!(text.contains("managed_struct=0"));
-    assert!(text.contains("managed_refs=0/0/0"));
     assert!(text.contains("Hot: slab_hit="));
     assert!(text.contains("phys_split="));
     assert!(text.contains("phys_defer="));
@@ -1311,8 +1270,6 @@ fn allocator_counter_diagnostic_reports_skipped_scan() {
     assert!(text.contains("phys_struct=skip"));
     assert!(text.contains("slab_struct=skip"));
     assert!(text.contains("kheap_struct=skip"));
-    assert!(text.contains("managed_struct=skip"));
-    assert!(text.contains("managed_refs=skip"));
     assert!(text.contains("scan=skip"));
     assert!(text.contains("Hot: slab_hit="));
     assert!(text.contains("phys_meta="));
@@ -1357,7 +1314,6 @@ fn allocator_hotspot_summary_is_no_alloc_snapshot() {
     assert!(hot.kheap_failure_per_mille <= 1000);
     assert!(hot.kheap_realloc_per_mille <= 1000);
     assert!(hot.kernel_vmem_largest_free_percent <= 100);
-    assert!(hot.managed_fragmentation_per_mille <= 1000);
 
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
@@ -1384,204 +1340,19 @@ fn allocator_capabilities_report_stable_external_api() {
     assert!(caps.supports(AllocatorCapabilityFlags::BUDDY_STRUCTURE_AUDIT));
     assert!(caps.supports(AllocatorCapabilityFlags::SLAB_STRUCTURE_AUDIT));
     assert!(caps.supports(AllocatorCapabilityFlags::KHEAP_STRUCTURE_AUDIT));
-    assert!(caps.supports(AllocatorCapabilityFlags::MANAGED_STRUCTURE_AUDIT));
-    assert!(caps.supports(AllocatorCapabilityFlags::MANAGED_REFERENCE_AUDIT));
     assert!(caps.supports(AllocatorCapabilityFlags::CACHE_RECLAIM));
     assert!(caps.supports(AllocatorCapabilityFlags::HOTSPOT_SUMMARY));
-    assert!(caps.supports(AllocatorCapabilityFlags::MANAGED_GC));
-    assert!(caps.supports(AllocatorCapabilityFlags::RELOCATION_OBSERVER));
-    assert!(caps.supports(AllocatorCapabilityFlags::EXACT_ROOT_PROVIDER));
-    assert!(caps.supports(AllocatorCapabilityFlags::GC_CRITICAL_SECTION_HOOKS));
-    assert_eq!(
-        caps.managed_enabled,
-        KERNEL_ALLOCATOR.managed_stats().enabled
-    );
 
     let counter = KERNEL_ALLOCATOR.audit_counters();
     assert!(counter.is_consistent());
     assert!(!counter.registry_structure_scanned);
     let full = KERNEL_ALLOCATOR.audit();
     assert!(full.is_consistent());
-    assert!(full.managed_structure_scanned);
 
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
     assert_eq!(after.registry_live_records, before.registry_live_records);
     assert_eq!(after.registry_node_capacity, before.registry_node_capacity);
-}
-
-/// managed 对象拒绝释放时，registry 必须回滚，不能丢失活跃对象账本。
-#[ktest]
-fn managed_deallocate_failure_keeps_registry_record() {
-    let before = KERNEL_ALLOCATOR.audit();
-    assert!(before.is_consistent());
-
-    let layout = Layout::from_size_align(64, 8).expect("valid managed layout");
-    let handle = KERNEL_ALLOCATOR
-        .allocate_managed_handle(layout, ManagedAllocFlags::default())
-        .expect("allocate managed handle");
-    let ptr = KERNEL_ALLOCATOR
-        .managed_allocator()
-        .resolve_handle(&handle)
-        .expect("resolve managed handle");
-
-    assert_eq!(
-        KERNEL_ALLOCATOR.deallocate(ptr),
-        Err(DeallocationError::ObjectStillReferenced)
-    );
-    assert!(KERNEL_ALLOCATOR.owns_allocation(ptr));
-
-    let blocked = KERNEL_ALLOCATOR.audit();
-    assert!(blocked.is_consistent());
-    assert_eq!(
-        blocked.managed_active_objects,
-        before.managed_active_objects + 1
-    );
-    assert_eq!(
-        blocked.managed_live_records,
-        before.managed_live_records + 1
-    );
-    let managed_audit = KERNEL_ALLOCATOR.managed_audit();
-    assert!(managed_audit.is_consistent());
-    assert_eq!(managed_audit.flags, ManagedAuditFlags::empty());
-    assert_eq!(
-        managed_audit.scanned_active_objects,
-        blocked.managed_active_objects
-    );
-    assert_eq!(
-        managed_audit.scanned_active_bytes,
-        KERNEL_ALLOCATOR.managed_stats().active_bytes
-    );
-
-    KERNEL_ALLOCATOR.managed_allocator().release_handle(handle);
-    KERNEL_ALLOCATOR
-        .deallocate(ptr)
-        .expect("deallocate managed object after releasing handle");
-
-    let after = KERNEL_ALLOCATOR.audit();
-    assert!(after.is_consistent());
-    assert_eq!(after.managed_active_objects, before.managed_active_objects);
-    assert_eq!(after.managed_live_records, before.managed_live_records);
-}
-
-/// managed audit 应扫描精确 trace descriptor 中声明的强/弱引用字段。
-#[ktest]
-fn managed_audit_scans_typed_reference_slots() {
-    let before = KERNEL_ALLOCATOR.audit();
-    assert!(before.is_consistent());
-    let before_managed = KERNEL_ALLOCATOR.managed_audit();
-    assert!(before_managed.is_consistent());
-
-    let node = KERNEL_ALLOCATOR
-        .allocate_managed_handle(
-            Layout::new::<ManagedAuditNode>(),
-            ManagedAllocFlags::new().with_trace_descriptor(&MANAGED_AUDIT_NODE_DESCRIPTOR),
-        )
-        .expect("allocate managed reference node");
-    let strong_target = KERNEL_ALLOCATOR
-        .allocate_managed_handle(
-            Layout::new::<ManagedAuditLeaf>(),
-            ManagedAllocFlags::default(),
-        )
-        .expect("allocate managed strong target");
-    let weak_target = KERNEL_ALLOCATOR
-        .allocate_managed_handle(
-            Layout::new::<ManagedAuditLeaf>(),
-            ManagedAllocFlags::default(),
-        )
-        .expect("allocate managed weak target");
-
-    let node_ptr = KERNEL_ALLOCATOR
-        .managed_allocator()
-        .resolve_handle(&node)
-        .expect("resolve managed node");
-    let strong_ptr = KERNEL_ALLOCATOR
-        .managed_allocator()
-        .resolve_handle(&strong_target)
-        .expect("resolve managed strong target");
-    let weak_ptr = KERNEL_ALLOCATOR
-        .managed_allocator()
-        .resolve_handle(&weak_target)
-        .expect("resolve managed weak target");
-
-    KERNEL_ALLOCATOR
-        .managed_allocator()
-        .store_ref(
-            &node,
-            GcRefSlot::<ManagedAuditLeaf>::new(MANAGED_AUDIT_STRONG_OFFSET),
-            GcRef::from_raw(strong_ptr),
-        )
-        .expect("store managed strong reference");
-    KERNEL_ALLOCATOR
-        .managed_allocator()
-        .store_weak_ref(
-            &node,
-            GcWeakRefSlot::<ManagedAuditLeaf>::new(MANAGED_AUDIT_WEAK_OFFSET),
-            GcWeakRef::from_raw(weak_ptr),
-        )
-        .expect("store managed weak reference");
-
-    let audit = KERNEL_ALLOCATOR.managed_audit();
-    assert!(audit.is_consistent());
-    assert_eq!(audit.flags, ManagedAuditFlags::empty());
-    assert_eq!(
-        audit.scanned_strong_reference_slots,
-        before_managed.scanned_strong_reference_slots + 1
-    );
-    assert_eq!(
-        audit.scanned_weak_reference_slots,
-        before_managed.scanned_weak_reference_slots + 1
-    );
-    assert_eq!(
-        audit.scanned_stale_weak_reference_slots,
-        before_managed.scanned_stale_weak_reference_slots
-    );
-
-    let header_addr = node_ptr - GcObjectHeader::HEADER_SIZE;
-    let saved_header = unsafe { *(header_addr as *const GcObjectHeader) };
-    let mut corrupted_header = saved_header;
-    corrupted_header.trace_descriptor_ptr = 0;
-    unsafe {
-        *(header_addr as *mut GcObjectHeader) = corrupted_header;
-    }
-    let drift = KERNEL_ALLOCATOR.managed_audit();
-    assert!(
-        drift
-            .flags
-            .contains(ManagedAuditFlags::OBJECT_HEADER_MISMATCH)
-    );
-    assert_eq!(
-        drift.scanned_strong_reference_slots,
-        before_managed.scanned_strong_reference_slots + 1
-    );
-    unsafe {
-        *(header_addr as *mut GcObjectHeader) = saved_header;
-    }
-    let restored = KERNEL_ALLOCATOR.managed_audit();
-    assert!(restored.is_consistent());
-
-    KERNEL_ALLOCATOR.managed_allocator().release_handle(node);
-    KERNEL_ALLOCATOR
-        .deallocate(node_ptr)
-        .expect("deallocate managed reference node");
-    KERNEL_ALLOCATOR
-        .managed_allocator()
-        .release_handle(strong_target);
-    KERNEL_ALLOCATOR
-        .deallocate(strong_ptr)
-        .expect("deallocate managed strong target");
-    KERNEL_ALLOCATOR
-        .managed_allocator()
-        .release_handle(weak_target);
-    KERNEL_ALLOCATOR
-        .deallocate(weak_ptr)
-        .expect("deallocate managed weak target");
-
-    let after = KERNEL_ALLOCATOR.audit();
-    assert!(after.is_consistent());
-    assert_eq!(after.registry_live_records, before.registry_live_records);
-    assert_eq!(after.managed_active_objects, before.managed_active_objects);
-    assert_eq!(after.managed_live_records, before.managed_live_records);
 }
 
 /// order-0 物理页短周期释放应优先进入受限延迟合并水位，减少下一轮分配的 split 抖动。

@@ -6,8 +6,7 @@
 //! 它把虚拟地址空间按用途拆成多个 arena：
 //!
 //! - `DirectMap`：直接映射区；
-//! - `Kernel`：普通内核堆与大对象区域；
-//! - `Managed`：受 GC 管理的虚拟区域。
+//! - `Kernel`：普通内核堆与大对象区域。
 //!
 //! 每次“带后备页帧的分配”都要经过这里完成三步：
 //!
@@ -48,7 +47,6 @@ fn elapsed_us(start_ns: u64) -> u64 {
 pub enum ArenaKind {
     DirectMap,
     Kernel,
-    Managed,
 }
 
 /// 一段同时具备虚拟地址和物理后备页的区间。
@@ -66,14 +64,11 @@ pub struct BackedRange {
 
 /// 地址空间层统计信息。
 ///
-/// 它分别描述 linear-map、kernel、managed 三个 arena 的使用状态，并额外给出
-/// managed 子系统是否已经启用。
+/// 它分别描述 linear-map 和 kernel 两个 arena 的使用状态。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AddressSpaceStats {
     pub direct_map: VmemStats,
     pub kernel: VmemStats,
-    pub managed: VmemStats,
-    pub managed_enabled: bool,
 }
 
 /// 内核虚拟地址空间管理器。
@@ -84,9 +79,7 @@ pub struct AddressSpaceStats {
 pub struct KernelAddressSpace {
     direct_map: Mutex<VmemArena>,
     kernel: Mutex<VmemArena>,
-    managed: Mutex<VmemArena>,
     initialized: AtomicBool,
-    managed_enabled: AtomicBool,
     kernel_direct_map: AtomicBool,
     kernel_virt_to_phys: AtomicUsize,
     kernel_heap_map: AtomicUsize,
@@ -98,9 +91,7 @@ impl KernelAddressSpace {
         Self {
             direct_map: Mutex::new(VmemArena::new()),
             kernel: Mutex::new(VmemArena::new()),
-            managed: Mutex::new(VmemArena::new()),
             initialized: AtomicBool::new(false),
-            managed_enabled: AtomicBool::new(false),
             kernel_direct_map: AtomicBool::new(false),
             kernel_virt_to_phys: AtomicUsize::new(0),
             kernel_heap_map: AtomicUsize::new(0),
@@ -139,7 +130,6 @@ impl KernelAddressSpace {
         let kernel_init_us;
         let mut kernel_span_us = 0u64;
         let mut kernel_span_count = 0usize;
-        let managed_init_us;
 
         {
             let phase_start_ns = now_ns();
@@ -318,21 +308,10 @@ impl KernelAddressSpace {
             kernel_init_us = elapsed_us(phase_start_ns);
         }
 
-        {
-            let phase_start_ns = now_ns();
-            let mut managed = self.managed.lock();
-            if !managed.init(b"managed_heap", 0, 0, PAGE_SIZE, VmemAllocPolicy::BestFit) {
-                self.initialized.store(false, Ordering::Release);
-                return Err(AddressSpaceError::MetadataOutOfMemory);
-            }
-            managed_init_us = elapsed_us(phase_start_ns);
-        }
-
-        self.managed_enabled.store(false, Ordering::Release);
         self.initialized.store(true, Ordering::Release);
         let stats = self.snapshot();
         log::info!(
-            "[alloc][vmem][timing] total={} us direct_init={} us direct_spans={} us direct_count={} kernel_init={} us kernel_spans={} us kernel_count={} managed_init={} us kernel_window={} MiB",
+            "[alloc][vmem][timing] total={} us direct_init={} us direct_spans={} us direct_count={} kernel_init={} us kernel_spans={} us kernel_count={} kernel_window={} MiB",
             elapsed_us(init_start_ns),
             direct_map_init_us,
             direct_map_span_us,
@@ -340,25 +319,18 @@ impl KernelAddressSpace {
             kernel_init_us,
             kernel_span_us,
             kernel_span_count,
-            managed_init_us,
             kernel_heap_region.1 / (1024 * 1024),
         );
         log::info!(
-            "[alloc][vmem] initialized direct_map_total={} kernel_total={} managed_total={} managed_enabled={}",
+            "[alloc][vmem] initialized direct_map_total={} kernel_total={}",
             stats.direct_map.total_size,
             stats.kernel.total_size,
-            stats.managed.total_size,
-            stats.managed_enabled,
         );
         Ok(())
     }
 
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
-    }
-
-    pub fn managed_enabled(&self) -> bool {
-        self.managed_enabled.load(Ordering::Acquire)
     }
 
     pub fn alloc_kernel_backed_range(
@@ -378,140 +350,6 @@ impl KernelAddressSpace {
         self.free_backed_range(range, phys)
     }
 
-    pub fn init_managed_heap(
-        &self,
-        order: usize,
-        phys: &Mutex<BuddyAllocator>,
-    ) -> Result<BackedRange, AddressSpaceError> {
-        if !self.is_initialized() {
-            return Err(AddressSpaceError::NotInitialized);
-        }
-        if self.managed_enabled() {
-            return Err(AddressSpaceError::ManagedUnavailable);
-        }
-
-        let page_policy = if order >= 9 {
-            PagePolicy::PreferLarge
-        } else {
-            PagePolicy::BaseOnly
-        };
-        let range = self.alloc_backed_range(ArenaKind::Kernel, order, page_policy, phys)?;
-        let add_span_result = {
-            let mut managed = self.managed.lock();
-            managed.add_span_result(range.vaddr, range.size)
-        };
-        if let Err(err) = add_span_result {
-            let _ = self.free_backed_range(range, phys);
-            return Err(match err {
-                crate::error::VmemError::MetadataOutOfMemory => {
-                    AddressSpaceError::MetadataOutOfMemory
-                }
-                crate::error::VmemError::Overlap | crate::error::VmemError::InvalidRange => {
-                    AddressSpaceError::InvalidRange
-                }
-                _ => AddressSpaceError::InvalidRange,
-            });
-        }
-        self.managed_enabled.store(true, Ordering::Release);
-        Ok(BackedRange {
-            arena: ArenaKind::Managed,
-            ..range
-        })
-    }
-
-    pub fn grow_managed_heap_contiguous(
-        &self,
-        expected_base: usize,
-        order: usize,
-        phys: &Mutex<BuddyAllocator>,
-    ) -> Result<BackedRange, AddressSpaceError> {
-        if !self.is_initialized() {
-            return Err(AddressSpaceError::NotInitialized);
-        }
-        if !self.managed_enabled() {
-            return Err(AddressSpaceError::ManagedUnavailable);
-        }
-
-        let page_policy = if order >= 9 {
-            PagePolicy::PreferLarge
-        } else {
-            PagePolicy::BaseOnly
-        };
-        let range =
-            self.alloc_backed_range_at(ArenaKind::Kernel, expected_base, order, page_policy, phys)?;
-        let add_span_result = {
-            let mut managed = self.managed.lock();
-            managed.add_span_result(range.vaddr, range.size)
-        };
-        if let Err(err) = add_span_result {
-            let _ = self.free_backed_range(range, phys);
-            return Err(match err {
-                crate::error::VmemError::MetadataOutOfMemory => {
-                    AddressSpaceError::MetadataOutOfMemory
-                }
-                crate::error::VmemError::Overlap | crate::error::VmemError::InvalidRange => {
-                    AddressSpaceError::InvalidRange
-                }
-                _ => AddressSpaceError::InvalidRange,
-            });
-        }
-        Ok(BackedRange {
-            arena: ArenaKind::Managed,
-            ..range
-        })
-    }
-
-    pub fn alloc_managed_range(
-        &self,
-        size: usize,
-        align: usize,
-    ) -> Result<usize, AddressSpaceError> {
-        if !self.managed_enabled() {
-            return Err(AddressSpaceError::ManagedUnavailable);
-        }
-        let result = self
-            .managed
-            .lock()
-            .alloc_result(size, align)
-            .map_err(AddressSpaceError::from);
-        match result {
-            Ok(addr) => Ok(addr),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn alloc_managed_range_in(
-        &self,
-        range_start: usize,
-        range_end: usize,
-        size: usize,
-        align: usize,
-    ) -> Result<usize, AddressSpaceError> {
-        if !self.managed_enabled() {
-            return Err(AddressSpaceError::ManagedUnavailable);
-        }
-        let result = self
-            .managed
-            .lock()
-            .alloc_in_range_result(range_start, range_end, size, align)
-            .map_err(AddressSpaceError::from);
-        match result {
-            Ok(addr) => Ok(addr),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn free_managed_range(&self, addr: usize, size: usize) -> Result<(), AddressSpaceError> {
-        if !self.managed_enabled() {
-            return Err(AddressSpaceError::ManagedUnavailable);
-        }
-        self.managed
-            .lock()
-            .free_result(addr, size)
-            .map_err(AddressSpaceError::from)?;
-        Ok(())
-    }
-
     pub fn kernel_range_allocated(&self, addr: usize) -> bool {
         if !self.is_initialized() {
             return false;
@@ -519,19 +357,10 @@ impl KernelAddressSpace {
         self.kernel.lock().is_allocated(addr)
     }
 
-    pub fn managed_range_allocated(&self, addr: usize) -> bool {
-        if !self.managed_enabled() {
-            return false;
-        }
-        self.managed.lock().is_allocated(addr)
-    }
-
     pub fn snapshot(&self) -> AddressSpaceStats {
         AddressSpaceStats {
             direct_map: self.direct_map.lock().stats(),
             kernel: self.kernel.lock().stats(),
-            managed: self.managed.lock().stats(),
-            managed_enabled: self.managed_enabled(),
         }
     }
 
@@ -543,16 +372,11 @@ impl KernelAddressSpace {
         self.direct_map.lock().stats()
     }
 
-    pub fn managed_stats(&self) -> VmemStats {
-        self.managed.lock().stats()
-    }
-
     #[inline]
     fn arena_lock(&self, arena: ArenaKind) -> &Mutex<VmemArena> {
         match arena {
             ArenaKind::DirectMap => &self.direct_map,
             ArenaKind::Kernel => &self.kernel,
-            ArenaKind::Managed => &self.managed,
         }
     }
 
@@ -675,93 +499,6 @@ impl KernelAddressSpace {
             vaddr,
             paddr: allocation.paddr,
             size: allocation.size, // 使用 buddy 分配器返回的 allocation.size
-            order: allocation.order,
-        };
-        Ok(backed)
-    }
-
-    fn alloc_backed_range_at(
-        &self,
-        arena: ArenaKind,
-        vaddr: usize,
-        order: usize,
-        page_policy: PagePolicy,
-        phys: &Mutex<BuddyAllocator>,
-    ) -> Result<BackedRange, AddressSpaceError> {
-        if !self.is_initialized() {
-            return Err(AddressSpaceError::NotInitialized);
-        }
-
-        let order = effective_order_for_page_policy(order, page_policy);
-        let block_pages = 1usize << order;
-        let size = block_pages * PAGE_SIZE;
-
-        {
-            let arena_lock = self.arena_lock(arena);
-            let mut arena_state = arena_lock.lock();
-            arena_state
-                .reserve_result(vaddr, size)
-                .map_err(AddressSpaceError::from)?;
-        }
-
-        let placement =
-            if arena == ArenaKind::Kernel && self.kernel_direct_map.load(Ordering::Acquire) {
-                let Some(virt_to_phys) = self.load_kernel_virt_to_phys_fn() else {
-                    let _ = self.arena_lock(arena).lock().free(vaddr, size);
-                    return Err(AddressSpaceError::MappingUnavailable);
-                };
-                MemoryPlacement::ExactPhys(virt_to_phys(vaddr))
-            } else {
-                MemoryPlacement::Any
-            };
-
-        let allocation = {
-            let mut phys = phys.lock();
-            phys.alloc_pages_with(
-                &PhysicalAllocRequest::new(size, size)
-                    .with_page_policy(page_policy)
-                    .with_placement(placement),
-            )
-        };
-
-        let allocation = match allocation {
-            Ok(alloc) => alloc,
-            Err(_) => {
-                let _ = self.arena_lock(arena).lock().free(vaddr, size);
-                return Err(AddressSpaceError::PhysicalRangeUnavailable);
-            }
-        };
-
-        if arena != ArenaKind::DirectMap
-            && !(arena == ArenaKind::Kernel && self.kernel_direct_map.load(Ordering::Acquire))
-        {
-            let Some(map_fn) = self.load_kernel_heap_map_fn() else {
-                let _ = self.arena_lock(arena).lock().free(vaddr, size);
-                let mut phys = phys.lock();
-                let _ = phys.free_pages(allocation.paddr, allocation.order);
-                return Err(AddressSpaceError::MappingUnavailable);
-            };
-            // 与普通地址分配路径保持相同的 owner 隔离语义，避免固定地址映射所需的
-            // 页表页被记到调用方 ELM 名下。
-            let Some(_accounting) = crate::suspend_implicit_allocation_accounting() else {
-                let _ = self.arena_lock(arena).lock().free(vaddr, size);
-                let mut phys = phys.lock();
-                let _ = phys.free_pages(allocation.paddr, allocation.order);
-                return Err(AddressSpaceError::MappingFailed);
-            };
-            if !map_fn(vaddr, allocation.paddr, allocation.size, page_policy) {
-                let _ = self.arena_lock(arena).lock().free(vaddr, size);
-                let mut phys = phys.lock();
-                let _ = phys.free_pages(allocation.paddr, allocation.order);
-                return Err(AddressSpaceError::MappingFailed);
-            }
-        }
-
-        let backed = BackedRange {
-            arena,
-            vaddr,
-            paddr: allocation.paddr,
-            size: allocation.size,
             order: allocation.order,
         };
         Ok(backed)
