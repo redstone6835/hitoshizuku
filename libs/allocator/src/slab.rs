@@ -23,7 +23,7 @@ use crate::Mutex;
 
 use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::request::AllocationRecord;
-use crate::space::{BackedRange, KernelAddressSpace};
+use crate::space::{ArenaKind, BackedRange, KernelAddressSpace};
 
 pub const MAX_SMALL_SIZE: usize = 2048;
 pub const MAX_CPUS: usize = 64;
@@ -72,6 +72,32 @@ pub struct SlabStats {
     pub free_slab_nodes: usize,
 }
 
+impl SlabStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.alloc_requests = self.alloc_requests.saturating_add(other.alloc_requests);
+        self.free_requests = self.free_requests.saturating_add(other.free_requests);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+        self.grow_failures = self.grow_failures.saturating_add(other.grow_failures);
+        self.active_objects = self.active_objects.saturating_add(other.active_objects);
+        self.active_slabs = self.active_slabs.saturating_add(other.active_slabs);
+        self.active_pages = self.active_pages.saturating_add(other.active_pages);
+        self.active_bytes = self.active_bytes.saturating_add(other.active_bytes);
+        self.address_reservation_failures = self
+            .address_reservation_failures
+            .saturating_add(other.address_reservation_failures);
+        self.invalid_frees = self.invalid_frees.saturating_add(other.invalid_frees);
+        self.cache_refills = self.cache_refills.saturating_add(other.cache_refills);
+        self.cache_flushes = self.cache_flushes.saturating_add(other.cache_flushes);
+        self.fast_free_hits = self.fast_free_hits.saturating_add(other.fast_free_hits);
+        self.fast_free_fallbacks = self
+            .fast_free_fallbacks
+            .saturating_add(other.fast_free_fallbacks);
+        self.reclaimed_slabs = self.reclaimed_slabs.saturating_add(other.reclaimed_slabs);
+        self.free_slab_nodes = self.free_slab_nodes.saturating_add(other.free_slab_nodes);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SlabClassStat {
     pub size_class: usize,
@@ -83,6 +109,21 @@ pub struct SlabClassStat {
     pub empty_pages: usize,
     pub reclaimable_empty_pages: usize,
     pub free_slab_nodes: usize,
+}
+
+impl SlabClassStat {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.active_objects = self.active_objects.saturating_add(other.active_objects);
+        self.active_bytes = self.active_bytes.saturating_add(other.active_bytes);
+        self.active_slabs = self.active_slabs.saturating_add(other.active_slabs);
+        self.active_pages = self.active_pages.saturating_add(other.active_pages);
+        self.empty_slabs = self.empty_slabs.saturating_add(other.empty_slabs);
+        self.empty_pages = self.empty_pages.saturating_add(other.empty_pages);
+        self.reclaimable_empty_pages = self
+            .reclaimable_empty_pages
+            .saturating_add(other.reclaimable_empty_pages);
+        self.free_slab_nodes = self.free_slab_nodes.saturating_add(other.free_slab_nodes);
+    }
 }
 
 /// 每 CPU 缓存中的一个槽位。
@@ -299,6 +340,17 @@ pub struct SlabReclaimStats {
     pub reclaimed_bytes: usize,
 }
 
+impl SlabReclaimStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.flushed_cached_objects = self
+            .flushed_cached_objects
+            .saturating_add(other.flushed_cached_objects);
+        self.reclaimed_slabs = self.reclaimed_slabs.saturating_add(other.reclaimed_slabs);
+        self.reclaimed_pages = self.reclaimed_pages.saturating_add(other.reclaimed_pages);
+        self.reclaimed_bytes = self.reclaimed_bytes.saturating_add(other.reclaimed_bytes);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SlabAudit {
     pub flags: SlabAuditFlags,
@@ -315,7 +367,7 @@ impl SlabAudit {
         self.flags.is_empty()
     }
 
-    fn merge(&mut self, other: Self) {
+    pub(crate) fn merge(&mut self, other: Self) {
         self.flags.0 |= other.flags.0;
         self.scanned_slabs = self.scanned_slabs.saturating_add(other.scanned_slabs);
         self.scanned_active_objects = self
@@ -869,17 +921,18 @@ enum SlabGrowError {
 fn allocate_slab_node(
     obj_size: usize,
     pages_per_slab: usize,
+    arena: ArenaKind,
     phys: &Mutex<BuddyAllocator>,
     vmem: &KernelAddressSpace,
     reusable_node: Option<usize>,
 ) -> Result<usize, SlabGrowError> {
     let order = pages_to_order(pages_per_slab).ok_or(SlabGrowError::UnsupportedOrder)?;
     let range = vmem
-        .alloc_kernel_backed_range(order, phys, crate::PagePolicy::BaseOnly)
+        .alloc_backed_range(arena, order, crate::PagePolicy::BaseOnly, phys)
         .map_err(|_| SlabGrowError::BackedRange)?;
     let block_pages = pages_for_order(order).ok_or(SlabGrowError::UnsupportedOrder)?;
     if range.paddr & (PAGE_SIZE - 1) != 0 {
-        let _ = vmem.free_kernel_backed_range(range, phys);
+        let _ = vmem.free_backed_range(range, phys);
         return Err(SlabGrowError::InvalidBacking);
     }
 
@@ -888,7 +941,7 @@ fn allocate_slab_node(
         None => {
             let node_addr = crate::alloc_internal_metadata(Layout::new::<SlabNode>()) as usize;
             if node_addr == 0 {
-                let _ = vmem.free_kernel_backed_range(range, phys);
+                let _ = vmem.free_backed_range(range, phys);
                 return Err(SlabGrowError::Metadata);
             }
             node_addr
@@ -902,7 +955,7 @@ fn allocate_slab_node(
     node.backing = range;
     node.next = 0;
     if !node.slab.active {
-        let _ = vmem.free_kernel_backed_range(range, phys);
+        let _ = vmem.free_backed_range(range, phys);
         return Err(SlabGrowError::Inactive);
     }
 
@@ -912,15 +965,17 @@ fn allocate_slab_node(
 struct Zone {
     size_class: usize,
     pages_per_slab: usize,
+    arena: ArenaKind,
     state: Mutex<ZoneState>,
     caches: [PerCpuCache; MAX_CPUS],
 }
 
 impl Zone {
-    const fn new(size_class: usize) -> Self {
+    const fn new(size_class: usize, arena: ArenaKind) -> Self {
         Self {
             size_class,
             pages_per_slab: pages_per_slab(size_class),
+            arena,
             state: Mutex::new(ZoneState::new()),
             caches: [const { PerCpuCache::new() }; MAX_CPUS],
         }
@@ -968,6 +1023,7 @@ impl Zone {
                 match allocate_slab_node(
                     self.size_class,
                     self.pages_per_slab,
+                    self.arena,
                     phys,
                     vmem,
                     reusable_node,
@@ -1019,8 +1075,8 @@ impl Zone {
         cpu: usize,
         backing: Option<(&Mutex<BuddyAllocator>, &KernelAddressSpace)>,
     ) -> bool {
-        // 没有 registry cookie 的兼容路径先在 ZoneState 中定位对象；正常 GlobalAlloc
-        // 释放走 free_with_hint，不进入这段扫描。
+        // 没有 registry cookie 的路径先在 ZoneState 中定位对象；普通
+        // GlobalAlloc 不记录逐对象 cookie，因此会进入这段扫描。
         if self.ptr_is_cached(ptr) {
             self.state.lock().stats.invalid_frees += 1;
             return false;
@@ -1128,7 +1184,7 @@ impl Zone {
             let Some(range) = range else {
                 break;
             };
-            if let Err(err) = vmem.free_kernel_backed_range(range, phys) {
+            if let Err(err) = vmem.free_backed_range(range, phys) {
                 panic!(
                     "[alloc][invariant] slab empty range reclaim failed class={} vaddr={:#x} paddr={:#x} size={} err={:?}",
                     self.size_class, range.vaddr, range.paddr, range.size, err
@@ -1288,23 +1344,23 @@ pub struct SlabAllocator {
 }
 
 impl SlabAllocator {
-    pub const fn new() -> Self {
+    pub const fn new(arena: ArenaKind) -> Self {
         Self {
             zones: [
-                Zone::new(SIZE_CLASSES[0]),
-                Zone::new(SIZE_CLASSES[1]),
-                Zone::new(SIZE_CLASSES[2]),
-                Zone::new(SIZE_CLASSES[3]),
-                Zone::new(SIZE_CLASSES[4]),
-                Zone::new(SIZE_CLASSES[5]),
-                Zone::new(SIZE_CLASSES[6]),
-                Zone::new(SIZE_CLASSES[7]),
-                Zone::new(SIZE_CLASSES[8]),
-                Zone::new(SIZE_CLASSES[9]),
-                Zone::new(SIZE_CLASSES[10]),
-                Zone::new(SIZE_CLASSES[11]),
-                Zone::new(SIZE_CLASSES[12]),
-                Zone::new(SIZE_CLASSES[13]),
+                Zone::new(SIZE_CLASSES[0], arena),
+                Zone::new(SIZE_CLASSES[1], arena),
+                Zone::new(SIZE_CLASSES[2], arena),
+                Zone::new(SIZE_CLASSES[3], arena),
+                Zone::new(SIZE_CLASSES[4], arena),
+                Zone::new(SIZE_CLASSES[5], arena),
+                Zone::new(SIZE_CLASSES[6], arena),
+                Zone::new(SIZE_CLASSES[7], arena),
+                Zone::new(SIZE_CLASSES[8], arena),
+                Zone::new(SIZE_CLASSES[9], arena),
+                Zone::new(SIZE_CLASSES[10], arena),
+                Zone::new(SIZE_CLASSES[11], arena),
+                Zone::new(SIZE_CLASSES[12], arena),
+                Zone::new(SIZE_CLASSES[13], arena),
             ],
             cpu_count: AtomicUsize::new(1),
             initialized: AtomicBool::new(false),
@@ -1385,6 +1441,24 @@ impl SlabAllocator {
         };
         let cpu = self.normalize_cpu(cpu_id);
         self.zones[zone_idx].free(ptr, cpu, None)
+    }
+
+    pub(crate) fn free_reclaiming(
+        &self,
+        ptr: usize,
+        layout: Layout,
+        cpu_id: usize,
+        phys: &Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> bool {
+        if !self.is_initialized() {
+            return false;
+        }
+        let Some(zone_idx) = Self::class_index_for(layout) else {
+            return false;
+        };
+        let cpu = self.normalize_cpu(cpu_id);
+        self.zones[zone_idx].free(ptr, cpu, Some((phys, vmem)))
     }
 
     pub fn same_size_class(old_layout: Layout, new_layout: Layout) -> bool {
@@ -1540,7 +1614,7 @@ impl SlabAllocator {
 
 impl Default for SlabAllocator {
     fn default() -> Self {
-        Self::new()
+        Self::new(ArenaKind::Kernel)
     }
 }
 

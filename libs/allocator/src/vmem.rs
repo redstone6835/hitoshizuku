@@ -71,6 +71,12 @@ pub struct BoundaryTag {
     pub free_prev: usize,
     /// 是否在使用中
     pub in_use: bool,
+    /// 动态映射区间对应的物理起始地址。
+    pub backing_paddr: usize,
+    /// 物理后备块的 buddy order。
+    pub backing_order: usize,
+    /// 当前标签是否已绑定物理后备块。
+    pub has_backing: bool,
 }
 
 impl BoundaryTag {
@@ -84,6 +90,9 @@ impl BoundaryTag {
             free_next: INVALID_TAG,
             free_prev: INVALID_TAG,
             in_use: false,
+            backing_paddr: 0,
+            backing_order: 0,
+            has_backing: false,
         }
     }
 }
@@ -986,6 +995,9 @@ impl VmemArena {
 
         let mut allocated = read_tag(tag_idx);
         allocated.bt_type = BtType::Allocated;
+        allocated.backing_paddr = 0;
+        allocated.backing_order = 0;
+        allocated.has_backing = false;
         write_tag(tag_idx, allocated);
         self.add_to_allocated_lookup(tag_idx);
         self.stats.allocated_size += allocated.size;
@@ -999,6 +1011,35 @@ impl VmemArena {
     /// 标记为空闲并尝试与相邻空闲段合并
     pub fn free(&mut self, addr: usize, size: usize) -> bool {
         self.free_result(addr, size).is_ok()
+    }
+
+    pub fn bind_backing(&mut self, addr: usize, size: usize, paddr: usize, order: usize) -> bool {
+        let Some(expected_size) = align_up(size, self.quantum) else {
+            return false;
+        };
+        let idx = self.find_allocated_tag(addr);
+        if idx == INVALID_TAG {
+            return false;
+        }
+        let mut tag = read_tag(idx);
+        if tag.size != expected_size || tag.has_backing {
+            return false;
+        }
+        tag.backing_paddr = paddr;
+        tag.backing_order = order;
+        tag.has_backing = true;
+        write_tag(idx, tag);
+        true
+    }
+
+    pub fn backing(&mut self, addr: usize) -> Option<(usize, usize, usize)> {
+        let idx = self.find_allocated_tag(addr);
+        if idx == INVALID_TAG {
+            return None;
+        }
+        let tag = read_tag(idx);
+        tag.has_backing
+            .then_some((tag.backing_paddr, tag.size, tag.backing_order))
     }
 
     pub fn free_result(&mut self, addr: usize, size: usize) -> Result<(), VmemError> {
@@ -1036,6 +1077,9 @@ impl VmemArena {
         current.bt_type = BtType::Free;
         current.free_prev = INVALID_TAG;
         current.free_next = INVALID_TAG;
+        current.backing_paddr = 0;
+        current.backing_order = 0;
+        current.has_backing = false;
         write_tag(idx, current);
         self.stats.allocated_size = self.stats.allocated_size.saturating_sub(tag_size);
         self.stats.free_size += tag_size;

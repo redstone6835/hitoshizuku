@@ -1116,6 +1116,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             },
             allocator: Some(StartAllocatorOps {
                 kernel_heap_region,
+                tracked_heap_region,
                 map_kernel_heap_range,
                 unmap_kernel_heap_range,
                 protect_kernel_heap_range,

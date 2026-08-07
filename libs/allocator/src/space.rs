@@ -47,6 +47,7 @@ fn elapsed_us(start_ns: u64) -> u64 {
 pub enum ArenaKind {
     DirectMap,
     Kernel,
+    Tracked,
 }
 
 /// 一段同时具备虚拟地址和物理后备页的区间。
@@ -69,6 +70,7 @@ pub struct BackedRange {
 pub struct AddressSpaceStats {
     pub direct_map: VmemStats,
     pub kernel: VmemStats,
+    pub tracked: VmemStats,
 }
 
 /// 内核虚拟地址空间管理器。
@@ -79,6 +81,7 @@ pub struct AddressSpaceStats {
 pub struct KernelAddressSpace {
     direct_map: Mutex<VmemArena>,
     kernel: Mutex<VmemArena>,
+    tracked: Mutex<VmemArena>,
     initialized: AtomicBool,
     kernel_direct_map: AtomicBool,
     kernel_virt_to_phys: AtomicUsize,
@@ -91,6 +94,7 @@ impl KernelAddressSpace {
         Self {
             direct_map: Mutex::new(VmemArena::new()),
             kernel: Mutex::new(VmemArena::new()),
+            tracked: Mutex::new(VmemArena::new()),
             initialized: AtomicBool::new(false),
             kernel_direct_map: AtomicBool::new(false),
             kernel_virt_to_phys: AtomicUsize::new(0),
@@ -117,6 +121,7 @@ impl KernelAddressSpace {
         phys_to_virt: fn(usize) -> usize,
         virt_to_phys: fn(usize) -> usize,
         kernel_heap_region: (usize, usize),
+        tracked_heap_region: (usize, usize),
         _boot: &BootAllocator,
     ) -> Result<(), AddressSpaceError> {
         if !phys.is_initialized() {
@@ -308,6 +313,24 @@ impl KernelAddressSpace {
             kernel_init_us = elapsed_us(phase_start_ns);
         }
 
+        if tracked_heap_region.1 != 0 {
+            let mut tracked = self.tracked.lock();
+            if !tracked.init(
+                b"tracked_heap",
+                tracked_heap_region.0,
+                tracked_heap_region.1,
+                PAGE_SIZE,
+                VmemAllocPolicy::BestFit,
+            ) {
+                self.initialized.store(false, Ordering::Release);
+                return Err(AddressSpaceError::MetadataOutOfMemory);
+            }
+            if (tracked_heap_region.0 & (PAGE_SIZE - 1)) != 0 {
+                self.initialized.store(false, Ordering::Release);
+                return Err(AddressSpaceError::InvalidRange);
+            }
+        }
+
         self.initialized.store(true, Ordering::Release);
         let stats = self.snapshot();
         log::info!(
@@ -322,9 +345,10 @@ impl KernelAddressSpace {
             kernel_heap_region.1 / (1024 * 1024),
         );
         log::info!(
-            "[alloc][vmem] initialized direct_map_total={} kernel_total={}",
+            "[alloc][vmem] initialized direct_map_total={} kernel_total={} tracked_total={}",
             stats.direct_map.total_size,
             stats.kernel.total_size,
+            stats.tracked.total_size,
         );
         Ok(())
     }
@@ -350,6 +374,23 @@ impl KernelAddressSpace {
         self.free_backed_range(range, phys)
     }
 
+    pub fn alloc_tracked_backed_range(
+        &self,
+        order: usize,
+        phys: &Mutex<BuddyAllocator>,
+        page_policy: PagePolicy,
+    ) -> Result<BackedRange, AddressSpaceError> {
+        self.alloc_backed_range(ArenaKind::Tracked, order, page_policy, phys)
+    }
+
+    pub fn free_tracked_backed_range(
+        &self,
+        range: BackedRange,
+        phys: &Mutex<BuddyAllocator>,
+    ) -> Result<(), AddressSpaceError> {
+        self.free_backed_range(range, phys)
+    }
+
     pub fn kernel_range_allocated(&self, addr: usize) -> bool {
         if !self.is_initialized() {
             return false;
@@ -357,10 +398,18 @@ impl KernelAddressSpace {
         self.kernel.lock().is_allocated(addr)
     }
 
+    pub fn tracked_range_allocated(&self, addr: usize) -> bool {
+        if !self.is_initialized() {
+            return false;
+        }
+        self.tracked.lock().is_allocated(addr)
+    }
+
     pub fn snapshot(&self) -> AddressSpaceStats {
         AddressSpaceStats {
             direct_map: self.direct_map.lock().stats(),
             kernel: self.kernel.lock().stats(),
+            tracked: self.tracked.lock().stats(),
         }
     }
 
@@ -377,6 +426,7 @@ impl KernelAddressSpace {
         match arena {
             ArenaKind::DirectMap => &self.direct_map,
             ArenaKind::Kernel => &self.kernel,
+            ArenaKind::Tracked => &self.tracked,
         }
     }
 
@@ -407,7 +457,7 @@ impl KernelAddressSpace {
         }
     }
 
-    fn alloc_backed_range(
+    pub(crate) fn alloc_backed_range(
         &self,
         arena: ArenaKind,
         order: usize,
@@ -494,6 +544,18 @@ impl KernelAddressSpace {
             }
         }
 
+        if !self.arena_lock(arena).lock().bind_backing(
+            vaddr,
+            allocation.size,
+            allocation.paddr,
+            allocation.order,
+        ) {
+            panic!(
+                "[alloc][invariant] failed to bind backing arena={:?} vaddr={:#x} paddr={:#x} size={} order={}",
+                arena, vaddr, allocation.paddr, allocation.size, allocation.order,
+            );
+        }
+
         let backed = BackedRange {
             arena,
             vaddr,
@@ -504,7 +566,21 @@ impl KernelAddressSpace {
         Ok(backed)
     }
 
-    fn free_backed_range(
+    pub(crate) fn backed_range(&self, arena: ArenaKind, vaddr: usize) -> Option<BackedRange> {
+        if !self.is_initialized() {
+            return None;
+        }
+        let (paddr, size, order) = self.arena_lock(arena).lock().backing(vaddr)?;
+        Some(BackedRange {
+            arena,
+            vaddr,
+            paddr,
+            size,
+            order,
+        })
+    }
+
+    pub(crate) fn free_backed_range(
         &self,
         range: BackedRange,
         phys: &Mutex<BuddyAllocator>,

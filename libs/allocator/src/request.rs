@@ -48,6 +48,7 @@ pub enum AllocationKind {
 pub enum AllocationArena {
     DirectMap,
     Kernel,
+    Tracked,
 }
 
 /// 页级映射策略。

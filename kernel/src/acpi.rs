@@ -294,6 +294,7 @@ pub fn kernel_start_init(context: &StartContext) {
     if let Some(alloc_ops) = context.allocator {
         KERNEL_ALLOCATOR.bind_kernel_heap_ops(
             alloc_ops.kernel_heap_region,
+            alloc_ops.tracked_heap_region,
             alloc_ops.map_kernel_heap_range,
             alloc_ops.unmap_kernel_heap_range,
         );

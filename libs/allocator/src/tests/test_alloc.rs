@@ -37,6 +37,47 @@ fn allocate_small() {
     KERNEL_ALLOCATOR.deallocate(record.ptr).expect("deallocate");
 }
 
+/// 普通内核 GlobalAlloc 分配不应进入显式资源账本。
+#[ktest]
+fn global_owner_zero_allocation_is_not_tracked() {
+    let layout = Layout::from_size_align(96, 16).expect("valid global allocation layout");
+    let ptr = unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, layout) };
+    assert!(!ptr.is_null());
+
+    assert!(
+        KERNEL_ALLOCATOR
+            .query_tracked_allocation(ptr as usize)
+            .is_err()
+    );
+
+    let failures_before = KERNEL_ALLOCATOR.stats().ownership_failures;
+    unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, ptr, layout) };
+    assert_eq!(KERNEL_ALLOCATOR.stats().ownership_failures, failures_before);
+}
+
+/// 显式分配接口仍应进入资源账本。
+#[ktest]
+fn explicit_allocation_remains_tracked() {
+    let record = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(MemoryDomain::Kernel, 96, 16))
+        .expect("explicit allocation");
+
+    assert_eq!(
+        KERNEL_ALLOCATOR.query_tracked_allocation(record.ptr),
+        Ok(record)
+    );
+
+    KERNEL_ALLOCATOR
+        .deallocate(record.ptr)
+        .expect("explicit deallocation");
+
+    assert!(
+        KERNEL_ALLOCATOR
+            .query_tracked_allocation(record.ptr)
+            .is_err()
+    );
+}
+
 /// 分配后释放，双向均返回 Ok。
 #[ktest]
 fn allocate_deallocate_roundtrip() {
@@ -406,8 +447,6 @@ fn slab_allocation_respects_requested_alignment() {
 fn slab_record_carries_private_backend_cookie() {
     let before = KERNEL_ALLOCATOR.audit();
     assert!(before.is_consistent());
-    let stats_before = KERNEL_ALLOCATOR.hotspot_summary();
-
     let record = KERNEL_ALLOCATOR
         .allocate(MemoryRequest::new(MemoryDomain::Kernel, 96, 8))
         .expect("allocate small object with backend cookie");
@@ -424,6 +463,7 @@ fn slab_record_carries_private_backend_cookie() {
     // 否则本测试自身会让 registry live 计数比基线多一个对象。
     drop(debug);
 
+    let stats_before = KERNEL_ALLOCATOR.hotspot_summary();
     KERNEL_ALLOCATOR
         .deallocate(record.ptr)
         .expect("deallocate cookie-backed small object");
@@ -720,9 +760,9 @@ fn reallocate_small_in_place_zeroed_growth_clears_new_bytes() {
     assert_eq!(after.slab_live_records, before.slab_live_records);
 }
 
-/// GlobalAlloc::realloc 的同 size-class 快路径应只更新账本，不移动对象。
+/// 普通 GlobalAlloc::realloc 的同 size-class 快路径不应移动对象或访问账本。
 #[ktest]
-fn global_realloc_same_class_keeps_pointer_and_record() {
+fn global_realloc_same_class_keeps_pointer_untracked() {
     let old_layout = Layout::from_size_align(64, 8).expect("valid old layout");
     let new_layout = Layout::from_size_align(63, 8).expect("valid new layout");
     let ptr = unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, old_layout) };
@@ -736,11 +776,10 @@ fn global_realloc_same_class_keeps_pointer_and_record() {
     let stats_before = KERNEL_ALLOCATOR.stats();
     let new_ptr = unsafe { GlobalAlloc::realloc(&KERNEL_ALLOCATOR, ptr, old_layout, 63) };
     assert_eq!(new_ptr, ptr);
-    assert_eq!(
+    assert!(
         KERNEL_ALLOCATOR
-            .allocation_size(new_ptr as usize)
-            .expect("query realloc size"),
-        63
+            .query_tracked_allocation(new_ptr as usize)
+            .is_err()
     );
     let bytes = unsafe { core::slice::from_raw_parts(new_ptr, 63) };
     for (idx, byte) in bytes.iter().enumerate() {
@@ -762,9 +801,9 @@ fn global_realloc_same_class_keeps_pointer_and_record() {
     unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, new_ptr, new_layout) };
 }
 
-/// GlobalAlloc::realloc 跨分配层搬迁时应复用单次账本 probe 返回的旧记录完成复制。
+/// 普通 GlobalAlloc::realloc 跨分配层搬迁时应保留数据，且全程不访问账本。
 #[ktest]
-fn global_realloc_grow_preserves_prefix() {
+fn global_realloc_grow_preserves_prefix_untracked() {
     let old_layout = Layout::from_size_align(64, 8).expect("valid old layout");
     let new_layout = Layout::from_size_align(4096, 8).expect("valid new layout");
     let ptr = unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, old_layout) };
@@ -781,12 +820,10 @@ fn global_realloc_grow_preserves_prefix() {
     let new_ptr = unsafe { GlobalAlloc::realloc(&KERNEL_ALLOCATOR, ptr, old_layout, 4096) };
     assert!(!new_ptr.is_null());
     assert!(!KERNEL_ALLOCATOR.owns_allocation(ptr as usize));
-    assert!(KERNEL_ALLOCATOR.owns_allocation(new_ptr as usize));
-    assert_eq!(
+    assert!(
         KERNEL_ALLOCATOR
-            .allocation_size(new_ptr as usize)
-            .expect("query grown size"),
-        4096
+            .query_tracked_allocation(new_ptr as usize)
+            .is_err()
     );
     let new = unsafe { core::slice::from_raw_parts(new_ptr, 64) };
     for (idx, byte) in new.iter().enumerate() {
@@ -796,8 +833,8 @@ fn global_realloc_grow_preserves_prefix() {
     let moved = KERNEL_ALLOCATOR.audit();
     assert!(moved.is_consistent());
     assert_eq!(moved.registry_live_records, before.registry_live_records);
-    assert_eq!(moved.slab_live_records + 1, before.slab_live_records);
-    assert_eq!(moved.kheap_live_records, before.kheap_live_records + 1);
+    assert_eq!(moved.slab_live_records, before.slab_live_records);
+    assert_eq!(moved.kheap_live_records, before.kheap_live_records);
 
     let stats_after_realloc = KERNEL_ALLOCATOR.stats();
     assert_eq!(

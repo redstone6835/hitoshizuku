@@ -286,6 +286,8 @@ pub struct AllocatorLayerStats {
     pub address_space: AddressSpaceStats,
     pub kheap: KernelHeapStats,
     pub slab: SlabStats,
+    pub tracked_kheap: KernelHeapStats,
+    pub tracked_slab: SlabStats,
     pub metadata: MetadataStats,
     pub registry: AllocationRegistryStats,
 }
@@ -425,7 +427,7 @@ fn build_audit_inner(
             flags.insert(AllocatorAuditFlags::REGISTRY_STRUCTURE_MISMATCH);
         }
     }
-    if layers.slab.active_objects != layers.registry.live_small as u64 {
+    if layers.tracked_slab.active_objects != layers.registry.live_small as u64 {
         flags.insert(AllocatorAuditFlags::SLAB_RECORD_MISMATCH);
     }
     if layers.slab.active_bytes > slab_backing_bytes {
@@ -442,7 +444,7 @@ fn build_audit_inner(
             flags.insert(AllocatorAuditFlags::SLAB_STRUCTURE_MISMATCH);
         }
     }
-    if layers.kheap.active_allocs != layers.registry.live_large as u64 {
+    if layers.tracked_kheap.active_allocs != layers.registry.live_large as u64 {
         flags.insert(AllocatorAuditFlags::KHEAP_RECORD_MISMATCH);
     }
     if layers.kheap.active_bytes != kheap_page_bytes {
@@ -582,11 +584,23 @@ pub fn build_overview(
         direct_map_total: address_space.direct_map.total_size,
         direct_map_allocated: address_space.direct_map.allocated_size,
         direct_map_free: address_space.direct_map.free_size,
-        kernel_vmem_total: address_space.kernel.total_size,
-        kernel_vmem_allocated: address_space.kernel.allocated_size,
-        kernel_vmem_free: address_space.kernel.free_size,
+        kernel_vmem_total: address_space
+            .kernel
+            .total_size
+            .saturating_add(address_space.tracked.total_size),
+        kernel_vmem_allocated: address_space
+            .kernel
+            .allocated_size
+            .saturating_add(address_space.tracked.allocated_size),
+        kernel_vmem_free: address_space
+            .kernel
+            .free_size
+            .saturating_add(address_space.tracked.free_size),
         kernel_heap_used,
-        kernel_heap_free: address_space.kernel.free_size,
+        kernel_heap_free: address_space
+            .kernel
+            .free_size
+            .saturating_add(address_space.tracked.free_size),
         boot_used: boot.used_bytes,
         boot_free: boot.free_bytes,
         pressure_level: pressure_level(phys),

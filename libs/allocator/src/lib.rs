@@ -163,7 +163,7 @@ pub use kheap::{
 pub use metadata::MetadataStats;
 pub use registry::{
     AllocationOwnerStats, AllocationRegistryAudit, AllocationRegistryAuditFlags,
-    AllocationRegistrySnapshot, AllocationRegistryStats,
+    AllocationRegistrySnapshot, AllocationRegistryStats, RegistryPathCounters,
 };
 pub use request::{
     AllocationArena, AllocationKind, AllocationRecord, AllocationRequestError, MemoryDomain,
@@ -284,7 +284,9 @@ pub struct KernelMemorySubsystem {
     phys: Mutex<BuddyAllocator>,
     vmem: KernelAddressSpace,
     kheap: KernelHeap,
+    tracked_kheap: KernelHeap,
     slab: SlabAllocator,
+    tracked_slab: SlabAllocator,
     metadata: MetadataAllocator,
     registry: AllocationRegistry,
     init_lock: Mutex<()>,
@@ -293,6 +295,7 @@ pub struct KernelMemorySubsystem {
     virt_to_phys: AtomicUsize,
     cpu_id_fn: AtomicUsize,
     kernel_heap_region_fn: AtomicUsize,
+    tracked_heap_region_fn: AtomicUsize,
     kernel_heap_map_fn: AtomicUsize,
     kernel_heap_unmap_fn: AtomicUsize,
     total_allocs: AtomicU64,
@@ -399,8 +402,10 @@ impl KernelMemorySubsystem {
             boot: BootAllocator::new(),
             phys: Mutex::new(BuddyAllocator::new()),
             vmem: KernelAddressSpace::new(),
-            kheap: KernelHeap::new(),
-            slab: SlabAllocator::new(),
+            kheap: KernelHeap::new(crate::space::ArenaKind::Kernel),
+            tracked_kheap: KernelHeap::new(crate::space::ArenaKind::Tracked),
+            slab: SlabAllocator::new(crate::space::ArenaKind::Kernel),
+            tracked_slab: SlabAllocator::new(crate::space::ArenaKind::Tracked),
             metadata: MetadataAllocator::new(),
             registry: AllocationRegistry::new(),
             init_lock: Mutex::new(()),
@@ -409,6 +414,7 @@ impl KernelMemorySubsystem {
             virt_to_phys: AtomicUsize::new(0),
             cpu_id_fn: AtomicUsize::new(0),
             kernel_heap_region_fn: AtomicUsize::new(0),
+            tracked_heap_region_fn: AtomicUsize::new(0),
             kernel_heap_map_fn: AtomicUsize::new(0),
             kernel_heap_unmap_fn: AtomicUsize::new(0),
             total_allocs: AtomicU64::new(0),
@@ -473,11 +479,14 @@ impl KernelMemorySubsystem {
     pub fn bind_kernel_heap_ops(
         &self,
         region_fn: KernelHeapRegionFn,
+        tracked_region_fn: KernelHeapRegionFn,
         map_fn: MapKernelHeapRangeFn,
         unmap_fn: UnmapKernelHeapRangeFn,
     ) {
         self.kernel_heap_region_fn
             .store(region_fn as usize, Ordering::Release);
+        self.tracked_heap_region_fn
+            .store(tracked_region_fn as usize, Ordering::Release);
         self.kernel_heap_map_fn
             .store(map_fn as usize, Ordering::Release);
         self.kernel_heap_unmap_fn
@@ -524,6 +533,10 @@ impl KernelMemorySubsystem {
             return Err(InitError::MissingKernelHeapRegion);
         };
         let kernel_heap_region = region_fn();
+        let Some(tracked_region_fn) = self.load_tracked_heap_region_fn() else {
+            return Err(InitError::MissingKernelHeapRegion);
+        };
+        let tracked_heap_region = tracked_region_fn();
 
         let init_result = {
             let phys = self.phys.lock();
@@ -541,6 +554,7 @@ impl KernelMemorySubsystem {
                 phys_to_virt,
                 virt_to_phys,
                 kernel_heap_region,
+                tracked_heap_region,
                 &self.boot,
             )
         };
@@ -563,11 +577,13 @@ impl KernelMemorySubsystem {
     pub fn init_kheap(&self) {
         let _guard = self.init_lock.lock();
         self.kheap.init();
+        self.tracked_kheap.init();
     }
 
     pub fn init_slab(&self, cpu_count: usize) {
         let _guard = self.init_lock.lock();
         self.slab.init(cpu_count);
+        self.tracked_slab.init(cpu_count);
     }
 
     pub fn activate_global(&self) -> Result<(), InitError> {
@@ -584,7 +600,13 @@ impl KernelMemorySubsystem {
         if !self.kheap.is_initialized() {
             return Err(InitError::LargeAllocatorNotInitialized);
         }
+        if !self.tracked_kheap.is_initialized() {
+            return Err(InitError::LargeAllocatorNotInitialized);
+        }
         if !self.slab.is_initialized() {
+            return Err(InitError::ZoneNotInitialized);
+        }
+        if !self.tracked_slab.is_initialized() {
             return Err(InitError::ZoneNotInitialized);
         }
         let kernel_heap_uses_mapped_window = self
@@ -659,8 +681,8 @@ impl KernelMemorySubsystem {
     pub fn stats(&self) -> AllocStats {
         let boot = self.boot.snapshot();
         let address_space = self.vmem.snapshot();
-        let slab = self.slab.snapshot();
-        let kheap = self.kheap.snapshot();
+        let slab = self.combined_slab_stats();
+        let kheap = self.combined_kheap_stats();
         AllocStats {
             total_allocs: self.total_allocs.load(Ordering::Acquire),
             total_deallocs: self.total_deallocs.load(Ordering::Acquire),
@@ -670,7 +692,10 @@ impl KernelMemorySubsystem {
             oom_count: self.oom_count.load(Ordering::Acquire),
             ownership_failures: self.ownership_failures.load(Ordering::Acquire),
             boot_used_bytes: boot.used_bytes,
-            vmem_used_bytes: address_space.kernel.allocated_size,
+            vmem_used_bytes: address_space
+                .kernel
+                .allocated_size
+                .saturating_add(address_space.tracked.allocated_size),
             active_small_allocs: slab.active_objects,
             active_large_allocs: kheap.active_allocs,
         }
@@ -680,9 +705,33 @@ impl KernelMemorySubsystem {
         let boot = self.boot.snapshot();
         let phys = self.buddy_stats();
         let address_space = self.address_space_stats();
-        let kheap = self.kheap.snapshot();
-        let slab = self.slab.snapshot();
+        let kheap = self.combined_kheap_stats();
+        let slab = self.combined_slab_stats();
         stats::build_overview(boot, phys, address_space, kheap, slab)
+    }
+
+    fn combined_kheap_stats(&self) -> KernelHeapStats {
+        let mut stats = self.kheap.snapshot();
+        stats.merge(self.tracked_kheap.snapshot());
+        stats
+    }
+
+    fn combined_slab_stats(&self) -> SlabStats {
+        let mut stats = self.slab.snapshot();
+        stats.merge(self.tracked_slab.snapshot());
+        stats
+    }
+
+    fn combined_kheap_audit(&self) -> KernelHeapAudit {
+        let mut audit = self.kheap.audit();
+        audit.merge(self.tracked_kheap.audit());
+        audit
+    }
+
+    fn combined_slab_audit(&self) -> SlabAudit {
+        let mut audit = self.slab.audit();
+        audit.merge(self.tracked_slab.audit());
+        audit
     }
 
     pub fn layer_stats(&self) -> stats::AllocatorLayerStats {
@@ -704,8 +753,10 @@ impl KernelMemorySubsystem {
         stats::AllocatorLayerStats {
             phys,
             address_space: self.address_space_stats(),
-            kheap: self.kheap.snapshot(),
-            slab: self.slab.snapshot(),
+            kheap: self.combined_kheap_stats(),
+            slab: self.combined_slab_stats(),
+            tracked_kheap: self.tracked_kheap.snapshot(),
+            tracked_slab: self.tracked_slab.snapshot(),
             metadata: self.metadata.stats(),
             registry,
         }
@@ -748,8 +799,8 @@ impl KernelMemorySubsystem {
                     registry_snapshot.stats,
                 );
                 let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
-                let slab_audit = self.slab.audit();
-                let kheap_audit = self.kheap.audit();
+                let slab_audit = self.combined_slab_audit();
+                let kheap_audit = self.combined_kheap_audit();
                 stats::format_diagnostic(
                     buf,
                     &overview,
@@ -800,8 +851,8 @@ impl KernelMemorySubsystem {
                     phys_snapshot.stats,
                     registry_snapshot.stats,
                 );
-                let slab_audit = self.slab.audit();
-                let kheap_audit = self.kheap.audit();
+                let slab_audit = self.combined_slab_audit();
+                let kheap_audit = self.combined_kheap_audit();
                 stats::build_audit_with_structures(
                     &layers,
                     registry_snapshot.audit,
@@ -828,7 +879,7 @@ impl KernelMemorySubsystem {
     /// 更适合在 allocator 自检和 panic 前诊断里确认 slab node 链、alloc/cache 位图与
     /// O(1) 统计是否仍然一致。
     pub fn slab_audit(&self) -> SlabAudit {
-        self.slab.audit()
+        self.combined_slab_audit()
     }
 
     /// 返回每个 slab size class 的轻量计数器快照。
@@ -836,7 +887,12 @@ impl KernelMemorySubsystem {
     /// 该接口只读取各 zone 的 O(1) 统计，不扫描对象内容，用于定位小对象泄漏集中在哪个
     /// 尺寸层级。
     pub fn slab_class_stats(&self) -> [SlabClassStat; SLAB_SIZE_CLASS_COUNT] {
-        self.slab.class_stats()
+        let mut stats = self.slab.class_stats();
+        let tracked = self.tracked_slab.class_stats();
+        for (combined, tracked) in stats.iter_mut().zip(tracked) {
+            combined.merge(tracked);
+        }
+        stats
     }
 
     /// 返回 kheap 大对象缓存 ring 和活跃页账本的一致性审计结果。
@@ -844,7 +900,7 @@ impl KernelMemorySubsystem {
     /// kheap 的活跃对象所有权由 registry 证明；这里重点扫描缓存 ring，确认 cached range
     /// 没有错阶、坏槽位或统计漂移。
     pub fn kheap_audit(&self) -> KernelHeapAudit {
-        self.kheap.audit()
+        self.combined_kheap_audit()
     }
 
     pub fn reclaim(
@@ -855,13 +911,20 @@ impl KernelMemorySubsystem {
             return Err(AllocationError::NotInitialized);
         }
 
-        let kheap = if request.kheap_cached_ranges == 0 {
+        let mut kheap = if request.kheap_cached_ranges == 0 {
             KernelHeapReclaimStats::default()
         } else {
             self.kheap
                 .reclaim_cached_ranges(request.kheap_cached_ranges, &self.phys, &self.vmem)
         };
-        let slab = if request.flush_slab_cpu_caches || request.reclaim_slab_empty {
+        if request.kheap_cached_ranges != 0 {
+            kheap.merge(self.tracked_kheap.reclaim_cached_ranges(
+                request.kheap_cached_ranges,
+                &self.phys,
+                &self.vmem,
+            ));
+        }
+        let mut slab = if request.flush_slab_cpu_caches || request.reclaim_slab_empty {
             self.slab.reclaim(
                 request.flush_slab_cpu_caches,
                 request.reclaim_slab_empty,
@@ -871,6 +934,14 @@ impl KernelMemorySubsystem {
         } else {
             SlabReclaimStats::default()
         };
+        if request.flush_slab_cpu_caches || request.reclaim_slab_empty {
+            slab.merge(self.tracked_slab.reclaim(
+                request.flush_slab_cpu_caches,
+                request.reclaim_slab_empty,
+                &self.phys,
+                &self.vmem,
+            ));
+        }
         let phys = if request.reclaim_physical_deferred {
             self.phys.lock().reclaim_deferred()
         } else {
@@ -920,9 +991,15 @@ impl KernelMemorySubsystem {
         self.registry.stats()
     }
 
+    pub fn registry_path_counters(&self) -> RegistryPathCounters {
+        self.registry.path_counters()
+    }
+
     #[cfg(feature = "performance-profile")]
     pub fn slab_profile_counter(&self, cpu: usize, counter: SlabProfileCounter) -> u64 {
-        self.slab.profile_counter(cpu, counter)
+        self.slab
+            .profile_counter(cpu, counter)
+            .saturating_add(self.tracked_slab.profile_counter(cpu, counter))
     }
 
     /// 返回指定外部所有者当前仍存活的 allocator 分配摘要。
@@ -1176,13 +1253,14 @@ impl KernelMemorySubsystem {
             return result;
         }
 
-        let mut allocation = self.allocate_active_once(request);
+        let mut allocation = self.allocate_active_once(request, crate::space::ArenaKind::Tracked);
         if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
             match request.reclaim {
                 ReclaimPolicy::NoReclaim => {}
                 ReclaimPolicy::TryAllocatorReclaim => {
                     self.reclaim_allocator_caches_for_retry();
-                    allocation = self.allocate_active_once(request);
+                    allocation =
+                        self.allocate_active_once(request, crate::space::ArenaKind::Tracked);
                 }
             }
         }
@@ -1476,10 +1554,15 @@ impl KernelMemorySubsystem {
             .registry
             .remove(ptr)
             .ok_or(DeallocationError::UnknownPointer)?;
+        let (slab, kheap) = match record.arena {
+            Some(AllocationArena::Tracked) => (&self.tracked_slab, &self.tracked_kheap),
+            Some(AllocationArena::Kernel) => (&self.slab, &self.kheap),
+            _ => (&self.slab, &self.kheap),
+        };
         let result = match record.kind {
             AllocationKind::Boot => Ok(()),
             AllocationKind::Small => {
-                if self.slab.free_record_reclaiming(
+                if slab.free_record_reclaiming(
                     record,
                     self.current_cpu_id(),
                     Some((&self.phys, &self.vmem)),
@@ -1493,7 +1576,7 @@ impl KernelMemorySubsystem {
                 }
             }
             AllocationKind::Large => {
-                if let Err(err) = self.kheap.free_record(record, &self.phys, &self.vmem) {
+                if let Err(err) = kheap.free_record(record, &self.phys, &self.vmem) {
                     panic!(
                         "[alloc][invariant] registry owned large allocation but kheap rejected free: ptr={:#x} paddr={:?} order={} err={:?}",
                         ptr, record.paddr, record.order, err
@@ -1532,7 +1615,7 @@ impl KernelMemorySubsystem {
         request: MemoryRequest,
     ) -> Result<AllocationRecord, AllocationError> {
         self.total_reallocs.fetch_add(1, Ordering::Relaxed);
-        self.kheap.record_realloc();
+        self.tracked_kheap.record_realloc();
 
         if ptr == 0 {
             return self.allocate(request);
@@ -1616,13 +1699,19 @@ impl KernelMemorySubsystem {
     }
 
     fn alloc_active(&self, layout: Layout, zeroing: Zeroing) -> *mut u8 {
+        let accounting_owner = resolve_accounting_owner(None);
         let request = MemoryRequest::for_kernel_layout(layout)
             .with_zeroing(zeroing)
-            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim);
-        match self.allocate(request) {
+            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim)
+            .with_accounting_owner(accounting_owner);
+        let result = if accounting_owner == 0 {
+            self.allocate_untracked_global(request)
+        } else {
+            self.allocate(request)
+        };
+        match result {
             Ok(record) => record.ptr as *mut u8,
             Err(error) => {
-                let accounting_owner = resolve_accounting_owner(None);
                 log::error!(
                     "[alloc] global allocation failed: size={} align={} zeroing={:?} owner={} error={:?}",
                     layout.size(),
@@ -1636,17 +1725,135 @@ impl KernelMemorySubsystem {
         }
     }
 
+    fn allocate_untracked_global(
+        &self,
+        request: MemoryRequest,
+    ) -> Result<AllocationRecord, AllocationError> {
+        let request = request.validate()?.with_accounting_owner(0);
+        let mut allocation = self.allocate_active_once(request, crate::space::ArenaKind::Kernel);
+        if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
+            let _ = self.reclaim_allocator_caches_for_retry();
+            allocation = self.allocate_active_once(request, crate::space::ArenaKind::Kernel);
+        }
+        allocation
+    }
+
+    fn is_tracked_heap_pointer(&self, ptr: usize) -> bool {
+        let Some(region_fn) = self.load_tracked_heap_region_fn() else {
+            return false;
+        };
+        let (start, size) = region_fn();
+        start
+            .checked_add(size)
+            .is_some_and(|end| ptr >= start && ptr < end)
+    }
+
+    fn deallocate_untracked_global(
+        &self,
+        ptr: usize,
+        layout: Layout,
+    ) -> Result<(), DeallocationError> {
+        if SlabAllocator::class_index_for(layout).is_some() {
+            if self
+                .slab
+                .free_reclaiming(ptr, layout, self.current_cpu_id(), &self.phys, &self.vmem)
+            {
+                return Ok(());
+            }
+            return Err(DeallocationError::UnknownPointer);
+        }
+        self.kheap.free_layout(ptr, layout, &self.phys, &self.vmem)
+    }
+
+    unsafe fn reallocate_untracked_global(
+        &self,
+        ptr: *mut u8,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> *mut u8 {
+        let old_small = SlabAllocator::class_index_for(old_layout);
+        let new_small = SlabAllocator::class_index_for(new_layout);
+        if old_small.is_some() && old_small == new_small && self.slab.owns(ptr as usize) {
+            return ptr;
+        }
+        if old_small.is_none()
+            && new_small.is_none()
+            && self
+                .kheap
+                .can_reuse_layout(ptr as usize, old_layout, new_layout, &self.vmem)
+        {
+            return ptr;
+        }
+
+        let old_valid = if old_small.is_some() {
+            self.slab.owns(ptr as usize)
+        } else {
+            self.kheap
+                .can_reuse_layout(ptr as usize, old_layout, old_layout, &self.vmem)
+        };
+        if !old_valid {
+            self.record_ownership_failure();
+            return null_mut();
+        }
+
+        let request = MemoryRequest::for_kernel_layout(new_layout)
+            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim)
+            .with_accounting_owner(0);
+        self.total_allocs.fetch_add(1, Ordering::Relaxed);
+        self.total_bytes_allocated
+            .fetch_add(new_layout.size() as u64, Ordering::Relaxed);
+        let new_record = match self.allocate_untracked_global(request) {
+            Ok(record) => record,
+            Err(_) => {
+                self.record_oom();
+                return null_mut();
+            }
+        };
+        let new_ptr = new_record.ptr as *mut u8;
+        let copy_len = old_layout.size().min(new_layout.size());
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::MemCopyRealloc).bytes(copy_len);
+        unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
+
+        if self
+            .deallocate_untracked_global(ptr as usize, old_layout)
+            .is_err()
+        {
+            let _ = self.deallocate_untracked_global(new_record.ptr, new_layout);
+            self.record_ownership_failure();
+            return null_mut();
+        }
+        self.record_global_dealloc_stats(old_layout);
+        new_ptr
+    }
+
     fn allocate_active_once(
         &self,
         request: MemoryRequest,
+        arena: crate::space::ArenaKind,
     ) -> Result<AllocationRecord, AllocationError> {
         match request.domain {
             MemoryDomain::Kernel => {
                 let cpu = self.current_cpu_id();
                 let layout = request.layout()?;
                 let force_large = matches!(request.page_policy, PagePolicy::RequireLarge);
+                let kheap = if arena == crate::space::ArenaKind::Tracked {
+                    &self.tracked_kheap
+                } else {
+                    &self.kheap
+                };
+                let slab = if arena == crate::space::ArenaKind::Tracked {
+                    &self.tracked_slab
+                } else {
+                    &self.slab
+                };
+                let allocation_arena = match arena {
+                    crate::space::ArenaKind::Tracked => AllocationArena::Tracked,
+                    crate::space::ArenaKind::Kernel => AllocationArena::Kernel,
+                    crate::space::ArenaKind::DirectMap => AllocationArena::DirectMap,
+                };
                 let alloc_large = || -> Result<AllocationRecord, AllocationError> {
-                    let range = match self.kheap.alloc_range(
+                    let range = match kheap.alloc_range(
                         layout,
                         request.page_policy,
                         &self.phys,
@@ -1670,7 +1877,7 @@ impl KernelMemorySubsystem {
                         MemoryDomain::Kernel,
                         range.vaddr,
                     )
-                    .with_arena(AllocationArena::Kernel)
+                    .with_arena(allocation_arena)
                     .with_sizes(request.size, range.size, request.align)
                     .with_accounting_owner(request.accounting_owner().unwrap_or(0))
                     .with_physical(
@@ -1682,11 +1889,11 @@ impl KernelMemorySubsystem {
                         range,
                         request.page_policy,
                     ));
-                    self.register_allocation(record, || {
-                        let _ = self
-                            .kheap
-                            .free_record_uncached(record, &self.phys, &self.vmem);
-                    })?;
+                    if arena == crate::space::ArenaKind::Tracked {
+                        self.register_allocation(record, || {
+                            let _ = kheap.free_record_uncached(record, &self.phys, &self.vmem);
+                        })?;
+                    }
                     Ok(record)
                 };
                 if is_small_request(request) && !force_large {
@@ -1694,9 +1901,8 @@ impl KernelMemorySubsystem {
                     let zone_idx_opt = SlabAllocator::class_index_for(layout);
 
                     if let Some(zone_idx) = zone_idx_opt {
-                        let usable_size = self.slab.zone_size_class(zone_idx);
-                        let allocation =
-                            self.slab.alloc_class(zone_idx, cpu, &self.phys, &self.vmem);
+                        let usable_size = slab.zone_size_class(zone_idx);
+                        let allocation = slab.alloc_class(zone_idx, cpu, &self.phys, &self.vmem);
                         if allocation.is_null() {
                             return Err(AllocationError::OutOfMemory);
                         }
@@ -1714,17 +1920,19 @@ impl KernelMemorySubsystem {
                             MemoryDomain::Kernel,
                             allocation.ptr,
                         )
-                        .with_arena(AllocationArena::Kernel)
+                        .with_arena(allocation_arena)
                         .with_sizes(request.size, usable_size, request.align)
                         .with_accounting_owner(request.accounting_owner().unwrap_or(0))
                         .with_backend_cookie(allocation.slab_node);
-                        self.register_allocation(record, || {
-                            self.slab.free_record_reclaiming(
-                                record,
-                                cpu,
-                                Some((&self.phys, &self.vmem)),
-                            );
-                        })?;
+                        if arena == crate::space::ArenaKind::Tracked {
+                            self.register_allocation(record, || {
+                                slab.free_record_reclaiming(
+                                    record,
+                                    cpu,
+                                    Some((&self.phys, &self.vmem)),
+                                );
+                            })?;
+                        }
                         Ok(record)
                     } else {
                         // slab 无法满足此对齐要求，回退到 kheap
@@ -1844,6 +2052,15 @@ impl KernelMemorySubsystem {
         }
     }
 
+    fn load_tracked_heap_region_fn(&self) -> Option<KernelHeapRegionFn> {
+        let raw = self.tracked_heap_region_fn.load(Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(unsafe { core::mem::transmute::<usize, KernelHeapRegionFn>(raw) })
+        }
+    }
+
     fn load_kernel_heap_map_fn(&self) -> Option<MapKernelHeapRangeFn> {
         let raw = self.kernel_heap_map_fn.load(Ordering::Acquire);
         if raw == 0 {
@@ -1883,9 +2100,17 @@ impl KernelMemorySubsystem {
         // `reallocate` 迁移路径已经把旧对象从 registry 移除。这里直接释放对应后端，避免
         // 再进入通用 `deallocate` 做一次查账和分派；如果后端拒绝释放，说明 registry 与
         // 后端状态已经不一致，必须作为 allocator invariant 暴露。
+        let (slab, kheap) = match record.arena {
+            Some(AllocationArena::Tracked) => (&self.tracked_slab, &self.tracked_kheap),
+            Some(AllocationArena::Kernel) => (&self.slab, &self.kheap),
+            _ => panic!(
+                "[alloc][invariant] movable allocation has invalid arena: {:?}",
+                record
+            ),
+        };
         match record.kind {
             AllocationKind::Small => {
-                if !self.slab.free_record_reclaiming(
+                if !slab.free_record_reclaiming(
                     record,
                     self.current_cpu_id(),
                     Some((&self.phys, &self.vmem)),
@@ -1897,7 +2122,7 @@ impl KernelMemorySubsystem {
                 }
             }
             AllocationKind::Large => {
-                if let Err(err) = self.kheap.free_record(record, &self.phys, &self.vmem) {
+                if let Err(err) = kheap.free_record(record, &self.phys, &self.vmem) {
                     panic!(
                         "[alloc][invariant] moved large allocation release failed: ptr={:#x} paddr={:?} order={} err={:?}",
                         record.ptr, record.paddr, record.order, err
@@ -2181,7 +2406,12 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             return;
         }
 
-        if self.deallocate(ptr as usize).is_err() {
+        let result = if self.is_tracked_heap_pointer(ptr as usize) {
+            self.deallocate(ptr as usize)
+        } else {
+            self.deallocate_untracked_global(ptr as usize, layout)
+        };
+        if result.is_err() {
             self.record_ownership_failure();
         }
     }
@@ -2195,7 +2425,11 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
     )]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         self.total_reallocs.fetch_add(1, Ordering::Relaxed);
-        self.kheap.record_realloc();
+        if self.is_tracked_heap_pointer(ptr as usize) {
+            self.tracked_kheap.record_realloc();
+        } else {
+            self.kheap.record_realloc();
+        }
 
         if ptr.is_null() {
             let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
@@ -2215,6 +2449,12 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             return null_mut();
         };
         let active = self.active.load(Ordering::Acquire);
+        if active
+            && !self.boot.contains(ptr as usize)
+            && !self.is_tracked_heap_pointer(ptr as usize)
+        {
+            return unsafe { self.reallocate_untracked_global(ptr, layout, new_layout) };
+        }
         let owner = if active {
             match self.probe_tracked_realloc(ptr as usize, new_layout, new_size) {
                 Ok(TrackedReallocProbe::Updated { .. }) => return ptr,

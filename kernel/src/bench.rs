@@ -306,6 +306,7 @@ const ALLOC_BENCH_SAMPLES: usize = 7;
 
 fn run_allocator_bench() {
     log::info!("[bench][alloc] ---------------- allocator cost model ----------------");
+    let registry_paths_start = KERNEL_ALLOCATOR.registry_path_counters();
     let audit_start = KERNEL_ALLOCATOR.audit();
     log::info!(
         "[bench][alloc] small_limit={} page_size={} batch={} audit_ok={} audit_flags={} live={}",
@@ -415,6 +416,20 @@ fn run_allocator_bench() {
         large4k,
         large8k,
         large64k
+    );
+    let registry_paths = KERNEL_ALLOCATOR
+        .registry_path_counters()
+        .saturating_sub(registry_paths_start);
+    log::info!(
+        "[bench][alloc][registry-paths] register kernel={} owned={} remove kernel={} owned={} containing queries={} shards={} buckets={} nodes={}",
+        registry_paths.register_kernel,
+        registry_paths.register_owned,
+        registry_paths.remove_kernel,
+        registry_paths.remove_owned,
+        registry_paths.containing_queries,
+        registry_paths.containing_scanned_shards,
+        registry_paths.containing_scanned_buckets,
+        registry_paths.containing_scanned_nodes,
     );
     log_allocator_hotspot("end");
 }

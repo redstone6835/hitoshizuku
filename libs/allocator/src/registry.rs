@@ -19,6 +19,7 @@
 //! 普通 alloc/free 只会碰其中一个 shard，避免所有 CPU 都竞争同一把 registry 全局锁。
 use core::alloc::Layout;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Mutex;
 
@@ -55,6 +56,42 @@ pub struct AllocationRegistryStats {
     pub live_small: usize,
     pub live_large: usize,
     pub live_physical: usize,
+}
+
+/// profiling 构建中 registry 各类路径的累计调用计数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistryPathCounters {
+    pub register_kernel: u64,
+    pub register_owned: u64,
+    pub remove_kernel: u64,
+    pub remove_owned: u64,
+    pub containing_queries: u64,
+    pub containing_scanned_shards: u64,
+    pub containing_scanned_buckets: u64,
+    pub containing_scanned_nodes: u64,
+}
+
+impl RegistryPathCounters {
+    pub const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            register_kernel: self.register_kernel.saturating_sub(earlier.register_kernel),
+            register_owned: self.register_owned.saturating_sub(earlier.register_owned),
+            remove_kernel: self.remove_kernel.saturating_sub(earlier.remove_kernel),
+            remove_owned: self.remove_owned.saturating_sub(earlier.remove_owned),
+            containing_queries: self
+                .containing_queries
+                .saturating_sub(earlier.containing_queries),
+            containing_scanned_shards: self
+                .containing_scanned_shards
+                .saturating_sub(earlier.containing_scanned_shards),
+            containing_scanned_buckets: self
+                .containing_scanned_buckets
+                .saturating_sub(earlier.containing_scanned_buckets),
+            containing_scanned_nodes: self
+                .containing_scanned_nodes
+                .saturating_sub(earlier.containing_scanned_nodes),
+        }
+    }
 }
 
 /// 注册表结构审计结果。
@@ -324,12 +361,28 @@ impl RegistryShard {
 
 pub struct AllocationRegistry {
     shards: [RegistryShard; REGISTRY_SHARDS],
+    register_kernel: AtomicU64,
+    register_owned: AtomicU64,
+    remove_kernel: AtomicU64,
+    remove_owned: AtomicU64,
+    containing_queries: AtomicU64,
+    containing_scanned_shards: AtomicU64,
+    containing_scanned_buckets: AtomicU64,
+    containing_scanned_nodes: AtomicU64,
 }
 
 impl AllocationRegistry {
     pub const fn new() -> Self {
         Self {
             shards: [const { RegistryShard::new() }; REGISTRY_SHARDS],
+            register_kernel: AtomicU64::new(0),
+            register_owned: AtomicU64::new(0),
+            remove_kernel: AtomicU64::new(0),
+            remove_owned: AtomicU64::new(0),
+            containing_queries: AtomicU64::new(0),
+            containing_scanned_shards: AtomicU64::new(0),
+            containing_scanned_buckets: AtomicU64::new(0),
+            containing_scanned_nodes: AtomicU64::new(0),
         }
     }
 
@@ -418,8 +471,13 @@ impl AllocationRegistry {
         _boot: &BootAllocator,
         record: AllocationRecord,
     ) -> Result<(), RegistryError> {
+        let owner = record.accounting_owner();
         #[cfg(feature = "performance-profile")]
-        let _profile = profiling::scope(profiling::Event::AllocRegistryRegister);
+        let _profile = profiling::scope(if owner == 0 {
+            profiling::Event::AllocRegistryRegisterKernel
+        } else {
+            profiling::Event::AllocRegistryRegisterOwned
+        });
         if record.ptr == 0 {
             let mut inner = self.shards[0].inner.lock();
             inner.insert_failures += 1;
@@ -515,6 +573,7 @@ impl AllocationRegistry {
             let chain_len = 1 + chain_len_before;
             set_bucket_chain_len(&inner, bucket, chain_len);
             note_chain_insert_locked(&mut inner, chain_len);
+            self.note_register(owner);
             return Ok(());
         }
     }
@@ -532,19 +591,26 @@ impl AllocationRegistry {
             return None;
         }
         let end = ptr.checked_add(len)?;
+        let mut scanned_shards = 0u64;
+        let mut scanned_buckets = 0u64;
+        let mut scanned_nodes = 0u64;
         for shard in &self.shards {
+            scanned_shards = scanned_shards.saturating_add(1);
             let mut inner = shard.inner.lock();
             if !inner.initialized {
                 continue;
             }
             for bucket in 0..inner.bucket_count {
+                scanned_buckets = scanned_buckets.saturating_add(1);
                 let mut current = bucket_head(&inner, bucket);
                 let mut visited = 0usize;
                 while current != 0 {
                     if visited >= inner.nodes_allocated {
                         note_chain_corruption_locked(&mut inner);
+                        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
                         return None;
                     }
+                    scanned_nodes = scanned_nodes.saturating_add(1);
                     let node = read_node(current);
                     let record = node.record.into_record();
                     let usable = record.usable_size.max(record.size);
@@ -554,6 +620,7 @@ impl AllocationRegistry {
                             .checked_add(usable)
                             .is_some_and(|record_end| record.ptr <= ptr && end <= record_end)
                     {
+                        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
                         return Some(record);
                     }
                     current = node.next;
@@ -561,6 +628,7 @@ impl AllocationRegistry {
                 }
             }
         }
+        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
         None
     }
 
@@ -637,6 +705,7 @@ impl AllocationRegistry {
                 decrement_live_records_locked(&mut inner);
                 let idx = kind_index(record.kind);
                 decrement_live_kind_locked(&mut inner, idx);
+                self.note_remove(record.accounting_owner());
                 return Ok(record);
             }
             prev = current;
@@ -746,6 +815,19 @@ impl AllocationRegistry {
             accumulate_stats_locked(&mut out, &inner);
         }
         out
+    }
+
+    pub fn path_counters(&self) -> RegistryPathCounters {
+        RegistryPathCounters {
+            register_kernel: self.register_kernel.load(Ordering::Relaxed),
+            register_owned: self.register_owned.load(Ordering::Relaxed),
+            remove_kernel: self.remove_kernel.load(Ordering::Relaxed),
+            remove_owned: self.remove_owned.load(Ordering::Relaxed),
+            containing_queries: self.containing_queries.load(Ordering::Relaxed),
+            containing_scanned_shards: self.containing_scanned_shards.load(Ordering::Relaxed),
+            containing_scanned_buckets: self.containing_scanned_buckets.load(Ordering::Relaxed),
+            containing_scanned_nodes: self.containing_scanned_nodes.load(Ordering::Relaxed),
+        }
     }
 
     pub fn audit(&self) -> AllocationRegistryAudit {
@@ -877,6 +959,46 @@ impl AllocationRegistry {
 
     fn shard_for_hash(&self, hash: usize) -> &RegistryShard {
         &self.shards[hash & (REGISTRY_SHARDS - 1)]
+    }
+
+    #[inline]
+    fn note_register(&self, owner: u64) {
+        #[cfg(feature = "performance-profile")]
+        if owner == 0 {
+            self.register_kernel.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.register_owned.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = owner;
+    }
+
+    #[inline]
+    fn note_remove(&self, owner: u64) {
+        #[cfg(feature = "performance-profile")]
+        if owner == 0 {
+            self.remove_kernel.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.remove_owned.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = owner;
+    }
+
+    #[inline]
+    fn note_containing_scan(&self, shards: u64, buckets: u64, nodes: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.containing_queries.fetch_add(1, Ordering::Relaxed);
+            self.containing_scanned_shards
+                .fetch_add(shards, Ordering::Relaxed);
+            self.containing_scanned_buckets
+                .fetch_add(buckets, Ordering::Relaxed);
+            self.containing_scanned_nodes
+                .fetch_add(nodes, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = (shards, buckets, nodes);
     }
 }
 
