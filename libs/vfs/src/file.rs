@@ -1121,7 +1121,9 @@ impl ::mm::FileLike for File {
     }
 
     fn size(&self) -> u64 {
-        File::stat(self).map(|s| s.size as u64).unwrap_or(0)
+        // 缺页和 fault-around 会频繁查询 EOF；inode 已在所有长度修改路径发布
+        // 同一份原子快照，无需为每个候选窗口重新构造完整 stat。
+        self.inode.size()
     }
 }
 
