@@ -1,3 +1,3 @@
 #include <ranalib/errno.h>
 
-int ranalib_errno;
+_Thread_local int ranalib_errno;

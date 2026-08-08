@@ -29,7 +29,7 @@ struct NativeResult {
 fn reset() {
     INITIAL_HANDLE.store(0, Ordering::Relaxed);
     LAST_REQUIREMENT.store(0, Ordering::Relaxed);
-    CALL_STATUS.store(binding::MYGO_STATUS_OK, Ordering::Relaxed);
+    CALL_STATUS.store(binding::MYGO_STATUS_ok, Ordering::Relaxed);
     CALL_VALUE0.store(0, Ordering::Relaxed);
     CALL_SLOT.store(u64::MAX, Ordering::Relaxed);
     CALL_HANDLE.store(0, Ordering::Relaxed);
@@ -84,7 +84,7 @@ fn missing_initial_stdout_is_not_fabricated() {
     assert!(stdout().is_none());
     assert_eq!(
         LAST_REQUIREMENT.load(Ordering::Relaxed),
-        binding::MYGO_REQUIREMENT_STDOUT
+        binding::MYGO_REQUIREMENT_stdout
     );
 }
 
@@ -102,7 +102,7 @@ fn stream_write_uses_bound_slot_and_initial_handle() {
     assert_eq!(written, message.len());
     assert_eq!(
         CALL_SLOT.load(Ordering::Relaxed),
-        binding::MYGO_SLOT_STREAM_WRITE
+        binding::MYGO_SLOT_stream_write
     );
     assert_eq!(CALL_HANDLE.load(Ordering::Relaxed), raw_handle);
     assert_eq!(
@@ -118,13 +118,13 @@ fn stream_write_preserves_native_error_status() {
     reset();
     INITIAL_HANDLE.store(UINT64_C_1_1, Ordering::Relaxed);
     CALL_STATUS.store(
-        binding::MYGO_STATUS_SECURITY_RIGHTS_DENIED,
+        binding::MYGO_STATUS_security_rights_denied,
         Ordering::Relaxed,
     );
 
     let error = stdout().unwrap().write(b"denied").unwrap_err();
 
-    assert_eq!(error.raw(), binding::MYGO_STATUS_SECURITY_RIGHTS_DENIED);
+    assert_eq!(error.raw(), binding::MYGO_STATUS_security_rights_denied);
 }
 
 const UINT64_C_1_1: u64 = 0x0000_0001_0000_0001;

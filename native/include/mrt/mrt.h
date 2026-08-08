@@ -17,8 +17,25 @@ enum mrt_start_error {
 
 struct mrt_start_view {
     const struct mygo_start_info *info;
+    const struct mygo_initial_handle *initial_handles;
+    uint32_t initial_handle_count;
     uint64_t self_process;
+    uint64_t address_space;
+    uint64_t stdin_stream;
     uint64_t stdout_stream;
+    const uint64_t *init_array;
+    uint32_t init_array_count;
+    const uint64_t *fini_array;
+    uint32_t fini_array_count;
+};
+
+struct mrt_program_result {
+    int status;
+};
+
+struct mrt_handle_result {
+    uint32_t status;
+    uint64_t handle;
 };
 
 enum mrt_start_error mrt_validate_start_info(
@@ -41,8 +58,19 @@ struct mygo_native_result mrt_call(
     uint64_t arg3,
     uint64_t arg4);
 
+uint32_t mrt_handle_close(uint64_t handle);
+struct mrt_handle_result mrt_handle_duplicate(uint64_t handle);
+struct mrt_handle_result mrt_handle_restrict(uint64_t handle, uint64_t rights);
+
 uint64_t mrt_initial_handle(uint32_t requirement_id);
 
+void mrt_run_initializers(const struct mrt_start_view *view);
+void mrt_run_finalizers(const struct mrt_start_view *view);
+
+int mrt_prepare_program(const struct mrt_start_view *view);
+struct mrt_program_result mrt_invoke_program(const struct mrt_start_view *view);
+
+_Noreturn void mrt_exit(uint32_t status);
 _Noreturn void mrt_terminate(uint32_t status);
 _Noreturn void mrt_abort(void);
 

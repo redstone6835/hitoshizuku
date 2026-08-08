@@ -12,6 +12,9 @@ OBJECT_DIR := $(OUTPUT)/obj
 INCLUDE_DIR := $(OUTPUT)/include
 BINDING := $(INCLUDE_DIR)/mygo_program.h
 MANIFEST := $(REPO_ROOT)/native/examples/hello/program.json
+OPTIONAL_MANIFEST := $(REPO_ROOT)/native/mrt/tests/optional-program.json
+OPTIONAL_INCLUDE_DIR := $(INCLUDE_DIR)/optional
+OPTIONAL_BINDING := $(OPTIONAL_INCLUDE_DIR)/mygo_program.h
 RUST_HELLO_DIR := $(REPO_ROOT)/native/examples/rust-hello
 RUST_MANIFEST := $(RUST_HELLO_DIR)/program.json
 RUST_INCLUDE_DIR := $(INCLUDE_DIR)/rust-hello
@@ -23,7 +26,8 @@ ANONLIB_MANIFEST := $(REPO_ROOT)/native/anonlib/Cargo.toml
 MRT_HEADER := $(REPO_ROOT)/native/include/mrt/mrt.h
 RANALIB_ERRNO_HEADER := $(REPO_ROOT)/native/include/ranalib/errno.h
 RANALIB_STDLIB_HEADER := $(REPO_ROOT)/native/include/ranalib/stdlib.h
-RANALIB_UNISTD_HEADER := $(REPO_ROOT)/native/include/ranalib/unistd.h
+RANALIB_STRING_HEADER := $(REPO_ROOT)/native/include/ranalib/string.h
+RANALIB_STDIO_HEADER := $(REPO_ROOT)/native/include/ranalib/stdio.h
 
 HOST_TARGET := x86_64-unknown-linux-gnu
 SOYO_LINKER_TARGET := $(REPO_ROOT)/tools/soyo-linker/target
@@ -70,17 +74,23 @@ endif
 MRT_OBJECTS := \
 	$(OBJECT_DIR)/mrt-entry.o \
 	$(OBJECT_DIR)/mrt-start.o \
-	$(OBJECT_DIR)/mrt-start-info.o
+	$(OBJECT_DIR)/mrt-start-info.o \
+	$(OBJECT_DIR)/mrt-lifecycle.o \
+	$(OBJECT_DIR)/mrt-entry-c.o
 RANALIB_OBJECTS := \
 	$(OBJECT_DIR)/ranalib-errno.o \
 	$(OBJECT_DIR)/ranalib-exit.o \
-	$(OBJECT_DIR)/ranalib-write.o
+	$(OBJECT_DIR)/ranalib-heap.o \
+	$(OBJECT_DIR)/ranalib-string.o \
+	$(OBJECT_DIR)/ranalib-stdio.o
 HELLO_OBJECT := $(OBJECT_DIR)/hello.o
 HELLO_SOYO := $(OUTPUT)/hello.soyo
 RUST_MRT_OBJECTS := \
 	$(OBJECT_DIR)/mrt-entry.o \
 	$(RUST_OBJECT_DIR)/mrt-start.o \
-	$(RUST_OBJECT_DIR)/mrt-start-info.o
+	$(RUST_OBJECT_DIR)/mrt-start-info.o \
+	$(RUST_OBJECT_DIR)/mrt-lifecycle.o \
+	$(RUST_OBJECT_DIR)/mrt-entry-rust.o
 ANONLIB_RLIB := $(RUST_OBJECT_DIR)/libanonlib.rlib
 ANONLIB_OBJECT := $(RUST_OBJECT_DIR)/anonlib.o
 RUST_HELLO_OBJECT := $(RUST_OBJECT_DIR)/rust-hello.o
@@ -88,7 +98,14 @@ RUST_HELLO_SOYO := $(OUTPUT)/rust-hello.soyo
 C_BUILD_CONFIG := $(OBJECT_DIR)/c-build-config.stamp
 RUST_BUILD_CONFIG := $(RUST_OBJECT_DIR)/rust-build-config.stamp
 HOST_START_INFO_TEST := $(OUTPUT)/mrt-start-info-test
-HOST_WRITE_TEST := $(OUTPUT)/ranalib-write-test
+HOST_OPTIONAL_START_INFO_TEST := $(OUTPUT)/mrt-optional-start-info-test
+HOST_ABORT_TEST := $(OUTPUT)/mrt-abort-test
+HOST_LIFECYCLE_TEST := $(OUTPUT)/mrt-lifecycle-test
+HOST_ENTRY_C_TEST := $(OUTPUT)/mrt-entry-c-test
+HOST_ERRNO_TEST := $(OUTPUT)/ranalib-errno-test
+HOST_HEAP_TEST := $(OUTPUT)/ranalib-heap-test
+HOST_STRING_TEST := $(OUTPUT)/ranalib-string-test
+HOST_STDIO_TEST := $(OUTPUT)/ranalib-stdio-test
 
 .PHONY: hello rust-hello mrt test FORCE
 
@@ -100,9 +117,16 @@ rust-hello: $(RUST_HELLO_SOYO)
 
 mrt: $(MRT_OBJECTS)
 
-test: $(HOST_START_INFO_TEST) $(HOST_WRITE_TEST) $(RUST_BINDING)
+test: $(HOST_START_INFO_TEST) $(HOST_OPTIONAL_START_INFO_TEST) $(HOST_ABORT_TEST) $(HOST_LIFECYCLE_TEST) $(HOST_ENTRY_C_TEST) $(HOST_ERRNO_TEST) $(HOST_HEAP_TEST) $(HOST_STRING_TEST) $(HOST_STDIO_TEST) $(RUST_BINDING)
 	$(HOST_START_INFO_TEST)
-	$(HOST_WRITE_TEST)
+	$(HOST_OPTIONAL_START_INFO_TEST)
+	$(HOST_ABORT_TEST)
+	$(HOST_LIFECYCLE_TEST)
+	$(HOST_ENTRY_C_TEST)
+	$(HOST_ERRNO_TEST)
+	$(HOST_HEAP_TEST)
+	$(HOST_STRING_TEST)
+	$(HOST_STDIO_TEST)
 	MYGO_PROGRAM_RS=$(abspath $(RUST_BINDING)) \
 		CARGO_TARGET_DIR=$(OUTPUT)/anonlib-target \
 		cargo test --manifest-path $(ANONLIB_MANIFEST) --target $(HOST_TARGET)
@@ -166,6 +190,11 @@ $(BINDING): $(SOYO_LD) $(MANIFEST)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(MANIFEST) \
 		--emit-c-header $@
 
+$(OPTIONAL_BINDING): $(SOYO_LD) $(OPTIONAL_MANIFEST)
+	mkdir -p $(OPTIONAL_INCLUDE_DIR)
+	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(OPTIONAL_MANIFEST) \
+		--emit-c-header $@
+
 $(RUST_C_BINDING): $(SOYO_LD) $(RUST_MANIFEST)
 	mkdir -p $(RUST_INCLUDE_DIR)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RUST_MANIFEST) \
@@ -188,12 +217,30 @@ $(OBJECT_DIR)/mrt-start-info.o: $(REPO_ROOT)/native/mrt/src/start_info.c $(BINDI
 	mkdir -p $(OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
+$(OBJECT_DIR)/mrt-lifecycle.o: $(REPO_ROOT)/native/mrt/src/lifecycle.c $(BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(OBJECT_DIR)/mrt-entry-c.o: $(REPO_ROOT)/native/mrt/src/entry_c.c $(BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
 $(RUST_OBJECT_DIR)/mrt-start.o: $(REPO_ROOT)/native/mrt/src/start.c $(RUST_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(RUST_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_INCLUDE_DIR) \
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
 $(RUST_OBJECT_DIR)/mrt-start-info.o: $(REPO_ROOT)/native/mrt/src/start_info.c $(RUST_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(RUST_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_INCLUDE_DIR) \
+		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(RUST_OBJECT_DIR)/mrt-lifecycle.o: $(REPO_ROOT)/native/mrt/src/lifecycle.c $(RUST_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(RUST_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_INCLUDE_DIR) \
+		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(RUST_OBJECT_DIR)/mrt-entry-rust.o: $(REPO_ROOT)/native/mrt/src/entry_rust.c $(RUST_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(RUST_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_INCLUDE_DIR) \
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
@@ -226,11 +273,19 @@ $(OBJECT_DIR)/ranalib-exit.o: $(REPO_ROOT)/native/ranalib/src/exit.c $(BINDING) 
 	mkdir -p $(OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
-$(OBJECT_DIR)/ranalib-write.o: $(REPO_ROOT)/native/ranalib/src/write.c $(BINDING) $(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_UNISTD_HEADER) $(C_BUILD_CONFIG)
+$(OBJECT_DIR)/ranalib-heap.o: $(REPO_ROOT)/native/ranalib/src/heap.c $(BINDING) $(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDLIB_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
-$(HELLO_OBJECT): $(REPO_ROOT)/native/examples/hello/main.c $(BINDING) $(RANALIB_UNISTD_HEADER) $(C_BUILD_CONFIG)
+$(OBJECT_DIR)/ranalib-string.o: $(REPO_ROOT)/native/ranalib/src/string.c $(RANALIB_STRING_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(OBJECT_DIR)/ranalib-stdio.o: $(REPO_ROOT)/native/ranalib/src/stdio.c $(BINDING) $(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDIO_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(HELLO_OBJECT): $(REPO_ROOT)/native/examples/hello/main.c $(BINDING) $(MRT_HEADER) $(RANALIB_STDLIB_HEADER) $(RANALIB_STDIO_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
@@ -250,11 +305,75 @@ $(HOST_START_INFO_TEST): $(REPO_ROOT)/native/mrt/tests/start_info.c \
 		$(REPO_ROOT)/native/mrt/tests/start_info.c \
 		$(REPO_ROOT)/native/mrt/src/start_info.c -o $@
 
-$(HOST_WRITE_TEST): $(REPO_ROOT)/native/ranalib/tests/write.c \
-		$(REPO_ROOT)/native/ranalib/src/write.c $(REPO_ROOT)/native/ranalib/src/errno.c \
-		$(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_UNISTD_HEADER) $(BINDING)
+$(HOST_OPTIONAL_START_INFO_TEST): $(REPO_ROOT)/native/mrt/tests/optional_start_info.c \
+		$(REPO_ROOT)/native/mrt/src/start_info.c $(REPO_ROOT)/native/include/mrt/mrt.h \
+		$(OPTIONAL_BINDING)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(OPTIONAL_INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include \
+		$(REPO_ROOT)/native/mrt/tests/optional_start_info.c \
+		$(REPO_ROOT)/native/mrt/src/start_info.c -o $@
+
+$(HOST_ABORT_TEST): $(REPO_ROOT)/native/mrt/tests/abort.c \
+		$(REPO_ROOT)/native/mrt/src/start.c $(REPO_ROOT)/native/mrt/src/entry_rust.c \
+		$(REPO_ROOT)/native/include/mrt/mrt.h $(BINDING)
+	mkdir -p $(OBJECT_DIR)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
 		-I$(REPO_ROOT)/native/include \
-		$(REPO_ROOT)/native/ranalib/tests/write.c \
-		$(REPO_ROOT)/native/ranalib/src/write.c \
+		-Dmain=program_main \
+		$(REPO_ROOT)/native/mrt/src/start.c -c -o $(OBJECT_DIR)/mrt-start-host-test.o
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include -Dmain=program_main \
+		$(REPO_ROOT)/native/mrt/src/entry_rust.c -c -o $(OBJECT_DIR)/mrt-entry-rust-host-test.o
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include \
+		$(REPO_ROOT)/native/mrt/tests/abort.c \
+		$(OBJECT_DIR)/mrt-start-host-test.o $(OBJECT_DIR)/mrt-entry-rust-host-test.o -o $@
+
+$(HOST_LIFECYCLE_TEST): $(REPO_ROOT)/native/mrt/tests/lifecycle.c \
+		$(REPO_ROOT)/native/mrt/src/lifecycle.c $(REPO_ROOT)/native/include/mrt/mrt.h $(BINDING)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include \
+		$(REPO_ROOT)/native/mrt/tests/lifecycle.c \
+		$(REPO_ROOT)/native/mrt/src/lifecycle.c -o $@
+
+$(HOST_ENTRY_C_TEST): $(REPO_ROOT)/native/mrt/tests/entry_c.c \
+		$(REPO_ROOT)/native/mrt/src/entry_c.c $(REPO_ROOT)/native/include/mrt/mrt.h \
+		$(BINDING)
+	mkdir -p $(OBJECT_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include -Dmain=program_main \
+		$(REPO_ROOT)/native/mrt/src/entry_c.c -c -o $(OBJECT_DIR)/mrt-entry-c-host-test.o
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include $(REPO_ROOT)/native/mrt/tests/entry_c.c \
+		$(OBJECT_DIR)/mrt-entry-c-host-test.o -o $@
+
+$(HOST_ERRNO_TEST): $(REPO_ROOT)/native/ranalib/tests/errno.c \
+		$(REPO_ROOT)/native/ranalib/src/errno.c $(RANALIB_ERRNO_HEADER)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
+		-I$(REPO_ROOT)/native/include $(REPO_ROOT)/native/ranalib/tests/errno.c \
+		$(REPO_ROOT)/native/ranalib/src/errno.c -o $@
+
+$(HOST_HEAP_TEST): $(REPO_ROOT)/native/ranalib/tests/heap.c \
+		$(REPO_ROOT)/native/ranalib/src/heap.c $(REPO_ROOT)/native/ranalib/src/errno.c \
+		$(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDLIB_HEADER) $(BINDING)
+	$(HOST_CC) -std=c11 -fno-builtin -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include \
+		$(REPO_ROOT)/native/ranalib/tests/heap.c \
+		$(REPO_ROOT)/native/ranalib/src/heap.c \
+		$(REPO_ROOT)/native/ranalib/src/errno.c -o $@
+
+$(HOST_STRING_TEST): $(REPO_ROOT)/native/ranalib/tests/string.c \
+		$(REPO_ROOT)/native/ranalib/src/string.c $(RANALIB_STRING_HEADER)
+	$(HOST_CC) -std=c11 -fno-builtin -Wall -Wextra -Werror \
+		-I$(REPO_ROOT)/native/include \
+		$(REPO_ROOT)/native/ranalib/tests/string.c \
+		$(REPO_ROOT)/native/ranalib/src/string.c -o $@
+
+$(HOST_STDIO_TEST): $(REPO_ROOT)/native/ranalib/tests/stdio.c \
+		$(REPO_ROOT)/native/ranalib/src/stdio.c $(REPO_ROOT)/native/ranalib/src/errno.c \
+		$(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDIO_HEADER) $(BINDING)
+	$(HOST_CC) -std=c11 -fno-builtin -Wall -Wextra -Werror -I$(INCLUDE_DIR) \
+		-I$(REPO_ROOT)/native/include \
+		$(REPO_ROOT)/native/ranalib/tests/stdio.c \
+		$(REPO_ROOT)/native/ranalib/src/stdio.c \
 		$(REPO_ROOT)/native/ranalib/src/errno.c -o $@

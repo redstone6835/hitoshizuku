@@ -2,7 +2,7 @@
     .globl _start
     .type _start,@function
 _start:
-    or $a3, $tp, $zero
+    or $a4, $tp, $zero
     bl __mrt_start
     break 0
     .size _start, .-_start

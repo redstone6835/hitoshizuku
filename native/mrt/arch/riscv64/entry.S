@@ -3,7 +3,7 @@
     .globl _start
     .type _start,@function
 _start:
-    mv a3, tp
+    mv a4, tp
     call __mrt_start
     ebreak
     .size _start, .-_start

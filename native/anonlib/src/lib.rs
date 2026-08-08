@@ -75,10 +75,10 @@ impl Stream<'_> {
     /// 将完整字节切片写入 Stream。
     pub fn write(&self, bytes: &[u8]) -> Result<usize, Status> {
         let length =
-            u64::try_from(bytes.len()).map_err(|_| Status(abi::MYGO_STATUS_CORE_OUT_OF_RANGE))?;
+            u64::try_from(bytes.len()).map_err(|_| Status(abi::MYGO_STATUS_core_out_of_range))?;
         let result = unsafe {
             mrt_call(
-                abi::MYGO_SLOT_STREAM_WRITE,
+                abi::MYGO_SLOT_stream_write,
                 self.handle.raw(),
                 bytes.as_ptr() as usize as u64,
                 length,
@@ -87,13 +87,13 @@ impl Stream<'_> {
                 0,
             )
         };
-        if result.status != abi::MYGO_STATUS_OK {
+        if result.status != abi::MYGO_STATUS_ok {
             return Err(Status(result.status));
         }
         let written = usize::try_from(result.value0)
-            .map_err(|_| Status(abi::MYGO_STATUS_CORE_OUT_OF_RANGE))?;
+            .map_err(|_| Status(abi::MYGO_STATUS_core_out_of_range))?;
         if written > bytes.len() {
-            return Err(Status(abi::MYGO_STATUS_CORE_OUT_OF_RANGE));
+            return Err(Status(abi::MYGO_STATUS_core_out_of_range));
         }
         Ok(written)
     }
@@ -101,7 +101,7 @@ impl Stream<'_> {
 
 /// 获取启动环境授予的 stdout Stream。
 pub fn stdout() -> Option<Stream<'static>> {
-    let raw = unsafe { mrt_initial_handle(abi::MYGO_REQUIREMENT_STDOUT) };
+    let raw = unsafe { mrt_initial_handle(abi::MYGO_REQUIREMENT_stdout) };
     Some(Stream {
         handle: BorrowedHandle::from_raw(raw)?,
     })

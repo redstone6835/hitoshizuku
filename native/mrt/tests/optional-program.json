@@ -3,8 +3,7 @@
   "abi_epoch": 1,
   "entry": "_start",
   "imports": [
-    { "operation": "process.exit", "required": true },
-    { "operation": "stream.write", "required": true }
+    { "operation": "process.exit", "required": true }
   ],
   "capabilities": [
     {
@@ -12,7 +11,16 @@
       "rights": ["exit"],
       "required": true
     },
-    { "requirement": "stdout", "rights": ["write"], "required": true }
+    {
+      "requirement": "stdin",
+      "rights": ["read"],
+      "required": false
+    },
+    {
+      "requirement": "stdout",
+      "rights": ["write"],
+      "required": true
+    }
   ],
   "runtime": {
     "stack_size": 65536,

@@ -6,12 +6,12 @@
 #include <mrt/mrt.h>
 
 enum {
-    FIXTURE_SIZE = MYGO_START_INFO_SIZE + 2 * MYGO_INITIAL_HANDLE_SIZE,
+    FIXTURE_SIZE = MYGO_START_INFO_SIZE + MYGO_CAPABILITY_COUNT * MYGO_INITIAL_HANDLE_SIZE,
 };
 
 struct start_fixture {
     struct mygo_start_info info;
-    struct mygo_initial_handle handles[2];
+    struct mygo_initial_handle handles[MYGO_CAPABILITY_COUNT];
 };
 
 _Static_assert(sizeof(struct start_fixture) == FIXTURE_SIZE, "fixture layout");
@@ -19,11 +19,15 @@ _Static_assert(sizeof(struct start_fixture) == FIXTURE_SIZE, "fixture layout");
 struct string_fixture {
     struct mygo_start_info info;
     struct mygo_string_ref argv[1];
-    struct mygo_initial_handle handles[2];
+    struct mygo_initial_handle handles[MYGO_CAPABILITY_COUNT];
     unsigned char strings[8];
 };
 
-_Static_assert(sizeof(struct string_fixture) == 272, "string fixture layout");
+_Static_assert(
+    sizeof(struct string_fixture) ==
+        MYGO_START_INFO_SIZE + MYGO_STRING_REF_SIZE +
+            MYGO_CAPABILITY_COUNT * MYGO_INITIAL_HANDLE_SIZE + 8,
+    "string fixture layout");
 
 static struct start_fixture valid_fixture(void) {
     struct start_fixture fixture;
@@ -43,15 +47,29 @@ static struct start_fixture valid_fixture(void) {
     fixture.info.call_slot_count = MYGO_CALL_SLOT_COUNT;
     fixture.info.random_seed[0] = 1;
 
-    fixture.handles[0].requirement_id = MYGO_REQUIREMENT_SELF_PROCESS;
-    fixture.handles[0].object_interface = MYGO_INTERFACE_PROCESS;
+    fixture.handles[0].requirement_id = MYGO_REQUIREMENT_self_process;
+    fixture.handles[0].object_interface = MYGO_INTERFACE_process;
     fixture.handles[0].handle = UINT64_C(0x0000000100000001);
-    fixture.handles[0].granted_rights = MYGO_RIGHT_TERMINATE_SELF;
+    fixture.handles[0].granted_rights = MYGO_RIGHT_exit;
 
-    fixture.handles[1].requirement_id = MYGO_REQUIREMENT_STDOUT;
-    fixture.handles[1].object_interface = MYGO_INTERFACE_STREAM;
+    fixture.handles[1].requirement_id = MYGO_REQUIREMENT_current_address_space;
+    fixture.handles[1].object_interface = MYGO_INTERFACE_address_space;
     fixture.handles[1].handle = UINT64_C(0x0000000100000002);
-    fixture.handles[1].granted_rights = MYGO_RIGHT_WRITE;
+    fixture.handles[1].granted_rights = MYGO_RIGHT_allocate | MYGO_RIGHT_free;
+
+    fixture.handles[2].requirement_id = MYGO_REQUIREMENT_stdin;
+    fixture.handles[2].object_interface = MYGO_INTERFACE_stream;
+    fixture.handles[2].handle = UINT64_C(0x0000000100000003);
+    fixture.handles[2].granted_rights = MYGO_RIGHT_read;
+
+    fixture.handles[3].requirement_id = MYGO_REQUIREMENT_stdout;
+    fixture.handles[3].object_interface = MYGO_INTERFACE_stream;
+    fixture.handles[3].handle = UINT64_C(0x0000000100000004);
+    fixture.handles[3].granted_rights = MYGO_RIGHT_write | MYGO_RIGHT_duplicate;
+    fixture.handles[4].requirement_id = MYGO_REQUIREMENT_monotonic_clock;
+    fixture.handles[4].object_interface = MYGO_INTERFACE_clock;
+    fixture.handles[4].handle = UINT64_C(0x0000000100000005);
+    fixture.handles[4].granted_rights = MYGO_RIGHT_read;
     return fixture;
 }
 
@@ -100,12 +118,14 @@ static struct string_fixture valid_string_fixture(void) {
     fixture.info.argv_offset = MYGO_START_INFO_SIZE;
     fixture.info.initial_handle_offset = MYGO_START_INFO_SIZE + MYGO_STRING_REF_SIZE;
     fixture.info.string_bytes_offset =
-        MYGO_START_INFO_SIZE + MYGO_STRING_REF_SIZE + 2 * MYGO_INITIAL_HANDLE_SIZE;
+        MYGO_START_INFO_SIZE + MYGO_STRING_REF_SIZE +
+        MYGO_CAPABILITY_COUNT * MYGO_INITIAL_HANDLE_SIZE;
     fixture.info.string_bytes_size = 2;
     fixture.argv[0].offset = fixture.info.string_bytes_offset;
     fixture.argv[0].length = 1;
-    fixture.handles[0] = base.handles[0];
-    fixture.handles[1] = base.handles[1];
+    for (unsigned int index = 0; index < MYGO_CAPABILITY_COUNT; ++index) {
+        fixture.handles[index] = base.handles[index];
+    }
     fixture.strings[0] = 'x';
     return fixture;
 }
@@ -125,7 +145,9 @@ static void valid_start_info_publishes_initial_handles(void) {
     assert(result == MRT_START_OK);
     assert(view.info == &fixture.info);
     assert(view.self_process == fixture.handles[0].handle);
-    assert(view.stdout_stream == fixture.handles[1].handle);
+    assert(view.address_space == fixture.handles[1].handle);
+    assert(view.stdin_stream == fixture.handles[2].handle);
+    assert(view.stdout_stream == fixture.handles[3].handle);
 }
 
 static void malformed_header_and_entry_range_are_rejected(void) {
@@ -152,7 +174,7 @@ static void reserved_and_program_contract_fields_are_rejected(void) {
     expect_error(&fixture, MRT_START_BAD_RESERVED);
 
     fixture = valid_fixture();
-    fixture.info.reserved2[39] = 1;
+    fixture.info.reserved4 = 1;
     expect_error(&fixture, MRT_START_BAD_RESERVED);
 
     fixture = valid_fixture();
@@ -170,6 +192,36 @@ static void reserved_and_program_contract_fields_are_rejected(void) {
     fixture = valid_fixture();
     fixture.info.call_slot_count += 1;
     expect_error(&fixture, MRT_START_BAD_CONTRACT);
+}
+
+static void valid_init_fini_arrays_are_published(void) {
+    static _Alignas(4096) uint64_t image[512];
+    struct start_fixture fixture = valid_fixture();
+    fixture.info.image_base = (uint64_t)(uintptr_t)image;
+    fixture.info.enabled_features = MYGO_FEATURE_INIT_FINI_ARRAY;
+    fixture.info.runtime_flags =
+        MYGO_RUNTIME_RUN_INIT_ARRAY | MYGO_RUNTIME_RUN_FINI_ARRAY;
+    fixture.info.init_array_offset = 8;
+    fixture.info.init_array_count = 1;
+    fixture.info.init_array_entry_size = sizeof(uint64_t);
+    fixture.info.fini_array_offset = 16;
+    fixture.info.fini_array_count = 1;
+    fixture.info.fini_array_entry_size = sizeof(uint64_t);
+
+    struct mrt_start_view view;
+    memset(&view, 0, sizeof(view));
+    enum mrt_start_error result = mrt_validate_start_info(
+        &fixture.info,
+        sizeof(fixture),
+        fixture.info.image_base,
+        0,
+        &view);
+
+    assert(result == MRT_START_OK);
+    assert(view.init_array == &image[1]);
+    assert(view.init_array_count == 1);
+    assert(view.fini_array == &image[2]);
+    assert(view.fini_array_count == 1);
 }
 
 static void tls_and_random_seed_invariants_are_rejected(void) {
@@ -216,15 +268,15 @@ static void malformed_handle_table_is_rejected(void) {
     expect_error(&fixture, MRT_START_BAD_RANGE);
 
     fixture = valid_fixture();
-    fixture.handles[1].requirement_id = MYGO_REQUIREMENT_SELF_PROCESS;
+    fixture.handles[1].requirement_id = MYGO_REQUIREMENT_self_process;
     expect_error(&fixture, MRT_START_BAD_HANDLES);
 
     fixture = valid_fixture();
-    fixture.handles[0].object_interface = MYGO_INTERFACE_STREAM;
+    fixture.handles[0].object_interface = MYGO_INTERFACE_stream;
     expect_error(&fixture, MRT_START_BAD_HANDLES);
 
     fixture = valid_fixture();
-    fixture.handles[1].granted_rights = MYGO_RIGHT_WRITE | MYGO_RIGHT_DUPLICATE;
+    fixture.handles[1].granted_rights = MYGO_RIGHT_write | MYGO_RIGHT_duplicate;
     expect_error(&fixture, MRT_START_BAD_HANDLES);
 
     fixture = valid_fixture();
@@ -257,6 +309,7 @@ int main(void) {
     reserved_and_program_contract_fields_are_rejected();
     tls_and_random_seed_invariants_are_rejected();
     static_tls_accepts_template_aligned_size();
+    valid_init_fini_arrays_are_published();
     malformed_handle_table_is_rejected();
     malformed_string_regions_are_rejected();
     return 0;
