@@ -13,6 +13,7 @@ use crate::bindings::generate_c_header;
 use crate::contract::parse_manifest;
 use crate::elf::MAX_OBJECT_FILE_SIZE;
 use crate::link::{InputObject, LinkRequest, apply_relocations, build_link_image};
+use crate::rust_bindings::generate_rust_module;
 use crate::writer::encode_soyo;
 
 const HELP: &str = "\
@@ -21,14 +22,16 @@ SOYO 直接静态链接器
 用法:
   soyo-ld --target <riscv64|loongarch64> --manifest <app.json> -o <app.soyo> <ELF ET_REL>...
   soyo-ld --target <riscv64|loongarch64> --manifest <app.json> --emit-c-header <path>
+  soyo-ld --target <riscv64|loongarch64> --manifest <app.json> --emit-rust-module <path>
 
 选项:
-  --target <arch>          输出目标架构
-  --manifest <path>       程序 ABI 与 capability 契约
-  --emit-c-header <path>  生成程序专属 C ABI binding
-  -o <path>                输出 SOYO 文件
-  -h, --help               显示帮助
-  --version                显示版本
+  --target <arch>            输出目标架构
+  --manifest <path>          程序 ABI 与 capability 契约
+  --emit-c-header <path>     生成程序专属 C ABI binding
+  --emit-rust-module <path>  生成程序专属 Rust ABI binding
+  -o <path>                  输出 SOYO 文件
+  -h, --help                 显示帮助
+  --version                  显示版本
 ";
 
 const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
@@ -62,6 +65,7 @@ enum Action {
     Version,
     Link(LinkOptions),
     EmitCHeader(HeaderOptions),
+    EmitRustModule(HeaderOptions),
 }
 
 #[derive(Debug)]
@@ -116,6 +120,13 @@ pub fn main_entry() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Ok(Action::EmitRustModule(options)) => match emit_rust_module(options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("soyo-ld: {error}");
+                ExitCode::from(1)
+            }
+        },
         Err(error) => {
             eprintln!("soyo-ld: {error}");
             if error.usage {
@@ -133,6 +144,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
     let mut manifest = None;
     let mut output = None;
     let mut c_header = None;
+    let mut rust_module = None;
     let mut objects = Vec::new();
     let mut positional_only = false;
     let mut arguments = arguments.into_iter();
@@ -181,6 +193,14 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
                 )?;
                 continue;
             }
+            if argument == "--emit-rust-module" {
+                set_once(
+                    &mut rust_module,
+                    PathBuf::from(next_value(&mut arguments, "--emit-rust-module")?),
+                    "--emit-rust-module",
+                )?;
+                continue;
+            }
             if argument.to_string_lossy().starts_with('-') {
                 return Err(CliError::usage(format!(
                     "未知选项 {}",
@@ -193,6 +213,11 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
 
     let target = target.ok_or_else(|| CliError::usage("缺少 --target"))?;
     let manifest = manifest.ok_or_else(|| CliError::usage("缺少 --manifest"))?;
+    if c_header.is_some() && rust_module.is_some() {
+        return Err(CliError::usage(
+            "--emit-c-header 不能与 --emit-rust-module 同时使用",
+        ));
+    }
     if let Some(c_header) = c_header {
         if output.is_some() || !objects.is_empty() {
             return Err(CliError::usage(
@@ -203,6 +228,18 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
             target,
             manifest,
             output: c_header,
+        }));
+    }
+    if let Some(rust_module) = rust_module {
+        if output.is_some() || !objects.is_empty() {
+            return Err(CliError::usage(
+                "--emit-rust-module 不能与 -o 或对象输入同时使用",
+            ));
+        }
+        return Ok(Action::EmitRustModule(HeaderOptions {
+            target,
+            manifest,
+            output: rust_module,
         }));
     }
     let output = output.ok_or_else(|| CliError::usage("缺少 -o"))?;
@@ -273,6 +310,14 @@ fn emit_c_header(options: HeaderOptions) -> Result<(), CliError> {
     let contract = parse_manifest(&manifest_source)
         .map_err(|error| CliError::operation(format!("manifest 无效: {error}")))?;
     let output = generate_c_header(options.target, &contract);
+    write_atomic(&options.output, &output, false)
+}
+
+fn emit_rust_module(options: HeaderOptions) -> Result<(), CliError> {
+    let manifest_source = read_manifest(&options.manifest)?;
+    let contract = parse_manifest(&manifest_source)
+        .map_err(|error| CliError::operation(format!("manifest 无效: {error}")))?;
+    let output = generate_rust_module(options.target, &contract);
     write_atomic(&options.output, &output, false)
 }
 

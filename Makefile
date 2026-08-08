@@ -2,7 +2,7 @@
 
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
 	kernel-la kernel-rv all clean cargo-setup \
-	native-hello-la native-hello-rv \
+	native-hello-la native-hello-rv native-rust-hello-la native-rust-hello-rv \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -27,20 +27,35 @@ INSTALL_MOD_PATH ?=
 KERNEL_MAP ?=
 KERNEL_PUBLISH_OUTPUT ?=
 
-UNKNOWN_NATIVE_EXAMPLES := $(filter-out hello,$(NATIVE_EXAMPLES))
+UNKNOWN_NATIVE_EXAMPLES := $(filter-out hello rust-hello,$(NATIVE_EXAMPLES))
 ifneq ($(strip $(UNKNOWN_NATIVE_EXAMPLES)),)
 $(error NATIVE_EXAMPLES 包含未知示例: $(UNKNOWN_NATIVE_EXAMPLES))
 endif
 
 ifneq ($(filter hello,$(NATIVE_EXAMPLES)),)
-define install_native_examples
+define install_native_hello
 	$(MAKE) -C native ARCH=$(1) hello
 	install -m 0755 $(BUILD_DIR)/$(1)/native/hello.soyo $(2)/bin/soyo-hello
 endef
 else
-define install_native_examples
+define install_native_hello
 endef
 endif
+
+ifneq ($(filter rust-hello,$(NATIVE_EXAMPLES)),)
+define install_native_rust_hello
+	$(MAKE) -C native ARCH=$(1) rust-hello
+	install -m 0755 $(BUILD_DIR)/$(1)/native/rust-hello.soyo $(2)/bin/soyo-rust-hello
+endef
+else
+define install_native_rust_hello
+endef
+endif
+
+define install_native_examples
+	$(call install_native_hello,$(1),$(2))
+	$(call install_native_rust_hello,$(1),$(2))
+endef
 
 empty :=
 space := $(empty) $(empty)
@@ -339,6 +354,12 @@ native-hello-la:
 
 native-hello-rv:
 	$(MAKE) -C native ARCH=$(RV_ARCH) hello
+
+native-rust-hello-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) rust-hello
+
+native-rust-hello-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) rust-hello
 
 clean:
 	cargo clean

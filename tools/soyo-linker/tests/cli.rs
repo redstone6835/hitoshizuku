@@ -83,6 +83,32 @@ fn header_only_mode_writes_generated_binding_without_objects() {
 }
 
 #[test]
+fn rust_module_mode_writes_generated_binding_without_objects() {
+    let directory = temp_dir();
+    let manifest = directory.join("app.json");
+    let module = directory.join("mygo_program.rs");
+    fs::write(&manifest, VALID_MANIFEST).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soyo-ld"))
+        .args(["--target", "riscv64", "--manifest"])
+        .arg(&manifest)
+        .args(["--emit-rust-module"])
+        .arg(&module)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Rust module 生成失败: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated = String::from_utf8(fs::read(&module).unwrap()).unwrap();
+    assert!(generated.contains("pub const MYGO_SLOT_PROCESS_EXIT: u64 = 0;\n"));
+    assert!(generated.contains("pub struct MygoNativeResult {\n"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn header_only_mode_rejects_link_output_without_partial_header() {
     let directory = temp_dir();
     let manifest = directory.join("app.json");

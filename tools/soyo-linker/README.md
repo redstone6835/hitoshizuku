@@ -28,17 +28,21 @@ soyo-ld --target riscv64 --manifest app.json -o app.soyo mrt.o app.o
 ELF `ET_REL` 对象。链接器会在写入前用共享 SOYO parser 和当前内核
 Native ABI policy 自检，并以原子替换方式写入输出。
 
-在编译程序对象前，可从同一份 manifest 生成目标架构的 C ABI binding：
+在编译程序对象前，可从同一份 manifest 生成目标架构的 C 或 Rust ABI binding：
 
 ```bash
 soyo-ld --target riscv64 --manifest app.json \
   --emit-c-header build/riscv64/native/include/mygo_program.h
+
+soyo-ld --target riscv64 --manifest app.json \
+  --emit-rust-module build/riscv64/native/include/mygo_program.rs
 ```
 
-生成文件包含 Native ABI registry、StartInfo/InitialHandle Wire 布局、程序
-Call Slot、capability 要求和 runtime 限制。结构大小和字段偏移带有 C11
-`_Static_assert`，编译与最终 SOYO 必须消费同一份 manifest。该模式只生成
-header，不能与 `-o` 或对象输入混用。
+两种生成物都包含 Native ABI registry、程序 Call Slot、capability 要求和
+runtime 限制。C header 还包含 StartInfo/InitialHandle 布局，Rust module
+包含 NativeCall/NativeResult 布局；结构大小和字段偏移分别带有 C11
+`_Static_assert` 与 Rust const assertion。编译与最终 SOYO 必须消费同一份
+manifest，两种 binding 模式都不能与 `-o` 或对象输入混用。
 
 RV64 建议使用以下 freestanding 参数：
 
@@ -53,6 +57,10 @@ LA64 建议使用：
 clang --target=loongarch64-unknown-none -ffreestanding -fno-pic -fno-pie \
   -fno-stack-protector -c app.c
 ```
+
+Rust `no_std` 对象使用固定评测工具链的 `riscv64imac-unknown-none-elf` 或
+`loongarch64-unknown-none` target，并通过 `--emit=obj` 生成 `ET_REL`。RV64
+选择 soft-float target 是为了与现有 mrt C 对象保持相同 psABI flags。
 
 ## 程序契约
 

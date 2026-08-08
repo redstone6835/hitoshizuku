@@ -1,0 +1,20 @@
+{
+  "entry": "_start",
+  "imports": [
+    { "name": "PROCESS_EXIT", "required": true },
+    { "name": "STREAM_WRITE", "required": true }
+  ],
+  "capabilities": [
+    {
+      "name": "SELF_PROCESS",
+      "rights": ["TERMINATE_SELF"],
+      "required": true
+    },
+    { "name": "STDOUT", "rights": ["WRITE"], "required": true }
+  ],
+  "runtime": {
+    "stack_size": 65536,
+    "stack_guard_size": 4096,
+    "start_info_max_size": 4096
+  }
+}

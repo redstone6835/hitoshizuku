@@ -5,4 +5,5 @@ pub mod cli;
 pub mod contract;
 pub mod elf;
 pub mod link;
+pub mod rust_bindings;
 pub mod writer;
