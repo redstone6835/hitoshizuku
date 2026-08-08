@@ -216,6 +216,9 @@ pub enum Event {
     AllocRegistryRegister,
     AllocRegistryRemove,
     AllocRegistryLookup,
+    AllocRegistryRegisterKernel,
+    AllocRegistryRegisterOwned,
+    AllocOwnerRangeLookup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,7 +249,7 @@ impl EventCategory {
 }
 
 impl Event {
-    pub const ALL: [Self; 96] = [
+    pub const ALL: [Self; 99] = [
         Self::SysSendCopy,
         Self::SysSendSocket,
         Self::SysRecvSocket,
@@ -343,6 +346,9 @@ impl Event {
         Self::AllocRegistryRegister,
         Self::AllocRegistryRemove,
         Self::AllocRegistryLookup,
+        Self::AllocRegistryRegisterKernel,
+        Self::AllocRegistryRegisterOwned,
+        Self::AllocOwnerRangeLookup,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -443,6 +449,9 @@ impl Event {
             Self::AllocRegistryRegister => "alloc_registry_register",
             Self::AllocRegistryRemove => "alloc_registry_remove",
             Self::AllocRegistryLookup => "alloc_registry_lookup",
+            Self::AllocRegistryRegisterKernel => "alloc_registry_register_kernel",
+            Self::AllocRegistryRegisterOwned => "alloc_registry_register_owned",
+            Self::AllocOwnerRangeLookup => "alloc_owner_range_lookup",
         }
     }
 
@@ -542,7 +551,10 @@ impl Event {
             | Self::MemCopyCow
             | Self::AllocRegistryRegister
             | Self::AllocRegistryRemove
-            | Self::AllocRegistryLookup => EventCategory::Memory,
+            | Self::AllocRegistryLookup
+            | Self::AllocRegistryRegisterKernel
+            | Self::AllocRegistryRegisterOwned
+            | Self::AllocOwnerRangeLookup => EventCategory::Memory,
             Self::SlabCacheHit
             | Self::SlabCacheMiss
             | Self::SlabRefill
@@ -3654,7 +3666,10 @@ mod tests {
         assert_eq!(Event::MmProtectBatch as usize, 82);
         assert_eq!(Event::PageFaultDecode as usize, 83);
         assert_eq!(Event::AllocRegistryLookup as usize, 95);
-        assert_eq!(Event::ALL.len(), 96);
+        assert_eq!(Event::AllocRegistryRegisterKernel as usize, 96);
+        assert_eq!(Event::AllocRegistryRegisterOwned as usize, 97);
+        assert_eq!(Event::AllocOwnerRangeLookup as usize, 98);
+        assert_eq!(Event::ALL.len(), 99);
         assert_eq!(Event::from_id(52), Some(Event::PageFaultResident));
         assert_eq!(Event::from_id(55), Some(Event::PageFaultSingle));
         assert_eq!(Event::from_id(57), Some(Event::PageFaultUncachedFill));

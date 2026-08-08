@@ -582,6 +582,19 @@ pub unsafe fn dispatch_kernel_mixin(
     unsafe { (hooks.dispatch)(core::ptr::from_ref(site), core::ptr::from_mut(frame)) }
 }
 
+/// 在独立冷路径中执行内核 Mixin 调用帧逻辑。
+///
+/// 导出宏只在站点存在活动处理链时调用这里。禁止内联可以阻止编译器把慢路径的大型栈帧
+/// 合并回常用入口，使没有处理器的直接符号调用只承担路由快查成本。
+#[cold]
+#[inline(never)]
+pub fn invoke_kernel_mixin_slow<F, R>(callback: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    callback()
+}
+
 /// 目标函数在栈上保存的原逻辑 continuation。
 ///
 /// 该类型把任意 `FnOnce() -> R` 擦除成 [`KernelMixinContinuationV1`]，使覆盖处理器能够
@@ -1304,5 +1317,16 @@ mod tests {
             )
             .valid([0; 32])
         );
+    }
+
+    #[test]
+    fn mixin_slow_path_invokes_callback_once() {
+        let mut calls = 0usize;
+        let result = invoke_kernel_mixin_slow(|| {
+            calls += 1;
+            42usize
+        });
+        assert_eq!(result, 42);
+        assert_eq!(calls, 1);
     }
 }

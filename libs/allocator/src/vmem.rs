@@ -71,6 +71,12 @@ pub struct BoundaryTag {
     pub free_prev: usize,
     /// 是否在使用中
     pub in_use: bool,
+    /// 动态映射区间对应的物理起始地址。
+    pub backing_paddr: usize,
+    /// 物理后备块的 buddy order。
+    pub backing_order: usize,
+    /// 当前标签是否已绑定物理后备块。
+    pub has_backing: bool,
 }
 
 impl BoundaryTag {
@@ -84,6 +90,9 @@ impl BoundaryTag {
             free_next: INVALID_TAG,
             free_prev: INVALID_TAG,
             in_use: false,
+            backing_paddr: 0,
+            backing_order: 0,
+            has_backing: false,
         }
     }
 }
@@ -679,81 +688,6 @@ impl VmemArena {
         result.ok_or(VmemError::OutOfAddressSpace)
     }
 
-    pub fn alloc_in_range_result(
-        &mut self,
-        range_start: usize,
-        range_end: usize,
-        size: usize,
-        align: usize,
-    ) -> Result<usize, VmemError> {
-        if !self.initialized {
-            return Err(VmemError::NotInitialized);
-        }
-        if size == 0 {
-            return Err(VmemError::InvalidSize);
-        }
-        if range_start >= range_end {
-            self.stats.alloc_failures += 1;
-            return Err(VmemError::InvalidRange);
-        }
-
-        self.stats.alloc_count += 1;
-        VMEM_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-
-        let aligned_size = match align_up(size, self.quantum) {
-            Some(size) => size,
-            None => {
-                self.stats.alloc_failures += 1;
-                return Err(VmemError::InvalidSize);
-            }
-        };
-        let align = align.max(self.quantum);
-        if (align & (align - 1)) != 0 {
-            self.stats.alloc_failures += 1;
-            return Err(VmemError::InvalidAlignment);
-        }
-
-        let mut idx = self.seg_list_head;
-        while idx != INVALID_TAG {
-            let tag = read_tag(idx);
-            if tag.bt_type != BtType::Free {
-                idx = tag.seg_next;
-                continue;
-            }
-            let Some(tag_end) = tag.base.checked_add(tag.size) else {
-                self.stats.alloc_failures += 1;
-                return Err(VmemError::InvalidRange);
-            };
-            let candidate_start = tag.base.max(range_start);
-            let candidate_end = tag_end.min(range_end);
-            if candidate_start >= candidate_end {
-                idx = tag.seg_next;
-                continue;
-            }
-            let Some(base) = align_up(candidate_start, align) else {
-                idx = tag.seg_next;
-                continue;
-            };
-            let Some(end) = base.checked_add(aligned_size) else {
-                self.stats.alloc_failures += 1;
-                return Err(VmemError::InvalidRange);
-            };
-            if end > candidate_end {
-                idx = tag.seg_next;
-                continue;
-            }
-            return if self.reserve_from_tag(idx, base, aligned_size) {
-                Ok(base)
-            } else {
-                self.stats.alloc_failures += 1;
-                Err(VmemError::MetadataOutOfMemory)
-            };
-        }
-
-        self.stats.alloc_failures += 1;
-        Err(VmemError::OutOfAddressSpace)
-    }
-
     pub fn reserve_result(&mut self, base: usize, size: usize) -> Result<(), VmemError> {
         // reserve 与普通 alloc 的区别在于：区间位置已经由上层决定，vmem 这里只是把这段
         // 地址从 free 视图中精准扣除，并把相邻剩余空间重新组织成新的 free tag。
@@ -1061,6 +995,9 @@ impl VmemArena {
 
         let mut allocated = read_tag(tag_idx);
         allocated.bt_type = BtType::Allocated;
+        allocated.backing_paddr = 0;
+        allocated.backing_order = 0;
+        allocated.has_backing = false;
         write_tag(tag_idx, allocated);
         self.add_to_allocated_lookup(tag_idx);
         self.stats.allocated_size += allocated.size;
@@ -1074,6 +1011,35 @@ impl VmemArena {
     /// 标记为空闲并尝试与相邻空闲段合并
     pub fn free(&mut self, addr: usize, size: usize) -> bool {
         self.free_result(addr, size).is_ok()
+    }
+
+    pub fn bind_backing(&mut self, addr: usize, size: usize, paddr: usize, order: usize) -> bool {
+        let Some(expected_size) = align_up(size, self.quantum) else {
+            return false;
+        };
+        let idx = self.find_allocated_tag(addr);
+        if idx == INVALID_TAG {
+            return false;
+        }
+        let mut tag = read_tag(idx);
+        if tag.size != expected_size || tag.has_backing {
+            return false;
+        }
+        tag.backing_paddr = paddr;
+        tag.backing_order = order;
+        tag.has_backing = true;
+        write_tag(idx, tag);
+        true
+    }
+
+    pub fn backing(&mut self, addr: usize) -> Option<(usize, usize, usize)> {
+        let idx = self.find_allocated_tag(addr);
+        if idx == INVALID_TAG {
+            return None;
+        }
+        let tag = read_tag(idx);
+        tag.has_backing
+            .then_some((tag.backing_paddr, tag.size, tag.backing_order))
     }
 
     pub fn free_result(&mut self, addr: usize, size: usize) -> Result<(), VmemError> {
@@ -1111,6 +1077,9 @@ impl VmemArena {
         current.bt_type = BtType::Free;
         current.free_prev = INVALID_TAG;
         current.free_next = INVALID_TAG;
+        current.backing_paddr = 0;
+        current.backing_order = 0;
+        current.has_backing = false;
         write_tag(idx, current);
         self.stats.allocated_size = self.stats.allocated_size.saturating_sub(tag_size);
         self.stats.free_size += tag_size;

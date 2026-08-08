@@ -255,6 +255,11 @@ pub const KERNEL_HEAP_BASE: usize = 0xFFFF_FFC0_0000_0000;
 /// 内核堆虚拟地址区域大小：32 GiB
 pub const KERNEL_HEAP_SIZE: usize = 32 * 1024 * 1024 * 1024;
 
+/// 需要 registry 账本的分配独立使用 2 GiB 分页窗口。
+pub const TRACKED_HEAP_BASE: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
+pub const TRACKED_HEAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
+const TRACKED_HEAP_END: usize = TRACKED_HEAP_BASE + TRACKED_HEAP_SIZE;
+
 /// 内核页表根物理地址
 pub(crate) static KERNEL_PAGE_TABLE_ROOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -274,6 +279,19 @@ static KERNEL_MAPPING_OBSERVED: [AtomicUsize; sched::NR_CPUS] =
 /// 返回内核堆虚拟地址区域
 pub fn kernel_heap_region() -> (usize, usize) {
     (KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE)
+}
+
+pub fn tracked_heap_region() -> (usize, usize) {
+    (TRACKED_HEAP_BASE, TRACKED_HEAP_SIZE)
+}
+
+fn dynamic_heap_window(vaddr: usize, size: usize) -> bool {
+    let Some(end) = vaddr.checked_add(size) else {
+        return false;
+    };
+    let kernel_end = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
+    (vaddr >= KERNEL_HEAP_BASE && end <= kernel_end)
+        || (vaddr >= TRACKED_HEAP_BASE && end <= TRACKED_HEAP_END)
 }
 
 /// 将当前内核可访问的虚拟地址转换为物理地址。
@@ -820,6 +838,14 @@ pub fn map_kernel_heap_range(
     size: usize,
     page_policy: PagePolicy,
 ) -> bool {
+    if size == 0
+        || !vaddr.is_multiple_of(PAGE_SIZE)
+        || !paddr.is_multiple_of(PAGE_SIZE)
+        || !size.is_multiple_of(PAGE_SIZE)
+        || !dynamic_heap_window(vaddr, size)
+    {
+        return false;
+    }
     // 检查页表是否已初始化
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     if root_paddr == 0 {
@@ -927,6 +953,13 @@ pub fn map_kernel_heap_range(
 /// - **页表遍历开销**: 每次解除映射都需要从根遍历到叶子，对于大量小对象释放
 ///   可能成为瓶颈。可以考虑缓存最近访问的页表页地址。
 pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
+    if size == 0
+        || !vaddr.is_multiple_of(PAGE_SIZE)
+        || !size.is_multiple_of(PAGE_SIZE)
+        || !dynamic_heap_window(vaddr, size)
+    {
+        return false;
+    }
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     if root_paddr == 0 {
         log::error!(
@@ -988,6 +1021,13 @@ pub fn protect_kernel_heap_range(
     write: bool,
     execute: bool,
 ) -> bool {
+    if size == 0
+        || !vaddr.is_multiple_of(PAGE_SIZE)
+        || !size.is_multiple_of(PAGE_SIZE)
+        || !dynamic_heap_window(vaddr, size)
+    {
+        return false;
+    }
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     if root_paddr == 0 {
         log::error!(
@@ -1036,6 +1076,13 @@ pub fn validate_kernel_heap_range(
     write: bool,
     execute: bool,
 ) -> bool {
+    if size == 0
+        || !vaddr.is_multiple_of(PAGE_SIZE)
+        || !size.is_multiple_of(PAGE_SIZE)
+        || !dynamic_heap_window(vaddr, size)
+    {
+        return false;
+    }
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     if root_paddr == 0 {
         return false;
@@ -1065,10 +1112,7 @@ pub(crate) fn recover_stale_kernel_heap_translation(
     write: bool,
     execute: bool,
 ) -> bool {
-    let Some(region_end) = KERNEL_HEAP_BASE.checked_add(KERNEL_HEAP_SIZE) else {
-        return false;
-    };
-    if vaddr < KERNEL_HEAP_BASE || vaddr >= region_end {
+    if !dynamic_heap_window(vaddr, 1) {
         return false;
     }
 

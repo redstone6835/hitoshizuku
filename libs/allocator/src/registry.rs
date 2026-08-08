@@ -3,11 +3,11 @@
 //! 这个模块维护“用户指针 -> 分配记录”的映射，用来支持以下关键能力：
 //!
 //! - `deallocate(ptr)` 时根据裸指针找回分配来源与布局信息；
-//! - `realloc` 时判断对象是 boot/small/large/managed/physical 哪一路分配；
+//! - `realloc` 时判断对象是 boot/small/large/physical 哪一路分配；
 //! - 统计和调试时追踪当前活跃分配。
 //!
 //! 从设计上看，它是整个 allocator 的“账本”。真正的内存页由 buddy、slab、
-//! kernel heap 或 managed allocator 持有，而注册表负责记账、查账和销账。
+//! kernel heap 持有，而注册表负责记账、查账和销账。
 //!
 //! 实现采用固定桶数组 + 单向链表节点的哈希表形式，强调三点：
 //!
@@ -19,6 +19,7 @@
 //! 普通 alloc/free 只会碰其中一个 shard，避免所有 CPU 都竞争同一把 registry 全局锁。
 use core::alloc::Layout;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Mutex;
 
@@ -54,8 +55,43 @@ pub struct AllocationRegistryStats {
     pub live_boot: usize,
     pub live_small: usize,
     pub live_large: usize,
-    pub live_managed: usize,
     pub live_physical: usize,
+}
+
+/// profiling 构建中 registry 各类路径的累计调用计数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistryPathCounters {
+    pub register_kernel: u64,
+    pub register_owned: u64,
+    pub remove_kernel: u64,
+    pub remove_owned: u64,
+    pub containing_queries: u64,
+    pub containing_scanned_shards: u64,
+    pub containing_scanned_buckets: u64,
+    pub containing_scanned_nodes: u64,
+}
+
+impl RegistryPathCounters {
+    pub const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            register_kernel: self.register_kernel.saturating_sub(earlier.register_kernel),
+            register_owned: self.register_owned.saturating_sub(earlier.register_owned),
+            remove_kernel: self.remove_kernel.saturating_sub(earlier.remove_kernel),
+            remove_owned: self.remove_owned.saturating_sub(earlier.remove_owned),
+            containing_queries: self
+                .containing_queries
+                .saturating_sub(earlier.containing_queries),
+            containing_scanned_shards: self
+                .containing_scanned_shards
+                .saturating_sub(earlier.containing_scanned_shards),
+            containing_scanned_buckets: self
+                .containing_scanned_buckets
+                .saturating_sub(earlier.containing_scanned_buckets),
+            containing_scanned_nodes: self
+                .containing_scanned_nodes
+                .saturating_sub(earlier.containing_scanned_nodes),
+        }
+    }
 }
 
 /// 注册表结构审计结果。
@@ -73,7 +109,6 @@ pub struct AllocationRegistryAudit {
     pub scanned_live_boot: usize,
     pub scanned_live_small: usize,
     pub scanned_live_large: usize,
-    pub scanned_live_managed: usize,
     pub scanned_live_physical: usize,
     pub scanned_max_chain_len: usize,
 }
@@ -89,11 +124,11 @@ pub struct AllocationRegistrySnapshot {
     pub audit: AllocationRegistryAudit,
 }
 
-/// 指定外部所有者仍存活的分配记录摘要。
+/// 指定非零外部所有者仍存活的分配记录摘要。
 ///
-/// 该快照直接扫描 allocator registry，不分配内存，也不暴露对象地址。它用于在 ELM
-/// 退役被资源账本阻塞时区分普通堆对象、大对象、受管对象和显式物理页泄漏。
-#[derive(Clone, Copy, Debug, Default)]
+/// 该快照由 owner index 维护，不分配内存，也不暴露对象地址。它用于在 ELM 退役被
+/// 资源账本阻塞时区分普通堆对象、大对象和显式物理页泄漏。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocationOwnerStats {
     pub records: usize,
     pub requested_bytes: usize,
@@ -101,7 +136,6 @@ pub struct AllocationOwnerStats {
     pub boot_records: usize,
     pub small_records: usize,
     pub large_records: usize,
-    pub managed_records: usize,
     pub physical_records: usize,
     pub largest_requested_bytes: usize,
     pub largest_usable_bytes: usize,
@@ -278,7 +312,7 @@ struct AllocationRegistryInner {
     /// alloc/free 热路径只标记失效；stats/audit 等冷路径读取前再扫描桶长数组，
     /// 避免稀疏哈希表在 `max_chain_len == 1` 时每次释放都持锁遍历整个 shard。
     max_chain_len_dirty: bool,
-    live_by_kind: [usize; 5],
+    live_by_kind: [usize; 4],
     initializing: bool,
     initialized: bool,
 }
@@ -304,7 +338,7 @@ impl AllocationRegistryInner {
             chain_corruptions: 0,
             max_chain_len: 0,
             max_chain_len_dirty: false,
-            live_by_kind: [0; 5],
+            live_by_kind: [0; 4],
             initializing: false,
             initialized: false,
         }
@@ -313,7 +347,7 @@ impl AllocationRegistryInner {
 
 struct RegistryShard {
     /// 每个 shard 独立加锁。跨指针迁移通过 remove + register 两阶段完成，不同时持有
-    /// 两个 shard 锁，避免未来 managed compact / realloc 路径出现锁顺序问题。
+    /// 两个 shard 锁，避免未来 realloc 路径出现锁顺序问题。
     inner: Mutex<AllocationRegistryInner>,
 }
 
@@ -327,12 +361,28 @@ impl RegistryShard {
 
 pub struct AllocationRegistry {
     shards: [RegistryShard; REGISTRY_SHARDS],
+    register_kernel: AtomicU64,
+    register_owned: AtomicU64,
+    remove_kernel: AtomicU64,
+    remove_owned: AtomicU64,
+    containing_queries: AtomicU64,
+    containing_scanned_shards: AtomicU64,
+    containing_scanned_buckets: AtomicU64,
+    containing_scanned_nodes: AtomicU64,
 }
 
 impl AllocationRegistry {
     pub const fn new() -> Self {
         Self {
             shards: [const { RegistryShard::new() }; REGISTRY_SHARDS],
+            register_kernel: AtomicU64::new(0),
+            register_owned: AtomicU64::new(0),
+            remove_kernel: AtomicU64::new(0),
+            remove_owned: AtomicU64::new(0),
+            containing_queries: AtomicU64::new(0),
+            containing_scanned_shards: AtomicU64::new(0),
+            containing_scanned_buckets: AtomicU64::new(0),
+            containing_scanned_nodes: AtomicU64::new(0),
         }
     }
 
@@ -409,7 +459,7 @@ impl AllocationRegistry {
             inner.chain_corruptions = 0;
             inner.max_chain_len = 0;
             inner.max_chain_len_dirty = false;
-            inner.live_by_kind = [0; 5];
+            inner.live_by_kind = [0; 4];
             inner.initializing = false;
             inner.initialized = true;
         }
@@ -421,8 +471,13 @@ impl AllocationRegistry {
         _boot: &BootAllocator,
         record: AllocationRecord,
     ) -> Result<(), RegistryError> {
+        let owner = record.accounting_owner();
         #[cfg(feature = "performance-profile")]
-        let _profile = profiling::scope(profiling::Event::AllocRegistryRegister);
+        let _profile = profiling::scope(if owner == 0 {
+            profiling::Event::AllocRegistryRegisterKernel
+        } else {
+            profiling::Event::AllocRegistryRegisterOwned
+        });
         if record.ptr == 0 {
             let mut inner = self.shards[0].inner.lock();
             inner.insert_failures += 1;
@@ -518,6 +573,7 @@ impl AllocationRegistry {
             let chain_len = 1 + chain_len_before;
             set_bucket_chain_len(&inner, bucket, chain_len);
             note_chain_insert_locked(&mut inner, chain_len);
+            self.note_register(owner);
             return Ok(());
         }
     }
@@ -528,26 +584,33 @@ impl AllocationRegistry {
 
     /// 查询完整覆盖给定地址范围的活跃分配记录。
     ///
-    /// 注册表按分配起点散列，内部指针无法直接命中桶，因此该接口会遍历各 shard。
-    /// 它只用于跨 ABI 裸指针校验，不应放进常规分配热路径。
+    /// 这是旧 ELM ABI 的兼容冷路径。注册表按分配起点散列，内部指针无法直接命中桶，
+    /// 因此调用会遍历各 shard；新代码应使用按 owner 建立的范围索引。
     pub fn find_containing(&self, ptr: usize, len: usize) -> Option<AllocationRecord> {
         if ptr == 0 || len == 0 {
             return None;
         }
         let end = ptr.checked_add(len)?;
+        let mut scanned_shards = 0u64;
+        let mut scanned_buckets = 0u64;
+        let mut scanned_nodes = 0u64;
         for shard in &self.shards {
+            scanned_shards = scanned_shards.saturating_add(1);
             let mut inner = shard.inner.lock();
             if !inner.initialized {
                 continue;
             }
             for bucket in 0..inner.bucket_count {
+                scanned_buckets = scanned_buckets.saturating_add(1);
                 let mut current = bucket_head(&inner, bucket);
                 let mut visited = 0usize;
                 while current != 0 {
                     if visited >= inner.nodes_allocated {
                         note_chain_corruption_locked(&mut inner);
+                        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
                         return None;
                     }
+                    scanned_nodes = scanned_nodes.saturating_add(1);
                     let node = read_node(current);
                     let record = node.record.into_record();
                     let usable = record.usable_size.max(record.size);
@@ -557,6 +620,7 @@ impl AllocationRegistry {
                             .checked_add(usable)
                             .is_some_and(|record_end| record.ptr <= ptr && end <= record_end)
                     {
+                        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
                         return Some(record);
                     }
                     current = node.next;
@@ -564,6 +628,7 @@ impl AllocationRegistry {
                 }
             }
         }
+        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
         None
     }
 
@@ -590,10 +655,6 @@ impl AllocationRegistry {
             }
         };
         Ok(read_node_record(node_addr))
-    }
-
-    pub fn remove(&self, ptr: usize) -> Option<AllocationRecord> {
-        self.remove_result(ptr).ok()
     }
 
     pub fn remove_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
@@ -640,6 +701,7 @@ impl AllocationRegistry {
                 decrement_live_records_locked(&mut inner);
                 let idx = kind_index(record.kind);
                 decrement_live_kind_locked(&mut inner, idx);
+                self.note_remove(record.accounting_owner());
                 return Ok(record);
             }
             prev = current;
@@ -751,6 +813,19 @@ impl AllocationRegistry {
         out
     }
 
+    pub fn path_counters(&self) -> RegistryPathCounters {
+        RegistryPathCounters {
+            register_kernel: self.register_kernel.load(Ordering::Relaxed),
+            register_owned: self.register_owned.load(Ordering::Relaxed),
+            remove_kernel: self.remove_kernel.load(Ordering::Relaxed),
+            remove_owned: self.remove_owned.load(Ordering::Relaxed),
+            containing_queries: self.containing_queries.load(Ordering::Relaxed),
+            containing_scanned_shards: self.containing_scanned_shards.load(Ordering::Relaxed),
+            containing_scanned_buckets: self.containing_scanned_buckets.load(Ordering::Relaxed),
+            containing_scanned_nodes: self.containing_scanned_nodes.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn audit(&self) -> AllocationRegistryAudit {
         self.snapshot().audit
     }
@@ -789,7 +864,6 @@ impl AllocationRegistry {
             out.scanned_live_boot += scanned.live_by_kind[kind_index(AllocationKind::Boot)];
             out.scanned_live_small += scanned.live_by_kind[kind_index(AllocationKind::Small)];
             out.scanned_live_large += scanned.live_by_kind[kind_index(AllocationKind::Large)];
-            out.scanned_live_managed += scanned.live_by_kind[kind_index(AllocationKind::Managed)];
             out.scanned_live_physical += scanned.live_by_kind[kind_index(AllocationKind::Physical)];
             out.scanned_max_chain_len = out.scanned_max_chain_len.max(scanned.max_chain_len);
 
@@ -823,67 +897,48 @@ impl AllocationRegistry {
         AllocationRegistrySnapshot { stats, audit: out }
     }
 
-    /// 扫描指定外部所有者仍存活的分配记录。
-    pub fn owner_stats(&self, owner: u64) -> AllocationOwnerStats {
-        let mut out = AllocationOwnerStats::default();
-        for shard in &self.shards {
-            let inner = shard.inner.lock();
-            if !inner.initialized
-                || inner.buckets.is_null()
-                || inner.bucket_lengths.is_null()
-                || inner.bucket_count == 0
-            {
-                out.scan_errors = out.scan_errors.saturating_add(1);
-                continue;
-            }
-            for bucket in 0..inner.bucket_count {
-                let mut current = bucket_head(&inner, bucket);
-                let mut visited = 0usize;
-                while current != 0 {
-                    if visited >= inner.nodes_allocated {
-                        out.scan_errors = out.scan_errors.saturating_add(1);
-                        break;
-                    }
-                    let node = read_node(current);
-                    let record = node.record.into_record();
-                    if record.accounting_owner() == owner {
-                        out.records = out.records.saturating_add(1);
-                        out.requested_bytes = out.requested_bytes.saturating_add(record.size);
-                        out.usable_bytes = out
-                            .usable_bytes
-                            .saturating_add(record.usable_size.max(record.size));
-                        out.largest_requested_bytes = out.largest_requested_bytes.max(record.size);
-                        out.largest_usable_bytes = out
-                            .largest_usable_bytes
-                            .max(record.usable_size.max(record.size));
-                        match record.kind {
-                            AllocationKind::Boot => {
-                                out.boot_records = out.boot_records.saturating_add(1)
-                            }
-                            AllocationKind::Small => {
-                                out.small_records = out.small_records.saturating_add(1)
-                            }
-                            AllocationKind::Large => {
-                                out.large_records = out.large_records.saturating_add(1)
-                            }
-                            AllocationKind::Managed => {
-                                out.managed_records = out.managed_records.saturating_add(1)
-                            }
-                            AllocationKind::Physical => {
-                                out.physical_records = out.physical_records.saturating_add(1)
-                            }
-                        }
-                    }
-                    current = node.next;
-                    visited = visited.saturating_add(1);
-                }
-            }
-        }
-        out
-    }
-
     fn shard_for_hash(&self, hash: usize) -> &RegistryShard {
         &self.shards[hash & (REGISTRY_SHARDS - 1)]
+    }
+
+    #[inline]
+    fn note_register(&self, owner: u64) {
+        #[cfg(feature = "performance-profile")]
+        if owner == 0 {
+            self.register_kernel.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.register_owned.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = owner;
+    }
+
+    #[inline]
+    fn note_remove(&self, owner: u64) {
+        #[cfg(feature = "performance-profile")]
+        if owner == 0 {
+            self.remove_kernel.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.remove_owned.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = owner;
+    }
+
+    #[inline]
+    fn note_containing_scan(&self, shards: u64, buckets: u64, nodes: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.containing_queries.fetch_add(1, Ordering::Relaxed);
+            self.containing_scanned_shards
+                .fetch_add(shards, Ordering::Relaxed);
+            self.containing_scanned_buckets
+                .fetch_add(buckets, Ordering::Relaxed);
+            self.containing_scanned_nodes
+                .fetch_add(nodes, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = (shards, buckets, nodes);
     }
 }
 
@@ -906,7 +961,6 @@ fn accumulate_stats_locked(out: &mut AllocationRegistryStats, inner: &Allocation
     out.live_boot += inner.live_by_kind[kind_index(AllocationKind::Boot)];
     out.live_small += inner.live_by_kind[kind_index(AllocationKind::Small)];
     out.live_large += inner.live_by_kind[kind_index(AllocationKind::Large)];
-    out.live_managed += inner.live_by_kind[kind_index(AllocationKind::Managed)];
     out.live_physical += inner.live_by_kind[kind_index(AllocationKind::Physical)];
 }
 
@@ -914,7 +968,7 @@ fn accumulate_stats_locked(out: &mut AllocationRegistryStats, inner: &Allocation
 struct RegistryShardScan {
     live_records: usize,
     free_nodes: usize,
-    live_by_kind: [usize; 5],
+    live_by_kind: [usize; 4],
     max_chain_len: usize,
 }
 
@@ -1189,8 +1243,7 @@ fn kind_index(kind: AllocationKind) -> usize {
         AllocationKind::Boot => 0,
         AllocationKind::Small => 1,
         AllocationKind::Large => 2,
-        AllocationKind::Managed => 3,
-        AllocationKind::Physical => 4,
+        AllocationKind::Physical => 3,
     }
 }
 
