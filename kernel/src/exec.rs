@@ -373,6 +373,59 @@ pub(crate) fn prepare_native_initial_frame(
     frame
 }
 
+/// 提交一个已经完全准备好的 Native 到 Native 映像替换。
+pub(crate) fn commit_native_replace(
+    task: &Arc<Task>,
+    image: crate::soyo::PreparedSoyoImage,
+    user_context: UserContextRef,
+) -> Result<(), Errno> {
+    if user_context.is_none() || task.user_abi_kind() != UserAbiKind::MygoNative {
+        return Err(Errno::EINVAL);
+    }
+    let old_vm = task_vm_space(task).ok_or(Errno::EAGAIN)?;
+    let kernel_stack_top = task.ensure_kernel_stack();
+    let mut frame = prepare_native_initial_frame(
+        image.entry_pc,
+        image.user_sp,
+        image.start_info_address,
+        image.start_info_size,
+        image.image_base,
+        image.tls_base,
+        image.bootstrap_process,
+        kernel_stack_top,
+    );
+
+    let group = task.thread_group();
+    let mut guard = group.lock_exec();
+    if guard.phase() != ExecPhase::Running
+        || !guard.has_only_member(task)
+        || group.group_exit_status().is_some()
+    {
+        return Err(Errno::EBUSY);
+    }
+    guard.set_phase(ExecPhase::Transitioning);
+
+    let erased_vm: Arc<dyn core::any::Any + Send + Sync> = Arc::clone(&image.vm) as Arc<_>;
+    if task.ext_replace(TASKEXT_VM_SPACE, erased_vm).is_err() {
+        guard.set_phase(ExecPhase::Running);
+        return Err(Errno::EAGAIN);
+    }
+    reset_signal_state_for_exec(task, UserAbiKind::MygoNative);
+    let personality: Arc<dyn core::any::Any + Send + Sync> = image.personality;
+    guard.install_personality(ProcessPersonalityState::MygoNative(personality));
+    image.vm.activate();
+    frame.set_current_address_space();
+    unsafe {
+        *(user_context.as_usize() as *mut UserTrapFrame) = frame;
+    }
+    guard.advance_generation();
+    guard.set_phase(ExecPhase::Running);
+    drop(guard);
+    drop(group);
+    drop(old_vm);
+    Ok(())
+}
+
 fn same_optional_arc<T>(current: Option<Arc<T>>, observed: &Option<Arc<T>>) -> bool {
     match (current, observed) {
         (Some(current), Some(observed)) => Arc::ptr_eq(&current, observed),

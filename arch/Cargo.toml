@@ -17,6 +17,7 @@ allocator = { path = "../libs/allocator" }
 efi = { path = "../libs/efi" }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
+native-abi = { path = "../libs/native-abi" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

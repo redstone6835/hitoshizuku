@@ -490,6 +490,50 @@ fn process_spawn_user_process(
     Ok(())
 }
 
+/// 为尚未进入运行队列的 Native 子进程安装完整映像与首次用户上下文。
+pub(crate) fn prepare_native_child(
+    child: &Arc<Task>,
+    image: crate::soyo::PreparedSoyoImage,
+) -> Result<(), Errno> {
+    if child.state() != sched::TaskState::New {
+        return Err(Errno::EINVAL);
+    }
+    let kernel_stack_top = child.ensure_kernel_stack();
+    let frame = crate::exec::prepare_native_initial_frame(
+        image.entry_pc,
+        image.user_sp,
+        image.start_info_address,
+        image.start_info_size,
+        image.image_base,
+        image.tls_base,
+        image.bootstrap_process,
+        kernel_stack_top,
+    );
+
+    let vm: Arc<dyn core::any::Any + Send + Sync> = image.vm.clone();
+    child.ext_install(TASKEXT_VM_SPACE, vm);
+    // Native child 从零建立用户态资源，不继承父侧 Linux fd、cwd 或 root。
+    let _ = child.ext_remove(TASKEXT_VFS_FDTABLE);
+    let _ = child.ext_remove(TASKEXT_VFS_CONTEXT);
+    child.set_comm(b"soyo-child");
+    child.into_kernel_thread(user_clone_entry, 0);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
+
+    let personality: Arc<dyn core::any::Any + Send + Sync> = image.personality;
+    let group = child.thread_group();
+    let mut exec = group.lock_exec();
+    if exec.phase() != native_abi::ExecPhase::Running || !exec.has_only_member(child) {
+        return Err(Errno::EBUSY);
+    }
+    exec.install_personality(sched::ProcessPersonalityState::MygoNative(personality));
+    exec.advance_generation();
+    drop(exec);
+
+    // SOYO 映射期间可能切换过活动页表，返回父调用现场前必须恢复当前地址空间。
+    activate_task_vm(&sched::current_task());
+    Ok(())
+}
+
 fn process_clone_user_context(
     parent: &Arc<Task>,
     child: &Arc<Task>,

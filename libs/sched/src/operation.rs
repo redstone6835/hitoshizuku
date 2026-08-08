@@ -299,6 +299,34 @@ pub fn exit_group(code: i32) -> ! {
     exit(code);
 }
 
+/// Native 同步用户异常的终止入口。它不构造 Linux signal frame，而是记录
+/// 进程级诊断并复用现有组退出清理。
+pub fn terminate_native_fault(
+    task: &Arc<Task>,
+    kind: u32,
+    exception_code: u64,
+    address: u64,
+    exit_code: i32,
+) -> ! {
+    let group = task.thread_group();
+    group.record_native_fault(crate::group::NativeFaultInfo {
+        kind,
+        exception_code,
+        address,
+    });
+    let code = group.request_group_exit(exit_code);
+    for member in group.snapshot() {
+        if !Arc::ptr_eq(&member, task)
+            && !member.is_kernel_task()
+            && !matches!(member.state(), TaskState::Zombie | TaskState::Dead)
+        {
+            crate::scheduler::group_exit_wakeup(&member);
+        }
+    }
+    drop(group);
+    exit(code)
+}
+
 /// 在目标线程自己的安全边界完成已经发布的 exit_group 请求。
 pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     // 正常 syscall/返回路径绝大多数没有协作退出请求；先读每任务原子标志，

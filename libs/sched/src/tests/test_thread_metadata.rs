@@ -226,6 +226,46 @@ fn pidfd_wait_target_keeps_thread_group_identity_after_leader_replacement() {
 }
 
 #[ktest]
+fn native_children_are_owned_by_the_thread_group_not_the_spawning_task() {
+    let owner = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&owner));
+    let worker = make_task_in_group(Arc::clone(&owner));
+    owner.set_leader(&leader);
+    owner.add_member(&leader);
+    owner.add_member(&worker);
+
+    let child = make_task();
+    let child_group = child.thread_group();
+    child_group.set_leader(&child);
+    child_group.add_member(&child);
+    child.set_state(TaskState::Zombie);
+    assert!(child_group.mark_terminated_if_all_members_terminal());
+
+    assert!(
+        owner
+            .try_add_native_child(Arc::clone(&child))
+            .expect("Native child 登记不应因资源不足失败")
+    );
+    assert!(leader.snapshot_children().is_empty());
+    assert!(worker.snapshot_children().is_empty());
+
+    // leader 可以先退出；只要线程组尚未整体终止，Native child 仍属于 owner。
+    leader.set_state(TaskState::Dead);
+    assert!(!owner.is_terminated());
+    assert!(
+        owner
+            .snapshot_native_children()
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &child))
+    );
+
+    let reaped = owner
+        .reap_native_child(|candidate| Arc::ptr_eq(candidate, &child))
+        .expect("owner 线程组应能回收 Native child");
+    assert!(Arc::ptr_eq(&reaped, &child));
+}
+
+#[ktest]
 fn running_leader_inspection_serializes_with_identity_replacement() {
     let group = ThreadGroup::new();
     let old_leader = make_task_in_group(Arc::clone(&group));

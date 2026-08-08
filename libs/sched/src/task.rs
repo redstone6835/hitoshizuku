@@ -801,6 +801,9 @@ pub struct Task {
     ptrace_traced: AtomicU8,
     pub exit_waiters: WaitQueue,
     rel: Spinlock<Relations>,
+    /// Native child 的线程组 owner；与 POSIX `parent` 解耦，避免调用线程退出
+    /// 时触发错误的 task-level reparent。
+    native_owner: Spinlock<Option<Weak<ThreadGroup>>>,
     kstack: Spinlock<Option<KernelStack>>,
     ctx: Spinlock<Option<ArchContextSlot>>,
 
@@ -983,6 +986,7 @@ impl Task {
                 process_group,
                 pid_in_ns: Vec::new(),
             }),
+            native_owner: Spinlock::new(None),
             kstack: Spinlock::new(None),
             ctx: Spinlock::new(None),
             creds: Spinlock::new(Arc::new(Credentials::root())),
@@ -1451,6 +1455,15 @@ impl Task {
 
     pub fn thread_group(&self) -> Arc<ThreadGroup> {
         Arc::clone(&self.rel.lock().thread_group)
+    }
+
+    /// 记录该任务由哪个线程组持有 Native child 所有权。
+    pub fn set_native_owner(&self, owner: &Arc<ThreadGroup>) {
+        *self.native_owner.lock() = Some(Arc::downgrade(owner));
+    }
+
+    pub fn native_owner(&self) -> Option<Arc<ThreadGroup>> {
+        self.native_owner.lock().as_ref().and_then(Weak::upgrade)
     }
 
     /// 取出并完整处理一条 signal，期间阻止 exec 发布 `Transitioning`。

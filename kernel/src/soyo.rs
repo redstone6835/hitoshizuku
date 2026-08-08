@@ -22,7 +22,10 @@ use soyo::{
 };
 use vfs::fdtable::FdTableSnapshot;
 
-use crate::native_runtime::{NativeProcessState, prepare_native_process_state};
+use crate::native_runtime::{
+    ExecutableImage, NativeProcessState, PreparedNativeCapability, prepare_native_process_state,
+    prepare_native_process_state_with_capabilities,
+};
 use crate::user::{file_size, read_exact_file};
 
 /// 已完成 SOYO 段映射与重定位、但尚未安装到任务的用户映像。
@@ -64,6 +67,26 @@ impl SoyoReadAt for VfsSoyoReader {
 
     fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<(), Self::Error> {
         read_exact_file(&self.file, offset, output)
+    }
+}
+
+struct ExecutableImageReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl SoyoReadAt for ExecutableImageReader<'_> {
+    type Error = Errno;
+
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<(), Self::Error> {
+        let start = usize::try_from(offset).map_err(|_| Errno::EIO)?;
+        let end = start.checked_add(output.len()).ok_or(Errno::EIO)?;
+        let source = self.bytes.get(start..end).ok_or(Errno::EIO)?;
+        output.copy_from_slice(source);
+        Ok(())
     }
 }
 
@@ -222,6 +245,31 @@ where
     let load_plan = validate_soyo(&metadata, policy).map_err(map_soyo_error)?;
     let binding = load_plan.native_binding;
     let enabled_features = load_plan.enabled_features;
+    map_validated_soyo_image(reader, Arc::new(metadata), binding, enabled_features)
+}
+
+/// 从已经由 `image.create` 验证的不可变字节构造独立地址空间。
+pub(crate) fn load_executable_image(image: &ExecutableImage) -> Result<LoadedSoyoImage, Errno> {
+    let reader = ExecutableImageReader {
+        bytes: image.bytes(),
+    };
+    map_validated_soyo_image(
+        &reader,
+        Arc::clone(&image.metadata),
+        image.binding.clone(),
+        image.enabled_features,
+    )
+}
+
+fn map_validated_soyo_image<R>(
+    reader: &R,
+    metadata: Arc<SoyoMetadata>,
+    binding: NativeBindingPlan,
+    enabled_features: u64,
+) -> Result<LoadedSoyoImage, Errno>
+where
+    R: SoyoReadAt<Error = Errno>,
+{
     let image_base = hal::user::main_pie_base();
     let image_base_u64 = u64::try_from(image_base).map_err(|_| Errno::ENOEXEC)?;
     let mapped = plan_mapped_segments(&metadata, image_base_u64).map_err(map_soyo_error)?;
@@ -259,7 +307,7 @@ where
         vm,
         entry_pc,
         image_base,
-        metadata: Arc::new(metadata),
+        metadata,
         native_binding: binding,
         enabled_features,
         tls_payload,
@@ -273,6 +321,16 @@ pub(crate) fn prepare_soyo_runtime(
     envp: &[Vec<u8>],
     descriptors: Option<&FdTableSnapshot>,
 ) -> Result<PreparedSoyoImage, Errno> {
+    prepare_soyo_runtime_with_capabilities(loaded, argv, envp, descriptors, &[])
+}
+
+pub(crate) fn prepare_soyo_runtime_with_capabilities(
+    loaded: LoadedSoyoImage,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    descriptors: Option<&FdTableSnapshot>,
+    transferred: &[PreparedNativeCapability],
+) -> Result<PreparedSoyoImage, Errno> {
     let LoadedSoyoImage {
         vm,
         entry_pc,
@@ -284,8 +342,18 @@ pub(crate) fn prepare_soyo_runtime(
     } = loaded;
     let call_slot_count =
         u32::try_from(native_binding.call_slots.len()).map_err(|_| Errno::ENOEXEC)?;
-    let (personality, initial_handles) =
-        prepare_native_process_state(&metadata, native_binding, &vm, image_base, descriptors)?;
+    let (personality, initial_handles) = if transferred.is_empty() {
+        prepare_native_process_state(&metadata, native_binding, &vm, image_base, descriptors)?
+    } else {
+        prepare_native_process_state_with_capabilities(
+            &metadata,
+            native_binding,
+            &vm,
+            image_base,
+            descriptors,
+            transferred,
+        )?
+    };
     let bootstrap_process = initial_handles
         .iter()
         .find(|record| record.requirement_id == RequirementId::SelfProcess)

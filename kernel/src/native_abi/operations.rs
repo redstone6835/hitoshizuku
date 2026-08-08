@@ -10,6 +10,7 @@ use general::vfs::error::VfsError;
 use general::vfs::file::{File, PollEvents};
 use mm::VmFlags;
 use native_abi::{NativeHandle, ObjectInterface, OperationId, Rights};
+use sched::UserContextRef;
 
 use super::dispatch::native_return;
 use super::{KernelNativeObject, NativeProcessState};
@@ -27,6 +28,7 @@ pub(super) fn execute_native_operation(
     handle: NativeHandle,
     pinned: PinnedNativeHandle,
     call: NativeCallFrame,
+    user_context: UserContextRef,
 ) -> NativeCallOutcome {
     match operation {
         OperationId::ProcessExit => {
@@ -85,6 +87,67 @@ pub(super) fn execute_native_operation(
             };
             memory_free(state, &vm, call.args[0], call.args[1])
         }
+        OperationId::ImageCreate => {
+            if !matches!(pinned.object, KernelNativeObject::SelfProcess) {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            }
+            super::process::image_create(state, call.args[0], call.args[1])
+        }
+        OperationId::ProcessSpawn => {
+            if !matches!(pinned.object, KernelNativeObject::SelfProcess) {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            }
+            super::process::process_spawn(task, state, call.args[0], call.args[1])
+        }
+        OperationId::ProcessReplace => {
+            if !matches!(pinned.object, KernelNativeObject::SelfProcess) {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            }
+            super::process::process_replace(task, state, call.args[0], call.args[1], user_context)
+        }
+        OperationId::ProcessQuery => match pinned.object {
+            KernelNativeObject::Process(process) => {
+                super::process::process_query(&process, call.args[0])
+            }
+            KernelNativeObject::SelfProcess => {
+                super::process::process_query_self(task, call.args[0])
+            }
+            _ => native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0),
+        },
+        OperationId::ProcessWait => match pinned.object {
+            KernelNativeObject::Process(process) => {
+                super::process::process_wait(task, &process, call.args[0], call.args[1])
+            }
+            _ => native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0),
+        },
+        OperationId::ProcessTerminate => match pinned.object {
+            KernelNativeObject::Process(process) => {
+                super::process::process_terminate(&process, call.args[0])
+            }
+            KernelNativeObject::SelfProcess => {
+                super::process::process_terminate_self(task, call.args[0])
+            }
+            _ => native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0),
+        },
+        OperationId::EventCreate => super::event::event_create(state, &pinned.object, call.args[0]),
+        OperationId::EventBind => super::event::event_bind(
+            state,
+            &pinned.object,
+            call.args[0],
+            call.args[1],
+            call.args[2],
+        ),
+        OperationId::EventTimer => {
+            super::event::event_timer(&pinned.object, call.args[0], call.args[1], call.args[2])
+        }
+        OperationId::EventCancel => super::event::event_cancel(&pinned.object, call.args[0]),
+        OperationId::EventWait => super::event::event_wait(
+            task,
+            &pinned.object,
+            call.args[0],
+            call.args[1],
+            call.args[2],
+        ),
     }
 }
 
@@ -180,7 +243,7 @@ fn insert_pinned_handle(
     insert_native_handle(state, pinned.object, pinned.interface, pinned.rights)
 }
 
-fn insert_native_handle(
+pub(super) fn insert_native_handle(
     state: &NativeProcessState,
     object: KernelNativeObject,
     interface: ObjectInterface,
@@ -439,7 +502,7 @@ fn finish_stream_wait(
     restore_native_task_after_wait(task);
 }
 
-fn has_native_external_control(task: &Arc<sched::Task>) -> bool {
+pub(super) fn has_native_external_control(task: &Arc<sched::Task>) -> bool {
     task.group_exit_pending()
         || task.signal.has_any_pending()
         || task.shared_signal_pending_bits_quick() != 0
@@ -452,7 +515,7 @@ fn has_native_external_control(task: &Arc<sched::Task>) -> bool {
         )
 }
 
-fn restore_native_task_after_wait(task: &Arc<sched::Task>) {
+pub(super) fn restore_native_task_after_wait(task: &Arc<sched::Task>) {
     if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
         let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
     }

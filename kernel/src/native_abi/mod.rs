@@ -8,24 +8,44 @@ use errno::Errno;
 use general::mm::VmSpace;
 use general::vfs::file::File;
 use native_abi::{
-    InitialHandleRecord, NativeBindingPlan, NativeHandleTable, RequirementId, Rights, requirement,
+    InitialHandleRecord, NativeBindingPlan, NativeHandle, NativeHandleTable, RequirementId, Rights,
+    requirement,
 };
 use sched::sync::Spinlock;
 use soyo::SoyoMetadata;
 use vfs::fdtable::{FdFlags, FdTableSnapshot};
 
-use self::dispatch::dispatch_native_call;
+use self::dispatch::dispatch_native_call_with_context;
 
 mod dispatch;
+mod event;
+mod image;
 mod operations;
+mod process;
+
+use event::EventPort;
+pub(crate) use image::ExecutableImage;
+pub(crate) use process::ProcessObject;
 
 /// Native handle 可引用的内核对象。
 #[derive(Clone)]
 pub(crate) enum KernelNativeObject {
     SelfProcess,
+    Process(Arc<ProcessObject>),
     AddressSpace(Arc<VmSpace>),
     Stream(Arc<File>),
     MonotonicClock,
+    ExecutableImage(Arc<ExecutableImage>),
+    EventPort(Arc<EventPort>),
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedNativeCapability {
+    pub(crate) requirement_id: RequirementId,
+    pub(crate) object: KernelNativeObject,
+    pub(crate) interface: native_abi::ObjectInterface,
+    pub(crate) rights: Rights,
+    pub(crate) source_handle: Option<NativeHandle>,
 }
 
 /// 由线程组 personality 唯一持有的 Native 进程状态。
@@ -96,7 +116,7 @@ impl NativeProcessState {
 }
 
 pub(crate) fn register() {
-    general::syscall::register_native_dispatcher(dispatch_native_call);
+    general::syscall::register_native_dispatcher(dispatch_native_call_with_context);
 }
 
 pub(crate) fn prepare_native_process_state(
@@ -105,6 +125,24 @@ pub(crate) fn prepare_native_process_state(
     vm: &Arc<VmSpace>,
     image_base: usize,
     descriptors: Option<&FdTableSnapshot>,
+) -> Result<(Arc<NativeProcessState>, Vec<InitialHandleRecord>), Errno> {
+    prepare_native_process_state_with_capabilities(
+        metadata,
+        binding,
+        vm,
+        image_base,
+        descriptors,
+        &[],
+    )
+}
+
+pub(crate) fn prepare_native_process_state_with_capabilities(
+    metadata: &SoyoMetadata,
+    binding: NativeBindingPlan,
+    vm: &Arc<VmSpace>,
+    image_base: usize,
+    descriptors: Option<&FdTableSnapshot>,
+    transferred: &[PreparedNativeCapability],
 ) -> Result<(Arc<NativeProcessState>, Vec<InitialHandleRecord>), Errno> {
     if descriptors.is_some_and(|snapshot| {
         snapshot.descriptors().iter().any(|descriptor| {
@@ -128,6 +166,17 @@ pub(crate) fn prepare_native_process_state(
             continue;
         };
         let rights = Rights::from_bits(capability.required_rights);
+        let transferred_object = transferred
+            .iter()
+            .find(|candidate| candidate.requirement_id == requirement_id)
+            .filter(|candidate| {
+                candidate.interface
+                    == requirement(requirement_id)
+                        .map(|spec| spec.interface)
+                        .unwrap_or(candidate.interface)
+                    && rights.is_subset_of(candidate.rights)
+            })
+            .map(|candidate| candidate.object.clone());
         let object = match requirement_id {
             RequirementId::SelfProcess => Some(KernelNativeObject::SelfProcess),
             RequirementId::CurrentAddressSpace => {
@@ -140,17 +189,21 @@ pub(crate) fn prepare_native_process_state(
                     RequirementId::Stderr => 2,
                     _ => unreachable!(),
                 };
-                descriptors
-                    .and_then(|snapshot| {
-                        snapshot.descriptors().iter().find(|descriptor| {
-                            descriptor.fd().as_raw() == fd
-                                && !descriptor.flags().has(FdFlags::CLOEXEC)
+                transferred_object.or_else(|| {
+                    descriptors
+                        .and_then(|snapshot| {
+                            snapshot.descriptors().iter().find(|descriptor| {
+                                descriptor.fd().as_raw() == fd
+                                    && !descriptor.flags().has(FdFlags::CLOEXEC)
+                            })
                         })
-                    })
-                    .filter(|descriptor| stream_supports(descriptor.file(), rights))
-                    .map(|descriptor| KernelNativeObject::Stream(Arc::clone(descriptor.file())))
+                        .filter(|descriptor| stream_supports(descriptor.file(), rights))
+                        .map(|descriptor| KernelNativeObject::Stream(Arc::clone(descriptor.file())))
+                })
             }
-            RequirementId::MonotonicClock => Some(KernelNativeObject::MonotonicClock),
+            RequirementId::MonotonicClock => {
+                transferred_object.or(Some(KernelNativeObject::MonotonicClock))
+            }
         };
         let Some(object) = object else {
             if capability.required() {

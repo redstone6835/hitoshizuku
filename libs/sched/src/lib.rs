@@ -120,25 +120,25 @@ pub use sched_class::{
 pub use scheduler::current_task_epoch;
 pub use scheduler::{
     DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
-    reserve_deadline_observer_id,
+    register_deadline_observer_deferred, reserve_deadline_observer_id,
+    try_register_deadline_observer, try_register_deadline_observer_deferred,
 };
 pub use scheduler::{
     NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask, balance_once,
     current_cpu_id, current_task, current_task_cpu_time_ns, current_task_fast,
     current_task_handoff_target, current_task_id, current_task_on, current_task_ref,
     defer_pi_effective_update, defer_task_wake, defer_timer_tick, drain_deferred_timer_tick,
-    enqueue_task,
-    enqueue_task_deferred, enqueue_task_preferred, enqueue_task_preferred_for_handoff,
-    enqueue_task_with_hint, group_exit_wakeup, idle_task, init, init_task, install_idle,
-    is_cpu_active, is_cpu_online, is_ready, mark_cpu_online, migrate_task, needs_resched,
-    needs_resched_current, now_ns_public, offline_cpu, on_timer_tick, online_cpu_mask, pid_count,
-    preempt_if_needed, register_cpu, register_sleep_deadline, reprogram_current_deadline,
-    request_balance, request_post_syscall_handoff, request_post_syscall_handoff_to,
-    request_resched, root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy,
-    sched_rr_timeslice_ms, sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us,
-    schedule_once, scheduler_diag, set_realtime_itimer, set_sched_rr_timeslice_ms,
-    set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for,
-    supported_cpu_mask, try_current_task_ref,
+    enqueue_task, enqueue_task_deferred, enqueue_task_preferred,
+    enqueue_task_preferred_for_handoff, enqueue_task_with_hint, group_exit_wakeup, idle_task, init,
+    init_task, install_idle, is_cpu_active, is_cpu_online, is_ready, mark_cpu_online, migrate_task,
+    needs_resched, needs_resched_current, now_ns_public, offline_cpu, on_timer_tick,
+    online_cpu_mask, pid_count, preempt_if_needed, register_cpu, register_sleep_deadline,
+    reprogram_current_deadline, request_balance, request_post_syscall_handoff,
+    request_post_syscall_handoff_to, request_resched, root_pid_ns, run_post_syscall_handoff,
+    run_post_syscall_handoff_lazy, sched_rr_timeslice_ms, sched_rr_timeslice_ns,
+    sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag, set_realtime_itimer,
+    set_sched_rr_timeslice_ms, set_sched_rt_period_us, set_sched_rt_runtime_us, signal_wakeup,
+    spawn_idle_for, supported_cpu_mask, try_current_task_ref,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
@@ -161,7 +161,7 @@ pub use spawn::activate_task_with_cpu_hint;
 pub use spawn::{
     SpawnKind, abort_new_task, activate_task, clone_task, exit_task, kthread_create,
     kthread_finish, kthread_spawn, kthread_spawn_on_cpu, list_zombie_children, reap_child,
-    reap_matching, reparent_to_init, spawn_child,
+    reap_matching, reap_native_child, reparent_to_init, spawn_child, spawn_native_child,
 };
 pub use task::{
     DEFAULT_TIMER_SLACK_NS, ExecutionActionClaim, ExecutionScopeKind, ExitCode, RobustListState,

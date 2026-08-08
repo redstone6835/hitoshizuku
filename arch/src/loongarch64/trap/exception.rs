@@ -172,6 +172,19 @@ fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
     }
 }
 
+fn native_fault_kind(code: usize) -> u32 {
+    match code {
+        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX | ECODE_PPI => {
+            native_abi::wire::PROCESS_FAULT_MEMORY
+        }
+        ECODE_INE | ECODE_IPE => native_abi::wire::PROCESS_FAULT_ILLEGAL_INSTRUCTION,
+        ECODE_BRK => native_abi::wire::PROCESS_FAULT_BREAKPOINT,
+        ECODE_ADE | ECODE_ALE | ECODE_BCE => native_abi::wire::PROCESS_FAULT_ADDRESS,
+        ECODE_FPE => native_abi::wire::PROCESS_FAULT_ARITHMETIC,
+        _ => native_abi::wire::PROCESS_FAULT_OTHER,
+    }
+}
+
 fn terminate_user_exception(
     code: usize,
     sig: sched::SignalNumber,
@@ -202,6 +215,15 @@ fn terminate_user_exception(
 
     if sched::is_ready() {
         let me = sched::current_task();
+        if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+            sched::operation::terminate_native_fault(
+                &me,
+                native_fault_kind(code),
+                code as u64,
+                badv as u64,
+                128 + i32::from(sig.raw()),
+            );
+        }
         let pid = me.pid_root().unwrap_or(0);
         let _ = sched::operation::tkill(pid, Some(sig));
         drop(me);
@@ -521,6 +543,15 @@ unsafe fn loongarch64_handle_exception_inner(
                 // timer 边界来安装用户 signal frame。
                 if sched::is_ready() {
                     let me = sched::current_task();
+                    if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                        sched::operation::terminate_native_fault(
+                            &me,
+                            native_abi::wire::PROCESS_FAULT_MEMORY,
+                            ecode as u64,
+                            arg2 as u64,
+                            128 + i32::from(sched::SignalNumber::SIGSEGV.raw()),
+                        );
+                    }
                     let pid = me.pid_root().unwrap_or(0);
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
                     drop(me);
@@ -533,6 +564,15 @@ unsafe fn loongarch64_handle_exception_inner(
                     let me = sched::current_task();
                     let pid = me.pid_root().unwrap_or(0);
                     log::warning!("[trap][mm][oom] killing pid={} comm={:?}", pid, me.comm());
+                    if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                        sched::operation::terminate_native_fault(
+                            &me,
+                            native_abi::wire::PROCESS_FAULT_RESOURCE,
+                            ecode as u64,
+                            arg2 as u64,
+                            128 + i32::from(sched::SignalNumber::SIGKILL.raw()),
+                        );
+                    }
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
                     drop(me);
                     deliver_user_signals_before_return(arg4, from_user);

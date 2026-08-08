@@ -113,6 +113,14 @@ impl GroupExitStatus {
     }
 }
 
+/// Native 用户异常的稳定进程级记录。只保存首个故障，避免并发异常覆盖诊断现场。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFaultInfo {
+    pub kind: u32,
+    pub exception_code: u64,
+    pub address: u64,
+}
+
 /// 订阅稳定进程身份的终止事件；实现方不得在回调中反向进入进程身份事务。
 pub trait ProcessExitObserver: Send + Sync {
     fn process_exited(&self);
@@ -200,6 +208,10 @@ pub struct ThreadGroup {
     leader: Spinlock<Weak<Task>>,
     /// 成员表。成员任务持 `Arc<ThreadGroup>`，此处用 Weak 避免循环保活。
     members: Spinlock<Vec<Weak<Task>>>,
+    /// Native 子进程的线程组级 owner 表。它独立于 Task 的 POSIX parent/children
+    /// 关系，因此 owner 线程组中的任意线程都可以 wait/reap，leader 提前退出也
+    /// 不会改变所有权。
+    native_children: Spinlock<Vec<Arc<Task>>>,
     /// 线程组共享的信号表（sigaction + shared pending）。
     shared_signal: Arc<SharedSignal>,
     /// 进程级资源限制（per-tg 共享；fork 时复制一份）。
@@ -216,6 +228,8 @@ pub struct ThreadGroup {
     terminated: AtomicBool,
     /// 协作式组退出请求；编码同时保存普通退出或信号退出原因。
     group_exit: AtomicU64,
+    /// 首个 Native 用户异常；故障路径不属于正常调度热路径。
+    native_fault: Spinlock<Option<NativeFaultInfo>>,
     /// 串行化同一线程组的 exec prepare/revalidate/commit。
     exec_lock: Spinlock<()>,
     /// 每次成功安装新映像后推进，供 prepare 阶段做乐观快照。
@@ -307,6 +321,7 @@ impl ThreadGroup {
             tgid: AtomicI32::new(PID_INVALID),
             leader: Spinlock::new(Weak::new()),
             members: Spinlock::new(Vec::new()),
+            native_children: Spinlock::new(Vec::new()),
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
@@ -315,6 +330,7 @@ impl ThreadGroup {
             closing: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             group_exit: AtomicU64::new(0),
+            native_fault: Spinlock::new(None),
             exec_lock: Spinlock::new(()),
             exec_generation: AtomicU64::new(0),
             exec_phase: AtomicU8::new(ExecPhase::Running as u8),
@@ -335,6 +351,7 @@ impl ThreadGroup {
             tgid: AtomicI32::new(PID_INVALID),
             leader: Spinlock::new(Weak::new()),
             members: Spinlock::new(Vec::new()),
+            native_children: Spinlock::new(Vec::new()),
             shared_signal: shared,
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
@@ -343,6 +360,7 @@ impl ThreadGroup {
             closing: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             group_exit: AtomicU64::new(0),
+            native_fault: Spinlock::new(None),
             exec_lock: Spinlock::new(()),
             exec_generation: AtomicU64::new(0),
             exec_phase: AtomicU8::new(ExecPhase::Running as u8),
@@ -427,6 +445,65 @@ impl ThreadGroup {
             self.try_add_member(task),
             "[sched][group] adding member to closing thread group"
         );
+    }
+
+    /// 把 Native child 登记到线程组 owner，而不是调用线程的 POSIX child 表。
+    ///
+    /// 成员索引和终止状态共用 `members` 锁，保证“整体终止已发布”后不会再
+    /// 接纳新的 Native child。返回 `Ok(false)` 表示 owner 已进入退出流程。
+    pub fn try_add_native_child(
+        &self,
+        child: Arc<Task>,
+    ) -> Result<bool, alloc::collections::TryReserveError> {
+        let members = self.members.lock();
+        if self.closing.load(Ordering::Acquire) || self.terminated.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let mut children = self.native_children.lock();
+        children.try_reserve(1)?;
+        children.push(child);
+        drop(children);
+        drop(members);
+        Ok(true)
+    }
+
+    /// 从 owner 表中移除尚未激活或被回滚的 Native child。
+    pub fn remove_native_child(&self, child: &Arc<Task>) -> bool {
+        let mut children = self.native_children.lock();
+        let Some(index) = children
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, child))
+        else {
+            return false;
+        };
+        children.swap_remove(index);
+        true
+    }
+
+    /// 仅供诊断和调度器边界构造稳定快照。
+    pub fn snapshot_native_children(&self) -> Vec<Arc<Task>> {
+        self.native_children.lock().clone()
+    }
+
+    pub(crate) fn has_native_children(&self) -> bool {
+        !self.native_children.lock().is_empty()
+    }
+
+    /// 领取一个已经完全终止的 Native child。调用者负责释放 pid 和其它组索引。
+    pub fn reap_native_child<F>(&self, mut pred: F) -> Option<Arc<Task>>
+    where
+        F: FnMut(&Arc<Task>) -> bool,
+    {
+        let mut children = self.native_children.lock();
+        let index = children
+            .iter()
+            .position(|child| child.is_user_task() && child.is_waitable_zombie() && pred(child))?;
+        Some(children.swap_remove(index))
+    }
+
+    /// owner 线程组整体终止时把未回收 Native child 交给系统 reaper。
+    pub(crate) fn take_native_children_for_reparent(&self) -> Vec<Arc<Task>> {
+        core::mem::take(&mut *self.native_children.lock())
     }
 
     /// 移除一个成员，同时顺带清理已死的 Weak。
@@ -610,6 +687,20 @@ impl ThreadGroup {
         GroupExitStatus::decode(self.group_exit.load(Ordering::Acquire))
     }
 
+    /// 记录首个 Native 用户异常。该状态独立于兼容 Linux 的 signal/wait 编码。
+    pub fn record_native_fault(&self, info: NativeFaultInfo) {
+        if info.kind != 0 {
+            let mut fault = self.native_fault.lock();
+            if fault.is_none() {
+                *fault = Some(info);
+            }
+        }
+    }
+
+    pub fn native_fault(&self) -> Option<NativeFaultInfo> {
+        *self.native_fault.lock()
+    }
+
     /// 返回已经发布的线程组退出码。
     pub fn group_exit_code(&self) -> Option<i32> {
         self.group_exit_status().map(GroupExitStatus::exit_code)
@@ -701,6 +792,7 @@ impl Default for ThreadGroup {
             tgid: AtomicI32::new(PID_INVALID),
             leader: Spinlock::new(Weak::new()),
             members: Spinlock::new(Vec::new()),
+            native_children: Spinlock::new(Vec::new()),
             shared_signal: Arc::new(SharedSignal::new()),
             rlimits: Spinlock::new(Rlimits::new_with_defaults()),
             exited_usage: Spinlock::new(TaskUsage::default()),
@@ -709,6 +801,7 @@ impl Default for ThreadGroup {
             closing: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             group_exit: AtomicU64::new(0),
+            native_fault: Spinlock::new(None),
             exec_lock: Spinlock::new(()),
             exec_generation: AtomicU64::new(0),
             exec_phase: AtomicU8::new(ExecPhase::Running as u8),

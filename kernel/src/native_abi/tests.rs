@@ -13,8 +13,9 @@ use native_abi::{
 };
 use sched::{ProcessGroup, ProcessPersonalityState, SchedParams, Session, Task, ThreadGroup};
 
+use super::dispatch::dispatch_native_call;
 use super::operations::{map_stream_read_error, map_stream_write_error, stream_read_progress};
-use super::{KernelNativeObject, NativeProcessState, dispatch_native_call};
+use super::{KernelNativeObject, NativeProcessState};
 
 #[ktest]
 fn native_frame_reads_the_frozen_register_contract() {
@@ -735,6 +736,34 @@ fn stream_read_maps_general_errors_without_reusing_user_fault() {
     );
 }
 
+#[ktest]
+fn process_result_preserves_full_exit_code_and_fault_details_after_reap() {
+    let group = ThreadGroup::new();
+    group.record_native_fault(sched::group::NativeFaultInfo {
+        kind: native_abi::wire::PROCESS_FAULT_MEMORY,
+        exception_code: 13,
+        address: 0xfeed_cafe,
+    });
+    assert_eq!(
+        group.request_group_exit(0x8765_4321u32 as i32),
+        0x8765_4321u32 as i32
+    );
+
+    let faulted = super::process::process_result(&group, false);
+    assert_eq!(faulted.state, native_abi::wire::PROCESS_STATE_FAULTED);
+    assert_eq!(faulted.exit_code, 0x8765_4321);
+    assert_eq!(faulted.fault_kind, native_abi::wire::PROCESS_FAULT_MEMORY);
+    assert_eq!(faulted.detail0, 13);
+    assert_eq!(faulted.detail1, 0xfeed_cafe);
+
+    let reaped = super::process::process_result(&group, true);
+    assert_eq!(reaped.state, native_abi::wire::PROCESS_STATE_REAPED);
+    assert_eq!(reaped.exit_code, faulted.exit_code);
+    assert_eq!(reaped.fault_kind, faulted.fault_kind);
+    assert_eq!(reaped.detail0, faulted.detail0);
+    assert_eq!(reaped.detail1, faulted.detail1);
+}
+
 fn assert_native_return(outcome: NativeCallOutcome, status: u32, value0: u64) {
     let NativeCallOutcome::Return(result) = outcome else {
         panic!("测试映射必须返回 Native status");
@@ -833,6 +862,7 @@ fn invoke_native(task: &Arc<Task>, call: NativeCallFrame) -> NativeCallReturn {
     match dispatch_native_call(task, call) {
         NativeCallOutcome::Return(result) => result,
         NativeCallOutcome::ExitGroup(_) => panic!("测试调用不应退出线程组"),
+        NativeCallOutcome::FrameFinalized => panic!("测试调用不应替换用户 frame"),
         NativeCallOutcome::RetryExternalControl => panic!("测试调用不应等待外部控制"),
     }
 }

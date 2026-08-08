@@ -1912,10 +1912,40 @@ pub fn register_deadline_observer(
     deadline_ns: u64,
     observer: Weak<dyn DeadlineObserver>,
 ) -> bool {
+    try_register_deadline_observer(registration, deadline_ns, observer)
+        .expect("deadline observer 分配失败")
+}
+
+pub fn try_register_deadline_observer(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> Result<bool, ()> {
     if now_ns_internal() >= deadline_ns {
-        return false;
+        return Ok(false);
     }
+    try_register_deadline_observer_deferred(registration, deadline_ns, observer)?;
+    Ok(true)
+}
+
+/// 注册一个允许已经到期的 deadline。调用方已同步发布首次过期事件时，用它
+/// 重装周期 observer，下一次 timer 边界会完成追赶而不会在调用路径自旋。
+pub fn register_deadline_observer_deferred(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) {
+    try_register_deadline_observer_deferred(registration, deadline_ns, observer)
+        .expect("deadline observer 分配失败");
+}
+
+pub fn try_register_deadline_observer_deferred(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> Result<(), ()> {
     let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.try_reserve(1).map_err(|_| ())?;
     observers.entries.push(DeadlineEntry {
         id: registration,
         deadline_ns,
@@ -1926,7 +1956,7 @@ pub fn register_deadline_observer(
         .entries
         .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
     HAS_DEADLINE_OBSERVERS.store(true, Ordering::Release);
-    true
+    Ok(())
 }
 
 /// 取消尚未到期的 observer 注册。

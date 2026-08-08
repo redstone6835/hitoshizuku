@@ -131,6 +131,19 @@ fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
     }
 }
 
+fn native_fault_kind(code: usize) -> u32 {
+    match code {
+        EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
+            native_abi::wire::PROCESS_FAULT_MEMORY
+        }
+        EXC_ILLEGAL_INST => native_abi::wire::PROCESS_FAULT_ILLEGAL_INSTRUCTION,
+        EXC_BREAKPOINT => native_abi::wire::PROCESS_FAULT_BREAKPOINT,
+        EXC_INST_MISALIGNED | EXC_LOAD_MISALIGNED | EXC_STORE_MISALIGNED | EXC_INST_ACCESS
+        | EXC_LOAD_ACCESS | EXC_STORE_ACCESS => native_abi::wire::PROCESS_FAULT_ADDRESS,
+        _ => native_abi::wire::PROCESS_FAULT_OTHER,
+    }
+}
+
 // Linux RISC-V64 syscall ABI 中会整体替换当前用户上下文的调用。
 const SYS_RT_SIGRETURN: usize = 139;
 const SYS_EXECVE: usize = 221;
@@ -253,6 +266,15 @@ fn terminate_user_exception(
 
     if sched::is_ready() {
         let me = sched::current_task();
+        if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+            sched::operation::terminate_native_fault(
+                &me,
+                native_fault_kind(code),
+                code as u64,
+                tval as u64,
+                128 + i32::from(sig.raw()),
+            );
+        }
         let pid = me.pid_root().unwrap_or(0);
         let _ = sched::operation::tkill(pid, Some(sig));
         drop(me);
@@ -389,6 +411,16 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
         FaultOutcome::Segv => {
             if sched::is_ready() {
                 let task = sched::current_task();
+                if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                    let address = unsafe { trap_frame_ref(tf_ptr) }.tval;
+                    sched::operation::terminate_native_fault(
+                        &task,
+                        native_abi::wire::PROCESS_FAULT_MEMORY,
+                        code as u64,
+                        address as u64,
+                        128 + i32::from(sched::SignalNumber::SIGSEGV.raw()),
+                    );
+                }
                 let pid = task.pid_root().unwrap_or(0);
                 let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
                 drop(task);
@@ -421,6 +453,16 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
                     vm.dropped,
                     vm.private_file_pressure_reclaims,
                 );
+                if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                    let address = unsafe { trap_frame_ref(tf_ptr) }.tval;
+                    sched::operation::terminate_native_fault(
+                        &task,
+                        native_abi::wire::PROCESS_FAULT_RESOURCE,
+                        code as u64,
+                        address as u64,
+                        128 + i32::from(sched::SignalNumber::SIGKILL.raw()),
+                    );
+                }
                 let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
                 drop(task);
                 deliver_user_signals_before_return(tf_ptr, from_user);

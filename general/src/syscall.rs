@@ -49,13 +49,16 @@ pub struct NativeCallReturn {
 /// kernel Native dispatcher 完成一次调用后的控制流决定。
 pub enum NativeCallOutcome {
     Return(NativeCallReturn),
+    /// Native replace 已经完整安装新的用户 trap frame。
+    FrameFinalized,
     ExitGroup(i32),
     /// 阻塞调用观察到外部进程控制，必须先在安全边界处理；存活后重试原调用。
     RetryExternalControl,
 }
 
 /// kernel 在启动期注册的 MyGO Native 调用入口。
-pub type NativeDispatchFn = fn(&Arc<sched::Task>, NativeCallFrame) -> NativeCallOutcome;
+pub type NativeDispatchFn =
+    fn(&Arc<sched::Task>, NativeCallFrame, sched::UserContextRef) -> NativeCallOutcome;
 
 impl NativeCallReturn {
     /// 失败结果不允许携带未定义值，避免泄漏架构现场或形成调用方依赖。
@@ -316,7 +319,11 @@ fn dispatch_native_for_task(
             task.begin_execution_scope(sched::ExecutionScopeKind::NativeCall),
             "同一任务不能嵌套进入 Native call 执行作用域"
         );
-        let outcome = native_dispatcher()(&task, (ops.native_call)(tf));
+        let outcome = native_dispatcher()(
+            &task,
+            (ops.native_call)(tf),
+            sched::UserContextRef::new(tf.as_usize()),
+        );
         let _ = task.end_execution_scope(sched::ExecutionScopeKind::NativeCall);
 
         match outcome {
@@ -328,6 +335,14 @@ fn dispatch_native_for_task(
                 }
                 (ops.set_native_ret)(tf, result);
                 (ops.advance_pc)(tf);
+                return;
+            }
+            NativeCallOutcome::FrameFinalized => {
+                if !complete_native_external_control_at_boundary(&task) {
+                    drop(task);
+                    sched::schedule_once(0);
+                    panic!("[native] terminal task scheduled back unexpectedly");
+                }
                 return;
             }
             NativeCallOutcome::RetryExternalControl => {

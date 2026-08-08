@@ -12,6 +12,14 @@ pub(super) fn dispatch_native_call(
     task: &Arc<sched::Task>,
     call: NativeCallFrame,
 ) -> NativeCallOutcome {
+    dispatch_native_call_with_context(task, call, sched::UserContextRef::NONE)
+}
+
+pub(super) fn dispatch_native_call_with_context(
+    task: &Arc<sched::Task>,
+    call: NativeCallFrame,
+    user_context: sched::UserContextRef,
+) -> NativeCallOutcome {
     let Some(payload) = task.thread_group().native_personality_payload() else {
         return native_return(native_abi::status::ABI_UNSUPPORTED_OPERATION, 0, 0);
     };
@@ -47,7 +55,7 @@ pub(super) fn dispatch_native_call(
             rights: entry.rights,
         }
     };
-    execute_native_operation(task, &state, operation, handle, pinned, call)
+    execute_native_operation(task, &state, operation, handle, pinned, call, user_context)
 }
 
 fn valid_call_arguments(operation: OperationId, call: &NativeCallFrame) -> bool {
@@ -55,13 +63,24 @@ fn valid_call_arguments(operation: OperationId, call: &NativeCallFrame) -> bool 
         return false;
     }
     let unused = match operation {
-        OperationId::ProcessExit | OperationId::HandleRestrict => &call.args[1..],
+        OperationId::ProcessExit
+        | OperationId::HandleRestrict
+        | OperationId::ProcessTerminate
+        | OperationId::EventCreate
+        | OperationId::EventCancel => &call.args[1..],
         OperationId::HandleClose | OperationId::HandleDuplicate | OperationId::ClockRead => {
             &call.args[..]
         }
         OperationId::StreamRead | OperationId::StreamWrite => &call.args[2..],
         OperationId::MemoryAllocate => &call.args[2..],
         OperationId::MemoryFree => &call.args[2..],
+        OperationId::ImageCreate | OperationId::ProcessSpawn | OperationId::ProcessReplace => {
+            &call.args[2..]
+        }
+        OperationId::ProcessQuery => &call.args[1..],
+        OperationId::ProcessWait => &call.args[2..],
+        OperationId::EventBind | OperationId::EventTimer => &call.args[3..],
+        OperationId::EventWait => &call.args[3..],
     };
     unused.iter().all(|argument| *argument == 0)
 }
