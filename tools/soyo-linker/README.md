@@ -71,20 +71,22 @@ operation、signature hash、requirement、interface 和 right 均来自
 
 ```json
 {
+  "manifest_version": 1,
+  "abi_epoch": 1,
   "entry": "_start",
   "imports": [
-    { "name": "PROCESS_EXIT", "required": true },
-    { "name": "STREAM_WRITE", "required": true }
+    { "operation": "process.exit", "required": true },
+    { "operation": "stream.write", "required": true }
   ],
   "capabilities": [
     {
-      "name": "SELF_PROCESS",
-      "rights": ["TERMINATE_SELF"],
+      "requirement": "self_process",
+      "rights": ["exit"],
       "required": true
     },
     {
-      "name": "STDOUT",
-      "rights": ["WRITE"],
+      "requirement": "stdout",
+      "rights": ["write"],
       "required": true
     }
   ],

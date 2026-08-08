@@ -57,6 +57,13 @@ fn rv64_objects() -> Vec<InputObject> {
         .collect()
 }
 
+fn la64_objects() -> Vec<InputObject> {
+    ["entry.c", "library.c"]
+        .into_iter()
+        .map(|fixture| compile_object(fixture, "loongarch64-unknown-none", &[]))
+        .collect()
+}
+
 fn with_elf_flags(object: InputObject, flags: u32) -> InputObject {
     let mut bytes = object.bytes().to_vec();
     bytes[48..52].copy_from_slice(&flags.to_le_bytes());
@@ -105,6 +112,94 @@ fn layout_is_byte_deterministic_for_identical_inputs() {
     assert_eq!(
         build_link_image(request()).unwrap(),
         build_link_image(request()).unwrap()
+    );
+}
+
+#[test]
+fn links_runtime_arrays_into_synthetic_rodata() {
+    let mut objects = rv64_objects();
+    objects.push(compile_object(
+        "constructors.c",
+        "riscv64-unknown-none-elf",
+        &["-mno-relax", "-msmall-data-limit=0", "-mcmodel=medany"],
+    ));
+    let image = build_link_image(LinkRequest {
+        target_arch: TargetArch::Riscv64,
+        entry_symbol: "_start",
+        objects: &objects,
+    })
+    .unwrap();
+
+    let arrays = image.runtime_arrays();
+    assert_eq!(arrays.init_count(), 2);
+    assert_eq!(arrays.fini_count(), 2);
+    let segment = image
+        .segments()
+        .iter()
+        .find(|segment| segment.virtual_offset() == arrays.init_offset())
+        .expect("应生成独立 init/fini RODATA");
+    assert_eq!(segment.kind(), SegmentKind::Rodata);
+    let values = segment
+        .payload()
+        .chunks_exact(8)
+        .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        [
+            image.symbol("init_first").unwrap().value(),
+            image.symbol("init_second").unwrap().value(),
+            image.symbol("fini_first").unwrap().value(),
+            image.symbol("fini_second").unwrap().value(),
+        ]
+        .map(|value| match value {
+            soyo_linker::link::SymbolValue::Image(value) => value,
+            _ => panic!("构造器与析构器必须位于映像 CODE"),
+        })
+    );
+}
+
+#[test]
+fn links_la64_runtime_arrays_into_synthetic_rodata() {
+    let mut objects = la64_objects();
+    objects.push(compile_object(
+        "constructors.c",
+        "loongarch64-unknown-none",
+        &[],
+    ));
+    let image = build_link_image(LinkRequest {
+        target_arch: TargetArch::LoongArch64,
+        entry_symbol: "_start",
+        objects: &objects,
+    })
+    .unwrap();
+
+    let arrays = image.runtime_arrays();
+    assert_eq!(arrays.init_count(), 2);
+    assert_eq!(arrays.fini_count(), 2);
+    let segment = image
+        .segments()
+        .iter()
+        .find(|segment| segment.virtual_offset() == arrays.init_offset())
+        .expect("应生成独立 init/fini RODATA");
+    assert_eq!(segment.kind(), SegmentKind::Rodata);
+    let values = segment
+        .payload()
+        .chunks_exact(8)
+        .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        [
+            image.symbol("init_first").unwrap().value(),
+            image.symbol("init_second").unwrap().value(),
+            image.symbol("fini_first").unwrap().value(),
+            image.symbol("fini_second").unwrap().value(),
+        ]
+        .map(|value| match value {
+            soyo_linker::link::SymbolValue::Image(value) => value,
+            _ => panic!("构造器与析构器必须位于映像 CODE"),
+        })
     );
 }
 
@@ -188,10 +283,7 @@ fn rv64_rvc_flag_does_not_change_the_calling_convention() {
 
 #[test]
 fn rejects_mixed_la64_float_abis() {
-    let mut objects = vec![
-        compile_object("entry.c", "loongarch64-unknown-none", &[]),
-        compile_object("library.c", "loongarch64-unknown-none", &[]),
-    ];
+    let mut objects = la64_objects();
     objects[0] = with_elf_flags(objects[0].clone(), 0x41);
     objects[1] = with_elf_flags(objects[1].clone(), 0x43);
 

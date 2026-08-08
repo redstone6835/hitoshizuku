@@ -10,6 +10,10 @@ use soyo::registry::FeatureFlags;
 
 use crate::contract::ProgramContract;
 
+fn public_ident(name: &str) -> String {
+    name.replace('.', "_")
+}
+
 pub fn generate_rust_module(target: TargetArch, contract: &ProgramContract) -> Vec<u8> {
     let mut output = String::new();
     writeln!(output, "// 由 soyo-ld 生成，请勿手工修改。").unwrap();
@@ -45,7 +49,13 @@ pub fn generate_rust_module(target: TargetArch, contract: &ProgramContract) -> V
     .unwrap();
     for (slot, import) in contract.imports().iter().enumerate() {
         let spec = operation(import.operation).expect("manifest import 已由 registry 归一化");
-        writeln!(output, "pub const MYGO_SLOT_{}: u64 = {slot};", spec.name).unwrap();
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
+        writeln!(
+            output,
+            "pub const MYGO_SLOT_{}: u64 = {slot};",
+            public_ident(spec.name)
+        )
+        .unwrap();
     }
     writeln!(
         output,
@@ -75,66 +85,80 @@ pub fn generate_rust_module(target: TargetArch, contract: &ProgramContract) -> V
 
 fn write_registry_definitions(output: &mut String) {
     for (name, value) in [
-        ("PROCESS", ObjectInterface::Process as u16),
-        ("ADDRESS_SPACE", ObjectInterface::AddressSpace as u16),
-        ("STREAM", ObjectInterface::Stream as u16),
-        ("CLOCK", ObjectInterface::Clock as u16),
+        ("process", ObjectInterface::Process as u16),
+        ("address_space", ObjectInterface::AddressSpace as u16),
+        ("stream", ObjectInterface::Stream as u16),
+        ("clock", ObjectInterface::Clock as u16),
     ] {
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(output, "pub const MYGO_INTERFACE_{name}: u16 = {value};").unwrap();
     }
 
     writeln!(output, "pub const MYGO_RIGHT_NONE: u64 = 0;").unwrap();
     for right in RIGHTS {
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(
             output,
             "pub const MYGO_RIGHT_{}: u64 = {};",
-            right.name,
+            public_ident(right.name),
             right.right.bits()
         )
         .unwrap();
     }
 
     for requirement in REQUIREMENTS {
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(
             output,
             "pub const MYGO_REQUIREMENT_{}: u32 = {};",
-            requirement.name, requirement.id as u32
+            public_ident(requirement.name),
+            requirement.id as u32
         )
         .unwrap();
     }
 
     for operation in native_abi::OPERATIONS {
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(
             output,
             "pub const MYGO_OPERATION_{}: u32 = {};",
-            operation.name, operation.id as u32
+            public_ident(operation.name),
+            operation.id as u32
         )
         .unwrap();
     }
 
     for (name, value) in [
-        ("OK", status::OK),
-        ("CORE_INVALID_ARGUMENT", status::CORE_INVALID_ARGUMENT),
-        ("CORE_OUT_OF_RANGE", status::CORE_OUT_OF_RANGE),
-        ("CORE_RESOURCE_EXHAUSTED", status::CORE_RESOURCE_EXHAUSTED),
-        ("ABI_BAD_SLOT", status::ABI_BAD_SLOT),
-        ("ABI_SIGNATURE_MISMATCH", status::ABI_SIGNATURE_MISMATCH),
+        ("ok", status::OK),
+        ("core.invalid_argument", status::CORE_INVALID_ARGUMENT),
+        ("core.out_of_range", status::CORE_OUT_OF_RANGE),
+        ("core.resource_exhausted", status::CORE_RESOURCE_EXHAUSTED),
+        ("abi.bad_slot", status::ABI_BAD_SLOT),
+        ("abi.signature_mismatch", status::ABI_SIGNATURE_MISMATCH),
         (
-            "ABI_UNSUPPORTED_OPERATION",
+            "abi.unsupported_operation",
             status::ABI_UNSUPPORTED_OPERATION,
         ),
-        ("HANDLE_INVALID", status::HANDLE_INVALID),
-        ("HANDLE_STALE", status::HANDLE_STALE),
-        ("HANDLE_WRONG_INTERFACE", status::HANDLE_WRONG_INTERFACE),
-        ("SECURITY_RIGHTS_DENIED", status::SECURITY_RIGHTS_DENIED),
-        ("IO_FAULT", status::IO_FAULT),
-        ("IO_WOULD_BLOCK", status::IO_WOULD_BLOCK),
-        ("IO_CLOSED", status::IO_CLOSED),
-        ("IO_ERROR", status::IO_ERROR),
-        ("VM_INVALID_RANGE", status::VM_INVALID_RANGE),
-        ("VM_ADDRESS_CONFLICT", status::VM_ADDRESS_CONFLICT),
+        ("handle.invalid", status::HANDLE_INVALID),
+        ("handle.stale", status::HANDLE_STALE),
+        ("handle.wrong_interface", status::HANDLE_WRONG_INTERFACE),
+        ("security.rights_denied", status::SECURITY_RIGHTS_DENIED),
+        ("stream.fault", status::STREAM_FAULT),
+        ("stream.would_block", status::STREAM_WOULD_BLOCK),
+        ("stream.end", status::STREAM_END),
+        ("stream.closed", status::STREAM_CLOSED),
+        ("stream.error", status::STREAM_ERROR),
+        ("memory.invalid_range", status::MEMORY_INVALID_RANGE),
+        ("memory.invalid_alignment", status::MEMORY_INVALID_ALIGNMENT),
+        ("memory.not_owned", status::MEMORY_NOT_OWNED),
     ] {
-        writeln!(output, "pub const MYGO_STATUS_{name}: u32 = 0x{value:08x};").unwrap();
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
+        writeln!(
+            output,
+            "pub const MYGO_STATUS_{}: u32 = 0x{value:08x};",
+            public_ident(name)
+        )
+        .unwrap();
     }
     writeln!(output).unwrap();
 }
@@ -149,16 +173,19 @@ fn write_capability_definitions(output: &mut String, contract: &ProgramContract)
     for capability in contract.capabilities() {
         let spec = native_abi::requirement(capability.requirement)
             .expect("manifest capability 已由 registry 归一化");
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(
             output,
-            "pub const MYGO_CAP_{}_REQUIRED: bool = {};",
-            spec.name, capability.required
+            "pub const MYGO_CAP_{}_required: bool = {};",
+            public_ident(spec.name),
+            capability.required
         )
         .unwrap();
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(
             output,
-            "pub const MYGO_CAP_{}_RIGHTS: u64 = {};",
-            spec.name,
+            "pub const MYGO_CAP_{}_rights: u64 = {};",
+            public_ident(spec.name),
             capability.rights.bits()
         )
         .unwrap();

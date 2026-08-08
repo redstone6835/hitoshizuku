@@ -7,8 +7,13 @@ use native_abi::{
     operation, status, wire as native_wire,
 };
 use soyo::registry::FeatureFlags;
+use soyo::registry::RuntimeFlags;
 
 use crate::contract::ProgramContract;
+
+fn public_ident(name: &str) -> String {
+    name.replace('.', "_")
+}
 
 pub fn generate_c_header(target: TargetArch, contract: &ProgramContract) -> Vec<u8> {
     let mut output = String::new();
@@ -40,13 +45,37 @@ pub fn generate_c_header(target: TargetArch, contract: &ProgramContract) -> Vec<
     .unwrap();
     writeln!(
         output,
+        "#define MYGO_FEATURE_INIT_FINI_ARRAY UINT64_C({})",
+        FeatureFlags::INIT_FINI_ARRAY.bits()
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "#define MYGO_RUNTIME_RUN_INIT_ARRAY UINT64_C({})",
+        RuntimeFlags::RUN_INIT_ARRAY.bits()
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "#define MYGO_RUNTIME_RUN_FINI_ARRAY UINT64_C({})",
+        RuntimeFlags::RUN_FINI_ARRAY.bits()
+    )
+    .unwrap();
+    writeln!(
+        output,
         "#define MYGO_CALL_SLOT_COUNT {}u",
         contract.imports().len()
     )
     .unwrap();
     for (slot, import) in contract.imports().iter().enumerate() {
         let spec = operation(import.operation).expect("manifest import 已由 registry 归一化");
-        writeln!(output, "#define MYGO_SLOT_{} {}u", spec.name, slot).unwrap();
+        writeln!(
+            output,
+            "#define MYGO_SLOT_{} {}u",
+            public_ident(spec.name),
+            slot
+        )
+        .unwrap();
     }
     writeln!(
         output,
@@ -78,10 +107,10 @@ pub fn generate_c_header(target: TargetArch, contract: &ProgramContract) -> Vec<
 
 fn write_registry_definitions(output: &mut String) {
     for (name, value) in [
-        ("PROCESS", ObjectInterface::Process as u16),
-        ("ADDRESS_SPACE", ObjectInterface::AddressSpace as u16),
-        ("STREAM", ObjectInterface::Stream as u16),
-        ("CLOCK", ObjectInterface::Clock as u16),
+        ("process", ObjectInterface::Process as u16),
+        ("address_space", ObjectInterface::AddressSpace as u16),
+        ("stream", ObjectInterface::Stream as u16),
+        ("clock", ObjectInterface::Clock as u16),
     ] {
         writeln!(output, "#define MYGO_INTERFACE_{name} {value}u").unwrap();
     }
@@ -91,7 +120,7 @@ fn write_registry_definitions(output: &mut String) {
         writeln!(
             output,
             "#define MYGO_RIGHT_{} UINT64_C({})",
-            right.name,
+            public_ident(right.name),
             right.right.bits()
         )
         .unwrap();
@@ -101,7 +130,8 @@ fn write_registry_definitions(output: &mut String) {
         writeln!(
             output,
             "#define MYGO_REQUIREMENT_{} {}u",
-            requirement.name, requirement.id as u32
+            public_ident(requirement.name),
+            requirement.id as u32
         )
         .unwrap();
     }
@@ -110,34 +140,42 @@ fn write_registry_definitions(output: &mut String) {
         writeln!(
             output,
             "#define MYGO_OPERATION_{} {}u",
-            operation.name, operation.id as u32
+            public_ident(operation.name),
+            operation.id as u32
         )
         .unwrap();
     }
 
     for (name, value) in [
-        ("OK", status::OK),
-        ("CORE_INVALID_ARGUMENT", status::CORE_INVALID_ARGUMENT),
-        ("CORE_OUT_OF_RANGE", status::CORE_OUT_OF_RANGE),
-        ("CORE_RESOURCE_EXHAUSTED", status::CORE_RESOURCE_EXHAUSTED),
-        ("ABI_BAD_SLOT", status::ABI_BAD_SLOT),
-        ("ABI_SIGNATURE_MISMATCH", status::ABI_SIGNATURE_MISMATCH),
+        ("ok", status::OK),
+        ("core.invalid_argument", status::CORE_INVALID_ARGUMENT),
+        ("core.out_of_range", status::CORE_OUT_OF_RANGE),
+        ("core.resource_exhausted", status::CORE_RESOURCE_EXHAUSTED),
+        ("abi.bad_slot", status::ABI_BAD_SLOT),
+        ("abi.signature_mismatch", status::ABI_SIGNATURE_MISMATCH),
         (
-            "ABI_UNSUPPORTED_OPERATION",
+            "abi.unsupported_operation",
             status::ABI_UNSUPPORTED_OPERATION,
         ),
-        ("HANDLE_INVALID", status::HANDLE_INVALID),
-        ("HANDLE_STALE", status::HANDLE_STALE),
-        ("HANDLE_WRONG_INTERFACE", status::HANDLE_WRONG_INTERFACE),
-        ("SECURITY_RIGHTS_DENIED", status::SECURITY_RIGHTS_DENIED),
-        ("IO_FAULT", status::IO_FAULT),
-        ("IO_WOULD_BLOCK", status::IO_WOULD_BLOCK),
-        ("IO_CLOSED", status::IO_CLOSED),
-        ("IO_ERROR", status::IO_ERROR),
-        ("VM_INVALID_RANGE", status::VM_INVALID_RANGE),
-        ("VM_ADDRESS_CONFLICT", status::VM_ADDRESS_CONFLICT),
+        ("handle.invalid", status::HANDLE_INVALID),
+        ("handle.stale", status::HANDLE_STALE),
+        ("handle.wrong_interface", status::HANDLE_WRONG_INTERFACE),
+        ("security.rights_denied", status::SECURITY_RIGHTS_DENIED),
+        ("stream.fault", status::STREAM_FAULT),
+        ("stream.would_block", status::STREAM_WOULD_BLOCK),
+        ("stream.end", status::STREAM_END),
+        ("stream.closed", status::STREAM_CLOSED),
+        ("stream.error", status::STREAM_ERROR),
+        ("memory.invalid_range", status::MEMORY_INVALID_RANGE),
+        ("memory.invalid_alignment", status::MEMORY_INVALID_ALIGNMENT),
+        ("memory.not_owned", status::MEMORY_NOT_OWNED),
     ] {
-        writeln!(output, "#define MYGO_STATUS_{name} UINT32_C(0x{value:08x})").unwrap();
+        writeln!(
+            output,
+            "#define MYGO_STATUS_{} UINT32_C(0x{value:08x})",
+            public_ident(name)
+        )
+        .unwrap();
     }
     writeln!(output).unwrap();
 }
@@ -154,16 +192,42 @@ fn write_capability_definitions(output: &mut String, contract: &ProgramContract)
             .expect("manifest capability 已由 registry 归一化");
         writeln!(
             output,
-            "#define MYGO_CAP_{}_REQUIRED {}u",
-            spec.name,
+            "#define MYGO_CAP_{}_required {}u",
+            public_ident(spec.name),
             u32::from(capability.required)
         )
         .unwrap();
         writeln!(
             output,
-            "#define MYGO_CAP_{}_RIGHTS UINT64_C({})",
-            spec.name,
+            "#define MYGO_CAP_{}_rights UINT64_C({})",
+            public_ident(spec.name),
             capability.rights.bits()
+        )
+        .unwrap();
+    }
+    writeln!(output, "#define MYGO_CAPABILITY_CONTRACT(X) \\").unwrap();
+    for (index, capability) in contract.capabilities().iter().enumerate() {
+        let spec = native_abi::requirement(capability.requirement)
+            .expect("manifest capability 已由 registry 归一化");
+        let interface = match spec.interface {
+            ObjectInterface::Process => "process",
+            ObjectInterface::AddressSpace => "address_space",
+            ObjectInterface::Stream => "stream",
+            ObjectInterface::Clock => "clock",
+        };
+        let suffix = if index + 1 == contract.capabilities().len() {
+            ""
+        } else {
+            concat!(" ", "\\")
+        };
+        writeln!(
+            output,
+            "    X(MYGO_REQUIREMENT_{}, MYGO_INTERFACE_{}, UINT64_C({}), {}u){}",
+            public_ident(spec.name),
+            interface,
+            capability.rights.bits(),
+            u32::from(capability.required),
+            suffix
         )
         .unwrap();
     }
@@ -204,7 +268,15 @@ fn write_wire_types(output: &mut String) {
     writeln!(output, "    uint32_t call_slot_count;").unwrap();
     writeln!(output, "    uint8_t random_seed[32];").unwrap();
     writeln!(output, "    uint64_t runtime_flags;").unwrap();
-    writeln!(output, "    uint8_t reserved2[40];").unwrap();
+    writeln!(output, "    uint64_t init_array_offset;").unwrap();
+    writeln!(output, "    uint32_t init_array_count;").unwrap();
+    writeln!(output, "    uint16_t init_array_entry_size;").unwrap();
+    writeln!(output, "    uint16_t reserved2;").unwrap();
+    writeln!(output, "    uint64_t fini_array_offset;").unwrap();
+    writeln!(output, "    uint32_t fini_array_count;").unwrap();
+    writeln!(output, "    uint16_t fini_array_entry_size;").unwrap();
+    writeln!(output, "    uint16_t reserved3;").unwrap();
+    writeln!(output, "    uint64_t reserved4;").unwrap();
     writeln!(output, "}};").unwrap();
 
     writeln!(output, "struct mygo_initial_handle {{").unwrap();
@@ -368,7 +440,39 @@ fn write_wire_types(output: &mut String) {
                 "runtime_flags",
                 native_wire::start_info::RUNTIME_FLAGS,
             ),
+            (
+                "INIT_ARRAY_OFFSET",
+                "init_array_offset",
+                native_wire::start_info::INIT_ARRAY_OFFSET,
+            ),
+            (
+                "INIT_ARRAY_COUNT",
+                "init_array_count",
+                native_wire::start_info::INIT_ARRAY_COUNT,
+            ),
+            (
+                "INIT_ARRAY_ENTRY_SIZE",
+                "init_array_entry_size",
+                native_wire::start_info::INIT_ARRAY_ENTRY_SIZE,
+            ),
             ("RESERVED2", "reserved2", native_wire::start_info::RESERVED2),
+            (
+                "FINI_ARRAY_OFFSET",
+                "fini_array_offset",
+                native_wire::start_info::FINI_ARRAY_OFFSET,
+            ),
+            (
+                "FINI_ARRAY_COUNT",
+                "fini_array_count",
+                native_wire::start_info::FINI_ARRAY_COUNT,
+            ),
+            (
+                "FINI_ARRAY_ENTRY_SIZE",
+                "fini_array_entry_size",
+                native_wire::start_info::FINI_ARRAY_ENTRY_SIZE,
+            ),
+            ("RESERVED3", "reserved3", native_wire::start_info::RESERVED3),
+            ("RESERVED4", "reserved4", native_wire::start_info::RESERVED4),
         ],
     );
     write_wire_offsets(

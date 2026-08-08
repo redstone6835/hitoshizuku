@@ -10,14 +10,16 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const MANIFEST: &str = r#"
 {
+  "manifest_version": 1,
+  "abi_epoch": 1,
   "entry": "_start",
   "imports": [
-    { "name": "STREAM_WRITE", "required": true },
-    { "name": "PROCESS_EXIT", "required": true }
+    { "operation": "stream.write", "required": true },
+    { "operation": "process.exit", "required": true }
   ],
   "capabilities": [
-    { "name": "STDOUT", "rights": ["WRITE"], "required": true },
-    { "name": "SELF_PROCESS", "rights": ["TERMINATE_SELF"], "required": true }
+    { "requirement": "stdout", "rights": ["write"], "required": true },
+    { "requirement": "self_process", "rights": ["exit"], "required": true }
   ],
   "runtime": {
     "stack_size": 65536,
@@ -54,16 +56,16 @@ const _: () = assert!(MYGO_TARGET_ARCH == 1);
 const _: () = assert!(MYGO_ABI_FAMILY == 1);
 const _: () = assert!(MYGO_ABI_EPOCH == 1);
 const _: () = assert!(MYGO_FEATURE_STATIC_TLS == 1);
-const _: () = assert!(MYGO_SLOT_PROCESS_EXIT == 0);
-const _: () = assert!(MYGO_SLOT_STREAM_WRITE == 1);
-const _: () = assert!(MYGO_REQUIREMENT_SELF_PROCESS == 1);
-const _: () = assert!(MYGO_REQUIREMENT_STDOUT == 4);
-const _: () = assert!(MYGO_RIGHT_WRITE == 2);
-const _: () = assert!(MYGO_RIGHT_TERMINATE_SELF == 16);
-const _: () = assert!(MYGO_STATUS_OK == 0x0000_0000);
-const _: () = assert!(MYGO_STATUS_IO_CLOSED == 0x0500_0003);
-const _: () = assert!(MYGO_CAP_SELF_PROCESS_RIGHTS == 16);
-const _: () = assert!(MYGO_CAP_STDOUT_RIGHTS == 2);
+const _: () = assert!(MYGO_SLOT_process_exit == 0);
+const _: () = assert!(MYGO_SLOT_stream_write == 1);
+const _: () = assert!(MYGO_REQUIREMENT_self_process == 1);
+const _: () = assert!(MYGO_REQUIREMENT_stdout == 4);
+const _: () = assert!(MYGO_RIGHT_write == 2);
+const _: () = assert!(MYGO_RIGHT_exit == 32);
+const _: () = assert!(MYGO_STATUS_ok == 0x0000_0000);
+const _: () = assert!(MYGO_STATUS_stream_closed == 0x0500_0004);
+const _: () = assert!(MYGO_CAP_self_process_rights == 32);
+const _: () = assert!(MYGO_CAP_stdout_rights == 2);
 const _: () = assert!(core::mem::size_of::<MygoNativeCall>() == 64);
 const _: () = assert!(core::mem::offset_of!(MygoNativeCall, args) == 16);
 const _: () = assert!(core::mem::size_of::<MygoNativeResult>() == 24);
@@ -73,7 +75,7 @@ const _: () = assert!(core::mem::offset_of!(MygoNativeResult, value0) == 8);
     .unwrap();
 
     let output = Command::new("rustc")
-        .args(["--edition=2024", "--crate-type=lib"])
+        .args(["--edition=2024", "--crate-type=lib", "--deny=warnings"])
         .arg(&probe_path)
         .arg("-o")
         .arg(directory.join("libprobe.rlib"))

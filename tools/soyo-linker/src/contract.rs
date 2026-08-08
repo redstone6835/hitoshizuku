@@ -13,6 +13,7 @@ use soyo::registry::{MAX_CAPABILITIES, MAX_IMPORTS, PAGE_SIZE};
 pub enum ContractErrorKind {
     InvalidJson,
     InvalidEntry,
+    InvalidVersion,
     TooManyImports,
     TooManyCapabilities,
     UnknownOperation,
@@ -102,6 +103,8 @@ impl ProgramContract {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    manifest_version: u16,
+    abi_epoch: u16,
     entry: String,
     imports: Vec<ManifestImport>,
     capabilities: Vec<ManifestCapability>,
@@ -111,14 +114,14 @@ struct Manifest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestImport {
-    name: String,
+    operation: String,
     required: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestCapability {
-    name: String,
+    requirement: String,
     rights: Vec<String>,
     required: bool,
 }
@@ -138,6 +141,12 @@ pub fn parse_manifest(source: &str) -> Result<ProgramContract, ContractError> {
             format!("manifest JSON 无效: {error}"),
         )
     })?;
+    if manifest.manifest_version != 1 || manifest.abi_epoch != native_abi::ABI_EPOCH {
+        return Err(ContractError::new(
+            ContractErrorKind::InvalidVersion,
+            "manifest_version 必须为 1 且 abi_epoch 必须匹配 Native ABI",
+        ));
+    }
     validate_entry(&manifest.entry)?;
     let imports = normalize_imports(manifest.imports)?;
     let capabilities = normalize_capabilities(manifest.capabilities)?;
@@ -172,11 +181,11 @@ fn normalize_imports(imports: Vec<ManifestImport>) -> Result<Vec<ContractImport>
     for import in imports {
         let spec = OPERATIONS
             .iter()
-            .find(|spec| spec.name == import.name)
+            .find(|spec| spec.name == import.operation)
             .ok_or_else(|| {
                 ContractError::new(
                     ContractErrorKind::UnknownOperation,
-                    format!("未知 Native ABI operation {}", import.name),
+                    format!("未知 Native ABI operation {}", import.operation),
                 )
             })?;
         if normalized
@@ -210,11 +219,11 @@ fn normalize_capabilities(
     for capability in capabilities {
         let spec = REQUIREMENTS
             .iter()
-            .find(|spec| spec.name == capability.name)
+            .find(|spec| spec.name == capability.requirement)
             .ok_or_else(|| {
                 ContractError::new(
                     ContractErrorKind::UnknownRequirement,
-                    format!("未知 capability requirement {}", capability.name),
+                    format!("未知 capability requirement {}", capability.requirement),
                 )
             })?;
         if normalized

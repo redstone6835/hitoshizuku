@@ -43,6 +43,7 @@ pub fn apply_relocations(mut image: LinkImage) -> Result<LinkedImage, LinkError>
         segments: image.segments,
         symbols: image.symbols,
         runtime_relocations,
+        runtime_arrays: image.runtime_arrays,
     })
 }
 

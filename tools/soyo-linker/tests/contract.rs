@@ -3,14 +3,16 @@ use soyo_linker::contract::{ContractErrorKind, parse_manifest};
 
 const VALID_MANIFEST: &str = r#"
 {
+  "manifest_version": 1,
+  "abi_epoch": 1,
   "entry": "_start",
   "imports": [
-    { "name": "STREAM_WRITE", "required": true },
-    { "name": "PROCESS_EXIT", "required": true }
+    { "operation": "stream.write", "required": true },
+    { "operation": "process.exit", "required": true }
   ],
   "capabilities": [
-    { "name": "STDOUT", "rights": ["WRITE"], "required": true },
-    { "name": "SELF_PROCESS", "rights": ["TERMINATE_SELF"], "required": true }
+    { "requirement": "stdout", "rights": ["write"], "required": true },
+    { "requirement": "self_process", "rights": ["exit"], "required": true }
   ],
   "runtime": {
     "stack_size": 65536,
@@ -47,15 +49,15 @@ fn manifest_becomes_a_registry_ordered_program_contract() {
 
 #[test]
 fn manifest_rejects_unknown_and_duplicate_registry_names() {
-    let unknown = VALID_MANIFEST.replace("STREAM_WRITE", "FUTURE_WRITE");
+    let unknown = VALID_MANIFEST.replace("stream.write", "future.write");
     assert_eq!(
         parse_manifest(&unknown).unwrap_err().kind(),
         ContractErrorKind::UnknownOperation
     );
 
     let duplicate = VALID_MANIFEST.replace(
-        r#"{ "name": "PROCESS_EXIT", "required": true }"#,
-        r#"{ "name": "STREAM_WRITE", "required": true }"#,
+        r#"{ "operation": "process.exit", "required": true }"#,
+        r#"{ "operation": "stream.write", "required": true }"#,
     );
     assert_eq!(
         parse_manifest(&duplicate).unwrap_err().kind(),
@@ -65,15 +67,15 @@ fn manifest_rejects_unknown_and_duplicate_registry_names() {
 
 #[test]
 fn manifest_rejects_capability_escalation_and_missing_authority() {
-    let escalation = VALID_MANIFEST.replace(r#"["WRITE"]"#, r#"["WRITE", "READ"]"#);
+    let escalation = VALID_MANIFEST.replace(r#"["write"]"#, r#"["write", "read"]"#);
     assert_eq!(
         parse_manifest(&escalation).unwrap_err().kind(),
         ContractErrorKind::RightsExceeded
     );
 
     let missing = VALID_MANIFEST
-        .replace("STDOUT", "STDIN")
-        .replace(r#"["WRITE"]"#, r#"["READ"]"#);
+        .replace("stdout", "stdin")
+        .replace(r#"["write"]"#, r#"["read"]"#);
     assert_eq!(
         parse_manifest(&missing).unwrap_err().kind(),
         ContractErrorKind::MissingCapability

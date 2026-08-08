@@ -42,6 +42,46 @@ pub enum SymbolValue {
     Absolute(u64),
 }
 
+/// 链接器合成的构造器与析构器数组位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeArrays {
+    pub(crate) init_offset: u64,
+    pub(crate) init_count: u32,
+    pub(crate) fini_offset: u64,
+    pub(crate) fini_count: u32,
+    pub(crate) segment_index: Option<usize>,
+}
+
+impl RuntimeArrays {
+    pub(crate) const EMPTY: Self = Self {
+        init_offset: 0,
+        init_count: 0,
+        fini_offset: 0,
+        fini_count: 0,
+        segment_index: None,
+    };
+
+    pub const fn init_offset(self) -> u64 {
+        self.init_offset
+    }
+
+    pub const fn init_count(self) -> u32 {
+        self.init_count
+    }
+
+    pub const fn fini_offset(self) -> u64 {
+        self.fini_offset
+    }
+
+    pub const fn fini_count(self) -> u32 {
+        self.fini_count
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.init_count == 0 && self.fini_count == 0
+    }
+}
+
 /// 已解析的全局符号。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSymbol {
@@ -152,6 +192,7 @@ pub struct LinkImage {
     pub(crate) segments: Vec<LinkSegment>,
     pub(crate) symbols: BTreeMap<String, LinkSymbol>,
     pub(crate) pending_relocations: Vec<PendingRelocation>,
+    pub(crate) runtime_arrays: RuntimeArrays,
 }
 
 impl LinkImage {
@@ -178,6 +219,10 @@ impl LinkImage {
     pub fn pending_relocations(&self) -> &[PendingRelocation] {
         &self.pending_relocations
     }
+
+    pub const fn runtime_arrays(&self) -> RuntimeArrays {
+        self.runtime_arrays
+    }
 }
 
 /// 已完成架构 relocation、可交给 SOYO writer 的链接映像。
@@ -189,6 +234,7 @@ pub struct LinkedImage {
     pub(crate) segments: Vec<LinkSegment>,
     pub(crate) symbols: BTreeMap<String, LinkSymbol>,
     pub(crate) runtime_relocations: Vec<Relocation>,
+    pub(crate) runtime_arrays: RuntimeArrays,
 }
 
 impl LinkedImage {
@@ -214,5 +260,9 @@ impl LinkedImage {
 
     pub fn runtime_relocations(&self) -> &[Relocation] {
         &self.runtime_relocations
+    }
+
+    pub const fn runtime_arrays(&self) -> RuntimeArrays {
+        self.runtime_arrays
     }
 }

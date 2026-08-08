@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const VALID_MANIFEST: &str = r#"{
+  "manifest_version": 1,
+  "abi_epoch": 1,
   "entry":"_start",
-  "imports":[{"name":"PROCESS_EXIT","required":true}],
+  "imports":[{"operation":"process.exit","required":true}],
   "capabilities":[{
-    "name":"SELF_PROCESS",
-    "rights":["TERMINATE_SELF"],
+    "requirement":"self_process",
+    "rights":["exit"],
     "required":true
   }],
   "runtime":{
@@ -78,7 +80,7 @@ fn header_only_mode_writes_generated_binding_without_objects() {
         String::from_utf8_lossy(&output.stderr)
     );
     let generated = String::from_utf8(fs::read(&header).unwrap()).unwrap();
-    assert!(generated.contains("#define MYGO_SLOT_PROCESS_EXIT 0u\n"));
+    assert!(generated.contains("#define MYGO_SLOT_process_exit 0u\n"));
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -103,7 +105,7 @@ fn rust_module_mode_writes_generated_binding_without_objects() {
         String::from_utf8_lossy(&output.stderr)
     );
     let generated = String::from_utf8(fs::read(&module).unwrap()).unwrap();
-    assert!(generated.contains("pub const MYGO_SLOT_PROCESS_EXIT: u64 = 0;\n"));
+    assert!(generated.contains("pub const MYGO_SLOT_process_exit: u64 = 0;\n"));
     assert!(generated.contains("pub struct MygoNativeResult {\n"));
     fs::remove_dir_all(directory).unwrap();
 }

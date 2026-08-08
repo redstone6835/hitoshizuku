@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use soyo::registry::{
     ArtifactKind, CapabilityFlags, DirectoryFlags, FORMAT_VERSION, FeatureFlags, HashAlgorithm,
     ImportFlags, MAX_FILE_SIZE, MAX_SEGMENTS, MAX_STRING_BYTES, PAGE_SIZE, RelocationKind,
-    SOYO_MAGIC, SegmentKind, SegmentPermissions, TableType,
+    RuntimeFlags, SOYO_MAGIC, SegmentKind, SegmentPermissions, TableType,
 };
 use soyo::wire;
 use soyo::{SliceSoyoReader, SoyoReadLimits, SoyoTargetPolicy, read_soyo, validate_soyo};
@@ -224,7 +224,7 @@ fn build_tables(
         entry_count: 1,
         alignment: 8,
         file_offset: 0,
-        bytes: encode_runtime(contract),
+        bytes: encode_runtime(image, contract),
     });
     Ok(tables)
 }
@@ -337,8 +337,9 @@ fn encode_relocations(image: &LinkedImage) -> Vec<u8> {
     bytes
 }
 
-fn encode_runtime(contract: &ProgramContract) -> Vec<u8> {
+fn encode_runtime(image: &LinkedImage, contract: &ProgramContract) -> Vec<u8> {
     let runtime = contract.runtime();
+    let arrays = image.runtime_arrays();
     let mut bytes = vec![0; wire::RUNTIME_INFO_SIZE];
     put_u64(
         &mut bytes,
@@ -350,6 +351,36 @@ fn encode_runtime(contract: &ProgramContract) -> Vec<u8> {
         wire::runtime_info::STACK_GUARD_SIZE,
         runtime.stack_guard_size,
     );
+    let mut runtime_flags = 0;
+    if arrays.init_count() != 0 {
+        runtime_flags |= RuntimeFlags::RUN_INIT_ARRAY.bits();
+        put_u64(
+            &mut bytes,
+            wire::runtime_info::INIT_ARRAY_OFFSET,
+            arrays.init_offset(),
+        );
+        put_u32(
+            &mut bytes,
+            wire::runtime_info::INIT_ARRAY_COUNT,
+            arrays.init_count(),
+        );
+        put_u16(&mut bytes, wire::runtime_info::INIT_ARRAY_ENTRY_SIZE, 8);
+    }
+    if arrays.fini_count() != 0 {
+        runtime_flags |= RuntimeFlags::RUN_FINI_ARRAY.bits();
+        put_u64(
+            &mut bytes,
+            wire::runtime_info::FINI_ARRAY_OFFSET,
+            arrays.fini_offset(),
+        );
+        put_u32(
+            &mut bytes,
+            wire::runtime_info::FINI_ARRAY_COUNT,
+            arrays.fini_count(),
+        );
+        put_u16(&mut bytes, wire::runtime_info::FINI_ARRAY_ENTRY_SIZE, 8);
+    }
+    put_u64(&mut bytes, wire::runtime_info::RUNTIME_FLAGS, runtime_flags);
     put_u32(&mut bytes, wire::runtime_info::STACK_ALIGNMENT, 16);
     put_u32(
         &mut bytes,
@@ -495,6 +526,18 @@ fn encode_header(
             output,
             wire::header::REQUIRED_FEATURES,
             FeatureFlags::STATIC_TLS.bits(),
+        );
+    }
+    if !image.runtime_arrays().is_empty() {
+        let existing = u64::from_le_bytes(
+            output[wire::header::REQUIRED_FEATURES..wire::header::REQUIRED_FEATURES + 8]
+                .try_into()
+                .expect("Header required feature 字段大小固定"),
+        );
+        put_u64(
+            output,
+            wire::header::REQUIRED_FEATURES,
+            existing | FeatureFlags::INIT_FINI_ARRAY.bits(),
         );
     }
     put_u64(output, wire::header::ENTRY_OFFSET, image.entry_offset());

@@ -10,14 +10,16 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const MANIFEST: &str = r#"
 {
+  "manifest_version": 1,
+  "abi_epoch": 1,
   "entry": "_start",
   "imports": [
-    { "name": "PROCESS_EXIT", "required": true },
-    { "name": "STREAM_WRITE", "required": true }
+    { "operation": "process.exit", "required": true },
+    { "operation": "stream.write", "required": true }
   ],
   "capabilities": [
-    { "name": "SELF_PROCESS", "rights": ["TERMINATE_SELF"], "required": true },
-    { "name": "STDOUT", "rights": ["WRITE"], "required": true }
+    { "requirement": "self_process", "rights": ["exit"], "required": true },
+    { "requirement": "stdout", "rights": ["write"], "required": true }
   ],
   "runtime": {
     "stack_size": 65536,

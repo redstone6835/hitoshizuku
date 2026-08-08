@@ -4,9 +4,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use native_abi::TargetArch;
-use soyo::registry::RelocationKind;
+use soyo::registry::{RelocationKind, SegmentKind};
 use soyo_linker::link::{
-    InputObject, LinkRequest, SymbolValue, apply_relocations, build_link_image,
+    InputObject, LinkRequest, PendingRelocation, SymbolValue, apply_relocations, build_link_image,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -73,6 +73,83 @@ fn la64_optimized_signed_i12_relocations_are_supported() {
     .unwrap();
 
     apply_relocations(pending).unwrap();
+}
+
+fn compile_tls_object(target: TargetArch) -> InputObject {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls.c");
+    let output = std::env::temp_dir().join(format!(
+        "soyo-linker-tls-{}-{}.o",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let (triple, arch_flags): (&str, &[&str]) = match target {
+        TargetArch::Riscv64 => (
+            "riscv64-unknown-none-elf",
+            &["-mno-relax", "-msmall-data-limit=0", "-mcmodel=medany"],
+        ),
+        TargetArch::LoongArch64 => ("loongarch64-unknown-none", &[]),
+    };
+    let status = Command::new("clang")
+        .arg(format!("--target={triple}"))
+        .args([
+            "-ffreestanding",
+            "-fno-stack-protector",
+            "-fno-pic",
+            "-fno-pie",
+            "-fno-asynchronous-unwind-tables",
+            "-fno-unwind-tables",
+            "-fvisibility=hidden",
+            "-O0",
+            "-c",
+        ])
+        .args(arch_flags)
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .expect("应能启动 clang");
+    assert!(status.success(), "clang 未能生成 TLS 对象");
+    let bytes = fs::read(&output).expect("应能读取 TLS 对象");
+    fs::remove_file(&output).expect("应能清理 TLS 对象");
+    InputObject::new(PathBuf::from("tls.o"), bytes)
+}
+
+#[test]
+fn local_exec_tls_relocations_link_for_both_architectures() {
+    for target in [TargetArch::Riscv64, TargetArch::LoongArch64] {
+        let object = compile_tls_object(target);
+        let pending = build_link_image(LinkRequest {
+            target_arch: target,
+            entry_symbol: "_start",
+            objects: std::slice::from_ref(&object),
+        })
+        .unwrap();
+        let kinds: Vec<_> = pending
+            .pending_relocations()
+            .iter()
+            .map(PendingRelocation::kind)
+            .collect();
+        match target {
+            TargetArch::Riscv64 => {
+                assert!(kinds.contains(&29));
+                assert!(kinds.contains(&30) || kinds.contains(&31));
+                assert!(kinds.contains(&32));
+            }
+            TargetArch::LoongArch64 => {
+                let legacy_pair = kinds.contains(&83) && kinds.contains(&84);
+                let relaxed_group =
+                    kinds.contains(&121) && kinds.contains(&122) && kinds.contains(&123);
+                assert!(legacy_pair || relaxed_group);
+            }
+        }
+        let linked = apply_relocations(pending).unwrap();
+        let tls = linked
+            .segments()
+            .iter()
+            .find(|segment| segment.kind() == SegmentKind::TlsTemplate)
+            .expect("TLS template 必须保留");
+        assert!(tls.memory_size() >= 4);
+    }
 }
 
 fn signed(value: u32, bits: u32) -> i64 {

@@ -7,20 +7,22 @@ use native_abi::{OperationId, RequirementId, TargetArch};
 use soyo::{SliceSoyoReader, SoyoReadLimits, SoyoTargetPolicy, read_soyo, validate_soyo};
 use soyo_linker::contract::parse_manifest;
 use soyo_linker::link::{InputObject, LinkRequest, apply_relocations, build_link_image};
-use soyo_linker::writer::{EncodeErrorKind, encode_soyo};
+use soyo_linker::writer::encode_soyo;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const MANIFEST: &str = r#"
 {
+  "manifest_version": 1,
+  "abi_epoch": 1,
   "entry": "_start",
   "imports": [
-    { "name": "STREAM_WRITE", "required": true },
-    { "name": "PROCESS_EXIT", "required": true }
+    { "operation": "stream.write", "required": true },
+    { "operation": "process.exit", "required": true }
   ],
   "capabilities": [
-    { "name": "STDOUT", "rights": ["WRITE"], "required": true },
-    { "name": "SELF_PROCESS", "rights": ["TERMINATE_SELF"], "required": true }
+    { "requirement": "stdout", "rights": ["write"], "required": true },
+    { "requirement": "self_process", "rights": ["exit"], "required": true }
   ],
   "runtime": {
     "stack_size": 65536,
@@ -31,7 +33,7 @@ const MANIFEST: &str = r#"
 "#;
 
 fn compile_rv64_objects() -> Vec<InputObject> {
-    ["entry.c", "library.c", "pointer.c"]
+    ["entry.c", "library.c", "pointer.c", "constructors.c"]
         .into_iter()
         .map(|fixture| {
             let source = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -121,19 +123,45 @@ fn canonical_writer_round_trips_real_linked_image() {
     );
     assert_eq!(metadata.relocations, image.runtime_relocations());
     assert_eq!(metadata.runtime.stack_size, 65536);
+    assert_eq!(metadata.runtime.init_array_count, 2);
+    assert_eq!(metadata.runtime.fini_array_count, 2);
+    assert_eq!(metadata.runtime.init_array_entry_size, 8);
+    assert_eq!(metadata.runtime.fini_array_entry_size, 8);
+    assert_ne!(metadata.header.required_features & (1 << 1), 0);
 }
 
 #[test]
-fn writer_rejects_contract_required_operation_not_supported_by_kernel() {
+fn writer_accepts_stream_read_contract_supported_by_kernel() {
     let image = linked_image();
     let manifest = MANIFEST
-        .replace("STREAM_WRITE", "STREAM_READ")
-        .replace("STDOUT", "STDIN")
-        .replace(r#"["WRITE"]"#, r#"["READ"]"#);
+        .replace("stream.write", "stream.read")
+        .replace("stdout", "stdin")
+        .replace(r#"["write"]"#, r#"["read"]"#);
     let contract = parse_manifest(&manifest).unwrap();
 
+    let bytes = encode_soyo(&image, &contract).unwrap();
+    let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable()).unwrap();
+    validate_soyo(&metadata, SoyoTargetPolicy::for_kernel(TargetArch::Riscv64)).unwrap();
     assert_eq!(
-        encode_soyo(&image, &contract).unwrap_err().kind(),
-        EncodeErrorKind::SelfValidation
+        metadata
+            .imports
+            .iter()
+            .map(|import| import.operation_id)
+            .collect::<Vec<_>>(),
+        [
+            OperationId::ProcessExit as u32,
+            OperationId::StreamRead as u32
+        ]
+    );
+    assert_eq!(
+        metadata
+            .capabilities
+            .iter()
+            .map(|capability| capability.requirement_id)
+            .collect::<Vec<_>>(),
+        [
+            RequirementId::SelfProcess as u32,
+            RequirementId::Stdin as u32
+        ]
     );
 }
