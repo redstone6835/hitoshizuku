@@ -111,6 +111,8 @@ fn write_registry_definitions(output: &mut String) {
         ("address_space", ObjectInterface::AddressSpace as u16),
         ("stream", ObjectInterface::Stream as u16),
         ("clock", ObjectInterface::Clock as u16),
+        ("executable_image", ObjectInterface::ExecutableImage as u16),
+        ("event_port", ObjectInterface::EventPort as u16),
     ] {
         writeln!(output, "#define MYGO_INTERFACE_{name} {value}u").unwrap();
     }
@@ -147,6 +149,39 @@ fn write_registry_definitions(output: &mut String) {
     }
 
     for (name, value) in [
+        ("PROCESS_STATE_RUNNING", native_wire::PROCESS_STATE_RUNNING),
+        ("PROCESS_STATE_TERMINATING", native_wire::PROCESS_STATE_TERMINATING),
+        ("PROCESS_STATE_EXITED", native_wire::PROCESS_STATE_EXITED),
+        ("PROCESS_STATE_FAULTED", native_wire::PROCESS_STATE_FAULTED),
+        ("PROCESS_STATE_REAPED", native_wire::PROCESS_STATE_REAPED),
+        ("PROCESS_FAULT_MEMORY", native_wire::PROCESS_FAULT_MEMORY),
+        ("PROCESS_FAULT_ILLEGAL_INSTRUCTION", native_wire::PROCESS_FAULT_ILLEGAL_INSTRUCTION),
+        ("PROCESS_FAULT_BREAKPOINT", native_wire::PROCESS_FAULT_BREAKPOINT),
+        ("PROCESS_FAULT_ADDRESS", native_wire::PROCESS_FAULT_ADDRESS),
+        ("PROCESS_FAULT_ARITHMETIC", native_wire::PROCESS_FAULT_ARITHMETIC),
+        ("PROCESS_FAULT_RESOURCE", native_wire::PROCESS_FAULT_RESOURCE),
+        ("PROCESS_FAULT_OTHER", native_wire::PROCESS_FAULT_OTHER),
+        ("EVENT_KIND_PROCESS_EXITED", native_wire::EVENT_KIND_PROCESS_EXITED),
+        ("EVENT_KIND_PROCESS_FAULT", native_wire::EVENT_KIND_PROCESS_FAULT),
+        ("EVENT_KIND_STREAM_READY", native_wire::EVENT_KIND_STREAM_READY),
+        ("EVENT_KIND_TIMER_EXPIRED", native_wire::EVENT_KIND_TIMER_EXPIRED),
+        ("EVENT_STREAM_READABLE", native_wire::EVENT_STREAM_READABLE),
+        ("EVENT_STREAM_WRITABLE", native_wire::EVENT_STREAM_WRITABLE),
+        ("EVENT_STREAM_ERROR", native_wire::EVENT_STREAM_ERROR),
+        ("EVENT_STREAM_CLOSED", native_wire::EVENT_STREAM_CLOSED),
+    ] {
+        writeln!(output, "#define MYGO_{name} {value}u").unwrap();
+    }
+    writeln!(
+        output,
+        "#define MYGO_HANDLE_TRANSFER_MOVE UINT64_C({})",
+        native_wire::HANDLE_TRANSFER_MOVE
+    )
+    .unwrap();
+    writeln!(output, "#define MYGO_MAX_EVENT_PORT_CAPACITY {}u", native_wire::MAX_EVENT_PORT_CAPACITY).unwrap();
+    writeln!(output, "#define MYGO_MAX_EVENT_BATCH {}u", native_wire::MAX_EVENT_BATCH).unwrap();
+
+    for (name, value) in [
         ("ok", status::OK),
         ("core.invalid_argument", status::CORE_INVALID_ARGUMENT),
         ("core.out_of_range", status::CORE_OUT_OF_RANGE),
@@ -169,6 +204,20 @@ fn write_registry_definitions(output: &mut String) {
         ("memory.invalid_range", status::MEMORY_INVALID_RANGE),
         ("memory.invalid_alignment", status::MEMORY_INVALID_ALIGNMENT),
         ("memory.not_owned", status::MEMORY_NOT_OWNED),
+        ("process.not_child", status::PROCESS_NOT_CHILD),
+        ("process.already_reaped", status::PROCESS_ALREADY_REAPED),
+        ("process.would_block", status::PROCESS_WOULD_BLOCK),
+        ("process.invalid_state", status::PROCESS_INVALID_STATE),
+        ("process.wait_in_progress", status::PROCESS_WAIT_IN_PROGRESS),
+        ("image.invalid", status::IMAGE_INVALID),
+        ("image.arch_mismatch", status::IMAGE_ARCH_MISMATCH),
+        ("image.not_executable", status::IMAGE_NOT_EXECUTABLE),
+        ("event.invalid_token", status::EVENT_INVALID_TOKEN),
+        ("event.source_unsupported", status::EVENT_SOURCE_UNSUPPORTED),
+        ("event.would_block", status::EVENT_WOULD_BLOCK),
+        ("event.timeout", status::EVENT_TIMEOUT),
+        ("event.queue_exhausted", status::EVENT_QUEUE_EXHAUSTED),
+        ("event.cancelled", status::EVENT_CANCELLED),
     ] {
         writeln!(
             output,
@@ -214,6 +263,8 @@ fn write_capability_definitions(output: &mut String, contract: &ProgramContract)
             ObjectInterface::AddressSpace => "address_space",
             ObjectInterface::Stream => "stream",
             ObjectInterface::Clock => "clock",
+            ObjectInterface::ExecutableImage => "executable_image",
+            ObjectInterface::EventPort => "event_port",
         };
         let suffix = if index + 1 == contract.capabilities().len() {
             ""
@@ -302,6 +353,13 @@ fn write_wire_types(output: &mut String) {
     writeln!(output, "    uint64_t value1;").unwrap();
     writeln!(output, "}};").unwrap();
 
+    writeln!(output, "typedef struct mygo_process_string_ref {{ uint64_t ptr; uint64_t len; }} mygo_process_string_ref;").unwrap();
+    writeln!(output, "typedef struct mygo_process_array_ref {{ uint64_t ptr; uint32_t count; uint32_t reserved; }} mygo_process_array_ref;").unwrap();
+    writeln!(output, "typedef struct mygo_handle_transfer {{ uint32_t requirement_id; uint32_t reserved; uint64_t source_handle; uint64_t requested_rights; uint64_t flags; }} mygo_handle_transfer;").unwrap();
+    writeln!(output, "typedef struct mygo_spawn_request {{ uint64_t image; mygo_process_array_ref argv; mygo_process_array_ref env; mygo_process_array_ref transfers; uint64_t resource_policy; }} mygo_spawn_request;").unwrap();
+    writeln!(output, "typedef struct mygo_process_result {{ uint32_t state; uint32_t flags; uint32_t exit_code; uint32_t fault_kind; uint64_t detail0; uint64_t detail1; }} mygo_process_result;").unwrap();
+    writeln!(output, "typedef struct mygo_event_record {{ uint32_t event_kind; uint32_t status; uint64_t source_handle; uint64_t sequence; uint64_t value0; uint64_t value1; }} mygo_event_record;").unwrap();
+
     for (name, type_name, size) in [
         (
             "MYGO_STRING_REF_SIZE",
@@ -320,6 +378,12 @@ fn write_wire_types(output: &mut String) {
         ),
         ("MYGO_NATIVE_CALL_SIZE", "struct mygo_native_call", 64),
         ("MYGO_NATIVE_RESULT_SIZE", "struct mygo_native_result", 24),
+        ("MYGO_PROCESS_STRING_REF_SIZE", "mygo_process_string_ref", native_wire::PROCESS_STRING_REF_SIZE),
+        ("MYGO_PROCESS_ARRAY_REF_SIZE", "mygo_process_array_ref", native_wire::PROCESS_ARRAY_REF_SIZE),
+        ("MYGO_HANDLE_TRANSFER_SIZE", "mygo_handle_transfer", native_wire::HANDLE_TRANSFER_SIZE),
+        ("MYGO_SPAWN_REQUEST_SIZE", "mygo_spawn_request", native_wire::SPAWN_REQUEST_SIZE),
+        ("MYGO_PROCESS_RESULT_SIZE", "mygo_process_result", native_wire::PROCESS_RESULT_SIZE),
+        ("MYGO_EVENT_RECORD_SIZE", "mygo_event_record", native_wire::EVENT_RECORD_SIZE),
     ] {
         writeln!(
             output,
@@ -473,6 +537,75 @@ fn write_wire_types(output: &mut String) {
             ),
             ("RESERVED3", "reserved3", native_wire::start_info::RESERVED3),
             ("RESERVED4", "reserved4", native_wire::start_info::RESERVED4),
+        ],
+    );
+    write_wire_offsets(
+        output,
+        "PROCESS_STRING_REF",
+        "mygo_process_string_ref",
+        &[
+            ("PTR", "ptr", native_wire::process_string_ref::PTR),
+            ("LEN", "len", native_wire::process_string_ref::LEN),
+        ],
+    );
+    write_wire_offsets(
+        output,
+        "PROCESS_ARRAY_REF",
+        "mygo_process_array_ref",
+        &[
+            ("PTR", "ptr", native_wire::process_array_ref::PTR),
+            ("COUNT", "count", native_wire::process_array_ref::COUNT),
+            ("RESERVED", "reserved", native_wire::process_array_ref::RESERVED),
+        ],
+    );
+    write_wire_offsets(
+        output,
+        "HANDLE_TRANSFER",
+        "mygo_handle_transfer",
+        &[
+            ("REQUIREMENT_ID", "requirement_id", native_wire::handle_transfer::REQUIREMENT_ID),
+            ("RESERVED", "reserved", native_wire::handle_transfer::RESERVED),
+            ("SOURCE_HANDLE", "source_handle", native_wire::handle_transfer::SOURCE_HANDLE),
+            ("REQUESTED_RIGHTS", "requested_rights", native_wire::handle_transfer::REQUESTED_RIGHTS),
+            ("FLAGS", "flags", native_wire::handle_transfer::FLAGS),
+        ],
+    );
+    write_wire_offsets(
+        output,
+        "SPAWN_REQUEST",
+        "mygo_spawn_request",
+        &[
+            ("IMAGE", "image", native_wire::spawn_request::IMAGE),
+            ("ARGV", "argv", native_wire::spawn_request::ARGV),
+            ("ENV", "env", native_wire::spawn_request::ENV),
+            ("TRANSFERS", "transfers", native_wire::spawn_request::TRANSFERS),
+            ("RESOURCE_POLICY", "resource_policy", native_wire::spawn_request::RESOURCE_POLICY),
+        ],
+    );
+    write_wire_offsets(
+        output,
+        "PROCESS_RESULT",
+        "mygo_process_result",
+        &[
+            ("STATE", "state", native_wire::process_result::STATE),
+            ("FLAGS", "flags", native_wire::process_result::FLAGS),
+            ("EXIT_CODE", "exit_code", native_wire::process_result::EXIT_CODE),
+            ("FAULT_KIND", "fault_kind", native_wire::process_result::FAULT_KIND),
+            ("DETAIL0", "detail0", native_wire::process_result::DETAIL0),
+            ("DETAIL1", "detail1", native_wire::process_result::DETAIL1),
+        ],
+    );
+    write_wire_offsets(
+        output,
+        "EVENT_RECORD",
+        "mygo_event_record",
+        &[
+            ("EVENT_KIND", "event_kind", native_wire::event_record::EVENT_KIND),
+            ("STATUS", "status", native_wire::event_record::STATUS),
+            ("SOURCE_HANDLE", "source_handle", native_wire::event_record::SOURCE_HANDLE),
+            ("SEQUENCE", "sequence", native_wire::event_record::SEQUENCE),
+            ("VALUE0", "value0", native_wire::event_record::VALUE0),
+            ("VALUE1", "value1", native_wire::event_record::VALUE1),
         ],
     );
     write_wire_offsets(

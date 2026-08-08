@@ -70,6 +70,16 @@ const _: () = assert!(core::mem::size_of::<MygoNativeCall>() == 64);
 const _: () = assert!(core::mem::offset_of!(MygoNativeCall, args) == 16);
 const _: () = assert!(core::mem::size_of::<MygoNativeResult>() == 24);
 const _: () = assert!(core::mem::offset_of!(MygoNativeResult, value0) == 8);
+const _: () = assert!(MYGO_PROCESS_STATE_FAULTED == 4);
+const _: () = assert!(MYGO_PROCESS_FAULT_MEMORY == 1);
+const _: () = assert!(MYGO_EVENT_KIND_TIMER_EXPIRED == 4);
+const _: () = assert!(MYGO_HANDLE_TRANSFER_MOVE == 1);
+const _: () = assert!(core::mem::size_of::<MygoSpawnRequest>() == 64);
+const _: () = assert!(core::mem::offset_of!(MygoSpawnRequest, transfers) == 40);
+const _: () = assert!(core::mem::size_of::<MygoProcessResult>() == 32);
+const _: () = assert!(core::mem::offset_of!(MygoProcessResult, detail1) == 24);
+const _: () = assert!(core::mem::size_of::<MygoEventRecord>() == 40);
+const _: () = assert!(core::mem::offset_of!(MygoEventRecord, value1) == 32);
 "#,
     )
     .unwrap();

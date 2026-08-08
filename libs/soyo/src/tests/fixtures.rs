@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use native_abi::{RequirementId, requirement};
 use sha2::{Digest, Sha256};
 
 pub const HEADER_REQUIRED_FEATURES: usize = 0x18;
@@ -114,7 +115,8 @@ pub fn minimal_soyo() -> Vec<u8> {
     put_u32(&mut bytes, 568, 1);
     put_u16(&mut bytes, 568 + 0x04, 1);
     put_u16(&mut bytes, 568 + 0x06, 1);
-    put_u64(&mut bytes, 568 + 0x08, 1 << 5);
+    let self_process = requirement(RequirementId::SelfProcess).expect("SelfProcess 必须注册");
+    put_u64(&mut bytes, 568 + 0x08, self_process.max_rights.bits());
 
     put_u64(&mut bytes, 632, 64 * 1024);
     put_u64(&mut bytes, 632 + 0x08, 4096);

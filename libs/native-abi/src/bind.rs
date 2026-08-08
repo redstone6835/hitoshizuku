@@ -23,6 +23,17 @@ const KERNEL_SUPPORTED_OPERATIONS: &[OperationId] = &[
     OperationId::ClockRead,
     OperationId::MemoryAllocate,
     OperationId::MemoryFree,
+    OperationId::ImageCreate,
+    OperationId::ProcessSpawn,
+    OperationId::ProcessReplace,
+    OperationId::ProcessQuery,
+    OperationId::ProcessWait,
+    OperationId::ProcessTerminate,
+    OperationId::EventCreate,
+    OperationId::EventBind,
+    OperationId::EventTimer,
+    OperationId::EventCancel,
+    OperationId::EventWait,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

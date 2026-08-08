@@ -115,7 +115,10 @@ fn requirement_registry_limits_interface_and_granted_rights() {
     let stdout = requirement(RequirementId::Stdout).expect("STDOUT 必须注册");
     assert_eq!(stdout.id as u32, 4);
     assert_eq!(stdout.interface, ObjectInterface::Stream);
-    assert_eq!(stdout.max_rights, Rights::WRITE | Rights::DUPLICATE);
+    assert_eq!(
+        stdout.max_rights,
+        Rights::WRITE | Rights::DUPLICATE | Rights::OBSERVE
+    );
 
     let clock = requirement(RequirementId::MonotonicClock).expect("时钟必须注册");
     assert_eq!(clock.id as u32, 6);
@@ -139,6 +142,51 @@ fn status_registry_preserves_wire_values() {
     assert_eq!(status::STREAM_CLOSED, 0x0500_0004);
     assert_eq!(status::STREAM_ERROR, 0x0500_0005);
     assert_eq!(status::MEMORY_INVALID_ALIGNMENT, 0x0600_0002);
+    assert_eq!(status::PROCESS_WAIT_IN_PROGRESS, 0x0700_0005);
+    assert_eq!(status::IMAGE_NOT_EXECUTABLE, 0x0800_0003);
+    assert_eq!(status::EVENT_CANCELLED, 0x0900_0006);
+}
+
+#[test]
+fn process_and_event_operations_preserve_contracts() {
+    let spawn = operation(OperationId::ProcessSpawn).expect("process.spawn 必须注册");
+    assert_eq!(spawn.id as u32, 11);
+    assert_eq!(spawn.interface, Some(ObjectInterface::Process));
+    assert_eq!(spawn.required_rights, Rights::SPAWN);
+    assert_eq!(
+        spawn.signature,
+        "epoch=1;operation=11;object=1;args=user_const_ptr,u64,zero,zero,zero;result=handle"
+    );
+
+    let wait = operation(OperationId::EventWait).expect("event.wait 必须注册");
+    assert_eq!(wait.id as u32, 20);
+    assert_eq!(wait.interface, Some(ObjectInterface::EventPort));
+    assert_eq!(wait.required_rights, Rights::OBSERVE);
+}
+
+#[test]
+fn process_and_event_wire_layouts_are_frozen() {
+    assert_eq!(wire::PROCESS_STRING_REF_SIZE, 16);
+    assert_eq!(wire::PROCESS_ARRAY_REF_SIZE, 16);
+    assert_eq!(wire::HANDLE_TRANSFER_SIZE, 32);
+    assert_eq!(wire::SPAWN_REQUEST_SIZE, 64);
+    assert_eq!(wire::PROCESS_RESULT_SIZE, 32);
+    assert_eq!(wire::EVENT_RECORD_SIZE, 40);
+    assert_eq!(core::mem::offset_of!(wire::SpawnRequest, argv), 8);
+    assert_eq!(core::mem::offset_of!(wire::SpawnRequest, transfers), 40);
+    assert_eq!(core::mem::offset_of!(wire::ProcessResult, detail0), 16);
+    assert_eq!(core::mem::offset_of!(wire::EventRecord, sequence), 16);
+    assert_eq!(wire::process_string_ref::LEN, 8);
+    assert_eq!(wire::process_array_ref::RESERVED, 12);
+    assert_eq!(wire::handle_transfer::SOURCE_HANDLE, 8);
+    assert_eq!(wire::handle_transfer::FLAGS, 24);
+    assert_eq!(wire::spawn_request::RESOURCE_POLICY, 56);
+    assert_eq!(wire::process_result::FAULT_KIND, 12);
+    assert_eq!(wire::process_result::DETAIL1, 24);
+    assert_eq!(wire::event_record::VALUE1, 32);
+    assert_eq!(wire::HANDLE_TRANSFER_MOVE, 1);
+    assert_eq!(wire::MAX_EVENT_PORT_CAPACITY, 4096);
+    assert_eq!(wire::MAX_EVENT_BATCH, 64);
 }
 
 #[test]

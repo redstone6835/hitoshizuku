@@ -20,6 +20,8 @@ pub enum ObjectInterface {
     AddressSpace = 2,
     Stream = 3,
     Clock = 4,
+    ExecutableImage = 5,
+    EventPort = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,15 @@ impl Rights {
     pub const ALLOCATE: Self = Self(1 << 3);
     pub const FREE: Self = Self(1 << 4);
     pub const EXIT: Self = Self(1 << 5);
+    pub const CREATE: Self = Self(1 << 6);
+    pub const EXECUTE: Self = Self(1 << 7);
+    pub const SPAWN: Self = Self(1 << 8);
+    pub const REPLACE: Self = Self(1 << 9);
+    pub const INSPECT: Self = Self(1 << 10);
+    pub const WAIT: Self = Self(1 << 11);
+    pub const TERMINATE: Self = Self(1 << 12);
+    pub const OBSERVE: Self = Self(1 << 13);
+    pub const BIND: Self = Self(1 << 14);
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -67,7 +78,7 @@ pub struct RightSpec {
     pub right: Rights,
 }
 
-pub const RIGHTS: [RightSpec; 6] = [
+pub const RIGHTS: [RightSpec; 15] = [
     RightSpec {
         name: "read",
         right: Rights::READ,
@@ -91,6 +102,42 @@ pub const RIGHTS: [RightSpec; 6] = [
     RightSpec {
         name: "exit",
         right: Rights::EXIT,
+    },
+    RightSpec {
+        name: "create",
+        right: Rights::CREATE,
+    },
+    RightSpec {
+        name: "execute",
+        right: Rights::EXECUTE,
+    },
+    RightSpec {
+        name: "spawn",
+        right: Rights::SPAWN,
+    },
+    RightSpec {
+        name: "replace",
+        right: Rights::REPLACE,
+    },
+    RightSpec {
+        name: "inspect",
+        right: Rights::INSPECT,
+    },
+    RightSpec {
+        name: "wait",
+        right: Rights::WAIT,
+    },
+    RightSpec {
+        name: "terminate",
+        right: Rights::TERMINATE,
+    },
+    RightSpec {
+        name: "observe",
+        right: Rights::OBSERVE,
+    },
+    RightSpec {
+        name: "bind",
+        right: Rights::BIND,
     },
 ];
 
@@ -136,7 +183,17 @@ pub const REQUIREMENTS: [RequirementSpec; 6] = [
         id: RequirementId::SelfProcess,
         name: "self_process",
         interface: ObjectInterface::Process,
-        max_rights: Rights::EXIT,
+        max_rights: Rights::from_bits(
+            Rights::EXIT.bits()
+                | Rights::DUPLICATE.bits()
+                | Rights::CREATE.bits()
+                | Rights::SPAWN.bits()
+                | Rights::REPLACE.bits()
+                | Rights::INSPECT.bits()
+                | Rights::WAIT.bits()
+                | Rights::TERMINATE.bits()
+                | Rights::OBSERVE.bits(),
+        ),
     },
     RequirementSpec {
         id: RequirementId::CurrentAddressSpace,
@@ -148,19 +205,23 @@ pub const REQUIREMENTS: [RequirementSpec; 6] = [
         id: RequirementId::Stdin,
         name: "stdin",
         interface: ObjectInterface::Stream,
-        max_rights: Rights::READ,
+        max_rights: Rights::from_bits(Rights::READ.bits() | Rights::OBSERVE.bits()),
     },
     RequirementSpec {
         id: RequirementId::Stdout,
         name: "stdout",
         interface: ObjectInterface::Stream,
-        max_rights: Rights::from_bits(Rights::WRITE.bits() | Rights::DUPLICATE.bits()),
+        max_rights: Rights::from_bits(
+            Rights::WRITE.bits() | Rights::DUPLICATE.bits() | Rights::OBSERVE.bits(),
+        ),
     },
     RequirementSpec {
         id: RequirementId::Stderr,
         name: "stderr",
         interface: ObjectInterface::Stream,
-        max_rights: Rights::from_bits(Rights::WRITE.bits() | Rights::DUPLICATE.bits()),
+        max_rights: Rights::from_bits(
+            Rights::WRITE.bits() | Rights::DUPLICATE.bits() | Rights::OBSERVE.bits(),
+        ),
     },
     RequirementSpec {
         id: RequirementId::MonotonicClock,
@@ -190,6 +251,17 @@ pub enum OperationId {
     ClockRead = 7,
     MemoryAllocate = 8,
     MemoryFree = 9,
+    ImageCreate = 10,
+    ProcessSpawn = 11,
+    ProcessReplace = 12,
+    ProcessQuery = 13,
+    ProcessWait = 14,
+    ProcessTerminate = 15,
+    EventCreate = 16,
+    EventBind = 17,
+    EventTimer = 18,
+    EventCancel = 19,
+    EventWait = 20,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +274,7 @@ pub struct OperationSpec {
     pub signature_hash: [u8; 32],
 }
 
-pub const OPERATIONS: [OperationSpec; 9] = [
+pub const OPERATIONS: [OperationSpec; 20] = [
     OperationSpec {
         id: OperationId::ProcessExit,
         name: "process.exit",
@@ -309,6 +381,138 @@ pub const OPERATIONS: [OperationSpec; 9] = [
             0x6b, 0x1f, 0x1c, 0xef, 0x89, 0x62, 0x0e, 0x51, 0x69, 0x8e, 0x2b, 0x9a, 0x93, 0x7b,
             0xa7, 0x9e, 0x4e, 0x22, 0xbd, 0xcd, 0x85, 0xf3, 0x93, 0x5c, 0x92, 0x18, 0xd4, 0xe5,
             0x36, 0xee, 0x51, 0x4e,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::ImageCreate,
+        name: "image.create",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::CREATE,
+        signature: "epoch=1;operation=10;object=1;args=user_const_ptr,u64,zero,zero,zero;result=handle",
+        signature_hash: [
+            0xab, 0xa6, 0xb2, 0x4f, 0xbe, 0x9b, 0x0a, 0x6b, 0xa6, 0xda, 0x65, 0x90, 0x9d, 0xe6,
+            0xd7, 0x98, 0x52, 0x63, 0xb9, 0x96, 0x5e, 0x3a, 0xab, 0xa6, 0x0a, 0xd3, 0x25, 0x4f,
+            0x7a, 0xfa, 0xc2, 0x4b,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::ProcessSpawn,
+        name: "process.spawn",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::SPAWN,
+        signature: "epoch=1;operation=11;object=1;args=user_const_ptr,u64,zero,zero,zero;result=handle",
+        signature_hash: [
+            0xf2, 0x55, 0xa4, 0xe2, 0xf4, 0x80, 0x69, 0xc2, 0x22, 0x07, 0x1c, 0xde, 0xca, 0xe7,
+            0x2e, 0x90, 0x02, 0x77, 0x07, 0x88, 0x30, 0x38, 0x9a, 0x18, 0xf5, 0x84, 0x63, 0x91,
+            0xa2, 0x3b, 0x71, 0xf4,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::ProcessReplace,
+        name: "process.replace",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::REPLACE,
+        signature: "epoch=1;operation=12;object=1;args=user_const_ptr,u64,zero,zero,zero;result=noreturn",
+        signature_hash: [
+            0x96, 0x54, 0x79, 0x1d, 0x03, 0x02, 0xfc, 0xc9, 0xbf, 0xc9, 0xb4, 0xb0, 0xfc, 0x84,
+            0xf2, 0xc1, 0x25, 0x34, 0x87, 0xb1, 0x25, 0x18, 0x31, 0xd6, 0x28, 0x3f, 0x94, 0x2c,
+            0xe3, 0x28, 0xb8, 0xc3,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::ProcessQuery,
+        name: "process.query",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::INSPECT,
+        signature: "epoch=1;operation=13;object=1;args=user_mut_ptr,zero,zero,zero,zero;result=status",
+        signature_hash: [
+            0x28, 0x2b, 0xd5, 0x41, 0xea, 0xae, 0x3e, 0xc5, 0xd3, 0xeb, 0xd7, 0x47, 0x30, 0x89,
+            0x90, 0xd6, 0x3c, 0xca, 0xbd, 0x2f, 0xf1, 0xd5, 0x9d, 0x12, 0x62, 0x15, 0x24, 0x63,
+            0x89, 0xc3, 0x11, 0xba,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::ProcessWait,
+        name: "process.wait",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::WAIT,
+        signature: "epoch=1;operation=14;object=1;args=user_mut_ptr,u64,zero,zero,zero;result=status",
+        signature_hash: [
+            0x83, 0xeb, 0x1a, 0x83, 0xba, 0x3f, 0xd3, 0x31, 0x63, 0xbd, 0x6d, 0x5c, 0x80, 0x32,
+            0x06, 0x50, 0x4b, 0x8e, 0xfa, 0x4f, 0xbb, 0x3d, 0xf0, 0x43, 0xae, 0xbd, 0x97, 0x79,
+            0x71, 0x0c, 0xab, 0xff,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::ProcessTerminate,
+        name: "process.terminate",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::TERMINATE,
+        signature: "epoch=1;operation=15;object=1;args=u32,zero,zero,zero,zero;result=status",
+        signature_hash: [
+            0xa1, 0xdf, 0x05, 0x20, 0x27, 0xef, 0xbd, 0xbb, 0x93, 0xfe, 0x88, 0x83, 0xa5, 0x70,
+            0x1d, 0xdd, 0x07, 0x67, 0xd4, 0x18, 0x89, 0xee, 0xa7, 0xaa, 0x8e, 0x70, 0x03, 0xc4,
+            0x7f, 0xe0, 0x91, 0x19,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::EventCreate,
+        name: "event.create",
+        interface: Some(ObjectInterface::Process),
+        required_rights: Rights::CREATE,
+        signature: "epoch=1;operation=16;object=1;args=u32,zero,zero,zero,zero;result=handle",
+        signature_hash: [
+            0xcf, 0xc4, 0x61, 0xbf, 0x5a, 0xac, 0xf8, 0x15, 0xb2, 0x88, 0x99, 0x95, 0x63, 0x80,
+            0xac, 0x9d, 0xb9, 0x53, 0xab, 0x59, 0x2a, 0x8d, 0x55, 0x6b, 0xf6, 0xc1, 0x35, 0x3e,
+            0xe3, 0x5c, 0xb4, 0x58,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::EventBind,
+        name: "event.bind",
+        interface: Some(ObjectInterface::EventPort),
+        required_rights: Rights::BIND,
+        signature: "epoch=1;operation=17;object=6;args=handle,u32,u64,zero,zero;result=u64",
+        signature_hash: [
+            0x24, 0x16, 0x1d, 0x6d, 0x32, 0x62, 0x94, 0xa6, 0xfe, 0x42, 0x53, 0xaf, 0x6d, 0xb0,
+            0xc1, 0xeb, 0x95, 0x64, 0x98, 0x0e, 0x0a, 0x6d, 0x5e, 0xe2, 0x9f, 0x56, 0xbb, 0x39,
+            0xf1, 0x5b, 0x30, 0x5e,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::EventTimer,
+        name: "event.timer",
+        interface: Some(ObjectInterface::EventPort),
+        required_rights: Rights::BIND,
+        signature: "epoch=1;operation=18;object=6;args=u64,u64,u64,zero,zero;result=u64",
+        signature_hash: [
+            0xee, 0x95, 0xd7, 0xff, 0x7e, 0x8d, 0xe1, 0x3a, 0x80, 0x8c, 0xae, 0xc9, 0xe2, 0x11,
+            0xd6, 0xb9, 0x78, 0xf6, 0x40, 0xee, 0x89, 0x31, 0x8e, 0xb0, 0x8d, 0x4e, 0x69, 0xfa,
+            0x54, 0x2e, 0x82, 0x70,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::EventCancel,
+        name: "event.cancel",
+        interface: Some(ObjectInterface::EventPort),
+        required_rights: Rights::BIND,
+        signature: "epoch=1;operation=19;object=6;args=u64,zero,zero,zero,zero;result=status",
+        signature_hash: [
+            0x75, 0x00, 0x9e, 0x0a, 0x5e, 0x3e, 0x71, 0xf6, 0xb3, 0x14, 0x78, 0x0c, 0xae, 0x4b,
+            0x24, 0x88, 0x74, 0x44, 0xdd, 0xe3, 0xfe, 0x77, 0x9c, 0x00, 0xe8, 0xf4, 0x56, 0xb9,
+            0x2b, 0x37, 0xb5, 0xb0,
+        ],
+    },
+    OperationSpec {
+        id: OperationId::EventWait,
+        name: "event.wait",
+        interface: Some(ObjectInterface::EventPort),
+        required_rights: Rights::OBSERVE,
+        signature: "epoch=1;operation=20;object=6;args=user_mut_ptr,u32,u64,zero,zero;result=u64",
+        signature_hash: [
+            0xda, 0x7b, 0xab, 0x23, 0xc5, 0x0d, 0xc5, 0x9d, 0x7c, 0x0a, 0xd4, 0x2e, 0x2a, 0x0d,
+            0x5a, 0xbb, 0x14, 0xaf, 0xcc, 0x9e, 0xa4, 0x45, 0x49, 0xa2, 0x79, 0x16, 0x78, 0x68,
+            0x14, 0xfe, 0x9b, 0xa1,
         ],
     },
 ];
