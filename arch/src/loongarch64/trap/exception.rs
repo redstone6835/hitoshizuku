@@ -163,6 +163,54 @@ fn decode_exception(ecode: usize, _esubcode: usize) -> Exception {
     }
 }
 
+fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
+    match code {
+        ECODE_INE => sched::SignalNumber::SIGILL,
+        ECODE_BRK => sched::SignalNumber::SIGTRAP,
+        ECODE_ADE | ECODE_ALE => sched::SignalNumber::SIGBUS,
+        _ => sched::SignalNumber::SIGSEGV,
+    }
+}
+
+fn terminate_user_exception(
+    code: usize,
+    sig: sched::SignalNumber,
+    tf_ptr: usize,
+    badv: usize,
+    from_user: bool,
+) -> usize {
+    let era = {
+        let tf = unsafe { trap_frame_mut(tf_ptr) };
+        tf.pc
+    };
+    let (pid, comm) = if sched::is_ready() {
+        let task = sched::current_task();
+        (task.pid_root(), task.comm())
+    } else {
+        (None, [0; sched::TASK_COMM_LEN])
+    };
+
+    log::warning!(
+        "[trap][exception] user exception pid={:?} comm={:?} code={:#x} era={:#x} badv={:#x} sig={}",
+        pid,
+        comm,
+        code,
+        era,
+        badv,
+        sig.raw()
+    );
+
+    if sched::is_ready() {
+        let me = sched::current_task();
+        let pid = me.pid_root().unwrap_or(0);
+        let _ = sched::operation::tkill(pid, Some(sig));
+        drop(me);
+        deliver_user_signals_before_return(tf_ptr, from_user);
+    }
+
+    tf_ptr
+}
+
 /// LoongArch64 统一异常入口（Rust 端）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn loongarch64_handle_exception(
@@ -525,6 +573,15 @@ unsafe fn loongarch64_handle_exception_inner(
     } else {
         // 非中断、非 syscall 的路径通常代表真正的同步故障，例如页故障、地址错、非法指令。
         // 当前内核尚未实现可恢复异常处理，因此除了断点外，一律记录现场后宣告不可恢复。
+        if from_user {
+            return terminate_user_exception(
+                ecode,
+                signal_for_user_exception(ecode),
+                arg4,
+                arg2,
+                true,
+            );
+        }
         let exc = decode_exception(ecode, esubcode);
         log::debug!(
             "[trap] exception {:?} pc={:#x} sp={:#x} bad_addr={:#x} \
@@ -580,7 +637,7 @@ unsafe fn loongarch64_handle_exception_inner(
             return arg4;
         }
 
-        // 其余异常目前无法恢复：返回 0 让汇编端宕机
+        // 内核态异常仍保持 fail-stop；ELM recovery 已在上方提前返回。
         0
     }
 }

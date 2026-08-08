@@ -361,10 +361,12 @@ pub(crate) fn prepare_native_initial_frame(
     start_info_size: usize,
     image_base: usize,
     tls_base: usize,
+    bootstrap_process: u64,
     kernel_stack_top: usize,
 ) -> UserTrapFrame {
     let mut frame = UserTrapFrame::init_user(entry_pc, user_sp, start_info_address);
     frame.set_args(start_info_address, start_info_size, image_base);
+    frame.set_arg3(usize::try_from(bootstrap_process).unwrap_or(0));
     frame.set_tls(tls_base);
     frame.set_ra(0);
     frame.set_kernel_stack_top(kernel_stack_top);
@@ -562,6 +564,7 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
                 image.start_info_size,
                 image.image_base,
                 image.tls_base,
+                image.bootstrap_process,
                 kernel_stack_top,
             );
             #[cfg(feature = "performance-profile")]

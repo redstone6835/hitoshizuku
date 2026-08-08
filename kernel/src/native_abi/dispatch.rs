@@ -59,13 +59,9 @@ fn valid_call_arguments(operation: OperationId, call: &NativeCallFrame) -> bool 
         OperationId::HandleClose | OperationId::HandleDuplicate | OperationId::ClockRead => {
             &call.args[..]
         }
-        OperationId::StreamWrite => {
-            if call.args[2] != 0 {
-                return false;
-            }
-            &call.args[3..]
-        }
-        OperationId::StreamRead | OperationId::VmMapAnon | OperationId::VmUnmap => return false,
+        OperationId::StreamRead | OperationId::StreamWrite => &call.args[2..],
+        OperationId::MemoryAllocate => &call.args[2..],
+        OperationId::MemoryFree => &call.args[2..],
     };
     unused.iter().all(|argument| *argument == 0)
 }

@@ -28,11 +28,11 @@ pub use model::{
 pub use registry::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, OPERATIONS, ObjectInterface, OperationId, OperationSpec,
     PAGE_SIZE, REQUIREMENTS, RIGHTS, RequirementId, RequirementSpec, RightSpec, Rights, TargetArch,
-    VmMapFlags, VmProtections, operation, operation_by_id, requirement, requirement_by_id,
-    right_by_name,
+    operation, operation_by_id, requirement, requirement_by_id, right_by_name,
 };
 pub use start_info::{
-    InitialHandleRecord, StartInfoBuildError, StartInfoImage, StartInfoInput, build_start_info,
+    InitialHandleRecord, RuntimeArrayInfo, StartInfoBuildError, StartInfoImage, StartInfoInput,
+    build_start_info,
 };
 
 #[cfg(test)]

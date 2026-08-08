@@ -177,7 +177,7 @@ fn loader_builds_private_native_runtime_with_exact_permissions() {
         .lookup(
             NativeHandle::from_parts(1, 1),
             Some(ObjectInterface::Process),
-            Rights::TERMINATE_SELF,
+            Rights::EXIT,
         )
         .expect("SELF_PROCESS 初始 handle 必须存在");
     assert!(matches!(handle.object, KernelNativeObject::SelfProcess));
@@ -262,11 +262,31 @@ fn loader_applies_relocation_and_preserves_data_bss_tls_zero_fill() {
 }
 
 #[ktest]
-fn loader_rejects_nonempty_init_array_for_native_exec() {
+fn loader_copies_nonempty_init_array_into_start_info() {
     let bytes = loader_init_array_image(current_target_arch());
+    let loaded = load_soyo_image_from_reader(&MemoryReader { bytes: &bytes })
+        .expect("内核应接受非空 init 数组");
+    let prepared =
+        prepare_soyo_runtime(loaded, &[], &[], None).expect("非空 init 数组应完成运行时准备");
+    let start_info = read_vm_bytes(
+        &prepared.vm,
+        prepared.start_info_address,
+        prepared.start_info_size,
+    );
     assert_eq!(
-        load_soyo_image_from_reader(&MemoryReader { bytes: &bytes }).err(),
-        Some(Errno::ENOEXEC)
+        u64_at(&start_info, wire::start_info::INIT_ARRAY_OFFSET),
+        soyo::test_support::LOADER_FIXTURE_RODATA_OFFSET
+    );
+    assert_eq!(u32_at(&start_info, wire::start_info::INIT_ARRAY_COUNT), 1);
+    assert_eq!(
+        u16_at(&start_info, wire::start_info::INIT_ARRAY_ENTRY_SIZE),
+        8
+    );
+    assert_eq!(u64_at(&start_info, wire::start_info::FINI_ARRAY_OFFSET), 0);
+    assert_eq!(u32_at(&start_info, wire::start_info::FINI_ARRAY_COUNT), 0);
+    assert_eq!(
+        u16_at(&start_info, wire::start_info::FINI_ARRAY_ENTRY_SIZE),
+        0
     );
 }
 
@@ -281,8 +301,16 @@ fn loader_maps_start_info_size_overflow_to_e2big() {
 
 #[ktest]
 fn native_initial_frame_contains_start_info_contract() {
-    let frame =
-        prepare_native_initial_frame(0x4000, 0x8000, 0x7000, 256, 0x1000, 0x6000, 0xdead_0000);
+    let frame = prepare_native_initial_frame(
+        0x4000,
+        0x8000,
+        0x7000,
+        256,
+        0x1000,
+        0x6000,
+        0x0000_0007_0000_0001,
+        0xdead_0000,
+    );
     assert_eq!(frame.pc(), 0x4000);
     assert_eq!(frame.sp(), 0x8000);
 
@@ -293,6 +321,7 @@ fn native_initial_frame_contains_start_info_contract() {
         assert_eq!(raw.a0, 0x7000);
         assert_eq!(raw.a1, 256);
         assert_eq!(raw.a2, 0x1000);
+        assert_eq!(raw.a3, 0x0000_0007_0000_0001);
         assert_eq!(raw.tp, 0x6000);
         assert_eq!(raw.ra, 0);
         assert_eq!(raw.kstack_top, 0xdead_0000);
@@ -305,6 +334,7 @@ fn native_initial_frame_contains_start_info_contract() {
         assert_eq!(raw.a0, 0x7000);
         assert_eq!(raw.a1, 256);
         assert_eq!(raw.a2, 0x1000);
+        assert_eq!(raw.a3, 0x0000_0007_0000_0001);
         assert_eq!(raw.tp, 0x6000);
         assert_eq!(raw.ra, 0);
     }
@@ -327,6 +357,10 @@ fn read_vm_bytes(vm: &general::mm::VmSpace, address: usize, length: usize) -> Ve
         cursor += copied;
     }
     output
+}
+
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {

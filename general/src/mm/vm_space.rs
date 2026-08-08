@@ -2579,6 +2579,59 @@ impl VmSpace {
         Err(Errno::ENOMEM)
     }
 
+    /// 在地址空间内原子选择并登记一段满足对齐要求的匿名映射。
+    pub fn map_anon_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let flags = self.with_future_mlock(flags).with(VmFlags::ANON);
+        let backing = if flags.has(VmFlags::SHARED) {
+            VmBacking::SharedAnon {
+                object: Arc::new(SharedAnonObject::new()),
+                offset: 0,
+            }
+        } else {
+            VmBacking::anonymous()
+        };
+        let mut set = self.vmas.lock();
+        let candidates = [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ];
+        for (start, end) in candidates {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags,
+                backing,
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
     #[kernel_symbols::export(name = "general.mm.VmSpace.is_range_free", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_range_free(&self, range: Range<usize>) -> bool {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
@@ -2906,12 +2959,26 @@ impl VmSpace {
     /// 取消映射。同时把已 commit 的页表项摘掉；物理页由 resident page refcount 回收。
     #[kernel_symbols::export(name = "general.mm.VmSpace.unmap", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.unmap_inner(range, false)
+    }
+
+    /// 仅在目标范围被 VMA 完整覆盖时取消映射。
+    ///
+    /// 覆盖检查和 VMA 摘除共用同一临界区，供要求 no-hole 语义的 Native ABI 使用。
+    pub fn unmap_existing(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.unmap_inner(range, true)
+    }
+
+    fn unmap_inner(&self, range: Range<usize>, require_existing: bool) -> Result<(), Errno> {
         #[cfg(feature = "performance-profile")]
         let _profile = profiling::scope(profiling::Event::MmUnmap)
             .bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
+            if require_existing && !vmas.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
             let removed_areas = vmas.unmap_range(&range);
             let removed = self.unmap_page_mappings(range.clone())?;
             (removed_areas, removed)

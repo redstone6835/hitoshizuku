@@ -19,7 +19,7 @@ impl SoyoTargetPolicy {
         Self {
             target_arch: Some(target_arch),
             supported_required_features: FeatureFlags::KNOWN.bits(),
-            allow_init_fini: false,
+            allow_init_fini: true,
             native_abi_policy: NativeAbiPolicy::for_kernel(),
         }
     }

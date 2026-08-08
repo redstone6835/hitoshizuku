@@ -1,5 +1,6 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
+use alloc::vec::Vec;
 
 use general::TrapFramePtr;
 use general::mm::VmSpace;
@@ -12,7 +13,7 @@ use native_abi::{
 };
 use sched::{ProcessGroup, ProcessPersonalityState, SchedParams, Session, Task, ThreadGroup};
 
-use super::operations::map_stream_write_error;
+use super::operations::{map_stream_read_error, map_stream_write_error, stream_read_progress};
 use super::{KernelNativeObject, NativeProcessState, dispatch_native_call};
 
 #[ktest]
@@ -173,7 +174,7 @@ fn native_dispatch_reports_wrong_interface_before_rights() {
         .insert(
             KernelNativeObject::MonotonicClock,
             ObjectInterface::Clock,
-            Rights::TERMINATE_SELF,
+            Rights::EXIT,
         )
         .expect("测试 handle 应分配成功");
     let task = make_native_task(
@@ -259,7 +260,7 @@ fn process_exit_preserves_the_full_u32_code() {
         .insert(
             KernelNativeObject::SelfProcess,
             ObjectInterface::Process,
-            Rights::TERMINATE_SELF,
+            Rights::EXIT,
         )
         .expect("self process handle 应分配成功");
     let task = make_native_task(
@@ -283,7 +284,7 @@ fn process_exit_rejects_bits_above_u32() {
         .insert(
             KernelNativeObject::SelfProcess,
             ObjectInterface::Process,
-            Rights::TERMINATE_SELF,
+            Rights::EXIT,
         )
         .expect("self process handle 应分配成功");
     let task = make_native_task(
@@ -442,6 +443,96 @@ fn clock_read_returns_a_monotonic_value_and_zero_second_result() {
 }
 
 #[ktest]
+fn memory_allocate_returns_owned_aligned_memory_and_frees_it() {
+    let (task, vm, address_space) = make_address_space_task();
+    let page_size = native_abi::PAGE_SIZE;
+    let alignment = 4 * 1024 * 1024;
+    let mut map = native_call(0, address_space);
+    map.args = [page_size * 2, alignment, 0, 0, 0];
+
+    let mapped = invoke_native(&task, map);
+    assert_eq!(mapped.status, status::OK);
+    assert_eq!(mapped.value0 % alignment, 0);
+    let start = mapped.value0 as usize;
+    vm.contains_user_range(start..start + mapped.value1 as usize)
+        .expect("Native 匿名映射应完整存在");
+
+    let mut unmap = native_call(1, address_space);
+    unmap.args[0] = mapped.value0;
+    unmap.args[1] = mapped.value1;
+    assert_eq!(invoke_native(&task, unmap).status, status::OK);
+    assert!(
+        vm.contains_user_range(start..start + mapped.value1 as usize)
+            .is_err()
+    );
+}
+
+#[ktest]
+fn vm_map_anon_any_aligned_publishes_the_mapping_before_return() {
+    let vm = Arc::new(VmSpace::new());
+    let page_size = general::mm::page_size();
+    let range = vm
+        .map_anon_any_aligned(
+            page_size * 2,
+            2 * 1024 * 1024,
+            VmFlags::EMPTY.with(VmFlags::READ).with(VmFlags::USER),
+        )
+        .expect("对齐匿名映射应成功");
+
+    assert_eq!(range.start % (2 * 1024 * 1024), 0);
+    vm.contains_user_range(range)
+        .expect("映射返回时必须已经发布到 VMA 集合");
+}
+
+#[ktest]
+fn memory_allocate_rejects_invalid_contract() {
+    let (task, _vm, address_space) = make_address_space_task();
+    let mut map = native_call(0, address_space);
+    map.args = [0, native_abi::PAGE_SIZE, 0, 0, 0];
+    assert_eq!(
+        invoke_native(&task, map).status,
+        status::MEMORY_INVALID_RANGE
+    );
+    map.args = [native_abi::PAGE_SIZE, native_abi::PAGE_SIZE / 2, 0, 0, 0];
+    assert_eq!(
+        invoke_native(&task, map).status,
+        status::MEMORY_INVALID_ALIGNMENT
+    );
+    map.args = [u64::MAX, native_abi::PAGE_SIZE, 0, 0, 0];
+    assert_eq!(
+        invoke_native(&task, map).status,
+        status::MEMORY_INVALID_RANGE
+    );
+}
+
+#[ktest]
+fn memory_free_rejects_ranges_not_owned_by_native_allocation() {
+    let (task, _vm, address_space) = make_address_space_task();
+    let layout = general::mm::user_vm_layout().expect("架构必须注册用户 VM 布局");
+    let mut unmap = native_call(1, address_space);
+    unmap.args[0] = layout.user_mmap_base as u64;
+    unmap.args[1] = native_abi::PAGE_SIZE;
+
+    assert_eq!(invoke_native(&task, unmap).status, status::MEMORY_NOT_OWNED);
+}
+
+#[ktest]
+fn memory_free_preserves_runtime_owned_ranges() {
+    let (task, vm, address_space) = make_address_space_task();
+    let page_size = native_abi::PAGE_SIZE;
+    let mut map = native_call(0, address_space);
+    map.args = [page_size, page_size, 0, 0, 0];
+    assert_eq!(invoke_native(&task, map).status, status::OK);
+
+    let mut unmap = native_call(1, address_space);
+    unmap.args[0] = page_size;
+    unmap.args[1] = page_size;
+    assert_eq!(invoke_native(&task, unmap).status, status::MEMORY_NOT_OWNED);
+    vm.contains_user_range(page_size as usize..(page_size * 2) as usize)
+        .expect("StartInfo 保护区不应被取消映射");
+}
+
+#[ktest]
 fn stream_write_zero_length_does_not_touch_the_pointer() {
     let (task, _state, _read, stream) = make_stream_task(Rights::WRITE, true);
     let mut call = native_call(0, stream);
@@ -460,7 +551,7 @@ fn stream_write_reports_user_buffer_fault_before_progress() {
     call.args[0] = 0x1000_0000;
     call.args[1] = 4;
 
-    assert_eq!(invoke_native(&task, call).status, status::IO_FAULT);
+    assert_eq!(invoke_native(&task, call).status, status::STREAM_FAULT);
 }
 
 #[ktest]
@@ -493,7 +584,10 @@ fn stream_write_maps_zero_progress_would_block() {
     call.args[0] = user as u64;
     call.args[1] = 16;
 
-    assert_eq!(invoke_native(&task, call).status, status::IO_WOULD_BLOCK);
+    assert_eq!(
+        invoke_native(&task, call).status,
+        status::STREAM_WOULD_BLOCK
+    );
 }
 
 #[ktest]
@@ -505,14 +599,14 @@ fn stream_write_maps_closed_peer_without_reusing_user_fault() {
     call.args[0] = user as u64;
     call.args[1] = 16;
 
-    assert_eq!(invoke_native(&task, call).status, status::IO_CLOSED);
+    assert_eq!(invoke_native(&task, call).status, status::STREAM_CLOSED);
 }
 
 #[ktest]
 fn stream_write_maps_general_io_error_without_reusing_user_fault() {
     assert_native_return(
         map_stream_write_error(general::vfs::error::VfsError::Io, 0),
-        status::IO_ERROR,
+        status::STREAM_ERROR,
         0,
     );
     assert_native_return(
@@ -542,6 +636,103 @@ fn stream_write_unwinds_when_group_exit_rejects_sleep() {
         NativeCallOutcome::RetryExternalControl
     ));
     assert_eq!(task.state(), sched::TaskState::Running);
+}
+
+#[ktest]
+fn stream_read_zero_length_does_not_touch_the_pointer() {
+    let (task, _state, _write, stream) = make_read_stream_task(Rights::READ, true);
+    let mut call = native_call(0, stream);
+    call.args[0] = usize::MAX as u64;
+    assert_native_return(dispatch_native_call(&task, call), status::OK, 0);
+}
+
+#[ktest]
+fn stream_read_copies_available_bytes_and_reports_eof() {
+    let (task, _state, write, stream) = make_read_stream_task(Rights::READ, true);
+    write.write(b"hello").expect("测试 pipe 写入应成功");
+    let user = install_user_bytes(&task, &[0; 8]);
+    let mut call = native_call(0, stream);
+    call.args[0] = user as u64;
+    call.args[1] = 8;
+
+    assert_native_return(dispatch_native_call(&task, call), status::OK, 5);
+    assert_eq!(read_user_bytes(&task, user, 5), b"hello");
+
+    drop(write);
+    let user = install_user_bytes(&task, &[0; 1]);
+    let mut call = native_call(0, stream);
+    call.args[0] = user as u64;
+    call.args[1] = 1;
+    assert_native_return(dispatch_native_call(&task, call), status::STREAM_END, 0);
+}
+
+#[ktest]
+fn stream_read_returns_after_first_positive_progress() {
+    assert_native_return(stream_read_progress(0, 5), status::OK, 5);
+}
+
+#[ktest]
+fn blocking_stream_read_returns_a_short_read_while_writer_remains_open() {
+    let (task, _state, write, stream) = make_read_stream_task(Rights::READ, false);
+    write.write(b"hello").expect("测试 pipe 写入应成功");
+    let user = install_user_bytes(&task, &[0; 8]);
+    let mut call = native_call(0, stream);
+    call.args[0] = user as u64;
+    call.args[1] = 8;
+
+    assert_native_return(dispatch_native_call(&task, call), status::OK, 5);
+    assert_eq!(read_user_bytes(&task, user, 5), b"hello");
+}
+
+#[ktest]
+fn stream_read_maps_nonblocking_empty_pipe_and_user_fault() {
+    let (task, _state, _write, stream) = make_read_stream_task(Rights::READ, true);
+    let user = install_user_bytes(&task, &[0; 4]);
+    let mut call = native_call(0, stream);
+    call.args[0] = user as u64;
+    call.args[1] = 4;
+    assert_native_return(
+        dispatch_native_call(&task, call),
+        status::STREAM_WOULD_BLOCK,
+        0,
+    );
+
+    let (task, _state, _write, stream) = make_read_stream_task(Rights::READ, true);
+    let mut call = native_call(0, stream);
+    call.args[0] = 0;
+    call.args[1] = 4;
+    assert_native_return(dispatch_native_call(&task, call), status::STREAM_FAULT, 0);
+}
+
+#[ktest]
+fn stream_read_unwinds_when_group_exit_rejects_sleep() {
+    let (task, _state, _write, stream) = make_read_stream_task(Rights::READ, false);
+    assert!(task.cas_state(sched::TaskState::New, sched::TaskState::Running));
+    let user = install_user_bytes(&task, &[0; 8]);
+    let mut call = native_call(0, stream);
+    call.args[0] = user as u64;
+    call.args[1] = 8;
+    assert_eq!(task.thread_group().request_group_exit(37), 37);
+    sched::group_exit_wakeup(&task);
+
+    assert!(matches!(
+        dispatch_native_call(&task, call),
+        NativeCallOutcome::RetryExternalControl
+    ));
+}
+
+#[ktest]
+fn stream_read_maps_general_errors_without_reusing_user_fault() {
+    assert_native_return(
+        map_stream_read_error(general::vfs::error::VfsError::Io, 0),
+        status::STREAM_ERROR,
+        0,
+    );
+    assert_native_return(
+        map_stream_read_error(general::vfs::error::VfsError::Io, 7),
+        status::OK,
+        7,
+    );
 }
 
 fn assert_native_return(outcome: NativeCallOutcome, status: u32, value0: u64) {
@@ -603,6 +794,8 @@ fn install_native_state(
         build_id: [0; 32],
         content_hash: [0; 32],
         image_base: 0,
+        runtime_ranges: sched::sync::Spinlock::new(None),
+        allocations: sched::sync::Spinlock::new(alloc::vec::Vec::new()),
     });
     let payload: Arc<dyn core::any::Any + Send + Sync> = state.clone();
     let group = task.thread_group();
@@ -671,6 +864,63 @@ fn make_stream_task(
     (task, state, read, handle)
 }
 
+fn make_read_stream_task(
+    rights: Rights,
+    nonblock: bool,
+) -> (
+    Arc<Task>,
+    Arc<NativeProcessState>,
+    Arc<general::vfs::file::File>,
+    NativeHandle,
+) {
+    let (read, write) =
+        general::vfs::pipe::new_pipe(Arc::new(general::vfs::Credentials::root()), nonblock)
+            .expect("测试 pipe 应创建成功");
+    let mut handles = empty_handles();
+    let handle = handles
+        .insert(
+            KernelNativeObject::Stream(read),
+            ObjectInterface::Stream,
+            rights,
+        )
+        .expect("stream handle 应分配成功");
+    let (task, state) =
+        make_native_task(alloc::vec![bound_slot(0, OperationId::StreamRead)], handles);
+    (task, state, write, handle)
+}
+
+fn make_address_space_task() -> (Arc<Task>, Arc<VmSpace>, NativeHandle) {
+    let vm = Arc::new(VmSpace::new());
+    let mut handles = empty_handles();
+    let handle = handles
+        .insert(
+            KernelNativeObject::AddressSpace(Arc::clone(&vm)),
+            ObjectInterface::AddressSpace,
+            Rights::ALLOCATE | Rights::FREE,
+        )
+        .expect("AddressSpace handle 应分配成功");
+    let (task, state) = make_native_task(
+        alloc::vec![
+            bound_slot(0, OperationId::MemoryAllocate),
+            bound_slot(1, OperationId::MemoryFree),
+        ],
+        handles,
+    );
+    let layout = general::mm::user_vm_layout().expect("架构必须注册用户 VM 布局");
+    let page_size = native_abi::PAGE_SIZE as usize;
+    vm.map_anon(
+        page_size..page_size * 2,
+        VmFlags::EMPTY.with(VmFlags::READ).with(VmFlags::USER),
+    )
+    .expect("测试 StartInfo 保护区应真实映射");
+    state.install_runtime_ranges(
+        layout.default_stack_top - page_size..layout.default_stack_top,
+        page_size..page_size * 2,
+        None,
+    );
+    (task, vm, handle)
+}
+
 fn stream_file(task: &Arc<Task>, handle: NativeHandle) -> Arc<general::vfs::file::File> {
     let payload = task
         .thread_group()
@@ -719,6 +969,17 @@ fn install_user_bytes(task: &Arc<Task>, bytes: &[u8]) -> usize {
     let payload: Arc<dyn core::any::Any + Send + Sync> = vm;
     task.ext_install(sched::TASKEXT_VM_SPACE, payload);
     USER
+}
+
+fn read_user_bytes(task: &Arc<Task>, address: usize, len: usize) -> Vec<u8> {
+    let vm = task
+        .ext_lookup(sched::TASKEXT_VM_SPACE)
+        .and_then(|payload| payload.downcast::<VmSpace>().ok())
+        .expect("测试 task 应有 VM");
+    unsafe {
+        vm.with_user_read_slice(address, len, |bytes| bytes.to_vec())
+            .expect("测试用户缓冲应可读取")
+    }
 }
 
 #[cfg(target_arch = "riscv64")]

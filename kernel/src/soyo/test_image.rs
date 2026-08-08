@@ -5,10 +5,10 @@ use alloc::vec::Vec;
 use native_abi::TargetArch;
 use soyo::test_support::{SoyoLoaderTestEncoder, SoyoTestEncoder};
 
-// 两段 payload 都直接执行 PROCESS_EXIT(slot 0)：a0=42、a6=handle(1, 1)、
+// 两段 payload 都直接执行 process.exit(slot 0)：a0=42、a6=handle(1, 1)、
 // a5=0、a7=0，若调用意外返回则停在末尾自环。固定字节由对应交叉汇编器核对，
 // 测试构造和内核构建均不读取 ELF，也不调用 objcopy。
-const RISCV64_PROCESS_EXIT: &[u8] = &[
+const RISCV64_EXIT_CODE: &[u8] = &[
     0x13, 0x05, 0xa0, 0x02, // addi a0, zero, 42
     0x13, 0x08, 0x10, 0x00, // addi a6, zero, 1
     0x13, 0x18, 0x08, 0x02, // slli a6, a6, 32
@@ -19,7 +19,7 @@ const RISCV64_PROCESS_EXIT: &[u8] = &[
     0x6f, 0x00, 0x00, 0x00, // jal zero, 0
 ];
 
-const LOONGARCH64_PROCESS_EXIT: &[u8] = &[
+const LOONGARCH64_EXIT_CODE: &[u8] = &[
     0x04, 0xa8, 0xc0, 0x02, // addi.d a0, zero, 42
     0x0a, 0x04, 0xc0, 0x02, // addi.d a6, zero, 1
     0x4a, 0x81, 0x41, 0x00, // slli.d a6, a6, 32
@@ -32,8 +32,8 @@ const LOONGARCH64_PROCESS_EXIT: &[u8] = &[
 
 pub(super) fn process_exit_payload(target: TargetArch) -> &'static [u8] {
     match target {
-        TargetArch::Riscv64 => RISCV64_PROCESS_EXIT,
-        TargetArch::LoongArch64 => LOONGARCH64_PROCESS_EXIT,
+        TargetArch::Riscv64 => RISCV64_EXIT_CODE,
+        TargetArch::LoongArch64 => LOONGARCH64_EXIT_CODE,
     }
 }
 

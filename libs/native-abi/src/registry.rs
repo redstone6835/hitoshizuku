@@ -6,42 +6,6 @@ pub const ABI_FAMILY_MYGO_NATIVE: u16 = 1;
 pub const ABI_EPOCH: u16 = 1;
 pub const PAGE_SIZE: u64 = 4096;
 
-macro_rules! abi_flags {
-    ($name:ident, $bits:ty, { $($constant:ident = $value:expr),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct $name($bits);
-
-        impl $name {
-            $(pub const $constant: Self = Self($value);)+
-
-            pub const fn from_bits(bits: $bits) -> Self {
-                Self(bits)
-            }
-
-            pub const fn bits(self) -> $bits {
-                self.0
-            }
-
-            pub const fn contains(self, other: Self) -> bool {
-                self.0 & other.0 == other.0
-            }
-        }
-    };
-}
-
-abi_flags!(VmProtections, u32, {
-    READ = 1 << 0,
-    WRITE = 1 << 1,
-    EXECUTE = 1 << 2,
-    KNOWN = 0b111,
-});
-
-abi_flags!(VmMapFlags, u32, {
-    FIXED = 1 << 0,
-    ZEROED = 1 << 1,
-    KNOWN = 0b11,
-});
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum TargetArch {
@@ -66,8 +30,9 @@ impl Rights {
     pub const READ: Self = Self(1 << 0);
     pub const WRITE: Self = Self(1 << 1);
     pub const DUPLICATE: Self = Self(1 << 2);
-    pub const MAP: Self = Self(1 << 3);
-    pub const TERMINATE_SELF: Self = Self(1 << 4);
+    pub const ALLOCATE: Self = Self(1 << 3);
+    pub const FREE: Self = Self(1 << 4);
+    pub const EXIT: Self = Self(1 << 5);
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -102,26 +67,30 @@ pub struct RightSpec {
     pub right: Rights,
 }
 
-pub const RIGHTS: [RightSpec; 5] = [
+pub const RIGHTS: [RightSpec; 6] = [
     RightSpec {
-        name: "READ",
+        name: "read",
         right: Rights::READ,
     },
     RightSpec {
-        name: "WRITE",
+        name: "write",
         right: Rights::WRITE,
     },
     RightSpec {
-        name: "DUPLICATE",
+        name: "duplicate",
         right: Rights::DUPLICATE,
     },
     RightSpec {
-        name: "MAP",
-        right: Rights::MAP,
+        name: "allocate",
+        right: Rights::ALLOCATE,
     },
     RightSpec {
-        name: "TERMINATE_SELF",
-        right: Rights::TERMINATE_SELF,
+        name: "free",
+        right: Rights::FREE,
+    },
+    RightSpec {
+        name: "exit",
+        right: Rights::EXIT,
     },
 ];
 
@@ -165,37 +134,37 @@ pub struct RequirementSpec {
 pub const REQUIREMENTS: [RequirementSpec; 6] = [
     RequirementSpec {
         id: RequirementId::SelfProcess,
-        name: "SELF_PROCESS",
+        name: "self_process",
         interface: ObjectInterface::Process,
-        max_rights: Rights::TERMINATE_SELF,
+        max_rights: Rights::EXIT,
     },
     RequirementSpec {
         id: RequirementId::CurrentAddressSpace,
-        name: "CURRENT_ADDRESS_SPACE",
+        name: "current_address_space",
         interface: ObjectInterface::AddressSpace,
-        max_rights: Rights::MAP,
+        max_rights: Rights::from_bits(Rights::ALLOCATE.bits() | Rights::FREE.bits()),
     },
     RequirementSpec {
         id: RequirementId::Stdin,
-        name: "STDIN",
+        name: "stdin",
         interface: ObjectInterface::Stream,
         max_rights: Rights::READ,
     },
     RequirementSpec {
         id: RequirementId::Stdout,
-        name: "STDOUT",
+        name: "stdout",
         interface: ObjectInterface::Stream,
         max_rights: Rights::from_bits(Rights::WRITE.bits() | Rights::DUPLICATE.bits()),
     },
     RequirementSpec {
         id: RequirementId::Stderr,
-        name: "STDERR",
+        name: "stderr",
         interface: ObjectInterface::Stream,
         max_rights: Rights::from_bits(Rights::WRITE.bits() | Rights::DUPLICATE.bits()),
     },
     RequirementSpec {
         id: RequirementId::MonotonicClock,
-        name: "MONOTONIC_CLOCK",
+        name: "monotonic_clock",
         interface: ObjectInterface::Clock,
         max_rights: Rights::READ,
     },
@@ -219,8 +188,8 @@ pub enum OperationId {
     StreamRead = 5,
     StreamWrite = 6,
     ClockRead = 7,
-    VmMapAnon = 8,
-    VmUnmap = 9,
+    MemoryAllocate = 8,
+    MemoryFree = 9,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,9 +205,9 @@ pub struct OperationSpec {
 pub const OPERATIONS: [OperationSpec; 9] = [
     OperationSpec {
         id: OperationId::ProcessExit,
-        name: "PROCESS_EXIT",
+        name: "process.exit",
         interface: Some(ObjectInterface::Process),
-        required_rights: Rights::TERMINATE_SELF,
+        required_rights: Rights::EXIT,
         signature: "epoch=1;operation=1;object=1;args=u32,zero,zero,zero,zero;result=noreturn",
         signature_hash: [
             0xa6, 0xc1, 0xfb, 0x70, 0xa1, 0x0c, 0x4b, 0x82, 0xa6, 0x32, 0xa3, 0x02, 0x75, 0xef,
@@ -248,7 +217,7 @@ pub const OPERATIONS: [OperationSpec; 9] = [
     },
     OperationSpec {
         id: OperationId::HandleClose,
-        name: "HANDLE_CLOSE",
+        name: "handle.close",
         interface: None,
         required_rights: Rights::NONE,
         signature: "epoch=1;operation=2;object=any;args=zero,zero,zero,zero,zero;result=status",
@@ -260,7 +229,7 @@ pub const OPERATIONS: [OperationSpec; 9] = [
     },
     OperationSpec {
         id: OperationId::HandleDuplicate,
-        name: "HANDLE_DUPLICATE",
+        name: "handle.duplicate",
         interface: None,
         required_rights: Rights::DUPLICATE,
         signature: "epoch=1;operation=3;object=any;args=zero,zero,zero,zero,zero;result=handle",
@@ -272,7 +241,7 @@ pub const OPERATIONS: [OperationSpec; 9] = [
     },
     OperationSpec {
         id: OperationId::HandleRestrict,
-        name: "HANDLE_RESTRICT",
+        name: "handle.restrict",
         interface: None,
         required_rights: Rights::DUPLICATE,
         signature: "epoch=1;operation=4;object=any;args=rights64,zero,zero,zero,zero;result=handle",
@@ -284,31 +253,31 @@ pub const OPERATIONS: [OperationSpec; 9] = [
     },
     OperationSpec {
         id: OperationId::StreamRead,
-        name: "STREAM_READ",
+        name: "stream.read",
         interface: Some(ObjectInterface::Stream),
         required_rights: Rights::READ,
-        signature: "epoch=1;operation=5;object=3;args=user_mut_ptr,u64,u32,zero,zero;result=u64",
+        signature: "epoch=1;operation=5;object=3;args=user_mut_ptr,u64,zero,zero,zero;result=u64",
         signature_hash: [
-            0xf9, 0xbe, 0xe0, 0xc9, 0xd6, 0xeb, 0x72, 0xbf, 0x36, 0x83, 0xa7, 0xdd, 0x17, 0x6c,
-            0xd9, 0xcb, 0x31, 0x3d, 0xd9, 0x23, 0x25, 0x57, 0xb6, 0xc2, 0x3a, 0x83, 0x9e, 0x98,
-            0xa4, 0xd1, 0x52, 0xbc,
+            0x98, 0x99, 0xf2, 0xa8, 0x8d, 0x7b, 0x89, 0xed, 0x70, 0xff, 0x0c, 0x4c, 0x21, 0x63,
+            0x2c, 0x13, 0xee, 0x8a, 0xb9, 0xfa, 0xb7, 0x30, 0x36, 0x8d, 0x79, 0x8c, 0x4a, 0xa1,
+            0x62, 0x10, 0x87, 0x82,
         ],
     },
     OperationSpec {
         id: OperationId::StreamWrite,
-        name: "STREAM_WRITE",
+        name: "stream.write",
         interface: Some(ObjectInterface::Stream),
         required_rights: Rights::WRITE,
-        signature: "epoch=1;operation=6;object=3;args=user_const_ptr,u64,u32,zero,zero;result=u64",
+        signature: "epoch=1;operation=6;object=3;args=user_const_ptr,u64,zero,zero,zero;result=u64",
         signature_hash: [
-            0x19, 0xa4, 0x61, 0xa4, 0x07, 0x10, 0xb5, 0xf7, 0xa4, 0x5c, 0x64, 0xf3, 0xf3, 0xb2,
-            0xdd, 0xd3, 0x6a, 0xe8, 0x8b, 0x66, 0x4a, 0x20, 0xca, 0xa1, 0xf0, 0x07, 0x64, 0xcb,
-            0x62, 0x8b, 0x56, 0xa6,
+            0x55, 0xee, 0x0a, 0x78, 0xe0, 0xe3, 0xbd, 0xf4, 0x89, 0x0a, 0xdf, 0x14, 0x1d, 0xed,
+            0x39, 0x58, 0x8a, 0xdb, 0xe7, 0x4d, 0x63, 0x18, 0xbd, 0x6f, 0x73, 0xc4, 0xca, 0x6a,
+            0x35, 0xe6, 0x8d, 0xac,
         ],
     },
     OperationSpec {
         id: OperationId::ClockRead,
-        name: "CLOCK_READ",
+        name: "clock.read",
         interface: Some(ObjectInterface::Clock),
         required_rights: Rights::READ,
         signature: "epoch=1;operation=7;object=4;args=zero,zero,zero,zero,zero;result=u64",
@@ -319,22 +288,22 @@ pub const OPERATIONS: [OperationSpec; 9] = [
         ],
     },
     OperationSpec {
-        id: OperationId::VmMapAnon,
-        name: "VM_MAP_ANON",
+        id: OperationId::MemoryAllocate,
+        name: "memory.allocate",
         interface: Some(ObjectInterface::AddressSpace),
-        required_rights: Rights::MAP,
-        signature: "epoch=1;operation=8;object=2;args=u64,u64,u32,u32,u64;result=u64",
+        required_rights: Rights::ALLOCATE,
+        signature: "epoch=1;operation=8;object=2;args=u64,u64,zero,zero,zero;result=u64,u64",
         signature_hash: [
-            0xf4, 0xb5, 0xa5, 0x20, 0x62, 0x45, 0x3e, 0xbb, 0x78, 0xe3, 0xd3, 0x97, 0x7a, 0xb6,
-            0xc2, 0x09, 0xfc, 0xf6, 0xdd, 0x70, 0x04, 0xe3, 0xfc, 0xcc, 0xd1, 0x6e, 0xf4, 0xcd,
-            0xd2, 0x13, 0x21, 0xd8,
+            0x43, 0x77, 0x0b, 0x2c, 0xe5, 0x3f, 0xcb, 0x6d, 0x76, 0xdc, 0xd4, 0x44, 0x50, 0xd2,
+            0xcf, 0x86, 0xb0, 0x7f, 0x45, 0x05, 0x11, 0x5a, 0xb4, 0x4c, 0x57, 0xb9, 0x47, 0x88,
+            0x0b, 0x21, 0x20, 0xfb,
         ],
     },
     OperationSpec {
-        id: OperationId::VmUnmap,
-        name: "VM_UNMAP",
+        id: OperationId::MemoryFree,
+        name: "memory.free",
         interface: Some(ObjectInterface::AddressSpace),
-        required_rights: Rights::MAP,
+        required_rights: Rights::FREE,
         signature: "epoch=1;operation=9;object=2;args=u64,u64,zero,zero,zero;result=status",
         signature_hash: [
             0x6b, 0x1f, 0x1c, 0xef, 0x89, 0x62, 0x0e, 0x51, 0x69, 0x8e, 0x2b, 0x9a, 0x93, 0x7b,

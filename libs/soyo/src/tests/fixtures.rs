@@ -114,7 +114,7 @@ pub fn minimal_soyo() -> Vec<u8> {
     put_u32(&mut bytes, 568, 1);
     put_u16(&mut bytes, 568 + 0x04, 1);
     put_u16(&mut bytes, 568 + 0x06, 1);
-    put_u64(&mut bytes, 568 + 0x08, 1 << 4);
+    put_u64(&mut bytes, 568 + 0x08, 1 << 5);
 
     put_u64(&mut bytes, 632, 64 * 1024);
     put_u64(&mut bytes, 632 + 0x08, 4096);
@@ -197,7 +197,7 @@ pub fn extended_soyo() -> Vec<u8> {
     put_u32(&mut bytes, 728, 1);
     put_u16(&mut bytes, 728 + 0x04, 1);
     put_u16(&mut bytes, 728 + 0x06, 1);
-    put_u64(&mut bytes, 728 + 0x08, 1 << 4);
+    put_u64(&mut bytes, 728 + 0x08, 1 << 5);
 
     put_u16(&mut bytes, 792, 1);
     put_u32(&mut bytes, EXTENDED_RELOCATION_TARGET_SEGMENT, 1);

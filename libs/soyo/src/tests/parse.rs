@@ -192,18 +192,14 @@ fn unknown_optional_payload_does_not_consume_parser_allocation_budget() {
 }
 
 #[test]
-fn host_accepts_init_array_while_kernel_rejects_it() {
+fn host_and_kernel_accept_nonempty_init_array() {
     let bytes = soyo_with_init_array(TargetArch::Riscv64, 0);
 
     let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
         .expect("合法 init array 应通过格式解析");
-    validate_soyo(&metadata, SoyoTargetPolicy::for_host()).expect("host 应接受完整 P0 格式语义");
-    assert_eq!(
-        validate_soyo(&metadata, SoyoTargetPolicy::for_kernel(TargetArch::Riscv64),),
-        Err(crate::SoyoError::Unsupported(
-            crate::UnsupportedKind::InitFini
-        ))
-    );
+    validate_soyo(&metadata, SoyoTargetPolicy::for_host()).expect("host 应接受完整格式语义");
+    validate_soyo(&metadata, SoyoTargetPolicy::for_kernel(TargetArch::Riscv64))
+        .expect("kernel 应接受完整 init/fini 语义");
 }
 
 #[test]

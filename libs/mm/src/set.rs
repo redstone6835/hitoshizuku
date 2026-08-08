@@ -246,6 +246,52 @@ impl VmaSet {
         }
     }
 
+    /// 在 `search` 内查找长度足够且起点满足 `alignment` 的空洞。
+    #[kernel_symbols::export(name = "mm.set.VmaSet.find_aligned_gap", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
+    pub fn find_aligned_gap(
+        &self,
+        search: Range<usize>,
+        len: usize,
+        alignment: usize,
+    ) -> Option<Range<usize>> {
+        if len == 0 || search.start >= search.end || alignment == 0 || !alignment.is_power_of_two()
+        {
+            return None;
+        }
+        let align_up = |value: usize| {
+            value
+                .checked_add(alignment - 1)
+                .map(|aligned| aligned & !(alignment - 1))
+        };
+        let mut cursor = search.start;
+        let end_bound = self
+            .areas
+            .partition_point(|area| area.range.start < search.end);
+        for area in &self.areas[..end_bound] {
+            if !area.is_well_formed() {
+                return None;
+            }
+            if area.range.end <= search.start {
+                continue;
+            }
+            let gap_end = area.range.start.min(search.end);
+            if gap_end > cursor {
+                let aligned = align_up(cursor)?;
+                let end = aligned.checked_add(len)?;
+                if end <= gap_end {
+                    return Some(aligned..end);
+                }
+            }
+            cursor = cursor.max(area.range.end);
+            if cursor >= search.end {
+                return None;
+            }
+        }
+        let aligned = align_up(cursor)?;
+        let end = aligned.checked_add(len)?;
+        (end <= search.end).then_some(aligned..end)
+    }
+
     /// 取消 `range` 内的所有映射，返回被摘掉的 VMA 片段列表（已按 range 裁剪）。
     /// 上层据此对每个片段下发 `UserPgdOps::unmap`。跨 VMA 边界时自动 split。
     #[kernel_symbols::export(name = "mm.set.VmaSet.unmap_range", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]

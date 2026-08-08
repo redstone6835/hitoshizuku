@@ -10,6 +10,28 @@ use crate::{NativeHandle, wire};
 const START_INFO_MAGIC: [u8; 4] = *b"syst";
 const START_INFO_VERSION: u16 = 1;
 const MAX_START_INFO_SIZE: usize = 1024 * 1024;
+const MAX_RUNTIME_ARRAY_ENTRIES: u32 = 4096;
+const RUNTIME_ARRAY_ENTRY_SIZE: u16 = 8;
+const STATIC_TLS_FEATURE: u64 = 1 << 0;
+const INIT_FINI_ARRAY_FEATURE: u64 = 1 << 1;
+const RUN_INIT_ARRAY: u64 = 1 << 0;
+const RUN_FINI_ARRAY: u64 = 1 << 1;
+const KNOWN_RUNTIME_FLAGS: u64 = RUN_INIT_ARRAY | RUN_FINI_ARRAY;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeArrayInfo {
+    pub offset: u64,
+    pub count: u32,
+    pub entry_size: u16,
+}
+
+impl RuntimeArrayInfo {
+    pub const EMPTY: Self = Self {
+        offset: 0,
+        count: 0,
+        entry_size: 0,
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitialHandleRecord {
@@ -33,6 +55,8 @@ pub struct StartInfoInput<'a> {
     pub call_slot_count: u32,
     pub random_seed: [u8; 32],
     pub runtime_flags: u64,
+    pub init_array: RuntimeArrayInfo,
+    pub fini_array: RuntimeArrayInfo,
     pub max_size: u32,
 }
 
@@ -184,6 +208,36 @@ pub fn build_start_info(input: StartInfoInput<'_>) -> Result<StartInfoImage, Sta
         wire::start_info::RUNTIME_FLAGS,
         input.runtime_flags,
     );
+    put_u64(
+        &mut bytes,
+        wire::start_info::INIT_ARRAY_OFFSET,
+        input.init_array.offset,
+    );
+    put_u32(
+        &mut bytes,
+        wire::start_info::INIT_ARRAY_COUNT,
+        input.init_array.count,
+    );
+    put_u16(
+        &mut bytes,
+        wire::start_info::INIT_ARRAY_ENTRY_SIZE,
+        input.init_array.entry_size,
+    );
+    put_u64(
+        &mut bytes,
+        wire::start_info::FINI_ARRAY_OFFSET,
+        input.fini_array.offset,
+    );
+    put_u32(
+        &mut bytes,
+        wire::start_info::FINI_ARRAY_COUNT,
+        input.fini_array.count,
+    );
+    put_u16(
+        &mut bytes,
+        wire::start_info::FINI_ARRAY_ENTRY_SIZE,
+        input.fini_array.entry_size,
+    );
 
     let mut string_cursor = string_offset;
     encode_strings(&mut bytes, argv_offset, input.argv, &mut string_cursor);
@@ -223,6 +277,7 @@ fn validate_input(input: &StartInfoInput<'_>) -> Result<(), StartInfoBuildError>
         || input.argv.len() > u32::MAX as usize
         || input.env.len() > u32::MAX as usize
         || input.initial_handles.len() > u32::MAX as usize
+        || input.runtime_flags & !KNOWN_RUNTIME_FLAGS != 0
     {
         return Err(StartInfoBuildError::InvalidInput);
     }
@@ -232,7 +287,13 @@ fn validate_input(input: &StartInfoInput<'_>) -> Result<(), StartInfoBuildError>
     let valid_tls = input.initial_tls_base != 0
         && input.initial_tls_size != 0
         && input.initial_thread_pointer == input.initial_tls_base;
-    if !no_tls && !valid_tls {
+    if (!no_tls && !valid_tls) || valid_tls != (input.enabled_features & STATIC_TLS_FEATURE != 0) {
+        return Err(StartInfoBuildError::InvalidInput);
+    }
+    validate_runtime_array(input.init_array, input.runtime_flags, RUN_INIT_ARRAY)?;
+    validate_runtime_array(input.fini_array, input.runtime_flags, RUN_FINI_ARRAY)?;
+    let has_runtime_array = input.init_array.count != 0 || input.fini_array.count != 0;
+    if has_runtime_array != (input.enabled_features & INIT_FINI_ARRAY_FEATURE != 0) {
         return Err(StartInfoBuildError::InvalidInput);
     }
     if input
@@ -257,6 +318,28 @@ fn validate_input(input: &StartInfoInput<'_>) -> Result<(), StartInfoBuildError>
             return Err(StartInfoBuildError::InvalidInput);
         }
         previous = id;
+    }
+    Ok(())
+}
+
+fn validate_runtime_array(
+    array: RuntimeArrayInfo,
+    runtime_flags: u64,
+    run_flag: u64,
+) -> Result<(), StartInfoBuildError> {
+    if array.count == 0 {
+        if array != RuntimeArrayInfo::EMPTY || runtime_flags & run_flag != 0 {
+            return Err(StartInfoBuildError::InvalidInput);
+        }
+        return Ok(());
+    }
+    if array.offset == 0
+        || array.offset % RUNTIME_ARRAY_ENTRY_SIZE as u64 != 0
+        || array.count > MAX_RUNTIME_ARRAY_ENTRIES
+        || array.entry_size != RUNTIME_ARRAY_ENTRY_SIZE
+        || runtime_flags & run_flag == 0
+    {
+        return Err(StartInfoBuildError::InvalidInput);
     }
     Ok(())
 }

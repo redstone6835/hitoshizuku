@@ -8,8 +8,10 @@ use general::dev::random::{RandomReadMode, fill as fill_random};
 use general::mm::{VmSpace, user_vm_layout};
 use general::vfs::file::File;
 use mm::VmFlags;
+use native_abi::registry::RequirementId;
 use native_abi::{
-    NativeBindingPlan, StartInfoBuildError, StartInfoInput, TargetArch, build_start_info,
+    NativeBindingPlan, RuntimeArrayInfo, StartInfoBuildError, StartInfoInput, TargetArch,
+    build_start_info,
 };
 use soyo::{
     ImageSegment, SoyoError, SoyoMappedSegment, SoyoMetadata, SoyoReadAt, SoyoReadError,
@@ -44,6 +46,7 @@ pub(crate) struct PreparedSoyoImage {
     pub(crate) tls_base: usize,
     pub(crate) start_info_address: usize,
     pub(crate) start_info_size: usize,
+    pub(crate) bootstrap_process: u64,
     pub(crate) personality: Arc<NativeProcessState>,
 }
 
@@ -283,6 +286,11 @@ pub(crate) fn prepare_soyo_runtime(
         u32::try_from(native_binding.call_slots.len()).map_err(|_| Errno::ENOEXEC)?;
     let (personality, initial_handles) =
         prepare_native_process_state(&metadata, native_binding, &vm, image_base, descriptors)?;
+    let bootstrap_process = initial_handles
+        .iter()
+        .find(|record| record.requirement_id == RequirementId::SelfProcess)
+        .map(|record| record.handle.raw())
+        .ok_or(Errno::ENOEXEC)?;
     let tls = metadata
         .segments
         .iter()
@@ -310,6 +318,16 @@ pub(crate) fn prepare_soyo_runtime(
         call_slot_count,
         random_seed,
         runtime_flags: metadata.runtime.runtime_flags,
+        init_array: RuntimeArrayInfo {
+            offset: metadata.runtime.init_array_offset,
+            count: metadata.runtime.init_array_count,
+            entry_size: metadata.runtime.init_array_entry_size,
+        },
+        fini_array: RuntimeArrayInfo {
+            offset: metadata.runtime.fini_array_offset,
+            count: metadata.runtime.fini_array_count,
+            entry_size: metadata.runtime.fini_array_entry_size,
+        },
         max_size: metadata.runtime.start_info_max_size,
     })
     .map_err(map_start_info_error)?;
@@ -340,6 +358,16 @@ pub(crate) fn prepare_soyo_runtime(
         call_slot_count,
         random_seed,
         runtime_flags: metadata.runtime.runtime_flags,
+        init_array: RuntimeArrayInfo {
+            offset: metadata.runtime.init_array_offset,
+            count: metadata.runtime.init_array_count,
+            entry_size: metadata.runtime.init_array_entry_size,
+        },
+        fini_array: RuntimeArrayInfo {
+            offset: metadata.runtime.fini_array_offset,
+            count: metadata.runtime.fini_array_count,
+            entry_size: metadata.runtime.fini_array_entry_size,
+        },
         max_size: metadata.runtime.start_info_max_size,
     })
     .map_err(map_start_info_error)?;
@@ -377,6 +405,8 @@ pub(crate) fn prepare_soyo_runtime(
         start_info_range.clone(),
         VmFlags::EMPTY.with(VmFlags::USER).with(VmFlags::READ),
     )?;
+    let tls_runtime_range = process_layout.tls.as_ref().map(usize_range).transpose()?;
+    personality.install_runtime_ranges(stack.clone(), start_info_range.clone(), tls_runtime_range);
 
     Ok(PreparedSoyoImage {
         vm,
@@ -387,6 +417,7 @@ pub(crate) fn prepare_soyo_runtime(
         tls_base: usize::try_from(tls_base).map_err(|_| Errno::ENOEXEC)?,
         start_info_address: start_info_range.start,
         start_info_size: start_info.as_bytes().len(),
+        bootstrap_process,
         personality,
     })
 }

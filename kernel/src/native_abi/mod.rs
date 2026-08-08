@@ -2,6 +2,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 use errno::Errno;
 use general::mm::VmSpace;
@@ -34,6 +35,64 @@ pub(crate) struct NativeProcessState {
     pub(crate) build_id: [u8; 32],
     pub(crate) content_hash: [u8; 32],
     pub(crate) image_base: usize,
+    runtime_ranges: Spinlock<Option<NativeRuntimeRanges>>,
+    allocations: Spinlock<Vec<Range<usize>>>,
+}
+
+struct NativeRuntimeRanges {
+    stack: Range<usize>,
+    start_info: Range<usize>,
+    tls: Option<Range<usize>>,
+}
+
+impl NativeProcessState {
+    pub(crate) fn install_runtime_ranges(
+        &self,
+        stack: Range<usize>,
+        start_info: Range<usize>,
+        tls: Option<Range<usize>>,
+    ) {
+        let mut ranges = self.runtime_ranges.lock();
+        assert!(ranges.is_none(), "Native runtime range 只能安装一次");
+        *ranges = Some(NativeRuntimeRanges {
+            stack,
+            start_info,
+            tls,
+        });
+    }
+
+    fn overlaps_runtime_range(&self, range: &Range<usize>) -> bool {
+        let ranges = self.runtime_ranges.lock();
+        let Some(ranges) = ranges.as_ref() else {
+            return true;
+        };
+        ranges.stack.start < range.end && range.start < ranges.stack.end
+            || ranges.start_info.start < range.end && range.start < ranges.start_info.end
+            || ranges
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.start < range.end && range.start < tls.end)
+    }
+
+    fn owns_allocation(&self, range: &Range<usize>) -> bool {
+        self.allocations.lock().iter().any(|owned| owned == range)
+    }
+
+    fn record_allocation(&self, range: Range<usize>) -> Result<(), ()> {
+        let mut allocations = self.allocations.lock();
+        allocations.try_reserve(1).map_err(|_| ())?;
+        allocations.push(range);
+        Ok(())
+    }
+
+    fn remove_allocation(&self, range: &Range<usize>) -> bool {
+        let mut allocations = self.allocations.lock();
+        let Some(index) = allocations.iter().position(|owned| owned == range) else {
+            return false;
+        };
+        allocations.swap_remove(index);
+        true
+    }
 }
 
 pub(crate) fn register() {
@@ -117,6 +176,8 @@ pub(crate) fn prepare_native_process_state(
         build_id: metadata.header.build_id,
         content_hash: metadata.header.content_hash,
         image_base,
+        runtime_ranges: Spinlock::new(None),
+        allocations: Spinlock::new(Vec::new()),
     });
     Ok((state, initial))
 }

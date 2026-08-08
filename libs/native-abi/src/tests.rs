@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, AbiImportRecord, CapabilityRequirementRecord,
     IncompatibleKind, InitialHandleRecord, MalformedKind, NativeAbiError, NativeAbiPolicy,
-    NativeHandle, ObjectInterface, OperationId, RequirementId, Rights, StartInfoBuildError,
-    StartInfoInput, TargetArch, UnsupportedKind, VmMapFlags, VmProtections, bind_native_abi,
+    NativeHandle, ObjectInterface, OperationId, RequirementId, Rights, RuntimeArrayInfo,
+    StartInfoBuildError, StartInfoInput, TargetArch, UnsupportedKind, bind_native_abi,
     build_start_info, operation, requirement, status, wire,
 };
 
@@ -75,10 +75,10 @@ impl CapabilityRequirementRecord for TestCapability {
 
 #[test]
 fn operation_registry_preserves_ids_signatures_and_hashes() {
-    let exit = operation(OperationId::ProcessExit).expect("PROCESS_EXIT 必须注册");
+    let exit = operation(OperationId::ProcessExit).expect("process.exit 必须注册");
     assert_eq!(exit.id as u32, 1);
     assert_eq!(exit.interface, Some(ObjectInterface::Process));
-    assert_eq!(exit.required_rights.bits(), 1 << 4);
+    assert_eq!(exit.required_rights.bits(), 1 << 5);
     assert_eq!(
         exit.signature,
         "epoch=1;operation=1;object=1;args=u32,zero,zero,zero,zero;result=noreturn"
@@ -92,13 +92,13 @@ fn operation_registry_preserves_ids_signatures_and_hashes() {
         ]
     );
 
-    let write = operation(OperationId::StreamWrite).expect("STREAM_WRITE 必须注册");
+    let write = operation(OperationId::StreamWrite).expect("stream.write 必须注册");
     assert_eq!(write.id as u32, 6);
     assert_eq!(write.interface, Some(ObjectInterface::Stream));
     assert_eq!(write.required_rights.bits(), 1 << 1);
     assert_eq!(
         write.signature,
-        "epoch=1;operation=6;object=3;args=user_const_ptr,u64,u32,zero,zero;result=u64"
+        "epoch=1;operation=6;object=3;args=user_const_ptr,u64,zero,zero,zero;result=u64"
     );
 }
 
@@ -124,26 +124,21 @@ fn requirement_registry_limits_interface_and_granted_rights() {
     assert_eq!(RequirementId::from_raw(4), Some(RequirementId::Stdout));
     assert_eq!(RequirementId::from_raw(0), None);
     assert_eq!(RequirementId::from_raw(7), None);
-    assert_eq!(crate::right_by_name("WRITE").unwrap().right, Rights::WRITE);
-    assert!(crate::right_by_name("UNKNOWN").is_none());
+    assert_eq!(crate::right_by_name("write").unwrap().right, Rights::WRITE);
+    assert!(crate::right_by_name("WRITE").is_none());
 }
 
 #[test]
-fn status_and_vm_flag_registries_preserve_wire_values() {
+fn status_registry_preserves_wire_values() {
     assert_eq!(status::OK, 0x0000_0000);
     assert_eq!(status::CORE_INVALID_ARGUMENT, 0x0100_0001);
     assert_eq!(status::ABI_BAD_SLOT, 0x0200_0001);
     assert_eq!(status::HANDLE_STALE, 0x0300_0002);
     assert_eq!(status::SECURITY_RIGHTS_DENIED, 0x0400_0001);
-    assert_eq!(status::IO_WOULD_BLOCK, 0x0500_0002);
-    assert_eq!(status::IO_CLOSED, 0x0500_0003);
-    assert_eq!(status::IO_ERROR, 0x0500_0004);
-    assert_eq!(status::VM_ADDRESS_CONFLICT, 0x0600_0002);
-    assert_eq!(VmProtections::READ.bits(), 1);
-    assert_eq!(VmProtections::WRITE.bits(), 2);
-    assert_eq!(VmProtections::EXECUTE.bits(), 4);
-    assert_eq!(VmMapFlags::FIXED.bits(), 1);
-    assert_eq!(VmMapFlags::ZEROED.bits(), 2);
+    assert_eq!(status::STREAM_WOULD_BLOCK, 0x0500_0002);
+    assert_eq!(status::STREAM_CLOSED, 0x0500_0004);
+    assert_eq!(status::STREAM_ERROR, 0x0500_0005);
+    assert_eq!(status::MEMORY_INVALID_ALIGNMENT, 0x0600_0002);
 }
 
 #[test]
@@ -154,7 +149,15 @@ fn native_startup_wire_layout_is_frozen() {
     assert_eq!(wire::start_info::ABI_EPOCH, 0x10);
     assert_eq!(wire::start_info::INITIAL_HANDLE_OFFSET, 0x68);
     assert_eq!(wire::start_info::RANDOM_SEED, 0x70);
-    assert_eq!(wire::start_info::RESERVED2, 0x98);
+    assert_eq!(wire::start_info::INIT_ARRAY_OFFSET, 0x98);
+    assert_eq!(wire::start_info::INIT_ARRAY_COUNT, 0xa0);
+    assert_eq!(wire::start_info::INIT_ARRAY_ENTRY_SIZE, 0xa4);
+    assert_eq!(wire::start_info::RESERVED2, 0xa6);
+    assert_eq!(wire::start_info::FINI_ARRAY_OFFSET, 0xa8);
+    assert_eq!(wire::start_info::FINI_ARRAY_COUNT, 0xb0);
+    assert_eq!(wire::start_info::FINI_ARRAY_ENTRY_SIZE, 0xb4);
+    assert_eq!(wire::start_info::RESERVED3, 0xb6);
+    assert_eq!(wire::start_info::RESERVED4, 0xb8);
     assert_eq!(wire::initial_handle::REQUIREMENT_ID, 0x00);
     assert_eq!(wire::initial_handle::GRANTED_RIGHTS, 0x10);
     assert_eq!(wire::initial_handle::RESERVED, 0x18);
@@ -169,7 +172,7 @@ fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
             requirement_id: RequirementId::SelfProcess,
             object_interface: ObjectInterface::Process,
             handle: NativeHandle::from_parts(1, 1),
-            granted_rights: Rights::TERMINATE_SELF,
+            granted_rights: Rights::EXIT,
         },
         InitialHandleRecord {
             requirement_id: RequirementId::Stdout,
@@ -182,7 +185,7 @@ fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
 
     let image = build_start_info(StartInfoInput {
         target_arch: TargetArch::Riscv64,
-        enabled_features: 0x11,
+        enabled_features: 0x13,
         image_base: 0x4000_0000,
         initial_tls_base: 0x7fff_0000,
         initial_tls_size: 0x1000,
@@ -192,7 +195,17 @@ fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
         initial_handles: &handles,
         call_slot_count: 3,
         random_seed,
-        runtime_flags: 1,
+        runtime_flags: 0b11,
+        init_array: RuntimeArrayInfo {
+            offset: 0x2000,
+            count: 2,
+            entry_size: 8,
+        },
+        fini_array: RuntimeArrayInfo {
+            offset: 0x3000,
+            count: 1,
+            entry_size: 8,
+        },
         max_size: 4096,
     })
     .expect("合法 StartInfo 应完成编码");
@@ -213,7 +226,7 @@ fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
     assert_eq!(u16::from_le_bytes(bytes[0x12..0x14].try_into().unwrap()), 1);
     assert_eq!(
         u64::from_le_bytes(bytes[0x18..0x20].try_into().unwrap()),
-        0x11
+        0x13
     );
     assert_eq!(
         u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()),
@@ -248,6 +261,20 @@ fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
     );
     assert_eq!(u32::from_le_bytes(bytes[0x6c..0x70].try_into().unwrap()), 3);
     assert_eq!(&bytes[0x70..0x90], &random_seed);
+    assert_eq!(
+        u64::from_le_bytes(bytes[0x98..0xa0].try_into().unwrap()),
+        0x2000
+    );
+    assert_eq!(u32::from_le_bytes(bytes[0xa0..0xa4].try_into().unwrap()), 2);
+    assert_eq!(u16::from_le_bytes(bytes[0xa4..0xa6].try_into().unwrap()), 8);
+    assert_eq!(
+        u64::from_le_bytes(bytes[0xa8..0xb0].try_into().unwrap()),
+        0x3000
+    );
+    assert_eq!(u32::from_le_bytes(bytes[0xb0..0xb4].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes(bytes[0xb4..0xb6].try_into().unwrap()), 8);
+    assert!(bytes[0xa6..0xa8].iter().all(|byte| *byte == 0));
+    assert!(bytes[0xb6..0xc0].iter().all(|byte| *byte == 0));
 
     assert_eq!(&bytes[288..293], b"prog\0");
     assert_eq!(&bytes[293..298], &[0xff, b'a', b'r', b'g', 0]);
@@ -268,7 +295,7 @@ fn start_info_builder_preserves_bytes_and_emits_canonical_layout() {
     );
     assert_eq!(
         u64::from_le_bytes(bytes[240..248].try_into().unwrap()),
-        1 << 4
+        1 << 5
     );
     assert_eq!(u32::from_le_bytes(bytes[256..260].try_into().unwrap()), 4);
     assert_eq!(
@@ -298,6 +325,8 @@ fn start_info_builder_rejects_oversize_or_noncanonical_input() {
         call_slot_count: 0,
         random_seed: [1; 32],
         runtime_flags: 0,
+        init_array: RuntimeArrayInfo::EMPTY,
+        fini_array: RuntimeArrayInfo::EMPTY,
         max_size: 192,
     };
     assert_eq!(build_start_info(input), Err(StartInfoBuildError::TooLarge));
@@ -330,6 +359,52 @@ fn start_info_builder_rejects_oversize_or_noncanonical_input() {
         build_start_info(StartInfoInput {
             argv: &[],
             initial_handles: &duplicate,
+            max_size: 4096,
+            ..input
+        }),
+        Err(StartInfoBuildError::InvalidInput)
+    );
+
+    assert_eq!(
+        build_start_info(StartInfoInput {
+            argv: &[],
+            init_array: RuntimeArrayInfo {
+                offset: 0x2000,
+                count: 0,
+                entry_size: 8,
+            },
+            max_size: 4096,
+            ..input
+        }),
+        Err(StartInfoBuildError::InvalidInput)
+    );
+
+    assert_eq!(
+        build_start_info(StartInfoInput {
+            enabled_features: 1,
+            argv: &[],
+            max_size: 4096,
+            ..input
+        }),
+        Err(StartInfoBuildError::InvalidInput)
+    );
+
+    assert_eq!(
+        build_start_info(StartInfoInput {
+            initial_tls_base: 0x7000_0000,
+            initial_tls_size: 32,
+            initial_thread_pointer: 0x7000_0000,
+            argv: &[],
+            max_size: 4096,
+            ..input
+        }),
+        Err(StartInfoBuildError::InvalidInput)
+    );
+
+    assert_eq!(
+        build_start_info(StartInfoInput {
+            runtime_flags: 1 << 63,
+            argv: &[],
             max_size: 4096,
             ..input
         }),
@@ -379,44 +454,74 @@ fn binding_rejects_wrong_family_or_epoch() {
 }
 
 #[test]
-fn optional_unknown_or_unimplemented_operation_stays_unbound() {
+fn optional_unknown_operation_stays_unbound() {
     let mut unknown = TestImport::known(0, OperationId::ProcessExit, false);
     unknown.operation_id = 100;
-    let stream_read = TestImport::known(0, OperationId::StreamRead, false);
 
-    for import in [unknown, stream_read] {
-        let plan = bind_native_abi(
-            ABI_FAMILY_MYGO_NATIVE,
-            ABI_EPOCH,
-            &[import],
-            &[] as &[TestCapability],
-            NativeAbiPolicy::for_kernel(),
-        )
-        .expect("optional operation 应产生未绑定 slot");
-        assert_eq!(plan.call_slots[0].operation, None);
-    }
+    let plan = bind_native_abi(
+        ABI_FAMILY_MYGO_NATIVE,
+        ABI_EPOCH,
+        &[unknown],
+        &[] as &[TestCapability],
+        NativeAbiPolicy::for_kernel(),
+    )
+    .expect("optional unknown operation 应产生未绑定 slot");
+    assert_eq!(plan.call_slots[0].operation, None);
 }
 
 #[test]
-fn required_unknown_or_unimplemented_operation_is_incompatible() {
+fn required_unknown_operation_is_incompatible() {
     let mut unknown = TestImport::known(0, OperationId::ProcessExit, true);
     unknown.operation_id = 100;
-    let stream_read = TestImport::known(0, OperationId::StreamRead, true);
 
-    for (import, operation_id) in [(unknown, 100), (stream_read, 5)] {
-        assert_eq!(
-            bind_native_abi(
-                ABI_FAMILY_MYGO_NATIVE,
-                ABI_EPOCH,
-                &[import],
-                &[] as &[TestCapability],
-                NativeAbiPolicy::for_kernel(),
-            ),
-            Err(NativeAbiError::Incompatible(IncompatibleKind::Operation(
-                operation_id
-            )))
-        );
-    }
+    assert_eq!(
+        bind_native_abi(
+            ABI_FAMILY_MYGO_NATIVE,
+            ABI_EPOCH,
+            &[unknown],
+            &[] as &[TestCapability],
+            NativeAbiPolicy::for_kernel(),
+        ),
+        Err(NativeAbiError::Incompatible(IncompatibleKind::Operation(
+            100
+        )))
+    );
+}
+
+#[test]
+fn stream_read_is_bound_for_kernel() {
+    let import = TestImport::known(0, OperationId::StreamRead, true);
+    let plan = bind_native_abi(
+        ABI_FAMILY_MYGO_NATIVE,
+        ABI_EPOCH,
+        &[import],
+        &[] as &[TestCapability],
+        NativeAbiPolicy::for_kernel(),
+    )
+    .expect("stream.read 应属于当前内核 Native operation");
+    assert_eq!(plan.call_slots[0].operation, Some(OperationId::StreamRead));
+}
+
+#[test]
+fn address_space_operations_are_bound_for_kernel() {
+    let imports = [
+        TestImport::known(0, OperationId::MemoryAllocate, true),
+        TestImport::known(1, OperationId::MemoryFree, true),
+    ];
+    let plan = bind_native_abi(
+        ABI_FAMILY_MYGO_NATIVE,
+        ABI_EPOCH,
+        &imports,
+        &[] as &[TestCapability],
+        NativeAbiPolicy::for_kernel(),
+    )
+    .expect("VM operation 应属于当前内核 Native ABI");
+
+    assert_eq!(
+        plan.call_slots[0].operation,
+        Some(OperationId::MemoryAllocate)
+    );
+    assert_eq!(plan.call_slots[1].operation, Some(OperationId::MemoryFree));
 }
 
 #[test]

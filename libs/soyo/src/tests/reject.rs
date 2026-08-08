@@ -671,7 +671,7 @@ fn diagnostic_string_must_be_valid_utf8() {
 #[test]
 fn capability_rights_escalation_is_malformed() {
     let mut bytes = minimal_soyo();
-    put_u64(&mut bytes, CAP_RIGHTS, (1 << 4) | (1 << 1));
+    put_u64(&mut bytes, CAP_RIGHTS, (1 << 5) | (1 << 1));
     rehash(&mut bytes);
     let reader = SliceSoyoReader::new(&bytes);
     let metadata = read_soyo(&reader, SoyoReadLimits::portable()).expect("capability 记录结构合法");
@@ -916,24 +916,28 @@ fn load_plan_cannot_bypass_native_abi_binding() {
 }
 
 #[test]
-fn kernel_rejects_unimplemented_required_operation() {
+fn policy_rejects_unsupported_required_operation() {
     let mut bytes = minimal_soyo();
     let operation = native_abi::operation(OperationId::StreamRead)
-        .expect("STREAM_READ 必须在 Native ABI registry 中");
+        .expect("stream.read 必须在 Native ABI registry 中");
     put_u32(&mut bytes, IMPORT_OPERATION_ID, operation.id as u32);
     bytes[IMPORT_SIGNATURE_HASH..IMPORT_SIGNATURE_HASH + 32]
         .copy_from_slice(&operation.signature_hash);
     rehash(&mut bytes);
 
     let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
-        .expect("STREAM_READ import 的 Wire 结构应合法");
+        .expect("stream.read import 的 Wire 结构应合法");
     assert_eq!(
         bind_native_abi(
             metadata.header.abi_family,
             metadata.header.abi_epoch,
             &metadata.imports,
             &metadata.capabilities,
-            NativeAbiPolicy::for_kernel(),
+            NativeAbiPolicy {
+                abi_family: native_abi::ABI_FAMILY_MYGO_NATIVE,
+                abi_epoch: native_abi::ABI_EPOCH,
+                supported_operations: Some(&[OperationId::ProcessExit]),
+            },
         ),
         Err(NativeAbiError::Incompatible(
             native_abi::IncompatibleKind::Operation(OperationId::StreamRead as u32,)
@@ -954,10 +958,10 @@ fn kernel_rejects_unimplemented_required_operation() {
 }
 
 #[test]
-fn kernel_leaves_unimplemented_optional_operation_unbound() {
+fn policy_leaves_unsupported_optional_operation_unbound() {
     let mut bytes = minimal_soyo();
     let operation = native_abi::operation(OperationId::StreamRead)
-        .expect("STREAM_READ 必须在 Native ABI registry 中");
+        .expect("stream.read 必须在 Native ABI registry 中");
     put_u32(&mut bytes, IMPORT_OPERATION_ID, operation.id as u32);
     put_u32(&mut bytes, IMPORT_FLAGS, 2);
     bytes[IMPORT_SIGNATURE_HASH..IMPORT_SIGNATURE_HASH + 32]
@@ -965,20 +969,24 @@ fn kernel_leaves_unimplemented_optional_operation_unbound() {
     rehash(&mut bytes);
 
     let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
-        .expect("optional STREAM_READ import 的 Wire 结构应合法");
+        .expect("optional stream.read import 的 Wire 结构应合法");
     let plan = bind_native_abi(
         metadata.header.abi_family,
         metadata.header.abi_epoch,
         &metadata.imports,
         &metadata.capabilities,
-        NativeAbiPolicy::for_kernel(),
+        NativeAbiPolicy {
+            abi_family: native_abi::ABI_FAMILY_MYGO_NATIVE,
+            abi_epoch: native_abi::ABI_EPOCH,
+            supported_operations: Some(&[OperationId::ProcessExit]),
+        },
     )
-    .expect("内核未实现的 optional operation 应生成未绑定 slot");
+    .expect("policy 不支持的 optional operation 应生成未绑定 slot");
     assert_eq!(plan.call_slots[0].operation, None);
 }
 
 #[test]
-fn known_unimplemented_optional_operation_still_checks_signature() {
+fn known_optional_operation_still_checks_signature() {
     let mut bytes = minimal_soyo();
     put_u32(
         &mut bytes,
@@ -989,7 +997,7 @@ fn known_unimplemented_optional_operation_still_checks_signature() {
     rehash(&mut bytes);
 
     let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
-        .expect("optional STREAM_READ import 的 Wire 结构应合法");
+        .expect("optional stream.read import 的 Wire 结构应合法");
     assert_eq!(
         bind_native_abi(
             metadata.header.abi_family,

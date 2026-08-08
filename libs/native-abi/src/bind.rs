@@ -18,8 +18,11 @@ const KERNEL_SUPPORTED_OPERATIONS: &[OperationId] = &[
     OperationId::HandleClose,
     OperationId::HandleDuplicate,
     OperationId::HandleRestrict,
+    OperationId::StreamRead,
     OperationId::StreamWrite,
     OperationId::ClockRead,
+    OperationId::MemoryAllocate,
+    OperationId::MemoryFree,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

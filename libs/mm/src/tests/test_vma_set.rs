@@ -102,6 +102,36 @@ fn find_gap_no_space() {
     assert!(vmas.find_gap(0x1000..0x3000, 0x500).is_none());
 }
 
+#[ktest]
+fn find_aligned_gap_accepts_exactly_sized_aligned_hole() {
+    let mut vmas = VmaSet::new();
+    vmas.insert(anon_area(0x1000, 0x20_0000)).unwrap();
+    vmas.insert(anon_area(0x20_2000, 0x20_3000)).unwrap();
+
+    assert_eq!(
+        vmas.find_aligned_gap(0x1000..0x20_3000, 0x2000, 0x20_0000),
+        Some(0x20_0000..0x20_2000)
+    );
+}
+
+#[ktest]
+fn find_aligned_gap_rejects_align_up_overflow() {
+    let vmas = VmaSet::new();
+    assert_eq!(
+        vmas.find_aligned_gap((usize::MAX - 0x1000)..usize::MAX, 0x1000, 0x2000),
+        None
+    );
+}
+
+#[ktest]
+fn find_aligned_gap_rejects_short_aligned_tail() {
+    let vmas = VmaSet::new();
+    assert_eq!(
+        vmas.find_aligned_gap(0x1000..0x401000, 0x2000, 0x400000),
+        None
+    );
+}
+
 /// unmap_range 精确匹配一个 VMA 时移除该 VMA。
 #[ktest]
 fn unmap_range_exact_match() {

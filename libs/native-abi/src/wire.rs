@@ -37,7 +37,15 @@ pub mod start_info {
     pub const CALL_SLOT_COUNT: usize = 0x6c;
     pub const RANDOM_SEED: usize = 0x70;
     pub const RUNTIME_FLAGS: usize = 0x90;
-    pub const RESERVED2: usize = 0x98;
+    pub const INIT_ARRAY_OFFSET: usize = 0x98;
+    pub const INIT_ARRAY_COUNT: usize = 0xa0;
+    pub const INIT_ARRAY_ENTRY_SIZE: usize = 0xa4;
+    pub const RESERVED2: usize = 0xa6;
+    pub const FINI_ARRAY_OFFSET: usize = 0xa8;
+    pub const FINI_ARRAY_COUNT: usize = 0xb0;
+    pub const FINI_ARRAY_ENTRY_SIZE: usize = 0xb4;
+    pub const RESERVED3: usize = 0xb6;
+    pub const RESERVED4: usize = 0xb8;
 }
 
 pub mod initial_handle {
