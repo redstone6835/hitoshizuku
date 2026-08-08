@@ -1,5 +1,6 @@
 use ktest::ktest;
 
+use core::alloc::{GlobalAlloc, Layout};
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -145,6 +146,53 @@ fn elm_kernel_memory_allocator_enforces_exact_owner() {
     let after = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_direct());
     assert_eq!(after.dynamic_alloc_bytes, before.dynamic_alloc_bytes);
     assert!(after.peak_dynamic_alloc_bytes >= before.peak_dynamic_alloc_bytes);
+}
+
+#[ktest]
+fn elm_context_without_native_guard_does_not_capture_kernel_global_allocations() {
+    let context = ElmContext::new(
+        ELM_MGR_ID,
+        None,
+        Generation::FIRST,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let current = elm_model::enter_current_context(&context).expect("ELM 测试上下文应能进入");
+    let layout = Layout::from_size_align(96, 16).expect("测试布局有效");
+    // Safety: 测试使用同一个 GlobalAlloc 和 Layout 完成分配、释放往返。
+    let pointer = unsafe { GlobalAlloc::alloc(&allocator::KERNEL_ALLOCATOR, layout) };
+    assert!(!pointer.is_null());
+    assert!(
+        allocator::KERNEL_ALLOCATOR
+            .query_tracked_allocation(pointer as usize)
+            .is_err(),
+        "只有原生 Guard 内的 ELM 代码才能取得隐式分配 owner"
+    );
+    // Safety: pointer 来自上面的同一个 allocator，layout 未改变。
+    unsafe { GlobalAlloc::dealloc(&allocator::KERNEL_ALLOCATOR, pointer, layout) };
+    drop(current);
+}
+
+#[ktest]
+fn elm_native_guard_captures_kernel_global_allocations() {
+    let guard = general::elm_guard::ElmGuard::enter(
+        ELM_MGR_ID.0,
+        general::elm_guard::ELM_GUARD_PHASE_HOOK,
+        0,
+    )
+    .expect("ELM 原生 Guard 应能进入");
+    let layout = Layout::from_size_align(96, 16).expect("测试布局有效");
+    // Safety: 测试使用同一个 GlobalAlloc 和 Layout 完成分配、释放往返。
+    let pointer = unsafe { GlobalAlloc::alloc(&allocator::KERNEL_ALLOCATOR, layout) };
+    assert!(!pointer.is_null());
+    let record = allocator::KERNEL_ALLOCATOR
+        .query_tracked_allocation(pointer as usize)
+        .expect("Guard 内的 ELM 分配应被追踪");
+    assert_eq!(record.accounting_owner(), ELM_MGR_ID.0);
+    // Safety: pointer 来自上面的同一个 allocator，layout 未改变。
+    unsafe { GlobalAlloc::dealloc(&allocator::KERNEL_ALLOCATOR, pointer, layout) };
+    drop(guard);
 }
 
 fn push_owned_resource_trace(stage: u64, handle: u64) -> Result<(), i32> {

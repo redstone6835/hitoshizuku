@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 
 use allocator::{AllocationAccountingOps, register_allocation_accounting_ops};
-use elm_model::{ElmId, ElmResourceBudget, current_cell};
+use elm_model::{ElmId, ElmResourceBudget};
 use sched::sync::Spinlock;
 
 const RESOURCE_ACCOUNTING_CAPACITY: usize = 1024;
@@ -400,7 +400,7 @@ fn finish_native_call(
 }
 
 fn allocation_current_owner() -> u64 {
-    current_cell().map(|cell| cell.0).unwrap_or(0)
+    general::elm_guard::active_cell()
 }
 
 fn allocation_try_reserve(owner: u64, bytes: u64) -> bool {
