@@ -4,7 +4,7 @@
 //! 本模块统一重导出所有公共符号，保持 `use crate::riscv64::specific::*` 的
 //! 对外接口不变。HartLocal（per-hart 数据）因跨模块性质保留在此处。
 
-use core::mem::offset_of;
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // 子模块重导出
@@ -57,6 +57,7 @@ pub struct HartLocal {
     /// 当前 CpuSchedState 中聚合返回工作 hint 的稳定地址。
     pub cpu_user_return_work: usize,
 }
+const _: () = assert!(offset_of!(HartLocal, logical_id) == size_of::<usize>());
 /// 最终 return-to-user 窗口使用的紧急栈可用大小。
 ///
 /// debug 构建中的 trap/scheduler/allocator 调用链可能超过 8 KiB，因此保留 32 KiB；

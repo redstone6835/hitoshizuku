@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := kernel
 
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
-	kernel-la kernel-rv syscall-bench-rv mm-bench-rv all clean cargo-setup \
+	kernel-la kernel-rv kcsan-la kcsan-rv syscall-bench-rv mm-bench-rv all clean cargo-setup \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -32,6 +32,25 @@ INITRAMFS ?=
 INSTALL_MOD_PATH ?=
 KERNEL_MAP ?=
 KERNEL_PUBLISH_OUTPUT ?=
+KCSAN_BUILD ?= 0
+
+KCSAN_RUSTC_WRAPPER := $(abspath scripts/kcsan-rustc-wrapper.sh)
+KCSAN_BUILD_DIR := $(abspath build/kcsan)
+KCSAN_TARGET_DIR := $(abspath target/kcsan)
+KCSAN_WRAPPER_ENV := $(if $(and $(filter 1,$(KCSAN_BUILD)),$(filter kcsan,$(FEATURES))),RUSTC_WRAPPER=$(KCSAN_RUSTC_WRAPPER),)
+KERNEL_INTERFACE_TARGET_DIR := $(if $(filter 1,$(KCSAN_BUILD)),$(abspath $(BUILD_DIR)/cargo-kernel-interface-target),$(CARGO_TARGET_DIR))
+KERNEL_INTERFACE_BUILD_ENV := $(if $(filter 1,$(KCSAN_BUILD)),env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_TARGET_DIR=$(KERNEL_INTERFACE_TARGET_DIR),)
+
+ifneq ($(filter kcsan,$(FEATURES)),)
+ifeq ($(KCSAN_BUILD),0)
+ifeq ($(strip $(MAKECMDGOALS)),)
+$(error KCSAN 调试构建必须使用 make kcsan-la 或 make kcsan-rv)
+endif
+ifneq ($(strip $(filter-out kcsan-la kcsan-rv clean,$(MAKECMDGOALS))),)
+$(error KCSAN 调试构建必须使用独立的 kcsan-la/kcsan-rv 目标)
+endif
+endif
+endif
 
 empty :=
 space := $(empty) $(empty)
@@ -150,10 +169,12 @@ defconfig: $(ELM_TOOL)
 define build_modules
 	rm -rf $(BUILD_DIR)/$(1)/modules $(ELM_INTERFACE_ROOT)/$(2)
 	env -u ELM_INTEGRATED_ARCHIVES -u ELM_BUILD_BOUND_MANIFEST -u INITRAMFS \
-		cargo build -p kernel --target $(2) $(BOOTSTRAP_FEATURE_ARGS) --release
-	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(2)/release/kernel \
+		$(KERNEL_INTERFACE_BUILD_ENV) cargo build -p kernel --target $(2) $(BOOTSTRAP_FEATURE_ARGS) --release
+	CARGO_TARGET_DIR=$(KERNEL_INTERFACE_TARGET_DIR) \
+		$(ELM_TOOL) elm profile-export $(KERNEL_INTERFACE_TARGET_DIR)/$(2)/release/kernel \
 		--target $(2) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(2)
-	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(2)) \
+	env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+		ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(2)) \
 		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) \
 		--target $(2) --output $(BUILD_DIR)/$(1)/modules $(ELM_DRIVER_FEATURE_ARGS)
 endef
@@ -172,7 +193,7 @@ define build_kernel
 		KERNEL_LINK_SOURCE="$(if $(strip $(KERNEL_MAP)),$(abspath $(CARGO_TARGET_DIR)/$(2)/release/kernel))" \
 		KERNEL_LINK_TARGET="$(if $(strip $(KERNEL_MAP)),$(2))" \
 		KERNEL_LINK_ROOT_OUTPUT="$(if $(and $(strip $(KERNEL_MAP)),$(strip $(KERNEL_PUBLISH_OUTPUT))),$(abspath $(KERNEL_PUBLISH_OUTPUT)))" \
-		$(ELM_KERNEL_BUILD) $(BUILD_DIR)/$(1)/modules/modules.manifest \
+		$(KCSAN_WRAPPER_ENV) $(ELM_KERNEL_BUILD) $(BUILD_DIR)/$(1)/modules/modules.manifest \
 		$(BUILD_DIR)/$(1)/modules/integrated.archives \
 		cargo build -p kernel --target $(2) $(FEATURE_ARGS) --release
 	$(if $(strip $(KERNEL_MAP)),test -s $(BUILD_DIR)/$(1)/kernel,cp $(CARGO_TARGET_DIR)/$(2)/release/kernel $(BUILD_DIR)/$(1)/kernel)
@@ -361,6 +382,22 @@ kernel-rv: _modules-riscv64 $(PACK_INITRAMFS)
 	$(MAKE) _compat-kernel-riscv64 $(if $(strip $(KERNEL_MAP)),KERNEL_PUBLISH_OUTPUT=$(abspath $(RV_ROOT_KERNEL)))
 	$(if $(strip $(KERNEL_MAP)),test -s $(RV_ROOT_KERNEL),cp $(BUILD_DIR)/$(RV_ARCH)/kernel $(RV_ROOT_KERNEL))
 
+kcsan-la:
+	$(MAKE) kernel-la ARCH=$(LA_ARCH) \
+		FEATURES="$(strip $(filter-out kcsan,$(FEATURES)) kcsan)" \
+		KCSAN_BUILD=1 \
+		BUILD_DIR=$(KCSAN_BUILD_DIR) CARGO_TARGET_DIR=$(KCSAN_TARGET_DIR) \
+		KERNEL_MAP=$(KCSAN_BUILD_DIR)/$(LA_ARCH)/kernel.map \
+		LA_ROOT_KERNEL=$(abspath kernel-la-kcsan) CARGO_PROFILE_RELEASE_DEBUG=2
+
+kcsan-rv:
+	$(MAKE) kernel-rv ARCH=$(RV_ARCH) \
+		FEATURES="$(strip $(filter-out kcsan,$(FEATURES)) kcsan)" \
+		KCSAN_BUILD=1 \
+		BUILD_DIR=$(KCSAN_BUILD_DIR) CARGO_TARGET_DIR=$(KCSAN_TARGET_DIR) \
+		KERNEL_MAP=$(KCSAN_BUILD_DIR)/$(RV_ARCH)/kernel.map \
+		RV_ROOT_KERNEL=$(abspath kernel-rv-kcsan) CARGO_PROFILE_RELEASE_DEBUG=2
+
 _compat-kernel-riscv64:
 	$(eval override INITRAMFS := $(abspath $(BUILD_DIR)/$(RV_ARCH)/compat-initramfs.cpio))
 	$(eval override BASE_KERNEL_FEATURES := $(strip $(FEATURES) embedded-initramfs))
@@ -373,6 +410,7 @@ all: kernel-la kernel-rv
 clean:
 	cargo clean
 	rm -rf $(BUILD_DIR)/loongarch64 $(BUILD_DIR)/riscv64 $(ELM_INTERFACE_ROOT) \
-		$(ELM_TOOL_TARGET)
+		$(ELM_TOOL_TARGET) $(KCSAN_BUILD_DIR) $(KCSAN_TARGET_DIR)
 	rm -f $(LA_ROOT_KERNEL) $(RV_ROOT_KERNEL) \
-		$(LA_ROOT_KERNEL).lock $(RV_ROOT_KERNEL).lock
+		$(LA_ROOT_KERNEL).lock $(RV_ROOT_KERNEL).lock \
+		kernel-la-kcsan kernel-rv-kcsan kernel-la-kcsan.lock kernel-rv-kcsan.lock
