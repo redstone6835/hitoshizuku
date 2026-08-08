@@ -52,6 +52,8 @@ impl AllocatorCapabilityFlags {
     pub const BUDDY_STRUCTURE_AUDIT: Self = Self(1 << 7);
     pub const CACHE_RECLAIM: Self = Self(1 << 10);
     pub const HOTSPOT_SUMMARY: Self = Self(1 << 11);
+    pub const SELECTIVE_TRACKING: Self = Self(1 << 16);
+    pub const OWNER_RANGE_INDEX: Self = Self(1 << 17);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -68,7 +70,9 @@ impl AllocatorCapabilityFlags {
                 | Self::KHEAP_STRUCTURE_AUDIT.0
                 | Self::BUDDY_STRUCTURE_AUDIT.0
                 | Self::CACHE_RECLAIM.0
-                | Self::HOTSPOT_SUMMARY.0,
+                | Self::HOTSPOT_SUMMARY.0
+                | Self::SELECTIVE_TRACKING.0
+                | Self::OWNER_RANGE_INDEX.0,
         )
     }
 

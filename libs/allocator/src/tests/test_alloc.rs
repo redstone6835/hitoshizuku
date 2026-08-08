@@ -49,6 +49,10 @@ fn global_owner_zero_allocation_is_not_tracked() {
             .query_tracked_allocation(ptr as usize)
             .is_err()
     );
+    assert_eq!(
+        KERNEL_ALLOCATOR.owner_allocation_stats(0),
+        crate::AllocationOwnerStats::default()
+    );
 
     let failures_before = KERNEL_ALLOCATOR.stats().ownership_failures;
     unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, ptr, layout) };
@@ -76,6 +80,65 @@ fn explicit_allocation_remains_tracked() {
             .query_tracked_allocation(record.ptr)
             .is_err()
     );
+}
+
+/// ELM 所有者对象应进入范围索引，并在释放后撤销授权。
+#[ktest]
+fn owned_range_index_tracks_lifecycle() {
+    const OWNER: u64 = 1;
+    let record = KERNEL_ALLOCATOR
+        .allocate_owned(OWNER, MemoryRequest::new(MemoryDomain::Kernel, 128, 16))
+        .expect("allocate owned object");
+    assert!(KERNEL_ALLOCATOR.query_owned_range(OWNER, record.ptr, 1));
+    assert!(KERNEL_ALLOCATOR.query_owned_range(OWNER, record.ptr + 64, 32));
+    assert!(!KERNEL_ALLOCATOR.query_owned_range(OWNER, record.ptr, record.usable_size + 1));
+    assert!(!KERNEL_ALLOCATOR.query_owned_range(OWNER + 1, record.ptr, 1));
+    let stats = KERNEL_ALLOCATOR.owner_allocation_stats(OWNER);
+    assert_eq!(stats.records, 1);
+    assert_eq!(stats.small_records, 1);
+    assert_eq!(stats.requested_bytes, 128);
+    assert!(KERNEL_ALLOCATOR.owner_index_audit().is_consistent());
+
+    KERNEL_ALLOCATOR
+        .deallocate_owned(OWNER, record.ptr)
+        .expect("deallocate owned object");
+    assert!(!KERNEL_ALLOCATOR.query_owned_range(OWNER, record.ptr, 1));
+    assert_eq!(KERNEL_ALLOCATOR.owner_allocation_stats(OWNER).records, 0);
+}
+
+/// 删除 owner 当前最大对象后，最大值应反映仍存活的对象。
+#[ktest]
+fn owned_range_index_recomputes_largest_after_delete() {
+    const OWNER: u64 = 2;
+    let large = KERNEL_ALLOCATOR
+        .allocate_owned(OWNER, MemoryRequest::new(MemoryDomain::Kernel, 512, 16))
+        .expect("allocate large owned object");
+    let small = KERNEL_ALLOCATOR
+        .allocate_owned(OWNER, MemoryRequest::new(MemoryDomain::Kernel, 64, 16))
+        .expect("allocate small owned object");
+
+    let during = KERNEL_ALLOCATOR.owner_allocation_stats(OWNER);
+    assert_eq!(during.records, 2);
+    assert_eq!(during.largest_requested_bytes, 512);
+    assert_eq!(
+        during.largest_usable_bytes,
+        large.usable_size.max(large.size)
+    );
+
+    KERNEL_ALLOCATOR
+        .deallocate_owned(OWNER, large.ptr)
+        .expect("deallocate large owned object");
+    let after = KERNEL_ALLOCATOR.owner_allocation_stats(OWNER);
+    assert_eq!(after.records, 1);
+    assert_eq!(after.largest_requested_bytes, small.size);
+    assert_eq!(
+        after.largest_usable_bytes,
+        small.usable_size.max(small.size)
+    );
+
+    KERNEL_ALLOCATOR
+        .deallocate_owned(OWNER, small.ptr)
+        .expect("deallocate small owned object");
 }
 
 /// 分配后释放，双向均返回 Ok。
@@ -397,6 +460,12 @@ fn allocation_query_helpers_report_record_fields() {
         KERNEL_ALLOCATOR
             .query_tracked_allocation(record.ptr)
             .expect("query tracked record"),
+        record
+    );
+    assert_eq!(
+        KERNEL_ALLOCATOR
+            .query_containing_allocation(record.ptr + 8, 16)
+            .expect("query containing record"),
         record
     );
     assert!(KERNEL_ALLOCATOR.owns_allocation(record.ptr));
@@ -1379,6 +1448,8 @@ fn allocator_capabilities_report_stable_external_api() {
     assert!(caps.supports(AllocatorCapabilityFlags::KHEAP_STRUCTURE_AUDIT));
     assert!(caps.supports(AllocatorCapabilityFlags::CACHE_RECLAIM));
     assert!(caps.supports(AllocatorCapabilityFlags::HOTSPOT_SUMMARY));
+    assert!(caps.supports(AllocatorCapabilityFlags::SELECTIVE_TRACKING));
+    assert!(caps.supports(AllocatorCapabilityFlags::OWNER_RANGE_INDEX));
 
     let counter = KERNEL_ALLOCATOR.audit_counters();
     assert!(counter.is_consistent());
@@ -1530,6 +1601,27 @@ fn physical_api_updates_registry_audit() {
         before.registry_physical_records
     );
     assert!(!KERNEL_ALLOCATOR.owns_allocation(allocation.paddr));
+}
+
+/// 非零 owner 的物理页必须进入 owner 索引，并能正常释放。
+#[ktest]
+fn physical_api_tracks_nonzero_owner_lifecycle() {
+    const OWNER: u64 = 1;
+    let allocation = KERNEL_ALLOCATOR
+        .allocate_physical(
+            PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE).with_accounting_owner(OWNER),
+        )
+        .expect("allocate owned physical page");
+
+    let stats = KERNEL_ALLOCATOR.owner_allocation_stats(OWNER);
+    assert_eq!(stats.records, 1);
+    assert_eq!(stats.physical_records, 1);
+    assert!(KERNEL_ALLOCATOR.owner_index_audit().is_consistent());
+
+    KERNEL_ALLOCATOR
+        .try_free_physical(allocation)
+        .expect("free owned physical page");
+    assert_eq!(KERNEL_ALLOCATOR.owner_allocation_stats(OWNER).records, 0);
 }
 
 /// 只保存 paddr 的外部子系统应通过 allocator 反查 registry 释放物理页。

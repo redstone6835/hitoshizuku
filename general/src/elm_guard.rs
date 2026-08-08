@@ -702,8 +702,7 @@ pub fn validate_current_memory_range(address: usize, len: usize, write: bool) ->
     }
     let cell = frame.cell.load(Ordering::Acquire);
     allocator::KERNEL_ALLOCATOR
-        .query_containing_allocation(address, len)
-        .is_ok_and(|record| record.accounting_owner() == cell)
+        .query_owned_range(cell, address, len)
 }
 
 /// 返回当前 ELM 调用已经由装载器验证的代码和镜像边界。

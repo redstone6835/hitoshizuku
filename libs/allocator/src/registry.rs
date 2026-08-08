@@ -124,11 +124,11 @@ pub struct AllocationRegistrySnapshot {
     pub audit: AllocationRegistryAudit,
 }
 
-/// 指定外部所有者仍存活的分配记录摘要。
+/// 指定非零外部所有者仍存活的分配记录摘要。
 ///
-/// 该快照直接扫描 allocator registry，不分配内存，也不暴露对象地址。它用于在 ELM
-/// 退役被资源账本阻塞时区分普通堆对象、大对象和显式物理页泄漏。
-#[derive(Clone, Copy, Debug, Default)]
+/// 该快照由 owner index 维护，不分配内存，也不暴露对象地址。它用于在 ELM 退役被
+/// 资源账本阻塞时区分普通堆对象、大对象和显式物理页泄漏。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocationOwnerStats {
     pub records: usize,
     pub requested_bytes: usize,
@@ -584,8 +584,8 @@ impl AllocationRegistry {
 
     /// 查询完整覆盖给定地址范围的活跃分配记录。
     ///
-    /// 注册表按分配起点散列，内部指针无法直接命中桶，因此该接口会遍历各 shard。
-    /// 它只用于跨 ABI 裸指针校验，不应放进常规分配热路径。
+    /// 这是旧 ELM ABI 的兼容冷路径。注册表按分配起点散列，内部指针无法直接命中桶，
+    /// 因此调用会遍历各 shard；新代码应使用按 owner 建立的范围索引。
     pub fn find_containing(&self, ptr: usize, len: usize) -> Option<AllocationRecord> {
         if ptr == 0 || len == 0 {
             return None;
@@ -655,10 +655,6 @@ impl AllocationRegistry {
             }
         };
         Ok(read_node_record(node_addr))
-    }
-
-    pub fn remove(&self, ptr: usize) -> Option<AllocationRecord> {
-        self.remove_result(ptr).ok()
     }
 
     pub fn remove_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
@@ -899,62 +895,6 @@ impl AllocationRegistry {
             }
         }
         AllocationRegistrySnapshot { stats, audit: out }
-    }
-
-    /// 扫描指定外部所有者仍存活的分配记录。
-    pub fn owner_stats(&self, owner: u64) -> AllocationOwnerStats {
-        let mut out = AllocationOwnerStats::default();
-        for shard in &self.shards {
-            let inner = shard.inner.lock();
-            if !inner.initialized
-                || inner.buckets.is_null()
-                || inner.bucket_lengths.is_null()
-                || inner.bucket_count == 0
-            {
-                out.scan_errors = out.scan_errors.saturating_add(1);
-                continue;
-            }
-            for bucket in 0..inner.bucket_count {
-                let mut current = bucket_head(&inner, bucket);
-                let mut visited = 0usize;
-                while current != 0 {
-                    if visited >= inner.nodes_allocated {
-                        out.scan_errors = out.scan_errors.saturating_add(1);
-                        break;
-                    }
-                    let node = read_node(current);
-                    let record = node.record.into_record();
-                    if record.accounting_owner() == owner {
-                        out.records = out.records.saturating_add(1);
-                        out.requested_bytes = out.requested_bytes.saturating_add(record.size);
-                        out.usable_bytes = out
-                            .usable_bytes
-                            .saturating_add(record.usable_size.max(record.size));
-                        out.largest_requested_bytes = out.largest_requested_bytes.max(record.size);
-                        out.largest_usable_bytes = out
-                            .largest_usable_bytes
-                            .max(record.usable_size.max(record.size));
-                        match record.kind {
-                            AllocationKind::Boot => {
-                                out.boot_records = out.boot_records.saturating_add(1)
-                            }
-                            AllocationKind::Small => {
-                                out.small_records = out.small_records.saturating_add(1)
-                            }
-                            AllocationKind::Large => {
-                                out.large_records = out.large_records.saturating_add(1)
-                            }
-                            AllocationKind::Physical => {
-                                out.physical_records = out.physical_records.saturating_add(1)
-                            }
-                        }
-                    }
-                    current = node.next;
-                    visited = visited.saturating_add(1);
-                }
-            }
-        }
-        out
     }
 
     fn shard_for_hash(&self, hash: usize) -> &RegistryShard {

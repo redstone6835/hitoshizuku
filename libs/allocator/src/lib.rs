@@ -85,6 +85,7 @@ mod error;
 pub use direct_symbols::catalog_anchor as kernel_symbol_catalog_anchor;
 mod kheap;
 mod metadata;
+mod owner_index;
 mod registry;
 mod request;
 mod slab;
@@ -145,6 +146,7 @@ use boot::BootAllocator;
 use buddy::BuddyAllocator;
 use kheap::KernelHeap;
 use metadata::MetadataAllocator;
+use owner_index::OwnerAllocationIndex;
 use registry::AllocationRegistry;
 use slab::SlabAllocator;
 
@@ -161,6 +163,10 @@ pub use kheap::{
     KernelHeapReclaimStats, KernelHeapStats,
 };
 pub use metadata::MetadataStats;
+pub use owner_index::{
+    OwnerAllocationIndex as AllocationOwnerIndex, OwnerIndexAudit, OwnerIndexAuditFlags,
+    OwnerIndexError,
+};
 pub use registry::{
     AllocationOwnerStats, AllocationRegistryAudit, AllocationRegistryAuditFlags,
     AllocationRegistrySnapshot, AllocationRegistryStats, RegistryPathCounters,
@@ -289,6 +295,7 @@ pub struct KernelMemorySubsystem {
     tracked_slab: SlabAllocator,
     metadata: MetadataAllocator,
     registry: AllocationRegistry,
+    owner_index: OwnerAllocationIndex,
     init_lock: Mutex<()>,
     active: AtomicBool,
     phys_to_virt: AtomicUsize,
@@ -408,6 +415,7 @@ impl KernelMemorySubsystem {
             tracked_slab: SlabAllocator::new(crate::space::ArenaKind::Tracked),
             metadata: MetadataAllocator::new(),
             registry: AllocationRegistry::new(),
+            owner_index: OwnerAllocationIndex::new(),
             init_lock: Mutex::new(()),
             active: AtomicBool::new(false),
             phys_to_virt: AtomicUsize::new(0),
@@ -620,6 +628,9 @@ impl KernelMemorySubsystem {
             return Err(InitError::MissingKernelHeapMappingOps);
         }
         if !self.registry.init(&self.boot) {
+            return Err(InitError::MetadataOutOfMemory);
+        }
+        if !self.owner_index.init() {
             return Err(InitError::MetadataOutOfMemory);
         }
         if let Some(range) = self.boot.seal_and_take_free_tail(PAGE_SIZE) {
@@ -1002,9 +1013,19 @@ impl KernelMemorySubsystem {
             .saturating_add(self.tracked_slab.profile_counter(cpu, counter))
     }
 
-    /// 返回指定外部所有者当前仍存活的 allocator 分配摘要。
+    /// 返回指定非零外部所有者当前仍存活的 allocator 分配摘要。
+    ///
+    /// `owner=0` 表示普通内核分配，不属于外部所有者；此时直接返回空摘要，不访问
+    /// registry 或 owner index。
     pub fn owner_allocation_stats(&self, owner: u64) -> AllocationOwnerStats {
-        self.registry.owner_stats(owner)
+        if owner == 0 {
+            return AllocationOwnerStats::default();
+        }
+        self.owner_index.stats(owner)
+    }
+
+    pub fn owner_index_audit(&self) -> OwnerIndexAudit {
+        self.owner_index.audit()
     }
 
     /// 扫描 registry 内部链表并返回结构审计结果。
@@ -1069,7 +1090,30 @@ impl KernelMemorySubsystem {
         {
             let record = physical_record_from_allocation(request, allocation, accounting_owner);
             match self.registry.register_result(&self.boot, record) {
-                Ok(()) => Ok(allocation),
+                Ok(()) => match self.owner_index.track(record) {
+                    Ok(()) => Ok(allocation),
+                    Err(owner_err) => {
+                        match self.registry.remove_result(record.ptr) {
+                            Ok(removed) if removed == record => {}
+                            Ok(removed) => panic!(
+                                "[alloc][invariant] physical owner index rollback removed unexpected record: expected={:?} removed={:?}",
+                                record, removed
+                            ),
+                            Err(registry_err) => panic!(
+                                "[alloc][invariant] physical owner index rollback lost registry record: paddr={:#x} owner_err={:?} registry_err={:?}",
+                                record.ptr, owner_err, registry_err
+                            ),
+                        }
+                        if !self.free_physical_raw(allocation) {
+                            panic!(
+                                "[alloc][invariant] physical owner index rollback failed to release buddy block: paddr={:#x} owner_err={:?}",
+                                record.ptr, owner_err
+                            );
+                        }
+                        release_accounting(accounting_owner, request.size);
+                        Err(buddy_alloc_error_from_owner_index(owner_err))
+                    }
+                },
                 Err(err) => {
                     let _ = self.free_physical_raw(allocation);
                     release_accounting(accounting_owner, request.size);
@@ -1125,13 +1169,28 @@ impl KernelMemorySubsystem {
             return Err(PhysicalFreeError::Registry(RegistryError::NotInitialized));
         }
 
-        let record = match self.registry.remove_result(paddr) {
+        let record = match self.registry.get_result(paddr) {
             Ok(record) => record,
             Err(RegistryError::UnknownPointer) => return Err(PhysicalFreeError::UnknownPointer),
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
+        if let Err(err) = self.owner_index.untrack(record) {
+            panic!(
+                "[alloc][invariant] owner index rejected physical free: paddr={:#x} owner={} err={:?}",
+                paddr,
+                record.accounting_owner(),
+                err
+            );
+        }
+        let record = match self.registry.remove_result(paddr) {
+            Ok(record) => record,
+            Err(err) => {
+                self.restore_owner_index_or_panic(record, "physical registry remove failure");
+                return Err(PhysicalFreeError::Registry(err));
+            }
+        };
         if record.kind != AllocationKind::Physical {
-            let _ = self.registry.register_result(&self.boot, record);
+            self.restore_tracked_record_or_panic(record, "physical kind validation failure");
             return Err(PhysicalFreeError::InvalidRecordKind {
                 actual: record.kind,
             });
@@ -1139,7 +1198,7 @@ impl KernelMemorySubsystem {
 
         let allocation = physical_allocation_from_record(record);
         if allocation.paddr != paddr {
-            let _ = self.registry.register_result(&self.boot, record);
+            self.restore_tracked_record_or_panic(record, "physical address validation failure");
             return Err(PhysicalFreeError::AddressMismatch {
                 expected: allocation.paddr,
                 actual: paddr,
@@ -1152,7 +1211,7 @@ impl KernelMemorySubsystem {
                 Ok(())
             }
             Err(err) => {
-                let _ = self.registry.register_result(&self.boot, record);
+                self.restore_tracked_record_or_panic(record, "physical buddy release failure");
                 Err(PhysicalFreeError::Buddy(err))
             }
         }
@@ -1174,16 +1233,32 @@ impl KernelMemorySubsystem {
                 .map_err(PhysicalFreeError::Buddy);
         }
 
-        let record = match self.registry.remove_result(allocation.paddr) {
+        let record = match self.registry.get_result(allocation.paddr) {
             Ok(record) => record,
             Err(RegistryError::UnknownPointer) => return Err(PhysicalFreeError::UnknownPointer),
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
 
+        if let Err(err) = self.owner_index.untrack(record) {
+            panic!(
+                "[alloc][invariant] owner index rejected physical free: paddr={:#x} owner={} err={:?}",
+                allocation.paddr,
+                record.accounting_owner(),
+                err
+            );
+        }
+        let record = match self.registry.remove_result(allocation.paddr) {
+            Ok(record) => record,
+            Err(err) => {
+                self.restore_owner_index_or_panic(record, "physical registry remove failure");
+                return Err(PhysicalFreeError::Registry(err));
+            }
+        };
+
         if let Err(err) = validate_physical_free_record(record, allocation) {
             // 调用方传入的句柄和 registry 中活跃记录不一致，说明这不是一次合法的
             // 所有权释放。物理页仍由原记录持有，必须先恢复账本再返回类型化错误。
-            let _ = self.registry.register_result(&self.boot, record);
+            self.restore_tracked_record_or_panic(record, "physical handle validation failure");
             return Err(err);
         }
 
@@ -1195,7 +1270,7 @@ impl KernelMemorySubsystem {
             Err(err) => {
                 // buddy 拒绝释放时，物理页实际仍由调用方持有；必须恢复 registry
                 // 账本，否则下一次释放会变成未知指针，审计也会漏掉该页。
-                let _ = self.registry.register_result(&self.boot, record);
+                self.restore_tracked_record_or_panic(record, "physical buddy release failure");
                 Err(PhysicalFreeError::Buddy(err))
             }
         }
@@ -1298,8 +1373,8 @@ impl KernelMemorySubsystem {
 
     /// 查询完整覆盖给定范围的逐对象分配记录。
     ///
-    /// 该接口用于 ELM 等跨 ABI 边界验证内部指针；返回成功只证明范围仍属于一个活跃
-    /// 分配，调用方仍必须检查记录中的资源所有者和访问权限。
+    /// 这是旧 ELM ABI 的兼容冷路径，会扫描 registry。新调用方应携带 owner 并使用
+    /// [`KernelMemorySubsystem::query_owned_range`]，避免全表扫描。
     pub fn query_containing_allocation(
         &self,
         ptr: usize,
@@ -1308,6 +1383,13 @@ impl KernelMemorySubsystem {
         self.registry
             .find_containing(ptr, len)
             .ok_or(OwnershipError::UnknownPointer)
+    }
+
+    /// 查询指定 owner 是否完整拥有一个 tracked 动态内存范围。
+    ///
+    /// 查询只访问该 owner 的有序范围树，不扫描其它 owner 或普通内核对象。
+    pub fn query_owned_range(&self, owner: u64, ptr: usize, len: usize) -> bool {
+        self.owner_index.contains(owner, ptr, len)
     }
 
     /// 为一个非零外部所有者创建普通 Kernel 域分配。
@@ -1552,8 +1634,28 @@ impl KernelMemorySubsystem {
 
         let record = self
             .registry
-            .remove(ptr)
+            .get(ptr)
             .ok_or(DeallocationError::UnknownPointer)?;
+        if let Err(err) = self.owner_index.untrack(record) {
+            panic!(
+                "[alloc][invariant] owner index rejected tracked free: ptr={:#x} owner={} err={:?}",
+                ptr,
+                record.accounting_owner(),
+                err
+            );
+        }
+        let record = match self.registry.remove_result(ptr) {
+            Ok(record) => record,
+            Err(err) => {
+                if let Err(restore_err) = self.owner_index.track(record) {
+                    panic!(
+                        "[alloc][invariant] failed to restore owner index after registry remove failure: ptr={:#x} remove={:?} restore={:?}",
+                        ptr, err, restore_err
+                    );
+                }
+                return Err(DeallocationError::UnknownPointer);
+            }
+        };
         let (slab, kheap) = match record.arena {
             Some(AllocationArena::Tracked) => (&self.tracked_slab, &self.tracked_kheap),
             Some(AllocationArena::Kernel) => (&self.slab, &self.kheap),
@@ -2145,9 +2247,23 @@ impl KernelMemorySubsystem {
     ) where
         F: FnOnce(),
     {
+        if let Err(err) = self.owner_index.untrack(expected) {
+            cleanup_new();
+            panic!(
+                "[alloc][invariant] reallocate could not remove old owner range: ptr={:#x} err={:?}",
+                ptr, err
+            );
+        }
         let removed = match self.registry.remove_result(ptr) {
             Ok(record) => record,
             Err(err) => {
+                if let Err(restore_err) = self.owner_index.track(expected) {
+                    cleanup_new();
+                    panic!(
+                        "[alloc][invariant] reallocate owner range restore failed: ptr={:#x} remove={:?} restore={:?}",
+                        ptr, err, restore_err
+                    );
+                }
                 cleanup_new();
                 panic!(
                     "[alloc][invariant] reallocate lost old registry record: ptr={:#x} err={:?}",
@@ -2156,6 +2272,7 @@ impl KernelMemorySubsystem {
             }
         };
         if removed != expected {
+            self.restore_owner_index_or_panic(removed, "reallocate removed unexpected record");
             cleanup_new();
             panic!(
                 "[alloc][invariant] reallocate removed unexpected record: ptr={:#x} expected={:?} removed={:?}",
@@ -2190,6 +2307,14 @@ impl KernelMemorySubsystem {
             let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
             return Err(err);
         }
+        if let Err(err) = self.owner_index.update(record, updated) {
+            let _ = self.registry.update_existing_result(ptr, record);
+            let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
+            panic!(
+                "[alloc][invariant] owner range update failed after registry resize: ptr={:#x} err={:?}",
+                ptr, err
+            );
+        }
         Ok(TrackedReallocProbe::Updated {
             old_size: record.size,
             record: updated,
@@ -2213,6 +2338,28 @@ impl KernelMemorySubsystem {
             .fetch_add(layout.size() as u64, Ordering::Relaxed);
     }
 
+    fn restore_owner_index_or_panic(&self, record: AllocationRecord, context: &str) {
+        if let Err(err) = self.owner_index.track(record) {
+            panic!(
+                "[alloc][invariant] {}: owner index restore failed ptr={:#x} owner={} err={:?}",
+                context,
+                record.ptr,
+                record.accounting_owner(),
+                err
+            );
+        }
+    }
+
+    fn restore_tracked_record_or_panic(&self, record: AllocationRecord, context: &str) {
+        self.restore_owner_index_or_panic(record, context);
+        if let Err(err) = self.registry.register_result(&self.boot, record) {
+            panic!(
+                "[alloc][invariant] {}: registry restore failed ptr={:#x} err={:?}",
+                context, record.ptr, err
+            );
+        }
+    }
+
     fn register_allocation<F>(
         &self,
         record: AllocationRecord,
@@ -2222,10 +2369,19 @@ impl KernelMemorySubsystem {
         F: FnOnce(),
     {
         match self.registry.register_result(&self.boot, record) {
-            Ok(()) => {
-                /* ... */
-                Ok(())
-            }
+            Ok(()) => match self.owner_index.track(record) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if let Err(remove_err) = self.registry.remove_result(record.ptr) {
+                        panic!(
+                            "[alloc][invariant] owner index failure could not roll back registry: ptr={:#x} owner_err={:?} registry_err={:?}",
+                            record.ptr, err, remove_err
+                        );
+                    }
+                    rollback();
+                    Err(allocation_error_from_owner_index(err))
+                }
+            },
             Err(RegistryError::DuplicatePointer) => {
                 rollback();
                 Err(allocation_error_from_registry(
@@ -2329,6 +2485,32 @@ fn allocation_error_from_registry(err: RegistryError) -> AllocationError {
         RegistryError::InvalidRecord
         | RegistryError::DuplicatePointer
         | RegistryError::UnknownPointer => AllocationError::InvalidLayout,
+    }
+}
+
+fn allocation_error_from_owner_index(err: OwnerIndexError) -> AllocationError {
+    match err {
+        OwnerIndexError::NotInitialized => AllocationError::NotInitialized,
+        OwnerIndexError::MetadataOutOfMemory => AllocationError::OutOfMemory,
+        OwnerIndexError::InvalidOwner
+        | OwnerIndexError::InvalidRange
+        | OwnerIndexError::UnknownOwner
+        | OwnerIndexError::UnknownRange
+        | OwnerIndexError::Overlap
+        | OwnerIndexError::Corrupt => AllocationError::InvalidLayout,
+    }
+}
+
+fn buddy_alloc_error_from_owner_index(err: OwnerIndexError) -> buddy::BuddyAllocError {
+    match err {
+        OwnerIndexError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
+        OwnerIndexError::MetadataOutOfMemory => buddy::BuddyAllocError::MetadataOutOfMemory,
+        OwnerIndexError::Overlap => buddy::BuddyAllocError::BlockNotFree,
+        OwnerIndexError::InvalidOwner
+        | OwnerIndexError::InvalidRange
+        | OwnerIndexError::UnknownOwner
+        | OwnerIndexError::UnknownRange
+        | OwnerIndexError::Corrupt => buddy::BuddyAllocError::InvalidAddress,
     }
 }
 
