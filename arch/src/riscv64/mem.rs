@@ -42,9 +42,9 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         addi    t1, t1, -1
         bnez    t1, .Lrv_copy_align
 
-        /* 每轮 128 字节，分成两个互不重叠的 64 字节读取组。 */
+        /* 每轮 256 字节，分成四个互不重叠的 64 字节读取组。 */
 .Lrv_copy_blocks:
-        li      t0, 128
+        li      t0, 256
         bltu    a2, t0, .Lrv_copy_words
         ld      a3, 0(a1)
         ld      a4, 8(a1)
@@ -78,9 +78,41 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         sd      t0, 104(a0)
         sd      t1, 112(a0)
         sd      t2, 120(a0)
-        addi    a0, a0, 128
-        addi    a1, a1, 128
-        addi    a2, a2, -128
+        ld      a3, 128(a1)
+        ld      a4, 136(a1)
+        ld      a5, 144(a1)
+        ld      a6, 152(a1)
+        ld      a7, 160(a1)
+        ld      t0, 168(a1)
+        ld      t1, 176(a1)
+        ld      t2, 184(a1)
+        sd      a3, 128(a0)
+        sd      a4, 136(a0)
+        sd      a5, 144(a0)
+        sd      a6, 152(a0)
+        sd      a7, 160(a0)
+        sd      t0, 168(a0)
+        sd      t1, 176(a0)
+        sd      t2, 184(a0)
+        ld      a3, 192(a1)
+        ld      a4, 200(a1)
+        ld      a5, 208(a1)
+        ld      a6, 216(a1)
+        ld      a7, 224(a1)
+        ld      t0, 232(a1)
+        ld      t1, 240(a1)
+        ld      t2, 248(a1)
+        sd      a3, 192(a0)
+        sd      a4, 200(a0)
+        sd      a5, 208(a0)
+        sd      a6, 216(a0)
+        sd      a7, 224(a0)
+        sd      t0, 232(a0)
+        sd      t1, 240(a0)
+        sd      t2, 248(a0)
+        addi    a0, a0, 256
+        addi    a1, a1, 256
+        addi    a2, a2, -256
         j       .Lrv_copy_blocks
 
 .Lrv_copy_words:
@@ -324,6 +356,53 @@ pub unsafe extern "C" fn memmove(_dst: *mut u8, _src: *const u8, _len: usize) ->
         bnez    t0, .Lrv_move_reverse_align
 
 .Lrv_move_reverse_blocks:
+        /* 距离至少 64 字节时每轮处理两个块；先完成上方块的读写，
+         * 再访问下方块，即使恰好 64 字节重叠也保持 memmove 语义。 */
+        sub     t3, a0, a1
+        li      t4, 64
+        bltu    t3, t4, .Lrv_move_reverse_blocks_narrow
+        li      t0, 128
+        bltu    a2, t0, .Lrv_move_reverse_blocks_narrow
+        addi    a0, a0, -64
+        addi    a1, a1, -64
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        ld      a7, 32(a1)
+        ld      t0, 40(a1)
+        ld      t1, 48(a1)
+        ld      t2, 56(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        sd      a7, 32(a0)
+        sd      t0, 40(a0)
+        sd      t1, 48(a0)
+        sd      t2, 56(a0)
+        addi    a0, a0, -64
+        addi    a1, a1, -64
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        ld      a7, 32(a1)
+        ld      t0, 40(a1)
+        ld      t1, 48(a1)
+        ld      t2, 56(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        sd      a7, 32(a0)
+        sd      t0, 40(a0)
+        sd      t1, 48(a0)
+        sd      t2, 56(a0)
+        addi    a2, a2, -128
+        j       .Lrv_move_reverse_blocks
+
+.Lrv_move_reverse_blocks_narrow:
         li      t0, 64
         bltu    a2, t0, .Lrv_move_reverse_words
         addi    a0, a0, -64
