@@ -12,7 +12,7 @@ use native_abi::wire::EventRecord;
 use native_abi::{NativeHandle, ObjectInterface, Rights, status, wire};
 use sched::{DeadlineObserver, ProcessExitObserver, Task, TaskState, WaitQueue};
 use vfs::file::{File, PollEvents};
-use vfs::poll_source::PollSubscriber;
+use vfs::poll_source::{PollSource, PollSubscriber};
 
 use super::dispatch::native_return;
 use super::operations::{
@@ -31,9 +31,9 @@ enum SubscriptionKind {
         process: Arc<ProcessObject>,
         backend: u64,
     },
-    Stream {
+    Readiness {
         source_id: u64,
-        file: Arc<File>,
+        source: ReadinessSource,
         backend: u64,
         interest: PollEvents,
         last_generation: u64,
@@ -44,6 +44,25 @@ enum SubscriptionKind {
         interval_ns: u64,
         expirations: u64,
     },
+}
+
+#[derive(Clone)]
+enum ReadinessSource {
+    Stream(Arc<File>),
+    Ring(Arc<super::ring::SubmissionRingObject>),
+    Socket(Arc<super::socket::SocketObject>),
+    Channel(Arc<super::channel::ChannelObject>),
+}
+
+impl ReadinessSource {
+    fn poll_source(&self) -> Option<&PollSource> {
+        match self {
+            Self::Stream(file) => file.poll_source(),
+            Self::Ring(ring) => Some(ring.poll_source()),
+            Self::Socket(socket) => socket.poll_source(),
+            Self::Channel(channel) => Some(channel.poll_source()),
+        }
+    }
 }
 
 struct Subscription {
@@ -240,7 +259,7 @@ impl EventPort {
             else {
                 return false;
             };
-            let SubscriptionKind::Stream {
+            let SubscriptionKind::Readiness {
                 source_id: expected_source,
                 interest,
                 last_generation,
@@ -582,16 +601,16 @@ impl EventPort {
                 .iter()
                 .find(|entry| entry.token == token)
                 .and_then(|entry| match &entry.kind {
-                    SubscriptionKind::Stream { file, .. } => Some(Arc::clone(file)),
+                    SubscriptionKind::Readiness { source, .. } => Some(source.clone()),
                     _ => None,
                 })
         };
-        let file = file?;
-        let source = file.poll_source()?;
-        let (readiness, generation) = source.snapshot();
+        let source = file?;
+        let poll_source = source.poll_source()?;
+        let (readiness, generation) = poll_source.snapshot();
         Some(StreamSnapshot {
             token,
-            source_id: source.id(),
+            source_id: poll_source.id(),
             readiness,
             generation,
         })
@@ -744,21 +763,84 @@ pub(super) fn event_bind(
             SubscriptionKind::Process { process, backend }
         }
         KernelNativeObject::Stream(file) => {
+            let source = ReadinessSource::Stream(file);
             let Some(interest) = stream_interest(mask as u32) else {
                 return native_return(status::CORE_INVALID_ARGUMENT, 0, 0);
             };
-            let Some(source) = file.poll_source() else {
+            let Some(poll_source) = source.poll_source() else {
                 return native_return(status::EVENT_SOURCE_UNSUPPORTED, 0, 0);
             };
-            source.enable_tracking();
+            poll_source.enable_tracking();
             let erased: Arc<dyn PollSubscriber> = observer.clone();
-            let backend = match source.try_subscribe(Arc::downgrade(&erased)) {
+            let backend = match poll_source.try_subscribe(Arc::downgrade(&erased)) {
                 Ok(backend) => backend,
                 Err(()) => return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0),
             };
-            SubscriptionKind::Stream {
-                source_id: source.id(),
-                file,
+            SubscriptionKind::Readiness {
+                source_id: poll_source.id(),
+                source,
+                backend,
+                interest,
+                last_generation: 0,
+            }
+        }
+        KernelNativeObject::SubmissionRing(ring) => {
+            let source = ReadinessSource::Ring(ring);
+            let Some(interest) = stream_interest(mask as u32) else {
+                return native_return(status::CORE_INVALID_ARGUMENT, 0, 0);
+            };
+            let poll_source = source.poll_source().expect("Ring 必须提供 PollSource");
+            poll_source.enable_tracking();
+            let erased: Arc<dyn PollSubscriber> = observer.clone();
+            let backend = match poll_source.try_subscribe(Arc::downgrade(&erased)) {
+                Ok(backend) => backend,
+                Err(()) => return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0),
+            };
+            SubscriptionKind::Readiness {
+                source_id: poll_source.id(),
+                source,
+                backend,
+                interest,
+                last_generation: 0,
+            }
+        }
+        KernelNativeObject::Socket(socket) => {
+            let source = ReadinessSource::Socket(socket);
+            let Some(interest) = stream_interest(mask as u32) else {
+                return native_return(status::CORE_INVALID_ARGUMENT, 0, 0);
+            };
+            let Some(poll_source) = source.poll_source() else {
+                return native_return(status::EVENT_SOURCE_UNSUPPORTED, 0, 0);
+            };
+            poll_source.enable_tracking();
+            let erased: Arc<dyn PollSubscriber> = observer.clone();
+            let backend = match poll_source.try_subscribe(Arc::downgrade(&erased)) {
+                Ok(backend) => backend,
+                Err(()) => return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0),
+            };
+            SubscriptionKind::Readiness {
+                source_id: poll_source.id(),
+                source,
+                backend,
+                interest,
+                last_generation: 0,
+            }
+        }
+        KernelNativeObject::Channel(channel) => {
+            let source = ReadinessSource::Channel(channel);
+            let Some(interest) = stream_interest(mask as u32) else {
+                return native_return(status::CORE_INVALID_ARGUMENT, 0, 0);
+            };
+            let poll_source = source.poll_source().expect("Channel 必须提供 PollSource");
+            poll_source.enable_tracking();
+            let erased: Arc<dyn PollSubscriber> = observer.clone();
+            let backend = match poll_source.try_subscribe(Arc::downgrade(&erased)) {
+                Ok(backend) => backend,
+                Err(()) => return native_return(status::CORE_RESOURCE_EXHAUSTED, 0, 0),
+            };
+            SubscriptionKind::Readiness {
+                source_id: poll_source.id(),
+                source,
                 backend,
                 interest,
                 last_generation: 0,
@@ -788,12 +870,12 @@ pub(super) fn event_bind(
             .iter()
             .find(|entry| entry.token == token)
             .and_then(|entry| match &entry.kind {
-                SubscriptionKind::Stream { file, .. } => Some(Arc::clone(file)),
+                SubscriptionKind::Readiness { source, .. } => Some(source.clone()),
                 _ => None,
             })
     };
-    if let Some(file) = initial_stream
-        && let Some(source) = file.poll_source()
+    if let Some(readiness_source) = initial_stream
+        && let Some(source) = readiness_source.poll_source()
     {
         let (readiness, generation) = source.snapshot();
         port.publish_stream_snapshot(token, source.id(), readiness, generation);
@@ -1033,8 +1115,10 @@ fn cancel_backend(subscription: Subscription) {
         } => {
             process.group().unsubscribe_process_exit(backend);
         }
-        SubscriptionKind::Stream { file, backend, .. } => {
-            if let Some(source) = file.poll_source() {
+        SubscriptionKind::Readiness {
+            source, backend, ..
+        } => {
+            if let Some(source) = source.poll_source() {
                 source.unsubscribe(backend);
             }
         }
@@ -1104,9 +1188,9 @@ mod tests {
             source_handle: token,
             user_data: 0x77,
             observer,
-            kind: SubscriptionKind::Stream {
+            kind: SubscriptionKind::Readiness {
                 source_id: source.id(),
-                file,
+                source: ReadinessSource::Stream(file),
                 backend: 0,
                 interest,
                 last_generation: 0,

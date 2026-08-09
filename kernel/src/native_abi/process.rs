@@ -56,15 +56,15 @@ pub(super) fn image_create(
     user: u64,
     length: u64,
 ) -> NativeCallOutcome {
-    let image = match super::ExecutableImage::copy_from_user(user, length) {
+    let image = match super::ImageObject::copy_from_user(user, length) {
         Ok(image) => image,
         Err(error) => return native_return(error, 0, 0),
     };
     insert_native_handle(
         state,
-        KernelNativeObject::ExecutableImage(image),
-        ObjectInterface::ExecutableImage,
-        Rights::EXECUTE | Rights::DUPLICATE,
+        KernelNativeObject::Image(image),
+        ObjectInterface::Image,
+        Rights::EXECUTE | Rights::LOAD | Rights::INSPECT | Rights::DUPLICATE,
     )
 }
 
@@ -318,7 +318,7 @@ pub(super) fn process_result(group: &ThreadGroup, reaped: bool) -> ProcessResult
 }
 
 type SpawnInputs = (
-    Arc<super::ExecutableImage>,
+    Arc<super::ImageObject>,
     Vec<Vec<u8>>,
     Vec<Vec<u8>>,
     Vec<PreparedNativeCapability>,
@@ -335,12 +335,15 @@ fn prepare_spawn_inputs(
         let handles = state.handles.lock();
         let entry = handles.lookup(
             NativeHandle::from_raw(request.image),
-            Some(ObjectInterface::ExecutableImage),
+            Some(ObjectInterface::Image),
             Rights::EXECUTE,
         )?;
-        let KernelNativeObject::ExecutableImage(image) = entry.object else {
+        let KernelNativeObject::Image(image) = entry.object else {
             return Err(status::HANDLE_WRONG_INTERFACE);
         };
+        if image.kind() != soyo::registry::ArtifactKind::Executable {
+            return Err(status::IMAGE_NOT_EXECUTABLE);
+        }
         Arc::clone(image)
     };
     let argv = read_string_array(request.argv)?;
@@ -523,16 +526,26 @@ mod tests {
     use super::*;
 
     fn test_state(handles: NativeHandleTable<KernelNativeObject>) -> NativeProcessState {
+        let binding = NativeBindingPlan {
+            call_slots: Vec::new(),
+        };
+        let vm = Arc::new(general::mm::VmSpace::new());
+        let handles = Arc::new(sched::sync::Spinlock::new(handles));
+        let components =
+            super::super::component::ComponentManager::new(vm, &binding, Arc::clone(&handles))
+                .expect("测试 component manager 应创建成功");
         NativeProcessState {
-            binding: NativeBindingPlan {
-                call_slots: Vec::new(),
-            },
-            handles: sched::sync::Spinlock::new(handles),
+            binding,
+            handles,
             build_id: [0; 32],
             content_hash: [0; 32],
             image_base: 0,
+            components,
+            vfs_context: None,
             runtime_ranges: sched::sync::Spinlock::new(None),
             allocations: sched::sync::Spinlock::new(Vec::new()),
+            memory_owner_id: super::super::next_memory_owner_id(),
+            mapped_memory_objects: Arc::new(super::super::memory::MemoryMappingRegistry::new()),
         }
     }
 
