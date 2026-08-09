@@ -68,5 +68,12 @@ fn loader_encoder_can_request_nonempty_init_array() {
     let metadata = read_soyo(&SliceSoyoReader::new(&encoded), SoyoReadLimits::portable())
         .expect("host parser 应接受 init array");
     validate_soyo(&metadata, SoyoTargetPolicy::for_host()).expect("host 策略应接受 init array");
-    assert_eq!(metadata.runtime.init_array_count, 1);
+    assert_eq!(
+        metadata
+            .runtime
+            .as_ref()
+            .expect("executable 必须携带 RuntimeInfo")
+            .init_array_count,
+        1
+    );
 }

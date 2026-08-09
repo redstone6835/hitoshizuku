@@ -11,6 +11,12 @@ const SCALARS: &[&str] = &[
     "CAPABILITY_REQUIREMENT_SIZE",
     "RELOCATION_SIZE",
     "RUNTIME_INFO_SIZE",
+    "COMPONENT_INFO_SIZE",
+    "COMPONENT_DEPENDENCY_SIZE",
+    "SYMBOL_IMPORT_SIZE",
+    "SYMBOL_EXPORT_SIZE",
+    "DYNAMIC_RELOCATION_SIZE",
+    "SIGNATURE_SIZE",
 ];
 
 const MODULES: &[(&str, &[&str])] = &[
@@ -127,6 +133,71 @@ const MODULES: &[(&str, &[&str])] = &[
             "RESERVED2",
         ],
     ),
+    (
+        "component_info",
+        &[
+            "COMPONENT_ID",
+            "ABI_ID",
+            "FLAGS",
+            "INIT_OFFSET",
+            "FINI_OFFSET",
+            "INTERFACE_COUNT",
+            "RESERVED0",
+            "CALL_STATE_SIZE",
+            "RESERVED1",
+        ],
+    ),
+    (
+        "component_dependency",
+        &[
+            "COMPONENT_ID",
+            "ABI_ID",
+            "CONTENT_HASH",
+            "FLAGS",
+            "DIAGNOSTIC_NAME_OFFSET",
+            "RESERVED",
+        ],
+    ),
+    (
+        "symbol_import",
+        &[
+            "DEPENDENCY_INDEX",
+            "FLAGS",
+            "INTERFACE_ID",
+            "SYMBOL_ID",
+            "SIGNATURE_HASH",
+            "DIAGNOSTIC_NAME_OFFSET",
+            "RESERVED0",
+            "RESERVED1",
+        ],
+    ),
+    (
+        "symbol_export",
+        &[
+            "INTERFACE_ID",
+            "SYMBOL_ID",
+            "SIGNATURE_HASH",
+            "ENTRY_OFFSET",
+            "FLAGS",
+            "DIAGNOSTIC_NAME_OFFSET",
+            "RESERVED",
+        ],
+    ),
+    (
+        "dynamic_relocation",
+        &[
+            "KIND",
+            "FLAGS",
+            "TARGET_SEGMENT_INDEX",
+            "TARGET_OFFSET",
+            "SOURCE_INDEX",
+            "RESERVED0",
+            "ADDEND",
+            "RESERVED1",
+            "RESERVED2",
+        ],
+    ),
+    ("signature", &["KEY_ID", "SIGNATURE", "FLAGS", "RESERVED"]),
 ];
 
 fn main() {

@@ -792,6 +792,7 @@ fn valid_static_tls_shape_is_accepted() {
     use native_abi::TargetArch;
 
     let header = SoyoHeader {
+        artifact_kind: crate::registry::ArtifactKind::Executable,
         target_arch: TargetArch::Riscv64,
         abi_family: native_abi::ABI_FAMILY_MYGO_NATIVE,
         abi_epoch: 1,

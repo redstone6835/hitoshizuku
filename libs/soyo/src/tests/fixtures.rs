@@ -128,6 +128,82 @@ pub fn minimal_soyo() -> Vec<u8> {
     bytes
 }
 
+pub fn minimal_component_soyo() -> Vec<u8> {
+    const COMPONENT_FILE_SIZE: usize = 8192;
+    const STRING_OFFSET: usize = 384;
+    const SEGMENT_OFFSET: usize = 392;
+    const COMPONENT_INFO_OFFSET: usize = 456;
+    const SYMBOL_EXPORT_OFFSET: usize = 584;
+
+    let mut bytes = vec![0u8; COMPONENT_FILE_SIZE];
+    bytes[0..4].copy_from_slice(b"soyo");
+    put_u16(&mut bytes, 0x04, 1);
+    put_u16(&mut bytes, 0x06, 192);
+    put_u16(&mut bytes, 0x08, 2);
+    put_u16(&mut bytes, HEADER_TARGET_ARCH, 1);
+    bytes[0x0c] = 1;
+    bytes[0x0d] = 64;
+    put_u16(&mut bytes, 0x0e, 1);
+    put_u16(&mut bytes, 0x10, 1);
+    put_u16(&mut bytes, 0x12, 1);
+    put_u64(&mut bytes, HEADER_ENTRY_OFFSET, 0);
+    put_u64(&mut bytes, 0x30, 192);
+    put_u32(&mut bytes, HEADER_TABLE_COUNT, 4);
+    put_u16(&mut bytes, 0x3c, 48);
+    put_u64(&mut bytes, HEADER_FILE_SIZE, COMPONENT_FILE_SIZE as u64);
+    put_u64(&mut bytes, HEADER_IMAGE_VIRTUAL_SIZE, 4096);
+
+    put_directory(&mut bytes, 0, 1, 1, 1, 8, STRING_OFFSET as u64, 8, 1);
+    put_directory(&mut bytes, 1, 2, 1, 64, 1, SEGMENT_OFFSET as u64, 64, 8);
+    put_directory(
+        &mut bytes,
+        2,
+        7,
+        1,
+        128,
+        1,
+        COMPONENT_INFO_OFFSET as u64,
+        128,
+        8,
+    );
+    put_directory(
+        &mut bytes,
+        3,
+        10,
+        1,
+        96,
+        1,
+        SYMBOL_EXPORT_OFFSET as u64,
+        96,
+        8,
+    );
+
+    bytes[STRING_OFFSET..STRING_OFFSET + 8].copy_from_slice(b"\0export\0");
+
+    put_u16(&mut bytes, SEGMENT_OFFSET, 1);
+    put_u16(&mut bytes, SEGMENT_OFFSET + 0x02, 5);
+    put_u64(&mut bytes, SEGMENT_OFFSET + 0x08, 0);
+    put_u64(&mut bytes, SEGMENT_OFFSET + 0x10, 4096);
+    put_u64(&mut bytes, SEGMENT_OFFSET + 0x18, 4);
+    put_u64(&mut bytes, SEGMENT_OFFSET + 0x20, 4096);
+    put_u64(&mut bytes, SEGMENT_OFFSET + 0x28, 4096);
+
+    bytes[COMPONENT_INFO_OFFSET..COMPONENT_INFO_OFFSET + 16].fill(1);
+    bytes[COMPONENT_INFO_OFFSET + 16..COMPONENT_INFO_OFFSET + 32].fill(2);
+    put_u32(&mut bytes, COMPONENT_INFO_OFFSET + 0x38, 1);
+    put_u64(&mut bytes, COMPONENT_INFO_OFFSET + 0x40, 4096);
+
+    bytes[SYMBOL_EXPORT_OFFSET..SYMBOL_EXPORT_OFFSET + 16].fill(3);
+    bytes[SYMBOL_EXPORT_OFFSET + 16..SYMBOL_EXPORT_OFFSET + 32].fill(4);
+    bytes[SYMBOL_EXPORT_OFFSET + 32..SYMBOL_EXPORT_OFFSET + 64].fill(5);
+    put_u64(&mut bytes, SYMBOL_EXPORT_OFFSET + 0x40, 0);
+    put_u32(&mut bytes, SYMBOL_EXPORT_OFFSET + 0x4c, 1);
+
+    bytes[4096..4100].copy_from_slice(&[0x73, 0x00, 0x00, 0x00]);
+    rehash(&mut bytes);
+    bytes
+}
+
 /// 包含 CODE、DATA、Relocation 和未知 optional 表的完整规范镜像。
 pub fn extended_soyo() -> Vec<u8> {
     const EXTENDED_FILE_SIZE: usize = 12288;

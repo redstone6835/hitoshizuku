@@ -13,5 +13,6 @@ bench = false
 test-support = []
 
 [dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "zeroize"] }
 native-abi = { path = "../native-abi" }
 sha2 = { version = "0.10.9", default-features = false }

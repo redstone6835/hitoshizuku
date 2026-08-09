@@ -27,6 +27,9 @@ pub enum MalformedKind {
     Capability,
     Relocation,
     Runtime,
+    Component,
+    Symbol,
+    Signature,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,10 @@ pub enum ResourceKind {
     Capabilities,
     Relocations,
     TlsSize,
+    ComponentDependencies,
+    SymbolImports,
+    SymbolExports,
+    DynamicRelocations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,10 +4,11 @@ use alloc::vec::Vec;
 
 use native_abi::{AbiImportRecord, CapabilityRequirementRecord, TargetArch};
 
-use crate::registry::{RelocationKind, SegmentKind};
+use crate::registry::{ArtifactKind, DynamicRelocationKind, RelocationKind, SegmentKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoyoHeader {
+    pub artifact_kind: ArtifactKind,
     pub target_arch: TargetArch,
     pub abi_family: u16,
     pub abi_epoch: u16,
@@ -133,6 +134,72 @@ pub struct RuntimeInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentInfo {
+    pub component_id: [u8; 16],
+    pub abi_id: [u8; 16],
+    pub flags: u64,
+    pub init_offset: u64,
+    pub fini_offset: u64,
+    pub interface_count: u32,
+    pub call_state_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentDependency {
+    pub component_id: [u8; 16],
+    pub abi_id: [u8; 16],
+    pub content_hash: [u8; 32],
+    pub flags: u32,
+    pub diagnostic_name_offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolImport {
+    pub dependency_index: u32,
+    pub flags: u32,
+    pub interface_id: [u8; 16],
+    pub symbol_id: [u8; 16],
+    pub signature_hash: [u8; 32],
+    pub diagnostic_name_offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolExport {
+    pub interface_id: [u8; 16],
+    pub symbol_id: [u8; 16],
+    pub signature_hash: [u8; 32],
+    pub entry_offset: u64,
+    pub flags: u32,
+    pub diagnostic_name_offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicRelocation {
+    pub kind: DynamicRelocationKind,
+    pub target_segment_index: u32,
+    pub target_offset: u64,
+    pub source_index: u32,
+    pub addend: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoyoSignature {
+    pub key_id: [u8; 32],
+    pub signature: [u8; 64],
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentMetadata {
+    pub info: ComponentInfo,
+    pub dependencies: Vec<ComponentDependency>,
+    pub symbol_imports: Vec<SymbolImport>,
+    pub symbol_exports: Vec<SymbolExport>,
+    pub dynamic_relocations: Vec<DynamicRelocation>,
+    pub signature: Option<SoyoSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoyoMetadata {
     pub header: SoyoHeader,
     pub directory: Vec<DirectoryEntry>,
@@ -141,5 +208,6 @@ pub struct SoyoMetadata {
     pub imports: Vec<AbiImport>,
     pub capabilities: Vec<CapabilityRequirement>,
     pub relocations: Vec<Relocation>,
-    pub runtime: RuntimeInfo,
+    pub runtime: Option<RuntimeInfo>,
+    pub component: Option<ComponentMetadata>,
 }

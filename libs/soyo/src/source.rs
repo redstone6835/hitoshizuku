@@ -8,10 +8,13 @@ use sha2::{Digest, Sha256};
 use crate::error::{MalformedKind, ResourceKind, SoyoError, UntrustedKind};
 use crate::metadata::{DirectoryEntry, SoyoHeader};
 use crate::reader::{SoyoReadAt, SoyoReadError, SoyoReadLimits};
+use crate::registry::TableType;
+use crate::wire;
 
 pub(crate) fn verify_hash<R: SoyoReadAt>(
     source: &R,
     header: &SoyoHeader,
+    directory: &[DirectoryEntry],
     file_size: u64,
 ) -> Result<(), SoyoReadError<R::Error>> {
     if header.build_id != header.content_hash {
@@ -19,6 +22,10 @@ pub(crate) fn verify_hash<R: SoyoReadAt>(
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 4096];
+    let signature_range = find_table(directory, TableType::Signature as u16).map(|table| {
+        let start = table.file_offset + wire::signature::SIGNATURE as u64;
+        start..start + 64
+    });
     let mut offset = 0u64;
     while offset < file_size {
         let length = cmp::min(buffer.len() as u64, file_size - offset) as usize;
@@ -26,6 +33,12 @@ pub(crate) fn verify_hash<R: SoyoReadAt>(
         for (index, byte) in buffer[..length].iter_mut().enumerate() {
             let absolute = offset + index as u64;
             if (0x50..0x90).contains(&absolute) {
+                *byte = 0;
+            }
+            if signature_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&absolute))
+            {
                 *byte = 0;
             }
         }

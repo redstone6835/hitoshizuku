@@ -14,6 +14,10 @@ pub const MAX_IMPORTS: u32 = 256;
 pub const MAX_CAPABILITIES: u32 = 64;
 pub const MAX_RELOCATIONS: u32 = 65_536;
 pub const MAX_TLS_SIZE: u64 = 16 * 1024 * 1024;
+pub const MAX_COMPONENT_DEPENDENCIES: u32 = 256;
+pub const MAX_SYMBOL_IMPORTS: u32 = 4096;
+pub const MAX_SYMBOL_EXPORTS: u32 = 4096;
+pub const MAX_DYNAMIC_RELOCATIONS: u32 = 65_536;
 
 macro_rules! wire_flags {
     ($name:ident, $bits:ty, { $($constant:ident = $value:expr),+ $(,)? }) => {
@@ -49,7 +53,8 @@ macro_rules! wire_flags {
 wire_flags!(FeatureFlags, u64, {
     STATIC_TLS = 1 << 0,
     INIT_FINI_ARRAY = 1 << 1,
-    KNOWN = 0b11,
+    DYNAMIC_COMPONENTS = 1 << 2,
+    KNOWN = 0b111,
 });
 
 wire_flags!(DirectoryFlags, u16, {
@@ -86,6 +91,7 @@ wire_flags!(RuntimeFlags, u64, {
 #[repr(u16)]
 pub enum ArtifactKind {
     Executable = 1,
+    SharedComponent = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +109,12 @@ pub enum TableType {
     CapabilityRequirement = 4,
     Relocation = 5,
     RuntimeInfo = 6,
+    ComponentInfo = 7,
+    ComponentDependency = 8,
+    SymbolImport = 9,
+    SymbolExport = 10,
+    DynamicRelocation = 11,
+    Signature = 12,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,4 +132,13 @@ pub enum SegmentKind {
 pub enum RelocationKind {
     ImageBase64 = 1,
     SegmentBase64 = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum DynamicRelocationKind {
+    AbiSlot32 = 1,
+    AbiSlot64 = 2,
+    InterfaceGate = 3,
+    TlsOffset64 = 4,
 }

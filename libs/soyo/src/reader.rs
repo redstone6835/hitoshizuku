@@ -4,11 +4,12 @@ use core::convert::Infallible;
 
 use crate::error::{ResourceKind, SoyoError};
 use crate::registry::{
-    MAX_CAPABILITIES, MAX_DIRECTORY_ENTRIES, MAX_IMPORTS, MAX_RELOCATIONS, MAX_SEGMENTS,
-    MAX_STRING_BYTES,
+    MAX_CAPABILITIES, MAX_COMPONENT_DEPENDENCIES, MAX_DIRECTORY_ENTRIES, MAX_DYNAMIC_RELOCATIONS,
+    MAX_IMPORTS, MAX_RELOCATIONS, MAX_SEGMENTS, MAX_STRING_BYTES, MAX_SYMBOL_EXPORTS,
+    MAX_SYMBOL_IMPORTS,
 };
 
-const PORTABLE_MAX_TABLE_BYTES: usize = 4_216_928;
+const PORTABLE_MAX_TABLE_BYTES: usize = 8_173_920;
 
 pub trait SoyoReadAt {
     type Error;
@@ -45,6 +46,10 @@ pub struct SoyoReadLimits {
     pub max_imports: u32,
     pub max_capabilities: u32,
     pub max_relocations: u32,
+    pub max_component_dependencies: u32,
+    pub max_symbol_imports: u32,
+    pub max_symbol_exports: u32,
+    pub max_dynamic_relocations: u32,
 }
 
 impl SoyoReadLimits {
@@ -57,6 +62,10 @@ impl SoyoReadLimits {
             max_imports: MAX_IMPORTS,
             max_capabilities: MAX_CAPABILITIES,
             max_relocations: MAX_RELOCATIONS,
+            max_component_dependencies: MAX_COMPONENT_DEPENDENCIES,
+            max_symbol_imports: MAX_SYMBOL_IMPORTS,
+            max_symbol_exports: MAX_SYMBOL_EXPORTS,
+            max_dynamic_relocations: MAX_DYNAMIC_RELOCATIONS,
         }
     }
 }

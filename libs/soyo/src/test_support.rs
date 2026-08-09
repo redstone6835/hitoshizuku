@@ -3,6 +3,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use ed25519_dalek::{Signer, SigningKey};
 use native_abi::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, OperationId, RequirementId, TargetArch, operation,
     requirement,
@@ -32,6 +33,202 @@ pub const LOADER_FIXTURE_DATA: [u8; 16] = [
 ];
 pub const LOADER_FIXTURE_TLS: [u8; 4] = [0x54, 0x4c, 0x53, 0x21];
 pub const LOADER_FIXTURE_TLS_SIZE: usize = 32;
+
+/// 构造用于端到端信任策略测试的最小共享组件。
+pub struct SoyoComponentTestEncoder {
+    target_arch: TargetArch,
+    signing_key: Option<[u8; 32]>,
+}
+
+impl SoyoComponentTestEncoder {
+    pub const fn new(target_arch: TargetArch) -> Self {
+        Self {
+            target_arch,
+            signing_key: None,
+        }
+    }
+
+    pub const fn signing_key(mut self, signing_key: [u8; 32]) -> Self {
+        self.signing_key = Some(signing_key);
+        self
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, SoyoError> {
+        const STRING_OFFSET: usize = 432;
+        const SEGMENT_OFFSET: usize = 440;
+        const COMPONENT_INFO_OFFSET: usize = 504;
+        const SYMBOL_EXPORT_OFFSET: usize = 632;
+        const SIGNATURE_OFFSET: usize = 728;
+        const CODE_FILE_OFFSET: usize = 4096;
+        const FILE_SIZE: usize = 8192;
+
+        let signed = self.signing_key.is_some();
+        let mut bytes = vec![0u8; FILE_SIZE];
+        bytes[wire::header::MAGIC..wire::header::MAGIC + 4].copy_from_slice(&SOYO_MAGIC);
+        put_u16(&mut bytes, wire::header::FORMAT_VERSION, FORMAT_VERSION);
+        put_u16(
+            &mut bytes,
+            wire::header::HEADER_SIZE,
+            wire::HEADER_SIZE as u16,
+        );
+        put_u16(
+            &mut bytes,
+            wire::header::ARTIFACT_KIND,
+            ArtifactKind::SharedComponent as u16,
+        );
+        put_u16(
+            &mut bytes,
+            wire::header::TARGET_ARCH,
+            self.target_arch as u16,
+        );
+        bytes[wire::header::ENDIAN] = 1;
+        bytes[wire::header::POINTER_WIDTH] = 64;
+        put_u16(&mut bytes, wire::header::ABI_FAMILY, ABI_FAMILY_MYGO_NATIVE);
+        put_u16(&mut bytes, wire::header::ABI_EPOCH, ABI_EPOCH);
+        put_u16(
+            &mut bytes,
+            wire::header::HASH_ALGORITHM,
+            HashAlgorithm::Sha256 as u16,
+        );
+        put_u64(
+            &mut bytes,
+            wire::header::TABLE_OFFSET,
+            wire::HEADER_SIZE as u64,
+        );
+        put_u32(
+            &mut bytes,
+            wire::header::TABLE_COUNT,
+            if signed { 5 } else { 4 },
+        );
+        put_u16(
+            &mut bytes,
+            wire::header::TABLE_ENTRY_SIZE,
+            wire::DIRECTORY_ENTRY_SIZE as u16,
+        );
+        put_u64(&mut bytes, wire::header::FILE_SIZE, FILE_SIZE as u64);
+        put_u64(&mut bytes, wire::header::IMAGE_VIRTUAL_SIZE, 4096);
+
+        put_directory(
+            &mut bytes,
+            0,
+            TableType::String,
+            1,
+            8,
+            STRING_OFFSET as u64,
+            8,
+            1,
+        );
+        put_directory(
+            &mut bytes,
+            1,
+            TableType::ImageSegment,
+            wire::IMAGE_SEGMENT_SIZE as u32,
+            1,
+            SEGMENT_OFFSET as u64,
+            wire::IMAGE_SEGMENT_SIZE as u64,
+            8,
+        );
+        put_directory(
+            &mut bytes,
+            2,
+            TableType::ComponentInfo,
+            wire::COMPONENT_INFO_SIZE as u32,
+            1,
+            COMPONENT_INFO_OFFSET as u64,
+            wire::COMPONENT_INFO_SIZE as u64,
+            8,
+        );
+        put_directory(
+            &mut bytes,
+            3,
+            TableType::SymbolExport,
+            wire::SYMBOL_EXPORT_SIZE as u32,
+            1,
+            SYMBOL_EXPORT_OFFSET as u64,
+            wire::SYMBOL_EXPORT_SIZE as u64,
+            8,
+        );
+        if signed {
+            put_directory(
+                &mut bytes,
+                4,
+                TableType::Signature,
+                wire::SIGNATURE_SIZE as u32,
+                1,
+                SIGNATURE_OFFSET as u64,
+                wire::SIGNATURE_SIZE as u64,
+                8,
+            );
+        }
+
+        bytes[STRING_OFFSET..STRING_OFFSET + 8].copy_from_slice(b"\0export\0");
+        put_segment(
+            &mut bytes,
+            SEGMENT_OFFSET,
+            SegmentKind::Code,
+            SegmentPermissions::READ | SegmentPermissions::EXECUTE,
+            0,
+            CODE_FILE_OFFSET as u64,
+            4,
+            4096,
+            4096,
+        );
+
+        bytes[COMPONENT_INFO_OFFSET + wire::component_info::COMPONENT_ID
+            ..COMPONENT_INFO_OFFSET + wire::component_info::COMPONENT_ID + 16]
+            .fill(1);
+        bytes[COMPONENT_INFO_OFFSET + wire::component_info::ABI_ID
+            ..COMPONENT_INFO_OFFSET + wire::component_info::ABI_ID + 16]
+            .fill(2);
+        put_u32(
+            &mut bytes,
+            COMPONENT_INFO_OFFSET + wire::component_info::INTERFACE_COUNT,
+            1,
+        );
+        put_u64(
+            &mut bytes,
+            COMPONENT_INFO_OFFSET + wire::component_info::CALL_STATE_SIZE,
+            4096,
+        );
+
+        bytes[SYMBOL_EXPORT_OFFSET + wire::symbol_export::INTERFACE_ID
+            ..SYMBOL_EXPORT_OFFSET + wire::symbol_export::INTERFACE_ID + 16]
+            .fill(3);
+        bytes[SYMBOL_EXPORT_OFFSET + wire::symbol_export::SYMBOL_ID
+            ..SYMBOL_EXPORT_OFFSET + wire::symbol_export::SYMBOL_ID + 16]
+            .fill(4);
+        bytes[SYMBOL_EXPORT_OFFSET + wire::symbol_export::SIGNATURE_HASH
+            ..SYMBOL_EXPORT_OFFSET + wire::symbol_export::SIGNATURE_HASH + 32]
+            .fill(5);
+        put_u32(
+            &mut bytes,
+            SYMBOL_EXPORT_OFFSET + wire::symbol_export::DIAGNOSTIC_NAME_OFFSET,
+            1,
+        );
+        bytes[CODE_FILE_OFFSET..CODE_FILE_OFFSET + 4].copy_from_slice(&[0x73, 0x00, 0x00, 0x00]);
+
+        if let Some(seed) = self.signing_key {
+            let signing_key = SigningKey::from_bytes(&seed);
+            let public_key = signing_key.verifying_key().to_bytes();
+            let key_id: [u8; 32] = Sha256::digest(public_key).into();
+            bytes[SIGNATURE_OFFSET + wire::signature::KEY_ID
+                ..SIGNATURE_OFFSET + wire::signature::KEY_ID + 32]
+                .copy_from_slice(&key_id);
+            rehash(&mut bytes);
+            let mut content_hash = [0; 32];
+            content_hash.copy_from_slice(
+                &bytes[wire::header::CONTENT_HASH..wire::header::CONTENT_HASH + 32],
+            );
+            let signature = signing_key.sign(&crate::signature_message(content_hash));
+            bytes[SIGNATURE_OFFSET + wire::signature::SIGNATURE
+                ..SIGNATURE_OFFSET + wire::signature::SIGNATURE + 64]
+                .copy_from_slice(&signature.to_bytes());
+        } else {
+            rehash(&mut bytes);
+        }
+        Ok(bytes)
+    }
+}
 
 /// 构造覆盖段权限、重定位、零填充与静态 TLS 的直接 SOYO 测试映像。
 pub struct SoyoLoaderTestEncoder<'a> {

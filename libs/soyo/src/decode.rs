@@ -7,15 +7,17 @@ use native_abi::{TargetArch, wire as native_wire};
 use crate::error::{MalformedKind, ResourceKind, SoyoError, UnsupportedKind};
 use crate::format::{validate_array, validate_relocation, validate_string_reference};
 use crate::metadata::{
-    AbiImport, CapabilityRequirement, DirectoryEntry, ImageSegment, Relocation, RuntimeInfo,
-    SoyoHeader,
+    AbiImport, CapabilityRequirement, ComponentDependency, ComponentInfo, ComponentMetadata,
+    DirectoryEntry, DynamicRelocation, ImageSegment, Relocation, RuntimeInfo, SoyoHeader,
+    SoyoSignature, SymbolExport, SymbolImport,
 };
 use crate::reader::{SoyoReadAt, SoyoReadError, SoyoReadLimits};
 use crate::registry::{
-    ArtifactKind, CapabilityFlags, DirectoryFlags, FORMAT_VERSION, FeatureFlags, HashAlgorithm,
-    ImportFlags, MAX_CAPABILITIES, MAX_DIRECTORY_ENTRIES, MAX_IMAGE_SIZE, MAX_IMPORTS,
-    MAX_RELOCATIONS, MAX_SEGMENTS, MAX_STRING_BYTES, RelocationKind, RuntimeFlags, SOYO_MAGIC,
-    SegmentKind, TableType,
+    ArtifactKind, CapabilityFlags, DirectoryFlags, DynamicRelocationKind, FORMAT_VERSION,
+    FeatureFlags, HashAlgorithm, ImportFlags, MAX_CAPABILITIES, MAX_COMPONENT_DEPENDENCIES,
+    MAX_DIRECTORY_ENTRIES, MAX_DYNAMIC_RELOCATIONS, MAX_IMAGE_SIZE, MAX_IMPORTS, MAX_RELOCATIONS,
+    MAX_SEGMENTS, MAX_STRING_BYTES, MAX_SYMBOL_EXPORTS, MAX_SYMBOL_IMPORTS, RelocationKind,
+    RuntimeFlags, SOYO_MAGIC, SegmentKind, TableType,
 };
 use crate::source::{
     align_up, all_zero, find_table, i64_at, range_within, read_bytes, u16_at, u32_at, u64_at,
@@ -40,12 +42,11 @@ pub(crate) fn decode_header(
     if u16_at(bytes, wire::header::HEADER_SIZE) as usize != wire::HEADER_SIZE {
         return Err(SoyoError::Malformed(MalformedKind::Header));
     }
-    let artifact_kind = u16_at(bytes, wire::header::ARTIFACT_KIND);
-    if artifact_kind != ArtifactKind::Executable as u16 {
-        return Err(SoyoError::Unsupported(UnsupportedKind::ArtifactKind(
-            artifact_kind,
-        )));
-    }
+    let artifact_kind = match u16_at(bytes, wire::header::ARTIFACT_KIND) {
+        value if value == ArtifactKind::Executable as u16 => ArtifactKind::Executable,
+        value if value == ArtifactKind::SharedComponent as u16 => ArtifactKind::SharedComponent,
+        other => return Err(SoyoError::Unsupported(UnsupportedKind::ArtifactKind(other))),
+    };
     let target_arch_raw = u16_at(bytes, wire::header::TARGET_ARCH);
     let target_arch = match target_arch_raw {
         value if value == TargetArch::Riscv64 as u16 => TargetArch::Riscv64,
@@ -134,6 +135,7 @@ pub(crate) fn decode_header(
         .copy_from_slice(&bytes[wire::header::CONTENT_HASH..wire::header::CONTENT_HASH + 32]);
 
     Ok(SoyoHeader {
+        artifact_kind,
         target_arch,
         abi_family,
         abi_epoch: u16_at(bytes, wire::header::ABI_EPOCH),
@@ -192,7 +194,7 @@ pub(crate) fn decode_directory(
         }
         let size = usize::try_from(file_size)
             .map_err(|_| SoyoError::AllocationFailed(ResourceKind::TableBytes))?;
-        if table_type <= TableType::RuntimeInfo as u16 {
+        if table_type <= TableType::Signature as u16 {
             total_table_bytes = total_table_bytes
                 .checked_add(size)
                 .ok_or(SoyoError::ResourceExhausted(ResourceKind::TableBytes))?;
@@ -216,6 +218,7 @@ pub(crate) fn decode_directory(
 
 pub(crate) fn validate_directory_shape(
     directory: &[DirectoryEntry],
+    artifact_kind: ArtifactKind,
     limits: SoyoReadLimits,
 ) -> Result<(), SoyoError> {
     for entry in directory {
@@ -246,6 +249,34 @@ pub(crate) fn validate_directory_shape(
             value if value == TableType::RuntimeInfo as u16 => {
                 Some((wire::RUNTIME_INFO_SIZE as u32, 8, 1))
             }
+            value if value == TableType::ComponentInfo as u16 => {
+                Some((wire::COMPONENT_INFO_SIZE as u32, 8, 1))
+            }
+            value if value == TableType::ComponentDependency as u16 => Some((
+                wire::COMPONENT_DEPENDENCY_SIZE as u32,
+                8,
+                limits
+                    .max_component_dependencies
+                    .min(MAX_COMPONENT_DEPENDENCIES),
+            )),
+            value if value == TableType::SymbolImport as u16 => Some((
+                wire::SYMBOL_IMPORT_SIZE as u32,
+                8,
+                limits.max_symbol_imports.min(MAX_SYMBOL_IMPORTS),
+            )),
+            value if value == TableType::SymbolExport as u16 => Some((
+                wire::SYMBOL_EXPORT_SIZE as u32,
+                8,
+                limits.max_symbol_exports.min(MAX_SYMBOL_EXPORTS),
+            )),
+            value if value == TableType::DynamicRelocation as u16 => Some((
+                wire::DYNAMIC_RELOCATION_SIZE as u32,
+                8,
+                limits.max_dynamic_relocations.min(MAX_DYNAMIC_RELOCATIONS),
+            )),
+            value if value == TableType::Signature as u16 => {
+                Some((wire::SIGNATURE_SIZE as u32, 8, 1))
+            }
             _ => None,
         };
         if let Some((entry_size, alignment, max_count)) = standard {
@@ -267,16 +298,41 @@ pub(crate) fn validate_directory_shape(
         }
     }
 
-    for required in [
-        TableType::String,
-        TableType::ImageSegment,
-        TableType::AbiImport,
-        TableType::CapabilityRequirement,
-        TableType::RuntimeInfo,
-    ] {
-        if find_table(directory, required as u16).is_none() {
+    let required: &[TableType] = match artifact_kind {
+        ArtifactKind::Executable => &[
+            TableType::String,
+            TableType::ImageSegment,
+            TableType::AbiImport,
+            TableType::CapabilityRequirement,
+            TableType::RuntimeInfo,
+        ],
+        ArtifactKind::SharedComponent => &[
+            TableType::String,
+            TableType::ImageSegment,
+            TableType::ComponentInfo,
+            TableType::SymbolExport,
+        ],
+    };
+    for required in required {
+        if find_table(directory, *required as u16).is_none() {
             return Err(SoyoError::Malformed(MalformedKind::Header));
         }
+    }
+    let forbidden: &[TableType] = match artifact_kind {
+        ArtifactKind::Executable => &[
+            TableType::ComponentInfo,
+            TableType::ComponentDependency,
+            TableType::SymbolImport,
+            TableType::SymbolExport,
+            TableType::DynamicRelocation,
+        ],
+        ArtifactKind::SharedComponent => &[TableType::RuntimeInfo],
+    };
+    if forbidden
+        .iter()
+        .any(|table| find_table(directory, *table as u16).is_some())
+    {
+        return Err(SoyoError::Malformed(MalformedKind::Header));
     }
     Ok(())
 }
@@ -315,6 +371,19 @@ pub(crate) fn read_standard_table<R: SoyoReadAt>(
     let entry = find_table(directory, table_type as u16)
         .ok_or(SoyoError::Malformed(MalformedKind::Header))?;
     read_entry_bytes(source, entry, file_size, limits)
+}
+
+pub(crate) fn read_optional_standard_table<R: SoyoReadAt>(
+    source: &R,
+    directory: &[DirectoryEntry],
+    table_type: TableType,
+    file_size: u64,
+    limits: SoyoReadLimits,
+) -> Result<Vec<u8>, SoyoReadError<R::Error>> {
+    match find_table(directory, table_type as u16) {
+        Some(entry) => read_entry_bytes(source, entry, file_size, limits),
+        None => Ok(Vec::new()),
+    }
 }
 
 pub(crate) fn read_entry_bytes<R: SoyoReadAt>(
@@ -564,6 +633,196 @@ pub(crate) fn decode_runtime(
     Ok(runtime)
 }
 
+pub(crate) fn decode_component(
+    info_bytes: &[u8],
+    dependency_bytes: &[u8],
+    symbol_import_bytes: &[u8],
+    symbol_export_bytes: &[u8],
+    dynamic_relocation_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> Result<ComponentMetadata, SoyoError> {
+    if info_bytes.len() != wire::COMPONENT_INFO_SIZE
+        || u32_at(info_bytes, wire::component_info::RESERVED0) != 0
+        || !all_zero(&info_bytes[wire::component_info::RESERVED1..wire::COMPONENT_INFO_SIZE])
+    {
+        return Err(SoyoError::Malformed(MalformedKind::Component));
+    }
+    let mut component_id = [0; 16];
+    component_id.copy_from_slice(
+        &info_bytes[wire::component_info::COMPONENT_ID..wire::component_info::COMPONENT_ID + 16],
+    );
+    let mut abi_id = [0; 16];
+    abi_id.copy_from_slice(
+        &info_bytes[wire::component_info::ABI_ID..wire::component_info::ABI_ID + 16],
+    );
+    let info = ComponentInfo {
+        component_id,
+        abi_id,
+        flags: u64_at(info_bytes, wire::component_info::FLAGS),
+        init_offset: u64_at(info_bytes, wire::component_info::INIT_OFFSET),
+        fini_offset: u64_at(info_bytes, wire::component_info::FINI_OFFSET),
+        interface_count: u32_at(info_bytes, wire::component_info::INTERFACE_COUNT),
+        call_state_size: u64_at(info_bytes, wire::component_info::CALL_STATE_SIZE),
+    };
+
+    let mut dependencies = Vec::new();
+    dependencies
+        .try_reserve_exact(dependency_bytes.len() / wire::COMPONENT_DEPENDENCY_SIZE)
+        .map_err(|_| SoyoError::AllocationFailed(ResourceKind::ComponentDependencies))?;
+    for record in dependency_bytes.chunks_exact(wire::COMPONENT_DEPENDENCY_SIZE) {
+        if !all_zero(&record[wire::component_dependency::RESERVED..wire::COMPONENT_DEPENDENCY_SIZE])
+        {
+            return Err(SoyoError::Malformed(MalformedKind::Reserved));
+        }
+        let mut component_id = [0; 16];
+        component_id.copy_from_slice(
+            &record[wire::component_dependency::COMPONENT_ID
+                ..wire::component_dependency::COMPONENT_ID + 16],
+        );
+        let mut abi_id = [0; 16];
+        abi_id.copy_from_slice(
+            &record[wire::component_dependency::ABI_ID..wire::component_dependency::ABI_ID + 16],
+        );
+        let mut content_hash = [0; 32];
+        content_hash.copy_from_slice(
+            &record[wire::component_dependency::CONTENT_HASH
+                ..wire::component_dependency::CONTENT_HASH + 32],
+        );
+        dependencies.push(ComponentDependency {
+            component_id,
+            abi_id,
+            content_hash,
+            flags: u32_at(record, wire::component_dependency::FLAGS),
+            diagnostic_name_offset: u32_at(
+                record,
+                wire::component_dependency::DIAGNOSTIC_NAME_OFFSET,
+            ),
+        });
+    }
+
+    let mut symbol_imports = Vec::new();
+    symbol_imports
+        .try_reserve_exact(symbol_import_bytes.len() / wire::SYMBOL_IMPORT_SIZE)
+        .map_err(|_| SoyoError::AllocationFailed(ResourceKind::SymbolImports))?;
+    for record in symbol_import_bytes.chunks_exact(wire::SYMBOL_IMPORT_SIZE) {
+        if u32_at(record, wire::symbol_import::RESERVED0) != 0
+            || !all_zero(&record[wire::symbol_import::RESERVED1..wire::SYMBOL_IMPORT_SIZE])
+        {
+            return Err(SoyoError::Malformed(MalformedKind::Reserved));
+        }
+        let mut interface_id = [0; 16];
+        interface_id.copy_from_slice(
+            &record[wire::symbol_import::INTERFACE_ID..wire::symbol_import::INTERFACE_ID + 16],
+        );
+        let mut symbol_id = [0; 16];
+        symbol_id.copy_from_slice(
+            &record[wire::symbol_import::SYMBOL_ID..wire::symbol_import::SYMBOL_ID + 16],
+        );
+        let mut signature_hash = [0; 32];
+        signature_hash.copy_from_slice(
+            &record[wire::symbol_import::SIGNATURE_HASH..wire::symbol_import::SIGNATURE_HASH + 32],
+        );
+        symbol_imports.push(SymbolImport {
+            dependency_index: u32_at(record, wire::symbol_import::DEPENDENCY_INDEX),
+            flags: u32_at(record, wire::symbol_import::FLAGS),
+            interface_id,
+            symbol_id,
+            signature_hash,
+            diagnostic_name_offset: u32_at(record, wire::symbol_import::DIAGNOSTIC_NAME_OFFSET),
+        });
+    }
+
+    let mut symbol_exports = Vec::new();
+    symbol_exports
+        .try_reserve_exact(symbol_export_bytes.len() / wire::SYMBOL_EXPORT_SIZE)
+        .map_err(|_| SoyoError::AllocationFailed(ResourceKind::SymbolExports))?;
+    for record in symbol_export_bytes.chunks_exact(wire::SYMBOL_EXPORT_SIZE) {
+        if !all_zero(&record[wire::symbol_export::RESERVED..wire::SYMBOL_EXPORT_SIZE]) {
+            return Err(SoyoError::Malformed(MalformedKind::Reserved));
+        }
+        let mut interface_id = [0; 16];
+        interface_id.copy_from_slice(
+            &record[wire::symbol_export::INTERFACE_ID..wire::symbol_export::INTERFACE_ID + 16],
+        );
+        let mut symbol_id = [0; 16];
+        symbol_id.copy_from_slice(
+            &record[wire::symbol_export::SYMBOL_ID..wire::symbol_export::SYMBOL_ID + 16],
+        );
+        let mut signature_hash = [0; 32];
+        signature_hash.copy_from_slice(
+            &record[wire::symbol_export::SIGNATURE_HASH..wire::symbol_export::SIGNATURE_HASH + 32],
+        );
+        symbol_exports.push(SymbolExport {
+            interface_id,
+            symbol_id,
+            signature_hash,
+            entry_offset: u64_at(record, wire::symbol_export::ENTRY_OFFSET),
+            flags: u32_at(record, wire::symbol_export::FLAGS),
+            diagnostic_name_offset: u32_at(record, wire::symbol_export::DIAGNOSTIC_NAME_OFFSET),
+        });
+    }
+
+    let mut dynamic_relocations = Vec::new();
+    dynamic_relocations
+        .try_reserve_exact(dynamic_relocation_bytes.len() / wire::DYNAMIC_RELOCATION_SIZE)
+        .map_err(|_| SoyoError::AllocationFailed(ResourceKind::DynamicRelocations))?;
+    for record in dynamic_relocation_bytes.chunks_exact(wire::DYNAMIC_RELOCATION_SIZE) {
+        if u16_at(record, wire::dynamic_relocation::FLAGS) != 0
+            || u32_at(record, wire::dynamic_relocation::RESERVED0) != 0
+            || u64_at(record, wire::dynamic_relocation::RESERVED1) != 0
+            || u64_at(record, wire::dynamic_relocation::RESERVED2) != 0
+        {
+            return Err(SoyoError::Malformed(MalformedKind::Reserved));
+        }
+        let kind = match u16_at(record, wire::dynamic_relocation::KIND) {
+            1 => DynamicRelocationKind::AbiSlot32,
+            2 => DynamicRelocationKind::AbiSlot64,
+            3 => DynamicRelocationKind::InterfaceGate,
+            4 => DynamicRelocationKind::TlsOffset64,
+            _ => return Err(SoyoError::Malformed(MalformedKind::Relocation)),
+        };
+        dynamic_relocations.push(DynamicRelocation {
+            kind,
+            target_segment_index: u32_at(record, wire::dynamic_relocation::TARGET_SEGMENT_INDEX),
+            target_offset: u64_at(record, wire::dynamic_relocation::TARGET_OFFSET),
+            source_index: u32_at(record, wire::dynamic_relocation::SOURCE_INDEX),
+            addend: i64_at(record, wire::dynamic_relocation::ADDEND),
+        });
+    }
+
+    let signature = if signature_bytes.is_empty() {
+        None
+    } else {
+        if signature_bytes.len() != wire::SIGNATURE_SIZE
+            || !all_zero(&signature_bytes[wire::signature::RESERVED..wire::SIGNATURE_SIZE])
+        {
+            return Err(SoyoError::Malformed(MalformedKind::Signature));
+        }
+        let mut key_id = [0; 32];
+        key_id.copy_from_slice(
+            &signature_bytes[wire::signature::KEY_ID..wire::signature::KEY_ID + 32],
+        );
+        let mut signature = [0; 64];
+        signature.copy_from_slice(
+            &signature_bytes[wire::signature::SIGNATURE..wire::signature::SIGNATURE + 64],
+        );
+        Some(SoyoSignature {
+            key_id,
+            signature,
+            flags: u32_at(signature_bytes, wire::signature::FLAGS),
+        })
+    };
+
+    Ok(ComponentMetadata {
+        info,
+        dependencies,
+        symbol_imports,
+        symbol_exports,
+        dynamic_relocations,
+        signature,
+    })
+}
+
 fn resource_for_table(table_type: u16) -> ResourceKind {
     match table_type {
         value if value == TableType::String as u16 => ResourceKind::StringBytes,
@@ -571,6 +830,12 @@ fn resource_for_table(table_type: u16) -> ResourceKind {
         value if value == TableType::AbiImport as u16 => ResourceKind::Imports,
         value if value == TableType::CapabilityRequirement as u16 => ResourceKind::Capabilities,
         value if value == TableType::Relocation as u16 => ResourceKind::Relocations,
+        value if value == TableType::ComponentDependency as u16 => {
+            ResourceKind::ComponentDependencies
+        }
+        value if value == TableType::SymbolImport as u16 => ResourceKind::SymbolImports,
+        value if value == TableType::SymbolExport as u16 => ResourceKind::SymbolExports,
+        value if value == TableType::DynamicRelocation as u16 => ResourceKind::DynamicRelocations,
         _ => ResourceKind::TableBytes,
     }
 }

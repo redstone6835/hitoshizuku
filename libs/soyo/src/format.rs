@@ -8,7 +8,7 @@ use crate::error::{MalformedKind, ResourceKind, SoyoError};
 use crate::metadata::{DirectoryEntry, ImageSegment, RuntimeInfo, SoyoHeader};
 use crate::reader::{SoyoReadAt, SoyoReadError};
 use crate::registry::{
-    FeatureFlags, MAX_TLS_SIZE, RelocationKind, SegmentKind, SegmentPermissions,
+    ArtifactKind, FeatureFlags, MAX_TLS_SIZE, RelocationKind, SegmentKind, SegmentPermissions,
 };
 use crate::source::{align_up, read_array, verify_zero_range};
 
@@ -109,7 +109,11 @@ pub(crate) fn validate_segments(
                 header.entry_offset >= segment.virtual_offset && header.entry_offset < end
             })
     });
-    if !saw_code || !entry_in_code || maximum_page_end != header.image_virtual_size {
+    let entry_valid = match header.artifact_kind {
+        ArtifactKind::Executable => entry_in_code,
+        ArtifactKind::SharedComponent => header.entry_offset == 0,
+    };
+    if !saw_code || !entry_valid || maximum_page_end != header.image_virtual_size {
         return Err(SoyoError::Malformed(MalformedKind::Segment));
     }
     if header.optional_features & FeatureFlags::STATIC_TLS.bits() != 0

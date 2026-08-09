@@ -1,9 +1,12 @@
 //! Wire 尺寸测试独立使用规范字面值，避免实现常量同时计算实际值和期望值。
 
 use crate::wire::{
-    ABI_IMPORT_SIZE, CAPABILITY_REQUIREMENT_SIZE, DIRECTORY_ENTRY_SIZE, HEADER_SIZE,
-    IMAGE_SEGMENT_SIZE, RELOCATION_SIZE, RUNTIME_INFO_SIZE, abi_import, capability_requirement,
-    directory, header, image_segment, relocation, runtime_info,
+    ABI_IMPORT_SIZE, CAPABILITY_REQUIREMENT_SIZE, COMPONENT_DEPENDENCY_SIZE, COMPONENT_INFO_SIZE,
+    DIRECTORY_ENTRY_SIZE, DYNAMIC_RELOCATION_SIZE, HEADER_SIZE, IMAGE_SEGMENT_SIZE,
+    RELOCATION_SIZE, RUNTIME_INFO_SIZE, SIGNATURE_SIZE, SYMBOL_EXPORT_SIZE, SYMBOL_IMPORT_SIZE,
+    abi_import, capability_requirement, component_dependency, component_info, directory,
+    dynamic_relocation, header, image_segment, relocation, runtime_info, signature, symbol_export,
+    symbol_import,
 };
 
 #[test]
@@ -15,6 +18,89 @@ fn standard_wire_records_have_frozen_sizes() {
     assert_eq!(CAPABILITY_REQUIREMENT_SIZE, 64);
     assert_eq!(RELOCATION_SIZE, 48);
     assert_eq!(RUNTIME_INFO_SIZE, 96);
+    assert_eq!(COMPONENT_INFO_SIZE, 128);
+    assert_eq!(COMPONENT_DEPENDENCY_SIZE, 96);
+    assert_eq!(SYMBOL_IMPORT_SIZE, 96);
+    assert_eq!(SYMBOL_EXPORT_SIZE, 96);
+    assert_eq!(DYNAMIC_RELOCATION_SIZE, 48);
+    assert_eq!(SIGNATURE_SIZE, 128);
+}
+
+#[test]
+fn component_record_offsets_select_every_frozen_field() {
+    assert_eq!(
+        [
+            component_info::COMPONENT_ID,
+            component_info::ABI_ID,
+            component_info::FLAGS,
+            component_info::INIT_OFFSET,
+            component_info::FINI_OFFSET,
+            component_info::INTERFACE_COUNT,
+            component_info::RESERVED0,
+            component_info::CALL_STATE_SIZE,
+            component_info::RESERVED1,
+        ],
+        [0x00, 0x10, 0x20, 0x28, 0x30, 0x38, 0x3c, 0x40, 0x48]
+    );
+    assert_eq!(
+        [
+            component_dependency::COMPONENT_ID,
+            component_dependency::ABI_ID,
+            component_dependency::CONTENT_HASH,
+            component_dependency::FLAGS,
+            component_dependency::DIAGNOSTIC_NAME_OFFSET,
+            component_dependency::RESERVED,
+        ],
+        [0x00, 0x10, 0x20, 0x40, 0x44, 0x48]
+    );
+    assert_eq!(
+        [
+            symbol_import::DEPENDENCY_INDEX,
+            symbol_import::FLAGS,
+            symbol_import::INTERFACE_ID,
+            symbol_import::SYMBOL_ID,
+            symbol_import::SIGNATURE_HASH,
+            symbol_import::DIAGNOSTIC_NAME_OFFSET,
+            symbol_import::RESERVED0,
+            symbol_import::RESERVED1,
+        ],
+        [0x00, 0x04, 0x08, 0x18, 0x28, 0x48, 0x4c, 0x50]
+    );
+    assert_eq!(
+        [
+            symbol_export::INTERFACE_ID,
+            symbol_export::SYMBOL_ID,
+            symbol_export::SIGNATURE_HASH,
+            symbol_export::ENTRY_OFFSET,
+            symbol_export::FLAGS,
+            symbol_export::DIAGNOSTIC_NAME_OFFSET,
+            symbol_export::RESERVED,
+        ],
+        [0x00, 0x10, 0x20, 0x40, 0x48, 0x4c, 0x50]
+    );
+    assert_eq!(
+        [
+            dynamic_relocation::KIND,
+            dynamic_relocation::FLAGS,
+            dynamic_relocation::TARGET_SEGMENT_INDEX,
+            dynamic_relocation::TARGET_OFFSET,
+            dynamic_relocation::SOURCE_INDEX,
+            dynamic_relocation::RESERVED0,
+            dynamic_relocation::ADDEND,
+            dynamic_relocation::RESERVED1,
+            dynamic_relocation::RESERVED2,
+        ],
+        [0x00, 0x02, 0x04, 0x08, 0x10, 0x14, 0x18, 0x20, 0x28]
+    );
+    assert_eq!(
+        [
+            signature::KEY_ID,
+            signature::SIGNATURE,
+            signature::FLAGS,
+            signature::RESERVED,
+        ],
+        [0x00, 0x20, 0x60, 0x64]
+    );
 }
 
 #[test]

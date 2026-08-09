@@ -4,7 +4,7 @@ use native_abi::{NativeAbiPolicy, NativeBindingPlan, TargetArch, bind_native_abi
 
 use crate::error::{IncompatibleKind, SoyoError, UnsupportedKind};
 use crate::metadata::SoyoMetadata;
-use crate::registry::FeatureFlags;
+use crate::registry::{ArtifactKind, FeatureFlags};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoyoTargetPolicy {
@@ -42,10 +42,22 @@ pub struct SoyoLoadPlan<'a> {
     pub native_binding: NativeBindingPlan,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct SoyoComponentPlan<'a> {
+    pub metadata: &'a SoyoMetadata,
+    pub enabled_features: u64,
+    pub native_binding: NativeBindingPlan,
+}
+
 pub fn validate_soyo<'a>(
     metadata: &'a SoyoMetadata,
     policy: SoyoTargetPolicy,
 ) -> Result<SoyoLoadPlan<'a>, SoyoError> {
+    if metadata.header.artifact_kind != ArtifactKind::Executable {
+        return Err(SoyoError::Unsupported(UnsupportedKind::ArtifactKind(
+            metadata.header.artifact_kind as u16,
+        )));
+    }
     if policy
         .target_arch
         .is_some_and(|target| target != metadata.header.target_arch)
@@ -77,6 +89,47 @@ pub fn validate_soyo<'a>(
     Ok(SoyoLoadPlan {
         metadata,
         entry_offset: metadata.header.entry_offset,
+        enabled_features: metadata.header.required_features
+            | (metadata.header.optional_features & policy.supported_required_features),
+        native_binding,
+    })
+}
+
+pub fn validate_component_soyo<'a>(
+    metadata: &'a SoyoMetadata,
+    policy: SoyoTargetPolicy,
+) -> Result<SoyoComponentPlan<'a>, SoyoError> {
+    if metadata.header.artifact_kind != ArtifactKind::SharedComponent {
+        return Err(SoyoError::Unsupported(UnsupportedKind::ArtifactKind(
+            metadata.header.artifact_kind as u16,
+        )));
+    }
+    if policy
+        .target_arch
+        .is_some_and(|target| target != metadata.header.target_arch)
+    {
+        return Err(SoyoError::Incompatible(IncompatibleKind::TargetArch));
+    }
+    let unsupported_features =
+        metadata.header.required_features & !policy.supported_required_features;
+    if unsupported_features != 0 {
+        return Err(SoyoError::Unsupported(UnsupportedKind::RequiredFeature(
+            unsupported_features,
+        )));
+    }
+    if metadata.header.required_features & FeatureFlags::INIT_FINI_ARRAY.bits() != 0 {
+        return Err(SoyoError::Unsupported(UnsupportedKind::InitFini));
+    }
+    let native_binding = bind_native_abi(
+        metadata.header.abi_family,
+        metadata.header.abi_epoch,
+        &metadata.imports,
+        &metadata.capabilities,
+        policy.native_abi_policy,
+    )
+    .map_err(SoyoError::NativeAbi)?;
+    Ok(SoyoComponentPlan {
+        metadata,
         enabled_features: metadata.header.required_features
             | (metadata.header.optional_features & policy.supported_required_features),
         native_binding,
