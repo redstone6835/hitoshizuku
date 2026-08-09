@@ -1648,6 +1648,12 @@ impl SlabAllocator {
         self.zone_index_for_ptr(ptr).is_some()
     }
 
+    pub(crate) fn owns_in_class(&self, zone_idx: usize, ptr: usize) -> bool {
+        self.zones
+            .get(zone_idx)
+            .is_some_and(|zone| zone.contains(ptr))
+    }
+
     pub fn free_ptr(&self, ptr: usize, cpu_id: usize) -> bool {
         if !self.is_initialized() {
             return false;
@@ -2013,10 +2019,14 @@ fn has_atomic_bits_outside_range(bits: &[AtomicU64; BITMAP_WORDS], end: usize) -
 #[cfg(test)]
 mod slab_state_tests {
     extern crate alloc;
+    extern crate std;
 
     use alloc::boxed::Box;
 
-    use super::{Slab, SlabAuditFlags, SlabNode, SlabObjectState, ZoneState, slab_lookup_bucket};
+    use super::{
+        Slab, SlabAllocator, SlabAuditFlags, SlabNode, SlabObjectState, ZoneState,
+        slab_lookup_bucket,
+    };
     use crate::buddy::PAGE_SIZE;
     use crate::space::{ArenaKind, BackedRange};
 
@@ -2100,6 +2110,30 @@ mod slab_state_tests {
             state.find_allocated_node(ptr, 64, PAGE_SIZE),
             Some((node_addr, SlabObjectState::Allocated))
         );
+    }
+
+    #[test]
+    fn owns_in_class_routes_to_only_the_requested_zone() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let allocator = Box::new(SlabAllocator::new(ArenaKind::Kernel));
+                let zone_idx = 3;
+                let mut node = test_slab_node(PAGE_SIZE);
+                let ptr = node.slab.allocate(64).expect("分配测试对象");
+                let node_addr = (&mut *node as *mut SlabNode) as usize;
+                allocator.zones[zone_idx]
+                    .state
+                    .lock()
+                    .insert_slab_node(node_addr);
+
+                assert!(allocator.owns_in_class(zone_idx, ptr));
+                assert!(!allocator.owns_in_class(zone_idx + 1, ptr));
+                assert!(!allocator.owns_in_class(super::SIZE_CLASS_COUNT, ptr));
+            })
+            .expect("创建大栈测试线程")
+            .join()
+            .expect("ownership 路由测试线程失败");
     }
 
     #[test]

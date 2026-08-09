@@ -1875,8 +1875,10 @@ impl KernelMemorySubsystem {
     ) -> *mut u8 {
         let old_small = SlabAllocator::class_index_for(old_layout);
         let new_small = SlabAllocator::class_index_for(new_layout);
-        if old_small.is_some() && old_small == new_small && self.slab.owns(ptr as usize) {
-            return ptr;
+        if let Some(old_zone_idx) = old_small {
+            if old_small == new_small && self.slab.owns_in_class(old_zone_idx, ptr as usize) {
+                return ptr;
+            }
         }
         if old_small.is_none()
             && new_small.is_none()
@@ -1887,8 +1889,8 @@ impl KernelMemorySubsystem {
             return ptr;
         }
 
-        let old_valid = if old_small.is_some() {
-            self.slab.owns(ptr as usize)
+        let old_valid = if let Some(old_zone_idx) = old_small {
+            self.slab.owns_in_class(old_zone_idx, ptr as usize)
         } else {
             self.kheap
                 .can_reuse_layout(ptr as usize, old_layout, old_layout, &self.vmem)
