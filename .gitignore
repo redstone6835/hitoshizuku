@@ -6,6 +6,8 @@ kernel-la
 kernel-rv
 kernel-la-kcsan
 kernel-rv-kcsan
+kernel-la-profile
+kernel-rv-profile
 disk.img
 disk-la.img
 
@@ -39,3 +41,5 @@ kernel-la.lock
 kernel-rv.lock
 kernel-la-kcsan.lock
 kernel-rv-kcsan.lock
+kernel-la-profile.lock
+kernel-rv-profile.lock
