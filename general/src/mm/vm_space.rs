@@ -1651,6 +1651,66 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
         let claim = self.shards[shard_index]
             .lock()
             .claim(key, hashes.table, &self.next_load_id);
+        self.wrap_claim(key, claim)
+    }
+
+    #[cfg(test)]
+    fn claim_batch(&self, keys: &[FilePageKey]) -> PrivateFilePageClaims<'_, SHARD_COUNT> {
+        let mut hashes =
+            SmallVec::<[PrivateFilePageHashes; PRIVATE_FILE_BATCH_MAX_PAGES]>::with_capacity(
+                keys.len(),
+            );
+        let mut claims = SmallVec::<
+            [Option<PrivateFilePageCacheStateClaim>; PRIVATE_FILE_BATCH_MAX_PAGES],
+        >::with_capacity(keys.len());
+        let mut shard_mask = 0usize;
+        for key in keys {
+            let key_hashes = key.private_cache_hashes();
+            let shard = (key_hashes.cache as usize) & (SHARD_COUNT - 1);
+            shard_mask |= 1usize << shard;
+            hashes.push(key_hashes);
+            claims.push(None);
+        }
+
+        while shard_mask != 0 {
+            let shard_index = shard_mask.trailing_zeros() as usize;
+            shard_mask &= shard_mask - 1;
+            let mut shard = self.shards[shard_index].lock();
+            for (index, (key, key_hashes)) in keys.iter().zip(&hashes).enumerate() {
+                if (key_hashes.cache as usize) & (SHARD_COUNT - 1) != shard_index {
+                    continue;
+                }
+                claims[index] = Some(shard.claim(*key, key_hashes.table, &self.next_load_id));
+            }
+        }
+
+        keys.iter()
+            .copied()
+            .zip(claims)
+            .map(|(key, claim)| {
+                self.wrap_claim(key, claim.expect("batch claim must cover every input key"))
+            })
+            .collect()
+    }
+
+    fn claim_batch_prefix(&self, keys: &[FilePageKey]) -> PrivateFilePageClaims<'_, SHARD_COUNT> {
+        let mut claims = PrivateFilePageClaims::new();
+        for key in keys {
+            let claim = self.claim(*key);
+            let owner = matches!(&claim, PrivateFilePageCacheClaim::Owner(_));
+            claims.push(claim);
+            if !owner {
+                break;
+            }
+        }
+        claims
+    }
+
+    fn wrap_claim(
+        &self,
+        key: FilePageKey,
+        claim: PrivateFilePageCacheStateClaim,
+    ) -> PrivateFilePageCacheClaim<'_, SHARD_COUNT> {
         match claim {
             PrivateFilePageCacheStateClaim::Ready(page) => PrivateFilePageCacheClaim::Ready(page),
             PrivateFilePageCacheStateClaim::Loading(id) => {
@@ -1880,6 +1940,54 @@ struct PageMapping {
     access: PageAccess,
 }
 
+#[derive(Clone, Copy)]
+struct ForkChildMap {
+    vaddr: usize,
+    paddr: usize,
+    flags: VmFlags,
+}
+
+fn map_fork_child_batches<F>(
+    maps: &[ForkChildMap],
+    page_size: usize,
+    mut map_batch: F,
+) -> Result<(), crate::MapBatchResult>
+where
+    F: FnMut(usize, &[usize], VmFlags) -> crate::MapBatchResult,
+{
+    let Some(first) = maps.first().copied() else {
+        return Ok(());
+    };
+    let mut batch_vaddr = first.vaddr;
+    let mut batch_flags = first.flags;
+    let mut paddrs = Vec::new();
+
+    for mapping in maps {
+        let next_vaddr = paddrs
+            .len()
+            .checked_mul(page_size)
+            .and_then(|len| batch_vaddr.checked_add(len));
+        if !paddrs.is_empty() && (next_vaddr != Some(mapping.vaddr) || mapping.flags != batch_flags)
+        {
+            let result = map_batch(batch_vaddr, &paddrs, batch_flags);
+            if result.error.is_some() || result.mapped != paddrs.len() {
+                return Err(result);
+            }
+            paddrs.clear();
+            batch_vaddr = mapping.vaddr;
+            batch_flags = mapping.flags;
+        }
+        paddrs.push(mapping.paddr);
+    }
+
+    let result = map_batch(batch_vaddr, &paddrs, batch_flags);
+    if result.error.is_some() || result.mapped != paddrs.len() {
+        Err(result)
+    } else {
+        Ok(())
+    }
+}
+
 struct PrivateFileFaultAround {
     fault_page: usize,
     end: usize,
@@ -1899,6 +2007,8 @@ type PreparedFilePages = SmallVec<[PreparedFilePage; FILE_FAULT_AROUND_PAGES]>;
 type PrivateFilePageBatch = SmallVec<[Arc<ResidentPage>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
 type PrivateFilePageLoadOwner = (FilePageKey, u64, u64);
 type PrivateFilePageLoadOwners = SmallVec<[PrivateFilePageLoadOwner; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+type PrivateFilePageClaims<'a, const SHARD_COUNT: usize> =
+    SmallVec<[PrivateFilePageCacheClaim<'a, SHARD_COUNT>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
 type PrivateFilePageCandidate = (FilePageKey, u64, Arc<ResidentPage>);
 type PrivateFilePageCandidates = SmallVec<[PrivateFilePageCandidate; PRIVATE_FILE_BATCH_MAX_PAGES]>;
 type PublishedPrivateFilePages =
@@ -3099,45 +3209,47 @@ impl VmSpace {
             let page_size = page_size();
             let mut batch: Option<(usize, usize, PageAccess, VmFlags)> = None;
             let mut protect_error = None;
-            pages.for_each_range_mut(range.clone(), |va, mapping| {
-                if protect_error.is_some() {
-                    return;
-                }
-                let Some(area) = set.find(va) else {
-                    return;
-                };
-                let access = access_for_existing_page(area.flags, &mapping.page);
-                let flags = pte_flags_for(area.flags, access);
-                mapping.access = access;
-                if let Some((batch_start, batch_end, batch_access, batch_flags)) = batch {
-                    if va == batch_end && access == batch_access && flags == batch_flags {
-                        batch = Some((
+            for area in set.iter_overlap(&range) {
+                let resident_range =
+                    area.range.start.max(range.start)..area.range.end.min(range.end);
+                let area_flags = area.flags;
+                pages.for_each_range_mut(resident_range, |va, mapping| {
+                    if protect_error.is_some() {
+                        return;
+                    }
+                    let access = access_for_existing_page(area_flags, &mapping.page);
+                    let flags = pte_flags_for(area_flags, access);
+                    mapping.access = access;
+                    if let Some((batch_start, batch_end, batch_access, batch_flags)) = batch {
+                        if va == batch_end && access == batch_access && flags == batch_flags {
+                            batch = Some((
+                                batch_start,
+                                batch_end + page_size,
+                                batch_access,
+                                batch_flags,
+                            ));
+                            return;
+                        }
+                        if let Err(err) = self.protect_pages_no_flush(
                             batch_start,
-                            batch_end + page_size,
-                            batch_access,
+                            batch_end - batch_start,
                             batch_flags,
-                        ));
-                        return;
+                        ) {
+                            protect_error = Some(err);
+                            return;
+                        }
+                        #[cfg(feature = "performance-profile")]
+                        profiling::record(
+                            profiling::Event::MmProtectBatch,
+                            0,
+                            (batch_end - batch_start) as u64,
+                            ((batch_end - batch_start) / page_size) as u64,
+                        );
+                        touched = true;
                     }
-                    if let Err(err) = self.protect_pages_no_flush(
-                        batch_start,
-                        batch_end - batch_start,
-                        batch_flags,
-                    ) {
-                        protect_error = Some(err);
-                        return;
-                    }
-                    #[cfg(feature = "performance-profile")]
-                    profiling::record(
-                        profiling::Event::MmProtectBatch,
-                        0,
-                        (batch_end - batch_start) as u64,
-                        ((batch_end - batch_start) / page_size) as u64,
-                    );
-                    touched = true;
-                }
-                batch = Some((va, va + page_size, access, flags));
-            });
+                    batch = Some((va, va + page_size, access, flags));
+                });
+            }
             if let Some(err) = protect_error {
                 return Err(err);
             }
@@ -3296,12 +3408,11 @@ impl VmSpace {
                         .expect("[mm] fork parent protect failed");
                 }
                 let child_mapping = mapping.clone();
-                child_maps.push((
-                    va,
-                    child_mapping.page.clone(),
-                    area.flags,
-                    child_mapping.access,
-                ));
+                child_maps.push(ForkChildMap {
+                    vaddr: va,
+                    paddr: child_mapping.page.paddr(),
+                    flags: pte_flags_for(area.flags, child_mapping.access).with(VmFlags::USER),
+                });
                 child_pages.insert(va, child_mapping);
             });
         }
@@ -3310,17 +3421,10 @@ impl VmSpace {
             self.flush_full_user_tlb();
         }
 
-        for (va, page, flags, access) in &child_maps {
-            unsafe {
-                (ops.map)(
-                    new_pgd,
-                    *va,
-                    page.paddr(),
-                    pte_flags_for(*flags, *access).with(VmFlags::USER),
-                )
-                .expect("[mm] fork child map failed");
-            }
-        }
+        map_fork_child_batches(&child_maps, page_size(), |vaddr, paddrs, flags| unsafe {
+            (ops.map_pages)(new_pgd, vaddr, paddrs, flags)
+        })
+        .expect("[mm] fork child map failed");
 
         Self::notify_files_mapped(cloned_file_backings);
 
@@ -5010,41 +5114,63 @@ fn load_private_file_page_batch(
     if plan.pages > PRIVATE_FILE_BATCH_MAX_PAGES {
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
-    let mut owners = PrivateFilePageLoadOwners::new();
+    let mut keys = SmallVec::<[FilePageKey; PRIVATE_FILE_BATCH_MAX_PAGES]>::new();
+    let mut offsets = SmallVec::<[u64; PRIVATE_FILE_BATCH_MAX_PAGES]>::new();
     for index in 0..plan.pages {
         let Some(offset) = private_file_batch_page_offset(file_off, index, page_size) else {
-            abort_private_file_page_loads(&owners, None);
             return Ok(PrivateFilePageBatchLoad::Fallback);
         };
-        let key = FilePageKey::new_private(file_key, offset, generation);
-        match PRIVATE_FILE_PAGES.claim(key) {
+        keys.push(FilePageKey::new_private(file_key, offset, generation));
+        offsets.push(offset);
+    }
+
+    let mut owners = PrivateFilePageLoadOwners::new();
+    let mut cached = None;
+    let mut fatal_error = None;
+    let mut force_fallback = false;
+    for (index, ((key, offset), claim)) in keys
+        .iter()
+        .copied()
+        .zip(offsets.iter().copied())
+        .zip(PRIVATE_FILE_PAGES.claim_batch_prefix(&keys))
+        .enumerate()
+    {
+        match claim {
             PrivateFilePageCacheClaim::Ready(page) if index == 0 => {
-                abort_private_file_page_loads(&owners, None);
-                if file.private_page_cache_generation() != Some(generation) {
-                    return Ok(PrivateFilePageBatchLoad::Fallback);
-                }
-                return Ok(PrivateFilePageBatchLoad::Cached(page));
+                cached = Some(page);
             }
-            PrivateFilePageCacheClaim::Ready(_) | PrivateFilePageCacheClaim::Loading(_) => {
-                break;
-            }
+            PrivateFilePageCacheClaim::Ready(_) | PrivateFilePageCacheClaim::Loading(_) => {}
             PrivateFilePageCacheClaim::Failed(error)
                 if private_file_batch_error_is_fatal(index) =>
             {
-                abort_private_file_page_loads(&owners, None);
-                return if file.private_page_cache_generation() == Some(generation) {
-                    Err(error)
-                } else {
-                    Ok(PrivateFilePageBatchLoad::Fallback)
-                };
+                fatal_error = Some(error);
             }
-            PrivateFilePageCacheClaim::Failed(_) => break,
+            PrivateFilePageCacheClaim::Failed(_) => {}
             PrivateFilePageCacheClaim::Owner(load_id) => owners.push((key, offset, load_id)),
             PrivateFilePageCacheClaim::Bypass => {
-                abort_private_file_page_loads(&owners, None);
-                return Ok(PrivateFilePageBatchLoad::Fallback);
+                force_fallback = true;
             }
         }
+    }
+    if let Some(page) = cached {
+        abort_private_file_page_loads(&owners, None);
+        return if file.private_page_cache_generation() == Some(generation) {
+            Ok(PrivateFilePageBatchLoad::Cached(page))
+        } else {
+            Ok(PrivateFilePageBatchLoad::Fallback)
+        };
+    }
+    if let Some(error) = fatal_error {
+        abort_private_file_page_loads(&owners, None);
+        return if file.private_page_cache_generation() == Some(generation) {
+            Err(error)
+        } else {
+            Ok(PrivateFilePageBatchLoad::Fallback)
+        };
+    }
+    if force_fallback {
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
     }
     if owners.len() < PRIVATE_FILE_BATCH_MIN_PAGES {
         abort_private_file_page_loads(&owners, None);
@@ -5646,25 +5772,130 @@ pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
 mod tests {
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
     use core::sync::atomic::Ordering;
 
     use super::{
         ANON_STORE_FAULT_AROUND_PAGES, ANON_STORE_SHADOW_PAGES, AnonStoreShadowKey,
         AnonStoreShadowState, FILE_FAULT_AROUND_PAGES, FaultKind, FaultOutcome, FilePageKey,
-        PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, PrivateFilePageCacheClaim,
+        ForkChildMap, PRIVATE_FILE_BATCH_MAX_BYTES, PageAccess, PrivateFilePageCacheClaim,
         PrivateFilePageCacheEntry, ResidentPage, ShardedPrivateFilePageCache, VmFlags,
         WeakFilePageCache, access_for_private_file, anon_store_fault_around_end, fault_from_errno,
-        file_fault_around_window, find_cached_private_file_page, observe_anon_store_shadow,
-        permits_file_fault_around, plan_file_segment, private_file_batch_error_is_fatal,
-        private_file_batch_page_offset, private_file_batch_plan, publish_cached_file_page,
-        publish_cached_private_file_page, read_file_bytes_exact, read_file_page_exact,
-        same_backing_snapshot, unmapped_prefix_len, user_page_allocation_handle,
+        file_fault_around_window, find_cached_private_file_page, map_fork_child_batches,
+        observe_anon_store_shadow, permits_file_fault_around, plan_file_segment,
+        private_file_batch_error_is_fatal, private_file_batch_page_offset, private_file_batch_plan,
+        publish_cached_file_page, publish_cached_private_file_page, read_file_bytes_exact,
+        read_file_page_exact, same_backing_snapshot, unmapped_prefix_len,
+        user_page_allocation_handle,
     };
     use errno::Errno;
     use mm::{FileLike, VmBacking};
     use sched::sync::Spinlock;
 
     const PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn fork_child_mapping_batches_contiguous_pages_with_same_flags() {
+        let flags = VmFlags::EMPTY.with(VmFlags::READ);
+        let maps = [
+            ForkChildMap {
+                vaddr: 0x1000,
+                paddr: 0x9000,
+                flags,
+            },
+            ForkChildMap {
+                vaddr: 0x2000,
+                paddr: 0xb000,
+                flags,
+            },
+            ForkChildMap {
+                vaddr: 0x3000,
+                paddr: 0xa000,
+                flags,
+            },
+        ];
+        let mut batches = Vec::new();
+
+        map_fork_child_batches(&maps, PAGE_SIZE, |vaddr, paddrs, batch_flags| {
+            batches.push((vaddr, paddrs.to_vec(), batch_flags));
+            crate::MapBatchResult {
+                mapped: paddrs.len(),
+                error: None,
+            }
+        })
+        .expect("contiguous child pages must map as one batch");
+
+        assert_eq!(batches, vec![(0x1000, vec![0x9000, 0xb000, 0xa000], flags)]);
+    }
+
+    #[test]
+    fn fork_child_mapping_splits_gaps_and_permission_changes() {
+        let read = VmFlags::EMPTY.with(VmFlags::READ);
+        let write = read.with(VmFlags::WRITE);
+        let maps = [
+            ForkChildMap {
+                vaddr: 0x1000,
+                paddr: 0x9000,
+                flags: read,
+            },
+            ForkChildMap {
+                vaddr: 0x3000,
+                paddr: 0xa000,
+                flags: read,
+            },
+            ForkChildMap {
+                vaddr: 0x4000,
+                paddr: 0xb000,
+                flags: write,
+            },
+        ];
+        let mut starts = Vec::new();
+
+        map_fork_child_batches(&maps, PAGE_SIZE, |vaddr, paddrs, flags| {
+            starts.push((vaddr, paddrs.len(), flags));
+            crate::MapBatchResult {
+                mapped: paddrs.len(),
+                error: None,
+            }
+        })
+        .expect("valid child batches must map");
+
+        assert_eq!(
+            starts,
+            vec![(0x1000, 1, read), (0x3000, 1, read), (0x4000, 1, write)]
+        );
+    }
+
+    #[test]
+    fn fork_child_mapping_stops_after_partial_batch_failure() {
+        let flags = VmFlags::EMPTY.with(VmFlags::READ);
+        let maps = [
+            ForkChildMap {
+                vaddr: 0x1000,
+                paddr: 0x9000,
+                flags,
+            },
+            ForkChildMap {
+                vaddr: 0x2000,
+                paddr: 0xa000,
+                flags,
+            },
+        ];
+
+        let result = map_fork_child_batches(&maps, PAGE_SIZE, |_, _, _| crate::MapBatchResult {
+            mapped: 1,
+            error: Some(crate::MapError::OutOfMemory),
+        });
+
+        assert_eq!(
+            result,
+            Err(crate::MapBatchResult {
+                mapped: 1,
+                error: Some(crate::MapError::OutOfMemory),
+            })
+        );
+    }
 
     #[test]
     fn user_page_allocation_failure_is_not_a_kernel_access_fault() {
@@ -6223,6 +6454,51 @@ mod tests {
         assert_eq!(ready_diag.load_leaders, 1);
         assert_eq!(ready_diag.hits, 1);
         assert_eq!(cache.next_load_id.load(Ordering::Relaxed), next_after_owner);
+    }
+
+    #[test]
+    fn private_file_cache_batch_claim_preserves_key_order() {
+        let cache = ShardedPrivateFilePageCache::<4>::new(16);
+        let keys = [
+            cache_key_for_shard(&cache, 3, 0),
+            cache_key_for_shard(&cache, 0, 0),
+            cache_key_for_shard(&cache, 3, 1),
+            cache_key_for_shard(&cache, 1, 0),
+        ];
+
+        let claims = cache.claim_batch(&keys);
+        assert_eq!(claims.len(), keys.len());
+        for (key, claim) in keys.into_iter().zip(claims) {
+            let PrivateFilePageCacheClaim::Owner(load_id) = claim else {
+                panic!("vacant batch key must create a load owner");
+            };
+            assert!(cache.load_pending(key, load_id));
+            cache.abort_load(key, load_id, None);
+        }
+    }
+
+    #[test]
+    fn private_file_cache_batch_claim_stops_after_first_non_owner() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(8);
+        let keys = [cache_key(61), cache_key(62), cache_key(63)];
+        let second_load = match cache.claim(keys[1]) {
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            _ => panic!("second key must start as an owner"),
+        };
+
+        let claims = cache.claim_batch_prefix(&keys);
+        assert_eq!(claims.len(), 2);
+        assert!(matches!(&claims[0], PrivateFilePageCacheClaim::Owner(_)));
+        assert!(matches!(&claims[1], PrivateFilePageCacheClaim::Loading(_)));
+        assert!(cache.shards[0].lock().pages.get(&keys[2]).is_none());
+
+        let first_load = match &claims[0] {
+            PrivateFilePageCacheClaim::Owner(load_id) => *load_id,
+            _ => unreachable!(),
+        };
+        drop(claims);
+        cache.abort_load(keys[0], first_load, None);
+        cache.abort_load(keys[1], second_load, None);
     }
 
     #[test]
