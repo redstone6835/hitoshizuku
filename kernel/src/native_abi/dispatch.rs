@@ -29,7 +29,11 @@ pub(super) fn dispatch_native_call_with_context(
     let Ok(slot) = usize::try_from(call.slot) else {
         return native_return(native_abi::status::ABI_BAD_SLOT, 0, 0);
     };
-    let Some(binding) = state.binding.call_slots.get(slot) else {
+    let binding = if let Some(binding) = state.binding.call_slots.get(slot).copied() {
+        binding
+    } else if let Some(binding) = state.components.resolve_slot(slot) {
+        binding
+    } else {
         return native_return(native_abi::status::ABI_BAD_SLOT, 0, 0);
     };
     if binding.slot as usize != slot {
@@ -64,23 +68,67 @@ fn valid_call_arguments(operation: OperationId, call: &NativeCallFrame) -> bool 
     }
     let unused = match operation {
         OperationId::ProcessExit
+        | OperationId::ThreadExit
         | OperationId::HandleRestrict
         | OperationId::ProcessTerminate
         | OperationId::EventCreate
         | OperationId::EventCancel => &call.args[1..],
-        OperationId::HandleClose | OperationId::HandleDuplicate | OperationId::ClockRead => {
-            &call.args[..]
-        }
+        OperationId::HandleClose
+        | OperationId::HandleDuplicate
+        | OperationId::ClockRead
+        | OperationId::ThreadYield
+        | OperationId::MemoryRevoke => &call.args[..],
         OperationId::StreamRead | OperationId::StreamWrite => &call.args[2..],
         OperationId::MemoryAllocate => &call.args[2..],
         OperationId::MemoryFree => &call.args[2..],
         OperationId::ImageCreate | OperationId::ProcessSpawn | OperationId::ProcessReplace => {
             &call.args[2..]
         }
-        OperationId::ProcessQuery => &call.args[1..],
+        OperationId::ProcessQuery | OperationId::ImageQuery => &call.args[1..],
         OperationId::ProcessWait => &call.args[2..],
         OperationId::EventBind | OperationId::EventTimer => &call.args[3..],
         OperationId::EventWait => &call.args[3..],
+        OperationId::ComponentLoad
+        | OperationId::ComponentActivate
+        | OperationId::ComponentFinish => &call.args[2..],
+        OperationId::ComponentUnload => &call.args[3..],
+        OperationId::ComponentQuery | OperationId::ComponentInterface => &call.args[1..],
+        OperationId::ComponentWake => &call.args[1..],
+        OperationId::ThreadQuery
+        | OperationId::MemoryCreate
+        | OperationId::MemoryMap
+        | OperationId::MemoryQuery
+        | OperationId::MemoryStatistics
+        | OperationId::DirectoryOpen
+        | OperationId::DirectoryCreate
+        | OperationId::DirectoryQuery
+        | OperationId::FileResize
+        | OperationId::FileQuery
+        | OperationId::ChannelCreate
+        | OperationId::ChannelSend => &call.args[1..],
+        OperationId::ThreadCreate => &call.args[2..],
+        OperationId::ThreadJoin
+        | OperationId::MemoryUnmap
+        | OperationId::DirectoryRemove
+        | OperationId::ChannelReceive => &call.args[2..],
+        OperationId::ThreadTerminate => &call.args[1..],
+        OperationId::FileRead | OperationId::FileWrite => &call.args[4..],
+        OperationId::FileMap => &call.args[3..],
+        OperationId::RingCreate => &call.args[1..],
+        OperationId::RingRegister => &call.args[3..],
+        OperationId::RingUnregister | OperationId::RingCancel => &call.args[1..],
+        OperationId::RingKick => &call.args[2..],
+        OperationId::RingWait => &call.args[3..],
+        OperationId::RingQuery => &call.args[1..],
+        OperationId::SocketCreate
+        | OperationId::SocketBind
+        | OperationId::SocketConnect
+        | OperationId::SocketListen
+        | OperationId::SocketAccept
+        | OperationId::SocketShutdown
+        | OperationId::SocketQuery => &call.args[1..],
+        OperationId::SocketSend | OperationId::SocketReceive => &call.args[5..],
+        OperationId::DeviceInvoke | OperationId::DeviceQuery => &call.args[1..],
     };
     unused.iter().all(|argument| *argument == 0)
 }

@@ -23,7 +23,7 @@ pub(super) struct PinnedNativeHandle {
 
 pub(super) fn execute_native_operation(
     task: &Arc<sched::Task>,
-    state: &NativeProcessState,
+    state: &Arc<NativeProcessState>,
     operation: OperationId,
     handle: NativeHandle,
     pinned: PinnedNativeHandle,
@@ -38,6 +38,23 @@ pub(super) fn execute_native_operation(
                 return native_return(native_abi::status::CORE_INVALID_ARGUMENT, 0, 0);
             }
             NativeCallOutcome::ExitGroup(call.args[0] as u32 as i32)
+        }
+        OperationId::ThreadExit => {
+            if !matches!(pinned.object, KernelNativeObject::SelfProcess)
+                || call.args[0] > u32::MAX as u64
+            {
+                return native_return(native_abi::status::CORE_INVALID_ARGUMENT, 0, 0);
+            }
+            NativeCallOutcome::ExitThread(call.args[0] as u32 as i32)
+        }
+        OperationId::ThreadYield => {
+            if !matches!(pinned.object, KernelNativeObject::SelfProcess) {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            }
+            match sched::operation::sched_yield() {
+                Ok(()) => native_return(native_abi::status::OK, 0, 0),
+                Err(_) => native_return(native_abi::status::THREAD_INVALID, 0, 0),
+            }
         }
         OperationId::HandleClose => {
             let result = state.handles.lock().close(handle);
@@ -92,6 +109,12 @@ pub(super) fn execute_native_operation(
                 return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
             }
             super::process::image_create(state, call.args[0], call.args[1])
+        }
+        OperationId::ImageQuery => {
+            let KernelNativeObject::Image(image) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::image::image_query(&image, call.args[0])
         }
         OperationId::ProcessSpawn => {
             if !matches!(pinned.object, KernelNativeObject::SelfProcess) {
@@ -148,6 +171,333 @@ pub(super) fn execute_native_operation(
             call.args[1],
             call.args[2],
         ),
+        OperationId::ComponentLoad => {
+            if !matches!(pinned.object, KernelNativeObject::SelfProcess) {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            }
+            super::component::component_load(state, call.args[0], call.args[1])
+        }
+        OperationId::ComponentActivate => {
+            let KernelNativeObject::ComponentTransaction(transaction) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::component::component_activate(
+                state,
+                &transaction,
+                handle,
+                call.args[0],
+                call.args[1],
+            )
+        }
+        OperationId::ComponentQuery => {
+            let KernelNativeObject::Component(component) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::component::component_query(&component, call.args[0])
+        }
+        OperationId::ComponentInterface => {
+            let KernelNativeObject::Component(component) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::component::component_interface(state, &component, handle, call.args[0])
+        }
+        OperationId::ComponentUnload => {
+            let KernelNativeObject::Component(component) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::component::component_unload(
+                task,
+                state,
+                &component,
+                handle,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+            )
+        }
+        OperationId::ComponentFinish => {
+            let KernelNativeObject::ComponentTransaction(transaction) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::component::component_finish(
+                state,
+                &transaction,
+                handle,
+                call.args[0],
+                call.args[1],
+            )
+        }
+        OperationId::ComponentWake => {
+            let KernelNativeObject::Component(component) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::component::component_wake(&component, call.args[0])
+        }
+        OperationId::MemoryCreate => {
+            super::memory::memory_create(task, state, &pinned.object, call.args[0])
+        }
+        OperationId::MemoryMap => {
+            let KernelNativeObject::MemoryObject(object) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::memory::memory_map(task, state, &object, pinned.rights, call.args[0])
+        }
+        OperationId::MemoryUnmap => {
+            let KernelNativeObject::AddressSpace(vm) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::memory::memory_unmap(state, &vm, call.args[0], call.args[1])
+        }
+        OperationId::MemoryQuery => {
+            let KernelNativeObject::MemoryObject(object) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::memory::memory_query(task, &object, call.args[0])
+        }
+        OperationId::MemoryRevoke => {
+            let KernelNativeObject::MemoryObject(object) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::memory::memory_revoke(task, &object)
+        }
+        OperationId::MemoryStatistics => {
+            let KernelNativeObject::MemoryObject(object) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::memory::memory_statistics(task, state, &object, call.args[0])
+        }
+        OperationId::ThreadCreate => {
+            super::thread::thread_create(task, state, &pinned.object, call.args[0], call.args[1])
+        }
+        OperationId::ThreadJoin => {
+            let KernelNativeObject::Thread(thread) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::thread::thread_join(task, &thread, call.args[0], call.args[1])
+        }
+        OperationId::ThreadTerminate => {
+            let KernelNativeObject::Thread(thread) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::thread::thread_terminate(task, &thread, call.args[0])
+        }
+        OperationId::ThreadQuery => {
+            let KernelNativeObject::Thread(thread) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::thread::thread_query(task, &thread, call.args[0])
+        }
+        OperationId::DirectoryOpen => {
+            let KernelNativeObject::Directory(directory) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::directory_open(task, state, &directory, call.args[0])
+        }
+        OperationId::DirectoryCreate => {
+            let KernelNativeObject::Directory(directory) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::directory_create(task, state, &directory, call.args[0])
+        }
+        OperationId::DirectoryRemove => {
+            let KernelNativeObject::Directory(directory) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::directory_remove(task, &directory, call.args[0], call.args[1])
+        }
+        OperationId::DirectoryQuery => {
+            let KernelNativeObject::Directory(directory) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::directory_query(task, &directory, call.args[0])
+        }
+        OperationId::FileRead => {
+            let KernelNativeObject::File(file) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::file_read(
+                task,
+                &file,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+                call.args[3],
+            )
+        }
+        OperationId::FileWrite => {
+            let KernelNativeObject::File(file) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::file_write(
+                task,
+                &file,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+                call.args[3],
+            )
+        }
+        OperationId::FileResize => {
+            let KernelNativeObject::File(file) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::file_resize(&file, call.args[0])
+        }
+        OperationId::FileQuery => {
+            let KernelNativeObject::File(file) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::file_query(task, &file, call.args[0])
+        }
+        OperationId::FileMap => {
+            let KernelNativeObject::File(file) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::fs::file_map(
+                task,
+                state,
+                &file,
+                pinned.rights,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+            )
+        }
+        OperationId::ChannelCreate => {
+            super::channel::channel_create(state, &pinned.object, call.args[0])
+        }
+        OperationId::ChannelSend => {
+            let KernelNativeObject::Channel(channel) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::channel::channel_send(task, state, &channel, call.args[0])
+        }
+        OperationId::ChannelReceive => {
+            let KernelNativeObject::Channel(channel) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::channel::channel_receive(task, state, &channel, call.args[0], call.args[1])
+        }
+        OperationId::RingCreate => {
+            super::ring::ring_create(task, state, &pinned.object, call.args[0])
+        }
+        OperationId::RingRegister => {
+            let KernelNativeObject::SubmissionRing(ring) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::ring::ring_register(state, &ring, call.args[0], call.args[1], call.args[2])
+        }
+        OperationId::RingUnregister => {
+            let KernelNativeObject::SubmissionRing(ring) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::ring::ring_unregister(&ring, call.args[0])
+        }
+        OperationId::RingKick => {
+            let KernelNativeObject::SubmissionRing(ring) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::ring::ring_kick(state, &ring, call.args[0])
+        }
+        OperationId::RingCancel => {
+            let KernelNativeObject::SubmissionRing(ring) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::ring::ring_cancel(&ring, call.args[0])
+        }
+        OperationId::RingWait => {
+            let KernelNativeObject::SubmissionRing(ring) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::ring::ring_wait(task, &ring, call.args[0], call.args[1])
+        }
+        OperationId::RingQuery => {
+            let KernelNativeObject::SubmissionRing(ring) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::ring::ring_query(task, &ring, call.args[0])
+        }
+        OperationId::SocketCreate => {
+            super::socket::socket_create(task, state, &pinned.object, call.args[0])
+        }
+        OperationId::SocketBind => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_bind(task, &socket, call.args[0])
+        }
+        OperationId::SocketConnect => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_connect(task, &socket, call.args[0])
+        }
+        OperationId::SocketListen => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_listen(&socket, call.args[0])
+        }
+        OperationId::SocketAccept => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_accept(task, state, &socket, call.args[0])
+        }
+        OperationId::SocketSend => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_send(
+                task,
+                state,
+                &socket,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+                call.args[3],
+                call.args[4],
+            )
+        }
+        OperationId::SocketReceive => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_receive(
+                task,
+                state,
+                &socket,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+                call.args[3],
+                call.args[4],
+            )
+        }
+        OperationId::SocketShutdown => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_shutdown(&socket, call.args[0])
+        }
+        OperationId::SocketQuery => {
+            let KernelNativeObject::Socket(socket) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::socket::socket_query(task, &socket, call.args[0])
+        }
+        OperationId::DeviceInvoke => {
+            let KernelNativeObject::DeviceFunction(device) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::device::device_invoke(task, state, &device, call.args[0])
+        }
+        OperationId::DeviceQuery => {
+            let KernelNativeObject::DeviceFunction(device) = pinned.object else {
+                return native_return(native_abi::status::HANDLE_WRONG_INTERFACE, 0, 0);
+            };
+            super::device::device_query(task, &device, call.args[0])
+        }
     }
 }
 
@@ -389,6 +739,93 @@ fn stream_read(task: &Arc<sched::Task>, file: &File, user: u64, len: u64) -> Nat
     native_return(native_abi::status::OK, read as u64, 0)
 }
 
+pub(super) fn stream_read_memory(
+    file: &File,
+    memory: &Arc<super::memory::MemoryObject>,
+    offset: u64,
+    length: u64,
+) -> NativeCallOutcome {
+    let Ok(length) = usize::try_from(length) else {
+        return native_return(native_abi::status::CORE_OUT_OF_RANGE, 0, 0);
+    };
+    if length == 0 {
+        return native_return(native_abi::status::OK, 0, 0);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    if buffer.try_reserve_exact(length).is_err() {
+        return native_return(native_abi::status::CORE_RESOURCE_EXHAUSTED, 0, 0);
+    }
+    buffer.resize(length, 0);
+    stream_read_memory_buffered(file, memory, offset, &mut buffer)
+}
+
+pub(super) fn stream_read_memory_buffered(
+    file: &File,
+    memory: &Arc<super::memory::MemoryObject>,
+    offset: u64,
+    buffer: &mut [u8],
+) -> NativeCallOutcome {
+    let access = match memory.begin_access() {
+        Ok(access) => access,
+        Err(error) => return native_return(error, 0, 0),
+    };
+    if let Err(error) = memory.validate_transfer(offset, buffer.len()) {
+        return native_return(error, 0, 0);
+    }
+    let count = match file.read(buffer) {
+        Ok(count) => count,
+        Err(error) => return map_stream_read_error(error, 0),
+    };
+    if count > buffer.len() {
+        return native_return(native_abi::status::STREAM_ERROR, 0, 0);
+    }
+    if count == 0 {
+        return native_return(native_abi::status::STREAM_END, 0, 0);
+    }
+    if let Err(error) = access.write_from(offset, &buffer[..count]) {
+        return native_return(error, 0, 0);
+    }
+    native_return(native_abi::status::OK, count as u64, 0)
+}
+
+pub(super) fn stream_write_memory(
+    file: &File,
+    memory: &Arc<super::memory::MemoryObject>,
+    offset: u64,
+    length: u64,
+) -> NativeCallOutcome {
+    let Ok(length) = usize::try_from(length) else {
+        return native_return(native_abi::status::CORE_OUT_OF_RANGE, 0, 0);
+    };
+    if length == 0 {
+        return native_return(native_abi::status::OK, 0, 0);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    if buffer.try_reserve_exact(length).is_err() {
+        return native_return(native_abi::status::CORE_RESOURCE_EXHAUSTED, 0, 0);
+    }
+    buffer.resize(length, 0);
+    stream_write_memory_buffered(file, memory, offset, &mut buffer)
+}
+
+pub(super) fn stream_write_memory_buffered(
+    file: &File,
+    memory: &Arc<super::memory::MemoryObject>,
+    offset: u64,
+    buffer: &mut [u8],
+) -> NativeCallOutcome {
+    if let Err(error) = memory.read_into(offset, buffer) {
+        return native_return(error, 0, 0);
+    }
+    match file.write(&buffer) {
+        Ok(count) if count <= buffer.len() => {
+            native_return(native_abi::status::OK, count as u64, 0)
+        }
+        Ok(_) => native_return(native_abi::status::STREAM_ERROR, 0, 0),
+        Err(error) => map_stream_write_error(error, 0),
+    }
+}
+
 pub(super) fn stream_read_progress(read: usize, count: usize) -> NativeCallOutcome {
     match read.checked_add(count) {
         Some(total) => native_return(native_abi::status::OK, total as u64, 0),
@@ -504,6 +941,7 @@ fn finish_stream_wait(
 
 pub(super) fn has_native_external_control(task: &Arc<sched::Task>) -> bool {
     task.group_exit_pending()
+        || task.native_thread_exit_boundary_pending().is_some()
         || task.signal.has_any_pending()
         || task.shared_signal_pending_bits_quick() != 0
         || matches!(
