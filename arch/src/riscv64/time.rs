@@ -14,11 +14,15 @@ const NS_FIXED_SHIFT: u32 = 32;
 // QEMU virt 的常见 10 MHz timebase 可精确化为 ticks * 100，不需要 128 位乘法。
 static NS_FACTOR: AtomicU64 = AtomicU64::new(100);
 static NS_SHIFT: AtomicUsize = AtomicUsize::new(0);
+static EXACT_NS_PER_TICK: AtomicU64 = AtomicU64::new(100);
 
 /// 设置稳定计时器频率，同时刷新 ns 转换的预算因子。
 pub fn set_stable_counter_hz(hz: usize) {
     STABLE_TIMER_HZ.store(hz, Ordering::Relaxed);
     let hz = hz.max(1) as u128;
+    let exact_ns_per_tick = (1_000_000_000u128 % hz == 0)
+        .then_some((1_000_000_000u128 / hz) as u64)
+        .unwrap_or(0);
     let (factor, shift) = if 1_000_000_000u128 % hz == 0 {
         ((1_000_000_000u128 / hz) as u64, 0)
     } else {
@@ -29,6 +33,7 @@ pub fn set_stable_counter_hz(hz: usize) {
     };
     NS_FACTOR.store(factor, Ordering::Release);
     NS_SHIFT.store(shift, Ordering::Release);
+    EXACT_NS_PER_TICK.store(exact_ns_per_tick, Ordering::Release);
 }
 
 /// 默认周期性调度 tick 频率。
@@ -194,18 +199,24 @@ pub fn rearm_local_timer(deadline_ns: Option<u64>) {
         || now_ticks.saturating_add(period),
         |deadline_ns| {
             let delta_ns = deadline_ns.saturating_sub(now_ns);
-            let hz = stable_counter_hz().max(1) as u128;
             let delta_ticks = if delta_ns == 0 {
                 1
+            } else if let exact_ns_per_tick = EXACT_NS_PER_TICK.load(Ordering::Acquire)
+                && exact_ns_per_tick != 0
+            {
+                delta_ns.div_ceil(exact_ns_per_tick).clamp(1, period)
             } else {
+                let hz = stable_counter_hz().max(1) as u128;
                 ((delta_ns as u128 * hz).saturating_add(999_999_999) / 1_000_000_000)
                     .clamp(1, period as u128) as u64
             };
             now_ticks.saturating_add(delta_ticks)
         },
     );
-    NEXT_TIMER_DEADLINES[current_timer_cpu()].store(deadline_ticks, Ordering::Release);
-    arm_timer_at(deadline_ticks);
+    let programmed = &NEXT_TIMER_DEADLINES[current_timer_cpu()];
+    if programmed.swap(deadline_ticks, Ordering::AcqRel) != deadline_ticks {
+        arm_timer_at(deadline_ticks);
+    }
 }
 
 #[inline]

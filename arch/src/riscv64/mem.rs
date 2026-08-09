@@ -22,6 +22,8 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
 
         mv      t6, a0
         beqz    a2, .Lrv_copy_return
+        li      t0, 8
+        bltu    a2, t0, .Lrv_copy_scalar_tail
 
         /* 只有源和目的地址同余时，才能同时对齐后使用机器字访问。 */
         xor     t0, a0, a1
@@ -356,6 +358,9 @@ pub unsafe extern "C" fn memset(_dst: *mut u8, _value: i32, _len: usize) -> *mut
         beqz    a2, .Lrv_set_return
 
         andi    a1, a1, 255
+        /* 小区域只使用低字节，跳过构造完整机器字的固定成本。 */
+        li      t0, 16
+        bltu    a2, t0, .Lrv_set_bytes
         slli    t0, a1, 8
         or      a1, a1, t0
         slli    t0, a1, 16
@@ -363,9 +368,6 @@ pub unsafe extern "C" fn memset(_dst: *mut u8, _value: i32, _len: usize) -> *mut
         slli    t0, a1, 32
         or      a1, a1, t0
 
-        /* 小区域逐字节写，避免为对齐付出固定成本。 */
-        li      t0, 16
-        bltu    a2, t0, .Lrv_set_bytes
         andi    t0, a0, 7
         beqz    t0, .Lrv_set_blocks
         li      t1, 8
