@@ -18,7 +18,7 @@
 use core::alloc::Layout;
 use core::mem::MaybeUninit;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::Mutex;
 
@@ -41,6 +41,7 @@ const BITMAP_WORDS: usize = 8;
 const INVALID_SLAB_NODE: usize = 0;
 const INVALID_CACHED_INDEX: u16 = u16::MAX;
 const SLAB_LOOKUP_BUCKETS: usize = 1024;
+const FAST_SLAB_HINT_BUCKETS: usize = 256;
 const MAX_GROW_ATTEMPTS: usize = 3;
 const MAX_EMPTY_SLABS_PER_ZONE: usize = 4;
 
@@ -146,6 +147,92 @@ impl CacheEntry {
             slab_node: INVALID_SLAB_NODE,
             cached_index: INVALID_CACHED_INDEX,
         }
+    }
+}
+
+struct FastSlabDirectoryEntry {
+    sequence: AtomicUsize,
+    slab_base: AtomicUsize,
+    slab_node: AtomicUsize,
+}
+
+impl FastSlabDirectoryEntry {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            slab_base: AtomicUsize::new(0),
+            slab_node: AtomicUsize::new(INVALID_SLAB_NODE),
+        }
+    }
+
+    fn publish(&self, slab_base: usize, slab_node: usize) {
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        debug_assert_eq!(sequence & 1, 0);
+        self.sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        // 先让读者观察到奇数代际，再发布组成同一快照的两个字段。
+        fence(Ordering::Release);
+        self.slab_base.store(slab_base, Ordering::Relaxed);
+        self.slab_node.store(slab_node, Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    fn remove(&self, slab_base: usize, slab_node: usize) {
+        if self.slab_base.load(Ordering::Relaxed) != slab_base
+            || self.slab_node.load(Ordering::Relaxed) != slab_node
+        {
+            return;
+        }
+        self.publish(0, INVALID_SLAB_NODE);
+    }
+
+    fn lookup(&self, slab_base: usize) -> Option<usize> {
+        for _ in 0..2 {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let observed_base = self.slab_base.load(Ordering::Relaxed);
+            let slab_node = self.slab_node.load(Ordering::Relaxed);
+            // 数据读取必须完成后才能验证代际，避免接受跨两次发布的混合快照。
+            fence(Ordering::Acquire);
+            let after = self.sequence.load(Ordering::Relaxed);
+            if before == after {
+                return (observed_base == slab_base && slab_node != INVALID_SLAB_NODE)
+                    .then_some(slab_node);
+            }
+        }
+        None
+    }
+}
+
+struct FastSlabDirectory {
+    entries: [FastSlabDirectoryEntry; FAST_SLAB_HINT_BUCKETS],
+}
+
+impl FastSlabDirectory {
+    const fn new() -> Self {
+        Self {
+            entries: [const { FastSlabDirectoryEntry::new() }; FAST_SLAB_HINT_BUCKETS],
+        }
+    }
+
+    fn publish(&self, slab_base: usize, slab_span: usize, slab_node: usize) {
+        self.entries[fast_slab_hint_bucket(slab_base, slab_span)].publish(slab_base, slab_node);
+    }
+
+    fn remove(&self, slab_base: usize, slab_span: usize, slab_node: usize) {
+        self.entries[fast_slab_hint_bucket(slab_base, slab_span)].remove(slab_base, slab_node);
+    }
+
+    fn lookup(&self, ptr: usize, slab_span: usize) -> Option<usize> {
+        if slab_span == 0 || !slab_span.is_power_of_two() {
+            return None;
+        }
+        let slab_base = ptr & !(slab_span - 1);
+        self.entries[fast_slab_hint_bucket(slab_base, slab_span)].lookup(slab_base)
     }
 }
 
@@ -960,7 +1047,7 @@ impl ZoneState {
         }
     }
 
-    fn take_reclaimable_empty_slab(&mut self) -> Option<BackedRange> {
+    fn take_reclaimable_empty_slab(&mut self) -> Option<(BackedRange, usize)> {
         let mut empty_count = 0usize;
         let mut node_addr = self.slab_head;
         while node_addr != 0 {
@@ -1002,7 +1089,7 @@ impl ZoneState {
                     .saturating_sub(backing.size / PAGE_SIZE);
                 self.stats.reclaimed_slabs += 1;
                 self.push_reusable_slab_node(current);
-                return Some(backing);
+                return Some((backing, current));
             }
             prev = current;
             current = next;
@@ -1170,6 +1257,7 @@ struct Zone {
     pages_per_slab: usize,
     arena: ArenaKind,
     state: Mutex<ZoneState>,
+    fast_slabs: FastSlabDirectory,
     caches: [PerCpuCache; MAX_CPUS],
 }
 
@@ -1180,6 +1268,7 @@ impl Zone {
             pages_per_slab: pages_per_slab(size_class),
             arena,
             state: Mutex::new(ZoneState::new()),
+            fast_slabs: FastSlabDirectory::new(),
             caches: [const { PerCpuCache::new() }; MAX_CPUS],
         }
     }
@@ -1237,6 +1326,9 @@ impl Zone {
                     Ok(node_addr) => {
                         let mut state = self.state.lock();
                         state.insert_slab_node(node_addr);
+                        let node = slab_node(node_addr);
+                        self.fast_slabs
+                            .publish(node.slab.base_addr, node.backing.size, node_addr);
                         produced = state.allocate_batch(self.size_class, &mut batch);
                     }
                     Err(err) => {
@@ -1362,6 +1454,19 @@ impl Zone {
         true
     }
 
+    fn free_trusted(
+        &self,
+        ptr: usize,
+        cpu: usize,
+        backing: Option<(&Mutex<BuddyAllocator>, &KernelAddressSpace)>,
+    ) -> bool {
+        let slab_span = self.pages_per_slab.saturating_mul(PAGE_SIZE);
+        match self.fast_slabs.lookup(ptr, slab_span) {
+            Some(slab_node) => self.free_with_hint(ptr, cpu, slab_node, backing),
+            None => self.free(ptr, cpu, backing),
+        }
+    }
+
     fn flush_cpu_caches(&self, cpu_count: usize) -> SlabReclaimStats {
         let mut out = SlabReclaimStats::default();
         for cpu in 0..cpu_count.min(MAX_CPUS) {
@@ -1397,7 +1502,13 @@ impl Zone {
         loop {
             let range = {
                 let mut state = self.state.lock();
-                state.take_reclaimable_empty_slab()
+                let reclaimed = state.take_reclaimable_empty_slab();
+                if let Some((range, node_addr)) = reclaimed {
+                    self.fast_slabs.remove(range.vaddr, range.size, node_addr);
+                    Some(range)
+                } else {
+                    None
+                }
             };
             let Some(range) = range else {
                 break;
@@ -1676,7 +1787,7 @@ impl SlabAllocator {
             return false;
         };
         let cpu = self.normalize_cpu(cpu_id);
-        self.zones[zone_idx].free(ptr, cpu, Some((phys, vmem)))
+        self.zones[zone_idx].free_trusted(ptr, cpu, Some((phys, vmem)))
     }
 
     pub fn same_size_class(old_layout: Layout, new_layout: Layout) -> bool {
@@ -1917,6 +2028,11 @@ fn slab_lookup_bucket(slab_base: usize, slab_span: usize) -> usize {
     slot.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (SLAB_LOOKUP_BUCKETS - 1)
 }
 
+#[inline]
+fn fast_slab_hint_bucket(slab_base: usize, slab_span: usize) -> usize {
+    slab_lookup_bucket(slab_base, slab_span) & (FAST_SLAB_HINT_BUCKETS - 1)
+}
+
 fn audit_slab(node: &SlabNode, obj_size: usize, audit: &mut SlabAudit) {
     let slab = &node.slab;
     let total = slab.total_objects as usize;
@@ -2063,8 +2179,9 @@ mod slab_state_tests {
     use alloc::boxed::Box;
 
     use super::{
-        CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, PerCpuCacheState, Slab,
-        SlabAllocator, SlabAuditFlags, SlabNode, SlabObjectState, ZoneState, slab_lookup_bucket,
+        CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, FastSlabDirectory,
+        PerCpuCacheState, Slab, SlabAllocator, SlabAuditFlags, SlabNode, SlabObjectState,
+        ZoneState, slab_lookup_bucket,
     };
     use crate::buddy::PAGE_SIZE;
     use crate::space::{ArenaKind, BackedRange};
@@ -2139,6 +2256,31 @@ mod slab_state_tests {
         assert!(slab.release_reserved(ptr, 64));
         assert_eq!(slab.object_state(ptr, 64), None);
         assert_eq!(slab.allocated_objects, 0);
+    }
+
+    #[test]
+    fn fast_slab_directory_replaces_collisions_and_removes_exact_owner() {
+        let directory = FastSlabDirectory::new();
+        let span = PAGE_SIZE;
+        let first = PAGE_SIZE;
+        let bucket = slab_lookup_bucket(first, span) & (super::FAST_SLAB_HINT_BUCKETS - 1);
+        let second = (2..=(super::FAST_SLAB_HINT_BUCKETS * 4))
+            .map(|page| page * PAGE_SIZE)
+            .find(|&base| {
+                slab_lookup_bucket(base, span) & (super::FAST_SLAB_HINT_BUCKETS - 1) == bucket
+            })
+            .expect("构造快速目录哈希碰撞");
+
+        directory.publish(first, span, 0x1110);
+        assert_eq!(directory.lookup(first, span), Some(0x1110));
+
+        directory.publish(second, span, 0x2220);
+        assert_eq!(directory.lookup(first, span), None);
+        assert_eq!(directory.lookup(second, span), Some(0x2220));
+        directory.remove(first, span, 0x1110);
+        assert_eq!(directory.lookup(second, span), Some(0x2220));
+        directory.remove(second, span, 0x2220);
+        assert_eq!(directory.lookup(second, span), None);
     }
 
     #[test]
