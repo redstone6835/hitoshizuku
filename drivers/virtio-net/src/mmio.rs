@@ -272,7 +272,7 @@ impl PnpDriver for VirtioMmioNetDriver {
             let _ = irq::unregister_irq_handler(irq_handle);
             return Err(error);
         }
-        if let Err(error) = dev.register_function(net_function("eth0")) {
+        if let Err(error) = dev.register_function(net_function("eth0", info.dma_context())) {
             super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);

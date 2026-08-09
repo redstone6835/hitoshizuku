@@ -30,4 +30,7 @@ pub use ops::{
 pub use user_access::{
     copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user, copy_to_user,
 };
-pub use vm_space::{UserReadWindows, VmFutexKey, VmSpace, page_size, vm_space_diag};
+pub use vm_space::{
+    UserReadWindows, VmFutexKey, VmSpace, page_size, read_shared_anon, vm_space_diag,
+    write_shared_anon,
+};

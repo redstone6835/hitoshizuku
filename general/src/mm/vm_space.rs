@@ -2632,6 +2632,199 @@ impl VmSpace {
         Err(Errno::ENOMEM)
     }
 
+    /// 在地址空间内原子选择并登记一段共享匿名对象映射。
+    ///
+    /// `object_offset` 表示返回区间起点对应的对象内偏移；同一对象的不同映射
+    /// 因而可以在不同地址空间共享物理页，而不依赖文件描述符或全局名称。
+    pub fn map_shared_anon_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        object: Arc<SharedAnonObject>,
+        object_offset: u64,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+            || object_offset % page_size as u64 != 0
+            || object_offset.checked_add(len as u64).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let flags = self
+            .with_future_mlock(flags)
+            .with(VmFlags::ANON)
+            .with(VmFlags::SHARED);
+        let mut set = self.vmas.lock();
+        for (start, end) in [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ] {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags,
+                backing: VmBacking::SharedAnon {
+                    object: Arc::clone(&object),
+                    offset: object_offset,
+                },
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在地址空间内原子选择并登记一段 file-backed 映射。
+    pub fn map_file_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        file: Arc<dyn FileLike>,
+        offset: u64,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+            || offset % page_size as u64 != 0
+            || offset.checked_add(len as u64).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let flags = self.with_future_mlock(flags);
+        let mapped_file = Arc::clone(&file);
+        let mut set = self.vmas.lock();
+        for (start, end) in [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ] {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags,
+                backing: VmBacking::File {
+                    file: Arc::clone(&file),
+                    offset,
+                },
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            drop(set);
+            mapped_file.on_mapped();
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在地址空间内原子选择地址，并立即映射一段连续物理内存。
+    ///
+    /// 物理内存的所有权仍由调用方持有；VMA 只保存 direct backing。调用方必须
+    /// 保证所有用户映射撤销前底层分配不会释放。
+    pub fn map_direct_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        paddr: usize,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+            || paddr % page_size != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let area_flags = self.with_future_mlock(flags).with(VmFlags::USER);
+        let mut set = self.vmas.lock();
+        for (start, end) in [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ] {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags: area_flags,
+                backing: VmBacking::Direct(paddr),
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            drop(set);
+            if let Err(error) = self.populate_direct_mapping(range.clone(), paddr, area_flags) {
+                let _ = self.unmap_existing(range);
+                return Err(error);
+            }
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在调用者指定的空闲地址登记共享匿名对象映射；已有映射不会被替换。
+    pub fn map_shared_anon(
+        &self,
+        range: Range<usize>,
+        object: Arc<SharedAnonObject>,
+        object_offset: u64,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let page_size = page_size();
+        if object_offset % page_size as u64 != 0
+            || object_offset.checked_add(range.len() as u64).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+        let area = VmArea {
+            range,
+            flags: self
+                .with_future_mlock(flags)
+                .with(VmFlags::ANON)
+                .with(VmFlags::SHARED),
+            backing: VmBacking::SharedAnon {
+                object,
+                offset: object_offset,
+            },
+        };
+        self.vmas.lock().insert(area)
+    }
+
     #[kernel_symbols::export(name = "general.mm.VmSpace.is_range_free", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_range_free(&self, range: Range<usize>) -> bool {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
@@ -2938,7 +3131,20 @@ impl VmSpace {
             backing: VmBacking::Direct(paddr),
         };
         self.vmas.lock().insert(area)?;
+        if let Err(error) = self.populate_direct_mapping(range.clone(), paddr, area_flags) {
+            let _ = self.unmap_existing(range);
+            return Err(error);
+        }
+        Ok(())
+    }
 
+    fn populate_direct_mapping(
+        &self,
+        range: Range<usize>,
+        paddr: usize,
+        area_flags: VmFlags,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
         let mut pages = self.pages.lock();
         let mut va = range.start;
         while va < range.end {
@@ -3227,7 +3433,9 @@ impl VmSpace {
             }
         }
         let pages = self.pages.lock();
-        let mut out = Vec::with_capacity(page_count);
+        let mut out = Vec::new();
+        out.try_reserve_exact(page_count)
+            .map_err(|_| Errno::ENOMEM)?;
         let mut va = range.start;
         while va < range.end {
             out.push(if pages.contains_key(&va) { 1 } else { 0 });
@@ -3244,6 +3452,30 @@ impl VmSpace {
             return Err(Errno::ENOMEM);
         }
         Ok(())
+    }
+
+    /// 校验一段用户 VMA 连续存在且每一段都包含指定权限。
+    pub fn contains_user_range_with_flags(
+        &self,
+        range: Range<usize>,
+        required: u32,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        if required == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let set = self.vmas.lock();
+        let mut cursor = range.start;
+        for area in set.iter_overlap(&range) {
+            if area.range.start > cursor || !area.flags.contains_all(required) {
+                return Err(Errno::EACCES);
+            }
+            cursor = cursor.max(area.range.end);
+            if cursor >= range.end {
+                return Ok(());
+            }
+        }
+        Err(Errno::ENOMEM)
     }
 
     /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
@@ -3653,6 +3885,29 @@ impl VmSpace {
         Ok(f(slice))
     }
 
+    /// 把可能跨越多个页面的用户区完整复制到内核缓冲区。
+    ///
+    /// 与 [`Self::with_user_read_slice`] 不同，本接口保证成功时填满整个 `output`；
+    /// 调用方不需要理解单页窗口边界，也不会因跨页结构产生长度不等的 slice。
+    pub fn copy_user_bytes_in(&self, user: usize, output: &mut [u8]) -> Result<(), Errno> {
+        user.checked_add(output.len()).ok_or(Errno::EFAULT)?;
+        let mut copied = 0usize;
+        while copied < output.len() {
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let count = unsafe {
+                self.with_user_read_slice(address, output.len() - copied, |window| {
+                    output[copied..copied + window.len()].copy_from_slice(window);
+                    window.len()
+                })
+            }?;
+            if count == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
     /// 固定覆盖给定范围的只读用户页，并在返回前完成全部权限检查和 fault-in。
     ///
     /// 固定窗口只保留到返回值析构为止，适合把用户复制与其它子系统的自旋锁分开。
@@ -3845,6 +4100,17 @@ impl VmSpace {
         })
     }
 
+    /// 向已经常驻且可写的用户 u32 执行 release store。
+    ///
+    /// 该接口供共享队列等内核生产者发布 head/tail；调用方必须先完成 fault-in，
+    /// 映射或权限已经变化时返回 EFAULT。
+    pub fn store_user_u32_nofault(&self, user: usize, value: u32) -> Result<(), Errno> {
+        self.with_user_atomic_u32(user, true, |word| {
+            word.store(value, Ordering::Release);
+            ((), true)
+        })
+    }
+
     fn user_u32_location(&self, user: usize) -> Result<(usize, usize), Errno> {
         if user % core::mem::align_of::<u32>() != 0 {
             return Err(Errno::EINVAL);
@@ -3916,6 +4182,28 @@ impl VmSpace {
         let result = f(slice);
         page.mark_dirty();
         Ok(result)
+    }
+
+    /// 把内核缓冲区完整复制到可能跨越多个页面的用户区。
+    ///
+    /// 成功返回前会访问并标脏覆盖范围内的每一页；任一页不可写时返回 `EFAULT`。
+    pub fn copy_user_bytes_out(&self, user: usize, input: &[u8]) -> Result<(), Errno> {
+        user.checked_add(input.len()).ok_or(Errno::EFAULT)?;
+        let mut copied = 0usize;
+        while copied < input.len() {
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let count = unsafe {
+                self.with_user_write_slice(address, input.len() - copied, |window| {
+                    window.copy_from_slice(&input[copied..copied + window.len()]);
+                    window.len()
+                })
+            }?;
+            if count == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copied += count;
+        }
+        Ok(())
     }
 
     /// 立即为一个 ELF 段分配并填充物理页。
@@ -4009,6 +4297,57 @@ impl VmSpace {
             )?;
             if plan.lazy_file.end < plan.mapping.end {
                 self.map_anon(plan.lazy_file.end..plan.mapping.end, area_flags)?;
+            }
+        }
+
+        for &page_va in plan.fragments() {
+            self.commit_file_fragment_page(
+                page_va,
+                vaddr,
+                file_offset,
+                file_size,
+                file.as_ref(),
+                area_flags.with(VmFlags::ANON),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 用文件段替换已经预留的同址 VMA，并保留首尾碎片页与 BSS 的精确清零语义。
+    ///
+    /// 动态组件先以匿名 VMA 预留完整映像地址，再用本入口把无需重定位的段改为
+    /// file-backed。每个子区间都通过 fixed 映射在 VMA 锁内替换，地址不会在事务
+    /// 准备期间被其它线程抢占。
+    pub fn commit_file_segment_fixed(
+        &self,
+        vaddr: usize,
+        memsz: usize,
+        file_offset: u64,
+        file_size: usize,
+        file: Arc<dyn FileLike>,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        if memsz == 0 {
+            return Ok(());
+        }
+        let page_size = page_size();
+        let plan = plan_file_segment(vaddr, memsz, file_offset, file_size, page_size)?;
+        let area_flags = flags.with(VmFlags::USER);
+
+        if plan.lazy_file.start >= plan.lazy_file.end {
+            self.map_fixed_anon(plan.mapping.clone(), area_flags)?;
+        } else {
+            if plan.mapping.start < plan.lazy_file.start {
+                self.map_fixed_anon(plan.mapping.start..plan.lazy_file.start, area_flags)?;
+            }
+            self.map_fixed_file(
+                plan.lazy_file.clone(),
+                Arc::clone(&file),
+                plan.lazy_file_offset,
+                area_flags,
+            )?;
+            if plan.lazy_file.end < plan.mapping.end {
+                self.map_fixed_anon(plan.lazy_file.end..plan.mapping.end, area_flags)?;
             }
         }
 
@@ -5369,6 +5708,70 @@ fn shared_anon_page(
         },
     );
     Ok(page)
+}
+
+/// 从共享匿名 backing 读取一段连续数据，不要求对象已经映射到某个用户地址空间。
+pub fn read_shared_anon(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<(), Errno> {
+    shared_anon_transfer(object, offset, output.as_mut_ptr(), output.len(), false)
+}
+
+/// 向共享匿名 backing 写入一段连续数据，不要求对象已经映射到某个用户地址空间。
+pub fn write_shared_anon(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+    input: &[u8],
+) -> Result<(), Errno> {
+    shared_anon_transfer(object, offset, input.as_ptr() as *mut u8, input.len(), true)
+}
+
+fn shared_anon_transfer(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+    buffer: *mut u8,
+    length: usize,
+    write: bool,
+) -> Result<(), Errno> {
+    if length == 0 {
+        return Ok(());
+    }
+    let page_size = page_size();
+    let page_size_u64 = u64::try_from(page_size).map_err(|_| Errno::EOVERFLOW)?;
+    let end = offset
+        .checked_add(u64::try_from(length).map_err(|_| Errno::EOVERFLOW)?)
+        .ok_or(Errno::EOVERFLOW)?;
+    let virt = allocator::KERNEL_ALLOCATOR
+        .load_phys_to_virt()
+        .ok_or(Errno::EINVAL)?;
+    let mut cursor = offset;
+    let mut done = 0usize;
+    while cursor < end {
+        let page_offset = cursor / page_size_u64 * page_size_u64;
+        let within = usize::try_from(cursor - page_offset).map_err(|_| Errno::EOVERFLOW)?;
+        let count = (page_size - within).min(length - done);
+        let page = shared_anon_page(object, page_offset)?;
+        let address = virt(page.paddr())
+            .checked_add(within)
+            .ok_or(Errno::EOVERFLOW)?;
+        if write {
+            unsafe {
+                core::ptr::copy_nonoverlapping(buffer.add(done), address as *mut u8, count);
+            }
+            page.mark_dirty();
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(address as *const u8, buffer.add(done), count);
+            }
+        }
+        cursor = cursor
+            .checked_add(u64::try_from(count).map_err(|_| Errno::EOVERFLOW)?)
+            .ok_or(Errno::EOVERFLOW)?;
+        done += count;
+    }
+    Ok(())
 }
 
 fn prune_shared_anon_pages() {

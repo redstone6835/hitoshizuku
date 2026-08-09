@@ -29,24 +29,9 @@ pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError
         return Err(UserAccessError::Fault);
     }
     if let Some(vm) = current_task_vm_space() {
-        let dst_ptr = dst.as_mut_ptr();
-        let total = dst.len();
-        let mut copied = 0usize;
-        while copied < total {
-            let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
-            let n = unsafe {
-                vm.with_user_read_slice(user_ptr, total - copied, |src| {
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr.add(copied), src.len());
-                    src.len()
-                })
-            }
-            .map_err(|_| UserAccessError::Fault)?;
-            if n == 0 {
-                return Err(UserAccessError::Fault);
-            }
-            copied += n;
-        }
-        return Ok(());
+        return vm
+            .copy_user_bytes_in(user, dst)
+            .map_err(|_| UserAccessError::Fault);
     }
 
     let Some(ops) = user_access_ops() else {
@@ -67,28 +52,9 @@ pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
         return Err(UserAccessError::Fault);
     }
     if let Some(vm) = current_task_vm_space() {
-        let src_ptr = src.as_ptr();
-        let total = src.len();
-        let mut copied = 0usize;
-        while copied < total {
-            let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
-            let n = unsafe {
-                vm.with_user_write_slice(user_ptr, total - copied, |dst| {
-                    core::ptr::copy_nonoverlapping(
-                        src_ptr.add(copied),
-                        dst.as_mut_ptr(),
-                        dst.len(),
-                    );
-                    dst.len()
-                })
-            }
-            .map_err(|_| UserAccessError::Fault)?;
-            if n == 0 {
-                return Err(UserAccessError::Fault);
-            }
-            copied += n;
-        }
-        return Ok(());
+        return vm
+            .copy_user_bytes_out(user, src)
+            .map_err(|_| UserAccessError::Fault);
     }
 
     let Some(ops) = user_access_ops() else {

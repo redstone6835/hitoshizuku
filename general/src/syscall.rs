@@ -52,6 +52,7 @@ pub enum NativeCallOutcome {
     /// Native replace 已经完整安装新的用户 trap frame。
     FrameFinalized,
     ExitGroup(i32),
+    ExitThread(i32),
     /// 阻塞调用观察到外部进程控制，必须先在安全边界处理；存活后重试原调用。
     RetryExternalControl,
 }
@@ -355,6 +356,10 @@ fn dispatch_native_for_task(
             NativeCallOutcome::ExitGroup(code) => {
                 drop(task);
                 sched::operation::exit_group(code);
+            }
+            NativeCallOutcome::ExitThread(code) => {
+                drop(task);
+                sched::operation::exit(code);
             }
         }
     }
