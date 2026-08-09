@@ -262,6 +262,26 @@ static void static_tls_accepts_template_aligned_size(void) {
     assert(view.info == &fixture.info);
 }
 
+static void dynamic_components_accept_a_tls_arena_without_static_tls(void) {
+    struct start_fixture fixture = valid_fixture();
+    struct mrt_start_view view;
+    memset(&view, 0, sizeof(view));
+    fixture.info.enabled_features = MYGO_FEATURE_DYNAMIC_COMPONENTS;
+    fixture.info.initial_tls_base = UINT64_C(0x70000000);
+    fixture.info.initial_tls_size = UINT64_C(16) * 1024u * 1024u;
+    fixture.info.initial_thread_pointer = fixture.info.initial_tls_base;
+
+    enum mrt_start_error result = mrt_validate_start_info(
+        &fixture.info,
+        sizeof(fixture),
+        UINT64_C(0x400000),
+        fixture.info.initial_thread_pointer,
+        &view);
+
+    assert(result == MRT_START_OK);
+    assert(view.info == &fixture.info);
+}
+
 static void malformed_handle_table_is_rejected(void) {
     struct start_fixture fixture = valid_fixture();
     fixture.info.initial_handle_offset += 8;
@@ -309,6 +329,7 @@ int main(void) {
     reserved_and_program_contract_fields_are_rejected();
     tls_and_random_seed_invariants_are_rejected();
     static_tls_accepts_template_aligned_size();
+    dynamic_components_accept_a_tls_arena_without_static_tls();
     valid_init_fini_arrays_are_published();
     malformed_handle_table_is_rejected();
     malformed_string_regions_are_rejected();

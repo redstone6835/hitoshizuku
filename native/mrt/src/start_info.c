@@ -1,7 +1,6 @@
 #include <mrt/mrt.h>
 
 _Static_assert(MYGO_CAP_self_process_required == 1u, "self process is required");
-_Static_assert(MYGO_CAP_stdout_required == 1u, "stdout is required");
 
 static void clear_view(struct mrt_start_view *view) {
     if (view != 0) {
@@ -288,7 +287,8 @@ enum mrt_start_error mrt_validate_start_info(
     }
     if (info->abi_epoch != MYGO_ABI_EPOCH || info->target_arch != MYGO_TARGET_ARCH ||
         (info->enabled_features &
-         ~(MYGO_FEATURE_STATIC_TLS | MYGO_FEATURE_INIT_FINI_ARRAY)) != 0 ||
+         ~(MYGO_FEATURE_STATIC_TLS | MYGO_FEATURE_INIT_FINI_ARRAY |
+           MYGO_FEATURE_DYNAMIC_COMPONENTS)) != 0 ||
         info->image_base != entry_image_base ||
         info->image_base == 0 || info->image_base % MYGO_PAGE_SIZE != 0 ||
         info->page_size != MYGO_PAGE_SIZE || info->call_slot_count != MYGO_CALL_SLOT_COUNT ||
@@ -318,13 +318,16 @@ enum mrt_start_error mrt_validate_start_info(
          ((info->enabled_features & MYGO_FEATURE_INIT_FINI_ARRAY) != 0))) {
         return MRT_START_BAD_CONTRACT;
     }
+    const uint64_t tls_features =
+        info->enabled_features &
+        (MYGO_FEATURE_STATIC_TLS | MYGO_FEATURE_DYNAMIC_COMPONENTS);
     if (info->initial_tls_size == 0) {
-        if ((info->enabled_features & MYGO_FEATURE_STATIC_TLS) != 0 ||
+        if (tls_features != 0 ||
             info->initial_tls_base != 0 ||
             info->initial_thread_pointer != 0 || entry_thread_pointer != 0) {
             return MRT_START_BAD_TLS;
         }
-    } else if ((info->enabled_features & MYGO_FEATURE_STATIC_TLS) == 0 ||
+    } else if (tls_features == 0 ||
                info->initial_tls_base == 0 ||
                info->initial_thread_pointer != info->initial_tls_base ||
                entry_thread_pointer != info->initial_thread_pointer ||

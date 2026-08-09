@@ -43,6 +43,23 @@ struct mrt_count_result {
     uint64_t count;
 };
 
+struct mrt_component_result {
+    uint32_t status;
+    uint64_t handle;
+};
+
+struct mrt_interface_result {
+    uint32_t status;
+    uint64_t handle;
+    const mygo_component_interface_gate *gate;
+};
+
+struct mrt_component_call {
+    uint32_t status;
+    uint64_t target;
+    uint64_t previous_component;
+};
+
 enum mrt_start_error mrt_validate_start_info(
     const struct mygo_start_info *info,
     uint64_t entry_size,
@@ -89,8 +106,24 @@ struct mrt_count_result mrt_event_wait(
     mygo_event_record *records,
     uint32_t capacity,
     uint64_t deadline_ns);
+struct mrt_component_result mrt_component_load(
+    uint64_t process,
+    const mygo_component_load_request *request);
+uint32_t mrt_component_query(uint64_t component, mygo_component_query *query);
+struct mrt_interface_result mrt_component_interface(
+    uint64_t component,
+    const mygo_interface_request *request);
+struct mrt_component_result mrt_component_unload(
+    uint64_t component,
+    uint64_t deadline_ns);
+struct mrt_component_call mrt_component_enter(
+    const mygo_component_interface_gate *gate);
+void mrt_component_leave(
+    const mygo_component_interface_gate *gate,
+    uint64_t previous_component);
 
 uint64_t mrt_initial_handle(uint32_t requirement_id);
+uint64_t mrt_current_component(void);
 
 void mrt_run_initializers(const struct mrt_start_view *view);
 void mrt_run_finalizers(const struct mrt_start_view *view);
