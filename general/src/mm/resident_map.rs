@@ -90,6 +90,46 @@ impl<T> RadixPageMap<T> {
         previous
     }
 
+    pub(super) fn insert_contiguous<I>(&mut self, start: usize, values: I) -> usize
+    where
+        I: ExactSizeIterator<Item = T>,
+    {
+        let mut values = values;
+        let value_count = values.len();
+        if value_count == 0 {
+            return 0;
+        }
+
+        let start_page = self.page_index(start);
+        let last_page = start_page
+            .checked_add(value_count - 1)
+            .expect("连续 resident 页范围溢出");
+        self.grow_root(required_root_level(last_page));
+
+        let mut page_index = start_page;
+        let mut inserted = 0usize;
+        let mut replaced = 0usize;
+        while inserted < value_count {
+            let leaf_slot = page_index & RADIX_MASK;
+            let chunk_len = (RADIX_SLOTS - leaf_slot).min(value_count - inserted);
+            let entries = leaf_entries_mut(&mut self.root, self.root_level, page_index);
+            for (entry, value) in entries[leaf_slot..leaf_slot + chunk_len]
+                .iter_mut()
+                .zip(values.by_ref())
+            {
+                if entry.replace(value).is_some() {
+                    replaced += 1;
+                } else {
+                    self.len += 1;
+                }
+            }
+            inserted += chunk_len;
+            page_index += chunk_len;
+        }
+        debug_assert_eq!(values.len(), 0);
+        replaced
+    }
+
     pub(super) fn remove(&mut self, address: usize) -> Option<T> {
         let page_index = self.page_index(address);
         if required_root_level(page_index) > self.root_level {
@@ -267,6 +307,25 @@ fn insert_node<T>(node: &mut RadixNode<T>, level: usize, page_index: usize, valu
     }
 }
 
+fn leaf_entries_mut<T>(
+    node: &mut RadixNode<T>,
+    level: usize,
+    page_index: usize,
+) -> &mut [Option<T>; RADIX_SLOTS] {
+    match node {
+        RadixNode::Branch(children) => {
+            debug_assert!(level != 0);
+            let child = children[radix_slot(page_index, level)]
+                .get_or_insert_with(|| Box::new(RadixNode::new(level - 1)));
+            leaf_entries_mut(child, level - 1, page_index)
+        }
+        RadixNode::Leaf(entries) => {
+            debug_assert_eq!(level, 0);
+            entries
+        }
+    }
+}
+
 fn remove_node<T>(node: &mut RadixNode<T>, level: usize, page_index: usize) -> Option<T> {
     match node {
         RadixNode::Branch(children) => {
@@ -439,6 +498,62 @@ mod tests {
         assert_eq!(pages.remove(64 * PAGE_SIZE), Some(99));
         assert_eq!(pages.get(64 * PAGE_SIZE), None);
         assert_eq!(pages.len(), addresses.len() - 1);
+    }
+
+    #[test]
+    fn contiguous_insert_fills_one_leaf() {
+        let mut pages = RadixPageMap::new(PAGE_SIZE);
+
+        assert_eq!(
+            pages.insert_contiguous(8 * PAGE_SIZE, [10usize, 11, 12].into_iter()),
+            0
+        );
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages.get(8 * PAGE_SIZE), Some(&10));
+        assert_eq!(pages.get(9 * PAGE_SIZE), Some(&11));
+        assert_eq!(pages.get(10 * PAGE_SIZE), Some(&12));
+    }
+
+    #[test]
+    fn contiguous_insert_crosses_leaf_boundary() {
+        let mut pages = RadixPageMap::new(PAGE_SIZE);
+
+        assert_eq!(
+            pages.insert_contiguous(62 * PAGE_SIZE, [62usize, 63, 64, 65].into_iter()),
+            0
+        );
+        assert_eq!(pages.len(), 4);
+        for page in 62usize..=65 {
+            assert_eq!(pages.get(page * PAGE_SIZE), Some(&page));
+        }
+    }
+
+    #[test]
+    fn contiguous_insert_grows_root_for_high_pages() {
+        let mut pages = RadixPageMap::new(PAGE_SIZE);
+        let start = 4095 * PAGE_SIZE;
+
+        assert_eq!(pages.insert_contiguous(start, [1usize, 2].into_iter()), 0);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages.get(start), Some(&1));
+        assert_eq!(pages.get(start + PAGE_SIZE), Some(&2));
+        assert!(pages.root_level >= 2);
+    }
+
+    #[test]
+    fn contiguous_insert_counts_replacements() {
+        let mut pages = RadixPageMap::new(PAGE_SIZE);
+        pages.insert(64 * PAGE_SIZE, 100usize);
+        pages.insert(66 * PAGE_SIZE, 300usize);
+
+        assert_eq!(
+            pages.insert_contiguous(63 * PAGE_SIZE, [1usize, 2, 3, 4].into_iter()),
+            2
+        );
+        assert_eq!(pages.len(), 4);
+        for (offset, value) in [1usize, 2, 3, 4].into_iter().enumerate() {
+            assert_eq!(pages.get((63 + offset) * PAGE_SIZE), Some(&value));
+        }
     }
 
     #[test]

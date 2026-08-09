@@ -12,7 +12,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use errno::Errno;
 use hashbrown::HashTable;
-use hashbrown::hash_table::Entry as HashTableEntry;
 use mm::area::AnonMergeDomain;
 use mm::{FileLike, SharedAnonObject, VmArea, VmBacking, VmFlags, VmaSet};
 use sched::sync::Spinlock;
@@ -1052,6 +1051,12 @@ struct FilePageKey {
     generation: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PrivateFilePageHashes {
+    cache: u64,
+    table: u64,
+}
+
 struct PrivateFilePageCacheReady {
     page: Arc<ResidentPage>,
     referenced: bool,
@@ -1211,6 +1216,15 @@ impl FilePageKey {
         hash ^ (hash >> 17)
     }
 
+    #[inline]
+    fn private_cache_hashes(self) -> PrivateFilePageHashes {
+        let cache = self.private_cache_hash();
+        PrivateFilePageHashes {
+            cache,
+            table: private_table_hash_from_cache_hash(cache),
+        }
+    }
+
     /// 为分片内 SwissTable 生成独立哈希。
     ///
     /// 分片已经消费了 `private_cache_hash` 的低位；再次直接使用同一哈希会让同一
@@ -1218,11 +1232,14 @@ impl FilePageKey {
     /// avalanche，同时打散 bucket 与 7-bit control tag；选片热路径本身仍不做乘法。
     #[inline]
     fn private_table_hash(self) -> u64 {
-        let hash = self
-            .private_cache_hash()
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        hash ^ hash.rotate_right(29)
+        private_table_hash_from_cache_hash(self.private_cache_hash())
     }
+}
+
+#[inline]
+fn private_table_hash_from_cache_hash(cache_hash: u64) -> u64 {
+    let hash = cache_hash.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    hash ^ hash.rotate_right(29)
 }
 
 #[inline]
@@ -1256,8 +1273,17 @@ impl PrivateFilePageTable {
 
     #[inline]
     fn get_mut(&mut self, key: &FilePageKey) -> Option<&mut PrivateFilePageCacheEntry> {
+        self.get_mut_hashed(key, key.private_table_hash())
+    }
+
+    #[inline]
+    fn get_mut_hashed(
+        &mut self,
+        key: &FilePageKey,
+        table_hash: u64,
+    ) -> Option<&mut PrivateFilePageCacheEntry> {
         self.entries
-            .find_mut(key.private_table_hash(), |entry| entry.0 == *key)
+            .find_mut(table_hash, |entry| entry.0 == *key)
             .map(|entry| &mut entry.1)
     }
 
@@ -1290,21 +1316,14 @@ impl PrivateFilePageTable {
             .is_ok()
     }
 
-    #[inline]
-    fn entry(&mut self, key: FilePageKey) -> HashTableEntry<'_, PrivateFilePageTableEntry> {
-        self.entries.entry(
-            key.private_table_hash(),
-            |entry| entry.0 == key,
-            private_file_page_table_entry_hash,
-        )
-    }
-
-    fn insert_unique(&mut self, key: FilePageKey, entry: PrivateFilePageCacheEntry) {
-        self.entries.insert_unique(
-            key.private_table_hash(),
-            (key, entry),
-            private_file_page_table_entry_hash,
-        );
+    fn insert_unique_hashed(
+        &mut self,
+        key: FilePageKey,
+        table_hash: u64,
+        entry: PrivateFilePageCacheEntry,
+    ) {
+        self.entries
+            .insert_unique(table_hash, (key, entry), private_file_page_table_entry_hash);
     }
 }
 
@@ -1344,8 +1363,12 @@ impl PrivateFilePageCacheState {
         Some(Arc::clone(&entry.page))
     }
 
-    fn claim_existing(&mut self, key: FilePageKey) -> Option<PrivateFilePageCacheStateClaim> {
-        let entry = self.pages.get_mut(&key)?;
+    fn claim_existing(
+        &mut self,
+        key: FilePageKey,
+        table_hash: u64,
+    ) -> Option<PrivateFilePageCacheStateClaim> {
+        let entry = self.pages.get_mut_hashed(&key, table_hash)?;
         Some(match entry {
             PrivateFilePageCacheEntry::Ready(entry) => {
                 entry.referenced = true;
@@ -1370,57 +1393,28 @@ impl PrivateFilePageCacheState {
     fn claim(
         &mut self,
         key: FilePageKey,
+        table_hash: u64,
         next_load_id: &AtomicU64,
     ) -> PrivateFilePageCacheStateClaim {
-        // HashTable::entry 会为潜在插入执行一次 infallible reserve。仅在增长空间耗尽
-        // 时先做显式、可失败 reserve；已有条目仍可在 OOM 下正常命中或等待。
-        if self.pages.insertion_needs_reserve() {
-            if let Some(existing) = self.claim_existing(key) {
-                return existing;
-            }
-            self.misses = self.misses.saturating_add(1);
-            if !self.pages.try_reserve_one() {
-                return PrivateFilePageCacheStateClaim::Bypass;
-            }
-            let Some(id) = next_private_file_load_id(next_load_id) else {
-                return PrivateFilePageCacheStateClaim::Bypass;
-            };
-            self.pages
-                .insert_unique(key, PrivateFilePageCacheEntry::Loading { id, waiters: 0 });
-            self.load_leaders = self.load_leaders.saturating_add(1);
-            return PrivateFilePageCacheStateClaim::Owner(id);
+        // BuildStorm 的缓存命中占绝大多数。先走只查询路径，避免命中时构造带
+        // reserve 语义的 HashTable entry；分片锁保证 miss 后不会出现并发插入。
+        if let Some(existing) = self.claim_existing(key, table_hash) {
+            return existing;
         }
-
-        match self.pages.entry(key) {
-            HashTableEntry::Occupied(mut slot) => match &mut slot.get_mut().1 {
-                PrivateFilePageCacheEntry::Ready(entry) => {
-                    entry.referenced = true;
-                    self.hits = self.hits.saturating_add(1);
-                    PrivateFilePageCacheStateClaim::Ready(Arc::clone(&entry.page))
-                }
-                PrivateFilePageCacheEntry::Loading { id, waiters } => {
-                    self.misses = self.misses.saturating_add(1);
-                    let Some(next_waiters) = waiters.checked_add(1) else {
-                        return PrivateFilePageCacheStateClaim::Failed(Errno::ENOMEM);
-                    };
-                    *waiters = next_waiters;
-                    PrivateFilePageCacheStateClaim::Loading(*id)
-                }
-                PrivateFilePageCacheEntry::Failed { error, .. } => {
-                    self.misses = self.misses.saturating_add(1);
-                    PrivateFilePageCacheStateClaim::Failed(*error)
-                }
-            },
-            HashTableEntry::Vacant(slot) => {
-                self.misses = self.misses.saturating_add(1);
-                let Some(id) = next_private_file_load_id(next_load_id) else {
-                    return PrivateFilePageCacheStateClaim::Bypass;
-                };
-                slot.insert((key, PrivateFilePageCacheEntry::Loading { id, waiters: 0 }));
-                self.load_leaders = self.load_leaders.saturating_add(1);
-                PrivateFilePageCacheStateClaim::Owner(id)
-            }
+        self.misses = self.misses.saturating_add(1);
+        if self.pages.insertion_needs_reserve() && !self.pages.try_reserve_one() {
+            return PrivateFilePageCacheStateClaim::Bypass;
         }
+        let Some(id) = next_private_file_load_id(next_load_id) else {
+            return PrivateFilePageCacheStateClaim::Bypass;
+        };
+        self.pages.insert_unique_hashed(
+            key,
+            table_hash,
+            PrivateFilePageCacheEntry::Loading { id, waiters: 0 },
+        );
+        self.load_leaders = self.load_leaders.saturating_add(1);
+        PrivateFilePageCacheStateClaim::Owner(id)
     }
 
     fn finish_load(
@@ -1652,9 +1646,11 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
     }
 
     fn claim(&self, key: FilePageKey) -> PrivateFilePageCacheClaim<'_, SHARD_COUNT> {
-        let claim = self.shards[self.shard_index(key)]
+        let hashes = key.private_cache_hashes();
+        let shard_index = (hashes.cache as usize) & (SHARD_COUNT - 1);
+        let claim = self.shards[shard_index]
             .lock()
-            .claim(key, &self.next_load_id);
+            .claim(key, hashes.table, &self.next_load_id);
         match claim {
             PrivateFilePageCacheStateClaim::Ready(page) => PrivateFilePageCacheClaim::Ready(page),
             PrivateFilePageCacheStateClaim::Loading(id) => {
@@ -4219,16 +4215,21 @@ impl VmSpace {
             pte_flags_for(plan.flags, PageAccess::ReadOnly),
         );
         let mut candidates = prepared.into_iter();
-        for candidate in candidates.by_ref().take(installed) {
-            let access = PageAccess::ReadOnly;
-            pages.insert(
-                candidate.vaddr,
-                PageMapping {
-                    page: candidate.page,
-                    access,
-                },
-            );
-        }
+        let replaced = pages.insert_contiguous(
+            plan.fault_page,
+            candidates
+                .by_ref()
+                .take(installed)
+                .enumerate()
+                .map(|(index, candidate)| {
+                    debug_assert_eq!(candidate.vaddr, plan.fault_page + index * page_size());
+                    PageMapping {
+                        page: candidate.page,
+                        access: PageAccess::ReadOnly,
+                    }
+                }),
+        );
+        debug_assert_eq!(replaced, 0);
         let mapped = pages.len();
         if installed != 0 {
             self.mapped_pages.store(mapped, Ordering::Release);
@@ -4396,16 +4397,21 @@ impl VmSpace {
             pte_flags_for(plan.flags, PageAccess::Writable),
         );
         let mut candidates = prepared.into_iter();
-        for candidate in candidates.by_ref().take(installed) {
-            let access = PageAccess::Writable;
-            pages.insert(
-                candidate.vaddr,
-                PageMapping {
-                    page: candidate.page,
-                    access,
-                },
-            );
-        }
+        let replaced = pages.insert_contiguous(
+            plan.fault_page,
+            candidates
+                .by_ref()
+                .take(installed)
+                .enumerate()
+                .map(|(index, candidate)| {
+                    debug_assert_eq!(candidate.vaddr, plan.fault_page + index * page_size);
+                    PageMapping {
+                        page: candidate.page,
+                        access: PageAccess::Writable,
+                    }
+                }),
+        );
+        debug_assert_eq!(replaced, 0);
         let mapped = pages.len();
         if installed != 0 {
             self.mapped_pages.store(mapped, Ordering::Release);
@@ -6186,12 +6192,20 @@ mod tests {
             PrivateFilePageCacheClaim::Owner(load_id) => load_id,
             _ => panic!("vacant key must create a load owner"),
         };
+        let owner_diag = cache.diag();
+        assert_eq!(owner_diag.misses, 1);
+        assert_eq!(owner_diag.load_leaders, 1);
+        assert_eq!(owner_diag.hits, 0);
         let next_after_owner = cache.next_load_id.load(Ordering::Relaxed);
 
         let waiter = match cache.claim(key) {
             PrivateFilePageCacheClaim::Loading(waiter) => waiter,
             _ => panic!("second claim must observe the active load"),
         };
+        let waiter_diag = cache.diag();
+        assert_eq!(waiter_diag.misses, 2);
+        assert_eq!(waiter_diag.load_leaders, 1);
+        assert_eq!(waiter_diag.hits, 0);
         assert_eq!(waiter.id(), load_id);
         assert_eq!(cache.next_load_id.load(Ordering::Relaxed), next_after_owner);
         drop(waiter);
@@ -6204,6 +6218,10 @@ mod tests {
             cache.claim(key),
             PrivateFilePageCacheClaim::Ready(_)
         ));
+        let ready_diag = cache.diag();
+        assert_eq!(ready_diag.misses, 2);
+        assert_eq!(ready_diag.load_leaders, 1);
+        assert_eq!(ready_diag.hits, 1);
         assert_eq!(cache.next_load_id.load(Ordering::Relaxed), next_after_owner);
     }
 
@@ -6357,8 +6375,11 @@ mod tests {
             offset: 0x5678,
             generation: 0x9abc,
         };
+        let hashes = key.private_cache_hashes();
 
         assert_eq!(cache.shard_index(key), cache.shard_index(key));
+        assert_eq!(hashes.cache, key.private_cache_hash());
+        assert_eq!(hashes.table, key.private_table_hash());
         assert_ne!(
             key.private_cache_hash(),
             FilePageKey {
