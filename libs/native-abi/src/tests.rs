@@ -111,6 +111,111 @@ fn every_canonical_signature_matches_its_frozen_hash() {
 }
 
 #[test]
+fn current_thread_control_has_direct_operations() {
+    let exit = crate::OPERATIONS
+        .iter()
+        .find(|spec| spec.name == "thread.exit")
+        .expect("当前线程退出必须有独立 operation");
+    assert_eq!(exit.interface, Some(ObjectInterface::Process));
+    assert_eq!(exit.required_rights, Rights::NONE);
+    assert!(exit.signature.ends_with("result=noreturn"));
+
+    let yield_now = crate::OPERATIONS
+        .iter()
+        .find(|spec| spec.name == "thread.yield")
+        .expect("主动让出调度器必须有独立 operation");
+    assert_eq!(yield_now.interface, Some(ObjectInterface::Process));
+    assert_eq!(yield_now.required_rights, Rights::NONE);
+    assert!(yield_now.signature.ends_with("result=status"));
+}
+
+#[test]
+fn memory_revocation_has_a_distinct_operation_and_statuses() {
+    let revoke = crate::OPERATIONS
+        .iter()
+        .find(|spec| spec.name == "memory.revoke")
+        .expect("MemoryObject 必须支持显式撤销");
+    assert_eq!(revoke.interface, Some(ObjectInterface::MemoryObject));
+    assert_eq!(revoke.required_rights, Rights::MODIFY);
+    assert!(revoke.signature.ends_with("result=u64"));
+
+    for name in ["memory.revoked", "memory.poisoned"] {
+        assert!(
+            crate::status::STATUS_CODES
+                .iter()
+                .any(|status| status.name == name),
+            "缺少稳定状态 {name}"
+        );
+    }
+}
+
+#[test]
+fn memory_statistics_is_a_read_only_snapshot() {
+    let statistics =
+        operation(OperationId::MemoryStatistics).expect("MemoryObject 必须提供只读统计快照");
+    assert_eq!(statistics.id as u32, 70);
+    assert_eq!(statistics.name, "memory.statistics");
+    assert_eq!(statistics.interface, Some(ObjectInterface::MemoryObject));
+    assert_eq!(statistics.required_rights, Rights::INSPECT);
+    assert_eq!(statistics.submission(), crate::SubmissionMode::DirectOnly);
+    assert_eq!(wire::MEMORY_STATISTICS_SIZE, 80);
+    assert_eq!(
+        core::mem::offset_of!(wire::MemoryStatistics, shared_resident_mappings),
+        24
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::MemoryStatistics, writeback_operations),
+        64
+    );
+}
+
+#[test]
+fn shared_ring_state_has_stable_layout_and_wrapping_counts() {
+    assert_eq!(core::mem::size_of::<wire::RingSharedState>(), 64);
+    assert_eq!(core::mem::align_of::<wire::RingSharedState>(), 8);
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, magic), 0x00);
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, entries), 0x08);
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, sq_head), 0x10);
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, sq_tail), 0x14);
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, cq_head), 0x18);
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, cq_tail), 0x1c);
+    assert_eq!(
+        core::mem::offset_of!(wire::RingSharedState, sq_offset),
+        0x20
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::RingSharedState, cq_offset),
+        0x28
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::RingSharedState, generation),
+        0x30
+    );
+    assert_eq!(core::mem::offset_of!(wire::RingSharedState, reserved), 0x38);
+
+    assert_eq!(wire::ring_queue_len(4, 4, 8), Some(0));
+    assert_eq!(wire::ring_queue_len(u32::MAX - 1, 1, 8), Some(3));
+    assert_eq!(wire::ring_queue_len(10, 18, 8), Some(8));
+    assert_eq!(wire::ring_queue_len(10, 19, 8), None);
+}
+
+#[test]
+fn submission_modes_distinguish_scalar_memory_and_control_operations() {
+    assert_eq!(
+        operation(OperationId::ClockRead).unwrap().submission(),
+        crate::SubmissionMode::Inline
+    );
+    assert_eq!(
+        operation(OperationId::StreamRead).unwrap().submission(),
+        crate::SubmissionMode::MemoryRegion
+    );
+    assert_eq!(
+        operation(OperationId::ProcessExit).unwrap().submission(),
+        crate::SubmissionMode::DirectOnly
+    );
+}
+
+#[test]
 fn requirement_registry_limits_interface_and_granted_rights() {
     let stdout = requirement(RequirementId::Stdout).expect("STDOUT 必须注册");
     assert_eq!(stdout.id as u32, 4);
@@ -126,9 +231,25 @@ fn requirement_registry_limits_interface_and_granted_rights() {
     assert_eq!(clock.max_rights, Rights::READ);
     assert_eq!(RequirementId::from_raw(4), Some(RequirementId::Stdout));
     assert_eq!(RequirementId::from_raw(0), None);
-    assert_eq!(RequirementId::from_raw(7), None);
+    assert_eq!(RequirementId::from_raw(10), None);
     assert_eq!(crate::right_by_name("write").unwrap().right, Rights::WRITE);
     assert!(crate::right_by_name("WRITE").is_none());
+}
+
+#[test]
+fn service_channel_requirement_only_grants_channel_messaging_rights() {
+    let service = requirement(RequirementId::ServiceChannel).expect("服务通道必须注册");
+    assert_eq!(service.id as u32, 9);
+    assert_eq!(service.name, "service_channel");
+    assert_eq!(service.interface, ObjectInterface::Channel);
+    assert_eq!(
+        service.max_rights,
+        Rights::SEND | Rights::RECEIVE | Rights::DUPLICATE | Rights::OBSERVE
+    );
+    assert_eq!(
+        RequirementId::from_raw(9),
+        Some(RequirementId::ServiceChannel)
+    );
 }
 
 #[test]
@@ -162,6 +283,605 @@ fn process_and_event_operations_preserve_contracts() {
     assert_eq!(wait.id as u32, 20);
     assert_eq!(wait.interface, Some(ObjectInterface::EventPort));
     assert_eq!(wait.required_rights, Rights::OBSERVE);
+}
+
+#[test]
+fn component_registry_preserves_append_only_ids_and_rights() {
+    assert_eq!(ObjectInterface::Image as u16, 5);
+    assert_eq!(ObjectInterface::Component as u16, 7);
+    assert_eq!(ObjectInterface::ComponentTransaction as u16, 8);
+    assert_eq!(ObjectInterface::Interface as u16, 9);
+    assert_eq!(Rights::LOAD.bits(), 1 << 15);
+    assert_eq!(Rights::UNLOAD.bits(), 1 << 16);
+    assert_eq!(crate::right_by_name("load").unwrap().right, Rights::LOAD);
+    assert_eq!(
+        crate::right_by_name("unload").unwrap().right,
+        Rights::UNLOAD
+    );
+    assert!(
+        requirement(RequirementId::SelfProcess)
+            .unwrap()
+            .max_rights
+            .is_subset_of(Rights::from_bits(u64::MAX))
+    );
+    assert!(Rights::LOAD.is_subset_of(requirement(RequirementId::SelfProcess).unwrap().max_rights));
+}
+
+#[test]
+fn component_operations_preserve_contracts() {
+    let expected = [
+        (
+            OperationId::ComponentLoad,
+            21,
+            "component.load",
+            Some(ObjectInterface::Process),
+            Rights::LOAD,
+            "epoch=1;operation=21;object=1;args=user_const_ptr,user_mut_ptr,zero,zero,zero;result=handle",
+        ),
+        (
+            OperationId::ComponentActivate,
+            22,
+            "component.activate",
+            Some(ObjectInterface::ComponentTransaction),
+            Rights::LOAD,
+            "epoch=1;operation=22;object=8;args=u32,user_mut_ptr,zero,zero,zero;result=handle",
+        ),
+        (
+            OperationId::ComponentQuery,
+            23,
+            "component.query",
+            Some(ObjectInterface::Component),
+            Rights::INSPECT,
+            "epoch=1;operation=23;object=7;args=user_mut_ptr,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::ComponentInterface,
+            24,
+            "component.interface",
+            Some(ObjectInterface::Component),
+            Rights::BIND,
+            "epoch=1;operation=24;object=7;args=user_const_ptr,zero,zero,zero,zero;result=handle,u64",
+        ),
+        (
+            OperationId::ComponentUnload,
+            25,
+            "component.unload",
+            Some(ObjectInterface::Component),
+            Rights::UNLOAD,
+            "epoch=1;operation=25;object=7;args=u64,user_mut_ptr,u64,zero,zero;result=handle",
+        ),
+        (
+            OperationId::ComponentFinish,
+            26,
+            "component.finish",
+            Some(ObjectInterface::ComponentTransaction),
+            Rights::UNLOAD,
+            "epoch=1;operation=26;object=8;args=u32,user_mut_ptr,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::ComponentWake,
+            27,
+            "component.wake",
+            Some(ObjectInterface::Component),
+            Rights::NONE,
+            "epoch=1;operation=27;object=7;args=u64,zero,zero,zero,zero;result=status",
+        ),
+    ];
+
+    for (id, raw, name, interface, rights, signature) in expected {
+        let spec = operation(id).expect("组件 operation 必须注册");
+        assert_eq!(spec.id as u32, raw);
+        assert_eq!(spec.name, name);
+        assert_eq!(spec.interface, interface);
+        assert_eq!(spec.required_rights, rights);
+        assert_eq!(spec.signature, signature);
+        assert_eq!(spec.submission(), crate::SubmissionMode::DirectOnly);
+    }
+}
+
+#[test]
+fn component_statuses_preserve_wire_values() {
+    assert_eq!(status::COMPONENT_INVALID_IMAGE, 0x0a00_0001);
+    assert_eq!(status::COMPONENT_DEPENDENCY_MISSING, 0x0a00_0002);
+    assert_eq!(status::COMPONENT_DEPENDENCY_CONFLICT, 0x0a00_0003);
+    assert_eq!(status::COMPONENT_DEPENDENCY_CYCLE, 0x0a00_0004);
+    assert_eq!(status::COMPONENT_INITIALIZING, 0x0a00_0005);
+    assert_eq!(status::COMPONENT_ACTIVE, 0x0a00_0006);
+    assert_eq!(status::COMPONENT_IN_USE, 0x0a00_0007);
+    assert_eq!(status::COMPONENT_DRAINING, 0x0a00_0008);
+    assert_eq!(status::COMPONENT_TIMEOUT, 0x0a00_0009);
+    assert_eq!(status::COMPONENT_UNLOADED, 0x0a00_000a);
+    assert_eq!(status::COMPONENT_SELF_UNLOAD, 0x0a00_000b);
+    assert_eq!(status::COMPONENT_LIFECYCLE_FAILED, 0x0a00_000c);
+    assert_eq!(status::COMPONENT_INVALID_TRANSACTION, 0x0a00_000d);
+}
+
+#[test]
+fn component_wire_layouts_are_frozen() {
+    assert_eq!(wire::COMPONENT_LOAD_REQUEST_SIZE, 64);
+    assert_eq!(wire::COMPONENT_LIFECYCLE_SIZE, 64);
+    assert_eq!(wire::COMPONENT_QUERY_SIZE, 64);
+    assert_eq!(wire::INTERFACE_REQUEST_SIZE, 48);
+    assert_eq!(wire::COMPONENT_CALL_STATE_SIZE, 64);
+    assert_eq!(wire::COMPONENT_CONTEXT_SIZE, 64);
+    assert_eq!(wire::COMPONENT_INTERFACE_GATE_SIZE, 32);
+    assert_eq!(core::mem::align_of::<wire::ComponentLoadRequest>(), 8);
+    assert_eq!(core::mem::offset_of!(wire::ComponentLoadRequest, images), 8);
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentLoadRequest, bindings),
+        24
+    );
+    assert_eq!(core::mem::offset_of!(wire::ComponentLifecycle, entry), 16);
+    assert_eq!(core::mem::offset_of!(wire::ComponentLifecycle, context), 24);
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentQuery, component_identity),
+        16
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentQuery, active_calls),
+        48
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::InterfaceRequest, signature_hash),
+        16
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentCallState, active_calls),
+        16
+    );
+    assert_eq!(core::mem::offset_of!(wire::ComponentContext, call_state), 8);
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentContext, call_slot_count),
+        32
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentContext, capability_count),
+        40
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentContext, capabilities),
+        48
+    );
+    assert_eq!(
+        core::mem::size_of::<wire::ComponentCapabilityRecord>(),
+        wire::COMPONENT_CAPABILITY_RECORD_SIZE
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentCapabilityRecord, handle),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentCapabilityRecord, granted_rights),
+        16
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentInterfaceGate, target),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ComponentInterfaceGate, component),
+        16
+    );
+    assert_eq!(wire::COMPONENT_ACTION_NONE, 0);
+    assert_eq!(wire::COMPONENT_ACTION_INITIALIZE, 1);
+    assert_eq!(wire::COMPONENT_ACTION_FINALIZE, 2);
+    assert_eq!(wire::COMPONENT_STATE_PREPARING, 1);
+    assert_eq!(wire::COMPONENT_STATE_FAILED, 7);
+    assert_eq!(wire::MAX_COMPONENT_IMAGES, 256);
+    assert_eq!(wire::MAX_COMPONENT_BINDINGS, 4096);
+}
+
+#[test]
+fn image_query_exposes_only_verified_identity() {
+    let query = operation(OperationId::ImageQuery).expect("image.query 必须注册");
+    assert_eq!(query.id as u32, 66);
+    assert_eq!(query.name, "image.query");
+    assert_eq!(query.interface, Some(ObjectInterface::Image));
+    assert_eq!(query.required_rights, Rights::INSPECT);
+    assert_eq!(
+        query.signature,
+        "epoch=1;operation=66;object=5;args=user_mut_ptr,zero,zero,zero,zero;result=status"
+    );
+    assert_eq!(query.submission(), crate::SubmissionMode::DirectOnly);
+
+    assert_eq!(wire::IMAGE_INFO_SIZE, 144);
+    assert_eq!(wire::IMAGE_ARTIFACT_EXECUTABLE, 1);
+    assert_eq!(wire::IMAGE_ARTIFACT_SHARED_COMPONENT, 2);
+    assert_eq!(core::mem::size_of::<wire::ImageInfo>(), 144);
+    assert_eq!(core::mem::align_of::<wire::ImageInfo>(), 8);
+    assert_eq!(core::mem::offset_of!(wire::ImageInfo, artifact_kind), 0);
+    assert_eq!(core::mem::offset_of!(wire::ImageInfo, enabled_features), 8);
+    assert_eq!(
+        core::mem::offset_of!(wire::ImageInfo, component_identity),
+        32
+    );
+    assert_eq!(core::mem::offset_of!(wire::ImageInfo, build_id), 64);
+    assert_eq!(core::mem::offset_of!(wire::ImageInfo, content_hash), 96);
+    assert_eq!(core::mem::offset_of!(wire::ImageInfo, reserved), 128);
+}
+
+#[test]
+fn image_trust_rejections_keep_distinct_statuses() {
+    assert_eq!(status::IMAGE_UNSIGNED, 0x0800_0004);
+    assert_eq!(status::IMAGE_UNKNOWN_KEY, 0x0800_0005);
+    assert_eq!(status::IMAGE_BAD_SIGNATURE, 0x0800_0006);
+    assert_eq!(status::IMAGE_REVOKED, 0x0800_0007);
+    assert_eq!(status::IMAGE_ROLLBACK, 0x0800_0008);
+    for name in [
+        "image.unsigned",
+        "image.unknown_key",
+        "image.bad_signature",
+        "image.revoked",
+        "image.rollback",
+    ] {
+        assert!(
+            crate::status::STATUS_CODES
+                .iter()
+                .any(|status| status.name == name),
+            "缺少 {name}"
+        );
+    }
+}
+
+#[test]
+fn native_foundation_interfaces_and_rights_are_append_only() {
+    assert_eq!(ObjectInterface::Thread as u16, 10);
+    assert_eq!(ObjectInterface::MemoryObject as u16, 11);
+    assert_eq!(ObjectInterface::Directory as u16, 12);
+    assert_eq!(ObjectInterface::File as u16, 13);
+    assert_eq!(ObjectInterface::Channel as u16, 14);
+    assert_eq!(Rights::MAP.bits(), 1 << 17);
+    assert_eq!(Rights::RESIZE.bits(), 1 << 18);
+    assert_eq!(Rights::OPEN.bits(), 1 << 19);
+    assert_eq!(Rights::MODIFY.bits(), 1 << 20);
+    assert_eq!(Rights::SEND.bits(), 1 << 21);
+    assert_eq!(Rights::RECEIVE.bits(), 1 << 22);
+    assert_eq!(crate::right_by_name("map").unwrap().right, Rights::MAP);
+    assert_eq!(
+        crate::right_by_name("receive").unwrap().right,
+        Rights::RECEIVE
+    );
+}
+
+#[test]
+fn native_foundation_status_families_are_append_only() {
+    assert_eq!(status::THREAD_INVALID, 0x0b00_0001);
+    assert_eq!(status::THREAD_WOULD_BLOCK, 0x0b00_0002);
+    assert_eq!(status::THREAD_TIMEOUT, 0x0b00_0003);
+    assert_eq!(status::THREAD_ALREADY_EXITED, 0x0b00_0004);
+    assert_eq!(status::THREAD_SELF, 0x0b00_0005);
+
+    assert_eq!(status::FILESYSTEM_INVALID_PATH, 0x0c00_0001);
+    assert_eq!(status::FILESYSTEM_NOT_FOUND, 0x0c00_0002);
+    assert_eq!(status::FILESYSTEM_ALREADY_EXISTS, 0x0c00_0003);
+    assert_eq!(status::FILESYSTEM_NOT_DIRECTORY, 0x0c00_0004);
+    assert_eq!(status::FILESYSTEM_IS_DIRECTORY, 0x0c00_0005);
+    assert_eq!(status::FILESYSTEM_NOT_EMPTY, 0x0c00_0006);
+    assert_eq!(status::FILESYSTEM_READ_ONLY, 0x0c00_0007);
+    assert_eq!(status::FILESYSTEM_END, 0x0c00_0008);
+    assert_eq!(status::FILESYSTEM_CHANGED, 0x0c00_0009);
+    assert_eq!(status::FILESYSTEM_ERROR, 0x0c00_000a);
+
+    assert_eq!(status::CHANNEL_FULL, 0x0d00_0001);
+    assert_eq!(status::CHANNEL_EMPTY, 0x0d00_0002);
+    assert_eq!(status::CHANNEL_PEER_CLOSED, 0x0d00_0003);
+    assert_eq!(status::CHANNEL_MESSAGE_TOO_LARGE, 0x0d00_0004);
+    assert_eq!(status::CHANNEL_BUFFER_TOO_SMALL, 0x0d00_0005);
+    assert_eq!(status::CHANNEL_TRANSFER_INVALID, 0x0d00_0006);
+}
+
+#[test]
+fn native_foundation_operations_preserve_contracts() {
+    let expected = [
+        (
+            OperationId::ThreadCreate,
+            28,
+            "thread.create",
+            Some(ObjectInterface::Process),
+            Rights::CREATE,
+            "epoch=1;operation=28;object=1;args=user_const_ptr,handle,zero,zero,zero;result=handle",
+        ),
+        (
+            OperationId::ThreadJoin,
+            29,
+            "thread.join",
+            Some(ObjectInterface::Thread),
+            Rights::WAIT,
+            "epoch=1;operation=29;object=10;args=user_mut_ptr,u64,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::ThreadTerminate,
+            30,
+            "thread.terminate",
+            Some(ObjectInterface::Thread),
+            Rights::TERMINATE,
+            "epoch=1;operation=30;object=10;args=u32,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::ThreadQuery,
+            31,
+            "thread.query",
+            Some(ObjectInterface::Thread),
+            Rights::INSPECT,
+            "epoch=1;operation=31;object=10;args=user_mut_ptr,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::MemoryCreate,
+            32,
+            "memory.create",
+            Some(ObjectInterface::Process),
+            Rights::CREATE,
+            "epoch=1;operation=32;object=1;args=user_const_ptr,zero,zero,zero,zero;result=handle",
+        ),
+        (
+            OperationId::MemoryMap,
+            33,
+            "memory.map",
+            Some(ObjectInterface::MemoryObject),
+            Rights::MAP,
+            "epoch=1;operation=33;object=11;args=user_const_ptr,zero,zero,zero,zero;result=u64,u64",
+        ),
+        (
+            OperationId::MemoryUnmap,
+            34,
+            "memory.unmap",
+            Some(ObjectInterface::AddressSpace),
+            Rights::FREE,
+            "epoch=1;operation=34;object=2;args=u64,u64,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::MemoryQuery,
+            35,
+            "memory.query",
+            Some(ObjectInterface::MemoryObject),
+            Rights::INSPECT,
+            "epoch=1;operation=35;object=11;args=user_mut_ptr,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::DirectoryOpen,
+            36,
+            "directory.open",
+            Some(ObjectInterface::Directory),
+            Rights::OPEN,
+            "epoch=1;operation=36;object=12;args=user_const_ptr,zero,zero,zero,zero;result=handle",
+        ),
+        (
+            OperationId::DirectoryCreate,
+            37,
+            "directory.create",
+            Some(ObjectInterface::Directory),
+            Rights::MODIFY,
+            "epoch=1;operation=37;object=12;args=user_const_ptr,zero,zero,zero,zero;result=handle",
+        ),
+        (
+            OperationId::DirectoryRemove,
+            38,
+            "directory.remove",
+            Some(ObjectInterface::Directory),
+            Rights::MODIFY,
+            "epoch=1;operation=38;object=12;args=user_const_ptr,u32,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::DirectoryQuery,
+            39,
+            "directory.query",
+            Some(ObjectInterface::Directory),
+            Rights::INSPECT,
+            "epoch=1;operation=39;object=12;args=user_mut_ptr,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::FileRead,
+            40,
+            "file.read",
+            Some(ObjectInterface::File),
+            Rights::READ,
+            "epoch=1;operation=40;object=13;args=user_mut_ptr,u64,u64,u32,zero;result=u64",
+        ),
+        (
+            OperationId::FileWrite,
+            41,
+            "file.write",
+            Some(ObjectInterface::File),
+            Rights::WRITE,
+            "epoch=1;operation=41;object=13;args=user_const_ptr,u64,u64,u32,zero;result=u64",
+        ),
+        (
+            OperationId::FileResize,
+            42,
+            "file.resize",
+            Some(ObjectInterface::File),
+            Rights::RESIZE,
+            "epoch=1;operation=42;object=13;args=u64,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::FileQuery,
+            43,
+            "file.query",
+            Some(ObjectInterface::File),
+            Rights::INSPECT,
+            "epoch=1;operation=43;object=13;args=user_mut_ptr,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::FileMap,
+            44,
+            "file.map",
+            Some(ObjectInterface::File),
+            Rights::MAP,
+            "epoch=1;operation=44;object=13;args=u64,u64,u32,zero,zero;result=handle",
+        ),
+        (
+            OperationId::ChannelCreate,
+            45,
+            "channel.create",
+            Some(ObjectInterface::Process),
+            Rights::CREATE,
+            "epoch=1;operation=45;object=1;args=u32,zero,zero,zero,zero;result=handle,handle",
+        ),
+        (
+            OperationId::ChannelSend,
+            46,
+            "channel.send",
+            Some(ObjectInterface::Channel),
+            Rights::SEND,
+            "epoch=1;operation=46;object=14;args=user_const_ptr,zero,zero,zero,zero;result=status",
+        ),
+        (
+            OperationId::ChannelReceive,
+            47,
+            "channel.receive",
+            Some(ObjectInterface::Channel),
+            Rights::RECEIVE,
+            "epoch=1;operation=47;object=14;args=user_mut_ptr,u64,zero,zero,zero;result=u64,u64",
+        ),
+    ];
+    for (id, raw, name, interface, rights, signature) in expected {
+        let spec = operation(id).expect("Native 基础对象 operation 必须注册");
+        assert_eq!(spec.id as u32, raw);
+        assert_eq!(spec.name, name);
+        assert_eq!(spec.interface, interface);
+        assert_eq!(spec.required_rights, rights);
+        assert_eq!(spec.signature, signature);
+        let submission = match id {
+            OperationId::FileRead
+            | OperationId::FileWrite
+            | OperationId::ChannelSend
+            | OperationId::ChannelReceive => crate::SubmissionMode::MemoryRegion,
+            _ => crate::SubmissionMode::DirectOnly,
+        };
+        assert_eq!(spec.submission(), submission);
+    }
+}
+
+#[test]
+fn native_foundation_wire_layouts_are_frozen() {
+    assert_eq!(wire::THREAD_CREATE_REQUEST_SIZE, 64);
+    assert_eq!(wire::THREAD_RESULT_SIZE, 32);
+    assert_eq!(wire::THREAD_INFO_SIZE, 48);
+    assert_eq!(wire::MEMORY_CREATE_REQUEST_SIZE, 64);
+    assert_eq!(wire::MEMORY_MAP_REQUEST_SIZE, 64);
+    assert_eq!(wire::MEMORY_INFO_SIZE, 64);
+    assert_eq!(wire::MEMORY_REGION_SIZE, 32);
+    assert_eq!(wire::PATH_REF_SIZE, 16);
+    assert_eq!(wire::DIRECTORY_REQUEST_SIZE, 64);
+    assert_eq!(wire::DIRECTORY_INFO_SIZE, 64);
+    assert_eq!(wire::FILE_INFO_SIZE, 64);
+    assert_eq!(wire::CHANNEL_HANDLE_TRANSFER_SIZE, 32);
+    assert_eq!(wire::CHANNEL_MESSAGE_SIZE, 64);
+    assert_eq!(
+        core::mem::offset_of!(wire::ThreadCreateRequest, stack_memory),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::ThreadCreateRequest, argument),
+        48
+    );
+    assert_eq!(
+        core::mem::offset_of!(wire::MemoryMapRequest, permissions),
+        40
+    );
+    assert_eq!(core::mem::offset_of!(wire::MemoryRegion, generation), 24);
+    assert_eq!(
+        core::mem::offset_of!(wire::DirectoryRequest, requested_rights),
+        24
+    );
+    assert_eq!(core::mem::offset_of!(wire::ChannelMessage, handles_ptr), 16);
+    assert_eq!(core::mem::offset_of!(wire::ChannelMessage, flags), 32);
+    assert_eq!(wire::MAX_PATH_BYTES, 4096);
+    assert_eq!(wire::MAX_CHANNEL_MESSAGE_BYTES, 1024 * 1024);
+    assert_eq!(wire::MAX_CHANNEL_MESSAGE_HANDLES, 64);
+}
+
+#[test]
+fn component_lifecycle_is_monotonic_and_unload_is_irreversible() {
+    let mut lifecycle = crate::ComponentLifecycleMachine::new();
+    assert_eq!(lifecycle.state(), crate::ComponentState::Preparing);
+    assert_eq!(lifecycle.begin_initialization(), Ok(()));
+    assert_eq!(lifecycle.state(), crate::ComponentState::Initializing);
+    assert_eq!(lifecycle.activate(status::OK), Ok(()));
+    assert_eq!(lifecycle.state(), crate::ComponentState::Active);
+    assert_eq!(lifecycle.generation(), 1);
+
+    assert_eq!(
+        lifecycle.begin_unload(1, false, 0),
+        Err(status::COMPONENT_IN_USE)
+    );
+    assert_eq!(lifecycle.state(), crate::ComponentState::Active);
+    assert_eq!(lifecycle.begin_unload(0, false, 2), Ok(false));
+    assert_eq!(lifecycle.state(), crate::ComponentState::Draining);
+    assert_eq!(lifecycle.timeout(), status::COMPONENT_TIMEOUT);
+    assert_eq!(lifecycle.state(), crate::ComponentState::Draining);
+    assert_eq!(lifecycle.calls_drained(1), Err(status::COMPONENT_DRAINING));
+    assert_eq!(lifecycle.calls_drained(0), Ok(()));
+    assert_eq!(lifecycle.state(), crate::ComponentState::Finalizing);
+    assert_eq!(
+        lifecycle.finish(status::CORE_INVALID_ARGUMENT),
+        status::COMPONENT_LIFECYCLE_FAILED
+    );
+    assert_eq!(lifecycle.state(), crate::ComponentState::Unloaded);
+    assert_eq!(lifecycle.generation(), 2);
+    assert_eq!(
+        lifecycle.begin_unload(0, false, 0),
+        Err(status::COMPONENT_UNLOADED)
+    );
+}
+
+#[test]
+fn component_lifecycle_rejects_self_unload_and_failed_init() {
+    let mut lifecycle = crate::ComponentLifecycleMachine::new();
+    lifecycle.begin_initialization().unwrap();
+    assert_eq!(
+        lifecycle.activate(status::CORE_INVALID_ARGUMENT),
+        Err(status::COMPONENT_LIFECYCLE_FAILED)
+    );
+    assert_eq!(lifecycle.state(), crate::ComponentState::Failed);
+
+    let mut active = crate::ComponentLifecycleMachine::new();
+    active.begin_initialization().unwrap();
+    active.activate(status::OK).unwrap();
+    assert_eq!(
+        active.begin_unload(0, true, 0),
+        Err(status::COMPONENT_SELF_UNLOAD)
+    );
+    assert_eq!(active.state(), crate::ComponentState::Active);
+}
+
+#[test]
+fn component_tls_allocator_honors_alignment_and_rolls_back_unpublished_tail() {
+    let mut arena =
+        crate::ComponentTlsAllocator::new(16 * 1024 * 1024, 4096).expect("合法 TLS arena 应建立");
+
+    let reservation = arena
+        .reserve(32, 2 * 1024 * 1024)
+        .expect("高对齐 TLS 模板应分配");
+    assert_eq!(reservation.offset(), 2 * 1024 * 1024);
+    assert_eq!(reservation.size(), 4096);
+    assert_eq!(reservation.identity(), 1);
+
+    assert!(arena.rollback(reservation));
+    let reused = arena
+        .reserve(32, 2 * 1024 * 1024)
+        .expect("未发布尾部回滚后应可复用");
+    assert_eq!(reused.offset(), 2 * 1024 * 1024);
+    assert_eq!(reused.identity(), 1);
+}
+
+#[test]
+fn component_tls_allocator_reuses_non_lifo_reservations() {
+    let mut arena =
+        crate::ComponentTlsAllocator::new(4 * 4096, 4096).expect("合法 TLS arena 应建立");
+
+    let first = arena.reserve(32, 16).expect("第一个 TLS 模板应分配");
+    let second = arena.reserve(32, 16).expect("第二个 TLS 模板应分配");
+    assert_eq!(first.offset(), 4096);
+    assert_eq!(second.offset(), 8192);
+
+    assert!(arena.rollback(first), "非尾部 TLS reservation 也必须可释放");
+    let reused = arena.reserve(32, 16).expect("释放的非尾部空洞应可复用");
+    assert_eq!(reused.offset(), first.offset());
+    assert_ne!(reused.identity(), first.identity());
+
+    assert!(arena.rollback(second));
+    assert!(arena.rollback(reused));
 }
 
 #[test]
@@ -570,6 +1290,26 @@ fn address_space_operations_are_bound_for_kernel() {
         Some(OperationId::MemoryAllocate)
     );
     assert_eq!(plan.call_slots[1].operation, Some(OperationId::MemoryFree));
+}
+
+#[test]
+fn registered_kernel_operations_are_all_bindable() {
+    let imports: alloc::vec::Vec<_> = crate::OPERATIONS
+        .iter()
+        .enumerate()
+        .map(|(slot, spec)| TestImport::known(slot as u32, spec.id, true))
+        .collect();
+
+    let plan = bind_native_abi(
+        ABI_FAMILY_MYGO_NATIVE,
+        ABI_EPOCH,
+        &imports,
+        &[] as &[TestCapability],
+        NativeAbiPolicy::for_kernel(),
+    )
+    .expect("内核已注册并分发的 operation 必须全部可绑定");
+
+    assert_eq!(plan.call_slots.len(), imports.len());
 }
 
 #[test]
