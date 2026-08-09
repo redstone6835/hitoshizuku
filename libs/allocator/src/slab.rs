@@ -16,6 +16,7 @@
 //!
 //! 它和 `kheap` 的分工边界很明确：不适合放进 slab 的对象，直接交给大对象路径。
 use core::alloc::Layout;
+use core::mem::MaybeUninit;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -148,6 +149,44 @@ impl CacheEntry {
     }
 }
 
+struct CacheDrainBuffer<const N: usize> {
+    entries: [MaybeUninit<CacheEntry>; N],
+    initialized: usize,
+}
+
+impl<const N: usize> CacheDrainBuffer<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [const { MaybeUninit::uninit() }; N],
+            initialized: 0,
+        }
+    }
+
+    fn push(&mut self, entry: CacheEntry) -> bool {
+        let Some(slot) = self.entries.get_mut(self.initialized) else {
+            return false;
+        };
+        slot.write(entry);
+        self.initialized += 1;
+        true
+    }
+
+    fn is_full(&self) -> bool {
+        self.initialized == N
+    }
+
+    fn initialized(&self) -> &[CacheEntry] {
+        // SAFETY: initialized 只会在对应槽位完成 MaybeUninit::write 后递增，因此
+        // entries 的这个前缀全部有效；后缀不会被构造成引用。
+        unsafe {
+            core::slice::from_raw_parts(
+                self.entries.as_ptr().cast::<CacheEntry>(),
+                self.initialized,
+            )
+        }
+    }
+}
+
 /// 某个 CPU 在某个 size class 下的本地缓存状态。
 ///
 /// 它的目标是把最热的小对象分配/释放留在本地 CPU 上完成，尽量少碰全局 slab 状态。
@@ -198,10 +237,10 @@ impl PerCpuCacheState {
         true
     }
 
-    fn push_for_free(
+    fn push_for_free<const N: usize>(
         &mut self,
         entry: CacheEntry,
-        drained: &mut [CacheEntry],
+        drained: &mut CacheDrainBuffer<N>,
         used_hint: bool,
     ) -> usize {
         self.stats.free_requests = self.stats.free_requests.saturating_add(1);
@@ -219,19 +258,19 @@ impl PerCpuCacheState {
             return 0;
         }
 
-        let mut drained_count = 0usize;
-        for slot in drained.iter_mut() {
+        while !drained.is_full() {
             let Some(entry) = self.pop_entry() else {
                 break;
             };
-            *slot = entry;
-            drained_count += 1;
+            if !drained.push(entry) {
+                panic!("[alloc][invariant] slab drain buffer rejected available slot");
+            }
         }
         if !self.push(entry) {
             panic!("[alloc][invariant] slab cache remained full after drain");
         }
         self.stats.flushes = self.stats.flushes.saturating_add(1);
-        drained_count
+        drained.initialized().len()
     }
 
     fn push_refill(&mut self, entries: &[CacheEntry], overflow: &mut [CacheEntry]) -> usize {
@@ -1245,7 +1284,7 @@ impl Zone {
         // 没有 registry cookie 的路径在 ZoneState 中定位对象。缓存对象由独立位图标记，
         // 因而不再需要扫描全部 CPU cache 来判断重复释放。
         let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
         let mut should_reclaim = false;
         let (slab_node, cached_index) = {
             let mut state = self.state.lock();
@@ -1277,7 +1316,7 @@ impl Zone {
         if drained_count != 0 {
             let mut state = self.state.lock();
             should_reclaim |= state
-                .flush_cached_entries(&drained[..drained_count], self.size_class)
+                .flush_cached_entries(drained.initialized(), self.size_class)
                 .made_empty;
         }
         if should_reclaim {
@@ -1300,7 +1339,7 @@ impl Zone {
         // backend cookie 由 allocator registry 生成且 SlabNode 只复用不释放；正常释放
         // 可以直接把 entry 放入本地 magazine，不读取 slab 元数据。
         let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
         let mut should_reclaim = false;
         let entry = CacheEntry {
             ptr,
@@ -1314,7 +1353,7 @@ impl Zone {
         if drained_count != 0 {
             let mut state = self.state.lock();
             should_reclaim |= state
-                .flush_cached_entries(&drained[..drained_count], self.size_class)
+                .flush_cached_entries(drained.initialized(), self.size_class)
                 .made_empty;
         }
         if should_reclaim {
@@ -2024,8 +2063,8 @@ mod slab_state_tests {
     use alloc::boxed::Box;
 
     use super::{
-        Slab, SlabAllocator, SlabAuditFlags, SlabNode, SlabObjectState, ZoneState,
-        slab_lookup_bucket,
+        CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, PerCpuCacheState, Slab,
+        SlabAllocator, SlabAuditFlags, SlabNode, SlabObjectState, ZoneState, slab_lookup_bucket,
     };
     use crate::buddy::PAGE_SIZE;
     use crate::space::{ArenaKind, BackedRange};
@@ -2045,6 +2084,46 @@ mod slab_state_tests {
             next: 0,
             lookup_next: 0,
         })
+    }
+
+    fn test_cache_entry(ptr: usize) -> CacheEntry {
+        CacheEntry {
+            ptr,
+            slab_node: ptr + PAGE_SIZE,
+            cached_index: ptr as u16,
+        }
+    }
+
+    #[test]
+    fn non_full_cache_free_leaves_drain_prefix_empty() {
+        let mut cache = PerCpuCacheState::new();
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
+        let entry = test_cache_entry(1);
+
+        assert_eq!(cache.push_for_free(entry, &mut drained, false), 0);
+        assert!(drained.initialized().is_empty());
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.entries[0].ptr, entry.ptr);
+    }
+
+    #[test]
+    fn full_cache_drain_exposes_only_the_written_prefix() {
+        let mut cache = PerCpuCacheState::new();
+        for ptr in 1..=CACHE_CAPACITY {
+            assert!(cache.push(test_cache_entry(ptr)));
+        }
+        let mut drained = CacheDrainBuffer::<{ CACHE_CAPACITY + 1 }>::new();
+        let incoming = test_cache_entry(CACHE_CAPACITY + 1);
+
+        assert_eq!(
+            cache.push_for_free(incoming, &mut drained, false),
+            CACHE_CAPACITY
+        );
+        assert_eq!(drained.initialized().len(), CACHE_CAPACITY);
+        assert_eq!(drained.initialized()[0].ptr, CACHE_CAPACITY);
+        assert_eq!(drained.initialized()[CACHE_CAPACITY - 1].ptr, 1);
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.entries[0].ptr, incoming.ptr);
     }
 
     #[test]
