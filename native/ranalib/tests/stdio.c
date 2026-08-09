@@ -11,6 +11,11 @@ static size_t output_length;
 static const char *input;
 static size_t input_length;
 static size_t input_offset;
+char **environ;
+
+_Noreturn void mrt_abort(void) {
+    __builtin_trap();
+}
 
 uint64_t mrt_initial_handle(uint32_t requirement_id) {
     switch (requirement_id) {
@@ -71,7 +76,7 @@ static void standard_streams_use_native_stream_capabilities(void) {
     assert(memcmp(output, "abc", sizeof(bytes)) == 0);
 }
 
-static void printf_supports_the_p0_conversion_set(void) {
+static void printf_supports_common_integer_and_text_conversions(void) {
     static const char expected[] = "-7 9 2a Z ok 0x1234 %";
     reset("");
     int written = printf(
@@ -85,6 +90,13 @@ static void printf_supports_the_p0_conversion_set(void) {
     assert(written == (int)(sizeof(expected) - 1));
     assert(output_length == sizeof(expected) - 1);
     assert(memcmp(output, expected, sizeof(expected) - 1) == 0);
+}
+
+static void snprintf_reports_full_length_and_terminates_the_buffer(void) {
+    char buffer[8];
+    int length = snprintf(buffer, sizeof(buffer), "%08x-%zu", 0x2au, (size_t)9);
+    assert(length == 10);
+    assert(strcmp(buffer, "0000002") == 0);
 }
 
 static void scanf_character_conversion_writes_a_char(void) {
@@ -101,10 +113,23 @@ static void scanf_returns_eof_when_input_fails_before_conversion(void) {
     assert(value == 0);
 }
 
+static void scanf_parses_bounded_text_and_integers(void) {
+    char word[8] = {0};
+    int signed_value = 0;
+    unsigned int hex_value = 0;
+    reset("native -42 2a");
+    assert(scanf("%7s %d %x", word, &signed_value, &hex_value) == 3);
+    assert(strcmp(word, "native") == 0);
+    assert(signed_value == -42);
+    assert(hex_value == 0x2a);
+}
+
 int main(void) {
     standard_streams_use_native_stream_capabilities();
-    printf_supports_the_p0_conversion_set();
+    printf_supports_common_integer_and_text_conversions();
+    snprintf_reports_full_length_and_terminates_the_buffer();
     scanf_character_conversion_writes_a_char();
     scanf_returns_eof_when_input_fails_before_conversion();
+    scanf_parses_bounded_text_and_integers();
     return 0;
 }

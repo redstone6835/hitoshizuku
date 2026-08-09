@@ -8,7 +8,8 @@
 #include <ranalib/stdlib.h>
 
 enum {
-    TEST_PAGE_COUNT = 4,
+    TEST_ARENA_SIZE = 1024 * 1024,
+    TEST_ARENA_COUNT = 4,
 };
 
 struct captured_call {
@@ -17,11 +18,13 @@ struct captured_call {
     uint64_t args[5];
 };
 
-static _Alignas(4096) unsigned char pages[TEST_PAGE_COUNT][4096];
-static struct captured_call calls[8];
+static _Alignas(4096) unsigned char arenas[TEST_ARENA_COUNT][TEST_ARENA_SIZE];
+static struct captured_call calls[16];
 static unsigned int call_count;
-static unsigned int next_page;
+static unsigned int next_arena;
 static uint32_t map_status;
+
+void ranalib_heap_reset_for_test(void);
 
 uint64_t mrt_initial_handle(uint32_t requirement_id) {
     assert(requirement_id == MYGO_REQUIREMENT_current_address_space);
@@ -50,9 +53,10 @@ struct mygo_native_result mrt_call(
     if (slot == MYGO_SLOT_memory_allocate) {
         result.status = map_status;
         if (result.status == MYGO_STATUS_ok) {
-            assert(next_page < TEST_PAGE_COUNT);
-            result.value0 = (uintptr_t)pages[next_page++];
-            result.value1 = MYGO_PAGE_SIZE;
+            assert(next_arena < TEST_ARENA_COUNT);
+            assert(arg0 <= TEST_ARENA_SIZE);
+            result.value0 = (uintptr_t)arenas[next_arena++];
+            result.value1 = arg0;
         }
     } else {
         assert(slot == MYGO_SLOT_memory_free);
@@ -67,35 +71,48 @@ _Noreturn void mrt_abort(void) {
 }
 
 static void reset(void) {
-    memset(pages, 0, sizeof(pages));
+    ranalib_heap_reset_for_test();
+    memset(arenas, 0, sizeof(arenas));
     memset(calls, 0, sizeof(calls));
     call_count = 0;
-    next_page = 0;
+    next_arena = 0;
     map_status = MYGO_STATUS_ok;
     errno = 0;
 }
 
-static void malloc_maps_zeroed_read_write_pages(void) {
+static void small_allocations_share_one_arena(void) {
     reset();
-    unsigned char *pointer = malloc(32);
+    unsigned char *first = malloc(32);
+    unsigned char *second = malloc(48);
 
-    assert(pointer != NULL);
-    assert((uintptr_t)pointer % _Alignof(max_align_t) == 0);
-    for (unsigned int index = 0; index < 32; ++index) {
-        assert(pointer[index] == 0);
-    }
+    assert(first != NULL && second != NULL && first != second);
+    assert((uintptr_t)first % _Alignof(max_align_t) == 0);
+    assert((uintptr_t)second % _Alignof(max_align_t) == 0);
     assert(call_count == 1);
     assert(calls[0].slot == MYGO_SLOT_memory_allocate);
     assert(calls[0].handle == UINT64_C(0x0000000100000004));
-    assert(calls[0].args[0] == MYGO_PAGE_SIZE);
+    assert(calls[0].args[0] == TEST_ARENA_SIZE);
     assert(calls[0].args[1] == MYGO_PAGE_SIZE);
-    assert(calls[0].args[2] == 0 && calls[0].args[3] == 0 && calls[0].args[4] == 0);
 
-    free(pointer);
-    assert(call_count == 2);
-    assert(calls[1].slot == MYGO_SLOT_memory_free);
-    assert(calls[1].args[0] == (uintptr_t)pages[0]);
-    assert(calls[1].args[1] == MYGO_PAGE_SIZE);
+    free(first);
+    free(second);
+    assert(call_count == 1);
+}
+
+static void calloc_clears_reused_storage(void) {
+    reset();
+    unsigned char *first = malloc(64);
+    assert(first != NULL);
+    memset(first, 0xa5, 64);
+    free(first);
+
+    unsigned char *cleared = calloc(16, 4);
+    assert(cleared != NULL);
+    for (unsigned int index = 0; index < 64; ++index) {
+        assert(cleared[index] == 0);
+    }
+    assert(call_count == 1);
+    free(cleared);
 }
 
 static void calloc_rejects_overflow_without_mapping(void) {
@@ -105,7 +122,7 @@ static void calloc_rejects_overflow_without_mapping(void) {
     assert(call_count == 0);
 }
 
-static void realloc_preserves_bytes_and_releases_the_old_mapping(void) {
+static void realloc_preserves_bytes_inside_the_arena(void) {
     reset();
     unsigned char *old = malloc(8);
     assert(old != NULL);
@@ -118,10 +135,23 @@ static void realloc_preserves_bytes_and_releases_the_old_mapping(void) {
     for (unsigned int index = 0; index < 8; ++index) {
         assert(grown[index] == (unsigned char)(index + 1));
     }
-    assert(call_count == 3);
-    assert(calls[2].slot == MYGO_SLOT_memory_free);
-    assert(calls[2].args[0] == (uintptr_t)pages[0]);
+    assert(call_count == 1);
     free(grown);
+}
+
+static void large_allocations_are_returned_to_native_memory(void) {
+    reset();
+    void *large = malloc(300 * 1024);
+    assert(large != NULL);
+    assert(call_count == 1);
+    assert(calls[0].slot == MYGO_SLOT_memory_allocate);
+    assert(calls[0].args[0] > 300 * 1024);
+
+    free(large);
+    assert(call_count == 2);
+    assert(calls[1].slot == MYGO_SLOT_memory_free);
+    assert(calls[1].args[0] == (uintptr_t)arenas[0]);
+    assert(calls[1].args[1] == calls[0].args[0]);
 }
 
 static void failed_mapping_reports_enomem(void) {
@@ -133,9 +163,11 @@ static void failed_mapping_reports_enomem(void) {
 }
 
 int main(void) {
-    malloc_maps_zeroed_read_write_pages();
+    small_allocations_share_one_arena();
+    calloc_clears_reused_storage();
     calloc_rejects_overflow_without_mapping();
-    realloc_preserves_bytes_and_releases_the_old_mapping();
+    realloc_preserves_bytes_inside_the_arena();
+    large_allocations_are_returned_to_native_memory();
     failed_mapping_reports_enomem();
     return 0;
 }

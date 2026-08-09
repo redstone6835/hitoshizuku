@@ -45,9 +45,28 @@ int memcmp(const void *left, const void *right, size_t count) {
     return 0;
 }
 
+void *memchr(const void *memory, int value, size_t count) {
+    const unsigned char *bytes = memory;
+    unsigned char needle = (unsigned char)value;
+    for (size_t index = 0; index < count; ++index) {
+        if (bytes[index] == needle) {
+            return (void *)(bytes + index);
+        }
+    }
+    return 0;
+}
+
 size_t strlen(const char *string) {
     size_t length = 0;
     while (string[length] != '\0') {
+        ++length;
+    }
+    return length;
+}
+
+size_t strnlen(const char *string, size_t maximum) {
+    size_t length = 0;
+    while (length < maximum && string[length] != '\0') {
         ++length;
     }
     return length;
@@ -73,4 +92,128 @@ int strncmp(const char *left, const char *right, size_t count) {
         }
     }
     return 0;
+}
+
+char *strcpy(char *destination, const char *source) {
+    size_t index = 0;
+    do {
+        destination[index] = source[index];
+    } while (source[index++] != '\0');
+    return destination;
+}
+
+char *strncpy(char *destination, const char *source, size_t count) {
+    size_t index = 0;
+    while (index < count && source[index] != '\0') {
+        destination[index] = source[index];
+        ++index;
+    }
+    while (index < count) {
+        destination[index++] = '\0';
+    }
+    return destination;
+}
+
+char *strcat(char *destination, const char *source) {
+    strcpy(destination + strlen(destination), source);
+    return destination;
+}
+
+char *strncat(char *destination, const char *source, size_t count) {
+    size_t offset = strlen(destination);
+    size_t index = 0;
+    while (index < count && source[index] != '\0') {
+        destination[offset + index] = source[index];
+        ++index;
+    }
+    destination[offset + index] = '\0';
+    return destination;
+}
+
+char *strchr(const char *string, int character) {
+    unsigned char needle = (unsigned char)character;
+    for (;;) {
+        if ((unsigned char)*string == needle) {
+            return (char *)string;
+        }
+        if (*string++ == '\0') {
+            return 0;
+        }
+    }
+}
+
+char *strrchr(const char *string, int character) {
+    unsigned char needle = (unsigned char)character;
+    const char *last = 0;
+    do {
+        if ((unsigned char)*string == needle) {
+            last = string;
+        }
+    } while (*string++ != '\0');
+    return (char *)last;
+}
+
+char *strstr(const char *haystack, const char *needle) {
+    if (*needle == '\0') {
+        return (char *)haystack;
+    }
+    size_t needle_length = strlen(needle);
+    for (; *haystack != '\0'; ++haystack) {
+        if (*haystack == *needle && strncmp(haystack, needle, needle_length) == 0) {
+            return (char *)haystack;
+        }
+    }
+    return 0;
+}
+
+static int character_in(const char *set, unsigned char character) {
+    while (*set != '\0') {
+        if ((unsigned char)*set++ == character) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+size_t strspn(const char *string, const char *accepted) {
+    size_t length = 0;
+    while (string[length] != '\0' && character_in(accepted, (unsigned char)string[length])) {
+        ++length;
+    }
+    return length;
+}
+
+size_t strcspn(const char *string, const char *rejected) {
+    size_t length = 0;
+    while (string[length] != '\0' && !character_in(rejected, (unsigned char)string[length])) {
+        ++length;
+    }
+    return length;
+}
+
+char *strpbrk(const char *string, const char *accepted) {
+    size_t offset = strcspn(string, accepted);
+    return string[offset] == '\0' ? 0 : (char *)(string + offset);
+}
+
+char *strtok(char *string, const char *delimiters) {
+    static _Thread_local char *next;
+    char *cursor = string == 0 ? next : string;
+    if (cursor == 0) {
+        return 0;
+    }
+    cursor += strspn(cursor, delimiters);
+    if (*cursor == '\0') {
+        next = 0;
+        return 0;
+    }
+    char *token = cursor;
+    cursor += strcspn(cursor, delimiters);
+    if (*cursor == '\0') {
+        next = 0;
+    } else {
+        *cursor = '\0';
+        next = cursor + 1;
+    }
+    return token;
 }

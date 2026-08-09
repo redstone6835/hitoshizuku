@@ -32,6 +32,35 @@ static void string_primitives_stop_at_nul_or_limit(void) {
     assert(strncmp("abc", "abd", 2) == 0);
     assert(strncmp("abc", "abd", 3) < 0);
     assert(strncmp("abc", "xyz", 0) == 0);
+
+    char buffer[16] = "so";
+    assert(strcat(buffer, "yo") == buffer);
+    assert(strcmp(buffer, "soyo") == 0);
+    assert(strncat(buffer, "-native-extra", 7) == buffer);
+    assert(strcmp(buffer, "soyo-native") == 0);
+    assert(strchr(buffer, '-') == buffer + 4);
+    const char *dashes = "a-b-c";
+    assert(strrchr(dashes, '-') == dashes + 3);
+    assert(strstr(buffer, "native") == buffer + 5);
+    assert(strspn("abc123", "abc") == 3);
+    assert(strcspn("abc123", "0123456789") == 3);
+    const char *native = "native";
+    assert(strpbrk(native, "xyzv") == native + 4);
+
+    char copied[8];
+    assert(strcpy(copied, "mygo") == copied);
+    assert(strcmp(copied, "mygo") == 0);
+    assert(strncpy(copied, "so", sizeof(copied)) == copied);
+    assert(copied[2] == 0 && copied[7] == 0);
+
+    char tokens[] = "a::b:c";
+    assert(strcmp(strtok(tokens, ":"), "a") == 0);
+    assert(strcmp(strtok(0, ":"), "b") == 0);
+    assert(strcmp(strtok(0, ":"), "c") == 0);
+    assert(strtok(0, ":") == 0);
+
+    assert(memchr(buffer, '-', strlen(buffer)) == buffer + 4);
+    assert(strnlen("abcd", 2) == 2);
 }
 
 int main(void) {
