@@ -178,6 +178,15 @@ struct RealtimeItimer {
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static HAS_REALTIME_ITIMERS: AtomicBool = AtomicBool::new(false);
+static DEADLINE_STATE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static DEADLINE_CACHE_GENERATION: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static DEADLINE_CACHE_VALUE: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static DEADLINE_CACHE_PRESENT: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+
+#[inline]
+fn invalidate_deadline_cache() {
+    DEADLINE_STATE_GENERATION.fetch_add(1, Ordering::Release);
+}
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 // 跨多个 runqueue 采样时统一取得这把锁，保证所有采样者以同一顺序观察
 // CPU 队列。单个 runqueue 的调度操作不取得它，避免把普通切换路径串行化。
@@ -1968,6 +1977,7 @@ fn register_sleep_deadline_on_cpu(task: &Arc<Task>, deadline_ns: u64, cpu_id: us
             });
         }
         HAS_TIMED_SLEEPERS.store(true, Ordering::Release);
+        invalidate_deadline_cache();
     }
     true
 }
@@ -2000,6 +2010,7 @@ pub fn cancel_sleep_deadline(task: &Arc<Task>) -> bool {
     };
     HAS_TIMED_SLEEPERS.store(nonempty, Ordering::Release);
     if changed {
+        invalidate_deadline_cache();
         reprogram_deadline_timer();
     }
     changed
@@ -2096,7 +2107,11 @@ pub fn get_realtime_itimer(task: &Arc<Task>) -> RealtimeItimerSpec {
     let tg = task.thread_group();
     let now_ns = now_ns_internal();
     let mut timers = REALTIME_ITIMERS.lock();
+    let old_len = timers.len();
     timers.retain(|entry| entry.thread_group.upgrade().is_some());
+    if timers.len() != old_len {
+        invalidate_deadline_cache();
+    }
     timers
         .iter()
         .find_map(|entry| {
@@ -2151,18 +2166,23 @@ pub fn set_realtime_itimer(
             });
         }
         HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
+        invalidate_deadline_cache();
         old
     };
     reprogram_deadline_timer();
     old
 }
 
-fn earliest_deadline(cpu_id: usize) -> Option<u64> {
+fn earliest_state_deadline_uncached(cpu_id: usize) -> Option<u64> {
     let sleeper_deadline = HAS_TIMED_SLEEPERS
         .load(Ordering::Acquire)
         .then(|| {
             let mut sleepers = TIMED_SLEEPERS.lock();
+            let old_len = sleepers.len();
             sleepers.retain(|entry| entry.task.upgrade().is_some());
+            if sleepers.len() != old_len {
+                invalidate_deadline_cache();
+            }
             HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
             sleepers
                 .iter()
@@ -2175,7 +2195,11 @@ fn earliest_deadline(cpu_id: usize) -> Option<u64> {
         .load(Ordering::Acquire)
         .then(|| {
             let mut timers = REALTIME_ITIMERS.lock();
+            let old_len = timers.len();
             timers.retain(|entry| entry.thread_group.upgrade().is_some());
+            if timers.len() != old_len {
+                invalidate_deadline_cache();
+            }
             HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
             timers
                 .iter()
@@ -2184,11 +2208,42 @@ fn earliest_deadline(cpu_id: usize) -> Option<u64> {
                 .min()
         })
         .flatten();
+    [sleeper_deadline, itimer_deadline]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+fn cached_state_deadline(cpu_id: usize) -> Option<u64> {
+    loop {
+        let generation = DEADLINE_STATE_GENERATION.load(Ordering::Acquire);
+        if DEADLINE_CACHE_GENERATION[cpu_id].load(Ordering::Acquire) == generation {
+            return DEADLINE_CACHE_PRESENT[cpu_id]
+                .load(Ordering::Relaxed)
+                .then(|| DEADLINE_CACHE_VALUE[cpu_id].load(Ordering::Relaxed));
+        }
+
+        let deadline = earliest_state_deadline_uncached(cpu_id);
+        if DEADLINE_STATE_GENERATION.load(Ordering::Acquire) != generation {
+            continue;
+        }
+        if let Some(deadline) = deadline {
+            DEADLINE_CACHE_VALUE[cpu_id].store(deadline, Ordering::Relaxed);
+        }
+        DEADLINE_CACHE_PRESENT[cpu_id].store(deadline.is_some(), Ordering::Relaxed);
+        DEADLINE_CACHE_GENERATION[cpu_id].store(generation, Ordering::Release);
+        return deadline;
+    }
+}
+
+fn earliest_deadline(cpu_id: usize) -> Option<u64> {
+    let cpu_id = cpu_id.min(NR_CPUS - 1);
+    let state_deadline = cached_state_deadline(cpu_id);
     #[cfg(feature = "performance-profile")]
     let profile_deadline = profiling::next_sample_deadline_ns(cpu_id, now_ns_internal());
     #[cfg(not(feature = "performance-profile"))]
     let profile_deadline = None;
-    [sleeper_deadline, itimer_deadline, profile_deadline]
+    [state_deadline, profile_deadline]
         .into_iter()
         .flatten()
         .min()
@@ -2238,6 +2293,7 @@ fn migrate_deadline_owners(source_cpu: usize, target_cpu: usize) {
             entry.cpu_id = target_cpu;
         }
     }
+    invalidate_deadline_cache();
 }
 
 fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
@@ -2249,11 +2305,13 @@ fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
     while index < sleepers.len() {
         let Some(task) = sleepers[index].task.upgrade() else {
             sleepers.swap_remove(index);
+            invalidate_deadline_cache();
             continue;
         };
         if sleepers[index].cpu_id == cpu_id && sleepers[index].deadline_ns <= now_ns {
             sleepers.swap_remove(index);
             HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
+            invalidate_deadline_cache();
             return Some(task);
         }
         index += 1;
@@ -2282,9 +2340,11 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
         let mut timers = REALTIME_ITIMERS.lock();
         let mut expired = Vec::new();
         let mut idx = 0;
+        let mut changed = false;
         while idx < timers.len() {
             let Some(tg) = timers[idx].thread_group.upgrade() else {
                 timers.swap_remove(idx);
+                changed = true;
                 continue;
             };
             if timers[idx].cpu_id != cpu_id || timers[idx].deadline_ns > now_ns {
@@ -2296,6 +2356,7 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
             let interval_ns = timers[idx].interval_ns;
             if interval_ns == 0 {
                 timers.swap_remove(idx);
+                changed = true;
                 continue;
             }
 
@@ -2308,9 +2369,13 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
                 next_deadline = advanced;
             }
             timers[idx].deadline_ns = next_deadline;
+            changed = true;
             idx += 1;
         }
         HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
+        if changed {
+            invalidate_deadline_cache();
+        }
         expired
     };
 
@@ -3385,12 +3450,20 @@ pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
 fn service_idle_scheduler_requests(cpu_id: usize) {
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
     // idle 循环本身每轮都会执行一次 schedule_once，因此先消费通知位，
-    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。随后无条件尝试从
-    // 远端繁忙队列拉取一个任务：该入口只在硬件等待返回后执行一次，不会在
-    // 空闲循环中忙轮询；成功拉取的任务会被紧随其后的 schedule_once 选中。
+    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。空闲核每次从硬件等待
+    // 返回后主动拉取一次；本地已经出现普通任务时直接交给 schedule_once。
     let _ = cpu_state.take_resched();
     let _ = cpu_state.take_balance();
-    let _ = balance_once(cpu_id);
+    let local_nr_running = cpu_state.runqueue().nr_running();
+    let _ = run_idle_balance_if_idle(local_nr_running, cpu_id, balance_once);
+}
+
+#[inline]
+fn run_idle_balance_if_idle<F>(local_nr_running: usize, cpu_id: usize, balance: F) -> bool
+where
+    F: FnOnce(usize) -> bool,
+{
+    local_nr_running <= 1 && balance(cpu_id)
 }
 
 // ── exit 辅助 ────────────────────────────────────────────────────────────────
@@ -3502,5 +3575,55 @@ mod deadline_observer_tests {
         assert_eq!(observer.0.load(Ordering::Acquire), 1);
         fire_expired_deadline_observers(deadline + 10);
         assert_eq!(observer.0.load(Ordering::Acquire), 2);
+    }
+
+    #[cfg(feature = "performance-profile")]
+    #[test]
+    fn profiling_deadline_refreshes_after_sampling_rate_change() {
+        let cpu_id = NR_CPUS - 1;
+        profiling::start();
+        profiling::set_sampling_enabled(true);
+        assert!(profiling::set_sample_hz(250));
+        invalidate_deadline_cache();
+
+        let first = earliest_deadline(cpu_id).expect("首次采样截止时间");
+        assert!(profiling::set_sample_hz(500));
+        let second = earliest_deadline(cpu_id).expect("更新后的采样截止时间");
+
+        profiling::set_sampling_enabled(false);
+        profiling::stop();
+        assert_ne!(first, second);
+        assert!(second < first);
+    }
+}
+
+#[cfg(test)]
+mod idle_balance_tests {
+    use super::run_idle_balance_if_idle;
+    use core::cell::Cell;
+
+    #[test]
+    fn idle_balance_runs_without_request_when_local_queue_is_empty() {
+        let calls = Cell::new(0usize);
+        let run = |cpu_id| {
+            assert_eq!(cpu_id, 3);
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(run_idle_balance_if_idle(1, 3, run));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_balance_skips_scan_when_local_queue_has_work() {
+        let calls = Cell::new(0usize);
+        let run = |_| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(!run_idle_balance_if_idle(2, 3, run));
+        assert_eq!(calls.get(), 0);
     }
 }
