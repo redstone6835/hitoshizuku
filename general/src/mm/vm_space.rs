@@ -4493,30 +4493,33 @@ impl VmSpace {
         }
 
         let mut pages = self.pages.lock();
-        let resident = pages.contains_key(&page_va);
-        let pte_present = if cfg!(debug_assertions) {
-            user_pgd_ops().is_some_and(|ops| {
-                (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
-            })
-        } else {
-            resident
-        };
-        if let Some(mapping) = pages.get_mut(&page_va) {
-            if !pte_present {
+        #[cfg(debug_assertions)]
+        let pte_present = user_pgd_ops().is_some_and(|ops| {
+            (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
+        });
+        let vacant = match pages.entry(page_va) {
+            alloc::collections::btree_map::Entry::Occupied(entry) => {
+                let mapping = entry.into_mut();
+                #[cfg(debug_assertions)]
+                if !pte_present {
+                    drop(pages);
+                    drop(set);
+                    drop(page);
+                    return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                        KernelFaultReason::UncaughtKernelAccess,
+                    ));
+                }
+                let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
                 drop(pages);
                 drop(set);
                 drop(page);
-                return FaultAroundCommit::Done(FaultOutcome::Kernel(
-                    KernelFaultReason::UncaughtKernelAccess,
-                ));
+                return FaultAroundCommit::Done(self.finish_resident_fault(page_va, update, true));
             }
-            let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
-            drop(pages);
-            drop(set);
-            drop(page);
-            return FaultAroundCommit::Done(self.finish_resident_fault(page_va, update, true));
-        }
+            alloc::collections::btree_map::Entry::Vacant(vacant) => vacant,
+        };
+        #[cfg(debug_assertions)]
         if pte_present {
+            drop(vacant);
             drop(pages);
             drop(set);
             drop(page);
@@ -4527,12 +4530,13 @@ impl VmSpace {
         if let Err(err) =
             self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
         {
+            drop(vacant);
             drop(pages);
             drop(set);
             drop(page);
             return FaultAroundCommit::Done(fault_from_errno(err));
         }
-        pages.insert(page_va, PageMapping { page, access });
+        vacant.insert(PageMapping { page, access });
         let mapped = pages.len();
         self.mapped_pages.store(mapped, Ordering::Release);
         drop(pages);
