@@ -45,7 +45,8 @@ pub(crate) struct PreparedNativeCapability {
     pub(crate) object: KernelNativeObject,
     pub(crate) interface: native_abi::ObjectInterface,
     pub(crate) rights: Rights,
-    pub(crate) source_handle: Option<NativeHandle>,
+    pub(crate) source_handle: NativeHandle,
+    pub(crate) move_source: bool,
 }
 
 /// 由线程组 personality 唯一持有的 Native 进程状态。

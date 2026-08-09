@@ -82,7 +82,7 @@ pub(super) fn process_spawn(
         Ok(inputs) => inputs,
         Err(error) => return native_return(error, 0, 0),
     };
-    if let Err(error) = validate_move_transfers(state, &transferred) {
+    if let Err(error) = validate_transfer_sources(state, &transferred) {
         return native_return(error, 0, 0);
     }
 
@@ -130,7 +130,7 @@ pub(super) fn process_spawn(
             return native_return(error, 0, 0);
         }
     };
-    if let Err(error) = commit_move_transfers(state, &transferred) {
+    if let Err(error) = commit_transfers(state, &transferred) {
         let _ = state.handles.lock().close(process_handle);
         sched::abort_new_task(&child);
         return native_return(error, 0, 0);
@@ -169,7 +169,7 @@ pub(super) fn process_replace(
         Ok(inputs) => inputs,
         Err(error) => return native_return(error, 0, 0),
     };
-    if let Err(error) = validate_move_transfers(state, &transferred) {
+    if let Err(error) = validate_transfer_sources(state, &transferred) {
         return native_return(error, 0, 0);
     }
     let loaded = match crate::soyo::load_executable_image(&image) {
@@ -188,10 +188,10 @@ pub(super) fn process_replace(
     };
     match crate::exec::commit_native_replace(task, prepared, user_context) {
         Ok(()) => {
-            // Native -> Native replace 已经完成 frame/VM 提交；此时 move source
-            // 不再有可失败路径，代际仍由同一 handle 表原子校验。
-            if let Err(error) = commit_move_transfers(state, &transferred) {
-                log::error!("[native][replace] committed move transfer lost: {error:#x}");
+            // Native -> Native replace 已经完成 frame/VM 提交；此时所有 source
+            // 再次统一复核，MOVE source 在同一 handle 表临界区内关闭。
+            if let Err(error) = commit_transfers(state, &transferred) {
+                log::error!("[native][replace] committed transfer lost: {error:#x}");
                 return NativeCallOutcome::ExitGroup(127);
             }
             NativeCallOutcome::FrameFinalized
@@ -442,9 +442,9 @@ fn read_transfers(
         }
         let source_handle = NativeHandle::from_raw(transfer.source_handle);
         if transfer.flags == wire::HANDLE_TRANSFER_MOVE
-            && transfers
-                .iter()
-                .any(|entry: &PreparedNativeCapability| entry.source_handle == Some(source_handle))
+            && transfers.iter().any(|entry: &PreparedNativeCapability| {
+                entry.move_source && entry.source_handle == source_handle
+            })
         {
             return Err(status::CORE_INVALID_ARGUMENT);
         }
@@ -457,8 +457,8 @@ fn read_transfers(
                 object: entry.object.clone(),
                 interface: entry.interface,
                 rights: requested,
-                source_handle: (transfer.flags == wire::HANDLE_TRANSFER_MOVE)
-                    .then_some(NativeHandle::from_raw(transfer.source_handle)),
+                source_handle,
+                move_source: transfer.flags == wire::HANDLE_TRANSFER_MOVE,
             }
         };
         transfers.push(entry);
@@ -466,36 +466,36 @@ fn read_transfers(
     Ok(transfers)
 }
 
-fn validate_move_transfers(
+fn validate_transfer_sources(
     state: &NativeProcessState,
     transfers: &[PreparedNativeCapability],
 ) -> Result<(), u32> {
     let handles = state.handles.lock();
     for transfer in transfers {
-        let Some(source) = transfer.source_handle else {
-            continue;
-        };
-        handles.lookup(source, Some(transfer.interface), transfer.rights)?;
+        handles.lookup(
+            transfer.source_handle,
+            Some(transfer.interface),
+            transfer.rights,
+        )?;
     }
     Ok(())
 }
 
-fn commit_move_transfers(
+fn commit_transfers(
     state: &NativeProcessState,
     transfers: &[PreparedNativeCapability],
 ) -> Result<(), u32> {
     let mut handles = state.handles.lock();
-    // Validate every source while holding the table lock so a move is all-or-none.
+    // COPY 与 MOVE 都必须在线性化提交点复核代际；MOVE 再以 all-or-none 方式关闭源。
     for transfer in transfers {
-        let Some(source) = transfer.source_handle else {
-            continue;
-        };
-        handles.lookup(source, Some(transfer.interface), transfer.rights)?;
+        handles.lookup(
+            transfer.source_handle,
+            Some(transfer.interface),
+            transfer.rights,
+        )?;
     }
-    for transfer in transfers {
-        if let Some(source) = transfer.source_handle {
-            let _ = handles.close(source)?;
-        }
+    for transfer in transfers.iter().filter(|transfer| transfer.move_source) {
+        let _ = handles.close(transfer.source_handle)?;
     }
     Ok(())
 }
@@ -511,6 +511,61 @@ fn copy_user_value<T: Copy + Default>(user: u64) -> Result<T, u32> {
     };
     copy_from_user(user, bytes).map_err(|_| status::STREAM_FAULT)?;
     Ok(value)
+}
+
+#[cfg(any(feature = "kernel-tests", feature = "soyo-tests"))]
+mod tests {
+    use alloc::vec::Vec;
+
+    use ktest::ktest;
+    use native_abi::{NativeBindingPlan, NativeHandleTable};
+
+    use super::*;
+
+    fn test_state(handles: NativeHandleTable<KernelNativeObject>) -> NativeProcessState {
+        NativeProcessState {
+            binding: NativeBindingPlan {
+                call_slots: Vec::new(),
+            },
+            handles: sched::sync::Spinlock::new(handles),
+            build_id: [0; 32],
+            content_hash: [0; 32],
+            image_base: 0,
+            runtime_ranges: sched::sync::Spinlock::new(None),
+            allocations: sched::sync::Spinlock::new(Vec::new()),
+        }
+    }
+
+    #[ktest]
+    fn copy_transfer_source_is_revalidated_before_commit() {
+        let mut handles = NativeHandleTable::new().expect("测试 handle table 应创建成功");
+        let source = handles
+            .insert(
+                KernelNativeObject::MonotonicClock,
+                ObjectInterface::Clock,
+                Rights::READ,
+            )
+            .expect("测试 source handle 应创建成功");
+        let state = test_state(handles);
+        let transfer = PreparedNativeCapability {
+            requirement_id: native_abi::RequirementId::MonotonicClock,
+            object: KernelNativeObject::MonotonicClock,
+            interface: ObjectInterface::Clock,
+            rights: Rights::READ,
+            source_handle: source,
+            move_source: false,
+        };
+        state
+            .handles
+            .lock()
+            .close(source)
+            .expect("测试 source handle 应关闭成功");
+
+        assert_eq!(
+            commit_transfers(&state, &[transfer]),
+            Err(status::HANDLE_STALE)
+        );
+    }
 }
 
 fn write_process_result(user: u64, result: &ProcessResult) -> Result<(), u32> {

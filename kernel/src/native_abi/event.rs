@@ -232,46 +232,55 @@ impl EventPort {
         allow_current_generation: bool,
         capacity: usize,
     ) -> bool {
-        let Some(subscription) = state
-            .subscriptions
-            .iter_mut()
-            .find(|entry| entry.token == token)
-        else {
-            return false;
+        let (previous_generation, interest, source_handle, user_data) = {
+            let Some(subscription) = state
+                .subscriptions
+                .iter_mut()
+                .find(|entry| entry.token == token)
+            else {
+                return false;
+            };
+            let SubscriptionKind::Stream {
+                source_id: expected_source,
+                interest,
+                last_generation,
+                ..
+            } = &mut subscription.kind
+            else {
+                return false;
+            };
+            if *expected_source != source_id
+                || generation < *last_generation
+                || (!allow_current_generation && generation == *last_generation)
+            {
+                return false;
+            }
+            let previous_generation = *last_generation;
+            *last_generation = generation;
+            (
+                previous_generation,
+                *interest,
+                subscription.source_handle,
+                subscription.user_data,
+            )
         };
-        let SubscriptionKind::Stream {
-            source_id: expected_source,
-            interest,
-            last_generation,
-            ..
-        } = &mut subscription.kind
-        else {
-            return false;
-        };
-        if *expected_source != source_id
-            || generation < *last_generation
-            || (!allow_current_generation && generation == *last_generation)
-        {
-            return false;
-        }
-        *last_generation = generation;
-        let ready = readiness.intersect(*interest);
-        if ready.is_empty() {
-            return false;
-        }
-        let source_handle = subscription.source_handle;
-        let user_data = subscription.user_data;
-        if let Some(index) = state.queue.iter().position(|entry| {
+        let ready = readiness.intersect(interest);
+        let queued = state.queue.iter().position(|entry| {
             entry.token == token && entry.record.event_kind == wire::EVENT_KIND_STREAM_READY
-        }) {
-            let claimed = state.queue[index].claimed;
-            state.queue[index].record.value0 |= u64::from(native_stream_events(ready));
-            if claimed {
-                let Some(mut queued) = state.queue.remove(index) else {
-                    return false;
-                };
-                queued.record.sequence = take_sequence(state);
-                state.queue.push_back(queued);
+        });
+
+        if ready.is_empty() {
+            if let Some(index) = queued {
+                state.queue.remove(index);
+            }
+            return false;
+        }
+
+        if let Some(index) = queued {
+            state.queue[index].record.value0 = u64::from(native_stream_events(ready));
+            if generation > previous_generation {
+                let sequence = take_sequence(state);
+                state.queue[index].record.sequence = sequence;
             }
             return false;
         }
@@ -428,7 +437,7 @@ impl EventPort {
                             .subscriptions
                             .iter()
                             .find(|entry| entry.token == *token)
-                            .is_some_and(|entry| !entry.terminal_claimed)
+                            .is_some_and(|entry| entry.terminal_claimed)
                 })
                 .min_by_key(|(_, record)| record.sequence);
             match (queue, terminal) {
@@ -494,9 +503,18 @@ impl EventPort {
     }
 
     fn commit_peek(&self, selection: &BatchSelection) {
+        let mut stream_snapshots = [None; wire::MAX_EVENT_BATCH as usize];
+        let mut stream_snapshot_count = 0usize;
+        for index in 0..selection.queue_count {
+            if selection.queue_kinds[index] == wire::EVENT_KIND_STREAM_READY
+                && let Some(snapshot) = self.snapshot_stream_level(selection.queue_tokens[index])
+            {
+                stream_snapshots[stream_snapshot_count] = Some(snapshot);
+                stream_snapshot_count += 1;
+            }
+        }
+
         let mut state = self.state.lock();
-        let mut level_tokens = [0u64; wire::MAX_EVENT_BATCH as usize];
-        let mut level_count = 0usize;
         for index in 0..selection.queue_count {
             let Some(queue_index) = state.queue.iter().position(|entry| {
                 entry.token == selection.queue_tokens[index]
@@ -508,10 +526,6 @@ impl EventPort {
                 let Some(entry) = state.queue.remove(queue_index) else {
                     continue;
                 };
-                if entry.record.event_kind == wire::EVENT_KIND_STREAM_READY {
-                    level_tokens[level_count] = entry.token;
-                    level_count += 1;
-                }
                 if entry.record.event_kind == wire::EVENT_KIND_TIMER_EXPIRED
                     && let Some(subscription) = state
                         .subscriptions
@@ -535,8 +549,16 @@ impl EventPort {
                 }
             }
         }
-        for token in &level_tokens[..level_count] {
-            Self::refresh_stream_level_locked(&mut state, *token, self.capacity);
+        for snapshot in stream_snapshots[..stream_snapshot_count].iter().flatten() {
+            Self::publish_stream_locked(
+                &mut state,
+                snapshot.token,
+                snapshot.source_id,
+                snapshot.readiness,
+                snapshot.generation,
+                true,
+                self.capacity,
+            );
         }
         for token in &selection.terminal_tokens[..selection.terminal_count] {
             if let Some(subscription) = state
@@ -550,27 +572,29 @@ impl EventPort {
         }
     }
 
-    /// 记录已交付后仍在 level 的 Stream。PollSource 在 readiness 未改变时不会
-    /// 再回调，因此必须主动读取 snapshot；整个过程持有 EventPort 锁，确保刚释放
-    /// 的队列槽位不会被并发生产者抢走。
-    fn refresh_stream_level_locked(state: &mut EventState, token: u64, capacity: usize) {
-        let snapshot = state
-            .subscriptions
-            .iter()
-            .find(|entry| entry.token == token)
-            .and_then(|entry| match &entry.kind {
-                SubscriptionKind::Stream { file, .. } => file.poll_source().map(|source| {
-                    let (readiness, generation) = source.snapshot();
-                    (source.id(), readiness, generation)
-                }),
-                _ => None,
-            });
-        let Some((source_id, readiness, generation)) = snapshot else {
-            return;
+    /// PollSource 可能在查询时同步发布 readiness，因此只在短临界区内克隆 File，
+    /// 实际查询必须位于 EventPort 锁外。commit 阶段会重新验证 token、source 与 generation。
+    fn snapshot_stream_level(&self, token: u64) -> Option<StreamSnapshot> {
+        let file = {
+            let state = self.state.lock();
+            state
+                .subscriptions
+                .iter()
+                .find(|entry| entry.token == token)
+                .and_then(|entry| match &entry.kind {
+                    SubscriptionKind::Stream { file, .. } => Some(Arc::clone(file)),
+                    _ => None,
+                })
         };
-        Self::publish_stream_locked(
-            state, token, source_id, readiness, generation, true, capacity,
-        );
+        let file = file?;
+        let source = file.poll_source()?;
+        let (readiness, generation) = source.snapshot();
+        Some(StreamSnapshot {
+            token,
+            source_id: source.id(),
+            readiness,
+            generation,
+        })
     }
 
     fn rollback_peek(&self, selection: &BatchSelection) {
@@ -637,6 +661,14 @@ struct BatchSelection {
     queue_kinds: [u32; wire::MAX_EVENT_BATCH as usize],
     queue_sequences: [u64; wire::MAX_EVENT_BATCH as usize],
     queue_values: [u64; wire::MAX_EVENT_BATCH as usize],
+}
+
+#[derive(Clone, Copy)]
+struct StreamSnapshot {
+    token: u64,
+    source_id: u64,
+    readiness: PollEvents,
+    generation: u64,
 }
 
 struct EventWaitClaim<'a> {
@@ -1017,12 +1049,17 @@ fn cancel_backend(subscription: Subscription) {
 mod tests {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
+    use core::any::Any;
+    use core::ops::ControlFlow;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     use ktest::ktest;
     use vfs::anon;
     use vfs::cred::Credentials;
+    use vfs::error::{VfsError, VfsResult};
     use vfs::eventfd::EventfdFileOps;
-    use vfs::file::{AccessMode, OpenOptions};
+    use vfs::file::{AccessMode, DirEntry, FileOps, OpenOptions};
+    use vfs::poll_source::PollSource;
 
     use super::*;
 
@@ -1048,6 +1085,15 @@ mod tests {
     }
 
     fn stream_subscription(port: &Arc<EventPort>, token: u64, file: Arc<File>) -> Subscription {
+        stream_subscription_with_interest(port, token, file, PollEvents::POLLIN)
+    }
+
+    fn stream_subscription_with_interest(
+        port: &Arc<EventPort>,
+        token: u64,
+        file: Arc<File>,
+        interest: PollEvents,
+    ) -> Subscription {
         let source = file.poll_source().expect("测试流必须暴露 PollSource");
         let observer = Arc::new(EventObserver {
             port: Arc::downgrade(port),
@@ -1062,7 +1108,7 @@ mod tests {
                 source_id: source.id(),
                 file,
                 backend: 0,
-                interest: PollEvents::POLLIN,
+                interest,
                 last_generation: 0,
             },
             terminal: None,
@@ -1081,6 +1127,68 @@ mod tests {
         )
     }
 
+    struct LockProbeFileOps {
+        source: PollSource,
+        port: Weak<EventPort>,
+        lock_was_free: Arc<AtomicBool>,
+    }
+
+    impl FileOps for LockProbeFileOps {
+        fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+            Err(VfsError::BadFileDescriptor)
+        }
+
+        fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+            Err(VfsError::BadFileDescriptor)
+        }
+
+        fn readdir(
+            &self,
+            _pos: u64,
+            _sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+        ) -> VfsResult<u64> {
+            Err(VfsError::NotADirectory)
+        }
+
+        fn sync(&self) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn poll(&self, _interest: PollEvents) -> PollEvents {
+            self.source.snapshot().0
+        }
+
+        fn poll_source(&self) -> Option<&PollSource> {
+            let lock_was_free = self
+                .port
+                .upgrade()
+                .is_some_and(|port| port.state.try_lock().is_some());
+            self.lock_was_free.store(lock_was_free, Ordering::Release);
+            Some(&self.source)
+        }
+
+        fn release(&self) {}
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn lock_probe_file(port: &Arc<EventPort>, lock_was_free: Arc<AtomicBool>) -> Arc<File> {
+        anon::new_file(
+            Arc::new(Credentials::root()),
+            OpenOptions {
+                access: AccessMode::ReadWrite,
+                ..Default::default()
+            },
+            Box::new(LockProbeFileOps {
+                source: PollSource::new(PollEvents::POLLIN),
+                port: Arc::downgrade(port),
+                lock_was_free,
+            }),
+        )
+    }
+
     #[ktest]
     fn stale_stream_generation_cannot_requeue_old_readiness() {
         let port = EventPort::new(2).expect("EventPort 应创建成功");
@@ -1094,6 +1202,48 @@ mod tests {
 
         port.publish_stream(token, source.id(), PollEvents::default(), 2);
         port.publish_stream(token, source.id(), PollEvents::POLLIN, 1);
+
+        assert!(!port.has_events());
+    }
+
+    #[ktest]
+    fn newer_stream_generation_replaces_queued_readiness() {
+        let port = EventPort::new(2).expect("EventPort 应创建成功");
+        let file = readable_eventfd();
+        let source = file.poll_source().expect("测试流必须暴露 PollSource");
+        let token = port.reserve_token().expect("token 应可分配");
+        assert!(
+            port.install_subscription(stream_subscription_with_interest(
+                &port,
+                token,
+                Arc::clone(&file),
+                PollEvents::POLLIN.with(PollEvents::POLLOUT),
+            ))
+            .is_ok()
+        );
+
+        port.publish_stream(token, source.id(), PollEvents::POLLIN, 2);
+        port.publish_stream(token, source.id(), PollEvents::POLLOUT, 3);
+
+        let mut records = [EventRecord::default(); 1];
+        let selection = port.peek(&mut records);
+        assert_eq!(selection.count, 1);
+        assert_eq!(records[0].value0, u64::from(wire::EVENT_STREAM_WRITABLE));
+    }
+
+    #[ktest]
+    fn newer_non_ready_generation_revokes_queued_readiness() {
+        let port = EventPort::new(2).expect("EventPort 应创建成功");
+        let file = readable_eventfd();
+        let source = file.poll_source().expect("测试流必须暴露 PollSource");
+        let token = port.reserve_token().expect("token 应可分配");
+        assert!(
+            port.install_subscription(stream_subscription(&port, token, Arc::clone(&file)))
+                .is_ok()
+        );
+
+        port.publish_stream(token, source.id(), PollEvents::POLLIN, 2);
+        port.publish_stream(token, source.id(), PollEvents::default(), 3);
 
         assert!(!port.has_events());
     }
@@ -1119,6 +1269,29 @@ mod tests {
         let second = port.peek(&mut records);
         assert_eq!(second.count, 1);
         assert_eq!(records[0].event_kind, wire::EVENT_KIND_STREAM_READY);
+    }
+
+    #[ktest]
+    fn level_refresh_reads_poll_source_without_holding_event_state_lock() {
+        let port = EventPort::new(2).expect("EventPort 应创建成功");
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        let file = lock_probe_file(&port, Arc::clone(&lock_was_free));
+        let source = file.poll_source().expect("测试流必须暴露 PollSource");
+        let token = port.reserve_token().expect("token 应可分配");
+        assert!(
+            port.install_subscription(stream_subscription(&port, token, Arc::clone(&file)))
+                .is_ok()
+        );
+        let (ready, generation) = source.snapshot();
+        port.publish_stream(token, source.id(), ready, generation);
+
+        let mut records = [EventRecord::default(); 1];
+        let selection = port.peek(&mut records);
+        assert_eq!(selection.count, 1);
+        lock_was_free.store(false, Ordering::Release);
+        port.commit_peek(&selection);
+
+        assert!(lock_was_free.load(Ordering::Acquire));
     }
 
     #[ktest]
