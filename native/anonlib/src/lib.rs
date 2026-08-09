@@ -2,6 +2,27 @@
 
 //! MyGO Native 的最小 Rust 安全对象接口。
 
+mod component;
+mod channel;
+mod device;
+mod fs;
+mod memory;
+mod memory_intrinsics;
+mod ring;
+mod socket;
+mod thread;
+
+pub use component::{Component, ComponentCall, Interface};
+pub use channel::{Channel, ChannelMessage, ChannelTransfer, ReceivedHandle};
+pub use device::DeviceFunction;
+pub use fs::{Directory, DirectoryRights, File, FileRights};
+pub use memory::{
+    AddressSpace, MappedRegion, MemoryCreate, MemoryObject, MemoryPermissions, MemoryRegion,
+};
+pub use ring::{Completion, Registration, Ring, Submission};
+pub use socket::{NetworkAddress, Socket, SocketConfig};
+pub use thread::{Thread, ThreadCreate};
+
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
@@ -11,7 +32,7 @@ mod abi {
 }
 
 unsafe extern "C" {
-    fn mrt_call(
+    pub(crate) fn mrt_call(
         slot: u64,
         object_handle: u64,
         arg0: u64,
@@ -21,6 +42,7 @@ unsafe extern "C" {
         arg4: u64,
     ) -> abi::MygoNativeResult;
     fn mrt_initial_handle(requirement_id: u32) -> u64;
+    pub(crate) fn mrt_current_component() -> u64;
     fn mrt_terminate(status: u32) -> !;
     fn mrt_abort() -> !;
 }
@@ -36,6 +58,11 @@ fn close_handle(raw: u64) {
 pub struct Status(u32);
 
 impl Status {
+    /// 判断 operation 是否成功，不要求调用者依赖生成 binding 的数值常量。
+    pub const fn is_ok(self) -> bool {
+        self.0 == abi::MYGO_STATUS_ok
+    }
+
     /// 返回 Wire ABI 中未经转换的状态值。
     pub const fn raw(self) -> u32 {
         self.0
@@ -125,21 +152,26 @@ pub fn stdout() -> Option<Stream<'static>> {
     })
 }
 
-struct OwnedHandle<T> {
+pub(crate) struct OwnedHandle<T> {
     raw: NonZeroU64,
     marker: PhantomData<T>,
 }
 
 impl<T> OwnedHandle<T> {
-    fn new(raw: u64) -> Option<Self> {
+    pub(crate) fn new(raw: u64) -> Option<Self> {
         Some(Self {
             raw: NonZeroU64::new(raw)?,
             marker: PhantomData,
         })
     }
 
-    fn raw(&self) -> u64 {
+    pub(crate) fn raw(&self) -> u64 {
         self.raw.get()
+    }
+
+    pub(crate) fn into_raw(self) -> u64 {
+        let handle = core::mem::ManuallyDrop::new(self);
+        handle.raw.get()
     }
 }
 
@@ -163,7 +195,7 @@ impl Process {
         })
     }
 
-    fn raw(&self) -> u64 {
+    pub(crate) fn raw(&self) -> u64 {
         self.handle.raw()
     }
 
@@ -224,8 +256,17 @@ impl Image {
             .ok_or(Status(abi::MYGO_STATUS_core_out_of_range))
     }
 
-    fn raw(&self) -> u64 {
+    pub(crate) fn raw(&self) -> u64 {
         self.handle.raw()
+    }
+
+    /// 按上层 Channel 协议把收到的 owned handle 解释为 Image。
+    ///
+    /// 若发送方违反协议，后续 Image operation 仍由内核返回 wrong-interface。
+    pub fn from_received(handle: ReceivedHandle) -> Self {
+        Self {
+            handle: OwnedHandle::new(handle.into_raw()).expect("received handle 必须非零"),
+        }
     }
 }
 
@@ -236,6 +277,10 @@ pub struct HandleTransfer {
 }
 
 impl HandleTransfer {
+    pub(crate) const fn raw(&self) -> &abi::MygoHandleTransfer {
+        &self.raw
+    }
+
     /// 复制 Stream 的 write 权限给 child 的 stdout requirement。
     pub fn stdout(stream: &Stream<'_>) -> Self {
         Self {
@@ -244,6 +289,35 @@ impl HandleTransfer {
                 reserved: 0,
                 source_handle: stream.handle.raw(),
                 requested_rights: abi::MYGO_RIGHT_write,
+                flags: 0,
+            },
+        }
+    }
+
+    /// 复制 Channel endpoint，满足 child 的通用服务通道 requirement。
+    pub fn service_channel(channel: &Channel) -> Self {
+        Self {
+            raw: abi::MygoHandleTransfer {
+                requirement_id: abi::MYGO_REQUIREMENT_service_channel,
+                reserved: 0,
+                source_handle: channel.raw(),
+                requested_rights: abi::MYGO_RIGHT_send
+                    | abi::MYGO_RIGHT_receive
+                    | abi::MYGO_RIGHT_duplicate
+                    | abi::MYGO_RIGHT_observe,
+                flags: 0,
+            },
+        }
+    }
+
+    /// 复制 Directory 视图，满足 child 的 root directory requirement。
+    pub fn root_directory(directory: &Directory) -> Self {
+        Self {
+            raw: abi::MygoHandleTransfer {
+                requirement_id: abi::MYGO_REQUIREMENT_root_directory,
+                reserved: 0,
+                source_handle: directory.raw(),
+                requested_rights: abi::MYGO_RIGHT_open | abi::MYGO_RIGHT_inspect,
                 flags: 0,
             },
         }
