@@ -45,7 +45,7 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         /* 每轮 256 字节，分成四个互不重叠的 64 字节读取组。 */
 .Lrv_copy_blocks:
         li      t0, 256
-        bltu    a2, t0, .Lrv_copy_words
+        bltu    a2, t0, .Lrv_copy_block64
         ld      a3, 0(a1)
         ld      a4, 8(a1)
         ld      a5, 16(a1)
@@ -114,6 +114,45 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         addi    a1, a1, 256
         addi    a2, a2, -256
         j       .Lrv_copy_blocks
+
+.Lrv_copy_block64:
+        li      t0, 64
+        bltu    a2, t0, .Lrv_copy_block32
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        ld      a7, 32(a1)
+        ld      t0, 40(a1)
+        ld      t1, 48(a1)
+        ld      t2, 56(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        sd      a7, 32(a0)
+        sd      t0, 40(a0)
+        sd      t1, 48(a0)
+        sd      t2, 56(a0)
+        addi    a0, a0, 64
+        addi    a1, a1, 64
+        addi    a2, a2, -64
+        j       .Lrv_copy_block64
+
+.Lrv_copy_block32:
+        li      t0, 32
+        bltu    a2, t0, .Lrv_copy_words
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        addi    a0, a0, 32
+        addi    a1, a1, 32
+        addi    a2, a2, -32
 
 .Lrv_copy_words:
         li      t0, 8
