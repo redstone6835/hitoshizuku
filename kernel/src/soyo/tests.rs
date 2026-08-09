@@ -85,7 +85,14 @@ fn direct_fixture_is_canonical_for_both_architectures() {
         let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable())
             .expect("直接 fixture 必须通过共享 parser");
         assert_eq!(metadata.header.target_arch, target);
-        assert!(metadata.runtime.start_info_max_size >= 4096);
+        assert!(
+            metadata
+                .runtime
+                .as_ref()
+                .expect("可执行映像必须包含 RuntimeInfo")
+                .start_info_max_size
+                >= 4096
+        );
     }
 }
 

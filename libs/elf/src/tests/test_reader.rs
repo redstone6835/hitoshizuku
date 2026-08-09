@@ -67,17 +67,34 @@ fn assert_same_metadata(image: &LinuxElfImage<'_>, metadata: &LinuxElfMetadata) 
     assert_eq!(image.is_pie(), metadata.is_pie());
     assert_eq!(image.interpreter(), metadata.interpreter().as_deref());
     assert_eq!(image.phdr_vaddr(), metadata.program_header_vaddr());
-    assert_eq!(image.phdr_entry_size(), metadata.program_header_entry_size() as usize);
+    assert_eq!(
+        image.phdr_entry_size(),
+        metadata.program_header_entry_size() as usize
+    );
     assert_eq!(image.phdr_count(), metadata.program_header_count() as usize);
     assert_eq!(image.load_vaddr_range(), metadata.load_range());
     let image_segments: Vec<_> = image
         .segments_typed()
-        .map(|segment| (segment.vaddr, segment.memsz, segment.file_offset, segment.file_size))
+        .map(|segment| {
+            (
+                segment.vaddr,
+                segment.memsz,
+                segment.file_offset,
+                segment.file_size,
+            )
+        })
         .collect();
     let metadata_segments: Vec<_> = metadata
         .load_segments()
         .iter()
-        .map(|segment| (segment.vaddr, segment.mem_size, segment.file_offset, segment.file_size))
+        .map(|segment| {
+            (
+                segment.vaddr,
+                segment.mem_size,
+                segment.file_offset,
+                segment.file_size,
+            )
+        })
         .collect();
     assert_eq!(image_segments, metadata_segments);
 }
@@ -94,9 +111,17 @@ fn reader_and_slice_parsers_produce_identical_metadata() {
     let metadata = read_linux_elf(&mut reader, ElfReadLimits::default()).expect("reader parse");
     assert_same_metadata(&image, &metadata);
     assert!(reader.ranges.borrow().iter().all(|(offset, len)| {
-        offset.checked_add(*len as u64).is_some_and(|end| end <= bytes.len() as u64)
+        offset
+            .checked_add(*len as u64)
+            .is_some_and(|end| end <= bytes.len() as u64)
     }));
-    assert!(!reader.ranges.borrow().iter().any(|(offset, _)| *offset >= 0x1000));
+    assert!(
+        !reader
+            .ranges
+            .borrow()
+            .iter()
+            .any(|(offset, _)| *offset >= 0x1000)
+    );
 }
 
 #[test]
@@ -114,7 +139,12 @@ fn reader_source_errors_are_not_reported_as_format_errors() {
 #[test]
 fn reader_and_slice_parsers_share_rejection_categories() {
     for (name, offset, value, expected) in [
-        ("invalid entry", 24usize, 0xdead_u64, crate::ElfError::InvalidEntry),
+        (
+            "invalid entry",
+            24usize,
+            0xdead_u64,
+            crate::ElfError::InvalidEntry,
+        ),
         (
             "invalid alignment",
             64 + 48,
@@ -130,7 +160,9 @@ fn reader_and_slice_parsers_share_rejection_categories() {
     ] {
         let mut bytes = fixture();
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        let slice_error = LinuxElfImage::parse(&bytes).err().unwrap_or_else(|| panic!("{name}"));
+        let slice_error = LinuxElfImage::parse(&bytes)
+            .err()
+            .unwrap_or_else(|| panic!("{name}"));
         assert_eq!(slice_error, expected);
         let reader = ChunkReader {
             bytes: &bytes,

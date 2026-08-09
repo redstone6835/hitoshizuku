@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use errno::Errno;
 use general::dev::random::{RandomReadMode, fill as fill_random};
 use general::mm::{VmSpace, user_vm_layout};
+use general::vfs::VfsContext;
 use general::vfs::file::File;
-use mm::VmFlags;
+use mm::{FileLike, VmFlags};
 use native_abi::registry::RequirementId;
 use native_abi::{
     NativeBindingPlan, RuntimeArrayInfo, StartInfoBuildError, StartInfoInput, TargetArch,
@@ -17,14 +18,14 @@ use soyo::{
     ImageSegment, SoyoError, SoyoMappedSegment, SoyoMetadata, SoyoReadAt, SoyoReadError,
     SoyoReadLimits, SoyoRuntimeLayoutInput, SoyoTargetPolicy, plan_mapped_segments,
     plan_runtime_layout, read_soyo,
-    registry::{RelocationKind, SegmentKind, SegmentPermissions},
+    registry::{FeatureFlags, RelocationKind, SegmentKind, SegmentPermissions},
     validate_soyo,
 };
 use vfs::fdtable::FdTableSnapshot;
 
 use crate::native_runtime::{
-    ExecutableImage, NativeProcessState, PreparedNativeCapability, prepare_native_process_state,
-    prepare_native_process_state_with_capabilities,
+    ImageObject, NativeProcessState, PreparedNativeCapability, prepare_native_process_state,
+    prepare_native_process_state_with_vfs,
 };
 use crate::user::{file_size, read_exact_file};
 
@@ -231,11 +232,22 @@ fn seal_segments(vm: &VmSpace, segments: &[SoyoMappedSegment]) -> Result<(), Err
 /// 从 VFS 文件构造 SOYO 用户映像。
 pub(crate) fn load_soyo_image_from_file(file: Arc<File>) -> Result<LoadedSoyoImage, Errno> {
     let size = file_size(&file)?;
+    let backing: Arc<dyn FileLike> = file.clone();
     let reader = VfsSoyoReader { file, size };
-    load_soyo_image_from_reader(&reader)
+    load_soyo_image_from_reader_with_backing(&reader, Some(backing))
 }
 
 pub(crate) fn load_soyo_image_from_reader<R>(reader: &R) -> Result<LoadedSoyoImage, Errno>
+where
+    R: SoyoReadAt<Error = Errno>,
+{
+    load_soyo_image_from_reader_with_backing(reader, None)
+}
+
+fn load_soyo_image_from_reader_with_backing<R>(
+    reader: &R,
+    backing: Option<Arc<dyn FileLike>>,
+) -> Result<LoadedSoyoImage, Errno>
 where
     R: SoyoReadAt<Error = Errno>,
 {
@@ -245,11 +257,17 @@ where
     let load_plan = validate_soyo(&metadata, policy).map_err(map_soyo_error)?;
     let binding = load_plan.native_binding;
     let enabled_features = load_plan.enabled_features;
-    map_validated_soyo_image(reader, Arc::new(metadata), binding, enabled_features)
+    map_validated_soyo_image(
+        reader,
+        Arc::new(metadata),
+        binding,
+        enabled_features,
+        backing,
+    )
 }
 
 /// 从已经由 `image.create` 验证的不可变字节构造独立地址空间。
-pub(crate) fn load_executable_image(image: &ExecutableImage) -> Result<LoadedSoyoImage, Errno> {
+pub(crate) fn load_executable_image(image: &ImageObject) -> Result<LoadedSoyoImage, Errno> {
     let reader = ExecutableImageReader {
         bytes: image.bytes(),
     };
@@ -258,6 +276,7 @@ pub(crate) fn load_executable_image(image: &ExecutableImage) -> Result<LoadedSoy
         Arc::clone(&image.metadata),
         image.binding.clone(),
         image.enabled_features,
+        Some(image.file_backing()),
     )
 }
 
@@ -266,6 +285,7 @@ fn map_validated_soyo_image<R>(
     metadata: Arc<SoyoMetadata>,
     binding: NativeBindingPlan,
     enabled_features: u64,
+    backing: Option<Arc<dyn FileLike>>,
 ) -> Result<LoadedSoyoImage, Errno>
 where
     R: SoyoReadAt<Error = Errno>,
@@ -275,20 +295,35 @@ where
     let mapped = plan_mapped_segments(&metadata, image_base_u64).map_err(map_soyo_error)?;
     let vm = Arc::new(VmSpace::new());
 
-    for segment in &mapped {
-        let payload = read_segment_payload(reader, segment.file_offset, segment.file_size)?;
+    for (index, segment) in mapped.iter().enumerate() {
         let memory_size = usize::try_from(segment.memory_size).map_err(|_| Errno::ENOEXEC)?;
         let virtual_start = usize::try_from(segment.virtual_start).map_err(|_| Errno::ENOEXEC)?;
-        vm.commit_segment(
-            virtual_start,
-            memory_size,
-            payload.len(),
-            &payload,
-            VmFlags::EMPTY
-                .with(VmFlags::USER)
-                .with(VmFlags::READ)
-                .with(VmFlags::WRITE),
-        )?;
+        let relocated = metadata
+            .relocations
+            .iter()
+            .any(|relocation| relocation.target_segment_index as usize == index);
+        if !relocated && let Some(backing) = backing.as_ref() {
+            vm.commit_file_segment(
+                virtual_start,
+                memory_size,
+                segment.file_offset,
+                usize::try_from(segment.file_size).map_err(|_| Errno::ENOEXEC)?,
+                Arc::clone(backing),
+                vm_flags_for_permissions(segment.permissions, true),
+            )?;
+        } else {
+            let payload = read_segment_payload(reader, segment.file_offset, segment.file_size)?;
+            vm.commit_segment(
+                virtual_start,
+                memory_size,
+                payload.len(),
+                &payload,
+                VmFlags::EMPTY
+                    .with(VmFlags::USER)
+                    .with(VmFlags::READ)
+                    .with(VmFlags::WRITE),
+            )?;
+        }
     }
 
     apply_relocations(&vm, &metadata, image_base_u64)?;
@@ -321,7 +356,7 @@ pub(crate) fn prepare_soyo_runtime(
     envp: &[Vec<u8>],
     descriptors: Option<&FdTableSnapshot>,
 ) -> Result<PreparedSoyoImage, Errno> {
-    prepare_soyo_runtime_with_capabilities(loaded, argv, envp, descriptors, &[])
+    prepare_soyo_runtime_with_vfs(loaded, argv, envp, descriptors, &[], None)
 }
 
 pub(crate) fn prepare_soyo_runtime_with_capabilities(
@@ -330,6 +365,17 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
     envp: &[Vec<u8>],
     descriptors: Option<&FdTableSnapshot>,
     transferred: &[PreparedNativeCapability],
+) -> Result<PreparedSoyoImage, Errno> {
+    prepare_soyo_runtime_with_vfs(loaded, argv, envp, descriptors, transferred, None)
+}
+
+pub(crate) fn prepare_soyo_runtime_with_vfs(
+    loaded: LoadedSoyoImage,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    descriptors: Option<&FdTableSnapshot>,
+    transferred: &[PreparedNativeCapability],
+    vfs_context: Option<Arc<VfsContext>>,
 ) -> Result<PreparedSoyoImage, Errno> {
     let LoadedSoyoImage {
         vm,
@@ -340,18 +386,20 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
         enabled_features,
         tls_payload,
     } = loaded;
+    let runtime = metadata.runtime.as_ref().ok_or(Errno::ENOEXEC)?;
     let call_slot_count =
         u32::try_from(native_binding.call_slots.len()).map_err(|_| Errno::ENOEXEC)?;
-    let (personality, initial_handles) = if transferred.is_empty() {
+    let (personality, initial_handles) = if transferred.is_empty() && vfs_context.is_none() {
         prepare_native_process_state(&metadata, native_binding, &vm, image_base, descriptors)?
     } else {
-        prepare_native_process_state_with_capabilities(
+        prepare_native_process_state_with_vfs(
             &metadata,
             native_binding,
             &vm,
             image_base,
             descriptors,
             transferred,
+            vfs_context,
         )?
     };
     let bootstrap_process = initial_handles
@@ -363,12 +411,18 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
         .segments
         .iter()
         .find(|segment| segment.kind == SegmentKind::TlsTemplate);
-    let initial_tls_size = tls
+    let static_tls_size = tls
         .map(|segment| checked_align_up(segment.memory_size, segment.alignment))
         .transpose()?
         .unwrap_or(0);
+    let dynamic_components = enabled_features & FeatureFlags::DYNAMIC_COMPONENTS.bits() != 0;
+    let initial_tls_size = if dynamic_components {
+        crate::native_runtime::DYNAMIC_TLS_ARENA_SIZE as u64
+    } else {
+        static_tls_size
+    };
     let random_seed = start_random_seed()?;
-    let provisional_tls_base = if tls.is_some() {
+    let provisional_tls_base = if initial_tls_size != 0 {
         soyo::registry::PAGE_SIZE
     } else {
         0
@@ -385,18 +439,18 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
         initial_handles: &initial_handles,
         call_slot_count,
         random_seed,
-        runtime_flags: metadata.runtime.runtime_flags,
+        runtime_flags: runtime.runtime_flags,
         init_array: RuntimeArrayInfo {
-            offset: metadata.runtime.init_array_offset,
-            count: metadata.runtime.init_array_count,
-            entry_size: metadata.runtime.init_array_entry_size,
+            offset: runtime.init_array_offset,
+            count: runtime.init_array_count,
+            entry_size: runtime.init_array_entry_size,
         },
         fini_array: RuntimeArrayInfo {
-            offset: metadata.runtime.fini_array_offset,
-            count: metadata.runtime.fini_array_count,
-            entry_size: metadata.runtime.fini_array_entry_size,
+            offset: runtime.fini_array_offset,
+            count: runtime.fini_array_count,
+            entry_size: runtime.fini_array_entry_size,
         },
-        max_size: metadata.runtime.start_info_max_size,
+        max_size: runtime.start_info_max_size,
     })
     .map_err(map_start_info_error)?;
     let vm_layout = user_vm_layout().ok_or(Errno::EIO)?;
@@ -404,10 +458,14 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
         image_base: image_base as u64,
         image_virtual_size: metadata.header.image_virtual_size,
         stack_top: vm_layout.default_stack_top as u64,
-        stack_size: metadata.runtime.stack_size,
-        stack_guard_size: metadata.runtime.stack_guard_size,
-        tls_memory_size: tls.map_or(0, |segment| segment.memory_size),
-        tls_alignment: tls.map_or(0, |segment| segment.alignment),
+        stack_size: runtime.stack_size,
+        stack_guard_size: runtime.stack_guard_size,
+        tls_memory_size: initial_tls_size,
+        tls_alignment: if initial_tls_size == 0 {
+            0
+        } else {
+            soyo::registry::PAGE_SIZE
+        },
         start_info_size: provisional.as_bytes().len() as u64,
         user_lower_bound: soyo::registry::PAGE_SIZE,
     })
@@ -425,18 +483,18 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
         initial_handles: &initial_handles,
         call_slot_count,
         random_seed,
-        runtime_flags: metadata.runtime.runtime_flags,
+        runtime_flags: runtime.runtime_flags,
         init_array: RuntimeArrayInfo {
-            offset: metadata.runtime.init_array_offset,
-            count: metadata.runtime.init_array_count,
-            entry_size: metadata.runtime.init_array_entry_size,
+            offset: runtime.init_array_offset,
+            count: runtime.init_array_count,
+            entry_size: runtime.init_array_entry_size,
         },
         fini_array: RuntimeArrayInfo {
-            offset: metadata.runtime.fini_array_offset,
-            count: metadata.runtime.fini_array_count,
-            entry_size: metadata.runtime.fini_array_entry_size,
+            offset: runtime.fini_array_offset,
+            count: runtime.fini_array_count,
+            entry_size: runtime.fini_array_entry_size,
         },
-        max_size: metadata.runtime.start_info_max_size,
+        max_size: runtime.start_info_max_size,
     })
     .map_err(map_start_info_error)?;
     if start_info.as_bytes().len() != provisional.as_bytes().len() {
@@ -451,12 +509,12 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
             .with(VmFlags::READ)
             .with(VmFlags::WRITE),
     )?;
-    if let (Some(template), Some(payload), Some(tls_range)) =
-        (tls, tls_payload.as_deref(), process_layout.tls.as_ref())
-    {
-        map_tls_template(&vm, payload, template, tls_range)?;
-    } else if tls.is_some() || tls_payload.is_some() || process_layout.tls.is_some() {
-        return Err(Errno::EIO);
+    match (tls, tls_payload.as_deref(), process_layout.tls.as_ref()) {
+        (template, payload, Some(tls_range)) => {
+            map_tls_arena(&vm, payload, template, tls_range)?;
+        }
+        (None, None, None) => {}
+        _ => return Err(Errno::EIO),
     }
     let start_info_range = usize_range(&process_layout.start_info)?;
     vm.commit_segment(
@@ -474,6 +532,19 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
         VmFlags::EMPTY.with(VmFlags::USER).with(VmFlags::READ),
     )?;
     let tls_runtime_range = process_layout.tls.as_ref().map(usize_range).transpose()?;
+    let static_tls_used = if static_tls_size == 0 {
+        0
+    } else {
+        usize::try_from(checked_align_up(
+            static_tls_size,
+            soyo::registry::PAGE_SIZE,
+        )?)
+        .map_err(|_| Errno::ENOEXEC)?
+    };
+    personality
+        .components
+        .install_tls_arena(tls_runtime_range.clone(), static_tls_used)
+        .map_err(|_| Errno::EIO)?;
     personality.install_runtime_ranges(stack.clone(), start_info_range.clone(), tls_runtime_range);
 
     Ok(PreparedSoyoImage {
@@ -490,27 +561,43 @@ pub(crate) fn prepare_soyo_runtime_with_capabilities(
     })
 }
 
-fn map_tls_template(
+fn map_tls_arena(
     vm: &VmSpace,
-    payload: &[u8],
-    template: &ImageSegment,
+    payload: Option<&[u8]>,
+    template: Option<&ImageSegment>,
     range: &core::ops::Range<u64>,
 ) -> Result<(), Errno> {
-    let file_size = usize::try_from(template.file_size).map_err(|_| Errno::ENOEXEC)?;
-    if payload.len() != file_size {
-        return Err(Errno::EIO);
-    }
     let mapped = usize_range(range)?;
-    vm.commit_segment(
-        mapped.start,
-        mapped.len(),
-        file_size,
-        payload,
+    vm.map_anon(
+        mapped.clone(),
         VmFlags::EMPTY
             .with(VmFlags::USER)
             .with(VmFlags::READ)
             .with(VmFlags::WRITE),
-    )
+    )?;
+    match (payload, template) {
+        (Some(payload), Some(template)) => {
+            let file_size = usize::try_from(template.file_size).map_err(|_| Errno::ENOEXEC)?;
+            if payload.len() != file_size || file_size > mapped.len() {
+                return Err(Errno::EIO);
+            }
+            let mut source = payload;
+            let mut address = mapped.start;
+            while !source.is_empty() {
+                let copied = unsafe {
+                    vm.with_user_write_slice(address, source.len(), |target| {
+                        target.copy_from_slice(&source[..target.len()]);
+                        target.len()
+                    })
+                }?;
+                address = address.checked_add(copied).ok_or(Errno::ENOEXEC)?;
+                source = &source[copied..];
+            }
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err(Errno::EIO),
+    }
 }
 
 fn read_segment_payload<R>(reader: &R, offset: u64, size: u64) -> Result<Vec<u8>, Errno>

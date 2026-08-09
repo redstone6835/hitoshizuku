@@ -11,8 +11,8 @@ use crate::types::{Arch, SegmentPerms};
 
 use super::raw::{
     EHDR_OFF_ENTRY, EHDR_OFF_MACHINE, EHDR_OFF_PHENTSIZE, EHDR_OFF_PHNUM, EHDR_OFF_PHOFF,
-    EHDR_OFF_TYPE, EHDR_SIZE, EM_AARCH64, EM_LOONGARCH, EM_RISCV, EM_X86_64, ET_DYN, ET_EXEC,
-    PF_R, PF_W, PF_X, PHDR_SIZE, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
+    EHDR_OFF_TYPE, EHDR_SIZE, EM_AARCH64, EM_LOONGARCH, EM_RISCV, EM_X86_64, ET_DYN, ET_EXEC, PF_R,
+    PF_W, PF_X, PHDR_SIZE, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
 };
 
 const DYN_ENTRY_SIZE: usize = 16;
@@ -241,7 +241,8 @@ fn validate_load_segments<E>(file_len: u64, phdrs: &[RawPhdr]) -> Result<(), Elf
         if ph.ty != PT_LOAD {
             continue;
         }
-        if ph.align > 1 && (!ph.align.is_power_of_two() || ph.vaddr % ph.align != ph.offset % ph.align)
+        if ph.align > 1
+            && (!ph.align.is_power_of_two() || ph.vaddr % ph.align != ph.offset % ph.align)
         {
             return Err(ElfReadError::Format(ElfError::InvalidSegment));
         }
@@ -319,12 +320,15 @@ fn read_interp<R: ElfReadAt + ?Sized>(
         if ph.ty != PT_INTERP {
             continue;
         }
-        let len = usize::try_from(ph.filesz).map_err(|_| ElfReadError::Format(ElfError::InvalidInterp))?;
+        let len = usize::try_from(ph.filesz)
+            .map_err(|_| ElfReadError::Format(ElfError::InvalidInterp))?;
         if len <= 1 || len > limits.max_interpreter_bytes {
             return Err(ElfReadError::Format(ElfError::InvalidInterp));
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| ElfReadError::ResourceExhausted)?;
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| ElfReadError::ResourceExhausted)?;
         bytes.resize(len, 0);
         read_range(source, ph.offset, &mut bytes, ElfError::InvalidInterp)?;
         if bytes.last() != Some(&0) {
@@ -334,7 +338,8 @@ fn read_interp<R: ElfReadAt + ?Sized>(
         if path.is_empty() || path.contains(&0) {
             return Err(ElfReadError::Format(ElfError::InvalidInterp));
         }
-        let path = core::str::from_utf8(path).map_err(|_| ElfReadError::Format(ElfError::InvalidInterp))?;
+        let path = core::str::from_utf8(path)
+            .map_err(|_| ElfReadError::Format(ElfError::InvalidInterp))?;
         let mut result = String::new();
         result
             .try_reserve_exact(path.len())
@@ -354,15 +359,23 @@ fn read_dynamic<R: ElfReadAt + ?Sized>(
         if ph.ty != PT_DYNAMIC {
             continue;
         }
-        let len = usize::try_from(ph.filesz).map_err(|_| ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
+        let len = usize::try_from(ph.filesz)
+            .map_err(|_| ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
         if len > limits.max_dynamic_bytes {
             return Err(ElfReadError::ResourceExhausted);
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| ElfReadError::ResourceExhausted)?;
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| ElfReadError::ResourceExhausted)?;
         bytes.resize(len, 0);
         if len != 0 {
-            read_range(source, ph.offset, &mut bytes, ElfError::SegmentOffsetOverflow)?;
+            read_range(
+                source,
+                ph.offset,
+                &mut bytes,
+                ElfError::SegmentOffsetOverflow,
+            )?;
         }
         return Ok(Some(bytes));
     }
@@ -426,7 +439,11 @@ fn load_vaddr_range<E>(phdrs: &[RawPhdr]) -> Result<Option<Range<usize>>, ElfRea
     Ok(range)
 }
 
-fn checked_file_range<E>(file_len: u64, offset: u64, size: u64) -> Result<Range<u64>, ElfReadError<E>> {
+fn checked_file_range<E>(
+    file_len: u64,
+    offset: u64,
+    size: u64,
+) -> Result<Range<u64>, ElfReadError<E>> {
     let end = offset
         .checked_add(size)
         .ok_or(ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
@@ -440,8 +457,10 @@ fn checked_vaddr_range<E>(vaddr: u64, size: u64) -> Result<Range<usize>, ElfRead
     let end = vaddr
         .checked_add(size)
         .ok_or(ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
-    let start = usize::try_from(vaddr).map_err(|_| ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
-    let end = usize::try_from(end).map_err(|_| ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
+    let start = usize::try_from(vaddr)
+        .map_err(|_| ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
+    let end =
+        usize::try_from(end).map_err(|_| ElfReadError::Format(ElfError::SegmentOffsetOverflow))?;
     Ok(start..end)
 }
 
@@ -468,9 +487,15 @@ fn decode_phdr(bytes: &[u8]) -> RawPhdr {
 
 fn permissions(flags: u32) -> SegmentPerms {
     let mut result = SegmentPerms::EMPTY;
-    if flags & PF_R != 0 { result = result.with(SegmentPerms::READ); }
-    if flags & PF_W != 0 { result = result.with(SegmentPerms::WRITE); }
-    if flags & PF_X != 0 { result = result.with(SegmentPerms::EXEC); }
+    if flags & PF_R != 0 {
+        result = result.with(SegmentPerms::READ);
+    }
+    if flags & PF_W != 0 {
+        result = result.with(SegmentPerms::WRITE);
+    }
+    if flags & PF_X != 0 {
+        result = result.with(SegmentPerms::EXEC);
+    }
     result
 }
 
@@ -489,11 +514,19 @@ fn read_u16(bytes: &[u8], offset: usize) -> u16 {
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed ELF field"))
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("fixed ELF field"),
+    )
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed ELF field"))
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed ELF field"),
+    )
 }
 
 fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {

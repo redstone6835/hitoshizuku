@@ -70,6 +70,7 @@ native-abi = { path = "../libs/native-abi" }
 net = { path = "../libs/net" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
+sha2 = { version = "0.10.9", default-features = false }
 socket = { path = "../libs/socket" }
 soyo = { path = "../libs/soyo" }
 vfs = { path = "../libs/vfs" }

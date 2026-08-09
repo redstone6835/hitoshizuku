@@ -3,9 +3,11 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use errno::Errno;
 use general::mm::VmSpace;
+use general::vfs::VfsContext;
 use general::vfs::file::File;
 use native_abi::{
     InitialHandleRecord, NativeBindingPlan, NativeHandle, NativeHandleTable, RequirementId, Rights,
@@ -17,26 +19,56 @@ use vfs::fdtable::{FdFlags, FdTableSnapshot};
 
 use self::dispatch::dispatch_native_call_with_context;
 
+mod channel;
+mod component;
+mod device;
 mod dispatch;
 mod event;
+mod fs;
 mod image;
+mod memory;
 mod operations;
 mod process;
+mod ring;
+mod socket;
+mod thread;
+mod trust_policy;
 
+use channel::ChannelObject;
+pub(crate) use component::DYNAMIC_TLS_ARENA_SIZE;
+use component::{ComponentManager, ComponentObject, ComponentTransaction, InterfaceObject};
+use device::DeviceFunctionObject;
 use event::EventPort;
-pub(crate) use image::ExecutableImage;
+pub(crate) use fs::{DirectoryObject, FileObject};
+pub(crate) use image::ImageObject;
+use memory::MemoryObject;
 pub(crate) use process::ProcessObject;
+use ring::SubmissionRingObject;
+use socket::SocketObject;
+pub(crate) use thread::record_task_exit;
+pub(crate) use thread::{TASKEXT_NATIVE_THREAD, ThreadObject};
 
 /// Native handle 可引用的内核对象。
 #[derive(Clone)]
 pub(crate) enum KernelNativeObject {
     SelfProcess,
     Process(Arc<ProcessObject>),
+    Thread(Arc<ThreadObject>),
     AddressSpace(Arc<VmSpace>),
     Stream(Arc<File>),
     MonotonicClock,
-    ExecutableImage(Arc<ExecutableImage>),
+    Image(Arc<ImageObject>),
     EventPort(Arc<EventPort>),
+    Component(Arc<ComponentObject>),
+    ComponentTransaction(Arc<ComponentTransaction>),
+    Interface(Arc<InterfaceObject>),
+    MemoryObject(Arc<MemoryObject>),
+    Directory(Arc<DirectoryObject>),
+    File(Arc<FileObject>),
+    Channel(Arc<ChannelObject>),
+    SubmissionRing(Arc<SubmissionRingObject>),
+    Socket(Arc<SocketObject>),
+    DeviceFunction(Arc<DeviceFunctionObject>),
 }
 
 #[derive(Clone)]
@@ -52,12 +84,24 @@ pub(crate) struct PreparedNativeCapability {
 /// 由线程组 personality 唯一持有的 Native 进程状态。
 pub(crate) struct NativeProcessState {
     pub(crate) binding: NativeBindingPlan,
-    pub(crate) handles: Spinlock<NativeHandleTable<KernelNativeObject>>,
+    pub(crate) handles: Arc<Spinlock<NativeHandleTable<KernelNativeObject>>>,
     pub(crate) build_id: [u8; 32],
     pub(crate) content_hash: [u8; 32],
     pub(crate) image_base: usize,
+    pub(crate) components: Arc<ComponentManager>,
+    pub(crate) vfs_context: Option<Arc<VfsContext>>,
     runtime_ranges: Spinlock<Option<NativeRuntimeRanges>>,
     allocations: Spinlock<Vec<Range<usize>>>,
+    memory_owner_id: u64,
+    mapped_memory_objects: Arc<memory::MemoryMappingRegistry>,
+}
+
+static NEXT_MEMORY_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_memory_owner_id() -> u64 {
+    let id = NEXT_MEMORY_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(id != 0, "Native memory owner identity 已耗尽");
+    id
 }
 
 struct NativeRuntimeRanges {
@@ -116,6 +160,71 @@ impl NativeProcessState {
     }
 }
 
+impl Drop for NativeProcessState {
+    fn drop(&mut self) {
+        memory::release_process_mappings(self);
+    }
+}
+
+pub(super) fn task_vm(task: &sched::Task) -> Result<Arc<VmSpace>, u32> {
+    task.ext_lookup(sched::TASKEXT_VM_SPACE)
+        .and_then(|payload| payload.downcast::<VmSpace>().ok())
+        .ok_or(native_abi::status::STREAM_FAULT)
+}
+
+pub(super) fn copy_user_bytes_in(
+    task: &sched::Task,
+    user: u64,
+    output: &mut [u8],
+) -> Result<(), u32> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    let user = usize::try_from(user).map_err(|_| native_abi::status::STREAM_FAULT)?;
+    if user == 0 {
+        return Err(native_abi::status::STREAM_FAULT);
+    }
+    task_vm(task)?
+        .copy_user_bytes_in(user, output)
+        .map_err(|_| native_abi::status::STREAM_FAULT)
+}
+
+pub(super) fn copy_user_bytes_out(task: &sched::Task, user: u64, input: &[u8]) -> Result<(), u32> {
+    if input.is_empty() {
+        return Ok(());
+    }
+    let user = usize::try_from(user).map_err(|_| native_abi::status::STREAM_FAULT)?;
+    if user == 0 {
+        return Err(native_abi::status::STREAM_FAULT);
+    }
+    task_vm(task)?
+        .copy_user_bytes_out(user, input)
+        .map_err(|_| native_abi::status::STREAM_FAULT)
+}
+
+pub(super) fn copy_user_value<T: Copy + Default>(task: &sched::Task, user: u64) -> Result<T, u32> {
+    let mut value = T::default();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut value as *mut T).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    };
+    copy_user_bytes_in(task, user, bytes)?;
+    Ok(value)
+}
+
+pub(super) fn copy_user_value_out<T: Copy>(
+    task: &sched::Task,
+    user: u64,
+    value: &T,
+) -> Result<(), u32> {
+    let bytes = unsafe {
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    };
+    copy_user_bytes_out(task, user, bytes)
+}
+
 pub(crate) fn register() {
     general::syscall::register_native_dispatcher(dispatch_native_call_with_context);
 }
@@ -144,6 +253,26 @@ pub(crate) fn prepare_native_process_state_with_capabilities(
     image_base: usize,
     descriptors: Option<&FdTableSnapshot>,
     transferred: &[PreparedNativeCapability],
+) -> Result<(Arc<NativeProcessState>, Vec<InitialHandleRecord>), Errno> {
+    prepare_native_process_state_with_vfs(
+        metadata,
+        binding,
+        vm,
+        image_base,
+        descriptors,
+        transferred,
+        None,
+    )
+}
+
+pub(crate) fn prepare_native_process_state_with_vfs(
+    metadata: &SoyoMetadata,
+    binding: NativeBindingPlan,
+    vm: &Arc<VmSpace>,
+    image_base: usize,
+    descriptors: Option<&FdTableSnapshot>,
+    transferred: &[PreparedNativeCapability],
+    vfs_context: Option<Arc<VfsContext>>,
 ) -> Result<(Arc<NativeProcessState>, Vec<InitialHandleRecord>), Errno> {
     if descriptors.is_some_and(|snapshot| {
         snapshot.descriptors().iter().any(|descriptor| {
@@ -205,6 +334,16 @@ pub(crate) fn prepare_native_process_state_with_capabilities(
             RequirementId::MonotonicClock => {
                 transferred_object.or(Some(KernelNativeObject::MonotonicClock))
             }
+            RequirementId::RootDirectory => transferred_object.or_else(|| {
+                vfs_context
+                    .as_ref()
+                    .map(|context| DirectoryObject::from_context(context))
+                    .map(KernelNativeObject::Directory)
+            }),
+            RequirementId::DeviceFunction => {
+                transferred_object.or_else(|| device::bootstrap_capability(vfs_context.as_ref()))
+            }
+            RequirementId::ServiceChannel => transferred_object,
         };
         let Some(object) = object else {
             if capability.required() {
@@ -224,14 +363,21 @@ pub(crate) fn prepare_native_process_state_with_capabilities(
         });
     }
 
+    let handles = Arc::new(Spinlock::new(handles));
+    let components = ComponentManager::new(Arc::clone(vm), &binding, Arc::clone(&handles))
+        .map_err(|_| Errno::ENOMEM)?;
     let state = Arc::new(NativeProcessState {
         binding,
-        handles: Spinlock::new(handles),
+        handles,
         build_id: metadata.header.build_id,
         content_hash: metadata.header.content_hash,
         image_base,
+        components,
+        vfs_context,
         runtime_ranges: Spinlock::new(None),
         allocations: Spinlock::new(Vec::new()),
+        memory_owner_id: next_memory_owner_id(),
+        mapped_memory_objects: Arc::new(memory::MemoryMappingRegistry::new()),
     });
     Ok((state, initial))
 }
