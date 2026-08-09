@@ -21,6 +21,7 @@ use smallvec::SmallVec;
 
 use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
 use crate::mm::ops::{PgdHandle, UserPteUpdate, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
+use crate::mm::resident_map::RadixPageMap;
 
 /// 顺序只读文件缺页一次最多预装的页数（包含硬件实际命中的页）。
 ///
@@ -2409,7 +2410,7 @@ impl AnonStoreFaultAround {
 /// 进程地址空间。
 pub struct VmSpace {
     vmas: Spinlock<VmaSet>,
-    pages: Spinlock<BTreeMap<usize, PageMapping>>,
+    pages: Spinlock<RadixPageMap<PageMapping>>,
     pgd: PgdHandle,
     brk_start: AtomicUsize,
     brk_current: AtomicUsize,
@@ -2440,7 +2441,7 @@ impl VmSpace {
         VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             vmas: Spinlock::new(VmaSet::new()),
-            pages: Spinlock::new(BTreeMap::new()),
+            pages: Spinlock::new(RadixPageMap::new(layout.page_size)),
             pgd,
             brk_start: AtomicUsize::new(layout.user_heap_base),
             brk_current: AtomicUsize::new(layout.user_heap_base),
@@ -3098,12 +3099,16 @@ impl VmSpace {
 
             let mut pages = self.pages.lock();
             // 只遍历已经驻留的页，避免在动态链接器的大量稀疏 mprotect 范围中
-            // 对每个空洞页分别执行 VMA 与 BTreeMap 查找。
+            // 对每个空洞页分别执行 VMA 与常驻页映射表查找。
             let page_size = page_size();
             let mut batch: Option<(usize, usize, PageAccess, VmFlags)> = None;
-            for (&va, mapping) in pages.range_mut(range.clone()) {
+            let mut protect_error = None;
+            pages.for_each_range_mut(range.clone(), |va, mapping| {
+                if protect_error.is_some() {
+                    return;
+                }
                 let Some(area) = set.find(va) else {
-                    continue;
+                    return;
                 };
                 let access = access_for_existing_page(area.flags, &mapping.page);
                 let flags = pte_flags_for(area.flags, access);
@@ -3116,9 +3121,16 @@ impl VmSpace {
                             batch_access,
                             batch_flags,
                         ));
-                        continue;
+                        return;
                     }
-                    self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
+                    if let Err(err) = self.protect_pages_no_flush(
+                        batch_start,
+                        batch_end - batch_start,
+                        batch_flags,
+                    ) {
+                        protect_error = Some(err);
+                        return;
+                    }
                     #[cfg(feature = "performance-profile")]
                     profiling::record(
                         profiling::Event::MmProtectBatch,
@@ -3129,6 +3141,9 @@ impl VmSpace {
                     touched = true;
                 }
                 batch = Some((va, va + page_size, access, flags));
+            });
+            if let Some(err) = protect_error {
+                return Err(err);
             }
             if let Some((batch_start, batch_end, _, batch_flags)) = batch {
                 self.protect_pages_no_flush(batch_start, batch_end - batch_start, batch_flags)?;
@@ -3163,7 +3178,7 @@ impl VmSpace {
         let mut out = Vec::with_capacity(page_count);
         let mut va = range.start;
         while va < range.end {
-            out.push(if pages.contains_key(&va) { 1 } else { 0 });
+            out.push(if pages.contains_key(va) { 1 } else { 0 });
             va += page_size;
         }
         Ok(out)
@@ -3206,10 +3221,11 @@ impl VmSpace {
         }
         let pages: Vec<Arc<ResidentPage>> = {
             let pages = self.pages.lock();
-            pages
-                .range(range)
-                .map(|(_va, mapping)| Arc::clone(&mapping.page))
-                .collect()
+            let mut resident = Vec::new();
+            pages.for_each_range(range, |_va, mapping| {
+                resident.push(Arc::clone(&mapping.page));
+            });
+            resident
         };
         for page in pages {
             page.flush_to_backing()?;
@@ -3268,30 +3284,30 @@ impl VmSpace {
         let mut parent_set = self.vmas.lock();
         let cloned_set = parent_set.fork_clone_metadata();
         let cloned_file_backings = Self::collect_file_backings(cloned_set.iter());
-        let mut child_pages = BTreeMap::new();
+        let mut child_pages = RadixPageMap::new(page_size());
         let mut child_maps = Vec::new();
 
         {
             let mut parent_pages = self.pages.lock();
-            for (va, mapping) in parent_pages.iter_mut() {
-                let Some(area) = cloned_set.find(*va) else {
-                    continue;
+            parent_pages.for_each_mut(|va, mapping| {
+                let Some(area) = cloned_set.find(va) else {
+                    return;
                 };
                 let old_access = mapping.access;
                 mapping.access = access_after_fork(area.flags, &mapping.page);
                 if old_access != mapping.access {
-                    self.protect_page_no_flush(*va, pte_flags_for(area.flags, mapping.access))
+                    self.protect_page_no_flush(va, pte_flags_for(area.flags, mapping.access))
                         .expect("[mm] fork parent protect failed");
                 }
                 let child_mapping = mapping.clone();
                 child_maps.push((
-                    *va,
+                    va,
                     child_mapping.page.clone(),
                     area.flags,
                     child_mapping.access,
                 ));
-                child_pages.insert(*va, child_mapping);
-            }
+                child_pages.insert(va, child_mapping);
+            });
         }
         drop(parent_set);
         if !child_maps.is_empty() {
@@ -3440,7 +3456,7 @@ impl VmSpace {
         if !permits(area.flags, kind) {
             #[cfg(feature = "performance-profile")]
             if let Some(backing) = hardware_fault_backing {
-                let resident = self.pages.lock().contains_key(&page);
+                let resident = self.pages.lock().contains_key(page);
                 record_hardware_user_fault(backing, hardware_fault_access, resident);
             }
             return FaultOutcome::Segv;
@@ -3460,11 +3476,11 @@ impl VmSpace {
             let pte_present = user_pgd_ops().is_some_and(|ops| {
                 (unsafe { (ops.count_mapped)(self.pgd, page, page_size()) }) != 0
             });
-            if pte_present != pages.contains_key(&page) {
+            if pte_present != pages.contains_key(page) {
                 return FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess);
             }
         }
-        let mapping = pages.get_mut(&page);
+        let mapping = pages.get_mut(page);
         #[cfg(feature = "performance-profile")]
         drop(page_lookup_profile);
         if let Some(mapping) = mapping {
@@ -3812,7 +3828,7 @@ impl VmSpace {
             return Err(Errno::EFAULT);
         }
         let pages = self.pages.lock();
-        let mapping = pages.get(&page_va).ok_or(Errno::EFAULT)?;
+        let mapping = pages.get(page_va).ok_or(Errno::EFAULT)?;
         if write && !mapping.access.pte_writable() {
             return Err(Errno::EFAULT);
         }
@@ -4010,7 +4026,7 @@ impl VmSpace {
         let page = ResidentPage::new_anon(paddr);
         let access = access_for_new_page(flags, &page);
         let mut pages = self.pages.lock();
-        if pages.contains_key(&page_va) {
+        if pages.contains_key(page_va) {
             return Err(Errno::EEXIST);
         }
         self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))?;
@@ -4055,7 +4071,7 @@ impl VmSpace {
         let page = {
             let pages = self.pages.lock();
             pages
-                .get(&page_va)
+                .get(page_va)
                 .map(|mapping| Arc::clone(&mapping.page))
                 .ok_or(Errno::EFAULT)?
         };
@@ -4096,7 +4112,7 @@ impl VmSpace {
                 return Ok(None);
             }
             let page_va = page_base(address);
-            let Some(mapping) = pages.get(&page_va) else {
+            let Some(mapping) = pages.get(page_va) else {
                 return Ok(None);
             };
             if is_write_fault(kind) && !mapping.access.pte_writable() {
@@ -4162,7 +4178,7 @@ impl VmSpace {
         }
 
         let mut pages = self.pages.lock();
-        if pages.contains_key(&plan.fault_page) {
+        if pages.contains_key(plan.fault_page) {
             #[cfg(feature = "performance-profile")]
             record_fault_around_raced_pages(prepared.len());
             drop(pages);
@@ -4180,7 +4196,7 @@ impl VmSpace {
         let prepared_len = prepared.len();
         let prefix_len =
             unmapped_prefix_len(prepared.iter().map(|candidate| candidate.vaddr), |vaddr| {
-                pages.contains_key(&vaddr)
+                pages.contains_key(vaddr)
             });
         #[cfg(feature = "performance-profile")]
         if prefix_len != prepared_len {
@@ -4189,7 +4205,7 @@ impl VmSpace {
                 .last()
                 .and_then(|candidate| candidate.vaddr.checked_add(page_size()))
                 .unwrap_or(suffix_start);
-            let duplicate = pages.range(suffix_start..suffix_end).count();
+            let duplicate = pages.count_range(suffix_start..suffix_end);
             record_fault_around_collision(duplicate, prepared_len - prefix_len - duplicate);
         }
         debug_assert!(prefix_len <= FILE_FAULT_AROUND_PAGES);
@@ -4295,7 +4311,7 @@ impl VmSpace {
         };
         let page_size = page_size();
         let mut pages = self.pages.lock();
-        let fault_resident = pages.contains_key(&plan.fault_page);
+        let fault_resident = pages.contains_key(plan.fault_page);
         let fault_present = if cfg!(debug_assertions) {
             (unsafe { (ops.count_mapped)(self.pgd, plan.fault_page, page_size) }) != 0
         } else {
@@ -4336,7 +4352,7 @@ impl VmSpace {
         let mut prefix_len = 0usize;
         let mut invariant_failure = false;
         for candidate in &prepared {
-            let resident = pages.contains_key(&candidate.vaddr);
+            let resident = pages.contains_key(candidate.vaddr);
             let present = if cfg!(debug_assertions) {
                 (unsafe { (ops.count_mapped)(self.pgd, candidate.vaddr, page_size) }) != 0
             } else {
@@ -4497,29 +4513,24 @@ impl VmSpace {
         let pte_present = user_pgd_ops().is_some_and(|ops| {
             (unsafe { (ops.count_mapped)(self.pgd, page_va, page_size()) }) != 0
         });
-        let vacant = match pages.entry(page_va) {
-            alloc::collections::btree_map::Entry::Occupied(entry) => {
-                let mapping = entry.into_mut();
-                #[cfg(debug_assertions)]
-                if !pte_present {
-                    drop(pages);
-                    drop(set);
-                    drop(page);
-                    return FaultAroundCommit::Done(FaultOutcome::Kernel(
-                        KernelFaultReason::UncaughtKernelAccess,
-                    ));
-                }
-                let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
+        if let Some(mapping) = pages.get_mut(page_va) {
+            #[cfg(debug_assertions)]
+            if !pte_present {
                 drop(pages);
                 drop(set);
                 drop(page);
-                return FaultAroundCommit::Done(self.finish_resident_fault(page_va, update, true));
+                return FaultAroundCommit::Done(FaultOutcome::Kernel(
+                    KernelFaultReason::UncaughtKernelAccess,
+                ));
             }
-            alloc::collections::btree_map::Entry::Vacant(vacant) => vacant,
-        };
+            let update = self.handle_resident_fault_locked(page_va, flags, kind, mapping);
+            drop(pages);
+            drop(set);
+            drop(page);
+            return FaultAroundCommit::Done(self.finish_resident_fault(page_va, update, true));
+        }
         #[cfg(debug_assertions)]
         if pte_present {
-            drop(vacant);
             drop(pages);
             drop(set);
             drop(page);
@@ -4530,13 +4541,13 @@ impl VmSpace {
         if let Err(err) =
             self.map_page_no_flush(page_va, page.paddr(), pte_flags_for(flags, access))
         {
-            drop(vacant);
             drop(pages);
             drop(set);
             drop(page);
             return FaultAroundCommit::Done(fault_from_errno(err));
         }
-        vacant.insert(PageMapping { page, access });
+        let previous = pages.insert(page_va, PageMapping { page, access });
+        debug_assert!(previous.is_none());
         let mapped = pages.len();
         self.mapped_pages.store(mapped, Ordering::Release);
         drop(pages);
@@ -4701,10 +4712,10 @@ impl VmSpace {
     fn unmap_page_mappings(&self, range: Range<usize>) -> Result<Vec<(usize, PageMapping)>, Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let mut pages = self.pages.lock();
-        let keys: Vec<usize> = pages.range(range).map(|(k, _)| *k).collect();
+        let keys = pages.keys_in_range(range);
         let mut removed = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(mapping) = pages.remove(&key) {
+            if let Some(mapping) = pages.remove(key) {
                 unsafe { (ops.unmap)(self.pgd, key, page_size()) };
                 removed.push((key, mapping));
             }
@@ -4726,12 +4737,12 @@ impl VmSpace {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let old_range = old_start..old_start + len;
         let mut pages = self.pages.lock();
-        let keys: Vec<usize> = pages.range(old_range.clone()).map(|(va, _)| *va).collect();
+        let keys = pages.keys_in_range(old_range.clone());
         let mut moves = Vec::with_capacity(keys.len());
         for old_va in &keys {
             let new_va = new_start + (old_va - old_start);
             let area = set.find(new_va).ok_or(Errno::ENOMEM)?;
-            let mapping = pages.get(old_va).ok_or(Errno::ENOMEM)?;
+            let mapping = pages.get(*old_va).ok_or(Errno::ENOMEM)?;
             moves.push((
                 *old_va,
                 new_va,
@@ -4740,7 +4751,7 @@ impl VmSpace {
             ));
         }
         for (old_va, new_va, paddr, flags) in moves {
-            let mapping = pages.remove(&old_va).ok_or(Errno::ENOMEM)?;
+            let mapping = pages.remove(old_va).ok_or(Errno::ENOMEM)?;
             unsafe {
                 (ops.unmap)(self.pgd, old_va, page_size());
                 (ops.map)(self.pgd, new_va, paddr, flags.with(VmFlags::USER))
