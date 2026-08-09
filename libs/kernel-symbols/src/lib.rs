@@ -507,9 +507,20 @@ impl KernelMixinSiteDescriptorV1 {
     }
 
     /// 返回该站点当前是否安装了处理链。
+    ///
+    /// 该入口供真正要读取路由的慢路径使用，Acquire 与发布者的 Release 配对。
     #[inline]
     pub fn has_handlers(&self) -> bool {
         !self.route.load(Ordering::Acquire).is_null()
+    }
+
+    /// 返回该站点是否可能安装了处理链，只用于决定是否进入慢路径。
+    ///
+    /// 调用方不得解引用这里观察到的指针。真正分发会再次以 Acquire 读取路由，
+    /// 因此空路由快路径不需要在 RISC-V 上为一次提示判断执行内存屏障。
+    #[inline(always)]
+    pub fn has_handlers_hint(&self) -> bool {
+        !self.route.load(Ordering::Relaxed).is_null()
     }
 }
 
@@ -1264,6 +1275,8 @@ fn valid_rust_path(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    static MIXIN_HINT_ROUTE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
     fn example(value: usize) -> usize {
         value
     }
@@ -1328,5 +1341,25 @@ mod tests {
         });
         assert_eq!(result, 42);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn mixin_handler_hint_tracks_only_route_presence() {
+        let descriptor = KernelMixinSiteDescriptorV1::new(
+            KERNEL_MIXIN_SITE_HEAD,
+            0,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            "tests.query",
+            "head",
+            &MIXIN_HINT_ROUTE,
+        );
+        assert!(!descriptor.has_handlers_hint());
+
+        let marker = core::ptr::from_ref(&MIXIN_HINT_ROUTE).cast_mut().cast();
+        MIXIN_HINT_ROUTE.store(marker, Ordering::Relaxed);
+        assert!(descriptor.has_handlers_hint());
+        MIXIN_HINT_ROUTE.store(core::ptr::null_mut(), Ordering::Relaxed);
     }
 }
