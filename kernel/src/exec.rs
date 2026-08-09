@@ -608,8 +608,14 @@ pub(crate) fn prepare_exec(task: &Arc<Task>, request: ExecRequest) -> Result<Pre
                     Ok(snapshot)
                 })
                 .transpose()?;
-            let image =
-                crate::soyo::prepare_soyo_runtime(image, &argv, &envp, descriptors.as_ref())?;
+            let image = crate::soyo::prepare_soyo_runtime_with_vfs(
+                image,
+                &argv,
+                &envp,
+                descriptors.as_ref(),
+                &[],
+                observed.vfs_context.clone(),
+            )?;
             let frame = prepare_native_initial_frame(
                 image.entry_pc,
                 image.user_sp,

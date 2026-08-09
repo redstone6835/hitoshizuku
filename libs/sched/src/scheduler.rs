@@ -2735,6 +2735,14 @@ pub fn exec_sibling_exit_wakeup(target: &Arc<Task>, preserve_leader_identity: bo
     forced_exit_wakeup(target);
 }
 
+/// 唤醒收到 Native 单线程终止请求的任务。目标在自己的安全边界完成退出，
+/// 发送者不会远程释放目标内核栈上的资源。
+pub fn native_thread_exit_wakeup(target: &Arc<Task>, code: i32) -> i32 {
+    let selected = target.publish_native_thread_exit_wakeup(code);
+    forced_exit_wakeup(target);
+    selected
+}
+
 fn forced_exit_wakeup(target: &Arc<Task>) {
     let resumed = target.resume_for_fatal_exit()
         || target.cas_state(TaskState::Sleeping, TaskState::Runnable)

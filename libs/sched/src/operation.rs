@@ -350,6 +350,17 @@ pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     true
 }
 
+/// 在目标线程自己的安全边界完成 Native Thread capability 发布的退出请求。
+pub fn complete_native_thread_exit_if_requested(task: &Arc<Task>) -> bool {
+    let Some(code) = task.native_thread_exit_boundary_pending() else {
+        return false;
+    };
+    if !matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
+        exit_task(task, ExitCode(code));
+    }
+    true
+}
+
 /// 要求 exec 发起者之外的线程在自己的安全边界退出。
 pub fn request_exec_sibling_exit(target: &Arc<Task>, preserve_leader_identity: bool) {
     crate::scheduler::exec_sibling_exit_wakeup(target, preserve_leader_identity);
@@ -1993,6 +2004,9 @@ pub fn consume_native_external_control_for_task(task: &Arc<Task>) -> NativeExter
     if complete_group_exit_if_requested(task) {
         return NativeExternalControl::Terminate;
     }
+    if complete_native_thread_exit_if_requested(task) {
+        return NativeExternalControl::Terminate;
+    }
 
     let _ = task.consume_pending_signal(|info| {
         if task.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
@@ -2008,7 +2022,7 @@ pub fn consume_native_external_control_for_task(task: &Arc<Task>) -> NativeExter
         }
     });
 
-    if complete_group_exit_if_requested(task) {
+    if complete_group_exit_if_requested(task) || complete_native_thread_exit_if_requested(task) {
         return NativeExternalControl::Terminate;
     }
     match task.state() {
@@ -2128,7 +2142,10 @@ pub fn prepare_user_return_for_task(
     if task.is_kernel_task() || user_ctx.is_none() {
         return Ok(());
     }
-    if complete_exec_sibling_exit_if_requested(task) || complete_group_exit_if_requested(task) {
+    if complete_exec_sibling_exit_if_requested(task)
+        || complete_group_exit_if_requested(task)
+        || complete_native_thread_exit_if_requested(task)
+    {
         return Ok(());
     }
     let Some(ops) = process_image_ops() else {

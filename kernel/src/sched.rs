@@ -155,6 +155,7 @@ struct KernelExtExitHook;
 
 impl TaskExtExitHook for KernelExtExitHook {
     fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        crate::native_runtime::record_task_exit(task);
         #[cfg(target_arch = "riscv64")]
         arch::riscv64::vector::clear_for_task(task);
         #[cfg(target_arch = "riscv64")]
@@ -162,6 +163,7 @@ impl TaskExtExitHook for KernelExtExitHook {
             let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
         }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
+        let _ = task.ext_remove(crate::native_runtime::TASKEXT_NATIVE_THREAD);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
         let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
@@ -531,6 +533,35 @@ pub(crate) fn prepare_native_child(
 
     // SOYO 映射期间可能切换过活动页表，返回父调用现场前必须恢复当前地址空间。
     activate_task_vm(&sched::current_task());
+    Ok(())
+}
+
+/// 为尚未进入运行队列的 Native 线程安装共享地址空间和首次用户上下文。
+pub(crate) fn prepare_native_thread(
+    child: &Arc<Task>,
+    vm: Arc<VmSpace>,
+    entry: usize,
+    stack_top: usize,
+    argument: usize,
+    tls_base: usize,
+) -> Result<(), Errno> {
+    if child.state() != sched::TaskState::New
+        || child.thread_group().user_abi_kind() != native_abi::UserAbiKind::MygoNative
+    {
+        return Err(Errno::EINVAL);
+    }
+    let kernel_stack_top = child.ensure_kernel_stack();
+    let mut frame = UserTrapFrame::init_user(entry, stack_top, argument);
+    frame.set_tls(tls_base);
+    frame.set_kernel_stack_top(kernel_stack_top);
+
+    let vm_payload: Arc<dyn core::any::Any + Send + Sync> = vm;
+    child.ext_install(TASKEXT_VM_SPACE, vm_payload);
+    let _ = child.ext_remove(TASKEXT_VFS_FDTABLE);
+    let _ = child.ext_remove(TASKEXT_VFS_CONTEXT);
+    child.set_comm(b"soyo-thread");
+    child.into_kernel_thread(user_clone_entry, 0);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     Ok(())
 }
 

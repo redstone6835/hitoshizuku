@@ -787,6 +787,9 @@ pub struct Task {
     /// exec 发起者要求本线程自行退出。1 表示普通兄弟线程，2 表示需要
     /// 暂时保留进程 leader 身份，等待执行线程接管。
     exec_sibling_exit_requested: AtomicU8,
+    /// Native Thread capability 发布的单线程协作退出请求。最高位表示请求已
+    /// 发布，低 32 位保存完整退出码；零值表示没有请求。
+    native_thread_exit_requested: AtomicU64,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
     exit_reason: AtomicU8,
@@ -968,6 +971,7 @@ impl Task {
             state: AtomicU8::new(TaskState::New as u8),
             group_exit_requested: AtomicBool::new(false),
             exec_sibling_exit_requested: AtomicU8::new(EXEC_SIBLING_EXIT_NONE),
+            native_thread_exit_requested: AtomicU64::new(0),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
             exit_reason: AtomicU8::new(EXIT_REASON_NONE),
@@ -1542,9 +1546,32 @@ impl Task {
             .store(EXEC_SIBLING_EXIT_NONE, Ordering::Release);
     }
 
+    /// 发布 Native 单线程退出请求，多个并发请求遵循 first-wins。
+    pub(crate) fn publish_native_thread_exit_wakeup(&self, code: i32) -> i32 {
+        const REQUESTED: u64 = 1 << 63;
+        let encoded = REQUESTED | u64::from(code as u32);
+        let selected = match self.native_thread_exit_requested.compare_exchange(
+            0,
+            encoded,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => encoded,
+            Err(existing) => existing,
+        };
+        selected as u32 as i32
+    }
+
+    /// 返回已经发布的 Native 单线程退出码。
+    pub fn native_thread_exit_boundary_pending(&self) -> Option<i32> {
+        let encoded = self.native_thread_exit_requested.load(Ordering::Acquire);
+        (encoded != 0).then_some(encoded as u32 as i32)
+    }
+
     fn forced_exit_wakeup_pending(&self) -> bool {
         self.group_exit_wakeup_pending()
             || self.exec_sibling_exit_requested.load(Ordering::SeqCst) != EXEC_SIBLING_EXIT_NONE
+            || self.native_thread_exit_requested.load(Ordering::SeqCst) != 0
     }
 
     pub(crate) fn exec_sibling_exit_boundary_pending(&self) -> bool {

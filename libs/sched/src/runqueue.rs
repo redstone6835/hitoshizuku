@@ -129,7 +129,9 @@ fn assert_rq_ownership_acquired(task: &Arc<Task>, owner_cpu: usize, site: &str) 
     if owner_cpu == RQ_OWNER_NONE {
         return;
     }
-    let previous = task.rq_owner.swap(owner_cpu, core::sync::atomic::Ordering::AcqRel);
+    let previous = task
+        .rq_owner
+        .swap(owner_cpu, core::sync::atomic::Ordering::AcqRel);
     assert!(
         previous == RQ_OWNER_NONE || previous == owner_cpu,
         "[sched] double enqueue at {}: pid={:?} already queued on cpu{} while enqueuing on cpu{} \

@@ -199,6 +199,57 @@ pub fn spawn_native_child(
     Ok(child)
 }
 
+/// 创建一个尚未激活的 Native 用户线程。
+///
+/// 新线程共享调用者的线程组、进程组与 personality，但不进入 POSIX
+/// parent/children 图，也不携带退出信号。调用方必须先安装 VM 和用户上下文，
+/// 再调用 [`activate_task`]。
+pub fn spawn_native_thread(
+    parent: &Arc<Task>,
+    params: SchedParams,
+) -> Result<Arc<Task>, errno::Errno> {
+    let root_ns = root_pid_ns();
+    let group = parent.thread_group();
+    let Some(exec) = group.lock_for_clone() else {
+        return Err(errno::Errno::EBUSY);
+    };
+    if group.user_abi_kind() != native_abi::UserAbiKind::MygoNative
+        || group.group_exit_status().is_some()
+    {
+        return Err(errno::Errno::EBUSY);
+    }
+
+    let process_group = parent.process_group();
+    let child = Task::new(
+        params,
+        Weak::new(),
+        Arc::clone(&group),
+        Arc::clone(&process_group),
+    );
+    child.set_exit_signal(0);
+    child.set_credentials(parent.credentials());
+    child.inherit_timer_slack_from(parent);
+    #[cfg(feature = "performance-profile")]
+    child.inherit_profile_session_from(parent);
+
+    if !exec.try_add_member(&child) {
+        child.set_state(TaskState::Dead);
+        return Err(errno::Errno::EBUSY);
+    }
+    process_group.add_member(&child);
+
+    let Some(pid) = root_ns.registry().allocate(&child) else {
+        abort_new_task(&child);
+        return Err(errno::Errno::ENOMEM);
+    };
+    child.register_pid(Arc::clone(&root_ns), pid);
+    child.set_tgid_cache(group.tgid());
+
+    #[cfg(feature = "performance-profile")]
+    register_profile_child(parent, &child, pid);
+    Ok(child)
+}
+
 /// 把已经安装执行上下文的任务放入合适的 runqueue。
 #[kernel_symbols::export(name = "sched.spawn.activate_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn activate_task(task: &Arc<Task>) -> Result<usize, errno::Errno> {
