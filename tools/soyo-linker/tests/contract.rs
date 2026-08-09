@@ -66,20 +66,43 @@ fn manifest_rejects_unknown_and_duplicate_registry_names() {
 }
 
 #[test]
-fn manifest_rejects_capability_escalation_and_missing_authority() {
+fn manifest_rejects_capability_escalation() {
     let escalation = VALID_MANIFEST.replace(r#"["write"]"#, r#"["write", "read"]"#);
     assert_eq!(
         parse_manifest(&escalation).unwrap_err().kind(),
         ContractErrorKind::RightsExceeded
     );
+}
 
-    let missing = VALID_MANIFEST
-        .replace("stdout", "stdin")
-        .replace(r#"["write"]"#, r#"["read"]"#);
-    assert_eq!(
-        parse_manifest(&missing).unwrap_err().kind(),
-        ContractErrorKind::MissingCapability
-    );
+#[test]
+fn manifest_allows_operations_on_objects_created_at_runtime() {
+    let dynamic_object_manifest = r#"
+{
+  "manifest_version": 1,
+  "abi_epoch": 1,
+  "entry": "_start",
+  "imports": [
+    { "operation": "event.create", "required": true },
+    { "operation": "event.bind", "required": true },
+    { "operation": "event.wait", "required": true }
+  ],
+  "capabilities": [
+    { "requirement": "self_process", "rights": ["create"], "required": true }
+  ],
+  "runtime": {
+    "stack_size": 65536,
+    "stack_guard_size": 4096,
+    "start_info_max_size": 4096
+  }
+}
+"#;
+
+    let contract = parse_manifest(dynamic_object_manifest)
+        .expect("EventPort 由 event.create 创建，不是初始 capability");
+
+    assert_eq!(contract.imports().len(), 3);
+    assert_eq!(contract.capabilities().len(), 1);
+    assert_eq!(contract.capabilities()[0].rights, Rights::CREATE);
 }
 
 #[test]

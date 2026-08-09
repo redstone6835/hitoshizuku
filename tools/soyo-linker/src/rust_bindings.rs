@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use native_abi::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, ObjectInterface, REQUIREMENTS, RIGHTS, TargetArch,
-    operation, status, wire as native_wire,
+    status, wire as native_wire,
 };
 use soyo::registry::FeatureFlags;
 
@@ -47,13 +47,25 @@ pub fn generate_rust_module(target: TargetArch, contract: &ProgramContract) -> V
         contract.imports().len()
     )
     .unwrap();
-    for (slot, import) in contract.imports().iter().enumerate() {
-        let spec = operation(import.operation).expect("manifest import 已由 registry 归一化");
+    for operation_spec in native_abi::OPERATIONS {
+        let slot = contract
+            .imports()
+            .iter()
+            .position(|import| import.operation == operation_spec.id);
         writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
         writeln!(
             output,
-            "pub const MYGO_SLOT_{}: u64 = {slot};",
-            public_ident(spec.name)
+            "pub const MYGO_HAS_{}: bool = {};",
+            public_ident(operation_spec.name),
+            slot.is_some()
+        )
+        .unwrap();
+        writeln!(output, "#[allow(non_upper_case_globals)]").unwrap();
+        writeln!(
+            output,
+            "pub const MYGO_SLOT_{}: u64 = {};",
+            public_ident(operation_spec.name),
+            slot.map_or(u64::MAX, |slot| slot as u64)
         )
         .unwrap();
     }

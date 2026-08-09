@@ -3,8 +3,8 @@
 use std::fmt;
 
 use native_abi::{
-    OPERATIONS, OperationId, REQUIREMENTS, RequirementId, Rights, operation, requirement,
-    right_by_name, wire as native_wire,
+    OPERATIONS, OperationId, REQUIREMENTS, RequirementId, Rights, right_by_name,
+    wire as native_wire,
 };
 use serde::Deserialize;
 use soyo::registry::{MAX_CAPABILITIES, MAX_IMPORTS, PAGE_SIZE};
@@ -150,7 +150,6 @@ pub fn parse_manifest(source: &str) -> Result<ProgramContract, ContractError> {
     validate_entry(&manifest.entry)?;
     let imports = normalize_imports(manifest.imports)?;
     let capabilities = normalize_capabilities(manifest.capabilities)?;
-    validate_operation_authority(&imports, &capabilities)?;
     let runtime = normalize_runtime(manifest.runtime)?;
     Ok(ProgramContract {
         entry: manifest.entry,
@@ -265,38 +264,6 @@ fn normalize_capabilities(
     }
     normalized.sort_by_key(|capability| capability.requirement as u32);
     Ok(normalized)
-}
-
-fn validate_operation_authority(
-    imports: &[ContractImport],
-    capabilities: &[ContractCapability],
-) -> Result<(), ContractError> {
-    for import in imports.iter().filter(|import| import.required) {
-        let spec = operation(import.operation).expect("已从 registry 归一化 operation");
-        let Some(interface) = spec.interface else {
-            continue;
-        };
-        let satisfied = capabilities
-            .iter()
-            .filter(|capability| capability.required)
-            .filter_map(|capability| {
-                requirement(capability.requirement).map(|spec| (capability, spec))
-            })
-            .any(|(capability, requirement)| {
-                requirement.interface == interface
-                    && spec.required_rights.is_subset_of(capability.rights)
-            });
-        if !satisfied {
-            return Err(ContractError::new(
-                ContractErrorKind::MissingCapability,
-                format!(
-                    "required operation {} 缺少匹配的 required capability",
-                    spec.name
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn normalize_runtime(runtime: ManifestRuntime) -> Result<RuntimeContract, ContractError> {

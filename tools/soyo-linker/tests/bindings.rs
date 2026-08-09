@@ -45,6 +45,8 @@ fn c_header_uses_registry_order_for_program_slots() {
     assert!(header.contains("#define MYGO_RUNTIME_RUN_INIT_ARRAY UINT64_C(1)\n"));
     assert!(header.contains("#define MYGO_RUNTIME_RUN_FINI_ARRAY UINT64_C(2)\n"));
     assert!(header.contains("#define MYGO_CALL_SLOT_COUNT 2u\n"));
+    assert!(header.contains("#define MYGO_HAS_image_create 0u\n"));
+    assert!(header.contains("#define MYGO_SLOT_image_create UINT64_MAX\n"));
     assert!(header.contains("#define MYGO_CAPABILITY_COUNT 2u\n"));
     assert!(header.contains("#define MYGO_CAPABILITY_CONTRACT(X) \\\n"));
     assert!(

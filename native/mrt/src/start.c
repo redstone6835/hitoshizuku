@@ -54,13 +54,13 @@ struct mygo_native_result mrt_call(
     return result;
 }
 
-#ifdef MYGO_SLOT_handle_close
+#if MYGO_HAS_handle_close
 uint32_t mrt_handle_close(uint64_t handle) {
     return mrt_call(MYGO_SLOT_handle_close, handle, 0, 0, 0, 0, 0).status;
 }
 #endif
 
-#ifdef MYGO_SLOT_handle_duplicate
+#if MYGO_HAS_handle_duplicate
 struct mrt_handle_result mrt_handle_duplicate(uint64_t handle) {
     struct mygo_native_result result =
         mrt_call(MYGO_SLOT_handle_duplicate, handle, 0, 0, 0, 0, 0);
@@ -68,7 +68,7 @@ struct mrt_handle_result mrt_handle_duplicate(uint64_t handle) {
 }
 #endif
 
-#ifdef MYGO_SLOT_handle_restrict
+#if MYGO_HAS_handle_restrict
 struct mrt_handle_result mrt_handle_restrict(uint64_t handle, uint64_t rights) {
     struct mygo_native_result result =
         mrt_call(MYGO_SLOT_handle_restrict, handle, rights, 0, 0, 0, 0);

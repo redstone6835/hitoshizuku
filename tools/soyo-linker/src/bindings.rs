@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use native_abi::{
     ABI_EPOCH, ABI_FAMILY_MYGO_NATIVE, ObjectInterface, REQUIREMENTS, RIGHTS, TargetArch,
-    operation, status, wire as native_wire,
+    status, wire as native_wire,
 };
 use soyo::registry::FeatureFlags;
 use soyo::registry::RuntimeFlags;
@@ -67,13 +67,23 @@ pub fn generate_c_header(target: TargetArch, contract: &ProgramContract) -> Vec<
         contract.imports().len()
     )
     .unwrap();
-    for (slot, import) in contract.imports().iter().enumerate() {
-        let spec = operation(import.operation).expect("manifest import 已由 registry 归一化");
+    for operation_spec in native_abi::OPERATIONS {
+        let slot = contract
+            .imports()
+            .iter()
+            .position(|import| import.operation == operation_spec.id);
         writeln!(
             output,
-            "#define MYGO_SLOT_{} {}u",
-            public_ident(spec.name),
-            slot
+            "#define MYGO_HAS_{} {}u",
+            public_ident(operation_spec.name),
+            u32::from(slot.is_some())
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "#define MYGO_SLOT_{} {}",
+            public_ident(operation_spec.name),
+            slot.map_or_else(|| "UINT64_MAX".to_string(), |slot| format!("{slot}u"))
         )
         .unwrap();
     }

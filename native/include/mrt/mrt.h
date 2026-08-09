@@ -38,6 +38,11 @@ struct mrt_handle_result {
     uint64_t handle;
 };
 
+struct mrt_count_result {
+    uint32_t status;
+    uint64_t count;
+};
+
 enum mrt_start_error mrt_validate_start_info(
     const struct mygo_start_info *info,
     uint64_t entry_size,
@@ -61,6 +66,29 @@ struct mygo_native_result mrt_call(
 uint32_t mrt_handle_close(uint64_t handle);
 struct mrt_handle_result mrt_handle_duplicate(uint64_t handle);
 struct mrt_handle_result mrt_handle_restrict(uint64_t handle, uint64_t rights);
+
+struct mrt_handle_result mrt_image_create(
+    uint64_t process,
+    const void *bytes,
+    uint64_t length);
+struct mrt_handle_result mrt_process_spawn(
+    uint64_t process,
+    const mygo_spawn_request *request);
+uint32_t mrt_process_wait(
+    uint64_t process,
+    mygo_process_result *result,
+    uint64_t deadline_ns);
+struct mrt_handle_result mrt_event_create(uint64_t process, uint32_t capacity);
+struct mrt_handle_result mrt_event_bind(
+    uint64_t event_port,
+    uint64_t source,
+    uint32_t event_mask,
+    uint64_t user_data);
+struct mrt_count_result mrt_event_wait(
+    uint64_t event_port,
+    mygo_event_record *records,
+    uint32_t capacity,
+    uint64_t deadline_ns);
 
 uint64_t mrt_initial_handle(uint32_t requirement_id);
 

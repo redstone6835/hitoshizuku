@@ -3,6 +3,7 @@
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
 	kernel-la kernel-rv all clean cargo-setup \
 	native-hello-la native-hello-rv native-rust-hello-la native-rust-hello-rv \
+	native-parent-la native-parent-rv native-rust-parent-la native-rust-parent-rv \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -27,7 +28,7 @@ INSTALL_MOD_PATH ?=
 KERNEL_MAP ?=
 KERNEL_PUBLISH_OUTPUT ?=
 
-UNKNOWN_NATIVE_EXAMPLES := $(filter-out hello rust-hello,$(NATIVE_EXAMPLES))
+UNKNOWN_NATIVE_EXAMPLES := $(filter-out hello rust-hello parent rust-parent,$(NATIVE_EXAMPLES))
 ifneq ($(strip $(UNKNOWN_NATIVE_EXAMPLES)),)
 $(error NATIVE_EXAMPLES 包含未知示例: $(UNKNOWN_NATIVE_EXAMPLES))
 endif
@@ -52,9 +53,31 @@ define install_native_rust_hello
 endef
 endif
 
+ifneq ($(filter parent,$(NATIVE_EXAMPLES)),)
+define install_native_parent
+	$(MAKE) -C native ARCH=$(1) native-parent
+	install -m 0755 $(BUILD_DIR)/$(1)/native/parent.soyo $(2)/bin/soyo-parent
+endef
+else
+define install_native_parent
+endef
+endif
+
+ifneq ($(filter rust-parent,$(NATIVE_EXAMPLES)),)
+define install_native_rust_parent
+	$(MAKE) -C native ARCH=$(1) native-rust-parent
+	install -m 0755 $(BUILD_DIR)/$(1)/native/rust-parent.soyo $(2)/bin/soyo-rust-parent
+endef
+else
+define install_native_rust_parent
+endef
+endif
+
 define install_native_examples
 	$(call install_native_hello,$(1),$(2))
 	$(call install_native_rust_hello,$(1),$(2))
+	$(call install_native_parent,$(1),$(2))
+	$(call install_native_rust_parent,$(1),$(2))
 endef
 
 empty :=
@@ -360,6 +383,18 @@ native-rust-hello-la:
 
 native-rust-hello-rv:
 	$(MAKE) -C native ARCH=$(RV_ARCH) rust-hello
+
+native-parent-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) native-parent
+
+native-parent-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) native-parent
+
+native-rust-parent-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) native-rust-parent
+
+native-rust-parent-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) native-rust-parent
 
 clean:
 	cargo clean

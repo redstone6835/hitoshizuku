@@ -58,6 +58,8 @@ const _: () = assert!(MYGO_ABI_EPOCH == 1);
 const _: () = assert!(MYGO_FEATURE_STATIC_TLS == 1);
 const _: () = assert!(MYGO_SLOT_process_exit == 0);
 const _: () = assert!(MYGO_SLOT_stream_write == 1);
+const _: () = assert!(!MYGO_HAS_image_create);
+const _: () = assert!(MYGO_SLOT_image_create == u64::MAX);
 const _: () = assert!(MYGO_REQUIREMENT_self_process == 1);
 const _: () = assert!(MYGO_REQUIREMENT_stdout == 4);
 const _: () = assert!(MYGO_RIGHT_write == 2);
