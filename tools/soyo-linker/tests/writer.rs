@@ -122,11 +122,12 @@ fn canonical_writer_round_trips_real_linked_image() {
         ]
     );
     assert_eq!(metadata.relocations, image.runtime_relocations());
-    assert_eq!(metadata.runtime.stack_size, 65536);
-    assert_eq!(metadata.runtime.init_array_count, 2);
-    assert_eq!(metadata.runtime.fini_array_count, 2);
-    assert_eq!(metadata.runtime.init_array_entry_size, 8);
-    assert_eq!(metadata.runtime.fini_array_entry_size, 8);
+    let runtime = metadata.runtime.expect("可执行映像必须包含 RuntimeInfo");
+    assert_eq!(runtime.stack_size, 65536);
+    assert_eq!(runtime.init_array_count, 2);
+    assert_eq!(runtime.fini_array_count, 2);
+    assert_eq!(runtime.init_array_entry_size, 8);
+    assert_eq!(runtime.fini_array_entry_size, 8);
     assert_ne!(metadata.header.required_features & (1 << 1), 0);
 }
 

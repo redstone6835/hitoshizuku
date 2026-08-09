@@ -85,7 +85,8 @@ struct TlsAdd {
     segment_index: usize,
     symbol_value: SymbolValue,
     addend: i64,
-    register: u32,
+    source_register: u32,
+    destination_register: u32,
 }
 
 fn apply_tls(image: &mut LinkImage, relocations: &[PendingRelocation]) -> Result<(), LinkError> {
@@ -150,7 +151,8 @@ fn apply_tls(image: &mut LinkImage, relocations: &[PendingRelocation]) -> Result
             segment_index: relocation.target_segment_index,
             symbol_value: relocation.symbol_value,
             addend: relocation.addend,
-            register: destination_register,
+            source_register,
+            destination_register,
         });
     }
 
@@ -163,7 +165,7 @@ fn apply_tls(image: &mut LinkImage, relocations: &[PendingRelocation]) -> Result
             add.segment_index == segment_index
                 && add.symbol_value == high.symbol_value
                 && add.addend == high.addend
-                && add.register == register
+                && add.source_register == register
         })
     });
 
@@ -187,7 +189,7 @@ fn apply_tls(image: &mut LinkImage, relocations: &[PendingRelocation]) -> Result
                 add.segment_index == relocation.target_segment_index
                     && add.symbol_value == relocation.symbol_value
                     && add.addend == relocation.addend
-                    && add.register == base_register
+                    && add.destination_register == base_register
             })
             .next()
             .map(|(index, add)| (index, *add));
@@ -201,7 +203,7 @@ fn apply_tls(image: &mut LinkImage, relocations: &[PendingRelocation]) -> Result
             if candidate.segment_index == add.segment_index
                 && candidate.symbol_value == relocation.symbol_value
                 && candidate.addend == relocation.addend
-                && candidate.register == base_register
+                && candidate.destination_register == base_register
             {
                 add_has_low[index] = true;
             }
@@ -712,6 +714,14 @@ mod tests {
             apply_tls(&mut image, &relocations).unwrap_err().kind(),
             LinkErrorKind::RelocationOverflow
         );
+    }
+
+    #[test]
+    fn tls_accepts_distinct_add_destination_register() {
+        let (mut image, relocations) = tls_fixture(0x0005_b603, SymbolValue::Tls(0));
+
+        apply_tls(&mut image, &relocations)
+            .expect("TPREL_ADD 可以把 HI20 基址写入不同的目标寄存器");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use native_abi::TargetArch;
+use soyo::registry::ArtifactKind;
 use soyo::{SliceSoyoReader, SoyoReadLimits, SoyoTargetPolicy, read_soyo, validate_soyo};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -154,6 +155,118 @@ fn rv64_sources_link_directly_to_deterministic_soyo() {
 #[test]
 fn la64_sources_link_directly_to_deterministic_soyo() {
     link_twice_and_validate(
+        "loongarch64",
+        TargetArch::LoongArch64,
+        "loongarch64-unknown-none",
+        &[],
+    );
+}
+
+const COMPONENT_MANIFEST: &str = r#"
+{
+  "manifest_version": 1,
+  "abi_epoch": 1,
+  "component_id": "00112233445566778899aabbccddeeff",
+  "abi_id": "102132435465768798a9bacbdcedfe0f",
+  "init": "component_init",
+  "fini": "component_fini",
+  "tls_offset_symbol": "component_tls_offset",
+  "imports": [
+    { "operation": "clock.read", "required": true, "slot_symbol": "clock_slot" }
+  ],
+  "dependencies": [
+    {
+      "component_id": "ffeeddccbbaa99887766554433221100",
+      "abi_id": "00ffeeddccbbaa998877665544332211",
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "math"
+    }
+  ],
+  "symbol_imports": [
+    {
+      "dependency_component_id": "ffeeddccbbaa99887766554433221100",
+      "interface_id": "11111111111111111111111111111111",
+      "symbol_id": "22222222222222222222222222222222",
+      "signature_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "binding_symbol": "math_add_gate",
+      "name": "math.add"
+    }
+  ],
+  "symbol_exports": [
+    {
+      "interface_id": "33333333333333333333333333333333",
+      "symbol_id": "44444444444444444444444444444444",
+      "signature_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "symbol": "plugin_run",
+      "name": "plugin.run"
+    }
+  ]
+}
+"#;
+
+fn link_component(target_name: &str, target: TargetArch, triple: &str, flags: &[&str]) {
+    let directory = TestDirectory::new(&format!("component-{target_name}"));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/component.c");
+    let object = directory.0.join("component.o");
+    let compilation = Command::new("clang")
+        .arg(format!("--target={triple}"))
+        .args([
+            "-ffreestanding",
+            "-fno-stack-protector",
+            "-fno-pic",
+            "-fno-pie",
+            "-fno-asynchronous-unwind-tables",
+            "-fno-unwind-tables",
+            "-fvisibility=hidden",
+            "-O2",
+            "-c",
+        ])
+        .args(flags)
+        .arg(source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("应能启动 clang");
+    assert!(
+        compilation.status.success(),
+        "clang 生成 {target_name} component 失败: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let manifest = directory.0.join("component.json");
+    let output_path = directory.0.join("component.soyo");
+    fs::write(&manifest, COMPONENT_MANIFEST).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_soyo-ld"))
+        .args(["--component", "--target", target_name, "--manifest"])
+        .arg(&manifest)
+        .arg("-o")
+        .arg(&output_path)
+        .arg(&object)
+        .output()
+        .expect("应能启动 soyo-ld");
+    assert!(
+        output.status.success(),
+        "soyo-ld {target_name} component 失败: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(output_path).unwrap();
+    let metadata = read_soyo(&SliceSoyoReader::new(&bytes), SoyoReadLimits::portable()).unwrap();
+    assert_eq!(metadata.header.target_arch, target);
+    assert_eq!(metadata.header.artifact_kind, ArtifactKind::SharedComponent);
+}
+
+#[test]
+fn rv64_component_links_directly_from_relocatable_object() {
+    link_component(
+        "riscv64",
+        TargetArch::Riscv64,
+        "riscv64-unknown-none-elf",
+        &["-mno-relax", "-msmall-data-limit=0", "-mcmodel=medany"],
+    );
+}
+
+#[test]
+fn la64_component_links_directly_from_relocatable_object() {
+    link_component(
         "loongarch64",
         TargetArch::LoongArch64,
         "loongarch64-unknown-none",

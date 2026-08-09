@@ -10,23 +10,26 @@ use std::process::ExitCode;
 use native_abi::TargetArch;
 
 use crate::bindings::generate_c_header;
-use crate::contract::parse_manifest;
+use crate::contract::{parse_component_manifest, parse_manifest};
 use crate::elf::MAX_OBJECT_FILE_SIZE;
 use crate::link::{InputObject, LinkRequest, apply_relocations, build_link_image};
 use crate::rust_bindings::generate_rust_module;
-use crate::writer::encode_soyo;
+use crate::writer::{encode_component_soyo, encode_signed_component_soyo, encode_soyo};
 
 const HELP: &str = "\
 SOYO 直接静态链接器
 
 用法:
   soyo-ld --target <riscv64|loongarch64> --manifest <app.json> -o <app.soyo> <ELF ET_REL>...
+  soyo-ld --component --target <riscv64|loongarch64> --manifest <component.json> -o <component.soyo> <ELF ET_REL>...
   soyo-ld --target <riscv64|loongarch64> --manifest <app.json> --emit-c-header <path>
   soyo-ld --target <riscv64|loongarch64> --manifest <app.json> --emit-rust-module <path>
 
 选项:
   --target <arch>            输出目标架构
   --manifest <path>          程序 ABI 与 capability 契约
+  --component                输出 shared component
+  --signing-key <path>       使用 32 字节 Ed25519 seed 签署 component
   --emit-c-header <path>     生成程序专属 C ABI binding
   --emit-rust-module <path>  生成程序专属 Rust ABI binding
   -o <path>                  输出 SOYO 文件
@@ -45,6 +48,8 @@ struct LinkOptions {
     manifest: PathBuf,
     output: PathBuf,
     objects: Vec<PathBuf>,
+    component: bool,
+    signing_key: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -145,6 +150,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
     let mut output = None;
     let mut c_header = None;
     let mut rust_module = None;
+    let mut component = false;
+    let mut signing_key = None;
     let mut objects = Vec::new();
     let mut positional_only = false;
     let mut arguments = arguments.into_iter();
@@ -174,6 +181,21 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
                     &mut manifest,
                     PathBuf::from(next_value(&mut arguments, "--manifest")?),
                     "--manifest",
+                )?;
+                continue;
+            }
+            if argument == "--component" {
+                if component {
+                    return Err(CliError::usage("重复指定 --component"));
+                }
+                component = true;
+                continue;
+            }
+            if argument == "--signing-key" {
+                set_once(
+                    &mut signing_key,
+                    PathBuf::from(next_value(&mut arguments, "--signing-key")?),
+                    "--signing-key",
                 )?;
                 continue;
             }
@@ -219,9 +241,9 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
         ));
     }
     if let Some(c_header) = c_header {
-        if output.is_some() || !objects.is_empty() {
+        if component || signing_key.is_some() || output.is_some() || !objects.is_empty() {
             return Err(CliError::usage(
-                "--emit-c-header 不能与 -o 或对象输入同时使用",
+                "--emit-c-header 不能与 -o 或对象输入同时使用；也不能与 --component 同时使用",
             ));
         }
         return Ok(Action::EmitCHeader(HeaderOptions {
@@ -231,9 +253,9 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
         }));
     }
     if let Some(rust_module) = rust_module {
-        if output.is_some() || !objects.is_empty() {
+        if component || signing_key.is_some() || output.is_some() || !objects.is_empty() {
             return Err(CliError::usage(
-                "--emit-rust-module 不能与 -o 或对象输入同时使用",
+                "--emit-rust-module 不能与 -o 或对象输入同时使用；也不能与 --component 同时使用",
             ));
         }
         return Ok(Action::EmitRustModule(HeaderOptions {
@@ -251,11 +273,16 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
             "对象数量超过 {MAX_OBJECT_COUNT} 个上限"
         )));
     }
+    if signing_key.is_some() && !component {
+        return Err(CliError::usage("--signing-key 只适用于 --component"));
+    }
     Ok(Action::Link(LinkOptions {
         target,
         manifest,
         output,
         objects,
+        component,
+        signing_key,
     }))
 }
 
@@ -288,10 +315,33 @@ fn parse_target(value: OsString) -> Result<TargetArch, CliError> {
 
 fn link(options: LinkOptions) -> Result<(), CliError> {
     let manifest_source = read_manifest(&options.manifest)?;
+    let objects = read_objects(open_objects(&options.objects)?)?;
+    if options.component {
+        let contract = parse_component_manifest(&manifest_source)
+            .map_err(|error| CliError::operation(format!("component manifest 无效: {error}")))?;
+        let entry = contract
+            .init()
+            .or_else(|| contract.fini())
+            .unwrap_or_else(|| &contract.symbol_exports()[0].symbol);
+        let image = build_link_image(LinkRequest {
+            target_arch: options.target,
+            entry_symbol: entry,
+            objects: &objects,
+        })
+        .map_err(|error| CliError::operation(format!("组件链接失败: {error}")))?;
+        let image = apply_relocations(image)
+            .map_err(|error| CliError::operation(format!("组件重定位失败: {error}")))?;
+        let output = if let Some(path) = &options.signing_key {
+            let key = read_signing_key(path)?;
+            encode_signed_component_soyo(&image, &contract, key)
+        } else {
+            encode_component_soyo(&image, &contract)
+        }
+            .map_err(|error| CliError::operation(format!("SOYO 组件编码失败: {error}")))?;
+        return write_atomic(&options.output, &output, false);
+    }
     let contract = parse_manifest(&manifest_source)
         .map_err(|error| CliError::operation(format!("manifest 无效: {error}")))?;
-
-    let objects = read_objects(open_objects(&options.objects)?)?;
     let image = build_link_image(LinkRequest {
         target_arch: options.target,
         entry_symbol: contract.entry(),
@@ -303,6 +353,41 @@ fn link(options: LinkOptions) -> Result<(), CliError> {
     let output = encode_soyo(&image, &contract)
         .map_err(|error| CliError::operation(format!("SOYO 编码失败: {error}")))?;
     write_atomic(&options.output, &output, true)
+}
+
+fn read_signing_key(path: &Path) -> Result<[u8; 32], CliError> {
+    let file = File::open(path).map_err(|error| {
+        CliError::operation(format!("读取 signing key {} 失败: {error}", path.display()))
+    })?;
+    let size = file.metadata().map_err(|error| {
+        CliError::operation(format!("读取 signing key {} 元数据失败: {error}", path.display()))
+    })?;
+    if size.len() > 128 {
+        return Err(CliError::operation("signing key 超过 128 字节上限"));
+    }
+    let bytes = read_bounded(file, size.len(), 128, || {
+        format!("读取 signing key {}", path.display())
+    })?;
+    if bytes.len() == 32 {
+        let mut key = [0; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| CliError::operation("signing key 必须是 32 字节 seed 或 64 位 hex"))?
+        .trim();
+    if text.len() != 64 {
+        return Err(CliError::operation(
+            "signing key 必须是 32 字节 seed 或 64 位 hex",
+        ));
+    }
+    let mut key = [0; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&text[offset..offset + 2], 16)
+            .map_err(|_| CliError::operation("signing key 包含非 hex 字符"))?;
+    }
+    Ok(key)
 }
 
 fn emit_c_header(options: HeaderOptions) -> Result<(), CliError> {

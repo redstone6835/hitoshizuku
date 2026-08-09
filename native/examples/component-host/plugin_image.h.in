@@ -1,0 +1,9 @@
+#ifndef SOYO_PLUGIN_IMAGE_H
+#define SOYO_PLUGIN_IMAGE_H
+
+#include <stdint.h>
+
+extern const unsigned char mygo_plugin_image_start[];
+extern const unsigned char mygo_plugin_image_end[];
+
+#endif
