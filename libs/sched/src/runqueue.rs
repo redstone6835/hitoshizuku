@@ -629,6 +629,10 @@ impl Runqueue {
 
         if target.sched.policy() != SchedPolicy::Fair
             || !task_can_run_on(target, cpu_mask)
+            // 精确交接目标不可能是 current（下一项已显式排除），因此只要仍有
+            // CPU 执行所有权，就尚未完成上下文保存。调用方的无锁预检与这里拿
+            // rq 锁之间可能跨过远端 claim，必须在摘除队列节点前再次拒绝。
+            || target.running_cpu().is_some()
             || inner
                 .current
                 .as_ref()
