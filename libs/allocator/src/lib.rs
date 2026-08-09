@@ -303,6 +303,8 @@ pub struct KernelMemorySubsystem {
     cpu_id_fn: AtomicUsize,
     kernel_heap_region_fn: AtomicUsize,
     tracked_heap_region_fn: AtomicUsize,
+    tracked_heap_start: AtomicUsize,
+    tracked_heap_size: AtomicUsize,
     kernel_heap_map_fn: AtomicUsize,
     kernel_heap_unmap_fn: AtomicUsize,
     total_allocs: AtomicU64,
@@ -423,6 +425,8 @@ impl KernelMemorySubsystem {
             cpu_id_fn: AtomicUsize::new(0),
             kernel_heap_region_fn: AtomicUsize::new(0),
             tracked_heap_region_fn: AtomicUsize::new(0),
+            tracked_heap_start: AtomicUsize::new(0),
+            tracked_heap_size: AtomicUsize::new(0),
             kernel_heap_map_fn: AtomicUsize::new(0),
             kernel_heap_unmap_fn: AtomicUsize::new(0),
             total_allocs: AtomicU64::new(0),
@@ -491,8 +495,13 @@ impl KernelMemorySubsystem {
         map_fn: MapKernelHeapRangeFn,
         unmap_fn: UnmapKernelHeapRangeFn,
     ) {
+        let (tracked_heap_start, tracked_heap_size) = tracked_region_fn();
         self.kernel_heap_region_fn
             .store(region_fn as usize, Ordering::Release);
+        self.tracked_heap_start
+            .store(tracked_heap_start, Ordering::Relaxed);
+        self.tracked_heap_size
+            .store(tracked_heap_size, Ordering::Relaxed);
         self.tracked_heap_region_fn
             .store(tracked_region_fn as usize, Ordering::Release);
         self.kernel_heap_map_fn
@@ -541,10 +550,10 @@ impl KernelMemorySubsystem {
             return Err(InitError::MissingKernelHeapRegion);
         };
         let kernel_heap_region = region_fn();
-        let Some(tracked_region_fn) = self.load_tracked_heap_region_fn() else {
+        let Some(_) = self.load_tracked_heap_region_fn() else {
             return Err(InitError::MissingKernelHeapRegion);
         };
-        let tracked_heap_region = tracked_region_fn();
+        let tracked_heap_region = self.cached_tracked_heap_region();
 
         let init_result = {
             let phys = self.phys.lock();
@@ -1876,13 +1885,18 @@ impl KernelMemorySubsystem {
     }
 
     fn is_tracked_heap_pointer(&self, ptr: usize) -> bool {
-        let Some(region_fn) = self.load_tracked_heap_region_fn() else {
-            return false;
-        };
-        let (start, size) = region_fn();
+        let (start, size) = self.cached_tracked_heap_region();
         start
             .checked_add(size)
             .is_some_and(|end| ptr >= start && ptr < end)
+    }
+
+    #[inline]
+    fn cached_tracked_heap_region(&self) -> (usize, usize) {
+        (
+            self.tracked_heap_start.load(Ordering::Relaxed),
+            self.tracked_heap_size.load(Ordering::Relaxed),
+        )
     }
 
     fn deallocate_untracked_global(
@@ -2791,6 +2805,64 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
 
 #[cfg(feature = "ktest-kernel")]
 mod tests;
+
+#[cfg(test)]
+mod host_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{KernelMemorySubsystem, PagePolicy};
+
+    static TRACKED_REGION_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TRACKED_REGION_START: AtomicUsize = AtomicUsize::new(0x4000);
+    static TRACKED_REGION_SIZE: AtomicUsize = AtomicUsize::new(0x2000);
+    static TEST_ALLOCATOR: KernelMemorySubsystem = KernelMemorySubsystem::new();
+
+    fn kernel_region() -> (usize, usize) {
+        (0x1000, 0x1000)
+    }
+
+    fn tracked_region() -> (usize, usize) {
+        TRACKED_REGION_CALLS.fetch_add(1, Ordering::Relaxed);
+        (
+            TRACKED_REGION_START.load(Ordering::Relaxed),
+            TRACKED_REGION_SIZE.load(Ordering::Relaxed),
+        )
+    }
+
+    fn map_range(_vaddr: usize, _paddr: usize, _size: usize, _page_policy: PagePolicy) -> bool {
+        true
+    }
+
+    fn unmap_range(_vaddr: usize, _size: usize) -> bool {
+        true
+    }
+
+    #[test]
+    fn tracked_heap_range_is_cached_with_exact_boundaries() {
+        TRACKED_REGION_CALLS.store(0, Ordering::Relaxed);
+        TRACKED_REGION_START.store(0x4000, Ordering::Relaxed);
+        TRACKED_REGION_SIZE.store(0x2000, Ordering::Relaxed);
+        TEST_ALLOCATOR.bind_kernel_heap_ops(kernel_region, tracked_region, map_range, unmap_range);
+
+        assert!(!TEST_ALLOCATOR.is_tracked_heap_pointer(0x3fff));
+        assert!(TEST_ALLOCATOR.is_tracked_heap_pointer(0x4000));
+        assert!(TEST_ALLOCATOR.is_tracked_heap_pointer(0x5fff));
+        assert!(!TEST_ALLOCATOR.is_tracked_heap_pointer(0x6000));
+        assert_eq!(TRACKED_REGION_CALLS.load(Ordering::Relaxed), 1);
+
+        TRACKED_REGION_START.store(0x7000, Ordering::Relaxed);
+        TRACKED_REGION_SIZE.store(0, Ordering::Relaxed);
+        TEST_ALLOCATOR.bind_kernel_heap_ops(kernel_region, tracked_region, map_range, unmap_range);
+        assert!(!TEST_ALLOCATOR.is_tracked_heap_pointer(0x7000));
+        assert_eq!(TRACKED_REGION_CALLS.load(Ordering::Relaxed), 2);
+
+        TRACKED_REGION_START.store(usize::MAX - 1, Ordering::Relaxed);
+        TRACKED_REGION_SIZE.store(4, Ordering::Relaxed);
+        TEST_ALLOCATOR.bind_kernel_heap_ops(kernel_region, tracked_region, map_range, unmap_range);
+        assert!(!TEST_ALLOCATOR.is_tracked_heap_pointer(usize::MAX - 1));
+        assert_eq!(TRACKED_REGION_CALLS.load(Ordering::Relaxed), 3);
+    }
+}
 
 /// 内核内存子系统的唯一状态实例；最终二进制自行选择是否把它安装为全局分配器。
 #[kernel_symbols::export(
