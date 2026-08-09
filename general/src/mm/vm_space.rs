@@ -5528,16 +5528,14 @@ unsafe fn alloc_uninitialized_user_page() -> Option<usize> {
 }
 
 fn try_alloc_user_page(order: usize, size: usize) -> Option<usize> {
-    // 用户物理页必须进入 allocator registry；否则 fork/munmap/drop 路径无法被
-    // allocator 审计发现泄漏或重复释放。
     let allocation = allocator::KERNEL_ALLOCATOR
-        .allocate_physical(allocator::PhysicalAllocRequest::new(
+        .allocate_untracked_physical(allocator::PhysicalAllocRequest::new(
             size,
             allocator::PAGE_SIZE,
         ))
         .ok()?;
     if allocation.order != order || allocation.size != size {
-        let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
+        let _ = allocator::KERNEL_ALLOCATOR.try_free_untracked_physical(allocation);
         return None;
     }
     Some(allocation.paddr)
@@ -5572,25 +5570,49 @@ unsafe fn zero_unpublished_user_pages(vaddr: usize, len: usize) {
 }
 
 fn free_user_page(paddr: usize) {
-    if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_physical_addr(paddr) {
+    let Some(allocation) = user_page_allocation_handle(paddr, page_size()) else {
         log::error!(
-            "[mm] failed to free tracked user page paddr={:#x}: {:?}",
+            "[mm] invalid user page geometry paddr={:#x} page_size={:#x}",
+            paddr,
+            page_size()
+        );
+        return;
+    };
+    if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_untracked_physical(allocation) {
+        log::error!(
+            "[mm] failed to free user page paddr={:#x}: {:?}",
             paddr,
             err
         );
     }
 }
 
+#[inline]
+fn user_page_allocation_handle(
+    paddr: usize,
+    page_size: usize,
+) -> Option<allocator::PhysicalAllocation> {
+    if page_size < allocator::PAGE_SIZE
+        || !page_size.is_power_of_two()
+        || paddr & (page_size - 1) != 0
+    {
+        return None;
+    }
+    let order = page_size.trailing_zeros() - allocator::PAGE_SIZE.trailing_zeros();
+    Some(allocator::PhysicalAllocation {
+        paddr,
+        size: page_size,
+        order: order as usize,
+        page_size,
+    })
+}
+
 fn user_page_order() -> Option<usize> {
     let page_size = page_size();
-    if page_size < allocator::PAGE_SIZE || page_size % allocator::PAGE_SIZE != 0 {
+    if page_size < allocator::PAGE_SIZE || !page_size.is_power_of_two() {
         return None;
     }
-    let allocator_pages = page_size / allocator::PAGE_SIZE;
-    if !allocator_pages.is_power_of_two() {
-        return None;
-    }
-    Some(allocator_pages.trailing_zeros() as usize)
+    Some((page_size.trailing_zeros() - allocator::PAGE_SIZE.trailing_zeros()) as usize)
 }
 
 /// 获取 Vec<Range<usize>> 视图，方便调试打印 / smoketest。
@@ -5619,7 +5641,7 @@ mod tests {
         permits_file_fault_around, plan_file_segment, private_file_batch_error_is_fatal,
         private_file_batch_page_offset, private_file_batch_plan, publish_cached_file_page,
         publish_cached_private_file_page, read_file_bytes_exact, read_file_page_exact,
-        same_backing_snapshot, unmapped_prefix_len,
+        same_backing_snapshot, unmapped_prefix_len, user_page_allocation_handle,
     };
     use errno::Errno;
     use mm::{FileLike, VmBacking};
@@ -5631,6 +5653,17 @@ mod tests {
     fn user_page_allocation_failure_is_not_a_kernel_access_fault() {
         assert_eq!(fault_from_errno(Errno::ENOMEM), FaultOutcome::OutOfMemory);
         assert_eq!(fault_from_errno(Errno::EIO), FaultOutcome::Segv);
+    }
+
+    #[test]
+    fn user_page_allocation_handle_preserves_exact_buddy_geometry() {
+        let allocation = user_page_allocation_handle(0x20_000, PAGE_SIZE)
+            .expect("valid user page allocation handle");
+
+        assert_eq!(allocation.paddr, 0x20_000);
+        assert_eq!(allocation.size, PAGE_SIZE);
+        assert_eq!(allocation.order, 0);
+        assert_eq!(allocation.page_size, allocator::PAGE_SIZE);
     }
 
     struct ChunkedFile {

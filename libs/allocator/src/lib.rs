@@ -1131,6 +1131,41 @@ impl KernelMemorySubsystem {
         }
     }
 
+    /// 分配由内核内部完整句柄独占管理的物理页，不写入通用逐对象注册表。
+    ///
+    /// 该入口只适用于 `owner=0` 且调用方会一直保留精确 [`PhysicalAllocation`]
+    /// 生命周期的对象，例如用户常驻页。外部所有者、DMA 和只保存裸物理
+    /// 地址的子系统仍必须使用 [`KernelMemorySubsystem::allocate_physical`]。
+    pub fn allocate_untracked_physical(
+        &self,
+        request: PhysicalAllocRequest,
+    ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
+        let request = request
+            .validate()
+            .map_err(buddy_alloc_error_from_request)?
+            .without_external_accounting();
+        let active = self.active.load(Ordering::Relaxed);
+        let mut allocation = self.allocate_physical_raw(request);
+        if allocation.is_err() && active {
+            let _ = self.reclaim_allocator_caches_for_retry();
+            allocation = self.allocate_physical_raw(request);
+        }
+        allocation
+    }
+
+    /// 释放由 [`KernelMemorySubsystem::allocate_untracked_physical`] 返回的完整句柄。
+    ///
+    /// 此路径直接按句柄中的物理地址和阶数归还伙伴分配器，不查询或修改通用
+    /// 注册表。调用方必须保留准确的分配几何；不得传入受追踪物理页的句柄，
+    /// 否则会留下失真的账本记录。
+    pub fn try_free_untracked_physical(
+        &self,
+        allocation: PhysicalAllocation,
+    ) -> Result<(), PhysicalFreeError> {
+        self.try_free_physical_raw(allocation)
+            .map_err(PhysicalFreeError::Buddy)
+    }
+
     pub fn free_physical(&self, allocation: PhysicalAllocation) -> bool {
         self.try_free_physical(allocation).is_ok()
     }
