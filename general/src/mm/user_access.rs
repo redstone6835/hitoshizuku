@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use mm::UserAccessError;
 
 use crate::mm::ops::user_access_ops;
-use crate::mm::vm_space::{VmSpace, page_size};
+use crate::mm::vm_space::{UserReadWindows, UserWriteWindows, VmSpace, page_size};
 
 const USER_COPY_WINDOWS: usize = 16;
 
@@ -33,11 +33,11 @@ pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError
     if let Some(vm) = current_task_vm_space() {
         let total = dst.len();
         let mut copied = 0usize;
+        let mut windows = UserReadWindows::<USER_COPY_WINDOWS>::empty();
         while copied < total {
             let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
             let chunk = user_copy_chunk_len(user_ptr, total - copied);
-            let windows = vm
-                .pin_user_read_windows::<USER_COPY_WINDOWS>(user_ptr, chunk)
+            vm.pin_user_read_windows_into(user_ptr, chunk, &mut windows)
                 .map_err(|_| UserAccessError::Fault)?;
             windows
                 .copy_into(0, &mut dst[copied..copied + chunk])
@@ -67,11 +67,11 @@ pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
     if let Some(vm) = current_task_vm_space() {
         let total = src.len();
         let mut copied = 0usize;
+        let mut windows = UserWriteWindows::<USER_COPY_WINDOWS>::empty();
         while copied < total {
             let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
             let chunk = user_copy_chunk_len(user_ptr, total - copied);
-            let windows = vm
-                .pin_user_write_windows::<USER_COPY_WINDOWS>(user_ptr, chunk)
+            vm.pin_user_write_windows_into(user_ptr, chunk, &mut windows)
                 .map_err(|_| UserAccessError::Fault)?;
             windows
                 .copy_from(0, &src[copied..copied + chunk])

@@ -315,20 +315,26 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         // 到最终不可调用窗口才发布 sscratch。U-mode frame 以非零 kstack_top
         // 作为类型标记，但实际发布当前内核 tp（per-hart TrapAnchor）；被打断的
         // return-to-user kernel frame 则从 satp 字段恢复原 anchor 指针。
+        //
+        // 普通内核态帧保存的是陷入时 hart 的内核 tp。陷阱处理流程可能触发调度
+        // 并让任务迁移，返回时必须保留当前 hart 的 tp，不能恢复已经过期的 HartLocal。
         "ld sp, {kstack_top_off}(s11)",
         "beqz sp, 7f",
         "csrw {sscratch}, tp",
+        "sd zero, {hart_entry_state_off}(tp)",
+        "ld tp, {tp_off}(s11)",
         "j 6f",
         "7:",
         "ld sp, {satp_off}(s11)",
         "beqz sp, 5f",
         "csrw {sscratch}, sp",
+        "sd zero, {hart_entry_state_off}(tp)",
+        "ld tp, {tp_off}(s11)",
         "j 6f",
         "5:",
         "csrw {sscratch}, x0",
-        "6:",
         "sd zero, {hart_entry_state_off}(tp)",
-        "ld tp, {tp_off}(s11)",
+        "6:",
         "ld gp, {gp_off}(s11)",
         "ld sp, {sp_off}(s11)",
         "ld s11, {s11_off}(s11)",
