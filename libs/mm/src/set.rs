@@ -104,7 +104,10 @@ impl VmaSet {
             return None;
         }
         let area = &self.areas[idx - 1];
-        if area.is_well_formed() && area.contains(addr) {
+        debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
+        // partition_point 已保证 area.start <= addr；集合只允许插入合法 VMA，
+        // 热查询无需再次检查 backing 覆盖范围。
+        if addr < area.range.end {
             Some(area)
         } else {
             None
@@ -118,7 +121,8 @@ impl VmaSet {
             return None;
         }
         let area = &mut self.areas[idx - 1];
-        if area.is_well_formed() && area.contains(addr) {
+        debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
+        if addr < area.range.end {
             Some(VmAreaMut { area })
         } else {
             None

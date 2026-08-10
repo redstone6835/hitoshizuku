@@ -136,7 +136,7 @@ impl VmArea {
         let Some(len) = self.len() else {
             return false;
         };
-        len != 0 && self.backing.checked_shift(len).is_some()
+        len != 0 && self.backing.can_shift(len)
     }
 
     /// 地址是否落在本 VMA 内（半开区间 `[start, end)`）。
@@ -196,6 +196,21 @@ impl VmArea {
 
 #[kernel_symbols::export]
 impl VmBacking {
+    /// 检查 backing 向后移动 `shift` 字节是否会溢出，不取得 backing 的所有权。
+    ///
+    /// VMA 集合会在插入及结构变更时频繁调用该检查。与 `checked_shift` 不同，这里
+    /// 不构造返回值，因此 file/shared-anon backing 不会产生无意义的 Arc 增减。
+    fn can_shift(&self, shift: usize) -> bool {
+        match self {
+            Self::Anon { .. } => true,
+            Self::SharedAnon { offset, .. } | Self::File { offset, .. } => u64::try_from(shift)
+                .ok()
+                .and_then(|shift| offset.checked_add(shift))
+                .is_some(),
+            Self::Direct(base) => base.checked_add(shift).is_some(),
+        }
+    }
+
     /// 建立一个具有独立合并来源的私有匿名 backing。
     #[kernel_symbols::export(name = "mm.area.VmBacking.anonymous", contract = "kernel.mm.vma-backing@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn anonymous() -> Self {

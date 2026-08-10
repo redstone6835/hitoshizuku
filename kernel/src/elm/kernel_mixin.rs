@@ -610,11 +610,14 @@ fn publish(registry: &mut Registry, next: Vec<RegisteredHandler>) -> Result<(), 
         updates.push((site, pointer));
     }
 
+    // reader 先登记再读 route，writer 先换 route 再读 reader；四个操作必须处于
+    // 同一全序，避免弱内存序下双方同时观察到旧值并提前回收快照。
     for (site, pointer) in &updates {
-        retired.push(site.route.swap(*pointer, Ordering::AcqRel));
+        retired.push(site.route.swap(*pointer, Ordering::SeqCst));
     }
+    kernel_symbols::publish_mixin_runtime_active(!next.is_empty());
     registry.handlers = next;
-    while ACTIVE_READERS.load(Ordering::Acquire) != 0 {
+    while ACTIVE_READERS.load(Ordering::SeqCst) != 0 {
         core::hint::spin_loop();
     }
     for pointer in retired {
@@ -630,14 +633,14 @@ struct ReaderGuard;
 
 impl ReaderGuard {
     fn enter() -> Self {
-        ACTIVE_READERS.fetch_add(1, Ordering::AcqRel);
+        ACTIVE_READERS.fetch_add(1, Ordering::SeqCst);
         Self
     }
 }
 
 impl Drop for ReaderGuard {
     fn drop(&mut self) {
-        ACTIVE_READERS.fetch_sub(1, Ordering::Release);
+        ACTIVE_READERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -657,7 +660,7 @@ unsafe extern "C" fn dispatch(
         return KERNEL_MIXIN_DISPATCH_INVALID;
     }
     let _reader = ReaderGuard::enter();
-    let route = site.route.load(Ordering::Acquire);
+    let route = site.route.load(Ordering::SeqCst);
     if route.is_null() {
         return kernel_symbols::KERNEL_MIXIN_DISPATCH_UNHANDLED;
     }

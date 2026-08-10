@@ -1594,6 +1594,92 @@ pub fn current_task_is_workload() -> bool {
     workload_root() == 0 || current_task_session() == session_id()
 }
 
+/// QEMU syscall 指令模型使用的入口标记。
+///
+/// 三个参数刻意遵循 RISC-V C ABI 的 `a0..a2`，插件在函数入口读取它们。
+#[cfg(feature = "syscall-model-markers")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn __mygo_profile_syscall_enter(session: u64, task: u64, nr: u64) {
+    core::hint::black_box((session, task, nr));
+    #[cfg(target_arch = "riscv64")]
+    // Safety: 指令只写入恒为零的 x0，不访问内存、栈或调用者状态；不同立即数
+    // 用于阻止链接器把三个 marker 做 identical-code folding。
+    unsafe {
+        core::arch::asm!("addi zero, zero, 0", options(nomem, nostack));
+    }
+}
+
+/// QEMU syscall 指令模型使用的出口标记。
+#[cfg(feature = "syscall-model-markers")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn __mygo_profile_syscall_exit(session: u64, task: u64, nr: u64) {
+    core::hint::black_box((session, task, nr));
+    #[cfg(target_arch = "riscv64")]
+    // Safety: 仅执行对 x0 的无副作用写入，见 enter marker 的说明。
+    unsafe {
+        core::arch::asm!("addi zero, zero, 1", options(nomem, nostack));
+    }
+}
+
+/// QEMU syscall 指令模型使用的任务切换标记。
+///
+/// `running=0` 暂停当前任务的 syscall，`running=1` 在迁移后的 CPU 上恢复它。
+#[cfg(feature = "syscall-model-markers")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn __mygo_profile_task_switch(session: u64, task: u64, running: u64) {
+    core::hint::black_box((session, task, running));
+    #[cfg(target_arch = "riscv64")]
+    // Safety: 仅执行对 x0 的无副作用写入，见 enter marker 的说明。
+    unsafe {
+        core::arch::asm!("addi zero, zero, 2", options(nomem, nostack));
+    }
+}
+
+/// 一个 syscall 指令模型实例。正常返回时自动发出配对出口；不返回的
+/// `exit/exit_group` 会有意保留为截断实例。
+#[cfg(feature = "syscall-model-markers")]
+pub struct SyscallModelScope {
+    session: u64,
+    task: u64,
+    nr: u64,
+    active: bool,
+}
+
+#[cfg(feature = "syscall-model-markers")]
+impl Drop for SyscallModelScope {
+    fn drop(&mut self) {
+        if self.active {
+            __mygo_profile_syscall_exit(self.session, self.task, self.nr);
+        }
+    }
+}
+
+/// 在当前 profiling 会话内建立一个 QEMU syscall 指令模型实例。
+#[cfg(feature = "syscall-model-markers")]
+#[inline]
+pub fn syscall_model_scope(session: u64, task: u64, nr: usize) -> SyscallModelScope {
+    let active = enabled() && session != 0 && session == session_id() && nr < SYSCALL_SLOTS;
+    if active {
+        __mygo_profile_syscall_enter(session, task, nr as u64);
+    }
+    SyscallModelScope {
+        session,
+        task,
+        nr: nr as u64,
+        active,
+    }
+}
+
+/// 通知 QEMU 模型当前任务已经切出或切入 CPU。
+#[cfg(feature = "syscall-model-markers")]
+#[inline]
+pub fn syscall_model_task_switch(session: u64, task: u64, running: bool) {
+    __mygo_profile_task_switch(session, task, u64::from(running));
+}
+
 pub fn state() -> SessionState {
     SessionState::from_raw(STATE.load(Ordering::Acquire))
 }
@@ -2151,13 +2237,27 @@ impl Drop for SyscallScope {
 
 pub fn syscall_scope(nr: usize) -> SyscallScope {
     let generation = generation();
-    let active = enabled()
+    let phase = phase().min(MAX_PHASES - 1);
+    let eligible = enabled()
         && nr < SYSCALL_SLOTS
         && installed_fn(&READ_COUNTER) != 0
         && current_task_is_workload();
+    let active = if eligible {
+        if let Some(_guard) = begin_write(Some(generation)) {
+            SYSCALLS[phase][nr]
+                .timing
+                .calls
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     SyscallScope {
         nr,
-        phase: phase(),
+        phase,
         start_cycles: if active { read_counter() } else { 0 },
         start_on_cpu_ns: if active { current_task_cpu_ns() } else { 0 },
         start_cpu: current_cpu(),
@@ -2181,7 +2281,6 @@ fn record_syscall(
         return;
     };
     let counter = &SYSCALLS[phase.min(MAX_PHASES - 1)][nr];
-    counter.timing.calls.fetch_add(1, Ordering::Relaxed);
     counter.timing.cycles.fetch_add(cycles, Ordering::Relaxed);
     counter
         .timing
@@ -3751,6 +3850,35 @@ mod tests {
             entry.phase == 3 && entry.nr == 63 && entry.errno == 2 && entry.count == 1
         }));
         assert_eq!(dropped_errno_records(), 0);
+        stop();
+    }
+
+    #[test]
+    fn syscall_entries_survive_nonreturning_or_frozen_scopes() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        install(
+            clock,
+            cpu,
+            task_cpu_ns,
+            task_id,
+            span_id,
+            set_span_id,
+            1_000_000_000,
+        );
+        start();
+        let profile = syscall_scope(94);
+        freeze();
+
+        let value = syscall_snapshot(0, 94).expect("syscall entry snapshot");
+        assert_eq!(value.timing.calls, 1);
+        assert_eq!(value.success, 0);
+        assert_eq!(value.errors, 0);
+        drop(profile);
+
+        let value = syscall_snapshot(0, 94).expect("frozen syscall entry snapshot");
+        assert_eq!(value.timing.calls, 1);
+        assert_eq!(value.success, 0);
+        assert_eq!(value.errors, 0);
         stop();
     }
 

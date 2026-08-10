@@ -38,6 +38,8 @@ EXPECTED_SYSCALLS = {
     "getppid": 173,
     "getuid": 174,
     "gettid": 178,
+    "read": 63,
+    "write": 64,
 }
 ZERO_RESULT_CASES = {
     "clock_gettime",

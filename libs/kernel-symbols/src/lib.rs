@@ -12,7 +12,7 @@
 use core::any::type_name;
 use core::fmt;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 include!(concat!(env!("OUT_DIR"), "/interface_source.rs"));
 
@@ -542,6 +542,25 @@ impl KernelMixinRuntimeHooksV1 {
 
 static MIXIN_RUNTIME_HOOKS: AtomicPtr<KernelMixinRuntimeHooksV1> =
     AtomicPtr::new(core::ptr::null_mut());
+static MIXIN_RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 返回当前是否至少有一个内核 Mixin 站点安装了处理器。
+///
+/// 导出包装器先读取这个全局门控。常态没有处理器时，每次调用只承担一次原子读取；
+/// 只有门控打开后才读取函数自己的 head/return 路由。
+#[inline]
+pub fn mixin_runtime_active() -> bool {
+    MIXIN_RUNTIME_ACTIVE.load(Ordering::Acquire)
+}
+
+/// 发布内核 Mixin 处理器集合的全局活动状态。
+///
+/// 路由器先更新所有站点指针，再更新该提示。门控本身不发布、解引用路由；观察到活动
+/// 状态后，包装器仍通过站点 route 的 Acquire 读取取得不可变快照。
+#[doc(hidden)]
+pub fn publish_mixin_runtime_active(active: bool) {
+    MIXIN_RUNTIME_ACTIVE.store(active, Ordering::Release);
+}
 
 /// 安装一次内核 Mixin 运行时钩子。
 pub fn install_mixin_runtime_hooks(hooks: &'static KernelMixinRuntimeHooksV1) -> bool {
@@ -1328,5 +1347,14 @@ mod tests {
         });
         assert_eq!(result, 42);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn mixin_runtime_gate_tracks_published_routes() {
+        publish_mixin_runtime_active(false);
+        assert!(!mixin_runtime_active());
+        publish_mixin_runtime_active(true);
+        assert!(mixin_runtime_active());
+        publish_mixin_runtime_active(false);
     }
 }

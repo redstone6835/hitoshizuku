@@ -11,6 +11,7 @@ bench = false
 [features]
 trace-task-lifecycle = []
 performance-profile = ["dep:profiling"]
+syscall-model-markers = ["performance-profile", "profiling/syscall-model-markers"]
 
 [dependencies]
 errno = { path = "../errno" }

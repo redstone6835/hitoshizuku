@@ -684,7 +684,9 @@ fn instrument_exported_body(
     };
 
     *block = syn::parse_quote!({
-        if !#head_descriptor.has_handlers() && !#return_descriptor.has_handlers() {
+        if !::kernel_symbols::mixin_runtime_active()
+            || (!#head_descriptor.has_handlers() && !#return_descriptor.has_handlers())
+        {
             #original
         } else {
             ::kernel_symbols::invoke_kernel_mixin_slow(|| {
@@ -880,6 +882,7 @@ mod tests {
         .to_string();
 
         assert!(tokens.contains("invoke_kernel_mixin_slow"));
+        assert!(tokens.contains("mixin_runtime_active"));
         assert!(tokens.contains("has_handlers"));
     }
 }
