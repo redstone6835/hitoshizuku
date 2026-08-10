@@ -17,6 +17,10 @@ path = "src/bin/soyo-ld.rs"
 name = "soyo-verify"
 path = "src/bin/soyo-verify.rs"
 
+[[bin]]
+name = "soyo-inspect"
+path = "src/bin/soyo-inspect.rs"
+
 [dependencies]
 ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }
 native-abi = { path = "../../libs/native-abi" }
