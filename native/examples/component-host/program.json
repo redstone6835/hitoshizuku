@@ -6,6 +6,7 @@
     { "operation": "process.exit", "required": true },
     { "operation": "handle.close", "required": true },
     { "operation": "stream.write", "required": true },
+    { "operation": "memory.allocate", "required": true },
     { "operation": "image.create", "required": true },
     { "operation": "component.load", "required": true },
     { "operation": "component.activate", "required": true },
@@ -17,6 +18,7 @@
   ],
   "capabilities": [
     { "requirement": "self_process", "rights": ["exit", "create", "load"], "required": true },
+    { "requirement": "current_address_space", "rights": ["allocate"], "required": true },
     { "requirement": "stdout", "rights": ["write"], "required": true }
   ],
   "runtime": {

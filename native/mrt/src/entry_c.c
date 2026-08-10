@@ -4,6 +4,14 @@
 
 #include <mrt/mrt.h>
 
+#if !MYGO_HAS_memory_allocate
+#error "mrt C 入口要求 manifest 导入 memory.allocate"
+#endif
+
+#if !MYGO_CAP_current_address_space_required
+#error "mrt C 入口要求 manifest 声明 current_address_space capability"
+#endif
+
 static char **program_argv;
 static char **program_envp;
 static int program_argc;

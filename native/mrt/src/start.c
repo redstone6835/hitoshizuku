@@ -130,7 +130,7 @@ _Noreturn void __mrt_start(
         entry_thread_pointer,
         &view);
     if (error != MRT_START_OK) {
-        mrt_abort();
+        mrt_terminate(160u + (uint32_t)error);
     }
     if (view.self_process != bootstrap_process_handle) {
         mrt_abort();

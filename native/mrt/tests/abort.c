@@ -78,6 +78,6 @@ int main(void) {
     assert(call_observed);
     assert(observed_call.slot == MYGO_SLOT_process_exit);
     assert(observed_call.object_handle == bootstrap_process);
-    assert(observed_call.args[0] == 134);
+    assert(observed_call.args[0] == 160 + MRT_START_BAD_HEADER);
     return 0;
 }
