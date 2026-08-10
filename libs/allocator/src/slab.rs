@@ -16,6 +16,7 @@
 //!
 //! 它和 `kheap` 的分工边界很明确：不适合放进 slab 的对象，直接交给大对象路径。
 use core::alloc::Layout;
+use core::mem::MaybeUninit;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -401,6 +402,46 @@ fn directory_page(addr: usize) -> Option<&'static SlabDirectoryPage> {
     }
 }
 
+/// 只暴露实际写入前缀的 cache 排空缓冲区。
+///
+/// 满 cache 释放属于冷路径，但不能为了排出少量对象先初始化整个临时数组。
+struct CacheDrainBuffer<const N: usize> {
+    entries: [MaybeUninit<CacheEntry>; N],
+    initialized: usize,
+}
+
+impl<const N: usize> CacheDrainBuffer<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [const { MaybeUninit::uninit() }; N],
+            initialized: 0,
+        }
+    }
+
+    fn push(&mut self, entry: CacheEntry) -> bool {
+        let Some(slot) = self.entries.get_mut(self.initialized) else {
+            return false;
+        };
+        slot.write(entry);
+        self.initialized += 1;
+        true
+    }
+
+    fn is_full(&self) -> bool {
+        self.initialized == N
+    }
+
+    fn initialized(&self) -> &[CacheEntry] {
+        // Safety: `initialized` 仅在对应槽位完成 write 后递增，因此此前缀全部有效。
+        unsafe {
+            core::slice::from_raw_parts(
+                self.entries.as_ptr().cast::<CacheEntry>(),
+                self.initialized,
+            )
+        }
+    }
+}
+
 /// 某个 CPU 在某个 size class 下的本地缓存状态。
 ///
 /// 它的目标是把最热的小对象分配/释放留在本地 CPU 上完成，尽量少碰全局 slab 状态。
@@ -451,7 +492,12 @@ impl PerCpuCacheState {
         true
     }
 
-    fn try_push_for_free(&mut self, entry: CacheEntry, used_hint: bool) -> bool {
+    fn push_for_free<const N: usize>(
+        &mut self,
+        entry: CacheEntry,
+        drained: &mut CacheDrainBuffer<N>,
+        used_hint: bool,
+    ) -> usize {
         self.stats.free_requests = self.stats.free_requests.saturating_add(1);
         self.stats.successful_frees = self.stats.successful_frees.saturating_add(1);
         if used_hint {
@@ -460,25 +506,22 @@ impl PerCpuCacheState {
             self.stats.fast_free_fallbacks = self.stats.fast_free_fallbacks.saturating_add(1);
             self.stats.note_slow_path();
         }
-        self.push(entry)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn push_for_free_slow(&mut self, entry: CacheEntry, drained: &mut [CacheEntry]) -> usize {
-        let mut drained_count = 0usize;
-        for slot in drained.iter_mut() {
+        if self.push(entry) {
+            return 0;
+        }
+        while !drained.is_full() {
             let Some(entry) = self.pop_entry() else {
                 break;
             };
-            *slot = entry;
-            drained_count += 1;
+            if !drained.push(entry) {
+                panic!("[alloc][invariant] slab drain buffer rejected available slot");
+            }
         }
         if !self.push(entry) {
             panic!("[alloc][invariant] slab cache remained full after drain");
         }
         self.stats.flushes = self.stats.flushes.saturating_add(1);
-        drained_count
+        drained.initialized().len()
     }
 
     fn push_refill(&mut self, entries: &[CacheEntry], overflow: &mut [CacheEntry]) -> usize {
@@ -1858,27 +1901,14 @@ impl Zone {
 
     fn enqueue_free(&self, entry: CacheEntry, cpu: usize, used_hint: bool) -> bool {
         let cache = &self.caches[cpu];
-        if cache.inner.lock().try_push_for_free(entry, used_hint) {
-            return true;
-        }
-        self.enqueue_free_slow(entry, cpu)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn enqueue_free_slow(&self, entry: CacheEntry, cpu: usize) -> bool {
-        let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
         let drained_count = {
             let mut cache_guard = cache.inner.lock();
-            if cache_guard.push(entry) {
-                return true;
-            }
-            cache_guard.push_for_free_slow(entry, &mut drained)
+            cache_guard.push_for_free(entry, &mut drained, used_hint)
         };
         if drained_count != 0 {
             let mut state = self.state.lock();
-            state.flush_cached_entries(&drained[..drained_count], self.size_class);
+            state.flush_cached_entries(drained.initialized(), self.size_class);
         }
         true
     }
@@ -2214,6 +2244,18 @@ impl SlabAllocator {
         self.is_initialized() && self.zone_index_for_ptr(ptr).is_some()
     }
 
+    pub(crate) fn owns_in_class(&self, zone_idx: usize, ptr: usize) -> bool {
+        if !self.is_initialized() {
+            return false;
+        }
+        let Some(zone) = self.zones.get(zone_idx) else {
+            return false;
+        };
+        self.directory
+            .lookup(ptr)
+            .is_some_and(|owner| owner.node().slab.object_size() == zone.size_class)
+    }
+
     pub fn free_ptr(&self, ptr: usize, cpu_id: usize) -> bool {
         if !self.is_initialized() {
             return false;
@@ -2544,9 +2586,11 @@ mod slab_state_tests {
     extern crate std;
 
     use alloc::boxed::Box;
+    use core::sync::atomic::Ordering;
 
     use super::{
-        CacheEntry, INVALID_SLAB_NODE, SLAB_DIRECTORY_BITS, SLAB_DIRECTORY_MASK, Slab,
+        CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, INVALID_SLAB_NODE,
+        PerCpuCacheState, SLAB_DIRECTORY_BITS, SLAB_DIRECTORY_MASK, Slab, SlabAllocator,
         SlabAuditFlags, SlabDirectoryPage, SlabNode, SlabObjectState, SlabPageDirectory, ZoneState,
         directory_page, slab_lookup_bucket,
     };
@@ -2599,6 +2643,46 @@ mod slab_state_tests {
                 core::sync::atomic::Ordering::Release,
             );
         }
+    }
+
+    fn test_cache_entry(ptr: usize) -> CacheEntry {
+        CacheEntry {
+            ptr,
+            slab_node: ptr + PAGE_SIZE,
+            cached_index: ptr as u16,
+        }
+    }
+
+    #[test]
+    fn non_full_cache_free_leaves_drain_prefix_empty() {
+        let mut cache = PerCpuCacheState::new();
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
+        let entry = test_cache_entry(1);
+
+        assert_eq!(cache.push_for_free(entry, &mut drained, false), 0);
+        assert!(drained.initialized().is_empty());
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.entries[0].ptr, entry.ptr);
+    }
+
+    #[test]
+    fn full_cache_drain_exposes_only_the_written_prefix() {
+        let mut cache = PerCpuCacheState::new();
+        for ptr in 1..=CACHE_CAPACITY {
+            assert!(cache.push(test_cache_entry(ptr)));
+        }
+        let mut drained = CacheDrainBuffer::<{ CACHE_CAPACITY + 1 }>::new();
+        let incoming = test_cache_entry(CACHE_CAPACITY + 1);
+
+        assert_eq!(
+            cache.push_for_free(incoming, &mut drained, false),
+            CACHE_CAPACITY
+        );
+        assert_eq!(drained.initialized().len(), CACHE_CAPACITY);
+        assert_eq!(drained.initialized()[0].ptr, CACHE_CAPACITY);
+        assert_eq!(drained.initialized()[CACHE_CAPACITY - 1].ptr, 1);
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.entries[0].ptr, incoming.ptr);
     }
 
     #[test]
@@ -2821,6 +2905,35 @@ mod slab_state_tests {
             state.find_allocated_node(ptr, 64, PAGE_SIZE),
             Some((node_addr, SlabObjectState::Allocated))
         );
+    }
+
+    #[test]
+    fn owns_in_class_uses_page_directory_owner() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                const BASE: usize = 0x1_0000_0000;
+                let allocator = Box::new(SlabAllocator::new(ArenaKind::Kernel));
+                assert!(allocator.directory.init((BASE, 4 * 1024 * 1024)));
+                allocator.initialized.store(true, Ordering::Release);
+
+                let mut node = test_slab_node(BASE);
+                let node_addr = (&mut *node as *mut SlabNode) as usize;
+                prepare_test_directory_page(&allocator.directory, 0);
+                assert!(
+                    allocator
+                        .directory
+                        .publish_range(BASE, PAGE_SIZE, node_addr)
+                );
+
+                let zone_idx = super::class_index_for_size(64).expect("64-byte size class");
+                assert!(allocator.owns_in_class(zone_idx, BASE));
+                assert!(!allocator.owns_in_class(zone_idx + 1, BASE));
+                assert!(!allocator.owns_in_class(super::SIZE_CLASS_COUNT, BASE));
+            })
+            .expect("创建大栈测试线程")
+            .join()
+            .expect("size-class owner 测试线程失败");
     }
 
     #[test]

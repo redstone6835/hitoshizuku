@@ -1603,6 +1603,36 @@ fn physical_api_updates_registry_audit() {
     assert!(!KERNEL_ALLOCATOR.owns_allocation(allocation.paddr));
 }
 
+/// 内核自行持有完整句柄的物理页不应进入通用逐对象注册表。
+#[ktest]
+fn untracked_physical_api_keeps_registry_unchanged() {
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+
+    let allocation = KERNEL_ALLOCATOR
+        .allocate_untracked_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
+        .expect("allocate untracked physical page");
+    let during = KERNEL_ALLOCATOR.audit();
+    assert!(during.is_consistent());
+    assert_eq!(during.registry_live_records, before.registry_live_records);
+    assert_eq!(
+        during.registry_physical_records,
+        before.registry_physical_records
+    );
+    assert!(!KERNEL_ALLOCATOR.owns_allocation(allocation.paddr));
+
+    KERNEL_ALLOCATOR
+        .try_free_untracked_physical(allocation)
+        .expect("free untracked physical page");
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(
+        after.registry_physical_records,
+        before.registry_physical_records
+    );
+}
+
 /// 非零 owner 的物理页必须进入 owner 索引，并能正常释放。
 #[ktest]
 fn physical_api_tracks_nonzero_owner_lifecycle() {

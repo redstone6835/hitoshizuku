@@ -196,21 +196,6 @@ impl VmArea {
 
 #[kernel_symbols::export]
 impl VmBacking {
-    /// 检查 backing 向后移动 `shift` 字节是否会溢出，不取得 backing 的所有权。
-    ///
-    /// VMA 集合会在插入及结构变更时频繁调用该检查。与 `checked_shift` 不同，这里
-    /// 不构造返回值，因此 file/shared-anon backing 不会产生无意义的 Arc 增减。
-    fn can_shift(&self, shift: usize) -> bool {
-        match self {
-            Self::Anon { .. } => true,
-            Self::SharedAnon { offset, .. } | Self::File { offset, .. } => u64::try_from(shift)
-                .ok()
-                .and_then(|shift| offset.checked_add(shift))
-                .is_some(),
-            Self::Direct(base) => base.checked_add(shift).is_some(),
-        }
-    }
-
     /// 建立一个具有独立合并来源的私有匿名 backing。
     #[kernel_symbols::export(name = "mm.area.VmBacking.anonymous", contract = "kernel.mm.vma-backing@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn anonymous() -> Self {
@@ -223,6 +208,21 @@ impl VmBacking {
     pub(crate) fn mark_fork_inherited(&mut self) {
         if let Self::Anon { merge_domain } = self {
             merge_domain.mark_inherited();
+        }
+    }
+
+    /// 判断向后移动 `shift` 字节是否会让 backing 地址或偏移溢出。
+    ///
+    /// 该检查不构造新 backing，因此不会为只读 VMA 校验增减文件或共享匿名对象的
+    /// 引用计数。真正需要移动 backing 的 split/clip 路径仍使用 [`Self::checked_shift`]。
+    fn can_shift(&self, shift: usize) -> bool {
+        match self {
+            Self::Anon { .. } => true,
+            Self::SharedAnon { offset, .. } | Self::File { offset, .. } => u64::try_from(shift)
+                .ok()
+                .and_then(|shift| offset.checked_add(shift))
+                .is_some(),
+            Self::Direct(base) => base.checked_add(shift).is_some(),
         }
     }
 
@@ -243,5 +243,30 @@ impl VmBacking {
             }),
             VmBacking::Direct(base) => Some(VmBacking::Direct(base.checked_add(shift)?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::{AnonMergeDomain, SharedAnonObject, VmBacking};
+
+    #[test]
+    fn backing_shift_validation_checks_offsets_without_building_a_backing() {
+        let anon = VmBacking::Anon {
+            merge_domain: AnonMergeDomain::fresh(),
+        };
+        let shared = VmBacking::SharedAnon {
+            object: Arc::new(SharedAnonObject::new()),
+            offset: u64::MAX - 1,
+        };
+        let direct = VmBacking::Direct(usize::MAX - 1);
+
+        assert!(anon.can_shift(usize::MAX));
+        assert!(shared.can_shift(1));
+        assert!(!shared.can_shift(2));
+        assert!(direct.can_shift(1));
+        assert!(!direct.can_shift(2));
     }
 }

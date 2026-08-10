@@ -18,6 +18,7 @@
 //! 检查对齐——调用方（VmSpace）在 range 送进来前做一次规整。
 
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::convert::TryFrom;
 use core::ops::Range;
 
@@ -30,6 +31,7 @@ use crate::flags::VmFlags;
 #[derive(Default)]
 pub struct VmaSet {
     areas: Vec<VmArea>,
+    last_find: Cell<Option<usize>>,
 }
 
 /// `VmaSet::find_mut` 返回的受限可变视图。
@@ -65,7 +67,10 @@ impl<'a> core::ops::Deref for VmAreaMut<'a> {
 #[kernel_symbols::export]
 impl VmaSet {
     pub const fn new() -> Self {
-        Self { areas: Vec::new() }
+        Self {
+            areas: Vec::new(),
+            last_find: Cell::new(None),
+        }
     }
 
     #[kernel_symbols::export(name = "mm.set.VmaSet.len", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
@@ -98,35 +103,15 @@ impl VmaSet {
     /// 查 `addr` 所在 VMA。
     #[kernel_symbols::export(name = "mm.set.VmaSet.find", contract = "kernel.mm.vma-set@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_MODULE_BORROW)]
     pub fn find(&self, addr: usize) -> Option<&VmArea> {
-        // 最靠后且 start <= addr 的那一条。
-        let idx = self.areas.partition_point(|a| a.range.start <= addr);
-        if idx == 0 {
-            return None;
-        }
-        let area = &self.areas[idx - 1];
-        debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
-        // partition_point 已保证 area.start <= addr；集合只允许插入合法 VMA，
-        // 热查询无需再次检查 backing 覆盖范围。
-        if addr < area.range.end {
-            Some(area)
-        } else {
-            None
-        }
+        self.find_area_index(addr).map(|idx| &self.areas[idx])
     }
 
     /// 同上的受限可变版。只允许改 flags，不允许改 range/backing。
     pub fn find_mut(&mut self, addr: usize) -> Option<VmAreaMut<'_>> {
-        let idx = self.areas.partition_point(|a| a.range.start <= addr);
-        if idx == 0 {
-            return None;
-        }
-        let area = &mut self.areas[idx - 1];
-        debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
-        if addr < area.range.end {
-            Some(VmAreaMut { area })
-        } else {
-            None
-        }
+        let idx = self.find_area_index(addr)?;
+        Some(VmAreaMut {
+            area: &mut self.areas[idx],
+        })
     }
 
     /// 若 `page` 落在某个 `GROWS_DOWN` 匿名 VMA 的下方且仍在允许增长窗口内，
@@ -441,17 +426,49 @@ impl VmaSet {
         }
         Self {
             areas: self.areas.clone(),
+            last_find: Cell::new(None),
         }
     }
 
     /// 摘出全部 VMA，供地址空间销毁路径先结束 backing 生命周期再回收页缓存。
     pub fn take_all(&mut self) -> Vec<VmArea> {
+        self.last_find.set(None);
         core::mem::take(&mut self.areas)
     }
 
     /// 只读迭代全部 VMA，按起址升序。
     pub fn iter(&self) -> impl Iterator<Item = &VmArea> + '_ {
         self.areas.iter()
+    }
+
+    /// 返回 `addr` 所在 VMA 的下标。连续访问同一 VMA 时直接命中；结构变化
+    /// 导致缓存下标失效时，范围校验会令查询自动退回二分查找。
+    fn find_area_index(&self, addr: usize) -> Option<usize> {
+        if let Some(idx) = self.last_find.get()
+            && let Some(area) = self.areas.get(idx)
+        {
+            debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
+            if area.contains(addr) {
+                return Some(idx);
+            }
+        }
+
+        // 最靠后且 start <= addr 的那一条。
+        let next = self.areas.partition_point(|area| area.range.start <= addr);
+        let found = next.checked_sub(1).filter(|&idx| {
+            let area = &self.areas[idx];
+            debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
+            // partition_point 已保证 start <= addr；集合只允许插入合法 VMA，
+            // 热查询无需再次检查 backing 覆盖范围。
+            addr < area.range.end
+        });
+        self.last_find.set(found);
+        found
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_find_index(&self) -> Option<usize> {
+        self.last_find.get()
     }
 
     /// 只检查目标区间的即时前驱与首个区间内起点，避免线性扫描。
