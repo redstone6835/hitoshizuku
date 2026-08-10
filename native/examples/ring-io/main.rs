@@ -193,9 +193,10 @@ pub extern "C" fn main() -> i32 {
     {
         return 31;
     }
-    if address_space.unmap(file_mapping).is_err() || file_memory.revoke().is_err() {
+    if address_space.unmap(file_mapping).is_err() {
         return 32;
     }
+    drop(file_memory);
 
     drop((sender, receiver));
     if ring.unregister(registration).is_err() {

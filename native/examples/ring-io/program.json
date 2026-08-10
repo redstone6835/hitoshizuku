@@ -12,6 +12,7 @@
     { "operation": "memory.query", "required": true },
     { "operation": "memory.statistics", "required": true },
     { "operation": "memory.revoke", "required": true },
+    { "operation": "directory.open", "required": true },
     { "operation": "directory.create", "required": true },
     { "operation": "directory.remove", "required": true },
     { "operation": "file.read", "required": true },
