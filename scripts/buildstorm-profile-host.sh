@@ -120,8 +120,12 @@ esac
 
 warmup_ms=${PROFILE_WARMUP_MS:-0}
 stage_timeout_ms=${PROFILE_STAGE_TIMEOUT_MS:-0}
+prebuild_timeout_ms=${PROFILE_PREBUILD_TIMEOUT_MS:-0}
+skip_prebuild=${PROFILE_SKIP_PREBUILD:-0}
+xtask_bin=${PROFILE_XTASK_BIN:-/work/tgoskits/target/debug/tg-xtask}
 boot_timeout_ms=${PROFILE_BOOT_TIMEOUT_MS:-0}
 done_timeout_requested_ms=${PROFILE_DONE_TIMEOUT_MS:-0}
+qemu_exit_timeout_ms=${PROFILE_QEMU_EXIT_TIMEOUT_MS:-300000}
 capture_start_timeout_ms=${PROFILE_CAPTURE_START_TIMEOUT_MS:-0}
 controller_timeout_ms=${PROFILE_CONTROLLER_TIMEOUT_MS:-0}
 sample_ms=${PROFILE_HOST_SAMPLE_MS:-1000}
@@ -191,8 +195,10 @@ esac
 for pair in \
     "PROFILE_WARMUP_MS:$warmup_ms" \
     "PROFILE_STAGE_TIMEOUT_MS:$stage_timeout_ms" \
+    "PROFILE_PREBUILD_TIMEOUT_MS:$prebuild_timeout_ms" \
     "PROFILE_BOOT_TIMEOUT_MS:$boot_timeout_ms" \
     "PROFILE_DONE_TIMEOUT_MS:$done_timeout_requested_ms" \
+    "PROFILE_QEMU_EXIT_TIMEOUT_MS:$qemu_exit_timeout_ms" \
     "PROFILE_CAPTURE_START_TIMEOUT_MS:$capture_start_timeout_ms" \
     "PROFILE_CONTROLLER_TIMEOUT_MS:$controller_timeout_ms" \
     "PROFILE_HOST_SAMPLE_MS:$sample_ms" \
@@ -206,6 +212,19 @@ done_timeout_ms=$done_timeout_requested_ms
 [ "$done_timeout_ms" -ne 0 ] || done_timeout_ms=300000
 [ "$sample_ms" -gt 0 ] || { echo "PROFILE_HOST_SAMPLE_MS must be positive" >&2; exit 2; }
 [ "$poll_ms" -gt 0 ] || { echo "PROFILE_POLL_MS must be positive" >&2; exit 2; }
+case "$skip_prebuild" in
+    0|1) ;;
+    *) echo "PROFILE_SKIP_PREBUILD must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$xtask_bin" in
+    /*) ;;
+    *) echo "PROFILE_XTASK_BIN must be an absolute path" >&2; exit 2 ;;
+esac
+printf '%s\n' "$xtask_bin" | LC_ALL=C awk '
+    NR == 1 && /^[A-Za-z0-9_.\/-]+$/ { ok = 1 }
+    NR != 1 { bad = 1 }
+    END { exit !(ok && !bad) }
+' || { echo "PROFILE_XTASK_BIN contains unsupported characters" >&2; exit 2; }
 case "$cpuset" in *[!0-9,-]*) echo "PROFILE_CPUSET has invalid syntax" >&2; exit 2 ;; esac
 case "$smp" in ''|*[!0-9]*) echo "PROFILE_SMP must be a positive integer" >&2; exit 2 ;; esac
 [ "$smp" -gt 0 ] || { echo "PROFILE_SMP must be a positive integer" >&2; exit 2; }
@@ -262,6 +281,17 @@ observer_histogram=${PROFILE_HISTOGRAM:-0}
 observer_proc_ms=${PROFILE_OBSERVER_PROC_MS:-1000}
 observer_require_valid=${PROFILE_OBSERVER_REQUIRE_VALID:-1}
 observer_require_manifest=${PROFILE_REQUIRE_SYMBOL_MANIFEST:-1}
+instruction_profile=${PROFILE_RISCV_INSTRUCTION_PROFILE:-0}
+instruction_mix_plugin=${PROFILE_RISCV_INSTRUCTION_MIX_PLUGIN:-"$repo/build/qemu-plugins/riscv_instruction_mix.so"}
+instruction_mix_epoch_ms=${PROFILE_RISCV_INSTRUCTION_EPOCH_MS:-1000}
+instruction_transition_timeout_ms=${PROFILE_RISCV_INSTRUCTION_TRANSITION_TIMEOUT_MS:-$((instruction_mix_epoch_ms * 3 + 1000))}
+tcg_time_collector=${PROFILE_RISCV_TCG_TIME_COLLECTOR:-"$repo/build/tools/rv_tcg_time_collect"}
+tcg_time_period_ns=${PROFILE_RISCV_TCG_TIME_PERIOD_NS:-2000000}
+tcg_time_collector_stop_timeout_ms=${PROFILE_RISCV_TCG_TIME_COLLECTOR_STOP_TIMEOUT_MS:-10000}
+instruction_min_jit_sample_mapping_ppm=${PROFILE_RISCV_MIN_JIT_SAMPLE_MAPPING_PPM:-100000}
+instruction_min_jit_catalog_mapping_ppm=${PROFILE_RISCV_MIN_JIT_CATALOG_MAPPING_PPM:-1000000}
+instruction_min_catalog_jit_coverage_ppm=${PROFILE_RISCV_MIN_CATALOG_JIT_COVERAGE_PPM:-999000}
+instruction_copy_qemu_executable=${PROFILE_RISCV_COPY_QEMU_EXECUTABLE:-0}
 sampling=${PROFILE_SAMPLING:-0}
 trace_enabled=${PROFILE_TRACE_ENABLED:-0}
 timing_shift=${PROFILE_TIMING_SHIFT:-8}
@@ -292,6 +322,11 @@ tools_device=$tools_device
 target_fs=$target_fs
 histogram_enabled=$observer_histogram
 done_timeout_ms=$done_timeout_ms
+prebuild_timeout_ms=$prebuild_timeout_ms
+skip_prebuild=$skip_prebuild
+xtask_bin=$xtask_bin
+qemu_exit_timeout_ms=$qemu_exit_timeout_ms
+riscv_instruction_profile=$instruction_profile
 EOF
     exit 0
 fi
@@ -312,6 +347,43 @@ case "$observer_require_manifest" in
     0|1) ;;
     *) echo "PROFILE_REQUIRE_SYMBOL_MANIFEST must be 0 or 1" >&2; exit 2 ;;
 esac
+case "$instruction_profile" in
+    0|1) ;;
+    *) echo "PROFILE_RISCV_INSTRUCTION_PROFILE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$instruction_copy_qemu_executable" in
+    0|1) ;;
+    *) echo "PROFILE_RISCV_COPY_QEMU_EXECUTABLE must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "$instruction_profile" -eq 1 ] && [ "$arch" != riscv64 ]; then
+    echo "PROFILE_RISCV_INSTRUCTION_PROFILE requires PROFILE_ARCH=riscv64" >&2
+    exit 2
+fi
+for pair in \
+    "PROFILE_RISCV_INSTRUCTION_EPOCH_MS:$instruction_mix_epoch_ms" \
+    "PROFILE_RISCV_INSTRUCTION_TRANSITION_TIMEOUT_MS:$instruction_transition_timeout_ms" \
+    "PROFILE_RISCV_TCG_TIME_PERIOD_NS:$tcg_time_period_ns" \
+    "PROFILE_RISCV_TCG_TIME_COLLECTOR_STOP_TIMEOUT_MS:$tcg_time_collector_stop_timeout_ms"
+do
+    name=${pair%%:*}
+    value=${pair#*:}
+    case "$value" in ''|*[!0-9]*) echo "$name must be a positive integer" >&2; exit 2 ;; esac
+    [ "$value" -gt 0 ] || { echo "$name must be a positive integer" >&2; exit 2; }
+done
+[ "$tcg_time_collector_stop_timeout_ms" -ge 100 ] || {
+    echo "PROFILE_RISCV_TCG_TIME_COLLECTOR_STOP_TIMEOUT_MS must be at least 100" >&2
+    exit 2
+}
+for pair in \
+    "PROFILE_RISCV_MIN_JIT_SAMPLE_MAPPING_PPM:$instruction_min_jit_sample_mapping_ppm" \
+    "PROFILE_RISCV_MIN_JIT_CATALOG_MAPPING_PPM:$instruction_min_jit_catalog_mapping_ppm" \
+    "PROFILE_RISCV_MIN_CATALOG_JIT_COVERAGE_PPM:$instruction_min_catalog_jit_coverage_ppm"
+do
+    name=${pair%%:*}
+    value=${pair#*:}
+    case "$value" in ''|*[!0-9]*) echo "$name must be an integer from 0 to 1000000" >&2; exit 2 ;; esac
+    [ "$value" -le 1000000 ] || { echo "$name must be an integer from 0 to 1000000" >&2; exit 2; }
+done
 case "$observer_system" in
     ''|*[!A-Za-z0-9_.-]*) echo "PROFILE_SYSTEM has invalid syntax" >&2; exit 2 ;;
 esac
@@ -366,7 +438,29 @@ if [ "$observer_enabled" -eq 1 ]; then
         }
     fi
 fi
-for command in docker id ln mkfs.ext4 socat timeout python3 sha256sum setsid; do
+if [ "$instruction_profile" -eq 1 ]; then
+    test -r "$instruction_mix_plugin" || {
+        echo "profile host: missing RISC-V instruction mix plugin: $instruction_mix_plugin" >&2
+        exit 1
+    }
+    test -x "$tcg_time_collector" || {
+        echo "profile host: missing RISC-V TCG time collector: $tcg_time_collector" >&2
+        exit 1
+    }
+    test -r "$repo/scripts/validate-riscv-instruction-profile.py" || {
+        echo "profile host: missing RISC-V instruction profile validator" >&2
+        exit 1
+    }
+    test -r "$repo/scripts/rv_instruction_profile_io.py" || {
+        echo "profile host: missing RISC-V instruction profile I/O parser" >&2
+        exit 1
+    }
+    command -v readelf >/dev/null 2>&1 || {
+        echo "profile host: readelf is required for a RISC-V instruction profile" >&2
+        exit 1
+    }
+fi
+for command in docker id ln mkfs.ext4 socat timeout python3 sha256sum setsid dd readlink; do
     command -v "$command" >/dev/null 2>&1 || { echo "profile host: $command is required" >&2; exit 1; }
 done
 
@@ -396,10 +490,13 @@ workload_log_line=
 workload_log_offset=
 logger_pid=
 qemu_pid=
+qemu_start_ticks=
 observer_pid=
+tcg_time_collector_pid=
 runtime_socket_dir=
 runtime_socket_root=$run_dir
 observer_quality_valid=1
+instruction_quality_valid=1
 normal_exit=0
 
 runtime_socket_dir=$(mktemp -d /tmp/mygo-qemu-runtime.XXXXXX)
@@ -418,7 +515,242 @@ host_process_group_alive() {
     ' /proc/[0-9]*/stat 2>/dev/null
 }
 
+host_process_alive() {
+    [ -r "/proc/$1/stat" ] || return 1
+    LC_ALL=C awk '
+        {
+            line = $0
+            sub(/^[0-9]+ \(.*\) /, "", line)
+            split(line, field, " ")
+            if (field[1] != "Z") found = 1
+        }
+        END { exit !found }
+    ' "/proc/$1/stat" 2>/dev/null
+}
+
+host_process_start_ticks() {
+    [ -r "/proc/$1/stat" ] || return 1
+    LC_ALL=C awk '
+        {
+            line = $0
+            sub(/^[0-9]+ \(.*\) /, "", line)
+            split(line, field, " ")
+            if (field[1] != "Z" && field[20] ~ /^[0-9]+$/) print field[20]
+        }
+    ' "/proc/$1/stat" 2>/dev/null
+}
+
+qemu_process_alive() {
+    [ -n "${qemu_pid:-}" ] && [ -n "${qemu_start_ticks:-}" ] || return 1
+    host_process_alive "$qemu_pid" || return 1
+    current_qemu_start_ticks=$(host_process_start_ticks "$qemu_pid") || return 1
+    [ "$current_qemu_start_ticks" = "$qemu_start_ticks" ]
+}
+
+report_qemu_exit() {
+    qemu_failure_phase=$1
+    printf '%s\n' "$qemu_failure_phase" >"$run_dir/qemu-failure-phase.txt"
+    echo "profile host: QEMU exited while waiting for $qemu_failure_phase" >&2
+    echo "profile host: --- profile.serial.log tail (last 200 lines) ---" >&2
+    if [ -r "$run_dir/profile.serial.log" ]; then
+        tail -n 200 "$run_dir/profile.serial.log" \
+            >"$run_dir/qemu-failure-serial-tail.log" 2>/dev/null || true
+        cat "$run_dir/qemu-failure-serial-tail.log" >&2 || true
+    else
+        : >"$run_dir/qemu-failure-serial-tail.log"
+        echo "profile host: profile.serial.log is not available" >&2
+    fi
+    echo "profile host: --- docker logs (last 200 lines) ---" >&2
+    if timeout 5 docker logs --tail 200 "$container" \
+        >"$run_dir/qemu-failure-docker.log" 2>&1; then
+        cat "$run_dir/qemu-failure-docker.log" >&2
+    else
+        cat "$run_dir/qemu-failure-docker.log" >&2 || true
+        echo "profile host: docker logs are not available" >&2
+    fi
+    timeout 5 docker inspect "$container" \
+        >"$run_dir/qemu-failure-container-inspect.json" 2>&1 || true
+}
+
+qemu_fail_fast() {
+    qemu_failure_phase=$1
+    [ -n "${qemu_pid:-}" ] || return 0
+    qemu_process_alive && return 0
+    report_qemu_exit "$qemu_failure_phase"
+    exit 1
+}
+
+stop_tcg_time_collector() {
+    collector_require_success=$1
+    [ -n "$tcg_time_collector_pid" ] || return 0
+    collector_stop_pid=$tcg_time_collector_pid
+    collector_stop_escalated=0
+    kill -TERM "$collector_stop_pid" >/dev/null 2>&1 || true
+    collector_stop_deadline=$(deadline_after_ms "$tcg_time_collector_stop_timeout_ms")
+    while host_process_alive "$collector_stop_pid" && ! deadline_expired "$collector_stop_deadline"; do
+        sleep_ms 20
+    done
+    if host_process_alive "$collector_stop_pid"; then
+        collector_stop_escalated=1
+        kill -KILL "$collector_stop_pid" >/dev/null 2>&1 || true
+        collector_kill_deadline=$(deadline_after_ms 1000)
+        while host_process_alive "$collector_stop_pid" && ! deadline_expired "$collector_kill_deadline"; do
+            sleep_ms 20
+        done
+    fi
+    tcg_time_collector_pid=
+    if host_process_alive "$collector_stop_pid"; then
+        echo "profile host: RISC-V TCG time collector remained alive after SIGKILL" >&2
+        return 1
+    fi
+    if wait "$collector_stop_pid" 2>/dev/null; then
+        collector_stop_status=0
+    else
+        collector_stop_status=$?
+    fi
+    if [ "$collector_require_success" -eq 1 ] && \
+        { [ "$collector_stop_escalated" -ne 0 ] || [ "$collector_stop_status" -ne 0 ]; }; then
+        echo "profile host: RISC-V TCG time collector failed during shutdown (status=$collector_stop_status escalated=$collector_stop_escalated)" >&2
+        return 1
+    fi
+    return 0
+}
+
+snapshot_tid_namespace_map() {
+    tid_snapshot_phase=$1
+    [ "$instruction_profile" -eq 1 ] || return 0
+    [ -n "$qemu_pid" ] || {
+        echo "profile host: cannot snapshot QEMU TIDs without a host PID" >&2
+        return 1
+    }
+    tid_snapshot_stamp=$(monotonic_ns)
+    python3 - "$qemu_pid" "$run_dir/tid-namespace-map.tsv" \
+        "$run_dir/tid-namespace-map-snapshots.tsv" "$tid_snapshot_stamp" \
+        "$tid_snapshot_phase" "$smp" <<'PY'
+import pathlib
+import re
+import sys
+
+pid = int(sys.argv[1])
+mapping_path = pathlib.Path(sys.argv[2])
+snapshots_path = pathlib.Path(sys.argv[3])
+stamp = int(sys.argv[4])
+phase = sys.argv[5]
+expected_vcpus = int(sys.argv[6])
+task_root = pathlib.Path("/proc") / str(pid) / "task"
+rows = []
+vcpu_indices = set()
+for status_path in sorted(task_root.glob("[0-9]*/status"), key=lambda path: int(path.parent.name)):
+    try:
+        fields = {}
+        for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                fields[key] = value.strip()
+    except FileNotFoundError:
+        continue
+    host_tid = int(status_path.parent.name)
+    chain = [int(value) for value in fields.get("NSpid", "").split()]
+    if not chain or chain[0] != host_tid:
+        raise SystemExit(f"profile host: missing/inconsistent NSpid for host TID {host_tid}")
+    container_tid = chain[-1]
+    comm = fields.get("Name", "")
+    if not comm or "\t" in comm or "\n" in comm:
+        raise SystemExit(f"profile host: invalid comm for host TID {host_tid}")
+    match = re.fullmatch(r"CPU ([0-9]+)/TCG", comm)
+    if match:
+        vcpu_indices.add(int(match.group(1)))
+    rows.append((host_tid, container_tid, ",".join(map(str, chain)), comm))
+if not rows:
+    raise SystemExit("profile host: QEMU TID namespace snapshot is empty")
+if vcpu_indices != set(range(expected_vcpus)):
+    raise SystemExit(
+        f"profile host: QEMU vCPU threads are not ready: {sorted(vcpu_indices)}"
+    )
+
+existing_host = {}
+existing_container = {}
+with mapping_path.open("r", encoding="utf-8") as source:
+    header = source.readline().rstrip("\r\n")
+    if header != "monotonic_ns\thost_tid\tcontainer_tid\tnspid_chain\tcomm":
+        raise SystemExit("profile host: invalid cumulative TID namespace map header")
+    for raw in source:
+        fields = raw.rstrip("\r\n").split("\t", 4)
+        if len(fields) != 5:
+            raise SystemExit("profile host: malformed cumulative TID namespace map")
+        old_host = int(fields[1])
+        old_container = int(fields[2])
+        if old_host in existing_host or old_container in existing_container:
+            raise SystemExit("profile host: duplicate cumulative TID namespace identity")
+        existing_host[old_host] = old_container
+        existing_container[old_container] = old_host
+
+new_rows = []
+for host_tid, container_tid, chain, comm in rows:
+    if host_tid in existing_host:
+        if existing_host[host_tid] != container_tid:
+            raise SystemExit(f"profile host: host TID {host_tid} changed namespace identity")
+        continue
+    if container_tid in existing_container:
+        raise SystemExit(f"profile host: container TID {container_tid} was reused")
+    existing_host[host_tid] = container_tid
+    existing_container[container_tid] = host_tid
+    new_rows.append((host_tid, container_tid, chain, comm))
+
+with mapping_path.open("a", encoding="utf-8") as output:
+    for host_tid, container_tid, chain, comm in new_rows:
+        output.write(f"{stamp}\t{host_tid}\t{container_tid}\t{chain}\t{comm}\n")
+phase_path = mapping_path.with_name(f"tid-namespace-map-{phase}.tsv")
+with phase_path.open("w", encoding="utf-8") as output:
+    output.write("monotonic_ns\thost_tid\tcontainer_tid\tnspid_chain\tcomm\n")
+    for host_tid, container_tid, chain, comm in rows:
+        output.write(f"{stamp}\t{host_tid}\t{container_tid}\t{chain}\t{comm}\n")
+with snapshots_path.open("a", encoding="utf-8") as output:
+    output.write(
+        f"{stamp}\t{phase}\t{len(rows)}\t{len(vcpu_indices)}\t{len(new_rows)}\n"
+    )
+PY
+}
+
+snapshot_qemu_host_state() {
+    qemu_snapshot_phase=$1
+    [ "$instruction_profile" -eq 1 ] || return 0
+    [ -n "$qemu_pid" ] && [ -r "/proc/$qemu_pid/maps" ] || {
+        echo "profile host: QEMU host mappings are unavailable" >&2
+        return 1
+    }
+    cp "/proc/$qemu_pid/maps" "$run_dir/qemu-host-maps-$qemu_snapshot_phase.txt"
+    if [ "$qemu_snapshot_phase" = setup ]; then
+        qemu_host_exe_link=$(readlink "/proc/$qemu_pid/exe")
+        qemu_host_exe_sha256=$(sha256sum "/proc/$qemu_pid/exe" | awk '{print $1}')
+        qemu_host_exe_build_id=$(readelf -n "/proc/$qemu_pid/exe" 2>/dev/null |
+            awk '/Build ID:/ { print $3; exit }')
+        case "$qemu_host_exe_sha256:$qemu_host_exe_build_id" in
+            *[!0-9a-f:]*|:*|*:) echo "profile host: cannot identify the QEMU host executable" >&2; return 1 ;;
+        esac
+        {
+            printf 'host_pid=%s\n' "$qemu_pid"
+            printf 'exe=%s\n' "$qemu_host_exe_link"
+            printf 'sha256=%s\n' "$qemu_host_exe_sha256"
+            printf 'build_id=%s\n' "$qemu_host_exe_build_id"
+        } >"$run_dir/qemu-host-executable.env"
+        if [ "$instruction_copy_qemu_executable" -eq 1 ]; then
+            cp "/proc/$qemu_pid/exe" "$run_dir/qemu-host-executable"
+            [ "$(sha256sum "$run_dir/qemu-host-executable" | awk '{print $1}')" = \
+                "$qemu_host_exe_sha256" ] || {
+                echo "profile host: copied QEMU executable identity changed" >&2
+                return 1
+            }
+        fi
+    fi
+}
+
 cleanup() {
+    if [ "$instruction_profile" -eq 1 ] && [ -e "$run_dir/instruction-profile.control" ]; then
+        printf '0' | dd of="$run_dir/instruction-profile.control" bs=1 count=1 conv=notrunc status=none \
+            >/dev/null 2>&1 || true
+    fi
+    stop_tcg_time_collector 0 || true
     if [ -n "$observer_pid" ]; then
         if [ -S "$runtime_socket_root/qemu-observer-control.sock" ]; then
             timeout 10 python3 "$repo/scripts/qemu_profile_daemon.py" ctl \
@@ -537,6 +869,7 @@ wait_for_fixed() {
     timeout_ms=$2
     deadline=$(deadline_after_ms "$timeout_ms")
     while ! grep -Fq "$needle" "$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast "serial marker: $needle"
         deadline_expired "$deadline" && return 1
         sleep_ms 20
     done
@@ -549,6 +882,7 @@ wait_for_ordered() {
     ordered_deadline=$(deadline_after_ms "$ordered_timeout_ms")
     while ! serial_has_ordered "$ordered_first" "$ordered_second" \
         <"$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast "ordered serial markers: $ordered_first -> $ordered_second"
         deadline_expired "$ordered_deadline" && return 1
         sleep_ms 20
     done
@@ -640,6 +974,59 @@ printf 'milestone\tmonotonic_ns\n' >"$run_dir/progress.tsv"
 printf 'monotonic_ns\tphase\tprogress\tqemu_utime_ticks\tqemu_stime_ticks\tload1\tload5\tload15\trunnable_total\tlast_pid\tcpu_some_avg10\tcpu_some_total\tio_some_avg10\tio_some_total\tio_full_avg10\tio_full_total\tmemory_some_avg10\tmemory_some_total\tmemory_full_avg10\tmemory_full_total\n' >"$run_dir/host-samples.tsv"
 printf 'monotonic_ns\tphase\tqemu_utime_ticks\tqemu_stime_ticks\n' >"$run_dir/qemu-cpu-boundaries.tsv"
 
+set_instruction_profile_control() {
+    profile_control_value=$1
+    profile_control_phase=$2
+    [ "$instruction_profile" -eq 1 ] || return 0
+    profile_control_stamp=$(monotonic_ns)
+    printf '%s' "$profile_control_value" | dd \
+        of="$run_dir/instruction-profile.control" bs=1 count=1 conv=notrunc status=none
+    printf '%s\t%s\t%s\n' "$profile_control_stamp" "$profile_control_phase" \
+        "$profile_control_value" >>"$run_dir/instruction-profile-control.tsv"
+}
+
+wait_for_instruction_profile_event() {
+    instruction_event_type=$1
+    instruction_event_deadline=$(deadline_after_ms "$instruction_transition_timeout_ms")
+    while ! grep -Fq "\"type\":\"$instruction_event_type\"" \
+        "$run_dir/instruction-mix.jsonl" 2>/dev/null; do
+        qemu_fail_fast "instruction profile $instruction_event_type"
+        deadline_expired "$instruction_event_deadline" && {
+            echo "profile host: instruction profile $instruction_event_type detection timed out" >&2
+            return 1
+        }
+        sleep_ms 20
+    done
+    python3 - "$run_dir/instruction-mix.jsonl" "$instruction_event_type" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+event_type = sys.argv[2]
+matches = []
+for line in path.read_text(encoding="utf-8").splitlines():
+    if f'"type":"{event_type}"' not in line:
+        continue
+    record = json.loads(line)
+    if record.get("type") == event_type:
+        matches.append(record)
+if len(matches) != 1 or not isinstance(matches[0].get("monotonic_ns"), int):
+    raise SystemExit(f"profile host: malformed/duplicate instruction profile {event_type}")
+print(matches[0]["monotonic_ns"])
+PY
+}
+
+record_instruction_profile_detection() {
+    instruction_detection_phase=$1
+    instruction_detection_request=$2
+    instruction_detection_timestamp=$3
+    instruction_detection_observed=$(monotonic_ns)
+    printf '%s\t%s\t%s\t%s\n' "$instruction_detection_phase" \
+        "$instruction_detection_request" "$instruction_detection_timestamp" \
+        "$instruction_detection_observed" >>"$run_dir/instruction-profile-detection.tsv"
+}
+
 cp "$kernel" "$run_dir/$kernel_name"
 kernel_id=$(sha256sum "$run_dir/$kernel_name" | awk '{print $1}')
 if [ -r "$linux_initramfs" ]; then
@@ -657,7 +1044,9 @@ fi
 base_id=$(sha256sum "$base" | awk '{print $1}')
 cp "$repo/scripts/profile-capture.sh" "$stage/profile-capture.sh"
 cp "$repo/scripts/buildstorm-profile-guest.sh" "$stage/run.sh"
-PROFILE_ARCH=$arch PROFILE_TARGET_FS=$target_fs "$stage/run.sh" plan \
+PROFILE_ARCH=$arch PROFILE_TARGET_FS=$target_fs \
+    PROFILE_SKIP_PREBUILD=$skip_prebuild PROFILE_XTASK_BIN=$xtask_bin \
+    "$stage/run.sh" plan \
     >"$run_dir/workload-plan.txt"
 cat >>"$run_dir/workload-plan.txt" <<EOF
 cwd=/work/tgoskits
@@ -692,11 +1081,31 @@ else
     manifest_target=unavailable
     manifest_id=unavailable
 fi
+if [ "$instruction_profile" -eq 1 ]; then
+    cp "$instruction_mix_plugin" "$run_dir/riscv-instruction-mix.so"
+    cp "$tcg_time_collector" "$run_dir/rv-tcg-time-collect"
+    chmod 0755 "$run_dir/rv-tcg-time-collect"
+    instruction_mix_id=$(sha256sum "$run_dir/riscv-instruction-mix.so" | awk '{print $1}')
+    tcg_time_collector_id=$(sha256sum "$run_dir/rv-tcg-time-collect" | awk '{print $1}')
+    printf '0' >"$run_dir/instruction-profile.control"
+    printf 'monotonic_ns\tphase\tvalue\n' >"$run_dir/instruction-profile-control.tsv"
+    printf 'phase\trequest_monotonic_ns\tdetected_monotonic_ns\tobserved_monotonic_ns\n' \
+        >"$run_dir/instruction-profile-detection.tsv"
+    printf 'monotonic_ns\thost_tid\tcontainer_tid\tnspid_chain\tcomm\n' \
+        >"$run_dir/tid-namespace-map.tsv"
+    printf 'monotonic_ns\tphase\tthread_count\tvcpu_count\tnew_tid_count\n' \
+        >"$run_dir/tid-namespace-map-snapshots.tsv"
+else
+    instruction_mix_id=unavailable
+    tcg_time_collector_id=unavailable
+fi
 {
     printf 'export PROFILE_BOOT_MODE=%s\n' "$boot_mode"
     printf 'export PROFILE_ARCH=%s\n' "$arch"
     printf 'export PROFILE_TARGET_FS=%s\n' "$target_fs"
     printf 'export PROFILE_CAPTURE=%s\n' "$capture"
+    printf 'export PROFILE_SKIP_PREBUILD=%s\n' "$skip_prebuild"
+    printf 'export PROFILE_XTASK_BIN=%s\n' "$xtask_bin"
     printf 'export PROFILE_EVENT_MASK=%s\n' "$event_mask"
     printf 'export PROFILE_EVENT_MASK_HIGH=%s\n' "$event_mask_high"
     printf 'export PROFILE_SAMPLING=%s\n' "$sampling"
@@ -736,8 +1145,9 @@ clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
     printf 'kernel_sha256=%s\nbase_sha256=%s\n' "$kernel_id" "$base_id"
     printf 'arch=%s\nqemu_binary=%s\nqemu_version=%s\ncontainer_image=%s\ncpuset=%s\n' \
         "$arch" "$qemu_binary" "$qemu_version" "$container_image" "$cpuset"
-    printf 'duration_ms=%s\nwarmup_ms=%s\nstage_anchor=%s\ndone_timeout_ms=%s\n' \
-        "$duration_ms" "$warmup_ms" "$anchor" "$done_timeout_ms"
+    printf 'duration_ms=%s\nwarmup_ms=%s\nstage_anchor=%s\nprebuild_timeout_ms=%s\nskip_prebuild=%s\nxtask_bin=%s\ndone_timeout_ms=%s\nqemu_exit_timeout_ms=%s\n' \
+        "$duration_ms" "$warmup_ms" "$anchor" "$prebuild_timeout_ms" "$skip_prebuild" \
+        "$xtask_bin" "$done_timeout_ms" "$qemu_exit_timeout_ms"
     printf 'capture_enabled=%s\n' "$capture"
     printf 'event_mask=%s\nevent_mask_high=%s\nsampling_enabled=%s\ntrace_enabled=%s\ntiming_shift=%s\ntiming_sampler=%s\n' \
         "$event_mask" "$event_mask_high" "$sampling" "$trace_enabled" "$timing_shift" "$timing_sampler"
@@ -761,6 +1171,16 @@ clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
     printf 'container_user=%s:%s\n' "$container_uid" "$container_gid"
     printf 'symbol_manifest_required=%s\nsymbol_manifest_target=%s\nsymbol_manifest_sha256=%s\n' \
         "$observer_require_manifest" "$manifest_target" "$manifest_id"
+    printf 'riscv_instruction_profile=%s\ninstruction_mix_sha256=%s\ninstruction_epoch_ms=%s\n' \
+        "$instruction_profile" "$instruction_mix_id" "$instruction_mix_epoch_ms"
+    printf 'instruction_transition_timeout_ms=%s\n' "$instruction_transition_timeout_ms"
+    printf 'tcg_time_collector_sha256=%s\ntcg_time_period_ns=%s\n' \
+        "$tcg_time_collector_id" "$tcg_time_period_ns"
+    printf 'tcg_time_collector_stop_timeout_ms=%s\n' "$tcg_time_collector_stop_timeout_ms"
+    printf 'instruction_min_jit_sample_mapping_ppm=%s\ninstruction_min_jit_catalog_mapping_ppm=%s\ninstruction_min_catalog_jit_coverage_ppm=%s\n' \
+        "$instruction_min_jit_sample_mapping_ppm" "$instruction_min_jit_catalog_mapping_ppm" \
+        "$instruction_min_catalog_jit_coverage_ppm"
+    printf 'instruction_copy_qemu_executable=%s\n' "$instruction_copy_qemu_executable"
 } >"$run_dir/metadata.env"
 
 base_dir=$(dirname "$base")
@@ -776,6 +1196,9 @@ mkfifo "$run_dir/serial.in"
 set -- docker run -d --name "$container"
 [ "$container_user_flag" -eq 0 ] || set -- "$@" --user "$container_uid:$container_gid"
 [ -z "$cpuset" ] || set -- "$@" --cpuset-cpus "$cpuset"
+if [ "$instruction_profile" -eq 1 ]; then
+    set -- "$@" -e JITDUMPDIR=/run -w /run
+fi
 set -- "$@" -v "$run_dir":/run -v "$base_dir":/base:ro "$container_image" \
     "$qemu_binary" \
     -machine virt -accel tcg,thread=multi -m "$memory" -smp "$smp" \
@@ -803,10 +1226,42 @@ if [ "$observer_enabled" -eq 1 ]; then
     set -- "$@" -plugin \
         "/run/qemu-observer-plugin.so,socket=/run/qemu-observer.sock,period=$observer_period,stack-bytes=$observer_stack_bytes,summary=/run/qemu-observer-plugin-summary.json${_histogram_plugin_arg}"
 fi
+if [ "$instruction_profile" -eq 1 ]; then
+    set -- "$@" -jitdump -plugin \
+        "/run/riscv-instruction-mix.so,output=/run/instruction-mix.jsonl,catalog=/run/instruction-catalog.jsonl,control=/run/instruction-profile.control,epoch-ms=$instruction_mix_epoch_ms"
+fi
 timeout 30 "$@" >/dev/null
+
+qemu_identity_deadline=$(deadline_after_ms "$controller_timeout_ms")
+while :; do
+    qemu_pid=$(timeout 5 docker top "$container" -eo pid,comm,args 2>/dev/null | \
+        awk -v qemu="$qemu_binary" 'NR > 1 && $2 != "tini" && index($0, qemu) { print $1; exit }')
+    case "$qemu_pid" in
+        ''|*[!0-9]*) qemu_pid= ;;
+        *)
+            qemu_start_ticks=$(host_process_start_ticks "$qemu_pid" || true)
+            case "$qemu_start_ticks" in
+                ''|*[!0-9]*) qemu_start_ticks= ;;
+                *) break ;;
+            esac
+            ;;
+    esac
+    container_running=$(timeout 5 docker inspect --format '{{.State.Running}}' \
+        "$container" 2>/dev/null || true)
+    if [ "$container_running" != true ]; then
+        report_qemu_exit qemu-process-identity
+        exit 1
+    fi
+    deadline_expired "$qemu_identity_deadline" && {
+        echo "profile host: unable to resolve QEMU host PID" >&2
+        exit 1
+    }
+    sleep_ms 20
+done
 
 socket_deadline=$(deadline_after_ms "$controller_timeout_ms")
 while [ ! -S "$run_dir/serial.sock" ] || [ ! -S "$run_dir/qmp.sock" ]; do
+    qemu_fail_fast qemu-sockets
     deadline_expired "$socket_deadline" && {
         echo "profile host: QEMU sockets did not appear" >&2
         timeout 5 docker logs "$container" >&2 || true
@@ -815,9 +1270,65 @@ while [ ! -S "$run_dir/serial.sock" ] || [ ! -S "$run_dir/qmp.sock" ]; do
     sleep_ms 20
 done
 
-qemu_pid=$(timeout 5 docker top "$container" -eo pid,comm,args | \
-    awk -v qemu="$qemu_binary" 'NR > 1 && $2 != "tini" && index($0, qemu) { print $1; exit }')
-case "$qemu_pid" in ''|*[!0-9]*) echo "profile host: unable to resolve QEMU host PID" >&2; exit 1 ;; esac
+if [ "$instruction_profile" -eq 1 ]; then
+    "$run_dir/rv-tcg-time-collect" \
+        --pid "$qemu_pid" \
+        --output "$run_dir/tcg-time-samples.bin" \
+        --control "$run_dir/instruction-profile.control" \
+        --period-ns "$tcg_time_period_ns" \
+        --ready "$run_dir/tcg-time-collector.ready" \
+        >"$run_dir/tcg-time-collector.stdout" \
+        2>"$run_dir/tcg-time-collector.stderr" &
+    tcg_time_collector_pid=$!
+    collector_deadline=$(deadline_after_ms "$controller_timeout_ms")
+    while [ ! -s "$run_dir/tcg-time-collector.ready" ]; do
+        qemu_fail_fast tcg-time-collector-setup
+        kill -0 "$tcg_time_collector_pid" 2>/dev/null || {
+            echo "profile host: RISC-V TCG time collector exited during setup" >&2
+            cat "$run_dir/tcg-time-collector.stderr" >&2 || true
+            exit 1
+        }
+        deadline_expired "$collector_deadline" && {
+            echo "profile host: RISC-V TCG time collector setup timed out" >&2
+            exit 1
+        }
+        sleep_ms 20
+    done
+    python3 - "$run_dir/tcg-time-collector.ready" "$tcg_time_collector_pid" \
+        "$qemu_pid" "$smp" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_collector = int(sys.argv[2])
+expected_target = int(sys.argv[3])
+expected_vcpus = int(sys.argv[4])
+values = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    key, value = line.split("=", 1)
+    if key in values or not value.isdecimal():
+        raise SystemExit("profile host: malformed RISC-V TCG collector ready file")
+    values[key] = int(value)
+required = {
+    "collector_pid", "target_pid", "tids_discovered", "tids_attached",
+    "attach_failures",
+}
+if set(values) != required:
+    raise SystemExit("profile host: incomplete RISC-V TCG collector ready file")
+if values["collector_pid"] != expected_collector or values["target_pid"] != expected_target:
+    raise SystemExit("profile host: stale RISC-V TCG collector ready identity")
+if (
+    values["tids_discovered"] < expected_vcpus
+    or values["tids_attached"] != values["tids_discovered"]
+    or values["attach_failures"] != 0
+):
+    raise SystemExit(
+        "profile host: RISC-V TCG collector could not attach every initial QEMU thread"
+    )
+PY
+    snapshot_tid_namespace_map setup
+    snapshot_qemu_host_state setup
+fi
 
 if [ "$observer_enabled" -eq 1 ]; then
     set -- python3 "$repo/scripts/qemu_profile_daemon.py" capture \
@@ -876,6 +1387,7 @@ if [ "$observer_enabled" -eq 1 ]; then
     observer_pid=$!
     observer_deadline=$(deadline_after_ms "$controller_timeout_ms")
     while [ ! -s "$run_dir/qemu-observer.ready" ]; do
+        qemu_fail_fast qemu-observer-setup
         kill -0 "$observer_pid" 2>/dev/null || {
             echo "profile host: QEMU observer exited during setup" >&2
             cat "$run_dir/qemu-observer.stderr" >&2 || true
@@ -940,8 +1452,16 @@ send_line '. /tmp/p/config.env && echo @""@PROFILE_SETUP_3'
 wait_for_ordered "@@PROFILE_SETUP_3" '~ # ' "$controller_timeout_ms" || { echo "profile host: guest setup config failed" >&2; exit 1; }
 send_line '/tmp/p/run.sh run "$PROFILE_RUN_TOKEN" &'
 
-marker_deadline=$(deadline_after_ms "$controller_timeout_ms")
+# tg-xtask 的冷预构建在强插桩下可能远慢于交互式控制操作。它拥有独立的
+# 超时（默认 0 表示显式无限），不能复用 controller timeout。
+marker_deadline=$(deadline_after_ms "$prebuild_timeout_ms")
 while ! grep -q "@@PROFILE_WORKLOAD .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
+    qemu_fail_fast guest-prebuild
+    if [ "$instruction_profile" -eq 1 ] && ! host_process_alive "$tcg_time_collector_pid"; then
+        echo "profile host: RISC-V TCG time collector exited during guest prebuild" >&2
+        cat "$run_dir/tcg-time-collector.stderr" >&2 || true
+        exit 1
+    fi
     if grep -Eq 'profile runner:|mount: .*failed|PROFILE_RUNNER_DONE' "$run_dir/profile.serial.log" 2>/dev/null; then
         echo "profile host: guest setup failed" >&2; exit 1
     fi
@@ -992,6 +1512,7 @@ esac
 anchor_deadline=$(deadline_after_ms "$stage_timeout_ms")
 anchor_ns=
 while [ -z "$anchor_ns" ]; do
+    qemu_fail_fast stage-anchor
     record_progress
     case "$anchor" in
         workload) anchor_ns=$(monotonic_ns) ;;
@@ -1014,6 +1535,7 @@ if [ -z "$anchor_ns" ]; then
 else
     warmup_deadline=$((anchor_ns + warmup_ms * 1000000))
     while [ "$(monotonic_ns)" -lt "$warmup_deadline" ]; do
+        qemu_fail_fast warmup
         record_progress
         if workload_finished; then workload_ended=1; break; fi
         sleep_ms "$poll_ms"
@@ -1026,6 +1548,7 @@ if [ "$workload_ended" -eq 0 ]; then
     send_line "/tmp/p/run.sh a $run_token"
     capture_deadline=$(deadline_after_ms "$capture_start_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_READY token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast capture-start
         record_progress
         if workload_finished; then
             workload_ended=1
@@ -1052,6 +1575,15 @@ for milestone in 0 64 128 256 384 440 446; do
 done
 printf 'milestone\tmonotonic_ns\n' >"$run_dir/progress.tsv"
 
+snapshot_tid_namespace_map window-start
+snapshot_qemu_host_state window-start
+if [ "$instruction_profile" -eq 1 ]; then
+    set_instruction_profile_control 1 start
+    instruction_start_request_ns=$profile_control_stamp
+    instruction_start_detected_ns=$(wait_for_instruction_profile_event window_start)
+    record_instruction_profile_detection start "$instruction_start_request_ns" \
+        "$instruction_start_detected_ns"
+fi
 if [ "$observer_enabled" -eq 1 ]; then
     timeout 10 python3 "$repo/scripts/qemu_profile_daemon.py" ctl \
         --socket "$runtime_socket_root/qemu-observer-control.sock" start --label "$safe_label" \
@@ -1074,6 +1606,12 @@ fi
 deadline_ns=$(window_deadline_ns "$start_ns" "$duration_ms")
 next_sample_ns=$((start_ns + sample_ms * 1000000))
 while [ "$workload_ended" -eq 0 ]; do
+    qemu_fail_fast measurement
+    if [ "$instruction_profile" -eq 1 ] && ! host_process_alive "$tcg_time_collector_pid"; then
+        echo "profile host: RISC-V TCG time collector exited during measurement" >&2
+        cat "$run_dir/tcg-time-collector.stderr" >&2 || true
+        exit 1
+    fi
     workload_done=0
     workload_finished && workload_done=1
     now_ns=$(monotonic_ns)
@@ -1099,6 +1637,8 @@ measurement_stop_ns=0
 observer_capture_stopped=0
 stop_progress=
 stop_request_ns=$(monotonic_ns)
+set_instruction_profile_control 0 stop
+instruction_stop_request_ns=${profile_control_stamp:-$stop_request_ns}
 if [ "$workload_ended" -eq 0 ]; then
     stop_sent=1
     # The fixed host deadline is the profiler/QEMU CPU boundary. Guest
@@ -1117,6 +1657,7 @@ if [ "$workload_ended" -eq 0 ]; then
     send_line "/tmp/p/run.sh z $run_token"
     stop_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_FROZEN .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast window-freeze
         deadline_expired "$stop_deadline" && {
             report_controller_status
             echo "profile host: window freeze timed out" >&2
@@ -1127,6 +1668,7 @@ if [ "$workload_ended" -eq 0 ]; then
 else
     stop_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_FROZEN .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast natural-window-freeze
         deadline_expired "$stop_deadline" && break
         sleep_ms "$poll_ms"
     done
@@ -1166,6 +1708,13 @@ if [ "$observer_enabled" -eq 1 ] && [ "$observer_capture_stopped" -eq 0 ]; then
         >>"$run_dir/qemu-observer-control.log"
     observer_capture_stopped=1
 fi
+if [ "$instruction_profile" -eq 1 ]; then
+    instruction_stop_detected_ns=$(wait_for_instruction_profile_event window_stop)
+    record_instruction_profile_detection stop "$instruction_stop_request_ns" \
+        "$instruction_stop_detected_ns"
+fi
+snapshot_tid_namespace_map window-stop
+snapshot_qemu_host_state window-stop
 if [ -z "$stop_progress" ]; then
     stop_progress=$(current_progress)
     [ -n "$stop_progress" ] || stop_progress=-1
@@ -1175,6 +1724,7 @@ if [ "$frozen_observed" -eq 1 ]; then
     send_line "/tmp/p/run.sh k $run_token"
     snapshot_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "@@PROFILE_WINDOW_STOPPED .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast window-snapshot
         deadline_expired "$snapshot_deadline" && {
             report_controller_status
             echo "profile host: window snapshot timed out" >&2
@@ -1210,6 +1760,7 @@ if [ "$runner_status_required" -eq 1 ]; then
     termination_mode=guest-runner-complete
     done_deadline=$(deadline_after_ms "$done_timeout_ms")
     while ! grep -q "PROFILE_RUNNER_DONE .* token=$run_token" "$run_dir/profile.serial.log" 2>/dev/null; do
+        qemu_fail_fast runner-completion
         deadline_expired "$done_deadline" && {
             echo "profile host: natural runner completion timed out" >&2
             exit 1
@@ -1274,8 +1825,23 @@ PY
 if [ "$qmp_shutdown_status" -ne 0 ]; then
     echo "profile host: QMP peer closed with status $qmp_shutdown_status after SHUTDOWN" >&2
 fi
-timeout 30 docker wait "$container" >"$run_dir/qemu-exit-status"
+if [ "$qemu_exit_timeout_ms" -eq 0 ]; then
+    docker wait "$container" >"$run_dir/qemu-exit-status"
+else
+    qemu_exit_timeout_seconds=$(((qemu_exit_timeout_ms + 999) / 1000))
+    timeout "$qemu_exit_timeout_seconds" docker wait "$container" \
+        >"$run_dir/qemu-exit-status"
+fi
+qemu_exit_status=$(tr -d '\r\n ' <"$run_dir/qemu-exit-status")
+case "$qemu_exit_status" in
+    0) ;;
+    ''|*[!0-9]*) echo "profile host: malformed QEMU exit status" >&2; exit 1 ;;
+    *) echo "profile host: QEMU exited with status $qemu_exit_status" >&2; exit 1 ;;
+esac
 qemu_pid=
+if [ -n "$tcg_time_collector_pid" ]; then
+    stop_tcg_time_collector 1
+fi
 if [ "$observer_enabled" -eq 1 ]; then
     timeout 10 python3 "$repo/scripts/qemu_profile_daemon.py" ctl \
         --socket "$runtime_socket_root/qemu-observer-control.sock" shutdown \
@@ -1300,6 +1866,35 @@ print(
 )
 PY
     )
+fi
+if [ "$instruction_profile" -eq 1 ]; then
+    set -- "$run_dir"/jit-*.dump
+    if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+        echo "profile host: expected exactly one completed jitdump" >&2
+        exit 1
+    fi
+    jitdump_path=$1
+    if python3 "$repo/scripts/validate-riscv-instruction-profile.py" \
+        --mix "$run_dir/instruction-mix.jsonl" \
+        --catalog "$run_dir/instruction-catalog.jsonl" \
+        --samples "$run_dir/tcg-time-samples.bin" \
+        --jitdump "$jitdump_path" \
+        --tid-map "$run_dir/tid-namespace-map.tsv" \
+        --tid-map-snapshots "$run_dir/tid-namespace-map-snapshots.tsv" \
+        --control "$run_dir/instruction-profile-control.tsv" \
+        --detections "$run_dir/instruction-profile-detection.tsv" \
+        --output "$run_dir/riscv-instruction-profile-quality.json" \
+        --expected-vcpus "$smp" \
+        --max-transition-latency-ms "$instruction_transition_timeout_ms" \
+        --min-jit-sample-mapping-ppm "$instruction_min_jit_sample_mapping_ppm" \
+        --min-jit-catalog-mapping-ppm "$instruction_min_jit_catalog_mapping_ppm" \
+        --min-catalog-jit-coverage-ppm "$instruction_min_catalog_jit_coverage_ppm"; then
+        instruction_quality_valid=1
+    else
+        instruction_quality_valid=0
+        echo "profile host: RISC-V instruction profile quality gate failed" >&2
+        exit 1
+    fi
 fi
 
 python3 - "$run_dir" "$anchor" "$anchor_ns" "$start_ns" "$stop_ns" "$done_ns" "$deadline_stop_sent" "$runner_status" "$profile_report_status" "$capture_started" "$window_progress" "$stop_progress" "$start_observed_ns" "$stop_request_ns" "$stop_command_sent_ns" "$capture_stop_observed_ns" "$stop_sent" "$frozen_ended" "$frozen_quiescence_verified" "$runner_status_observed" "$termination_mode" "$frozen_quiescence_method" "$measurement_stop_ns" "$observer_histogram" <<'PY'
@@ -1333,6 +1928,14 @@ observer_summary = None
 if observer_enabled:
     observer_summary = json.loads((run_dir / "qemu-profile-summary.json").read_text())
 observer_capture = observer_summary.get("capture") if observer_summary else None
+instruction_profile_enabled = metadata.get("riscv_instruction_profile") == "1"
+instruction_profile_quality = None
+if instruction_profile_enabled:
+    instruction_profile_quality = json.loads(
+        (run_dir / "riscv-instruction-profile-quality.json").read_text()
+    )
+    if instruction_profile_quality.get("valid") is not True:
+        raise SystemExit("RISC-V instruction profile quality is not valid")
 window_start_ns = int(sys.argv[4])
 measurement_stop_ns = int(sys.argv[23])
 duration_ms = int(metadata["duration_ms"])
@@ -1436,15 +2039,35 @@ summary = {
         "guest_instructions": observer_summary["guest_instructions"] if observer_summary else None,
         "histogram": "histogram.json" if (observer_enabled and bool(int(sys.argv[24]))) else None,
     },
+    "riscv_instruction_profile": {
+        "enabled": instruction_profile_enabled,
+        "quality": "riscv-instruction-profile-quality.json" if instruction_profile_enabled else None,
+        "valid": instruction_profile_quality.get("valid") if instruction_profile_quality else None,
+        "instruction_mix": "instruction-mix.jsonl" if instruction_profile_enabled else None,
+        "instruction_catalog": "instruction-catalog.jsonl" if instruction_profile_enabled else None,
+        "tcg_time_samples": "tcg-time-samples.bin" if instruction_profile_enabled else None,
+        "tid_namespace_map": "tid-namespace-map.tsv" if instruction_profile_enabled else None,
+        "tid_namespace_snapshots": "tid-namespace-map-snapshots.tsv" if instruction_profile_enabled else None,
+        "qemu_host_executable": "qemu-host-executable.env" if instruction_profile_enabled else None,
+        "qemu_host_maps": (
+            [
+                "qemu-host-maps-setup.txt",
+                "qemu-host-maps-window-start.txt",
+                "qemu-host-maps-window-stop.txt",
+            ]
+            if instruction_profile_enabled else []
+        ),
+    },
 }
 (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 PY
 
 elapsed_ns=$((measurement_stop_ns - start_ns))
 normal_exit=1
-printf 'PROFILE_HOST_DONE run_dir=%s elapsed_ms=%d.%06d status=%s status_observed=%s termination=%s stopped=%s observer_valid=%s\n' \
+printf 'PROFILE_HOST_DONE run_dir=%s elapsed_ms=%d.%06d status=%s status_observed=%s termination=%s stopped=%s observer_valid=%s instruction_valid=%s\n' \
     "$run_dir" "$((elapsed_ns / 1000000))" "$((elapsed_ns % 1000000))" \
-    "$runner_status" "$runner_status_observed" "$termination_mode" "$deadline_stop_sent" "$observer_quality_valid"
+    "$runner_status" "$runner_status_observed" "$termination_mode" "$deadline_stop_sent" "$observer_quality_valid" \
+    "$instruction_quality_valid"
 if [ "$observer_enabled" -eq 1 ] && [ "$observer_require_valid" -eq 1 ] && \
     [ "$observer_quality_valid" -ne 1 ]; then
     echo "profile host: QEMU observer quality gate failed" >&2

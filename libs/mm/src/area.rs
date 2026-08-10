@@ -136,7 +136,7 @@ impl VmArea {
         let Some(len) = self.len() else {
             return false;
         };
-        len != 0 && self.backing.checked_shift(len).is_some()
+        len != 0 && self.backing.can_shift(len)
     }
 
     /// 地址是否落在本 VMA 内（半开区间 `[start, end)`）。
@@ -211,6 +211,21 @@ impl VmBacking {
         }
     }
 
+    /// 判断向后移动 `shift` 字节是否会让 backing 地址或偏移溢出。
+    ///
+    /// 该检查不构造新 backing，因此不会为只读 VMA 校验增减文件或共享匿名对象的
+    /// 引用计数。真正需要移动 backing 的 split/clip 路径仍使用 [`Self::checked_shift`]。
+    fn can_shift(&self, shift: usize) -> bool {
+        match self {
+            Self::Anon { .. } => true,
+            Self::SharedAnon { offset, .. } | Self::File { offset, .. } => u64::try_from(shift)
+                .ok()
+                .and_then(|shift| offset.checked_add(shift))
+                .is_some(),
+            Self::Direct(base) => base.checked_add(shift).is_some(),
+        }
+    }
+
     /// 返回向后移动 `shift` 字节后的 backing；任一地址/offset 加法溢出则返回 None。
     #[kernel_symbols::export(name = "mm.area.VmBacking.checked_shift", contract = "kernel.mm.vma-backing@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn checked_shift(&self, shift: usize) -> Option<Self> {
@@ -228,5 +243,30 @@ impl VmBacking {
             }),
             VmBacking::Direct(base) => Some(VmBacking::Direct(base.checked_add(shift)?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::{AnonMergeDomain, SharedAnonObject, VmBacking};
+
+    #[test]
+    fn backing_shift_validation_checks_offsets_without_building_a_backing() {
+        let anon = VmBacking::Anon {
+            merge_domain: AnonMergeDomain::fresh(),
+        };
+        let shared = VmBacking::SharedAnon {
+            object: Arc::new(SharedAnonObject::new()),
+            offset: u64::MAX - 1,
+        };
+        let direct = VmBacking::Direct(usize::MAX - 1);
+
+        assert!(anon.can_shift(usize::MAX));
+        assert!(shared.can_shift(1));
+        assert!(!shared.can_shift(2));
+        assert!(direct.can_shift(1));
+        assert!(!direct.can_shift(2));
     }
 }

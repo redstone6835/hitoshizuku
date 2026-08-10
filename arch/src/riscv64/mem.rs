@@ -1,7 +1,7 @@
 //! RISC-V64 内核内存原语。
 //!
 //! 实现只使用基础整数指令，不要求向量扩展，也不假定平台能够高效处理
-//! 非对齐机器字访问。共同对齐的区域走展开块循环，其余区域保守复制。
+//! 非对齐机器字访问。共同对齐的区域走展开块循环，不同余区域通过对齐加载拼接。
 
 #![allow(named_asm_labels)]
 
@@ -22,6 +22,8 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
 
         mv      t6, a0
         beqz    a2, .Lrv_copy_return
+        li      t0, 8
+        bltu    a2, t0, .Lrv_copy_scalar_tail
 
         /* 只有源和目的地址同余时，才能同时对齐后使用机器字访问。 */
         xor     t0, a0, a1
@@ -42,10 +44,10 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         addi    t1, t1, -1
         bnez    t1, .Lrv_copy_align
 
-        /* 每轮 128 字节，分成两个互不重叠的 64 字节读取组。 */
+        /* 每轮 256 字节，分成四个互不重叠的 64 字节读取组。 */
 .Lrv_copy_blocks:
-        li      t0, 128
-        bltu    a2, t0, .Lrv_copy_words
+        li      t0, 256
+        bltu    a2, t0, .Lrv_copy_block64
         ld      a3, 0(a1)
         ld      a4, 8(a1)
         ld      a5, 16(a1)
@@ -78,10 +80,81 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         sd      t0, 104(a0)
         sd      t1, 112(a0)
         sd      t2, 120(a0)
-        addi    a0, a0, 128
-        addi    a1, a1, 128
-        addi    a2, a2, -128
+        ld      a3, 128(a1)
+        ld      a4, 136(a1)
+        ld      a5, 144(a1)
+        ld      a6, 152(a1)
+        ld      a7, 160(a1)
+        ld      t0, 168(a1)
+        ld      t1, 176(a1)
+        ld      t2, 184(a1)
+        sd      a3, 128(a0)
+        sd      a4, 136(a0)
+        sd      a5, 144(a0)
+        sd      a6, 152(a0)
+        sd      a7, 160(a0)
+        sd      t0, 168(a0)
+        sd      t1, 176(a0)
+        sd      t2, 184(a0)
+        ld      a3, 192(a1)
+        ld      a4, 200(a1)
+        ld      a5, 208(a1)
+        ld      a6, 216(a1)
+        ld      a7, 224(a1)
+        ld      t0, 232(a1)
+        ld      t1, 240(a1)
+        ld      t2, 248(a1)
+        sd      a3, 192(a0)
+        sd      a4, 200(a0)
+        sd      a5, 208(a0)
+        sd      a6, 216(a0)
+        sd      a7, 224(a0)
+        sd      t0, 232(a0)
+        sd      t1, 240(a0)
+        sd      t2, 248(a0)
+        addi    a0, a0, 256
+        addi    a1, a1, 256
+        addi    a2, a2, -256
         j       .Lrv_copy_blocks
+
+.Lrv_copy_block64:
+        li      t0, 64
+        bltu    a2, t0, .Lrv_copy_block32
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        ld      a7, 32(a1)
+        ld      t0, 40(a1)
+        ld      t1, 48(a1)
+        ld      t2, 56(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        sd      a7, 32(a0)
+        sd      t0, 40(a0)
+        sd      t1, 48(a0)
+        sd      t2, 56(a0)
+        addi    a0, a0, 64
+        addi    a1, a1, 64
+        addi    a2, a2, -64
+        j       .Lrv_copy_block64
+
+.Lrv_copy_block32:
+        li      t0, 32
+        bltu    a2, t0, .Lrv_copy_words
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        addi    a0, a0, 32
+        addi    a1, a1, 32
+        addi    a2, a2, -32
 
 .Lrv_copy_words:
         li      t0, 8
@@ -95,8 +168,111 @@ pub unsafe extern "C" fn memcpy(_dst: *mut u8, _src: *const u8, _len: usize) -> 
         bgeu    a2, t0, .Lrv_copy_word_loop
         j       .Lrv_copy_bytes
 
-        /* 不同余地址只在两端都自然对齐时使用 4/2 字节访问。 */
+        /* 不同余地址先对齐目的端，再用两个对齐双字拼出源端的错位双字。
+         * 小复制保留集中式字节循环，避免支付对齐和移位的固定成本。 */
 .Lrv_copy_scalar:
+        li      t0, 24
+        bltu    a2, t0, .Lrv_copy_scalar_tail
+        mv      t5, a1
+
+        andi    t0, a0, 7
+        beqz    t0, .Lrv_copy_misaligned_check_prefix
+        li      t1, 8
+        sub     t1, t1, t0
+.Lrv_copy_misaligned_align:
+        lbu     t2, 0(a1)
+        sb      t2, 0(a0)
+        addi    a0, a0, 1
+        addi    a1, a1, 1
+        addi    a2, a2, -1
+        addi    t1, t1, -1
+        bnez    t1, .Lrv_copy_misaligned_align
+
+.Lrv_copy_misaligned_check_prefix:
+        andi    t0, a1, -8
+        bgeu    t0, t5, .Lrv_copy_misaligned_prepare
+
+        /* 第一次向下对齐会越过源区间起点时，先精确复制八字节。
+         * 目的地址仍保持对齐，随后所有对齐读取都位于原始源区间内。 */
+        lbu     a3, 0(a1)
+        lbu     a4, 1(a1)
+        lbu     a5, 2(a1)
+        lbu     a6, 3(a1)
+        lbu     a7, 4(a1)
+        lbu     t0, 5(a1)
+        lbu     t1, 6(a1)
+        lbu     t2, 7(a1)
+        sb      a3, 0(a0)
+        sb      a4, 1(a0)
+        sb      a5, 2(a0)
+        sb      a6, 3(a0)
+        sb      a7, 4(a0)
+        sb      t0, 5(a0)
+        sb      t1, 6(a0)
+        sb      t2, 7(a0)
+        addi    a0, a0, 8
+        addi    a1, a1, 8
+        addi    a2, a2, -8
+
+.Lrv_copy_misaligned_prepare:
+        andi    t1, a1, 7
+        li      t2, 16
+        sub     t2, t2, t1
+        bltu    a2, t2, .Lrv_copy_scalar_tail
+        andi    t4, a1, -8
+        ld      a3, 0(t4)
+        slli    t3, t1, 3
+        li      t5, 64
+        sub     t5, t5, t3
+
+        /* 每个新双字只需再读一个对齐双字；32 字节循环减少分支开销。
+         * t2 是产生八字节时所需的最小剩余长度，确保高端读取不越界。 */
+.Lrv_copy_misaligned_blocks:
+        addi    a7, t2, 24
+        bltu    a2, a7, .Lrv_copy_misaligned_words
+        ld      a4, 8(t4)
+        srl     t0, a3, t3
+        sll     t1, a4, t5
+        or      t0, t0, t1
+        sd      t0, 0(a0)
+        ld      a5, 16(t4)
+        srl     t0, a4, t3
+        sll     t1, a5, t5
+        or      t0, t0, t1
+        sd      t0, 8(a0)
+        ld      a6, 24(t4)
+        srl     t0, a5, t3
+        sll     t1, a6, t5
+        or      t0, t0, t1
+        sd      t0, 16(a0)
+        ld      a7, 32(t4)
+        srl     t0, a6, t3
+        sll     t1, a7, t5
+        or      t0, t0, t1
+        sd      t0, 24(a0)
+        mv      a3, a7
+        addi    t4, t4, 32
+        addi    a0, a0, 32
+        addi    a1, a1, 32
+        addi    a2, a2, -32
+        j       .Lrv_copy_misaligned_blocks
+
+.Lrv_copy_misaligned_words:
+        bltu    a2, t2, .Lrv_copy_scalar_tail
+        ld      a4, 8(t4)
+        srl     t0, a3, t3
+        sll     t1, a4, t5
+        or      t0, t0, t1
+        sd      t0, 0(a0)
+        mv      a3, a4
+        addi    t4, t4, 8
+        addi    a0, a0, 8
+        addi    a1, a1, 8
+        addi    a2, a2, -8
+        j       .Lrv_copy_misaligned_words
+
+        /* 短复制和拼接尾部保留自然对齐的 4/2 字节访问。 */
+.Lrv_copy_scalar_tail:
         or      t0, a0, a1
         andi    t1, t0, 3
         bnez    t1, .Lrv_copy_half_check
@@ -182,6 +358,9 @@ pub unsafe extern "C" fn memset(_dst: *mut u8, _value: i32, _len: usize) -> *mut
         beqz    a2, .Lrv_set_return
 
         andi    a1, a1, 255
+        /* 小区域只使用低字节，跳过构造完整机器字的固定成本。 */
+        li      t0, 16
+        bltu    a2, t0, .Lrv_set_bytes
         slli    t0, a1, 8
         or      a1, a1, t0
         slli    t0, a1, 16
@@ -189,9 +368,6 @@ pub unsafe extern "C" fn memset(_dst: *mut u8, _value: i32, _len: usize) -> *mut
         slli    t0, a1, 32
         or      a1, a1, t0
 
-        /* 小区域逐字节写，避免为对齐付出固定成本。 */
-        li      t0, 16
-        bltu    a2, t0, .Lrv_set_bytes
         andi    t0, a0, 7
         beqz    t0, .Lrv_set_blocks
         li      t1, 8
@@ -324,6 +500,53 @@ pub unsafe extern "C" fn memmove(_dst: *mut u8, _src: *const u8, _len: usize) ->
         bnez    t0, .Lrv_move_reverse_align
 
 .Lrv_move_reverse_blocks:
+        /* 距离至少 64 字节时每轮处理两个块；先完成上方块的读写，
+         * 再访问下方块，即使恰好 64 字节重叠也保持 memmove 语义。 */
+        sub     t3, a0, a1
+        li      t4, 64
+        bltu    t3, t4, .Lrv_move_reverse_blocks_narrow
+        li      t0, 128
+        bltu    a2, t0, .Lrv_move_reverse_blocks_narrow
+        addi    a0, a0, -64
+        addi    a1, a1, -64
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        ld      a7, 32(a1)
+        ld      t0, 40(a1)
+        ld      t1, 48(a1)
+        ld      t2, 56(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        sd      a7, 32(a0)
+        sd      t0, 40(a0)
+        sd      t1, 48(a0)
+        sd      t2, 56(a0)
+        addi    a0, a0, -64
+        addi    a1, a1, -64
+        ld      a3, 0(a1)
+        ld      a4, 8(a1)
+        ld      a5, 16(a1)
+        ld      a6, 24(a1)
+        ld      a7, 32(a1)
+        ld      t0, 40(a1)
+        ld      t1, 48(a1)
+        ld      t2, 56(a1)
+        sd      a3, 0(a0)
+        sd      a4, 8(a0)
+        sd      a5, 16(a0)
+        sd      a6, 24(a0)
+        sd      a7, 32(a0)
+        sd      t0, 40(a0)
+        sd      t1, 48(a0)
+        sd      t2, 56(a0)
+        addi    a2, a2, -128
+        j       .Lrv_move_reverse_blocks
+
+.Lrv_move_reverse_blocks_narrow:
         li      t0, 64
         bltu    a2, t0, .Lrv_move_reverse_words
         addi    a0, a0, -64

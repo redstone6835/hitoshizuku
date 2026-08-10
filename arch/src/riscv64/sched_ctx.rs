@@ -12,7 +12,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
 use sched::arch_hooks::{
-    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry,
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchLocalInterruptOps, ArchTimeOps,
+    ArchTrapOps, KernelEntry,
 };
 
 use crate::riscv64::specific::{
@@ -135,6 +136,22 @@ static ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     switch_context,
 };
 
+fn save_and_disable_local_interrupts() -> usize {
+    // Safety: 只原子读取并清除当前 hart 的 SSTATUS.SIE；返回值随任务调用栈保存，
+    // 可在任务迁移后由另一 hart 按同一 ISA 语义恢复。
+    unsafe { Riscv64InterruptOps::save_and_disable() }
+}
+
+fn restore_local_interrupts(state: usize) {
+    // Safety: state 来自配对的 save_and_disable，仅按保存值恢复 SSTATUS.SIE。
+    unsafe { Riscv64InterruptOps::restore_interrupt_state(state) };
+}
+
+static ARCH_LOCAL_INTERRUPT_OPS: ArchLocalInterruptOps = ArchLocalInterruptOps {
+    save_and_disable: save_and_disable_local_interrupts,
+    restore: restore_local_interrupts,
+};
+
 static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
     now_ns: kernel_timestamp_ns,
     current_cpu_id,
@@ -189,6 +206,7 @@ pub fn register() {
         .is_ok()
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
+        sched::arch_hooks::register_local_interrupt(&ARCH_LOCAL_INTERRUPT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);

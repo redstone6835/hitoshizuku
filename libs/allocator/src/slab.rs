@@ -16,8 +16,9 @@
 //!
 //! 它和 `kheap` 的分工边界很明确：不适合放进 slab 的对象，直接交给大对象路径。
 use core::alloc::Layout;
+use core::mem::MaybeUninit;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::Mutex;
 
@@ -40,6 +41,7 @@ const BITMAP_WORDS: usize = 8;
 const INVALID_SLAB_NODE: usize = 0;
 const INVALID_CACHED_INDEX: u16 = u16::MAX;
 const SLAB_LOOKUP_BUCKETS: usize = 1024;
+const FAST_SLAB_HINT_BUCKETS: usize = 256;
 const MAX_GROW_ATTEMPTS: usize = 3;
 const MAX_EMPTY_SLABS_PER_ZONE: usize = 4;
 
@@ -148,6 +150,130 @@ impl CacheEntry {
     }
 }
 
+struct FastSlabDirectoryEntry {
+    sequence: AtomicUsize,
+    slab_base: AtomicUsize,
+    slab_node: AtomicUsize,
+}
+
+impl FastSlabDirectoryEntry {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            slab_base: AtomicUsize::new(0),
+            slab_node: AtomicUsize::new(INVALID_SLAB_NODE),
+        }
+    }
+
+    fn publish(&self, slab_base: usize, slab_node: usize) {
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        debug_assert_eq!(sequence & 1, 0);
+        self.sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        // 先让读者观察到奇数代际，再发布组成同一快照的两个字段。
+        fence(Ordering::Release);
+        self.slab_base.store(slab_base, Ordering::Relaxed);
+        self.slab_node.store(slab_node, Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    fn remove(&self, slab_base: usize, slab_node: usize) {
+        if self.slab_base.load(Ordering::Relaxed) != slab_base
+            || self.slab_node.load(Ordering::Relaxed) != slab_node
+        {
+            return;
+        }
+        self.publish(0, INVALID_SLAB_NODE);
+    }
+
+    fn lookup(&self, slab_base: usize) -> Option<usize> {
+        for _ in 0..2 {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let observed_base = self.slab_base.load(Ordering::Relaxed);
+            let slab_node = self.slab_node.load(Ordering::Relaxed);
+            // 数据读取必须完成后才能验证代际，避免接受跨两次发布的混合快照。
+            fence(Ordering::Acquire);
+            let after = self.sequence.load(Ordering::Relaxed);
+            if before == after {
+                return (observed_base == slab_base && slab_node != INVALID_SLAB_NODE)
+                    .then_some(slab_node);
+            }
+        }
+        None
+    }
+}
+
+struct FastSlabDirectory {
+    entries: [FastSlabDirectoryEntry; FAST_SLAB_HINT_BUCKETS],
+}
+
+impl FastSlabDirectory {
+    const fn new() -> Self {
+        Self {
+            entries: [const { FastSlabDirectoryEntry::new() }; FAST_SLAB_HINT_BUCKETS],
+        }
+    }
+
+    fn publish(&self, slab_base: usize, slab_span: usize, slab_node: usize) {
+        self.entries[fast_slab_hint_bucket(slab_base, slab_span)].publish(slab_base, slab_node);
+    }
+
+    fn remove(&self, slab_base: usize, slab_span: usize, slab_node: usize) {
+        self.entries[fast_slab_hint_bucket(slab_base, slab_span)].remove(slab_base, slab_node);
+    }
+
+    fn lookup(&self, ptr: usize, slab_span: usize) -> Option<usize> {
+        if slab_span == 0 || !slab_span.is_power_of_two() {
+            return None;
+        }
+        let slab_base = ptr & !(slab_span - 1);
+        self.entries[fast_slab_hint_bucket(slab_base, slab_span)].lookup(slab_base)
+    }
+}
+
+struct CacheDrainBuffer<const N: usize> {
+    entries: [MaybeUninit<CacheEntry>; N],
+    initialized: usize,
+}
+
+impl<const N: usize> CacheDrainBuffer<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [const { MaybeUninit::uninit() }; N],
+            initialized: 0,
+        }
+    }
+
+    fn push(&mut self, entry: CacheEntry) -> bool {
+        let Some(slot) = self.entries.get_mut(self.initialized) else {
+            return false;
+        };
+        slot.write(entry);
+        self.initialized += 1;
+        true
+    }
+
+    fn is_full(&self) -> bool {
+        self.initialized == N
+    }
+
+    fn initialized(&self) -> &[CacheEntry] {
+        // SAFETY: initialized 只会在对应槽位完成 MaybeUninit::write 后递增，因此
+        // entries 的这个前缀全部有效；后缀不会被构造成引用。
+        unsafe {
+            core::slice::from_raw_parts(
+                self.entries.as_ptr().cast::<CacheEntry>(),
+                self.initialized,
+            )
+        }
+    }
+}
+
 /// 某个 CPU 在某个 size class 下的本地缓存状态。
 ///
 /// 它的目标是把最热的小对象分配/释放留在本地 CPU 上完成，尽量少碰全局 slab 状态。
@@ -198,10 +324,10 @@ impl PerCpuCacheState {
         true
     }
 
-    fn push_for_free(
+    fn push_for_free<const N: usize>(
         &mut self,
         entry: CacheEntry,
-        drained: &mut [CacheEntry],
+        drained: &mut CacheDrainBuffer<N>,
         used_hint: bool,
     ) -> usize {
         self.stats.free_requests = self.stats.free_requests.saturating_add(1);
@@ -219,19 +345,19 @@ impl PerCpuCacheState {
             return 0;
         }
 
-        let mut drained_count = 0usize;
-        for slot in drained.iter_mut() {
+        while !drained.is_full() {
             let Some(entry) = self.pop_entry() else {
                 break;
             };
-            *slot = entry;
-            drained_count += 1;
+            if !drained.push(entry) {
+                panic!("[alloc][invariant] slab drain buffer rejected available slot");
+            }
         }
         if !self.push(entry) {
             panic!("[alloc][invariant] slab cache remained full after drain");
         }
         self.stats.flushes = self.stats.flushes.saturating_add(1);
-        drained_count
+        drained.initialized().len()
     }
 
     fn push_refill(&mut self, entries: &[CacheEntry], overflow: &mut [CacheEntry]) -> usize {
@@ -921,7 +1047,7 @@ impl ZoneState {
         }
     }
 
-    fn take_reclaimable_empty_slab(&mut self) -> Option<BackedRange> {
+    fn take_reclaimable_empty_slab(&mut self) -> Option<(BackedRange, usize)> {
         let mut empty_count = 0usize;
         let mut node_addr = self.slab_head;
         while node_addr != 0 {
@@ -963,7 +1089,7 @@ impl ZoneState {
                     .saturating_sub(backing.size / PAGE_SIZE);
                 self.stats.reclaimed_slabs += 1;
                 self.push_reusable_slab_node(current);
-                return Some(backing);
+                return Some((backing, current));
             }
             prev = current;
             current = next;
@@ -1131,6 +1257,7 @@ struct Zone {
     pages_per_slab: usize,
     arena: ArenaKind,
     state: Mutex<ZoneState>,
+    fast_slabs: FastSlabDirectory,
     caches: [PerCpuCache; MAX_CPUS],
 }
 
@@ -1141,6 +1268,7 @@ impl Zone {
             pages_per_slab: pages_per_slab(size_class),
             arena,
             state: Mutex::new(ZoneState::new()),
+            fast_slabs: FastSlabDirectory::new(),
             caches: [const { PerCpuCache::new() }; MAX_CPUS],
         }
     }
@@ -1198,6 +1326,9 @@ impl Zone {
                     Ok(node_addr) => {
                         let mut state = self.state.lock();
                         state.insert_slab_node(node_addr);
+                        let node = slab_node(node_addr);
+                        self.fast_slabs
+                            .publish(node.slab.base_addr, node.backing.size, node_addr);
                         produced = state.allocate_batch(self.size_class, &mut batch);
                     }
                     Err(err) => {
@@ -1245,7 +1376,7 @@ impl Zone {
         // 没有 registry cookie 的路径在 ZoneState 中定位对象。缓存对象由独立位图标记，
         // 因而不再需要扫描全部 CPU cache 来判断重复释放。
         let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
         let mut should_reclaim = false;
         let (slab_node, cached_index) = {
             let mut state = self.state.lock();
@@ -1277,7 +1408,7 @@ impl Zone {
         if drained_count != 0 {
             let mut state = self.state.lock();
             should_reclaim |= state
-                .flush_cached_entries(&drained[..drained_count], self.size_class)
+                .flush_cached_entries(drained.initialized(), self.size_class)
                 .made_empty;
         }
         if should_reclaim {
@@ -1300,7 +1431,7 @@ impl Zone {
         // backend cookie 由 allocator registry 生成且 SlabNode 只复用不释放；正常释放
         // 可以直接把 entry 放入本地 magazine，不读取 slab 元数据。
         let cache = &self.caches[cpu];
-        let mut drained = [CacheEntry::empty(); FLUSH_BATCH];
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
         let mut should_reclaim = false;
         let entry = CacheEntry {
             ptr,
@@ -1314,13 +1445,26 @@ impl Zone {
         if drained_count != 0 {
             let mut state = self.state.lock();
             should_reclaim |= state
-                .flush_cached_entries(&drained[..drained_count], self.size_class)
+                .flush_cached_entries(drained.initialized(), self.size_class)
                 .made_empty;
         }
         if should_reclaim {
             self.reclaim_empty_slabs(backing);
         }
         true
+    }
+
+    fn free_trusted(
+        &self,
+        ptr: usize,
+        cpu: usize,
+        backing: Option<(&Mutex<BuddyAllocator>, &KernelAddressSpace)>,
+    ) -> bool {
+        let slab_span = self.pages_per_slab.saturating_mul(PAGE_SIZE);
+        match self.fast_slabs.lookup(ptr, slab_span) {
+            Some(slab_node) => self.free_with_hint(ptr, cpu, slab_node, backing),
+            None => self.free(ptr, cpu, backing),
+        }
     }
 
     fn flush_cpu_caches(&self, cpu_count: usize) -> SlabReclaimStats {
@@ -1358,7 +1502,13 @@ impl Zone {
         loop {
             let range = {
                 let mut state = self.state.lock();
-                state.take_reclaimable_empty_slab()
+                let reclaimed = state.take_reclaimable_empty_slab();
+                if let Some((range, node_addr)) = reclaimed {
+                    self.fast_slabs.remove(range.vaddr, range.size, node_addr);
+                    Some(range)
+                } else {
+                    None
+                }
             };
             let Some(range) = range else {
                 break;
@@ -1637,7 +1787,7 @@ impl SlabAllocator {
             return false;
         };
         let cpu = self.normalize_cpu(cpu_id);
-        self.zones[zone_idx].free(ptr, cpu, Some((phys, vmem)))
+        self.zones[zone_idx].free_trusted(ptr, cpu, Some((phys, vmem)))
     }
 
     pub fn same_size_class(old_layout: Layout, new_layout: Layout) -> bool {
@@ -1646,6 +1796,12 @@ impl SlabAllocator {
 
     pub fn owns(&self, ptr: usize) -> bool {
         self.zone_index_for_ptr(ptr).is_some()
+    }
+
+    pub(crate) fn owns_in_class(&self, zone_idx: usize, ptr: usize) -> bool {
+        self.zones
+            .get(zone_idx)
+            .is_some_and(|zone| zone.contains(ptr))
     }
 
     pub fn free_ptr(&self, ptr: usize, cpu_id: usize) -> bool {
@@ -1872,6 +2028,11 @@ fn slab_lookup_bucket(slab_base: usize, slab_span: usize) -> usize {
     slot.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (SLAB_LOOKUP_BUCKETS - 1)
 }
 
+#[inline]
+fn fast_slab_hint_bucket(slab_base: usize, slab_span: usize) -> usize {
+    slab_lookup_bucket(slab_base, slab_span) & (FAST_SLAB_HINT_BUCKETS - 1)
+}
+
 fn audit_slab(node: &SlabNode, obj_size: usize, audit: &mut SlabAudit) {
     let slab = &node.slab;
     let total = slab.total_objects as usize;
@@ -2013,10 +2174,15 @@ fn has_atomic_bits_outside_range(bits: &[AtomicU64; BITMAP_WORDS], end: usize) -
 #[cfg(test)]
 mod slab_state_tests {
     extern crate alloc;
+    extern crate std;
 
     use alloc::boxed::Box;
 
-    use super::{Slab, SlabAuditFlags, SlabNode, SlabObjectState, ZoneState, slab_lookup_bucket};
+    use super::{
+        CACHE_CAPACITY, CacheDrainBuffer, CacheEntry, FLUSH_BATCH, FastSlabDirectory,
+        PerCpuCacheState, Slab, SlabAllocator, SlabAuditFlags, SlabNode, SlabObjectState,
+        ZoneState, slab_lookup_bucket,
+    };
     use crate::buddy::PAGE_SIZE;
     use crate::space::{ArenaKind, BackedRange};
 
@@ -2037,6 +2203,46 @@ mod slab_state_tests {
         })
     }
 
+    fn test_cache_entry(ptr: usize) -> CacheEntry {
+        CacheEntry {
+            ptr,
+            slab_node: ptr + PAGE_SIZE,
+            cached_index: ptr as u16,
+        }
+    }
+
+    #[test]
+    fn non_full_cache_free_leaves_drain_prefix_empty() {
+        let mut cache = PerCpuCacheState::new();
+        let mut drained = CacheDrainBuffer::<FLUSH_BATCH>::new();
+        let entry = test_cache_entry(1);
+
+        assert_eq!(cache.push_for_free(entry, &mut drained, false), 0);
+        assert!(drained.initialized().is_empty());
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.entries[0].ptr, entry.ptr);
+    }
+
+    #[test]
+    fn full_cache_drain_exposes_only_the_written_prefix() {
+        let mut cache = PerCpuCacheState::new();
+        for ptr in 1..=CACHE_CAPACITY {
+            assert!(cache.push(test_cache_entry(ptr)));
+        }
+        let mut drained = CacheDrainBuffer::<{ CACHE_CAPACITY + 1 }>::new();
+        let incoming = test_cache_entry(CACHE_CAPACITY + 1);
+
+        assert_eq!(
+            cache.push_for_free(incoming, &mut drained, false),
+            CACHE_CAPACITY
+        );
+        assert_eq!(drained.initialized().len(), CACHE_CAPACITY);
+        assert_eq!(drained.initialized()[0].ptr, CACHE_CAPACITY);
+        assert_eq!(drained.initialized()[CACHE_CAPACITY - 1].ptr, 1);
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.entries[0].ptr, incoming.ptr);
+    }
+
     #[test]
     fn cached_object_state_round_trip() {
         let mut slab = Slab::empty();
@@ -2050,6 +2256,31 @@ mod slab_state_tests {
         assert!(slab.release_reserved(ptr, 64));
         assert_eq!(slab.object_state(ptr, 64), None);
         assert_eq!(slab.allocated_objects, 0);
+    }
+
+    #[test]
+    fn fast_slab_directory_replaces_collisions_and_removes_exact_owner() {
+        let directory = FastSlabDirectory::new();
+        let span = PAGE_SIZE;
+        let first = PAGE_SIZE;
+        let bucket = slab_lookup_bucket(first, span) & (super::FAST_SLAB_HINT_BUCKETS - 1);
+        let second = (2..=(super::FAST_SLAB_HINT_BUCKETS * 4))
+            .map(|page| page * PAGE_SIZE)
+            .find(|&base| {
+                slab_lookup_bucket(base, span) & (super::FAST_SLAB_HINT_BUCKETS - 1) == bucket
+            })
+            .expect("构造快速目录哈希碰撞");
+
+        directory.publish(first, span, 0x1110);
+        assert_eq!(directory.lookup(first, span), Some(0x1110));
+
+        directory.publish(second, span, 0x2220);
+        assert_eq!(directory.lookup(first, span), None);
+        assert_eq!(directory.lookup(second, span), Some(0x2220));
+        directory.remove(first, span, 0x1110);
+        assert_eq!(directory.lookup(second, span), Some(0x2220));
+        directory.remove(second, span, 0x2220);
+        assert_eq!(directory.lookup(second, span), None);
     }
 
     #[test]
@@ -2100,6 +2331,30 @@ mod slab_state_tests {
             state.find_allocated_node(ptr, 64, PAGE_SIZE),
             Some((node_addr, SlabObjectState::Allocated))
         );
+    }
+
+    #[test]
+    fn owns_in_class_routes_to_only_the_requested_zone() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let allocator = Box::new(SlabAllocator::new(ArenaKind::Kernel));
+                let zone_idx = 3;
+                let mut node = test_slab_node(PAGE_SIZE);
+                let ptr = node.slab.allocate(64).expect("分配测试对象");
+                let node_addr = (&mut *node as *mut SlabNode) as usize;
+                allocator.zones[zone_idx]
+                    .state
+                    .lock()
+                    .insert_slab_node(node_addr);
+
+                assert!(allocator.owns_in_class(zone_idx, ptr));
+                assert!(!allocator.owns_in_class(zone_idx + 1, ptr));
+                assert!(!allocator.owns_in_class(super::SIZE_CLASS_COUNT, ptr));
+            })
+            .expect("创建大栈测试线程")
+            .join()
+            .expect("ownership 路由测试线程失败");
     }
 
     #[test]

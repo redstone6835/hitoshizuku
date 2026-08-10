@@ -76,6 +76,20 @@ fn find_existing_vma() {
     assert_eq!(found.unwrap().range, 0x1000..0x3000);
 }
 
+#[ktest]
+fn find_cache_recovers_after_index_shift() {
+    let mut vmas = VmaSet::new();
+    vmas.insert(anon_area(0x1000, 0x2000)).unwrap();
+    vmas.insert(anon_area(0x5000, 0x6000)).unwrap();
+
+    assert_eq!(vmas.find(0x5800).unwrap().range, 0x5000..0x6000);
+    assert_eq!(vmas.cached_find_index(), Some(1));
+
+    vmas.insert(anon_area(0x3000, 0x4000)).unwrap();
+    assert_eq!(vmas.find(0x5800).unwrap().range, 0x5000..0x6000);
+    assert_eq!(vmas.cached_find_index(), Some(2));
+}
+
 /// find 在不属于任何 VMA 的地址处返回 None。
 #[ktest]
 fn find_hole_returns_none() {

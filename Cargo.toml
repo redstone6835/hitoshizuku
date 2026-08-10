@@ -22,6 +22,7 @@ members = [
     "libs/elm-loader",
     "libs/kernel-symbols",
     "libs/kernel-symbols/macros",
+    "libs/kcsan",
     "arch",
     "hal",
     "general",

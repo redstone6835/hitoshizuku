@@ -661,6 +661,33 @@ fn runqueue_exact_pick_yields_to_higher_class() {
 }
 
 #[ktest]
+fn runqueue_exact_pick_rejects_owned_non_current_task() {
+    let current = make_task();
+    let target = make_task();
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&current));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&target), 1));
+    assert!(target.try_claim_cpu(0));
+
+    assert!(
+        rq.pick_target_on(&target, 2, CpuMask::single_raw(0).bits())
+            .is_none()
+    );
+    assert!(rq.is_current(&current));
+
+    unsafe {
+        target
+            .on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    let picked = rq
+        .pick_target_on(&target, 3, CpuMask::single_raw(0).bits())
+        .expect("上下文释放后精确目标应可被选中");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &target));
+}
+
+#[ktest]
 fn runqueue_reports_task_waiting_for_context_release() {
     let task = make_task();
     task.set_cpu_affinity(CpuMask::single_raw(1).bits());

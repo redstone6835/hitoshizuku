@@ -1,7 +1,8 @@
 .DEFAULT_GOAL := kernel
 
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
-	kernel-la kernel-rv syscall-bench-rv mm-bench-rv all clean cargo-setup \
+	kernel-la kernel-rv kcsan-la kcsan-rv syscall-bench-rv mm-bench-rv \
+	instruction-weight-rv all clean cargo-setup \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -22,6 +23,10 @@ MM_BENCH_CASE ?= anon-write
 MM_BENCH_PAGES ?= 1
 MM_BENCH_THREADS ?= 1
 MM_BENCH_REPEATS ?= 1
+RISCV_WEIGHT_BASE_BLOCKS ?= 256
+RISCV_WEIGHT_ROUNDS ?= 9
+RISCV_WEIGHT_CASE ?= all
+RISCV_WEIGHT_RUN_ID ?= default
 PROFILE_MODE ?= sample
 PROFILE_PRESET ?= all
 PROFILE_SAMPLE_HZ ?= 250
@@ -32,6 +37,25 @@ INITRAMFS ?=
 INSTALL_MOD_PATH ?=
 KERNEL_MAP ?=
 KERNEL_PUBLISH_OUTPUT ?=
+KCSAN_BUILD ?= 0
+
+KCSAN_RUSTC_WRAPPER := $(abspath scripts/kcsan-rustc-wrapper.sh)
+KCSAN_BUILD_DIR := $(abspath build/kcsan)
+KCSAN_TARGET_DIR := $(abspath target/kcsan)
+KCSAN_WRAPPER_ENV := $(if $(and $(filter 1,$(KCSAN_BUILD)),$(filter kcsan,$(FEATURES))),RUSTC_WRAPPER=$(KCSAN_RUSTC_WRAPPER),)
+KERNEL_INTERFACE_TARGET_DIR := $(if $(filter 1,$(KCSAN_BUILD)),$(abspath $(BUILD_DIR)/cargo-kernel-interface-target),$(CARGO_TARGET_DIR))
+KERNEL_INTERFACE_BUILD_ENV := $(if $(filter 1,$(KCSAN_BUILD)),env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_TARGET_DIR=$(KERNEL_INTERFACE_TARGET_DIR),)
+
+ifneq ($(filter kcsan,$(FEATURES)),)
+ifeq ($(KCSAN_BUILD),0)
+ifeq ($(strip $(MAKECMDGOALS)),)
+$(error KCSAN 调试构建必须使用 make kcsan-la 或 make kcsan-rv)
+endif
+ifneq ($(strip $(filter-out kcsan-la kcsan-rv clean,$(MAKECMDGOALS))),)
+$(error KCSAN 调试构建必须使用独立的 kcsan-la/kcsan-rv 目标)
+endif
+endif
+endif
 
 empty :=
 space := $(empty) $(empty)
@@ -74,6 +98,7 @@ PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
 ACCT_TEST_SRC := userland/tests/acct.c
 SYSCALL_BENCH_SRC := userland/tests/syscall_bench.c
 MM_BENCH_SRC := userland/tests/mm_fault_bench.c
+RISCV_WEIGHT_SRC := userland/tests/riscv_instruction_weight_probe.c
 LOONGARCH_SXE_TEST_SRC := userland/tests/loongarch_sxe.c
 INIT_KEYWAIT_SRC := userland/init-keywait.c
 
@@ -150,10 +175,12 @@ defconfig: $(ELM_TOOL)
 define build_modules
 	rm -rf $(BUILD_DIR)/$(1)/modules $(ELM_INTERFACE_ROOT)/$(2)
 	env -u ELM_INTEGRATED_ARCHIVES -u ELM_BUILD_BOUND_MANIFEST -u INITRAMFS \
-		cargo build -p kernel --target $(2) $(BOOTSTRAP_FEATURE_ARGS) --release
-	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(2)/release/kernel \
+		$(KERNEL_INTERFACE_BUILD_ENV) cargo build -p kernel --target $(2) $(BOOTSTRAP_FEATURE_ARGS) --release
+	CARGO_TARGET_DIR=$(KERNEL_INTERFACE_TARGET_DIR) \
+		$(ELM_TOOL) elm profile-export $(KERNEL_INTERFACE_TARGET_DIR)/$(2)/release/kernel \
 		--target $(2) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(2)
-	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(2)) \
+	env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+		ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(2)) \
 		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) \
 		--target $(2) --output $(BUILD_DIR)/$(1)/modules $(ELM_DRIVER_FEATURE_ARGS)
 endef
@@ -172,7 +199,7 @@ define build_kernel
 		KERNEL_LINK_SOURCE="$(if $(strip $(KERNEL_MAP)),$(abspath $(CARGO_TARGET_DIR)/$(2)/release/kernel))" \
 		KERNEL_LINK_TARGET="$(if $(strip $(KERNEL_MAP)),$(2))" \
 		KERNEL_LINK_ROOT_OUTPUT="$(if $(and $(strip $(KERNEL_MAP)),$(strip $(KERNEL_PUBLISH_OUTPUT))),$(abspath $(KERNEL_PUBLISH_OUTPUT)))" \
-		$(ELM_KERNEL_BUILD) $(BUILD_DIR)/$(1)/modules/modules.manifest \
+		$(KCSAN_WRAPPER_ENV) $(ELM_KERNEL_BUILD) $(BUILD_DIR)/$(1)/modules/modules.manifest \
 		$(BUILD_DIR)/$(1)/modules/integrated.archives \
 		cargo build -p kernel --target $(2) $(FEATURE_ARGS) --release
 	$(if $(strip $(KERNEL_MAP)),test -s $(BUILD_DIR)/$(1)/kernel,cp $(CARGO_TARGET_DIR)/$(2)/release/kernel $(BUILD_DIR)/$(1)/kernel)
@@ -299,6 +326,24 @@ define build_mm_benchmark
 	fi
 endef
 
+define build_riscv_instruction_weight_probe
+	@if [ "$(1)" = "$(RV_ARCH)" ] && [ "$(TEST_MODE)" = "instruction-weight" ]; then \
+		rm -rf $(BUILD_DIR)/$(1)/instruction-weight; \
+		mkdir -p $(BUILD_DIR)/$(1)/instruction-weight $(2)/bin; \
+		$(3)gcc -std=c11 -static -fno-pie -no-pie -O2 -Wall -Wextra -Werror \
+			$(RISCV_WEIGHT_SRC) \
+			-o $(BUILD_DIR)/$(1)/instruction-weight/riscv-instruction-weight.elf; \
+		install -m 0755 \
+			$(BUILD_DIR)/$(1)/instruction-weight/riscv-instruction-weight.elf \
+			$(2)/bin/riscv-instruction-weight; \
+		$(3)strip $(2)/bin/riscv-instruction-weight || true; \
+		printf '%s %s %s %s\n' \
+			'$(RISCV_WEIGHT_BASE_BLOCKS)' '$(RISCV_WEIGHT_ROUNDS)' \
+			'$(RISCV_WEIGHT_CASE)' '$(RISCV_WEIGHT_RUN_ID)' \
+			>$(2)/etc/mygo-riscv-instruction-weight-args; \
+	fi
+endef
+
 define prepare_compat_rootfs
 	$(MAKE) _busybox-$(1)
 	rm -rf $(2)
@@ -327,6 +372,7 @@ define prepare_compat_rootfs
 	$(call build_loongarch_sxe_tests,$(1),$(2),$(5))
 	$(call build_syscall_benchmark,$(1),$(2),$(5))
 	$(call build_mm_benchmark,$(1),$(2),$(5))
+	$(call build_riscv_instruction_weight_probe,$(1),$(2),$(5))
 	install -m 0644 $(BUILD_DIR)/$(1)/modules/modules.manifest $(2)/lib/elm/
 	find $(BUILD_DIR)/$(1)/modules -maxdepth 1 -type f -name '*.eki' \
 		-exec install -m 0644 {} $(2)/lib/elm/ \;
@@ -356,10 +402,34 @@ mm-bench-rv:
 		MM_BENCH_THREADS='$(MM_BENCH_THREADS)' MM_BENCH_REPEATS='$(MM_BENCH_REPEATS)' \
 		KERNEL_MAP=$(abspath $(BUILD_DIR)/$(RV_ARCH)/kernel.map)
 
+instruction-weight-rv:
+	$(MAKE) kernel-rv TEST_MODE=instruction-weight \
+		RISCV_WEIGHT_BASE_BLOCKS='$(RISCV_WEIGHT_BASE_BLOCKS)' \
+		RISCV_WEIGHT_ROUNDS='$(RISCV_WEIGHT_ROUNDS)' \
+		RISCV_WEIGHT_CASE='$(RISCV_WEIGHT_CASE)' \
+		RISCV_WEIGHT_RUN_ID='$(RISCV_WEIGHT_RUN_ID)' \
+		KERNEL_MAP=$(abspath $(BUILD_DIR)/$(RV_ARCH)/kernel.map)
+
 kernel-rv: _modules-riscv64 $(PACK_INITRAMFS)
 	$(call prepare_compat_rootfs,$(RV_ARCH),$(RV_COMPAT_ROOTFS),$(RV_COMPAT_ROOTFS_SOURCE),$(RV_TARGET),$(RV_CROSS_COMPILE))
 	$(MAKE) _compat-kernel-riscv64 $(if $(strip $(KERNEL_MAP)),KERNEL_PUBLISH_OUTPUT=$(abspath $(RV_ROOT_KERNEL)))
 	$(if $(strip $(KERNEL_MAP)),test -s $(RV_ROOT_KERNEL),cp $(BUILD_DIR)/$(RV_ARCH)/kernel $(RV_ROOT_KERNEL))
+
+kcsan-la:
+	$(MAKE) kernel-la ARCH=$(LA_ARCH) \
+		FEATURES="$(strip $(filter-out kcsan,$(FEATURES)) kcsan)" \
+		KCSAN_BUILD=1 \
+		BUILD_DIR=$(KCSAN_BUILD_DIR) CARGO_TARGET_DIR=$(KCSAN_TARGET_DIR) \
+		KERNEL_MAP=$(KCSAN_BUILD_DIR)/$(LA_ARCH)/kernel.map \
+		LA_ROOT_KERNEL=$(abspath kernel-la-kcsan) CARGO_PROFILE_RELEASE_DEBUG=2
+
+kcsan-rv:
+	$(MAKE) kernel-rv ARCH=$(RV_ARCH) \
+		FEATURES="$(strip $(filter-out kcsan,$(FEATURES)) kcsan)" \
+		KCSAN_BUILD=1 \
+		BUILD_DIR=$(KCSAN_BUILD_DIR) CARGO_TARGET_DIR=$(KCSAN_TARGET_DIR) \
+		KERNEL_MAP=$(KCSAN_BUILD_DIR)/$(RV_ARCH)/kernel.map \
+		RV_ROOT_KERNEL=$(abspath kernel-rv-kcsan) CARGO_PROFILE_RELEASE_DEBUG=2
 
 _compat-kernel-riscv64:
 	$(eval override INITRAMFS := $(abspath $(BUILD_DIR)/$(RV_ARCH)/compat-initramfs.cpio))
@@ -373,6 +443,7 @@ all: kernel-la kernel-rv
 clean:
 	cargo clean
 	rm -rf $(BUILD_DIR)/loongarch64 $(BUILD_DIR)/riscv64 $(ELM_INTERFACE_ROOT) \
-		$(ELM_TOOL_TARGET)
+		$(ELM_TOOL_TARGET) $(KCSAN_BUILD_DIR) $(KCSAN_TARGET_DIR)
 	rm -f $(LA_ROOT_KERNEL) $(RV_ROOT_KERNEL) \
-		$(LA_ROOT_KERNEL).lock $(RV_ROOT_KERNEL).lock
+		$(LA_ROOT_KERNEL).lock $(RV_ROOT_KERNEL).lock \
+		kernel-la-kcsan kernel-rv-kcsan kernel-la-kcsan.lock kernel-rv-kcsan.lock

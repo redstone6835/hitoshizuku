@@ -26,6 +26,42 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+if [ -x /bin/riscv-instruction-weight ]; then
+    riscv_weight_args="$(cat /etc/mygo-riscv-instruction-weight-args 2>/dev/null || true)"
+    # shellcheck disable=SC2086
+    set -- $riscv_weight_args
+    riscv_weight_base_blocks="${1:-256}"
+    riscv_weight_rounds="${2:-9}"
+    riscv_weight_case="${3:-all}"
+    riscv_weight_run_id="${4:-default}"
+    for cmdline_file in /proc/cmdline /sys/kernel/cmdline; do
+        [ -r "$cmdline_file" ] || continue
+        for cmdline_arg in $(cat "$cmdline_file" 2>/dev/null); do
+            case "$cmdline_arg" in
+                riscv_weight_base_blocks=*)
+                    riscv_weight_base_blocks="${cmdline_arg#*=}"
+                    ;;
+                riscv_weight_rounds=*) riscv_weight_rounds="${cmdline_arg#*=}" ;;
+                riscv_weight_case=*) riscv_weight_case="${cmdline_arg#*=}" ;;
+                riscv_weight_run_id=*) riscv_weight_run_id="${cmdline_arg#*=}" ;;
+            esac
+        done
+    done
+    riscv_weight_args="$riscv_weight_base_blocks $riscv_weight_rounds $riscv_weight_case $riscv_weight_run_id"
+    echo "[init][riscv-weight] start args=$riscv_weight_args"
+    # 参数由构建系统生成并由探针自身再次严格校验。
+    # shellcheck disable=SC2086
+    /bin/riscv-instruction-weight $riscv_weight_args
+    riscv_weight_status=$?
+    echo "[init][riscv-weight] exit=$riscv_weight_status"
+    echo "RISCV_WEIGHT_GUEST_DONE status=$riscv_weight_status"
+    sync || true
+    poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || \
+        reboot -f >/dev/null 2>&1 || true
+    echo "[init][riscv-weight] shutdown failed"
+    exec /bin/sh -i
+fi
+
 if [ -x /bin/mm-fault-bench ]; then
     mm_bench_args="$(cat /etc/mygo-mm-bench-args 2>/dev/null || true)"
     # shellcheck disable=SC2086

@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::cpu::SCHED_CAPACITY_SCALE;
-use crate::eevdf::{NICE_0_WEIGHT, SchedParams};
+use crate::eevdf::{SchedParams, scale_delta_by_weight};
 use crate::sched_class::{
     DEFAULT_RT_PERIOD_NS, DEFAULT_RT_RUNTIME_NS, RT_PRIO_MAX, SchedAttr, SchedClass, SchedPolicy,
 };
@@ -629,6 +629,10 @@ impl Runqueue {
 
         if target.sched.policy() != SchedPolicy::Fair
             || !task_can_run_on(target, cpu_mask)
+            // 精确交接目标不可能是 current（下一项已显式排除），因此只要仍有
+            // CPU 执行所有权，就尚未完成上下文保存。调用方的无锁预检与这里拿
+            // rq 锁之间可能跨过远端 claim，必须在摘除队列节点前再次拒绝。
+            || target.running_cpu().is_some()
             || inner
                 .current
                 .as_ref()
@@ -1414,11 +1418,11 @@ fn requeue_ready_deadline_locked(inner: &mut RqInner, now_ns: u64) -> bool {
 }
 
 fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64) {
-    let weight = curr.sched.weight() as u128;
+    let weight = curr.sched.weight();
     if weight == 0 {
         return;
     }
-    let delta_vr = (delta_ns as u128 * NICE_0_WEIGHT as u128 / weight) as u64;
+    let delta_vr = scale_delta_by_weight(delta_ns, weight);
     if delta_vr == 0 {
         return;
     }
@@ -1450,6 +1454,8 @@ fn avg_vruntime_locked(inner: &RqInner) -> u64 {
     };
     if w_sum == 0 {
         inner.min_vruntime
+    } else if let (Ok(vw_sum), Ok(w_sum)) = (u64::try_from(vw_sum), u64::try_from(w_sum)) {
+        vw_sum / w_sum
     } else {
         (vw_sum / w_sum) as u64
     }

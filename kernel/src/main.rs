@@ -20,6 +20,8 @@ mod dtb;
 mod elm;
 mod initramfs;
 mod integrated_components;
+#[cfg(feature = "kcsan")]
+mod kcsan_runtime;
 mod net_runtime;
 mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -110,6 +112,13 @@ fn main() -> ! {
         ::sched::online_cpu_mask(),
         ::sched::active_cpu_mask(),
     );
+    #[cfg(feature = "kcsan")]
+    {
+        // AP 在建立架构 per-CPU 状态前也会经过已插桩代码。等全部 AP 完成
+        // 启动后再启用检测器，避免调试延迟干扰启动超时或读取未就绪的 tp。
+        kcsan_runtime::install();
+        kcsan_runtime::start_reporter();
+    }
     device_init::install_network_boot_config();
     let integrated =
         integrated_components::initialize_phase(integrated_components::IntegratedPhase::Runtime)
