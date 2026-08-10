@@ -30,6 +30,12 @@ RUST_HELLO_DIR := $(REPO_ROOT)/native/examples/rust-hello
 RUST_MANIFEST := $(RUST_HELLO_DIR)/program.json
 RUST_CHILD_DIR := $(REPO_ROOT)/native/examples/rust-child
 RUST_CHILD_MANIFEST := $(RUST_CHILD_DIR)/program.json
+RUST_CHILD_INCLUDE_DIR := $(INCLUDE_DIR)/rust-child
+RUST_CHILD_C_BINDING := $(RUST_CHILD_INCLUDE_DIR)/mygo_program.h
+RUST_CHILD_BINDING := $(RUST_CHILD_INCLUDE_DIR)/mygo_program.rs
+RUST_CHILD_OBJECT_DIR := $(OBJECT_DIR)/rust-child
+RUST_CHILD_RLIB := $(RUST_CHILD_OBJECT_DIR)/libanonlib.rlib
+RUST_CHILD_ANONLIB := $(RUST_CHILD_OBJECT_DIR)/anonlib.o
 RUST_PARENT_DIR := $(REPO_ROOT)/native/examples/rust-parent
 RUST_PARENT_MANIFEST := $(RUST_PARENT_DIR)/program.json
 RUST_INCLUDE_DIR := $(INCLUDE_DIR)/rust-hello
@@ -71,6 +77,7 @@ RING_IO_DIR := $(REPO_ROOT)/native/examples/ring-io
 RING_IO_MANIFEST := $(RING_IO_DIR)/program.json
 RING_IO_INCLUDE_DIR := $(INCLUDE_DIR)/ring-io
 RING_IO_BINDING := $(RING_IO_INCLUDE_DIR)/mygo_program.rs
+RING_IO_C_BINDING := $(RING_IO_INCLUDE_DIR)/mygo_program.h
 RING_IO_OBJECT_DIR := $(OBJECT_DIR)/ring-io
 RING_IO_RLIB := $(RING_IO_OBJECT_DIR)/libanonlib.rlib
 RING_IO_ANONLIB := $(RING_IO_OBJECT_DIR)/anonlib.o
@@ -80,6 +87,7 @@ SOCKET_RING_DIR := $(REPO_ROOT)/native/examples/socket-ring
 SOCKET_RING_MANIFEST := $(SOCKET_RING_DIR)/program.json
 SOCKET_RING_INCLUDE_DIR := $(INCLUDE_DIR)/socket-ring
 SOCKET_RING_BINDING := $(SOCKET_RING_INCLUDE_DIR)/mygo_program.rs
+SOCKET_RING_C_BINDING := $(SOCKET_RING_INCLUDE_DIR)/mygo_program.h
 SOCKET_RING_OBJECT_DIR := $(OBJECT_DIR)/socket-ring
 SOCKET_RING_RLIB := $(SOCKET_RING_OBJECT_DIR)/libanonlib.rlib
 SOCKET_RING_ANONLIB := $(SOCKET_RING_OBJECT_DIR)/anonlib.o
@@ -89,6 +97,7 @@ DEVICE_RING_DIR := $(REPO_ROOT)/native/examples/device-ring
 DEVICE_RING_MANIFEST := $(DEVICE_RING_DIR)/program.json
 DEVICE_RING_INCLUDE_DIR := $(INCLUDE_DIR)/device-ring
 DEVICE_RING_BINDING := $(DEVICE_RING_INCLUDE_DIR)/mygo_program.rs
+DEVICE_RING_C_BINDING := $(DEVICE_RING_INCLUDE_DIR)/mygo_program.h
 DEVICE_RING_OBJECT_DIR := $(OBJECT_DIR)/device-ring
 DEVICE_RING_RLIB := $(DEVICE_RING_OBJECT_DIR)/libanonlib.rlib
 DEVICE_RING_ANONLIB := $(DEVICE_RING_OBJECT_DIR)/anonlib.o
@@ -153,7 +162,9 @@ COMMON_RUSTFLAGS := --edition=2024 -C opt-level=2 -C panic=abort \
 	-C relocation-model=static -C code-model=medium -C codegen-units=1 -C debuginfo=0
 ANONLIB_METADATA := mygo_native_anonlib
 ANONLIB_PARENT_METADATA := mygo_native_anonlib_parent
+ANONLIB_CHILD_METADATA := mygo_native_anonlib_child
 RUST_HELLO_METADATA := mygo_native_rust_hello
+RUST_CHILD_METADATA := mygo_native_rust_child
 RUST_COMPONENT_HOST_METADATA := mygo_native_rust_component_host
 ANONLIB_COMPONENT_METADATA := mygo_native_anonlib_component
 RUST_PARENT_METADATA := mygo_native_rust_parent
@@ -223,7 +234,7 @@ RUST_CHILD_SOYO := $(OUTPUT)/rust-child.soyo
 RUST_PARENT_SOYO := $(OUTPUT)/rust-parent.soyo
 CHILD_C_OBJECT := $(CHILD_C_OBJECT_DIR)/child.o
 PARENT_C_OBJECT := $(PARENT_C_OBJECT_DIR)/parent.o
-RUST_CHILD_OBJECT := $(RUST_OBJECT_DIR)/rust-child.o
+RUST_CHILD_OBJECT := $(RUST_CHILD_OBJECT_DIR)/rust-child.o
 RUST_PARENT_OBJECT := $(RUST_PARENT_OBJECT_DIR)/rust-parent.o
 PARENT_C_CHILD_IMAGE_SOURCE := $(PARENT_C_OBJECT_DIR)/child-image.S
 PARENT_C_CHILD_IMAGE_OBJECT := $(PARENT_C_OBJECT_DIR)/child-image.o
@@ -391,6 +402,16 @@ $(RUST_BINDING): $(SOYO_LD) $(RUST_MANIFEST)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RUST_MANIFEST) \
 		--emit-rust-module $@
 
+$(RUST_CHILD_C_BINDING): $(SOYO_LD) $(RUST_CHILD_MANIFEST)
+	mkdir -p $(RUST_CHILD_INCLUDE_DIR)
+	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RUST_CHILD_MANIFEST) \
+		--emit-c-header $@
+
+$(RUST_CHILD_BINDING): $(SOYO_LD) $(RUST_CHILD_MANIFEST)
+	mkdir -p $(RUST_CHILD_INCLUDE_DIR)
+	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RUST_CHILD_MANIFEST) \
+		--emit-rust-module $@
+
 $(CHILD_C_BINDING): $(SOYO_LD) $(CHILD_C_MANIFEST)
 	mkdir -p $(CHILD_C_INCLUDE_DIR)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(CHILD_C_MANIFEST) \
@@ -426,15 +447,30 @@ $(RING_IO_BINDING): $(SOYO_LD) $(RING_IO_MANIFEST)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RING_IO_MANIFEST) \
 		--emit-rust-module $@
 
+$(RING_IO_C_BINDING): $(SOYO_LD) $(RING_IO_MANIFEST)
+	mkdir -p $(RING_IO_INCLUDE_DIR)
+	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RING_IO_MANIFEST) \
+		--emit-c-header $@
+
 $(SOCKET_RING_BINDING): $(SOYO_LD) $(SOCKET_RING_MANIFEST)
 	mkdir -p $(SOCKET_RING_INCLUDE_DIR)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(SOCKET_RING_MANIFEST) \
 		--emit-rust-module $@
 
+$(SOCKET_RING_C_BINDING): $(SOYO_LD) $(SOCKET_RING_MANIFEST)
+	mkdir -p $(SOCKET_RING_INCLUDE_DIR)
+	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(SOCKET_RING_MANIFEST) \
+		--emit-c-header $@
+
 $(DEVICE_RING_BINDING): $(SOYO_LD) $(DEVICE_RING_MANIFEST)
 	mkdir -p $(DEVICE_RING_INCLUDE_DIR)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(DEVICE_RING_MANIFEST) \
 		--emit-rust-module $@
+
+$(DEVICE_RING_C_BINDING): $(SOYO_LD) $(DEVICE_RING_MANIFEST)
+	mkdir -p $(DEVICE_RING_INCLUDE_DIR)
+	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(DEVICE_RING_MANIFEST) \
+		--emit-c-header $@
 
 $(COMPONENT_REPOSITORY_BINDING): $(SOYO_LD) $(COMPONENT_REPOSITORY_MANIFEST)
 	mkdir -p $(COMPONENT_REPOSITORY_INCLUDE_DIR)
@@ -556,6 +592,10 @@ $(CHILD_C_OBJECT_DIR)/ranalib-errno.o: $(REPO_ROOT)/native/ranalib/src/errno.c $
 	mkdir -p $(CHILD_C_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(CHILD_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
+$(CHILD_C_OBJECT_DIR)/ranalib-ctype.o: $(REPO_ROOT)/native/ranalib/src/ctype.c $(RANALIB_CTYPE_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(CHILD_C_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(CHILD_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
 $(CHILD_C_OBJECT_DIR)/ranalib-exit.o: $(REPO_ROOT)/native/ranalib/src/exit.c $(CHILD_C_BINDING) $(MRT_HEADER) $(RANALIB_STDLIB_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(CHILD_C_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(CHILD_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
@@ -564,7 +604,19 @@ $(CHILD_C_OBJECT_DIR)/ranalib-stdio.o: $(REPO_ROOT)/native/ranalib/src/stdio.c $
 	mkdir -p $(CHILD_C_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(CHILD_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
+$(CHILD_C_OBJECT_DIR)/ranalib-stdlib.o: $(REPO_ROOT)/native/ranalib/src/stdlib.c $(CHILD_C_BINDING) $(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDLIB_HEADER) $(RANALIB_STRING_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(CHILD_C_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(CHILD_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(CHILD_C_OBJECT_DIR)/ranalib-string.o: $(REPO_ROOT)/native/ranalib/src/string.c $(RANALIB_STRING_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(CHILD_C_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(CHILD_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
 $(PARENT_C_OBJECT_DIR)/ranalib-errno.o: $(REPO_ROOT)/native/ranalib/src/errno.c $(PARENT_C_BINDING) $(RANALIB_ERRNO_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(PARENT_C_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(PARENT_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(PARENT_C_OBJECT_DIR)/ranalib-ctype.o: $(REPO_ROOT)/native/ranalib/src/ctype.c $(RANALIB_CTYPE_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(PARENT_C_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(PARENT_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
@@ -573,6 +625,14 @@ $(PARENT_C_OBJECT_DIR)/ranalib-exit.o: $(REPO_ROOT)/native/ranalib/src/exit.c $(
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(PARENT_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
 $(PARENT_C_OBJECT_DIR)/ranalib-stdio.o: $(REPO_ROOT)/native/ranalib/src/stdio.c $(PARENT_C_BINDING) $(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDIO_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(PARENT_C_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(PARENT_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(PARENT_C_OBJECT_DIR)/ranalib-stdlib.o: $(REPO_ROOT)/native/ranalib/src/stdlib.c $(PARENT_C_BINDING) $(MRT_HEADER) $(RANALIB_ERRNO_HEADER) $(RANALIB_STDLIB_HEADER) $(RANALIB_STRING_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(PARENT_C_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(PARENT_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(PARENT_C_OBJECT_DIR)/ranalib-string.o: $(REPO_ROOT)/native/ranalib/src/string.c $(RANALIB_STRING_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(PARENT_C_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(PARENT_C_INCLUDE_DIR) $(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
@@ -596,6 +656,11 @@ $(RUST_PARENT_OBJECT_DIR)/mrt-lifecycle.o: $(REPO_ROOT)/native/mrt/src/lifecycle
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
 $(RUST_PARENT_OBJECT_DIR)/mrt-process.o: $(REPO_ROOT)/native/mrt/src/process.c $(RUST_PARENT_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(RUST_PARENT_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_PARENT_INCLUDE_DIR) \
+		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(RUST_PARENT_OBJECT_DIR)/mrt-component.o: $(REPO_ROOT)/native/mrt/src/component.c $(RUST_PARENT_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(RUST_PARENT_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_PARENT_INCLUDE_DIR) \
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
@@ -625,11 +690,34 @@ $(RUST_HELLO_OBJECT): $(RUST_HELLO_DIR)/main.rs $(ANONLIB_RLIB) $(RUST_BUILD_CON
 		--crate-type=bin --emit=obj --target=$(RUST_TARGET_TRIPLE) $(COMMON_RUSTFLAGS) \
 		-C metadata=$(RUST_HELLO_METADATA) --extern anonlib=$(ANONLIB_RLIB) -o $@
 
-$(RUST_CHILD_OBJECT): $(RUST_CHILD_DIR)/main.rs $(ANONLIB_RLIB) $(RUST_BUILD_CONFIG)
-	mkdir -p $(RUST_OBJECT_DIR)
+$(RUST_CHILD_OBJECT_DIR)/mrt-entry.o: $(ENTRY_SOURCE) $(C_BUILD_CONFIG)
+	mkdir -p $(RUST_CHILD_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_ASFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(RUST_CHILD_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(RUST_CHILD_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+	mkdir -p $(RUST_CHILD_OBJECT_DIR)
+	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RUST_CHILD_INCLUDE_DIR) \
+		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
+
+$(RUST_CHILD_RLIB): $(ANONLIB_SOURCES) $(RUST_CHILD_BINDING) $(RUST_BUILD_CONFIG)
+	mkdir -p $(RUST_CHILD_OBJECT_DIR)
+	MYGO_PROGRAM_RS=$(abspath $(RUST_CHILD_BINDING)) \
+		$(RUSTC) $(ANONLIB_SOURCE) --crate-name anonlib --crate-type=rlib \
+		--target=$(RUST_TARGET_TRIPLE) $(COMMON_RUSTFLAGS) \
+		-C metadata=$(ANONLIB_CHILD_METADATA) -o $@
+
+$(RUST_CHILD_ANONLIB): $(ANONLIB_SOURCES) $(RUST_CHILD_BINDING) $(RUST_BUILD_CONFIG)
+	mkdir -p $(RUST_CHILD_OBJECT_DIR)
+	MYGO_PROGRAM_RS=$(abspath $(RUST_CHILD_BINDING)) \
+		$(RUSTC) $(ANONLIB_SOURCE) --crate-name anonlib --crate-type=lib --emit=obj \
+		--target=$(RUST_TARGET_TRIPLE) $(COMMON_RUSTFLAGS) \
+		-C metadata=$(ANONLIB_CHILD_METADATA) -o $@
+
+$(RUST_CHILD_OBJECT): $(RUST_CHILD_DIR)/main.rs $(RUST_CHILD_RLIB) $(RUST_BUILD_CONFIG)
+	mkdir -p $(RUST_CHILD_OBJECT_DIR)
 	$(RUSTC) $(RUST_CHILD_DIR)/main.rs --crate-name soyo_rust_child \
 		--crate-type=bin --emit=obj --target=$(RUST_TARGET_TRIPLE) $(COMMON_RUSTFLAGS) \
-		-C metadata=$(RUST_HELLO_METADATA) --extern anonlib=$(ANONLIB_RLIB) -o $@
+		-C metadata=$(RUST_CHILD_METADATA) --extern anonlib=$(RUST_CHILD_RLIB) -o $@
 
 $(RUST_PARENT_OBJECT_DIR)/libanonlib.rlib: $(ANONLIB_SOURCES) $(RUST_PARENT_BINDING) $(RUST_BUILD_CONFIG)
 	mkdir -p $(RUST_PARENT_OBJECT_DIR)
@@ -725,13 +813,17 @@ $(CHILD_C_SOYO): \
 		$(CHILD_C_OBJECT_DIR)/mrt-entry.o $(CHILD_C_OBJECT_DIR)/mrt-start.o \
 		$(CHILD_C_OBJECT_DIR)/mrt-start-info.o $(CHILD_C_OBJECT_DIR)/mrt-lifecycle.o \
 		$(CHILD_C_OBJECT_DIR)/mrt-process.o $(CHILD_C_OBJECT_DIR)/mrt-entry-c.o \
-		$(CHILD_C_OBJECT_DIR)/ranalib-errno.o $(CHILD_C_OBJECT_DIR)/ranalib-exit.o \
+		$(CHILD_C_OBJECT_DIR)/ranalib-ctype.o $(CHILD_C_OBJECT_DIR)/ranalib-errno.o \
+		$(CHILD_C_OBJECT_DIR)/ranalib-exit.o \
+		$(CHILD_C_OBJECT_DIR)/ranalib-stdlib.o $(CHILD_C_OBJECT_DIR)/ranalib-string.o \
 		$(CHILD_C_OBJECT_DIR)/ranalib-stdio.o $(CHILD_C_OBJECT) $(CHILD_C_MANIFEST) $(SOYO_LD)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(CHILD_C_MANIFEST) -o $@ \
 		$(CHILD_C_OBJECT_DIR)/mrt-entry.o $(CHILD_C_OBJECT_DIR)/mrt-start.o \
 		$(CHILD_C_OBJECT_DIR)/mrt-start-info.o $(CHILD_C_OBJECT_DIR)/mrt-lifecycle.o \
 		$(CHILD_C_OBJECT_DIR)/mrt-process.o $(CHILD_C_OBJECT_DIR)/mrt-entry-c.o \
-		$(CHILD_C_OBJECT_DIR)/ranalib-errno.o $(CHILD_C_OBJECT_DIR)/ranalib-exit.o \
+		$(CHILD_C_OBJECT_DIR)/ranalib-ctype.o $(CHILD_C_OBJECT_DIR)/ranalib-errno.o \
+		$(CHILD_C_OBJECT_DIR)/ranalib-exit.o \
+		$(CHILD_C_OBJECT_DIR)/ranalib-stdlib.o $(CHILD_C_OBJECT_DIR)/ranalib-string.o \
 		$(CHILD_C_OBJECT_DIR)/ranalib-stdio.o $(CHILD_C_OBJECT)
 
 $(PARENT_C_CHILD_IMAGE_HEADER): $(PARENT_C_DIR)/child_image.h.in
@@ -754,21 +846,36 @@ $(PARENT_C_SOYO): \
 		$(PARENT_C_OBJECT_DIR)/mrt-entry.o $(PARENT_C_OBJECT_DIR)/mrt-start.o \
 		$(PARENT_C_OBJECT_DIR)/mrt-start-info.o $(PARENT_C_OBJECT_DIR)/mrt-lifecycle.o \
 		$(PARENT_C_OBJECT_DIR)/mrt-process.o $(PARENT_C_OBJECT_DIR)/mrt-entry-c.o \
-		$(PARENT_C_OBJECT_DIR)/ranalib-errno.o $(PARENT_C_OBJECT_DIR)/ranalib-exit.o \
+		$(PARENT_C_OBJECT_DIR)/ranalib-ctype.o $(PARENT_C_OBJECT_DIR)/ranalib-errno.o \
+		$(PARENT_C_OBJECT_DIR)/ranalib-exit.o \
+		$(PARENT_C_OBJECT_DIR)/ranalib-stdlib.o $(PARENT_C_OBJECT_DIR)/ranalib-string.o \
 		$(PARENT_C_OBJECT_DIR)/ranalib-stdio.o $(PARENT_C_OBJECT) \
 		$(PARENT_C_CHILD_IMAGE_OBJECT) $(PARENT_C_MANIFEST) $(SOYO_LD)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(PARENT_C_MANIFEST) -o $@ \
 		$(PARENT_C_OBJECT_DIR)/mrt-entry.o $(PARENT_C_OBJECT_DIR)/mrt-start.o \
 		$(PARENT_C_OBJECT_DIR)/mrt-start-info.o $(PARENT_C_OBJECT_DIR)/mrt-lifecycle.o \
 		$(PARENT_C_OBJECT_DIR)/mrt-process.o $(PARENT_C_OBJECT_DIR)/mrt-entry-c.o \
-		$(PARENT_C_OBJECT_DIR)/ranalib-errno.o $(PARENT_C_OBJECT_DIR)/ranalib-exit.o \
+		$(PARENT_C_OBJECT_DIR)/ranalib-ctype.o $(PARENT_C_OBJECT_DIR)/ranalib-errno.o \
+		$(PARENT_C_OBJECT_DIR)/ranalib-exit.o \
+		$(PARENT_C_OBJECT_DIR)/ranalib-stdlib.o $(PARENT_C_OBJECT_DIR)/ranalib-string.o \
 		$(PARENT_C_OBJECT_DIR)/ranalib-stdio.o $(PARENT_C_OBJECT) \
 		$(PARENT_C_CHILD_IMAGE_OBJECT)
 
-$(RUST_CHILD_SOYO): $(RUST_MRT_OBJECTS) $(ANONLIB_OBJECT) $(RUST_CHILD_OBJECT) \
+RUST_CHILD_OBJECTS := \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-entry.o \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-start.o \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-start_info.o \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-lifecycle.o \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-process.o \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-component.o \
+	$(RUST_CHILD_OBJECT_DIR)/mrt-entry_rust.o \
+	$(RUST_CHILD_ANONLIB) \
+	$(RUST_CHILD_OBJECT)
+
+$(RUST_CHILD_SOYO): $(RUST_CHILD_OBJECTS) \
 		$(RUST_CHILD_MANIFEST) $(SOYO_LD)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RUST_CHILD_MANIFEST) -o $@ \
-		$(RUST_MRT_OBJECTS) $(ANONLIB_OBJECT) $(RUST_CHILD_OBJECT)
+		$(RUST_CHILD_OBJECTS)
 
 $(RUST_PARENT_CHILD_IMAGE_SOURCE): $(RUST_CHILD_SOYO)
 	mkdir -p $(RUST_PARENT_OBJECT_DIR)
@@ -781,13 +888,15 @@ $(RUST_PARENT_CHILD_IMAGE_OBJECT): $(RUST_PARENT_CHILD_IMAGE_SOURCE)
 $(RUST_PARENT_SOYO): \
 		$(RUST_PARENT_OBJECT_DIR)/mrt-entry.o $(RUST_PARENT_OBJECT_DIR)/mrt-start.o \
 		$(RUST_PARENT_OBJECT_DIR)/mrt-start-info.o $(RUST_PARENT_OBJECT_DIR)/mrt-lifecycle.o \
-		$(RUST_PARENT_OBJECT_DIR)/mrt-process.o $(RUST_PARENT_OBJECT_DIR)/mrt-entry-rust.o \
+		$(RUST_PARENT_OBJECT_DIR)/mrt-process.o $(RUST_PARENT_OBJECT_DIR)/mrt-component.o \
+		$(RUST_PARENT_OBJECT_DIR)/mrt-entry-rust.o \
 		$(RUST_PARENT_OBJECT_DIR)/anonlib.o $(RUST_PARENT_OBJECT) \
 		$(RUST_PARENT_CHILD_IMAGE_OBJECT) $(RUST_PARENT_MANIFEST) $(SOYO_LD)
 	$(SOYO_LD) --target $(SOYO_TARGET) --manifest $(RUST_PARENT_MANIFEST) -o $@ \
 		$(RUST_PARENT_OBJECT_DIR)/mrt-entry.o $(RUST_PARENT_OBJECT_DIR)/mrt-start.o \
 		$(RUST_PARENT_OBJECT_DIR)/mrt-start-info.o $(RUST_PARENT_OBJECT_DIR)/mrt-lifecycle.o \
-		$(RUST_PARENT_OBJECT_DIR)/mrt-process.o $(RUST_PARENT_OBJECT_DIR)/mrt-entry-rust.o \
+		$(RUST_PARENT_OBJECT_DIR)/mrt-process.o $(RUST_PARENT_OBJECT_DIR)/mrt-component.o \
+		$(RUST_PARENT_OBJECT_DIR)/mrt-entry-rust.o \
 		$(RUST_PARENT_OBJECT_DIR)/anonlib.o $(RUST_PARENT_OBJECT) \
 		$(RUST_PARENT_CHILD_IMAGE_OBJECT)
 
@@ -934,7 +1043,7 @@ $(RING_IO_OBJECT_DIR)/mrt-entry.o: $(ENTRY_SOURCE) $(C_BUILD_CONFIG)
 	mkdir -p $(RING_IO_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_ASFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
-$(RING_IO_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(RING_IO_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+$(RING_IO_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(RING_IO_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(RING_IO_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(RING_IO_INCLUDE_DIR) \
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
@@ -978,7 +1087,7 @@ $(SOCKET_RING_OBJECT_DIR)/mrt-entry.o: $(ENTRY_SOURCE) $(C_BUILD_CONFIG)
 	mkdir -p $(SOCKET_RING_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_ASFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
-$(SOCKET_RING_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(SOCKET_RING_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+$(SOCKET_RING_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(SOCKET_RING_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(SOCKET_RING_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(SOCKET_RING_INCLUDE_DIR) \
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
@@ -1022,7 +1131,7 @@ $(DEVICE_RING_OBJECT_DIR)/mrt-entry.o: $(ENTRY_SOURCE) $(C_BUILD_CONFIG)
 	mkdir -p $(DEVICE_RING_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) $(COMMON_ASFLAGS) $(TARGET_FLAGS) -c $< -o $@
 
-$(DEVICE_RING_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(DEVICE_RING_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
+$(DEVICE_RING_OBJECT_DIR)/mrt-%.o: $(REPO_ROOT)/native/mrt/src/%.c $(DEVICE_RING_C_BINDING) $(MRT_HEADER) $(C_BUILD_CONFIG)
 	mkdir -p $(DEVICE_RING_OBJECT_DIR)
 	$(CLANG) --target=$(TARGET_TRIPLE) -I$(DEVICE_RING_INCLUDE_DIR) \
 		$(COMMON_CFLAGS) $(TARGET_FLAGS) -c $< -o $@
