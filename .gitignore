@@ -33,5 +33,7 @@ tests/elm/*/rust-toolchain.toml
 # vendor 不受上述规则限制
 !vendor/**
 __pycache__/
+bench/results/*
+!bench/results/.gitignore
 kernel-la.lock
 kernel-rv.lock
