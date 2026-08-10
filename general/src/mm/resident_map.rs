@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 const RADIX_BITS: usize = 6;
@@ -8,13 +9,115 @@ const RADIX_MASK: usize = RADIX_SLOTS - 1;
 
 enum RadixNode<T> {
     Branch([Option<Box<RadixNode<T>>>; RADIX_SLOTS]),
-    Leaf([Option<T>; RADIX_SLOTS]),
+    Leaf(RadixSlots<T>),
+}
+
+struct RadixSlots<T> {
+    occupied: u64,
+    entries: [MaybeUninit<T>; RADIX_SLOTS],
+}
+
+impl<T> RadixSlots<T> {
+    const fn new() -> Self {
+        Self {
+            occupied: 0,
+            entries: [const { MaybeUninit::uninit() }; RADIX_SLOTS],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.occupied == 0
+    }
+
+    fn contains(&self, slot: usize) -> bool {
+        debug_assert!(slot < RADIX_SLOTS);
+        self.occupied & (1u64 << slot) != 0
+    }
+
+    fn get(&self, slot: usize) -> Option<&T> {
+        self.contains(slot).then(|| {
+            // Safety: 占用位只在对应槽位完成初始化后设置。
+            unsafe { self.entries[slot].assume_init_ref() }
+        })
+    }
+
+    fn get_mut(&mut self, slot: usize) -> Option<&mut T> {
+        if !self.contains(slot) {
+            return None;
+        }
+        // Safety: 占用位保证该槽位已初始化，独占借用保证不会制造别名。
+        Some(unsafe { self.entries[slot].assume_init_mut() })
+    }
+
+    fn insert(&mut self, slot: usize, value: T) -> Option<T> {
+        debug_assert!(slot < RADIX_SLOTS);
+        if self.contains(slot) {
+            // Safety: 占用位保证该槽位已初始化。
+            return Some(core::mem::replace(
+                unsafe { self.entries[slot].assume_init_mut() },
+                value,
+            ));
+        }
+        self.entries[slot].write(value);
+        self.occupied |= 1u64 << slot;
+        None
+    }
+
+    fn take(&mut self, slot: usize) -> Option<T> {
+        if !self.contains(slot) {
+            return None;
+        }
+        self.occupied &= !(1u64 << slot);
+        // Safety: 清除占用位前该槽位已初始化，此后所有路径都不会再次读取它。
+        Some(unsafe { self.entries[slot].assume_init_read() })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        let occupied = self.occupied;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(move |(slot, entry)| {
+                (occupied & (1u64 << slot) != 0)
+                    .then(|| {
+                        // Safety: 迭代使用创建时的占用位快照，只暴露已初始化槽位。
+                        unsafe { entry.assume_init_ref() }
+                    })
+                    .map(|value| (slot, value))
+            })
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+        let occupied = self.occupied;
+        self.entries
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(slot, entry)| {
+                (occupied & (1u64 << slot) != 0)
+                    .then(|| {
+                        // Safety: 每个槽位只迭代一次，且调用方持有整个槽位表的独占借用。
+                        unsafe { entry.assume_init_mut() }
+                    })
+                    .map(|value| (slot, value))
+            })
+    }
+}
+
+impl<T> Drop for RadixSlots<T> {
+    fn drop(&mut self) {
+        for slot in 0..RADIX_SLOTS {
+            if self.contains(slot) {
+                // Safety: 占用位保证该槽位已初始化，析构期间每个槽位只访问一次。
+                unsafe { self.entries[slot].assume_init_drop() };
+            }
+        }
+    }
 }
 
 impl<T> RadixNode<T> {
     fn new(level: usize) -> Self {
         if level == 0 {
-            Self::Leaf(core::array::from_fn(|_| None))
+            Self::Leaf(RadixSlots::new())
         } else {
             Self::Branch(core::array::from_fn(|_| None))
         }
@@ -23,7 +126,7 @@ impl<T> RadixNode<T> {
     fn is_empty(&self) -> bool {
         match self {
             Self::Branch(children) => children.iter().all(Option::is_none),
-            Self::Leaf(entries) => entries.iter().all(Option::is_none),
+            Self::Leaf(entries) => entries.is_empty(),
         }
     }
 }
@@ -113,11 +216,9 @@ impl<T> RadixPageMap<T> {
             let leaf_slot = page_index & RADIX_MASK;
             let chunk_len = (RADIX_SLOTS - leaf_slot).min(value_count - inserted);
             let entries = leaf_entries_mut(&mut self.root, self.root_level, page_index);
-            for (entry, value) in entries[leaf_slot..leaf_slot + chunk_len]
-                .iter_mut()
-                .zip(values.by_ref())
-            {
-                if entry.replace(value).is_some() {
+            for slot in leaf_slot..leaf_slot + chunk_len {
+                let value = values.next().expect("连续 resident 页迭代器提前结束");
+                if entries.insert(slot, value).is_some() {
                     replaced += 1;
                 } else {
                     self.len += 1;
@@ -273,7 +374,7 @@ fn get_node<T>(node: &RadixNode<T>, level: usize, page_index: usize) -> Option<&
         }
         RadixNode::Leaf(entries) => {
             debug_assert_eq!(level, 0);
-            entries[page_index & RADIX_MASK].as_ref()
+            entries.get(page_index & RADIX_MASK)
         }
     }
 }
@@ -287,7 +388,7 @@ fn get_node_mut<T>(node: &mut RadixNode<T>, level: usize, page_index: usize) -> 
         }
         RadixNode::Leaf(entries) => {
             debug_assert_eq!(level, 0);
-            entries[page_index & RADIX_MASK].as_mut()
+            entries.get_mut(page_index & RADIX_MASK)
         }
     }
 }
@@ -302,7 +403,7 @@ fn insert_node<T>(node: &mut RadixNode<T>, level: usize, page_index: usize, valu
         }
         RadixNode::Leaf(entries) => {
             debug_assert_eq!(level, 0);
-            entries[page_index & RADIX_MASK].replace(value)
+            entries.insert(page_index & RADIX_MASK, value)
         }
     }
 }
@@ -311,7 +412,7 @@ fn leaf_entries_mut<T>(
     node: &mut RadixNode<T>,
     level: usize,
     page_index: usize,
-) -> &mut [Option<T>; RADIX_SLOTS] {
+) -> &mut RadixSlots<T> {
     match node {
         RadixNode::Branch(children) => {
             debug_assert!(level != 0);
@@ -344,7 +445,7 @@ fn remove_node<T>(node: &mut RadixNode<T>, level: usize, page_index: usize) -> O
         }
         RadixNode::Leaf(entries) => {
             debug_assert_eq!(level, 0);
-            entries[page_index & RADIX_MASK].take()
+            entries.take(page_index & RADIX_MASK)
         }
     }
 }
@@ -373,10 +474,8 @@ fn for_each_node_mut<T>(
             }
         }
         RadixNode::Leaf(entries) => {
-            for (slot, entry) in entries.iter_mut().enumerate() {
-                if let Some(value) = entry.as_mut() {
-                    visit((prefix | slot) << page_shift, value);
-                }
+            for (slot, value) in entries.iter_mut() {
+                visit((prefix | slot) << page_shift, value);
             }
         }
     }
@@ -407,7 +506,7 @@ fn for_each_range_node<T>(
             }
         }
         RadixNode::Leaf(entries) => {
-            for (slot, entry) in entries.iter().enumerate() {
+            for (slot, value) in entries.iter() {
                 let page_index = prefix | slot;
                 if page_index >= range.end {
                     break;
@@ -415,9 +514,7 @@ fn for_each_range_node<T>(
                 if page_index < range.start {
                     continue;
                 }
-                if let Some(value) = entry.as_ref() {
-                    visit(page_index << page_shift, value);
-                }
+                visit(page_index << page_shift, value);
             }
         }
     }
@@ -448,7 +545,7 @@ fn for_each_range_node_mut<T>(
             }
         }
         RadixNode::Leaf(entries) => {
-            for (slot, entry) in entries.iter_mut().enumerate() {
+            for (slot, value) in entries.iter_mut() {
                 let page_index = prefix | slot;
                 if page_index >= range.end {
                     break;
@@ -456,9 +553,7 @@ fn for_each_range_node_mut<T>(
                 if page_index < range.start {
                     continue;
                 }
-                if let Some(value) = entry.as_mut() {
-                    visit(page_index << page_shift, value);
-                }
+                visit(page_index << page_shift, value);
             }
         }
     }
@@ -466,12 +561,39 @@ fn for_each_range_node_mut<T>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::rc::Rc;
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::cell::Cell;
 
-    use super::RadixPageMap;
+    use super::{RadixPageMap, RadixSlots};
 
     const PAGE_SIZE: usize = 4096;
+
+    struct DropCounter(Rc<Cell<usize>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn radix_slots_drop_each_initialized_value_once() {
+        let drops = Rc::new(Cell::new(0));
+        let mut slots = RadixSlots::new();
+        assert!(slots.insert(3, DropCounter(Rc::clone(&drops))).is_none());
+        let replaced = slots
+            .insert(3, DropCounter(Rc::clone(&drops)))
+            .expect("占用槽位必须返回旧值");
+        drop(replaced);
+        assert_eq!(drops.get(), 1);
+        drop(slots.take(3));
+        assert_eq!(drops.get(), 2);
+        slots.insert(7, DropCounter(Rc::clone(&drops)));
+        drop(slots);
+        assert_eq!(drops.get(), 3);
+    }
 
     #[test]
     fn exact_operations_cross_radix_boundaries() {

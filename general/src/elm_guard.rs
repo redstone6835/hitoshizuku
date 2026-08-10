@@ -701,8 +701,7 @@ pub fn validate_current_memory_range(address: usize, len: usize, write: bool) ->
         return crate::elm_image::validate_elm_image_range(address, len, true, write, false);
     }
     let cell = frame.cell.load(Ordering::Acquire);
-    allocator::KERNEL_ALLOCATOR
-        .query_owned_range(cell, address, len)
+    allocator::KERNEL_ALLOCATOR.query_owned_range(cell, address, len)
 }
 
 /// 返回当前 ELM 调用已经由装载器验证的代码和镜像边界。
