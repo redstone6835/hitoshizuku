@@ -12,10 +12,56 @@ use native_abi::{
     OperationId, Rights, operation, status,
 };
 use sched::{ProcessGroup, ProcessPersonalityState, SchedParams, Session, Task, ThreadGroup};
+use soyo::ImageSegment;
+use soyo::registry::{SegmentKind, SegmentPermissions};
 
 use super::dispatch::dispatch_native_call;
 use super::operations::{map_stream_read_error, map_stream_write_error, stream_read_progress};
 use super::{KernelNativeObject, NativeProcessState};
+
+#[ktest]
+fn component_final_permissions_protect_only_unmapped_gaps() {
+    const BASE: usize = 0x4000_0000;
+    const PAGE: u64 = 4096;
+
+    let segments = [
+        ImageSegment {
+            kind: SegmentKind::Code,
+            permissions: (SegmentPermissions::READ | SegmentPermissions::EXECUTE).bits(),
+            virtual_offset: 0,
+            file_offset: PAGE,
+            file_size: 32,
+            memory_size: 32,
+            alignment: PAGE,
+        },
+        ImageSegment {
+            kind: SegmentKind::Data,
+            permissions: (SegmentPermissions::READ | SegmentPermissions::WRITE).bits(),
+            virtual_offset: PAGE * 3,
+            file_offset: PAGE * 2,
+            file_size: 16,
+            memory_size: 16,
+            alignment: PAGE,
+        },
+    ];
+
+    let plan =
+        super::component::component_protection_plan(&(BASE..BASE + PAGE as usize * 4), &segments)
+            .expect("合法组件段应生成最终权限计划");
+
+    assert_eq!(plan.len(), 3);
+    assert_eq!(plan[0].0, BASE..BASE + PAGE as usize);
+    assert!(plan[0].1.has(VmFlags::READ));
+    assert!(plan[0].1.has(VmFlags::EXEC));
+    assert_eq!(plan[1].0, BASE + PAGE as usize..BASE + PAGE as usize * 3);
+    assert_eq!(plan[1].1.permissions(), VmFlags::EMPTY);
+    assert_eq!(
+        plan[2].0,
+        BASE + PAGE as usize * 3..BASE + PAGE as usize * 4
+    );
+    assert!(plan[2].1.has(VmFlags::READ));
+    assert!(plan[2].1.has(VmFlags::WRITE));
+}
 
 #[ktest]
 fn native_fixed_record_copy_supports_cross_page_user_ranges() {

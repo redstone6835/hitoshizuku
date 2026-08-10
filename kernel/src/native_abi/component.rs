@@ -6,6 +6,7 @@ use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use general::TaskOps;
 use general::mm::{VmSpace, copy_from_user, copy_to_user};
 use general::syscall::NativeCallOutcome;
 use mm::VmFlags;
@@ -23,8 +24,8 @@ use sched::sync::Spinlock;
 use sched::{Task, TaskState, WaitQueue};
 use soyo::registry::{DynamicRelocationKind, RelocationKind, SegmentKind, SegmentPermissions};
 use soyo::{
-    ComponentGraphError, ComponentGraphIdentity, ComponentGraphNode, DynamicRelocation, Relocation,
-    SymbolExport, plan_component_graph,
+    ComponentGraphError, ComponentGraphIdentity, ComponentGraphNode, DynamicRelocation,
+    ImageSegment, Relocation, SymbolExport, plan_component_graph,
 };
 
 use super::dispatch::native_return;
@@ -1055,6 +1056,7 @@ fn prepare_load(
         .try_reserve_exact(resources.nodes.len())
         .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
     let (new_nodes, owned_slots) = resources.disarm();
+    arch::CurrentTaskOps::sync_icache();
     let mut load = LoadTransaction {
         nodes: new_nodes,
         root,
@@ -2257,34 +2259,61 @@ fn populate_component(
         ..ComponentContext::default()
     };
     write_vm_value(vm, context_range.start, &context)?;
-    vm.mprotect(image_range.clone(), VmFlags::EMPTY)
+    for (range, flags) in component_protection_plan(image_range, &image.metadata.segments)? {
+        vm.mprotect(range, flags)
+            .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
+    }
+    vm.mprotect(
+        context_range.clone(),
+        VmFlags::EMPTY.with(VmFlags::USER).with(VmFlags::READ),
+    )
+    .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
+    Ok(())
+}
+
+pub(super) fn component_protection_plan(
+    image_range: &Range<usize>,
+    segments: &[ImageSegment],
+) -> Result<Vec<(Range<usize>, VmFlags)>, u32> {
+    let capacity = segments
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(status::CORE_RESOURCE_EXHAUSTED)?;
+    let mut plan = Vec::new();
+    plan.try_reserve_exact(capacity)
         .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
-    for segment in &image.metadata.segments {
+    let mut cursor = image_range.start;
+    for segment in segments {
         if segment.kind == SegmentKind::TlsTemplate {
             continue;
         }
+        let offset =
+            usize::try_from(segment.virtual_offset).map_err(|_| status::COMPONENT_INVALID_IMAGE)?;
+        let memory_size =
+            usize::try_from(segment.memory_size).map_err(|_| status::COMPONENT_INVALID_IMAGE)?;
         let start = image_range
             .start
-            .checked_add(segment.virtual_offset as usize)
+            .checked_add(offset)
             .ok_or(status::COMPONENT_INVALID_IMAGE)?;
-        let length = align_up(segment.memory_size as usize, native_abi::PAGE_SIZE as usize)
+        let length = align_up(memory_size, native_abi::PAGE_SIZE as usize)
             .ok_or(status::COMPONENT_INVALID_IMAGE)?;
-        let mut flags = VmFlags::EMPTY;
-        if segment.permissions & SegmentPermissions::READ.bits() != 0 {
-            flags = flags.with(VmFlags::READ);
+        let end = start
+            .checked_add(length)
+            .ok_or(status::COMPONENT_INVALID_IMAGE)?;
+        if start < cursor || end > image_range.end {
+            return Err(status::COMPONENT_INVALID_IMAGE);
         }
-        if segment.permissions & SegmentPermissions::WRITE.bits() != 0 {
-            flags = flags.with(VmFlags::WRITE);
+        if cursor < start {
+            plan.push((cursor..start, VmFlags::EMPTY));
         }
-        if segment.permissions & SegmentPermissions::EXECUTE.bits() != 0 {
-            flags = flags.with(VmFlags::EXEC);
-        }
-        vm.mprotect(start..start + length, flags)
-            .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
+        plan.push((start..end, segment_vm_flags(segment.permissions)));
+        cursor = end;
     }
-    vm.mprotect(context_range.clone(), VmFlags::EMPTY.with(VmFlags::READ))
-        .map_err(|_| status::CORE_RESOURCE_EXHAUSTED)?;
-    Ok(())
+    if cursor < image_range.end {
+        plan.push((cursor..image_range.end, VmFlags::EMPTY));
+    }
+    Ok(plan)
 }
 
 fn segment_requires_eager_backing(image: &ImageObject, index: usize) -> bool {
