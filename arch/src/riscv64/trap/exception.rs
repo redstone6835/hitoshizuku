@@ -438,6 +438,11 @@ fn handle_user_syscall(tf_ptr: usize) -> usize {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, tf.satp)
     };
+    #[cfg(feature = "syscall-model-markers")]
+    let _syscall_model = {
+        let task = sched::current_task();
+        profiling::syscall_model_scope(task.profile_session_id(), task.syscall_model_task_id(), nr)
+    };
     general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
     if sched::needs_resched_current() {
         sched::preempt_if_needed(kernel_timestamp_ns());
@@ -710,6 +715,12 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5], tf.satp)
     };
+    #[cfg(feature = "syscall-model-markers")]
+    let _syscall_model = profiling::syscall_model_scope(
+        task.as_arc().profile_session_id(),
+        task.as_arc().syscall_model_task_id(),
+        nr,
+    );
     #[cfg(feature = "performance-profile")]
     let original_switch_sequence = unsafe { trap_frame_ref(tf_ptr) }.tval;
     let dispatch_outcome = general::syscall::dispatch_fast_with_frame(

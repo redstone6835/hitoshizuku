@@ -309,9 +309,9 @@ pub struct AllocationRecord {
     /// 后端私有定位 cookie。
     ///
     /// 这个字段不属于外部所有权语义，只给 allocator 内部热路径使用。例如 slab 会在
-    /// registry record 里保存所属 `SlabNode` 地址，释放时即可直接回到对应 slab，而不必
-    /// 再按 size class 扫描整条 slab 链。外部扩展应通过公开字段理解对象属性，不能依赖
-    /// 该值的格式或稳定性。
+    /// registry record 里保存所属 slab 生命周期的不可伪造 cookie，释放时可与页目录的
+    /// 当前 owner 交叉校验，而不必扫描 size class 链。外部扩展应通过公开字段理解对象
+    /// 属性，不能依赖该值的格式或稳定性。
     pub(crate) backend_cookie: usize,
 }
 

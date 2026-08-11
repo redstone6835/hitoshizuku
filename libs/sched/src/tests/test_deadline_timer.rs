@@ -9,6 +9,7 @@ use crate::ArchDeadlineTimerOps;
 use crate::scheduler::{
     cancel_sleep_deadline, earliest_deadline_for_test, register_sleep_deadline,
     register_sleep_deadline_for_test, reprogram_current_deadline, set_realtime_itimer,
+    take_expired_sleepers_for_test,
 };
 
 const NO_DEADLINE: u64 = u64::MAX;
@@ -61,4 +62,35 @@ fn deadline_timer_tracks_earliest_source_and_cancellation() {
 
     cancel_sleep_deadline(&first);
     assert_eq!(LAST_DEADLINE.load(Ordering::Acquire), NO_DEADLINE);
+}
+
+#[ktest]
+fn expired_sleepers_are_taken_in_one_cpu_local_batch() {
+    let first = make_task();
+    let second = make_task();
+    let future = make_task();
+    let remote = make_task();
+
+    assert!(register_sleep_deadline_for_test(&first, 100, 0));
+    assert!(register_sleep_deadline_for_test(&second, 120, 0));
+    assert!(register_sleep_deadline_for_test(&future, 300, 0));
+    assert!(register_sleep_deadline_for_test(&remote, 80, 1));
+
+    let expired = take_expired_sleepers_for_test(150, 0);
+    assert_eq!(expired.len(), 2);
+    assert!(
+        expired
+            .iter()
+            .any(|task| alloc::sync::Arc::ptr_eq(task, &first))
+    );
+    assert!(
+        expired
+            .iter()
+            .any(|task| alloc::sync::Arc::ptr_eq(task, &second))
+    );
+    assert_eq!(earliest_deadline_for_test(0), Some(300));
+    assert_eq!(earliest_deadline_for_test(1), Some(80));
+
+    cancel_sleep_deadline(&future);
+    cancel_sleep_deadline(&remote);
 }

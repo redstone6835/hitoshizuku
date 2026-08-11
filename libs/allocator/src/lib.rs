@@ -599,8 +599,16 @@ impl KernelMemorySubsystem {
 
     pub fn init_slab(&self, cpu_count: usize) {
         let _guard = self.init_lock.lock();
-        self.slab.init(cpu_count);
-        self.tracked_slab.init(cpu_count);
+        let kernel_region = self
+            .load_kernel_heap_region_fn()
+            .map(|region| region())
+            .unwrap_or((0, 0));
+        let tracked_region = self
+            .load_tracked_heap_region_fn()
+            .map(|region| region())
+            .unwrap_or((0, 0));
+        self.slab.init(cpu_count, kernel_region);
+        self.tracked_slab.init(cpu_count, tracked_region);
     }
 
     pub fn activate_global(&self) -> Result<(), InitError> {
@@ -1708,11 +1716,7 @@ impl KernelMemorySubsystem {
         let result = match record.kind {
             AllocationKind::Boot => Ok(()),
             AllocationKind::Small => {
-                if slab.free_record_reclaiming(
-                    record,
-                    self.current_cpu_id(),
-                    Some((&self.phys, &self.vmem)),
-                ) {
+                if slab.free_record(record, self.current_cpu_id()) {
                     Ok(())
                 } else {
                     panic!(
@@ -2122,14 +2126,10 @@ impl KernelMemorySubsystem {
                         .with_arena(allocation_arena)
                         .with_sizes(request.size, usable_size, request.align)
                         .with_accounting_owner(request.accounting_owner().unwrap_or(0))
-                        .with_backend_cookie(allocation.slab_node);
+                        .with_backend_cookie(allocation.backend_cookie);
                         if arena == crate::space::ArenaKind::Tracked {
                             self.register_allocation(record, || {
-                                slab.free_record_reclaiming(
-                                    record,
-                                    cpu,
-                                    Some((&self.phys, &self.vmem)),
-                                );
+                                slab.free_record(record, cpu);
                             })?;
                         }
                         Ok(record)
@@ -2309,11 +2309,7 @@ impl KernelMemorySubsystem {
         };
         match record.kind {
             AllocationKind::Small => {
-                if !slab.free_record_reclaiming(
-                    record,
-                    self.current_cpu_id(),
-                    Some((&self.phys, &self.vmem)),
-                ) {
+                if !slab.free_record(record, self.current_cpu_id()) {
                     panic!(
                         "[alloc][invariant] moved small allocation release failed: ptr={:#x} size={} usable={}",
                         record.ptr, record.size, record.usable_size

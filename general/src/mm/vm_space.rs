@@ -1718,6 +1718,7 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
             .collect()
     }
 
+    #[cfg(test)]
     fn claim_batch_prefix(&self, keys: &[FilePageKey]) -> PrivateFilePageClaims<'_, SHARD_COUNT> {
         let mut claims = PrivateFilePageClaims::new();
         for key in keys {
@@ -1729,6 +1730,41 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
             }
         }
         claims
+    }
+
+    fn claim_contiguous_prefix(
+        &self,
+        first_key: FilePageKey,
+        page_size: usize,
+        pages: usize,
+    ) -> Option<PrivateFilePageClaimPrefix<'_, SHARD_COUNT>> {
+        let mut owners = PrivateFilePageLoadOwners::new();
+        for index in 0..pages {
+            let Some(offset) = private_file_batch_page_offset(first_key.offset, index, page_size)
+            else {
+                for (key, load_id) in &owners {
+                    self.abort_load(*key, *load_id, None);
+                }
+                return None;
+            };
+            let key = FilePageKey {
+                offset,
+                ..first_key
+            };
+            match self.claim(key) {
+                PrivateFilePageCacheClaim::Owner(load_id) => owners.push((key, load_id)),
+                terminal => {
+                    return Some(PrivateFilePageClaimPrefix {
+                        owners,
+                        terminal: Some((index, terminal)),
+                    });
+                }
+            }
+        }
+        Some(PrivateFilePageClaimPrefix {
+            owners,
+            terminal: None,
+        })
     }
 
     fn wrap_claim(
@@ -2031,15 +2067,17 @@ struct PreparedFilePage {
 
 type PreparedFilePages = SmallVec<[PreparedFilePage; FILE_FAULT_AROUND_PAGES]>;
 type PrivateFilePageBatch = SmallVec<[Arc<ResidentPage>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
-type PrivateFilePageLoadOwner = (FilePageKey, u64, u64);
+type PrivateFilePageLoadOwner = (FilePageKey, u64);
 type PrivateFilePageLoadOwners = SmallVec<[PrivateFilePageLoadOwner; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+#[cfg(test)]
 type PrivateFilePageClaims<'a, const SHARD_COUNT: usize> =
     SmallVec<[PrivateFilePageCacheClaim<'a, SHARD_COUNT>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
-type PrivateFilePageCandidate = (FilePageKey, u64, Arc<ResidentPage>);
-type PrivateFilePageCandidates = SmallVec<[PrivateFilePageCandidate; PRIVATE_FILE_BATCH_MAX_PAGES]>;
-type PublishedPrivateFilePages =
-    SmallVec<[(FilePageKey, Arc<ResidentPage>); PRIVATE_FILE_BATCH_MAX_PAGES]>;
 type PrivateFilePageTargets<'a> = SmallVec<[&'a mut [u8]; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+
+struct PrivateFilePageClaimPrefix<'a, const SHARD_COUNT: usize> {
+    owners: PrivateFilePageLoadOwners,
+    terminal: Option<(usize, PrivateFilePageCacheClaim<'a, SHARD_COUNT>)>,
+}
 
 struct AnonStoreFaultAround {
     fault_page: usize,
@@ -4681,7 +4719,8 @@ impl VmSpace {
         let virt_fn = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EFAULT)?;
-        Ok((Arc::clone(&page), virt_fn(page.paddr()) + offset, len))
+        let kva = virt_fn(page.paddr()) + offset;
+        Ok((page, kva, len))
     }
 
     /// 在一次 VMA/pages 快照中固定已经常驻且权限就绪的用户页。
@@ -5620,63 +5659,37 @@ fn load_private_file_page_batch(
     if plan.pages > PRIVATE_FILE_BATCH_MAX_PAGES {
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
-    let mut keys = SmallVec::<[FilePageKey; PRIVATE_FILE_BATCH_MAX_PAGES]>::new();
-    let mut offsets = SmallVec::<[u64; PRIVATE_FILE_BATCH_MAX_PAGES]>::new();
-    for index in 0..plan.pages {
-        let Some(offset) = private_file_batch_page_offset(file_off, index, page_size) else {
-            return Ok(PrivateFilePageBatchLoad::Fallback);
-        };
-        keys.push(FilePageKey::new_private(file_key, offset, generation));
-        offsets.push(offset);
-    }
-
-    let mut owners = PrivateFilePageLoadOwners::new();
-    let mut cached = None;
-    let mut fatal_error = None;
-    let mut force_fallback = false;
-    for (index, ((key, offset), claim)) in keys
-        .iter()
-        .copied()
-        .zip(offsets.iter().copied())
-        .zip(PRIVATE_FILE_PAGES.claim_batch_prefix(&keys))
-        .enumerate()
-    {
-        match claim {
-            PrivateFilePageCacheClaim::Ready(page) if index == 0 => {
-                cached = Some(page);
-            }
-            PrivateFilePageCacheClaim::Ready(_) | PrivateFilePageCacheClaim::Loading(_) => {}
-            PrivateFilePageCacheClaim::Failed(error)
-                if private_file_batch_error_is_fatal(index) =>
-            {
-                fatal_error = Some(error);
-            }
-            PrivateFilePageCacheClaim::Failed(_) => {}
-            PrivateFilePageCacheClaim::Owner(load_id) => owners.push((key, offset, load_id)),
-            PrivateFilePageCacheClaim::Bypass => {
-                force_fallback = true;
-            }
-        }
-    }
-    if let Some(page) = cached {
-        abort_private_file_page_loads(&owners, None);
-        return if file.private_page_cache_generation() == Some(generation) {
-            Ok(PrivateFilePageBatchLoad::Cached(page))
-        } else {
-            Ok(PrivateFilePageBatchLoad::Fallback)
-        };
-    }
-    if let Some(error) = fatal_error {
-        abort_private_file_page_loads(&owners, None);
-        return if file.private_page_cache_generation() == Some(generation) {
-            Err(error)
-        } else {
-            Ok(PrivateFilePageBatchLoad::Fallback)
-        };
-    }
-    if force_fallback {
-        abort_private_file_page_loads(&owners, None);
+    let first_key = FilePageKey::new_private(file_key, file_off, generation);
+    let Some(prefix) = PRIVATE_FILE_PAGES.claim_contiguous_prefix(first_key, page_size, plan.pages)
+    else {
         return Ok(PrivateFilePageBatchLoad::Fallback);
+    };
+    let owners = prefix.owners;
+    let terminal = prefix.terminal;
+    match terminal {
+        Some((0, PrivateFilePageCacheClaim::Ready(page))) => {
+            abort_private_file_page_loads(&owners, None);
+            return if file.private_page_cache_generation() == Some(generation) {
+                Ok(PrivateFilePageBatchLoad::Cached(page))
+            } else {
+                Ok(PrivateFilePageBatchLoad::Fallback)
+            };
+        }
+        Some((index, PrivateFilePageCacheClaim::Failed(error)))
+            if private_file_batch_error_is_fatal(index) =>
+        {
+            abort_private_file_page_loads(&owners, None);
+            return if file.private_page_cache_generation() == Some(generation) {
+                Err(error)
+            } else {
+                Ok(PrivateFilePageBatchLoad::Fallback)
+            };
+        }
+        Some((_, PrivateFilePageCacheClaim::Bypass)) => {
+            abort_private_file_page_loads(&owners, None);
+            return Ok(PrivateFilePageBatchLoad::Fallback);
+        }
+        _ => {}
     }
     if owners.len() < PRIVATE_FILE_BATCH_MIN_PAGES {
         abort_private_file_page_loads(&owners, None);
@@ -5688,18 +5701,16 @@ fn load_private_file_page_batch(
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
 
-    let mut candidates = PrivateFilePageCandidates::new();
+    let mut candidates = PrivateFilePageBatch::new();
     let mut pages = PrivateFilePageBatch::new();
-    let mut published_candidates = PublishedPrivateFilePages::new();
 
-    for (key, _, load_id) in &owners {
+    for _ in &owners {
         // Safety: 候选页在读满有效前缀并清零 EOF 尾部前不会进入 cache 或页表。
         let Some(paddr) = (unsafe { alloc_uninitialized_user_page() }) else {
             abort_private_file_page_loads(&owners, None);
             return Ok(PrivateFilePageBatchLoad::Fallback);
         };
-        let candidate = ResidentPage::new_private_file(paddr);
-        candidates.push((*key, *load_id, candidate));
+        candidates.push(ResidentPage::new_private_file(paddr));
     }
     debug_assert!(!candidates.spilled());
     let Some(owner_capacity) = owners.len().checked_mul(page_size) else {
@@ -5712,7 +5723,7 @@ fn load_private_file_page_batch(
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
     let mut targets = PrivateFilePageTargets::new();
-    for (_, _, candidate) in &candidates {
+    for candidate in &candidates {
         // Safety: 每个 candidate 持有不同的独占物理页；所有页在本次批量读取完成
         // 前都只存在于本地内联批次，尚未进入 cache、resident map 或用户页表。
         targets.push(unsafe {
@@ -5735,33 +5746,31 @@ fn load_private_file_page_batch(
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
 
-    let mut candidates = candidates.into_iter();
-    while let Some((key, load_id, candidate)) = candidates.next() {
+    for (index, ((key, load_id), candidate)) in owners.iter().copied().zip(candidates).enumerate() {
         let Some(page) = PRIVATE_FILE_PAGES.finish_load(key, load_id, candidate) else {
-            for (remaining_key, remaining_load_id, _) in candidates {
-                PRIVATE_FILE_PAGES.abort_load(remaining_key, remaining_load_id, None);
+            for (remaining_key, remaining_load_id) in &owners[index + 1..] {
+                PRIVATE_FILE_PAGES.abort_load(*remaining_key, *remaining_load_id, None);
             }
-            rollback_private_file_page_batch(&published_candidates);
+            rollback_private_file_page_batch(&PRIVATE_FILE_PAGES, &owners, &pages);
             return Ok(PrivateFilePageBatchLoad::Fallback);
         };
-        published_candidates.push((key, Arc::clone(&page)));
         pages.push(page);
-        if file.private_page_cache_generation() != Some(generation) {
-            for (remaining_key, remaining_load_id, _) in candidates {
-                PRIVATE_FILE_PAGES.abort_load(remaining_key, remaining_load_id, None);
-            }
-            rollback_private_file_page_batch(&published_candidates);
-            return Ok(PrivateFilePageBatchLoad::Fallback);
-        }
     }
     debug_assert!(!pages.spilled());
-    debug_assert!(!published_candidates.spilled());
+    if file.private_page_cache_generation() != Some(generation) {
+        rollback_private_file_page_batch(&PRIVATE_FILE_PAGES, &owners, &pages);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
     Ok(PrivateFilePageBatchLoad::Batched(pages))
 }
 
-fn rollback_private_file_page_batch(published: &[(FilePageKey, Arc<ResidentPage>)]) {
-    for (key, page) in published {
-        PRIVATE_FILE_PAGES.remove_if_same(*key, page);
+fn rollback_private_file_page_batch<const SHARD_COUNT: usize>(
+    cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
+    owners: &[(FilePageKey, u64)],
+    published: &[Arc<ResidentPage>],
+) {
+    for ((key, _), page) in owners.iter().zip(published) {
+        cache.remove_if_same(*key, page);
     }
 }
 
@@ -5857,8 +5866,8 @@ fn find_cached_private_file_page<const SHARD_COUNT: usize>(
     cache.find(key)
 }
 
-fn abort_private_file_page_loads(loads: &[(FilePageKey, u64, u64)], error: Option<Errno>) {
-    for (key, _, load_id) in loads {
+fn abort_private_file_page_loads(loads: &[(FilePageKey, u64)], error: Option<Errno>) {
+    for (key, load_id) in loads {
         PRIVATE_FILE_PAGES.abort_load(*key, *load_id, error);
     }
 }
@@ -6351,15 +6360,15 @@ mod tests {
         AnonStoreShadowKey, AnonStoreShadowState, FILE_FAULT_AROUND_PAGES, FaultAroundCommit,
         FaultKind, FaultOutcome, FilePageKey, ForkChildMap, PRIVATE_FILE_BATCH_MAX_BYTES,
         PageAccess, PreparedAnonPages, PreparedFilePages, PrivateFileFaultAround,
-        PrivateFilePageCacheClaim, PrivateFilePageCacheEntry, ResidentPage,
-        ShardedPrivateFilePageCache, VmFlags, VmSpace, WeakFilePageCache, access_for_private_file,
-        anon_store_fault_around_end, fault_from_errno, file_fault_around_window,
-        find_cached_private_file_page, map_fork_child_batches, observe_anon_store_shadow,
-        permits_file_fault_around, plan_file_segment, private_file_batch_error_is_fatal,
-        private_file_batch_page_offset, private_file_batch_plan, private_file_cache_snapshot,
-        publish_cached_file_page, publish_cached_private_file_page, read_file_bytes_exact,
-        read_file_page_exact, same_backing_snapshot, unmapped_prefix_len,
-        user_page_allocation_handle,
+        PrivateFilePageBatch, PrivateFilePageCacheClaim, PrivateFilePageCacheEntry,
+        PrivateFilePageLoadOwners, ResidentPage, ShardedPrivateFilePageCache, VmFlags, VmSpace,
+        WeakFilePageCache, access_for_private_file, anon_store_fault_around_end, fault_from_errno,
+        file_fault_around_window, find_cached_private_file_page, map_fork_child_batches,
+        observe_anon_store_shadow, permits_file_fault_around, plan_file_segment,
+        private_file_batch_error_is_fatal, private_file_batch_page_offset, private_file_batch_plan,
+        private_file_cache_snapshot, publish_cached_file_page, publish_cached_private_file_page,
+        read_file_bytes_exact, read_file_page_exact, rollback_private_file_page_batch,
+        same_backing_snapshot, unmapped_prefix_len, user_page_allocation_handle,
     };
     use errno::Errno;
     use mm::{FileLike, VmBacking};
@@ -7150,6 +7159,69 @@ mod tests {
         drop(claims);
         cache.abort_load(keys[0], first_load, None);
         cache.abort_load(keys[1], second_load, None);
+    }
+
+    #[test]
+    fn private_file_cache_contiguous_claim_returns_owner_prefix() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(8);
+        let first = cache_key(71);
+        let keys = [
+            first,
+            FilePageKey {
+                offset: first.offset + PAGE_SIZE as u64,
+                ..first
+            },
+            FilePageKey {
+                offset: first.offset + (2 * PAGE_SIZE) as u64,
+                ..first
+            },
+        ];
+        let competing_load = match cache.claim(keys[1]) {
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            _ => panic!("第二页必须先进入加载状态"),
+        };
+
+        let prefix = cache
+            .claim_contiguous_prefix(first, PAGE_SIZE, keys.len())
+            .expect("连续页偏移必须有效");
+        assert_eq!(prefix.owners.len(), 1);
+        assert_eq!(prefix.owners[0].0, keys[0]);
+        assert!(matches!(
+            &prefix.terminal,
+            Some((1, PrivateFilePageCacheClaim::Loading(_)))
+        ));
+        assert!(cache.shards[0].lock().pages.get(&keys[2]).is_none());
+
+        let first_load = prefix.owners[0].1;
+        drop(prefix);
+        cache.abort_load(keys[0], first_load, None);
+        cache.abort_load(keys[1], competing_load, None);
+    }
+
+    #[test]
+    fn private_file_cache_batch_rollback_uses_owner_order() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(8);
+        let keys = [cache_key(73), cache_key(74)];
+        let mut owners = PrivateFilePageLoadOwners::new();
+        let mut pages = PrivateFilePageBatch::new();
+
+        for (index, key) in keys.into_iter().enumerate() {
+            let load_id = match cache.claim(key) {
+                PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+                _ => panic!("空键必须由当前批次持有"),
+            };
+            let candidate = ResidentPage::new_direct((index + 1) * PAGE_SIZE);
+            let page = cache
+                .finish_load(key, load_id, candidate)
+                .expect("当前 owner 必须能发布页面");
+            owners.push((key, load_id));
+            pages.push(page);
+        }
+
+        rollback_private_file_page_batch(&cache, &owners, &pages);
+        for key in keys {
+            assert!(find_cached_private_file_page(&cache, key).is_none());
+        }
     }
 
     #[test]

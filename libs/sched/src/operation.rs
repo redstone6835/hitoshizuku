@@ -1713,18 +1713,12 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
     let Some(consumer) = group.lock_signal_consumer() else {
         return false;
     };
+    let shared = task.shared_signal();
     let blocked = task.signal.blocked_snapshot().raw();
-    let pending = (task.signal.pending_snapshot().raw()
-        | task.shared_signal().pending_snapshot().raw())
-        & !blocked;
-    for raw in 1..crate::signal::NSIG as i32 {
-        let Some(sig) = SignalNumber::from_raw(raw) else {
-            continue;
-        };
-        if (pending & sig.bit()) == 0 {
-            continue;
-        }
-        let action = task.shared_signal().get_action(sig);
+    let mut pending =
+        (task.signal.pending_snapshot().raw() | shared.pending_snapshot().raw()) & !blocked;
+    while let Some(sig) = take_next_pending_signal(&mut pending) {
+        let action = shared.get_action(sig);
         match action.handler {
             SigHandler::Ignore => continue,
             SigHandler::Handler(_) => return true,
@@ -1739,7 +1733,7 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
                         let info = task
                             .signal
                             .dequeue_one_in(sig.bit())
-                            .or_else(|| task.shared_signal().dequeue_one_in(sig.bit()))
+                            .or_else(|| shared.dequeue_one_in(sig.bit()))
                             .unwrap_or_else(|| make_siginfo(sig));
                         drop(consumer);
                         apply_default_action_for_task(task, info);
@@ -1752,26 +1746,33 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
     false
 }
 
+#[inline]
+pub(crate) fn take_next_pending_signal(pending: &mut u64) -> Option<SignalNumber> {
+    while *pending != 0 {
+        let bit = pending.trailing_zeros();
+        *pending &= pending.wrapping_sub(1);
+        if let Some(signal) = SignalNumber::from_raw(bit as i32 + 1) {
+            return Some(signal);
+        }
+    }
+    None
+}
+
 /// syscall 返回 `EINTR` 前尝试消费一条可自动重启的用户 handler 信号。
 ///
 /// `SA_RESTART` 要求 handler 返回后重新执行被打断的 syscall。分发器在写返回值、
 /// 推进 PC 之前调用这里，因此原始参数寄存器仍然完整。
 pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
     let me = current_task();
+    let group = me.thread_group();
+    let _consumer = group.lock_signal_consumer()?;
+    let shared = me.shared_signal();
     let blocked = me.signal.blocked_snapshot().raw();
-    let pending = (me.signal.pending_snapshot().raw()
-        | me.shared_signal().pending_snapshot().raw())
-        & !blocked;
+    let mut pending =
+        (me.signal.pending_snapshot().raw() | shared.pending_snapshot().raw()) & !blocked;
 
-    for raw in 1..crate::signal::NSIG as i32 {
-        let Some(sig) = SignalNumber::from_raw(raw) else {
-            continue;
-        };
-        if (pending & sig.bit()) == 0 {
-            continue;
-        }
-
-        let action = me.shared_signal().get_action(sig);
+    while let Some(sig) = take_next_pending_signal(&mut pending) {
+        let action = shared.get_action(sig);
         if !matches!(action.handler, SigHandler::Handler(_)) {
             continue;
         }
@@ -1779,7 +1780,10 @@ pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
             continue;
         }
 
-        let info = me.dequeue_pending_signal_in(SigSet::from_raw(sig.bit()))?;
+        let info = me
+            .signal
+            .dequeue_one_in(sig.bit())
+            .or_else(|| shared.dequeue_one_in(sig.bit()))?;
         return Some((info, action));
     }
 

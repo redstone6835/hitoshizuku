@@ -21,6 +21,12 @@ performance-profile = [
     "sched/performance-profile",
     "vfs/performance-profile",
 ]
+syscall-model-markers = [
+    "performance-profile",
+    "arch/syscall-model-markers",
+    "profiling/syscall-model-markers",
+    "sched/syscall-model-markers",
+]
 allocator-tests = [
     "ktest/kernel",
     "allocator/ktest-kernel",

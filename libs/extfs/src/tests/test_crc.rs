@@ -20,7 +20,7 @@ fn known_vector() {
 /// 宽分块实现必须保留 seed 语义，并正确处理任意长度的尾部字节。
 #[ktest]
 fn accelerated_update_preserves_seed_and_tail_lengths() {
-    let mut data = [0u8; 31];
+    let mut data = [0u8; 47];
     for (index, byte) in data.iter_mut().enumerate() {
         *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
     }
@@ -29,15 +29,15 @@ fn accelerated_update_preserves_seed_and_tail_lengths() {
     for len in 0..=data.len() {
         let expected = reference_update(seed, &data[..len]);
         assert_eq!(
-            crc::update_slicing_by_8(seed, &data[..len]),
+            crc::update_slicing_by_16(seed, &data[..len]),
             expected,
             "len={len}"
         );
     }
 
-    let split = crc::update_slicing_by_8(seed, &data[..13]);
+    let split = crc::update_slicing_by_16(seed, &data[..19]);
     assert_eq!(
-        crc::update_slicing_by_8(split, &data[13..]),
+        crc::update_slicing_by_16(split, &data[19..]),
         reference_update(seed, &data),
     );
 }

@@ -491,16 +491,23 @@ impl VmaSet {
     /// 导致缓存下标失效时，范围校验会令查询自动退回二分查找。
     fn find_area_index(&self, addr: usize) -> Option<usize> {
         if let Some(idx) = self.last_find.get()
-            && self.areas.get(idx).is_some_and(|area| area.contains(addr))
+            && let Some(area) = self.areas.get(idx)
         {
-            return Some(idx);
+            debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
+            if area.contains(addr) {
+                return Some(idx);
+            }
         }
 
         // 最靠后且 start <= addr 的那一条。
         let next = self.areas.partition_point(|area| area.range.start <= addr);
-        let found = next
-            .checked_sub(1)
-            .filter(|&idx| self.areas[idx].contains(addr));
+        let found = next.checked_sub(1).filter(|&idx| {
+            let area = &self.areas[idx];
+            debug_assert!(area.is_well_formed(), "VmaSet 内部不变式损坏");
+            // partition_point 已保证 start <= addr；集合只允许插入合法 VMA，
+            // 热查询无需再次检查 backing 覆盖范围。
+            addr < area.range.end
+        });
         self.last_find.set(found);
         found
     }
