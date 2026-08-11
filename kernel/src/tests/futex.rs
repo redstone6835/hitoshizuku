@@ -31,6 +31,12 @@ fn futex_wait_state_rearms_after_non_futex_wakeup() {
 fn exec_cleanup_uses_bounded_scratch_and_clears_user_registrations() {
     let task = sched::current_task();
     let saved_vm = task.ext_remove(sched::TASKEXT_VM_SPACE);
+    let saved_vm_space = saved_vm.as_ref().map(|payload| {
+        payload
+            .clone()
+            .downcast::<VmSpace>()
+            .expect("当前测试任务的地址空间类型错误")
+    });
     let saved_robust = task.robust_list();
     let saved_clear_child_tid = task.clear_child_tid();
     let vm = Arc::new(VmSpace::new());
@@ -44,6 +50,7 @@ fn exec_cleanup_uses_bounded_scratch_and_clears_user_registrations() {
             .with(VmFlags::USER),
     )
     .expect("exec cleanup 测试映射失败");
+    vm.activate();
 
     let node = PROBE + 0x40;
     let robust_word = node + 8;
@@ -80,12 +87,23 @@ fn exec_cleanup_uses_bounded_scratch_and_clears_user_registrations() {
     if let Some(saved_vm) = saved_vm {
         task.ext_install(sched::TASKEXT_VM_SPACE, saved_vm);
     }
+    if let Some(saved_vm_space) = saved_vm_space {
+        saved_vm_space.activate();
+    } else {
+        hal::sched::activate_kernel_address_space();
+    }
 }
 
 #[ktest]
 fn futex_wait_requeue_and_user_rmw_are_atomic() {
     let task = sched::current_task_direct();
     let saved_vm = task.ext_remove(sched::TASKEXT_VM_SPACE);
+    let saved_vm_space = saved_vm.as_ref().map(|payload| {
+        payload
+            .clone()
+            .downcast::<VmSpace>()
+            .expect("当前测试任务的地址空间类型错误")
+    });
     let vm = Arc::new(VmSpace::new());
     task.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
     let page_size = general::mm::page_size();
@@ -97,6 +115,7 @@ fn futex_wait_requeue_and_user_rmw_are_atomic() {
             .with(VmFlags::USER),
     )
     .expect("futex 测试映射失败");
+    vm.activate();
 
     let src = vm.futex_key_for(PROBE, true).expect("源 futex key 失败");
     let dst = vm
@@ -269,6 +288,11 @@ fn futex_wait_requeue_and_user_rmw_are_atomic() {
     if let Some(saved_vm) = saved_vm {
         task.ext_install(sched::TASKEXT_VM_SPACE, saved_vm);
     }
+    if let Some(saved_vm_space) = saved_vm_space {
+        saved_vm_space.activate();
+    } else {
+        hal::sched::activate_kernel_address_space();
+    }
 }
 
 unsafe extern "C" fn pi_test_thread(_arg: usize) -> ! {
@@ -281,6 +305,12 @@ unsafe extern "C" fn pi_test_thread(_arg: usize) -> ! {
 fn pi_requeue_donates_and_hands_lock_to_highest_priority_waiter() {
     let owner = sched::current_task_direct();
     let saved_vm = owner.ext_remove(sched::TASKEXT_VM_SPACE);
+    let saved_vm_space = saved_vm.as_ref().map(|payload| {
+        payload
+            .clone()
+            .downcast::<VmSpace>()
+            .expect("当前测试任务的地址空间类型错误")
+    });
     let vm = Arc::new(VmSpace::new());
     owner.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
     let page_size = general::mm::page_size();
@@ -292,6 +322,7 @@ fn pi_requeue_donates_and_hands_lock_to_highest_priority_waiter() {
             .with(VmFlags::USER),
     )
     .expect("PI futex 测试映射失败");
+    vm.activate();
 
     let fair = sched::kthread_create(pi_test_thread, 0, sched::SchedParams::default_fair());
     let realtime = sched::kthread_create(pi_test_thread, 0, sched::SchedParams::default_fair());
@@ -381,5 +412,10 @@ fn pi_requeue_donates_and_hands_lock_to_highest_priority_waiter() {
     owner.ext_remove(sched::TASKEXT_VM_SPACE);
     if let Some(saved_vm) = saved_vm {
         owner.ext_install(sched::TASKEXT_VM_SPACE, saved_vm);
+    }
+    if let Some(saved_vm_space) = saved_vm_space {
+        saved_vm_space.activate();
+    } else {
+        hal::sched::activate_kernel_address_space();
     }
 }
