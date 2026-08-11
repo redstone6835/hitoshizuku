@@ -6,9 +6,9 @@
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::Mutex;
 use crate::registry::AllocationOwnerStats;
 use crate::request::{AllocationKind, AllocationRecord};
-use crate::Mutex;
 
 const OWNER_SHARDS: usize = 64;
 const OWNER_BUCKETS_PER_SHARD: usize = 64;

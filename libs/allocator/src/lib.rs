@@ -1855,12 +1855,12 @@ impl KernelMemorySubsystem {
             .with_reclaim(ReclaimPolicy::TryAllocatorReclaim)
             .with_accounting_owner(accounting_owner);
         let result = if accounting_owner == 0 {
-            self.allocate_untracked_global(request)
+            self.allocate_untracked_global_ptr(request)
         } else {
-            self.allocate(request)
+            self.allocate(request).map(|record| record.ptr)
         };
         match result {
-            Ok(record) => record.ptr as *mut u8,
+            Ok(ptr) => ptr as *mut u8,
             Err(error) => {
                 log::error!(
                     "[alloc] global allocation failed: size={} align={} zeroing={:?} owner={} error={:?}",
@@ -1875,17 +1875,64 @@ impl KernelMemorySubsystem {
         }
     }
 
-    fn allocate_untracked_global(
+    fn allocate_untracked_global_ptr(
         &self,
         request: MemoryRequest,
-    ) -> Result<AllocationRecord, AllocationError> {
+    ) -> Result<usize, AllocationError> {
         let request = request.validate()?.with_accounting_owner(0);
-        let mut allocation = self.allocate_active_once(request, crate::space::ArenaKind::Kernel);
+        let mut allocation = self.allocate_untracked_global_ptr_once(request);
         if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
             let _ = self.reclaim_allocator_caches_for_retry();
-            allocation = self.allocate_active_once(request, crate::space::ArenaKind::Kernel);
+            allocation = self.allocate_untracked_global_ptr_once(request);
         }
         allocation
+    }
+
+    fn allocate_untracked_global_ptr_once(
+        &self,
+        request: MemoryRequest,
+    ) -> Result<usize, AllocationError> {
+        if !matches!(request.domain, MemoryDomain::Kernel) {
+            return Err(AllocationError::InvalidLayout);
+        }
+        let layout = request.layout()?;
+        let force_large = matches!(request.page_policy, PagePolicy::RequireLarge);
+        let alloc_large = || -> Result<usize, AllocationError> {
+            let range =
+                self.kheap
+                    .alloc_range(layout, request.page_policy, &self.phys, &self.vmem)?;
+            if matches!(request.zeroing, Zeroing::Zeroed) {
+                #[cfg(feature = "performance-profile")]
+                let _profile =
+                    profiling::scope(profiling::Event::MemZeroAllocatorLarge).bytes(request.size);
+                // Safety: kheap 返回当前调用方独占且至少覆盖请求长度的有效范围。
+                unsafe { core::ptr::write_bytes(range.vaddr as *mut u8, 0, request.size) };
+            }
+            Ok(range.vaddr)
+        };
+
+        if is_small_request(request) && !force_large {
+            if let Some(zone_idx) = SlabAllocator::class_index_for(layout) {
+                let allocation =
+                    self.slab
+                        .alloc_class(zone_idx, self.current_cpu_id(), &self.phys, &self.vmem);
+                if allocation.is_null() {
+                    return Err(AllocationError::OutOfMemory);
+                }
+                if matches!(request.zeroing, Zeroing::Zeroed) {
+                    #[cfg(feature = "performance-profile")]
+                    let _profile = profiling::scope(profiling::Event::MemZeroAllocatorSmall)
+                        .bytes(request.size);
+                    // Safety: slab 返回当前调用方独占且至少覆盖请求长度的有效对象。
+                    unsafe { core::ptr::write_bytes(allocation.ptr as *mut u8, 0, request.size) };
+                }
+                Ok(allocation.ptr)
+            } else {
+                alloc_large()
+            }
+        } else {
+            alloc_large()
+        }
     }
 
     fn is_tracked_heap_pointer(&self, ptr: usize) -> bool {
@@ -1959,14 +2006,13 @@ impl KernelMemorySubsystem {
         self.total_allocs.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_allocated
             .fetch_add(new_layout.size() as u64, Ordering::Relaxed);
-        let new_record = match self.allocate_untracked_global(request) {
-            Ok(record) => record,
+        let new_ptr = match self.allocate_untracked_global_ptr(request) {
+            Ok(ptr) => ptr as *mut u8,
             Err(_) => {
                 self.record_oom();
                 return null_mut();
             }
         };
-        let new_ptr = new_record.ptr as *mut u8;
         let copy_len = old_layout.size().min(new_layout.size());
         #[cfg(feature = "performance-profile")]
         let _profile = profiling::scope(profiling::Event::MemCopyRealloc).bytes(copy_len);
@@ -1976,7 +2022,7 @@ impl KernelMemorySubsystem {
             .deallocate_untracked_global(ptr as usize, old_layout)
             .is_err()
         {
-            let _ = self.deallocate_untracked_global(new_record.ptr, new_layout);
+            let _ = self.deallocate_untracked_global(new_ptr as usize, new_layout);
             self.record_ownership_failure();
             return null_mut();
         }

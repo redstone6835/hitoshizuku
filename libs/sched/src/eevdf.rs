@@ -298,7 +298,11 @@ impl SchedEntity {
 
     pub(crate) fn set_on_rq(&self, on: bool) {
         self.on_rq.store(
-            if on { TASK_ON_RQ_QUEUED } else { TASK_ON_RQ_NONE },
+            if on {
+                TASK_ON_RQ_QUEUED
+            } else {
+                TASK_ON_RQ_NONE
+            },
             Ordering::Release,
         );
     }

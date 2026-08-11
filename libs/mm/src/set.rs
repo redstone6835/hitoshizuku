@@ -466,7 +466,7 @@ impl VmaSet {
         found
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ktest-kernel"))]
     pub(crate) fn cached_find_index(&self) -> Option<usize> {
         self.last_find.get()
     }

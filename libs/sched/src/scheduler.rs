@@ -69,7 +69,7 @@ impl RunqueueLoadSnapshot {
         Self { loads }
     }
 
-    pub(crate) fn load_of(self, cpu: CpuId) -> usize {
+    pub(crate) fn load_of(&self, cpu: CpuId) -> usize {
         self.loads[cpu.get()]
     }
 
@@ -97,7 +97,7 @@ impl RunqueueClassLoadSnapshot {
         Self { loads }
     }
 
-    pub(crate) fn load_of(self, cpu: CpuId) -> RunqueueClassLoad {
+    pub(crate) fn load_of(&self, cpu: CpuId) -> RunqueueClassLoad {
         self.loads[cpu.get()]
     }
 
@@ -2605,7 +2605,7 @@ pub fn balance_once(cpu_id: usize) -> bool {
     }
 
     let topology_snapshot = SCHEDULER.topology_snapshot();
-    let topology = topology_snapshot.topology;
+    let topology = &topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
     let load_snapshot = {
         let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
@@ -2680,7 +2680,9 @@ pub(crate) fn requeue_balance_task_on(
             // task 可能带着 MIGRATING 状态进来（来自失败的 balance_once 回滚）；
             // 普通 enqueue 的 on_rq 门禁会拒绝它，需要走提交入口。
             let queued = if task.sched.is_migrating() {
-                cpu_state.runqueue().enqueue_migrated(Arc::clone(&task), now_ns)
+                cpu_state
+                    .runqueue()
+                    .enqueue_migrated(Arc::clone(&task), now_ns)
             } else {
                 cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
             };
@@ -2698,7 +2700,7 @@ pub(crate) fn requeue_balance_task_on(
 }
 
 pub(crate) fn select_balance_source_for_class<F>(
-    topology: SchedTopology,
+    topology: &SchedTopology,
     local_cpu: CpuId,
     active: CpuMask,
     class: SchedClass,

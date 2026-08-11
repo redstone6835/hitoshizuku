@@ -59,6 +59,23 @@ fn global_owner_zero_allocation_is_not_tracked() {
     assert_eq!(KERNEL_ALLOCATOR.stats().ownership_failures, failures_before);
 }
 
+/// owner=0 的清零分配仍须完整清零并沿无账本路径释放。
+#[ktest]
+fn global_owner_zero_zeroed_allocation_preserves_contents() {
+    let layout = Layout::from_size_align(96, 16).expect("valid global allocation layout");
+    let ptr = unsafe { GlobalAlloc::alloc_zeroed(&KERNEL_ALLOCATOR, layout) };
+    assert!(!ptr.is_null());
+    // Safety: 分配成功后，返回范围至少覆盖 layout.size() 字节。
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
+    assert!(bytes.iter().all(|byte| *byte == 0));
+    assert!(
+        KERNEL_ALLOCATOR
+            .query_tracked_allocation(ptr as usize)
+            .is_err()
+    );
+    unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, ptr, layout) };
+}
+
 /// 显式分配接口仍应进入资源账本。
 #[ktest]
 fn explicit_allocation_remains_tracked() {

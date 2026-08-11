@@ -304,7 +304,7 @@ fn balance_source_allows_single_remote_task_when_local_is_idle() {
     let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
 
     let source = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(1).unwrap(),
         online,
         SchedClass::Fair,
@@ -314,7 +314,7 @@ fn balance_source_allows_single_remote_task_when_local_is_idle() {
     assert_eq!(source.get(), 0);
 
     let no_pull = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(1).unwrap(),
         online,
         SchedClass::Fair,
@@ -357,7 +357,7 @@ fn balance_source_checks_parent_when_near_domain_is_balanced() {
         .union(CpuMask::single_raw(2));
 
     let source = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(0).unwrap(),
         online,
         SchedClass::Fair,
@@ -382,7 +382,7 @@ fn deadline_balance_does_not_move_single_task() {
     let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
 
     let single = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(1).unwrap(),
         online,
         SchedClass::Deadline,
@@ -391,7 +391,7 @@ fn deadline_balance_does_not_move_single_task() {
     assert!(single.is_none());
 
     let overloaded = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(1).unwrap(),
         online,
         SchedClass::Deadline,
@@ -410,7 +410,7 @@ fn fair_balance_uses_weight_instead_of_task_count() {
     source.fair_weight = 3072;
 
     let no_pull = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(1).unwrap(),
         online,
         SchedClass::Fair,
@@ -420,7 +420,7 @@ fn fair_balance_uses_weight_instead_of_task_count() {
 
     source.fair_weight = 6144;
     let pull = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(1).unwrap(),
         online,
         SchedClass::Fair,
@@ -443,7 +443,7 @@ fn balance_source_normalizes_load_by_cpu_capacity() {
         .union(CpuMask::single_raw(2));
 
     let source = select_balance_source_for_class(
-        topology,
+        &topology,
         CpuId::new(2).unwrap(),
         online,
         SchedClass::Fair,
