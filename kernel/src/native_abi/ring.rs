@@ -70,6 +70,8 @@ struct RingState {
     generation: u64,
     completed: u64,
     cancelled: u64,
+    #[cfg(feature = "kernel-tests")]
+    worker_paused: bool,
 }
 
 pub(crate) struct SubmissionRingObject {
@@ -365,6 +367,8 @@ pub(super) fn ring_create(
             generation: 1,
             completed: 0,
             cancelled: 0,
+            #[cfg(feature = "kernel-tests")]
+            worker_paused: false,
         }),
         capacity: entries,
         vm,
@@ -1336,7 +1340,17 @@ unsafe extern "C" fn ring_worker(argument: usize) -> ! {
         let Some(ring) = signal.ring.upgrade() else {
             break;
         };
-        let budget = ring.state.lock().pending.len();
+        let budget = {
+            let state = ring.state.lock();
+            #[cfg(feature = "kernel-tests")]
+            if state.worker_paused {
+                0
+            } else {
+                state.pending.len()
+            }
+            #[cfg(not(feature = "kernel-tests"))]
+            state.pending.len()
+        };
         if budget == 0 {
             drop(ring);
             wait_for_worker(&signal, false);
@@ -1374,6 +1388,11 @@ unsafe extern "C" fn ring_worker(argument: usize) -> ! {
     }
     drop(signal);
     sched::kthread_finish(sched::ExitCode(0));
+}
+
+#[cfg(feature = "kernel-tests")]
+pub(super) fn pause_worker_for_test(ring: &SubmissionRingObject) {
+    ring.state.lock().worker_paused = true;
 }
 
 fn wait_for_worker(signal: &RingWorkerSignal, has_pending: bool) {

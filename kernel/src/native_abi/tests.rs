@@ -1499,7 +1499,18 @@ fn ring_poll_readiness_tracks_shared_cq_consumption() {
 
 #[ktest]
 fn ring_cancel_publishes_one_completion_and_reserves_user_data_until_consumed() {
-    let (task, _state, ring, clock, shared) = make_ring_task(4);
+    let (task, state, ring, clock, shared) = make_ring_task(4);
+    let object = state
+        .handles
+        .lock()
+        .lookup(ring, Some(ObjectInterface::SubmissionRing), Rights::CANCEL)
+        .expect("测试 Ring handle 应可查找")
+        .object
+        .clone();
+    let KernelNativeObject::SubmissionRing(object) = object else {
+        panic!("测试对象必须是 SubmissionRing");
+    };
+    super::ring::pause_worker_for_test(&object);
     write_ring_submission(&task, shared, 0, ring_clock_submission(clock, 31));
     write_ring_index(
         &task,
