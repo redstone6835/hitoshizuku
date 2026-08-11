@@ -41,7 +41,7 @@ use crate::pid::{PidNamespace, PidT};
 use crate::placement::{PlacementSnapshot, TaskPlacement};
 use crate::rseq::{RseqEvent, RseqEvents};
 use crate::sched_class::{RT_PRIO_MAX, SchedAttr, SchedPolicy};
-use crate::signal::{SharedSignal, SignalNumber, SignalState};
+use crate::signal::{SharedSignal, SigInfo, SigSet, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
 use crate::wait_flags::WaitStatus;
@@ -457,6 +457,7 @@ pub struct TaskUsage {
 pub enum ExecutionScopeKind {
     Syscall = 1,
     NetworkWorker = 2,
+    NativeCall = 3,
 }
 
 impl ExecutionScopeKind {
@@ -464,6 +465,7 @@ impl ExecutionScopeKind {
         match raw {
             1 => Some(Self::Syscall),
             2 => Some(Self::NetworkWorker),
+            3 => Some(Self::NativeCall),
             _ => None,
         }
     }
@@ -642,6 +644,9 @@ const EXIT_REASON_NONE: u8 = 0;
 const EXIT_REASON_EXITED: u8 = 1;
 const EXIT_REASON_SIGNALED: u8 = 2;
 const EXIT_REASON_CORE_DUMPED: u8 = 3;
+const EXEC_SIBLING_EXIT_NONE: u8 = 0;
+const EXEC_SIBLING_EXIT_ORDINARY: u8 = 1;
+const EXEC_SIBLING_EXIT_PRESERVE_LEADER: u8 = 2;
 
 /// 默认内核栈大小：64 KiB。fork 等深层调用需要足够空间，避免栈溢出损坏堆。
 pub const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
@@ -773,10 +778,18 @@ pub struct Task {
     /// 用户任务和内核任务的生命周期域不同。该字段用于把内核线程从 POSIX
     /// signal/exit_group/wait 模型中隔离出去。
     kind: AtomicU8,
+    /// 从线程组权威 personality 派生的 trap 热路径缓存。
+    user_abi_kind: AtomicU8,
     state: AtomicU8,
     /// 发送者已对本成员发布协作组退出。与睡眠状态使用
     /// SeqCst 握手，覆盖“waker 先观察到 Running”的提交窗口。
     group_exit_requested: AtomicBool,
+    /// exec 发起者要求本线程自行退出。1 表示普通兄弟线程，2 表示需要
+    /// 暂时保留进程 leader 身份，等待执行线程接管。
+    exec_sibling_exit_requested: AtomicU8,
+    /// Native Thread capability 发布的单线程协作退出请求。最高位表示请求已
+    /// 发布，低 32 位保存完整退出码；零值表示没有请求。
+    native_thread_exit_requested: AtomicU64,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
     exit_reason: AtomicU8,
@@ -791,6 +804,9 @@ pub struct Task {
     ptrace_traced: AtomicU8,
     pub exit_waiters: WaitQueue,
     rel: Spinlock<Relations>,
+    /// Native child 的线程组 owner；与 POSIX `parent` 解耦，避免调用线程退出
+    /// 时触发错误的 task-level reparent。
+    native_owner: Spinlock<Option<Weak<ThreadGroup>>>,
     kstack: Spinlock<Option<KernelStack>>,
     ctx: Spinlock<Option<ArchContextSlot>>,
 
@@ -895,6 +911,8 @@ pub struct Task {
     /// 在安全调度边界消费前保持任务存活。
     deferred_wake_next: AtomicPtr<Task>,
     deferred_wake_queued: AtomicBool,
+    /// 需要在安全调度边界重新应用的 PI 有效属性。
+    deferred_pi_update: AtomicBool,
     /// 当前登记本任务的 rq 所属 CPU；`usize::MAX` 表示不在任何 rq 上。
     ///
     /// 只在 rq 锁内更新，用于捕获"同一任务同时挂在两个 rq 上"的错误。参见
@@ -921,6 +939,9 @@ pub struct Task {
     /// 退出清理是否已经运行。exit、最终切换和 wait/reap 都可能观察到同一个任务，
     /// 必须只让上层 ext hook 执行一次。
     ext_exit_cleaned: AtomicBool,
+    /// 上层退出清理已经完整返回。与 `ext_exit_cleaned` 的抢占位分开，避免 exec
+    /// 在远端 CPU 仍持有旧资源时提前接管 leader 身份。
+    ext_exit_cleanup_complete: AtomicBool,
     /// 进入退出态前的用户态线程 ABI 清理是否已经运行。该阶段仍可访问用户地址空间，
     /// 用于 clear-child-tid、robust futex 等必须在释放 VM 前完成的动作。
     pre_exit_cleaned: AtomicBool,
@@ -941,13 +962,17 @@ impl Task {
         process_group: Arc<ProcessGroup>,
     ) -> Arc<Self> {
         let shared = Arc::clone(thread_group.shared_signal());
+        let user_abi_kind = thread_group.user_abi_kind();
         TASK_CREATED.fetch_add(1, Ordering::Relaxed);
         TASK_LIVE.fetch_add(1, Ordering::Relaxed);
         let task = Arc::new(Self {
             sched: SchedEntity::new(params),
             kind: AtomicU8::new(TaskKind::User as u8),
+            user_abi_kind: AtomicU8::new(user_abi_kind as u8),
             state: AtomicU8::new(TaskState::New as u8),
             group_exit_requested: AtomicBool::new(false),
+            exec_sibling_exit_requested: AtomicU8::new(EXEC_SIBLING_EXIT_NONE),
+            native_thread_exit_requested: AtomicU64::new(0),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
             exit_reason: AtomicU8::new(EXIT_REASON_NONE),
@@ -966,6 +991,7 @@ impl Task {
                 process_group,
                 pid_in_ns: Vec::new(),
             }),
+            native_owner: Spinlock::new(None),
             kstack: Spinlock::new(None),
             ctx: Spinlock::new(None),
             creds: Spinlock::new(Arc::new(Credentials::root())),
@@ -1037,6 +1063,7 @@ impl Task {
             placement: TaskPlacement::unbound(),
             deferred_wake_next: AtomicPtr::new(core::ptr::null_mut()),
             deferred_wake_queued: AtomicBool::new(false),
+            deferred_pi_update: AtomicBool::new(false),
             rq_owner: AtomicUsize::new(usize::MAX),
             ioprio: AtomicU32::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
@@ -1045,6 +1072,7 @@ impl Task {
             hot_ext: HotTaskExt::new(),
             ext: Spinlock::new(Vec::new()),
             ext_exit_cleaned: AtomicBool::new(false),
+            ext_exit_cleanup_complete: AtomicBool::new(false),
             pre_exit_cleaned: AtomicBool::new(false),
         });
         TASK_TRACKER.lock().push(Arc::downgrade(&task));
@@ -1058,6 +1086,15 @@ impl Task {
 
     pub fn kind(&self) -> TaskKind {
         TaskKind::from_u8(self.kind.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    pub fn user_abi_kind(&self) -> native_abi::UserAbiKind {
+        native_abi::UserAbiKind::from_raw(self.user_abi_kind.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn publish_user_abi_kind(&self, kind: native_abi::UserAbiKind) {
+        self.user_abi_kind.store(kind as u8, Ordering::Release);
     }
 
     pub fn is_user_task(&self) -> bool {
@@ -1184,10 +1221,10 @@ impl Task {
     /// CAS 状态，成功时返回 `true`。用于 wakeup 路径无锁切换。
     pub fn cas_state(&self, expect: TaskState, new: TaskState) -> bool {
         let entering_wait = matches!(new, TaskState::Sleeping | TaskState::Uninterruptible);
-        if entering_wait && self.group_exit_wakeup_pending() {
+        if entering_wait && self.forced_exit_wakeup_pending() {
             return false;
         }
-        let ordered_exit_transition = entering_wait || self.group_exit_wakeup_pending();
+        let ordered_exit_transition = entering_wait || self.forced_exit_wakeup_pending();
         let transitioned = if ordered_exit_transition {
             self.state
                 .compare_exchange(expect as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst)
@@ -1202,7 +1239,7 @@ impl Task {
         if transitioned.is_err() {
             return false;
         }
-        if entering_wait && self.group_exit_wakeup_pending() {
+        if entering_wait && self.forced_exit_wakeup_pending() {
             // 与 group_exit_wakeup 构成两阶段握手：请求若在首次
             // 检查后发布，waker 要么把已提交的睡眠拉回 Runnable，
             // 要么由这里撤销较晚的睡眠提交。
@@ -1226,7 +1263,7 @@ impl Task {
         loop {
             let current = self.state();
             if current == state {
-                if !self.group_exit_wakeup_pending() {
+                if !self.forced_exit_wakeup_pending() {
                     return true;
                 }
                 let _ = self.state.compare_exchange(
@@ -1246,15 +1283,15 @@ impl Task {
             if self.cas_state(current, state) {
                 return true;
             }
-            if self.group_exit_wakeup_pending() {
+            if self.forced_exit_wakeup_pending() {
                 return false;
             }
         }
     }
 
-    /// 在调度入口撤销已发布组退出任务的睡眠。
+    /// 在调度入口撤销已发布强制退出任务的睡眠。
     pub(crate) fn abort_group_exit_sleep(&self) -> bool {
-        if !self.group_exit_wakeup_pending() {
+        if !self.forced_exit_wakeup_pending() {
             return false;
         }
         self.state
@@ -1291,11 +1328,29 @@ impl Task {
     }
 
     pub fn parent(&self) -> Option<Arc<Task>> {
-        self.rel.lock().parent.upgrade()
+        let identity = crate::pid::lock_process_identity();
+        self.parent_in(&identity)
     }
 
     /// 把 `child` 登记为本任务的子。调用方持有 `child` 的 `Arc` 副本即可。
     pub fn add_child(&self, child: Arc<Task>) {
+        let identity = crate::pid::lock_process_identity();
+        self.add_child_in(&identity, child);
+    }
+
+    pub(crate) fn parent_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+    ) -> Option<Arc<Task>> {
+        self.rel.lock().parent.upgrade()
+    }
+
+    /// 在已经持有进程身份事务时登记 child，避免 CLONE_PARENT 与 exec 身份迁移交错。
+    pub(crate) fn add_child_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+        child: Arc<Task>,
+    ) {
         self.rel.lock().children.push(child);
     }
 
@@ -1309,8 +1364,72 @@ impl Task {
         true
     }
 
+    pub(crate) fn has_child(&self, child: &Arc<Task>) -> bool {
+        self.rel
+            .lock()
+            .children
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, child))
+    }
+
+    /// exec 的非 leader 线程接管进程身份时，原地替换父任务的 child 项。
+    pub(crate) fn replace_child_for_exec_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+        old_leader: &Arc<Task>,
+        replacement: &Arc<Task>,
+    ) -> bool {
+        let mut rel = self.rel.lock();
+        let Some(slot) = rel
+            .children
+            .iter_mut()
+            .find(|child| Arc::ptr_eq(child, old_leader))
+        else {
+            return false;
+        };
+        *slot = Arc::clone(replacement);
+        true
+    }
+
+    pub(crate) fn child_count(&self) -> usize {
+        self.rel.lock().children.len()
+    }
+
+    pub(crate) fn try_reserve_children_for_exec(
+        &self,
+        additional: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        self.rel.lock().children.try_reserve(additional)
+    }
+
+    /// 检查 exec 身份迁移所需的 children 容量是否已在可回退阶段预留。
+    pub(crate) fn children_capacity_for_exec(&self, additional: usize) -> bool {
+        let rel = self.rel.lock();
+        rel.children.capacity().saturating_sub(rel.children.len()) >= additional
+    }
+
+    pub(crate) fn take_children_for_exec_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+    ) -> Vec<Arc<Task>> {
+        core::mem::take(&mut self.rel.lock().children)
+    }
+
+    pub(crate) fn append_children_for_exec_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+        children: Vec<Arc<Task>>,
+    ) {
+        self.rel.lock().children.extend(children);
+    }
+
+    pub(crate) fn clear_parent_for_exec_in(&self, _identity: &crate::pid::ProcessIdentityGuard) {
+        self.rel.lock().parent = Weak::new();
+    }
+
     /// 父先死时，把所有子转交给 `new_parent`（通常为 init）。
     pub fn reparent_children_to(&self, new_parent: &Arc<Task>) {
+        let _identity = crate::pid::lock_process_identity();
         let drained: Vec<Arc<Task>> = {
             let mut rel = self.rel.lock();
             core::mem::take(&mut rel.children)
@@ -1325,11 +1444,62 @@ impl Task {
 
     /// 替换本任务在亲缘表里的"父"指向，常见于 reparent。
     pub fn reparent_to(&self, new_parent: &Arc<Task>) {
+        let identity = crate::pid::lock_process_identity();
+        self.reparent_to_in(&identity, new_parent);
+    }
+
+    pub(crate) fn reparent_to_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+        new_parent: &Arc<Task>,
+    ) {
         self.rel.lock().parent = Arc::downgrade(new_parent);
     }
 
     pub fn thread_group(&self) -> Arc<ThreadGroup> {
         Arc::clone(&self.rel.lock().thread_group)
+    }
+
+    /// 记录该任务由哪个线程组持有 Native child 所有权。
+    pub fn set_native_owner(&self, owner: &Arc<ThreadGroup>) {
+        *self.native_owner.lock() = Some(Arc::downgrade(owner));
+    }
+
+    pub fn native_owner(&self) -> Option<Arc<ThreadGroup>> {
+        self.native_owner.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// 取出并完整处理一条 signal，期间阻止 exec 发布 `Transitioning`。
+    ///
+    /// disposition 读取、默认动作和用户 frame 构造都必须在 `consume` 返回前完成；
+    /// producer 不取得 consumer 锁，仍可并发追加 pending。
+    pub(crate) fn consume_pending_signal<R>(
+        &self,
+        consume: impl FnOnce(SigInfo) -> R,
+    ) -> Option<R> {
+        let group = self.thread_group();
+        let _consumer = group.lock_signal_consumer()?;
+        let info = self.signal.dequeue_one().or_else(|| {
+            self.shared_signal()
+                .dequeue_one(self.signal.blocked_snapshot().raw())
+        })?;
+        Some(consume(info))
+    }
+
+    pub(crate) fn dequeue_pending_signal_in(&self, these: SigSet) -> Option<SigInfo> {
+        let group = self.thread_group();
+        let _consumer = group.lock_signal_consumer()?;
+        self.signal
+            .dequeue_one_in(these.raw())
+            .or_else(|| self.shared_signal().dequeue_one_in(these.raw()))
+    }
+
+    pub(crate) fn has_pending_signal_in(&self, these: SigSet) -> bool {
+        let group = self.thread_group();
+        let Some(_consumer) = group.lock_signal_consumer() else {
+            return false;
+        };
+        self.signal.has_pending_in(these.raw()) || self.shared_signal().has_pending_in(these.raw())
     }
 
     /// 当前用户任务是否需要协作退出线程组。
@@ -1350,6 +1520,63 @@ impl Task {
 
     fn group_exit_wakeup_pending(&self) -> bool {
         self.group_exit_requested.load(Ordering::SeqCst)
+    }
+
+    /// 对单个兄弟线程发布 exec 协作退出请求。
+    pub(crate) fn publish_exec_sibling_exit_wakeup(&self, preserve_leader_identity: bool) {
+        if !self.is_user_task() {
+            return;
+        }
+        let requested = if preserve_leader_identity {
+            EXEC_SIBLING_EXIT_PRESERVE_LEADER
+        } else {
+            EXEC_SIBLING_EXIT_ORDINARY
+        };
+        self.exec_sibling_exit_requested
+            .store(requested, Ordering::SeqCst);
+        self.signal.mark_user_return_work();
+    }
+
+    pub(crate) fn exec_sibling_exit_preserves_identity(&self) -> bool {
+        self.exec_sibling_exit_requested.load(Ordering::Acquire)
+            == EXEC_SIBLING_EXIT_PRESERVE_LEADER
+    }
+
+    pub(crate) fn clear_exec_sibling_exit_request(&self) {
+        self.exec_sibling_exit_requested
+            .store(EXEC_SIBLING_EXIT_NONE, Ordering::Release);
+    }
+
+    /// 发布 Native 单线程退出请求，多个并发请求遵循 first-wins。
+    pub(crate) fn publish_native_thread_exit_wakeup(&self, code: i32) -> i32 {
+        const REQUESTED: u64 = 1 << 63;
+        let encoded = REQUESTED | u64::from(code as u32);
+        let selected = match self.native_thread_exit_requested.compare_exchange(
+            0,
+            encoded,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => encoded,
+            Err(existing) => existing,
+        };
+        selected as u32 as i32
+    }
+
+    /// 返回已经发布的 Native 单线程退出码。
+    pub fn native_thread_exit_boundary_pending(&self) -> Option<i32> {
+        let encoded = self.native_thread_exit_requested.load(Ordering::Acquire);
+        (encoded != 0).then_some(encoded as u32 as i32)
+    }
+
+    fn forced_exit_wakeup_pending(&self) -> bool {
+        self.group_exit_wakeup_pending()
+            || self.exec_sibling_exit_requested.load(Ordering::SeqCst) != EXEC_SIBLING_EXIT_NONE
+            || self.native_thread_exit_requested.load(Ordering::SeqCst) != 0
+    }
+
+    pub(crate) fn exec_sibling_exit_boundary_pending(&self) -> bool {
+        self.exec_sibling_exit_requested.load(Ordering::Acquire) != EXEC_SIBLING_EXIT_NONE
     }
 
     /// syscall/用户返回边界的无锁快速判定；发布端的 SeqCst store 已提供
@@ -1704,6 +1931,13 @@ impl Task {
         if let Some(hook) = ext_exit_hook() {
             hook.cleanup_on_exit(self);
         }
+        self.ext_exit_cleanup_complete
+            .store(true, Ordering::Release);
+        self.exit_waiters.wake_all();
+    }
+
+    pub fn exit_extensions_cleanup_complete(&self) -> bool {
+        self.ext_exit_cleanup_complete.load(Ordering::Acquire)
     }
 
     /// 在任务进入 Zombie/Dead 前运行一次上层用户态退出清理。
@@ -1778,6 +2012,10 @@ impl Task {
         self.rel.lock().pid_in_ns.first().map(|(_, pid)| *pid)
     }
 
+    pub(crate) fn pid_root_in(&self, _identity: &crate::pid::ProcessIdentityGuard) -> Option<PidT> {
+        self.rel.lock().pid_in_ns.first().map(|(_, pid)| *pid)
+    }
+
     /// 任务在根 ns 中的 pid 快照。热路径使用，避免只读查询进入亲缘锁。
     pub fn pid_root_cached(&self) -> Option<PidT> {
         // PID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
@@ -1809,6 +2047,41 @@ impl Task {
     /// 取出所有 (ns, pid) 登记副本，便于 exit 时反向调用 `release`。
     pub fn pid_namespaces_snapshot(&self) -> Vec<(Arc<PidNamespace>, PidT)> {
         self.rel.lock().pid_in_ns.clone()
+    }
+
+    pub(crate) fn pid_registrations_owned_by_self_in(
+        self: &Arc<Self>,
+        identity: &crate::pid::ProcessIdentityGuard,
+    ) -> bool {
+        self.rel
+            .lock()
+            .pid_in_ns
+            .iter()
+            .all(|(namespace, pid)| namespace.registry().is_owned_by_in(identity, *pid, self))
+    }
+
+    pub(crate) fn take_pid_registrations_for_exec_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+    ) -> Vec<(Arc<PidNamespace>, PidT)> {
+        let registrations = core::mem::take(&mut self.rel.lock().pid_in_ns);
+        self.root_pid_cache
+            .store(crate::pid::PID_INVALID, Ordering::Release);
+        registrations
+    }
+
+    pub(crate) fn install_pid_registrations_for_exec_in(
+        &self,
+        _identity: &crate::pid::ProcessIdentityGuard,
+        registrations: Vec<(Arc<PidNamespace>, PidT)>,
+    ) {
+        let root_pid = registrations
+            .first()
+            .map_or(crate::pid::PID_INVALID, |(_, pid)| *pid);
+        let mut rel = self.rel.lock();
+        debug_assert!(rel.pid_in_ns.is_empty());
+        rel.pid_in_ns = registrations;
+        self.root_pid_cache.store(root_pid, Ordering::Release);
     }
 
     // ── 凭据 ─────────────────────────────────────────────────────────────
@@ -1877,6 +2150,11 @@ impl Task {
 
     pub fn set_robust_list(&self, head: usize, len: usize) {
         *self.robust_list.lock() = RobustListState { head, len };
+    }
+
+    /// 原子取走 robust futex 登记；后续清理即使早退也不会遗留旧用户指针。
+    pub fn take_robust_list(&self) -> RobustListState {
+        core::mem::take(&mut *self.robust_list.lock())
     }
 
     pub fn rseq_registration(&self) -> RseqRegistration {
@@ -1965,6 +2243,8 @@ impl Task {
     #[inline]
     fn user_return_work_authoritative(&self) -> bool {
         self.group_exit_boundary_pending()
+            || self.exec_sibling_exit_boundary_pending()
+            || self.native_thread_exit_boundary_pending().is_some()
             || self.has_deliverable_signal()
             || !self.rseq_events().is_empty()
             || matches!(
@@ -2369,6 +2649,17 @@ impl Task {
         self.start_time_ns.load(Ordering::Acquire)
     }
 
+    /// profiling 会话内稳定的任务标识。
+    ///
+    /// PID 可能在长窗口中复用；把任务对象地址、创建时刻和根 PID 混合后，
+    /// QEMU 插件可在阻塞、迁移和 PID 回绕期间继续识别同一个 syscall 实例。
+    #[cfg(feature = "syscall-model-markers")]
+    pub fn syscall_model_task_id(&self) -> u64 {
+        let address = self as *const Self as usize as u64;
+        let pid = self.pid_root_cached().unwrap_or(0) as u64;
+        address.rotate_left(17) ^ self.start_time_ns().rotate_left(7) ^ pid
+    }
+
     pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
         TaskUsage {
             user_ns: self.elapsed_usage_ns(now_ns),
@@ -2465,6 +2756,36 @@ impl Task {
         pi.effective()
     }
 
+    /// 在不可回退的 exec 清理阶段登记 donation；不会因容量不足而分配。
+    pub fn pi_try_add_donation(&self, token: usize, attr: SchedAttr) -> Option<SchedAttr> {
+        let mut pi = self.pi.lock();
+        if let Some(existing) = pi.donations.iter_mut().find(|d| d.token == token) {
+            existing.attr = attr.normalized();
+        } else {
+            if pi.donations.len() == pi.donations.capacity() {
+                return None;
+            }
+            pi.donations.push(PiDonation {
+                token,
+                attr: attr.normalized(),
+            });
+        }
+        Some(pi.effective())
+    }
+
+    /// 仅更新已登记的 donation；exec 退出清理使用它避免在不可回退阶段扩容。
+    pub fn pi_update_existing_donation(&self, token: usize, attr: Option<SchedAttr>) -> SchedAttr {
+        let mut pi = self.pi.lock();
+        if let Some(attr) = attr {
+            if let Some(existing) = pi.donations.iter_mut().find(|d| d.token == token) {
+                existing.attr = attr.normalized();
+            }
+        } else {
+            pi.donations.retain(|donation| donation.token != token);
+        }
+        pi.effective()
+    }
+
     /// 移除一个 PI waiter 的 donation，返回 owner 恢复后的有效属性。
     pub fn pi_remove_donation(&self, token: usize) -> SchedAttr {
         let mut pi = self.pi.lock();
@@ -2526,6 +2847,16 @@ impl Task {
 
     pub(crate) fn finish_deferred_wake(&self) {
         self.deferred_wake_queued.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn request_deferred_pi_update(&self) {
+        self.deferred_pi_update.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_deferred_pi_effective_attr(&self) -> Option<SchedAttr> {
+        self.deferred_pi_update
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.pi_effective_attr())
     }
 
     pub(crate) fn bind_placement(
@@ -2612,6 +2943,40 @@ impl Task {
         }
     }
 
+    /// 原地替换一个已经存在的扩展槽，返回旧 payload。
+    ///
+    /// 与 [`Task::ext_install`] 不同，本接口绝不新增条目，因而可用于 exec 的
+    /// point-of-no-return 之后。槽不存在时原样返回待安装 payload。
+    pub fn ext_replace(
+        &self,
+        key: TaskExtKey,
+        payload: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, Arc<dyn Any + Send + Sync>> {
+        let execution_ptr = if key == TASKEXT_ELM_EXECUTION {
+            Arc::as_ptr(&payload) as *const () as usize
+        } else {
+            0
+        };
+        let replaced = if let Some(slot) = self.hot_ext.slot(key) {
+            let mut guard = slot.lock();
+            let Some(current) = guard.as_mut() else {
+                return Err(payload);
+            };
+            core::mem::replace(current, payload)
+        } else {
+            let mut ext = self.ext.lock();
+            let Some(entry) = ext.iter_mut().find(|entry| entry.key == key) else {
+                return Err(payload);
+            };
+            core::mem::replace(&mut entry.payload, payload)
+        };
+        if execution_ptr != 0 {
+            self.elm_execution_ptr
+                .store(execution_ptr, Ordering::Release);
+        }
+        Ok(replaced)
+    }
+
     /// 查询某个子系统状态；不存在返回 `None`。
     pub fn ext_lookup(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
         if let Some(payload) = self.hot_ext.lookup(key) {
@@ -2622,6 +2987,12 @@ impl Task {
             .iter()
             .find(|e| e.key == key)
             .map(|e| Arc::clone(&e.payload))
+    }
+
+    /// 判断扩展槽是否仍持有调用方观察到的同一个 payload。
+    pub fn ext_is_current(&self, key: TaskExtKey, observed: &Arc<dyn Any + Send + Sync>) -> bool {
+        self.ext_lookup(key)
+            .is_some_and(|current| Arc::ptr_eq(&current, observed))
     }
 
     /// 在扩展槽的借用期内访问 payload，避免只读热路径反复增减 Arc 引用计数。

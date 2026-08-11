@@ -1718,6 +1718,7 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
             .collect()
     }
 
+    #[cfg(test)]
     fn claim_batch_prefix(&self, keys: &[FilePageKey]) -> PrivateFilePageClaims<'_, SHARD_COUNT> {
         let mut claims = PrivateFilePageClaims::new();
         for key in keys {
@@ -1729,6 +1730,41 @@ impl<const SHARD_COUNT: usize> ShardedPrivateFilePageCache<SHARD_COUNT> {
             }
         }
         claims
+    }
+
+    fn claim_contiguous_prefix(
+        &self,
+        first_key: FilePageKey,
+        page_size: usize,
+        pages: usize,
+    ) -> Option<PrivateFilePageClaimPrefix<'_, SHARD_COUNT>> {
+        let mut owners = PrivateFilePageLoadOwners::new();
+        for index in 0..pages {
+            let Some(offset) = private_file_batch_page_offset(first_key.offset, index, page_size)
+            else {
+                for (key, load_id) in &owners {
+                    self.abort_load(*key, *load_id, None);
+                }
+                return None;
+            };
+            let key = FilePageKey {
+                offset,
+                ..first_key
+            };
+            match self.claim(key) {
+                PrivateFilePageCacheClaim::Owner(load_id) => owners.push((key, load_id)),
+                terminal => {
+                    return Some(PrivateFilePageClaimPrefix {
+                        owners,
+                        terminal: Some((index, terminal)),
+                    });
+                }
+            }
+        }
+        Some(PrivateFilePageClaimPrefix {
+            owners,
+            terminal: None,
+        })
     }
 
     fn wrap_claim(
@@ -2031,15 +2067,17 @@ struct PreparedFilePage {
 
 type PreparedFilePages = SmallVec<[PreparedFilePage; FILE_FAULT_AROUND_PAGES]>;
 type PrivateFilePageBatch = SmallVec<[Arc<ResidentPage>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
-type PrivateFilePageLoadOwner = (FilePageKey, u64, u64);
+type PrivateFilePageLoadOwner = (FilePageKey, u64);
 type PrivateFilePageLoadOwners = SmallVec<[PrivateFilePageLoadOwner; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+#[cfg(test)]
 type PrivateFilePageClaims<'a, const SHARD_COUNT: usize> =
     SmallVec<[PrivateFilePageCacheClaim<'a, SHARD_COUNT>; PRIVATE_FILE_BATCH_MAX_PAGES]>;
-type PrivateFilePageCandidate = (FilePageKey, u64, Arc<ResidentPage>);
-type PrivateFilePageCandidates = SmallVec<[PrivateFilePageCandidate; PRIVATE_FILE_BATCH_MAX_PAGES]>;
-type PublishedPrivateFilePages =
-    SmallVec<[(FilePageKey, Arc<ResidentPage>); PRIVATE_FILE_BATCH_MAX_PAGES]>;
 type PrivateFilePageTargets<'a> = SmallVec<[&'a mut [u8]; PRIVATE_FILE_BATCH_MAX_PAGES]>;
+
+struct PrivateFilePageClaimPrefix<'a, const SHARD_COUNT: usize> {
+    owners: PrivateFilePageLoadOwners,
+    terminal: Option<(usize, PrivateFilePageCacheClaim<'a, SHARD_COUNT>)>,
+}
 
 struct AnonStoreFaultAround {
     fault_page: usize,
@@ -2769,6 +2807,252 @@ impl VmSpace {
         Err(Errno::ENOMEM)
     }
 
+    /// 在地址空间内原子选择并登记一段满足对齐要求的匿名映射。
+    pub fn map_anon_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let flags = self.with_future_mlock(flags).with(VmFlags::ANON);
+        let backing = if flags.has(VmFlags::SHARED) {
+            VmBacking::SharedAnon {
+                object: Arc::new(SharedAnonObject::new()),
+                offset: 0,
+            }
+        } else {
+            VmBacking::anonymous()
+        };
+        let mut set = self.vmas.lock();
+        let candidates = [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ];
+        for (start, end) in candidates {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags,
+                backing,
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在地址空间内原子选择并登记一段共享匿名对象映射。
+    ///
+    /// `object_offset` 表示返回区间起点对应的对象内偏移；同一对象的不同映射
+    /// 因而可以在不同地址空间共享物理页，而不依赖文件描述符或全局名称。
+    pub fn map_shared_anon_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        object: Arc<SharedAnonObject>,
+        object_offset: u64,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+            || object_offset % page_size as u64 != 0
+            || object_offset.checked_add(len as u64).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let flags = self
+            .with_future_mlock(flags)
+            .with(VmFlags::ANON)
+            .with(VmFlags::SHARED);
+        let mut set = self.vmas.lock();
+        for (start, end) in [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ] {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags,
+                backing: VmBacking::SharedAnon {
+                    object: Arc::clone(&object),
+                    offset: object_offset,
+                },
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在地址空间内原子选择并登记一段 file-backed 映射。
+    pub fn map_file_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        file: Arc<dyn FileLike>,
+        offset: u64,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+            || offset % page_size as u64 != 0
+            || offset.checked_add(len as u64).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let flags = self.with_future_mlock(flags);
+        let mapped_file = Arc::clone(&file);
+        let mut set = self.vmas.lock();
+        for (start, end) in [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ] {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags,
+                backing: VmBacking::File {
+                    file: Arc::clone(&file),
+                    offset,
+                },
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            drop(set);
+            mapped_file.on_mapped();
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在地址空间内原子选择地址，并立即映射一段连续物理内存。
+    ///
+    /// 物理内存的所有权仍由调用方持有；VMA 只保存 direct backing。调用方必须
+    /// 保证所有用户映射撤销前底层分配不会释放。
+    pub fn map_direct_any_aligned(
+        &self,
+        len: usize,
+        alignment: usize,
+        paddr: usize,
+        flags: VmFlags,
+    ) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0
+            || alignment < page_size
+            || !alignment.is_power_of_two()
+            || alignment % page_size != 0
+            || paddr % page_size != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let area_flags = self.with_future_mlock(flags).with(VmFlags::USER);
+        let mut set = self.vmas.lock();
+        for (start, end) in [
+            (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
+        ] {
+            if start >= end {
+                continue;
+            }
+            let Some(range) = set.find_aligned_gap(start..end, len, alignment) else {
+                continue;
+            };
+            set.insert(VmArea {
+                range: range.clone(),
+                flags: area_flags,
+                backing: VmBacking::Direct(paddr),
+            })?;
+            self.mmap_next.store(range.end, Ordering::Release);
+            drop(set);
+            if let Err(error) = self.populate_direct_mapping(range.clone(), paddr, area_flags) {
+                let _ = self.unmap_existing(range);
+                return Err(error);
+            }
+            return Ok(range);
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    /// 在调用者指定的空闲地址登记共享匿名对象映射；已有映射不会被替换。
+    pub fn map_shared_anon(
+        &self,
+        range: Range<usize>,
+        object: Arc<SharedAnonObject>,
+        object_offset: u64,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let page_size = page_size();
+        if object_offset % page_size as u64 != 0
+            || object_offset.checked_add(range.len() as u64).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+        let area = VmArea {
+            range,
+            flags: self
+                .with_future_mlock(flags)
+                .with(VmFlags::ANON)
+                .with(VmFlags::SHARED),
+            backing: VmBacking::SharedAnon {
+                object,
+                offset: object_offset,
+            },
+        };
+        self.vmas.lock().insert(area)
+    }
+
     #[kernel_symbols::export(name = "general.mm.VmSpace.is_range_free", contract = "kernel.mm.address-space@1", version = 1, capabilities = kernel_symbols::capability::MM_QUERY)]
     pub fn is_range_free(&self, range: Range<usize>) -> bool {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
@@ -3075,7 +3359,20 @@ impl VmSpace {
             backing: VmBacking::Direct(paddr),
         };
         self.vmas.lock().insert(area)?;
+        if let Err(error) = self.populate_direct_mapping(range.clone(), paddr, area_flags) {
+            let _ = self.unmap_existing(range);
+            return Err(error);
+        }
+        Ok(())
+    }
 
+    fn populate_direct_mapping(
+        &self,
+        range: Range<usize>,
+        paddr: usize,
+        area_flags: VmFlags,
+    ) -> Result<(), Errno> {
+        let page_size = page_size();
         let mut pages = self.pages.lock();
         let mut va = range.start;
         while va < range.end {
@@ -3096,12 +3393,26 @@ impl VmSpace {
     /// 取消映射。同时把已 commit 的页表项摘掉；物理页由 resident page refcount 回收。
     #[kernel_symbols::export(name = "general.mm.VmSpace.unmap", contract = "kernel.mm.mapping@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.unmap_inner(range, false)
+    }
+
+    /// 仅在目标范围被 VMA 完整覆盖时取消映射。
+    ///
+    /// 覆盖检查和 VMA 摘除共用同一临界区，供要求 no-hole 语义的 Native ABI 使用。
+    pub fn unmap_existing(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.unmap_inner(range, true)
+    }
+
+    fn unmap_inner(&self, range: Range<usize>, require_existing: bool) -> Result<(), Errno> {
         #[cfg(feature = "performance-profile")]
         let _profile = profiling::scope(profiling::Event::MmUnmap)
             .bytes(range.end.saturating_sub(range.start));
         self.validate_range(&range)?;
         let (removed_areas, removed) = {
             let mut vmas = self.vmas.lock();
+            if require_existing && !vmas.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
             let removed_areas = vmas.unmap_range(&range);
             let removed = self.unmap_page_mappings(range.clone())?;
             (removed_areas, removed)
@@ -3366,7 +3677,9 @@ impl VmSpace {
             }
         }
         let pages = self.pages.lock();
-        let mut out = Vec::with_capacity(page_count);
+        let mut out = Vec::new();
+        out.try_reserve_exact(page_count)
+            .map_err(|_| Errno::ENOMEM)?;
         let mut va = range.start;
         while va < range.end {
             out.push(if pages.contains_key(va) { 1 } else { 0 });
@@ -3383,6 +3696,30 @@ impl VmSpace {
             return Err(Errno::ENOMEM);
         }
         Ok(())
+    }
+
+    /// 校验一段用户 VMA 连续存在且每一段都包含指定权限。
+    pub fn contains_user_range_with_flags(
+        &self,
+        range: Range<usize>,
+        required: u32,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        if required == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let set = self.vmas.lock();
+        let mut cursor = range.start;
+        for area in set.iter_overlap(&range) {
+            if area.range.start > cursor || !area.flags.contains_all(required) {
+                return Err(Errno::EACCES);
+            }
+            cursor = cursor.max(area.range.end);
+            if cursor >= range.end {
+                return Ok(());
+            }
+        }
+        Err(Errno::ENOMEM)
     }
 
     /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
@@ -3785,6 +4122,29 @@ impl VmSpace {
         Ok(f(slice))
     }
 
+    /// 把可能跨越多个页面的用户区完整复制到内核缓冲区。
+    ///
+    /// 与 [`Self::with_user_read_slice`] 不同，本接口保证成功时填满整个 `output`；
+    /// 调用方不需要理解单页窗口边界，也不会因跨页结构产生长度不等的 slice。
+    pub fn copy_user_bytes_in(&self, user: usize, output: &mut [u8]) -> Result<(), Errno> {
+        user.checked_add(output.len()).ok_or(Errno::EFAULT)?;
+        let mut copied = 0usize;
+        while copied < output.len() {
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let count = unsafe {
+                self.with_user_read_slice(address, output.len() - copied, |window| {
+                    output[copied..copied + window.len()].copy_from_slice(window);
+                    window.len()
+                })
+            }?;
+            if count == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
     /// 固定覆盖给定范围的只读用户页，并在返回前完成全部权限检查和 fault-in。
     ///
     /// 固定窗口只保留到返回值析构为止，适合把用户复制与其它子系统的自旋锁分开。
@@ -3991,6 +4351,17 @@ impl VmSpace {
         })
     }
 
+    /// 向已经常驻且可写的用户 u32 执行 release store。
+    ///
+    /// 该接口供共享队列等内核生产者发布 head/tail；调用方必须先完成 fault-in，
+    /// 映射或权限已经变化时返回 EFAULT。
+    pub fn store_user_u32_nofault(&self, user: usize, value: u32) -> Result<(), Errno> {
+        self.with_user_atomic_u32(user, true, |word| {
+            word.store(value, Ordering::Release);
+            ((), true)
+        })
+    }
+
     fn user_u32_location(&self, user: usize) -> Result<(usize, usize), Errno> {
         if user % core::mem::align_of::<u32>() != 0 {
             return Err(Errno::EINVAL);
@@ -4062,6 +4433,28 @@ impl VmSpace {
         let result = f(slice);
         page.mark_dirty();
         Ok(result)
+    }
+
+    /// 把内核缓冲区完整复制到可能跨越多个页面的用户区。
+    ///
+    /// 成功返回前会访问并标脏覆盖范围内的每一页；任一页不可写时返回 `EFAULT`。
+    pub fn copy_user_bytes_out(&self, user: usize, input: &[u8]) -> Result<(), Errno> {
+        user.checked_add(input.len()).ok_or(Errno::EFAULT)?;
+        let mut copied = 0usize;
+        while copied < input.len() {
+            let address = user.checked_add(copied).ok_or(Errno::EFAULT)?;
+            let count = unsafe {
+                self.with_user_write_slice(address, input.len() - copied, |window| {
+                    window.copy_from_slice(&input[copied..copied + window.len()]);
+                    window.len()
+                })
+            }?;
+            if count == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copied += count;
+        }
+        Ok(())
     }
 
     /// 立即为一个 ELF 段分配并填充物理页。
@@ -4155,6 +4548,57 @@ impl VmSpace {
             )?;
             if plan.lazy_file.end < plan.mapping.end {
                 self.map_anon(plan.lazy_file.end..plan.mapping.end, area_flags)?;
+            }
+        }
+
+        for &page_va in plan.fragments() {
+            self.commit_file_fragment_page(
+                page_va,
+                vaddr,
+                file_offset,
+                file_size,
+                file.as_ref(),
+                area_flags.with(VmFlags::ANON),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 用文件段替换已经预留的同址 VMA，并保留首尾碎片页与 BSS 的精确清零语义。
+    ///
+    /// 动态组件先以匿名 VMA 预留完整映像地址，再用本入口把无需重定位的段改为
+    /// file-backed。每个子区间都通过 fixed 映射在 VMA 锁内替换，地址不会在事务
+    /// 准备期间被其它线程抢占。
+    pub fn commit_file_segment_fixed(
+        &self,
+        vaddr: usize,
+        memsz: usize,
+        file_offset: u64,
+        file_size: usize,
+        file: Arc<dyn FileLike>,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        if memsz == 0 {
+            return Ok(());
+        }
+        let page_size = page_size();
+        let plan = plan_file_segment(vaddr, memsz, file_offset, file_size, page_size)?;
+        let area_flags = flags.with(VmFlags::USER);
+
+        if plan.lazy_file.start >= plan.lazy_file.end {
+            self.map_fixed_anon(plan.mapping.clone(), area_flags)?;
+        } else {
+            if plan.mapping.start < plan.lazy_file.start {
+                self.map_fixed_anon(plan.mapping.start..plan.lazy_file.start, area_flags)?;
+            }
+            self.map_fixed_file(
+                plan.lazy_file.clone(),
+                Arc::clone(&file),
+                plan.lazy_file_offset,
+                area_flags,
+            )?;
+            if plan.lazy_file.end < plan.mapping.end {
+                self.map_fixed_anon(plan.lazy_file.end..plan.mapping.end, area_flags)?;
             }
         }
 
@@ -4275,7 +4719,8 @@ impl VmSpace {
         let virt_fn = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EFAULT)?;
-        Ok((Arc::clone(&page), virt_fn(page.paddr()) + offset, len))
+        let kva = virt_fn(page.paddr()) + offset;
+        Ok((page, kva, len))
     }
 
     /// 在一次 VMA/pages 快照中固定已经常驻且权限就绪的用户页。
@@ -5214,63 +5659,37 @@ fn load_private_file_page_batch(
     if plan.pages > PRIVATE_FILE_BATCH_MAX_PAGES {
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
-    let mut keys = SmallVec::<[FilePageKey; PRIVATE_FILE_BATCH_MAX_PAGES]>::new();
-    let mut offsets = SmallVec::<[u64; PRIVATE_FILE_BATCH_MAX_PAGES]>::new();
-    for index in 0..plan.pages {
-        let Some(offset) = private_file_batch_page_offset(file_off, index, page_size) else {
-            return Ok(PrivateFilePageBatchLoad::Fallback);
-        };
-        keys.push(FilePageKey::new_private(file_key, offset, generation));
-        offsets.push(offset);
-    }
-
-    let mut owners = PrivateFilePageLoadOwners::new();
-    let mut cached = None;
-    let mut fatal_error = None;
-    let mut force_fallback = false;
-    for (index, ((key, offset), claim)) in keys
-        .iter()
-        .copied()
-        .zip(offsets.iter().copied())
-        .zip(PRIVATE_FILE_PAGES.claim_batch_prefix(&keys))
-        .enumerate()
-    {
-        match claim {
-            PrivateFilePageCacheClaim::Ready(page) if index == 0 => {
-                cached = Some(page);
-            }
-            PrivateFilePageCacheClaim::Ready(_) | PrivateFilePageCacheClaim::Loading(_) => {}
-            PrivateFilePageCacheClaim::Failed(error)
-                if private_file_batch_error_is_fatal(index) =>
-            {
-                fatal_error = Some(error);
-            }
-            PrivateFilePageCacheClaim::Failed(_) => {}
-            PrivateFilePageCacheClaim::Owner(load_id) => owners.push((key, offset, load_id)),
-            PrivateFilePageCacheClaim::Bypass => {
-                force_fallback = true;
-            }
-        }
-    }
-    if let Some(page) = cached {
-        abort_private_file_page_loads(&owners, None);
-        return if file.private_page_cache_generation() == Some(generation) {
-            Ok(PrivateFilePageBatchLoad::Cached(page))
-        } else {
-            Ok(PrivateFilePageBatchLoad::Fallback)
-        };
-    }
-    if let Some(error) = fatal_error {
-        abort_private_file_page_loads(&owners, None);
-        return if file.private_page_cache_generation() == Some(generation) {
-            Err(error)
-        } else {
-            Ok(PrivateFilePageBatchLoad::Fallback)
-        };
-    }
-    if force_fallback {
-        abort_private_file_page_loads(&owners, None);
+    let first_key = FilePageKey::new_private(file_key, file_off, generation);
+    let Some(prefix) = PRIVATE_FILE_PAGES.claim_contiguous_prefix(first_key, page_size, plan.pages)
+    else {
         return Ok(PrivateFilePageBatchLoad::Fallback);
+    };
+    let owners = prefix.owners;
+    let terminal = prefix.terminal;
+    match terminal {
+        Some((0, PrivateFilePageCacheClaim::Ready(page))) => {
+            abort_private_file_page_loads(&owners, None);
+            return if file.private_page_cache_generation() == Some(generation) {
+                Ok(PrivateFilePageBatchLoad::Cached(page))
+            } else {
+                Ok(PrivateFilePageBatchLoad::Fallback)
+            };
+        }
+        Some((index, PrivateFilePageCacheClaim::Failed(error)))
+            if private_file_batch_error_is_fatal(index) =>
+        {
+            abort_private_file_page_loads(&owners, None);
+            return if file.private_page_cache_generation() == Some(generation) {
+                Err(error)
+            } else {
+                Ok(PrivateFilePageBatchLoad::Fallback)
+            };
+        }
+        Some((_, PrivateFilePageCacheClaim::Bypass)) => {
+            abort_private_file_page_loads(&owners, None);
+            return Ok(PrivateFilePageBatchLoad::Fallback);
+        }
+        _ => {}
     }
     if owners.len() < PRIVATE_FILE_BATCH_MIN_PAGES {
         abort_private_file_page_loads(&owners, None);
@@ -5282,18 +5701,16 @@ fn load_private_file_page_batch(
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
 
-    let mut candidates = PrivateFilePageCandidates::new();
+    let mut candidates = PrivateFilePageBatch::new();
     let mut pages = PrivateFilePageBatch::new();
-    let mut published_candidates = PublishedPrivateFilePages::new();
 
-    for (key, _, load_id) in &owners {
+    for _ in &owners {
         // Safety: 候选页在读满有效前缀并清零 EOF 尾部前不会进入 cache 或页表。
         let Some(paddr) = (unsafe { alloc_uninitialized_user_page() }) else {
             abort_private_file_page_loads(&owners, None);
             return Ok(PrivateFilePageBatchLoad::Fallback);
         };
-        let candidate = ResidentPage::new_private_file(paddr);
-        candidates.push((*key, *load_id, candidate));
+        candidates.push(ResidentPage::new_private_file(paddr));
     }
     debug_assert!(!candidates.spilled());
     let Some(owner_capacity) = owners.len().checked_mul(page_size) else {
@@ -5306,7 +5723,7 @@ fn load_private_file_page_batch(
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
     let mut targets = PrivateFilePageTargets::new();
-    for (_, _, candidate) in &candidates {
+    for candidate in &candidates {
         // Safety: 每个 candidate 持有不同的独占物理页；所有页在本次批量读取完成
         // 前都只存在于本地内联批次，尚未进入 cache、resident map 或用户页表。
         targets.push(unsafe {
@@ -5329,33 +5746,31 @@ fn load_private_file_page_batch(
         return Ok(PrivateFilePageBatchLoad::Fallback);
     }
 
-    let mut candidates = candidates.into_iter();
-    while let Some((key, load_id, candidate)) = candidates.next() {
+    for (index, ((key, load_id), candidate)) in owners.iter().copied().zip(candidates).enumerate() {
         let Some(page) = PRIVATE_FILE_PAGES.finish_load(key, load_id, candidate) else {
-            for (remaining_key, remaining_load_id, _) in candidates {
-                PRIVATE_FILE_PAGES.abort_load(remaining_key, remaining_load_id, None);
+            for (remaining_key, remaining_load_id) in &owners[index + 1..] {
+                PRIVATE_FILE_PAGES.abort_load(*remaining_key, *remaining_load_id, None);
             }
-            rollback_private_file_page_batch(&published_candidates);
+            rollback_private_file_page_batch(&PRIVATE_FILE_PAGES, &owners, &pages);
             return Ok(PrivateFilePageBatchLoad::Fallback);
         };
-        published_candidates.push((key, Arc::clone(&page)));
         pages.push(page);
-        if file.private_page_cache_generation() != Some(generation) {
-            for (remaining_key, remaining_load_id, _) in candidates {
-                PRIVATE_FILE_PAGES.abort_load(remaining_key, remaining_load_id, None);
-            }
-            rollback_private_file_page_batch(&published_candidates);
-            return Ok(PrivateFilePageBatchLoad::Fallback);
-        }
     }
     debug_assert!(!pages.spilled());
-    debug_assert!(!published_candidates.spilled());
+    if file.private_page_cache_generation() != Some(generation) {
+        rollback_private_file_page_batch(&PRIVATE_FILE_PAGES, &owners, &pages);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
     Ok(PrivateFilePageBatchLoad::Batched(pages))
 }
 
-fn rollback_private_file_page_batch(published: &[(FilePageKey, Arc<ResidentPage>)]) {
-    for (key, page) in published {
-        PRIVATE_FILE_PAGES.remove_if_same(*key, page);
+fn rollback_private_file_page_batch<const SHARD_COUNT: usize>(
+    cache: &ShardedPrivateFilePageCache<SHARD_COUNT>,
+    owners: &[(FilePageKey, u64)],
+    published: &[Arc<ResidentPage>],
+) {
+    for ((key, _), page) in owners.iter().zip(published) {
+        cache.remove_if_same(*key, page);
     }
 }
 
@@ -5451,8 +5866,8 @@ fn find_cached_private_file_page<const SHARD_COUNT: usize>(
     cache.find(key)
 }
 
-fn abort_private_file_page_loads(loads: &[(FilePageKey, u64, u64)], error: Option<Errno>) {
-    for (key, _, load_id) in loads {
+fn abort_private_file_page_loads(loads: &[(FilePageKey, u64)], error: Option<Errno>) {
+    for (key, load_id) in loads {
         PRIVATE_FILE_PAGES.abort_load(*key, *load_id, error);
     }
 }
@@ -5549,6 +5964,70 @@ fn shared_anon_page(
         },
     );
     Ok(page)
+}
+
+/// 从共享匿名 backing 读取一段连续数据，不要求对象已经映射到某个用户地址空间。
+pub fn read_shared_anon(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<(), Errno> {
+    shared_anon_transfer(object, offset, output.as_mut_ptr(), output.len(), false)
+}
+
+/// 向共享匿名 backing 写入一段连续数据，不要求对象已经映射到某个用户地址空间。
+pub fn write_shared_anon(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+    input: &[u8],
+) -> Result<(), Errno> {
+    shared_anon_transfer(object, offset, input.as_ptr() as *mut u8, input.len(), true)
+}
+
+fn shared_anon_transfer(
+    object: &Arc<SharedAnonObject>,
+    offset: u64,
+    buffer: *mut u8,
+    length: usize,
+    write: bool,
+) -> Result<(), Errno> {
+    if length == 0 {
+        return Ok(());
+    }
+    let page_size = page_size();
+    let page_size_u64 = u64::try_from(page_size).map_err(|_| Errno::EOVERFLOW)?;
+    let end = offset
+        .checked_add(u64::try_from(length).map_err(|_| Errno::EOVERFLOW)?)
+        .ok_or(Errno::EOVERFLOW)?;
+    let virt = allocator::KERNEL_ALLOCATOR
+        .load_phys_to_virt()
+        .ok_or(Errno::EINVAL)?;
+    let mut cursor = offset;
+    let mut done = 0usize;
+    while cursor < end {
+        let page_offset = cursor / page_size_u64 * page_size_u64;
+        let within = usize::try_from(cursor - page_offset).map_err(|_| Errno::EOVERFLOW)?;
+        let count = (page_size - within).min(length - done);
+        let page = shared_anon_page(object, page_offset)?;
+        let address = virt(page.paddr())
+            .checked_add(within)
+            .ok_or(Errno::EOVERFLOW)?;
+        if write {
+            unsafe {
+                core::ptr::copy_nonoverlapping(buffer.add(done), address as *mut u8, count);
+            }
+            page.mark_dirty();
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(address as *const u8, buffer.add(done), count);
+            }
+        }
+        cursor = cursor
+            .checked_add(u64::try_from(count).map_err(|_| Errno::EOVERFLOW)?)
+            .ok_or(Errno::EOVERFLOW)?;
+        done += count;
+    }
+    Ok(())
 }
 
 fn prune_shared_anon_pages() {
@@ -5881,15 +6360,15 @@ mod tests {
         AnonStoreShadowKey, AnonStoreShadowState, FILE_FAULT_AROUND_PAGES, FaultAroundCommit,
         FaultKind, FaultOutcome, FilePageKey, ForkChildMap, PRIVATE_FILE_BATCH_MAX_BYTES,
         PageAccess, PreparedAnonPages, PreparedFilePages, PrivateFileFaultAround,
-        PrivateFilePageCacheClaim, PrivateFilePageCacheEntry, ResidentPage,
-        ShardedPrivateFilePageCache, VmFlags, VmSpace, WeakFilePageCache, access_for_private_file,
-        anon_store_fault_around_end, fault_from_errno, file_fault_around_window,
-        find_cached_private_file_page, map_fork_child_batches, observe_anon_store_shadow,
-        permits_file_fault_around, plan_file_segment, private_file_batch_error_is_fatal,
-        private_file_batch_page_offset, private_file_batch_plan, private_file_cache_snapshot,
-        publish_cached_file_page, publish_cached_private_file_page, read_file_bytes_exact,
-        read_file_page_exact, same_backing_snapshot, unmapped_prefix_len,
-        user_page_allocation_handle,
+        PrivateFilePageBatch, PrivateFilePageCacheClaim, PrivateFilePageCacheEntry,
+        PrivateFilePageLoadOwners, ResidentPage, ShardedPrivateFilePageCache, VmFlags, VmSpace,
+        WeakFilePageCache, access_for_private_file, anon_store_fault_around_end, fault_from_errno,
+        file_fault_around_window, find_cached_private_file_page, map_fork_child_batches,
+        observe_anon_store_shadow, permits_file_fault_around, plan_file_segment,
+        private_file_batch_error_is_fatal, private_file_batch_page_offset, private_file_batch_plan,
+        private_file_cache_snapshot, publish_cached_file_page, publish_cached_private_file_page,
+        read_file_bytes_exact, read_file_page_exact, rollback_private_file_page_batch,
+        same_backing_snapshot, unmapped_prefix_len, user_page_allocation_handle,
     };
     use errno::Errno;
     use mm::{FileLike, VmBacking};
@@ -6680,6 +7159,69 @@ mod tests {
         drop(claims);
         cache.abort_load(keys[0], first_load, None);
         cache.abort_load(keys[1], second_load, None);
+    }
+
+    #[test]
+    fn private_file_cache_contiguous_claim_returns_owner_prefix() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(8);
+        let first = cache_key(71);
+        let keys = [
+            first,
+            FilePageKey {
+                offset: first.offset + PAGE_SIZE as u64,
+                ..first
+            },
+            FilePageKey {
+                offset: first.offset + (2 * PAGE_SIZE) as u64,
+                ..first
+            },
+        ];
+        let competing_load = match cache.claim(keys[1]) {
+            PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+            _ => panic!("第二页必须先进入加载状态"),
+        };
+
+        let prefix = cache
+            .claim_contiguous_prefix(first, PAGE_SIZE, keys.len())
+            .expect("连续页偏移必须有效");
+        assert_eq!(prefix.owners.len(), 1);
+        assert_eq!(prefix.owners[0].0, keys[0]);
+        assert!(matches!(
+            &prefix.terminal,
+            Some((1, PrivateFilePageCacheClaim::Loading(_)))
+        ));
+        assert!(cache.shards[0].lock().pages.get(&keys[2]).is_none());
+
+        let first_load = prefix.owners[0].1;
+        drop(prefix);
+        cache.abort_load(keys[0], first_load, None);
+        cache.abort_load(keys[1], competing_load, None);
+    }
+
+    #[test]
+    fn private_file_cache_batch_rollback_uses_owner_order() {
+        let cache = ShardedPrivateFilePageCache::<1>::new(8);
+        let keys = [cache_key(73), cache_key(74)];
+        let mut owners = PrivateFilePageLoadOwners::new();
+        let mut pages = PrivateFilePageBatch::new();
+
+        for (index, key) in keys.into_iter().enumerate() {
+            let load_id = match cache.claim(key) {
+                PrivateFilePageCacheClaim::Owner(load_id) => load_id,
+                _ => panic!("空键必须由当前批次持有"),
+            };
+            let candidate = ResidentPage::new_direct((index + 1) * PAGE_SIZE);
+            let page = cache
+                .finish_load(key, load_id, candidate)
+                .expect("当前 owner 必须能发布页面");
+            owners.push((key, load_id));
+            pages.push(page);
+        }
+
+        rollback_private_file_page_batch(&cache, &owners, &pages);
+        for key in keys {
+            assert!(find_cached_private_file_page(&cache, key).is_none());
+        }
     }
 
     #[test]

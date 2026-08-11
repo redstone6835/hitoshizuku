@@ -16,11 +16,13 @@ fn main() {
 
     generate_elm_trust_anchors(&root, &out_dir);
     generate_elm_build_bound(&root, &out_dir, &target);
+    generate_soyo_trust_policy(&root, &out_dir);
     link_integrated_components();
 
     println!("cargo:rerun-if-env-changed=INITRAMFS");
     println!("cargo:rerun-if-env-changed=ELM_TRUST_ANCHORS_FILE");
     println!("cargo:rerun-if-env-changed=ELM_BUILD_BOUND_MANIFEST");
+    println!("cargo:rerun-if-env-changed=SOYO_TRUST_POLICY_FILE");
     if std::env::var_os("CARGO_FEATURE_EMBEDDED_INITRAMFS").is_some() {
         let initramfs = env_path("INITRAMFS", &root)
             .unwrap_or_else(|| panic!("启用 embedded-initramfs 时必须设置 INITRAMFS"));
@@ -224,6 +226,135 @@ fn write_rust_byte_array(output: &mut String, bytes: &[u8; 32]) {
         write!(output, "0x{byte:02x}").unwrap();
     }
     output.push(']');
+}
+
+fn generate_soyo_trust_policy(root: &Path, out_dir: &Path) {
+    let configured_path = std::env::var_os("SOYO_TRUST_POLICY_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        });
+    let (allow_unsigned, trusted, revoked, rejected) = match configured_path {
+        Some(path) => {
+            println!("cargo:rerun-if-changed={}", path.display());
+            parse_soyo_trust_policy(&path)
+        }
+        None => (true, Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    let mut generated = String::new();
+    writeln!(
+        generated,
+        "pub(super) const CONFIGURED_SOYO_ALLOW_UNSIGNED: bool = {allow_unsigned};"
+    )
+    .unwrap();
+    generated.push_str(
+        "pub(super) const CONFIGURED_SOYO_TRUSTED_KEYS: &[soyo::TrustedPublicKey] = &[\n",
+    );
+    for public_key in trusted {
+        let key_id: [u8; 32] = Sha256::digest(public_key).into();
+        generated.push_str("    soyo::TrustedPublicKey { key_id: ");
+        write_rust_byte_array(&mut generated, &key_id);
+        generated.push_str(", public_key: ");
+        write_rust_byte_array(&mut generated, &public_key);
+        generated.push_str(" },\n");
+    }
+    generated.push_str("];\n");
+    generated.push_str("pub(super) const CONFIGURED_SOYO_REVOKED_KEYS: &[[u8; 32]] = &[\n");
+    for key_id in revoked {
+        generated.push_str("    ");
+        write_rust_byte_array(&mut generated, &key_id);
+        generated.push_str(",\n");
+    }
+    generated.push_str("];\n");
+    generated.push_str("pub(super) const CONFIGURED_SOYO_REJECTED_HASHES: &[[u8; 32]] = &[\n");
+    for content_hash in rejected {
+        generated.push_str("    ");
+        write_rust_byte_array(&mut generated, &content_hash);
+        generated.push_str(",\n");
+    }
+    generated.push_str("];\n");
+    std::fs::write(out_dir.join("soyo_trust_policy.rs"), generated)
+        .unwrap_or_else(|error| panic!("写入 SOYO 信任策略失败：{error}"));
+}
+
+fn parse_soyo_trust_policy(path: &Path) -> (bool, Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<[u8; 32]>) {
+    let input = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("读取 SOYO 信任策略 {path:?} 失败：{error}"));
+    let mut allow_unsigned = None;
+    let mut trusted = BTreeSet::new();
+    let mut revoked = BTreeSet::new();
+    let mut rejected = BTreeSet::new();
+    for (index, raw_line) in input.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            2,
+            "SOYO 信任策略 {path:?} 第 {line_number} 行必须包含动作和值"
+        );
+        match fields[0] {
+            "allow-unsigned" => {
+                let value = match fields[1] {
+                    "true" => true,
+                    "false" => false,
+                    _ => panic!(
+                        "SOYO 信任策略 {path:?} 第 {line_number} 行的 allow-unsigned 必须是 true 或 false"
+                    ),
+                };
+                assert!(
+                    allow_unsigned.replace(value).is_none(),
+                    "SOYO 信任策略 {path:?} 重复声明 allow-unsigned"
+                );
+            }
+            "key" => {
+                let public_key = parse_hex32(fields[1]).unwrap_or_else(|| {
+                    panic!("SOYO 信任策略 {path:?} 第 {line_number} 行的公钥不是 64 位 hex")
+                });
+                ed25519_dalek::VerifyingKey::from_bytes(&public_key).unwrap_or_else(|_| {
+                    panic!("SOYO 信任策略 {path:?} 第 {line_number} 行不是有效 Ed25519 公钥")
+                });
+                assert!(
+                    trusted.insert(public_key),
+                    "SOYO 信任策略 {path:?} 第 {line_number} 行包含重复公钥"
+                );
+            }
+            "revoke" => {
+                let key_id = parse_hex32(fields[1]).unwrap_or_else(|| {
+                    panic!("SOYO 信任策略 {path:?} 第 {line_number} 行的 key id 不是 64 位 hex")
+                });
+                assert!(
+                    revoked.insert(key_id),
+                    "SOYO 信任策略 {path:?} 第 {line_number} 行包含重复撤销项"
+                );
+            }
+            "reject" => {
+                let content_hash = parse_hex32(fields[1]).unwrap_or_else(|| {
+                    panic!("SOYO 信任策略 {path:?} 第 {line_number} 行的内容摘要不是 64 位 hex")
+                });
+                assert!(
+                    rejected.insert(content_hash),
+                    "SOYO 信任策略 {path:?} 第 {line_number} 行包含重复回滚拒绝项"
+                );
+            }
+            action => panic!("SOYO 信任策略 {path:?} 第 {line_number} 行包含未知动作 {action:?}"),
+        }
+    }
+    (
+        allow_unsigned.unwrap_or(true),
+        trusted.into_iter().collect(),
+        revoked.into_iter().collect(),
+        rejected.into_iter().collect(),
+    )
 }
 
 fn link_integrated_components() {

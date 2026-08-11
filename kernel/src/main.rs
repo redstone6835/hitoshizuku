@@ -18,10 +18,13 @@ mod bench;
 mod device_init;
 mod dtb;
 mod elm;
+mod exec;
 mod initramfs;
 mod integrated_components;
 #[cfg(feature = "kcsan")]
 mod kcsan_runtime;
+#[path = "native_abi/mod.rs"]
+mod native_runtime;
 mod net_runtime;
 mod net_stack;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -29,6 +32,7 @@ mod net_tests;
 mod panic;
 mod rseq;
 mod sched;
+mod soyo;
 mod start;
 mod stdio;
 mod syscalls;
@@ -64,6 +68,35 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
 
 #[global_allocator]
 static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
+
+#[cfg(any(
+    feature = "kernel-tests",
+    feature = "soyo-tests",
+    feature = "network-tests",
+    feature = "allocator-tests",
+    feature = "smp-tests"
+))]
+const RUN_KTESTS_BEFORE_RUNTIME_COMPONENTS: bool = cfg!(all(
+    feature = "allocator-tests",
+    not(any(
+        feature = "kernel-tests",
+        feature = "soyo-tests",
+        feature = "network-tests",
+        feature = "smp-tests"
+    ))
+));
+
+#[cfg(any(
+    feature = "kernel-tests",
+    feature = "soyo-tests",
+    feature = "network-tests",
+    feature = "allocator-tests",
+    feature = "smp-tests"
+))]
+fn run_ktests() {
+    ktest::runner::set_writer(hal::console::early_write_bytes);
+    let _ = ktest::runner::run_all();
+}
 
 #[cfg(feature = "performance-profile")]
 fn external_profile_counter(cpu: usize, event: profiling::Event) -> u64 {
@@ -112,6 +145,16 @@ fn main() -> ! {
         ::sched::online_cpu_mask(),
         ::sched::active_cpu_mask(),
     );
+    #[cfg(any(
+        feature = "kernel-tests",
+        feature = "soyo-tests",
+        feature = "network-tests",
+        feature = "allocator-tests",
+        feature = "smp-tests"
+    ))]
+    if RUN_KTESTS_BEFORE_RUNTIME_COMPONENTS {
+        run_ktests();
+    }
     #[cfg(feature = "kcsan")]
     {
         // AP 在建立架构 per-CPU 状态前也会经过已插桩代码。等全部 AP 完成
@@ -159,14 +202,13 @@ fn main() -> ! {
 
     #[cfg(any(
         feature = "kernel-tests",
+        feature = "soyo-tests",
         feature = "network-tests",
         feature = "allocator-tests",
         feature = "smp-tests"
     ))]
-    {
-        ktest::runner::set_writer(hal::console::early_write_bytes);
-        let report = ktest::runner::run_all();
-        let _ = report;
+    if !RUN_KTESTS_BEFORE_RUNTIME_COMPONENTS {
+        run_ktests();
     }
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────

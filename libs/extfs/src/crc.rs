@@ -3,7 +3,7 @@
 //! ext4 METADATA_CSUM 使用 crc32c(CRC-32C / iSCSI),生成多项式 `0x1EDC6F41`;
 //! 驱动在读路径用它验证超级块、块组描述符、inode、extent、目录块的校验和。
 //!
-//! 本模块不依赖任何硬件指令。主路径使用 slicing-by-8 查表，尾部保留字节查表；
+//! 本模块不依赖任何硬件指令。主路径使用 slicing-by-16 查表，尾部保留字节查表；
 //! 未来若需要架构 CRC 指令再替换。
 
 const POLY: u32 = 0x82f63b78; // 0x1EDC6F41 的位反射
@@ -25,11 +25,11 @@ static TABLE: [u32; 256] = {
     t
 };
 
-const fn build_slicing_tables() -> [[u32; 256]; 8] {
-    let mut tables = [[0u32; 256]; 8];
+const fn build_slicing_tables() -> [[u32; 256]; 16] {
+    let mut tables = [[0u32; 256]; 16];
     tables[0] = TABLE;
     let mut table = 1usize;
-    while table < 8 {
+    while table < 16 {
         let mut index = 0usize;
         while index < 256 {
             let previous = tables[table - 1][index];
@@ -41,22 +41,48 @@ const fn build_slicing_tables() -> [[u32; 256]; 8] {
     tables
 }
 
-static TABLE_SLICING: [[u32; 256]; 8] = build_slicing_tables();
+static TABLE_SLICING: [[u32; 256]; 16] = build_slicing_tables();
 
 /// 以 `seed` 为初值,对 `data` 继续求 CRC32C。
 #[inline]
 pub(crate) fn update(seed: u32, data: &[u8]) -> u32 {
-    update_slicing_by_8(seed, data)
+    update_slicing_by_16(seed, data)
 }
 
-/// 以 `seed` 为初值，使用 slicing-by-8 继续求 CRC32C。
+/// 以 `seed` 为初值，使用 slicing-by-16 继续求 CRC32C。
 ///
-/// 输入按字节读取，因而不要求对齐；不足 8 字节的尾部保持与 [`update`] 相同的语义。
+/// 输入按字节读取，因而不要求对齐；不足 16 字节的尾部保持与 [`update`] 相同的语义。
 #[inline]
-pub(crate) fn update_slicing_by_8(seed: u32, data: &[u8]) -> u32 {
+pub(crate) fn update_slicing_by_16(seed: u32, data: &[u8]) -> u32 {
     let mut c = seed;
     let mut offset = 0usize;
-    while data.len() >= 8 && offset <= data.len() - 8 {
+    while data.len() >= 16 && offset <= data.len() - 16 {
+        let word = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        c ^= word;
+        c = TABLE_SLICING[15][(c & 0xff) as usize]
+            ^ TABLE_SLICING[14][((c >> 8) & 0xff) as usize]
+            ^ TABLE_SLICING[13][((c >> 16) & 0xff) as usize]
+            ^ TABLE_SLICING[12][(c >> 24) as usize]
+            ^ TABLE_SLICING[11][data[offset + 4] as usize]
+            ^ TABLE_SLICING[10][data[offset + 5] as usize]
+            ^ TABLE_SLICING[9][data[offset + 6] as usize]
+            ^ TABLE_SLICING[8][data[offset + 7] as usize]
+            ^ TABLE_SLICING[7][data[offset + 8] as usize]
+            ^ TABLE_SLICING[6][data[offset + 9] as usize]
+            ^ TABLE_SLICING[5][data[offset + 10] as usize]
+            ^ TABLE_SLICING[4][data[offset + 11] as usize]
+            ^ TABLE_SLICING[3][data[offset + 12] as usize]
+            ^ TABLE_SLICING[2][data[offset + 13] as usize]
+            ^ TABLE_SLICING[1][data[offset + 14] as usize]
+            ^ TABLE_SLICING[0][data[offset + 15] as usize];
+        offset += 16;
+    }
+    if data.len() - offset >= 8 {
         let word = u32::from_le_bytes([
             data[offset],
             data[offset + 1],

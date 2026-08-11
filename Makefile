@@ -1,8 +1,14 @@
 .DEFAULT_GOAL := kernel
 
 .PHONY: default kernel modules modules_install config oldconfig defconfig busybox \
-	kernel-la kernel-rv kcsan-la kcsan-rv syscall-bench-rv mm-bench-rv \
-	instruction-weight-rv all clean cargo-setup \
+	kernel-la kernel-rv all clean cargo-setup \
+	native-hello-la native-hello-rv native-rust-hello-la native-rust-hello-rv \
+	native-parent-la native-parent-rv native-rust-parent-la native-rust-parent-rv \
+	native-component-la native-component-rv native-repository-la native-repository-rv \
+	native-ring-io-la native-ring-io-rv native-socket-ring-la native-socket-ring-rv \
+	native-device-ring-la native-device-ring-rv \
+	kcsan-la kcsan-rv syscall-bench-rv mm-bench-rv \
+	instruction-weight-rv \
 	_kernel-loongarch64 _kernel-riscv64 _modules-loongarch64 _modules-riscv64 \
 	_busybox-loongarch64 _busybox-riscv64 \
 	_compat-kernel-loongarch64 _compat-kernel-riscv64
@@ -13,6 +19,15 @@ JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 BUILD_DIR := build
 CARGO_TARGET_DIR ?= target
 FEATURES ?=
+NATIVE_EXAMPLES ?=
+
+ifneq ($(filter soyo-tests,$(FEATURES)),)
+ifeq ($(strip $(NATIVE_EXAMPLES)),)
+NATIVE_EXAMPLES := component ring-io socket-ring device-ring
+endif
+endif
+
+NATIVE_EXAMPLE_COMMANDS := $(addprefix /bin/soyo-,$(NATIVE_EXAMPLES))
 TEST_MODE ?= default
 TEST_WORKLOAD ?=
 SYSCALL_BENCH_ITERATIONS ?= 1000000
@@ -56,6 +71,113 @@ $(error KCSAN 调试构建必须使用独立的 kcsan-la/kcsan-rv 目标)
 endif
 endif
 endif
+
+UNKNOWN_NATIVE_EXAMPLES := $(filter-out hello rust-hello parent rust-parent component repository ring-io socket-ring device-ring,$(NATIVE_EXAMPLES))
+ifneq ($(strip $(UNKNOWN_NATIVE_EXAMPLES)),)
+$(error NATIVE_EXAMPLES 包含未知示例: $(UNKNOWN_NATIVE_EXAMPLES))
+endif
+
+ifneq ($(filter component,$(NATIVE_EXAMPLES)),)
+define install_native_component
+	$(MAKE) -C native ARCH=$(1) component
+	install -m 0755 $(BUILD_DIR)/$(1)/native/component-host.soyo $(2)/bin/soyo-component
+endef
+else
+define install_native_component
+endef
+endif
+
+ifneq ($(filter repository,$(NATIVE_EXAMPLES)),)
+define install_native_repository
+	$(MAKE) -C native ARCH=$(1) repository-client
+	install -m 0755 $(BUILD_DIR)/$(1)/native/repository-client.soyo $(2)/bin/soyo-repository
+endef
+else
+define install_native_repository
+endef
+endif
+
+ifneq ($(filter hello,$(NATIVE_EXAMPLES)),)
+define install_native_hello
+	$(MAKE) -C native ARCH=$(1) hello
+	install -m 0755 $(BUILD_DIR)/$(1)/native/hello.soyo $(2)/bin/soyo-hello
+endef
+else
+define install_native_hello
+endef
+endif
+
+ifneq ($(filter rust-hello,$(NATIVE_EXAMPLES)),)
+define install_native_rust_hello
+	$(MAKE) -C native ARCH=$(1) rust-hello
+	install -m 0755 $(BUILD_DIR)/$(1)/native/rust-hello.soyo $(2)/bin/soyo-rust-hello
+endef
+else
+define install_native_rust_hello
+endef
+endif
+
+ifneq ($(filter parent,$(NATIVE_EXAMPLES)),)
+define install_native_parent
+	$(MAKE) -C native ARCH=$(1) native-parent
+	install -m 0755 $(BUILD_DIR)/$(1)/native/parent.soyo $(2)/bin/soyo-parent
+endef
+else
+define install_native_parent
+endef
+endif
+
+ifneq ($(filter rust-parent,$(NATIVE_EXAMPLES)),)
+define install_native_rust_parent
+	$(MAKE) -C native ARCH=$(1) native-rust-parent
+	install -m 0755 $(BUILD_DIR)/$(1)/native/rust-parent.soyo $(2)/bin/soyo-rust-parent
+endef
+else
+define install_native_rust_parent
+endef
+endif
+
+ifneq ($(filter ring-io,$(NATIVE_EXAMPLES)),)
+define install_native_ring_io
+	$(MAKE) -C native ARCH=$(1) ring-io
+	install -m 0755 $(BUILD_DIR)/$(1)/native/ring-io.soyo $(2)/bin/soyo-ring-io
+endef
+else
+define install_native_ring_io
+endef
+endif
+
+ifneq ($(filter socket-ring,$(NATIVE_EXAMPLES)),)
+define install_native_socket_ring
+	$(MAKE) -C native ARCH=$(1) socket-ring
+	install -m 0755 $(BUILD_DIR)/$(1)/native/socket-ring.soyo $(2)/bin/soyo-socket-ring
+endef
+else
+define install_native_socket_ring
+endef
+endif
+
+ifneq ($(filter device-ring,$(NATIVE_EXAMPLES)),)
+define install_native_device_ring
+	$(MAKE) -C native ARCH=$(1) device-ring
+	install -m 0755 $(BUILD_DIR)/$(1)/native/device-ring.soyo $(2)/bin/soyo-device-ring
+endef
+else
+define install_native_device_ring
+endef
+endif
+
+define install_native_examples
+	$(call install_native_hello,$(1),$(2))
+	$(call install_native_rust_hello,$(1),$(2))
+	$(call install_native_parent,$(1),$(2))
+	$(call install_native_rust_parent,$(1),$(2))
+	$(call install_native_component,$(1),$(2))
+	$(call install_native_repository,$(1),$(2))
+	$(call install_native_ring_io,$(1),$(2))
+	$(call install_native_socket_ring,$(1),$(2))
+	$(call install_native_device_ring,$(1),$(2))
+endef
 
 empty :=
 space := $(empty) $(empty)
@@ -370,6 +492,12 @@ define prepare_compat_rootfs
 	$(call build_elm_user_tools,$(1),$(2),$(5))
 	$(call build_smp_user_tests,$(1),$(2),$(5))
 	$(call build_loongarch_sxe_tests,$(1),$(2),$(5))
+	$(call install_native_examples,$(1),$(2))
+	@if [ -n "$(strip $(NATIVE_EXAMPLE_COMMANDS))" ]; then \
+		printf '%s\n' $(NATIVE_EXAMPLE_COMMANDS) >$(2)/etc/mygo-native-examples; \
+	else \
+		rm -f $(2)/etc/mygo-native-examples; \
+	fi
 	$(call build_syscall_benchmark,$(1),$(2),$(5))
 	$(call build_mm_benchmark,$(1),$(2),$(5))
 	$(call build_riscv_instruction_weight_probe,$(1),$(2),$(5))
@@ -439,6 +567,60 @@ _compat-kernel-riscv64:
 	$(call build_kernel,$(RV_ARCH),$(RV_TARGET),$(RV_CROSS_COMPILE),1)
 
 all: kernel-la kernel-rv
+
+native-hello-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) hello
+
+native-hello-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) hello
+
+native-rust-hello-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) rust-hello
+
+native-rust-hello-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) rust-hello
+
+native-parent-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) native-parent
+
+native-parent-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) native-parent
+
+native-rust-parent-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) native-rust-parent
+
+native-rust-parent-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) native-rust-parent
+
+native-component-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) component
+
+native-component-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) component
+
+native-repository-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) repository-client
+
+native-repository-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) repository-client
+
+native-ring-io-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) ring-io
+
+native-ring-io-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) ring-io
+
+native-socket-ring-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) socket-ring
+
+native-socket-ring-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) socket-ring
+
+native-device-ring-la:
+	$(MAKE) -C native ARCH=$(LA_ARCH) device-ring
+
+native-device-ring-rv:
+	$(MAKE) -C native ARCH=$(RV_ARCH) device-ring
 
 clean:
 	cargo clean

@@ -1,0 +1,9 @@
+#ifndef MYGO_REPOSITORY_CLIENT_IMAGES_H
+#define MYGO_REPOSITORY_CLIENT_IMAGES_H
+
+extern const unsigned char mygo_repository_image_start[];
+extern const unsigned char mygo_repository_image_end[];
+extern const unsigned char mygo_component_image_start[];
+extern const unsigned char mygo_component_image_end[];
+
+#endif

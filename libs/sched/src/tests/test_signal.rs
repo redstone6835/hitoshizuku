@@ -7,11 +7,32 @@
 extern crate std;
 
 use crate::ids::Uid;
+use crate::operation::take_next_pending_signal;
 use crate::signal::{
     SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
     SignalNumber, SignalState,
 };
 use ktest::ktest;
+
+#[ktest]
+fn sparse_pending_bits_only_yield_set_signals() {
+    let mut pending =
+        SignalNumber::SIGUSR2.bit() | SignalNumber::SIGKILL.bit() | SignalNumber::SIGTERM.bit();
+
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGKILL)
+    );
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGUSR2)
+    );
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGTERM)
+    );
+    assert_eq!(take_next_pending_signal(&mut pending), None);
+}
 
 /// 空集不包含任何信号。
 #[ktest]
@@ -149,6 +170,35 @@ fn sigsuspend_explicit_restore_clears_saved_mask() {
     assert_eq!(state.take_sigsuspend_saved_blocked(), None);
 }
 
+/// Native exec 丢弃 Tomori 的线程级屏蔽/等待状态，但保留已经 pending 的信号。
+#[ktest]
+fn native_exec_reset_clears_masks_and_keeps_pending() {
+    let state = SignalState::new();
+    let pending = SignalNumber::SIGUSR1;
+    state.block(SigSet::EMPTY.with(pending), SigProcMaskHow::SetMask);
+    state.save_blocked(SigSet::EMPTY.with(SignalNumber::SIGUSR2));
+    state.begin_sigtimedwait(SigSet::EMPTY.with(SignalNumber::SIGTERM));
+    state.deliver(SigInfo {
+        sig: pending,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    state.reset_for_native_exec();
+
+    assert_eq!(state.blocked_snapshot(), SigSet::EMPTY);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
+    assert!(!state.sigtimedwait_wants(SignalNumber::SIGTERM));
+    assert!(state.pending_snapshot().has(pending));
+
+    // saved_blocked 也必须归零，遗留的清理调用不能恢复旧 Tomori mask。
+    state.restore_blocked();
+    assert_eq!(state.blocked_snapshot(), SigSet::EMPTY);
+    assert_eq!(state.dequeue_one().map(|info| info.sig), Some(pending));
+}
+
 /// 信号编号 1..=64 为合法，构造成功。
 #[ktest]
 fn signal_number_from_raw_valid() {
@@ -242,4 +292,75 @@ fn clone_sighand_shares_actions_without_sharing_pending() {
     });
     assert!(parent.pending_snapshot().has(SignalNumber::SIGUSR2));
     assert!(!child.pending_snapshot().has(SignalNumber::SIGUSR2));
+}
+
+/// exec 必须脱离 CLONE_SIGHAND 共享表，同时保留当前线程组的 pending 队列。
+#[ktest]
+fn prepared_exec_actions_detach_shared_sighand_without_moving_pending() {
+    let process = SharedSignal::new();
+    let sharing_process = process.clone_sighand();
+    process.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            ..SigAction::default_new()
+        },
+    );
+    process.set_action(
+        SignalNumber::SIGUSR2,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+    process.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+
+    let prepared = process.prepare_actions_for_exec();
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234),
+        "prepare 不得提前改变旧 disposition"
+    );
+    process.install_actions_for_exec(&prepared);
+
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Default
+    );
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+    assert_eq!(
+        sharing_process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234),
+        "exec 不得重置另一个 CLONE_SIGHAND 线程组"
+    );
+    assert!(process.pending_snapshot().has(SignalNumber::SIGTERM));
+}
+
+/// exec prepare 后的 sigaction 修改必须使安装失败，不能覆盖新动作。
+#[ktest]
+fn prepared_exec_actions_reject_stale_disposition_generation() {
+    let process = SharedSignal::new();
+    let prepared = process.prepare_actions_for_exec();
+    process.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+
+    assert!(!process.install_actions_for_exec(&prepared));
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Ignore
+    );
 }

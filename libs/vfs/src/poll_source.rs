@@ -82,12 +82,18 @@ impl PollSource {
     }
 
     pub fn subscribe(&self, subscriber: Weak<dyn PollSubscriber>) -> u64 {
+        self.try_subscribe(subscriber)
+            .expect("PollSource subscription 分配失败")
+    }
+
+    /// 供可向用户态报告资源不足的调用路径使用。
+    pub fn try_subscribe(&self, subscriber: Weak<dyn PollSubscriber>) -> Result<u64, ()> {
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         assert!(id != 0, "PollSource subscription id 已耗尽");
-        self.subscriptions
-            .lock()
-            .push(Subscription { id, subscriber });
-        id
+        let mut subscriptions = self.subscriptions.lock();
+        subscriptions.try_reserve(1).map_err(|_| ())?;
+        subscriptions.push(Subscription { id, subscriber });
+        Ok(id)
     }
 
     pub fn unsubscribe(&self, id: u64) {

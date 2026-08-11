@@ -13,6 +13,10 @@
 #endif
 
 enum {
+    SYS_READ = 63,
+    SYS_WRITE = 64,
+    SYS_OPENAT = 56,
+    SYS_CLOSE = 57,
     SYS_FUTEX = 98,
     SYS_CLOCK_GETTIME = 113,
     SYS_SCHED_YIELD = 124,
@@ -23,6 +27,10 @@ enum {
     SYS_GETTID = 178,
     CLOCK_MONOTONIC_RAW_ID = 4,
     FUTEX_WAKE_PRIVATE = 129,
+    AT_FDCWD = -100,
+    O_RDONLY = 0,
+    O_WRONLY = 1,
+    RW_BUFFER_SIZE = 4096,
 };
 
 struct timeval64 {
@@ -37,6 +45,12 @@ struct bench_case {
     long syscall_nr;
     bench_op_t op;
     void *context;
+};
+
+struct rw_context {
+    long fd;
+    unsigned char *buffer;
+    size_t length;
 };
 
 struct result {
@@ -93,6 +107,17 @@ static inline long raw_syscall3(long nr, long arg0, long arg1, long arg2)
     return a0;
 }
 
+static inline long raw_syscall4(long nr, long arg0, long arg1, long arg2, long arg3)
+{
+    register long a0 __asm__("a0") = arg0;
+    register long a1 __asm__("a1") = arg1;
+    register long a2 __asm__("a2") = arg2;
+    register long a3 __asm__("a3") = arg3;
+    register long a7 __asm__("a7") = nr;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
+    return a0;
+}
+
 static uint64_t timespec_ns(const struct timespec *value)
 {
     return (uint64_t)value->tv_sec * UINT64_C(1000000000) + (uint64_t)value->tv_nsec;
@@ -129,6 +154,66 @@ static long op_gettimeofday(void *context)
 static long op_futex_wake(void *context)
 {
     return raw_syscall3(SYS_FUTEX, (long)context, FUTEX_WAKE_PRIVATE, 1);
+}
+
+static long op_read(void *context)
+{
+    const struct rw_context *rw = context;
+    return raw_syscall3(SYS_READ, rw->fd, (long)rw->buffer, (long)rw->length);
+}
+
+static long op_write(void *context)
+{
+    const struct rw_context *rw = context;
+    return raw_syscall3(SYS_WRITE, rw->fd, (long)rw->buffer, (long)rw->length);
+}
+
+static unsigned char read_buffer[RW_BUFFER_SIZE] __attribute__((aligned(16)));
+static unsigned char write_buffer[RW_BUFFER_SIZE] __attribute__((aligned(16)));
+static struct rw_context read_context = {
+    .fd = -1,
+    .buffer = read_buffer,
+    .length = sizeof(read_buffer),
+};
+static struct rw_context write_context = {
+    .fd = -1,
+    .buffer = write_buffer,
+    .length = sizeof(write_buffer),
+};
+
+static int prepare_case(const struct bench_case *bench)
+{
+    struct rw_context *rw;
+    const char *path;
+    long flags;
+
+    if (strcmp(bench->name, "read") == 0) {
+        rw = bench->context;
+        path = "/dev/zero";
+        flags = O_RDONLY;
+    } else if (strcmp(bench->name, "write") == 0) {
+        rw = bench->context;
+        path = "/dev/null";
+        flags = O_WRONLY;
+        for (size_t index = 0; index < rw->length; ++index) {
+            rw->buffer[index] = (unsigned char)(index * 17U + 3U);
+        }
+    } else {
+        return 0;
+    }
+    rw->fd = raw_syscall4(SYS_OPENAT, AT_FDCWD, (long)path, flags, 0);
+    return rw->fd < 0 ? -1 : 0;
+}
+
+static void cleanup_case(const struct bench_case *bench)
+{
+    if (strcmp(bench->name, "read") == 0 || strcmp(bench->name, "write") == 0) {
+        struct rw_context *rw = bench->context;
+        if (rw->fd >= 0) {
+            (void)raw_syscall1(SYS_CLOSE, rw->fd);
+            rw->fd = -1;
+        }
+    }
 }
 
 static int timespec_is_valid(const struct timespec *value)
@@ -174,6 +259,10 @@ static int validate_case(const struct bench_case *bench)
 
     first = bench->op(bench->context);
     second = bench->op(bench->context);
+    if (strcmp(bench->name, "read") == 0 || strcmp(bench->name, "write") == 0) {
+        const struct rw_context *rw = bench->context;
+        return first == (long)rw->length && second == (long)rw->length ? 0 : -1;
+    }
     if (strcmp(bench->name, "getpid") == 0 || strcmp(bench->name, "getppid") == 0
         || strcmp(bench->name, "gettid") == 0) {
         return first > 0 && second == first ? 0 : -1;
@@ -297,6 +386,8 @@ int main(int argc, char **argv)
         {"gettimeofday", SYS_GETTIMEOFDAY, op_gettimeofday, &time_value},
         {"futex_wake", SYS_FUTEX, op_futex_wake, &futex_word},
         {"sched_yield", SYS_SCHED_YIELD, op_syscall0, (void *)(uintptr_t)SYS_SCHED_YIELD},
+        {"read", SYS_READ, op_read, &read_context},
+        {"write", SYS_WRITE, op_write, &write_context},
     };
 
     if (argc > 1 && parse_count(argv[1], 1, UINT64_C(1000000000), &iterations) != 0) {
@@ -337,9 +428,15 @@ int main(int argc, char **argv)
             continue;
         }
         ++selected_cases;
+        if (prepare_case(bench) != 0) {
+            fprintf(stderr, "SYSCALL_ERROR case=%s phase=prepare\n", bench->name);
+            ++failures;
+            continue;
+        }
         if (validate_case(bench) != 0) {
             fprintf(stderr, "SYSCALL_ERROR case=%s phase=validate\n", bench->name);
             ++failures;
+            cleanup_case(bench);
             continue;
         }
         uint64_t warmup_errors = 0;
@@ -350,6 +447,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "SYSCALL_ERROR case=%s phase=warmup errors=%" PRIu64 "\n",
                     bench->name, warmup_errors + empty_warmup_errors);
             ++failures;
+            cleanup_case(bench);
             continue;
         }
 
@@ -377,6 +475,7 @@ int main(int argc, char **argv)
             }
         }
         if (completed != repeats) {
+            cleanup_case(bench);
             continue;
         }
         qsort(medians, completed, sizeof(medians[0]), compare_u64);
@@ -386,6 +485,7 @@ int main(int argc, char **argv)
                bench->name, bench->syscall_nr, iterations, repeats, median);
         print_ns_per_call(median, iterations);
         putchar('\n');
+        cleanup_case(bench);
     }
 
     if (selected_cases == 0) {

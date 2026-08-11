@@ -5,15 +5,19 @@ extern crate std;
 
 use alloc::sync::{Arc, Weak};
 use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 
+use errno::Errno;
 use ktest::ktest;
 
 use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS, ProcessGroup,
-    RobustListState, RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy,
-    Session, SigInfo, SigProcMaskHow, SigSet, SignalNumber, TASK_COMM_LEN, TASKEXT_VM_SPACE, Task,
-    TaskState, TaskUsage, ThreadGroup, Uid, supported_cpu_mask,
+    ArchContextOps, CpuMask, ExecPhase, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS,
+    NativeExternalControl, PidNamespace, ProcessGroup, ProcessPersonalityState, RobustListState,
+    RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy, Session,
+    SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
+    TASK_COMM_LEN, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage, ThreadGroup,
+    Uid, UserAbiKind, UserContextRef, WaitId, supported_cpu_mask,
 };
 
 const TEST_EXECUTION_ACTION: u64 = 1;
@@ -33,6 +37,79 @@ fn vm_space_extension_can_be_borrowed_without_arc_clone() {
     );
     assert!(task.ext_remove(TASKEXT_VM_SPACE).is_some());
     assert!(task.ext_with(TASKEXT_VM_SPACE, |_| ()).is_none());
+}
+
+#[ktest]
+fn existing_extension_can_be_replaced_without_changing_its_slot() {
+    const COLD_KEY: u64 = 0x7fff_0001;
+    let task = make_task();
+    task.ext_install(TASKEXT_VM_SPACE, Arc::new(10usize));
+    task.ext_install(COLD_KEY, Arc::new(20usize));
+
+    let old_hot = task
+        .ext_replace(TASKEXT_VM_SPACE, Arc::new(11usize))
+        .expect("hot 扩展槽应已存在");
+    let old_cold = task
+        .ext_replace(COLD_KEY, Arc::new(21usize))
+        .expect("cold 扩展槽应已存在");
+
+    assert_eq!(old_hot.downcast_ref::<usize>(), Some(&10));
+    assert_eq!(old_cold.downcast_ref::<usize>(), Some(&20));
+    assert_eq!(
+        task.ext_with(TASKEXT_VM_SPACE, |value| value
+            .downcast_ref::<usize>()
+            .copied()),
+        Some(Some(11))
+    );
+    assert_eq!(
+        task.ext_with(COLD_KEY, |value| value.downcast_ref::<usize>().copied()),
+        Some(Some(21))
+    );
+}
+
+#[ktest]
+fn replacing_missing_extension_returns_payload_without_installing_it() {
+    const MISSING_KEY: u64 = 0x7fff_0002;
+    let task = make_task();
+    let replacement: Arc<dyn core::any::Any + Send + Sync> = Arc::new(30usize);
+
+    let returned = match task.ext_replace(MISSING_KEY, replacement) {
+        Ok(_) => panic!("缺失扩展槽不得在 replace 中隐式分配"),
+        Err(payload) => payload,
+    };
+
+    assert_eq!(returned.downcast_ref::<usize>(), Some(&30));
+    assert!(task.ext_lookup(MISSING_KEY).is_none());
+}
+
+#[ktest]
+fn extension_identity_check_rejects_replaced_payload() {
+    const KEY: u64 = 0x7fff_0003;
+    let task = make_task();
+    let observed: Arc<dyn core::any::Any + Send + Sync> = Arc::new(40usize);
+    task.ext_install(KEY, Arc::clone(&observed));
+
+    assert!(task.ext_is_current(KEY, &observed));
+    task.ext_replace(KEY, Arc::new(41usize))
+        .expect("待重验扩展槽应已存在");
+    assert!(!task.ext_is_current(KEY, &observed));
+}
+
+#[ktest]
+fn taking_robust_list_clears_registration_before_cleanup() {
+    let task = make_task();
+    task.set_robust_list(0x1234, 24);
+
+    let taken = task.take_robust_list();
+
+    assert_eq!(
+        taken,
+        RobustListState {
+            head: 0x1234,
+            len: 24
+        }
+    );
+    assert_eq!(task.robust_list(), RobustListState::default());
 }
 
 #[ktest]
@@ -123,6 +200,523 @@ fn make_task_in_group(group: Arc<ThreadGroup>) -> Arc<Task> {
     let task = Task::new(SchedParams::default_fair(), Weak::new(), group, pg);
     task.adopt_current_context();
     task
+}
+
+#[ktest]
+fn new_thread_group_is_tomori_without_native_payload() {
+    let group = ThreadGroup::new();
+
+    assert_eq!(group.user_abi_kind(), UserAbiKind::TomoriLinux);
+    assert_eq!(group.exec_phase(), ExecPhase::Running);
+    assert_eq!(group.exec_generation(), 0);
+    assert!(group.native_personality_payload().is_none());
+}
+
+#[ktest]
+fn pidfd_wait_target_keeps_thread_group_identity_after_leader_replacement() {
+    let group = ThreadGroup::new();
+    let old_leader = make_task_in_group(Arc::clone(&group));
+    let executor = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&old_leader);
+    let target = WaitId::Pidfd(Arc::clone(&group));
+
+    group.set_leader(&executor);
+
+    assert_eq!(target, WaitId::Pidfd(executor.thread_group()));
+}
+
+#[ktest]
+fn native_children_are_owned_by_the_thread_group_not_the_spawning_task() {
+    let owner = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&owner));
+    let worker = make_task_in_group(Arc::clone(&owner));
+    owner.set_leader(&leader);
+    owner.add_member(&leader);
+    owner.add_member(&worker);
+
+    let child = make_task();
+    let child_group = child.thread_group();
+    child_group.set_leader(&child);
+    child_group.add_member(&child);
+    child.set_state(TaskState::Zombie);
+    assert!(child_group.mark_terminated_if_all_members_terminal());
+
+    assert!(
+        owner
+            .try_add_native_child(Arc::clone(&child))
+            .expect("Native child 登记不应因资源不足失败")
+    );
+    assert!(leader.snapshot_children().is_empty());
+    assert!(worker.snapshot_children().is_empty());
+
+    // leader 可以先退出；只要线程组尚未整体终止，Native child 仍属于 owner。
+    leader.set_state(TaskState::Dead);
+    assert!(!owner.is_terminated());
+    assert!(
+        owner
+            .snapshot_native_children()
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &child))
+    );
+
+    let reaped = owner
+        .reap_native_child(|candidate| Arc::ptr_eq(candidate, &child))
+        .expect("owner 线程组应能回收 Native child");
+    assert!(Arc::ptr_eq(&reaped, &child));
+}
+
+#[ktest]
+fn running_leader_inspection_serializes_with_identity_replacement() {
+    let group = ThreadGroup::new();
+    let old_leader = make_task_in_group(Arc::clone(&group));
+    let executor = make_task_in_group(Arc::clone(&group));
+    old_leader.ext_install(TASKEXT_VFS_FDTABLE, Arc::new(0x5a_u8));
+    group.set_leader(&old_leader);
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let inspected_group = Arc::clone(&group);
+    let inspector = std::thread::spawn(move || {
+        inspected_group.with_running_leader(|leader| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            leader.ext_lookup(TASKEXT_VFS_FDTABLE)
+        })
+    });
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("资源读取应进入稳定 leader 临界区");
+
+    let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
+    let replacement_group = Arc::clone(&group);
+    let replacement = Arc::clone(&executor);
+    let replacer = std::thread::spawn(move || {
+        replacement_group.set_leader(&replacement);
+        replaced_tx.send(()).unwrap();
+    });
+    assert!(
+        replaced_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "leader 身份替换不得穿过受保护的资源读取"
+    );
+
+    release_tx.send(()).unwrap();
+    let payload = inspector
+        .join()
+        .unwrap()
+        .expect("Running 线程组应存在 leader")
+        .expect("旧 leader 的 fdtable 扩展应可读取");
+    assert_eq!(payload.downcast_ref::<u8>(), Some(&0x5a));
+    replaced_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("资源读取结束后身份替换应继续");
+    replacer.join().unwrap();
+    assert!(
+        group
+            .leader()
+            .is_some_and(|leader| Arc::ptr_eq(&leader, &executor))
+    );
+}
+
+#[ktest]
+fn personality_publication_updates_existing_and_late_thread_caches() {
+    let group = ThreadGroup::new();
+    let first = make_task_in_group(Arc::clone(&group));
+    let second = make_task_in_group(Arc::clone(&group));
+    group.add_member(&first);
+    group.add_member(&second);
+    assert_eq!(first.user_abi_kind(), UserAbiKind::TomoriLinux);
+    assert_eq!(second.user_abi_kind(), UserAbiKind::TomoriLinux);
+
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(0x5a5a_u32);
+    {
+        let mut exec = group.lock_exec();
+        exec.set_phase(ExecPhase::Transitioning);
+        exec.install_personality(ProcessPersonalityState::MygoNative(Arc::clone(&payload)));
+        assert_eq!(exec.advance_generation(), 1);
+        exec.set_phase(ExecPhase::Running);
+    }
+
+    assert_eq!(first.user_abi_kind(), UserAbiKind::MygoNative);
+    assert_eq!(second.user_abi_kind(), UserAbiKind::MygoNative);
+    assert_eq!(group.exec_generation(), 1);
+    let installed = group
+        .native_personality_payload()
+        .expect("Native personality 应持有进程级 payload");
+    assert!(Arc::ptr_eq(&installed, &payload));
+
+    let late = make_task_in_group(Arc::clone(&group));
+    group.add_member(&late);
+    assert_eq!(late.user_abi_kind(), UserAbiKind::MygoNative);
+}
+
+#[ktest]
+fn native_external_control_consumes_ignored_signal_without_user_frame() {
+    let task = make_native_control_task();
+    task.shared_signal().set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Ignore,
+            mask: SigSet::EMPTY,
+            flags: SigActionFlags(0),
+            restorer: 0,
+        },
+    );
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Continue
+    );
+    assert!(!task.signal.has_any_pending());
+    assert_eq!(task.state(), TaskState::Running);
+}
+
+#[ktest]
+fn native_external_control_applies_default_terminate_at_safe_boundary() {
+    let task = make_native_control_task();
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Terminate
+    );
+    assert_eq!(task.state(), TaskState::Zombie);
+}
+
+#[ktest]
+fn generic_signal_delivery_cannot_build_a_linux_frame_for_native() {
+    let task = make_native_control_task();
+    task.shared_signal().set_action(
+        SignalNumber::SIGTERM,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            mask: SigSet::EMPTY,
+            flags: SigActionFlags(0),
+            restorer: 0,
+        },
+    );
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert!(
+        crate::operation::deliver_pending_signals_for_task(&task, UserContextRef::new(0x4000),)
+            .is_none()
+    );
+    assert_eq!(task.state(), TaskState::Zombie);
+}
+
+#[ktest]
+fn native_external_control_reports_stop_and_continue_as_reschedule() {
+    let task = make_native_control_task();
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGSTOP,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Reschedule
+    );
+    assert_eq!(task.state(), TaskState::Stopped);
+
+    let continued = SigInfo {
+        sig: SignalNumber::SIGCONT,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    };
+    task.shared_signal().deliver(continued);
+    crate::signal_wakeup(&task, &continued);
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Continue
+    );
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(task.shared_signal().pending_len_hint(), 0);
+}
+
+#[ktest]
+fn native_external_control_completes_published_group_exit() {
+    let task = make_native_control_task();
+    assert_eq!(task.thread_group().request_group_exit(73), 73);
+    task.publish_group_exit_wakeup();
+
+    assert_eq!(
+        crate::operation::consume_native_external_control_for_task(&task),
+        NativeExternalControl::Terminate
+    );
+    assert_eq!(task.state(), TaskState::Zombie);
+}
+
+fn make_native_control_task() -> Arc<Task> {
+    let task = make_task();
+    let group = task.thread_group();
+    group.set_leader(&task);
+    group.add_member(&task);
+    task.set_state(TaskState::Running);
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    let mut exec = group.lock_exec();
+    exec.set_phase(ExecPhase::Transitioning);
+    exec.install_personality(ProcessPersonalityState::MygoNative(payload));
+    exec.set_phase(ExecPhase::Running);
+    drop(exec);
+    task
+}
+
+#[ktest]
+fn session_leader_follows_thread_group_identity_after_exec_adoption() {
+    let session = Session::new();
+    let process_group = ProcessGroup::new(&session);
+    session.register_group(&process_group);
+    let group = ThreadGroup::new();
+    let old_leader = make_task_in_group(Arc::clone(&group));
+    let executor = make_task_in_group(Arc::clone(&group));
+
+    group.set_leader(&old_leader);
+    session.set_leader(&old_leader);
+    group.add_member(&old_leader);
+    group.add_member(&executor);
+
+    group.set_leader(&executor);
+
+    assert!(
+        session
+            .leader()
+            .is_some_and(|leader| Arc::ptr_eq(&leader, &executor))
+    );
+}
+
+#[ktest]
+fn child_registration_waits_for_process_identity_transaction() {
+    let parent = make_task();
+    let child = make_task();
+    let identity = crate::pid::lock_process_identity();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+    let parent_for_thread = Arc::clone(&parent);
+    let child_for_thread = Arc::clone(&child);
+    let registration = std::thread::spawn(move || {
+        parent_for_thread.add_child(child_for_thread);
+        registered_tx.send(()).unwrap();
+    });
+
+    assert!(
+        registered_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "父侧 child 登记不得绕过进程身份事务"
+    );
+    drop(identity);
+    registered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("身份事务结束后 child 登记应继续");
+    registration.join().unwrap();
+    assert!(parent.has_child(&child));
+}
+
+#[ktest]
+fn pid_registry_exposes_fallible_task_snapshot_for_pre_ponr_work() {
+    let namespace = PidNamespace::new_root();
+    let task = make_task();
+    let pid = namespace.registry().allocate(&task).expect("测试任务 pid");
+    task.register_pid(Arc::clone(&namespace), pid);
+
+    let snapshot = namespace
+        .registry()
+        .try_snapshot_tasks()
+        .expect("任务快照应传播可失败分配结果");
+
+    assert!(
+        snapshot
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &task))
+    );
+}
+
+#[ktest]
+fn transitioning_keeps_signal_producers_live_and_pauses_consumers() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.add_member(&task);
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    group.lock_exec().set_phase(ExecPhase::Transitioning);
+
+    task.shared_signal().deliver(SigInfo {
+        sig: SignalNumber::SIGUSR2,
+        code: 0,
+        sender_pid: 2,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    assert!(
+        task.dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit()
+        ))
+        .is_none(),
+        "Transitioning 期间 consumer 不得出队"
+    );
+    assert!(task.signal.has_pending_in(SignalNumber::SIGUSR1.bit()));
+    assert!(
+        task.shared_signal()
+            .has_pending_in(SignalNumber::SIGUSR2.bit())
+    );
+
+    group.lock_exec().set_phase(ExecPhase::Running);
+    let first = task
+        .dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit(),
+        ))
+        .expect("恢复 Running 后应消费 per-task pending");
+    let second = task
+        .dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit(),
+        ))
+        .expect("恢复 Running 后应消费 shared pending");
+    assert_eq!(first.sig, SignalNumber::SIGUSR1);
+    assert_eq!(second.sig, SignalNumber::SIGUSR2);
+    assert!(
+        task.dequeue_pending_signal_in(SigSet::from_raw(
+            SignalNumber::SIGUSR1.bit() | SignalNumber::SIGUSR2.bit()
+        ))
+        .is_none(),
+        "两条 pending 各消费一次后队列应为空"
+    );
+}
+
+#[ktest]
+fn transitioning_publication_waits_for_active_signal_consumer() {
+    let group = ThreadGroup::new();
+    let consumer = group
+        .lock_signal_consumer()
+        .expect("Running 阶段应允许 consumer 进入");
+    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let publisher_group = Arc::clone(&group);
+    let publisher = std::thread::spawn(move || {
+        attempting_tx.send(()).expect("应通知发布线程已启动");
+        publisher_group
+            .lock_exec()
+            .set_phase(ExecPhase::Transitioning);
+        published_tx.send(()).expect("应通知 Transitioning 已发布");
+    });
+
+    attempting_rx.recv().expect("发布线程应启动");
+    assert!(
+        published_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "活动 consumer 退出前不得发布 Transitioning"
+    );
+    drop(consumer);
+    published_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("consumer 退出后应完成发布");
+    publisher.join().expect("发布线程不得 panic");
+    assert_eq!(group.exec_phase(), ExecPhase::Transitioning);
+}
+
+#[ktest]
+fn transitioning_waits_for_complete_signal_consumption() {
+    let group = ThreadGroup::new();
+    let task = make_task_in_group(Arc::clone(&group));
+    group.add_member(&task);
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let consumer_task = Arc::clone(&task);
+    let consumer = std::thread::spawn(move || {
+        consumer_task
+            .consume_pending_signal(|info| {
+                assert_eq!(info.sig, SignalNumber::SIGUSR1);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .expect("Running 阶段应消费 pending signal");
+    });
+    entered_rx.recv().expect("consumer 应进入完整消费区间");
+
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let publisher_group = Arc::clone(&group);
+    let publisher = std::thread::spawn(move || {
+        publisher_group
+            .lock_exec()
+            .set_phase(ExecPhase::Transitioning);
+        published_tx.send(()).unwrap();
+    });
+    assert!(
+        published_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "signal action 完成前不得发布 Transitioning"
+    );
+    release_tx.send(()).unwrap();
+    published_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("完整消费结束后应完成 Transitioning 发布");
+    consumer.join().unwrap();
+    publisher.join().unwrap();
+}
+
+#[ktest]
+fn clone_guard_rejects_transitioning_and_serializes_publication() {
+    let group = ThreadGroup::new();
+    group.lock_exec().set_phase(ExecPhase::Transitioning);
+    assert!(group.lock_for_clone().is_none());
+    group.lock_exec().set_phase(ExecPhase::Running);
+
+    let clone_guard = group.lock_for_clone().expect("Running 阶段应允许 clone");
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let publisher_group = Arc::clone(&group);
+    let publisher = std::thread::spawn(move || {
+        publisher_group
+            .lock_exec()
+            .set_phase(ExecPhase::Transitioning);
+        published_tx.send(()).unwrap();
+    });
+    assert!(
+        published_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "clone 登记完成前 exec 不得发布 Transitioning"
+    );
+    drop(clone_guard);
+    published_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("clone guard 释放后 exec 应继续");
+    publisher.join().unwrap();
 }
 
 #[ktest]
@@ -260,6 +854,27 @@ fn thread_group_leader_becomes_waitable_only_after_last_member() {
 
     let late = make_task_in_group(Arc::clone(&group));
     assert!(!group.try_add_member(&late));
+}
+
+#[ktest]
+fn process_exit_waiters_are_woken_by_group_termination() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+
+    leader.set_state(TaskState::Zombie);
+    worker.set_state(TaskState::Dead);
+    let waiter = make_task();
+    let entry = group
+        .process_exit_waiters()
+        .prepare_to_wait(&waiter, TaskState::Sleeping);
+
+    assert!(group.mark_terminated_if_all_members_terminal());
+    assert_eq!(waiter.state(), TaskState::Runnable);
+    group.process_exit_waiters().finish_wait(&entry);
 }
 
 #[ktest]
@@ -492,6 +1107,434 @@ fn fatal_group_resume_does_not_publish_continued_event() {
 }
 
 #[ktest]
+fn exec_sibling_exit_is_distinct_from_group_exit_and_blocks_sleep() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    leader.set_state(TaskState::Running);
+    worker.set_state(TaskState::Running);
+    worker.set_exit_signal(0);
+
+    crate::operation::request_exec_sibling_exit(&worker, false);
+
+    assert!(worker.exec_sibling_exit_boundary_pending());
+    assert!(group.group_exit_status().is_none());
+    assert!(!worker.cas_state(TaskState::Running, TaskState::Sleeping));
+    assert!(crate::operation::complete_exec_sibling_exit_if_requested(
+        &worker
+    ));
+    assert_eq!(worker.state(), TaskState::Dead);
+    assert!(group.has_only_member(&leader));
+}
+
+#[ktest]
+fn exec_sibling_exit_interrupts_blocking_syscall() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    worker.set_state(TaskState::Running);
+
+    assert!(!crate::operation::has_interrupting_signal(&worker));
+    crate::operation::request_exec_sibling_exit(&worker, false);
+
+    assert!(crate::operation::has_interrupting_signal(&worker));
+}
+
+#[ktest]
+fn exec_sibling_exit_keeps_user_return_work_armed() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+
+    crate::operation::request_exec_sibling_exit(&worker, false);
+
+    assert!(worker.user_return_work_hint_acquire());
+    assert!(worker.signal.take_user_return_work());
+    assert!(worker.refresh_user_return_work_hint());
+    assert!(worker.user_return_work_hint_acquire());
+}
+
+#[ktest]
+fn exec_preserved_zombie_leader_waits_for_identity_adoption() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let executor = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&executor);
+    leader.set_state(TaskState::Zombie);
+    leader.cleanup_exit_extensions();
+
+    crate::operation::request_exec_sibling_exit(&leader, true);
+
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(crate::operation::complete_exec_sibling_exit_if_requested(
+        &leader
+    ));
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(leader.exec_sibling_exit_boundary_pending());
+    assert!(
+        group
+            .snapshot()
+            .iter()
+            .any(|member| Arc::ptr_eq(member, &leader))
+    );
+}
+
+#[ktest]
+fn process_identity_transaction_serializes_reparent_without_blocking_pid_lookup() {
+    let parent = make_task();
+    let new_parent = make_task();
+    let child = make_task();
+    parent.add_child(Arc::clone(&child));
+    child.reparent_to(&parent);
+
+    let namespace = PidNamespace::new_root();
+    let pid = namespace.registry().allocate(&child).expect("child pid");
+    child.register_pid(Arc::clone(&namespace), pid);
+
+    let identity = crate::pid::lock_process_identity();
+    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel();
+    let lookup_namespace = Arc::clone(&namespace);
+    let lookup = std::thread::spawn(move || {
+        let owner = lookup_namespace
+            .registry()
+            .lookup(pid)
+            .and_then(|owner| owner.upgrade());
+        lookup_tx.send(owner).unwrap();
+    });
+    let (reparent_tx, reparent_rx) = std::sync::mpsc::channel();
+    let exiting_parent = Arc::clone(&parent);
+    let reaper = Arc::clone(&new_parent);
+    let reparent = std::thread::spawn(move || {
+        exiting_parent.reparent_children_to(&reaper);
+        reparent_tx.send(()).unwrap();
+    });
+
+    let owner = lookup_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("PID 查询应由注册表自身锁完成");
+    assert!(owner.is_some_and(|owner| Arc::ptr_eq(&owner, &child)));
+    assert!(
+        reparent_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "身份事务提交前父退出不得改写亲缘关系"
+    );
+
+    drop(identity);
+    reparent_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("事务结束后 reparent 应继续");
+    lookup.join().unwrap();
+    reparent.join().unwrap();
+    assert!(
+        child
+            .parent()
+            .is_some_and(|task| Arc::ptr_eq(&task, &new_parent))
+    );
+}
+
+#[ktest]
+fn readonly_task_pid_query_does_not_wait_for_identity_transaction() {
+    let namespace = PidNamespace::new_root();
+    let task = make_task();
+    let pid = namespace
+        .registry()
+        .allocate(&task)
+        .expect("应分配测试 PID");
+    task.register_pid(Arc::clone(&namespace), pid);
+    let identity = crate::pid::lock_process_identity();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let queried = Arc::clone(&task);
+    let query = std::thread::spawn(move || {
+        result_tx.send(queried.pid_root()).unwrap();
+    });
+
+    let result = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(identity);
+    query.join().unwrap();
+
+    assert_eq!(result, Ok(Some(pid)), "只读 PID 查询不应进入全局身份事务");
+}
+
+#[ktest]
+fn readonly_pid_registry_queries_do_not_wait_for_identity_transaction() {
+    let namespace = PidNamespace::new_root();
+    let task = make_task();
+    let pid = namespace
+        .registry()
+        .allocate(&task)
+        .expect("应分配测试 PID");
+    task.register_pid(Arc::clone(&namespace), pid);
+    let identity = crate::pid::lock_process_identity();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let queried_namespace = Arc::clone(&namespace);
+    let query = std::thread::spawn(move || {
+        let owner = queried_namespace
+            .registry()
+            .lookup(pid)
+            .and_then(|owner| owner.upgrade());
+        let snapshot_contains_owner = queried_namespace
+            .registry()
+            .try_snapshot_tasks()
+            .unwrap()
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &task));
+        result_tx
+            .send((
+                owner.is_some_and(|owner| Arc::ptr_eq(&owner, &task)),
+                snapshot_contains_owner,
+            ))
+            .unwrap();
+    });
+
+    let result = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(identity);
+    query.join().unwrap();
+
+    assert_eq!(
+        result,
+        Ok((true, true)),
+        "PID 注册表只读查询不应进入全局身份事务"
+    );
+}
+
+#[ktest]
+fn unrelated_pid_registry_mutation_does_not_wait_for_identity_transaction() {
+    let namespace = PidNamespace::new_root();
+    let task = make_task();
+    let identity = crate::pid::lock_process_identity();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let mutated_namespace = Arc::clone(&namespace);
+    let mutation = std::thread::spawn(move || {
+        let pid = mutated_namespace
+            .registry()
+            .allocate(&task)
+            .expect("应分配测试 PID");
+        mutated_namespace.registry().release(pid);
+        result_tx.send(pid).unwrap();
+    });
+
+    let result = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(identity);
+    mutation.join().unwrap();
+
+    assert!(result.is_ok(), "无关 PID 分配与释放不应进入全局身份事务");
+}
+
+#[ktest]
+fn exec_leader_adoption_joins_process_identity_transaction() {
+    let task = make_task();
+    let identity = crate::pid::lock_process_identity();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&task);
+    let adoption = std::thread::spawn(move || {
+        result_tx.send(crate::operation::adopt_exec_leader_identity(
+            &worker, &worker,
+        ))
+    });
+
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "exec 身份接管必须进入统一身份事务"
+    );
+    drop(identity);
+    assert_eq!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("身份事务结束后接管检查应继续"),
+        Err(Errno::EINVAL)
+    );
+    adoption.join().unwrap().unwrap();
+}
+
+#[ktest]
+fn failed_exec_leader_adoption_keeps_the_old_identity_waitable() {
+    let parent = make_task();
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let executor = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&executor);
+    parent.add_child(Arc::clone(&leader));
+    leader.reparent_to(&parent);
+    leader.set_state(TaskState::Zombie);
+    leader.cleanup_exit_extensions();
+
+    crate::operation::prepare_exec_leader_identity(&executor, &leader)
+        .expect("身份迁移应在退出旧 leader 前完成资源预留");
+    crate::operation::request_exec_sibling_exit(&leader, true);
+    assert!(crate::operation::complete_exec_sibling_exit_if_requested(
+        &leader
+    ));
+    assert!(crate::operation::adopt_exec_leader_identity(&executor, &leader).is_err());
+
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert!(
+        group
+            .snapshot()
+            .iter()
+            .any(|member| Arc::ptr_eq(member, &leader))
+    );
+    assert!(
+        group
+            .leader()
+            .is_some_and(|current| Arc::ptr_eq(&current, &leader))
+    );
+    assert!(parent.has_child(&leader));
+
+    let _ = group.request_group_exit(127);
+    crate::spawn::exit_task(&executor, crate::ExitCode(127));
+    assert!(leader.is_waitable_zombie());
+    let reaped = parent
+        .reap_matching(|child| Arc::ptr_eq(child, &leader))
+        .expect("失败的身份接管必须留下可回收的进程身份");
+    assert!(Arc::ptr_eq(&reaped, &leader));
+}
+
+#[ktest]
+fn zombie_leader_is_not_finished_while_it_still_owns_a_cpu_context() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let executor = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&executor);
+    leader.set_state(TaskState::Zombie);
+    assert!(leader.try_claim_cpu(0));
+
+    crate::operation::request_exec_sibling_exit(&leader, true);
+    assert!(crate::operation::complete_exec_sibling_exit_if_requested(
+        &leader
+    ));
+    assert_eq!(leader.state(), TaskState::Zombie);
+
+    // Safety: 测试持有 leader 的强引用，并只模拟上下文切换汇编完成 release store。
+    unsafe {
+        leader.on_cpu_slot().as_ref().store(0, Ordering::Release);
+    }
+    leader.cleanup_exit_extensions();
+    assert!(crate::operation::complete_exec_sibling_exit_if_requested(
+        &leader
+    ));
+    assert_eq!(leader.state(), TaskState::Zombie);
+}
+
+#[ktest]
+fn nonleader_exec_adopts_stopped_leader_identity() {
+    crate::arch_hooks::register(&TEST_ARCH_CONTEXT_OPS);
+    let parent = make_task();
+    let session = Session::new();
+    let process_group = ProcessGroup::new(&session);
+    session.register_group(&process_group);
+    let group = ThreadGroup::new();
+    let leader = Task::new(
+        SchedParams::default_fair(),
+        Arc::downgrade(&parent),
+        Arc::clone(&group),
+        Arc::clone(&process_group),
+    );
+    let executor = Task::new(
+        SchedParams::default_fair(),
+        Arc::downgrade(&leader),
+        Arc::clone(&group),
+        Arc::clone(&process_group),
+    );
+    leader.adopt_current_context();
+    executor.adopt_current_context();
+    group.add_member(&leader);
+    group.add_member(&executor);
+    process_group.add_member(&leader);
+    process_group.add_member(&executor);
+    parent.add_child(Arc::clone(&leader));
+
+    let namespace = PidNamespace::new_root();
+    let leader_pid = namespace.registry().allocate(&leader).expect("leader pid");
+    let executor_pid = namespace
+        .registry()
+        .allocate(&executor)
+        .expect("executor tid");
+    leader.register_pid(Arc::clone(&namespace), leader_pid);
+    executor.register_pid(Arc::clone(&namespace), executor_pid);
+    leader.set_tgid_cache(leader_pid);
+    executor.set_tgid_cache(leader_pid);
+    group.set_leader(&leader);
+    leader.set_state(TaskState::Running);
+    executor.set_state(TaskState::Running);
+    executor.set_exit_signal(0);
+
+    let child_group = ThreadGroup::new();
+    let child = Task::new(
+        SchedParams::default_fair(),
+        Arc::downgrade(&leader),
+        child_group,
+        Arc::clone(&process_group),
+    );
+    leader.add_child(Arc::clone(&child));
+
+    crate::operation::prepare_exec_leader_identity(&executor, &leader)
+        .expect("身份迁移应在退出旧 leader 前完成资源预留");
+    crate::operation::request_exec_sibling_exit(&leader, true);
+    assert!(crate::operation::complete_exec_sibling_exit_if_requested(
+        &leader
+    ));
+    assert_eq!(leader.state(), TaskState::Zombie);
+    assert_eq!(leader.pid_root(), Some(leader_pid));
+    assert!(Arc::ptr_eq(&parent.snapshot_children()[0], &leader));
+
+    crate::operation::adopt_exec_leader_identity(&executor, &leader)
+        .expect("执行线程应接管 leader 身份");
+
+    assert_eq!(executor.pid_root(), Some(leader_pid));
+    assert_eq!(leader.pid_root(), None);
+    assert!(
+        namespace
+            .registry()
+            .lookup(leader_pid)
+            .and_then(|task| task.upgrade())
+            .is_some_and(|task| Arc::ptr_eq(&task, &executor))
+    );
+    assert!(namespace.registry().lookup(executor_pid).is_none());
+    assert!(
+        group
+            .leader()
+            .is_some_and(|task| Arc::ptr_eq(&task, &executor))
+    );
+    assert!(
+        executor
+            .parent()
+            .is_some_and(|task| Arc::ptr_eq(&task, &parent))
+    );
+    assert!(Arc::ptr_eq(&parent.snapshot_children()[0], &executor));
+    assert!(
+        child
+            .parent()
+            .is_some_and(|task| Arc::ptr_eq(&task, &executor))
+    );
+    assert!(
+        executor
+            .snapshot_children()
+            .iter()
+            .any(|task| Arc::ptr_eq(task, &child))
+    );
+    assert_eq!(executor.exit_signal(), SignalNumber::SIGCHLD.raw() as i32);
+    assert_eq!(leader.exit_signal(), 0);
+}
+
+#[ktest]
 fn robust_list_and_rseq_state_roundtrip() {
     let task = make_task();
     task.set_robust_list(0x1000, 24);
@@ -569,6 +1612,23 @@ fn pi_donation_preserves_base_update_until_last_waiter_leaves() {
     let restored = task.pi_remove_donation(9);
     assert_eq!(restored.policy, SchedPolicy::Fair);
     assert_eq!(restored.nice, 3);
+}
+
+#[ktest]
+fn deferred_pi_update_reads_latest_effective_attr() {
+    let task = make_task();
+    task.set_sched_attr(SchedAttr::fair(7, 0));
+    let _ = task.pi_add_donation(11, SchedAttr::rt_fifo(50));
+    task.request_deferred_pi_update();
+
+    let _ = task.pi_remove_donation(11);
+
+    let effective = task
+        .take_deferred_pi_effective_attr()
+        .expect("延迟 PI 更新应保留待处理标记");
+    assert_eq!(effective.policy, SchedPolicy::Fair);
+    assert_eq!(effective.nice, 7);
+    assert!(task.take_deferred_pi_effective_attr().is_none());
 }
 
 #[ktest]

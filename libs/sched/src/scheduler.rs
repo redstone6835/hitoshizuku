@@ -248,6 +248,8 @@ static SCHED_RR_TIMESLICE_MS: AtomicI32 =
 
 /// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
 static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
+/// init 的稳定进程身份；非 leader exec 后通过线程组 leader 动态解析。
+static INIT_THREAD_GROUP: AtomicPtr<ThreadGroup> = AtomicPtr::new(core::ptr::null_mut());
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
 static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
@@ -424,12 +426,23 @@ pub fn init() -> Arc<Task> {
 
     // 7) 发布全局锚点。AtomicPtr 持有的强引用与内核同寿命，不参与常规回收。
     let init_ptr = Arc::into_raw(Arc::clone(&init_task)).cast_mut();
+    let init_group_ptr = Arc::into_raw(Arc::clone(&tgroup)).cast_mut();
     let root_ptr = Arc::into_raw(Arc::clone(&root_ns)).cast_mut();
     assert!(
         INIT_TASK
             .compare_exchange(
                 core::ptr::null_mut(),
                 init_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
+    assert!(
+        INIT_THREAD_GROUP
+            .compare_exchange(
+                core::ptr::null_mut(),
+                init_group_ptr,
                 Ordering::Release,
                 Ordering::Relaxed,
             )
@@ -469,7 +482,19 @@ pub fn init_task() -> Arc<Task> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] init_task() called before sched::init()"
     );
-    clone_global_arc(&INIT_TASK, "[sched] INIT_TASK flag set but slot empty")
+    let group = clone_global_arc(
+        &INIT_THREAD_GROUP,
+        "[sched] INIT_THREAD_GROUP flag set but slot empty",
+    );
+    group
+        .leader()
+        .or_else(|| {
+            Some(clone_global_arc(
+                &INIT_TASK,
+                "[sched] INIT_TASK flag set but slot empty",
+            ))
+        })
+        .expect("[sched] init thread group leader missing")
 }
 
 /// 当前 CPU 的 runqueue。
@@ -1566,6 +1591,12 @@ pub fn defer_task_wake(task: &Arc<Task>) {
     request_resched(target);
 }
 
+/// 把 PI 有效属性更新推迟到安全调度边界，供不可分配的清理路径使用。
+pub fn defer_pi_effective_update(task: &Arc<Task>) {
+    task.request_deferred_pi_update();
+    defer_task_wake(task);
+}
+
 fn drain_deferred_task_wakes() {
     let mut raw = DEFERRED_TASK_WAKES[cpu()].swap(core::ptr::null_mut(), Ordering::AcqRel);
     while !raw.is_null() {
@@ -1574,6 +1605,9 @@ fn drain_deferred_task_wakes() {
         let task = unsafe { Arc::from_raw(raw) };
         raw = task.take_deferred_wake_next();
         task.finish_deferred_wake();
+        if let Some(attr) = task.take_deferred_pi_effective_attr() {
+            let _ = crate::operation::pi_apply_effective_attr(&task, attr);
+        }
         if task.arch_context().is_some()
             && matches!(
                 task.state(),
@@ -2031,10 +2065,40 @@ pub fn register_deadline_observer(
     deadline_ns: u64,
     observer: Weak<dyn DeadlineObserver>,
 ) -> bool {
+    try_register_deadline_observer(registration, deadline_ns, observer)
+        .expect("deadline observer 分配失败")
+}
+
+pub fn try_register_deadline_observer(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> Result<bool, ()> {
     if now_ns_internal() >= deadline_ns {
-        return false;
+        return Ok(false);
     }
+    try_register_deadline_observer_deferred(registration, deadline_ns, observer)?;
+    Ok(true)
+}
+
+/// 注册一个允许已经到期的 deadline。调用方已同步发布首次过期事件时，用它
+/// 重装周期 observer，下一次 timer 边界会完成追赶而不会在调用路径自旋。
+pub fn register_deadline_observer_deferred(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) {
+    try_register_deadline_observer_deferred(registration, deadline_ns, observer)
+        .expect("deadline observer 分配失败");
+}
+
+pub fn try_register_deadline_observer_deferred(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> Result<(), ()> {
     let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.try_reserve(1).map_err(|_| ())?;
     observers.entries.push(DeadlineEntry {
         id: registration,
         deadline_ns,
@@ -2045,7 +2109,7 @@ pub fn register_deadline_observer(
         .entries
         .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
     HAS_DEADLINE_OBSERVERS.store(true, Ordering::Release);
-    true
+    Ok(())
 }
 
 /// 取消尚未到期的 observer 注册。
@@ -2296,33 +2360,44 @@ fn migrate_deadline_owners(source_cpu: usize, target_cpu: usize) {
     invalidate_deadline_cache();
 }
 
-fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
+fn take_expired_sleepers(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
     if !HAS_TIMED_SLEEPERS.load(Ordering::Acquire) {
-        return None;
+        return Vec::new();
     }
+    let mut expired = Vec::new();
     let mut sleepers = TIMED_SLEEPERS.lock();
     let mut index = 0;
+    let mut changed = false;
     while index < sleepers.len() {
         let Some(task) = sleepers[index].task.upgrade() else {
             sleepers.swap_remove(index);
-            invalidate_deadline_cache();
+            changed = true;
             continue;
         };
         if sleepers[index].cpu_id == cpu_id && sleepers[index].deadline_ns <= now_ns {
             sleepers.swap_remove(index);
-            HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
-            invalidate_deadline_cache();
-            return Some(task);
+            expired.push(task);
+            changed = true;
+            continue;
         }
         index += 1;
     }
     HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
-    None
+    drop(sleepers);
+    if changed {
+        invalidate_deadline_cache();
+    }
+    expired
+}
+
+#[cfg(test)]
+pub(crate) fn take_expired_sleepers_for_test(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
+    take_expired_sleepers(now_ns, cpu_id)
 }
 
 fn wake_expired_sleepers(now_ns: u64, cpu_id: usize) -> bool {
     let mut woke = false;
-    while let Some(task) = take_expired_sleeper(now_ns, cpu_id) {
+    for task in take_expired_sleepers(now_ns, cpu_id) {
         if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
             task.mark_profile_woken(now_ns);
             enqueue_task_preferred(task, now_ns);
@@ -2892,6 +2967,24 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
 /// 到达安全边界。
 pub fn group_exit_wakeup(target: &Arc<Task>) {
     target.publish_group_exit_wakeup();
+    forced_exit_wakeup(target);
+}
+
+/// 唤醒被 exec 发起者要求自行退出的兄弟线程。
+pub fn exec_sibling_exit_wakeup(target: &Arc<Task>, preserve_leader_identity: bool) {
+    target.publish_exec_sibling_exit_wakeup(preserve_leader_identity);
+    forced_exit_wakeup(target);
+}
+
+/// 唤醒收到 Native 单线程终止请求的任务。目标在自己的安全边界完成退出，
+/// 发送者不会远程释放目标内核栈上的资源。
+pub fn native_thread_exit_wakeup(target: &Arc<Task>, code: i32) -> i32 {
+    let selected = target.publish_native_thread_exit_wakeup(code);
+    forced_exit_wakeup(target);
+    selected
+}
+
+fn forced_exit_wakeup(target: &Arc<Task>) {
     let resumed = target.resume_for_fatal_exit()
         || target.cas_state(TaskState::Sleeping, TaskState::Runnable)
         || target.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
@@ -3003,9 +3096,11 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
     // 恢复阻塞调用栈并返回 syscall 安全边界。
     let _ = prev.abort_group_exit_sleep();
 
-    // 在调度边界消费当前任务的 pending signal。默认 Term/Core 会把 prev 标成
-    // Zombie；后续 pick_next 看到它不再 runnable，就不会放回 runqueue。
-    if prev.state() == TaskState::Running
+    // Tomori 在调度边界消费当前任务的 pending signal。Native 必须保留
+    // 到调用或用户返回的安全边界，避免在深层调度栈中执行外部控制。
+    // 默认 Term/Core 会把 prev 标成 Zombie；后续 pick_next 不再将它放回 runqueue。
+    if prev.user_abi_kind() == crate::UserAbiKind::TomoriLinux
+        && prev.state() == TaskState::Running
         && (prev.signal.has_any_pending() || prev.shared_signal_pending_bits_quick() != 0)
     {
         let _ = crate::operation::deliver_pending_signals();
@@ -3178,6 +3273,12 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
     // 9. 切换。
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
     let prev_on_cpu = prev.on_cpu_slot();
+    #[cfg(feature = "syscall-model-markers")]
+    profiling::syscall_model_task_switch(
+        prev.profile_session_id(),
+        prev.syscall_model_task_id(),
+        false,
+    );
     unsafe {
         if final_prev {
             drop(next);
@@ -3188,6 +3289,12 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
             (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx, prev_on_cpu);
         }
     }
+    #[cfg(feature = "syscall-model-markers")]
+    profiling::syscall_model_task_switch(
+        prev.profile_session_id(),
+        prev.syscall_model_task_id(),
+        true,
+    );
     #[cfg(feature = "performance-profile")]
     {
         let started = CONTEXT_SWITCH_STARTED[cpu_id].swap(0, Ordering::AcqRel);
@@ -3455,17 +3562,51 @@ fn service_idle_scheduler_requests(cpu_id: usize) {
     // 防止已处理的请求让 idle_relax 永久跳过硬件等待。空闲核每次从硬件等待
     // 返回后主动拉取一次；本地已经出现普通任务时直接交给 schedule_once。
     let _ = cpu_state.take_resched();
-    let _ = cpu_state.take_balance();
+    let balance_requested = cpu_state.take_balance();
     let local_nr_running = cpu_state.runqueue().nr_running();
-    let _ = run_idle_balance_if_idle(local_nr_running, cpu_id, balance_once);
+    let now_ns = now_ns_internal();
+    let next = &NEXT_BALANCE_NS[cpu_id.min(NR_CPUS - 1)];
+    let _ = run_idle_balance_if_due(
+        local_nr_running,
+        balance_requested,
+        now_ns,
+        next,
+        cpu_id,
+        balance_once,
+    );
 }
 
 #[inline]
-fn run_idle_balance_if_idle<F>(local_nr_running: usize, cpu_id: usize, balance: F) -> bool
+fn run_idle_balance_if_due<F>(
+    local_nr_running: usize,
+    requested: bool,
+    now_ns: u64,
+    next_allowed: &AtomicU64,
+    cpu_id: usize,
+    balance: F,
+) -> bool
 where
     F: FnOnce(usize) -> bool,
 {
-    local_nr_running <= 1 && balance(cpu_id)
+    if local_nr_running > 1 {
+        return false;
+    }
+
+    let next = now_ns.saturating_add(PERIODIC_BALANCE_INTERVAL_NS);
+    if requested {
+        next_allowed.store(next, Ordering::Relaxed);
+        return balance(cpu_id);
+    }
+
+    let previous = next_allowed.load(Ordering::Relaxed);
+    if now_ns < previous
+        || next_allowed
+            .compare_exchange(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return false;
+    }
+    balance(cpu_id)
 }
 
 // ── exit 辅助 ────────────────────────────────────────────────────────────────
@@ -3601,31 +3742,53 @@ mod deadline_observer_tests {
 
 #[cfg(test)]
 mod idle_balance_tests {
-    use super::run_idle_balance_if_idle;
+    use super::{PERIODIC_BALANCE_INTERVAL_NS, run_idle_balance_if_due};
     use core::cell::Cell;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn idle_balance_runs_without_request_when_local_queue_is_empty() {
+    fn requested_idle_balance_runs_immediately() {
         let calls = Cell::new(0usize);
+        let next = AtomicU64::new(1_000);
         let run = |cpu_id| {
             assert_eq!(cpu_id, 3);
             calls.set(calls.get() + 1);
             true
         };
 
-        assert!(run_idle_balance_if_idle(1, 3, run));
+        assert!(run_idle_balance_if_due(1, true, 100, &next, 3, run));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            100 + PERIODIC_BALANCE_INTERVAL_NS
+        );
+    }
+
+    #[test]
+    fn idle_balance_without_request_is_rate_limited() {
+        let calls = Cell::new(0usize);
+        let next = AtomicU64::new(200);
+        let run = |_| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(!run_idle_balance_if_due(1, false, 199, &next, 3, run));
+        assert_eq!(calls.get(), 0);
+        assert!(run_idle_balance_if_due(1, false, 200, &next, 3, run));
         assert_eq!(calls.get(), 1);
     }
 
     #[test]
     fn idle_balance_skips_scan_when_local_queue_has_work() {
         let calls = Cell::new(0usize);
+        let next = AtomicU64::new(0);
         let run = |_| {
             calls.set(calls.get() + 1);
             true
         };
 
-        assert!(!run_idle_balance_if_idle(2, 3, run));
+        assert!(!run_idle_balance_if_due(2, true, 0, &next, 3, run));
         assert_eq!(calls.get(), 0);
     }
 }

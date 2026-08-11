@@ -7,3 +7,6 @@ mod test_error;
 
 #[cfg(not(feature = "ktest-kernel"))]
 mod test_parse;
+
+#[cfg(not(feature = "ktest-kernel"))]
+mod test_reader;

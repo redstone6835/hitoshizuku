@@ -84,6 +84,21 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
         return;
     }
     let task = sched::current_task();
+    if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+        match sched::operation::consume_native_external_control_for_task(&task) {
+            sched::NativeExternalControl::Continue => {}
+            sched::NativeExternalControl::Reschedule => {
+                drop(task);
+                schedule_from_trap(super::super::specific::kernel_timestamp_ns());
+            }
+            sched::NativeExternalControl::Terminate => {
+                drop(task);
+                schedule_from_trap(super::super::specific::kernel_timestamp_ns());
+                panic!("[trap][native] terminal task scheduled back unexpectedly");
+            }
+        }
+        return;
+    }
     if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
         let _ = sched::operation::deliver_pending_signals_for_task(
             &task,
@@ -146,6 +161,76 @@ fn decode_exception(ecode: usize, _esubcode: usize) -> Exception {
         ECODE_FPE => Exception::FloatingPointException,
         other => Exception::Other(other),
     }
+}
+
+fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
+    match code {
+        ECODE_INE => sched::SignalNumber::SIGILL,
+        ECODE_BRK => sched::SignalNumber::SIGTRAP,
+        ECODE_ADE | ECODE_ALE => sched::SignalNumber::SIGBUS,
+        _ => sched::SignalNumber::SIGSEGV,
+    }
+}
+
+fn native_fault_kind(code: usize) -> u32 {
+    match code {
+        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX | ECODE_PPI => {
+            native_abi::wire::PROCESS_FAULT_MEMORY
+        }
+        ECODE_INE | ECODE_IPE => native_abi::wire::PROCESS_FAULT_ILLEGAL_INSTRUCTION,
+        ECODE_BRK => native_abi::wire::PROCESS_FAULT_BREAKPOINT,
+        ECODE_ADE | ECODE_ALE | ECODE_BCE => native_abi::wire::PROCESS_FAULT_ADDRESS,
+        ECODE_FPE => native_abi::wire::PROCESS_FAULT_ARITHMETIC,
+        _ => native_abi::wire::PROCESS_FAULT_OTHER,
+    }
+}
+
+fn terminate_user_exception(
+    code: usize,
+    sig: sched::SignalNumber,
+    tf_ptr: usize,
+    badv: usize,
+    from_user: bool,
+) -> usize {
+    let era = {
+        let tf = unsafe { trap_frame_mut(tf_ptr) };
+        tf.pc
+    };
+    let (pid, comm) = if sched::is_ready() {
+        let task = sched::current_task();
+        (task.pid_root(), task.comm())
+    } else {
+        (None, [0; sched::TASK_COMM_LEN])
+    };
+
+    log::warning!(
+        "[trap][exception] user exception pid={:?} comm={:?} code={:#x} era={:#x} badv={:#x} sig={}",
+        pid,
+        comm,
+        code,
+        era,
+        badv,
+        sig.raw()
+    );
+
+    if sched::is_ready() {
+        let me = sched::current_task();
+        if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+            sched::operation::terminate_native_fault(
+                &me,
+                native_fault_kind(code),
+                code as u64,
+                badv as u64,
+                128 + i32::from(sig.raw()),
+            );
+        }
+        let pid = me.pid_root().unwrap_or(0);
+        let _ = sched::operation::tkill(pid, Some(sig));
+        drop(me);
+        deliver_user_signals_before_return(tf_ptr, from_user);
+    }
+
+    tf_ptr
 }
 
 /// LoongArch64 统一异常入口（Rust 端）。
@@ -458,6 +543,15 @@ unsafe fn loongarch64_handle_exception_inner(
                 // timer 边界来安装用户 signal frame。
                 if sched::is_ready() {
                     let me = sched::current_task();
+                    if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                        sched::operation::terminate_native_fault(
+                            &me,
+                            native_abi::wire::PROCESS_FAULT_MEMORY,
+                            ecode as u64,
+                            arg2 as u64,
+                            128 + i32::from(sched::SignalNumber::SIGSEGV.raw()),
+                        );
+                    }
                     let pid = me.pid_root().unwrap_or(0);
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
                     drop(me);
@@ -470,6 +564,15 @@ unsafe fn loongarch64_handle_exception_inner(
                     let me = sched::current_task();
                     let pid = me.pid_root().unwrap_or(0);
                     log::warning!("[trap][mm][oom] killing pid={} comm={:?}", pid, me.comm());
+                    if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                        sched::operation::terminate_native_fault(
+                            &me,
+                            native_abi::wire::PROCESS_FAULT_RESOURCE,
+                            ecode as u64,
+                            arg2 as u64,
+                            128 + i32::from(sched::SignalNumber::SIGKILL.raw()),
+                        );
+                    }
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
                     drop(me);
                     deliver_user_signals_before_return(arg4, from_user);
@@ -510,6 +613,15 @@ unsafe fn loongarch64_handle_exception_inner(
     } else {
         // 非中断、非 syscall 的路径通常代表真正的同步故障，例如页故障、地址错、非法指令。
         // 当前内核尚未实现可恢复异常处理，因此除了断点外，一律记录现场后宣告不可恢复。
+        if from_user {
+            return terminate_user_exception(
+                ecode,
+                signal_for_user_exception(ecode),
+                arg4,
+                arg2,
+                true,
+            );
+        }
         let exc = decode_exception(ecode, esubcode);
         log::debug!(
             "[trap] exception {:?} pc={:#x} sp={:#x} bad_addr={:#x} \
@@ -565,7 +677,7 @@ unsafe fn loongarch64_handle_exception_inner(
             return arg4;
         }
 
-        // 其余异常目前无法恢复：返回 0 让汇编端宕机
+        // 内核态异常仍保持 fail-stop；ELM recovery 已在上方提前返回。
         0
     }
 }

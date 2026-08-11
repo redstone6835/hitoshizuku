@@ -195,6 +195,39 @@ fn elm_native_guard_captures_kernel_global_allocations() {
     drop(guard);
 }
 
+#[ktest]
+fn elm_resident_context_overrides_native_guard_allocation_owner() {
+    let guard = general::elm_guard::ElmGuard::enter(
+        ELM_MGR_ID.0,
+        general::elm_guard::ELM_GUARD_PHASE_HOOK,
+        0,
+    )
+    .expect("ELM 原生 Guard 应能进入");
+    let context = ElmContext::new(
+        ElmId(0),
+        None,
+        Generation::FIRST,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let current = elm_model::enter_current_context(&context).expect("resident 上下文应能进入");
+    let layout = Layout::from_size_align(96, 16).expect("测试布局有效");
+    // Safety: 测试使用同一个 GlobalAlloc 和 Layout 完成分配、释放往返。
+    let pointer = unsafe { GlobalAlloc::alloc(&allocator::KERNEL_ALLOCATOR, layout) };
+    assert!(!pointer.is_null());
+    assert!(
+        allocator::KERNEL_ALLOCATOR
+            .query_tracked_allocation(pointer as usize)
+            .is_err(),
+        "resident 上下文中的内核对象不应归外层 ELM 单元所有"
+    );
+    // Safety: pointer 来自上面的同一个 allocator，layout 未改变。
+    unsafe { GlobalAlloc::dealloc(&allocator::KERNEL_ALLOCATOR, pointer, layout) };
+    drop(current);
+    drop(guard);
+}
+
 fn push_owned_resource_trace(stage: u64, handle: u64) -> Result<(), i32> {
     OWNED_RESOURCE_TRACE
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -4065,9 +4098,14 @@ fn elm_native_nested_fault_uses_controlled_recovery_exit() {
 
 #[ktest]
 fn elm_native_fault_recovers_on_secondary_cpu() {
-    if sched::active_cpu_mask().count_ones() < 2 {
+    let active_cpus = sched::active_cpu_mask();
+    if active_cpus.count_ones() < 2 {
         return;
     }
+    let current_cpu = sched::current_task_direct().current_cpu();
+    let target_cpu = (0..u64::BITS as usize)
+        .find(|cpu| *cpu != current_cpu && active_cpus & (1u64 << cpu) != 0)
+        .expect("在线 CPU 集合应包含当前 CPU 之外的处理器");
     SMP_NATIVE_FAULT_TEST_STATE.store(0, Ordering::Release);
     SMP_NATIVE_FAULT_TEST_CPU.store(usize::MAX, Ordering::Release);
     #[cfg(target_arch = "loongarch64")]
@@ -4090,7 +4128,7 @@ fn elm_native_fault_recovers_on_secondary_cpu() {
             nice: 0,
             slice_ns: 0,
         },
-        1,
+        target_cpu,
     )
     .expect("无法在辅助 CPU 启动 ELM fault 测试线程");
 
@@ -4102,7 +4140,7 @@ fn elm_native_fault_recovers_on_secondary_cpu() {
     }
     let cleanup_deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     while (task.state() != sched::TaskState::Dead
-        || sched::current_task_on(1).is_some_and(|current| Arc::ptr_eq(&current, &task)))
+        || sched::current_task_on(target_cpu).is_some_and(|current| Arc::ptr_eq(&current, &task)))
         && sched::now_ns_direct() < cleanup_deadline
     {
         core::hint::spin_loop();
@@ -4120,19 +4158,23 @@ fn elm_native_fault_recovers_on_secondary_cpu() {
     );
     if SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire) != 1 {
         log::error!(
-            "[elm][test] AP native fault timeout: state={} task_state={:?} placement={:?} on_rq={} current_cpu={} cpu1_current={:?}",
+            "[elm][test] AP native fault timeout: state={} task_state={:?} placement={:?} on_rq={} current_cpu={} target_cpu={} target_current={:?}",
             SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire),
             task.state(),
             task.placement(),
             task.sched.on_rq(),
             task.current_cpu(),
-            sched::current_task_on(1).map(|current| current.pid_root()),
+            target_cpu,
+            sched::current_task_on(target_cpu).map(|current| current.pid_root()),
         );
     }
     assert_eq!(task.state(), sched::TaskState::Dead);
-    assert!(sched::current_task_on(1).is_none_or(|current| !Arc::ptr_eq(&current, &task)));
+    assert!(sched::current_task_on(target_cpu).is_none_or(|current| !Arc::ptr_eq(&current, &task)));
     assert_eq!(SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire), 1);
-    assert_eq!(SMP_NATIVE_FAULT_TEST_CPU.load(Ordering::Acquire), 1);
+    assert_eq!(
+        SMP_NATIVE_FAULT_TEST_CPU.load(Ordering::Acquire),
+        target_cpu
+    );
 }
 
 #[ktest]

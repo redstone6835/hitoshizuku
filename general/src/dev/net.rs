@@ -10,6 +10,7 @@ use spin::mutex::Mutex;
 
 use net::device::{QueueIrqControl, QueueIrqError, QueueIrqStats, QueueWakeHandle};
 
+use crate::dev::dma::DmaContext;
 use crate::dev::function::{DeviceClassId, DeviceFunction};
 use crate::dev::irq::{IrqHandler, IrqLine, IrqStatus};
 
@@ -17,12 +18,16 @@ pub const NET_CLASS: DeviceClassId = DeviceClassId::new("net");
 
 pub struct NetFunction {
     dev_name: Box<str>,
+    dma_context: DmaContext,
+    gone: AtomicBool,
 }
 
 impl NetFunction {
-    pub fn new(dev_name: &str) -> Self {
+    pub fn new(dev_name: &str, dma_context: DmaContext) -> Self {
         Self {
             dev_name: dev_name.into(),
+            dma_context,
+            gone: AtomicBool::new(false),
         }
     }
 }
@@ -36,7 +41,48 @@ impl DeviceFunction for NetFunction {
         &self.dev_name
     }
 
-    fn mark_gone(&self) {}
+    fn operation_contract(&self) -> Option<&str> {
+        Some("mygo.device.net@1;1=dma_constraints:32")
+    }
+
+    fn invoke(
+        &self,
+        opcode: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, crate::dev::function::DeviceFunctionInvokeError> {
+        use crate::dev::function::DeviceFunctionInvokeError as InvokeError;
+
+        if self.is_gone() {
+            return Err(InvokeError::Gone);
+        }
+        if opcode != 1 {
+            return Err(InvokeError::Unsupported);
+        }
+        if !input.is_empty() || output.len() < 32 {
+            return Err(InvokeError::Invalid);
+        }
+        let constraints = self.dma_context.constraints();
+        let flags =
+            u64::from(constraints.coherent) | (u64::from(constraints.supports_scatter_gather) << 1);
+        output[0..8].copy_from_slice(&(constraints.address_mask as u64).to_le_bytes());
+        output[8..16].copy_from_slice(&(constraints.max_segment_size as u64).to_le_bytes());
+        output[16..24].copy_from_slice(&(constraints.max_segments as u64).to_le_bytes());
+        output[24..32].copy_from_slice(&flags.to_le_bytes());
+        Ok(32)
+    }
+
+    fn dma_context(&self) -> Option<DmaContext> {
+        (!self.is_gone()).then_some(self.dma_context)
+    }
+
+    fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    fn mark_gone(&self) {
+        self.gone.store(true, Ordering::Release);
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -51,8 +97,8 @@ impl DeviceFunction for NetFunction {
     capabilities = kernel_symbols::capability::DEVICE_DRIVER,
     flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
 )]
-pub fn net_function(dev_name: &str) -> Arc<dyn DeviceFunction> {
-    Arc::new(NetFunction::new(dev_name))
+pub fn net_function(dev_name: &str, dma_context: DmaContext) -> Arc<dyn DeviceFunction> {
+    Arc::new(NetFunction::new(dev_name, dma_context))
 }
 
 const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;

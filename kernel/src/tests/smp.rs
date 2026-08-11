@@ -5,6 +5,17 @@ use ktest::ktest;
 static MEMBARRIER_START: AtomicBool = AtomicBool::new(false);
 static MEMBARRIER_REMOTE_STATE: AtomicUsize = AtomicUsize::new(0);
 
+struct TestAffinityRestore {
+    task: alloc::sync::Arc<sched::Task>,
+    previous: u64,
+}
+
+impl Drop for TestAffinityRestore {
+    fn drop(&mut self) {
+        self.task.set_cpu_affinity(self.previous);
+    }
+}
+
 unsafe extern "C" fn concurrent_membarrier_worker(_arg: usize) -> ! {
     MEMBARRIER_REMOTE_STATE.store(1, Ordering::Release);
     while !MEMBARRIER_START.load(Ordering::Acquire) {
@@ -18,9 +29,18 @@ unsafe extern "C" fn concurrent_membarrier_worker(_arg: usize) -> ! {
 
 #[ktest]
 fn concurrent_membarrier_rendezvous_completes_on_smp() {
-    if sched::active_cpu_mask().count_ones() < 2 {
+    let active_cpus = sched::active_cpu_mask();
+    if active_cpus.count_ones() < 2 {
         return;
     }
+    let current_cpu = sched::current_cpu_id();
+    let target_cpu = (0..u64::BITS as usize)
+        .find(|cpu| *cpu != current_cpu && active_cpus & (1u64 << cpu) != 0)
+        .expect("在线 CPU 集合应包含当前 CPU 之外的处理器");
+    let task = sched::current_task_direct();
+    let previous = task.cpu_affinity();
+    task.set_cpu_affinity(1u64 << current_cpu);
+    let _affinity = TestAffinityRestore { task, previous };
 
     MEMBARRIER_START.store(false, Ordering::Release);
     MEMBARRIER_REMOTE_STATE.store(0, Ordering::Release);
@@ -31,15 +51,15 @@ fn concurrent_membarrier_rendezvous_completes_on_smp() {
             nice: 0,
             slice_ns: 0,
         },
-        1,
+        target_cpu,
     )
-    .expect("无法在 CPU1 启动 membarrier 测试线程");
+    .expect("无法在辅助 CPU 启动 membarrier 测试线程");
 
     let ready_deadline = sched::now_ns_direct().saturating_add(2_000_000_000);
     while MEMBARRIER_REMOTE_STATE.load(Ordering::Acquire) == 0
         && sched::now_ns_direct() < ready_deadline
     {
-        core::hint::spin_loop();
+        let _ = sched::operation::sched_yield();
     }
     assert_eq!(MEMBARRIER_REMOTE_STATE.load(Ordering::Acquire), 1);
 
@@ -50,10 +70,10 @@ fn concurrent_membarrier_rendezvous_completes_on_smp() {
     while MEMBARRIER_REMOTE_STATE.load(Ordering::Acquire) == 1
         && sched::now_ns_direct() < completion_deadline
     {
-        // CPU1 可能在本地中断关闭时发布反向请求；等待期间继续服务本 CPU，
+        // 辅助 CPU 可能在本地中断关闭时发布反向请求；等待期间继续服务本 CPU，
         // 与实际 syscall rendezvous 的主动进展规则保持一致。
         sched::handle_membarrier_ipi();
-        core::hint::spin_loop();
+        let _ = sched::operation::sched_yield();
     }
     assert_eq!(MEMBARRIER_REMOTE_STATE.load(Ordering::Acquire), 2);
 }

@@ -45,9 +45,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -119,6 +117,47 @@ const STATE_EVICTED: u8 = 2;
 /// 私有文件页缓存身份；0 保留为“不可缓存”，耗尽后永久停止分配新身份。
 static NEXT_PRIVATE_PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
+const DATA_MUTATION_BITS: u32 = 16;
+const DATA_MUTATION_MASK: u64 = (1 << DATA_MUTATION_BITS) - 1;
+const DATA_GENERATION_SHIFT: u32 = DATA_MUTATION_BITS;
+const DATA_CACHE_DISABLED: u64 = 1 << 63;
+const DATA_GENERATION_MAX: u64 = (DATA_CACHE_DISABLED - 1) >> DATA_GENERATION_SHIFT;
+
+const fn data_state(generation: u64, active: usize, disabled: bool) -> u64 {
+    debug_assert!(generation <= DATA_GENERATION_MAX);
+    debug_assert!(active <= DATA_MUTATION_MASK as usize);
+    (generation << DATA_GENERATION_SHIFT)
+        | active as u64
+        | if disabled { DATA_CACHE_DISABLED } else { 0 }
+}
+
+const fn data_state_generation(state: u64) -> u64 {
+    (state & !DATA_CACHE_DISABLED) >> DATA_GENERATION_SHIFT
+}
+
+const fn data_state_active(state: u64) -> usize {
+    (state & DATA_MUTATION_MASK) as usize
+}
+
+const fn data_state_disabled(state: u64) -> bool {
+    state & DATA_CACHE_DISABLED != 0
+}
+
+const fn finish_data_mutation_state(state: u64) -> Option<u64> {
+    let active = data_state_active(state);
+    if active == 0 {
+        return None;
+    }
+    let generation = data_state_generation(state);
+    let disabled = data_state_disabled(state) || generation == DATA_GENERATION_MAX;
+    let generation = if generation == DATA_GENERATION_MAX {
+        generation
+    } else {
+        generation + 1
+    };
+    Some(data_state(generation, active - 1, disabled))
+}
+
 fn allocate_private_page_cache_id() -> usize {
     NEXT_PRIVATE_PAGE_CACHE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -189,17 +228,11 @@ pub struct Inode {
     /// `meta.nlink` 的原子镜像，用于 link/unlink/evict 相关热路径。
     cached_nlink: AtomicU32,
 
-    /// 文件内容代际。每轮可能修改数据或长度的操作结束后递增，供私有 mmap
-    /// 干净页缓存拒绝操作前的旧快照；失败也递增以覆盖部分写副作用。
-    data_generation: AtomicU64,
-
-    /// 正在修改内容的 VFS 操作数量。非零期间私有缺页只能生成
-    /// 不发布到跨地址空间缓存的临时快照；可写 MAP_SHARED 由下方的永久 latch 处理。
-    data_mutations: AtomicUsize,
-
-    /// 可写 MAP_SHARED 一旦生效便永久置位。用户 store 不再经过 VFS，无法安全
-    /// 判断最后一次修改何时完成，因此该 inode 生命周期内不再恢复私有页缓存。
-    private_page_cache_disabled: AtomicBool,
+    /// 文件代际、活跃修改数和永久禁用标志的原子快照。
+    ///
+    /// 三者必须由读者一致观察；合并后稳定代际查询只需一次 Acquire，写者仍以
+    /// 单次 AcqRel 更新发布开始和结束状态。
+    data_state: AtomicU64,
 
     /// 普通文件的写打开与执行映像排斥状态。
     ///
@@ -276,9 +309,7 @@ impl Inode {
             meta: crate::vfs::sync::Spinlock::new(meta),
             cached_size: AtomicU64::new(meta.size),
             cached_nlink: AtomicU32::new(meta.nlink),
-            data_generation: AtomicU64::new(1),
-            data_mutations: AtomicUsize::new(0),
-            private_page_cache_disabled: AtomicBool::new(false),
+            data_state: AtomicU64::new(data_state(1, 0, false)),
             exec_write_state: AtomicIsize::new(0),
             ops,
             superblock,
@@ -313,50 +344,48 @@ impl Inode {
 
     /// 返回当前文件内容代际的无锁快照。
     pub fn data_generation(&self) -> u64 {
-        self.data_generation.load(Ordering::Acquire)
-    }
-
-    /// 发布一轮已经结束的数据或长度修改尝试。
-    pub(crate) fn bump_data_generation(&self) {
-        if self
-            .data_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .is_err()
-        {
-            // 代际不能回绕后重用旧 key；饱和后保守地永久停止发布。
-            self.private_page_cache_disabled
-                .store(true, Ordering::Release);
-        }
+        data_state_generation(self.data_state.load(Ordering::Acquire))
     }
 
     /// 返回可用于私有干净页缓存的稳定代际。
     ///
-    /// 两次读取 active 夹住 generation，覆盖写者在第一次检查后才开始的窗口；
-    /// VM 在读取文件页之后还会再次验证同一代际，形成完整的乐观快照协议。
+    /// 代际、active 和禁用标志来自同一个原子状态字；VM 在读取文件页之后还会
+    /// 再次验证同一状态，形成完整的乐观快照协议。
     pub(crate) fn private_page_cache_generation(&self) -> Option<u64> {
-        if self.private_page_cache_id == 0
-            || self.private_page_cache_disabled.load(Ordering::Acquire)
-            || self.data_mutations.load(Ordering::Acquire) != 0
-        {
+        if self.private_page_cache_id == 0 {
             return None;
         }
-        let generation = self.data_generation();
-        (!self.private_page_cache_disabled.load(Ordering::Acquire)
-            && self.data_mutations.load(Ordering::Acquire) == 0)
-            .then_some(generation)
+        let state = self.data_state.load(Ordering::Acquire);
+        (!data_state_disabled(state) && data_state_active(state) == 0)
+            .then(|| data_state_generation(state))
     }
 
-    fn begin_data_mutation_raw(&self) {
-        self.data_mutations.fetch_add(1, Ordering::AcqRel);
+    fn begin_data_mutation_raw(&self) -> bool {
+        let previous = self
+            .data_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let active = data_state_active(state);
+                if active == DATA_MUTATION_MASK as usize {
+                    return Some(state | DATA_CACHE_DISABLED);
+                }
+                Some(data_state(
+                    data_state_generation(state),
+                    active + 1,
+                    data_state_disabled(state),
+                ))
+            })
+            .expect("data state update closure must always produce a value");
+        data_state_active(previous) != DATA_MUTATION_MASK as usize
     }
 
     fn end_data_mutation_raw(&self) {
         // 必须先推进代际再撤销最后一个 active，防止读者观察到“稳定的旧代际”。
-        self.bump_data_generation();
-        let previous = self.data_mutations.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous != 0, "[vfs] data mutation publication underflow");
+        let result = self.data_state.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            finish_data_mutation_state,
+        );
+        assert!(result.is_ok(), "[vfs] data mutation publication underflow");
     }
 
     fn private_page_cache_supported(&self) -> bool {
@@ -366,27 +395,30 @@ impl Inode {
     /// 在可能修改文件内容的 VFS 调用前建立发布 guard。失败路径也会推进代际，
     /// 因为文件系统错误可能发生在已经写入部分块之后。
     pub(crate) fn begin_data_mutation(&self) -> InodeDataMutation<'_> {
-        let active = self.private_page_cache_supported();
-        if active {
-            self.begin_data_mutation_raw();
-        }
+        let active = self.private_page_cache_supported() && self.begin_data_mutation_raw();
         InodeDataMutation {
             inode: self,
             active,
         }
     }
 
-    /// 在可写共享映射生效前永久关闭私有干净页缓存。先置 latch 再推进代际，
-    /// 与 VM 发布候选页前的二次 generation 检查共同封闭并发窗口。
+    /// 在可写共享映射生效前永久关闭私有干净页缓存。禁用标志与新代际在同一次
+    /// 原子更新中发布，与 VM 发布候选页前的二次 generation 检查共同封闭并发窗口。
     pub(crate) fn disable_private_page_cache(&self) {
-        if self.private_page_cache_supported()
-            && self
-                .private_page_cache_disabled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            self.bump_data_generation();
+        if !self.private_page_cache_supported() {
+            return;
         }
+        let _ = self
+            .data_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if data_state_disabled(state) {
+                    return None;
+                }
+                let generation = data_state_generation(state)
+                    .saturating_add(1)
+                    .min(DATA_GENERATION_MAX);
+                Some(data_state(generation, data_state_active(state), true))
+            });
     }
 
     /// 获取普通文件写访问租约。
@@ -941,4 +973,32 @@ pub trait InodeOps {
     /// 返回 &dyn Any 引用，用于支持从 trait object 向下转型到具体的驱动类型。
     /// 实现者只需写 fn as_any(&self) -> &dyn Any { self } 即可。
     fn as_any(&self) -> &dyn core::any::Any;
+}
+
+#[cfg(test)]
+mod data_state_tests {
+    use super::{
+        DATA_GENERATION_MAX, data_state, data_state_active, data_state_disabled,
+        data_state_generation, finish_data_mutation_state,
+    };
+
+    #[test]
+    fn data_mutation_finish_advances_generation_before_last_active_clears() {
+        let state = data_state(7, 1, false);
+        let next = finish_data_mutation_state(state).expect("活跃 mutation 必须能结束");
+
+        assert_eq!(data_state_generation(next), 8);
+        assert_eq!(data_state_active(next), 0);
+        assert!(!data_state_disabled(next));
+    }
+
+    #[test]
+    fn data_generation_saturation_permanently_disables_private_cache() {
+        let state = data_state(DATA_GENERATION_MAX, 1, false);
+        let next = finish_data_mutation_state(state).expect("最后一个 mutation 必须能结束");
+
+        assert_eq!(data_state_generation(next), DATA_GENERATION_MAX);
+        assert_eq!(data_state_active(next), 0);
+        assert!(data_state_disabled(next));
+    }
 }

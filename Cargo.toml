@@ -8,6 +8,8 @@ members = [
     "libs/profiling",
     "libs/efi",
     "libs/elf",
+    "libs/native-abi",
+    "libs/soyo",
     "libs/mm",
     "libs/sched",
     "libs/allocator",

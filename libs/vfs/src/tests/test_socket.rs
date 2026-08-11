@@ -286,6 +286,45 @@ fn fixture_with_cred(cred: Credentials) -> Fixture {
     Fixture { ctx, fdt }
 }
 
+/// 共享 VFS context 的权限状态变化必须推进代际，供 exec 重验识别。
+#[ktest]
+fn vfs_context_generation_tracks_mutations() {
+    let fixture = fixture();
+    let initial = fixture.ctx.generation();
+
+    fixture.ctx.set_umask(FileMode::new(0o022));
+    assert!(fixture.ctx.generation() > initial);
+}
+
+/// exec VFS 租约存活期间，CLONE_FS 共享方的修改必须等提交后再完成。
+#[ktest]
+fn vfs_exec_lease_blocks_shared_context_mutation() {
+    let fixture = fixture();
+    let context = Arc::new(fixture.ctx);
+    let lease = context.lock_for_exec();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+    let shared = Arc::clone(&context);
+    let changer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        shared.set_umask(FileMode::new(0o022));
+        changed_tx.send(()).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(
+        changed_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "VFS exec 租约存活期间不得修改共享 context"
+    );
+    drop(lease);
+    changed_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("释放 VFS exec 租约后修改应完成");
+    changer.join().unwrap();
+}
+
 fn abstract_addr(name: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(3 + name.len());
     out.extend_from_slice(&vsock::AF_UNIX.to_ne_bytes());

@@ -45,6 +45,9 @@
 //! 7. `WaitQueue::waiters` —— 等待者列表。
 //! 8. `SignalState::pending_infos` —— per-task 信号队列。
 //!
+//! exec 提交另有固定锁序：`ThreadGroup::exec_lock` → signal consumer lock →
+//! pending queue lock。信号 producer 只取得 pending queue lock。
+//!
 //! 调用可能触发唤醒 / 分配的函数前必须释放所有 rq 锁。
 //!
 //! 依赖 `alloc` 的 `Arc` / `Vec` / `BTreeMap`；不做堆外分配。原子操作必须
@@ -89,14 +92,18 @@ pub use cpu::{
     SchedTopology,
 };
 pub use eevdf::{SchedEntity, SchedParams, Weight};
-pub use group::{GroupExitStatus, ProcessGroup, Session, ThreadGroup};
+pub use group::{
+    GroupExitStatus, ProcessExitObserver, ProcessGroup, ProcessPersonalityState, Session,
+    ThreadGroup, ThreadGroupExecGuard,
+};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
 pub use membarrier::{
     handle_ipi as handle_membarrier_ipi, handle_ipi_on as handle_membarrier_ipi_on,
     pending_on as membarrier_pending_on, synchronize_cpus,
 };
 pub use migration::MigrationContext;
-pub use operation::spawn_user_process;
+pub use native_abi::{ExecPhase, UserAbiKind};
+pub use operation::{NativeExternalControl, spawn_user_process};
 pub use pid::{PidNamespace, PidRegistry, PidT};
 pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};
 pub use process_ops::{
@@ -117,13 +124,14 @@ pub use scheduler::{
     balance_once, borrow_current_task_internal, current_cpu_id, current_task,
     current_task_cpu_time_ns, current_task_direct, current_task_fast, current_task_fast_direct,
     current_task_fast_internal, current_task_handoff_target, current_task_id, current_task_on,
-    current_task_ref, defer_task_wake, defer_timer_tick, drain_deferred_timer_tick, enqueue_task,
-    enqueue_task_deferred, enqueue_task_preferred, enqueue_task_preferred_for_handoff,
-    enqueue_task_with_hint, group_exit_wakeup, idle_task, init, init_task, install_idle,
-    is_cpu_active, is_cpu_online, is_ready, is_ready_direct, is_ready_internal, mark_cpu_online,
-    migrate_task, needs_resched, needs_resched_current, now_ns_direct, now_ns_public, offline_cpu,
-    on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, refresh_user_return_work_on,
-    register_cpu, register_sleep_deadline, reprogram_current_deadline, request_balance,
+    current_task_ref, defer_pi_effective_update, defer_task_wake, defer_timer_tick,
+    drain_deferred_timer_tick, enqueue_task, enqueue_task_deferred, enqueue_task_preferred,
+    enqueue_task_preferred_for_handoff, enqueue_task_with_hint, group_exit_wakeup, idle_task, init,
+    init_task, install_idle, is_cpu_active, is_cpu_online, is_ready, is_ready_direct,
+    is_ready_internal, mark_cpu_online, migrate_task, native_thread_exit_wakeup, needs_resched,
+    needs_resched_current, now_ns_direct, now_ns_public, offline_cpu, on_timer_tick,
+    online_cpu_mask, pid_count, preempt_if_needed, refresh_user_return_work_on, register_cpu,
+    register_sleep_deadline, reprogram_current_deadline, request_balance,
     request_post_syscall_handoff, request_post_syscall_handoff_to, request_resched, root_pid_ns,
     run_post_syscall_handoff, run_post_syscall_handoff_lazy, sched_rr_timeslice_ms,
     sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag,
@@ -133,7 +141,8 @@ pub use scheduler::{
 };
 pub use scheduler::{
     DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
-    reserve_deadline_observer_id,
+    register_deadline_observer_deferred, reserve_deadline_observer_id,
+    try_register_deadline_observer, try_register_deadline_observer_deferred,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
@@ -149,14 +158,15 @@ pub use scheduler_state::{
     CpuSchedState, HandoffReason, HandoffTarget, SchedDomainStats, Scheduler, TopologySnapshot,
 };
 pub use signal::{
-    DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
-    SigSet, SignalNumber, SignalObserver, SignalState,
+    DefaultAction, PreparedSignalActions, SharedSignal, SigAction, SigActionFlags, SigHandler,
+    SigInfo, SigProcMaskHow, SigSet, SignalNumber, SignalObserver, SignalState,
 };
 pub use spawn::activate_task_with_cpu_hint;
 pub use spawn::{
     SpawnKind, abort_new_task, activate_task, clone_task, exit_task, kthread_create,
     kthread_finish, kthread_spawn, kthread_spawn_on_cpu, list_zombie_children, reap_child,
-    reap_matching, reparent_to_init, spawn_child,
+    reap_matching, reap_native_child, reparent_to_init, spawn_child, spawn_native_child,
+    spawn_native_thread,
 };
 pub use task::{
     DEFAULT_TIMER_SLACK_NS, ExecutionActionClaim, ExecutionScopeKind, ExitCode, RobustListState,

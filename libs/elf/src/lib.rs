@@ -22,12 +22,14 @@ mod detect;
 mod error;
 mod image;
 mod linux;
+mod reader;
 mod types;
 
 pub use detect::parse;
 pub use error::ElfError;
 pub use image::Image;
-pub use linux::LinuxElfImage;
+pub use linux::{ElfFileType, ElfLoadSegment, LinuxElfImage, LinuxElfMetadata, read_linux_elf};
+pub use reader::{ElfReadAt, ElfReadError, ElfReadLimits};
 pub use types::{AddressWidth, Arch, Segment, SegmentPerms};
 
 /// 强制链接器保留镜像解析直接符号目录。

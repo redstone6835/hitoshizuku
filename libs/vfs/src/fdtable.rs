@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::file::File;
 use crate::vfs::limits::VfsLimits;
-use crate::vfs::sync::Spinlock;
+use crate::vfs::sync::{Spinlock, SpinlockGuard};
 
 static FDTABLE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static FDTABLE_CREATED: AtomicUsize = AtomicUsize::new(0);
@@ -108,6 +108,53 @@ impl FdFlags {
     }
 }
 
+/// `FdTable` 在某一代际中的单个描述符视图。
+///
+/// 快照持有 `File` 的共享引用，因此调用方可以在不继续持有 fdtable 锁的情况下
+/// 完成 exec 资源规划；`flags` 是描述符属性，不可从 `File` 本身恢复。
+pub struct FdDescriptorSnapshot {
+    fd: Fd,
+    file: Arc<File>,
+    flags: FdFlags,
+}
+
+impl FdDescriptorSnapshot {
+    pub const fn fd(&self) -> Fd {
+        self.fd
+    }
+
+    pub fn file(&self) -> &Arc<File> {
+        &self.file
+    }
+
+    pub const fn flags(&self) -> FdFlags {
+        self.flags
+    }
+}
+
+/// 在 fdtable 同一把锁下取得的描述符集合与代际。
+pub struct FdTableSnapshot {
+    generation: u64,
+    descriptors: Vec<FdDescriptorSnapshot>,
+}
+
+/// exec 提交前取得的 fdtable 代际租约。
+///
+/// 租约存活期间持有表锁，使代际重验与新资源表发布之间不存在修改窗口。
+pub struct FdTableGenerationLease<'a> {
+    _guard: SpinlockGuard<'a, FdTableInner>,
+}
+
+impl FdTableSnapshot {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn descriptors(&self) -> &[FdDescriptorSnapshot] {
+        &self.descriptors
+    }
+}
+
 /// 文件描述符表中的单个条目。
 struct FdEntry {
     /// 指向打开文件的共享引用。多个 fd（`dup`/`dup2`）可共享同一 `File`。
@@ -115,6 +162,7 @@ struct FdEntry {
     /// 该描述符的标志（目前只有 CLOEXEC）。
     flags: FdFlags,
     fd_reference_live: bool,
+    suppress_drop_notification: bool,
 }
 
 struct RemovedFd {
@@ -130,6 +178,23 @@ impl FdEntry {
             file,
             flags,
             fd_reference_live: true,
+            suppress_drop_notification: false,
+        }
+    }
+
+    fn new_unpublished(file: Arc<File>, flags: FdFlags) -> Self {
+        Self {
+            file,
+            flags,
+            fd_reference_live: false,
+            suppress_drop_notification: false,
+        }
+    }
+
+    fn activate_fd_reference(&mut self) {
+        if !self.fd_reference_live {
+            self.file.acquire_fd_reference();
+            self.fd_reference_live = true;
         }
     }
 
@@ -191,6 +256,8 @@ struct FdTableInner {
     hard_limit: u32,
     /// fd 分配位图：第 i 位为 1 表示 fd=i 已被占用。
     bitmap: Vec<u64>,
+    /// 每次可观察状态变化后递增，供 exec 在提交前重验快照。
+    generation: u64,
 }
 
 impl FdTableInner {
@@ -201,7 +268,13 @@ impl FdTableInner {
             limit,
             hard_limit,
             bitmap: alloc::vec![0u64; bitmap_words(hard_limit)],
+            generation: 0,
         }
+    }
+
+    #[inline]
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// 在位图中标记 fd 为已占用。
@@ -284,6 +357,7 @@ impl FdTableInner {
         if old.is_none() {
             self.count += 1;
         }
+        self.bump_generation();
         old
     }
 
@@ -294,6 +368,7 @@ impl FdTableInner {
         if entry.is_some() {
             self.bitmap_clear(fd);
             self.count -= 1;
+            self.bump_generation();
         }
         entry
     }
@@ -553,7 +628,10 @@ impl FdTable {
     pub fn set_fd_flags(&self, fd: Fd, flags: FdFlags) -> VfsResult<()> {
         let mut inner = self.inner.lock();
         let entry = inner.get_mut(fd.0).ok_or(VfsError::BadFileDescriptor)?;
-        entry.flags = flags;
+        if entry.flags != flags {
+            entry.flags = flags;
+            inner.bump_generation();
+        }
         Ok(())
     }
 
@@ -568,9 +646,13 @@ impl FdTable {
 
     /// 设置描述符标志。
     pub fn set_flags(&self, fd: Fd, flags: FdFlags) -> VfsResult<()> {
-        match self.inner.lock().get_mut(fd.0) {
+        let mut inner = self.inner.lock();
+        match inner.get_mut(fd.0) {
             Some(e) => {
-                e.flags = flags;
+                if e.flags != flags {
+                    e.flags = flags;
+                    inner.bump_generation();
+                }
                 Ok(())
             }
             None => Err(VfsError::BadFileDescriptor),
@@ -646,6 +728,53 @@ impl FdTable {
         out
     }
 
+    /// 原子取得全部描述符、descriptor flags 和对应的 fdtable 代际。
+    ///
+    /// 条目按 fd 升序返回。快照创建完成后，调用方应在进入不可回退阶段前使用
+    /// [`FdTable::is_generation_current`] 重验代际。
+    pub fn snapshot_descriptors(&self) -> VfsResult<FdTableSnapshot> {
+        let inner = self.inner.lock();
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(inner.count)
+            .map_err(|_| VfsError::OutOfMemory)?;
+        for (i, &word) in inner.bitmap.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros();
+                let fd = i as u32 * 64 + bit;
+                remaining &= remaining - 1;
+                if let Some(entry) = inner.get(fd) {
+                    descriptors.push(FdDescriptorSnapshot {
+                        fd: Fd(fd),
+                        file: Arc::clone(&entry.file),
+                        flags: entry.flags,
+                    });
+                }
+            }
+        }
+        Ok(FdTableSnapshot {
+            generation: inner.generation,
+            descriptors,
+        })
+    }
+
+    /// 判断给定快照代际是否仍对应当前 fdtable 状态。
+    pub fn is_generation_current(&self, generation: u64) -> bool {
+        self.inner.lock().generation == generation
+    }
+
+    /// 读取当前代际，不创建描述符快照。
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().generation
+    }
+
+    /// 在代际匹配时取得发布租约；不匹配时保持 fdtable 不变。
+    pub fn lock_generation(&self, generation: u64) -> Option<FdTableGenerationLease<'_>> {
+        let guard = self.inner.lock();
+        (guard.generation == generation).then_some(FdTableGenerationLease { _guard: guard })
+    }
+
     /// 返回当前打开的描述符数量。
     pub fn len(&self) -> usize {
         self.inner.lock().count
@@ -658,19 +787,28 @@ impl FdTable {
     /// 调整每进程打开文件数软/硬限制。
     ///
     /// 已经打开的 fd 不会因为限制下调而被关闭；后续分配和 `dup` 必须同时满足
-    /// `fd < soft` 与 `fd < hard`。位图按需截断，避免软限制已降到 42 时仍从
-    /// 旧 hard_limit 4096 范围内找出高位 fd。
+    /// `fd < soft` 与 `fd < hard`。位图保留已有高编号条目，但分配路径只使用
+    /// 新 hard limit 覆盖的有效位。
     pub fn set_limits(&self, new_soft: u32, new_hard: u32) -> VfsResult<()> {
         let mut inner = self.inner.lock();
         if new_soft > new_hard {
             return Err(VfsError::OperationNotPermitted);
         }
+        let changed = inner.limit != new_soft || inner.hard_limit != new_hard;
         inner.limit = new_soft;
         inner.hard_limit = new_hard;
-        let words = bitmap_words(new_hard);
+        // 降低 hard limit 不会关闭已有描述符。位图必须继续覆盖 entries 中
+        // 保留的高编号 fd；valid_bits_mask 仍会阻止后续分配越过新 hard limit。
+        let words = bitmap_words(new_hard).max(bitmap_words(inner.entries.len() as u32));
         inner.bitmap.resize(words, 0);
-        for word_idx in 0..inner.bitmap.len() {
-            inner.bitmap[word_idx] &= inner.valid_bits_mask(word_idx);
+        inner.bitmap.fill(0);
+        for fd in 0..inner.entries.len() {
+            if inner.entries[fd].is_some() {
+                inner.bitmap_set(fd as u32);
+            }
+        }
+        if changed {
+            inner.bump_generation();
         }
         Ok(())
     }
@@ -682,6 +820,7 @@ impl FdTable {
                 return;
             }
             let upper = last.min(inner.hard_limit.saturating_sub(1));
+            let mut changed = false;
             for word_idx in 0..inner.bitmap.len() {
                 let word_start = word_idx as u32 * 64;
                 if word_start > upper {
@@ -696,9 +835,15 @@ impl FdTable {
                         continue;
                     }
                     if let Some(entry) = inner.get_mut(fd) {
-                        entry.flags = entry.flags.with(FdFlags::CLOEXEC);
+                        if !entry.flags.has(FdFlags::CLOEXEC) {
+                            entry.flags = entry.flags.with(FdFlags::CLOEXEC);
+                            changed = true;
+                        }
                     }
                 }
+            }
+            if changed {
+                inner.bump_generation();
             }
             return;
         }
@@ -864,25 +1009,85 @@ impl FdTable {
 
     /// 为 `fork` 创建当前描述符表的深拷贝。
     pub fn fork(&self) -> Self {
+        self.copy_where(|_| true)
+    }
+
+    /// 为成功 exec 预构造一张独立描述符表，只继承未设置 CLOEXEC 的条目。
+    ///
+    /// 过滤发生在源表锁内，且不会对被过滤条目调用关闭通知；因此 prepare 失败时
+    /// 原进程及文件关闭观察者都看不到任何变化。
+    pub fn fork_for_exec(&self) -> VfsResult<Self> {
+        self.try_copy_where(|flags| !flags.has(FdFlags::CLOEXEC), false)
+    }
+
+    fn copy_where(&self, retain: impl Fn(FdFlags) -> bool) -> Self {
+        self.try_copy_where(retain, true)
+            .expect("FdTable fork 资源预留失败")
+    }
+
+    fn try_copy_where(
+        &self,
+        retain: impl Fn(FdFlags) -> bool,
+        acquire_references: bool,
+    ) -> VfsResult<Self> {
         let inner = self.inner.lock();
-        let new_entries: Vec<Option<FdEntry>> = inner
-            .entries
-            .iter()
-            .map(|opt| {
-                opt.as_ref()
-                    .map(|e| FdEntry::new(Arc::clone(&e.file), e.flags))
-            })
-            .collect();
+        let mut new_entries = Vec::new();
+        new_entries
+            .try_reserve_exact(inner.entries.len())
+            .map_err(|_| VfsError::OutOfMemory)?;
+        for opt in &inner.entries {
+            let entry = opt
+                .as_ref()
+                .filter(|entry| retain(entry.flags))
+                .map(|entry| {
+                    if acquire_references {
+                        FdEntry::new(Arc::clone(&entry.file), entry.flags)
+                    } else {
+                        FdEntry::new_unpublished(Arc::clone(&entry.file), entry.flags)
+                    }
+                });
+            new_entries.push(entry);
+        }
+        let count = new_entries.iter().filter(|entry| entry.is_some()).count();
+        let bitmap_len = bitmap_words(inner.hard_limit).max(bitmap_words(new_entries.len() as u32));
+        let mut bitmap = Vec::new();
+        bitmap
+            .try_reserve_exact(bitmap_len)
+            .map_err(|_| VfsError::OutOfMemory)?;
+        bitmap.resize(bitmap_len, 0);
+        for (fd, entry) in new_entries.iter().enumerate() {
+            if entry.is_some() {
+                bitmap[fd / 64] |= 1u64 << (fd % 64);
+            }
+        }
         FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
         FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
-        FdTable {
+        Ok(FdTable {
             inner: Spinlock::new(FdTableInner {
                 entries: new_entries,
-                count: inner.count,
+                count,
                 limit: inner.limit,
                 hard_limit: inner.hard_limit,
-                bitmap: inner.bitmap.clone(),
+                bitmap,
+                generation: 0,
             }),
+        })
+    }
+
+    /// 在 exec 提交时把 prepare 阶段未发布的文件引用激活。
+    pub fn activate_fd_references(&self) {
+        let mut inner = self.inner.lock();
+        for entry in inner.entries.iter_mut().flatten() {
+            entry.activate_fd_reference();
+        }
+    }
+
+    /// 成功 exec 后，旧的私有表只抑制仍被新表继承的条目通知。
+    /// CLOEXEC 条目仍需正常触发关闭观察者和最后描述符引用通知。
+    pub fn suppress_drop_notifications_for_exec(&self) {
+        let mut inner = self.inner.lock();
+        for entry in inner.entries.iter_mut().flatten() {
+            entry.suppress_drop_notification = !entry.flags.has(FdFlags::CLOEXEC);
         }
     }
 }
@@ -898,7 +1103,9 @@ impl Drop for FdTable {
         for (fd, entry) in entries.into_iter().enumerate() {
             if let Some(entry) = entry {
                 let removed = RemovedFd::new(fd as u32, entry);
-                self.notify_fd_closed(&removed);
+                if !removed.entry.suppress_drop_notification {
+                    self.notify_fd_closed(&removed);
+                }
             }
         }
         FDTABLE_DROPPED.fetch_add(1, Ordering::Relaxed);

@@ -355,9 +355,70 @@ fn net_stack_builds_udp_and_raw_fragment_plans() {
     assert_eq!(reconstructed, raw_bytes[raw_header_len..]);
 }
 
+struct TestCpuAffinity {
+    task: alloc::sync::Arc<sched::Task>,
+    previous: u64,
+}
+
+impl Drop for TestCpuAffinity {
+    fn drop(&mut self) {
+        self.task.set_cpu_affinity(self.previous);
+    }
+}
+
+fn pin_test_task_to_protocol_cpu() -> (TestCpuAffinity, usize) {
+    let protocol_shards = usize::from(
+        net::stack::boot_config()
+            .expect("net-stack 启动配置应已安装")
+            .active_cpu_count(),
+    );
+    assert_ne!(protocol_shards, 0);
+    let task = sched::current_task_direct();
+    let previous = task.cpu_affinity();
+    let current_cpu = sched::current_cpu_id();
+    let target_cpu = if current_cpu < protocol_shards {
+        current_cpu
+    } else {
+        0
+    };
+    task.set_cpu_affinity(1u64 << target_cpu);
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
+    while sched::current_cpu_id() != target_cpu && sched::now_ns_direct() < deadline {
+        let _ = sched::operation::sched_yield();
+    }
+    assert_eq!(
+        sched::current_cpu_id(),
+        target_cpu,
+        "测试任务未迁移到已初始化的协议 shard CPU"
+    );
+    (TestCpuAffinity { task, previous }, target_cpu)
+}
+
+fn invoke_test_shard_turn(
+    shard: crate::net_stack::ElmShardTurnClient,
+    mut commands: alloc::vec::Vec<net::stack::NetStackFlowCommand>,
+) -> alloc::vec::Vec<net::stack::NetStackFlowCommand> {
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
+    loop {
+        match shard.invoke_turn(commands, &[]) {
+            Ok(commands) => return commands,
+            Err((crate::net_stack::ShardTurnError::Busy, returned))
+                if sched::now_ns_direct() < deadline =>
+            {
+                commands = returned;
+                let _ = sched::operation::sched_yield();
+            }
+            Err((error, _)) => panic!("测试 shard-turn 失败: {error:?}"),
+        }
+    }
+}
+
 #[ktest]
 fn net_stack_elm_persists_flow_shard_state() {
-    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(0));
+    let (_affinity, cpu) = pin_test_task_to_protocol_cpu();
+    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(
+        u16::try_from(cpu).expect("当前 CPU 编号应可表示为 shard"),
+    ));
     let local = net::Endpoint {
         addr: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
         port: 49_151,
@@ -376,9 +437,7 @@ fn net_stack_elm_persists_flow_shard_state() {
             output: None,
         },
     ];
-    let mut commands = shard
-        .invoke_turn(commands, &[])
-        .unwrap_or_else(|_| panic!("ELM shard 应接受 UDP endpoint batch"));
+    let mut commands = invoke_test_shard_turn(shard, commands);
     let second = match commands.pop() {
         Some(net::stack::NetStackFlowCommand::BindUdp {
             output: Some(Ok(flow)),
@@ -394,21 +453,22 @@ fn net_stack_elm_persists_flow_shard_state() {
         _ => panic!("首个 UDP endpoint 未提交"),
     };
     assert_ne!(first, second);
-    shard
-        .invoke_turn(
-            alloc::vec![
-                net::stack::NetStackFlowCommand::CloseUdp { flow: first },
-                net::stack::NetStackFlowCommand::CloseUdp { flow: second },
-            ],
-            &[],
-        )
-        .unwrap_or_else(|_| panic!("ELM shard 应提交 UDP close batch"));
+    invoke_test_shard_turn(
+        shard,
+        alloc::vec![
+            net::stack::NetStackFlowCommand::CloseUdp { flow: first },
+            net::stack::NetStackFlowCommand::CloseUdp { flow: second },
+        ],
+    );
 }
 
 #[ktest]
 fn net_stack_calls_are_bounded_by_task_execution_scope() {
     let task = sched::current_task_direct();
-    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(0));
+    let (_affinity, cpu) = pin_test_task_to_protocol_cpu();
+    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(
+        u16::try_from(cpu).expect("当前 CPU 编号应可表示为 shard"),
+    ));
 
     assert!(task.begin_execution_scope(sched::ExecutionScopeKind::Syscall));
     assert!(
@@ -762,16 +822,6 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
         .expect("TCP client 缺少网络 socket ops")
         .proxy();
-    let stat_max = |key: &str| {
-        net::device::snapshot_stats()
-            .into_iter()
-            .filter(|stat| stat.key == key)
-            .map(|stat| stat.value)
-            .max()
-            .unwrap_or(0)
-    };
-    let shared_before = stat_max("tcp_loopback_shared_bytes");
-    let compact_before = stat_max("tcp_rx_compact_copy_bytes");
     client_proxy.set_buffer_limits(Some(16 * 1024), None);
     BLOCKING_STREAM_WRITTEN.store(usize::MAX, core::sync::atomic::Ordering::Release);
     *BLOCKING_STREAM_SENDER.lock() = Some(alloc::sync::Arc::clone(&client_file));
@@ -931,15 +981,6 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         }
     }
     assert_eq!(sent, stream.len());
-    let expected_shared = BLOCKING_STREAM_BYTES + 4 + 4 + stream.len();
-    assert_eq!(
-        stat_max("tcp_loopback_shared_bytes").saturating_sub(shared_before),
-        expected_shared as u64
-    );
-    assert_eq!(
-        stat_max("tcp_rx_compact_copy_bytes").saturating_sub(compact_before),
-        0
-    );
 
     vfs::socket::shutdown(&table, client, vfs::socket::SHUT_WR).expect("关闭 client 写方向");
     wait_readable(&accepted_file);

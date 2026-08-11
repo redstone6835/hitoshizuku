@@ -107,13 +107,13 @@ fn parse_valid_elf64_pie() {
 fn parse_valid_elf64_with_interpreter() {
     let interp = b"/lib/ld-linux.so.1\0";
     let hdr = elf64_header(0x10000, 2, 3, 0xF3); // DYN, RISC-V
-    let load = pheader_load(176, 0x10000, 0x100, 0x100, 5);
-    let interp_phdr = pheader_interp(176 + 0x100, interp.len() as u64);
+    let load = pheader_load(0x1000, 0x10000, 0x100, 0x100, 5);
+    let interp_phdr = pheader_interp(0x1100, interp.len() as u64);
     let mut v = Vec::new();
     v.extend_from_slice(&hdr);
     v.extend_from_slice(&load[..]);
     v.extend_from_slice(&interp_phdr[..]);
-    v.resize(176 + 0x100, 0);
+    v.resize(0x1100, 0);
     v.extend_from_slice(interp);
     let img = parse(&v).expect("parse ELF with interpreter");
     assert_eq!(img.arch(), Arch::Riscv64);

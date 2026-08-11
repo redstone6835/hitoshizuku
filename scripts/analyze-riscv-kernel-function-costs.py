@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -32,7 +33,7 @@ from rv_instruction_profile_io import (
 )
 
 
-OUTPUT_SCHEMA = "mygo.riscv-kernel-function-costs.v2"
+OUTPUT_SCHEMA = "mygo.riscv-kernel-function-costs.v3"
 ELM_INTERFACE_SCHEMA = "ELM-KERNEL-INTERFACE-V1"
 ELM_API_PREFIX = "__elm_kernel_api_"
 VCPU_COMM = re.compile(r"CPU ([0-9]+)/TCG\Z")
@@ -211,6 +212,500 @@ class ElmApiMetadata:
     rust_name: str
     linker_symbol: str
     contract: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RiscvDisassembledInstruction:
+    """objdump 中的一条指令以及所在的 ELF 函数地址。"""
+
+    address: int
+    mnemonic: str
+    operands: str
+    function_address: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class DirectCallGraph:
+    """静态可解析的 direct-call 图（边方向为 caller -> callee）。"""
+
+    edges: dict[FunctionSymbol, set[FunctionSymbol]]
+    instruction_count: int
+    call_site_count: int
+    resolved_call_site_count: int
+    unresolved_call_site_count: int
+    resolved_tail_transfer_site_count: int
+    tail_edges: frozenset[tuple[FunctionSymbol, FunctionSymbol]]
+
+
+@dataclasses.dataclass(frozen=True)
+class InclusiveClosure:
+    """SCC 压缩后的可达闭包，成员集合不包含重复路径。"""
+
+    members: dict[FunctionSymbol, frozenset[FunctionSymbol]]
+    component_count: int
+    recursive_component_count: int
+
+
+OBJDUMP_FUNCTION_LINE = re.compile(
+    r"^\s*([0-9a-fA-F]+)\s+<[^>]+>:\s*$"
+)
+OBJDUMP_INSTRUCTION_LINE = re.compile(
+    r"^\s*([0-9a-fA-F]+):\s*(.*?)\s*$"
+)
+REGISTER_ALIASES = {
+    "x1": "ra",
+    "x5": "t0",
+    "x6": "t1",
+    "x7": "t2",
+    "x28": "t3",
+    "x29": "t4",
+    "x30": "t5",
+    "x31": "t6",
+    "x0": "zero",
+}
+HEX_NUMBER = re.compile(r"(?<![A-Za-z0-9_])(?:0x)?[0-9a-fA-F]+")
+TARGET_WITH_SYMBOL = re.compile(r"((?:0x)?[0-9a-fA-F]+)\s*<[^>]+>")
+JALR_OPERANDS = re.compile(
+    r"^(?:(?P<rd>[A-Za-z0-9]+)\s*,\s*)?"
+    r"(?P<offset>[+-]?(?:0x)?[0-9a-fA-F]+)\((?P<base>[A-Za-z0-9]+)\)"
+)
+
+
+def normalize_register(value: str) -> str:
+    register = value.strip().lower()
+    return REGISTER_ALIASES.get(register, register)
+
+
+def parse_integer(value: str) -> int | None:
+    token = value.strip().lower()
+    try:
+        return int(token, 0)
+    except ValueError:
+        if token.startswith("-"):
+            try:
+                return -int(token[1:], 16)
+            except ValueError:
+                return None
+        try:
+            return int(token, 16)
+        except ValueError:
+            return None
+
+
+def parse_target_integer(value: str) -> int | None:
+    token = value.strip().lower()
+    try:
+        return (
+            int(token, 0)
+            if token.startswith(("0x", "+0x", "-0x"))
+            else int(token, 16)
+        )
+    except ValueError:
+        return None
+
+
+def parse_riscv_objdump(content: str) -> list[RiscvDisassembledInstruction]:
+    """解析 GNU/LLVM RISC-V objdump 的函数头和指令行。
+
+    调用目标在后续阶段解析，因为 ``auipc``+``jalr`` 需要查看相邻指令。
+    ``--no-show-raw-insn`` 的输出不含机器码；若调用方没有该选项，函数也会
+    跳过前面的十六进制机器码后读取助记符。
+    """
+
+    result: list[RiscvDisassembledInstruction] = []
+    function_address: int | None = None
+    for line in content.splitlines():
+        function_match = OBJDUMP_FUNCTION_LINE.match(line)
+        if function_match is not None:
+            function_address = int(function_match.group(1), 16)
+            continue
+        instruction_match = OBJDUMP_INSTRUCTION_LINE.match(line)
+        if instruction_match is None:
+            continue
+        address = int(instruction_match.group(1), 16)
+        body = instruction_match.group(2).strip()
+        if not body:
+            continue
+        tokens = body.split()
+        mnemonic_index = next(
+            (
+                token_index
+                for token_index, token in enumerate(tokens)
+                if re.match(r"^[A-Za-z.][A-Za-z0-9_.]*$", token)
+                and not (
+                    re.fullmatch(r"[0-9a-fA-F]+", token)
+                    and len(token) in {2, 4, 8}
+                )
+            ),
+            None,
+        )
+        if mnemonic_index is None:
+            continue
+        mnemonic = tokens[mnemonic_index].lower()
+        operands = " ".join(tokens[mnemonic_index + 1 :])
+        result.append(
+            RiscvDisassembledInstruction(
+                address, mnemonic, operands, function_address
+            )
+        )
+    return result
+
+
+def _target_from_operands(operands: str) -> int | None:
+    """读取 objdump 在 ``# address <symbol>`` 中给出的绝对目标地址。"""
+
+    comment = operands.split("#", 1)[1] if "#" in operands else ""
+    match = TARGET_WITH_SYMBOL.search(comment)
+    if match is not None:
+        return parse_target_integer(match.group(1))
+    if comment:
+        match = HEX_NUMBER.search(comment)
+        if match is not None:
+            return parse_target_integer(match.group(0))
+    match = TARGET_WITH_SYMBOL.search(operands)
+    if match is not None:
+        return parse_target_integer(match.group(1))
+    return None
+
+
+def _split_operands(operands: str) -> list[str]:
+    return [part.strip() for part in operands.split(",") if part.strip()]
+
+
+def _sign_extend(value: int, bits: int) -> int:
+    sign = 1 << (bits - 1)
+    return (value ^ sign) - sign
+
+
+def _direct_call_target(
+    instructions: Sequence[RiscvDisassembledInstruction], index: int
+) -> int | None:
+    instruction = instructions[index]
+    mnemonic = instruction.mnemonic
+    operands = instruction.operands
+    parts = _split_operands(operands)
+    if mnemonic in {"call", "call.t0"}:
+        return _target_from_operands(operands)
+    if mnemonic == "jal":
+        # ``jal target`` is the ra pseudo-instruction; ``jal zero,target`` is
+        # an unconditional jump and must not contribute a call edge.
+        if len(parts) == 1:
+            target = _target_from_operands(operands)
+            return target if target is not None else parse_target_integer(parts[0])
+        if not parts or normalize_register(parts[0]) != "ra":
+            return None
+        target = _target_from_operands(operands)
+        if target is not None:
+            return target
+        return parse_target_integer(parts[1]) if len(parts) >= 2 else None
+    if mnemonic != "jalr":
+        return None
+
+    match = JALR_OPERANDS.match(operands)
+    if match is None:
+        return None
+    rd = normalize_register(match.group("rd") or "ra")
+    if rd != "ra":
+        return None
+    target = _target_from_operands(operands)
+    if target is not None:
+        return target
+
+    # Linker-relaxed calls retain an AUIPC immediately before JALR.  Decode the
+    # pair when objdump did not print a relocation target comment.
+    if index == 0:
+        return None
+    previous = instructions[index - 1]
+    if previous.function_address != instruction.function_address:
+        return None
+    if (
+        instruction.address <= previous.address
+        or instruction.address - previous.address > 8
+    ):
+        return None
+    if previous.mnemonic != "auipc":
+        return None
+    auipc_parts = _split_operands(previous.operands)
+    if len(auipc_parts) != 2:
+        return None
+    auipc_register = normalize_register(auipc_parts[0])
+    if normalize_register(match.group("base")) != auipc_register:
+        return None
+    immediate = parse_integer(auipc_parts[1])
+    offset = parse_integer(match.group("offset"))
+    if immediate is None or offset is None:
+        return None
+    # GNU objdump prints the 20-bit AUIPC immediate before the implicit shift.
+    return previous.address + (_sign_extend(immediate, 20) << 12) + offset
+
+
+def _is_call_site(instruction: RiscvDisassembledInstruction) -> bool:
+    if instruction.mnemonic in {"call", "call.t0"}:
+        return True
+    parts = _split_operands(instruction.operands)
+    if instruction.mnemonic == "jal":
+        return len(parts) == 1 or (
+            len(parts) >= 2 and normalize_register(parts[0]) == "ra"
+        )
+    if instruction.mnemonic != "jalr":
+        return False
+    match = JALR_OPERANDS.match(instruction.operands)
+    if match is not None:
+        return normalize_register(match.group("rd") or "ra") == "ra"
+    # GNU objdump uses ``jalr register`` for the indirect ra-link pseudo-op.
+    return len(parts) == 1 and re.fullmatch(r"[A-Za-z0-9]+", parts[0]) is not None
+
+
+def build_direct_call_graph(
+    instructions: Sequence[RiscvDisassembledInstruction],
+    symbols: Sequence[FunctionSymbol],
+    resolver: SymbolResolver,
+) -> DirectCallGraph:
+    """从反汇编构建可解析 direct-call 图。
+
+    只有目标能定位到正式 ELF 函数符号的调用才形成图边；未知的 ELF 内部
+    目标和动态 ELM 目标仍计入 ``unresolved_call_site_count``，避免静默夸大
+    inclusive 成本。
+    """
+
+    edges: dict[FunctionSymbol, set[FunctionSymbol]] = {
+        symbol: set() for symbol in symbols if symbol.address >= 0
+    }
+    call_sites = 0
+    resolved = 0
+    unresolved = 0
+    tail_edges: set[tuple[FunctionSymbol, FunctionSymbol]] = set()
+    for index, instruction in enumerate(instructions):
+        if not _is_call_site(instruction):
+            if instruction.mnemonic not in {"j", "tail"}:
+                continue
+            target = _target_from_operands(instruction.operands)
+            if target is None:
+                continue
+            caller = resolver.resolve(instruction.address)
+            callee = resolver.resolve(target)
+            if caller.address < 0 or callee.address < 0 or caller == callee:
+                continue
+            edges.setdefault(caller, set()).add(callee)
+            tail_edges.add((caller, callee))
+            continue
+        call_sites += 1
+        target = _direct_call_target(instructions, index)
+        if target is None:
+            unresolved += 1
+            continue
+        caller = resolver.resolve(instruction.address)
+        callee = resolver.resolve(target)
+        if caller.address < 0 or callee.address < 0:
+            unresolved += 1
+            continue
+        edges.setdefault(caller, set()).add(callee)
+        resolved += 1
+    return DirectCallGraph(
+        edges,
+        len(instructions),
+        call_sites,
+        resolved,
+        unresolved,
+        len(tail_edges),
+        frozenset(tail_edges),
+    )
+
+
+def load_direct_call_graph(
+    kernel: Path,
+    objdump: str,
+    symbols: Sequence[FunctionSymbol],
+    resolver: SymbolResolver,
+) -> DirectCallGraph:
+    """运行交叉 objdump 并构建静态 direct-call 图。"""
+
+    process = subprocess.run(
+        [objdump, "-d", "--wide", "--no-show-raw-insn", str(kernel)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    require(
+        process.returncode == 0,
+        f"objdump 反汇编失败（{objdump}）：{process.stderr.strip()}",
+    )
+    instructions = parse_riscv_objdump(process.stdout)
+    require(instructions, "objdump 没有产生可解析的 RISC-V 指令")
+    return build_direct_call_graph(instructions, symbols, resolver)
+
+
+def select_objdump(requested: str | None) -> str:
+    if requested is not None:
+        return requested
+    for candidate in (
+        "riscv64-linux-gnu-objdump",
+        "riscv64-unknown-elf-objdump",
+        "llvm-objdump",
+        "objdump",
+    ):
+        if shutil.which(candidate) is not None:
+            return candidate
+    raise FunctionCostError("没有找到可用的 RISC-V objdump")
+
+
+def _strongly_connected_components(
+    graph: Mapping[FunctionSymbol, Iterable[FunctionSymbol]],
+) -> tuple[list[tuple[FunctionSymbol, ...]], dict[FunctionSymbol, int]]:
+    """Kosaraju SCC，使用显式栈以覆盖较深的内核调用链。"""
+
+    nodes = set(graph)
+    for targets in graph.values():
+        nodes.update(targets)
+    adjacency: dict[FunctionSymbol, tuple[FunctionSymbol, ...]] = {}
+    for node in nodes:
+        adjacency[node] = tuple(
+            sorted(
+                set(graph.get(node, ())),
+                key=lambda item: (item.address, item.name),
+            )
+        )
+    for node in nodes:
+        adjacency.setdefault(node, tuple())
+    reverse: dict[FunctionSymbol, list[FunctionSymbol]] = {
+        node: [] for node in nodes
+    }
+    for caller, targets in adjacency.items():
+        for callee in targets:
+            reverse[callee].append(caller)
+    for node in reverse:
+        reverse[node].sort(key=lambda item: (item.address, item.name))
+
+    visited: set[FunctionSymbol] = set()
+    finish_order: list[FunctionSymbol] = []
+    for root in sorted(nodes, key=lambda item: (item.address, item.name)):
+        if root in visited:
+            continue
+        visited.add(root)
+        stack: list[tuple[FunctionSymbol, int]] = [(root, 0)]
+        while stack:
+            node, next_index = stack[-1]
+            if next_index < len(adjacency[node]):
+                target = adjacency[node][next_index]
+                stack[-1] = (node, next_index + 1)
+                if target not in visited:
+                    visited.add(target)
+                    stack.append((target, 0))
+            else:
+                finish_order.append(node)
+                stack.pop()
+
+    components: list[tuple[FunctionSymbol, ...]] = []
+    assigned: set[FunctionSymbol] = set()
+    for root in reversed(finish_order):
+        if root in assigned:
+            continue
+        assigned.add(root)
+        component: list[FunctionSymbol] = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for target in reverse[node]:
+                if target not in assigned:
+                    assigned.add(target)
+                    stack.append(target)
+        components.append(
+            tuple(sorted(component, key=lambda item: (item.address, item.name)))
+        )
+    component_of = {
+        member: component_id
+        for component_id, members in enumerate(components)
+        for member in members
+    }
+    return components, component_of
+
+
+def compute_inclusive_closure(
+    graph: Mapping[FunctionSymbol, Iterable[FunctionSymbol]],
+) -> InclusiveClosure:
+    """返回每个函数可达的唯一函数集合（含自身）。"""
+
+    components, component_of = _strongly_connected_components(graph)
+    outgoing: list[set[int]] = [set() for _ in components]
+    for caller, targets in graph.items():
+        caller_component = component_of[caller]
+        for callee in targets:
+            callee_component = component_of[callee]
+            if caller_component != callee_component:
+                outgoing[caller_component].add(callee_component)
+
+    # Condensation graph is a DAG.  A reverse topological pass lets each
+    # component reuse already-built descendant sets and counts a diamond's
+    # shared child exactly once.
+    indegree = [0] * len(components)
+    for targets in outgoing:
+        for target in targets:
+            indegree[target] += 1
+    queue = collections.deque(
+        component_id for component_id, degree in enumerate(indegree) if degree == 0
+    )
+    topological: list[int] = []
+    while queue:
+        component_id = queue.popleft()
+        topological.append(component_id)
+        for target in sorted(outgoing[component_id]):
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                queue.append(target)
+    require(len(topological) == len(components), "SCC condensation graph 不是 DAG")
+    component_closure: list[set[int]] = [set() for _ in components]
+    for component_id in reversed(topological):
+        closure = component_closure[component_id]
+        closure.add(component_id)
+        for target in outgoing[component_id]:
+            closure.update(component_closure[target])
+    members = {
+        member: frozenset(
+            component_member
+            for component_id in component_closure[component_of[member]]
+            for component_member in components[component_id]
+        )
+        for member in component_of
+    }
+    recursive_count = sum(len(component) > 1 for component in components)
+    recursive_count += sum(
+        len(component) == 1
+        and component[0] in graph
+        and component[0] in set(graph.get(component[0], ()))
+        for component in components
+    )
+    return InclusiveClosure(members, len(components), recursive_count)
+
+
+def inclusive_metric(
+    exclusive: Mapping[FunctionSymbol, float],
+    closure: InclusiveClosure,
+) -> dict[FunctionSymbol, float]:
+    """按静态可达闭包对任意函数标量成本做 inclusive 求和。"""
+
+    return {
+        symbol: math.fsum(
+            exclusive.get(callee, 0.0) for callee in reachable
+        )
+        for symbol, reachable in closure.members.items()
+    }
+
+
+def inclusive_descriptor_counts(
+    exclusive: Mapping[FunctionSymbol, Mapping[int, float]],
+    closure: InclusiveClosure,
+) -> dict[FunctionSymbol, dict[int, float]]:
+    """按闭包合并 descriptor 计数，供成本和区间字段共同使用。"""
+
+    result: dict[FunctionSymbol, dict[int, float]] = {}
+    for symbol, reachable in closure.members.items():
+        counters: collections.Counter[int] = collections.Counter()
+        for callee in reachable:
+            counters.update(exclusive.get(callee, {}))
+        result[symbol] = dict(counters)
+    return result
 
 
 def parse_key_value_manifest(content: str) -> dict[str, str]:
@@ -599,6 +1094,10 @@ def share_bounds(
     def root(*, maximize: bool) -> float:
         left = 0.0
         right = 1.0
+        while difference(right, maximize=maximize) >= 0.0:
+            left = right
+            right *= 2.0
+            require(right <= 2.0**40, "成本占比求根没有收敛上界")
         for _ in range(80):
             middle = (left + right) / 2.0
             if difference(middle, maximize=maximize) >= 0.0:
@@ -638,7 +1137,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--readelf", default="readelf")
     parser.add_argument("--cxxfilt", default="c++filt")
+    parser.add_argument("--objdump")
     arguments = parser.parse_args(argv)
+    objdump = select_objdump(arguments.objdump)
 
     run_dir = arguments.run_dir.resolve()
     kernel = (arguments.kernel or run_dir / "kernel-rv").resolve()
@@ -709,6 +1210,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     dynamic_code_symbol = FunctionSymbol(-3, 0, arguments.dynamic_code_label, "?")
     resolver = SymbolResolver(symbols, text_start, text_end, dynamic_code_symbol)
+    print("kernel-functions: 解析 ELF 静态 direct-call 图", file=os.sys.stderr)
+    call_graph_resolver = SymbolResolver(
+        symbols, text_start, text_end, dynamic_code_symbol
+    )
+    call_graph = load_direct_call_graph(
+        kernel, objdump, symbols, call_graph_resolver
+    )
+    inclusive_closure = compute_inclusive_closure(call_graph.edges)
     namespace = read_tid_namespace_tsv(run_dir / "tid-namespace-map.tsv")
     vcpu_host_tids = {
         entry.host_tid for entry in namespace.entries if VCPU_COMM.fullmatch(entry.comm)
@@ -878,6 +1387,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
 
+    # Inclusive 归因只沿静态 direct-call 闭包向下累加；特殊的未采样/未解析
+    # 桶不在 ELF 图中，因此保留其自身的 exclusive 计数，不虚构调用边。
+    inclusive_primary_counts = inclusive_descriptor_counts(
+        function_descriptor_counts, inclusive_closure
+    )
+    inclusive_alternative_counts = inclusive_descriptor_counts(
+        alternative_function_descriptor_counts, inclusive_closure
+    )
+    for symbol, counts in function_descriptor_counts.items():
+        inclusive_primary_counts.setdefault(symbol, dict(counts))
+    for symbol, counts in alternative_function_descriptor_counts.items():
+        inclusive_alternative_counts.setdefault(symbol, dict(counts))
+
     total_bounded_low = math.fsum(
         row.exact_kernel_count * float(row.low_ns)
         for row in descriptors.values()
@@ -947,7 +1469,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             for descriptor_id, count in counts.items()
             if descriptors[descriptor_id].strict
         )
+        inclusive_counts = inclusive_primary_counts.get(symbol, counts)
+        inclusive_alternative_by_descriptor = inclusive_alternative_counts.get(
+            symbol, alternative_counts_by_descriptor
+        )
+        inclusive_instruction_count = math.fsum(inclusive_counts.values())
+        inclusive_alternative_instruction_count = math.fsum(
+            inclusive_alternative_by_descriptor.values()
+        )
+        inclusive_bounded_count = math.fsum(
+            count
+            for descriptor_id, count in inclusive_counts.items()
+            if descriptors[descriptor_id].bounded
+        )
+        inclusive_low_cost = math.fsum(
+            count * float(descriptors[descriptor_id].low_ns)
+            for descriptor_id, count in inclusive_counts.items()
+            if descriptors[descriptor_id].bounded
+        )
+        inclusive_high_cost = math.fsum(
+            count * float(descriptors[descriptor_id].high_ns)
+            for descriptor_id, count in inclusive_counts.items()
+            if descriptors[descriptor_id].bounded
+        )
+        inclusive_center_cost = math.fsum(
+            count * float(descriptors[descriptor_id].center_ns)
+            for descriptor_id, count in inclusive_counts.items()
+            if descriptors[descriptor_id].bounded
+        )
+        inclusive_alternative_center = math.fsum(
+            count * float(descriptors[descriptor_id].center_ns)
+            for descriptor_id, count in inclusive_alternative_by_descriptor.items()
+            if descriptors[descriptor_id].bounded
+        )
+        inclusive_strict_cost = math.fsum(
+            count * float(descriptors[descriptor_id].point_ns)
+            for descriptor_id, count in inclusive_counts.items()
+            if descriptors[descriptor_id].strict
+        )
         share_low, share_high = share_bounds(counts, descriptors)
+        inclusive_share_low, inclusive_share_high = share_bounds(
+            inclusive_counts, descriptors
+        )
         center_share = center_cost / total_center if total_center else 0.0
         alternative_center_share = (
             alternative_center / total_center if total_center else 0.0
@@ -976,6 +1539,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "sampled_kernel_tcg_task_clock_share": sampled_clock
             / mapped_kernel_clock,
             "descriptor_count": len(counts),
+            "inclusive_estimated_instruction_count": inclusive_instruction_count,
+            "inclusive_instruction_share": inclusive_instruction_count
+            / expected_kernel_count,
+            "inclusive_alternative_estimated_instruction_count": inclusive_alternative_instruction_count,
+            "inclusive_bounded_instruction_count": inclusive_bounded_count,
+            "inclusive_unpriced_instruction_count": inclusive_instruction_count
+            - inclusive_bounded_count,
+            "inclusive_bounded_cost_low_ns": inclusive_low_cost,
+            "inclusive_bounded_cost_high_ns": inclusive_high_cost,
+            "inclusive_diagnostic_context_center_cost_ns": inclusive_center_cost,
+            "inclusive_diagnostic_context_center_cost_share": (
+                inclusive_center_cost / total_center if total_center else 0.0
+            ),
+            "inclusive_conditional_model_share_low": inclusive_share_low,
+            "inclusive_conditional_model_share_high": inclusive_share_high,
+            "inclusive_alternative_diagnostic_center_cost_ns": inclusive_alternative_center,
+            "inclusive_alternative_diagnostic_center_cost_share": (
+                inclusive_alternative_center / total_center if total_center else 0.0
+            ),
+            "inclusive_strict_cost_ns": inclusive_strict_cost,
+            "inclusive_static_callee_count": max(
+                0, len(inclusive_closure.members.get(symbol, frozenset({symbol}))) - 1
+            ),
         }
         function_rows.append(row)
         function_row_by_symbol[symbol] = row
@@ -983,6 +1569,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         key=lambda row: (
             row["diagnostic_context_center_cost_ns"],
             row["sampled_kernel_tcg_task_clock_ns"],
+        ),
+        reverse=True,
+    )
+    inclusive_function_rows = sorted(
+        function_rows,
+        key=lambda row: (
+            row["inclusive_diagnostic_context_center_cost_ns"],
+            row["diagnostic_context_center_cost_ns"],
         ),
         reverse=True,
     )
@@ -1009,7 +1603,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     for symbol in sampled_function_clock:
         aliases = symbol.aliases or (symbol.name,)
         logical_symbols[(symbol.name, aliases)].append(symbol)
-
     logical_rows: list[dict[str, Any]] = []
     for key, raw_symbols in logical_symbols.items():
         name, aliases = key
@@ -1112,6 +1705,65 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "sampled_kernel_tcg_task_clock_share": sampled_clock
                 / mapped_kernel_clock,
                 "descriptor_count": len(counts),
+                "inclusive_estimated_instruction_count": math.fsum(
+                    row["inclusive_estimated_instruction_count"]
+                    for row in source_rows
+                ),
+                "inclusive_instruction_share": math.fsum(
+                    row["inclusive_estimated_instruction_count"]
+                    for row in source_rows
+                )
+                / expected_kernel_count,
+                "inclusive_alternative_estimated_instruction_count": math.fsum(
+                    row["inclusive_alternative_estimated_instruction_count"]
+                    for row in source_rows
+                ),
+                "inclusive_bounded_instruction_count": math.fsum(
+                    row["inclusive_bounded_instruction_count"]
+                    for row in source_rows
+                ),
+                "inclusive_unpriced_instruction_count": math.fsum(
+                    row["inclusive_unpriced_instruction_count"]
+                    for row in source_rows
+                ),
+                "inclusive_bounded_cost_low_ns": math.fsum(
+                    row["inclusive_bounded_cost_low_ns"] for row in source_rows
+                ),
+                "inclusive_bounded_cost_high_ns": math.fsum(
+                    row["inclusive_bounded_cost_high_ns"] for row in source_rows
+                ),
+                "inclusive_diagnostic_context_center_cost_ns": math.fsum(
+                    row["inclusive_diagnostic_context_center_cost_ns"]
+                    for row in source_rows
+                ),
+                "inclusive_diagnostic_context_center_cost_share": math.fsum(
+                    row["inclusive_diagnostic_context_center_cost_ns"]
+                    for row in source_rows
+                )
+                / total_center,
+                "inclusive_conditional_model_share_low": math.fsum(
+                    row["inclusive_conditional_model_share_low"] or 0.0
+                    for row in source_rows
+                ),
+                "inclusive_conditional_model_share_high": math.fsum(
+                    row["inclusive_conditional_model_share_high"] or 0.0
+                    for row in source_rows
+                ),
+                "inclusive_alternative_diagnostic_center_cost_ns": math.fsum(
+                    row["inclusive_alternative_diagnostic_center_cost_ns"]
+                    for row in source_rows
+                ),
+                "inclusive_alternative_diagnostic_center_cost_share": math.fsum(
+                    row["inclusive_alternative_diagnostic_center_cost_ns"]
+                    for row in source_rows
+                )
+                / total_center,
+                "inclusive_strict_cost_ns": math.fsum(
+                    row["inclusive_strict_cost_ns"] for row in source_rows
+                ),
+                "inclusive_static_callee_count": sum(
+                    row["inclusive_static_callee_count"] for row in source_rows
+                ),
             }
         )
     logical_rows.sort(
@@ -1213,6 +1865,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         reverse=True,
     )
+    inclusive_logical_rows = sorted(
+        logical_rows,
+        key=lambda row: (
+            row["inclusive_diagnostic_context_center_cost_ns"],
+            row["diagnostic_context_center_cost_ns"],
+        ),
+        reverse=True,
+    )
+    call_graph_rows = [
+        {
+            "caller_function": caller.name,
+            "caller_address": f"0x{caller.address:016x}",
+            "callee_function": callee.name,
+            "callee_address": f"0x{callee.address:016x}",
+            "call_kind": (
+                "static-direct-tail"
+                if (caller, callee) in call_graph.tail_edges
+                else "static-direct-call"
+            ),
+        }
+        for caller in sorted(call_graph.edges, key=lambda row: (row.address, row.name))
+        for callee in sorted(
+            call_graph.edges[caller], key=lambda row: (row.address, row.name)
+        )
+    ]
 
     primary_center_sum = math.fsum(
         row["diagnostic_context_center_cost_ns"] for row in function_rows
@@ -1270,6 +1947,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dynamic_pc_counts_available": False,
             "function_allocation_is_estimated": True,
             "cost_scope": "bounded microbenchmark-priced kernel instruction subset",
+            "inclusive_allocation": "unique transitive closure of statically resolved direct calls after SCC condensation",
+            "unprefixed_function_cost_fields_are_exclusive": True,
+            "inclusive_counts_shared_descendant_once": True,
+            "inclusive_global_sum_is_not_a_closure_check": True,
+            "inclusive_rank_scope": "functions with nonzero exclusive exposure in this trace",
         },
         "configuration": {
             "window_start_monotonic_ns": window_start,
@@ -1279,6 +1961,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "symbols": {
             "readelf": arguments.readelf,
             "cxxfilt": arguments.cxxfilt,
+            "objdump": objdump,
             "text_start": f"0x{text_start:016x}",
             "text_end": f"0x{text_end:016x}",
             "function_symbol_count": len(symbols),
@@ -1298,6 +1981,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             / sampled_tb_instructions,
             "sampled_clock_symbol_ratio": symbolized_kernel_clock
             / mapped_kernel_clock,
+        },
+        "direct_call_graph": {
+            "disassembled_instruction_count": call_graph.instruction_count,
+            "call_site_count": call_graph.call_site_count,
+            "resolved_call_site_count": call_graph.resolved_call_site_count,
+            "unresolved_or_indirect_call_site_count": call_graph.unresolved_call_site_count,
+            "resolved_tail_transfer_site_count": call_graph.resolved_tail_transfer_site_count,
+            "unique_edge_count": len(call_graph_rows),
+            "scc_count": inclusive_closure.component_count,
+            "recursive_scc_count": inclusive_closure.recursive_component_count,
+            "edge_direction": "caller-to-callee",
+            "scope": "jal ra,target, statically resolvable auipc+jalr/call forms, and cross-symbol direct tail transfers",
         },
         "sampling": {
             "all_perf_samples": len(samples),
@@ -1347,11 +2042,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "function_instruction_row_count": len(logical_instruction_rows),
         "symbol_instruction_row_count": len(instruction_rows),
         "top_functions": logical_rows[:50],
+        "top_inclusive_functions": inclusive_logical_rows[:50],
         "outputs": {
             "function_costs": "kernel-function-costs.csv",
             "symbol_costs": "kernel-symbol-costs.csv",
+            "inclusive_function_costs": "kernel-function-inclusive-costs.csv",
+            "inclusive_symbol_costs": "kernel-symbol-inclusive-costs.csv",
             "function_instructions": "kernel-function-instructions.csv",
             "symbol_instructions": "kernel-symbol-instructions.csv",
+            "direct_call_graph": "kernel-direct-call-graph.csv",
         },
         "limitations": [
             "本次插件没有按 guest PC 记录动态计数，函数计数由 task-clock 样本估计",
@@ -1359,11 +2058,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "restricted/unpriced 指令只计数，不进入 bounded 函数成本",
             "native QEMU 和未定位尾部无法回溯到 guest 函数",
             "函数占比是本次单轨迹的条件性估计，不是无条件 95% 置信区间",
+            "inclusive 仅覆盖 ELF 中静态可解析的 direct-call 闭包，函数指针、动态 ELM 和其他间接调用不会被猜测",
+            "没有 exclusive 暴露度的静态父函数不进入 inclusive 热点排名，避免把本次未观测入口误报为热点",
+            "采集数据没有调用栈或调用边频次，inclusive 是唯一静态可达函数集合的条件性聚合，不推断每个调用点的动态次数",
+            "inclusive 行之间会按调用层次重复计入同一后代，因此不能跨函数求和做全局闭合",
         ],
     }
 
     atomic_csv(output_dir / "kernel-function-costs.csv", list(logical_rows[0]), logical_rows)
     atomic_csv(output_dir / "kernel-symbol-costs.csv", list(function_rows[0]), function_rows)
+    atomic_csv(
+        output_dir / "kernel-function-inclusive-costs.csv",
+        list(inclusive_logical_rows[0]),
+        inclusive_logical_rows,
+    )
+    atomic_csv(
+        output_dir / "kernel-symbol-inclusive-costs.csv",
+        list(inclusive_function_rows[0]),
+        inclusive_function_rows,
+    )
     atomic_csv(
         output_dir / "kernel-function-instructions.csv",
         list(logical_instruction_rows[0]),
@@ -1373,6 +2086,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir / "kernel-symbol-instructions.csv",
         list(instruction_rows[0]),
         instruction_rows,
+    )
+    atomic_csv(
+        output_dir / "kernel-direct-call-graph.csv",
+        [
+            "caller_function",
+            "caller_address",
+            "callee_function",
+            "callee_address",
+            "call_kind",
+        ],
+        call_graph_rows,
     )
     atomic_json(output_dir / "summary.json", summary)
     print(

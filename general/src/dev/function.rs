@@ -14,6 +14,7 @@ use spin::mutex::Mutex;
 
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
+use crate::dev::dma::DmaContext;
 pub use crate::dev::naming::{
     StableName as FunctionProjectionName, StableNameAllocError as FunctionProjectionNameAllocError,
     StableNameAllocator as FunctionProjectionNameAllocator,
@@ -150,6 +151,14 @@ pub trait DeviceFunction: Send + Sync {
         _output: &mut [u8],
     ) -> Result<usize, DeviceFunctionInvokeError> {
         Err(DeviceFunctionInvokeError::Unsupported)
+    }
+    /// 返回该 function 的设备级 DMA 约束；没有 DMA 数据面的 function 返回 `None`。
+    fn dma_context(&self) -> Option<DmaContext> {
+        None
+    }
+    /// 判断 function 是否已经脱离底层设备。
+    fn is_gone(&self) -> bool {
+        false
     }
     /// 标记 function 已不可用，使旧句柄尽快停止访问底层设备。
     fn mark_gone(&self);
@@ -350,6 +359,10 @@ impl DeviceFunction for CharFunction {
         self.dev.mark_gone();
     }
 
+    fn is_gone(&self) -> bool {
+        !self.dev.is_active()
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -428,6 +441,10 @@ impl DeviceFunction for BlockFunction {
 
     fn mark_gone(&self) {
         self.dev.mark_gone();
+    }
+
+    fn is_gone(&self) -> bool {
+        !self.dev.is_active()
     }
 
     fn drain_io(&self) {

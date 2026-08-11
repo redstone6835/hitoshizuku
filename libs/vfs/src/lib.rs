@@ -40,7 +40,7 @@ pub mod sync;
 pub mod sysctl;
 pub mod timerfd;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cred::Credentials;
 use dentry::{Dentry, DentryCache, VfsRoot};
 use error::{VfsError, VfsResult};
@@ -127,7 +127,16 @@ pub struct VfsContext {
     pub mount_ns: Arc<MountNamespace>,
     cred: sync::Spinlock<Arc<Credentials>>,
     umask: sync::Spinlock<FileMode>,
+    /// exec 快照租约与 cwd/root/cred/umask 更新共用的变更门。
+    mutation_gate: sync::Spinlock<()>,
+    /// cwd/root/cred/umask 变化的代际，供 exec 事务重验共享 CLONE_FS 状态。
+    generation: AtomicU64,
     pub limits: Arc<VfsLimits>,
+}
+
+/// exec 持有期间禁止共享 `CLONE_FS` 方修改 VFS 上下文。
+pub struct VfsExecLease<'a> {
+    _gate: sync::SpinlockGuard<'a, ()>,
 }
 
 #[kernel_symbols::export]
@@ -158,6 +167,8 @@ impl VfsContext {
             mount_ns,
             cred: sync::Spinlock::new(cred),
             umask: sync::Spinlock::new(umask),
+            mutation_gate: sync::Spinlock::new(()),
+            generation: AtomicU64::new(0),
             limits,
         }
     }
@@ -193,6 +204,21 @@ impl VfsContext {
         Arc::clone(&self.cwd_state.lock().cwd_mount)
     }
 
+    /// 返回当前 VFS 上下文代际。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn lock_for_exec(&self) -> VfsExecLease<'_> {
+        VfsExecLease {
+            _gate: self.mutation_gate.lock(),
+        }
+    }
+
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     #[kernel_symbols::export(
         name = "vfs.VfsContext.set_cwd",
         contract = "kernel.vfs.context@1",
@@ -201,6 +227,7 @@ impl VfsContext {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn set_cwd(&self, new_cwd: Arc<Dentry>, new_mount: Arc<mount::Mount>) -> VfsResult<()> {
+        let _gate = self.mutation_gate.lock();
         if let Some(inode) = new_cwd.inode() {
             if inode.kind() != FileType::Directory {
                 return Err(VfsError::NotADirectory);
@@ -214,6 +241,7 @@ impl VfsContext {
         state.cwd = new_cwd;
         state.cwd_mount = new_mount;
         old_mount.dec_open();
+        self.bump_generation();
         Ok(())
     }
 
@@ -225,6 +253,7 @@ impl VfsContext {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn set_root(&self, new_root: Arc<Dentry>, new_mount: Arc<mount::Mount>) -> VfsResult<()> {
+        let _gate = self.mutation_gate.lock();
         if let Some(inode) = new_root.inode() {
             if inode.kind() != FileType::Directory {
                 return Err(VfsError::NotADirectory);
@@ -233,6 +262,7 @@ impl VfsContext {
             return Err(VfsError::NotFound);
         }
         self.root.set(new_root, new_mount);
+        self.bump_generation();
         Ok(())
     }
 
@@ -248,7 +278,9 @@ impl VfsContext {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn set_cred(&self, new_cred: Arc<Credentials>) {
+        let _gate = self.mutation_gate.lock();
         *self.cred.lock() = new_cred;
+        self.bump_generation();
     }
 
     #[kernel_symbols::export(
@@ -259,9 +291,11 @@ impl VfsContext {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn set_umask(&self, new_mask: FileMode) -> FileMode {
+        let _gate = self.mutation_gate.lock();
         let mut umask = self.umask.lock();
         let old = *umask;
         *umask = new_mask.mask(FileMode::PERM_MASK);
+        self.bump_generation();
         old
     }
 
@@ -295,6 +329,8 @@ impl VfsContext {
             mount_ns: Arc::clone(&self.mount_ns),
             cred: sync::Spinlock::new(self.cred()),
             umask: sync::Spinlock::new(*self.umask.lock()),
+            mutation_gate: sync::Spinlock::new(()),
+            generation: AtomicU64::new(0),
             limits: Arc::clone(&self.limits),
         })
     }
@@ -329,6 +365,8 @@ impl VfsContext {
             mount_ns: new_ns,
             cred: sync::Spinlock::new(self.cred()),
             umask: sync::Spinlock::new(*self.umask.lock()),
+            mutation_gate: sync::Spinlock::new(()),
+            generation: AtomicU64::new(0),
             limits: Arc::clone(&self.limits),
         })
     }
