@@ -25,10 +25,10 @@ use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::rseq::RseqEvent;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
-    migrate_task, now_ns_public, online_cpu_mask, request_balance, request_post_syscall_handoff,
-    request_resched, root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
-    task_runqueue_cpu,
+    NR_CPUS, continue_task, current_cpu_id, current_task, deliver_shared_signal_to_group,
+    enqueue_task_deferred, mark_task_stopped, migrate_task, now_ns_public, online_cpu_mask,
+    request_balance, request_post_syscall_handoff, request_resched, root_pid_ns, runqueue_of,
+    schedule_once, select_cpu_for_mask, signal_wakeup, task_runqueue_cpu,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
@@ -334,6 +334,12 @@ pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     if !task.group_exit_boundary_pending() {
         return false;
     }
+    complete_group_exit_slow(task)
+}
+
+#[cold]
+#[inline(never)]
+fn complete_group_exit_slow(task: &Arc<Task>) -> bool {
     let Some(status) = task.thread_group().group_exit_status() else {
         return false;
     };
@@ -1319,11 +1325,6 @@ fn make_siginfo_with_code(sig: SignalNumber, code: i32) -> SigInfo {
     }
 }
 
-fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
-    task.is_user_task()
-        && (!task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig))
-}
-
 fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
     let current = current_task();
     terminate_thread_group_by_signal_from(target, info, &current)
@@ -1382,13 +1383,7 @@ fn deliver_to_thread_group_identity(group: &Arc<ThreadGroup>, info: SigInfo) -> 
         return terminate_thread_group_identity_by_signal_from(group, info, &current);
     }
 
-    group.shared_signal().deliver(info);
-    for member in group.snapshot() {
-        if should_wake_for_signal(&member, info.sig) {
-            signal_wakeup(&member, &info);
-            break;
-        }
-    }
+    deliver_shared_signal_to_group(group, info);
     true
 }
 
@@ -2135,6 +2130,7 @@ pub fn setup_user_signal_frame_for_task(
 }
 
 /// 在即将恢复用户态时处理依赖当前 trap frame 的线程状态。
+#[inline]
 pub fn prepare_user_return_for_task(
     task: &Arc<Task>,
     user_ctx: UserContextRef,
@@ -2142,6 +2138,19 @@ pub fn prepare_user_return_for_task(
     if task.is_kernel_task() || user_ctx.is_none() {
         return Ok(());
     }
+    if !task.exec_sibling_exit_boundary_pending()
+        && !task.group_exit_boundary_pending()
+        && task.native_thread_exit_boundary_pending().is_none()
+        && task.rseq_events().is_empty()
+    {
+        return Ok(());
+    }
+    prepare_user_return_slow(task, user_ctx)
+}
+
+#[cold]
+#[inline(never)]
+fn prepare_user_return_slow(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno> {
     if complete_exec_sibling_exit_if_requested(task)
         || complete_group_exit_if_requested(task)
         || complete_native_thread_exit_if_requested(task)

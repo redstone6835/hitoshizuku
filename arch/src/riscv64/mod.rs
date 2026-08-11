@@ -30,6 +30,7 @@ pub mod trap_frame;
 
 pub mod addr;
 pub mod heap_vm;
+mod mem;
 pub mod mm;
 pub mod paging;
 

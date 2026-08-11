@@ -547,9 +547,15 @@ unsafe fn count_mapped_pages(pgd: PgdHandle, vaddr: usize, len: usize) -> usize 
     count
 }
 
+unsafe fn zero_user_pages(vaddr: usize, len: usize) {
+    // Safety: UserPgdOps 契约保证 direct-map 范围独占、可写且按页对齐。
+    unsafe { crate::riscv64::specific::zero_memory_fast(vaddr, len) };
+}
+
 pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
+    zero_user_pages,
     map: map_user_pages,
     map_pages: map_user_page_batch,
     publish_new_mapping,

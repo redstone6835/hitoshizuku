@@ -32,13 +32,22 @@ resolve_workload() {
 
 print_workload_plan() {
     resolve_workload || return
+    plan_skip_prebuild=${PROFILE_SKIP_PREBUILD:-0}
+    plan_xtask_bin=${PROFILE_XTASK_BIN:-/work/tgoskits/target/debug/tg-xtask}
+    if [ "$plan_skip_prebuild" -eq 1 ]; then
+        plan_prebuild="prebuilt:$plan_xtask_bin"
+        plan_command="timeout 14400 $plan_xtask_bin arceos build -p arceos-helloworld --arch $profile_arch"
+    else
+        plan_prebuild="cargo build -p tg-xtask"
+        plan_command="timeout 14400 cargo xtask arceos build -p arceos-helloworld --arch $profile_arch"
+    fi
     cat <<EOF
 schema=mygo.buildstorm-workload.v2
 arch=$profile_arch
 target=$profile_target
 target_fs=$profile_target_fs
-prebuild=cargo build -p tg-xtask
-command=timeout 14400 cargo xtask arceos build -p arceos-helloworld --arch $profile_arch
+prebuild=$plan_prebuild
+command=$plan_command
 EOF
 }
 
@@ -827,6 +836,16 @@ run_profile() {
     valid_token "$token" || usage
     capture=${PROFILE_CAPTURE:-1}
     case "$capture" in 0|1) ;; *) echo "profile runner: PROFILE_CAPTURE must be 0 or 1" >&2; exit 2 ;; esac
+    skip_prebuild=${PROFILE_SKIP_PREBUILD:-0}
+    case "$skip_prebuild" in
+        0|1) ;;
+        *) echo "profile runner: PROFILE_SKIP_PREBUILD must be 0 or 1" >&2; exit 2 ;;
+    esac
+    xtask_bin=${PROFILE_XTASK_BIN:-/work/tgoskits/target/debug/tg-xtask}
+    case "$xtask_bin" in
+        /*) ;;
+        *) echo "profile runner: PROFILE_XTASK_BIN must be an absolute path" >&2; exit 2 ;;
+    esac
     event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
     valid_event_mask "$event_mask" || { echo "profile runner: invalid PROFILE_EVENT_MASK" >&2; exit 2; }
     event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}
@@ -879,14 +898,23 @@ run_profile() {
     cat /proc/meminfo 2>/dev/null || true
     echo "@@PROFILE_MEMINFO_END phase=before"
 
-    # tg-xtask 预编不属于正式计分窗口，但必须和官方脚本一样在计时构建前完成。
-    echo "@@PROFILE_PREBUILD_BEGIN command=tg-xtask"
-    if ! chroot /mnt /bin/bash -lc \
-        'export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; cargo build -p tg-xtask'; then
-        echo "profile runner: tg-xtask prebuild failed" >&2
-        exit 1
+    if [ "$skip_prebuild" -eq 1 ]; then
+        if ! chroot /mnt /bin/bash -lc 'test -x "$1"' bash "$xtask_bin"; then
+            echo "profile runner: prebuilt tg-xtask is unavailable: $xtask_bin" >&2
+            exit 1
+        fi
+        echo "@@PROFILE_PREBUILD_BEGIN command=tg-xtask status=skipped"
+        echo "@@PROFILE_PREBUILD_END command=tg-xtask status=skipped"
+    else
+        # tg-xtask 预编不属于正式计分窗口，但必须和官方脚本一样在计时构建前完成。
+        echo "@@PROFILE_PREBUILD_BEGIN command=tg-xtask"
+        if ! chroot /mnt /bin/bash -lc \
+            'export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; cargo build -p tg-xtask'; then
+            echo "profile runner: tg-xtask prebuild failed" >&2
+            exit 1
+        fi
+        echo "@@PROFILE_PREBUILD_END command=tg-xtask status=0"
     fi
-    echo "@@PROFILE_PREBUILD_END command=tg-xtask status=0"
 
     export PROFILE_EVENT_MASK=$event_mask
     export PROFILE_EVENT_MASK_HIGH=$event_mask_high
@@ -921,7 +949,7 @@ run_profile() {
     # 保证 progress 一定落到串口日志上；同时不引入任何转发进程——转发进程
     # 会被窗口起止的 SIGSTOP 组停止一起冻住，反而让 cargo 阻塞在管道上。
     setsid chroot /mnt /bin/bash -lc \
-        'gate=$1; token=$2; arch=$3; exec 9<>"$gate" || exit 1; echo "@@PROFILE_GATE_READY token=$token"; IFS= read -r gate_word <&9; [ "$gate_word" = go ] || exit 1; exec 9>&-; export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; if [ -w /dev/console ]; then exec >/dev/console 2>&1; echo "@@PROFILE_BUILD_SINK sink=console"; else echo "@@PROFILE_BUILD_SINK sink=inherited"; exec 2>&1; fi; echo "@@PROFILE_CARGO_EXEC token=$token"; exec timeout 14400 cargo xtask arceos build -p arceos-helloworld --arch "$arch"' bash "$gate" "$token" "$profile_arch" &
+        'gate=$1; token=$2; arch=$3; skip_prebuild=$4; xtask_bin=$5; exec 9<>"$gate" || exit 1; echo "@@PROFILE_GATE_READY token=$token"; IFS= read -r gate_word <&9; [ "$gate_word" = go ] || exit 1; exec 9>&-; export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; if [ -w /dev/console ]; then exec >/dev/console 2>&1; echo "@@PROFILE_BUILD_SINK sink=console"; else echo "@@PROFILE_BUILD_SINK sink=inherited"; exec 2>&1; fi; echo "@@PROFILE_CARGO_EXEC token=$token"; if [ "$skip_prebuild" -eq 1 ]; then exec timeout 14400 "$xtask_bin" arceos build -p arceos-helloworld --arch "$arch"; else exec timeout 14400 cargo xtask arceos build -p arceos-helloworld --arch "$arch"; fi' bash "$gate" "$token" "$profile_arch" "$skip_prebuild" "$xtask_bin" &
     workload_pid=$!
 
     attempts=0

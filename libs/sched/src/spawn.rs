@@ -13,8 +13,9 @@ use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    activate_task_on_cpu, current_task, enqueue_task, enqueue_task_with_hint, init_task,
-    is_current_on_any_cpu, mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
+    activate_task_on_cpu, current_task, deliver_shared_signal_to_group, enqueue_task,
+    enqueue_task_with_hint, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
+    root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -571,8 +572,7 @@ fn notify_task_parent(task: &Arc<Task>) {
             sender_uid: crate::ids::Uid::ROOT,
             raw: None,
         };
-        parent.thread_group().shared_signal().deliver(info);
-        crate::scheduler::signal_wakeup(&parent, &info);
+        deliver_shared_signal_to_group(&parent.thread_group(), info);
     }
     parent.exit_waiters.wake_all();
 }
@@ -660,8 +660,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                             sender_uid: crate::ids::Uid::ROOT,
                             raw: None,
                         };
-                        init.thread_group().shared_signal().deliver(info);
-                        crate::scheduler::signal_wakeup(&init, &info);
+                        deliver_shared_signal_to_group(&init.thread_group(), info);
                     }
                 }
             }

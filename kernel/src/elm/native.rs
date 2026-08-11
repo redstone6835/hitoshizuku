@@ -117,7 +117,7 @@ struct NativeInvocationResult {
 
 impl NativeInvocation {
     fn enter(cell: ElmId, phase: u32, requested_deadline_ns: u64) -> ElmResult<Self> {
-        let now_ns = sched::now_ns_public();
+        let now_ns = sched::now_ns_direct();
         let accounting = super::resource_accounting::begin_native_call(
             cell,
             ELM_NATIVE_STACK_TOTAL_SIZE as u64,
@@ -181,7 +181,7 @@ impl NativeInvocation {
 
     fn finish(self) -> NativeInvocationResult {
         let aborted = self.guard.aborted();
-        let accounting = self.accounting.finish(sched::now_ns_public());
+        let accounting = self.accounting.finish(sched::now_ns_direct());
         NativeInvocationResult {
             aborted: aborted || accounting.watchdog_expired,
         }
@@ -1370,23 +1370,23 @@ pub(crate) fn invoke_kernel_mixin_handler(
     {
         return kernel_symbols::KERNEL_MIXIN_DISPATCH_INVALID;
     }
-    let now_ns = sched::now_ns_public();
+    let now_ns = sched::now_ns_direct();
     let Ok(accounting) = super::resource_accounting::begin_native_call(cell, 0, 0, now_ns) else {
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_KERNEL_MIXIN, 0) else {
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     let Some((stack_start, stack_end)) = sched::current_task_ref().kernel_stack_bounds() else {
         drop(guard);
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     let frame_start = core::ptr::from_mut(frame) as usize;
     let Some(frame_end) = frame_start.checked_add(core::mem::size_of_val(frame)) else {
         drop(guard);
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     let mut host_ranges = [(0usize, 0usize); general::elm_guard::ELM_GUARD_MAX_HOST_RANGES];
@@ -1398,12 +1398,12 @@ pub(crate) fn invoke_kernel_mixin_handler(
             .checked_mul(core::mem::size_of::<kernel_symbols::KernelMixinValueV1>())
         else {
             drop(guard);
-            let _ = accounting.finish(sched::now_ns_public());
+            let _ = accounting.finish(sched::now_ns_direct());
             return ELM_CALL_STATUS_PROVIDER_FAULT;
         };
         let Some(end) = start.checked_add(size) else {
             drop(guard);
-            let _ = accounting.finish(sched::now_ns_public());
+            let _ = accounting.finish(sched::now_ns_direct());
             return ELM_CALL_STATUS_PROVIDER_FAULT;
         };
         host_ranges[host_count] = (start, end);
@@ -1415,7 +1415,7 @@ pub(crate) fn invoke_kernel_mixin_handler(
             start.checked_add(core::mem::size_of::<kernel_symbols::KernelMixinValueV1>())
         else {
             drop(guard);
-            let _ = accounting.finish(sched::now_ns_public());
+            let _ = accounting.finish(sched::now_ns_direct());
             return ELM_CALL_STATUS_PROVIDER_FAULT;
         };
         host_ranges[host_count] = (start, end);
@@ -1431,7 +1431,7 @@ pub(crate) fn invoke_kernel_mixin_handler(
         &host_ranges[..host_count],
     ) {
         drop(guard);
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     }
     let context = ElmContext::new(
@@ -1444,12 +1444,12 @@ pub(crate) fn invoke_kernel_mixin_handler(
     );
     let Some(_current) = try_enter_current_context(&context) else {
         drop(guard);
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     let Some(_domain) = guard.enter_domain(ElmExecutionDomain::ElmCode) else {
         drop(guard);
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     // Safety: 地址和边界来自已验证、仍由路由快照固定的 RX 镜像；处理器 ABI 只接收该帧。
@@ -1457,7 +1457,7 @@ pub(crate) fn invoke_kernel_mixin_handler(
         arch::call_elm_native_current_stack(address, core::ptr::from_mut(frame).cast::<u8>())
     };
     let aborted = guard.aborted();
-    let accounting = accounting.finish(sched::now_ns_public());
+    let accounting = accounting.finish(sched::now_ns_direct());
     if aborted || accounting.watchdog_expired {
         ELM_CALL_STATUS_PROVIDER_FAULT
     } else {
@@ -1482,7 +1482,7 @@ pub(crate) fn invoke_pinned_export<T>(
     }
     #[cfg(feature = "performance-profile")]
     let accounting_begin_start = profiling::read_counter();
-    let now_ns = sched::now_ns_public();
+    let now_ns = sched::now_ns_direct();
     let accounting = super::resource_accounting::begin_native_call(
         cell,
         ELM_NATIVE_STACK_TOTAL_SIZE as u64,
@@ -1510,7 +1510,7 @@ pub(crate) fn invoke_pinned_export<T>(
         profiling::read_counter().wrapping_sub(guard_enter_start),
     );
     let Some(guard) = guard else {
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     #[cfg(feature = "performance-profile")]
@@ -1531,7 +1531,7 @@ pub(crate) fn invoke_pinned_export<T>(
         profiling::read_counter().wrapping_sub(context_enter_start),
     );
     let Some(_current) = current else {
-        let _ = accounting.finish(sched::now_ns_public());
+        let _ = accounting.finish(sched::now_ns_direct());
         return ELM_CALL_STATUS_PROVIDER_FAULT;
     };
     #[cfg(feature = "performance-profile")]
@@ -1549,7 +1549,7 @@ pub(crate) fn invoke_pinned_export<T>(
     let abort_reason = guard.abort_reason();
     #[cfg(feature = "performance-profile")]
     let accounting_finish_start = profiling::read_counter();
-    let accounting = accounting.finish(sched::now_ns_public());
+    let accounting = accounting.finish(sched::now_ns_direct());
     #[cfg(feature = "performance-profile")]
     profiling::observe(
         profiling::Metric::PinnedAccountingFinishCycles,

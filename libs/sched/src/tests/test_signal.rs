@@ -20,6 +20,26 @@ fn sigset_empty() {
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGTERM));
 }
 
+#[ktest]
+fn pending_bit_tracks_last_queued_signal() {
+    let state = SignalState::new();
+    let info = SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    };
+
+    state.deliver(info);
+    state.deliver(info);
+    assert!(state.has_any_pending());
+    assert!(state.dequeue_one().is_some());
+    assert!(state.has_any_pending());
+    assert!(state.dequeue_one().is_some());
+    assert!(!state.has_any_pending());
+}
+
 /// CLONE_CLEAR_SIGHAND 只重置已捕获的 handler，SIG_IGN 在子进程中保持。
 #[ktest]
 fn clear_sighand_copy_resets_handlers_but_keeps_ignored_signals() {

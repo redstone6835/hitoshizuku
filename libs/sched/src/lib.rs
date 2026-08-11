@@ -35,8 +35,9 @@
 //!    `Runqueue::inner`，反向获取禁止。
 //! 2. `Runqueue::inner` —— 每 CPU 一把，严禁跨 rq 反序。
 //! 3. `Task::rel` —— 亲子关系（parent / children / tg_link / pid_in_ns）。
-//! 4. `Task::creds` / `Task::shared_signal` / `Task::kstack` / `Task::ctx`
-//!    / `Task::ext` —— 同一 Task 内的次级字段锁，彼此独立，禁止互相嵌套。
+//! 4. `Task::creds` / `Task::kstack` / `Task::ctx` / `Task::ext` —— 同一
+//!    Task 内的次级字段锁，彼此独立，禁止互相嵌套。`Task::shared_signal`
+//!    是稳定的 `Arc`，其内部状态按自身规则同步。
 //! 5. `ThreadGroup::members` / `ProcessGroup::members` / `Session::groups` ——
 //!    组成员索引。
 //! 6. `SharedSignal::actions` / `SharedSignal::shared_pending_infos` ——
@@ -119,27 +120,29 @@ pub use sched_class::{
 #[cfg(feature = "performance-profile")]
 pub use scheduler::current_task_epoch;
 pub use scheduler::{
-    DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
-    register_deadline_observer_deferred, reserve_deadline_observer_id,
-    try_register_deadline_observer, try_register_deadline_observer_deferred,
-};
-pub use scheduler::{
-    NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask, balance_once,
-    current_cpu_id, current_task, current_task_cpu_time_ns, current_task_fast,
-    current_task_handoff_target, current_task_id, current_task_on, current_task_ref,
-    defer_pi_effective_update, defer_task_wake, defer_timer_tick, drain_deferred_timer_tick,
-    enqueue_task, enqueue_task_deferred, enqueue_task_preferred,
+    BorrowedCurrentTask, NR_CPUS, acknowledge_resched_notification, activate_cpu, active_cpu_mask,
+    balance_once, borrow_current_task_internal, current_cpu_id, current_task,
+    current_task_cpu_time_ns, current_task_direct, current_task_fast, current_task_fast_direct,
+    current_task_fast_internal, current_task_handoff_target, current_task_id, current_task_on,
+    current_task_ref, defer_pi_effective_update, defer_task_wake, defer_timer_tick,
+    drain_deferred_timer_tick, enqueue_task, enqueue_task_deferred, enqueue_task_preferred,
     enqueue_task_preferred_for_handoff, enqueue_task_with_hint, group_exit_wakeup, idle_task, init,
-    init_task, install_idle, is_cpu_active, is_cpu_online, is_ready, mark_cpu_online, migrate_task,
-    native_thread_exit_wakeup, needs_resched, needs_resched_current, now_ns_public, offline_cpu,
-    on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
+    init_task, install_idle, is_cpu_active, is_cpu_online, is_ready, is_ready_direct,
+    is_ready_internal, mark_cpu_online, migrate_task, native_thread_exit_wakeup, needs_resched,
+    needs_resched_current, now_ns_direct, now_ns_public, offline_cpu, on_timer_tick,
+    online_cpu_mask, pid_count, preempt_if_needed, refresh_user_return_work_on, register_cpu,
     register_sleep_deadline, reprogram_current_deadline, request_balance,
     request_post_syscall_handoff, request_post_syscall_handoff_to, request_resched, root_pid_ns,
     run_post_syscall_handoff, run_post_syscall_handoff_lazy, sched_rr_timeslice_ms,
     sched_rr_timeslice_ns, sched_rt_period_us, sched_rt_runtime_us, schedule_once, scheduler_diag,
     set_realtime_itimer, set_sched_rr_timeslice_ms, set_sched_rt_period_us,
     set_sched_rt_runtime_us, signal_wakeup, spawn_idle_for, supported_cpu_mask,
-    try_current_task_ref,
+    try_current_task_ref, user_return_work_pending_on,
+};
+pub use scheduler::{
+    DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
+    register_deadline_observer_deferred, reserve_deadline_observer_id,
+    try_register_deadline_observer, try_register_deadline_observer_deferred,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};

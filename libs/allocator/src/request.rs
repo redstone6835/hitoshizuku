@@ -1,6 +1,6 @@
 //! 分配请求与分配记录的公共数据模型。
 //!
-//! allocator 内部有多条分配路径：boot、slab、kernel heap、managed、physical。
+//! allocator 内部有多条分配路径：boot、slab、kernel heap、physical。
 //! 如果每条路径都使用自己的一套参数与记录结构，上层接口会很快失去一致性，调试时也
 //! 很难判断一次分配到底走了哪条线路。
 //!
@@ -15,19 +15,15 @@ use core::alloc::Layout;
 use core::fmt;
 
 use crate::buddy::{MAX_TRACKED_ORDER, PAGE_SIZE};
-use crate::gc::TraceDescriptor;
-
 /// 内存请求所属的逻辑域。
 ///
 /// 这个枚举决定 allocator 应该把一次请求路由到哪类后端：
 ///
 /// - `Kernel`：普通内核对象与缓冲区，优先走 slab / kheap；
-/// - `Managed`：受 GC 管理的对象，走 managed allocator；
 /// - `Physical`：调用者直接请求物理页，不附带内核堆映射语义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryDomain {
     Kernel,
-    Managed,
     Physical,
 }
 
@@ -41,7 +37,6 @@ pub enum AllocationKind {
     Boot,
     Small,
     Large,
-    Managed,
     Physical,
 }
 
@@ -53,7 +48,7 @@ pub enum AllocationKind {
 pub enum AllocationArena {
     DirectMap,
     Kernel,
-    Managed,
+    Tracked,
 }
 
 /// 页级映射策略。
@@ -81,7 +76,6 @@ pub enum MemoryPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReclaimPolicy {
     NoReclaim,
-    TryManagedGc,
     TryAllocatorReclaim,
 }
 
@@ -107,47 +101,6 @@ pub enum AllocationRequestError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManagedAllocFlags {
-    pub pinned: bool,
-    pub finalizer_id: Option<u16>,
-    pub trace_descriptor: Option<&'static TraceDescriptor>,
-}
-
-impl ManagedAllocFlags {
-    pub const fn new() -> Self {
-        Self {
-            pinned: false,
-            finalizer_id: None,
-            trace_descriptor: None,
-        }
-    }
-
-    pub const fn pinned(mut self, pinned: bool) -> Self {
-        self.pinned = pinned;
-        self
-    }
-
-    pub const fn with_finalizer(mut self, finalizer_id: u16) -> Self {
-        self.finalizer_id = Some(finalizer_id);
-        self
-    }
-
-    pub const fn with_trace_descriptor(
-        mut self,
-        trace_descriptor: &'static TraceDescriptor,
-    ) -> Self {
-        self.trace_descriptor = Some(trace_descriptor);
-        self
-    }
-}
-
-impl Default for ManagedAllocFlags {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryRequest {
     pub domain: MemoryDomain,
     pub size: usize,
@@ -156,7 +109,6 @@ pub struct MemoryRequest {
     pub placement: MemoryPlacement,
     pub reclaim: ReclaimPolicy,
     pub zeroing: Zeroing,
-    pub managed: ManagedAllocFlags,
     pub(crate) accounting_owner: Option<u64>,
 }
 
@@ -170,7 +122,6 @@ impl MemoryRequest {
             placement: MemoryPlacement::Any,
             reclaim: ReclaimPolicy::TryAllocatorReclaim,
             zeroing: Zeroing::Uninitialized,
-            managed: ManagedAllocFlags::new(),
             accounting_owner: None,
         }
     }
@@ -179,15 +130,6 @@ impl MemoryRequest {
         let aligned = layout.pad_to_align();
         Self::new(
             MemoryDomain::Kernel,
-            aligned.size().max(1),
-            aligned.align().max(1),
-        )
-    }
-
-    pub fn for_managed_layout(layout: Layout) -> Self {
-        let aligned = layout.pad_to_align();
-        Self::new(
-            MemoryDomain::Managed,
             aligned.size().max(1),
             aligned.align().max(1),
         )
@@ -210,11 +152,6 @@ impl MemoryRequest {
 
     pub const fn with_reclaim(mut self, reclaim: ReclaimPolicy) -> Self {
         self.reclaim = reclaim;
-        self
-    }
-
-    pub const fn with_managed_flags(mut self, managed: ManagedAllocFlags) -> Self {
-        self.managed = managed;
         self
     }
 

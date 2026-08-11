@@ -148,6 +148,7 @@ enum IngressPayload<'a> {
         lease: &'a TcpTxLease,
         offset: usize,
         len: usize,
+        flush: bool,
     },
 }
 
@@ -186,9 +187,12 @@ impl IngressPayload<'_> {
                 pressure,
                 ..
             } => facade.push_stream_rx_packet(chain, *offset + payload_offset, len, *pressure),
-            Self::Lease { lease, offset, .. } => {
-                facade.push_stream_rx_lease(lease, *offset + payload_offset, len, true)
-            }
+            Self::Lease {
+                lease,
+                offset,
+                flush,
+                ..
+            } => facade.push_stream_rx_lease(lease, *offset + payload_offset, len, *flush),
         }
     }
 
@@ -207,7 +211,9 @@ impl IngressPayload<'_> {
                     .map_err(|_| TcpIngressError::Malformed)?;
                 Ok(bytes)
             }
-            Self::Lease { lease, offset, len } => {
+            Self::Lease {
+                lease, offset, len, ..
+            } => {
                 let mut bytes = Vec::new();
                 bytes.resize(len, 0);
                 lease
@@ -1018,6 +1024,7 @@ impl TcpEndpointTable {
             lease: payload,
             offset: 0,
             len: payload_len,
+            flush: tcp.flags.contains(TcpFlags::PSH),
         });
         self.process_segment_inner(id, tcp, ingress, now_ns, publish_info)?;
         self.stats.delivered = self.stats.delivered.saturating_add(1);
@@ -2235,13 +2242,24 @@ impl TcpEndpointTable {
                 .get_or_insert(now_ns.saturating_add(flow.rtt.rto_ns));
         }
         let (options, options_len, parsed_options) = wire_options(flow, transmit.flags, now_ns);
-        let advertised = advertised_window(&flow.facade, flow.local_window_scale);
+        // RFC 7323 只允许在 SYN 之后的报文中应用窗口缩放；SYN/SYN-ACK
+        // 的窗口字段始终携带未缩放值，窗口缩放选项仅协商后续报文的解释方式。
+        let window_scale = if transmit.flags.contains(TcpFlags::SYN) {
+            0
+        } else {
+            flow.local_window_scale
+        };
+        let advertised = advertised_window(&flow.facade, window_scale);
         let wire_window = if transmit.flags.contains(TcpFlags::RST) {
             transmit.window
         } else {
             advertised
         };
-        flow.last_advertised_window = wire_window;
+        // last_advertised_window 以握手后的缩放单位保存，不能把 SYN 的原始
+        // 16-bit 窗口混入后续窗口更新比较。
+        if !transmit.flags.contains(TcpFlags::SYN) {
+            flow.last_advertised_window = wire_window;
+        }
         let completion = self.next_completion;
         self.next_completion = self.next_completion.wrapping_add(1).max(1);
         self.output.push_back(PreparedTcpTx {
@@ -3234,6 +3252,82 @@ mod tests {
             work.payload.as_ref(),
             now_ns,
         )
+    }
+
+    #[test]
+    fn window_scaling_starts_after_syn_exchange() {
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_101,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_001,
+        };
+        let listener = facade(92);
+        listener.test_set_stack_generation(1);
+        let group = listen_group(&listener, 92, 1, 4);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        table
+            .listen(server_endpoint, Some(InterfaceId(1)), group)
+            .unwrap();
+
+        let client = facade(93);
+        client.test_set_stack_generation(1);
+        let client_flow = table
+            .connect(
+                client_endpoint,
+                server_endpoint,
+                path(client_endpoint.addr, server_endpoint.addr),
+                Arc::clone(&client),
+                1,
+                true,
+                1_000,
+            )
+            .unwrap();
+        client.publish_binding(
+            OwnerRef::Flow {
+                shard: ShardId(0),
+                flow: client_flow,
+                generation: client.generation(),
+            },
+            client_endpoint,
+            Some(server_endpoint),
+            Some(InterfaceId(1)),
+        );
+
+        let syn = table.take_output().unwrap();
+        let client_scale = syn
+            .parsed_options
+            .window_scale
+            .expect("SYN 必须协商窗口缩放");
+        assert!(client_scale != 0);
+        assert_eq!(syn.flags, TcpFlags::SYN);
+        assert_eq!(syn.window, advertised_window(&client, 0));
+        assert_ne!(syn.window, advertised_window(&client, client_scale));
+
+        let server_flow = ingest_prepared_local_work(&mut table, &syn, 2_000).unwrap();
+        let syn_ack = table.take_output().unwrap();
+        let server = Arc::clone(&table.flows.get(server_flow).unwrap().facade);
+        let server_scale = syn_ack
+            .parsed_options
+            .window_scale
+            .expect("SYN-ACK 必须协商窗口缩放");
+        assert!(server_scale != 0);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN | TcpFlags::ACK);
+        assert_eq!(syn_ack.window, advertised_window(&server, 0));
+        assert_ne!(syn_ack.window, advertised_window(&server, server_scale));
+
+        ingest_prepared_local_work(&mut table, &syn_ack, 3_000).unwrap();
+        assert_eq!(
+            table.flows.get(client_flow).unwrap().peer_window,
+            u32::from(syn_ack.window)
+        );
+        let ack = table.take_output().unwrap();
+        assert_eq!(ack.flags, TcpFlags::ACK);
+        assert_eq!(ack.parsed_options.window_scale, None);
+        assert_eq!(ack.window, advertised_window(&client, client_scale));
+        assert_ne!(ack.window, syn.window);
     }
 
     fn prepare_local_payload(

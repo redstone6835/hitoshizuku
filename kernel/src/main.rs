@@ -21,6 +21,8 @@ mod elm;
 mod exec;
 mod initramfs;
 mod integrated_components;
+#[cfg(feature = "kcsan")]
+mod kcsan_runtime;
 #[path = "native_abi/mod.rs"]
 mod native_runtime;
 mod net_runtime;
@@ -114,6 +116,13 @@ fn main() -> ! {
         ::sched::online_cpu_mask(),
         ::sched::active_cpu_mask(),
     );
+    #[cfg(feature = "kcsan")]
+    {
+        // AP 在建立架构 per-CPU 状态前也会经过已插桩代码。等全部 AP 完成
+        // 启动后再启用检测器，避免调试延迟干扰启动超时或读取未就绪的 tp。
+        kcsan_runtime::install();
+        kcsan_runtime::start_reporter();
+    }
     device_init::install_network_boot_config();
     let integrated =
         integrated_components::initialize_phase(integrated_components::IntegratedPhase::Runtime)
@@ -191,6 +200,8 @@ pub unsafe extern "C" fn __kernel_start_init(context: *const general::StartConte
     context
         .validate()
         .unwrap_or_else(|err| panic!("[main] invalid StartContext: {}", err));
+    #[cfg(target_arch = "riscv64")]
+    general::set_start_cmdline(context.boot.command_line);
     match context.firmware_source() {
         general::StartFirmwareSource::Acpi => acpi::kernel_start_init(context),
         general::StartFirmwareSource::Dtb => dtb::kernel_start_init(context),

@@ -6,7 +6,9 @@
 
 extern crate std;
 
-use crate::eevdf::{DEFAULT_BASE_SLICE_NS, NICE_0_WEIGHT, SchedParams, weight_from_nice};
+use crate::eevdf::{
+    DEFAULT_BASE_SLICE_NS, NICE_0_WEIGHT, SchedParams, scale_delta_by_weight, weight_from_nice,
+};
 use ktest::ktest;
 
 /// nice=-20 对应最高权重 88761。
@@ -72,4 +74,15 @@ fn params_slice_uses_explicit() {
         slice_ns: 10_000_000,
     };
     assert_eq!(p.slice(), 10_000_000);
+}
+
+#[ktest]
+fn scaled_delta_matches_wide_reference_without_overflow() {
+    for delta in [0, 1, 999, 6_000_000, u32::MAX as u64, u64::MAX] {
+        for weight in [15, 1024, 88761] {
+            let reference = ((delta as u128 * NICE_0_WEIGHT as u128) / weight as u128)
+                .min(u64::MAX as u128) as u64;
+            assert_eq!(scale_delta_by_weight(delta, weight), reference);
+        }
+    }
 }

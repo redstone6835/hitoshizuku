@@ -17,6 +17,7 @@
 
 pub mod fault;
 pub mod ops;
+mod resident_map;
 pub mod smoketest;
 pub mod user_access;
 pub mod vm_space;

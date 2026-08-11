@@ -84,7 +84,7 @@ fn exec_cleanup_uses_bounded_scratch_and_clears_user_registrations() {
 
 #[ktest]
 fn futex_wait_requeue_and_user_rmw_are_atomic() {
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     let saved_vm = task.ext_remove(sched::TASKEXT_VM_SPACE);
     let vm = Arc::new(VmSpace::new());
     task.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
@@ -279,7 +279,7 @@ unsafe extern "C" fn pi_test_thread(_arg: usize) -> ! {
 
 #[ktest]
 fn pi_requeue_donates_and_hands_lock_to_highest_priority_waiter() {
-    let owner = sched::current_task();
+    let owner = sched::current_task_direct();
     let saved_vm = owner.ext_remove(sched::TASKEXT_VM_SPACE);
     let vm = Arc::new(VmSpace::new());
     owner.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());

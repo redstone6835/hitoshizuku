@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 use mm::UserAccessError;
 
 use crate::mm::ops::user_access_ops;
-use crate::mm::vm_space::VmSpace;
+use crate::mm::vm_space::{UserReadWindows, UserWriteWindows, VmSpace, page_size};
+
+const USER_COPY_WINDOWS: usize = 16;
 
 /// 从用户地址 `user` 读 `dst.len()` 字节到 `dst`。
 #[kernel_symbols::export(name = "general.mm.user_access.copy_from_user", contract = "kernel.mm.user-access@1", version = 1, capabilities = kernel_symbols::capability::MM_MEMORY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
@@ -29,9 +31,20 @@ pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError
         return Err(UserAccessError::Fault);
     }
     if let Some(vm) = current_task_vm_space() {
-        return vm
-            .copy_user_bytes_in(user, dst)
-            .map_err(|_| UserAccessError::Fault);
+        let total = dst.len();
+        let mut copied = 0usize;
+        let mut windows = UserReadWindows::<USER_COPY_WINDOWS>::empty();
+        while copied < total {
+            let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
+            let chunk = user_copy_chunk_len(user_ptr, total - copied);
+            vm.pin_user_read_windows_into(user_ptr, chunk, &mut windows)
+                .map_err(|_| UserAccessError::Fault)?;
+            windows
+                .copy_into(0, &mut dst[copied..copied + chunk])
+                .map_err(|_| UserAccessError::Fault)?;
+            copied += chunk;
+        }
+        return Ok(());
     }
 
     let Some(ops) = user_access_ops() else {
@@ -52,9 +65,20 @@ pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
         return Err(UserAccessError::Fault);
     }
     if let Some(vm) = current_task_vm_space() {
-        return vm
-            .copy_user_bytes_out(user, src)
-            .map_err(|_| UserAccessError::Fault);
+        let total = src.len();
+        let mut copied = 0usize;
+        let mut windows = UserWriteWindows::<USER_COPY_WINDOWS>::empty();
+        while copied < total {
+            let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
+            let chunk = user_copy_chunk_len(user_ptr, total - copied);
+            vm.pin_user_write_windows_into(user_ptr, chunk, &mut windows)
+                .map_err(|_| UserAccessError::Fault)?;
+            windows
+                .copy_from(0, &src[copied..copied + chunk])
+                .map_err(|_| UserAccessError::Fault)?;
+            copied += chunk;
+        }
+        return Ok(());
     }
 
     let Some(ops) = user_access_ops() else {
@@ -102,4 +126,11 @@ fn current_task_vm_space() -> Option<Arc<VmSpace>> {
     let task = sched::current_task_ref();
     let payload = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
+}
+
+#[inline]
+fn user_copy_chunk_len(user: usize, remaining: usize) -> usize {
+    let page_size = page_size();
+    let first_page = page_size - (user & (page_size - 1));
+    remaining.min(first_page + (USER_COPY_WINDOWS - 1) * page_size)
 }

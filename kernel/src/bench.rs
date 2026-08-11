@@ -306,6 +306,7 @@ const ALLOC_BENCH_SAMPLES: usize = 7;
 
 fn run_allocator_bench() {
     log::info!("[bench][alloc] ---------------- allocator cost model ----------------");
+    let registry_paths_start = KERNEL_ALLOCATOR.registry_path_counters();
     let audit_start = KERNEL_ALLOCATOR.audit();
     log::info!(
         "[bench][alloc] small_limit={} page_size={} batch={} audit_ok={} audit_flags={} live={}",
@@ -371,26 +372,23 @@ fn run_allocator_bench() {
     let audit_end = KERNEL_ALLOCATOR.audit();
     if audit_end.is_consistent() {
         log::info!(
-            "[bench][alloc][audit] final ok live={} boot={} physrec={} slab={}/{} kheap={}/{} managed={}/{}",
+            "[bench][alloc][audit] final ok live={} boot={} physrec={} slab={}/{} kheap={}/{}",
             audit_end.registry_live_records,
             audit_end.registry_boot_records,
             audit_end.registry_physical_records,
             audit_end.slab_active_objects,
             audit_end.slab_live_records,
             audit_end.kheap_active_allocs,
-            audit_end.kheap_live_records,
-            audit_end.managed_active_objects,
-            audit_end.managed_live_records
+            audit_end.kheap_live_records
         );
     } else {
         log::error!(
-            "[bench][alloc][audit] final inconsistent flags={} reg_struct={} phys_struct={} slab_struct={} kheap_struct={} managed_struct={} live={} kinds={} boot={} physrec={} nodes={}/{} scan={}/{} slab={}/{} kheap={}/{} managed={}/{}",
+            "[bench][alloc][audit] final inconsistent flags={} reg_struct={} phys_struct={} slab_struct={} kheap_struct={} live={} kinds={} boot={} physrec={} nodes={}/{} scan={}/{} slab={}/{} kheap={}/{}",
             audit_end.flags.bits(),
             audit_end.registry_structure.flags.bits(),
             audit_end.phys_structure.flags.bits(),
             audit_end.slab_structure.flags.bits(),
             audit_end.kheap_structure.flags.bits(),
-            audit_end.managed_structure.flags.bits(),
             audit_end.registry_live_records,
             audit_end.registry_kind_records,
             audit_end.registry_boot_records,
@@ -402,9 +400,7 @@ fn run_allocator_bench() {
             audit_end.slab_active_objects,
             audit_end.slab_live_records,
             audit_end.kheap_active_allocs,
-            audit_end.kheap_live_records,
-            audit_end.managed_active_objects,
-            audit_end.managed_live_records
+            audit_end.kheap_live_records
         );
     }
 
@@ -421,13 +417,27 @@ fn run_allocator_bench() {
         large8k,
         large64k
     );
+    let registry_paths = KERNEL_ALLOCATOR
+        .registry_path_counters()
+        .saturating_sub(registry_paths_start);
+    log::info!(
+        "[bench][alloc][registry-paths] register kernel={} owned={} remove kernel={} owned={} containing queries={} shards={} buckets={} nodes={}",
+        registry_paths.register_kernel,
+        registry_paths.register_owned,
+        registry_paths.remove_kernel,
+        registry_paths.remove_owned,
+        registry_paths.containing_queries,
+        registry_paths.containing_scanned_shards,
+        registry_paths.containing_scanned_buckets,
+        registry_paths.containing_scanned_nodes,
+    );
     log_allocator_hotspot("end");
 }
 
 fn log_allocator_hotspot(stage: &str) {
     let hot = KERNEL_ALLOCATOR.hotspot_summary();
     log::info!(
-        "[bench][alloc][hotspot][{}] phys_fail={}/1000 phys_split={}/1000alloc phys_merge={}/1000free phys_defer={}/1000free phys_reclaim={}/1000alloc phys_meta={}/1000 phys_corrupt={} slab_hit={}/1000 slab_miss={}/1000 refill={}/1000 flush={}/1000 fast_free={}/1000 fallback={} reg_chain={} reg_shard={} reg_load={}/1000 reg_underflow={} reg_corrupt={} kheap_fail={}/1000 kheap_realloc={}/1000 kheap_cache={}/1000 cached_pages={} pressure_rel={} vmem_largest={}pct vmem_free_segs={} managed_frag={}/1000 pressure={}",
+        "[bench][alloc][hotspot][{}] phys_fail={}/1000 phys_split={}/1000alloc phys_merge={}/1000free phys_defer={}/1000free phys_reclaim={}/1000alloc phys_meta={}/1000 phys_corrupt={} slab_hit={}/1000 slab_miss={}/1000 refill={}/1000 flush={}/1000 fast_free={}/1000 fallback={} reg_chain={} reg_shard={} reg_load={}/1000 reg_underflow={} reg_corrupt={} kheap_fail={}/1000 kheap_realloc={}/1000 kheap_cache={}/1000 cached_pages={} pressure_rel={} vmem_largest={}pct vmem_free_segs={} pressure={}",
         stage,
         hot.phys_alloc_failure_per_mille,
         hot.phys_split_per_alloc_mille,
@@ -454,7 +464,6 @@ fn log_allocator_hotspot(stage: &str) {
         hot.kheap_cache_pressure_releases,
         hot.kernel_vmem_largest_free_percent,
         hot.kernel_vmem_free_segments,
-        hot.managed_fragmentation_per_mille,
         hot.pressure_level
     );
 }
@@ -474,7 +483,6 @@ fn run_allocator_audit() {
     let mut phys_flags = 0u32;
     let mut slab_flags = 0u32;
     let mut kheap_flags = 0u32;
-    let mut managed_flags = 0u32;
     let mut live = 0usize;
     for _ in 0..iters {
         let audit = KERNEL_ALLOCATOR.audit();
@@ -483,13 +491,12 @@ fn run_allocator_audit() {
         phys_flags |= audit.phys_structure.flags.bits();
         slab_flags |= audit.slab_structure.flags.bits();
         kheap_flags |= audit.kheap_structure.flags.bits();
-        managed_flags |= audit.managed_structure.flags.bits();
         live = live.saturating_add(audit.registry_live_records);
         core::hint::black_box(audit);
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][alloc][audit] {} snapshots avg {} ns/op audit_flags={} registry_flags={} phys_flags={} slab_flags={} kheap_flags={} managed_flags={} avg_live={}; source=layer stats snapshot + full registry/buddy/slab/kheap/managed structure scan + typed invariant checks",
+        "[bench][alloc][audit] {} snapshots avg {} ns/op audit_flags={} registry_flags={} phys_flags={} slab_flags={} kheap_flags={} avg_live={}; source=layer stats snapshot + full registry/buddy/slab/kheap structure scan + typed invariant checks",
         iters,
         dt / iters as u64,
         audit_flags,
@@ -497,7 +504,6 @@ fn run_allocator_audit() {
         phys_flags,
         slab_flags,
         kheap_flags,
-        managed_flags,
         live / iters
     );
 }
@@ -1211,7 +1217,7 @@ fn run_allocator_diagnostic() {
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + full registry/buddy/slab/kheap/managed audit scan + no_alloc formatting",
+        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + full registry/buddy/slab/kheap audit scan + no_alloc formatting",
         iters,
         dt / iters as u64,
         total_len / iters
@@ -2466,18 +2472,18 @@ fn run_block_overhead_diagnosis(tag: &str, dev: &Arc<BlockDevice>) {
         n
     );
 
-    // B2: 2x now_ns_public — 同步路径每次 I/O 都至少调 2 次
+    // B2: 2x now_ns_direct — 同步路径每次 I/O 都至少调 2 次
     let t0 = hal::time::monotonic_ns();
     let mut sink = 0u64;
     for _ in 0..n {
-        let a = sched::now_ns_public();
-        let b = sched::now_ns_public();
+        let a = sched::now_ns_direct();
+        let b = sched::now_ns_direct();
         sink = sink.wrapping_add(a ^ b);
     }
     core::hint::black_box(sink);
     let dt_now2 = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][{}][DIAG]   2x now_ns_public:         {} ns/op (n={})",
+        "[bench][{}][DIAG]   2x now_ns_direct:         {} ns/op (n={})",
         tag,
         dt_now2 / n,
         n

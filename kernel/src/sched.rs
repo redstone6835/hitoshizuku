@@ -406,7 +406,7 @@ fn pop_riscv_vector_signal_snapshot(task: &Arc<Task>, user_ctx: UserContextRef) 
 
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
     let frame = {
-        let me = sched::current_task();
+        let me = sched::current_task_direct();
         activate_task_vm(&me);
 
         // 子任务可能在"已入队、尚未首次运行"的窗口里被 exit_group / SIGKILL
@@ -459,7 +459,7 @@ fn process_spawn_user_process(
     let loaded = match crate::user::load_user_image_from_path(child, path, argv, envp) {
         Ok(loaded) => loaded,
         Err(error) => {
-            activate_task_vm(&sched::current_task());
+            activate_task_vm(&sched::current_task_direct());
             return Err(error);
         }
     };
@@ -488,7 +488,7 @@ fn process_spawn_user_process(
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
 
     // 装载器会激活新地址空间以布置用户栈；返回调用者前必须恢复当前任务页表。
-    activate_task_vm(&sched::current_task());
+    activate_task_vm(&sched::current_task_direct());
     Ok(())
 }
 

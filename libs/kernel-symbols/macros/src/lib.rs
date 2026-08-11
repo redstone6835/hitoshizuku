@@ -684,60 +684,62 @@ fn instrument_exported_body(
     };
 
     *block = syn::parse_quote!({
-        if !#head_descriptor.has_handlers() && !#return_descriptor.has_handlers() {
+        if !#head_descriptor.has_handlers_hint() && !#return_descriptor.has_handlers_hint() {
             #original
         } else {
-        let mut __elm_mixin_arguments: [::kernel_symbols::KernelMixinValueV1; #argument_count] = [
-            #(#slots),*
-        ];
-        let mut __elm_mixin_result = ::core::mem::MaybeUninit::<#result>::uninit();
-        let mut __elm_mixin_result_slot =
-            ::kernel_symbols::KernelMixinValueV1::from_uninit(&mut __elm_mixin_result);
-        let mut __elm_mixin_frame = ::kernel_symbols::KernelMixinFrameV1::new(
-            ::kernel_symbols::KERNEL_MIXIN_SITE_HEAD,
-            &mut __elm_mixin_arguments,
-            Some(&mut __elm_mixin_result_slot),
-        );
-        let mut __elm_mixin_original = ::kernel_symbols::KernelMixinOriginal::new(
-            || -> #result #original,
-            &mut __elm_mixin_result,
-        );
-        __elm_mixin_original.bind(&mut __elm_mixin_frame);
-        let __elm_mixin_head_status = unsafe {
-            ::kernel_symbols::dispatch_kernel_mixin(
-                &#head_descriptor,
-                &mut __elm_mixin_frame,
-            )
-        };
-        if __elm_mixin_head_status < 0 {
-            __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
-        }
-        if __elm_mixin_frame.flags & ::kernel_symbols::KERNEL_MIXIN_FRAME_RESULT_READY == 0 {
-            let __elm_mixin_original_status = unsafe {
-                __elm_mixin_frame.call_original()
-            };
-            if __elm_mixin_original_status != ::kernel_symbols::KERNEL_MIXIN_DISPATCH_OK {
-                __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
-            }
-        }
-        __elm_mixin_frame.site_kind = ::kernel_symbols::KERNEL_MIXIN_SITE_RETURN;
-        __elm_mixin_frame.next = None;
-        __elm_mixin_frame.next_context = ::core::ptr::null_mut();
-        __elm_mixin_frame.original = None;
-        __elm_mixin_frame.original_context = ::core::ptr::null_mut();
-        let __elm_mixin_return_status = unsafe {
-            ::kernel_symbols::dispatch_kernel_mixin(
-                &#return_descriptor,
-                &mut __elm_mixin_frame,
-            )
-        };
-        if __elm_mixin_return_status < 0 {
-            __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
-        }
-        ::kernel_symbols::finish_kernel_mixin_result(
-            __elm_mixin_result,
-            &__elm_mixin_frame,
-        )
+            ::kernel_symbols::invoke_kernel_mixin_slow(|| {
+                let mut __elm_mixin_arguments: [::kernel_symbols::KernelMixinValueV1; #argument_count] = [
+                    #(#slots),*
+                ];
+                let mut __elm_mixin_result = ::core::mem::MaybeUninit::<#result>::uninit();
+                let mut __elm_mixin_result_slot =
+                    ::kernel_symbols::KernelMixinValueV1::from_uninit(&mut __elm_mixin_result);
+                let mut __elm_mixin_frame = ::kernel_symbols::KernelMixinFrameV1::new(
+                    ::kernel_symbols::KERNEL_MIXIN_SITE_HEAD,
+                    &mut __elm_mixin_arguments,
+                    Some(&mut __elm_mixin_result_slot),
+                );
+                let mut __elm_mixin_original = ::kernel_symbols::KernelMixinOriginal::new(
+                    || -> #result #original,
+                    &mut __elm_mixin_result,
+                );
+                __elm_mixin_original.bind(&mut __elm_mixin_frame);
+                let __elm_mixin_head_status = unsafe {
+                    ::kernel_symbols::dispatch_kernel_mixin(
+                        &#head_descriptor,
+                        &mut __elm_mixin_frame,
+                    )
+                };
+                if __elm_mixin_head_status < 0 {
+                    __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
+                }
+                if __elm_mixin_frame.flags & ::kernel_symbols::KERNEL_MIXIN_FRAME_RESULT_READY == 0 {
+                    let __elm_mixin_original_status = unsafe {
+                        __elm_mixin_frame.call_original()
+                    };
+                    if __elm_mixin_original_status != ::kernel_symbols::KERNEL_MIXIN_DISPATCH_OK {
+                        __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
+                    }
+                }
+                __elm_mixin_frame.site_kind = ::kernel_symbols::KERNEL_MIXIN_SITE_RETURN;
+                __elm_mixin_frame.next = None;
+                __elm_mixin_frame.next_context = ::core::ptr::null_mut();
+                __elm_mixin_frame.original = None;
+                __elm_mixin_frame.original_context = ::core::ptr::null_mut();
+                let __elm_mixin_return_status = unsafe {
+                    ::kernel_symbols::dispatch_kernel_mixin(
+                        &#return_descriptor,
+                        &mut __elm_mixin_frame,
+                    )
+                };
+                if __elm_mixin_return_status < 0 {
+                    __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
+                }
+                ::kernel_symbols::finish_kernel_mixin_result(
+                    __elm_mixin_result,
+                    &__elm_mixin_frame,
+                )
+            })
         }
     });
 
@@ -854,5 +856,30 @@ mod tests {
     fn normalizes_trait_paths_used_in_descriptor_identity() {
         let trait_path: syn::Path = syn::parse_quote!(fmt::Display);
         assert_eq!(normalize_abi_tokens(quote!(#trait_path)), "fmt::Display");
+    }
+
+    #[test]
+    fn exported_function_moves_mixin_frame_to_cold_helper() {
+        let function: ItemFn = syn::parse_quote! {
+            pub fn query(value: usize) -> usize {
+                value + 1
+            }
+        };
+        let tokens = export_function(
+            ExportArgs {
+                name: syn::parse_quote!("tests.query"),
+                contract: syn::parse_quote!("kernel.tests.query@1"),
+                version: 1,
+                capabilities: syn::parse_quote!(kernel_symbols::capability::CORE_SAFE),
+                flags: None,
+                retained_args: None,
+            },
+            function,
+        )
+        .expect("导出函数应能展开")
+        .to_string();
+
+        assert!(tokens.contains("invoke_kernel_mixin_slow"));
+        assert!(tokens.contains("has_handlers_hint"));
     }
 }

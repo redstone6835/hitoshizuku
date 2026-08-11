@@ -141,7 +141,8 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = Arc::clone(ctx.task());
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
-    ctx.release_task_ref();
+    // Safety: sched::operation::exit 不返回，不会再访问本 syscall context。
+    unsafe { ctx.release_task_ref() };
     drop(task);
     sched::operation::exit(code);
 }
@@ -155,7 +156,8 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         task.pid_root(),
         code
     );
-    ctx.release_task_ref();
+    // Safety: sched::operation::exit_group 不返回，不会再访问本 syscall context。
+    unsafe { ctx.release_task_ref() };
     drop(task);
     sched::operation::exit_group(code);
 }
@@ -1024,7 +1026,7 @@ const CLOCK_THREAD_CPUTIME_ID: usize = 3;
 fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
     match clock_id {
         CLOCK_PROCESS_CPUTIME_ID => {
-            let now_ns = sched::now_ns_public();
+            let now_ns = sched::now_ns_direct();
             let mut total = 0u64;
             for member in task.thread_group().snapshot() {
                 let usage = member.usage_snapshot(now_ns);
@@ -1035,7 +1037,7 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
             Some(total)
         }
         CLOCK_THREAD_CPUTIME_ID => {
-            let usage = task.usage_snapshot(sched::now_ns_public());
+            let usage = task.usage_snapshot(sched::now_ns_direct());
             Some(usage.user_ns.saturating_add(usage.system_ns))
         }
         _ => crate::vdso::clock_time_ns(clock_id),
@@ -1086,11 +1088,11 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if ns_total == 0 {
         return Ok(0);
     }
-    let deadline = sched::now_ns_public().saturating_add(ns_total as u64);
-    match sleep_until_deadline(ctx.task(), deadline, || Ok(sched::now_ns_public())) {
+    let deadline = sched::now_ns_direct().saturating_add(ns_total as u64);
+    match sleep_until_deadline(ctx.task(), deadline, || Ok(sched::now_ns_direct())) {
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
-            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()))?;
+            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_direct()))?;
             Err(Errno::EINTR)
         }
         Err(err) => Err(err),
@@ -1166,7 +1168,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
     } else {
         let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
-        sched::now_ns_public().saturating_add(ns_total as u64)
+        sched::now_ns_direct().saturating_add(ns_total as u64)
     };
     if !absolute && sec == 0 && nsec == 0 {
         return Ok(0);
@@ -1175,7 +1177,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         if absolute {
             crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)
         } else {
-            Ok(sched::now_ns_public())
+            Ok(sched::now_ns_direct())
         }
     };
     match sleep_until_deadline(ctx.task(), deadline, now_fn) {
@@ -1184,7 +1186,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
             if !absolute {
                 write_remaining_timespec(
                     rem_user,
-                    deadline.saturating_sub(sched::now_ns_public()),
+                    deadline.saturating_sub(sched::now_ns_direct()),
                 )?;
             }
             Err(Errno::EINTR)
@@ -1207,7 +1209,7 @@ fn sleep_until_deadline(
         }
 
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Timer, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Timer, sched::now_ns_direct());
         if !task.cas_state(TaskState::Running, TaskState::Sleeping)
             && !task.cas_state(TaskState::Runnable, TaskState::Sleeping)
             && task.state() != TaskState::Sleeping
@@ -1228,12 +1230,12 @@ fn sleep_until_deadline(
             return Err(Errno::EINTR);
         }
 
-        let sleep_deadline = sched::now_ns_public().saturating_add(deadline.saturating_sub(now));
+        let sleep_deadline = sched::now_ns_direct().saturating_add(deadline.saturating_sub(now));
         if !sched::register_sleep_deadline(task, sleep_deadline) {
             restore_current_task_after_sleep(task);
             return Ok(());
         }
-        sched::schedule_once(sched::now_ns_public());
+        sched::schedule_once(sched::now_ns_direct());
         sched::cancel_sleep_deadline(task);
         restore_current_task_after_sleep(task);
     }
@@ -1278,9 +1280,9 @@ pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 
 pub(super) fn sys_times(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let buf = ctx.args[0];
-    let self_usage = ctx.task().usage_snapshot(sched::now_ns_public());
+    let self_usage = ctx.task().usage_snapshot(sched::now_ns_direct());
     let child_usage = ctx.task().child_usage_snapshot();
-    let ticks = ns_to_clock_ticks(sched::now_ns_public());
+    let ticks = ns_to_clock_ticks(sched::now_ns_direct());
     if buf != 0 {
         let mut raw = [0u8; 32];
         put_i64(&mut raw, 0, ns_to_clock_ticks(self_usage.user_ns));
@@ -1303,7 +1305,7 @@ pub(super) fn sys_getrusage(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Err(Errno::EFAULT);
     }
     let snapshot = match who {
-        RUSAGE_SELF | RUSAGE_THREAD => ctx.task().usage_snapshot(sched::now_ns_public()),
+        RUSAGE_SELF | RUSAGE_THREAD => ctx.task().usage_snapshot(sched::now_ns_direct()),
         RUSAGE_CHILDREN => ctx.task().child_usage_snapshot(),
         _ => return Err(Errno::EINVAL),
     };
@@ -1350,7 +1352,7 @@ pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let info = ctx.args[0];
     if info != 0 {
         let mut out = [0u8; 112];
-        put_i64(&mut out, 0, sched::now_ns_public() as i64 / 1_000_000_000);
+        put_i64(&mut out, 0, sched::now_ns_direct() as i64 / 1_000_000_000);
         put_u64(&mut out, 8, 0);
         put_u64(&mut out, 16, 0);
         put_u64(&mut out, 24, 0);
@@ -3614,7 +3616,7 @@ fn pi_wait_registered(
             return Ok(0);
         }
         if let Some(deadline) = deadline_ns
-            && sched::now_ns_public() >= deadline
+            && sched::now_ns_direct() >= deadline
             && pi_remove_waiter(vm, key, uaddr, task, wait_state)?
         {
             restore_current_task_after_sleep(task);
@@ -3631,7 +3633,7 @@ fn pi_wait_registered(
             return Err(Errno::EINTR);
         }
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             restore_current_task_after_sleep(task);
@@ -3910,7 +3912,7 @@ fn futex_wait_requeue_pi(
             restore_current_task_after_sleep(task);
             return Ok(0);
         }
-        let timed_out = deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline);
+        let timed_out = deadline_ns.is_some_and(|deadline| sched::now_ns_direct() >= deadline);
         let interrupted = sched::operation::has_interrupting_signal(task);
         if timed_out || interrupted {
             let removed = futex_remove_waiter(src, task)
@@ -3929,7 +3931,7 @@ fn futex_wait_requeue_pi(
             continue;
         }
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             restore_current_task_after_sleep(task);
@@ -4367,7 +4369,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         entries.push(entry);
     }
     if let Some(deadline) = deadline
-        && sched::now_ns_public() >= deadline
+        && sched::now_ns_direct() >= deadline
     {
         return Err(Errno::ETIMEDOUT);
     }
@@ -4399,7 +4401,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
             return Err(Errno::EAGAIN);
         }
         if let Some(deadline) = deadline {
-            if sched::now_ns_public() >= deadline {
+            if sched::now_ns_direct() >= deadline {
                 futex_waitv_remove_all(&entries, ctx.task());
                 restore_current_task_after_sleep(ctx.task());
                 sched::cancel_sleep_deadline(ctx.task());
@@ -4413,7 +4415,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         }
         #[cfg(feature = "performance-profile")]
         ctx.task()
-            .begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+            .begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping);
@@ -4944,7 +4946,7 @@ fn futex_wait(
     }
     loop {
         if let Some(deadline) = deadline_ns {
-            if sched::now_ns_public() >= deadline {
+            if sched::now_ns_direct() >= deadline {
                 futex_remove_waiter(key, &me);
                 restore_current_task_after_sleep(task);
                 sched::cancel_sleep_deadline(task);
@@ -4985,7 +4987,7 @@ fn futex_wait(
             return Ok(0);
         }
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             if wait_state.is_woken() {
@@ -5086,7 +5088,7 @@ fn read_futex_waitv_entry(user: usize, index: usize) -> Result<FutexWaitvEntry, 
         return Err(Errno::EINVAL);
     }
     let private = futex2_private(flags)?;
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     Ok(FutexWaitvEntry {
         index,
         uaddr,
@@ -5144,7 +5146,7 @@ fn futex2_abs_deadline(timeout_user: usize, clockid: usize) -> Result<Option<u64
         return Err(Errno::EINVAL);
     }
     let abs_ns = read_timespec_ns(timeout_user)?;
-    let sched_now = sched::now_ns_public();
+    let sched_now = sched::now_ns_direct();
     let clock_now = crate::vdso::clock_time_ns(clockid).unwrap_or(sched_now);
     Ok(Some(if abs_ns <= clock_now {
         sched_now
@@ -5158,7 +5160,7 @@ fn futex_wait_deadline(futex_op: u32, cmd: u32, timeout_user: usize) -> Result<O
         return Ok(None);
     }
     let timeout_ns = read_timespec_ns(timeout_user)?;
-    let sched_now = sched::now_ns_public();
+    let sched_now = sched::now_ns_direct();
     if cmd == FUTEX_WAIT {
         return Ok(Some(sched_now.saturating_add(timeout_ns)));
     }
@@ -5283,7 +5285,7 @@ pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
         "[syscall][exit-cleanup] futex-begin pid={:?}",
         task.pid_root(),
     );
-    let current = sched::current_task();
+    let current = sched::current_task_direct();
     if Arc::ptr_eq(&current, task) {
         cleanup_task_before_exit_in_active_vm(task);
         return;

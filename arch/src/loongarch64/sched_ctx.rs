@@ -238,6 +238,7 @@ fn arch_current_cpu_id() -> usize {
 /// 切换后由 sched 调用，把 CSR_KS0 指向 next 的内核栈顶。
 static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
+    set_current_task: set_current_task_raw,
 };
 
 static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
@@ -318,6 +319,9 @@ fn loongarch64_idle_relax() {
 unsafe fn set_kernel_trap_stack_raw(stack_top: usize) {
     <LoongArch64TaskOps as TaskOps>::set_kernel_trap_stack(stack_top);
 }
+
+/// LoongArch64 暂不使用 borrowed-current 架构槽，保留契约以维持通用调度层布局。
+unsafe fn set_current_task_raw(_task_ptr: usize, _cpu_work_ptr: usize) {}
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 

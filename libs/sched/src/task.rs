@@ -816,7 +816,8 @@ pub struct Task {
     pub signal: SignalState,
     /// 与同 thread-group 共享的 sigaction + shared pending。
     /// CLONE_SIGHAND 时 `Arc::clone`，否则 fork 时深拷一份。
-    shared_signal: Spinlock<Arc<SharedSignal>>,
+    /// 任务创建后只读该 Arc，SharedSignal 内部状态自行同步。
+    shared_signal: Arc<SharedSignal>,
     /// 退出时给父发的信号号码（默认 SIGCHLD=17）；clone 低 8 位指定。
     /// 值 0 表示"不发信号"（CLONE_THREAD 等情况）。
     exit_signal: AtomicI32,
@@ -952,8 +953,8 @@ impl Task {
     /// 调用方负责在返回 `Arc` 之后把它登记进父的 `children` 与组成员表。
     ///
     /// `creds` / `shared_signal` 默认从 `thread_group` 复制：thread group 内
-    /// 必然共享 shared_signal。调用方若需覆盖（如 CLONE_SIGHAND），可随后
-    /// 调 [`Task::install_shared_signal`] 替换。
+    /// 必然共享 shared_signal；新进程需要不同共享状态时应在创建任务前构造
+    /// 对应的 `ThreadGroup`。
     pub fn new(
         params: SchedParams,
         parent: Weak<Task>,
@@ -995,7 +996,7 @@ impl Task {
             ctx: Spinlock::new(None),
             creds: Spinlock::new(Arc::new(Credentials::root())),
             signal: SignalState::new(),
-            shared_signal: Spinlock::new(shared),
+            shared_signal: shared,
             exit_signal: AtomicI32::new(SignalNumber::SIGCHLD.raw() as i32),
             vfork_done: WaitQueue::new_with_reason(WaitReason::Vfork),
             vforking: AtomicBool::new(false),
@@ -1078,6 +1079,7 @@ impl Task {
         task
     }
 
+    #[inline]
     pub fn state(&self) -> TaskState {
         TaskState::from_u8(self.state.load(Ordering::Acquire))
     }
@@ -1109,27 +1111,24 @@ impl Task {
 
     /// 开始一个不能与本任务其它有界入口重叠的执行作用域。
     pub fn begin_execution_scope(&self, kind: ExecutionScopeKind) -> bool {
-        if self
-            .execution_scope
-            .compare_exchange(0, kind as u8, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        // 调度器保证同一任务的执行上下文只由一个 CPU 持有；这里的原子字段用于
+        // 中断边界观测和嵌套校验，不承担多 CPU 所有权仲裁。避免在每次 syscall
+        // 入口执行 LR/SC，可以显著降低 RISC-V 模拟器中的固定开销。
+        if self.execution_scope.load(Ordering::Relaxed) != 0 {
             return false;
         }
-        self.execution_actions.store(0, Ordering::Release);
+        self.execution_actions.store(0, Ordering::Relaxed);
+        self.execution_scope.store(kind as u8, Ordering::Relaxed);
         true
     }
 
     /// 结束作用域并返回其中成功认领过的动作位。
     pub fn end_execution_scope(&self, kind: ExecutionScopeKind) -> u64 {
-        let actions = self.execution_actions.swap(0, Ordering::AcqRel);
-        let previous = self.execution_scope.compare_exchange(
-            kind as u8,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        assert!(previous.is_ok(), "任务执行作用域必须由原入口结束");
+        let previous = self.execution_scope.load(Ordering::Relaxed);
+        assert_eq!(previous, kind as u8, "任务执行作用域必须由原入口结束");
+        let actions = self.execution_actions.load(Ordering::Relaxed);
+        self.execution_actions.store(0, Ordering::Relaxed);
+        self.execution_scope.store(0, Ordering::Relaxed);
         actions
     }
 
@@ -1515,6 +1514,7 @@ impl Task {
     pub(crate) fn publish_group_exit_wakeup(&self) {
         if self.is_user_task() {
             self.group_exit_requested.store(true, Ordering::SeqCst);
+            self.signal.mark_user_return_work();
         }
     }
 
@@ -1728,6 +1728,8 @@ impl Task {
                 }
             }
         }
+
+        self.signal.mark_user_return_work();
 
         self.wait_stop_sig
             .store(sig.raw() as i32, Ordering::Release);
@@ -2015,7 +2017,8 @@ impl Task {
 
     /// 任务在根 ns 中的 pid 快照。热路径使用，避免只读查询进入亲缘锁。
     pub fn pid_root_cached(&self) -> Option<PidT> {
-        let pid = self.root_pid_cache.load(Ordering::Acquire);
+        // PID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
+        let pid = self.root_pid_cache.load(Ordering::Relaxed);
         if pid > crate::pid::PID_INVALID {
             Some(pid)
         } else {
@@ -2029,8 +2032,10 @@ impl Task {
         }
     }
 
+    #[inline]
     pub fn tgid_cached(&self) -> Option<PidT> {
-        let pid = self.tgid_cache.load(Ordering::Acquire);
+        // TGID 在任务进入运行队列前写入，之后不再改变；当前任务读取无需栅栏。
+        let pid = self.tgid_cache.load(Ordering::Relaxed);
         if pid > crate::pid::PID_INVALID {
             Some(pid)
         } else {
@@ -2094,16 +2099,21 @@ impl Task {
 
     /// 取本任务当前的 SharedSignal（thread-group 共享部分）。
     pub fn shared_signal(&self) -> Arc<SharedSignal> {
-        Arc::clone(&self.shared_signal.lock())
+        Arc::clone(&self.shared_signal)
     }
 
+    #[inline]
     pub fn shared_signal_pending_bits_quick(&self) -> u64 {
-        self.shared_signal.lock().pending_snapshot().raw()
+        self.shared_signal.pending_snapshot().raw()
     }
 
-    /// 替换 SharedSignal —— 仅供 spawn 时根据 CLONE_SIGHAND 设定使用。
-    pub fn install_shared_signal(&self, shared: Arc<SharedSignal>) {
-        *self.shared_signal.lock() = shared;
+    /// 当前任务是否存在未被 signal mask 屏蔽的待投递信号。
+    #[inline]
+    pub fn has_deliverable_signal(&self) -> bool {
+        let blocked = self.signal.blocked_snapshot().raw();
+        let pending = self.signal.pending_snapshot().raw();
+        let shared = self.shared_signal.pending_snapshot().raw();
+        (pending | shared) & !blocked != 0
     }
 
     /// exit 时给父发的信号号码（0 表示不发）。
@@ -2150,6 +2160,31 @@ impl Task {
         *self.rseq.lock()
     }
 
+    /// 仅在任务已注册 rseq 时获取完整注册信息。
+    ///
+    /// 未注册是绝大多数程序的返回用户态热路径，先检查无锁发布位可以避免
+    /// 每次系统调用都获取 rseq 自旋锁。
+    pub fn rseq_registration_if_registered(&self) -> Option<RseqRegistration> {
+        if !self.rseq_registered() {
+            return None;
+        }
+        let registration = *self.rseq.lock();
+        registration.registered.then_some(registration)
+    }
+
+    /// 仅在存在待处理事件时读取 rseq 注册信息。
+    ///
+    /// glibc 通常会长期注册 rseq，但绝大多数用户态返回没有抢占、迁移或信号
+    /// 事件。先读取无锁事件位，避免每次系统调用返回都获取注册信息锁。
+    pub fn pending_rseq_work(&self) -> Option<(RseqRegistration, RseqEvents)> {
+        let events = self.rseq_events();
+        if events.is_empty() {
+            return None;
+        }
+        self.rseq_registration_if_registered()
+            .map(|registration| (registration, events))
+    }
+
     pub fn set_rseq_registration(&self, registration: RseqRegistration) {
         self.rseq_cpu.store(usize::MAX, Ordering::Release);
         *self.rseq.lock() = registration;
@@ -2177,11 +2212,57 @@ impl Task {
     pub fn mark_rseq_event(&self, event: RseqEvent) {
         if self.rseq_registered() {
             self.rseq_events.fetch_or(event as u8, Ordering::AcqRel);
+            self.signal.mark_user_return_work();
         }
     }
 
     pub fn rseq_events(&self) -> RseqEvents {
         RseqEvents::from_bits(self.rseq_events.load(Ordering::Acquire))
+    }
+
+    /// 发布本任务存在返回用户态前必须处理的工作。
+    #[inline]
+    pub(crate) fn mark_user_return_work(&self) {
+        self.signal.mark_user_return_work();
+    }
+
+    /// Linux `thread_info.flags` 风格的无工作热路径读取。
+    #[inline(always)]
+    pub fn user_return_work_hint_relaxed(&self) -> bool {
+        self.signal.user_return_work_pending_relaxed()
+    }
+
+    /// 慢路径进入时与任务工作生产者建立 Acquire/Release 同步。
+    #[inline]
+    pub fn user_return_work_hint_acquire(&self) -> bool {
+        self.signal.user_return_work_pending_acquire()
+    }
+
+    /// 重新扫描任务返回工作的权威状态。
+    #[inline]
+    fn user_return_work_authoritative(&self) -> bool {
+        self.group_exit_boundary_pending()
+            || self.has_deliverable_signal()
+            || !self.rseq_events().is_empty()
+            || matches!(
+                self.state(),
+                TaskState::Stopped | TaskState::Continued | TaskState::Zombie | TaskState::Dead
+            )
+    }
+
+    /// 清除并重建任务级粘性 hint。
+    ///
+    /// 本函数只允许在返回用户态慢路径调用。先用 AcqRel swap 清零，再读取权威
+    /// 状态；并发生产者若发生在 swap 前，其 Release 与 swap 配对，若发生在
+    /// swap 后则会留下新的 true，因此不会出现永久漏工作。
+    #[inline]
+    pub fn refresh_user_return_work_hint(&self) -> bool {
+        let _ = self.signal.take_user_return_work();
+        let pending = self.user_return_work_authoritative();
+        if pending {
+            self.signal.mark_user_return_work();
+        }
+        pending || self.signal.user_return_work_pending_acquire()
     }
 
     pub fn clear_rseq_events(&self, events: RseqEvents) {

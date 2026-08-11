@@ -15,9 +15,9 @@ use crate::{
     ArchContextOps, CpuMask, ExecPhase, ExecutionActionClaim, ExecutionScopeKind, NR_CPUS,
     NativeExternalControl, PidNamespace, ProcessGroup, ProcessPersonalityState, RobustListState,
     RseqEvent, RseqRegistration, SchedAttr, SchedClass, SchedParams, SchedPolicy, Session,
-    SigAction, SigActionFlags, SigHandler, SigInfo, SigSet, SignalNumber, TASK_COMM_LEN,
-    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage, ThreadGroup, Uid,
-    UserAbiKind, UserContextRef, WaitId, supported_cpu_mask,
+    SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
+    TASK_COMM_LEN, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskState, TaskUsage, ThreadGroup,
+    Uid, UserAbiKind, UserContextRef, WaitId, supported_cpu_mask,
 };
 
 const TEST_EXECUTION_ACTION: u64 = 1;
@@ -763,6 +763,71 @@ fn thread_group_accounting_waits_for_last_member_and_aggregates_usage() {
 }
 
 #[ktest]
+fn shared_signal_marks_all_members_and_unblock_rearms_delivery() {
+    let group = ThreadGroup::new();
+    let first = make_task_in_group(Arc::clone(&group));
+    let second = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&first);
+    group.add_member(&first);
+    group.add_member(&second);
+
+    let blocked = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    first.signal.block(blocked, SigProcMaskHow::SetMask);
+    second.signal.block(blocked, SigProcMaskHow::SetMask);
+    assert!(!first.refresh_user_return_work_hint());
+    assert!(!second.refresh_user_return_work_hint());
+
+    crate::scheduler::deliver_shared_signal_to_group(
+        &group,
+        SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: Uid::ROOT,
+            raw: None,
+        },
+    );
+    assert!(first.user_return_work_hint_relaxed());
+    assert!(second.user_return_work_hint_relaxed());
+    assert!(!first.refresh_user_return_work_hint());
+    assert!(!second.refresh_user_return_work_hint());
+
+    first.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
+    assert!(first.user_return_work_hint_relaxed());
+    assert!(first.refresh_user_return_work_hint());
+}
+
+#[ktest]
+fn member_joining_after_shared_signal_inherits_return_work_hint() {
+    let group = ThreadGroup::new();
+    crate::scheduler::deliver_shared_signal_to_group(
+        &group,
+        SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: Uid::ROOT,
+            raw: None,
+        },
+    );
+
+    let late = make_task_in_group(Arc::clone(&group));
+    late.signal.block(
+        SigSet::EMPTY.with(SignalNumber::SIGUSR1),
+        SigProcMaskHow::SetMask,
+    );
+    assert!(!late.refresh_user_return_work_hint());
+    assert!(!late.user_return_work_hint_relaxed());
+    group.add_member(&late);
+    assert!(!late.has_deliverable_signal());
+    assert!(late.user_return_work_hint_relaxed());
+
+    late.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
+    assert!(late.has_deliverable_signal());
+    assert!(late.refresh_user_return_work_hint());
+}
+
+#[ktest]
 fn thread_group_leader_becomes_waitable_only_after_last_member() {
     let group = ThreadGroup::new();
     let leader = make_task_in_group(Arc::clone(&group));
@@ -1454,10 +1519,18 @@ fn robust_list_and_rseq_state_roundtrip() {
         signature: 0x5305_5305,
         registered: true,
     };
+    assert_eq!(task.rseq_registration_if_registered(), None);
     task.set_rseq_registration(rseq);
     assert!(task.rseq_registered());
     assert_eq!(task.rseq_registration(), rseq);
+    assert_eq!(task.rseq_registration_if_registered(), Some(rseq));
+    assert_eq!(task.pending_rseq_work(), None);
     task.mark_rseq_event(RseqEvent::Preempt);
+    let (pending_registration, pending_events) = task
+        .pending_rseq_work()
+        .expect("已注册且存在事件时必须返回 rseq 工作");
+    assert_eq!(pending_registration, rseq);
+    assert!(pending_events.contains(RseqEvent::Preempt));
     assert!(task.rseq_events().contains(RseqEvent::Preempt));
     task.publish_rseq_cpu(0);
     task.publish_rseq_cpu(1);
@@ -1465,6 +1538,7 @@ fn robust_list_and_rseq_state_roundtrip() {
     task.clear_rseq_registration();
     assert!(!task.rseq_registered());
     assert_eq!(task.rseq_registration(), RseqRegistration::default());
+    assert_eq!(task.rseq_registration_if_registered(), None);
     assert!(task.rseq_events().is_empty());
 }
 
@@ -1614,6 +1688,33 @@ fn runqueue_exact_pick_yields_to_higher_class() {
 }
 
 #[ktest]
+fn runqueue_exact_pick_rejects_owned_non_current_task() {
+    let current = make_task();
+    let target = make_task();
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&current));
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&target), 1));
+    assert!(target.try_claim_cpu(0));
+
+    assert!(
+        rq.pick_target_on(&target, 2, CpuMask::single_raw(0).bits())
+            .is_none()
+    );
+    assert!(rq.is_current(&current));
+
+    unsafe {
+        target
+            .on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    let picked = rq
+        .pick_target_on(&target, 3, CpuMask::single_raw(0).bits())
+        .expect("上下文释放后精确目标应可被选中");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &target));
+}
+
+#[ktest]
 fn runqueue_reports_task_waiting_for_context_release() {
     let task = make_task();
     task.set_cpu_affinity(CpuMask::single_raw(1).bits());
@@ -1649,6 +1750,27 @@ fn runqueue_ignores_local_context_release_window() {
             .store(0, core::sync::atomic::Ordering::Release);
     }
     assert!(rq.dequeue(&task, 2));
+}
+
+#[ktest]
+fn runqueue_does_not_pick_task_before_context_release() {
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    assert!(task.try_claim_cpu(0));
+
+    let rq = Runqueue::new();
+    assert!(rq.enqueue(alloc::sync::Arc::clone(&task), 1));
+    assert!(rq.pick_next_on(2, CpuMask::single_raw(0).bits()).is_none());
+
+    unsafe {
+        task.on_cpu_slot()
+            .as_ref()
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+    let picked = rq
+        .pick_next_on(3, CpuMask::single_raw(0).bits())
+        .expect("任务释放上下文后应可被选中");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &task));
 }
 
 #[ktest]

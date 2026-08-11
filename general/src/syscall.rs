@@ -21,6 +21,7 @@
 //! 走 ctx.tf 直接改），也能 `ctx.task.ext_lookup` 拿 fdtable / vmspace。
 
 use alloc::sync::Arc;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use errno::Errno;
@@ -140,52 +141,123 @@ fn native_dispatcher() -> NativeDispatchFn {
 ///
 /// `tf` 让需要直接改 PC / 寄存器的特殊 syscall（execve / sigreturn）能拿到
 /// 完整 trap frame；普通 syscall 只用 `args` + `task` 即可。
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TaskOwnership {
+    Owned,
+    Borrowed,
+    Released,
+}
+
 pub struct SyscallContext<'a> {
     pub nr: usize,
     pub args: [usize; 6],
     pub tf: TrapFramePtr,
-    task: Option<Arc<sched::Task>>,
+    task: ManuallyDrop<Arc<sched::Task>>,
+    task_ownership: TaskOwnership,
     frame_finalized: bool,
     restart_disabled: bool,
     execution_scope_active: bool,
-    _phantom: core::marker::PhantomData<&'a ()>,
+    _phantom: core::marker::PhantomData<(&'a (), *mut ())>,
 }
 
-impl SyscallContext<'_> {
+impl<'a> SyscallContext<'a> {
     fn new(nr: usize, args: [usize; 6], tf: TrapFramePtr, task: Arc<sched::Task>) -> Self {
-        assert!(
-            task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
-            "同一任务不能嵌套进入 syscall 执行作用域"
-        );
         Self {
             nr,
             args,
             tf,
-            task: Some(task),
+            task: ManuallyDrop::new(task),
+            task_ownership: TaskOwnership::Owned,
             frame_finalized: false,
             restart_disabled: false,
-            execution_scope_active: true,
+            execution_scope_active: false,
             _phantom: core::marker::PhantomData,
         }
     }
 
+    /// RISC-V syscall 热路径借用调度器 current 槽，不修改 `Arc` 强引用计数。
+    #[inline(always)]
+    fn new_borrowed(
+        nr: usize,
+        args: [usize; 6],
+        tf: TrapFramePtr,
+        task: &'a Arc<sched::Task>,
+    ) -> Self {
+        Self {
+            nr,
+            args,
+            tf,
+            // Safety: task 指向 current 槽托底的 Arc allocation。该 Arc 视图由
+            // ManuallyDrop 包装，borrowed context 的结束路径绝不会减少强引用。
+            task: ManuallyDrop::new(unsafe { Arc::from_raw(Arc::as_ptr(task)) }),
+            task_ownership: TaskOwnership::Borrowed,
+            frame_finalized: false,
+            restart_disabled: false,
+            execution_scope_active: false,
+            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// 在当前 syscall 第一次进入网络协议栈前建立有界执行作用域。
+    ///
+    /// 普通 syscall 不消费网络栈调用预算，因此不应为它们修改任务上的原子状态。
+    /// 网络 syscall 可以经过多个通用文件 I/O 分支，本方法保持幂等，由首次确认
+    /// `NetSocketFileOps` 的分支负责调用，最终仍由 context 的 RAII 边界统一结束。
+    pub fn ensure_network_execution_scope(&mut self) {
+        if self.execution_scope_active {
+            return;
+        }
+        assert!(
+            self.task()
+                .begin_execution_scope(sched::ExecutionScopeKind::Syscall),
+            "同一任务不能嵌套进入 syscall 执行作用域"
+        );
+        self.execution_scope_active = true;
+    }
+
+    #[inline(always)]
     fn finish_execution_scope(&mut self) {
         if !self.execution_scope_active {
             return;
         }
-        if let Some(task) = self.task.as_ref() {
-            let _ = task.end_execution_scope(sched::ExecutionScopeKind::Syscall);
+        if self.task_ownership != TaskOwnership::Released {
+            let _ = self
+                .task()
+                .end_execution_scope(sched::ExecutionScopeKind::Syscall);
         }
         self.execution_scope_active = false;
     }
 
+    #[inline(always)]
     pub fn task(&self) -> &Arc<sched::Task> {
-        self.task.as_ref().expect("[syscall] task already released")
+        debug_assert!(
+            self.task_ownership != TaskOwnership::Released,
+            "[syscall] task already released"
+        );
+        &self.task
     }
 
-    pub fn release_task_ref(&mut self) {
+    /// 在不会再返回或访问本 context 的退出路径提前释放拥有型 task 引用。
+    ///
+    /// # Safety
+    /// 调用后不得再调用 [`SyscallContext::task`]，并且控制流必须立即进入不返回的
+    /// 任务退出或最终调度路径。
+    pub unsafe fn release_task_ref(&mut self) {
         self.finish_execution_scope();
-        self.task.take();
+        let ownership = core::mem::replace(&mut self.task_ownership, TaskOwnership::Released);
+        if ownership == TaskOwnership::Owned {
+            // Safety: Owned 只由 new 构造且尚未释放，此处恰好消费一次强引用。
+            unsafe { ManuallyDrop::drop(&mut self.task) };
+        }
+    }
+
+    /// 结束由 `new_borrowed` 构造的同步 syscall context，不触碰 Arc 强引用计数。
+    #[inline(always)]
+    fn finish_borrowed(&mut self) {
+        self.finish_execution_scope();
+        debug_assert!(self.task_ownership != TaskOwnership::Owned);
+        self.task_ownership = TaskOwnership::Released;
     }
 
     /// 标记当前 syscall 已经完整重写 trap frame。dispatch 不再写 syscall
@@ -216,6 +288,11 @@ impl SyscallContext<'_> {
 impl Drop for SyscallContext<'_> {
     fn drop(&mut self) {
         self.finish_execution_scope();
+        if self.task_ownership == TaskOwnership::Owned {
+            // Safety: Owned context 的强引用尚未由 release_task_ref 消费。
+            unsafe { ManuallyDrop::drop(&mut self.task) };
+            self.task_ownership = TaskOwnership::Released;
+        }
     }
 }
 
@@ -258,13 +335,39 @@ pub fn registered_count() -> usize {
 
 /// syscall 实现已经返回，此时深层调用栈中的 VmSpace/File 等临时 Arc 均已析构；
 /// 在这个边界消费 exit_group 请求，避免远程废弃另一个线程的 Rust 栈。
+#[inline]
 fn complete_group_exit_at_boundary(ctx: &mut SyscallContext<'_>) {
     if !sched::operation::complete_group_exit_if_requested(ctx.task()) {
         return;
     }
-    ctx.release_task_ref();
+    // Safety: group-exit 完成后立即最终调度；本 context 不会再被访问。
+    unsafe { ctx.release_task_ref() };
     sched::schedule_once(0);
     panic!("[syscall] group-exit task scheduled back unexpectedly");
+}
+
+/// `EINTR + SA_RESTART` 的低频信号帧构造路径。
+#[cold]
+#[inline(never)]
+fn try_restart_syscall_signal(ctx: &mut SyscallContext<'_>, tf: TrapFramePtr) -> bool {
+    let Some((info, action)) = sched::operation::consume_restartable_signal() else {
+        return false;
+    };
+    if sched::operation::setup_user_signal_frame_for_task(
+        ctx.task(),
+        info,
+        action,
+        sched::UserContextRef::new(tf.as_usize()),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    #[cfg(feature = "performance-profile")]
+    let _handoff_profile =
+        profiling::scope(profiling::Event::SyscallHandoff).trace_args(ctx.nr as u64, 0);
+    sched::run_post_syscall_handoff(sched::now_ns_direct());
+    true
 }
 
 // ── 3. 主分发 ────────────────────────────────────────────────────────────────
@@ -276,11 +379,11 @@ pub fn dispatch(tf: TrapFramePtr) {
         return;
     };
 
-    // 取 current task；sched::init 之前不应触发用户 syscall，但安全起见做防御。
-    if !sched::is_ready() {
+    // sched::init 之前不应触发用户 syscall，但安全起见做防御。
+    if !sched::is_ready_direct() {
         let nr = (ops.sys_nr)(tf);
         log::debug!("[syscall] dispatch before sched ready, nr={}", nr);
-        (ops.set_sys_ret)(tf, -(Errno::ENOSYS.as_i32() as isize));
+        (ops.set_sys_ret)(tf, -(Errno::ENOSYS.as_i32_direct() as isize));
         (ops.advance_pc)(tf);
         return;
     }
@@ -396,7 +499,8 @@ fn dispatch_tomori_for_task(
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
     let entry = if nr < SYSCALL_TABLE_LEN {
-        let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
+        // 表在用户任务启动前完成注册且之后只读，等价于 Linux 的静态 syscall 表。
+        let ptr = SYSCALL_TABLE[nr].load(Ordering::Relaxed);
         if ptr == 0 {
             None
         } else {
@@ -412,9 +516,9 @@ fn dispatch_tomori_for_task(
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
-            Err(e) => -(e.as_i32() as isize),
+            Err(e) => -(e.as_i32_direct() as isize),
         },
-        None => -(Errno::ENOSYS.as_i32() as isize),
+        None => -(Errno::ENOSYS.as_i32_direct() as isize),
     };
     #[cfg(feature = "trace-task-lifecycle")]
     if trace_signal_boundary(nr) {
@@ -437,7 +541,7 @@ fn dispatch_tomori_for_task(
         #[cfg(feature = "performance-profile")]
         let finalize_profile =
             profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
-        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
+        if ret == -(Errno::EINTR.as_i32_direct() as isize) && !ctx.restart_disabled() {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::operation::setup_user_signal_frame_for_task(
                     ctx.task(),
@@ -452,7 +556,7 @@ fn dispatch_tomori_for_task(
                     #[cfg(feature = "performance-profile")]
                     let _handoff_profile =
                         profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
-                    sched::run_post_syscall_handoff(sched::now_ns_public());
+                    sched::run_post_syscall_handoff(sched::now_ns_direct());
                     return;
                 }
             }
@@ -489,7 +593,8 @@ fn dispatch_tomori_for_task(
 
         match task.state() {
             sched::TaskState::Zombie | sched::TaskState::Dead => {
-                ctx.release_task_ref();
+                // Safety: terminal task 随即最终调度，本 context 不会再被访问。
+                unsafe { ctx.release_task_ref() };
                 sched::schedule_once(0);
                 panic!("[syscall] terminal task scheduled back unexpectedly");
             }
@@ -520,41 +625,49 @@ fn dispatch_tomori_for_task(
 }
 
 /// arch 快速 syscall 路径用。调用方已经从 trap frame 取出 syscall 号和参数，
-/// 因而这里跳过 frame_ops 的 sys_nr/sys_args 间接调用，但保持普通 dispatch
-/// 的任务引用与信号语义。
+/// 因而这里跳过 frame_ops 的 sys_nr/sys_args 间接调用，同时复用 current task。
 #[inline]
 pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
     let Some(ops) = frame_ops() else { return };
-    let _ = dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
+    let task = sched::current_task_fast();
+    let _ = dispatch_fast_with_frame(tf, nr, args, &task, |tf, ret| {
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
     });
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FastDispatchOutcome {
-    TomoriLinux,
+    FrameAdvanced,
+    FrameRewritten,
     MygoNative,
 }
 
-/// arch 快速 syscall 路径用。调用方直接提供 trap frame 写回逻辑，避免热路径
-/// 每次通过 `frame_ops()` 全局表做原子加载和间接调用。
+impl FastDispatchOutcome {
+    #[inline(always)]
+    pub const fn requires_full_restore(self) -> bool {
+        matches!(self, Self::FrameRewritten | Self::MygoNative)
+    }
+}
+
+/// RISC-V arch 快速 syscall 调用入口；返回工作在 arch 冷路径消费。
 #[inline]
 pub fn dispatch_fast_with_frame<F>(
     tf: TrapFramePtr,
     nr: usize,
     args: [usize; 6],
+    task: &Arc<sched::Task>,
     mut finish: F,
 ) -> FastDispatchOutcome
 where
     F: FnMut(TrapFramePtr, isize),
 {
-    let task = sched::current_task_fast();
     if task.user_abi_kind() == native_abi::UserAbiKind::MygoNative {
         let Some(ops) = frame_ops() else {
             return FastDispatchOutcome::MygoNative;
         };
-        dispatch_native_for_task(tf, ops, task);
+        dispatch_native_for_task(tf, ops, Arc::clone(task));
         return FastDispatchOutcome::MygoNative;
     }
     #[cfg(feature = "performance-profile")]
@@ -565,7 +678,8 @@ where
     let mut syscall_profile = profiling::syscall_scope(nr);
 
     let entry = if nr < SYSCALL_TABLE_LEN {
-        let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
+        // 注册在首个用户任务运行前完成，热路径只读，不需要每次建立 Acquire 栅栏。
+        let ptr = SYSCALL_TABLE[nr].load(Ordering::Relaxed);
         if ptr == 0 {
             None
         } else {
@@ -575,16 +689,16 @@ where
         None
     };
 
-    let mut ctx = SyscallContext::new(nr, args, tf, task);
+    let mut ctx = SyscallContext::new_borrowed(nr, args, tf, task);
 
     #[cfg(feature = "performance-profile")]
     let invoke_profile = profiling::scope(profiling::Event::SyscallInvoke).trace_args(nr as u64, 0);
     let ret: isize = match entry {
         Some(f) => match f(&mut ctx) {
             Ok(v) => v as isize,
-            Err(e) => -(e.as_i32() as isize),
+            Err(e) => -(e.as_i32_direct() as isize),
         },
-        None => -(Errno::ENOSYS.as_i32() as isize),
+        None => -(Errno::ENOSYS.as_i32_direct() as isize),
     };
     #[cfg(feature = "trace-task-lifecycle")]
     if trace_signal_boundary(nr) {
@@ -600,34 +714,19 @@ where
     #[cfg(feature = "performance-profile")]
     drop(invoke_profile);
 
-    complete_group_exit_at_boundary(&mut ctx);
-
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
         #[cfg(feature = "performance-profile")]
         let finalize_profile =
             profiling::scope(profiling::Event::SyscallFinalize).trace_args(nr as u64, 0);
-        if ret == -(Errno::EINTR.as_i32() as isize) && !ctx.restart_disabled() {
-            if let Some((info, action)) = sched::operation::consume_restartable_signal() {
-                let delivered = sched::operation::setup_user_signal_frame_for_task(
-                    ctx.task(),
-                    info,
-                    action,
-                    sched::UserContextRef::new(tf.as_usize()),
-                )
-                .is_ok();
-                if delivered {
-                    #[cfg(feature = "performance-profile")]
-                    drop(finalize_profile);
-                    #[cfg(feature = "performance-profile")]
-                    let _handoff_profile =
-                        profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
-                    sched::run_post_syscall_handoff(sched::now_ns_public());
-                    return FastDispatchOutcome::TomoriLinux;
-                }
-            }
+        if ret == -(Errno::EINTR.as_i32_internal() as isize)
+            && !ctx.restart_disabled()
+            && try_restart_syscall_signal(&mut ctx, tf)
+        {
+            ctx.finish_borrowed();
+            core::mem::forget(ctx);
+            return FastDispatchOutcome::FrameRewritten;
         }
-
         finish(tf, ret);
 
         #[cfg(feature = "trace-task-lifecycle")]
@@ -638,49 +737,12 @@ where
                 nr,
             );
         }
-
-        let task = ctx.task();
-        if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
-            let _ = sched::operation::deliver_pending_signals_for_task(
-                task,
-                sched::UserContextRef::new(tf.as_usize()),
-            );
-        }
-        #[cfg(feature = "trace-task-lifecycle")]
-        if trace_signal_boundary(nr) {
-            log::info!(
-                "[syscall][signal-boundary] signals-done pid={:?} nr={} state={:?}",
-                task.pid_root(),
-                nr,
-                task.state(),
-            );
-        }
-
-        match task.state() {
-            sched::TaskState::Zombie | sched::TaskState::Dead => {
-                ctx.release_task_ref();
-                sched::schedule_once(0);
-                panic!("[syscall] terminal task scheduled back");
-            }
-            sched::TaskState::Stopped | sched::TaskState::Continued => {
-                sched::schedule_once(0);
-            }
-            _ => {}
-        }
-        #[cfg(feature = "performance-profile")]
-        drop(finalize_profile);
-        #[cfg(feature = "performance-profile")]
-        let _handoff_profile =
-            profiling::scope(profiling::Event::SyscallHandoff).trace_args(nr as u64, 0);
-        sched::run_post_syscall_handoff_lazy();
-        #[cfg(feature = "trace-task-lifecycle")]
-        if trace_signal_boundary(nr) {
-            log::info!(
-                "[syscall][signal-boundary] handoff-done pid={:?} nr={}",
-                ctx.task().pid_root(),
-                nr,
-            );
-        }
     }
-    FastDispatchOutcome::TomoriLinux
+    ctx.finish_borrowed();
+    core::mem::forget(ctx);
+    if frame_finalized {
+        FastDispatchOutcome::FrameRewritten
+    } else {
+        FastDispatchOutcome::FrameAdvanced
+    }
 }

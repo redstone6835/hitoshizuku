@@ -661,25 +661,6 @@ pub(crate) fn rearm_local_timer(deadline_ns: Option<u64>) {
     }
 }
 
-// ── 分配器临界区辅助 ──────────────────────────────────────────────
-
-/// 进入分配器临界区：保存当前中断状态并关闭中断。
-///
-/// 这确保分配器内部操作不被中断打断，避免重入导致的数据竞争。
-#[inline]
-fn gc_enter_critical() -> usize {
-    let state = unsafe { LoongArch64InterruptOps::save_interrupt_state() };
-    unsafe { LoongArch64InterruptOps::disable_interrupts() };
-    state
-}
-
-/// 离开分配器临界区：恢复之前保存的中断状态。
-///
-/// 参数 `state` 来自 `gc_enter_critical` 的返回值。
-fn gc_leave_critical(state: usize) {
-    unsafe { LoongArch64InterruptOps::restore_interrupt_state(state) };
-}
-
 /// LoongArch64 平台内核架构加载器入口。
 ///
 /// 本函数由汇编引导代码（`_start_virtualized`）在以下前置条件均满足后调用：
@@ -695,6 +676,9 @@ fn gc_leave_critical(state: usize) {
 /// # Safety
 /// 此函数只能由 `_start_virtualized` 调用一次，不得从其他任何位置调用。
 pub unsafe extern "C" fn __kernel_arch_loader() {
+    // 内存原语默认使用启动安全的字节路径；读取能力后再开放非对齐快路径。
+    super::mem::init_ual();
+
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 1：安装异常/中断入口地址
     // ═══════════════════════════════════════════════════════════════════════════
@@ -892,7 +876,6 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
 
         allocator::KERNEL_ALLOCATOR.bind_address_translation(phys_to_virt, virt_to_phys);
         allocator::KERNEL_ALLOCATOR.bind_cpu_id(LoongArch64MessageInterruptOps::current_cpu_id);
-        allocator::KERNEL_ALLOCATOR.bind_gc_critical_section(gc_enter_critical, gc_leave_critical);
         allocator::KERNEL_ALLOCATOR.init_boot(heap_start, heap_size);
 
         printk!(
@@ -1136,6 +1119,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             },
             allocator: Some(StartAllocatorOps {
                 kernel_heap_region,
+                tracked_heap_region,
                 map_kernel_heap_range,
                 unmap_kernel_heap_range,
                 protect_kernel_heap_range,

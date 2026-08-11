@@ -55,6 +55,8 @@ EVENT_NAMES = [
     "mem_zero_anon_page", "mem_zero_allocator_small", "mem_zero_allocator_large",
     "mem_copy_realloc", "mem_copy_cow", "alloc_registry_register",
     "alloc_registry_remove", "alloc_registry_lookup",
+    "alloc_registry_register_kernel", "alloc_registry_register_owned",
+    "alloc_owner_range_lookup",
 ]
 
 

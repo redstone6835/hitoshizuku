@@ -507,9 +507,20 @@ impl KernelMixinSiteDescriptorV1 {
     }
 
     /// 返回该站点当前是否安装了处理链。
+    ///
+    /// 该入口供真正要读取路由的慢路径使用，Acquire 与发布者的 Release 配对。
     #[inline]
     pub fn has_handlers(&self) -> bool {
         !self.route.load(Ordering::Acquire).is_null()
+    }
+
+    /// 返回该站点是否可能安装了处理链，只用于决定是否进入慢路径。
+    ///
+    /// 调用方不得解引用这里观察到的指针。真正分发会再次以 Acquire 读取路由，
+    /// 因此空路由快路径不需要在 RISC-V 上为一次提示判断执行内存屏障。
+    #[inline(always)]
+    pub fn has_handlers_hint(&self) -> bool {
+        !self.route.load(Ordering::Relaxed).is_null()
     }
 }
 
@@ -580,6 +591,19 @@ pub unsafe fn dispatch_kernel_mixin(
     let hooks = unsafe { &*hooks };
     // Safety: 调用方承担站点和帧生命周期，钩子表保证同步返回。
     unsafe { (hooks.dispatch)(core::ptr::from_ref(site), core::ptr::from_mut(frame)) }
+}
+
+/// 在独立冷路径中执行内核 Mixin 调用帧逻辑。
+///
+/// 导出宏只在站点存在活动处理链时调用这里。禁止内联可以阻止编译器把慢路径的大型栈帧
+/// 合并回常用入口，使没有处理器的直接符号调用只承担路由快查成本。
+#[cold]
+#[inline(never)]
+pub fn invoke_kernel_mixin_slow<F, R>(callback: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    callback()
 }
 
 /// 目标函数在栈上保存的原逻辑 continuation。
@@ -1251,6 +1275,8 @@ fn valid_rust_path(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    static MIXIN_HINT_ROUTE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
     fn example(value: usize) -> usize {
         value
     }
@@ -1304,5 +1330,36 @@ mod tests {
             )
             .valid([0; 32])
         );
+    }
+
+    #[test]
+    fn mixin_slow_path_invokes_callback_once() {
+        let mut calls = 0usize;
+        let result = invoke_kernel_mixin_slow(|| {
+            calls += 1;
+            42usize
+        });
+        assert_eq!(result, 42);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn mixin_handler_hint_tracks_only_route_presence() {
+        let descriptor = KernelMixinSiteDescriptorV1::new(
+            KERNEL_MIXIN_SITE_HEAD,
+            0,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            "tests.query",
+            "head",
+            &MIXIN_HINT_ROUTE,
+        );
+        assert!(!descriptor.has_handlers_hint());
+
+        let marker = core::ptr::from_ref(&MIXIN_HINT_ROUTE).cast_mut().cast();
+        MIXIN_HINT_ROUTE.store(marker, Ordering::Relaxed);
+        assert!(descriptor.has_handlers_hint());
+        MIXIN_HINT_ROUTE.store(core::ptr::null_mut(), Ordering::Relaxed);
     }
 }

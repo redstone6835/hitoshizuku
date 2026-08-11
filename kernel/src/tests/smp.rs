@@ -35,9 +35,9 @@ fn concurrent_membarrier_rendezvous_completes_on_smp() {
     )
     .expect("无法在 CPU1 启动 membarrier 测试线程");
 
-    let ready_deadline = sched::now_ns_public().saturating_add(2_000_000_000);
+    let ready_deadline = sched::now_ns_direct().saturating_add(2_000_000_000);
     while MEMBARRIER_REMOTE_STATE.load(Ordering::Acquire) == 0
-        && sched::now_ns_public() < ready_deadline
+        && sched::now_ns_direct() < ready_deadline
     {
         core::hint::spin_loop();
     }
@@ -46,9 +46,9 @@ fn concurrent_membarrier_rendezvous_completes_on_smp() {
     MEMBARRIER_START.store(true, Ordering::Release);
     sched::synchronize_cpus().expect("CPU0 membarrier rendezvous 失败");
 
-    let completion_deadline = sched::now_ns_public().saturating_add(2_000_000_000);
+    let completion_deadline = sched::now_ns_direct().saturating_add(2_000_000_000);
     while MEMBARRIER_REMOTE_STATE.load(Ordering::Acquire) == 1
-        && sched::now_ns_public() < completion_deadline
+        && sched::now_ns_direct() < completion_deadline
     {
         // CPU1 可能在本地中断关闭时发布反向请求；等待期间继续服务本 CPU，
         // 与实际 syscall rendezvous 的主动进展规则保持一致。

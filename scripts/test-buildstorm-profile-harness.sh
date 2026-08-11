@@ -60,6 +60,17 @@ if grep -Fq 'deadline_after_ms "$done_timeout_requested_ms"' "$host"; then
     echo "timeout fixture: protocol waits still use the unbounded requested timeout" >&2
     exit 1
 fi
+qemu_exit_unbounded_config=$(PROFILE_QEMU_EXIT_TIMEOUT_MS=0 "$host" --print-config)
+printf '%s\n' "$qemu_exit_unbounded_config" | grep -Fxq 'qemu_exit_timeout_ms=0' || {
+    echo "timeout fixture: explicit unbounded QEMU exit wait was not preserved" >&2
+    exit 1
+}
+qemu_exit_wait_body=$(sed -n '/^if \[ "$qemu_exit_timeout_ms" -eq 0 \]; then$/,/^fi$/p' "$host")
+printf '%s\n' "$qemu_exit_wait_body" | grep -Fq 'docker wait "$container"' &&
+    printf '%s\n' "$qemu_exit_wait_body" | grep -Fq 'timeout "$qemu_exit_timeout_seconds" docker wait "$container"' || {
+    echo "timeout fixture: QEMU exit wait lost its zero/nonzero timeout split" >&2
+    exit 1
+}
 
 la_config=$(PROFILE_ARCH=loongarch64 PROFILE_BOOT_MODE=mygo PROFILE_TARGET_FS=extfs \
     "$host" --print-config)
@@ -523,12 +534,58 @@ stage_watch_output=$(mktemp)
 slow_awk_dir=$(mktemp -d)
 natural_dir=$(mktemp -d)
 early_dir=$(mktemp -d)
+qemu_library=$(mktemp)
+qemu_diag_dir=$(mktemp -d)
+qemu_fake_bin=$(mktemp -d)
 group_pid=
 stage_group_pid=
 stage_watch_pid=
-trap '[ -z "$stage_watch_pid" ] || kill -KILL "$stage_watch_pid" 2>/dev/null || true; [ -z "$stage_group_pid" ] || kill -KILL "-$stage_group_pid" 2>/dev/null || true; [ -z "$group_pid" ] || kill -KILL "-$group_pid" 2>/dev/null || true; rm -f "$fixture" "$summary_python" "$guest_library" "$deadline_library" "$termination_library" "$container_user_library" "$child_pid_file" "$stage_watch_output" /tmp/buildstorm-profile-owner-fixture-mismatch /tmp/buildstorm-profile-owner-fixture-group /tmp/buildstorm-profile-owner-fixture-stage; rm -rf "$summary_dir" "$stage_root" "$slow_awk_dir" "$natural_dir" "$early_dir"' EXIT INT TERM
+trap '[ -z "$stage_watch_pid" ] || kill -KILL "$stage_watch_pid" 2>/dev/null || true; [ -z "$stage_group_pid" ] || kill -KILL "-$stage_group_pid" 2>/dev/null || true; [ -z "$group_pid" ] || kill -KILL "-$group_pid" 2>/dev/null || true; rm -f "$fixture" "$summary_python" "$guest_library" "$deadline_library" "$termination_library" "$container_user_library" "$qemu_library" "$child_pid_file" "$stage_watch_output" /tmp/buildstorm-profile-owner-fixture-mismatch /tmp/buildstorm-profile-owner-fixture-group /tmp/buildstorm-profile-owner-fixture-stage; rm -rf "$summary_dir" "$stage_root" "$slow_awk_dir" "$natural_dir" "$early_dir" "$qemu_diag_dir" "$qemu_fake_bin"' EXIT INT TERM
 printf '#!/bin/sh\nsleep 30\n' >"$slow_awk_dir/awk"
 chmod +x "$slow_awk_dir/awk"
+sed -n '/^host_process_alive()/,/^stop_tcg_time_collector()/p' "$host" |
+    sed '$d' >"$qemu_library"
+qemu_identity_output=$(sh -c '
+    . "$1"
+    sleep 30 & pid=$!
+    qemu_pid=$pid
+    qemu_start_ticks=$(host_process_start_ticks "$pid")
+    qemu_process_alive || exit 10
+    qemu_start_ticks=$((qemu_start_ticks + 1))
+    if qemu_process_alive; then exit 11; fi
+    kill "$pid"
+    wait "$pid" 2>/dev/null || true
+    printf "identity-bound\n"
+' sh "$qemu_library")
+[ "$qemu_identity_output" = identity-bound ] || {
+    echo "QEMU liveness fixture: PID/start-time identity was not enforced" >&2
+    exit 1
+}
+printf '#!/bin/sh\ncase "$1" in logs) echo docker-panic-line ;; inspect) echo container-stopped ;; *) exit 2 ;; esac\n' \
+    >"$qemu_fake_bin/docker"
+chmod +x "$qemu_fake_bin/docker"
+printf 'old-line\nserial-panic-line\n' >"$qemu_diag_dir/profile.serial.log"
+set +e
+qemu_failure_output=$(PATH="$qemu_fake_bin:$PATH" sh -c '
+    . "$1"
+    run_dir=$2 container=fixture-container qemu_pid=99999999 qemu_start_ticks=1
+    qemu_fail_fast guest-prebuild
+' sh "$qemu_library" "$qemu_diag_dir" 2>&1)
+qemu_failure_status=$?
+set -e
+[ "$qemu_failure_status" -ne 0 ] || {
+    echo "QEMU liveness fixture: dead QEMU did not terminate the wait" >&2
+    exit 1
+}
+printf '%s\n' "$qemu_failure_output" | grep -Fq 'QEMU exited while waiting for guest-prebuild' &&
+    printf '%s\n' "$qemu_failure_output" | grep -Fq serial-panic-line &&
+    printf '%s\n' "$qemu_failure_output" | grep -Fq docker-panic-line &&
+    grep -Fxq guest-prebuild "$qemu_diag_dir/qemu-failure-phase.txt" &&
+    grep -Fq docker-panic-line "$qemu_diag_dir/qemu-failure-docker.log" &&
+    grep -Fq container-stopped "$qemu_diag_dir/qemu-failure-container-inspect.json" || {
+    echo "QEMU liveness fixture: failure diagnostics are incomplete" >&2
+    exit 1
+}
 sed -n '/^window_deadline_ns()/,/^}/p' "$host" >"$deadline_library"
 sed -n '/^classify_window_state()/,/^}/p' "$host" >>"$deadline_library"
 deadline_output=$(sh -c '. "$1"; printf "zero=%s positive=%s\n" \

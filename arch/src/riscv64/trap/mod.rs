@@ -257,6 +257,13 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "li t1, {fs_mask}",
         "and t3, t3, t1",
         "ld t0, {sepc_off}(s11)",
+        // 与 Linux 一致，在返回用户态前用不会改变 sepc 的条件存储清除可能由
+        // 用户 LR 指令遗留的 reservation，避免它跨越 syscall/trap 边界存活。
+        "addi t1, s11, {sepc_off}",
+        ".option push",
+        ".option arch, +zalrsc",
+        "sc.d zero, t0, (t1)",
+        ".option pop",
         "csrw {sepc}, t0",
         "ld t0, {status_off}(s11)",
         "li t1, {user_status_keep}",
