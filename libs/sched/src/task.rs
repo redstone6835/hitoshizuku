@@ -1534,6 +1534,7 @@ impl Task {
         };
         self.exec_sibling_exit_requested
             .store(requested, Ordering::SeqCst);
+        self.signal.mark_user_return_work();
     }
 
     pub(crate) fn exec_sibling_exit_preserves_identity(&self) -> bool {
@@ -2242,6 +2243,8 @@ impl Task {
     #[inline]
     fn user_return_work_authoritative(&self) -> bool {
         self.group_exit_boundary_pending()
+            || self.exec_sibling_exit_boundary_pending()
+            || self.native_thread_exit_boundary_pending().is_some()
             || self.has_deliverable_signal()
             || !self.rseq_events().is_empty()
             || matches!(

@@ -1131,6 +1131,39 @@ fn exec_sibling_exit_is_distinct_from_group_exit_and_blocks_sleep() {
 }
 
 #[ktest]
+fn exec_sibling_exit_interrupts_blocking_syscall() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+    worker.set_state(TaskState::Running);
+
+    assert!(!crate::operation::has_interrupting_signal(&worker));
+    crate::operation::request_exec_sibling_exit(&worker, false);
+
+    assert!(crate::operation::has_interrupting_signal(&worker));
+}
+
+#[ktest]
+fn exec_sibling_exit_keeps_user_return_work_armed() {
+    let group = ThreadGroup::new();
+    let leader = make_task_in_group(Arc::clone(&group));
+    let worker = make_task_in_group(Arc::clone(&group));
+    group.set_leader(&leader);
+    group.add_member(&leader);
+    group.add_member(&worker);
+
+    crate::operation::request_exec_sibling_exit(&worker, false);
+
+    assert!(worker.user_return_work_hint_acquire());
+    assert!(worker.signal.take_user_return_work());
+    assert!(worker.refresh_user_return_work_hint());
+    assert!(worker.user_return_work_hint_acquire());
+}
+
+#[ktest]
 fn exec_preserved_zombie_leader_waits_for_identity_adoption() {
     let group = ThreadGroup::new();
     let leader = make_task_in_group(Arc::clone(&group));

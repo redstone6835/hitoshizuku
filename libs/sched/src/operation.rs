@@ -1706,7 +1706,10 @@ pub fn sigpending() -> Result<SigSet, Errno> {
     capabilities = kernel_symbols::capability::SCHED_QUERY
 )]
 pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
-    if task.group_exit_pending() {
+    if task.group_exit_pending()
+        || task.exec_sibling_exit_boundary_pending()
+        || task.native_thread_exit_boundary_pending().is_some()
+    {
         return true;
     }
     let group = task.thread_group();
