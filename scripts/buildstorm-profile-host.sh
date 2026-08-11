@@ -292,6 +292,9 @@ instruction_min_jit_sample_mapping_ppm=${PROFILE_RISCV_MIN_JIT_SAMPLE_MAPPING_PP
 instruction_min_jit_catalog_mapping_ppm=${PROFILE_RISCV_MIN_JIT_CATALOG_MAPPING_PPM:-1000000}
 instruction_min_catalog_jit_coverage_ppm=${PROFILE_RISCV_MIN_CATALOG_JIT_COVERAGE_PPM:-999000}
 instruction_copy_qemu_executable=${PROFILE_RISCV_COPY_QEMU_EXECUTABLE:-0}
+syscall_model=${PROFILE_RISCV_SYSCALL_MODEL:-0}
+syscall_model_plugin=${PROFILE_RISCV_SYSCALL_MODEL_PLUGIN:-"$repo/build/qemu-plugins/riscv_syscall_model.so"}
+syscall_model_map=${PROFILE_RISCV_SYSCALL_MODEL_MAP:-}
 sampling=${PROFILE_SAMPLING:-0}
 trace_enabled=${PROFILE_TRACE_ENABLED:-0}
 timing_shift=${PROFILE_TIMING_SHIFT:-8}
@@ -355,8 +358,16 @@ case "$instruction_copy_qemu_executable" in
     0|1) ;;
     *) echo "PROFILE_RISCV_COPY_QEMU_EXECUTABLE must be 0 or 1" >&2; exit 2 ;;
 esac
+case "$syscall_model" in
+    0|1) ;;
+    *) echo "PROFILE_RISCV_SYSCALL_MODEL must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "$instruction_profile" -eq 1 ] && [ "$arch" != riscv64 ]; then
     echo "PROFILE_RISCV_INSTRUCTION_PROFILE requires PROFILE_ARCH=riscv64" >&2
+    exit 2
+fi
+if [ "$syscall_model" -eq 1 ] && [ "$arch" != riscv64 ]; then
+    echo "PROFILE_RISCV_SYSCALL_MODEL requires PROFILE_ARCH=riscv64" >&2
     exit 2
 fi
 for pair in \
@@ -457,6 +468,16 @@ if [ "$instruction_profile" -eq 1 ]; then
     }
     command -v readelf >/dev/null 2>&1 || {
         echo "profile host: readelf is required for a RISC-V instruction profile" >&2
+        exit 1
+    }
+fi
+if [ "$syscall_model" -eq 1 ]; then
+    test -r "$syscall_model_plugin" || {
+        echo "profile host: missing RISC-V syscall model plugin: $syscall_model_plugin" >&2
+        exit 1
+    }
+    test -r "$syscall_model_map" || {
+        echo "profile host: missing RISC-V syscall model map: ${syscall_model_map:-unset}" >&2
         exit 1
     }
 fi
@@ -1099,6 +1120,40 @@ else
     instruction_mix_id=unavailable
     tcg_time_collector_id=unavailable
 fi
+if [ "$syscall_model" -eq 1 ]; then
+    cp "$syscall_model_plugin" "$run_dir/riscv-syscall-model.so"
+    cp "$syscall_model_map" "$run_dir/riscv-syscall-model.map"
+    syscall_model_id=$(sha256sum "$run_dir/riscv-syscall-model.so" | awk '{print $1}')
+    resolve_syscall_marker() {
+        awk -v symbol="$1" '
+            $NF == symbol && $1 ~ /^[0-9A-Fa-f]+$/ {
+                value = $1
+                matches++
+            }
+            END {
+                if (matches != 1) exit 1
+                print "0x" value
+            }
+        ' "$run_dir/riscv-syscall-model.map"
+    }
+    syscall_enter_pc=$(resolve_syscall_marker __mygo_profile_syscall_enter) || {
+        echo "profile host: syscall enter marker is missing or ambiguous" >&2
+        exit 1
+    }
+    syscall_exit_pc=$(resolve_syscall_marker __mygo_profile_syscall_exit) || {
+        echo "profile host: syscall exit marker is missing or ambiguous" >&2
+        exit 1
+    }
+    syscall_switch_pc=$(resolve_syscall_marker __mygo_profile_task_switch) || {
+        echo "profile host: task switch marker is missing or ambiguous" >&2
+        exit 1
+    }
+else
+    syscall_model_id=unavailable
+    syscall_enter_pc=unavailable
+    syscall_exit_pc=unavailable
+    syscall_switch_pc=unavailable
+fi
 {
     printf 'export PROFILE_BOOT_MODE=%s\n' "$boot_mode"
     printf 'export PROFILE_ARCH=%s\n' "$arch"
@@ -1181,6 +1236,10 @@ clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
         "$instruction_min_jit_sample_mapping_ppm" "$instruction_min_jit_catalog_mapping_ppm" \
         "$instruction_min_catalog_jit_coverage_ppm"
     printf 'instruction_copy_qemu_executable=%s\n' "$instruction_copy_qemu_executable"
+    printf 'riscv_syscall_model=%s\nsyscall_model_sha256=%s\n' \
+        "$syscall_model" "$syscall_model_id"
+    printf 'syscall_enter_pc=%s\nsyscall_exit_pc=%s\nsyscall_switch_pc=%s\n' \
+        "$syscall_enter_pc" "$syscall_exit_pc" "$syscall_switch_pc"
 } >"$run_dir/metadata.env"
 
 base_dir=$(dirname "$base")
@@ -1229,6 +1288,10 @@ fi
 if [ "$instruction_profile" -eq 1 ]; then
     set -- "$@" -jitdump -plugin \
         "/run/riscv-instruction-mix.so,output=/run/instruction-mix.jsonl,catalog=/run/instruction-catalog.jsonl,control=/run/instruction-profile.control,epoch-ms=$instruction_mix_epoch_ms"
+fi
+if [ "$syscall_model" -eq 1 ]; then
+    set -- "$@" -plugin \
+        "/run/riscv-syscall-model.so,output=/run/riscv-syscall-model.json,enter_pc=$syscall_enter_pc,exit_pc=$syscall_exit_pc,switch_pc=$syscall_switch_pc"
 fi
 timeout 30 "$@" >/dev/null
 
@@ -1782,6 +1845,8 @@ done_ns=$(monotonic_ns)
 sample_host final
 if [ "$capture_started" -eq 1 ]; then
     "$repo/scripts/profile-report.sh" "$run_dir/profile.serial.log" >"$run_dir/profile.report" 2>"$run_dir/profile-report.err"
+    python3 "$repo/scripts/analyze-buildstorm-syscalls.py" \
+        "$run_dir/profile.serial.log" --output-dir "$run_dir/syscall-analysis"
     profile_report_status=available
 else
     printf 'unavailable\n' >"$run_dir/profile.report"
@@ -1838,6 +1903,12 @@ case "$qemu_exit_status" in
     ''|*[!0-9]*) echo "profile host: malformed QEMU exit status" >&2; exit 1 ;;
     *) echo "profile host: QEMU exited with status $qemu_exit_status" >&2; exit 1 ;;
 esac
+if [ "$syscall_model" -eq 1 ]; then
+    test -s "$run_dir/riscv-syscall-model.json" || {
+        echo "profile host: RISC-V syscall model plugin produced no report" >&2
+        exit 1
+    }
+fi
 qemu_pid=
 if [ -n "$tcg_time_collector_pid" ]; then
     stop_tcg_time_collector 1

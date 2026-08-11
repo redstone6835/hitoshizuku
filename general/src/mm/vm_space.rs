@@ -4313,7 +4313,8 @@ impl VmSpace {
         let virt_fn = allocator::KERNEL_ALLOCATOR
             .load_phys_to_virt()
             .ok_or(Errno::EFAULT)?;
-        Ok((Arc::clone(&page), virt_fn(page.paddr()) + offset, len))
+        let kva = virt_fn(page.paddr()) + offset;
+        Ok((page, kva, len))
     }
 
     /// 在一次 VMA/pages 快照中固定已经常驻且权限就绪的用户页。

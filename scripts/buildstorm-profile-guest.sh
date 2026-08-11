@@ -708,6 +708,8 @@ capture_controller() {
     fi
     if [ "$PROFILE_CAPTURE" -eq 1 ]; then
         PROFILE_LEAVE_FROZEN=1 /bin/sh /tmp/profile-capture.sh start "$PROFILE_WORKLOAD" || return 1
+        printf 'root=%s\n' "$workload_pid" >"${PROFILE_CONTROL:-/sys/kernel/profile_control}" || return 1
+        echo "@@PROFILE_WORKLOAD_ROOT pid=$workload_pid token=$token"
     fi
     echo "@@PROFILE_WINDOW_READY token=$token"
 

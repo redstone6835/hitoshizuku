@@ -10,6 +10,7 @@ bench = false
 
 [features]
 performance-profile = ["dep:profiling"]
+syscall-model-markers = ["performance-profile", "profiling/syscall-model-markers", "sched/syscall-model-markers"]
 
 [dependencies]
 general = { path = "../general" }

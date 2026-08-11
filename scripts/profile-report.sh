@@ -103,6 +103,16 @@ function require_uint(name, context,    number) {
     if (!is_uint(number)) fail("invalid " context " field " name "=" number)
     return number
 }
+function require_cpu(name, context,    cpu) {
+    if (!has(name)) {
+        fail("missing " context " field " name)
+        return "0"
+    }
+    cpu = value(name)
+    if (!is_uint(cpu) && cpu != "mixed")
+        fail("invalid " context " field " name "=" cpu)
+    return cpu
+}
 function parse_hist(contents, prefix, context,    count, bucket_index, buckets) {
     count = split(contents, buckets, ",")
     if (count != 64) {
@@ -222,7 +232,7 @@ stats_active && /^state=/ {
     next
 }
 stats_active && /^cpu=/ && / event=/ {
-    cpu = require_uint("cpu", "event")
+    cpu = require_cpu("cpu", "event")
     event = value("event")
     if (event == "") fail("missing event field event")
     event_key = case_id SUBSEP phase SUBSEP cpu SUBSEP event
@@ -240,7 +250,7 @@ stats_active && /^cpu=/ && / event=/ {
     next
 }
 stats_active && /^cpu=/ && / metric=/ {
-    cpu = require_uint("cpu", "metric")
+    cpu = require_cpu("cpu", "metric")
     metric = value("metric")
     if (metric == "") fail("missing metric field metric")
     metric_key = case_id SUBSEP phase SUBSEP cpu SUBSEP metric

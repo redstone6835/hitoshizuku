@@ -528,7 +528,7 @@ fn slab_allocation_respects_requested_alignment() {
     }
 }
 
-/// small record 必须携带 slab node cookie，释放路径才能绕过 slab 链表扫描。
+/// small record 必须携带 slab 生命周期 cookie，释放路径才能校验 owner 并绕过链表扫描。
 #[ktest]
 fn slab_record_carries_private_backend_cookie() {
     let before = KERNEL_ALLOCATOR.audit();

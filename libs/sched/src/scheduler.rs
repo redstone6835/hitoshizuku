@@ -3189,6 +3189,12 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
     // 9. 切换。
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
     let prev_on_cpu = prev.on_cpu_slot();
+    #[cfg(feature = "syscall-model-markers")]
+    profiling::syscall_model_task_switch(
+        prev.profile_session_id(),
+        prev.syscall_model_task_id(),
+        false,
+    );
     unsafe {
         if final_prev {
             drop(next);
@@ -3199,6 +3205,12 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
             (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx, prev_on_cpu);
         }
     }
+    #[cfg(feature = "syscall-model-markers")]
+    profiling::syscall_model_task_switch(
+        prev.profile_session_id(),
+        prev.syscall_model_task_id(),
+        true,
+    );
     #[cfg(feature = "performance-profile")]
     {
         let started = CONTEXT_SWITCH_STARTED[cpu_id].swap(0, Ordering::AcqRel);
