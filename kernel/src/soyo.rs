@@ -421,6 +421,11 @@ pub(crate) fn prepare_soyo_runtime_with_vfs(
     } else {
         static_tls_size
     };
+    let initial_tls_alignment = if dynamic_components {
+        soyo::registry::PAGE_SIZE
+    } else {
+        tls.map_or(0, |segment| segment.alignment)
+    };
     let random_seed = start_random_seed()?;
     let provisional_tls_base = if initial_tls_size != 0 {
         soyo::registry::PAGE_SIZE
@@ -461,11 +466,7 @@ pub(crate) fn prepare_soyo_runtime_with_vfs(
         stack_size: runtime.stack_size,
         stack_guard_size: runtime.stack_guard_size,
         tls_memory_size: initial_tls_size,
-        tls_alignment: if initial_tls_size == 0 {
-            0
-        } else {
-            soyo::registry::PAGE_SIZE
-        },
+        tls_alignment: initial_tls_alignment,
         start_info_size: provisional.as_bytes().len() as u64,
         user_lower_bound: soyo::registry::PAGE_SIZE,
     })
