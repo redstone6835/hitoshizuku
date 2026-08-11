@@ -7,11 +7,32 @@
 extern crate std;
 
 use crate::ids::Uid;
+use crate::operation::take_next_pending_signal;
 use crate::signal::{
     SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
     SignalNumber, SignalState,
 };
 use ktest::ktest;
+
+#[ktest]
+fn sparse_pending_bits_only_yield_set_signals() {
+    let mut pending =
+        SignalNumber::SIGUSR2.bit() | SignalNumber::SIGKILL.bit() | SignalNumber::SIGTERM.bit();
+
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGKILL)
+    );
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGUSR2)
+    );
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGTERM)
+    );
+    assert_eq!(take_next_pending_signal(&mut pending), None);
+}
 
 /// 空集不包含任何信号。
 #[ktest]

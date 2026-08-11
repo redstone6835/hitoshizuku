@@ -2296,33 +2296,44 @@ fn migrate_deadline_owners(source_cpu: usize, target_cpu: usize) {
     invalidate_deadline_cache();
 }
 
-fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
+fn take_expired_sleepers(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
     if !HAS_TIMED_SLEEPERS.load(Ordering::Acquire) {
-        return None;
+        return Vec::new();
     }
+    let mut expired = Vec::new();
     let mut sleepers = TIMED_SLEEPERS.lock();
     let mut index = 0;
+    let mut changed = false;
     while index < sleepers.len() {
         let Some(task) = sleepers[index].task.upgrade() else {
             sleepers.swap_remove(index);
-            invalidate_deadline_cache();
+            changed = true;
             continue;
         };
         if sleepers[index].cpu_id == cpu_id && sleepers[index].deadline_ns <= now_ns {
             sleepers.swap_remove(index);
-            HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
-            invalidate_deadline_cache();
-            return Some(task);
+            expired.push(task);
+            changed = true;
+            continue;
         }
         index += 1;
     }
     HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
-    None
+    drop(sleepers);
+    if changed {
+        invalidate_deadline_cache();
+    }
+    expired
+}
+
+#[cfg(test)]
+pub(crate) fn take_expired_sleepers_for_test(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
+    take_expired_sleepers(now_ns, cpu_id)
 }
 
 fn wake_expired_sleepers(now_ns: u64, cpu_id: usize) -> bool {
     let mut woke = false;
-    while let Some(task) = take_expired_sleeper(now_ns, cpu_id) {
+    for task in take_expired_sleepers(now_ns, cpu_id) {
         if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
             task.mark_profile_woken(now_ns);
             enqueue_task_preferred(task, now_ns);
@@ -3455,17 +3466,51 @@ fn service_idle_scheduler_requests(cpu_id: usize) {
     // 防止已处理的请求让 idle_relax 永久跳过硬件等待。空闲核每次从硬件等待
     // 返回后主动拉取一次；本地已经出现普通任务时直接交给 schedule_once。
     let _ = cpu_state.take_resched();
-    let _ = cpu_state.take_balance();
+    let balance_requested = cpu_state.take_balance();
     let local_nr_running = cpu_state.runqueue().nr_running();
-    let _ = run_idle_balance_if_idle(local_nr_running, cpu_id, balance_once);
+    let now_ns = now_ns_internal();
+    let next = &NEXT_BALANCE_NS[cpu_id.min(NR_CPUS - 1)];
+    let _ = run_idle_balance_if_due(
+        local_nr_running,
+        balance_requested,
+        now_ns,
+        next,
+        cpu_id,
+        balance_once,
+    );
 }
 
 #[inline]
-fn run_idle_balance_if_idle<F>(local_nr_running: usize, cpu_id: usize, balance: F) -> bool
+fn run_idle_balance_if_due<F>(
+    local_nr_running: usize,
+    requested: bool,
+    now_ns: u64,
+    next_allowed: &AtomicU64,
+    cpu_id: usize,
+    balance: F,
+) -> bool
 where
     F: FnOnce(usize) -> bool,
 {
-    local_nr_running <= 1 && balance(cpu_id)
+    if local_nr_running > 1 {
+        return false;
+    }
+
+    let next = now_ns.saturating_add(PERIODIC_BALANCE_INTERVAL_NS);
+    if requested {
+        next_allowed.store(next, Ordering::Relaxed);
+        return balance(cpu_id);
+    }
+
+    let previous = next_allowed.load(Ordering::Relaxed);
+    if now_ns < previous
+        || next_allowed
+            .compare_exchange(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return false;
+    }
+    balance(cpu_id)
 }
 
 // ── exit 辅助 ────────────────────────────────────────────────────────────────
@@ -3601,31 +3646,53 @@ mod deadline_observer_tests {
 
 #[cfg(test)]
 mod idle_balance_tests {
-    use super::run_idle_balance_if_idle;
+    use super::{PERIODIC_BALANCE_INTERVAL_NS, run_idle_balance_if_due};
     use core::cell::Cell;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn idle_balance_runs_without_request_when_local_queue_is_empty() {
+    fn requested_idle_balance_runs_immediately() {
         let calls = Cell::new(0usize);
+        let next = AtomicU64::new(1_000);
         let run = |cpu_id| {
             assert_eq!(cpu_id, 3);
             calls.set(calls.get() + 1);
             true
         };
 
-        assert!(run_idle_balance_if_idle(1, 3, run));
+        assert!(run_idle_balance_if_due(1, true, 100, &next, 3, run));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            100 + PERIODIC_BALANCE_INTERVAL_NS
+        );
+    }
+
+    #[test]
+    fn idle_balance_without_request_is_rate_limited() {
+        let calls = Cell::new(0usize);
+        let next = AtomicU64::new(200);
+        let run = |_| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(!run_idle_balance_if_due(1, false, 199, &next, 3, run));
+        assert_eq!(calls.get(), 0);
+        assert!(run_idle_balance_if_due(1, false, 200, &next, 3, run));
         assert_eq!(calls.get(), 1);
     }
 
     #[test]
     fn idle_balance_skips_scan_when_local_queue_has_work() {
         let calls = Cell::new(0usize);
+        let next = AtomicU64::new(0);
         let run = |_| {
             calls.set(calls.get() + 1);
             true
         };
 
-        assert!(!run_idle_balance_if_idle(2, 3, run));
+        assert!(!run_idle_balance_if_due(2, true, 0, &next, 3, run));
         assert_eq!(calls.get(), 0);
     }
 }
