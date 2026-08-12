@@ -582,13 +582,16 @@ impl FileOps for ExtRegFileOps {
                         .then_some(phys_start + (partial_lb - range_lb) as u64)
                 });
             if let Some(physical) = physical {
-                let mut block = vec![0u8; block_size];
-                self.state
-                    .read_block(physical, &mut block)
-                    .map_err(map_err)?;
-                copy_to_scatter(pages, full_len, &block[..partial_len])?;
+                {
+                    let mut targets = scatter_range_mut(pages, full_len, block_size)
+                        .ok_or(VfsError::InvalidArgument)?;
+                    self.state
+                        .read_data_blocks_vectored(physical, 1, &mut targets)
+                        .map_err(map_err)?;
+                }
+                zero_scatter_range(pages, valid_len, block_size - partial_len)?;
             } else {
-                zero_scatter_range(pages, full_len, partial_len)?;
+                zero_scatter_range(pages, full_len, block_size)?;
             }
         }
 
@@ -985,17 +988,6 @@ fn zero_scatter_range(pages: &mut [&mut [u8]], start: usize, len: usize) -> VfsR
     let targets = scatter_range_mut(pages, start, len).ok_or(VfsError::InvalidArgument)?;
     for target in targets {
         target.fill(0);
-    }
-    Ok(())
-}
-
-fn copy_to_scatter(pages: &mut [&mut [u8]], start: usize, src: &[u8]) -> VfsResult<()> {
-    let targets = scatter_range_mut(pages, start, src.len()).ok_or(VfsError::InvalidArgument)?;
-    let mut copied = 0usize;
-    for target in targets {
-        let end = copied + target.len();
-        target.copy_from_slice(&src[copied..end]);
-        copied = end;
     }
     Ok(())
 }
