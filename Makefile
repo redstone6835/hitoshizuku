@@ -214,6 +214,8 @@ ENSURE_BUSYBOX := scripts/ensure-busybox.sh
 BUSYBOX_SKELETON := userland/busybox-initramfs
 PACK_INITRAMFS := scripts/pack-initramfs.sh
 WORKLOAD_PROFILER := scripts/profile-workload-guest.sh
+LEGACY_LTP_TESTCODE := userland/ltp_testcode.sh
+LEGACY_LTP_SCENARIOS := userland/ltp-scenarios
 
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
@@ -473,6 +475,12 @@ define prepare_compat_rootfs
 	cp -a $(BUILD_DIR)/$(1)/busybox-rootfs/. $(2)/
 	mkdir -p $(2)/etc $(2)/tmp
 	cp -a $(3)/etc/. $(2)/etc/
+	mkdir -p $(2)/etc/ltp-scenarios
+	cp -a $(LEGACY_LTP_SCENARIOS)/. $(2)/etc/ltp-scenarios/
+	install -m 0755 $(LEGACY_LTP_TESTCODE) $(2)/etc/ltp_testcode.sh
+	install -m 0755 $(3)/etc/init.d/rcS $(2)/etc/init.d/rcS
+	install -m 0755 $(3)/etc/init.d/test.sh $(2)/etc/init.d/test.sh
+	install -m 0755 $(3)/etc/init.d/judge.sh $(2)/etc/init.d/judge.sh
 	printf '%s\n' '$(TEST_MODE)' >$(2)/etc/mygo-test-mode
 	printf '%s\n' '$(TEST_WORKLOAD)' >$(2)/etc/mygo-test-workload
 	printf '%s\n' '$(PROFILE_MODE)' >$(2)/etc/mygo-profile-mode

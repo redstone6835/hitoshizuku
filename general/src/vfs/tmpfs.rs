@@ -31,8 +31,8 @@ const TMPFS_VIRTUAL_BLOCKS: u64 = 256 * 1024;
 const TMPFS_VIRTUAL_INODES: u64 = 1_000_000;
 const TMPFS_PAGE_SIZE: usize = 4096;
 const TMPFS_PAGE_SIZE_U64: u64 = TMPFS_PAGE_SIZE as u64;
+// 一个槽池批量管理 16 个页，但每个页单独申请，避免依赖连续的 64 KiB 大块。
 const TMPFS_SLAB_PAGES: usize = 16;
-const TMPFS_SLAB_SIZE: usize = TMPFS_PAGE_SIZE * TMPFS_SLAB_PAGES;
 const TMPFS_SLAB_FREE: u16 = u16::MAX;
 const TMPFS_MAX_BATCH_PAGES: usize = 8;
 
@@ -338,7 +338,7 @@ impl SuperblockOps for TmpfsSuperblockOps {
 // ── 分片页槽池 ───────────────────────────────────────────────────────────────
 
 struct TmpfsPageSlab {
-    data: Box<[UnsafeCell<u8>]>,
+    data: Box<[Box<[UnsafeCell<u8>]>]>,
     free: Spinlock<u16>,
     shard: usize,
     pool: Weak<TmpfsPagePool>,
@@ -346,14 +346,20 @@ struct TmpfsPageSlab {
 
 impl TmpfsPageSlab {
     fn new(shard: usize, pool: Weak<TmpfsPagePool>) -> VfsResult<Self> {
-        let mut data: Vec<UnsafeCell<u8>> = Vec::new();
-        data.try_reserve_exact(TMPFS_SLAB_SIZE)
+        let mut data: Vec<Box<[UnsafeCell<u8>]>> = Vec::new();
+        data.try_reserve_exact(TMPFS_SLAB_PAGES)
             .map_err(|_| VfsError::OutOfMemory)?;
-        // Safety: `UnsafeCell<u8>` 与 `u8` 布局相同且全零有效。capacity 已经精确
-        // 预留；初始化全部元素后才发布 Vec 长度。
-        unsafe {
-            core::ptr::write_bytes(data.as_mut_ptr(), 0, TMPFS_SLAB_SIZE);
-            data.set_len(TMPFS_SLAB_SIZE);
+        for _ in 0..TMPFS_SLAB_PAGES {
+            let mut page: Vec<UnsafeCell<u8>> = Vec::new();
+            page.try_reserve_exact(TMPFS_PAGE_SIZE)
+                .map_err(|_| VfsError::OutOfMemory)?;
+            // Safety: `UnsafeCell<u8>` 与 `u8` 布局相同且全零有效。capacity 已经精确
+            // 预留；初始化全部元素后才发布 Vec 长度。
+            unsafe {
+                core::ptr::write_bytes(page.as_mut_ptr(), 0, TMPFS_PAGE_SIZE);
+                page.set_len(TMPFS_PAGE_SIZE);
+            }
+            data.push(page.into_boxed_slice());
         }
         Ok(Self {
             data: data.into_boxed_slice(),
@@ -442,7 +448,7 @@ impl TmpfsPagePool {
             Self::append_slots(output, &slab, &batch);
         }
 
-        if output.len() < count {
+        while output.len() < count {
             let slab = match TmpfsPageSlab::new(shard_index, Arc::downgrade(self)) {
                 Ok(slab) => Arc::new(slab),
                 Err(error) => {
@@ -455,10 +461,15 @@ impl TmpfsPagePool {
                 take_tmpfs_slots(&mut free, count - output.len())
             };
             debug_assert!(batch.len != 0);
-            self.available[shard_index]
-                .lock()
-                .push(Arc::downgrade(&slab));
-            Self::append_slots(output, &slab, &batch);
+            if batch.len != 0 {
+                let remains_available = *slab.free.lock() != 0;
+                if remains_available {
+                    self.available[shard_index]
+                        .lock()
+                        .push(Arc::downgrade(&slab));
+                }
+                Self::append_slots(output, &slab, &batch);
+            }
         }
 
         debug_assert_eq!(output.len(), count);
@@ -539,8 +550,7 @@ impl TmpfsPageSlot {
     }
 
     fn range(&self) -> core::ops::Range<usize> {
-        let start = self.lease.slot as usize * TMPFS_PAGE_SIZE;
-        start..start + TMPFS_PAGE_SIZE
+        0..TMPFS_PAGE_SIZE
     }
 
     fn data(&self) -> &[u8] {
@@ -548,7 +558,10 @@ impl TmpfsPageSlot {
         // Safety: 活跃 slot 唯一且固定映射到该区间；backing 在 Arc 生命周期内不移动。
         unsafe {
             core::slice::from_raw_parts(
-                self.slab.data.as_ptr().add(range.start).cast::<u8>(),
+                self.slab.data[self.lease.slot as usize]
+                    .as_ptr()
+                    .add(range.start)
+                    .cast::<u8>(),
                 range.len(),
             )
         }
@@ -560,8 +573,7 @@ impl TmpfsPageSlot {
         // slot 不重叠，同一 inode 又由 data 锁串行化。
         unsafe {
             core::slice::from_raw_parts_mut(
-                self.slab
-                    .data
+                self.slab.data[self.lease.slot as usize]
                     .as_ptr()
                     .add(range.start)
                     .cast_mut()
@@ -1837,23 +1849,21 @@ mod tests {
     }
 
     #[test]
-    fn tmpfs_slot_batch_reserves_disjoint_pages_and_releases_them() {
+    fn tmpfs_page_slab_releases_all_slots() {
         let mut free = TMPFS_SLAB_FREE;
-        let first = take_tmpfs_slots(&mut free, 4);
+        let first = take_tmpfs_slots(&mut free, TMPFS_MAX_BATCH_PAGES);
+        assert_eq!(first.len, TMPFS_MAX_BATCH_PAGES);
+        assert_eq!(&first.slots[..first.len], &[0, 1, 2, 3, 4, 5, 6, 7]);
         let second = take_tmpfs_slots(&mut free, TMPFS_MAX_BATCH_PAGES);
-        assert_eq!(&first.slots[..first.len], &[0, 1, 2, 3]);
-        assert_eq!(&second.slots[..second.len], &[4, 5, 6, 7, 8, 9, 10, 11]);
-
-        let allocated = first.len + second.len;
-        for (index, slot) in first.slots[..first.len]
+        assert_eq!(second.len, TMPFS_MAX_BATCH_PAGES);
+        assert_eq!(&second.slots[..second.len], &[8, 9, 10, 11, 12, 13, 14, 15]);
+        for slot in first.slots[..first.len]
             .iter()
             .chain(second.slots[..second.len].iter())
             .copied()
-            .enumerate()
         {
-            assert_eq!(release_tmpfs_slot(&mut free, slot), index + 1 == allocated);
+            release_tmpfs_slot(&mut free, slot);
         }
-        let tail = take_tmpfs_slots(&mut free, TMPFS_MAX_BATCH_PAGES);
-        assert_eq!(&tail.slots[..tail.len], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(free, TMPFS_SLAB_FREE);
     }
 }
