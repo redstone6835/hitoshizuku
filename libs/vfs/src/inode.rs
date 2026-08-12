@@ -45,7 +45,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::vfs::cred::{Credentials, Gid, Uid};
 use crate::vfs::error::{VfsError, VfsResult};
@@ -114,6 +114,57 @@ pub struct InodeMeta {
 const STATE_LIVE: u8 = 0;
 const STATE_ORPHANED: u8 = 1;
 const STATE_EVICTED: u8 = 2;
+/// 私有文件页缓存身份；0 保留为“不可缓存”，耗尽后永久停止分配新身份。
+static NEXT_PRIVATE_PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(1);
+
+const DATA_MUTATION_BITS: u32 = 16;
+const DATA_MUTATION_MASK: u64 = (1 << DATA_MUTATION_BITS) - 1;
+const DATA_GENERATION_SHIFT: u32 = DATA_MUTATION_BITS;
+const DATA_CACHE_DISABLED: u64 = 1 << 63;
+const DATA_GENERATION_MAX: u64 = (DATA_CACHE_DISABLED - 1) >> DATA_GENERATION_SHIFT;
+
+const fn data_state(generation: u64, active: usize, disabled: bool) -> u64 {
+    debug_assert!(generation <= DATA_GENERATION_MAX);
+    debug_assert!(active <= DATA_MUTATION_MASK as usize);
+    (generation << DATA_GENERATION_SHIFT)
+        | active as u64
+        | if disabled { DATA_CACHE_DISABLED } else { 0 }
+}
+
+const fn data_state_generation(state: u64) -> u64 {
+    (state & !DATA_CACHE_DISABLED) >> DATA_GENERATION_SHIFT
+}
+
+const fn data_state_active(state: u64) -> usize {
+    (state & DATA_MUTATION_MASK) as usize
+}
+
+const fn data_state_disabled(state: u64) -> bool {
+    state & DATA_CACHE_DISABLED != 0
+}
+
+const fn finish_data_mutation_state(state: u64) -> Option<u64> {
+    let active = data_state_active(state);
+    if active == 0 {
+        return None;
+    }
+    let generation = data_state_generation(state);
+    let disabled = data_state_disabled(state) || generation == DATA_GENERATION_MAX;
+    let generation = if generation == DATA_GENERATION_MAX {
+        generation
+    } else {
+        generation + 1
+    };
+    Some(data_state(generation, active - 1, disabled))
+}
+
+fn allocate_private_page_cache_id() -> usize {
+    NEXT_PRIVATE_PAGE_CACHE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or(0)
+}
 
 /// 根据文件系统实例标识符和超级块设备号推导 `stat(2)` 使用的 `st_dev` 值。
 ///
@@ -138,6 +189,9 @@ pub struct Inode {
     /// 全局唯一标识符，由文件系统实例 ID 和 inode 编号组成。在 Inode 创建时确定，
     /// 之后永远不会改变。
     pub(crate) id: InodeId,
+
+    /// 内核生命周期内不复用的私有文件页缓存身份。
+    private_page_cache_id: usize,
 
     /// 文件类型（普通文件、目录、符号链接、字符设备、块设备、FIFO 或套接字）。
     /// 在 Inode 创建时确定，之后永远不会改变。将文件类型作为顶层不可变字段而非
@@ -174,6 +228,19 @@ pub struct Inode {
     /// `meta.nlink` 的原子镜像，用于 link/unlink/evict 相关热路径。
     cached_nlink: AtomicU32,
 
+    /// 文件代际、活跃修改数和永久禁用标志的原子快照。
+    ///
+    /// 三者必须由读者一致观察；合并后稳定代际查询只需一次 Acquire，写者仍以
+    /// 单次 AcqRel 更新发布开始和结束状态。
+    data_state: AtomicU64,
+
+    /// 普通文件的写打开与执行映像排斥状态。
+    ///
+    /// 正值表示当前持有写访问的打开文件描述数量，负值表示当前引用该 inode 的
+    /// 执行映像数量，零表示空闲。两类访问通过同一个原子量切换，保证并发
+    /// `open(O_WRONLY)` 与 `execve` 不会同时成功。
+    exec_write_state: AtomicIsize,
+
     /// 文件系统驱动提供的操作实现。VFS 层通过这个 trait object 调用 lookup、
     /// create、read、write 等操作，实现对不同文件系统（ext4、tmpfs、procfs 等）
     /// 的透明访问。通过 Arc 共享操作对象，使同一类 inode 可以复用同一套方法实现，
@@ -193,6 +260,20 @@ pub struct Inode {
     lifecycle: AtomicU8,
 }
 
+/// 文件内容发布区间的 RAII guard。只对显式声明支持私有页缓存的普通文件激活。
+pub(crate) struct InodeDataMutation<'a> {
+    inode: &'a Inode,
+    active: bool,
+}
+
+impl Drop for InodeDataMutation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.inode.end_data_mutation_raw();
+        }
+    }
+}
+
 impl Inode {
     /// 构造一个新的 Inode 并返回其 Arc 引用。
     ///
@@ -210,8 +291,17 @@ impl Inode {
         ops: Arc<dyn InodeOps + Send + Sync>,
         superblock: Weak<Superblock>,
     ) -> Arc<Self> {
+        // 只有显式支持稳定内容代际的普通文件才会进入全局私有页缓存。目录、设备
+        // 以及未实现该协议的文件不应争用全局 ID 分配原子的 cache line。
+        let private_page_cache_id =
+            if kind == FileType::Regular && ops.supports_private_page_cache() {
+                allocate_private_page_cache_id()
+            } else {
+                0
+            };
         Arc::new(Self {
             id,
+            private_page_cache_id,
             kind,
             rdev,
             blksize,
@@ -219,6 +309,8 @@ impl Inode {
             meta: crate::vfs::sync::Spinlock::new(meta),
             cached_size: AtomicU64::new(meta.size),
             cached_nlink: AtomicU32::new(meta.nlink),
+            data_state: AtomicU64::new(data_state(1, 0, false)),
+            exec_write_state: AtomicIsize::new(0),
             ops,
             superblock,
             lifecycle: AtomicU8::new(STATE_LIVE),
@@ -235,6 +327,11 @@ impl Inode {
         self.kind
     }
 
+    /// 返回可跨打开文件描述复用、且不会因对象地址复用而冲突的缓存身份。
+    pub(crate) fn private_page_cache_key(&self) -> Option<usize> {
+        (self.private_page_cache_id != 0).then_some(self.private_page_cache_id)
+    }
+
     /// 返回当前文件大小的无锁快照。
     pub fn size(&self) -> u64 {
         self.cached_size.load(Ordering::Acquire)
@@ -243,6 +340,143 @@ impl Inode {
     /// 返回当前硬链接计数的无锁快照。
     pub fn nlink(&self) -> u32 {
         self.cached_nlink.load(Ordering::Acquire)
+    }
+
+    /// 返回当前文件内容代际的无锁快照。
+    pub fn data_generation(&self) -> u64 {
+        data_state_generation(self.data_state.load(Ordering::Acquire))
+    }
+
+    /// 返回可用于私有干净页缓存的稳定代际。
+    ///
+    /// 代际、active 和禁用标志来自同一个原子状态字；VM 在读取文件页之后还会
+    /// 再次验证同一状态，形成完整的乐观快照协议。
+    pub(crate) fn private_page_cache_generation(&self) -> Option<u64> {
+        if self.private_page_cache_id == 0 {
+            return None;
+        }
+        let state = self.data_state.load(Ordering::Acquire);
+        (!data_state_disabled(state) && data_state_active(state) == 0)
+            .then(|| data_state_generation(state))
+    }
+
+    fn begin_data_mutation_raw(&self) -> bool {
+        let previous = self
+            .data_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let active = data_state_active(state);
+                if active == DATA_MUTATION_MASK as usize {
+                    return Some(state | DATA_CACHE_DISABLED);
+                }
+                Some(data_state(
+                    data_state_generation(state),
+                    active + 1,
+                    data_state_disabled(state),
+                ))
+            })
+            .expect("data state update closure must always produce a value");
+        data_state_active(previous) != DATA_MUTATION_MASK as usize
+    }
+
+    fn end_data_mutation_raw(&self) {
+        // 必须先推进代际再撤销最后一个 active，防止读者观察到“稳定的旧代际”。
+        let result = self.data_state.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            finish_data_mutation_state,
+        );
+        assert!(result.is_ok(), "[vfs] data mutation publication underflow");
+    }
+
+    fn private_page_cache_supported(&self) -> bool {
+        self.private_page_cache_id != 0
+    }
+
+    /// 在可能修改文件内容的 VFS 调用前建立发布 guard。失败路径也会推进代际，
+    /// 因为文件系统错误可能发生在已经写入部分块之后。
+    pub(crate) fn begin_data_mutation(&self) -> InodeDataMutation<'_> {
+        let active = self.private_page_cache_supported() && self.begin_data_mutation_raw();
+        InodeDataMutation {
+            inode: self,
+            active,
+        }
+    }
+
+    /// 在可写共享映射生效前永久关闭私有干净页缓存。禁用标志与新代际在同一次
+    /// 原子更新中发布，与 VM 发布候选页前的二次 generation 检查共同封闭并发窗口。
+    pub(crate) fn disable_private_page_cache(&self) {
+        if !self.private_page_cache_supported() {
+            return;
+        }
+        let _ = self
+            .data_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if data_state_disabled(state) {
+                    return None;
+                }
+                let generation = data_state_generation(state)
+                    .saturating_add(1)
+                    .min(DATA_GENERATION_MAX);
+                Some(data_state(generation, data_state_active(state), true))
+            });
+    }
+
+    /// 获取普通文件写访问租约。
+    ///
+    /// 当该 inode 正被任一执行映像占用时返回 `ETXTBSY`。同类写访问可以并存，
+    /// 租约析构时自动递减计数，因此 `dup`/`fork` 共享同一个 `File` 时不会重复计数。
+    pub(crate) fn acquire_write_access(self: &Arc<Self>) -> VfsResult<InodeWriteAccess> {
+        let mut current = self.exec_write_state.load(Ordering::Acquire);
+        loop {
+            if current < 0 {
+                return Err(VfsError::TextFileBusy);
+            }
+            let next = current
+                .checked_add(1)
+                .ok_or(VfsError::TooManyOpenFilesSystem)?;
+            match self.exec_write_state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(InodeWriteAccess {
+                        inode: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// 获取执行映像租约。
+    ///
+    /// 当该 inode 已有写打开时返回 `ETXTBSY`。多个由 `fork` 或重复 `exec` 产生的
+    /// 执行映像可以同时持有租约；最后一个租约释放前，新的写打开和路径截断均被拒绝。
+    pub fn acquire_exec_access(self: &Arc<Self>) -> VfsResult<InodeExecAccess> {
+        let mut current = self.exec_write_state.load(Ordering::Acquire);
+        loop {
+            if current > 0 {
+                return Err(VfsError::TextFileBusy);
+            }
+            let next = current
+                .checked_sub(1)
+                .ok_or(VfsError::TooManyOpenFilesSystem)?;
+            match self.exec_write_state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(InodeExecAccess {
+                        inode: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// 返回当前元数据的一致性快照。
@@ -280,6 +514,8 @@ impl Inode {
     /// 这样既减少了一次 `Weak::upgrade()` 的原子开销，也进一步缩短了 `stat` 热路径
     /// 上的依赖链。
     pub fn stat(&self) -> VfsResult<FileStat> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::VfsStat);
         let m = self.meta_snapshot();
         let size = i64::try_from(m.size).map_err(|_| VfsError::FileTooLarge)?;
         Ok(FileStat {
@@ -331,6 +567,21 @@ impl Inode {
         let mut meta = self.meta.lock();
         meta.size = new_size;
         meta.blocks = blocks;
+        self.cached_size.store(new_size, Ordering::Release);
+    }
+
+    /// 同时发布常规写入后的大小、块数与修改时间。
+    ///
+    /// 文件系统已经完成数据写入后使用此入口，可把原本分散的三次元数据加锁和
+    /// 两次时钟读取合并为一次。`mtime` 与 `ctime` 取同一个时间点，`atime` 以及
+    /// 所有权、权限和链接计数保持不变。
+    pub fn set_size_blocks_and_modified(&self, new_size: u64, blocks: u64) {
+        let mut meta = self.meta.lock();
+        let now = Timespec::now();
+        meta.size = new_size;
+        meta.blocks = blocks;
+        meta.mtime = now;
+        meta.ctime = now;
         self.cached_size.store(new_size, Ordering::Release);
     }
 
@@ -470,6 +721,33 @@ impl Inode {
     }
 }
 
+/// 普通文件写访问租约，只能由 VFS 打开和路径截断流程创建。
+pub(crate) struct InodeWriteAccess {
+    inode: Arc<Inode>,
+}
+
+impl Drop for InodeWriteAccess {
+    fn drop(&mut self) {
+        let previous = self.inode.exec_write_state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "write access state must be positive");
+    }
+}
+
+/// 执行映像租约。
+///
+/// 装载器必须在 ELF 校验和复制前获取该租约，并将其保存到任务执行状态；这样文件
+/// 从 `execve` 成功直至最后一个相关任务退出期间都不能被写打开或截断。
+pub struct InodeExecAccess {
+    inode: Arc<Inode>,
+}
+
+impl Drop for InodeExecAccess {
+    fn drop(&mut self) {
+        let previous = self.inode.exec_write_state.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous < 0, "exec access state must be negative");
+    }
+}
+
 impl Drop for Inode {
     fn drop(&mut self) {
         if self.lifecycle.load(Ordering::Acquire) == STATE_ORPHANED {
@@ -502,6 +780,14 @@ impl Drop for Inode {
 /// NotSupported 错误的默认实现，只读文件系统只需实现 lookup、readlink 和 open
 /// 等读取类方法即可。
 pub trait InodeOps {
+    /// 是否保证普通文件内容的每次变化都经由 VFS 数据代际发布。
+    ///
+    /// 默认关闭，避免 procfs、sysfs 和设备文件等动态内容被跨地址空间复用。
+    /// 只有内容变化完全受 VFS write/truncate/fallocate 路径约束的文件系统才能开启。
+    fn supports_private_page_cache(&self) -> bool {
+        false
+    }
+
     /// 在当前目录中按名称查找子项。
     ///
     /// name 是单个路径分量（不含路径分隔符），例如 "etc" 或 "passwd"。如果目录中
@@ -513,7 +799,7 @@ pub trait InodeOps {
     /// 在当前目录中创建一个新的普通文件。
     ///
     /// mode 是经过 umask 掩码处理后的最终权限位，cred 是发起操作的进程凭据（驱动
-    /// 应当用 cred 中的 euid 和 egid 设置新文件的所有者和所属组）。如果目录中已
+    /// 应当用 cred 中的 fsuid 和 fsgid 设置新文件的所有者和所属组）。如果目录中已
     /// 存在同名条目，驱动应当返回 AlreadyExists 错误。
     fn create(
         &self,
@@ -687,4 +973,32 @@ pub trait InodeOps {
     /// 返回 &dyn Any 引用，用于支持从 trait object 向下转型到具体的驱动类型。
     /// 实现者只需写 fn as_any(&self) -> &dyn Any { self } 即可。
     fn as_any(&self) -> &dyn core::any::Any;
+}
+
+#[cfg(test)]
+mod data_state_tests {
+    use super::{
+        DATA_GENERATION_MAX, data_state, data_state_active, data_state_disabled,
+        data_state_generation, finish_data_mutation_state,
+    };
+
+    #[test]
+    fn data_mutation_finish_advances_generation_before_last_active_clears() {
+        let state = data_state(7, 1, false);
+        let next = finish_data_mutation_state(state).expect("活跃 mutation 必须能结束");
+
+        assert_eq!(data_state_generation(next), 8);
+        assert_eq!(data_state_active(next), 0);
+        assert!(!data_state_disabled(next));
+    }
+
+    #[test]
+    fn data_generation_saturation_permanently_disables_private_cache() {
+        let state = data_state(DATA_GENERATION_MAX, 1, false);
+        let next = finish_data_mutation_state(state).expect("最后一个 mutation 必须能结束");
+
+        assert_eq!(data_state_generation(next), DATA_GENERATION_MAX);
+        assert_eq!(data_state_active(next), 0);
+        assert!(data_state_disabled(next));
+    }
 }

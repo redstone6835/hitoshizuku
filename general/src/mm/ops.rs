@@ -148,19 +148,65 @@ pub struct UserPgdOps {
     /// 任何对该 handle 的访问都是 UB。
     pub drop_pgd: unsafe fn(handle: PgdHandle),
 
+    /// 清零一段尚未发布的用户物理页 direct-map 虚拟地址。
+    ///
+    /// arch 可以在这里使用 `cbo.zero`、向量存储等 ISA 专用清页实现；general
+    /// 保证范围由分配器独占，且在回调完成前不会写入 resident ledger 或页表。
+    ///
+    /// # Safety
+    /// `vaddr` 必须按用户基础页对齐并覆盖至少 `len` 个可写字节；`len` 必须是
+    /// 用户基础页大小的整数倍。
+    pub zero_user_pages: unsafe fn(vaddr: usize, len: usize),
+
     /// 在 `vaddr` 处映射一页 4 KiB 物理页 `paddr`，权限 `flags`。
     ///
     /// # Safety
     /// `vaddr` 必须 4K 对齐；`paddr` 同；`flags` 必须含 [`VmFlags::USER`]。
-    pub map: unsafe fn(handle: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags),
+    pub map: unsafe fn(
+        handle: PgdHandle,
+        vaddr: usize,
+        paddr: usize,
+        flags: VmFlags,
+    ) -> Result<(), crate::MapError>,
+
+    /// 从 `vaddr` 起连续安装一批基础页，物理页地址由 `paddrs` 逐页给出。
+    ///
+    /// 返回值中的 `mapped` 表示错误前已经生效的连续前缀。调用方必须为这部分
+    /// 页面建立 resident 所有权账本，不能因为批次后缀失败而直接释放它们。
+    ///
+    /// # Safety
+    /// `handle` 必须合法；`vaddr` 和所有 `paddrs` 必须按基础页对齐；目标叶
+    /// PTE 必须为空，`flags` 必须含 [`VmFlags::USER`]。
+    pub map_pages: unsafe fn(
+        handle: PgdHandle,
+        vaddr: usize,
+        paddrs: &[usize],
+        flags: VmFlags,
+    ) -> crate::MapBatchResult,
+
+    /// 发布一段从“无叶 PTE”变为“有效叶 PTE”的新映射。
+    ///
+    /// 本回调只保证先前页表写对当前 CPU 的硬件页表遍历可见，并清除当前 CPU
+    /// 可能缓存的无效 translation；不会等待其它 CPU，也不能用于替换、解除映射
+    /// 或权限变更。其它正在运行同一地址空间的 CPU 若命中旧无效状态，会在缺页
+    /// 重试路径调用同一回调完成本地收敛。
+    ///
+    /// # Safety
+    /// `handle` 必须合法；区间必须按基础页对齐，且调用方必须确认其中所有新写入
+    /// 的叶 PTE 此前均无有效映射。
+    pub publish_new_mapping: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize),
 
     /// 解除 `[vaddr, vaddr+len)` 区间的映射。`len` 必须是 4K 倍数。
     ///
     /// # Safety
     /// 区间需位于用户半空间且属于本 PGD 拥有的页。
+    /// 页表修改完成后不会自动执行跨 CPU TLB 失效；调用方必须在不持有内部
+    /// 自旋锁的情况下单独调用 [`Self::invalidate_range`]。
     pub unmap: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize),
 
     /// 改变现有映射的权限。
+    /// 页表修改完成后不会自动执行跨 CPU TLB 失效；调用方必须在不持有内部
+    /// 自旋锁的情况下单独调用 [`Self::invalidate_range`]。
     pub protect: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags),
 
     /// fork 时把 src 的 [`range`] 区间已映射页拷到 dst。保底"全深拷"语义；
@@ -177,6 +223,15 @@ pub struct UserPgdOps {
     /// 通常只在 `schedule_once` 切换 task 之后立刻调用。
     pub activate: unsafe fn(handle: PgdHandle),
 
+    /// 把当前 CPU 切回内核页表。
+    ///
+    /// idle 和纯内核线程没有用户 `VmSpace`，但不能继续沿用上一个
+    /// 用户任务的 PGD；该 PGD 可能在退出回收路径中立即释放。
+    ///
+    /// # Safety
+    /// 通常只在调度器已决定切向无用户地址空间任务时调用。
+    pub activate_kernel: unsafe fn(),
+
     /// 让 `[vaddr, vaddr+len)` 的 TLB 项失效。
     pub invalidate_range: unsafe fn(handle: PgdHandle, vaddr: usize, len: usize),
 
@@ -187,6 +242,36 @@ pub struct UserPgdOps {
 // Safety: 仅函数指针。
 unsafe impl Sync for UserPgdOps {}
 unsafe impl Send for UserPgdOps {}
+
+/// 用户页表更新的发布范围。
+///
+/// 新建映射没有可越过资源回收边界的旧有效 translation，只需当前 CPU 本地
+/// 收敛；其它更新可能遗留仍可访问旧物理页或旧权限的 TLB 项，必须同步所有曾经
+/// 激活过该地址空间的 CPU。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserPteUpdate {
+    NewMapping,
+    ExistingMapping,
+}
+
+impl UserPteUpdate {
+    /// 按更新类型选择本地发布或同步跨核失效。
+    ///
+    /// # Safety
+    /// 调用方必须满足所选 [`UserPgdOps`] 回调的句柄、地址范围和映射状态契约。
+    pub(super) unsafe fn publish(
+        self,
+        ops: &UserPgdOps,
+        handle: PgdHandle,
+        vaddr: usize,
+        len: usize,
+    ) {
+        match self {
+            Self::NewMapping => unsafe { (ops.publish_new_mapping)(handle, vaddr, len) },
+            Self::ExistingMapping => unsafe { (ops.invalidate_range)(handle, vaddr, len) },
+        }
+    }
+}
 
 // ── UserAccessOps ────────────────────────────────────────────────────────────
 
@@ -280,4 +365,90 @@ pub fn all_ops_registered() -> bool {
         && user_pgd_ops().is_some()
         && user_access_ops().is_some()
         && fault_decode_ops().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ops::Range;
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{PgdHandle, UserPgdOps, UserPteUpdate};
+    use mm::VmFlags;
+
+    static LOCAL_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
+    static REMOTE_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn new_pgd() -> PgdHandle {
+        PgdHandle::from_raw(NonNull::dangling())
+    }
+
+    unsafe fn ignore_handle(_: PgdHandle) {}
+    unsafe fn ignore_zero_user_pages(_: usize, _: usize) {}
+    unsafe fn ignore_activate_kernel() {}
+    unsafe fn ignore_map(
+        _: PgdHandle,
+        _: usize,
+        _: usize,
+        _: VmFlags,
+    ) -> Result<(), crate::MapError> {
+        Ok(())
+    }
+    unsafe fn ignore_map_pages(
+        _: PgdHandle,
+        _: usize,
+        paddrs: &[usize],
+        _: VmFlags,
+    ) -> crate::MapBatchResult {
+        crate::MapBatchResult {
+            mapped: paddrs.len(),
+            error: None,
+        }
+    }
+    unsafe fn record_local(_: PgdHandle, _: usize, _: usize) {
+        LOCAL_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn ignore_protect(_: PgdHandle, _: usize, _: usize, _: VmFlags) {}
+    unsafe fn ignore_clone(_: PgdHandle, _: PgdHandle, _: Range<usize>) {}
+    unsafe fn record_remote(_: PgdHandle, _: usize, _: usize) {
+        REMOTE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn count_none(_: PgdHandle, _: usize, _: usize) -> usize {
+        0
+    }
+
+    fn fake_ops() -> UserPgdOps {
+        UserPgdOps {
+            new_pgd_for_user: new_pgd,
+            drop_pgd: ignore_handle,
+            zero_user_pages: ignore_zero_user_pages,
+            map: ignore_map,
+            map_pages: ignore_map_pages,
+            publish_new_mapping: record_local,
+            unmap: record_remote,
+            protect: ignore_protect,
+            clone_for_fork: ignore_clone,
+            activate: ignore_handle,
+            activate_kernel: ignore_activate_kernel,
+            invalidate_range: record_remote,
+            count_mapped: count_none,
+        }
+    }
+
+    #[test]
+    fn user_pte_update_routes_local_and_remote_publication() {
+        LOCAL_PUBLICATIONS.store(0, Ordering::Relaxed);
+        REMOTE_INVALIDATIONS.store(0, Ordering::Relaxed);
+        let ops = fake_ops();
+        let handle = (ops.new_pgd_for_user)();
+
+        // Safety: fake 回调不解引用句柄；地址范围仅用于验证 vtable 路由。
+        unsafe {
+            UserPteUpdate::NewMapping.publish(&ops, handle, 0x1000, 0x1000);
+            UserPteUpdate::ExistingMapping.publish(&ops, handle, 0x2000, 0x1000);
+        }
+
+        assert_eq!(LOCAL_PUBLICATIONS.load(Ordering::Relaxed), 1);
+        assert_eq!(REMOTE_INVALIDATIONS.load(Ordering::Relaxed), 1);
+    }
 }

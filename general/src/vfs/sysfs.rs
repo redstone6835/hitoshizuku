@@ -25,10 +25,9 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::dev::block::BlockDevice;
+use crate::dev::block::{BlockAttributes, BlockFeatures, BlockGeometry, BlockIoStatsSnapshot};
 use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::DeviceFunction;
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
 use crate::vfs::device_files::projection::{
@@ -62,6 +61,23 @@ const KERNEL_OSRELEASE_INO: u64 = 21;
 const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
 const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
+const KERNEL_NET_STATS_INO: u64 = 25;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_STATS_INO: u64 = 26;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_SAMPLES_INO: u64 = 28;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_CATALOG_INO: u64 = 29;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_TRACE_INO: u64 = 73;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_SNAPSHOT_INO: u64 = 74;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_HEALTH_INO: u64 = 75;
+const KERNEL_ELM_DIR_INO: u64 = 80;
+const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -73,12 +89,19 @@ const CPU_TOPOLOGY_SLOTS: u64 = 8;
 
 static SYSFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SYSFS_INO_REGISTRY: Spinlock<Option<SysfsInoRegistry>> = Spinlock::new(None);
+static ELM_SYSFS_RENDERER: Spinlock<Option<ElmSysfsRenderer>> = Spinlock::new(None);
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
 const SYSFS_BLOCK_CLASS: &str = "block";
 const SYSFS_CHAR_CLASS: &str = "char";
 const SYSFS_NET_CLASS: &str = NET_CLASS.as_str();
+
+pub type ElmSysfsRenderer = fn(&str) -> String;
+
+pub fn register_elm_renderer(renderer: ElmSysfsRenderer) {
+    *ELM_SYSFS_RENDERER.lock() = Some(renderer);
+}
 
 /// sysfs 用户视图默认策略。
 ///
@@ -346,7 +369,10 @@ struct BlockDevSnapshot {
     /// /sys/block/ 与 /sys/dev/block/ 下的目录名 = `dev.name()`（如 "vd0"）。
     sysfs_name: String,
     rdev: DevId,
-    dev: Arc<BlockDevice>,
+    geometry: BlockGeometry,
+    features: BlockFeatures,
+    attributes: BlockAttributes,
+    io_stats: BlockIoStatsSnapshot,
     class_name: &'static str,
 }
 
@@ -379,15 +405,21 @@ struct SysPnpDeviceSnapshot {
     sysfs_name: String,
     /// PnP core 内部登记名，保留原始固件/总线语义用于展示。
     name: String,
-    bus_type: &'static str,
+    bus_type: String,
     id: PnpId,
     state: &'static str,
-    driver: Option<&'static str>,
+    driver: Option<String>,
     parent: Option<String>,
     child_count: usize,
-    functions: Vec<Arc<dyn DeviceFunction>>,
+    functions: Vec<SysPnpFunctionSnapshot>,
     resources: Vec<PnpOwnedResourceSnapshot>,
     deferred_dependency: Option<PnpDependency>,
+}
+
+#[derive(Clone)]
+struct SysPnpFunctionSnapshot {
+    class_name: String,
+    dev_name: String,
 }
 
 #[derive(Clone)]
@@ -478,7 +510,7 @@ fn push_sysfs_dir_entry(out: &mut Vec<DirEntry>, ino: u64, name: &str, kind: Fil
 struct SysSnapshot {
     devices: Vec<SysDeviceSnapshot>,
     pnp_devices: Vec<SysPnpDeviceSnapshot>,
-    pnp_buses: Vec<&'static str>,
+    pnp_buses: Vec<String>,
     virtual_devices: Vec<SysVirtualDeviceSnapshot>,
     virtual_classes: Vec<&'static str>,
     classes: Vec<SysClassSnapshot>,
@@ -626,7 +658,7 @@ impl SysSnapshot {
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
         for dev in PNP_DEVICES.try_list().unwrap_or_default() {
-            let bus_type = dev.info.bus_type().as_str();
+            let bus_type = dev.info.bus_name().to_string();
             let mut sysfs_name = sysfs_component_name(&dev.name);
             if snap
                 .pnp_devices
@@ -644,7 +676,15 @@ impl SysSnapshot {
                 sysfs_name = sysfs_component_name(&format!("{}-{}-{suffix}", dev.name, dev.id));
                 suffix = suffix.saturating_add(1);
             }
-            let functions = dev.try_functions().unwrap_or_default();
+            let functions = dev
+                .try_functions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|function| SysPnpFunctionSnapshot {
+                    class_name: function.class_name().to_string(),
+                    dev_name: function.dev_name().to_string(),
+                })
+                .collect();
             let resources = dev.try_owned_resources().unwrap_or_default();
             let parent = dev.parent().map(|parent| parent.name.to_string());
             let child_count = dev
@@ -654,7 +694,7 @@ impl SysSnapshot {
             snap.pnp_devices.push(SysPnpDeviceSnapshot {
                 sysfs_name,
                 name: dev.name.to_string(),
-                bus_type,
+                bus_type: bus_type.clone(),
                 id: dev.id.clone(),
                 state: pnp_state_name(dev.state()),
                 driver: dev.bound_driver_name(),
@@ -673,14 +713,17 @@ impl SysSnapshot {
         // projection 层已经确认发布的 devtmpfs+device_numbers 联合快照，sysfs
         // 不再重复解释 `/dev` 节点和设备号表的关联规则。
         for projection in published_block_devnodes(&DEVICES.functions) {
-            let dev = Arc::clone(projection.dev());
+            let dev = projection.dev();
             let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), projection.rdev(), |name| {
                 snap.blocks.iter().any(|block| block.sysfs_name == name)
             });
             snap.blocks.push(BlockDevSnapshot {
                 sysfs_name,
                 rdev: projection.rdev(),
-                dev,
+                geometry: *dev.geometry(),
+                features: dev.features(),
+                attributes: dev.attributes(),
+                io_stats: dev.io_stats(),
                 class_name: projection.class_id().as_str(),
             });
         }
@@ -837,11 +880,11 @@ impl SysSnapshot {
                 SysClassNodeKind::Symlink { target },
             );
         }
-        for iface in net::stack().snapshot_interfaces() {
+        for iface in net::device::snapshot_devices() {
             push_class_node(
                 &mut snap,
                 SYSFS_NET_CLASS,
-                iface.name,
+                iface.name.into_string(),
                 SysClassNodeKind::NetInterface {
                     iface_id: iface.id.raw(),
                 },
@@ -1149,7 +1192,7 @@ fn class_net_stats_slot_ino(iface_id: u32, slot: u64) -> u64 {
     sysfs_dynamic_ino(SysfsKey::net_stats_slot(iface_id, slot))
 }
 
-fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -> String {
+fn render_netdev_file(iface: &net::device::NetDeviceSnapshot, slot: NetDevSlot) -> String {
     use alloc::fmt::Write;
     let mut s = String::new();
     match slot {
@@ -1159,7 +1202,7 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_link_type_ether);
         }
         NetDevSlot::Address => {
-            let mac = iface.mac;
+            let mac = iface.mac_address;
             let _ = writeln!(
                 s,
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1170,7 +1213,8 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", iface.mtu);
         }
         NetDevSlot::Flags => {
-            let _ = writeln!(s, "0x{:x}", iface.flags);
+            let flags = if iface.running { 0x41u32 } else { 0 };
+            let _ = writeln!(s, "0x{:x}", flags);
         }
         NetDevSlot::IfIndex => {
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_ifindex(iface.id.raw()));
@@ -1179,19 +1223,11 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_tx_queue_len);
         }
         NetDevSlot::Carrier => {
-            let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 {
-                "1"
-            } else {
-                "0"
-            };
+            let carrier = if iface.running { "1" } else { "0" };
             let _ = writeln!(s, "{}", carrier);
         }
         NetDevSlot::Operstate => {
-            let state = if iface.flags & net::stack::IFF_UP != 0 {
-                "up"
-            } else {
-                "down"
-            };
+            let state = if iface.running { "up" } else { "down" };
             let _ = writeln!(s, "{}", state);
         }
         NetDevSlot::StatisticsRxBytes => {
@@ -1483,18 +1519,142 @@ enum SysRegFile {
     Version,
     Cmdline,
     DeviceFunctions,
+    NetStats,
+    #[cfg(feature = "performance-profile")]
+    ProfileStats,
+    #[cfg(feature = "performance-profile")]
+    ProfileControl,
+    #[cfg(feature = "performance-profile")]
+    ProfileSamples,
+    #[cfg(feature = "performance-profile")]
+    ProfileCatalog,
+    #[cfg(feature = "performance-profile")]
+    ProfileTrace,
+    #[cfg(feature = "performance-profile")]
+    ProfileSnapshot,
+    #[cfg(feature = "performance-profile")]
+    ProfileHealth,
+    Elm {
+        slot: ElmSysfsSlot,
+    },
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
     },
 }
 
+#[derive(Clone, Copy)]
+enum ElmSysfsSlot {
+    Core,
+    Policy,
+    Health,
+    Menu,
+    Topology,
+    Ports,
+    Providers,
+    Bindings,
+    Events,
+    Audit,
+    Api,
+    Trust,
+    ProjectionSources,
+    Journal,
+    Executions,
+    OwnedResources,
+    ResourceAccounting,
+    Workers,
+    Diagnostics,
+}
+
+impl ElmSysfsSlot {
+    const ALL: &'static [Self] = &[
+        Self::Core,
+        Self::Policy,
+        Self::Health,
+        Self::Menu,
+        Self::Topology,
+        Self::Ports,
+        Self::Providers,
+        Self::Bindings,
+        Self::Events,
+        Self::Audit,
+        Self::Api,
+        Self::Trust,
+        Self::ProjectionSources,
+        Self::Journal,
+        Self::Executions,
+        Self::OwnedResources,
+        Self::ResourceAccounting,
+        Self::Workers,
+        Self::Diagnostics,
+    ];
+
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::Core => 0,
+            Self::Policy => 1,
+            Self::Health => 2,
+            Self::Menu => 3,
+            Self::Topology => 4,
+            Self::Ports => 5,
+            Self::Providers => 6,
+            Self::Bindings => 7,
+            Self::Events => 8,
+            Self::Audit => 9,
+            Self::Api => 10,
+            Self::Trust => 11,
+            Self::ProjectionSources => 12,
+            Self::Journal => 13,
+            Self::Executions => 14,
+            Self::OwnedResources => 15,
+            Self::ResourceAccounting => 16,
+            Self::Workers => 18,
+            Self::Diagnostics => 17,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Policy => "policy",
+            Self::Health => "health",
+            Self::Menu => "menu",
+            Self::Topology => "topology",
+            Self::Ports => "ports",
+            Self::Providers => "providers",
+            Self::Bindings => "bindings",
+            Self::Events => "events",
+            Self::Audit => "audit",
+            Self::Api => "api",
+            Self::Trust => "trust",
+            Self::ProjectionSources => "projection-sources",
+            Self::Journal => "journal",
+            Self::Executions => "executions",
+            Self::OwnedResources => "owned-resources",
+            Self::ResourceAccounting => "resource-accounting",
+            Self::Workers => "workers",
+            Self::Diagnostics => "diagnostics",
+        }
+    }
+}
+
+fn elm_sysfs_slot_by_name(name: &str) -> Option<ElmSysfsSlot> {
+    ElmSysfsSlot::ALL
+        .iter()
+        .find(|slot| slot.file_name() == name)
+        .copied()
+}
+
+fn kernel_elm_slot_ino(slot: ElmSysfsSlot) -> u64 {
+    KERNEL_ELM_FILE_BASE_INO + slot.to_u64()
+}
+
 // ─── 内容渲染 ────────────────────────────────────────────────
 
 fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> String {
-    let dev = &snap.blocks[idx].dev;
-    let geom = dev.geometry();
-    let features = dev.features();
+    let dev = &snap.blocks[idx];
+    let geom = &dev.geometry;
+    let features = dev.features;
     match slot {
         BlockDevSlot::Size => {
             let sectors = geom
@@ -1511,7 +1671,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             }
         }
         BlockDevSlot::Removable => {
-            if dev.attributes().removable() {
+            if dev.attributes.removable() {
                 "1\n".into()
             } else {
                 "0\n".into()
@@ -1521,7 +1681,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
-            let stats = dev.io_stats();
+            let stats = dev.io_stats;
             // 这里输出通用块层维护的兼容 diskstats 字段。合并计数和队列总耗时
             // 当前没有独立数据源，保持为 0；完成数、扇区数、inflight 和操作耗时
             // 均来自 BlockDevice 的 BIO 统计。
@@ -1542,7 +1702,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             )
         }
         BlockDevSlot::Inflight => {
-            let stats = dev.io_stats();
+            let stats = dev.io_stats;
             format!("{} {}\n", stats.read_inflight, stats.write_inflight)
         }
         BlockDevSlot::Periodic => String::new(),
@@ -1551,14 +1711,14 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
 }
 
 fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot) -> String {
-    let dev = &snap.blocks[idx].dev;
-    let geom = dev.geometry();
-    let features = dev.features();
+    let dev = &snap.blocks[idx];
+    let geom = &dev.geometry;
+    let features = dev.features;
     match slot {
         BlockQueueSlot::Lbs => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::Pbs => format!("{}\n", geom.physical_block_size().get()),
         BlockQueueSlot::Rotational => {
-            if dev.attributes().rotational() {
+            if dev.attributes.rotational() {
                 "1\n".into()
             } else {
                 "0\n".into()
@@ -1567,7 +1727,7 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
         BlockQueueSlot::NrRequests => {
             // 没有真实队列深度的设备使用 sysfs 用户视图默认值；VirtIO 等驱动会填实际协商值。
             let depth = dev
-                .attributes()
+                .attributes
                 .queue_depth()
                 .map(|n| n.get())
                 .unwrap_or(SYSFS_USER_VIEW_POLICY.block_nr_requests);
@@ -1622,6 +1782,7 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
         PnpDeviceSlot::State => format!("{}\n", dev.state),
         PnpDeviceSlot::Driver => dev
             .driver
+            .as_deref()
             .map(|name| format!("{name}\n"))
             .unwrap_or_default(),
         PnpDeviceSlot::Parent => dev
@@ -1635,7 +1796,7 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
             for function in &dev.functions {
                 let _ = core::fmt::Write::write_fmt(
                     &mut out,
-                    format_args!("{}:{}\n", function.class_id().as_str(), function.dev_name()),
+                    format_args!("{}:{}\n", function.class_name, function.dev_name),
                 );
             }
             out
@@ -1874,6 +2035,430 @@ fn render_kernel_cmdline() -> String {
     }
 }
 
+fn render_net_stats() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    for stat in net::device::snapshot_stats() {
+        let _ = writeln!(
+            output,
+            "device={} queue={} key={} value={}",
+            stat.device.0, stat.queue.0, stat.key, stat.value,
+        );
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_stats() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let session = profiling::session_info();
+    let _ = writeln!(
+        output,
+        "state={} enabled={} session={} generation={} phase={} active_writers={} counter_hz={} event_mask={:#x} event_mask_high={:#x} sampling={} sample_hz={} trace={} timing_shift={} effective_timing_shift={} timing_sampler={} cpu_slots={} histogram_buckets={} syscall_slots={} errno_slots={}",
+        session.state.name(),
+        u8::from(profiling::enabled()),
+        session.session_id,
+        session.generation,
+        session.phase,
+        session.active_writers,
+        session.counter_hz,
+        session.event_mask,
+        session.event_mask_high,
+        u8::from(session.sampling_enabled),
+        session.sample_hz,
+        u8::from(session.trace_enabled),
+        session.timing_shift,
+        profiling::effective_timing_shift(),
+        session.timing_sampler,
+        profiling::CPU_SLOTS,
+        profiling::HISTOGRAM_BUCKETS,
+        profiling::SYSCALL_SLOTS,
+        profiling::ERRNO_SLOTS,
+    );
+    for cpu in 0..profiling::CPU_SLOTS {
+        for event in profiling::Event::ALL {
+            let value = profiling::snapshot(cpu, event);
+            if value.calls == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                output,
+                "cpu={} event={} event_id={} category={} calls={} timed_samples={} sample_ratio={}/{} cycles={} bytes={} packets={} sampled_max_cycles={} sampled_wall_ns={} estimated_wall_ns={} mean_ns={} sampled_on_cpu_ns={} estimated_on_cpu_ns={} sampled_off_cpu_ns={} estimated_off_cpu_ns={} sampled_max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                ProfileCpuDisplay(cpu),
+                event.name(),
+                event as usize,
+                event.category().name(),
+                value.calls,
+                value.timed_samples,
+                value.timed_samples,
+                value.calls,
+                value.cycles,
+                value.bytes,
+                value.packets,
+                value.max_cycles,
+                value.wall_ns,
+                profiling::estimate_total(value.wall_ns, value.calls, value.timed_samples),
+                value.wall_ns.checked_div(value.timed_samples).unwrap_or(0),
+                value.on_cpu_ns,
+                profiling::estimate_total(value.on_cpu_ns, value.calls, value.timed_samples),
+                value.off_cpu_ns,
+                profiling::estimate_total(value.off_cpu_ns, value.calls, value.timed_samples),
+                value.max_latency_ns,
+                value.migrations,
+                profiling::histogram_percentile(&value.latency, 50),
+                profiling::histogram_percentile(&value.latency, 95),
+                profiling::histogram_percentile(&value.latency, 99),
+                HistogramDisplay(&value.latency),
+            );
+        }
+        for metric in profiling::Metric::ALL {
+            let value = profiling::metric_snapshot(cpu, metric);
+            if value.observations == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                output,
+                "cpu={} metric={} observations={} sum={} max={} p50={} p95={} p99={} hist={}",
+                ProfileCpuDisplay(cpu),
+                metric.name(),
+                value.observations,
+                value.sum,
+                value.max,
+                profiling::histogram_percentile(&value.values, 50),
+                profiling::histogram_percentile(&value.values, 95),
+                profiling::histogram_percentile(&value.values, 99),
+                HistogramDisplay(&value.values),
+            );
+        }
+    }
+    for phase in 0..profiling::MAX_PHASES {
+        for nr in 0..profiling::SYSCALL_SLOTS {
+            let Some(value) = profiling::syscall_snapshot(phase, nr) else {
+                continue;
+            };
+            let timing = value.timing;
+            let completed = value.success.saturating_add(value.errors);
+            let inflight = timing.calls.saturating_sub(completed);
+            let _ = writeln!(
+                output,
+                "phase={} syscall={} calls={} completed={} inflight={} success={} errors={} cycles={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                phase,
+                nr,
+                timing.calls,
+                completed,
+                inflight,
+                value.success,
+                value.errors,
+                timing.cycles,
+                timing.max_cycles,
+                timing.wall_ns,
+                timing.on_cpu_ns,
+                timing.off_cpu_ns,
+                timing.max_latency_ns,
+                timing.migrations,
+                profiling::histogram_percentile(&timing.latency, 50),
+                profiling::histogram_percentile(&timing.latency, 95),
+                profiling::histogram_percentile(&timing.latency, 99),
+                HistogramDisplay(&timing.latency),
+            );
+        }
+    }
+    for slot in 0..profiling::ERRNO_SLOTS {
+        let Some(value) = profiling::errno_snapshot(slot) else {
+            continue;
+        };
+        let _ = writeln!(
+            output,
+            "phase={} syscall={} errno={} count={}",
+            value.phase, value.nr, value.errno, value.count,
+        );
+    }
+    for slot in 0..profiling::TASK_SLOTS {
+        let Some(value) = profiling::task_snapshot(slot) else {
+            continue;
+        };
+        let _ = writeln!(
+            output,
+            "task session={} pid={} tgid={} ppid={} runtime_ns={} voluntary_switches={} involuntary_switches={} migrations={} exited={} exit_code={}",
+            value.session,
+            value.pid,
+            value.tgid,
+            value.ppid,
+            value.runtime_ns,
+            value.voluntary_switches,
+            value.involuntary_switches,
+            value.migrations,
+            u8::from(value.exited),
+            value.exit_code,
+        );
+    }
+    let _ = writeln!(
+        output,
+        "health dropped_errno_records={} dropped_task_records={}",
+        profiling::dropped_errno_records(),
+        profiling::dropped_task_records(),
+    );
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+struct HistogramDisplay<'a>(&'a [u64; profiling::HISTOGRAM_BUCKETS]);
+
+#[cfg(feature = "performance-profile")]
+struct ProfileCpuDisplay(usize);
+
+#[cfg(feature = "performance-profile")]
+impl core::fmt::Display for ProfileCpuDisplay {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == profiling::MIXED_CPU {
+            formatter.write_str("mixed")
+        } else {
+            write!(formatter, "{}", self.0)
+        }
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+impl core::fmt::Display for HistogramDisplay<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, value) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{value}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_samples() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let session = profiling::session_info();
+    let _ = writeln!(
+        output,
+        "state={} enabled={} session={} generation={} sampling={} sample_hz={} aggregation=image_pc slots_per_cpu={}",
+        session.state.name(),
+        u8::from(profiling::enabled()),
+        session.session_id,
+        session.generation,
+        u8::from(session.sampling_enabled),
+        session.sample_hz,
+        profiling::SAMPLE_SLOTS,
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        let _ = writeln!(
+            output,
+            "cpu={} dropped_samples={}",
+            cpu,
+            profiling::dropped_samples(cpu),
+        );
+        for slot in 0..profiling::SAMPLE_SLOTS {
+            let Some(sample) = profiling::sample_slot(cpu, slot) else {
+                continue;
+            };
+            let _ = writeln!(
+                output,
+                "cpu={} task=0 mode={} pc={:#x} image={:#x} load_base={:#x} samples={}",
+                cpu,
+                if sample.from_user { "user" } else { "kernel" },
+                sample.pc,
+                sample.image_id,
+                sample.load_base,
+                sample.samples,
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_trace() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let session = profiling::session_info();
+    let _ = writeln!(
+        output,
+        "state={} enabled={} session={} generation={} active_writers={} trace={} counter_hz={} slots_per_cpu={} record_bytes={} format_version={}",
+        session.state.name(),
+        u8::from(profiling::enabled()),
+        session.session_id,
+        session.generation,
+        session.active_writers,
+        u8::from(session.trace_enabled),
+        session.counter_hz,
+        profiling::TRACE_SLOTS_PER_CPU,
+        profiling::TRACE_RECORD_BYTES,
+        profiling::TRACE_FORMAT_VERSION,
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        let window = profiling::trace_window(cpu);
+        let _ = writeln!(
+            output,
+            "cpu={} first_sequence={} next_sequence={} retained={} overwritten={} dropped={}",
+            cpu,
+            window.first_sequence,
+            window.next_sequence,
+            window.next_sequence.saturating_sub(window.first_sequence),
+            window.overwritten,
+            window.dropped,
+        );
+        for sequence in window.first_sequence..window.next_sequence {
+            let Some(record) = profiling::trace_record(cpu, sequence) else {
+                continue;
+            };
+            let _ = writeln!(
+                output,
+                "cpu={} sequence={} session={} generation={} timestamp_cycles={} duration_cycles={} kind={} event={} event_id={} category={} task={} span={} arg0={} arg1={}",
+                record.cpu,
+                record.sequence,
+                record.session_id,
+                record.generation,
+                record.timestamp_cycles,
+                record.duration_cycles,
+                record.kind.name(),
+                record.event.name(),
+                record.event as usize,
+                record.event.category().name(),
+                record.task_id,
+                record.span_id,
+                record.arg0,
+                record.arg1,
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_control() -> String {
+    let session = profiling::session_info();
+    format!(
+        "state={} enabled={} session={} generation={} phase={} workload_root={} active_writers={} event_mask={:#x} event_mask_high={:#x} sampling={} sample_hz={} trace={} timing_shift={} effective_timing_shift={} timing_sampler={} commands=start,resume,freeze,stop,reset,preset=<name>,events=<mask>,events_high=<mask>,root=<pid>,phase=<0..31>,samples=0|1,sample_hz=<50..1000>,trace=0|1,timing_shift=0..16\n",
+        session.state.name(),
+        u8::from(profiling::enabled()),
+        session.session_id,
+        session.generation,
+        session.phase,
+        profiling::workload_root(),
+        session.active_writers,
+        session.event_mask,
+        session.event_mask_high,
+        u8::from(session.sampling_enabled),
+        session.sample_hz,
+        u8::from(session.trace_enabled),
+        session.timing_shift,
+        profiling::effective_timing_shift(),
+        session.timing_sampler,
+    )
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_catalog() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    for preset in [
+        profiling::Preset::Io,
+        profiling::Preset::Syscall,
+        profiling::Preset::Filesystem,
+        profiling::Preset::Memory,
+        profiling::Preset::Scheduler,
+        profiling::Preset::Block,
+        profiling::Preset::Network,
+        profiling::Preset::Build,
+        profiling::Preset::All,
+    ] {
+        let _ = writeln!(
+            output,
+            "kind=preset name={} mask={:#x} mask_high={:#x}",
+            preset.name(),
+            profiling::preset_event_mask(preset),
+            profiling::preset_event_mask_high(preset),
+        );
+    }
+    for event in profiling::Event::ALL {
+        let id = event as usize;
+        let (word, mask) = if id < u64::BITS as usize {
+            (0, 1u64 << id)
+        } else {
+            (1, 1u64 << (id - u64::BITS as usize))
+        };
+        let _ = writeln!(
+            output,
+            "kind=event id={} name={} category={} mask_word={} mask={:#x}",
+            id,
+            event.name(),
+            event.category().name(),
+            word,
+            mask,
+        );
+    }
+    for metric in profiling::Metric::ALL {
+        let _ = writeln!(
+            output,
+            "kind=metric id={} name={}",
+            metric as usize,
+            metric.name(),
+        );
+    }
+    for kind in profiling::TraceKind::ALL {
+        let _ = writeln!(
+            output,
+            "kind=trace id={} name={}",
+            kind as usize,
+            kind.name(),
+        );
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_health() -> String {
+    use alloc::fmt::Write;
+    let session = profiling::session_info();
+    let mut output = String::new();
+    let dropped_samples = (0..profiling::MAX_CPUS)
+        .map(profiling::dropped_samples)
+        .sum::<u64>();
+    let dropped_trace = (0..profiling::MAX_CPUS)
+        .map(|cpu| profiling::trace_window(cpu).overwritten)
+        .sum::<u64>();
+    let valid = session.state == profiling::SessionState::Frozen && session.active_writers == 0;
+    let samples_complete = dropped_samples == 0;
+    let trace_complete = dropped_trace == 0;
+    let errno_complete = profiling::dropped_errno_records() == 0;
+    let tasks_complete = profiling::dropped_task_records() == 0;
+    let complete = samples_complete && trace_complete && errno_complete && tasks_complete;
+    let _ = writeln!(
+        output,
+        "valid={} complete={} samples_complete={} trace_complete={} errno_complete={} tasks_complete={} state={} active_writers={} dropped_samples={} dropped_trace={} dropped_errno_records={} dropped_task_records={} schema_version={} snapshot_bytes={}",
+        u8::from(valid),
+        u8::from(complete),
+        u8::from(samples_complete),
+        u8::from(trace_complete),
+        u8::from(errno_complete),
+        u8::from(tasks_complete),
+        session.state.name(),
+        session.active_writers,
+        dropped_samples,
+        dropped_trace,
+        profiling::dropped_errno_records(),
+        profiling::dropped_task_records(),
+        profiling::BINARY_SCHEMA_VERSION,
+        profiling::binary_snapshot_len(),
+    );
+    output
+}
+
+fn render_elm_sysfs_file(name: &str) -> String {
+    match *ELM_SYSFS_RENDERER.lock() {
+        Some(renderer) => renderer(name),
+        None => "status=unavailable\n".into(),
+    }
+}
+
 fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
     match kind {
         SysRegFile::BlockDev { idx, slot } => render_block_dev_file(snap, idx, slot),
@@ -1900,9 +2485,24 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
             append_function_projection_diagnostics(&mut out);
             out
         }
+        SysRegFile::NetStats => render_net_stats(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileStats => render_profile_stats(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileControl => render_profile_control(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileSamples => render_profile_samples(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileCatalog => render_profile_catalog(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileTrace => render_profile_trace(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileSnapshot => String::new(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileHealth => render_profile_health(),
+        SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
-            if let Some(iface) = net::stack()
-                .snapshot_interfaces()
+            if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
                 .find(|i| i.id.raw() == iface_id)
             {
@@ -1995,6 +2595,17 @@ struct SysDirFile {
 struct SysRegFileOps {
     kind: SysRegFile,
     snap: Arc<SysSnapshot>,
+    snapshot: Option<Box<[u8]>>,
+}
+
+fn read_bytes_at(buf: &mut [u8], offset: u64, bytes: &[u8]) -> VfsResult<usize> {
+    let off = offset as usize;
+    if off >= bytes.len() {
+        return Ok(0);
+    }
+    let n = core::cmp::min(buf.len(), bytes.len() - off);
+    buf[..n].copy_from_slice(&bytes[off..off + n]);
+    Ok(n)
 }
 
 fn feed_dir_entries(
@@ -2045,18 +2656,137 @@ impl FileOps for SysDirFile {
 
 impl FileOps for SysRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let s = render_reg_file(&self.snap, self.kind);
-        let bytes = s.as_bytes();
-        let total = bytes.len();
-        let off = offset as usize;
-        if off >= total {
-            return Ok(0);
+        #[cfg(feature = "performance-profile")]
+        if matches!(self.kind, SysRegFile::ProfileSnapshot) {
+            if profiling::state() != profiling::SessionState::Frozen {
+                return Err(VfsError::InvalidArgument);
+            }
+            return Ok(profiling::read_binary_snapshot(buf, offset));
         }
-        let n = core::cmp::min(buf.len(), total - off);
-        buf[..n].copy_from_slice(&bytes[off..off + n]);
-        Ok(n)
+        if let Some(snapshot) = self.snapshot.as_deref() {
+            return read_bytes_at(buf, offset, snapshot);
+        }
+        let s = render_reg_file(&self.snap, self.kind);
+        read_bytes_at(buf, offset, s.as_bytes())
     }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        if matches!(self.kind, SysRegFile::ProfileControl) {
+            if _offset != 0 {
+                // BusyBox ash 的 `printf '%s\n'` 可能把命令和结尾换行拆成
+                // 两次 write。第一段已经完成控制操作；后续纯空白片段应像
+                // Linux sysfs 的单次文本事务一样被接纳，不能让 shell 误判
+                // 整个控制命令失败。
+                return if _buf.iter().all(u8::is_ascii_whitespace) {
+                    Ok(_buf.len())
+                } else {
+                    Err(VfsError::InvalidArgument)
+                };
+            }
+            let command = core::str::from_utf8(_buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            if let Some(mask) = command.strip_prefix("events=") {
+                let mask = mask.strip_prefix("0x").unwrap_or(mask);
+                let mask = u64::from_str_radix(mask, 16).map_err(|_| VfsError::InvalidArgument)?;
+                profiling::set_event_mask(mask);
+                return Ok(_buf.len());
+            }
+            if let Some(mask) = command.strip_prefix("events_high=") {
+                let mask = mask.strip_prefix("0x").unwrap_or(mask);
+                let mask = u64::from_str_radix(mask, 16).map_err(|_| VfsError::InvalidArgument)?;
+                profiling::set_event_masks(profiling::event_mask(), mask);
+                return Ok(_buf.len());
+            }
+            if let Some(name) = command.strip_prefix("preset=") {
+                let preset = profiling::Preset::from_name(name).ok_or(VfsError::InvalidArgument)?;
+                profiling::set_event_preset(preset);
+                return Ok(_buf.len());
+            }
+            if let Some(value) = command.strip_prefix("phase=") {
+                let phase = value
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if !profiling::set_phase(phase) {
+                    return Err(VfsError::InvalidArgument);
+                }
+                return Ok(_buf.len());
+            }
+            if let Some(value) = command.strip_prefix("root=") {
+                let pid = value
+                    .parse::<i32>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                let task = sched::root_pid_ns()
+                    .registry()
+                    .lookup(pid)
+                    .and_then(|task| task.upgrade())
+                    .ok_or(VfsError::NotFound)?;
+                task.set_profile_session_id(profiling::session_id());
+                profiling::register_task(
+                    profiling::session_id(),
+                    pid as u64,
+                    task.parent()
+                        .and_then(|parent| parent.pid_root_cached())
+                        .unwrap_or(0) as u64,
+                    task.tgid_cached().unwrap_or(pid) as u64,
+                );
+                profiling::record_task_images(
+                    profiling::session_id(),
+                    pid as u64,
+                    task.profile_main_image(),
+                    task.profile_interpreter_image(),
+                );
+                profiling::set_workload_root(pid as u64);
+                return Ok(_buf.len());
+            }
+            if let Some(enabled) = command.strip_prefix("samples=") {
+                match enabled {
+                    "0" | "off" => profiling::set_sampling_enabled(false),
+                    "1" | "on" => profiling::set_sampling_enabled(true),
+                    _ => return Err(VfsError::InvalidArgument),
+                }
+                sched::reprogram_current_deadline(None);
+                return Ok(_buf.len());
+            }
+            if let Some(value) = command.strip_prefix("sample_hz=") {
+                let hz = value
+                    .parse::<u64>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if !profiling::set_sample_hz(hz) {
+                    return Err(VfsError::InvalidArgument);
+                }
+                sched::reprogram_current_deadline(None);
+                return Ok(_buf.len());
+            }
+            if let Some(enabled) = command.strip_prefix("trace=") {
+                match enabled {
+                    "0" | "off" => profiling::set_trace_enabled(false),
+                    "1" | "on" => profiling::set_trace_enabled(true),
+                    _ => return Err(VfsError::InvalidArgument),
+                }
+                return Ok(_buf.len());
+            }
+            if let Some(shift) = command.strip_prefix("timing_shift=") {
+                let shift = shift
+                    .parse::<usize>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                if shift > profiling::MAX_TIMING_SHIFT {
+                    return Err(VfsError::InvalidArgument);
+                }
+                profiling::set_timing_shift(shift);
+                return Ok(_buf.len());
+            }
+            match command {
+                "start" => profiling::start(),
+                "1" | "enable" | "resume" => profiling::resume(),
+                "0" | "freeze" => profiling::freeze(),
+                "disable" | "stop" => profiling::stop(),
+                "reset" => profiling::reset(),
+                _ => return Err(VfsError::InvalidArgument),
+            }
+            sched::reprogram_current_deadline(None);
+            return Ok(_buf.len());
+        }
         Err(VfsError::ReadOnlyFilesystem)
     }
     fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
@@ -2092,12 +2822,20 @@ fn build_child_inode(
         kind,
         snap: Arc::clone(snap),
     });
+    #[cfg(feature = "performance-profile")]
+    let mode = if matches!(kind, SysRegFile::ProfileControl) {
+        0o644
+    } else {
+        0o444
+    };
+    #[cfg(not(feature = "performance-profile"))]
+    let mode = 0o444;
     Some(mk_inode(
         fs_id,
         weak_sb,
         ino,
         FileType::Regular,
-        0o444,
+        mode,
         1,
         ops,
     ))
@@ -2164,10 +2902,10 @@ enum SysDirKind {
     },
     DevicesPnp,
     DevicesPnpBus {
-        bus: &'static str,
+        bus: String,
     },
     PnpDevice {
-        bus: &'static str,
+        bus: String,
         name: String,
     },
     Dev,
@@ -2177,14 +2915,15 @@ enum SysDirKind {
         rdev: DevId,
     },
     Kernel,
+    KernelElm,
     Fs,
     FsCgroup,
     Bus,
     BusClass {
-        bus: &'static str,
+        bus: String,
     },
     BusClassDevices {
-        bus: &'static str,
+        bus: String,
     },
     Class,
     ClassDir {
@@ -2225,6 +2964,19 @@ struct SysDirInodeOps {
     snap: Arc<SysSnapshot>,
 }
 
+fn truncate_sys_reg(kind: SysRegFile, size: u64) -> VfsResult<()> {
+    #[cfg(feature = "performance-profile")]
+    if matches!(kind, SysRegFile::ProfileControl) {
+        return if size == 0 {
+            Ok(())
+        } else {
+            Err(VfsError::InvalidArgument)
+        };
+    }
+    let _ = (kind, size);
+    Err(VfsError::ReadOnlyFilesystem)
+}
+
 impl InodeOps for SysRegInodeOps {
     fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
         Err(VfsError::NotADirectory)
@@ -2235,10 +2987,23 @@ impl InodeOps for SysRegInodeOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        // trace 是有界环，打开时固定窗口，避免 read_at 重渲染或读取期间窗口漂移。
+        #[cfg(feature = "performance-profile")]
+        let snapshot = if matches!(self.kind, SysRegFile::ProfileTrace) {
+            Some(render_profile_trace().into_bytes().into_boxed_slice())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "performance-profile"))]
+        let snapshot = None;
         Ok(Box::new(SysRegFileOps {
             kind: self.kind,
             snap: Arc::clone(&self.snap),
+            snapshot,
         }))
+    }
+    fn truncate(&self, _: &Inode, size: u64) -> VfsResult<()> {
+        truncate_sys_reg(self.kind, size)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
@@ -2475,9 +3240,9 @@ impl SysDirInodeOps {
                     .position(|bus| *bus == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
-                    pnp_bus_ino(snap.pnp_buses[bus_idx]),
+                    pnp_bus_ino(&snap.pnp_buses[bus_idx]),
                     SysDirKind::DevicesPnpBus {
-                        bus: snap.pnp_buses[bus_idx],
+                        bus: snap.pnp_buses[bus_idx].clone(),
                     },
                 ))
             }
@@ -2490,7 +3255,7 @@ impl SysDirInodeOps {
                     return Err(VfsError::NotFound);
                 }
                 Ok(mk_dir(
-                    pnp_device_ino(bus, name),
+                    pnp_device_ino(&bus, name),
                     SysDirKind::PnpDevice {
                         bus,
                         name: name.to_string(),
@@ -2508,7 +3273,7 @@ impl SysDirInodeOps {
                     .ok_or(VfsError::NotFound)?;
                 let slot = pnp_device_slot_by_name(name).ok_or(VfsError::NotFound)?;
                 mk_reg(
-                    pnp_device_slot_ino(bus, &dev_name, slot.to_u64()),
+                    pnp_device_slot_ino(&bus, &dev_name, slot.to_u64()),
                     SysRegFile::PnpDevice { idx, slot },
                 )
             }
@@ -2570,8 +3335,30 @@ impl SysDirInodeOps {
                 "device_functions" => {
                     mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
                 }
+                "net_stats" => mk_reg(KERNEL_NET_STATS_INO, SysRegFile::NetStats),
+                #[cfg(feature = "performance-profile")]
+                "profile_stats" => mk_reg(KERNEL_PROFILE_STATS_INO, SysRegFile::ProfileStats),
+                #[cfg(feature = "performance-profile")]
+                "profile_control" => mk_reg(KERNEL_PROFILE_CONTROL_INO, SysRegFile::ProfileControl),
+                #[cfg(feature = "performance-profile")]
+                "profile_samples" => mk_reg(KERNEL_PROFILE_SAMPLES_INO, SysRegFile::ProfileSamples),
+                #[cfg(feature = "performance-profile")]
+                "profile_catalog" => mk_reg(KERNEL_PROFILE_CATALOG_INO, SysRegFile::ProfileCatalog),
+                #[cfg(feature = "performance-profile")]
+                "profile_trace" => mk_reg(KERNEL_PROFILE_TRACE_INO, SysRegFile::ProfileTrace),
+                #[cfg(feature = "performance-profile")]
+                "profile_snapshot" => {
+                    mk_reg(KERNEL_PROFILE_SNAPSHOT_INO, SysRegFile::ProfileSnapshot)
+                }
+                #[cfg(feature = "performance-profile")]
+                "profile_health" => mk_reg(KERNEL_PROFILE_HEALTH_INO, SysRegFile::ProfileHealth),
+                "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
+            SysDirKind::KernelElm => {
+                let slot = elm_sysfs_slot_by_name(name).ok_or(VfsError::NotFound)?;
+                mk_reg(kernel_elm_slot_ino(slot), SysRegFile::Elm { slot })
+            }
             SysDirKind::Fs => match name {
                 // 当前内核尚未提供 cgroup controller registry；这里暴露稳定的空根目录，
                 // 等 controller 子系统接入后再由 registry 驱动目录内容。
@@ -2642,15 +3429,15 @@ impl SysDirInodeOps {
                     .position(|bus| *bus == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
-                    bus_class_ino(snap.pnp_buses[bus_idx]),
+                    bus_class_ino(&snap.pnp_buses[bus_idx]),
                     SysDirKind::BusClass {
-                        bus: snap.pnp_buses[bus_idx],
+                        bus: snap.pnp_buses[bus_idx].clone(),
                     },
                 ))
             }
             SysDirKind::BusClass { bus } => match name {
                 "devices" => Ok(mk_dir(
-                    bus_class_devices_ino(bus),
+                    bus_class_devices_ino(&bus),
                     SysDirKind::BusClassDevices { bus },
                 )),
                 _ => Err(VfsError::NotFound),
@@ -2665,7 +3452,7 @@ impl SysDirInodeOps {
                     .position(|dev| dev.bus_type == bus && dev.sysfs_name == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_link(
-                    bus_class_device_link_ino(bus, name),
+                    bus_class_device_link_ino(&bus, name),
                     format!(
                         "../../../devices/pnp/{}/{}",
                         bus, snap.pnp_devices[idx].sysfs_name
@@ -3049,7 +3836,7 @@ impl SysDirInodeOps {
                 for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        pnp_device_ino(dev.bus_type, &dev.sysfs_name),
+                        pnp_device_ino(&dev.bus_type, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Directory,
                     ) {
@@ -3070,7 +3857,7 @@ impl SysDirInodeOps {
                 for slot in PnpDeviceSlot::ALL {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        pnp_device_slot_ino(bus, &name, slot.to_u64()),
+                        pnp_device_slot_ino(&bus, &name, slot.to_u64()),
                         slot.file_name(),
                         FileType::Regular,
                     ) {
@@ -3151,7 +3938,57 @@ impl SysDirInodeOps {
                     "device_functions",
                     FileType::Regular,
                 ),
+                mk_dir_entry(KERNEL_NET_STATS_INO, "net_stats", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(KERNEL_PROFILE_STATS_INO, "profile_stats", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_CONTROL_INO,
+                    "profile_control",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_SAMPLES_INO,
+                    "profile_samples",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_CATALOG_INO,
+                    "profile_catalog",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(KERNEL_PROFILE_TRACE_INO, "profile_trace", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_SNAPSHOT_INO,
+                    "profile_snapshot",
+                    FileType::Regular,
+                ),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_HEALTH_INO,
+                    "profile_health",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),
             ],
+            SysDirKind::KernelElm => {
+                let mut entries = Vec::new();
+                for slot in ElmSysfsSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        kernel_elm_slot_ino(*slot),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
             SysDirKind::Class => {
@@ -3245,7 +4082,7 @@ impl SysDirInodeOps {
                     return Vec::new();
                 };
                 vec![mk_dir_entry(
-                    bus_class_devices_ino(bus),
+                    bus_class_devices_ino(&bus),
                     "devices",
                     FileType::Directory,
                 )]
@@ -3258,7 +4095,7 @@ impl SysDirInodeOps {
                 for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        bus_class_device_link_ino(bus, &dev.sysfs_name),
+                        bus_class_device_link_ino(&bus, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Symlink,
                     ) {
@@ -3412,4 +4249,55 @@ fn build_root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, snap: Arc<SysSnapsh
         ops,
         weak_sb.clone(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regular_file_reads_stable_open_snapshot() {
+        let file = SysRegFileOps {
+            kind: SysRegFile::Hostname,
+            snap: Arc::new(SysSnapshot::default()),
+            snapshot: Some(b"trace-snapshot\n".to_vec().into_boxed_slice()),
+        };
+        let mut first = [0u8; 6];
+        let first_len = file.read_at(&mut first, 0).unwrap();
+        assert_eq!(&first[..first_len], b"trace-");
+
+        let mut second = [0u8; 16];
+        let second_len = file.read_at(&mut second, first_len as u64).unwrap();
+        assert_eq!(&second[..second_len], b"snapshot\n");
+        assert_eq!(
+            file.read_at(&mut second, (first_len + second_len) as u64),
+            Ok(0)
+        );
+    }
+
+    #[cfg(feature = "performance-profile")]
+    #[test]
+    fn profile_control_accepts_shell_truncate() {
+        assert_eq!(truncate_sys_reg(SysRegFile::ProfileControl, 0), Ok(()));
+        assert_eq!(
+            truncate_sys_reg(SysRegFile::ProfileControl, 1),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(
+            truncate_sys_reg(SysRegFile::ProfileStats, 0),
+            Err(VfsError::ReadOnlyFilesystem)
+        );
+    }
+
+    #[cfg(feature = "performance-profile")]
+    #[test]
+    fn profile_control_accepts_split_trailing_newline() {
+        let file = SysRegFileOps {
+            kind: SysRegFile::ProfileControl,
+            snap: Arc::new(SysSnapshot::default()),
+            snapshot: None,
+        };
+        assert_eq!(file.write_at(b"\n", 6), Ok(1));
+        assert_eq!(file.write_at(b"x", 6), Err(VfsError::InvalidArgument));
+    }
 }

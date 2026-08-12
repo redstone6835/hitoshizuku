@@ -1,0 +1,30 @@
+{
+  "manifest_version": 1,
+  "abi_epoch": 1,
+  "entry": "_start",
+  "imports": [
+    { "operation": "process.exit", "required": true }
+  ],
+  "capabilities": [
+    {
+      "requirement": "self_process",
+      "rights": ["exit"],
+      "required": true
+    },
+    {
+      "requirement": "stdin",
+      "rights": ["read"],
+      "required": false
+    },
+    {
+      "requirement": "stdout",
+      "rights": ["write"],
+      "required": true
+    }
+  ],
+  "runtime": {
+    "stack_size": 65536,
+    "stack_guard_size": 4096,
+    "start_info_max_size": 4096
+  }
+}

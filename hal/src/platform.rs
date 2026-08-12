@@ -3,6 +3,7 @@
 use core::ops::Range;
 
 /// Linux `utsname.machine` 风格的架构名称。
+#[kernel_symbols::export(name = "hal.platform.arch_name", contract = "kernel.hal.platform@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn arch_name() -> &'static str {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -16,6 +17,7 @@ pub fn arch_name() -> &'static str {
 }
 
 /// 当前平台期望的用户态 ELF 架构。
+#[kernel_symbols::export(name = "hal.platform.elf_arch", contract = "kernel.hal.platform@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn elf_arch() -> elf::Arch {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -29,6 +31,7 @@ pub fn elf_arch() -> elf::Arch {
 }
 
 /// 固件未分配 PCI BAR 时使用的默认 MMIO 窗口。
+#[kernel_symbols::export(name = "hal.platform.default_pci_mmio_window", contract = "kernel.hal.platform@1", version = 1, capabilities = kernel_symbols::capability::HAL_QUERY)]
 pub fn default_pci_mmio_window() -> Option<Range<u64>> {
     #[cfg(target_arch = "loongarch64")]
     {

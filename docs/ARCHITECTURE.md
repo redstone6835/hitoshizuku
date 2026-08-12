@@ -1,292 +1,167 @@
 # 架构设计文档
 
----
+## 1. 当前架构总览
 
-## 目录
+本文描述当前代码和构建系统已经落实的依赖关系，不把尚未完成的分层目标写成既成事实。`Cargo.toml` 是编译期依赖的权威来源；若本文与清单不一致，应先修正文档或代码，再合入变更。
 
-1. [架构总览](#1-架构总览)
-2. [层级定义](#2-层级定义)
-3. [依赖规则](#3-依赖规则)
-4. [能力注入机制](#4-能力注入机制)
-5. [不安全代码治理](#5-不安全代码治理)
-6. [并发模型](#6-并发模型)
+当前工程由六类单元组成：
 
----
+1. `kernel` 负责引导后的全局编排、系统调用、进程入口、文件系统挂载和 ELM 运行时接入。
+2. `arch` 保存 LoongArch64 与 RISC-V 64 的引导、异常、中断、页表和指令级机制。
+3. `hal` 对常用架构能力提供统一入口，但当前不是 `kernel` 到 `arch` 的唯一通道。
+4. `general` 保存架构无关的共享内核基础设施，其中设备部分只保留发现、PnP、资源、字符设备、块设备、开放设备功能和用户态投影等抽象。
+5. `libs` 保存可独立复用的内核子系统与数据结构，例如 allocator、VFS、调度、AF_UNIX、IP 网络、ELM、ELF 和文件系统实现。
+6. `drivers` 保存具体硬件驱动。每个驱动都是独立 ELM 工程，由统一模块清单决定集成、受管装载或禁用。
 
-## 1. 架构总览
+IP 协议栈位于 `libs/net`，INET 套接字数据路径由 `libs/vfs` 接入；AF_UNIX 本地 IPC
+继续由 `libs/socket` 和 `libs/vfs` 提供。loopback 是位于 `drivers/loopback` 的 ELM，
+VirtIO-net 则仍未恢复。
 
-本项目架构遵循以下核心原则：
+## 2. 编译期层级
 
-1. **架构无关与架构相关彻底分离。** 通用算法和数据结构不包含任何 ISA 特定知识，仅通过 trait 契约与架构实现交互。
+```text
+                              ┌──────────────┐
+                              │    kernel    │
+                              └──────┬───────┘
+                      ┌──────────────┼──────────────┐
+                      ▼              ▼              ▼
+                 ┌────────┐     ┌─────────┐    ┌────────┐
+                 │  arch  │◄────│   hal   │    │general │
+                 └───┬────┘     └────┬────┘    └───┬────┘
+                     │               │             │
+                     └───────────────┴──────┬──────┘
+                                            ▼
+                                      ┌──────────┐
+                                      │   libs   │
+                                      └──────────┘
 
-2. **hal 统一 arch 对外接口。** hal 层将不同架构（LoongArch64、RISC-V 64）的差异化实现收敛为统一的调用接口。kernel 只调用 hal，不直接接触 arch。
-
-3. **general 提供通用算法与标准化接口。** general 层定义平台 trait（如 `PagingArch`），同时提供依赖这些 trait 的泛型算法（如页表遍历）。arch 实现 general 定义的 trait，并调用 general 的泛型算法。
-
-4. **kernel 不直接接触 arch。** kernel 仅依赖 hal（统一接口）、general（通用算法）和 libs（算法库），不得直接依赖 arch crate。
-
-5. **能力通过运行期注入。** 关键子系统后端（分配器、日志、控制台）通过全局原子指针在运行期注册，支持引导期到运行时的无锁后端切换。
-
-6. **unsafe 代码收敛于架构层与底层原语。** 上层策略逻辑在安全 Rust 中编写。
-
----
-
-## 2. 层级定义
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        kernel（策略与集成）                      │
-├──────────────────────────────────────────────────────────────────┤
-│ hal（统一架构接口）general（通用算法/标准接口）libs（可复用算法）│
-│      包装 arch 实现      · 架构 trait 定义     · 分配器  · VFS   │
-│ 面向 kernel 的统一 API  · 泛型页表遍历 · DTB   · 日志 · 错误码   │
-│                  · 控制台框架 · VFS 集成                         │
-├──────────────────────────────────────────────────────────────────┤
-│                       arch（架构实现）                           │
-│         实现 general trait · 汇编引导 · 页表激活                 │
-└──────────────────────────────────────────────────────────────────┘
+drivers/ELM --编译时使用 Kernel API Profile--> kernel 导出的 Rust 接口
+drivers/ELM --配置为 y 时以集成归档链接-------> kernel
+drivers/ELM --配置为 m 时输出 EKI------------> build/<arch>/modules
 ```
 
-### 2.1 `kernel` — 策略与集成层
+箭头表示编译期或链接期依赖。`kernel -> arch` 是当前真实关系：引导上下文、异常恢复、VDSO 和部分架构专属集成仍由 `kernel` 直接使用。新的通用调用应优先进入 `hal`，但在代码完成迁移前，不得把“禁止直接依赖”写成已落实规则。
 
-**职责：** 内核入口点、子系统编排、系统调用分发、进程/线程管理、驱动注册、文件系统挂载策略。
+### 2.1 `kernel`
 
-**依赖约束：**
-- 仅允许依赖 `hal`、`general`、`libs`
-- 不得直接依赖 `arch` — 所有架构操作通过 hal 接口
-- 不得包含 `asm!` 或直接操作硬件寄存器
+`kernel` 是最终镜像的集成层，职责包括：
 
-### 2.2 `hal` — 统一架构接口层
+- 接收架构加载器传入的启动上下文；
+- 初始化内存、调度、VFS、系统调用和 ELM；
+- 把 DTB、ACPI、PCI 等发现结果交给通用设备模型；
+- 装入配置为 `y` 的集成 ELM，登记配置为 `m` 的 BuildBound 元数据；
+- 选择裸内核或显式指定的 initramfs。
 
-**职责：** 包装 arch 的具体实现，将 `loongarch64::paging` 和 `riscv64::paging` 等不同实现统一为同一个对外接口。kernel 需要调用架构函数时，只调用 hal，不关心底层是哪个架构。
+`kernel` 可以依赖 `arch`、`hal`、`general` 和所需 `libs`。它不得反向成为这些 crate 的依赖，也不得重新容纳已经迁出的具体设备驱动。
 
-hal 是 kernel 与 arch 之间唯一的桥梁。它从 arch 获取各架构的实现，并向上层暴露统一 API。
+### 2.2 `arch`
 
-**约束：**
-- 可依赖 `arch`（获取架构实现）和 `general`（引用其定义的 trait 类型）
-- 不包含直接的硬件操作或 `asm!` — 全部通过 arch 间接执行
-- 每个对外接口对应一类硬件能力，内部根据目标架构路由到正确的 arch 实现
+`arch` 只保存 ISA 或平台机制，包括启动汇编、寄存器访问、异常入口、页表切换、中断控制、用户态上下文和 VDSO。它依赖 `general` 中的通用契约以及必要的 `libs`，不依赖 `kernel`、`hal` 或具体驱动 ELM。
 
-### 2.3 `general` — 通用基础设施与标准接口层
+ISA 专属汇编和 CSR/寄存器操作必须留在 `arch`。通用状态机、设备策略和文件系统逻辑不得通过目标架构条件编译塞入 `general`。
 
-**职责：** 定义平台无关的 trait（如 `PagingArch`、平台选择逻辑等），同时提供依赖这些 trait 的泛型算法和基础设施。这些算法对所有架构通用。
+### 2.3 `hal`
 
-**典型内容：**
-- 架构 trait 定义（`PagingArch` 等）— hal 和 arch 都引用这些 trait 作为契约
-- 泛型页表遍历与映射算法（`page_walk::walk_and_map<T: PagingArch>(...)`）
-- DTB / ACPI / UEFI 解析
-- 控制台框架与设备枚举
-- VFS 管线集成与文件系统
-- 平台选择与引导阶段编排
+`hal` 依赖 `arch` 和 `general`，为时间、中断、用户地址访问、CPU 控制等常用机制提供统一入口。它用于减少上层的 ISA 分支，但当前不承担完整的依赖隔离职责。
 
-**约束：**
-- 可依赖 `libs`（使用算法库）
-- 不得包含 ISA 特定指令或 `asm!`
-- 不得依赖具体 arch 实现 — 所有架构相关操作通过 trait 间接调用
+新增跨架构能力时，应先判断该能力是否能够形成稳定的通用语义。能够统一的进入 `hal`；只能由启动或异常路径表达的机制可以暂时由 `kernel` 直接调用 `arch`，并在代码中保持边界明确。
 
-### 2.4 `arch` — 架构实现层
+### 2.4 `general`
 
-**职责：** 实现 general 中定义的所有平台 trait（如 `impl PagingArch for LoongArch64Paging`）。包含汇编引导、CSR 操作、异常入口、页表激活、中断控制等硬件操作。同时调用 general 的泛型算法完成页表遍历、设备枚举等工作。
+`general` 提供共享内核基础设施和设备抽象，不包含具体硬件型号驱动。设备相关职责包括：
 
-**依赖约束：**
-- 必须实现 `general` 中定义的所有平台 trait
-- 可依赖 `general`（调用泛型算法并注入架构特定回调）和 `libs`（使用算法库）
-- 仅提供机制，不制定策略决策
-- 按架构组织：`arch/src/<arch-name>/`
+- 固件与总线发现结果的通用表示；
+- PnP 设备、驱动匹配、资源归属和移除状态机；
+- IRQ、DMA、MMIO、PCI、platform 等驱动所需的通用机制与契约；
+- 字符设备和块设备两条基础 I/O 轨道；
+- `DeviceFunction` 开放类别、动态类别注册和设备功能生命周期；
+- devtmpfs、sysfs、procfs 等用户态投影视图。
 
-### 2.5 `libs` — 可复用算法库
+`general` 可以依赖 `libs`，但不得依赖 `arch`、`hal`、`kernel` 或 `drivers`。具体 UART、RTC、IRQ 控制器、固件总线、flash、random 和 VirtIO 实现均位于 `drivers`。
 
-**职责：** 独立于硬件架构的通用算法与数据结构（分配器、VFS 核心抽象、日志系统、POSIX 错误码等）。以独立 crate 存在于 `libs/` 下。
+### 2.5 `libs`
 
-**约束：**
-- 不包含 `asm!` 或 ISA 特定指令
-- 平台能力依赖全部通过函数指针或 trait object 注入
-- 不依赖 `hal`、`general`、`arch`、`kernel`
-- `libs` 内部 crate 之间可按需依赖，但不得形成循环
+`libs` 中的 crate 按实际子系统关系互相依赖，但不得依赖 `kernel`。其中：
 
----
+- `allocator`、`sched`、`vfs`、`socket`、`net` 等提供可直接由内核和 ELM 使用的 Rust API；
+- `kernel-symbols` 为审核后的 API 生成稳定导出描述符和 Mixin 站点；
+- `elm` 与 `elm-loader` 定义运行时模型、EBI 和装载协议；
+- `socket` 提供 AF_UNIX，`net` 提供 IP/TCP/UDP 协议栈与 `NetDriver` 设备契约；
+- `mygo-smoltcp` 是 `net` 的内部协议引擎，不作为独立 Kernel API 暴露。
+
+跨 crate 依赖必须保持无环。全局能力需要后端时，优先使用明确的注册接口、trait 或函数指针，不允许通过依赖 `kernel` 获取实现。
+
+### 2.6 `drivers`
+
+`drivers/Modules.toml` 是驱动集合的配置与依赖图。每个条目声明模块名、工程路径、配置键、适用目标和 ELM 依赖：
+
+- `y`：编译为集成归档并链接进内核镜像；运行时不经过动态调用封装，但仍保留 ELM 身份和生命周期登记。
+- `m`：编译为受管 EKI，写入 `build/<arch>/modules`，由 `elm-mgr` 在运行时校验和装载。
+- `n`：不构建，也不进入最终依赖图。
+
+模块之间的功能依赖必须写入 ELM 清单，不能用隐藏的 Cargo path dependency 代替。例如 `virtio.block` 依赖 `virtio.framework`，构建工具必须在依赖被禁用时直接拒绝配置。
+
+驱动源码通过 Kernel API Profile 使用与内核相同路径的 Rust API。配置为 `y` 和 `m` 的源码保持一致，差异只存在于构建、链接、装载和生命周期管理阶段。
 
 ## 3. 依赖规则
 
-### 3.1 依赖方向图
+| 来源 | 允许依赖 | 禁止依赖 |
+|---|---|---|
+| `kernel` | `arch`、`hal`、`general`、`libs`、配置为 `y` 的集成归档 | 被 `arch`、`general`、`libs` 或驱动反向依赖 |
+| `hal` | `arch`、`general`、必要 `libs` | `kernel`、`drivers` |
+| `arch` | `general`、必要 `libs` | `kernel`、`hal`、`drivers` |
+| `general` | `libs` | `arch`、`hal`、`kernel`、`drivers` |
+| `libs` | 其他无环 `libs` crate | `general`、`hal`、`arch`、`kernel`、`drivers` |
+| `drivers` | ELM 框架、Kernel API Profile、显式 ELM 依赖 | 内核源码 path dependency、未声明的其他驱动 |
 
-```
-kernel ──→ hal         kernel 通过 hal 的统一接口使用架构能力
-kernel ──→ general     kernel 依赖 general 的泛型算法和平台 trait 定义
-kernel ──→ libs        kernel 依赖 libs 的算法库
+所有层都必须遵守以下硬约束：
 
-hal ──→ arch           hal 包装 arch 的具体实现，向上层暴露统一接口
-hal ──→ general        hal 引用 general 定义的平台 trait 作为接口类型
+1. 禁止循环依赖。
+2. `general` 中不得使用架构条件编译承载通用功能分叉。
+3. 具体硬件匹配表、寄存器布局和探测逻辑不得回流到 `general`。
+4. 网络设备实现必须位于 `drivers` 并通过 ELM 清单管理，不得作为 `general` 或 `libs/net` 的隐藏具体驱动。
+5. 动态 ELM 只能解析 Kernel API Profile 中审核过的符号；存在源码或 metadata 不等于允许链接。
 
-arch ──→ general       arch 实现 general 定义的平台 trait，调用 general 的泛型算法
-arch ──→ libs          arch 依赖 libs 的算法库
+## 4. ELM 与内核接口
 
-general ──→ libs       general 的通用算法依赖 libs 的数据结构
-libs（仅依赖其他 libs crate）
-```
+Kernel API Profile 同时包含目标专属 Rust metadata、源码投影、导入库、支持归档和符号清单。各部分职责不同：
 
-箭头方向为编译期 `Cargo.toml` 依赖方向。
+- metadata 负责类型检查和 Rust 单态化所需的编译信息；
+- 源码投影负责 LSP 跳转、诊断和补全；
+- 符号清单规定动态 ELM 真正允许解析的内核入口；
+- 导入库把稳定 API 名称映射到当前内核实现；
+- Profile 哈希绑定上述内容，防止模块把相似但不一致的接口误认为兼容。
 
-### 3.2 硬性规则
+一个 crate 出现在 metadata 列表中，并不意味着它的全部公有函数自动成为 ELM API。可调用入口必须使用 `kernel_symbols::export` 明确登记，并声明契约、能力、状态修改、所有权返回和长期保留参数等属性。
 
-| # | 规则 |
-|---|------|
-| 1 | `libs` 不依赖 `hal`、`general`、`arch`、`kernel` |
-| 2 | `general` 依赖 `libs`，不依赖 `hal`、`arch`、`kernel` |
-| 3 | `arch` 依赖 `general`、`libs`，不依赖 `hal`、`kernel` |
-| 4 | `hal` 依赖 `arch`、`general`，不依赖 `kernel` |
-| 5 | `kernel` 依赖 `hal`、`general`、`libs`，不直接依赖 `arch` |
-| 6 | 循环依赖绝对禁止 |
+具体驱动不通过通用 ELM 消息调用 MMIO、DMA、IRQ 或 VFS 热路径。装载器完成权限和符号解析后，驱动调用的是直接 Rust API；ELM 抽象层负责镜像、依赖、生命周期、资源、策略、故障隔离和热替换，而不是充当第二套内核 API。
 
-### 3.3 禁止的依赖路径
+## 5. 构建与产物
 
-| 路径 | 原因 |
-|------|------|
-| `kernel → arch` | kernel 只能通过 hal 间接使用 arch 实现 |
-| `general → arch` | general 必须是架构无关的，不得耦合具体架构实现 |
-| `general → hal` | general 定义 trait，不消费 hal 的包装 |
-| `arch → hal` | arch 实现 general 的 trait，hal 包装 arch，关系不反向 |
-| `libs → hal / general / arch / kernel` | libs 通过函数指针注入获取平台能力 |
+默认 `make` 构建两个架构的裸内核，不打包 initramfs：
 
-### 3.4 类型流转
-
-- **general → arch：** general 定义平台 trait（如 `PagingArch`），arch 提供 `impl PagingArch for LoongArch64Paging`
-- **general → kernel：** general 提供泛型算法和 trait 定义，kernel 直接使用
-- **arch → hal：** arch 暴露架构实现，hal 包装并统一为对外接口
-- **hal → kernel：** hal 提供统一接口，kernel 调用 hal 而非 arch
-- **libs → 外部：** libs 暴露注入入口（如 `fn bind_allocator(backend: fn_ptr)`），调用方在 general、arch 或 hal 中注册具体后端
-
----
-
-## 4. 能力注入机制
-
-### 4.1 设计动机
-
-内核需要在不依赖静态链接的前提下，在运行期确定子系统的具体后端实现。原因：
-
-- **引导期需要最小化依赖。** 在正式分配器、页表、控制台就绪之前，系统仍然需要日志输出和内存分配。
-- **支持多架构。** 同一个 libs crate 在不同 ISA 上需要不同的地址转换公式、时间戳源、临界区语义。
-- **引导期与运行时后端不同。** 引导期使用线性分配器、直接 MMU 映射、裸 UART 输出；运行时替换为伙伴系统、页表映射、完整控制台。
-
-### 4.2 核心模式
-
-```
-  后端实现               全局原子指针              调用方
-  (arch/general)        AtomicPtr<dyn Trait>        (libs)
-
-      │ 注册（Release store）   │                      │
-      ├────────────────────────→│                      │
-      │                         │ 查询（Acquire load） │
-      │                         │←─────────────────────┤
-      │                         ├─────────────────────→│
-      │                         │返回 Option<&dyn Trait>
+```text
+build/loongarch64/kernel
+build/riscv64/kernel
 ```
 
-**注册端（单核执行）：**
+其他公开目标：
 
-```rust
-static BACKEND: AtomicPtr<dyn SomeTrait> = AtomicPtr::new(null_mut());
+- `make modules [ARCH=...]`：只构建配置选择的 ELM 集合；
+- `make modules_install ARCH=... INSTALL_MOD_PATH=...`：安装受管模块和清单；
+- `make busybox [ARCH=...]`：生成独立 `build/<arch>/initramfs.cpio`；
+- `make kernel ARCH=... INITRAMFS=...`：把明确指定的 cpio 嵌入对应内核；
+- `make kernel-la`、`make kernel-rv`、`make all`：保留竞赛兼容行为，构建测试 rootfs、嵌入 initramfs，并复制根目录兼容镜像。
 
-pub fn bind(backend: &'static dyn SomeTrait) {
-    BACKEND.store(backend as *const _ as *mut _, Ordering::Release);
-}
-```
+默认构建和模块构建不得修改 `userland/rootfs-la` 或 `userland/rootfs-rv`。兼容目标使用 `build/<arch>/compat-rootfs` 作为临时 staging 目录。
 
-**使用端（任意上下文）：**
+## 6. 不安全代码与并发
 
-```rust
-pub fn do_something() -> Option<Output> {
-    // Acquire 保证在见到非空指针时，Release 之前的所有写入均已可见
-    let ptr = BACKEND.load(Ordering::Acquire);
-    // Safety: ptr 非空时指向 'static 对象，注册后永不移动/释放
-    Some(unsafe { (*ptr.as_ref()?).method() })
-}
-```
+所有 `unsafe` 块必须按 `docs/STYLES.md` 给出 `// Safety:` 说明。职责边界如下：
 
-### 4.3 注入能力清单
+- `arch` 可以使用汇编、寄存器和上下文切换所需的不安全操作；
+- `general` 和 `libs` 只能在已验证的底层原语、设备资源、裸指针或 FFI 边界使用不安全操作；
+- 驱动访问 MMIO、DMA 和中断资源时必须遵守资源所有权与失效顺序；
+- `kernel` 只在无法下沉的集成边界使用不安全操作，不把策略代码建立在未经验证的裸指针上。
 
-所有跨越「引导期→运行时」边界的能力均通过注入管理：
-
-| 能力 | 引导期后端 | 运行时后端 |
-|------|-----------|-----------|
-| 物理内存分配 | 线性分配器（boot allocator） | 伙伴系统 |
-| 虚拟内存管理 | MMU 直接映射窗口 | 页表精细映射 + 虚拟地址空间管理 |
-| 内核堆与全局分配器 | 禁用 / 未激活 | kheap + slab + managed heap |
-| 日志输出 | 直接写硬件串口寄存器 | console-backed sink |
-| 时间戳 | 架构计数器（频率未校准） | 架构计数器（频率已校准） |
-| 控制台 | 未注册 | 设备驱动后端 |
-| 地址转换 (phys↔virt) | 直接映射窗口公式 | 页表遍历 |
-| 临界区保护 | 关中断/恢复中断 | per-CPU 中断控制 |
-
-### 4.4 注入安全准则
-
-- 后端指针注册后视为不可变。允许替换的能力必须通过 `compare_exchange` 确保唯一生产者。
-- 每次读取必须处理 null 情况（尚未注册），返回 `Option` 或 `Result`。
-- 注册使用 `Release` 存储，查询使用 `Acquire` 加载，保证 happens-before 关系。
-- 注入点必须声明后端 trait 的来源（来自 general 的平台 trait），禁止注入无关接口。
-
----
-
-## 5. 不安全代码治理
-
-### 5.1 分层 unsafe 许可
-
-| 层 | unsafe 许可范围 |
-|----|---------------|
-| `arch` | 合法使用 `asm!` 和 CSR 操作。所有 unsafe 块必须有安全注释。 |
-| `libs` | 已验证有效性的裸指针解引用、受 `AtomicBool` 保护的 `static mut` 访问、全局分配器实现。 |
-| `general` | 能力注册中的 trait object→裸指针转换、已验证的 FFI 指针解引用。 |
-| `hal` | 转发 arch 的 unsafe 接口，自身不引入新的 unsafe。 |
-| `kernel` | 目标为零 unsafe。仅允许 `extern "C"` 函数声明。 |
-
-### 5.2 安全注释规范
-
-每个 `unsafe` 块必须包含：
-
-```rust
-// Safety:
-// - <操作为什么是 unsafe>
-// - <调用方必须满足的前置条件>
-// - <当前上下文为什么满足这些条件>
-unsafe { ... }
-```
-
-### 5.3 禁止模式
-
-| # | 禁止模式 |
-|---|---------|
-| 1 | 在 `static mut` 上创建引用 — 必须使用 `addr_of!`/`addr_of_mut!` + `ptr::read`/`ptr::write` |
-| 2 | 未验证即解引用外部传入的裸指针 — 必须先做 null/对齐/范围检查 |
-| 3 | 在 `libs` 或 `general` 中使用内联汇编 — 所有 `asm!` 仅在 `arch` 中使用 |
-| 4 | 在中断上下文中以非原子操作访问全局可变状态 |
-| 5 | `transmute` 到包含未定义位模式的类型（bool、枚举、引用） |
-
----
-
-## 6. 并发模型
-
-### 6.1 保护机制
-
-所有共享状态通过以下机制之一保护：
-
-- **原子类型**（`AtomicBool`、`AtomicPtr`、`AtomicUsize`）— 能力注册、标志位、计数器
-- **per-CPU 数据结构** — 调度器状态、分配器缓存、中断统计
-- **锁** — 设备驱动、文件系统元数据、进程表等复杂共享状态
-
-### 6.2 SMP 语义分层
-
-| 层 | SMP 职责 |
-|----|---------|
-| `general` | 定义 CPU 拓扑查询、IPI 发送、原子屏障的 trait 契约 |
-| `arch` | 实现 fence/barrier/IPI/local interrupt control |
-| `hal` | 统一暴露 arch 的 SMP 原语 |
-| `kernel` | 决定锁粒度、抢占模型、RCU/epoch 策略、跨 CPU 调度 |
-| `libs` | 内部使用原子操作；不引入锁策略 — 仅提供数据结构，同步方式由上层决定 |
-
-### 6.3 禁止模式
-
-- 禁止在 `libs` 中使用 ISA 特定 fence 指令 — 必须通过注入的函数指针
-- 禁止在能力层提供带策略语义的 helper（如 `with_global_kernel_lock`）
-- 禁止在 `arch` 之外使用架构特定内存屏障
-
----
+SMP 下的共享状态必须使用原子、per-CPU 数据或明确锁保护。设备移除遵循“停止发现新对象、标记失效、唤醒等待者、排空 I/O、注销投影、释放资源”的顺序。ELM 卸载还必须等待直接调用、租约和保留模块代码的对象全部收束。

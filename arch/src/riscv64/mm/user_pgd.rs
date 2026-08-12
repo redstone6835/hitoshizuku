@@ -11,49 +11,106 @@
 
 use alloc::boxed::Box;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use general::mm::{PgdHandle, UserPgdOps};
 use general::{
-    PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, unmap_range_entries, walk_and_map,
+    MapBatchResult, PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, unmap_range_entries,
+    walk_and_map, walk_and_map_pages,
 };
 use mm::VmFlags;
 
 use crate::riscv64::paging::Riscv64Paging;
 use crate::riscv64::specific::phys_to_virt;
+use spin::Mutex;
 
-static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
-/// ASID 位宽上限（硬件相关，Sv48 通常 16 位 = 65535）。
-/// 初始化时通过探测硬件获取实际值。
+const SATP_ASID_SHIFT: usize = 44;
+const SATP_ASID_MASK: usize = 0xffff;
+const ASID_TAG_BITS: usize = 16;
+
+/// 硬件实际实现的 ASID 掩码。0 表示没有 ASID 支持。
 static MAX_ASID: AtomicUsize = AtomicUsize::new(0xFFFF);
 
-/// 分配下一个 ASID。到达上限时回绕到 1 并 flush 全 TLB。
-// TODO(SMP): 多核时需改为 generation-based 方案——回绕时递增 generation，
-// 各核在 context switch 时 lazy 重分配，避免全核 IPI + 全 TLB flush。
-fn alloc_asid() -> usize {
-    loop {
-        let cur = NEXT_ASID.load(Ordering::Relaxed);
-        let max = MAX_ASID.load(Ordering::Relaxed);
-        let next = if cur >= max { 1 } else { cur + 1 };
-        if NEXT_ASID
-            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            if cur >= max {
-                // 回绕：flush 全 TLB（所有 ASID）
-                unsafe {
-                    core::arch::asm!("sfence.vma zero, zero");
-                }
-            }
-            return cur;
-        }
+#[derive(Clone, Copy)]
+struct AsidAllocator {
+    next: usize,
+    generation: usize,
+}
+
+static ASID_ALLOCATOR: Mutex<AsidAllocator> = Mutex::new(AsidAllocator {
+    next: 1,
+    generation: 1,
+});
+static CURRENT_ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
+
+#[inline]
+const fn make_asid_tag(generation: usize, asid: usize) -> usize {
+    (generation << ASID_TAG_BITS) | asid
+}
+
+#[inline]
+const fn tag_asid(tag: usize) -> usize {
+    tag & SATP_ASID_MASK
+}
+
+#[inline]
+const fn tag_generation(tag: usize) -> usize {
+    tag >> ASID_TAG_BITS
+}
+
+/// 探测 satp.ASID 的 WARL 位宽，并初始化全局 generation allocator。
+///
+/// 临时写入全 1 ASID 后立即恢复原 satp；调用发生在第一个用户地址空间创建前。
+pub(super) fn init_asid_allocator() {
+    let old_satp = crate::read_csr!(satp);
+    let probe_satp = old_satp | (SATP_ASID_MASK << SATP_ASID_SHIFT);
+    crate::write_csr!(satp, probe_satp);
+    let implemented = (crate::read_csr!(satp) >> SATP_ASID_SHIFT) & SATP_ASID_MASK;
+    crate::write_csr!(satp, old_satp);
+    unsafe { Riscv64Paging::flush_tlb_global(None) };
+
+    MAX_ASID.store(implemented, Ordering::Release);
+    let mut allocator = ASID_ALLOCATOR.lock();
+    allocator.next = 1;
+    allocator.generation = 1;
+    CURRENT_ASID_GENERATION.store(1, Ordering::Release);
+    log::info!(
+        "[arch][mm] satp ASID probe: mask={:#x} bits={}",
+        implemented,
+        implemented.count_ones()
+    );
+}
+
+/// 在当前 generation 中分配 ASID。回绕时只做一次全局 flush；旧地址空间在
+/// 下一次 activate 时 lazy 获取新一代 ASID，因此不会与新地址空间共享 tag。
+fn alloc_asid_tag() -> usize {
+    let max = MAX_ASID.load(Ordering::Acquire);
+    if max == 0 {
+        return 0;
     }
+
+    let mut allocator = ASID_ALLOCATOR.lock();
+    if allocator.next > max {
+        allocator.generation = allocator.generation.wrapping_add(1).max(1);
+        allocator.next = 1;
+        unsafe { Riscv64Paging::flush_tlb_global(None) };
+        CURRENT_ASID_GENERATION.store(allocator.generation, Ordering::Release);
+    }
+
+    let asid = allocator.next;
+    allocator.next += 1;
+    make_asid_tag(allocator.generation, asid)
 }
 
 struct UserPgdInner {
     pgd_phys: usize,
     pgd_virt: usize,
-    asid: usize,
+    asid_tag: AtomicUsize,
+    /// 曾经激活过本地址空间的逻辑 CPU。位图在 PGD 生命周期内单调增长，
+    /// 保证已经缓存过该 ASID translation 的 hart 不会被后续 shootdown 遗漏。
+    active_cpus: AtomicUsize,
+    needs_page_table_fence: AtomicBool,
+    needs_asid_fence: AtomicBool,
 }
 
 impl UserPgdInner {
@@ -87,11 +144,14 @@ impl UserPgdInner {
             }
         }
 
-        let asid = alloc_asid();
+        let asid_tag = alloc_asid_tag();
         Some(Box::new(Self {
             pgd_phys,
             pgd_virt,
-            asid,
+            asid_tag: AtomicUsize::new(asid_tag),
+            active_cpus: AtomicUsize::new(0),
+            needs_page_table_fence: AtomicBool::new(true),
+            needs_asid_fence: AtomicBool::new(false),
         }))
     }
 
@@ -104,7 +164,20 @@ impl UserPgdInner {
     }
 
     fn asid(&self) -> usize {
-        self.asid
+        let tag = self.asid_tag.load(Ordering::Acquire);
+        if tag == 0 {
+            return 0;
+        }
+
+        let generation = CURRENT_ASID_GENERATION.load(Ordering::Acquire);
+        if tag_generation(tag) == generation {
+            return tag_asid(tag);
+        }
+
+        let new_tag = alloc_asid_tag();
+        self.asid_tag.store(new_tag, Ordering::Release);
+        self.needs_asid_fence.store(true, Ordering::Release);
+        tag_asid(new_tag)
     }
 }
 
@@ -171,15 +244,31 @@ unsafe fn drop_pgd(pgd: PgdHandle) {
     let _ = unsafe { Box::from_raw(raw) };
 }
 
-fn pgd_phys(pgd: PgdHandle) -> PhysPageTableRoot {
-    let inner = unsafe { inner_ref(pgd) };
-    PhysPageTableRoot::new(inner.pgd_phys())
-}
-
 unsafe fn activate(pgd: PgdHandle) {
     let inner = unsafe { inner_ref(pgd) };
+    let asid = inner.asid();
+    let cpu = crate::riscv64::specific::current_cpu_id();
+    let cpu_bit = 1usize
+        .checked_shl(cpu as u32)
+        .expect("[arch][mm] logical CPU exceeds active mask width");
+    let first_activation = inner.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit == 0;
+    let needs_page_table_fence = inner.needs_page_table_fence.swap(false, Ordering::AcqRel);
+    let needs_asid_fence = inner.needs_asid_fence.swap(false, Ordering::AcqRel);
     unsafe {
-        Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(inner.pgd_phys()), inner.asid());
+        Riscv64Paging::activate_with_asid(
+            PhysPageTableRoot::new(inner.pgd_phys()),
+            asid,
+            first_activation || needs_page_table_fence || needs_asid_fence,
+        );
+    }
+}
+
+unsafe fn activate_kernel() {
+    let root = crate::riscv64::heap_vm::kernel_page_table_root();
+    unsafe {
+        // ASID 0 专用于内核页表；activate_with_asid 会在切根后刷新
+        // 本地 ASID 0，避免 idle 沿用已经回收的用户 PGD。
+        Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(root), 0, false);
     }
 }
 
@@ -191,41 +280,68 @@ fn allocate_page_table_page() -> Result<usize, general::MapError> {
         .map_err(|_| general::MapError::OutOfMemory)
 }
 
-fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
+fn flush_user_tlb_range(asid: usize, active_cpus: usize, vaddr: usize, len: usize) {
     if len == 0 {
         return;
     }
     let page_size = Riscv64Paging::PAGE_SIZE;
     const PAGE_THRESHOLD: usize = 64;
     let Some(end) = vaddr.checked_add(len) else {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
         return;
     };
     let aligned_start = vaddr & !(page_size - 1);
     let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
     if pages > PAGE_THRESHOLD {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
         return;
     }
+    let Some(range_size) = pages.checked_mul(page_size) else {
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
+        return;
+    };
+    if aligned_start.checked_add(range_size).is_none() {
+        unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
+        return;
+    }
+
+    // 本地 sfence.vma 只能按地址或整个 ASID 失效，因此仍按页执行。SBI RFENCE
+    // 原生接受连续范围，远端只需一次 M-mode 往返，避免把常见的多页 mprotect
+    // 和 munmap 放大为每页一次同步调用。
+    let current = crate::riscv64::specific::current_cpu_id();
+    let flush_local = current < usize::BITS as usize && active_cpus & (1usize << current) != 0;
     let mut va = aligned_start;
     while va < end {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };
+        if flush_local {
+            unsafe { Riscv64Paging::flush_tlb_local_with_asid(asid, Some(VirtAddr::new(va))) };
+        }
         let Some(next) = va.checked_add(page_size) else {
-            unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+            unsafe { Riscv64Paging::flush_tlb_with_asid_on_cpus(asid, None, active_cpus) };
             return;
         };
         va = next;
     }
+    crate::riscv64::smp::remote_sfence_vma_range_on(
+        active_cpus,
+        Some(asid),
+        aligned_start,
+        range_size,
+    );
 }
 
-unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
+unsafe fn map_user_pages(
+    pgd: PgdHandle,
+    vaddr: usize,
+    paddr: usize,
+    flags: VmFlags,
+) -> Result<(), general::MapError> {
     let inner = unsafe { inner_ref(pgd) };
     let root_virt = inner.pgd_virt();
     let read = flags.has(VmFlags::READ);
     let write = flags.has(VmFlags::WRITE);
     let execute = flags.has(VmFlags::EXEC);
     let user = flags.has(VmFlags::USER);
-    walk_and_map::<Riscv64Paging>(
+    let result = walk_and_map::<Riscv64Paging>(
         root_virt,
         vaddr,
         paddr,
@@ -237,14 +353,60 @@ unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFl
         false,
         phys_to_virt,
         allocate_page_table_page,
-    )
-    .expect("[arch][mm] map_user_pages: walk_and_map failed");
+    );
+    // 即使中途 OOM，walk 也可能已经发布新的中间页表；首次激活仍须 fence。
+    inner.needs_page_table_fence.store(true, Ordering::Release);
+    result
+}
+
+unsafe fn map_user_page_batch(
+    pgd: PgdHandle,
+    vaddr: usize,
+    paddrs: &[usize],
+    flags: VmFlags,
+) -> MapBatchResult {
+    // Safety: 由 UserPgdOps 契约保证 handle、地址、权限和空目标 PTE 合法。
+    let inner = unsafe { inner_ref(pgd) };
+    let result = walk_and_map_pages::<Riscv64Paging>(
+        inner.pgd_virt(),
+        vaddr,
+        paddrs,
+        Riscv64Paging::LEVELS - 1,
+        flags.has(VmFlags::READ),
+        flags.has(VmFlags::WRITE),
+        flags.has(VmFlags::EXEC),
+        flags.has(VmFlags::USER),
+        false,
+        phys_to_virt,
+        allocate_page_table_page,
+        true, // fresh_range=true: pages are freshly allocated, skip intermediate fences
+    );
+    // 批次即使只安装了前缀，也可能发布新的中间页表；首次激活仍需 fence。
+    inner.needs_page_table_fence.store(true, Ordering::Release);
+    result
+}
+
+unsafe fn publish_new_mapping(pgd: PgdHandle, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // Safety: 由 UserPgdOps 契约保证 handle 与范围合法。
+    let inner = unsafe { inner_ref(pgd) };
+    let page_size = Riscv64Paging::PAGE_SIZE;
+    let aligned_start = vaddr & !(page_size - 1);
+    let targeted = vaddr
+        .checked_add(len)
+        .is_some_and(|end| end.saturating_sub(aligned_start) <= page_size);
+    let address = targeted.then(|| VirtAddr::new(aligned_start));
+    // Safety: sfence.vma 同时排序先前 PTE store 并清除本 hart 的旧无效状态；
+    // needs_page_table_fence 保留为 true，使以后首次激活该 PGD 的其它 hart 仍会 fence。
+    unsafe { Riscv64Paging::flush_tlb_local_with_asid(inner.asid(), address) };
 }
 
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
     let _ = unmap_range_entries::<Riscv64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
-    flush_user_tlb_range(inner.asid(), vaddr, len);
+    inner.needs_page_table_fence.store(true, Ordering::Release);
 }
 
 unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
@@ -255,10 +417,36 @@ unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: Vm
     let user = flags.has(VmFlags::USER);
     let mut va = vaddr & !(Riscv64Paging::PAGE_SIZE - 1);
     let end = vaddr.saturating_add(len);
+    let base_level = Riscv64Paging::LEVELS - 1;
+    let mut leaf_table_vaddr = 0usize;
+    let mut leaf_table_end = va;
     while va < end {
-        if let Ok((level, pte_ptr, old_pte)) =
-            find_leaf::<Riscv64Paging>(inner.pgd_virt(), va, phys_to_virt)
-        {
+        let cached = if leaf_table_vaddr != 0 && va < leaf_table_end {
+            let index = Riscv64Paging::level_index(va, base_level);
+            let pte_ptr = (leaf_table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+            let old_pte =
+                Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) });
+            (Riscv64Paging::pte_is_valid(old_pte) && Riscv64Paging::pte_is_leaf(old_pte))
+                .then_some((base_level, pte_ptr, old_pte))
+        } else {
+            None
+        };
+        if let Ok((level, pte_ptr, old_pte)) = cached.ok_or(()).or_else(|_| {
+            let found =
+                find_leaf::<Riscv64Paging>(inner.pgd_virt(), va, phys_to_virt).map_err(|_| ())?;
+            if found.0 == base_level {
+                let index = Riscv64Paging::level_index(va, base_level);
+                leaf_table_vaddr = found.1 as usize - index * core::mem::size_of::<usize>();
+                let entries_left = Riscv64Paging::ENTRIES_PER_TABLE - index;
+                leaf_table_end = va
+                    .saturating_add(entries_left * Riscv64Paging::PAGE_SIZE)
+                    .min(end);
+            } else {
+                leaf_table_vaddr = 0;
+                leaf_table_end = va;
+            }
+            Ok::<_, ()>(found)
+        }) {
             let old_flags = Riscv64Paging::pte_flags(old_pte);
             let new_pte = Riscv64Paging::make_leaf_pte_for_level(
                 level,
@@ -274,7 +462,7 @@ unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: Vm
         }
         va += Riscv64Paging::PAGE_SIZE;
     }
-    flush_user_tlb_range(inner.asid(), vaddr, len);
+    inner.needs_page_table_fence.store(true, Ordering::Release);
 }
 
 unsafe fn clone_for_fork_user_pages(
@@ -331,25 +519,18 @@ unsafe fn clone_for_fork_user_pages(
         }
         va += Riscv64Paging::PAGE_SIZE;
     }
-}
-
-fn lookup_pgd(pgd: PgdHandle, vaddr: usize) -> Option<usize> {
-    let inner = unsafe { inner_ref(pgd) };
-    let root_virt = inner.pgd_virt();
-    find_leaf::<Riscv64Paging>(root_virt, vaddr, phys_to_virt)
-        .map(|(_, _, pte)| Riscv64Paging::pte_addr(pte))
-        .ok()
-}
-
-#[allow(dead_code)]
-fn get_asid(pgd: PgdHandle) -> usize {
-    let inner = unsafe { inner_ref(pgd) };
-    inner.asid()
+    dst_inner
+        .needs_page_table_fence
+        .store(true, Ordering::Release);
 }
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    flush_user_tlb_range(inner.asid(), vaddr, len);
+    let active_cpus = inner.active_cpus.load(Ordering::Acquire);
+    flush_user_tlb_range(inner.asid(), active_cpus, vaddr, len);
+    // 本次定向 fence 已覆盖相应页表修改，但不能消费新一代 ASID 的首次激活
+    // 标记；后者要求 activate() 在安装该 ASID 时完成一次完整 ASID fence。
+    inner.needs_page_table_fence.store(false, Ordering::Release);
 }
 
 unsafe fn count_mapped_pages(pgd: PgdHandle, vaddr: usize, len: usize) -> usize {
@@ -366,14 +547,23 @@ unsafe fn count_mapped_pages(pgd: PgdHandle, vaddr: usize, len: usize) -> usize 
     count
 }
 
+unsafe fn zero_user_pages(vaddr: usize, len: usize) {
+    // Safety: UserPgdOps 契约保证 direct-map 范围独占、可写且按页对齐。
+    unsafe { crate::riscv64::specific::zero_memory_fast(vaddr, len) };
+}
+
 pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
+    zero_user_pages,
     map: map_user_pages,
+    map_pages: map_user_page_batch,
+    publish_new_mapping,
     unmap: unmap_user_pages,
     protect: protect_user_pages,
     clone_for_fork: clone_for_fork_user_pages,
     activate,
+    activate_kernel,
     invalidate_range,
     count_mapped: count_mapped_pages,
 };

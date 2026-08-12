@@ -4,7 +4,7 @@
 //! 不具备密码学安全性，仅用于内核早期初始化（ASLR seed、初始 RNG state）。
 //! 如果硬件支持 Zkr 扩展（`seed` CSR），应优先使用硬件真随机数。
 
-use general::dev::random_source::{EntropySource, register_entropy_source};
+use general::dev::random_source::{EntropySample, EntropySource, register_entropy_source};
 
 struct Riscv64EntropySource;
 
@@ -27,7 +27,7 @@ impl EntropySource for Riscv64EntropySource {
     }
 
     fn name(&self) -> &'static str {
-        "riscv64-jitter"
+        "riscv64-jitter-uncredited"
     }
 
     fn sample(&self, out: &mut [u8]) {
@@ -50,6 +50,12 @@ impl EntropySource for Riscv64EntropySource {
             let bytes = state.to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
+    }
+
+    fn sample_with_credit(&self, out: &mut [u8]) -> EntropySample {
+        self.sample(out);
+        // 时间、SP 和 RA 只用于扰动池状态；没有经验证的不可预测性，不增加熵估计。
+        EntropySample::new(out.len(), 0)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

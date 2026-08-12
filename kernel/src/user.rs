@@ -4,25 +4,25 @@
 //!
 //! 流程：
 //! - 解析 ELF；
-//! - 建 VmSpace，对每个 PT_LOAD 段调 VmSpace::commit_segment；
+//! - 建 VmSpace，对主程序 PT_LOAD 段注册 file-backed 按需映射；
 //! - 预分配用户栈并布 argc/argv/envp/auxv；
 //! - 返回 LoadedUserImage（vm + entry_pc + user_sp）。
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::convert::TryFrom;
 
 use general::mm::{VmSpace, user_pgd_ops};
 use general::vfs::{
     self, FdTable, FileMode, VfsContext,
     file::{AccessMode, File, OpenOptions},
+    inode::InodeExecAccess,
     path::{Dirfd, LookupFlags},
 };
 use mm::VmFlags;
 use sched::Task;
 
-use elf::{Arch, Image, SegmentPerms};
+use elf::{ElfReadAt, ElfReadError, ElfReadLimits, Image, LinuxElfMetadata, read_linux_elf};
 
 const AT_NULL: usize = 0;
 const AT_PHDR: usize = 3;
@@ -43,94 +43,99 @@ const AT_EXECFN: usize = 31;
 const AT_SYSINFO_EHDR: usize = 33;
 const MAX_SHEBANG_DEPTH: usize = 4;
 
-const ELF64_EHDR_SIZE: usize = 64;
-const ELF64_PHDR_SIZE: usize = 56;
 const ELF_PREFIX_READ_SIZE: usize = 4096;
-const MAX_ELF_PHDR_BYTES: usize = 256 * 1024;
-const MAX_ELF_INTERP_BYTES: usize = 4096;
-const MAX_ELF_DYNAMIC_BYTES: usize = 1024 * 1024;
-const ELF64_EHDR_OFF_TYPE: usize = 0x10;
-const ELF64_EHDR_OFF_MACHINE: usize = 0x12;
-const ELF64_EHDR_OFF_ENTRY: usize = 0x18;
-const ELF64_EHDR_OFF_PHOFF: usize = 0x20;
-const ELF64_EHDR_OFF_PHENTSIZE: usize = 0x36;
-const ELF64_EHDR_OFF_PHNUM: usize = 0x38;
-const ELF64_PHDR_OFF_TYPE: usize = 0x00;
-const ELF64_PHDR_OFF_FLAGS: usize = 0x04;
-const ELF64_PHDR_OFF_OFFSET: usize = 0x08;
-const ELF64_PHDR_OFF_VADDR: usize = 0x10;
-const ELF64_PHDR_OFF_FILESZ: usize = 0x20;
-const ELF64_PHDR_OFF_MEMSZ: usize = 0x28;
-const ELF64_PHDR_OFF_ALIGN: usize = 0x30;
-const ELF64_PT_DYNAMIC: u32 = 2;
-const ELF64_ET_EXEC: u16 = 2;
-const ELF64_ET_DYN: u16 = 3;
-const ELF64_PT_LOAD: u32 = 1;
-const ELF64_PT_INTERP: u32 = 3;
-const ELF64_PT_PHDR: u32 = 6;
-const ELF64_PF_X: u32 = 1 << 0;
-const ELF64_PF_W: u32 = 1 << 1;
-const ELF64_PF_R: u32 = 1 << 2;
-const ELF64_DYN_ENTRY_SIZE: usize = 16;
-const EM_X86_64: u16 = 62;
-const EM_AARCH64: u16 = 183;
-const EM_RISCV: u16 = 243;
-const EM_LOONGARCH: u16 = 258;
-const DT_NULL: u64 = 0;
-const DT_NEEDED: u64 = 1;
-const DT_RELA: u64 = 7;
-const DT_RELASZ: u64 = 8;
-const DT_REL: u64 = 17;
-const DT_RELSZ: u64 = 18;
-const DT_JMPREL: u64 = 23;
-const DT_PLTRELSZ: u64 = 2;
 
 pub struct LoadedUserImage {
     pub vm: Arc<VmSpace>,
     pub entry_pc: usize,
     pub user_sp: usize,
     pub exec_path: String,
+    #[cfg(feature = "performance-profile")]
+    pub main_image_range: core::ops::Range<usize>,
+    #[cfg(feature = "performance-profile")]
+    pub interpreter_image: Option<(String, core::ops::Range<usize>)>,
+    pub exec_access: Arc<ExecutableAccessSet>,
+}
+
+/// exec 探测完成后交给事务层的映像类型。
+pub(crate) enum LoadedExecutionImage {
+    Tomori {
+        image: LoadedUserImage,
+        argv: Vec<String>,
+        envp: Vec<String>,
+    },
+    MygoNative {
+        image: crate::soyo::LoadedSoyoImage,
+        exec_path: String,
+        exec_access: Arc<ExecutableAccessSet>,
+        argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableFormat {
+    Soyo,
+    Elf,
+    Script,
+    Unknown,
+}
+
+pub(crate) fn detect_executable_format(prefix: &[u8]) -> ExecutableFormat {
+    if prefix.starts_with(&soyo::registry::SOYO_MAGIC) {
+        ExecutableFormat::Soyo
+    } else if prefix.starts_with(b"\x7fELF") {
+        ExecutableFormat::Elf
+    } else if prefix.starts_with(b"#!") {
+        ExecutableFormat::Script
+    } else {
+        ExecutableFormat::Unknown
+    }
+}
+
+/// 一次成功执行映像持有的全部 inode 执行租约。
+///
+/// 主程序和内核装载的动态解释器都保存在同一个集合中。任务 fork 时共享该集合，
+/// exec 替换或最后一个相关任务退出时集合析构，从而精确维持 ETXTBSY 生命周期。
+pub struct ExecutableAccessSet {
+    leases: Vec<InodeExecAccess>,
+}
+
+struct LoadedInterpreter {
+    bytes: Vec<u8>,
+    access: InodeExecAccess,
+}
+
+struct PreparedExecutableFile {
+    file: Arc<File>,
+    prefix: Vec<u8>,
+    access: InodeExecAccess,
 }
 
 struct LoadedImage {
     entry: usize,
     base: usize,
+    end: usize,
     phdr: usize,
     phent: usize,
     phnum: usize,
 }
 
-struct ExecImage {
-    entry: usize,
-    arch: Arch,
-    is_pie: bool,
-    phent: usize,
-    phnum: usize,
-    phdr_vaddr: Option<usize>,
-    load_range_seen: bool,
-    interpreter: Option<String>,
-    can_run_without_interpreter: bool,
-    segments: Vec<ExecSegment>,
+struct VfsElfReader {
+    file: Arc<File>,
+    size: u64,
 }
 
-#[derive(Clone)]
-struct ExecSegment {
-    vaddr: usize,
-    memsz: usize,
-    file_offset: u64,
-    file_size: usize,
-    perms: SegmentPerms,
-}
+impl ElfReadAt for VfsElfReader {
+    type Error = errno::Errno;
 
-#[derive(Clone, Copy)]
-struct ExecPhdr {
-    ty: u32,
-    flags: u32,
-    offset: u64,
-    vaddr: u64,
-    filesz: u64,
-    memsz: u64,
-    align: u64,
+    fn len(&self) -> u64 {
+        self.size
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
+        read_exact_file(&self.file, offset, dst)
+    }
 }
 
 pub fn load_user_image_from_path(
@@ -140,6 +145,57 @@ pub fn load_user_image_from_path(
     envp: &[String],
 ) -> Result<LoadedUserImage, errno::Errno> {
     load_user_image_from_path_inner(task, path, argv, envp, 0)
+}
+
+pub fn load_user_image_from_file(
+    task: &Arc<Task>,
+    file: Arc<File>,
+    exec_path: &str,
+    argv: &[String],
+    envp: &[String],
+) -> Result<LoadedUserImage, errno::Errno> {
+    load_user_image_from_file_inner(task, file, exec_path, argv, envp, 0)
+}
+
+pub(crate) fn load_execution_image_from_path(
+    task: &Arc<Task>,
+    path: &str,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Result<LoadedExecutionImage, errno::Errno> {
+    let file = open_file_from_task_vfs(task, path)?;
+    load_execution_image_from_file(task, file, path, argv, envp)
+}
+
+pub(crate) fn load_execution_image_from_file(
+    task: &Arc<Task>,
+    file: Arc<File>,
+    exec_path: &str,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Result<LoadedExecutionImage, errno::Errno> {
+    let prepared = prepare_executable_file(task, file)?;
+    match detect_executable_format(&prepared.prefix) {
+        ExecutableFormat::Soyo => {
+            let image = crate::soyo::load_soyo_image_from_file(Arc::clone(&prepared.file))?;
+            return Ok(LoadedExecutionImage::MygoNative {
+                image,
+                exec_path: String::from(exec_path),
+                exec_access: Arc::new(ExecutableAccessSet {
+                    leases: alloc::vec![prepared.access],
+                }),
+                argv,
+                envp,
+            });
+        }
+        ExecutableFormat::Elf | ExecutableFormat::Script => {}
+        ExecutableFormat::Unknown => return Err(errno::Errno::ENOEXEC),
+    }
+
+    let argv = byte_strings_to_text(argv)?;
+    let envp = byte_strings_to_text(envp)?;
+    let image = load_tomori_image_from_prepared(task, prepared, exec_path, &argv, &envp, 0)?;
+    Ok(LoadedExecutionImage::Tomori { image, argv, envp })
 }
 
 fn load_user_image_from_path_inner(
@@ -156,16 +212,75 @@ fn load_user_image_from_path_inner(
             return Err(e);
         }
     };
+    load_user_image_from_file_inner(task, file, path, argv, envp, shebang_depth)
+}
+
+fn load_user_image_from_file_inner(
+    task: &Arc<Task>,
+    file: Arc<File>,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    shebang_depth: usize,
+) -> Result<LoadedUserImage, errno::Errno> {
+    let prepared = prepare_executable_file(task, file)?;
+    load_tomori_image_from_prepared(task, prepared, path, argv, envp, shebang_depth)
+}
+
+fn prepare_executable_file(
+    task: &Arc<Task>,
+    file: Arc<File>,
+) -> Result<PreparedExecutableFile, errno::Errno> {
+    check_exec_permission(task, &file)?;
+    let access = file
+        .inode()
+        .acquire_exec_access()
+        .map_err(|error| error.to_errno())?;
+    let file = if file.flags().readable() {
+        file
+    } else {
+        let cred = task_vfs_context(task)?.cred();
+        file.open_exec_view(cred)
+            .map_err(|error| error.to_errno())?
+    };
     let prefix = load_elf_prefix_from_file(&file)?;
+    Ok(PreparedExecutableFile {
+        file,
+        prefix,
+        access,
+    })
+}
+
+fn load_tomori_image_from_prepared(
+    task: &Arc<Task>,
+    prepared: PreparedExecutableFile,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    shebang_depth: usize,
+) -> Result<LoadedUserImage, errno::Errno> {
+    let PreparedExecutableFile {
+        file,
+        prefix,
+        access: main_exec_access,
+    } = prepared;
     if prefix.starts_with(b"#!") {
         let script = parse_shebang(path, argv, &prefix, shebang_depth)?;
-        return load_user_image_from_path_inner(
+        let mut loaded = load_user_image_from_path_inner(
             task,
             &script.interpreter,
             &script.argv,
             envp,
             shebang_depth + 1,
-        );
+        )?;
+        Arc::get_mut(&mut loaded.exec_access)
+            .ok_or(errno::Errno::EIO)?
+            .leases
+            .push(main_exec_access);
+        return Ok(loaded);
+    }
+    if !prefix.starts_with(b"\x7fELF") {
+        return Err(errno::Errno::ENOEXEC);
     }
 
     let exec_image = match load_exec_image_from_file(&file) {
@@ -201,33 +316,42 @@ fn load_user_image_from_path_inner(
     }
 
     let vm = Arc::new(VmSpace::new());
-    let main_bias = if exec_image.is_pie {
+    let main_bias = if exec_image.is_pie() {
         hal::user::main_pie_base()
     } else {
         0
     };
     let main_loaded = load_exec_image(&vm, &exec_image, &file, main_bias, true, "exec")?;
     let exec_path = resolve_exec_path(task, path);
+    let mut exec_access = Vec::new();
+    exec_access.push(main_exec_access);
 
-    let interp_loaded = if let Some(interp) = exec_image.interpreter.as_deref() {
+    let interpreter_path = exec_image.interpreter().map(String::from);
+    let interp_loaded = if let Some(interp) = interpreter_path.as_deref() {
         match load_interpreter_from_task_vfs(task, &exec_path, interp) {
-            Ok(mut interp_bytes) => {
-                hal::user::patch_interpreter_image(interp, &mut interp_bytes);
-                let interp_img = elf::parse(&interp_bytes).map_err(|_| errno::Errno::ENOEXEC)?;
+            Ok(loaded_interpreter) => {
+                let LoadedInterpreter { mut bytes, access } = loaded_interpreter;
+                hal::user::patch_interpreter_image(interp, &mut bytes);
+                let interp_img = elf::parse(&bytes).map_err(|_| errno::Errno::ENOEXEC)?;
                 validate_user_image_result(&*interp_img).map_err(|_| errno::Errno::ENOEXEC)?;
-                Some(load_image(
-                    &vm,
-                    &*interp_img,
-                    hal::user::interp_base(),
-                    "interp",
-                )?)
+                let loaded = load_image(&vm, &*interp_img, hal::user::interp_base(), "interp")?;
+                exec_access.push(access);
+                Some(loaded)
             }
-            Err(errno::Errno::ENOENT) if exec_image.can_run_without_interpreter => None,
+            Err(errno::Errno::ENOENT) if exec_image.can_run_without_interpreter() => None,
             Err(err) => return Err(err),
         }
     } else {
         None
     };
+    let entry_pc = interp_loaded
+        .as_ref()
+        .map(|interp| interp.entry)
+        .unwrap_or(main_loaded.entry);
+    let at_base = interp_loaded
+        .as_ref()
+        .map(|interp| interp.base)
+        .unwrap_or(0);
 
     let stack_top = hal::user::default_stack_top();
     let stack_size = hal::user::default_stack_size();
@@ -239,7 +363,27 @@ fn load_user_image_from_path_inner(
         .with(VmFlags::WRITE)
         .with(VmFlags::USER)
         .with(VmFlags::GROWS_DOWN);
-    vm.commit_segment(stack_bottom, stack_size, 0, &[], stack_flags)?;
+    let creds = task.credentials();
+    // 规划与写入复用同一套游标运算，避免估算误差让直接用户地址写越过预驻留页。
+    let planned_user_sp = layout_user_stack(
+        StackLayoutMode::Plan,
+        stack_top,
+        &main_loaded,
+        at_base,
+        &exec_path,
+        argv,
+        envp,
+        creds.uid.0,
+        creds.euid.0,
+        creds.gid.0,
+        creds.egid.0,
+        hal::user::vdso_base(),
+    )?;
+    if planned_user_sp < stack_bottom || planned_user_sp >= stack_top {
+        return Err(errno::Errno::EINVAL);
+    }
+    vm.map_anon(stack_bottom..stack_top, stack_flags)?;
+    vm.prefault_user_range(planned_user_sp..stack_top, true)?;
 
     // Map vDSO code page from the synthesized ELF image, then attach the shared
     // data page as a direct read-only mapping for user-space fast paths.
@@ -273,16 +417,8 @@ fn load_user_image_from_path_inner(
     // RISC-V: 设置 SUM 位允许 S-mode 访问 U=1 的用户页面
     unsafe { hal::user::enable_sum() };
 
-    let entry_pc = interp_loaded
-        .as_ref()
-        .map(|interp| interp.entry)
-        .unwrap_or(main_loaded.entry);
-    let at_base = interp_loaded
-        .as_ref()
-        .map(|interp| interp.base)
-        .unwrap_or(0);
-    let creds = task.credentials();
     let user_sp = layout_user_stack(
+        StackLayoutMode::Write,
         stack_top,
         &main_loaded,
         at_base,
@@ -295,16 +431,51 @@ fn load_user_image_from_path_inner(
         creds.egid.0,
         hal::user::vdso_base(),
     )?;
+    if user_sp != planned_user_sp {
+        return Err(errno::Errno::EIO);
+    }
 
     Ok(LoadedUserImage {
         vm,
         entry_pc,
         user_sp,
         exec_path,
+        #[cfg(feature = "performance-profile")]
+        main_image_range: main_loaded.base..main_loaded.end,
+        #[cfg(feature = "performance-profile")]
+        interpreter_image: interpreter_path
+            .zip(interp_loaded.as_ref().map(|loaded| loaded.base..loaded.end)),
+        exec_access: Arc::new(ExecutableAccessSet {
+            leases: exec_access,
+        }),
     })
 }
 
+fn byte_strings_to_text(values: Vec<Vec<u8>>) -> Result<Vec<String>, errno::Errno> {
+    let mut strings = Vec::new();
+    strings
+        .try_reserve_exact(values.len())
+        .map_err(|_| errno::Errno::ENOMEM)?;
+    for value in values {
+        strings.push(String::from_utf8(value).map_err(|_| errno::Errno::EFAULT)?);
+    }
+    Ok(strings)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StackLayoutMode {
+    Plan,
+    Write,
+}
+
+impl StackLayoutMode {
+    fn writes(self) -> bool {
+        self == Self::Write
+    }
+}
+
 fn layout_user_stack(
+    mode: StackLayoutMode,
     stack_top: usize,
     main: &LoadedImage,
     at_base: usize,
@@ -347,28 +518,32 @@ fn layout_user_stack(
     let mut sp = stack_top;
     let mut argv_ptrs = Vec::new();
     let mut envp_ptrs = Vec::new();
-    let execfn_ptr = push_user_string(&mut sp, path.as_bytes());
+    let execfn_ptr = push_user_string(mode, &mut sp, path.as_bytes());
 
     if argv.is_empty() {
         argv_ptrs.push(execfn_ptr);
     } else {
         for arg in argv.iter().rev() {
-            let ptr = push_user_string(&mut sp, arg.as_bytes());
+            let ptr = push_user_string(mode, &mut sp, arg.as_bytes());
             argv_ptrs.push(ptr);
         }
         argv_ptrs.reverse();
     }
     for env in envp.iter().rev() {
-        let ptr = push_user_string(&mut sp, env.as_bytes());
+        let ptr = push_user_string(mode, &mut sp, env.as_bytes());
         envp_ptrs.push(ptr);
     }
     envp_ptrs.reverse();
 
     sp -= 16;
     let random_ptr = sp;
-    unsafe {
-        core::ptr::write_unaligned(random_ptr as *mut u64, 0x6d79676f5f726e64);
-        core::ptr::write_unaligned((random_ptr + 8) as *mut u64, 0xfedcba9876543210);
+    if mode.writes() {
+        unsafe {
+            // Safety: Plan 阶段计算出的完整内容区间已预驻留且可写，两个 u64
+            // 都位于该区间内；写入阶段已经激活目标用户页表。
+            core::ptr::write_unaligned(random_ptr as *mut u64, 0x6d79676f5f726e64);
+            core::ptr::write_unaligned((random_ptr + 8) as *mut u64, 0xfedcba9876543210);
+        }
     }
 
     sp &= !0xf;
@@ -396,43 +571,68 @@ fn layout_user_stack(
     let stack_slots = 1 + argv_ptrs.len() + 1 + envp_ptrs.len() + 1 + auxv.len() * 2;
     if stack_slots % 2 != 0 {
         sp -= 8;
-        unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+        if mode.writes() {
+            // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+            unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+        }
     }
 
     for (key, value) in auxv.iter().rev() {
         sp -= 16;
-        unsafe {
-            core::ptr::write_unaligned(sp as *mut u64, *key as u64);
-            core::ptr::write_unaligned((sp + 8) as *mut u64, *value as u64);
+        if mode.writes() {
+            unsafe {
+                // Safety: sp 与 sp + 8 均由共享布局游标产生，位于已预驻留区间。
+                core::ptr::write_unaligned(sp as *mut u64, *key as u64);
+                core::ptr::write_unaligned((sp + 8) as *mut u64, *value as u64);
+            }
         }
     }
 
     sp -= 8;
-    unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    if mode.writes() {
+        // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+        unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    }
     for ptr in envp_ptrs.iter().rev() {
         sp -= 8;
-        unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        if mode.writes() {
+            // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+            unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        }
     }
 
     sp -= 8;
-    unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    if mode.writes() {
+        // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+        unsafe { core::ptr::write_unaligned(sp as *mut u64, 0) };
+    }
     for ptr in argv_ptrs.iter().rev() {
         sp -= 8;
-        unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        if mode.writes() {
+            // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+            unsafe { core::ptr::write_unaligned(sp as *mut u64, *ptr as u64) };
+        }
     }
 
     sp -= 8;
-    unsafe { core::ptr::write_unaligned(sp as *mut u64, argc as u64) };
+    if mode.writes() {
+        // Safety: sp 由共享布局游标产生，指向已预驻留的初始栈内容区间。
+        unsafe { core::ptr::write_unaligned(sp as *mut u64, argc as u64) };
+    }
 
     Ok(sp)
 }
 
-fn push_user_string(sp: &mut usize, bytes: &[u8]) -> usize {
+fn push_user_string(mode: StackLayoutMode, sp: &mut usize, bytes: &[u8]) -> usize {
     *sp -= bytes.len() + 1;
     let ptr = *sp;
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        core::ptr::write((ptr + bytes.len()) as *mut u8, 0);
+    if mode.writes() {
+        unsafe {
+            // Safety: ptr..ptr+len+1 由 Plan 阶段同一游标计算并已预驻留；源切片
+            // 有 bytes.len() 字节，末尾 NUL 仍位于对应字符串保留区间内。
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            core::ptr::write((ptr + bytes.len()) as *mut u8, 0);
+        }
     }
     ptr
 }
@@ -442,7 +642,11 @@ fn arch_hwcap() -> usize {
     {
         arch::riscv64::vector::user_hwcap()
     }
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::user_hwcap()
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     {
         0
     }
@@ -522,55 +726,6 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn dynamic_can_run_without_interpreter(dynamic: Option<&[u8]>) -> bool {
-    let Some(dynamic) = dynamic else {
-        return true;
-    };
-    let mut has_needed = false;
-    let mut rela_size = 0u64;
-    let mut rel_size = 0u64;
-    let mut plt_rel_size = 0u64;
-    let mut has_jmprel = false;
-
-    for ent in dynamic.chunks_exact(ELF64_DYN_ENTRY_SIZE) {
-        let tag = read_u64_at(ent, 0);
-        let val = read_u64_at(ent, 8);
-        match tag {
-            DT_NULL => break,
-            DT_NEEDED => has_needed = true,
-            DT_RELASZ => rela_size = val,
-            DT_RELSZ => rel_size = val,
-            DT_PLTRELSZ => plt_rel_size = val,
-            DT_JMPREL => has_jmprel = val != 0,
-            DT_RELA | DT_REL => {}
-            _ => {}
-        }
-    }
-
-    !has_needed && rela_size == 0 && rel_size == 0 && plt_rel_size == 0 && !has_jmprel
-}
-
-fn read_u16_at(bytes: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([bytes[off], bytes[off + 1]])
-}
-
-fn read_u32_at(bytes: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-}
-
-fn read_u64_at(bytes: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[off],
-        bytes[off + 1],
-        bytes[off + 2],
-        bytes[off + 3],
-        bytes[off + 4],
-        bytes[off + 5],
-        bytes[off + 6],
-        bytes[off + 7],
-    ])
-}
-
 fn validate_user_image_result(img: &dyn Image<'_>) -> Result<(), ()> {
     if img.arch() != hal::platform::elf_arch() {
         log::info!(
@@ -587,16 +742,16 @@ fn validate_user_image_result(img: &dyn Image<'_>) -> Result<(), ()> {
     Ok(())
 }
 
-fn validate_exec_image_result(img: &ExecImage) -> Result<(), ()> {
-    if img.arch != hal::platform::elf_arch() {
+fn validate_exec_image_result(img: &LinuxElfMetadata) -> Result<(), ()> {
+    if img.arch() != hal::platform::elf_arch() {
         log::info!(
             "[user] validate: arch mismatch got={:?} expect={:?}",
-            img.arch,
+            img.arch(),
             hal::platform::elf_arch()
         );
         return Err(());
     }
-    if !img.load_range_seen {
+    if img.load_range().is_none() {
         log::info!("[user] validate: load_vaddr_range is None");
         return Err(());
     }
@@ -605,33 +760,35 @@ fn validate_exec_image_result(img: &ExecImage) -> Result<(), ()> {
 
 fn load_exec_image(
     vm: &VmSpace,
-    img: &ExecImage,
+    img: &LinuxElfMetadata,
     file: &Arc<File>,
     load_bias: usize,
     update_brk: bool,
     label: &str,
 ) -> Result<LoadedImage, errno::Errno> {
     let mut max_segment_end: usize = 0;
-    for seg in &img.segments {
-        let flags = seg.perms.to_vm_flags();
+    for seg in img.load_segments() {
+        let flags = seg.permissions.to_vm_flags();
         let vaddr = load_bias
             .checked_add(seg.vaddr)
             .ok_or(errno::Errno::ENOEXEC)?;
-        let seg_end = vaddr.checked_add(seg.memsz).ok_or(errno::Errno::ENOEXEC)?;
+        let seg_end = vaddr
+            .checked_add(seg.mem_size)
+            .ok_or(errno::Errno::ENOEXEC)?;
         log::debug!(
             "[user] {} segment vaddr={:#x} memsz={:#x} filesz={:#x} flags={:?}",
             label,
             vaddr,
-            seg.memsz,
+            seg.mem_size,
             seg.file_size,
             flags
         );
         vm.commit_file_segment(
             vaddr,
-            seg.memsz,
+            seg.mem_size,
             seg.file_offset,
             seg.file_size,
-            file.as_ref(),
+            file.clone(),
             flags,
         )?;
         if seg_end > max_segment_end {
@@ -643,290 +800,33 @@ fn load_exec_image(
     }
     Ok(LoadedImage {
         entry: load_bias
-            .checked_add(img.entry)
+            .checked_add(img.entry())
             .ok_or(errno::Errno::ENOEXEC)?,
         base: load_bias,
+        end: max_segment_end,
         phdr: img
-            .phdr_vaddr
+            .program_header_vaddr()
             .and_then(|v| load_bias.checked_add(v))
             .unwrap_or(0),
-        phent: img.phent,
-        phnum: img.phnum,
+        phent: img.program_header_entry_size() as usize,
+        phnum: img.program_header_count() as usize,
     })
 }
 
-fn load_exec_image_from_file(file: &Arc<File>) -> Result<ExecImage, errno::Errno> {
+fn load_exec_image_from_file(file: &Arc<File>) -> Result<LinuxElfMetadata, errno::Errno> {
     let file_size = file_size(file)?;
     if file_size == 0 {
         return Err(errno::Errno::ENOEXEC);
     }
-
-    let mut ehdr = [0u8; ELF64_EHDR_SIZE];
-    read_exact_file(file, 0, &mut ehdr)?;
-    validate_elf_ident(&ehdr)?;
-
-    let ty = read_u16_at(&ehdr, ELF64_EHDR_OFF_TYPE);
-    if ty != ELF64_ET_EXEC && ty != ELF64_ET_DYN {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    let arch = map_elf_machine(read_u16_at(&ehdr, ELF64_EHDR_OFF_MACHINE));
-    let entry = usize::try_from(read_u64_at(&ehdr, ELF64_EHDR_OFF_ENTRY))
-        .map_err(|_| errno::Errno::ENOEXEC)?;
-    let phoff = read_u64_at(&ehdr, ELF64_EHDR_OFF_PHOFF);
-    let phentsize = read_u16_at(&ehdr, ELF64_EHDR_OFF_PHENTSIZE) as usize;
-    let phnum = read_u16_at(&ehdr, ELF64_EHDR_OFF_PHNUM) as usize;
-    if phentsize != ELF64_PHDR_SIZE {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    let phdr_bytes_len = phentsize.checked_mul(phnum).ok_or(errno::Errno::ENOEXEC)?;
-    if phdr_bytes_len > MAX_ELF_PHDR_BYTES {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    let phdr_end = phoff
-        .checked_add(u64::try_from(phdr_bytes_len).map_err(|_| errno::Errno::ENOEXEC)?)
-        .ok_or(errno::Errno::ENOEXEC)?;
-    if phdr_end > file_size {
-        return Err(errno::Errno::ENOEXEC);
-    }
-
-    let mut phdr_bytes = Vec::new();
-    phdr_bytes
-        .try_reserve_exact(phdr_bytes_len)
-        .map_err(|_| errno::Errno::ENOMEM)?;
-    phdr_bytes.resize(phdr_bytes_len, 0);
-    read_exact_file(file, phoff, &mut phdr_bytes)?;
-
-    let mut phdrs = Vec::new();
-    phdrs
-        .try_reserve_exact(phnum)
-        .map_err(|_| errno::Errno::ENOMEM)?;
-    for idx in 0..phnum {
-        let off = idx * phentsize;
-        phdrs.push(decode_exec_phdr(&phdr_bytes[off..off + ELF64_PHDR_SIZE]));
-    }
-
-    validate_load_segments(file_size, &phdrs)?;
-    validate_phdr_table(phoff, phdr_end, file_size, &phdrs)?;
-    validate_entry(entry, &phdrs)?;
-
-    let interpreter = read_interp(file, file_size, &phdrs)?;
-    let dynamic = read_dynamic(file, file_size, &phdrs)?;
-    let can_run_without_interpreter = dynamic_can_run_without_interpreter(dynamic.as_deref());
-    let phdr_vaddr = find_exec_phdr_vaddr(phoff, phdr_end, &phdrs);
-
-    let mut segments = Vec::new();
-    let mut load_range_seen = false;
-    for ph in &phdrs {
-        if ph.ty != ELF64_PT_LOAD || ph.memsz == 0 {
-            continue;
-        }
-        segments
-            .try_reserve_exact(1)
-            .map_err(|_| errno::Errno::ENOMEM)?;
-        segments.push(ExecSegment {
-            vaddr: usize::try_from(ph.vaddr).map_err(|_| errno::Errno::ENOEXEC)?,
-            memsz: usize::try_from(ph.memsz).map_err(|_| errno::Errno::ENOEXEC)?,
-            file_offset: ph.offset,
-            file_size: usize::try_from(ph.filesz).map_err(|_| errno::Errno::ENOEXEC)?,
-            perms: perms_from_exec_phdr(ph),
-        });
-        load_range_seen = true;
-    }
-
-    Ok(ExecImage {
-        entry,
-        arch,
-        is_pie: ty == ELF64_ET_DYN,
-        phent: phentsize,
-        phnum,
-        phdr_vaddr,
-        load_range_seen,
-        interpreter,
-        can_run_without_interpreter,
-        segments,
+    let reader = VfsElfReader {
+        file: file.clone(),
+        size: file_size,
+    };
+    read_linux_elf(&reader, ElfReadLimits::default()).map_err(|error| match error {
+        ElfReadError::Format(_) => errno::Errno::ENOEXEC,
+        ElfReadError::Source(error) => error,
+        ElfReadError::ResourceExhausted => errno::Errno::ENOMEM,
     })
-}
-
-fn validate_elf_ident(ehdr: &[u8]) -> Result<(), errno::Errno> {
-    if ehdr.get(0..4) != Some(b"\x7fELF") {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    if ehdr[4] != 2 || ehdr[5] != 1 {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    Ok(())
-}
-
-fn map_elf_machine(machine: u16) -> Arch {
-    match machine {
-        EM_LOONGARCH => Arch::LoongArch64,
-        EM_RISCV => Arch::Riscv64,
-        EM_X86_64 => Arch::X86_64,
-        EM_AARCH64 => Arch::Aarch64,
-        other => Arch::Unknown(other),
-    }
-}
-
-fn decode_exec_phdr(bytes: &[u8]) -> ExecPhdr {
-    ExecPhdr {
-        ty: read_u32_at(bytes, ELF64_PHDR_OFF_TYPE),
-        flags: read_u32_at(bytes, ELF64_PHDR_OFF_FLAGS),
-        offset: read_u64_at(bytes, ELF64_PHDR_OFF_OFFSET),
-        vaddr: read_u64_at(bytes, ELF64_PHDR_OFF_VADDR),
-        filesz: read_u64_at(bytes, ELF64_PHDR_OFF_FILESZ),
-        memsz: read_u64_at(bytes, ELF64_PHDR_OFF_MEMSZ),
-        align: read_u64_at(bytes, ELF64_PHDR_OFF_ALIGN),
-    }
-}
-
-fn perms_from_exec_phdr(ph: &ExecPhdr) -> SegmentPerms {
-    let mut perms = SegmentPerms::EMPTY;
-    if ph.flags & ELF64_PF_R != 0 {
-        perms = perms.with(SegmentPerms::READ);
-    }
-    if ph.flags & ELF64_PF_W != 0 {
-        perms = perms.with(SegmentPerms::WRITE);
-    }
-    if ph.flags & ELF64_PF_X != 0 {
-        perms = perms.with(SegmentPerms::EXEC);
-    }
-    perms
-}
-
-fn validate_load_segments(file_size: u64, phdrs: &[ExecPhdr]) -> Result<(), errno::Errno> {
-    for ph in phdrs {
-        if ph.ty != ELF64_PT_LOAD {
-            continue;
-        }
-        validate_load_alignment(ph)?;
-        if ph.filesz > ph.memsz {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        checked_file_range(file_size, ph.offset, ph.filesz)?;
-        checked_vaddr_range(ph.vaddr, ph.memsz)?;
-    }
-    validate_load_overlaps(phdrs)
-}
-
-fn validate_load_alignment(ph: &ExecPhdr) -> Result<(), errno::Errno> {
-    if ph.align <= 1 {
-        return Ok(());
-    }
-    if !ph.align.is_power_of_two() {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    if ph.vaddr % ph.align != ph.offset % ph.align {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    Ok(())
-}
-
-fn validate_load_overlaps(phdrs: &[ExecPhdr]) -> Result<(), errno::Errno> {
-    for i in 0..phdrs.len() {
-        let left = phdrs[i];
-        if left.ty != ELF64_PT_LOAD || left.memsz == 0 {
-            continue;
-        }
-        let left_range = checked_vaddr_range(left.vaddr, left.memsz)?;
-        for right in phdrs.iter().skip(i + 1).copied() {
-            if right.ty != ELF64_PT_LOAD || right.memsz == 0 {
-                continue;
-            }
-            let right_range = checked_vaddr_range(right.vaddr, right.memsz)?;
-            if left_range.0 < right_range.1 && right_range.0 < left_range.1 {
-                return Err(errno::Errno::ENOEXEC);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_phdr_table(
-    phoff: u64,
-    phdr_end: u64,
-    file_size: u64,
-    phdrs: &[ExecPhdr],
-) -> Result<(), errno::Errno> {
-    let mut seen = false;
-    for ph in phdrs {
-        if ph.ty != ELF64_PT_PHDR {
-            continue;
-        }
-        if seen || ph.filesz > ph.memsz {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        seen = true;
-        checked_file_range(file_size, ph.offset, ph.filesz)?;
-        let seg_end = ph
-            .offset
-            .checked_add(ph.filesz)
-            .ok_or(errno::Errno::ENOEXEC)?;
-        if ph.offset > phoff || seg_end < phdr_end {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        checked_vaddr_range(ph.vaddr, ph.memsz)?;
-    }
-    Ok(())
-}
-
-fn validate_entry(entry: usize, phdrs: &[ExecPhdr]) -> Result<(), errno::Errno> {
-    for ph in phdrs {
-        if ph.ty != ELF64_PT_LOAD || ph.memsz == 0 || ph.flags & ELF64_PF_X == 0 {
-            continue;
-        }
-        let range = checked_vaddr_range(ph.vaddr, ph.memsz)?;
-        if range.0 <= entry && entry < range.1 {
-            return Ok(());
-        }
-    }
-    Err(errno::Errno::ENOEXEC)
-}
-
-fn read_interp(
-    file: &File,
-    file_size: u64,
-    phdrs: &[ExecPhdr],
-) -> Result<Option<String>, errno::Errno> {
-    for ph in phdrs {
-        if ph.ty != ELF64_PT_INTERP {
-            continue;
-        }
-        checked_file_range(file_size, ph.offset, ph.filesz)?;
-        let len = usize::try_from(ph.filesz).map_err(|_| errno::Errno::ENOEXEC)?;
-        if len <= 1 || len > MAX_ELF_INTERP_BYTES {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        let raw = read_small_file_range(file, ph.offset, len)?;
-        if raw.last() != Some(&0) {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        let path = &raw[..raw.len() - 1];
-        if path.is_empty() || path.contains(&0) {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        let path = core::str::from_utf8(path).map_err(|_| errno::Errno::ENOEXEC)?;
-        return Ok(Some(String::from(path)));
-    }
-    Ok(None)
-}
-
-fn read_dynamic(
-    file: &File,
-    file_size: u64,
-    phdrs: &[ExecPhdr],
-) -> Result<Option<Vec<u8>>, errno::Errno> {
-    for ph in phdrs {
-        if ph.ty != ELF64_PT_DYNAMIC {
-            continue;
-        }
-        checked_file_range(file_size, ph.offset, ph.filesz)?;
-        let len = usize::try_from(ph.filesz).map_err(|_| errno::Errno::ENOEXEC)?;
-        if len > MAX_ELF_DYNAMIC_BYTES {
-            return Err(errno::Errno::ENOEXEC);
-        }
-        return Ok(Some(read_small_file_range(file, ph.offset, len)?));
-    }
-    Ok(None)
 }
 
 fn read_small_file_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>, errno::Errno> {
@@ -939,55 +839,6 @@ fn read_small_file_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>
         read_exact_file(file, offset, &mut bytes)?;
     }
     Ok(bytes)
-}
-
-fn find_exec_phdr_vaddr(phoff: u64, phdr_end: u64, phdrs: &[ExecPhdr]) -> Option<usize> {
-    for ph in phdrs {
-        if ph.ty == ELF64_PT_PHDR {
-            return phdr_table_vaddr_in_segment(phoff, phdr_end, ph.offset, ph.filesz, ph.vaddr);
-        }
-    }
-    for ph in phdrs {
-        if ph.ty != ELF64_PT_LOAD {
-            continue;
-        }
-        if let Some(vaddr) =
-            phdr_table_vaddr_in_segment(phoff, phdr_end, ph.offset, ph.filesz, ph.vaddr)
-        {
-            return Some(vaddr);
-        }
-    }
-    None
-}
-
-fn phdr_table_vaddr_in_segment(
-    table_start: u64,
-    table_end: u64,
-    seg_offset: u64,
-    seg_filesz: u64,
-    seg_vaddr: u64,
-) -> Option<usize> {
-    let seg_end = seg_offset.checked_add(seg_filesz)?;
-    if seg_offset > table_start || seg_end < table_end {
-        return None;
-    }
-    let delta = table_start.checked_sub(seg_offset)?;
-    usize::try_from(seg_vaddr.checked_add(delta)?).ok()
-}
-
-fn checked_file_range(file_size: u64, offset: u64, size: u64) -> Result<(), errno::Errno> {
-    let end = offset.checked_add(size).ok_or(errno::Errno::ENOEXEC)?;
-    if end > file_size {
-        return Err(errno::Errno::ENOEXEC);
-    }
-    Ok(())
-}
-
-fn checked_vaddr_range(vaddr: u64, size: u64) -> Result<(usize, usize), errno::Errno> {
-    let end = vaddr.checked_add(size).ok_or(errno::Errno::ENOEXEC)?;
-    let start = usize::try_from(vaddr).map_err(|_| errno::Errno::ENOEXEC)?;
-    let end = usize::try_from(end).map_err(|_| errno::Errno::ENOEXEC)?;
-    Ok((start, end))
 }
 
 fn load_image(
@@ -1021,6 +872,7 @@ fn load_image(
             .checked_add(img.entry())
             .ok_or(errno::Errno::ENOEXEC)?,
         base: load_bias,
+        end: max_segment_end,
         phdr: img
             .phdr_vaddr()
             .and_then(|v| load_bias.checked_add(v))
@@ -1052,9 +904,9 @@ fn load_interpreter_from_task_vfs(
     task: &Arc<Task>,
     exec_path: &str,
     interp: &str,
-) -> Result<Vec<u8>, errno::Errno> {
-    match load_file_from_task_vfs(task, interp) {
-        Ok(bytes) => return Ok(bytes),
+) -> Result<LoadedInterpreter, errno::Errno> {
+    match load_executable_bytes_from_task_vfs(task, interp) {
+        Ok(loaded) => return Ok(loaded),
         Err(errno::Errno::ENOENT) => {}
         Err(err) => return Err(err),
     }
@@ -1074,8 +926,8 @@ fn load_interpreter_from_task_vfs(
     }
 
     for candidate in candidates {
-        match load_file_from_task_vfs(task, &candidate) {
-            Ok(bytes) => return Ok(bytes),
+        match load_executable_bytes_from_task_vfs(task, &candidate) {
+            Ok(loaded) => return Ok(loaded),
             Err(errno::Errno::ENOENT) => continue,
             Err(err) => return Err(err),
         }
@@ -1165,12 +1017,16 @@ fn load_elf_prefix_from_file(file: &File) -> Result<Vec<u8>, errno::Errno> {
     read_small_file_range(file, 0, len)
 }
 
-fn file_size(file: &File) -> Result<u64, errno::Errno> {
+pub(crate) fn file_size(file: &File) -> Result<u64, errno::Errno> {
     let size = file.stat().map_err(|e| e.to_errno())?.size;
     u64::try_from(size).map_err(|_| errno::Errno::EFBIG)
 }
 
-fn read_exact_file(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), errno::Errno> {
+pub(crate) fn read_exact_file(
+    file: &File,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), errno::Errno> {
     let mut done = 0usize;
     while done < buf.len() {
         let read_off = offset
@@ -1187,9 +1043,54 @@ fn read_exact_file(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), errno
     Ok(())
 }
 
-fn load_file_from_task_vfs(task: &Arc<Task>, path: &str) -> Result<Vec<u8>, errno::Errno> {
+pub(crate) fn load_file_from_task_vfs(
+    task: &Arc<Task>,
+    path: &str,
+) -> Result<Vec<u8>, errno::Errno> {
     let file = open_file_from_task_vfs(task, path)?;
-    let size = usize::try_from(file_size(&file)?).map_err(|_| errno::Errno::EFBIG)?;
+    read_entire_file(&file)
+}
+
+fn load_executable_bytes_from_task_vfs(
+    task: &Arc<Task>,
+    path: &str,
+) -> Result<LoadedInterpreter, errno::Errno> {
+    let file = open_file_from_task_vfs(task, path)?;
+    check_exec_permission(task, &file)?;
+    let access = file
+        .inode()
+        .acquire_exec_access()
+        .map_err(|error| error.to_errno())?;
+    let bytes = read_entire_file(&file)?;
+    Ok(LoadedInterpreter { bytes, access })
+}
+
+fn check_exec_permission(task: &Arc<Task>, file: &Arc<File>) -> Result<(), errno::Errno> {
+    if file.inode().kind() != vfs::stat::FileType::Regular {
+        return Err(errno::Errno::EACCES);
+    }
+    if file
+        .mount()
+        .flags_snapshot()
+        .has(vfs::mount::MountFlags::NOEXEC)
+    {
+        return Err(errno::Errno::EACCES);
+    }
+    let stat = file.inode().stat().map_err(|error| error.to_errno())?;
+    let ctx = task_vfs_context(task)?;
+    if !ctx.cred().can_exec(
+        vfs::cred::Uid(stat.uid),
+        vfs::cred::Gid(stat.gid),
+        FileMode::new(stat.mode as u16),
+        false,
+    ) {
+        return Err(errno::Errno::EACCES);
+    }
+    Ok(())
+}
+
+fn read_entire_file(file: &Arc<File>) -> Result<Vec<u8>, errno::Errno> {
+    let size = usize::try_from(file_size(file)?).map_err(|_| errno::Errno::EFBIG)?;
     if size == 0 {
         return Err(errno::Errno::ENOEXEC);
     }

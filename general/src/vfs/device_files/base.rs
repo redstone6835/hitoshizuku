@@ -5,7 +5,7 @@
 //! 注册都放在 VFS 设备文件适配层，底层驱动只保留 typed I/O 能力。
 
 use crate::dev::char::CharDevice;
-use crate::dev::drivers::{RANDOM_DRIVER, URANDOM_DRIVER};
+use crate::dev::random::{RANDOM_PROXY_DRIVER, URANDOM_PROXY_DRIVER};
 use crate::vfs::device_files::spec::{DevNodeSpec, fallible_box_str};
 use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 use vfs::error::VfsResult;
@@ -36,14 +36,14 @@ fn zero_dev_node() -> VfsResult<DevNodeSpec> {
 fn random_dev_node() -> VfsResult<DevNodeSpec> {
     Ok(DevNodeSpec::Char {
         name: fallible_box_str("random")?,
-        dev: CharDevice::new("random", &RANDOM_DRIVER),
+        dev: CharDevice::new("random", &RANDOM_PROXY_DRIVER),
     })
 }
 
 fn urandom_dev_node() -> VfsResult<DevNodeSpec> {
     Ok(DevNodeSpec::Char {
         name: fallible_box_str("urandom")?,
-        dev: CharDevice::new("urandom", &URANDOM_DRIVER),
+        dev: CharDevice::new("urandom", &URANDOM_PROXY_DRIVER),
     })
 }
 

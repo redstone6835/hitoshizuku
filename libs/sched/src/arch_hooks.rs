@@ -26,7 +26,9 @@
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
+#[cfg(feature = "performance-profile")]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// 新内核线程的入口函数签名。`arg` 通过 ABI 规定的第一个参数寄存器传入。
 pub type KernelEntry = unsafe extern "C" fn(arg: usize) -> !;
@@ -57,17 +59,24 @@ pub struct ArchContextOps {
     ///   活跃期间不被回收。
     pub init_kernel_context:
         unsafe fn(ctx: NonNull<u8>, stack_top: usize, entry: KernelEntry, arg: usize),
-    /// 切换内核上下文：把当前寄存器保存进 `prev`，从 `next` 恢复后跳走。
+    /// 切换内核上下文：把当前寄存器保存进 `prev`，释放 prev 的 CPU 所有权，
+    /// 再从 `next` 恢复后跳走。
     ///
     /// 必须 `extern "C"` —— 实现通常是 `#[naked]` 汇编，依赖确定的参数寄存器。
     ///
     /// # Safety
     /// - `prev`、`next` 必须都是之前由 [`init_kernel_context`] 初始化过的
     ///   缓冲，或当前线程用于"保存再回来"的合法缓冲；
+    /// - `prev_on_cpu` 指向 prev 任务的 `AtomicUsize` 所有权槽，保存完上下文后
+    ///   必须以 release 语义写零；
     /// - 调用方必须持有调度锁（避免同一 ctx 同时被两个核保存）；
     /// - 函数返回后，调用方看到的是被切出前的世界；如果 `next` 是从未跑过
     ///   的新线程，控制流将跳到其 entry，**不会返回**。
-    pub switch_context: unsafe extern "C" fn(prev: NonNull<u8>, next: NonNull<u8>),
+    pub switch_context: unsafe extern "C" fn(
+        prev: NonNull<u8>,
+        next: NonNull<u8>,
+        prev_on_cpu: NonNull<AtomicUsize>,
+    ),
 }
 
 // Safety: 仅包含 `usize` 与函数指针，全部 POD。
@@ -130,6 +139,85 @@ pub fn ops_or_panic() -> &'static ArchContextOps {
     ops().expect("[sched] ArchContextOps not registered — arch init missing")
 }
 
+// ── ArchLocalInterruptOps ───────────────────────────────────────────────────
+
+/// 调度边界所需的本地中断状态操作。
+///
+/// `schedule_once_inner` 的调用栈属于当前任务，可能随任务迁移到另一 CPU 后再恢复。
+/// 因此保存值只能包含可在同架构其它 CPU 上恢复的中断使能状态，不能携带 CPU 私有指针。
+#[repr(C)]
+pub struct ArchLocalInterruptOps {
+    /// 保存当前中断使能状态并关闭本地可屏蔽中断。
+    pub save_and_disable: fn() -> usize,
+    /// 在当前 CPU 恢复先前保存的中断使能状态。
+    pub restore: fn(state: usize),
+}
+
+// Safety: 仅包含函数指针，不含需要额外维护的共享状态。
+unsafe impl Sync for ArchLocalInterruptOps {}
+unsafe impl Send for ArchLocalInterruptOps {}
+
+static LOCAL_INTERRUPT_OPS: AtomicPtr<ArchLocalInterruptOps> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// 注入调度边界使用的本地中断状态操作。
+pub fn register_local_interrupt(ops: &'static ArchLocalInterruptOps) {
+    register_once(
+        &LOCAL_INTERRUPT_OPS,
+        ops as *const _ as *mut _,
+        "ArchLocalInterruptOps",
+    );
+}
+
+fn local_interrupt() -> Option<&'static ArchLocalInterruptOps> {
+    let ptr = LOCAL_INTERRUPT_OPS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: register_local_interrupt 只接受静态函数表，注册后指针永久有效。
+        Some(unsafe { &*(ptr as *const ArchLocalInterruptOps) })
+    }
+}
+
+/// 把中断状态与当前任务的调度调用栈绑定，在任务恢复执行时自动还原。
+#[must_use]
+pub(crate) struct LocalInterruptGuard {
+    state: usize,
+    restore: Option<fn(usize)>,
+}
+
+impl LocalInterruptGuard {
+    fn new() -> Self {
+        Self::with_ops(local_interrupt())
+    }
+
+    fn with_ops(ops: Option<&ArchLocalInterruptOps>) -> Self {
+        match ops {
+            Some(ops) => Self {
+                state: (ops.save_and_disable)(),
+                restore: Some(ops.restore),
+            },
+            None => Self {
+                state: 0,
+                restore: None,
+            },
+        }
+    }
+}
+
+impl Drop for LocalInterruptGuard {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore {
+            restore(self.state);
+        }
+    }
+}
+
+/// 关闭本地中断并返回随当前任务调用栈保存的恢复保护器。
+pub(crate) fn disable_local_interrupts() -> LocalInterruptGuard {
+    LocalInterruptGuard::new()
+}
+
 // ── ArchTimeOps ──────────────────────────────────────────────────────────────
 //
 // 时间戳源 + 当前 CPU id。两件事都被调度核心高频访问（tick 推进虚拟时间、
@@ -145,6 +233,9 @@ pub struct ArchTimeOps {
     /// 单调纳秒时间戳。配合 EEVDF 推进虚拟时间。
     pub now_ns: fn() -> u64,
     /// 当前 CPU 的逻辑 id。`0..NR_CPUS`。
+    ///
+    /// AP 启动后必须返回稳定且连续的逻辑 CPU id。
+    /// 回退到 boot CPU 的槽位。
     pub current_cpu_id: fn() -> usize,
 }
 
@@ -171,6 +262,66 @@ pub fn time() -> Option<&'static ArchTimeOps> {
     }
 }
 
+/// 返回当前逻辑 CPU，未完成架构注册时使用 boot CPU。
+///
+/// 时间函数表由静态对象构成且只注册一次；这里直接读取函数表并调用 CPU 钩子，
+/// 避免调度热路径反复构造 `Option`。Relaxed 读取只负责取得单调发布的指针，
+/// 表内字段在程序装载时已经完成初始化。
+#[inline(always)]
+pub fn current_cpu_id_or_boot() -> usize {
+    let ptr = TIME_OPS.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        0
+    } else {
+        unsafe { ((*ptr).current_cpu_id)() }
+    }
+}
+
+// ── ArchDeadlineTimerOps ────────────────────────────────────────────────────
+
+/// 调度器软件截止时间到架构本地定时器的重编程契约。
+///
+/// 调度核心只发布归属于当前 CPU 的定时等待中最早的绝对纳秒截止时间，不假设
+/// 底层定时器是周期模式还是比较器模式。架构实现必须保证下一次本地定时器中断
+/// 不晚于该截止时间，同时仍需保留常规调度 tick 的最大间隔。deadline 在登记
+/// 时绑定到本地 CPU，避免多个 CPU 为同一等待同时触发中断并争用全局队列。
+#[repr(C)]
+pub struct ArchDeadlineTimerOps {
+    /// 重编程当前 CPU 的本地定时器。
+    ///
+    /// `Some(deadline_ns)` 使用与 [`ArchTimeOps::now_ns`] 相同的绝对时间域；
+    /// `None` 表示当前没有软件截止时间，架构应恢复常规调度 tick。调用本函数
+    /// 时调度器不会持有定时等待队列锁。
+    pub reprogram: fn(deadline_ns: Option<u64>),
+}
+
+// Safety: 仅包含函数指针。
+unsafe impl Sync for ArchDeadlineTimerOps {}
+unsafe impl Send for ArchDeadlineTimerOps {}
+
+static DEADLINE_TIMER_OPS: AtomicPtr<ArchDeadlineTimerOps> = AtomicPtr::new(core::ptr::null_mut());
+
+/// 注入架构本地 deadline timer 契约。
+pub fn register_deadline_timer(ops: &'static ArchDeadlineTimerOps) {
+    register_once(
+        &DEADLINE_TIMER_OPS,
+        ops as *const _ as *mut _,
+        "ArchDeadlineTimerOps",
+    );
+}
+
+/// 读取已注入的 deadline timer 契约。
+pub fn deadline_timer() -> Option<&'static ArchDeadlineTimerOps> {
+    let ptr = DEADLINE_TIMER_OPS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: register_deadline_timer 仅接受 'static；Acquire 与注册时的
+        // Release 配对，因此函数表一旦可见便永久有效。
+        Some(unsafe { &*(ptr as *const ArchDeadlineTimerOps) })
+    }
+}
+
 // ── CpuControlOps ────────────────────────────────────────────────────────────
 
 /// 跨 CPU 调度控制契约。AP/真实 IPI 未接入时可以不注册；sched 会只置本地
@@ -178,6 +329,19 @@ pub fn time() -> Option<&'static ArchTimeOps> {
 #[repr(C)]
 pub struct CpuControlOps {
     pub send_resched: fn(cpu_id: usize),
+    /// 向目标 CPU 发送 membarrier rendezvous IPI。返回 false 表示没有成功投递。
+    pub send_membarrier: fn(cpu_id: usize) -> bool,
+    /// 当前 CPU 是否存在必须在自旋等待中协作处理的请求。
+    pub has_urgent_work: fn() -> bool,
+    /// 在当前 CPU 上服务不能推迟到普通中断返回路径的架构请求。
+    ///
+    /// 调度器和依赖调度器的子系统会在自旋锁等待期间调用本钩子。回调可能运行在
+    /// 中断关闭且调用方正等待任意内核锁的上下文中，因此必须满足以下约束：
+    ///
+    /// - 只能执行有界的原子操作、内存屏障和本地 TLB/I-cache 失效；
+    /// - 不得分配、阻塞、获取锁、触发调度或调用日志设施；
+    /// - 没有待处理请求时必须快速返回。
+    pub poll_urgent: fn(),
     pub is_online: fn(cpu_id: usize) -> bool,
 }
 
@@ -185,7 +349,20 @@ unsafe impl Sync for CpuControlOps {}
 unsafe impl Send for CpuControlOps {}
 
 static CPU_CONTROL_OPS: AtomicPtr<CpuControlOps> = AtomicPtr::new(core::ptr::null_mut());
+static URGENT_PENDING: [AtomicBool; crate::cpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::cpu::MAX_CPUS];
+#[cfg(feature = "performance-profile")]
+static URGENT_SPIN_CHECKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+#[cfg(feature = "performance-profile")]
+static URGENT_PENDING_HITS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+#[cfg(feature = "performance-profile")]
+static URGENT_SERVICES: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
 
+/// 支持 SMP 的架构在接通 AP 和 reschedule IPI 后注册该接口。
+/// `send_resched` 只负责通知目标 CPU，实际切换仍在安全的调度边界完成。
 pub fn register_cpu_control(ops: &'static CpuControlOps) {
     register_once(&CPU_CONTROL_OPS, ops as *const _ as *mut _, "CpuControlOps");
 }
@@ -197,6 +374,239 @@ pub fn cpu_control() -> Option<&'static CpuControlOps> {
     } else {
         // Safety: register_cpu_control only stores 'static ops.
         Some(unsafe { &*(ptr as *const CpuControlOps) })
+    }
+}
+
+/// 在发布架构请求序号后标记目标 CPU。该位只用于跳过空检查，序号仍是完成真值。
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.mark_urgent_work",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+#[inline(never)]
+pub fn mark_urgent_work(cpu_id: usize) {
+    if let Some(pending) = URGENT_PENDING.get(cpu_id) {
+        pending.store(true, Ordering::Release);
+    }
+}
+
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.urgent_work_pending",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = 0
+)]
+#[inline(never)]
+pub fn urgent_work_pending() -> bool {
+    let cpu = crate::scheduler::current_cpu_id().min(crate::cpu::MAX_CPUS - 1);
+    URGENT_PENDING[cpu].load(Ordering::Acquire)
+}
+
+/// allocator 竞争路径直接读取这组稳定原子位，避免每次 relax 调用 sched/ELM。
+pub fn urgent_pending_slots() -> &'static [AtomicBool] {
+    &URGENT_PENDING
+}
+
+#[inline]
+fn take_urgent_work(cpu: usize) -> bool {
+    URGENT_PENDING
+        .get(cpu)
+        .is_some_and(|pending| pending.swap(false, Ordering::AcqRel))
+}
+
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.record_urgent_spin_checks",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+#[inline(never)]
+pub fn record_urgent_spin_checks(cpu: usize, checks: usize) {
+    #[cfg(feature = "performance-profile")]
+    if checks != 0
+        && let Some(counter) = URGENT_SPIN_CHECKS.get(cpu)
+    {
+        counter.fetch_add(checks as u64, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = (cpu, checks);
+}
+
+#[cfg(feature = "performance-profile")]
+pub fn urgent_profile_counter(cpu: usize, event: profiling::Event) -> u64 {
+    match event {
+        profiling::Event::UrgentSpinCheck => URGENT_SPIN_CHECKS
+            .get(cpu)
+            .map_or(0, |value| value.load(Ordering::Relaxed)),
+        profiling::Event::UrgentPendingHit => URGENT_PENDING_HITS
+            .get(cpu)
+            .map_or(0, |value| value.load(Ordering::Relaxed)),
+        profiling::Event::UrgentService => URGENT_SERVICES
+            .get(cpu)
+            .map_or(0, |value| value.load(Ordering::Relaxed)),
+        _ => 0,
+    }
+}
+
+#[inline]
+fn dispatch_urgent_work(ops: Option<&CpuControlOps>) -> bool {
+    if let Some(ops) = ops
+        && (ops.has_urgent_work)()
+    {
+        (ops.poll_urgent)();
+        return true;
+    }
+    false
+}
+
+/// 在当前 CPU 上协作处理架构级紧急请求。
+///
+/// 该函数专供不能安全打开中断或让出 CPU 的自旋等待路径使用。未注册
+/// [`CpuControlOps`] 时为无操作。
+#[kernel_symbols::export(
+    name = "sched.arch_hooks.poll_urgent_work",
+    contract = "kernel.sched.control@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::SCHED_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+#[inline(never)]
+pub fn poll_urgent_work() {
+    let cpu = crate::scheduler::current_cpu_id().min(crate::cpu::MAX_CPUS - 1);
+    if !take_urgent_work(cpu) {
+        return;
+    }
+    #[cfg(feature = "performance-profile")]
+    URGENT_PENDING_HITS[cpu].fetch_add(1, Ordering::Relaxed);
+    let ops = cpu_control();
+    let serviced = dispatch_urgent_work(ops);
+    #[cfg(feature = "performance-profile")]
+    if serviced {
+        URGENT_SERVICES[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = serviced;
+    // 请求可能在 swap(false) 后到达；producer 会重新置位。这里额外复核序号，
+    // 覆盖清位和序号发布交错的窗口。
+    if ops.is_some_and(|ops| (ops.has_urgent_work)()) {
+        URGENT_PENDING[cpu].store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod cpu_control_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{CpuControlOps, dispatch_urgent_work, mark_urgent_work, take_urgent_work};
+
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn no_cpu_action(_: usize) {}
+    fn no_membarrier(_: usize) -> bool {
+        false
+    }
+    fn urgent_work() -> bool {
+        true
+    }
+    fn no_urgent_work() -> bool {
+        false
+    }
+    fn poll() {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn offline(_: usize) -> bool {
+        false
+    }
+
+    static TEST_OPS: CpuControlOps = CpuControlOps {
+        send_resched: no_cpu_action,
+        send_membarrier: no_membarrier,
+        has_urgent_work: urgent_work,
+        poll_urgent: poll,
+        is_online: offline,
+    };
+
+    static IDLE_TEST_OPS: CpuControlOps = CpuControlOps {
+        send_resched: no_cpu_action,
+        send_membarrier: no_membarrier,
+        has_urgent_work: no_urgent_work,
+        poll_urgent: poll,
+        is_online: offline,
+    };
+
+    #[test]
+    fn urgent_dispatch_is_optional_and_invokes_registered_hook() {
+        POLLS.store(0, Ordering::Relaxed);
+        assert!(!dispatch_urgent_work(None));
+        assert_eq!(POLLS.load(Ordering::Relaxed), 0);
+        assert!(!dispatch_urgent_work(Some(&IDLE_TEST_OPS)));
+        assert_eq!(POLLS.load(Ordering::Relaxed), 0);
+        assert!(dispatch_urgent_work(Some(&TEST_OPS)));
+        assert_eq!(POLLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn urgent_latch_is_consumed_once() {
+        let cpu = crate::cpu::MAX_CPUS - 1;
+        let _ = take_urgent_work(cpu);
+        mark_urgent_work(cpu);
+        assert!(take_urgent_work(cpu));
+        assert!(!take_urgent_work(cpu));
+    }
+}
+
+#[cfg(test)]
+mod local_interrupt_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{ArchLocalInterruptOps, LocalInterruptGuard};
+
+    const SAVED_STATE: usize = 0x4;
+
+    static SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RESTORED_STATE: AtomicUsize = AtomicUsize::new(0);
+
+    fn save_and_disable() -> usize {
+        SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
+        SAVED_STATE
+    }
+
+    fn restore(state: usize) {
+        RESTORE_CALLS.fetch_add(1, Ordering::Relaxed);
+        RESTORED_STATE.store(state, Ordering::Relaxed);
+    }
+
+    static TEST_OPS: ArchLocalInterruptOps = ArchLocalInterruptOps {
+        save_and_disable,
+        restore,
+    };
+
+    #[test]
+    fn guard_restores_saved_state_and_is_optional() {
+        SAVE_CALLS.store(0, Ordering::Relaxed);
+        RESTORE_CALLS.store(0, Ordering::Relaxed);
+        RESTORED_STATE.store(0, Ordering::Relaxed);
+
+        {
+            let _guard = LocalInterruptGuard::with_ops(Some(&TEST_OPS));
+            assert_eq!(SAVE_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(RESTORE_CALLS.load(Ordering::Relaxed), 0);
+        }
+
+        assert_eq!(RESTORE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(RESTORED_STATE.load(Ordering::Relaxed), SAVED_STATE);
+
+        {
+            let _guard = LocalInterruptGuard::with_ops(None);
+        }
+
+        assert_eq!(SAVE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(RESTORE_CALLS.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -216,6 +626,13 @@ pub struct ArchTrapOps {
     /// `stack_top` 必须落在当前线程（即即将运行的 next）持有的内核栈范围内，
     /// 且按当前架构 ABI 对齐。本函数只写硬件寄存器，不做范围检查。
     pub set_kernel_trap_stack: unsafe fn(stack_top: usize),
+    /// 把架构本地 borrowed-current 与 CPU 返回工作 hint 更新为刚发布的任务。
+    ///
+    /// # Safety
+    /// `task_ptr` 必须来自仍由调度器 current 槽持有强引用的 `Arc<Task>`；
+    /// `cpu_work_ptr` 必须指向生命周期覆盖内核运行期的 `AtomicU32`。本函数只能
+    /// 为正在执行发布操作的本 CPU 更新本地状态。
+    pub set_current_task: unsafe fn(task_ptr: usize, cpu_work_ptr: usize),
 }
 
 // Safety: 仅函数指针。

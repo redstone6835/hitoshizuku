@@ -13,6 +13,10 @@ mod user_pgd;
 
 /// 由 `arch::riscv64::sched_ctx::register` 在启动装契约阶段调用一次。
 pub fn register() {
+    #[cfg(debug_assertions)]
+    crate::riscv64::heap_vm::debug_verify_heap_mapping_transactions();
+    fault_decode::validate_exception_table();
+    user_pgd::init_asid_allocator();
     general::mm::register_user_vm_layout(&layout::USER_VM_LAYOUT_OPS);
     general::mm::register_user_pgd(&user_pgd::USER_PGD_OPS);
     general::mm::register_user_access(&user_copy::USER_ACCESS_OPS);

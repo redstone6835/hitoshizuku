@@ -108,6 +108,15 @@ impl SysconRegistry {
 
 static SYSCONS: Spinlock<SysconRegistry> = Spinlock::new(SysconRegistry::new());
 
+#[kernel_symbols::export(
+    name = "general.dev.syscon.register",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+    retained_args = 1u64
+)]
 pub fn register(dev: Arc<dyn SysconDevice>) -> Result<SysconHandle, SysconError> {
     let phandle = dev.phandle();
     if phandle == 0 {
@@ -136,6 +145,13 @@ pub fn register(dev: Arc<dyn SysconDevice>) -> Result<SysconHandle, SysconError>
     Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.syscon.unregister",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister(handle: SysconHandle) -> Result<(), SysconError> {
     let mut registry = SYSCONS.lock();
     let Some(index) = registry
@@ -157,6 +173,13 @@ fn release_syscon_resource(handle: SysconHandle) -> bool {
 ///
 /// 驱动 probe 成功登记 syscon 后应立即交给 PnP 设备拥有，remove/rollback 时由
 /// core 统一注销，避免驱动私有状态和 registry 生命周期分离。
+#[kernel_symbols::export(
+    name = "general.dev.syscon.pnp_resource",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn pnp_resource(handle: SysconHandle, label: &'static str) -> PnpHandleResource<SysconHandle> {
     PnpHandleResource::new(
         PnpResourceKind::Syscon,
@@ -166,6 +189,13 @@ pub fn pnp_resource(handle: SysconHandle, label: &'static str) -> PnpHandleResou
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.syscon.get",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn get(phandle: u32) -> Option<Arc<dyn SysconDevice>> {
     SYSCONS
         .lock()
@@ -175,6 +205,13 @@ pub fn get(phandle: u32) -> Option<Arc<dyn SysconDevice>> {
         .map(|registered| Arc::clone(&registered.dev))
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.syscon.write",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn write(
     phandle: u32,
     offset: usize,
@@ -185,6 +222,12 @@ pub fn write(
     dev.write(offset, width, value)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.syscon.read",
+    contract = "kernel.general.syscon@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+)]
 pub fn read(phandle: u32, offset: usize, width: SysconAccessWidth) -> Result<u64, SysconError> {
     let dev = get(phandle).ok_or(SysconError::NotFound)?;
     dev.read(offset, width)

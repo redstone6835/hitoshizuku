@@ -1,6 +1,6 @@
 //! 分配请求与分配记录的公共数据模型。
 //!
-//! allocator 内部有多条分配路径：boot、slab、kernel heap、managed、physical。
+//! allocator 内部有多条分配路径：boot、slab、kernel heap、physical。
 //! 如果每条路径都使用自己的一套参数与记录结构，上层接口会很快失去一致性，调试时也
 //! 很难判断一次分配到底走了哪条线路。
 //!
@@ -15,19 +15,15 @@ use core::alloc::Layout;
 use core::fmt;
 
 use crate::buddy::{MAX_TRACKED_ORDER, PAGE_SIZE};
-use crate::gc::TraceDescriptor;
-
 /// 内存请求所属的逻辑域。
 ///
 /// 这个枚举决定 allocator 应该把一次请求路由到哪类后端：
 ///
 /// - `Kernel`：普通内核对象与缓冲区，优先走 slab / kheap；
-/// - `Managed`：受 GC 管理的对象，走 managed allocator；
 /// - `Physical`：调用者直接请求物理页，不附带内核堆映射语义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryDomain {
     Kernel,
-    Managed,
     Physical,
 }
 
@@ -41,7 +37,6 @@ pub enum AllocationKind {
     Boot,
     Small,
     Large,
-    Managed,
     Physical,
 }
 
@@ -53,7 +48,7 @@ pub enum AllocationKind {
 pub enum AllocationArena {
     DirectMap,
     Kernel,
-    Managed,
+    Tracked,
 }
 
 /// 页级映射策略。
@@ -81,7 +76,6 @@ pub enum MemoryPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReclaimPolicy {
     NoReclaim,
-    TryManagedGc,
     TryAllocatorReclaim,
 }
 
@@ -107,47 +101,6 @@ pub enum AllocationRequestError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManagedAllocFlags {
-    pub pinned: bool,
-    pub finalizer_id: Option<u16>,
-    pub trace_descriptor: Option<&'static TraceDescriptor>,
-}
-
-impl ManagedAllocFlags {
-    pub const fn new() -> Self {
-        Self {
-            pinned: false,
-            finalizer_id: None,
-            trace_descriptor: None,
-        }
-    }
-
-    pub const fn pinned(mut self, pinned: bool) -> Self {
-        self.pinned = pinned;
-        self
-    }
-
-    pub const fn with_finalizer(mut self, finalizer_id: u16) -> Self {
-        self.finalizer_id = Some(finalizer_id);
-        self
-    }
-
-    pub const fn with_trace_descriptor(
-        mut self,
-        trace_descriptor: &'static TraceDescriptor,
-    ) -> Self {
-        self.trace_descriptor = Some(trace_descriptor);
-        self
-    }
-}
-
-impl Default for ManagedAllocFlags {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryRequest {
     pub domain: MemoryDomain,
     pub size: usize,
@@ -156,7 +109,7 @@ pub struct MemoryRequest {
     pub placement: MemoryPlacement,
     pub reclaim: ReclaimPolicy,
     pub zeroing: Zeroing,
-    pub managed: ManagedAllocFlags,
+    pub(crate) accounting_owner: Option<u64>,
 }
 
 impl MemoryRequest {
@@ -169,7 +122,7 @@ impl MemoryRequest {
             placement: MemoryPlacement::Any,
             reclaim: ReclaimPolicy::TryAllocatorReclaim,
             zeroing: Zeroing::Uninitialized,
-            managed: ManagedAllocFlags::new(),
+            accounting_owner: None,
         }
     }
 
@@ -177,15 +130,6 @@ impl MemoryRequest {
         let aligned = layout.pad_to_align();
         Self::new(
             MemoryDomain::Kernel,
-            aligned.size().max(1),
-            aligned.align().max(1),
-        )
-    }
-
-    pub fn for_managed_layout(layout: Layout) -> Self {
-        let aligned = layout.pad_to_align();
-        Self::new(
-            MemoryDomain::Managed,
             aligned.size().max(1),
             aligned.align().max(1),
         )
@@ -211,9 +155,21 @@ impl MemoryRequest {
         self
     }
 
-    pub const fn with_managed_flags(mut self, managed: ManagedAllocFlags) -> Self {
-        self.managed = managed;
+    /// 显式指定分配账本所有者。
+    ///
+    /// 所有者编号的含义由注册的计量后端解释；`0` 表示内核自身，不计入外部单元预算。
+    pub const fn with_accounting_owner(mut self, owner: u64) -> Self {
+        self.accounting_owner = Some(owner);
         self
+    }
+
+    /// 强制把本次分配归入内核自身，避免继承当前扩展执行上下文。
+    pub const fn without_external_accounting(self) -> Self {
+        self.with_accounting_owner(0)
+    }
+
+    pub(crate) const fn accounting_owner(self) -> Option<u64> {
+        self.accounting_owner
     }
 
     /// 校验通用内存请求的基础 layout 约束。
@@ -244,6 +200,7 @@ pub struct PhysicalAllocRequest {
     pub align: usize,
     pub page_policy: PagePolicy,
     pub placement: MemoryPlacement,
+    pub(crate) accounting_owner: Option<u64>,
 }
 
 impl PhysicalAllocRequest {
@@ -253,6 +210,7 @@ impl PhysicalAllocRequest {
             align,
             page_policy: PagePolicy::BaseOnly,
             placement: MemoryPlacement::Any,
+            accounting_owner: None,
         }
     }
 
@@ -264,6 +222,21 @@ impl PhysicalAllocRequest {
     pub const fn with_placement(mut self, placement: MemoryPlacement) -> Self {
         self.placement = placement;
         self
+    }
+
+    /// 显式指定物理页分配的账本所有者。
+    pub const fn with_accounting_owner(mut self, owner: u64) -> Self {
+        self.accounting_owner = Some(owner);
+        self
+    }
+
+    /// 强制把本次物理页分配归入内核自身。
+    pub const fn without_external_accounting(self) -> Self {
+        self.with_accounting_owner(0)
+    }
+
+    pub(crate) const fn accounting_owner(self) -> Option<u64> {
+        self.accounting_owner
     }
 
     /// 校验物理页请求，并返回原请求方便链式使用。
@@ -332,12 +305,13 @@ pub struct AllocationRecord {
     pub align: usize,
     pub order: usize,
     pub page_size: usize,
+    accounting_owner: u64,
     /// 后端私有定位 cookie。
     ///
     /// 这个字段不属于外部所有权语义，只给 allocator 内部热路径使用。例如 slab 会在
-    /// registry record 里保存所属 `SlabNode` 地址，释放时即可直接回到对应 slab，而不必
-    /// 再按 size class 扫描整条 slab 链。外部扩展应通过公开字段理解对象属性，不能依赖
-    /// 该值的格式或稳定性。
+    /// registry record 里保存所属 slab 生命周期的不可伪造 cookie，释放时可与页目录的
+    /// 当前 owner 交叉校验，而不必扫描 size class 链。外部扩展应通过公开字段理解对象
+    /// 属性，不能依赖该值的格式或稳定性。
     pub(crate) backend_cookie: usize,
 }
 
@@ -354,6 +328,7 @@ impl AllocationRecord {
             align: 1,
             order: 0,
             page_size: PAGE_SIZE,
+            accounting_owner: 0,
             backend_cookie: 0,
         }
     }
@@ -377,6 +352,16 @@ impl AllocationRecord {
         self
     }
 
+    pub(crate) const fn with_accounting_owner(mut self, owner: u64) -> Self {
+        self.accounting_owner = owner;
+        self
+    }
+
+    /// 返回该对象在外部资源账本中的所有者编号；`0` 表示内核自身。
+    pub const fn accounting_owner(self) -> u64 {
+        self.accounting_owner
+    }
+
     pub(crate) const fn with_backend_cookie(mut self, backend_cookie: usize) -> Self {
         self.backend_cookie = backend_cookie;
         self
@@ -398,6 +383,7 @@ impl fmt::Debug for AllocationRecord {
             .field("align", &self.align)
             .field("order", &self.order)
             .field("page_size", &self.page_size)
+            .field("accounting_owner", &self.accounting_owner)
             .finish()
     }
 }

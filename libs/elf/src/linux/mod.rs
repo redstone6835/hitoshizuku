@@ -8,9 +8,9 @@
 //! 本子模块**不**处理装载、动态链接、`PT_INTERP` 跟进——那是 loader 的事；
 //! 这里只解析、切片、报告。
 
-mod header;
+mod metadata;
 mod parse;
-mod program_header;
 mod raw;
 
+pub use metadata::{ElfFileType, ElfLoadSegment, LinuxElfMetadata, read_linux_elf};
 pub use parse::LinuxElfImage;

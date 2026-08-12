@@ -11,9 +11,15 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
-use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
+use sched::arch_hooks::{
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchLocalInterruptOps, ArchTimeOps,
+    ArchTrapOps, KernelEntry,
+};
 
-use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns};
+use crate::riscv64::specific::{
+    CONTEXT_SWITCH_TOKEN_STRIDE, HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id,
+    kernel_timestamp_ns,
+};
 use crate::riscv64::task::Riscv64TaskOps;
 use crate::riscv64::trap::Riscv64InterruptOps;
 
@@ -25,20 +31,20 @@ pub(crate) const KCTX_ALIGN: usize = 16;
 //   +0x20 s2    +0x28 s3    +0x30 s4    +0x38 s5
 //   +0x40 s6    +0x48 s7    +0x50 s8    +0x58 s9
 //   +0x60 s10   +0x68 s11
-const RA_OFF: usize = 0x00;
-const SP_OFF: usize = 0x08;
-const S0_OFF: usize = 0x10;
-const S1_OFF: usize = 0x18;
-const S2_OFF: usize = 0x20;
-const S3_OFF: usize = 0x28;
-const S4_OFF: usize = 0x30;
-const S5_OFF: usize = 0x38;
-const S6_OFF: usize = 0x40;
-const S7_OFF: usize = 0x48;
-const S8_OFF: usize = 0x50;
-const S9_OFF: usize = 0x58;
-const S10_OFF: usize = 0x60;
-const S11_OFF: usize = 0x68;
+const RA_OFFSET: usize = 0x00;
+const SP_OFFSET: usize = 0x08;
+const S0_OFFSET: usize = 0x10;
+const S1_OFFSET: usize = 0x18;
+const S2_OFFSET: usize = 0x20;
+const S3_OFFSET: usize = 0x28;
+const S4_OFFSET: usize = 0x30;
+const S5_OFFSET: usize = 0x38;
+const S6_OFFSET: usize = 0x40;
+const S7_OFFSET: usize = 0x48;
+const S8_OFFSET: usize = 0x50;
+const S9_OFFSET: usize = 0x58;
+const S10_OFFSET: usize = 0x60;
+const S11_OFFSET: usize = 0x68;
 
 /// # Safety
 ///
@@ -50,16 +56,26 @@ unsafe fn init_kernel_context(ctx: NonNull<u8>, stack_top: usize, entry: KernelE
     unsafe {
         core::ptr::write_bytes(base, 0, KCTX_SIZE);
         let w = |off: usize, v: usize| (base.add(off) as *mut usize).write(v);
-        w(RA_OFF, __kthread_trampoline as usize);
-        w(SP_OFF, stack_top & !0xF); // 保证 16 字节对齐
-        w(S0_OFF, entry as usize);
-        w(S1_OFF, arg);
+        w(RA_OFFSET, __kthread_trampoline as usize);
+        w(SP_OFFSET, stack_top & !0xF); // 保证 16 字节对齐
+        w(S0_OFFSET, entry as usize);
+        w(S1_OFFSET, arg);
     }
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
+unsafe extern "C" fn switch_context(
+    _prev: NonNull<u8>,
+    _next: NonNull<u8>,
+    _prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
+) {
     core::arch::naked_asm!(
+        // fast syscall 可在内部阻塞并迁移，随后从同一内核调用点继续。token 低位
+        // 编码 hart id，按固定步长递增，因此跨 hart 或本 hart 切换都必然变化。
+        "ld t0, {switch_seq}(tp)",
+        "addi t0, t0, {switch_stride}",
+        "sd t0, {switch_seq}(tp)",
+
         "sd ra,  {ra}(a0)",
         "sd sp,  {sp}(a0)",
         "sd s0,  {s0}(a0)",
@@ -74,6 +90,10 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         "sd s9,  {s9}(a0)",
         "sd s10, {s10}(a0)",
         "sd s11, {s11}(a0)",
+
+        // 只有保存完整上下文后，远端 CPU 才能认领并恢复 prev。
+        "fence rw, w",
+        "sd zero, 0(a2)",
 
         "ld ra,  {ra}(a1)",
         "ld sp,  {sp}(a1)",
@@ -91,13 +111,15 @@ unsafe extern "C" fn switch_context(_prev: NonNull<u8>, _next: NonNull<u8>) {
         "ld s11, {s11}(a1)",
 
         "ret",
-        ra = const RA_OFF, sp = const SP_OFF,
-        s0 = const S0_OFF, s1 = const S1_OFF,
-        s2 = const S2_OFF, s3 = const S3_OFF,
-        s4 = const S4_OFF, s5 = const S5_OFF,
-        s6 = const S6_OFF, s7 = const S7_OFF,
-        s8 = const S8_OFF, s9 = const S9_OFF,
-        s10 = const S10_OFF, s11 = const S11_OFF,
+        ra = const RA_OFFSET, sp = const SP_OFFSET,
+        s0 = const S0_OFFSET, s1 = const S1_OFFSET,
+        s2 = const S2_OFFSET, s3 = const S3_OFFSET,
+        s4 = const S4_OFFSET, s5 = const S5_OFFSET,
+        s6 = const S6_OFFSET, s7 = const S7_OFFSET,
+        s8 = const S8_OFFSET, s9 = const S9_OFFSET,
+        s10 = const S10_OFFSET, s11 = const S11_OFFSET,
+        switch_seq = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,
+        switch_stride = const CONTEXT_SWITCH_TOKEN_STRIDE,
     );
 }
 
@@ -114,9 +136,29 @@ static ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     switch_context,
 };
 
+fn save_and_disable_local_interrupts() -> usize {
+    // Safety: 只原子读取并清除当前 hart 的 SSTATUS.SIE；返回值随任务调用栈保存，
+    // 可在任务迁移后由另一 hart 按同一 ISA 语义恢复。
+    unsafe { Riscv64InterruptOps::save_and_disable() }
+}
+
+fn restore_local_interrupts(state: usize) {
+    // Safety: state 来自配对的 save_and_disable，仅按保存值恢复 SSTATUS.SIE。
+    unsafe { Riscv64InterruptOps::restore_interrupt_state(state) };
+}
+
+static ARCH_LOCAL_INTERRUPT_OPS: ArchLocalInterruptOps = ArchLocalInterruptOps {
+    save_and_disable: save_and_disable_local_interrupts,
+    restore: restore_local_interrupts,
+};
+
 static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
     now_ns: kernel_timestamp_ns,
     current_cpu_id,
+};
+
+static ARCH_DEADLINE_TIMER_OPS: ArchDeadlineTimerOps = ArchDeadlineTimerOps {
+    reprogram: super::time::rearm_local_timer,
 };
 
 /// # Safety
@@ -126,8 +168,16 @@ unsafe fn set_kernel_trap_stack_raw(stack_top: usize) {
     <Riscv64TaskOps as TaskOps>::set_kernel_trap_stack(stack_top);
 }
 
+/// # Safety
+/// `task_ptr` 必须由调度器已发布且仍持有强引用的 current task 提供；
+/// `cpu_work_ptr` 必须指向稳定的 CpuSchedState 返回工作 hint。
+unsafe fn set_current_task_raw(task_ptr: usize, cpu_work_ptr: usize) {
+    unsafe { crate::riscv64::specific::set_current_task_ptr(task_ptr, cpu_work_ptr) };
+}
+
 static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
+    set_current_task: set_current_task_raw,
 };
 
 static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
@@ -156,9 +206,12 @@ pub fn register() {
         .is_ok()
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
+        sched::arch_hooks::register_local_interrupt(&ARCH_LOCAL_INTERRUPT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
+        sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
         sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
+        sched::arch_hooks::register_cpu_control(&super::smp::CPU_CONTROL_OPS);
         crate::riscv64::mm::register();
         crate::riscv64::syscall::register();
     }

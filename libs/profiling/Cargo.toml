@@ -1,0 +1,12 @@
+[package]
+name = "profiling"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = true
+doctest = false
+bench = false
+
+[features]
+syscall-model-markers = []

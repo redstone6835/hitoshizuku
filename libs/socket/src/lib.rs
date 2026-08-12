@@ -23,6 +23,7 @@ pub use types::{
     SharedHandle, SocketError, SocketHandle, SocketLinger, SocketShutdown, SocketTimeval,
     SocketType, UnixAddress,
 };
+pub use wait::SocketReadinessObserver;
 
 #[cfg(test)]
 mod tests;

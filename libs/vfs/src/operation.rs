@@ -50,16 +50,56 @@ fn check_parent_perm(
     Ok(())
 }
 
-/// 应用 umask 并根据 CAP_FSETID 清除 SUID/SGID 位。
+/// 根据父目录和调用者凭据计算新 inode 的最终模式与所有者凭据。
 ///
-/// POSIX：不持有 CAP_FSETID 的进程不得创建 setuid/setgid 文件，
-/// VFS 层在传入驱动之前统一清除特殊位，防止权限提升。
-fn apply_create_mode(ctx: &VfsContext, mode: FileMode) -> FileMode {
-    let mut m = ctx.apply_umask(mode);
-    if !ctx.cred().has_cap(cred::Capability::FSetId) {
-        m = m.without(FileMode::SUID_SGID);
+/// setgid 目录中的新对象继承目录 GID，子目录还继承 setgid 位。普通文件请求
+/// setgid 时，调用者必须属于最终文件组或持有 `CAP_FSETID`；setuid 位不会在创建时
+/// 无条件清除，因为文件所有者仍是调用者自身。
+pub(crate) fn derive_create_attributes(
+    mode_after_umask: FileMode,
+    caller: &cred::Credentials,
+    parent_meta: &inode::InodeMeta,
+    kind: stat::FileType,
+) -> (FileMode, cred::Credentials) {
+    let mut mode = mode_after_umask;
+    let mut owner = caller.clone();
+    let parent_setgid = parent_meta.mode.has(FileMode::ISGID);
+
+    if parent_setgid {
+        owner.fsgid = parent_meta.gid;
+        if kind == stat::FileType::Directory {
+            mode = mode.with(FileMode::ISGID);
+        }
     }
-    m
+
+    let inherited_directory_setgid = parent_setgid && kind == stat::FileType::Directory;
+    let caller_in_final_group = caller.fsgid == owner.fsgid
+        || caller.egid == owner.fsgid
+        || caller.groups.contains(&owner.fsgid);
+    if mode.has(FileMode::ISGID)
+        && !inherited_directory_setgid
+        && !caller_in_final_group
+        && !caller.has_cap(cred::Capability::FSetId)
+    {
+        mode = mode.without(FileMode::ISGID);
+    }
+
+    (mode, owner)
+}
+
+fn create_attributes(
+    ctx: &VfsContext,
+    parent_inode: &Arc<Inode>,
+    requested_mode: FileMode,
+    kind: stat::FileType,
+) -> (FileMode, cred::Credentials) {
+    let caller = ctx.cred();
+    derive_create_attributes(
+        ctx.apply_umask(requested_mode),
+        &caller,
+        &parent_inode.meta_snapshot(),
+        kind,
+    )
 }
 
 fn unregister_socket_inode(inode: &Inode) {
@@ -96,6 +136,14 @@ fn retire_inode(inode: Arc<Inode>) {
 /// `openat(2)` — 打开或创建文件，返回 fd。
 ///
 /// 将路径解析、权限检查、`InodeOps::open`、挂载引用计数、fd 分配串成完整流程。
+#[kernel_symbols::export(
+    name = "vfs.operation.openat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn openat(
     ctx: &VfsContext,
     fdt: &FdTable,
@@ -111,6 +159,14 @@ pub fn openat(
 ///
 /// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
 /// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+#[kernel_symbols::export(
+    name = "vfs.operation.openat_with_lookup_flags",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn openat_with_lookup_flags(
     ctx: &VfsContext,
     fdt: &FdTable,
@@ -120,6 +176,8 @@ pub fn openat_with_lookup_flags(
     mode: FileMode,
     extra_lookup_flags: LookupFlags,
 ) -> VfsResult<Fd> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::VfsOpen).bytes(path.len());
     let lookup_flags = {
         let mut f = extra_lookup_flags;
         if flags.nofollow {
@@ -159,8 +217,8 @@ pub fn openat_with_lookup_flags(
             check_parent_perm(ctx, &parent_inode, None)?;
 
             // 驱动的 create 负责原子地检查 O_EXCL（若文件已并发创建，返回 AlreadyExists）
-            let effective_mode = apply_create_mode(ctx, mode);
-            let cred = ctx.cred();
+            let (effective_mode, cred) =
+                create_attributes(ctx, &parent_inode, mode, stat::FileType::Regular);
             let new_inode = parent_inode
                 .ops
                 .create(&parent_inode, name, effective_mode, &cred)?;
@@ -206,22 +264,48 @@ pub fn openat_with_lookup_flags(
         }
     }
 
+    // 普通文件的写打开必须先与执行映像租约完成原子排斥，再执行 O_TRUNC 或驱动
+    // open。这样并发 execve 不会落入“已经截断但最终返回 ETXTBSY”的半完成状态。
+    let write_access = if flags.writable() && inode.kind == stat::FileType::Regular {
+        Some(inode.acquire_write_access()?)
+    } else {
+        None
+    };
+
+    // guard 覆盖驱动 open 内可能重复执行的 O_TRUNC；即使失败也发布新代际，
+    // 防止已产生部分副作用的文件页进入私有缓存。
+    let truncates_data =
+        flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular;
+    let _data_mutation = truncates_data.then(|| inode.begin_data_mutation());
+
     // ── O_TRUNC ──
-    if flags.truncate && flags.writable() && inode.kind == stat::FileType::Regular {
+    if truncates_data {
         inode.ops.truncate(&inode, 0)?;
     }
 
     // ── 调用驱动 open，VFS 层组装 File（含 Mount，Drop 时自动 dec_open）──
     let cred = ctx.cred();
     let ops = inode.ops.open(&inode, &flags, &cred)?;
-    let file = File::new(
-        Arc::clone(&inode),
-        flags,
-        Arc::clone(&cred),
-        ops,
-        Arc::clone(&dentry),
-        Arc::clone(&mount), // File::drop 时自动 dec_open
-    );
+    let file = if let Some(write_access) = write_access {
+        File::new_with_write_access(
+            Arc::clone(&inode),
+            flags,
+            Arc::clone(&cred),
+            ops,
+            Arc::clone(&dentry),
+            Arc::clone(&mount),
+            write_access,
+        )
+    } else {
+        File::new(
+            Arc::clone(&inode),
+            flags,
+            Arc::clone(&cred),
+            ops,
+            Arc::clone(&dentry),
+            Arc::clone(&mount),
+        )
+    };
 
     // ── 挂载引用计数：inc_open 在 File 构造之后，alloc_fd 之前 ──
     mount.inc_open();
@@ -241,13 +325,42 @@ pub fn openat_with_lookup_flags(
 ///
 /// `Arc<File>` 引用计数归零时 `File::drop` 自动调用 `FileOps::release` 并 `dec_open`，
 /// 无需在此处手动处理。
+#[kernel_symbols::export(
+    name = "vfs.operation.close",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn close(fdt: &FdTable, fd: Fd) -> VfsResult<()> {
     fdt.close_fd(fd)
+}
+
+/// 关闭 fd，并释放指定进程在对应 inode 上持有的 POSIX record lock。
+///
+/// 用户态 `close(2)` 通过该统一入口进入 VFS，使普通关闭和带 owner 的关闭都能参与
+/// 内核符号导出、Mixin 观测与权限审计，同时保留 [`FdTable::close_fd_for_owner`] 的语义。
+#[kernel_symbols::export(
+    name = "vfs.operation.close_for_owner",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn close_for_owner(fdt: &FdTable, fd: Fd, owner_pid: i32) -> VfsResult<()> {
+    fdt.close_fd_for_owner(fd, owner_pid)
 }
 
 // ── mkdir ─────────────────────────────────────────────────────────────────────
 
 /// `mkdirat(2)` — 创建目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.mkdirat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> VfsResult<()> {
     if !path.is_empty() && path.as_bytes().iter().all(|&b| b == b'/') {
         return Err(VfsError::AlreadyExists);
@@ -264,8 +377,8 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let effective_mode = apply_create_mode(ctx, mode);
-    let cred = ctx.cred();
+    let (effective_mode, cred) =
+        create_attributes(ctx, &parent_inode, mode, stat::FileType::Directory);
     let new_inode = parent_inode
         .ops
         .mkdir(&parent_inode, name, effective_mode, &cred)?;
@@ -277,6 +390,13 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 // ── rmdir ─────────────────────────────────────────────────────────────────────
 
 /// `unlinkat(AT_REMOVEDIR)` — 删除空目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.rmdir",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
@@ -303,7 +423,9 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.rmdir(&parent_inode, name, &child_inode)?;
-    DCACHE.invalidate_subtree(&target.dentry);
+    // 常见空目录只逐出根键；若失败 lookup 留下负向子项，则一并清掉这些不可达引用，
+    // 否则它们会长期保活 nlink=0 的 inode，导致磁盘位图和目录计数无法回收。
+    DCACHE.invalidate_removed_directory(&target.dentry);
     retire_inode(child_inode);
     Ok(())
 }
@@ -311,6 +433,13 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 // ── unlink ────────────────────────────────────────────────────────────────────
 
 /// `unlinkat(2)` — 删除文件（减少 nlink）。
+#[kernel_symbols::export(
+    name = "vfs.operation.unlink",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
@@ -345,6 +474,13 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 // ── rename ────────────────────────────────────────────────────────────────────
 
 /// `renameat2(2)` — 重命名/移动文件或目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.renameat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_IO,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn renameat(
     ctx: &VfsContext,
     old_dirfd: &Dirfd,
@@ -450,6 +586,12 @@ pub fn renameat(
 // ── stat ──────────────────────────────────────────────────────────────────────
 
 /// `fstatat(2)` — 通过路径获取文件元数据。
+#[kernel_symbols::export(
+    name = "vfs.operation.fstatat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY
+)]
 pub fn fstatat(
     ctx: &VfsContext,
     dirfd: &Dirfd,
@@ -467,6 +609,12 @@ pub fn fstatat(
 }
 
 /// `fstat(2)` — 通过已打开的 fd 获取文件元数据。
+#[kernel_symbols::export(
+    name = "vfs.operation.fstat",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY
+)]
 pub fn fstat(fdt: &FdTable, fd: Fd) -> VfsResult<stat::FileStat> {
     let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
     file.stat()
@@ -475,6 +623,13 @@ pub fn fstat(fdt: &FdTable, fd: Fd) -> VfsResult<stat::FileStat> {
 // ── chdir ─────────────────────────────────────────────────────────────────────
 
 /// `chdir(2)` / `fchdir(2)` — 修改当前工作目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.chdir",
+    contract = "kernel.vfs.operation@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn chdir(ctx: &mut VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
@@ -633,6 +788,14 @@ fn chown_inode(
 /// 挂载文件系统：查找驱动 → 创建 Superblock → 挂载到挂载点。
 ///
 /// `dev` 为块设备路径（如 `"/dev/sda1"`），内存文件系统（tmpfs 等）传 `None`。
+#[kernel_symbols::export(
+    name = "vfs.operation.mount",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn mount(
     ctx: &VfsContext,
     dirfd: &Dirfd,
@@ -713,6 +876,13 @@ pub fn mount(
 }
 
 /// 卸载文件系统。
+#[kernel_symbols::export(
+    name = "vfs.operation.umount",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsResult<()> {
     if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
@@ -728,15 +898,22 @@ pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsRe
 }
 
 /// `chroot(2)` — 修改当前进程可见根目录。
+#[kernel_symbols::export(
+    name = "vfs.operation.chroot",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
-    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
-        return Err(VfsError::OperationNotPermitted);
-    }
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
     let meta = inode.meta_snapshot();
     if !ctx.cred().can_exec(meta.uid, meta.gid, meta.mode, true) {
         return Err(VfsError::PermissionDenied);
+    }
+    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
+        return Err(VfsError::OperationNotPermitted);
     }
     ctx.set_root(result.dentry, result.mount)
 }
@@ -745,6 +922,13 @@ pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 ///
 /// 当前 VFS 的进程根不是对命名空间根的裸引用，因此 pivot 成功后必须同步更新
 /// 调用进程的 root/cwd，后续绝对路径解析才会从新根开始。
+#[kernel_symbols::export(
+    name = "vfs.operation.pivot_root",
+    contract = "kernel.vfs.mount@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn pivot_root(ctx: &VfsContext, new_root_path: &str, put_old_path: &str) -> VfsResult<()> {
     if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
@@ -786,7 +970,12 @@ pub fn symlinkat(ctx: &VfsContext, target: &str, dirfd: &Dirfd, link_path: &str)
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let cred = ctx.cred();
+    let (_, cred) = create_attributes(
+        ctx,
+        &parent_inode,
+        FileMode::new(0o777),
+        stat::FileType::Symlink,
+    );
     let new_inode = parent_inode
         .ops
         .symlink(&parent_inode, name, target, &cred)?;
@@ -821,7 +1010,14 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
             return Err(VfsError::PermissionDenied);
         }
     }
-    inode.ops.truncate(&inode, size)
+    let _write_access = if inode.kind == stat::FileType::Regular {
+        Some(inode.acquire_write_access()?)
+    } else {
+        None
+    };
+    let _data_mutation = inode.begin_data_mutation();
+    inode.ops.truncate(&inode, size)?;
+    Ok(())
 }
 
 // ── utimes ────────────────────────────────────────────────────────────────────
@@ -1003,8 +1199,7 @@ pub fn mknodat(
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
-    let effective_mode = apply_create_mode(ctx, mode);
-    let cred = ctx.cred();
+    let (effective_mode, cred) = create_attributes(ctx, &parent_inode, mode, kind);
     let new_inode =
         parent_inode
             .ops

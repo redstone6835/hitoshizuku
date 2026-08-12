@@ -1,8 +1,8 @@
 //! 位图分配/释放(块 + inode) + 超级块/块组计数回写。
 //!
 //! 所有分配都先同步修改 bitmap,再把计数元数据标脏。没有日志兜底,
-//! 中间崩溃会让 FS 损坏。mount 会因此拒绝 `NEEDS_RECOVERY`,要求 clean umount
-//! 或 fsck。
+//! 中间崩溃会让 FS 损坏。mount 时由 [`crate::journal`] 回放日志,
+//! 并由 s_state(VALID_FS) 标记向 fsck 暴露不干净卸载。
 
 use alloc::vec;
 use core::sync::atomic::Ordering;
@@ -10,15 +10,17 @@ use core::sync::atomic::Ordering;
 use crate::bgd;
 use crate::crc;
 use crate::layout::{
-    COMPAT_ORPHAN_FILE, RO_COMPAT_ORPHAN_PRESENT, SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET,
+    EXT4_BG_BLOCK_UNINIT, EXT4_BG_INODE_UNINIT, EXT4_BG_INODE_ZEROED, SUPERBLOCK_CHECKSUM_OFFSET,
+    SUPERBLOCK_OFFSET, sb_off,
 };
 use crate::state::{BlockBackendError, FsState};
+use vfs::stat::Timespec;
 use vfs::sync::{Spinlock, SpinlockGuard};
 
 /// 互斥锁:整个 FS 串行化分配/释放路径。粒度粗但简单,不留 torn-state。
 static ALLOC_LOCK: Spinlock<()> = Spinlock::new(());
 
-fn lock_alloc() -> SpinlockGuard<'static, ()> {
+pub(crate) fn lock_alloc() -> SpinlockGuard<'static, ()> {
     loop {
         if let Some(guard) = ALLOC_LOCK.try_lock() {
             return guard;
@@ -27,6 +29,10 @@ fn lock_alloc() -> SpinlockGuard<'static, ()> {
         // 下持锁任务拿不到 CPU。这里必须用真实时间戳推进 fair 调度；
         // `schedule_once(0)` 不记账，在 iozone 多进程写入时会放大成饥饿。
         if sched::is_ready() {
+            // LoongArch syscall 内核栈可能暂时保持中断关闭；仅让出 CPU 在本任务
+            // 被再次选中时不会消费 IPI。先显式处理紧急 shootdown，避免持锁方
+            // 等待本 CPU 确认而形成锁环。
+            sched::poll_urgent_work();
             sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
@@ -156,6 +162,16 @@ pub(crate) fn alloc_blocks_run(
         } else {
             sb.blocks_per_group
         };
+        if gd.flags & EXT4_BG_BLOCK_UNINIT != 0 {
+            // 惰性块位图不能当作普通磁盘内容读取。当前仅物化描述符声明“全部有效块
+            // 都空闲”的块组；含本地备份或元数据的块组先跳过，避免覆盖元数据。
+            if state.group_counts(group)?.free_blocks != bits_in_group {
+                continue;
+            }
+            initialize_empty_bitmap(&mut bitmap_scratch, bits_in_group);
+            state.write_block(bmap, &bitmap_scratch)?;
+            state.clear_group_flags(group, EXT4_BG_BLOCK_UNINIT)?;
+        }
         let start_bit = if group == start_group {
             (start_rel % sb.blocks_per_group as u64) as u32
         } else {
@@ -341,6 +357,14 @@ mod tests {
 
         assert_eq!(choose_zero_run(&bits, 16, 32, 6), Some((2, 6)));
     }
+
+    #[test]
+    fn initialized_bitmap_marks_only_tail_bits_used() {
+        let mut bits = [0xa5; 3];
+        initialize_empty_bitmap(&mut bits, 13);
+
+        assert_eq!(bits, [0, 0b1110_0000, 0xff]);
+    }
 }
 
 /// 释放一个数据块。宽松:允许重复释放(do nothing if bitmap bit 已 0)。
@@ -351,7 +375,7 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     if block < sb.first_data_block as u64 {
         return Err(BlockBackendError::OutOfRange);
     }
-    state.discard_cached_blocks(block, 1);
+    state.discard_cached_blocks(block, 1)?;
     let rel = block - sb.first_data_block as u64;
     let group = (rel / sb.blocks_per_group as u64) as u32;
     let in_group = (rel % sb.blocks_per_group as u64) as u32;
@@ -389,7 +413,7 @@ pub(crate) fn free_blocks_run(
     }
 
     let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
-    state.discard_cached_blocks(start_block, count);
+    state.discard_cached_blocks(start_block, count)?;
     let first_rel = start_block - sb.first_data_block as u64;
     let mut rel = first_rel;
     let mut remaining = count;
@@ -460,7 +484,7 @@ pub(crate) fn free_blocks_sparse(state: &FsState, blocks: &[u64]) -> Result<(), 
     let mut sorted = blocks.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    discard_sorted_cached_blocks(state, &sorted);
+    discard_sorted_cached_blocks(state, &sorted)?;
 
     let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
     let mut idx = 0usize;
@@ -532,7 +556,7 @@ pub(crate) fn free_blocks_sparse(state: &FsState, blocks: &[u64]) -> Result<(), 
     Ok(())
 }
 
-fn discard_sorted_cached_blocks(state: &FsState, blocks: &[u64]) {
+fn discard_sorted_cached_blocks(state: &FsState, blocks: &[u64]) -> Result<(), BlockBackendError> {
     let mut idx = 0usize;
     while idx < blocks.len() {
         let start = blocks[idx];
@@ -542,8 +566,117 @@ fn discard_sorted_cached_blocks(state: &FsState, blocks: &[u64]) {
             end += 1;
             idx += 1;
         }
-        state.discard_cached_blocks(start, (end - start) as u32);
+        state.discard_cached_blocks(start, (end - start) as u32)?;
     }
+    Ok(())
+}
+
+/// 把一段物理块在位图中标记为已使用(0→1 跳变才扣减计数)。
+///
+/// 日志/fast-commit 回放时,崩溃前已分配但位图更新未落盘的块需要按
+/// 最终映射重新置位(与 Linux `ext4_mb_mark_bb(..., true)` 对应)。
+pub(crate) fn mark_blocks_used(
+    state: &FsState,
+    start_block: u64,
+    count: u32,
+) -> Result<(), BlockBackendError> {
+    if count == 0 {
+        return Ok(());
+    }
+    let _g = lock_alloc();
+    let sb = &state.ext_sb;
+    if start_block < sb.first_data_block as u64 {
+        return Err(BlockBackendError::OutOfRange);
+    }
+
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
+    let mut rel = start_block - sb.first_data_block as u64;
+    let mut remaining = count;
+    let mut total_set = 0u64;
+
+    while remaining > 0 {
+        let group = (rel / sb.blocks_per_group as u64) as u32;
+        if group >= sb.groups_count {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        let in_group = (rel % sb.blocks_per_group as u64) as u32;
+        let bits_in_group = if group == sb.groups_count - 1 {
+            let used_before = group as u64 * sb.blocks_per_group as u64;
+            let remain = sb.blocks_count.saturating_sub(used_before);
+            remain.min(sb.blocks_per_group as u64) as u32
+        } else {
+            sb.blocks_per_group
+        };
+        if in_group >= bits_in_group {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        let run = remaining.min(bits_in_group - in_group);
+        let gd = state.group_desc_mut(group)?;
+        state.read_block(gd.block_bitmap, &mut bitmap_scratch)?;
+
+        let mut set = 0u32;
+        for bit in in_group..in_group + run {
+            let byte_idx = (bit / 8) as usize;
+            let mask = 1u8 << ((bit % 8) as u8);
+            if bitmap_scratch[byte_idx] & mask == 0 {
+                bitmap_scratch[byte_idx] |= mask;
+                set += 1;
+            }
+        }
+        if set != 0 {
+            state.write_block(gd.block_bitmap, &bitmap_scratch)?;
+            state.adjust_group_free_blocks(group, -(set as i32))?;
+            total_set += set as u64;
+        }
+        rel += run as u64;
+        remaining -= run;
+    }
+
+    if total_set != 0 {
+        if total_set > i64::MAX as u64 {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        state.adjust_sb_free_blocks(-(total_set as i64))?;
+    }
+    Ok(())
+}
+
+/// 在 inode 位图中把 `ino` 标记为已使用(对齐 Linux `ext4_mark_inode_used`)。
+///
+/// 返回 `Ok(true)` 表示本次发生了 0→1 跳变。`is_dir` 用于 `s_used_dirs` 计数。
+pub(crate) fn mark_inode_used(
+    state: &FsState,
+    ino: u32,
+    is_dir: bool,
+) -> Result<bool, BlockBackendError> {
+    let _g = lock_alloc();
+    if ino == 0 || ino > state.ext_sb.inodes_count {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    let sb = &state.ext_sb;
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
+    let group = (ino - 1) / sb.inodes_per_group;
+    let in_group = (ino - 1) % sb.inodes_per_group;
+    let gd = state.group_desc_mut(group)?;
+    state.read_block(gd.inode_bitmap, &mut bitmap_scratch)?;
+    let byte_idx = (in_group / 8) as usize;
+    let mask = 1u8 << (in_group % 8) as u8;
+    if bitmap_scratch[byte_idx] & mask != 0 {
+        return Ok(false);
+    }
+    bitmap_scratch[byte_idx] |= mask;
+    state.write_block(gd.inode_bitmap, &bitmap_scratch)?;
+    let used_before = group as u64 * sb.inodes_per_group as u64;
+    let bits_in_group = (sb.inodes_count as u64)
+        .saturating_sub(used_before)
+        .min(sb.inodes_per_group as u64) as u32;
+    state.record_inode_table_use(group, bits_in_group.saturating_sub(in_group + 1))?;
+    state.adjust_group_free_inodes(group, -1)?;
+    if is_dir {
+        state.adjust_group_used_dirs(group, 1)?;
+    }
+    state.adjust_sb_free_inodes(-1)?;
+    Ok(true)
 }
 
 /// 分配一个 inode(非目录)。`is_dir` 控制用于 `s_used_dirs` 计数。
@@ -563,20 +696,40 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
             continue;
         }
         let gd = state.group_desc_mut(group)?;
+        let used_before = group as u64 * sb.inodes_per_group as u64;
+        let bits_in_group = (sb.inodes_count as u64)
+            .saturating_sub(used_before)
+            .min(sb.inodes_per_group as u64) as u32;
+        if bits_in_group == 0 {
+            continue;
+        }
+        if gd.flags & EXT4_BG_INODE_UNINIT != 0 {
+            // 新 inode 不能暴露磁盘旧数据。惰性初始化镜像通常同时带
+            // INODE_ZEROED；其它布局在实现整张 inode 表清零前保守跳过。
+            if gd.flags & EXT4_BG_INODE_ZEROED == 0
+                || state.group_counts(group)?.free_inodes != bits_in_group
+            {
+                continue;
+            }
+            initialize_empty_bitmap(&mut bitmap_scratch, bits_in_group);
+            state.write_block(gd.inode_bitmap, &bitmap_scratch)?;
+            state.clear_group_flags(group, EXT4_BG_INODE_UNINIT)?;
+        }
         let start_bit = if group == start_group {
-            start_rel % sb.inodes_per_group
+            (start_rel % sb.inodes_per_group).min(bits_in_group)
         } else {
             0
         };
         let nr = alloc_bit_in_bitmap(
             state,
             gd.inode_bitmap,
-            sb.inodes_per_group,
+            bits_in_group,
             start_bit,
             &mut bitmap_scratch,
         )?;
         if let Some(nr) = nr {
             let ino = group * sb.inodes_per_group + nr + 1;
+            state.record_inode_table_use(group, bits_in_group - nr - 1)?;
             state
                 .inode_alloc_hint
                 .store(group * sb.inodes_per_group + nr + 1, Ordering::Relaxed);
@@ -589,6 +742,15 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
         }
     }
     Err(BlockBackendError::OutOfRange)
+}
+
+/// 构造已初始化的空位图：有效项保持空闲，块组范围外的尾部位全部标记为已用。
+fn initialize_empty_bitmap(bitmap: &mut [u8], valid_bits: u32) {
+    bitmap.fill(0);
+    let total_bits = bitmap.len().saturating_mul(8);
+    for bit in valid_bits as usize..total_bits {
+        bitmap[bit / 8] |= 1u8 << (bit % 8);
+    }
 }
 
 pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), BlockBackendError> {
@@ -615,8 +777,12 @@ pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), 
     Ok(())
 }
 
-/// 写超级块的若干计数字段(free_blocks, free_inodes)并重算 checksum。
-pub(crate) fn write_superblock(state: &FsState) -> Result<(), BlockBackendError> {
+/// 读取-修改-写回超级块:调用方在闭包内改 1024 字节超级块区,
+/// 返回前自动重算 METADATA_CSUM 并落盘。
+pub(crate) fn patch_superblock(
+    state: &FsState,
+    f: impl FnOnce(&mut [u8]),
+) -> Result<(), BlockBackendError> {
     let sector_size = state.backend.sector_size() as u64;
     let start_sector = SUPERBLOCK_OFFSET / sector_size;
     let in_sector = (SUPERBLOCK_OFFSET % sector_size) as usize;
@@ -627,28 +793,8 @@ pub(crate) fn write_superblock(state: &FsState) -> Result<(), BlockBackendError>
         .read_sectors(start_sector, sectors_needed as u32, &mut raw)?;
     let sb_slice = &mut raw[in_sector..in_sector + 1024];
 
-    // 更新 s_free_blocks_count_{lo,hi} 与 s_free_inodes_count
-    let free_blocks = state.ext_sb_free_blocks();
-    let free_inodes = state.ext_sb_free_inodes();
-    sb_slice[12..16].copy_from_slice(&(free_blocks as u32).to_le_bytes());
-    sb_slice[16..20].copy_from_slice(&free_inodes.to_le_bytes());
-    // 当前写路径不维护 ext4 orphan_file。进入可写挂载后清掉该特性位,
-    // 否则 e2fsck 会按 orphan file 扫描已释放 inode 并报告 corrupted orphan list。
-    let compat = u32::from_le_bytes([sb_slice[92], sb_slice[93], sb_slice[94], sb_slice[95]])
-        & !COMPAT_ORPHAN_FILE;
-    sb_slice[92..96].copy_from_slice(&compat.to_le_bytes());
-    let ro_compat =
-        u32::from_le_bytes([sb_slice[100], sb_slice[101], sb_slice[102], sb_slice[103]])
-            & !RO_COMPAT_ORPHAN_PRESENT;
-    sb_slice[100..104].copy_from_slice(&ro_compat.to_le_bytes());
-    sb_slice[0xe8..0xec].copy_from_slice(&0u32.to_le_bytes());
-    sb_slice[0x280..0x284].copy_from_slice(&0u32.to_le_bytes());
-    if state.ext_sb.feature_incompat & crate::layout::INCOMPAT_64BIT != 0 {
-        let hi = (free_blocks >> 32) as u32;
-        sb_slice[0x154..0x158].copy_from_slice(&hi.to_le_bytes());
-    }
+    f(sb_slice);
 
-    // Recompute checksum
     if state.ext_sb.metadata_csum {
         let sum = crc::crc32c(&sb_slice[..SUPERBLOCK_CHECKSUM_OFFSET]);
         sb_slice[SUPERBLOCK_CHECKSUM_OFFSET..SUPERBLOCK_CHECKSUM_OFFSET + 4]
@@ -657,6 +803,58 @@ pub(crate) fn write_superblock(state: &FsState) -> Result<(), BlockBackendError>
     state
         .backend
         .write_sectors(start_sector, sectors_needed as u32, &raw)
+}
+
+/// 写超级块的若干计数字段(free_blocks, free_inodes)与 s_wtime,并重算 checksum。
+pub(crate) fn write_superblock(state: &FsState) -> Result<(), BlockBackendError> {
+    let free_blocks = state.ext_sb_free_blocks();
+    let free_inodes = state.ext_sb_free_inodes();
+    let is_64bit = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_64BIT != 0;
+    let now = Timespec::now().secs.max(0) as u64;
+    patch_superblock(state, |sb_slice| {
+        // 更新 s_free_blocks_count_{lo,hi} 与 s_free_inodes_count
+        sb_slice[12..16].copy_from_slice(&(free_blocks as u32).to_le_bytes());
+        sb_slice[16..20].copy_from_slice(&free_inodes.to_le_bytes());
+        if is_64bit {
+            let hi = (free_blocks >> 32) as u32;
+            sb_slice[0x154..0x158].copy_from_slice(&hi.to_le_bytes());
+        }
+        // Linux 每次 commit_super 都刷新 s_wtime(以及其高 8 位)。
+        sb_slice[sb_off::WTIME..sb_off::WTIME + 4].copy_from_slice(&(now as u32).to_le_bytes());
+        sb_slice[sb_off::WTIME_HI] = (now >> 32) as u8;
+    })
+}
+
+/// 挂载时的超级块记账:清除 VALID_FS(读写挂载期间),
+/// `s_mnt_count+1`,更新 `s_mtime`(及高位)。
+pub(crate) fn mark_mounted(state: &FsState, read_only: bool) -> Result<(), BlockBackendError> {
+    let now = Timespec::now().secs.max(0) as u64;
+    patch_superblock(state, |sb_slice| {
+        let mut state_flags =
+            u16::from_le_bytes([sb_slice[sb_off::STATE], sb_slice[sb_off::STATE + 1]]);
+        if read_only {
+            state_flags |= crate::layout::EXT2_STATE_VALID_FS;
+        } else {
+            state_flags &= !crate::layout::EXT2_STATE_VALID_FS;
+        }
+        sb_slice[sb_off::STATE..sb_off::STATE + 2].copy_from_slice(&state_flags.to_le_bytes());
+        let mnt_count =
+            u16::from_le_bytes([sb_slice[sb_off::MNT_COUNT], sb_slice[sb_off::MNT_COUNT + 1]]);
+        sb_slice[sb_off::MNT_COUNT..sb_off::MNT_COUNT + 2]
+            .copy_from_slice(&mnt_count.wrapping_add(1).to_le_bytes());
+        sb_slice[sb_off::MTIME..sb_off::MTIME + 4].copy_from_slice(&(now as u32).to_le_bytes());
+        sb_slice[sb_off::MTIME_HI] = (now >> 32) as u8;
+    })
+}
+
+/// 干净卸载/转只读时写回 VALID_FS,让 fsck 知道无需检查。
+pub(crate) fn mark_clean_unmount(state: &FsState) -> Result<(), BlockBackendError> {
+    patch_superblock(state, |sb_slice| {
+        let mut state_flags =
+            u16::from_le_bytes([sb_slice[sb_off::STATE], sb_slice[sb_off::STATE + 1]]);
+        state_flags |= crate::layout::EXT2_STATE_VALID_FS;
+        sb_slice[sb_off::STATE..sb_off::STATE + 2].copy_from_slice(&state_flags.to_le_bytes());
+    })
 }
 
 /// 把状态里缓存的某个块组描述符写回磁盘。

@@ -42,7 +42,14 @@ fn detect(bytes: &[u8]) -> Result<Kind, ElfError> {
 ///
 /// 返回的 [`Box<dyn Image>`] 借用 `bytes`——调用方需确保 image 字节在
 /// trait object 活跃期间不释放。
-pub fn parse<'a>(bytes: &'a [u8]) -> Result<Box<dyn Image<'a> + 'a>, ElfError> {
+#[kernel_symbols::export(
+    name = "elf.parse",
+    contract = "kernel.image.parse@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::IMAGE_PARSE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn parse(bytes: &[u8]) -> Result<Box<dyn Image<'_> + '_>, ElfError> {
     match detect(bytes)? {
         Kind::Elf => {
             let img = crate::linux::LinuxElfImage::parse(bytes)?;

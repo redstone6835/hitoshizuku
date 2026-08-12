@@ -1,7 +1,13 @@
 //! 通用 DMA 分配与同步辅助。
 
+extern crate alloc;
+
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::mutex::Mutex;
 
 /// CPU 与设备之间的 DMA 所有权转移方向。
@@ -110,16 +116,27 @@ struct LegacyGlobalDmaMapper;
 
 impl DmaMapper for LegacyGlobalDmaMapper {
     fn sync_for_device(&self, region: DmaSyncRegion) {
+        if !DMA_OPS_OVERRIDDEN.load(Ordering::Acquire) {
+            return;
+        }
         let ops = *DMA_OPS.lock();
         (ops.sync_for_device)(region);
     }
 
     fn sync_for_cpu(&self, region: DmaSyncRegion) {
+        if !DMA_OPS_OVERRIDDEN.load(Ordering::Acquire) {
+            return;
+        }
         let ops = *DMA_OPS.lock();
         (ops.sync_for_cpu)(region);
     }
 
     fn phys_to_dma(&self, region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize> {
+        if !DMA_OPS_OVERRIDDEN.load(Ordering::Acquire) {
+            return constraints
+                .accepts_dma_addr(region.paddr, region.len)
+                .then_some(region.paddr);
+        }
         let ops = *DMA_OPS.lock();
         let dma_addr = (ops.phys_to_dma)(region);
         constraints
@@ -141,6 +158,7 @@ pub struct DmaContext {
     mapper: &'static dyn DmaMapper,
 }
 
+#[kernel_symbols::export]
 impl DmaContext {
     pub const fn new(constraints: DmaConstraints, mapper: &'static dyn DmaMapper) -> Self {
         Self {
@@ -157,7 +175,13 @@ impl DmaContext {
         Self::new(constraints, &LEGACY_GLOBAL_DMA_MAPPER)
     }
 
-    pub const fn default_coherent() -> Self {
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaContext.default_coherent",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA
+    )]
+    pub fn default_coherent() -> Self {
         Self::new(
             DmaConstraints::coherent_identity(),
             &LEGACY_GLOBAL_DMA_MAPPER,
@@ -167,6 +191,156 @@ impl DmaContext {
     pub const fn constraints(self) -> DmaConstraints {
         self.constraints
     }
+
+    /// 由具体设备驱动确认 scatter/gather descriptor 能力后设置段数上限。
+    ///
+    /// `supports_scatter_gather == false` 表示总线尚未启用 SG，设备驱动可以用
+    /// 自己的协议上限激活它；若总线已经显式声明 SG 能力，则只能与现有上限取
+    /// 交集，不能覆盖 IOMMU、桥或 mapper 给出的更严格限制。
+    pub const fn with_scatter_gather(mut self, max_segments: usize) -> Self {
+        let requested = if max_segments == 0 { 1 } else { max_segments };
+        let effective = if self.constraints.supports_scatter_gather {
+            let existing = if self.constraints.max_segments == 0 {
+                1
+            } else {
+                self.constraints.max_segments
+            };
+            if existing < requested {
+                existing
+            } else {
+                requested
+            }
+        } else {
+            requested
+        };
+        self.constraints.max_segments = effective;
+        self.constraints.supports_scatter_gather = effective > 1;
+        self
+    }
+
+    /// 为调用者持有的稳定内核虚拟区间生成非拥有 DMA 映射。
+    ///
+    /// 当前 mapper 契约是无状态的物理地址投影；因此这里不创建需要显式 unmap 的
+    /// IOMMU 映射。地址转换、设备窗口与单段长度全部由既有 mapper/constraints
+    /// 校验，虚拟区间跨物理不连续页时直接返回 `None`，由驱动走 bounce fallback。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaContext.map_borrowed",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn map_borrowed(
+        self,
+        vaddr: usize,
+        len: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBorrowedMapping> {
+        let paddr = borrowed_range_paddr(vaddr, len)?;
+        let region = DmaSyncRegion {
+            paddr,
+            vaddr,
+            len,
+            direction,
+        };
+        let dma_addr = self.mapper.phys_to_dma(region, self.constraints)?;
+        Some(DmaBorrowedMapping {
+            dma_addr,
+            sync: self.sync_handle(region),
+        })
+    }
+
+    pub(crate) const fn sync_handle(self, region: DmaSyncRegion) -> DmaSyncHandle {
+        DmaSyncHandle {
+            mapper: self.mapper,
+            region,
+            coherent: self.constraints.coherent,
+        }
+    }
+}
+
+/// 可跨对象保存的 DMA 同步句柄，不拥有底层内存。
+#[derive(Clone, Copy)]
+pub(crate) struct DmaSyncHandle {
+    mapper: &'static dyn DmaMapper,
+    region: DmaSyncRegion,
+    coherent: bool,
+}
+
+impl DmaSyncHandle {
+    #[inline]
+    pub(crate) fn sync_for_device(&self) {
+        if !self.coherent {
+            self.mapper.sync_for_device(self.region);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sync_for_cpu(&self) {
+        if !self.coherent {
+            self.mapper.sync_for_cpu(self.region);
+        }
+    }
+}
+
+/// 非拥有 DMA 段的设备地址与 cache 同步句柄。
+#[derive(Clone, Copy)]
+pub struct DmaBorrowedMapping {
+    dma_addr: usize,
+    sync: DmaSyncHandle,
+}
+
+#[kernel_symbols::export]
+impl DmaBorrowedMapping {
+    pub const fn dma_addr(&self) -> usize {
+        self.dma_addr
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBorrowedMapping.sync_for_device",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn sync_for_device(&self) {
+        self.sync.sync_for_device();
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBorrowedMapping.sync_for_cpu",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn sync_for_cpu(&self) {
+        self.sync.sync_for_cpu();
+    }
+}
+
+fn borrowed_range_paddr(vaddr: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let end = vaddr.checked_add(len)?;
+    let base = KERNEL_ALLOCATOR.virtual_to_physical(vaddr)?;
+    let mut current = vaddr;
+    while current < end {
+        let offset = current - vaddr;
+        if KERNEL_ALLOCATOR.virtual_to_physical(current)? != base.checked_add(offset)? {
+            return None;
+        }
+        let page_left = PAGE_SIZE - current % PAGE_SIZE;
+        let chunk_end = current.checked_add(page_left.min(end - current))?;
+        let last = chunk_end - 1;
+        let last_offset = last - vaddr;
+        if KERNEL_ALLOCATOR.virtual_to_physical(last)? != base.checked_add(last_offset)? {
+            return None;
+        }
+        current = chunk_end;
+    }
+    Some(base)
 }
 
 #[derive(Clone, Copy)]
@@ -191,14 +365,68 @@ impl DmaOps {
 }
 
 static DMA_OPS: Mutex<DmaOps> = Mutex::new(DmaOps::coherent());
+/// 一旦平台安装过自定义 mapper，便永久退出默认无操作快路径。
+static DMA_OPS_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 
 /// 安装平台默认 DMA mapper。
 ///
 /// 这个入口只定义“未提供设备专属 mapper 时”的平台默认行为。设备的地址位宽、
 /// 段大小、coherency 等能力仍由 [`DmaContext`] 内的 per-device constraints
 /// 表达，驱动不通过这里反推设备能力。
+#[kernel_symbols::export(
+    name = "general.dev.dma.set_dma_ops",
+    contract = "kernel.general.dma-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn set_dma_ops(ops: DmaOps) {
-    *DMA_OPS.lock() = ops;
+    if super::elm_lifecycle::install_dma_ops(ops).is_err() {
+        log::error!("[dma] ELM DMA 平台操作安装失败，原操作保持不变");
+    }
+}
+
+pub(crate) fn replace_dma_ops(ops: DmaOps) -> DmaOps {
+    // 先关闭快路径再发布新 hook；并发同步至多调用一次旧的 coherent 空操作，
+    // 不会在自定义 mapper 生效后错误跳过 cache 维护。
+    DMA_OPS_OVERRIDDEN.store(true, Ordering::Release);
+    let mut current = DMA_OPS.lock();
+    core::mem::replace(&mut *current, ops)
+}
+
+/// 使用平台默认 mapper 把 CPU 写入同步给设备。
+#[kernel_symbols::export(
+    name = "general.dev.dma.sync_for_device",
+    contract = "kernel.general.dma-map@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn sync_for_device(region: DmaSyncRegion) {
+    LEGACY_GLOBAL_DMA_MAPPER.sync_for_device(region);
+}
+
+/// 使用平台默认 mapper 把设备写入同步给 CPU。
+#[kernel_symbols::export(
+    name = "general.dev.dma.sync_for_cpu",
+    contract = "kernel.general.dma-map@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn sync_for_cpu(region: DmaSyncRegion) {
+    LEGACY_GLOBAL_DMA_MAPPER.sync_for_cpu(region);
+}
+
+/// 使用平台默认 mapper 生成设备可见 DMA 地址并执行设备约束校验。
+#[kernel_symbols::export(
+    name = "general.dev.dma.phys_to_dma",
+    contract = "kernel.general.dma-map@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+)]
+pub fn phys_to_dma(region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize> {
+    LEGACY_GLOBAL_DMA_MAPPER.phys_to_dma(region, constraints)
 }
 
 fn dma_coherent_sync(_region: DmaSyncRegion) {
@@ -221,6 +449,7 @@ pub struct DmaBuffer {
     direction: DmaDirection,
 }
 
+#[kernel_symbols::export]
 impl DmaBuffer {
     /// 分配一个已清零的 DMA 缓冲区，至少暴露 `len` 字节可用空间。
     pub fn new(len: usize, align: usize, direction: DmaDirection) -> Result<Self, &'static str> {
@@ -228,6 +457,14 @@ impl DmaBuffer {
     }
 
     /// 使用指定设备 DMA 上下文分配缓冲区。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.new_in",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new_in(
         context: DmaContext,
         len: usize,
@@ -325,13 +562,31 @@ impl DmaBuffer {
     }
 
     /// 将 CPU 写入的内容同步到设备可见状态。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.sync_for_device",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync_for_device(&self) {
-        self.context.mapper.sync_for_device(self.sync_region());
+        self.sync_handle().sync_for_device();
     }
 
     /// 将设备写入的内容同步到 CPU 可见状态。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.sync_for_cpu",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync_for_cpu(&self) {
-        self.context.mapper.sync_for_cpu(self.sync_region());
+        self.sync_handle().sync_for_cpu();
+    }
+
+    pub(crate) fn sync_handle(&self) -> DmaSyncHandle {
+        self.context.sync_handle(self.sync_region())
     }
 
     fn sync_region(&self) -> DmaSyncRegion {
@@ -429,8 +684,19 @@ impl DmaBuffer {
 }
 
 impl Drop for DmaBuffer {
+    #[inline]
     fn drop(&mut self) {
-        let _ = KERNEL_ALLOCATOR.free_physical(self.allocation);
+        if self.allocation.size == 0 {
+            return;
+        }
+        if let Err(error) = KERNEL_ALLOCATOR.try_free_physical(self.allocation) {
+            log::error!(
+                "[dma] 释放 DMA 缓冲失败: paddr={:#x} size={} error={:?}",
+                self.allocation.paddr,
+                self.allocation.size,
+                error
+            );
+        }
     }
 }
 
@@ -477,16 +743,150 @@ impl core::ops::DerefMut for DmaPage {
     }
 }
 
-impl net::driver::DmaBackend for DmaBuffer {
-    fn as_slice(&self) -> &[u8] {
-        self.as_slice()
+impl net::buf::NetBufStorage for DmaBuffer {
+    fn capacity(&self) -> usize {
+        self.len()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
+    fn base_ptr(&self) -> core::ptr::NonNull<u8> {
+        core::ptr::NonNull::new(self.vaddr() as *mut u8).expect("DMA buffer 虚拟地址为空")
     }
 
-    fn into_any(self: Box<Self>) -> Box<dyn core::any::Any> {
-        self
+    fn dma_addr(&self) -> Option<u64> {
+        Some(self.dma_addr() as u64)
+    }
+
+    fn sync_for_cpu(&self, offset: usize, len: usize) {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return;
+        }
+        self.context
+            .sync_handle(DmaSyncRegion {
+                paddr: self.paddr() + offset,
+                vaddr: self.vaddr() + offset,
+                len,
+                direction: self.direction(),
+            })
+            .sync_for_cpu();
+    }
+
+    fn sync_for_device(&self, offset: usize, len: usize) {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return;
+        }
+        self.context
+            .sync_handle(DmaSyncRegion {
+                paddr: self.paddr() + offset,
+                vaddr: self.vaddr() + offset,
+                len,
+                direction: self.direction(),
+            })
+            .sync_for_device();
+    }
+}
+
+/// 在常驻 DMA 子系统中构造网络 buffer pool，使 storage trait vtable 和回收入口
+/// 不依赖可卸载的 driver ELM 镜像。
+#[kernel_symbols::export(
+    name = "general.dev.dma.new_netbuf_pool",
+    contract = "kernel.general.dma-netbuf-pool@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+        | kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn new_netbuf_pool(
+    context: DmaContext,
+    count: usize,
+    size: usize,
+    align: usize,
+    direction: DmaDirection,
+) -> Result<net::buf::NetBufPoolOwner, &'static str> {
+    if count == 0 {
+        return Err("DMA NetBuf pool 不能为空");
+    }
+    let mut storages: Vec<Box<dyn net::buf::NetBufStorage>> = Vec::new();
+    storages
+        .try_reserve_exact(count)
+        .map_err(|_| "DMA NetBuf pool 元数据分配失败")?;
+    for _ in 0..count {
+        storages.push(Box::new(DmaBuffer::new_in(
+            context, size, align, direction,
+        )?));
+    }
+    net::buf::NetBufPool::new(storages.into_boxed_slice()).map_err(|_| "DMA NetBuf pool 构造失败")
+}
+
+/// 在常驻内核中构造共享 DMA 网络 buffer pool。
+///
+/// `SharedNetBufPool` 的锁类型属于常驻 `net` crate；动态驱动不能自行构造，
+/// 否则模块侧的第三方锁 crate 实例会泄漏进 ELM ABI。
+#[kernel_symbols::export(
+    name = "general.dev.dma.new_shared_netbuf_pool",
+    contract = "kernel.general.dma-netbuf-pool@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+        | kernel_symbols::capability::DEVICE_RESOURCE
+        | kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn new_shared_netbuf_pool(
+    context: DmaContext,
+    count: usize,
+    size: usize,
+    align: usize,
+    direction: DmaDirection,
+) -> Result<net::buf::SharedNetBufPool, &'static str> {
+    new_netbuf_pool(context, count, size, align, direction).map(|owner| Arc::new(Mutex::new(owner)))
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{DmaConstraints, DmaContext, DmaDirection, DmaMapper, DmaSyncRegion};
+
+    static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingMapper;
+
+    impl DmaMapper for CountingMapper {
+        fn sync_for_device(&self, _region: DmaSyncRegion) {
+            SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn sync_for_cpu(&self, _region: DmaSyncRegion) {
+            SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn phys_to_dma(
+            &self,
+            region: DmaSyncRegion,
+            _constraints: DmaConstraints,
+        ) -> Option<usize> {
+            Some(region.paddr)
+        }
+    }
+
+    static COUNTING_MAPPER: CountingMapper = CountingMapper;
+
+    #[test]
+    fn coherent_dma_context_skips_mapper_sync_hooks() {
+        SYNC_CALLS.store(0, Ordering::Relaxed);
+        let context = DmaContext::new(DmaConstraints::coherent_identity(), &COUNTING_MAPPER);
+        let sync = context.sync_handle(DmaSyncRegion {
+            paddr: 0x1000,
+            vaddr: 0x2000,
+            len: 4096,
+            direction: DmaDirection::Bidirectional,
+        });
+
+        sync.sync_for_device();
+        sync.sync_for_cpu();
+
+        assert_eq!(SYNC_CALLS.load(Ordering::Relaxed), 0);
     }
 }

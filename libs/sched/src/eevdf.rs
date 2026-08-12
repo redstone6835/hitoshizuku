@@ -53,6 +53,17 @@ pub fn weight_from_nice(nice: i8) -> Weight {
     NICE_TO_WEIGHT[(clamped - NICE_MIN) as usize]
 }
 
+/// 计算 `delta * NICE_0_WEIGHT / weight`，避免调度热路径进入 128 位软件除法。
+#[inline]
+pub(crate) fn scale_delta_by_weight(delta: u64, weight: Weight) -> u64 {
+    let weight = weight.max(1);
+    let quotient = delta / weight;
+    let remainder = delta % weight;
+    quotient
+        .saturating_mul(NICE_0_WEIGHT)
+        .saturating_add(remainder.saturating_mul(NICE_0_WEIGHT) / weight)
+}
+
 /// 任务创建 / 属性变更时传入的调度参数。
 #[derive(Debug, Clone, Copy)]
 pub struct SchedParams {
@@ -97,7 +108,9 @@ impl From<SchedParams> for SchedAttr {
 ///   [`SchedEntity::set_weight`] 在锁外安全更新（Release，由 rq 重算时 Acquire 读）。
 /// - `vruntime` / `deadline` 只在 rq 锁持有下写入，但也提供原子读接口供统计。
 /// - `lag` 离开 rq 时保存；重新入队时恢复 `vruntime = avg_vruntime - lag`。
-/// - `on_rq` 是观测性标记；权威状态由所在 rq 的索引决定。
+/// - `on_rq` 是 rq 归属的权威三态（`TASK_ON_RQ_NONE` / `QUEUED` / `MIGRATING`）。
+///   `MIGRATING` 覆盖"已从源 rq 摘除、尚未进入目标 rq"的窗口，是防止同一任务
+///   被两个 CPU 同时入队的唯一门禁；所有入队路径都必须先等待它退出该状态。
 pub struct SchedEntity {
     policy: AtomicU8,
     nice: AtomicI64,
@@ -116,7 +129,32 @@ pub struct SchedEntity {
     vruntime: AtomicU64,
     deadline: AtomicU64,
     lag: AtomicI64,
-    on_rq: AtomicBool,
+    on_rq: AtomicU8,
+    enqueue_in_progress: AtomicBool,
+}
+
+/// 任务不属于任何 runqueue。
+pub const TASK_ON_RQ_NONE: u8 = 0;
+/// 任务已登记在某个 runqueue 的索引中（或是该 CPU 的 current）。
+pub const TASK_ON_RQ_QUEUED: u8 = 1;
+/// 任务正处于跨 CPU 迁移事务中间：已从源 rq 摘除，尚未进入目标 rq。
+///
+/// 这个状态是 rq 归属的唯一权威标记。它存在的窗口里，任务不在任何 rq 的索引
+/// 中，但**仍然被迁移方独占**；任何其它路径都不得据此认为任务空闲而重新入队，
+/// 否则同一个任务会同时登记到两个 rq 上，被两个 CPU 各自切入同一份内核栈与
+/// arch context。
+pub const TASK_ON_RQ_MIGRATING: u8 = 2;
+
+pub(crate) struct TaskEnqueueGuard<'a> {
+    entity: &'a SchedEntity,
+}
+
+impl Drop for TaskEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.entity
+            .enqueue_in_progress
+            .store(false, Ordering::Release);
+    }
 }
 
 impl SchedEntity {
@@ -140,7 +178,8 @@ impl SchedEntity {
             vruntime: AtomicU64::new(0),
             deadline: AtomicU64::new(0),
             lag: AtomicI64::new(0),
-            on_rq: AtomicBool::new(false),
+            on_rq: AtomicU8::new(TASK_ON_RQ_NONE),
+            enqueue_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -238,12 +277,73 @@ impl SchedEntity {
         self.lag.store(l, Ordering::Release);
     }
 
+    /// 任务是否归属于某个 runqueue。
+    ///
+    /// 迁移中的任务同样返回 `true`：它虽然不在任何 rq 的索引里，但归属权已被
+    /// 迁移方持有，调用方不能把它当作可自由入队的空闲任务。需要区分两者的
+    /// 路径请用 [`on_rq_state`] 或 [`is_migrating`]。
     pub fn on_rq(&self) -> bool {
+        self.on_rq_state() != TASK_ON_RQ_NONE
+    }
+
+    /// rq 归属的三态权威值。
+    pub fn on_rq_state(&self) -> u8 {
         self.on_rq.load(Ordering::Acquire)
     }
 
+    /// 任务是否正处于迁移事务窗口中。
+    pub fn is_migrating(&self) -> bool {
+        self.on_rq_state() == TASK_ON_RQ_MIGRATING
+    }
+
     pub(crate) fn set_on_rq(&self, on: bool) {
-        self.on_rq.store(on, Ordering::Release);
+        self.on_rq.store(
+            if on {
+                TASK_ON_RQ_QUEUED
+            } else {
+                TASK_ON_RQ_NONE
+            },
+            Ordering::Release,
+        );
+    }
+
+    /// 把任务标记为迁移中。仅在持有源 rq 锁、刚把任务从索引里摘出时调用。
+    pub(crate) fn set_migrating(&self) {
+        self.on_rq.store(TASK_ON_RQ_MIGRATING, Ordering::Release);
+    }
+
+    /// 结束迁移事务：`queued` 表示任务是否已经进入目标（或回滚后的源）rq。
+    ///
+    /// 迁移路径的每条出口都必须经过这里，否则任务会永久停留在 `MIGRATING`，
+    /// 让所有唤醒方无限期自旋等待一个已经结束的事务。
+    /// 兜底收尾：把卡在 `MIGRATING` 的任务强制标记为不在 rq 上。
+    ///
+    /// 仅供 `wait_for_migration_to_settle` 的超时分支使用；正常路径必须用
+    /// [`finish_migrating`]。用 CAS 而不是无条件 store，避免与真正完成迁移的
+    /// 一方竞争，把已经入队成功的任务错误地改回 NONE。
+    pub(crate) fn force_finish_migrating(&self) {
+        let _ = self.on_rq.compare_exchange(
+            TASK_ON_RQ_MIGRATING,
+            TASK_ON_RQ_NONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn finish_migrating(&self, queued: bool) {
+        debug_assert_eq!(
+            self.on_rq.load(Ordering::Acquire),
+            TASK_ON_RQ_MIGRATING,
+            "[sched] finish_migrating on non-migrating task",
+        );
+        self.set_on_rq(queued);
+    }
+
+    pub(crate) fn try_begin_enqueue(&self) -> Option<TaskEnqueueGuard<'_>> {
+        self.enqueue_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(TaskEnqueueGuard { entity: self })
     }
 
     pub(crate) fn store_rq_account(&self, vruntime: u64, weight: Weight) {
@@ -265,9 +365,7 @@ impl SchedEntity {
 
     /// `vruntime_delta = delta_exec * NICE_0_WEIGHT / weight`。
     pub fn scale_delta(&self, delta_exec_ns: u64) -> u64 {
-        let w = self.weight().max(1);
-        // 使用 128 位中间值避免溢出。NICE_0_WEIGHT 最大 88761，delta_exec_ns 可能较大。
-        ((delta_exec_ns as u128 * NICE_0_WEIGHT as u128) / w as u128) as u64
+        scale_delta_by_weight(delta_exec_ns, self.weight())
     }
 
     /// 根据当前 vruntime 与 slice 计算新的 deadline。
@@ -277,7 +375,7 @@ impl SchedEntity {
         vr.saturating_add(scaled_slice)
     }
 
-    /// 一次性更新 weight + slice。调用方随后应当调 [`crate::Runqueue::resort_after_weight_change`]
+    /// 一次性更新 weight + slice。调用方随后应当让所属 runqueue 重新排序。
     /// 把 task 在 tree 中的位置重算。
     pub fn set_params(&self, params: SchedParams) {
         self.set_nice(params.nice);
@@ -347,7 +445,7 @@ impl SchedEntity {
 
     pub(crate) fn reset_rr_slice(&self) {
         self.rr_remaining_ns
-            .store(self.slice_ns().max(1), Ordering::Release);
+            .store(crate::scheduler::sched_rr_timeslice_ns(), Ordering::Release);
     }
 
     pub(crate) fn rr_remaining_ns(&self) -> u64 {

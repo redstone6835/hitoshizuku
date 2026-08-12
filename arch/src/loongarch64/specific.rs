@@ -107,6 +107,9 @@ pub const EUEN_FPE: usize = 0x1;
 /// EUEN bit 4（保留位）：内核内部标志，记录异常入口时是否保存了 FPU 上下文。
 /// 写入 CSR_EUEN 前必须清除。
 pub const FPU_SAVED: usize = 0x10;
+/// EUEN bit 5（保留位）：内核内部标志，记录异常入口时是否保存了 LSX 上下文。
+/// 写入 CSR_EUEN 前必须清除。
+pub const LSX_SAVED: usize = 0x20;
 pub const EUEN_SXE: usize = 0x2;
 pub const EUEN_ASXE: usize = 0x4;
 pub const EUEN_BTE: usize = 0x8;
@@ -178,6 +181,10 @@ pub const CPUCFG1_VALEN_BITS: usize = 8;
 pub const CPUCFG1_VALEN_MASK: usize = (1usize << CPUCFG1_VALEN_BITS) - 1;
 /// CPUCFG.1 中 HP（huge page）能力位。
 pub const CPUCFG1_HP: usize = 1 << 24;
+/// CPUCFG.1 中 UAL（非对齐访存）能力位。
+const CPUCFG1_UAL: usize = 1 << 20;
+/// LoongArch 用户 ABI 中的非对齐访存能力位。
+const HWCAP_LOONGARCH_UAL: usize = 1 << 2;
 
 /// 读取指定 CPUCFG 配置字。
 ///
@@ -198,6 +205,16 @@ pub fn read_cpucfg_word(index: usize) -> usize {
     // LA64 下 CPUCFG 配置字宽度为 32 位，指令结果会符号扩展到 GRLEN。
     // 这里统一裁剪为低 32 位，避免上半区符号位干扰字段解析。
     value as u32 as usize
+}
+
+/// 返回当前处理器可安全暴露给用户态的 LoongArch HWCAP。
+pub fn user_hwcap() -> usize {
+    let cpucfg1 = read_cpucfg_word(CPUCFG_WORD1);
+    if cpucfg1 & CPUCFG1_UAL != 0 {
+        HWCAP_LOONGARCH_UAL
+    } else {
+        0
+    }
 }
 
 // LoongArch64 定义的异常代码（ECODE）枚举。
@@ -225,7 +242,7 @@ pub const ECODE_FPE: usize = 18; // 浮点异常
 ///
 /// LoongArch64 的异常上下文包含了所有通用寄存器、核心控制寄存器以及浮点寄存器的
 /// 状态，以便在异常处理过程中能够完整地保存和恢复用户态程序的执行状态。
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
     // 1. 除 $r0 之外的 31 个通用寄存器
@@ -267,7 +284,11 @@ pub struct TrapFrame {
     pub euen: usize,   // CSR_EUEN
     pub llbctl: usize, // CSR_LLBCTL
 
-    // 3. FPU 浮点寄存器
+    // 3. LSX 向量寄存器。显式填充使寄存器区保持 16 字节对齐。
+    pub _lsx_padding: u64,
+    pub lsx: [[u64; 2]; 32], // VR0..VR31
+
+    // 4. FPU 浮点寄存器
     pub f: [u64; 32], // F0..F31
     pub fcsr: u64,    // FCSR 控制位
     pub fcc: u64,     // FPU 浮点使能标志位
@@ -334,9 +355,17 @@ pub const PC_OFFSET: usize = offset_of!(TrapFrame, pc);
 pub const STATUS_OFFSET: usize = offset_of!(TrapFrame, status);
 pub const EUEN_OFFSET: usize = offset_of!(TrapFrame, euen);
 pub const LLBCTL_OFFSET: usize = offset_of!(TrapFrame, llbctl);
+pub const LSX_PADDING_OFFSET: usize = offset_of!(TrapFrame, _lsx_padding);
+pub const LSX_OFFSET: usize = offset_of!(TrapFrame, lsx);
 pub const F_OFFSET: usize = offset_of!(TrapFrame, f);
 pub const FCSR_OFFSET: usize = offset_of!(TrapFrame, fcsr);
 pub const FCC_OFFSET: usize = offset_of!(TrapFrame, fcc);
+
+const _: () = {
+    assert!(LSX_OFFSET % 16 == 0);
+    assert!(align_of::<TrapFrame>() >= 16);
+    assert!(FRAME_SIZE % 16 == 0);
+};
 
 /// LoongArch64 架构的 ID 标识 (用于异常分发)。
 pub const ARCH_ID_LOONGARCH64: usize = 2;

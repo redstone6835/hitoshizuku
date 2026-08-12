@@ -81,7 +81,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = user_sp;
         tf.a0 = arg0;
         tf.status = PRMD_USER_IE;
-        tf.euen = EUEN_FPE | EUEN_SXE;
+        tf.euen = 0;
     }
 
     fn set_user_trap_frame_args(
@@ -114,9 +114,7 @@ impl TaskOps for LoongArch64TaskOps {
     }
 
     fn sync_icache() {
-        unsafe {
-            core::arch::asm!("ibar 0", options(nostack, preserves_flags));
-        }
+        crate::loongarch64::smp::sync_icache_all_cpus();
     }
 }
 
@@ -124,6 +122,7 @@ const PRMD_PPLV_USER: usize = CSR_PRMD_PPLV_PLV3;
 const PRMD_PIE_ENABLED: usize = 1 << 2;
 const PRMD_USER_IE: usize = PRMD_PPLV_USER | PRMD_PIE_ENABLED;
 const PRMD_KERNEL_IE: usize = CSR_PRMD_PPLV_PLV0 | PRMD_PIE_ENABLED;
+const CRMD_IE_MASK: usize = 1 << CSR_CRMD_IE_OFFSET;
 
 impl Default for TrapFrame {
     fn default() -> Self {
@@ -163,6 +162,8 @@ impl Default for TrapFrame {
             status: 0,
             euen: 0,
             llbctl: 0,
+            _lsx_padding: 0,
+            lsx: [[0; 2]; 32],
             f: [0; 32],
             fcsr: 0,
             fcc: 0,
@@ -174,7 +175,12 @@ impl Default for TrapFrame {
 unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
     use core::arch::naked_asm;
     naked_asm!(
+        // 在恢复寄存器前发布 PRMD，使 `ertn` 能返回请求的特权级。整个窗口内
+        // 保持中断屏蔽，否则该例程仍在内核栈执行时的中断会被误判为用户态陷入。
+        "ori $r12, $r0, {crmd_ie_mask}",
+        "csrxchg $r0, $r12, {csr_crmd}",
         "or $r31, $r4, $zero",
+        "bl {handle_shootdown}",
 
         "ld.d $r12, $r31, {status_off}",
         "csrwr $r12, {csr_prmd}",
@@ -255,7 +261,35 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
         ".Lresume_skip_fpu:",
 
         "ld.d $r12, $r31, {euen_off}",
-        "bstrins.d $r12, $r0, 4, 4",
+        "andi $r13, $r12, {euen_sxe}",
+        "beqz $r13, .Lresume_skip_lsx",
+
+        "csrrd $r14, {csr_euen}",
+        "ori $r15, $r14, {euen_sxe}",
+        "csrwr $r15, {csr_euen}",
+
+        "addi.d $r12, $r31, {lsx_off}",
+        "vld $vr0, $r12, 0 * 16",     "vld $vr1, $r12, 1 * 16",
+        "vld $vr2, $r12, 2 * 16",     "vld $vr3, $r12, 3 * 16",
+        "vld $vr4, $r12, 4 * 16",     "vld $vr5, $r12, 5 * 16",
+        "vld $vr6, $r12, 6 * 16",     "vld $vr7, $r12, 7 * 16",
+        "vld $vr8, $r12, 8 * 16",     "vld $vr9, $r12, 9 * 16",
+        "vld $vr10, $r12, 10 * 16",   "vld $vr11, $r12, 11 * 16",
+        "vld $vr12, $r12, 12 * 16",   "vld $vr13, $r12, 13 * 16",
+        "vld $vr14, $r12, 14 * 16",   "vld $vr15, $r12, 15 * 16",
+        "vld $vr16, $r12, 16 * 16",   "vld $vr17, $r12, 17 * 16",
+        "vld $vr18, $r12, 18 * 16",   "vld $vr19, $r12, 19 * 16",
+        "vld $vr20, $r12, 20 * 16",   "vld $vr21, $r12, 21 * 16",
+        "vld $vr22, $r12, 22 * 16",   "vld $vr23, $r12, 23 * 16",
+        "vld $vr24, $r12, 24 * 16",   "vld $vr25, $r12, 25 * 16",
+        "vld $vr26, $r12, 26 * 16",   "vld $vr27, $r12, 27 * 16",
+        "vld $vr28, $r12, 28 * 16",   "vld $vr29, $r12, 29 * 16",
+        "vld $vr30, $r12, 30 * 16",   "vld $vr31, $r12, 31 * 16",
+
+        ".Lresume_skip_lsx:",
+
+        "ld.d $r12, $r31, {euen_off}",
+        "bstrins.d $r12, $r0, 5, 4",
         "csrwr $r12, {csr_euen}",
 
         "ld.d $r12, $r31, {llbctl_off}",
@@ -303,6 +337,8 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
 
         status_off = const STATUS_OFFSET,
         pc_off = const PC_OFFSET,
+        csr_crmd = const CSR_CRMD,
+        crmd_ie_mask = const CRMD_IE_MASK,
         euen_off = const EUEN_OFFSET,
         llbctl_off = const LLBCTL_OFFSET,
         ra_off = const RA_OFFSET,
@@ -337,6 +373,7 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
         s8_off = const S8_OFFSET,
         s9_off = const S9_OFFSET,
         f_off = const F_OFFSET,
+        lsx_off = const LSX_OFFSET,
         fcsr_off = const FCSR_OFFSET,
         fcc_off = const FCC_OFFSET,
         csr_prmd = const CSR_PRMD,
@@ -344,6 +381,8 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
         csr_euen = const CSR_EUEN,
         csr_llbctl = const CSR_LLBCTL,
         euen_fpe = const EUEN_FPE,
+        euen_sxe = const EUEN_SXE,
+        handle_shootdown = sym crate::loongarch64::smp::handle_shootdown_requests,
     );
 }
 

@@ -224,6 +224,19 @@ fn validate_basename(name: &str) -> VfsResult<()> {
     Ok(())
 }
 
+/// 将文件系统返回的符号链接目标转换为可解析路径。
+///
+/// Linux 的链接跟随路径以 C pathname 语义消费目标，首个 NUL 后的填充不会进入
+/// 分量解析。磁盘文件系统返回的内容仍可由 `readlink(2)` 原样读取；这里只规范化
+/// 实际参与路径遍历的视图。空目标没有可解析对象，按悬空链接处理。
+pub(crate) fn symlink_target_path(target: &str) -> VfsResult<&str> {
+    let path = target.split_once('\0').map_or(target, |(prefix, _)| prefix);
+    if path.is_empty() {
+        return Err(VfsError::NotFound);
+    }
+    Ok(path)
+}
+
 fn check_name_max(parent: &Arc<Dentry>, name: &str) -> VfsResult<()> {
     let parent_inode = parent.inode().ok_or(VfsError::NotFound)?;
     if let Some(sb) = parent_inode.superblock.upgrade()
@@ -250,12 +263,21 @@ fn check_name_max(parent: &Arc<Dentry>, name: &str) -> VfsResult<()> {
 /// - [`VfsError::NotADirectory`]：中间分量不是目录；
 /// - [`VfsError::SymlinkLoop`]：符号链接深度超过 `ctx.limits.symlink_max_depth`；
 /// - [`VfsError::NameTooLong`]：某分量字节数超过文件系统的 `name_max`。
+#[kernel_symbols::export(
+    name = "vfs.path.lookup",
+    contract = "kernel.vfs.path@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn lookup(
     ctx: &VfsContext,
     dirfd: &Dirfd,
     path: &str,
     flags: LookupFlags,
 ) -> VfsResult<LookupResult> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::VfsLookup).bytes(path.len());
     if path.is_empty() {
         return Err(VfsError::NotFound);
     }
@@ -296,6 +318,9 @@ fn step(state: &mut WalkState<'_>, name: &str, traverse_mounts: bool) -> VfsResu
 }
 
 fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsResult<()> {
+    if path.contains('\0') {
+        return Err(VfsError::InvalidArgument);
+    }
     let mut components = PathComponents::new(path).peekable();
     let requires_dir = requires_final_directory(path, flags);
     let cred = state.ctx.cred();
@@ -306,12 +331,6 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
         if !is_last {
             step(state, component, true)?;
             if let Some(inode) = state.current.inode() {
-                {
-                    let meta = inode.meta_snapshot();
-                    if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
-                        return Err(VfsError::PermissionDenied);
-                    }
-                }
                 if inode.kind == crate::vfs::stat::FileType::Symlink {
                     if flags.has(LookupFlags::NO_SYMLINKS) {
                         return Err(symlink_not_allowed(state));
@@ -326,6 +345,14 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
                 } else if inode.kind != crate::vfs::stat::FileType::Directory {
                     return Err(VfsError::NotADirectory);
                 }
+            }
+            let inode = state.current.inode().ok_or(VfsError::NotFound)?;
+            if inode.kind != crate::vfs::stat::FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            let meta = inode.meta_snapshot();
+            if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                return Err(VfsError::PermissionDenied);
             }
             continue;
         }
@@ -600,8 +627,9 @@ fn follow_symlink(
 
     let inode = link_dentry.inode().ok_or(VfsError::NotFound)?;
     let target = inode.ops.readlink(&inode)?;
+    let target_path = symlink_target_path(&target)?;
 
-    if PathComponents::is_absolute(&target) {
+    if PathComponents::is_absolute(target_path) {
         // 绝对链接：从进程根重新开始，同步重置挂载上下文
         state.current = state.ctx.root.root();
         state.current_mount = state.ctx.root.mount();
@@ -619,9 +647,7 @@ fn follow_symlink(
         // 若 link_dentry 无父（根 dentry 不应是符号链接），维持不变
     }
 
-    if !target.is_empty() {
-        walk_path(state, &target, flags)?;
-    }
+    walk_path(state, target_path, flags)?;
 
     Ok(Arc::clone(&state.current))
 }
@@ -631,6 +657,13 @@ fn follow_symlink(
 ///
 /// 注意：这里**不**解析 `..`（因为 `..` 的语义依赖文件系统状态和符号链接），
 /// 仅做纯字符串层面的化简。
+#[kernel_symbols::export(
+    name = "vfs.path.normalize_path",
+    contract = "kernel.vfs.path@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::CORE_SAFE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn normalize_path(path: &str) -> String {
     let absolute = PathComponents::is_absolute(path);
     // 过滤空分量和 "." 分量，重新组装

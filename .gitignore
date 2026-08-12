@@ -1,8 +1,13 @@
 # 构建输出
-/target/
+target/
+.config
 Cargo.lock
 kernel-la
 kernel-rv
+kernel-la-kcsan
+kernel-rv-kcsan
+kernel-la-profile
+kernel-rv-profile
 disk.img
 disk-la.img
 
@@ -15,8 +20,29 @@ disk-la.img
 AGENTS.md
 
 build
+output/
 userland/rootfs-la/bin/
 userland/rootfs-rv/bin/
+userland/rootfs-la/lib/elm/
+userland/rootfs-rv/lib/elm/
+drivers/*/.elm/
+drivers/*/dist/
+drivers/*/.cargo/
+drivers/*/Elm.lock
+tests/elm/*/.cargo/
+tests/elm/*/.elm/
+tests/elm/*/dist/
+tests/elm/*/elm.ld
+tests/elm/*/rust-toolchain.toml
 
 # vendor 不受上述规则限制
 !vendor/**
+__pycache__/
+bench/results/*
+!bench/results/.gitignore
+kernel-la.lock
+kernel-rv.lock
+kernel-la-kcsan.lock
+kernel-rv-kcsan.lock
+kernel-la-profile.lock
+kernel-rv-profile.lock

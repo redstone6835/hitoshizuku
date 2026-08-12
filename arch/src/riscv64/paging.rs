@@ -83,14 +83,11 @@ impl Riscv64Paging {
 
     const fn leaf_flags(r: bool, w: bool, x: bool, u: bool, g: bool) -> usize {
         let mut f = PTE_V | PTE_A;
-        if w {
-            f |= PTE_D;
-        }
         if r {
             f |= PTE_R;
         }
         if w {
-            f |= PTE_W;
+            f |= PTE_W | PTE_D;
         }
         if x {
             f |= PTE_X;
@@ -134,7 +131,11 @@ impl Riscv64Paging {
     /// - `root` 指向有效且完整的 Sv48 根页表物理页
     /// - `asid` 与目标地址空间匹配
     /// - 调用发生在上下文切换临界区（中断已关闭或不会被抢占）
-    pub unsafe fn activate_with_asid(root: PhysPageTableRoot, asid: usize) {
+    pub unsafe fn activate_with_asid(
+        root: PhysPageTableRoot,
+        asid: usize,
+        needs_page_table_fence: bool,
+    ) {
         let satp =
             SATP_MODE_SV48 | ((asid & ASID_MASK) << PPN_BITS) | (Self::make_ppn(root.as_usize()));
         let current: usize;
@@ -145,18 +146,28 @@ impl Riscv64Paging {
                 options(nostack, preserves_flags)
             );
         }
-        if current == satp {
+        if current == satp && !needs_page_table_fence {
             // 同一进程内的 pthread 切换会反复进入 VmSpace::activate。
             // root/asid 未变化时不需要重写 satp，也不能白白做全局 sfence.vma。
             return;
         }
+        if current != satp {
+            unsafe {
+                core::arch::asm!(
+                    "csrw satp, {val}",
+                    val = in(reg) satp,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
         unsafe {
-            core::arch::asm!(
-                "csrw satp, {val}",
-                "sfence.vma",
-                val = in(reg) satp,
-                options(nostack, preserves_flags)
-            );
+            // 非零 ASID 由 user_pgd 的 generation allocator 保证在当前代内唯一，
+            // 旧地址空间的 translation 可以继续留在 TLB 中。硬件没有 ASID 时
+            // 所有地址空间都退化为 ASID 0，切根后必须冲刷该 ASID。新建/修改后
+            // 尚未 fence 的页表同样需要一次 ASID 定向 fence 来排序 PTE store。
+            if asid == 0 || needs_page_table_fence {
+                Self::flush_tlb_local_with_asid(asid, None);
+            }
         }
     }
 
@@ -175,15 +186,51 @@ impl Riscv64Paging {
     /// - rs1 = 虚拟地址（x0 寄存器表示匹配所有地址）
     /// - rs2 = ASID（x0 寄存器表示匹配所有 ASID）
     ///
-    /// 注意：当 `asid` 参数值为 0 时，编译器会将 0 加载到一个通用寄存器中，
-    /// 硬件将其视为"flush ASID 0"而非"flush 所有 ASID"。若需全局 flush，
-    /// 应传 `vaddr = None`（走无操作数的 `sfence.vma` 路径）。
+    /// 注意：即使 `asid` 的数值为 0，这里也会把它放进普通寄存器，因此硬件
+    /// 仍把它解释为“只刷新 ASID 0”，而不是 rs2=`x0` 的“刷新所有 ASID”。
+    /// 真正的全局刷新应调用 [`flush_tlb_global`](Self::flush_tlb_global)。
     ///
     /// # Safety
     ///
     /// 必须在 S-mode 下调用。
     #[inline]
     pub unsafe fn flush_tlb_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
+        unsafe { Self::flush_tlb_local_with_asid(asid, vaddr) };
+        crate::riscv64::smp::remote_sfence_vma(Some(asid), vaddr.map(VirtAddr::as_usize));
+    }
+
+    /// 只刷新使用过目标用户地址空间的 CPU 集合。
+    ///
+    /// 本接口供用户 PGD 的活跃 CPU 跟踪使用。内核全局映射不得调用它，因为
+    /// Global translation 仍要求覆盖全部在线 hart。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_with_asid_on_cpus(
+        asid: usize,
+        vaddr: Option<VirtAddr>,
+        cpu_mask: usize,
+    ) {
+        let current = crate::riscv64::specific::current_cpu_id();
+        if current < usize::BITS as usize && cpu_mask & (1usize << current) != 0 {
+            unsafe { Self::flush_tlb_local_with_asid(asid, vaddr) };
+        }
+        crate::riscv64::smp::remote_sfence_vma_on(
+            cpu_mask,
+            Some(asid),
+            vaddr.map(VirtAddr::as_usize),
+        );
+    }
+
+    /// 排序先前页表写，并只失效当前 hart 的目标 ASID translation。
+    ///
+    /// 本接口不发 SBI RFENCE。调用者只有在确认不存在旧有效映射，或只是收敛
+    /// 当前 hart 缓存的无效 translation 时才能单独使用它。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 S-mode 下调用；解除映射、权限变化和物理页替换仍需使用同步多核
+    /// 失效接口。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_local_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
         unsafe {
             if let Some(addr) = vaddr {
                 core::arch::asm!(
@@ -193,7 +240,11 @@ impl Riscv64Paging {
                     options(nostack)
                 );
             } else {
-                core::arch::asm!("sfence.vma", options(nostack));
+                core::arch::asm!(
+                    "sfence.vma zero, {asid}",
+                    asid = in(reg) asid,
+                    options(nostack)
+                );
             }
         }
     }
@@ -207,6 +258,45 @@ impl Riscv64Paging {
     pub unsafe fn flush_tlb_current_asid(vaddr: Option<VirtAddr>) {
         unsafe {
             Self::flush_tlb_with_asid(Self::current_asid(), vaddr);
+        }
+    }
+
+    /// 刷新所有 ASID（包括 Global translation）对应的 TLB 项。
+    ///
+    /// 内核高半区映射使用 PTE.G。对于这类映射，`sfence.vma va, asid`
+    /// 不保证失效 Global translation，必须把第二个操作数编码为寄存器 `x0`。
+    /// 这里不能把数值 0 放进普通寄存器代替 `x0`，两者硬件语义不同。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 S-mode 下调用；函数返回前会完成本地失效和远端 hart shootdown，
+    /// 调用方随后才能释放被解除映射的物理页或页表页。
+    #[inline]
+    pub unsafe fn flush_tlb_global(vaddr: Option<VirtAddr>) {
+        unsafe { Self::flush_tlb_global_local(vaddr) };
+        crate::riscv64::smp::remote_sfence_vma(None, vaddr.map(VirtAddr::as_usize));
+    }
+
+    /// 只在当前 hart 失效 Global translation。
+    ///
+    /// 该入口供需要把多个本地地址失效合并为一次 SBI range RFENCE 的架构内部
+    /// 路径使用。调用者必须自行保证所有相关远端 hart 在物理页复用前完成失效。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 S-mode 下调用。
+    #[inline]
+    pub(crate) unsafe fn flush_tlb_global_local(vaddr: Option<VirtAddr>) {
+        unsafe {
+            if let Some(addr) = vaddr {
+                core::arch::asm!(
+                    "sfence.vma {va}, zero",
+                    va = in(reg) addr.as_usize(),
+                    options(nostack)
+                );
+            } else {
+                core::arch::asm!("sfence.vma zero, zero", options(nostack));
+            }
         }
     }
 }
@@ -332,7 +422,7 @@ impl PagingArch for Riscv64Paging {
 
     unsafe fn activate(root: PhysPageTableRoot) {
         unsafe {
-            Riscv64Paging::activate_with_asid(root, Riscv64Paging::current_asid());
+            Riscv64Paging::activate_with_asid(root, Riscv64Paging::current_asid(), true);
         }
     }
 

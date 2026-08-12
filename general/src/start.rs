@@ -36,6 +36,11 @@ pub type DeviceMmioToVirtFn = fn(phys_addr: usize) -> usize;
 /// 在启动阶段可能在没有可分页内核堆的情况下运行。成熟的平台
 /// 应在固件暴露可用物理内存时提供该项。
 pub type InitKernelPageTableFn = fn();
+pub type ProtectKernelHeapRangeFn =
+    fn(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool;
+pub type ValidateKernelHeapRangeFn =
+    fn(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool;
+pub type SyncIcacheFn = fn();
 
 /// 使用排他上界的物理地址范围。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,10 +338,18 @@ pub struct StartAddressOps {
 pub struct StartAllocatorOps {
     /// 返回为内核堆保留的虚拟地址范围。
     pub kernel_heap_region: KernelHeapRegionFn,
+    /// 返回需要 registry 账本的分配使用的独立虚拟地址窗口。
+    pub tracked_heap_region: KernelHeapRegionFn,
     /// 为内核堆虚拟范围映射物理后备范围。
     pub map_kernel_heap_range: MapKernelHeapRangeFn,
     /// 取消映射先前映射的内核堆虚拟范围。
     pub unmap_kernel_heap_range: UnmapKernelHeapRangeFn,
+    /// 修改内核堆页权限，供 ELM 原生镜像完成 W^X 切换。
+    pub protect_kernel_heap_range: ProtectKernelHeapRangeFn,
+    /// 只读校验内核堆映射权限，供 ELM 原生 API 验证跨边界裸指针。
+    pub validate_kernel_heap_range: ValidateKernelHeapRangeFn,
+    /// 同步指令缓存，供 ELM 原生镜像完成代码发布。
+    pub sync_icache: SyncIcacheFn,
     /// 安装映射的堆页所需的架构页表状态。
     pub init_kernel_page_table: InitKernelPageTableFn,
 }

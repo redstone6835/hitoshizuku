@@ -206,7 +206,7 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
     let task = sched::current_task();
 
     loop {
-        let (should_sleep, wake) = {
+        let (wait_entry, wake) = {
             let mut table = RECORD_LOCKS.lock();
             let state = table.entry(key).or_insert_with(RecordLockState::new);
             if state.first_conflict(owner, &req).is_none() {
@@ -217,24 +217,24 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
                     None
                 };
                 cleanup_empty_state(&mut table, key);
-                (false, wake)
+                (None, wake)
             } else if !wait {
                 return Err(Errno::EAGAIN);
             } else {
                 PENDING_LOCKS
                     .lock()
                     .insert(owner.pid, PendingLock { key, req });
-                state.waiters.prepare_to_wait(&task, TaskState::Sleeping);
-                (true, None)
+                let entry = state.waiters.prepare_to_wait(&task, TaskState::Sleeping);
+                (Some((Arc::clone(&state.waiters), entry)), None)
             }
         };
         if let Some(waiters) = wake {
             waiters.wake_all();
         }
 
-        if !should_sleep {
+        let Some((waiters, entry)) = wait_entry else {
             return Ok(());
-        }
+        };
 
         let (retry_without_sleep, deadlock) = {
             let table = RECORD_LOCKS.lock();
@@ -246,23 +246,23 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
             (retry, deadlock)
         };
         if retry_without_sleep {
-            finish_wait_for(key, &task);
+            waiters.finish_wait(&entry);
             PENDING_LOCKS.lock().remove(&owner.pid);
             continue;
         }
         if deadlock {
-            finish_wait_for(key, &task);
+            waiters.finish_wait(&entry);
             PENDING_LOCKS.lock().remove(&owner.pid);
             return Err(Errno::EDEADLK);
         }
         if sched::operation::has_interrupting_signal(&task) {
-            finish_wait_for(key, &task);
+            waiters.finish_wait(&entry);
             PENDING_LOCKS.lock().remove(&owner.pid);
             return Err(Errno::EINTR);
         }
 
         sched::schedule_once(sched::now_ns_public());
-        finish_wait_for(key, &task);
+        waiters.finish_wait(&entry);
         PENDING_LOCKS.lock().remove(&owner.pid);
     }
 }
@@ -289,16 +289,6 @@ pub fn release_process_locks_for_file(file: &File, owner_pid: i32) {
     };
     if let Some(waiters) = waiters {
         waiters.wake_all();
-    }
-}
-
-fn finish_wait_for(key: LockKey, task: &Arc<sched::Task>) {
-    let waiters = RECORD_LOCKS
-        .lock()
-        .get(&key)
-        .map(|state| Arc::clone(&state.waiters));
-    if let Some(waiters) = waiters {
-        waiters.finish_wait(task);
     }
 }
 

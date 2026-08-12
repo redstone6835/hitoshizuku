@@ -30,13 +30,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
-use crate::riscv64::specific::{kernel_timestamp_ns, phys_to_virt, virt_to_phys};
+use crate::riscv64::sbi;
+use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns, phys_to_virt, virt_to_phys};
 use crate::riscv64::time;
 use crate::riscv64::trap;
 use general::dtb::Dtb;
 use general::{
     StartAddressOps, StartAllocatorOps, StartArchitecture, StartBootInfo, StartBootProtocol,
-    StartContext, StartFirmware, StartMemory, StartMemoryMap,
+    StartContext, StartFirmware, StartMemory, StartMemoryMap, StartMemoryRegion,
+    StartMemoryRegionKind, StartPhysRange,
 };
 
 // ── DTB 访问 ──────────────────────────────────────────────────────────────────
@@ -52,8 +54,16 @@ struct DtbBuffer(UnsafeCell<[u8; DTB_BUF_SIZE]>);
 unsafe impl Sync for DtbBuffer {}
 static DTB_BUFFER: DtbBuffer = DtbBuffer(UnsafeCell::new([0u8; DTB_BUF_SIZE]));
 
-/// 启动 hart ID，由 loader 设置后供 allocator 的 cpu_id 回调使用。
-static HART_ID: AtomicUsize = AtomicUsize::new(0);
+/// DTB 中的 RAM 最终会与此启动映射求交集。这样在动态 direct map 落地前，
+/// 物理分配器不会拿到当前页表无法访问的 4 GiB 以上页面。
+static RISCV_BOOT_MEMORY_MAP: [StartMemoryRegion; 1] = [StartMemoryRegion::new(
+    StartPhysRange::new(
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_START,
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_END,
+    ),
+    StartMemoryRegionKind::UsableRam,
+    0,
+)];
 
 /// 返回内核 DTB 视图（始终从内核缓冲区读取）。
 fn kernel_dtb() -> Option<Dtb<'static>> {
@@ -154,7 +164,7 @@ fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
 
 // ── ISA 扩展检测 ──────────────────────────────────────────────────────────────
 
-/// 从 DTB 的 `/cpus/cpu@*` 节点解析 `riscv,isa` 属性，检测硬件扩展支持。
+/// 从 DTB 的 `/cpus/cpu@*` 节点解析所有启用 hart 共同支持的 ISA 扩展。
 fn detect_isa_extensions(dtb: &Dtb<'_>) {
     use crate::riscv64::specific::{CBO_BLOCK_SIZE, HAS_ZICBOZ};
     use core::sync::atomic::Ordering;
@@ -167,32 +177,90 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
         Some(c) => c,
         None => return,
     };
-    // 取第一个 cpu 节点的 riscv,isa 属性
+    let mut enabled_harts = 0usize;
+    let mut first_isa_processed = false;
+    let mut common_cboz_block_size = None;
+    let mut zicboz_common = true;
     for cpu_node in cpus.children() {
-        if !cpu_node.base_name_bytes().starts_with(b"cpu") {
+        if cpu_node.base_name_bytes() != b"cpu" || !cpu_node_enabled(cpu_node) {
             continue;
         }
-        if let Some(isa_prop) = cpu_node.find_property("riscv,isa") {
-            let isa_bytes = isa_prop.value();
-            // riscv,isa 值是以 NUL 结尾的字符串
-            if contains_extension(isa_bytes, b"zicboz") {
-                HAS_ZICBOZ.store(true, Ordering::Release);
-                log::info!("[loader] ISA: Zicboz detected");
-            }
-            crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
-            // 检查 riscv,cboz-block-size（如果有）
-            if let Some(bs_prop) = cpu_node.find_property("riscv,cboz-block-size") {
-                let val = bs_prop.value();
-                if val.len() >= 4 {
-                    let bs = u32::from_be_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    if bs.is_power_of_two() && bs >= 16 {
-                        CBO_BLOCK_SIZE.store(bs, Ordering::Release);
-                    }
+        enabled_harts += 1;
+        if !first_isa_processed {
+            first_isa_processed = true;
+            if let Some(isa_prop) = cpu_node.find_property("riscv,isa") {
+                let isa_bytes = isa_prop.value();
+                if contains_extension(isa_bytes, b"sstc") {
+                    crate::riscv64::time::set_sstc_available(true);
+                    log::info!("[loader] ISA: Sstc detected; timer uses stimecmp");
                 }
+                crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
             }
-            break; // 只需检测一个 hart，假设所有 hart 同构
+        }
+
+        if !cpu_has_extension(cpu_node, b"zicboz") {
+            zicboz_common = false;
+            continue;
+        }
+        let Some(block_size) = cpu_node
+            .find_property("riscv,cboz-block-size")
+            .and_then(|property| read_be_u32_prop(property.value()))
+            .map(|value| value as usize)
+        else {
+            zicboz_common = false;
+            continue;
+        };
+        if !block_size.is_power_of_two() || block_size < 16 || block_size > allocator::PAGE_SIZE {
+            zicboz_common = false;
+            continue;
+        }
+        match common_cboz_block_size {
+            None => common_cboz_block_size = Some(block_size),
+            Some(expected) if expected == block_size => {}
+            Some(_) => zicboz_common = false,
         }
     }
+
+    if enabled_harts != 0 && zicboz_common {
+        if let Some(block_size) = common_cboz_block_size {
+            // 先发布尺寸，HAS_ZICBOZ 的 Release store 最后开放快路径。
+            CBO_BLOCK_SIZE.store(block_size, Ordering::Relaxed);
+            HAS_ZICBOZ.store(true, Ordering::Release);
+            log::info!(
+                "[loader] ISA: Zicboz detected on {} harts, block_size={}",
+                enabled_harts,
+                block_size
+            );
+        }
+    }
+}
+
+fn cpu_node_enabled(node: general::dtb::DtbNode<'_>) -> bool {
+    let Some(status) = node.find_property("status") else {
+        return true;
+    };
+    let value = status.value();
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(value.len());
+    matches!(&value[..end], b"okay" | b"ok")
+}
+
+fn cpu_has_extension(node: general::dtb::DtbNode<'_>, extension: &[u8]) -> bool {
+    if node
+        .find_property("riscv,isa-extensions")
+        .is_some_and(|property| {
+            property
+                .value()
+                .split(|&byte| byte == 0)
+                .any(|entry| entry.eq_ignore_ascii_case(extension))
+        })
+    {
+        return true;
+    }
+    node.find_property("riscv,isa")
+        .is_some_and(|property| contains_extension(property.value(), extension))
 }
 
 /// 检查 ISA 字符串中是否包含指定扩展名（不区分大小写）。
@@ -209,8 +277,144 @@ fn contains_extension(isa: &[u8], ext: &[u8]) -> bool {
     false
 }
 
+/// 读取 DTB 属性开头的大端 `u32`；不足 4 字节时返回 `None`。
 fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
+}
+
+fn read_cells(value: &[u8], cells: usize) -> Option<usize> {
+    if cells == 0 || cells > 2 || value.len() < cells * 4 {
+        return None;
+    }
+    let mut result = 0u64;
+    for chunk in value[..cells * 4].chunks_exact(4) {
+        result = (result << 32) | u32::from_be_bytes(chunk.try_into().ok()?) as u64;
+    }
+    usize::try_from(result).ok()
+}
+
+fn dtb_cstr(value: &[u8]) -> &[u8] {
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0 || byte == b':')
+        .unwrap_or(value.len());
+    &value[..end]
+}
+
+/// 返回 `/chosen/bootargs` 的稳定 DTB 快照，不包含末尾 NUL。
+fn command_line_from_dtb(dtb: &Dtb<'static>) -> Option<&'static [u8]> {
+    let value = dtb
+        .root()?
+        .find_child("chosen")?
+        .find_property("bootargs")?
+        .value();
+    let end = value
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(value.len());
+    (end != 0).then_some(&value[..end])
+}
+
+fn find_dtb_node_by_absolute_path<'a>(
+    dtb: &Dtb<'a>,
+    path: &[u8],
+) -> Option<(general::dtb::DtbNode<'a>, general::dtb::DtbNode<'a>, bool)> {
+    if path.first().copied() != Some(b'/') {
+        return None;
+    }
+
+    let root = dtb.root()?;
+    let mut parent = root;
+    let mut current = root;
+    let mut depth = 0usize;
+    for component in path[1..].split(|&byte| byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        parent = current;
+        current = current
+            .children()
+            .find(|child| child.name_bytes() == component)?;
+        depth += 1;
+    }
+    Some((parent, current, depth == 1))
+}
+
+fn dtb_compatible_contains(node: general::dtb::DtbNode<'_>, expected: &[u8]) -> bool {
+    node.find_property("compatible").is_some_and(|property| {
+        property
+            .value()
+            .split(|&byte| byte == 0)
+            .any(|value| value == expected)
+    })
+}
+
+/// 在完整 platform parser 接管前，仅解析 early console 所需的 stdout-path 与首个 reg。
+/// 对带非空 bus `ranges` 的复杂地址转换保持 QEMU fallback，避免在 arch 重复通用解析器。
+fn configure_early_console_from_dtb(dtb: &Dtb<'static>) {
+    let Some(root) = dtb.root() else {
+        return;
+    };
+    let Some(chosen) = root.find_child("chosen") else {
+        return;
+    };
+    let Some(stdout) = chosen.find_property("stdout-path") else {
+        return;
+    };
+
+    let mut path = dtb_cstr(stdout.value());
+    if path.first().copied() != Some(b'/') {
+        let Some(alias_name) = core::str::from_utf8(path).ok() else {
+            return;
+        };
+        let Some(aliases) = root.find_child("aliases") else {
+            return;
+        };
+        let Some(alias) = aliases.find_property(alias_name) else {
+            return;
+        };
+        path = dtb_cstr(alias.value());
+    }
+
+    let Some((parent, serial, parent_is_root)) = find_dtb_node_by_absolute_path(dtb, path) else {
+        return;
+    };
+    if !dtb_compatible_contains(serial, b"ns16550a")
+        && !dtb_compatible_contains(serial, b"ns16550")
+        && !dtb_compatible_contains(serial, b"uart16550")
+    {
+        log::warning!("[loader] DTB stdout is not NS16550-compatible; keeping QEMU fallback");
+        return;
+    }
+    // 根节点的 reg 已经是 CPU 物理地址；子总线只有空 ranges 才明确表示恒等映射。
+    // 缺失 ranges 表示地址不可向父总线转换，非空 ranges 则需要完整 cell 翻译。
+    if !parent_is_root
+        && !parent
+            .find_property("ranges")
+            .is_some_and(|ranges| ranges.value().is_empty())
+    {
+        log::warning!(
+            "[loader] early console bus needs address translation; keeping QEMU fallback"
+        );
+        return;
+    }
+
+    let address_cells = parent
+        .find_property("#address-cells")
+        .and_then(|prop| read_be_u32_prop(prop.value()))
+        .map(|value| value as usize)
+        .unwrap_or(2);
+    let Some(reg) = serial.find_property("reg") else {
+        return;
+    };
+    let Some(phys_base) = read_cells(reg.value(), address_cells) else {
+        return;
+    };
+    if early_console::configure_physical_base(phys_base) {
+        log::info!("[loader] early console relocated from DTB to {phys_base:#x}");
+    } else {
+        log::warning!("[loader] DTB stdout UART {phys_base:#x} is outside the early MMIO window");
+    }
 }
 
 /// 解析 RISC-V DTB 的 timebase-frequency，并启动周期性 S-mode timer。
@@ -248,12 +452,48 @@ fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
 
 /// allocator 扩展堆时调用，将虚拟地址映射到物理页。
 fn map_kernel_heap(vaddr: usize, paddr: usize, size: usize, policy: allocator::PagePolicy) -> bool {
-    heap_vm::map_kernel_heap_range(vaddr, paddr, size, policy).is_ok()
+    match heap_vm::map_kernel_heap_range(vaddr, paddr, size, policy) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!(
+                "[loader][heap_vm] map failed vaddr={:#x} paddr={:#x} size={:#x} policy={:?}: {:?}",
+                vaddr,
+                paddr,
+                size,
+                policy,
+                err
+            );
+            false
+        }
+    }
 }
 
 /// allocator 收缩堆时调用，解除虚拟地址映射。
 fn unmap_kernel_heap(vaddr: usize, size: usize) -> bool {
-    heap_vm::unmap_kernel_heap_range(vaddr, size).is_ok()
+    match heap_vm::unmap_kernel_heap_range(vaddr, size) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!(
+                "[loader][heap_vm] unmap failed vaddr={:#x} size={:#x}: {:?}",
+                vaddr,
+                size,
+                err
+            );
+            false
+        }
+    }
+}
+
+fn protect_kernel_heap(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool {
+    heap_vm::protect_kernel_heap_range(vaddr, size, read, write, execute).is_ok()
+}
+
+fn validate_kernel_heap(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool {
+    heap_vm::validate_kernel_heap_range(vaddr, size, read, write, execute).is_ok()
+}
+
+fn sync_icache() {
+    <crate::riscv64::task::Riscv64TaskOps as general::TaskOps>::sync_icache();
 }
 
 // ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -288,15 +528,24 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
         dtb_addr
     );
 
+    let sbi_info = sbi::init();
+    log::info!(
+        "[loader] SBI: base={} spec={:?} impl={:?}/{:?} srst={} hsm={} ipi={} rfence={}",
+        sbi_info.base_available,
+        sbi_info.spec_version,
+        sbi_info.implementation_id,
+        sbi_info.implementation_version,
+        sbi_info.srst_available,
+        sbi_info.hsm_available,
+        sbi_info.ipi_available,
+        sbi_info.rfence_available,
+    );
+
     // 初始化引导期分配器
     {
         allocator::KERNEL_ALLOCATOR.bind_address_translation(phys_to_virt, virt_to_phys);
 
-        HART_ID.store(hart_id, Ordering::Relaxed);
-        fn get_cpu_id() -> usize {
-            HART_ID.load(Ordering::Relaxed)
-        }
-        allocator::KERNEL_ALLOCATOR.bind_cpu_id(get_cpu_id);
+        allocator::KERNEL_ALLOCATOR.bind_cpu_id(current_cpu_id);
 
         unsafe extern "C" {
             fn sheap();
@@ -316,6 +565,13 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
     // 快照 DTB 到内核缓冲区
     let dtb = store_kernel_dtb(dtb_addr).unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
     log::info!("[loader] DTB: {} bytes", dtb.as_bytes().len());
+    log::info!(
+        "[loader] usable RAM handoff constrained to direct map {:#x}..{:#x}",
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_START,
+        heap_vm::KERNEL_DIRECT_MAP_PHYS_END
+    );
+
+    configure_early_console_from_dtb(&dtb);
 
     // 检测 ISA 扩展（Zicboz 等）
     detect_isa_extensions(&dtb);
@@ -340,12 +596,12 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 architecture: StartArchitecture::new("riscv64"),
                 protocol: StartBootProtocol::Direct,
                 boot_cpu_id: hart_id,
-                command_line: None,
+                command_line: command_line_from_dtb(&dtb),
             },
             firmware: StartFirmware::Dtb(dtb),
             memory: StartMemory {
                 kernel_image: kernel_phys,
-                boot_map: StartMemoryMap::None,
+                boot_map: StartMemoryMap::Regions(&RISCV_BOOT_MEMORY_MAP),
             },
             address: StartAddressOps {
                 phys_to_virt,
@@ -354,8 +610,12 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
             },
             allocator: Some(StartAllocatorOps {
                 kernel_heap_region: heap_vm::kernel_heap_region,
+                tracked_heap_region: heap_vm::tracked_heap_region,
                 map_kernel_heap_range: map_kernel_heap,
                 unmap_kernel_heap_range: unmap_kernel_heap,
+                protect_kernel_heap_range: protect_kernel_heap,
+                validate_kernel_heap_range: validate_kernel_heap,
+                sync_icache,
                 init_kernel_page_table: heap_vm::init_kernel_page_table,
             }),
         };

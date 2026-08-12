@@ -5,7 +5,7 @@
 //! 读 a7 / a0-a5、写返回值、推 PC——arch 零业务逻辑。
 
 use general::TrapFramePtr;
-use general::syscall::SyscallFrameOps;
+use general::syscall::{NativeCallFrame, NativeCallReturn, SyscallFrameOps};
 
 use crate::riscv64::specific::TrapFrame;
 
@@ -39,6 +39,32 @@ fn set_sys_ret(tf: TrapFramePtr, ret: isize) {
     unsafe { trap_frame_mut(tf).a0 = ret as usize };
 }
 
+fn native_call(tf: TrapFramePtr) -> NativeCallFrame {
+    // 安全性：契约。
+    let f = unsafe { trap_frame(tf) };
+    NativeCallFrame {
+        slot: f.a7 as u64,
+        object_handle: f.a6 as u64,
+        args: [
+            f.a0 as u64,
+            f.a1 as u64,
+            f.a2 as u64,
+            f.a3 as u64,
+            f.a4 as u64,
+        ],
+        reserved_arg: f.a5 as u64,
+    }
+}
+
+fn set_native_ret(tf: TrapFramePtr, ret: NativeCallReturn) {
+    let ret = ret.canonicalized();
+    // 安全性：契约；同一 trap 不会并发进入。
+    let f = unsafe { trap_frame_mut(tf) };
+    f.a0 = ret.status as usize;
+    f.a1 = ret.value0 as usize;
+    f.a2 = ret.value1 as usize;
+}
+
 fn advance_pc(tf: TrapFramePtr) {
     // 安全性：契约。
     let f = unsafe { trap_frame_mut(tf) };
@@ -49,5 +75,7 @@ pub(super) static SYSCALL_FRAME_OPS: SyscallFrameOps = SyscallFrameOps {
     sys_nr,
     sys_args,
     set_sys_ret,
+    native_call,
+    set_native_ret,
     advance_pc,
 };

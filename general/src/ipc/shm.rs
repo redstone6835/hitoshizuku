@@ -376,7 +376,9 @@ pub struct ShmManager {
     state: Arc<Mutex<ShmState>>,
 }
 
+#[kernel_symbols::export]
 impl ShmManager {
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.new", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn new(limits: ShmLimits) -> Self {
         Self {
             limits,
@@ -384,11 +386,13 @@ impl ShmManager {
         }
     }
 
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.limits", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC)]
     pub fn limits(&self) -> ShmLimits {
         self.limits
     }
 
     /// SysV `shmget` 语义：`IPC_PRIVATE` 总是创建新段；普通 key 可查找或创建。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.shmget", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn shmget(
         &self,
         key: ShmKey,
@@ -420,6 +424,7 @@ impl ShmManager {
     }
 
     /// 创建一个不进入 key 表的私有段。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.create_private", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn create_private(
         &self,
         size: u64,
@@ -435,6 +440,7 @@ impl ShmManager {
     /// 真正的 attach 计数由 VM 在 VMA 成功插入后通过 [`FileLike::on_mapped`]
     /// 提交；如果在 syscall 层提前增加，`map_file` 失败或 `fork` 复制时都会让
     /// `shm_nattch` 偏离真实地址空间状态。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.attach", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED)]
     pub fn attach(
         &self,
         id: ShmId,
@@ -455,6 +461,7 @@ impl ShmManager {
 
     /// 手工释放一次 attach。正常 VM 路径不应调用它；`munmap`、`shmdt`、fork 和
     /// 进程退出都通过 FileLike hook 自动同步计数。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.detach", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn detach(&self, id: ShmId) -> Result<(), Errno> {
         let remove_now = {
             let mut state = self.state.lock();
@@ -505,6 +512,7 @@ impl ShmManager {
         }
     }
 
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.stat", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC)]
     pub fn stat(&self, id: ShmId, cred: &Credentials) -> Result<ShmMetadata, Errno> {
         let state = self.state.lock();
         let entry = state.by_id.get(&id).ok_or(Errno::EINVAL)?;
@@ -514,6 +522,7 @@ impl ShmManager {
         Ok(metadata_from_entry(id, entry))
     }
 
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.set", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn set(
         &self,
         id: ShmId,
@@ -536,6 +545,7 @@ impl ShmManager {
     }
 
     /// `IPC_RMID`：先从 key 表摘除；有 attach 时延迟到最后一次 detach 再释放。
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.remove", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
     pub fn remove(&self, id: ShmId, cred: &Credentials) -> Result<(), Errno> {
         let mut state = self.state.lock();
         let (key, remove_now) = {
@@ -555,6 +565,7 @@ impl ShmManager {
         Ok(())
     }
 
+    #[kernel_symbols::export(name = "general.ipc.ShmManager.info", contract = "kernel.ipc.sysv-shm@1", version = 1, capabilities = kernel_symbols::capability::IPC, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
     pub fn info(&self) -> ShmSystemInfo {
         let state = self.state.lock();
         ShmSystemInfo {

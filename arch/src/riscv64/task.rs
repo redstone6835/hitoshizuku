@@ -3,7 +3,7 @@
 //! 本模块实现 [`general::TaskOps`] trait，提供：
 //!
 //! - trap frame 字段的读写（pc / sp / status / args）；
-//! - `sscratch` 管理（用户态 trap 时恢复内核栈）；
+//! - `sscratch`/per-hart TrapAnchor 管理（用户态 trap 时恢复内核栈）；
 //! - [`__riscv64_resume_to_trap_frame`]：设 sepc/sstatus/satp，恢复通用寄存器后 sret；
 //! - 内核任务 / 用户任务 / idle 任务入口桩。
 
@@ -11,9 +11,14 @@ use general::{TaskOps, TrapFramePtr};
 
 use crate::riscv64::specific::{
     CSR_FCSR, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, EXC_ECALL_S, EXC_ECALL_U, FRAME_SIZE,
-    SSTATUS_FS_DIRTY, SSTATUS_FS_MASK, SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SPP, TrapFrame,
+    SSTATUS_FS_CLEAN, SSTATUS_FS_INITIAL, SSTATUS_FS_MASK, SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SPP,
+    SSTATUS_USER_RESTORE_MASK, SSTATUS_USER_RETURN_BASE, SSTATUS_UXL_64, SSTATUS_VS_MASK,
+    TrapFrame,
 };
 use core::arch::naked_asm;
+
+/// satp 中除 ASID[59:44] 外用于标识地址空间根的 MODE + PPN 位。
+const SATP_ADDRESS_SPACE_MASK: usize = !(0xffffusize << 44);
 
 // ── TaskOps impl ────────────────────────────────────────────────────────────────
 
@@ -58,9 +63,10 @@ impl TaskOps for Riscv64TaskOps {
         core::mem::align_of::<TrapFrame>()
     }
 
-    fn set_kernel_trap_stack(_stack_top: usize) {
-        // RISC-V trap entry 依赖 sscratch=0 表示当前在 S-mode；
-        // 返回 U-mode 时 resume_to_trap_frame 会写入用户 trap 栈顶。
+    fn set_kernel_trap_stack(stack_top: usize) {
+        unsafe { crate::riscv64::specific::set_current_kernel_stack_top(stack_top) };
+        // RISC-V trap entry 依赖 sscratch=0 表示普通 S-mode；
+        // 返回 U-mode 时 resume_to_trap_frame 会发布当前 HartLocal TrapAnchor。
         write_csr!(sscratch, 0);
     }
 
@@ -90,9 +96,11 @@ impl TaskOps for Riscv64TaskOps {
         tf.sepc = entry_pc;
         tf.sp = user_sp;
         tf.a0 = arg0;
-        // HACK: OpenSBI/QEMU 当前没有把 illegal instruction 委托给 S-mode；
-        // 用户态浮点指令不能依赖 illegal trap 做 lazy enable。
-        tf.status = SSTATUS_SPIE | SSTATUS_SIE | SSTATUS_FS_DIRTY;
+        // 新任务以 FS=Off 启动。绝大多数 syscall 密集程序并不执行浮点指令，避免
+        // 首次返回用户态无条件加载 32 个零寄存器，并让它们从此进入 FPU-active
+        // 保存/恢复路径。首次真实 F/D 指令由 illegal-instruction handler 清零并
+        // 按需启用；QEMU/OpenSBI 的 S-mode domain 会委托 illegal instruction。
+        tf.status = SSTATUS_SPIE | SSTATUS_UXL_64;
         // 初始化时使用当前内核页表。exec 系统调用时会被替换为目标进程的用户页表。
         let satp_val: usize = read_csr!(satp);
         tf.satp = satp_val;
@@ -115,13 +123,11 @@ impl TaskOps for Riscv64TaskOps {
         if tf.cause != EXC_ECALL_U && tf.cause != EXC_ECALL_S {
             return None;
         }
-        let pc = tf.sepc.checked_sub(4)?;
 
-        // RISC-V C 扩展允许 32 位指令只按 2 字节对齐；确认回退位置确实是 ecall，
-        // 避免把 ucontext PC 暴露到上一条 32 位指令的后半。
-        let mut insn = [0u8; 4];
-        general::mm::copy_from_user(pc, &mut insn).ok()?;
-        (u32::from_le_bytes(insn) == 0x0000_0073).then_some(pc)
+        // cause 由本次硬件 trap/快速入口覆盖，明确表示当前指令就是固定 4-byte
+        // ecall；不必在 signal 热路径再次打开 MXR+SUM 并读取用户页。即使其它线程
+        // 在 syscall 期间改写该页面，取消语义仍应指向实际触发本次 trap 的 PC。
+        tf.sepc.checked_sub(4)
     }
 
     fn init_user_entry() -> unsafe extern "C" fn() -> ! {
@@ -140,53 +146,7 @@ impl TaskOps for Riscv64TaskOps {
         unsafe {
             core::arch::asm!("fence.i", options(nostack, preserves_flags));
         }
-    }
-}
-
-impl Default for TrapFrame {
-    fn default() -> Self {
-        Self {
-            ra: 0,
-            tp: 0,
-            sp: 0,
-            gp: 0,
-            t0: 0,
-            t1: 0,
-            t2: 0,
-            s0: 0,
-            s1: 0,
-            a0: 0,
-            a1: 0,
-            a2: 0,
-            a3: 0,
-            a4: 0,
-            a5: 0,
-            a6: 0,
-            a7: 0,
-            s2: 0,
-            s3: 0,
-            s4: 0,
-            s5: 0,
-            s6: 0,
-            s7: 0,
-            s8: 0,
-            s9: 0,
-            s10: 0,
-            s11: 0,
-            t3: 0,
-            t4: 0,
-            t5: 0,
-            t6: 0,
-            sepc: 0,
-            status: 0,
-            cause: 0,
-            tval: 0,
-            satp: 0,
-            kstack_top: 0,
-            f: [0; 32],
-            fcsr: 0,
-            _pad: 0,
-        }
+        crate::riscv64::smp::sync_icache_remote();
     }
 }
 
@@ -203,52 +163,85 @@ impl Default for TrapFrame {
 /// # 流程
 ///
 /// 1. 写 sepc / sstatus（清 SIE 防恢复期间中断）
-/// 2. 判断 SPP：若返回用户态，切换 satp 并设置 sscratch
+/// 2. 根据可信 `kstack_top` 区分 U/S 返回；U-mode 返回时切换 satp
 /// 3. 条件恢复 FPU（检查 FS 字段）
 /// 4. 恢复通用寄存器
-/// 5. sret
+/// 5. 在最终窗口发布 sscratch 并 sret
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
     naked_asm!(
+        // 调用方可能在 SIE 开启时进入恢复桩。必须先关闭本地中断，再标记脆弱
+        // 恢复窗口；否则 timer interrupt 会被 trap 入口误判为嵌套 fault。
+        "csrci {sstatus}, 2",
         "mv s11, a0",
+        "li t0, 1",
+        "sd t0, {hart_entry_state_off}(tp)",
 
         // 写 sepc
         "ld t0, {sepc_off}(s11)",
+        // 清除可能由被打断上下文留下的 LR reservation；若 SC 意外成功，写回的
+        // 仍是原 sepc 值，因此 TrapFrame 内容保持不变。
+        "addi t1, s11, {sepc_off}",
+        ".option push",
+        ".option arch, +zalrsc",
+        "sc.d zero, t0, (t1)",
+        ".option pop",
         "csrw {sepc}, t0",
 
-        // 写 sstatus（清 SIE bit 防止恢复期间被中断）
+        // kstack_top 是由 arch trap 入口或内核上下文构造代码写入的可信返回类型标记：
+        // 非零表示 U-mode，零表示 S-mode。不能再用用户可修改的 status.SPP 判定。
+        "ld t2, {kstack_top_off}(s11)",
+        "beqz t2, 1f",
+        // 发布到当前 per-hart anchor；覆盖初次 enter_user_mode 或任务切换中尚未
+        // 调用 set_kernel_trap_stack 的情况。
+        "sd t2, {hart_kstack_off}(tp)",
+
+        // return-to-user：只恢复用户拥有的 FS/VS，强制 SPP/SIE/SUM/MXR=0、
+        // SPIE=1、UXL=64。
         "ld t0, {status_off}(s11)",
+        "li t1, {user_status_keep}",
+        "and t0, t0, t1",
+        "li t1, {user_status_base}",
+        "or t0, t0, t1",
+        "csrw {sstatus}, t0",
+
+        // TrapFrame 可能跨 ASID generation 休眠。只比较 MODE+PPN：地址空间根
+        // 相同时保留 activate() 已安装的新 ASID，并回写 frame，不能让旧 frame
+        // 把回卷前的 ASID 写回硬件。
+        "ld t2, {satp_off}(s11)",
+        "csrr t3, {satp}",
+        // 绝大多数 trap 返回仍在同一 ASID：先走精确相等分支，避免常见路径的
+        // xor/mask 和 frame 回写。只有 ASID generation 变化时才比较 MODE+PPN。
+        "beq t2, t3, 9f",
+        "xor t4, t2, t3",
+        "li t5, {satp_address_space_mask}",
+        "and t4, t4, t5",
+        "beqz t4, 8f",
+        "csrw {satp}, t2",
+        "sfence.vma",
+        "j 9f",
+        "8:",
+        "sd t3, {satp_off}(s11)",
+        "9:",
+
+        // Vector helper 只在用户 VS active 时调用，避免普通 syscall 的函数调用开销。
+        "ld t0, {status_off}(s11)",
+        "li t1, {vs_mask}",
+        "and t1, t0, t1",
+        "beqz t1, 2f",
+        "mv a0, s11",
+        "call {restore_vector}",
+        "j 2f",
+
+        // return-to-kernel：强制 SPP=1，并清 SIE 防止恢复期间被中断。
+        "1:",
+        "ld t0, {status_off}(s11)",
+        "ori t0, t0, {spp}",
         "andi t0, t0, -3",
         "csrw {sstatus}, t0",
 
-        // 判断 SPP：返回 user 还是 kernel
-        "andi t1, t0, {spp}",
-        "bnez t1, 1f",
-
-        // return-to-user：目标 satp 已经生效时跳过写 CSR 和全局 sfence.vma。
-        // 同一进程的 pthread/futex 热路径会频繁在相同地址空间内往返，重复刷新
-        // TLB 会把短线程 benchmark 放大成页表切换开销。
-        "ld t2, {satp_off}(s11)",
-        "csrr t3, {satp}",
-        "beq t2, t3, 4f",
-        "csrw {satp}, t2",
-        "sfence.vma",
-        "4:",
-        "ld t0, {kstack_top_off}(s11)",
-        "beqz t0, 2f",
-        "csrw {sscratch}, t0",
-        "j 2f",
-
-        // return-to-kernel：确保 sscratch=0（from_kernel 路径依赖此约定）
-        "1:",
-        "csrw {sscratch}, x0",
-
-        // Vector 恢复（只在用户态 V active 时真正执行）
         "2:",
-        "mv a0, s11",
-        "call {restore_vector}",
-
         // FPU 恢复（检查 sstatus.FS != Off）
         "ld t0, {status_off}(s11)",
         "li t1, {fs_mask}",
@@ -276,11 +269,22 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "fld f28, {f_off}+224(s11)", "fld f29, {f_off}+232(s11)",
         "fld f30, {f_off}+240(s11)", "fld f31, {f_off}+248(s11)",
 
+        // 恢复指令会把硬件 FS 标成 Dirty。Initial 用于首次从临时 frame 进入用户态，
+        // 保持 Dirty 以确保第一次 trap 把状态写入任务固定 frame；其余已落盘状态
+        // 改回 Clean，使用户未执行浮点指令时下一次 trap 可以跳过 32 次 fsd。
+        "ld t0, {status_off}(s11)",
+        "li t1, {fs_mask}",
+        "and t0, t0, t1",
+        "li t1, {fs_initial}",
+        "beq t0, t1, 3f",
+        "li t0, {fs_mask}",
+        "csrc {sstatus}, t0",
+        "li t0, {fs_clean}",
+        "csrs {sstatus}, t0",
+
         // 通用寄存器恢复
         "3:",
         "ld ra, {ra_off}(s11)",
-        "ld tp, {tp_off}(s11)",
-        "ld gp, {gp_off}(s11)",
         "ld t0, {t0_off}(s11)",
         "ld t1, {t1_off}(s11)",
         "ld t2, {t2_off}(s11)",
@@ -307,6 +311,31 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "ld t4, {t4_off}(s11)",
         "ld t5, {t5_off}(s11)",
         "ld t6, {t6_off}(s11)",
+
+        // 到最终不可调用窗口才发布 sscratch。U-mode frame 以非零 kstack_top
+        // 作为类型标记，但实际发布当前内核 tp（per-hart TrapAnchor）；被打断的
+        // return-to-user kernel frame 则从 satp 字段恢复原 anchor 指针。
+        //
+        // 普通内核态帧保存的是陷入时 hart 的内核 tp。陷阱处理流程可能触发调度
+        // 并让任务迁移，返回时必须保留当前 hart 的 tp，不能恢复已经过期的 HartLocal。
+        "ld sp, {kstack_top_off}(s11)",
+        "beqz sp, 7f",
+        "csrw {sscratch}, tp",
+        "sd zero, {hart_entry_state_off}(tp)",
+        "ld tp, {tp_off}(s11)",
+        "j 6f",
+        "7:",
+        "ld sp, {satp_off}(s11)",
+        "beqz sp, 5f",
+        "csrw {sscratch}, sp",
+        "sd zero, {hart_entry_state_off}(tp)",
+        "ld tp, {tp_off}(s11)",
+        "j 6f",
+        "5:",
+        "csrw {sscratch}, x0",
+        "sd zero, {hart_entry_state_off}(tp)",
+        "6:",
+        "ld gp, {gp_off}(s11)",
         "ld sp, {sp_off}(s11)",
         "ld s11, {s11_off}(s11)",
 
@@ -356,7 +385,56 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         restore_vector = sym crate::riscv64::vector::restore_vector_from_resume,
         spp = const SSTATUS_SPP,
         fs_mask = const SSTATUS_FS_MASK,
+        fs_initial = const SSTATUS_FS_INITIAL,
+        fs_clean = const SSTATUS_FS_CLEAN,
+        vs_mask = const SSTATUS_VS_MASK,
+        user_status_keep = const SSTATUS_USER_RESTORE_MASK,
+        user_status_base = const SSTATUS_USER_RETURN_BASE,
+        hart_kstack_off = const crate::riscv64::specific::HART_LOCAL_KERNEL_STACK_TOP_OFF,
+        hart_entry_state_off = const crate::riscv64::specific::HART_LOCAL_TRAP_ENTRY_STATE_OFF,
         satp_off = const crate::riscv64::specific::SATP_OFFSET,
+        satp_address_space_mask = const SATP_ADDRESS_SPACE_MASK,
+    );
+}
+
+/// syscall 最小返回路径使用的 FPU 恢复桩。
+///
+/// 入口 a0 指向 FS=Clean 的用户 TrapFrame。fast return 检测到 syscall 内发生过
+/// context switch，或硬件 FS 不再为 Clean 时，才调用这里恢复当前任务的可信副本。
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __riscv64_restore_clean_fpu_for_fast_return(_tf_ptr: usize) {
+    naked_asm!(
+        ".option arch, +d",
+        "ld t0, {fcsr_off}(a0)",
+        "csrw {fcsr}, t0",
+        "fld f0, {f_off}(a0)",     "fld f1, {f_off}+8(a0)",
+        "fld f2, {f_off}+16(a0)",   "fld f3, {f_off}+24(a0)",
+        "fld f4, {f_off}+32(a0)",   "fld f5, {f_off}+40(a0)",
+        "fld f6, {f_off}+48(a0)",   "fld f7, {f_off}+56(a0)",
+        "fld f8, {f_off}+64(a0)",   "fld f9, {f_off}+72(a0)",
+        "fld f10, {f_off}+80(a0)",  "fld f11, {f_off}+88(a0)",
+        "fld f12, {f_off}+96(a0)",  "fld f13, {f_off}+104(a0)",
+        "fld f14, {f_off}+112(a0)", "fld f15, {f_off}+120(a0)",
+        "fld f16, {f_off}+128(a0)", "fld f17, {f_off}+136(a0)",
+        "fld f18, {f_off}+144(a0)", "fld f19, {f_off}+152(a0)",
+        "fld f20, {f_off}+160(a0)", "fld f21, {f_off}+168(a0)",
+        "fld f22, {f_off}+176(a0)", "fld f23, {f_off}+184(a0)",
+        "fld f24, {f_off}+192(a0)", "fld f25, {f_off}+200(a0)",
+        "fld f26, {f_off}+208(a0)", "fld f27, {f_off}+216(a0)",
+        "fld f28, {f_off}+224(a0)", "fld f29, {f_off}+232(a0)",
+        "fld f30, {f_off}+240(a0)", "fld f31, {f_off}+248(a0)",
+        "li t0, {fs_mask}",
+        "csrc {sstatus}, t0",
+        "li t0, {fs_clean}",
+        "csrs {sstatus}, t0",
+        "ret",
+        fcsr = const CSR_FCSR,
+        fcsr_off = const crate::riscv64::specific::FCSR_OFFSET,
+        f_off = const crate::riscv64::specific::F_OFFSET,
+        fs_mask = const SSTATUS_FS_MASK,
+        fs_clean = const SSTATUS_FS_CLEAN,
+        sstatus = const CSR_SSTATUS,
     );
 }
 

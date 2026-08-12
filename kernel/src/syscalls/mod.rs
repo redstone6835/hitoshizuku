@@ -14,6 +14,12 @@ mod process;
 mod signal;
 mod syslog;
 
+#[cfg(feature = "kernel-tests")]
+pub(crate) use process::fdtable_has_other_live_owner_in;
+pub(crate) use process::{
+    ExecCleanupScratch, cleanup_task_for_exec, try_fdtable_has_other_live_owner,
+};
+
 use alloc::sync::Arc;
 use general::syscall::register_syscall;
 use sched::Task;
@@ -35,9 +41,13 @@ pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
         (SchedCapability::DacReadSearch, VfsCapability::DacReadSearch),
         (SchedCapability::Fowner, VfsCapability::FOwner),
         (SchedCapability::Fsetid, VfsCapability::FSetId),
+        (
+            SchedCapability::NetBindService,
+            VfsCapability::NetBindService,
+        ),
         (SchedCapability::SysAdmin, VfsCapability::SysAdmin),
         (SchedCapability::SysBoot, VfsCapability::SysAdmin),
-        (SchedCapability::SysResource, VfsCapability::SysAdmin),
+        (SchedCapability::SysResource, VfsCapability::SysResource),
     ] {
         if src.has_cap(sched_cap) {
             caps = caps.with(vfs_cap);
@@ -290,6 +300,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_RT_TGSIGQUEUEINFO, process::sys_rt_tgsigqueueinfo);
     register_syscall(nr::SYS_SCHED_SETATTR, process::sys_sched_setattr);
     register_syscall(nr::SYS_SCHED_GETATTR, process::sys_sched_getattr);
+    register_syscall(nr::SYS_ELM_CTL, crate::elm::syscall::sys_elm_ctl);
     register_syscall(nr::SYS_MYGO_SCHED_INFO, process::sys_mygo_sched_info);
     register_syscall(nr::SYS_MEMBARRIER, process::sys_membarrier);
     register_syscall(nr::SYS_FUTEX, process::sys_futex);

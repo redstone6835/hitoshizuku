@@ -6,14 +6,93 @@
 
 extern crate std;
 
-use crate::signal::{SigSet, SignalNumber};
+use crate::ids::Uid;
+use crate::operation::take_next_pending_signal;
+use crate::signal::{
+    SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
+    SignalNumber, SignalState,
+};
 use ktest::ktest;
+
+#[ktest]
+fn sparse_pending_bits_only_yield_set_signals() {
+    let mut pending =
+        SignalNumber::SIGUSR2.bit() | SignalNumber::SIGKILL.bit() | SignalNumber::SIGTERM.bit();
+
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGKILL)
+    );
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGUSR2)
+    );
+    assert_eq!(
+        take_next_pending_signal(&mut pending),
+        Some(SignalNumber::SIGTERM)
+    );
+    assert_eq!(take_next_pending_signal(&mut pending), None);
+}
 
 /// 空集不包含任何信号。
 #[ktest]
 fn sigset_empty() {
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGKILL));
     assert!(!SigSet::EMPTY.has(SignalNumber::SIGTERM));
+}
+
+#[ktest]
+fn pending_bit_tracks_last_queued_signal() {
+    let state = SignalState::new();
+    let info = SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    };
+
+    state.deliver(info);
+    state.deliver(info);
+    assert!(state.has_any_pending());
+    assert!(state.dequeue_one().is_some());
+    assert!(state.has_any_pending());
+    assert!(state.dequeue_one().is_some());
+    assert!(!state.has_any_pending());
+}
+
+/// CLONE_CLEAR_SIGHAND 只重置已捕获的 handler，SIG_IGN 在子进程中保持。
+#[ktest]
+fn clear_sighand_copy_resets_handlers_but_keeps_ignored_signals() {
+    let parent = SharedSignal::new();
+    let caught = SigAction {
+        handler: SigHandler::Handler(0x1234),
+        mask: SigSet::EMPTY.with(SignalNumber::SIGTERM),
+        flags: SigActionFlags(SigActionFlags::SA_RESTART),
+        restorer: 0x5678,
+    };
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        mask: SigSet::EMPTY,
+        flags: SigActionFlags(0),
+        restorer: 0,
+    };
+    parent.set_action(SignalNumber::SIGUSR1, caught);
+    parent.set_action(SignalNumber::SIGUSR2, ignored);
+
+    let child = parent.fork_copy_clearing_handlers();
+    let child_caught = child.get_action(SignalNumber::SIGUSR1);
+    let child_ignored = child.get_action(SignalNumber::SIGUSR2);
+
+    assert!(matches!(child_caught.handler, SigHandler::Default));
+    assert_eq!(child_caught.mask, SigSet::EMPTY);
+    assert_eq!(child_caught.flags, SigActionFlags(0));
+    assert_eq!(child_caught.restorer, 0);
+    assert!(matches!(child_ignored.handler, SigHandler::Ignore));
+    assert!(matches!(
+        parent.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234)
+    ));
 }
 
 /// with 添加信号后 has 返回 true。
@@ -62,6 +141,64 @@ fn sigset_raw_roundtrip() {
     assert_eq!(s.raw(), 0xdead_beef);
 }
 
+/// sigsuspend 的旧 mask 只交给首个 handler frame，不能被嵌套投递重复消费。
+#[ktest]
+fn sigsuspend_saved_mask_is_consumed_once() {
+    let state = SignalState::new();
+    let original = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    let temporary = SigSet::EMPTY.with(SignalNumber::SIGUSR2);
+    state.block(original, SigProcMaskHow::SetMask);
+
+    state.save_blocked(temporary);
+
+    assert_eq!(state.blocked_snapshot(), temporary);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), Some(original));
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
+}
+
+/// 未建立 handler frame 时显式恢复会同时清除待消费标记。
+#[ktest]
+fn sigsuspend_explicit_restore_clears_saved_mask() {
+    let state = SignalState::new();
+    let original = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    state.block(original, SigProcMaskHow::SetMask);
+    state.save_blocked(SigSet::EMPTY);
+
+    state.restore_blocked();
+
+    assert_eq!(state.blocked_snapshot(), original);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
+}
+
+/// Native exec 丢弃 Tomori 的线程级屏蔽/等待状态，但保留已经 pending 的信号。
+#[ktest]
+fn native_exec_reset_clears_masks_and_keeps_pending() {
+    let state = SignalState::new();
+    let pending = SignalNumber::SIGUSR1;
+    state.block(SigSet::EMPTY.with(pending), SigProcMaskHow::SetMask);
+    state.save_blocked(SigSet::EMPTY.with(SignalNumber::SIGUSR2));
+    state.begin_sigtimedwait(SigSet::EMPTY.with(SignalNumber::SIGTERM));
+    state.deliver(SigInfo {
+        sig: pending,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    state.reset_for_native_exec();
+
+    assert_eq!(state.blocked_snapshot(), SigSet::EMPTY);
+    assert_eq!(state.take_sigsuspend_saved_blocked(), None);
+    assert!(!state.sigtimedwait_wants(SignalNumber::SIGTERM));
+    assert!(state.pending_snapshot().has(pending));
+
+    // saved_blocked 也必须归零，遗留的清理调用不能恢复旧 Tomori mask。
+    state.restore_blocked();
+    assert_eq!(state.blocked_snapshot(), SigSet::EMPTY);
+    assert_eq!(state.dequeue_one().map(|info| info.sig), Some(pending));
+}
+
 /// 信号编号 1..=64 为合法，构造成功。
 #[ktest]
 fn signal_number_from_raw_valid() {
@@ -89,4 +226,141 @@ fn signal_number_bit() {
 #[ktest]
 fn signal_number_as_usize() {
     assert_eq!(SignalNumber::SIGKILL.as_usize(), 9);
+}
+
+/// CLONE_CLEAR_SIGHAND 的信号表副本清除用户处理函数，但保留 SIG_IGN。
+#[ktest]
+fn clear_sighand_copy_resets_handlers_and_keeps_ignored_actions() {
+    let source = SharedSignal::new();
+    source.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            mask: SigSet::EMPTY.with(SignalNumber::SIGTERM),
+            flags: SigActionFlags(SigActionFlags::SA_RESTART),
+            restorer: 0x5678,
+        },
+    );
+    source.set_action(
+        SignalNumber::SIGUSR2,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+
+    let copied = source.fork_copy_clearing_handlers();
+
+    assert_eq!(
+        copied.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Default
+    );
+    assert_eq!(
+        copied.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+    assert_eq!(
+        source.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234)
+    );
+}
+
+/// CLONE_SIGHAND 共享处理表，但不能共享线程组 pending 队列。
+#[ktest]
+fn clone_sighand_shares_actions_without_sharing_pending() {
+    let parent = SharedSignal::new();
+    let child = parent.clone_sighand();
+    let ignored = SigAction {
+        handler: SigHandler::Ignore,
+        flags: SigActionFlags(0),
+        mask: SigSet::EMPTY,
+        restorer: 0,
+    };
+
+    child.set_action(SignalNumber::SIGUSR2, ignored);
+    assert_eq!(
+        parent.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+
+    parent.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR2,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+    assert!(parent.pending_snapshot().has(SignalNumber::SIGUSR2));
+    assert!(!child.pending_snapshot().has(SignalNumber::SIGUSR2));
+}
+
+/// exec 必须脱离 CLONE_SIGHAND 共享表，同时保留当前线程组的 pending 队列。
+#[ktest]
+fn prepared_exec_actions_detach_shared_sighand_without_moving_pending() {
+    let process = SharedSignal::new();
+    let sharing_process = process.clone_sighand();
+    process.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Handler(0x1234),
+            ..SigAction::default_new()
+        },
+    );
+    process.set_action(
+        SignalNumber::SIGUSR2,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+    process.deliver(SigInfo {
+        sig: SignalNumber::SIGTERM,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid(0),
+        raw: None,
+    });
+
+    let prepared = process.prepare_actions_for_exec();
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234),
+        "prepare 不得提前改变旧 disposition"
+    );
+    process.install_actions_for_exec(&prepared);
+
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Default
+    );
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR2).handler,
+        SigHandler::Ignore
+    );
+    assert_eq!(
+        sharing_process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Handler(0x1234),
+        "exec 不得重置另一个 CLONE_SIGHAND 线程组"
+    );
+    assert!(process.pending_snapshot().has(SignalNumber::SIGTERM));
+}
+
+/// exec prepare 后的 sigaction 修改必须使安装失败，不能覆盖新动作。
+#[ktest]
+fn prepared_exec_actions_reject_stale_disposition_generation() {
+    let process = SharedSignal::new();
+    let prepared = process.prepare_actions_for_exec();
+    process.set_action(
+        SignalNumber::SIGUSR1,
+        SigAction {
+            handler: SigHandler::Ignore,
+            ..SigAction::default_new()
+        },
+    );
+
+    assert!(!process.install_actions_for_exec(&prepared));
+    assert_eq!(
+        process.get_action(SignalNumber::SIGUSR1).handler,
+        SigHandler::Ignore
+    );
 }

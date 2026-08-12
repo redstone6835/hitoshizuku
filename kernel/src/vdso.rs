@@ -1,7 +1,7 @@
 //! vDSO 共享数据页与时间语义。
 
 use core::mem::size_of;
-use core::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, fence};
 
 use errno::Errno;
 use general::dev::pnp::RealtimeClockSource;
@@ -43,6 +43,7 @@ const _: () = {
 static DATA_PAGE_PADDR: AtomicUsize = AtomicUsize::new(0);
 static DATA_PAGE_KVA: AtomicUsize = AtomicUsize::new(0);
 static INIT_LOCK: Spinlock<()> = Spinlock::new(());
+static DATA_WRITE_BUSY: AtomicBool = AtomicBool::new(false);
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 static REALTIME_SOURCE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -59,9 +60,7 @@ pub fn set_realtime_ns(realtime_ns: u64) {
     let offset = (realtime_ns as i128).saturating_sub(now_ns as i128);
     let offset = offset.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
-    if let Some(data) = data_ptr() {
-        write_data(data, now_ns);
-    }
+    try_write_data(now_ns);
 }
 
 pub fn install_realtime_source(source: RealtimeClockSource) -> bool {
@@ -123,8 +122,8 @@ pub fn shared_data_page_paddr() -> Result<usize, Errno> {
 }
 
 pub fn update_on_timer_tick(now_ns: u64) {
-    if let Some(data) = data_ptr() {
-        write_data(data, now_ns);
+    if sched::current_cpu_id() == 0 {
+        try_write_data(now_ns);
     }
 }
 
@@ -143,9 +142,7 @@ fn ensure_data_page() -> Result<usize, Errno> {
     let (paddr, kva) = alloc_zeroed_page()?;
     DATA_PAGE_KVA.store(kva, Ordering::Release);
     DATA_PAGE_PADDR.store(paddr, Ordering::Release);
-    if let Some(data) = data_ptr() {
-        write_data(data, monotonic_ns());
-    }
+    try_write_data(monotonic_ns());
     Ok(paddr)
 }
 
@@ -166,13 +163,18 @@ fn alloc_zeroed_page() -> Result<(usize, usize), Errno> {
     Ok((paddr, kva))
 }
 
-fn data_ptr() -> Option<&'static mut VdsoData> {
-    let kva = DATA_PAGE_KVA.load(Ordering::Acquire);
-    if kva == 0 {
-        None
-    } else {
-        Some(unsafe { &mut *(kva as *mut VdsoData) })
+fn try_write_data(now_ns: u64) {
+    if DATA_WRITE_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
     }
+    let kva = DATA_PAGE_KVA.load(Ordering::Acquire);
+    if kva != 0 {
+        unsafe { write_data(&mut *(kva as *mut VdsoData), now_ns) };
+    }
+    DATA_WRITE_BUSY.store(false, Ordering::Release);
 }
 
 fn write_data(data: &mut VdsoData, now_ns: u64) {

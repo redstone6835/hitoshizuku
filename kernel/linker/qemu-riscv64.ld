@@ -13,7 +13,9 @@ SECTIONS
 
     stext = .;
     .text ALIGN(4K) : AT(ADDR(.text) - LOAD_OFFSET) {
-        KEEP(*(.text.entry))
+        /* OpenSBI 跳转到物理装载基址，主入口必须严格占据首地址。 */
+        KEEP(*(.text.entry.boot))
+        KEEP(*(.text.entry .text.entry.*))
         . = ALIGN(4K);
         KEEP(*(.text.trap.eentry))
         . = ALIGN(4K);
@@ -38,6 +40,23 @@ SECTIONS
         PROVIDE(__ex_table_start = .);
         KEEP(*(__ex_table))
         PROVIDE(__ex_table_end = .);
+        . = ALIGN(8);
+        PROVIDE(__start_ktest = .);
+        KEEP(*(.ktest .ktest.*))
+        PROVIDE(__stop_ktest = .);
+        . = ALIGN(8);
+        PROVIDE(__elm_kernel_symbols_start = .);
+        KEEP(*(.elm.kernel_symbols .elm.kernel_symbols.*))
+        PROVIDE(__elm_kernel_symbols_end = .);
+        . = ALIGN(8);
+        PROVIDE(__elm_kernel_mixin_sites_start = .);
+        KEEP(*(.elm.kernel_mixin_sites .elm.kernel_mixin_sites.*))
+        PROVIDE(__elm_kernel_mixin_sites_end = .);
+        . = ALIGN(8);
+        PROVIDE(__kernel_integrated_components_start = .);
+        KEEP(*(.kernel.integrated_components .kernel.integrated_components.*))
+        PROVIDE(__kernel_integrated_components_end = .);
+        . = ALIGN(8);
         *(.eh_frame_hdr)
         *(.eh_frame)
     }
@@ -85,3 +104,6 @@ SECTIONS
 
     . = ALIGN(8);
 }
+
+ASSERT(_start == VIRTUAL_BASE_ADDRESS,
+       "RISC-V boot entry must be the first byte of the load image")

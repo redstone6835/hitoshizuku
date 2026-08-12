@@ -31,7 +31,7 @@ pub trait Image<'a> {
     fn is_pie(&self) -> bool;
 
     /// 动态链接解释器路径。静态链接 / mygo 原生格式返 `None`。
-    fn interpreter(&self) -> Option<&'a str>;
+    fn interpreter(&self) -> Option<&str>;
 
     /// 遍历全部"需要装入地址空间"的段。
     ///

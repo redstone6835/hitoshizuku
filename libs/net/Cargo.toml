@@ -8,21 +8,13 @@ test = true
 doctest = false
 bench = false
 
+[features]
+performance-profile = ["dep:profiling"]
+
 [dependencies]
-socket = { path = "../socket" }
-smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
-    "alloc",
-    "medium-ethernet",
-    "medium-ip",
-    "proto-ipv4",
-    "proto-ipv6",
-    "multicast",
-    "socket-tcp",
-    "socket-udp",
-    "socket-icmp",
-    "socket-raw",
-    "socket-dhcpv4",
-] }
-spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }
-# 用于全局 socket 事件唤醒队列（WakeQueue）。
+elm_model = { package = "elm", path = "../elm" }
+hashbrown = { version = "0.17.1", default-features = false }
+kernel-symbols = { path = "../kernel-symbols", default-features = false }
+profiling = { path = "../profiling", optional = true }
 sched = { path = "../sched" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }

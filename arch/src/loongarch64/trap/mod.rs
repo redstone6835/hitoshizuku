@@ -17,6 +17,7 @@ use core::arch::naked_asm;
 use crate::*;
 
 pub const ESTAT_IS_MASK: usize = 0x7fff;
+const CRMD_IE_MASK: usize = 1 << CSR_CRMD_IE_OFFSET;
 
 #[inline]
 /// 把 DMW1 高半区地址还原为物理地址。
@@ -115,8 +116,11 @@ pub unsafe extern "C" fn __loongarch_tlb_refill_entry() {
 
         // 4 级页表遍历：Dir3 -> Dir2 -> Dir1 -> PTE。
         "lddir $r12, $r12, 3",
+        "beqz $r12, .L_tlb_refill_invalid",
         "lddir $r12, $r12, 2",
+        "beqz $r12, .L_tlb_refill_invalid",
         "lddir $r12, $r12, 1",
+        "beqz $r12, .L_tlb_refill_invalid",
 
         // 从当前 $r12 指向的 PTE 页的物理地址处加载一对页表项（PTE0 和 PTE1），
         // 并将其填充到 TLB 中，完成 TLB 重填。
@@ -124,12 +128,23 @@ pub unsafe extern "C" fn __loongarch_tlb_refill_entry() {
         "ldpte $r12, 1",
         "tlbfill",
 
+        ".L_tlb_refill_return:",
         // 恢复 $r12 寄存器的值并返回。
         "csrrd $r12, {csr_tlbrsave}",
         "ertn",
 
+        // 空目录表示该地址没有可供 TLB 重填的页表路径。安装一个无效的匹配项，
+        // 让重试转入普通 PIF/PIL/PIS 异常，而不是继续从物理地址 0 读取伪 PTE。
+        ".L_tlb_refill_invalid:",
+        "csrwr $r0, {csr_tlbrelo0}",
+        "csrwr $r0, {csr_tlbrelo1}",
+        "tlbfill",
+        "b .L_tlb_refill_return",
+
         csr_pgd = const CSR_PGD,
         csr_tlbrsave = const CSR_TLBRSAVE,
+        csr_tlbrelo0 = const CSR_TLBRELO0,
+        csr_tlbrelo1 = const CSR_TLBRELO1,
     )
 }
 
@@ -211,11 +226,41 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "csrrd $r12, {csr_euen}",
         "csrrd $r14, {csr_llbctl}",
         "st.d $r14, $r3, {llbctl_offset}",
+        "st.d $r0, $r3, {lsx_padding_offset}",
 
-        // 当前内核不使用 LSX/LASX 寄存器，用户态启用 SXE/ASXE 时 trap 路径只保存
-        // EUEN 并在返回时恢复。BTE 仍未接入上下文管理，保留 fail-closed。
+        // LASX/BTE 尚未接入上下文管理，保留 fail-closed。
         "andi $r13, $r12, {euen_unsupported_context_mask}",
         "bnez $r13, .L_halt",
+
+        // 必须保存完整 VR0..VR31。
+        // LSX_SAVED 是只存在于 TrapFrame.euen 的内部标志。
+        "andi $r13, $r12, {euen_sxe}",
+        "beqz $r13, .L_no_lsx_save",
+        "ori $r12, $r12, {lsx_saved}",
+        "st.d $r12, $r3, {euen_offset}",
+        "addi.d $r13, $r3, {lsx_offset}",
+        "vst $vr0, $r13, 0 * 16",     "vst $vr1, $r13, 1 * 16",
+        "vst $vr2, $r13, 2 * 16",     "vst $vr3, $r13, 3 * 16",
+        "vst $vr4, $r13, 4 * 16",     "vst $vr5, $r13, 5 * 16",
+        "vst $vr6, $r13, 6 * 16",     "vst $vr7, $r13, 7 * 16",
+        "vst $vr8, $r13, 8 * 16",     "vst $vr9, $r13, 9 * 16",
+        "vst $vr10, $r13, 10 * 16",   "vst $vr11, $r13, 11 * 16",
+        "vst $vr12, $r13, 12 * 16",   "vst $vr13, $r13, 13 * 16",
+        "vst $vr14, $r13, 14 * 16",   "vst $vr15, $r13, 15 * 16",
+        "vst $vr16, $r13, 16 * 16",   "vst $vr17, $r13, 17 * 16",
+        "vst $vr18, $r13, 18 * 16",   "vst $vr19, $r13, 19 * 16",
+        "vst $vr20, $r13, 20 * 16",   "vst $vr21, $r13, 21 * 16",
+        "vst $vr22, $r13, 22 * 16",   "vst $vr23, $r13, 23 * 16",
+        "vst $vr24, $r13, 24 * 16",   "vst $vr25, $r13, 25 * 16",
+        "vst $vr26, $r13, 26 * 16",   "vst $vr27, $r13, 27 * 16",
+        "vst $vr28, $r13, 28 * 16",   "vst $vr29, $r13, 29 * 16",
+        "vst $vr30, $r13, 30 * 16",   "vst $vr31, $r13, 31 * 16",
+        "b .L_lsx_save_done",
+
+        ".L_no_lsx_save:",
+        "st.d $r12, $r3, {euen_offset}",
+
+        ".L_lsx_save_done:",
 
         // 基于入口 FPE 决定是否保存 FPU，结果以 FPU_SAVED 标志存在 bit 4。
         // 恢复路径据此判断，不受 handler 改写 tf.euen 影响。
@@ -289,6 +334,11 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
 
         ".L_fpu_save_done:",
 
+        // 无论用户入口状态如何，handler 运行期间都开启 SXE。
+        "csrrd $r12, {csr_euen}",
+        "ori $r12, $r12, {euen_sxe}",
+        "csrwr $r12, {csr_euen}",
+
         // 将参数按照 ABI 规范准备好后调用异常报告函数，将异常信息传递给 Rust 代
         // 码进行处理。
         "ld.d $r4, $r3, {pc_offset}",
@@ -304,6 +354,11 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
 
         // 开始恢复寄存器状态，准备继续执行用户态程序。
         "or $r31, $r4, $r0",
+        // PRMD 会在恢复通用寄存器前发布。先关闭当前中断，防止嵌套异常
+        // 将尚在内核恢复桩中的现场误判为用户态并覆盖外层 TrapFrame。
+        "ori $r12, $r0, {crmd_ie_mask}",
+        "csrxchg $r0, $r12, {csr_crmd}",
+        "bl {handle_shootdown}",
 
         // 恢复程序计数器和状态寄存器的值。
         "ld.d $r12, $r31, {status_offset}",
@@ -373,9 +428,33 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
 
         ".L_skip_fpu_restore:",
 
-        // 恢复 EUEN。先清除内部 FPU_SAVED 标志再写硬件。
+        // LSX 可能已经使用，返回前必须用陷阱帧中的值覆盖硬件向量寄存器。
         "ld.d $r12, $r31, {euen_offset}",
-        "bstrins.d $r12, $r0, 4, 4",
+        "andi $r13, $r12, {lsx_saved}",
+        "beqz $r13, .L_skip_lsx_restore",
+        "addi.d $r12, $r31, {lsx_offset}",
+        "vld $vr0, $r12, 0 * 16",     "vld $vr1, $r12, 1 * 16",
+        "vld $vr2, $r12, 2 * 16",     "vld $vr3, $r12, 3 * 16",
+        "vld $vr4, $r12, 4 * 16",     "vld $vr5, $r12, 5 * 16",
+        "vld $vr6, $r12, 6 * 16",     "vld $vr7, $r12, 7 * 16",
+        "vld $vr8, $r12, 8 * 16",     "vld $vr9, $r12, 9 * 16",
+        "vld $vr10, $r12, 10 * 16",   "vld $vr11, $r12, 11 * 16",
+        "vld $vr12, $r12, 12 * 16",   "vld $vr13, $r12, 13 * 16",
+        "vld $vr14, $r12, 14 * 16",   "vld $vr15, $r12, 15 * 16",
+        "vld $vr16, $r12, 16 * 16",   "vld $vr17, $r12, 17 * 16",
+        "vld $vr18, $r12, 18 * 16",   "vld $vr19, $r12, 19 * 16",
+        "vld $vr20, $r12, 20 * 16",   "vld $vr21, $r12, 21 * 16",
+        "vld $vr22, $r12, 22 * 16",   "vld $vr23, $r12, 23 * 16",
+        "vld $vr24, $r12, 24 * 16",   "vld $vr25, $r12, 25 * 16",
+        "vld $vr26, $r12, 26 * 16",   "vld $vr27, $r12, 27 * 16",
+        "vld $vr28, $r12, 28 * 16",   "vld $vr29, $r12, 29 * 16",
+        "vld $vr30, $r12, 30 * 16",   "vld $vr31, $r12, 31 * 16",
+
+        ".L_skip_lsx_restore:",
+
+        // 恢复 EUEN。先清除内部 FPU_SAVED/LSX_SAVED 标志再写硬件。
+        "ld.d $r12, $r31, {euen_offset}",
+        "bstrins.d $r12, $r0, 5, 4",
         "csrwr $r12, {csr_euen}",
 
         // 恢复 LLBit 相关控制位。
@@ -427,7 +506,9 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "b .L_halt",
 
         report = sym loongarch64_handle_exception,
+        handle_shootdown = sym crate::loongarch64::smp::handle_shootdown_requests,
         frame_size = const FRAME_SIZE,
+        csr_crmd = const CSR_CRMD,
         csr_prmd = const CSR_PRMD,
         csr_euen = const CSR_EUEN,
         csr_llbctl = const CSR_LLBCTL,
@@ -437,9 +518,12 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         csr_ks0 = const CSR_KS0,
         csr_ks1 = const CSR_KS1,
         prmd_pplv_mask = const CSR_PRMD_PPLV_MASK,
+        crmd_ie_mask = const CRMD_IE_MASK,
         euen_fpe = const EUEN_FPE,
+        euen_sxe = const EUEN_SXE,
         fpu_saved = const FPU_SAVED,
-        euen_unsupported_context_mask = const EUEN_BTE,
+        lsx_saved = const LSX_SAVED,
+        euen_unsupported_context_mask = const (EUEN_ASXE | EUEN_BTE),
 
         ra_offset = const RA_OFFSET,
         tp_offset = const TP_OFFSET,
@@ -476,6 +560,8 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         status_offset = const STATUS_OFFSET,
         euen_offset = const EUEN_OFFSET,
         llbctl_offset = const LLBCTL_OFFSET,
+        lsx_padding_offset = const LSX_PADDING_OFFSET,
+        lsx_offset = const LSX_OFFSET,
         fcsr_offset = const FCSR_OFFSET,
         fcc_offset = const FCC_OFFSET,
         f_offset = const F_OFFSET,

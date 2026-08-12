@@ -1,0 +1,21 @@
+{
+  "manifest_version": 1,
+  "abi_epoch": 1,
+  "component_id": "6d79676f2e6578616d706c652e616464",
+  "abi_id": "6d79676f2e6164642e6162692e303031",
+  "init": "component_init",
+  "fini": "component_fini",
+  "tls_offset_symbol": "component_tls_offset",
+  "imports": [],
+  "dependencies": [],
+  "symbol_imports": [],
+  "symbol_exports": [
+    {
+      "interface_id": "6d79676f2e6164642e69666163653031",
+      "symbol_id": "6d79676f2e6164642e73796d626f6c31",
+      "signature_hash": "cc8bc77a01e503a7d41b424bf939622616de5e75754479134efff24f727c8c25",
+      "symbol": "plugin_add",
+      "name": "example.add"
+    }
+  ]
+}

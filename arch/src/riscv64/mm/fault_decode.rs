@@ -30,6 +30,8 @@ struct ExTableEntry {
 unsafe extern "C" {
     static __ex_table_start: u8;
     static __ex_table_end: u8;
+    fn stext();
+    fn etext();
 }
 
 // ── TrapFrame 访问 ───────────────────────────────────────────────────────────
@@ -95,6 +97,46 @@ fn try_fixup_kernel_access(tf: TrapFramePtr) -> bool {
         }
     }
     false
+}
+
+pub(super) fn validate_exception_table() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+
+    let start = addr_of!(__ex_table_start) as usize;
+    let end = addr_of!(__ex_table_end) as usize;
+    let entry_size = core::mem::size_of::<ExTableEntry>();
+    assert!(start <= end, "[arch][mm] invalid __ex_table bounds");
+    assert_eq!(start % core::mem::align_of::<ExTableEntry>(), 0);
+    assert_eq!((end - start) % entry_size, 0);
+
+    let text_start = stext as usize;
+    let text_end = etext as usize;
+    let count = (end - start) / entry_size;
+    let table = start as *const ExTableEntry;
+    for index in 0..count {
+        let entry = unsafe { core::ptr::read(table.add(index)) };
+        assert!(
+            (text_start..text_end).contains(&entry.fault_pc),
+            "[arch][mm] __ex_table fault PC outside text: {:#x}",
+            entry.fault_pc
+        );
+        assert!(
+            (text_start..text_end).contains(&entry.fixup_pc),
+            "[arch][mm] __ex_table fixup PC outside text: {:#x}",
+            entry.fixup_pc
+        );
+        for previous in 0..index {
+            let previous = unsafe { core::ptr::read(table.add(previous)) };
+            assert_ne!(
+                previous.fault_pc, entry.fault_pc,
+                "[arch][mm] duplicate __ex_table fault PC {:#x}",
+                entry.fault_pc
+            );
+        }
+    }
+    log::info!("[arch][mm] __ex_table validated: {} entries", count);
 }
 
 pub(super) static FAULT_DECODE_OPS: FaultDecodeOps = FaultDecodeOps {

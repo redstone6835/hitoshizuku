@@ -3,11 +3,11 @@
 //! 这个模块维护“用户指针 -> 分配记录”的映射，用来支持以下关键能力：
 //!
 //! - `deallocate(ptr)` 时根据裸指针找回分配来源与布局信息；
-//! - `realloc` 时判断对象是 boot/small/large/managed/physical 哪一路分配；
+//! - `realloc` 时判断对象是 boot/small/large/physical 哪一路分配；
 //! - 统计和调试时追踪当前活跃分配。
 //!
 //! 从设计上看，它是整个 allocator 的“账本”。真正的内存页由 buddy、slab、
-//! kernel heap 或 managed allocator 持有，而注册表负责记账、查账和销账。
+//! kernel heap 持有，而注册表负责记账、查账和销账。
 //!
 //! 实现采用固定桶数组 + 单向链表节点的哈希表形式，强调三点：
 //!
@@ -19,14 +19,17 @@
 //! 普通 alloc/free 只会碰其中一个 shard，避免所有 CPU 都竞争同一把 registry 全局锁。
 use core::alloc::Layout;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::mutex::Mutex;
+use crate::Mutex;
 
 use crate::boot::BootAllocator;
 use crate::error::RegistryError;
 use crate::request::{AllocationKind, AllocationRecord, MemoryDomain};
 
-const DEFAULT_BUCKETS: usize = 4096;
+// 注册表覆盖所有内核堆对象，桶数需要按长期活跃对象规模配置。两份 usize 数组
+// （桶头与链长）合计占用 1 MiB，避免文件系统等高分配负载退化成长链扫描。
+const DEFAULT_BUCKETS: usize = 65_536;
 const REGISTRY_NODE_REFILL: usize = 64;
 /// registry 固定分片数。保持 2 的幂，才能用哈希低位直接选择 shard。
 const REGISTRY_SHARDS: usize = 64;
@@ -52,8 +55,43 @@ pub struct AllocationRegistryStats {
     pub live_boot: usize,
     pub live_small: usize,
     pub live_large: usize,
-    pub live_managed: usize,
     pub live_physical: usize,
+}
+
+/// profiling 构建中 registry 各类路径的累计调用计数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistryPathCounters {
+    pub register_kernel: u64,
+    pub register_owned: u64,
+    pub remove_kernel: u64,
+    pub remove_owned: u64,
+    pub containing_queries: u64,
+    pub containing_scanned_shards: u64,
+    pub containing_scanned_buckets: u64,
+    pub containing_scanned_nodes: u64,
+}
+
+impl RegistryPathCounters {
+    pub const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            register_kernel: self.register_kernel.saturating_sub(earlier.register_kernel),
+            register_owned: self.register_owned.saturating_sub(earlier.register_owned),
+            remove_kernel: self.remove_kernel.saturating_sub(earlier.remove_kernel),
+            remove_owned: self.remove_owned.saturating_sub(earlier.remove_owned),
+            containing_queries: self
+                .containing_queries
+                .saturating_sub(earlier.containing_queries),
+            containing_scanned_shards: self
+                .containing_scanned_shards
+                .saturating_sub(earlier.containing_scanned_shards),
+            containing_scanned_buckets: self
+                .containing_scanned_buckets
+                .saturating_sub(earlier.containing_scanned_buckets),
+            containing_scanned_nodes: self
+                .containing_scanned_nodes
+                .saturating_sub(earlier.containing_scanned_nodes),
+        }
+    }
 }
 
 /// 注册表结构审计结果。
@@ -71,7 +109,6 @@ pub struct AllocationRegistryAudit {
     pub scanned_live_boot: usize,
     pub scanned_live_small: usize,
     pub scanned_live_large: usize,
-    pub scanned_live_managed: usize,
     pub scanned_live_physical: usize,
     pub scanned_max_chain_len: usize,
 }
@@ -85,6 +122,24 @@ pub struct AllocationRegistryAudit {
 pub struct AllocationRegistrySnapshot {
     pub stats: AllocationRegistryStats,
     pub audit: AllocationRegistryAudit,
+}
+
+/// 指定非零外部所有者仍存活的分配记录摘要。
+///
+/// 该快照由 owner index 维护，不分配内存，也不暴露对象地址。它用于在 ELM 退役被
+/// 资源账本阻塞时区分普通堆对象、大对象和显式物理页泄漏。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocationOwnerStats {
+    pub records: usize,
+    pub requested_bytes: usize,
+    pub usable_bytes: usize,
+    pub boot_records: usize,
+    pub small_records: usize,
+    pub large_records: usize,
+    pub physical_records: usize,
+    pub largest_requested_bytes: usize,
+    pub largest_usable_bytes: usize,
+    pub scan_errors: usize,
 }
 
 impl AllocationRegistryAudit {
@@ -116,6 +171,7 @@ impl AllocationRegistryAuditFlags {
     pub const WRONG_BUCKET: Self = Self(1 << 10);
     pub const ACCOUNTING_UNDERFLOW: Self = Self(1 << 11);
     pub const CHAIN_CORRUPTION_OBSERVED: Self = Self(1 << 12);
+    pub const BUCKET_LENGTH_MISMATCH: Self = Self(1 << 13);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -140,12 +196,98 @@ impl AllocationRegistryAuditFlags {
 
 #[derive(Clone, Copy)]
 struct RegistryNode {
-    record: AllocationRecord,
+    record: StoredAllocationRecord,
     next: usize,
+}
+
+/// registry 内部的紧凑分配记录。
+///
+/// `AllocationRecord` 为公开接口保留了易用的 `Option<usize>` 和完整 `usize` 字段，
+/// 直接嵌入链表节点会让每个节点达到 104 字节。allocator 产生的对齐和页尺寸都必然
+/// 是 2 的幂，order 也受 buddy 上限约束，因此内部只保存它们的指数和窄 order；
+/// 读取记录时再无损还原公开结构。这样不改变 registry 的查询、审计和错误语义，同时
+/// 显著减少注册、删除时触碰的 metadata cache line 数量。
+#[derive(Clone, Copy)]
+struct StoredAllocationRecord {
+    ptr: usize,
+    paddr: usize,
+    size: usize,
+    usable_size: usize,
+    accounting_owner: u64,
+    backend_cookie: usize,
+    kind: AllocationKind,
+    domain: MemoryDomain,
+    arena: Option<crate::request::AllocationArena>,
+    has_paddr: bool,
+    align_log2: u8,
+    order: u8,
+    page_size_log2: u8,
+}
+
+impl StoredAllocationRecord {
+    fn try_from_record(record: AllocationRecord) -> Result<Self, RegistryError> {
+        if record.ptr == 0 || !record.align.is_power_of_two() || !record.page_size.is_power_of_two()
+        {
+            return Err(RegistryError::InvalidRecord);
+        }
+        let order = u8::try_from(record.order).map_err(|_| RegistryError::InvalidRecord)?;
+        Ok(Self {
+            ptr: record.ptr,
+            paddr: record.paddr.unwrap_or(0),
+            size: record.size,
+            usable_size: record.usable_size,
+            accounting_owner: record.accounting_owner(),
+            backend_cookie: record.backend_cookie,
+            kind: record.kind,
+            domain: record.domain,
+            arena: record.arena,
+            has_paddr: record.paddr.is_some(),
+            align_log2: record.align.trailing_zeros() as u8,
+            order,
+            page_size_log2: record.page_size.trailing_zeros() as u8,
+        })
+    }
+
+    fn into_record(self) -> AllocationRecord {
+        let align = 1usize << self.align_log2;
+        let page_size = 1usize << self.page_size_log2;
+        let mut record = AllocationRecord::new(self.kind, self.domain, self.ptr)
+            .with_sizes(self.size, self.usable_size, align)
+            .with_accounting_owner(self.accounting_owner)
+            .with_backend_cookie(self.backend_cookie);
+        record.arena = self.arena;
+        if self.has_paddr {
+            record = record.with_physical(self.paddr, self.order as usize, page_size);
+        } else {
+            record.order = self.order as usize;
+            record.page_size = page_size;
+        }
+        record
+    }
+
+    const fn empty() -> Self {
+        Self {
+            ptr: 0,
+            paddr: 0,
+            size: 0,
+            usable_size: 0,
+            accounting_owner: 0,
+            backend_cookie: 0,
+            kind: AllocationKind::Boot,
+            domain: MemoryDomain::Kernel,
+            arena: None,
+            has_paddr: false,
+            align_log2: 0,
+            order: 0,
+            page_size_log2: crate::buddy::PAGE_SIZE.trailing_zeros() as u8,
+        }
+    }
 }
 
 struct AllocationRegistryInner {
     buckets: *mut usize,
+    /// 每个桶当前的链长。它与桶头数组在同一块 metadata 内存中连续存放。
+    bucket_lengths: *mut usize,
     bucket_count: usize,
     /// 空闲 RegistryNode 单链表的头地址。
     ///
@@ -165,7 +307,12 @@ struct AllocationRegistryInner {
     accounting_underflows: u64,
     chain_corruptions: u64,
     max_chain_len: usize,
-    live_by_kind: [usize; 5],
+    /// 删除当前最长链中的节点后，缓存的最大链长可能只是上界。
+    ///
+    /// alloc/free 热路径只标记失效；stats/audit 等冷路径读取前再扫描桶长数组，
+    /// 避免稀疏哈希表在 `max_chain_len == 1` 时每次释放都持锁遍历整个 shard。
+    max_chain_len_dirty: bool,
+    live_by_kind: [usize; 4],
     initializing: bool,
     initialized: bool,
 }
@@ -174,6 +321,7 @@ impl AllocationRegistryInner {
     const fn new() -> Self {
         Self {
             buckets: null_mut(),
+            bucket_lengths: null_mut(),
             bucket_count: 0,
             free_nodes: 0,
             free_node_count: 0,
@@ -189,7 +337,8 @@ impl AllocationRegistryInner {
             accounting_underflows: 0,
             chain_corruptions: 0,
             max_chain_len: 0,
-            live_by_kind: [0; 5],
+            max_chain_len_dirty: false,
+            live_by_kind: [0; 4],
             initializing: false,
             initialized: false,
         }
@@ -198,7 +347,7 @@ impl AllocationRegistryInner {
 
 struct RegistryShard {
     /// 每个 shard 独立加锁。跨指针迁移通过 remove + register 两阶段完成，不同时持有
-    /// 两个 shard 锁，避免未来 managed compact / realloc 路径出现锁顺序问题。
+    /// 两个 shard 锁，避免未来 realloc 路径出现锁顺序问题。
     inner: Mutex<AllocationRegistryInner>,
 }
 
@@ -212,12 +361,28 @@ impl RegistryShard {
 
 pub struct AllocationRegistry {
     shards: [RegistryShard; REGISTRY_SHARDS],
+    register_kernel: AtomicU64,
+    register_owned: AtomicU64,
+    remove_kernel: AtomicU64,
+    remove_owned: AtomicU64,
+    containing_queries: AtomicU64,
+    containing_scanned_shards: AtomicU64,
+    containing_scanned_buckets: AtomicU64,
+    containing_scanned_nodes: AtomicU64,
 }
 
 impl AllocationRegistry {
     pub const fn new() -> Self {
         Self {
             shards: [const { RegistryShard::new() }; REGISTRY_SHARDS],
+            register_kernel: AtomicU64::new(0),
+            register_owned: AtomicU64::new(0),
+            remove_kernel: AtomicU64::new(0),
+            remove_owned: AtomicU64::new(0),
+            containing_queries: AtomicU64::new(0),
+            containing_scanned_shards: AtomicU64::new(0),
+            containing_scanned_buckets: AtomicU64::new(0),
+            containing_scanned_nodes: AtomicU64::new(0),
         }
     }
 
@@ -246,7 +411,14 @@ impl AllocationRegistry {
                 continue;
             }
 
-            let layout = match Layout::array::<usize>(buckets_per_shard) {
+            let metadata_slots = match buckets_per_shard.checked_mul(2) {
+                Some(count) => count,
+                None => {
+                    shard.inner.lock().initializing = false;
+                    return false;
+                }
+            };
+            let layout = match Layout::array::<usize>(metadata_slots) {
                 Ok(layout) => layout,
                 Err(_) => {
                     shard.inner.lock().initializing = false;
@@ -258,7 +430,7 @@ impl AllocationRegistry {
                 shard.inner.lock().initializing = false;
                 return false;
             }
-            for idx in 0..buckets_per_shard {
+            for idx in 0..metadata_slots {
                 unsafe {
                     buckets.add(idx).write(0);
                 }
@@ -270,6 +442,7 @@ impl AllocationRegistry {
                 continue;
             }
             inner.buckets = buckets;
+            inner.bucket_lengths = unsafe { buckets.add(buckets_per_shard) };
             inner.bucket_count = buckets_per_shard;
             inner.free_nodes = 0;
             inner.free_node_count = 0;
@@ -285,7 +458,8 @@ impl AllocationRegistry {
             inner.accounting_underflows = 0;
             inner.chain_corruptions = 0;
             inner.max_chain_len = 0;
-            inner.live_by_kind = [0; 5];
+            inner.max_chain_len_dirty = false;
+            inner.live_by_kind = [0; 4];
             inner.initializing = false;
             inner.initialized = true;
         }
@@ -297,6 +471,13 @@ impl AllocationRegistry {
         _boot: &BootAllocator,
         record: AllocationRecord,
     ) -> Result<(), RegistryError> {
+        let owner = record.accounting_owner();
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(if owner == 0 {
+            profiling::Event::AllocRegistryRegisterKernel
+        } else {
+            profiling::Event::AllocRegistryRegisterOwned
+        });
         if record.ptr == 0 {
             let mut inner = self.shards[0].inner.lock();
             inner.insert_failures += 1;
@@ -305,6 +486,13 @@ impl AllocationRegistry {
 
         let hash = hash_ptr(record.ptr);
         let shard = self.shard_for_hash(hash);
+        let stored = match StoredAllocationRecord::try_from_record(record) {
+            Ok(stored) => stored,
+            Err(err) => {
+                shard.inner.lock().insert_failures += 1;
+                return Err(err);
+            }
+        };
         let mut pending_nodes = 0usize;
         let mut pending_node_count = 0usize;
         let mut pending_refill_count = 0usize;
@@ -369,7 +557,13 @@ impl AllocationRegistry {
                 recycle_node_list_locked(&mut inner, pending_nodes, pending_node_count);
             }
 
-            write_node(node_addr, RegistryNode { record, next: head });
+            write_node(
+                node_addr,
+                RegistryNode {
+                    record: stored,
+                    next: head,
+                },
+            );
             set_bucket_head(&inner, bucket, node_addr);
             if head != 0 {
                 inner.collisions += 1;
@@ -377,9 +571,9 @@ impl AllocationRegistry {
             inner.live_records += 1;
             inner.live_by_kind[kind_index(record.kind)] += 1;
             let chain_len = 1 + chain_len_before;
-            if chain_len > inner.max_chain_len {
-                inner.max_chain_len = chain_len;
-            }
+            set_bucket_chain_len(&inner, bucket, chain_len);
+            note_chain_insert_locked(&mut inner, chain_len);
+            self.note_register(owner);
             return Ok(());
         }
     }
@@ -388,7 +582,59 @@ impl AllocationRegistry {
         self.get_result(ptr).ok()
     }
 
+    /// 查询完整覆盖给定地址范围的活跃分配记录。
+    ///
+    /// 这是旧 ELM ABI 的兼容冷路径。注册表按分配起点散列，内部指针无法直接命中桶，
+    /// 因此调用会遍历各 shard；新代码应使用按 owner 建立的范围索引。
+    pub fn find_containing(&self, ptr: usize, len: usize) -> Option<AllocationRecord> {
+        if ptr == 0 || len == 0 {
+            return None;
+        }
+        let end = ptr.checked_add(len)?;
+        let mut scanned_shards = 0u64;
+        let mut scanned_buckets = 0u64;
+        let mut scanned_nodes = 0u64;
+        for shard in &self.shards {
+            scanned_shards = scanned_shards.saturating_add(1);
+            let mut inner = shard.inner.lock();
+            if !inner.initialized {
+                continue;
+            }
+            for bucket in 0..inner.bucket_count {
+                scanned_buckets = scanned_buckets.saturating_add(1);
+                let mut current = bucket_head(&inner, bucket);
+                let mut visited = 0usize;
+                while current != 0 {
+                    if visited >= inner.nodes_allocated {
+                        note_chain_corruption_locked(&mut inner);
+                        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
+                        return None;
+                    }
+                    scanned_nodes = scanned_nodes.saturating_add(1);
+                    let node = read_node(current);
+                    let record = node.record.into_record();
+                    let usable = record.usable_size.max(record.size);
+                    if usable != 0
+                        && record
+                            .ptr
+                            .checked_add(usable)
+                            .is_some_and(|record_end| record.ptr <= ptr && end <= record_end)
+                    {
+                        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
+                        return Some(record);
+                    }
+                    current = node.next;
+                    visited += 1;
+                }
+            }
+        }
+        self.note_containing_scan(scanned_shards, scanned_buckets, scanned_nodes);
+        None
+    }
+
     pub fn get_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::AllocRegistryLookup);
         let hash = hash_ptr(ptr);
         let mut inner = self.shard_for_hash(hash).inner.lock();
         if !inner.initialized {
@@ -408,14 +654,12 @@ impl AllocationRegistry {
                 return Err(RegistryError::InvalidRecord);
             }
         };
-        Ok(read_node(node_addr).record)
-    }
-
-    pub fn remove(&self, ptr: usize) -> Option<AllocationRecord> {
-        self.remove_result(ptr).ok()
+        Ok(read_node_record(node_addr))
     }
 
     pub fn remove_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::AllocRegistryRemove);
         let hash = hash_ptr(ptr);
         let mut inner = self.shard_for_hash(hash).inner.lock();
         if !inner.initialized {
@@ -434,29 +678,34 @@ impl AllocationRegistry {
             }
             visited += 1;
 
-            let node = read_node(current);
-            if node.record.ptr == ptr {
-                if prev == 0 {
-                    set_bucket_head(&inner, bucket, node.next);
-                } else {
-                    let mut prev_node = read_node(prev);
-                    prev_node.next = node.next;
-                    write_node(prev, prev_node);
+            let next = read_node_next(current);
+            if read_node_ptr(current) == ptr {
+                let record = read_node_record(current);
+                let old_chain_len = bucket_chain_len(&inner, bucket);
+                if old_chain_len == 0 {
+                    note_chain_corruption_locked(&mut inner);
+                    inner.remove_failures += 1;
+                    return Err(RegistryError::InvalidRecord);
                 }
-                refresh_max_chain_len_after_remove_locked(&mut inner, bucket);
+                if prev == 0 {
+                    set_bucket_head(&inner, bucket, next);
+                } else {
+                    write_node_next(prev, next);
+                }
+                set_bucket_chain_len(&inner, bucket, old_chain_len - 1);
+                note_chain_remove_locked(&mut inner, old_chain_len);
 
-                let mut recycled = node;
-                recycled.next = inner.free_nodes;
-                write_node(current, recycled);
+                write_node_next(current, inner.free_nodes);
                 inner.free_nodes = current;
                 inner.free_node_count += 1;
                 decrement_live_records_locked(&mut inner);
-                let idx = kind_index(node.record.kind);
+                let idx = kind_index(record.kind);
                 decrement_live_kind_locked(&mut inner, idx);
-                return Ok(node.record);
+                self.note_remove(record.accounting_owner());
+                return Ok(record);
             }
             prev = current;
-            current = node.next;
+            current = next;
         }
         inner.remove_failures += 1;
         inner.double_free_attempts += 1;
@@ -521,9 +770,9 @@ impl AllocationRegistry {
             }
             visited += 1;
 
-            let mut node = read_node(current);
-            if node.record.ptr == ptr {
-                let old_record = node.record;
+            let next = read_node_next(current);
+            if read_node_ptr(current) == ptr {
+                let old_record = read_node_record(current);
                 let Some(new_record) = f(old_record) else {
                     return Ok((old_record, false));
                 };
@@ -535,11 +784,17 @@ impl AllocationRegistry {
                     decrement_live_kind_locked(&mut inner, kind_index(old_record.kind));
                     inner.live_by_kind[kind_index(new_record.kind)] += 1;
                 }
-                node.record = new_record;
-                write_node(current, node);
+                let stored = match StoredAllocationRecord::try_from_record(new_record) {
+                    Ok(stored) => stored,
+                    Err(err) => {
+                        inner.insert_failures += 1;
+                        return Err(err);
+                    }
+                };
+                write_node_record(current, stored);
                 return Ok((new_record, true));
             }
-            current = node.next;
+            current = next;
         }
         inner.lookup_misses += 1;
         Err(RegistryError::UnknownPointer)
@@ -551,10 +806,24 @@ impl AllocationRegistry {
             ..AllocationRegistryStats::default()
         };
         for shard in &self.shards {
-            let inner = shard.inner.lock();
+            let mut inner = shard.inner.lock();
+            refresh_max_chain_len_if_dirty_locked(&mut inner);
             accumulate_stats_locked(&mut out, &inner);
         }
         out
+    }
+
+    pub fn path_counters(&self) -> RegistryPathCounters {
+        RegistryPathCounters {
+            register_kernel: self.register_kernel.load(Ordering::Relaxed),
+            register_owned: self.register_owned.load(Ordering::Relaxed),
+            remove_kernel: self.remove_kernel.load(Ordering::Relaxed),
+            remove_owned: self.remove_owned.load(Ordering::Relaxed),
+            containing_queries: self.containing_queries.load(Ordering::Relaxed),
+            containing_scanned_shards: self.containing_scanned_shards.load(Ordering::Relaxed),
+            containing_scanned_buckets: self.containing_scanned_buckets.load(Ordering::Relaxed),
+            containing_scanned_nodes: self.containing_scanned_nodes.load(Ordering::Relaxed),
+        }
     }
 
     pub fn audit(&self) -> AllocationRegistryAudit {
@@ -568,7 +837,8 @@ impl AllocationRegistry {
         };
         let mut out = AllocationRegistryAudit::default();
         for (shard_idx, shard) in self.shards.iter().enumerate() {
-            let inner = shard.inner.lock();
+            let mut inner = shard.inner.lock();
+            refresh_max_chain_len_if_dirty_locked(&mut inner);
             let mut shard_flags = AllocationRegistryAuditFlags::empty();
             accumulate_stats_locked(&mut stats, &inner);
 
@@ -580,7 +850,8 @@ impl AllocationRegistry {
             }
             out.initialized_shards += 1;
 
-            if inner.buckets.is_null() || inner.bucket_count == 0 {
+            if inner.buckets.is_null() || inner.bucket_lengths.is_null() || inner.bucket_count == 0
+            {
                 shard_flags.insert(AllocationRegistryAuditFlags::NULL_BUCKETS);
                 out.corrupt_shards += 1;
                 out.flags.insert(shard_flags);
@@ -593,7 +864,6 @@ impl AllocationRegistry {
             out.scanned_live_boot += scanned.live_by_kind[kind_index(AllocationKind::Boot)];
             out.scanned_live_small += scanned.live_by_kind[kind_index(AllocationKind::Small)];
             out.scanned_live_large += scanned.live_by_kind[kind_index(AllocationKind::Large)];
-            out.scanned_live_managed += scanned.live_by_kind[kind_index(AllocationKind::Managed)];
             out.scanned_live_physical += scanned.live_by_kind[kind_index(AllocationKind::Physical)];
             out.scanned_max_chain_len = out.scanned_max_chain_len.max(scanned.max_chain_len);
 
@@ -609,7 +879,7 @@ impl AllocationRegistry {
             if scanned.live_records.saturating_add(scanned.free_nodes) != inner.nodes_allocated {
                 shard_flags.insert(AllocationRegistryAuditFlags::NODE_ACCOUNTING_MISMATCH);
             }
-            if scanned.max_chain_len > inner.max_chain_len {
+            if scanned.max_chain_len != inner.max_chain_len {
                 shard_flags.insert(AllocationRegistryAuditFlags::MAX_CHAIN_MISMATCH);
             }
             if inner.accounting_underflows != 0 {
@@ -629,6 +899,46 @@ impl AllocationRegistry {
 
     fn shard_for_hash(&self, hash: usize) -> &RegistryShard {
         &self.shards[hash & (REGISTRY_SHARDS - 1)]
+    }
+
+    #[inline]
+    fn note_register(&self, owner: u64) {
+        #[cfg(feature = "performance-profile")]
+        if owner == 0 {
+            self.register_kernel.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.register_owned.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = owner;
+    }
+
+    #[inline]
+    fn note_remove(&self, owner: u64) {
+        #[cfg(feature = "performance-profile")]
+        if owner == 0 {
+            self.remove_kernel.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.remove_owned.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = owner;
+    }
+
+    #[inline]
+    fn note_containing_scan(&self, shards: u64, buckets: u64, nodes: u64) {
+        #[cfg(feature = "performance-profile")]
+        {
+            self.containing_queries.fetch_add(1, Ordering::Relaxed);
+            self.containing_scanned_shards
+                .fetch_add(shards, Ordering::Relaxed);
+            self.containing_scanned_buckets
+                .fetch_add(buckets, Ordering::Relaxed);
+            self.containing_scanned_nodes
+                .fetch_add(nodes, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = (shards, buckets, nodes);
     }
 }
 
@@ -651,7 +961,6 @@ fn accumulate_stats_locked(out: &mut AllocationRegistryStats, inner: &Allocation
     out.live_boot += inner.live_by_kind[kind_index(AllocationKind::Boot)];
     out.live_small += inner.live_by_kind[kind_index(AllocationKind::Small)];
     out.live_large += inner.live_by_kind[kind_index(AllocationKind::Large)];
-    out.live_managed += inner.live_by_kind[kind_index(AllocationKind::Managed)];
     out.live_physical += inner.live_by_kind[kind_index(AllocationKind::Physical)];
 }
 
@@ -659,7 +968,7 @@ fn accumulate_stats_locked(out: &mut AllocationRegistryStats, inner: &Allocation
 struct RegistryShardScan {
     live_records: usize,
     free_nodes: usize,
-    live_by_kind: [usize; 5],
+    live_by_kind: [usize; 4],
     max_chain_len: usize,
 }
 
@@ -696,6 +1005,9 @@ fn audit_shard_locked(
 
             current = node.next;
         }
+        if bucket_chain_len(inner, bucket) != chain_len {
+            flags.insert(AllocationRegistryAuditFlags::BUCKET_LENGTH_MISMATCH);
+        }
         scan.max_chain_len = scan.max_chain_len.max(chain_len);
     }
 
@@ -705,9 +1017,8 @@ fn audit_shard_locked(
             flags.insert(AllocationRegistryAuditFlags::FREE_LIST_LOOP);
             break;
         }
-        let node = read_node(current);
         scan.free_nodes += 1;
-        current = node.next;
+        current = read_node_next(current);
     }
 
     scan
@@ -716,7 +1027,7 @@ fn audit_shard_locked(
 fn pop_free_node_locked(inner: &mut AllocationRegistryInner) -> usize {
     let node_addr = inner.free_nodes;
     if node_addr != 0 {
-        inner.free_nodes = read_node(node_addr).next;
+        inner.free_nodes = read_node_next(node_addr);
         decrement_free_node_count_locked(inner);
     }
     node_addr
@@ -725,7 +1036,7 @@ fn pop_free_node_locked(inner: &mut AllocationRegistryInner) -> usize {
 fn pop_node_from_list(head: &mut usize, count: &mut usize) -> usize {
     let node_addr = *head;
     if node_addr != 0 {
-        *head = read_node(node_addr).next;
+        *head = read_node_next(node_addr);
         *count = count.saturating_sub(1);
     }
     node_addr
@@ -767,32 +1078,35 @@ fn note_chain_corruption_locked(inner: &mut AllocationRegistryInner) {
     inner.chain_corruptions = inner.chain_corruptions.saturating_add(1);
 }
 
-fn refresh_max_chain_len_after_remove_locked(inner: &mut AllocationRegistryInner, bucket: usize) {
-    let new_bucket_len = match bounded_chain_len(bucket_head(inner, bucket), inner.nodes_allocated)
-    {
-        Ok(len) => len,
-        Err(()) => {
-            note_chain_corruption_locked(inner);
-            return;
-        }
-    };
-    if new_bucket_len.saturating_add(1) != inner.max_chain_len {
-        return;
-    }
-
-    match recompute_max_chain_len_locked(inner) {
-        Ok(max_chain_len) => inner.max_chain_len = max_chain_len,
-        Err(()) => note_chain_corruption_locked(inner),
+fn note_chain_insert_locked(inner: &mut AllocationRegistryInner, chain_len: usize) {
+    if chain_len >= inner.max_chain_len {
+        // 若缓存此前因删除而失效，新链已经达到旧上界，就能重新证明最大值精确；
+        // 超过旧上界时同理，新链必然是唯一可能的新最大值。
+        inner.max_chain_len = chain_len;
+        inner.max_chain_len_dirty = false;
     }
 }
 
-fn recompute_max_chain_len_locked(inner: &AllocationRegistryInner) -> Result<usize, ()> {
+fn note_chain_remove_locked(inner: &mut AllocationRegistryInner, old_bucket_len: usize) {
+    if old_bucket_len == inner.max_chain_len {
+        inner.max_chain_len_dirty = true;
+    }
+}
+
+fn refresh_max_chain_len_if_dirty_locked(inner: &mut AllocationRegistryInner) {
+    if !inner.max_chain_len_dirty {
+        return;
+    }
+    inner.max_chain_len = recompute_max_chain_len_locked(inner);
+    inner.max_chain_len_dirty = false;
+}
+
+fn recompute_max_chain_len_locked(inner: &AllocationRegistryInner) -> usize {
     let mut max_chain_len = 0usize;
     for bucket in 0..inner.bucket_count {
-        let chain_len = bounded_chain_len(bucket_head(inner, bucket), inner.nodes_allocated)?;
-        max_chain_len = max_chain_len.max(chain_len);
+        max_chain_len = max_chain_len.max(bucket_chain_len(inner, bucket));
     }
-    Ok(max_chain_len)
+    max_chain_len
 }
 
 fn recycle_node_list_locked(inner: &mut AllocationRegistryInner, head: usize, count: usize) {
@@ -803,18 +1117,16 @@ fn recycle_node_list_locked(inner: &mut AllocationRegistryInner, head: usize, co
     let mut visited = 0usize;
     while visited < count {
         visited += 1;
-        let node = read_node(tail);
-        if node.next == 0 {
+        let next = read_node_next(tail);
+        if next == 0 {
             break;
         }
-        tail = node.next;
+        tail = next;
     }
-    if visited != count || read_node(tail).next != 0 {
+    if visited != count || read_node_next(tail) != 0 {
         note_chain_corruption_locked(inner);
     }
-    let mut tail_node = read_node(tail);
-    tail_node.next = inner.free_nodes;
-    write_node(tail, tail_node);
+    write_node_next(tail, inner.free_nodes);
     inner.free_nodes = head;
     inner.free_node_count = inner.free_node_count.saturating_add(visited);
 }
@@ -832,7 +1144,7 @@ fn alloc_node_batch() -> Option<(usize, usize)> {
         write_node(
             addr,
             RegistryNode {
-                record: AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, 0),
+                record: StoredAllocationRecord::empty(),
                 next: head,
             },
         );
@@ -842,7 +1154,14 @@ fn alloc_node_batch() -> Option<(usize, usize)> {
 }
 
 fn hash_ptr(ptr: usize) -> usize {
-    (ptr >> 3) ^ (ptr >> 11) ^ (ptr >> 19) ^ (ptr >> 27)
+    // SplitMix64 的终结混合能打散 slab 地址中的页号、size class 和对齐低位相关性。
+    let mut value = ptr as u64;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value as usize
 }
 
 fn bucket_index(hash: usize, bucket_count: usize) -> usize {
@@ -874,6 +1193,16 @@ fn set_bucket_head(inner: &AllocationRegistryInner, bucket: usize, head: usize) 
     }
 }
 
+fn bucket_chain_len(inner: &AllocationRegistryInner, bucket: usize) -> usize {
+    unsafe { *inner.bucket_lengths.add(bucket) }
+}
+
+fn set_bucket_chain_len(inner: &AllocationRegistryInner, bucket: usize, length: usize) {
+    unsafe {
+        inner.bucket_lengths.add(bucket).write(length);
+    }
+}
+
 fn find_node(mut head: usize, ptr: usize, limit: usize) -> Result<Option<usize>, ()> {
     let mut visited = 0usize;
     while head != 0 {
@@ -882,11 +1211,10 @@ fn find_node(mut head: usize, ptr: usize, limit: usize) -> Result<Option<usize>,
         }
         visited += 1;
 
-        let node = read_node(head);
-        if node.record.ptr == ptr {
+        if read_node_ptr(head) == ptr {
             return Ok(Some(head));
         }
-        head = node.next;
+        head = read_node_next(head);
     }
     Ok(None)
 }
@@ -902,25 +1230,12 @@ fn find_node_and_chain_len(
             return Err(());
         }
         len += 1;
-        let node = read_node(head);
-        if node.record.ptr == ptr {
+        if read_node_ptr(head) == ptr {
             return Ok((Some(head), len));
         }
-        head = node.next;
+        head = read_node_next(head);
     }
     Ok((None, len))
-}
-
-fn bounded_chain_len(mut head: usize, limit: usize) -> Result<usize, ()> {
-    let mut len = 0usize;
-    while head != 0 {
-        if len >= limit {
-            return Err(());
-        }
-        len += 1;
-        head = read_node(head).next;
-    }
-    Ok(len)
 }
 
 fn kind_index(kind: AllocationKind) -> usize {
@@ -928,8 +1243,7 @@ fn kind_index(kind: AllocationKind) -> usize {
         AllocationKind::Boot => 0,
         AllocationKind::Small => 1,
         AllocationKind::Large => 2,
-        AllocationKind::Managed => 3,
-        AllocationKind::Physical => 4,
+        AllocationKind::Physical => 3,
     }
 }
 
@@ -937,8 +1251,88 @@ fn read_node(addr: usize) -> RegistryNode {
     unsafe { *(addr as *const RegistryNode) }
 }
 
+#[inline]
+fn read_node_ptr(addr: usize) -> usize {
+    unsafe { core::ptr::addr_of!((*(addr as *const RegistryNode)).record.ptr).read() }
+}
+
+#[inline]
+fn read_node_next(addr: usize) -> usize {
+    unsafe { core::ptr::addr_of!((*(addr as *const RegistryNode)).next).read() }
+}
+
+#[inline]
+fn read_node_record(addr: usize) -> AllocationRecord {
+    unsafe {
+        core::ptr::addr_of!((*(addr as *const RegistryNode)).record)
+            .read()
+            .into_record()
+    }
+}
+
+#[inline]
+fn write_node_next(addr: usize, next: usize) {
+    unsafe { core::ptr::addr_of_mut!((*(addr as *mut RegistryNode)).next).write(next) }
+}
+
+#[inline]
+fn write_node_record(addr: usize, stored: StoredAllocationRecord) {
+    unsafe { core::ptr::addr_of_mut!((*(addr as *mut RegistryNode)).record).write(stored) }
+}
+
 fn write_node(addr: usize, node: RegistryNode) {
     unsafe {
         (addr as *mut RegistryNode).write(node);
+    }
+}
+
+#[cfg(feature = "ktest-kernel")]
+mod compact_record_tests {
+    use super::*;
+    use crate::request::AllocationArena;
+    use ktest::ktest;
+
+    #[ktest]
+    fn compact_record_round_trips_all_fields() {
+        let original = AllocationRecord::new(
+            AllocationKind::Large,
+            MemoryDomain::Kernel,
+            0xffff_8000_1234_0000,
+        )
+        .with_arena(AllocationArena::Kernel)
+        .with_physical(0x2345_0000, 9, 2 * 1024 * 1024)
+        .with_sizes(123_457, 2 * 1024 * 1024, 64 * 1024)
+        .with_accounting_owner(0x1234_5678_9abc_def0)
+        .with_backend_cookie(0x55aa_aa55);
+
+        let stored = StoredAllocationRecord::try_from_record(original).expect("compact record");
+        assert_eq!(stored.into_record(), original);
+    }
+
+    #[ktest]
+    fn compact_record_rejects_noncanonical_layout() {
+        let bad_align = AllocationRecord::new(AllocationKind::Small, MemoryDomain::Kernel, 1)
+            .with_sizes(8, 8, 3);
+        assert!(matches!(
+            StoredAllocationRecord::try_from_record(bad_align),
+            Err(RegistryError::InvalidRecord)
+        ));
+
+        let mut bad_page =
+            AllocationRecord::new(AllocationKind::Physical, MemoryDomain::Physical, 2);
+        bad_page.page_size = 0;
+        assert!(matches!(
+            StoredAllocationRecord::try_from_record(bad_page),
+            Err(RegistryError::InvalidRecord)
+        ));
+    }
+
+    #[ktest]
+    fn compact_node_fits_one_cache_line_on_supported_targets() {
+        assert!(core::mem::size_of::<RegistryNode>() <= 64);
+        assert!(
+            core::mem::size_of::<RegistryNode>()
+                < core::mem::size_of::<AllocationRecord>() + core::mem::size_of::<usize>()
+        );
     }
 }

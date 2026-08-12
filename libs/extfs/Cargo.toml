@@ -11,8 +11,10 @@ bench = false
 [dependencies]
 vfs = { path = "../vfs" }
 errno = { path = "../errno" }
+kernel-symbols = { path = "../kernel-symbols" }
 log = { path = "../log" }
 sched = { path = "../sched" }
+smallvec = { version = "1.15.1", default-features = false, features = ["const_generics"] }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 [dev-dependencies]

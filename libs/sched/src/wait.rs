@@ -1,9 +1,9 @@
 //! 通用等待队列。
 //!
-//! [`WaitQueue`] 是调度器级别的通知原语：任务把自身的 [`Weak<Task>`] 注册到
-//! 某个事件源上，事件发生时 upgrade 这些弱引用并将对应任务从 `Sleeping`
-//! 推回 `Runnable`。默认唤醒路径会走 sched 的统一入队入口；需要绑定特殊事件
-//! 源时也可以通过 `wake_fn` 注入额外动作。
+//! [`WaitQueue`] 是调度器级别的通知原语：任务通过 [`WaitQueueEntry`] 注册到
+//! 某个事件源上，事件发生时等待队列将对应任务从 `Sleeping` 推回 `Runnable`。
+//! 默认唤醒路径会走 sched 的统一入队入口；需要绑定特殊事件源时也可以通过
+//! `wake_fn` 注入额外动作。
 //!
 //! 用 `Weak<Task>` 而非 `Arc<Task>` 的原因：
 //!
@@ -13,84 +13,216 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::sync::Spinlock;
-use crate::task::{Task, TaskState};
+use crate::task::{Task, TaskState, WaitReason};
 
 /// 唤醒回调。调用方负责把 task 加入某个 runqueue 并可能触发 IPI。
 ///
 /// 回调在**不持 WaitQueue 锁**时被调用，避免把 rq 锁反向耦合进来。
 pub type WakeFn = fn(&Arc<Task>);
 
-/// 等待队列。
-pub struct WaitQueue {
-    waiters: Spinlock<VecDeque<Weak<Task>>>,
+const ENTRY_WAITING: u8 = 0;
+const ENTRY_WOKEN: u8 = 1;
+const ENTRY_FINISHED: u8 = 2;
+
+/// 等待队列中的单个任务登记项。
+pub struct WaitQueueEntry {
+    task: Weak<Task>,
+    state: AtomicU8,
 }
 
+impl WaitQueueEntry {
+    fn new(task: &Arc<Task>) -> Arc<Self> {
+        Arc::new(Self {
+            task: Arc::downgrade(task),
+            state: AtomicU8::new(ENTRY_WAITING),
+        })
+    }
+
+    fn task(&self) -> Option<Arc<Task>> {
+        self.task.upgrade()
+    }
+
+    fn is_waiting(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ENTRY_WAITING
+    }
+
+    fn mark_woken(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ENTRY_WAITING,
+                ENTRY_WOKEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish(&self) {
+        self.state.store(ENTRY_FINISHED, Ordering::Release);
+    }
+}
+
+/// 等待队列。
+pub struct WaitQueue {
+    waiters: Spinlock<VecDeque<Arc<WaitQueueEntry>>>,
+    #[cfg(feature = "performance-profile")]
+    reason: WaitReason,
+}
+
+#[kernel_symbols::export]
 impl WaitQueue {
     pub const fn new() -> Self {
+        Self::new_with_reason(WaitReason::Other)
+    }
+
+    pub const fn new_with_reason(reason: WaitReason) -> Self {
+        #[cfg(not(feature = "performance-profile"))]
+        let _ = reason;
         Self {
             waiters: Spinlock::new(VecDeque::new()),
+            #[cfg(feature = "performance-profile")]
+            reason,
         }
     }
 
-    /// 把任务挂到队列上，调用方随后应把自己置 `Sleeping` 并让出 CPU。
+    /// 把任务登记到队列上，不改变任务状态。
     ///
-    /// 允许同一任务多次挂入多个队列（典型：`poll`）；每个队列只记一条 Weak。
-    pub fn enqueue(&self, task: &Arc<Task>) {
+    /// 该接口用于 `poll` 等只登记通知对象的路径。阻塞当前任务应使用
+    /// [`prepare_to_wait`](Self::prepare_to_wait)。同一任务可以登记到多个队列，
+    /// 但在同一个队列中只保留一个有效条目。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.enqueue",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn enqueue(&self, task: &Arc<Task>) -> Arc<WaitQueueEntry> {
         let mut waiters = self.waiters.lock();
-        waiters.retain(|weak| weak.upgrade().is_some());
-        if waiters.iter().any(|weak| {
-            weak.upgrade()
+        waiters.retain(|entry| entry.is_waiting() && entry.task().is_some());
+        if let Some(entry) = waiters.iter().find(|entry| {
+            entry
+                .task()
                 .as_ref()
                 .is_some_and(|queued| Arc::ptr_eq(queued, task))
         }) {
-            return;
+            return Arc::clone(entry);
         }
-        waiters.push_back(Arc::downgrade(task));
+        let entry = WaitQueueEntry::new(task);
+        waiters.push_back(Arc::clone(&entry));
+        entry
     }
 
-    /// 准备进入等待：先把当前任务标成睡眠态，再挂入等待队列。
+    /// 准备进入等待：登记任务并把它切换到指定睡眠态。
     ///
     /// 调用方必须在 prepare 后重新检查条件；若条件已经满足，应立即
     /// [`finish_wait`]，不要调度出去。这个协议覆盖"事件发生在首次检查和
     /// 真正睡眠之间"的窗口。
-    pub fn prepare_to_wait(&self, task: &Arc<Task>, state: TaskState) {
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.prepare_to_wait",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn prepare_to_wait(&self, task: &Arc<Task>, state: TaskState) -> Arc<WaitQueueEntry> {
         debug_assert!(matches!(
             state,
             TaskState::Sleeping | TaskState::Uninterruptible
         ));
-        // 先入队再切状态：若先切 Sleeping 再入队，waker 可能在入队前
-        // 检查队列（空），唤醒丢失。
-        self.enqueue(task);
-        task.set_state(state);
+        let mut waiters = self.waiters.lock();
+        waiters.retain(|entry| entry.is_waiting() && entry.task().is_some());
+        let entry = waiters
+            .iter()
+            .find(|entry| {
+                entry
+                    .task()
+                    .as_ref()
+                    .is_some_and(|queued| Arc::ptr_eq(queued, task))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                let entry = WaitQueueEntry::new(task);
+                waiters.push_back(Arc::clone(&entry));
+                entry
+            });
+        // 状态切换与登记由同一把锁序列化。waker 要么先完成且调用方随后重新
+        // 检查条件，要么在这里之后看到 Sleeping/Uninterruptible。
+        #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+        let before = task.state();
+        #[cfg(feature = "performance-profile")]
+        task.begin_profile_wait(self.reason, crate::scheduler::now_ns_public());
+        let prepared = task.prepare_wait_state(state);
+        #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+        if self.reason == WaitReason::ProcessExit {
+            log::info!(
+                "[sched][wait-queue] prepare pid={:?} before={:?} after={:?} prepared={} queued={}",
+                task.pid_root(),
+                before,
+                task.state(),
+                prepared,
+                waiters.len(),
+            );
+        }
+        #[cfg(not(all(feature = "performance-profile", feature = "trace-task-lifecycle")))]
+        let _ = prepared;
+        entry
     }
 
     /// 结束等待：从队列移除，并把仍处于睡眠态的任务恢复为可运行态。
-    pub fn finish_wait(&self, task: &Arc<Task>) {
-        self.remove(task);
-        transition_from_wait(task);
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.finish_wait",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
+    pub fn finish_wait(&self, entry: &Arc<WaitQueueEntry>) {
+        {
+            let mut waiters = self.waiters.lock();
+            waiters.retain(|queued| !Arc::ptr_eq(queued, entry));
+            entry.finish();
+        }
+        if let Some(task) = entry.task() {
+            transition_from_wait(&task);
+        }
     }
 
     /// 等到 `condition` 为真。每次真正让出 CPU 前都会在已经登记到队列、
     /// 且任务处于 Sleeping 状态后重新检查一次条件。
     pub fn wait_event(&self, task: &Arc<Task>, mut condition: impl FnMut() -> bool) {
         while !condition() {
-            self.prepare_to_wait(task, TaskState::Sleeping);
+            let entry = self.prepare_to_wait(task, TaskState::Sleeping);
             if condition() {
-                self.finish_wait(task);
+                self.finish_wait(&entry);
                 return;
             }
             crate::scheduler::schedule_once(crate::scheduler::now_ns_public());
-            self.finish_wait(task);
+            self.finish_wait(&entry);
         }
     }
 
     /// 从队列中显式移除某个任务。常见于被信号打断、提前超时等场景。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.remove",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn remove(&self, task: &Arc<Task>) {
         let mut w = self.waiters.lock();
-        w.retain(|weak| match weak.upgrade() {
-            Some(t) => !Arc::ptr_eq(&t, task),
+        w.retain(|entry| match entry.task() {
+            Some(queued) if Arc::ptr_eq(&queued, task) => {
+                entry.finish();
+                false
+            }
+            Some(_) => entry.is_waiting(),
             None => false,
         });
     }
@@ -98,30 +230,37 @@ impl WaitQueue {
     /// 唤醒一个等待者。用 VecDeque 从队头取元素，避免 Vec::remove(0)
     /// 在 pipe/select 等高频等待路径上反复搬移整段数组。
     /// 返回被唤醒任务的 `Arc`，便于上层决定是否直接转入 runqueue。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.wake_one",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn wake_one(&self, wake: WakeFn) -> Option<Arc<Task>> {
         let picked = {
             let mut w = self.waiters.lock();
             let initial_len = w.len();
-            let mut pushed_back = 0usize;
-            loop {
-                let weak = match w.pop_front() {
-                    None => break None,
-                    Some(wk) => wk,
+            let mut picked = None;
+            for _ in 0..initial_len {
+                let Some(entry) = w.pop_front() else {
+                    break;
                 };
-                let Some(task) = weak.upgrade() else {
+                let Some(task) = entry.task() else {
                     continue;
                 };
                 let st = task.state();
                 if st != TaskState::Sleeping && st != TaskState::Uninterruptible {
-                    if pushed_back < initial_len {
-                        w.push_back(weak);
-                        pushed_back += 1;
-                        continue;
-                    }
-                    break None;
+                    w.push_back(entry);
+                    continue;
                 }
-                break Some(task);
+                if entry.mark_woken() {
+                    picked = Some(task);
+                    break;
+                }
             }
+            picked
         };
         if let Some(ref task) = picked {
             transition_to_runnable(task);
@@ -131,26 +270,105 @@ impl WaitQueue {
     }
 
     /// 唤醒所有等待者。先把列表整取出来，锁外逐个调用 wake，防止反序。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.wake_all",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn wake_all(&self) {
         self.wake_all_with(default_wake);
     }
 
     /// 使用默认调度器入口唤醒一个等待者。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.wake_one_default",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_TASK,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn wake_one_default(&self) -> Option<Arc<Task>> {
         self.wake_one(default_wake)
     }
 
+    /// 使用默认调度器入口唤醒一个等待者，并在剖析构建中携带事件源关联号。
+    pub fn wake_one_default_with_cause(
+        &self,
+        kind: u8,
+        object: u64,
+        correlation: u64,
+    ) -> Option<Arc<Task>> {
+        let picked = {
+            let mut w = self.waiters.lock();
+            let initial_len = w.len();
+            let mut picked = None;
+            for _ in 0..initial_len {
+                let Some(entry) = w.pop_front() else {
+                    break;
+                };
+                let Some(task) = entry.task() else {
+                    continue;
+                };
+                let state = task.state();
+                if state != TaskState::Sleeping && state != TaskState::Uninterruptible {
+                    w.push_back(entry);
+                    continue;
+                }
+                if entry.mark_woken() {
+                    picked = Some(task);
+                    break;
+                }
+            }
+            picked
+        };
+        if let Some(ref task) = picked {
+            task.set_profile_wake_cause(
+                kind,
+                object,
+                correlation,
+                crate::scheduler::now_ns_public(),
+            );
+            transition_to_runnable(task);
+            default_wake(task);
+        }
+        picked
+    }
+
     /// 带回调的全量唤醒。
     pub fn wake_all_with(&self, wake: impl Fn(&Arc<Task>)) {
-        let drained: VecDeque<Weak<Task>> = {
+        let tasks: VecDeque<Arc<Task>> = {
             let mut w = self.waiters.lock();
-            core::mem::take(&mut *w)
+            let drained = core::mem::take(&mut *w);
+            drained
+                .into_iter()
+                .filter_map(|entry| {
+                    let task = entry.task()?;
+                    entry.mark_woken().then_some(task)
+                })
+                .collect()
         };
-        for weak in drained {
-            if let Some(task) = weak.upgrade() {
-                transition_to_runnable(&task);
-                wake(&task);
+        for task in tasks {
+            #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+            let before = task.state();
+            let transitioned = transition_to_runnable(&task);
+            #[cfg(all(feature = "performance-profile", feature = "trace-task-lifecycle"))]
+            if self.reason == WaitReason::ProcessExit {
+                log::info!(
+                    "[sched][wait-queue] wake pid={:?} before={:?} after={:?} transitioned={} on_rq={} running_cpu={:?}",
+                    task.pid_root(),
+                    before,
+                    task.state(),
+                    transitioned,
+                    task.sched.on_rq(),
+                    task.running_cpu(),
+                );
             }
+            #[cfg(not(all(feature = "performance-profile", feature = "trace-task-lifecycle")))]
+            let _ = transitioned;
+            wake(&task);
         }
     }
 
@@ -159,22 +377,26 @@ impl WaitQueue {
         if n == 0 {
             return 0;
         }
-        let mut taken: VecDeque<Weak<Task>> = VecDeque::new();
-        {
+        let tasks: VecDeque<Arc<Task>> = {
             let mut w = self.waiters.lock();
-            while taken.len() < n && !w.is_empty() {
-                if let Some(weak) = w.pop_front() {
-                    taken.push_back(weak);
+            let mut tasks = VecDeque::new();
+            while tasks.len() < n && !w.is_empty() {
+                if let Some(entry) = w.pop_front() {
+                    let Some(task) = entry.task() else {
+                        continue;
+                    };
+                    if entry.mark_woken() {
+                        tasks.push_back(task);
+                    }
                 }
             }
-        }
+            tasks
+        };
         let mut woken = 0usize;
-        for weak in taken {
-            if let Some(task) = weak.upgrade() {
-                transition_to_runnable(&task);
-                wake(&task);
-                woken += 1;
-            }
+        for task in tasks {
+            transition_to_runnable(&task);
+            wake(&task);
+            woken += 1;
         }
         woken
     }
@@ -186,8 +408,10 @@ impl WaitQueue {
             loop {
                 match w.pop_front() {
                     None => break None,
-                    Some(weak) => {
-                        if let Some(task) = weak.upgrade() {
+                    Some(entry) => {
+                        if entry.mark_woken()
+                            && let Some(task) = entry.task()
+                        {
                             break Some(task);
                         }
                     }
@@ -201,7 +425,14 @@ impl WaitQueue {
         picked
     }
 
-    /// 当前等待者数量（含已死 Weak，读路径不做清理避免写锁）。
+    /// 当前队列中的登记项数量。该值只用于诊断和测试。
+    #[kernel_symbols::export(
+        name = "sched.wait.WaitQueue.len_hint",
+        contract = "kernel.sched.wait@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::SCHED_QUERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+    )]
     pub fn len_hint(&self) -> usize {
         self.waiters.lock().len()
     }
@@ -215,13 +446,21 @@ impl Default for WaitQueue {
 
 /// 把 Sleeping / Uninterruptible 切回 Runnable。CAS 失败说明任务已经
 /// 处于其他状态（例如刚被另一路径唤醒），跳过即可。
-fn transition_to_runnable(task: &Arc<Task>) {
-    if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
-        let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+fn transition_to_runnable(task: &Arc<Task>) -> bool {
+    let transitioned = task.cas_state(TaskState::Sleeping, TaskState::Runnable)
+        || task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    #[cfg(feature = "performance-profile")]
+    if transitioned {
+        task.mark_profile_woken(crate::scheduler::now_ns_public());
     }
+    #[cfg(not(feature = "performance-profile"))]
+    let _ = transitioned;
+    transitioned
 }
 
 fn transition_from_wait(task: &Arc<Task>) {
+    #[cfg(feature = "performance-profile")]
+    task.cancel_profile_wait();
     if crate::scheduler::is_ready() {
         let current = crate::scheduler::current_task();
         if Arc::ptr_eq(&current, task) {
@@ -233,7 +472,9 @@ fn transition_from_wait(task: &Arc<Task>) {
             return;
         }
     }
-    transition_to_runnable(task);
+    if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+        let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
+    }
 }
 
 fn default_wake(task: &Arc<Task>) {

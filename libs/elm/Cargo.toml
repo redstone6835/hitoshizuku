@@ -1,0 +1,25 @@
+[package]
+name = "elm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = true
+doctest = true
+bench = false
+
+[features]
+default = ["runtime-model", "macros"]
+runtime-model = ["dep:ed25519-dalek"]
+module = []
+management = ["module"]
+macros = ["dep:elm-macros"]
+elm-integrated = []
+
+[dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "zeroize"], optional = true }
+elm-macros = { path = "macros", optional = true }
+kernel-symbols = { path = "../kernel-symbols", default-features = false }
+
+[dev-dependencies]
+ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }

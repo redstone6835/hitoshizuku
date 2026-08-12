@@ -27,7 +27,6 @@
 //! InitError                          (初始化阶段)
 //! RegistryError                      (分配记录注册表)
 //! OwnershipError                     (所有权查询)
-//! ManagedHandleError                 (受管句柄操作)
 //! ```
 use crate::buddy::{BuddyAllocError, BuddyFreeError};
 use crate::request::{AllocationKind, AllocationRequestError};
@@ -53,8 +52,6 @@ use crate::request::{AllocationKind, AllocationRequestError};
 /// | `AddressSpaceInitFailed` | 虚拟地址空间初始化失败 |
 /// | `ZoneNotInitialized` | Slab 分配器尚未初始化 |
 /// | `LargeAllocatorNotInitialized` | 大对象分配器尚未初始化 |
-/// | `ManagedAlreadyInitialized` | 受管堆已经被初始化，不能重复初始化 |
-/// | `ManagedRegionUnavailable` | 无法为受管堆预留地址空间 |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitError {
     BootNotInitialized,
@@ -68,8 +65,6 @@ pub enum InitError {
     AddressSpaceInitFailed,
     ZoneNotInitialized,
     LargeAllocatorNotInitialized,
-    ManagedAlreadyInitialized,
-    ManagedRegionUnavailable,
 }
 
 /// 虚拟地址空间层错误。
@@ -89,7 +84,6 @@ pub enum InitError {
 /// | `InvalidAlignment` | 请求的对齐要求不合法（不是 2 的幂或低于 quantum） |
 /// | `InvalidSize` | 请求的大小为零或非法 |
 /// | `InvalidRange` | 指定的地址范围无效（如起始地址大于结束地址） |
-/// | `ManagedUnavailable` | 受管堆的虚拟区域尚未建立 |
 /// | `NoBackingRange` | 找不到与虚拟地址对应的物理后备区间 |
 /// | `PhysicalRangeUnavailable` | 物理页分配失败 |
 /// | `PhysicalReleaseFailed` | 物理页释放失败 |
@@ -105,7 +99,6 @@ pub enum AddressSpaceError {
     InvalidAlignment,
     InvalidSize,
     InvalidRange,
-    ManagedUnavailable,
     NoBackingRange,
     PhysicalRangeUnavailable,
     PhysicalReleaseFailed,
@@ -209,14 +202,12 @@ pub enum AllocationError {
 /// | `InvalidPointer` | 指针无效（如物理地址缺失） |
 /// | `AddressSpace(AddressSpaceError)` | 地址空间回收失败 |
 /// | `Physical(BuddyFreeError)` | 物理页释放失败 |
-/// | `ObjectStillReferenced` | 对象仍有活跃引用，不能释放 |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeallocationError {
     UnknownPointer,
     InvalidPointer,
     AddressSpace(AddressSpaceError),
     Physical(BuddyFreeError),
-    ObjectStillReferenced,
 }
 
 /// 显式物理页释放错误。
@@ -258,31 +249,29 @@ pub enum OwnershipError {
     UnknownPointer,
 }
 
-/// 受管句柄操作错误。
+/// 带外部所有者约束的普通内核分配操作错误。
 ///
-/// 受管堆提供了基于句柄的引用计数和 GC 集成。对句柄、根、字段访问的操作可能因为
-/// 各种原因失败，这些原因被统一在这个枚举中。
-///
-/// # 变体说明
-///
-/// | 变体 | 含义 |
-/// |------|------|
-/// | `NotInitialized` | 受管堆尚未初始化 |
-/// | `InvalidHandle` | 句柄无效（slot 不匹配或已过期） |
-/// | `RootTableFull` | 根表已满，无法添加新根 |
-/// | `SlotOutOfRange` | 帧槽索引超出帧容量 |
-/// | `InvalidFieldOffset` | 字段偏移不合法或不在 trace descriptor 允许的范围内 |
-/// | `InvalidStoredReference` | 存储的引用指向无效对象 |
-/// | `NotPinned` | 尝试解钉一个未被钉住的对象 |
+/// 该错误用于 ELM 等不能被信任为 allocator 全权调用方的执行环境。它把“地址不存在”与
+/// “地址存在但不属于调用方”分开，同时禁止外部所有者取得 boot 或 physical 对象。
+/// 调用方不得根据具体错误绕过资源账本继续操作裸地址。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ManagedHandleError {
-    NotInitialized,
-    InvalidHandle,
-    RootTableFull,
-    SlotOutOfRange,
-    InvalidFieldOffset,
-    InvalidStoredReference,
-    NotPinned,
+pub enum OwnedAllocationError {
+    /// 所有者编号为零；零只保留给内核自身。
+    InvalidOwner,
+    /// 请求布局、内存域或对象种类不属于普通可调整内核分配。
+    InvalidRequest,
+    /// 地址不是仍然活跃的逐对象分配起始地址。
+    UnknownPointer,
+    /// 活跃对象属于另一个资源所有者。
+    PermissionDenied,
+    /// 调用方要求保持有效的外部区间与待移动对象发生重叠。
+    AliasedRange,
+    /// allocator 尚未激活。
+    Unavailable,
+    /// 资源预算或底层内存不足。
+    OutOfMemory,
+    /// allocator 后端拒绝了已经通过账本校验的操作。
+    BackendFailure,
 }
 
 // ---------------------------------------------------------------------------

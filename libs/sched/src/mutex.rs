@@ -15,7 +15,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scheduler::{current_task, now_ns_public, schedule_once};
-use crate::task::TaskState;
+use crate::task::{TaskState, WaitReason};
 use crate::wait::WaitQueue;
 
 /// 可睡眠互斥锁。
@@ -39,7 +39,7 @@ impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
-            waiters: WaitQueue::new(),
+            waiters: WaitQueue::new_with_reason(WaitReason::Mutex),
             data: UnsafeCell::new(data),
         }
     }
@@ -73,19 +73,19 @@ impl<T> Mutex<T> {
             }
 
             let current = current_task();
-            self.waiters.prepare_to_wait(&current, TaskState::Sleeping);
+            let entry = self.waiters.prepare_to_wait(&current, TaskState::Sleeping);
 
             if self
                 .locked
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                self.waiters.finish_wait(&current);
+                self.waiters.finish_wait(&entry);
                 return MutexGuard { lock: self };
             }
 
             schedule_once(now_ns_public());
-            self.waiters.finish_wait(&current);
+            self.waiters.finish_wait(&entry);
         }
     }
 }

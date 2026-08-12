@@ -1,13 +1,14 @@
 //! signalfd-backed anonymous files.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::ops::ControlFlow;
 
 use errno::Errno;
-use sched::{SigInfo, SigSet, Task, WaitQueue};
+use sched::{SigInfo, SigSet, SignalObserver, Task, WaitQueue};
 
+use crate::poll_source::PollSource;
 use crate::vfs::anon;
 use crate::vfs::cred::Credentials;
 use crate::vfs::error::{VfsError, VfsResult};
@@ -16,27 +17,76 @@ use crate::vfs::file::{AccessMode, DirEntry, FileOps, IoctlCmd, OpenOptions, Pol
 use crate::vfs::sync::Spinlock;
 
 pub struct SignalfdFileOps {
+    shared: Arc<SignalfdShared>,
+}
+
+struct SignalfdShared {
     mask: Spinlock<SigSet>,
     waiters: WaitQueue,
+    poll_source: PollSource,
+    owner: Weak<Task>,
 }
 
 impl SignalfdFileOps {
     pub fn new(mask: SigSet) -> Self {
-        Self {
+        let owner = if sched::is_ready() {
+            Some(sched::current_task())
+        } else {
+            None
+        };
+        let shared = Arc::new(SignalfdShared {
             mask: Spinlock::new(mask.sanitized()),
             waiters: WaitQueue::new(),
+            poll_source: PollSource::new(PollEvents::default()),
+            owner: owner.as_ref().map_or_else(Weak::new, Arc::downgrade),
+        });
+        if let Some(owner) = owner {
+            let observer: Arc<dyn SignalObserver> = shared.clone();
+            let weak = Arc::downgrade(&observer);
+            owner.signal.subscribe(weak.clone());
+            owner.shared_signal().subscribe(weak);
         }
+        shared.publish_readiness();
+        Self { shared }
     }
 
     pub fn set_mask(&self, mask: SigSet) {
-        *self.mask.lock() = mask.sanitized();
-        self.waiters.wake_all();
+        *self.shared.mask.lock() = mask.sanitized();
+        self.refresh_readiness();
+        self.shared.waiters.wake_all();
     }
 
+    fn refresh_readiness(&self) {
+        self.shared.publish_readiness();
+    }
+}
+
+impl SignalfdShared {
     fn pending(&self) -> bool {
+        let Some(owner) = self.owner.upgrade() else {
+            return false;
+        };
         let mask = self.mask.lock().raw();
-        let task = sched::current_task();
-        task.signal.has_pending_in(mask) || task.shared_signal().has_pending_in(mask)
+        owner.signal.has_pending_in(mask) || owner.shared_signal().has_pending_in(mask)
+    }
+
+    fn publish_readiness(&self) {
+        let version = self.poll_source.reserve_version();
+        let readiness = if self.pending() {
+            PollEvents::POLLIN
+        } else {
+            PollEvents::default()
+        };
+        self.poll_source.publish_versioned(readiness, version);
+    }
+}
+
+impl SignalObserver for SignalfdShared {
+    fn signal_state_changed(&self) {
+        self.publish_readiness();
+        if self.pending() {
+            self.waiters.wake_all();
+        }
     }
 }
 
@@ -45,7 +95,7 @@ impl FileOps for SignalfdFileOps {
         if buf.len() < SIGNALFD_SIGINFO_SIZE {
             return Err(VfsError::InvalidArgument);
         }
-        let mask = *self.mask.lock();
+        let mask = *self.shared.mask.lock();
         let mut written = 0usize;
         while written + SIGNALFD_SIGINFO_SIZE <= buf.len() {
             let Some(info) = sched::operation::sigtimedwait_poll(mask) else {
@@ -57,6 +107,7 @@ impl FileOps for SignalfdFileOps {
         if written == 0 {
             return Err(VfsError::WouldBlock);
         }
+        self.refresh_readiness();
         Ok(written)
     }
 
@@ -77,23 +128,27 @@ impl FileOps for SignalfdFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let ready = if self.pending() {
-            PollEvents::POLLIN
-        } else {
-            PollEvents::default()
-        };
-        ready.intersect(interest)
+        self.refresh_readiness();
+        self.shared.poll_source.snapshot().0.intersect(interest)
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
         if interest.has(PollEvents::POLLIN) {
-            self.waiters.enqueue(task);
+            self.shared.waiters.enqueue(task);
         }
         true
     }
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
-        self.waiters.remove(task);
+        self.shared.waiters.remove(task);
+    }
+
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.shared.poll_source)
+    }
+
+    fn is_epollable(&self) -> bool {
+        true
     }
 
     fn is_seekable(&self) -> bool {
@@ -105,7 +160,7 @@ impl FileOps for SignalfdFileOps {
     }
 
     fn release(&self) {
-        self.waiters.wake_all();
+        self.shared.waiters.wake_all();
     }
 
     fn as_any(&self) -> &dyn Any {

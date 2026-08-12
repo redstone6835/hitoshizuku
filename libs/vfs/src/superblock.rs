@@ -275,6 +275,24 @@ pub trait SuperblockOps {
     /// 为空，因为"存储"就是内存本身。
     fn write_inode(&self, inode: &Arc<Inode>) -> VfsResult<()>;
 
+    /// 是否允许缓存层驱逐仍为正向的 Dentry。
+    ///
+    /// 默认保持 `false`：tmpfs、devtmpfs 等内存文件系统可能只由
+    /// Dentry 强引用保活 Inode，驱逐会导致文件内容永久丢失。能够从
+    /// 持久化后端完整重建 Inode 语义的文件系统应显式返回 `true`。
+    fn can_evict_positive_dentry(&self) -> bool {
+        false
+    }
+
+    /// 最后一个挂载实例释放后，是否仍需保留整棵 dentry 树。
+    ///
+    /// 默认文件系统在最后一个 Mount 生命周期结束时清理缓存。像 devtmpfs 这类由
+    /// 内核全局单例持有、后续 mount 仍会复用同一 Superblock 的文件系统必须返回
+    /// `true`，否则一次完整卸载会让单例根目录永久失效。
+    fn retain_dentries_without_mounts(&self) -> bool {
+        false
+    }
+
     /// 返回 `&dyn Any`，用于向下转型到具体 FS 驱动的超级块操作类型。
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
@@ -488,6 +506,7 @@ pub struct FsRegistry {
 unsafe impl Sync for FsRegistry {}
 unsafe impl Send for FsRegistry {}
 
+#[kernel_symbols::export]
 impl FsRegistry {
     /// 构造空注册表。
     pub const fn new() -> Self {
@@ -503,6 +522,14 @@ impl FsRegistry {
     ///
     /// 成功返回分配到的索引，注册表已满时返回 `Err`。
     /// 不检查重名——调用方应确保不重复注册同名驱动。
+    #[kernel_symbols::export(
+        name = "vfs.superblock.FsRegistry.register",
+        contract = "kernel.vfs.filesystem-registry@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 1
+    )]
     pub fn register(&self, driver: &'static dyn FsDriver) -> VfsResult<usize> {
         // 1. 原子抢占唯一槽位
         let idx = self.reserved_idx.fetch_add(1, Ordering::Relaxed);
@@ -529,6 +556,13 @@ impl FsRegistry {
     }
 
     /// 按名称查找已注册驱动（O(1) 期望，哈希索引）。
+    #[kernel_symbols::export(
+        name = "vfs.superblock.FsRegistry.find",
+        contract = "kernel.vfs.filesystem-registry@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_MODULE_BORROW
+    )]
     pub fn find(&self, name: &str) -> Option<&'static dyn FsDriver> {
         self.name_index
             .find(name, self.slots.get() as *const Option<FsDriverEntry>)
@@ -559,6 +593,13 @@ impl FsRegistry {
     }
 
     /// 返回所有已注册文件系统的名称列表（用于 `/proc/filesystems`）。
+    #[kernel_symbols::export(
+        name = "vfs.superblock.FsRegistry.list_names",
+        contract = "kernel.vfs.filesystem-registry@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn list_names(&self) -> Vec<String> {
         self.iter().map(|e| String::from(e.driver.name())).collect()
     }

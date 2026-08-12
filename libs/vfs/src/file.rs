@@ -21,7 +21,8 @@
 //!   保证驱动私有状态（缓冲区、打开计数等）在最后一个引用消失时被正确清理。
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -32,7 +33,7 @@ use crate::vfs::dentry::SmallStr;
 
 use crate::vfs::cred::Credentials;
 use crate::vfs::error::VfsResult;
-use crate::vfs::inode::Inode;
+use crate::vfs::inode::{Inode, InodeWriteAccess};
 use crate::vfs::stat::FileStat;
 use crate::vfs::sync::Spinlock;
 
@@ -47,6 +48,13 @@ pub struct FileDiag {
     pub dropped: usize,
 }
 
+#[kernel_symbols::export(
+    name = "vfs.file.file_diag",
+    contract = "kernel.vfs.file-diagnostic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn file_diag() -> FileDiag {
     FileDiag {
         live: FILE_LIVE.load(Ordering::Acquire),
@@ -125,6 +133,43 @@ impl OpenOptions {
     }
 }
 
+/// 文件范围预分配操作的语义模式。
+///
+/// 这是 VFS 内部的类型化表示，不暴露任何具体系统调用 ABI 的位编号。系统调用
+/// 层负责把用户态的模式位解码成这里的值，具体文件系统只需要实现自己支持的
+/// 语义。未知位不会被静默丢弃，底层实现应返回 [`VfsError::NotSupported`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FallocateMode(u32);
+
+impl FallocateMode {
+    /// 不改变文件大小的额外标志：普通预分配，同时允许扩大逻辑文件大小。
+    pub const NONE: Self = Self(0);
+    /// 只分配存储，不改变逻辑文件大小。
+    pub const KEEP_SIZE: Self = Self(1 << 0);
+    /// 释放指定范围的已分配页；必须与 [`Self::KEEP_SIZE`] 一起使用。
+    pub const PUNCH_HOLE: Self = Self(1 << 1);
+
+    /// 从 VFS 内部位集合构造模式。
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// 返回模式的内部位集合。
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// 判断是否包含指定语义位。
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// 合并两个模式位。
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 // ── 文件定位 ──────────────────────────────────────────────────────────────────
 
 /// `lseek(2)` 的基准点，对应 `SEEK_SET`/`SEEK_CUR`/`SEEK_END`。
@@ -136,6 +181,10 @@ pub enum SeekFrom {
     Current(i64),
     /// 从文件末尾计算（`SEEK_END`），`offset` 通常 ≤ 0。
     End(i64),
+    /// 从指定绝对偏移查找下一个已分配数据区（`SEEK_DATA`）。
+    Data(u64),
+    /// 从指定绝对偏移查找下一个空洞或文件末尾（`SEEK_HOLE`）。
+    Hole(u64),
 }
 
 // ── I/O 事件掩码（poll/select/epoll） ────────────────────────────────────────
@@ -342,6 +391,15 @@ pub struct File {
     /// 当前文件读写偏移量（字节）。
     pub(crate) pos: AtomicU64,
 
+    /// 指向此打开文件描述的 fd 数量。
+    ///
+    /// 该计数独立于 `Arc` 强引用：epoll watch、VMA 和内核临时引用都不属于
+    /// 用户可见 fd，不能参与“最后一个描述符已关闭”的判断。
+    fd_references: AtomicUsize,
+
+    /// 监听此打开文件描述最后一个 fd 关闭事件的对象。
+    description_close_observers: Spinlock<Vec<Weak<File>>>,
+
     /// 串行化会读取或推进共享偏移的操作。
     pos_lock: Spinlock<()>,
 
@@ -367,13 +425,29 @@ pub struct File {
     /// `File::drop` 时自动调用 `mount.dec_open()`，保证卸载安全检查（`is_busy()`）
     /// 的准确性：只要有打开的 fd，挂载点就不会被误判为空闲而被强制卸载。
     pub(crate) mount: Arc<crate::vfs::mount::Mount>,
+
+    /// 普通文件的写访问租约。
+    ///
+    /// 只有 VFS 规范打开路径会设置该字段；设备、管道、套接字等合成描述符不参与
+    /// 可执行文件写入排斥。租约跟随打开文件描述而不是 fd，因此 `dup` 不重复计数。
+    _write_access: Option<InodeWriteAccess>,
 }
 
+#[kernel_symbols::export]
 impl File {
     /// 构造一个新的打开文件描述符。
     ///
     /// 由 VFS 层在 `InodeOps::open` 返回后调用；`dentry` 是打开的文件对应的 Dentry，
     /// 用于 `Dirfd::Fd` 场景下的路径解析基准。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.new",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 1 << 3
+    )]
     pub fn new(
         inode: Arc<Inode>,
         flags: OpenOptions,
@@ -381,6 +455,31 @@ impl File {
         ops: Box<dyn FileOps + Send + Sync>,
         dentry: Arc<crate::vfs::dentry::Dentry>,
         mount: Arc<crate::vfs::mount::Mount>,
+    ) -> Self {
+        Self::new_inner(inode, flags, cred, ops, dentry, mount, None)
+    }
+
+    /// 使用已经获取的普通文件写访问租约构造打开文件描述。
+    pub(crate) fn new_with_write_access(
+        inode: Arc<Inode>,
+        flags: OpenOptions,
+        cred: Arc<Credentials>,
+        ops: Box<dyn FileOps + Send + Sync>,
+        dentry: Arc<crate::vfs::dentry::Dentry>,
+        mount: Arc<crate::vfs::mount::Mount>,
+        write_access: InodeWriteAccess,
+    ) -> Self {
+        Self::new_inner(inode, flags, cred, ops, dentry, mount, Some(write_access))
+    }
+
+    fn new_inner(
+        inode: Arc<Inode>,
+        flags: OpenOptions,
+        cred: Arc<Credentials>,
+        ops: Box<dyn FileOps + Send + Sync>,
+        dentry: Arc<crate::vfs::dentry::Dentry>,
+        mount: Arc<crate::vfs::mount::Mount>,
+        write_access: Option<InodeWriteAccess>,
     ) -> Self {
         FILE_CREATED.fetch_add(1, Ordering::Relaxed);
         FILE_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -392,30 +491,100 @@ impl File {
             owner_pid: AtomicI32::new(0),
             owner_sig: AtomicI32::new(0),
             pos: AtomicU64::new(0),
+            fd_references: AtomicUsize::new(0),
+            description_close_observers: Spinlock::new(Vec::new()),
             pos_lock: Spinlock::new(()),
             cred,
             ops,
             dentry,
             mount,
+            _write_access: write_access,
         }
     }
 
     /// 返回此文件所在挂载点的共享引用。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.mount",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn mount(&self) -> &Arc<crate::vfs::mount::Mount> {
         &self.mount
     }
 
     /// 返回此文件对应的 Dentry。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.dentry",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn dentry(&self) -> &Arc<crate::vfs::dentry::Dentry> {
         &self.dentry
     }
 
     /// 返回当前读写偏移量。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.pos",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn pos(&self) -> u64 {
         self.pos.load(Ordering::Acquire)
     }
 
+    pub(crate) fn acquire_fd_reference(&self) {
+        let previous = self.fd_references.fetch_add(1, Ordering::AcqRel);
+        assert!(previous != usize::MAX, "打开文件描述的 fd 引用计数已耗尽");
+    }
+
+    pub(crate) fn release_fd_reference(&self) -> bool {
+        let previous = self.fd_references.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "打开文件描述的 fd 引用计数下溢");
+        previous == 1
+    }
+
+    pub(crate) fn register_description_close_observer(&self, observer: &Arc<File>) {
+        let mut observers = self.description_close_observers.lock();
+        observers.retain(|weak| weak.upgrade().is_some());
+        if observers.iter().any(|weak| {
+            weak.upgrade()
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, observer))
+        }) {
+            return;
+        }
+        observers.push(Arc::downgrade(observer));
+    }
+
+    pub(crate) fn notify_description_closed(file: &Arc<File>) {
+        let observers = {
+            let mut registered = file.description_close_observers.lock();
+            let mut observers = Vec::new();
+            registered.retain(|weak| {
+                if let Some(observer) = weak.upgrade() {
+                    observers.push(observer);
+                    true
+                } else {
+                    false
+                }
+            });
+            observers
+        };
+        for observer in observers {
+            observer.on_file_description_closed(file);
+        }
+    }
+
     /// 返回打开选项。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.flags",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn flags(&self) -> OpenOptions {
         StatusFlags(self.status_flags.load(Ordering::Acquire)).apply(self.flags)
     }
@@ -468,10 +637,45 @@ impl File {
         &self.inode
     }
 
+    /// 为内核执行映像装载器创建一个可读文件视图。
+    ///
+    /// `O_PATH` 描述符本身禁止普通读写，但 `execveat(AT_EMPTY_PATH)` 必须能够从其
+    /// 指向的 inode 装载映像。调用方必须先完成执行权限和写入排斥检查；本方法只
+    /// 重新建立驱动文件操作对象，不重新解析路径，也不向用户态暴露新的描述符。
+    pub fn open_exec_view(&self, cred: Arc<Credentials>) -> VfsResult<Arc<Self>> {
+        if self.inode.kind() != crate::vfs::stat::FileType::Regular {
+            return Err(crate::vfs::error::VfsError::PermissionDenied);
+        }
+        let flags = OpenOptions {
+            access: AccessMode::ReadOnly,
+            ..OpenOptions::default()
+        };
+        let ops = self.inode.ops.open(&self.inode, &flags, &cred)?;
+        let file = Self::new(
+            Arc::clone(&self.inode),
+            flags,
+            cred,
+            ops,
+            Arc::clone(&self.dentry),
+            Arc::clone(&self.mount),
+        );
+        self.mount.inc_open();
+        Ok(Arc::new(file))
+    }
+
     /// 读取数据到 `buf`，从当前偏移量开始，读完后推进偏移量。
     ///
     /// 对 `O_PATH` 描述符调用 `read` 将返回 `VfsError::BadFileDescriptor`。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.read",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsRead);
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
@@ -480,53 +684,125 @@ impl File {
         let n = self.ops.read_at(buf, offset)?;
         self.pos
             .store(offset.saturating_add(n as u64), Ordering::Release);
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(n);
         Ok(n)
     }
 
     /// 将 `buf` 中的数据写入文件，从当前偏移量（或文件末尾，若 `O_APPEND`）开始。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.write",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsWrite);
         let flags = self.flags();
         if !flags.writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         let _pos_guard = self.pos_lock.lock();
+        let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
         if flags.append {
             let n = self.ops.write_at(buf, u64::MAX)?;
             let new_eof = self.inode.size();
             self.pos.store(new_eof, Ordering::Release);
+            #[cfg(feature = "performance-profile")]
+            profile.set_bytes(n);
             Ok(n)
         } else {
             let offset = self.pos.load(Ordering::Acquire);
             let n = self.ops.write_at(buf, offset)?;
             self.pos
                 .store(offset.saturating_add(n as u64), Ordering::Release);
+            #[cfg(feature = "performance-profile")]
+            profile.set_bytes(n);
             Ok(n)
         }
     }
 
     /// 在指定偏移量处读取，不改变描述符的当前偏移量（`pread64`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.read_at",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO
+    )]
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsRead);
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
-        self.ops.read_at(buf, offset)
+        let n = self.ops.read_at(buf, offset)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(n);
+        Ok(n)
+    }
+
+    /// 从指定偏移精确初始化一组页面，不改变描述符的当前偏移量。
+    ///
+    /// 前 `valid_len` 字节必须来自文件，剩余页面尾部由底层实现清零。该接口供
+    /// VM 批量缺页路径使用，普通文件系统可以覆盖 [`FileOps::read_pages_at`]
+    /// 以避免中间缓冲和二次复制。
+    pub fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> VfsResult<()> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsRead);
+        if !self.flags().readable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        if !self.ops.is_seekable() {
+            return Err(crate::vfs::error::VfsError::IllegalSeek);
+        }
+        self.ops.read_pages_at(offset, pages, valid_len)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(valid_len);
+        Ok(())
     }
 
     /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.write_at",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::VfsWrite);
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
-        self.ops.write_at(buf, offset)
+        let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
+        let n = self.ops.write_at(buf, offset)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(n);
+        Ok(n)
     }
 
     /// 移动文件偏移量（`lseek`）。返回移动后的绝对偏移量。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.seek",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn seek(&self, from: SeekFrom) -> VfsResult<u64> {
         let _pos_guard = self.pos_lock.lock();
         let new_pos = match from {
@@ -557,6 +833,8 @@ impl File {
                     size - abs
                 }
             }
+            SeekFrom::Data(offset) => self.ops.seek_data(offset, self.inode.size())?,
+            SeekFrom::Hole(offset) => self.ops.seek_hole(offset, self.inode.size())?,
         };
         self.pos.store(new_pos, Ordering::Release);
         Ok(new_pos)
@@ -571,6 +849,8 @@ impl File {
     /// 函数返回枚举实际停止时的新游标值（可用于下次 `readdir` 的起始位置）。
     /// 游标语义由驱动自定义（通常为已枚举条目数；不同文件系统实现可能不同）。
     pub fn readdir(&self, sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::VfsGetdents);
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
@@ -585,16 +865,25 @@ impl File {
     }
 
     /// 修改文件大小，委托给底层文件系统以同步数据容器和 inode 元数据。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.truncate",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn truncate(&self, size: u64) -> VfsResult<()> {
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         self.mount.check_writable()?;
-        self.inode.ops.truncate(&self.inode, size)
+        let _data_mutation = self.inode.begin_data_mutation();
+        self.inode.ops.truncate(&self.inode, size)?;
+        Ok(())
     }
 
-    /// 为指定范围分配底层存储。是否支持由具体文件系统决定。
-    pub fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+    /// 按指定模式调整文件范围的底层存储。是否支持由具体文件系统决定。
+    pub fn fallocate(&self, mode: FallocateMode, offset: u64, len: u64) -> VfsResult<()> {
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
@@ -608,7 +897,9 @@ impl File {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
         self.mount.check_writable()?;
-        self.ops.fallocate(offset, len)
+        let _data_mutation = self.inode.begin_data_mutation();
+        self.ops.fallocate(mode, offset, len)?;
+        Ok(())
     }
 
     /// 将文件操作对象向下转型为具体驱动类型 `T`。
@@ -633,17 +924,49 @@ impl File {
     }
 
     /// 将文件内容刷入底层存储（`fsync`）：等待数据和元数据均落盘。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.sync",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync(&self) -> VfsResult<()> {
+        self.check_syncable()?;
         self.ops.sync()?;
         self.inode.ops.sync_metadata(&self.inode)
     }
 
     /// 仅将数据刷盘，不保证元数据（如 mtime）同步（`fdatasync`）。
     pub fn datasync(&self) -> VfsResult<()> {
+        self.check_syncable()?;
         self.ops.sync()
     }
 
+    fn check_syncable(&self) -> VfsResult<()> {
+        if self.flags().path_only {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        match self.inode.kind() {
+            crate::vfs::stat::FileType::Regular
+            | crate::vfs::stat::FileType::Directory
+            | crate::vfs::stat::FileType::BlockDevice => Ok(()),
+            crate::vfs::stat::FileType::Symlink
+            | crate::vfs::stat::FileType::CharDevice
+            | crate::vfs::stat::FileType::Fifo
+            | crate::vfs::stat::FileType::Socket => {
+                Err(crate::vfs::error::VfsError::InvalidArgument)
+            }
+        }
+    }
+
     /// 获取文件当前元数据快照（`fstat`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.stat",
+        contract = "kernel.vfs.file@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn stat(&self) -> VfsResult<FileStat> {
         self.inode.stat()
     }
@@ -653,6 +976,12 @@ impl File {
     /// `interest` 指定调用方感兴趣的事件掩码；返回值为当前已就绪的事件子集
     /// （`interest` 与实际就绪事件的交集）。若无就绪事件，调用方应将此
     /// 描述符加入内核等待队列（等待队列由调度器层实现，此处不涉及）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.poll",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO
+    )]
     pub fn poll(&self, interest: PollEvents) -> PollEvents {
         let ready = self.ops.poll(interest);
         // POLLERR/POLLHUP/POLLNVAL 始终返回，不受 interest 过滤（POSIX 语义）。
@@ -668,6 +997,31 @@ impl File {
 
     pub fn poll_remove_waiter(&self, task: &Arc<Task>) {
         self.ops.poll_remove_waiter(task)
+    }
+
+    /// 判断该打开文件描述是否允许加入 epoll 实例。
+    ///
+    /// `poll(2)` 会把没有专用等待源的普通文件视为立即可读写，但 Linux 的
+    /// `epoll_ctl(2)` 只接纳底层明确提供事件轮询能力的文件。该能力必须由
+    /// 具体 `FileOps` 显式声明，不能根据 inode 类型或当前就绪结果推断。
+    pub fn is_epollable(&self) -> bool {
+        self.ops.is_epollable()
+    }
+
+    /// 执行由具体打开文件描述实现的 `fcntl(2)` 命令。
+    ///
+    /// 通用描述符标志和记录锁仍由系统调用层统一处理；只有必须访问底层对象
+    /// 私有状态的命令才下沉到这里，例如 pipe 容量调整。
+    pub fn fcntl(&self, cmd: usize, arg: usize, cred: &Credentials) -> Result<usize, Errno> {
+        self.ops.fcntl(cmd, arg, cred)
+    }
+
+    /// 返回可供事件订阅器直接监听的就绪源。
+    ///
+    /// 新的 epoll 实现以该对象的代际通知为准；旧式 `poll_add_waiter` 仍保留给
+    /// 不具备稳定就绪源的文件类型和普通阻塞 I/O。
+    pub fn poll_source(&self) -> Option<&crate::poll_source::PollSource> {
+        self.ops.poll_source()
     }
 
     pub fn on_fd_closed(&self, fd: u32) {
@@ -687,6 +1041,13 @@ impl File {
     }
 
     /// 执行设备或文件系统特定的控制命令（`ioctl(2)`）。
+    #[kernel_symbols::export(
+        name = "vfs.file.File.ioctl",
+        contract = "kernel.vfs.file-io@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_IO,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         if self.flags.path_only {
             return Err(Errno::EBADF);
@@ -724,10 +1085,31 @@ impl ::mm::FileLike for File {
         Arc::as_ptr(&self.inode) as usize
     }
 
+    fn private_page_cache_key(&self) -> Option<usize> {
+        self.inode.private_page_cache_key()
+    }
+
+    fn private_page_cache_generation(&self) -> Option<u64> {
+        self.inode.private_page_cache_generation()
+    }
+
+    fn disable_private_page_cache(&self) {
+        self.inode.disable_private_page_cache();
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, errno::Errno> {
         // File::read_at 会检查 readable flag；loader / mmap 场景打开时必然带
         // O_RDONLY，返错说明文件描述符状态异常——映回 EIO。
         File::read_at(self, buf, offset).map_err(|_| errno::Errno::EIO)
+    }
+
+    fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> Result<(), errno::Errno> {
+        File::read_pages_at(self, offset, pages, valid_len).map_err(|error| error.to_errno())
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, errno::Errno> {
@@ -739,7 +1121,9 @@ impl ::mm::FileLike for File {
     }
 
     fn size(&self) -> u64 {
-        File::stat(self).map(|s| s.size as u64).unwrap_or(0)
+        // 缺页和 fault-around 会频繁查询 EOF；inode 已在所有长度修改路径发布
+        // 同一份原子快照，无需为每个候选窗口重新构造完整 stat。
+        self.inode.size()
     }
 }
 
@@ -760,6 +1144,18 @@ pub trait FileOps {
     /// 返回 `Ok(0)` 表示到达文件末尾（EOF）。不应修改文件的当前偏移量，
     /// 偏移量的推进由 [`File::read`] 统一处理。
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
+
+    /// 从 `offset` 起精确填充页面前 `valid_len` 字节，并把剩余尾部清零。
+    ///
+    /// 默认路径循环调用 [`Self::read_at`]；文件系统可覆盖它以直接填充调用方页。
+    fn read_pages_at(
+        &self,
+        offset: u64,
+        pages: &mut [&mut [u8]],
+        valid_len: usize,
+    ) -> VfsResult<()> {
+        read_pages_at_default(self, offset, pages, valid_len)
+    }
 
     /// 在指定 `offset` 处写入 `buf`，返回实际写入字节数。
     ///
@@ -810,6 +1206,24 @@ pub trait FileOps {
     /// 显式移除之前登记的等待者。
     fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
 
+    /// 是否允许该打开文件描述加入 epoll。
+    ///
+    /// 默认关闭，避免普通文件、目录以及仅为兼容 `poll(2)` 返回立即就绪的
+    /// 对象被误接纳。真正的事件源应在实现中显式返回 `true`。
+    fn is_epollable(&self) -> bool {
+        false
+    }
+
+    /// 处理文件类型私有的 `fcntl(2)` 命令。
+    fn fcntl(&self, _cmd: usize, _arg: usize, _cred: &Credentials) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+
+    /// 返回稳定的就绪状态发布源；默认文件类型不提供事件订阅能力。
+    fn poll_source(&self) -> Option<&crate::poll_source::PollSource> {
+        None
+    }
+
     /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。
     fn set_status_flags(&self, _flags: OpenOptions) {}
 
@@ -835,8 +1249,21 @@ pub trait FileOps {
         true
     }
 
-    /// 为指定范围分配底层存储。默认表示该文件类型不支持 `fallocate(2)`。
-    fn fallocate(&self, _offset: u64, _len: u64) -> VfsResult<()> {
+    /// 查找指定偏移之后的第一个已分配数据字节。
+    ///
+    /// 不具备稀疏区间信息的文件类型默认不声明支持，避免把设备、目录或匿名对象
+    /// 错误地解释为普通稠密文件。
+    fn seek_data(&self, _offset: u64, _file_size: u64) -> VfsResult<u64> {
+        Err(crate::vfs::error::VfsError::NotSupported)
+    }
+
+    /// 查找指定偏移之后的第一个空洞字节或逻辑文件末尾。
+    fn seek_hole(&self, _offset: u64, _file_size: u64) -> VfsResult<u64> {
+        Err(crate::vfs::error::VfsError::NotSupported)
+    }
+
+    /// 按指定模式调整文件范围的底层存储。默认表示该文件类型不支持该操作。
+    fn fallocate(&self, _mode: FallocateMode, _offset: u64, _len: u64) -> VfsResult<()> {
         Err(crate::vfs::error::VfsError::NotSupported)
     }
 
@@ -863,4 +1290,60 @@ pub trait FileOps {
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
     fn as_any(&self) -> &dyn core::any::Any;
+}
+
+/// [`FileOps::read_pages_at`] 的通用精确读取实现。
+///
+/// 单独暴露此函数，便于文件系统在无法使用自身对齐快速路径时回退，同时避免
+/// 通过 trait 默认方法形成递归调用。
+pub fn read_pages_at_default<T: FileOps + ?Sized>(
+    ops: &T,
+    offset: u64,
+    pages: &mut [&mut [u8]],
+    valid_len: usize,
+) -> VfsResult<()> {
+    let mut capacity = 0usize;
+    for page in pages.iter() {
+        if page.is_empty() {
+            return Err(crate::vfs::error::VfsError::InvalidArgument);
+        }
+        capacity = capacity
+            .checked_add(page.len())
+            .ok_or(crate::vfs::error::VfsError::FileTooLarge)?;
+    }
+    if valid_len > capacity {
+        return Err(crate::vfs::error::VfsError::InvalidArgument);
+    }
+    let valid_len_u64 =
+        u64::try_from(valid_len).map_err(|_| crate::vfs::error::VfsError::FileTooLarge)?;
+    offset
+        .checked_add(valid_len_u64)
+        .ok_or(crate::vfs::error::VfsError::FileTooLarge)?;
+
+    let mut page_start = 0usize;
+    for page in pages.iter_mut() {
+        let tail_start = valid_len.saturating_sub(page_start).min(page.len());
+        page[tail_start..].fill(0);
+        page_start += page.len();
+    }
+
+    let mut remaining = valid_len;
+    let mut read_offset = offset;
+    for page in pages.iter_mut() {
+        let page_valid = remaining.min(page.len());
+        let mut done = 0usize;
+        while done < page_valid {
+            let count = ops.read_at(&mut page[done..page_valid], read_offset)?;
+            if count == 0 || count > page_valid - done {
+                return Err(crate::vfs::error::VfsError::Io);
+            }
+            done += count;
+            read_offset += count as u64;
+        }
+        remaining -= page_valid;
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
 }

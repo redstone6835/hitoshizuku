@@ -720,5 +720,6 @@ fn map_function_registry_errno(err: FunctionRegistryError) -> Errno {
         FunctionRegistryError::NameExists => Errno::EEXIST,
         FunctionRegistryError::NotFound => Errno::ENODEV,
         FunctionRegistryError::OutOfMemory => Errno::ENOMEM,
+        FunctionRegistryError::InvalidName | FunctionRegistryError::IdExhausted => Errno::EINVAL,
     }
 }

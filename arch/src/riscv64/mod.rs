@@ -21,6 +21,7 @@ pub mod loader; // RISC-V 不走 UEFI，仅提供 panic stub
 
 // ── 异常与中断 ────────────────────────────────────────────────────────────────
 
+mod elm_native;
 pub mod syscall;
 pub mod trap;
 pub mod trap_frame;
@@ -29,17 +30,20 @@ pub mod trap_frame;
 
 pub mod addr;
 pub mod heap_vm;
+mod mem;
 pub mod mm;
 pub mod paging;
 
 // ── 任务 ──────────────────────────────────────────────────────────────────────
 
 pub mod sched_ctx;
+pub mod smp;
 pub mod task;
 
 // ── 平台服务 ──────────────────────────────────────────────────────────────────
 
 pub mod early_console;
+pub mod sbi;
 pub mod specific;
 pub mod time;
 pub mod vdso;
@@ -55,8 +59,13 @@ mod random_source;
 // `specific` 聚合了 csr / trap_frame / addr / time 的全量符号并追加别名常量，
 // 通过 glob re-export 让上层可以 `use crate::riscv64::*` 统一引用 arch 符号。
 
+pub use elm_native::{
+    call_elm_native, call_elm_native_current_stack, elm_native_recovery_address, resume_elm_panic,
+};
+pub use heap_vm::activate_kernel_page_table;
 pub use mm::user_copy::set_sum;
 pub use random_source::register as register_entropy_source;
 pub use sched_ctx::register as register_sched_ctx;
+pub use smp::{SecondaryCpuReport, start_secondary_cpus};
 pub use specific::*;
 pub use task::Riscv64TaskOps;

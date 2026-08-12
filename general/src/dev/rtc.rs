@@ -44,7 +44,14 @@ pub struct RtcDateTime {
     pub second: u32,
 }
 
+#[kernel_symbols::export]
 impl RtcDateTime {
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDateTime.new",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     pub fn new(
         year: u32,
         month: u32,
@@ -64,6 +71,12 @@ impl RtcDateTime {
         value.is_valid().then_some(value)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDateTime.from_unix_time_ns",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     pub fn from_unix_time_ns(ns: u64) -> Option<Self> {
         let mut days = ns / NSEC_PER_SEC / SECS_PER_DAY;
         let seconds_of_day = (ns / NSEC_PER_SEC) % SECS_PER_DAY;
@@ -101,6 +114,12 @@ impl RtcDateTime {
         )
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDateTime.unix_time_ns",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::CORE_SAFE
+    )]
     pub fn unix_time_ns(self) -> Option<u64> {
         let seconds = self.days_since_unix_epoch()?.checked_mul(SECS_PER_DAY)?;
         seconds
@@ -380,7 +399,16 @@ impl RtcRuntimeState {
     }
 }
 
+#[kernel_symbols::export]
 impl RtcDevice {
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDevice.new",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
     pub fn new(projection_name: FunctionProjectionName, driver: Arc<dyn RtcDriver>) -> Self {
         let index = projection_name.index();
         Self {
@@ -397,6 +425,14 @@ impl RtcDevice {
     ///
     /// `stable_key` 由 PnP 设备身份或固件路径提供。RTC core 统一管理投影命名，
     /// 具体硬件驱动只需要传入自身实例身份，避免在驱动里散落 `rtc{n}` 拼接逻辑。
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDevice.alloc_stable_projection_name",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn alloc_stable_projection_name(
         stable_key: &str,
     ) -> Result<FunctionProjectionName, FunctionProjectionNameAllocError> {
@@ -422,6 +458,13 @@ impl RtcDevice {
         self.state() == RtcDeviceState::Active
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDevice.mark_gone",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn mark_gone(&self) {
         self.state
             .store(RtcDeviceState::Gone as u8, Ordering::Release);
@@ -444,6 +487,13 @@ impl RtcDevice {
     /// 平台中断处理器在确认 alarm/update/periodic 事件后调用本方法。通用层会按
     /// 当前 enable bit 过滤事件、合并 pending word，并通过 WaitQueue 唤醒
     /// 阻塞 read/poll。这样 IRQ 分发路径不需要知道 ioctl ABI 的位布局。
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcDevice.record_irq",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn record_irq(&self, data: RtcIrqData) -> Result<(), RtcError> {
         self.ensure_active()?;
         let mut runtime = self.runtime.lock();
@@ -669,9 +719,30 @@ pub struct RtcFunction {
     dev: Arc<RtcDevice>,
 }
 
+#[kernel_symbols::export]
 impl RtcFunction {
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcFunction.new",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 1u64
+    )]
     pub fn new(dev: Arc<RtcDevice>) -> Self {
         Self { dev }
+    }
+
+    #[kernel_symbols::export(
+        name = "general.dev.rtc.RtcFunction.new_arc",
+        contract = "kernel.general.rtc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 1u64
+    )]
+    pub fn new_arc(dev: Arc<RtcDevice>) -> Arc<dyn DeviceFunction> {
+        Arc::new(Self::new(dev))
     }
 
     pub fn dev(&self) -> Arc<RtcDevice> {
@@ -688,12 +759,81 @@ impl DeviceFunction for RtcFunction {
         self.dev.name()
     }
 
+    fn operation_contract(&self) -> Option<&str> {
+        Some("mygo.device.rtc@1;1=read_time_ns:u64;2=features:u32")
+    }
+
+    fn invoke(
+        &self,
+        opcode: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, crate::dev::function::DeviceFunctionInvokeError> {
+        use crate::dev::function::DeviceFunctionInvokeError as InvokeError;
+
+        if self.is_gone() {
+            return Err(InvokeError::Gone);
+        }
+        if !input.is_empty() {
+            return Err(InvokeError::Invalid);
+        }
+        match opcode {
+            1 => {
+                if output.len() < core::mem::size_of::<u64>() {
+                    return Err(InvokeError::Invalid);
+                }
+                let RtcControlResponse::Time(time) = self
+                    .dev
+                    .control(RtcControlRequest::ReadTime)
+                    .map_err(map_rtc_invoke_error)?
+                else {
+                    return Err(InvokeError::Fault);
+                };
+                let value = time.unix_time_ns().ok_or(InvokeError::Fault)?;
+                output[..8].copy_from_slice(&value.to_le_bytes());
+                Ok(8)
+            }
+            2 => {
+                if output.len() < core::mem::size_of::<u32>() {
+                    return Err(InvokeError::Invalid);
+                }
+                let RtcControlResponse::Features(features) = self
+                    .dev
+                    .control(RtcControlRequest::GetFeatures)
+                    .map_err(map_rtc_invoke_error)?
+                else {
+                    return Err(InvokeError::Fault);
+                };
+                output[..4].copy_from_slice(&features.bits().to_le_bytes());
+                Ok(4)
+            }
+            _ => Err(InvokeError::Unsupported),
+        }
+    }
+
     fn mark_gone(&self) {
         self.dev.mark_gone();
     }
 
+    fn is_gone(&self) -> bool {
+        !self.dev.is_active()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+fn map_rtc_invoke_error(error: RtcError) -> crate::dev::function::DeviceFunctionInvokeError {
+    use crate::dev::function::DeviceFunctionInvokeError as InvokeError;
+
+    match error {
+        RtcError::Unsupported => InvokeError::Unsupported,
+        RtcError::Invalid => InvokeError::Invalid,
+        RtcError::NoDevice => InvokeError::Gone,
+        RtcError::Busy | RtcError::WouldBlock => InvokeError::Busy,
+        RtcError::Io => InvokeError::Fault,
+        RtcError::Permission => InvokeError::Invalid,
     }
 }
 

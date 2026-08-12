@@ -8,7 +8,11 @@ test = true
 doctest = false
 bench = false
 
+[features]
+performance-profile = ["sched/performance-profile"]
+
 [dependencies]
+kernel-symbols = { path = "../kernel-symbols" }
 sched = { path = "../sched" }
 
 [dev-dependencies]

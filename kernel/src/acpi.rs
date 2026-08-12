@@ -26,8 +26,6 @@ use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
 use acpi::{AcpiTable, AmlHandler, Handle, Handler, PhysicalMapping};
 
 use allocator::KERNEL_ALLOCATOR;
-use general::dev::char::CharDevice;
-use general::dev::enumerate::DEVICES;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, IrqPolarity, IrqResourceAttributes,
     IrqSharing, IrqTrigger, PlatformDeviceInfo, PlatformProbeStatus,
@@ -42,17 +40,11 @@ use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
-use general::vfs::device_files::projection::find_char_device_by_fw_name;
-use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
-use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::{StartContext, StartFirmware};
-use log::{LogRecord, LogSink, printk};
-
-use crate::start;
+use log::printk;
 
 const ACPI_MADT_TYPE_LOCAL_APIC: u8 = 0;
 const ACPI_MADT_TYPE_GENERIC_INTERRUPT: u8 = 11;
@@ -302,8 +294,14 @@ pub fn kernel_start_init(context: &StartContext) {
     if let Some(alloc_ops) = context.allocator {
         KERNEL_ALLOCATOR.bind_kernel_heap_ops(
             alloc_ops.kernel_heap_region,
+            alloc_ops.tracked_heap_region,
             alloc_ops.map_kernel_heap_range,
             alloc_ops.unmap_kernel_heap_range,
+        );
+        general::elm_image::register_elm_image_ops(
+            alloc_ops.protect_kernel_heap_range,
+            alloc_ops.validate_kernel_heap_range,
+            alloc_ops.sync_icache,
         );
         (alloc_ops.init_kernel_page_table)();
         KERNEL_ALLOCATOR
@@ -393,17 +391,17 @@ pub fn kernel_start_init(context: &StartContext) {
     let dev_sb = crate::device_init::mount_devtmpfs("acpi");
     crate::device_init::mount_devtmpfs_on_dev("acpi", &vfs_ctx, Arc::clone(&dev_sb));
 
-    let dev_ops = crate::device_init::devtmpfs_ops(&dev_sb, "acpi");
-
     crate::device_init::activate_device_subsystem(
         "acpi",
         Arc::clone(&dev_sb),
         DevInitContext::new(context.address.device_mmio_to_virt)
+            .with_boot_cpu_id(context.boot.boot_cpu_id)
             .with_realtime_clock(crate::vdso::set_realtime_ns)
             .with_realtime_source_hooks(
                 crate::vdso::install_realtime_source,
                 crate::vdso::unregister_realtime_source,
             ),
+        None,
     );
 
     let stdout_phys = console_serial_port_phys;
@@ -476,116 +474,40 @@ pub fn kernel_start_init(context: &StartContext) {
         "[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'"
     );
 
-    let console_registered = {
-        let cmdline_dev = cmdline
-            .as_ref()
-            .and_then(|cl| {
-                cl.find("console")
-                    .map(|v| v.split_once(',').map_or(v, |(d, _)| d))
-            })
-            .and_then(|name| resolve_cmdline_console(&vfs_ctx, dev_ops, name));
-
+    let console_selector = if let Some(name) = cmdline.as_ref().and_then(|cl| {
+        cl.find("console")
+            .map(|value| value.split_once(',').map_or(value, |(device, _)| device))
+    }) {
         printk!(
-            "[kernel-start][acpi] console device from cmdline: {:?}",
-            cmdline_dev.as_ref().map(|dev| dev.fw_name())
+            "[kernel-start][acpi] console requested by cmdline: {}",
+            name
         );
-
-        let dev = if let Some(dev) = cmdline_dev {
-            printk!(
-                "[kernel-start][acpi] console from cmdline: {}",
-                dev.fw_name()
-            );
-            Some(dev)
-        } else if let Some(device) = console_serial_port_index.and_then(|i| serial_devices.get(i)) {
-            let found = lookup_char_fw_name(device.port.name);
-            if let Some(dev) = found.as_ref() {
-                printk!(
-                    "[kernel-start][acpi] console from firmware: {}",
-                    dev.fw_name()
-                );
-            }
-            found
-        } else {
-            None
-        };
-
-        if let Some(dev) = dev {
-            general::console::register_console(dev.clone());
-            match dev_ops.bind_char("console", dev.clone()) {
-                Ok(()) => {
-                    printk!(
-                        "[kernel-start][acpi] bound /dev/console -> {}",
-                        dev.fw_name()
-                    );
-                    crate::sched::stash_boot_console_name(alloc::string::String::from(
-                        "/dev/console",
-                    ));
-                }
-                Err(VfsError::AlreadyExists) => {
-                    printk!("[kernel-start][acpi] /dev/console already exists; using it for stdio");
-                    crate::sched::stash_boot_console_name(alloc::string::String::from(
-                        "/dev/console",
-                    ));
-                }
-                Err(err) => {
-                    printk!(
-                        "[kernel-start][acpi] failed to bind /dev/console: {:?}",
-                        err
-                    );
-                }
-            }
-            true
-        } else {
-            printk!("[kernel-start][acpi] no console registered");
-            false
-        }
+        Some(crate::device_init::BootConsoleSelector::DeviceName(
+            String::from(name),
+        ))
+    } else if let Some(device) = console_serial_port_index.and_then(|i| serial_devices.get(i)) {
+        printk!(
+            "[kernel-start][acpi] console requested by firmware: {}",
+            device.port.name
+        );
+        Some(crate::device_init::BootConsoleSelector::FirmwareName(
+            String::from(device.port.name),
+        ))
+    } else {
+        None
     };
-
-    if console_registered {
-        static LOG_SINK: LogSink = LogSink {
-            write_record: write_log_record_to_console,
-        };
-        log::bind_log_sink(&LOG_SINK);
+    if let Some(selector) = console_selector {
+        let _ = crate::device_init::bind_or_defer_boot_console(
+            "acpi",
+            &vfs_ctx,
+            Arc::clone(&dev_sb),
+            selector,
+        );
+    } else {
+        printk!("[kernel-start][acpi] no console selected");
     }
 
     printk!("[kernel-start][acpi] kernel initialization complete, jumping to main entry");
-}
-
-fn write_log_record_to_console(record: &LogRecord<'_>) {
-    let line = start::format_log_record_line(record);
-    general::console::console_write(line.as_bytes());
-}
-
-fn resolve_cmdline_console(
-    vfs_ctx: &VfsContext,
-    dev_ops: &DevTmpfsSuperblockOps,
-    name: &str,
-) -> Option<CharDevice> {
-    if let Some(dev_name) = name.strip_prefix("/dev/")
-        && let Some(dev) = dev_ops.char_dev(dev_name)
-    {
-        return Some(dev);
-    }
-    if !name.starts_with('/')
-        && let Some(dev) = dev_ops.char_dev(name)
-    {
-        return Some(dev);
-    }
-    if name.starts_with('/') {
-        return path::lookup(vfs_ctx, &Dirfd::Cwd, name, LookupFlags::default())
-            .ok()
-            .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root.root()))
-            .and_then(|resolved| {
-                resolved
-                    .strip_prefix("/dev/")
-                    .and_then(|dev_name| dev_ops.char_dev(dev_name))
-            });
-    }
-    lookup_char_fw_name(name)
-}
-
-fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
-    find_char_device_by_fw_name(&DEVICES.functions, name)
 }
 
 fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {

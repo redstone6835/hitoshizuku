@@ -16,6 +16,30 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+const URGENT_POLL_INTERVAL: usize = 1024;
+
+#[inline]
+fn spin_until_unlocked(locked: &AtomicBool, mut poll_urgent: impl FnMut()) {
+    let mut spins = 0usize;
+    while locked.load(Ordering::Relaxed) {
+        hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(URGENT_POLL_INTERVAL) {
+            poll_urgent();
+        }
+    }
+    #[cfg(feature = "performance-profile")]
+    {
+        let checks = spins / URGENT_POLL_INTERVAL;
+        if checks != 0 {
+            crate::arch_hooks::record_urgent_spin_checks(
+                crate::scheduler::current_cpu_id(),
+                checks,
+            );
+        }
+    }
+}
+
 pub struct SpinlockGuard<'a, T> {
     lock: &'a Spinlock<T>,
     _not_send: PhantomData<*mut ()>,
@@ -65,9 +89,11 @@ impl<T> Spinlock<T> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.locked.load(Ordering::Relaxed) {
-                hint::spin_loop();
-            }
+            spin_until_unlocked(&self.locked, || {
+                if crate::urgent_work_pending() {
+                    crate::poll_urgent_work();
+                }
+            });
         }
         SpinlockGuard {
             lock: self,
@@ -83,5 +109,26 @@ impl<T> Spinlock<T> {
                 lock: self,
                 _not_send: PhantomData,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::spin_until_unlocked;
+
+    #[test]
+    fn contended_wait_polls_urgent_work_periodically() {
+        let locked = AtomicBool::new(true);
+        let polls = AtomicUsize::new(0);
+
+        spin_until_unlocked(&locked, || {
+            if polls.fetch_add(1, Ordering::Relaxed) == 2 {
+                locked.store(false, Ordering::Release);
+            }
+        });
+
+        assert_eq!(polls.load(Ordering::Relaxed), 3);
     }
 }

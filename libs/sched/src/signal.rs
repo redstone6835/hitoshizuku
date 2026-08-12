@@ -3,12 +3,13 @@
 //! 本实现覆盖 Linux 常用 64 个信号（标准 1..=31 + 实时 32..=64）。SIGKILL/SIGSTOP
 //! 不可被 handler / blocked / ignored —— 投递路径直接走默认动作。
 
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::ids::Uid;
 use crate::pid::PidT;
-use crate::sync::Spinlock;
+use crate::sync::{Spinlock, SpinlockGuard};
 
 /// 支持的最大信号数（含 0 号无效位，实际可用 1..=NSIG-1）。
 pub const NSIG: usize = 65;
@@ -224,13 +225,86 @@ pub const fn default_action(sig: SignalNumber) -> DefaultAction {
 
 // ── per-task 信号状态 ────────────────────────────────────────────────────────
 
+/// 订阅某个 per-task 或 thread-group 信号状态的定向观察者。
+pub trait SignalObserver: Send + Sync {
+    fn signal_state_changed(&self);
+}
+
+struct SignalSubscription {
+    id: u64,
+    observer: Weak<dyn SignalObserver>,
+}
+
+struct SignalObservers {
+    has_entries: AtomicBool,
+    next_id: AtomicU64,
+    entries: Spinlock<Vec<SignalSubscription>>,
+}
+
+impl SignalObservers {
+    const fn new() -> Self {
+        Self {
+            has_entries: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            entries: Spinlock::new(Vec::new()),
+        }
+    }
+
+    fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "signal observer id 已耗尽");
+        self.entries
+            .lock()
+            .push(SignalSubscription { id, observer });
+        self.has_entries.store(true, Ordering::Release);
+    }
+
+    fn notify(&self) {
+        if !self.has_entries.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            entries.retain(|entry| entry.observer.strong_count() != 0);
+            if entries.is_empty() {
+                self.has_entries.store(false, Ordering::Release);
+                return;
+            }
+        }
+        let mut after = 0u64;
+        loop {
+            let next = {
+                let entries = self.entries.lock();
+                let index = entries.partition_point(|entry| entry.id <= after);
+                entries
+                    .get(index)
+                    .map(|entry| (entry.id, entry.observer.clone()))
+            };
+            let Some((id, observer)) = next else {
+                break;
+            };
+            after = id;
+            if let Some(observer) = observer.upgrade() {
+                observer.signal_state_changed();
+            }
+        }
+    }
+}
+
 /// 每个 Task 自带的信号上下文。
 pub struct SignalState {
     pending_bits: AtomicU64,
     pending_infos: Spinlock<Vec<SigInfo>>,
     blocked: AtomicU64,
     saved_blocked: AtomicU64,
+    sigsuspend_saved_blocked: AtomicBool,
     sigtimedwait_mask: AtomicU64,
+    /// Linux `thread_info.flags` 风格的粘性返回工作提示。
+    ///
+    /// 该位只决定是否进入慢路径，不替代 pending 队列等权威状态。生产者在发布
+    /// payload 后置位；消费者只在慢路径中清零并重新扫描权威状态。
+    user_return_work: AtomicU32,
+    observers: SignalObservers,
 }
 
 impl SignalState {
@@ -240,18 +314,61 @@ impl SignalState {
             pending_infos: Spinlock::new(Vec::new()),
             blocked: AtomicU64::new(0),
             saved_blocked: AtomicU64::new(0),
+            sigsuspend_saved_blocked: AtomicBool::new(false),
             sigtimedwait_mask: AtomicU64::new(0),
+            user_return_work: AtomicU32::new(0),
+            observers: SignalObservers::new(),
         }
+    }
+
+    /// 发布本任务存在返回用户态前必须处理的工作。
+    #[inline]
+    pub(crate) fn mark_user_return_work(&self) {
+        #[cfg(any(target_arch = "riscv64", test))]
+        self.user_return_work.fetch_or(1, Ordering::Release);
+    }
+
+    /// 普通 trap/syscall 返回热路径的无栅栏提示读取。
+    #[inline(always)]
+    pub(crate) fn user_return_work_pending_relaxed(&self) -> bool {
+        self.user_return_work.load(Ordering::Relaxed) != 0
+    }
+
+    /// 慢路径进入时与生产者的 Release 发布建立同步。
+    #[inline]
+    pub(crate) fn user_return_work_pending_acquire(&self) -> bool {
+        self.user_return_work.load(Ordering::Acquire) != 0
+    }
+
+    /// 清除粘性提示并取得清除前状态。
+    ///
+    /// 生产者的 Release fetch_or 形成 release sequence。AcqRel swap 若清除了
+    /// 多个生产者合并后的位，就同步观察这些生产者此前发布的权威状态；若生产者
+    /// 发生在 swap 后，它留下的非零值不会被本次消费者覆盖。
+    #[inline]
+    pub(crate) fn take_user_return_work(&self) -> bool {
+        self.user_return_work.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// 订阅当前任务的 pending 信号变化。
+    pub fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
+        self.observers.subscribe(observer);
     }
 
     /// 把一条信号投到本 task 的 pending。
     pub fn deliver(&self, info: SigInfo) {
-        self.pending_bits.fetch_or(info.sig.bit(), Ordering::AcqRel);
-        self.pending_infos.lock().push(info);
+        let mut queue = self.pending_infos.lock();
+        queue.push(info);
+        let pending = self.pending_bits.load(Ordering::Relaxed);
+        self.pending_bits
+            .store(pending | info.sig.bit(), Ordering::Release);
+        drop(queue);
+        self.mark_user_return_work();
+        self.observers.notify();
     }
 
     /// 取出一条当前未被 block 的信号；无匹配返回 None。
-    pub fn dequeue_one(&self) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one(&self) -> Option<SigInfo> {
         let blocked = self.blocked.load(Ordering::Acquire);
         let mut queue = self.pending_infos.lock();
         let idx = queue.iter().position(|i| (blocked & i.sig.bit()) == 0)?;
@@ -259,23 +376,29 @@ impl SignalState {
         // 若该信号已经没有其它实例，则清掉位图。
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.pending_bits.load(Ordering::Relaxed);
             self.pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
     /// sigtimedwait 用：从 per-task pending 里取出一条属于 `these` 集合的信号。
     /// sigtimedwait 显式等待调用方给定集合，不再受当前 blocked mask 过滤。
-    pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
         let mut queue = self.pending_infos.lock();
         let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.pending_bits.load(Ordering::Relaxed);
             self.pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
@@ -285,6 +408,7 @@ impl SignalState {
     }
 
     /// 是否有 pending 信号（不限 these 集合）。
+    #[inline]
     pub fn has_any_pending(&self) -> bool {
         self.pending_bits.load(Ordering::Acquire) != 0
     }
@@ -329,6 +453,7 @@ impl SignalState {
             SigProcMaskHow::SetMask => set.0,
         };
         self.blocked.store(next, Ordering::Release);
+        self.mark_user_return_work();
         SigSet(prev)
     }
 
@@ -336,14 +461,41 @@ impl SignalState {
     pub fn save_blocked(&self, new_mask: SigSet) {
         let prev = self.blocked.load(Ordering::Acquire);
         self.saved_blocked.store(prev, Ordering::Release);
+        self.sigsuspend_saved_blocked.store(true, Ordering::Release);
         self.blocked
             .store(new_mask.sanitized().0, Ordering::Release);
+        self.mark_user_return_work();
     }
 
-    /// sigreturn 用：恢复保存的 mask。
+    /// signal frame 构造时取得 sigsuspend 调用前的 mask。
+    ///
+    /// 临时 mask 必须保持到 pending 信号被选中，否则该信号可能在 syscall
+    /// 返回边界重新变为 blocked。旧 mask 只由首个 handler frame 消费，随后
+    /// 通过 rt_sigreturn 从 frame 中恢复。
+    pub fn take_sigsuspend_saved_blocked(&self) -> Option<SigSet> {
+        self.sigsuspend_saved_blocked
+            .swap(false, Ordering::AcqRel)
+            .then(|| SigSet(self.saved_blocked.load(Ordering::Acquire)))
+    }
+
+    /// 放弃 sigsuspend 临时 mask 并立即恢复，供未建立 handler frame 的路径使用。
     pub fn restore_blocked(&self) {
         let saved = self.saved_blocked.load(Ordering::Acquire);
         self.blocked.store(saved, Ordering::Release);
+        self.sigsuspend_saved_blocked
+            .store(false, Ordering::Release);
+        self.mark_user_return_work();
+    }
+
+    /// 进入 Native personality 前丢弃 Tomori 的线程级信号等待状态。
+    ///
+    /// pending 队列属于 personality-neutral 的进程控制状态，必须跨 exec 保留。
+    pub fn reset_for_native_exec(&self) {
+        self.blocked.store(0, Ordering::Release);
+        self.saved_blocked.store(0, Ordering::Release);
+        self.sigsuspend_saved_blocked
+            .store(false, Ordering::Release);
+        self.sigtimedwait_mask.store(0, Ordering::Release);
     }
 }
 
@@ -357,52 +509,120 @@ impl Default for SignalState {
 
 /// ThreadGroup 共享的信号表：sigaction + 进程级 pending。
 pub struct SharedSignal {
-    actions: Spinlock<[SigAction; NSIG]>,
+    /// 信号处理表可由 `CLONE_SIGHAND` 跨线程组共享。
+    actions: Spinlock<Arc<SharedActionTable>>,
+    /// 共享表的变更门；exec 在 PONR 前持有它，阻止 disposition 写入竞争。
+    actions_gate: Arc<Spinlock<()>>,
+    /// pending 队列只属于当前线程组，不能随 `CLONE_SIGHAND` 共享。
     shared_pending_bits: AtomicU64,
     shared_pending_infos: Spinlock<Vec<SigInfo>>,
+    observers: SignalObservers,
+}
+
+struct SharedActionTable {
+    actions: Spinlock<[SigAction; NSIG]>,
+    generation: AtomicU64,
+}
+
+/// prepare 阶段构造完成、可在 exec 提交时直接发布的 disposition 表。
+pub struct PreparedSignalActions {
+    source: Arc<SharedActionTable>,
+    source_generation: u64,
+    replacement: Arc<SharedActionTable>,
 }
 
 impl SharedSignal {
     pub fn new() -> Self {
         Self {
-            actions: Spinlock::new([SigAction::default_new(); NSIG]),
+            actions: Spinlock::new(Arc::new(SharedActionTable {
+                actions: Spinlock::new([SigAction::default_new(); NSIG]),
+                generation: AtomicU64::new(0),
+            })),
+            actions_gate: Arc::new(Spinlock::new(())),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
+            observers: SignalObservers::new(),
         }
     }
 
     /// 深拷一份（不 CLONE_SIGHAND 时）；pending 不复制。
     pub fn fork_copy(&self) -> Self {
-        let actions_copy = *self.actions.lock();
+        let actions = Arc::clone(&self.actions.lock());
+        let actions_copy = *actions.actions.lock();
         Self {
-            actions: Spinlock::new(actions_copy),
+            actions: Spinlock::new(Arc::new(SharedActionTable {
+                actions: Spinlock::new(actions_copy),
+                generation: AtomicU64::new(0),
+            })),
+            actions_gate: Arc::new(Spinlock::new(())),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
+            observers: SignalObservers::new(),
         }
     }
 
+    /// 构造 `CLONE_SIGHAND` 子进程的信号状态。
+    ///
+    /// 处理表与父进程共享，但进程级 pending 队列从空状态开始。只有
+    /// `CLONE_THREAD` 才应直接复用同一个 [`SharedSignal`]。
+    pub fn clone_sighand(&self) -> Self {
+        Self {
+            actions: Spinlock::new(Arc::clone(&self.actions.lock())),
+            actions_gate: Arc::clone(&self.actions_gate),
+            shared_pending_bits: AtomicU64::new(0),
+            shared_pending_infos: Spinlock::new(Vec::new()),
+            observers: SignalObservers::new(),
+        }
+    }
+
+    /// 为 `CLONE_CLEAR_SIGHAND` 深拷信号表，并把所有用户处理函数恢复为默认动作。
+    /// 被显式忽略的信号保持忽略，pending 信号不复制。
+    pub fn fork_copy_clearing_handlers(&self) -> Self {
+        let copied = self.fork_copy();
+        copied.reset_handlers_for_exec();
+        copied
+    }
+
+    /// 订阅当前线程组共享 pending 信号变化。
+    pub fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
+        self.observers.subscribe(observer);
+    }
+
     pub fn get_action(&self, sig: SignalNumber) -> SigAction {
-        self.actions.lock()[sig.as_usize()]
+        let actions = self.actions.lock();
+        actions.actions.lock()[sig.as_usize()]
     }
 
     /// 写 sigaction；SIGKILL/SIGSTOP 不允许改——调用方负责拒绝。
     pub fn set_action(&self, sig: SignalNumber, new: SigAction) -> SigAction {
-        let mut guard = self.actions.lock();
+        let _gate = self.actions_gate.lock();
+        let actions = self.actions.lock();
+        let mut guard = actions.actions.lock();
         let old = guard[sig.as_usize()];
         guard[sig.as_usize()] = new;
+        actions.generation.fetch_add(1, Ordering::AcqRel);
         old
     }
 
     /// execve 时按 POSIX 重置信号处理：所有 caught 信号恢复为 SIG_DFL，
     /// SIG_IGN 保持（除 SIGCHLD 特殊情况）。SIGKILL/SIGSTOP 不可改，跳过。
     pub fn reset_handlers_for_exec(&self) {
-        let mut guard = self.actions.lock();
-        for sig_idx in 0..guard.len() {
+        let prepared = self.prepare_actions_for_exec();
+        self.install_actions_for_exec(&prepared);
+    }
+
+    /// 在不改变旧表的前提下预构造 exec 后的私有 disposition。
+    pub fn prepare_actions_for_exec(&self) -> PreparedSignalActions {
+        let _gate = self.actions_gate.lock();
+        let current = self.actions.lock();
+        let source_generation = current.generation.load(Ordering::Acquire);
+        let mut prepared = *current.actions.lock();
+        for sig_idx in 0..prepared.len() {
             let sig = SignalNumber::from_raw(sig_idx as i32);
-            let action = guard[sig_idx];
+            let action = prepared[sig_idx];
             match action.handler {
                 SigHandler::Handler(_) => {
-                    guard[sig_idx] = SigAction {
+                    prepared[sig_idx] = SigAction {
                         handler: SigHandler::Default,
                         flags: SigActionFlags(0),
                         mask: SigSet(0),
@@ -418,42 +638,76 @@ impl SharedSignal {
             }
             let _ = sig;
         }
+        PreparedSignalActions {
+            source: Arc::clone(&current),
+            source_generation,
+            replacement: Arc::new(SharedActionTable {
+                actions: Spinlock::new(prepared),
+                generation: AtomicU64::new(source_generation.wrapping_add(1)),
+            }),
+        }
+    }
+
+    /// 无分配发布 prepare 阶段构造的私有 disposition，pending 队列保持原位。
+    /// 来源表或代际变化时返回 false，调用方必须把它视为提交失败。
+    pub fn install_actions_for_exec(&self, prepared: &PreparedSignalActions) -> bool {
+        let lease = self.lock_actions_for_exec();
+        lease.install(prepared)
+    }
+
+    pub fn lock_actions_for_exec(&self) -> SignalActionsLease<'_> {
+        SignalActionsLease {
+            signal: self,
+            _gate: self.actions_gate.lock(),
+        }
+    }
+
+    /// 返回当前 disposition 表代际；只读取共享原子，不分配。
+    pub fn actions_generation(&self) -> u64 {
+        let _gate = self.actions_gate.lock();
+        self.actions.lock().generation.load(Ordering::Acquire)
     }
 
     /// 投一条信号到 tg 的共享 pending。
-    pub fn deliver(&self, info: SigInfo) {
+    pub(crate) fn deliver(&self, info: SigInfo) {
+        let mut queue = self.shared_pending_infos.lock();
+        queue.push(info);
+        let pending = self.shared_pending_bits.load(Ordering::Relaxed);
         self.shared_pending_bits
-            .fetch_or(info.sig.bit(), Ordering::AcqRel);
-        self.shared_pending_infos.lock().push(info);
+            .store(pending | info.sig.bit(), Ordering::Release);
+        drop(queue);
+        self.observers.notify();
     }
 
     /// 取出一条与 per-task `blocked` 不冲突的信号。
-    pub fn dequeue_one(&self, blocked: u64) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one(&self, blocked: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
         let idx = queue.iter().position(|i| (blocked & i.sig.bit()) == 0)?;
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.shared_pending_bits.load(Ordering::Relaxed);
             self.shared_pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
     /// sigtimedwait 用：从 tg 共享 pending 里取出一条属于 `these` 集合的信号。
-    /// 不受调用线程当前 blocked mask 过滤。
-    ///
-    /// `these` 的含义是"调用方想要消费的信号集"——通常在
-    /// `rt_sigtimedwait(uthese, ...)` 中由用户态直接传入。
-    pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
+    pub(crate) fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
         let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
+            let pending = self.shared_pending_bits.load(Ordering::Relaxed);
             self.shared_pending_bits
-                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+                .store(pending & !info.sig.bit(), Ordering::Release);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
@@ -471,8 +725,70 @@ impl SharedSignal {
     }
 }
 
+pub struct SignalActionsLease<'a> {
+    signal: &'a SharedSignal,
+    _gate: SpinlockGuard<'a, ()>,
+}
+
+impl SignalActionsLease<'_> {
+    pub fn is_current(&self, prepared: &PreparedSignalActions) -> bool {
+        let current = self.signal.actions.lock();
+        Arc::ptr_eq(&current, &prepared.source)
+            && current.generation.load(Ordering::Acquire) == prepared.source_generation
+    }
+
+    pub fn install(&self, prepared: &PreparedSignalActions) -> bool {
+        if !self.is_current(prepared) {
+            return false;
+        }
+        *self.signal.actions.lock() = Arc::clone(&prepared.replacement);
+        true
+    }
+}
+
+impl PreparedSignalActions {
+    /// 检查 prepare 时观察的 disposition 表仍是当前表。
+    pub fn is_current(&self, shared: &SharedSignal) -> bool {
+        let lease = shared.lock_actions_for_exec();
+        lease.is_current(self)
+    }
+}
+
 impl Default for SharedSignal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU64;
+
+    struct Observer(AtomicU64);
+
+    impl SignalObserver for Observer {
+        fn signal_state_changed(&self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn signal_state_notifies_only_its_subscribers_on_enqueue_and_dequeue() {
+        let state = SignalState::new();
+        let observer = Arc::new(Observer(AtomicU64::new(0)));
+        let subscriber: Arc<dyn SignalObserver> = observer.clone();
+        state.subscribe(Arc::downgrade(&subscriber));
+        state.deliver(SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: Uid(0),
+            raw: None,
+        });
+        assert_eq!(observer.0.load(Ordering::Acquire), 1);
+        assert!(state.dequeue_one_in(SignalNumber::SIGUSR1.bit()).is_some());
+        assert_eq!(observer.0.load(Ordering::Acquire), 2);
     }
 }
