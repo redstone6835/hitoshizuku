@@ -36,7 +36,7 @@ const MAX_UDP4_PAYLOAD: usize = 65_507;
 const MAX_UDP6_PAYLOAD: usize = 65_527;
 const TCP_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_BUFFER_HARD_LIMIT: usize = 1024 * 1024;
-const TCP_LOCAL_AUTOTUNE_LIMIT: usize = 16 * 1024 * 1024;
+const TCP_LOCAL_AUTOTUNE_LIMIT: usize = TCP_BUFFER_HARD_LIMIT;
 const TCP_LOCAL_READ_BATCH_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 const TCP_LOCAL_READ_BATCH_MIN_BYTES: usize = 1024 * 1024;
 const TCP_LOCAL_SHARED_READ_BATCH_BYTES: usize = 1024 * 1024;
@@ -6451,6 +6451,16 @@ mod tests {
             .unwrap();
         assert_eq!(automatic.buffer_limits().1, TCP_LOCAL_AUTOTUNE_LIMIT);
         assert_eq!(explicit.buffer_limits().1, 48 * 1024);
+    }
+
+    #[test]
+    fn local_stream_autotune_stays_within_socket_hard_limit() {
+        let facade = stream_facade(65);
+        facade.prepare_local_stream_send();
+        assert_eq!(
+            facade.buffer_limits(),
+            (TCP_BUFFER_HARD_LIMIT, TCP_BUFFER_BYTES)
+        );
     }
 
     #[test]
