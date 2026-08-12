@@ -2218,20 +2218,13 @@ impl SlabAllocator {
         self.zones[zone_idx].free(ptr, cpu, &self.directory)
     }
 
-    pub(crate) fn free_reclaiming(
-        &self,
-        ptr: usize,
-        layout: Layout,
-        cpu_id: usize,
-        _phys: &Mutex<BuddyAllocator>,
-        _vmem: &KernelAddressSpace,
-    ) -> bool {
+    pub(crate) fn free_class(&self, ptr: usize, zone_idx: usize, cpu_id: usize) -> bool {
         if !self.is_initialized() {
             return false;
         }
-        let Some(zone_idx) = Self::class_index_for(layout) else {
+        if zone_idx >= self.zones.len() {
             return false;
-        };
+        }
         let cpu = self.normalize_cpu(cpu_id);
         self.zones[zone_idx].free(ptr, cpu, &self.directory)
     }
