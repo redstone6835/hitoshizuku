@@ -476,6 +476,12 @@ run_direct_test_script() {
     /bin/sh "$script"
 }
 
+has_ltp_tests() {
+    test_dir="$1"
+
+    [ -d "$test_dir/ltp/testcases/bin" ] && [ -d "$test_dir/ltp/runtest" ]
+}
+
 install_ltp_testcode_script() {
     test_dir="$1"
     src="/etc/ltp_testcode.sh"
@@ -602,10 +608,12 @@ run_test_scripts() {
     done
 
     for dir in $dirs; do
-        install_ltp_testcode_script "$dir"
-        script="$dir/ltp_testcode.sh"
-        if [ -f "$script" ] && ! run_test_script_file "$script"; then
-            test_status=1
+        if has_ltp_tests "$dir"; then
+            install_ltp_testcode_script "$dir"
+            script="$dir/ltp_testcode.sh"
+            if [ -f "$script" ] && ! run_test_script_file "$script"; then
+                test_status=1
+            fi
         fi
     done
 
