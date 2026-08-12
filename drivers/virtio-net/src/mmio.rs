@@ -1,4 +1,4 @@
-//! modern VirtIO-MMIO 网络设备 PnP 适配。
+//! VirtIO-MMIO 网络设备 PnP 适配。
 
 use alloc::sync::Arc;
 use core::ptr::read_volatile;
@@ -36,7 +36,6 @@ const VIRTIO_NET_F_CSUM: u64 = 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
-const REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
 const OPTIONAL_FEATURES: u64 =
     VIRTIO_NET_F_CSUM | VIRTIO_NET_F_MTU | VIRTIO_NET_F_STATUS | VIRTIO_F_RING_EVENT_IDX;
 
@@ -62,6 +61,7 @@ fn setup_queue(
     transport: &dyn VirtioMmioTransport,
     context: general::dev::dma::DmaContext,
     index: u16,
+    legacy: bool,
 ) -> Result<SplitVirtQueue, &'static str> {
     transport.select_queue(index);
     let maximum = transport.read_queue_max_size();
@@ -74,7 +74,11 @@ fn setup_queue(
         return Err("VirtIO-net MMIO queue 过小");
     }
     transport.write_queue_size(u32::from(size));
-    let queue = SplitVirtQueue::new_in(context, size)
+    let queue = (if legacy {
+        SplitVirtQueue::new_legacy_in(context, size)
+    } else {
+        SplitVirtQueue::new_in(context, size)
+    })
         .map_err(|_| "VirtIO-net MMIO queue DMA 分配失败")?;
     transport.configure_queue_addresses(
         queue.desc_dma_addr() as u64,
@@ -90,18 +94,22 @@ fn probe_queue(
     context: general::dev::dma::DmaContext,
 ) -> Result<(VirtioNetQueue, NetQueueIrqBinding, [u8; 6], u32), &'static str> {
     let transport = detect_virtio_mmio(base)?;
-    if transport.is_legacy() {
-        return Err("VirtIO-net 不支持 legacy MMIO transport");
-    }
+    let legacy = transport.is_legacy();
     transport.write_status(0);
     transport.add_status(VIRTIO_STATUS_ACKNOWLEDGE);
     transport.add_status(VIRTIO_STATUS_DRIVER);
     let offered = transport.read_device_features();
-    if offered & REQUIRED_FEATURES != REQUIRED_FEATURES {
+    let required = VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
+    if offered & required != required {
         transport.add_status(VIRTIO_STATUS_FAILED);
-        return Err("VirtIO-net 缺少 VERSION_1、MAC 或 MRG_RXBUF feature");
+        return Err("VirtIO-net 缺少 MAC 或 MRG_RXBUF feature");
     }
-    let accepted = REQUIRED_FEATURES | (offered & OPTIONAL_FEATURES);
+    if !legacy && offered & VIRTIO_F_VERSION_1 == 0 {
+        transport.add_status(VIRTIO_STATUS_FAILED);
+        return Err("VirtIO-net 缺少 VERSION_1 feature");
+    }
+    let version = if legacy { 0 } else { VIRTIO_F_VERSION_1 };
+    let accepted = version | required | (offered & OPTIONAL_FEATURES);
     transport.write_driver_features(accepted);
     transport.add_status(VIRTIO_STATUS_FEATURES_OK);
     if transport.read_status() & VIRTIO_STATUS_FEATURES_OK == 0 {
@@ -110,8 +118,8 @@ fn probe_queue(
     }
     let mac = read_mac(base);
     let mtu = read_mtu(base, accepted);
-    let rx = setup_queue(transport.as_ref(), context, 0)?;
-    let tx = setup_queue(transport.as_ref(), context, 1)?;
+    let rx = setup_queue(transport.as_ref(), context, 0, legacy)?;
+    let tx = setup_queue(transport.as_ref(), context, 1, legacy)?;
     let event_idx = accepted & VIRTIO_F_RING_EVENT_IDX != 0;
     let tx_checksum = accepted & VIRTIO_NET_F_CSUM != 0;
     let irq = if event_idx {
@@ -212,7 +220,9 @@ impl VirtioMmioNetDriver {
         let magic = unsafe { read_volatile((base + MMIO_MAGIC) as *const u32) };
         let version = unsafe { read_volatile((base + MMIO_VERSION) as *const u32) };
         let device = unsafe { read_volatile((base + MMIO_DEVICE_ID) as *const u32) };
-        magic == VIRTIO_MMIO_MAGIC && version == 2 && device == VIRTIO_NET_DEVICE_ID
+        magic == VIRTIO_MMIO_MAGIC
+            && (version == 1 || version == 2)
+            && device == VIRTIO_NET_DEVICE_ID
     }
 }
 
