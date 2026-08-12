@@ -38,8 +38,10 @@
 #let chapter-09-title = "第九章 用户态执行环境"
 #let chapter-10-title = "第十章 信号与异步事件"
 #let chapter-11-title = "第十一章 日志、控制台与终端"
-#let chapter-12-title = "第十二章 网络子系统"
-#let chapter-13-title = "后记"
+#let chapter-12-title = "第十二章 可拓展内核模块（ELM）"
+#let chapter-13-title = "第十三章 网络子系统"
+#let chapter-14-title = "第十四章 SOYO 与 MyGO Native ABI"
+#let chapter-15-title = "后记"
 
 #let appendix-title = "附录"
 #let term-index-title = "名词索引"
