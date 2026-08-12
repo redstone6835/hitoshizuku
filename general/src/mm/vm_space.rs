@@ -5369,13 +5369,22 @@ impl VmSpace {
     fn unmap_page_mappings(&self, range: Range<usize>) -> Result<Vec<(usize, PageMapping)>, Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
         let mut pages = self.pages.lock();
-        let keys = pages.keys_in_range(range);
-        let mut removed = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(mapping) = pages.remove(key) {
-                unsafe { (ops.unmap)(self.pgd, key, page_size()) };
-                removed.push((key, mapping));
+        let removed = pages.take_range(range);
+        let page_size = page_size();
+        let mut run_start = None;
+        let mut run_end = 0usize;
+        for (vaddr, _) in &removed {
+            if let Some(start) = run_start
+                && *vaddr != run_end
+            {
+                unsafe { (ops.unmap)(self.pgd, start, run_end - start) };
+                run_start = None;
             }
+            run_start.get_or_insert(*vaddr);
+            run_end = vaddr.saturating_add(page_size);
+        }
+        if let Some(start) = run_start {
+            unsafe { (ops.unmap)(self.pgd, start, run_end - start) };
         }
         let mapped = pages.len();
         self.mapped_pages.store(mapped, Ordering::Release);
@@ -5500,7 +5509,8 @@ impl Drop for VmSpace {
         for file in files {
             file.on_unmapped();
         }
-        self.pages.lock().clear();
+        let resident_pages = self.pages.lock().take_all();
+        drop(resident_pages);
         drop(areas);
         prune_shared_anon_pages();
         if let Some(ops) = user_pgd_ops() {
