@@ -357,6 +357,7 @@ unsafe fn loongarch64_handle_exception_inner(
             general::dev::irq::record_timer_interrupt();
             // TCFG 使用 one-shot 模式；先恢复常规 tick 作为兜底。调度器处理完
             // 到期等待后会按新的最早 deadline 再次缩短本次计时。
+            sched::deadline_timer_fired();
             super::super::loader::rearm_local_timer(None);
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
