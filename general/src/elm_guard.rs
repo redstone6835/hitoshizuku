@@ -159,6 +159,8 @@ pub struct ElmTaskExecutionState {
     guard_depth: AtomicUsize,
     frames: [ElmGuardFrame; ELM_GUARD_MAX_DEPTH],
     contexts: Spinlock<ElmContextStack>,
+    context_cell: AtomicU64,
+    context_present: AtomicBool,
     registered: AtomicBool,
 }
 
@@ -168,6 +170,8 @@ impl ElmTaskExecutionState {
             guard_depth: AtomicUsize::new(0),
             frames: [const { ElmGuardFrame::new() }; ELM_GUARD_MAX_DEPTH],
             contexts: Spinlock::new(ElmContextStack::new()),
+            context_cell: AtomicU64::new(0),
+            context_present: AtomicBool::new(false),
             registered: AtomicBool::new(false),
         }
     }
@@ -189,6 +193,9 @@ impl ElmTaskExecutionState {
         let depth = stack.depth;
         stack.entries[depth] = Some(context);
         stack.depth = depth + 1;
+        self.context_cell
+            .store(context.cell_id.0, Ordering::Relaxed);
+        self.context_present.store(true, Ordering::Release);
         Some((depth + 1) as u64)
     }
 
@@ -206,6 +213,18 @@ impl ElmTaskExecutionState {
         }
         stack.entries[expected_depth - 1] = None;
         stack.depth -= 1;
+        if let Some(previous) = stack
+            .depth
+            .checked_sub(1)
+            .and_then(|index| stack.entries[index])
+        {
+            self.context_cell
+                .store(previous.cell_id.0, Ordering::Relaxed);
+            self.context_present.store(true, Ordering::Release);
+        } else {
+            self.context_cell.store(0, Ordering::Relaxed);
+            self.context_present.store(false, Ordering::Release);
+        }
     }
 
     fn current_context(&self) -> Option<ElmCurrentContext> {
@@ -214,6 +233,13 @@ impl ElmTaskExecutionState {
             .depth
             .checked_sub(1)
             .and_then(|index| stack.entries[index])
+    }
+
+    #[inline]
+    fn current_context_cell(&self) -> Option<u64> {
+        self.context_present
+            .load(Ordering::Acquire)
+            .then(|| self.context_cell.load(Ordering::Relaxed))
     }
 }
 
@@ -481,6 +507,15 @@ pub fn active_cell() -> u64 {
         .and_then(|state| state.current_frame().map(|(_, frame)| frame))
         .map(|frame| frame.cell.load(Ordering::Acquire))
         .unwrap_or(0)
+}
+
+/// 无锁读取当前任务最内层上下文的 cell id。
+///
+/// `Some(0)` 表示显式 root 上下文，`None` 表示当前没有 ELM 上下文；两者在
+/// 资源计量上都归入普通内核 owner，但调用方仍可保留这一区分。
+#[inline]
+pub fn current_context_cell() -> Option<u64> {
+    current_state_ref()?.current_context_cell()
 }
 
 pub fn active_phase() -> u32 {
@@ -952,4 +987,39 @@ fn current_cpu_id() -> usize {
 
 const fn fault_slot(cpu_id: usize, index: usize) -> usize {
     cpu_id * ELM_GUARD_FAULT_RING_PER_CPU + index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ElmTaskExecutionState;
+    use elm_model::{ElmCurrentContext, ElmId, ElmKind, ElmLifecyclePhase, ElmState, Generation};
+
+    fn context(cell: u64) -> ElmCurrentContext {
+        ElmCurrentContext {
+            cell_id: ElmId(cell),
+            parent_id: None,
+            generation: Generation::FIRST,
+            state: ElmState::Active,
+            phase: ElmLifecyclePhase::Resume,
+            kind: ElmKind::Other,
+            flags: 0,
+            allowed_actions: 0,
+        }
+    }
+
+    #[test]
+    fn context_cell_snapshot_tracks_nested_stack() {
+        let state = ElmTaskExecutionState::new();
+
+        assert_eq!(state.current_context_cell(), None);
+        let outer = state.push_context(context(11)).expect("外层上下文应可入栈");
+        assert_eq!(state.current_context_cell(), Some(11));
+        let inner = state.push_context(context(22)).expect("内层上下文应可入栈");
+        assert_eq!(state.current_context_cell(), Some(22));
+
+        state.pop_context(inner);
+        assert_eq!(state.current_context_cell(), Some(11));
+        state.pop_context(outer);
+        assert_eq!(state.current_context_cell(), None);
+    }
 }
