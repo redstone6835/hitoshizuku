@@ -1955,11 +1955,8 @@ impl KernelMemorySubsystem {
         ptr: usize,
         layout: Layout,
     ) -> Result<(), DeallocationError> {
-        if SlabAllocator::class_index_for(layout).is_some() {
-            if self
-                .slab
-                .free_reclaiming(ptr, layout, self.current_cpu_id(), &self.phys, &self.vmem)
-            {
+        if let Some(zone_idx) = SlabAllocator::class_index_for(layout) {
+            if self.slab.free_class(ptr, zone_idx, self.current_cpu_id()) {
                 return Ok(());
             }
             return Err(DeallocationError::UnknownPointer);

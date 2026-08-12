@@ -400,10 +400,11 @@ fn finish_native_call(
 }
 
 fn allocation_current_owner() -> u64 {
-    if elm_model::current_context().is_some_and(|context| context.cell_id.0 == 0) {
-        return 0;
+    match general::elm_guard::current_context_cell() {
+        Some(0) => 0,
+        Some(_) => general::elm_guard::active_cell(),
+        None => general::elm_guard::active_cell(),
     }
-    general::elm_guard::active_cell()
 }
 
 fn allocation_try_reserve(owner: u64, bytes: u64) -> bool {

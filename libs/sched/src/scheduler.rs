@@ -182,6 +182,11 @@ static DEADLINE_STATE_GENERATION: AtomicU64 = AtomicU64::new(1);
 static DEADLINE_CACHE_GENERATION: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 static DEADLINE_CACHE_VALUE: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 static DEADLINE_CACHE_PRESENT: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+static PROGRAMMED_DEADLINE_VALUE: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static PROGRAMMED_DEADLINE_PRESENT: [AtomicBool; NR_CPUS] =
+    [const { AtomicBool::new(false) }; NR_CPUS];
+static PROGRAMMED_DEADLINE_VALID: [AtomicBool; NR_CPUS] =
+    [const { AtomicBool::new(false) }; NR_CPUS];
 
 #[inline]
 fn invalidate_deadline_cache() {
@@ -1096,6 +1101,7 @@ pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
     let _ = SCHEDULER.mark_cpu_online(cpu);
+    PROGRAMMED_DEADLINE_VALID[cpu_id.min(NR_CPUS - 1)].store(false, Ordering::Release);
     Ok(())
 }
 
@@ -1111,6 +1117,7 @@ pub fn activate_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     if !SCHEDULER.activate_cpu(cpu) {
         return Err(errno::Errno::EINVAL);
     }
+    PROGRAMMED_DEADLINE_VALID[cpu_id.min(NR_CPUS - 1)].store(false, Ordering::Release);
     Ok(())
 }
 
@@ -1134,6 +1141,7 @@ fn register_cpu_locked(cpu_id: usize) -> Result<(), errno::Errno> {
         return Err(errno::Errno::EINVAL);
     };
     let _ = SCHEDULER.mark_cpu_online(cpu);
+    PROGRAMMED_DEADLINE_VALID[cpu_id].store(false, Ordering::Release);
     if !SCHEDULER.activate_cpu(cpu) {
         return Err(errno::Errno::EINVAL);
     }
@@ -2323,15 +2331,42 @@ pub(crate) fn earliest_deadline_for_test(cpu_id: usize) -> Option<u64> {
 /// 原生扩展等不会进入睡眠队列的受限执行区间可借此复用同一架构定时器契约。
 /// `None` 仅撤销调用方的临时约束，不会覆盖已经登记的睡眠或实时定时器。
 pub fn reprogram_current_deadline(external_deadline: Option<u64>) {
-    let scheduler_deadline = earliest_deadline(cpu());
+    let cpu_id = cpu();
+    let scheduler_deadline = earliest_deadline(cpu_id);
     let deadline = match (scheduler_deadline, external_deadline) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
         (None, None) => None,
     };
+    if PROGRAMMED_DEADLINE_VALID[cpu_id].load(Ordering::Acquire)
+        && PROGRAMMED_DEADLINE_PRESENT[cpu_id].load(Ordering::Relaxed) == deadline.is_some()
+        && deadline
+            .is_none_or(|value| PROGRAMMED_DEADLINE_VALUE[cpu_id].load(Ordering::Relaxed) == value)
+    {
+        return;
+    }
     if let Some(ops) = arch_hooks::deadline_timer() {
         (ops.reprogram)(deadline);
+        if let Some(value) = deadline {
+            PROGRAMMED_DEADLINE_VALUE[cpu_id].store(value, Ordering::Relaxed);
+        }
+        PROGRAMMED_DEADLINE_PRESENT[cpu_id].store(deadline.is_some(), Ordering::Relaxed);
+        PROGRAMMED_DEADLINE_VALID[cpu_id].store(true, Ordering::Release);
     }
+}
+
+/// 标记当前 CPU 的 one-shot 定时器已经触发。
+///
+/// 架构中断入口必须在重装常规 tick 前调用。后续即使最早软件截止时间没有变化，
+/// 调度器也会重新写入硬件，不能复用已经被消费的编程状态。
+#[inline]
+pub fn deadline_timer_fired() {
+    PROGRAMMED_DEADLINE_VALID[cpu()].store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn timer_fired_for_test() {
+    deadline_timer_fired();
 }
 
 fn reprogram_deadline_timer() {

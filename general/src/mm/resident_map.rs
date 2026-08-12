@@ -244,10 +244,35 @@ impl<T> RadixPageMap<T> {
         removed
     }
 
+    /// 一次树遍历摘除范围内的全部条目，并按虚拟地址递增返回所有权。
+    pub(super) fn take_range(&mut self, range: Range<usize>) -> Vec<(usize, T)> {
+        let page_range = self.page_range(range);
+        let mut removed = Vec::new();
+        take_range_node(
+            &mut self.root,
+            self.root_level,
+            0,
+            &page_range,
+            self.page_shift,
+            &mut removed,
+        );
+        self.len = self.len.saturating_sub(removed.len());
+        self.shrink_root();
+        removed
+    }
+
     pub(super) fn clear(&mut self) {
         self.root = RadixNode::new(0);
         self.root_level = 0;
         self.len = 0;
+    }
+
+    /// 以常数时间把完整映射替换为空树，并返回旧树的所有权。
+    ///
+    /// 调用方可在释放外部锁后析构返回值，避免条目析构和物理页回收延长锁区间。
+    pub(super) fn take_all(&mut self) -> Self {
+        let page_size = 1usize << self.page_shift;
+        core::mem::replace(self, Self::new(page_size))
     }
 
     pub(super) fn for_each_mut(&mut self, mut visit: impl FnMut(usize, &mut T)) {
@@ -446,6 +471,57 @@ fn remove_node<T>(node: &mut RadixNode<T>, level: usize, page_index: usize) -> O
         RadixNode::Leaf(entries) => {
             debug_assert_eq!(level, 0);
             entries.take(page_index & RADIX_MASK)
+        }
+    }
+}
+
+fn take_range_node<T>(
+    node: &mut RadixNode<T>,
+    level: usize,
+    prefix: usize,
+    range: &Range<usize>,
+    page_shift: usize,
+    removed: &mut Vec<(usize, T)>,
+) {
+    match node {
+        RadixNode::Branch(children) => {
+            let shift = level * RADIX_BITS;
+            let span = 1usize << shift;
+            for (slot, child) in children.iter_mut().enumerate() {
+                let child_start = prefix | (slot << shift);
+                let child_end = child_start.saturating_add(span);
+                if child_start >= range.end || child_end <= range.start {
+                    continue;
+                }
+                let Some(child_node) = child.as_deref_mut() else {
+                    continue;
+                };
+                take_range_node(
+                    child_node,
+                    level - 1,
+                    child_start,
+                    range,
+                    page_shift,
+                    removed,
+                );
+                if child_node.is_empty() {
+                    *child = None;
+                }
+            }
+        }
+        RadixNode::Leaf(entries) => {
+            for slot in 0..RADIX_SLOTS {
+                let page_index = prefix | slot;
+                if page_index >= range.end {
+                    break;
+                }
+                if page_index < range.start {
+                    continue;
+                }
+                if let Some(value) = entries.take(slot) {
+                    removed.push((page_index << page_shift, value));
+                }
+            }
         }
     }
 }
@@ -704,6 +780,30 @@ mod tests {
     }
 
     #[test]
+    fn take_range_removes_entries_in_one_ordered_pass() {
+        let mut pages = RadixPageMap::new(PAGE_SIZE);
+        for page in [1usize, 63, 64, 65, 128, 129, 130] {
+            pages.insert(page * PAGE_SIZE, page);
+        }
+
+        let removed = pages.take_range(63 * PAGE_SIZE..130 * PAGE_SIZE);
+
+        assert_eq!(
+            removed,
+            vec![
+                (63 * PAGE_SIZE, 63),
+                (64 * PAGE_SIZE, 64),
+                (65 * PAGE_SIZE, 65),
+                (128 * PAGE_SIZE, 128),
+                (129 * PAGE_SIZE, 129),
+            ]
+        );
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages.get(PAGE_SIZE), Some(&1));
+        assert_eq!(pages.get(130 * PAGE_SIZE), Some(&130));
+    }
+
+    #[test]
     fn mutable_walk_and_clear_preserve_length() {
         let mut pages = RadixPageMap::new(PAGE_SIZE);
         for page in [2usize, 66, 130] {
@@ -723,6 +823,23 @@ mod tests {
         pages.clear();
         assert!(pages.is_empty());
         assert_eq!(pages.len(), 0);
+    }
+
+    #[test]
+    fn take_all_defers_value_drops_to_returned_map() {
+        let drops = Rc::new(Cell::new(0));
+        let mut pages = RadixPageMap::new(PAGE_SIZE);
+        for page in [1usize, 64, 4096] {
+            pages.insert(page * PAGE_SIZE, DropCounter(Rc::clone(&drops)));
+        }
+
+        let removed = pages.take_all();
+
+        assert!(pages.is_empty());
+        assert_eq!(removed.len(), 3);
+        assert_eq!(drops.get(), 0);
+        drop(removed);
+        assert_eq!(drops.get(), 3);
     }
 
     #[test]
