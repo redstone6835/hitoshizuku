@@ -12,7 +12,7 @@
 use core::any::type_name;
 use core::fmt;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 include!(concat!(env!("OUT_DIR"), "/interface_source.rs"));
 
@@ -507,9 +507,20 @@ impl KernelMixinSiteDescriptorV1 {
     }
 
     /// 返回该站点当前是否安装了处理链。
+    ///
+    /// 该入口供真正要读取路由的慢路径使用，Acquire 与发布者的 Release 配对。
     #[inline]
     pub fn has_handlers(&self) -> bool {
         !self.route.load(Ordering::Acquire).is_null()
+    }
+
+    /// 返回该站点是否可能安装了处理链，只用于决定是否进入慢路径。
+    ///
+    /// 调用方不得解引用这里观察到的指针。真正分发会再次以 Acquire 读取路由，
+    /// 因此空路由快路径不需要在 RISC-V 上为一次提示判断执行内存屏障。
+    #[inline(always)]
+    pub fn has_handlers_hint(&self) -> bool {
+        !self.route.load(Ordering::Relaxed).is_null()
     }
 }
 
@@ -542,6 +553,25 @@ impl KernelMixinRuntimeHooksV1 {
 
 static MIXIN_RUNTIME_HOOKS: AtomicPtr<KernelMixinRuntimeHooksV1> =
     AtomicPtr::new(core::ptr::null_mut());
+static MIXIN_RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 返回当前是否至少有一个内核 Mixin 站点安装了处理器。
+///
+/// 导出包装器先读取这个全局门控。常态没有处理器时，每次调用只承担一次原子读取；
+/// 只有门控打开后才读取函数自己的 head/return 路由。
+#[inline]
+pub fn mixin_runtime_active() -> bool {
+    MIXIN_RUNTIME_ACTIVE.load(Ordering::Acquire)
+}
+
+/// 发布内核 Mixin 处理器集合的全局活动状态。
+///
+/// 路由器先更新所有站点指针，再更新该提示。门控本身不发布、解引用路由；观察到活动
+/// 状态后，包装器仍通过站点 route 的 Acquire 读取取得不可变快照。
+#[doc(hidden)]
+pub fn publish_mixin_runtime_active(active: bool) {
+    MIXIN_RUNTIME_ACTIVE.store(active, Ordering::Release);
+}
 
 /// 安装一次内核 Mixin 运行时钩子。
 pub fn install_mixin_runtime_hooks(hooks: &'static KernelMixinRuntimeHooksV1) -> bool {
@@ -580,6 +610,19 @@ pub unsafe fn dispatch_kernel_mixin(
     let hooks = unsafe { &*hooks };
     // Safety: 调用方承担站点和帧生命周期，钩子表保证同步返回。
     unsafe { (hooks.dispatch)(core::ptr::from_ref(site), core::ptr::from_mut(frame)) }
+}
+
+/// 在独立冷路径中执行内核 Mixin 调用帧逻辑。
+///
+/// 导出宏只在站点存在活动处理链时调用这里。禁止内联可以阻止编译器把慢路径的大型栈帧
+/// 合并回常用入口，使没有处理器的直接符号调用只承担路由快查成本。
+#[cold]
+#[inline(never)]
+pub fn invoke_kernel_mixin_slow<F, R>(callback: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    callback()
 }
 
 /// 目标函数在栈上保存的原逻辑 continuation。
@@ -1251,6 +1294,8 @@ fn valid_rust_path(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    static MIXIN_HINT_ROUTE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
     fn example(value: usize) -> usize {
         value
     }
@@ -1304,5 +1349,45 @@ mod tests {
             )
             .valid([0; 32])
         );
+    }
+
+    #[test]
+    fn mixin_slow_path_invokes_callback_once() {
+        let mut calls = 0usize;
+        let result = invoke_kernel_mixin_slow(|| {
+            calls += 1;
+            42usize
+        });
+        assert_eq!(result, 42);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn mixin_runtime_gate_tracks_published_routes() {
+        publish_mixin_runtime_active(false);
+        assert!(!mixin_runtime_active());
+        publish_mixin_runtime_active(true);
+        assert!(mixin_runtime_active());
+        publish_mixin_runtime_active(false);
+    }
+
+    #[test]
+    fn mixin_handler_hint_tracks_only_route_presence() {
+        let descriptor = KernelMixinSiteDescriptorV1::new(
+            KERNEL_MIXIN_SITE_HEAD,
+            0,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            "tests.query",
+            "head",
+            &MIXIN_HINT_ROUTE,
+        );
+        assert!(!descriptor.has_handlers_hint());
+
+        let marker = core::ptr::from_ref(&MIXIN_HINT_ROUTE).cast_mut().cast();
+        MIXIN_HINT_ROUTE.store(marker, Ordering::Relaxed);
+        assert!(descriptor.has_handlers_hint());
+        MIXIN_HINT_ROUTE.store(core::ptr::null_mut(), Ordering::Relaxed);
     }
 }

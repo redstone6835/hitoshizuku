@@ -31,7 +31,6 @@ static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
 static STARTED_HARTS: AtomicUsize = AtomicUsize::new(0);
 static AP_IDLE_TASKS: [AtomicPtr<sched::Task>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
-static REMOTE_FENCE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 #[repr(C, align(16))]
 struct SecondaryStack([u8; AP_STACK_SIZE]);
@@ -128,16 +127,11 @@ fn for_each_remote_hart_mask(
     logical_targets: usize,
     mut action: impl FnMut(usize, usize) -> sbi::SbiRet,
 ) {
-    // SBI RFENCE 是同步操作。若多个 hart 同时互相发起 fence，固件可能让每个
-    // 调用都等待另一个仍停留在 RFENCE ecall 中的 hart。统一串行化所有远端
-    // TLB/I-cache fence，避免形成跨 hart 等待环。
     let source = crate::riscv64::specific::current_cpu_id();
     let targets = logical_targets & ONLINE_HARTS.load(Ordering::Acquire) & !(1 << source);
     if targets == 0 {
         return;
     }
-    let _guard = REMOTE_FENCE_LOCK.lock();
-
     // SBI 的 hart mask 允许一次 ecall 通知一组 hart。旧实现按逻辑 CPU
     // 逐个调用 RFENCE；在 QEMU/OpenSBI 上这会把一次页表更新放大成最多
     // MAX_CPUS-1 次 M-mode 往返。物理 hart 编号不保证连续，因此先按

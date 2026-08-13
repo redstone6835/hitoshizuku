@@ -82,6 +82,25 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(identity.device)
         self.assertIsNone(identity.inode)
 
+    def test_qemu_identity_accepts_the_configured_riscv_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory) / "42"
+            process.mkdir()
+            (process / "comm").write_text("qemu-system-ris\n")
+            cmdline = b"/opt/qemu/bin/qemu-system-riscv64\0-machine\0virt\0"
+            (process / "cmdline").write_bytes(cmdline)
+            denied = PermissionError(errno.EACCES, "permission denied")
+            with mock.patch("scripts.qemu_profile_daemon.os.readlink", side_effect=denied):
+                identity = read_qemu_process_identity(
+                    42,
+                    Path(directory),
+                    "qemu-system-riscv64",
+                )
+
+        self.assertEqual(identity.method, "proc-comm-cmdline")
+        self.assertEqual(identity.comm, "qemu-system-ris")
+        self.assertEqual(identity.argv0, "/opt/qemu/bin/qemu-system-riscv64")
+
     def test_qemu_fallback_rejects_non_qemu_cmdline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             process = Path(directory) / "42"
@@ -155,6 +174,31 @@ class ParserTests(unittest.TestCase):
         self.assertEqual([(trace.cpu, len(trace.frames)) for trace in traces], [(1, 2), (0, 1)])
         self.assertEqual(traces[0].frames[0].function, "idle_loop")
         self.assertFalse(traces[1].frames[0].symbolized)
+
+
+class SerialWriterTests(unittest.TestCase):
+    """验证交互串口命令不会以整行突发方式写入。"""
+
+    def test_serial_line_is_paced_one_byte_at_a_time(self) -> None:
+        try:
+            from scripts.serial_line_writer import write_serial_line
+        except ImportError as error:
+            self.fail(f"serial line writer is unavailable: {error}")
+
+        class RecordingStream:
+            def __init__(self) -> None:
+                self.chunks: list[bytes] = []
+
+            def write(self, chunk: bytes) -> int:
+                self.chunks.append(chunk)
+                return len(chunk)
+
+        stream = RecordingStream()
+        delays: list[float] = []
+        write_serial_line(stream, "ab", delay_seconds=0.002, sleep=delays.append)
+
+        self.assertEqual(stream.chunks, [b"a", b"b", b"\n"])
+        self.assertEqual(delays, [0.002, 0.002, 0.002])
 
 
 class SymbolTests(unittest.TestCase):
@@ -380,6 +424,56 @@ class SymbolTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, field):
                     validate_plugin_record_progress(previous, record)
 
+    def test_unsymbolized_plugin_sample_is_not_an_invalid_record(self) -> None:
+        payload = PLUGIN_HEADER.pack(
+            PLUGIN_MAGIC,
+            PLUGIN_VERSION,
+            PLUGIN_HEADER.size,
+            PLUGIN_HEADER.size,
+            0,
+            PLUGIN_FLAG_REGISTERS_VALID | PLUGIN_FLAG_STACK_VALID,
+            1,
+            100,
+            100,
+            100,
+            0,
+            0,
+            0x4000,
+            0x8000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+        class OneRecordSocket:
+            def __init__(self) -> None:
+                self.payload = payload
+
+            def recv(self, _size: int) -> bytes:
+                if self.payload is None:
+                    raise BlockingIOError
+                result = self.payload
+                self.payload = None
+                return result
+
+        capture = CaptureState("unit", 1, 0)
+        daemon = object.__new__(ProfileDaemon)
+        daemon.args = SimpleNamespace(plugin_stack_bytes=0, vcpu_count=1, max_frames=8)
+        daemon.plugin_socket = OneRecordSocket()
+        daemon.plugin_latest = {}
+        daemon.capture = capture
+        daemon.clock = lambda: 200
+        daemon.symbol_table = SymbolTable([Symbol(0x1000, "kernel")], 0x1000, 0x2000)
+        daemon.writer = SimpleNamespace(write=lambda *_args, **_kwargs: None)
+
+        daemon._drain_plugin()
+
+        self.assertEqual(capture.plugin_invalid, 0)
+        self.assertEqual(getattr(capture, "plugin_unsymbolized", 0), 1)
+
 
 class PluginExitTests(unittest.TestCase):
     """验证 preliminary summary 只能由完整 atexit 累计量解锁。"""
@@ -388,6 +482,7 @@ class PluginExitTests(unittest.TestCase):
     def exit_value(dropped: int = 0) -> dict[str, object]:
         return {
             "schema": "mygo.qemu-observer-plugin.v1",
+            "counter_granularity": "translation-block",
             "period_insns": 100,
             "stack_bytes": 16,
             "vcpus": [
@@ -421,6 +516,7 @@ class PluginExitTests(unittest.TestCase):
             path = Path(directory) / "plugin-summary.json"
             path.write_text(json.dumps(self.exit_value()))
             summary = load_plugin_exit_summary(path, 100, 16, 2)
+        self.assertEqual(summary.counter_granularity, "translation-block")
         reconcile_plugin_exit(summary, self.latest())
 
         no_sample_at_period = dataclasses.replace(

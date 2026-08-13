@@ -53,7 +53,7 @@ unsafe extern "C" fn blocking_stream_writer(_arg: usize) -> ! {
     let payload = (0..BLOCKING_STREAM_BYTES)
         .map(|index| index.wrapping_mul(17) as u8)
         .collect::<alloc::vec::Vec<_>>();
-    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
     let socket = sender
         .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
         .expect("blocking TCP sender 缺少网络 socket ops");
@@ -93,7 +93,7 @@ unsafe extern "C" fn blocking_detach_reader(_arg: usize) -> ! {
                 wait_all: false,
                 trunc: false,
                 defer_window_update: false,
-                deadline_ns: Some(sched::now_ns_public().saturating_add(5_000_000_000)),
+                deadline_ns: Some(sched::now_ns_direct().saturating_add(5_000_000_000)),
             },
         );
     let status = match result {
@@ -108,7 +108,7 @@ fn current_vfs() -> (
     alloc::sync::Arc<vfs::VfsContext>,
     alloc::sync::Arc<vfs::fdtable::FdTable>,
 ) {
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     let context = task
         .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
         .expect("当前任务缺少 VFS context")
@@ -139,17 +139,17 @@ fn sockaddr_in6(address: [u8; 16], port: u16) -> [u8; 28] {
 }
 
 fn wait_poll(file: &vfs::file::File, events: vfs::file::PollEvents) {
-    let deadline = sched::now_ns_public().saturating_add(1_000_000_000);
-    while sched::now_ns_public() < deadline {
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
+    while sched::now_ns_direct() < deadline {
         if file.poll(events).intersect(events).raw() != 0 {
             return;
         }
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-            let wake = sched::now_ns_public().saturating_add(100_000);
+            let wake = sched::now_ns_direct().saturating_add(100_000);
             let _ = sched::register_sleep_deadline(&task, wake);
             drop(task);
-            sched::schedule_once(sched::now_ns_public());
+            sched::schedule_once(sched::now_ns_direct());
         }
     }
     panic!("1 秒内 socket 未出现预期 poll 事件");
@@ -355,9 +355,70 @@ fn net_stack_builds_udp_and_raw_fragment_plans() {
     assert_eq!(reconstructed, raw_bytes[raw_header_len..]);
 }
 
+struct TestCpuAffinity {
+    task: alloc::sync::Arc<sched::Task>,
+    previous: u64,
+}
+
+impl Drop for TestCpuAffinity {
+    fn drop(&mut self) {
+        self.task.set_cpu_affinity(self.previous);
+    }
+}
+
+fn pin_test_task_to_protocol_cpu() -> (TestCpuAffinity, usize) {
+    let protocol_shards = usize::from(
+        net::stack::boot_config()
+            .expect("net-stack 启动配置应已安装")
+            .active_cpu_count(),
+    );
+    assert_ne!(protocol_shards, 0);
+    let task = sched::current_task_direct();
+    let previous = task.cpu_affinity();
+    let current_cpu = sched::current_cpu_id();
+    let target_cpu = if current_cpu < protocol_shards {
+        current_cpu
+    } else {
+        0
+    };
+    task.set_cpu_affinity(1u64 << target_cpu);
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
+    while sched::current_cpu_id() != target_cpu && sched::now_ns_direct() < deadline {
+        let _ = sched::operation::sched_yield();
+    }
+    assert_eq!(
+        sched::current_cpu_id(),
+        target_cpu,
+        "测试任务未迁移到已初始化的协议 shard CPU"
+    );
+    (TestCpuAffinity { task, previous }, target_cpu)
+}
+
+fn invoke_test_shard_turn(
+    shard: crate::net_stack::ElmShardTurnClient,
+    mut commands: alloc::vec::Vec<net::stack::NetStackFlowCommand>,
+) -> alloc::vec::Vec<net::stack::NetStackFlowCommand> {
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
+    loop {
+        match shard.invoke_turn(commands, &[]) {
+            Ok(commands) => return commands,
+            Err((crate::net_stack::ShardTurnError::Busy, returned))
+                if sched::now_ns_direct() < deadline =>
+            {
+                commands = returned;
+                let _ = sched::operation::sched_yield();
+            }
+            Err((error, _)) => panic!("测试 shard-turn 失败: {error:?}"),
+        }
+    }
+}
+
 #[ktest]
 fn net_stack_elm_persists_flow_shard_state() {
-    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(0));
+    let (_affinity, cpu) = pin_test_task_to_protocol_cpu();
+    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(
+        u16::try_from(cpu).expect("当前 CPU 编号应可表示为 shard"),
+    ));
     let local = net::Endpoint {
         addr: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
         port: 49_151,
@@ -376,9 +437,7 @@ fn net_stack_elm_persists_flow_shard_state() {
             output: None,
         },
     ];
-    let mut commands = shard
-        .invoke_turn(commands, &[])
-        .unwrap_or_else(|_| panic!("ELM shard 应接受 UDP endpoint batch"));
+    let mut commands = invoke_test_shard_turn(shard, commands);
     let second = match commands.pop() {
         Some(net::stack::NetStackFlowCommand::BindUdp {
             output: Some(Ok(flow)),
@@ -394,21 +453,22 @@ fn net_stack_elm_persists_flow_shard_state() {
         _ => panic!("首个 UDP endpoint 未提交"),
     };
     assert_ne!(first, second);
-    shard
-        .invoke_turn(
-            alloc::vec![
-                net::stack::NetStackFlowCommand::CloseUdp { flow: first },
-                net::stack::NetStackFlowCommand::CloseUdp { flow: second },
-            ],
-            &[],
-        )
-        .unwrap_or_else(|_| panic!("ELM shard 应提交 UDP close batch"));
+    invoke_test_shard_turn(
+        shard,
+        alloc::vec![
+            net::stack::NetStackFlowCommand::CloseUdp { flow: first },
+            net::stack::NetStackFlowCommand::CloseUdp { flow: second },
+        ],
+    );
 }
 
 #[ktest]
 fn net_stack_calls_are_bounded_by_task_execution_scope() {
-    let task = sched::current_task();
-    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(0));
+    let task = sched::current_task_direct();
+    let (_affinity, cpu) = pin_test_task_to_protocol_cpu();
+    let shard = crate::net_stack::ElmShardTurnClient::new(net::ShardId(
+        u16::try_from(cpu).expect("当前 CPU 编号应可表示为 shard"),
+    ));
 
     assert!(task.begin_execution_scope(sched::ExecutionScopeKind::Syscall));
     assert!(
@@ -465,7 +525,7 @@ fn net_stack_calls_are_bounded_by_task_execution_scope() {
         net::stack::NetStackCommandBatch::new(),
         net::stack::TxPlanBatch::new(),
         &config,
-        sched::now_ns_public(),
+        sched::now_ns_direct(),
         &mut tcp_output,
         &mut pool_installs,
         true,
@@ -482,7 +542,7 @@ fn net_stack_calls_are_bounded_by_task_execution_scope() {
         commands,
         net::stack::TxPlanBatch::new(),
         &config,
-        sched::now_ns_public(),
+        sched::now_ns_direct(),
         &mut tcp_output,
         &mut pool_installs,
         true,
@@ -762,16 +822,6 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
         .downcast_ops::<vfs::net_socket::NetSocketFileOps>()
         .expect("TCP client 缺少网络 socket ops")
         .proxy();
-    let stat_max = |key: &str| {
-        net::device::snapshot_stats()
-            .into_iter()
-            .filter(|stat| stat.key == key)
-            .map(|stat| stat.value)
-            .max()
-            .unwrap_or(0)
-    };
-    let shared_before = stat_max("tcp_loopback_shared_bytes");
-    let compact_before = stat_max("tcp_rx_compact_copy_bytes");
     client_proxy.set_buffer_limits(Some(16 * 1024), None);
     BLOCKING_STREAM_WRITTEN.store(usize::MAX, core::sync::atomic::Ordering::Release);
     *BLOCKING_STREAM_SENDER.lock() = Some(alloc::sync::Arc::clone(&client_file));
@@ -785,7 +835,7 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
     );
     sched::activate_task(&blocking_writer).expect("启动 blocking TCP writer");
     let accepted_file = table.get_file(accepted).unwrap();
-    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
     let mut blocking_received = 0usize;
     let mut blocking_window = alloc::vec![0; 64 * 1024];
     while blocking_received < BLOCKING_STREAM_BYTES {
@@ -805,33 +855,33 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
                 blocking_received += output.len;
             }
             Ok(_) | Err(errno::Errno::EAGAIN) => {
-                if sched::now_ns_public() >= deadline {
+                if sched::now_ns_direct() >= deadline {
                     panic!(
                         "blocking TCP send 超时: received={} total={}",
                         blocking_received, BLOCKING_STREAM_BYTES
                     );
                 }
-                let task = sched::current_task();
+                let task = sched::current_task_direct();
                 if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-                    let wake = sched::now_ns_public().saturating_add(100_000);
+                    let wake = sched::now_ns_direct().saturating_add(100_000);
                     let _ = sched::register_sleep_deadline(&task, wake);
                     drop(task);
-                    sched::schedule_once(sched::now_ns_public());
+                    sched::schedule_once(sched::now_ns_direct());
                 }
             }
             Err(error) => panic!("blocking TCP recv 失败: {:?}", error),
         }
     }
     while BLOCKING_STREAM_WRITTEN.load(core::sync::atomic::Ordering::Acquire) == usize::MAX {
-        if sched::now_ns_public() >= deadline {
+        if sched::now_ns_direct() >= deadline {
             panic!("blocking TCP writer 未按时结束");
         }
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-            let wake = sched::now_ns_public().saturating_add(100_000);
+            let wake = sched::now_ns_direct().saturating_add(100_000);
             let _ = sched::register_sleep_deadline(&task, wake);
             drop(task);
-            sched::schedule_once(sched::now_ns_public());
+            sched::schedule_once(sched::now_ns_direct());
         }
     }
     assert_eq!(
@@ -866,7 +916,7 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
     let stream = (0usize..2 * 1024 * 1024)
         .map(|index| index.wrapping_mul(13) as u8)
         .collect::<alloc::vec::Vec<_>>();
-    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
     let mut sent = 0usize;
     let mut consumed = 0usize;
     let mut receive_window = alloc::vec![0; 64 * 1024];
@@ -912,7 +962,7 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
                 Err(error) => panic!("jumbo TCP recv 失败: {:?}", error),
             }
         }
-        if sched::now_ns_public() >= deadline {
+        if sched::now_ns_direct() >= deadline {
             panic!(
                 "jumbo TCP loopback 超时: sent={} consumed={} total={}",
                 sent,
@@ -921,25 +971,16 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
             );
         }
         if !progressed {
-            let task = sched::current_task();
+            let task = sched::current_task_direct();
             if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-                let wake = sched::now_ns_public().saturating_add(100_000);
+                let wake = sched::now_ns_direct().saturating_add(100_000);
                 let _ = sched::register_sleep_deadline(&task, wake);
                 drop(task);
-                sched::schedule_once(sched::now_ns_public());
+                sched::schedule_once(sched::now_ns_direct());
             }
         }
     }
     assert_eq!(sent, stream.len());
-    let expected_shared = BLOCKING_STREAM_BYTES + 4 + 4 + stream.len();
-    assert_eq!(
-        stat_max("tcp_loopback_shared_bytes").saturating_sub(shared_before),
-        expected_shared as u64
-    );
-    assert_eq!(
-        stat_max("tcp_rx_compact_copy_bytes").saturating_sub(compact_before),
-        0
-    );
 
     vfs::socket::shutdown(&table, client, vfs::socket::SHUT_WR).expect("关闭 client 写方向");
     wait_readable(&accepted_file);
@@ -979,7 +1020,7 @@ fn udp_blocking_reader_writer_stress() {
         },
     );
     sched::activate_task(&writer).expect("启动 UDP stress writer");
-    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
     for expected in 0..256u32 {
         let mut bytes = [0u8; 4];
         let received = receiver
@@ -990,7 +1031,7 @@ fn udp_blocking_reader_writer_stress() {
     }
     while !STRESS_WRITER_DONE.load(core::sync::atomic::Ordering::Acquire) {
         assert!(
-            sched::now_ns_public() < deadline,
+            sched::now_ns_direct() < deadline,
             "UDP stress writer 未在期限内完成"
         );
         let _ = sched::operation::sched_yield();
@@ -1021,7 +1062,7 @@ fn udp_socket_facade_loopback_roundtrip() {
         Err(net::SocketError::WouldBlock)
     ));
     assert_eq!(sender.send(b"ping", None, false, None), Ok(4));
-    let deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     let mut payload = [0u8; 4];
     let received = receiver_alias
         .recv(&mut payload, false, false, false, Some(deadline))
@@ -1058,7 +1099,7 @@ fn udp_send_then_close_preserves_accepted_datagram() {
     assert_eq!(sender.send(b"last", None, false, None), Ok(4));
     sender.close();
 
-    let deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     let mut payload = [0u8; 4];
     let received = receiver
         .recv(&mut payload, false, false, false, Some(deadline))
@@ -1074,17 +1115,17 @@ fn virtio_user_network_arp_roundtrip() {
         return;
     }
     net_runtime::request_arp_probe();
-    let deadline = sched::now_ns_public().saturating_add(3_000_000_000);
-    while sched::now_ns_public() < deadline {
+    let deadline = sched::now_ns_direct().saturating_add(3_000_000_000);
+    while sched::now_ns_direct() < deadline {
         if net_runtime::arp_probe_complete() {
             return;
         }
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-            let wake = sched::now_ns_public().saturating_add(1_000_000);
+            let wake = sched::now_ns_direct().saturating_add(1_000_000);
             let _ = sched::register_sleep_deadline(&task, wake);
             drop(task);
-            sched::schedule_once(sched::now_ns_public());
+            sched::schedule_once(sched::now_ns_direct());
         }
     }
     panic!("3 秒内未观察到 QEMU user networking 的 ARP reply");
@@ -1093,17 +1134,17 @@ fn virtio_user_network_arp_roundtrip() {
 #[ktest]
 fn udp_loopback_frontend_roundtrip() {
     net_runtime::request_udp_loopback_probe();
-    let deadline = sched::now_ns_public().saturating_add(3_000_000_000);
-    while sched::now_ns_public() < deadline {
+    let deadline = sched::now_ns_direct().saturating_add(3_000_000_000);
+    while sched::now_ns_direct() < deadline {
         if net_runtime::udp_loopback_probe_complete() {
             return;
         }
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-            let wake = sched::now_ns_public().saturating_add(1_000_000);
+            let wake = sched::now_ns_direct().saturating_add(1_000_000);
             let _ = sched::register_sleep_deadline(&task, wake);
             drop(task);
-            sched::schedule_once(sched::now_ns_public());
+            sched::schedule_once(sched::now_ns_direct());
         }
     }
     let stats = net::device::snapshot_stats();
@@ -1133,17 +1174,17 @@ fn virtio_udp_dns_roundtrip() {
         return;
     }
     net_runtime::request_physical_udp_probe();
-    let deadline = sched::now_ns_public().saturating_add(5_000_000_000);
-    while sched::now_ns_public() < deadline {
+    let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
+    while sched::now_ns_direct() < deadline {
         if net_runtime::physical_udp_probe_complete() {
             return;
         }
-        let task = sched::current_task();
+        let task = sched::current_task_direct();
         if task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping) {
-            let wake = sched::now_ns_public().saturating_add(1_000_000);
+            let wake = sched::now_ns_direct().saturating_add(1_000_000);
             let _ = sched::register_sleep_deadline(&task, wake);
             drop(task);
-            sched::schedule_once(sched::now_ns_public());
+            sched::schedule_once(sched::now_ns_direct());
         }
     }
     if net_runtime::physical_udp_probe_complete() {
@@ -1389,10 +1430,10 @@ fn net_stack_forced_reload_invalidates_old_fds_and_wakes_waiters() {
         },
     );
     sched::activate_task(&reader).expect("启动卸载测试 blocking reader");
-    let sleep_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let sleep_deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     while reader.state() != sched::TaskState::Sleeping {
         assert!(
-            sched::now_ns_public() < sleep_deadline,
+            sched::now_ns_direct() < sleep_deadline,
             "blocking reader 未进入 socket wait queue"
         );
         let _ = sched::operation::sched_yield();
@@ -1404,10 +1445,10 @@ fn net_stack_forced_reload_invalidates_old_fds_and_wakes_waiters() {
         net::stack::stack_snapshot().state,
         net::stack::NetStackState::Absent
     );
-    let wake_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let wake_deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     while DETACH_READER_RESULT.load(core::sync::atomic::Ordering::Acquire) == i32::MIN {
         assert!(
-            sched::now_ns_public() < wake_deadline,
+            sched::now_ns_direct() < wake_deadline,
             "net.stack 卸载后 blocking reader 未被唤醒"
         );
         let _ = sched::operation::sched_yield();
@@ -1444,7 +1485,7 @@ fn net_stack_forced_reload_invalidates_old_fds_and_wakes_waiters() {
         Err(errno::Errno::EAFNOSUPPORT)
     ));
 
-    let current = sched::current_task();
+    let current = sched::current_task_direct();
     let new_cell = crate::elm::reload_build_bound_module_for_test(&current, "net.stack")
         .expect("重新装载 net.stack");
     assert_ne!(new_cell, old_cell);

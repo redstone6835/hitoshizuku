@@ -7,6 +7,7 @@ edition = "2024"
 bench = []
 block-bench = ["general/block-profile"]
 allocator-bench = []
+kcsan = ["dep:kcsan"]
 embedded-initramfs = []
 trace-task-lifecycle = ["general/trace-task-lifecycle", "sched/trace-task-lifecycle"]
 trace-signal-wait = []
@@ -20,6 +21,12 @@ performance-profile = [
     "sched/performance-profile",
     "vfs/performance-profile",
 ]
+syscall-model-markers = [
+    "performance-profile",
+    "arch/syscall-model-markers",
+    "profiling/syscall-model-markers",
+    "sched/syscall-model-markers",
+]
 allocator-tests = [
     "ktest/kernel",
     "allocator/ktest-kernel",
@@ -31,6 +38,11 @@ kernel-tests = [
     "mm/ktest-kernel",
     "log/ktest-kernel",
     "allocator/ktest-kernel",
+    "soyo/test-support",
+]
+soyo-tests = [
+    "ktest/kernel",
+    "soyo/test-support",
 ]
 smp-tests = ["ktest/kernel"]
 lazy-sxe-tests = []
@@ -56,15 +68,19 @@ extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
 general = { path = "../general" }
 ktest = { path = "../libs/ktest" }
+kcsan = { path = "../libs/kcsan", optional = true }
 kernel-symbols = { path = "../libs/kernel-symbols", default-features = false }
 log = { path = "../libs/log" }
 allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
 mm = { path = "../libs/mm" }
+native-abi = { path = "../libs/native-abi" }
 net = { path = "../libs/net" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
+sha2 = { version = "0.10.9", default-features = false }
 socket = { path = "../libs/socket" }
+soyo = { path = "../libs/soyo" }
 vfs = { path = "../libs/vfs" }
 
 [build-dependencies]

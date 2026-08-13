@@ -1,5 +1,6 @@
 use ktest::ktest;
 
+use core::alloc::{GlobalAlloc, Layout};
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -102,7 +103,7 @@ fn elm_runtime_namespace_registry_resolves_declared_namespace() {
 
 #[ktest]
 fn elm_kernel_memory_allocator_enforces_exact_owner() {
-    let before = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_public());
+    let before = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_direct());
     let request = allocator::MemoryRequest::new(allocator::MemoryDomain::Kernel, 64, 16)
         .with_zeroing(allocator::Zeroing::Zeroed);
     let record = allocator::KERNEL_ALLOCATOR
@@ -142,9 +143,89 @@ fn elm_kernel_memory_allocator_enforces_exact_owner() {
     allocator::KERNEL_ALLOCATOR
         .deallocate_owned(ELM_MGR_ID.0, grown.ptr)
         .expect("同一 owner 释放应成功");
-    let after = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_public());
+    let after = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_direct());
     assert_eq!(after.dynamic_alloc_bytes, before.dynamic_alloc_bytes);
     assert!(after.peak_dynamic_alloc_bytes >= before.peak_dynamic_alloc_bytes);
+}
+
+#[ktest]
+fn elm_context_without_native_guard_does_not_capture_kernel_global_allocations() {
+    let context = ElmContext::new(
+        ELM_MGR_ID,
+        None,
+        Generation::FIRST,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let current = elm_model::enter_current_context(&context).expect("ELM 测试上下文应能进入");
+    let layout = Layout::from_size_align(96, 16).expect("测试布局有效");
+    // Safety: 测试使用同一个 GlobalAlloc 和 Layout 完成分配、释放往返。
+    let pointer = unsafe { GlobalAlloc::alloc(&allocator::KERNEL_ALLOCATOR, layout) };
+    assert!(!pointer.is_null());
+    assert!(
+        allocator::KERNEL_ALLOCATOR
+            .query_tracked_allocation(pointer as usize)
+            .is_err(),
+        "只有原生 Guard 内的 ELM 代码才能取得隐式分配 owner"
+    );
+    // Safety: pointer 来自上面的同一个 allocator，layout 未改变。
+    unsafe { GlobalAlloc::dealloc(&allocator::KERNEL_ALLOCATOR, pointer, layout) };
+    drop(current);
+}
+
+#[ktest]
+fn elm_native_guard_captures_kernel_global_allocations() {
+    let guard = general::elm_guard::ElmGuard::enter(
+        ELM_MGR_ID.0,
+        general::elm_guard::ELM_GUARD_PHASE_HOOK,
+        0,
+    )
+    .expect("ELM 原生 Guard 应能进入");
+    let layout = Layout::from_size_align(96, 16).expect("测试布局有效");
+    // Safety: 测试使用同一个 GlobalAlloc 和 Layout 完成分配、释放往返。
+    let pointer = unsafe { GlobalAlloc::alloc(&allocator::KERNEL_ALLOCATOR, layout) };
+    assert!(!pointer.is_null());
+    let record = allocator::KERNEL_ALLOCATOR
+        .query_tracked_allocation(pointer as usize)
+        .expect("Guard 内的 ELM 分配应被追踪");
+    assert_eq!(record.accounting_owner(), ELM_MGR_ID.0);
+    // Safety: pointer 来自上面的同一个 allocator，layout 未改变。
+    unsafe { GlobalAlloc::dealloc(&allocator::KERNEL_ALLOCATOR, pointer, layout) };
+    drop(guard);
+}
+
+#[ktest]
+fn elm_resident_context_overrides_native_guard_allocation_owner() {
+    let guard = general::elm_guard::ElmGuard::enter(
+        ELM_MGR_ID.0,
+        general::elm_guard::ELM_GUARD_PHASE_HOOK,
+        0,
+    )
+    .expect("ELM 原生 Guard 应能进入");
+    let context = ElmContext::new(
+        ElmId(0),
+        None,
+        Generation::FIRST,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let current = elm_model::enter_current_context(&context).expect("resident 上下文应能进入");
+    let layout = Layout::from_size_align(96, 16).expect("测试布局有效");
+    // Safety: 测试使用同一个 GlobalAlloc 和 Layout 完成分配、释放往返。
+    let pointer = unsafe { GlobalAlloc::alloc(&allocator::KERNEL_ALLOCATOR, layout) };
+    assert!(!pointer.is_null());
+    assert!(
+        allocator::KERNEL_ALLOCATOR
+            .query_tracked_allocation(pointer as usize)
+            .is_err(),
+        "resident 上下文中的内核对象不应归外层 ELM 单元所有"
+    );
+    // Safety: pointer 来自上面的同一个 allocator，layout 未改变。
+    unsafe { GlobalAlloc::dealloc(&allocator::KERNEL_ALLOCATOR, pointer, layout) };
+    drop(current);
+    drop(guard);
 }
 
 fn push_owned_resource_trace(stage: u64, handle: u64) -> Result<(), i32> {
@@ -3977,7 +4058,7 @@ fn elm_native_panic_uses_controlled_recovery_exit() {
 #[ktest]
 fn elm_native_timeout_forces_controlled_exit() {
     let cell = ElmId(0x7002);
-    let deadline = sched::now_ns_public().saturating_add(50_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(50_000_000);
     let result = super::native::test_call_native_entry_with_deadline(
         test_native_entry_spins as usize,
         cell,
@@ -4017,9 +4098,14 @@ fn elm_native_nested_fault_uses_controlled_recovery_exit() {
 
 #[ktest]
 fn elm_native_fault_recovers_on_secondary_cpu() {
-    if sched::active_cpu_mask().count_ones() < 2 {
+    let active_cpus = sched::active_cpu_mask();
+    if active_cpus.count_ones() < 2 {
         return;
     }
+    let current_cpu = sched::current_task_direct().current_cpu();
+    let target_cpu = (0..u64::BITS as usize)
+        .find(|cpu| *cpu != current_cpu && active_cpus & (1u64 << cpu) != 0)
+        .expect("在线 CPU 集合应包含当前 CPU 之外的处理器");
     SMP_NATIVE_FAULT_TEST_STATE.store(0, Ordering::Release);
     SMP_NATIVE_FAULT_TEST_CPU.store(usize::MAX, Ordering::Release);
     #[cfg(target_arch = "loongarch64")]
@@ -4042,20 +4128,20 @@ fn elm_native_fault_recovers_on_secondary_cpu() {
             nice: 0,
             slice_ns: 0,
         },
-        1,
+        target_cpu,
     )
     .expect("无法在辅助 CPU 启动 ELM fault 测试线程");
 
-    let deadline = sched::now_ns_public().saturating_add(2_000_000_000);
+    let deadline = sched::now_ns_direct().saturating_add(2_000_000_000);
     while matches!(SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire), 0 | 10)
-        && sched::now_ns_public() < deadline
+        && sched::now_ns_direct() < deadline
     {
         core::hint::spin_loop();
     }
-    let cleanup_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    let cleanup_deadline = sched::now_ns_direct().saturating_add(1_000_000_000);
     while (task.state() != sched::TaskState::Dead
-        || sched::current_task_on(1).is_some_and(|current| Arc::ptr_eq(&current, &task)))
-        && sched::now_ns_public() < cleanup_deadline
+        || sched::current_task_on(target_cpu).is_some_and(|current| Arc::ptr_eq(&current, &task)))
+        && sched::now_ns_direct() < cleanup_deadline
     {
         core::hint::spin_loop();
     }
@@ -4072,19 +4158,23 @@ fn elm_native_fault_recovers_on_secondary_cpu() {
     );
     if SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire) != 1 {
         log::error!(
-            "[elm][test] AP native fault timeout: state={} task_state={:?} placement={:?} on_rq={} current_cpu={} cpu1_current={:?}",
+            "[elm][test] AP native fault timeout: state={} task_state={:?} placement={:?} on_rq={} current_cpu={} target_cpu={} target_current={:?}",
             SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire),
             task.state(),
             task.placement(),
             task.sched.on_rq(),
             task.current_cpu(),
-            sched::current_task_on(1).map(|current| current.pid_root()),
+            target_cpu,
+            sched::current_task_on(target_cpu).map(|current| current.pid_root()),
         );
     }
     assert_eq!(task.state(), sched::TaskState::Dead);
-    assert!(sched::current_task_on(1).is_none_or(|current| !Arc::ptr_eq(&current, &task)));
+    assert!(sched::current_task_on(target_cpu).is_none_or(|current| !Arc::ptr_eq(&current, &task)));
     assert_eq!(SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire), 1);
-    assert_eq!(SMP_NATIVE_FAULT_TEST_CPU.load(Ordering::Acquire), 1);
+    assert_eq!(
+        SMP_NATIVE_FAULT_TEST_CPU.load(Ordering::Acquire),
+        target_cpu
+    );
 }
 
 #[ktest]
@@ -4273,7 +4363,7 @@ fn elm_mgr_loads_eki_declarative_topology() {
         detach_plan.affected_dependents,
         detach_plan.affected_extensions,
     );
-    let resources = super::resource_accounting::snapshot(ElmId(cell_id), sched::now_ns_public());
+    let resources = super::resource_accounting::snapshot(ElmId(cell_id), sched::now_ns_direct());
     assert_eq!(
         (
             resources.dynamic_alloc_bytes,
@@ -4507,7 +4597,7 @@ fn elm_provider_async_core_completes_and_releases_lease_on_poll() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1_000, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4548,7 +4638,7 @@ fn elm_provider_async_cancel_queued_job_releases_lease() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit = core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 0, 0), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
 
@@ -4577,7 +4667,7 @@ fn elm_provider_async_running_job_is_observable_and_cancelable() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1_000, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4651,7 +4741,7 @@ fn elm_provider_async_running_timeout_is_retained_until_poll() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4690,7 +4780,7 @@ fn elm_provider_async_queued_timeout_is_retained_until_poll() {
         ELM_ACTION_OPCODE_INVOKE,
         &payload,
     );
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
     let submit =
         core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1, 1_000), now);
     assert_eq!(submit.status, ELM_MGR_STATUS_OK);
@@ -4722,7 +4812,7 @@ fn elm_provider_async_queue_full_rejects_without_holding_lease() {
     core.init_builtin_mgr().unwrap();
     let (action, bind_response) = bind_mgr_action_provider(&mut core);
     let payload = action_invoke_payload(&ElmActionInvokeRequest::new(action));
-    let now = sched::now_ns_public();
+    let now = sched::now_ns_direct();
 
     for call_id in 0..ELM_PROVIDER_ASYNC_QUEUE_LIMIT {
         let frame = ElmCallFrame::new(
@@ -5790,7 +5880,7 @@ fn elm_mgr_channel_dispatches_async_provider_queue_flow() {
     }
     assert!(found);
 
-    assert!(core.run_one_async_provider_job_at(sched::now_ns_public().saturating_add(100_000)));
+    assert!(core.run_one_async_provider_job_at(sched::now_ns_direct().saturating_add(100_000)));
     let poll_payload = provider_async_poll_payload(&ElmProviderAsyncPollRequest::new(ticket_id));
     let poll_response = dispatch_mgr_call_on_core(
         &mut core,

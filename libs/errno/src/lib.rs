@@ -184,8 +184,9 @@ impl Errno {
         }
     }
 
-    #[kernel_symbols::export(name = "errno.Errno.as_i32", contract = "kernel.errno.conversion@1", version = 1, capabilities = kernel_symbols::capability::CORE_SAFE)]
-    pub fn as_i32(self) -> i32 {
+    /// 内核常驻代码使用的错误码转换，不经过 ELM 导出包装。
+    #[inline(always)]
+    pub const fn as_i32_internal(self) -> i32 {
         match self {
             Errno::ESUCCESS => 0,
             Errno::EPERM => 1,
@@ -269,6 +270,17 @@ impl Errno {
             Errno::ENOTRECOVERABLE => 131,
             Errno::Other(code) => code,
         }
+    }
+
+    /// 兼容现有内核直调入口。
+    #[inline(always)]
+    pub const fn as_i32_direct(self) -> i32 {
+        self.as_i32_internal()
+    }
+
+    #[kernel_symbols::export(name = "errno.Errno.as_i32", contract = "kernel.errno.conversion@1", version = 1, capabilities = kernel_symbols::capability::CORE_SAFE)]
+    pub fn as_i32(self) -> i32 {
+        self.as_i32_internal()
     }
 
     pub fn as_usize(self) -> usize {

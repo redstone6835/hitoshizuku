@@ -192,6 +192,10 @@ pub const CPUCFG1_VALEN_BITS: usize = 8;
 pub const CPUCFG1_VALEN_MASK: usize = (1usize << CPUCFG1_VALEN_BITS) - 1;
 /// CPUCFG.1 中 HP（huge page）能力位。
 pub const CPUCFG1_HP: usize = 1 << 24;
+/// CPUCFG.1 中 UAL（非对齐访存）能力位。
+const CPUCFG1_UAL: usize = 1 << 20;
+/// LoongArch 用户 ABI 中的非对齐访存能力位。
+const HWCAP_LOONGARCH_UAL: usize = 1 << 2;
 
 /// 读取指定 CPUCFG 配置字。
 ///
@@ -212,6 +216,16 @@ pub fn read_cpucfg_word(index: usize) -> usize {
     // LA64 下 CPUCFG 配置字宽度为 32 位，指令结果会符号扩展到 GRLEN。
     // 这里统一裁剪为低 32 位，避免上半区符号位干扰字段解析。
     value as u32 as usize
+}
+
+/// 返回当前处理器可安全暴露给用户态的 LoongArch HWCAP。
+pub fn user_hwcap() -> usize {
+    let cpucfg1 = read_cpucfg_word(CPUCFG_WORD1);
+    if cpucfg1 & CPUCFG1_UAL != 0 {
+        HWCAP_LOONGARCH_UAL
+    } else {
+        0
+    }
 }
 
 // LoongArch64 定义的异常代码（ECODE）枚举。

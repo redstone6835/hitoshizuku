@@ -278,6 +278,33 @@ impl BlockCache {
         true
     }
 
+    fn read_cached_prefix(&mut self, start: u64, count: u32, out: &mut [u8]) -> u32 {
+        let mut copied = 0u32;
+        while copied < count {
+            let offset = copied as usize * self.block_size;
+            if !self.read(
+                start + copied as u64,
+                &mut out[offset..offset + self.block_size],
+            ) {
+                break;
+            }
+            copied += 1;
+        }
+        copied
+    }
+
+    fn uncached_prefix_len(&self, start: u64, count: u32) -> u32 {
+        let mut missing = 0u32;
+        while missing < count {
+            let block = start + missing as u64;
+            if self.contains(block) || self.has_active_direct(block) {
+                break;
+            }
+            missing += 1;
+        }
+        missing
+    }
+
     fn read_range_vectored(&mut self, start: u64, count: u32, out: &mut [&mut [u8]]) -> bool {
         if vectored_block_count(out, self.block_size) != Some(count) {
             return false;
@@ -1235,50 +1262,107 @@ impl FsState {
             let n = remaining.min(MAX_CHUNK_BLOCKS);
             let chunk_bytes = bs * n as usize;
             let chunk = &mut out[off..off + chunk_bytes];
-            loop {
-                let coherence_stamp = {
-                    let mut cache = self.block_cache.lock();
-                    if cache.read_range(block, n, chunk) {
-                        break;
-                    }
+            'read_chunk: loop {
+                let chunk_stamp = {
+                    let cache = self.block_cache.lock();
                     if cache.has_unreadable_direct_in_range(block, n) {
+                        None
+                    } else {
+                        Some(cache.coherence_stamp_in_range(block, n))
+                    }
+                };
+                let Some(chunk_stamp) = chunk_stamp else {
+                    Self::wait_for_writeback_progress();
+                    continue;
+                };
+
+                let mut completed = 0u32;
+                while completed < n {
+                    let current_block = block + completed as u64;
+                    let current_offset = completed as usize * bs;
+                    let current = &mut chunk[current_offset..];
+                    let (cached, missing, coherence_stamp, wait_direct) = {
+                        let mut cache = self.block_cache.lock();
+                        let cached =
+                            cache.read_cached_prefix(current_block, n - completed, current);
+                        if cached != 0 {
+                            (cached, 0, (0, 0), false)
+                        } else if cache.has_unreadable_direct_in_range(current_block, 1) {
+                            (0, 0, (0, 0), true)
+                        } else {
+                            let missing = cache.uncached_prefix_len(current_block, n - completed);
+                            debug_assert!(missing != 0);
+                            (
+                                0,
+                                missing,
+                                cache.coherence_stamp_in_range(current_block, missing),
+                                false,
+                            )
+                        }
+                    };
+                    if cached != 0 {
+                        completed += cached;
+                        continue;
+                    }
+                    if wait_direct {
+                        Self::wait_for_writeback_progress();
+                        continue;
+                    }
+
+                    let missing_bytes = missing as usize * bs;
+                    let target = &mut current[..missing_bytes];
+
+                    bgd::read_blocks(
+                        self.backend.as_ref(),
+                        &self.ext_sb,
+                        current_block,
+                        missing,
+                        target,
+                    )?;
+                    let mut cache = self.block_cache.lock();
+                    if cache.coherence_stamp_in_range(current_block, missing) != coherence_stamp {
+                        // 写入可能已经落盘并从 active/pending 消失；仅 overlay
+                        // 不足以证明 miss 部分仍是新数据，必须丢弃本次后端结果。
+                        if cache.read_range(current_block, missing, target) {
+                            completed += missing;
+                            continue;
+                        }
+                        let wait_direct =
+                            cache.has_unreadable_direct_in_range(current_block, missing);
+                        drop(cache);
+                        if wait_direct {
+                            Self::wait_for_writeback_progress();
+                        }
+                        continue;
+                    }
+                    if cache.has_unreadable_direct_in_range(current_block, missing) {
                         drop(cache);
                         Self::wait_for_writeback_progress();
                         continue;
                     }
-                    cache.coherence_stamp_in_range(block, n)
-                };
 
-                bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, block, n, chunk)?;
+                    cache.overlay_range(current_block, missing, target);
+                    for i in 0..missing {
+                        let cur_block = current_block + i as u64;
+                        let start = bs * i as usize;
+                        let end = start + bs;
+                        if !cache.contains(cur_block) && !cache.has_active_direct(cur_block) {
+                            cache.try_insert_clean(cur_block, &target[start..end]);
+                        }
+                    }
+                    completed += missing;
+                }
+
                 let mut cache = self.block_cache.lock();
-                if cache.coherence_stamp_in_range(block, n) != coherence_stamp {
-                    // 写入可能已经落盘并从 active/pending 消失；仅 overlay
-                    // 不足以证明 miss 部分仍是新数据，必须丢弃本次后端结果。
-                    if cache.read_range(block, n, chunk) {
-                        break;
-                    }
-                    let wait_direct = cache.has_unreadable_direct_in_range(block, n);
-                    drop(cache);
-                    if wait_direct {
-                        Self::wait_for_writeback_progress();
-                    }
-                    continue;
+                if cache.coherence_stamp_in_range(block, n) != chunk_stamp {
+                    continue 'read_chunk;
                 }
                 if cache.has_unreadable_direct_in_range(block, n) {
                     drop(cache);
                     Self::wait_for_writeback_progress();
-                    continue;
+                    continue 'read_chunk;
                 }
-
                 cache.overlay_range(block, n, chunk);
-                for i in 0..n {
-                    let cur_block = block + i as u64;
-                    let start = bs * i as usize;
-                    let end = start + bs;
-                    if !cache.contains(cur_block) && !cache.has_active_direct(cur_block) {
-                        cache.try_insert_clean(cur_block, &chunk[start..end]);
-                    }
-                }
                 break;
             }
             off += chunk_bytes;
@@ -3421,6 +3505,40 @@ mod tests {
     }
 
     #[test]
+    fn partial_cache_hit_rechecks_prefix_after_concurrent_write() {
+        const BLOCK_SIZE: u32 = 1024;
+        let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
+        backend.seed_block(4, &vec![0x41; BLOCK_SIZE as usize]);
+        backend.seed_block(5, &vec![0x51; BLOCK_SIZE as usize]);
+        let state = Arc::new(alloc_test_state(Arc::clone(&backend), BLOCK_SIZE, 32));
+
+        let mut prefix = vec![0; BLOCK_SIZE as usize];
+        state.read_block(4, &mut prefix).expect("预热缓存前缀");
+        backend.gate_read(5);
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut out = vec![0; 2 * BLOCK_SIZE as usize];
+            reader_state.read_data_blocks(4, 2, &mut out).map(|()| out)
+        });
+        backend.wait_for_read_gate();
+        state
+            .write_data_block(4, &vec![0x91; BLOCK_SIZE as usize])
+            .expect("并发更新缓存前缀");
+        backend.release_read_gate();
+
+        let observed = reader.join().unwrap().expect("完成部分命中读取");
+        assert_eq!(
+            &observed[..BLOCK_SIZE as usize],
+            &vec![0x91; BLOCK_SIZE as usize]
+        );
+        assert_eq!(
+            &observed[BLOCK_SIZE as usize..],
+            &vec![0x51; BLOCK_SIZE as usize]
+        );
+    }
+
+    #[test]
     fn stale_vectored_read_retries_after_direct_completion() {
         const BLOCK_SIZE: u32 = 1024;
         let backend = Arc::new(BlockingBackend::new(32, BLOCK_SIZE, u64::MAX));
@@ -3740,6 +3858,28 @@ mod tests {
         assert_eq!(first, data);
         assert_eq!(second, data);
         assert_eq!(backend.reads(), vec![(16, 2)]);
+    }
+
+    #[test]
+    fn partially_cached_range_reads_only_missing_suffix() {
+        let backend = Arc::new(CountingBackend::new(128, 512));
+        for block in 8..12u64 {
+            backend.seed_block(block, 1024, &vec![block as u8; 1024]);
+        }
+        let state = alloc_test_state(Arc::clone(&backend), 1024, 64);
+        let mut first = vec![0u8; 1024];
+        let mut range = vec![0u8; 4 * 1024];
+
+        state.read_blocks(8, 1, &mut first).expect("prime cache");
+        state.read_blocks(8, 4, &mut range).expect("range read");
+
+        for index in 0..4 {
+            assert_eq!(
+                &range[index * 1024..(index + 1) * 1024],
+                &vec![(8 + index) as u8; 1024]
+            );
+        }
+        assert_eq!(backend.reads(), vec![(16, 2), (18, 6)]);
     }
 
     #[test]

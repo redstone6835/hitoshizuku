@@ -53,6 +53,10 @@ const SHOOTDOWN_WARNING_SECONDS: u64 = 5;
 
 static PHYSICAL_CPU_IDS: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(UNKNOWN_CPU_ID) }; MAX_CPUS];
+// CSR_CPUID 的 coreid 字段只有 9 位，启动时建立物理 ID 到逻辑 ID 的反向表，
+// 避免每次读取当前 CPU 时扫描全部在线 CPU。
+static LOGICAL_CPU_IDS_BY_PHYSICAL: [AtomicUsize; 1 << CSR_CPUID_COREID_WIDTH] =
+    [const { AtomicUsize::new(UNKNOWN_CPU_ID) }; 1 << CSR_CPUID_COREID_WIDTH];
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
 static STARTED_CPUS: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_LOGICAL_ASIDS: CurrentAsidTracker<MAX_CPUS> = CurrentAsidTracker::new();
@@ -81,18 +85,22 @@ pub struct SecondaryCpuReport {
 
 pub(crate) fn init_boot_cpu_mapping() {
     let physical_id = LoongArch64MessageInterruptOps::current_hardware_cpu_id();
+    for logical_id in LOGICAL_CPU_IDS_BY_PHYSICAL.iter() {
+        logical_id.store(UNKNOWN_CPU_ID, Ordering::Relaxed);
+    }
     PHYSICAL_CPU_IDS[0].store(physical_id, Ordering::Release);
+    LOGICAL_CPU_IDS_BY_PHYSICAL[physical_id & CSR_CPUID_COREID_MASK].store(0, Ordering::Release);
     ONLINE_CPUS.store(1, Ordering::Release);
     STARTED_CPUS.store(1, Ordering::Release);
 }
 
+#[inline]
 pub(crate) fn logical_cpu_id(physical_id: usize) -> usize {
-    for (logical_id, mapped_id) in PHYSICAL_CPU_IDS.iter().enumerate() {
-        if mapped_id.load(Ordering::Acquire) == physical_id {
-            return logical_id;
-        }
-    }
-    0
+    let logical_id =
+        LOGICAL_CPU_IDS_BY_PHYSICAL[physical_id & CSR_CPUID_COREID_MASK].load(Ordering::Acquire);
+    (logical_id != UNKNOWN_CPU_ID)
+        .then_some(logical_id)
+        .unwrap_or(0)
 }
 
 fn physical_cpu_id(logical_id: usize) -> Option<usize> {
@@ -534,7 +542,14 @@ pub fn start_secondary_cpus() -> SecondaryCpuReport {
 
     let detected = topology.len().min(MAX_CPUS);
     for (logical_id, cpu) in topology.iter().take(detected).enumerate() {
-        PHYSICAL_CPU_IDS[logical_id].store(cpu.reg as usize, Ordering::Release);
+        let physical_id = cpu.reg as usize;
+        PHYSICAL_CPU_IDS[logical_id].store(physical_id, Ordering::Release);
+        let _ = LOGICAL_CPU_IDS_BY_PHYSICAL[physical_id & CSR_CPUID_COREID_MASK].compare_exchange(
+            UNKNOWN_CPU_ID,
+            logical_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     let mut report = SecondaryCpuReport {

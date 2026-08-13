@@ -11,6 +11,7 @@ use allocator::{
     KERNEL_ALLOCATOR, MemoryPlacement, PAGE_SIZE, PhysicalAllocError, PhysicalAllocRequest,
     PhysicalAllocation,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::mutex::Mutex;
 
 use super::iommu::IommuConsumerLease;
@@ -170,16 +171,27 @@ struct LegacyGlobalDmaMapper;
 
 impl DmaMapper for LegacyGlobalDmaMapper {
     fn sync_for_device(&self, region: DmaSyncRegion) {
+        if !DMA_OPS_OVERRIDDEN.load(Ordering::Acquire) {
+            return;
+        }
         let ops = *DMA_OPS.lock();
         (ops.sync_for_device)(region);
     }
 
     fn sync_for_cpu(&self, region: DmaSyncRegion) {
+        if !DMA_OPS_OVERRIDDEN.load(Ordering::Acquire) {
+            return;
+        }
         let ops = *DMA_OPS.lock();
         (ops.sync_for_cpu)(region);
     }
 
     fn phys_to_dma(&self, region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize> {
+        if !DMA_OPS_OVERRIDDEN.load(Ordering::Acquire) {
+            return constraints
+                .accepts_dma_addr(region.paddr, region.len)
+                .then_some(region.paddr);
+        }
         let ops = *DMA_OPS.lock();
         let dma_addr = (ops.phys_to_dma)(region);
         constraints
@@ -461,6 +473,7 @@ impl DmaContext {
         DmaSyncHandle {
             context: self.clone(),
             region,
+            coherent: self.constraints.coherent,
         }
     }
 
@@ -603,15 +616,22 @@ impl Drop for DmaAddressMapping {
 pub(crate) struct DmaSyncHandle {
     context: DmaContext,
     region: DmaSyncRegion,
+    coherent: bool,
 }
 
 impl DmaSyncHandle {
+    #[inline]
     pub(crate) fn sync_for_device(&self) {
-        self.context.mapper.get().sync_for_device(self.region);
+        if !self.coherent {
+            self.context.mapper.get().sync_for_device(self.region);
+        }
     }
 
+    #[inline]
     pub(crate) fn sync_for_cpu(&self) {
-        self.context.mapper.get().sync_for_cpu(self.region);
+        if !self.coherent {
+            self.context.mapper.get().sync_for_cpu(self.region);
+        }
     }
 }
 
@@ -727,6 +747,8 @@ impl DmaOps {
 }
 
 static DMA_OPS: Mutex<DmaOps> = Mutex::new(DmaOps::coherent());
+/// 一旦平台安装过自定义 mapper，便永久退出默认无操作快路径。
+static DMA_OPS_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 
 /// 安装平台默认 DMA mapper。
 ///
@@ -747,6 +769,9 @@ pub fn set_dma_ops(ops: DmaOps) {
 }
 
 pub(crate) fn replace_dma_ops(ops: DmaOps) -> DmaOps {
+    // 先关闭快路径再发布新 hook；并发同步至多调用一次旧的 coherent 空操作，
+    // 不会在自定义 mapper 生效后错误跳过 cache 维护。
+    DMA_OPS_OVERRIDDEN.store(true, Ordering::Release);
     let mut current = DMA_OPS.lock();
     core::mem::replace(&mut *current, ops)
 }
@@ -945,10 +970,7 @@ impl DmaBuffer {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn sync_for_device(&self) {
-        self.context
-            .mapper
-            .get()
-            .sync_for_device(self.sync_region());
+        self.sync_handle().sync_for_device();
     }
 
     /// 将设备写入的内容同步到 CPU 可见状态。
@@ -960,7 +982,7 @@ impl DmaBuffer {
         flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
     )]
     pub fn sync_for_cpu(&self) {
-        self.context.mapper.get().sync_for_cpu(self.sync_region());
+        self.sync_handle().sync_for_cpu();
     }
 
     pub(crate) fn sync_handle(&self) -> DmaSyncHandle {
@@ -1186,24 +1208,28 @@ impl net::buf::NetBufStorage for DmaBuffer {
         if offset.checked_add(len).is_none_or(|end| end > self.len()) {
             return;
         }
-        self.context.mapper.get().sync_for_cpu(DmaSyncRegion {
-            paddr: self.paddr() + offset,
-            vaddr: self.vaddr() + offset,
-            len,
-            direction: self.direction(),
-        });
+        self.context
+            .sync_handle(DmaSyncRegion {
+                paddr: self.paddr() + offset,
+                vaddr: self.vaddr() + offset,
+                len,
+                direction: self.direction(),
+            })
+            .sync_for_cpu();
     }
 
     fn sync_for_device(&self, offset: usize, len: usize) {
         if offset.checked_add(len).is_none_or(|end| end > self.len()) {
             return;
         }
-        self.context.mapper.get().sync_for_device(DmaSyncRegion {
-            paddr: self.paddr() + offset,
-            vaddr: self.vaddr() + offset,
-            len,
-            direction: self.direction(),
-        });
+        self.context
+            .sync_handle(DmaSyncRegion {
+                paddr: self.paddr() + offset,
+                vaddr: self.vaddr() + offset,
+                len,
+                direction: self.direction(),
+            })
+            .sync_for_device();
     }
 }
 
@@ -1450,5 +1476,46 @@ mod tests {
         assert_eq!(mapper.maps.load(Ordering::Relaxed), 1);
         assert!(mapping.unmap().is_ok());
         assert_eq!(mapper.unmaps.load(Ordering::Relaxed), 1);
+    }
+
+    static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingMapper;
+
+    impl DmaMapper for CountingMapper {
+        fn sync_for_device(&self, _region: DmaSyncRegion) {
+            SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn sync_for_cpu(&self, _region: DmaSyncRegion) {
+            SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn phys_to_dma(
+            &self,
+            region: DmaSyncRegion,
+            _constraints: DmaConstraints,
+        ) -> Option<usize> {
+            Some(region.paddr)
+        }
+    }
+
+    static COUNTING_MAPPER: CountingMapper = CountingMapper;
+
+    #[test]
+    fn coherent_dma_context_skips_mapper_sync_hooks() {
+        SYNC_CALLS.store(0, Ordering::Relaxed);
+        let context = DmaContext::new(DmaConstraints::coherent_identity(), &COUNTING_MAPPER);
+        let sync = context.sync_handle(DmaSyncRegion {
+            paddr: 0x1000,
+            vaddr: 0x2000,
+            len: 4096,
+            direction: DmaDirection::Bidirectional,
+        });
+
+        sync.sync_for_device();
+        sync.sync_for_cpu();
+
+        assert_eq!(SYNC_CALLS.load(Ordering::Relaxed), 0);
     }
 }

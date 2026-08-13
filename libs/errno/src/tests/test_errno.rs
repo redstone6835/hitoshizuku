@@ -177,3 +177,11 @@ fn into_i32_matches_as_i32() {
         assert_eq!(into_val, e.as_i32(), "Into<i32> mismatch for code {}", code);
     }
 }
+
+#[ktest]
+fn direct_conversion_matches_exported_conversion() {
+    for &(code, errno) in KNOWN_ERRNOS {
+        assert_eq!(errno.as_i32_direct(), code);
+    }
+    assert_eq!(Errno::Other(-7).as_i32_direct(), -7);
+}

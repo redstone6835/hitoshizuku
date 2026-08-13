@@ -164,6 +164,21 @@ pub fn query_containing_allocation(
 }
 
 #[kernel_symbols::export(
+    name = "allocator.KernelMemorySubsystem.query_owned_range",
+    contract = "kernel.allocator.query@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::ALLOCATOR_DIAGNOSTIC
+)]
+pub fn query_owned_range(
+    allocator: &KernelMemorySubsystem,
+    owner: u64,
+    pointer: usize,
+    len: usize,
+) -> bool {
+    allocator.query_owned_range(owner, pointer, len)
+}
+
+#[kernel_symbols::export(
     name = "allocator.KernelMemorySubsystem.owns_allocation",
     contract = "kernel.allocator.query@1",
     version = 1,

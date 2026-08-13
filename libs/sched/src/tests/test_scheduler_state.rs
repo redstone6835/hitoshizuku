@@ -9,15 +9,127 @@ use super::std::thread;
 use ktest::ktest;
 
 use super::test_thread_metadata::make_task;
+use crate::ids::Uid;
 use crate::scheduler::{
     cpu_ready_for_activation, dequeue_for_state_change_on, enqueue_task_on_scheduler,
     offline_cpu_with_scheduler, record_deferred_timer_tick, refresh_task_placement,
     requeue_balance_task_on, take_deferred_timer_tick, task_runqueue_cpu_on,
 };
 use crate::{
-    CpuId, CpuMask, HandoffReason, HandoffTarget, PlacementState, RunqueueClassLoad,
-    SCHED_CAPACITY_SCALE, SchedAttr, SchedClass, SchedDomain, SchedTopology, Scheduler, TaskState,
+    BorrowedCurrentTask, CpuId, CpuMask, HandoffReason, HandoffTarget, PlacementState,
+    RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass, SchedDomain, SchedTopology,
+    Scheduler, SigInfo, SigProcMaskHow, SigSet, SignalNumber, TaskState,
 };
+
+#[ktest]
+fn direct_ready_query_matches_exported_query() {
+    assert_eq!(crate::is_ready_direct(), crate::is_ready());
+    assert_eq!(crate::is_ready_internal(), crate::is_ready());
+}
+
+#[ktest]
+fn borrowed_current_does_not_change_strong_count() {
+    let task = make_task();
+    let raw_owner = Arc::into_raw(Arc::clone(&task));
+    let before = Arc::strong_count(&task);
+    // Safety: raw_owner 是模拟 current_raw 槽持有的有效 Arc 裸指针。
+    let borrowed = unsafe { BorrowedCurrentTask::from_current_raw(raw_owner) };
+
+    assert!(!core::mem::needs_drop::<BorrowedCurrentTask>());
+    assert_eq!(Arc::strong_count(&task), before);
+    let promoted = borrowed.to_arc();
+    assert_eq!(Arc::strong_count(&task), before + 1);
+    drop(promoted);
+    drop(borrowed);
+    assert_eq!(Arc::strong_count(&task), before);
+
+    // Safety: raw_owner 由上面的 Arc::into_raw 产生，尚未被消费。
+    unsafe { drop(Arc::from_raw(raw_owner)) };
+}
+
+#[ktest]
+fn borrowed_current_survives_raw_slot_replacement_with_prev_owner() {
+    let task = make_task();
+    let raw_owner = Arc::into_raw(Arc::clone(&task));
+    // Safety: raw_owner 是模拟 current_raw 槽持有的有效 Arc 裸指针。
+    let borrowed = unsafe { BorrowedCurrentTask::from_current_raw(raw_owner) };
+    let suspended_stack_prev = Arc::clone(&task);
+
+    // 模拟调度器 publish next 时释放旧 current_raw；暂停栈上的 prev Arc 继续托底。
+    unsafe { drop(Arc::from_raw(raw_owner)) };
+    drop(task);
+    assert!(Arc::ptr_eq(borrowed.as_arc(), &suspended_stack_prev));
+    let promoted = borrowed.to_arc();
+    assert!(Arc::ptr_eq(&promoted, &suspended_stack_prev));
+}
+
+#[ktest]
+fn blocked_signal_hint_is_cleared_and_rearmed_on_unblock() {
+    let task = make_task();
+    let blocked = SigSet::EMPTY.with(SignalNumber::SIGUSR1);
+    task.signal.block(blocked, SigProcMaskHow::SetMask);
+    task.signal.deliver(SigInfo {
+        sig: SignalNumber::SIGUSR1,
+        code: 0,
+        sender_pid: 1,
+        sender_uid: Uid::ROOT,
+        raw: None,
+    });
+
+    assert!(!task.has_deliverable_signal());
+    assert!(task.user_return_work_hint_relaxed());
+    assert!(!task.refresh_user_return_work_hint());
+    assert!(!task.user_return_work_hint_relaxed());
+
+    task.signal.block(SigSet::EMPTY, SigProcMaskHow::SetMask);
+    assert!(task.has_deliverable_signal());
+    assert!(task.user_return_work_hint_relaxed());
+    assert!(task.refresh_user_return_work_hint());
+}
+
+#[ktest]
+fn task_work_hint_preserves_publish_after_clear() {
+    let task = make_task();
+    task.mark_user_return_work();
+    assert!(task.signal.take_user_return_work());
+
+    let producer = Arc::clone(&task);
+    let barrier = Arc::new(Barrier::new(2));
+    let producer_barrier = Arc::clone(&barrier);
+    let handle = thread::spawn(move || {
+        producer_barrier.wait();
+        producer.mark_user_return_work();
+    });
+    barrier.wait();
+    handle.join().expect("producer thread");
+
+    assert!(task.user_return_work_hint_acquire());
+}
+
+#[ktest]
+fn cpu_work_hint_preserves_publish_after_clear() {
+    let scheduler = Arc::new(Scheduler::new());
+    let cpu = scheduler.cpu(0).expect("boot cpu state");
+    cpu.request_resched();
+    assert!(cpu.take_user_return_work());
+    assert!(cpu.take_resched());
+
+    let producer_scheduler = Arc::clone(&scheduler);
+    let barrier = Arc::new(Barrier::new(2));
+    let producer_barrier = Arc::clone(&barrier);
+    let handle = thread::spawn(move || {
+        producer_barrier.wait();
+        producer_scheduler
+            .cpu(0)
+            .expect("boot cpu state")
+            .request_resched();
+    });
+    barrier.wait();
+    handle.join().expect("producer thread");
+
+    assert!(cpu.user_return_work_pending_acquire());
+    assert!(cpu.needs_resched());
+}
 
 #[ktest]
 fn scheduler_state_bootstraps_root_and_boot_cpu() {
@@ -44,9 +156,11 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     cpu1.request_post_syscall_handoff(1);
 
     assert!(!cpu0.needs_resched());
+    assert!(!cpu0.user_return_work_pending_relaxed());
     assert!(!cpu0.take_balance());
     assert!(!cpu0.has_post_syscall_handoff());
     assert!(cpu1.needs_resched());
+    assert!(cpu1.user_return_work_pending_relaxed());
     assert!(cpu1.take_balance());
     let (rounds, target) = cpu1.take_post_syscall_handoff();
     assert_eq!(rounds, 1);
@@ -54,6 +168,8 @@ fn scheduler_state_keeps_cpu_intents_isolated() {
     assert!(cpu1.take_resched());
     assert!(cpu1.claim_resched_notification());
     assert!(!cpu1.needs_resched());
+    assert!(cpu1.take_user_return_work());
+    assert!(!cpu1.user_return_work_authoritative());
 }
 
 #[ktest]

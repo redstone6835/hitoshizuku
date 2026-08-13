@@ -55,25 +55,79 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
-fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
-    if !from_user || !sched::is_ready() {
-        return;
-    }
-    let task = sched::current_task();
+fn prepare_user_state_for_task(tf_ptr: usize, task: &alloc::sync::Arc<sched::Task>) {
     let _ =
-        sched::operation::prepare_user_return_for_task(&task, sched::UserContextRef::new(tf_ptr));
+        sched::operation::prepare_user_return_for_task(task, sched::UserContextRef::new(tf_ptr));
     match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
-            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
         sched::TaskState::Stopped | sched::TaskState::Continued => {
-            drop(task);
             sched::schedule_once(kernel_timestamp_ns());
         }
         _ => {}
     }
+}
+
+fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready_internal() {
+        return;
+    }
+    let task = sched::borrow_current_task_internal();
+    prepare_user_state_for_task(tf_ptr, task.as_arc());
+}
+
+#[cold]
+#[inline(never)]
+fn finish_fast_syscall_return_work(tf_ptr: usize, task: &alloc::sync::Arc<sched::Task>) -> bool {
+    let mut require_full_restore = false;
+    loop {
+        let task_work = task.user_return_work_hint_acquire();
+        let cpu_work = crate::riscv64::specific::current_cpu_user_return_work_pending_acquire();
+        if !task_work && !cpu_work {
+            break;
+        }
+
+        if sched::operation::complete_group_exit_if_requested(task) {
+            sched::schedule_once(kernel_timestamp_ns());
+            panic!("[trap][syscall] group-exit task scheduled back unexpectedly");
+        }
+        if cpu_work {
+            require_full_restore = true;
+            sched::run_post_syscall_handoff_lazy();
+            if sched::needs_resched_current() {
+                sched::preempt_if_needed(kernel_timestamp_ns());
+            }
+        }
+        if task.has_deliverable_signal() {
+            require_full_restore = true;
+            let _ = sched::operation::deliver_pending_signals_for_task(
+                task,
+                sched::UserContextRef::new(tf_ptr),
+            );
+        }
+        if matches!(
+            task.state(),
+            sched::TaskState::Stopped
+                | sched::TaskState::Continued
+                | sched::TaskState::Zombie
+                | sched::TaskState::Dead
+        ) {
+            require_full_restore = true;
+        }
+        prepare_user_state_for_task(tf_ptr, task);
+
+        let task_pending = task.refresh_user_return_work_hint();
+        let cpu_pending =
+            sched::refresh_user_return_work_on(crate::riscv64::specific::current_cpu_id());
+        let cpu_rearmed = crate::riscv64::specific::current_cpu_user_return_work_pending_acquire();
+        let task_rearmed = task.user_return_work_hint_acquire();
+        if !task_pending && !cpu_pending && !cpu_rearmed && !task_rearmed {
+            break;
+        }
+    }
+    require_full_restore
 }
 
 /// 在从用户态 trap 返回前投递异步信号。
@@ -82,10 +136,25 @@ fn prepare_user_state_before_return(tf_ptr: usize, from_user: bool) {
 /// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。
 fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     prepare_user_state_before_return(tf_ptr, from_user);
-    if !from_user || !sched::is_ready() {
+    if !from_user || !sched::is_ready_internal() {
         return;
     }
     let task = sched::current_task();
+    if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+        match sched::operation::consume_native_external_control_for_task(&task) {
+            sched::NativeExternalControl::Continue => {}
+            sched::NativeExternalControl::Reschedule => {
+                drop(task);
+                sched::schedule_once(kernel_timestamp_ns());
+            }
+            sched::NativeExternalControl::Terminate => {
+                drop(task);
+                sched::schedule_once(kernel_timestamp_ns());
+                panic!("[trap][native] terminal task scheduled back unexpectedly");
+            }
+        }
+        return;
+    }
     if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
         let _ = sched::operation::deliver_pending_signals_for_task(
             &task,
@@ -116,15 +185,21 @@ fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
     }
 }
 
+fn native_fault_kind(code: usize) -> u32 {
+    match code {
+        EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
+            native_abi::wire::PROCESS_FAULT_MEMORY
+        }
+        EXC_ILLEGAL_INST => native_abi::wire::PROCESS_FAULT_ILLEGAL_INSTRUCTION,
+        EXC_BREAKPOINT => native_abi::wire::PROCESS_FAULT_BREAKPOINT,
+        EXC_INST_MISALIGNED | EXC_LOAD_MISALIGNED | EXC_STORE_MISALIGNED | EXC_INST_ACCESS
+        | EXC_LOAD_ACCESS | EXC_STORE_ACCESS => native_abi::wire::PROCESS_FAULT_ADDRESS,
+        _ => native_abi::wire::PROCESS_FAULT_OTHER,
+    }
+}
+
 // Linux RISC-V64 syscall ABI 中会整体替换当前用户上下文的调用。
 const SYS_RT_SIGRETURN: usize = 139;
-const SYS_EXECVE: usize = 221;
-const SYS_EXECVEAT: usize = 281;
-
-#[inline]
-fn rewrites_user_frame(nr: usize) -> bool {
-    matches!(nr, SYS_RT_SIGRETURN | SYS_EXECVE | SYS_EXECVEAT)
-}
 
 /// 对即将返回 U-mode 的架构上下文做最后一道防御性净化。
 ///
@@ -238,6 +313,15 @@ fn terminate_user_exception(
 
     if sched::is_ready() {
         let me = sched::current_task();
+        if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
+            sched::operation::terminate_native_fault(
+                &me,
+                native_fault_kind(code),
+                code as u64,
+                tval as u64,
+                128 + i32::from(sig.raw()),
+            );
+        }
         let pid = me.pid_root().unwrap_or(0);
         let _ = sched::operation::tkill(pid, Some(sig));
         drop(me);
@@ -284,6 +368,7 @@ fn handle_interrupt(tf_ptr: usize, cause: usize, code: usize, from_user: bool) -
 
     if code == IRQ_S_TIMER {
         // Timer 必须先重装 compare，否则 sret 后会立刻再次陷入。
+        sched::deadline_timer_fired();
         let now_ticks = time::rearm_periodic_timer();
         crate::riscv64::aia::sync_current_cpu();
         general::dev::irq::record_timer_interrupt();
@@ -355,6 +440,11 @@ fn handle_user_syscall(tf_ptr: usize) -> usize {
         let tf = unsafe { trap_frame_ref(tf_ptr) };
         (tf.a7, tf.satp)
     };
+    #[cfg(feature = "syscall-model-markers")]
+    let _syscall_model = {
+        let task = sched::current_task();
+        profiling::syscall_model_scope(task.profile_session_id(), task.syscall_model_task_id(), nr)
+    };
     general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
     if sched::needs_resched_current() {
         sched::preempt_if_needed(kernel_timestamp_ns());
@@ -375,6 +465,16 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
         FaultOutcome::Segv => {
             if sched::is_ready() {
                 let task = sched::current_task();
+                if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                    let address = unsafe { trap_frame_ref(tf_ptr) }.tval;
+                    sched::operation::terminate_native_fault(
+                        &task,
+                        native_abi::wire::PROCESS_FAULT_MEMORY,
+                        code as u64,
+                        address as u64,
+                        128 + i32::from(sched::SignalNumber::SIGSEGV.raw()),
+                    );
+                }
                 let pid = task.pid_root().unwrap_or(0);
                 let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
                 drop(task);
@@ -407,6 +507,16 @@ fn handle_page_fault(tf_ptr: usize, code: usize, from_user: bool) -> usize {
                     vm.dropped,
                     vm.private_file_pressure_reclaims,
                 );
+                if task.user_abi_kind() == sched::UserAbiKind::MygoNative {
+                    let address = unsafe { trap_frame_ref(tf_ptr) }.tval;
+                    sched::operation::terminate_native_fault(
+                        &task,
+                        native_abi::wire::PROCESS_FAULT_RESOURCE,
+                        code as u64,
+                        address as u64,
+                        128 + i32::from(sched::SignalNumber::SIGKILL.raw()),
+                    );
+                }
                 let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGKILL));
                 drop(task);
                 deliver_user_signals_before_return(tf_ptr, from_user);
@@ -600,21 +710,26 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// signal/resched/frame rewrite 读取不完整状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
-    let (nr, args, original_satp, original_sepc, original_sp, original_switch_sequence) = {
-        let tf = unsafe { trap_frame_ref(tf_ptr) };
-        (
-            tf.a7,
-            [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5],
-            tf.satp,
-            tf.sepc,
-            tf.sp,
-            tf.tval,
-        )
+    let task = unsafe {
+        sched::BorrowedCurrentTask::from_current_raw(crate::riscv64::specific::current_task_ptr())
     };
-    general::syscall::dispatch_fast_with_frame(
+    let (nr, args, original_satp) = {
+        let tf = unsafe { trap_frame_ref(tf_ptr) };
+        (tf.a7, [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5], tf.satp)
+    };
+    #[cfg(feature = "syscall-model-markers")]
+    let _syscall_model = profiling::syscall_model_scope(
+        task.as_arc().profile_session_id(),
+        task.as_arc().syscall_model_task_id(),
+        nr,
+    );
+    #[cfg(feature = "performance-profile")]
+    let original_switch_sequence = unsafe { trap_frame_ref(tf_ptr) }.tval;
+    let dispatch_outcome = general::syscall::dispatch_fast_with_frame(
         general::TrapFramePtr::new(tf_ptr),
         nr,
         args,
+        task.as_arc(),
         |tf, ret| {
             let frame = unsafe { trap_frame_mut(tf.as_usize()) };
             frame.a0 = ret as usize;
@@ -622,21 +737,17 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         },
     );
 
-    let mut require_full_restore = rewrites_user_frame(nr);
-    if sched::needs_resched_current() {
-        sched::preempt_if_needed(kernel_timestamp_ns());
-        require_full_restore = true;
+    let mut require_full_restore = dispatch_outcome.requires_full_restore();
+    let task_work = task.user_return_work_hint_relaxed();
+    let cpu_work = crate::riscv64::specific::current_cpu_user_return_work_pending_relaxed();
+    if task_work || cpu_work {
+        require_full_restore |= finish_fast_syscall_return_work(tf_ptr, task.as_arc());
     }
-    prepare_user_state_before_return(tf_ptr, true);
 
     let frame = unsafe { trap_frame_ref(tf_ptr) };
-    // signal delivery、exec/sigreturn 或其它上下文重写都会改变 PC/SP。最小返回不会
-    // 恢复 s0-s10，因此只有仍保持普通 syscall 收尾形态时才可使用。
-    if frame.sepc != original_sepc.wrapping_add(4) || frame.sp != original_sp {
-        require_full_restore = true;
-    }
     let fs = frame.status & SSTATUS_FS_MASK;
     let vs = frame.status & SSTATUS_VS_MASK;
+    #[cfg(feature = "performance-profile")]
     let switched =
         crate::riscv64::specific::current_context_switch_sequence() != original_switch_sequence;
     #[cfg(feature = "performance-profile")]

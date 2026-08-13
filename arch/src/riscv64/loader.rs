@@ -774,6 +774,7 @@ pub extern "C" fn __kernel_arch_loader(
             },
             allocator: Some(StartAllocatorOps {
                 kernel_heap_region: heap_vm::kernel_heap_region,
+                tracked_heap_region: heap_vm::tracked_heap_region,
                 map_kernel_heap_range: map_kernel_heap,
                 unmap_kernel_heap_range: unmap_kernel_heap,
                 protect_kernel_heap_range: protect_kernel_heap,

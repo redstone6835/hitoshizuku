@@ -547,10 +547,16 @@ unsafe fn count_mapped(handle: PgdHandle, vaddr: usize, len: usize) -> usize {
     count
 }
 
+unsafe fn zero_user_pages(vaddr: usize, len: usize) {
+    // Safety: UserPgdOps 契约保证 direct-map 范围独占、可写且覆盖 `len` 字节。
+    unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, len) };
+}
+
 /// 注入到 general 的 vtable。
 pub(super) static USER_PGD_OPS: UserPgdOps = UserPgdOps {
     new_pgd_for_user,
     drop_pgd,
+    zero_user_pages,
     map,
     map_pages,
     publish_new_mapping,

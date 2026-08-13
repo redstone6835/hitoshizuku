@@ -730,7 +730,7 @@ pub(crate) fn append(
     flags: u32,
 ) -> Result<u64, JournalError> {
     JOURNAL.lock().append_at(
-        sched::now_ns_public(),
+        sched::now_ns_direct(),
         action,
         status,
         cell,
@@ -749,7 +749,7 @@ pub(crate) fn append_trust_acceptance(
     release_epoch: u64,
 ) -> Result<u64, JournalError> {
     JOURNAL.lock().append_trust_acceptance_at(
-        sched::now_ns_public(),
+        sched::now_ns_direct(),
         JournalTrustEpoch {
             rollback_authority_id,
             module_digest,

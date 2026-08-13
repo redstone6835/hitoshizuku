@@ -1,0 +1,48 @@
+{
+  "manifest_version": 1,
+  "abi_epoch": 1,
+  "entry": "_start",
+  "imports": [
+    { "operation": "process.exit", "required": true },
+    { "operation": "handle.close", "required": true },
+    { "operation": "handle.duplicate", "required": true },
+    { "operation": "handle.restrict", "required": true },
+    { "operation": "stream.read", "required": true },
+    { "operation": "stream.write", "required": true },
+    { "operation": "clock.read", "required": true },
+    { "operation": "memory.allocate", "required": true },
+    { "operation": "memory.free", "required": true }
+  ],
+  "capabilities": [
+    {
+      "requirement": "self_process",
+      "rights": ["exit"],
+      "required": true
+    },
+    {
+      "requirement": "current_address_space",
+      "rights": ["allocate", "free"],
+      "required": true
+    },
+    {
+      "requirement": "stdin",
+      "rights": ["read"],
+      "required": true
+    },
+    {
+      "requirement": "stdout",
+      "rights": ["write", "duplicate"],
+      "required": true
+    },
+    {
+      "requirement": "monotonic_clock",
+      "rights": ["read"],
+      "required": true
+    }
+  ],
+  "runtime": {
+    "stack_size": 65536,
+    "stack_guard_size": 4096,
+    "start_info_max_size": 4096
+  }
+}

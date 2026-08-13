@@ -17,6 +17,7 @@
 
 pub mod fault;
 pub mod ops;
+mod resident_map;
 pub mod smoketest;
 pub mod user_access;
 pub mod vm_space;
@@ -27,5 +28,10 @@ pub use ops::{
     register_fault_decode, register_user_access, register_user_pgd, register_user_vm_layout,
     user_pgd_ops, user_vm_layout,
 };
-pub use user_access::{copy_cstr_from_user, copy_from_user, copy_to_user};
-pub use vm_space::{UserReadWindows, VmFutexKey, VmSpace, page_size, vm_space_diag};
+pub use user_access::{
+    copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user, copy_to_user,
+};
+pub use vm_space::{
+    UserReadWindows, VmFutexKey, VmSpace, page_size, read_shared_anon, vm_space_diag,
+    write_shared_anon,
+};

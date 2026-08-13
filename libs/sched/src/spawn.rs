@@ -4,7 +4,7 @@
 //! Runqueue 的关系网，并通过注册的 `TaskExtCloneHook` 让上层（VFS 等）参与
 //! fork 决策。具体的 syscall 接入由 [`crate::operation`] 调用本模块的函数。
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::arch_hooks::KernelEntry;
@@ -13,8 +13,9 @@ use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    activate_task_on_cpu, current_task, enqueue_task, enqueue_task_with_hint, init_task,
-    is_current_on_any_cpu, mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
+    activate_task_on_cpu, current_task, deliver_shared_signal_to_group, enqueue_task,
+    enqueue_task_with_hint, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
+    root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -134,6 +135,122 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
     child
 }
 
+/// 派生由整个线程组拥有的 Native child。
+///
+/// Native ABI 的 `process.spawn` 不把 child 绑定到发起调用的线程：所有权、wait
+/// 与 reap 都归属于 `owner` 线程组。Task 的 POSIX parent 保持为空，避免某个
+/// 非 leader 线程退出时把仍属存活线程组的 child 过继给 init。
+pub fn spawn_native_child(
+    parent: &Arc<Task>,
+    params: SchedParams,
+) -> Result<Arc<Task>, errno::Errno> {
+    let root_ns = root_pid_ns();
+    let owner = parent.thread_group();
+    let child_group = ThreadGroup::new();
+    {
+        let src = owner.rlimits().lock();
+        let mut dst = child_group.rlimits().lock();
+        *dst = src.fork_copy();
+    }
+    let process_group = parent.process_group();
+    let child = Task::new(
+        params,
+        Weak::new(),
+        Arc::clone(&child_group),
+        Arc::clone(&process_group),
+    );
+    child.set_native_owner(&owner);
+    child.inherit_timer_slack_from(parent);
+    child.set_credentials(parent.credentials());
+    #[cfg(feature = "performance-profile")]
+    child.inherit_profile_session_from(parent);
+
+    child_group.set_leader(&child);
+    if !child_group.try_add_member(&child) {
+        child.set_state(TaskState::Dead);
+        return Err(errno::Errno::EBUSY);
+    }
+    process_group.add_member(&child);
+    match owner.try_add_native_child(Arc::clone(&child)) {
+        Ok(true) => {}
+        Ok(false) => {
+            abort_new_task(&child);
+            return Err(errno::Errno::EBUSY);
+        }
+        Err(_) => {
+            abort_new_task(&child);
+            return Err(errno::Errno::ENOMEM);
+        }
+    }
+
+    let Some(pid) = root_ns.registry().allocate(&child) else {
+        abort_new_task(&child);
+        return Err(errno::Errno::ENOMEM);
+    };
+    child.register_pid(Arc::clone(&root_ns), pid);
+    child_group.set_tgid(pid);
+    child.set_tgid_cache(pid);
+    if process_group.pgid() <= 0 {
+        process_group.set_pgid(pid);
+    }
+
+    #[cfg(feature = "performance-profile")]
+    register_profile_child(parent, &child, pid);
+
+    Ok(child)
+}
+
+/// 创建一个尚未激活的 Native 用户线程。
+///
+/// 新线程共享调用者的线程组、进程组与 personality，但不进入 POSIX
+/// parent/children 图，也不携带退出信号。调用方必须先安装 VM 和用户上下文，
+/// 再调用 [`activate_task`]。
+pub fn spawn_native_thread(
+    parent: &Arc<Task>,
+    params: SchedParams,
+) -> Result<Arc<Task>, errno::Errno> {
+    let root_ns = root_pid_ns();
+    let group = parent.thread_group();
+    let Some(exec) = group.lock_for_clone() else {
+        return Err(errno::Errno::EBUSY);
+    };
+    if group.user_abi_kind() != native_abi::UserAbiKind::MygoNative
+        || group.group_exit_status().is_some()
+    {
+        return Err(errno::Errno::EBUSY);
+    }
+
+    let process_group = parent.process_group();
+    let child = Task::new(
+        params,
+        Weak::new(),
+        Arc::clone(&group),
+        Arc::clone(&process_group),
+    );
+    child.set_exit_signal(0);
+    child.set_credentials(parent.credentials());
+    child.inherit_timer_slack_from(parent);
+    #[cfg(feature = "performance-profile")]
+    child.inherit_profile_session_from(parent);
+
+    if !exec.try_add_member(&child) {
+        child.set_state(TaskState::Dead);
+        return Err(errno::Errno::EBUSY);
+    }
+    process_group.add_member(&child);
+
+    let Some(pid) = root_ns.registry().allocate(&child) else {
+        abort_new_task(&child);
+        return Err(errno::Errno::ENOMEM);
+    };
+    child.register_pid(Arc::clone(&root_ns), pid);
+    child.set_tgid_cache(group.tgid());
+
+    #[cfg(feature = "performance-profile")]
+    register_profile_child(parent, &child, pid);
+    Ok(child)
+}
+
 /// 把已经安装执行上下文的任务放入合适的 runqueue。
 #[kernel_symbols::export(name = "sched.spawn.activate_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn activate_task(task: &Arc<Task>) -> Result<usize, errno::Errno> {
@@ -188,6 +305,9 @@ pub fn activate_task_with_cpu_hint(
 #[kernel_symbols::export(name = "sched.spawn.abort_new_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn abort_new_task(task: &Arc<Task>) {
     crate::scheduler::deadline_admission().release(task);
+    if let Some(owner) = task.native_owner() {
+        owner.remove_native_child(task);
+    }
     if let Some(parent) = task.parent() {
         let _ = parent.remove_child(task);
     }
@@ -215,10 +335,20 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let flags = args.flags;
     let root_ns = root_pid_ns();
     let parent_tg = parent.thread_group();
+    let Some(parent_exec) = parent_tg.lock_for_clone() else {
+        let rejected = Task::new(
+            params,
+            Arc::downgrade(parent),
+            Arc::clone(&parent_tg),
+            parent.process_group(),
+        );
+        rejected.set_state(TaskState::Dead);
+        return rejected;
+    };
 
     // 1. 决定 thread group：CLONE_THREAD 共享，否则新建。
     let new_tg = if flags.has(CloneFlags::CLONE_THREAD) {
-        parent_tg
+        Arc::clone(&parent_tg)
     } else {
         // CLONE_SIGHAND 只共享 handler 表；独立线程组必须拥有自己的
         // 进程级 pending 队列。CLONE_THREAD 才复用完整 SharedSignal。
@@ -246,7 +376,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     let pg = parent.process_group();
 
     // 3. 父选择：CLONE_PARENT → 新任务的父等于 parent.parent；否则 parent。
-    let real_parent = if flags.has(CloneFlags::CLONE_PARENT) {
+    let mut real_parent = if flags.has(CloneFlags::CLONE_PARENT) {
         parent.parent().unwrap_or_else(init_task)
     } else {
         Arc::clone(parent)
@@ -315,7 +445,12 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     if !flags.has(CloneFlags::CLONE_THREAD) {
         new_tg.set_leader(&child);
     }
-    if !new_tg.try_add_member(&child) {
+    let member_added = if flags.has(CloneFlags::CLONE_THREAD) {
+        parent_exec.try_add_member(&child)
+    } else {
+        new_tg.try_add_member(&child)
+    };
+    if !member_added {
         child.set_state(TaskState::Dead);
         return child;
     }
@@ -323,7 +458,24 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
 
     // 8. 父登记（亲缘图保活）。CLONE_THREAD 线程不进入普通 child/wait 模型。
     if !flags.has(CloneFlags::CLONE_THREAD) {
-        real_parent.add_child(Arc::clone(&child));
+        let identity = crate::pid::lock_process_identity();
+        // CLONE_PARENT 的 real_parent 可能属于另一个线程组；等待身份事务后
+        // 必须重新读取，不能继续使用 exec 前缓存的旧 leader。
+        if flags.has(CloneFlags::CLONE_PARENT) {
+            real_parent = parent
+                .parent_in(&identity)
+                .filter(|candidate| {
+                    !matches!(candidate.state(), TaskState::Zombie | TaskState::Dead)
+                })
+                .unwrap_or_else(init_task);
+        }
+        if real_parent.try_reserve_children_for_exec(1).is_err() {
+            drop(identity);
+            abort_new_task(&child);
+            return child;
+        }
+        child.reparent_to_in(&identity, &real_parent);
+        real_parent.add_child_in(&identity, Arc::clone(&child));
     }
 
     // 9. 分配 pid（根 ns 一次；多 ns 留待后续）。
@@ -420,8 +572,7 @@ fn notify_task_parent(task: &Arc<Task>) {
             sender_uid: crate::ids::Uid::ROOT,
             raw: None,
         };
-        parent.thread_group().shared_signal().deliver(info);
-        crate::scheduler::signal_wakeup(&parent, &info);
+        deliver_shared_signal_to_group(&parent.thread_group(), info);
     }
     parent.exit_waiters.wake_all();
 }
@@ -433,6 +584,35 @@ fn notify_terminated_thread_group(group: &Arc<ThreadGroup>) {
     };
     if leader.state() == TaskState::Zombie {
         notify_task_parent(&leader);
+    }
+}
+
+/// Native owner 线程组全部退出后，按普通进程亲缘模型把尚未回收的 child 交给
+/// system reaper。迁移 parent 指针与 init 的 children 登记由身份事务一起保护，
+/// 防止 child 的退出通知落在半迁移状态。
+fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
+    if !owner.has_native_children() {
+        return;
+    }
+    let init = init_task();
+    if Arc::ptr_eq(&init.thread_group(), owner) {
+        return;
+    }
+    let children = owner.take_native_children_for_reparent();
+    if children.is_empty() {
+        return;
+    }
+    {
+        let identity = crate::pid::lock_process_identity();
+        for child in children.iter() {
+            child.reparent_to_in(&identity, &init);
+            init.add_child_in(&identity, Arc::clone(child));
+        }
+    }
+    for child in children {
+        if child.is_waitable_zombie() {
+            notify_task_parent(&child);
+        }
     }
 }
 
@@ -452,13 +632,18 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 
     let group = task.thread_group();
     let is_group_leader = task.is_thread_group_leader();
+    let preserve_exec_identity = task.exec_sibling_exit_preserves_identity();
 
     task.cleanup_before_exit();
     crate::scheduler::deadline_admission().release(task);
 
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
     //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。
-    let children = task.snapshot_children();
+    let children = if preserve_exec_identity {
+        Vec::new()
+    } else {
+        task.snapshot_children()
+    };
     if !children.is_empty() {
         let init = init_task();
         if !Arc::ptr_eq(&init, task) {
@@ -475,8 +660,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                             sender_uid: crate::ids::Uid::ROOT,
                             raw: None,
                         };
-                        init.thread_group().shared_signal().deliver(info);
-                        crate::scheduler::signal_wakeup(&init, &info);
+                        deliver_shared_signal_to_group(&init.thread_group(), info);
                     }
                 }
             }
@@ -485,6 +669,9 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 
     mark_task_exited(task, code);
     let group_terminated = group.mark_terminated_if_all_members_terminal();
+    if group_terminated {
+        reparent_native_children_to_init(&group);
+    }
     if !is_current_on_any_cpu(task) {
         task.cleanup_exit_extensions();
     }
@@ -498,13 +685,17 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     // CLONE_THREAD 成员的 exit_signal 为 0，直接释放独立 TID；线程组 leader
     // 必须保留 Zombie/PID，直到所有成员终止后才允许父进程观察和回收。
     let exit_sig = task.exit_signal();
-    if exit_sig == 0 {
+    if preserve_exec_identity {
+        // 非 leader 执行 exec 时，旧 leader 先停止执行并释放线程资源，但保持
+        // Zombie、PID、父侧 child 项和组成员资格，直到身份迁移完整成功。
+    } else if exit_sig == 0 {
         for (ns, pid) in task.pid_namespaces_snapshot() {
             ns.registry().release(pid);
         }
         group.remove_member(task);
         task.process_group().remove_member(task);
         task.set_state(TaskState::Dead);
+        task.exit_waiters.wake_all();
     } else if !is_group_leader {
         // 非 leader 若显式携带退出信号，仍保持逐任务通知语义。
         notify_task_parent(task);
@@ -563,6 +754,27 @@ where
         zombie.pid_root(),
         code.0,
     );
+    Some((zombie, code))
+}
+
+/// Native owner 线程组侧的 reap。Tomori 的 Task parent/children 表保持不变；
+/// 该入口只消费 `ThreadGroup` 的 Native child 表。
+pub fn reap_native_child<F>(owner: &Arc<ThreadGroup>, mut pred: F) -> Option<(Arc<Task>, ExitCode)>
+where
+    F: FnMut(&Arc<Task>) -> bool,
+{
+    let zombie = owner.reap_native_child(|task| pred(task))?;
+    let code = zombie
+        .exit_code()
+        .expect("[sched][native-reap] zombie without exit code");
+
+    for (ns, pid) in zombie.pid_namespaces_snapshot() {
+        ns.registry().release(pid);
+    }
+    zombie.thread_group().remove_member(&zombie);
+    zombie.process_group().remove_member(&zombie);
+
+    debug_assert_eq!(zombie.state(), TaskState::Dead);
     Some((zombie, code))
 }
 

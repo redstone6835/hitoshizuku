@@ -22,7 +22,8 @@ pub(crate) const NET_STACK_EXECUTION_ACTION: u64 = 1;
 fn observe_duplicate_stack_request(kind: Option<sched::ExecutionScopeKind>) {
     profiling::observe(profiling::Metric::NetStackDuplicateRequests, 1);
     match kind {
-        Some(sched::ExecutionScopeKind::Syscall) => {
+        Some(sched::ExecutionScopeKind::Syscall | sched::ExecutionScopeKind::NativeCall) => {
+            // Native ABI 与 Linux syscall 都是同步的用户入口，共用现有同步调用计数桶。
             profiling::observe(profiling::Metric::NetStackDuplicateSyscall, 1);
         }
         Some(sched::ExecutionScopeKind::NetworkWorker) => {
@@ -36,7 +37,10 @@ fn claim_stack_call() -> bool {
     let claim = sched::current_task_fast().claim_execution_action(NET_STACK_EXECUTION_ACTION);
     #[cfg(feature = "performance-profile")]
     match claim {
-        sched::ExecutionActionClaim::Claimed(sched::ExecutionScopeKind::Syscall) => {
+        sched::ExecutionActionClaim::Claimed(
+            sched::ExecutionScopeKind::Syscall | sched::ExecutionScopeKind::NativeCall,
+        ) => {
+            // Native ABI 与 Linux syscall 都是同步的用户入口，共用现有同步调用计数桶。
             profiling::observe(profiling::Metric::NetStackSyscallCalls, 1);
         }
         sched::ExecutionActionClaim::Claimed(sched::ExecutionScopeKind::NetworkWorker) => {

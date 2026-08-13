@@ -148,6 +148,7 @@ enum IngressPayload<'a> {
         lease: &'a TcpTxLease,
         offset: usize,
         len: usize,
+        flush: bool,
     },
 }
 
@@ -186,9 +187,12 @@ impl IngressPayload<'_> {
                 pressure,
                 ..
             } => facade.push_stream_rx_packet(chain, *offset + payload_offset, len, *pressure),
-            Self::Lease { lease, offset, .. } => {
-                facade.push_stream_rx_lease(lease, *offset + payload_offset, len, true)
-            }
+            Self::Lease {
+                lease,
+                offset,
+                flush,
+                ..
+            } => facade.push_stream_rx_lease(lease, *offset + payload_offset, len, *flush),
         }
     }
 
@@ -207,7 +211,9 @@ impl IngressPayload<'_> {
                     .map_err(|_| TcpIngressError::Malformed)?;
                 Ok(bytes)
             }
-            Self::Lease { lease, offset, len } => {
+            Self::Lease {
+                lease, offset, len, ..
+            } => {
                 let mut bytes = Vec::new();
                 bytes.resize(len, 0);
                 lease
@@ -900,6 +906,29 @@ impl TcpEndpointTable {
         Ok(Some((sender_id, peer_id)))
     }
 
+    /// 查找仍由流表持有的本地 TCP 对端。
+    ///
+    /// `SocketFacade::close()` 会在 ELM 处理关闭命令前递增 facade 代际，
+    /// 但已经交付到接收环形缓冲区的数据仍必须结算。这里以流代际、反向四元组
+    /// 和协议栈代际确认身份，不使用只适合发送快速路径的 facade 状态。
+    fn local_peer_flow_id(&self, sender_id: FlowId) -> Option<FlowId> {
+        let sender = self.flows.get(sender_id)?;
+        let hint = sender.local_peer_hint?;
+        let peer_id = hint.flow;
+        if sender_id == peer_id || self.flows.generation(peer_id) != Some(hint.flow_generation) {
+            return None;
+        }
+        let peer = self.flows.get(peer_id)?;
+        (sender.local_transport
+            && peer.local_transport
+            && sender.local == peer.remote
+            && sender.remote == peer.local
+            && sender.path.route.interface == peer.path.route.interface
+            && sender.facade.stack_generation() == hint.stack_generation
+            && peer.facade.stack_generation() == hint.stack_generation)
+            .then_some(peer_id)
+    }
+
     /// 对 socket 直达 lane 已经交付的字节统一推进 TCP 序列空间。
     ///
     /// 数据在进入这里前已经由代际校验的 peer route 原子地提交到接收 ring；本函数
@@ -913,18 +942,7 @@ impl TcpEndpointTable {
         if bytes == 0 {
             return None;
         }
-        let hint = self.flows.get(sender_id)?.local_peer_hint?;
-        let peer_id = hint.flow;
-        if sender_id == peer_id
-            || self.flows.generation(peer_id) != Some(hint.flow_generation)
-            || self.flows.get(peer_id).is_none_or(|peer| {
-                peer.facade.generation() != hint.facade_generation
-                    || peer.facade.stack_generation() != hint.stack_generation
-                    || peer.facade.is_closing()
-            })
-        {
-            return None;
-        }
+        let peer_id = self.local_peer_flow_id(sender_id)?;
 
         while bytes != 0 {
             let chunk = bytes;
@@ -978,12 +996,9 @@ impl TcpEndpointTable {
     }
 
     pub fn local_peer_facade(&self, sender_id: FlowId) -> Option<(FlowId, Arc<SocketFacade>)> {
-        let hint = self.flows.get(sender_id)?.local_peer_hint?;
-        let peer = self.flows.get(hint.flow)?;
-        (self.flows.generation(hint.flow) == Some(hint.flow_generation)
-            && peer.facade.generation() == hint.facade_generation
-            && peer.facade.stack_generation() == hint.stack_generation)
-            .then(|| (hint.flow, Arc::clone(&peer.facade)))
+        let peer_id = self.local_peer_flow_id(sender_id)?;
+        let peer = self.flows.get(peer_id)?;
+        Some((peer_id, Arc::clone(&peer.facade)))
     }
 
     fn ingest_local_with_info(
@@ -1009,6 +1024,7 @@ impl TcpEndpointTable {
             lease: payload,
             offset: 0,
             len: payload_len,
+            flush: tcp.flags.contains(TcpFlags::PSH),
         });
         self.process_segment_inner(id, tcp, ingress, now_ns, publish_info)?;
         self.stats.delivered = self.stats.delivered.saturating_add(1);
@@ -1128,14 +1144,20 @@ impl TcpEndpointTable {
                 break;
             };
             queued_bytes = queued_bytes.saturating_add(usize::from(payload.len));
-            unsent_hint = Some(unsent.saturating_sub(usize::from(payload.len)));
+            let remaining_unsent = unsent.saturating_sub(usize::from(payload.len));
+            unsent_hint = Some(remaining_unsent);
             let Some(sequence) = flow.machine.reserve_send(u32::from(payload.len)) else {
                 break;
+            };
+            let flags = if remaining_unsent == 0 {
+                TcpFlags::ACK | TcpFlags::PSH
+            } else {
+                TcpFlags::ACK
             };
             let transmit = TcpTransmit {
                 sequence,
                 acknowledgement: flow.machine.receive_next(),
-                flags: TcpFlags::ACK | TcpFlags::PSH,
+                flags,
                 window: advertised_window(&flow.facade, flow.local_window_scale),
             };
             self.queue_transmit(id, transmit, Some(payload), now_ns, false, true);
@@ -2220,13 +2242,24 @@ impl TcpEndpointTable {
                 .get_or_insert(now_ns.saturating_add(flow.rtt.rto_ns));
         }
         let (options, options_len, parsed_options) = wire_options(flow, transmit.flags, now_ns);
-        let advertised = advertised_window(&flow.facade, flow.local_window_scale);
+        // RFC 7323 只允许在 SYN 之后的报文中应用窗口缩放；SYN/SYN-ACK
+        // 的窗口字段始终携带未缩放值，窗口缩放选项仅协商后续报文的解释方式。
+        let window_scale = if transmit.flags.contains(TcpFlags::SYN) {
+            0
+        } else {
+            flow.local_window_scale
+        };
+        let advertised = advertised_window(&flow.facade, window_scale);
         let wire_window = if transmit.flags.contains(TcpFlags::RST) {
             transmit.window
         } else {
             advertised
         };
-        flow.last_advertised_window = wire_window;
+        // last_advertised_window 以握手后的缩放单位保存，不能把 SYN 的原始
+        // 16-bit 窗口混入后续窗口更新比较。
+        if !transmit.flags.contains(TcpFlags::SYN) {
+            flow.last_advertised_window = wire_window;
+        }
         let completion = self.next_completion;
         self.next_completion = self.next_completion.wrapping_add(1).max(1);
         self.output.push_back(PreparedTcpTx {
@@ -3221,6 +3254,82 @@ mod tests {
         )
     }
 
+    #[test]
+    fn window_scaling_starts_after_syn_exchange() {
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_101,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_001,
+        };
+        let listener = facade(92);
+        listener.test_set_stack_generation(1);
+        let group = listen_group(&listener, 92, 1, 4);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        table
+            .listen(server_endpoint, Some(InterfaceId(1)), group)
+            .unwrap();
+
+        let client = facade(93);
+        client.test_set_stack_generation(1);
+        let client_flow = table
+            .connect(
+                client_endpoint,
+                server_endpoint,
+                path(client_endpoint.addr, server_endpoint.addr),
+                Arc::clone(&client),
+                1,
+                true,
+                1_000,
+            )
+            .unwrap();
+        client.publish_binding(
+            OwnerRef::Flow {
+                shard: ShardId(0),
+                flow: client_flow,
+                generation: client.generation(),
+            },
+            client_endpoint,
+            Some(server_endpoint),
+            Some(InterfaceId(1)),
+        );
+
+        let syn = table.take_output().unwrap();
+        let client_scale = syn
+            .parsed_options
+            .window_scale
+            .expect("SYN 必须协商窗口缩放");
+        assert!(client_scale != 0);
+        assert_eq!(syn.flags, TcpFlags::SYN);
+        assert_eq!(syn.window, advertised_window(&client, 0));
+        assert_ne!(syn.window, advertised_window(&client, client_scale));
+
+        let server_flow = ingest_prepared_local_work(&mut table, &syn, 2_000).unwrap();
+        let syn_ack = table.take_output().unwrap();
+        let server = Arc::clone(&table.flows.get(server_flow).unwrap().facade);
+        let server_scale = syn_ack
+            .parsed_options
+            .window_scale
+            .expect("SYN-ACK 必须协商窗口缩放");
+        assert!(server_scale != 0);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN | TcpFlags::ACK);
+        assert_eq!(syn_ack.window, advertised_window(&server, 0));
+        assert_ne!(syn_ack.window, advertised_window(&server, server_scale));
+
+        ingest_prepared_local_work(&mut table, &syn_ack, 3_000).unwrap();
+        assert_eq!(
+            table.flows.get(client_flow).unwrap().peer_window,
+            u32::from(syn_ack.window)
+        );
+        let ack = table.take_output().unwrap();
+        assert_eq!(ack.flags, TcpFlags::ACK);
+        assert_eq!(ack.parsed_options.window_scale, None);
+        assert_eq!(ack.window, advertised_window(&client, client_scale));
+        assert_ne!(ack.window, syn.window);
+    }
+
     fn prepare_local_payload(
         table: &mut TcpEndpointTable,
         pair: &LocalPair,
@@ -3761,6 +3870,44 @@ mod tests {
     }
 
     #[test]
+    fn closing_local_receiver_reconciles_pending_direct_payload() {
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let sequence = table
+            .flows
+            .get(pair.client_flow)
+            .unwrap()
+            .machine
+            .send_next();
+        let payload = b"payload before local receiver close";
+        assert_eq!(
+            pair.client.send_stream(payload, true, None, false),
+            Ok(payload.len())
+        );
+
+        pair.server.close();
+        assert!(table.close_flow(pair.server_flow, 10_000));
+        assert_eq!(
+            table
+                .flows
+                .get(pair.client_flow)
+                .unwrap()
+                .machine
+                .send_next(),
+            sequence + payload.len() as u32
+        );
+        assert_eq!(
+            table
+                .flows
+                .get(pair.server_flow)
+                .unwrap()
+                .machine
+                .receive_next(),
+            sequence + payload.len() as u32
+        );
+    }
+
+    #[test]
     fn deferred_accept_first_payload_uses_promoting_ingress_path() {
         let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
         let pair = establish_local_pair_with_defer(&mut table, None, 1_000_000_000);
@@ -4003,6 +4150,38 @@ mod tests {
         assert_eq!(table.resume_output_blocked(40_000, 1), 1);
         assert_eq!(facade.stream_unsent_len(), 0);
         assert!(!table.has_output_blocked());
+    }
+
+    #[test]
+    fn stream_send_marks_only_the_batch_tail_with_psh() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_014,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_014,
+        };
+        let facade = facade(14);
+        facade.set_tcp_maxseg(536);
+        facade.set_tcp_nodelay(true);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        {
+            let state = table.flows.get_mut(flow).unwrap();
+            state.peer_window = u32::MAX;
+            state.congestion.cwnd = u32::MAX;
+        }
+        let payload = alloc::vec![0x5a; 536 * 3 + 17];
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+
+        assert!(table.drain_send(flow, 20_000));
+        let flags =
+            core::iter::from_fn(|| table.take_output().map(|work| work.flags)).collect::<Vec<_>>();
+
+        assert_eq!(flags.len(), 4);
+        assert_eq!(&flags[..3], &[TcpFlags::ACK; 3]);
+        assert_eq!(flags[3], TcpFlags::ACK | TcpFlags::PSH);
     }
 
     #[test]

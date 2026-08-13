@@ -17,6 +17,7 @@
 //!   PUD[1]:    kernel heap（1GiB，按需映射 4K / 2M 页）
 //!   PUD[2]:    kernel code direct map（1GiB，2MiB leaf；no-map 边界按 4KiB 拆分）
 //!   PUD[3..17]: kernel direct map 扩展（通常为 1GiB leaf，no-map 窗口按需拆分）
+//!   PUD[18..19]: tracked heap（2GiB，按需映射 4K / 2M 页）
 //!
 //! PGD[510] (0xFFFF_FF00_0000_0000 .. 0xFFFF_FF80_0000_0000)
 //!   PUD[0]:    MMIO 直接映射（1GiB leaf，PA 0x0..0x4000_0000）
@@ -106,6 +107,12 @@ const PTE_SOFTWARE_LEVEL_MASK: usize = 0b11 << PTE_SOFTWARE_LEVEL_SHIFT;
 /// 内核 direct map 对应的虚拟基址（高半区，独立于 identity phys_to_virt）。
 const KERNEL_VIRT_BASE: usize = KERNEL_PHYS_BASE.wrapping_add(KERNEL_VA_OFFSET);
 
+/// 需要 registry 账本的分配使用独立窗口，使释放路径能按指针范围直接分流。
+pub const TRACKED_HEAP_BASE: usize =
+    KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
+pub const TRACKED_HEAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
+const TRACKED_HEAP_END: usize = TRACKED_HEAP_BASE + TRACKED_HEAP_SIZE;
+
 pub(crate) static KERNEL_PAGE_TABLE_ROOT: AtomicUsize = AtomicUsize::new(0);
 
 const PAGE_TABLE_UNINITIALIZED: usize = 0;
@@ -154,7 +161,7 @@ static FAIL_PAGE_TABLE_ALLOCATION_AFTER: AtomicUsize =
     AtomicUsize::new(NO_PAGE_TABLE_ALLOCATION_FAILURE);
 
 const TLB_ADDRESS_THRESHOLD: usize = 64;
-const MAX_RECLAIMED_TABLES: usize = KERNEL_HEAP_SIZE / HEAP_PMD_SIZE + 2;
+const MAX_RECLAIMED_TABLES: usize = (KERNEL_HEAP_SIZE + TRACKED_HEAP_SIZE) / HEAP_PMD_SIZE + 4;
 
 /// 页表回收不能在持有 heap 页表锁时再向 allocator 申请临时 Vec，否则可能递归进入
 /// map 回调。该固定 scratch 由同一把全局锁和本地关中断共同保护。
@@ -447,6 +454,21 @@ fn no_map_range_containing(paddr: usize) -> Option<StartPhysRange> {
         if paddr < range.end {
             return Some(range);
         }
+    }
+    None
+}
+
+pub fn tracked_heap_region() -> (usize, usize) {
+    (TRACKED_HEAP_BASE, TRACKED_HEAP_SIZE)
+}
+
+fn dynamic_heap_window(vaddr: usize, size: usize) -> Option<(usize, usize)> {
+    let end = vaddr.checked_add(size)?;
+    if vaddr >= KERNEL_HEAP_BASE && end <= KERNEL_HEAP_USABLE_END {
+        return Some((KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END));
+    }
+    if vaddr >= TRACKED_HEAP_BASE && end <= TRACKED_HEAP_END {
+        return Some((TRACKED_HEAP_BASE, TRACKED_HEAP_END));
     }
     None
 }
@@ -1536,7 +1558,7 @@ fn flush_kernel_tlb_all() {
     TLB_GLOBAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
 }
 
-fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, range_size: usize) {
+fn execute_kernel_tlb_flush_plan_local(plan: &KernelTlbFlushPlan) {
     if plan.global {
         unsafe { Riscv64Paging::flush_tlb_global_local(None) };
         TLB_GLOBAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -1546,7 +1568,10 @@ fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, 
             TLB_ADDRESS_FLUSHES.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
 
+fn execute_kernel_tlb_flush_plan(plan: &KernelTlbFlushPlan, range_start: usize, range_size: usize) {
+    execute_kernel_tlb_flush_plan_local(plan);
     // 本地 sfence 需要逐 leaf 执行，但 SBI RFENCE 原生接受连续范围。把原先最多
     // 64 次 M-mode 往返合并为一次，同时仍在返回前等待所有远端 hart 完成失效。
     crate::riscv64::smp::remote_sfence_vma_range_on(usize::MAX, None, range_start, range_size);
@@ -1633,7 +1658,7 @@ fn free_page_table_page(paddr: usize) -> bool {
     }
 }
 
-/// 回收解除映射后变空的 PT/PMD 页，只处理内核堆 PUD[0..1]。
+/// 回收解除映射后变空的 PT/PMD 页，只处理两个动态堆窗口。
 ///
 /// 根页表和启动阶段创建的 PUD 页由整个内核地址空间共享，绝不在这里释放。
 /// 返回 true 表示至少摘除了一个非叶页表，并已执行一次覆盖叶映射的全局 TLB flush。
@@ -1663,9 +1688,6 @@ fn reclaim_empty_heap_page_tables(root_vaddr: usize, vaddr: usize, size: usize) 
 
         let pud_vaddr = phys_to_virt(Riscv64Paging::pte_addr(pgd_pte));
         let pud_index = Riscv64Paging::level_index(chunk_start, 1);
-        if pud_index > 1 {
-            break;
-        }
         let pud_pte_ptr = (pud_vaddr + pud_index * core::mem::size_of::<usize>()) as *mut usize;
         let pud_pte =
             Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pud_pte_ptr) });
@@ -1844,7 +1866,7 @@ fn map_range_with_policy(
         LARGE_PAGE_MAPS.fetch_add(size / page_size, Ordering::Relaxed);
     }
     let plan = uniform_kernel_tlb_flush_plan(vaddr, size, page_size);
-    execute_kernel_tlb_flush_plan(&plan, vaddr, size);
+    execute_kernel_tlb_flush_plan_local(&plan);
     Ok(())
 }
 
@@ -1934,18 +1956,15 @@ pub fn map_kernel_heap_range(
     size: usize,
     page_policy: PagePolicy,
 ) -> Result<(), MapError> {
-    map_kernel_range_in_window(
-        vaddr,
-        paddr,
-        size,
-        page_policy,
-        KERNEL_HEAP_BASE,
-        KERNEL_HEAP_USABLE_END,
-    )
+    let (allowed_start, allowed_end) =
+        dynamic_heap_window(vaddr, size).ok_or(MapError::NotMapped)?;
+    map_kernel_range_in_window(vaddr, paddr, size, page_policy, allowed_start, allowed_end)
 }
 
 pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> Result<(), MapError> {
-    unmap_kernel_range_in_window(vaddr, size, KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END)
+    let (allowed_start, allowed_end) =
+        dynamic_heap_window(vaddr, size).ok_or(MapError::NotMapped)?;
+    unmap_kernel_range_in_window(vaddr, size, allowed_start, allowed_end)
 }
 
 fn unmap_kernel_heap_range_locked(vaddr: usize, size: usize) -> Result<(), MapError> {
@@ -2101,7 +2120,9 @@ pub fn protect_kernel_heap_range(
     write: bool,
     execute: bool,
 ) -> Result<(), MapError> {
-    validate_mapping_range(vaddr, None, size, KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END)?;
+    let (allowed_start, allowed_end) =
+        dynamic_heap_window(vaddr, size).ok_or(MapError::NotMapped)?;
+    validate_mapping_range(vaddr, None, size, allowed_start, allowed_end)?;
     with_kernel_heap_page_table_lock(|| {
         protect_kernel_heap_range_locked(vaddr, size, read, write, execute)
     })
@@ -2114,7 +2135,9 @@ pub fn validate_kernel_heap_range(
     write: bool,
     execute: bool,
 ) -> Result<(), MapError> {
-    validate_mapping_range(vaddr, None, size, KERNEL_HEAP_BASE, KERNEL_HEAP_USABLE_END)?;
+    let (allowed_start, allowed_end) =
+        dynamic_heap_window(vaddr, size).ok_or(MapError::NotMapped)?;
+    validate_mapping_range(vaddr, None, size, allowed_start, allowed_end)?;
     with_kernel_heap_page_table_lock(|| {
         let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
         if root_paddr == 0 {

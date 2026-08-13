@@ -12,11 +12,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
 use sched::arch_hooks::{
-    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry,
+    ArchContextOps, ArchDeadlineTimerOps, ArchIdleOps, ArchLocalInterruptOps, ArchTimeOps,
+    ArchTrapOps, KernelEntry,
 };
 
 use crate::riscv64::specific::{
-    HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id, kernel_timestamp_ns,
+    CONTEXT_SWITCH_TOKEN_STRIDE, HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF, current_cpu_id,
+    kernel_timestamp_ns,
 };
 use crate::riscv64::task::Riscv64TaskOps;
 use crate::riscv64::trap::Riscv64InterruptOps;
@@ -68,10 +70,10 @@ unsafe extern "C" fn switch_context(
     _prev_on_cpu: NonNull<core::sync::atomic::AtomicUsize>,
 ) {
     core::arch::naked_asm!(
-        // fast syscall 可在内部阻塞并切走，随后从同一内核调用点继续。递增 per-hart
-        // 序号，使返回汇编能够判断硬件 FPR 是否可能已被其它任务替换。
+        // fast syscall 可在内部阻塞并迁移，随后从同一内核调用点继续。token 低位
+        // 编码 hart id，按固定步长递增，因此跨 hart 或本 hart 切换都必然变化。
         "ld t0, {switch_seq}(tp)",
-        "addi t0, t0, 1",
+        "addi t0, t0, {switch_stride}",
         "sd t0, {switch_seq}(tp)",
 
         "sd ra,  {ra}(a0)",
@@ -117,6 +119,7 @@ unsafe extern "C" fn switch_context(
         s8 = const S8_OFFSET, s9 = const S9_OFFSET,
         s10 = const S10_OFFSET, s11 = const S11_OFFSET,
         switch_seq = const HART_LOCAL_CONTEXT_SWITCH_SEQ_OFF,
+        switch_stride = const CONTEXT_SWITCH_TOKEN_STRIDE,
     );
 }
 
@@ -131,6 +134,22 @@ static ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     context_align: KCTX_ALIGN,
     init_kernel_context,
     switch_context,
+};
+
+fn save_and_disable_local_interrupts() -> usize {
+    // Safety: 只原子读取并清除当前 hart 的 SSTATUS.SIE；返回值随任务调用栈保存，
+    // 可在任务迁移后由另一 hart 按同一 ISA 语义恢复。
+    unsafe { Riscv64InterruptOps::save_and_disable() }
+}
+
+fn restore_local_interrupts(state: usize) {
+    // Safety: state 来自配对的 save_and_disable，仅按保存值恢复 SSTATUS.SIE。
+    unsafe { Riscv64InterruptOps::restore_interrupt_state(state) };
+}
+
+static ARCH_LOCAL_INTERRUPT_OPS: ArchLocalInterruptOps = ArchLocalInterruptOps {
+    save_and_disable: save_and_disable_local_interrupts,
+    restore: restore_local_interrupts,
 };
 
 static ARCH_TIME_OPS: ArchTimeOps = ArchTimeOps {
@@ -149,8 +168,16 @@ unsafe fn set_kernel_trap_stack_raw(stack_top: usize) {
     <Riscv64TaskOps as TaskOps>::set_kernel_trap_stack(stack_top);
 }
 
+/// # Safety
+/// `task_ptr` 必须由调度器已发布且仍持有强引用的 current task 提供；
+/// `cpu_work_ptr` 必须指向稳定的 CpuSchedState 返回工作 hint。
+unsafe fn set_current_task_raw(task_ptr: usize, cpu_work_ptr: usize) {
+    unsafe { crate::riscv64::specific::set_current_task_ptr(task_ptr, cpu_work_ptr) };
+}
+
 static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
+    set_current_task: set_current_task_raw,
 };
 
 static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
@@ -179,6 +206,7 @@ pub fn register() {
         .is_ok()
     {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
+        sched::arch_hooks::register_local_interrupt(&ARCH_LOCAL_INTERRUPT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_deadline_timer(&ARCH_DEADLINE_TIMER_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);

@@ -41,6 +41,8 @@ pub enum ElfError {
     MisalignedPhoff,
     /// PT_INTERP 区段不以 NUL 结尾或非 UTF-8。
     InvalidInterp,
+    /// 解析所需的元数据缓冲区超过分配器能力或显式限制。
+    ResourceExhausted,
 }
 
 impl From<ElfError> for Errno {
