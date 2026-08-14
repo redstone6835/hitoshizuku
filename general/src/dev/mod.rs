@@ -45,6 +45,7 @@ pub mod rtc;
 pub mod syscon;
 pub mod tty;
 pub mod usb;
+pub mod wdt;
 
 mod elm_lifecycle;
 mod registry_id;

@@ -122,6 +122,15 @@ default = "y"
 after = "platform.firmware-bus"
 
 [[modules]]
+name = "platform.ls2x-wdt"
+path = "ls2x-wdt"
+config = "CONFIG_LS2X_WDT"
+prompt = "Loongson LS2X 看门狗驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk"
+
+[[modules]]
 name = "platform.ls2k-rtc"
 path = "ls2k-rtc"
 config = "CONFIG_LS2K_RTC"

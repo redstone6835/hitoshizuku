@@ -47,6 +47,7 @@ exclude = [
     "drivers/loopback",
     "drivers/net-stack",
     "drivers/ls2k-rtc",
+    "drivers/ls2x-wdt",
     "drivers/ls7a-rtc",
     "drivers/plic",
     "drivers/pci-host-ecam",
