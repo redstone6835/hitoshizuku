@@ -1,0 +1,7 @@
+[elm]
+name = "platform.loongson-apbdma"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.loongson-apbdma"
+mode = "m"
+integrated_phase = "device"

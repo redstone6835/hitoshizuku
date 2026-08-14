@@ -32,6 +32,7 @@ members = [
     "kernel"
 ]
 exclude = [
+    "drivers/ahci",
     "drivers/cfi-flash",
     "drivers/dt-providers",
     "drivers/dt-providers/host-tests",
@@ -39,8 +40,10 @@ exclude = [
     "drivers/fw-cfg",
     "drivers/goldfish-rtc",
     "drivers/loongson-clk",
+    "drivers/loongson-apbdma",
     "drivers/loongson-irq",
     "drivers/loongson-pinctrl-gpio",
+    "drivers/loongson-sdio",
     "drivers/loopback",
     "drivers/net-stack",
     "drivers/ls7a-rtc",
