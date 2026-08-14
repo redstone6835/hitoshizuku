@@ -43,6 +43,7 @@ pub mod random;
 pub mod random_source;
 pub mod rtc;
 pub mod syscon;
+pub mod tty;
 pub mod usb;
 
 mod elm_lifecycle;

@@ -7,9 +7,6 @@
 use errno::Errno;
 use vfs::file::IoctlCmd;
 
-use crate::dev::char::{CharControlRequest, CharControlResponse, CharDevice};
-use crate::dev::control::ControlError;
-
 use super::ioctl::{
     put_u32, read_bytes_from_user, read_i32_from_user, read_u32, write_bytes_to_user,
     write_i32_to_user, write_u32_to_user,
@@ -266,6 +263,17 @@ pub trait TtyIoctlState {
     fn clear_line_state(&self);
     fn foreground_pgrp(&self) -> i32;
     fn set_foreground_pgrp(&self, pgrp: i32);
+
+    /// 执行终端后端控制请求(排空/冲刷/串口配置等)。
+    ///
+    /// 默认实现返回 `ENOTTY`;`TtyCore` 通过其 [`TerminalDriver`] 执行,
+    /// 因此控制面不再依赖底层 `CharDevice` 类型。
+    fn control(
+        &self,
+        _req: crate::dev::tty::TtyControlRequest,
+    ) -> Result<crate::dev::tty::TtyControlResponse, Errno> {
+        Err(Errno::ENOTTY)
+    }
 }
 
 /// TTY ioctl 外部上下文。
@@ -306,18 +314,14 @@ pub fn is_tty_ioctl(cmd: IoctlCmd) -> bool {
     )
 }
 
-/// 执行 TTY ioctl，把用户 ABI 转换为 typed char control 或状态更新。
-pub fn handle_tty_ioctl<S, C>(
-    state: &S,
-    ctx: &C,
-    dev: &CharDevice,
-    cmd: IoctlCmd,
-    arg: usize,
-) -> Result<usize, Errno>
+/// 执行 TTY ioctl，把用户 ABI 转换为 typed 控制请求或状态更新。
+pub fn handle_tty_ioctl<S, C>(state: &S, ctx: &C, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno>
 where
     S: TtyIoctlState,
     C: TtyIoctlContext,
 {
+    use crate::dev::tty::TtyControlRequest;
+
     match cmd.raw() {
         TCGETS => {
             let termios = state.termios();
@@ -334,11 +338,11 @@ where
             read_bytes_from_user(arg, &mut raw)?;
             state.set_termios(UserTermios { raw });
             if matches!(cmd.raw(), TCSETSW | TCSETSF) {
-                control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             }
             if matches!(cmd.raw(), TCSETSF) {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushRx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushRx)?;
             }
             Ok(0)
         }
@@ -350,13 +354,13 @@ where
                 *dst = *src;
             }
             state.set_termios(UserTermios { raw: termios });
-            sync_termios2_hardware(dev, &raw)?;
+            sync_termios2_hardware(state, &raw)?;
             if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {
-                control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             }
             if matches!(cmd.raw(), TCSETSF2) {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushRx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushRx)?;
             }
             Ok(0)
         }
@@ -371,12 +375,12 @@ where
             Ok(0)
         }
         FIONREAD => {
-            let queued = control_u32_or_zero(dev, CharControlRequest::GetInputQueueLen)?;
+            let queued = control_u32_or_zero(state, TtyControlRequest::GetInputQueueLen)?;
             write_u32_to_user(arg, queued)?;
             Ok(0)
         }
         TIOCOUTQ => {
-            let queued = control_u32_or_zero(dev, CharControlRequest::GetOutputQueueLen)?;
+            let queued = control_u32_or_zero(state, TtyControlRequest::GetOutputQueueLen)?;
             write_u32_to_user(arg, queued)?;
             Ok(0)
         }
@@ -409,11 +413,11 @@ where
             }
         }
         TCSBRK => {
-            control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+            control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             if arg == 0 {
                 control_done_ignore_unsupported(
-                    dev,
-                    CharControlRequest::SendBreak {
+                    state,
+                    TtyControlRequest::SendBreak {
                         duration_ms: TTY_DEFAULT_BREAK_MS,
                     },
                 )?;
@@ -421,29 +425,32 @@ where
             Ok(0)
         }
         TCSBRKP => {
-            control_done_ignore_unsupported(dev, CharControlRequest::DrainTx)?;
+            control_done_ignore_unsupported(state, TtyControlRequest::DrainTx)?;
             let units = u32::try_from(arg).unwrap_or(u32::MAX);
             let duration_ms = if units == 0 {
                 TTY_DEFAULT_BREAK_MS
             } else {
                 units.saturating_mul(TTY_BREAK_UNIT_MS)
             };
-            control_done_ignore_unsupported(dev, CharControlRequest::SendBreak { duration_ms })?;
+            control_done_ignore_unsupported(
+                state,
+                TtyControlRequest::SendBreak { duration_ms },
+            )?;
             Ok(0)
         }
         TCFLSH => match arg {
             TCIFLUSH => {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushRx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushRx)?;
                 Ok(0)
             }
             TCOFLUSH => {
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushTx)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushTx)?;
                 Ok(0)
             }
             TCIOFLUSH => {
                 state.clear_line_state();
-                control_done_ignore_unsupported(dev, CharControlRequest::FlushBoth)?;
+                control_done_ignore_unsupported(state, TtyControlRequest::FlushBoth)?;
                 Ok(0)
             }
             _ => Err(Errno::EINVAL),
@@ -453,41 +460,39 @@ where
     }
 }
 
-fn sync_termios2_hardware(dev: &CharDevice, raw: &[u8; LINUX_TERMIOS2_LEN]) -> Result<(), Errno> {
+fn sync_termios2_hardware<S: TtyIoctlState>(
+    state: &S,
+    raw: &[u8; LINUX_TERMIOS2_LEN],
+) -> Result<(), Errno> {
     let ospeed = read_u32(raw, 40).ok_or(Errno::EINVAL)?;
     if ospeed == 0 {
         return Ok(());
     }
     control_done_ignore_unsupported(
-        dev,
-        CharControlRequest::SetSerialConfig { baud: Some(ospeed) },
+        state,
+        crate::dev::tty::TtyControlRequest::SetSerialConfig { baud: Some(ospeed) },
     )
 }
 
-fn control_done_ignore_unsupported(dev: &CharDevice, req: CharControlRequest) -> Result<(), Errno> {
-    match dev.control(req) {
-        Ok(CharControlResponse::Done) | Err(ControlError::Unsupported) => Ok(()),
+fn control_done_ignore_unsupported<S: TtyIoctlState>(
+    state: &S,
+    req: crate::dev::tty::TtyControlRequest,
+) -> Result<(), Errno> {
+    match state.control(req) {
+        Ok(crate::dev::tty::TtyControlResponse::Done) | Err(Errno::ENOTTY) => Ok(()),
         Ok(_) => Err(Errno::EINVAL),
-        Err(err) => Err(map_control_errno(err)),
+        Err(err) => Err(err),
     }
 }
 
-fn control_u32_or_zero(dev: &CharDevice, req: CharControlRequest) -> Result<u32, Errno> {
-    match dev.control(req) {
-        Ok(CharControlResponse::U32(value)) => Ok(value),
-        Ok(CharControlResponse::Done) => Err(Errno::EINVAL),
-        Err(ControlError::Unsupported) => Ok(0),
-        Err(err) => Err(map_control_errno(err)),
-    }
-}
-
-fn map_control_errno(e: ControlError) -> Errno {
-    match e {
-        ControlError::Unsupported => Errno::ENOTTY,
-        ControlError::Invalid => Errno::EINVAL,
-        ControlError::NoDevice => Errno::ENODEV,
-        ControlError::Busy => Errno::EBUSY,
-        ControlError::Io => Errno::EIO,
-        ControlError::Permission => Errno::EPERM,
+fn control_u32_or_zero<S: TtyIoctlState>(
+    state: &S,
+    req: crate::dev::tty::TtyControlRequest,
+) -> Result<u32, Errno> {
+    match state.control(req) {
+        Ok(crate::dev::tty::TtyControlResponse::U32(value)) => Ok(value),
+        Ok(crate::dev::tty::TtyControlResponse::Done) => Err(Errno::EINVAL),
+        Err(Errno::ENOTTY) => Ok(0),
+        Err(err) => Err(err),
     }
 }

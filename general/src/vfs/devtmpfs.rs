@@ -33,9 +33,8 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,6 +55,7 @@ use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
 use crate::dev::char::{CharDevice, CharIoError};
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError};
+use crate::dev::tty::{self, TtyCore};
 use crate::dev::enumerate::{
     DEVICES, DeviceFunctionEvent, DeviceFunctionEventKind, subscribe_function_events,
 };
@@ -70,7 +70,7 @@ use crate::vfs::device_files::spec::{
 };
 use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
 use crate::vfs::user_api::tty::{
-    TtyIoctlContext, TtyIoctlState, UserTermios, UserWinSize, handle_tty_ioctl,
+    TtyIoctlContext, TtyIoctlState, UserTermios, handle_tty_ioctl,
 };
 
 // ───────── 全局实例计数器 ─────────
@@ -78,9 +78,6 @@ use crate::vfs::user_api::tty::{
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
-static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
-    Spinlock::new(BTreeMap::new());
-const TTY_ASYNC_PUMP_LIMIT: usize = 256;
 // 无 PnP backing 的内核服务由 VFS device_files 层注册静态投影。devtmpfs 只维护
 // 这张声明表和事务绑定逻辑，不直接知道 null/zero/random/loop-control 等具体设备。
 static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
@@ -672,105 +669,14 @@ fn map_control_vfs(e: ControlError) -> VfsError {
     }
 }
 
-#[derive(Default)]
-struct TtyLineState {
-    line: Vec<u8>,
-    ready: VecDeque<u8>,
-    eof_pending: bool,
-}
-
-impl TtyLineState {
-    fn clear(&mut self) {
-        self.line.clear();
-        self.ready.clear();
-        self.eof_pending = false;
-    }
-}
-
-/// 一个底层 TTY 设备的共享行规程状态。
-///
-/// devtmpfs 可能把同一个串口同时投影成 `/dev/console` 和 `/dev/uart0`。
-/// termios、窗口大小、前台进程组和规范模式行缓冲都属于控制终端本身，
-/// 必须在这些节点和所有 open fd 之间共享；每个 fd 只保留自己的状态标志。
-struct TtySharedState {
-    dev: CharDevice,
-    termios: Spinlock<UserTermios>,
-    winsize: Spinlock<UserWinSize>,
-    foreground_pgrp: Spinlock<i32>,
-    line_state: Spinlock<TtyLineState>,
-}
-
-impl TtySharedState {
-    fn new(dev: CharDevice) -> Self {
-        Self {
-            dev,
-            termios: Spinlock::new(UserTermios::new_default()),
-            winsize: Spinlock::new(UserWinSize::default_console()),
-            foreground_pgrp: Spinlock::new(0),
-            line_state: Spinlock::new(TtyLineState::default()),
-        }
-    }
-}
-
-impl TtyIoctlState for TtySharedState {
-    fn termios(&self) -> UserTermios {
-        *self.termios.lock()
-    }
-
-    fn set_termios(&self, termios: UserTermios) {
-        *self.termios.lock() = termios;
-    }
-
-    fn winsize(&self) -> UserWinSize {
-        *self.winsize.lock()
-    }
-
-    fn set_winsize(&self, winsize: UserWinSize) {
-        *self.winsize.lock() = winsize;
-    }
-
-    fn clear_line_state(&self) {
-        self.line_state.lock().clear();
-    }
-
-    fn foreground_pgrp(&self) -> i32 {
-        *self.foreground_pgrp.lock()
-    }
-
-    fn set_foreground_pgrp(&self, pgrp: i32) {
-        *self.foreground_pgrp.lock() = pgrp;
-    }
-}
-
-fn shared_tty_state(dev: &CharDevice) -> Option<Arc<TtySharedState>> {
-    if !dev.is_tty() {
-        return None;
-    }
-
-    let mut states = TTY_SHARED_STATES.lock();
-    if let Some(state) = states.get(dev.fw_name()).and_then(Weak::upgrade) {
-        return Some(state);
-    }
-
-    // 同一个底层 TTY 可能被投影成多个 `/dev` 节点，例如稳定的 console 别名
-    // 和驱动自己的串口节点。行规程状态必须按设备共享，不能按 open fd 分裂。
-    let state = Arc::new(TtySharedState::new(dev.clone()));
-    // 共享状态缓存只是优化；如果名称键分配失败，当前 open fd 仍可持有独立
-    // 状态继续工作，不能因为缓存失败阻断字符设备打开路径。
-    if let Ok(key) = devtmpfs_fallible_string(dev.fw_name()) {
-        states.insert(key, Arc::downgrade(&state));
-    }
-    Some(state)
-}
-
 struct CharDevFileOps {
     dev: CharDevice,
     nonblock: AtomicBool,
-    tty: Option<Arc<TtySharedState>>,
+    tty: Option<Arc<TtyCore>>,
 }
 
 impl CharDevFileOps {
-    fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtySharedState>>) -> Self {
+    fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtyCore>>) -> Self {
         Self {
             dev,
             nonblock: AtomicBool::new(nonblock),
@@ -783,366 +689,47 @@ impl CharDevFileOps {
     }
 
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
-        let stored = self
-            .tty
-            .as_deref()
-            .map(|tty| *tty.foreground_pgrp.lock())
-            .unwrap_or(0);
-        if stored > 0 {
-            Ok(stored)
-        } else {
-            operation::getpgid(0)
+        match self.tty.as_deref() {
+            Some(tty) => tty.current_or_stored_pgrp(),
+            None => operation::getpgid(0),
         }
     }
 
-    fn remember_reader_pgrp(&self, tty: &TtySharedState) {
-        let Ok(pgrp) = operation::getpgid(0) else {
-            return;
-        };
-        if pgrp <= 0 {
-            return;
-        }
-        let mut foreground = tty.foreground_pgrp.lock();
-        if *foreground <= 0 {
-            // 某些 shell 在当前作业控制尚不完整时不会显式 TIOCSPGRP。
-            // 记录最近的 tty reader 进程组，供 timer 输入泵在没有 reader
-            // 调用栈时仍能把 Ctrl-C 发给合理的前台组。
-            *foreground = pgrp;
+    fn remember_reader_pgrp(&self) {
+        if let Some(tty) = self.tty.as_deref() {
+            tty.remember_reader_pgrp();
         }
     }
 
-    fn write_tty_bytes(&self, buf: &[u8], termios: UserTermios) -> VfsResult<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        if !termios.opost_onlcr() {
-            return self.dev.write_all(buf).map_err(map_char_err);
-        }
-
-        let mut cooked = Vec::with_capacity(buf.len());
-        for &byte in buf {
-            if byte == b'\n' {
-                cooked.push(b'\r');
-                cooked.push(b'\n');
-            } else {
-                cooked.push(byte);
-            }
-        }
-        self.dev.write_all(&cooked).map_err(map_char_err)
-    }
-
-    fn dequeue_ready(&self, tty: &TtySharedState, buf: &mut [u8]) -> Option<usize> {
-        let mut state = tty.line_state.lock();
-        if state.eof_pending {
-            state.eof_pending = false;
-            return Some(0);
-        }
-        if state.ready.is_empty() {
-            return None;
-        }
-        let mut n = 0usize;
-        while n < buf.len() {
-            let Some(byte) = state.ready.pop_front() else {
-                break;
-            };
-            buf[n] = byte;
-            n += 1;
-        }
-        Some(n)
-    }
-
-    fn dequeue_pending_bytes(&self, tty: &TtySharedState, buf: &mut [u8]) -> usize {
-        let mut state = tty.line_state.lock();
-        let mut n = 0usize;
-        while n < buf.len() {
-            let Some(byte) = state.ready.pop_front() else {
-                break;
-            };
-            buf[n] = byte;
-            n += 1;
-        }
-        n
-    }
-
-    fn send_fg_signal(&self, sig: sched::SignalNumber) {
-        let stored = self
-            .tty
-            .as_deref()
-            .map(|tty| *tty.foreground_pgrp.lock())
-            .unwrap_or(0);
-        let current = operation::getpgid(0).ok().filter(|pgrp| *pgrp > 0);
-        let primary = if stored > 0 { Some(stored) } else { current };
-
-        if let Some(pgrp) = primary {
-            // 前台进程组是 TTY 的内部对象关系，不应通过 kill(-PGID) 的
-            // 用户态 pid 编码间接表达；PGID==1 会与特殊广播形式冲突。
-            let _ = operation::kill_process_group(pgrp, Some(sig));
-        }
-
-        if stored > 0 {
-            if let Some(current_pgrp) = current {
-                if current_pgrp != stored {
-                    // 当前作业控制还不完整：某些 shell 会把 TTY 前台组留在 shell 自己，
-                    // 但前台程序已经在这个读路径里消费到 VINTR/VQUIT/VSUSP。补发给当前
-                    // 读者进程组，避免 Ctrl-C 只打到 shell，真正阻塞的程序继续睡眠。
-                    let _ = operation::kill_process_group(current_pgrp, Some(sig));
-                }
-            }
-        }
-    }
-
-    fn echo_signal_char(&self, sig: sched::SignalNumber, termios: UserTermios) {
-        if !termios.echo() {
-            return;
-        }
-        let bytes = if sig == sched::SignalNumber::SIGINT {
-            &b"^C\n"[..]
-        } else if sig == sched::SignalNumber::SIGQUIT {
-            &b"^\\\n"[..]
-        } else if sig == sched::SignalNumber::SIGTSTP {
-            &b"^Z\n"[..]
-        } else {
-            &b"\n"[..]
-        };
-        let _ = self.write_tty_bytes(bytes, termios);
-    }
-
-    fn handle_input_signal(
-        &self,
-        tty: &TtySharedState,
-        ch: u8,
-        termios: UserTermios,
-    ) -> VfsResult<()> {
-        let Some(sig) = termios.signal_for_input(ch) else {
-            return Ok(());
-        };
-        self.send_fg_signal(sig);
-        tty.line_state.lock().clear();
-        self.echo_signal_char(sig, termios);
-        Err(VfsError::Interrupted)
-    }
-
-    fn handle_async_input_signal(
-        &self,
-        tty: &TtySharedState,
-        ch: u8,
-        termios: UserTermios,
-    ) -> VfsResult<()> {
-        // 异步输入泵没有用户态 read() 调用栈，不能完全依赖当前 termios 的
-        // ISIG 状态：BusyBox shell 在启动前台命令前可能短暂把终端切到 raw
-        // 模式。此时 Ctrl-C 如果按普通字节排队，就会等到前台命令结束后才
-        // 被 shell 读到。这里仅对 VINTR/VQUIT/VSUSP 做兜底信号化，普通字节
-        // 仍进入行规程 pending 队列，避免破坏 raw 模式数据流。
-        let sig = termios.signal_for_input(ch).or_else(|| {
-            if ch == 0 {
-                None
-            } else if ch == termios.vintr() {
-                Some(sched::SignalNumber::SIGINT)
-            } else if ch == termios.vquit() {
-                Some(sched::SignalNumber::SIGQUIT)
-            } else if ch == termios.vsusp() {
-                Some(sched::SignalNumber::SIGTSTP)
-            } else {
-                None
-            }
-        });
-        let Some(sig) = sig else {
-            return Ok(());
-        };
-        self.send_fg_signal(sig);
-        tty.line_state.lock().clear();
-        self.echo_signal_char(sig, termios);
-        Err(VfsError::Interrupted)
-    }
-
-    fn pump_tty_canonical_once(
-        &self,
-        tty: &TtySharedState,
-        termios: UserTermios,
-    ) -> VfsResult<bool> {
-        let mut byte = [0u8; 1];
-        let n = self.dev.read(&mut byte).map_err(map_char_err)?;
-        if n == 0 {
-            return Ok(false);
-        }
-
-        let mut ch = byte[0];
-        if termios.icrnl() && ch == b'\r' {
-            ch = b'\n';
-        }
-        if termios.ixon() && (ch == 17 || ch == 19) {
-            return Ok(true);
-        }
-        self.handle_input_signal(tty, ch, termios)?;
-
-        let mut echo_bytes: Option<Vec<u8>> = None;
-        {
-            let mut state = tty.line_state.lock();
-            if ch == termios.verase() && ch != 0 {
-                if state.line.pop().is_some() && termios.echo() {
-                    echo_bytes = Some(if termios.echoe() {
-                        Vec::from(&b"\x08 \x08"[..])
-                    } else {
-                        Vec::from(&[ch][..])
-                    });
-                }
-            } else if ch == termios.vkill() && ch != 0 {
-                let erased = state.line.len();
-                state.line.clear();
-                if erased != 0 && termios.echo() {
-                    let mut out = Vec::new();
-                    if termios.echoe() {
-                        out.reserve(erased * 3);
-                        for _ in 0..erased {
-                            out.extend_from_slice(b"\x08 \x08");
-                        }
-                    }
-                    if termios.echok() {
-                        out.push(b'\n');
-                    }
-                    if !out.is_empty() {
-                        echo_bytes = Some(out);
-                    }
-                }
-            } else if ch == termios.veof() && ch != 0 {
-                if state.line.is_empty() {
-                    state.eof_pending = true;
-                } else {
-                    while let Some(byte) = state.line.first().copied() {
-                        state.ready.push_back(byte);
-                        state.line.remove(0);
-                    }
-                }
-            } else {
-                state.line.push(ch);
-                if termios.echo() {
-                    echo_bytes = Some(Vec::from(&[ch][..]));
-                }
-                if ch == b'\n' {
-                    while let Some(byte) = state.line.first().copied() {
-                        state.ready.push_back(byte);
-                        state.line.remove(0);
-                    }
-                }
-            }
-        }
-
-        if let Some(bytes) = echo_bytes.as_deref() {
-            let _ = self.write_tty_bytes(bytes, termios);
-        }
-        Ok(true)
-    }
-
-    fn process_raw_input_bytes(
-        &self,
-        tty: &TtySharedState,
-        termios: UserTermios,
-        buf: &mut [u8],
-        force_control_signal: bool,
-    ) -> VfsResult<usize> {
-        let mut out = 0usize;
-        for idx in 0..buf.len() {
-            let mut ch = buf[idx];
-            if termios.icrnl() && ch == b'\r' {
-                ch = b'\n';
-            }
-            if termios.ixon() && (ch == 17 || ch == 19) {
-                continue;
-            }
-            if force_control_signal {
-                self.handle_async_input_signal(tty, ch, termios)?;
-            } else {
-                self.handle_input_signal(tty, ch, termios)?;
-            }
-            buf[out] = ch;
-            out += 1;
-        }
-        if out != 0 && termios.echo() {
-            let _ = self.write_tty_bytes(&buf[..out], termios);
-        }
-        Ok(out)
-    }
-
-    fn pump_tty_raw_once(&self, tty: &TtySharedState, termios: UserTermios) -> VfsResult<bool> {
-        let mut byte = [0u8; 1];
-        let n = self.dev.read(&mut byte).map_err(map_char_err)?;
-        if n == 0 {
-            return Ok(false);
-        }
-
-        let produced = self.process_raw_input_bytes(tty, termios, &mut byte, true)?;
-        if produced == 0 {
-            return Ok(true);
-        }
-        let mut state = tty.line_state.lock();
-        state
-            .ready
-            .try_reserve(produced)
-            .map_err(|_| VfsError::NoSpace)?;
-        for &byte in &byte[..produced] {
-            state.ready.push_back(byte);
-        }
-        Ok(true)
-    }
-
-    fn drain_tty_input(&self, tty: &TtySharedState, termios: UserTermios) {
-        for _ in 0..TTY_ASYNC_PUMP_LIMIT {
-            let result = if termios.canonical() {
-                self.pump_tty_canonical_once(tty, termios)
-            } else {
-                self.pump_tty_raw_once(tty, termios)
-            };
-            match result {
-                Ok(true) | Err(VfsError::Interrupted) => {}
-                Ok(false) | Err(_) => break,
-            }
+    fn map_tty_err(err: tty::TtyIoError) -> VfsError {
+        match err {
+            tty::TtyIoError::WouldBlock => VfsError::WouldBlock,
+            tty::TtyIoError::Interrupted => VfsError::Interrupted,
+            tty::TtyIoError::NoSpace => VfsError::NoSpace,
+            tty::TtyIoError::Io => VfsError::Io,
+            tty::TtyIoError::NoDevice => VfsError::NoDevice,
+            tty::TtyIoError::TimedOut => VfsError::TimedOut,
+            tty::TtyIoError::Unsupported => VfsError::NotSupported,
+            tty::TtyIoError::Busy => VfsError::DeviceBusy,
+            tty::TtyIoError::Invalid => VfsError::InvalidArgument,
         }
     }
 
     fn read_tty_canonical(
         &self,
-        tty: &TtySharedState,
+        tty: &TtyCore,
         buf: &mut [u8],
         termios: UserTermios,
     ) -> VfsResult<usize> {
-        loop {
-            if let Some(n) = self.dequeue_ready(tty, buf) {
-                return Ok(n);
-            }
-            if !self.pump_tty_canonical_once(tty, termios)? {
-                return Err(VfsError::WouldBlock);
-            }
-        }
+        tty.read_tty_canonical(buf, termios).map_err(Self::map_tty_err)
     }
 
-    fn read_tty_raw(
-        &self,
-        tty: &TtySharedState,
-        buf: &mut [u8],
-        termios: UserTermios,
-    ) -> VfsResult<usize> {
-        let want = termios.vmin().max(1) as usize;
-        let mut filled = self.dequeue_pending_bytes(tty, buf);
-        if filled >= want || filled == buf.len() {
-            return Ok(filled);
-        }
-        loop {
-            let start = filled;
-            let n = self.dev.read(&mut buf[start..]).map_err(map_char_err)?;
-            if n != 0 {
-                let produced =
-                    self.process_raw_input_bytes(tty, termios, &mut buf[start..start + n], false)?;
-                filled += produced;
-                if filled >= want || filled == buf.len() {
-                    return Ok(filled);
-                }
-            } else {
-                if filled != 0 && termios.vtime() == 0 {
-                    return Ok(filled);
-                }
-                return Err(VfsError::WouldBlock);
-            }
-        }
+    fn read_tty_raw(&self, tty: &TtyCore, buf: &mut [u8], termios: UserTermios) -> VfsResult<usize> {
+        tty.read_tty_raw(buf, termios).map_err(Self::map_tty_err)
+    }
+
+    fn write_tty_bytes(&self, tty: &TtyCore, buf: &[u8], termios: UserTermios) -> VfsResult<()> {
+        tty.write_tty_bytes(buf, termios).map_err(Self::map_tty_err)
     }
 }
 
@@ -1164,25 +751,12 @@ impl TtyIoctlContext for CharDevFileOps {
 /// 非规范模式下普通字节会进入 TTY pending 队列，由之后的 read() 取走；
 /// 控制字符则立即处理，避免 raw-mode shell 启动前台程序后 Ctrl-C 滞留。
 pub fn poll_tty_input() {
-    let mut active = Vec::new();
-    {
-        let mut states = TTY_SHARED_STATES.lock();
-        states.retain(|_, weak| {
-            let Some(tty) = weak.upgrade() else {
-                return false;
-            };
-            active.push(tty);
-            true
-        });
-    }
-
-    for tty in active {
-        if !tty.dev.is_active() {
+    for tty in tty::active_tty_cores() {
+        if !tty.is_active() {
             continue;
         }
-        let termios = *tty.termios.lock();
-        let ops = CharDevFileOps::new(tty.dev.clone(), false, Some(Arc::clone(&tty)));
-        ops.drain_tty_input(&tty, termios);
+        let termios = tty.termios();
+        tty.drain_tty_input(termios);
     }
 }
 
@@ -1197,8 +771,8 @@ impl FileOps for CharDevFileOps {
         // O_NONBLOCK 只影响没有完整输入时是否等待，不能绕过 TTY 行规程。
         // Ctrl-C/Ctrl-D 等控制字符必须先经过 ISIG/ICANON 处理，再由 syscall
         // 层把 WouldBlock 按文件状态转换成 EAGAIN 或阻塞等待。
-        self.remember_reader_pgrp(tty);
-        let termios = *tty.termios.lock();
+        self.remember_reader_pgrp();
+        let termios = tty.termios();
         if termios.canonical() {
             self.read_tty_canonical(tty, buf, termios)
         } else {
@@ -1213,8 +787,8 @@ impl FileOps for CharDevFileOps {
             self.dev.write_all(buf).map_err(map_char_err)?;
             return Ok(buf.len());
         };
-        let termios = *tty.termios.lock();
-        self.write_tty_bytes(buf, termios)?;
+        let termios = tty.termios();
+        self.write_tty_bytes(tty, buf, termios)?;
         Ok(buf.len())
     }
     fn readdir(
@@ -1232,15 +806,12 @@ impl FileOps for CharDevFileOps {
             return PollEvents::POLLERR.with(PollEvents::POLLHUP);
         }
         if let Some(tty) = self.tty.as_deref() {
-            let line_readable = {
-                let state = tty.line_state.lock();
-                state.eof_pending || !state.ready.is_empty()
-            };
+            let line_readable = tty.has_ready_input();
             // 规范模式同样要暴露底层 FIFO 的“有字节可取”状态。阻塞 read()
             // 在无完整行时会先返回 WouldBlock，再由 syscall 层按 poll() 等待；
             // 若这里只看行缓冲，UART 字节永远不会被重新拉进行规程，shell 会像
             // 串口输入失效一样卡住。
-            let dev_readable = self.dev.poll_read();
+            let dev_readable = tty.poll_read();
             let readable = line_readable || dev_readable;
             return if readable {
                 PollEvents::POLLIN.with(PollEvents::POLLOUT)
@@ -1280,7 +851,7 @@ impl FileOps for CharDevFileOps {
             return Err(Errno::ENOTTY);
         };
 
-        handle_tty_ioctl(tty, self, &self.dev, cmd, arg)
+        handle_tty_ioctl(tty, self, cmd, arg)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1296,7 +867,7 @@ impl FileOps for CharDevFileOps {
 /// 和已打开 fd 都会通过同一状态停止访问底层驱动。
 struct DevCharOps {
     dev: CharDevice,
-    tty: Option<Arc<TtySharedState>>,
+    tty: Option<Arc<TtyCore>>,
 }
 
 impl DevCharOps {
@@ -2524,7 +2095,7 @@ impl DevTmpfsSuperblockOps {
             blocks: 0,
         };
 
-        let tty = shared_tty_state(&dev);
+        let tty = tty::shared_tty_core(&dev);
         let ops = Arc::new(DevCharOps { dev, tty });
         let inode = Inode::new(
             InodeId {
