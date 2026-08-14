@@ -237,6 +237,7 @@ define build_busybox
 	$(MAKE) -C $(BUSYBOX_SRC) O=$(abspath $(BUILD_DIR)/$(1)/busybox-build) \
 		CROSS_COMPILE=$(2) CONFIG_PREFIX=$(abspath $(BUILD_DIR)/$(1)/busybox-rootfs) install
 	cp -a $(BUSYBOX_SKELETON)/. $(BUILD_DIR)/$(1)/busybox-rootfs/
+	ln -sfn bin/busybox $(BUILD_DIR)/$(1)/busybox-rootfs/init
 	chmod +x $(BUILD_DIR)/$(1)/busybox-rootfs/etc/init.d/rcS
 	mkdir -p $(BUILD_DIR)/$(1)/busybox-rootfs/dev $(BUILD_DIR)/$(1)/busybox-rootfs/proc \
 		$(BUILD_DIR)/$(1)/busybox-rootfs/sys $(BUILD_DIR)/$(1)/busybox-rootfs/tmp

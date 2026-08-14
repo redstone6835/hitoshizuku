@@ -13,6 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use errno::Errno;
 use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
@@ -37,6 +38,7 @@ use vfs::Arc as VfsArc;
 /// acpi / dtb 启动路径在控制台挂载完成后，把 VFS 根部件存这里；
 /// [`boot_init`] 再取出来装到 init 任务上。
 static BOOT_VFS_PARTS: Spinlock<Option<BootVfsParts>> = Spinlock::new(None);
+static BOOT_ROOT_IS_INITRAMFS: AtomicBool = AtomicBool::new(false);
 
 /// 控制台路径或 devtmpfs 节点名（例如 "/dev/console" 或 "uart0"）。stash 后
 /// install_stdio 用它走 openat 路径打开 fd 0/1/2。
@@ -76,6 +78,7 @@ pub fn stash_boot_vfs_parts(
     cwd_mount: VfsArc<Mount>,
     mount_ns: VfsArc<MountNamespace>,
     cred: VfsArc<Credentials>,
+    root_is_initramfs: bool,
 ) {
     let (cwd, cwd_mount, root, mount_ns, cred, umask, limits) =
         build_boot_vfs_parts(cwd, cwd_mount, mount_ns, cred);
@@ -88,6 +91,7 @@ pub fn stash_boot_vfs_parts(
         umask,
         limits,
     });
+    BOOT_ROOT_IS_INITRAMFS.store(root_is_initramfs, Ordering::Release);
 }
 
 // ── TaskExtCloneHook ─────────────────────────────────────────────────────────
@@ -980,7 +984,120 @@ pub fn boot_init() -> Arc<Task> {
     init
 }
 
-const INIT_CANDIDATES: [&str; 3] = ["/init", "/sbin/init", "/bin/init"];
+const RAMDISK_INIT: &str = "/init";
+pub(crate) const INIT_CANDIDATES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InitCommandLine<'a> {
+    pub(crate) rdinit: Option<&'a str>,
+    pub(crate) init: Option<&'a str>,
+}
+
+pub(crate) fn parse_init_command_line(cmdline: Option<&[u8]>) -> InitCommandLine<'_> {
+    let Some(cmdline) = cmdline else {
+        return InitCommandLine::default();
+    };
+    let cmdline = general::cmdline::Cmdline::new(cmdline);
+    InitCommandLine {
+        rdinit: cmdline.find("rdinit"),
+        init: cmdline.find("init"),
+    }
+}
+
+pub(crate) fn ramdisk_init_command(cmdline: Option<&[u8]>) -> &str {
+    parse_init_command_line(cmdline)
+        .rdinit
+        .unwrap_or(RAMDISK_INIT)
+}
+
+fn load_init_process(
+    init: &Arc<Task>,
+    path: &str,
+    init_args: &[String],
+    envp: &[String],
+) -> Result<(crate::user::LoadedUserImage, Vec<String>), Errno> {
+    let mut argv = Vec::with_capacity(init_args.len() + 1);
+    argv.push(String::from(path));
+    argv.extend(init_args.iter().cloned());
+    let loaded = crate::user::load_user_image_from_path(init, path, &argv, envp)?;
+    Ok((loaded, argv))
+}
+
+fn enter_init_process(
+    init: &Arc<Task>,
+    path: &str,
+    envp: &[String],
+    loaded: crate::user::LoadedUserImage,
+    argv: &[String],
+) -> ! {
+    log::info!("[sched][init] starting user init '{}'", path);
+    enter_loaded_user_image(init, loaded, argv, envp)
+}
+
+/// 提取独立 `--` 之后交给 PID 1 的参数。Linux 的 `set_init_arg()` 会把这些
+/// token 作为 argv，而不是当作内核参数或环境变量；这里按 Linux `next_arg()`
+/// 的双引号规则分词并返回拥有的字符串，避免修改固件提供的只读快照。
+pub(crate) fn init_args_after_delimiter(cmdline: Option<&[u8]>) -> Vec<String> {
+    let Some(bytes) = cmdline else {
+        return Vec::new();
+    };
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    let bytes = &bytes[..end];
+    let mut cursor = 0usize;
+    let mut after_delimiter = false;
+    let mut args = Vec::new();
+
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let start = cursor;
+        let mut quote = false;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            if byte == b'"' {
+                quote = !quote;
+            } else if byte.is_ascii_whitespace() && !quote {
+                break;
+            }
+            cursor += 1;
+        }
+        let token = &bytes[start..cursor];
+        if !after_delimiter {
+            if token == b"--" || token == b"\"--\"" {
+                after_delimiter = true;
+            }
+            continue;
+        }
+
+        args.push(decode_linux_init_arg(token));
+    }
+    args
+}
+
+fn decode_linux_init_arg(token: &[u8]) -> String {
+    let token = if token.first() == Some(&b'"') {
+        let token = &token[1..];
+        token.strip_suffix(b"\"").unwrap_or(token)
+    } else if let Some(equals) = token.iter().position(|&byte| byte == b'=')
+        && token.get(equals + 1) == Some(&b'"')
+        && token.last() == Some(&b'"')
+    {
+        let mut value = Vec::with_capacity(token.len().saturating_sub(2));
+        value.extend_from_slice(&token[..=equals]);
+        value.extend_from_slice(&token[equals + 2..token.len() - 1]);
+        return String::from_utf8_lossy(&value).into_owned();
+    } else {
+        token
+    };
+    String::from_utf8_lossy(token).into_owned()
+}
 
 /// Replace the boot init task with the first user-space init image that exists.
 ///
@@ -992,26 +1109,41 @@ pub fn start_init_process(init: &Arc<Task>) -> ! {
         String::from("HOME=/"),
         String::from("TERM=linux"),
     ];
-    let mut last_error = Errno::ENOENT;
+    let commands = parse_init_command_line(general::start_cmdline());
+    let init_args = init_args_after_delimiter(general::start_cmdline());
 
-    for path in INIT_CANDIDATES {
-        let argv = [String::from(path)];
-        match crate::user::load_user_image_from_path(init, path, &argv, &envp) {
-            Ok(loaded) => {
-                log::info!("[sched][init] starting user init '{}'", path);
-                enter_loaded_user_image(init, loaded, &argv, &envp)
-            }
-            Err(err) => {
-                last_error = err;
-                log::info!("[sched][init] cannot start '{}': {:?}", path, err);
-            }
+    if BOOT_ROOT_IS_INITRAMFS.load(Ordering::Acquire) {
+        let path = ramdisk_init_command(general::start_cmdline());
+        match load_init_process(init, path, &init_args, &envp) {
+            Ok((loaded, argv)) => enter_init_process(init, path, &envp, loaded, &argv),
+            Err(err) => log::error!(
+                "[sched][init] failed to execute ramdisk init '{}': {:?}",
+                path,
+                err
+            ),
         }
     }
 
-    panic!(
-        "[sched][init] failed to start init from {:?}: last error {:?}",
-        INIT_CANDIDATES, last_error
-    );
+    if let Some(path) = commands.init {
+        match load_init_process(init, path, &init_args, &envp) {
+            Ok((loaded, argv)) => enter_init_process(init, path, &envp, loaded, &argv),
+            Err(err) => panic!("[sched][init] requested init '{}' failed: {:?}", path, err),
+        }
+    }
+
+    for path in INIT_CANDIDATES {
+        match load_init_process(init, path, &init_args, &envp) {
+            Ok((loaded, argv)) => enter_init_process(init, path, &envp, loaded, &argv),
+            Err(Errno::ENOENT) => {}
+            Err(err) => log::error!(
+                "[sched][init] '{}' exists but could not be executed: {:?}",
+                path,
+                err
+            ),
+        }
+    }
+
+    panic!("[sched][init] no working init found; try passing init= to the kernel");
 }
 
 fn enter_loaded_user_image(
