@@ -131,6 +131,15 @@ targets = "loongarch64-unknown-none"
 after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
 
 [[modules]]
+name = "platform.ls2k-i2c"
+path = "ls2k-i2c"
+config = "CONFIG_LS2K_I2C"
+prompt = "Loongson LS2K I2C 控制器驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk"
+
+[[modules]]
 name = "platform.ls2k-spi"
 path = "ls2k-spi"
 config = "CONFIG_LS2K_SPI"

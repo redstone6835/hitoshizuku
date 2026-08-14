@@ -47,6 +47,7 @@ exclude = [
     "drivers/loopback",
     "drivers/net-stack",
     "drivers/ls2k-gmac",
+    "drivers/ls2k-i2c",
     "drivers/ls2k-spi",
     "drivers/ls2k-rtc",
     "drivers/ls2x-wdt",
