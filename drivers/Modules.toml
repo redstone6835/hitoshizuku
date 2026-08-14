@@ -122,6 +122,15 @@ default = "y"
 after = "platform.firmware-bus"
 
 [[modules]]
+name = "platform.ls2k-gmac"
+path = "ls2k-gmac"
+config = "CONFIG_LS2K_GMAC"
+prompt = "Loongson LS2K1000 GMAC 以太网驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
+
+[[modules]]
 name = "platform.ls2x-wdt"
 path = "ls2x-wdt"
 config = "CONFIG_LS2X_WDT"
