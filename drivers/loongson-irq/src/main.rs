@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod driver;
 mod eio_layout;
+mod ls2k_icu_layout;
 
 use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 use general::dev::pnp::{DriverHandle, PnpError, unregister_driver};
@@ -14,7 +15,7 @@ use allocator as _;
 pub(crate) use general::dev;
 
 struct LoongsonIrqElm {
-    drivers: [Option<DriverHandle>; 4],
+    drivers: [Option<DriverHandle>; 5],
 }
 
 fn unregister_drivers<const N: usize>(drivers: &mut [Option<DriverHandle>; N]) -> HookResult {
@@ -38,7 +39,7 @@ fn unregister_drivers<const N: usize>(drivers: &mut [Option<DriverHandle>; N]) -
 #[elm::module]
 impl ElmModule for LoongsonIrqElm {
     fn create(_context: &LifecycleContext) -> Result<Self, HookError> {
-        Ok(Self { drivers: [None; 4] })
+        Ok(Self { drivers: [None; 5] })
     }
 
     fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {

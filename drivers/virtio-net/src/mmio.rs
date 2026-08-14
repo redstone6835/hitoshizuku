@@ -36,7 +36,6 @@ const VIRTIO_NET_F_CSUM: u64 = 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
-const REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_MRG_RXBUF;
 const OPTIONAL_FEATURES: u64 = VIRTIO_NET_F_CSUM
     | VIRTIO_NET_F_MTU
     | VIRTIO_NET_F_STATUS
@@ -116,11 +115,8 @@ fn probe_queue(
         transport.add_status(VIRTIO_STATUS_FAILED);
         return Err("VirtIO-net 缺少 VERSION_1 feature");
     }
-    let accepted = if legacy {
-        required | (offered & OPTIONAL_FEATURES)
-    } else {
-        REQUIRED_FEATURES | (offered & OPTIONAL_FEATURES)
-    };
+    let version = if legacy { 0 } else { VIRTIO_F_VERSION_1 };
+    let accepted = version | required | (offered & OPTIONAL_FEATURES);
     transport.write_driver_features(accepted);
     transport.add_status(VIRTIO_STATUS_FEATURES_OK);
     if transport.read_status() & VIRTIO_STATUS_FEATURES_OK == 0 {
@@ -294,7 +290,7 @@ impl PnpDriver for VirtioMmioNetDriver {
             return Err(error);
         }
         if let Err(error) = dev.register_function(net_function("eth0", info.dma_context())) {
-            super::common::remove_active_from_pnp();
+            let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);
         }

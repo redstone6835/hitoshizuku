@@ -17,7 +17,11 @@ pub fn register() {
     crate::riscv64::heap_vm::debug_verify_heap_mapping_transactions();
     fault_decode::validate_exception_table();
     user_pgd::init_asid_allocator();
-    general::mm::register_user_vm_layout(&layout::USER_VM_LAYOUT_OPS);
+    let user_layout = match crate::riscv64::paging::active_paging_mode() {
+        crate::riscv64::paging_geometry::RiscvPagingMode::Sv39 => &layout::SV39_USER_VM_LAYOUT_OPS,
+        crate::riscv64::paging_geometry::RiscvPagingMode::Sv48 => &layout::SV48_USER_VM_LAYOUT_OPS,
+    };
+    general::mm::register_user_vm_layout(user_layout);
     general::mm::register_user_pgd(&user_pgd::USER_PGD_OPS);
     general::mm::register_user_access(&user_copy::USER_ACCESS_OPS);
     general::mm::register_fault_decode(&fault_decode::FAULT_DECODE_OPS);

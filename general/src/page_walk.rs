@@ -98,7 +98,7 @@ pub fn find_leaf<P: PagingArch>(
 ) -> Result<(usize, *mut usize, P::Pte), MapError> {
     let mut table_vaddr = root_vaddr;
 
-    for level in 0..P::LEVELS {
+    for level in 0..P::active_levels() {
         let index = P::level_index(vaddr, level);
         let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
         let pte_bits = unsafe { core::ptr::read_volatile(pte_ptr) };
@@ -382,7 +382,7 @@ pub fn walk_and_map_pages<P: PagingArch>(
     if paddrs.is_empty() {
         return MapBatchResult::complete(0);
     }
-    if target_level >= P::LEVELS || P::leaf_page_size(target_level) != Some(P::PAGE_SIZE) {
+    if target_level >= P::active_levels() || P::leaf_page_size(target_level) != Some(P::PAGE_SIZE) {
         return MapBatchResult::failed(0, MapError::UnsupportedLevel);
     }
     if !P::is_valid_leaf_perm(read, write, execute, user, global) {
@@ -510,7 +510,7 @@ pub fn replace_empty_table_with_leaf<P: PagingArch>(
     phys_to_virt: fn(usize) -> usize,
     free_page: fn(usize) -> bool,
 ) -> Result<usize, MapError> {
-    if target_level >= P::LEVELS {
+    if target_level >= P::active_levels() {
         return Err(MapError::UnsupportedLevel);
     }
     let page_size = P::leaf_page_size(target_level).ok_or(MapError::UnsupportedLevel)?;
@@ -574,7 +574,7 @@ fn page_table_subtree_is_empty<P: PagingArch>(
     level: usize,
     phys_to_virt: fn(usize) -> usize,
 ) -> bool {
-    if level >= P::LEVELS {
+    if level >= P::active_levels() {
         return false;
     }
     for index in 0..P::ENTRIES_PER_TABLE {
@@ -584,7 +584,7 @@ fn page_table_subtree_is_empty<P: PagingArch>(
             continue;
         }
         if P::pte_is_leaf(pte)
-            || level + 1 >= P::LEVELS
+            || level + 1 >= P::active_levels()
             || !page_table_subtree_is_empty::<P>(
                 phys_to_virt(P::pte_addr(pte)),
                 level + 1,
@@ -605,7 +605,7 @@ fn reclaim_empty_page_table_subtree<P: PagingArch>(
 ) -> usize {
     let table_vaddr = phys_to_virt(table_paddr);
     let mut failures = 0usize;
-    if level + 1 < P::LEVELS {
+    if level + 1 < P::active_levels() {
         for index in 0..P::ENTRIES_PER_TABLE {
             let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
             let pte = read_page_table_entry::<P>(pte_ptr);
@@ -632,4 +632,119 @@ fn table_entry_ptr<P: PagingArch>(table_vaddr: usize, vaddr: usize, level: usize
 
 fn read_page_table_entry<P: PagingArch>(pte_ptr: *mut usize) -> P::Pte {
     P::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MapError, find_leaf};
+    use crate::{PagingArch, PhysPageTableRoot, VirtAddr};
+
+    struct ThreeLevelPaging;
+
+    impl PagingArch for ThreeLevelPaging {
+        type Pte = usize;
+        type Flags = usize;
+
+        const PAGE_SIZE: usize = 4096;
+        const LEVELS: usize = 4;
+        const ENTRIES_PER_TABLE: usize = 512;
+
+        fn active_levels() -> usize {
+            3
+        }
+        fn is_canonical_vaddr(_: usize) -> bool {
+            true
+        }
+        fn level_index(_: usize, _: usize) -> usize {
+            0
+        }
+        fn invalid_pte() -> usize {
+            0
+        }
+        fn pte_is_valid(pte: usize) -> bool {
+            pte & 1 != 0
+        }
+        fn pte_is_leaf(pte: usize) -> bool {
+            pte & 2 != 0
+        }
+        fn pte_addr(pte: usize) -> usize {
+            pte & !7
+        }
+        fn pte_flags(pte: usize) -> usize {
+            pte & 7
+        }
+        fn flags_readable(_: usize) -> bool {
+            false
+        }
+        fn flags_writable(_: usize) -> bool {
+            false
+        }
+        fn flags_executable(_: usize) -> bool {
+            false
+        }
+        fn flags_user_accessible(_: usize) -> bool {
+            false
+        }
+        fn flags_global(_: usize) -> bool {
+            false
+        }
+        fn make_table_pte(next_table: usize) -> usize {
+            next_table | 1
+        }
+        fn is_valid_leaf_perm(_: bool, _: bool, _: bool, _: bool, _: bool) -> bool {
+            true
+        }
+        fn supported_leaf_levels() -> &'static [usize] {
+            &[0, 1, 2]
+        }
+        fn leaf_page_size(level: usize) -> Option<usize> {
+            [1usize << 30, 1usize << 21, 1usize << 12]
+                .get(level)
+                .copied()
+        }
+        fn make_leaf_pte(paddr: usize, _: bool, _: bool, _: bool, _: bool, _: bool) -> usize {
+            paddr | 3
+        }
+        fn make_leaf_pte_for_level(
+            level: usize,
+            paddr: usize,
+            _: bool,
+            _: bool,
+            _: bool,
+            _: bool,
+            _: bool,
+        ) -> Option<usize> {
+            Self::leaf_page_size(level).map(|_| paddr | 3)
+        }
+        fn pte_to_usize(pte: usize) -> usize {
+            pte
+        }
+        fn pte_from_usize(bits: usize) -> usize {
+            bits
+        }
+        unsafe fn activate(_: PhysPageTableRoot) {}
+        unsafe fn flush_tlb(_: Option<VirtAddr>) {}
+    }
+
+    fn identity(value: usize) -> usize {
+        value
+    }
+
+    #[test]
+    fn find_leaf_stops_at_the_runtime_depth() {
+        let mut root = [0usize; 512];
+        let mut level_one = [0usize; 512];
+        let mut level_two = [0usize; 512];
+        let mut forbidden_fourth_level = [0usize; 512];
+
+        root[0] = level_one.as_mut_ptr() as usize | 1;
+        level_one[0] = level_two.as_mut_ptr() as usize | 1;
+        level_two[0] = forbidden_fourth_level.as_mut_ptr() as usize | 1;
+        forbidden_fourth_level[0] = 3;
+
+        assert_eq!(
+            find_leaf::<ThreeLevelPaging>(root.as_mut_ptr() as usize, 0, identity),
+            Err(MapError::NotMapped)
+        );
+    }
 }

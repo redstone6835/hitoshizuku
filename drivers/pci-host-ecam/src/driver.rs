@@ -11,6 +11,7 @@ use crate::dev::pnp::{
 const COMPAT_PCI_ECAM: &str = "pci-host-ecam-generic";
 const COMPAT_PCIE_ECAM: &str = "pcie-host-ecam-generic";
 const COMPAT_PCI_CAM: &str = "pci-host-cam-generic";
+const COMPAT_LS2K1000_PCI: &str = "loongson,ls2k1000-pci";
 
 struct GenericPciHostDriver {
     device_mmio_to_virt: fn(usize) -> usize,
@@ -24,7 +25,10 @@ impl GenericPciHostDriver {
     }
 
     fn matches_platform(info: &PlatformDeviceInfo) -> bool {
-        info.has_id(COMPAT_PCI_ECAM) || info.has_id(COMPAT_PCIE_ECAM) || info.has_id(COMPAT_PCI_CAM)
+        info.has_id(COMPAT_PCI_ECAM)
+            || info.has_id(COMPAT_PCIE_ECAM)
+            || info.has_id(COMPAT_PCI_CAM)
+            || info.has_id(COMPAT_LS2K1000_PCI)
     }
 }
 

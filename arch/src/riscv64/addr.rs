@@ -1,21 +1,18 @@
 //! RISC-V64 虚拟/物理地址转换与空间常量。
 //!
-//! Sv48 采用线性偏移直映：`VA = PA + KERNEL_VA_OFFSET`。与 LoongArch 的 DMW
+//! Sv39/Sv48 共用线性偏移直映：`VA = PA + KERNEL_VA_OFFSET`。与 LoongArch 的 DMW
 //! 硬件窗口不同，RISC-V 的直映是通过页表实现的（boot 阶段建立 1GiB leaf 映射），
 //! 但对软件而言转换公式完全相同——加减固定偏移即可。
 //!
-//! 地址空间布局（Sv48，高半区）：
+//! 地址空间布局（Sv39/Sv48 共同高半区）：
 //! ```text
-//! 0xFFFF_FF80_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF  — 内核直映（512 GiB）
-//!   PGD[511] → 内核 code + heap
-//!   PGD[510] → MMIO 直映
+//! 0xFFFF_FFC0_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF  — 共同规范窗口（256 GiB）
 //! ```
 
 /// 内核直接映射偏移：`VA = PA + KERNEL_VA_OFFSET`。
 ///
-/// Sv48 高半区起始地址（0xFFFF_FF80_0000_0000），对应 PGD[511] 覆盖的 512 GiB 范围。
-/// 这是 RISC-V Sv48 页表模式的标准常量，由架构规范定义。
-pub const KERNEL_VA_OFFSET: usize = 0xFFFF_FF80_0000_0000;
+/// Sv39 高半区起始地址；该地址同时满足 Sv48 的规范地址要求。
+pub const KERNEL_VA_OFFSET: usize = 0xFFFF_FFC0_0000_0000;
 
 /// 物理地址 → 内核虚拟地址（线性偏移直映）。
 ///

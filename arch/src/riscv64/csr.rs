@@ -118,8 +118,12 @@ pub const EXC_STORE_PAGE_FAULT: usize = 15;
 
 // ── satp ──────────────────────────────────────────────────────────────────────
 
+/// Sv39 模式：satp.MODE = 8（三级页表，39 位虚拟地址）。
+pub const SATP_MODE_SV39: usize = 8 << 60;
 /// Sv48 模式：satp.MODE = 9（四级页表，48 位虚拟地址）。
 pub const SATP_MODE_SV48: usize = 9 << 60;
+/// RV64 satp.MODE 字段掩码。
+pub const SATP_MODE_MASK: usize = 0xf << 60;
 
 // ── stvec ─────────────────────────────────────────────────────────────────────
 

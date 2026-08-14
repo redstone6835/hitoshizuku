@@ -193,14 +193,7 @@ impl ElmTaskExecutionState {
         let depth = stack.depth;
         stack.entries[depth] = context;
         stack.depth = depth + 1;
-        if let Some(context) = context {
-            self.context_cell
-                .store(context.cell_id.0, Ordering::Relaxed);
-            self.context_present.store(true, Ordering::Release);
-        } else {
-            self.context_cell.store(0, Ordering::Relaxed);
-            self.context_present.store(false, Ordering::Release);
-        }
+        self.publish_context_cell(context);
         Some((depth + 1) as u64)
     }
 
@@ -226,13 +219,17 @@ impl ElmTaskExecutionState {
         }
         stack.entries[expected_depth - 1] = None;
         stack.depth -= 1;
-        if let Some(previous) = stack
+        let previous = stack
             .depth
             .checked_sub(1)
-            .and_then(|index| stack.entries[index])
-        {
+            .and_then(|index| stack.entries[index]);
+        self.publish_context_cell(previous);
+    }
+
+    fn publish_context_cell(&self, context: Option<ElmCurrentContext>) {
+        if let Some(context) = context {
             self.context_cell
-                .store(previous.cell_id.0, Ordering::Relaxed);
+                .store(context.cell_id.0, Ordering::Relaxed);
             self.context_present.store(true, Ordering::Release);
         } else {
             self.context_cell.store(0, Ordering::Relaxed);
@@ -1019,7 +1016,6 @@ const fn fault_slot(cpu_id: usize, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elm_model::{ElmCurrentContext, ElmId, ElmKind, ElmLifecyclePhase, ElmState, Generation};
 
     struct ContextStackGuard<'a> {
         state: &'a ElmTaskExecutionState,
@@ -1042,19 +1038,6 @@ mod tests {
             kind: elm_model::ElmKind::Driver,
             flags: 0,
             allowed_actions: u32::MAX,
-        }
-    }
-
-    fn context(cell: u64) -> ElmCurrentContext {
-        ElmCurrentContext {
-            cell_id: ElmId(cell),
-            parent_id: None,
-            generation: Generation::FIRST,
-            state: ElmState::Active,
-            phase: ElmLifecyclePhase::Resume,
-            kind: ElmKind::Other,
-            flags: 0,
-            allowed_actions: 0,
         }
     }
 
@@ -1096,9 +1079,13 @@ mod tests {
         let state = ElmTaskExecutionState::new();
 
         assert_eq!(state.current_context_cell(), None);
-        let outer = state.push_context(context(11)).expect("外层上下文应可入栈");
+        let outer = state
+            .push_context(test_context(11, 1))
+            .expect("外层上下文应可入栈");
         assert_eq!(state.current_context_cell(), Some(11));
-        let inner = state.push_context(context(22)).expect("内层上下文应可入栈");
+        let inner = state
+            .push_context(test_context(22, 1))
+            .expect("内层上下文应可入栈");
         assert_eq!(state.current_context_cell(), Some(22));
 
         state.pop_context(inner);

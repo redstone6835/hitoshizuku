@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod bar;
 mod driver;
+mod ls2k_config;
 mod routing;
 mod runtime;
 mod topology;

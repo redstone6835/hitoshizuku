@@ -258,6 +258,7 @@ const COMPAT_NS16550A: &[u8] = b"ns16550a";
 const COMPAT_PCI_ECAM: &[u8] = b"pci-host-ecam-generic";
 const COMPAT_PCIE_ECAM: &[u8] = b"pcie-host-ecam-generic";
 const COMPAT_PCI_CAM: &[u8] = b"pci-host-cam-generic";
+const COMPAT_PCI_LS2K1000: &[u8] = b"loongson,ls2k1000-pci";
 const COMPAT_SIMPLE_BUS: &[u8] = b"simple-bus";
 const COMPAT_SIMPLE_MFD: &[u8] = b"simple-mfd";
 const COMPAT_SIMPLE_PM_BUS: &[u8] = b"simple-pm-bus";
@@ -709,6 +710,8 @@ pub enum DtbPciConfigSpace {
     Cam,
     /// PCIe ECAM：每条 bus 占 1 MiB，每个 function 暴露 4 KiB。
     Ecam,
+    /// LS2K1000 CFG1：Type 1、bus/devfn 与扩展寄存器高位采用厂商编码。
+    Ls2k1000,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2177,6 +2180,7 @@ impl<'a> DtbTree<'a> {
         host: NodeId,
         bus_start: u8,
         bus_end: u8,
+        config_space: DtbPciConfigSpace,
     ) -> Result<Vec<DtbPciChildInfo>, DtbFirmwareError> {
         let mut result = Vec::new();
         let mut pending = self.children(host).to_vec();
@@ -2204,7 +2208,15 @@ impl<'a> DtbTree<'a> {
             let [phys_hi, _, _] = address.cells() else {
                 continue;
             };
-            let bus = ((phys_hi >> 16) & 0xff) as u8;
+            let encoded_bus = ((phys_hi >> 16) & 0xff) as u8;
+            let bus = if config_space == DtbPciConfigSpace::Ls2k1000
+                && encoded_bus == 0
+                && self.tree.parent(node_id) == Some(host)
+            {
+                bus_start
+            } else {
+                encoded_bus
+            };
             let device = ((phys_hi >> 11) & 0x1f) as u8;
             let function = ((phys_hi >> 8) & 0x7) as u8;
             if bus < bus_start || bus > bus_end {
@@ -2246,6 +2258,8 @@ impl<'a> DtbTree<'a> {
                     || value.as_bytes() == COMPAT_PCIE_ECAM
                 {
                     Some(DtbPciConfigSpace::Ecam)
+                } else if value.as_bytes() == COMPAT_PCI_LS2K1000 {
+                    Some(DtbPciConfigSpace::Ls2k1000)
                 } else {
                     None
                 }
@@ -2255,13 +2269,20 @@ impl<'a> DtbTree<'a> {
 
             let (ecam_phys, ecam_size) = self.pci_config_range(node_id)?;
             let (bus_start, bus_end) = self.pci_bus_range(node_id)?;
-            let bytes_per_bus = match config_space {
-                DtbPciConfigSpace::Cam => 1 << 16,
-                DtbPciConfigSpace::Ecam => 1 << 20,
+            let required_ecam = match config_space {
+                DtbPciConfigSpace::Cam | DtbPciConfigSpace::Ecam => {
+                    let bytes_per_bus = match config_space {
+                        DtbPciConfigSpace::Cam => 1 << 16,
+                        DtbPciConfigSpace::Ecam => 1 << 20,
+                        DtbPciConfigSpace::Ls2k1000 => unreachable!(),
+                    };
+                    (usize::from(bus_end) - usize::from(bus_start) + 1)
+                        .checked_mul(bytes_per_bus)
+                        .ok_or_else(|| pci_overflow(node_id, "reg", 0))?
+                }
+                // 最高扩展寄存器 nibble 和 Type 1 位共同占用 512 MiB CFG1 窗口。
+                DtbPciConfigSpace::Ls2k1000 => 0x2000_0000,
             };
-            let required_ecam = (usize::from(bus_end) - usize::from(bus_start) + 1)
-                .checked_mul(bytes_per_bus)
-                .ok_or_else(|| pci_overflow(node_id, "reg", 0))?;
             if ecam_size < required_ecam {
                 return Err(DtbFirmwareError::InvalidPci(fdt::PciError::InvalidValue {
                     node: node_id,
@@ -2445,7 +2466,7 @@ impl<'a> DtbTree<'a> {
                 .collect();
             let effective_dma =
                 self.effective_dma_info(node_id, Some(node_id), &iommus, DmaChildAddressKind::Pci)?;
-            let children = self.pci_children(node_id, bus_start, bus_end)?;
+            let children = self.pci_children(node_id, bus_start, bus_end, config_space)?;
             hosts.push(DtbPcieHostInfo {
                 name: self.node_name_or_path(node_id),
                 path: host_path,
@@ -4506,6 +4527,92 @@ mod tests {
         assert_eq!(host.bus_start, 0);
         assert_eq!(host.bus_end, 1);
         assert_eq!(host.ecam_size, 0x0002_0000);
+    }
+
+    #[test]
+    fn ls2k1000_pci_host_preserves_cfg1_window_root_bridges_and_disabled_msi() {
+        let mut builder = DtbBuilder::new();
+        builder.begin_node("");
+        builder.property("#address-cells", &cells(&[2]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.begin_node("interrupt-controller");
+        builder.property("phandle", &cells(&[6]));
+        builder.property("interrupt-controller", &[]);
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.end_node();
+        builder.begin_node("pcie-msi-controller@1fe014a0");
+        builder.property("compatible", b"loongson,2k1000-pci-msi\0");
+        builder.property("msi-controller", &[]);
+        builder.property("reg", &cells(&[0, 0x1fe0_14a0, 0, 0x60]));
+        builder.property("status", b"disabled\0");
+        builder.end_node();
+        builder.begin_node("pcie@0");
+        builder.property("compatible", b"loongson,ls2k1000-pci\0");
+        builder.property("#address-cells", &cells(&[3]));
+        builder.property("#size-cells", &cells(&[2]));
+        builder.property("#interrupt-cells", &cells(&[1]));
+        builder.property("bus-range", &cells(&[1, 0x16]));
+        builder.property("reg", &cells(&[0xfe, 0, 0, 0x2000_0000]));
+        builder.property(
+            "ranges",
+            &cells(&[
+                0x0200_0000,
+                0,
+                0x6000_0000,
+                0,
+                0x6000_0000,
+                0,
+                0x2000_0000,
+                0x0100_0000,
+                0,
+                0x8000,
+                0,
+                0x1800_8000,
+                0,
+                0x8000,
+            ]),
+        );
+        for (device, irq) in (9u32..=14).zip(0x20u32..=0x25) {
+            let name = alloc::format!("pci_bridge@{device},0");
+            builder.begin_node(&name);
+            builder.property("compatible", b"pciclass060400\0pciclass0604\0");
+            builder.property("reg", &cells(&[device << 11, 0, 0, 0, 0]));
+            builder.property("interrupt-parent", &cells(&[6]));
+            builder.property("interrupts", &cells(&[irq]));
+            builder.end_node();
+        }
+        builder.end_node();
+        builder.end_node();
+
+        let firmware = parse_test_firmware_from(builder);
+        assert_eq!(firmware.pcie_hosts.len(), 1);
+        let host = &firmware.pcie_hosts[0];
+        assert_eq!(host.config_space, DtbPciConfigSpace::Ls2k1000);
+        assert_eq!((host.bus_start, host.bus_end), (1, 0x16));
+        assert_eq!(
+            (host.ecam_phys, host.ecam_size),
+            (0xfe00_0000_00, 0x2000_0000)
+        );
+        assert_eq!(host.ranges.len(), 2);
+        assert_eq!(host.children.len(), 6);
+        for (index, child) in host.children.iter().enumerate() {
+            assert_eq!(
+                (child.bus, child.device, child.function),
+                (1, 9 + index as u8, 0)
+            );
+            assert_eq!(child.interrupts.len(), 1);
+            assert_eq!(child.interrupts[0].parent, Some(6));
+            assert_eq!(
+                child.interrupts[0].specifier.as_ref(),
+                &[0x20 + index as u32]
+            );
+        }
+        assert!(
+            firmware
+                .platform_devices
+                .iter()
+                .all(|device| device.path.as_ref() != "/pcie-msi-controller@1fe014a0")
+        );
     }
 
     #[test]

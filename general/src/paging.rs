@@ -14,6 +14,13 @@ pub trait PagingArch {
     const LEVELS: usize;
     const ENTRIES_PER_TABLE: usize;
 
+    /// 返回当前硬件页表实际使用的层数。
+    ///
+    /// 固定分页架构沿用编译期层数；支持启动期选择模式的架构可以覆盖此值。
+    fn active_levels() -> usize {
+        Self::LEVELS
+    }
+
     fn is_canonical_vaddr(vaddr: usize) -> bool;
     fn level_index(vaddr: usize, level: usize) -> usize;
 
@@ -75,4 +82,120 @@ pub trait PagingArch {
     ///
     /// .
     unsafe fn flush_tlb(vaddr: Option<VirtAddr>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PagingArch;
+    use crate::{PhysPageTableRoot, VirtAddr};
+
+    struct FixedDepth;
+    struct RuntimeDepth;
+
+    macro_rules! impl_test_paging {
+        ($paging:ty, $active_levels:expr) => {
+            impl PagingArch for $paging {
+                type Pte = usize;
+                type Flags = usize;
+
+                const PAGE_SIZE: usize = 4096;
+                const LEVELS: usize = 4;
+                const ENTRIES_PER_TABLE: usize = 512;
+
+                fn active_levels() -> usize {
+                    $active_levels
+                }
+
+                fn is_canonical_vaddr(_: usize) -> bool {
+                    true
+                }
+                fn level_index(_: usize, _: usize) -> usize {
+                    0
+                }
+                fn invalid_pte() -> usize {
+                    0
+                }
+                fn pte_is_valid(pte: usize) -> bool {
+                    pte != 0
+                }
+                fn pte_is_leaf(_: usize) -> bool {
+                    false
+                }
+                fn pte_addr(_: usize) -> usize {
+                    0
+                }
+                fn pte_flags(_: usize) -> usize {
+                    0
+                }
+                fn flags_readable(_: usize) -> bool {
+                    false
+                }
+                fn flags_writable(_: usize) -> bool {
+                    false
+                }
+                fn flags_executable(_: usize) -> bool {
+                    false
+                }
+                fn flags_user_accessible(_: usize) -> bool {
+                    false
+                }
+                fn flags_global(_: usize) -> bool {
+                    false
+                }
+                fn make_table_pte(_: usize) -> usize {
+                    0
+                }
+                fn is_valid_leaf_perm(_: bool, _: bool, _: bool, _: bool, _: bool) -> bool {
+                    true
+                }
+                fn supported_leaf_levels() -> &'static [usize] {
+                    &[]
+                }
+                fn leaf_page_size(_: usize) -> Option<usize> {
+                    None
+                }
+                fn make_leaf_pte(_: usize, _: bool, _: bool, _: bool, _: bool, _: bool) -> usize {
+                    0
+                }
+                fn make_leaf_pte_for_level(
+                    _: usize,
+                    _: usize,
+                    _: bool,
+                    _: bool,
+                    _: bool,
+                    _: bool,
+                    _: bool,
+                ) -> Option<usize> {
+                    None
+                }
+                fn pte_to_usize(pte: usize) -> usize {
+                    pte
+                }
+                fn pte_from_usize(bits: usize) -> usize {
+                    bits
+                }
+                unsafe fn activate(_: PhysPageTableRoot) {}
+                unsafe fn flush_tlb(_: Option<VirtAddr>) {}
+            }
+        };
+    }
+
+    impl_test_paging!(FixedDepth, 4);
+    impl_test_paging!(RuntimeDepth, 3);
+
+    impl RuntimeDepth {
+        fn reported_depth() -> usize {
+            <Self as PagingArch>::active_levels()
+        }
+    }
+
+    #[test]
+    fn fixed_architecture_defaults_to_maximum_depth() {
+        assert_eq!(<FixedDepth as PagingArch>::active_levels(), 4);
+    }
+
+    #[test]
+    fn architecture_can_report_a_smaller_active_depth() {
+        assert_eq!(RuntimeDepth::reported_depth(), 3);
+    }
 }

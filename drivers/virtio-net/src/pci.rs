@@ -712,7 +712,7 @@ impl PnpDriver for VirtioPciNetDriver {
                 ));
             }
             if let Err(error) = dev.register_function(net_function("eth0", pci.dma_context())) {
-                super::common::remove_active_from_pnp();
+                let _ = super::common::remove_active_from_pnp();
                 super::common::destroy_active();
                 return Err(error);
             }
@@ -752,7 +752,7 @@ impl PnpDriver for VirtioPciNetDriver {
             ));
         }
         if let Err(error) = dev.register_function(net_function("eth0", pci.dma_context())) {
-            super::common::remove_active_from_pnp();
+            let _ = super::common::remove_active_from_pnp();
             super::common::destroy_active();
             return Err(error);
         }

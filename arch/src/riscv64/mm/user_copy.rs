@@ -8,8 +8,10 @@
 use general::mm::UserAccessOps;
 use mm::UserAccessError;
 
-/// Sv48 用户空间上界（不含）。
-const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
+#[inline]
+fn user_space_top() -> usize {
+    crate::riscv64::paging::active_paging_mode().user_space_top()
+}
 
 /// SSTATUS.SUM 位（bit 18）。
 const SSTATUS_SUM: usize = 1 << 18;
@@ -388,7 +390,7 @@ unsafe fn sum_copy_to_user(
 unsafe fn copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<(), UserAccessError> {
     if src_user
         .checked_add(len)
-        .map_or(true, |end| end > USER_SPACE_TOP)
+        .map_or(true, |end| end > user_space_top())
     {
         return Err(UserAccessError::Fault);
     }
@@ -413,7 +415,7 @@ pub(crate) fn copy_instruction_from_user(
 unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<(), UserAccessError> {
     if dst_user
         .checked_add(len)
-        .map_or(true, |end| end > USER_SPACE_TOP)
+        .map_or(true, |end| end > user_space_top())
     {
         return Err(UserAccessError::Fault);
     }
@@ -421,10 +423,11 @@ unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<()
 }
 
 unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAccessError> {
-    if start_user >= USER_SPACE_TOP {
+    let user_space_top = user_space_top();
+    if start_user >= user_space_top {
         return Err(UserAccessError::Fault);
     }
-    let effective_max = max.min(USER_SPACE_TOP - start_user);
+    let effective_max = max.min(user_space_top - start_user);
     let mut i = 0usize;
     let old_sstatus = unsafe { enable_sum_and_save() };
 

@@ -343,7 +343,7 @@ pub static HAS_ZICBOP: AtomicBool = AtomicBool::new(false);
 ///
 /// 只有 [`HAS_ZICBOZ`] 发布为 `true` 后该值才可消费；loader 会在
 /// 发布前校验 DT 中所有 hart 的块大小一致且可安全用于页清零。
-pub static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(64);
+pub static CBO_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// `cbo.clean/flush/inval` 的 cache block 大小（字节）。
 pub static CBOM_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -351,7 +351,7 @@ pub static CBOM_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// `prefetch.*` 的 cache block 大小（字节）。
 pub static CBOP_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-/// 高效清零一页内存。
+/// 使用 Zicboz 连续清零 16 个 cache block，并返回下一块地址。
 ///
 /// Linux `clear_page` 采用同样的 16 块展开，避免每个 cache block 都执行一次
 /// 地址计算和循环分支。

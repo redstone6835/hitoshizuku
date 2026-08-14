@@ -1,0 +1,11 @@
+[elm]
+name = "platform.loongson-clk"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.loongson-clk"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"
