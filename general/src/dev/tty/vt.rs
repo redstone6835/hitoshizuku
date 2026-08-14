@@ -550,6 +550,7 @@ fn vt_wait_recheck() {
 
 fn map_char_err(e: CharIoError) -> TtyIoError {
     match e {
+        CharIoError::NoSpace => TtyIoError::NoSpace,
         CharIoError::HardwareError => TtyIoError::Io,
         CharIoError::Unavailable => TtyIoError::NoDevice,
         CharIoError::Interrupted => TtyIoError::Interrupted,
@@ -559,6 +560,7 @@ fn map_char_err(e: CharIoError) -> TtyIoError {
 
 fn map_tty_err(e: TtyIoError) -> CharIoError {
     match e {
+        TtyIoError::NoSpace => CharIoError::NoSpace,
         TtyIoError::WouldBlock | TtyIoError::TimedOut => CharIoError::Timeout,
         TtyIoError::Interrupted => CharIoError::Interrupted,
         TtyIoError::NoDevice => CharIoError::Unavailable,

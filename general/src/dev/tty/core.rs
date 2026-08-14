@@ -158,6 +158,8 @@ impl TtyLineState {
 /// 属于终端本身,必须在这些节点和所有 open fd 之间共享。每个 fd 只保留
 /// 自己的状态标志。
 pub struct TtyCore {
+    /// 终端名(共享键,如 `uart0`/`tty1`/`pts/0`);诊断与泵路由用。
+    name: String,
     driver: Arc<dyn TerminalDriver>,
     termios: Spinlock<UserTermios>,
     winsize: Spinlock<UserWinSize>,
@@ -171,7 +173,13 @@ const TTY_ASYNC_PUMP_LIMIT: usize = 256;
 
 impl TtyCore {
     pub fn new(driver: Arc<dyn TerminalDriver>) -> Self {
+        Self::named(String::new(), driver)
+    }
+
+    /// 以指定名字构造(共享注册表按名字键控)。
+    pub fn named(name: String, driver: Arc<dyn TerminalDriver>) -> Self {
         Self {
+            name,
             driver,
             termios: Spinlock::new(UserTermios::new_default()),
             winsize: Spinlock::new(UserWinSize::default_console()),
@@ -183,6 +191,11 @@ impl TtyCore {
 
     pub fn driver(&self) -> &dyn TerminalDriver {
         self.driver.as_ref()
+    }
+
+    /// 终端名(与共享注册表键一致)。
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn is_active(&self) -> bool {
@@ -696,6 +709,7 @@ impl TerminalDriver for CharDeviceTerminalDriver {
 
 fn map_char_err(e: CharIoError) -> TtyIoError {
     match e {
+        CharIoError::NoSpace => TtyIoError::NoSpace,
         CharIoError::HardwareError => TtyIoError::Io,
         CharIoError::Unavailable => TtyIoError::NoDevice,
         CharIoError::Interrupted => TtyIoError::Interrupted,
@@ -731,7 +745,7 @@ pub fn shared_tty_core(dev: &CharDevice) -> Option<Arc<TtyCore>> {
     }
 
     let driver: Arc<dyn TerminalDriver> = Arc::new(CharDeviceTerminalDriver::new(dev.clone()));
-    let core = Arc::new(TtyCore::new(driver));
+    let core = Arc::new(TtyCore::named(alloc::string::String::from(dev.fw_name()), driver));
     if let Some(key) = fallible_string(dev.fw_name()) {
         cores.insert(key, Arc::downgrade(&core));
     }

@@ -13,6 +13,8 @@ pub use super::control::{CharControlRequest, CharControlResponse, ControlError, 
 /// 字符设备 I/O 错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharIoError {
+    /// 无剩余空间(如 /dev/full 的写)。
+    NoSpace,
     /// 硬件级错误（帧、奇偶校验、溢出等）。
     HardwareError,
     /// 设备不可用或已断开。
@@ -234,6 +236,7 @@ where
 
 fn map_char_control_error(err: CharIoError) -> ControlError {
     match err {
+        CharIoError::NoSpace => ControlError::Invalid,
         CharIoError::HardwareError => ControlError::Io,
         CharIoError::Unavailable => ControlError::NoDevice,
         CharIoError::Interrupted => ControlError::Busy,

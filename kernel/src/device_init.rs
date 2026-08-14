@@ -56,6 +56,8 @@ static DEFERRED_BOOT_CONSOLE: Spinlock<Option<DeferredBootConsole>> = Spinlock::
 
 static PTMX_DEVNODE_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+static EXTRA_STATIC_NODES_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 static CONSOLE_LOG_SINK: LogSink = LogSink {
     write_record: write_log_record_to_console,
 };
@@ -320,6 +322,12 @@ fn replay_buffered_logs_to_console() {
 /// 这里按名字做幂等检查，避免未来固件路径或测试代码重复进入设备初始化时把同名
 /// driver 重复塞进全局 registry。块文件系统的注册函数内部负责自己的适配器集合。
 pub fn register_core_filesystems(tag: &str) {
+    if let Err(err) = general::vfs::device_files::base::register_standard_node_policies() {
+        panic!(
+            "[kernel-start][{}] failed to register standard node policies: {:?}",
+            tag, err
+        );
+    }
     if FS_REGISTRY.find("tmpfs").is_none() {
         FS_REGISTRY
             .register(Box::leak(Box::new(general::vfs::TmpfsDriver)))
@@ -429,6 +437,7 @@ pub fn register_core_filesystems(tag: &str) {
 /// 创建并发布 devtmpfs 单例 superblock。
 pub fn mount_devtmpfs(tag: &str) -> Arc<Superblock> {
     register_pty_devnode_if_needed(tag);
+    register_extra_static_nodes_if_needed(tag);
     FS_REGISTRY
         .find("devtmpfs")
         .unwrap_or_else(|| panic!("[kernel-start][{}] devtmpfs driver not found", tag))
@@ -558,6 +567,20 @@ fn mount_devpts_on_pts(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
         Err(err) => panic!(
             "[kernel-start][{}] failed to mount devpts at /dev/pts: {:?}",
             tag, err
+        ),
+    }
+}
+
+fn register_extra_static_nodes_if_needed(tag: &str) {
+    if EXTRA_STATIC_NODES_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match general::vfs::device_files::base::register_extra_static_nodes() {
+        Ok(_) => printk!("[kernel-start][{}] registered /dev/full /dev/kmsg", tag),
+        Err(err) => printk!(
+            "[kernel-start][{}] failed to register full/kmsg nodes: {:?}",
+            tag,
+            err
         ),
     }
 }

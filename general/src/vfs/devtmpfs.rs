@@ -377,7 +377,7 @@ impl DevTmpfsNodePolicy {
         Self {
             dir_mode: FileMode::new(0o755),
             symlink_mode: FileMode::new(0o777),
-            device_mode: FileMode::new(0o660),
+            device_mode: FileMode::new(0o600),
             regular_mode: FileMode::new(0o644),
             uid: Uid::ROOT,
             gid: Gid::ROOT,
@@ -408,6 +408,46 @@ impl DevTmpfsNodePolicy {
 }
 
 const DEVTMPFS_STANDARD_POLICY: DevTmpfsNodePolicy = DevTmpfsNodePolicy::standard();
+
+/// 按节点名注册的设备节点权限(与 Linux devtmpfs 的 devnode 回调对应)。
+///
+/// 设备身份与权限策略分离:驱动声明功能,投影层按名查策略;未注册的
+/// 节点使用默认 0600 root:root(Linux devtmpfs 默认)。
+#[derive(Clone, Copy, Debug)]
+pub struct DevNodePolicy {
+    pub mode: FileMode,
+    pub uid: Uid,
+    pub gid: Gid,
+}
+
+impl DevNodePolicy {
+    pub const fn new(mode: u16) -> Self {
+        Self {
+            mode: FileMode::new(mode),
+            uid: Uid::ROOT,
+            gid: Gid::ROOT,
+        }
+    }
+}
+
+static NODE_POLICIES: Spinlock<BTreeMap<String, DevNodePolicy>> = Spinlock::new(BTreeMap::new());
+
+/// 注册节点权限策略(幂等;同名覆盖)。
+pub fn register_node_policy(name: &str, policy: DevNodePolicy) -> VfsResult<()> {
+    let mut out = String::new();
+    out.try_reserve(name.len()).map_err(|_| VfsError::NoSpace)?;
+    out.push_str(name);
+    NODE_POLICIES.lock().insert(out, policy);
+    Ok(())
+}
+
+fn node_policy(name: &str) -> DevNodePolicy {
+    NODE_POLICIES
+        .lock()
+        .get(name)
+        .copied()
+        .unwrap_or(DevNodePolicy::new(0o600))
+}
 
 fn devtmpfs_fallible_string(value: &str) -> VfsResult<String> {
     let mut out = String::new();
@@ -640,6 +680,7 @@ fn remember_bound_projection_nodes(func: &dyn DeviceFunction, nodes: &DevNodeSet
 
 fn map_char_err(e: CharIoError) -> VfsError {
     match e {
+        CharIoError::NoSpace => VfsError::NoSpace,
         CharIoError::HardwareError => VfsError::Io,
         CharIoError::Unavailable => VfsError::NoDevice,
         CharIoError::Interrupted => VfsError::Interrupted,
@@ -754,11 +795,28 @@ impl TtyIoctlContext for CharDevFileOps {
 /// 控制字符则立即处理，避免 raw-mode shell 启动前台程序后 Ctrl-C 滞留。
 pub fn poll_tty_input() {
     // VT 串口输入模式(console=ttyN):物理控制台字节属于活动 VT,由 VT 泵
-    // 消费;此时不能再按通用路径 drain 各 TTY 核心,否则同一 FIFO 会被
-    // console/uart 的行规程与活动 VT 竞争读取。
+    // 消费;此时不能按通用路径 drain 控制台核心,否则同一 FIFO 会被
+    // console/uart 的行规程与活动 VT 竞争读取。其余终端(pty slave 等)
+    // 仍需要 tick 泵推进其行规程。
     if let Some(manager) = crate::dev::tty::vt::VtManager::global()
         && manager.pump_console()
     {
+        // VT 串口输入模式:物理控制台字节已由 VT 泵消费;此时不能按通用路径
+        // drain 控制台核心,否则同一 FIFO 会被 console/uart 的行规程与活动
+        // VT 竞争读取。其余终端(pty slave 等)仍需要 tick 泵推进。
+        let console_name = manager
+            .console_device()
+            .map(|dev| alloc::string::String::from(dev.fw_name()));
+        for tty in tty::active_tty_cores() {
+            if !tty.is_active() {
+                continue;
+            }
+            if console_name.as_deref() == Some(tty.name()) {
+                continue;
+            }
+            let termios = tty.termios();
+            tty.drain_tty_input(termios);
+        }
         return;
     }
     for tty in tty::active_tty_cores() {
@@ -873,6 +931,47 @@ impl FileOps for CharDevFileOps {
         crate::dev::tty::vt::note_vt_opened(&self.dev, -1);
         crate::dev::tty::pty::note_pty_opened(&self.dev, -1);
     }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+// ───────── mknod 节点 InodeOps ─────────
+
+/// 用户 mknod 创建的设备节点:open 时按投影名委托给已绑定设备。
+///
+/// 未绑定设备时按设备号反查(呈现层索引);仍未命中返回 ENXIO。
+struct MknodInodeOps {
+    target_name: String,
+}
+
+impl InodeOps for MknodInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let target = sb_ops
+            .lookup_node_at(&self.target_name)
+            .map_err(|_| VfsError::NoSuchDeviceOrAddress)?;
+        if let Some(ops) = target.downcast_ops::<DevCharOps>() {
+            return ops.open(&target, opts, cred);
+        }
+        if let Some(ops) = target.downcast_ops::<DevBlockOps>() {
+            return ops.open(&target, opts, cred);
+        }
+        Err(VfsError::NoSuchDeviceOrAddress)
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -1389,6 +1488,42 @@ impl InodeOps for DevDirOps {
             .ok_or(VfsError::NotFound)
     }
 
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if !matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+            // devtmpfs 只投影设备节点;其他 mknod 类型不支持。
+            return Err(VfsError::NotSupported);
+        }
+        validate_devtmpfs_component(name)?;
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+
+        // 设备号只作呈现层键:经 device_numbers 反查投影节点名,open 时
+        // 委托给已绑定设备;未登记的设备号在 open 时返回 ENXIO(Linux 语义)。
+        let node_kind = match kind {
+            FileType::CharDevice => super::user_api::device_numbers::DeviceNumberKind::Char,
+            _ => super::user_api::device_numbers::DeviceNumberKind::Block,
+        };
+        let Some(record) = super::user_api::device_numbers::lookup_rdev(node_kind, dev) else {
+            // 允许先建节点后绑定设备:open 时再解析。
+            let inode = sb_ops.new_mknod_inode(name, kind, mode, dev, cred, name)?;
+            return sb_ops.insert_mknod(dir, name, inode);
+        };
+
+        let inode = sb_ops.new_mknod_inode(name, kind, mode, dev, cred, &record.node_name)?;
+        sb_ops.insert_mknod(dir, name, inode)
+    }
+
     fn mkdir(
         &self,
         dir: &Inode,
@@ -1880,6 +2015,7 @@ impl DevTmpfsSuperblockOps {
     }
 
     fn new_custom_inode(&self, spec: &CustomDevNodeSpec, rdev: DevId) -> VfsResult<Arc<Inode>> {
+        let policy = node_policy(spec.name());
         split_devtmpfs_path(spec.name())?;
         let block_size = DEVTMPFS_STANDARD_POLICY.block_size;
         let nlink = DEVTMPFS_STANDARD_POLICY.custom_nlink(spec.kind());
@@ -1895,9 +2031,23 @@ impl DevTmpfsSuperblockOps {
         let meta = InodeMeta {
             size: 0,
             nlink,
-            mode: DEVTMPFS_STANDARD_POLICY.custom_mode(spec.kind()),
-            uid: DEVTMPFS_STANDARD_POLICY.uid,
-            gid: DEVTMPFS_STANDARD_POLICY.gid,
+            // 设备节点优先使用按名登记的节点策略(如 ptmx 0666);目录/普通
+            // 文件保持标准策略。
+            mode: if matches!(spec.kind(), CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice) {
+                policy.mode
+            } else {
+                DEVTMPFS_STANDARD_POLICY.custom_mode(spec.kind())
+            },
+            uid: if matches!(spec.kind(), CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice) {
+                policy.uid
+            } else {
+                DEVTMPFS_STANDARD_POLICY.uid
+            },
+            gid: if matches!(spec.kind(), CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice) {
+                policy.gid
+            } else {
+                DEVTMPFS_STANDARD_POLICY.gid
+            },
             atime: now,
             mtime: now,
             ctime: now,
@@ -2104,21 +2254,33 @@ impl DevTmpfsSuperblockOps {
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        // 节点已存在且设备号一致时幂等复用(initramfs 预建节点/重复绑定)。
+        // register_char 对同名已登记记录返回其原设备号,因此这里同时完成
+        // 复用判定与(必要时)设备号登记。
         if self.lookup_node_at(user_name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+            let expected = super::user_api::device_numbers::register_char(user_name, dev.fw_name())
+                .ok_or(VfsError::NoSpace)?;
+            let existing_rdev =
+                super::user_api::device_numbers::lookup_node(user_name).map(|record| record.rdev);
+            return if existing_rdev == Some(expected) {
+                Ok(())
+            } else {
+                Err(VfsError::AlreadyExists)
+            };
         }
-        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
-        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
         let rdev = super::user_api::device_numbers::register_char(user_name, dev.fw_name())
             .ok_or(VfsError::NoSpace)?;
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let policy = node_policy(user_name);
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: DEVTMPFS_STANDARD_POLICY.device_mode,
-            uid: DEVTMPFS_STANDARD_POLICY.uid,
-            gid: DEVTMPFS_STANDARD_POLICY.gid,
+            mode: policy.mode,
+            uid: policy.uid,
+            gid: policy.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -2185,20 +2347,29 @@ impl DevTmpfsSuperblockOps {
             return Err(VfsError::NoDevice);
         }
         if self.lookup_node_at(user_name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+            let expected = super::user_api::device_numbers::register_block(user_name, dev.name())
+                .ok_or(VfsError::NoSpace)?;
+            let existing_rdev =
+                super::user_api::device_numbers::lookup_node(user_name).map(|record| record.rdev);
+            return if existing_rdev == Some(expected) {
+                Ok(())
+            } else {
+                Err(VfsError::AlreadyExists)
+            };
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
         let rdev = super::user_api::device_numbers::register_block(user_name, dev.name())
             .ok_or(VfsError::NoSpace)?;
+        let policy = node_policy(user_name);
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: DEVTMPFS_STANDARD_POLICY.device_mode,
-            uid: DEVTMPFS_STANDARD_POLICY.uid,
-            gid: DEVTMPFS_STANDARD_POLICY.gid,
+            mode: policy.mode,
+            uid: policy.uid,
+            gid: policy.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -2250,6 +2421,67 @@ impl DevTmpfsSuperblockOps {
     ///
     /// 自定义节点的底层 function 只提交 opaque payload；这里作为 VFS 用户接口
     /// 适配层负责解释 payload、分配兼容 `dev_t` 并创建 inode。
+    /// 构造一个用户 mknod 的设备节点 inode。
+    ///
+    /// open 时按 `target_name`(已登记投影)或设备号(open 时反查)解析设备。
+    fn new_mknod_inode(
+        &self,
+        name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+        target_name: &str,
+    ) -> VfsResult<Arc<Inode>> {
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: 0,
+            nlink: 1,
+            mode,
+            uid: cred.euid,
+            gid: cred.egid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+        let ops = Arc::new(MknodInodeOps {
+            target_name: devtmpfs_fallible_string(target_name)?,
+        });
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            kind,
+            dev,
+            DEVTMPFS_STANDARD_POLICY.block_size,
+            None,
+            meta,
+            ops,
+            sb_weak,
+        ))
+    }
+
+    /// 把 mknod 节点插入父目录。
+    fn insert_mknod(&self, dir: &Inode, name: &str, inode: Arc<Inode>) -> VfsResult<Arc<Inode>> {
+        let parent_ops = dir
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let mut children = parent_ops.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(devtmpfs_fallible_string(name)?, Arc::clone(&inode));
+        drop(children);
+        dir.inc_nlink();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        Ok(inode)
+    }
+
     pub fn bind_custom(&self, spec: &CustomDevNodeSpec) -> VfsResult<()> {
         split_devtmpfs_path(spec.name())?;
         if self.lookup_node_at(spec.name()).is_ok() {
@@ -2448,6 +2680,39 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
 /// ops.bind_block("block/root", block_dev)?;  // 目录化块设备节点
 /// ops.bind_symlink("disk/root", "../block/root")?; // 可选符号链接投影
 /// ```
+/// 解析 devtmpfs 挂载选项(与 Linux 同键名)。
+///
+/// 只消费 `mode=/uid=/gid=`;其余常见选项接受但忽略。
+fn parse_devtmpfs_mount_options(data: &str) -> VfsResult<FileMode> {
+    let mut mode = DEVTMPFS_STANDARD_POLICY.dir_mode;
+    for item in data.split(',').filter(|item| !item.is_empty()) {
+        let (key, value) = item.split_once('=').unwrap_or((item, ""));
+        match key {
+            "mode" => mode = FileMode::new(parse_octal_mount_mode(value)?),
+            "uid" | "gid" | "nosuid" | "nodev" | "noexec" | "rw" | "ro" | "defaults" => {}
+            _ => return Err(VfsError::InvalidArgument),
+        }
+    }
+    Ok(mode)
+}
+
+fn parse_octal_mount_mode(value: &str) -> VfsResult<u16> {
+    if value.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    let mut result = 0u16;
+    for byte in value.bytes() {
+        if !(b'0'..=b'7').contains(&byte) {
+            return Err(VfsError::InvalidArgument);
+        }
+        result = result
+            .checked_mul(8)
+            .and_then(|value| value.checked_add((byte - b'0') as u16))
+            .ok_or(VfsError::InvalidArgument)?;
+    }
+    Ok(result)
+}
+
 pub struct DevTmpfsDriver;
 
 impl FsDriver for DevTmpfsDriver {
@@ -2459,13 +2724,14 @@ impl FsDriver for DevTmpfsDriver {
         FsDriverFlags::NODEV.with(FsDriverFlags::SINGLE)
     }
 
-    fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
+    fn mount(&self, _dev: Option<&str>, data: &str) -> VfsResult<Arc<Superblock>> {
         // devtmpfs 是内核设备树的用户可见投影，不能像 tmpfs 一样每次 mount
         // 都创建空实例。启动期 PnP bridge 安装后，用户态再次挂载 devtmpfs
         // 应复用同一个 superblock，否则会覆盖掉已经绑定的 console/uart/vd0 等节点。
         if let Some(sb) = mounted_devtmpfs_sb() {
             return Ok(sb);
         }
+        let mount_root_mode = parse_devtmpfs_mount_options(data)?;
 
         let fs_id = FsId::new(DEVTMPFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
@@ -2488,7 +2754,7 @@ impl FsDriver for DevTmpfsDriver {
             let root_meta = InodeMeta {
                 size: 0,
                 nlink: 2,
-                mode: DEVTMPFS_STANDARD_POLICY.dir_mode,
+                mode: mount_root_mode,
                 uid: DEVTMPFS_STANDARD_POLICY.uid,
                 gid: DEVTMPFS_STANDARD_POLICY.gid,
                 atime: now,
@@ -2584,11 +2850,12 @@ impl InodeOps for VtZeroInodeOps {
 fn vt_zero_node_build(
     spec: &CustomDevNodeSpec,
 ) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    // 适配器按注册顺序逐个尝试;不属于自己的 spec 返回 None 交给下一个。
     let payload = spec.payload();
-    let manager = payload
-        .as_ref()
-        .downcast_ref::<&'static crate::dev::tty::VtManager>()
-        .ok_or(VfsError::InvalidArgument)?;
+    let Some(manager) = payload.as_ref().downcast_ref::<&'static crate::dev::tty::VtManager>()
+    else {
+        return Ok(None);
+    };
     Ok(Some(Arc::new(VtZeroInodeOps { manager: *manager })))
 }
 
@@ -2640,8 +2907,11 @@ fn map_pty_open_err(err: Errno) -> VfsError {
 }
 
 fn ptmx_node_build(
-    _spec: &CustomDevNodeSpec,
+    spec: &CustomDevNodeSpec,
 ) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    if spec.name() != "ptmx" {
+        return Ok(None);
+    }
     Ok(Some(Arc::new(PtyMasterInodeOps)))
 }
 

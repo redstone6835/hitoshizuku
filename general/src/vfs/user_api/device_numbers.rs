@@ -4,6 +4,7 @@
 //! 需要主次设备号，但底层设备模型仍以 PnP identity 和 typed device object 为准，
 //! 不能通过 `major/minor` 反向寻址硬件设备。
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -60,6 +61,8 @@ struct DeviceNumberRegistry {
     next_misc_minor: Option<u32>,
     well_known: Vec<DeviceNumberPolicy>,
     records: Vec<DeviceNumberRecord>,
+    /// 动态分配的已释放 (major, minor),优先复用(Linux idr 语义)。
+    freed: BTreeSet<(u32, u32)>,
 }
 
 impl DeviceNumberRegistry {
@@ -70,6 +73,7 @@ impl DeviceNumberRegistry {
             next_misc_minor: Some(0),
             well_known: Vec::new(),
             records: Vec::new(),
+            freed: BTreeSet::new(),
         }
     }
 }
@@ -247,6 +251,13 @@ pub const PTY_MAJOR: u32 = 136;
 const PTY_MAJOR_NAME: &str = "pts";
 
 fn next_pty_minor(registry: &DeviceNumberRegistry) -> Option<u32> {
+    if let Some(&(_, minor)) = registry
+        .freed
+        .iter()
+        .find(|(major, _)| *major == PTY_MAJOR)
+    {
+        return Some(minor);
+    }
     let mut minor = 0u32;
     loop {
         if registry.records.iter().all(|record| {
@@ -342,6 +353,7 @@ fn register(kind: DeviceNumberKind, node_name: &str, display_name: &str) -> Opti
         major_name,
         rdev,
     )?;
+    registry.freed.remove(&(rdev.major, rdev.minor));
     if private_rdev {
         advance_private_rdev(&mut registry, kind);
     }
@@ -389,6 +401,11 @@ fn next_private_rdev(registry: &DeviceNumberRegistry, kind: DeviceNumberKind) ->
         DeviceNumberKind::Char => registry.next_char_private,
         DeviceNumberKind::Block => registry.next_block_private,
     }?;
+    if let Some(&(major, minor)) = registry.freed.iter().find(|(major, _)| {
+        *major >= PRIVATE_DYNAMIC_MAJOR_START
+    }) {
+        return Some(DevId::new(major, minor));
+    }
     Some(DevId::new(cursor.major, cursor.minor))
 }
 
@@ -413,6 +430,13 @@ fn advance_private_cursor(cursor: PrivateDynamicCursor) -> Option<PrivateDynamic
 }
 
 fn next_misc_minor(registry: &DeviceNumberRegistry) -> Option<u32> {
+    if let Some(&(_, minor)) = registry
+        .freed
+        .iter()
+        .find(|(major, _)| *major == MISC_MAJOR)
+    {
+        return Some(minor);
+    }
     let mut minor = registry.next_misc_minor?;
     loop {
         if registry.records.iter().all(|record| {
@@ -439,10 +463,25 @@ fn well_known_rdev(
 }
 
 pub fn unregister_node(node_name: &str) {
-    DEVICE_NUMBERS
-        .lock()
+    let mut registry = DEVICE_NUMBERS.lock();
+    let Some(index) = registry
         .records
-        .retain(|record| record.node_name != node_name);
+        .iter()
+        .position(|record| record.node_name == node_name)
+    else {
+        return;
+    };
+    let record = registry.records.swap_remove(index);
+    // well-known 策略的设备号由策略表固定,不进入复用池;动态分配的
+    // (misc/private/pts)释放后回收,保证热插拔同名设备拿到原次号。
+    let is_well_known = registry.well_known.iter().any(|policy| {
+        policy.kind == record.kind
+            && policy.node_name == record.node_name
+            && policy.rdev() == record.rdev
+    });
+    if !is_well_known {
+        registry.freed.insert((record.rdev.major, record.rdev.minor));
+    }
 }
 
 pub fn lookup_node(node_name: &str) -> Option<DeviceNumberRecord> {

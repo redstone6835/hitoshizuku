@@ -3535,7 +3535,26 @@ impl FileOps for SysRegFileOps {
         let s = render_reg_file(&self.snap, self.kind);
         read_bytes_at(buf, offset, s.as_bytes())
     }
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        // uevent 文件写:接受 Linux 的动作词并触发事件回调(当前为校验 +
+        // 钩子占位;mdev/udevadm trigger 兼容)。非法动作返回 EINVAL。
+        if matches!(
+            self.kind,
+            SysRegFile::DevCharInner {
+                slot: DevCharInnerSlot::Uevent,
+                ..
+            }
+        ) {
+            let action = core::str::from_utf8(buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            return match action {
+                "add" | "remove" | "change" | "bind" | "unbind" | "online" | "offline" => {
+                    Ok(buf.len())
+                }
+                _ => Err(VfsError::InvalidArgument),
+            };
+        }
         #[cfg(feature = "performance-profile")]
         if matches!(self.kind, SysRegFile::ProfileControl) {
             if _offset != 0 {
@@ -3875,8 +3894,14 @@ fn truncate_sys_reg(kind: SysRegFile, size: u64) -> VfsResult<()> {
             Err(VfsError::InvalidArgument)
         };
     }
-    let _ = (kind, size);
-    Err(VfsError::ReadOnlyFilesystem)
+    let _ = kind;
+    // 与 Linux kernfs 一致:sysfs 普通文件忽略截断到 0 的请求
+    // (shell 的 `echo x > file` 带 O_TRUNC),非零截断拒绝。
+    if size == 0 {
+        Ok(())
+    } else {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
 }
 
 impl InodeOps for SysRegInodeOps {

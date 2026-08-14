@@ -986,6 +986,7 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
                     general::dev::char::CharIoError::Unavailable => Errno::ENODEV,
                     general::dev::char::CharIoError::Interrupted => Errno::EINTR,
                     general::dev::char::CharIoError::Timeout => Errno::EAGAIN,
+                    general::dev::char::CharIoError::NoSpace => Errno::ENOSPC,
                     general::dev::char::CharIoError::HardwareError => Errno::EIO,
                 });
             }

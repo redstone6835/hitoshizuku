@@ -11,7 +11,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 

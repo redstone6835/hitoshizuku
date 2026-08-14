@@ -13,6 +13,8 @@ const WELL_KNOWN_DEVICE_POLICIES: &[DeviceNumberPolicy] = &[
     DeviceNumberPolicy::char("zero", 1, 5, "mem"),
     DeviceNumberPolicy::char("random", 1, 8, "mem"),
     DeviceNumberPolicy::char("urandom", 1, 9, "mem"),
+    DeviceNumberPolicy::char("full", 1, 7, "mem"),
+    DeviceNumberPolicy::char("kmsg", 1, 11, "mem"),
     DeviceNumberPolicy::char("console", 5, 1, "console"),
     // 控制终端与虚拟终端(与 Linux devtmpfs 布局一致)。
     DeviceNumberPolicy::char("tty", 5, 0, "console"),

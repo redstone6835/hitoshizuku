@@ -936,6 +936,7 @@ pub enum UartError {
 
 fn map_uart_char_error(err: CharIoError) -> ControlError {
     match err {
+        CharIoError::NoSpace => ControlError::Invalid,
         CharIoError::HardwareError => ControlError::Io,
         CharIoError::Unavailable => ControlError::NoDevice,
         CharIoError::Interrupted => ControlError::Busy,
