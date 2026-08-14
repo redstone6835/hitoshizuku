@@ -784,6 +784,18 @@ impl TtyIoctlContext for CharDevFileOps {
     fn session_id(&self) -> Result<i32, Errno> {
         operation::getsid(0)
     }
+
+    fn is_session_leader(&self) -> bool {
+        sched::operation::is_current_session_leader()
+    }
+
+    fn session_ctty(&self) -> Option<u64> {
+        sched::operation::current_session_ctty()
+    }
+
+    fn set_session_ctty(&self, cookie: Option<u64>) -> Result<(), Errno> {
+        sched::operation::set_current_session_ctty(cookie)
+    }
 }
 
 /// 从已打开的 TTY 中主动拉取输入，供 timer tick 路径调用。
@@ -2872,6 +2884,80 @@ fn bind_vt_zero_node(
     let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(manager);
     let spec = CustomDevNodeSpec::try_new(name, CustomDevNodeKind::CharDevice, payload)?;
     dev_ops.bind_custom(&spec)
+}
+
+/// `/dev/tty`(5:0)别名节点:open 时解析为当前会话的控制终端。
+///
+/// 无控制终端返回 ENXIO(Linux 语义);控制终端必须是 CharDevice 承载
+/// 的 tty(当前全部后端均满足)。
+pub fn register_tty_alias_devnode() -> VfsResult<()> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        "tty-alias-devnode",
+        "tty",
+        tty_alias_node_build,
+    ))?;
+    register_static_dev_node(DevTmpfsStaticNode::new(
+        "tty-alias-devnode",
+        "tty",
+        build_tty_alias_node,
+    ))?;
+    Ok(())
+}
+
+fn build_tty_alias_node() -> VfsResult<DevNodeSpec> {
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    Ok(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
+        "tty",
+        CustomDevNodeKind::CharDevice,
+        payload,
+    )?))
+}
+
+fn tty_alias_node_build(
+    spec: &CustomDevNodeSpec,
+) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    if spec.name() != "tty" {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(TtyAliasInodeOps)))
+}
+
+/// 会话控制终端别名节点(tty0 式 open 时解析,但目标是会话 ctty)。
+struct TtyAliasInodeOps;
+
+impl InodeOps for TtyAliasInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let Some(cookie) = sched::operation::current_session_ctty() else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        let Some(core) = tty::resolve_ctty_cookie(cookie) else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        // 会话退出后惰性释放:ctty 指向的会话已不存在时按无控制终端处理。
+        if let Some(sid) = core.session_sid()
+            && !sched::operation::session_exists(sid)
+        {
+            let _ = sched::operation::set_current_session_ctty(None);
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        }
+        let Some(dev) = core.char_device() else {
+            return Err(VfsError::NoSuchDeviceOrAddress);
+        };
+        char_dev_file_ops(dev, opts.nonblock)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 /// `/dev/ptmx` 节点:open 时分配 pty 对并返回 master。

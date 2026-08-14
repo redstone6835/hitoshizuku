@@ -11,7 +11,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::vec::Vec;
 
 use errno::Errno;
@@ -160,6 +160,12 @@ impl TtyLineState {
 pub struct TtyCore {
     /// 终端名(共享键,如 `uart0`/`tty1`/`pts/0`);诊断与泵路由用。
     name: String,
+    /// 控制终端句柄(会话 ctty 引用;解析见 [`resolve_ctty_cookie`])。
+    cookie: u64,
+    /// 把该终端作为控制终端的会话 sid(无则 None)。
+    session: Spinlock<Option<i32>>,
+    /// 底层字符设备(所有当前终端后端均为 CharDevice 承载)。
+    dev: Spinlock<Option<CharDevice>>,
     driver: Arc<dyn TerminalDriver>,
     termios: Spinlock<UserTermios>,
     winsize: Spinlock<UserWinSize>,
@@ -172,21 +178,29 @@ pub struct TtyCore {
 const TTY_ASYNC_PUMP_LIMIT: usize = 256;
 
 impl TtyCore {
-    pub fn new(driver: Arc<dyn TerminalDriver>) -> Self {
+    pub fn new(driver: Arc<dyn TerminalDriver>) -> Arc<Self> {
         Self::named(String::new(), driver)
     }
 
     /// 以指定名字构造(共享注册表按名字键控)。
-    pub fn named(name: String, driver: Arc<dyn TerminalDriver>) -> Self {
-        Self {
+    pub fn named(name: String, driver: Arc<dyn TerminalDriver>) -> Arc<Self> {
+        let cookie = NEXT_TTY_COOKIE.fetch_add(1, Ordering::Relaxed);
+        let core = Arc::new(Self {
             name,
+            cookie,
+            session: Spinlock::new(None),
+            dev: Spinlock::new(None),
             driver,
             termios: Spinlock::new(UserTermios::new_default()),
             winsize: Spinlock::new(UserWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
             line_state: Spinlock::new(TtyLineState::default()),
             hung_up: AtomicBool::new(false),
-        }
+        });
+        TTY_CORES_BY_COOKIE
+            .lock()
+            .insert(cookie, Arc::downgrade(&core));
+        core
     }
 
     pub fn driver(&self) -> &dyn TerminalDriver {
@@ -196,6 +210,21 @@ impl TtyCore {
     /// 终端名(与共享注册表键一致)。
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// 控制终端 cookie。
+    pub fn ctty_cookie(&self) -> u64 {
+        self.cookie
+    }
+
+    /// 绑定底层字符设备(供 /dev/tty 别名解析)。
+    pub fn attach_char_device(&self, dev: CharDevice) {
+        *self.dev.lock() = Some(dev);
+    }
+
+    /// 底层字符设备(非 CharDevice 承载的后端返回 None)。
+    pub fn char_device(&self) -> Option<CharDevice> {
+        self.dev.lock().clone()
     }
 
     pub fn is_active(&self) -> bool {
@@ -618,6 +647,22 @@ impl crate::vfs::user_api::tty::TtyIoctlState for TtyCore {
         *self.foreground_pgrp.lock() = pgrp;
     }
 
+    fn ctty_cookie(&self) -> Option<u64> {
+        Some(self.cookie)
+    }
+
+    fn session_sid(&self) -> Option<i32> {
+        *self.session.lock()
+    }
+
+    fn set_session_sid(&self, sid: Option<i32>) {
+        *self.session.lock() = sid;
+    }
+
+    fn signal_foreground(&self, sig: sched::SignalNumber) {
+        self.send_fg_signal(sig);
+    }
+
     fn control(&self, req: TtyControlRequest) -> Result<TtyControlResponse, Errno> {
         self.driver
             .control(req)
@@ -745,7 +790,8 @@ pub fn shared_tty_core(dev: &CharDevice) -> Option<Arc<TtyCore>> {
     }
 
     let driver: Arc<dyn TerminalDriver> = Arc::new(CharDeviceTerminalDriver::new(dev.clone()));
-    let core = Arc::new(TtyCore::named(alloc::string::String::from(dev.fw_name()), driver));
+    let core = TtyCore::named(alloc::string::String::from(dev.fw_name()), driver);
+    core.attach_char_device(dev.clone());
     if let Some(key) = fallible_string(dev.fw_name()) {
         cores.insert(key, Arc::downgrade(&core));
     }
@@ -766,6 +812,15 @@ pub fn active_tty_cores() -> Vec<Arc<TtyCore>> {
         });
     }
     out
+}
+
+static NEXT_TTY_COOKIE: AtomicU64 = AtomicU64::new(1);
+
+static TTY_CORES_BY_COOKIE: Spinlock<BTreeMap<u64, Weak<TtyCore>>> = Spinlock::new(BTreeMap::new());
+
+/// 按控制终端 cookie 解析行规程实例(会话 ctty 引用)。
+pub fn resolve_ctty_cookie(cookie: u64) -> Option<Arc<TtyCore>> {
+    TTY_CORES_BY_COOKIE.lock().get(&cookie).and_then(Weak::upgrade)
 }
 
 /// 按节点名(fw_name)查询共享行规程实例。

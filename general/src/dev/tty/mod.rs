@@ -11,7 +11,7 @@ pub mod core;
 pub mod pty;
 pub mod vt;
 
-pub use core::{
+pub use core::{resolve_ctty_cookie,
     CharDeviceTerminalDriver, TerminalDriver, TtyControlRequest, TtyControlResponse, TtyCore,
     TtyIoError, TtyIoResult, active_tty_cores, lookup_tty_core, shared_tty_core,
 };

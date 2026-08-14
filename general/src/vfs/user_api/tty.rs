@@ -5,6 +5,7 @@
 //! 只需要把字符设备 inode 委托给 TTY 适配器，不再散落这些常量。
 
 use errno::Errno;
+use sched::operation;
 use vfs::file::IoctlCmd;
 
 use super::ioctl::{
@@ -274,12 +275,43 @@ pub trait TtyIoctlState {
     ) -> Result<crate::dev::tty::TtyControlResponse, Errno> {
         Err(Errno::ENOTTY)
     }
+
+    /// 本终端的控制终端 cookie(TIOCSCTTY 用;非 tty 状态返回 None)。
+    fn ctty_cookie(&self) -> Option<u64> {
+        None
+    }
+
+    /// 本终端作为控制终端所属的会话 sid。
+    fn session_sid(&self) -> Option<i32> {
+        None
+    }
+
+    /// 设置/清除本终端的控制会话。
+    fn set_session_sid(&self, _sid: Option<i32>) {}
+
+    /// 向前台进程组发信号(TIOCNOTTY 的 SIGHUP 等)。
+    fn signal_foreground(&self, _sig: sched::SignalNumber) {}
 }
 
 /// TTY ioctl 外部上下文。
 pub trait TtyIoctlContext {
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno>;
     fn session_id(&self) -> Result<i32, Errno>;
+
+    /// 调用者是否为会话首进程(TIOCSCTTY 前置检查)。
+    fn is_session_leader(&self) -> bool {
+        false
+    }
+
+    /// 当前会话的控制终端 cookie。
+    fn session_ctty(&self) -> Option<u64> {
+        None
+    }
+
+    /// 设置当前会话的控制终端。
+    fn set_session_ctty(&self, _cookie: Option<u64>) -> Result<(), Errno> {
+        Ok(())
+    }
 }
 
 /// 判断 ioctl 是否是当前适配层认识的 TTY 命令。
@@ -455,7 +487,47 @@ where
             }
             _ => Err(Errno::EINVAL),
         },
-        TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
+        TCXONC | TIOCEXCL | TIOCNXCL => Ok(0),
+        TIOCSCTTY => {
+            // Linux 语义:仅会话首进程可设置;arg=1 允许抢占已有控制终端。
+            if !ctx.is_session_leader() {
+                return Err(Errno::EPERM);
+            }
+            let steal = arg != 0;
+            if !steal && ctx.session_ctty().is_some() {
+                return Err(Errno::EPERM);
+            }
+            if steal {
+                if let Some(old) = ctx.session_ctty() {
+                    if let Some(old_core) = crate::dev::tty::core::resolve_ctty_cookie(old) {
+                        old_core.signal_foreground(sched::SignalNumber::SIGHUP);
+                        old_core.set_session_sid(None);
+                    }
+                }
+            }
+            let Some(cookie) = state.ctty_cookie() else {
+                return Err(Errno::ENOTTY);
+            };
+            ctx.set_session_ctty(Some(cookie))?;
+            state.set_session_sid(operation::getsid(0).ok());
+            if state.foreground_pgrp() <= 0 {
+                state.set_foreground_pgrp(operation::getpgid(0).unwrap_or(0));
+            }
+            Ok(0)
+        }
+        TIOCNOTTY => {
+            // 仅当该终端是当前会话的控制终端时生效(Linux:否则 ENOTTY)。
+            if ctx.session_ctty() != state.ctty_cookie() {
+                return Err(Errno::ENOTTY);
+            }
+            if ctx.is_session_leader() {
+                return Err(Errno::EINVAL);
+            }
+            state.signal_foreground(sched::SignalNumber::SIGHUP);
+            ctx.set_session_ctty(None)?;
+            state.set_session_sid(None);
+            Ok(0)
+        }
         _ => Err(Errno::ENOTTY),
     }
 }

@@ -58,6 +58,8 @@ static PTMX_DEVNODE_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 static EXTRA_STATIC_NODES_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+static TTY_ALIAS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 static CONSOLE_LOG_SINK: LogSink = LogSink {
     write_record: write_log_record_to_console,
 };
@@ -438,6 +440,7 @@ pub fn register_core_filesystems(tag: &str) {
 pub fn mount_devtmpfs(tag: &str) -> Arc<Superblock> {
     register_pty_devnode_if_needed(tag);
     register_extra_static_nodes_if_needed(tag);
+    register_tty_alias_if_needed(tag);
     FS_REGISTRY
         .find("devtmpfs")
         .unwrap_or_else(|| panic!("[kernel-start][{}] devtmpfs driver not found", tag))
@@ -567,6 +570,20 @@ fn mount_devpts_on_pts(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
         Err(err) => panic!(
             "[kernel-start][{}] failed to mount devpts at /dev/pts: {:?}",
             tag, err
+        ),
+    }
+}
+
+fn register_tty_alias_if_needed(tag: &str) {
+    if TTY_ALIAS_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match general::vfs::devtmpfs::register_tty_alias_devnode() {
+        Ok(_) => printk!("[kernel-start][{}] registered /dev/tty devnode", tag),
+        Err(err) => printk!(
+            "[kernel-start][{}] failed to register /dev/tty devnode: {:?}",
+            tag,
+            err
         ),
     }
 }
