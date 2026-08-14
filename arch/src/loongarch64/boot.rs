@@ -53,7 +53,9 @@ pub(crate) fn boot_registers() -> crate::boot_protocol::BootRegisters {
 /// 再安装异常入口，最后才跳向更高层初始化。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
+// 独立段名保证 rlib 归档顺序不会把其它 .text.entry 输入排到入口之前；
+// 链接脚本 KEEP 顺序与 ASSERT 共同约束 _start 必须是镜像首字节。
+#[unsafe(link_section = ".text.entry.boot")]
 pub unsafe extern "C" fn _start() {
     naked_asm!(
         // QEMU LoongArch 直启路径下，`$a0 / $a1 / $a2`（即 `$r4 / $r5 / $r6`）

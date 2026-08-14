@@ -97,13 +97,20 @@ pub fn kernel_start_init(context: &StartContext) {
             .unwrap_or_else(|err| panic!("[kernel-start][dtb] invalid DT memory range: {:?}", err));
         if let Some(boot_segments) = boot_memory_segments {
             if described.is_empty() {
-                panic!("[kernel-start][dtb] non-UEFI DT boot is missing usable /memory nodes");
+                // 工厂 DTB 可能不带 /memory 节点（2K1000LA 开发板），此时以
+                // bootloader/板级提供的启动内存映射为权威来源。
+                printk!(
+                    "[kernel-start][dtb] non-UEFI DT boot has no usable /memory nodes; using boot memory map ({} segments)",
+                    boot_segments.len(),
+                );
+                boot_segments
+            } else {
+                start::intersect_memory_segments(&described, &boot_segments).unwrap_or_else(|| {
+                    panic!(
+                        "[kernel-start][dtb] DTB memory description does not overlap usable boot memory"
+                    )
+                })
             }
-            start::intersect_memory_segments(&described, &boot_segments).unwrap_or_else(|| {
-                panic!(
-                    "[kernel-start][dtb] DTB memory description does not overlap usable boot memory"
-                )
-            })
         } else if described.is_empty() {
             panic!("[kernel-start][dtb] DT boot has neither /memory nor a UEFI memory map");
         } else {
