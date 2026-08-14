@@ -45,6 +45,26 @@ typedef void (*kernel_fn_t)(uintptr_t arg0, uintptr_t arg1);
 #define DEFINE_RV64_KERNEL(name, body) DEFINE_KERNEL(name, ".option norvc", body)
 #define DEFINE_RVC_KERNEL(name, body) DEFINE_KERNEL(name, ".option rvc", body)
 
+#define DEFINE_RV64_CONTEXT_KERNEL(name, setup, body)                           \
+    __asm__(                                                                    \
+        ".pushsection .text.riscv_weight_kernels,\"ax\",@progbits\n"        \
+        ".balign 64\n"                                                        \
+        ".globl " #name "\n"                                                 \
+        ".type " #name ", @function\n"                                       \
+        #name ":\n"                                                           \
+        ".option push\n"                                                      \
+        ".option norelax\n"                                                   \
+        ".option norvc\n"                                                     \
+        setup "\n"                                                            \
+        ".rept " STRINGIFY(RV_SLOT_COUNT) "\n"                               \
+        body "\n"                                                             \
+        ".endr\n"                                                             \
+        "jalr zero, 0(ra)\n"                                                  \
+        ".option pop\n"                                                       \
+        ".size " #name ", .-" #name "\n"                                    \
+        ".popsection\n");                                                     \
+    extern void name(uintptr_t, uintptr_t)
+
 #define DEFINE_STACK_RVC_KERNEL(name, body)                                    \
     __asm__(                                                                    \
         ".pushsection .text.riscv_weight_kernels,\"ax\",@progbits\n"        \
@@ -214,6 +234,46 @@ DEFINE_RV64_KERNEL(rv_kernel_divw, "divw a0, a0, a1");
 DEFINE_RV64_KERNEL(rv_kernel_divuw, "divuw a0, a0, a1");
 DEFINE_RV64_KERNEL(rv_kernel_remw, "remw a0, a0, a1");
 DEFINE_RV64_KERNEL(rv_kernel_remuw, "remuw a0, a0, a1");
+
+/*
+ * 差分套件在每个目标槽前从 t2 恢复被除数。匹配 baseline 保留恢复指令，
+ * 只用 nop 替换目标操作，使精确指令差仍闭合为 RV_SLOT_COUNT。
+ */
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_nop4, "addi t2, a0, 0",
+                           "addi a0, t2, 0\naddi zero, zero, 0");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_div, "addi t2, a0, 0",
+                           "addi a0, t2, 0\ndiv a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_divu, "addi t2, a0, 0",
+                           "addi a0, t2, 0\ndivu a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_rem, "addi t2, a0, 0",
+                           "addi a0, t2, 0\nrem a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_remu, "addi t2, a0, 0",
+                           "addi a0, t2, 0\nremu a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_divw, "addi t2, a0, 0",
+                           "addi a0, t2, 0\ndivw a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_divuw, "addi t2, a0, 0",
+                           "addi a0, t2, 0\ndivuw a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_remw, "addi t2, a0, 0",
+                           "addi a0, t2, 0\nremw a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(rv_kernel_reset_remuw, "addi t2, a0, 0",
+                           "addi a0, t2, 0\nremuw a0, a0, a1");
+
+/*
+ * 交替上下文为目标和相邻 M 操作分别恢复输入；baseline 仅替换被测操作。
+ * 齐次与交替版本都在每个槽恢复目标输入，因此对照集中反映混合 TB 邻域。
+ */
+DEFINE_RV64_CONTEXT_KERNEL(
+    rv_kernel_alternating_rem_div, "addi t2, a0, 0",
+    "addi t0, t2, 0\nrem t0, t0, a1\naddi a0, t2, 0\ndiv a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(
+    rv_kernel_alternating_rem_div_baseline, "addi t2, a0, 0",
+    "addi t0, t2, 0\nrem t0, t0, a1\naddi a0, t2, 0\naddi zero, zero, 0");
+DEFINE_RV64_CONTEXT_KERNEL(
+    rv_kernel_alternating_div_rem, "addi t2, a0, 0",
+    "addi t0, t2, 0\ndiv t0, t0, a1\naddi a0, t2, 0\nrem a0, a0, a1");
+DEFINE_RV64_CONTEXT_KERNEL(
+    rv_kernel_alternating_div_rem_baseline, "addi t2, a0, 0",
+    "addi t0, t2, 0\ndiv t0, t0, a1\naddi a0, t2, 0\naddi zero, zero, 0");
 
 DEFINE_RV64_KERNEL(rv_kernel_lb, "lb t0, 0(a0)");
 DEFINE_RV64_KERNEL(rv_kernel_lbu, "lbu t0, 0(a0)");
@@ -430,6 +490,7 @@ void riscv_weight_profile_stop(void)
 
 enum argument_kind {
     ARG_ARITHMETIC,
+    ARG_DIV_NONDEGENERATE,
     ARG_MEMORY,
     ARG_EQUAL,
     ARG_NOT_EQUAL,
@@ -703,9 +764,127 @@ static const struct instruction_case instruction_cases[] = {
                     rv_kernel_c_stack_nop, ARG_MEMORY),
 };
 
+struct differential_case {
+    struct instruction_case instruction_case;
+    const char *suite;
+    const char *contrast;
+    const char *context;
+};
+
+/* variant 由实际选择的 kernel pattern 决定，避免把 context 文本误当成
+ * provenance。合并器会用同一张契约表再次校验这些组合。 */
+static const char *differential_variant_for(const struct instruction_case *entry)
+{
+    if (strcmp(entry->pattern, "dependency-chain") == 0 ||
+        strcmp(entry->pattern, "homogeneous-reset") == 0 ||
+        strcmp(entry->pattern, "independent") == 0) {
+        return "reference";
+    }
+    if (strcmp(entry->pattern, "independent-reset") == 0) {
+        return "independent";
+    }
+    if (strcmp(entry->pattern, "stability-anchor-positive-div") == 0) {
+        return "anchor";
+    }
+    if (strcmp(entry->pattern, "alternating-rem-div-reset") == 0 ||
+        strcmp(entry->pattern, "alternating-div-rem-reset") == 0) {
+        return "alternating";
+    }
+    return "unknown";
+}
+
+static int is_stability_anchor(const struct differential_case *entry)
+{
+    return entry && strcmp(entry->suite, "stability-anchor-v1") == 0;
+}
+
+static int is_calibration_case(const struct differential_case *entry)
+{
+    return strcmp(entry->suite, "differential-calibration-v2") == 0 ||
+           strcmp(entry->suite, "stability-anchor-v1") == 0;
+}
+
+#define DIFFERENTIAL_CASE(name, pattern, function, baseline, contrast, context) \
+    {{name, 4, pattern, function, baseline, ARG_DIV_NONDEGENERATE},               \
+     "div-rem-dataflow-v2", contrast, context}
+#define INTERACTION_CASE(name, pattern, function, baseline, contrast, context)   \
+    {{name, 4, pattern, function, baseline, ARG_DIV_NONDEGENERATE},               \
+     "mixed-tb-interaction-v2", contrast, context}
+#define CALIBRATION_CASE()                                                        \
+    {{"nop", 4, "independent", rv_kernel_nop4, rv_kernel_empty,                \
+      ARG_ARITHMETIC},                                                            \
+     "differential-calibration-v2", "nop-reference", "independent-nop"}
+#define STABILITY_ANCHOR_CASE()                                                   \
+    {{"div", 4, "stability-anchor-positive-div", rv_kernel_div,                \
+      rv_kernel_nop4, ARG_DIV_NONDEGENERATE},                                    \
+     "stability-anchor-v1", "positive-div-anchor", "repeated-positive-anchor"}
+
+/* 该套件只在 filter=differential-v2 时启用，不改变 instruction_cases。 */
+static const struct differential_case differential_cases[] = {
+    CALIBRATION_CASE(),
+    STABILITY_ANCHOR_CASE(),
+    DIFFERENTIAL_CASE("div", "dependency-chain", rv_kernel_div, rv_kernel_nop4,
+                      "div-dataflow", "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("div", "independent-reset", rv_kernel_reset_div,
+                      rv_kernel_reset_nop4, "div-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("divu", "dependency-chain", rv_kernel_divu, rv_kernel_nop4,
+                      "divu-dataflow", "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("divu", "independent-reset", rv_kernel_reset_divu,
+                      rv_kernel_reset_nop4, "divu-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("rem", "dependency-chain", rv_kernel_rem, rv_kernel_nop4,
+                      "rem-dataflow", "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("rem", "independent-reset", rv_kernel_reset_rem,
+                      rv_kernel_reset_nop4, "rem-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("remu", "dependency-chain", rv_kernel_remu, rv_kernel_nop4,
+                      "remu-dataflow", "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("remu", "independent-reset", rv_kernel_reset_remu,
+                      rv_kernel_reset_nop4, "remu-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("divw", "dependency-chain", rv_kernel_divw, rv_kernel_nop4,
+                      "divw-dataflow", "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("divw", "independent-reset", rv_kernel_reset_divw,
+                      rv_kernel_reset_nop4, "divw-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("divuw", "dependency-chain", rv_kernel_divuw,
+                      rv_kernel_nop4, "divuw-dataflow",
+                      "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("divuw", "independent-reset", rv_kernel_reset_divuw,
+                      rv_kernel_reset_nop4, "divuw-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("remw", "dependency-chain", rv_kernel_remw, rv_kernel_nop4,
+                      "remw-dataflow", "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("remw", "independent-reset", rv_kernel_reset_remw,
+                      rv_kernel_reset_nop4, "remw-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    DIFFERENTIAL_CASE("remuw", "dependency-chain", rv_kernel_remuw,
+                      rv_kernel_nop4, "remuw-dataflow",
+                      "evolving-dependency-chain"),
+    DIFFERENTIAL_CASE("remuw", "independent-reset", rv_kernel_reset_remuw,
+                      rv_kernel_reset_nop4, "remuw-dataflow",
+                      "per-slot-reset-nondegenerate"),
+    INTERACTION_CASE("div", "homogeneous-reset", rv_kernel_reset_div,
+                     rv_kernel_reset_nop4, "div-rem-alternation",
+                     "homogeneous-div-reset"),
+    INTERACTION_CASE("div", "alternating-rem-div-reset",
+                     rv_kernel_alternating_rem_div,
+                     rv_kernel_alternating_rem_div_baseline,
+                     "div-rem-alternation", "alternating-with-rem-reset"),
+    INTERACTION_CASE("rem", "homogeneous-reset", rv_kernel_reset_rem,
+                     rv_kernel_reset_nop4, "rem-div-alternation",
+                     "homogeneous-rem-reset"),
+    INTERACTION_CASE("rem", "alternating-div-rem-reset",
+                     rv_kernel_alternating_div_rem,
+                     rv_kernel_alternating_div_rem_baseline,
+                     "rem-div-alternation", "alternating-with-div-reset"),
+};
+
 struct sample_job {
     size_t case_index;
     unsigned int level;
+    size_t order_slot;
 };
 
 struct aligned_data {
@@ -862,6 +1041,11 @@ static void arguments_for(const struct instruction_case *entry,
                           uintptr_t *arg1)
 {
     switch (entry->argument_kind) {
+    case ARG_DIV_NONDEGENERATE:
+        /* 64/32 位视角下均非零且不整除，供每槽恢复用例稳定复用。 */
+        *arg0 = UINT64_C(0x7fedcba987654321);
+        *arg1 = UINT64_C(0x000000000001f123);
+        break;
     case ARG_MEMORY:
         *arg0 = (uintptr_t)data;
         *arg1 = 0;
@@ -926,6 +1110,9 @@ __attribute__((noinline)) static void run_profiled_window(kernel_fn_t kernel,
 
 static int measure_window(const char *run_id,
                           const struct instruction_case *entry,
+                          const struct differential_case *differential,
+                          const char *calibration_profile,
+                          const char *anchor_position,
                           const char *role, const char *order,
                           uint64_t block_id, uint64_t pair_id,
                           uint64_t sequence, unsigned int level,
@@ -961,7 +1148,8 @@ static int measure_window(const char *run_id,
     prepare_window_state(entry, data, 1);
     kernel(arg0, arg1);
     run_blocks(rv_kernel_empty, (uintptr_t)data, 0, 1);
-    prepare_window_state(entry, data, 0);
+    /* 预热可能改变 FCSR/fflags；被测窗口必须从同一完整状态重新开始。 */
+    prepare_window_state(entry, data, 1);
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &before) != 0) {
         return -1;
     }
@@ -973,21 +1161,56 @@ static int measure_window(const char *run_id,
     }
     uint64_t elapsed_ns = timespec_ns(&after) - timespec_ns(&before);
     uint64_t checksum = data->words[0] ^ data->words[1] ^ time_after;
-    printf("RV_WEIGHT_SAMPLE version=1 run_id=%s block_id=%" PRIu64
-           " segment_id=%" PRIu64 " pair_id=%" PRIu64
-           " sequence=%" PRIu64 " role=%s order=%s round=%" PRIu64
-           " count_level=%u instruction=%s encoding_bytes=%u pattern=%s"
-           " executed_instruction=%s baseline_instruction=%s"
-           " baseline_encoding_bytes=%u control_instruction=empty-call"
-           " requested_count=%" PRIu64 " target_count=%" PRIu64
-           " blocks=%" PRIu64 " slots_per_block=%u elapsed_ns=%" PRIu64
-           " guest_elapsed_ns=%" PRIu64 " rdtime_delta=%" PRIu64
-           " timer_reads=4 checksum=%" PRIu64 "\n",
-           run_id, block_id, pair_id, pair_id, sequence, role, order, block_id,
-           level, entry->instruction, entry->encoding_bytes, entry->pattern,
-           executed_instruction, baseline_instruction, baseline_encoding,
-           requested_count, target_count, blocks, RV_SLOT_COUNT, elapsed_ns,
-           elapsed_ns, time_after - time_before, checksum);
+    if (differential) {
+        const char *differential_variant = differential_variant_for(entry);
+        if (strcmp(differential_variant, "unknown") == 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        printf("RV_WEIGHT_SAMPLE version=2"
+               " probe_contract=mygo.riscv-instruction-weight-differential.v2"
+               " operand_set=nondegenerate-7fedcba987654321-by-1f123"
+               " calibration_profile=%s"
+               " suite=%s contrast=%s"
+               " differential_variant=%s context=%s"
+               " run_id=%s block_id=%" PRIu64 " segment_id=%" PRIu64
+               " pair_id=%" PRIu64 " sequence=%" PRIu64
+               " role=%s order=%s round=%" PRIu64
+               " count_level=%u instruction=%s encoding_bytes=%u pattern=%s"
+               " executed_instruction=%s baseline_instruction=%s"
+               " baseline_encoding_bytes=%u control_instruction=empty-call"
+               " requested_count=%" PRIu64 " target_count=%" PRIu64
+               " blocks=%" PRIu64 " slots_per_block=%u elapsed_ns=%" PRIu64
+               " guest_elapsed_ns=%" PRIu64 " rdtime_delta=%" PRIu64
+               " anchor_position=%s"
+               " timer_reads=4 checksum=%" PRIu64 "\n",
+               calibration_profile, differential->suite, differential->contrast,
+               differential_variant, differential->context, run_id, block_id,
+               pair_id, pair_id, sequence, role, order, block_id, level,
+               entry->instruction, entry->encoding_bytes, entry->pattern,
+               executed_instruction, baseline_instruction, baseline_encoding,
+               requested_count, target_count, blocks, RV_SLOT_COUNT,
+               elapsed_ns, elapsed_ns, time_after - time_before,
+               anchor_position,
+               checksum);
+    } else {
+        printf("RV_WEIGHT_SAMPLE version=1 run_id=%s block_id=%" PRIu64
+               " segment_id=%" PRIu64 " pair_id=%" PRIu64
+               " sequence=%" PRIu64 " role=%s order=%s round=%" PRIu64
+               " count_level=%u instruction=%s encoding_bytes=%u pattern=%s"
+               " executed_instruction=%s baseline_instruction=%s"
+               " baseline_encoding_bytes=%u control_instruction=empty-call"
+               " requested_count=%" PRIu64 " target_count=%" PRIu64
+               " blocks=%" PRIu64 " slots_per_block=%u elapsed_ns=%" PRIu64
+               " guest_elapsed_ns=%" PRIu64 " rdtime_delta=%" PRIu64
+               " timer_reads=4 checksum=%" PRIu64 "\n",
+               run_id, block_id, pair_id, pair_id, sequence, role, order,
+               block_id, level, entry->instruction, entry->encoding_bytes,
+               entry->pattern, executed_instruction, baseline_instruction,
+               baseline_encoding, requested_count, target_count, blocks,
+               RV_SLOT_COUNT, elapsed_ns, elapsed_ns, time_after - time_before,
+               checksum);
+    }
     return 0;
 }
 
@@ -998,8 +1221,11 @@ int main(int argc, char **argv)
     const char *filter = "all";
     const char *run_id = "default";
     static const uint64_t level_multipliers[] = {1, 4, 16};
+    static const uint64_t long_calibration_multipliers[] = {16, 64, 256};
     const size_t case_count =
         sizeof(instruction_cases) / sizeof(instruction_cases[0]);
+    const size_t differential_case_count =
+        sizeof(differential_cases) / sizeof(differential_cases[0]);
     struct aligned_data data = {0};
 
     if (argc > 1 && parse_u64(argv[1], 1, UINT64_C(1000000), &base_blocks) != 0) {
@@ -1019,68 +1245,179 @@ int main(int argc, char **argv)
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
 
+    int long_calibration_mode =
+        strcmp(filter, "differential-v2-long-calibration") == 0 ||
+        strcmp(filter, "calibration-v2-long") == 0;
+    int calibration_only = strcmp(filter, "calibration-v2-long") == 0;
+    int differential_mode = strcmp(filter, "differential-v2") == 0 ||
+                            long_calibration_mode;
+    const char *calibration_profile =
+        long_calibration_mode ? "long-window-v1" : "standard-v2";
+    size_t selected_differential_cases =
+        calibration_only ? 1 : differential_case_count;
     size_t selected_count = 0;
-    for (size_t index = 0; index < case_count; ++index) {
-        selected_count += selected(filter, &instruction_cases[index]) != 0;
+    if (differential_mode) {
+        selected_count = selected_differential_cases;
+    } else {
+        for (size_t index = 0; index < case_count; ++index) {
+            selected_count += selected(filter, &instruction_cases[index]) != 0;
+        }
     }
     if (selected_count == 0) {
         fprintf(stderr, "RV_WEIGHT_ERROR unknown_filter=%s\n", filter);
         return 2;
     }
-    if (base_blocks > UINT64_MAX / level_multipliers[2] ||
-        base_blocks * level_multipliers[2] > UINT64_MAX / RV_SLOT_COUNT) {
+    uint64_t maximum_multiplier = long_calibration_mode
+                                      ? long_calibration_multipliers[2]
+                                      : level_multipliers[2];
+    if (base_blocks > UINT64_MAX / maximum_multiplier ||
+        base_blocks * maximum_multiplier > UINT64_MAX / RV_SLOT_COUNT) {
         fprintf(stderr, "RV_WEIGHT_ERROR count_overflow=1\n");
         return 2;
     }
 
-    printf("RV_WEIGHT_BENCH version=1 arch=riscv64 isa=rv64imafdc"
-           " cases=%zu selected=%zu base_blocks=%" PRIu64
-           " levels=3 rounds=%" PRIu64 " filter=%s run_id=%s"
-           " slots_per_block=%u extensions=zicsr,zifencei,zihintpause"
-           " fp_operands=normal-deterministic clock=monotonic_raw"
-           " independent_clock=rdtime\n",
-           case_count, selected_count, base_blocks, rounds, filter, run_id,
-           RV_SLOT_COUNT);
-    printf("RV_WEIGHT_UNSUPPORTED version=1 classes=privileged,trap,cbo-user-disabled,vector"
-           " policy=separate-contextual-probes\n");
+    if (differential_mode) {
+        printf("RV_WEIGHT_BENCH version=2 arch=riscv64 isa=rv64imafdc"
+               " suite=differential-v2 cases=%zu selected=%zu"
+               " base_blocks=%" PRIu64 " levels=3 rounds=%" PRIu64
+               " filter=%s run_id=%s slots_per_block=%u"
+               " calibration_profile=%s"
+               " calibration_level_multipliers=%s"
+               " operand_policy=nondegenerate-per-slot-reset"
+               " clock=monotonic_raw independent_clock=rdtime\n",
+               differential_case_count, selected_count, base_blocks, rounds,
+               filter, run_id, RV_SLOT_COUNT, calibration_profile,
+               long_calibration_mode ? "16,64,256" : "1,4,16");
+        printf("RV_WEIGHT_UNSUPPORTED version=2"
+               " classes=privileged,trap,cbo-user-disabled,vector"
+               " policy=separate-contextual-probes\n");
+    } else {
+        printf("RV_WEIGHT_BENCH version=1 arch=riscv64 isa=rv64imafdc"
+               " cases=%zu selected=%zu base_blocks=%" PRIu64
+               " levels=3 rounds=%" PRIu64 " filter=%s run_id=%s"
+               " slots_per_block=%u extensions=zicsr,zifencei,zihintpause"
+               " fp_operands=normal-deterministic clock=monotonic_raw"
+               " independent_clock=rdtime\n",
+               case_count, selected_count, base_blocks, rounds, filter, run_id,
+               RV_SLOT_COUNT);
+        printf("RV_WEIGHT_UNSUPPORTED version=1"
+               " classes=privileged,trap,cbo-user-disabled,vector"
+               " policy=separate-contextual-probes\n");
+    }
 
     /* 预翻译所有会进入测量窗口的 kernel，避免首轮 TCG 翻译成本。 */
     reset_probe_data(&data);
     rv_kernel_empty((uintptr_t)&data, 0);
-    for (size_t index = 0; index < case_count; ++index) {
-        if (!selected(filter, &instruction_cases[index])) {
-            continue;
+    if (differential_mode) {
+        for (size_t index = 0; index < selected_differential_cases; ++index) {
+            const struct instruction_case *entry =
+                &differential_cases[index].instruction_case;
+            uintptr_t arg0;
+            uintptr_t arg1;
+            arguments_for(entry, &data, &arg0, &arg1);
+            prepare_window_state(entry, &data, 1);
+            entry->probe(arg0, arg1);
+            prepare_window_state(entry, &data, 0);
+            entry->baseline(arg0, arg1);
         }
-        uintptr_t arg0;
-        uintptr_t arg1;
-        arguments_for(&instruction_cases[index], &data, &arg0, &arg1);
-        prepare_window_state(&instruction_cases[index], &data, 1);
-        instruction_cases[index].probe(arg0, arg1);
-        prepare_window_state(&instruction_cases[index], &data, 0);
-        instruction_cases[index].baseline(arg0, arg1);
+    } else {
+        for (size_t index = 0; index < case_count; ++index) {
+            if (!selected(filter, &instruction_cases[index])) {
+                continue;
+            }
+            uintptr_t arg0;
+            uintptr_t arg1;
+            arguments_for(&instruction_cases[index], &data, &arg0, &arg1);
+            prepare_window_state(&instruction_cases[index], &data, 1);
+            instruction_cases[index].probe(arg0, arg1);
+            prepare_window_state(&instruction_cases[index], &data, 0);
+            instruction_cases[index].baseline(arg0, arg1);
+        }
     }
     /* 首个不记样本的窗口预热 marker、run_blocks 与 stop TB。插件默认丢弃它。 */
     run_profiled_window(rv_kernel_nop4, (uintptr_t)&data, 0, 4);
 
     size_t jobs_per_round = selected_count * 3;
     struct sample_job *jobs = calloc(jobs_per_round, sizeof(*jobs));
-    if (!jobs) {
+    unsigned char *order_schedule = calloc(
+        jobs_per_round * (size_t)rounds, sizeof(*order_schedule));
+    if (!jobs || !order_schedule) {
         fprintf(stderr, "RV_WEIGHT_ERROR allocation=jobs\n");
+        free(order_schedule);
+        free(jobs);
         return 1;
     }
     uint64_t random_state = hash_token(run_id) ^ UINT64_C(0x9e3779b97f4a7c15);
+    /*
+     * 每个 context/batch 独立生成受约束随机顺序。偶数 rounds 严格 AB/BA
+     * 各半；奇数 rounds 最多相差一对。这样保留随机化，同时避免小样本中
+     * 独立抛硬币产生的顺序失衡。
+     */
+    for (size_t slot = 0; slot < jobs_per_round; ++slot) {
+        unsigned int offset = (unsigned int)(next_random(&random_state) & 1U);
+        unsigned char *schedule = order_schedule + slot * (size_t)rounds;
+        for (size_t round = 0; round < (size_t)rounds; ++round) {
+            schedule[round] = (unsigned char)((round + offset) & 1U);
+        }
+        for (size_t index = (size_t)rounds; index > 1; --index) {
+            size_t other = (size_t)(next_random(&random_state) % index);
+            unsigned char temporary = schedule[index - 1];
+            schedule[index - 1] = schedule[other];
+            schedule[other] = temporary;
+        }
+    }
     uint64_t sequence = 0;
     uint64_t pair_id = 0;
     unsigned int failures = 0;
 
+    /*
+     * 正成本 anchor 在主随机序列之外于首部先测一次；同一用例仍会在每轮
+     * 的随机位置出现，并在末尾再测一次。这样能够分别检查启动、段内和
+     * 尾部速度尺度，且 anchor 窗口使用 long profile 提高信噪比。
+     */
+    if (differential_mode && !calibration_only) {
+        const struct differential_case *anchor = &differential_cases[1];
+        const uint64_t *anchor_multipliers =
+            long_calibration_mode ? long_calibration_multipliers
+                                  : level_multipliers;
+        uint64_t blocks = base_blocks * anchor_multipliers[1];
+        uint64_t requested_count = blocks * RV_SLOT_COUNT;
+        ++pair_id;
+        for (size_t role_index = 0; role_index < 2; ++role_index) {
+            const char *role = role_index == 0 ? "probe" : "baseline";
+            ++sequence;
+            if (measure_window(run_id, &anchor->instruction_case, anchor,
+                               calibration_profile, "head", role, "AB", 0, pair_id,
+                               sequence, 1, blocks, requested_count, &data) != 0) {
+                ++failures;
+            }
+        }
+    }
+
     for (uint64_t round = 0; round < rounds; ++round) {
         size_t job_count = 0;
-        for (size_t case_index = 0; case_index < case_count; ++case_index) {
-            if (!selected(filter, &instruction_cases[case_index])) {
-                continue;
+        size_t selected_slot = 0;
+        if (differential_mode) {
+            for (size_t case_index = 0; case_index < selected_differential_cases;
+                 ++case_index) {
+                for (unsigned int level = 0; level < 3; ++level) {
+                    jobs[job_count++] =
+                        (struct sample_job){case_index, level,
+                                            selected_slot * 3 + level};
+                }
+                ++selected_slot;
             }
-            for (unsigned int level = 0; level < 3; ++level) {
-                jobs[job_count++] = (struct sample_job){case_index, level};
+        } else {
+            for (size_t case_index = 0; case_index < case_count; ++case_index) {
+                if (!selected(filter, &instruction_cases[case_index])) {
+                    continue;
+                }
+                for (unsigned int level = 0; level < 3; ++level) {
+                    jobs[job_count++] =
+                        (struct sample_job){case_index, level,
+                                            selected_slot * 3 + level};
+                }
+                ++selected_slot;
             }
         }
         for (size_t index = job_count; index > 1; --index) {
@@ -1092,12 +1429,20 @@ int main(int argc, char **argv)
 
         for (size_t job_index = 0; job_index < job_count; ++job_index) {
             const struct sample_job *job = &jobs[job_index];
+            const struct differential_case *differential =
+                differential_mode ? &differential_cases[job->case_index] : NULL;
             const struct instruction_case *entry =
-                &instruction_cases[job->case_index];
-            uint64_t blocks =
-                base_blocks * level_multipliers[job->level];
+                differential ? &differential->instruction_case
+                             : &instruction_cases[job->case_index];
+            const uint64_t *multipliers =
+                long_calibration_mode && differential &&
+                        is_calibration_case(differential)
+                    ? long_calibration_multipliers
+                    : level_multipliers;
+            uint64_t blocks = base_blocks * multipliers[job->level];
             uint64_t requested_count = blocks * RV_SLOT_COUNT;
-            int probe_first = (next_random(&random_state) & 1U) == 0;
+            int probe_first =
+                order_schedule[job->order_slot * (size_t)rounds + round] == 0;
             const char *order = probe_first ? "AB" : "BA";
             const char *roles[2] = {
                 probe_first ? "probe" : "baseline",
@@ -1106,7 +1451,12 @@ int main(int argc, char **argv)
             ++pair_id;
             for (size_t role_index = 0; role_index < 2; ++role_index) {
                 ++sequence;
-                if (measure_window(run_id, entry, roles[role_index], order,
+                if (measure_window(run_id, entry, differential,
+                                   calibration_profile,
+                                   is_stability_anchor(differential)
+                                       ? "body"
+                                       : "not-anchor",
+                                   roles[role_index], order,
                                    round + 1, pair_id, sequence, job->level,
                                    blocks, requested_count, &data) != 0) {
                     fprintf(stderr,
@@ -1118,15 +1468,36 @@ int main(int argc, char **argv)
             }
         }
     }
+    if (differential_mode && !calibration_only) {
+        const struct differential_case *anchor = &differential_cases[1];
+        const uint64_t *anchor_multipliers =
+            long_calibration_mode ? long_calibration_multipliers
+                                  : level_multipliers;
+        uint64_t blocks = base_blocks * anchor_multipliers[1];
+        uint64_t requested_count = blocks * RV_SLOT_COUNT;
+        ++pair_id;
+        for (size_t role_index = 0; role_index < 2; ++role_index) {
+            const char *role = role_index == 0 ? "baseline" : "probe";
+            ++sequence;
+            if (measure_window(run_id, &anchor->instruction_case, anchor,
+                               calibration_profile, "tail", role, "BA", rounds + 1,
+                               pair_id, sequence, 1, blocks, requested_count,
+                               &data) != 0) {
+                ++failures;
+            }
+        }
+    }
+    free(order_schedule);
     free(jobs);
-    printf("RV_WEIGHT_BENCH_DONE version=1 status=%u pairs=%" PRIu64
+    printf("RV_WEIGHT_BENCH_DONE version=%u status=%u pairs=%" PRIu64
            " windows=%" PRIu64 "\n",
-           failures ? 1U : 0U, pair_id, sequence);
+           differential_mode ? 2U : 1U, failures ? 1U : 0U, pair_id,
+           sequence);
     return failures ? 1 : 0;
 
 usage:
     fprintf(stderr,
-            "usage: %s [base_blocks [rounds [instruction[:2|4]|all [run_id]]]]\n",
+            "usage: %s [base_blocks [rounds [instruction[:2|4]|all|differential-v2|differential-v2-long-calibration|calibration-v2-long [run_id]]]]\n",
             argv[0]);
     return 2;
 }

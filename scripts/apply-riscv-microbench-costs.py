@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from riscv_instruction_encoding import decode_riscv64_instruction
+from riscv_weight_model_seal import ModelSealError, verify_model_document_seal
+from riscv_weight_provenance import (
+    ProvenanceError,
+    discover_provenance_root,
+    verify_finalized_model,
+)
 from rv_instruction_profile_io import (
     PerfSample,
     RvTcgQuality,
@@ -31,6 +37,20 @@ MIX_SCHEMA = "mygo.riscv-instruction-mix.v1"
 CATALOG_SCHEMA = "mygo.riscv-tb-catalog.v1"
 OUTPUT_SCHEMA = "mygo.riscv-buildstorm-microbench-costs.v1"
 MODEL_KEY = "raw-encoding+semantic-decoding+execution-pattern"
+REQUIRED_PUBLICATION_COMPONENTS = frozenset(
+    {
+        "statistical_core",
+        "raw",
+        "anchor_adjusted",
+        "positive_anchor",
+        "raw_adjusted_discrepancy",
+        "estimator_sensitivity",
+        "single_super_run_influence",
+        "joint_bootstrap",
+        "host_isolation",
+        "ml_validation",
+    }
+)
 VCPU_COMM = re.compile(r"CPU ([0-9]+)/TCG\Z")
 
 
@@ -243,25 +263,155 @@ def restricted_reason(decoded: Any) -> str | None:
     return None
 
 
-def load_model(path: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+def load_model(
+    path: Path,
+    *,
+    require_publication: bool = True,
+    require_provenance: bool = False,
+    provenance_root: Path | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """读取权重模型；正式成本消费者必须要求 publication seal。
+
+    syscall 指令路径分析可以显式读取未封印的诊断模型，但该模式只用于
+    诊断报告，不能绕过 mapper/apply 的正式发布门禁。
+    """
     model = json.loads(path.read_text(encoding="utf-8"))
-    require(model.get("schema_version") == 2, "unsupported weight model schema")
+    if require_publication:
+        try:
+            verify_model_document_seal(model)
+            if require_provenance:
+                root = provenance_root or discover_provenance_root(path)
+                verify_finalized_model(path, root=root)
+        except (ModelSealError, ProvenanceError) as error:
+            raise CostError(str(error)) from error
+    require(model.get("schema_version") == 3, "unsupported weight model schema")
     require(model.get("instruction_key") == MODEL_KEY, "unsupported instruction key")
+    if require_publication:
+        publication_gate = model.get("publication_gate")
+        require(
+            isinstance(publication_gate, Mapping)
+            and publication_gate.get("passed") is True,
+            "weight model publication gate did not pass",
+        )
+        components = publication_gate.get("components")
+        require(
+            isinstance(components, Mapping)
+            and all(
+                components.get(name) is True
+                for name in REQUIRED_PUBLICATION_COMPONENTS
+            ),
+            "weight model publication components are incomplete",
+        )
+        host_audit = model.get("host_isolation_audit")
+        host_binding = model.get("host_isolation_audit_binding")
+        require(
+            isinstance(host_audit, Mapping)
+            and host_audit.get("schema") == "mygo.riscv-weight-host-audit.v1"
+            and host_audit.get("status") == "accepted",
+            "weight model lacks an accepted host isolation audit",
+        )
+        require(
+            model.get("host_isolation_audit_source") == "current"
+            and isinstance(host_binding, Mapping)
+            and host_binding.get("schema")
+            == "mygo.riscv-weight-host-audit-binding.v1"
+            and host_binding.get("source") == "current"
+            and host_binding.get("publication_allowed") is True,
+            "weight model host isolation audit is not bound to this acquisition",
+        )
+        ml_validation = model.get("ml_validation")
+        ml_conclusion = (
+            ml_validation.get("conclusion")
+            if isinstance(ml_validation, Mapping)
+            else None
+        )
+        ml_evidence = model.get("ml_validation_evidence")
+        ml_evidence_checks = (
+            ml_evidence.get("checks")
+            if isinstance(ml_evidence, Mapping)
+            else None
+        )
+        ml_binding_checks = (
+            ml_evidence.get("binding_checks")
+            if isinstance(ml_evidence, Mapping)
+            else None
+        )
+        require(
+            isinstance(ml_validation, Mapping)
+            and ml_validation.get("schema")
+            == "mygo.riscv-instruction-ml-validation.v3"
+            and isinstance(ml_conclusion, Mapping)
+            and ml_conclusion.get("status") == "supported"
+            and ml_conclusion.get("high_confidence_status") == "supported"
+            and ml_conclusion.get("high_confidence_gate_passed") is True
+            and ml_conclusion.get("may_publish_weights") is False,
+            "weight model lacks a supported independent ML validation",
+        )
+        require(
+            isinstance(ml_evidence, Mapping)
+            and ml_evidence.get("schema")
+            == "mygo.riscv-instruction-ml-validation.v3"
+            and isinstance(ml_evidence_checks, Mapping)
+            and bool(ml_evidence_checks)
+            and all(value is True for value in ml_evidence_checks.values())
+            and isinstance(ml_binding_checks, Mapping)
+            and set(ml_binding_checks)
+            == {"samples", "statistical_weights_pre_finalization"}
+            and all(value is True for value in ml_binding_checks.values()),
+            "weight model ML evidence or verified input bindings are incomplete",
+        )
     by_semantic: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for item in model.get("instructions", []):
         key = item.get("key", {})
         semantic = key.get("semantic_encoding_key")
         require(isinstance(semantic, str) and semantic, "model item lacks semantic key")
-        value = item.get("ns_per_instruction")
-        interval = item.get("simultaneous_ci")
+        if item.get("calibration_only") is True:
+            continue
+        value = item.get("published_ns_per_instruction")
+        adjusted = item.get("anchor_adjusted")
+        adjusted_value = (
+            adjusted.get("ns_per_instruction")
+            if isinstance(adjusted, Mapping)
+            else None
+        )
+        interval = (
+            adjusted.get("simultaneous_ci")
+            if isinstance(adjusted, Mapping)
+            else None
+        )
+        publishable = item.get("quality") == "high-confidence"
         require(
-            isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value),
+            publishable == (value is not None),
+            f"model {semantic} publication state disagrees with quality",
+        )
+        if not publishable:
+            # 低置信上下文仍被 seal 覆盖并保留作审计，但不进入正式成本
+            # 索引。遇到该 encoding 时由 missing/unpriced 路径传播未知成本。
+            continue
+        require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and float(value) >= 0.0,
             f"model {semantic} has invalid estimate",
+        )
+        require(
+            isinstance(adjusted_value, (int, float))
+            and not isinstance(adjusted_value, bool)
+            and math.isfinite(adjusted_value)
+            and float(adjusted_value) == float(value),
+            f"model {semantic} published estimate disagrees with anchor-adjusted estimate",
         )
         require(
             isinstance(interval, list)
             and len(interval) == 2
-            and all(isinstance(x, (int, float)) and math.isfinite(x) for x in interval),
+            and all(
+                isinstance(x, (int, float))
+                and not isinstance(x, bool)
+                and math.isfinite(x)
+                for x in interval
+            )
+            and float(interval[0]) <= float(interval[1]),
             f"model {semantic} has invalid simultaneous interval",
         )
         by_semantic[semantic].append(item)
@@ -277,7 +427,9 @@ def descriptor_estimate(
     )
     contexts = [item for key in sorted(semantic_keys) for item in model.get(key, [])]
     if missing or not contexts or restrictions:
-        diagnostic_values = [float(item["ns_per_instruction"]) for item in contexts]
+        diagnostic_values = [
+            float(item["published_ns_per_instruction"]) for item in contexts
+        ]
         return {
             "assignment": "restricted" if restrictions else "unpriced",
             "quality": "restricted-context" if restrictions else "unmeasured",
@@ -294,9 +446,15 @@ def descriptor_estimate(
             "restrictions": restrictions,
             "context_count": len(contexts),
         }
-    values = [float(item["ns_per_instruction"]) for item in contexts]
-    lows = [max(0.0, float(item["simultaneous_ci"][0])) for item in contexts]
-    highs = [max(0.0, float(item["simultaneous_ci"][1])) for item in contexts]
+    values = [float(item["published_ns_per_instruction"]) for item in contexts]
+    lows = [
+        max(0.0, float(item["anchor_adjusted"]["simultaneous_ci"][0]))
+        for item in contexts
+    ]
+    highs = [
+        max(0.0, float(item["anchor_adjusted"]["simultaneous_ci"][1]))
+        for item in contexts
+    ]
     qualities = {str(item.get("quality")) for item in contexts}
     unique_context = len(contexts) == 1 and len(semantic_keys) == 1
     strict = unique_context and qualities == {"high-confidence"}
@@ -476,11 +634,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--weights", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--stages", type=Path)
+    parser.add_argument(
+        "--provenance-root",
+        type=Path,
+        help="final weights acquisition root；省略时从 manifest 路径唯一推导",
+    )
     arguments = parser.parse_args(argv)
     run_dir = arguments.run_dir.resolve()
     output_dir = (arguments.output_dir or run_dir / "microbench-costs").resolve()
     mix = parse_mix(run_dir / "instruction-mix.jsonl")
-    model_by_semantic, model_metadata = load_model(arguments.weights.resolve())
+    model_by_semantic, model_metadata = load_model(
+        arguments.weights.resolve(),
+        require_provenance=True,
+        provenance_root=(
+            None
+            if arguments.provenance_root is None
+            else arguments.provenance_root.resolve()
+        ),
+    )
     semantics, semantic_metadata, catalog_stats = parse_descriptor_semantics(
         run_dir / "instruction-catalog.jsonl", set(mix["totals"])
     )

@@ -117,6 +117,13 @@ stop_pc=$(printf '%s\n' "$symbols" | \
     echo "instruction-weight marker symbols are unavailable" >&2
     exit 1
 }
+trap_entry_pc=$(docker run --rm -v "$root":/work -w /work "$image" \
+    riscv64-linux-musl-nm -n /work/kernel-rv | \
+    awk '$3 == "__riscv_exception_entry" {print "0x" $1}')
+[ "$(printf '%s\n' "$trap_entry_pc" | awk 'NF {n++} END {print n+0}')" -eq 1 ] || {
+    echo "kernel trap entry symbol is missing or ambiguous" >&2
+    exit 1
+}
 exec_load=$(docker run --rm -v "$root":/work -w /work "$image" \
     riscv64-linux-musl-readelf -W -l \
         /work/build/riscv64/instruction-weight/riscv-instruction-weight.elf | \
@@ -131,8 +138,9 @@ for mode in timing validation; do
     plugin_options="$plugin_options,mode=$mode"
     plugin_options="$plugin_options,output=/work/$relative_work/$mode.jsonl"
     plugin_options="$plugin_options,start_pc=$start_pc,stop_pc=$stop_pc"
+    plugin_options="$plugin_options,trap_entry_pc=$trap_entry_pc"
     plugin_options="$plugin_options,user_min_pc=$user_min_pc,user_max_pc=$user_max_pc"
-    append="riscv_weight_base_blocks=1 riscv_weight_rounds=1"
+    append="timer_hz=0 riscv_weight_base_blocks=1 riscv_weight_rounds=1"
     append="$append riscv_weight_case=addi:4 riscv_weight_run_id=plugin-$mode"
     docker run --rm -v "$root":/work -w /work "$image" sh -c '
         timeout -k 5 "$1" qemu-system-riscv64 \
@@ -164,6 +172,11 @@ for mode in ("timing", "validation"):
     assert all(isinstance(row["translations_during_window"], int) for row in windows)
     assert all(
         isinstance(row["scoped_translations_during_window"], int)
+        for row in windows
+    )
+    assert all(
+        isinstance(row["guest_trap_entries_during_window"], int)
+        and row["guest_trap_entries_during_window"] == 0
         for row in windows
     )
     if mode == "timing":
