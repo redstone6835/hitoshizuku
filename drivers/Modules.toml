@@ -131,6 +131,15 @@ targets = "loongarch64-unknown-none"
 after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
 
 [[modules]]
+name = "platform.ls2k-tsensor"
+path = "ls2k-tsensor"
+config = "CONFIG_LS2K_TSENSOR"
+prompt = "Loongson LS2K 温度传感器驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq"
+
+[[modules]]
 name = "platform.ls2k-usb"
 path = "ls2k-usb"
 config = "CONFIG_LS2K_USB"
