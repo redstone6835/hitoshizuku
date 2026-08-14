@@ -18,6 +18,7 @@ fn main() {
     generate_elm_build_bound(&root, &out_dir, &target);
     generate_soyo_trust_policy(&root, &out_dir);
     link_integrated_components();
+    select_kernel_linker_script(&root, &target);
 
     println!("cargo:rerun-if-env-changed=INITRAMFS");
     println!("cargo:rerun-if-env-changed=ELM_TRUST_ANCHORS_FILE");
@@ -35,6 +36,38 @@ fn main() {
     }
     println!("cargo:rustc-env=ELM_TARGET_TRIPLE={target}");
     println!("cargo:rustc-env=ELM_RUSTC_VERSION={}", rustc_version_line());
+}
+
+/// 按目标架构选择内核链接脚本，并作为 bin 链接参数注入。
+///
+/// 链接脚本原先硬编码在 `.cargo/config.toml` 的 rustflags 中；移到 build.rs
+/// 后可以用环境变量选择板级脚本：
+///
+/// - riscv64：`qemu-riscv64.ld`（QEMU virt / OpenSBI 直启）。
+/// - loongarch64：默认 `qemu-loongarch64.ld`（QEMU virt 直启）；
+///   - `MYGO_LA_BOARD=ls2k1000` → `ls2k1000.ld`（2K1000LA 板 fork U-Boot
+///     装载于物理 0x200000）；
+///   - `MYGO_LA_DEBUG_LINKER=1` → `qemu-loongarch64-debug.ld`（ELF 输出，
+///     QEMU loongarch64 virt 的 `-kernel` 只接受 ELF）。
+fn select_kernel_linker_script(root: &Path, target: &str) {
+    println!("cargo:rerun-if-env-changed=MYGO_LA_BOARD");
+    println!("cargo:rerun-if-env-changed=MYGO_LA_DEBUG_LINKER");
+    let script = match target {
+        "riscv64gc-unknown-none-elf" => "kernel/linker/qemu-riscv64.ld",
+        "loongarch64-unknown-none" => {
+            if std::env::var_os("MYGO_LA_DEBUG_LINKER").is_some_and(|v| v == "1") {
+                "kernel/linker/qemu-loongarch64-debug.ld"
+            } else if std::env::var_os("MYGO_LA_BOARD").is_some_and(|v| v == "ls2k1000") {
+                "kernel/linker/ls2k1000.ld"
+            } else {
+                "kernel/linker/qemu-loongarch64.ld"
+            }
+        }
+        _ => return,
+    };
+    let path = root.join(script);
+    println!("cargo:rerun-if-changed={}", path.display());
+    println!("cargo:rustc-link-arg-bin=kernel=-T{}", path.display());
 }
 
 struct ConfiguredBuildBoundModule {
