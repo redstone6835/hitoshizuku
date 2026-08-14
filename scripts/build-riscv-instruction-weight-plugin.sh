@@ -4,6 +4,9 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 output=${1:-"$root/build/qemu-plugins/riscv_instruction_weight.so"}
 image=${RISCV_WEIGHT_CONTAINER:-zhouzhouyi/os-contest:20260510}
+container_runtime=${RISCV_WEIGHT_CONTAINER_RUNTIME:-docker}
+container_mount_suffix=${RISCV_WEIGHT_CONTAINER_MOUNT_SUFFIX:-}
+container_run_arguments=${RISCV_WEIGHT_CONTAINER_RUN_ARGUMENTS:-}
 
 case "$output" in
     /*) ;;
@@ -16,7 +19,10 @@ esac
 relative=${output#"$root"/}
 mkdir -p "$(dirname "$output")"
 
-docker run --rm -v "$root":/work -w /work "$image" sh -c '
+case "$container_mount_suffix" in ''|:z|:Z) ;; *) exit 2 ;; esac
+# shellcheck disable=SC2086
+"$container_runtime" run $container_run_arguments --rm \
+    -v "$root:/work$container_mount_suffix" -w /work "$image" sh -c '
     set -eu
     cc -std=c11 -O2 -g0 -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
         -shared -pthread -I/opt/qemu-bin-10.0.2/include \

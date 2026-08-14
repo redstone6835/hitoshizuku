@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::set_csr;
+use crate::{clear_csr, set_csr};
 
 use super::csr::SIE_STIE;
 use super::sbi;
@@ -161,6 +161,17 @@ pub fn init_periodic_timer(timer_hz: usize) {
     let deadline = stable_counter_raw().saturating_add(period);
     NEXT_TIMER_DEADLINES[current_timer_cpu()].store(deadline, Ordering::Release);
     arm_timer_at(deadline);
+}
+
+/// 禁用当前 hart 的周期性调度 timer。
+///
+/// 仅供单 vCPU、无阻塞等待的确定性测量启动使用。普通内核仍必须调用
+/// [`init_periodic_timer`]；关闭后 sleep、超时和抢占不会由周期 tick 推进。
+pub fn disable_periodic_timer() {
+    clear_csr!(sie, SIE_STIE);
+    TIMER_HZ.store(0, Ordering::Release);
+    NEXT_TIMER_DEADLINES[current_timer_cpu()].store(u64::MAX, Ordering::Release);
+    arm_timer_at(u64::MAX);
 }
 
 /// 在 timer interrupt handler 中重装下一次 tick。

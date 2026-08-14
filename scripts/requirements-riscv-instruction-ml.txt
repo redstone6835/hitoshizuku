@@ -1,0 +1,6 @@
+joblib==1.5.3
+narwhals==2.24.0
+numpy==2.5.2
+scikit-learn==1.9.0
+scipy==1.18.0
+threadpoolctl==3.6.0
