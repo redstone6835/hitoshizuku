@@ -116,6 +116,11 @@
 
 #include "chapters/chapter-13.typ"
 
+#manual-running-title.update(chapter-14-title)
+#pagebreak()
+
+#include "chapters/chapter-14.typ"
+
 #manual-running-title.update(appendix-title)
 #pagebreak()
 
