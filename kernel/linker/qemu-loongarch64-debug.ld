@@ -2,127 +2,26 @@ OUTPUT_FORMAT(elf64-loongarch)
 OUTPUT_ARCH(loongarch64)
 ENTRY(_start)
 
+/* 与 release 版 qemu-loongarch64.ld 同构（ELF 输出，供 QEMU/gdb 调试）。
+   QEMU virt 直启装载基址：
+   QEMU loongarch64 virt 的默认内核装载地址为 0x90000000；
+   2K1000LA 开发板 fork U-Boot 装载于物理 0x200000（见 ls2k1000.ld）。 */
 BASE_ADDRESS = 0x90000000;
-
-PECOFF_FILE_ALIGN = 0x200;
-PECOFF_SEGMENT_ALIGN = 0x10000;
-
-IMAGE_NT_SIGNATURE = 0x00004550;
-IMAGE_FILE_MACHINE_LOONGARCH64 = 0x6264;
-IMAGE_FILE_EXECUTABLE_IMAGE = 0x0002;
-IMAGE_FILE_LINE_NUMS_STRIPPED = 0x0004;
-IMAGE_FILE_DEBUG_STRIPPED = 0x0200;
-IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x020b;
-IMAGE_SUBSYSTEM_EFI_APPLICATION = 0x0a;
-IMAGE_SCN_CNT_CODE = 0x00000020;
-IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040;
-IMAGE_SCN_MEM_EXECUTE = 0x20000000;
-IMAGE_SCN_MEM_READ = 0x40000000;
-IMAGE_SCN_MEM_WRITE = 0x80000000;
-LINUX_EFISTUB_MAJOR_VERSION = 0x3;
-LINUX_EFISTUB_MINOR_VERSION = 0x0;
-LINUX_PE_MAGIC = 0x818223cd;
+VIRTUAL_BASE_ADDRESS = 0x9000000090000000;
+LOAD_OFFSET = VIRTUAL_BASE_ADDRESS - BASE_ADDRESS;
 
 SECTIONS
 {
-    . = BASE_ADDRESS;
+    . = VIRTUAL_BASE_ADDRESS;
     skernel = .;
-    _head = .;
 
-    .head : AT(BASE_ADDRESS) {
-        efi_header_begin = .;
-
-        SHORT(0x5a4d)
-        . = efi_header_begin + 0x8;
-        QUAD(ABSOLUTE(_start))
-        QUAD(ABSOLUTE(ekernel - skernel))
-        QUAD(BASE_ADDRESS)
-        . = efi_header_begin + 0x38;
-        LONG(LINUX_PE_MAGIC)
-        LONG(pe_header - efi_header_begin)
-
-        pe_header = .;
-        LONG(IMAGE_NT_SIGNATURE)
-        SHORT(IMAGE_FILE_MACHINE_LOONGARCH64)
-        SHORT(2)
-        LONG(0)
-        LONG(0)
-        LONG(0)
-        SHORT(section_table - optional_header)
-        SHORT(IMAGE_FILE_DEBUG_STRIPPED | IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LINE_NUMS_STRIPPED)
-
-        optional_header = .;
-        SHORT(IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        BYTE(0x02)
-        BYTE(0x14)
-        LONG(etext - pecoff_header_end)
-        LONG(edata - etext)
-        LONG(ebss - edata)
-        LONG(efi_pe_entry_trampoline - skernel)
-        LONG(pecoff_header_end - skernel)
-
-        QUAD(BASE_ADDRESS)
-        LONG(PECOFF_SEGMENT_ALIGN)
-        LONG(PECOFF_FILE_ALIGN)
-        SHORT(0)
-        SHORT(0)
-        SHORT(LINUX_EFISTUB_MAJOR_VERSION)
-        SHORT(LINUX_EFISTUB_MINOR_VERSION)
-        SHORT(0)
-        SHORT(0)
-        LONG(0)
-        LONG(ekernel - skernel)
-        LONG(pecoff_header_end - skernel)
-        LONG(0)
-        SHORT(IMAGE_SUBSYSTEM_EFI_APPLICATION)
-        SHORT(0)
-        QUAD(0)
-        QUAD(0)
-        QUAD(0)
-        QUAD(0)
-        LONG(0)
-        LONG(6)
-
-        QUAD(0)
-        QUAD(0)
-        QUAD(0)
-        QUAD(0)
-        QUAD(0)
-        QUAD(0)
-
-        section_table = .;
-        LONG(0x7865742e)
-        LONG(0x00000074)
-        LONG(etext - pecoff_header_end)
-        LONG(pecoff_header_end - skernel)
-        LONG(etext - pecoff_header_end)
-        LONG(pecoff_header_end - skernel)
-        LONG(0)
-        LONG(0)
-        SHORT(0)
-        SHORT(0)
-        LONG(IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)
-
-        LONG(0x7461642e)
-        LONG(0x00000061)
-        LONG(ebss - etext)
-        LONG(etext - skernel)
-        LONG(edata - etext)
-        LONG(etext - skernel)
-        LONG(0)
-        LONG(0)
-        SHORT(0)
-        SHORT(0)
-        LONG(IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
-
-        . = efi_header_begin + PECOFF_SEGMENT_ALIGN;
-        pecoff_header_end = .;
-    }
-
+    /* 无 EFI/PE 头部：U-Boot（bootm/booti）与 QEMU -kernel 都跳到装载基址，
+       _start 必须是镜像首字节。启动 ABI 遵循 LoongArch Linux 协议：
+       a0=efi_boot（U-Boot 直启为 0）、a1=cmdline 或 DTB、a2=EFI system table 或 DTB。 */
     stext = .;
-    .text ALIGN(4K) : AT(ADDR(.text)) {
+    .text ALIGN(4K) : AT(ADDR(.text) - LOAD_OFFSET) {
+        KEEP(*(.text.entry.boot))
         KEEP(*(.text.entry))
-        KEEP(*(.text.efi.entry))
         . = ALIGN(4K);
         KEEP(*(.text.trap.eentry))
         . = ALIGN(4K);
@@ -137,10 +36,10 @@ SECTIONS
         *(.text.trampoline_kernel);
     }
 
-    . = ALIGN(PECOFF_SEGMENT_ALIGN);
+    . = ALIGN(0x10000);
     etext = .;
     srodata = .;
-    .rodata ALIGN(4K) : AT(ADDR(.rodata)) {
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - LOAD_OFFSET) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
         . = ALIGN(8);
@@ -173,17 +72,17 @@ SECTIONS
     . = ALIGN(8);
 
     sdata = .;
-    .data ALIGN(4K) : AT(ADDR(.data)) {
+    .data ALIGN(4K) : AT(ADDR(.data) - LOAD_OFFSET) {
         . = ALIGN(4K);
         *(.data.prepage .data.prepage.*)
         . = ALIGN(4K);
         *(.data .data.*)
         *(.sdata .sdata.*)
-        . = ALIGN(PECOFF_FILE_ALIGN);
+        . = ALIGN(4K);
     }
 
     edata = .;
-    .bss (NOLOAD) : AT(ADDR(.bss)) {
+    .bss (NOLOAD) : AT(ADDR(.bss) - LOAD_OFFSET) {
         PROVIDE(sheap = .);
         *(.bss.heap)
         . += 0x04000000;
@@ -201,21 +100,17 @@ SECTIONS
 
     . = ALIGN(4K);
     ebss = .;
-    . = ALIGN(PECOFF_SEGMENT_ALIGN);
+    . = ALIGN(0x10000);
     ekernel = .;
 
-    .debug_info       0 : { *(.debug_info) }
-    .debug_abbrev     0 : { *(.debug_abbrev) }
-    .debug_str        0 : { *(.debug_str) }
-    .debug_line       0 : { *(.debug_line) }
-    .debug_line_str   0 : { *(.debug_line_str) }
-    .debug_ranges     0 : { *(.debug_ranges) }
-    .debug_rnglists   0 : { *(.debug_rnglists) }
-    .debug_loc        0 : { *(.debug_loc) }
-    .debug_loclists   0 : { *(.debug_loclists) }
-    .debug_frame      0 : { *(.debug_frame) }
-    .debug_aranges    0 : { *(.debug_aranges) }
-    .debug_macro      0 : { *(.debug_macro) }
-    .debug_pubnames   0 : { *(.debug_pubnames) }
-    .debug_pubtypes   0 : { *(.debug_pubtypes) }
+    . = ALIGN(8);
+
+    .debug_line : {
+        KEEP(*(.debug_line))
+    }
+
+    . = ALIGN(8);
 }
+
+ASSERT(_start == VIRTUAL_BASE_ADDRESS,
+       "LoongArch64 boot entry must be the first byte of the load image")
