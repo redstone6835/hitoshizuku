@@ -22,6 +22,7 @@ use general::{StartBootProtocol, StartFirmwareSource};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BootRegisters {
     /// `$a0`：efi_boot 标志（U-Boot 直启为 0）。
+    #[allow(dead_code)]
     pub(crate) efi_boot_flag: usize,
     /// `$a1`：命令行或 DTB 物理地址（0 也可能是有效地址）。
     #[allow(dead_code)]
@@ -65,8 +66,6 @@ pub(crate) trait FirmwareSnapshot {
 /// 协议适配器快照后的统一固件交接。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FirmwareHandoff {
-    /// 选定的固件来源（固定为 DTB）。
-    pub(crate) source: StartFirmwareSource,
     /// 本次启动使用的有效协议。
     pub(crate) protocol: StartBootProtocol,
     /// 协议适配器的诊断名称。
@@ -77,7 +76,6 @@ impl FirmwareHandoff {
     /// 构造 DTB 来源的交接。
     pub(crate) const fn dtb_source() -> Self {
         Self {
-            source: StartFirmwareSource::Dtb,
             protocol: StartBootProtocol::LinuxBoot,
             adapter: "u-boot-direct",
         }
@@ -91,6 +89,9 @@ impl FirmwareHandoff {
 /// `$a2` 配置表取得 FDT）。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BootProtocolDispatcher {
+    /// `_start` 原始参数快照，仅保留诊断语义（当前分派恒为 LinuxBoot，
+    /// 不再读取字段值）。
+    #[allow(dead_code)]
     regs: BootRegisters,
 }
 
@@ -160,7 +161,6 @@ mod tests {
         let handoff = BootProtocolDispatcher::new(regs)
             .dispatch(&mut engine)
             .unwrap();
-        assert_eq!(handoff.source, StartFirmwareSource::Dtb);
         assert_eq!(handoff.protocol, StartBootProtocol::LinuxBoot);
         let calls = engine.calls.into_inner();
         assert!(calls.contains(&"snapshot_dtb_from_paddr"));
@@ -175,7 +175,6 @@ mod tests {
         let handoff = BootProtocolDispatcher::new(regs)
             .dispatch(&mut engine)
             .unwrap();
-        assert_eq!(handoff.source, StartFirmwareSource::Dtb);
         assert_eq!(handoff.protocol, StartBootProtocol::LinuxBoot);
         let calls = engine.calls.into_inner();
         assert!(!calls.contains(&"snapshot_dtb_from_paddr"));

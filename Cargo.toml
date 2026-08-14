@@ -46,6 +46,7 @@ exclude = [
     "drivers/loongson-sdio",
     "drivers/loopback",
     "drivers/net-stack",
+    "drivers/ls2k-rtc",
     "drivers/ls7a-rtc",
     "drivers/plic",
     "drivers/pci-host-ecam",

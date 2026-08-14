@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_
 use core::{fmt, fmt::Write};
 
 use super::early_console::configure_early_console;
-use crate::boot_protocol::{BootProtocolDispatcher, FirmwareSnapshot};
+use crate::boot_protocol::FirmwareSnapshot;
 use crate::*;
 use efi::{EfiSystemTable, EfiSystemTableView};
 use fdt::Fdt;
