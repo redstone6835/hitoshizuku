@@ -677,6 +677,7 @@ struct CharDevFileOps {
 
 impl CharDevFileOps {
     fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtyCore>>) -> Self {
+        crate::dev::tty::vt::note_vt_opened(&dev, 1);
         Self {
             dev,
             nonblock: AtomicBool::new(nonblock),
@@ -751,6 +752,14 @@ impl TtyIoctlContext for CharDevFileOps {
 /// 非规范模式下普通字节会进入 TTY pending 队列，由之后的 read() 取走；
 /// 控制字符则立即处理，避免 raw-mode shell 启动前台程序后 Ctrl-C 滞留。
 pub fn poll_tty_input() {
+    // VT 串口输入模式(console=ttyN):物理控制台字节属于活动 VT,由 VT 泵
+    // 消费;此时不能再按通用路径 drain 各 TTY 核心,否则同一 FIFO 会被
+    // console/uart 的行规程与活动 VT 竞争读取。
+    if let Some(manager) = crate::dev::tty::vt::VtManager::global()
+        && manager.pump_console()
+    {
+        return;
+    }
     for tty in tty::active_tty_cores() {
         if !tty.is_active() {
             continue;
@@ -847,13 +856,21 @@ impl FileOps for CharDevFileOps {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
         }
+        // VT 设备优先走 VT/KD ioctl 表;非 VT 命令回落 TTY 表。
+        if let Some(vt) = crate::dev::tty::vt::vt_from_char_device(&self.dev) {
+            if let Some(result) = crate::dev::tty::vt::handle_vt_ioctl(&vt, cmd, arg)? {
+                return Ok(result);
+            }
+        }
         let Some(tty) = self.tty.as_deref() else {
             return Err(Errno::ENOTTY);
         };
 
         handle_tty_ioctl(tty, self, cmd, arg)
     }
-    fn release(&self) {}
+    fn release(&self) {
+        crate::dev::tty::vt::note_vt_opened(&self.dev, -1);
+    }
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -2508,4 +2525,98 @@ impl FsDriver for DevTmpfsDriver {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+// ───────── 虚拟终端节点投影 ─────────
+
+const VT_DEVNODE_OWNER: &'static str = "vt-devnode";
+
+/// tty0 / VT console 节点:open 时解析为当前活动 VT。
+///
+/// 与 Linux 的 `/dev/tty0` 语义一致:它是活动 VT 的别名,切换后重新打开
+/// 即得到新活动 VT。
+struct VtZeroInodeOps {
+    manager: &'static crate::dev::tty::VtManager,
+}
+
+impl InodeOps for VtZeroInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let Some(fg) = self.manager.fg_vt() else {
+            return Err(VfsError::NoDevice);
+        };
+        let Some(dev) = fg.char_device() else {
+            return Err(VfsError::NoDevice);
+        };
+        if !dev.is_active() {
+            return Err(VfsError::NoDevice);
+        }
+        let tty = tty::shared_tty_core(&dev);
+        Ok(Box::new(CharDevFileOps::new(dev, opts.nonblock, tty)))
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn vt_zero_node_build(
+    spec: &CustomDevNodeSpec,
+) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    let payload = spec.payload();
+    let manager = payload
+        .as_ref()
+        .downcast_ref::<&'static crate::dev::tty::VtManager>()
+        .ok_or(VfsError::InvalidArgument)?;
+    Ok(Some(Arc::new(VtZeroInodeOps { manager: *manager })))
+}
+
+fn bind_vt_zero_node(
+    dev_ops: &DevTmpfsSuperblockOps,
+    name: &'static str,
+    manager: &'static crate::dev::tty::VtManager,
+) -> VfsResult<()> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        VT_DEVNODE_OWNER,
+        name,
+        vt_zero_node_build,
+    ))?;
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(manager);
+    let spec = CustomDevNodeSpec::try_new(name, CustomDevNodeKind::CharDevice, payload)?;
+    dev_ops.bind_custom(&spec)
+}
+
+/// 安装虚拟终端节点投影:tty0(活动 VT 别名)+ tty1..tty7。
+///
+/// `bind_console` 为 true 时(`console=ttyN`)把 `/dev/console` 重绑为
+/// 活动 VT 别名;否则 console 保持指向物理串口。节点创建与 VT 管理器
+/// 安装分离,便于启动期按 console= 参数决定输入路由与 console 绑定。
+pub fn install_virtual_terminal_nodes(
+    dev_ops: &DevTmpfsSuperblockOps,
+    manager: &'static crate::dev::tty::VtManager,
+    bind_console: bool,
+) -> VfsResult<()> {
+    bind_vt_zero_node(dev_ops, "tty0", manager)?;
+    for index in 1..crate::dev::tty::vt::VT_COUNT {
+        let Some(vt) = manager.vt(index as u8) else {
+            continue;
+        };
+        let Some(dev) = vt.char_device() else {
+            continue;
+        };
+        dev_ops.bind_char(&vt.name(), dev)?;
+    }
+    if bind_console {
+        let _ = dev_ops.unbind("console");
+        bind_vt_zero_node(dev_ops, "console", manager)?;
+    }
+    Ok(())
 }

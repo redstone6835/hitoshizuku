@@ -711,3 +711,10 @@ pub fn active_tty_cores() -> Vec<Arc<TtyCore>> {
     }
     out
 }
+
+/// 按节点名(fw_name)查询共享行规程实例。
+///
+/// 供 VT 泵等需要按名定位具体终端核心的路径使用;未创建或已失效时返回 None。
+pub fn lookup_tty_core(name: &str) -> Option<Arc<TtyCore>> {
+    TTY_CORES.lock().get(name).and_then(Weak::upgrade)
+}

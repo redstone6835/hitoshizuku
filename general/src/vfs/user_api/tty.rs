@@ -227,7 +227,7 @@ impl UserWinSize {
         }
     }
 
-    fn from_bytes(raw: [u8; LINUX_WINSIZE_LEN]) -> Self {
+    pub(crate) fn from_bytes(raw: [u8; LINUX_WINSIZE_LEN]) -> Self {
         Self {
             rows: u16::from_le_bytes([raw[0], raw[1]]),
             cols: u16::from_le_bytes([raw[2], raw[3]]),
@@ -236,7 +236,7 @@ impl UserWinSize {
         }
     }
 
-    fn to_bytes(self) -> [u8; LINUX_WINSIZE_LEN] {
+    pub(crate) fn to_bytes(self) -> [u8; LINUX_WINSIZE_LEN] {
         let mut out = [0u8; LINUX_WINSIZE_LEN];
         let rows = self.rows.to_le_bytes();
         let cols = self.cols.to_le_bytes();

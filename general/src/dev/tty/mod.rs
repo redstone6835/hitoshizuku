@@ -8,8 +8,10 @@
 //! 设备身份仍由底层设备模型持有,这里只消费字节流与生命周期回调。
 
 pub mod core;
+pub mod vt;
 
 pub use core::{
     CharDeviceTerminalDriver, TerminalDriver, TtyControlRequest, TtyControlResponse, TtyCore,
-    TtyIoError, TtyIoResult, active_tty_cores, shared_tty_core,
+    TtyIoError, TtyIoResult, active_tty_cores, lookup_tty_core, shared_tty_core,
 };
+pub use vt::{VtDevice, VtManager, handle_vt_ioctl, vt_from_char_device};
