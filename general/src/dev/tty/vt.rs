@@ -181,9 +181,13 @@ impl VtDevice {
         }
     }
 
-    /// 把输出写入活动控制台(活动 VT)或滚动缓冲(非活动 VT)。
+    /// 把输出写入活动控制台(活动 VT 且 VT 为活动控制台时)或滚动缓冲。
+    ///
+    /// `console=ttyN` 时活动 VT 输出镜像到物理控制台(VT 屏幕投影到串口);
+    /// `console=uart0` 等非 VT 控制台下 VT 与 Linux 无头场景一致:输出只进
+    /// 内存滚动缓冲,不泄漏到物理串口。
     fn route_output(&self, buf: &[u8]) -> TtyIoResult<usize> {
-        if self.is_fg() {
+        if self.is_fg() && self.manager.vt_console.load(Ordering::Acquire) {
             let console = self
                 .manager
                 .console
@@ -200,7 +204,7 @@ impl VtDevice {
     }
 
     fn route_output_all(&self, buf: &[u8]) -> TtyIoResult<()> {
-        if self.is_fg() {
+        if self.is_fg() && self.manager.vt_console.load(Ordering::Acquire) {
             let console = self
                 .manager
                 .console
@@ -377,8 +381,10 @@ pub struct VtManager {
     vts: Spinlock<Vec<Arc<VtDevice>>>,
     fg: AtomicU8,
     console: Spinlock<Option<CharDevice>>,
-    /// 串口输入是否路由到活动 VT(`console=ttyN` 时置位)。
-    serial_input_to_fg: AtomicBool,
+    /// VT 是否作为活动控制台(`console=ttyN` 时置位):置位时串口输入路由到
+    /// 活动 VT,活动 VT 输出镜像到物理控制台;否则 VT 仅存在于内存(输入由
+    /// 原串口行规程消费,输出进滚动缓冲),与 Linux 无头 VT 行为一致。
+    vt_console: AtomicBool,
     switch_lock: Spinlock<()>,
     /// VT_LOCKSWITCH 置位后禁止切换。
     locked: AtomicBool,
@@ -389,9 +395,10 @@ static MANAGER: Spinlock<Option<&'static VtManager>> = Spinlock::new(None);
 impl VtManager {
     /// 安装 VT 管理器(幂等),返回单例。
     ///
-    /// `route_input` 为 true 时,串口泵把物理控制台输入路由到活动 VT
-    /// (`console=tty0` 等场景);否则 VT 仍存在且可经 ioctl 切换,但输入
-    /// 保持由原串口行规程消费。
+    /// `route_input` 为 true 时 VT 作为活动控制台(`console=tty0` 等场景):
+    /// 串口泵把物理控制台输入路由到活动 VT,活动 VT 输出镜像到物理控制台;
+    /// 否则 VT 仍存在且可经 ioctl 切换,但输入保持由原串口行规程消费,
+    /// 输出只进内存滚动缓冲。
     pub fn install(console: CharDevice, route_input: bool) -> &'static VtManager {
         let mut slot = MANAGER.lock();
         if let Some(existing) = *slot {
@@ -400,11 +407,18 @@ impl VtManager {
         let leaked: &'static VtManager = Box::leak(Box::new(VtManager {
             vts: Spinlock::new(Vec::new()),
             fg: AtomicU8::new(1),
-            console: Spinlock::new(Some(console)),
-            serial_input_to_fg: AtomicBool::new(route_input),
+            console: Spinlock::new(Some(console.clone())),
+            vt_console: AtomicBool::new(route_input),
             switch_lock: Spinlock::new(()),
             locked: AtomicBool::new(false),
         }));
+        // VT 作为活动控制台时,物理控制台输入归 VT 泵所有:行规程的用户读
+        // 路径不得再拉取同一 FIFO(见 CharDeviceTerminalDriver::read_input)。
+        crate::dev::tty::core::set_vt_console_input_owner(if route_input {
+            Some(console.fw_name())
+        } else {
+            None
+        });
         let mut vts = leaked.vts.lock();
         for index in 1..VT_COUNT {
             let vt = Arc::new(VtDevice::new(index as u8, leaked));
@@ -454,7 +468,7 @@ let dev = CharDevice::from_arc(vt.name().into_boxed_str(), driver);
     ///
     /// 返回 true 表示本泵消费了控制台输入(调用方不应再走通用 TTY drain)。
     pub fn pump_console(&self) -> bool {
-        if !self.serial_input_to_fg.load(Ordering::Acquire) {
+        if !self.vt_console.load(Ordering::Acquire) {
             return false;
         }
         let Some(console) = self.console.lock().clone() else {

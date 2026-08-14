@@ -8,6 +8,7 @@
 //! 迁移时逐行保留原有行为;VFS 投影层只负责把 [`TtyIoError`] 映射为
 //! `VfsError` 并挂接 FileOps。
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -709,10 +710,22 @@ impl TerminalDriver for CharDeviceTerminalDriver {
     }
 
     fn read_input(&self, buf: &mut [u8]) -> TtyIoResult<usize> {
+        // `console=ttyN` 时物理控制台输入由 VT 泵独占路由到活动 VT;行规程
+        // 的用户读路径(串口 getty 等)不得再从底层驱动拉取,否则同一 FIFO
+        // 会被两个读者拆分,一行输入散落到不同终端。
+        if vt_console_owns_input(self.dev.fw_name()) {
+            return Ok(0);
+        }
         self.dev.read(buf).map_err(map_char_err)
     }
 
     fn poll_read(&self) -> bool {
+        // 与 read_input 的门控一致:VT 控制台模式下该行规程的输入归 VT 泵,
+        // 用户读路径必须同时报告"不可读",否则 getty 等读者会在 poll 就绪
+        // 但 read 恒空之间空转,配合电平触发 RX 中断形成活锁。
+        if vt_console_owns_input(self.dev.fw_name()) {
+            return false;
+        }
         self.dev.poll_read()
     }
 
@@ -815,6 +828,32 @@ pub fn active_tty_cores() -> Vec<Arc<TtyCore>> {
 }
 
 static NEXT_TTY_COOKIE: AtomicU64 = AtomicU64::new(1);
+
+/// 活动 VT 控制台(`console=ttyN`)独占的物理控制台输入(fw_name)。
+///
+/// VT 控制台模式下串口字节由 VT 泵路由到活动 VT;同一底层设备的行规程
+/// 用户读路径(串口 getty 等)必须停止从驱动拉取,避免 FIFO 被多个读者
+/// 拆分。置 `None` 表示无 VT 独占(常规 `console=uart0` 等模式)。
+static VT_CONSOLE_INPUT_OWNER: Spinlock<Option<Box<str>>> = Spinlock::new(None);
+
+/// 设置/清除 VT 控制台输入独占者(fw_name)。
+///
+/// 由 VT 管理器安装时调用(`console=ttyN` 置位,其余模式清除)。分配失败时
+/// 保留原值,输入独占退化为共享读取(可诊断但不再拆分)。
+pub fn set_vt_console_input_owner(fw_name: Option<&str>) {
+    let mut slot = VT_CONSOLE_INPUT_OWNER.lock();
+    *slot = fw_name.and_then(|name| {
+        let mut out = String::new();
+        out.try_reserve(name.len()).ok()?;
+        out.push_str(name);
+        Some(out.into_boxed_str())
+    });
+}
+
+/// 该 fw_name 对应的行规程输入是否被 VT 控制台独占。
+fn vt_console_owns_input(fw_name: &str) -> bool {
+    VT_CONSOLE_INPUT_OWNER.lock().as_deref() == Some(fw_name)
+}
 
 static TTY_CORES_BY_COOKIE: Spinlock<BTreeMap<u64, Weak<TtyCore>>> = Spinlock::new(BTreeMap::new());
 
