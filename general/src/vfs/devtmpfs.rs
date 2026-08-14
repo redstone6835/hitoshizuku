@@ -678,6 +678,7 @@ struct CharDevFileOps {
 impl CharDevFileOps {
     fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtyCore>>) -> Self {
         crate::dev::tty::vt::note_vt_opened(&dev, 1);
+        crate::dev::tty::pty::note_pty_opened(&dev, 1);
         Self {
             dev,
             nonblock: AtomicBool::new(nonblock),
@@ -870,6 +871,7 @@ impl FileOps for CharDevFileOps {
     }
     fn release(&self) {
         crate::dev::tty::vt::note_vt_opened(&self.dev, -1);
+        crate::dev::tty::pty::note_pty_opened(&self.dev, -1);
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -907,16 +909,27 @@ impl InodeOps for DevCharOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
-        Ok(Box::new(CharDevFileOps::new(
-            self.dev.clone(),
-            opts.nonblock,
-            self.tty.clone(),
-        )))
+        char_dev_file_ops(self.dev.clone(), opts.nonblock)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+/// 构造字符设备的 FileOps(带共享行规程)。
+///
+/// devtmpfs 节点与 devpts 节点共用;`tty` 实例按设备 fw_name 共享,
+/// 因此同一终端的多个节点/多次打开拿到同一行规程状态。
+pub(crate) fn char_dev_file_ops(
+    dev: CharDevice,
+    nonblock: bool,
+) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    if !dev.is_active() {
+        return Err(VfsError::NoDevice);
+    }
+    let tty = tty::shared_tty_core(&dev);
+    Ok(Box::new(CharDevFileOps::new(dev, nonblock, tty)))
 }
 
 // ───────── 块设备 InodeOps ─────────
@@ -2592,6 +2605,65 @@ fn bind_vt_zero_node(
     let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(manager);
     let spec = CustomDevNodeSpec::try_new(name, CustomDevNodeKind::CharDevice, payload)?;
     dev_ops.bind_custom(&spec)
+}
+
+/// `/dev/ptmx` 节点:open 时分配 pty 对并返回 master。
+pub fn register_pty_devnode() -> VfsResult<()> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        "ptmx-devnode",
+        "ptmx",
+        ptmx_node_build,
+    ))?;
+    register_static_dev_node(DevTmpfsStaticNode::new(
+        "ptmx-devnode",
+        "ptmx",
+        build_ptmx_node,
+    ))?;
+    Ok(())
+}
+
+fn build_ptmx_node() -> VfsResult<DevNodeSpec> {
+    let payload: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    Ok(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
+        "ptmx",
+        CustomDevNodeKind::CharDevice,
+        payload,
+    )?))
+}
+
+fn map_pty_open_err(err: Errno) -> VfsError {
+    match err {
+        Errno::ENOMEM => VfsError::OutOfMemory,
+        Errno::EAGAIN => VfsError::NoSpace,
+        _ => VfsError::NoDevice,
+    }
+}
+
+fn ptmx_node_build(
+    _spec: &CustomDevNodeSpec,
+) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    Ok(Some(Arc::new(PtyMasterInodeOps)))
+}
+
+struct PtyMasterInodeOps;
+
+impl InodeOps for PtyMasterInodeOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        crate::dev::tty::pty::open_ptmx(opts.nonblock).map_err(map_pty_open_err)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 /// 安装虚拟终端节点投影:tty0(活动 VT 别名)+ tty1..tty7。

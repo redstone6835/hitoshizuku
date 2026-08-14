@@ -1,5 +1,6 @@
 pub mod blockfs;
 pub mod device_files;
+pub mod devpts;
 pub mod devtmpfs;
 pub mod mount_source;
 pub mod pidfd;
@@ -15,6 +16,7 @@ pub use blockfs::{
     BlockFsDriver, BlockFsProbe, mount_block_device_auto, mount_block_source_auto,
     register_block_filesystems, register_block_fs_driver,
 };
+pub use devpts::DevPtsDriver;
 pub use devtmpfs::DevTmpfsDriver;
 pub use mount_source::{MountSource, resolve_block_mount_source};
 pub use procfs::ProcFsDriver;

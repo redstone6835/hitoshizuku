@@ -11,6 +11,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
 
 use errno::Errno;
@@ -124,6 +125,9 @@ pub trait TerminalDriver: Send + Sync {
         Err(TtyIoError::Invalid)
     }
 
+    /// 窗口大小变化通知(pts 对端同步、TTY 层发 SIGWINCH 后回调)。
+    fn winsize_changed(&self, _winsize: UserWinSize) {}
+
     /// VT 切换 / pty 挂起时的激活通知。
     fn activate(&self, _active: bool) {}
 
@@ -159,6 +163,7 @@ pub struct TtyCore {
     winsize: Spinlock<UserWinSize>,
     foreground_pgrp: Spinlock<i32>,
     line_state: Spinlock<TtyLineState>,
+    hung_up: AtomicBool,
 }
 
 /// 异步输入泵的单次 drain 上限。
@@ -172,6 +177,7 @@ impl TtyCore {
             winsize: Spinlock::new(UserWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
             line_state: Spinlock::new(TtyLineState::default()),
+            hung_up: AtomicBool::new(false),
         }
     }
 
@@ -226,6 +232,9 @@ impl TtyCore {
     }
 
     pub(crate) fn write_tty_bytes(&self, buf: &[u8], termios: UserTermios) -> TtyIoResult<()> {
+        if self.hung_up.load(Ordering::Acquire) {
+            return Err(TtyIoError::NoDevice);
+        }
         if buf.is_empty() {
             return Ok(());
         }
@@ -278,7 +287,7 @@ impl TtyCore {
         n
     }
 
-    fn send_fg_signal(&self, sig: sched::SignalNumber) {
+    pub(crate) fn send_fg_signal(&self, sig: sched::SignalNumber) {
         let stored = *self.foreground_pgrp.lock();
         let current = operation::getpgid(0).ok().filter(|pgrp| *pgrp > 0);
         let primary = if stored > 0 { Some(stored) } else { current };
@@ -487,6 +496,20 @@ impl TtyCore {
     /// 终端识别并投递给前台进程组;因此这里在 tick 上做一次有界 drain。
     /// 非规范模式下普通字节会进入 TTY pending 队列,由之后的 read() 取走;
     /// 控制字符则立即处理,避免 raw-mode shell 启动前台程序后 Ctrl-C 滞留。
+    /// 终端挂起(设备移除 / pts master 关闭)。
+    ///
+    /// 置挂起位、通知后端,并向前台进程组发 SIGHUP(Linux 语义);此后
+    /// 读返回已缓冲数据后 EOF,写返回 `NoDevice`。
+    pub fn hangup(&self) {
+        self.hung_up.store(true, Ordering::Release);
+        self.driver.hangup();
+        self.send_fg_signal(sched::SignalNumber::SIGHUP);
+    }
+
+    pub fn is_hung_up(&self) -> bool {
+        self.hung_up.load(Ordering::Acquire)
+    }
+
     pub fn drain_tty_input(&self, termios: UserTermios) {
         for _ in 0..TTY_ASYNC_PUMP_LIMIT {
             let result = if termios.canonical() {
@@ -503,6 +526,10 @@ impl TtyCore {
 
     pub fn read_tty_canonical(&self, buf: &mut [u8], termios: UserTermios) -> TtyIoResult<usize> {
         loop {
+            if self.hung_up.load(Ordering::Acquire) {
+                // 挂起后先取走已缓冲数据,再返回 EOF。
+                return Ok(self.dequeue_ready(buf).unwrap_or(0));
+            }
             if let Some(n) = self.dequeue_ready(buf) {
                 return Ok(n);
             }
@@ -513,6 +540,14 @@ impl TtyCore {
     }
 
     pub fn read_tty_raw(&self, buf: &mut [u8], termios: UserTermios) -> TtyIoResult<usize> {
+        if self.hung_up.load(Ordering::Acquire) {
+            // 挂起后先取走已缓冲数据,再返回 EOF。
+            let filled = self.dequeue_pending_bytes(buf);
+            if filled != 0 {
+                return Ok(filled);
+            }
+            return Ok(0);
+        }
         let want = termios.vmin().max(1) as usize;
         let mut filled = self.dequeue_pending_bytes(buf);
         if filled >= want || filled == buf.len() {
@@ -553,6 +588,9 @@ impl crate::vfs::user_api::tty::TtyIoctlState for TtyCore {
 
     fn set_winsize(&self, winsize: UserWinSize) {
         *self.winsize.lock() = winsize;
+        // Linux: TIOCSWINSZ 成功后向前台进程组发 SIGWINCH。
+        self.driver.winsize_changed(winsize);
+        self.send_fg_signal(sched::SignalNumber::SIGWINCH);
     }
 
     fn clear_line_state(&self) {
@@ -622,6 +660,10 @@ impl TerminalDriver for CharDeviceTerminalDriver {
 
     fn is_active(&self) -> bool {
         self.dev.is_active()
+    }
+
+    fn winsize_changed(&self, winsize: UserWinSize) {
+        self.dev.winsize_changed(winsize);
     }
 
     fn control(&self, req: TtyControlRequest) -> TtyIoResult<TtyControlResponse> {

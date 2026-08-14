@@ -93,6 +93,9 @@ pub trait CharDriver: Send + Sync {
     /// 默认只把通用 drain 请求接到底层 [`flush`](Self::flush)，其它请求返回
     /// `Unsupported`。丢弃输入/输出队列需要驱动明确知道自己的缓冲结构，
     /// 不能由类层假定完成。
+    /// 窗口大小变化通知(pts 对端同步等)。
+    fn winsize_changed(&self, _winsize: crate::vfs::user_api::tty::UserWinSize) {}
+
     fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
         match req {
             CharControlRequest::DrainTx => {
@@ -455,6 +458,11 @@ impl CharDevice {
 
     /// 执行字符设备类 typed control。
     #[inline]
+    /// 通知驱动窗口大小变化(pts 对端同步等)。
+    pub fn winsize_changed(&self, winsize: crate::vfs::user_api::tty::UserWinSize) {
+        self.inner.driver.winsize_changed(winsize);
+    }
+
     pub fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
         if !self.is_active() {
             return Err(ControlError::NoDevice);

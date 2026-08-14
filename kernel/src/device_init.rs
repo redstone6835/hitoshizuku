@@ -21,6 +21,8 @@ use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
 use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_standard_shm_tmpfs};
 use log::{LogRecord, LogSink, printk};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use sched::sync::Spinlock;
 use sched::{TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, Task};
 
@@ -51,6 +53,8 @@ struct DeferredBootConsole {
 }
 
 static DEFERRED_BOOT_CONSOLE: Spinlock<Option<DeferredBootConsole>> = Spinlock::new(None);
+
+static PTMX_DEVNODE_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 static CONSOLE_LOG_SINK: LogSink = LogSink {
     write_record: write_log_record_to_console,
@@ -336,6 +340,16 @@ pub fn register_core_filesystems(tag: &str) {
                 )
             });
     }
+    if FS_REGISTRY.find("devpts").is_none() {
+        FS_REGISTRY
+            .register(Box::leak(Box::new(general::vfs::DevPtsDriver)))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "[kernel-start][{}] failed to register devpts driver: {:?}",
+                    tag, err
+                )
+            });
+    }
     if FS_REGISTRY.find("procfs").is_none() {
         FS_REGISTRY
             .register(Box::leak(Box::new(general::vfs::ProcFsDriver)))
@@ -414,6 +428,7 @@ pub fn register_core_filesystems(tag: &str) {
 
 /// 创建并发布 devtmpfs 单例 superblock。
 pub fn mount_devtmpfs(tag: &str) -> Arc<Superblock> {
+    register_pty_devnode_if_needed(tag);
     FS_REGISTRY
         .find("devtmpfs")
         .unwrap_or_else(|| panic!("[kernel-start][{}] devtmpfs driver not found", tag))
@@ -489,7 +504,76 @@ pub fn mount_standard_user_api_filesystems(tag: &str, ctx: &VfsContext) {
             tag, err
         )
     });
+    mount_devpts_on_pts(tag, ctx);
     mount_sysfs_on_sys(tag, ctx);
+}
+
+/// 挂载 devpts 到 `/dev/pts`(Linux 布局)。
+fn mount_devpts_on_pts(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
+    ensure_dir(ctx, "/dev/pts", vfs::stat::FileMode::new(0o755)).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to ensure /dev/pts directory: {:?}",
+            tag, err
+        )
+    });
+    if let Ok(existing) = path::lookup(ctx, &Dirfd::Cwd, "/dev/pts", LookupFlags::DIRECTORY)
+        && existing.mount.superblock.fs_type == "devpts"
+        && Arc::ptr_eq(&existing.dentry, &existing.mount.mount_root)
+    {
+        return existing.mount;
+    }
+    let mountpoint = path::lookup(
+        ctx,
+        &Dirfd::Cwd,
+        "/dev/pts",
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to resolve /dev/pts mountpoint: {:?}",
+            tag, err
+        )
+    });
+    let sb = FS_REGISTRY
+        .find("devpts")
+        .expect("[kernel-start] devpts driver not found")
+        .mount(None, "mode=0620,ptmxmode=0666")
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to mount devpts: {:?}",
+                tag, err
+            )
+        });
+    let mount = ctx.mount_ns.mount_at(
+        Arc::clone(&mountpoint.dentry),
+        Arc::clone(&mountpoint.mount),
+        sb,
+        MountFlags::default(),
+    );
+    match mount {
+        Ok(mount) => {
+            printk!("[kernel-start][{}] devpts mounted on /dev/pts", tag);
+            mount
+        }
+        Err(err) => panic!(
+            "[kernel-start][{}] failed to mount devpts at /dev/pts: {:?}",
+            tag, err
+        ),
+    }
+}
+
+fn register_pty_devnode_if_needed(tag: &str) {
+    if PTMX_DEVNODE_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match general::vfs::devtmpfs::register_pty_devnode() {
+        Ok(_) => printk!("[kernel-start][{}] registered /dev/ptmx devnode", tag),
+        Err(err) => printk!(
+            "[kernel-start][{}] failed to register /dev/ptmx devnode: {:?}",
+            tag,
+            err
+        ),
+    }
 }
 
 fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
