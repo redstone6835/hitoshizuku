@@ -1,0 +1,7 @@
+[elm]
+name = "platform.loongson-pinctrl-gpio"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.loongson-pinctrl-gpio"
+mode = "m"
+integrated_phase = "device"
