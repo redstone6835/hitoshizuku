@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 
 use allocator::{AllocationAccountingOps, register_allocation_accounting_ops};
-use elm_model::{ElmId, ElmResourceBudget, current_cell};
+use elm_model::{ElmId, ElmResourceBudget};
 use sched::sync::Spinlock;
 
 const RESOURCE_ACCOUNTING_CAPACITY: usize = 1024;
@@ -287,7 +287,7 @@ impl NativeCallPermit {
 impl Drop for NativeCallPermit {
     fn drop(&mut self) {
         if !self.finished {
-            let now_ns = sched::now_ns_public();
+            let now_ns = sched::now_ns_direct();
             let _ = finish_native_call(
                 self.cell,
                 self.stack_bytes,
@@ -400,7 +400,11 @@ fn finish_native_call(
 }
 
 fn allocation_current_owner() -> u64 {
-    current_cell().map(|cell| cell.0).unwrap_or(0)
+    match general::elm_guard::current_context_cell() {
+        Some(0) => 0,
+        Some(_) => general::elm_guard::active_cell(),
+        None => general::elm_guard::active_cell(),
+    }
 }
 
 fn allocation_try_reserve(owner: u64, bytes: u64) -> bool {

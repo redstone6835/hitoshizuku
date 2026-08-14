@@ -53,6 +53,17 @@ pub fn weight_from_nice(nice: i8) -> Weight {
     NICE_TO_WEIGHT[(clamped - NICE_MIN) as usize]
 }
 
+/// 计算 `delta * NICE_0_WEIGHT / weight`，避免调度热路径进入 128 位软件除法。
+#[inline]
+pub(crate) fn scale_delta_by_weight(delta: u64, weight: Weight) -> u64 {
+    let weight = weight.max(1);
+    let quotient = delta / weight;
+    let remainder = delta % weight;
+    quotient
+        .saturating_mul(NICE_0_WEIGHT)
+        .saturating_add(remainder.saturating_mul(NICE_0_WEIGHT) / weight)
+}
+
 /// 任务创建 / 属性变更时传入的调度参数。
 #[derive(Debug, Clone, Copy)]
 pub struct SchedParams {
@@ -354,9 +365,7 @@ impl SchedEntity {
 
     /// `vruntime_delta = delta_exec * NICE_0_WEIGHT / weight`。
     pub fn scale_delta(&self, delta_exec_ns: u64) -> u64 {
-        let w = self.weight().max(1);
-        // 使用 128 位中间值避免溢出。NICE_0_WEIGHT 最大 88761，delta_exec_ns 可能较大。
-        ((delta_exec_ns as u128 * NICE_0_WEIGHT as u128) / w as u128) as u64
+        scale_delta_by_weight(delta_exec_ns, self.weight())
     }
 
     /// 根据当前 vruntime 与 slice 计算新的 deadline。

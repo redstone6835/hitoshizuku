@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -248,6 +249,103 @@ static int test_signal_interrupted_wait(void) {
         return (int)(intptr_t)result;
     }
     return atomic_load(&signal_count) > 0 ? 0 : EIO;
+}
+
+static atomic_int termination_workers_ready;
+
+static void *termination_worker(void *unused) {
+    (void)unused;
+    atomic_fetch_add_explicit(&termination_workers_ready, 1, memory_order_release);
+    for (;;) {
+        pause();
+    }
+    return NULL;
+}
+
+static int wait_for_child_exit(pid_t child, int *status) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        return errno;
+    }
+    add_ms(&deadline, WAIT_TIMEOUT_MS);
+    for (;;) {
+        pid_t result = waitpid(child, status, WNOHANG);
+        if (result == child) {
+            return 0;
+        }
+        if (result < 0) {
+            return errno;
+        }
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return errno;
+        }
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            return ETIMEDOUT;
+        }
+        sched_yield();
+    }
+}
+
+static int test_default_sigterm_exits_thread_group(void) {
+    int ready_pipe[2];
+    if (pipe(ready_pipe) != 0) {
+        return errno;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        int error = errno;
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return error;
+    }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        atomic_store(&termination_workers_ready, 0);
+        pthread_t workers[MUTEX_THREADS];
+        for (size_t i = 0; i < ARRAY_SIZE(workers); i++) {
+            if (pthread_create(&workers[i], NULL, termination_worker, NULL) != 0) {
+                _exit(2);
+            }
+        }
+        if (wait_for_flag(&termination_workers_ready, MUTEX_THREADS) != 0 ||
+            write(ready_pipe[1], "R", 1) != 1) {
+            _exit(3);
+        }
+        for (;;) {
+            pause();
+        }
+    }
+
+    close(ready_pipe[1]);
+    char ready = 0;
+    ssize_t ready_size = read(ready_pipe[0], &ready, 1);
+    int ready_error = ready_size < 0 ? errno : EIO;
+    close(ready_pipe[0]);
+    if (ready_size != 1 || ready != 'R') {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return ready_error;
+    }
+    if (kill(child, SIGTERM) != 0) {
+        int error = errno;
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return error;
+    }
+
+    int status = 0;
+    int error = wait_for_child_exit(child, &status);
+    if (error != 0) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return error;
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
+        return EIO;
+    }
+    return 0;
 }
 
 static pthread_mutex_t robust_mutex;
@@ -697,6 +795,7 @@ int main(void) {
         {"pthread condvar broadcast", test_cond_broadcast},
         {"pthread condvar timed wait", test_cond_timedwait},
         {"pthread wait signal restart", test_signal_interrupted_wait},
+        {"pthread default SIGTERM exits thread group", test_default_sigterm_exits_thread_group},
         {"pthread robust owner exit", test_robust_owner_exit},
         {"pthread PI timed lock", test_pi_timedlock},
         {"pthread PI priority handoff", test_pi_priority_handoff},

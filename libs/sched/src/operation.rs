@@ -17,7 +17,7 @@ use errno::Errno;
 use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::cpu::{CpuId, CpuMask};
 use crate::eevdf::SchedParams;
-use crate::group::{GroupExitStatus, ProcessGroup, Session};
+use crate::group::{GroupExitStatus, ProcessGroup, Session, ThreadGroup};
 use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
@@ -25,10 +25,10 @@ use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::rseq::RseqEvent;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
-    migrate_task, now_ns_public, online_cpu_mask, request_balance, request_post_syscall_handoff,
-    request_resched, root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
-    task_runqueue_cpu,
+    NR_CPUS, continue_task, current_cpu_id, current_task, deliver_shared_signal_to_group,
+    enqueue_task_deferred, mark_task_stopped, migrate_task, now_ns_public, online_cpu_mask,
+    request_balance, request_post_syscall_handoff, request_resched, root_pid_ns, runqueue_of,
+    schedule_once, select_cpu_for_mask, signal_wakeup, task_runqueue_cpu,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
@@ -299,6 +299,34 @@ pub fn exit_group(code: i32) -> ! {
     exit(code);
 }
 
+/// Native 同步用户异常的终止入口。它不构造 Linux signal frame，而是记录
+/// 进程级诊断并复用现有组退出清理。
+pub fn terminate_native_fault(
+    task: &Arc<Task>,
+    kind: u32,
+    exception_code: u64,
+    address: u64,
+    exit_code: i32,
+) -> ! {
+    let group = task.thread_group();
+    group.record_native_fault(crate::group::NativeFaultInfo {
+        kind,
+        exception_code,
+        address,
+    });
+    let code = group.request_group_exit(exit_code);
+    for member in group.snapshot() {
+        if !Arc::ptr_eq(&member, task)
+            && !member.is_kernel_task()
+            && !matches!(member.state(), TaskState::Zombie | TaskState::Dead)
+        {
+            crate::scheduler::group_exit_wakeup(&member);
+        }
+    }
+    drop(group);
+    exit(code)
+}
+
 /// 在目标线程自己的安全边界完成已经发布的 exit_group 请求。
 pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     // 正常 syscall/返回路径绝大多数没有协作退出请求；先读每任务原子标志，
@@ -306,6 +334,12 @@ pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
     if !task.group_exit_boundary_pending() {
         return false;
     }
+    complete_group_exit_slow(task)
+}
+
+#[cold]
+#[inline(never)]
+fn complete_group_exit_slow(task: &Arc<Task>) -> bool {
     let Some(status) = task.thread_group().group_exit_status() else {
         return false;
     };
@@ -320,6 +354,162 @@ pub fn complete_group_exit_if_requested(task: &Arc<Task>) -> bool {
         exit_task(task, ExitCode(status.exit_code()));
     }
     true
+}
+
+/// 在目标线程自己的安全边界完成 Native Thread capability 发布的退出请求。
+pub fn complete_native_thread_exit_if_requested(task: &Arc<Task>) -> bool {
+    let Some(code) = task.native_thread_exit_boundary_pending() else {
+        return false;
+    };
+    if !matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
+        exit_task(task, ExitCode(code));
+    }
+    true
+}
+
+/// 要求 exec 发起者之外的线程在自己的安全边界退出。
+pub fn request_exec_sibling_exit(target: &Arc<Task>, preserve_leader_identity: bool) {
+    crate::scheduler::exec_sibling_exit_wakeup(target, preserve_leader_identity);
+}
+
+/// 在目标线程自己的 syscall/用户返回边界完成 exec 协作退出。
+pub fn complete_exec_sibling_exit_if_requested(task: &Arc<Task>) -> bool {
+    if !task.exec_sibling_exit_boundary_pending() {
+        return false;
+    }
+    match task.state() {
+        // 保留 leader 身份的 exec 退出必须停在 Zombie，直到执行线程完成 PID、
+        // 父子关系和 children 的事务迁移；提前置 Dead 会让失败回滚无处可收。
+        TaskState::Zombie => {}
+        TaskState::Dead => {}
+        _ => exit_task(task, ExitCode(0)),
+    }
+    true
+}
+
+/// 在请求旧 leader 退出前预留身份迁移所需的 children 容量。
+pub fn prepare_exec_leader_identity(
+    executor: &Arc<Task>,
+    old_leader: &Arc<Task>,
+) -> Result<(), Errno> {
+    if Arc::ptr_eq(executor, old_leader) {
+        return Err(Errno::EINVAL);
+    }
+    let group = executor.thread_group();
+    if !Arc::ptr_eq(&group, &old_leader.thread_group())
+        || !group
+            .leader()
+            .is_some_and(|leader| Arc::ptr_eq(&leader, old_leader))
+    {
+        return Err(Errno::EBUSY);
+    }
+    executor
+        .try_reserve_children_for_exec(old_leader.child_count())
+        .map_err(|_| Errno::ENOMEM)
+}
+
+/// 非 leader 线程执行 exec 后，接管已经停止的旧 leader 进程身份。
+pub fn adopt_exec_leader_identity(
+    executor: &Arc<Task>,
+    old_leader: &Arc<Task>,
+) -> Result<(), Errno> {
+    let identity = crate::pid::lock_process_identity();
+    if Arc::ptr_eq(executor, old_leader) {
+        return Err(Errno::EINVAL);
+    }
+    let group = executor.thread_group();
+    if !Arc::ptr_eq(&group, &old_leader.thread_group())
+        || old_leader.state() != TaskState::Zombie
+        || !old_leader.exec_sibling_exit_preserves_identity()
+        || !group.has_only_exec_members(executor, old_leader)
+        || !group
+            .leader()
+            .is_some_and(|leader| Arc::ptr_eq(&leader, old_leader))
+    {
+        return Err(Errno::EBUSY);
+    }
+
+    let parent = old_leader.parent_in(&identity);
+    if parent
+        .as_ref()
+        .is_some_and(|parent| !parent.has_child(old_leader))
+        || old_leader.pid_root_in(&identity).is_none()
+        || executor.pid_root_in(&identity).is_none()
+        || !old_leader.pid_registrations_owned_by_self_in(&identity)
+        || !executor.pid_registrations_owned_by_self_in(&identity)
+    {
+        return Err(Errno::EAGAIN);
+    }
+    if !executor.children_capacity_for_exec(old_leader.child_count()) {
+        return Err(Errno::ENOMEM);
+    }
+
+    let leader_registrations = old_leader.take_pid_registrations_for_exec_in(&identity);
+    let executor_registrations = executor.take_pid_registrations_for_exec_in(&identity);
+    let mut replaced = 0;
+    for (namespace, pid) in leader_registrations.iter() {
+        if !namespace
+            .registry()
+            .replace_owner_in(&identity, *pid, old_leader, executor)
+        {
+            for (rollback_namespace, rollback_pid) in leader_registrations[..replaced].iter() {
+                let restored = rollback_namespace.registry().replace_owner_in(
+                    &identity,
+                    *rollback_pid,
+                    executor,
+                    old_leader,
+                );
+                debug_assert!(restored, "exec leader PID owner 回滚失败");
+            }
+            old_leader.install_pid_registrations_for_exec_in(&identity, leader_registrations);
+            executor.install_pid_registrations_for_exec_in(&identity, executor_registrations);
+            return Err(Errno::EAGAIN);
+        }
+        replaced += 1;
+    }
+
+    if let Some(parent) = parent.as_ref() {
+        if !parent.replace_child_for_exec_in(&identity, old_leader, executor) {
+            for (namespace, pid) in leader_registrations.iter() {
+                let restored = namespace
+                    .registry()
+                    .replace_owner_in(&identity, *pid, executor, old_leader);
+                debug_assert!(restored, "exec leader PID owner 回滚失败");
+            }
+            old_leader.install_pid_registrations_for_exec_in(&identity, leader_registrations);
+            executor.install_pid_registrations_for_exec_in(&identity, executor_registrations);
+            return Err(Errno::EAGAIN);
+        }
+        executor.reparent_to_in(&identity, parent);
+    } else {
+        executor.clear_parent_for_exec_in(&identity);
+    }
+    old_leader.clear_parent_for_exec_in(&identity);
+
+    for (namespace, pid) in executor_registrations.iter() {
+        namespace.registry().release_in(&identity, *pid);
+    }
+    executor.install_pid_registrations_for_exec_in(&identity, leader_registrations);
+    if let Some(leader_pid) = executor.pid_root_in(&identity) {
+        executor.set_tgid_cache(leader_pid);
+    }
+
+    let children = old_leader.take_children_for_exec_in(&identity);
+    for child in children.iter() {
+        child.reparent_to_in(&identity, executor);
+    }
+    executor.append_children_for_exec_in(&identity, children);
+
+    executor.set_exit_signal(old_leader.exit_signal());
+    old_leader.set_exit_signal(0);
+    group.set_leader_in(&identity, executor);
+    let removed = group.remove_member(old_leader);
+    debug_assert!(removed, "exec leader 身份迁移后旧 leader 应仍在成员表中");
+    old_leader.process_group().remove_member(old_leader);
+    old_leader.set_state(TaskState::Dead);
+    old_leader.exit_waiters.wake_all();
+    old_leader.clear_exec_sibling_exit_request();
+    Ok(())
 }
 
 // ── 调度器相关 ────────────────────────────────────────────────────────────────
@@ -462,6 +652,11 @@ pub fn all_tasks_snapshot() -> Vec<Arc<Task>> {
         .into_iter()
         .filter_map(|(_, weak)| weak.upgrade())
         .collect()
+}
+
+/// 为 PONR 前资源准备提供可失败的全局任务快照。
+pub fn try_all_tasks_snapshot() -> Result<Vec<Arc<Task>>, alloc::collections::TryReserveError> {
+    root_pid_ns().registry().try_snapshot_tasks()
 }
 
 #[kernel_symbols::export(name = "sched.operation.sched_getaffinity", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
@@ -612,9 +807,6 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
-    me.clear_rseq_registration();
-    me.clear_sigaltstack();
-    me.shared_signal().reset_handlers_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);
         // vfork 父进程到这里已经可以继续运行，但不要立刻抢占刚 exec 完成的
@@ -670,10 +862,98 @@ pub struct CloneOutcome {
     pub child: Arc<Task>,
 }
 
-pub fn clone_with_context_outcome(
+/// 已完成任务图和用户上下文构造、但尚未进入运行队列的 clone 事务。
+///
+/// syscall personality 可在 [`Self::activate`] 前完成 pidfd 等可失败输出；若
+/// 提前返回，`Drop` 会回滚尚未对调度器可见的 child。
+pub struct PreparedClone {
+    parent: Option<Arc<Task>>,
+    child: Option<Arc<Task>>,
+    pid: PidT,
+    args: CloneArgs,
+}
+
+impl PreparedClone {
+    fn from_parts(parent: Arc<Task>, child: Arc<Task>, pid: PidT, args: CloneArgs) -> Self {
+        Self {
+            parent: Some(parent),
+            child: Some(child),
+            pid,
+            args,
+        }
+    }
+
+    pub fn pid(&self) -> PidT {
+        self.pid
+    }
+
+    pub fn child(&self) -> &Arc<Task> {
+        self.child.as_ref().expect("prepared clone child 已被消费")
+    }
+
+    /// 发布 child 并完成 vfork / 调度交接语义。
+    pub fn activate(mut self) -> Result<CloneOutcome, Errno> {
+        let child = self.child.take().expect("prepared clone 只能激活一次");
+        let parent = self.parent.take().expect("prepared clone 缺少父任务");
+        if let Err(err) = activate_task(&child) {
+            abort_new_task(&child);
+            return Err(err);
+        }
+
+        if self.args.flags.has(CloneFlags::CLONE_VFORK) {
+            let child_wait = Arc::downgrade(&child);
+            drop(parent);
+            loop {
+                let Some(wait_child) = child_wait.upgrade() else {
+                    break;
+                };
+                if !wait_child.is_vforking() {
+                    break;
+                }
+                let parent = current_task();
+                if parent.group_exit_pending() {
+                    break;
+                }
+                let entry = wait_child
+                    .vfork_done
+                    .prepare_to_wait(&parent, TaskState::Sleeping);
+                if !wait_child.is_vforking() || parent.group_exit_pending() {
+                    wait_child.vfork_done.finish_wait(&entry);
+                    break;
+                }
+                drop(wait_child);
+                drop(parent);
+                schedule_once(crate::scheduler::now_ns_public());
+                if let Some(wait_child) = child_wait.upgrade() {
+                    wait_child.vfork_done.finish_wait(&entry);
+                }
+            }
+        } else if !self.args.flags.has(CloneFlags::CLONE_THREAD) {
+            // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
+            // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
+            // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
+            request_post_syscall_handoff();
+        }
+
+        Ok(CloneOutcome {
+            pid: self.pid,
+            child,
+        })
+    }
+}
+
+impl Drop for PreparedClone {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            abort_new_task(&child);
+        }
+    }
+}
+
+pub fn prepare_clone_with_context(
     args: CloneArgs,
     user_ctx: UserContextRef,
-) -> Result<CloneOutcome, Errno> {
+) -> Result<PreparedClone, Errno> {
     validate_clone_args(args)?;
     let parent = current_task();
     let params = SchedParams::default_fair();
@@ -699,52 +979,15 @@ pub fn clone_with_context_outcome(
         abort_new_task(&child);
         return Err(err);
     }
-    if let Err(err) = activate_task(&child) {
-        abort_new_task(&child);
-        return Err(err);
-    }
 
-    if args.flags.has(CloneFlags::CLONE_VFORK) {
-        let child_wait = Arc::downgrade(&child);
-        drop(parent);
-        loop {
-            let Some(wait_child) = child_wait.upgrade() else {
-                break;
-            };
-            if !wait_child.is_vforking() {
-                break;
-            }
-            let parent = current_task();
-            if parent.group_exit_pending() {
-                break;
-            }
-            let entry = wait_child
-                .vfork_done
-                .prepare_to_wait(&parent, TaskState::Sleeping);
-            if !wait_child.is_vforking() || parent.group_exit_pending() {
-                wait_child.vfork_done.finish_wait(&entry);
-                break;
-            }
-            drop(wait_child);
-            drop(parent);
-            schedule_once(crate::scheduler::now_ns_public());
-            if let Some(wait_child) = child_wait.upgrade() {
-                wait_child.vfork_done.finish_wait(&entry);
-            }
-        }
-    } else if !args.flags.has(CloneFlags::CLONE_THREAD) {
-        // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
-        // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
-        // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
-        request_post_syscall_handoff();
-    } else {
-        // pthread 创建后，父线程通常会立即 join/futex 等待，或继续批量创建
-        // 其它线程。强制在每次 clone 返回后切给子线程会把 create 串行化，
-        // 使 libcbench 的 pthread 创建项异常变慢；让父线程自然运行到阻塞点，
-        // 再由 futex/preferred 入队把子线程调度起来即可。
-    }
+    Ok(PreparedClone::from_parts(parent, child, pid, args))
+}
 
-    Ok(CloneOutcome { pid, child })
+pub fn clone_with_context_outcome(
+    args: CloneArgs,
+    user_ctx: UserContextRef,
+) -> Result<CloneOutcome, Errno> {
+    prepare_clone_with_context(args, user_ctx)?.activate()
 }
 
 pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
@@ -802,8 +1045,10 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
     // pthread_create() 会复用 clone_args 缓冲，把该字段填成 TID 地址但不置
     // CLONE_PIDFD；Linux 对这种无效字段是忽略而不是返回 EINVAL，否则用户态
     // 不会 fallback 到传统 clone，线程创建会直接失败。
-    if flags.has(CloneFlags::CLONE_PIDFD) && args.pidfd == 0 {
-        return Err(Errno::EINVAL);
+    if flags.has(CloneFlags::CLONE_PIDFD) {
+        if args.pidfd == 0 || flags.has(CloneFlags::CLONE_THREAD) {
+            return Err(Errno::EINVAL);
+        }
     }
     if args.exit_signal > 64 {
         return Err(Errno::EINVAL);
@@ -839,7 +1084,7 @@ fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> boo
         WaitId::Pid(pid) => child.pid_root() == Some(*pid),
         WaitId::Pgid(pgid) => child.process_group().pgid() == *pgid,
         WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &parent.process_group()),
-        WaitId::Pidfd(task) => Arc::ptr_eq(child, task),
+        WaitId::Pidfd(group) => Arc::ptr_eq(&child.thread_group(), group),
     }
 }
 
@@ -1080,24 +1325,34 @@ fn make_siginfo_with_code(sig: SignalNumber, code: i32) -> SigInfo {
     }
 }
 
-fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
-    task.is_user_task()
-        && (!task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig))
+fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
+    let current = current_task();
+    terminate_thread_group_by_signal_from(target, info, &current)
 }
 
-fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
+fn terminate_thread_group_by_signal_from(
+    target: &Arc<Task>,
+    info: SigInfo,
+    current: &Arc<Task>,
+) -> bool {
     if target.is_kernel_task() {
         return false;
     }
 
+    terminate_thread_group_identity_by_signal_from(&target.thread_group(), info, current)
+}
+
+fn terminate_thread_group_identity_by_signal_from(
+    group: &Arc<ThreadGroup>,
+    info: SigInfo,
+    current: &Arc<Task>,
+) -> bool {
     let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
-    let group = target.thread_group();
     // 与 CLONE_THREAD 登记通过 members 锁排序：先登记者会进入本次 snapshot，
     // 后到者被拒绝，避免 SIGKILL 之后仍产生未收到终止请求的新线程。
     let _ = group.request_group_signal(info.sig, core_dumped);
     let members = group.snapshot();
     let mut terminated = false;
-    let current = current_task();
     let mut need_handoff = false;
 
     for member in members.iter() {
@@ -1110,7 +1365,7 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
         // 不在发送者上下文直接 exit 目标任务。目标恢复自己的
         // 阻塞调用栈，再在 syscall/用户返回边界消费权威组状态。
         crate::scheduler::group_exit_wakeup(member);
-        if !Arc::ptr_eq(member, &current) {
+        if !Arc::ptr_eq(member, current) {
             need_handoff = true;
         }
         terminated = true;
@@ -1122,6 +1377,16 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
     terminated
 }
 
+fn deliver_to_thread_group_identity(group: &Arc<ThreadGroup>, info: SigInfo) -> bool {
+    if info.sig == SignalNumber::SIGKILL {
+        let current = current_task();
+        return terminate_thread_group_identity_by_signal_from(group, info, &current);
+    }
+
+    deliver_shared_signal_to_group(group, info);
+    true
+}
+
 fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
@@ -1130,32 +1395,41 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
         info.sig,
         target.state(),
     );
-    if info.sig == SignalNumber::SIGKILL {
-        let delivered = terminate_thread_group_by_signal(target, info);
-        #[cfg(feature = "trace-task-lifecycle")]
-        log::info!(
-            "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered={}",
-            target.pid_root(),
-            info.sig,
-            delivered,
-        );
-        return delivered;
+    if target.is_kernel_task() {
+        return false;
     }
-
-    target.thread_group().shared_signal().deliver(info);
-    for m in target.thread_group().snapshot() {
-        if should_wake_for_signal(&m, info.sig) {
-            signal_wakeup(&m, &info);
-            break;
-        }
-    }
+    let delivered = deliver_to_thread_group_identity(&target.thread_group(), info);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
-        "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered=true",
+        "[sched][signal] group-deliver-leave target={:?} signal={:?} delivered={}",
         target.pid_root(),
         info.sig,
+        delivered,
     );
-    true
+    delivered
+}
+
+fn check_pidfd_group_permission(group: &Arc<ThreadGroup>) -> Result<(), Errno> {
+    if group.is_terminated() {
+        return Err(Errno::ESRCH);
+    }
+    let target = group.leader().ok_or(Errno::ESRCH)?;
+    check_kill_permission(&target)
+}
+
+/// pidfd 的普通信号入口：直接使用稳定线程组身份，禁止经由可重用的 TGID 回查。
+pub fn pidfd_kill(group: &Arc<ThreadGroup>, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    check_pidfd_group_permission(group)?;
+    let Some(sig) = sig else { return Ok(()) };
+    let _ = deliver_to_thread_group_identity(group, make_siginfo(sig));
+    Ok(())
+}
+
+/// pidfd 的排队信号入口，保留用户提供的 siginfo，同时绑定稳定线程组身份。
+pub fn pidfd_queueinfo(group: &Arc<ThreadGroup>, info: SigInfo) -> Result<(), Errno> {
+    check_pidfd_group_permission(group)?;
+    let _ = deliver_to_thread_group_identity(group, info);
+    Ok(())
 }
 
 /// `kill(pid, sig)`：按 POSIX pid 语义投递信号。
@@ -1432,21 +1706,22 @@ pub fn sigpending() -> Result<SigSet, Errno> {
     capabilities = kernel_symbols::capability::SCHED_QUERY
 )]
 pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
-    if task.group_exit_pending() {
+    if task.group_exit_pending()
+        || task.exec_sibling_exit_boundary_pending()
+        || task.native_thread_exit_boundary_pending().is_some()
+    {
         return true;
     }
+    let group = task.thread_group();
+    let Some(consumer) = group.lock_signal_consumer() else {
+        return false;
+    };
+    let shared = task.shared_signal();
     let blocked = task.signal.blocked_snapshot().raw();
-    let pending = (task.signal.pending_snapshot().raw()
-        | task.shared_signal().pending_snapshot().raw())
-        & !blocked;
-    for raw in 1..crate::signal::NSIG as i32 {
-        let Some(sig) = SignalNumber::from_raw(raw) else {
-            continue;
-        };
-        if (pending & sig.bit()) == 0 {
-            continue;
-        }
-        let action = task.shared_signal().get_action(sig);
+    let mut pending =
+        (task.signal.pending_snapshot().raw() | shared.pending_snapshot().raw()) & !blocked;
+    while let Some(sig) = take_next_pending_signal(&mut pending) {
+        let action = shared.get_action(sig);
         match action.handler {
             SigHandler::Ignore => continue,
             SigHandler::Handler(_) => return true,
@@ -1461,9 +1736,10 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
                         let info = task
                             .signal
                             .dequeue_one_in(sig.bit())
-                            .or_else(|| task.shared_signal().dequeue_one_in(sig.bit()))
+                            .or_else(|| shared.dequeue_one_in(sig.bit()))
                             .unwrap_or_else(|| make_siginfo(sig));
-                        apply_default_action(info);
+                        drop(consumer);
+                        apply_default_action_for_task(task, info);
                     }
                     return true;
                 }
@@ -1473,26 +1749,33 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
     false
 }
 
+#[inline]
+pub(crate) fn take_next_pending_signal(pending: &mut u64) -> Option<SignalNumber> {
+    while *pending != 0 {
+        let bit = pending.trailing_zeros();
+        *pending &= pending.wrapping_sub(1);
+        if let Some(signal) = SignalNumber::from_raw(bit as i32 + 1) {
+            return Some(signal);
+        }
+    }
+    None
+}
+
 /// syscall 返回 `EINTR` 前尝试消费一条可自动重启的用户 handler 信号。
 ///
 /// `SA_RESTART` 要求 handler 返回后重新执行被打断的 syscall。分发器在写返回值、
 /// 推进 PC 之前调用这里，因此原始参数寄存器仍然完整。
 pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
     let me = current_task();
+    let group = me.thread_group();
+    let _consumer = group.lock_signal_consumer()?;
+    let shared = me.shared_signal();
     let blocked = me.signal.blocked_snapshot().raw();
-    let pending = (me.signal.pending_snapshot().raw()
-        | me.shared_signal().pending_snapshot().raw())
-        & !blocked;
+    let mut pending =
+        (me.signal.pending_snapshot().raw() | shared.pending_snapshot().raw()) & !blocked;
 
-    for raw in 1..crate::signal::NSIG as i32 {
-        let Some(sig) = SignalNumber::from_raw(raw) else {
-            continue;
-        };
-        if (pending & sig.bit()) == 0 {
-            continue;
-        }
-
-        let action = me.shared_signal().get_action(sig);
+    while let Some(sig) = take_next_pending_signal(&mut pending) {
+        let action = shared.get_action(sig);
         if !matches!(action.handler, SigHandler::Handler(_)) {
             continue;
         }
@@ -1503,7 +1786,7 @@ pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
         let info = me
             .signal
             .dequeue_one_in(sig.bit())
-            .or_else(|| me.shared_signal().dequeue_one_in(sig.bit()))?;
+            .or_else(|| shared.dequeue_one_in(sig.bit()))?;
         return Some((info, action));
     }
 
@@ -1516,16 +1799,12 @@ pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
 /// 不匹配 `these` 的 pending 会保留在原队列中，等待常规投递或其它 sigwait。
 pub fn sigtimedwait_poll(these: SigSet) -> Option<SigInfo> {
     let me = current_task();
-    // 先 per-task（更及时），再 tg-shared。
-    if let Some(info) = me.signal.dequeue_one_in(these.0) {
-        return Some(info);
-    }
-    me.shared_signal().dequeue_one_in(these.0)
+    me.dequeue_pending_signal_in(these)
 }
 
 fn sigtimedwait_pending(these: SigSet) -> bool {
     let me = current_task();
-    me.signal.has_pending_in(these.0) || me.shared_signal().has_pending_in(these.0)
+    me.has_pending_signal_in(these)
 }
 
 fn finish_current_signal_wait(me: &Arc<Task>) {
@@ -1708,6 +1987,53 @@ pub fn rlimits_snapshot() -> Rlimits {
 
 // ── 信号投递在内核边界的默认动作处理 ─────────────────────────────────────────
 
+/// Native 用户返回边界消费外部进程控制后的调度决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeExternalControl {
+    /// 可以继续完成当前 Native call 或返回用户态。
+    Continue,
+    /// 任务已停止或刚被继续，需要先经过一次调度边界。
+    Reschedule,
+    /// 任务已经进入线程组退出，禁止返回用户态。
+    Terminate,
+}
+
+/// 在 Native 安全边界消费一条外部进程控制事件。
+///
+/// Native 不暴露 Unix signal frame。显式忽略仍然保留；默认动作和异常残留的
+/// Linux handler 都按内核默认动作执行，确保不会把 Linux 用户上下文带入 Native。
+pub fn consume_native_external_control_for_task(task: &Arc<Task>) -> NativeExternalControl {
+    if complete_group_exit_if_requested(task) {
+        return NativeExternalControl::Terminate;
+    }
+    if complete_native_thread_exit_if_requested(task) {
+        return NativeExternalControl::Terminate;
+    }
+
+    let _ = task.consume_pending_signal(|info| {
+        if task.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            let _ = mark_task_stopped(task, info.sig);
+            return;
+        }
+        let action = task.shared_signal().get_action(info.sig);
+        match action.handler {
+            SigHandler::Ignore => {}
+            SigHandler::Default | SigHandler::Handler(_) => {
+                apply_default_action_for_task(task, info);
+            }
+        }
+    });
+
+    if complete_group_exit_if_requested(task) || complete_native_thread_exit_if_requested(task) {
+        return NativeExternalControl::Terminate;
+    }
+    match task.state() {
+        TaskState::Zombie | TaskState::Dead => NativeExternalControl::Terminate,
+        TaskState::Stopped | TaskState::Continued => NativeExternalControl::Reschedule,
+        _ => NativeExternalControl::Continue,
+    }
+}
+
 /// 消费当前任务的一条可投递信号；若其 action 是 Default，按 [`default_action`]
 /// 施加副作用（Term 立刻走 exit）。如果 action 是 Handler（用户态），暂时
 /// 返回 Some 供上层组装 sigframe（本实现暂无 userspace 不会触发）。
@@ -1729,37 +2055,40 @@ pub fn deliver_pending_signals_for_task(
     if me.is_kernel_task() {
         return None;
     }
-    let info = me.signal.dequeue_one().or_else(|| {
-        me.shared_signal()
-            .dequeue_one(me.signal.blocked_snapshot().raw())
-    })?;
-    if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
-        let _ = mark_task_stopped(me, info.sig);
+    if me.user_abi_kind() == crate::UserAbiKind::MygoNative {
+        let _ = consume_native_external_control_for_task(me);
         return None;
     }
-    let action = me.shared_signal().get_action(info.sig);
-    use crate::signal::SigHandler;
-    match action.handler {
-        SigHandler::Default => {
-            apply_default_action(info);
-            None
+    me.consume_pending_signal(|info| {
+        if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+            let _ = mark_task_stopped(me, info.sig);
+            return None;
         }
-        SigHandler::Ignore => None,
-        SigHandler::Handler(_) => {
-            if process_image_ops().is_none() {
-                me.signal.deliver(info);
-                return Some(info);
+        let action = me.shared_signal().get_action(info.sig);
+        use crate::signal::SigHandler;
+        match action.handler {
+            SigHandler::Default => {
+                apply_default_action_for_task(me, info);
+                None
             }
-            match setup_user_signal_frame_for_task(me, info, action, user_ctx) {
-                Ok(()) => None,
-                Err(Errno::ENOSYS) => {
+            SigHandler::Ignore => None,
+            SigHandler::Handler(_) => {
+                if process_image_ops().is_none() {
                     me.signal.deliver(info);
-                    Some(info)
+                    return Some(info);
                 }
-                Err(_) => None,
+                match setup_user_signal_frame_for_task(me, info, action, user_ctx) {
+                    Ok(()) => None,
+                    Err(Errno::ENOSYS) => {
+                        me.signal.deliver(info);
+                        Some(info)
+                    }
+                    Err(_) => None,
+                }
             }
         }
-    }
+    })
+    .flatten()
 }
 
 /// 在保存 signal frame 前先应用 rseq 的 SIGNAL 事件。
@@ -1776,32 +2105,39 @@ pub fn setup_user_signal_frame_for_task(
     task.mark_rseq_event(RseqEvent::Signal);
     if (ops.prepare_user_return)(task, user_ctx).is_err() {
         task.clear_rseq_registration();
-        apply_default_action(SigInfo {
-            sig: SignalNumber::SIGSEGV,
-            code: 0,
-            sender_pid: 0,
-            sender_uid: crate::ids::Uid::ROOT,
-            raw: None,
-        });
+        apply_default_action_for_task(
+            task,
+            SigInfo {
+                sig: SignalNumber::SIGSEGV,
+                code: 0,
+                sender_pid: 0,
+                sender_uid: crate::ids::Uid::ROOT,
+                raw: None,
+            },
+        );
         return Err(Errno::EFAULT);
     }
     match (ops.setup_signal_frame)(task, info, action, user_ctx) {
         Ok(()) => Ok(()),
         Err(Errno::ENOSYS) => Err(Errno::ENOSYS),
         Err(error) => {
-            apply_default_action(SigInfo {
-                sig: SignalNumber::SIGSEGV,
-                code: 0,
-                sender_pid: 0,
-                sender_uid: crate::ids::Uid::ROOT,
-                raw: None,
-            });
+            apply_default_action_for_task(
+                task,
+                SigInfo {
+                    sig: SignalNumber::SIGSEGV,
+                    code: 0,
+                    sender_pid: 0,
+                    sender_uid: crate::ids::Uid::ROOT,
+                    raw: None,
+                },
+            );
             Err(error)
         }
     }
 }
 
 /// 在即将恢复用户态时处理依赖当前 trap frame 的线程状态。
+#[inline]
 pub fn prepare_user_return_for_task(
     task: &Arc<Task>,
     user_ctx: UserContextRef,
@@ -1809,7 +2145,23 @@ pub fn prepare_user_return_for_task(
     if task.is_kernel_task() || user_ctx.is_none() {
         return Ok(());
     }
-    if complete_group_exit_if_requested(task) {
+    if !task.exec_sibling_exit_boundary_pending()
+        && !task.group_exit_boundary_pending()
+        && task.native_thread_exit_boundary_pending().is_none()
+        && task.rseq_events().is_empty()
+    {
+        return Ok(());
+    }
+    prepare_user_return_slow(task, user_ctx)
+}
+
+#[cold]
+#[inline(never)]
+fn prepare_user_return_slow(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), Errno> {
+    if complete_exec_sibling_exit_if_requested(task)
+        || complete_group_exit_if_requested(task)
+        || complete_native_thread_exit_if_requested(task)
+    {
         return Ok(());
     }
     let Some(ops) = process_image_ops() else {
@@ -1818,36 +2170,36 @@ pub fn prepare_user_return_for_task(
     let result = (ops.prepare_user_return)(task, user_ctx);
     if result.is_err() {
         task.clear_rseq_registration();
-        apply_default_action(SigInfo {
-            sig: SignalNumber::SIGSEGV,
-            code: 0,
-            sender_pid: 0,
-            sender_uid: crate::ids::Uid::ROOT,
-            raw: None,
-        });
+        apply_default_action_for_task(
+            task,
+            SigInfo {
+                sig: SignalNumber::SIGSEGV,
+                code: 0,
+                sender_pid: 0,
+                sender_uid: crate::ids::Uid::ROOT,
+                raw: None,
+            },
+        );
     }
     result
 }
 
 pub fn apply_default_action(info: SigInfo) {
+    let task = current_task();
+    apply_default_action_for_task(&task, info);
+}
+
+pub(crate) fn apply_default_action_for_task(task: &Arc<Task>, info: SigInfo) {
     match default_action(info.sig) {
-        DefaultAction::Term => {
-            let me = current_task();
-            me.mark_signaled_exit(info.sig, false);
-            exit_task(&me, ExitCode(info.sig.raw() as i32));
-        }
-        DefaultAction::Core => {
-            let me = current_task();
-            me.mark_signaled_exit(info.sig, true);
-            exit_task(&me, ExitCode(info.sig.raw() as i32));
+        DefaultAction::Term | DefaultAction::Core => {
+            let _ = terminate_thread_group_by_signal_from(task, info, task);
+            let _ = complete_group_exit_if_requested(task);
         }
         DefaultAction::Stop => {
-            let me = current_task();
-            let _ = mark_task_stopped(&me, info.sig);
+            let _ = mark_task_stopped(task, info.sig);
         }
         DefaultAction::Cont => {
-            let me = current_task();
-            let _ = continue_task(&me);
+            let _ = continue_task(task);
         }
         DefaultAction::Ign => {}
     }
@@ -2360,5 +2712,67 @@ pub mod smoketest {
             runqueue().nr_running(),
             crate::scheduler::pid_count(),
         );
+    }
+}
+
+#[cfg(test)]
+mod pidfd_signal_tests {
+    use alloc::sync::Weak;
+
+    use super::*;
+
+    #[test]
+    fn process_signal_delivery_uses_stable_thread_group_identity() {
+        let group = crate::ThreadGroup::new();
+        let info = SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 7,
+            sender_uid: Uid(0),
+            raw: None,
+        };
+
+        assert!(deliver_to_thread_group_identity(&group, info));
+        assert!(
+            group
+                .shared_signal()
+                .pending_snapshot()
+                .has(SignalNumber::SIGUSR1)
+        );
+    }
+
+    #[test]
+    fn dropping_prepared_clone_rolls_back_unactivated_child() {
+        let session = crate::Session::new();
+        let process_group = crate::ProcessGroup::new(&session);
+        session.register_group(&process_group);
+        let parent = Task::new(
+            SchedParams::default_fair(),
+            Weak::new(),
+            crate::ThreadGroup::new(),
+            Arc::clone(&process_group),
+        );
+        let child_group = crate::ThreadGroup::new();
+        let child = Task::new(
+            SchedParams::default_fair(),
+            Arc::downgrade(&parent),
+            Arc::clone(&child_group),
+            Arc::clone(&process_group),
+        );
+        child_group.set_leader(&child);
+        child_group.add_member(&child);
+        process_group.add_member(&child);
+        parent.add_child(Arc::clone(&child));
+
+        drop(PreparedClone::from_parts(
+            Arc::clone(&parent),
+            Arc::clone(&child),
+            7,
+            CloneArgs::fork_default(),
+        ));
+
+        assert_eq!(child.state(), TaskState::Dead);
+        assert!(parent.snapshot_children().is_empty());
+        assert!(child_group.snapshot().is_empty());
     }
 }

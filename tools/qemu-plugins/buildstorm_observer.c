@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* QEMU TCG plugin for low-frequency LoongArch guest kernel stack sampling. */
+/* 用于低频客机内核栈采样的 QEMU TCG plugin。 */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -71,12 +71,11 @@ struct vcpu_state {
     struct qemu_plugin_register *percpu;
     GByteArray *register_buffer;
     GByteArray *stack_buffer;
+    uint64_t completed_insns;
     uint64_t sequence;
     uint64_t dropped;
 };
 
-static qemu_plugin_u64 total_insns;
-static qemu_plugin_u64 user_insns;
 static qemu_plugin_u64 kernel_insns;
 static qemu_plugin_u64 total_period;
 static struct vcpu_state *vcpu_states;
@@ -87,6 +86,7 @@ static int output_socket = -1;
 static struct sockaddr_un output_address;
 static socklen_t output_address_len;
 static char *summary_path;
+static bool riscv_target;
 
 /* ---- per-TB histogram ------------------------------------------- */
 struct tb_entry {
@@ -208,6 +208,7 @@ static void sample_guest(unsigned int vcpu_index, void *userdata)
     struct observer_record record = {0};
     struct vcpu_state *state;
     uint64_t accumulated;
+    uint64_t remainder;
     uint64_t pc;
     uint64_t sp;
     uint64_t ra;
@@ -222,14 +223,15 @@ static void sample_guest(unsigned int vcpu_index, void *userdata)
         return;
     }
     accumulated = qemu_plugin_u64_get(total_period, vcpu_index);
-    qemu_plugin_u64_set(total_period, vcpu_index,
-                        accumulated % period_insns);
+    remainder = accumulated % period_insns;
     state = &vcpu_states[vcpu_index];
+    state->completed_insns += accumulated - remainder;
+    qemu_plugin_u64_set(total_period, vcpu_index, remainder);
     record.sequence = ++state->sequence;
     record.monotonic_ns = monotonic_ns();
-    record.total_insns = qemu_plugin_u64_get(total_insns, vcpu_index);
-    record.user_insns = qemu_plugin_u64_get(user_insns, vcpu_index);
+    record.total_insns = state->completed_insns + remainder;
     record.kernel_insns = qemu_plugin_u64_get(kernel_insns, vcpu_index);
+    record.user_insns = record.total_insns - record.kernel_insns;
     record.dropped = state->dropped;
 
     if (!kernel) {
@@ -281,7 +283,7 @@ static void count_tb_exec(unsigned int vcpu_index, void *userdata)
 static void translate_block(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
-    size_t count = qemu_plugin_tb_n_insns(tb);
+    uint64_t instruction_count = (uint64_t)qemu_plugin_tb_n_insns(tb);
     bool kernel = (pc >> 63) != 0;
 
     (void)id;
@@ -290,18 +292,12 @@ static void translate_block(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         kernel ? QEMU_PLUGIN_CB_R_REGS : QEMU_PLUGIN_CB_NO_REGS,
         QEMU_PLUGIN_COND_GE, total_period, period_insns,
         GUINT_TO_POINTER(kernel));
-    for (size_t index = 0; index < count; ++index) {
-        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
-        uint64_t insn_pc = qemu_plugin_insn_vaddr(insn);
-        qemu_plugin_u64 domain_counter =
-            (insn_pc >> 63) != 0 ? kernel_insns : user_insns;
-
-        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-            insn, QEMU_PLUGIN_INLINE_ADD_U64, total_insns, 1);
-        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-            insn, QEMU_PLUGIN_INLINE_ADD_U64, domain_counter, 1);
-        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-            insn, QEMU_PLUGIN_INLINE_ADD_U64, total_period, 1);
+    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+        tb, QEMU_PLUGIN_INLINE_ADD_U64, total_period, instruction_count);
+    if (kernel) {
+        qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+            tb, QEMU_PLUGIN_INLINE_ADD_U64, kernel_insns,
+            instruction_count);
     }
     if (tb_histogram != NULL) {
         gpointer hkey = (gpointer)(uintptr_t)pc;
@@ -311,7 +307,7 @@ static void translate_block(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         entry = g_hash_table_lookup(tb_histogram, hkey);
         if (entry == NULL) {
             entry = g_new0(struct tb_entry, 1);
-            entry->insns = (uint32_t)count;
+            entry->insns = (uint32_t)instruction_count;
             g_hash_table_insert(tb_histogram, hkey, entry);
         }
         g_mutex_unlock(&histogram_mutex);
@@ -337,21 +333,39 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
         qemu_plugin_reg_descriptor *descriptor =
             &g_array_index(registers, qemu_plugin_reg_descriptor, index);
 
-        if (strcmp(descriptor->name, "pc") == 0) {
+        const char *name = descriptor->name;
+
+        if (strcmp(name, "pc") == 0) {
             state->pc = descriptor->handle;
-        } else if (strcmp(descriptor->name, "r3") == 0) {
+        } else if (!riscv_target && strcmp(name, "r3") == 0) {
             state->sp = descriptor->handle;
-        } else if (strcmp(descriptor->name, "r1") == 0) {
+        } else if (!riscv_target && strcmp(name, "r1") == 0) {
             state->ra = descriptor->handle;
-        } else if (strcmp(descriptor->name, "r22") == 0) {
+        } else if (!riscv_target && strcmp(name, "r22") == 0) {
             state->fp = descriptor->handle;
-        } else if (strcmp(descriptor->name, "r2") == 0) {
+        } else if (!riscv_target && strcmp(name, "r2") == 0) {
             state->tp = descriptor->handle;
-        } else if (strcmp(descriptor->name, "r21") == 0) {
+        } else if (!riscv_target && strcmp(name, "r21") == 0) {
             state->percpu = descriptor->handle;
+        } else if (riscv_target &&
+                   (strcmp(name, "sp") == 0 || strcmp(name, "x2") == 0)) {
+            state->sp = descriptor->handle;
+        } else if (riscv_target &&
+                   (strcmp(name, "ra") == 0 || strcmp(name, "x1") == 0)) {
+            state->ra = descriptor->handle;
+        } else if (riscv_target &&
+                   (strcmp(name, "fp") == 0 || strcmp(name, "s0") == 0 ||
+                    strcmp(name, "x8") == 0)) {
+            state->fp = descriptor->handle;
+        } else if (riscv_target &&
+                   (strcmp(name, "tp") == 0 || strcmp(name, "x4") == 0)) {
+            state->tp = descriptor->handle;
         }
     }
     g_array_free(registers, true);
+    if (riscv_target) {
+        state->percpu = state->tp;
+    }
 }
 
 static void write_histogram(void)
@@ -414,20 +428,22 @@ static void write_summary(void)
     }
     fprintf(stream,
             "{\n  \"schema\": \"mygo.qemu-observer-plugin.v1\",\n"
+            "  \"counter_granularity\": \"translation-block\",\n"
             "  \"period_insns\": %" PRIu64 ",\n"
             "  \"stack_bytes\": %u,\n  \"vcpus\": [\n",
             period_insns, stack_bytes);
     for (int cpu = 0, count = qemu_plugin_num_vcpus(); cpu < count; ++cpu) {
         struct vcpu_state *state = &vcpu_states[cpu];
+        uint64_t total = state->completed_insns +
+                         qemu_plugin_u64_get(total_period, cpu);
+        uint64_t kernel = qemu_plugin_u64_get(kernel_insns, cpu);
 
         fprintf(stream,
                 "    {\"cpu\": %d, \"total\": %" PRIu64
                 ", \"user\": %" PRIu64 ", \"kernel\": %" PRIu64
                 ", \"samples\": %" PRIu64 ", \"dropped\": %" PRIu64
                 "}%s\n",
-                cpu, qemu_plugin_u64_get(total_insns, cpu),
-                qemu_plugin_u64_get(user_insns, cpu),
-                qemu_plugin_u64_get(kernel_insns, cpu), state->sequence,
+                cpu, total, total - kernel, kernel, state->sequence,
                 state->dropped, cpu + 1 == count ? "" : ",");
     }
     fputs("  ]\n}\n", stream);
@@ -460,8 +476,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         }
     }
     g_free(vcpu_states);
-    qemu_plugin_scoreboard_free(total_insns.score);
-    qemu_plugin_scoreboard_free(user_insns.score);
     qemu_plugin_scoreboard_free(kernel_insns.score);
     qemu_plugin_scoreboard_free(total_period.score);
     if (output_socket >= 0) {
@@ -524,11 +538,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 {
     struct qemu_plugin_scoreboard *scoreboard;
 
-    if (!info->system_emulation || strcmp(info->target_name, "loongarch64") != 0) {
-        fputs("buildstorm_observer: LoongArch system emulation is required\n",
+    if (!info->system_emulation ||
+        (strcmp(info->target_name, "loongarch64") != 0 &&
+         strcmp(info->target_name, "riscv64") != 0)) {
+        fputs("buildstorm_observer: RISC-V or LoongArch system emulation is required\n",
               stderr);
         return -1;
     }
+    riscv_target = strcmp(info->target_name, "riscv64") == 0;
     if (parse_options(argc, argv) != 0) {
         return -1;
     }
@@ -540,10 +557,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     max_vcpus = info->system.max_vcpus;
     vcpu_states = g_new0(struct vcpu_state, max_vcpus);
-    scoreboard = qemu_plugin_scoreboard_new(sizeof(uint64_t));
-    total_insns = qemu_plugin_scoreboard_u64(scoreboard);
-    scoreboard = qemu_plugin_scoreboard_new(sizeof(uint64_t));
-    user_insns = qemu_plugin_scoreboard_u64(scoreboard);
     scoreboard = qemu_plugin_scoreboard_new(sizeof(uint64_t));
     kernel_insns = qemu_plugin_scoreboard_u64(scoreboard);
     scoreboard = qemu_plugin_scoreboard_new(sizeof(uint64_t));

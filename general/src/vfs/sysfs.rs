@@ -2971,12 +2971,16 @@ fn render_profile_stats() -> String {
                 continue;
             };
             let timing = value.timing;
+            let completed = value.success.saturating_add(value.errors);
+            let inflight = timing.calls.saturating_sub(completed);
             let _ = writeln!(
                 output,
-                "phase={} syscall={} calls={} success={} errors={} cycles={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
+                "phase={} syscall={} calls={} completed={} inflight={} success={} errors={} cycles={} max_cycles={} wall_ns={} on_cpu_ns={} off_cpu_ns={} max_latency_ns={} migrations={} p50_ns={} p95_ns={} p99_ns={} hist={}",
                 phase,
                 nr,
                 timing.calls,
+                completed,
+                inflight,
                 value.success,
                 value.errors,
                 timing.cycles,
@@ -3535,7 +3539,15 @@ impl FileOps for SysRegFileOps {
         #[cfg(feature = "performance-profile")]
         if matches!(self.kind, SysRegFile::ProfileControl) {
             if _offset != 0 {
-                return Err(VfsError::InvalidArgument);
+                // BusyBox ash 的 `printf '%s\n'` 可能把命令和结尾换行拆成
+                // 两次 write。第一段已经完成控制操作；后续纯空白片段应像
+                // Linux sysfs 的单次文本事务一样被接纳，不能让 shell 误判
+                // 整个控制命令失败。
+                return if _buf.iter().all(u8::is_ascii_whitespace) {
+                    Ok(_buf.len())
+                } else {
+                    Err(VfsError::InvalidArgument)
+                };
             }
             let command = core::str::from_utf8(_buf)
                 .map_err(|_| VfsError::InvalidArgument)?
@@ -6413,5 +6425,17 @@ mod tests {
             truncate_sys_reg(SysRegFile::ProfileStats, 0),
             Err(VfsError::ReadOnlyFilesystem)
         );
+    }
+
+    #[cfg(feature = "performance-profile")]
+    #[test]
+    fn profile_control_accepts_split_trailing_newline() {
+        let file = SysRegFileOps {
+            kind: SysRegFile::ProfileControl,
+            snap: Arc::new(SysSnapshot::default()),
+            snapshot: None,
+        };
+        assert_eq!(file.write_at(b"\n", 6), Ok(1));
+        assert_eq!(file.write_at(b"x", 6), Err(VfsError::InvalidArgument));
     }
 }

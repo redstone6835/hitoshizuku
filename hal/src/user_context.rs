@@ -182,6 +182,19 @@ impl UserTrapFrame {
         }
     }
 
+    /// 设置 Native 启动入口专用的 bootstrap process handle。
+    pub fn set_arg3(&mut self, value: usize) {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            self.inner.a3 = value;
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.inner.a3 = value;
+        }
+    }
+
     pub fn set_ra(&mut self, ra: usize) {
         #[cfg(target_arch = "loongarch64")]
         {

@@ -8,7 +8,9 @@ extern crate alloc;
 #[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
 
-use crate::{VmArea, VmBacking, VmFlags};
+use alloc::sync::Arc;
+
+use crate::{SharedAnonObject, VmArea, VmBacking, VmFlags};
 use ktest::ktest;
 
 fn anon_area(start: usize, end: usize) -> VmArea {
@@ -64,4 +66,36 @@ fn split_at_boundary_returns_none() {
     let area = anon_area(0x1000, 0x3000);
     assert!(area.split_at(0x1000).is_none());
     assert!(area.split_at(0x3000).is_none());
+}
+
+/// backing 的末地址溢出时必须在进入 VmaSet 前被拒绝。
+#[ktest]
+fn well_formed_rejects_backing_overflow() {
+    let direct = VmArea {
+        range: 0x1000..0x3000,
+        flags: VmFlags::from_bits(VmFlags::READ | VmFlags::USER),
+        backing: VmBacking::Direct(usize::MAX - 0x1000),
+    };
+    assert!(!direct.is_well_formed());
+
+    let shared = VmArea {
+        range: 0x1000..0x3000,
+        flags: VmFlags::from_bits(VmFlags::READ | VmFlags::USER),
+        backing: VmBacking::SharedAnon {
+            object: Arc::new(SharedAnonObject::new()),
+            offset: u64::MAX - 0x1000,
+        },
+    };
+    assert!(!shared.is_well_formed());
+}
+
+/// backing 末地址恰好可表示时仍是合法 VMA。
+#[ktest]
+fn well_formed_accepts_backing_boundary() {
+    let area = VmArea {
+        range: 0x1000..0x3000,
+        flags: VmFlags::from_bits(VmFlags::READ | VmFlags::USER),
+        backing: VmBacking::Direct(usize::MAX - 0x2000),
+    };
+    assert!(area.is_well_formed());
 }

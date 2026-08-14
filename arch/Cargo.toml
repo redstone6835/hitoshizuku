@@ -10,6 +10,7 @@ bench = false
 
 [features]
 performance-profile = ["dep:profiling"]
+syscall-model-markers = ["performance-profile", "profiling/syscall-model-markers", "sched/syscall-model-markers"]
 
 [dependencies]
 general = { path = "../general" }
@@ -18,6 +19,7 @@ efi = { path = "../libs/efi" }
 fdt = { path = "../libs/fdt", features = ["alloc"] }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
+native-abi = { path = "../libs/native-abi" }
 profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

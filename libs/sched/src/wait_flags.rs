@@ -15,9 +15,10 @@
 use alloc::sync::Arc;
 use core::fmt;
 
+use crate::group::ThreadGroup;
 use crate::pid::PidT;
 use crate::signal::SignalNumber;
-use crate::task::{Task, TaskUsage};
+use crate::task::TaskUsage;
 
 /// `wait4` / `waitid` 的标志位。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,8 +57,8 @@ pub enum WaitId {
     SameGroup,
     /// pid < -1：pgid == -pid 的子。
     Pgid(PidT),
-    /// `waitid` 的 P_PIDFD：syscall 层已经把 fd 解成具体任务句柄。
-    Pidfd(Arc<Task>),
+    /// `waitid` 的 P_PIDFD：syscall 层已经把 fd 解成稳定线程组身份。
+    Pidfd(Arc<ThreadGroup>),
 }
 
 impl fmt::Debug for WaitId {

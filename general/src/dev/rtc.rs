@@ -759,12 +759,81 @@ impl DeviceFunction for RtcFunction {
         self.dev.name()
     }
 
+    fn operation_contract(&self) -> Option<&str> {
+        Some("mygo.device.rtc@1;1=read_time_ns:u64;2=features:u32")
+    }
+
+    fn invoke(
+        &self,
+        opcode: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, crate::dev::function::DeviceFunctionInvokeError> {
+        use crate::dev::function::DeviceFunctionInvokeError as InvokeError;
+
+        if self.is_gone() {
+            return Err(InvokeError::Gone);
+        }
+        if !input.is_empty() {
+            return Err(InvokeError::Invalid);
+        }
+        match opcode {
+            1 => {
+                if output.len() < core::mem::size_of::<u64>() {
+                    return Err(InvokeError::Invalid);
+                }
+                let RtcControlResponse::Time(time) = self
+                    .dev
+                    .control(RtcControlRequest::ReadTime)
+                    .map_err(map_rtc_invoke_error)?
+                else {
+                    return Err(InvokeError::Fault);
+                };
+                let value = time.unix_time_ns().ok_or(InvokeError::Fault)?;
+                output[..8].copy_from_slice(&value.to_le_bytes());
+                Ok(8)
+            }
+            2 => {
+                if output.len() < core::mem::size_of::<u32>() {
+                    return Err(InvokeError::Invalid);
+                }
+                let RtcControlResponse::Features(features) = self
+                    .dev
+                    .control(RtcControlRequest::GetFeatures)
+                    .map_err(map_rtc_invoke_error)?
+                else {
+                    return Err(InvokeError::Fault);
+                };
+                output[..4].copy_from_slice(&features.bits().to_le_bytes());
+                Ok(4)
+            }
+            _ => Err(InvokeError::Unsupported),
+        }
+    }
+
     fn mark_gone(&self) {
         self.dev.mark_gone();
     }
 
+    fn is_gone(&self) -> bool {
+        !self.dev.is_active()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+fn map_rtc_invoke_error(error: RtcError) -> crate::dev::function::DeviceFunctionInvokeError {
+    use crate::dev::function::DeviceFunctionInvokeError as InvokeError;
+
+    match error {
+        RtcError::Unsupported => InvokeError::Unsupported,
+        RtcError::Invalid => InvokeError::Invalid,
+        RtcError::NoDevice => InvokeError::Gone,
+        RtcError::Busy | RtcError::WouldBlock => InvokeError::Busy,
+        RtcError::Io => InvokeError::Fault,
+        RtcError::Permission => InvokeError::Invalid,
     }
 }
 

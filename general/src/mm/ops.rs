@@ -148,6 +148,16 @@ pub struct UserPgdOps {
     /// 任何对该 handle 的访问都是 UB。
     pub drop_pgd: unsafe fn(handle: PgdHandle),
 
+    /// 清零一段尚未发布的用户物理页 direct-map 虚拟地址。
+    ///
+    /// arch 可以在这里使用 `cbo.zero`、向量存储等 ISA 专用清页实现；general
+    /// 保证范围由分配器独占，且在回调完成前不会写入 resident ledger 或页表。
+    ///
+    /// # Safety
+    /// `vaddr` 必须按用户基础页对齐并覆盖至少 `len` 个可写字节；`len` 必须是
+    /// 用户基础页大小的整数倍。
+    pub zero_user_pages: unsafe fn(vaddr: usize, len: usize),
+
     /// 在 `vaddr` 处映射一页 4 KiB 物理页 `paddr`，权限 `flags`。
     ///
     /// # Safety
@@ -374,6 +384,7 @@ mod tests {
     }
 
     unsafe fn ignore_handle(_: PgdHandle) {}
+    unsafe fn ignore_zero_user_pages(_: usize, _: usize) {}
     unsafe fn ignore_activate_kernel() {}
     unsafe fn ignore_map(
         _: PgdHandle,
@@ -410,6 +421,7 @@ mod tests {
         UserPgdOps {
             new_pgd_for_user: new_pgd,
             drop_pgd: ignore_handle,
+            zero_user_pages: ignore_zero_user_pages,
             map: ignore_map,
             map_pages: ignore_map_pages,
             publish_new_mapping: record_local,

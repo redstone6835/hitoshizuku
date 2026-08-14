@@ -59,6 +59,7 @@ impl CpuMembarrier {
         targets: usize,
         mut is_online: impl FnMut(usize) -> bool,
         mut send_ipi: impl FnMut(usize) -> bool,
+        mut poll_urgent: impl FnMut(),
     ) -> Result<(), Errno> {
         fence(Ordering::SeqCst);
         if targets == 0 {
@@ -93,8 +94,9 @@ impl CpuMembarrier {
                 self.completed[cpu_id].load(Ordering::Acquire),
                 expected[cpu_id],
             ) {
-                // syscall/trap 路径可能保持本地中断关闭。并发 rendezvous 时主动
-                // 服务发给本 CPU 的请求，避免两个发起方相互等待 IPI handler。
+                // syscall/trap 路径可能保持本地中断关闭。等待期间必须推进全部
+                // 紧急工作，避免 membarrier 与 TLB shootdown 等同步请求形成互等。
+                poll_urgent();
                 self.service_cpu(source_cpu);
                 core::hint::spin_loop();
             }
@@ -142,7 +144,13 @@ pub fn synchronize_cpus() -> Result<(), Errno> {
         return Ok(());
     }
     let ops = arch_hooks::cpu_control().ok_or(Errno::EOPNOTSUPP)?;
-    CPU_MEMBARRIER.synchronize_with(source_cpu, targets, ops.is_online, ops.send_membarrier)
+    CPU_MEMBARRIER.synchronize_with(
+        source_cpu,
+        targets,
+        ops.is_online,
+        ops.send_membarrier,
+        crate::poll_urgent_work,
+    )
 }
 
 /// 架构 IPI handler 调用：处理当前 CPU 尚未确认的 membarrier 请求。
@@ -198,13 +206,42 @@ mod tests {
             let start = Arc::clone(&start);
             workers.push(thread::spawn(move || {
                 start.wait();
-                state.synchronize_with(cpu_id, cpu_bit(cpu_id ^ 1), |_| true, |_| true)
+                state.synchronize_with(cpu_id, cpu_bit(cpu_id ^ 1), |_| true, |_| true, || {})
             }));
         }
 
         for worker in workers {
             worker.join().expect("membarrier worker").unwrap();
         }
+    }
+
+    #[test]
+    fn waiting_for_remote_barrier_polls_urgent_work() {
+        use core::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let state = Arc::new(CpuMembarrier::new());
+        let fallback = Arc::clone(&state);
+        let fallback_worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            fallback.service_cpu(1);
+        });
+        let progress_calls = AtomicUsize::new(0);
+
+        let result = state.synchronize_with(
+            0,
+            cpu_bit(1),
+            |_| true,
+            |_| true,
+            || {
+                progress_calls.fetch_add(1, Ordering::Relaxed);
+                state.service_cpu(1);
+            },
+        );
+
+        fallback_worker.join().expect("urgent fallback worker");
+        assert_eq!(result, Ok(()));
+        assert_ne!(progress_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -219,6 +256,7 @@ mod tests {
                 sent = true;
                 true
             },
+            || {},
         );
 
         assert_eq!(result, Err(Errno::EIO));

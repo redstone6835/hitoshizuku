@@ -12,10 +12,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::mem::size_of;
 
 use errno::Errno;
-use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
+use general::mm::{VmSpace, copy_from_user, copy_to_user};
 use general::vfs::{
     Credentials, Dentry, FdTable, FileMode, Mount, MountNamespace, VfsContext, VfsLimits, VfsRoot,
     build_boot_vfs_parts,
@@ -23,7 +22,7 @@ use general::vfs::{
 use hal::user_context::UserTrapFrame;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::process_ops::{ExecPath, ExecRequest, ProcessImageOps, UserContextRef};
+use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
 use sched::task::{
@@ -155,6 +154,7 @@ struct KernelExtExitHook;
 
 impl TaskExtExitHook for KernelExtExitHook {
     fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        crate::native_runtime::record_task_exit(task);
         #[cfg(target_arch = "riscv64")]
         arch::riscv64::vector::clear_for_task(task);
         #[cfg(target_arch = "riscv64")]
@@ -162,6 +162,7 @@ impl TaskExtExitHook for KernelExtExitHook {
             let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
         }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
+        let _ = task.ext_remove(crate::native_runtime::TASKEXT_NATIVE_THREAD);
         let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
         let _ = task.ext_remove(TASKEXT_EXEC_ACCESS);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
@@ -270,12 +271,6 @@ static TASK_CPU_STATE_OPS: sched::arch_hooks::TaskCpuStateOps =
 // sched 拥有 exec/clone/sigreturn 的状态机；真正解释用户指针、构造 trap frame、
 // 替换 VmSpace 的实现留在 kernel/hal 侧。
 
-const EXEC_PATH_MAX: usize = 4096;
-// Rust 链接器命令会携带数百个目标文件与静态库；最终可用空间仍由
-// EXEC_MAX_ARG_BYTES 和用户栈布局共同约束，这里不应提前卡在 256 项。
-const EXEC_MAX_STRINGS: usize = 4096;
-const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
-
 const SIGFRAME_MAGIC: u64 = 0x4d59474f_53494746; // "MYGOSIGF"
 const SIGFRAME_HEADER_SIZE: usize = 64;
 const SIGFRAME_SIGINFO_SIZE: usize = 128;
@@ -360,47 +355,8 @@ fn install_exec_access(task: &Arc<Task>, access: Arc<crate::user::ExecutableAcce
     task.ext_install(TASKEXT_EXEC_ACCESS, access);
 }
 
-fn read_user_usize(user: usize) -> Result<usize, Errno> {
-    let mut raw = [0u8; size_of::<usize>()];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
-    Ok(usize::from_ne_bytes(raw))
-}
-
 fn write_user_pid_t(user: usize, value: sched::pid::PidT) -> Result<(), Errno> {
     copy_to_user(user, &value.to_ne_bytes()).map_err(|e| e.as_errno())
-}
-
-fn collect_user_string_array(
-    table_user: usize,
-    used_bytes: &mut usize,
-) -> Result<Vec<String>, Errno> {
-    let mut out = Vec::new();
-    if table_user == 0 {
-        return Ok(out);
-    }
-
-    for idx in 0..EXEC_MAX_STRINGS {
-        let ptr_addr = table_user
-            .checked_add(idx.checked_mul(size_of::<usize>()).ok_or(Errno::EINVAL)?)
-            .ok_or(Errno::EINVAL)?;
-        let str_user = read_user_usize(ptr_addr)?;
-        if str_user == 0 {
-            return Ok(out);
-        }
-        let remaining = EXEC_MAX_ARG_BYTES
-            .checked_sub(*used_bytes)
-            .ok_or(Errno::EINVAL)?;
-        if remaining == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let s = copy_cstr_from_user(str_user, remaining).map_err(|e| e.as_errno())?;
-        *used_bytes = used_bytes.checked_add(s.len() + 1).ok_or(Errno::EINVAL)?;
-        if *used_bytes > EXEC_MAX_ARG_BYTES {
-            return Err(Errno::EINVAL);
-        }
-        out.push(s);
-    }
-    Err(Errno::EINVAL)
 }
 
 fn activate_task_vm(task: &Arc<Task>) {
@@ -449,7 +405,7 @@ fn pop_riscv_vector_signal_snapshot(task: &Arc<Task>, user_ctx: UserContextRef) 
 
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
     let frame = {
-        let me = sched::current_task();
+        let me = sched::current_task_direct();
         activate_task_vm(&me);
 
         // 子任务可能在"已入队、尚未首次运行"的窗口里被 exit_group / SIGKILL
@@ -488,77 +444,8 @@ fn process_execve(
     if user_ctx.is_none() {
         return Err(Errno::EINVAL);
     }
-
-    let old_vm = task_vm_space(task);
-    let (path, file) = match request.path {
-        ExecPath::User(path_user) => (
-            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?,
-            None,
-        ),
-        ExecPath::Kernel(path) => (path, None),
-        ExecPath::FileDescriptor(fd_raw) => {
-            let fdt = task_fdtable(task).ok_or(Errno::EBADF)?;
-            let file = fdt
-                .get_file(vfs::fdtable::Fd::from_raw(fd_raw))
-                .ok_or(Errno::EBADF)?;
-            let vfs_ctx = task
-                .ext_lookup(TASKEXT_VFS_CONTEXT)
-                .ok_or(Errno::EBADF)?
-                .downcast::<VfsContext>()
-                .map_err(|_| Errno::EBADF)?;
-            let display_path = general::vfs::namespace_path(&vfs_ctx, file.dentry(), file.mount())
-                .unwrap_or_else(|| alloc::format!("/proc/self/fd/{fd_raw}"));
-            (display_path, Some(file))
-        }
-    };
-    let mut used = path.len().checked_add(1).ok_or(Errno::EINVAL)?;
-    let argv = collect_user_string_array(request.argv_user, &mut used)?;
-    let envp = collect_user_string_array(request.envp_user, &mut used)?;
-
-    let load_result = if let Some(file) = file {
-        crate::user::load_user_image_from_file(task, file, &path, &argv, &envp)
-    } else {
-        crate::user::load_user_image_from_path(task, &path, &argv, &envp)
-    };
-    let loaded = match load_result {
-        Ok(loaded) => loaded,
-        Err(err) => {
-            if matches!(err, Errno::ENOEXEC | Errno::ENOENT) {
-                log::debug!("[exec] load failed: path={:?} err={:?}", path, err);
-            } else {
-                log::info!("[exec] load failed: path={:?} err={:?}", path, err);
-            }
-            if let Some(vm) = old_vm {
-                vm.activate();
-            }
-            return Err(err);
-        }
-    };
-
-    let _ = task.ext_remove(TASKEXT_VM_SPACE);
-    task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
-    install_exec_access(task, Arc::clone(&loaded.exec_access));
-    #[cfg(target_arch = "riscv64")]
-    arch::riscv64::vector::clear_for_task(task);
-    loaded.vm.activate();
-    install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
-    #[cfg(feature = "performance-profile")]
-    install_profile_images(task, &loaded);
-    if let Some(fdt) = task_fdtable(task) {
-        fdt.close_on_exec();
-    }
-
-    // exec 时将 caught 信号重置为 SIG_DFL
-    task.thread_group()
-        .shared_signal()
-        .reset_handlers_for_exec();
-
-    let kstack_top = task.ensure_kernel_stack();
-    hal::user_context::set_kernel_trap_stack(kstack_top);
-    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
-    frame.set_kernel_stack_top(kstack_top);
-    frame.apply_to_context(user_ctx.as_usize());
-    Ok(())
+    let prepared = crate::exec::prepare_exec(task, request)?;
+    crate::exec::commit_exec(task, prepared, user_ctx)
 }
 
 fn process_spawn_user_process(
@@ -571,7 +458,7 @@ fn process_spawn_user_process(
     let loaded = match crate::user::load_user_image_from_path(child, path, argv, envp) {
         Ok(loaded) => loaded,
         Err(error) => {
-            activate_task_vm(&sched::current_task());
+            activate_task_vm(&sched::current_task_direct());
             return Err(error);
         }
     };
@@ -600,7 +487,80 @@ fn process_spawn_user_process(
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
 
     // 装载器会激活新地址空间以布置用户栈；返回调用者前必须恢复当前任务页表。
+    activate_task_vm(&sched::current_task_direct());
+    Ok(())
+}
+
+/// 为尚未进入运行队列的 Native 子进程安装完整映像与首次用户上下文。
+pub(crate) fn prepare_native_child(
+    child: &Arc<Task>,
+    image: crate::soyo::PreparedSoyoImage,
+) -> Result<(), Errno> {
+    if child.state() != sched::TaskState::New {
+        return Err(Errno::EINVAL);
+    }
+    let kernel_stack_top = child.ensure_kernel_stack();
+    let frame = crate::exec::prepare_native_initial_frame(
+        image.entry_pc,
+        image.user_sp,
+        image.start_info_address,
+        image.start_info_size,
+        image.image_base,
+        image.tls_base,
+        image.bootstrap_process,
+        kernel_stack_top,
+    );
+
+    let vm: Arc<dyn core::any::Any + Send + Sync> = image.vm.clone();
+    child.ext_install(TASKEXT_VM_SPACE, vm);
+    // Native child 从零建立用户态资源，不继承父侧 Linux fd、cwd 或 root。
+    let _ = child.ext_remove(TASKEXT_VFS_FDTABLE);
+    let _ = child.ext_remove(TASKEXT_VFS_CONTEXT);
+    child.set_comm(b"soyo-child");
+    child.into_kernel_thread(user_clone_entry, 0);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
+
+    let personality: Arc<dyn core::any::Any + Send + Sync> = image.personality;
+    let group = child.thread_group();
+    let mut exec = group.lock_exec();
+    if exec.phase() != native_abi::ExecPhase::Running || !exec.has_only_member(child) {
+        return Err(Errno::EBUSY);
+    }
+    exec.install_personality(sched::ProcessPersonalityState::MygoNative(personality));
+    exec.advance_generation();
+    drop(exec);
+
+    // SOYO 映射期间可能切换过活动页表，返回父调用现场前必须恢复当前地址空间。
     activate_task_vm(&sched::current_task());
+    Ok(())
+}
+
+/// 为尚未进入运行队列的 Native 线程安装共享地址空间和首次用户上下文。
+pub(crate) fn prepare_native_thread(
+    child: &Arc<Task>,
+    vm: Arc<VmSpace>,
+    entry: usize,
+    stack_top: usize,
+    argument: usize,
+    tls_base: usize,
+) -> Result<(), Errno> {
+    if child.state() != sched::TaskState::New
+        || child.thread_group().user_abi_kind() != native_abi::UserAbiKind::MygoNative
+    {
+        return Err(Errno::EINVAL);
+    }
+    let kernel_stack_top = child.ensure_kernel_stack();
+    let mut frame = UserTrapFrame::init_user(entry, stack_top, argument);
+    frame.set_tls(tls_base);
+    frame.set_kernel_stack_top(kernel_stack_top);
+
+    let vm_payload: Arc<dyn core::any::Any + Send + Sync> = vm;
+    child.ext_install(TASKEXT_VM_SPACE, vm_payload);
+    let _ = child.ext_remove(TASKEXT_VFS_FDTABLE);
+    let _ = child.ext_remove(TASKEXT_VFS_CONTEXT);
+    child.set_comm(b"soyo-thread");
+    child.into_kernel_thread(user_clone_entry, 0);
+    child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     Ok(())
 }
 
@@ -1335,6 +1295,7 @@ pub fn boot_init() -> Arc<Task> {
     // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
+    crate::native_runtime::register();
 
     init
 }

@@ -431,6 +431,8 @@ pub struct StartAddressOps {
 pub struct StartAllocatorOps {
     /// 返回为内核堆保留的虚拟地址范围。
     pub kernel_heap_region: KernelHeapRegionFn,
+    /// 返回需要 registry 账本的分配使用的独立虚拟地址窗口。
+    pub tracked_heap_region: KernelHeapRegionFn,
     /// 为内核堆虚拟范围映射物理后备范围。
     pub map_kernel_heap_range: MapKernelHeapRangeFn,
     /// 取消映射先前映射的内核堆虚拟范围。

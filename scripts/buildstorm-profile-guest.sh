@@ -12,8 +12,91 @@ case "$profile_boot_mode" in
 esac
 
 usage() {
-    echo "usage: $0 run <run-token> | watch-stage <run-token> aws-first-object | go <run-token> | arm <run-token> | resume <run-token> | finish <run-token> | ack-stop <run-token> | controller-status <run-token> | stop-token <run-token>" >&2
+    echo "usage: $0 plan | run <run-token> | watch-stage <run-token> aws-first-object | go <run-token> | arm <run-token> | resume <run-token> | finish <run-token> | ack-stop <run-token> | controller-status <run-token> | stop-token <run-token>" >&2
     exit 2
+}
+
+resolve_workload() {
+    profile_arch=${PROFILE_ARCH:-$(uname -m 2>/dev/null || echo unknown)}
+    profile_target_fs=${PROFILE_TARGET_FS:-extfs}
+    case "$profile_arch" in
+        riscv64) profile_target=riscv64gc-unknown-linux-musl ;;
+        loongarch64) profile_target=loongarch64-unknown-linux-musl ;;
+        *) echo "profile runner: PROFILE_ARCH must be riscv64 or loongarch64" >&2; return 2 ;;
+    esac
+    case "$profile_target_fs" in
+        extfs|tmpfs) ;;
+        *) echo "profile runner: PROFILE_TARGET_FS must be extfs or tmpfs" >&2; return 2 ;;
+    esac
+}
+
+print_workload_plan() {
+    resolve_workload || return
+    plan_skip_prebuild=${PROFILE_SKIP_PREBUILD:-0}
+    plan_xtask_bin=${PROFILE_XTASK_BIN:-/work/tgoskits/target/debug/tg-xtask}
+    if [ "$plan_skip_prebuild" -eq 1 ]; then
+        plan_prebuild="prebuilt:$plan_xtask_bin"
+        plan_command="timeout 14400 $plan_xtask_bin arceos build -p arceos-helloworld --arch $profile_arch"
+    else
+        plan_prebuild="cargo build -p tg-xtask"
+        plan_command="timeout 14400 cargo xtask arceos build -p arceos-helloworld --arch $profile_arch"
+    fi
+    cat <<EOF
+schema=mygo.buildstorm-workload.v2
+arch=$profile_arch
+target=$profile_target
+target_fs=$profile_target_fs
+prebuild=$plan_prebuild
+command=$plan_command
+EOF
+}
+
+prepare_target() {
+    root_mount=${PROFILE_ROOT_MOUNT:-/mnt}
+    mounts_file=${PROFILE_MOUNTS_FILE:-/proc/mounts}
+    target_mount=$root_mount/work/tgoskits/target
+    mkdir -p "$target_mount" || {
+        echo "profile runner: unable to create BuildStorm target directory" >&2
+        return 1
+    }
+
+    case "$profile_target_fs" in
+        extfs)
+            if awk -v target="$target_mount" '$2 == target { found = 1 } END { exit !found }' \
+                "$mounts_file" 2>/dev/null; then
+                echo "profile runner: formal BuildStorm target has an unexpected mount" >&2
+                return 1
+            fi
+            workload_fs=$(awk -v root="$root_mount" \
+                '$2 == root { print $3; found = 1; exit } END { exit !found }' \
+                "$mounts_file" 2>/dev/null) || {
+                echo "profile runner: workload root filesystem is unavailable" >&2
+                return 1
+            }
+            case "$workload_fs" in
+                ext2|ext3|ext4) ;;
+                *) echo "profile runner: formal BuildStorm requires an ext filesystem" >&2; return 1 ;;
+            esac
+            rm -rf "$target_mount/$profile_target" || return 1
+            [ ! -e "$target_mount/$profile_target" ] || {
+                echo "profile runner: unable to remove the formal architecture target" >&2
+                return 1
+            }
+            echo "@@PROFILE_TARGET_FS type=$workload_fs path=/work/tgoskits/target source=workload"
+            ;;
+        tmpfs)
+            if awk -v target="$target_mount" \
+                '$2 == target && $3 == "tmpfs" { found = 1 } END { exit !found }' \
+                "$mounts_file" 2>/dev/null; then
+                :
+            elif ! mount -t tmpfs -o size=5G tmpfs "$target_mount"; then
+                echo "profile runner: unable to mount BuildStorm target tmpfs" >&2
+                return 1
+            fi
+            rm -rf "$target_mount/debug" || return 1
+            echo "@@PROFILE_TARGET_FS type=tmpfs path=/work/tgoskits/target limit=5G"
+            ;;
+    esac
 }
 
 valid_token() {
@@ -503,7 +586,10 @@ watch_stage() {
     fi
     echo "@@PROFILE_STAGE_WATCH_READY name=$stage_name token=$token"
     while read_owner_record "$token"; do
-        for object in "$stage_root"/work/tgoskits/target/debug/build/aws-lc-sys-*/out/*.o; do
+        for object in \
+            "$stage_root"/work/tgoskits/target/*/debug/build/aws-lc-sys-*/out/*.o \
+            "$stage_root"/work/tgoskits/target/debug/build/aws-lc-sys-*/out/*.o
+        do
             [ -f "$object" ] || continue
             relative=${object#"$stage_root"}
             echo "@@PROFILE_STAGE name=$stage_name token=$token path=$relative"
@@ -524,6 +610,7 @@ expect_controller_state() {
         "$controller_expected_state" "$controller_state" >"$controller_phase_file"
     case "$controller_state" in
         "$controller_expected_state") return 0 ;;
+        stop) return 3 ;;
         abort)
             echo "PROFILE_CAPTURE_SKIPPED reason=workload-ended state=$controller_expected_state token=$token"
             return 2
@@ -533,6 +620,32 @@ expect_controller_state() {
             return 1
             ;;
     esac
+}
+
+publish_capture_window() {
+    ended=$1
+    quiescence_verified=$2
+    quiescence_method=$3
+    capture_prepared=$4
+    if [ "$capture_prepared" -eq 1 ] && [ "$PROFILE_CAPTURE" -eq 1 ]; then
+        printf 'freeze\n' >"${PROFILE_CONTROL:-/sys/kernel/profile_control}" || return 1
+    fi
+    echo "@@PROFILE_WINDOW_FROZEN ended=$ended token=$token quiescence_verified=$quiescence_verified quiescence_method=$quiescence_method"
+
+    while :; do
+        expect_controller_state snapshot
+        controller_wait_status=$?
+        case "$controller_wait_status" in
+            0) break ;;
+            2) return 0 ;;
+            3) continue ;;
+            *) return 1 ;;
+        esac
+    done
+    if [ "$capture_prepared" -eq 1 ] && [ "$PROFILE_CAPTURE" -eq 1 ]; then
+        PROFILE_ALREADY_FROZEN=1 /bin/sh /tmp/profile-capture.sh stop "$PROFILE_WORKLOAD" || return 1
+    fi
+    echo "@@PROFILE_WINDOW_STOPPED ended=$ended token=$token"
 }
 
 capture_controller() {
@@ -562,7 +675,12 @@ capture_controller() {
 
     expect_controller_state start
     controller_wait_status=$?
-    case "$controller_wait_status" in 0) ;; 2) return 0 ;; *) return 1 ;; esac
+    case "$controller_wait_status" in
+        0) ;;
+        2) return 0 ;;
+        3) publish_capture_window 1 1 workload-ended 0; return $? ;;
+        *) return 1 ;;
+    esac
     controller_actual=$(cat "$owner" 2>/dev/null) || {
         echo "PROFILE_CAPTURE_SKIPPED reason=workload-ended token=$token"
         return 0
@@ -584,21 +702,28 @@ capture_controller() {
             return 1
         }
         [ "$group_stop_empty" -eq 0 ] || {
-            echo "PROFILE_CAPTURE_SKIPPED reason=workload-ended token=$token"
-            return 0
+            publish_capture_window 1 1 workload-ended 0
+            return $?
         }
     fi
     if [ "$PROFILE_CAPTURE" -eq 1 ]; then
         PROFILE_LEAVE_FROZEN=1 /bin/sh /tmp/profile-capture.sh start "$PROFILE_WORKLOAD" || return 1
+        printf 'root=%s\n' "$workload_pid" >"${PROFILE_CONTROL:-/sys/kernel/profile_control}" || return 1
+        echo "@@PROFILE_WORKLOAD_ROOT pid=$workload_pid token=$token"
     fi
     echo "@@PROFILE_WINDOW_READY token=$token"
 
     expect_controller_state resume
     controller_wait_status=$?
-    case "$controller_wait_status" in 0) ;; 2) return 0 ;; *) return 1 ;; esac
+    case "$controller_wait_status" in
+        0) ;;
+        2) return 0 ;;
+        3) publish_capture_window 1 1 workload-ended 1; return $? ;;
+        *) return 1 ;;
+    esac
     [ -r "$owner" ] || {
-        echo "PROFILE_CAPTURE_SKIPPED reason=workload-ended-before-resume token=$token"
-        return 0
+        publish_capture_window 1 1 workload-ended 1
+        return $?
     }
     if [ "$controller_gate_closed" -eq 1 ] && [ -e "$controller_gate_released" ]; then
         echo "profile runner: cooperative start gate opened before window resume" >&2
@@ -642,21 +767,7 @@ capture_controller() {
     else
         ended=1
     fi
-    if [ "$PROFILE_CAPTURE" -eq 1 ]; then
-        printf 'freeze\n' >"${PROFILE_CONTROL:-/sys/kernel/profile_control}" || return 1
-    fi
-    # This marker defines the shared host/QEMU/profiler stop boundary.
-    # The host acknowledges it only after taking the QEMU/observer
-    # boundary; snapshot rendering and termination stay outside.
-    echo "@@PROFILE_WINDOW_FROZEN ended=$ended token=$token quiescence_verified=$quiescence_verified quiescence_method=$quiescence_method"
-
-    expect_controller_state snapshot
-    controller_wait_status=$?
-    case "$controller_wait_status" in 0) ;; 2) return 0 ;; *) return 1 ;; esac
-    if [ "$PROFILE_CAPTURE" -eq 1 ]; then
-        PROFILE_ALREADY_FROZEN=1 /bin/sh /tmp/profile-capture.sh stop "$PROFILE_WORKLOAD" || return 1
-    fi
-    echo "@@PROFILE_WINDOW_STOPPED ended=$ended token=$token"
+    publish_capture_window "$ended" "$quiescence_verified" "$quiescence_method" 1 || return 1
     if [ "$ended" -eq 0 ]; then
         # 窗口快照已经完成；只终止已校验身份的 leader，让 host 的 QEMU
         # teardown 回收仍冻结的后代，避免再次遍历正在退出的进程组。
@@ -665,6 +776,19 @@ capture_controller() {
     fi
     exec 8>&-
     return 0
+}
+
+finish_natural_capture() {
+    natural_owner=$1
+    natural_controller_pid=$2
+    printf 'stop\n' >&7 || {
+        echo "profile runner: unable to notify controller of workload completion" >&2
+        return 1
+    }
+    if [ -n "$natural_controller_pid" ]; then
+        wait "$natural_controller_pid" || return 1
+    fi
+    rm -f "$natural_owner"
 }
 
 stop_run() {
@@ -714,6 +838,16 @@ run_profile() {
     valid_token "$token" || usage
     capture=${PROFILE_CAPTURE:-1}
     case "$capture" in 0|1) ;; *) echo "profile runner: PROFILE_CAPTURE must be 0 or 1" >&2; exit 2 ;; esac
+    skip_prebuild=${PROFILE_SKIP_PREBUILD:-0}
+    case "$skip_prebuild" in
+        0|1) ;;
+        *) echo "profile runner: PROFILE_SKIP_PREBUILD must be 0 or 1" >&2; exit 2 ;;
+    esac
+    xtask_bin=${PROFILE_XTASK_BIN:-/work/tgoskits/target/debug/tg-xtask}
+    case "$xtask_bin" in
+        /*) ;;
+        *) echo "profile runner: PROFILE_XTASK_BIN must be an absolute path" >&2; exit 2 ;;
+    esac
     event_mask=${PROFILE_EVENT_MASK:-0xfef000000}
     valid_event_mask "$event_mask" || { echo "profile runner: invalid PROFILE_EVENT_MASK" >&2; exit 2; }
     event_mask_high=${PROFILE_EVENT_MASK_HIGH:-0x0}
@@ -726,6 +860,12 @@ run_profile() {
     [ "$timing_shift" -le 16 ] || { echo "profile runner: invalid PROFILE_TIMING_SHIFT" >&2; exit 2; }
     workload=${PROFILE_WORKLOAD:-xtask}
     valid_token "$workload" || { echo "profile runner: invalid PROFILE_WORKLOAD" >&2; exit 2; }
+    resolve_workload || exit $?
+    actual_arch=$(uname -m 2>/dev/null || echo unknown)
+    [ "$actual_arch" = "$profile_arch" ] || {
+        echo "profile runner: configured architecture does not match the guest" >&2
+        exit 1
+    }
 
     mkdir -p "$tool_mount" /mnt/proc /mnt/sys /mnt/dev /mnt/run /mnt/tmp
     if ! grep -q " $tool_mount " /proc/mounts 2>/dev/null; then
@@ -749,29 +889,7 @@ run_profile() {
         exit 1
     fi
 
-    # Match the contest init path exactly: BuildStorm writes all Cargo output
-    # to a bounded tmpfs.  Profiling ext4 here would mix filesystem writeback
-    # and recovery failures into the compiler/MM measurements and would no
-    # longer describe the workload used for scoring.
-    target_mount=/mnt/work/tgoskits/target
-    mkdir -p "$target_mount" || {
-        echo "profile runner: unable to create BuildStorm target mount" >&2
-        exit 1
-    }
-    if grep -q " $target_mount " /proc/mounts 2>/dev/null; then
-        if ! grep -q " $target_mount tmpfs " /proc/mounts 2>/dev/null; then
-            echo "profile runner: BuildStorm target is mounted on a non-tmpfs filesystem" >&2
-            exit 1
-        fi
-    elif ! mount -t tmpfs -o size=5G tmpfs "$target_mount"; then
-        echo "profile runner: unable to mount BuildStorm target tmpfs" >&2
-        exit 1
-    fi
-    grep -q " $target_mount tmpfs " /proc/mounts 2>/dev/null || {
-        echo "profile runner: BuildStorm target tmpfs verification failed" >&2
-        exit 1
-    }
-    echo "@@PROFILE_TARGET_FS type=tmpfs path=/work/tgoskits/target limit=5G"
+    prepare_target || exit 1
 
     if [ "$capture" -eq 1 ]; then
         cp "$tool_mount/profile-capture.sh" /tmp/profile-capture.sh || exit 1
@@ -782,12 +900,22 @@ run_profile() {
     cat /proc/meminfo 2>/dev/null || true
     echo "@@PROFILE_MEMINFO_END phase=before"
 
-    # Every run uses a fresh overlay. Keep this explicit deletion as a second
-    # invariant, and fail instead of accidentally measuring an incremental run.
-    if ! chroot /mnt /bin/sh -c \
-        'rm -rf /work/tgoskits/target/debug && test ! -e /work/tgoskits/target/debug'; then
-        echo "profile runner: unable to establish a cold target directory" >&2
-        exit 1
+    if [ "$skip_prebuild" -eq 1 ]; then
+        if ! chroot /mnt /bin/bash -lc 'test -x "$1"' bash "$xtask_bin"; then
+            echo "profile runner: prebuilt tg-xtask is unavailable: $xtask_bin" >&2
+            exit 1
+        fi
+        echo "@@PROFILE_PREBUILD_BEGIN command=tg-xtask status=skipped"
+        echo "@@PROFILE_PREBUILD_END command=tg-xtask status=skipped"
+    else
+        # tg-xtask 预编不属于正式计分窗口，但必须和官方脚本一样在计时构建前完成。
+        echo "@@PROFILE_PREBUILD_BEGIN command=tg-xtask"
+        if ! chroot /mnt /bin/bash -lc \
+            'export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; cargo build -p tg-xtask'; then
+            echo "profile runner: tg-xtask prebuild failed" >&2
+            exit 1
+        fi
+        echo "@@PROFILE_PREBUILD_END command=tg-xtask status=0"
     fi
 
     export PROFILE_EVENT_MASK=$event_mask
@@ -823,7 +951,7 @@ run_profile() {
     # 保证 progress 一定落到串口日志上；同时不引入任何转发进程——转发进程
     # 会被窗口起止的 SIGSTOP 组停止一起冻住，反而让 cargo 阻塞在管道上。
     setsid chroot /mnt /bin/bash -lc \
-        'gate=$1; token=$2; exec 9<>"$gate" || exit 1; echo "@@PROFILE_GATE_READY token=$token"; IFS= read -r gate_word <&9; [ "$gate_word" = go ] || exit 1; exec 9>&-; export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; if [ -w /dev/console ]; then exec >/dev/console 2>&1; echo "@@PROFILE_BUILD_SINK sink=console"; else echo "@@PROFILE_BUILD_SINK sink=inherited"; exec 2>&1; fi; echo "@@PROFILE_CARGO_EXEC token=$token"; exec cargo build -p tg-xtask' bash "$gate" "$token" &
+        'gate=$1; token=$2; arch=$3; skip_prebuild=$4; xtask_bin=$5; exec 9<>"$gate" || exit 1; echo "@@PROFILE_GATE_READY token=$token"; IFS= read -r gate_word <&9; [ "$gate_word" = go ] || exit 1; exec 9>&-; export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true; cd /work/tgoskits; if [ -w /dev/console ]; then exec >/dev/console 2>&1; echo "@@PROFILE_BUILD_SINK sink=console"; else echo "@@PROFILE_BUILD_SINK sink=inherited"; exec 2>&1; fi; echo "@@PROFILE_CARGO_EXEC token=$token"; if [ "$skip_prebuild" -eq 1 ]; then exec timeout 14400 "$xtask_bin" arceos build -p arceos-helloworld --arch "$arch"; else exec timeout 14400 cargo xtask arceos build -p arceos-helloworld --arch "$arch"; fi' bash "$gate" "$token" "$profile_arch" "$skip_prebuild" "$xtask_bin" &
     workload_pid=$!
 
     attempts=0
@@ -874,15 +1002,7 @@ run_profile() {
     status=$?
     set -u
     echo "@@PROFILE_WORKLOAD_EXIT status=$status token=$token"
-    # deadline 路径的后代仍保持冻结，随本轮 QEMU overlay 一并销毁。
-    rm -f "$owner"
-    printf 'abort\n' >&7 2>/dev/null || true
-
-    if [ -n "$controller_pid" ]; then
-        # 自然完成时通过 FIFO 的 abort 消息唤醒 controller；deadline 路径由
-        # host 直接销毁 QEMU，不依赖这里完成。
-        wait "$controller_pid" || exit 1
-    fi
+    finish_natural_capture "$owner" "$controller_pid" || exit 1
     exec 7>&-
     rm -f "$control" "/mnt$gate" "/mnt$gate_released"
     rm -f "/tmp/buildstorm-profile-controller-phase-$token"
@@ -897,6 +1017,7 @@ run_profile() {
 command=$1
 shift
 case "$command" in
+    plan) [ "$#" -eq 0 ] || usage; print_workload_plan ;;
     run) run_profile "$@" ;;
     watch-stage|w) watch_stage "$@" ;;
     go|g) release_workload "$@" ;;

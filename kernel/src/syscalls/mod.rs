@@ -14,6 +14,12 @@ mod process;
 mod signal;
 mod syslog;
 
+#[cfg(feature = "kernel-tests")]
+pub(crate) use process::fdtable_has_other_live_owner_in;
+pub(crate) use process::{
+    ExecCleanupScratch, cleanup_task_for_exec, try_fdtable_has_other_live_owner,
+};
+
 use alloc::sync::Arc;
 use general::syscall::register_syscall;
 use sched::Task;

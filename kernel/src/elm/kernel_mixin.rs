@@ -613,6 +613,7 @@ fn publish(registry: &mut Registry, next: Vec<RegisteredHandler>) -> Result<(), 
     for (site, pointer) in &updates {
         retired.push(site.route.swap(*pointer, Ordering::AcqRel));
     }
+    kernel_symbols::publish_mixin_runtime_active(!next.is_empty());
     registry.handlers = next;
     while ACTIVE_READERS.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();

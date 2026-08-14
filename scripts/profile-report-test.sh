@@ -32,6 +32,7 @@ zero=$(awk 'BEGIN { for (i = 0; i < 64; i++) printf "%s0", (i == 0 ? "" : ","); 
     echo "@@PROFILE_STATS_BEGIN phase=before case=smoke"
     echo "state=frozen enabled=0 session=1 generation=1 active_writers=0 counter_hz=1000000000 event_mask=0x1ffffffff sampling=1 trace=1 timing_shift=8 effective_timing_shift=8 timing_sampler=hashed-bernoulli-v1"
     echo "cpu=0 event=net_protocol_turn calls=0 timed_samples=0 cycles=0 bytes=0 packets=0 sampled_wall_ns=0 sampled_on_cpu_ns=0 sampled_off_cpu_ns=0 sampled_max_latency_ns=0 migrations=0 hist=$zero"
+    echo "cpu=mixed event=slab_cache_hit calls=0 timed_samples=0 cycles=0 bytes=0 packets=0 sampled_wall_ns=0 sampled_on_cpu_ns=0 sampled_off_cpu_ns=0 sampled_max_latency_ns=0 migrations=0 hist=$zero"
     echo "cpu=0 metric=ingress_ring_depth observations=0 sum=0 max=0 hist=$zero"
     echo "@@PROFILE_STATS_END phase=before case=smoke"
     echo "@@PROFILE_SAMPLES_BEGIN phase=before case=smoke"
@@ -45,6 +46,7 @@ zero=$(awk 'BEGIN { for (i = 0; i < 64; i++) printf "%s0", (i == 0 ? "" : ","); 
     echo "@@PROFILE_STATS_BEGIN phase=after case=smoke"
     echo "state=frozen enabled=0 session=1 generation=2 active_writers=0 counter_hz=1000000000 event_mask=0x1ffffffff sampling=1 trace=1 timing_shift=8 effective_timing_shift=8 timing_sampler=hashed-bernoulli-v1"
     echo "cpu=0 event=net_protocol_turn calls=8 timed_samples=2 cycles=20 bytes=64 packets=2 sampled_wall_ns=20 sampled_on_cpu_ns=12 sampled_off_cpu_ns=8 sampled_max_latency_ns=16 migrations=1 hist=$hist"
+    echo "cpu=mixed event=slab_cache_hit calls=4 timed_samples=0 cycles=0 bytes=0 packets=0 sampled_wall_ns=0 sampled_on_cpu_ns=0 sampled_off_cpu_ns=0 sampled_max_latency_ns=0 migrations=0 hist=$zero"
     echo "cpu=0 metric=ingress_ring_depth observations=2 sum=10 max=8 hist=$hist"
     echo "@@PROFILE_STATS_END phase=after case=smoke"
     echo "@@PROFILE_SAMPLES_BEGIN phase=after case=smoke"
@@ -64,6 +66,10 @@ printf '%s\n' "$output" | awk -F '\t' '$1 == "smoke" && $2 == "net_protocol_turn
         $7 != 20 || $8 != 64 || $9 != 2 || $10 != 20 || $11 != "NA" || \
         $12 != "NA" || $13 != 12 || $14 != "NA" || $15 != 8 || $16 != "NA" || \
         $17 != 1 || $18 != "NA" || $19 != "NA" || $20 != "NA" || $21 != "NA") exit 1
+    found = 1
+} END { if (!found) exit 1 }'
+printf '%s\n' "$output" | awk -F '\t' '$1 == "smoke" && $2 == "slab_cache_hit" {
+    if ($3 != 4 || $4 != 0 || $6 != "invalid-no-samples") exit 1
     found = 1
 } END { if (!found) exit 1 }'
 output=$(PROFILE_REPORT_MIN_TIMED_SAMPLES=2 $root/scripts/profile-report.sh "$tmp")

@@ -211,8 +211,11 @@ case "$command" in
             export PROFILE_WORKLOAD
         fi
         start_capture "$case_id"
-        "$@" <&0 &
+        # 无作业控制时异步列表会先把 stdin 指向 /dev/null，因此提前保存管道。
+        exec 9<&0
+        "$@" <&9 9<&- &
         workload_pid=$!
+        exec 9<&-
         echo "@@PROFILE_WORKLOAD case=$case_id pid=$workload_pid"
         if wait "$workload_pid"; then
             workload_status=0

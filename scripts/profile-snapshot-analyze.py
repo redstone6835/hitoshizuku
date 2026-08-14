@@ -55,6 +55,8 @@ EVENT_NAMES = [
     "mem_zero_anon_page", "mem_zero_allocator_small", "mem_zero_allocator_large",
     "mem_copy_realloc", "mem_copy_cow", "alloc_registry_register",
     "alloc_registry_remove", "alloc_registry_lookup",
+    "alloc_registry_register_kernel", "alloc_registry_register_owned",
+    "alloc_owner_range_lookup",
 ]
 
 
@@ -262,11 +264,16 @@ def parse_snapshot(path: Path, health_path: Path | None = None) -> dict[str, obj
         timing = parse_timing(record, 24)
         if not timing["calls"]:
             continue
+        success = u64(record, 8)
+        errors = u64(record, 16)
+        completed = success + errors
         syscalls.append({
             "phase": u16(record, 0),
             "nr": u16(record, 2),
-            "success": u64(record, 8),
-            "errors": u64(record, 16),
+            "completed": completed,
+            "inflight": max(int(timing["calls"]) - completed, 0),
+            "success": success,
+            "errors": errors,
             **timing,
         })
 
@@ -678,8 +685,9 @@ def write_reports(profile: dict[str, object], output: Path,
     write_tsv(output / "events.tsv", ["id", "name", "calls", "wall_ns", "on_cpu_ns",
               "off_cpu_ns", "bytes", "packets", "max_latency_ns", "migrations"], events)
     write_tsv(output / "syscalls.tsv", ["phase", "phase_name", "nr", "name", "calls",
-              "success", "errors", "wall_ns", "on_cpu_ns", "off_cpu_ns", "p50_ns",
-              "p95_ns", "p99_ns", "max_latency_ns", "migrations"], syscalls)
+              "completed", "inflight", "success", "errors", "wall_ns", "on_cpu_ns",
+              "off_cpu_ns", "p50_ns", "p95_ns", "p99_ns", "max_latency_ns",
+              "migrations"], syscalls)
     write_tsv(output / "errnos.tsv", ["phase", "phase_name", "nr", "name", "errno", "count"], errnos)
     write_tsv(output / "tasks.tsv", ["pid", "tgid", "ppid", "runtime_ns", "voluntary_switches",
               "involuntary_switches", "migrations", "exited", "exit_code", "main_image_id",

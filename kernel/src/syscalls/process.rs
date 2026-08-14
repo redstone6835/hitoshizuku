@@ -141,7 +141,8 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = Arc::clone(ctx.task());
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
-    ctx.release_task_ref();
+    // Safety: sched::operation::exit 不返回，不会再访问本 syscall context。
+    unsafe { ctx.release_task_ref() };
     drop(task);
     sched::operation::exit(code);
 }
@@ -155,7 +156,8 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         task.pid_root(),
         code
     );
-    ctx.release_task_ref();
+    // Safety: sched::operation::exit_group 不返回，不会再访问本 syscall context。
+    unsafe { ctx.release_task_ref() };
     drop(task);
     sched::operation::exit_group(code);
 }
@@ -195,8 +197,27 @@ fn release_exit_files(task: &Arc<Task>) {
     let _ = task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
 }
 
-fn fdtable_has_other_live_owner(task: &Arc<Task>, fdt: &Arc<vfs::fdtable::FdTable>) -> bool {
-    for other in sched::operation::all_tasks_snapshot() {
+pub(crate) fn fdtable_has_other_live_owner(
+    task: &Arc<Task>,
+    fdt: &Arc<vfs::fdtable::FdTable>,
+) -> bool {
+    try_fdtable_has_other_live_owner(task, fdt).unwrap_or(true)
+}
+
+pub(crate) fn try_fdtable_has_other_live_owner(
+    task: &Arc<Task>,
+    fdt: &Arc<vfs::fdtable::FdTable>,
+) -> Result<bool, Errno> {
+    let tasks = sched::operation::try_all_tasks_snapshot().map_err(|_| Errno::ENOMEM)?;
+    Ok(fdtable_has_other_live_owner_in(task, fdt, tasks.iter()))
+}
+
+pub(crate) fn fdtable_has_other_live_owner_in<'a>(
+    task: &Arc<Task>,
+    fdt: &Arc<vfs::fdtable::FdTable>,
+    tasks: impl IntoIterator<Item = &'a Arc<Task>>,
+) -> bool {
+    for other in tasks {
         if Arc::ptr_eq(&other, task) || other.is_kernel_task() {
             continue;
         }
@@ -255,9 +276,13 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if flags.has(CloneFlags::CLONE_PIDFD) && flags.has(CloneFlags::CLONE_PARENT_SETTID) {
         return Err(Errno::EINVAL);
     }
-    let outcome =
-        sched::operation::clone_with_context_outcome(args, UserContextRef::new(ctx.tf.as_usize()))?;
-    install_clone_pidfd(args, Arc::clone(&outcome.child))?;
+    let prepared =
+        sched::operation::prepare_clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
+    let installed_pidfd = install_clone_pidfd(args, prepared.child())?;
+    let outcome = prepared.activate()?;
+    if let Some(installed) = installed_pidfd {
+        installed.commit();
+    }
     Ok(outcome.pid as usize)
 }
 
@@ -313,26 +338,55 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         // TODO(threading): cgroup 需要成员状态与迁移事务；当前阶段不把 fd 当作占位接受。
         return Err(Errno::EOPNOTSUPP);
     }
-    let outcome =
-        sched::operation::clone_with_context_outcome(args, UserContextRef::new(ctx.tf.as_usize()))?;
-    install_clone_pidfd(args, Arc::clone(&outcome.child))?;
+    let prepared =
+        sched::operation::prepare_clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
+    let installed_pidfd = install_clone_pidfd(args, prepared.child())?;
+    let outcome = prepared.activate()?;
+    if let Some(installed) = installed_pidfd {
+        installed.commit();
+    }
     Ok(outcome.pid as usize)
 }
 
-fn install_clone_pidfd(args: CloneArgs, child: Arc<Task>) -> Result<(), Errno> {
+struct InstalledClonePidfd {
+    fdt: Arc<vfs::fdtable::FdTable>,
+    fd: Option<Fd>,
+}
+
+impl InstalledClonePidfd {
+    fn commit(mut self) {
+        self.fd.take();
+    }
+}
+
+impl Drop for InstalledClonePidfd {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            let _ = self.fdt.close_fd(fd);
+        }
+    }
+}
+
+fn install_clone_pidfd(
+    args: CloneArgs,
+    child: &Arc<Task>,
+) -> Result<Option<InstalledClonePidfd>, Errno> {
     if !args.flags.has(CloneFlags::CLONE_PIDFD) {
-        return Ok(());
+        return Ok(None);
     }
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
         .map(|ctx| ctx.cred())
         .ok_or(Errno::ENOSYS)?;
-    let fd = pidfd::create(&fdt, cred, child, false)?;
+    let fd = pidfd::create(&fdt, cred, child.thread_group(), false)?;
+    let installed = InstalledClonePidfd {
+        fdt: Arc::clone(&fdt),
+        fd: Some(fd),
+    };
     if let Err(err) = copy_to_user(args.pidfd, &(fd.as_raw() as i32).to_le_bytes()) {
-        let _ = fdt.close_fd(fd);
         return Err(err.as_errno());
     }
-    Ok(())
+    Ok(Some(installed))
 }
 
 fn prepare_clone3_set_tid(args: &mut CloneArgs, task: &Arc<Task>) -> Result<(), Errno> {
@@ -499,11 +553,11 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
             let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
             let nonblock_pidfd = file.flags().nonblock;
-            let task = pidfd::task_from_file(&file).ok_or(Errno::EINVAL)?;
+            let group = pidfd::group_from_file(&file).ok_or(Errno::EINVAL)?;
             if nonblock_pidfd && !options.has(WaitOptions::WNOHANG) {
                 let probe_options = WaitOptions::from_raw(options.raw() | WaitOptions::WNOHANG);
                 let probe =
-                    sched::operation::waitid(WaitId::Pidfd(Arc::clone(&task)), probe_options)?;
+                    sched::operation::waitid(WaitId::Pidfd(Arc::clone(&group)), probe_options)?;
                 if probe.pid == 0 {
                     return Err(Errno::EAGAIN);
                 }
@@ -522,7 +576,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 }
                 return Ok(0);
             }
-            WaitId::Pidfd(task)
+            WaitId::Pidfd(group)
         }
         _ => return Err(Errno::EINVAL),
     };
@@ -972,7 +1026,7 @@ const CLOCK_THREAD_CPUTIME_ID: usize = 3;
 fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
     match clock_id {
         CLOCK_PROCESS_CPUTIME_ID => {
-            let now_ns = sched::now_ns_public();
+            let now_ns = sched::now_ns_direct();
             let mut total = 0u64;
             for member in task.thread_group().snapshot() {
                 let usage = member.usage_snapshot(now_ns);
@@ -983,7 +1037,7 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
             Some(total)
         }
         CLOCK_THREAD_CPUTIME_ID => {
-            let usage = task.usage_snapshot(sched::now_ns_public());
+            let usage = task.usage_snapshot(sched::now_ns_direct());
             Some(usage.user_ns.saturating_add(usage.system_ns))
         }
         _ => crate::vdso::clock_time_ns(clock_id),
@@ -1034,11 +1088,11 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if ns_total == 0 {
         return Ok(0);
     }
-    let deadline = sched::now_ns_public().saturating_add(ns_total as u64);
-    match sleep_until_deadline(ctx.task(), deadline, || Ok(sched::now_ns_public())) {
+    let deadline = sched::now_ns_direct().saturating_add(ns_total as u64);
+    match sleep_until_deadline(ctx.task(), deadline, || Ok(sched::now_ns_direct())) {
         Ok(()) => Ok(0),
         Err(Errno::EINTR) => {
-            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()))?;
+            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_direct()))?;
             Err(Errno::EINTR)
         }
         Err(err) => Err(err),
@@ -1114,7 +1168,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         sec.saturating_mul(1_000_000_000i64).saturating_add(nsec) as u64
     } else {
         let ns_total = sec.saturating_mul(1_000_000_000i64).saturating_add(nsec);
-        sched::now_ns_public().saturating_add(ns_total as u64)
+        sched::now_ns_direct().saturating_add(ns_total as u64)
     };
     if !absolute && sec == 0 && nsec == 0 {
         return Ok(0);
@@ -1123,7 +1177,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         if absolute {
             crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)
         } else {
-            Ok(sched::now_ns_public())
+            Ok(sched::now_ns_direct())
         }
     };
     match sleep_until_deadline(ctx.task(), deadline, now_fn) {
@@ -1132,7 +1186,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
             if !absolute {
                 write_remaining_timespec(
                     rem_user,
-                    deadline.saturating_sub(sched::now_ns_public()),
+                    deadline.saturating_sub(sched::now_ns_direct()),
                 )?;
             }
             Err(Errno::EINTR)
@@ -1155,7 +1209,7 @@ fn sleep_until_deadline(
         }
 
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Timer, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Timer, sched::now_ns_direct());
         if !task.cas_state(TaskState::Running, TaskState::Sleeping)
             && !task.cas_state(TaskState::Runnable, TaskState::Sleeping)
             && task.state() != TaskState::Sleeping
@@ -1176,12 +1230,12 @@ fn sleep_until_deadline(
             return Err(Errno::EINTR);
         }
 
-        let sleep_deadline = sched::now_ns_public().saturating_add(deadline.saturating_sub(now));
+        let sleep_deadline = sched::now_ns_direct().saturating_add(deadline.saturating_sub(now));
         if !sched::register_sleep_deadline(task, sleep_deadline) {
             restore_current_task_after_sleep(task);
             return Ok(());
         }
-        sched::schedule_once(sched::now_ns_public());
+        sched::schedule_once(sched::now_ns_direct());
         sched::cancel_sleep_deadline(task);
         restore_current_task_after_sleep(task);
     }
@@ -1226,9 +1280,9 @@ pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 
 pub(super) fn sys_times(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let buf = ctx.args[0];
-    let self_usage = ctx.task().usage_snapshot(sched::now_ns_public());
+    let self_usage = ctx.task().usage_snapshot(sched::now_ns_direct());
     let child_usage = ctx.task().child_usage_snapshot();
-    let ticks = ns_to_clock_ticks(sched::now_ns_public());
+    let ticks = ns_to_clock_ticks(sched::now_ns_direct());
     if buf != 0 {
         let mut raw = [0u8; 32];
         put_i64(&mut raw, 0, ns_to_clock_ticks(self_usage.user_ns));
@@ -1251,7 +1305,7 @@ pub(super) fn sys_getrusage(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Err(Errno::EFAULT);
     }
     let snapshot = match who {
-        RUSAGE_SELF | RUSAGE_THREAD => ctx.task().usage_snapshot(sched::now_ns_public()),
+        RUSAGE_SELF | RUSAGE_THREAD => ctx.task().usage_snapshot(sched::now_ns_direct()),
         RUSAGE_CHILDREN => ctx.task().child_usage_snapshot(),
         _ => return Err(Errno::EINVAL),
     };
@@ -1298,7 +1352,7 @@ pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let info = ctx.args[0];
     if info != 0 {
         let mut out = [0u8; 112];
-        put_i64(&mut out, 0, sched::now_ns_public() as i64 / 1_000_000_000);
+        put_i64(&mut out, 0, sched::now_ns_direct() as i64 / 1_000_000_000);
         put_u64(&mut out, 8, 0);
         put_u64(&mut out, 16, 0);
         put_u64(&mut out, 24, 0);
@@ -2538,6 +2592,62 @@ const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 const ROBUST_LIST_HEAD_SIZE: usize = 24;
 const ROBUST_LIST_LIMIT: usize = 2048;
 
+/// exec 在 PONR 前预分配的 robust futex 遍历空间。
+pub(crate) struct ExecCleanupScratch {
+    robust_visited: Vec<usize>,
+    pi_handoffs: Vec<ExecPiHandoff>,
+    pi_handoff_overflow: bool,
+}
+
+struct ExecPiHandoff {
+    task: Arc<Task>,
+    token: usize,
+    attr: SchedAttr,
+}
+
+impl ExecCleanupScratch {
+    pub(crate) fn prepare() -> Result<Self, Errno> {
+        let mut robust_visited = Vec::new();
+        robust_visited
+            .try_reserve_exact(ROBUST_LIST_LIMIT)
+            .map_err(|_| Errno::ENOMEM)?;
+        let mut pi_handoffs = Vec::new();
+        let reserve = ROBUST_LIST_LIMIT.saturating_add(PI_FUTEX_TABLE.lock().len());
+        pi_handoffs
+            .try_reserve_exact(reserve)
+            .map_err(|_| Errno::ENOMEM)?;
+        Ok(Self {
+            robust_visited,
+            pi_handoffs,
+            pi_handoff_overflow: false,
+        })
+    }
+
+    pub(crate) fn has_pi_handoff_overflow(&self) -> bool {
+        self.pi_handoff_overflow
+    }
+
+    pub(crate) fn apply_pi_handoffs(&mut self) -> bool {
+        let mut applied = true;
+        for handoff in self.pi_handoffs.drain(..) {
+            if handoff
+                .task
+                .pi_try_add_donation(handoff.token, handoff.attr)
+                .is_some()
+            {
+                sched::defer_pi_effective_update(&handoff.task);
+            } else {
+                applied = false;
+                log::emergency!(
+                    "[syscall][futex] exec PI donation capacity exhausted token={}",
+                    handoff.token
+                );
+            }
+        }
+        applied
+    }
+}
+
 type FutexKey = VmFutexKey;
 
 struct FutexWaiter {
@@ -2572,6 +2682,17 @@ impl FutexWaitState {
             .compare_exchange(
                 FUTEX_WAIT_ARMED,
                 FUTEX_WAIT_SLEEPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn rearm_after_non_futex_wakeup(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FUTEX_WAIT_SLEEPING,
+                FUTEX_WAIT_ARMED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -2789,7 +2910,56 @@ fn pi_propagate_from(waiter: &Arc<Task>) {
 }
 
 fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
+    if count == 1 {
+        return futex_wake_key_one(key, bitset);
+    }
     futex_wake_key_inner(key, count, bitset, false)
+}
+
+/// 只取出一个 waiter 的无分配唤醒路径，供退出清理中的 robust/clear-child-tid 使用。
+fn futex_wake_key_one(key: FutexKey, bitset: u32) -> usize {
+    futex_wake_key_one_with_mode(key, bitset, false)
+}
+
+fn futex_wake_key_one_with_mode(key: FutexKey, bitset: u32, deferred: bool) -> usize {
+    let waiter = {
+        let mut table = FUTEX_TABLE.lock();
+        let mut selected = None;
+        loop {
+            let Some(bucket) = table.get_mut(&key) else {
+                break;
+            };
+            let Some(index) = bucket
+                .waiters
+                .iter()
+                .position(|waiter| waiter.bitset & bitset != 0)
+            else {
+                break;
+            };
+            let waiter = bucket.waiters.remove(index);
+            if let Some(task) = waiter.task.upgrade() {
+                selected = Some((task, waiter.state));
+                break;
+            }
+            if bucket.waiters.is_empty() {
+                break;
+            }
+        }
+        if table
+            .get(&key)
+            .is_some_and(|bucket| bucket.waiters.is_empty())
+        {
+            table.remove(&key);
+        }
+        selected
+    };
+    waiter.map_or(0, |(task, state)| {
+        if deferred {
+            wake_futex_waiter_deferred(task, state)
+        } else {
+            wake_futex_waiter(task, state)
+        }
+    })
 }
 
 fn futex_wake_key_inner(key: FutexKey, count: usize, bitset: u32, trace: bool) -> usize {
@@ -2843,33 +3013,42 @@ fn futex_wake_key_inner(key: FutexKey, count: usize, bitset: u32, trace: bool) -
 
 fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> usize {
     let mut woken = 0usize;
-    let now_ns = sched::now_ns_public();
     for (waiter, state) in waiters {
-        match state.mark_woken() {
-            FUTEX_WAIT_SLEEPING => {
-                if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
-                    #[cfg(feature = "performance-profile")]
-                    waiter.mark_profile_woken(now_ns);
-                    // futex 唤醒可以跨越任意用户态同步原语；只按常规首选队列入队，
-                    // 不依赖当前 syscall 的返回边界完成交接，避免唤醒者与等待者的
-                    // 执行边界不重合时延迟调度。
-                    sched::enqueue_task_preferred(waiter, now_ns);
-                }
-                woken += 1;
-            }
-            FUTEX_WAIT_ARMED => {
-                // waiter 已经登记到 futex 表，但尚未切出 CPU。只标记 WOKEN，
-                // 由 waiter 在 schedule 前的复查中直接返回，不能把 current
-                // 当作已睡眠任务入队。
-                woken += 1;
-            }
-            FUTEX_WAIT_WOKEN => {
-                woken += 1;
-            }
-            _ => {}
-        }
+        woken += wake_futex_waiter(waiter, state);
     }
     woken
+}
+
+fn wake_futex_waiter(waiter: Arc<sched::Task>, state: Arc<FutexWaitState>) -> usize {
+    match state.mark_woken() {
+        FUTEX_WAIT_SLEEPING => {
+            if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+                let now_ns = sched::now_ns_public();
+                #[cfg(feature = "performance-profile")]
+                waiter.mark_profile_woken(now_ns);
+                // futex 唤醒可以跨越任意用户态同步原语；只按常规首选队列入队，
+                // 不依赖当前 syscall 的返回边界完成交接。
+                sched::enqueue_task_preferred(waiter, now_ns);
+            }
+            1
+        }
+        FUTEX_WAIT_ARMED | FUTEX_WAIT_WOKEN => 1,
+        _ => 0,
+    }
+}
+
+/// exec 清理使用无锁 deferred 链发布唤醒，避免在 PONR 后触碰 runqueue 分配。
+fn wake_futex_waiter_deferred(waiter: Arc<sched::Task>, state: Arc<FutexWaitState>) -> usize {
+    match state.mark_woken() {
+        FUTEX_WAIT_SLEEPING => {
+            if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+                sched::defer_task_wake(&waiter);
+            }
+            1
+        }
+        FUTEX_WAIT_ARMED | FUTEX_WAIT_WOKEN => 1,
+        _ => 0,
+    }
 }
 
 fn futex_remove_waiter(key: FutexKey, task: &Arc<Task>) -> bool {
@@ -2948,8 +3127,111 @@ fn pi_release_owned_futexes(task: &Arc<Task>) {
             })
             .collect::<Vec<_>>()
     };
+    let mut no_handoffs = Vec::new();
+    let mut overflow = false;
     for (key, vm, uaddr) in owned {
-        let _ = pi_owner_died_key(&vm, key, uaddr, task);
+        let _ = pi_owner_died_key(
+            &vm,
+            key,
+            uaddr,
+            task,
+            false,
+            &mut no_handoffs,
+            &mut overflow,
+        );
+    }
+}
+
+/// exec 清理专用：不创建临时 Vec 地移除当前任务在普通 futex 表中的 waiter。
+fn futex_remove_task_waiters_for_exec(task: &Arc<Task>) -> usize {
+    let mut removed = 0usize;
+    loop {
+        let empty_key = {
+            let mut table = FUTEX_TABLE.lock();
+            let mut empty_key = None;
+            for (key, bucket) in table.iter_mut() {
+                let before = bucket.waiters.len();
+                bucket.waiters.retain(|waiter| {
+                    !waiter
+                        .task
+                        .upgrade()
+                        .is_some_and(|queued| Arc::ptr_eq(&queued, task))
+                });
+                removed = removed.saturating_add(before.saturating_sub(bucket.waiters.len()));
+                if bucket.waiters.is_empty() {
+                    empty_key = Some(*key);
+                    break;
+                }
+            }
+            if let Some(key) = empty_key {
+                table.remove(&key);
+            }
+            empty_key
+        };
+        if empty_key.is_none() {
+            return removed;
+        }
+    }
+}
+
+/// exec 清理专用：逐项更新已有 PI donation，避免在不可回退阶段收集更新 Vec。
+fn pi_remove_task_waiters_for_exec(task: &Arc<Task>) {
+    loop {
+        let update = {
+            let mut table = PI_FUTEX_TABLE.lock();
+            table.values_mut().find_map(|state| {
+                let before = state.waiters.len();
+                state.waiters.retain(|waiter| {
+                    !waiter
+                        .task
+                        .upgrade()
+                        .is_some_and(|queued| Arc::ptr_eq(&queued, task))
+                });
+                (before != state.waiters.len()).then(|| {
+                    state
+                        .owner
+                        .upgrade()
+                        .map(|owner| (owner, state.token, pi_top_donation(state)))
+                })
+            })
+        };
+        match update {
+            None => return,
+            Some(None) => continue,
+            Some(Some((owner, token, donation))) => {
+                let _ = owner.pi_update_existing_donation(token, donation);
+                sched::defer_pi_effective_update(&owner);
+            }
+        }
+    }
+}
+
+/// exec 清理专用：沿用标准 PI owner-death handoff，只把调度器重排和 waiter
+/// 唤醒推迟到安全调度边界。
+fn pi_release_owned_futexes_for_exec(task: &Arc<Task>, scratch: &mut ExecCleanupScratch) {
+    loop {
+        let owned = {
+            let table = PI_FUTEX_TABLE.lock();
+            table.iter().find_map(|(key, state)| {
+                state
+                    .owner
+                    .upgrade()
+                    .filter(|owner| Arc::ptr_eq(owner, task))
+                    .and_then(|_| state.vm.upgrade().map(|vm| (*key, vm, state.uaddr)))
+            })
+        };
+        let Some((key, vm, uaddr)) = owned else {
+            return;
+        };
+        let _ = pi_owner_died_key(
+            &vm,
+            key,
+            uaddr,
+            task,
+            true,
+            &mut scratch.pi_handoffs,
+            &mut scratch.pi_handoff_overflow,
+        );
     }
 }
 
@@ -3334,7 +3616,7 @@ fn pi_wait_registered(
             return Ok(0);
         }
         if let Some(deadline) = deadline_ns
-            && sched::now_ns_public() >= deadline
+            && sched::now_ns_direct() >= deadline
             && pi_remove_waiter(vm, key, uaddr, task, wait_state)?
         {
             restore_current_task_after_sleep(task);
@@ -3351,7 +3633,7 @@ fn pi_wait_registered(
             return Err(Errno::EINTR);
         }
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             restore_current_task_after_sleep(task);
@@ -3362,6 +3644,7 @@ fn pi_wait_registered(
             continue;
         }
         sched::operation::sched_yield()?;
+        let _ = wait_state.rearm_after_non_futex_wakeup();
         restore_current_task_after_sleep(task);
     }
 }
@@ -3474,12 +3757,20 @@ fn futex_unlock_pi(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<usiz
 
         pi_owner_update(&old_owner, token, None);
         pi_owner_update(&next_owner, token, next_donation);
-        let _ = wake_futex_waiters(alloc::vec![(next_owner, handed.state)]);
+        let _ = wake_futex_waiter(next_owner, handed.state);
         return Ok(0);
     }
 }
 
-fn pi_owner_died_key(vm: &VmSpace, key: FutexKey, uaddr: usize, task: &Arc<Task>) -> bool {
+fn pi_owner_died_key(
+    vm: &VmSpace,
+    key: FutexKey,
+    uaddr: usize,
+    task: &Arc<Task>,
+    deferred: bool,
+    pi_handoffs: &mut Vec<ExecPiHandoff>,
+    pi_handoff_overflow: &mut bool,
+) -> bool {
     let update = {
         let mut table = PI_FUTEX_TABLE.lock();
         let Some(state) = table.get_mut(&key) else {
@@ -3532,10 +3823,38 @@ fn pi_owner_died_key(vm: &VmSpace, key: FutexKey, uaddr: usize, task: &Arc<Task>
         }
     };
     if let Some((token, handoff)) = update {
-        pi_owner_update(task, token, None);
+        if deferred {
+            let _ = task.pi_update_existing_donation(token, None);
+            sched::defer_pi_effective_update(task);
+        } else {
+            pi_owner_update(task, token, None);
+        }
         if let Some((next, donation, state)) = handoff {
-            pi_owner_update(&next, token, donation);
-            let _ = wake_futex_waiters(alloc::vec![(next, state)]);
+            if deferred {
+                if let Some(donation) = donation {
+                    if !pi_handoffs
+                        .iter()
+                        .any(|handoff| handoff.token == token && Arc::ptr_eq(&handoff.task, &next))
+                    {
+                        if pi_handoffs.len() == pi_handoffs.capacity() {
+                            *pi_handoff_overflow = true;
+                            log::emergency!(
+                                "[syscall][futex] exec PI handoff scratch exhausted token={token}"
+                            );
+                        } else {
+                            pi_handoffs.push(ExecPiHandoff {
+                                task: Arc::clone(&next),
+                                token,
+                                attr: donation,
+                            });
+                        }
+                    }
+                }
+                let _ = wake_futex_waiter_deferred(next, state);
+            } else {
+                pi_owner_update(&next, token, donation);
+                let _ = wake_futex_waiter(next, state);
+            }
         }
     }
     true
@@ -3593,7 +3912,7 @@ fn futex_wait_requeue_pi(
             restore_current_task_after_sleep(task);
             return Ok(0);
         }
-        let timed_out = deadline_ns.is_some_and(|deadline| sched::now_ns_public() >= deadline);
+        let timed_out = deadline_ns.is_some_and(|deadline| sched::now_ns_direct() >= deadline);
         let interrupted = sched::operation::has_interrupting_signal(task);
         if timed_out || interrupted {
             let removed = futex_remove_waiter(src, task)
@@ -3612,7 +3931,7 @@ fn futex_wait_requeue_pi(
             continue;
         }
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             restore_current_task_after_sleep(task);
@@ -3623,6 +3942,7 @@ fn futex_wait_requeue_pi(
             continue;
         }
         sched::operation::sched_yield()?;
+        let _ = wait_state.rearm_after_non_futex_wakeup();
         restore_current_task_after_sleep(task);
     }
 }
@@ -3775,13 +4095,16 @@ fn futex_cmp_requeue_pi(
             pi_owner_update(&owner, token, donation);
         }
         if let Some((task, state)) = acquired {
-            let _ = wake_futex_waiters(alloc::vec![(task, state)]);
+            let _ = wake_futex_waiter(task, state);
         }
         return Ok(moved);
     }
 }
 
 fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
+    if count == 1 {
+        return futex_wake_addr_one(task, uaddr);
+    }
     let mut woken = 0usize;
     if let Ok(key) = futex_key(task, uaddr, true) {
         woken += futex_wake_key(key, count, FUTEX_BITSET_MATCH_ANY);
@@ -3792,15 +4115,57 @@ fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
     woken
 }
 
+fn futex_wake_addr_one(task: &Arc<Task>, uaddr: usize) -> usize {
+    let mut woken = 0usize;
+    if let Ok(key) = futex_key(task, uaddr, true) {
+        woken += futex_wake_key_one(key, FUTEX_BITSET_MATCH_ANY);
+    }
+    if let Ok(key) = futex_key(task, uaddr, false) {
+        woken += futex_wake_key_one(key, FUTEX_BITSET_MATCH_ANY);
+    }
+    woken
+}
+
+fn futex_wake_addr_one_deferred(task: &Arc<Task>, uaddr: usize) -> usize {
+    let mut woken = 0usize;
+    if let Ok(key) = futex_key(task, uaddr, true) {
+        woken += futex_wake_key_one_with_mode(key, FUTEX_BITSET_MATCH_ANY, true);
+    }
+    if let Ok(key) = futex_key(task, uaddr, false) {
+        woken += futex_wake_key_one_with_mode(key, FUTEX_BITSET_MATCH_ANY, true);
+    }
+    woken
+}
+
 fn clear_child_tid_and_wake(task: &Arc<Task>) {
+    clear_child_tid_and_wake_with_mode(task, false);
+}
+
+fn clear_child_tid_and_wake_with_mode(task: &Arc<Task>, deferred: bool) {
     let tid_addr = task.clear_child_tid();
     if tid_addr == 0 {
         return;
     }
-    let zero = 0u32;
-    let written = copy_to_user(tid_addr, &zero.to_ne_bytes()).is_ok();
+    let written = task_vm_space(task).is_some_and(|vm| {
+        vm.read_user_u32_nofault(tid_addr)
+            .ok()
+            .and_then(|current| {
+                vm.compare_exchange_user_u32_nofault(tid_addr, current, 0)
+                    .ok()
+                    .filter(|previous| *previous == current)
+            })
+            .is_some()
+    });
     task.set_clear_child_tid(0);
-    let woken = futex_wake_addr(task, tid_addr, 1);
+    let woken = written
+        .then(|| {
+            if deferred {
+                futex_wake_addr_one_deferred(task, tid_addr)
+            } else {
+                futex_wake_addr(task, tid_addr, 1)
+            }
+        })
+        .unwrap_or(0);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[syscall][clear-child-tid] pid={:?} addr={:#x} written={} woken={}",
@@ -4004,7 +4369,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         entries.push(entry);
     }
     if let Some(deadline) = deadline
-        && sched::now_ns_public() >= deadline
+        && sched::now_ns_direct() >= deadline
     {
         return Err(Errno::ETIMEDOUT);
     }
@@ -4036,7 +4401,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
             return Err(Errno::EAGAIN);
         }
         if let Some(deadline) = deadline {
-            if sched::now_ns_public() >= deadline {
+            if sched::now_ns_direct() >= deadline {
                 futex_waitv_remove_all(&entries, ctx.task());
                 restore_current_task_after_sleep(ctx.task());
                 sched::cancel_sleep_deadline(ctx.task());
@@ -4050,7 +4415,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         }
         #[cfg(feature = "performance-profile")]
         ctx.task()
-            .begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+            .begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping);
@@ -4073,6 +4438,9 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
             return Ok(index);
         }
         sched::operation::sched_yield()?;
+        for entry in &entries {
+            let _ = entry.wait_state.rearm_after_non_futex_wakeup();
+        }
         if deadline.is_some() {
             sched::cancel_sleep_deadline(ctx.task());
         }
@@ -4493,11 +4861,12 @@ pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     }
     let task = lookup_task_for_thread_syscall(pid, ctx.task())?;
     require_task_access(ctx.task(), &task)?;
+    let group = pidfd::group_for_process_pid(pid, &task)?;
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
         .map(|ctx| ctx.cred())
         .ok_or(Errno::ENOSYS)?;
-    let fd = pidfd::create(&fdt, cred, task, (flags & PIDFD_NONBLOCK) != 0)?;
+    let fd = pidfd::create(&fdt, cred, group, (flags & PIDFD_NONBLOCK) != 0)?;
     Ok(fd.as_raw() as usize)
 }
 
@@ -4577,7 +4946,7 @@ fn futex_wait(
     }
     loop {
         if let Some(deadline) = deadline_ns {
-            if sched::now_ns_public() >= deadline {
+            if sched::now_ns_direct() >= deadline {
                 futex_remove_waiter(key, &me);
                 restore_current_task_after_sleep(task);
                 sched::cancel_sleep_deadline(task);
@@ -4618,7 +4987,7 @@ fn futex_wait(
             return Ok(0);
         }
         #[cfg(feature = "performance-profile")]
-        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_public());
+        task.begin_profile_wait(sched::WaitReason::Futex, sched::now_ns_direct());
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
         if !wait_state.mark_sleeping() {
             if wait_state.is_woken() {
@@ -4642,6 +5011,7 @@ fn futex_wait(
             return Ok(0);
         }
         sched::operation::sched_yield()?;
+        let _ = wait_state.rearm_after_non_futex_wakeup();
         if wait_state.is_woken() {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
@@ -4718,7 +5088,7 @@ fn read_futex_waitv_entry(user: usize, index: usize) -> Result<FutexWaitvEntry, 
         return Err(Errno::EINVAL);
     }
     let private = futex2_private(flags)?;
-    let task = sched::current_task();
+    let task = sched::current_task_direct();
     Ok(FutexWaitvEntry {
         index,
         uaddr,
@@ -4776,7 +5146,7 @@ fn futex2_abs_deadline(timeout_user: usize, clockid: usize) -> Result<Option<u64
         return Err(Errno::EINVAL);
     }
     let abs_ns = read_timespec_ns(timeout_user)?;
-    let sched_now = sched::now_ns_public();
+    let sched_now = sched::now_ns_direct();
     let clock_now = crate::vdso::clock_time_ns(clockid).unwrap_or(sched_now);
     Ok(Some(if abs_ns <= clock_now {
         sched_now
@@ -4790,7 +5160,7 @@ fn futex_wait_deadline(futex_op: u32, cmd: u32, timeout_user: usize) -> Result<O
         return Ok(None);
     }
     let timeout_ns = read_timespec_ns(timeout_user)?;
-    let sched_now = sched::now_ns_public();
+    let sched_now = sched::now_ns_direct();
     if cmd == FUTEX_WAIT {
         return Ok(Some(sched_now.saturating_add(timeout_ns)));
     }
@@ -4915,7 +5285,7 @@ pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
         "[syscall][exit-cleanup] futex-begin pid={:?}",
         task.pid_root(),
     );
-    let current = sched::current_task();
+    let current = sched::current_task_direct();
     if Arc::ptr_eq(&current, task) {
         cleanup_task_before_exit_in_active_vm(task);
         return;
@@ -4959,6 +5329,21 @@ fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
     );
 }
 
+/// 在 exec 的旧地址空间仍激活时完成不可回退的用户 ABI 清理。
+pub(crate) fn cleanup_task_for_exec(task: &Arc<Task>, scratch: &mut ExecCleanupScratch) {
+    let _ = futex_remove_task_waiters_for_exec(task);
+    pi_remove_task_waiters_for_exec(task);
+    pi_release_owned_futexes_for_exec(task, scratch);
+    exit_robust_list_with_scratch(
+        task,
+        &mut scratch.robust_visited,
+        true,
+        &mut scratch.pi_handoffs,
+        &mut scratch.pi_handoff_overflow,
+    );
+    clear_child_tid_and_wake_with_mode(task, true);
+}
+
 fn kcmp_arc<T>(left: &Arc<T>, right: &Arc<T>) -> usize {
     if Arc::ptr_eq(left, right) {
         return 0;
@@ -4978,25 +5363,43 @@ fn kcmp_fd_arg(raw: usize) -> Result<Fd, Errno> {
 }
 
 fn exit_robust_list(task: &Arc<Task>) {
-    let robust = task.robust_list();
+    let mut visited = Vec::new();
+    if visited.try_reserve_exact(ROBUST_LIST_LIMIT).is_err() {
+        let _ = task.take_robust_list();
+        return;
+    }
+    let mut pi_handoffs = Vec::new();
+    let mut overflow = false;
+    exit_robust_list_with_scratch(task, &mut visited, false, &mut pi_handoffs, &mut overflow);
+}
+
+fn exit_robust_list_with_scratch(
+    task: &Arc<Task>,
+    visited: &mut Vec<usize>,
+    deferred_wake: bool,
+    pi_handoffs: &mut Vec<ExecPiHandoff>,
+    pi_handoff_overflow: &mut bool,
+) {
+    visited.clear();
+    let robust = task.take_robust_list();
+    let Some(vm) = task_vm_space(task) else {
+        return;
+    };
     if robust.head == 0 || robust.len != ROBUST_LIST_HEAD_SIZE {
         return;
     }
     if !robust_node_aligned(robust.head)
-        || !task_user_range_readable(task, robust.head, ROBUST_LIST_HEAD_SIZE)
+        || !vm.is_user_range_readable(robust.head, ROBUST_LIST_HEAD_SIZE)
     {
-        task.set_robust_list(0, 0);
         return;
     }
     let tid = task.pid_root().unwrap_or(0) as u32;
-    let Ok(futex_offset) = read_robust_isize(task, robust.head + 8) else {
-        task.set_robust_list(0, 0);
+    let Ok(futex_offset) = read_robust_isize(&vm, robust.head + 8) else {
         return;
     };
-    let pending = read_robust_usize(task, robust.head + 16).unwrap_or(0);
-    let mut next = read_robust_usize(task, robust.head).unwrap_or(0);
+    let pending = read_robust_usize(&vm, robust.head + 16).unwrap_or(0);
+    let mut next = read_robust_usize(&vm, robust.head).unwrap_or(0);
     let mut walked = 0usize;
-    let mut visited = Vec::new();
     while next != 0 && next != robust.head && walked < ROBUST_LIST_LIMIT {
         if !robust_node_aligned(next) {
             log::debug!(
@@ -5015,7 +5418,7 @@ fn exit_robust_list(task: &Arc<Task>) {
             break;
         }
         visited.push(next);
-        let Ok(next_link) = read_robust_usize(task, next) else {
+        let Ok(next_link) = read_robust_usize(&vm, next) else {
             log::debug!(
                 "[syscall][robust] pid={:?} stopped at unreadable robust node {:#x}",
                 task.pid_root(),
@@ -5023,7 +5426,16 @@ fn exit_robust_list(task: &Arc<Task>) {
             );
             break;
         };
-        handle_robust_node(task, next, futex_offset, tid);
+        handle_robust_node(
+            task,
+            &vm,
+            next,
+            futex_offset,
+            tid,
+            deferred_wake,
+            pi_handoffs,
+            pi_handoff_overflow,
+        );
         next = next_link;
         walked += 1;
     }
@@ -5038,29 +5450,54 @@ fn exit_robust_list(task: &Arc<Task>) {
         && robust_node_aligned(pending)
         && !visited.contains(&pending)
     {
-        handle_robust_node(task, pending, futex_offset, tid);
+        handle_robust_node(
+            task,
+            &vm,
+            pending,
+            futex_offset,
+            tid,
+            deferred_wake,
+            pi_handoffs,
+            pi_handoff_overflow,
+        );
     }
-    task.set_robust_list(0, 0);
 }
 
-fn handle_robust_node(task: &Arc<Task>, node: usize, futex_offset: isize, tid: u32) {
+fn handle_robust_node(
+    task: &Arc<Task>,
+    vm: &Arc<VmSpace>,
+    node: usize,
+    futex_offset: isize,
+    tid: u32,
+    deferred_wake: bool,
+    pi_handoffs: &mut Vec<ExecPiHandoff>,
+    pi_handoff_overflow: &mut bool,
+) {
     let Some(uaddr) = robust_futex_addr(node, futex_offset) else {
         return;
     };
     if uaddr % 4 != 0 {
         return;
     }
-    let Ok(cur) = read_robust_u32(task, uaddr) else {
+    let Ok(cur) = vm.read_user_u32_nofault(uaddr) else {
         return;
     };
     if (cur & FUTEX_TID_MASK) != tid {
         return;
     }
-    if let Ok(vm) = task_vm_space_for_futex(task) {
+    {
         let mut handed_off = false;
         for private in [true, false] {
             if let Ok(key) = vm.futex_key_for(uaddr, private) {
-                handed_off |= pi_owner_died_key(&vm, key, uaddr, task);
+                handed_off |= pi_owner_died_key(
+                    vm,
+                    key,
+                    uaddr,
+                    task,
+                    deferred_wake,
+                    pi_handoffs,
+                    pi_handoff_overflow,
+                );
             }
         }
         if handed_off {
@@ -5068,8 +5505,12 @@ fn handle_robust_node(task: &Arc<Task>, node: usize, futex_offset: isize, tid: u
         }
     }
     let new = (cur & !FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
-    if write_user_u32(uaddr, new).is_ok() {
-        let _ = futex_wake_addr(task, uaddr, 1);
+    if vm.compare_exchange_user_u32_nofault(uaddr, cur, new).ok() == Some(cur) {
+        if deferred_wake {
+            let _ = futex_wake_addr_one_deferred(task, uaddr);
+        } else {
+            let _ = futex_wake_addr(task, uaddr, 1);
+        }
     }
 }
 
@@ -5082,41 +5523,24 @@ fn robust_node_aligned(node: usize) -> bool {
     node % core::mem::align_of::<usize>() == 0
 }
 
-fn task_user_range_readable(task: &Arc<Task>, user: usize, len: usize) -> bool {
-    task_vm_space(task).is_some_and(|vm| vm.is_user_range_readable(user, len))
-}
-
-fn read_robust_usize(task: &Arc<Task>, user: usize) -> Result<usize, Errno> {
-    if !task_user_range_readable(task, user, core::mem::size_of::<usize>()) {
+fn read_robust_usize(vm: &VmSpace, user: usize) -> Result<usize, Errno> {
+    if !vm.is_user_range_readable(user, core::mem::size_of::<usize>()) {
         return Err(Errno::EFAULT);
     }
-    read_user_usize(user)
-}
-
-fn read_robust_isize(task: &Arc<Task>, user: usize) -> Result<isize, Errno> {
-    if !task_user_range_readable(task, user, core::mem::size_of::<isize>()) {
-        return Err(Errno::EFAULT);
+    #[cfg(target_pointer_width = "64")]
+    {
+        let low = vm.read_user_u32_nofault(user)? as usize;
+        let high = vm.read_user_u32_nofault(user + 4)? as usize;
+        Ok(low | (high << 32))
     }
-    read_user_isize(user)
-}
-
-fn read_robust_u32(task: &Arc<Task>, user: usize) -> Result<u32, Errno> {
-    if !task_user_range_readable(task, user, core::mem::size_of::<u32>()) {
-        return Err(Errno::EFAULT);
+    #[cfg(target_pointer_width = "32")]
+    {
+        vm.read_user_u32_nofault(user).map(|value| value as usize)
     }
-    read_user_u32(user)
 }
 
-fn read_user_usize(user: usize) -> Result<usize, Errno> {
-    let mut raw = [0u8; core::mem::size_of::<usize>()];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
-    Ok(usize::from_ne_bytes(raw))
-}
-
-fn read_user_isize(user: usize) -> Result<isize, Errno> {
-    let mut raw = [0u8; core::mem::size_of::<isize>()];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
-    Ok(isize::from_ne_bytes(raw))
+fn read_robust_isize(vm: &VmSpace, user: usize) -> Result<isize, Errno> {
+    read_robust_usize(vm, user).map(|value| value as isize)
 }
 
 fn read_user_u32(user: usize) -> Result<u32, Errno> {

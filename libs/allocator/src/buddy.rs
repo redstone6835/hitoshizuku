@@ -111,8 +111,6 @@ pub struct PageInfo {
     pub slab_zone_id: u16,
     pub state: PageState,
     pub order: u8,
-    #[allow(dead_code)]
-    pub gc_mark: u8,
 }
 
 impl PageInfo {
@@ -124,7 +122,6 @@ impl PageInfo {
             slab_zone_id: 0,
             state: PageState::Reserved,
             order: 0,
-            gc_mark: 0,
         }
     }
 }
@@ -345,7 +342,6 @@ struct BlockNode {
     is_free: bool,
     ref_count: u16,
     slab_zone_id: u16,
-    gc_mark: u8,
     free_next: usize,
     free_prev: usize,
     hash_next: usize,
@@ -361,7 +357,6 @@ impl BlockNode {
             is_free: false,
             ref_count: 0,
             slab_zone_id: 0,
-            gc_mark: 0,
             free_next: 0,
             free_prev: 0,
             hash_next: 0,
@@ -861,7 +856,6 @@ impl BuddyAllocator {
         node.is_free = true;
         node.ref_count = 0;
         node.slab_zone_id = 0;
-        node.gc_mark = 0;
         node.free_next = 0;
         node.free_prev = 0;
         node.hash_next = 0;
@@ -975,7 +969,6 @@ impl BuddyAllocator {
         node.is_free = true;
         node.ref_count = 0;
         node.slab_zone_id = 0;
-        node.gc_mark = 0;
         node.free_next = 0;
         node.free_prev = 0;
         node.hash_next = 0;
@@ -1114,48 +1107,6 @@ impl BuddyAllocator {
             current: 0,
             current_limit: 0,
             visited_current: 0,
-        }
-    }
-
-    pub fn set_gc_mark(&mut self, addr: usize, mark: u8) {
-        let node_addr = self.hash_find(addr);
-        if node_addr == 0 {
-            return;
-        }
-        let node = node_mut(node_addr);
-        if !node.is_free {
-            node.gc_mark = mark;
-        }
-    }
-
-    pub fn clear_all_gc_marks(&mut self) {
-        let mut nonempty_seen = 0usize;
-        for bucket in 0..self.hash_bucket_count {
-            let mut node_addr = self.bucket_head(bucket);
-            if node_addr == 0 {
-                continue;
-            }
-            nonempty_seen += 1;
-            let mut visited = 0usize;
-            while node_addr != 0 {
-                if visited >= self.node_used {
-                    self.note_chain_corruption();
-                    break;
-                }
-                visited += 1;
-
-                let node = node_mut(node_addr);
-                if !node.is_free {
-                    node.gc_mark = 0;
-                }
-                node_addr = node.hash_next;
-            }
-            if nonempty_seen >= self.nonempty_hash_bucket_count {
-                break;
-            }
-        }
-        if nonempty_seen != self.nonempty_hash_bucket_count {
-            self.note_chain_corruption();
         }
     }
 
@@ -1754,7 +1705,6 @@ impl BuddyAllocator {
         node.is_free = false;
         node.ref_count = 1;
         node.slab_zone_id = 0;
-        node.gc_mark = 0;
         node.free_next = 0;
         node.free_prev = 0;
         node.hash_next = 0;
@@ -1866,7 +1816,6 @@ impl BuddyAllocator {
         node.is_free = false;
         node.ref_count = 1;
         node.slab_zone_id = 0;
-        node.gc_mark = 0;
         node.free_next = 0;
         node.free_prev = 0;
         node.hash_next = 0;
@@ -2308,7 +2257,6 @@ fn initialize_node(
         is_free,
         ref_count: if is_free { 0 } else { 1 },
         slab_zone_id: 0,
-        gc_mark: 0,
         free_next: 0,
         free_prev: 0,
         hash_next: 0,

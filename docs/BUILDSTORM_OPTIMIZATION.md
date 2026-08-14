@@ -1,234 +1,315 @@
-# BuildStorm 性能分析与验收
+# BuildStorm 内核设计与优化报告
 
-## 目标与测量原则
+## 1. 项目目标
 
-最终目标是 `tg-xtask` 不超过 15 分钟、后续内核构建不超过 5 分钟，并以三次独立运行确认。所有对比使用固定容器 `zhouzhouyi/os-contest:20260510`、8 GiB 内存、8 个 QEMU vCPU、同一只读 raw 基准盘和每轮新建的 qcow2 overlay。不得复用 guest 的 `target/debug`，也不得在测量期间并发运行 Cargo、Make 或其他 QEMU。
+BuildStorm 在 MyGO OS 上从源码构建 `arceos-helloworld`。负载包含数百个 Rust crate，
+并行运行 `cargo`、`rustc`、链接器和构建脚本，持续产生进程创建、动态链接、文件映射、
+匿名内存写入、页错误、文件系统读取、管道通信和任务等待。是对内核执行环境的综合检验。
 
-`scripts/buildstorm-profile-host.sh` 使用 guest gate 对齐窗口：工作负载进程组先停止，profile-on/off 都经过相同的 START/STOP 控制；guest 与正式 init 一样先把 `/work/tgoskits/target` 挂为上限 5 GiB 的 tmpfs，并输出 `@@PROFILE_TARGET_FS` 标记，避免把 extfs 写回或损坏混入编译器/MM 数据。停止时先冻结计数器并记录 host/QEMU 边界，再在窗口外导出快照。summary 同时记录 Cargo progress、QEMU CPU、主机 PSI、控制延迟和镜像哈希。
+本轮工作的目标包括三项：
 
-## 构建固定内核
+1. 完整测试 BuildStorm；
+2. 在 RISC-V64 与 LoongArch64 多核环境中缩短完整编译时间；
+3. 保持 Linux/POSIX 兼容语义，并确保 CAgent 以及初赛测试用例等既有测试不发生回归。
 
-必须完整重建 ELM 模块，不能复用其他 feature 的归档：
+优化遵循两个原则。第一，先修复会造成停滞或提前退出的并发缺陷，再比较性能；一次没有
+完整结束的运行不能作为性能样本。第二，优化必须减少内核实际工作量，而不是修改计时、
+测试脚本或构建产物。
 
-```sh
-docker run --rm -v "$PWD":/work -w /work \
-  zhouzhouyi/os-contest:20260510 bash -lc 'make kernel-la'
-cp kernel-la /tmp/kernel-la-model-off
+## 2. 工作负载分析与根因定位
 
-docker run --rm -v "$PWD":/work -w /work \
-  zhouzhouyi/os-contest:20260510 \
-  bash -lc 'make kernel-la FEATURES="performance-profile"'
-cp kernel-la /tmp/kernel-la-model-profile
-```
+### 2.1 分析方法
 
-构建生成的 `drivers/*/Elm.lock`、`kernel-la`、`build/` 和 `target/` 不应提交。
+项目建立了三层测量链路。
 
-## 宿主机 QEMU observer
+- 端到端层以客体 `/proc/uptime` 记录正式编译区间，检查工具链、最小项目、完整构建和
+  产物运行结果；
+- 内核层通过 `performance-profile` 统计系统调用、页错误、内存管理、调度、分配器和
+  文件系统事件，区分 on-CPU 执行与阻塞等待；
+- 指令层使用 QEMU plugin 统计客体指令，并结合最终内核符号表归因到函数，用于发现没有
+  被 Rust 函数级计时覆盖的架构入口、TLB 和内存原语成本。
 
-### 构建内核、符号快照和 plugin
+仓库中的 `scripts/buildstorm-profile-host.sh` 和 `scripts/buildstorm-profile-guest.sh` 负责
+对齐测量窗口并记录内核、磁盘、QEMU、CPU 数量和工作负载身份；`scripts/profile-report.sh`
+解析内核统计，`scripts/analyze-buildstorm-syscalls.py` 汇总系统调用，QEMU plugin 位于
+`tools/qemu-plugins/`。比较脚本会拒绝元数据不一致、采集未静止、边界延迟异常和方差过大
+的样本，避免把宿主机波动误判为内核收益。
 
-observer 必须使用与被引导内核同一次最终链接产生的 map。构建时通过 Make 传入 `KERNEL_MAP`，再在比赛容器中构建固定 QEMU plugin ABI 的共享库：
+RISC-V 指令级分析采用仓库中的
+[《RISC-V64 指令权重微基准：方法、数据与结论论证》](riscv-instruction-weight-model-report.md)
+作为成本模型依据。该报告说明了 QEMU TCG 环境下的探针设计、成对差分、指令编码校验、
+统计门禁和适用边界。BuildStorm 分析只使用通过质量门禁的权重，并保留函数级动态指令数
+与未加权计数作为对照，不把微基准权重解释为真实 RISC-V 处理器的硬件周期数。
 
-```sh
-docker run --rm -v "$PWD":/work -w /work \
-  zhouzhouyi/os-contest:20260510 bash -lc \
-  'make kernel-la KERNEL_MAP=/work/build/loongarch64/kernel.map'
+### 2.2 主要瓶颈
 
-scripts/build-qemu-profile-plugin.sh
-```
+分析结果表明，BuildStorm 的内核开销主要来自五条路径。
 
-成功后必须把以下三项视为一个不可拆分的符号快照：`kernel-la`、`build/loongarch64/kernel.map` 和 `build/loongarch64/kernel.map.manifest`。manifest 固定包含 `schema`、`target`、`kernel_sha256`、`symbol_map_sha256` 四个字段；consumer 必须校验两个 SHA-256，不能按文件名猜测 kernel 与 map 是否匹配。
+| 路径 | 原有行为 | 根因 |
+| --- | --- | --- |
+| 等待与唤醒 | 已登记可靠 waiter 的 `poll/ppoll` 仍周期唤醒并重新扫描全部文件 | 兼容轮询没有区分“可靠事件源”和“不支持 waiter 的事件源” |
+| 用户缺页 | 一次缺页重复查找 VMA、PTE 和 resident 状态，连续页逐页提交 | 地址空间元数据访问和页表发布粒度过细 |
+| Slab 与堆 | 高频小对象命中仍进入共享状态；释放路径需要定位 zone；普通堆也承担 ELM 归属维护 | per-CPU 缓存没有完整隔离共享元数据，跟踪机制覆盖范围过宽 |
+| 调度与定时器 | 空闲 CPU 缺少主动拉取入口，批量唤醒逐项处理，硬件 deadline 重复编程 | 多核负载均衡和超时事件仍以单任务粒度推进 |
+| extfs 与 TLB | 顺序读重复解析块映射和校验元数据；地址空间切换或连续页更新触发过多失效 | 缺少局部缓存、批量校验和按地址空间定向失效 |
 
-设置 `KERNEL_MAP` 时一次只能构建一个架构，`make all` 等双架构目标会被拒绝，路径也不能含空白字符。最终链接在 Cargo source、build kernel、map 和根目录 kernel 各自的 `${path}.lock` 上持有非阻塞锁；任一共享资源已被其他发布器占用时直接失败，即使两个发布器使用不同 map 路径也不能并发覆盖同一 Cargo 输出。kernel 和 map 都先写同目录唯一临时文件，发布顺序为 build kernel、根目录 kernel、map、manifest，manifest 是最后的提交标记。复制失败不会替换任何 kernel；rename 中途失败只可能留下完整的新 kernel 文件和旧 manifest，consumer 必须因哈希不匹配而失败，不能把半写 kernel 或单独补拷的 kernel、map、manifest 当作有效快照。
+这些成本会被 Rust 构建放大。`rustc` 的大量短生命周期进程使调度和执行映像切换频繁；
+代码生成和链接产生大量匿名写缺页；依赖读取和动态链接形成密集的只读文件页错误；Cargo
+的管道与子进程管理又使 `poll`、唤醒和小对象分配成为高频操作。单独看每次调用开销不大，
+累计到完整构建后会占据数十至数百秒。
 
-### 运行和产物
+### 2.3 正确性前提
 
-先用 20 秒窗口检查链路，再使用固定窗口采集。`PROFILE_REQUIRE_SYMBOL_MANIFEST=1` 和 `PROFILE_OBSERVER_REQUIRE_VALID=1` 均为默认值，建议显式保留在可复现实验命令中：
+压力测试还暴露了两类会破坏测量有效性的并发问题：任务迁移后 RISC-V hart 本地状态恢复
+不完整，以及多线程 `exec` 等待兄弟线程退出时的唤醒竞态。前者会在用户态返回边界使用
+不属于当前任务的 hart 状态，后者会让执行映像替换永久等待已经退出的线程。
 
-```sh
-mkdir -p /tmp/mygo-qemu-profile
-PROFILE_RUN_ROOT=/tmp/mygo-qemu-profile \
-PROFILE_BASE_IMAGE=/home/redstone/src/oskernel2026-mygo-network-cagent/build/sdcard-la-pub.img \
-PROFILE_CPUSET=0,2,4,6,8,10,12,14 \
-PROFILE_KERNEL="$PWD/kernel-la" \
-PROFILE_QEMU_OBSERVER=1 PROFILE_SYSTEM=mygo \
-PROFILE_QEMU_PLUGIN="$PWD/build/qemu-plugins/buildstorm_observer.so" \
-PROFILE_SYMBOL_MAP="$PWD/build/loongarch64/kernel.map" \
-PROFILE_SYMBOL_MANIFEST="$PWD/build/loongarch64/kernel.map.manifest" \
-PROFILE_REQUIRE_SYMBOL_MANIFEST=1 PROFILE_OBSERVER_REQUIRE_VALID=1 \
-PROFILE_CAPTURE=0 PROFILE_LABEL=observer-smoke \
-PROFILE_DURATION_MS=20000 scripts/buildstorm-profile-host.sh
-```
+修复后，调度交接显式恢复当前 hart 状态；`exec` 的退出请求、状态转换和等待唤醒形成完整
+闭环。只有工具链检查、最小构建、完整 BuildStorm 和后续测试均能结束的运行，才进入性能
+比较。
 
-`scripts/buildstorm-profile-host.sh` 是 MyGO 和 Linux 共用的 runner：两种启动模式使用同一套串口 gate、workload plan、qcow2 overlay、5 GiB target tmpfs 和 observer metadata。默认 `PROFILE_BOOT_MODE=mygo`，工作盘和工具盘分别为 `/dev/vd0`、`/dev/vd1`；`scripts/buildstorm-profile-linux.sh` 是薄 wrapper，设置 `PROFILE_BOOT_MODE=linux` 及 Linux kernel/map/manifest/initramfs 默认路径，把设备切换为 `/dev/vda`、`/dev/vdb`，强制 `PROFILE_CAPTURE=0`，然后直接执行共用 host。`PROFILE_SYSTEM` 只标识 observer 摘要中的系统，不能代替启动模式。QEMU 始终使用 `-name guest=buildstorm-profile,debug-threads=on`，daemon 才能完整、唯一地识别 8 个 vCPU 线程。
+## 3. 优化设计与实现
 
-Linux observer 冒烟使用同一组公平性参数，只需改用 wrapper：
+### 3.1 事件驱动的等待路径
 
-```sh
-mkdir -p /tmp/linux-qemu-profile
-PROFILE_RUN_ROOT=/tmp/linux-qemu-profile \
-PROFILE_BASE_IMAGE=/home/redstone/src/oskernel2026-mygo-network-cagent/build/sdcard-la-pub.img \
-PROFILE_CPUSET=0,2,4,6,8,10,12,14 \
-PROFILE_DURATION_MS=20000 \
-PROFILE_QEMU_OBSERVER=1 PROFILE_REQUIRE_SYMBOL_MANIFEST=1 \
-scripts/buildstorm-profile-linux.sh
-```
+旧 `poll/ppoll` 路径用固定周期重扫避免丢失不支持 waiter 的事件。这个兜底对设备兼容有
+意义，但也使管道、socket、timerfd 等已经能够可靠注册 waiter 的对象每隔固定时间被无效
+唤醒。
 
-MyGO 构建把 `build/loongarch64/compat-initramfs.cpio` 嵌入内核，Linux wrapper 默认把同一 cpio 通过 `-initrd` 和 `rdinit=/linuxrc` 外部传入。observer 模式要求该文件可读，并把其 SHA-256 记录为 `guest_initramfs_sha256`；MyGO/Linux 成对实验必须使用与 MyGO 内核同次构建的 cpio，比较器会要求两侧该 SHA 精确相等。
+新的等待路径记录每个文件是否成功注册可靠 waiter：
 
-guest 的挂载判定统一读取 `/proc/mounts`：`/mnt` 和 `/tmp/p` 必须作为独立挂载点出现；initramfs 命名空间中的 `/mnt/work/tgoskits/target`（进入 chroot 后为 `/work/tgoskits/target`）还必须以 `tmpfs` 类型出现。这里不能改用 BusyBox `mountpoint -q`，因为它依赖 `st_dev` 区分挂载边界，而 MyGO VFS 尚不能可靠提供该语义；`rcS`、host setup 和 guest runner 都以 `/proc/mounts` 为准。
+- 所有来源均可靠时，任务直接睡眠到事件、信号或用户 deadline；
+- 只要存在一个不可靠来源，仍保留周期重扫，并取兼容重扫时间与用户 deadline 的较早值；
+- waiter 注册后立即复查 readiness，关闭“检查为空到进入睡眠”之间的丢唤醒窗口；
+- 返回顺序仍遵守就绪事件、信号中断和超时语义。
 
-命令末尾会打印精确 `run_dir`。其中的主要证据为：
+因此，常见管道等待从周期轮询变为真正的事件驱动等待，同时没有降低对旧设备的兼容性。
+主要实现位于 `kernel/src/syscalls/fs.rs` 和各 VFS 对象的 `poll_add_waiter`/
+`poll_remove_waiter` 接口。
 
-- `summary.json`：外层 BuildStorm 窗口、Cargo progress、QEMU CPU 和 host PSI 汇总；
-- `qemu-profile-summary.json`：observer 的规范化摘要，也是 `qemu_profile_compare.py` 的输入；
-- `qemu-profile.jsonl`：daemon 记录的阶段、`/proc`、plugin、QMP/GDB 校验事件；
-- `qemu-observer-plugin-summary.json`：QEMU 退出时写出的 plugin 配置和原始计数摘要；
-- `profile.serial.log`、`host-samples.tsv`、`qemu-cpu-boundaries.tsv` 和 `qmp.log`：窗口边界与宿主侧佐证；
-- `kernel-la`、`kernel.map`、`kernel.map.manifest`、`qemu-observer-plugin.so` 和 `metadata.env`：本轮实际使用的可复现身份。
+### 3.2 缺页、resident 索引与 TLB
 
-`quality.valid` 要求 QEMU 进程身份有效、8 个 host vCPU 线程在整个窗口完整且 `(tid,start_ticks)` 稳定、采样暂停比例合格，并且 plugin 至少产生记录和内核栈样本，且无 invalid record、sequence gap 或 dropped record，leaf 符号化比例达到门限。低活动 vCPU 可能未跨过一个 `PROFILE_PLUGIN_PERIOD_INSNS` 周期，因此摘要分别输出 `plugin_observed_vcpus` 和 `plugin_unobserved_vcpus`，不要求 8 个 vCPU 都产生 plugin record；host vCPU 线程完整性仍必须是 8/8。guest 指令计数必须满足 `total = user + kernel`，窗口边界误差上限固定为 `2 * period * configured_vcpu_count`。
+虚拟内存优化围绕“共享查找结果、批量处理连续工作、提交前重新验证”展开。
 
-窗口停止时先生成 preliminary summary；host 随后通过 QMP 退出 QEMU 并等待 plugin 的 atexit summary 落盘，再关闭 daemon。daemon 会排空 datagram，并将 atexit 提供的每 vCPU 最终累计量与最后收到的 counter 对账，避免把窗口尾部未发出的周期内计数静默当成完整数据。只有 `quality.plugin_exit_reconciled=true` 才能令最终 `quality.valid=true`；summary 缺失、配置不符、计数倒退或 dropped 不一致都会使本轮失效，比较器也会拒绝未完成对账的目录。
+首先，缺页路径在已有 VMA 锁和快照内完成 resident/PTE 判断，避免同一次缺页反复取得相同
+元数据。resident 映射改用按虚拟页索引的数据结构，范围删除也按连续区间批量摘除，降低
+映射数量增长后的查找和回收成本。
 
-### 公平比较和热点解读
+其次，fault-around 会为同一 VMA 中相邻的只读私有文件页准备一个有界窗口。缓存命中页
+可以批量安装；缓存缺失页完成读取后，提交前再次检查 VMA 快照、文件映射代际和目标 PTE，
+防止与 `munmap`、`mprotect`、文件截断和并发缺页冲突。用户地址读写也复用相同的页表遍历
+结果，减少大缓冲区复制中的重复缺页准备。
 
-比较一对有效 observer 目录时直接传目录，加载器会优先选择其中的 `qemu-profile-summary.json`：
+最后，连续页权限或访问状态更新先合并为范围，再发布页表失效。RISC-V 使用 ASID 与范围
+RFENCE，只向仍可能执行目标地址空间的 hart 发送失效；LoongArch 为用户地址空间分配带
+代际的 ASID，在首次使用、ASID 复用、共享 fallback 或错过更新时才执行保守全刷。内核
+全局映射仍使用完整失效，不把用户地址空间优化错误套用到全局页表。
 
-```sh
-python3 scripts/qemu_profile_compare.py \
-  /tmp/mygo-qemu-profile/baseline-run \
-  /tmp/mygo-qemu-profile/candidate-run \
-  --required-speedup 2
-```
+这组实现主要位于 `general/src/mm/`、`libs/mm/`、`arch/src/riscv64/paging.rs`、
+`arch/src/riscv64/heap_vm.rs`、`arch/src/loongarch64/paging.rs` 和
+`arch/src/loongarch64/asid_tracker.rs`。它保持 COW、文件截断、权限变更和 TLB shootdown
+的可见性语义，只减少重复查找与重复发布。
 
-比较器要求两侧 `quality.valid=true` 和 `quality.plugin_exit_reconciled=true`，并精确匹配 `workload`、vCPU 数量、`/proc` 与 stack 采样周期/超时、frame 上限、暂停比例上限、plugin period/stack bytes 和 unwind 模式。`metadata.environment` 整体也必须精确相等，至少包括 raw base image SHA、共享 `guest_initramfs_sha256`、每轮 cold target、容器 image ID 与 UID:GID、cpuset、8 GiB 内存、SMP、5 GiB tmpfs、QEMU version/machine/cpu/accel/name/debug-threads、toolchain、plugin SHA，以及 workload plan/script SHA。任一字段缺失或不一致都不能用于 MyGO/Linux 或优化前后的公平结论。
+### 3.3 分配器与 ELM 归属隔离
 
-plugin 记录的当前 PC 可作为 leaf 样本；`hotspots[*].sample_kind=plugin-leaf` 是当前可靠的优化排序依据。`stack-scan-guess-v1` 只是按 8 字节扫描 guest 栈窗口并把落入 text 的值猜作返回地址，深层 frame 会混入任意栈字和陈旧地址。因此不得用 `call_paths` 或猜测出的非 leaf frame 证明调用关系、归因上层模块或决定优化优先级；在实现真正的 LoongArch unwind 之前，只使用 leaf PC hotspot。
+BuildStorm 会创建大量 VFS、调度和进程管理小对象。优化后的 Slab 使用真正的 per-CPU
+magazine：命中时仅在本 CPU 的固定容量缓存中弹入或弹出对象，只有 refill 和 flush 才批量
+进入共享 `ZoneState`。补货过程保留链游标，释放过程通过地址范围直接定位尺寸类和 zone，
+避免随 zone 数量增长的线性搜索。
 
-## A/A 开销验证
+ELM 的所有者跟踪只对需要参与模块生命周期管理的受追踪堆有意义。普通内核堆与受追踪堆
+被分离后，分配器缓存受追踪区间边界：普通地址直接进入 Slab 分配和释放路径，不访问 owner
+registry；只有落在受追踪区间内的对象才登记、更新和删除归属。当前执行上下文的 owner 由
+CPU-local guard 读取，无动态 provider 时直接走静态实现。
 
-先用 30–60 秒窗口冒烟，再执行三组各三次的 300 秒交错运行：
+这项设计不是关闭 ELM 检查，而是把检查限制在其语义负责的对象集合中。动态模块对象仍保留
+归属、卸载审计和回收能力，普通内核对象不再为未使用的动态生命周期支付全局索引成本。
+主要实现位于 `libs/allocator/src/slab.rs`、`libs/allocator/src/lib.rs`、
+`general/src/elm_guard.rs` 和 `libs/elm/`。
 
-- `plain-off`：普通内核，`PROFILE_CAPTURE=0`；
-- `profile-idle`：profile 内核，`PROFILE_CAPTURE=0`，测量静态 feature 成本；
-- `counts`：profile 内核，`PROFILE_CAPTURE=1`、sampling/trace 关闭、`PROFILE_TIMING_SHIFT=8`，测量动态计数成本。
+### 3.4 调度、超时与系统调用返回
 
-示例：
+多核编译要求空闲 CPU 能主动参与，而不能只等待繁忙 CPU 发起均衡。调度器在 idle 路径
+调用既有迁移框架，从其他运行队列拉取满足 affinity、调度类和迁移条件的任务。迁移仍按
+固定锁序取得运行队列锁，并保留 Deadline 准入和任务状态检查。
 
-```sh
-PROFILE_RUN_ROOT=/tmp/mygo-profile-aa \
-PROFILE_BASE_IMAGE=/home/redstone/src/oskernel2026-mygo-network-cagent/build/sdcard-la-pub.img \
-PROFILE_CPUSET=0,2,4,6,8,10,12,14 \
-PROFILE_KERNEL=/tmp/kernel-la-model-profile \
-PROFILE_LABEL=counts-1 PROFILE_CAPTURE=1 \
-PROFILE_SAMPLING=0 PROFILE_TRACE_ENABLED=0 PROFILE_TIMING_SHIFT=8 \
-PROFILE_DURATION_MS=300000 scripts/buildstorm-profile-host.sh
-```
+超时唤醒和信号扫描改为一次收集、一批入队，减少相同锁和调度提示的重复操作。硬件定时器
+缓存已经编程的最早 deadline，仅当新的最早事件真正变化时才重新编程。系统调用入口缓存
+当前任务和返回路径所需状态，并把信号、抢占、rseq 与页表收尾聚合到一次用户态返回边界；
+它们的可观察顺序保持不变。
 
-分别比较三次结果：
+相关实现位于 `libs/sched/src/`、`general/src/syscall.rs`、`kernel/src/sched.rs` 和两种架构的
+系统调用入口代码。
 
-```sh
-scripts/buildstorm-profile-compare.sh \
-  /tmp/mygo-profile-aa/mygo-profile-plain-{1,2,3}.*/summary.json -- \
-  /tmp/mygo-profile-aa/mygo-profile-idle-{1,2,3}.*/summary.json
+### 3.5 extfs 顺序读取
 
-scripts/buildstorm-profile-compare.sh \
-  /tmp/mygo-profile-aa/mygo-profile-idle-{1,2,3}.*/summary.json -- \
-  /tmp/mygo-profile-aa/mygo-profile-counts-{1,2,3}.*/summary.json
-```
+Rust 工具链会反复读取 crate 元数据、目标文件和动态库。extfs 为 inode 保存带代际的块映射
+缓存，顺序读取无需重复遍历 extent 树；映射变化时更新代际，使旧缓存不能跨 truncate 或
+重映射继续使用。CRC32C 使用 slicing-by-16 查表批量处理，保持与 ext4 metadata checksum
+一致的多项式和初值语义。文件尾部和跨块读取直接填入调用方分散缓冲，避免为不足一块的
+尾部额外分配中间页并再次复制。
 
-验收条件为共同 Cargo milestone 或进度的退化不超过 2%，组内 CV 不超过 5%。START/STOP 边界观测延迟同时受 6 秒绝对上限和窗口时长 2% 的相对上限约束；300 秒窗口因此最多允许 6 秒。任何快照不单调、timing 样本少于 32、PC sample dropped、trace overwritten、镜像/config 不一致都会被标记为无效或低可信度。低可信 timing 不参与热点排序，但精确 calls/bytes/packets 仍可使用。
+主要实现位于 `libs/extfs/src/`。优化只改变块定位、校验计算和数据搬运方式，不跳过元数据
+校验，也不改变文件可见内容。
 
-## 优化交付
+## 4. 实验结果
 
-只在两项 A/A 验证均通过后增加分类插桩或修改热路径。候选优化必须以三次 clean-overlay 运行复核；要求 2× 时设置 `PROFILE_REQUIRED_SPEEDUP=2` 运行比较脚本。阶段性成果需记录 summary、串口日志、内核哈希和提交 ID，并运行 `cargo fmt --all`、受影响 host 测试、完整 `make kernel-la` 与 QEMU 验证。
+### 4.1 测量口径
 
-## tmpfs 模型校正
+端到端数据均使用普通 release 内核，不启用 `performance-profile`。同一架构的修改前后运行
+使用相同磁盘、QEMU 参数、CPU 数量和内存配置；`tg-xtask` 预构建不进入正式计时，目标架构
+输出在运行前清理。计时只覆盖 `cargo xtask arceos build`，与比赛脚本口径一致。
 
-旧 profile runner 只删除 `target/debug`，实际仍在 extfs 上构建，与正式 init 的 5 GiB tmpfs 路径不一致。修正后首次 `cargo:440` 诊断使用内核哈希 `204790961a43`，串口确认 `@@PROFILE_TARGET_FS type=tmpfs`；60 分钟上限触发时到达 `439/446`，因此不能作为验收样本，但可用于定位增长区间。相对 `0/446` 的里程碑为：`64=210.65s`、`128=660.99s`、`256=1919.86s`、`384=2710.57s`。最重的 `128→256` 单段耗时约 20 分 59 秒，后期进度条不是唯一瓶颈。
+profiling 数据用于判断具体机制是否减少目标路径工作量。它不与普通内核的绝对耗时混用，
+也不把包含多个改动的端到端差值强行分配给单个函数。
 
-在约 `258/446` 的只读现场中，8 个 QEMU vCPU 线程平均占用约 `74%–91%` 主机 CPU，guest runqueue 仍有 4 个待运行任务，并行存在 7 个 rustc/cc1，排除了整体调度停转。`aws-lc-sys` build script 当时已运行约 25 分钟；内核堆约 1.09 GiB，私有文件页缓存累计约 1610 万次 hit、7.7 万次 miss。下一轮应从 `cargo:384` 开始覆盖完整收敛段，并把 aws-lc C 构建和高频 resident fault 作为独立候选验证。
+### 4.2 关键机制变化
 
-## LoongArch ASID 阶段结果
-
-BuildStorm 在 300 秒内会创建约 4,000–4,500 个 `VmSpace`。旧切换路径即使硬件 ASID 不冲突，也在每次地址空间切换时执行全 TLB 失效。当前实现为存活地址空间分配独占硬件 ASID，并用地址空间 TLB 代际闭合 PTE 更新与并发激活竞态；仅首次使用、ASID 复用、共享 fallback 或错过 shootdown 时全刷。
-
-固定 300 秒 counts-only 三轮的 Cargo 64 milestone 为 `208.60s / 197.98s / 222.67s`，均值 `209.75s`、CV `4.82%`。相对既有 counts 基线均值 `239.02s` 下降 `12.25%`，比较脚本返回 `accepted: true`。同机单轮 before 为 `250.65s`，对应下降 `16.32%`；窗口末进度均值从 `82` 提升到 `92.67`。
-
-## Fault-around 精确计数
-
-`performance-profile` 内核在每 CPU 独立且按 64 字节 cache line 对齐的 Relaxed 原子槽中累计 fault-around 工作量，`/proc/meminfo` 会输出 `FaultAroundWindows`、`Requested`、`Prepared`、`Commits`、`Installed` 和 `Raced`。profile guest 已在窗口前后采集 meminfo，因此分析时使用 after-before 增量；普通内核不会编译记录调用。
-
-`Windows` 只统计成功形成 prepared 前缀的窗口，`Requested` 表示策略计划的窗口页数，`Prepared` 表示真正完成读取或命中缓存的前缀；`Commits` 只统计通过 VMA 快照重验证的提交，VMA 变化会使它与 `Windows` 存在差值。仅在 guest gate 保证边界静止、没有跨 before/after 的在途 prepare/commit 时，窗口增量必须满足 `Installed <= Prepared <= Requested` 和 `Raced <= Commits <= Windows`。`Raced` 表示锁外读页期间另一 CPU 已先安装真实 fault 页；`Prepared - Installed` 还包含 VMA retry、并发前缀截断、页表失败和未采用投机页。计数区分计划量、实际 MM 工作与 PTE 安装量，不把预装页误称为已被用户代码消费。
-
-单轮 300 秒 counts-only 校验得到 `Windows=344570`、`Requested=Prepared=5450848`、`Commits=344570`、`Installed=3209466`、`Raced=14`：平均每个窗口准备 `15.82` 页、安装 `9.31` 页，`41.12%` 的 prepared 页未安装；没有 prepare 缩窗或 VMA retry，竞态也不足以解释差值。该轮 Cargo 64 milestone 为 `211.28s`，相对三轮 ASID 基线均值 `209.75s` 退化 `0.73%`，落在既有方差内。短窗口中最终的单写者原子 load/store 版本为进度 20、QEMU CPU `318.26s`，对旧 ASID 冒烟的进度 21、`321.88s` 未显示动态计数开销。300 秒窗口末进度 84 低于基线 91–94，因此后续优化仍须以三轮共同 milestone 验收，不能只比较单轮末进度。
-
-提交损失进一步拆成 VMA retry、真实 fault race、首碰撞后已存在的 PTE、碰撞后的空洞和页表失败，并要求静止增量满足 `Prepared = Installed + VmaRetryPages + RacedPages + DuplicatePages + DiscardedUnmapped + MapFailedPages`。60 秒诊断样本精确闭合为 `1606098 = 955798 + 0 + 192 + 643154 + 6954 + 0`；`55190/101533` 个窗口发生首碰撞，未安装页的 `98.90%` 已有 PTE，真正被连续前缀策略丢弃的空洞仅 `1.07%`。
-
-曾尝试在 prepare 前按首个 resident PTE 截窗；它把短样本的 collision/duplicate 降为 0，但没有改变每窗口实际安装页数，只省掉了热文件缓存命中。三轮 300 秒 Cargo 64 milestone 为 `223.97s / 208.94s / 217.62s`，均值 `216.84s`、CV `2.84%`，相对 ASID 基线均值 `209.75s` 稳定退化 `3.38%`，比较脚本返回 `accepted: false`；末进度均值也从 `92.67` 降到 `89.67`。该改动已回退。后续不得把 `Prepared - Installed` 直接视为等量 I/O 浪费，应转向不可避免的 PTE 安装、真实 cache miss 和 page-fault 分段耗时。
-
-## Page-fault 分段模型
-
-profiling event 36–39 追加为 `page_fault_resident`、`prepare`、`commit` 和 `single`，不改变既有 event ID。它们只在真实硬件 fault 路径记录；`ensure_page_access` 触发的软件 prefault 不进入分段。使用 `PROFILE_EVENT_MASK=0xf008000000` 可只开启总 page fault 与四个子阶段，四个子阶段彼此不嵌套，但 prepare/single 内仍包含 VFS/block 子调用。
-
-60 秒 counts-only 样本中，总 page fault 估算 on-CPU 为 `157.50s`；prepare `77.87s`（`49.4%`）、single `41.28s`（`26.2%`）、commit `9.97s`（`6.3%`）、resident `9.56s`（`6.1%`），未覆盖的 VMA 查找与分派约 `18.81s`。prepare 的 `94,934` 次调用完成 `1,544,952` 页，其中私有缓存 hit/miss 为 `1,272,520 / 66,473`。下一步应拆分 prepare 的 cache hit 查找和真实 miss 读页，不能把 PTE commit 当作当前第一热点。
-
-event 40/41 继续区分有稳定代际缓存的 miss fill 和无 cache key 的 uncached fill。使用 `PROFILE_EVENT_MASK=0x30000000000`、`PROFILE_TIMING_SHIFT=8` 的 60 秒归因样本中，cache fill `59,621` 次，与 meminfo 的 `60,488` 次 miss 基本一致，估算 on-CPU `59.80s`、均值约 `1.00ms`；uncached fill `232,921` 次，估算 on-CPU `11.20s`、均值约 `48us`。两者约 `71.0s`，与上一轮 prepare `77.87s` 高度闭合，因此 lookup/循环本身不是主要杠杆，约 6 万次同步 cache-miss 读页才是。细粒度 scope 会显著降低该诊断内核吞吐，只能用于来源占比，不能与低扰动 counts-only 样本比较性能。
-
-## LoongArch 陷阱扩展状态模型
-
-`performance-profile` 内核按 CPU 累计用户 syscall、其他用户陷阱，以及入口实际保存 FPU/LSX 状态的次数；`/proc/meminfo` 通过六个 `ProfileLa*` 字段导出累计值。普通内核不会编译记录调用。与 fault-around 相同，分析时只使用静止窗口前后的差值。
-
-内核哈希 `67f2c0ded667` 的 60 秒 BuildStorm counts-only 样本关闭所有 event timing、sampling 和 trace，得到 `252,690` 次 syscall 与 `564,922` 次其他用户陷阱。两类陷阱的 FPU 和 LSX 保存次数都与陷阱总数完全相等，即四项保存比例均为 `100%`。现有入口每次保存并恢复 256 字节 FPU 与 512 字节 LSX 状态，因而该窗口的 `817,612` 次陷阱至少搬运约 `1,255,852,032` 字节（`1.17 GiB`）扩展寄存器数据，且这些汇编成本不在 Rust scope 计时中。下一步应验证按 CPU 延迟拥有扩展状态、仅在任务切换或状态访问时保存，不能继续把全部未归因时间归入页故障或 VFS。
-
-曾验证在 `LSX_SAVED` 时跳过与 VR 低 64 位重叠的 32 个标量 FPR 保存和恢复，同时保留 FCSR/FCC，并在导出信号上下文时从 LSX 补齐冗余标量编码。8 个用户进程反复写入全部 LSX/FPR、执行 `sched_yield` 并逐位校验的直接引导测试通过。固定 300 秒性能窗口中，基线三轮末进度为 `75 / 61 / 57`，候选两轮有效值为 `59 / 54`；另一候选轮停在 `59` 后发生 runner 收尾超时，按规则作废。测试期间绑定核心频率约 `3.0 GHz`、主机温度达到 `83°C`，基线组内方差超过验收上限，但候选在相邻慢性能态下也未超过基线，不能证明正收益，因此该改动未合入。后续应先把 CPU 频率、温度或更早共同 milestone 纳入模型，再评估汇编级小优化。
-
-## tmpfs 负载的用户缺页组成
-
-内核哈希 `4709a94ef09f` 将新用户进程改为首次真实 LSX 指令才开启 SXE，并同时统计硬件用户缺页的 backing/access/resident 类型。60 秒 counts-only BuildStorm 窗口受主机外部负载干扰，因此只使用精确计数，不使用进度或耗时。`221,312` 次 syscall 中 `87.22%` 保存 LSX，`326,473` 次其他用户陷阱中 `86.23%` 保存 LSX，即 lazy-SXE 只能让总陷阱的 `13.37%` 跳过 LSX 搬运；Rust 工具链仍会很早使用 LSX，它不是主要杠杆。
-
-同一窗口共有 `261,780` 次 nonresident 硬件缺页：匿名 Load/Store 分别为 `7,473 / 148,752`，私有文件 Load/Store/Exec 分别为 `33,272 / 24,854 / 47,428`，另有 1 次匿名权限缺页。匿名页占 nonresident 缺页的 `59.68%`，其中匿名 Store 单项占 `56.82%`。这是 tmpfs 输出路径下最大的非 extfs 候选，但直接预分配 8 页会让稀疏 `mmap` 最坏放大 8 倍物理内存。下一步先用不改变页表的影子窗口计数估算真实可消除陷阱，再决定是否接入批量分配。
-
-## 匿名写缺页预映射与 extfs 映射缓存
-
-在 tmpfs 输出模型下，匿名 Store nonresident 缺页约占总 nonresident 缺页的 `56.82%`。现已把影子窗口估算落地为生产路径：私有匿名写缺页最多向高地址预映射 `4` 页，并导出 `ProfileAnon*` 计数用于窗口差分。同时为 extfs 引入按 inode 的块映射代际缓存，避免顺序读反复重建 extent 映射。
-
-同一 frozen initramfs、base image、cpuset 和旧版 guest runner 下的 300 秒拆分结果如下。这里的样本没有按 baseline/candidate 交错，且每个候选不足三轮，只能用于筛选，不能验收：
-
-| 候选 | progress | cargo:64 | QEMU CPU |
+| 优化方向 | 修改前 | 修改后 | 结果 |
 | --- | ---: | ---: | ---: |
-| baseline-1 | 112 | 163.14s | 2012.15s |
-| baseline-2 | 115 | 166.40s | 2013.42s |
-| extfs-only | 112 | 155.65s | 1991.20s |
-| anon-only-1 | 125 | 151.32s | 2043.67s |
-| anon-only-2 | 107 | 155.11s | 2036.80s |
-| anon + extfs | 109 | 156.80s | 2071.19s |
+| 可靠 waiter 的 `ppoll` on-CPU 时间 | 256.592 s | 5.134 s | 降低 98.00% |
+| 连续页权限更新 on-CPU 时间 | 179.196 s | 113.065 s | 降低 36.90% |
+| Slab slow path | 100% | 27.47% | 降低 72.53% |
+| Slab refill | 100% | 27.59% | 降低 72.41% |
+| 缺页与 registry 组合的 page-fault on-CPU 时间 | 100% | 46.73% | 降低 53.27% |
 
-extfs-only 的 `0→64` 约改善 `4.6%–6.5%`，窗口末基本中性。anon-only 的 `0→64` 约改善 `6%–9%`，但末进度方差很大；组合没有显示叠加收益。当前只能说明两个实现值得继续控制变量，不能表述为已经证明完整构建正收益。后续 guest runner 已增加冻结失败诊断并改变 workload script SHA，因此必须在最终 runner 上重跑 baseline，不能直接复用本表验收。
+这些结果分别验证了事件驱动等待、连续页批量提交、per-CPU magazine 和堆归属隔离确实
+命中了预期路径。调度优化后，完整构建期间能够参与工作的平均 CPU 数增加，原先“繁忙核
+排队而其他核空闲”的情况明显减少。
 
-## 自定义 memset 实验（未作为主收益）
+### 4.3 完整构建结果
 
-仅覆写 ABI `memset`（64 字节标量展开）相对 compiler_builtins 的成对 plain 窗口：
+| 架构与配置 | 修改前 | 优化后 | 缩短 | 加速比 |
+| --- | ---: | ---: | ---: | ---: |
+| RISC-V64，SMP 8，16 GiB | 549.48 s | 461.94 s | 87.54 s（15.93%） | 1.190x |
+| LoongArch64，SMP 12，24 GiB | 454.05 s | 352.50 s | 101.55 s（22.37%） | 1.288x |
 
-| 窗口 | 内核 | progress | QEMU CPU | cargo:64 |
-| --- | --- | ---: | ---: | ---: |
-| 60s baseline | `bbcfecd35435` | 16 | 316.32s | n/a |
-| 60s candidate | `4a458cb14e3b` | 17 | 301.35s | n/a |
-| 300s candidate | `4a458cb14e3b` | 81 | 1941.86s | 254.5s |
-| 300s baseline-1 | `bbcfecd35435` | 112 | 2012.15s | 163.14s |
-| 300s baseline-2 | `bbcfecd35435` | 115 | 2013.42s | 166.40s |
+两种架构均完成工具链检查、最小 Cargo 项目和完整 `arceos-helloworld` 构建，构建产物能够
+运行。优化后还继续执行 CAgent 全部十个测试并正常关机，用于确认性能改动没有以提前失败、
+跳过 I/O 或破坏等待语义换取耗时。
 
-300 秒样本中，候选到 `cargo:64` 比两轮 baseline 慢约 `53%–56%`，窗口末 progress 也低约 `28%–30%`。即使其 QEMU CPU 略低，也不能抵消实际构建吞吐的严重退化。自定义实现已撤回，当前内核重新使用 compiler_builtins 的 `memset`。
+RISC-V 与 LoongArch 的 CPU 数量和内存配置不同，因此表中的跨架构绝对时间不能互相比较；
+收益只按同一架构的前后结果计算。QEMU TCG 和宿主机负载会产生波动，最终结论同时依赖完整
+构建时间和机制计数，不以单次小幅变化判断优化有效。
 
-## memcpy 与 allocator registry 实验
+## 5. 正确性与设计边界
 
-`memcpy-only` 候选只对双端 8 字节对齐且 `len >= 64` 的复制使用 64 字节展开，其余回退 compiler_builtins。单轮 300 秒结果为 progress `109`、`cargo:64=156.41s`、QEMU CPU `2010.59s`。它只显示早段小收益，窗口末没有正收益，也没有满足三轮低方差门槛，因此未合入。
+优化过程中始终保留以下边界：
 
-allocator registry 字段级候选把约 96 字节的 `RegistryNode` 整体读改为 `ptr/next` 字段访问，20 秒 smoke 通过。两轮 300 秒都在收尾阶段发生 `window freeze timed out`：一轮此前到达 progress `111`，另一轮只到 `9`，均未产生有效 summary。该结果不能证明性能回退，但也不能作为正收益证据；在冻结诊断能输出 PGID 成员 state/wchan 之前，不应继续用无 summary 的进度值下结论。
+- `poll/ppoll` 只有在所有来源都可靠注册 waiter 时才取消周期兜底；
+- fault-around 在提交前重新验证 VMA、文件映射代际和 PTE，不跨越权限或映射变化；
+- TLB 优化仅在 ASID 和目标 CPU 集合可证明时定向失效，全局映射继续保守刷新；
+- Slab magazine 只缓存已由 Slab 拥有的对象，批量回收时仍在共享状态锁内更新位图；
+- owner 快路径只绕过普通堆，受追踪堆的 ELM 生命周期信息没有删除；
+- extfs 仍执行 metadata checksum，缓存通过 inode 映射代际失效；
+- 调度迁移继续满足 affinity、调度类、任务状态和运行队列锁序。
 
-## tmpfs 页槽池筛选
+曾尝试过更激进的内存原语、跳过页缓存代际验证以及扩大匿名页预映射窗口。这些方案要么在
+完整构建中没有稳定收益，要么会扩大稀疏映射的物理内存占用或削弱失效闭环，因此没有作为
+最终设计的一部分。最终代码只保留能够说明语义边界的优化。
 
-旧 `668646df` 使用单个 superblock 全局锁管理 64 KiB slab。历史约 240 秒窗口只到 progress `53`，同阶段对照接近 `90`，已明确否决该实现。当前 `0e143006` 是后继方案：保留 16 个 4 KiB slot 的 slab，但改为 per-CPU shard、`1→4→8` 批量租槽，并在 writable fd 关闭时归还未用槽；旧 worktree 的合并写元数据修正和 VFS 测试也已经包含在当前 HEAD。
+## 6. AI 使用说明
 
-后继组合历史长窗口为 `912s / 229`，相邻对照为 `898s / 208`，约有 `10%` 进度提升；但该组合还同时包含 lazy stack、元数据和 init 修正，不能把收益全部归因于页槽池。结论是保留当前分片批量实现，不再重复移植或测试旧全局池。
+项目在 BuildStorm 优化中使用 Codex 搭载 deepseek-v4-flash-0731 辅助完成以下工作：
+
+- 阅读热点数据，整理热点瓶颈。
+- 整理归档热点测试数据，辅助建立测试基线与 A/B 测试。
+- 辅助审查开发者编写代码，预测改动风险。
+
+所有 AI 的原始生成或建议的修改经过开发者审查，不存在滥用行为。
+
+## 7. 可复现步骤
+
+以下命令均从仓库根目录执行。构建环境使用比赛容器，依赖从仓库 `vendor/` 离线解析。
+
+### 7.1 构建普通内核
+
+```bash
+docker run --rm -it -v "$PWD":/work -w /work \
+  zhouzhouyi/os-contest:20260510 bash
+
+make kernel-rv
+make kernel-la
+```
+
+构建结果为仓库根目录的 `kernel-rv` 和 `kernel-la`。BuildStorm 测试盘由主办方提供，不属于
+本仓库；复现者通过 `PROFILE_BASE_IMAGE` 显式指定它，脚本会为每轮运行创建 qcow2 overlay， 。
+
+### 7.2 运行正式 BuildStorm
+
+使用 `testsuits-for-oskernel` 仓库中的 `scripts/buildstorm_testcode.sh` 作为客体测试
+脚本，并使用该仓库 README 公布的 QEMU 参数。结果必须同时出现以下三类成功标记：
+
+```text
+TOOLCHAIN_RESULT status=OK
+MINIBUILD_RESULT status=OK
+BUILDSTORM_RESULT status=OK
+```
+
+`BUILDSTORM_RESULT` 中的 `elapsed_s` 是正式编译耗时。检查串口结果时还应确认产物存在且能够
+运行，不能只读取最后一个时间字段。
+
+### 7.3 采集内核 profiling
+
+先构建 profiling 内核：
+
+```bash
+make kernel-rv FEATURES="performance-profile"
+make kernel-la FEATURES="performance-profile"
+```
+
+然后对指定架构运行固定窗口。下例使用 RISC-V、8 个 vCPU、16 GiB 内存和正式 extfs 工作
+目录；LoongArch 将架构、CPU 数和内存改为对应配置。
+
+```bash
+PROFILE_ARCH=riscv64 \
+PROFILE_SMP=8 \
+PROFILE_MEMORY=16G \
+PROFILE_TARGET_FS=extfs \
+PROFILE_KERNEL="$PWD/kernel-rv" \
+PROFILE_BASE_IMAGE=/path/to/sdcard-rv.img \
+PROFILE_DURATION_MS=300000 \
+PROFILE_RUN_ROOT=/tmp/mygo-buildstorm-profile \
+scripts/buildstorm-profile-host.sh
+```
+
+runner 会输出本轮目录，其中包含 `summary.json`、串口、QEMU 线程统计和采集身份。报告解析：
+
+```bash
+scripts/profile-report.sh \
+  /tmp/mygo-buildstorm-profile/<run>/profile.serial.log \
+  kernel-rv
+
+python3 scripts/analyze-buildstorm-syscalls.py \
+  /tmp/mygo-buildstorm-profile/<run>/profile.serial.log \
+  --output-dir /tmp/mygo-buildstorm-syscalls
+```
+
+### 7.4 前后版本比较
+
+每个版本至少采集三轮，并保持架构、磁盘、QEMU、容器、CPU 集合、窗口和 workload metadata
+一致。比较脚本会检查一致性、组内变异系数和边界误差：
+
+```bash
+scripts/buildstorm-profile-compare.sh \
+  /tmp/baseline-1/summary.json \
+  /tmp/baseline-2/summary.json \
+  /tmp/baseline-3/summary.json -- \
+  /tmp/candidate-1/summary.json \
+  /tmp/candidate-2/summary.json \
+  /tmp/candidate-3/summary.json
+```
+
+验收一项性能修改时，应同时满足：完整构建成功、正确性测试通过、目标机制计数下降、端到端
+耗时没有超过噪声范围的回退。这样可以区分真实优化、宿主性能波动和 profiling 本身的扰动。
+
+## 8. 总结
+
+BuildStorm 的主要问题不是某一条系统调用缺失，而是成熟工具链把等待、缺页、对象分配、
+多核调度和文件读取中的细粒度重复成本同时放大。MyGO 的优化因此没有集中在单个“特殊
+BuildStorm 快路径”，而是把这些通用机制改为事件驱动、范围批量、per-CPU 缓存、定向失效
+和带代际的局部缓存。
+
+最终结果表明，两种架构都能完成完整 Rust 构建，并在相同架构的前后对比中获得 15% 以上
+的端到端加速。更重要的是，这些改动保留了 POSIX 等待、虚拟内存一致性、文件系统校验和
+ELM 生命周期语义，因此收益能够继续服务于 CAgent、编译器和其他真实用户态负载。

@@ -290,7 +290,7 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                 principal,
                 kind,
                 call_payload(input, header),
-                sched::now_ns_public(),
+                sched::now_ns_direct(),
             );
             return finish_unlocked_call(kind, authorization, response);
         }
@@ -698,7 +698,7 @@ fn dispatch_mgr_call_on_core_unchecked(
             else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
-            let response = core.submit_provider_call(request, sched::now_ns_public());
+            let response = core.submit_provider_call(request, sched::now_ns_direct());
             let should_wake = response.status == ELM_MGR_STATUS_OK;
             let out = response_with_plain_payload(&response);
             if should_wake {
@@ -711,7 +711,7 @@ fn dispatch_mgr_call_on_core_unchecked(
             else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
-            let response = core.poll_provider_reply(request, sched::now_ns_public());
+            let response = core.poll_provider_reply(request, sched::now_ns_direct());
             response_with_plain_payload(&response)
         }
         ElmMgrCallKind::CancelProviderCall => {
@@ -719,14 +719,14 @@ fn dispatch_mgr_call_on_core_unchecked(
             else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
-            let response = core.cancel_provider_call(request, sched::now_ns_public());
+            let response = core.cancel_provider_call(request, sched::now_ns_direct());
             response_with_plain_payload(&response)
         }
         ElmMgrCallKind::QueryProviderQueue => {
             if !payload_is_empty(header) {
                 return response_only(ElmMgrResponseHeader::invalid());
             }
-            let payload = core.provider_queue_bytes(sched::now_ns_public());
+            let payload = core.provider_queue_bytes(sched::now_ns_direct());
             response_with_payload(payload)
         }
         ElmMgrCallKind::QueryProviderStats => {
@@ -849,7 +849,7 @@ fn dispatch_mgr_call_on_core_unchecked(
             principal,
             kind,
             call_payload(input, header),
-            sched::now_ns_public(),
+            sched::now_ns_direct(),
         ),
     }
 }
@@ -1371,7 +1371,7 @@ fn load_projection_image(
         let reference = read_image_session_reference(provider_payload)
             .ok_or(elm_model::ELM_MGR_STATUS_INVALID)?;
         let reader =
-            source::consume_image_session(principal, reference.session_id, sched::now_ns_public())?;
+            source::consume_image_session(principal, reference.session_id, sched::now_ns_direct())?;
         source::project_ebi_image(request.provider_id, &reader, arch)
             .map_err(|_| elm_model::ELM_MGR_STATUS_INVALID)
     } else {

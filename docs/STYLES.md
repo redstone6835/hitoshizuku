@@ -273,7 +273,7 @@ let hz = if cc_mul == 0 || cc_div == 0 {
 
 ```rust
 // 短结构体：单行
-self.managed_growth_order.store(config.order, Ordering::Release);
+self.active.store(true, Ordering::Release);
 
 // 长结构体：每行一个字段
 AllocStats {
@@ -298,13 +298,12 @@ AllocStats {
 pub fn free_physical(&self, allocation: PhysicalAllocation) -> bool
 
 // 长参数：每行一个
-pub fn init_managed(
+pub fn alloc_kernel_backed_range(
     &self,
     order: usize,
-    mode: GcMode,
-    free_callback: fn(ptr: usize, size: usize),
-    timestamp_ns: Option<fn() -> u64>,
-) -> Result<BackedRange, InitError> {
+    phys: &Mutex<BuddyAllocator>,
+    page_policy: PagePolicy,
+) -> Result<BackedRange, AddressSpaceError> {
 ```
 
 ### 3.6 trait 定义

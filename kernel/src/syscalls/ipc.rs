@@ -330,7 +330,7 @@ fn sys_semop_common(
         if sched::operation::has_interrupting_signal(&task) {
             return Err(Errno::EINTR);
         }
-        if deadline.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
+        if deadline.is_some_and(|deadline| sched::now_ns_direct() >= deadline) {
             return Err(Errno::EAGAIN);
         }
 
@@ -364,17 +364,17 @@ fn sys_semop_common(
             finish_sem_wait(&set, &entry, &task, deadline_armed);
             return Err(Errno::EINTR);
         }
-        if deadline.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
+        if deadline.is_some_and(|deadline| sched::now_ns_direct() >= deadline) {
             finish_sem_wait(&set, &entry, &task, deadline_armed);
             return Err(Errno::EAGAIN);
         }
 
-        sched::schedule_once(sched::now_ns_public());
+        sched::schedule_once(sched::now_ns_direct());
         finish_sem_wait(&set, &entry, &task, deadline_armed);
         if sched::operation::has_interrupting_signal(&task) {
             return Err(Errno::EINTR);
         }
-        if deadline.is_some_and(|deadline| sched::now_ns_public() >= deadline) {
+        if deadline.is_some_and(|deadline| sched::now_ns_direct() >= deadline) {
             return Err(Errno::EAGAIN);
         }
     }
@@ -429,7 +429,7 @@ fn read_sem_deadline(user: usize) -> Result<Option<u64>, Errno> {
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(nanoseconds as u64))
         .ok_or(Errno::EINVAL)?;
-    Ok(Some(sched::now_ns_public().saturating_add(duration)))
+    Ok(Some(sched::now_ns_direct().saturating_add(duration)))
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {

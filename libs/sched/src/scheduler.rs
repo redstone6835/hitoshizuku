@@ -18,6 +18,8 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
@@ -67,7 +69,7 @@ impl RunqueueLoadSnapshot {
         Self { loads }
     }
 
-    pub(crate) fn load_of(self, cpu: CpuId) -> usize {
+    pub(crate) fn load_of(&self, cpu: CpuId) -> usize {
         self.loads[cpu.get()]
     }
 
@@ -95,7 +97,7 @@ impl RunqueueClassLoadSnapshot {
         Self { loads }
     }
 
-    pub(crate) fn load_of(self, cpu: CpuId) -> RunqueueClassLoad {
+    pub(crate) fn load_of(&self, cpu: CpuId) -> RunqueueClassLoad {
         self.loads[cpu.get()]
     }
 
@@ -176,6 +178,20 @@ struct RealtimeItimer {
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static HAS_REALTIME_ITIMERS: AtomicBool = AtomicBool::new(false);
+static DEADLINE_STATE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static DEADLINE_CACHE_GENERATION: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static DEADLINE_CACHE_VALUE: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static DEADLINE_CACHE_PRESENT: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+static PROGRAMMED_DEADLINE_VALUE: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
+static PROGRAMMED_DEADLINE_PRESENT: [AtomicBool; NR_CPUS] =
+    [const { AtomicBool::new(false) }; NR_CPUS];
+static PROGRAMMED_DEADLINE_VALID: [AtomicBool; NR_CPUS] =
+    [const { AtomicBool::new(false) }; NR_CPUS];
+
+#[inline]
+fn invalidate_deadline_cache() {
+    DEADLINE_STATE_GENERATION.fetch_add(1, Ordering::Release);
+}
 static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 // 跨多个 runqueue 采样时统一取得这把锁，保证所有采样者以同一顺序观察
 // CPU 队列。单个 runqueue 的调度操作不取得它，避免把普通切换路径串行化。
@@ -237,6 +253,8 @@ static SCHED_RR_TIMESLICE_MS: AtomicI32 =
 
 /// init 任务全局锚点。槽位永久持有一个 Arc 强引用，读取路径无需加锁。
 static INIT_TASK: AtomicPtr<Task> = AtomicPtr::new(core::ptr::null_mut());
+/// init 的稳定进程身份；非 leader exec 后通过线程组 leader 动态解析。
+static INIT_THREAD_GROUP: AtomicPtr<ThreadGroup> = AtomicPtr::new(core::ptr::null_mut());
 /// 根 PID namespace。所有任务在分配 pid 时至少在该 ns 中登记一次。
 static ROOT_PID_NS: AtomicPtr<PidNamespace> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_READY: AtomicBool = AtomicBool::new(false);
@@ -258,7 +276,16 @@ fn cpu() -> usize {
 }
 
 fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
-    SCHEDULER.cpu_or_boot(cpu_id).publish_current(task);
+    debug_assert_eq!(cpu_id, cpu(), "publishing current task for a remote CPU");
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let task_ptr = cpu_state.publish_current(task) as usize;
+    let cpu_work_ptr = cpu_state.user_return_work_ptr() as usize;
+    if let Some(trap) = arch_hooks::trap() {
+        // Safety: publish_current 已经让 current/current_raw 持有 task，且该函数
+        // 只在正在完成切换的本 CPU 上发布架构本地指针。CpuSchedState 位于静态
+        // Scheduler 中，其 user_return_work 地址在内核运行期保持稳定。
+        unsafe { (trap.set_current_task)(task_ptr, cpu_work_ptr) };
+    }
     #[cfg(feature = "performance-profile")]
     {
         let epoch = &CURRENT_TASK_EPOCH[cpu_id.min(NR_CPUS - 1)];
@@ -312,10 +339,16 @@ fn now_ns_internal() -> u64 {
     arch_hooks::time().map_or(0, |o| (o.now_ns)())
 }
 
+/// 内核内部时间戳入口，不经过 ELM 导出路由。
+#[inline]
+pub fn now_ns_direct() -> u64 {
+    now_ns_internal()
+}
+
 /// 对外导出的时间戳访问器。上层 idle / main loop 要喂 `schedule_once` 用。
 #[kernel_symbols::export(name = "sched.scheduler.now_ns_public", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn now_ns_public() -> u64 {
-    now_ns_internal()
+    now_ns_direct()
 }
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
@@ -398,12 +431,23 @@ pub fn init() -> Arc<Task> {
 
     // 7) 发布全局锚点。AtomicPtr 持有的强引用与内核同寿命，不参与常规回收。
     let init_ptr = Arc::into_raw(Arc::clone(&init_task)).cast_mut();
+    let init_group_ptr = Arc::into_raw(Arc::clone(&tgroup)).cast_mut();
     let root_ptr = Arc::into_raw(Arc::clone(&root_ns)).cast_mut();
     assert!(
         INIT_TASK
             .compare_exchange(
                 core::ptr::null_mut(),
                 init_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    );
+    assert!(
+        INIT_THREAD_GROUP
+            .compare_exchange(
+                core::ptr::null_mut(),
+                init_group_ptr,
                 Ordering::Release,
                 Ordering::Relaxed,
             )
@@ -443,7 +487,19 @@ pub fn init_task() -> Arc<Task> {
         INIT_READY.load(Ordering::Acquire),
         "[sched] init_task() called before sched::init()"
     );
-    clone_global_arc(&INIT_TASK, "[sched] INIT_TASK flag set but slot empty")
+    let group = clone_global_arc(
+        &INIT_THREAD_GROUP,
+        "[sched] INIT_THREAD_GROUP flag set but slot empty",
+    );
+    group
+        .leader()
+        .or_else(|| {
+            Some(clone_global_arc(
+                &INIT_TASK,
+                "[sched] INIT_TASK flag set but slot empty",
+            ))
+        })
+        .expect("[sched] init thread group leader missing")
 }
 
 /// 当前 CPU 的 runqueue。
@@ -489,13 +545,19 @@ pub fn pid_count() -> usize {
 ///
 /// [`init`] 之后，在 CPU 0 上必然非空。AP 启动路径落地前，其它 CPU 调用此
 /// 函数会 panic（目前不会发生，因为只有 CPU 0 跑代码）。
-#[kernel_symbols::export(name = "sched.scheduler.current_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
-pub fn current_task() -> Arc<Task> {
+#[inline]
+pub fn current_task_direct() -> Arc<Task> {
     let id = cpu();
     SCHEDULER
         .cpu_or_boot(id)
         .current()
         .expect("[sched] current_task called before sched::init() on this CPU")
+}
+
+/// ELM 模块使用的当前任务导出入口。
+#[kernel_symbols::export(name = "sched.scheduler.current_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn current_task() -> Arc<Task> {
+    current_task_direct()
 }
 
 /// 尝试借用当前 CPU 上正在执行的任务。
@@ -521,11 +583,79 @@ pub fn current_task_ref() -> &'static Task {
     })
 }
 
+/// 当前执行栈对调度器 current 槽中 `Arc<Task>` 的非拥有型视图。
+///
+/// 这等价于 Linux/C 热路径中的 borrowed `current`：构造和析构都不修改强引用
+/// 计数。句柄可以随所属内核栈整体阻塞、迁移和恢复，但不可异步移交给另一执行
+/// 栈或被其它 CPU 并发访问；若对象需要进入等待队列、异步工作或其它拥有型容器，
+/// 调用方必须通过 [`BorrowedCurrentTask::to_arc`] 显式提升。持有借用期间禁止对
+/// 该 Task 使用 `Arc::get_mut/make_mut/try_unwrap/into_inner` 等唯一所有权 API。
+pub struct BorrowedCurrentTask {
+    task: ManuallyDrop<Arc<Task>>,
+    _not_send_or_sync: PhantomData<*mut ()>,
+}
+
+impl BorrowedCurrentTask {
+    /// 从调度器已经持有强引用的 current 裸指针创建借用句柄。
+    ///
+    /// # Safety
+    /// - `ptr` 必须由本 CPU current 槽中的 `Arc::into_raw` 指针镜像得到；
+    /// - 当前内核执行栈结束前，调度器必须持续保证该任务至少有一份强引用；
+    /// - 返回值不得异步移交给另一执行栈或保存到并发上下文。
+    #[inline(always)]
+    pub unsafe fn from_current_raw(ptr: *const Task) -> Self {
+        debug_assert!(!ptr.is_null(), "[sched] borrowed current pointer is null");
+        Self {
+            // Safety: 调用方保证 ptr 来自 current 槽持有的 Arc。ManuallyDrop
+            // 只构造 Arc 的借用视图，绝不会消费该槽拥有的强引用。
+            task: ManuallyDrop::new(unsafe { Arc::from_raw(ptr) }),
+            _not_send_or_sync: PhantomData,
+        }
+    }
+
+    /// 以现有 syscall/调度接口使用的 `&Arc<Task>` 形式借用 current。
+    #[inline(always)]
+    pub fn as_arc(&self) -> &Arc<Task> {
+        &self.task
+    }
+
+    /// 只有跨当前同步执行边界时才取得一份真正拥有的强引用。
+    #[inline]
+    pub fn to_arc(&self) -> Arc<Task> {
+        Arc::clone(self.as_arc())
+    }
+}
+
+impl core::ops::Deref for BorrowedCurrentTask {
+    type Target = Task;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.as_arc()
+    }
+}
+
+/// 通过通用 per-CPU current 槽借用当前任务。
+#[inline]
+pub fn borrow_current_task_internal() -> BorrowedCurrentTask {
+    let id = cpu();
+    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
+    // Safety: current_raw 指向槽位持有的 Arc；句柄不可跨 CPU，当前执行栈在
+    // 调度切走期间本身也持有任务生命周期，恢复后仍回到同一任务。
+    unsafe { BorrowedCurrentTask::from_current_raw(ptr) }
+}
+
 /// 当前 CPU 上正在执行的任务句柄，热路径版本。
 ///
 /// 与 [`current_task`] 语义相同，但不进入 owning current 锁。
 #[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_fast() -> Arc<Task> {
+    current_task_fast_internal()
+}
+
+/// 内核常驻代码使用的 current 快入口，不经过 ELM 导出包装。
+#[inline]
+pub fn current_task_fast_internal() -> Arc<Task> {
     let id = cpu();
     let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
     if ptr.is_null() {
@@ -537,6 +667,12 @@ pub fn current_task_fast() -> Arc<Task> {
         Arc::increment_strong_count(ptr);
         Arc::from_raw(ptr)
     }
+}
+
+/// 兼容现有内核直调入口。
+#[inline]
+pub fn current_task_fast_direct() -> Arc<Task> {
+    current_task_fast_internal()
 }
 
 /// 当前 CPU task 的根 namespace tid；启动早期没有 current 时返回 0。
@@ -669,10 +805,22 @@ pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
     SCHEDULER.cpu(cpu_id)?.idle()
 }
 
-/// 是否已完成 init（避免有人在早期路径误调 current_task）。
+/// ELM 模块使用的调度器就绪状态导出入口。
 #[kernel_symbols::export(name = "sched.scheduler.is_ready", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_ready() -> bool {
+    is_ready_internal()
+}
+
+/// 内核常驻代码使用的初始化状态快入口，不经过 ELM 导出包装。
+#[inline]
+pub fn is_ready_internal() -> bool {
     INIT_READY.load(Ordering::Acquire)
+}
+
+/// 兼容现有内核直调入口。
+#[inline]
+pub fn is_ready_direct() -> bool {
+    is_ready_internal()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.online_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
@@ -953,6 +1101,7 @@ pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
     let _ = SCHEDULER.mark_cpu_online(cpu);
+    PROGRAMMED_DEADLINE_VALID[cpu_id.min(NR_CPUS - 1)].store(false, Ordering::Release);
     Ok(())
 }
 
@@ -968,6 +1117,7 @@ pub fn activate_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     if !SCHEDULER.activate_cpu(cpu) {
         return Err(errno::Errno::EINVAL);
     }
+    PROGRAMMED_DEADLINE_VALID[cpu_id.min(NR_CPUS - 1)].store(false, Ordering::Release);
     Ok(())
 }
 
@@ -991,6 +1141,7 @@ fn register_cpu_locked(cpu_id: usize) -> Result<(), errno::Errno> {
         return Err(errno::Errno::EINVAL);
     };
     let _ = SCHEDULER.mark_cpu_online(cpu);
+    PROGRAMMED_DEADLINE_VALID[cpu_id].store(false, Ordering::Release);
     if !SCHEDULER.activate_cpu(cpu) {
         return Err(errno::Errno::EINVAL);
     }
@@ -1258,7 +1409,7 @@ fn restore_unmoved_tasks(
 /// AP 完成 per-CPU 栈、trap、页表和本地数据初始化后调用。
 /// 本 CPU idle task，最后进入 [`cpu_start_scheduling`]。
 pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Errno> {
-    if CpuId::new(cpu_id).is_none() {
+    if CpuId::new(cpu_id).is_none() || cpu_id != cpu() {
         return Err(errno::Errno::EINVAL);
     }
     mark_cpu_online(cpu_id)?;
@@ -1284,11 +1435,44 @@ pub fn needs_resched(cpu_id: usize) -> bool {
         .is_some_and(|cpu_state| cpu_state.needs_resched())
 }
 
+#[inline]
 pub fn needs_resched_current() -> bool {
     if !INIT_READY.load(Ordering::Acquire) {
         return false;
     }
     SCHEDULER.cpu_or_boot(cpu()).needs_resched()
+}
+
+/// RISC-V 返回用户态热路径对本 CPU 调度工作的无栅栏预检。
+///
+/// `cpu_id` 来自架构本地 HartLocal，非零结果只能用于决定进入慢路径；真正消费
+/// timer/handoff/resched 时仍使用原有 Acquire/RMW 接口。
+#[inline(always)]
+pub fn user_return_work_pending_on(cpu_id: usize) -> bool {
+    if cpu_id >= NR_CPUS {
+        return true;
+    }
+    SCHEDULER
+        .cpu_or_boot(cpu_id)
+        .user_return_work_pending_relaxed()
+}
+
+/// 清除并重建指定 CPU 的返回工作 hint。
+///
+/// AcqRel swap 与生产者的 Release fetch_or 配对。并发生产若发生在 swap 前，后续
+/// Acquire 权威复查可见；若发生在 swap 后，生产者留下的 true 不会被覆盖。
+pub fn refresh_user_return_work_on(cpu_id: usize) -> bool {
+    if cpu_id >= NR_CPUS {
+        return true;
+    }
+    let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
+    let _ = cpu_state.take_user_return_work();
+    let pending = DEFERRED_TIMER_TICK_NS[cpu_id].load(Ordering::Acquire) != 0
+        || cpu_state.user_return_work_authoritative();
+    if pending {
+        cpu_state.mark_user_return_work();
+    }
+    pending || cpu_state.user_return_work_pending_acquire()
 }
 
 #[kernel_symbols::export(name = "sched.scheduler.request_resched", contract = "kernel.sched.control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
@@ -1415,6 +1599,12 @@ pub fn defer_task_wake(task: &Arc<Task>) {
     request_resched(target);
 }
 
+/// 把 PI 有效属性更新推迟到安全调度边界，供不可分配的清理路径使用。
+pub fn defer_pi_effective_update(task: &Arc<Task>) {
+    task.request_deferred_pi_update();
+    defer_task_wake(task);
+}
+
 fn drain_deferred_task_wakes() {
     let mut raw = DEFERRED_TASK_WAKES[cpu()].swap(core::ptr::null_mut(), Ordering::AcqRel);
     while !raw.is_null() {
@@ -1423,6 +1613,9 @@ fn drain_deferred_task_wakes() {
         let task = unsafe { Arc::from_raw(raw) };
         raw = task.take_deferred_wake_next();
         task.finish_deferred_wake();
+        if let Some(attr) = task.take_deferred_pi_effective_attr() {
+            let _ = crate::operation::pi_apply_effective_attr(&task, attr);
+        }
         if task.arch_context().is_some()
             && matches!(
                 task.state(),
@@ -1488,8 +1681,8 @@ pub fn run_post_syscall_handoff_lazy() {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
-    drain_deferred_timer_tick();
     let cpu_id = cpu();
+    drain_deferred_timer_tick_on(cpu_id);
     if !SCHEDULER.cpu_or_boot(cpu_id).has_post_syscall_handoff() {
         return;
     }
@@ -1826,6 +2019,7 @@ fn register_sleep_deadline_on_cpu(task: &Arc<Task>, deadline_ns: u64, cpu_id: us
             });
         }
         HAS_TIMED_SLEEPERS.store(true, Ordering::Release);
+        invalidate_deadline_cache();
     }
     true
 }
@@ -1858,6 +2052,7 @@ pub fn cancel_sleep_deadline(task: &Arc<Task>) -> bool {
     };
     HAS_TIMED_SLEEPERS.store(nonempty, Ordering::Release);
     if changed {
+        invalidate_deadline_cache();
         reprogram_deadline_timer();
     }
     changed
@@ -1878,10 +2073,40 @@ pub fn register_deadline_observer(
     deadline_ns: u64,
     observer: Weak<dyn DeadlineObserver>,
 ) -> bool {
+    try_register_deadline_observer(registration, deadline_ns, observer)
+        .expect("deadline observer 分配失败")
+}
+
+pub fn try_register_deadline_observer(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> Result<bool, ()> {
     if now_ns_internal() >= deadline_ns {
-        return false;
+        return Ok(false);
     }
+    try_register_deadline_observer_deferred(registration, deadline_ns, observer)?;
+    Ok(true)
+}
+
+/// 注册一个允许已经到期的 deadline。调用方已同步发布首次过期事件时，用它
+/// 重装周期 observer，下一次 timer 边界会完成追赶而不会在调用路径自旋。
+pub fn register_deadline_observer_deferred(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) {
+    try_register_deadline_observer_deferred(registration, deadline_ns, observer)
+        .expect("deadline observer 分配失败");
+}
+
+pub fn try_register_deadline_observer_deferred(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> Result<(), ()> {
     let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.try_reserve(1).map_err(|_| ())?;
     observers.entries.push(DeadlineEntry {
         id: registration,
         deadline_ns,
@@ -1892,7 +2117,7 @@ pub fn register_deadline_observer(
         .entries
         .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
     HAS_DEADLINE_OBSERVERS.store(true, Ordering::Release);
-    true
+    Ok(())
 }
 
 /// 取消尚未到期的 observer 注册。
@@ -1954,7 +2179,11 @@ pub fn get_realtime_itimer(task: &Arc<Task>) -> RealtimeItimerSpec {
     let tg = task.thread_group();
     let now_ns = now_ns_internal();
     let mut timers = REALTIME_ITIMERS.lock();
+    let old_len = timers.len();
     timers.retain(|entry| entry.thread_group.upgrade().is_some());
+    if timers.len() != old_len {
+        invalidate_deadline_cache();
+    }
     timers
         .iter()
         .find_map(|entry| {
@@ -2009,18 +2238,23 @@ pub fn set_realtime_itimer(
             });
         }
         HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
+        invalidate_deadline_cache();
         old
     };
     reprogram_deadline_timer();
     old
 }
 
-fn earliest_deadline(cpu_id: usize) -> Option<u64> {
+fn earliest_state_deadline_uncached(cpu_id: usize) -> Option<u64> {
     let sleeper_deadline = HAS_TIMED_SLEEPERS
         .load(Ordering::Acquire)
         .then(|| {
             let mut sleepers = TIMED_SLEEPERS.lock();
+            let old_len = sleepers.len();
             sleepers.retain(|entry| entry.task.upgrade().is_some());
+            if sleepers.len() != old_len {
+                invalidate_deadline_cache();
+            }
             HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
             sleepers
                 .iter()
@@ -2033,7 +2267,11 @@ fn earliest_deadline(cpu_id: usize) -> Option<u64> {
         .load(Ordering::Acquire)
         .then(|| {
             let mut timers = REALTIME_ITIMERS.lock();
+            let old_len = timers.len();
             timers.retain(|entry| entry.thread_group.upgrade().is_some());
+            if timers.len() != old_len {
+                invalidate_deadline_cache();
+            }
             HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
             timers
                 .iter()
@@ -2042,11 +2280,42 @@ fn earliest_deadline(cpu_id: usize) -> Option<u64> {
                 .min()
         })
         .flatten();
+    [sleeper_deadline, itimer_deadline]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+fn cached_state_deadline(cpu_id: usize) -> Option<u64> {
+    loop {
+        let generation = DEADLINE_STATE_GENERATION.load(Ordering::Acquire);
+        if DEADLINE_CACHE_GENERATION[cpu_id].load(Ordering::Acquire) == generation {
+            return DEADLINE_CACHE_PRESENT[cpu_id]
+                .load(Ordering::Relaxed)
+                .then(|| DEADLINE_CACHE_VALUE[cpu_id].load(Ordering::Relaxed));
+        }
+
+        let deadline = earliest_state_deadline_uncached(cpu_id);
+        if DEADLINE_STATE_GENERATION.load(Ordering::Acquire) != generation {
+            continue;
+        }
+        if let Some(deadline) = deadline {
+            DEADLINE_CACHE_VALUE[cpu_id].store(deadline, Ordering::Relaxed);
+        }
+        DEADLINE_CACHE_PRESENT[cpu_id].store(deadline.is_some(), Ordering::Relaxed);
+        DEADLINE_CACHE_GENERATION[cpu_id].store(generation, Ordering::Release);
+        return deadline;
+    }
+}
+
+fn earliest_deadline(cpu_id: usize) -> Option<u64> {
+    let cpu_id = cpu_id.min(NR_CPUS - 1);
+    let state_deadline = cached_state_deadline(cpu_id);
     #[cfg(feature = "performance-profile")]
     let profile_deadline = profiling::next_sample_deadline_ns(cpu_id, now_ns_internal());
     #[cfg(not(feature = "performance-profile"))]
     let profile_deadline = None;
-    [sleeper_deadline, itimer_deadline, profile_deadline]
+    [state_deadline, profile_deadline]
         .into_iter()
         .flatten()
         .min()
@@ -2062,15 +2331,42 @@ pub(crate) fn earliest_deadline_for_test(cpu_id: usize) -> Option<u64> {
 /// 原生扩展等不会进入睡眠队列的受限执行区间可借此复用同一架构定时器契约。
 /// `None` 仅撤销调用方的临时约束，不会覆盖已经登记的睡眠或实时定时器。
 pub fn reprogram_current_deadline(external_deadline: Option<u64>) {
-    let scheduler_deadline = earliest_deadline(cpu());
+    let cpu_id = cpu();
+    let scheduler_deadline = earliest_deadline(cpu_id);
     let deadline = match (scheduler_deadline, external_deadline) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
         (None, None) => None,
     };
+    if PROGRAMMED_DEADLINE_VALID[cpu_id].load(Ordering::Acquire)
+        && PROGRAMMED_DEADLINE_PRESENT[cpu_id].load(Ordering::Relaxed) == deadline.is_some()
+        && deadline
+            .is_none_or(|value| PROGRAMMED_DEADLINE_VALUE[cpu_id].load(Ordering::Relaxed) == value)
+    {
+        return;
+    }
     if let Some(ops) = arch_hooks::deadline_timer() {
         (ops.reprogram)(deadline);
+        if let Some(value) = deadline {
+            PROGRAMMED_DEADLINE_VALUE[cpu_id].store(value, Ordering::Relaxed);
+        }
+        PROGRAMMED_DEADLINE_PRESENT[cpu_id].store(deadline.is_some(), Ordering::Relaxed);
+        PROGRAMMED_DEADLINE_VALID[cpu_id].store(true, Ordering::Release);
     }
+}
+
+/// 标记当前 CPU 的 one-shot 定时器已经触发。
+///
+/// 架构中断入口必须在重装常规 tick 前调用。后续即使最早软件截止时间没有变化，
+/// 调度器也会重新写入硬件，不能复用已经被消费的编程状态。
+#[inline]
+pub fn deadline_timer_fired() {
+    PROGRAMMED_DEADLINE_VALID[cpu()].store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn timer_fired_for_test() {
+    deadline_timer_fired();
 }
 
 fn reprogram_deadline_timer() {
@@ -2096,33 +2392,47 @@ fn migrate_deadline_owners(source_cpu: usize, target_cpu: usize) {
             entry.cpu_id = target_cpu;
         }
     }
+    invalidate_deadline_cache();
 }
 
-fn take_expired_sleeper(now_ns: u64, cpu_id: usize) -> Option<Arc<Task>> {
+fn take_expired_sleepers(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
     if !HAS_TIMED_SLEEPERS.load(Ordering::Acquire) {
-        return None;
+        return Vec::new();
     }
+    let mut expired = Vec::new();
     let mut sleepers = TIMED_SLEEPERS.lock();
     let mut index = 0;
+    let mut changed = false;
     while index < sleepers.len() {
         let Some(task) = sleepers[index].task.upgrade() else {
             sleepers.swap_remove(index);
+            changed = true;
             continue;
         };
         if sleepers[index].cpu_id == cpu_id && sleepers[index].deadline_ns <= now_ns {
             sleepers.swap_remove(index);
-            HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
-            return Some(task);
+            expired.push(task);
+            changed = true;
+            continue;
         }
         index += 1;
     }
     HAS_TIMED_SLEEPERS.store(!sleepers.is_empty(), Ordering::Release);
-    None
+    drop(sleepers);
+    if changed {
+        invalidate_deadline_cache();
+    }
+    expired
+}
+
+#[cfg(test)]
+pub(crate) fn take_expired_sleepers_for_test(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
+    take_expired_sleepers(now_ns, cpu_id)
 }
 
 fn wake_expired_sleepers(now_ns: u64, cpu_id: usize) -> bool {
     let mut woke = false;
-    while let Some(task) = take_expired_sleeper(now_ns, cpu_id) {
+    for task in take_expired_sleepers(now_ns, cpu_id) {
         if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
             task.mark_profile_woken(now_ns);
             enqueue_task_preferred(task, now_ns);
@@ -2140,9 +2450,11 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
         let mut timers = REALTIME_ITIMERS.lock();
         let mut expired = Vec::new();
         let mut idx = 0;
+        let mut changed = false;
         while idx < timers.len() {
             let Some(tg) = timers[idx].thread_group.upgrade() else {
                 timers.swap_remove(idx);
+                changed = true;
                 continue;
             };
             if timers[idx].cpu_id != cpu_id || timers[idx].deadline_ns > now_ns {
@@ -2154,6 +2466,7 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
             let interval_ns = timers[idx].interval_ns;
             if interval_ns == 0 {
                 timers.swap_remove(idx);
+                changed = true;
                 continue;
             }
 
@@ -2166,9 +2479,13 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
                 next_deadline = advanced;
             }
             timers[idx].deadline_ns = next_deadline;
+            changed = true;
             idx += 1;
         }
         HAS_REALTIME_ITIMERS.store(!timers.is_empty(), Ordering::Release);
+        if changed {
+            invalidate_deadline_cache();
+        }
         expired
     };
 
@@ -2188,15 +2505,7 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
         sender_uid: Uid::ROOT,
         raw: None,
     };
-    tg.shared_signal().deliver(info);
-    for task in tg.snapshot() {
-        if !task.signal.blocked_snapshot().has(SignalNumber::SIGALRM)
-            || task.signal.sigtimedwait_wants(SignalNumber::SIGALRM)
-        {
-            signal_wakeup(&task, &info);
-            break;
-        }
-    }
+    deliver_shared_signal_to_group(tg, info);
 }
 
 fn migration_context(
@@ -2397,21 +2706,17 @@ pub fn balance_once(cpu_id: usize) -> bool {
 
     // 便宜的前置检查：本 CPU 已经有活干就没必要偷。
     //
-    // 下面的 domain stats 刷新 + 两次全 CPU 负载快照（其中一次还要取全局
-    // RUNQUEUE_SNAPSHOT_LOCK）是这个函数的绝大部分开销。实测在 BuildStorm
-    // 1200 s 窗口里，balance_once + update_domain_stats 合计吃掉约 9% 的内核
-    // 指令，其中大多数调用最后什么都没偷到——因为本核当时并不空闲。
-    // 先看一眼本地 runqueue 深度，能把绝大部分无收益的全局扫描挡在门外。
+    // 下面的亲和性敏感全 CPU 负载快照需要取全局 RUNQUEUE_SNAPSHOT_LOCK，是
+    // 这个函数的主要开销。域统计只供诊断查询使用，不能让每次迁移尝试都
+    // 重复构建一份不会参与本次决策的聚合统计。
+    // 先计算本地 runqueue 深度，能把绝大部分无收益的全局扫描挡在门外。
     if SCHEDULER.cpu_or_boot(cpu_id).runqueue().nr_running() > 1 {
         return false;
     }
 
     let topology_snapshot = SCHEDULER.topology_snapshot();
-    let topology = topology_snapshot.topology;
+    let topology = &topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
-    let domain_loads = collect_class_load_snapshot_for(&SCHEDULER, active);
-    SCHEDULER.update_domain_stats(topology_snapshot, domain_loads.loads());
-
     let load_snapshot = {
         let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
         RunqueueClassLoadSnapshot::collect(active, |cpu| {
@@ -2505,7 +2810,7 @@ pub(crate) fn requeue_balance_task_on(
 }
 
 pub(crate) fn select_balance_source_for_class<F>(
-    topology: SchedTopology,
+    topology: &SchedTopology,
     local_cpu: CpuId,
     active: CpuMask,
     class: SchedClass,
@@ -2614,6 +2919,28 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
 
 // ── 信号唤醒 ─────────────────────────────────────────────────────────────────
 
+/// 向线程组发布共享信号，并为所有用户成员设置任务级返回工作 hint。
+///
+/// 共享 pending 最终只会被一个成员消费。发布与成员修改 blocked mask 没有共同
+/// 锁，因此不能用发布时的 mask 快照筛掉 hint；给全部用户成员置位可封闭并发
+/// unblock 窗口。硬件唤醒仍只发送给第一个当前可投递候选，避免 IPI 风暴。
+pub(crate) fn deliver_shared_signal_to_group(tg: &Arc<ThreadGroup>, info: SigInfo) {
+    tg.shared_signal().deliver(info);
+    let mut woke = false;
+    for task in tg.snapshot() {
+        if task.is_kernel_task() {
+            continue;
+        }
+        task.mark_user_return_work();
+        let eligible = !task.signal.blocked_snapshot().has(info.sig)
+            || task.signal.sigtimedwait_wants(info.sig);
+        if !woke && eligible {
+            signal_wakeup(&task, &info);
+            woke = true;
+        }
+    }
+}
+
 /// 把一条信号投给 `target`，并在可行时把它从 Sleeping 拉回 Runnable。
 ///
 /// 调用方已经把 `info` 放进了 target 的 per-task 或共享 pending 队列，这里
@@ -2629,6 +2956,7 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.sched.on_rq(),
         target.running_cpu(),
     );
+    target.mark_user_return_work();
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;
     }
@@ -2645,6 +2973,14 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.mark_profile_woken(now_ns_internal());
         enqueue_task(Arc::clone(target), now_ns_internal());
     }
+    if let Some(target_cpu) = target.running_cpu() {
+        let target_cpu = target_cpu.min(NR_CPUS - 1);
+        if target_cpu != cpu() {
+            // signal 可能在目标返回用户态的最后一次 flags 读取之后发布；与 Linux
+            // 的 task-work kick 相同，用 resched IPI 封闭这个最终检查窗口。
+            request_resched(target_cpu);
+        }
+    }
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[sched][signal] wake-leave target={:?} signal={:?} state={:?} on_rq={} running_cpu={:?}",
@@ -2654,7 +2990,7 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
         target.sched.on_rq(),
         target.running_cpu(),
     );
-    // Running / Runnable：pending 位已经设好；下一轮 schedule 自然会检查。
+    // Running：远端执行者已收到 resched IPI；Runnable 会在恢复内核栈后检查。
     // Stopped：只有 SIGCONT 可以恢复；其它信号保持 pending。
     // Uninterruptible / Zombie / Dead：什么都不做。
 }
@@ -2666,6 +3002,24 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
 /// 到达安全边界。
 pub fn group_exit_wakeup(target: &Arc<Task>) {
     target.publish_group_exit_wakeup();
+    forced_exit_wakeup(target);
+}
+
+/// 唤醒被 exec 发起者要求自行退出的兄弟线程。
+pub fn exec_sibling_exit_wakeup(target: &Arc<Task>, preserve_leader_identity: bool) {
+    target.publish_exec_sibling_exit_wakeup(preserve_leader_identity);
+    forced_exit_wakeup(target);
+}
+
+/// 唤醒收到 Native 单线程终止请求的任务。目标在自己的安全边界完成退出，
+/// 发送者不会远程释放目标内核栈上的资源。
+pub fn native_thread_exit_wakeup(target: &Arc<Task>, code: i32) -> i32 {
+    let selected = target.publish_native_thread_exit_wakeup(code);
+    forced_exit_wakeup(target);
+    selected
+}
+
+fn forced_exit_wakeup(target: &Arc<Task>) {
     let resumed = target.resume_for_fatal_exit()
         || target.cas_state(TaskState::Sleeping, TaskState::Runnable)
         || target.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
@@ -2681,6 +3035,12 @@ pub fn group_exit_wakeup(target: &Arc<Task>) {
 pub(crate) fn mark_task_stopped(task: &Arc<Task>, sig: SignalNumber) -> bool {
     let removed = dequeue_for_state_change(task, now_ns_internal());
     let stopped = task.mark_stopped(sig);
+    if stopped
+        && let Some(target_cpu) = task.running_cpu()
+        && target_cpu != cpu()
+    {
+        request_resched(target_cpu.min(NR_CPUS - 1));
+    }
     log::debug!(
         "[sched][signal] stop pid={:?} sig={} on_rq={} state={:?}",
         task.pid_root(),
@@ -2727,6 +3087,9 @@ pub fn schedule_once(now_ns: u64) {
 }
 
 fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
+    // 保护器保存在当前任务自己的调用栈上。任务被切回（即使迁移到另一 CPU）后，
+    // 会恢复它进入本次调度前的中断状态，而不是继承此前运行任务留下的硬件状态。
+    let _local_interrupt_guard = arch_hooks::disable_local_interrupts();
     #[cfg(feature = "performance-profile")]
     let schedule_start = profiling::read_counter();
     // LoongArch syscall 路径可能在本地中断暂时关闭时主动调度。即使本次仍选回
@@ -2768,9 +3131,11 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
     // 恢复阻塞调用栈并返回 syscall 安全边界。
     let _ = prev.abort_group_exit_sleep();
 
-    // 在调度边界消费当前任务的 pending signal。默认 Term/Core 会把 prev 标成
-    // Zombie；后续 pick_next 看到它不再 runnable，就不会放回 runqueue。
-    if prev.state() == TaskState::Running
+    // Tomori 在调度边界消费当前任务的 pending signal。Native 必须保留
+    // 到调用或用户返回的安全边界，避免在深层调度栈中执行外部控制。
+    // 默认 Term/Core 会把 prev 标成 Zombie；后续 pick_next 不再将它放回 runqueue。
+    if prev.user_abi_kind() == crate::UserAbiKind::TomoriLinux
+        && prev.state() == TaskState::Running
         && (prev.signal.has_any_pending() || prev.shared_signal_pending_bits_quick() != 0)
     {
         let _ = crate::operation::deliver_pending_signals();
@@ -2943,6 +3308,12 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
     // 9. 切换。
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
     let prev_on_cpu = prev.on_cpu_slot();
+    #[cfg(feature = "syscall-model-markers")]
+    profiling::syscall_model_task_switch(
+        prev.profile_session_id(),
+        prev.syscall_model_task_id(),
+        false,
+    );
     unsafe {
         if final_prev {
             drop(next);
@@ -2953,6 +3324,12 @@ fn schedule_once_inner(now_ns: u64, target: Option<&HandoffTarget>) {
             (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx, prev_on_cpu);
         }
     }
+    #[cfg(feature = "syscall-model-markers")]
+    profiling::syscall_model_task_switch(
+        prev.profile_session_id(),
+        prev.syscall_model_task_id(),
+        true,
+    );
     #[cfg(feature = "performance-profile")]
     {
         let started = CONTEXT_SWITCH_STARTED[cpu_id].swap(0, Ordering::AcqRel);
@@ -2990,13 +3367,20 @@ fn targeted_handoff_is_valid(target: &HandoffTarget, cpu_id: usize) -> bool {
 /// 记录一次发生在内核临界区中的 timer tick，等待下一处安全调度边界处理。
 pub fn defer_timer_tick(now_ns: u64) {
     if INIT_READY.load(Ordering::Acquire) {
-        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()], now_ns);
+        let cpu_id = cpu();
+        record_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id], now_ns);
+        SCHEDULER.cpu_or_boot(cpu_id).mark_user_return_work();
     }
 }
 
 /// 在不持有调度器内部锁的边界消费本 CPU 延迟的 timer tick。
 pub fn drain_deferred_timer_tick() {
-    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu()]);
+    drain_deferred_timer_tick_on(cpu());
+}
+
+#[inline]
+fn drain_deferred_timer_tick_on(cpu_id: usize) {
+    let now_ns = take_deferred_timer_tick(&DEFERRED_TIMER_TICK_NS[cpu_id]);
     if now_ns != 0 {
         let _ = on_timer_tick_inner(now_ns);
     }
@@ -3021,7 +3405,11 @@ pub(crate) fn record_deferred_timer_tick(slot: &AtomicU64, now_ns: u64) {
 }
 
 pub(crate) fn take_deferred_timer_tick(slot: &AtomicU64) -> u64 {
-    slot.swap(0, Ordering::AcqRel)
+    if slot.load(Ordering::Acquire) == 0 {
+        0
+    } else {
+        slot.swap(0, Ordering::AcqRel)
+    }
 }
 
 fn on_timer_tick_inner(now_ns: u64) -> bool {
@@ -3206,12 +3594,54 @@ pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
 fn service_idle_scheduler_requests(cpu_id: usize) {
     let cpu_state = SCHEDULER.cpu_or_boot(cpu_id);
     // idle 循环本身每轮都会执行一次 schedule_once，因此先消费通知位，
-    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。随后无条件尝试从
-    // 远端繁忙队列拉取一个任务：该入口只在硬件等待返回后执行一次，不会在
-    // 空闲循环中忙轮询；成功拉取的任务会被紧随其后的 schedule_once 选中。
+    // 防止已处理的请求让 idle_relax 永久跳过硬件等待。空闲核每次从硬件等待
+    // 返回后主动拉取一次；本地已经出现普通任务时直接交给 schedule_once。
     let _ = cpu_state.take_resched();
-    let _ = cpu_state.take_balance();
-    let _ = balance_once(cpu_id);
+    let balance_requested = cpu_state.take_balance();
+    let local_nr_running = cpu_state.runqueue().nr_running();
+    let now_ns = now_ns_internal();
+    let next = &NEXT_BALANCE_NS[cpu_id.min(NR_CPUS - 1)];
+    let _ = run_idle_balance_if_due(
+        local_nr_running,
+        balance_requested,
+        now_ns,
+        next,
+        cpu_id,
+        balance_once,
+    );
+}
+
+#[inline]
+fn run_idle_balance_if_due<F>(
+    local_nr_running: usize,
+    requested: bool,
+    now_ns: u64,
+    next_allowed: &AtomicU64,
+    cpu_id: usize,
+    balance: F,
+) -> bool
+where
+    F: FnOnce(usize) -> bool,
+{
+    if local_nr_running > 1 {
+        return false;
+    }
+
+    let next = now_ns.saturating_add(PERIODIC_BALANCE_INTERVAL_NS);
+    if requested {
+        next_allowed.store(next, Ordering::Relaxed);
+        return balance(cpu_id);
+    }
+
+    let previous = next_allowed.load(Ordering::Relaxed);
+    if now_ns < previous
+        || next_allowed
+            .compare_exchange(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return false;
+    }
+    balance(cpu_id)
 }
 
 // ── exit 辅助 ────────────────────────────────────────────────────────────────
@@ -3323,5 +3753,77 @@ mod deadline_observer_tests {
         assert_eq!(observer.0.load(Ordering::Acquire), 1);
         fire_expired_deadline_observers(deadline + 10);
         assert_eq!(observer.0.load(Ordering::Acquire), 2);
+    }
+
+    #[cfg(feature = "performance-profile")]
+    #[test]
+    fn profiling_deadline_refreshes_after_sampling_rate_change() {
+        let cpu_id = NR_CPUS - 1;
+        profiling::start();
+        profiling::set_sampling_enabled(true);
+        assert!(profiling::set_sample_hz(250));
+        invalidate_deadline_cache();
+
+        let first = earliest_deadline(cpu_id).expect("首次采样截止时间");
+        assert!(profiling::set_sample_hz(500));
+        let second = earliest_deadline(cpu_id).expect("更新后的采样截止时间");
+
+        profiling::set_sampling_enabled(false);
+        profiling::stop();
+        assert_ne!(first, second);
+        assert!(second < first);
+    }
+}
+
+#[cfg(test)]
+mod idle_balance_tests {
+    use super::{PERIODIC_BALANCE_INTERVAL_NS, run_idle_balance_if_due};
+    use core::cell::Cell;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn requested_idle_balance_runs_immediately() {
+        let calls = Cell::new(0usize);
+        let next = AtomicU64::new(1_000);
+        let run = |cpu_id| {
+            assert_eq!(cpu_id, 3);
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(run_idle_balance_if_due(1, true, 100, &next, 3, run));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            100 + PERIODIC_BALANCE_INTERVAL_NS
+        );
+    }
+
+    #[test]
+    fn idle_balance_without_request_is_rate_limited() {
+        let calls = Cell::new(0usize);
+        let next = AtomicU64::new(200);
+        let run = |_| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(!run_idle_balance_if_due(1, false, 199, &next, 3, run));
+        assert_eq!(calls.get(), 0);
+        assert!(run_idle_balance_if_due(1, false, 200, &next, 3, run));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_balance_skips_scan_when_local_queue_has_work() {
+        let calls = Cell::new(0usize);
+        let next = AtomicU64::new(0);
+        let run = |_| {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        assert!(!run_idle_balance_if_due(2, true, 0, &next, 3, run));
+        assert_eq!(calls.get(), 0);
     }
 }

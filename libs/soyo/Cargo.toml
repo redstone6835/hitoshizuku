@@ -1,0 +1,18 @@
+[package]
+name = "soyo"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[lib]
+test = true
+doctest = false
+bench = false
+
+[features]
+test-support = []
+
+[dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "zeroize"] }
+native-abi = { path = "../native-abi" }
+sha2 = { version = "0.10.9", default-features = false }

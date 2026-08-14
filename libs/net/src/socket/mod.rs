@@ -36,7 +36,7 @@ const MAX_UDP4_PAYLOAD: usize = 65_507;
 const MAX_UDP6_PAYLOAD: usize = 65_527;
 const TCP_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_BUFFER_HARD_LIMIT: usize = 1024 * 1024;
-const TCP_LOCAL_AUTOTUNE_LIMIT: usize = 16 * 1024 * 1024;
+const TCP_LOCAL_AUTOTUNE_LIMIT: usize = TCP_BUFFER_HARD_LIMIT;
 const TCP_LOCAL_READ_BATCH_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 const TCP_LOCAL_READ_BATCH_MIN_BYTES: usize = 1024 * 1024;
 const TCP_LOCAL_SHARED_READ_BATCH_BYTES: usize = 1024 * 1024;
@@ -4112,12 +4112,12 @@ impl SocketFacade {
                 }
                 break;
             }
-            let Some(lease) = self.take_stream_tx_direct_deferred(max_len) else {
+            let Some((lease, flush)) = self.take_stream_tx_direct_deferred(max_len) else {
                 break;
             };
             let lease_len = usize::from(lease.len);
             if peer
-                .push_stream_rx_lease(&lease, 0, lease_len, true)
+                .push_stream_rx_lease(&lease, 0, lease_len, flush)
                 .is_err()
             {
                 self.stream_tx.lock().rewind_unsent(lease_len);
@@ -4494,16 +4494,24 @@ impl SocketFacade {
         })
     }
 
-    fn take_stream_tx_direct_deferred(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
-        let (start, len) = self
-            .stream_tx
-            .lock()
-            .take_unsent_without_inflight(max_len)?;
-        Some(TcpTxLease {
-            facade: Arc::clone(self),
-            start,
-            len: len as u16,
-        })
+    fn take_stream_tx_direct_deferred(
+        self: &Arc<Self>,
+        max_len: usize,
+    ) -> Option<(TcpTxLease, bool)> {
+        let (start, len, flush) = {
+            let mut tx = self.stream_tx.lock();
+            let (start, len) = tx.take_unsent_without_inflight(max_len)?;
+            let flush = tx.bytes.len().saturating_sub(tx.sent) == 0;
+            (start, len, flush)
+        };
+        Some((
+            TcpTxLease {
+                facade: Arc::clone(self),
+                start,
+                len: len as u16,
+            },
+            flush,
+        ))
     }
 
     pub(crate) fn finish_stream_tx_batch(&self, bytes: usize) {
@@ -4741,13 +4749,11 @@ impl SocketFacade {
                 )
             }
         };
-        // PSH 是字节流的协议提示，不等价于 CPU 调度边界。阻塞的小消息接收者
-        // 立即交接；吞吐流则累计有界批次，避免每个 segment 都切换任务。
-        let handoff_ready = (was_empty && len <= TCP_LOCAL_IMMEDIATE_HANDOFF_BYTES)
+        // flush 标记发送批次尾部；在尾段到达前只发布 READABLE，不跨任务
+        // 交接，避免一次性 read 在本地 TCP 请求分段中途过早返回。
+        let handoff_ready = flush
             || buffered >= TCP_LOCAL_SHARED_READ_BATCH_BYTES
             || available < TCP_LOCAL_PRESSURE_BYTES;
-        #[cfg(not(feature = "performance-profile"))]
-        let _ = flush;
         #[cfg(feature = "performance-profile")]
         {
             profiling::observe(profiling::Metric::TcpLocalRxBufferedBytes, buffered as u64);
@@ -4843,22 +4849,20 @@ impl SocketFacade {
         profiling::observe(profiling::Metric::TcpBytesReceived, len as u64);
         if was_empty && len != 0 {
             self.set_ready(Readiness::READABLE);
-            if local {
-                let target = wake_one_local_socket_reader(&self.read_wait, self.id, handoff_ready);
-                if let Some(target) = target {
-                    if target.preferred_cpu() != sched::current_cpu_id() || handoff_ready {
-                        #[cfg(feature = "performance-profile")]
-                        profiling::observe(profiling::Metric::TcpLocalConsumerHandoffs, 1);
-                        sched::request_post_syscall_handoff_to(target);
-                    } else {
-                        *self.local_read_handoff.lock() = Some(target);
-                    }
-                }
-            } else {
-                wake_one_socket_reader(&self.read_wait, self.id);
+        }
+        if local {
+            if !handoff_ready {
+                return;
             }
-        } else if local && handoff_ready {
-            self.request_local_tcp_consumer_handoff();
+            if let Some(target) = wake_one_local_socket_reader(&self.read_wait, self.id, true) {
+                #[cfg(feature = "performance-profile")]
+                profiling::observe(profiling::Metric::TcpLocalConsumerHandoffs, 1);
+                sched::request_post_syscall_handoff_to(target);
+            } else {
+                self.request_local_tcp_consumer_handoff();
+            }
+        } else if was_empty && len != 0 {
+            wake_one_socket_reader(&self.read_wait, self.id);
         }
     }
 
@@ -6300,6 +6304,57 @@ mod tests {
         ))
     }
 
+    fn sleeping_task() -> Arc<sched::Task> {
+        let session = sched::Session::new();
+        let process_group = sched::ProcessGroup::new(&session);
+        session.register_group(&process_group);
+        sched::Task::new(
+            sched::SchedParams::default_fair(),
+            Weak::new(),
+            sched::ThreadGroup::new(),
+            process_group,
+        )
+    }
+
+    #[test]
+    fn local_stream_lease_handoff_waits_for_flush() {
+        let sender = stream_facade(2);
+        let receiver = stream_facade(3);
+        let mut payload = alloc::vec![0x31; 1024];
+        payload[512..].fill(0xa7);
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        let first = sender.take_stream_tx(512).unwrap();
+        let second = sender.take_stream_tx(512).unwrap();
+
+        let task = sleeping_task();
+        let entry = receiver
+            .read_wait
+            .prepare_to_wait(&task, TaskState::Sleeping);
+
+        receiver
+            .push_stream_rx_lease(&first, 0, 512, false)
+            .unwrap();
+
+        assert_eq!(task.state(), TaskState::Sleeping);
+        assert_eq!(receiver.read_wait.len_hint(), 1);
+        assert!(receiver.readiness().0.contains(Readiness::READABLE));
+
+        receiver
+            .push_stream_rx_lease(&second, 0, 512, true)
+            .unwrap();
+
+        assert_eq!(task.state(), TaskState::Runnable);
+        assert_eq!(receiver.read_wait.len_hint(), 0);
+        receiver.read_wait.finish_wait(&entry);
+
+        let mut output = alloc::vec![0; payload.len()];
+        assert_eq!(
+            receiver.recv_stream(&mut output, false, true, false, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(output, payload);
+    }
+
     fn install_test_local_tcp_direct_pair(
         sender: &Arc<SocketFacade>,
         receiver: &Arc<SocketFacade>,
@@ -6399,6 +6454,16 @@ mod tests {
     }
 
     #[test]
+    fn local_stream_autotune_stays_within_socket_hard_limit() {
+        let facade = stream_facade(65);
+        facade.prepare_local_stream_send();
+        assert_eq!(
+            facade.buffer_limits(),
+            (TCP_BUFFER_HARD_LIMIT, TCP_BUFFER_BYTES)
+        );
+    }
+
+    #[test]
     fn local_stream_window_updates_only_after_backpressure() {
         let sender = stream_facade(63);
         let receiver = stream_facade(64);
@@ -6471,6 +6536,43 @@ mod tests {
         let mut output = alloc::vec![0; payload.len()];
         assert_eq!(
             receiver.recv_stream(&mut output, false, false, true, true, None),
+            Ok(payload.len())
+        );
+        assert_eq!(output, payload);
+    }
+
+    #[test]
+    fn local_tcp_direct_multi_lease_wakes_only_for_final_lease() {
+        let sender = stream_facade(73);
+        let receiver = stream_facade(74);
+        sender.stack_generation.store(12, Ordering::Release);
+        receiver.stack_generation.store(12, Ordering::Release);
+        sender.mark_local_stream_tx_prepared();
+        install_test_local_tcp_direct_pair(&sender, &receiver);
+
+        let first_task = sleeping_task();
+        let first_entry = receiver
+            .read_wait
+            .prepare_to_wait(&first_task, TaskState::Sleeping);
+        let second_task = sleeping_task();
+        let second_entry = receiver
+            .read_wait
+            .prepare_to_wait(&second_task, TaskState::Sleeping);
+
+        let payload = alloc::vec![0x5cu8; u16::MAX as usize + 512];
+        assert_eq!(sender.test_push_stream_tx(&payload), payload.len());
+        assert_eq!(sender.try_deliver_local_tcp_direct(), payload.len());
+
+        let runnable = usize::from(first_task.state() == TaskState::Runnable)
+            + usize::from(second_task.state() == TaskState::Runnable);
+        assert_eq!(runnable, 1, "只有最终 lease 可以唤醒一个 reader");
+        assert_eq!(receiver.read_wait.len_hint(), 1);
+        receiver.read_wait.finish_wait(&first_entry);
+        receiver.read_wait.finish_wait(&second_entry);
+
+        let mut output = alloc::vec![0; payload.len()];
+        assert_eq!(
+            receiver.recv_stream(&mut output, false, true, false, true, None),
             Ok(payload.len())
         );
         assert_eq!(output, payload);

@@ -1,0 +1,29 @@
+{
+  "manifest_version": 1,
+  "abi_epoch": 1,
+  "entry": "_start",
+  "imports": [
+    { "operation": "process.exit", "required": true },
+    { "operation": "handle.close", "required": true },
+    { "operation": "stream.write", "required": true },
+    { "operation": "memory.allocate", "required": true },
+    { "operation": "image.create", "required": true },
+    { "operation": "component.load", "required": true },
+    { "operation": "component.activate", "required": true },
+    { "operation": "component.query", "required": true },
+    { "operation": "component.interface", "required": true },
+    { "operation": "component.unload", "required": true },
+    { "operation": "component.finish", "required": true },
+    { "operation": "component.wake", "required": true }
+  ],
+  "capabilities": [
+    { "requirement": "self_process", "rights": ["exit", "create", "load"], "required": true },
+    { "requirement": "current_address_space", "rights": ["allocate"], "required": true },
+    { "requirement": "stdout", "rights": ["write"], "required": true }
+  ],
+  "runtime": {
+    "stack_size": 65536,
+    "stack_guard_size": 4096,
+    "start_info_max_size": 4096
+  }
+}
