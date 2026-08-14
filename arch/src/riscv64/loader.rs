@@ -562,7 +562,7 @@ fn configure_early_console_from_dtb(dtb: &Fdt<'static>) {
     }
 }
 
-/// 解析 RISC-V DTB 的 timebase-frequency，并启动周期性 S-mode timer。
+/// 解析 RISC-V DTB 的 timebase-frequency，并配置周期性 S-mode timer。
 fn configure_timer_from_dtb(dtb: &Fdt<'_>) {
     let hz = dtb
         .root()
@@ -583,13 +583,25 @@ fn configure_timer_from_dtb(dtb: &Fdt<'_>) {
         .filter(|&hz| hz != 0)
         .unwrap_or_else(|| time::STABLE_TIMER_HZ.load(Ordering::Relaxed));
 
+    let timer_hz = dtb
+        .chosen_bootargs()
+        .ok()
+        .flatten()
+        .and_then(|bootargs| general::cmdline::Cmdline::new(bootargs.as_bytes()).find("timer_hz"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(time::DEFAULT_TIMER_HZ);
     time::set_stable_counter_hz(hz);
-    time::init_periodic_timer(time::DEFAULT_TIMER_HZ);
+    if timer_hz == 0 {
+        time::disable_periodic_timer();
+    } else {
+        time::init_periodic_timer(timer_hz);
+    }
     log::info!(
-        "[loader] timer configured: stable_hz={} tick_hz={} period_ticks={}",
+        "[loader] timer configured: stable_hz={} tick_hz={} period_ticks={} disabled={}",
         time::stable_counter_hz(),
         time::timer_hz(),
-        time::timer_period_ticks()
+        time::timer_period_ticks(),
+        timer_hz == 0
     );
 }
 

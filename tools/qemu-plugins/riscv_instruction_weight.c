@@ -44,6 +44,7 @@ static FILE *output;
 static char *output_path;
 static uint64_t start_pc;
 static uint64_t stop_pc;
+static uint64_t trap_entry_pc;
 static uint64_t user_min_pc;
 static uint64_t user_max_pc;
 static uint64_t window_generation;
@@ -53,6 +54,7 @@ static uint64_t window_start_thread_cpu_ns;
 static uint64_t window_start_monotonic_ns;
 static uint64_t window_translations;
 static uint64_t window_scoped_translations;
+static uint64_t window_guest_trap_entries;
 static uint64_t translations_while_active;
 static uint64_t start_events;
 static uint64_t stop_events;
@@ -239,6 +241,13 @@ static void count_instruction(unsigned int vcpu_index, void *userdata)
     ++descriptor->count;
 }
 
+static void count_guest_trap(unsigned int vcpu_index, void *userdata)
+{
+    (void)vcpu_index;
+    (void)userdata;
+    ++window_guest_trap_entries;
+}
+
 static void write_json_string(FILE *stream, const char *text)
 {
     fputc('"', stream);
@@ -289,6 +298,7 @@ static void start_window(unsigned int vcpu_index, void *userdata)
     window_active = true;
     window_translations = 0;
     window_scoped_translations = 0;
+    window_guest_trap_entries = 0;
     if (mode == MODE_VALIDATION) {
         ++window_generation;
         g_ptr_array_set_size(touched, 0);
@@ -297,9 +307,7 @@ static void start_window(unsigned int vcpu_index, void *userdata)
         clock_ns(CLOCK_MONOTONIC_RAW, &window_monotonic_timer_valid);
     window_start_thread_cpu_ns =
         clock_ns(CLOCK_THREAD_CPUTIME_ID, &window_thread_timer_valid);
-    if (mode == MODE_VALIDATION) {
-        qemu_plugin_u64_set(active_entry(), vcpu_index, 1);
-    }
+    qemu_plugin_u64_set(active_entry(), vcpu_index, 1);
 }
 
 static void stop_window(unsigned int vcpu_index, void *userdata)
@@ -310,9 +318,7 @@ static void stop_window(unsigned int vcpu_index, void *userdata)
         ++inactive_stop_events;
         return;
     }
-    if (mode == MODE_VALIDATION) {
-        qemu_plugin_u64_set(active_entry(), vcpu_index, 0);
-    }
+    qemu_plugin_u64_set(active_entry(), vcpu_index, 0);
     bool monotonic_valid;
     bool thread_valid;
     uint64_t stop_thread_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID, &thread_valid);
@@ -364,6 +370,8 @@ static void stop_window(unsigned int vcpu_index, void *userdata)
     } else {
         fputs("null", output);
     }
+    fprintf(output, ",\"guest_trap_entries_during_window\":%" PRIu64,
+            window_guest_trap_entries);
     if (mode == MODE_TIMING) {
         fputs(",\"counts_available\":false,\"instruction_count\":null,"
               "\"counts\":null}\n",
@@ -415,6 +423,11 @@ static void translate_block(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         qemu_plugin_register_vcpu_tb_exec_cb(tb, stop_window,
                                              QEMU_PLUGIN_CB_NO_REGS, NULL);
         return;
+    }
+    if (pc == trap_entry_pc) {
+        qemu_plugin_register_vcpu_tb_exec_cond_cb(
+            tb, count_guest_trap, QEMU_PLUGIN_CB_NO_REGS,
+            QEMU_PLUGIN_COND_NE, active_entry(), 0, NULL);
     }
     if (mode == MODE_TIMING) {
         return;
@@ -492,6 +505,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 {
     bool have_start = false;
     bool have_stop = false;
+    bool have_trap_entry = false;
     bool have_mode = false;
     bool have_user_min = false;
     bool have_user_max = false;
@@ -511,6 +525,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (strncmp(argv[index], "stop_pc=", 8) == 0 && !have_stop &&
                    parse_u64(argv[index] + 8, &stop_pc)) {
             have_stop = true;
+        } else if (strncmp(argv[index], "trap_entry_pc=", 14) == 0 &&
+                   !have_trap_entry &&
+                   parse_u64(argv[index] + 14, &trap_entry_pc)) {
+            have_trap_entry = true;
         } else if (strncmp(argv[index], "mode=", 5) == 0 && !have_mode &&
                    parse_mode(argv[index] + 5, &mode)) {
             have_mode = true;
@@ -533,9 +551,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
     }
     if (!output_path || !output_path[0] || !have_start || !have_stop ||
-        start_pc == stop_pc) {
+        !have_trap_entry || start_pc == stop_pc || trap_entry_pc == 0) {
         fprintf(stderr,
-                "riscv instruction weight: output and distinct start/stop PCs are required\n");
+                "riscv instruction weight: output, distinct start/stop PCs, and trap entry PC are required\n");
         release_resources();
         return 1;
     }
@@ -547,16 +565,16 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return 1;
     }
     have_user_range = have_user_min;
+    scoreboard = qemu_plugin_scoreboard_new(sizeof(struct vcpu_state));
     if (mode == MODE_VALIDATION) {
-        scoreboard = qemu_plugin_scoreboard_new(sizeof(struct vcpu_state));
         descriptor_by_encoding = g_hash_table_new(g_str_hash, g_str_equal);
         descriptors = g_ptr_array_new_with_free_func(free_descriptor);
         touched = g_ptr_array_new();
     }
     output = fopen(output_path, "w");
-    if (!output ||
+    if (!output || !scoreboard ||
         (mode == MODE_VALIDATION &&
-         (!scoreboard || !descriptor_by_encoding || !descriptors || !touched))) {
+         (!descriptor_by_encoding || !descriptors || !touched))) {
         fprintf(stderr, "riscv instruction weight: resource allocation failed\n");
         release_resources();
         return 1;
@@ -569,6 +587,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             "\"counts_available\":%s,\"configured_vcpus\":1,"
             "\"start_pc\":\"0x%" PRIx64
             "\",\"stop_pc\":\"0x%" PRIx64
+            "\",\"trap_entry_pc\":\"0x%" PRIx64
             "\",\"warmup_windows\":%" PRIu64
             ",\"primary_clock\":\"CLOCK_THREAD_CPUTIME_ID\","
             "\"secondary_clock\":\"CLOCK_MONOTONIC_RAW\","
@@ -577,7 +596,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             "\"legacy_bit63_domain_heuristic\":false,\"user_min_pc\":",
             mode_name(), count_scope_name(),
             mode == MODE_VALIDATION ? "true" : "false", start_pc, stop_pc,
-            warmup_windows);
+            trap_entry_pc, warmup_windows);
     if (have_user_range) {
         fprintf(output, "\"0x%" PRIx64 "\"", user_min_pc);
     } else {

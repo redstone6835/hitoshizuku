@@ -27,18 +27,61 @@ def weight(semantic: str, value: float, low: float, high: float) -> dict[str, ob
     return {
         "key": {"semantic_encoding_key": semantic},
         "ns_per_instruction": value,
+        "published_ns_per_instruction": value,
         "simultaneous_ci": [low, high],
+        "anchor_adjusted": {
+            "ns_per_instruction": value,
+            "simultaneous_ci": [low, high],
+        },
+        "calibration_only": False,
         "quality": "high-confidence",
     }
 
 
 def weights_document() -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "instruction_key": ANALYZER.COST_MODEL.MODEL_KEY,
         "model": "fixture",
         "primary_response": "fixture-vcpu-time",
         "confidence": 0.95,
+        "publication_gate": {
+            "passed": True,
+            "failures": [],
+            "components": {
+                "statistical_core": True,
+                "raw": True,
+                "anchor_adjusted": True,
+                "positive_anchor": True,
+                "raw_adjusted_discrepancy": True,
+                "estimator_sensitivity": True,
+                "single_super_run_influence": True,
+                "joint_bootstrap": True,
+                "host_isolation": True,
+                "ml_validation": True,
+            },
+        },
+        "host_isolation_audit": {
+            "schema": "mygo.riscv-weight-host-audit.v1",
+            "status": "accepted",
+        },
+        "ml_validation": {
+            "schema": "mygo.riscv-instruction-ml-validation.v3",
+            "conclusion": {
+                "status": "supported",
+                "high_confidence_status": "supported",
+                "high_confidence_gate_passed": True,
+                "may_publish_weights": False,
+            },
+        },
+        "ml_validation_evidence": {
+            "schema": "mygo.riscv-instruction-ml-validation.v3",
+            "checks": {"all_subgates": True},
+            "binding_checks": {
+                "samples": True,
+                "statistical_weights_pre_finalization": True,
+            },
+        },
         "instructions": [
             weight("rv64:32:i:addi:form=nop", 2.0, 1.0, 3.0),
             weight("rv64:32:i:ecall", 10.0, 9.0, 11.0),

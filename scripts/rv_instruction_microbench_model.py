@@ -14,18 +14,58 @@ import csv
 import io
 import json
 import math
+import os
 import random
+import re
 import statistics
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import NormalDist
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EMPTY_CONTROL = "<empty>"
+STABILITY_ANCHOR_PATTERN = "stability-anchor-positive-div"
+CALIBRATION_ONLY_PATTERNS = frozenset({STABILITY_ANCHOR_PATTERN})
+ANCHOR_REFERENCE_POSITION = "body"
+ANCHOR_MAX_SCALE_RATIO = 1.10
+MAX_TRANSLATION_EXCLUDED_PAIR_FRACTION = 0.02
+MIN_CROSSOVER_DESIGN_FRACTION = 0.40
+PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES = 4999
+PUBLICATION_MINIMUM_MAX_STAT_CALIBRATION_REPLICATES = 4000
+PUBLICATION_MAX_STAT_SCALE_REPLICATES = 999
+MAX_STATISTIC_SCALE_REPLICATE_DIVISOR = 5
+PUBLICATION_SAMPLING_ALPHA_FRACTION = 0.5
+PUBLICATION_MONTE_CARLO_ALPHA_FRACTION = 0.5
+PUBLICATION_CONFIDENCE = 0.95
+PUBLICATION_BOOTSTRAP_SEED = 0x525643
+PUBLICATION_MIN_PAIRS = 30
+PUBLICATION_MIN_EFFECTIVE_PAIRS = 20.0
+PUBLICATION_MIN_SUPER_RUNS = 10
+PUBLICATION_MIN_COUNT_LEVELS = 3
+PUBLICATION_MIN_PURITY = 0.99
+PUBLICATION_MAX_RELATIVE_CI_HALF_WIDTH = 0.15
+PUBLICATION_MAX_I_SQUARED = 0.40
+PUBLICATION_EQUIVALENCE_MARGIN = 0.10
+PUBLICATION_MIN_CROSS_CLOCK_RATIO = 0.75
+PUBLICATION_MAX_CROSS_CLOCK_RATIO = 1.50
+PUBLICATION_MIN_PLUGIN_OFF_RATIO = 0.85
+PUBLICATION_MAX_PLUGIN_OFF_RATIO = 1.15
+PUBLICATION_MAX_ZERO_COST_CI_UPPER_NS = 0.15
+PUBLICATION_MAX_TRANSLATION_DENSITY = 0.002
+PUBLICATION_MAX_SEVERE_OUTLIER_FRACTION = 0.10
+GENERATION_CONFIGURATION_SCHEMA = (
+    "mygo.riscv-instruction-weight-generation-configuration.v1"
+)
+PUBLICATION_INFERENCE_FAMILIES = (
+    "raw-absolute-costs",
+    "diagnostic-nuisance-effects",
+    "auxiliary-clock-consistency",
+    "joint-adjusted-anchor-sensitivity",
+)
 
 
 class MicrobenchmarkModelError(ValueError):
@@ -74,6 +114,14 @@ class _ControlReference:
 @dataclass(frozen=True)
 class _Sample:
     run: str
+    run_order: int | None
+    super_run: str
+    super_run_order: int | None
+    crossover_pair: int | None
+    crossover_design: str | None
+    timing_launch_position: int | None
+    plugin_off_launch_position: int | None
+    anchor_position: str | None
     block: str
     pair: str
     sequence: int
@@ -110,6 +158,15 @@ class _Sample:
 @dataclass(frozen=True)
 class _Pair:
     run: str
+    run_order: int
+    run_order_source: str
+    super_run: str
+    super_run_order: int
+    crossover_pair: int | None
+    crossover_design: str | None
+    timing_launch_position: int | None
+    plugin_off_launch_position: int | None
+    anchor_position: str | None
     block: str
     pair: str
     sequence: float
@@ -119,6 +176,8 @@ class _Pair:
     plugin_delta_ns: float | None
     guest_delta_ns: float | None
     plugin_off_guest_delta_ns: float | None
+    cross_clock_difference_ns: float | None
+    plugin_off_difference_ns: float | None
     target_count: int
     purity: float | None
     timer_matched: bool
@@ -136,15 +195,21 @@ class _Fit:
     order_effect: float | None
     drift_effect: float | None
     batch_effect: float | None
+    batch_reference: int | None
+    batch_levels: tuple[int, ...]
+    batch_level_effects: dict[int, float]
+    batch_peak_to_peak: float
     translation_effect: float | None
     batch_log_range: float
     residuals: list[float]
     robust_weights: list[float]
     hetero_weights: list[float]
     pairs: list[_Pair]
+    run_level_estimates: dict[str, float]
     predictor_names: list[str]
     irls_converged: bool
     irls_iterations: int
+    irls_cycle_damping_used: bool
     design_condition_number: float
 
 
@@ -154,10 +219,107 @@ class _BootstrapState:
     keys: tuple[_InstructionKey, ...]
     response_names: Mapping[_InstructionKey, str]
     controls: Mapping[_InstructionKey, _InstructionKey | None]
+    batch_levels: Mapping[_InstructionKey, tuple[int, ...]]
+    batch_references: Mapping[_InstructionKey, int | None]
     block_length: int
+    run_block_length: int
+    linear_algebra_backend: str
 
 
 _BOOTSTRAP_STATE: _BootstrapState | None = None
+_ACTIVE_LINEAR_ALGEBRA_BACKEND = "python"
+_NUMPY: Any | None = None
+
+
+def _default_cli_jobs() -> int:
+    """给正式 bootstrap 选择有上限的进程数。"""
+
+    return max(1, min(16, os.cpu_count() or 1))
+
+
+def publication_generation_configuration() -> dict[str, Any]:
+    """返回不可由结果产物放宽的正式统计重放参数。"""
+
+    return {
+        "schema": GENERATION_CONFIGURATION_SCHEMA,
+        "bootstrap_replicates": PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES,
+        "confidence": PUBLICATION_CONFIDENCE,
+        "seed": PUBLICATION_BOOTSTRAP_SEED,
+        "block_length": None,
+        "run_block_length": None,
+        "minimum_pairs": PUBLICATION_MIN_PAIRS,
+        "minimum_effective_pairs": PUBLICATION_MIN_EFFECTIVE_PAIRS,
+        "minimum_independent_super_runs": PUBLICATION_MIN_SUPER_RUNS,
+        "minimum_count_levels": PUBLICATION_MIN_COUNT_LEVELS,
+        "minimum_instruction_purity": PUBLICATION_MIN_PURITY,
+        "maximum_relative_simultaneous_ci_half_width": (
+            PUBLICATION_MAX_RELATIVE_CI_HALF_WIDTH
+        ),
+        "maximum_i_squared": PUBLICATION_MAX_I_SQUARED,
+        "effect_equivalence_margin": PUBLICATION_EQUIVALENCE_MARGIN,
+        "cross_clock_ratio_range": [
+            PUBLICATION_MIN_CROSS_CLOCK_RATIO,
+            PUBLICATION_MAX_CROSS_CLOCK_RATIO,
+        ],
+        "plugin_off_ratio_range": [
+            PUBLICATION_MIN_PLUGIN_OFF_RATIO,
+            PUBLICATION_MAX_PLUGIN_OFF_RATIO,
+        ],
+        "maximum_zero_cost_simultaneous_ci_upper_ns": (
+            PUBLICATION_MAX_ZERO_COST_CI_UPPER_NS
+        ),
+        "maximum_translation_events_per_target_instruction": (
+            PUBLICATION_MAX_TRANSLATION_DENSITY
+        ),
+        "maximum_translation_excluded_pair_fraction": (
+            MAX_TRANSLATION_EXCLUDED_PAIR_FRACTION
+        ),
+        "maximum_severe_outlier_fraction": (
+            PUBLICATION_MAX_SEVERE_OUTLIER_FRACTION
+        ),
+        "linear_algebra_backend": "numpy",
+    }
+
+
+def _numpy_module() -> Any:
+    """延迟加载可选 NumPy 后端，避免纯 Python 用户被强制依赖。"""
+
+    global _NUMPY
+    if _NUMPY is None:
+        # Bootstrap 已经在进程级并行；每个小矩阵再启动一组 BLAS 线程只会
+        # 造成过度订阅。调用者仍可通过预先设置环境变量覆盖这些默认值。
+        for variable in (
+            "OPENBLAS_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "BLIS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        ):
+            os.environ.setdefault(variable, "1")
+        try:
+            import numpy
+        except ImportError as error:
+            raise MicrobenchmarkModelError(
+                "NumPy 线性代数后端不可用；请在 venv 中安装锁定依赖"
+            ) from error
+        _NUMPY = numpy
+    return _NUMPY
+
+
+def _linear_algebra_backend(name: str) -> str:
+    if name not in {"python", "numpy", "auto"}:
+        raise MicrobenchmarkModelError(
+            "linear_algebra_backend 必须是 python、numpy 或 auto"
+        )
+    if name == "auto":
+        try:
+            _numpy_module()
+        except MicrobenchmarkModelError:
+            return "python"
+        return "numpy"
+    if name == "numpy":
+        _numpy_module()
+    return name
 
 
 def _field(row: Any, names: Sequence[str], default: Any = None) -> Any:
@@ -420,6 +582,73 @@ def _parse_sample(row: Any, index: int) -> _Sample:
     pattern = pattern_raw.strip().lower()
     instruction_key = _instruction_key(row, mnemonic, size, pattern, owner)
     run = _identifier(_field(row, ("run_id", "run")), f"{owner}.run_id")
+    run_order_raw = _field(
+        row, ("run_order", "acquisition_order", "run_index")
+    )
+    run_order = (
+        None
+        if run_order_raw is None
+        else _integer(run_order_raw, f"{owner}.run_order", minimum=0)
+    )
+    super_run_raw = _field(row, ("super_run_id", "cluster_id"), run)
+    super_run = _identifier(super_run_raw, f"{owner}.super_run_id")
+    super_run_order_raw = _field(row, ("super_run_order", "cluster_order"))
+    super_run_order = (
+        run_order
+        if super_run_order_raw is None
+        else _integer(
+            super_run_order_raw, f"{owner}.super_run_order", minimum=0
+        )
+    )
+    crossover_pair_raw = _field(row, ("crossover_pair",))
+    crossover_pair = (
+        None
+        if crossover_pair_raw is None
+        else _integer(crossover_pair_raw, f"{owner}.crossover_pair", minimum=1)
+    )
+    crossover_design_raw = _field(row, ("crossover_design",))
+    if crossover_design_raw is None:
+        crossover_design = None
+    elif not isinstance(crossover_design_raw, str) or not crossover_design_raw.strip():
+        raise MicrobenchmarkModelError(
+            f"{owner}.crossover_design 必须是非空字符串"
+        )
+    else:
+        crossover_design = crossover_design_raw.strip().upper()
+    timing_launch_position_raw = _field(row, ("timing_launch_position",))
+    timing_launch_position = (
+        None
+        if timing_launch_position_raw is None
+        else _integer(
+            timing_launch_position_raw,
+            f"{owner}.timing_launch_position",
+            minimum=1,
+        )
+    )
+    plugin_off_launch_position_raw = _field(
+        row, ("plugin_off_launch_position",)
+    )
+    plugin_off_launch_position = (
+        None
+        if plugin_off_launch_position_raw is None
+        else _integer(
+            plugin_off_launch_position_raw,
+            f"{owner}.plugin_off_launch_position",
+            minimum=1,
+        )
+    )
+    anchor_position_raw = _field(row, ("anchor_position",))
+    if anchor_position_raw is None:
+        anchor_position = None
+    elif not isinstance(anchor_position_raw, str) or anchor_position_raw not in {
+        "head",
+        "body",
+        "tail",
+        "not-anchor",
+    }:
+        raise MicrobenchmarkModelError(f"{owner}.anchor_position 非法")
+    else:
+        anchor_position = anchor_position_raw
     block = _identifier(
         _field(row, ("block_id", "block", "round")), f"{owner}.block_id"
     )
@@ -623,8 +852,19 @@ def _parse_sample(row: Any, index: int) -> _Sample:
             if isinstance(raw_control_pattern, str) and raw_control_pattern.strip()
             else None
         )
+    if super_run_order is None:
+        # 没有显式层级的旧输入由 _pair_samples 在恢复 run 时间轴后补齐。
+        super_run_order = -1
     return _Sample(
         run,
+        run_order,
+        super_run,
+        super_run_order,
+        crossover_pair,
+        crossover_design,
+        timing_launch_position,
+        plugin_off_launch_position,
+        anchor_position,
         block,
         pair,
         sequence,
@@ -663,12 +903,133 @@ def _pair_samples(rows: Sequence[Any]) -> tuple[list[_Pair], set[_InstructionKey
     if not rows:
         raise MicrobenchmarkModelError("samples 不能为空")
     samples = [_parse_sample(row, index) for index, row in enumerate(rows)]
+    first_seen_runs = list(dict.fromkeys(sample.run for sample in samples))
+    explicit_orders: dict[str, int] = {}
+    for run in first_seen_runs:
+        values = {
+            sample.run_order
+            for sample in samples
+            if sample.run == run and sample.run_order is not None
+        }
+        if len(values) > 1:
+            raise MicrobenchmarkModelError(
+                f"run={run!r} 的 run_order 在同一 run 内不一致"
+            )
+        if values:
+            explicit_orders[run] = next(iter(values))
+    if explicit_orders and len(explicit_orders) != len(first_seen_runs):
+        missing = [run for run in first_seen_runs if run not in explicit_orders]
+        raise MicrobenchmarkModelError(
+            f"run_order 必须覆盖所有 run，缺少 {missing!r}"
+        )
+    if explicit_orders:
+        if len(set(explicit_orders.values())) != len(explicit_orders):
+            raise MicrobenchmarkModelError("不同 run 不能复用同一 run_order")
+        run_orders = explicit_orders
+        run_order_source = "explicit-run-order"
+    else:
+        inferred: dict[str, int] = {}
+        prefixes: set[str] = set()
+        for run in first_seen_runs:
+            match = re.fullmatch(r"(.*[-_])(\d+)", run)
+            if match is None:
+                inferred = {}
+                break
+            prefixes.add(match.group(1))
+            inferred[run] = int(match.group(2), 10)
+        expected = set(range(1, len(first_seen_runs) + 1))
+        if len(prefixes) == 1 and set(inferred.values()) == expected:
+            run_orders = inferred
+            run_order_source = "strict-common-prefix-contiguous-suffix"
+        else:
+            run_orders = {
+                run: position for position, run in enumerate(first_seen_runs)
+            }
+            run_order_source = "input-first-appearance"
+    super_run_orders: dict[str, int] = {}
+    super_run_designs: dict[str, str | None] = {}
+    super_run_pairs: dict[str, set[int]] = defaultdict(set)
+    for sample in samples:
+        effective_super_order = (
+            run_orders[sample.run]
+            if sample.super_run_order < 0
+            else sample.super_run_order
+        )
+        previous_order = super_run_orders.setdefault(
+            sample.super_run, effective_super_order
+        )
+        previous_design = super_run_designs.setdefault(
+            sample.super_run, sample.crossover_design
+        )
+        if previous_order != effective_super_order:
+            raise MicrobenchmarkModelError("同一 super-run 的 order 不一致")
+        if previous_design != sample.crossover_design:
+            raise MicrobenchmarkModelError("同一 super-run 的 crossover design 不一致")
+        if sample.crossover_pair is not None:
+            super_run_pairs[sample.super_run].add(sample.crossover_pair)
+    if len(set(super_run_orders.values())) != len(super_run_orders):
+        raise MicrobenchmarkModelError("不同 super-run 不能复用 super_run_order")
+    for super_run, design in super_run_designs.items():
+        members = [sample for sample in samples if sample.super_run == super_run]
+        has_crossover_metadata = any(
+            value is not None
+            for sample in members
+            for value in (
+                sample.crossover_pair,
+                sample.crossover_design,
+                sample.timing_launch_position,
+                sample.plugin_off_launch_position,
+            )
+        )
+        if not has_crossover_metadata:
+            continue
+        if design not in {"ABBA", "BAAB"} or super_run_pairs[super_run] != {1, 2}:
+            raise MicrobenchmarkModelError(
+                f"super-run={super_run!r} 的 crossover 设计不完整"
+            )
+        by_pair: dict[int, tuple[int, int]] = {}
+        for sample in members:
+            if (
+                sample.crossover_pair not in {1, 2}
+                or sample.timing_launch_position is None
+                or sample.plugin_off_launch_position is None
+            ):
+                raise MicrobenchmarkModelError(
+                    f"super-run={super_run!r} 的 crossover 启动位置不完整"
+                )
+            launch_pair = (
+                sample.timing_launch_position,
+                sample.plugin_off_launch_position,
+            )
+            previous = by_pair.setdefault(sample.crossover_pair, launch_pair)
+            if previous != launch_pair:
+                raise MicrobenchmarkModelError(
+                    f"super-run={super_run!r} 的 crossover pair 元数据不一致"
+                )
+        expected_pairs = (
+            {1: (1, 2), 2: (4, 3)}
+            if design == "ABBA"
+            else {1: (2, 1), 2: (3, 4)}
+        )
+        expected_timing = {1, 4} if design == "ABBA" else {2, 3}
+        timing_positions = {timing for timing, _off in by_pair.values()}
+        off_positions = {off for _timing, off in by_pair.values()}
+        all_positions = timing_positions | off_positions
+        if (
+            by_pair != expected_pairs
+            or timing_positions != expected_timing
+            or off_positions != ({1, 2, 3, 4} - expected_timing)
+            or all_positions != {1, 2, 3, 4}
+        ):
+            raise MicrobenchmarkModelError(
+                f"super-run={super_run!r} 的启动位置与 {design} 不一致"
+            )
     grouped: dict[tuple[str, str], list[_Sample]] = defaultdict(list)
     for sample in samples:
         grouped[(sample.run, sample.pair)].append(sample)
     pairs: list[_Pair] = []
     assumed_empty: set[_InstructionKey] = set()
-    for group_key, members in sorted(grouped.items()):
+    for group_key, members in grouped.items():
         if len(members) != 2 or {member.role for member in members} != {
             "probe",
             "baseline",
@@ -700,6 +1061,13 @@ def _pair_samples(rows: Sequence[Any]) -> tuple[list[_Pair], set[_InstructionKey
             "control_pattern",
             "empty_control_declared",
             "plugin_mode",
+            "super_run",
+            "super_run_order",
+            "crossover_pair",
+            "crossover_design",
+            "timing_launch_position",
+            "plugin_off_launch_position",
+            "anchor_position",
         )
         for name in comparable:
             if getattr(probe, name) != getattr(baseline, name):
@@ -730,6 +1098,16 @@ def _pair_samples(rows: Sequence[Any]) -> tuple[list[_Pair], set[_InstructionKey
             if probe.plugin_off_guest_ns is None
             or baseline.plugin_off_guest_ns is None
             else probe.plugin_off_guest_ns - baseline.plugin_off_guest_ns
+        )
+        cross_clock_difference = (
+            None
+            if guest_delta is None or plugin_delta is None
+            else guest_delta - plugin_delta
+        )
+        plugin_off_difference = (
+            None
+            if plugin_off_guest_delta is None or guest_delta is None
+            else guest_delta - plugin_off_guest_delta
         )
         purity = probe.paired_purity
         if purity is None:
@@ -769,6 +1147,15 @@ def _pair_samples(rows: Sequence[Any]) -> tuple[list[_Pair], set[_InstructionKey
         pairs.append(
             _Pair(
                 run=probe.run,
+                run_order=run_orders[probe.run],
+                run_order_source=run_order_source,
+                super_run=probe.super_run,
+                super_run_order=super_run_orders[probe.super_run],
+                crossover_pair=probe.crossover_pair,
+                crossover_design=probe.crossover_design,
+                timing_launch_position=probe.timing_launch_position,
+                plugin_off_launch_position=probe.plugin_off_launch_position,
+                anchor_position=probe.anchor_position,
                 block=probe.block,
                 pair=probe.pair,
                 sequence=(probe.sequence + baseline.sequence) / 2.0,
@@ -778,6 +1165,8 @@ def _pair_samples(rows: Sequence[Any]) -> tuple[list[_Pair], set[_InstructionKey
                 plugin_delta_ns=plugin_delta,
                 guest_delta_ns=guest_delta,
                 plugin_off_guest_delta_ns=plugin_off_guest_delta,
+                cross_clock_difference_ns=cross_clock_difference,
+                plugin_off_difference_ns=plugin_off_difference,
                 target_count=target_delta,
                 purity=purity,
                 timer_matched=probe.timer_reads == baseline.timer_reads,
@@ -831,6 +1220,42 @@ def _json_finite(value: float | None) -> float | None:
     return value if value is not None and math.isfinite(value) else None
 
 
+def _ordered_runs(pairs: Iterable[_Pair]) -> list[str]:
+    """按显式或输入派生的采集序号返回 run，且验证序号一致。"""
+
+    by_run: dict[str, list[int]] = defaultdict(list)
+    for pair in pairs:
+        by_run[pair.run].append(pair.run_order)
+    for run, orders in by_run.items():
+        if len(set(orders)) != 1:
+            raise MicrobenchmarkModelError(
+                f"run={run!r} 的内部 run_order 不一致"
+            )
+    return sorted(
+        by_run,
+        key=lambda run: (by_run[run][0], run),
+    )
+
+
+def _ordered_super_runs(pairs: Iterable[_Pair]) -> list[str]:
+    """返回最高独立层级；旧样本自然退化为一 run 一 cluster。"""
+
+    orders: dict[str, set[int]] = defaultdict(set)
+    for pair in pairs:
+        orders[pair.super_run].add(pair.super_run_order)
+    for super_run, values in orders.items():
+        if len(values) != 1:
+            raise MicrobenchmarkModelError(
+                f"super-run={super_run!r} 的内部 order 不一致"
+            )
+    if len({next(iter(values)) for values in orders.values()}) != len(orders):
+        raise MicrobenchmarkModelError("不同 super-run 不能复用 order")
+    return sorted(
+        orders,
+        key=lambda super_run: (next(iter(orders[super_run])), super_run),
+    )
+
+
 def _invert(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
     size = len(matrix)
     if size == 0 or any(len(row) != size for row in matrix):
@@ -867,6 +1292,48 @@ def _wls(
     *,
     sparse_rows: Sequence[Sequence[tuple[int, float]]] | None = None,
 ) -> tuple[list[float], list[list[float]]]:
+    coefficients, inverse = _wls_native(
+        matrix, response, weights, sparse_rows=sparse_rows
+    )
+    if _ACTIVE_LINEAR_ALGEBRA_BACKEND == "numpy":
+        return coefficients.tolist(), inverse.tolist()
+    return coefficients, inverse
+
+
+def _wls_native(
+    matrix: Any,
+    response: Any,
+    weights: Any,
+    *,
+    sparse_rows: Sequence[Sequence[tuple[int, float]]] | None = None,
+    compute_inverse: bool = True,
+) -> tuple[Any, Any]:
+    if _ACTIVE_LINEAR_ALGEBRA_BACKEND == "numpy":
+        np = _numpy_module()
+        design = np.asarray(matrix, dtype=np.float64)
+        values = np.asarray(response, dtype=np.float64)
+        diagonal = np.asarray(weights, dtype=np.float64)
+        gram = design.T @ (diagonal[:, None] * design)
+        rhs = design.T @ (diagonal * values)
+        width = design.shape[1]
+        ridge = max(
+            1e-14,
+            float(np.trace(gram)) * 1e-13 / max(1, width),
+        )
+        gram = gram.copy()
+        indices = np.arange(1, width)
+        gram[indices, indices] += ridge
+        try:
+            if compute_inverse:
+                inverse = np.linalg.inv(gram)
+                coefficients = inverse @ rhs
+            else:
+                coefficients = np.linalg.solve(gram, rhs)
+                inverse = None
+        except np.linalg.LinAlgError as error:
+            raise MicrobenchmarkModelError("微基准设计矩阵秩不足") from error
+        return coefficients, inverse
+
     width = len(matrix[0])
     if sparse_rows is None:
         sparse_rows = [
@@ -901,9 +1368,10 @@ def _robust_fit(
     response: Sequence[float],
     base_weights: Sequence[float],
     *,
-    max_iterations: int = 60,
+    max_iterations: int = 120,
     huber_delta: float = 1.345,
     sparse_rows: Sequence[Sequence[tuple[int, float]]] | None = None,
+    compute_inverse: bool = True,
 ) -> tuple[
     list[float],
     list[float],
@@ -911,49 +1379,163 @@ def _robust_fit(
     list[list[float]],
     bool,
     int,
+    bool,
 ]:
-    if sparse_rows is None:
+    np = (
+        _numpy_module()
+        if _ACTIVE_LINEAR_ALGEBRA_BACKEND == "numpy"
+        else None
+    )
+    native_matrix = (
+        np.asarray(matrix, dtype=np.float64) if np is not None else matrix
+    )
+    native_response = (
+        np.asarray(response, dtype=np.float64) if np is not None else response
+    )
+    native_base_weights = (
+        np.asarray(base_weights, dtype=np.float64)
+        if np is not None
+        else base_weights
+    )
+    if sparse_rows is None and np is None:
         sparse_rows = [
             [(column, value) for column, value in enumerate(row) if value != 0.0]
             for row in matrix
         ]
-    robust = [1.0] * len(response)
+    robust: Any = (
+        np.ones(len(response), dtype=np.float64)
+        if np is not None
+        else [1.0] * len(response)
+    )
     coefficients: list[float] = []
     inverse: list[list[float]] = []
     residuals: list[float] = []
     converged = False
     iterations = 0
+    cycle_damping_used = False
+    previous_robust: Any | None = None
     for iteration in range(1, max_iterations + 1):
         iterations = iteration
-        combined = [base * weight for base, weight in zip(base_weights, robust)]
-        coefficients, inverse = _wls(
-            matrix, response, combined, sparse_rows=sparse_rows
+        combined = (
+            native_base_weights * robust
+            if np is not None
+            else [base * weight for base, weight in zip(base_weights, robust)]
         )
-        residuals = [
-            value - math.fsum(coefficient * item for coefficient, item in zip(coefficients, row))
-            for row, value in zip(matrix, response)
-        ]
-        scale = max(1e-15, 1.4826 * _median_absolute_deviation(residuals))
-        cutoff = huber_delta * scale
-        updated = [
-            1.0 if abs(value) <= cutoff else cutoff / abs(value)
-            for value in residuals
-        ]
-        change = math.sqrt(
-            math.fsum((new - old) ** 2 for new, old in zip(updated, robust))
-            / len(robust)
+        coefficients, inverse = _wls_native(
+            native_matrix,
+            native_response,
+            combined,
+            sparse_rows=sparse_rows,
+            compute_inverse=compute_inverse,
         )
-        robust = updated
+        if np is not None:
+            native_residuals = native_response - native_matrix @ coefficients
+            center = np.median(native_residuals)
+            scale = max(
+                1e-15,
+                1.4826 * float(np.median(np.abs(native_residuals - center))),
+            )
+            cutoff = huber_delta * scale
+            absolute = np.abs(native_residuals)
+            fixed_point = np.ones_like(absolute)
+            mask = absolute > cutoff
+            fixed_point[mask] = cutoff / absolute[mask]
+            change = float(np.sqrt(np.mean((fixed_point - robust) ** 2)))
+            residuals = native_residuals.tolist()
+        else:
+            residuals = [
+                value
+                - math.fsum(
+                    coefficient * item
+                    for coefficient, item in zip(coefficients, row)
+                )
+                for row, value in zip(matrix, response)
+            ]
+            scale = max(
+                1e-15, 1.4826 * _median_absolute_deviation(residuals)
+            )
+            cutoff = huber_delta * scale
+            fixed_point = [
+                1.0 if abs(value) <= cutoff else cutoff / abs(value)
+                for value in residuals
+            ]
+            change = math.sqrt(
+                math.fsum(
+                    (new - old) ** 2
+                    for new, old in zip(fixed_point, robust)
+                )
+                / len(robust)
+            )
+        if (
+            not cycle_damping_used
+            and iteration >= 8
+            and previous_robust is not None
+        ):
+            cycle_distance = (
+                float(
+                    np.sqrt(
+                        np.mean((fixed_point - previous_robust) ** 2)
+                    )
+                )
+                if np is not None
+                else math.sqrt(
+                    math.fsum(
+                        (new - old) ** 2
+                        for new, old in zip(fixed_point, previous_robust)
+                    )
+                    / len(robust)
+                )
+            )
+            if cycle_distance <= max(1e-12, 0.05 * change):
+                cycle_damping_used = True
+        old_robust = robust
+        robust = (
+            robust + 0.75 * (fixed_point - robust)
+            if np is not None and cycle_damping_used
+            else [
+                old + 0.75 * (new - old)
+                for old, new in zip(robust, fixed_point)
+            ]
+            if cycle_damping_used
+            else fixed_point
+        )
         if change <= 1e-6:
             converged = True
             break
-    return coefficients, residuals, robust, inverse, converged, iterations
+        previous_robust = old_robust
+    return (
+        coefficients.tolist() if np is not None else coefficients,
+        residuals,
+        robust.tolist() if np is not None else robust,
+        (
+            inverse.tolist()
+            if np is not None and inverse is not None
+            else inverse
+        ),
+        converged,
+        iterations,
+        cycle_damping_used,
+    )
 
 
 def _design_condition_number(
     matrix: Sequence[Sequence[float]], weights: Sequence[float]
 ) -> float:
     """返回列标准化加权 Gram 矩阵的无穷范数条件数。"""
+
+    if _ACTIVE_LINEAR_ALGEBRA_BACKEND == "numpy":
+        np = _numpy_module()
+        design = np.asarray(matrix, dtype=np.float64)
+        diagonal = np.asarray(weights, dtype=np.float64)
+        scales = np.sqrt(np.sum(diagonal[:, None] * design * design, axis=0))
+        if bool(np.any(scales <= 1e-15)):
+            return math.inf
+        normalized = design / scales
+        gram = normalized.T @ (diagonal[:, None] * normalized)
+        try:
+            return float(np.linalg.cond(gram, p=np.inf))
+        except np.linalg.LinAlgError:
+            return math.inf
 
     width = len(matrix[0])
     scales = [
@@ -982,14 +1564,51 @@ def _design_condition_number(
     return norm * inverse_norm
 
 
-def _design(pairs: Sequence[_Pair], response_name: str) -> tuple[list[list[float]], list[float], list[str]]:
+def _batch_levels_and_reference(
+    pairs: Sequence[_Pair],
+    batch_levels: Sequence[int] | None = None,
+    batch_reference: int | None = None,
+) -> tuple[tuple[int, ...], int | None]:
+    """返回固定的 batch 档位和最接近几何中心的实际参考档。"""
+
+    observed = tuple(sorted({pair.batch for pair in pairs}))
+    if batch_levels is None:
+        levels = observed
+    else:
+        levels = tuple(sorted(set(batch_levels)))
+        if observed != levels:
+            raise MicrobenchmarkModelError(
+                "拟合样本没有完整覆盖预先声明的 batch 档位"
+            )
+    if not levels:
+        return levels, None
+    if batch_reference is None:
+        log_center = statistics.median(math.log(level) for level in levels)
+        reference = min(
+            levels,
+            key=lambda level: (abs(math.log(level) - log_center), level),
+        )
+    else:
+        if batch_reference not in levels:
+            raise MicrobenchmarkModelError("batch 参考档不属于声明的档位")
+        reference = batch_reference
+    return levels, reference
+
+
+def _design(
+    pairs: Sequence[_Pair],
+    response_name: str,
+    *,
+    batch_levels: Sequence[int] | None = None,
+    batch_reference: int | None = None,
+) -> tuple[list[list[float]], list[float], list[str]]:
     response: list[float] = []
     for pair in pairs:
         raw = getattr(pair, response_name)
         if raw is None:
             raise MicrobenchmarkModelError("响应列不完整")
         response.append(raw / pair.target_count)
-    runs = sorted({pair.run for pair in pairs})
+    runs = _ordered_runs(pairs)
     names = ["intercept"]
     rows: list[list[float]] = [[1.0] for _ in pairs]
     for run in runs[1:]:
@@ -1026,12 +1645,15 @@ def _design(pairs: Sequence[_Pair], response_name: str) -> tuple[list[list[float
         for row, value in zip(rows, translation_rates):
             row.append(value)
 
-    counts = [pair.target_count for pair in pairs]
-    if len(set(counts)) >= 2:
-        log_reference = statistics.median(math.log(value) for value in counts)
-        names.append("log_batch")
-        for row, count in zip(rows, counts):
-            row.append(math.log(count) - log_reference)
+    levels, reference = _batch_levels_and_reference(
+        pairs, batch_levels, batch_reference
+    )
+    for level in levels:
+        if level == reference:
+            continue
+        names.append(f"batch_level:{level}")
+        for row, pair in zip(rows, pairs):
+            row.append(1.0 if pair.batch == level else 0.0)
     return rows, response, names
 
 
@@ -1059,7 +1681,7 @@ def _heteroscedastic_weights(
 def _contrast_for_coefficients(
     pairs: Sequence[_Pair], names: Sequence[str]
 ) -> list[float]:
-    runs = sorted({pair.run for pair in pairs})
+    runs = _ordered_runs(pairs)
     result = [0.0] * len(names)
     result[0] = 1.0
     for run in runs[1:]:
@@ -1076,6 +1698,24 @@ def _sandwich_standard_error(
     contrast: Sequence[float],
 ) -> float | None:
     width = len(matrix[0])
+    if _ACTIVE_LINEAR_ALGEBRA_BACKEND == "numpy":
+        np = _numpy_module()
+        design = np.asarray(matrix, dtype=np.float64)
+        score = (
+            np.asarray(base_weights, dtype=np.float64)
+            * np.asarray(robust_weights, dtype=np.float64)
+            * np.asarray(residuals, dtype=np.float64)
+        )
+        meat = design.T @ ((score * score)[:, None] * design)
+        inv = np.asarray(inverse, dtype=np.float64)
+        direction = np.asarray(contrast, dtype=np.float64) @ inv
+        variance = float(direction @ meat @ direction)
+        degrees = len(matrix) - width
+        if degrees <= 0:
+            return None
+        variance *= len(matrix) / degrees
+        return math.sqrt(max(0.0, variance))
+
     meat = [[0.0] * width for _ in range(width)]
     for row, residual, base, robust in zip(matrix, residuals, base_weights, robust_weights):
         score_scale = base * robust * residual
@@ -1106,11 +1746,26 @@ def _fit_variant(
     response_name: str,
     *,
     compute_condition: bool = True,
+    compute_standard_error: bool = True,
+    batch_levels: Sequence[int] | None = None,
+    batch_reference: int | None = None,
 ) -> _Fit:
     if len(pairs) < 4:
         raise MicrobenchmarkModelError("每个指令变体至少需要 4 个有效 pair")
-    ordered = sorted(pairs, key=lambda pair: (pair.run, pair.sequence, pair.pair))
-    matrix, response, names = _design(ordered, response_name)
+    run_rank = {run: rank for rank, run in enumerate(_ordered_runs(pairs))}
+    ordered = sorted(
+        pairs,
+        key=lambda pair: (run_rank[pair.run], pair.sequence, pair.pair),
+    )
+    levels, reference = _batch_levels_and_reference(
+        ordered, batch_levels, batch_reference
+    )
+    matrix, response, names = _design(
+        ordered,
+        response_name,
+        batch_levels=levels,
+        batch_reference=reference,
+    )
     sparse_rows = [
         [(column, value) for column, value in enumerate(row) if value != 0.0]
         for row in matrix
@@ -1120,42 +1775,94 @@ def _fit_variant(
         min(16.0, max(1.0 / 16.0, (pair.target_count / count_reference) ** 2))
         for pair in ordered
     ]
-    _, initial_residuals, _, _, _, _ = _robust_fit(
-        matrix, response, initial_weights, sparse_rows=sparse_rows
+    _, initial_residuals, _, _, _, _, initial_cycle_damping = _robust_fit(
+        matrix,
+        response,
+        initial_weights,
+        sparse_rows=sparse_rows,
+        compute_inverse=False,
     )
     hetero = _heteroscedastic_weights(ordered, initial_residuals)
-    coefficients, residuals, robust, inverse, converged, iterations = _robust_fit(
-        matrix, response, hetero, sparse_rows=sparse_rows
+    (
+        coefficients,
+        residuals,
+        robust,
+        inverse,
+        converged,
+        iterations,
+        final_cycle_damping,
+    ) = _robust_fit(
+        matrix,
+        response,
+        hetero,
+        sparse_rows=sparse_rows,
+        compute_inverse=compute_standard_error,
     )
     combined_weights = [
         base * weight for base, weight in zip(hetero, robust)
     ]
     contrast = _contrast_for_coefficients(ordered, names)
     estimate = math.fsum(value * coefficient for value, coefficient in zip(contrast, coefficients))
-    standard_error = _sandwich_standard_error(
-        matrix, residuals, hetero, robust, inverse, contrast
+    standard_error = (
+        _sandwich_standard_error(
+            matrix, residuals, hetero, robust, inverse, contrast
+        )
+        if compute_standard_error
+        else None
     )
     by_name = dict(zip(names, coefficients))
-    count_values = [pair.target_count for pair in ordered]
+    run_level_estimates = {
+        run: by_name["intercept"] + by_name.get(f"run:{run}", 0.0)
+        for run in _ordered_runs(ordered)
+    }
+    batch_level_effects = {
+        level: (
+            0.0
+            if level == reference
+            else by_name[f"batch_level:{level}"]
+        )
+        for level in levels
+    }
+    if len(levels) >= 2:
+        low, high = levels[0], levels[-1]
+        batch_log_range = math.log(high / low)
+        # 兼容旧的 per_log_batch 输出；这是 categorical 两端点的割线，
+        # 不参与新门禁，也不能代表中间档位。
+        batch_effect = (
+            (batch_level_effects[high] - batch_level_effects[low])
+            / batch_log_range
+        )
+    else:
+        batch_log_range = 0.0
+        batch_effect = None
+    batch_peak_to_peak = (
+        max(batch_level_effects.values()) - min(batch_level_effects.values())
+        if batch_level_effects
+        else 0.0
+    )
     return _Fit(
         estimate=estimate,
         standard_error=standard_error,
         order_effect=by_name.get("order_ab_ba"),
         drift_effect=by_name.get("within_run_drift"),
-        batch_effect=by_name.get("log_batch"),
+        batch_effect=batch_effect,
+        batch_reference=reference,
+        batch_levels=levels,
+        batch_level_effects=batch_level_effects,
+        batch_peak_to_peak=batch_peak_to_peak,
         translation_effect=by_name.get("translation_per_target"),
-        batch_log_range=(
-            math.log(max(count_values) / min(count_values))
-            if min(count_values) > 0
-            else 0.0
-        ),
+        batch_log_range=batch_log_range,
         residuals=residuals,
         robust_weights=robust,
         hetero_weights=hetero,
         pairs=ordered,
+        run_level_estimates=run_level_estimates,
         predictor_names=names,
         irls_converged=converged,
         irls_iterations=iterations,
+        irls_cycle_damping_used=(
+            initial_cycle_damping or final_cycle_damping
+        ),
         design_condition_number=(
             _design_condition_number(matrix, combined_weights)
             if compute_condition
@@ -1164,11 +1871,92 @@ def _fit_variant(
     )
 
 
+def _classical_variant_estimate(
+    pairs: Sequence[_Pair],
+    response_name: str,
+    *,
+    batch_levels: Sequence[int] | None = None,
+    batch_reference: int | None = None,
+    heteroscedastic_weights: Sequence[float] | None = None,
+) -> float:
+    """返回不使用 Huber 降权的异方差 WLS 对照估计。
+
+    该估计器与主模型共享完全相同的设计矩阵、配对响应和 target-count
+    异方差权重；只省略最终 Huber influence 权重。它不是第二个发布模型，
+    而是用来检验主估计是否依赖少数观测的敏感性对照。
+    """
+
+    if len(pairs) < 4:
+        raise MicrobenchmarkModelError("经典 WLS 对照至少需要 4 个有效 pair")
+    run_rank = {run: rank for rank, run in enumerate(_ordered_runs(pairs))}
+    sort_key = lambda pair: (run_rank[pair.run], pair.sequence, pair.pair)
+    supplied_hetero: list[float] | None = None
+    if heteroscedastic_weights is None:
+        ordered = sorted(pairs, key=sort_key)
+    else:
+        if len(heteroscedastic_weights) != len(pairs):
+            raise MicrobenchmarkModelError("经典 WLS 对照的异方差权重长度不匹配")
+        ordered_observations = sorted(
+            zip(pairs, heteroscedastic_weights, strict=True),
+            key=lambda observation: sort_key(observation[0]),
+        )
+        ordered = [pair for pair, _weight in ordered_observations]
+        supplied_hetero = [
+            float(weight) for _pair, weight in ordered_observations
+        ]
+    levels, reference = _batch_levels_and_reference(
+        ordered, batch_levels, batch_reference
+    )
+    matrix, response, _names = _design(
+        ordered,
+        response_name,
+        batch_levels=levels,
+        batch_reference=reference,
+    )
+    sparse_rows = [
+        [(column, value) for column, value in enumerate(row) if value != 0.0]
+        for row in matrix
+    ]
+    count_reference = statistics.median(pair.target_count for pair in ordered)
+    initial_weights = [
+        min(16.0, max(1.0 / 16.0, (pair.target_count / count_reference) ** 2))
+        for pair in ordered
+    ]
+    if supplied_hetero is None:
+        _coefficients, initial_residuals, _robust, _inverse, *_rest = (
+            _robust_fit(
+                matrix,
+                response,
+                initial_weights,
+                sparse_rows=sparse_rows,
+                compute_inverse=False,
+            )
+        )
+        hetero = _heteroscedastic_weights(ordered, initial_residuals)
+    else:
+        hetero = supplied_hetero
+    coefficients, _inverse = _wls_native(
+        matrix,
+        response,
+        hetero,
+        sparse_rows=sparse_rows,
+        compute_inverse=False,
+    )
+    contrast = _contrast_for_coefficients(ordered, _names)
+    estimate = math.fsum(
+        value * coefficient
+        for value, coefficient in zip(contrast, coefficients)
+    )
+    if not math.isfinite(estimate):
+        raise MicrobenchmarkModelError("经典 WLS 对照估计不是有限数")
+    return float(estimate)
+
+
 def _acf_ess(fit: _Fit) -> tuple[float, list[dict[str, Any]], int]:
     rows: list[dict[str, Any]] = []
     total_ess = 0.0
     recommended_block = 1
-    for run in sorted({pair.run for pair in fit.pairs}):
+    for run in _ordered_runs(fit.pairs):
         members = [
             (pair, residual, robust * hetero)
             for pair, residual, robust, hetero in zip(
@@ -1258,12 +2046,21 @@ def _acf_ess(fit: _Fit) -> tuple[float, list[dict[str, Any]], int]:
 
 
 def _student_t_critical(confidence: float, degrees: int) -> float:
-    """用 Cornish-Fisher 展开近似双侧 Student-t 临界值。"""
+    """返回双侧 Student-t 临界值；df=1/2 精确，其余用展开。"""
 
     probability = 0.5 + confidence / 2.0
-    z_value = NormalDist().inv_cdf(probability)
     if degrees <= 0:
         return math.inf
+    # Cornish-Fisher 在最关键的 df=1/2 小样本处会明显偏小；这两档有闭式
+    # 逆 CDF，直接使用精确值，避免 mKH 区间反而反保守。
+    if degrees == 1:
+        return math.tan(math.pi * (probability - 0.5))
+    if degrees == 2:
+        centered = 2.0 * probability - 1.0
+        return math.sqrt(2.0) * centered / math.sqrt(
+            1.0 - centered * centered
+        )
+    z_value = NormalDist().inv_cdf(probability)
     inverse_degrees = 1.0 / degrees
     return (
         z_value
@@ -1274,8 +2071,10 @@ def _student_t_critical(confidence: float, degrees: int) -> float:
     )
 
 
-def _wilson_upper_bound(successes: int, total: int, confidence: float) -> float:
-    """返回二项比例单侧 Wilson 上置信界。"""
+def _wilson_upper_bound(
+    successes: float, total: float, confidence: float
+) -> float:
+    """返回二项/准二项比例的单侧 Wilson 上置信界。"""
 
     if total <= 0:
         return 1.0
@@ -1295,19 +2094,265 @@ def _wilson_upper_bound(successes: int, total: int, confidence: float) -> float:
     return min(1.0, center + radius)
 
 
+def _run_cluster_proportion_upper_bound(
+    outcomes: Sequence[bool], runs: Sequence[str], confidence: float
+) -> dict[str, Any]:
+    """把完整 QEMU run 作为独立单位估计异常比例的保守上界。
+
+    pair 仅在各自 run 内汇总为一个 ``[0, 1]`` 比例。上界取 run-level
+    quasi-Wilson score 与 run 均值 Student-t 上界的较大者，避免复制同一
+    run 的相关 pair 虚增独立样本量，也避免 run 间方差恰为零时区间坍缩。
+    """
+
+    if len(outcomes) != len(runs):
+        raise MicrobenchmarkModelError("异常标记与 run 标签数量不一致")
+    grouped: dict[str, list[bool]] = defaultdict(list)
+    for outcome, run in zip(outcomes, runs):
+        grouped[run].append(outcome)
+    per_run = [
+        {
+            "run": run,
+            "pairs": len(values),
+            "severe_outliers": sum(values),
+            "fraction": sum(values) / len(values),
+        }
+        for run, values in sorted(grouped.items())
+        if values
+    ]
+    if not per_run:
+        return {
+            "runs": 0,
+            "mean_run_fraction": None,
+            "pair_fraction": None,
+            "score_upper": 1.0,
+            "t_upper": 1.0,
+            "upper": 1.0,
+            "per_run": [],
+        }
+    fractions = [float(row["fraction"]) for row in per_run]
+    run_count = len(fractions)
+    mean_fraction = math.fsum(fractions) / run_count
+    score_upper = _wilson_upper_bound(
+        math.fsum(fractions), run_count, confidence
+    )
+    if run_count < 2:
+        t_upper = 1.0
+    else:
+        standard_error = statistics.stdev(fractions) / math.sqrt(run_count)
+        central_confidence = 2.0 * confidence - 1.0
+        t_critical = (
+            _student_t_critical(central_confidence, run_count - 1)
+            if central_confidence > 0.0
+            else 0.0
+        )
+        t_upper = min(1.0, mean_fraction + t_critical * standard_error)
+    pair_fraction = sum(outcomes) / len(outcomes) if outcomes else None
+    return {
+        "runs": run_count,
+        "mean_run_fraction": mean_fraction,
+        "pair_fraction": pair_fraction,
+        "score_upper": score_upper,
+        "t_upper": t_upper,
+        "upper": max(score_upper, t_upper),
+        "per_run": per_run,
+    }
+
+
+def _paule_mandel_tau_squared(
+    estimates: Sequence[float], variances: Sequence[float]
+) -> dict[str, Any]:
+    """求解 ``Q(tau^2)=k-1`` 的 Paule-Mandel 方差分量。"""
+
+    if len(estimates) != len(variances) or len(estimates) < 2:
+        raise MicrobenchmarkModelError("Paule-Mandel 至少需要两个等长 run 估计")
+    if any(
+        not math.isfinite(value) or value <= 0.0 for value in variances
+    ):
+        raise MicrobenchmarkModelError("Paule-Mandel 的 run 方差必须为正有限数")
+
+    def location_and_q(tau_squared: float) -> tuple[float, float]:
+        weights = [1.0 / (variance + tau_squared) for variance in variances]
+        weight_sum = math.fsum(weights)
+        location = math.fsum(
+            weight * estimate
+            for weight, estimate in zip(weights, estimates)
+        ) / weight_sum
+        q_value = math.fsum(
+            weight * (estimate - location) ** 2
+            for weight, estimate in zip(weights, estimates)
+        )
+        return location, q_value
+
+    degrees = len(estimates) - 1
+    _fixed, q_zero = location_and_q(0.0)
+    if q_zero <= degrees:
+        return {
+            "tau_squared": 0.0,
+            "q_at_zero": q_zero,
+            "q_at_tau": q_zero,
+            "iterations": 0,
+            "converged": True,
+        }
+
+    upper = max(
+        1e-18,
+        statistics.pvariance(estimates),
+        statistics.median(variances),
+    )
+    _location, q_upper = location_and_q(upper)
+    bracket_iterations = 0
+    while q_upper > degrees and bracket_iterations < 100:
+        upper *= 2.0
+        _location, q_upper = location_and_q(upper)
+        bracket_iterations += 1
+    if q_upper > degrees or not math.isfinite(upper):
+        return {
+            "tau_squared": upper,
+            "q_at_zero": q_zero,
+            "q_at_tau": q_upper,
+            "iterations": bracket_iterations,
+            "converged": False,
+        }
+
+    lower = 0.0
+    converged = False
+    q_middle = q_upper
+    bisection_iterations = 0
+    for bisection_iterations in range(1, 201):
+        middle = (lower + upper) / 2.0
+        _location, q_middle = location_and_q(middle)
+        if abs(q_middle - degrees) <= 1e-10 * max(1.0, degrees):
+            lower = upper = middle
+            converged = True
+            break
+        if q_middle > degrees:
+            lower = middle
+        else:
+            upper = middle
+        if upper - lower <= 1e-12 * max(1.0, upper):
+            converged = True
+            break
+    tau_squared = (lower + upper) / 2.0
+    _location, q_at_tau = location_and_q(tau_squared)
+    return {
+        "tau_squared": tau_squared,
+        "q_at_zero": q_zero,
+        "q_at_tau": q_at_tau,
+        "iterations": bracket_iterations + bisection_iterations,
+        "converged": converged,
+    }
+
+
+def _summarize_random_effects(
+    estimates: Sequence[float],
+    variances: Sequence[float],
+    per_run: list[dict[str, Any]],
+    total_runs: int,
+    confidence: float,
+    *,
+    estimand: str,
+) -> dict[str, Any]:
+    if len(estimates) < 2:
+        return {
+            "runs": per_run,
+            "random_effect_estimate": estimates[0] if estimates else None,
+            "tau_squared": None,
+            "i_squared": None,
+            "usable_runs": len(estimates),
+            "total_runs": total_runs,
+            "prediction_interval": None,
+            "tau_squared_method": "Paule-Mandel",
+            "confidence_interval": None,
+            "confidence_interval_method": "modified-Hartung-Knapp-t(k-1)",
+            "estimand": estimand,
+            "identifiable": False,
+        }
+    paule_mandel = _paule_mandel_tau_squared(estimates, variances)
+    degrees = len(estimates) - 1
+    tau_squared = float(paule_mandel["tau_squared"])
+    random_weights = [1.0 / (variance + tau_squared) for variance in variances]
+    random_weight_sum = math.fsum(random_weights)
+    random_estimate = math.fsum(
+        weight * value for weight, value in zip(random_weights, estimates)
+    ) / random_weight_sum
+    conventional_standard_error = math.sqrt(1.0 / random_weight_sum)
+    q_at_tau = math.fsum(
+        weight * (value - random_estimate) ** 2
+        for weight, value in zip(random_weights, estimates)
+    )
+    hartung_knapp_scale = q_at_tau / degrees
+    modified_hartung_knapp_scale = max(1.0, hartung_knapp_scale)
+    random_standard_error = conventional_standard_error * math.sqrt(
+        modified_hartung_knapp_scale
+    )
+    q_at_zero = float(paule_mandel["q_at_zero"])
+    i_squared = (
+        max(0.0, (q_at_zero - degrees) / q_at_zero)
+        if q_at_zero > 0.0
+        else 0.0
+    )
+    critical = _student_t_critical(confidence, degrees)
+    confidence_half_width = critical * random_standard_error
+    prediction_half_width = critical * math.sqrt(
+        tau_squared + random_standard_error * random_standard_error
+    )
+    return {
+        "runs": per_run,
+        "random_effect_estimate": random_estimate,
+        "random_effect_standard_error": random_standard_error,
+        "conventional_random_effect_standard_error": (
+            conventional_standard_error
+        ),
+        "tau_squared": tau_squared,
+        "tau_squared_method": "Paule-Mandel",
+        "tau_squared_converged": paule_mandel["converged"],
+        "tau_squared_iterations": paule_mandel["iterations"],
+        "i_squared": i_squared,
+        "cochran_q": q_at_zero,
+        "paule_mandel_q_at_tau_squared": q_at_tau,
+        "hartung_knapp_scale": hartung_knapp_scale,
+        "modified_hartung_knapp_scale": modified_hartung_knapp_scale,
+        "degrees_of_freedom": degrees,
+        "usable_runs": len(estimates),
+        "total_runs": total_runs,
+        "confidence_interval": [
+            random_estimate - confidence_half_width,
+            random_estimate + confidence_half_width,
+        ],
+        "confidence_interval_method": "modified-Hartung-Knapp-t(k-1)",
+        "prediction_interval": [
+            random_estimate - prediction_half_width,
+            random_estimate + prediction_half_width,
+        ],
+        "prediction_interval_method": (
+            "Paule-Mandel-modified-Hartung-Knapp-t(k-1)-with-ESS-inflated-run-SE"
+        ),
+        "estimand": estimand,
+        "identifiable": True,
+    }
+
+
 def _random_effects(
     fit: _Fit, response_name: str, confidence: float
 ) -> dict[str, Any]:
+    """保留给局部 contrast 诊断；绝对质量门禁使用 control-chain 版本。"""
+
     estimates: list[float] = []
     variances: list[float] = []
     per_run: list[dict[str, Any]] = []
-    for run in sorted({pair.run for pair in fit.pairs}):
+    run_names = _ordered_runs(fit.pairs)
+    for run in run_names:
         subset = [pair for pair in fit.pairs if pair.run == run]
         if len(subset) < 4:
             per_run.append({"run": run, "pairs": len(subset), "estimate": None})
             continue
         try:
-            current = _fit_variant(subset, response_name)
+            current = _fit_variant(
+                subset,
+                response_name,
+                batch_levels=fit.batch_levels,
+                batch_reference=fit.batch_reference,
+            )
         except MicrobenchmarkModelError:
             per_run.append({"run": run, "pairs": len(subset), "estimate": None})
             continue
@@ -1344,52 +2389,14 @@ def _random_effects(
                 ),
             }
         )
-    if len(estimates) < 2:
-        return {
-            "runs": per_run,
-            "random_effect_estimate": estimates[0] if estimates else None,
-            "tau_squared": None,
-            "i_squared": None,
-            "usable_runs": len(estimates),
-            "total_runs": len({pair.run for pair in fit.pairs}),
-            "prediction_interval": None,
-            "identifiable": False,
-        }
-    fixed_weights = [1.0 / value for value in variances]
-    fixed = math.fsum(weight * value for weight, value in zip(fixed_weights, estimates)) / math.fsum(fixed_weights)
-    q = math.fsum(
-        weight * (value - fixed) ** 2
-        for weight, value in zip(fixed_weights, estimates)
+    return _summarize_random_effects(
+        estimates,
+        variances,
+        per_run,
+        len(run_names),
+        confidence,
+        estimand="local-target-minus-control-contrast",
     )
-    degrees = len(estimates) - 1
-    c_value = math.fsum(fixed_weights) - math.fsum(weight * weight for weight in fixed_weights) / math.fsum(fixed_weights)
-    tau_squared = max(0.0, (q - degrees) / c_value) if c_value > 0.0 else 0.0
-    random_weights = [1.0 / (variance + tau_squared) for variance in variances]
-    random_estimate = math.fsum(
-        weight * value for weight, value in zip(random_weights, estimates)
-    ) / math.fsum(random_weights)
-    random_standard_error = math.sqrt(1.0 / math.fsum(random_weights))
-    i_squared = max(0.0, (q - degrees) / q) if q > 0.0 else 0.0
-    prediction_half_width = _student_t_critical(
-        confidence, degrees
-    ) * math.sqrt(tau_squared + random_standard_error * random_standard_error)
-    return {
-        "runs": per_run,
-        "random_effect_estimate": random_estimate,
-        "random_effect_standard_error": random_standard_error,
-        "tau_squared": tau_squared,
-        "i_squared": i_squared,
-        "cochran_q": q,
-        "degrees_of_freedom": degrees,
-        "usable_runs": len(estimates),
-        "total_runs": len({pair.run for pair in fit.pairs}),
-        "prediction_interval": [
-            random_estimate - prediction_half_width,
-            random_estimate + prediction_half_width,
-        ],
-        "prediction_interval_method": "DL-t-approx-with-ESS-inflated-run-SE",
-        "identifiable": True,
-    }
 
 
 def _per_run_design_diagnostics(fit: _Fit, response_name: str) -> list[dict[str, Any]]:
@@ -1397,7 +2404,7 @@ def _per_run_design_diagnostics(fit: _Fit, response_name: str) -> list[dict[str,
 
     global_batches = {pair.batch for pair in fit.pairs}
     diagnostics: list[dict[str, Any]] = []
-    for run in sorted({pair.run for pair in fit.pairs}):
+    for run in _ordered_runs(fit.pairs):
         members = [pair for pair in fit.pairs if pair.run == run]
         negative = sum(pair.order < 0.0 for pair in members)
         positive = sum(pair.order > 0.0 for pair in members)
@@ -1406,7 +2413,12 @@ def _per_run_design_diagnostics(fit: _Fit, response_name: str) -> list[dict[str,
         blocks = {pair.block for pair in members}
         current: _Fit | None = None
         try:
-            current = _fit_variant(members, response_name)
+            current = _fit_variant(
+                members,
+                response_name,
+                batch_levels=fit.batch_levels,
+                batch_reference=fit.batch_reference,
+            )
         except MicrobenchmarkModelError:
             pass
         diagnostics.append(
@@ -1451,37 +2463,107 @@ def _moving_block_positions(length: int, block_length: int, rng: random.Random) 
     return result[:length]
 
 
+def _run_resample_positions(
+    length: int, block_length: int, rng: random.Random
+) -> list[int]:
+    """主权重与辅助一致性检查共享的 run circular-block 下标。"""
+
+    return _moving_block_positions(length, block_length, rng)
+
+
 def _hierarchical_resample(
-    pairs: Sequence[_Pair], block_length: int, rng: random.Random
+    pairs: Sequence[_Pair],
+    block_length: int,
+    rng: random.Random,
+    *,
+    run_block_length: int = 1,
+    run_positions: Sequence[int] | None = None,
 ) -> list[_Pair]:
-    by_run: dict[str, list[_Pair]] = defaultdict(list)
+    by_super_run: dict[str, list[_Pair]] = defaultdict(list)
     for pair in pairs:
-        by_run[pair.run].append(pair)
-    run_names = sorted(by_run)
-    selected_runs = [rng.choice(run_names) for _ in run_names]
-    output: list[_Pair] = []
-    for run_copy, run in enumerate(selected_runs):
-        members = by_run[run]
-        blocks: dict[str, list[_Pair]] = defaultdict(list)
-        for pair in members:
-            blocks[pair.block].append(pair)
-        block_names = sorted(
-            blocks, key=lambda name: min(pair.sequence for pair in blocks[name])
+        by_super_run[pair.super_run].append(pair)
+    super_run_names = _ordered_super_runs(pairs)
+    if run_positions is None:
+        run_positions = _moving_block_positions(
+            len(super_run_names), run_block_length, rng
         )
-        positions = _moving_block_positions(len(block_names), block_length, rng)
-        sequence = 0.0
-        synthetic_run = f"bootstrap-run-{run_copy}"
-        for block_copy, position in enumerate(positions):
-            for pair in sorted(blocks[block_names[position]], key=lambda item: item.sequence):
-                output.append(
-                    replace(
-                        pair,
-                        run=synthetic_run,
-                        block=f"bootstrap-block-{block_copy}",
-                        sequence=sequence,
+    if len(run_positions) != len(super_run_names) or any(
+        position < 0 or position >= len(super_run_names)
+        for position in run_positions
+    ):
+        raise MicrobenchmarkModelError("super-run bootstrap 下标越界或长度不匹配")
+    selected_super_runs = [
+        super_run_names[position] for position in run_positions
+    ]
+    output: list[_Pair] = []
+    synthetic_run_order = 0
+    for super_copy, super_run in enumerate(selected_super_runs):
+        super_members = by_super_run[super_run]
+        source_runs = _ordered_runs(super_members)
+        synthetic_super_run = f"bootstrap-super-run-{super_copy}"
+        for source_run in source_runs:
+            members = [pair for pair in super_members if pair.run == source_run]
+            blocks: dict[str, list[_Pair]] = defaultdict(list)
+            for pair in members:
+                blocks[pair.block].append(pair)
+            block_names = sorted(
+                blocks,
+                key=lambda name: min(pair.sequence for pair in blocks[name]),
+            )
+            head_blocks = [
+                name
+                for name in block_names
+                if any(pair.anchor_position == "head" for pair in blocks[name])
+            ]
+            tail_blocks = [
+                name
+                for name in block_names
+                if any(pair.anchor_position == "tail" for pair in blocks[name])
+            ]
+            if head_blocks or tail_blocks:
+                if len(head_blocks) != 1 or len(tail_blocks) != 1:
+                    raise MicrobenchmarkModelError(
+                        "anchor bootstrap 要求每个 QEMU run 恰有一个 head/tail block"
                     )
+                body_blocks = [
+                    name
+                    for name in block_names
+                    if name not in {head_blocks[0], tail_blocks[0]}
+                ]
+                body_positions = _moving_block_positions(
+                    len(body_blocks), block_length, rng
                 )
-                sequence += 1.0
+                selected_blocks = [head_blocks[0]] + [
+                    body_blocks[position] for position in body_positions
+                ] + [tail_blocks[0]]
+            else:
+                positions = _moving_block_positions(
+                    len(block_names), block_length, rng
+                )
+                selected_blocks = [block_names[position] for position in positions]
+            sequence = 0.0
+            synthetic_run = f"{synthetic_super_run}-qemu-{synthetic_run_order}"
+            for block_copy, selected_block in enumerate(selected_blocks):
+                for pair in sorted(
+                    blocks[selected_block],
+                    key=lambda item: item.sequence,
+                ):
+                    output.append(
+                        replace(
+                            pair,
+                            run=synthetic_run,
+                            run_order=synthetic_run_order,
+                            run_order_source=(
+                                "bootstrap-super-run-circular-moving-block"
+                            ),
+                            super_run=synthetic_super_run,
+                            super_run_order=super_copy,
+                            block=f"bootstrap-block-{block_copy}",
+                            sequence=sequence,
+                        )
+                    )
+                    sequence += 1.0
+            synthetic_run_order += 1
     return output
 
 
@@ -1567,19 +2649,56 @@ def _simultaneous_intervals(
     points: Mapping[Any, float],
     rows: Sequence[Mapping[Any, float]],
     confidence: float,
-) -> tuple[dict[Any, list[float] | None], float | None, int]:
+    monte_carlo_confidence: float | None = None,
+) -> tuple[dict[Any, list[float] | None], float | None, int, dict[str, Any]]:
     """以全族 max-standardized-deviation 构造同时区间。"""
 
     alpha = 1.0 - confidence
+    family = set(points)
+    # 所有 estimand 必须先筛到同一批完整重采样。若允许每个 estimand
+    # 各自使用部分 replicate，不同缺失模式会让尺度与联合统计量基于不同
+    # 经验分布，进而产生反保守的同时区间。
+    complete_rows = [row for row in rows if family.issubset(row)]
+    # 用独立的 bootstrap 子样本估计标准化尺度和校准 max-stat 分位数。
+    # 若同一批 draw 同时参与样本标准差和 order statistic，max-stat 之间
+    # 只有交换性而非二项 rank 证明要求的条件独立性。正式 B=4999 时固定
+    # 使用前 999 个 complete draw 拟合尺度、后 4000 个校准临界值。
+    if len(complete_rows) < PUBLICATION_MINIMUM_MAX_STAT_CALIBRATION_REPLICATES:
+        # 小样本只用于诊断，若再切掉一个尺度子样本会无声丢弃大量有效
+        # 观测。这里显式复用完整行，并在 evidence 中标记非独立校准；正式
+        # 发布要求 B>=4999，因此永远走下面的独立 999/4000 分区。
+        scale_rows = complete_rows
+        calibration_rows = complete_rows
+        partition_method = "all-complete-replicates-diagnostic-v1"
+    else:
+        scale_count = min(
+            PUBLICATION_MAX_STAT_SCALE_REPLICATES,
+            max(2, len(complete_rows) // MAX_STATISTIC_SCALE_REPLICATE_DIVISOR),
+            max(0, len(complete_rows) - 1),
+        )
+        scale_rows = complete_rows[:scale_count]
+        calibration_rows = complete_rows[scale_count:]
+        partition_method = (
+            "ordered-independent-prefix-scale-remainder-quantile-v1"
+        )
     standard_deviations: dict[Any, float | None] = {}
     marginal: dict[Any, list[float] | None] = {}
     for key, point in points.items():
-        values = [row[key] for row in rows if key in row]
-        standard_deviations[key] = (
-            statistics.stdev(values) if len(values) >= 2 else None
+        scale_values = [row[key] for row in scale_rows]
+        calibration_values = [row[key] for row in calibration_rows]
+        complete_values = [row[key] for row in complete_rows]
+        scale = (
+            statistics.stdev(scale_values)
+            if len(scale_values) >= 2
+            else None
         )
-        low = _quantile(values, alpha / 2.0)
-        high = _quantile(values, 1.0 - alpha / 2.0)
+        if scale == 0.0 and not all(
+            value == point for value in complete_values
+        ):
+            scale = None
+        standard_deviations[key] = scale
+        low = _quantile(calibration_values, alpha / 2.0)
+        high = _quantile(calibration_values, 1.0 - alpha / 2.0)
         marginal[key] = None if low is None or high is None else [low, high]
     eligible = [
         key
@@ -1587,28 +2706,43 @@ def _simultaneous_intervals(
         if scale is not None and scale > 0.0 and math.isfinite(points[key])
     ]
     max_statistics: list[float] = []
-    if points and not eligible:
-        max_statistics = [
-            0.0 for row in rows if all(key in row for key in points)
-        ]
-    for row in rows:
+    exact_family = bool(points) and all(
+        complete_rows
+        and all(row[key] == points[key] for row in complete_rows)
+        for key in points
+    )
+    if exact_family:
+        max_statistics = [0.0 for _row in calibration_rows]
+    for row in calibration_rows:
         if not eligible:
             break
-        if any(key not in row for key in eligible):
-            continue
         deviations = [
             abs((row[key] - points[key]) / float(standard_deviations[key]))
             for key in eligible
         ]
         if deviations:
             max_statistics.append(max(deviations))
-    critical = _quantile(max_statistics, confidence)
+    critical, monte_carlo = _conservative_bootstrap_quantile(
+        max_statistics,
+        confidence,
+        confidence
+        if monte_carlo_confidence is None
+        else monte_carlo_confidence,
+    )
+    monte_carlo.update(
+        {
+            "replicate_partition_method": partition_method,
+            "complete_family_replicates": len(complete_rows),
+            "scale_replicates": len(scale_rows),
+            "quantile_replicates": len(calibration_rows),
+        }
+    )
     intervals: dict[Any, list[float] | None] = {}
     for key, point in points.items():
         scale = standard_deviations[key]
         if scale is None:
             # 精确常量的 bootstrap 分布仍支持零宽同时区间。
-            values = [row[key] for row in rows if key in row]
+            values = [row[key] for row in complete_rows]
             intervals[key] = [point, point] if values and all(
                 value == point for value in values
             ) else None
@@ -1622,7 +2756,59 @@ def _simultaneous_intervals(
             low = min(low, marginal[key][0])
             high = max(high, marginal[key][1])
         intervals[key] = [low, high]
-    return intervals, critical, len(max_statistics)
+    return intervals, critical, len(max_statistics), monte_carlo
+
+
+def _conservative_bootstrap_quantile(
+    values: Sequence[float], probability: float, monte_carlo_confidence: float
+) -> tuple[float | None, dict[str, Any]]:
+    """返回 bootstrap 分位数的单侧 Monte-Carlo 上置信 order statistic。"""
+
+    count = len(values)
+    evidence: dict[str, Any] = {
+        "method": "one-sided-binomial-order-statistic-upper-confidence-bound",
+        "target_probability": probability,
+        "monte_carlo_confidence": monte_carlo_confidence,
+        "replicates": count,
+        "required_rank": None,
+        "selected_rank": None,
+        "finite_rank_supported": False,
+    }
+    if count == 0:
+        return None, evidence
+    if not 0.0 < probability < 1.0 or not 0.0 < monte_carlo_confidence < 1.0:
+        raise MicrobenchmarkModelError("bootstrap 分位数概率必须位于 (0,1)")
+
+    log_probabilities = [
+        math.lgamma(count + 1)
+        - math.lgamma(successes + 1)
+        - math.lgamma(count - successes + 1)
+        + successes * math.log(probability)
+        + (count - successes) * math.log1p(-probability)
+        for successes in range(count + 1)
+    ]
+    log_peak = max(log_probabilities)
+    probabilities = [math.exp(value - log_peak) for value in log_probabilities]
+    normalization = math.fsum(probabilities)
+    cumulative = 0.0
+    required_rank = count + 1
+    for successes, mass in enumerate(probabilities):
+        cumulative += mass / normalization
+        if cumulative >= monte_carlo_confidence:
+            # X_(r) >= q_p exactly when at most r-1 bootstrap draws are below q_p.
+            required_rank = successes + 1
+            break
+    supported = required_rank <= count
+    selected_rank = required_rank if supported else count
+    ordered = sorted(values)
+    evidence.update(
+        {
+            "required_rank": required_rank,
+            "selected_rank": selected_rank,
+            "finite_rank_supported": supported,
+        }
+    )
+    return ordered[selected_rank - 1], evidence
 
 
 def _per_run_absolute_estimates(
@@ -1632,20 +2818,27 @@ def _per_run_absolute_estimates(
 ) -> tuple[
     dict[_InstructionKey, dict[str, float]],
     dict[_InstructionKey, set[str]],
+    dict[_InstructionKey, dict[str, float]],
 ]:
-    """在主 fit 的同一批 pair 上按 run 拟合并解析 control 链。"""
+    """按 run 拟合 control 链，并以标准误之和给出最坏相关性方差界。"""
 
-    run_names = sorted({pair.run for fit in fits.values() for pair in fit.pairs})
+    run_names = _ordered_super_runs(
+        pair for fit in fits.values() for pair in fit.pairs
+    )
     estimates: dict[_InstructionKey, dict[str, float]] = {
         key: {} for key in fits
     }
     incomplete: dict[_InstructionKey, set[str]] = {
         key: set() for key in fits
     }
+    variances: dict[_InstructionKey, dict[str, float]] = {
+        key: {} for key in fits
+    }
     for run in run_names:
         contrasts: dict[_InstructionKey, float] = {}
+        contrast_standard_errors: dict[_InstructionKey, float] = {}
         for key, fit in fits.items():
-            members = [pair for pair in fit.pairs if pair.run == run]
+            members = [pair for pair in fit.pairs if pair.super_run == run]
             response_name = response_names[key]
             if len(members) < 4 or any(
                 getattr(pair, response_name) is None for pair in members
@@ -1654,7 +2847,11 @@ def _per_run_absolute_estimates(
                 continue
             try:
                 current = _fit_variant(
-                    members, response_name, compute_condition=False
+                    members,
+                    response_name,
+                    compute_condition=False,
+                    batch_levels=fit.batch_levels,
+                    batch_reference=fit.batch_reference,
                 )
             except MicrobenchmarkModelError:
                 incomplete[key].add(run)
@@ -1662,15 +2859,214 @@ def _per_run_absolute_estimates(
             if not current.irls_converged:
                 incomplete[key].add(run)
                 continue
+            run_ess, _run_rows, _run_block = _acf_ess(current)
+            if run_ess <= 0.0:
+                incomplete[key].add(run)
+                continue
+            dependence_inflation = max(1.0, len(members) / run_ess)
+            variance = (
+                current.standard_error
+                * current.standard_error
+                * dependence_inflation
+                if current.standard_error is not None
+                and current.standard_error > 0.0
+                else max(
+                    1e-18,
+                    statistics.pvariance(current.residuals) / len(members),
+                )
+            )
             contrasts[key] = current.estimate
+            contrast_standard_errors[key] = math.sqrt(variance)
         absolute, failures = _resolve_absolute(contrasts, controls)
+        absolute_standard_errors, variance_failures = _resolve_absolute(
+            contrast_standard_errors, controls
+        )
         for key in fits:
             value = absolute.get(key)
-            if key in failures or value is None or not math.isfinite(value):
+            standard_error = absolute_standard_errors.get(key)
+            if (
+                key in failures
+                or key in variance_failures
+                or value is None
+                or standard_error is None
+                or not math.isfinite(value)
+                or not math.isfinite(standard_error)
+                or standard_error <= 0.0
+            ):
                 incomplete[key].add(run)
             else:
                 estimates[key][run] = float(value)
-    return estimates, incomplete
+                variances[key][run] = float(standard_error * standard_error)
+    return estimates, incomplete, variances
+
+
+def _absolute_random_effects(
+    fits: Mapping[_InstructionKey, _Fit],
+    response_names: Mapping[_InstructionKey, str],
+    controls: Mapping[_InstructionKey, _InstructionKey | None],
+    confidence: float,
+    per_run_data: tuple[
+        dict[_InstructionKey, dict[str, float]],
+        dict[_InstructionKey, set[str]],
+        dict[_InstructionKey, dict[str, float]],
+    ]
+    | None = None,
+) -> dict[_InstructionKey, dict[str, Any]]:
+    """以 per-run absolute cost，而非局部 target-control contrast 做异质性。"""
+
+    estimates, incomplete, variances = (
+        per_run_data
+        if per_run_data is not None
+        else _per_run_absolute_estimates(fits, response_names, controls)
+    )
+    result: dict[_InstructionKey, dict[str, Any]] = {}
+    for key, fit in fits.items():
+        run_names = _ordered_super_runs(fit.pairs)
+        usable = [
+            run
+            for run in run_names
+            if run in estimates[key] and run in variances[key]
+        ]
+        per_run = [
+            {
+                "run": run,
+                "pairs": sum(pair.super_run == run for pair in fit.pairs),
+                "estimate": estimates[key].get(run),
+                "standard_error": (
+                    math.sqrt(variances[key][run])
+                    if run in variances[key]
+                    else None
+                ),
+                "complete_control_chain": run not in incomplete[key],
+            }
+            for run in run_names
+        ]
+        meta = _summarize_random_effects(
+            [estimates[key][run] for run in usable],
+            [variances[key][run] for run in usable],
+            per_run,
+            len(run_names),
+            confidence,
+            estimand="absolute-instruction-cost-through-control-chain",
+        )
+        meta["run_variance_method"] = (
+            "square-of-summed-control-chain-contrast-SEs-with-ESS-inflation"
+        )
+        meta["run_variance_covariance_assumption"] = (
+            "worst-case-perfect-positive-correlation-upper-bound"
+        )
+        meta["incomplete_control_chain_runs"] = [
+            run for run in run_names if run in incomplete[key]
+        ]
+        result[key] = meta
+    return result
+
+
+def _leave_one_super_run_out_sensitivity(
+    fits: Mapping[_InstructionKey, _Fit],
+    response_names: Mapping[_InstructionKey, str],
+    controls: Mapping[_InstructionKey, _InstructionKey | None],
+    full_estimates: Mapping[_InstructionKey, float | None],
+) -> dict[_InstructionKey, dict[str, Any]]:
+    """删除一个最高层 cluster 后重新拟合发布估计器。
+
+    这是 deterministic influence analysis，不产生额外独立样本，也不把
+    jackknife 标准误与 bootstrap 区间混用。每次删除后重新估计异方差权重、
+    Huber 权重、run 固定效应和完整 control chain，并直接与全样本发布点估计
+    比较。
+    """
+
+    super_runs = _ordered_super_runs(
+        pair for fit in fits.values() for pair in fit.pairs
+    )
+    values: dict[_InstructionKey, list[dict[str, Any]]] = {
+        key: [] for key in fits
+    }
+    failures: dict[_InstructionKey, set[str]] = {
+        key: set() for key in fits
+    }
+    if len(super_runs) < 3:
+        return {
+            key: {
+                "method": (
+                    "leave-one-complete-crossover-super-run-out full Huber "
+                    "heteroscedastic control-chain refit"
+                ),
+                "complete": False,
+                "reason": "fewer-than-three-super-runs",
+                "runs": len(super_runs),
+                "maximum_absolute_shift_ns": None,
+                "per_super_run": [],
+            }
+            for key in fits
+        }
+    for omitted in super_runs:
+        contrasts: dict[_InstructionKey, float] = {}
+        failed_keys: set[_InstructionKey] = set()
+        for key, fit in fits.items():
+            members = [
+                pair for pair in fit.pairs if pair.super_run != omitted
+            ]
+            try:
+                current = _fit_variant(
+                    members,
+                    response_names[key],
+                    compute_condition=False,
+                    compute_standard_error=False,
+                    batch_levels=fit.batch_levels,
+                    batch_reference=fit.batch_reference,
+                )
+            except MicrobenchmarkModelError:
+                failed_keys.add(key)
+                continue
+            if not current.irls_converged:
+                failed_keys.add(key)
+                continue
+            contrasts[key] = current.estimate
+        absolute, resolution_failures = _resolve_absolute(contrasts, controls)
+        for key in fits:
+            point = full_estimates.get(key)
+            estimate = absolute.get(key)
+            if (
+                key in failed_keys
+                or key in resolution_failures
+                or point is None
+                or estimate is None
+                or not math.isfinite(float(point))
+                or not math.isfinite(float(estimate))
+            ):
+                failures[key].add(omitted)
+                continue
+            shift = float(estimate) - float(point)
+            values[key].append(
+                {
+                    "omitted_super_run": omitted,
+                    "ns_per_instruction": float(estimate),
+                    "full_estimate_ns_per_instruction": float(point),
+                    "shift_ns": shift,
+                }
+            )
+    return {
+        key: {
+            "method": (
+                "leave-one-complete-crossover-super-run-out full Huber "
+                "heteroscedastic control-chain refit"
+            ),
+            "complete": not failures[key]
+            and len(values[key]) == len(super_runs),
+            "reason": None if not failures[key] else "one-or-more-refits-failed",
+            "runs": len(super_runs),
+            "full_estimate_ns_per_instruction": full_estimates.get(key),
+            "maximum_absolute_shift_ns": (
+                max(abs(float(row["shift_ns"])) for row in values[key])
+                if values[key]
+                else None
+            ),
+            "failed_super_runs": sorted(failures[key]),
+            "per_super_run": values[key],
+        }
+        for key in fits
+    }
 
 
 def _auxiliary_run_cluster_inference(
@@ -1680,31 +3076,61 @@ def _auxiliary_run_cluster_inference(
     comparison_modes: Mapping[_InstructionKey, str | None],
     replicate_seeds: Sequence[int],
     confidence: float,
+    run_block_length: int,
+    monte_carlo_confidence: float | None = None,
 ) -> dict[str, Any]:
-    """用一次性 per-run 拟合和廉价 run bootstrap 校验两套辅助时钟。"""
+    """用一次性 per-run 拟合和与主模型一致的 run 块 bootstrap 校验时钟。"""
 
-    primary, primary_incomplete = _per_run_absolute_estimates(
+    primary, primary_incomplete, _primary_variances = _per_run_absolute_estimates(
         fits, response_names, controls
     )
     guest_names = {key: "guest_delta_ns" for key in fits}
     plugin_off_names = {key: "plugin_off_guest_delta_ns" for key in fits}
-    guest, guest_incomplete = _per_run_absolute_estimates(
+    guest, guest_incomplete, _guest_variances = _per_run_absolute_estimates(
         fits, guest_names, controls
     )
-    plugin_off, plugin_off_incomplete = _per_run_absolute_estimates(
-        fits, plugin_off_names, controls
+    plugin_off, plugin_off_incomplete, _plugin_off_variances = (
+        _per_run_absolute_estimates(
+            fits, plugin_off_names, controls
+        )
+    )
+    cross_difference_names = {
+        key: "cross_clock_difference_ns" for key in fits
+    }
+    plugin_off_difference_names = {
+        key: "plugin_off_difference_ns" for key in fits
+    }
+    cross_difference, cross_difference_incomplete, _cross_difference_variances = (
+        _per_run_absolute_estimates(
+            fits, cross_difference_names, controls
+        )
+    )
+    (
+        plugin_off_difference,
+        plugin_off_difference_incomplete,
+        _plugin_off_difference_variances,
+    ) = _per_run_absolute_estimates(
+        fits, plugin_off_difference_names, controls
     )
     metric_sources: dict[
         tuple[str, _InstructionKey], tuple[list[str], list[float], list[float]]
     ] = {}
     coverage: dict[_InstructionKey, dict[str, Any]] = {}
     for key, fit in fits.items():
-        runs = sorted({pair.run for pair in fit.pairs})
+        runs = _ordered_super_runs(fit.pairs)
         primary_complete = not primary_incomplete[key] and set(primary[key]) == set(runs)
         guest_complete = not guest_incomplete[key] and set(guest[key]) == set(runs)
         plugin_off_complete = (
             not plugin_off_incomplete[key]
             and set(plugin_off[key]) == set(runs)
+        )
+        cross_difference_complete = (
+            not cross_difference_incomplete[key]
+            and set(cross_difference[key]) == set(runs)
+        )
+        plugin_off_difference_complete = (
+            not plugin_off_difference_incomplete[key]
+            and set(plugin_off_difference[key]) == set(runs)
         )
         coverage[key] = {
             "required_runs": len(runs),
@@ -1714,15 +3140,35 @@ def _auxiliary_run_cluster_inference(
             "primary_complete": primary_complete,
             "guest_complete": guest_complete,
             "plugin_off_complete": plugin_off_complete,
+            "cross_difference_usable_runs": len(cross_difference[key]),
+            "plugin_off_difference_usable_runs": len(
+                plugin_off_difference[key]
+            ),
+            "cross_difference_complete": cross_difference_complete,
+            "plugin_off_difference_complete": (
+                plugin_off_difference_complete
+            ),
         }
         mode = comparison_modes.get(key)
-        if primary_complete and guest_complete and mode is not None:
+        if mode == "difference" and cross_difference_complete:
+            metric_sources[("cross-clock-difference", key)] = (
+                runs,
+                [0.0 for _run in runs],
+                [cross_difference[key][run] for run in runs],
+            )
+        elif primary_complete and guest_complete and mode is not None:
             metric_sources[(f"cross-clock-{mode}", key)] = (
                 runs,
                 [primary[key][run] for run in runs],
                 [guest[key][run] for run in runs],
             )
-        if guest_complete and plugin_off_complete and mode is not None:
+        if mode == "difference" and plugin_off_difference_complete:
+            metric_sources[("plugin-off-difference", key)] = (
+                runs,
+                [0.0 for _run in runs],
+                [plugin_off_difference[key][run] for run in runs],
+            )
+        elif guest_complete and plugin_off_complete and mode is not None:
             metric_sources[(f"plugin-off-{mode}", key)] = (
                 runs,
                 [plugin_off[key][run] for run in runs],
@@ -1748,15 +3194,18 @@ def _auxiliary_run_cluster_inference(
             points[metric] = value
     bootstrap_rows: list[dict[tuple[str, _InstructionKey], float]] = []
     for replicate_seed in replicate_seeds:
-        rng = random.Random(replicate_seed ^ 0xA11CE5EED)
         row: dict[tuple[str, _InstructionKey], float] = {}
         sampled_by_runs: dict[tuple[str, ...], list[int]] = {}
         for metric, (runs, denominator, numerator) in metric_sources.items():
             run_key = tuple(runs)
-            indices = sampled_by_runs.setdefault(
-                run_key,
-                [rng.randrange(len(runs)) for _ in runs],
-            )
+            indices = sampled_by_runs.get(run_key)
+            if indices is None:
+                indices = _run_resample_positions(
+                    len(runs),
+                    run_block_length,
+                    random.Random(replicate_seed),
+                )
+                sampled_by_runs[run_key] = indices
             value = metric_value(
                 metric[0],
                 [denominator[index] for index in indices],
@@ -1765,8 +3214,11 @@ def _auxiliary_run_cluster_inference(
             if value is not None:
                 row[metric] = value
         bootstrap_rows.append(row)
-    intervals, critical, valid = _simultaneous_intervals(
-        points, bootstrap_rows, confidence
+    intervals, critical, valid, monte_carlo = _simultaneous_intervals(
+        points,
+        bootstrap_rows,
+        confidence,
+        monte_carlo_confidence,
     )
     return {
         "points": points,
@@ -1774,32 +3226,458 @@ def _auxiliary_run_cluster_inference(
         "coverage": coverage,
         "critical_value": critical,
         "valid_replicates": valid,
+        "complete_max_statistic_replicates": valid,
+        "complete_family_replicates": monte_carlo["complete_family_replicates"],
         "requested_replicates": len(replicate_seeds),
+        "critical_value_monte_carlo": monte_carlo,
     }
+
+
+def _fit_diagnostic_effects(fit: _Fit) -> dict[str, float | None]:
+    """返回 bootstrap 使用的稳定诊断键，包括局部 categorical batch 效应。"""
+
+    process = _process_crossover_effects(fit)
+    effects: dict[str, float | None] = {
+        "order": fit.order_effect,
+        "drift": fit.drift_effect,
+        # 兼容旧消费者的端点割线，不用于 categorical batch 门禁。
+        "batch": fit.batch_effect,
+        "translation": fit.translation_effect,
+        "process_design": process["design_abba_minus_baab"],
+        "process_period": process["second_pair_minus_first_pair"],
+        "process_carryover": process[
+            "preceded_by_plugin_off_minus_other_timing"
+        ],
+    }
+    for rank, level in enumerate(fit.batch_levels):
+        if level != fit.batch_reference:
+            effects[f"batch_level_rank:{rank}"] = (
+                fit.batch_level_effects[level]
+            )
+    for left_rank, left in enumerate(fit.batch_levels):
+        for right_rank, right in enumerate(
+            fit.batch_levels[left_rank + 1 :], start=left_rank + 1
+        ):
+            effects[f"batch_pairwise_rank:{left_rank}:{right_rank}"] = (
+                fit.batch_level_effects[right]
+                - fit.batch_level_effects[left]
+            )
+    return effects
+
+
+def _process_crossover_effects(fit: _Fit) -> dict[str, Any]:
+    """从 QEMU run 固定效应构造进程级 crossover 对比。"""
+
+    metadata: dict[str, tuple[str, int]] = {}
+    for pair in fit.pairs:
+        if pair.crossover_design not in {"ABBA", "BAAB"} or pair.crossover_pair not in {
+            1,
+            2,
+        }:
+            return {
+                "available": False,
+                "reason": "process-crossover-metadata-unavailable",
+                "design_counts": {},
+                "minimum_design_fraction": 0.0,
+                "design_abba_minus_baab": None,
+                "second_pair_minus_first_pair": None,
+                "preceded_by_plugin_off_minus_other_timing": None,
+            }
+        current = (pair.crossover_design, pair.crossover_pair)
+        previous = metadata.setdefault(pair.run, current)
+        if previous != current:
+            raise MicrobenchmarkModelError("同一 QEMU run 的 crossover 元数据不一致")
+
+    by_super: dict[str, dict[int, float]] = defaultdict(dict)
+    designs: dict[str, str] = {}
+    run_to_super = {pair.run: pair.super_run for pair in fit.pairs}
+    for run, estimate in fit.run_level_estimates.items():
+        design, crossover_pair = metadata[run]
+        super_run = run_to_super[run]
+        previous_design = designs.setdefault(super_run, design)
+        if previous_design != design or crossover_pair in by_super[super_run]:
+            raise MicrobenchmarkModelError("super-run 的 crossover 固定效应不唯一")
+        by_super[super_run][crossover_pair] = estimate
+    if not by_super or any(set(values) != {1, 2} for values in by_super.values()):
+        return {
+            "available": False,
+            "reason": "process-crossover-pair-coverage-incomplete",
+            "design_counts": {},
+            "minimum_design_fraction": 0.0,
+            "design_abba_minus_baab": None,
+            "second_pair_minus_first_pair": None,
+            "preceded_by_plugin_off_minus_other_timing": None,
+        }
+
+    centers: dict[str, list[float]] = defaultdict(list)
+    period: list[float] = []
+    carryover: list[float] = []
+    for super_run, pair_estimates in by_super.items():
+        first = pair_estimates[1]
+        second = pair_estimates[2]
+        design = designs[super_run]
+        centers[design].append((first + second) / 2.0)
+        period.append(second - first)
+        # ABBA 的第二个 timing、BAAB 的第一个 timing 紧跟 plugin-off launch。
+        carryover.append(second - first if design == "ABBA" else first - second)
+    counts = {name: len(values) for name, values in sorted(centers.items())}
+    total = len(by_super)
+    minimum_fraction = min(
+        (counts.get("ABBA", 0) / total, counts.get("BAAB", 0) / total)
+    )
+    design_effect = (
+        statistics.mean(centers["ABBA"]) - statistics.mean(centers["BAAB"])
+        if centers.get("ABBA") and centers.get("BAAB")
+        else None
+    )
+    return {
+        "available": design_effect is not None,
+        "reason": None if design_effect is not None else "process-crossover-design-unbalanced",
+        "design_counts": counts,
+        "minimum_design_fraction": minimum_fraction,
+        "design_abba_minus_baab": design_effect,
+        "second_pair_minus_first_pair": statistics.mean(period),
+        "preceded_by_plugin_off_minus_other_timing": statistics.mean(carryover),
+    }
+
+
+def _resolve_diagnostic_effects(
+    diagnostics: Mapping[_InstructionKey, Mapping[str, float | None]],
+    controls: Mapping[_InstructionKey, _InstructionKey | None],
+) -> dict[_InstructionKey, dict[str, float]]:
+    """沿 control graph 累加可比较的 nuisance contrast。"""
+
+    resolved: dict[_InstructionKey, dict[str, float]] = {
+        key: {} for key in diagnostics
+    }
+    names = sorted(
+        {
+            name
+            for values in diagnostics.values()
+            for name, value in values.items()
+            if value is not None
+        }
+    )
+    for name in names:
+        contrasts = {
+            key: float(value)
+            for key, values in diagnostics.items()
+            if (value := values.get(name)) is not None
+        }
+        if name.startswith(("batch_level_rank:", "batch_pairwise_rank:")):
+            # Batch 档位是当前 target-control edge 的实际执行规模。不同 edge
+            # 可以使用不同物理 batch 网格，不能沿 control graph 按 rank 或
+            # 原始数值相加；control 自身的稳定性由 quality chain 独立传播。
+            for key, value in contrasts.items():
+                resolved[key][name] = value
+            continue
+        absolute, failures = _resolve_absolute(contrasts, controls)
+        for key, value in absolute.items():
+            if key not in failures and value is not None and math.isfinite(value):
+                resolved[key][name] = float(value)
+    return resolved
+
+
+def _anchor_super_run_calibration(
+    pairs: Sequence[_Pair], *, minimum_signal: float = 0.5
+) -> dict[str, Any]:
+    """从每个 super-run 的独立正锚点估计 plugin-off 到主时钟的尺度。
+
+    这里使用同一 anchor contrast 的组内中位数比，而不使用任何目标指令
+    响应。最高层 bootstrap 会重新采样 anchor block 并再次调用本函数，
+    因而把分母测量误差和宿主速度变化一并传播到 adjusted 权重。
+    """
+
+    anchor_keys = {
+        pair.key for pair in pairs if pair.key.pattern == STABILITY_ANCHOR_PATTERN
+    }
+    if len(anchor_keys) != 1:
+        return {
+            "status": "unavailable",
+            "reason": "requires-exactly-one-positive-stability-anchor",
+            "anchor_key": None,
+            "scales": {},
+            "metrics": {},
+            "per_super_run": [],
+        }
+    anchor_key = next(iter(anchor_keys))
+    expected_runs = _ordered_super_runs(pairs)
+    anchor_pairs = [pair for pair in pairs if pair.key == anchor_key]
+    scales: dict[str, float] = {}
+    rows: list[dict[str, Any]] = []
+    metric_values: dict[str, list[float]] = defaultdict(list)
+    for super_run in expected_runs:
+        members = [
+            pair for pair in anchor_pairs if pair.super_run == super_run
+        ]
+        if len(members) < 4 or any(
+            pair.plugin_delta_ns is None
+            or pair.guest_delta_ns is None
+            or pair.plugin_off_guest_delta_ns is None
+            for pair in members
+        ):
+            return {
+                "status": "unavailable",
+                "reason": "anchor-super-run-coverage-incomplete",
+                "anchor_key": anchor_key.public(),
+                "scales": {},
+                "metrics": {},
+                "per_super_run": rows,
+            }
+        positions = {pair.anchor_position for pair in members}
+        if positions != {"head", "body", "tail"}:
+            return {
+                "status": "unavailable",
+                "reason": "anchor-position-coverage-incomplete",
+                "anchor_key": anchor_key.public(),
+                "scales": {},
+                "metrics": {},
+                "per_super_run": rows,
+            }
+        body_batches = sorted(
+            {pair.batch for pair in members if pair.anchor_position == "body"}
+        )
+        if not body_batches:
+            return {
+                "status": "unavailable",
+                "reason": "anchor-body-batch-coverage-incomplete",
+                "anchor_key": anchor_key.public(),
+                "scales": {},
+                "metrics": {},
+                "per_super_run": rows,
+            }
+        reference_batch = min(
+            body_batches,
+            key=lambda value: (
+                abs(
+                    math.log(value)
+                    - statistics.median(math.log(item) for item in body_batches)
+                ),
+                value,
+            ),
+        )
+        strata: dict[tuple[str, int], list[_Pair]] = defaultdict(list)
+        for pair in members:
+            if pair.anchor_position is not None:
+                strata[(pair.anchor_position, pair.batch)].append(pair)
+
+        def response_median(name: str, subset: Sequence[_Pair]) -> float:
+            return statistics.median(
+                float(getattr(pair, name)) / pair.target_count for pair in subset
+            )
+
+        stratum_metrics: dict[tuple[str, int], dict[str, float]] = {}
+        for stratum, subset in strata.items():
+            primary_value = response_median("plugin_delta_ns", subset)
+            guest_value = response_median("guest_delta_ns", subset)
+            plugin_off_value = response_median("plugin_off_guest_delta_ns", subset)
+            if min(primary_value, guest_value, plugin_off_value) <= minimum_signal:
+                return {
+                    "status": "unavailable",
+                    "reason": "anchor-signal-below-positive-floor",
+                    "anchor_key": anchor_key.public(),
+                    "scales": {},
+                    "metrics": {},
+                    "per_super_run": rows,
+                }
+            stratum_metrics[stratum] = {
+                "primary_signal": primary_value,
+                "guest_signal": guest_value,
+                "plugin_off_signal": plugin_off_value,
+                "guest_to_primary_scale": primary_value / guest_value,
+                "plugin_off_to_guest_scale": guest_value / plugin_off_value,
+                "plugin_off_to_primary_scale": primary_value / plugin_off_value,
+            }
+        reference = stratum_metrics.get((ANCHOR_REFERENCE_POSITION, reference_batch))
+        if reference is None:
+            return {
+                "status": "unavailable",
+                "reason": "anchor-reference-stratum-missing",
+                "anchor_key": anchor_key.public(),
+                "scales": {},
+                "metrics": {},
+                "per_super_run": rows,
+            }
+        # 尺度点估计固定使用主体中档，避免 head/tail 和不同 batch 的混合
+        # 比例把位置/批次漂移吸收到校正因子中。其余层级只作 nuisance 门禁。
+        primary = reference["primary_signal"]
+        guest = reference["guest_signal"]
+        plugin_off = reference["plugin_off_signal"]
+        if min(primary, guest, plugin_off) <= minimum_signal:
+            return {
+                "status": "unavailable",
+                "reason": "anchor-signal-below-positive-floor",
+                "anchor_key": anchor_key.public(),
+                "scales": {},
+                "metrics": {
+                    "primary_signal": primary,
+                    "guest_signal": guest,
+                    "plugin_off_signal": plugin_off,
+                },
+                "per_super_run": rows,
+            }
+        metrics = {
+            "primary_signal": primary,
+            "guest_signal": guest,
+            "plugin_off_signal": plugin_off,
+            "guest_to_primary_scale": primary / guest,
+            "plugin_off_to_guest_scale": guest / plugin_off,
+            "plugin_off_to_primary_scale": primary / plugin_off,
+        }
+        for position in ("head", "tail"):
+            position_value = stratum_metrics.get((position, reference_batch))
+            if position_value is None:
+                return {
+                    "status": "unavailable",
+                    "reason": "anchor-position-reference-batch-missing",
+                    "anchor_key": anchor_key.public(),
+                    "scales": {},
+                    "metrics": {},
+                    "per_super_run": rows,
+                }
+            metrics[f"position_log_scale:{position}"] = math.log(
+                position_value["plugin_off_to_primary_scale"]
+                / reference["plugin_off_to_primary_scale"]
+            )
+        for batch in body_batches:
+            if batch == reference_batch:
+                continue
+            metrics[f"batch_log_scale:{batch}"] = math.log(
+                stratum_metrics[(ANCHOR_REFERENCE_POSITION, batch)][
+                    "plugin_off_to_primary_scale"
+                ]
+                / reference["plugin_off_to_primary_scale"]
+            )
+        if any(not math.isfinite(value) for value in metrics.values()) or any(
+            value <= 0.0
+            for name, value in metrics.items()
+            if not name.startswith(("position_log_scale:", "batch_log_scale:"))
+        ):
+            return {
+                "status": "unavailable",
+                "reason": "anchor-scale-not-positive-finite",
+                "anchor_key": anchor_key.public(),
+                "scales": {},
+                "metrics": {},
+                "per_super_run": rows,
+            }
+        scales[super_run] = metrics["plugin_off_to_primary_scale"]
+        for name, value in metrics.items():
+            metric_values[name].append(value)
+        rows.append(
+            {
+                "super_run": super_run,
+                "pairs": len(members),
+                "positions": sorted(str(value) for value in positions),
+                "reference_batch": reference_batch,
+                "body_batches": body_batches,
+                **metrics,
+            }
+        )
+    return {
+        "status": "available",
+        "reason": None,
+        "anchor_key": anchor_key.public(),
+        "minimum_signal_ns_per_instruction": minimum_signal,
+        "scales": scales,
+        "metrics": {
+            name: statistics.median(values)
+            for name, values in metric_values.items()
+        },
+        "per_super_run": rows,
+        "estimator": (
+            "within-super-run stratified median contrast ratio with body-middle "
+            "reference; target-independent errors-in-variables nuisance calibration"
+        ),
+    }
+
+
+def _anchor_adjusted_absolute_estimates(
+    pairs: Sequence[_Pair],
+    keys: Sequence[_InstructionKey],
+    controls: Mapping[_InstructionKey, _InstructionKey | None],
+    batch_levels: Mapping[_InstructionKey, tuple[int, ...]],
+    batch_references: Mapping[_InstructionKey, int | None],
+) -> tuple[dict[_InstructionKey, float], dict[str, Any]]:
+    calibration = _anchor_super_run_calibration(pairs)
+    if calibration["status"] != "available":
+        return {}, calibration
+    scales = calibration["scales"]
+    transformed: dict[_InstructionKey, list[_Pair]] = defaultdict(list)
+    for pair in pairs:
+        if pair.plugin_off_guest_delta_ns is None or pair.super_run not in scales:
+            return {}, {
+                **calibration,
+                "status": "unavailable",
+                "reason": "plugin-off-response-incomplete-for-adjustment",
+            }
+        transformed[pair.key].append(
+            replace(
+                pair,
+                plugin_delta_ns=(
+                    pair.plugin_off_guest_delta_ns * scales[pair.super_run]
+                ),
+            )
+        )
+    contrasts: dict[_InstructionKey, float] = {}
+    for key in keys:
+        try:
+            fit = _fit_variant(
+                transformed.get(key, []),
+                "plugin_delta_ns",
+                compute_condition=False,
+                compute_standard_error=False,
+                batch_levels=batch_levels[key],
+                batch_reference=batch_references[key],
+            )
+        except MicrobenchmarkModelError:
+            return {}, {
+                **calibration,
+                "status": "unavailable",
+                "reason": "anchor-adjusted-fit-failed",
+            }
+        contrasts[key] = fit.estimate
+    absolute, failures = _resolve_absolute(contrasts, controls)
+    resolved = {
+        key: float(value)
+        for key, value in absolute.items()
+        if key not in failures and value is not None and math.isfinite(value)
+    }
+    if len(resolved) != len(keys):
+        return {}, {
+            **calibration,
+            "status": "unavailable",
+            "reason": "anchor-adjusted-control-chain-incomplete",
+        }
+    return resolved, calibration
 
 
 def _run_bootstrap_replicate(
     state: _BootstrapState, replicate_seed: int
 ) -> tuple[
     dict[_InstructionKey, float],
-    dict[
-        _InstructionKey,
-        tuple[float | None, float | None, float | None, float | None],
-    ],
+    dict[_InstructionKey, dict[str, float | None]],
 ] | None:
     """运行一个可独立并行的分层 moving-block bootstrap replicate。"""
 
+    run_count = len(_ordered_super_runs(state.pairs))
+    rng = random.Random(replicate_seed)
+    run_positions = _run_resample_positions(
+        run_count, state.run_block_length, rng
+    )
     resampled = _hierarchical_resample(
-        state.pairs, state.block_length, random.Random(replicate_seed)
+        state.pairs,
+        state.block_length,
+        rng,
+        run_block_length=state.run_block_length,
+        run_positions=run_positions,
     )
     by_key: dict[_InstructionKey, list[_Pair]] = defaultdict(list)
     for pair in resampled:
         by_key[pair.key].append(pair)
     contrasts: dict[_InstructionKey, float] = {}
-    diagnostics: dict[
-        _InstructionKey,
-        tuple[float | None, float | None, float | None, float | None],
-    ] = {}
+    contrast_diagnostics: dict[_InstructionKey, dict[str, float | None]] = {}
+    classical_contrasts: dict[_InstructionKey, float] = {}
     for key in state.keys:
         response_name = state.response_names[key]
         members = [
@@ -1809,29 +3687,65 @@ def _run_bootstrap_replicate(
         ]
         try:
             current = _fit_variant(
-                members, response_name, compute_condition=False
+                members,
+                response_name,
+                compute_condition=False,
+                compute_standard_error=False,
+                batch_levels=state.batch_levels[key],
+                batch_reference=state.batch_references[key],
             )
         except MicrobenchmarkModelError:
             return None
         contrasts[key] = current.estimate
-        diagnostics[key] = (
-            current.order_effect,
-            current.drift_effect,
-            current.batch_effect,
-            current.translation_effect,
-        )
+        contrast_diagnostics[key] = _fit_diagnostic_effects(current)
+        try:
+            classical_contrasts[key] = _classical_variant_estimate(
+                current.pairs,
+                response_name,
+                batch_levels=state.batch_levels[key],
+                batch_reference=state.batch_references[key],
+                heteroscedastic_weights=current.hetero_weights,
+            )
+        except MicrobenchmarkModelError:
+            # 主 bootstrap 仍可作为计时分布；缺失的敏感性对照会在发布
+            # 门禁中按 key 明确标记为 inconclusive。
+            pass
     absolute, _failures = _resolve_absolute(contrasts, state.controls)
+    classical_absolute, _classical_failures = _resolve_absolute(
+        classical_contrasts, state.controls
+    )
     resolved = {
         key: float(value)
         for key, value in absolute.items()
         if value is not None
     }
+    for key, value in classical_absolute.items():
+        if key in resolved and value is not None and math.isfinite(value):
+            resolved[("estimator-sensitivity", key)] = float(value - resolved[key])
+    diagnostics = _resolve_diagnostic_effects(
+        contrast_diagnostics, state.controls
+    )
+    adjusted, calibration = _anchor_adjusted_absolute_estimates(
+        resampled,
+        state.keys,
+        state.controls,
+        state.batch_levels,
+        state.batch_references,
+    )
+    if calibration["status"] == "available" and len(adjusted) == len(absolute):
+        for key, value in adjusted.items():
+            resolved[("anchor-adjusted", key)] = value
+            if key in resolved:
+                resolved[("raw-adjusted-discrepancy", key)] = value - resolved[key]
+        for name, value in calibration["metrics"].items():
+            resolved[("anchor-metric", name)] = value
     return (resolved, diagnostics) if resolved else None
 
 
 def _initialize_bootstrap_worker(state: _BootstrapState) -> None:
-    global _BOOTSTRAP_STATE
+    global _ACTIVE_LINEAR_ALGEBRA_BACKEND, _BOOTSTRAP_STATE
     _BOOTSTRAP_STATE = state
+    _ACTIVE_LINEAR_ALGEBRA_BACKEND = state.linear_algebra_backend
 
 
 def _bootstrap_worker(replicate_seed: int):
@@ -1853,24 +3767,29 @@ def fit_microbenchmark_weight_model(
     *,
     bootstrap_replicates: int = 999,
     bootstrap_jobs: int = 1,
-    confidence: float = 0.95,
-    seed: int = 0x525643,
+    confidence: float = PUBLICATION_CONFIDENCE,
+    seed: int = PUBLICATION_BOOTSTRAP_SEED,
     block_length: int | None = None,
-    min_pairs: int = 30,
-    min_effective_pairs: float = 20.0,
-    min_runs: int = 10,
-    min_count_levels: int = 3,
-    min_purity: float = 0.99,
-    max_relative_ci_half_width: float = 0.15,
-    max_i_squared: float = 0.40,
-    equivalence_margin: float = 0.10,
-    min_cross_clock_ratio: float = 0.75,
-    max_cross_clock_ratio: float = 1.50,
-    min_plugin_off_ratio: float = 0.85,
-    max_plugin_off_ratio: float = 1.15,
-    max_zero_cost_ci_upper_ns: float = 0.15,
-    max_translation_density: float = 0.002,
-    max_severe_outlier_fraction: float = 0.10,
+    run_block_length: int | None = None,
+    min_pairs: int = PUBLICATION_MIN_PAIRS,
+    min_effective_pairs: float = PUBLICATION_MIN_EFFECTIVE_PAIRS,
+    min_runs: int = PUBLICATION_MIN_SUPER_RUNS,
+    min_count_levels: int = PUBLICATION_MIN_COUNT_LEVELS,
+    min_purity: float = PUBLICATION_MIN_PURITY,
+    max_relative_ci_half_width: float = PUBLICATION_MAX_RELATIVE_CI_HALF_WIDTH,
+    max_i_squared: float = PUBLICATION_MAX_I_SQUARED,
+    equivalence_margin: float = PUBLICATION_EQUIVALENCE_MARGIN,
+    min_cross_clock_ratio: float = PUBLICATION_MIN_CROSS_CLOCK_RATIO,
+    max_cross_clock_ratio: float = PUBLICATION_MAX_CROSS_CLOCK_RATIO,
+    min_plugin_off_ratio: float = PUBLICATION_MIN_PLUGIN_OFF_RATIO,
+    max_plugin_off_ratio: float = PUBLICATION_MAX_PLUGIN_OFF_RATIO,
+    max_zero_cost_ci_upper_ns: float = PUBLICATION_MAX_ZERO_COST_CI_UPPER_NS,
+    max_translation_density: float = PUBLICATION_MAX_TRANSLATION_DENSITY,
+    max_translation_excluded_pair_fraction: float = (
+        MAX_TRANSLATION_EXCLUDED_PAIR_FRACTION
+    ),
+    max_severe_outlier_fraction: float = PUBLICATION_MAX_SEVERE_OUTLIER_FRACTION,
+    linear_algebra_backend: str = "auto",
 ) -> dict[str, Any]:
     """拟合逐完整编码键权重并给出 FWER 同时区间。"""
 
@@ -1888,10 +3807,29 @@ def fit_microbenchmark_weight_model(
         raise MicrobenchmarkModelError("bootstrap_jobs 必须是正整数")
     if not 0.0 < confidence < 1.0:
         raise MicrobenchmarkModelError("confidence 必须位于 (0,1)")
+    overall_alpha = 1.0 - confidence
+    sampling_alpha = overall_alpha * PUBLICATION_SAMPLING_ALPHA_FRACTION
+    monte_carlo_alpha = (
+        overall_alpha * PUBLICATION_MONTE_CARLO_ALPHA_FRACTION
+    )
+    family_sampling_alpha = sampling_alpha / len(
+        PUBLICATION_INFERENCE_FAMILIES
+    )
+    family_confidence = 1.0 - family_sampling_alpha
+    family_monte_carlo_alpha = monte_carlo_alpha / len(
+        PUBLICATION_INFERENCE_FAMILIES
+    )
+    family_monte_carlo_confidence = 1.0 - family_monte_carlo_alpha
     if block_length is not None and (
         isinstance(block_length, bool) or not isinstance(block_length, int) or block_length <= 0
     ):
         raise MicrobenchmarkModelError("block_length 必须是正整数")
+    if run_block_length is not None and (
+        isinstance(run_block_length, bool)
+        or not isinstance(run_block_length, int)
+        or run_block_length <= 0
+    ):
+        raise MicrobenchmarkModelError("run_block_length 必须是正整数")
     if not (
         0.0 < min_cross_clock_ratio <= 1.0 <= max_cross_clock_ratio
         and min_cross_clock_ratio < max_cross_clock_ratio
@@ -1907,10 +3845,18 @@ def fit_microbenchmark_weight_model(
     if not math.isfinite(max_translation_density) or not 0 <= max_translation_density < 1:
         raise MicrobenchmarkModelError("翻译事件密度阈值必须位于 [0,1)")
     if (
+        not math.isfinite(max_translation_excluded_pair_fraction)
+        or not 0.0 < max_translation_excluded_pair_fraction < 1.0
+    ):
+        raise MicrobenchmarkModelError("翻译污染 pair 比例阈值必须位于 (0,1)")
+    if (
         not math.isfinite(max_severe_outlier_fraction)
         or not 0.0 < max_severe_outlier_fraction < 0.5
     ):
         raise MicrobenchmarkModelError("严重异常比例阈值必须位于 (0,0.5)")
+    global _ACTIVE_LINEAR_ALGEBRA_BACKEND
+    selected_backend = _linear_algebra_backend(linear_algebra_backend)
+    _ACTIVE_LINEAR_ALGEBRA_BACKEND = selected_backend
     all_pairs, assumed_empty = _pair_samples(samples)
     translation_contaminated = [
         pair
@@ -1929,6 +3875,16 @@ def fit_microbenchmark_weight_model(
     excluded_by_key: dict[_InstructionKey, int] = defaultdict(int)
     for pair in translation_contaminated:
         excluded_by_key[pair.key] += 1
+    translation_exclusion_inference: dict[_InstructionKey, dict[str, Any]] = {}
+    all_pairs_by_key: dict[_InstructionKey, list[_Pair]] = defaultdict(list)
+    for pair in all_pairs:
+        all_pairs_by_key[pair.key].append(pair)
+    for key, members in all_pairs_by_key.items():
+        translation_exclusion_inference[key] = _run_cluster_proportion_upper_bound(
+            [pair.translation_observed and not pair.translation_free for pair in members],
+            [pair.super_run for pair in members],
+            confidence,
+        )
     grouped: dict[_InstructionKey, list[_Pair]] = defaultdict(list)
     raw_controls: dict[_InstructionKey, _ControlReference | None] = {}
     for pair in pairs:
@@ -1992,6 +3948,32 @@ def fit_microbenchmark_weight_model(
     point_contrasts = {key: fit.estimate for key, fit in fits.items()}
     point_absolute, absolute_failures = _resolve_absolute(point_contrasts, controls)
     absolute_failures.update(control_resolution_failures)
+    classical_contrasts: dict[_InstructionKey, float] = {}
+    classical_fit_failures: dict[_InstructionKey, str] = {}
+    for key, fit in fits.items():
+        try:
+            classical_contrasts[key] = _classical_variant_estimate(
+                fit.pairs,
+                response_names[key],
+                batch_levels=fit.batch_levels,
+                batch_reference=fit.batch_reference,
+                heteroscedastic_weights=fit.hetero_weights,
+            )
+        except MicrobenchmarkModelError as error:
+            classical_fit_failures[key] = str(error)
+    classical_absolute, classical_absolute_failures = _resolve_absolute(
+        classical_contrasts, controls
+    )
+    estimator_sensitivity_points = {
+        key: float(classical_absolute[key] - point_absolute[key])
+        for key in fits
+        if key in point_absolute
+        and key in classical_absolute
+        and point_absolute[key] is not None
+        and classical_absolute[key] is not None
+        and math.isfinite(float(point_absolute[key]))
+        and math.isfinite(float(classical_absolute[key]))
+    }
     guest_contrasts = {key: fit.estimate for key, fit in guest_fits.items()}
     guest_absolute, _guest_absolute_failures = _resolve_absolute(
         guest_contrasts, controls
@@ -2008,7 +3990,17 @@ def fit_microbenchmark_weight_model(
     }
     automatic_block = max(value[2] for value in ess_by_key.values())
     selected_block = block_length or automatic_block
-    bootstrap_rows: list[dict[_InstructionKey, float]] = []
+    run_count = len(_ordered_super_runs(pairs))
+    selected_run_block = run_block_length or max(
+        1, int(round(run_count ** (1.0 / 3.0)))
+    )
+    run_order_sources = {pair.run_order_source for pair in pairs}
+    run_order_source = (
+        next(iter(run_order_sources))
+        if len(run_order_sources) == 1
+        else "mixed"
+    )
+    bootstrap_rows: list[dict[Any, float]] = []
     diagnostic_rows: list[dict[tuple[_InstructionKey, str], float]] = []
     seed_rng = random.Random(seed)
     replicate_seeds = [
@@ -2019,7 +4011,13 @@ def fit_microbenchmark_weight_model(
         keys=tuple(fits),
         response_names=response_names,
         controls=controls,
+        batch_levels={key: fit.batch_levels for key, fit in fits.items()},
+        batch_references={
+            key: fit.batch_reference for key, fit in fits.items()
+        },
         block_length=selected_block,
+        run_block_length=selected_run_block,
+        linear_algebra_backend=selected_backend,
     )
     if bootstrap_jobs == 1 or bootstrap_replicates == 0:
         replicate_results = (
@@ -2044,9 +4042,17 @@ def fit_microbenchmark_weight_model(
             bootstrap_rows.append(resolved_row)
             diagnostic_row: dict[tuple[_InstructionKey, str], float] = {}
             for key, values in diagnostics.items():
-                for name, value in zip(
-                    ("order", "drift", "batch", "translation"), values
-                ):
+                # 兼容测试/外部 monkeypatch 仍返回旧四元组的情况；模型自身
+                # 始终返回带逐 batch 档位键的 mapping。
+                named_values = (
+                    values.items()
+                    if isinstance(values, Mapping)
+                    else zip(
+                        ("order", "drift", "batch", "translation"),
+                        values,
+                    )
+                )
+                for name, value in named_values:
                     if value is not None:
                         diagnostic_row[(key, name)] = value
             diagnostic_rows.append(diagnostic_row)
@@ -2066,24 +4072,45 @@ def fit_microbenchmark_weight_model(
         for key, value in point_absolute.items()
         if value is not None and math.isfinite(value)
     }
-    simultaneous_ci, critical, simultaneous_valid = _simultaneous_intervals(
-        finite_points, bootstrap_rows, confidence
+    (
+        simultaneous_ci,
+        critical,
+        simultaneous_valid,
+        simultaneous_monte_carlo,
+    ) = _simultaneous_intervals(
+        finite_points,
+        bootstrap_rows,
+        family_confidence,
+        family_monte_carlo_confidence,
     )
     for key in fits:
         simultaneous_ci.setdefault(key, None)
 
-    diagnostic_points: dict[tuple[_InstructionKey, str], float] = {}
-    for key, fit in fits.items():
-        for name, value in (
-            ("order", fit.order_effect),
-            ("drift", fit.drift_effect),
-            ("batch", fit.batch_effect),
-        ):
-            if value is not None:
-                diagnostic_points[(key, name)] = value
-    diagnostic_intervals, diagnostic_critical, diagnostic_valid = (
+    contrast_diagnostic_points = {
+        key: _fit_diagnostic_effects(fit) for key, fit in fits.items()
+    }
+    absolute_diagnostic_points = _resolve_diagnostic_effects(
+        contrast_diagnostic_points, controls
+    )
+    diagnostic_points: dict[tuple[_InstructionKey, str], float] = {
+        (key, name): value
+        for key, values in absolute_diagnostic_points.items()
+        for name, value in values.items()
+    }
+    diagnostic_complete_rows = sum(
+        set(diagnostic_points).issubset(row) for row in diagnostic_rows
+    )
+    (
+        diagnostic_intervals,
+        diagnostic_critical,
+        diagnostic_valid,
+        diagnostic_monte_carlo,
+    ) = (
         _simultaneous_intervals(
-            diagnostic_points, diagnostic_rows, confidence
+            diagnostic_points,
+            diagnostic_rows,
+            family_confidence,
+            family_monte_carlo_confidence,
         )
     )
 
@@ -2110,10 +4137,149 @@ def fit_microbenchmark_weight_model(
             for key, interval in simultaneous_ci.items()
         },
         replicate_seeds,
-        confidence,
+        family_confidence,
+        selected_run_block,
+        family_monte_carlo_confidence,
     )
+    adjusted_points, anchor_calibration = _anchor_adjusted_absolute_estimates(
+        pairs,
+        tuple(fits),
+        controls,
+        {key: fit.batch_levels for key, fit in fits.items()},
+        {key: fit.batch_reference for key, fit in fits.items()},
+    )
+    joint_points: dict[Any, float] = {
+        ("raw", key): value for key, value in finite_points.items()
+    }
+    for key, value in estimator_sensitivity_points.items():
+        joint_points[("estimator-sensitivity", key)] = value
+    if anchor_calibration["status"] == "available":
+        for key, value in adjusted_points.items():
+            joint_points[("anchor-adjusted", key)] = value
+            if key in finite_points:
+                joint_points[("raw-adjusted-discrepancy", key)] = (
+                    value - finite_points[key]
+                )
+        for name, value in anchor_calibration["metrics"].items():
+            joint_points[("anchor-metric", name)] = value
+    joint_rows: list[dict[Any, float]] = []
+    for row in bootstrap_rows:
+        joint_row: dict[Any, float] = {
+            ("raw", key): row[key]
+            for key in finite_points
+            if key in row
+        }
+        for key in adjusted_points:
+            adjusted_key = ("anchor-adjusted", key)
+            discrepancy_key = ("raw-adjusted-discrepancy", key)
+            if adjusted_key in row:
+                joint_row[adjusted_key] = row[adjusted_key]
+            if discrepancy_key in row:
+                joint_row[discrepancy_key] = row[discrepancy_key]
+        for key in estimator_sensitivity_points:
+            sensitivity_key = ("estimator-sensitivity", key)
+            if sensitivity_key in row:
+                joint_row[sensitivity_key] = row[sensitivity_key]
+        for name in anchor_calibration.get("metrics", {}):
+            metric_key = ("anchor-metric", name)
+            if metric_key in row:
+                joint_row[metric_key] = row[metric_key]
+        joint_rows.append(joint_row)
+    joint_intervals, joint_critical, joint_valid, joint_monte_carlo = (
+        _simultaneous_intervals(
+            joint_points,
+            joint_rows,
+            family_confidence,
+            family_monte_carlo_confidence,
+        )
+    )
+    joint_complete_rows = sum(
+        set(row) == set(joint_points) for row in joint_rows
+    )
+    anchor_metric_intervals = {
+        name: joint_intervals.get(("anchor-metric", name))
+        for name in anchor_calibration.get("metrics", {})
+    }
+    estimator_sensitivity_intervals = {
+        key: joint_intervals.get(("estimator-sensitivity", key))
+        for key in estimator_sensitivity_points
+    }
+    scale_interval_names = (
+        "guest_to_primary_scale",
+        "plugin_off_to_guest_scale",
+        "plugin_off_to_primary_scale",
+    )
+    anchor_interval_ok = all(
+        anchor_metric_intervals.get(name) is not None
+        and anchor_metric_intervals[name][0] > 0.0
+        and anchor_metric_intervals[name][1]
+        / anchor_metric_intervals[name][0]
+        <= ANCHOR_MAX_SCALE_RATIO
+        for name in scale_interval_names
+    )
+    anchor_signal_interval_ok = all(
+        interval is not None
+        and interval[0] > 0.0
+        for name, interval in anchor_metric_intervals.items()
+        if name.endswith("_signal")
+    )
+    anchor_nuisance_interval_names = sorted(
+        name
+        for name in anchor_metric_intervals
+        if name.startswith(("position_log_scale:", "batch_log_scale:"))
+    )
+    anchor_log_equivalence_margin = math.log(ANCHOR_MAX_SCALE_RATIO)
+    anchor_nuisance_interval_ok = bool(anchor_nuisance_interval_names) and all(
+        anchor_metric_intervals[name] is not None
+        and anchor_metric_intervals[name][0] >= -anchor_log_equivalence_margin
+        and anchor_metric_intervals[name][1] <= anchor_log_equivalence_margin
+        for name in anchor_nuisance_interval_names
+    )
+    anchor_accepted = (
+        anchor_calibration["status"] == "available"
+        and bootstrap_replicates >= PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES
+        and joint_complete_rows == bootstrap_replicates
+        and joint_monte_carlo["finite_rank_supported"]
+        and anchor_interval_ok
+        and anchor_signal_interval_ok
+        and anchor_nuisance_interval_ok
+    )
+    anchor_scale_inference = {
+        **anchor_calibration,
+        "status": "accepted" if anchor_accepted else (
+            "inconclusive"
+            if anchor_calibration["status"] == "available"
+            else anchor_calibration["status"]
+        ),
+        "reason": None if anchor_accepted else (
+            anchor_calibration.get("reason")
+            or "anchor-joint-simultaneous-inference-inconclusive"
+        ),
+        "simultaneous_intervals": anchor_metric_intervals,
+        "maximum_interval_ratio": ANCHOR_MAX_SCALE_RATIO,
+        "interval_ratio_applies_to": list(scale_interval_names),
+        "nuisance_log_scale_intervals": {
+            name: anchor_metric_intervals[name]
+            for name in anchor_nuisance_interval_names
+        },
+        "nuisance_log_equivalence_margin": anchor_log_equivalence_margin,
+        "nuisance_interval_gate_passed": anchor_nuisance_interval_ok,
+        "nuisance_estimands": (
+            "head/tail and body-batch plugin-off-to-primary log scale relative "
+            "to the body middle-batch stratum"
+        ),
+        "requested_replicates": bootstrap_replicates,
+        "complete_joint_replicates": joint_complete_rows,
+        "joint_critical_value": joint_critical,
+        "joint_max_statistic_replicates": joint_valid,
+        "joint_critical_value_monte_carlo": joint_monte_carlo,
+        "calibration_policy": (
+            "same-super-run target-independent EIV scale re-estimated inside "
+            "each hierarchical bootstrap replicate"
+        ),
+    }
 
-    heterogeneity = {
+    contrast_heterogeneity = {
         key: _random_effects(
             fit,
             response_names[key],
@@ -2121,11 +4287,32 @@ def fit_microbenchmark_weight_model(
         )
         for key, fit in fits.items()
     }
+    per_run_absolute_data = _per_run_absolute_estimates(
+        fits, response_names, controls
+    )
+    heterogeneity = _absolute_random_effects(
+        fits,
+        response_names,
+        controls,
+        confidence,
+        per_run_data=per_run_absolute_data,
+    )
+    leave_one_run_out = _leave_one_super_run_out_sensitivity(
+        fits,
+        response_names,
+        controls,
+        point_absolute,
+    )
+    for key, meta in heterogeneity.items():
+        contrast_meta = contrast_heterogeneity[key]
+        contrast_meta["may_support_absolute_high_confidence"] = False
+        meta["local_contrast_only"] = contrast_meta
     per_run_design = {
         key: _per_run_design_diagnostics(fit, response_names[key])
         for key, fit in fits.items()
     }
     items: list[dict[str, Any]] = []
+    item_by_key: dict[_InstructionKey, dict[str, Any]] = {}
     fatal_codes = {
         "fit-failed",
         "absolute-reference-unresolved",
@@ -2134,25 +4321,36 @@ def fit_microbenchmark_weight_model(
     for key in sorted(grouped):
         fit = fits.get(key)
         if fit is None:
-            items.append(
-                {
+            failed_item = {
                     "key": key.public(),
                     "ns_per_instruction": None,
                     "simultaneous_ci": None,
                     "point_ci": None,
                     "ESS": 0.0,
-                    "runs": len({pair.run for pair in grouped[key]}),
+                    "runs": len(_ordered_super_runs(grouped[key])),
+                    "qemu_runs": len({pair.run for pair in grouped[key]}),
                     "pairs": len(grouped[key]),
                     "identifiability": "not-identifiable",
                     "quality": "not-identifiable",
                     "source": "unfitted-paired-probe",
                     "quality_failures": ["fit-failed", fit_failures.get(key, "unknown")],
                 }
-            )
+            items.append(failed_item)
+            item_by_key[key] = failed_item
             continue
         members = fit.pairs
         raw_point = point_absolute.get(key)
-        raw_interval = simultaneous_ci[key]
+        raw_interval = joint_intervals.get(("raw", key))
+        adjusted_raw_point = adjusted_points.get(key)
+        adjusted_interval = joint_intervals.get(("anchor-adjusted", key))
+        discrepancy_point = (
+            None
+            if raw_point is None or adjusted_raw_point is None
+            else adjusted_raw_point - raw_point
+        )
+        discrepancy_interval = joint_intervals.get(
+            ("raw-adjusted-discrepancy", key)
+        )
         zero_cost_equivalent = (
             raw_interval is not None
             and raw_interval[0] >= -max_zero_cost_ci_upper_ns
@@ -2169,7 +4367,8 @@ def fit_microbenchmark_weight_model(
             point = None
         interval = raw_interval
         relative_half = None
-        runs = len({pair.run for pair in members})
+        runs = len(_ordered_super_runs(members))
+        qemu_runs = len({pair.run for pair in members})
         count_levels = len({pair.batch for pair in members})
         per_level = [
             sum(pair.batch == level for pair in members)
@@ -2181,6 +4380,8 @@ def fit_microbenchmark_weight_model(
         translation_density_q95 = 0.0 if all(
             pair.translation_observed for pair in members
         ) else None
+        translation_exclusion = translation_exclusion_inference[key]
+        translation_exclusion_upper = float(translation_exclusion["upper"])
         huber_downweighted = sum(
             weight < 1.0 - 1e-12 for weight in fit.robust_weights
         ) / len(members)
@@ -2190,9 +4391,12 @@ def fit_microbenchmark_weight_model(
         severe_outlier_count = sum(
             weight < 0.25 for weight in fit.robust_weights
         )
-        severe_outlier_upper_bound = _wilson_upper_bound(
-            severe_outlier_count, len(members), confidence
+        severe_outlier_cluster = _run_cluster_proportion_upper_bound(
+            [weight < 0.25 for weight in fit.robust_weights],
+            [pair.super_run for pair in members],
+            confidence,
         )
+        severe_outlier_upper_bound = float(severe_outlier_cluster["upper"])
         order_balance = min(
             sum(pair.order < 0 for pair in members),
             sum(pair.order > 0 for pair in members),
@@ -2226,6 +4430,8 @@ def fit_microbenchmark_weight_model(
             failures.append("plugin-response-incomplete")
         if not all(pair.translation_observed for pair in members):
             failures.append("translation-observation-unavailable")
+        if translation_exclusion_upper > max_translation_excluded_pair_fraction:
+            failures.append("translation-exclusion-fraction-too-high")
         if not fit.irls_converged:
             failures.append("irls-not-converged")
         if not math.isfinite(fit.design_condition_number) or fit.design_condition_number > 1e8:
@@ -2258,18 +4464,114 @@ def fit_microbenchmark_weight_model(
                 failures.append("simultaneous-ci-too-wide")
         else:
             failures.append("zero-cost-ci-too-wide")
-        if len(bootstrap_rows) < 999:
+        adjusted_zero_cost_equivalent = (
+            adjusted_interval is not None
+            and adjusted_interval[0] >= -max_zero_cost_ci_upper_ns
+            and adjusted_interval[1] <= max_zero_cost_ci_upper_ns
+        )
+        adjusted_point = (
+            0.0
+            if adjusted_raw_point is not None and adjusted_zero_cost_equivalent
+            else adjusted_raw_point
+            if adjusted_raw_point is not None and adjusted_raw_point >= 0.0
+            else None
+        )
+        adjusted_relative_half = None
+        if adjusted_raw_point is None or adjusted_interval is None:
+            failures.append("anchor-adjusted-estimate-unavailable")
+        elif adjusted_raw_point < 0.0 and not adjusted_zero_cost_equivalent:
+            failures.append("anchor-adjusted-negative-weight")
+        elif adjusted_zero_cost_equivalent:
+            adjusted_relative_half = None
+        elif adjusted_raw_point > 0.0:
+            adjusted_relative_half = (
+                adjusted_interval[1] - adjusted_interval[0]
+            ) / (2.0 * adjusted_raw_point)
+            if (
+                adjusted_interval[0] <= 0.0
+                or adjusted_relative_half > max_relative_ci_half_width
+            ):
+                failures.append("anchor-adjusted-ci-too-wide")
+        else:
+            failures.append("anchor-adjusted-zero-cost-ci-too-wide")
+        discrepancy_margin = max(
+            max_zero_cost_ci_upper_ns,
+            equivalence_margin * abs(float(raw_point or 0.0)),
+        )
+        discrepancy_equivalent = (
+            discrepancy_interval is not None
+            and discrepancy_interval[0] >= -discrepancy_margin
+            and discrepancy_interval[1] <= discrepancy_margin
+        )
+        if not discrepancy_equivalent:
+            failures.append("raw-adjusted-discrepancy-not-equivalent")
+        sensitivity_interval = estimator_sensitivity_intervals.get(key)
+        sensitivity_margin = max(
+            max_zero_cost_ci_upper_ns,
+            equivalence_margin * abs(float(raw_point or 0.0)),
+        )
+        sensitivity_equivalent = (
+            sensitivity_interval is not None
+            and sensitivity_interval[0] >= -sensitivity_margin
+            and sensitivity_interval[1] <= sensitivity_margin
+        )
+        if key not in estimator_sensitivity_points:
+            failures.append("estimator-sensitivity-unavailable")
+        elif not sensitivity_equivalent:
+            failures.append("estimator-sensitivity-not-equivalent")
+        deletion_margin = max(
+            max_zero_cost_ci_upper_ns,
+            equivalence_margin * abs(float(raw_point or 0.0)),
+        )
+        deletion_sensitivity = leave_one_run_out[key]
+        maximum_deletion_shift = deletion_sensitivity.get(
+            "maximum_absolute_shift_ns"
+        )
+        deletion_stable = (
+            deletion_sensitivity.get("complete") is True
+            and isinstance(maximum_deletion_shift, (int, float))
+            and not isinstance(maximum_deletion_shift, bool)
+            and math.isfinite(float(maximum_deletion_shift))
+            and float(maximum_deletion_shift) <= deletion_margin
+        )
+        if not deletion_stable:
+            failures.append("single-super-run-influence-too-high")
+        if joint_complete_rows != bootstrap_replicates:
+            failures.append("joint-bootstrap-incomplete")
+        if len(bootstrap_rows) < PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES:
             failures.append("insufficient-bootstrap-replicates")
-        if bootstrap_replicates > 0 and bootstrap_valid_fraction < 0.99:
+        if len(bootstrap_rows) != bootstrap_replicates or (
+            simultaneous_monte_carlo["complete_family_replicates"]
+            != bootstrap_replicates
+        ):
             failures.append("insufficient-bootstrap-valid-fraction")
+        if not simultaneous_monte_carlo["finite_rank_supported"]:
+            failures.append("max-stat-monte-carlo-inconclusive")
+        if (
+            diagnostic_complete_rows
+            < PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES
+        ):
+            failures.append("insufficient-diagnostic-bootstrap-replicates")
+        if (
+            diagnostic_complete_rows != bootstrap_replicates
+        ):
+            failures.append("insufficient-diagnostic-bootstrap-valid-fraction")
+        if not diagnostic_monte_carlo["finite_rank_supported"]:
+            failures.append("diagnostic-max-stat-monte-carlo-inconclusive")
         if order_balance < 0.35:
             failures.append("ab-ba-imbalance")
-        if severe_outlier_upper_bound > max_severe_outlier_fraction:
-            failures.append("too-many-severe-outliers")
+        # Huber 权重是连续的 influence diagnostic，不是独立 Bernoulli 事件。
+        # 严重降权比例保留在输出中供审计，但不再单独否决结果；真正的
+        # estimator-sensitivity 联合等价门禁在上面执行，避免把同一异常同时
+        # 计入比例门禁和稳健估计器影响而造成双重惩罚。
         if meta["i_squared"] is None:
             failures.append("cross-run-heterogeneity-unavailable")
         if meta["usable_runs"] != runs:
             failures.append("cross-run-coverage-incomplete")
+        if meta.get("identifiable") and not meta.get(
+            "tau_squared_converged", False
+        ):
+            failures.append("cross-run-tau-estimator-not-converged")
         prediction_interval = meta.get("prediction_interval")
         prediction_half_width = None
         if prediction_interval is None:
@@ -2289,11 +4591,7 @@ def fit_microbenchmark_weight_model(
                     max_zero_cost_ci_upper_ns,
                     2.0 * equivalence_margin * raw_point,
                 )
-                if (
-                    meta["i_squared"] is not None
-                    and meta["i_squared"] > max_i_squared
-                    and prediction_half_width > practical_half_width
-                ):
+                if prediction_half_width > practical_half_width:
                     failures.append("cross-run-heterogeneity-high")
         meta["prediction_interval_half_width"] = prediction_half_width
         meta["relative_prediction_interval_half_width"] = (
@@ -2304,11 +4602,49 @@ def fit_microbenchmark_weight_model(
             else None
         )
 
+        absolute_effects = absolute_diagnostic_points.get(key, {})
+        contrast_effects = contrast_diagnostic_points[key]
         diagnostic_ci: dict[str, list[float] | None] = {
             name: diagnostic_intervals.get((key, name))
-            for name in ("order", "drift", "batch")
+            for name in (
+                "order",
+                "drift",
+                "batch",
+                "process_design",
+                "process_period",
+                "process_carryover",
+            )
         }
         diagnostic_ci["translation"] = None
+        process_crossover = _process_crossover_effects(fit)
+        batch_level_effects: dict[str, float | None] = {}
+        batch_level_ci: dict[str, list[float] | None] = {}
+        for rank, level in enumerate(fit.batch_levels):
+            name = f"batch_level_rank:{rank}"
+            batch_level_effects[str(level)] = (
+                0.0
+                if level == fit.batch_reference
+                else contrast_effects.get(name)
+            )
+            batch_level_ci[str(level)] = (
+                [0.0, 0.0]
+                if level == fit.batch_reference
+                else diagnostic_intervals.get((key, name))
+            )
+        batch_pairwise_effects: dict[str, float | None] = {}
+        batch_pairwise_ci: dict[str, list[float] | None] = {}
+        for left_rank, left in enumerate(fit.batch_levels):
+            for right_rank, right in enumerate(
+                fit.batch_levels[left_rank + 1 :], start=left_rank + 1
+            ):
+                label = f"{left}:{right}"
+                name = f"batch_pairwise_rank:{left_rank}:{right_rank}"
+                batch_pairwise_effects[label] = contrast_effects.get(
+                    name
+                )
+                batch_pairwise_ci[label] = diagnostic_intervals.get(
+                    (key, name)
+                )
         if raw_point is not None:
             margin = (
                 max_zero_cost_ci_upper_ns
@@ -2318,16 +4654,26 @@ def fit_microbenchmark_weight_model(
             for name, code in (
                 ("order", "order-effect-not-equivalent"),
                 ("drift", "drift-effect-not-equivalent"),
+                ("process_design", "process-design-effect-not-equivalent"),
+                ("process_period", "process-period-effect-not-equivalent"),
+                ("process_carryover", "process-carryover-effect-not-equivalent"),
             ):
                 current = diagnostic_ci[name]
                 if current is None or current[0] < -margin or current[1] > margin:
                     failures.append(code)
-            batch_interval = diagnostic_ci["batch"]
-            batch_multiplier = fit.batch_log_range
-            if (
-                batch_interval is None
-                or batch_interval[0] * batch_multiplier < -margin
-                or batch_interval[1] * batch_multiplier > margin
+            if not process_crossover["available"]:
+                failures.append("process-crossover-effect-unavailable")
+            elif (
+                process_crossover["minimum_design_fraction"]
+                < MIN_CROSSOVER_DESIGN_FRACTION
+            ):
+                failures.append("process-crossover-design-imbalanced")
+            pairwise_batch_intervals = list(batch_pairwise_ci.values())
+            if not pairwise_batch_intervals or any(
+                interval is None
+                or interval[0] < -margin
+                or interval[1] > margin
+                for interval in pairwise_batch_intervals
             ):
                 failures.append("batch-size-nonlinearity")
 
@@ -2345,17 +4691,18 @@ def fit_microbenchmark_weight_model(
         cross_clock_difference_ci = auxiliary_intervals.get(
             ("cross-clock-difference", key)
         )
-        auxiliary_valid_fraction = (
-            auxiliary_inference["valid_replicates"]
-            / auxiliary_inference["requested_replicates"]
-            if auxiliary_inference["requested_replicates"] > 0
-            else 0.0
-        )
         cross_clock_complete = (
-            auxiliary_coverage["primary_complete"]
-            and auxiliary_coverage["guest_complete"]
-            and auxiliary_coverage["primary_usable_runs"] == runs
-            and auxiliary_coverage["guest_usable_runs"] == runs
+            (
+                auxiliary_coverage["cross_difference_complete"]
+                and auxiliary_coverage["cross_difference_usable_runs"] == runs
+            )
+            if zero_cost_equivalent
+            else (
+                auxiliary_coverage["primary_complete"]
+                and auxiliary_coverage["guest_complete"]
+                and auxiliary_coverage["primary_usable_runs"] == runs
+                and auxiliary_coverage["guest_usable_runs"] == runs
+            )
         )
         selected_cross_interval = (
             cross_clock_difference_ci
@@ -2365,9 +4712,14 @@ def fit_microbenchmark_weight_model(
         if not cross_clock_complete or selected_cross_interval is None:
             failures.append("cross-clock-check-unavailable")
             cross_clock_status = "unavailable"
-        elif bootstrap_replicates > 0 and auxiliary_valid_fraction < 0.99:
+        elif auxiliary_inference["complete_family_replicates"] != bootstrap_replicates:
             failures.append("cross-clock-check-unavailable")
             cross_clock_status = "insufficient-bootstrap-valid-fraction"
+        elif not auxiliary_inference["critical_value_monte_carlo"][
+            "finite_rank_supported"
+        ]:
+            failures.append("cross-clock-check-unavailable")
+            cross_clock_status = "max-stat-monte-carlo-inconclusive"
         elif zero_cost_equivalent and (
             selected_cross_interval[0] < -max_zero_cost_ci_upper_ns
             or selected_cross_interval[1] > max_zero_cost_ci_upper_ns
@@ -2394,10 +4746,20 @@ def fit_microbenchmark_weight_model(
             ("plugin-off-difference", key)
         )
         plugin_off_complete = (
-            auxiliary_coverage["guest_complete"]
-            and auxiliary_coverage["plugin_off_complete"]
-            and auxiliary_coverage["guest_usable_runs"] == runs
-            and auxiliary_coverage["plugin_off_usable_runs"] == runs
+            (
+                auxiliary_coverage["plugin_off_difference_complete"]
+                and auxiliary_coverage[
+                    "plugin_off_difference_usable_runs"
+                ]
+                == runs
+            )
+            if zero_cost_equivalent
+            else (
+                auxiliary_coverage["guest_complete"]
+                and auxiliary_coverage["plugin_off_complete"]
+                and auxiliary_coverage["guest_usable_runs"] == runs
+                and auxiliary_coverage["plugin_off_usable_runs"] == runs
+            )
         )
         selected_plugin_off_interval = (
             plugin_off_difference_ci
@@ -2407,9 +4769,14 @@ def fit_microbenchmark_weight_model(
         if not plugin_off_complete or selected_plugin_off_interval is None:
             failures.append("plugin-off-check-unavailable")
             plugin_off_status = "unavailable"
-        elif bootstrap_replicates > 0 and auxiliary_valid_fraction < 0.99:
+        elif auxiliary_inference["complete_family_replicates"] != bootstrap_replicates:
             failures.append("plugin-off-check-unavailable")
             plugin_off_status = "insufficient-bootstrap-valid-fraction"
+        elif not auxiliary_inference["critical_value_monte_carlo"][
+            "finite_rank_supported"
+        ]:
+            failures.append("plugin-off-check-unavailable")
+            plugin_off_status = "max-stat-monte-carlo-inconclusive"
         elif zero_cost_equivalent and (
             selected_plugin_off_interval[0] < -max_zero_cost_ci_upper_ns
             or selected_plugin_off_interval[1] > max_zero_cost_ci_upper_ns
@@ -2424,6 +4791,8 @@ def fit_microbenchmark_weight_model(
             plugin_off_status = "divergent"
         else:
             plugin_off_status = "accepted"
+        if anchor_scale_inference["status"] != "accepted":
+            failures.append("positive-anchor-scale-inconclusive")
 
         control = controls.get(key)
         if key in assumed_empty and control is None:
@@ -2439,6 +4808,7 @@ def fit_microbenchmark_weight_model(
             },
             "semantic_mnemonic": _semantic_mnemonic(key.mnemonic),
             "ns_per_instruction": point,
+            "published_ns_per_instruction": None,
             "unconstrained_ns_per_instruction": raw_point,
             "contrast_ns_per_instruction": fit.estimate,
             "control_key": (
@@ -2450,9 +4820,38 @@ def fit_microbenchmark_weight_model(
             "unconstrained_simultaneous_ci": raw_interval,
             "point_ci": point_ci[key],
             "unconstrained_point_ci": point_ci[key],
+            "anchor_adjusted": {
+                "ns_per_instruction": adjusted_point,
+                "unconstrained_ns_per_instruction": adjusted_raw_point,
+                "simultaneous_ci": adjusted_interval,
+                "relative_simultaneous_ci_half_width": adjusted_relative_half,
+                "calibration_only": key.pattern in CALIBRATION_ONLY_PATTERNS,
+            },
+            "raw_adjusted_discrepancy": {
+                "ns_per_instruction": discrepancy_point,
+                "simultaneous_ci": discrepancy_interval,
+                "equivalence_margin_ns": discrepancy_margin,
+                "equivalent": discrepancy_equivalent,
+            },
+            "estimator_sensitivity": {
+                "estimand": "classical-heteroscedastic-wls-minus-huber-absolute-cost",
+                "ns_per_instruction": estimator_sensitivity_points.get(key),
+                "simultaneous_ci": sensitivity_interval,
+                "equivalence_margin_ns": sensitivity_margin,
+                "equivalent": sensitivity_equivalent,
+                "classical_fit_available": key in classical_contrasts,
+                "classical_control_chain_resolved": key in classical_absolute,
+            },
+            "leave_one_super_run_out_sensitivity": {
+                **deletion_sensitivity,
+                "equivalence_margin_ns": deletion_margin,
+                "stable": deletion_stable,
+            },
+            "calibration_only": key.pattern in CALIBRATION_ONLY_PATTERNS,
             "zero_cost_equivalent": zero_cost_equivalent,
             "ESS": ess,
-            "runs": runs,
+                "runs": runs,
+                "qemu_runs": qemu_runs,
             "pairs": len(members),
             "total_target_count": sum(pair.target_count for pair in members),
             "count_levels": count_levels,
@@ -2461,6 +4860,16 @@ def fit_microbenchmark_weight_model(
             "translation_density_q95": translation_density_q95,
             "translation_contaminated_pairs_excluded": excluded_by_key.get(
                 key, 0
+            ),
+            "translation_exclusion_run_cluster_inference": translation_exclusion,
+            "translation_exclusion_fraction_run_cluster_upper": (
+                translation_exclusion_upper
+            ),
+            "maximum_translation_excluded_pair_fraction": (
+                max_translation_excluded_pair_fraction
+            ),
+            "minimum_crossover_design_fraction": (
+                MIN_CROSSOVER_DESIGN_FRACTION
             ),
             "identifiability": (
                 "strong" if status == "high-confidence" else "weak"
@@ -2478,24 +4887,115 @@ def fit_microbenchmark_weight_model(
             "huber_downweighted_fraction": huber_downweighted,
             "severe_outlier_fraction": severe_outliers,
             "severe_outlier_count": severe_outlier_count,
+            "severe_outlier_scope": (
+                "local-target-minus-control-contrast; absolute quality also requires every control"
+            ),
+            "severe_outlier_fraction_cluster_mean": (
+                severe_outlier_cluster["mean_run_fraction"]
+            ),
+            "severe_outlier_fraction_run_cluster_upper": (
+                severe_outlier_upper_bound
+            ),
+            "severe_outlier_run_cluster_inference": severe_outlier_cluster,
+            # 兼容旧 JSON 消费者；值已切换为 run-cluster 上界，不能再解释
+            # 为把每个 pair 当作独立 Bernoulli 的 Wilson 区间。
             "severe_outlier_fraction_wilson_upper": severe_outlier_upper_bound,
             "maximum_severe_outlier_fraction": max_severe_outlier_fraction,
             "order_balance": order_balance,
             "fit_diagnostics": {
                 "irls_converged": fit.irls_converged,
                 "irls_iterations": fit.irls_iterations,
+                "irls_cycle_damping_used": fit.irls_cycle_damping_used,
                 "design_condition_number": _json_finite(
                     fit.design_condition_number
                 ),
                 "per_run": run_design,
             },
             "effects": {
-                "ab_ba_difference": fit.order_effect,
-                "within_run_end_minus_start": fit.drift_effect,
-                "per_log_batch": fit.batch_effect,
-                "ns_per_translation_event": fit.translation_effect,
+                "estimand": "absolute-instruction-cost-through-control-chain",
+                "ab_ba_difference": absolute_effects.get("order"),
+                "within_run_end_minus_start": absolute_effects.get("drift"),
+                "batch_effect_model": "categorical-reference-batch",
+                "batch_quality_estimand": (
+                    "local-target-minus-control-contrast; every control edge "
+                    "is gated on its own physical batch grid"
+                ),
+                "batch_reference": fit.batch_reference,
+                "batch_levels": list(fit.batch_levels),
+                "batch_level_effects_vs_reference": batch_level_effects,
+                "batch_level_simultaneous_ci": batch_level_ci,
+                "batch_pairwise_contrast_direction": "right-minus-left",
+                "batch_pairwise_effects": batch_pairwise_effects,
+                "batch_pairwise_simultaneous_ci": batch_pairwise_ci,
+                "batch_peak_to_peak": (
+                    max(
+                        value
+                        for value in batch_level_effects.values()
+                        if value is not None
+                    )
+                    - min(
+                        value
+                        for value in batch_level_effects.values()
+                        if value is not None
+                    )
+                    if all(
+                        value is not None
+                        for value in batch_level_effects.values()
+                    )
+                    else None
+                ),
+                # 兼容旧输出：categorical 两端点的割线，不是模型中的线性项。
+                "per_log_batch": absolute_effects.get("batch"),
+                "per_log_batch_method": (
+                    "compatibility-endpoint-secant-not-used-for-gating"
+                ),
+                "ns_per_translation_event": absolute_effects.get(
+                    "translation"
+                ),
                 "batch_log_range": fit.batch_log_range,
                 "bootstrap_ci": diagnostic_ci,
+                "process_launch_crossover": {
+                    **process_crossover,
+                    "simultaneous_ci": {
+                        "design_abba_minus_baab": diagnostic_ci[
+                            "process_design"
+                        ],
+                        "second_pair_minus_first_pair": diagnostic_ci[
+                            "process_period"
+                        ],
+                        "preceded_by_plugin_off_minus_other_timing": diagnostic_ci[
+                            "process_carryover"
+                        ],
+                    },
+                    "minimum_required_design_fraction": (
+                        MIN_CROSSOVER_DESIGN_FRACTION
+                    ),
+                },
+                "local_contrast_only": {
+                    "ab_ba_difference": contrast_effects.get("order"),
+                    "within_run_end_minus_start": contrast_effects.get(
+                        "drift"
+                    ),
+                    "per_log_batch": contrast_effects.get("batch"),
+                    "batch_level_effects_vs_reference": {
+                        str(level): value
+                        for level, value in fit.batch_level_effects.items()
+                    },
+                    "batch_pairwise_effects": {
+                        f"{left}:{right}": contrast_effects.get(
+                            f"batch_pairwise_rank:{left_rank}:{right_rank}"
+                        )
+                        for left_rank, left in enumerate(fit.batch_levels)
+                        for right_rank, right in enumerate(
+                            fit.batch_levels[left_rank + 1 :],
+                            start=left_rank + 1,
+                        )
+                    },
+                    "ns_per_translation_event": contrast_effects.get(
+                        "translation"
+                    ),
+                    "may_support_absolute_high_confidence": False,
+                },
             },
             "autocorrelation": autocorrelation,
             "cross_run_random_effects": meta,
@@ -2542,22 +5042,75 @@ def fit_microbenchmark_weight_model(
             },
         }
         items.append(item)
+        item_by_key[key] = item
+
+    control_chains: dict[_InstructionKey, list[_InstructionKey]] = {}
+    for key in item_by_key:
+        chain: list[_InstructionKey] = []
+        seen = {key}
+        control = controls.get(key)
+        while control is not None and control not in seen:
+            chain.append(control)
+            seen.add(control)
+            control = controls.get(control)
+        control_chains[key] = chain
+        if any(
+            item_by_key.get(dependency, {}).get("quality")
+            != "high-confidence"
+            for dependency in chain
+        ):
+            failures = item_by_key[key]["quality_failures"]
+            if "control-quality-not-high" not in failures:
+                failures.append("control-quality-not-high")
+            status = _quality_status(failures, fatal_codes)
+            item_by_key[key]["quality"] = status
+            item_by_key[key]["identifiability"] = (
+                "strong" if status == "high-confidence" else "weak"
+            )
+    for key, item in item_by_key.items():
+        item["control_quality_chain"] = [
+            {
+                "key": dependency.public(),
+                "quality": item_by_key.get(dependency, {}).get(
+                    "quality", "not-identifiable"
+                ),
+                "quality_failures": item_by_key.get(dependency, {}).get(
+                    "quality_failures", ["control-result-unavailable"]
+                ),
+            }
+            for dependency in control_chains[key]
+        ]
+        item["absolute_quality_requires_control_chain"] = True
+        item["published_ns_per_instruction"] = (
+            item.get("anchor_adjusted", {}).get("ns_per_instruction")
+            if item.get("quality") == "high-confidence"
+            and not item.get("calibration_only", False)
+            else None
+        )
 
     positive = [
-        item["ns_per_instruction"]
+        item["published_ns_per_instruction"]
         for item in items
-        if isinstance(item.get("ns_per_instruction"), (int, float))
-        and item["ns_per_instruction"] > 0.0
-        and item.get("quality") == "high-confidence"
+        if isinstance(item.get("published_ns_per_instruction"), (int, float))
+        and item["published_ns_per_instruction"] > 0.0
+        and not item.get("calibration_only", False)
     ]
     reference = statistics.median(positive) if positive else None
     for item in items:
-        value = item.get("ns_per_instruction")
-        conservative = item.get("conservative_ns_per_instruction")
+        value = item.get("published_ns_per_instruction")
+        adjusted_interval = item.get("anchor_adjusted", {}).get(
+            "simultaneous_ci"
+        )
+        conservative = (
+            max(0.0, float(adjusted_interval[1]))
+            if isinstance(adjusted_interval, list)
+            and len(adjusted_interval) == 2
+            and value is not None
+            else None
+        )
         item["relative_weight"] = (
             value / reference
             if reference is not None
-            and item.get("quality") == "high-confidence"
             and isinstance(value, (int, float))
             and value >= 0.0
             else None
@@ -2565,7 +5118,6 @@ def fit_microbenchmark_weight_model(
         item["conservative_relative_weight"] = (
             conservative / reference
             if reference is not None
-            and item.get("quality") == "high-confidence"
             and isinstance(conservative, (int, float))
             and conservative > 0.0
             else None
@@ -2576,19 +5128,23 @@ def fit_microbenchmark_weight_model(
     recommendations: list[dict[str, Any]] = []
     aggregate: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for item in items:
+        if item.get("calibration_only", False):
+            continue
         key = item["key"]
         aggregate[(key["mnemonic"], key["size"])].append(item)
     for (mnemonic, size), members in sorted(aggregate.items()):
         usable = [
             item for item in members
-            if item["ns_per_instruction"] is not None
-            and item["quality"] == "high-confidence"
+            if item["published_ns_per_instruction"] is not None
         ]
         if len(members) == 1 and usable:
-            recommendation = usable[0]["ns_per_instruction"]
+            recommendation = usable[0]["published_ns_per_instruction"]
             source = "single-context"
         elif len(usable) == len(members) and usable:
-            values = [float(item["ns_per_instruction"]) for item in usable]
+            values = [
+                float(item["published_ns_per_instruction"])
+                for item in usable
+            ]
             center = statistics.median(values)
             spread = max(values) - min(values)
             if center > 0.0 and spread <= equivalence_margin * center:
@@ -2610,12 +5166,107 @@ def fit_microbenchmark_weight_model(
             }
         )
 
+    publishable_items = [
+        item
+        for item in items
+        if item.get("published_ns_per_instruction") is not None
+        and not item.get("calibration_only", False)
+    ]
+    publication_failures: list[str] = []
+    if anchor_scale_inference["status"] != "accepted":
+        publication_failures.append("positive-anchor-scale-inconclusive")
+    if bootstrap_replicates < PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES:
+        publication_failures.append("insufficient-joint-bootstrap-replicates")
+    family_completion = {
+        "raw": simultaneous_monte_carlo["complete_family_replicates"],
+        "diagnostic": diagnostic_monte_carlo["complete_family_replicates"],
+        "auxiliary": auxiliary_inference["complete_family_replicates"],
+        "joint": joint_complete_rows,
+    }
+    for family, complete in family_completion.items():
+        if complete != bootstrap_replicates:
+            publication_failures.append(
+                f"incomplete-{family}-bootstrap-family"
+            )
+    if joint_complete_rows != bootstrap_replicates:
+        publication_failures.append("insufficient-joint-bootstrap-valid-fraction")
+    if not joint_monte_carlo["finite_rank_supported"]:
+        publication_failures.append("joint-max-stat-monte-carlo-inconclusive")
+    if not publishable_items:
+        publication_failures.append("no-context-passed-all-publication-gates")
+    # 统计核心不能自行证明采集宿主隔离或独立预测验证。这两项只能由
+    # runner 在校验输入哈希和协议后注入；裸模型始终 fail closed。
+    publication_failures.extend(
+        ["host-isolation-audit-missing", "ml-validation-missing"]
+    )
+    statistical_core_passed = not publication_failures[:-2]
     result = {
         "schema_version": SCHEMA_VERSION,
-        "model": "paired-huber-heteroscedastic-hierarchical-moving-block-max-standardized-deviation",
+        "generation_configuration": {
+            "schema": GENERATION_CONFIGURATION_SCHEMA,
+            "bootstrap_replicates": bootstrap_replicates,
+            "confidence": confidence,
+            "seed": seed,
+            "block_length": block_length,
+            "run_block_length": run_block_length,
+            "minimum_pairs": min_pairs,
+            "minimum_effective_pairs": min_effective_pairs,
+            "minimum_independent_super_runs": min_runs,
+            "minimum_count_levels": min_count_levels,
+            "minimum_instruction_purity": min_purity,
+            "maximum_relative_simultaneous_ci_half_width": (
+                max_relative_ci_half_width
+            ),
+            "maximum_i_squared": max_i_squared,
+            "effect_equivalence_margin": equivalence_margin,
+            "cross_clock_ratio_range": [
+                min_cross_clock_ratio,
+                max_cross_clock_ratio,
+            ],
+            "plugin_off_ratio_range": [
+                min_plugin_off_ratio,
+                max_plugin_off_ratio,
+            ],
+            "maximum_zero_cost_simultaneous_ci_upper_ns": (
+                max_zero_cost_ci_upper_ns
+            ),
+            "maximum_translation_events_per_target_instruction": (
+                max_translation_density
+            ),
+            "maximum_translation_excluded_pair_fraction": (
+                max_translation_excluded_pair_fraction
+            ),
+            "maximum_severe_outlier_fraction": max_severe_outlier_fraction,
+            "linear_algebra_backend": selected_backend,
+        },
+        "model": "paired-huber-categorical-batch-paule-mandel-mkh-hierarchical-moving-block-max-standardized-deviation",
+        "linear_algebra_backend": selected_backend,
         "primary_response": "marker-only-qemu-vcpu-thread-cpu-time",
         "instruction_key": "raw-encoding+semantic-decoding+execution-pattern",
         "confidence": confidence,
+        "publication_familywise_error_control": {
+            "method": (
+                "union-bound-across-pre-registered-max-stat-families-with-"
+                "split-sampling-and-monte-carlo-error-budgets"
+            ),
+            "overall_confidence": confidence,
+            "overall_alpha": overall_alpha,
+            "sampling_alpha_budget": sampling_alpha,
+            "monte_carlo_alpha_budget": monte_carlo_alpha,
+            "families": list(PUBLICATION_INFERENCE_FAMILIES),
+            "family_count": len(PUBLICATION_INFERENCE_FAMILIES),
+            "sampling_alpha_per_family": family_sampling_alpha,
+            "sampling_confidence_per_family": family_confidence,
+            "monte_carlo_alpha_per_family": family_monte_carlo_alpha,
+            "monte_carlo_confidence_per_family": (
+                family_monte_carlo_confidence
+            ),
+            "coverage_claim": (
+                "unconditional family intersection failure probability is "
+                "bounded by sampling_alpha_budget plus finite-bootstrap "
+                "monte_carlo_alpha_budget under the stated bootstrap model"
+            ),
+        },
         "instructions": items,
         "recommended_by_mnemonic_size": recommendations,
         "normalization_ns_per_instruction": reference,
@@ -2635,60 +5286,215 @@ def fit_microbenchmark_weight_model(
         },
         "simultaneous_inference": {
             "method": "hierarchical run-cluster moving-block bootstrap max-standardized-deviation",
-            "familywise_confidence": confidence,
+            "familywise_confidence": family_confidence,
             "requested_replicates": bootstrap_replicates,
             "valid_replicates": len(bootstrap_rows),
             "valid_fraction": bootstrap_valid_fraction,
-            "minimum_valid_fraction": 0.99,
+            "minimum_valid_fraction": 1.0,
             "worker_processes": bootstrap_jobs,
             "quantile_probability_monte_carlo_se": (
                 math.sqrt(
-                    confidence * (1.0 - confidence) / len(bootstrap_rows)
+                    family_confidence
+                    * (1.0 - family_confidence)
+                    / len(bootstrap_rows)
                 )
                 if bootstrap_rows
                 else None
             ),
             "critical_value": critical,
+            "complete_family_replicates": simultaneous_monte_carlo[
+                "complete_family_replicates"
+            ],
             "complete_max_statistic_replicates": simultaneous_valid,
-            "run_is_highest_cluster": True,
+            "critical_value_monte_carlo": simultaneous_monte_carlo,
+            "run_is_highest_cluster": False,
+            "super_run_is_highest_cluster": True,
+            "run_order": _ordered_runs(pairs),
+            "super_run_order": _ordered_super_runs(pairs),
+            "run_order_source": run_order_source,
+            "run_resampling": "super-run-circular-moving-block-bootstrap",
+            "run_block_length": selected_run_block,
+            "automatic_run_block_length_rule": "round(number-of-runs^(1/3))",
             "block_length": selected_block,
             "automatic_block_length": automatic_block,
             "block_length_unit": "probe-round-blocks",
         },
         "diagnostic_simultaneous_inference": {
             "method": "joint-instruction-and-effect max-standardized-deviation",
-            "familywise_confidence": confidence,
+            "familywise_confidence": family_confidence,
             "critical_value": diagnostic_critical,
             "complete_replicates": diagnostic_valid,
-            "effects": ["order", "drift", "batch"],
+            "complete_family_replicates": diagnostic_monte_carlo[
+                "complete_family_replicates"
+            ],
+            "requested_replicates": bootstrap_replicates,
+            "valid_fraction": (
+                diagnostic_complete_rows / bootstrap_replicates
+                if bootstrap_replicates > 0
+                else 0.0
+            ),
+            "minimum_complete_replicates": (
+                PUBLICATION_MINIMUM_MAX_STAT_CALIBRATION_REPLICATES
+            ),
+            "minimum_valid_fraction": 1.0,
+            "critical_value_monte_carlo": diagnostic_monte_carlo,
+            "effects": [
+                "order",
+                "drift",
+                "local-edge-batch-categorical-vs-reference",
+                "local-edge-batch-categorical-all-pairwise-contrasts",
+                "batch-endpoint-secant-compatibility",
+                "process-launch-design-abba-minus-baab",
+                "process-launch-second-pair-minus-first-pair",
+                "process-launch-preceded-by-plugin-off-carryover",
+            ],
+            "batch_control_chain_policy": (
+                "gate-each-control-edge-on-its-own-physical-batch-grid"
+            ),
         },
         "auxiliary_consistency_inference": {
-            "method": "paired-per-run-estimate run-cluster bootstrap max-standardized-deviation",
-            "familywise_confidence": confidence,
+            "method": (
+                "paired-per-run-estimate run-cluster bootstrap "
+                "max-standardized-deviation"
+            ),
+            "zero_cost_difference_method": (
+                "fit-within-pair-difference-of-responses-before-run-bootstrap"
+            ),
+            "familywise_confidence": family_confidence,
             "requested_replicates": auxiliary_inference[
                 "requested_replicates"
             ],
             "valid_replicates": auxiliary_inference["valid_replicates"],
+            "complete_family_replicates": auxiliary_inference[
+                "complete_family_replicates"
+            ],
             "valid_fraction": (
-                auxiliary_inference["valid_replicates"]
+                auxiliary_inference["complete_family_replicates"]
                 / auxiliary_inference["requested_replicates"]
                 if auxiliary_inference["requested_replicates"] > 0
                 else 0.0
             ),
             "critical_value": auxiliary_inference["critical_value"],
-            "requires_same_pairs_and_all_primary_runs": True,
+            "critical_value_monte_carlo": auxiliary_inference[
+                "critical_value_monte_carlo"
+            ],
+            "requires_same_pairs_and_all_primary_super_runs": True,
+            "run_resampling": "super-run-circular-moving-block-bootstrap",
+            "run_block_length": selected_run_block,
+            "shares_run_indices_with_primary_bootstrap": True,
+        },
+        "positive_anchor_scale_inference": anchor_scale_inference,
+        "estimator_sensitivity_inference": {
+            "method": (
+                "joint-super-run-moving-block-bootstrap of classical "
+                "heteroscedastic-WLS minus Huber absolute estimates"
+            ),
+            "estimand": "classical-heteroscedastic-wls-minus-huber-absolute-cost",
+            "simultaneous_intervals": {
+                json.dumps(key.public(), sort_keys=True, separators=(",", ":")): joint_intervals.get(
+                    ("estimator-sensitivity", key)
+                )
+                for key in estimator_sensitivity_points
+            },
+            "points": {
+                json.dumps(key.public(), sort_keys=True, separators=(",", ":")): value
+                for key, value in estimator_sensitivity_points.items()
+            },
+            "shared_bootstrap_family": True,
+            "equivalence_policy": (
+                "absolute interval must lie within max(zero-cost margin, "
+                "relative effect margin)"
+            ),
+            "severe_outlier_fraction_role": "diagnostic-only",
+        },
+        "joint_raw_adjusted_inference": {
+            "method": (
+                "single hierarchical super-run moving-block bootstrap with "
+                "one max-standardized-deviation family over raw, adjusted, "
+                "anchor nuisance and raw-adjusted discrepancy"
+            ),
+            "familywise_confidence": family_confidence,
+            "requested_replicates": bootstrap_replicates,
+            "complete_replicates": joint_complete_rows,
+            "complete_family_replicates": joint_monte_carlo[
+                "complete_family_replicates"
+            ],
+            "complete_max_statistic_replicates": joint_valid,
+            "critical_value": joint_critical,
+            "critical_value_monte_carlo": joint_monte_carlo,
+            "point_family_size": len(joint_points),
+            "target_and_anchor_share_super_run_indices": True,
+            "anchor_reestimated_inside_each_replicate": True,
+        },
+        "publication_gate": {
+            "passed": False,
+            "failures": publication_failures,
+            "publishable_contexts": len(publishable_items),
+            "components": {
+                "statistical_core": statistical_core_passed,
+                "raw": all(
+                    item.get("simultaneous_ci") is not None
+                    for item in publishable_items
+                ),
+                "anchor_adjusted": all(
+                    item.get("anchor_adjusted", {}).get("simultaneous_ci")
+                    is not None
+                    for item in publishable_items
+                ),
+                "positive_anchor": anchor_scale_inference["status"] == "accepted",
+                "raw_adjusted_discrepancy": all(
+                    item.get("raw_adjusted_discrepancy", {}).get("equivalent")
+                    is True
+                    for item in publishable_items
+                ),
+                "estimator_sensitivity": all(
+                    item.get("estimator_sensitivity", {}).get("equivalent")
+                    is True
+                    for item in publishable_items
+                ),
+                "single_super_run_influence": all(
+                    item.get("leave_one_super_run_out_sensitivity", {}).get(
+                        "stable"
+                    )
+                    is True
+                    for item in publishable_items
+                ),
+                "joint_bootstrap": (
+                    bootstrap_replicates
+                    >= PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES
+                    and joint_complete_rows == bootstrap_replicates
+                    and joint_monte_carlo["finite_rank_supported"]
+                ),
+                "host_isolation": False,
+                "ml_validation": False,
+            },
+            "statistical_core_passed": statistical_core_passed,
+            "policy": (
+                "publish only non-calibration contexts that pass raw, "
+                "anchor-adjusted, anchor-position/batch, discrepancy, estimator-"
+                "sensitivity, single-run influence, joint-bootstrap, host-isolation "
+                "and independent-ML validation gates"
+            ),
         },
         "quality_thresholds": {
             "minimum_pairs": min_pairs,
             "minimum_effective_pairs": min_effective_pairs,
-            "minimum_independent_runs": min_runs,
+            "minimum_independent_super_runs": min_runs,
             "minimum_count_levels": min_count_levels,
             "minimum_instruction_purity": min_purity,
             "maximum_relative_simultaneous_ci_half_width": max_relative_ci_half_width,
             "maximum_i_squared": max_i_squared,
+            "i_squared_role": "diagnostic-only-not-a-prediction-interval-gate",
+            "future_run_prediction_interval_gate": (
+                "unconditional-practical-half-width"
+            ),
             "maximum_design_condition_number": 1e8,
             "irls_weight_rms_tolerance": 1e-6,
-            "irls_maximum_iterations": 60,
+            "irls_maximum_iterations": 120,
+            "irls_cycle_damping": {
+                "trigger": "two-cycle-distance-at-most-five-percent-of-fixed-point-residual",
+                "relaxation": 0.75,
+            },
             "effect_equivalence_margin": equivalence_margin,
             "cross_clock_ratio_range": [
                 min_cross_clock_ratio,
@@ -2704,12 +5510,30 @@ def fit_microbenchmark_weight_model(
             "maximum_translation_events_per_target_instruction": (
                 max_translation_density
             ),
-            "minimum_bootstrap_replicates": 999,
-            "minimum_bootstrap_valid_fraction": 0.99,
+            "maximum_translation_excluded_pair_fraction": (
+                max_translation_excluded_pair_fraction
+            ),
+            "minimum_crossover_design_fraction": (
+                MIN_CROSSOVER_DESIGN_FRACTION
+            ),
+            "translation_exclusion_independent_unit": (
+                "complete-crossover-super-run"
+            ),
+            "minimum_bootstrap_replicates": (
+                PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES
+            ),
+            "minimum_bootstrap_valid_fraction": 1.0,
             "severe_huber_weight_threshold": 0.25,
             "maximum_severe_outlier_fraction": max_severe_outlier_fraction,
-            "severe_outlier_fraction_gate": (
-                "one-sided-Wilson-upper-bound-at-model-confidence"
+            "severe_outlier_fraction_gate": "diagnostic-only; estimator sensitivity is the formal robustness gate",
+            "severe_outlier_independent_unit": "complete-crossover-super-run",
+            "estimator_sensitivity_gate": (
+                "joint simultaneous equivalence of classical heteroscedastic WLS "
+                "and Huber absolute estimates"
+            ),
+            "single_super_run_influence_gate": (
+                "all leave-one-super-run-out refits complete and maximum "
+                "absolute shift within the practical equivalence margin"
             ),
         },
     }
@@ -2808,9 +5632,12 @@ def write_csv(result: Mapping[str, Any], path: str | Path) -> None:
         "csr",
         "pattern",
         "ns_per_instruction",
+        "diagnostic_raw_ns_per_instruction",
         "relative_weight",
         "simultaneous_ci_low",
         "simultaneous_ci_high",
+        "diagnostic_raw_simultaneous_ci_low",
+        "diagnostic_raw_simultaneous_ci_high",
         "point_ci_low",
         "point_ci_high",
         "ESS",
@@ -2826,7 +5653,10 @@ def write_csv(result: Mapping[str, Any], path: str | Path) -> None:
         writer.writeheader()
         for item in result["instructions"]:
             key = item["key"]
-            simultaneous = item.get("simultaneous_ci") or [None, None]
+            simultaneous = item.get("anchor_adjusted", {}).get(
+                "simultaneous_ci"
+            ) or [None, None]
+            diagnostic_raw_interval = item.get("simultaneous_ci") or [None, None]
             point = item.get("point_ci") or [None, None]
             writer.writerow(
                 {
@@ -2838,10 +5668,21 @@ def write_csv(result: Mapping[str, Any], path: str | Path) -> None:
                     "rl": key["rl"],
                     "csr": key["csr"],
                     "pattern": key["pattern"],
-                    "ns_per_instruction": item.get("ns_per_instruction"),
+                    "ns_per_instruction": item.get(
+                        "published_ns_per_instruction"
+                    ),
+                    "diagnostic_raw_ns_per_instruction": item.get(
+                        "ns_per_instruction"
+                    ),
                     "relative_weight": item.get("relative_weight"),
                     "simultaneous_ci_low": simultaneous[0],
                     "simultaneous_ci_high": simultaneous[1],
+                    "diagnostic_raw_simultaneous_ci_low": (
+                        diagnostic_raw_interval[0]
+                    ),
+                    "diagnostic_raw_simultaneous_ci_high": (
+                        diagnostic_raw_interval[1]
+                    ),
                     "point_ci_low": point[0],
                     "point_ci_high": point[1],
                     "ESS": item.get("ESS"),
@@ -2860,10 +5701,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("input", help="探针 JSON/JSONL/TSV")
     parser.add_argument("--output", required=True, help="模型 JSON 输出")
     parser.add_argument("--csv", help="可选的逐指令 CSV 输出")
-    parser.add_argument("--bootstrap", type=int, default=999)
-    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument(
+        "--bootstrap",
+        type=int,
+        default=PUBLICATION_MINIMUM_BOOTSTRAP_REPLICATES,
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=_default_cli_jobs(),
+        help="bootstrap worker 数；默认 min(16, 可用 CPU)",
+    )
     parser.add_argument("--seed", type=int, default=0x525643)
     parser.add_argument("--block-length", type=int)
+    parser.add_argument("--run-block-length", type=int)
+    parser.add_argument(
+        "--linear-algebra-backend",
+        choices=("auto", "numpy", "python"),
+        default="auto",
+        help="线性代数后端；正式大样本建议 numpy",
+    )
     arguments = parser.parse_args(argv)
     result = fit_microbenchmark_weight_model(
         load_samples(arguments.input),
@@ -2871,6 +5728,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         bootstrap_jobs=arguments.jobs,
         seed=arguments.seed,
         block_length=arguments.block_length,
+        run_block_length=arguments.run_block_length,
+        linear_algebra_backend=arguments.linear_algebra_backend,
     )
     Path(arguments.output).write_text(
         json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n",

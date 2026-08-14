@@ -4,6 +4,10 @@
 
 实验日期：2026-08-09（Asia/Shanghai）；正式 run 标识前缀：`run-20260809T042758Z-measure-90861-*`。
 
+> 本文前半部分保留 2026-08-09 的 12-run 全 catalog 实验作为历史记录。2026-08-12 的差分结构实验、独立 run 机器学习校验和修正后的结论见第 18 节；两套实验的样本、bootstrap 和发布结论不能混用。
+
+> **当前发布状态（2026-08-13）**：工作区内没有任何一个 RISC-V 指令权重模型通过现行 `publication_gate`，也没有产物同时具备可复验的 provenance manifest 与 publication seal。前文的 “high-confidence” 和“可发布”均是旧分析器、旧门禁下的历史标签，不能视为现行协议下已经发布的权重；当前证据审计见第 23 节。
+
 ## 1. 结论摘要
 
 - 正式实验包含 **12 个独立 QEMU run、213 个执行上下文、153,360 个计时窗口、76,680 个 probe/baseline pair**。
@@ -12,8 +16,8 @@
 - 目标汇编在保留窗口中总计执行 **2,173,366,272 次**。
 - 主估计使用 marker-only QEMU vCPU thread CPU time、成对差分、异方差 Huber 回归和 run-cluster moving-block bootstrap。
 - 正式 bootstrap 为 **999/999 有效**；主权重使用全族 95% max-standardized-deviation 同时区间。
-- 模型层有 4 个 high-confidence、209 个 low-confidence 上下文。catalog 层严格赋权 3 类，另保留 183 类单一探索估计。
-- 严格可发布 catalog 权重只有 `divuw`、`rem`、`remw`；`time` CSR 在模型层通过，但因 CSR 上下文受限而禁止转成通用 catalog 权重。
+- 按 2026-08-09 旧门禁，模型层有 4 个 high-confidence、209 个 low-confidence 上下文；catalog 层曾严格赋权 3 类，另保留 183 类单一探索估计。
+- 按该旧门禁，catalog 候选只有 `divuw`、`rem`、`remw`；`time` CSR 在模型层通过，但因 CSR 上下文受限而禁止转成通用 catalog 权重。这些历史标签不等于通过现行发布协议。
 - 大多数 low-confidence 不是“主计时没有信号”：主同时区间过宽仅 16 项；主要降级原因是 plugin-off、batch、顺序和漂移等辅助稳健性门禁。
 
 ## 2. 范围与不可外推内容
@@ -57,7 +61,7 @@
 | weights.json | `d8cbf38ec15de2819fbf4d781dabc5d55a6712048eb0f213eddea4a613c70ffb` |
 | catalog-weights.json | `bb6ee48ec728ed12538f6dc2ef1e6b496e50b9d9abbfc8732e399c6042a39110` |
 
-注意：这些是正式采样 manifest 中记录的身份，不应使用之后重建的同名 `kernel-rv` 替代。
+注意：这些值来自正式采样目录中的 `artifacts.sha256`，不是现行 provenance manifest。样本、权重、catalog 和 QEMU plugin 的保留字节仍可重算并匹配上述哈希；原始 `kernel-rv` 与 probe ELF 没有保存在该目录中，当前同名文件的哈希已经变化，因而这两项目前只能作为历史记录，不能从工作区现存字节独立复验。
 
 ## 4. 测量链路
 
@@ -463,7 +467,7 @@ catalog loader 校验 schema、target、TB 计数、完整 bytes、decode 错误
 
 ## 15. 验证结果
 
-- `python3 -m unittest discover -s scripts/tests`：167/167 通过；
+- `python3 -m unittest discover -s scripts/tests`：旧 12-run 实验记录为 167/167 通过；本次 differential-v2 与 ML 修订后的当前套件结果见第 18.9 节；
 - QEMU plugin validation/timing 双模式 smoke：通过；
 - Python `py_compile`、shell `sh -n`、`git diff --check`：通过；
 - 稀疏 WLS 与稠密参考在 24 个正式 key 上系数、残差、Huber/异方差权重和 estimate bit-for-bit 相同；
@@ -1152,3 +1156,321 @@ catalog loader 校验 schema、target、TB 计数、完整 bytes、decode 错误
 3. **严格发布是保守的**：只有 3 个 catalog 类通过所有门禁；183 个类保留探索估计但不冒充严格权重。
 4. **受限类不伪造权重**：CSR/priv/trap/CBO 需要专用上下文，当前 mapper 明确留空。
 5. **结论只针对 QEMU TCG 条件**：代表值可用于当前 QEMU/BuildStorm 指令成本建模，不能直接解释为硬件 cycle。
+
+---
+
+## 18. differential-v2 结构置信度（2026-08-11/12）
+
+本节追加记录后续 differential-v2 实验，不改写 2026-08-09 的 12-run catalog 实验。新实验的目的不是重新覆盖全部 409 个 catalog 类，而是检查最容易被“一个助记符一个权重”错误隐藏的 `div/rem` 数据流依赖、mixed-TB 交互以及绝对控制基准。以下“高置信”仅表示对应门禁通过；不同层级的结论不可相互替代。
+
+### 18.1 分层结论
+
+| 结论层级 | 结果 | 可以声称 | 不可以声称 |
+| --- | --- | --- | --- |
+| 构造闭合与绝对可辨识 | 通过 | 21 个上下文均可沿 `target -> nop -> empty-call` 控制图求出有限绝对估计；validation 与 merge 契约闭合 | 估计可直接发布为通用权重 |
+| `div/rem` 数据流上下文依赖 | 通过 | 8 个 dependency-chain 与 per-slot-reset 对比均明确为 context-dependent | 同一 mnemonic 可以压缩成唯一上下文无关标量 |
+| mixed-TB 交互 | 在当前阈值内等价 | 两个 alternation 对比的区间均落入 `+-0.15 ns` 实用等价带 | 任意 TB 组合都没有交互效应 |
+| ML 遗漏结构检查 | 支持，但全面高置信门禁未通过 | 相对无泄漏 `context+batch median` 基线，未发现大于 `0.15 ns` 的实用遗漏结构 | ML 证明了统计模型正确，或 ML 预测可以充当权重 |
+| 21 个绝对权重的发布资格 | 不通过 | 21 个上下文都保留探索性估计和不确定性 | 发布任何一个 differential-v2 绝对通用权重 |
+| 外部有效性 | 未检验 | 结论适用于本次固定宿主、QEMU 10.0.2 和 TCG 配置 | 外推到其他宿主、QEMU 版本或真实 RISC-V 硬件 |
+
+因此，本次实验最强的正结论是“数据流上下文依赖存在，且新增 ML 检查没有发现超过预设实用阈值的遗漏结构”。它不是“21 个权重已经达到高置信”的证明。
+
+### 18.2 实验身份与数据完整性
+
+| 项目 | 数值 |
+| --- | ---: |
+| 独立 QEMU run | 60 |
+| run 标识前缀 | `run-20260811T190603Z-differential-measure-3678065-*` |
+| 执行上下文 / 差分比较 | 21 / 10 |
+| 原始计时窗口 / probe-baseline pair | 75,600 / 37,800 |
+| 每上下文 pair / 每 batch pair | 1,800 / 12,600 |
+| batch | 4096、16384、65536，各 25,200 个窗口 |
+| AB / BA | 38,004 / 37,596 个窗口 |
+| timing-first / plugin-off-first | 30 / 30 个 run |
+| 翻译污染窗口 / pair | 0 / 0 |
+| purity 范围 | 1.0--1.0 |
+| validation | 1,260 个窗口，630 个 pair |
+
+60 个 timing footer 各含 1,260 个窗口，合计 `nested_starts=0`、`inactive_stops=0`、`translation_failures=0`、`timer_failures=0`，退出时均无活动窗口。validation footer 同样没有 marker、translation 或 timer failure。`launch-order.tsv` 证明 plugin-on/off 的进程启动顺序已交叉平衡，消除了旧实验中“plugin-on 固定先运行”的系统性混杂，但不能消除同一宿主上的所有时间变化。
+
+正式环境仍为 QEMU 10.0.2、`virt`、`tcg,thread=single`、`-smp 1`、`-m 1G`。关键派生产物的 SHA-256 为：
+
+| 产物 | SHA-256 |
+| --- | --- |
+| `samples.jsonl` | `88fe136fb40fa4278b7ad35222463aac527fffa4d839781311f911056d5420cc` |
+| `weights.json` | `d87905d98fc1c32c47eed0a569999abbef95b26f06bca11989a2ccaa80b33e6e` |
+| `ml-validation.json`（修正判定后） | `1e835833247553f7a6179911cdf55e7f744a833ad06d4b83495f75abe7c02d83` |
+| QEMU plugin | `ff7a28701a20fba6b7f1c99899a7d9052e58e6a75f673b467ec6a07c2e4d2c87` |
+
+完整产物位于 [`differential-structural-formal-20260812`](../build/riscv-instruction-weight-runs/differential-structural-formal-20260812/)；其中 `launch-order.tsv`、`validation.windows.jsonl`、`weights.csv`、`ml-contexts.csv` 和 `ml-predictions.csv` 分别提供启动顺序、构造闭合、逐上下文结果和逐 pair 预测明细。
+
+### 18.3 为什么旧 20-run differential 实验不够
+
+旧 differential 正式目录只有 20 个 run、12,000 个 pair 和 20 个上下文，且缺少 `nop -> empty-call` calibration。结果不是“绝对权重为零”，而是控制图没有绝对锚点：20/20 个上下文均为 `not-identifiable`，999 次主 bootstrap 没有形成完整绝对控制图 replicate。旧 ML 又使用交叉验证折残差做诊断性 conformal，同一批 run 参与模型选择和覆盖评估；按完整 run 的最大 pair 残差得到 `51.5888 ns` 半宽，只能暴露尾部噪声，不能作为高置信区间。
+
+新实验增加 calibration 并把 run 数提高到 60，分别解决“绝对控制图不闭合”和“无法互斥划分 train/calibration/test”的问题。旧结果仍保留为设计缺陷证据，不与新结果拼接，也不通过事后补点把旧 run 冒充同一预注册实验。
+
+### 18.4 差分探针与统计模型升级
+
+探针覆盖 `div/divu/divuw/divw/rem/remu/remuw/remw` 的 evolving dependency-chain 与 per-slot nondegenerate reset 两类数据流；另对 `div-rem`、`rem-div` mixed-TB alternation 与同质 reset 做成对比较。新增 `nop -> empty-call` calibration 后，所有目标都能通过同一控制图恢复绝对量，而不再把 `nop` 暗中当作零成本。
+
+每个上下文仍使用三档 categorical batch、AB/BA 配对和 Huber IRLS。新版模型还执行三档 batch 的全部 pairwise contrast，按完整 run 估计严重异常比例，并用 Paule--Mandel `tau^2` 与 modified Hartung--Knapp 区间描述 run 间随机效应。future-run prediction interval 是无条件质量门禁；`I^2` 仅为诊断量。控制节点的不确定性、辅助时钟状态和质量标签沿控制图传播，避免目标 contrast 很窄时忽略 reference 本身的不稳定性。
+
+分层 moving-block bootstrap 使用 4,999 个 replicate，4,999 个全部有效；全族 max-stat critical value 为 `2.9769498827`，95% 分位的 Monte Carlo SE 为 `0.0030825153`。21 个上下文各有 60 run、1,800 pair，ESS 范围为 `653.44--1039.95`。这证明采样与主区间计算稳定，但不覆盖辅助一致性门禁，也不自动提升发布等级。
+
+### 18.5 差分结论
+
+差分效应定义为 `independent/reset - dependency/reference`；负值表示 per-slot reset 路径比 dependency-chain 更快。区间按完整 QEMU run 聚类。
+
+| 比较 | 效应 ns | 95% run-cluster CI | 实用等价边界 ns | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `div-dataflow` | -4.044538 | [-4.135249, -3.988876] | 0.394287 | context-dependent |
+| `divu-dataflow` | -2.780482 | [-2.799526, -2.760566] | 0.275140 | context-dependent |
+| `divuw-dataflow` | -2.916284 | [-2.933197, -2.899084] | 0.290772 | context-dependent |
+| `divw-dataflow` | -4.481537 | [-4.566091, -4.414282] | 0.435898 | context-dependent |
+| `rem-dataflow` | -4.820826 | [-4.885022, -4.769107] | 0.472821 | context-dependent |
+| `remu-dataflow` | -2.932454 | [-2.962274, -2.901046] | 0.287989 | context-dependent |
+| `remuw-dataflow` | -3.230385 | [-3.292797, -3.187815] | 0.317124 | context-dependent |
+| `remw-dataflow` | -5.075190 | [-5.162296, -4.994326] | 0.501903 | context-dependent |
+| `div-rem-alternation` | 0.040602 | [0.012968, 0.066958] | 0.150000 | equivalent |
+| `rem-div-alternation` | 0.038388 | [0.014648, 0.062883] | 0.150000 | equivalent |
+
+可视化差分幅度如下；条长表示绝对效应，不能用于比较置信区间宽度。
+
+```text
+div-dataflow          4.045 ns  ################################
+divu-dataflow         2.780 ns  ######################
+divuw-dataflow        2.916 ns  #######################
+divw-dataflow         4.482 ns  ####################################
+rem-dataflow          4.821 ns  ######################################
+remu-dataflow         2.932 ns  #######################
+remuw-dataflow        3.230 ns  ##########################
+remw-dataflow         5.075 ns  ########################################
+div-rem alternation   0.041 ns  #
+rem-div alternation   0.038 ns  #
+```
+
+八个数据流 CI 均远离各自等价带，因而“上下文依赖”结论不依赖单个点估计。两个 mixed-TB 对比只证明当前 operand、reset 策略、batch 和 TCG 版本下没有超过 `0.15 ns` 的实用交互，不能推广到任意指令组合。
+
+### 18.6 ML 独立结构检查
+
+ML 使用 one-hot HistGradientBoostingRegressor 和 absolute-error loss。所有交叉验证都按完整 QEMU run 分组，严禁同一 run 同时进入训练与验证。主基线不是全局常数，而是仅由训练折计算的 `context+batch median`；未见 batch/context 才逐级回退。因此 ML 相对该基线的增量才用于检查 order、drift 等特征中是否还有实用的遗漏结构。
+
+| 指标 | 数值 |
+| --- | ---: |
+| HGB OOF MAE | 0.119238156 ns |
+| 无泄漏 context+batch baseline MAE | 0.120530642 ns |
+| baseline - HGB MAE | 0.001292486 ns |
+| run-cluster 95% CI | [0.000913962, 0.001672706] ns |
+| 实用遗漏结构边界 | +-0.15 ns |
+
+改善区间完整落在 `+-0.15 ns` 内，支持 `no-practically-material-omitted-structure`。相对全局 median 的大幅改善只说明 context 标签有预测力，不作为结构高置信证据；R-squared 同样不参与权重发布。
+
+```text
+OOF MAE（越低越好）
+context+batch median  0.120531 ns  ########################################
+HGB                   0.119238 ns  #######################################
+绝对改善              0.001292 ns  #
+实用遗漏结构边界      0.150000 ns  ##################################################
+```
+
+图中改善量只有预设实用边界的约 0.86%；这支持“未检测到实用量级的新增预测结构”，而不是“模型预测误差只有 0.001292 ns”。HGB 自身的 OOF MAE 仍为 `0.119238156 ns`。
+
+split conformal 使用互斥的 20 train / 20 calibration / 20 honest-test run。20 个 calibration run 的有限样本覆盖下界为 `20/21 = 95.238%`，刚好覆盖 95% 目标。这也是 60 run 的设计理由：旧 20-run 数据无法同时提供足够的训练、校准和诚实测试组。
+
+| conformal 检查 | honest-test 结果 | sharpness | 门禁 |
+| --- | --- | --- | --- |
+| 21 个结构中心 | 20/20 run、420/420 center 数值覆盖 | 2/21 不够窄 | 失败 |
+| 10 个差分中心 | 19/20 run、199/200 center 数值覆盖 | 10/10 够窄 | 通过 |
+| 差分结论分类 | 200/200 supported | 与数值覆盖分开判定 | 通过 |
+
+唯一数值未覆盖点是 `rem-div-alternation` 的 run 16：观测 `0.0928955 ns`，预测 `0.0327626 ns`，半宽 `0.0429620 ns`。观测值和 conformal 区间都仍在 `+-0.15 ns` 等价带内，因此它是“数值未覆盖但结论分类一致”，不是结论矛盾。复算后的分类为 200/200 `supported`；数值覆盖仍诚实保留为 19/20 run、199/200 center。
+
+全面 ML high-confidence gate 仍失败，因为结构区间有两项不够尖锐：
+
+| 上下文 | conformal 半宽 ns | 等价边界 ns | 半宽/边界 |
+| --- | ---: | ---: | ---: |
+| `divuw dependency-chain` | 0.338120 | 0.290304 | 1.1647 |
+| `divw dependency-chain` | 0.478204 | 0.434997 | 1.0993 |
+
+因此 ML 的准确表述是“独立检查支持现有差分分类，且未发现大于 0.15 ns 的实用遗漏结构；全面结构高置信仍为 inconclusive”。`ml-validation.json` 固定输出 `may_publish_weights=false`，即使未来 conformal 全部通过，也不能替代统计权重门禁。
+
+### 18.7 为什么绝对权重仍不可发布
+
+21/21 个绝对上下文都已计算出有限值，随机效应控制链也均可辨识；但它们全部为 `identifiability=weak`、`quality=low-confidence`，`recommended_by_mnemonic_size` 的九组推荐值全部为空。失败原因分布为：
+
+```text
+control-quality-not-high          20  ########################################
+cross-clock-check-divergent       10  ####################
+plugin-off-check-unavailable       8  ################
+plugin-off-check-divergent         7  ##############
+cross-clock-check-unavailable      6  ############
+per-run-irls-not-converged         4  ########
+cross-run-coverage-incomplete      4  ########
+```
+
+根 calibration `nop -> empty-call` 的主估计为 `0.0146461 ns`，95% 同时区间为 `[0.00706795, 0.02222425] ns`。主区间可辨识且很窄，但辅助检查没有证明它在实用阈值内稳定：cross-clock difference CI 为 `[-0.167835, 0.162961] ns`，plugin-off difference CI 为 `[-0.232459, 0.191937] ns`，都没有完整落入 `+-0.15 ns`。因此 calibration 为 low-confidence，其质量通过控制图传播到其余 20 个目标。这是绝对发布失败的主要结构原因，不应通过放宽阈值或忽略 reference 质量消除。
+
+| calibration 量 | 点估计 / 差值 ns | 95% 同时区间 ns | `+-0.15 ns` 门禁 |
+| --- | ---: | ---: | --- |
+| 主 `nop -> empty-call` | 0.014646 | [0.007068, 0.022224] | 主量可辨识 |
+| cross-clock difference | -0.002437 | [-0.167835, 0.162961] | 失败 |
+| plugin-off difference | -0.020261 | [-0.232459, 0.191937] | 失败 |
+
+另有四个上下文各缺一个可用的逐 run 控制链拟合：`div alternating` 的 run 43、`divuw dependency-chain` 的 run 26、`remu dependency-chain` 的 run 29、`remuw independent-reset` 的 run 57。它们仍能在 59 个 run 上估计总体量，但不能满足完整 60-run 覆盖门禁。
+
+### 18.8 后续高置信实验
+
+下一轮首先应提高 calibration 的信噪比，而不是调低质量阈值。现已增加 `calibration-measure` 模式：仍运行全部 21 个上下文，但只把 `nop -> empty-call` 的三档 multiplier 从 1/4/16 扩大为 16/64/256；其他上下文和控制图不变。`calibration_profile` 纳入严格 merge/validation signature，standard 与 long 样本不能静默混合。该模式继续在 run 级交叉随机化 plugin-on/off 顺序，并将 calibration run 作为独立 cluster。正式重采样必须写入新目录，保留本次产物和哈希不变。
+
+随后应对 `divuw/divw dependency-chain` 增加独立 train/calibration run 或专用差分窗口，目标是让 split-conformal 半宽分别降到 `0.290304 ns` 和 `0.434997 ns` 以内，同时保持 honest test 完全隔离。20 个 calibration run 在 95% 覆盖下取最大 score，区间对一次随机三分组较敏感；不能事后搜索一个通过的 seed。扩展实验应预注册固定 seed，并优先使用 120 run 的 40/40/40 分组，使 conformal 分位不由单个最坏 run 唯一决定。四个逐 run IRLS 缺口需要通过更稳定的聚合或预注册的收敛策略修复，不能在看到结果后删除异常 run。
+
+跨宿主、跨 QEMU 版本和真实硬件是另一层实验：至少应把宿主和 QEMU 版本作为最高层 cluster，并在硬件上使用 cycle/PMU 测量。当前 60-run 区间只量化同一宿主和 QEMU 10.0.2 条件内的重复运行不确定性；ML、bootstrap 和更多同宿主 run 都不能证明外部有效性。
+
+### 18.9 结论复核索引
+
+| 报告结论 | 正式产物及字段 |
+| --- | --- |
+| 60 run、37,800 pair、21 context、10 comparison | `ml-validation.json`: `data` |
+| 75,600 窗口、三档 batch、AB/BA、purity、翻译污染 | `samples.jsonl`: 每行的 `requested_count`、`order`、`paired_contrast_purity`、`translations_during_window` |
+| timing/plugin-off 启动平衡 | `launch-order.tsv`: `first`、`second` |
+| validation 和 timer/marker 闭合 | `validation.windows.jsonl` 与 `run-*.timing.jsonl`: footer |
+| 4,999 replicate、critical value、Monte Carlo SE | `weights.json`: `simultaneous_inference` |
+| 控制图、绝对可辨识与质量传播 | `weights.json`: `instructions[].control_key`、`cross_run_random_effects`、`control_quality_chain` |
+| 21 个 low-confidence 与失败原因 | `weights.json`: `instructions[].quality`、`identifiability`、`quality_failures` |
+| 九组 mnemonic 推荐均为空 | `weights.json`: `recommended_by_mnemonic_size` |
+| 十个差分效应、区间和分类 | `ml-validation.json`: `differential_checks` |
+| HGB 与无泄漏基线比较 | `ml-validation.json`: `cross_validation.ml`、`context_batch_median`、`incremental_value` |
+| 20/20/20 split、覆盖与 sharpness | `ml-validation.json`: `cross_validation.split_conformal` |
+| ML 不得发布权重 | `ml-validation.json`: `purpose`、`conclusion.may_publish_weights` |
+| 本次代码回归验证 | `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`：228 tests OK（2 skipped）；`py_compile`、`sh -n`、`git diff --check` 均通过 |
+
+Paule--Mandel/modified Hartung--Knapp 处理 run 间随机效应，split conformal 给出的有限样本覆盖保证依赖完整 QEMU run 的可交换性。二者解决的问题不同：前者估计平均 run 与 future-run 不确定性，后者检验独立预测校准；它们都不能从单宿主实验推出跨平台有效性。
+
+## 19. NumPy/OpenBLAS 加速复核（2026-08-12）
+
+此前模型的 bootstrap 拟合在纯 Python 线性代数路径上约需 6 小时。本次保留同一输入样本和统计模型，只替换数值后端：WLS 的 Gram/RHS、Huber IRLS 的残差/MAD/权重更新、条件数和 sandwich covariance 使用 NumPy 数组运算；bootstrap 拟合不再计算未使用的逆矩阵，而使用 `np.linalg.solve`。`scripts/riscv-instruction-weight.sh` 默认选择 `numpy`，并通过隔离 venv 安装锁定依赖；每个 worker 将 OpenBLAS、OMP、MKL、BLIS 和 NumExpr 限制为单线程，避免嵌套过度并行。纯 Python 后端仍可用 `RISCV_WEIGHT_LINEAR_ALGEBRA_BACKEND=python` 显式选择。
+
+远程 Intel i9-7900X 主机的正式复核使用 120 个独立 QEMU run、75,600 个 pair、999 个 moving-block bootstrap replicate 和 16 个 worker。实测 wall time 为 **820.65 s（13 分 40.65 秒）**，user/sys CPU time 为 `11462.95/43.90 s`，999/999 replicate 有效，输出声明 `linear_algebra_backend=numpy`。相对约 6 小时的旧路径约为 **26 倍加速**，低于 30 分钟目标。实验记录给出的权重输出 SHA-256 为 `f95a2b26a74e8a51f75e5f8e341b19fe8f2a08420c1fb95a542dfc1b45aa87d2`；2026-08-13 审计未在当前工作区找到该哈希对应的文件，因此该时间复核只能作为历史记录，不能据当前保留产物独立重放。
+
+随后用新权重运行 4,999 replicate 的独立 ML/conformal 校验，耗时 `60.71 s`，结果仍为 `status=supported`，但 `may_publish_weights=false` 保持不变；这说明加速没有改变统计质量判定。当前矩阵约为每 context `3600 x 124`，且 bootstrap 的重采样、对象组织和排序仍在 CPU 上，RTX 3060 的传输与 kernel 启动开销不适合该规模，因此没有引入 CUDA 后端。
+
+## 20. 120-run 时间相关性与严格置信度复核（2026-08-12）
+
+### 20.1 为什么旧结论偏乐观
+
+120 个 run 并非可直接视作 iid 样本。8 条 dependency-chain 的 lag-1 相关为 `0.36--0.61`，早 20 次到晚 20 次的中位成本上升 `2.3%--3.9%`；指令间 run 相关中位数为 `0.729`，第一主成分解释 `76.3%` 方差。这说明宿主/QEMU 存在共同慢漂移。原 iid run bootstrap 与随机 40/40/40 划分会混合早晚阶段，从而低估时间外推风险。
+
+模型因此作了以下收紧：
+
+- 合并结果显式保存 `run_order`；旧文件只在 run ID 具有共同前缀且后缀严格覆盖 `1..N` 时恢复顺序，否则只允许首次出现顺序并明确标注来源。
+- 主权重和辅助时钟检查都使用 run 顶层 circular moving-block bootstrap；120 run 的预声明自动块长为 `round(120^(1/3)) = 5`。
+- 零成本辅助检查先在同 pair 上构造 `guest-plugin`、`guest-plugin-off` 响应差，再拟合及重采样，保留共同噪声协方差。
+- ML 同时运行随机完整-run split 与 chronological 前向 split；两者都必须通过。非共形分数按预声明实践等价边界归一化，MAD/IQR 仅作诊断。
+- test 证据不再用经验覆盖率点估计，而要求单侧 95% Clopper--Pearson 下界达到目标覆盖率 95%。自动划分改为 20 train / 20 calibration / 80 test。
+
+### 20.2 时间块统计结果
+
+正式输入仍为 `samples.jsonl`（SHA-256 `4e725d867d808b8c19ad298ff908d4f1bed06e35b3afd31aa1128bf38e70973b`，当前保留字节可匹配）。远程 NumPy/OpenBLAS 复算耗时 `875.37 s`，999/999 bootstrap replicate 有效，run block 长度为 5；实验记录给出的结果 SHA-256 为 `70f5f6f0e441cf60d240e8262c912ba94b95bc512b2347ce2919ca88ebd0f276`。当前工作区没有该哈希对应的结果文件，所以以下 `8/21` 标签属于未封印的历史分析结论，不是现行发布证据。
+
+当时的旧分析质量分布为 **8/21 high-confidence、13/21 low-confidence**。13 个失败上下文的直接原因计数为：
+
+```text
+plugin-off-check-divergent      11
+cross-clock-check-divergent      3
+plugin-off-check-unavailable     1
+```
+
+这说明 8 个高置信上下文对时间块敏感性仍稳健，但不能据此发布全部 21 个权重。plugin-off 与 cross-clock 一致性是实测失败，不应通过放宽阈值、删除 run 或让 ML 覆盖统计门禁来消除。
+
+### 20.3 独立 ML 与前向验证
+
+HGB OOF MAE 为 `0.122577675 ns`，无泄漏 context+batch baseline MAE 为 `0.123919821 ns`；改善 `0.001342146 ns` 的 moving-block 95% CI 为 `[0.001018956, 0.001652919] ns`，完整落在预声明 `+-0.15 ns` 实践等价带内。因此 ML 支持“未检测到实用量级的遗漏预测结构”，但不能证明统计权重正确。
+
+| 留出策略 | 层级 | run 覆盖 | center 覆盖 | 单侧 95% 精确下界 | 结论 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 随机 20/20/80 | 结构 | 74/80 | 1666/1680 | 0.8573 | 失败 |
+| 随机 20/20/80 | 差分 | 76/80 | 788/800 | 0.8892 | 失败 |
+| 前向 20/20/80 | 结构 | 79/80 | 1673/1680 | 0.9421 | 失败 |
+| 前向 20/20/80 | 差分 | 78/80 | 791/800 | 0.9234 | 失败 |
+
+前向 test 的 800/800 个差分结论分类均为 `supported`，且 calibration 区间全部满足 sharpness 门禁；失败来自独立覆盖率证据不足，而不是事后改变等价阈值。chronological split 也不冒充普通 exchangeable conformal 的无条件保证，输出将其标为条件性前向验证。
+
+### 20.4 最终置信度结论
+
+当时的 ML 结果记录为 `status=supported`，但 `high_confidence_status=inconclusive-ml-high-confidence-gate`，`may_publish_weights=false`；记录的输出 SHA-256 为 `1e10e9d7953d5a7a7211f02bf473ecf864caf53e60413465f846c465006d0065`。2026-08-13 审计同样没有找到该哈希对应的文件。因而可保留的历史解读仅是“当时的分析未发现大于 `0.15 ns` 的遗漏结构，并曾把 8 个上下文标为通过旧统计门禁”；不能把它表述为当前可复验的高置信权重，更不能声称 21 个上下文整体、通用 mnemonic 权重或跨宿主模型已经达到高置信。
+
+下一轮应预注册相同前向设计，先预热并固定 CPU affinity/governor，逐 run 记录频率与温度，再增加稳定的同-run anchor。anchor 校正必须由 train 数据确定，并要求 raw 与校正后结果同时通过。按当前精确门禁，0/59 miss、1/93 miss 或 2/124 miss 才能使单侧 95% 下界达到 95%；当前 79/80 和 78/80 因而不足。不能用更多同一批 pair 或更复杂 ML 替代新的独立 run。
+
+## 21. 改进后的测量与高置信协议（2026-08-12）
+
+旧数据只用于说明问题，不能被新协议追认成高置信。新 runner 把一个独立样本定义为四次 QEMU 启动组成的 `ABBA` 或 `BAAB` super-run，其中 A 为 timing-plugin，B 为 plugin-off；两次 timing/off 在相邻 crossover pair 内合并。QEMU 子运行仍作为固定效应和组内重复，但 bootstrap、ESS、随机效应、异常比例、ML GroupKFold 以及 train/calibration/test 都只按 super-run 计数。因此复制同一组启动不会增加独立自由度。
+
+正式模式要求 `RISCV_WEIGHT_CPUSET` 绑定一个逻辑 CPU，并在每次启动前后写入 `host-telemetry.jsonl`。遥测包含所选 CPU 及 SMT sibling 的 `/proc/stat`、频率/governor、load average、CPU/memory PSI、可用内存与可读取温度。`host-audit.json` 对 sibling 忙占比、负载、频率下限和温漂执行硬门禁；启动前另运行不计样本的 QEMU 预热。缺少 CPU 绑定或宿主门禁失败时拒绝拟合正式结果。
+
+探针新增独立 key `stability-anchor-positive-div`。它是正成本 `div` 差分负载，在每个子运行首部、随机主体和尾部重复，长模式使用 16/64/256 窗口，解决 `nop -> empty` 接近零分母的问题。统计层要求唯一 anchor、完整 super-run 覆盖和大于 `0.5 ns/instruction` 的信号；速度比例在每个 super-run moving-block bootstrap replicate 内重新估计，使锚点误差传播到尺度区间。当前实现先把 anchor 作为保守发布门禁：缺失、非正或联合区间宽度比超过 1.10 时，所有权重增加 `positive-anchor-scale-inconclusive`，不会因校正得到高置信标签。
+
+当前固定正式规模为 **205 个独立 super-run**，预注册为 20 train / 39 calibration / 146 honest test。随机留出与 chronological 前向留出组成两个联合 conformal family；每个 family 内先对 structural 与 differential 层取完整 super-run 的最大标准化 nonconformity，再用 Bonferroni 将总体 `alpha=0.05` 分配为每族 `alpha=0.025`，即每族目标置信度 `97.5%`。39 个 calibration super-run 的最大有限样本覆盖恰为 `39/40=97.5%`；若 146 个 test super-run 全部覆盖，单侧 97.5% Clopper--Pearson 下界约为 `0.97505`，刚好超过目标。ML 仍只有独立反证作用且 `may_publish_weights=false`。最终高置信声明还必须同时满足原始主区间、plugin-off/cross-clock、正锚点尺度、宿主隔离、随机与前向联合 conformal、raw/adjusted discrepancy、稳健估计器敏感性和单一 super-run 影响门禁；任何一项失败都保持 inconclusive。必须先完成新协议 pilot 的预注册比较，才可启动 205-super-run 正式实验。
+
+## 22. 高置信协议实现与当前证据（2026-08-12）
+
+统计模型 schema 已升级为 v3。每个独立样本是四次 QEMU 启动组成的 ABBA/BAAB super-run；两次 timing/plugin-off 对只作为组内重复，bootstrap、随机效应、异常比例、ML 分组和前向覆盖全部以 super-run 为最高层。正式模式要求单 CPU 绑定，并把 CPU/SMT sibling、频率、governor、load、PSI、内存和温度审计嵌入 `weights.json`；离线 mapper 只有在顶层 `publication_gate.passed=true` 时才接受 `published_ns_per_instruction`。
+
+正锚点已改为可辨识的 dependency-chain `div` contrast，并明确记录 `head/body/tail` 位置。合并器要求每个 QEMU 子运行具有首部中档锚点、每个主体轮次的三档重复和尾部中档锚点，缺项立即拒绝。一次本地长窗口 smoke 得到：
+
+| 量 | 点估计 |
+| --- | ---: |
+| primary anchor | 3.6994 ns/instruction |
+| guest anchor | 3.7512 ns/instruction |
+| plugin-off anchor | 3.8187 ns/instruction |
+| plugin-off 到 primary 尺度 | 0.9688 |
+
+该结果只证明锚点不再是接近零分母。smoke 仅有 1 个 super-run，不能估计未来运行异质性，也不能形成覆盖证据。
+
+v3 在每个 hierarchical bootstrap replicate 内同时重采样 target 与 anchor block，重新估计该 super-run 的 target-independent plugin-off-to-primary 尺度，再重新拟合 adjusted 权重。raw、adjusted、anchor nuisance 和 `adjusted - raw` discrepancy 共用一次 max-standardized-deviation family；只有完整包含全族字段的 replicate 才计入有效数。逐上下文发布要求 raw/adjusted 区间均通过、anchor 尺度区间宽度比不超过 1.10、discrepancy 区间完全落入实践等价带。现行 publication seal 把总体 `alpha=0.05` 先等分给 sampling error 与 finite-bootstrap Monte Carlo error，再分别对四个预注册统计 family 使用 union bound，因此每个 family 在两个误差预算中都使用 `alpha=0.00625`、置信度 `99.375%`。四个 family 还必须各有 **4,999/4,999 完整 replicate**，其中固定的 999 个前缀 replicate 用于尺度估计、其余 4,000 个用于有限 bootstrap 分位校准；不得以“有效率达到 99%”替代全 replicate 闭合。
+
+本地 smoke 的 999/999 联合 replicate 全部完整，但由于只有一个 super-run，尺度联合区间仍过宽且所有上下文保持 low-confidence；`publication_gate.passed=false`。这是一项预期的 fail-closed 结果，不是正式结论，而且 999 replicate 也低于后来收紧的 4,999-replicate seal 合同。下一项可发布证据必须来自隔离宿主上的独立 pilot，然后才是预注册的 205-super-run 正式实验。机器学习只检查遗漏结构与前向覆盖，读取 adjusted 结果但永远保持 `may_publish_weights=false`，不能替代上述统计门禁。
+
+### 22.1 位置/批次锚点与最终发布闭环
+
+后续复核发现，仅验证 `head/body/tail` 存在仍会把位置和 batch 漂移吸收到一个混合中位数尺度中。当前尺度点估计固定取每个 super-run 的 `body` 中档 batch；`head`、`tail` 和 body 的低/高 batch 分别形成相对参考层的 plugin-off-to-primary 对数尺度 nuisance。它们与 raw、adjusted、anchor signal、anchor scale 和 raw-adjusted discrepancy 共用同一次 moving-block max-stat bootstrap。所有位置/批次 nuisance 同时区间必须完全落入 `+-log(1.10)`，否则锚点门禁失败。bootstrap 固定保留每次 QEMU 启动唯一的首尾块，只对主体块进行 moving-block 重采样，避免破坏预声明布局。
+
+最新单 super-run 端到端 smoke 位于 `build/riscv-instruction-weight-runs/high-confidence-protocol-smoke-v2-20260812`。它得到 body 中档 primary `3.6069 ns/instruction`、plugin-off-to-primary scale `0.9704`。head nuisance 点估计为 `0.0744`，联合 95% 区间为 `[0.0054, 0.1434]`；高 batch nuisance 区间为 `[-0.1067, 0.2116]`，均未完整落入 `+-0.0953`。因此 `nuisance_interval_gate_passed=false` 且发布继续失败。该结果证明新门禁能识别一次启动内的尺度漂移，不能被解释为总体参数估计。
+
+宿主审计现在必须与本次 `run-design.jsonl` 精确绑定：计划外或缺失 launch、ABBA/BAAB 不完整、before/after 元数据变化、非单 CPU、所选 CPU 未实际运行、SMT sibling 忙占、频率/governor、负载、内存和同传感器温漂任一失败都会拒绝。PSI 在宿主内核提供时执行阈值门禁；缺失时明确记录 `null`，不伪造证据。审计输出保存 telemetry 与 run-design 的 SHA-256。
+
+ML validation schema 升级为 v2，并绑定 `samples.jsonl` 与 ML 运行前 `weights.json` 的 SHA-256/大小。统计模型裸输出固定包含 `host-isolation-audit-missing` 和 `ml-validation-missing`；runner 先嵌入通过的宿主审计，再运行 ML，最后复验哈希并重算全部 required components。mapper 和成本消费者还会二次要求统计核心、raw、adjusted、anchor、discrepancy、joint bootstrap、宿主和 ML 七类证据全部成立。因而 ML 仍不产生权重，但其独立反证门禁缺失或失败时，任何下游都不能把模型当作已发布模型使用。
+
+## 23. 2026-08-13 当前证据与发布审计
+
+### 23.1 总结论
+
+当前结论是 **不可发布、尚未达到整体高置信**。工作区内所有 v3 smoke 和 pilot 的 `publication_gate.passed` 都为 `false`；在 `build/riscv-instruction-weight-runs/` 下也没有产物同时包含现行 `artifact_provenance`、外部 `provenance.json` 与 `publication_seal`。普通 `artifacts.sha256` 只能校验若干文件字节，不能替代来源关系重放、最终 payload 封印和通过发布门禁的证明。
+
+| 产物 | 独立规模与数据量 | 已得到的结果 | 不能发布的直接原因 |
+| --- | --- | --- | --- |
+| [`high-confidence-final-smoke-20260813`](../build/riscv-instruction-weight-runs/high-confidence-final-smoke-20260813/) | 1 super-run、4 次 QEMU 启动、664 pair、9 个 bootstrap replicate | 22 个上下文全部 low-confidence，`publishable_contexts=0` | 正锚点尺度 inconclusive；bootstrap 远低于正式合同；缺宿主审计与 ML |
+| [`differential-ml-final-smoke-20260813`](../build/riscv-instruction-weight-runs/differential-ml-final-smoke-20260813/) | 1 super-run、400 个统计 pair；ML 排除 22 个 anchor pair 后使用 378 pair | ML 为 `inconclusive-insufficient-independent-runs`；最终统计细节复验拒绝 | 只有一个独立单元、9 个 bootstrap replicate、无合格宿主审计，且 ML/统计门禁均失败 |
+| [`local-runner-smoke-20260813`](../build/riscv-instruction-weight-runs/local-runner-smoke-20260813/) | 3 super-run、12 次 QEMU 启动、1,992 pair、9 个 bootstrap replicate | 数据链路可以运行，但宿主审计为 `rejected` | 24 条 powersave governor 记录、12 次 SMT sibling 干扰、10 次超过 90°C、1 次温度不可用；最低频率比例 `0.619978`，峰值 96°C |
+| [`remote-pilot-abba-12-current-model-20260813`](../build/riscv-instruction-weight-runs/remote-pilot-abba-12-current-model-20260813/) | 12 super-run、48 次 QEMU 启动、15,888 pair、999 个 bootstrap replicate | 过渡分析器的统计核心通过，并给出 11 个非 calibration 候选上下文 | 宿主审计拒绝；缺现行 ML、FWER 合同、audit binding、provenance 与 seal；现行 verifier 不能接受该结果 |
+
+远程 pilot 的宿主失败是实测而非文档缺项：最低频率比例为 `0.744735`，低于 `0.9` 门槛；有 9 次 SMT sibling 干扰；同一传感器最大温漂为 `35°C`，高于 `12°C` 门槛。因此即使其中 11 个候选在过渡统计核心中通过，也不能升级为可发布权重。
+
+### 23.2 当前覆盖范围
+
+新 differential/anchor 探针仅覆盖 **9 个 mnemonic、22 个执行上下文**：`div`、`divu`、`divuw`、`divw`、`nop`、`rem`、`remu`、`remuw`、`remw`。其中 21 个为目标上下文，1 个为正锚点 calibration；pattern 包含 dependency-chain、independent/reset、两种 mixed alternation 和 anchor。它可以验证 `div/rem` 数据流依赖和锚点稳定性，不能代表完整 RV64I/M/A/F/D/C、特权指令、RVV 或其他扩展，更不能据此声称“已经为一切 RISC-V 指令建立高置信权重”。前文 409-key catalog 实验覆盖更广，但使用旧采样与旧发布协议，不能和这 22 个上下文拼接来增加现行独立样本数。
+
+### 23.3 ML 能证明什么
+
+机器学习在本协议中是**独立反证器**，不是统计模型正确性的证明器，也不是权重来源。HGB 只能检查现有特征中是否仍存在超过预声明 `0.15 ns` 实用阈值的可预测残差结构；随机与 chronological 两个联合 conformal family 只能在各自交换性或前向稳定性假设下检验完整 future super-run 的覆盖和 sharpness。即使 ML 全部通过，`may_publish_weights` 仍固定为 `false`；它只能作为发布门禁的必要条件之一。最终高置信来自统计区间、有限 bootstrap、宿主隔离、独立 ML 反证、来源链和内容封印的交集，而不是由 ML 单独“证明”。
+
+### 23.4 历史哈希的可复验边界
+
+- 2026-08-09 目录中的 `samples.jsonl`、`weights.json`、`catalog-weights.json` 和 QEMU plugin 仍能重算并匹配报告哈希；旧 kernel `f963e6b6f72a9892574283128bc0000916938d9cec12068ea44694cfd3655a6e` 与 probe `6aa736ae988614bea7972edba83e84d5a3893835e83e2024f6508d55ce8a4aa7` 仅保留在 `artifacts.sha256` 中，当前同名文件分别为 `97c00309ab3a6ef2664412888753449adfb73d6073774f2e93a33f51eb5eefac` 与 `01036028914eeb4e47de599ee878ec9e305c2960079bb43ed2123aae382999c8`，原始二进制字节不在目录中。
+- 2026-08-12 的 60-run differential 目录仍能匹配 samples `88fe136fb40fa4278b7ad35222463aac527fffa4d839781311f911056d5420cc`、weights `d87905d98fc1c32c47eed0a569999abbef95b26f06bca11989a2ccaa80b33e6e`、ML `1e835833247553f7a6179911cdf55e7f744a833ad06d4b83495f75abe7c02d83` 和 plugin `ff7a28701a20fba6b7f1c99899a7d9052e58e6a75f673b467ec6a07c2e4d2c87`，所以这些文件可做字节级历史复核；但它们没有现行 provenance/seal，也不满足 205-super-run 发布合同。
+- 120-run 输入 `4e725d867d808b8c19ad298ff908d4f1bed06e35b3afd31aa1128bf38e70973b` 仍存在；报告记录的派生结果 `f95a2b26a74e8a51f75e5f8e341b19fe8f2a08420c1fb95a542dfc1b45aa87d2`、`70f5f6f0e441cf60d240e8262c912ba94b95bc512b2347ce2919ca88ebd0f276` 和 `1e10e9d7953d5a7a7211f02bf473ecf864caf53e60413465f846c465006d0065` 在当前工作区均未找到精确对应文件。因此第 19--20 节的性能数字、`8/21` 标签和 ML 摘要只能标作历史记录。若要恢复可复验性，应恢复这些只读产物及其生成代码身份，或在冻结的新协议下重新采样/重算；不能用当前不同哈希的文件替代。
+
+### 23.5 达到高置信的剩余工作
+
+正式采集前必须让 runner、ML validator、pilot comparator、测试 fixture 和报告共同锁定同一 205-super-run 政策，并通过完整回归。随后先在严格隔离宿主上取得 audit accepted 的新 pilot；只有预注册 pilot 比较通过，才运行 205 个独立 super-run。最终结果还必须有四个统计 family 各 4,999/4,999 完整 replicate、20/39/146 的两族联合 conformal 证据、当前 acquisition 的 host audit binding、全量 artifact provenance，以及覆盖最终 payload 的 publication seal。任何一项缺失都应继续 fail closed。

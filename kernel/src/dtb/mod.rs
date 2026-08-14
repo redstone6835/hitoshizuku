@@ -12,9 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use allocator::{KERNEL_ALLOCATOR, MemorySegment};
-use general::dev::block::BlockDevice;
 use general::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext, DmaWindow};
-use general::dev::enumerate::DEVICES;
 use general::dev::iommu::{self, IommuAttachment, IommuRequester};
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, PlatformDeviceInfo,
@@ -23,15 +21,6 @@ use general::dev::platform::{
 use general::dev::pnp::DevInitContext;
 use general::dev::pnp::PnpDevice;
 use general::firmware::dtb as firmware_dtb;
-use general::vfs::FS_REGISTRY;
-use general::vfs::VfsContext;
-use general::vfs::cred::Credentials;
-use general::vfs::dentry::VfsRoot;
-use general::vfs::device_files::projection::active_block_devices;
-use general::vfs::limits::VfsLimits;
-use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::stat::FileMode;
-use general::vfs::superblock::Superblock;
 use general::{StartBootProtocol, StartContext, StartFirmware, StartNoMapSupport, StartPhysRange};
 use log::printk;
 
@@ -526,58 +515,21 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // 小步骤 5.4 再决定根文件系统的来源。优先级是外部/内建 initramfs，其次才是
     // 已经注册好的块设备根盘。
-    let selected_initramfs = external_initramfs.or_else(crate::initramfs::embedded_image);
-    let cred = Credentials::root();
-    let (root_sb, root_source) = if let Some(image) = selected_initramfs {
-        let sb = mount_tmpfs_superblock();
-        (
-            sb,
-            match image.source {
-                crate::initramfs::InitramfsSource::Embedded => "embedded initramfs",
-                crate::initramfs::InitramfsSource::External => "external initramfs",
-            },
-        )
-    } else {
-        mount_first_block_root()
-            .unwrap_or_else(|err| panic!("[kernel-start][dtb] failed to mount block root: {}", err))
-    };
-    printk!("[kernel-start][dtb] root source selected: {}", root_source);
-
-    // 小步骤 5.5 在确定根 superblock 之后，创建 mount namespace 和启动期 VFS
-    // 上下文，并在需要时把 initramfs 内容解包到最终根目录。
-    let root_mount = Mount::new(
-        Arc::clone(&root_sb),
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_sb.root_dentry),
-        MountFlags::default(),
-        None,
+    let root = crate::boot_root::prepare(
+        "dtb",
+        context.boot.command_line,
+        crate::initramfs::embedded_image(),
+        external_initramfs,
     );
-    let mount_ns = MountNamespace::new(1, Arc::clone(&root_mount));
-
-    let vfs_ctx = VfsContext::new(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        VfsRoot::new(Arc::clone(&root_sb.root_dentry), Arc::clone(&root_mount)),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
-        FileMode::new(0),
-        VfsLimits::default_arc(),
-    );
-
-    if let Some(image) = selected_initramfs {
-        crate::initramfs::unpack_newc(image, &vfs_ctx).unwrap_or_else(|err| {
-            panic!("[kernel-start][dtb] failed to unpack initramfs: {:?}", err)
-        });
-        printk!("[kernel-start][dtb] initramfs unpacked into root");
-    }
+    printk!("[kernel-start][dtb] root source selected: {}", root.source);
 
     // 小步骤 5.6 最后把 devtmpfs 和标准用户接口伪文件系统挂到公共路径。
-    crate::device_init::mount_devtmpfs_on_dev("dtb", &vfs_ctx, Arc::clone(&dev_sb));
-    crate::device_init::mount_standard_user_api_filesystems("dtb", &vfs_ctx);
+    crate::device_init::mount_devtmpfs_on_dev("dtb", &root.vfs_ctx, Arc::clone(&dev_sb));
+    crate::device_init::mount_standard_user_api_filesystems("dtb", &root.vfs_ctx);
 
     printk!(
         "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",
-        root_source
+        root.source
     );
 
     // 步骤 6 最后确定启动期控制台，并把日志出口绑定到已经就绪的字符设备上。
@@ -587,10 +539,11 @@ pub fn kernel_start_init(context: &StartContext) {
     // 小步骤 6.1 先把根目录、挂载点和凭据等 VFS 组件交给 sched shim 保管；随后
     // sched::boot_init 会据此给 init 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
     crate::sched::stash_boot_vfs_parts(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
+        Arc::clone(&root.superblock.root_dentry),
+        Arc::clone(&root.root_mount),
+        Arc::clone(&root.mount_ns),
+        Arc::clone(&root.cred),
+        root.is_initramfs,
     );
 
     // 小步骤 6.2 然后解析控制台来源。这里优先看命令行 console 参数，找不到时再
@@ -617,7 +570,7 @@ pub fn kernel_start_init(context: &StartContext) {
     if let Some(selector) = console_selector {
         let _ = crate::device_init::bind_or_defer_boot_console(
             "dtb",
-            &vfs_ctx,
+            &root.vfs_ctx,
             Arc::clone(&dev_sb),
             selector,
         );
@@ -635,43 +588,6 @@ fn wipe_secret(bytes: &mut [u8]) {
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
     compiler_fence(Ordering::SeqCst);
-}
-
-fn mount_tmpfs_superblock() -> Arc<Superblock> {
-    FS_REGISTRY
-        .find("tmpfs")
-        .expect("[kernel-start][dtb] tmpfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][dtb] failed to mount tmpfs root")
-}
-
-fn mount_block_root(
-    dev: Arc<BlockDevice>,
-) -> Result<(Arc<Superblock>, &'static str), &'static str> {
-    general::vfs::mount_block_device_auto(dev, "")
-        .map_err(|_| "unsupported or invalid root filesystem")
-}
-
-fn mount_first_block_root() -> Result<(Arc<Superblock>, &'static str), &'static str> {
-    let devices = active_block_devices(&DEVICES.functions);
-    if devices.is_empty() {
-        return Err("no initramfs and no active block device found");
-    }
-
-    for dev in devices {
-        match mount_block_root(Arc::clone(&dev)) {
-            Ok(root) => return Ok(root),
-            Err(err) => {
-                log::debug!(
-                    "[kernel-start][dtb] block device {} is not root candidate: {}",
-                    dev.name(),
-                    err
-                );
-            }
-        }
-    }
-
-    Err("no active block device contains a supported root filesystem")
 }
 
 fn platform_device_info_from_dtb(

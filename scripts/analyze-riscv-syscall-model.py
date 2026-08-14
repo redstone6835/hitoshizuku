@@ -301,7 +301,11 @@ def counters_are_zero(value: Any) -> bool:
 def descriptor_estimates(
     plugin: Mapping[str, Any], weights_path: Path
 ) -> tuple[dict[tuple[int, str], Mapping[str, Any]], dict[str, Any]]:
-    by_semantic, model_metadata = COST_MODEL.load_model(weights_path)
+    # 该工具用于 syscall 路径诊断，允许读取未封印的诊断模型；正式
+    # BuildStorm 成本映射仍通过 mapper/apply 的默认 publication 门禁。
+    by_semantic, model_metadata = COST_MODEL.load_model(
+        weights_path, require_publication=False
+    )
     estimates: dict[tuple[int, str], Mapping[str, Any]] = {}
     semantic_metadata: dict[str, Any] = {}
     semantics: dict[int, set[str]] = {}
