@@ -356,6 +356,8 @@ pub enum PciConfigSpaceKind {
     Cam,
     /// PCIe ECAM：每条 bus 1 MiB，每个 function 4 KiB。
     Ecam,
+    /// LS2K1000 厂商 CFG1 编码，配置函数仍暴露完整 4 KiB 空间。
+    Ls2k1000,
 }
 
 impl PciConfigSpaceKind {
@@ -363,26 +365,27 @@ impl PciConfigSpaceKind {
         match self {
             Self::Cam => 1 << 16,
             Self::Ecam => 1 << 20,
+            Self::Ls2k1000 => 1 << 16,
         }
     }
 
     pub const fn bytes_per_function(self) -> u16 {
         match self {
             Self::Cam => 0x100,
-            Self::Ecam => PCI_EXTENDED_CONFIG_SPACE_SIZE,
+            Self::Ecam | Self::Ls2k1000 => PCI_EXTENDED_CONFIG_SPACE_SIZE,
         }
     }
 
     pub const fn bus_shift(self) -> u8 {
         match self {
-            Self::Cam => 16,
+            Self::Cam | Self::Ls2k1000 => 16,
             Self::Ecam => 20,
         }
     }
 
     pub const fn function_shift(self) -> u8 {
         match self {
-            Self::Cam => 8,
+            Self::Cam | Self::Ls2k1000 => 8,
             Self::Ecam => 12,
         }
     }

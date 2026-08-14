@@ -29,6 +29,7 @@ use crate::bar::{
     PciBarAddressWidth, PciBarAllocation, PciBarKind, PciBarRuntimeWindow, PciBarWindowAllocator,
     PciBarWindowSpace, probed_20bit_memory_bar_size,
 };
+use crate::ls2k_config::{Ls2kConfigWindow, Ls2kRootIrqRoute, Ls2kRootIrqTable};
 use crate::routing::{
     PciIntxBridgeRoute, PciIntxRouting, PciMsiMapRoute, PciMsiParentRoute, PciMsiRoutingMode,
     allocate_first_available,
@@ -44,11 +45,13 @@ use crate::topology::{
 struct PciEcamRegion {
     phys_base: usize,
     bus_start: u8,
+    bus_end: u8,
     bus_shift: u8,
     function_shift: u8,
     function_size: u16,
     vbase: usize,
     size: usize,
+    config_space: DtbPciConfigSpace,
 }
 
 /// DT 可以描述多个互不重叠的 host bridge；配置空间回调必须按每次访问携带的
@@ -57,10 +60,17 @@ static PCI_ECAM_REGIONS: Spinlock<PciHostTable<PciEcamRegion>> = Spinlock::new(P
 static PCI_ACCESS_INIT: Spinlock<Option<usize>> = Spinlock::new(None);
 
 struct PciIrqRouting {
-    address_cells: usize,
-    interrupt_cells: usize,
-    resolver: DtbPciInterruptResolver,
+    backend: PciIrqRoutingBackend,
     intx: Spinlock<PciIntxRouting>,
+}
+
+enum PciIrqRoutingBackend {
+    Dtb {
+        address_cells: usize,
+        interrupt_cells: usize,
+        resolver: DtbPciInterruptResolver,
+    },
+    Ls2k1000(Ls2kRootIrqTable),
 }
 
 static PCI_IRQ_ROUTING: Spinlock<PciHostTable<Arc<PciIrqRouting>>> =
@@ -403,6 +413,7 @@ const fn pci_config_space_kind(config_space: DtbPciConfigSpace) -> PciConfigSpac
     match config_space {
         DtbPciConfigSpace::Cam => PciConfigSpaceKind::Cam,
         DtbPciConfigSpace::Ecam => PciConfigSpaceKind::Ecam,
+        DtbPciConfigSpace::Ls2k1000 => PciConfigSpaceKind::Ls2k1000,
     }
 }
 
@@ -595,6 +606,7 @@ fn ecam_addr(
     device: u8,
     function: u8,
     offset: u16,
+    width: usize,
 ) -> Result<usize, PciConfigError> {
     if device >= PCI_DEVICES_PER_BUS
         || function >= PCI_FUNCTIONS_PER_DEVICE
@@ -615,6 +627,12 @@ fn ecam_addr(
     }
     drop(regions);
 
+    if region.config_space == DtbPciConfigSpace::Ls2k1000 {
+        return Ls2kConfigWindow::new(region.vbase, region.size, region.bus_start, region.bus_end)
+            .and_then(|window| window.address(bus, device, function, offset, width))
+            .map_err(|_| PciConfigError::InvalidOffset);
+    }
+
     let rel_bus = usize::from(bus - region.bus_start);
     let off = (rel_bus << region.bus_shift)
         | (usize::from(device) << (region.function_shift + 3))
@@ -630,17 +648,17 @@ fn ecam_addr(
 }
 
 fn ecam_read_u8(seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u8, PciConfigError> {
-    let a = ecam_addr(seg, bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset, 1)?;
     // Safety: `ecam_addr` 已验证 BDF、偏移和已映射 ECAM 窗口边界，地址按 u8 对齐。
     Ok(unsafe { core::ptr::read_volatile(a as *const u8) })
 }
 fn ecam_read_u16(seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u16, PciConfigError> {
-    let a = ecam_addr(seg, bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset, 2)?;
     // Safety: 调用者的 config API 已校验 2 字节对齐，`ecam_addr` 已验证窗口边界。
     Ok(unsafe { core::ptr::read_volatile(a as *const u16) })
 }
 fn ecam_read_u32(seg: u16, bus: u8, dev: u8, func: u8, offset: u16) -> Result<u32, PciConfigError> {
-    let a = ecam_addr(seg, bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset, 4)?;
     // Safety: 调用者的 config API 已校验 4 字节对齐，`ecam_addr` 已验证窗口边界。
     Ok(unsafe { core::ptr::read_volatile(a as *const u32) })
 }
@@ -652,7 +670,7 @@ fn ecam_write_u8(
     offset: u16,
     v: u8,
 ) -> Result<(), PciConfigError> {
-    let a = ecam_addr(seg, bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset, 1)?;
     // Safety: `ecam_addr` 已验证 BDF、偏移和已映射 ECAM 窗口边界，地址按 u8 对齐。
     unsafe { core::ptr::write_volatile(a as *mut u8, v) };
     Ok(())
@@ -665,7 +683,7 @@ fn ecam_write_u16(
     offset: u16,
     v: u16,
 ) -> Result<(), PciConfigError> {
-    let a = ecam_addr(seg, bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset, 2)?;
     // Safety: 调用者的 config API 已校验 2 字节对齐，`ecam_addr` 已验证窗口边界。
     unsafe { core::ptr::write_volatile(a as *mut u16, v) };
     Ok(())
@@ -678,7 +696,7 @@ fn ecam_write_u32(
     offset: u16,
     v: u32,
 ) -> Result<(), PciConfigError> {
-    let a = ecam_addr(seg, bus, dev, func, offset)?;
+    let a = ecam_addr(seg, bus, dev, func, offset, 4)?;
     // Safety: 调用者的 config API 已校验 4 字节对齐，`ecam_addr` 已验证窗口边界。
     unsafe { core::ptr::write_volatile(a as *mut u32, v) };
     Ok(())
@@ -787,19 +805,32 @@ fn resolve_pci_irq(
         let intx = routing.intx.lock();
         intx.resolve(bus, device, function, interrupt_pin)?
     };
-    let key = pci_child_interrupt_key(
-        route_key.bus,
-        route_key.device,
-        route_key.function,
-        route_key.pin,
-        routing.address_cells,
-        routing.interrupt_cells,
-    )?;
-    let (child_address, child_interrupt) = key.split_at(routing.address_cells);
-    let route = resolve_dtb_pci_interrupt(&routing.resolver, child_address, child_interrupt)
-        .ok()
-        .flatten()?;
-    irq::translate_firmware_irq(Some(route.parent), &route.parent_specifier)
+    match &routing.backend {
+        PciIrqRoutingBackend::Dtb {
+            address_cells,
+            interrupt_cells,
+            resolver,
+        } => {
+            let key = pci_child_interrupt_key(
+                route_key.bus,
+                route_key.device,
+                route_key.function,
+                route_key.pin,
+                *address_cells,
+                *interrupt_cells,
+            )?;
+            let (child_address, child_interrupt) = key.split_at(*address_cells);
+            let route = resolve_dtb_pci_interrupt(resolver, child_address, child_interrupt)
+                .ok()
+                .flatten()?;
+            irq::translate_firmware_irq(Some(route.parent), &route.parent_specifier)
+        }
+        PciIrqRoutingBackend::Ls2k1000(table) => {
+            let (parent, specifier) =
+                table.resolve(route_key.bus, route_key.device, route_key.function)?;
+            irq::translate_firmware_irq(Some(parent), &[specifier])
+        }
+    }
 }
 
 fn pci_requester_id(bus: u8, device: u8, function: u8) -> u32 {
@@ -818,6 +849,28 @@ fn resolve_pci_msi(segment: u16, bus: u8, device: u8, function: u8) -> Option<ms
 }
 
 pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool {
+    if host.config_space == DtbPciConfigSpace::Ls2k1000 {
+        let Some(table) = ls2k_irq_table(host) else {
+            return false;
+        };
+        let Some(key) = PciHostBusRange::new(segment, host.bus_start, host.bus_end) else {
+            return false;
+        };
+        let Some(intx) = PciIntxRouting::new(host.bus_start, Vec::new()) else {
+            return false;
+        };
+        return PCI_IRQ_ROUTING
+            .lock()
+            .insert(
+                key,
+                Arc::new(PciIrqRouting {
+                    backend: PciIrqRoutingBackend::Ls2k1000(table),
+                    intx: Spinlock::new(intx),
+                }),
+            )
+            .is_ok();
+    }
+
     // 所有行先在局部内存中构造完整候选；只有全部可用才发布，
     // 因此验证或插入失败时不会留下半张表，也不会破坏旧表。
     let expected = match host.address_cells.checked_add(host.interrupt_cells) {
@@ -857,9 +910,11 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
     // kernel resolver 的 clone 在表锁外执行；额外保留 candidate Arc，保证插入失败时
     // 锁内释放的 published Arc 不是最后一个引用，不会跨 ELM 调用 resolver drop。
     let candidate = Arc::new(PciIrqRouting {
-        address_cells: host.address_cells,
-        interrupt_cells: host.interrupt_cells,
-        resolver: resolver.clone_owned(),
+        backend: PciIrqRoutingBackend::Dtb {
+            address_cells: host.address_cells,
+            interrupt_cells: host.interrupt_cells,
+            resolver: resolver.clone_owned(),
+        },
         intx: Spinlock::new(intx),
     });
     let published = Arc::clone(&candidate);
@@ -944,7 +999,34 @@ pub(crate) fn msi_route_count(host: &DtbPcieHostInfo) -> usize {
 }
 
 pub(crate) fn usable_irq_route_count(host: &DtbPcieHostInfo) -> usize {
-    host.interrupt_map.len()
+    if host.config_space == DtbPciConfigSpace::Ls2k1000 {
+        ls2k_irq_table(host).map_or(0, Ls2kRootIrqTable::len)
+    } else {
+        host.interrupt_map.len()
+    }
+}
+
+fn ls2k_irq_table(host: &DtbPcieHostInfo) -> Option<Ls2kRootIrqTable> {
+    let mut routes = Vec::new();
+    for child in &host.children {
+        if child.bus != host.bus_start {
+            continue;
+        }
+        let [interrupt] = child.interrupts.as_slice() else {
+            return None;
+        };
+        let parent = interrupt.parent?;
+        let [specifier] = interrupt.specifier.as_ref() else {
+            return None;
+        };
+        routes.push(Ls2kRootIrqRoute::new(
+            child.device,
+            child.function,
+            parent,
+            *specifier,
+        ));
+    }
+    Ls2kRootIrqTable::new(host.bus_start, &routes).ok()
 }
 
 fn usize_ranges_overlap(
@@ -1019,28 +1101,41 @@ pub(crate) fn install_ecam(
     else {
         return false;
     };
-    let config_space = pci_config_space_kind(config_space);
-    let bus_shift = config_space.bus_shift();
-    let function_shift = config_space.function_shift();
-    let function_size = config_space.bytes_per_function();
-    let Some(required_size) = bus_count.checked_mul(config_space.bytes_per_bus()) else {
-        return false;
+    let config_kind = pci_config_space_kind(config_space);
+    let bus_shift = config_kind.bus_shift();
+    let function_shift = config_kind.function_shift();
+    let function_size = config_kind.bytes_per_function();
+    let linear_size = bus_count.checked_mul(config_kind.bytes_per_bus());
+    let valid_size = match config_space {
+        DtbPciConfigSpace::Ls2k1000 => {
+            Ls2kConfigWindow::new(phys_base, size, bus_start, bus_end).is_ok()
+        }
+        DtbPciConfigSpace::Cam | DtbPciConfigSpace::Ecam => {
+            linear_size.is_some_and(|required| size >= required)
+        }
     };
-    if size < required_size || phys_base.checked_add(size).is_none() {
+    if !valid_size || phys_base.checked_add(size).is_none() {
         return false;
     }
     let vbase = device_mmio_to_virt(phys_base);
     if vbase.checked_add(size).is_none() {
         return false;
     }
+    if config_space == DtbPciConfigSpace::Ls2k1000
+        && Ls2kConfigWindow::new(vbase, size, bus_start, bus_end).is_err()
+    {
+        return false;
+    }
     let candidate = PciEcamRegion {
         phys_base,
         bus_start,
+        bus_end,
         bus_shift,
         function_shift,
         function_size,
         vbase,
         size,
+        config_space,
     };
     if !ensure_pci_access_callbacks(device_mmio_to_virt) {
         return false;
