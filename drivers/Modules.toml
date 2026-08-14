@@ -61,6 +61,15 @@ default = "y"
 after = "platform.firmware-bus"
 
 [[modules]]
+name = "platform.loongson-clk"
+path = "loongson-clk"
+config = "CONFIG_LOONGSON_CLK"
+prompt = "Loongson LS2X 时钟控制器驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.dt-providers"
+
+[[modules]]
 name = "platform.pci-host-ecam"
 path = "pci-host-ecam"
 config = "CONFIG_PCI_HOST_ECAM"
@@ -116,7 +125,7 @@ path = "uart16550"
 config = "CONFIG_UART16550"
 prompt = "NS16550A UART 驱动"
 default = "y"
-after = "platform.firmware-bus,platform.loongson-irq,platform.plic,platform.riscv-aia"
+after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk,platform.plic,platform.riscv-aia"
 
 [[modules]]
 name = "kernel.random"

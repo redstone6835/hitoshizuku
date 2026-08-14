@@ -38,6 +38,7 @@ exclude = [
     "drivers/firmware-bus",
     "drivers/fw-cfg",
     "drivers/goldfish-rtc",
+    "drivers/loongson-clk",
     "drivers/loongson-irq",
     "drivers/loopback",
     "drivers/net-stack",
