@@ -131,6 +131,15 @@ targets = "loongarch64-unknown-none"
 after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
 
 [[modules]]
+name = "platform.ls2k-usb"
+path = "ls2k-usb"
+config = "CONFIG_LS2K_USB"
+prompt = "Loongson LS2K1000 USB 主机控制器驱动（dwc2/ehci/ohci）"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-irq"
+
+[[modules]]
 name = "platform.ls2k-i2c"
 path = "ls2k-i2c"
 config = "CONFIG_LS2K_I2C"

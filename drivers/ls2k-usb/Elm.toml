@@ -1,0 +1,11 @@
+[elm]
+name = "platform.ls2k-usb"
+version = "0.1.0"
+kind = "driver"
+source = "kernel-tree:drivers.ls2k-usb"
+mode = "m"
+integrated_phase = "device"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"
