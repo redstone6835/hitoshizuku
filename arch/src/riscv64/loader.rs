@@ -30,6 +30,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
+use crate::riscv64::paging_geometry::{RiscvPagingMode, common_paging_mode};
 use crate::riscv64::sbi;
 use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns, phys_to_virt, virt_to_phys};
 use crate::riscv64::time;
@@ -191,6 +192,7 @@ impl CacheBlockKind {
 struct RiscvHartFeatures {
     isa_source: RiscvIsaSource,
     mmu_type: &'static str,
+    paging_mode: RiscvPagingMode,
     cbom_block_size: Option<usize>,
     cboz_block_size: Option<usize>,
     cbop_block_size: Option<usize>,
@@ -202,6 +204,7 @@ struct RiscvHartFeatures {
 struct RiscvPlatformFeatures {
     harts: usize,
     split_isa_harts: usize,
+    paging_mode: RiscvPagingMode,
     cbom_block_size: Option<usize>,
     cboz_block_size: Option<usize>,
     cbop_block_size: Option<usize>,
@@ -269,7 +272,7 @@ enum RiscvCpuConfigError {
 fn configure_cpu_features_from_dtb(
     dtb: &Fdt<'static>,
     boot_hart_id: usize,
-) -> Result<(), RiscvCpuConfigError> {
+) -> Result<RiscvPagingMode, RiscvCpuConfigError> {
     use crate::riscv64::specific::{
         CBO_BLOCK_SIZE, CBOM_BLOCK_SIZE, CBOP_BLOCK_SIZE, HAS_ZICBOM, HAS_ZICBOP, HAS_ZICBOZ,
     };
@@ -318,17 +321,18 @@ fn configure_cpu_features_from_dtb(
     crate::riscv64::vector::detect_vector_support(aggregate.vector);
 
     log::info!(
-        "[loader] DT CPU binding: harts={} split-isa={} legacy-isa={} mmu={} kernel-mmu=Sv48 cbom={} cboz={} cbop={} sstc={}",
+        "[loader] DT CPU binding: harts={} split-isa={} legacy-isa={} boot-mmu={} common-mmu={:?} cbom={} cboz={} cbop={} sstc={}",
         aggregate.harts,
         aggregate.split_isa_harts,
         aggregate.harts - aggregate.split_isa_harts,
         boot_mmu_type,
+        aggregate.paging_mode,
         aggregate.cbom_block_size.unwrap_or(0),
         aggregate.cboz_block_size.unwrap_or(0),
         aggregate.cbop_block_size.unwrap_or(0),
         aggregate.sstc as usize,
     );
-    Ok(())
+    Ok(aggregate.paging_mode)
 }
 
 fn is_riscv_cpu_node(node_id: NodeId, node: Node<'static>) -> Result<bool, RiscvCpuConfigError> {
@@ -371,18 +375,17 @@ fn riscv_hart_features(
     if binding.isa_base() != "rv64i" {
         return Err(RiscvCpuConfigError::UnsupportedIsaBase { node: node_id });
     }
-    // RISC-V privileged spec 要求 Sv57 实现同时实现 Sv48；Sv39/none 则
-    // 无法承载已由启动汇编激活的四级 Sv48 页表。
-    if !matches!(binding.mmu_type(), "riscv,sv48" | "riscv,sv57") {
-        return Err(RiscvCpuConfigError::UnsupportedMmuType {
+    let paging_mode = RiscvPagingMode::from_mmu_type(binding.mmu_type()).ok_or(
+        RiscvCpuConfigError::UnsupportedMmuType {
             node: node_id,
             mmu_type: binding.mmu_type(),
-        });
-    }
+        },
+    )?;
 
     Ok(RiscvHartFeatures {
         isa_source: binding.isa_source(),
         mmu_type: binding.mmu_type(),
+        paging_mode,
         cbom_block_size: validate_cache_block(
             node_id,
             &binding,
@@ -454,6 +457,7 @@ fn merge_platform_features(
         *aggregate = Some(RiscvPlatformFeatures {
             harts: 1,
             split_isa_harts: usize::from(hart.isa_source == RiscvIsaSource::Split),
+            paging_mode: hart.paging_mode,
             cbom_block_size: hart.cbom_block_size,
             cboz_block_size: hart.cboz_block_size,
             cbop_block_size: hart.cbop_block_size,
@@ -465,6 +469,8 @@ fn merge_platform_features(
 
     current.harts += 1;
     current.split_isa_harts += usize::from(hart.isa_source == RiscvIsaSource::Split);
+    current.paging_mode = common_paging_mode([current.paging_mode, hart.paging_mode])
+        .expect("两个分页模式一定存在交集");
     current.cbom_block_size = intersect_cache_block_sizes(
         CacheBlockKind::Management,
         current.cbom_block_size,
@@ -735,10 +741,16 @@ pub extern "C" fn __kernel_arch_loader(
 
     configure_early_console_from_dtb(&dtb);
 
-    // 页表、timer 和可迁移用户任务都依赖全 hart 能力；任一 CPU 的
-    // binding 不兼容当前 Sv48 实现时立即 fail closed。
-    configure_cpu_features_from_dtb(&dtb, hart_id)
+    // 页表、定时器和可迁移用户任务都依赖全 hart 能力。先取全部 CPU 的
+    // MMU 能力交集，再尝试从早期 Sv39 页表升级到 Sv48。
+    let requested_paging_mode = configure_cpu_features_from_dtb(&dtb, hart_id)
         .unwrap_or_else(|error| panic!("[loader] invalid RISC-V CPU DT binding: {:?}", error));
+    let final_paging_mode = crate::riscv64::boot::select_final_paging_mode(requested_paging_mode);
+    log::info!(
+        "[loader] paging mode: requested={:?} final={:?}",
+        requested_paging_mode,
+        final_paging_mode
+    );
 
     // 启动 S-mode 周期 timer。sleep/调度 tick 依赖该中断推进。
     configure_timer_from_dtb(&dtb);

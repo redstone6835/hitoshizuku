@@ -11,7 +11,7 @@ use super::addr::{KERNEL_VA_OFFSET, virt_to_phys};
 use super::boot::BOOT_HART_ID;
 use super::heap_vm;
 use super::sbi;
-use super::specific::{MAX_HARTS, SATP_MODE_SV48, init_secondary_hart_local};
+use super::specific::{MAX_HARTS, init_secondary_hart_local};
 use super::task::Riscv64TaskOps;
 use super::time;
 use super::trap::{Riscv64InterruptOps, Riscv64MessageInterruptOps};
@@ -321,7 +321,13 @@ unsafe extern "C" fn secondary_entry() -> ! {
         "ld t2, 0(t0)",
         "beqz t2, 9f",
         "srli t2, t2, 12",
-        "li t3, {satp_mode}",
+        "la t3, {satp_mode}",
+        "ld t3, 0(t3)",
+        "li t5, 8",
+        "beq t3, t5, 1f",
+        "li t5, 9",
+        "bne t3, t5, 9f",
+        "1:",
         "slli t3, t3, 60",
         "or t2, t2, t3",
 
@@ -351,7 +357,7 @@ unsafe extern "C" fn secondary_entry() -> ! {
         main = sym secondary_main,
         max_cpus = const MAX_CPUS,
         stack_shift = const AP_STACK_SHIFT,
-        satp_mode = const (SATP_MODE_SV48 >> 60),
+        satp_mode = sym super::paging::ACTIVE_SATP_MODE,
         va_hi32 = const (KERNEL_VA_OFFSET >> 32),
     )
 }

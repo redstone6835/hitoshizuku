@@ -33,6 +33,7 @@ pub mod heap_vm;
 mod mem;
 pub mod mm;
 pub mod paging;
+pub(crate) mod paging_geometry;
 
 // ── 任务 ──────────────────────────────────────────────────────────────────────
 

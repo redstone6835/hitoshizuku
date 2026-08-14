@@ -10,19 +10,18 @@
 //!   _start (PA)             _start_virtualized (VA)         __kernel_arch_loader (VA)
 //!       │                          │                                │
 //!       ├─ 关中断/清 sscratch       ├─ 设临时栈                      ├─ 正式初始化
-//!       ├─ 建 Sv48 最小页表         ├─ 使能 FPU                     └─ 不返回
+//!       ├─ 建 Sv39 最小页表         ├─ 使能 FPU                     └─ 不返回
 //!       ├─ csrw satp               ├─ pre_boot_init()
 //!       └─ jr VA ─────────────────►└─ jr __kernel_arch_loader ───►
 //! ```
 //!
-//! 早期页表布局（5 × 4KiB）：
+//! 早期页表布局（3 × 4KiB）：
 //!
 //! ```text
-//!   PGD[0]   → PUD_identity    PUD_identity[0] = 1G leaf → 0x0 (MMIO, RW+NX)
-//!   PGD[511] → PUD_kernel      PUD_identity[2] ─┐
-//!                              PUD_kernel[2]   ──┴→ PMD_kernel
-//!                                                   内部使用 2MiB leaves，末边界拆到 4KiB
-//!                              PUD_kernel[3..] = invalid
+//!   root[0]   = 1G leaf → 0x0 (MMIO, RW+NX)
+//!   root[2]   ─┐
+//!   root[258] ─┴→ PMD_kernel
+//!                  内部使用 2MiB leaves，末边界拆到 4KiB
 //!
 //! DTB 在开启 MMU 前已复制到内核保留缓冲区，因此无需为不可信的
 //! 固件物理位置建立宽范围临时映射。解析 DTB 后，`prepare_no_map()` 才会在
@@ -33,7 +32,10 @@ use core::arch::naked_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::clear_bss;
-use crate::riscv64::csr::SATP_MODE_SV48;
+use crate::riscv64::addr::virt_to_phys;
+use crate::riscv64::csr::{SATP_MODE_MASK, SATP_MODE_SV39, SATP_MODE_SV48};
+use crate::riscv64::paging::finalize_paging_mode;
+use crate::riscv64::paging_geometry::RiscvPagingMode;
 
 // ── 启动参数 ──────────────────────────────────────────────────────────────────
 
@@ -48,9 +50,9 @@ pub static BOOT_DTB_ADDR: AtomicUsize = AtomicUsize::new(0);
 // 与真正执行的立即数发生漂移。
 
 /// 内核虚拟地址偏移的高 32 位，必须与 `addr.rs::KERNEL_VA_OFFSET` 一致。
-const VA_OFFSET_HI32: usize = 0xFFFF_FF80;
+const VA_OFFSET_HI32: usize = 0xFFFF_FFC0;
 
-// PTE flags（Sv48 叶节点）
+// PTE 标志位（Sv39/Sv48 共用）
 /// MMIO 区域：V|R|W|A|D（无 X，防止投机执行 MMIO）
 const PTE_MMIO_LEAF: usize = 0xC7; // 1100_0111
 /// RAM 数据区域：V|R|W|A|D（NX）。
@@ -67,12 +69,19 @@ const PMD_PTE_STEP: usize = 0x8_0000;
 
 // ── 早期页表存储 ──────────────────────────────────────────────────────────────
 
-/// 早期启动页表——PGD、identity PUD、kernel PUD、共享 RAM PMD 和末边界 PTE。
+/// 早期 Sv39 页表——根表、共享 RAM PMD 和末边界 PTE。
 #[repr(C, align(4096))]
-struct EarlyPageTable([u64; 512 * 5]);
+struct EarlyPageTable([u64; 512 * 3]);
 
 #[unsafe(link_section = ".data.prepage")]
-static EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 5]);
+static mut EARLY_PT: EarlyPageTable = EarlyPageTable([0u64; 512 * 3]);
+
+/// Sv48 升级页表——根表、恒等映射 PUD、内核 PUD；更低层复用 Sv39 页表。
+#[repr(C, align(4096))]
+struct Sv48UpgradePageTable([u64; 512 * 3]);
+
+#[unsafe(link_section = ".data.prepage")]
+static mut SV48_UPGRADE_PT: Sv48UpgradePageTable = Sv48UpgradePageTable([0u64; 512 * 3]);
 
 // ── _start ────────────────────────────────────────────────────────────────────
 
@@ -147,47 +156,35 @@ pub unsafe extern "C" fn _start() {
         "bnez t2, 12b",
         "13:",
 
-        // ── 构建 Sv48 最小页表 ──
+        // ── 构建 Sv39 最小页表 ──
         // la 是 PC-relative，VMA 差值 == PA 差值，物理空间有效
         "la t0, {early_pt}",
         "lui t1, 0x1",
-        "add t1, t0, t1",           // t1 = PUD_identity (t0 + 4K)
-        "lui t3, 0x2",
-        "add t3, t0, t3",           // t3 = PUD_kernel  (t0 + 8K)
-        "lui t4, 0x3",
-        "add t4, t0, t4",           // t4 = PMD_ram     (t0 + 12K)
-        "lui s3, 0x4",
-        "add s3, t0, s3",           // s3 = PTE_tail    (t0 + 16K)
+        "add t4, t0, t1",           // t4 = PMD_ram  (t0 + 4K)
+        "lui t1, 0x2",
+        "add s3, t0, t1",           // s3 = PTE_tail (t0 + 8K)
 
-        // 清零 20KiB（.data 段不保证零初始化）
+        // 清零 12KiB（.data 段不保证零初始化）
         "mv t5, t0",
-        "lui t6, 0x5",
+        "lui t6, 0x3",
         "add t6, t0, t6",
         "2: sd zero, 0(t5)",
         "addi t5, t5, 8",
         "bne t5, t6, 2b",
 
-        // PGD[0] → PUD_identity（非叶：PPN | V）
-        "srli t2, t1, 2",
-        "ori t2, t2, {pte_nonleaf_v}",
-        "sd t2, 0(t0)",
-
-        // PGD[511] → PUD_kernel
-        "srli t2, t3, 2",
-        "ori t2, t2, {pte_nonleaf_v}",
-        "li t5, 511 * 8",
-        "add t5, t0, t5",
-        "sd t2, 0(t5)",
-
-        // PUD_identity[0] = 1G → PA 0 (MMIO, RW, no X)
+        // root[0] = 1G → PA 0（MMIO, RW, no X）
         "li t2, {pte_mmio_leaf}",
-        "sd t2, 0(t1)",
+        "sd t2, 0(t0)",
 
         // identity 与高半区共享同一张 RAM PMD；叶项仍映射相同 PA。
         "srli t2, t4, 2",
         "ori t2, t2, {pte_nonleaf_v}",
-        "sd t2, 16(t1)",
-        "sd t2, 16(t3)",
+        "li t5, 2 * 8",
+        "add t5, t0, t5",
+        "sd t2, 0(t5)",
+        "li t5, 258 * 8",
+        "add t5, t0, t5",
+        "sd t2, 0(t5)",
 
         // 仅为内核镜像 [skernel, ekernel) 建立 2MiB leaves。合法 DT 中的
         // no-map 不得与正在执行的镜像重叠，因此解析 DTB 之前不映射
@@ -271,11 +268,11 @@ pub unsafe extern "C" fn _start() {
         "j 6b",
         "7:",
 
-        // ── 激活 Sv48 ──
+        // ── 激活 Sv39 ──
         "la t0, {early_pt}",
         "srli t2, t0, 12",           // PPN
         "li t3, {satp_mode}",
-        "slli t3, t3, 60",           // MODE = Sv48
+        "slli t3, t3, 60",           // MODE = Sv39
         "or t2, t2, t3",
 
         // 计算 _start_virtualized 的虚拟地址
@@ -289,7 +286,7 @@ pub unsafe extern "C" fn _start() {
         "sfence.vma",
         "jr t0",
 
-        // DTB 超出当前早期 Sv48 窗口时不能冒险越界写页表。
+        // DTB 超出当前早期复制约束时不能冒险继续启动。
         "99: csrci sstatus, 2",
         "100: wfi",
         "j 100b",
@@ -309,7 +306,7 @@ pub unsafe extern "C" fn _start() {
         pte_ram_rx_leaf = const PTE_RAM_RX_LEAF,
         pte_ram_r_leaf = const PTE_RAM_R_LEAF,
         pmd_pte_step = const PMD_PTE_STEP,
-        satp_mode = const (SATP_MODE_SV48 >> 60),
+        satp_mode = const (SATP_MODE_SV39 >> 60),
         va_hi32 = const VA_OFFSET_HI32,
     )
 }
@@ -322,13 +319,71 @@ unsafe extern "C" {
     fn erodata();
 }
 
+/// 根据全平台能力完成最终分页模式选择。
+///
+/// Sv48 写入遵循 `satp.MODE` 的 WARL 语义：不支持的模式不会改变当前 Sv39
+/// 配置，因此回读失败时可以继续沿用原页表。
+pub(crate) fn select_final_paging_mode(requested: RiscvPagingMode) -> RiscvPagingMode {
+    if requested == RiscvPagingMode::Sv39 {
+        finalize_paging_mode(RiscvPagingMode::Sv39);
+        return RiscvPagingMode::Sv39;
+    }
+
+    let old_satp = crate::read_csr!(satp);
+    assert_eq!(old_satp & SATP_MODE_MASK, SATP_MODE_SV39);
+    let old_root_paddr = (old_satp & 0x0fff_ffff_ffff) << 12;
+    let old_root = crate::riscv64::addr::phys_to_virt(old_root_paddr) as *const usize;
+
+    let upgrade_root = unsafe { core::ptr::addr_of_mut!(SV48_UPGRADE_PT.0) as *mut usize };
+    let identity_pud = unsafe { upgrade_root.add(512) };
+    let kernel_pud = unsafe { upgrade_root.add(1024) };
+    unsafe {
+        core::ptr::write_bytes(upgrade_root, 0, 512 * 3);
+
+        let identity_pud_paddr = virt_to_phys(identity_pud as usize);
+        let kernel_pud_paddr = virt_to_phys(kernel_pud as usize);
+        core::ptr::write_volatile(upgrade_root, (identity_pud_paddr >> 2) | PTE_NONLEAF_V);
+        core::ptr::write_volatile(
+            upgrade_root.add(511),
+            (kernel_pud_paddr >> 2) | PTE_NONLEAF_V,
+        );
+
+        core::ptr::write_volatile(identity_pud, core::ptr::read_volatile(old_root));
+        core::ptr::write_volatile(
+            identity_pud.add(2),
+            core::ptr::read_volatile(old_root.add(2)),
+        );
+        core::ptr::write_volatile(
+            kernel_pud.add(258),
+            core::ptr::read_volatile(old_root.add(258)),
+        );
+        core::arch::asm!("fence w, w", options(nostack));
+    }
+
+    let upgrade_root_paddr = virt_to_phys(upgrade_root as usize);
+    let candidate_satp = SATP_MODE_SV48 | (upgrade_root_paddr >> 12);
+    crate::write_csr!(satp, candidate_satp);
+    unsafe {
+        core::arch::asm!("sfence.vma zero, zero", "fence.i", options(nostack));
+    }
+    let accepted = crate::read_csr!(satp) & SATP_MODE_MASK == SATP_MODE_SV48;
+    let final_mode = if accepted {
+        RiscvPagingMode::Sv48
+    } else {
+        assert_eq!(crate::read_csr!(satp), old_satp);
+        RiscvPagingMode::Sv39
+    };
+    finalize_paging_mode(final_mode);
+    final_mode
+}
+
 // ── _start_virtualized ────────────────────────────────────────────────────────
 
 /// 虚拟地址空间入口，承接 `_start`，准备 Rust 执行环境。
 ///
 /// # Safety
 ///
-/// 前置条件：Sv48 已激活，s0=hartid，s1=dtb_paddr，PC 在 VA 空间。
+/// 前置条件：Sv39 已激活，s0=hartid，s1=dtb_paddr，PC 在 VA 空间。
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]

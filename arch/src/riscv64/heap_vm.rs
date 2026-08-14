@@ -9,19 +9,13 @@
 //! - `paging` 负责描述 RISC-V64 页表项格式、层级、TLB 操作；
 //! - 本模块负责在运行时"走页表、创建中间页表页、写入叶子映射、解除映射"。
 //!
-//! ## 虚拟地址布局（Sv48）
+//! ## 虚拟地址布局（Sv39/Sv48 共同窗口）
 //!
 //! ```text
-//! PGD[511] (0xFFFF_FF80_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF)
-//!   PUD[0]:    kernel heap（1GiB，按需映射 4K / 2M 页）
-//!   PUD[1]:    kernel heap（1GiB，按需映射 4K / 2M 页）
-//!   PUD[2]:    kernel code direct map（1GiB，2MiB leaf；no-map 边界按 4KiB 拆分）
-//!   PUD[3..17]: kernel direct map 扩展（通常为 1GiB leaf，no-map 窗口按需拆分）
-//!   PUD[18..19]: tracked heap（2GiB，按需映射 4K / 2M 页）
-//!
-//! PGD[510] (0xFFFF_FF00_0000_0000 .. 0xFFFF_FF80_0000_0000)
-//!   PUD[0]:    MMIO 直接映射（1GiB leaf，PA 0x0..0x4000_0000）
-//!   PUD[1]:    PCI 32-bit BAR 窗口（1GiB leaf，PA 0x4000_0000..0x8000_0000）
+//! 1GiB 槽位[257..273]：RAM 直接映射（PA 0x4000_0000..0x4_8000_0000）
+//! 1GiB 槽位[506..507]：内核堆（2GiB，按需映射 4K / 2M 页）
+//! 1GiB 槽位[508..509]：受追踪堆（2GiB，按需映射 4K / 2M 页）
+//! 1GiB 槽位[510..511]：MMIO 与 PCI 32-bit BAR 窗口
 //! ```
 //!
 //! ## 大页策略
@@ -45,20 +39,22 @@ use general::{
 use spin::Mutex;
 
 use crate::riscv64::paging::{Riscv64Paging, Riscv64Pte};
+use crate::riscv64::paging::{active_paging_mode, paging_mode_is_final};
+use crate::riscv64::paging_geometry::{RiscvPagingMode, advance_leaf_cursor};
 use crate::riscv64::specific::{
-    IRQ_STACK_GUARD_SIZE, IRQ_STACK_SIZE, KERNEL_VA_OFFSET, SATP_MODE_SV48, phys_to_virt,
+    IRQ_STACK_GUARD_SIZE, IRQ_STACK_SIZE, KERNEL_VA_OFFSET, SATP_MODE_MASK, phys_to_virt,
     virt_to_phys,
 };
 use crate::riscv64::trap::LocalIrqGuard;
 
 // ── 常量与静态 ──────────────────────────────────────────────────────────────────
 
-/// 内核堆虚拟地址起始（PGD[511]→PUD[0]）。
-pub const KERNEL_HEAP_BASE: usize = 0xFFFF_FF80_0000_0000;
+/// 内核堆虚拟地址起始（共同 1GiB 槽位[506..507]）。
+pub const KERNEL_HEAP_BASE: usize = 0xFFFF_FFFE_8000_0000;
 
 /// 内核堆虚拟地址范围大小（2 GiB）。
 ///
-/// 对应页表布局中 PGD[511]→PUD[0..1]，每 PUD 覆盖 1 GiB。
+/// 对应共同页表布局中的两个 1 GiB 槽位。
 pub const KERNEL_HEAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 /// debug 构建为页表 map/unmap/rollback 自检保留一个不会交给 vmem 的窗口。
@@ -81,21 +77,24 @@ const EMERGENCY_STACK_GUARD_BASE: usize = KERNEL_HEAP_USABLE_END + HEAP_VM_SELFT
 const EMERGENCY_STACK_BASE: usize = EMERGENCY_STACK_GUARD_BASE + IRQ_STACK_GUARD_SIZE;
 const EMERGENCY_STACK_END: usize = EMERGENCY_STACK_BASE + IRQ_STACK_SIZE;
 
-/// MMIO 直接映射基址（PGD[510]，独立于 kernel heap/code）。
+/// MMIO 直接映射基址（共同 1GiB 槽位[510..511]）。
 ///
 /// `device_mmio_to_virt(paddr) = paddr + MMIO_VIRT_BASE`。
-pub const MMIO_VIRT_BASE: usize = 0xFFFF_FF00_0000_0000;
+pub const MMIO_VIRT_BASE: usize = 0xFFFF_FFFF_8000_0000;
 
 /// 内核 direct map 覆盖物理 RAM 的基址和大小（QEMU virt 默认从 0x80000000 开始）。
-const KERNEL_PHYS_BASE: usize = 0x8000_0000;
+const KERNEL_PHYS_BASE: usize = 0x4000_0000;
 const KERNEL_DIRECT_MAP_WINDOW_SIZE: usize = 0x4000_0000; // 1 GiB
-const KERNEL_DIRECT_MAP_PUD_START: usize = 2;
-/// 正式页表覆盖的 RAM 物理范围：从 PUD[2] 连续映射 16 个 1 GiB 窗口。
-/// 这覆盖 QEMU 16 GiB 配置（扣除起始物理地址后的可用 RAM）并保留首窗的 W^X 细分。
-const KERNEL_DIRECT_MAP_PUD_COUNT: usize = 16;
+const KERNEL_DIRECT_MAP_SLOT_START: usize = 257;
+const KERNEL_IMAGE_WINDOW: usize = 1;
+const KERNEL_IMAGE_SLOT: usize = KERNEL_DIRECT_MAP_SLOT_START + KERNEL_IMAGE_WINDOW;
+const KERNEL_HEAP_SLOT_START: usize = 506;
+const MMIO_SLOT_START: usize = 510;
+/// 正式页表覆盖 17 个 1 GiB 窗口，结束地址与原 QEMU 16 GiB 布局一致。
+const KERNEL_DIRECT_MAP_SLOT_COUNT: usize = 17;
 pub const KERNEL_DIRECT_MAP_PHYS_START: usize = KERNEL_PHYS_BASE;
 pub const KERNEL_DIRECT_MAP_PHYS_END: usize =
-    KERNEL_PHYS_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
+    KERNEL_PHYS_BASE + KERNEL_DIRECT_MAP_SLOT_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
 const HEAP_PMD_SIZE: usize = 2 * 1024 * 1024;
 const HEAP_PUD_SIZE: usize = 1024 * 1024 * 1024;
 /// RISC-V 正式线性映射落实 `no-map` 的最小粒度。
@@ -108,8 +107,7 @@ const PTE_SOFTWARE_LEVEL_MASK: usize = 0b11 << PTE_SOFTWARE_LEVEL_SHIFT;
 const KERNEL_VIRT_BASE: usize = KERNEL_PHYS_BASE.wrapping_add(KERNEL_VA_OFFSET);
 
 /// 需要 registry 账本的分配使用独立窗口，使释放路径能按指针范围直接分流。
-pub const TRACKED_HEAP_BASE: usize =
-    KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
+pub const TRACKED_HEAP_BASE: usize = 0xFFFF_FFFF_0000_0000;
 pub const TRACKED_HEAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 const TRACKED_HEAP_END: usize = TRACKED_HEAP_BASE + TRACKED_HEAP_SIZE;
 
@@ -120,6 +118,7 @@ const PAGE_TABLE_INITIALIZING: usize = 1;
 const PAGE_TABLE_INITIALIZED: usize = 2;
 static PAGE_TABLE_INIT_STATE: AtomicUsize = AtomicUsize::new(PAGE_TABLE_UNINITIALIZED);
 static SECONDARY_IDENTITY_PUD: AtomicUsize = AtomicUsize::new(0);
+const SECONDARY_IDENTITY_DIRECT: usize = usize::MAX;
 
 const NO_MAP_UNPREPARED: usize = 0;
 const NO_MAP_PREPARING: usize = 1;
@@ -516,7 +515,7 @@ fn debug_verify_unpublished_page_table_transactions() {
         .allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
         .expect("[arch][heap_vm] debug transaction test page allocation failed");
 
-    // heap 的 PUD 项初始为空，建立一个 4 KiB leaf 需要两张下级页表。分别在
+    // 内核堆的 1 GiB 槽位初始为空，建立一个 4 KiB 叶项需要两张下级页表。分别在
     // 第一次和第二次分配处失败，验证私有子树不会被提前发布。
     for successful_allocations_before_failure in 0..=1usize {
         FAIL_PAGE_TABLE_ALLOCATION_AFTER
@@ -563,7 +562,7 @@ pub(crate) fn debug_verify_heap_mapping_transactions() {
         .allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
         .expect("[arch][heap_vm] debug reclaim test page allocation failed");
 
-    // 重复发布、解除映射并回收空 PT。PUD/PMD 同时承载顶部 emergency stack，
+    // 重复发布、解除映射并回收空 PT。1 GiB/2 MiB 层同时承载顶部应急栈，
     // 因此这里只要求每轮回收 self-test leaf 所属的 PT，并在释放前全局 flush。
     const RECLAIM_CYCLES: usize = 3;
     let reclaimed_before = PAGE_TABLE_PAGES_RECLAIMED.load(Ordering::Relaxed);
@@ -743,7 +742,7 @@ fn walk_and_map_heap(
     paddr: usize,
     target_level: usize,
 ) -> Result<(), MapError> {
-    if target_level >= Riscv64Paging::LEVELS
+    if target_level >= Riscv64Paging::active_levels()
         || !Riscv64Paging::supported_leaf_levels().contains(&target_level)
     {
         return Err(MapError::UnsupportedLevel);
@@ -843,18 +842,31 @@ fn walk_and_map_heap(
 
 struct EarlyPageTableLayout {
     root_paddr: usize,
-    pgd: *mut usize,
-    pud_identity: *mut usize,
-    pud_kernel: *mut usize,
+    root: *mut usize,
+    identity_slots: *mut usize,
+    kernel_slots: *mut usize,
 }
 
-/// 定位并验证 boot 汇编建立的 Sv48 根页表与两张 PUD。
+fn child_table_from_entry(table: *mut usize, index: usize, label: &str) -> *mut usize {
+    let pte = Riscv64Pte(unsafe { core::ptr::read_volatile(table.add(index)) });
+    assert!(
+        Riscv64Paging::pte_is_valid(pte) && !Riscv64Paging::pte_is_leaf(pte),
+        "[arch][heap_vm] invalid early {label}"
+    );
+    phys_to_virt(Riscv64Paging::pte_addr(pte)) as *mut usize
+}
+
+/// 定位并验证启动阶段建立的最终模式根页表和 1 GiB 槽位表。
 fn locate_early_page_tables() -> EarlyPageTableLayout {
+    assert!(
+        paging_mode_is_final(),
+        "[arch][heap_vm] paging mode was not finalized"
+    );
     let satp: usize = read_csr!(satp);
     assert_eq!(
-        satp & (0xFusize << 60),
-        SATP_MODE_SV48,
-        "[arch][heap_vm] expected Sv48 during page-table initialization"
+        satp & SATP_MODE_MASK,
+        active_paging_mode().satp_mode(),
+        "[arch][heap_vm] satp mode disagrees with finalized paging mode"
     );
     let root_ppn = satp & 0xFFF_FFFF_FFFF;
     let root_paddr = root_ppn << 12;
@@ -864,73 +876,61 @@ fn locate_early_page_tables() -> EarlyPageTableLayout {
     );
 
     // 统一通过高半区 direct map 访问页表页，不依赖 identity mapping 的生命周期。
-    let pgd = phys_to_virt(root_paddr) as *mut usize;
-    let pud_identity_pte = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd) });
-    assert!(
-        Riscv64Paging::pte_is_valid(pud_identity_pte)
-            && !Riscv64Paging::pte_is_leaf(pud_identity_pte),
-        "[arch][heap_vm] invalid early PGD[0]"
-    );
-    let pud_identity = phys_to_virt(Riscv64Paging::pte_addr(pud_identity_pte)) as *mut usize;
-    let pud_kernel_pte = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd.add(511)) });
-    assert!(
-        Riscv64Paging::pte_is_valid(pud_kernel_pte) && !Riscv64Paging::pte_is_leaf(pud_kernel_pte),
-        "[arch][heap_vm] invalid early PGD[511]"
-    );
-    let pud_kernel = phys_to_virt(Riscv64Paging::pte_addr(pud_kernel_pte)) as *mut usize;
+    let root = phys_to_virt(root_paddr) as *mut usize;
+    let (identity_slots, kernel_slots) = match active_paging_mode() {
+        RiscvPagingMode::Sv39 => (root, root),
+        RiscvPagingMode::Sv48 => (
+            child_table_from_entry(root, 0, "Sv48 identity root[0]"),
+            child_table_from_entry(root, 511, "Sv48 kernel root[511]"),
+        ),
+    };
 
-    for index in 0..2usize {
-        let heap_pte = Riscv64Pte(unsafe { core::ptr::read_volatile(pud_kernel.add(index)) });
+    for index in KERNEL_HEAP_SLOT_START..(MMIO_SLOT_START + 2) {
+        let pte = Riscv64Pte(unsafe { core::ptr::read_volatile(kernel_slots.add(index)) });
         assert!(
-            !Riscv64Paging::pte_is_valid(heap_pte),
-            "[arch][heap_vm] early heap PUD[{index}] unexpectedly occupied"
+            !Riscv64Paging::pte_is_valid(pte),
+            "[arch][heap_vm] early dynamic slot[{index}] unexpectedly occupied"
         );
     }
 
-    let mmio_pgd = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd.add(510)) });
-    assert!(
-        !Riscv64Paging::pte_is_valid(mmio_pgd),
-        "[arch][heap_vm] early PGD[510] unexpectedly occupied"
-    );
-
     EarlyPageTableLayout {
         root_paddr,
-        pgd,
-        pud_identity,
-        pud_kernel,
+        root,
+        identity_slots,
+        kernel_slots,
     }
 }
 
 /// 确认尚未解析 DTB 时的页表只映射了内核镜像所在的首窗口。
 fn validate_minimal_boot_direct_map(layout: &EarlyPageTableLayout) {
-    let first = Riscv64Pte(unsafe {
-        core::ptr::read_volatile(layout.pud_kernel.add(KERNEL_DIRECT_MAP_PUD_START))
-    });
+    let first =
+        Riscv64Pte(unsafe { core::ptr::read_volatile(layout.kernel_slots.add(KERNEL_IMAGE_SLOT)) });
     assert!(
         Riscv64Paging::pte_is_valid(first) && !Riscv64Paging::pte_is_leaf(first),
-        "[arch][heap_vm] minimal boot PUD[2] is not a PMD table"
+        "[arch][heap_vm] minimal kernel slot is not a PMD table"
     );
-    let identity_first = Riscv64Pte(unsafe {
-        core::ptr::read_volatile(layout.pud_identity.add(KERNEL_DIRECT_MAP_PUD_START))
-    });
+    let identity_first =
+        Riscv64Pte(unsafe { core::ptr::read_volatile(layout.identity_slots.add(2)) });
     assert_eq!(
         Riscv64Paging::pte_to_usize(identity_first),
         Riscv64Paging::pte_to_usize(first),
         "[arch][heap_vm] minimal identity and high-half mappings do not share the kernel PMD"
     );
-    for index in (KERNEL_DIRECT_MAP_PUD_START + 1)
-        ..(KERNEL_DIRECT_MAP_PUD_START + KERNEL_DIRECT_MAP_PUD_COUNT)
-    {
-        let pte = Riscv64Pte(unsafe { core::ptr::read_volatile(layout.pud_kernel.add(index)) });
+    for window in 0..KERNEL_DIRECT_MAP_SLOT_COUNT {
+        if window == KERNEL_IMAGE_WINDOW {
+            continue;
+        }
+        let index = KERNEL_DIRECT_MAP_SLOT_START + window;
+        let pte = Riscv64Pte(unsafe { core::ptr::read_volatile(layout.kernel_slots.add(index)) });
         assert!(
             !Riscv64Paging::pte_is_valid(pte),
-            "[arch][heap_vm] minimal boot PUD[{index}] maps RAM before DT no-map parsing"
+            "[arch][heap_vm] minimal boot slot[{index}] maps RAM before DT no-map parsing"
         );
     }
 }
 
 struct DirectMapPageTables {
-    pud_entries: [usize; KERNEL_DIRECT_MAP_PUD_COUNT],
+    slot_entries: [usize; KERNEL_DIRECT_MAP_SLOT_COUNT],
     split_pud_windows: usize,
     split_pmd_chunks: usize,
     unmapped_pages: usize,
@@ -1057,17 +1057,19 @@ fn build_direct_map_page_tables() -> Result<DirectMapPageTables, StartNoMapError
         fn erodata();
     }
 
-    let direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_WINDOW_SIZE;
+    let kernel_window_start =
+        phys_to_virt(KERNEL_PHYS_BASE + KERNEL_IMAGE_WINDOW * KERNEL_DIRECT_MAP_WINDOW_SIZE);
+    let kernel_window_end = kernel_window_start + KERNEL_DIRECT_MAP_WINDOW_SIZE;
     let text_start = stext as usize;
     let text_end = etext as usize;
     let rodata_end = erodata as usize;
     assert!(
-        KERNEL_VIRT_BASE <= text_start && text_start < text_end && text_end <= rodata_end,
+        kernel_window_start <= text_start && text_start < text_end && text_end <= rodata_end,
         "[arch][heap_vm] invalid kernel section ordering"
     );
     assert!(
-        rodata_end <= direct_map_end,
-        "[arch][heap_vm] kernel image exceeds the first 1 GiB direct-map window"
+        rodata_end <= kernel_window_end,
+        "[arch][heap_vm] kernel image exceeds its 1 GiB direct-map window"
     );
     assert_eq!(
         text_end % HEAP_PMD_SIZE,
@@ -1084,22 +1086,17 @@ fn build_direct_map_page_tables() -> Result<DirectMapPageTables, StartNoMapError
     // 因而与正文使用相同的只读可执行权限。
     let text_leaf_start = text_start & !(HEAP_PMD_SIZE - 1);
     let mut stats = DirectMapBuildStats::default();
-    let mut pud_entries = [0usize; KERNEL_DIRECT_MAP_PUD_COUNT];
+    let mut slot_entries = [0usize; KERNEL_DIRECT_MAP_SLOT_COUNT];
 
-    let first_pmd_paddr = build_direct_map_pmd(
-        KERNEL_PHYS_BASE,
-        text_leaf_start,
-        text_end,
-        rodata_end,
-        &mut stats,
-    )?;
-    pud_entries[0] = Riscv64Paging::make_table_pte(first_pmd_paddr).bits();
-    stats.split_pud_windows += 1;
-
-    for (window, entry) in pud_entries.iter_mut().enumerate().skip(1) {
+    for (window, entry) in slot_entries.iter_mut().enumerate() {
         let paddr = KERNEL_PHYS_BASE + window * KERNEL_DIRECT_MAP_WINDOW_SIZE;
         let end = paddr + KERNEL_DIRECT_MAP_WINDOW_SIZE;
-        *entry = if no_map_covers(paddr, end) {
+        *entry = if window == KERNEL_IMAGE_WINDOW {
+            stats.split_pud_windows += 1;
+            let pmd_paddr =
+                build_direct_map_pmd(paddr, text_leaf_start, text_end, rodata_end, &mut stats)?;
+            Riscv64Paging::make_table_pte(pmd_paddr).bits()
+        } else if no_map_covers(paddr, end) {
             stats.unmapped_pages += KERNEL_DIRECT_MAP_WINDOW_SIZE / PAGE_SIZE;
             0
         } else if no_map_intersects(paddr, end) {
@@ -1122,27 +1119,11 @@ fn build_direct_map_page_tables() -> Result<DirectMapPageTables, StartNoMapError
     );
 
     Ok(DirectMapPageTables {
-        pud_entries,
+        slot_entries,
         split_pud_windows: stats.split_pud_windows,
         split_pmd_chunks: stats.split_pmd_chunks,
         unmapped_pages: stats.unmapped_pages,
     })
-}
-
-/// 构造 PGD[510] 下的 MMIO 与 PCI 32-bit BAR 直接映射窗口。
-fn build_mmio_pud() -> Result<PhysicalAllocation, MapError> {
-    let allocation = alloc_page_table_allocation()?;
-    let pud = phys_to_virt(allocation.paddr) as *mut usize;
-    // Safety: pud 指向刚分配且尚未发布的完整页表页；清零覆盖整页，随后写入的两个
-    // usize 表项都位于 512 项容量内，父 PGD 项会在函数返回后才发布。
-    unsafe {
-        core::ptr::write_bytes(pud, 0, PAGE_SIZE / core::mem::size_of::<usize>());
-        let mmio_leaf = Riscv64Paging::make_leaf_pte(0, true, true, false, false, true);
-        core::ptr::write_volatile(pud, mmio_leaf.bits());
-        let pci32_leaf = Riscv64Paging::make_leaf_pte(0x4000_0000, true, true, false, false, true);
-        core::ptr::write_volatile(pud.add(1), pci32_leaf.bits());
-    }
-    Ok(allocation)
 }
 
 /// 在 buddy 初始化之前发布完整 RAM 直映。
@@ -1152,28 +1133,24 @@ fn publish_boot_direct_map(layout: &EarlyPageTableLayout, direct_map: &DirectMap
     // identity 项和高端窗口，最后原子地替换承载正文的首窗口。
     unsafe {
         core::arch::asm!("fence w, w");
-        for index in (KERNEL_DIRECT_MAP_PUD_START + KERNEL_DIRECT_MAP_PUD_COUNT)
-            ..Riscv64Paging::ENTRIES_PER_TABLE
-        {
-            core::ptr::write_volatile(layout.pud_kernel.add(index), 0);
-        }
-        for window in 1..KERNEL_DIRECT_MAP_PUD_COUNT {
+        for window in 0..KERNEL_DIRECT_MAP_SLOT_COUNT {
             core::ptr::write_volatile(
-                layout.pud_kernel.add(KERNEL_DIRECT_MAP_PUD_START + window),
-                direct_map.pud_entries[window],
+                layout
+                    .kernel_slots
+                    .add(KERNEL_DIRECT_MAP_SLOT_START + window),
+                direct_map.slot_entries[window],
             );
         }
-        // identity 只保留低端 UART/MMIO 与继承相同空洞的内核首窗口。
-        for index in 1..Riscv64Paging::ENTRIES_PER_TABLE {
-            core::ptr::write_volatile(layout.pud_identity.add(index), 0);
+        // Sv48 恒等映射 PUD 与高半区 PUD 分离，可以清除未使用项；Sv39 的
+        // 恒等映射和高半区共享根表，不能清除刚发布的高半区槽位。
+        if active_paging_mode() == RiscvPagingMode::Sv48 {
+            for index in 1..Riscv64Paging::ENTRIES_PER_TABLE {
+                core::ptr::write_volatile(layout.identity_slots.add(index), 0);
+            }
         }
         core::ptr::write_volatile(
-            layout.pud_identity.add(KERNEL_DIRECT_MAP_PUD_START),
-            direct_map.pud_entries[0],
-        );
-        core::ptr::write_volatile(
-            layout.pud_kernel.add(KERNEL_DIRECT_MAP_PUD_START),
-            direct_map.pud_entries[0],
+            layout.identity_slots.add(2),
+            direct_map.slot_entries[KERNEL_IMAGE_WINDOW],
         );
         core::arch::asm!("fence rw, rw");
         Riscv64Paging::flush_tlb_global(None);
@@ -1181,22 +1158,32 @@ fn publish_boot_direct_map(layout: &EarlyPageTableLayout, direct_map: &DirectMap
     }
 }
 
-/// 发布独立的高半区 MMIO PUD；RAM 直映已在物理 allocator 之前完成。
-fn publish_mmio_page_table(layout: &EarlyPageTableLayout, mmio_pud_paddr: usize) {
-    let mmio_pgd_pte = Riscv64Paging::make_table_pte(mmio_pud_paddr);
-    // Safety: 子 PUD 已完整初始化，PGD[510] 在启动 hart 发布前为空。
+/// 发布共同高半区的 MMIO 与 PCI 32-bit BAR 叶映射。
+fn publish_mmio_page_table(layout: &EarlyPageTableLayout) {
     unsafe {
         core::arch::asm!("fence w, w");
-        core::ptr::write_volatile(layout.pgd.add(510), mmio_pgd_pte.bits());
+        let mmio_leaf = Riscv64Paging::make_leaf_pte(0, true, true, false, false, true);
+        let pci32_leaf = Riscv64Paging::make_leaf_pte(0x4000_0000, true, true, false, false, true);
+        core::ptr::write_volatile(layout.kernel_slots.add(MMIO_SLOT_START), mmio_leaf.bits());
+        core::ptr::write_volatile(
+            layout.kernel_slots.add(MMIO_SLOT_START + 1),
+            pci32_leaf.bits(),
+        );
         core::arch::asm!("fence rw, rw");
         Riscv64Paging::flush_tlb_global(None);
     }
 }
 
-/// UART 切到高半区后移除 boot 阶段使用的 PGD[0] identity mapping。
+/// UART 切到高半区后移除启动阶段使用的低地址恒等映射。
 fn remove_identity_mapping(layout: &EarlyPageTableLayout) {
     unsafe {
-        core::ptr::write_volatile(layout.pgd, 0);
+        match active_paging_mode() {
+            RiscvPagingMode::Sv39 => {
+                core::ptr::write_volatile(layout.root, 0);
+                core::ptr::write_volatile(layout.root.add(2), 0);
+            }
+            RiscvPagingMode::Sv48 => core::ptr::write_volatile(layout.root, 0),
+        }
         Riscv64Paging::flush_tlb_global(None);
     }
 }
@@ -1220,13 +1207,9 @@ pub fn init_kernel_page_table() {
         "[arch][heap_vm] direct map was not published before physical allocator initialization"
     );
     let layout = locate_early_page_tables();
-    let mmio_pud = match build_mmio_pud() {
-        Ok(allocation) => allocation,
-        Err(err) => panic!("[arch][heap_vm] failed to allocate MMIO PUD page: {err:?}"),
-    };
-    publish_mmio_page_table(&layout, mmio_pud.paddr);
+    publish_mmio_page_table(&layout);
     log::info!(
-        "[arch][heap_vm] direct map ready: split-pud={} split-pmd={} no-map-pages={}; PUD[0..1] reserved for heap",
+        "[arch][heap_vm] direct map ready: split-1g={} split-2m={} no-map-pages={}; slots[506..509] reserved for heaps",
         DIRECT_MAP_SPLIT_PUD_WINDOWS.load(Ordering::Acquire),
         DIRECT_MAP_SPLIT_PMD_CHUNKS.load(Ordering::Acquire),
         DIRECT_MAP_UNMAPPED_PAGES.load(Ordering::Acquire)
@@ -1244,10 +1227,10 @@ pub fn init_kernel_page_table() {
     remove_identity_mapping(&layout);
 
     PAGE_TABLE_INIT_STATE.store(PAGE_TABLE_INITIALIZED, Ordering::Release);
-    log::info!("[arch][heap_vm] identity mapping (PGD[0]) removed");
+    log::info!("[arch][heap_vm] low identity mapping removed");
 }
 
-/// 返回 boot hart 已发布的正式 Sv48 根页表物理地址。
+/// 返回启动 hart 已发布的正式页表根物理地址。
 pub(crate) fn kernel_page_table_root() -> usize {
     let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
     assert_ne!(root_paddr, 0, "[smp] kernel page table is not ready");
@@ -1273,23 +1256,33 @@ pub(crate) fn install_secondary_identity_mapping() {
         return;
     }
     let root_paddr = kernel_page_table_root();
-    let pgd = phys_to_virt(root_paddr) as *mut usize;
-    let kernel_pud_pte = Riscv64Pte(unsafe { core::ptr::read_volatile(pgd.add(511)) });
-    assert!(
-        Riscv64Paging::pte_is_valid(kernel_pud_pte) && !Riscv64Paging::pte_is_leaf(kernel_pud_pte)
-    );
-    let kernel_pud = phys_to_virt(Riscv64Paging::pte_addr(kernel_pud_pte)) as *mut usize;
+    let root = phys_to_virt(root_paddr) as *mut usize;
+    let kernel_slots = match active_paging_mode() {
+        RiscvPagingMode::Sv39 => root,
+        RiscvPagingMode::Sv48 => child_table_from_entry(root, 511, "Sv48 kernel root[511]"),
+    };
+    let kernel_image_pte = unsafe { core::ptr::read_volatile(kernel_slots.add(KERNEL_IMAGE_SLOT)) };
+
+    if active_paging_mode() == RiscvPagingMode::Sv39 {
+        unsafe {
+            core::ptr::write_volatile(root.add(2), kernel_image_pte);
+            core::arch::asm!("fence rw, rw", options(nostack));
+            Riscv64Paging::flush_tlb_global(None);
+        }
+        SECONDARY_IDENTITY_PUD.store(SECONDARY_IDENTITY_DIRECT, Ordering::Release);
+        return;
+    }
+
     let identity_pud_paddr = alloc_page_table_allocation()
         .expect("[smp] identity PUD allocation failed")
         .paddr;
     let identity_pud = phys_to_virt(identity_pud_paddr) as *mut usize;
     unsafe {
         core::ptr::write_bytes(identity_pud, 0, PAGE_SIZE / core::mem::size_of::<usize>());
-        let kernel_image_pte = core::ptr::read_volatile(kernel_pud.add(2));
         core::ptr::write_volatile(identity_pud.add(2), kernel_image_pte);
         core::arch::asm!("fence w, w", options(nostack));
         let identity_pgd_pte = Riscv64Paging::make_table_pte(identity_pud_paddr);
-        core::ptr::write_volatile(pgd, identity_pgd_pte.bits());
+        core::ptr::write_volatile(root, identity_pgd_pte.bits());
         core::arch::asm!("fence rw, rw", options(nostack));
         Riscv64Paging::flush_tlb_global(None);
     }
@@ -1304,13 +1297,19 @@ pub(crate) fn remove_secondary_identity_mapping() {
         return;
     }
     let root_paddr = kernel_page_table_root();
-    let pgd = phys_to_virt(root_paddr) as *mut usize;
+    let root = phys_to_virt(root_paddr) as *mut usize;
     unsafe {
-        core::ptr::write_volatile(pgd, 0);
+        if identity_pud_paddr == SECONDARY_IDENTITY_DIRECT {
+            core::ptr::write_volatile(root.add(2), 0);
+        } else {
+            core::ptr::write_volatile(root, 0);
+        }
         core::arch::asm!("fence rw, rw", options(nostack));
         Riscv64Paging::flush_tlb_global(None);
     }
-    free_page_table_page(identity_pud_paddr);
+    if identity_pud_paddr != SECONDARY_IDENTITY_DIRECT {
+        free_page_table_page(identity_pud_paddr);
+    }
 }
 
 /// 验证内核关键段的页表权限。仅在 debug 构建中生效。
@@ -1416,9 +1415,7 @@ fn verify_kernel_segments(root_paddr: usize) {
                 "[heap_vm] physical mapping mismatch for '{name}' at {va:#x}"
             );
             let leaf_base = va & !(page_size - 1);
-            let next = leaf_base
-                .checked_add(page_size)
-                .expect("[heap_vm] verification address overflow");
+            let next = advance_leaf_cursor(leaf_base, page_size, end);
             assert!(next > va, "[heap_vm] verification walker made no progress");
             va = next.min(end);
         }
@@ -1426,22 +1423,24 @@ fn verify_kernel_segments(root_paddr: usize) {
 
     let text_start = stext as usize;
     let text_leaf_start = text_start & !(HEAP_PMD_SIZE - 1);
-    let first_direct_map_end = KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_WINDOW_SIZE;
+    let kernel_window_start =
+        phys_to_virt(KERNEL_PHYS_BASE + KERNEL_IMAGE_WINDOW * KERNEL_DIRECT_MAP_WINDOW_SIZE);
+    let kernel_window_end = kernel_window_start + KERNEL_DIRECT_MAP_WINDOW_SIZE;
     let full_direct_map_end =
-        KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_PUD_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
+        KERNEL_VIRT_BASE + KERNEL_DIRECT_MAP_SLOT_COUNT * KERNEL_DIRECT_MAP_WINDOW_SIZE;
     assert!(
-        KERNEL_VIRT_BASE <= text_leaf_start
+        kernel_window_start <= text_leaf_start
             && text_start < etext as usize
             && etext as usize == srodata as usize
             && erodata as usize <= sdata as usize
-            && ekernel as usize <= first_direct_map_end,
+            && ekernel as usize <= kernel_window_end,
         "[heap_vm] invalid linker section layout"
     );
 
     // 验证整个 direct map，而不是只检查每个段的第一个地址。
     check_range(
-        "firmware/reserved",
-        KERNEL_VIRT_BASE,
+        "kernel window prefix",
+        kernel_window_start,
         text_leaf_start,
         true,
         true,
@@ -1485,9 +1484,9 @@ fn verify_kernel_segments(root_paddr: usize) {
         KERNEL_VA_OFFSET,
     );
     check_range(
-        "PUD[2] direct-map tail",
+        "kernel window tail",
         ekernel as usize,
-        first_direct_map_end,
+        kernel_window_end,
         true,
         true,
         false,
@@ -1495,7 +1494,7 @@ fn verify_kernel_segments(root_paddr: usize) {
     );
     check_range(
         "高端 direct map",
-        first_direct_map_end,
+        kernel_window_end,
         full_direct_map_end,
         true,
         true,
@@ -1514,7 +1513,7 @@ fn verify_kernel_segments(root_paddr: usize) {
     check_range(
         "MMIO PCI32",
         MMIO_VIRT_BASE + 0x4000_0000,
-        MMIO_VIRT_BASE + 0x8000_0000,
+        usize::MAX,
         true,
         true,
         false,
@@ -1660,7 +1659,7 @@ fn free_page_table_page(paddr: usize) -> bool {
 
 /// 回收解除映射后变空的 PT/PMD 页，只处理两个动态堆窗口。
 ///
-/// 根页表和启动阶段创建的 PUD 页由整个内核地址空间共享，绝不在这里释放。
+/// 根页表和启动阶段创建的 1 GiB 槽位表由整个内核地址空间共享，绝不在这里释放。
 /// 返回 true 表示至少摘除了一个非叶页表，并已执行一次覆盖叶映射的全局 TLB flush。
 fn reclaim_empty_heap_page_tables(root_vaddr: usize, vaddr: usize, size: usize) -> bool {
     let Some(end_vaddr) = vaddr.checked_add(size) else {
@@ -1669,38 +1668,38 @@ fn reclaim_empty_heap_page_tables(root_vaddr: usize, vaddr: usize, size: usize) 
     let invalid = Riscv64Paging::pte_to_usize(Riscv64Paging::invalid_pte());
     let reclaimed = unsafe { &mut *RECLAIM_SCRATCH.0.get() };
     let mut reclaimed_count = 0usize;
-    let mut current_pud_base = vaddr & !(HEAP_PUD_SIZE - 1);
+    let one_gib_level = Riscv64Paging::active_levels() - 3;
+    let kernel_slots_vaddr = match active_paging_mode() {
+        RiscvPagingMode::Sv39 => root_vaddr,
+        RiscvPagingMode::Sv48 => {
+            let root = root_vaddr as *mut usize;
+            child_table_from_entry(root, 511, "Sv48 kernel root[511]") as usize
+        }
+    };
+    let mut current_slot_base = vaddr & !(HEAP_PUD_SIZE - 1);
 
-    while current_pud_base < end_vaddr {
-        let next_pud_base = current_pud_base
+    while current_slot_base < end_vaddr {
+        let next_slot_base = current_slot_base
             .checked_add(HEAP_PUD_SIZE)
             .unwrap_or(end_vaddr);
-        let chunk_start = vaddr.max(current_pud_base);
-        let chunk_end = end_vaddr.min(next_pud_base);
+        let chunk_start = vaddr.max(current_slot_base);
+        let chunk_end = end_vaddr.min(next_slot_base);
 
-        let pgd_index = Riscv64Paging::level_index(chunk_start, 0);
-        let pgd_pte_ptr = (root_vaddr + pgd_index * core::mem::size_of::<usize>()) as *const usize;
-        let pgd_pte =
-            Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pgd_pte_ptr) });
-        if !Riscv64Paging::pte_is_valid(pgd_pte) || Riscv64Paging::pte_is_leaf(pgd_pte) {
-            break;
-        }
-
-        let pud_vaddr = phys_to_virt(Riscv64Paging::pte_addr(pgd_pte));
-        let pud_index = Riscv64Paging::level_index(chunk_start, 1);
-        let pud_pte_ptr = (pud_vaddr + pud_index * core::mem::size_of::<usize>()) as *mut usize;
-        let pud_pte =
-            Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pud_pte_ptr) });
-        if !Riscv64Paging::pte_is_valid(pud_pte) || Riscv64Paging::pte_is_leaf(pud_pte) {
-            current_pud_base = next_pud_base;
+        let slot_index = Riscv64Paging::level_index(chunk_start, one_gib_level);
+        let slot_pte_ptr =
+            (kernel_slots_vaddr + slot_index * core::mem::size_of::<usize>()) as *mut usize;
+        let slot_pte =
+            Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(slot_pte_ptr) });
+        if !Riscv64Paging::pte_is_valid(slot_pte) || Riscv64Paging::pte_is_leaf(slot_pte) {
+            current_slot_base = next_slot_base;
             continue;
         }
 
-        let pmd_paddr = Riscv64Paging::pte_addr(pud_pte);
+        let pmd_paddr = Riscv64Paging::pte_addr(slot_pte);
         let pmd_vaddr = phys_to_virt(pmd_paddr);
         let mut current_pmd_base = chunk_start & !(HEAP_PMD_SIZE - 1);
         while current_pmd_base < chunk_end {
-            let pmd_index = Riscv64Paging::level_index(current_pmd_base, 2);
+            let pmd_index = Riscv64Paging::level_index(current_pmd_base, one_gib_level + 1);
             let pmd_pte_ptr = (pmd_vaddr + pmd_index * core::mem::size_of::<usize>()) as *mut usize;
             let pmd_pte =
                 Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pmd_pte_ptr) });
@@ -1720,15 +1719,15 @@ fn reclaim_empty_heap_page_tables(root_vaddr: usize, vaddr: usize, size: usize) 
                 .unwrap_or(chunk_end);
         }
 
-        // 每个 PUD chunk 只扫描一次 PMD，避免大范围 unmap 时重复 512 次全表检查。
+        // 每个 1GiB chunk 只扫描一次 PMD，避免大范围 unmap 时重复全表检查。
         if page_table_is_empty(pmd_vaddr) {
-            unsafe { core::ptr::write_volatile(pud_pte_ptr, invalid) };
+            unsafe { core::ptr::write_volatile(slot_pte_ptr, invalid) };
             debug_assert!(reclaimed_count < reclaimed.len());
             reclaimed[reclaimed_count] = pmd_paddr;
             reclaimed_count += 1;
         }
 
-        current_pud_base = next_pud_base;
+        current_slot_base = next_slot_base;
     }
 
     if reclaimed_count == 0 {
@@ -1998,7 +1997,7 @@ fn find_kernel_heap_leaf_or_guard(
     vaddr: usize,
 ) -> Result<KernelHeapLeaf, MapError> {
     let mut table_vaddr = root_vaddr;
-    for level in 0..Riscv64Paging::LEVELS {
+    for level in 0..Riscv64Paging::active_levels() {
         let index = Riscv64Paging::level_index(vaddr, level);
         let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
         let pte = Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) });
