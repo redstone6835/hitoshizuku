@@ -21,6 +21,8 @@ use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
 use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_standard_shm_tmpfs};
 use log::{LogRecord, LogSink, printk};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use sched::sync::Spinlock;
 use sched::{TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, Task};
 
@@ -52,6 +54,12 @@ struct DeferredBootConsole {
 
 static DEFERRED_BOOT_CONSOLE: Spinlock<Option<DeferredBootConsole>> = Spinlock::new(None);
 
+static PTMX_DEVNODE_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+static EXTRA_STATIC_NODES_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+static TTY_ALIAS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 static CONSOLE_LOG_SINK: LogSink = LogSink {
     write_record: write_log_record_to_console,
 };
@@ -77,7 +85,13 @@ pub fn bind_or_defer_boot_console(
         });
         return false;
     };
-    activate_console(tag, dev_ops, device, true)
+    if selector_is_vt(&selector) {
+        activate_vt_console(tag, dev_ops, device, true)
+    } else {
+        let bound = activate_console(tag, dev_ops, device.clone(), true);
+        maybe_install_virtual_terminals(tag, dev_ops, &selector, device);
+        bound
+    }
 }
 
 /// 在 BuildBound 设备 ELM 装载完成后重试尚未解析的启动控制台。
@@ -111,9 +125,17 @@ pub fn retry_deferred_boot_console(init: &Arc<Task>) -> bool {
         *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
         return false;
     };
-    if !activate_console(request.tag, dev_ops, device, false) {
-        *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
-        return false;
+    if selector_is_vt(&request.selector) {
+        if !activate_vt_console(request.tag, dev_ops, device, false) {
+            *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
+            return false;
+        }
+    } else {
+        if !activate_console(request.tag, dev_ops, device.clone(), false) {
+            *DEFERRED_BOOT_CONSOLE.lock() = Some(request);
+            return false;
+        }
+        maybe_install_virtual_terminals(request.tag, dev_ops, &request.selector, device);
     }
     crate::stdio::install_stdio(&vfs_ctx, &fdtable, "/dev/console");
     true
@@ -124,6 +146,14 @@ fn resolve_boot_console(
     dev_ops: &DevTmpfsSuperblockOps,
     selector: &BootConsoleSelector,
 ) -> Option<CharDevice> {
+    // VT 选择器(console=ttyN)没有自己的底层设备:物理控制台回退到
+    // 固件 stdout 指向的 console 字符设备(uart),VT 管理器以它为渲染
+    // 与输入目标。ttyN 节点由 install_virtual_terminal_nodes 在之后创建。
+    if selector_is_vt(selector) {
+        return general::vfs::device_files::projection::active_char_devices(&DEVICES.functions)
+            .into_iter()
+            .find(|dev| dev.is_console());
+    }
     match selector {
         BootConsoleSelector::FirmwareName(name) => {
             find_char_device_by_fw_name(&DEVICES.functions, name)
@@ -191,6 +221,74 @@ fn activate_console(
     true
 }
 
+/// console= 选择器是否为虚拟终端(`tty0`..`ttyN`)。
+///
+/// 注意 `tty`(5:0,会话控制终端别名)与 `ttyS0` 等串口名不是 VT。
+fn selector_is_vt(selector: &BootConsoleSelector) -> bool {
+    let name = selector.description();
+    let name = name.strip_prefix("/dev/").unwrap_or(name);
+    name.strip_prefix("tty")
+        .and_then(|digits| digits.parse::<u8>().ok())
+        .is_some_and(|index| index < general::dev::tty::vt::VT_COUNT as u8)
+}
+
+/// 以虚拟终端为启动控制台(`console=ttyN`)。
+///
+/// 安装 VT 管理器并把串口输入路由到活动 VT;`/dev/console` 绑定为 tty0
+/// 别名(活动 VT)。内核日志仍直接写物理串口,不经过 VT 行规程。
+fn activate_vt_console(
+    tag: &str,
+    dev_ops: &DevTmpfsSuperblockOps,
+    device: CharDevice,
+    stash_for_boot_init: bool,
+) -> bool {
+    let manager = general::dev::tty::VtManager::install(device.clone(), true);
+    if let Err(error) =
+        general::vfs::devtmpfs::install_virtual_terminal_nodes(dev_ops, manager, true)
+    {
+        printk!(
+            "[kernel-start][{}] failed to install virtual terminal nodes: {:?}",
+            tag,
+            error
+        );
+        return false;
+    }
+    general::console::register_console(device);
+    log::bind_log_sink(&CONSOLE_LOG_SINK);
+    replay_buffered_logs_to_console();
+    if stash_for_boot_init {
+        crate::sched::stash_boot_console_name(String::from("/dev/console"));
+    }
+    printk!("[kernel-start][{}] bound /dev/console -> tty0 (VT console)", tag);
+    true
+}
+
+/// 非 VT 控制台下仍安装虚拟终端(与 Linux 一致,/dev/ttyN 始终存在),
+/// 但串口输入不路由到 VT,console 保持指向物理串口。
+fn maybe_install_virtual_terminals(
+    tag: &str,
+    dev_ops: &DevTmpfsSuperblockOps,
+    selector: &BootConsoleSelector,
+    device: CharDevice,
+) {
+    if selector_is_vt(selector) {
+        return;
+    }
+    let manager = general::dev::tty::VtManager::install(device, false);
+    match general::vfs::devtmpfs::install_virtual_terminal_nodes(dev_ops, manager, false) {
+        Ok(()) => printk!(
+            "[kernel-start][{}] installed virtual terminals tty0..tty{}",
+            tag,
+            general::dev::tty::vt::VT_COUNT - 1
+        ),
+        Err(error) => printk!(
+            "[kernel-start][{}] virtual terminal node installation failed: {:?}",
+            tag,
+            error
+        ),
+    }
+}
+
 fn task_vfs_context(task: &Arc<Task>) -> Option<Arc<VfsContext>> {
     Arc::downcast::<VfsContext>(task.ext_lookup(TASKEXT_VFS_CONTEXT)?).ok()
 }
@@ -226,6 +324,12 @@ fn replay_buffered_logs_to_console() {
 /// 这里按名字做幂等检查，避免未来固件路径或测试代码重复进入设备初始化时把同名
 /// driver 重复塞进全局 registry。块文件系统的注册函数内部负责自己的适配器集合。
 pub fn register_core_filesystems(tag: &str) {
+    if let Err(err) = general::vfs::device_files::base::register_standard_node_policies() {
+        panic!(
+            "[kernel-start][{}] failed to register standard node policies: {:?}",
+            tag, err
+        );
+    }
     if FS_REGISTRY.find("tmpfs").is_none() {
         FS_REGISTRY
             .register(Box::leak(Box::new(general::vfs::TmpfsDriver)))
@@ -242,6 +346,16 @@ pub fn register_core_filesystems(tag: &str) {
             .unwrap_or_else(|err| {
                 panic!(
                     "[kernel-start][{}] failed to register devtmpfs driver: {:?}",
+                    tag, err
+                )
+            });
+    }
+    if FS_REGISTRY.find("devpts").is_none() {
+        FS_REGISTRY
+            .register(Box::leak(Box::new(general::vfs::DevPtsDriver)))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "[kernel-start][{}] failed to register devpts driver: {:?}",
                     tag, err
                 )
             });
@@ -324,6 +438,9 @@ pub fn register_core_filesystems(tag: &str) {
 
 /// 创建并发布 devtmpfs 单例 superblock。
 pub fn mount_devtmpfs(tag: &str) -> Arc<Superblock> {
+    register_pty_devnode_if_needed(tag);
+    register_extra_static_nodes_if_needed(tag);
+    register_tty_alias_if_needed(tag);
     FS_REGISTRY
         .find("devtmpfs")
         .unwrap_or_else(|| panic!("[kernel-start][{}] devtmpfs driver not found", tag))
@@ -399,7 +516,104 @@ pub fn mount_standard_user_api_filesystems(tag: &str, ctx: &VfsContext) {
             tag, err
         )
     });
+    mount_devpts_on_pts(tag, ctx);
     mount_sysfs_on_sys(tag, ctx);
+}
+
+/// 挂载 devpts 到 `/dev/pts`(Linux 布局)。
+fn mount_devpts_on_pts(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
+    ensure_dir(ctx, "/dev/pts", vfs::stat::FileMode::new(0o755)).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to ensure /dev/pts directory: {:?}",
+            tag, err
+        )
+    });
+    if let Ok(existing) = path::lookup(ctx, &Dirfd::Cwd, "/dev/pts", LookupFlags::DIRECTORY)
+        && existing.mount.superblock.fs_type == "devpts"
+        && Arc::ptr_eq(&existing.dentry, &existing.mount.mount_root)
+    {
+        return existing.mount;
+    }
+    let mountpoint = path::lookup(
+        ctx,
+        &Dirfd::Cwd,
+        "/dev/pts",
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to resolve /dev/pts mountpoint: {:?}",
+            tag, err
+        )
+    });
+    let sb = FS_REGISTRY
+        .find("devpts")
+        .expect("[kernel-start] devpts driver not found")
+        .mount(None, "mode=0620,ptmxmode=0666")
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to mount devpts: {:?}",
+                tag, err
+            )
+        });
+    let mount = ctx.mount_ns.mount_at(
+        Arc::clone(&mountpoint.dentry),
+        Arc::clone(&mountpoint.mount),
+        sb,
+        MountFlags::default(),
+    );
+    match mount {
+        Ok(mount) => {
+            printk!("[kernel-start][{}] devpts mounted on /dev/pts", tag);
+            mount
+        }
+        Err(err) => panic!(
+            "[kernel-start][{}] failed to mount devpts at /dev/pts: {:?}",
+            tag, err
+        ),
+    }
+}
+
+fn register_tty_alias_if_needed(tag: &str) {
+    if TTY_ALIAS_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match general::vfs::devtmpfs::register_tty_alias_devnode() {
+        Ok(_) => printk!("[kernel-start][{}] registered /dev/tty devnode", tag),
+        Err(err) => printk!(
+            "[kernel-start][{}] failed to register /dev/tty devnode: {:?}",
+            tag,
+            err
+        ),
+    }
+}
+
+fn register_extra_static_nodes_if_needed(tag: &str) {
+    if EXTRA_STATIC_NODES_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match general::vfs::device_files::base::register_extra_static_nodes() {
+        Ok(_) => printk!("[kernel-start][{}] registered /dev/full /dev/kmsg", tag),
+        Err(err) => printk!(
+            "[kernel-start][{}] failed to register full/kmsg nodes: {:?}",
+            tag,
+            err
+        ),
+    }
+}
+
+fn register_pty_devnode_if_needed(tag: &str) {
+    if PTMX_DEVNODE_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match general::vfs::devtmpfs::register_pty_devnode() {
+        Ok(_) => printk!("[kernel-start][{}] registered /dev/ptmx devnode", tag),
+        Err(err) => printk!(
+            "[kernel-start][{}] failed to register /dev/ptmx devnode: {:?}",
+            tag,
+            err
+        ),
+    }
 }
 
 fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {

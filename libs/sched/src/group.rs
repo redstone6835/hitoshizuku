@@ -901,6 +901,8 @@ pub struct Session {
     /// 会话 leader 绑定线程组身份；线程组内 exec 替换 leader 时无需搬运引用。
     leader: Spinlock<Weak<ThreadGroup>>,
     groups: Spinlock<Vec<Weak<ProcessGroup>>>,
+    /// 控制终端句柄(不透明 cookie,由 TTY 层解析;sched 不依赖 general)。
+    ctty: Spinlock<Option<u64>>,
 }
 
 impl Session {
@@ -909,6 +911,7 @@ impl Session {
             sid: AtomicI32::new(PID_INVALID),
             leader: Spinlock::new(Weak::new()),
             groups: Spinlock::new(Vec::new()),
+            ctty: Spinlock::new(None),
         })
     }
 
@@ -956,6 +959,15 @@ impl Session {
 
     pub fn sid(&self) -> PidT {
         self.sid.load(Ordering::Acquire)
+    }
+
+    /// 控制终端 cookie(TTY 层登记的不透明句柄)。
+    pub fn ctty(&self) -> Option<u64> {
+        *self.ctty.lock()
+    }
+
+    pub fn set_ctty(&self, cookie: Option<u64>) {
+        *self.ctty.lock() = cookie;
     }
 
     pub fn set_sid(&self, pid: PidT) {

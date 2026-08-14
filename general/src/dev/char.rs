@@ -13,6 +13,8 @@ pub use super::control::{CharControlRequest, CharControlResponse, ControlError, 
 /// 字符设备 I/O 错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharIoError {
+    /// 无剩余空间(如 /dev/full 的写)。
+    NoSpace,
     /// 硬件级错误（帧、奇偶校验、溢出等）。
     HardwareError,
     /// 设备不可用或已断开。
@@ -93,6 +95,9 @@ pub trait CharDriver: Send + Sync {
     /// 默认只把通用 drain 请求接到底层 [`flush`](Self::flush)，其它请求返回
     /// `Unsupported`。丢弃输入/输出队列需要驱动明确知道自己的缓冲结构，
     /// 不能由类层假定完成。
+    /// 窗口大小变化通知(pts 对端同步等)。
+    fn winsize_changed(&self, _winsize: crate::vfs::user_api::tty::UserWinSize) {}
+
     fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
         match req {
             CharControlRequest::DrainTx => {
@@ -231,6 +236,7 @@ where
 
 fn map_char_control_error(err: CharIoError) -> ControlError {
     match err {
+        CharIoError::NoSpace => ControlError::Invalid,
         CharIoError::HardwareError => ControlError::Io,
         CharIoError::Unavailable => ControlError::NoDevice,
         CharIoError::Interrupted => ControlError::Busy,
@@ -455,6 +461,11 @@ impl CharDevice {
 
     /// 执行字符设备类 typed control。
     #[inline]
+    /// 通知驱动窗口大小变化(pts 对端同步等)。
+    pub fn winsize_changed(&self, winsize: crate::vfs::user_api::tty::UserWinSize) {
+        self.inner.driver.winsize_changed(winsize);
+    }
+
     pub fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
         if !self.is_active() {
             return Err(ControlError::NoDevice);
