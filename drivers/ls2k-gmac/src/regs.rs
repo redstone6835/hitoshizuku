@@ -11,26 +11,34 @@ pub const GMAC_CONTROL: usize = 0x000;
 pub const GMAC_FRAME_FILTER: usize = 0x004;
 pub const GMAC_MII_ADDR: usize = 0x010;
 pub const GMAC_MII_DATA: usize = 0x014;
+#[allow(dead_code)]
 pub const GMAC_DEBUG: usize = 0x024;
+#[allow(dead_code)]
 pub const GMAC_INT_MASK: usize = 0x03c;
 pub const GMAC_ADDR0_HIGH: usize = 0x300;
 pub const GMAC_ADDR0_LOW: usize = 0x304;
 
+#[allow(dead_code)]
 pub const GMAC_CONTROL_2K: u32 = 0x0800_0000;
 pub const GMAC_CONTROL_JD: u32 = 0x0040_0000;
 pub const GMAC_CONTROL_BE: u32 = 0x0020_0000;
+#[allow(dead_code)]
 pub const GMAC_CONTROL_JE: u32 = 0x0010_0000;
 pub const GMAC_CONTROL_PS: u32 = 0x0000_8000;
 pub const GMAC_CONTROL_FES: u32 = 0x0000_4000;
+#[allow(dead_code)]
 pub const GMAC_CONTROL_LM: u32 = 0x0000_1000;
 pub const GMAC_CONTROL_DM: u32 = 0x0000_0800;
+#[allow(dead_code)]
 pub const GMAC_CONTROL_IPC: u32 = 0x0000_0400;
 pub const GMAC_CONTROL_TE: u32 = 0x0000_0008;
 pub const GMAC_CONTROL_RE: u32 = 0x0000_0004;
 /// 内核初始化位（Linux dwmac1000_core_init 的 GMAC_CORE_INIT）。
 pub const GMAC_CORE_INIT: u32 = GMAC_CONTROL_JD | GMAC_CONTROL_PS | GMAC_CONTROL_BE;
 
+#[allow(dead_code)]
 pub const GMAC_FRAME_FILTER_PR: u32 = 0x0000_0001;
+#[allow(dead_code)]
 pub const GMAC_FRAME_FILTER_PM: u32 = 0x0000_0010;
 
 // ─────────────── MII 地址寄存器（Loongson 布局） ───────────────
@@ -64,12 +72,16 @@ pub const DMA_BUS_MODE_MAXPBL: u32 = 0x0100_0000;
 
 pub const DMA_STATUS_NIS: u32 = 0x0001_0000;
 pub const DMA_STATUS_AIS: u32 = 0x0000_8000;
+#[allow(dead_code)]
 pub const DMA_STATUS_ERI: u32 = 0x0000_4000;
+#[allow(dead_code)]
 pub const DMA_STATUS_FBI: u32 = 0x0000_2000;
+#[allow(dead_code)]
 pub const DMA_STATUS_RPS: u32 = 0x0000_0100;
 pub const DMA_STATUS_RU: u32 = 0x0000_0080;
 pub const DMA_STATUS_RI: u32 = 0x0000_0040;
 pub const DMA_STATUS_UNF: u32 = 0x0000_0020;
+#[allow(dead_code)]
 pub const DMA_STATUS_OVF: u32 = 0x0000_0010;
 pub const DMA_STATUS_TU: u32 = 0x0000_0004;
 pub const DMA_STATUS_TPS: u32 = 0x0000_0002;
@@ -116,6 +128,7 @@ pub struct DmaDesc {
 }
 
 pub const TDES0_OWN: u32 = 1 << 31;
+#[allow(dead_code)]
 pub const TDES0_ERROR_SUMMARY: u32 = 1 << 15;
 pub const TDES1_BUFFER1_SIZE_MASK: u32 = 0x7ff;
 pub const TDES1_END_RING: u32 = 1 << 25;

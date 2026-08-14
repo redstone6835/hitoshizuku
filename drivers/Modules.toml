@@ -131,6 +131,15 @@ targets = "loongarch64-unknown-none"
 after = "platform.firmware-bus,platform.loongson-irq,platform.loongson-clk"
 
 [[modules]]
+name = "platform.ls2k-spi"
+path = "ls2k-spi"
+config = "CONFIG_LS2K_SPI"
+prompt = "Loongson LS2K SPI 控制器与 SPI-NOR 驱动"
+default = "y"
+targets = "loongarch64-unknown-none"
+after = "platform.firmware-bus,platform.loongson-clk"
+
+[[modules]]
 name = "platform.ls2x-wdt"
 path = "ls2x-wdt"
 config = "CONFIG_LS2X_WDT"
