@@ -1753,7 +1753,7 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         #[cfg(feature = "performance-profile")]
         drop(lookup_profile);
         vfs_socket::validate_send_flags(ctx.args[3])?;
-        if (ctx.args[3] & vfs_socket::MSG_OOB) != 0 {
+        if (ctx.args[3] & (vfs_socket::MSG_OOB | vfs_socket::MSG_FASTOPEN)) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         // 最大 UDP 数据报即使从页尾开始也只覆盖 17 个 4 KiB 页；多留一个槽
@@ -1808,6 +1808,7 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     if addr.is_none()
         && len != 0
+        && (ctx.args[3] & vfs_socket::MSG_FASTOPEN) == 0
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)
         && let Some(socket) = inet_stream_file(&file)
@@ -1970,7 +1971,15 @@ fn send_inet_stream_file_from_user(
 ) -> Result<usize, Errno> {
     vfs_socket::validate_send_flags(flags)?;
     if (flags & vfs_socket::MSG_OOB) != 0 {
-        return Err(Errno::EOPNOTSUPP);
+        // Linux 语义：MSG_OOB 只发送缓冲的最后一个字节作为紧急数据，返回 1。
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut byte = [0u8; 1];
+        let urgent_ptr = user.checked_add(len - 1).ok_or(Errno::EFAULT)?;
+        copy_from_user(urgent_ptr, &mut byte).map_err(|e| e.as_errno())?;
+        let nonblocking = file.flags().nonblock || (flags & vfs_socket::MSG_DONTWAIT) != 0;
+        return socket.send_oob(byte[0], nonblocking);
     }
     // 内部分页会临时设置 MSG_MORE；若后续用户页缺页失败或发送只完成一部分，
     // 仍须发布已经接受的数据。应用显式传入 MSG_MORE 时则保留其 cork 语义。
@@ -2257,6 +2266,7 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     if hdr.iovlen <= 1024
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
+        && (ctx.args[2] & (vfs_socket::MSG_OOB | vfs_socket::MSG_FASTOPEN)) == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)
@@ -2354,7 +2364,12 @@ pub(super) fn sys_recvmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
         && total != 0
-        && (ctx.args[2] & (vfs_socket::MSG_PEEK | vfs_socket::MSG_WAITALL)) == 0
+        && (ctx.args[2]
+            & (vfs_socket::MSG_PEEK
+                | vfs_socket::MSG_WAITALL
+                | vfs_socket::MSG_OOB
+                | vfs_socket::MSG_ERRQUEUE))
+            == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)
@@ -2468,22 +2483,94 @@ pub(super) fn sys_recvmmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(recv_count)
 }
 
+/// SOL_SOCKET（Linux 标准值 1）。
+const SOL_SOCKET_LEVEL: i32 = 1;
+
 pub(super) fn sys_setsockopt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
+    let level = ctx.args[1] as i32;
+    let optname = ctx.args[2] as i32;
+    // SO_ATTACH_FILTER 的 optval 是 sock_fprog（含用户指针），需要在内核层解引用。
+    if level == SOL_SOCKET_LEVEL && optname == vfs_socket::SO_ATTACH_FILTER {
+        let fprog = copy_user_region(ctx.args[3], ctx.args[4])?;
+        let instructions = read_sock_fprog(&fprog)?;
+        ctx.ensure_network_execution_scope();
+        vfs_socket::socket_attach_filter(&fdt, fd, instructions)?;
+        return Ok(0);
+    }
+    if level == SOL_SOCKET_LEVEL && optname == vfs_socket::SO_DETACH_FILTER {
+        ctx.ensure_network_execution_scope();
+        vfs_socket::socket_detach_filter(&fdt, fd)?;
+        return Ok(0);
+    }
+    if level == SOL_SOCKET_LEVEL && optname == vfs_socket::SO_LOCK_FILTER {
+        ctx.ensure_network_execution_scope();
+        vfs_socket::socket_lock_filter(&fdt, fd)?;
+        return Ok(0);
+    }
     let value = copy_user_region(ctx.args[3], ctx.args[4])?;
     ctx.ensure_network_execution_scope();
-    vfs_socket::setsockopt(&fdt, fd, ctx.args[1] as i32, ctx.args[2] as i32, &value)?;
+    vfs_socket::setsockopt(&fdt, fd, level, optname, &value)?;
     Ok(0)
 }
 
 pub(super) fn sys_getsockopt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
+    let level = ctx.args[1] as i32;
+    let optname = ctx.args[2] as i32;
+    if level == SOL_SOCKET_LEVEL && optname == vfs_socket::SO_ATTACH_FILTER {
+        // SO_GET_FILTER：把已安装程序写入用户 sock_fprog。
+        ctx.ensure_network_execution_scope();
+        let instructions = vfs_socket::socket_get_filter(&fdt, fd)?;
+        write_sock_fprog(ctx.args[3], ctx.args[4], &instructions)?;
+        return Ok(0);
+    }
     ctx.ensure_network_execution_scope();
-    let value = vfs_socket::getsockopt(&fdt, fd, ctx.args[1] as i32, ctx.args[2] as i32)?;
+    let value = vfs_socket::getsockopt(&fdt, fd, level, optname)?;
     copy_optval_to_user(ctx.args[3], ctx.args[4], &value)?;
     Ok(0)
+}
+
+/// 从用户 sock_fprog（64 位：len u16 + pad 6 + filter 指针 8）读取指令数组。
+fn read_sock_fprog(fprog: &[u8]) -> Result<alloc::vec::Vec<net::bpf::CbpfInsn>, Errno> {
+    if fprog.len() < 16 {
+        return Err(Errno::EINVAL);
+    }
+    let len = u16::from_ne_bytes(fprog[..2].try_into().unwrap());
+    let filter_ptr = usize::from_ne_bytes(fprog[8..16].try_into().unwrap());
+    if len == 0 || usize::from(len) > 4096 {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = alloc::vec![0u8; usize::from(len) * 8];
+    copy_from_user(filter_ptr, &mut raw).map_err(|e| e.as_errno())?;
+    net::bpf::parse_sock_filters(&raw).map_err(|_| Errno::EINVAL)
+}
+
+/// 把过滤器指令写回用户 sock_fprog（SO_GET_FILTER 语义）。
+fn write_sock_fprog(
+    optval: usize,
+    optlen: usize,
+    instructions: &[net::bpf::CbpfInsn],
+) -> Result<(), Errno> {
+    if optval == 0 || optlen < 16 {
+        return Err(Errno::EINVAL);
+    }
+    let mut fprog = [0u8; 16];
+    copy_from_user(optval, &mut fprog).map_err(|e| e.as_errno())?;
+    let capacity = u16::from_ne_bytes(fprog[..2].try_into().unwrap()) as usize;
+    let filter_ptr = usize::from_ne_bytes(fprog[8..16].try_into().unwrap());
+    let count = instructions.len().min(capacity);
+    let bytes = net::bpf::serialize_sock_filters(&instructions[..count]);
+    if !bytes.is_empty() {
+        copy_to_user(filter_ptr, &bytes).map_err(|e| e.as_errno())?;
+    }
+    // 回写实际指令数。
+    let mut updated = fprog;
+    updated[..2].copy_from_slice(&(count as u16).to_ne_bytes());
+    copy_to_user(optval, &updated).map_err(|e| e.as_errno())?;
+    Ok(())
 }
 
 pub(super) fn sys_shutdown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

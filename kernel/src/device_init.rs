@@ -723,18 +723,27 @@ pub fn install_network_boot_config() {
     let online_cpu_count = sched::online_cpu_mask().count_ones();
     let active_cpu_count =
         net::boot::select_protocol_shard_count(online_cpu_count).expect("网络启动时没有在线 CPU");
-    let (host_config, driver_config, stack_config) =
+    let (host_config, driver_config, mut stack_config) =
         net::boot::NetBootConfigs::from_random_material(material, active_cpu_count)
             .expect("active CPU count 超出网络栈范围")
             .split();
+    // 启动参数 net.dhcp=0|off|false|no：关闭内核 DHCP 客户端。
+    let dhcp_disabled = general::start_cmdline()
+        .map(|cmdline| general::cmdline::Cmdline::new(cmdline).find("net.dhcp"))
+        .flatten()
+        .is_some_and(|value| matches!(value, "0" | "off" | "false" | "no"));
+    if dhcp_disabled {
+        stack_config.set_dhcp_disabled(true);
+    }
     net::boot::install_host_boot_config(host_config).expect("网络 host 启动配置被重复安装");
     net::device::install_net_runtime(driver_config, crate::net_runtime::registrar())
         .expect("网络运行时被重复安装");
     net::stack::install_stack_runtime(stack_config, crate::net_stack::registrar())
         .expect("网络 stack broker 被重复安装");
     log::info!(
-        "[kernel] installed network boot config: online_cpus={} protocol_shards={}",
+        "[kernel] installed network boot config: online_cpus={} protocol_shards={} dhcp={}",
         online_cpu_count,
-        active_cpu_count
+        active_cpu_count,
+        if dhcp_disabled { "disabled" } else { "enabled" }
     );
 }

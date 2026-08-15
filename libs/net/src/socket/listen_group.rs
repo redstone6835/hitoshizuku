@@ -30,6 +30,8 @@ pub struct ListenGroup {
     accept_count: AtomicUsize,
     syn_count: AtomicUsize,
     closing: AtomicBool,
+    /// TCP Fast Open（TCP_FASTOPEN setsockopt）启用状态。
+    tfo_enabled: AtomicBool,
 }
 
 impl ListenGroup {
@@ -76,6 +78,7 @@ impl ListenGroup {
             accept_count: AtomicUsize::new(0),
             syn_count: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
+            tfo_enabled: AtomicBool::new(false),
         })
     }
 
@@ -109,6 +112,14 @@ impl ListenGroup {
 
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn set_tfo_enabled(&self, enabled: bool) {
+        self.tfo_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn tfo_enabled(&self) -> bool {
+        self.tfo_enabled.load(Ordering::Acquire)
     }
 
     pub fn update_backlog(&self, backlog: u32) {

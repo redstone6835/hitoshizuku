@@ -225,6 +225,25 @@ impl RouteSnapshot {
             .find(|candidate| candidate.id == table)
             .and_then(|candidate| candidate.lookup(address))
     }
+
+    /// SO_BINDTODEVICE 语义：只在指定接口的路由中做最长前缀匹配。
+    ///
+    /// trie 每个前缀只保留全局 metric 最优的路由，无法表达"绑定接口后使用
+    /// 该接口的次优路由"；此查找按接口过滤后选前缀最长、metric 最小的条目。
+    pub fn lookup_with_interface(
+        &self,
+        table: u8,
+        address: IpAddr,
+        interface: InterfaceId,
+    ) -> Option<RouteEntry> {
+        use core::cmp::Reverse;
+        self.entries
+            .iter()
+            .copied()
+            .filter(|route| route.table == table && route.interface == interface)
+            .filter(|route| prefix_matches(address, route.network, route.prefix_len))
+            .min_by_key(|route| (Reverse(route.prefix_len), route.metric, route.interface))
+    }
 }
 
 #[derive(Clone)]
@@ -395,13 +414,17 @@ impl ConfigSnapshot {
             .find(|rule| mark & rule.mask == rule.mark & rule.mask)
             .map(|rule| rule.table)
             .unwrap_or(MAIN_ROUTE_TABLE);
-        let route = self
-            .routes
-            .lookup(table, destination)
-            .ok_or(ConfigError::NoRoute)?;
-        if interface_scope.is_some_and(|scope| scope != route.interface) {
-            return Err(ConfigError::NoRoute);
-        }
+        // SO_BINDTODEVICE：路由查找限定在绑定接口（Linux 语义）。
+        let route = match interface_scope {
+            Some(scope) => self
+                .routes
+                .lookup_with_interface(table, destination, scope)
+                .ok_or(ConfigError::NoRoute)?,
+            None => self
+                .routes
+                .lookup(table, destination)
+                .ok_or(ConfigError::NoRoute)?,
+        };
         let interface = self
             .interfaces
             .iter()
@@ -768,5 +791,121 @@ mod tests {
             .unwrap();
         assert_eq!(route.interface, InterfaceId(1));
         assert_eq!(route.next_hop, group);
+    }
+    #[test]
+    fn bindtodevice_scope_forces_interface_route() {
+        // 双接口：if1 有 10.0.1.0/24 直连 + 默认路由经 gw1；if2 有 10.0.2.0/24 直连 + 默认路由经 gw2。
+        // SO_BINDTODEVICE（interface_scope）应强制路由选择绑定接口。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![interface(1), interface(2)],
+            alloc::vec![
+                AddressEntry {
+                    interface: InterfaceId(1),
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 15)),
+                    prefix_len: 24,
+                    primary: true,
+                },
+                AddressEntry {
+                    interface: InterfaceId(2),
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
+                    prefix_len: 24,
+                    primary: true,
+                },
+            ],
+            alloc::vec![
+                RouteEntry {
+                    table: 0,
+                    network: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    prefix_len: 0,
+                    gateway: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1))),
+                    interface: InterfaceId(1),
+                    metric: 0,
+                    mtu: None,
+                },
+                RouteEntry {
+                    table: 0,
+                    network: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    prefix_len: 0,
+                    gateway: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1))),
+                    interface: InterfaceId(2),
+                    metric: 100,
+                    mtu: None,
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let destination = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+
+        // 无 scope：选 metric 更优的 if1。
+        let route = config.route(destination, 0, None, None).unwrap();
+        assert_eq!(route.interface, InterfaceId(1));
+        assert_eq!(route.next_hop, IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)));
+
+        // SO_BINDTODEVICE=eth1：强制 if2 的默认路由。
+        let route = config
+            .route_with_source_policy(destination, 0, None, Some(InterfaceId(2)), false)
+            .unwrap();
+        assert_eq!(route.interface, InterfaceId(2));
+        assert_eq!(route.next_hop, IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)));
+
+        // 绑定到不存在的接口：NoRoute。
+        assert_eq!(
+            config.route_with_source_policy(destination, 0, None, Some(InterfaceId(9)), false),
+            Err(ConfigError::NoRoute)
+        );
+    }
+
+    #[test]
+    fn bindtodevice_scope_keeps_connected_route() {
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![interface(1), interface(2)],
+            alloc::vec![
+                AddressEntry {
+                    interface: InterfaceId(1),
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 15)),
+                    prefix_len: 24,
+                    primary: true,
+                },
+                AddressEntry {
+                    interface: InterfaceId(2),
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
+                    prefix_len: 24,
+                    primary: true,
+                },
+            ],
+            alloc::vec![
+                RouteEntry {
+                    table: 0,
+                    network: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 0)),
+                    prefix_len: 24,
+                    gateway: None,
+                    interface: InterfaceId(1),
+                    metric: 0,
+                    mtu: None,
+                },
+                RouteEntry {
+                    table: 0,
+                    network: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 0)),
+                    prefix_len: 24,
+                    gateway: None,
+                    interface: InterfaceId(2),
+                    metric: 0,
+                    mtu: None,
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        // 绑到 if2 时，去往 10.0.2.5 走 if2 直连路由。
+        let destination = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 5));
+        let route = config
+            .route_with_source_policy(destination, 0, None, Some(InterfaceId(2)), false)
+            .unwrap();
+        assert_eq!(route.interface, InterfaceId(2));
+        assert_eq!(route.next_hop, destination);
+        assert_eq!(route.source, IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)));
     }
 }

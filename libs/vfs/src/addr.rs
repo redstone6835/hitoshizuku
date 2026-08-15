@@ -9,6 +9,8 @@ use net::{Endpoint, IpAddr, Ipv4Addr, Ipv6Addr};
 pub const AF_UNSPEC: u16 = 0;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
+pub const AF_NETLINK: u16 = 16;
+pub const AF_PACKET: u16 = 17;
 
 const SOCKADDR_IN_SIZE: usize = 16;
 const SOCKADDR_IN6_SIZE: usize = 28;

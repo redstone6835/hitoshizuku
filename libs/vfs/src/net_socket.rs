@@ -170,6 +170,10 @@ pub struct NetSocketFileOps {
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
     options: Mutex<SocketOptions>,
+    /// SO_ATTACH_FILTER 安装的 cBPF 程序（作用于网络层报文）。
+    filter: Mutex<Option<alloc::sync::Arc<net::bpf::CbpfProgram>>>,
+    /// SO_LOCK_FILTER：禁止替换/卸载过滤器。
+    filter_locked: AtomicBool,
 }
 
 impl net::ReadinessObserver for PollSource {
@@ -437,6 +441,37 @@ impl NetSocketFileOps {
             .map_err(map_socket_error)
     }
 
+    /// sendmsg(MSG_FASTOPEN)：TCP Fast Open 客户端发送（仅 TCP）。
+    pub fn send_fastopen(
+        &self,
+        data: &[u8],
+        peer: net::Endpoint,
+        nonblocking: bool,
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .send_fastopen(data, peer, nonblocking, self.send_deadline())
+            .map_err(map_socket_error)
+    }
+
+    /// send(MSG_OOB)：发送单个紧急字节（仅 TCP；UDP 在调用方拒绝）。
+    pub fn send_oob(&self, byte: u8, nonblocking: bool) -> Result<usize, Errno> {
+        self.proxy
+            .send_urgent(byte, nonblocking, self.send_deadline())
+            .map_err(map_socket_error)
+    }
+
+    /// recv(MSG_OOB)：读取紧急字节（仅 TCP）。
+    pub fn recv_oob(
+        &self,
+        peek: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<u8, Errno> {
+        self.proxy
+            .recv_oob(peek, nonblocking, deadline_ns)
+            .map_err(map_socket_error)
+    }
+
     pub fn stream_send_deadline(&self) -> Option<u64> {
         self.send_deadline()
     }
@@ -660,7 +695,50 @@ impl NetSocketFileOps {
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             options: Mutex::new(options),
+            filter: Mutex::new(None),
+            filter_locked: AtomicBool::new(false),
         }
+    }
+
+    /// SO_ATTACH_FILTER：安装 cBPF 过滤器（已锁定则 EPERM）。
+    pub fn attach_filter(&self, program: net::bpf::CbpfProgram) -> Result<(), Errno> {
+        if self.filter_locked.load(Ordering::Acquire) {
+            return Err(Errno::EPERM);
+        }
+        *self.filter.lock() = Some(alloc::sync::Arc::new(program));
+        Ok(())
+    }
+
+    /// SO_DETACH_FILTER：卸载过滤器（已锁定则 EPERM）。
+    pub fn detach_filter(&self) -> Result<(), Errno> {
+        if self.filter_locked.load(Ordering::Acquire) {
+            return Err(Errno::EPERM);
+        }
+        *self.filter.lock() = None;
+        Ok(())
+    }
+
+    /// SO_LOCK_FILTER：锁定当前过滤器，禁止后续替换/卸载。
+    pub fn lock_filter(&self) -> Result<(), Errno> {
+        self.filter_locked.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// SO_GET_FILTER：读取已安装的过滤器指令（未安装返回空）。
+    pub fn get_filter(&self) -> alloc::vec::Vec<net::bpf::CbpfInsn> {
+        self.filter
+            .lock()
+            .as_ref()
+            .map(|program| program.instructions().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// 在接收路径执行过滤器（数据为网络层报文）。返回 false 表示丢弃。
+    pub fn filter_accepts(&self, packet: &[u8]) -> bool {
+        let Some(filter) = self.filter.lock().as_ref().cloned() else {
+            return true;
+        };
+        filter.run(packet) != 0
     }
 }
 
@@ -749,6 +827,10 @@ impl FileOps for NetSocketFileOps {
         if readiness.contains(net::Readiness::READ_HANGUP) {
             ready = ready.with(PollEvents::POLLRDHUP);
         }
+        // 紧急数据到达：Linux 以 POLLPRI 上报（无论 SO_OOBINLINE）。
+        if self.proxy.oob_pending() {
+            ready = ready.with(PollEvents::POLLPRI);
+        }
         ready.intersect(
             interest
                 .with(PollEvents::POLLERR)
@@ -795,6 +877,11 @@ impl FileOps for NetSocketFileOps {
         self.nonblock.store(flags.nonblock, Ordering::Relaxed);
     }
 
+    /// F_SETOWN：登记紧急数据（SIGURG）接收者。
+    fn set_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.proxy.set_urgent_owner(owner_type, owner_pid);
+    }
+
     fn release(&self) {
         let options = self.options.lock().clone();
         if self.sock_type() == SOCK_STREAM && options.linger_enabled && options.linger_seconds == 0
@@ -822,6 +909,13 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
+        // Linux SIOCATMARK（0x8905）：读指针是否位于 OOB 标记处。
+        const SIOCATMARK: usize = 0x8905;
+        if cmd.raw() == SIOCATMARK {
+            // 读指针是否位于 OOB 标记处（仅 TCP 有语义；其他 socket 返回 0）。
+            let at_mark = self.sock_type() == SOCK_STREAM as u16 && self.proxy.at_oob_mark();
+            return Ok(usize::from(at_mark));
+        }
         dispatch_net_ioctl(cmd.raw() as u32, arg)
     }
 

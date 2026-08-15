@@ -404,6 +404,39 @@ impl FlowShard {
         Ok(id)
     }
 
+    /// TCP Fast Open 主动打开（sendmsg(MSG_FASTOPEN)）。
+    pub fn connect_tcp_fastopen(
+        &mut self,
+        local: Endpoint,
+        remote: Endpoint,
+        path: TcpPath,
+        facade: Arc<SocketFacade>,
+        control_sequence: u64,
+        local_transport: bool,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpBindError> {
+        let id = self.tcp.connect_fastopen(
+            local,
+            remote,
+            path,
+            Arc::clone(&facade),
+            control_sequence,
+            now_ns,
+        )?;
+        facade.publish_binding(
+            OwnerRef::Flow {
+                shard: self.id,
+                flow: id,
+                generation: facade.generation(),
+            },
+            local,
+            Some(remote),
+            Some(path.route.interface),
+        );
+        self.reschedule_tcp(id);
+        Ok(id)
+    }
+
     pub fn close_tcp(&mut self, flow: FlowId, now_ns: u64) {
         if self.tcp.close_flow(flow, now_ns) {
             self.reschedule_tcp(flow);
@@ -834,13 +867,22 @@ impl FlowShard {
             };
             mac_address
         };
-        let packet = match build_udp_packet(
+        let facade = self.udp.facade(flow);
+        let packet = match crate::transport::build_udp_packet_with_options(
             payload,
             route,
             destination,
             endpoint.local.port,
             interface.mac_address,
             destination_mac,
+            facade.as_ref().map_or(64, |facade| facade.ip_hop_limit()),
+            facade
+                .as_ref()
+                .map_or(0, |facade| facade.ip_traffic_class()),
+            false,
+            facade.map_or(crate::ip_options::IpOptions::empty(), |facade| {
+                facade.ip_options()
+            }),
         ) {
             Ok(packet) => packet,
             Err((error, payload)) => {
@@ -1444,6 +1486,7 @@ impl FlowShard {
                 facade.ip_hop_limit()
             },
             traffic_class: facade.ip_traffic_class(),
+            ip_options: facade.ip_options(),
             mark,
             completion: {
                 let completion = CompletionToken(self.next_completion);
@@ -1535,6 +1578,8 @@ impl FlowShard {
             header_included: facade.raw_header_included(),
             hop_limit: facade.ip_hop_limit(),
             traffic_class: facade.ip_traffic_class(),
+            ip_options: facade.ip_options(),
+            ipv6_checksum_offset: facade.ipv6_checksum_offset(),
             completion: {
                 let completion = CompletionToken(self.next_completion);
                 self.next_completion = self.next_completion.wrapping_add(1).max(1);

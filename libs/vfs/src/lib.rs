@@ -27,6 +27,7 @@ pub mod memfd;
 pub mod mount;
 pub mod net_socket;
 pub mod netlink_socket;
+pub mod packet_socket;
 pub mod operation;
 pub mod path;
 pub mod pipe;
