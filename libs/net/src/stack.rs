@@ -2493,6 +2493,23 @@ pub enum NetStackControlCommand {
         now_ns: u64,
         output: Option<RouterSolicitRunOutput>,
     },
+    RunDhcpv6 {
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<Dhcpv6RunOutput>,
+    },
+    HandleDhcpv6Packet {
+        interface: InterfaceId,
+        packet: Option<FrontendPacket>,
+        now_ns: u64,
+        output: Option<Dhcpv6PacketOutput>,
+    },
+    EnableDhcpv6 {
+        interface: InterfaceId,
+        config: *const ConfigSnapshot,
+        now_ns: u64,
+        output: Option<()>,
+    },
     HandleRouterAdvertisement {
         interface: InterfaceId,
         packet: Option<FrontendPacket>,
@@ -2651,6 +2668,67 @@ pub struct DhcpPacketOutput {
     pub lease_change: Option<DhcpLeaseChange>,
 }
 
+/// DHCPv6（RFC 8415）租约。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dhcpv6Lease {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+    pub dns: alloc::vec::Vec<Ipv6Addr>,
+    pub valid_seconds: u32,
+}
+
+pub struct Dhcpv6LeaseChange {
+    pub interface: InterfaceId,
+    pub old: Option<Dhcpv6Lease>,
+    pub new: Option<Dhcpv6Lease>,
+}
+
+pub struct Dhcpv6RunOutput {
+    pub frames: Vec<(InterfaceId, Vec<u8>)>,
+    pub lease_changes: Vec<Dhcpv6LeaseChange>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+pub struct Dhcpv6PacketOutput {
+    pub handled: bool,
+    pub lease_change: Option<Dhcpv6LeaseChange>,
+}
+
+/// DHCPv6 客户端（RFC 8415 §18）。
+struct Dhcpv6Client {
+    interface: InterfaceId,
+    mac_address: [u8; 6],
+    transaction_id: u32,
+    iaid: u32,
+    phase: Dhcpv6Phase,
+    next_action_ns: u64,
+    retry_seconds: u32,
+}
+
+enum Dhcpv6Phase {
+    /// 发送 Solicit，等待 Advertise。
+    Solicit,
+    /// 已选择服务器，发送 Request（携带 server-id 与 IA_NA）。
+    Requesting {
+        server: Ipv6Addr,
+        server_id: alloc::vec::Vec<u8>,
+        address: Option<Ipv6Addr>,
+        prefix_len: u8,
+        valid_seconds: u32,
+        dns: alloc::vec::Vec<Ipv6Addr>,
+    },
+    /// 已获得租约：T1 到期 Renew，T2 到期 Rebind。
+    Bound {
+        server: Ipv6Addr,
+        server_id: alloc::vec::Vec<u8>,
+        address: Ipv6Addr,
+        prefix_len: u8,
+        dns: alloc::vec::Vec<Ipv6Addr>,
+        renew_ns: u64,
+        rebind_ns: u64,
+    },
+}
+
 /// Router Solicitation（RFC 4861 §6.3.7）本轮输出。
 /// RFC 4861 §6.3.7：最多重试次数。
 pub const MAX_ROUTER_SOLICITATIONS: u8 = 3;
@@ -2678,6 +2756,8 @@ pub struct RouterAdvertisementOutput {
     pub mac: Option<[u8; 6]>,
     pub lifetime_seconds: u32,
     pub prefixes: alloc::vec::Vec<SlaacPrefix>,
+    /// M 标志：地址由有状态 DHCPv6 管理（RFC 4861 §4.2）。
+    pub managed: bool,
 }
 
 /// Router Solicitation 重试状态（RFC 4861：最多 3 次，间隔 1s/2s/4s）。
@@ -2703,6 +2783,8 @@ pub struct NetStackControlPlane {
     dhcp_disabled: bool,
     /// IPv6 Router Solicitation（无默认路由器时发现路由器）。
     router_solicits: Mutex<alloc::vec::Vec<RouterSolicitState>>,
+    /// DHCPv6 客户端（RA M 标志启用）。
+    dhcpv6: Mutex<alloc::vec::Vec<Dhcpv6Client>>,
     multicast_refs: Mutex<BTreeMap<(InterfaceId, IpAddr), usize>>,
     multicast_bindings: Mutex<BTreeMap<(SocketId, MulticastMembership), InterfaceId>>,
 }
@@ -2731,6 +2813,7 @@ impl NetStackControlPlane {
             dhcp: Mutex::new(Vec::new()),
             dhcp_disabled,
             router_solicits: Mutex::new(Vec::new()),
+            dhcpv6: Mutex::new(Vec::new()),
             multicast_refs: Mutex::new(BTreeMap::new()),
             multicast_bindings: Mutex::new(BTreeMap::new()),
         }
@@ -2954,6 +3037,220 @@ impl NetStackControlPlane {
         }
     }
 
+    /// 启动/确保 DHCPv6 客户端（RA M 标志触发）。
+    fn enable_dhcpv6(&self, interface: InterfaceId, config: &ConfigSnapshot, now_ns: u64) {
+        let mut clients = self.dhcpv6.lock();
+        if clients.iter().any(|client| client.interface == interface) {
+            return;
+        }
+        let Some(snapshot) = config.interfaces.iter().find(|entry| entry.id == interface) else {
+            return;
+        };
+        if snapshot.loopback || !snapshot.running || snapshot.mac_address == [0; 6] {
+            return;
+        }
+        let mut transaction_id = interface.0.wrapping_mul(0x9e37_79b9);
+        for byte in snapshot.mac_address {
+            transaction_id = transaction_id.rotate_left(5) ^ u32::from(byte);
+        }
+        clients.push(Dhcpv6Client {
+            interface,
+            mac_address: snapshot.mac_address,
+            transaction_id: (transaction_id.max(1)) & 0x00ff_ffff,
+            iaid: transaction_id.max(1),
+            phase: Dhcpv6Phase::Solicit,
+            next_action_ns: now_ns,
+            retry_seconds: 1,
+        });
+    }
+
+    fn run_dhcpv6(&self, config: &ConfigSnapshot, now_ns: u64) -> Dhcpv6RunOutput {
+        let mut dhcpv6 = self.dhcpv6.lock();
+        let mut frames = Vec::new();
+        let mut changes = Vec::new();
+        let mut index = 0;
+        while index < dhcpv6.len() {
+            let client = &mut dhcpv6[index];
+            if client.next_action_ns > now_ns {
+                index += 1;
+                continue;
+            }
+            let retry = client.retry_seconds.clamp(1, 64);
+            client.next_action_ns =
+                now_ns.saturating_add(u64::from(retry).saturating_mul(1_000_000_000));
+            client.retry_seconds = retry.saturating_mul(2).min(64);
+            match &client.phase {
+                Dhcpv6Phase::Solicit => {
+                    if let Some(frame) = build_dhcpv6_frame(client, config, 1, None, None) {
+                        frames.push((client.interface, frame));
+                    }
+                    index += 1;
+                }
+                Dhcpv6Phase::Requesting {
+                    server,
+                    server_id,
+                    address,
+                    ..
+                } => {
+                    if let Some(frame) =
+                        build_dhcpv6_frame(client, config, 3, Some(server_id), *address)
+                    {
+                        frames.push((client.interface, frame));
+                    }
+                    let _ = server;
+                    index += 1;
+                }
+                Dhcpv6Phase::Bound {
+                    server,
+                    server_id,
+                    address,
+                    renew_ns,
+                    rebind_ns,
+                    ..
+                } => {
+                    if now_ns >= *rebind_ns {
+                        // Rebind（type 4，不带 server-id）。
+                        if let Some(frame) =
+                            build_dhcpv6_frame(client, config, 4, None, Some(*address))
+                        {
+                            frames.push((client.interface, frame));
+                        }
+                    } else if now_ns >= *renew_ns {
+                        // Renew（type 3，带 server-id）。
+                        if let Some(frame) =
+                            build_dhcpv6_frame(client, config, 3, Some(server_id), Some(*address))
+                        {
+                            frames.push((client.interface, frame));
+                        }
+                    }
+                    let _ = server;
+                    index += 1;
+                }
+            }
+        }
+        Dhcpv6RunOutput {
+            frames,
+            lease_changes: changes,
+            next_deadline_ns: dhcpv6.iter().map(|client| client.next_action_ns).min(),
+        }
+    }
+
+    fn handle_dhcpv6_packet(
+        &self,
+        interface: InterfaceId,
+        packet: &FrontendPacket,
+        now_ns: u64,
+    ) -> Dhcpv6PacketOutput {
+        let Some(reply) = parse_dhcpv6_reply(packet) else {
+            return Dhcpv6PacketOutput {
+                handled: false,
+                lease_change: None,
+            };
+        };
+        let mut dhcpv6 = self.dhcpv6.lock();
+        let Some(client) = dhcpv6.iter_mut().find(|client| {
+            client.interface == interface && client.transaction_id == reply.transaction_id
+        }) else {
+            return Dhcpv6PacketOutput {
+                handled: false,
+                lease_change: None,
+            };
+        };
+        let mut change = None;
+        match reply.message_type {
+            2 => {
+                // Advertise → Request。
+                if !matches!(client.phase, Dhcpv6Phase::Solicit) || reply.server_id.is_empty() {
+                    return Dhcpv6PacketOutput {
+                        handled: true,
+                        lease_change: None,
+                    };
+                }
+                let IpAddr::V6(server) = packet
+                    .parsed
+                    .ip
+                    .map(|ip| ip.source)
+                    .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+                else {
+                    return Dhcpv6PacketOutput {
+                        handled: true,
+                        lease_change: None,
+                    };
+                };
+                client.phase = Dhcpv6Phase::Requesting {
+                    server,
+                    server_id: reply.server_id.clone(),
+                    address: reply.address,
+                    prefix_len: 64,
+                    valid_seconds: reply.valid_seconds,
+                    dns: reply.dns.clone(),
+                };
+                client.next_action_ns = now_ns;
+                client.retry_seconds = 1;
+            }
+            7 => {
+                // Reply → Bound / 续约更新。
+                let (requesting_prefix, bound_prefix) = match &client.phase {
+                    Dhcpv6Phase::Requesting { prefix_len, .. } => (Some(*prefix_len), None),
+                    Dhcpv6Phase::Bound { prefix_len, .. } => (None, Some(*prefix_len)),
+                    _ => (None, None),
+                };
+                if let Some(prefix_len) = requesting_prefix.or(bound_prefix) {
+                    let old_address = match &client.phase {
+                        Dhcpv6Phase::Bound { address, .. } => Some(*address),
+                        _ => None,
+                    };
+                    let lease = Dhcpv6Lease {
+                        address: reply
+                            .address
+                            .unwrap_or(old_address.unwrap_or(Ipv6Addr::UNSPECIFIED)),
+                        prefix_len,
+                        dns: reply.dns.clone(),
+                        valid_seconds: reply.valid_seconds,
+                    };
+                    change = Some(Dhcpv6LeaseChange {
+                        interface,
+                        old: None,
+                        new: Some(lease.clone()),
+                    });
+                    let t1 = if reply.t1_seconds != 0 {
+                        reply.t1_seconds
+                    } else {
+                        reply.valid_seconds / 2
+                    };
+                    let t2 = if reply.t2_seconds != 0 {
+                        reply.t2_seconds
+                    } else {
+                        (reply.valid_seconds * 4) / 5
+                    };
+                    client.phase = Dhcpv6Phase::Bound {
+                        server: Ipv6Addr::UNSPECIFIED,
+                        server_id: alloc::vec::Vec::new(),
+                        address: lease.address,
+                        prefix_len,
+                        dns: reply.dns.clone(),
+                        renew_ns: now_ns
+                            .saturating_add(u64::from(t1).saturating_mul(1_000_000_000)),
+                        rebind_ns: now_ns
+                            .saturating_add(u64::from(t2).saturating_mul(1_000_000_000)),
+                    };
+                }
+                client.next_action_ns = now_ns.saturating_add(1_000_000_000);
+                client.retry_seconds = 1;
+            }
+            _ => {
+                return Dhcpv6PacketOutput {
+                    handled: true,
+                    lease_change: None,
+                };
+            }
+        }
+        Dhcpv6PacketOutput {
+            handled: true,
+            lease_change: change,
+        }
+    }
+
     fn run_router_solicit(&self, now_ns: u64) -> RouterSolicitRunOutput {
         let mut router_solicits = self.router_solicits.lock();
         let mut probes = Vec::new();
@@ -2997,6 +3294,7 @@ impl NetStackControlPlane {
             mac: None,
             lifetime_seconds: 0,
             prefixes: Vec::new(),
+            managed: false,
         };
         let Some(ip) = packet.parsed.ip else {
             return empty;
@@ -3016,6 +3314,8 @@ impl NetStackControlPlane {
             return empty;
         }
         let lifetime_seconds = u32::from(u16::from_be_bytes([header[6], header[7]]));
+        // M 标志（RFC 4861 §4.2：flags 字节 bit7）。
+        let managed = header[5] & 0x80 != 0;
         let mut mac = None;
         let mut prefixes = Vec::new();
         let mut cursor = offset + 16;
@@ -3064,6 +3364,7 @@ impl NetStackControlPlane {
             mac,
             lifetime_seconds,
             prefixes,
+            managed,
         }
     }
 
@@ -3235,6 +3536,9 @@ impl NetStackControlPlane {
         self.router_solicits
             .lock()
             .retain(|state| state.interface != interface);
+        self.dhcpv6
+            .lock()
+            .retain(|client| client.interface != interface);
         let mut dhcp = self.dhcp.lock();
         let index = dhcp
             .iter()
@@ -3532,6 +3836,173 @@ fn parse_dhcp_reply(packet: &FrontendPacket) -> Option<DhcpReply> {
     (reply.message_type != 0).then_some(reply)
 }
 
+struct Dhcpv6Reply {
+    message_type: u8,
+    transaction_id: u32,
+    server_id: Vec<u8>,
+    address: Option<Ipv6Addr>,
+    valid_seconds: u32,
+    t1_seconds: u32,
+    t2_seconds: u32,
+    dns: Vec<Ipv6Addr>,
+}
+
+/// 构建 DHCPv6 客户端帧（Solicit/Request/Renew/Rebind，RFC 8415 §7）。
+fn build_dhcpv6_frame(
+    client: &Dhcpv6Client,
+    config: &ConfigSnapshot,
+    message_type: u8,
+    server_id: Option<&[u8]>,
+    address: Option<Ipv6Addr>,
+) -> Option<Vec<u8>> {
+    let snapshot = config
+        .interfaces
+        .iter()
+        .find(|entry| entry.id == client.interface)?;
+    let IpAddr::V6(source) = config.addresses.iter().find_map(|entry| {
+        (entry.interface == client.interface && matches!(entry.address, IpAddr::V6(_)))
+            .then_some(entry.address)
+    })?
+    else {
+        return None;
+    };
+    let mut payload = Vec::with_capacity(64);
+    payload.push(message_type);
+    payload.extend_from_slice(&client.transaction_id.to_be_bytes()[1..]);
+    // Client Identifier（option 1，DUID-LL：type 3，hw-type 1，MAC，共 10 字节）。
+    payload.extend_from_slice(&[0, 1, 0, 10, 0, 3, 0, 1]);
+    payload.extend_from_slice(&client.mac_address);
+    // Server Identifier（option 2；Rebind 不带）。
+    if let Some(server_id) = server_id {
+        payload.extend_from_slice(&[0, 2]);
+        payload.extend_from_slice(&(server_id.len() as u16).to_be_bytes());
+        payload.extend_from_slice(server_id);
+    }
+    // IA_NA（option 3）：iaid + t1 + t2 + IAADDR（option 5）。
+    let preferred: u32 = if address.is_some() { 0xffff_ffff } else { 0 };
+    let valid: u32 = if address.is_some() { 0xffff_ffff } else { 0 };
+    payload.extend_from_slice(&[0, 3, 0, 40]);
+    payload.extend_from_slice(&client.iaid.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&[0, 5, 0, 24]);
+    payload.extend_from_slice(&address.unwrap_or(Ipv6Addr::UNSPECIFIED).0);
+    payload.extend_from_slice(&preferred.to_be_bytes());
+    payload.extend_from_slice(&valid.to_be_bytes());
+    if message_type == 1 {
+        // Option Request Option（option 6）：DNS servers（23）、domain（24）。
+        payload.extend_from_slice(&[0, 6, 0, 4, 0, 23, 0, 24]);
+    }
+    // Elapsed Time（option 8）。
+    payload.extend_from_slice(&[0, 8, 0, 2, 0, 0]);
+    let udp_len = 8 + payload.len();
+    let mut frame = alloc::vec![0; 14 + 40 + udp_len];
+    // ff02::1:2 组播 MAC。
+    frame[0..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 0x02]);
+    frame[6..12].copy_from_slice(&snapshot.mac_address);
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    frame[18..20].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    frame[20] = 17;
+    frame[21] = 255;
+    frame[22..38].copy_from_slice(&source.0);
+    frame[38..54].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    // UDP：客户端 546 → 服务器 547。
+    frame[54..56].copy_from_slice(&546u16.to_be_bytes());
+    frame[56..58].copy_from_slice(&547u16.to_be_bytes());
+    frame[58..60].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    frame[62..].copy_from_slice(&payload);
+    let chain = PacketChain::from_owned(frame.clone());
+    let destination = Ipv6Addr([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    let checksum = crate::pipeline::transport_checksum(
+        &chain,
+        54,
+        udp_len,
+        IpAddr::V6(source),
+        IpAddr::V6(destination),
+        17,
+    )
+    .ok()?;
+    frame[60..62].copy_from_slice(&checksum.to_be_bytes());
+    Some(frame)
+}
+
+/// 解析 DHCPv6 应答（Advertise/Reply，RFC 8415 §7）。
+fn parse_dhcpv6_reply(packet: &FrontendPacket) -> Option<Dhcpv6Reply> {
+    let udp = packet.parsed.udp?;
+    if udp.source_port != 547 || udp.destination_port != 546 || udp.payload_len < 12 {
+        return None;
+    }
+    let mut payload = alloc::vec![0; usize::from(udp.payload_len)];
+    packet
+        .chain
+        .copy_out(usize::from(udp.payload_offset), &mut payload)
+        .ok()?;
+    let message_type = payload[0];
+    if !matches!(message_type, 2 | 7) {
+        return None;
+    }
+    let transaction_id = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+    let mut reply = Dhcpv6Reply {
+        message_type,
+        transaction_id,
+        server_id: Vec::new(),
+        address: None,
+        valid_seconds: 0,
+        t1_seconds: 0,
+        t2_seconds: 0,
+        dns: Vec::new(),
+    };
+    let mut cursor = 4usize;
+    while cursor + 4 <= payload.len() {
+        let code = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+        let len = usize::from(u16::from_be_bytes([
+            payload[cursor + 2],
+            payload[cursor + 3],
+        ]));
+        if cursor + 4 + len > payload.len() {
+            break;
+        }
+        let option = &payload[cursor + 4..cursor + 4 + len];
+        match code {
+            2 => reply.server_id = option.to_vec(),
+            3 => {
+                // IA_NA：iaid(4) + t1(4) + t2(4) + 子选项。
+                if len >= 12 {
+                    reply.t1_seconds = u32::from_be_bytes(option[4..8].try_into().ok()?);
+                    reply.t2_seconds = u32::from_be_bytes(option[8..12].try_into().ok()?);
+                    let mut sub = 12usize;
+                    while sub + 4 <= option.len() {
+                        let sub_code = u16::from_be_bytes([option[sub], option[sub + 1]]);
+                        let sub_len =
+                            usize::from(u16::from_be_bytes([option[sub + 2], option[sub + 3]]));
+                        if sub + 4 + sub_len > option.len() {
+                            break;
+                        }
+                        if sub_code == 5 && sub_len >= 24 {
+                            // IAADDR：地址(16) + preferred(4) + valid(4)。
+                            reply.address =
+                                Some(Ipv6Addr(option[sub + 4..sub + 20].try_into().ok()?));
+                            reply.valid_seconds =
+                                u32::from_be_bytes(option[sub + 24..sub + 28].try_into().ok()?);
+                        }
+                        sub += 4 + sub_len;
+                    }
+                }
+            }
+            23 => {
+                // DNS servers：16 字节一组。
+                for chunk in option.chunks_exact(16) {
+                    reply.dns.push(Ipv6Addr(chunk.try_into().ok()?));
+                }
+            }
+            _ => {}
+        }
+        cursor += 4 + len;
+    }
+    Some(reply)
+}
+
 fn ipv4_mask_prefix(mask: Ipv4Addr) -> Option<u8> {
     let value = mask.as_u32();
     let prefix = value.leading_ones() as u8;
@@ -3639,6 +4110,43 @@ pub fn dispatch_control_plane_call(
         }
         NetStackControlCommand::RunRouterSolicit { now_ns, output } => {
             *output = Some(plane.run_router_solicit(*now_ns));
+        }
+        NetStackControlCommand::RunDhcpv6 {
+            config,
+            now_ns,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return;
+            }
+            // Safety: config 只在同步 control-call 期间借用。
+            let config = unsafe { &**config };
+            *output = Some(plane.run_dhcpv6(config, *now_ns));
+        }
+        NetStackControlCommand::HandleDhcpv6Packet {
+            interface,
+            packet,
+            now_ns,
+            output,
+        } => {
+            let Some(packet) = packet.as_ref() else {
+                return;
+            };
+            *output = Some(plane.handle_dhcpv6_packet(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::EnableDhcpv6 {
+            interface,
+            config,
+            now_ns,
+            output,
+        } => {
+            if config.is_null() || !config.is_aligned() {
+                return;
+            }
+            // Safety: config 只在同步 control-call 期间借用。
+            let config = unsafe { &**config };
+            plane.enable_dhcpv6(*interface, config, *now_ns);
+            *output = Some(());
         }
         NetStackControlCommand::HandleRouterAdvertisement {
             interface,
@@ -6514,6 +7022,164 @@ mod tests {
             1,
             "重复地址只排一次"
         );
+    }
+
+    #[test]
+    fn dhcpv6_reply_parser_extracts_address_and_dns() {
+        let server_mac = [0x02, 0, 0, 0, 0, 0x02];
+        let server = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let offered = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ]);
+        let dns = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ]);
+        let packet = build_dhcpv6_reply_frame(7, 0x123456, server_mac, server, offered, dns, 3600);
+        let reply = parse_dhcpv6_reply(&packet).expect("解析应答");
+        assert_eq!(reply.transaction_id, 0x123456);
+        assert_eq!(reply.address, Some(offered));
+        assert_eq!(reply.valid_seconds, 3600);
+        assert_eq!(reply.dns, alloc::vec![dns]);
+    }
+
+    /// 测试辅助：构造 DHCPv6 服务器应答帧（Advertise/Reply）。
+    fn build_dhcpv6_reply_frame(
+        message_type: u8,
+        transaction_id: u32,
+        server_mac: [u8; 6],
+        server: Ipv6Addr,
+        address: Ipv6Addr,
+        dns: Ipv6Addr,
+        valid_seconds: u32,
+    ) -> FrontendPacket {
+        let mut payload = Vec::new();
+        payload.push(message_type);
+        payload.extend_from_slice(&transaction_id.to_be_bytes()[1..]);
+        // Server Identifier（DUID-LL，10 字节）。
+        payload.extend_from_slice(&[0, 2, 0, 10, 0, 3, 0, 1]);
+        payload.extend_from_slice(&server_mac);
+        // IA_NA：t1/t2 + IAADDR。
+        payload.extend_from_slice(&[0, 3, 0, 40]);
+        payload.extend_from_slice(&[0, 0, 0, 1]); // iaid
+        payload.extend_from_slice(&(valid_seconds / 2).to_be_bytes());
+        payload.extend_from_slice(&((valid_seconds * 4) / 5).to_be_bytes());
+        payload.extend_from_slice(&[0, 5, 0, 24]);
+        payload.extend_from_slice(&address.0);
+        payload.extend_from_slice(&valid_seconds.to_be_bytes());
+        payload.extend_from_slice(&valid_seconds.to_be_bytes());
+        // DNS servers。
+        payload.extend_from_slice(&[0, 23, 0, 16]);
+        payload.extend_from_slice(&dns.0);
+        let udp_len = 8 + payload.len();
+        let mut frame = alloc::vec![0; 14 + 40 + udp_len];
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[20] = 17;
+        frame[22..38].copy_from_slice(&server.0);
+        frame[54..56].copy_from_slice(&547u16.to_be_bytes());
+        frame[56..58].copy_from_slice(&546u16.to_be_bytes());
+        frame[58..60].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[62..].copy_from_slice(&payload);
+        FrontendPacket {
+            chain: crate::buf::PacketChain::from_owned(frame),
+            parsed: crate::pipeline::ParsedPacket {
+                ethernet: crate::pipeline::EthernetHeader {
+                    destination: [0x33, 0x33, 0, 0, 0, 0x02],
+                    source: server_mac,
+                    ethertype: 0x86dd,
+                },
+                ip: Some(crate::pipeline::IpPacket {
+                    source: IpAddr::V6(server),
+                    destination: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    next_header: 17,
+                    header_len: 40,
+                    payload_offset: 54,
+                    payload_len: udp_len as u32,
+                    hop_limit: 255,
+                    traffic_class: 0,
+                    fragment: None,
+                }),
+                tcp: None,
+                udp: Some(crate::pipeline::UdpPacket {
+                    source_port: 547,
+                    destination_port: 546,
+                    payload_offset: 62,
+                    payload_len: payload.len() as u16,
+                }),
+                flow: None,
+                rss_hash: None,
+                disposition: crate::pipeline::FrontendDisposition::Udp,
+            },
+            metadata: crate::buf::PacketMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn dhcpv6_solicit_request_reply_roundtrip() {
+        // DHCPv6 端到端（控制面内）：Solicit → Advertise → Request → Reply → Bound。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            alloc::vec![crate::control::AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V6(Ipv6Addr([
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ])),
+                prefix_len: 64,
+                primary: true,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        plane.enable_dhcpv6(InterfaceId(1), &config, 100);
+        // Solicit 帧发出。
+        let solicit = plane.run_dhcpv6(&config, 100);
+        assert_eq!(solicit.frames.len(), 1);
+        let frame = &solicit.frames[0].1;
+        assert_eq!(frame[62], 1, "Solicit 消息类型");
+        assert_eq!(frame[56..58], 547u16.to_be_bytes(), "发往服务器端口");
+        // 构造 Advertise 应答。
+        let transaction_id = u32::from_be_bytes([0, frame[63], frame[64], frame[65]]);
+        let server_mac = [0x02, 0, 0, 0, 0, 0x02];
+        let server = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let offered = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ]);
+        let dns = Ipv6Addr([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ]);
+        let reply =
+            build_dhcpv6_reply_frame(2, transaction_id, server_mac, server, offered, dns, 3600);
+        let advertise = plane.handle_dhcpv6_packet(InterfaceId(1), &reply, 200);
+        assert!(advertise.handled);
+        assert!(advertise.lease_change.is_none(), "Advertise 不安装租约");
+        // Request 发出。
+        let request = plane.run_dhcpv6(&config, 200);
+        assert_eq!(request.frames.len(), 1);
+        let frame = &request.frames[0].1;
+        assert_eq!(frame[62], 3, "Request 消息类型");
+        // 服务器 Reply。
+        let reply =
+            build_dhcpv6_reply_frame(7, transaction_id, server_mac, server, offered, dns, 3600);
+        let bound = plane.handle_dhcpv6_packet(InterfaceId(1), &reply, 300);
+        assert!(bound.handled);
+        let lease = bound.lease_change.unwrap().new.unwrap();
+        assert_eq!(lease.address, offered);
+        assert_eq!(lease.dns, alloc::vec![dns]);
+        assert_eq!(lease.valid_seconds, 3600);
+        // T1 = 3600/2 = 1800s：到期后 Renew（type 3）。
+        let renew = plane.run_dhcpv6(&config, 1_800_000_000_300);
+        assert_eq!(renew.frames.len(), 1);
+        assert_eq!(renew.frames[0].1[62], 3, "T1 续约发 Renew");
     }
 
     #[test]

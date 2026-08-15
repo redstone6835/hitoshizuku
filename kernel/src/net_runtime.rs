@@ -3393,6 +3393,11 @@ enum TurnControlMeta {
         interface: InterfaceId,
     },
     AddDadState,
+    Dhcpv6,
+    Dhcpv6Packet {
+        interface: InterfaceId,
+    },
+    EnableDhcpv6,
     RemoveAutoconfigInterface,
     ReleaseBinding {
         facade: Option<Arc<SocketFacade>>,
@@ -5368,6 +5373,15 @@ impl NetWorkerContext {
                 output: None,
             });
         self.turn_control_meta.push(TurnControlMeta::RouterSolicit);
+        // DHCPv6（RA M 标志启用的接口）。
+        self.turn_control_commands
+            .0
+            .push(NetStackControlCommand::RunDhcpv6 {
+                config: config as *const _,
+                now_ns,
+                output: None,
+            });
+        self.turn_control_meta.push(TurnControlMeta::Dhcpv6);
     }
 
     fn finish_dad_turn(&mut self, output: net::stack::DadRunOutput) -> Option<u64> {
@@ -5543,6 +5557,18 @@ impl NetWorkerContext {
         if output.router.is_unspecified() {
             return;
         }
+        // M 标志：地址由有状态 DHCPv6 管理 → 启动客户端。
+        if output.managed {
+            self.turn_control_commands
+                .0
+                .push(NetStackControlCommand::EnableDhcpv6 {
+                    interface,
+                    config: config as *const _,
+                    now_ns: sched::now_ns_direct(),
+                    output: None,
+                });
+            self.turn_control_meta.push(TurnControlMeta::EnableDhcpv6);
+        }
         let expires_ns = if output.lifetime_seconds == 0 {
             0
         } else {
@@ -5651,6 +5677,115 @@ impl NetWorkerContext {
             if self.config.publish(next).is_ok() {
                 self.emit_interface_multicast_reports(interface);
             }
+        }
+    }
+
+    /// DHCPv6 turn 收尾：发出帧、应用租约变更（地址经 DAD 后安装）。
+    fn finish_dhcpv6_turn(
+        &mut self,
+        output: net::stack::Dhcpv6RunOutput,
+        config: &ConfigSnapshot,
+    ) -> Option<u64> {
+        for change in output.lease_changes {
+            self.apply_dhcpv6_lease(change.interface, &change, config);
+        }
+        for (interface, frame) in output.frames {
+            self.emit_control_frame(interface, frame);
+        }
+        output.next_deadline_ns
+    }
+
+    /// 应用 DHCPv6 租约：新地址排队 DAD（通过后安装），旧地址回收，DNS 更新。
+    fn apply_dhcpv6_lease(
+        &mut self,
+        interface: InterfaceId,
+        change: &net::stack::Dhcpv6LeaseChange,
+        config: &ConfigSnapshot,
+    ) {
+        let current = self.config.snapshot();
+        let mut addresses = current.addresses.clone();
+        let mut routes = current.routes.entries().to_vec();
+        let mut dns_servers = current.dns_servers.clone();
+        let interface_mtu = config
+            .interfaces
+            .iter()
+            .find(|entry| entry.id == interface)
+            .map(|entry| entry.mtu)
+            .unwrap_or(1500);
+        let mut changed = false;
+        if let Some(old) = change.old.as_ref() {
+            let entry = AddressEntry {
+                interface,
+                address: IpAddr::V6(old.address),
+                prefix_len: old.prefix_len,
+                primary: true,
+            };
+            if let Some(index) = addresses.iter().rposition(|candidate| *candidate == entry) {
+                addresses.remove(index);
+                changed = true;
+            }
+            let onlink = RouteEntry {
+                table: 0,
+                network: IpAddr::V6(ipv6_network(old.address, old.prefix_len)),
+                prefix_len: old.prefix_len,
+                gateway: None,
+                interface,
+                metric: 0,
+                mtu: Some(interface_mtu),
+            };
+            if let Some(index) = routes.iter().rposition(|route| *route == onlink) {
+                routes.remove(index);
+                changed = true;
+            }
+            for server in &old.dns {
+                let address = IpAddr::V6(*server);
+                if let Some(index) = dns_servers.iter().rposition(|entry| *entry == address) {
+                    dns_servers.remove(index);
+                }
+            }
+        }
+        if let Some(new) = change.new.as_ref()
+            && !new.address.is_unspecified()
+        {
+            let present = addresses.iter().any(|entry| {
+                entry.interface == interface && entry.address == IpAddr::V6(new.address)
+            }) || self
+                .slaac_pending
+                .iter()
+                .any(|(candidate, entry, _)| *candidate == interface && *entry == new.address);
+            if !present {
+                // 地址先 DAD（与 SLAAC 同一机制），通过后安装。
+                self.slaac_pending
+                    .push((interface, new.address, new.prefix_len));
+                self.turn_control_commands
+                    .0
+                    .push(NetStackControlCommand::AddDadState {
+                        interface,
+                        address: new.address,
+                        now_ns: sched::now_ns_direct(),
+                        output: None,
+                    });
+                self.turn_control_meta.push(TurnControlMeta::AddDadState);
+                changed = true;
+            }
+            for server in &new.dns {
+                let address = IpAddr::V6(*server);
+                if !dns_servers.contains(&address) {
+                    dns_servers.push(address);
+                }
+            }
+        }
+        if changed
+            && let Ok(next) = ConfigSnapshot::new_with_dns(
+                current.generation.saturating_add(1),
+                current.interfaces.clone(),
+                addresses,
+                routes,
+                current.policy.clone(),
+                dns_servers,
+            )
+        {
+            let _ = self.config.publish(next);
         }
     }
 
@@ -6253,6 +6388,34 @@ impl NetWorkerContext {
                         );
                     }
                     (NetStackControlCommand::AddDadState { .. }, TurnControlMeta::AddDadState) => {}
+                    (
+                        NetStackControlCommand::RunDhcpv6 {
+                            output: Some(output),
+                            ..
+                        },
+                        TurnControlMeta::Dhcpv6,
+                    ) => {
+                        control_deadline =
+                            [control_deadline, self.finish_dhcpv6_turn(output, config)]
+                                .into_iter()
+                                .flatten()
+                                .min();
+                    }
+                    (
+                        NetStackControlCommand::HandleDhcpv6Packet {
+                            output: Some(output),
+                            ..
+                        },
+                        TurnControlMeta::Dhcpv6Packet { interface },
+                    ) => {
+                        if let Some(change) = output.lease_change {
+                            self.apply_dhcpv6_lease(interface, &change, config);
+                        }
+                    }
+                    (
+                        NetStackControlCommand::EnableDhcpv6 { .. },
+                        TurnControlMeta::EnableDhcpv6,
+                    ) => {}
                     (
                         NetStackControlCommand::ObserveDadConflict { .. },
                         TurnControlMeta::DadConflict,
@@ -7760,6 +7923,24 @@ impl NetWorkerContext {
                 interface,
                 local_mac,
             });
+            return;
+        }
+        // DHCPv6：服务器 547 → 客户端 546（控制面解析）。
+        let is_dhcpv6 = packet
+            .parsed
+            .udp
+            .is_some_and(|udp| udp.source_port == 547 && udp.destination_port == 546);
+        if is_dhcpv6 {
+            self.turn_control_commands
+                .0
+                .push(NetStackControlCommand::HandleDhcpv6Packet {
+                    interface,
+                    packet: Some(packet),
+                    now_ns: sched::now_ns_direct(),
+                    output: None,
+                });
+            self.turn_control_meta
+                .push(TurnControlMeta::Dhcpv6Packet { interface });
             return;
         }
         // IPv6 Router Advertisement（ICMPv6 type 134）→ 控制面解析（SLAAC/默认路由）。
