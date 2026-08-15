@@ -2073,13 +2073,91 @@ pub(super) fn sys_personality(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 }
 
 pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const PR_SET_PDEATHSIG: usize = 1;
+    const PR_GET_PDEATHSIG: usize = 2;
+    const PR_GET_DUMPABLE: usize = 3;
+    const PR_SET_DUMPABLE: usize = 4;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_KEEPCAPS: usize = 8;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
+    const PR_GET_SECCOMP: usize = 21;
+    const PR_SET_SECCOMP: usize = 22;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
+    const PR_GET_TSC: usize = 25;
+    const PR_SET_TSC: usize = 26;
+    const PR_GET_SECUREBITS: usize = 27;
+    const PR_SET_SECUREBITS: usize = 28;
     const PR_SET_TIMERSLACK: usize = 29;
     const PR_GET_TIMERSLACK: usize = 30;
+    const PR_SET_MM: usize = 35;
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
+    const PR_SET_NO_NEW_PRIVS: usize = 38;
+    const PR_GET_NO_NEW_PRIVS: usize = 39;
+    const PR_SET_THP_DISABLE: usize = 41;
+    const PR_GET_THP_DISABLE: usize = 42;
+
+    const SECBIT_KEEP_CAPS: u32 = 1 << 0;
+    const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 1;
+    const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+    const SECBIT_NO_SETUID_FIXUP_LOCKED: u32 = 1 << 3;
+    const SECBIT_NOROOT: u32 = 1 << 4;
+    const SECBIT_NOROOT_LOCKED: u32 = 1 << 5;
+    const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+    const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: u32 = 1 << 7;
+    const SECBIT_LOCKED: u32 = SECBIT_KEEP_CAPS_LOCKED
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+    const SECBIT_ALL: u32 = SECBIT_KEEP_CAPS
+        | SECBIT_KEEP_CAPS_LOCKED
+        | SECBIT_NO_SETUID_FIXUP
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NOROOT
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RAISE
+        | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+    let task = ctx.task();
     match ctx.args[0] {
+        PR_SET_PDEATHSIG => {
+            let raw = ctx.args[1] as i32;
+            if raw >= 0 && raw > 64 {
+                return Err(Errno::EINVAL);
+            }
+            task.set_pdeathsig(raw);
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.pdeathsig() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(task.dumpable() as usize),
+        PR_SET_DUMPABLE => {
+            let value = ctx.args[1];
+            if value > 2 {
+                return Err(Errno::EINVAL);
+            }
+            task.set_dumpable(value as u8);
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(task.keepcaps() as usize),
+        PR_SET_KEEPCAPS => {
+            let enabled = ctx.args[1] != 0;
+            let creds = task.credentials();
+            if enabled && creds.euid != Uid::ROOT {
+                return Err(Errno::EPERM);
+            }
+            task.set_keepcaps(enabled);
+            Ok(0)
+        }
         PR_SET_NAME => {
             let name_user = ctx.args[1];
             if name_user == 0 {
@@ -2087,13 +2165,13 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let mut raw = [0u8; sched::TASK_COMM_LEN];
             copy_from_user(name_user, &mut raw).map_err(|e| e.as_errno())?;
-            ctx.task().set_comm(&raw);
+            task.set_comm(&raw);
             Ok(0)
         }
         PR_GET_NAME => {
             let buf = ctx.args[1];
             if buf != 0 {
-                copy_to_user(buf, &ctx.task().comm()).map_err(|e| e.as_errno())?;
+                copy_to_user(buf, &task.comm()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -2102,7 +2180,7 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if !linux_cap_valid(cap) {
                 return Err(Errno::EINVAL);
             }
-            let creds = ctx.task().credentials();
+            let creds = task.credentials();
             Ok(((creds.cap_bset.raw() >> cap) & 1) as usize)
         }
         PR_CAPBSET_DROP => {
@@ -2110,22 +2188,102 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             if !linux_cap_valid(cap) {
                 return Err(Errno::EINVAL);
             }
-            let current = ctx.task().credentials();
+            let current = task.credentials();
             if !current.has_cap(Capability::Setpcap) {
                 return Err(Errno::EPERM);
             }
             let mut new = (*current).clone();
             new.cap_bset = CapSet::from_raw(new.cap_bset.raw() & !(1u64 << cap));
-            install_credentials(ctx.task(), new);
+            install_credentials(task, new);
+            Ok(0)
+        }
+        PR_GET_TSC => Ok(0), // 无 RDTSC 限制需求：保持 enable 状态（Linux 返回 1 = PR_TSC_ENABLE）
+        PR_SET_TSC => {
+            let flag = ctx.args[1];
+            if flag > 1 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
+        PR_GET_SECUREBITS => Ok(task.credentials().securebits as usize),
+        PR_SET_SECUREBITS => {
+            let bits = ctx.args[1] as u32;
+            if bits & !SECBIT_ALL != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let current = task.credentials();
+            if current.securebits & SECBIT_LOCKED != 0 {
+                // 已锁定位不可再改。
+                if current.securebits & SECBIT_LOCKED != bits & SECBIT_LOCKED {
+                    return Err(Errno::EPERM);
+                }
+            }
+            if bits & SECBIT_LOCKED != 0 && !current.has_cap(Capability::Setpcap) {
+                return Err(Errno::EPERM);
+            }
+            let mut new = (*current).clone();
+            new.securebits = bits;
+            install_credentials(task, new);
             Ok(0)
         }
         PR_SET_TIMERSLACK => {
-            ctx.task().set_timer_slack_ns(ctx.args[1] as u64);
+            task.set_timer_slack_ns(ctx.args[1] as u64);
             Ok(0)
         }
-        PR_GET_TIMERSLACK => Ok(ctx.task().timer_slack_ns().min(usize::MAX as u64) as usize),
-        _ => Ok(0),
+        PR_GET_TIMERSLACK => Ok(task.timer_slack_ns().min(usize::MAX as u64) as usize),
+        PR_SET_MM => Err(Errno::EINVAL),
+        PR_SET_CHILD_SUBREAPER => {
+            task.set_subreaper(ctx.args[1] != 0);
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let addr = ctx.args[1];
+            if addr == 0 {
+                return Err(Errno::EFAULT);
+            }
+            copy_to_user(addr, &(task.is_subreaper() as u32).to_le_bytes())
+                .map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if ctx.args[1] != 0 && ctx.args[1] != 1 {
+                return Err(Errno::EINVAL);
+            }
+            if ctx.args[1] == 1 {
+                task.set_no_new_privs(true);
+            }
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(task.no_new_privs() as usize),
+        PR_SET_THP_DISABLE => {
+            if ctx.args[1] > 1 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
+        PR_GET_THP_DISABLE => Ok(0),
+        PR_GET_SECCOMP => Ok(0),
+        PR_SET_SECCOMP => {
+            // 老式 PR_SET_SECCOMP：等价 seccomp(2)。
+            crate::syscalls::process::seccomp_filter_setup(
+                ctx.task(),
+                ctx.args[1],
+                ctx.args[2],
+            )?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
     }
+}
+
+/// 占位：seccomp 过滤器安装（由 seccomp 子系统实现；当前无过滤器时接受
+/// `SECCOMP_MODE_NONE`）。
+pub(super) fn seccomp_filter_setup(
+    _task: &Arc<Task>,
+    _mode: usize,
+    _filter_user: usize,
+) -> Result<(), Errno> {
+    Err(Errno::EINVAL)
 }
 
 pub(super) fn sys_capget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

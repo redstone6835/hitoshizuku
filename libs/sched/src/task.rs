@@ -826,6 +826,14 @@ pub struct Task {
     ptrace_syscall_ret: AtomicI64,
     /// `PR_SET_DUMPABLE` 状态（0/1/2）；ptrace 访问权限使用。
     dumpable: AtomicU8,
+    /// `PR_SET_PDEATHSIG`：父进程退出时投递的信号（0 = 不投递）。
+    pdeathsig: AtomicI32,
+    /// `PR_SET_CHILD_SUBREAPER`：是否收养孤儿。
+    subreaper: AtomicU8,
+    /// `PR_SET_NO_NEW_PRIVS`：禁止 exec 提升权限。
+    no_new_privs: AtomicU8,
+    /// `PR_SET_KEEPCAPS`：setuid 后保留能力位。
+    keepcaps: AtomicU8,
     /// `PTRACE_SINGLESTEP` 补丁法单步：已把断点指令写入目标地址。
     ptrace_singlestep: AtomicU8,
     /// 被替换指令的地址与原指令（32 位）。
@@ -1024,6 +1032,10 @@ impl Task {
             ptrace_syscall_args: Spinlock::new([0; 6]),
             ptrace_syscall_ret: AtomicI64::new(0),
             dumpable: AtomicU8::new(1),
+            pdeathsig: AtomicI32::new(0),
+            subreaper: AtomicU8::new(0),
+            no_new_privs: AtomicU8::new(0),
+            keepcaps: AtomicU8::new(0),
             ptrace_singlestep: AtomicU8::new(0),
             ptrace_singlestep_addr: AtomicUsize::new(0),
             ptrace_singlestep_insn: Spinlock::new(None),
@@ -1474,6 +1486,38 @@ impl Task {
             *self.ptrace_syscall_args.lock(),
             self.ptrace_syscall_ret.load(Ordering::Acquire),
         )
+    }
+
+    pub fn set_pdeathsig(&self, sig: i32) {
+        self.pdeathsig.store(sig, Ordering::Release);
+    }
+
+    pub fn pdeathsig(&self) -> i32 {
+        self.pdeathsig.load(Ordering::Acquire)
+    }
+
+    pub fn set_subreaper(&self, enabled: bool) {
+        self.subreaper.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn is_subreaper(&self) -> bool {
+        self.subreaper.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_no_new_privs(&self, enabled: bool) {
+        self.no_new_privs.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn no_new_privs(&self) -> bool {
+        self.no_new_privs.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_keepcaps(&self, enabled: bool) {
+        self.keepcaps.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn keepcaps(&self) -> bool {
+        self.keepcaps.load(Ordering::Acquire) != 0
     }
 
     pub fn set_dumpable(&self, value: u8) {
