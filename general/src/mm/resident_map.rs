@@ -14,14 +14,14 @@ enum RadixNode<T> {
 
 struct RadixBranches<T> {
     occupied: u64,
-    children: [Option<Box<RadixNode<T>>>; RADIX_SLOTS],
+    children: [MaybeUninit<Box<RadixNode<T>>>; RADIX_SLOTS],
 }
 
 impl<T> RadixBranches<T> {
     fn new() -> Self {
         Self {
             occupied: 0,
-            children: core::array::from_fn(|_| None),
+            children: [const { MaybeUninit::uninit() }; RADIX_SLOTS],
         }
     }
 
@@ -33,24 +33,25 @@ impl<T> RadixBranches<T> {
         if self.occupied & (1u64 << slot) == 0 {
             return None;
         }
-        self.children[slot].as_deref()
+        // Safety: 占用位保证对应槽位已经写入子节点。
+        Some(unsafe { self.children[slot].assume_init_ref().as_ref() })
     }
 
     fn get_mut(&mut self, slot: usize) -> Option<&mut RadixNode<T>> {
         if self.occupied & (1u64 << slot) == 0 {
             return None;
         }
-        self.children[slot].as_deref_mut()
+        // Safety: 占用位保证对应槽位已经写入子节点。
+        Some(unsafe { self.children[slot].assume_init_mut().as_mut() })
     }
 
     fn get_or_insert(&mut self, slot: usize, level: usize) -> &mut RadixNode<T> {
         if self.occupied & (1u64 << slot) == 0 {
-            self.children[slot] = Some(Box::new(RadixNode::new(level)));
+            self.children[slot].write(Box::new(RadixNode::new(level)));
             self.occupied |= 1u64 << slot;
         }
-        self.children[slot]
-            .as_deref_mut()
-            .expect("radix 分支占用位必须对应子节点")
+        // Safety: 缺失槽位在上面完成初始化；已有槽位由占用位保证有效。
+        unsafe { self.children[slot].assume_init_mut().as_mut() }
     }
 
     fn take(&mut self, slot: usize) -> Option<Box<RadixNode<T>>> {
@@ -58,7 +59,17 @@ impl<T> RadixBranches<T> {
             return None;
         }
         self.occupied &= !(1u64 << slot);
-        self.children[slot].take()
+        // Safety: 清除占用位前对应槽位已经初始化。
+        Some(unsafe { self.children[slot].assume_init_read() })
+    }
+}
+
+impl<T> Drop for RadixBranches<T> {
+    fn drop(&mut self) {
+        for slot in occupied_slots(self.occupied) {
+            // Safety: 占用位保证对应槽位已经初始化，析构期间每个槽位只访问一次。
+            unsafe { self.children[slot].assume_init_drop() };
+        }
     }
 }
 
@@ -410,7 +421,7 @@ impl<T> RadixPageMap<T> {
             let RadixNode::Branch(children) = &mut new_root else {
                 unreachable!("radix 根扩展必须创建分支节点");
             };
-            children.children[0] = Some(Box::new(old_root));
+            children.children[0].write(Box::new(old_root));
             children.occupied = 1;
             self.root = new_root;
             self.root_level += 1;
