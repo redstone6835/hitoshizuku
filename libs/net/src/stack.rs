@@ -2266,6 +2266,8 @@ pub enum NetStackFlowCommand {
         facade: Arc<SocketFacade>,
         control_sequence: u64,
         local_transport: bool,
+        /// TCP Fast Open（sendmsg(MSG_FASTOPEN)）：SYN 携带缓存 cookie，数据随 SYN 发出。
+        fastopen: bool,
         now_ns: u64,
         output: Option<Result<FlowId, TcpBindError>>,
     },
@@ -4062,18 +4064,31 @@ pub fn dispatch_flow_shard_command(
             facade,
             control_sequence,
             local_transport,
+            fastopen,
             now_ns,
             output,
         } => {
-            *output = Some(shard.connect_tcp(
-                *local,
-                *remote,
-                *path,
-                Arc::clone(facade),
-                *control_sequence,
-                *local_transport,
-                *now_ns,
-            ));
+            *output = Some(if *fastopen {
+                shard.connect_tcp_fastopen(
+                    *local,
+                    *remote,
+                    *path,
+                    Arc::clone(facade),
+                    *control_sequence,
+                    *local_transport,
+                    *now_ns,
+                )
+            } else {
+                shard.connect_tcp(
+                    *local,
+                    *remote,
+                    *path,
+                    Arc::clone(facade),
+                    *control_sequence,
+                    *local_transport,
+                    *now_ns,
+                )
+            });
         }
         NetStackFlowCommand::CloseTcp { flow, now_ns } => {
             reconcile_local_tcp_direct_pair(shard, *flow, *now_ns);

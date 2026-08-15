@@ -126,6 +126,8 @@ pub struct TcpOptions {
     pub sack_permitted: bool,
     pub sack_blocks: [Option<TcpSackBlock>; 4],
     pub timestamp: Option<TcpTimestamp>,
+    /// TCP Fast Open（RFC 7413）cookie：kind 34，4 或 8 字节。
+    pub fastopen_cookie: Option<[u8; 8]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +318,15 @@ fn parse_options(
                     value: u32::from_be_bytes(option[2..6].try_into().unwrap()),
                     echo_reply: u32::from_be_bytes(option[6..10].try_into().unwrap()),
                 });
+            }
+            34 => {
+                // TCP Fast Open cookie（RFC 7413）：4 字节 cookie 补零到 8 字节。
+                if !matches!(len, 6 | 10) || parsed.fastopen_cookie.is_some() {
+                    return Err(DropReason::MalformedTcp);
+                }
+                let mut cookie = [0u8; 8];
+                cookie[8 - (len - 2)..].copy_from_slice(&option[2..len]);
+                parsed.fastopen_cookie = Some(cookie);
             }
             _ => {}
         }

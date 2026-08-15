@@ -464,6 +464,10 @@ struct TcpFlow {
     local_peer_hint: Option<LocalTcpPeerHint>,
     /// 当前紧急字节的绝对序列号（URG 标记；递送时据此剔除/记录）。
     urgent_byte_seq: Option<TcpSequence>,
+    /// TCP Fast Open（RFC 7413）：SYN/SYN-ACK 携带的 cookie。
+    tfo_cookie: Option<[u8; 8]>,
+    /// 服务端收到无效/缺失 TFO cookie 时：丢弃 SYN 载荷（不 ACK，握手后重传）。
+    tfo_drop_syn_data: bool,
 }
 
 impl TcpFlow {
@@ -616,6 +620,8 @@ impl TcpEndpointTable {
             accept_group: None,
             accept_reserved: false,
             urgent_byte_seq: None,
+            tfo_cookie: None,
+            tfo_drop_syn_data: false,
             retransmit: VecDeque::new(),
             unacknowledged_segments: 0,
             retransmitted_segments: 0,
@@ -656,6 +662,132 @@ impl TcpEndpointTable {
         publish_tcp_info(self.flows.get(id).unwrap());
         facade.publish_connecting();
         self.queue_control(id, transmit, now_ns, true);
+        Ok(id)
+    }
+
+    /// TCP Fast Open 主动打开（RFC 7413）：SYN 携带缓存的 cookie，
+    /// 有 cookie 时把 stream_tx 中已排队的数据随 SYN 一起发出。
+    ///
+    /// 控制序列在 SYN 排队后立即完成（sendmsg(MSG_FASTOPEN) 不等握手），
+    /// 与普通 connect 的 pending_connect（建立后完成）不同。
+    pub fn connect_fastopen(
+        &mut self,
+        local: Endpoint,
+        remote: Endpoint,
+        path: TcpPath,
+        facade: Arc<SocketFacade>,
+        control_sequence: u64,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpBindError> {
+        let key = FlowKey::new(remote, local, TransportProtocol::Tcp)
+            .ok_or(TcpBindError::InvalidEndpoint)?;
+        let mss = apply_user_mss(path_mss(path.route.mtu, local.addr), facade.tcp_maxseg());
+        let iss = self.initial_sequence(key, now_ns);
+        let mut machine = TcpStateMachine::new(iss, advertised_window(&facade, 0));
+        let transmit = machine.active_open().unwrap();
+        let local_window_scale = choose_window_scale(facade.receive_window_scale_limit());
+        let initial_window = advertised_window(&facade, local_window_scale);
+        // 客户端缓存的 cookie；无 cookie 时数据留在 stream_tx，握手完成后发送。
+        let tfo_cookie = facade.tfo_cookie();
+        // MSG_FASTOPEN（有排队数据）：SYN 排队即完成控制；TCP_FASTOPEN_CONNECT
+        // （无数据）：保持与普通 connect 一致，建立后完成。
+        let immediate = facade.stream_unsent_len() != 0;
+        let flow = TcpFlow {
+            facade: Arc::clone(&facade),
+            machine,
+            path,
+            remote,
+            local,
+            pending_connect: if immediate {
+                None
+            } else {
+                Some(control_sequence)
+            },
+            accept_group: None,
+            accept_reserved: false,
+            urgent_byte_seq: None,
+            tfo_cookie,
+            tfo_drop_syn_data: false,
+            retransmit: VecDeque::new(),
+            unacknowledged_segments: 0,
+            retransmitted_segments: 0,
+            flight_bytes: 0,
+            reassembly: Vec::new(),
+            reassembly_bytes: 0,
+            deadlines: TcpDeadlines::new(),
+            rtt: RttEstimator::new(),
+            congestion: CongestionControl::new(mss),
+            peer_window: u32::from(u16::MAX),
+            peer_window_scale: 0,
+            local_window_scale,
+            mss,
+            peer_mss: mss,
+            ack_pending: 0,
+            persist_ns: PERSIST_INITIAL_NS,
+            timestamp_enabled: false,
+            timestamp_recent: None,
+            sack_permitted: false,
+            cork_force: false,
+            close_requested: false,
+            listener_key: None,
+            last_activity_ns: now_ns,
+            keepalive_probes: 0,
+            last_advertised_window: initial_window,
+            output_blocked: false,
+            local_transport: false,
+            local_peer_hint: None,
+        };
+        let hash = flow_hash64(rss_hash(&self.rss_key, &key));
+        let id = self
+            .flows
+            .insert_prehashed(key, hash, flow)
+            .map_err(|error| match error {
+                crate::flow::FlowInsertError::Duplicate => TcpBindError::Duplicate,
+                _ => TcpBindError::Full,
+            })?;
+        publish_tcp_info(self.flows.get(id).unwrap());
+        facade.publish_connecting();
+        // 立即完成 sendmsg(MSG_FASTOPEN) 控制：数据是否随 SYN 发出取决于 cookie。
+        let data_sent = if tfo_cookie.is_some() {
+            let unsent = facade.stream_unsent_len();
+            if unsent != 0 {
+                let take = unsent.min(usize::from(mss));
+                if let Some(payload) = facade.take_stream_tx_deferred(take) {
+                    let payload_len = usize::from(payload.len);
+                    // 段序列号为 ISN（SYN 占第一个序列号），载荷从 ISN+1 开始；
+                    // reserve_send 推进 send_next 使重传账本覆盖载荷。
+                    self.flows
+                        .get_mut(id)
+                        .unwrap()
+                        .machine
+                        .reserve_send(payload_len as u32);
+                    let transmit = TcpTransmit {
+                        sequence: transmit.sequence,
+                        acknowledgement: self.flows.get(id).unwrap().machine.receive_next(),
+                        flags: TcpFlags::SYN | TcpFlags::ACK,
+                        window: advertised_window(&facade, local_window_scale),
+                        urgent_pointer: 0,
+                    };
+                    self.queue_transmit(id, transmit, Some(payload), now_ns, false, true);
+                    payload_len
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        // 无 cookie 或没有数据时也要发 SYN（TCP_FASTOPEN_CONNECT 的 SYN 仍带 cookie）。
+        if data_sent == 0 {
+            self.queue_control(id, transmit, now_ns, true);
+        }
+        if immediate {
+            // MSG_FASTOPEN：数据已接受（随 SYN 发出或排队），控制立即完成。
+            facade.complete_control(control_sequence, Ok(()));
+        }
+        // TCP_FASTOPEN_CONNECT：pending_connect 在 on_established 完成控制。
         Ok(id)
     }
 
@@ -1558,6 +1690,21 @@ impl TcpEndpointTable {
         if !group.reserve_syn() {
             return Err(TcpIngressError::FlowTableFull);
         }
+        // TCP Fast Open（RFC 7413）：监听组启用时校验客户端 cookie。
+        // - 有效 cookie：SYN 载荷直接进入流（无需完整三次握手往返）。
+        // - 缺失/无效 cookie：SYN-ACK 携带新 cookie，SYN 载荷丢弃（不 ACK，
+        //   客户端握手完成后按普通数据重传）。
+        let mut tfo_cookie = None;
+        let mut tfo_drop_syn_data = false;
+        if group.tfo_enabled() {
+            match tcp.options.fastopen_cookie {
+                Some(cookie) if cookie == self.fastopen_cookie(key) => {}
+                _ => {
+                    tfo_cookie = Some(self.fastopen_cookie(key));
+                    tfo_drop_syn_data = tcp.payload_len != 0;
+                }
+            }
+        }
         let Some(parent) = group.parent() else {
             group.release_syn();
             return Err(TcpIngressError::NoEndpoint);
@@ -1586,6 +1733,8 @@ impl TcpEndpointTable {
             accept_group: Some(Arc::clone(&group)),
             accept_reserved: false,
             urgent_byte_seq: None,
+            tfo_cookie,
+            tfo_drop_syn_data,
             retransmit: VecDeque::new(),
             unacknowledged_segments: 0,
             retransmitted_segments: 0,
@@ -1706,6 +1855,13 @@ impl TcpEndpointTable {
                 .facade
                 .tcp_keepalive_enabled()
                 .then(|| now_ns.saturating_add(flow.facade.tcp_keepidle_ns()));
+            // TCP Fast Open 客户端：从 SYN-ACK 学习 cookie 并缓存（后续连接复用）。
+            if state_before == TcpState::SynSent
+                && tcp.flags.contains(TcpFlags::SYN)
+                && let Some(cookie) = tcp.options.fastopen_cookie
+            {
+                flow.facade.set_tfo_cookie(cookie);
+            }
         }
         // URG 标记处理（Linux tcp_check_urg）：记录紧急字节位置、唤醒接收端并
         // 触发 SIGURG。非内联模式紧急指针指向紧急数据之后的首字节（RFC 793），
@@ -1790,9 +1946,21 @@ impl TcpEndpointTable {
         }
 
         if !payload.is_empty() {
-            self.receive_payload(id, receive_before, tcp.sequence, payload, now_ns)?;
-            if !self.promote_deferred(id, now_ns) {
-                return Ok(());
+            if self
+                .flows
+                .get(id)
+                .is_some_and(|flow| flow.tfo_drop_syn_data)
+            {
+                // TCP Fast Open 无效 cookie：丢弃 SYN 载荷且不 ACK（客户端在握手
+                // 完成后按普通数据重传，Linux tcp_conn_request 语义）。
+                self.flows.get_mut(id).unwrap().tfo_drop_syn_data = false;
+            } else {
+                // SYN 段的数据从 seq+1 开始（SYN 占用第一个序列号，RFC 793）。
+                let data_sequence = tcp.sequence + u32::from(tcp.flags.contains(TcpFlags::SYN));
+                self.receive_payload(id, receive_before, data_sequence, payload, now_ns)?;
+                if !self.promote_deferred(id, now_ns) {
+                    return Ok(());
+                }
             }
         }
         if tcp.flags.contains(TcpFlags::FIN) {
@@ -2510,6 +2678,15 @@ impl TcpEndpointTable {
         TcpSequence((hash as u32).wrapping_add((now_ns / 64) as u32))
     }
 
+    /// TCP Fast Open cookie：siphash24(四元组, 栈密钥)（对齐 Linux
+    /// tcp_fastopen_cookie_gen 的 SipHash 构造）。
+    fn fastopen_cookie(&self, key: FlowKey) -> [u8; 8] {
+        let mut bytes = [0u8; 36];
+        let len = encode_flow_key(key, &mut bytes);
+        let hash = siphash24(self.isn_key, &bytes[..len]);
+        hash.to_le_bytes()
+    }
+
     fn reap(&mut self, id: FlowId, error: Option<SocketError>) {
         self.quiesce_local_pair(id, 0);
         let Some(key) = self.flows.key(id) else {
@@ -2667,6 +2844,13 @@ fn wire_options(
         options[len..len + 4].copy_from_slice(&[1, 1, 4, 2]);
         parsed.sack_permitted = true;
         len += 4;
+        if let Some(cookie) = flow.tfo_cookie {
+            // TCP Fast Open cookie（kind 34，8 字节）。
+            options[len..len + 2].copy_from_slice(&[34, 10]);
+            options[len + 2..len + 10].copy_from_slice(&cookie);
+            parsed.fastopen_cookie = Some(cookie);
+            len += 10;
+        }
     }
     if flow.timestamp_enabled || flags.contains(TcpFlags::SYN) {
         options[len..len + 2].copy_from_slice(&[1, 1]);
@@ -5365,6 +5549,156 @@ mod tests {
     }
 
     #[test]
+    fn fastopen_server_accepts_valid_cookie_and_delivers_syn_data() {
+        // TCP Fast Open 服务端：有效 cookie 的 SYN 载荷直接进入流，
+        // SYN-ACK 不再携带 cookie。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.listener.set_listener_tfo_enabled(true);
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_123,
+        };
+        let key = FlowKey::new(client_endpoint, server_endpoint, TransportProtocol::Tcp).unwrap();
+        let cookie = table.fastopen_cookie(key);
+        let client = facade(95);
+        client.test_set_stack_generation(1);
+        assert_eq!(client.test_push_stream_tx(b"TFO!"), 4);
+        let payload = client.take_stream_tx_deferred(4).unwrap();
+        let mut tcp = packet(
+            client_endpoint.port,
+            server_endpoint.port,
+            1000,
+            0,
+            TcpFlags::SYN,
+            4,
+        );
+        tcp.options.fastopen_cookie = Some(cookie);
+        let flow = table
+            .ingest_local(
+                InterfaceId(1),
+                path(server_endpoint.addr, client_endpoint.addr),
+                key,
+                tcp,
+                Some(&payload),
+                10_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        assert!(syn_ack.flags.contains(TcpFlags::SYN));
+        assert_eq!(
+            syn_ack.parsed_options.fastopen_cookie, None,
+            "有效 cookie 时 SYN-ACK 不再带 cookie",
+        );
+        // SYN 载荷已进入流。
+        let facade = table.flows.get(flow).unwrap().facade.clone();
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            facade
+                .recv_stream(&mut stream, false, false, false, true, None)
+                .unwrap(),
+            4,
+        );
+        assert_eq!(&stream[..4], b"TFO!");
+    }
+
+    #[test]
+    fn fastopen_server_rejects_invalid_cookie_and_drops_syn_data() {
+        // 无效 cookie：SYN-ACK 携带新 cookie，SYN 载荷被丢弃（握手后重传）。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.listener.set_listener_tfo_enabled(true);
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_124,
+        };
+        let key = FlowKey::new(client_endpoint, server_endpoint, TransportProtocol::Tcp).unwrap();
+        let client = facade(96);
+        client.test_set_stack_generation(1);
+        assert_eq!(client.test_push_stream_tx(b"stale"), 5);
+        let payload = client.take_stream_tx_deferred(5).unwrap();
+        let mut tcp = packet(
+            client_endpoint.port,
+            server_endpoint.port,
+            2000,
+            0,
+            TcpFlags::SYN,
+            5,
+        );
+        // 错误的 cookie。
+        tcp.options.fastopen_cookie = Some([0xaa; 8]);
+        let flow = table
+            .ingest_local(
+                InterfaceId(1),
+                path(server_endpoint.addr, client_endpoint.addr),
+                key,
+                tcp,
+                Some(&payload),
+                10_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        assert_eq!(
+            syn_ack.parsed_options.fastopen_cookie,
+            Some(table.fastopen_cookie(key))
+        );
+        // 载荷被丢弃：流为空。
+        let facade = table.flows.get(flow).unwrap().facade.clone();
+        let mut stream = [0u8; 8];
+        assert_eq!(
+            facade.recv_stream(&mut stream, false, false, false, true, None),
+            Err(SocketError::WouldBlock),
+        );
+    }
+
+    #[test]
+    fn fastopen_server_advertises_cookie_without_client_cookie() {
+        // 无 cookie 的普通 SYN：监听端启用 TFO 时 SYN-ACK 携带新 cookie。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.listener.set_listener_tfo_enabled(true);
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_125,
+        };
+        let key = FlowKey::new(client_endpoint, server_endpoint, TransportProtocol::Tcp).unwrap();
+        let flow = table
+            .ingest_local(
+                InterfaceId(1),
+                path(server_endpoint.addr, client_endpoint.addr),
+                key,
+                packet(
+                    client_endpoint.port,
+                    server_endpoint.port,
+                    3000,
+                    0,
+                    TcpFlags::SYN,
+                    0,
+                ),
+                None,
+                10_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        assert_eq!(
+            syn_ack.parsed_options.fastopen_cookie,
+            Some(table.fastopen_cookie(key))
+        );
+        assert!(table.flows.get(flow).is_some());
+    }
+    #[test]
     fn urgent_byte_in_multi_byte_segment_per_rfc() {
         // 多字节段带 URG（指针 1）：紧急窗口是段首字节（RFC 793 语义：
         // 紧急数据为 [seq, seq+ptr)）。
@@ -5409,5 +5743,156 @@ mod tests {
         );
         assert_eq!(&stream[..2], b"bc");
         assert_eq!(pair.server.recv_oob(false, true, None), Ok(b'X'));
+    }
+
+    #[test]
+    fn fastopen_client_sends_cookie_and_data_in_syn() {
+        // 客户端 MSG_FASTOPEN：SYN 携带缓存 cookie + 数据（端到端第一条连接）。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.listener.set_listener_tfo_enabled(true);
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_126,
+        };
+        let key = FlowKey::new(client_endpoint, server_endpoint, TransportProtocol::Tcp).unwrap();
+        let cookie = table.fastopen_cookie(key);
+        let client = facade(97);
+        client.test_set_stack_generation(1);
+        // 缓存 cookie（此前从 SYN-ACK 学习）。
+        client.set_tfo_cookie(cookie);
+        assert_eq!(client.test_push_stream_tx(b"hello"), 5);
+        let flow = table
+            .connect_fastopen(
+                client_endpoint,
+                server_endpoint,
+                path(client_endpoint.addr, server_endpoint.addr),
+                Arc::clone(&client),
+                1,
+                5_000,
+            )
+            .unwrap();
+        let syn = table.take_output().unwrap();
+        assert!(syn.flags.contains(TcpFlags::SYN));
+        assert_eq!(syn.parsed_options.fastopen_cookie, Some(cookie));
+        assert_eq!(syn.payload.as_ref().unwrap().len, 5, "数据随 SYN 发出");
+        // 控制立即完成（不等握手）：无 pending_connect。
+        assert!(table.flows.get(flow).is_some());
+        assert_eq!(table.flows.get(flow).unwrap().pending_connect, None);
+    }
+
+    #[test]
+    fn fastopen_client_without_cookie_queues_data_and_returns_inprogress() {
+        // 无 cookie：SYN 不带数据，数据排队（sendmsg 返回 EINPROGRESS 语义）。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_127,
+        };
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let client = facade(98);
+        client.test_set_stack_generation(1);
+        assert_eq!(client.test_push_stream_tx(b"queued"), 6);
+        let flow = table
+            .connect_fastopen(
+                client_endpoint,
+                server_endpoint,
+                path(client_endpoint.addr, server_endpoint.addr),
+                Arc::clone(&client),
+                2,
+                5_000,
+            )
+            .unwrap();
+        let syn = table.take_output().unwrap();
+        assert!(syn.flags.contains(TcpFlags::SYN));
+        assert_eq!(syn.parsed_options.fastopen_cookie, None);
+        assert!(syn.payload.is_none(), "无 cookie 时数据不随 SYN");
+        // 数据仍排队，握手完成后 drain_send 发送。
+        assert_eq!(client.stream_unsent_len(), 6);
+        assert!(table.flows.get(flow).is_some());
+    }
+
+    #[test]
+    fn fastopen_client_learns_cookie_from_syn_ack() {
+        // 客户端从 SYN-ACK 学习 cookie 并缓存。
+        let mut table = TcpEndpointTable::new([7; 40], [9; 16]);
+        let pair = establish_local_pair(&mut table, None);
+        pair.listener.set_listener_tfo_enabled(true);
+        let client_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_128,
+        };
+        let server_endpoint = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_100,
+        };
+        let key = FlowKey::new(client_endpoint, server_endpoint, TransportProtocol::Tcp).unwrap();
+        let server_flow = table
+            .ingest_local(
+                InterfaceId(1),
+                path(server_endpoint.addr, client_endpoint.addr),
+                key,
+                packet(
+                    client_endpoint.port,
+                    server_endpoint.port,
+                    4000,
+                    0,
+                    TcpFlags::SYN,
+                    0,
+                ),
+                None,
+                10_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        let cookie = syn_ack.parsed_options.fastopen_cookie.unwrap();
+        // 客户端先建立连接（SynSent），再收到带 cookie 的 SYN-ACK。
+        let client = facade(99);
+        client.test_set_stack_generation(1);
+        let client_flow = table
+            .connect(
+                client_endpoint,
+                server_endpoint,
+                path(client_endpoint.addr, server_endpoint.addr),
+                Arc::clone(&client),
+                5,
+                false,
+                10_500,
+            )
+            .unwrap();
+        table.take_output().unwrap(); // 客户端 SYN
+        let mut syn_ack_packet = packet(
+            server_endpoint.port,
+            client_endpoint.port,
+            syn_ack.sequence.0,
+            syn_ack.acknowledgement.0,
+            syn_ack.flags,
+            0,
+        );
+        syn_ack_packet.options.fastopen_cookie = Some(cookie);
+        table
+            .ingest_local(
+                InterfaceId(1),
+                path(client_endpoint.addr, server_endpoint.addr),
+                FlowKey::new(server_endpoint, client_endpoint, TransportProtocol::Tcp).unwrap(),
+                syn_ack_packet,
+                None,
+                11_000,
+            )
+            .unwrap();
+        assert_eq!(
+            table.flows.get(client_flow).unwrap().facade.tfo_cookie(),
+            Some(cookie),
+            "客户端从 SYN-ACK 学习 TFO cookie",
+        );
+        assert!(table.flows.get(server_flow).is_some());
     }
 }

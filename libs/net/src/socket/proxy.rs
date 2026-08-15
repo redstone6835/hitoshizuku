@@ -517,6 +517,38 @@ impl NetSocketProxy {
         self.facade.ip_options()
     }
 
+    /// sendmsg(MSG_FASTOPEN)：TCP Fast Open 客户端发送。
+    pub fn send_fastopen(
+        &self,
+        data: &[u8],
+        peer: Endpoint,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_backend()?;
+        self.facade
+            .send_fastopen(data, peer, nonblocking, deadline_ns)
+    }
+
+    /// TCP_FASTOPEN（监听端）：启用/关闭 TFO 接受。
+    pub fn set_listener_tfo_enabled(&self, enabled: bool) {
+        self.facade.set_listener_tfo_enabled(enabled);
+    }
+
+    /// TCP_FASTOPEN_CONNECT：后续 connect() 携带缓存的 cookie。
+    pub fn set_tfo_connect_enabled(&self, enabled: bool) {
+        self.facade.set_tfo_connect_enabled(enabled);
+    }
+
+    pub fn tfo_connect_enabled(&self) -> bool {
+        self.facade.tfo_connect_enabled()
+    }
+
+    /// 客户端缓存的 TFO cookie。
+    pub fn tfo_cookie(&self) -> Option<[u8; 8]> {
+        self.facade.tfo_cookie()
+    }
+
     pub fn recv_stream_to(
         &self,
         output_len: usize,
@@ -552,6 +584,11 @@ impl NetSocketProxy {
             self.facade.close();
         }
         self.state.detach();
+    }
+
+    /// TCP 流是否已建立（MSG_FASTOPEN 已连接退化的判断）。
+    pub fn stream_connected(&self) -> bool {
+        self.facade.stream_connected()
     }
 
     pub fn owner(&self) -> OwnerRef {

@@ -625,6 +625,7 @@ fn tcp_options(sidecar: NetStackTcpOptions) -> TcpOptions {
             .then_some(sidecar.window_scale),
         sack_permitted: sidecar.flags & NET_STACK_TCP_OPTION_SACK_PERMITTED != 0,
         sack_blocks,
+        fastopen_cookie: None,
         timestamp: (sidecar.flags & NET_STACK_TCP_OPTION_TIMESTAMP != 0).then_some(TcpTimestamp {
             value: sidecar.timestamp_value,
             echo_reply: sidecar.timestamp_echo_reply,

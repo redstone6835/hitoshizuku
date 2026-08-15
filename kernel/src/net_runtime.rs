@@ -1028,6 +1028,8 @@ enum ControlWork {
         peer: Endpoint,
         path: TcpPath,
         local_transport: bool,
+        /// TCP Fast Open（sendmsg(MSG_FASTOPEN)）。
+        fastopen: bool,
     },
     InstallListener {
         transaction: Arc<ListenerInstall>,
@@ -1088,8 +1090,14 @@ enum ControlWork {
 
 enum TcpReserveNext {
     Bind,
-    Connect { peer: Endpoint, path: TcpPath },
-    Listen { backlog: u32 },
+    Connect {
+        peer: Endpoint,
+        path: TcpPath,
+        fastopen: bool,
+    },
+    Listen {
+        backlog: u32,
+    },
 }
 
 struct InterfaceGoneBarrier {
@@ -2289,7 +2297,11 @@ fn rtentry_sockaddr_ipv4(rt: &[u8; RTENTRY_LEN], offset: usize) -> Result<Ipv4Ad
 fn ipv4_mask_prefix_len(mask: Ipv4Addr) -> Option<u8> {
     let value = mask.as_u32();
     let prefix = value.leading_ones() as u8;
-    let expected = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let expected = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     (value == expected).then_some(prefix)
 }
 
@@ -2311,25 +2323,17 @@ fn ioctl_route_entry(cmd: u32, arg: usize) -> Result<usize, Errno> {
     } else {
         let mut name = [0u8; IFNAMSIZ];
         copy_from_user(dev_ptr, &mut name).map_err(|error| error.as_errno())?;
-        let end = name
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(IFNAMSIZ);
+        let end = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
         if end == 0 {
             return Err(Errno::EINVAL);
         }
         net::interface_by_name(&name[..end]).map_err(|_| Errno::ENODEV)?
     };
     let prefix_len = ipv4_mask_prefix_len(genmask).ok_or(Errno::EINVAL)?;
-    let gateway = (flags & RTF_GATEWAY != 0)
-        .then_some(IpAddr::V4(gateway));
+    let gateway = (flags & RTF_GATEWAY != 0).then_some(IpAddr::V4(gateway));
     if cmd == SIOCADDRT {
         // 重复路由 → EEXIST（Linux rtnetlink/ioctl 语义）。
-        let store = CONFIG_STORE
-            .lock()
-            .as_ref()
-            .cloned()
-            .ok_or(Errno::ENODEV)?;
+        let store = CONFIG_STORE.lock().as_ref().cloned().ok_or(Errno::ENODEV)?;
         let current = store.snapshot();
         let duplicate = current.routes.entries().iter().any(|route| {
             route.table == 0
@@ -2749,9 +2753,7 @@ fn map_config_error(error: net::control::ConfigError) -> i32 {
 }
 
 /// netlink 配置写请求的真正执行者（由 vfs netlink_socket 经 handler 注入调用）。
-fn netlink_config_update(
-    request: &vfs::netlink_socket::NetlinkConfigRequest,
-) -> Result<(), i32> {
+fn netlink_config_update(request: &vfs::netlink_socket::NetlinkConfigRequest) -> Result<(), i32> {
     let _guard = NET_IOCTL_LOCK.lock();
     let store = CONFIG_STORE
         .lock()
@@ -2791,9 +2793,7 @@ fn netlink_config_update(
             }
         }
         vfs::netlink_socket::NetlinkConfigRequest::DelAddress {
-            interface,
-            address,
-            ..
+            interface, address, ..
         } => {
             let present = current
                 .addresses
@@ -2804,9 +2804,7 @@ fn netlink_config_update(
             }
         }
         vfs::netlink_socket::NetlinkConfigRequest::AddRoute {
-            network,
-            gateway,
-            ..
+            network, gateway, ..
         } => {
             if let Some(gateway) = gateway
                 && !same_family_public(*network, *gateway)
@@ -2926,7 +2924,10 @@ fn netlink_config_update(
                             && route.interface == *interface)
                     });
                 }
-                vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning { interface, running } => {
+                vfs::netlink_socket::NetlinkConfigRequest::SetLinkRunning {
+                    interface,
+                    running,
+                } => {
                     let mut interfaces = current.interfaces.clone();
                     if let Some(candidate) = interfaces
                         .iter_mut()
@@ -3324,6 +3325,8 @@ enum TurnCommandMeta {
         generation: u32,
         peer: Endpoint,
         options: BindOptions,
+        /// TCP Fast Open（sendmsg(MSG_FASTOPEN)）。
+        fastopen: bool,
     },
     ConnectTcp {
         facade: Arc<SocketFacade>,
@@ -3425,6 +3428,8 @@ enum TurnControlMeta {
         peer: Endpoint,
         path: TcpPath,
         local_transport: bool,
+        /// TCP Fast Open（sendmsg(MSG_FASTOPEN)）。
+        fastopen: bool,
     },
     AllocateListener {
         facade: Arc<SocketFacade>,
@@ -4178,6 +4183,21 @@ impl NetWorkerContext {
                             );
                         }
                     }
+                    SocketCommand::ConnectFastopen {
+                        facade,
+                        sequence,
+                        generation,
+                        peer,
+                        interface,
+                    } => {
+                        if facade.generation() != generation {
+                            facade.complete_control(sequence, Err(SocketError::Closed));
+                        } else {
+                            self.queue_connect_fastopen_facade(
+                                facade, sequence, generation, peer, interface, config,
+                            );
+                        }
+                    }
                     SocketCommand::Listen {
                         facade,
                         sequence,
@@ -4199,6 +4219,7 @@ impl NetWorkerContext {
                     peer,
                     path,
                     local_transport,
+                    fastopen,
                 } => {
                     if facade.generation() == generation {
                         let interface = path.route.interface;
@@ -4210,6 +4231,7 @@ impl NetWorkerContext {
                             facade: Arc::clone(&facade),
                             control_sequence: sequence,
                             local_transport,
+                            fastopen,
                             now_ns: sched::now_ns_direct(),
                             output: None,
                         });
@@ -4724,6 +4746,7 @@ impl NetWorkerContext {
                 generation,
                 peer,
                 options,
+                fastopen: false,
             });
             return;
         }
@@ -4863,6 +4886,7 @@ impl NetWorkerContext {
         peer: Endpoint,
         path: TcpPath,
         local_transport: bool,
+        fastopen: bool,
     ) {
         self.turn_control_commands
             .0
@@ -4882,6 +4906,7 @@ impl NetWorkerContext {
                 peer,
                 path,
                 local_transport,
+                fastopen,
             });
     }
 
@@ -5690,6 +5715,49 @@ impl NetWorkerContext {
         processed
     }
 
+    /// TCP Fast Open 主动打开：与 connect 相同的路径解析，标记 fastopen 后由
+    /// 引擎完成控制（SYN 排队即完成，不等握手）。
+    fn queue_connect_fastopen_facade(
+        &mut self,
+        facade: Arc<SocketFacade>,
+        sequence: u64,
+        generation: u32,
+        peer: Endpoint,
+        interface: Option<InterfaceId>,
+        config: &ConfigSnapshot,
+    ) {
+        if facade.kind() != SocketKind::Stream {
+            facade.complete_control(sequence, Err(SocketError::InvalidState));
+            return;
+        }
+        if !address_allowed(facade.family(), peer.addr, false) {
+            facade.complete_control(sequence, Err(SocketError::AddressUnavailable));
+            return;
+        }
+        let bound = facade.local_endpoint();
+        let bound_source =
+            bound.and_then(|local| (!local.addr.is_unspecified()).then_some(local.addr));
+        self.turn_commands
+            .0
+            .push(NetStackFlowCommand::ResolveTcpPath {
+                destination: peer.addr,
+                bound_source,
+                interface: interface.or_else(|| facade.interface()),
+                config: config as *const _,
+                now_ns: sched::now_ns_direct(),
+                free_bind: false,
+                output: None,
+            });
+        self.turn_meta.push(TurnCommandMeta::ResolveTcpPath {
+            facade,
+            sequence,
+            generation,
+            peer,
+            options: BindOptions::default(),
+            fastopen: true,
+        });
+    }
+
     fn queue_release_binding(&mut self, facade: Arc<SocketFacade>, publish_closed: bool) {
         if self.runtime.id != ShardId(0) {
             let _ = self.cluster.publish_control(
@@ -6123,7 +6191,11 @@ impl NetWorkerContext {
                             );
                             match next {
                                 TcpReserveNext::Bind => facade.complete_control(sequence, Ok(())),
-                                TcpReserveNext::Connect { peer, path } => {
+                                TcpReserveNext::Connect {
+                                    peer,
+                                    path,
+                                    fastopen,
+                                } => {
                                     let local_transport =
                                         config.interfaces.iter().any(|interface| {
                                             interface.id == path.route.interface
@@ -6137,6 +6209,7 @@ impl NetWorkerContext {
                                         peer,
                                         path,
                                         local_transport,
+                                        fastopen,
                                     );
                                 }
                                 TcpReserveNext::Listen { backlog } => {
@@ -6167,6 +6240,7 @@ impl NetWorkerContext {
                             peer,
                             path,
                             local_transport,
+                            fastopen,
                         },
                     ) => {
                         if self
@@ -6181,6 +6255,7 @@ impl NetWorkerContext {
                                     peer,
                                     path,
                                     local_transport,
+                                    fastopen,
                                 },
                             )
                             .is_err()
@@ -6625,6 +6700,7 @@ impl NetWorkerContext {
                             generation,
                             peer,
                             options,
+                            fastopen,
                         },
                     ) => match result {
                         Ok(path) if facade.generation() == generation => match facade.owner() {
@@ -6639,7 +6715,11 @@ impl NetWorkerContext {
                                     },
                                     Some(path.route.interface),
                                     options,
-                                    TcpReserveNext::Connect { peer, path },
+                                    TcpReserveNext::Connect {
+                                        peer,
+                                        path,
+                                        fastopen,
+                                    },
                                     config,
                                 ) {
                                     facade.complete_control(sequence, Err(error));
@@ -6665,6 +6745,7 @@ impl NetWorkerContext {
                                     peer,
                                     path,
                                     local_transport,
+                                    fastopen,
                                 );
                             }
                             OwnerRef::Closed { .. } => {
@@ -8224,8 +8305,7 @@ impl WorkerContext {
                 if let Some(packet) = self.rx_batch.packet(index) {
                     let mut header = [0u8; 14];
                     if packet.copy_out(0, &mut header).is_ok() {
-                        let ethertype =
-                            u16::from_be_bytes([header[12], header[13]]);
+                        let ethertype = u16::from_be_bytes([header[12], header[13]]);
                         let frame_len = packet.total_len();
                         let copy_len = frame_len.min(2048);
                         let mut frame = alloc::vec![0u8; copy_len];

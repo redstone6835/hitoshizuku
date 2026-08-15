@@ -1753,7 +1753,7 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         #[cfg(feature = "performance-profile")]
         drop(lookup_profile);
         vfs_socket::validate_send_flags(ctx.args[3])?;
-        if (ctx.args[3] & vfs_socket::MSG_OOB) != 0 {
+        if (ctx.args[3] & (vfs_socket::MSG_OOB | vfs_socket::MSG_FASTOPEN)) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         // 最大 UDP 数据报即使从页尾开始也只覆盖 17 个 4 KiB 页；多留一个槽
@@ -1808,6 +1808,7 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     if addr.is_none()
         && len != 0
+        && (ctx.args[3] & vfs_socket::MSG_FASTOPEN) == 0
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)
         && let Some(socket) = inet_stream_file(&file)
@@ -2265,7 +2266,7 @@ pub(super) fn sys_sendmsg(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     if hdr.iovlen <= 1024
         && hdr.controllen == 0
         && (hdr.name == 0 || hdr.namelen == 0)
-        && (ctx.args[2] & vfs_socket::MSG_OOB) == 0
+        && (ctx.args[2] & (vfs_socket::MSG_OOB | vfs_socket::MSG_FASTOPEN)) == 0
         && vfs_socket::inet_socket_type(&fdt, fd)? == Some(vfs_socket::SOCK_STREAM)
         && let Some(vm) = current_vm_space()
         && let Some(file) = fdt.get_file(fd)

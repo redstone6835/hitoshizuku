@@ -60,6 +60,7 @@ pub const TCP_QUICKACK: i32 = 12;
 pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_USER_TIMEOUT: i32 = 18;
 pub const TCP_FASTOPEN: i32 = 23;
+pub const TCP_FASTOPEN_CONNECT: i32 = 30;
 pub const TCP_NOTSENT_LOWAT: i32 = 25;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_BROADCAST: i32 = 6;
@@ -98,6 +99,7 @@ pub const MSG_DONTROUTE: usize = 0x0004;
 pub const MSG_CONFIRM: usize = 0x0800;
 pub const MSG_MORE: usize = 0x8000;
 pub const MSG_ERRQUEUE: usize = 0x2000;
+pub const MSG_FASTOPEN: usize = 0x20000000;
 
 pub const SHUT_RD: usize = 0;
 pub const SHUT_WR: usize = 1;
@@ -524,7 +526,14 @@ fn new_packet_socket_file(
         nonblock,
         ..Default::default()
     };
-    let file = File::new(inode, flags, cred, ops, dentry, Arc::clone(&mount));
+    let file = File::new(
+        inode,
+        flags,
+        cred,
+        ops,
+        dentry,
+        Arc::clone(&mount),
+    );
     mount.inc_open();
     Arc::new(file)
 }
@@ -909,6 +918,26 @@ pub fn send(
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
         if !control.is_empty() {
             return Err(Errno::ENOPROTOOPT);
+        }
+        if (flags & MSG_FASTOPEN) != 0 {
+            // Linux：MSG_FASTOPEN 仅 TCP；未连接时需要目标地址（SYN 携带数据），
+            // 已连接时退化为普通发送（地址忽略）。
+            if net_ops.sock_type() != crate::net_socket::SOCK_STREAM_PUB {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let peer = match raw_addr {
+                Some(raw) => crate::addr::parse_inet_sockaddr_for_socket(raw, net_ops.family())?,
+                None if net_ops.proxy().stream_connected() => net::Endpoint {
+                    addr: match net_ops.family() {
+                        crate::addr::AF_INET => net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+                        _ => net::IpAddr::V6(net::Ipv6Addr::UNSPECIFIED),
+                    },
+                    port: 0,
+                },
+                None => return Err(Errno::EDESTADDRREQ),
+            };
+            let nonblocking = file.flags().nonblock || (flags & MSG_DONTWAIT) != 0;
+            return net_ops.send_fastopen(data, peer, nonblocking);
         }
         if (flags & MSG_OOB) != 0 {
             // Linux：MSG_OOB 只把缓冲的最后一个字节作为紧急数据发送（TCP）；
@@ -2080,7 +2109,25 @@ fn inet_setsockopt(
                 net_ops.proxy().set_tcp_notsent_lowat(value as u32);
                 Ok(())
             }
-            TCP_FASTOPEN => Err(Errno::EOPNOTSUPP),
+            TCP_FASTOPEN => {
+                // 监听端：qlen > 0 启用 TCP Fast Open（qlen 仅作开关，Linux 语义）。
+                if net_ops.sock_type() != SOCK_STREAM as u16 {
+                    return Err(Errno::ENOPROTOOPT);
+                }
+                let qlen = parse_int_opt(value)?.max(0);
+                net_ops.proxy().set_listener_tfo_enabled(qlen > 0);
+                Ok(())
+            }
+            TCP_FASTOPEN_CONNECT => {
+                // 客户端：connect() 携带缓存的 TFO cookie。
+                if net_ops.sock_type() != SOCK_STREAM as u16 {
+                    return Err(Errno::ENOPROTOOPT);
+                }
+                net_ops
+                    .proxy()
+                    .set_tfo_connect_enabled(parse_int_opt(value)? != 0);
+                Ok(())
+            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
@@ -2152,8 +2199,14 @@ pub fn socket_get_filter(
 }
 
 pub fn validate_send_flags(flags: usize) -> Result<(), Errno> {
-    let allowed =
-        MSG_DONTWAIT | MSG_NOSIGNAL | MSG_EOR | MSG_MORE | MSG_OOB | MSG_DONTROUTE | MSG_CONFIRM;
+    let allowed = MSG_DONTWAIT
+        | MSG_NOSIGNAL
+        | MSG_EOR
+        | MSG_MORE
+        | MSG_OOB
+        | MSG_DONTROUTE
+        | MSG_CONFIRM
+        | MSG_FASTOPEN;
     if (flags & !allowed) != 0 {
         return Err(Errno::EINVAL);
     }

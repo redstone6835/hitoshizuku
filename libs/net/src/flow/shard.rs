@@ -404,6 +404,39 @@ impl FlowShard {
         Ok(id)
     }
 
+    /// TCP Fast Open 主动打开（sendmsg(MSG_FASTOPEN)）。
+    pub fn connect_tcp_fastopen(
+        &mut self,
+        local: Endpoint,
+        remote: Endpoint,
+        path: TcpPath,
+        facade: Arc<SocketFacade>,
+        control_sequence: u64,
+        local_transport: bool,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpBindError> {
+        let id = self.tcp.connect_fastopen(
+            local,
+            remote,
+            path,
+            Arc::clone(&facade),
+            control_sequence,
+            now_ns,
+        )?;
+        facade.publish_binding(
+            OwnerRef::Flow {
+                shard: self.id,
+                flow: id,
+                generation: facade.generation(),
+            },
+            local,
+            Some(remote),
+            Some(path.route.interface),
+        );
+        self.reschedule_tcp(id);
+        Ok(id)
+    }
+
     pub fn close_tcp(&mut self, flow: FlowId, now_ns: u64) {
         if self.tcp.close_flow(flow, now_ns) {
             self.reschedule_tcp(flow);

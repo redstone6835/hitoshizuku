@@ -283,6 +283,14 @@ pub enum SocketCommand {
         options: BindOptions,
         nonblocking: bool,
     },
+    /// TCP Fast Open 主动打开（sendmsg(MSG_FASTOPEN)）：数据已入 stream_tx。
+    ConnectFastopen {
+        facade: Arc<SocketFacade>,
+        sequence: u64,
+        generation: u32,
+        peer: Endpoint,
+        interface: Option<InterfaceId>,
+    },
     Listen {
         facade: Arc<SocketFacade>,
         sequence: u64,
@@ -2792,6 +2800,10 @@ pub struct SocketFacade {
     ip_traffic_class: AtomicU16,
     /// IP_OPTIONS：随发出的 IPv4 头携带的选项。
     ip_options: Mutex<crate::ip_options::IpOptions>,
+    /// TCP Fast Open：客户端缓存的 cookie（从 SYN-ACK 学习，后续连接复用）。
+    tfo_cookie: Mutex<Option<[u8; 8]>>,
+    /// TCP_FASTOPEN_CONNECT：connect() 时携带缓存的 TFO cookie。
+    tfo_connect_enabled: AtomicBool,
     multicast_memberships: Mutex<Vec<MulticastMembership>>,
     multicast_interface: AtomicU32,
     multicast_hops: AtomicU16,
@@ -2964,6 +2976,8 @@ impl SocketFacade {
             ip_hop_limit: AtomicU16::new(64),
             ip_traffic_class: AtomicU16::new(0),
             ip_options: Mutex::new(crate::ip_options::IpOptions::empty()),
+            tfo_cookie: Mutex::new(None),
+            tfo_connect_enabled: AtomicBool::new(false),
             multicast_memberships: Mutex::new(Vec::new()),
             multicast_interface: AtomicU32::new(0),
             multicast_hops: AtomicU16::new(1),
@@ -3072,6 +3086,35 @@ impl SocketFacade {
     /// IP 选项的 4 字节对齐长度（MSS 计算用）。
     pub fn ip_options_wire_len(&self) -> u8 {
         self.ip_options.lock().wire_len() as u8
+    }
+
+    /// TCP Fast Open：客户端缓存 cookie（引擎从 SYN-ACK 学习后写入）。
+    pub fn set_tfo_cookie(&self, cookie: [u8; 8]) {
+        *self.tfo_cookie.lock() = Some(cookie);
+    }
+
+    pub fn tfo_cookie(&self) -> Option<[u8; 8]> {
+        *self.tfo_cookie.lock()
+    }
+
+    pub fn stream_connected(&self) -> bool {
+        self.stream_connected.load(Ordering::Acquire)
+    }
+
+    /// TCP_FASTOPEN_CONNECT：后续 connect() 携带缓存的 cookie。
+    pub fn set_tfo_connect_enabled(&self, enabled: bool) {
+        self.tfo_connect_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn tfo_connect_enabled(&self) -> bool {
+        self.tfo_connect_enabled.load(Ordering::Acquire)
+    }
+
+    /// TCP_FASTOPEN（监听端）：启用/关闭监听组的 TFO 接受。
+    pub fn set_listener_tfo_enabled(&self, enabled: bool) {
+        if let Some(group) = self.listen_group.lock().as_ref() {
+            group.set_tfo_enabled(enabled);
+        }
     }
 
     pub fn add_multicast_membership(
@@ -3401,14 +3444,27 @@ impl SocketFacade {
             return Err(error);
         }
         let sequence = self.next_control_sequence();
-        let command = SocketCommand::Connect {
-            facade: Arc::clone(self),
-            sequence,
-            generation: self.generation(),
-            peer,
-            interface,
-            options,
-            nonblocking,
+        // TCP_FASTOPEN_CONNECT：connect() 携带缓存的 TFO cookie（SYN 带 cookie）。
+        let fastopen_connect =
+            self.kind == SocketKind::Stream && self.tfo_connect_enabled.load(Ordering::Acquire);
+        let command = if fastopen_connect {
+            SocketCommand::ConnectFastopen {
+                facade: Arc::clone(self),
+                sequence,
+                generation: self.generation(),
+                peer,
+                interface,
+            }
+        } else {
+            SocketCommand::Connect {
+                facade: Arc::clone(self),
+                sequence,
+                generation: self.generation(),
+                peer,
+                interface,
+                options,
+                nonblocking,
+            }
         };
         if socket_runtime()?.submit_control(command).is_err() {
             self.connect_pending.store(false, Ordering::Release);
@@ -4420,6 +4476,95 @@ impl SocketFacade {
             (Ok(accepted), Err(error)) if accepted == 0 => Err(error),
             (result, _) => result,
         }
+    }
+
+    /// sendmsg(MSG_FASTOPEN)：TCP Fast Open 客户端发送。
+    ///
+    /// - 已连接：退化为普通发送。
+    /// - 未连接且缓存了 cookie：数据推入 stream_tx，SYN 携带 cookie + 数据
+    ///   一次发出，返回已接受字节数。
+    /// - 未连接且无 cookie：数据排队，返回 EINPROGRESS（Linux 语义，SYN 不
+    ///   带数据，握手完成后按普通数据发送）。
+    pub fn send_fastopen(
+        self: &Arc<Self>,
+        data: &[u8],
+        peer: Endpoint,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        self.ensure_stack_attached()?;
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if data.is_empty() {
+            return Err(SocketError::InvalidState);
+        }
+        if self.stream_connected.load(Ordering::Acquire) {
+            // 已连接：MSG_FASTOPEN 退化为普通发送。
+            return self.send_stream(data, nonblocking, deadline_ns, false);
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(SocketError::Closed);
+        }
+        // 数据必须先进入 stream_tx：引擎在 SYN 排队时按 cookie 决定是否随 SYN 发出。
+        let mut accepted = 0usize;
+        loop {
+            if let Some(error) = self.backend_error() {
+                return Err(error);
+            }
+            let copied =
+                self.stream_tx
+                    .lock()
+                    .push_with(data.len() - accepted, &mut |offset, output| {
+                        output.copy_from_slice(
+                            &data[accepted + offset..accepted + offset + output.len()],
+                        );
+                    });
+            if copied != 0 {
+                accepted += copied;
+                if accepted == data.len() {
+                    break;
+                }
+            }
+            if nonblocking {
+                return if accepted == 0 {
+                    Err(SocketError::WouldBlock)
+                } else {
+                    Err(SocketError::InProgress)
+                };
+            }
+            if let Err(error) = self.wait_write(deadline_ns) {
+                return if accepted == 0 {
+                    Err(error)
+                } else {
+                    Ok(accepted)
+                };
+            }
+        }
+        let _control = self.control_lock.lock();
+        if self.connect_pending.swap(true, Ordering::AcqRel) {
+            return Err(SocketError::AlreadyInProgress);
+        }
+        let sequence = self.next_control_sequence();
+        let command = SocketCommand::ConnectFastopen {
+            facade: Arc::clone(self),
+            sequence,
+            generation: self.generation(),
+            peer,
+            interface: None,
+        };
+        if socket_runtime()?.submit_control(command).is_err() {
+            self.connect_pending.store(false, Ordering::Release);
+            return Err(SocketError::RuntimeBusy);
+        }
+        let result = self.wait_control(sequence);
+        self.connect_pending.store(false, Ordering::Release);
+        result?;
+        // 无缓存 cookie：数据已排队，Linux 返回 EINPROGRESS。
+        if self.tfo_cookie().is_none() {
+            return Err(SocketError::InProgress);
+        }
+        Ok(accepted)
     }
 
     /// send(MSG_OOB)：把单字节作为紧急数据发送（Linux 语义：只发送缓冲

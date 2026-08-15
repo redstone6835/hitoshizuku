@@ -441,6 +441,18 @@ impl NetSocketFileOps {
             .map_err(map_socket_error)
     }
 
+    /// sendmsg(MSG_FASTOPEN)：TCP Fast Open 客户端发送（仅 TCP）。
+    pub fn send_fastopen(
+        &self,
+        data: &[u8],
+        peer: net::Endpoint,
+        nonblocking: bool,
+    ) -> Result<usize, Errno> {
+        self.proxy
+            .send_fastopen(data, peer, nonblocking, self.send_deadline())
+            .map_err(map_socket_error)
+    }
+
     /// send(MSG_OOB)：发送单个紧急字节（仅 TCP；UDP 在调用方拒绝）。
     pub fn send_oob(&self, byte: u8, nonblocking: bool) -> Result<usize, Errno> {
         self.proxy
