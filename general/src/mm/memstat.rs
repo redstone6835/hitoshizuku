@@ -28,6 +28,23 @@ pub static SHARED_ANON_PAGES: AtomicU64 = AtomicU64::new(0);
 pub static PRIVATE_FILE_PAGES: AtomicU64 = AtomicU64::new(0);
 pub static SHARED_FILE_PAGES: AtomicU64 = AtomicU64::new(0);
 
+/// 全局锁页数（所有地址空间 `locked_pages` 之和；`/proc/meminfo` Mlocked 用）。
+static LOCKED_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// 记账一次锁页数变化（页为单位，可为负）。
+pub fn locked_pages_delta(delta: i64) {
+    if delta > 0 {
+        LOCKED_PAGES.fetch_add(delta as u64, Ordering::Relaxed);
+    } else {
+        LOCKED_PAGES.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+    }
+}
+
+/// 当前全局锁页数。
+pub fn locked_pages() -> u64 {
+    LOCKED_PAGES.load(Ordering::Acquire)
+}
+
 /// 记账一次承诺页数变化（页为单位，可为负）。
 pub fn commit_pages(delta: i64) {
     if delta > 0 {
@@ -111,6 +128,7 @@ pub fn get_vm_u32(which: VmParam) -> u32 {
         VmParam::UnprivilegedUserfaultfd => {
             u32::from(UNPRIVILEGED_USERFAULTFD.load(Ordering::Acquire))
         }
+        VmParam::DropCaches => DROP_CACHES.load(Ordering::Acquire),
     }
 }
 
@@ -138,6 +156,7 @@ pub fn set_vm_u32(which: VmParam, value: u32) {
         VmParam::UnprivilegedUserfaultfd => {
             UNPRIVILEGED_USERFAULTFD.store(value != 0, Ordering::Release)
         }
+        VmParam::DropCaches => DROP_CACHES.store(value, Ordering::Release),
     }
 }
 
@@ -211,6 +230,7 @@ pub enum VmParam {
     DirtyExpireCentisecs,
     VfsCachePressure,
     UnprivilegedUserfaultfd,
+    DropCaches,
 }
 
 impl VmParam {
@@ -233,6 +253,7 @@ impl VmParam {
             Self::DirtyExpireCentisecs => "dirty_expire_centisecs",
             Self::VfsCachePressure => "vfs_cache_pressure",
             Self::UnprivilegedUserfaultfd => "unprivileged_userfaultfd",
+            Self::DropCaches => "drop_caches",
         }
     }
 
@@ -255,6 +276,7 @@ impl VmParam {
             "dirty_expire_centisecs" => Self::DirtyExpireCentisecs,
             "vfs_cache_pressure" => Self::VfsCachePressure,
             "unprivileged_userfaultfd" => Self::UnprivilegedUserfaultfd,
+            "drop_caches" => Self::DropCaches,
             _ => return None,
         })
     }
@@ -307,6 +329,19 @@ pub fn check_overcommit(
             return Ok(());
         }
     }
+}
+
+/// 当前 overcommit 上限（KB）：`overcommit_kbytes` 优先，否则
+/// `(物理内存 + 交换) * overcommit_ratio / 100`。`/proc/meminfo` CommitLimit 用。
+pub fn commit_limit_kb(total_ram_pages: u64, total_swap_pages: u64) -> u64 {
+    let kbytes = OVERCOMMIT_KBYTES.load(Ordering::Acquire);
+    if kbytes != 0 {
+        return kbytes;
+    }
+    (total_ram_pages.saturating_add(total_swap_pages)
+        * OVERCOMMIT_RATIO.load(Ordering::Acquire) as u64
+        / 100)
+        * (allocator::PAGE_SIZE as u64 / 1024)
 }
 
 /// 当前 VMA 数量是否超过 `max_map_count`。

@@ -1352,22 +1352,50 @@ fn write_timeval_pair(out: &mut [u8], off: usize, ns: u64) {
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let info = ctx.args[0];
     if info != 0 {
+        // Linux struct sysinfo（64 位布局，sizeof == 112）：
+        // uptime(0) loads[3](8,16,24) totalram(32) freeram(40) sharedram(48)
+        // bufferram(56) totalswap(64) freeswap(72) procs(u16,80) pad(82)
+        // totalhigh(88) freehigh(96) mem_unit(u32,104) _f(108..112)。
+        let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
+        let page_size = hal::memory::page_size() as u64;
+        let totalram = overview.total_physical as u64;
+        // freeram 与 /proc/meminfo MemAvailable 同口径：空闲物理页 + 可回收缓存。
+        let allocator_reclaimable = {
+            let layers = allocator::KERNEL_ALLOCATOR.layer_stats();
+            let slab_reclaimable = allocator::KERNEL_ALLOCATOR
+                .slab_class_stats()
+                .iter()
+                .fold(0usize, |sum, class| {
+                    sum.saturating_add(class.reclaimable_empty_pages)
+                })
+                .saturating_mul(hal::memory::page_size());
+            layers.kheap.cached_bytes.saturating_add(slab_reclaimable)
+        };
+        let freeram = overview.free_physical.saturating_add(allocator_reclaimable) as u64;
+        let sharedram = general::mm::memstat::SHARED_ANON_PAGES
+            .load(core::sync::atomic::Ordering::Relaxed)
+            * page_size;
+        let bufferram = (general::mm::memstat::PRIVATE_FILE_PAGES
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(
+                general::mm::memstat::SHARED_FILE_PAGES.load(core::sync::atomic::Ordering::Relaxed),
+            ))
+            * page_size;
+        let (total_swap_pages, free_swap_pages) = general::mm::swap::swap_totals();
+        let procs = sched::root_pid_ns().registry().snapshot().len().min(65535) as u16;
         let mut out = [0u8; 112];
-        put_i64(&mut out, 0, sched::now_ns_direct() as i64 / 1_000_000_000);
-        put_u64(&mut out, 8, 0);
-        put_u64(&mut out, 16, 0);
-        put_u64(&mut out, 24, 0);
-        put_u64(&mut out, 32, 256 * 1024 * 1024);
-        put_u64(&mut out, 40, 128 * 1024 * 1024);
-        put_u64(&mut out, 48, 256 * 1024 * 1024);
-        put_u16(&mut out, 56, 0);
-        put_u16(&mut out, 58, 0);
-        put_u16(&mut out, 60, 0);
-        put_u16(&mut out, 62, 0);
-        put_u32(&mut out, 64, 1);
-        put_u32(&mut out, 68, 65536);
-        put_u32(&mut out, 72, 65536);
-        put_u32(&mut out, 76, 0);
+        put_i64(&mut out, 0, (sched::now_ns_direct() / 1_000_000_000) as i64);
+        // loads[1/5/15]：暂无负载均值统计，保持 0。
+        put_u64(&mut out, 32, totalram);
+        put_u64(&mut out, 40, freeram);
+        put_u64(&mut out, 48, sharedram);
+        put_u64(&mut out, 56, bufferram);
+        put_u64(&mut out, 64, total_swap_pages * page_size);
+        put_u64(&mut out, 72, free_swap_pages * page_size);
+        put_u16(&mut out, 80, procs);
+        put_u64(&mut out, 88, 0); // totalhigh
+        put_u64(&mut out, 96, 0); // freehigh
+        put_u32(&mut out, 104, 1); // mem_unit = 1 字节
         copy_to_user(info, &out).map_err(|e| e.as_errno())?;
     }
     Ok(0)

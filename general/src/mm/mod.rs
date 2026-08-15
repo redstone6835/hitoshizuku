@@ -35,6 +35,6 @@ pub use user_access::{
     copy_cstr_bytes_from_user, copy_cstr_from_user, copy_from_user, copy_to_user,
 };
 pub use vm_space::{
-    Mempolicy, UserReadWindows, VmFutexKey, VmSpace, file_cache_stat, page_size, read_shared_anon,
-    vm_space_diag, write_shared_anon,
+    Mempolicy, UserReadWindows, VmFutexKey, VmSpace, drop_private_file_cache, file_cache_stat,
+    page_size, read_shared_anon, vm_space_diag, write_shared_anon,
 };

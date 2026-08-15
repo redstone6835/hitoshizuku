@@ -4854,13 +4854,13 @@ impl VmSpace {
             .map(|(piece_range, _)| (piece_range.end - piece_range.start) / page_size())
             .sum();
         if locked {
-            self.locked_pages.fetch_add(
-                after_locked.saturating_sub(already_locked),
-                Ordering::Relaxed,
-            );
+            let delta = after_locked.saturating_sub(already_locked);
+            self.locked_pages.fetch_add(delta, Ordering::Relaxed);
+            memstat::locked_pages_delta(delta as i64);
         } else {
             self.locked_pages
                 .fetch_sub(already_locked, Ordering::Relaxed);
+            memstat::locked_pages_delta(-(already_locked as i64));
         }
         Ok(())
     }
@@ -7005,6 +7005,16 @@ fn publish_cached_private_file_page<const SHARD_COUNT: usize>(
 /// 缓存持有的页则立即归还 buddy。返回移除的缓存条目数，而不是实际释放的物理页数。
 fn reclaim_private_file_cache_pages(limit: usize) -> usize {
     PRIVATE_FILE_PAGES.reclaim(limit)
+}
+
+/// `drop_caches=1`：清空私有干净文件页缓存（逐批回收直到空）。
+pub fn drop_private_file_cache() {
+    loop {
+        let reclaimed = reclaim_private_file_cache_pages(1024);
+        if reclaimed == 0 {
+            break;
+        }
+    }
 }
 
 fn find_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey) -> Option<Arc<ResidentPage>> {
