@@ -2645,12 +2645,23 @@ pub struct NetStackControlPlane {
     dad: Mutex<Vec<DadState>>,
     dad_errors: Mutex<BTreeMap<InterfaceId, SocketError>>,
     dhcp: Mutex<Vec<DhcpClient>>,
+    /// 内核 DHCP 客户端关闭开关（启动参数 net.dhcp=0）。
+    dhcp_disabled: bool,
     multicast_refs: Mutex<BTreeMap<(InterfaceId, IpAddr), usize>>,
     multicast_bindings: Mutex<BTreeMap<(SocketId, MulticastMembership), InterfaceId>>,
 }
 
 impl NetStackControlPlane {
     fn new(shard_count: usize, rss_key: [u8; 40], hash_seed: &[u8; 16]) -> Self {
+        Self::new_with_options(shard_count, rss_key, hash_seed, false)
+    }
+
+    fn new_with_options(
+        shard_count: usize,
+        rss_key: [u8; 40],
+        hash_seed: &[u8; 16],
+        dhcp_disabled: bool,
+    ) -> Self {
         Self {
             bind_registry: BindRegistry::new(shard_count, hash_seed),
             bindings: Mutex::new(BTreeMap::new()),
@@ -2662,6 +2673,7 @@ impl NetStackControlPlane {
             dad: Mutex::new(Vec::new()),
             dad_errors: Mutex::new(BTreeMap::new()),
             dhcp: Mutex::new(Vec::new()),
+            dhcp_disabled,
             multicast_refs: Mutex::new(BTreeMap::new()),
             multicast_bindings: Mutex::new(BTreeMap::new()),
         }
@@ -2736,7 +2748,13 @@ impl NetStackControlPlane {
     fn initialize_autoconfig(&self, config: &ConfigSnapshot, now_ns: u64) {
         *self.dad.lock() = initial_dad_states(config, now_ns);
         self.dad_errors.lock().clear();
-        *self.dhcp.lock() = initial_dhcp_clients(config, now_ns);
+        // 内核 DHCP 客户端可由启动参数 net.dhcp=0 关闭：无静态 IPv4 地址的
+        // 接口也不发起 DHCP（SLAAC/DAD 等 IPv6 自动配置不受影响）。
+        *self.dhcp.lock() = if self.dhcp_disabled {
+            Vec::new()
+        } else {
+            initial_dhcp_clients(config, now_ns)
+        };
     }
 
     fn run_dad(&self, now_ns: u64) -> DadRunOutput {
@@ -3341,7 +3359,9 @@ pub fn create_control_plane(
     rss_key: [u8; 40],
     hash_seed: &[u8; 16],
 ) -> NetStackControlPlane {
-    NetStackControlPlane::new(shard_count, rss_key, hash_seed)
+    // 内核 DHCP 关闭开关随启动配置（net.dhcp=0）进入控制面。
+    let dhcp_disabled = boot_config().is_some_and(|boot| boot.dhcp_disabled());
+    NetStackControlPlane::new_with_options(shard_count, rss_key, hash_seed, dhcp_disabled)
 }
 
 #[kernel_symbols::export(
@@ -6110,6 +6130,31 @@ mod tests {
             Some(30_000_000_400)
         );
         assert_eq!(dhcp_rebind_seconds(800, 400, Some(1)), 401);
+    }
+
+    #[test]
+    fn dhcp_client_disabled_by_boot_switch() {
+        // 启动参数 net.dhcp=0：无静态 IPv4 的接口也不发起 DHCP discover。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        plane.initialize_autoconfig(&config, 100);
+        assert!(plane.run_dhcp(&config, 100).frames.is_empty());
+        // 关闭开关不影响 DAD（IPv6 自动配置）。
+        assert_eq!(plane.run_dad(100).probes.len(), 1);
     }
 
     #[test]
