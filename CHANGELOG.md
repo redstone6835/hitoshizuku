@@ -2,6 +2,9 @@
 
 ## 2026-08-15
 ### feat/fs-time-full
+- `feat(vfs)`：扩展属性（xattr）全套与 POSIX ACL——16 个 syscall（set/get/list/removexattr × path/l/fd + set/get/list/removexattrat 带 AT_EMPTY_PATH/NOFOLLOW）；VFS 语义层（user./trusted./security./system.posix_acl_* 命名空间、权限模型、目录 sticky 规则、XATTR_CREATE/REPLACE、ERANGE/E2BIG/ENODATA）；POSIX ACL 二进制格式（version 2 + tag/perm/id 条目）、校验、`posix_acl_permission` 强制（能力绕过优先）与 `posix_acl_create`（default ACL 派生 + mode 调整）；extfs 用 ext4 兼容 xattr 块（magic 0xea020000、name_index 1/2/3/4/6、值区块尾分配、i_file_acl 读写）；tmpfs 用内存表；chmod↔ACL mask 双向同步；创建路径继承 default ACL
+- `test(vfs)`：宿主单测 + QEMU 运行时自测（userland/tests/xattr_test.c，tmpfs 后端 ALL PASS，覆盖权限模型/ACL/默认 ACL/双向同步）
+
 - `feat(time)`：时间子系统完整化——`sysinfo(2)` 真实统计（1/5/15 分钟负载 avenrun 定点衰减 + 真实内存/进程数，mem_unit=1 字节单位）；POSIX timer 全套（`timer_create/settime/gettime/getoverrun/delete` + time64，SIGEV_NONE/SIGNAL/THREAD_ID，overrun 追赶计数，CLOCK_REALTIME/MONOTONIC/BOOTTIME + PROCESS/THREAD_CPUTIME_ID，DeadlineObserver 复用）；`adjtimex/clock_adjtime` NTP 状态机（ADJ_OFFSET/FREQUENCY/STATUS/TIMECONST/TICK/NANO 等，频率误差按 tick 折叠进 REALTIME 偏移，vDSO 与内核路径一致）；`ITIMER_VIRTUAL/ITIMER_PROF`（tick 级 user/system CPU 记账，两架构 timer ISR 传 from_user）；timerfd `TFD_TIMER_CANCEL_ON_SET`（Linux 语义：settime 登记、时钟设置取消、read/settime 返回 ECANCELED）
 - `chore(scripts)`：新增 `wrap-kernel-elf.py`（裸内核镜像包装为最小 ELF64，使 QEMU loongarch virt 走 `-kernel` 直启路径）
 

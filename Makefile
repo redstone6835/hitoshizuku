@@ -220,6 +220,7 @@ LEGACY_LTP_SCENARIOS := userland/ltp-scenarios
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
 ACCT_TEST_SRC := userland/tests/acct.c
+XATTR_TEST_SRC := userland/tests/xattr_test.c
 SYSCALL_BENCH_SRC := userland/tests/syscall_bench.c
 MM_BENCH_SRC := userland/tests/mm_fault_bench.c
 RISCV_WEIGHT_SRC := userland/tests/riscv_instruction_weight_probe.c
@@ -406,6 +407,15 @@ define build_smp_user_tests
 	fi
 endef
 
+define build_fs_tests
+	rm -rf $(BUILD_DIR)/$(1)/fs-user; \
+	mkdir -p $(BUILD_DIR)/$(1)/fs-user $(2)/bin; \
+	$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		$(XATTR_TEST_SRC) -o $(BUILD_DIR)/$(1)/fs-user/xattr-test; \
+	$(3)strip $(BUILD_DIR)/$(1)/fs-user/xattr-test || true; \
+	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/xattr-test $(2)/bin/;
+endef
+
 define build_loongarch_sxe_tests
 	@if [ "$(1)" = "$(LA_ARCH)" ] && [ -n "$(filter lazy-sxe-tests,$(FEATURES))" ]; then \
 		rm -rf $(BUILD_DIR)/$(1)/lazy-sxe-user; \
@@ -500,6 +510,7 @@ define prepare_compat_rootfs
 	rm -f $(2)/lib/elm/*
 	$(call build_elm_user_tools,$(1),$(2),$(5))
 	$(call build_smp_user_tests,$(1),$(2),$(5))
+	$(call build_fs_tests,$(1),$(2),$(5))
 	$(call build_loongarch_sxe_tests,$(1),$(2),$(5))
 	$(call install_native_examples,$(1),$(2))
 	@if [ -n "$(strip $(NATIVE_EXAMPLE_COMMANDS))" ]; then \

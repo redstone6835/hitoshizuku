@@ -67,6 +67,8 @@ pub(crate) struct InodeMetaDisk {
     pub flags: u32,
     pub blocks_512: u64,
     pub file_acl_hi: u32,
+    /// `i_file_acl` 低 32 位（xattr 块号）。
+    pub file_acl_lo: u32,
     pub generation: u32,
 }
 
@@ -130,6 +132,7 @@ fn parse_inode_meta(raw: &[u8], huge_file: bool, block_size: u32) -> InodeMetaDi
     let blocks_lo = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
     let flags = u32::from_le_bytes([raw[32], raw[33], raw[34], raw[35]]);
     let size_hi = u32::from_le_bytes([raw[108], raw[109], raw[110], raw[111]]);
+    let file_acl_lo = u32::from_le_bytes([raw[104], raw[105], raw[106], raw[107]]);
     let file_acl_hi = u16::from_le_bytes([raw[120], raw[121]]) as u32;
     let uid_hi = u16::from_le_bytes([raw[0x74], raw[0x75]]) as u32;
     let gid_hi = u16::from_le_bytes([raw[0x72], raw[0x73]]) as u32;
@@ -152,6 +155,7 @@ fn parse_inode_meta(raw: &[u8], huge_file: bool, block_size: u32) -> InodeMetaDi
         flags,
         blocks_512,
         file_acl_hi,
+        file_acl_lo,
         generation: u32::from_le_bytes([raw[100], raw[101], raw[102], raw[103]]),
     }
 }
@@ -408,6 +412,7 @@ fn build_inode_for(
         blocks: meta.blocks_512,
     };
     let block_size = state.ext_sb.block_size;
+    let has_xattr_block = meta.file_acl_lo != 0 || meta.file_acl_hi != 0;
     let ops = ExtInodeOps::new(Arc::clone(state), ino, raw);
     let inode = Inode::new(
         InodeId {
@@ -422,6 +427,10 @@ fn build_inode_for(
         Arc::new(ops) as Arc<dyn InodeOps + Send + Sync>,
         sb.self_weak.clone(),
     );
+    if has_xattr_block {
+        // xattr 快速路径提示：ACL 强制需要知道 inode 可能携带属性。
+        inode.mark_has_xattrs();
+    }
     Ok(sb.insert_inode(inode))
 }
 
@@ -544,6 +553,56 @@ fn clear_deleted_inode(raw: &mut RawInode) {
 }
 
 impl InodeOps for ExtInodeOps {
+    fn getxattr(&self, name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
+        let acl_block = lock_raw(&self.raw).file_acl();
+        crate::xattr::get(&self.state, acl_block, name)
+    }
+
+    fn setxattr(&self, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
+        let mut raw = lock_raw(&self.raw);
+        let acl_block = raw.file_acl();
+        let (new_block, block) = crate::xattr::set(&self.state, acl_block, name, value, flags)?;
+        if new_block == 0 {
+            // 首个属性：分配 xattr 块。
+            let block_no = crate::alloc_mod::alloc_block(&self.state)
+                .map_err(|_| VfsError::Io)?;
+            raw.set_file_acl(block_no);
+            self.state
+                .write_data_blocks(block_no, 1, &block)
+                .map_err(|_| VfsError::Io)?;
+        } else {
+            self.state
+                .write_data_blocks(new_block, 1, &block)
+                .map_err(|_| VfsError::Io)?;
+        }
+        self.state.publish_inode_write(&raw).map_err(|_| VfsError::Io)?;
+        Ok(())
+    }
+
+    fn listxattr(&self) -> VfsResult<Vec<Vec<u8>>> {
+        let acl_block = lock_raw(&self.raw).file_acl();
+        crate::xattr::list(&self.state, acl_block)
+    }
+
+    fn removexattr(&self, name: &[u8]) -> VfsResult<()> {
+        let mut raw = lock_raw(&self.raw);
+        let acl_block = raw.file_acl();
+        let (new_block, block) = crate::xattr::remove(&self.state, acl_block, name)?;
+        if new_block == 0 {
+            // 最后一个属性被删除：释放 xattr 块并清 i_file_acl。
+            if acl_block != 0 {
+                crate::alloc_mod::free_block(&self.state, acl_block)
+                    .map_err(|_| VfsError::Io)?;
+            }
+            raw.set_file_acl(0);
+            self.state.publish_inode_write(&raw).map_err(|_| VfsError::Io)?;
+        } else {
+            self.state
+                .write_data_blocks(new_block, 1, &block)
+                .map_err(|_| VfsError::Io)?;
+        }
+        Ok(())
+    }
     fn supports_private_page_cache(&self) -> bool {
         true
     }

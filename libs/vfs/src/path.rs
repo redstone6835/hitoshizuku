@@ -350,16 +350,19 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
             if inode.kind != crate::vfs::stat::FileType::Directory {
                 return Err(VfsError::NotADirectory);
             }
-            let meta = inode.meta_snapshot();
-            if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+            if !crate::acl::check_access(&cred, inode.as_ref(), crate::acl::AclCheckKind::Exec { is_dir: true })
+            {
                 return Err(VfsError::PermissionDenied);
             }
             continue;
         }
 
         if let Some(parent_inode) = state.current.inode() {
-            let meta = parent_inode.meta_snapshot();
-            if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+            if !crate::acl::check_access(
+                &cred,
+                parent_inode.as_ref(),
+                crate::acl::AclCheckKind::Exec { is_dir: true },
+            ) {
                 return Err(VfsError::PermissionDenied);
             }
         }

@@ -2162,8 +2162,7 @@ fn resolve_connect_address(ctx: &VfsContext, raw: &[u8]) -> Result<UnixAddress, 
             if inode.kind() != FileType::Socket {
                 return Err(Errno::ENOTSOCK);
             }
-            let meta = inode.meta_snapshot();
-            if !ctx.cred().can_write(meta.uid, meta.gid, meta.mode) {
+            if !crate::acl::check_access(ctx.cred().as_ref(), inode.as_ref(), crate::acl::AclCheckKind::Write) {
                 return Err(Errno::EACCES);
             }
             Ok(UnixAddress::Path {

@@ -38,6 +38,12 @@ if [ -x /bin/pthread-smp-test ]; then
     status=$?
     echo "[init][smp-tests] pthread SMP tests exit=$status"
 fi
+if [ -x /bin/xattr-test ]; then
+    echo "[init][fs-tests] running xattr tests"
+    /bin/xattr-test
+    status=$?
+    echo "[init][fs-tests] xattr tests exit=$status"
+fi
 if [ -x /bin/loongarch-sxe-test ]; then
     echo "[init][lazy-sxe-tests] running LoongArch FP/LSX state tests"
     /bin/loongarch-sxe-test

@@ -2714,53 +2714,304 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     }
 }
 
-pub(super) fn sys_setxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+// ── xattr ────────────────────────────────────────────────────────────────────
+
+const XATTR_CREATE: u32 = 1;
+const XATTR_REPLACE: u32 = 2;
+
+/// 拷贝并校验 xattr 名称（长度超限 → ERANGE）。
+fn copy_xattr_name(user: usize) -> Result<Vec<u8>, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let name = copy_cstr_from_user(user, vfs::xattr::XATTR_NAME_MAX + 1)
+        .map_err(|e| e.as_errno())?;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    if bytes.len() > vfs::xattr::XATTR_NAME_MAX {
+        return Err(Errno::ERANGE);
+    }
+    Ok(bytes.to_vec())
 }
 
-pub(super) fn sys_lsetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// 拷贝 xattr 值（长度超限 → E2BIG）。
+fn copy_xattr_value(user: usize, size: usize) -> Result<Vec<u8>, Errno> {
+    if user == 0 {
+        return Ok(Vec::new());
+    }
+    if size > vfs::xattr::XATTR_SIZE_MAX {
+        return Err(Errno::E2BIG);
+    }
+    let mut buf = vec![0u8; size];
+    copy_from_user(user, &mut buf).map_err(|e| e.as_errno())?;
+    Ok(buf)
 }
 
-pub(super) fn sys_fsetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// getxattr/listxattr 的"值/列表拷回"公共逻辑：size==0 返回所需长度；
+/// 缓冲不足返回 ERANGE。
+fn copy_xattr_out(user: usize, size: usize, data: &[u8]) -> Result<usize, Errno> {
+    if size == 0 {
+        return Ok(data.len());
+    }
+    if size < data.len() {
+        return Err(Errno::ERANGE);
+    }
+    copy_to_user(user, data).map_err(|e| e.as_errno())?;
+    Ok(data.len())
 }
 
-pub(super) fn sys_getxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+fn vfs_ctx_or_err() -> Result<alloc::sync::Arc<vfs::VfsContext>, Errno> {
+    current_vfs_context().ok_or(Errno::EBADF)
 }
 
-pub(super) fn sys_lgetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+fn xattr_flags_validate(flags: usize) -> Result<u32, Errno> {
+    if flags & !(XATTR_CREATE as usize | XATTR_REPLACE as usize) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(flags as u32)
 }
 
-pub(super) fn sys_fgetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+// ── 路径变体（setxattr/lsetxattr/getxattr/lgetxattr/listxattr/llistxattr/
+//    removexattr/lremovexattr）───────────────────────────────────────────────
+
+pub(super) fn sys_setxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let value = copy_xattr_value(ctx.args[2], ctx.args[3])?;
+    let flags = xattr_flags_validate(ctx.args[4])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    operation::setxattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, &value, flags, false)
+        .map_err(|e| e.to_errno())?;
+    let _ = fdt;
+    Ok(0)
 }
 
-pub(super) fn sys_listxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_lsetxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let value = copy_xattr_value(ctx.args[2], ctx.args[3])?;
+    let flags = xattr_flags_validate(ctx.args[4])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    operation::setxattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, &value, flags, true)
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
 }
 
-pub(super) fn sys_llistxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_fsetxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let value = copy_xattr_value(ctx.args[2], ctx.args[3])?;
+    let flags = xattr_flags_validate(ctx.args[4])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    operation::fsetxattr(&vfs_ctx, &fdt, fd, &name, &value, flags).map_err(|e| e.to_errno())?;
+    Ok(0)
 }
 
-pub(super) fn sys_flistxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_getxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let value = ctx.args[2];
+    let size = ctx.args[3];
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let data = operation::getxattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, false)
+        .map_err(|e| e.to_errno())?
+        .ok_or(Errno::ENODATA)?;
+    copy_xattr_out(value, size, &data)
 }
 
-pub(super) fn sys_removexattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_lgetxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let value = ctx.args[2];
+    let size = ctx.args[3];
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let data = operation::getxattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, true)
+        .map_err(|e| e.to_errno())?
+        .ok_or(Errno::ENODATA)?;
+    copy_xattr_out(value, size, &data)
 }
 
-pub(super) fn sys_lremovexattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_fgetxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let value = ctx.args[2];
+    let size = ctx.args[3];
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let data = operation::fgetxattr(&vfs_ctx, &fdt, fd, &name)
+        .map_err(|e| e.to_errno())?
+        .ok_or(Errno::ENODATA)?;
+    copy_xattr_out(value, size, &data)
 }
 
-pub(super) fn sys_fremovexattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_listxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let list = ctx.args[1];
+    let size = ctx.args[2];
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let names = operation::listxattr(&vfs_ctx, &Dirfd::Cwd, &path, false)
+        .map_err(|e| e.to_errno())?;
+    let data = vfs::xattr::encode_list(&names);
+    copy_xattr_out(list, size, &data)
 }
+
+pub(super) fn sys_llistxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let list = ctx.args[1];
+    let size = ctx.args[2];
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let names = operation::listxattr(&vfs_ctx, &Dirfd::Cwd, &path, true)
+        .map_err(|e| e.to_errno())?;
+    let data = vfs::xattr::encode_list(&names);
+    copy_xattr_out(list, size, &data)
+}
+
+pub(super) fn sys_flistxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let list = ctx.args[1];
+    let size = ctx.args[2];
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let names = operation::flistxattr(&vfs_ctx, &fdt, fd).map_err(|e| e.to_errno())?;
+    let data = vfs::xattr::encode_list(&names);
+    copy_xattr_out(list, size, &data)
+}
+
+pub(super) fn sys_removexattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    operation::removexattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, false)
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_lremovexattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let path = copy_path_from_user(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    operation::removexattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, true)
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_fremovexattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let name = copy_xattr_name(ctx.args[1])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    operation::fremovexattr(&vfs_ctx, &fdt, fd, &name).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+// ── at 变体（setxattrat/getxattrat/listxattrat/removexattrat）──────────────
+
+fn xattrat_flags_validate(flags: usize) -> Result<u32, Errno> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(flags as u32)
+}
+
+pub(super) fn sys_setxattrat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let name = copy_xattr_name(ctx.args[2])?;
+    let value = copy_xattr_value(ctx.args[3], ctx.args[4])?;
+    let flags = xattrat_flags_validate(ctx.args[5])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    if path.is_empty() {
+        // AT_EMPTY_PATH：作用于 dirfd 指向的文件本身。
+        let fd = dirfd_as_fd(&dirfd, &fdt).ok_or(Errno::EINVAL)?;
+        operation::fsetxattr(&vfs_ctx, &fdt, fd, &name, &value, flags).map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+    let no_follow = (flags & AT_SYMLINK_NOFOLLOW as u32) != 0;
+    operation::setxattr(&vfs_ctx, &dirfd, &path, &name, &value, flags, no_follow)
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_getxattrat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let name = copy_xattr_name(ctx.args[2])?;
+    let value = ctx.args[3];
+    let size = ctx.args[4];
+    let flags = xattrat_flags_validate(ctx.args[5])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let data = if path.is_empty() {
+        let fd = dirfd_as_fd(&dirfd, &fdt).ok_or(Errno::EINVAL)?;
+        operation::fgetxattr(&vfs_ctx, &fdt, fd, &name)
+            .map_err(|e| e.to_errno())?
+            .ok_or(Errno::ENODATA)?
+    } else {
+        let no_follow = (flags & AT_SYMLINK_NOFOLLOW as u32) != 0;
+        operation::getxattr(&vfs_ctx, &dirfd, &path, &name, no_follow)
+            .map_err(|e| e.to_errno())?
+            .ok_or(Errno::ENODATA)?
+    };
+    copy_xattr_out(value, size, &data)
+}
+
+pub(super) fn sys_listxattrat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let list = ctx.args[2];
+    let size = ctx.args[3];
+    let flags = xattrat_flags_validate(ctx.args[4])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    let names = if path.is_empty() {
+        let fd = dirfd_as_fd(&dirfd, &fdt).ok_or(Errno::EINVAL)?;
+        operation::flistxattr(&vfs_ctx, &fdt, fd).map_err(|e| e.to_errno())?
+    } else {
+        let no_follow = (flags & AT_SYMLINK_NOFOLLOW as u32) != 0;
+        operation::listxattr(&vfs_ctx, &dirfd, &path, no_follow).map_err(|e| e.to_errno())?
+    };
+    let data = vfs::xattr::encode_list(&names);
+    copy_xattr_out(list, size, &data)
+}
+
+pub(super) fn sys_removexattrat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let name = copy_xattr_name(ctx.args[2])?;
+    let flags = xattrat_flags_validate(ctx.args[3])?;
+    let vfs_ctx = vfs_ctx_or_err()?;
+    if path.is_empty() {
+        let fd = dirfd_as_fd(&dirfd, &fdt).ok_or(Errno::EINVAL)?;
+        operation::fremovexattr(&vfs_ctx, &fdt, fd, &name).map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+    let no_follow = (flags & AT_SYMLINK_NOFOLLOW as u32) != 0;
+    operation::removexattr(&vfs_ctx, &dirfd, &path, &name, no_follow)
+        .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+/// 从 Dirfd 取底层 fd（仅 Fd 变体；Cwd 返回 None）。
+///
+/// FdTable 无反向索引，用快照线性反查（AT_EMPTY_PATH 属低频路径）。
+fn dirfd_as_fd(dirfd: &Dirfd, fdt: &vfs::fdtable::FdTable) -> Option<Fd> {
+    match dirfd {
+        Dirfd::Cwd => None,
+        Dirfd::Fd(file) => fdt
+            .snapshot_fds()
+            .into_iter()
+            .find(|(_, f)| alloc::sync::Arc::ptr_eq(f, file))
+            .map(|(raw, _)| Fd::from_raw(raw)),
+    }
+}
+
+
 
 pub(super) fn sys_lookup_dcookie(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
@@ -3266,21 +3517,7 @@ pub(super) fn sys_listmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_setxattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
-}
 
-pub(super) fn sys_getxattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
-}
-
-pub(super) fn sys_listxattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
-}
-
-pub(super) fn sys_removexattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
-}
 
 pub(super) fn sys_open_tree_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
