@@ -163,6 +163,21 @@ impl TaskExtCloneHook for KernelExtCloneHook {
                     Arc::new(general::ipc::sem_undo::SemUndoTable::new())
                 }
             }
+            crate::syscalls::ipc::TASKEXT_KEYRINGS => {
+                let process = Arc::clone(src)
+                    .downcast::<general::ipc::keys::ProcessKeyrings>()
+                    .expect("[sched][ext] process keyrings type mismatch");
+                // CLONE_THREAD 共享 thread keyring；fork 时新建引用集并继承
+                // process/session keyring 引用（Linux copy_keys 语义）。
+                if flags.has(CloneFlags::CLONE_THREAD) {
+                    process
+                } else {
+                    let child = general::ipc::keys::ProcessKeyrings::new();
+                    *child.process.lock() = *process.process.lock();
+                    *child.session.lock() = *process.session.lock();
+                    Arc::new(child)
+                }
+            }
             _ => Arc::clone(src),
         }
     }

@@ -4,12 +4,18 @@
 //! asm-generic ABI 编解码、当前任务凭据转换、阻塞调度和 VM 映射操作。
 
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
 use errno::Errno;
+use general::ipc::keys::{
+    KEY_DEFAULT_PERM, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_SESSION_KEYRING, KeyId, KeyManager,
+    KeyState, KeyType, ProcessKeyrings,
+};
 use general::ipc::mqueue::{
     MQ_ATTR_CURMSGS, MQ_ATTR_FLAGS, MQ_ATTR_MAXMSG, MQ_ATTR_MSGSIZE, MQ_ATTR_SIZE, MQ_NAME_MAX,
     SI_MESGQ, MqAttr, MqNotifyKind, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
@@ -81,9 +87,16 @@ const MSGSEG: u16 = 0xffff;
 /// 每个任务/进程的 `SEM_UNDO` 撤销表（`Arc<SemUndoTable>`）。
 pub(crate) const TASKEXT_SEM_UNDO: sched::TaskExtKey = 0x0004_0001;
 
+/// 每个任务/进程的 keyring 引用（`Arc<ProcessKeyrings>`）。
+pub(crate) const TASKEXT_KEYRINGS: sched::TaskExtKey = 0x0004_0002;
+
+/// key 描述符/类型的最大长度。
+const KEY_DESC_MAX: usize = 4096;
+
 static SYSV_SHM_MANAGER: Spinlock<Option<Arc<ShmManager>>> = Spinlock::new(None);
 static SYSV_SEM_MANAGER: Spinlock<Option<Arc<SemManager>>> = Spinlock::new(None);
 static SYSV_MSG_MANAGER: Spinlock<Option<Arc<MsgManager>>> = Spinlock::new(None);
+static SYSV_KEYS_MANAGER: Spinlock<Option<Arc<KeyManager>>> = Spinlock::new(None);
 
 pub(super) fn sys_shmget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let key = ShmKey(ctx.args[0] as i32);
@@ -946,16 +959,440 @@ fn mq_notify_dispatcher(notification: &general::ipc::mqueue::MqNotification) {
     }
 }
 
-pub(super) fn sys_add_key(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_add_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let type_user = ctx.args[0];
+    let desc_user = ctx.args[1];
+    let payload_user = ctx.args[2];
+    let plen = ctx.args[3];
+    let keyring_arg = ctx.args[4] as i32;
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
+    let manager = keys_manager();
+    let now = now_sec_u64();
+
+    let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
+    let mut payload = vec![0u8; plen];
+    if plen > 0 {
+        copy_from_user(payload_user, &mut payload).map_err(|e| e.as_errno())?;
+    }
+    let keyring = resolve_keyring(&manager, &process_keyrings(ctx), keyring_arg, &cred, now)?;
+    let id = manager.add_key(key_type, &description, payload, keyring, &cred, now)?;
+    Ok(id.0 as usize)
 }
 
-pub(super) fn sys_request_key(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_request_key(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let type_user = ctx.args[0];
+    let desc_user = ctx.args[1];
+    let info_user = ctx.args[2];
+    let keyring_arg = ctx.args[3] as i32;
+    let dest_keyring_arg = ctx.args[4] as i32;
+    let task = Arc::clone(ctx.task());
+    let cred = vfs_cred_from_sched(&task.credentials());
+    let manager = keys_manager();
+    let now = now_sec_u64();
+    let process = process_keyrings(ctx);
+
+    let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
+    let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+    let description = copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
+    let info = if info_user != 0 {
+        copy_cstr_from_user(info_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?
+    } else {
+        alloc::string::String::new()
+    };
+
+    let search_keyring = resolve_keyring(&manager, &process, keyring_arg, &cred, now)?;
+    if let Ok(key) = manager.search(search_keyring, key_type, &description, &cred, now) {
+        return Ok(key.id.0 as usize);
+    }
+    // 未命中：创建未实例化 key + 授权 key，spawn `/sbin/request-key` upcall。
+    let dest_keyring = resolve_keyring(&manager, &process, dest_keyring_arg, &cred, now)?;
+    let key = manager.create_uninstantiated(
+        key_type,
+        &description,
+        cred.euid.0,
+        cred.egid.0,
+        KEY_DEFAULT_PERM,
+    )?;
+    let auth = manager.create_uninstantiated(
+        KeyType::User,
+        &format!("_reqkey_auth.{}", key.id.0),
+        cred.euid.0,
+        cred.egid.0,
+        KEY_DEFAULT_PERM,
+    )?;
+    *process.reqkey_auth.lock() = Some(auth.id);
+    if let Ok(dest) = manager.key(dest_keyring) {
+        dest.add_member(key.id, key_type.name(), &description);
+    }
+
+    // Linux 布局：/sbin/request-key <op> <key> <uid> <gid> <keyring> <type> <desc> <info>
+    let argv = vec![
+        "/sbin/request-key".to_string(),
+        "create".to_string(),
+        key.id.0.to_string(),
+        cred.euid.0.to_string(),
+        cred.egid.0.to_string(),
+        keyring_arg.to_string(),
+        key_type_name,
+        description.clone(),
+        info,
+    ];
+    let spawned =
+        sched::operation::spawn_user_process(&task, "/sbin/request-key", &argv, &[]).is_ok();
+    if !spawned {
+        *process.reqkey_auth.lock() = None;
+        return Err(Errno::ENOKEY);
+    }
+
+    // 等待实例化（最多 60 秒，可被信号打断）。
+    let deadline = sched::now_ns_direct().saturating_add(60_000_000_000);
+    loop {
+        match key.state() {
+            KeyState::Instantiated => return Ok(key.id.0 as usize),
+            KeyState::Negative => return Err(Errno::ENOKEY),
+            KeyState::Revoked => return Err(Errno::ENOKEY),
+            KeyState::Uninstantiated => {}
+        }
+        if sched::operation::has_interrupting_signal(&task) {
+            return Err(Errno::EINTR);
+        }
+        if sched::now_ns_direct() >= deadline {
+            return Err(Errno::ENOKEY);
+        }
+        sched::schedule_once(sched::now_ns_direct());
+    }
 }
 
-pub(super) fn sys_keyctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_keyctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const KEYCTL_GET_KEYRING_ID: usize = 0;
+    const KEYCTL_JOIN_SESSION_KEYRING: usize = 1;
+    const KEYCTL_UPDATE: usize = 2;
+    const KEYCTL_REVOKE: usize = 3;
+    const KEYCTL_CHOWN: usize = 4;
+    const KEYCTL_SETPERM: usize = 5;
+    const KEYCTL_DESCRIBE: usize = 6;
+    const KEYCTL_CLEAR: usize = 7;
+    const KEYCTL_LINK: usize = 8;
+    const KEYCTL_UNLINK: usize = 9;
+    const KEYCTL_SEARCH: usize = 10;
+    const KEYCTL_READ: usize = 11;
+    const KEYCTL_INSTANTIATE: usize = 12;
+    const KEYCTL_NEGATE: usize = 13;
+    const KEYCTL_SET_REQKEY_KEYRING: usize = 14;
+    const KEYCTL_SET_TIMEOUT: usize = 15;
+    const KEYCTL_ASSUME_AUTHORITY: usize = 16;
+    const KEYCTL_GET_SECURITY: usize = 17;
+    const KEYCTL_SESSION_TO_PARENT: usize = 18;
+    const KEYCTL_REJECT: usize = 19;
+    const KEYCTL_INSTANTIATE_IOV: usize = 20;
+    const KEYCTL_INVALIDATE: usize = 21;
+    const KEYCTL_GET_PERSISTENT: usize = 22;
+    const KEYCTL_RESTRICT_KEYRING: usize = 29;
+    const KEYCTL_CAPABILITIES: usize = 36;
+
+    let cmd = ctx.args[0];
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
+    let manager = keys_manager();
+    let now = now_sec_u64();
+
+    match cmd {
+        KEYCTL_GET_KEYRING_ID => {
+            // arg2: keyring（KEY_SPEC 或 id）；arg3: create 标志。
+            let spec = ctx.args[1] as i32;
+            let create = ctx.args[2] != 0;
+            if create && spec == KEY_SPEC_SESSION_KEYRING {
+                let name = format!("_ses.{}", cred.euid.0);
+                let key = manager.create_uninstantiated(
+                    KeyType::Keyring,
+                    &name,
+                    cred.euid.0,
+                    cred.egid.0,
+                    KEY_DEFAULT_PERM,
+                )?;
+                key.set_state(KeyState::Instantiated);
+                *process_keyrings(ctx).session.lock() = Some(key.id);
+                return Ok(key.id.0 as usize);
+            }
+            let keyring = resolve_keyring(&manager, &process_keyrings(ctx), spec, &cred, now)?;
+            Ok(keyring.0 as usize)
+        }
+        KEYCTL_JOIN_SESSION_KEYRING => {
+            let name_user = ctx.args[1];
+            let name = if name_user != 0 {
+                copy_cstr_from_user(name_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?
+            } else {
+                format!("_ses.{}", cred.euid.0)
+            };
+            let key = manager.create_uninstantiated(
+                KeyType::Keyring,
+                &name,
+                cred.euid.0,
+                cred.egid.0,
+                KEY_DEFAULT_PERM,
+            )?;
+            key.set_state(KeyState::Instantiated);
+            *process_keyrings(ctx).session.lock() = Some(key.id);
+            Ok(key.id.0 as usize)
+        }
+        KEYCTL_UPDATE => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let payload_user = ctx.args[2];
+            let plen = ctx.args[3];
+            let mut payload = vec![0u8; plen];
+            if plen > 0 {
+                copy_from_user(payload_user, &mut payload).map_err(|e| e.as_errno())?;
+            }
+            manager.update(key_id, payload, &cred)?;
+            Ok(0)
+        }
+        KEYCTL_REVOKE => {
+            manager.revoke(KeyId(ctx.args[1] as i32), &cred)?;
+            Ok(0)
+        }
+        KEYCTL_CHOWN => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let uid = ctx.args[2] as u32;
+            let gid = ctx.args[3] as u32;
+            manager.chown(
+                key_id,
+                (uid != u32::MAX).then_some(uid),
+                (gid != u32::MAX).then_some(gid),
+                &cred,
+            )?;
+            Ok(0)
+        }
+        KEYCTL_SETPERM => {
+            manager.setperm(KeyId(ctx.args[1] as i32), ctx.args[2] as u32, &cred)?;
+            Ok(0)
+        }
+        KEYCTL_DESCRIBE => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let buffer = ctx.args[2];
+            let buflen = ctx.args[3];
+            let description = manager.describe(key_id, &cred)?;
+            keyctl_copy_string(buffer, buflen, &description)
+        }
+        KEYCTL_CLEAR => {
+            manager.clear(KeyId(ctx.args[1] as i32), &cred)?;
+            Ok(0)
+        }
+        KEYCTL_LINK => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let keyring_id = KeyId(ctx.args[2] as i32);
+            manager.link(keyring_id, key_id, &cred)?;
+            Ok(0)
+        }
+        KEYCTL_UNLINK => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let keyring_id = KeyId(ctx.args[2] as i32);
+            manager.unlink(keyring_id, key_id, &cred)?;
+            Ok(0)
+        }
+        KEYCTL_SEARCH => {
+            let keyring_arg = ctx.args[1] as i32;
+            let type_user = ctx.args[2];
+            let desc_user = ctx.args[3];
+            let dest_keyring_arg = ctx.args[4] as i32;
+            let key_type_name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
+            let key_type = KeyType::parse(&key_type_name).ok_or(Errno::ENODEV)?;
+            let description =
+                copy_cstr_from_user(desc_user, KEY_DESC_MAX).map_err(|e| e.as_errno())?;
+            let search_keyring =
+                resolve_keyring(&manager, &process_keyrings(ctx), keyring_arg, &cred, now)?;
+            let key = manager.search(search_keyring, key_type, &description, &cred, now)?;
+            if dest_keyring_arg != 0 {
+                let dest = resolve_keyring(
+                    &manager,
+                    &process_keyrings(ctx),
+                    dest_keyring_arg,
+                    &cred,
+                    now,
+                )?;
+                if let Ok(dest_keyring) = manager.key(dest) {
+                    dest_keyring.add_member(key.id, key_type.name(), &description);
+                }
+            }
+            Ok(key.id.0 as usize)
+        }
+        KEYCTL_READ => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let buffer = ctx.args[2];
+            let buflen = ctx.args[3];
+            let data = manager.read(key_id, &cred)?;
+            if buffer == 0 || buflen == 0 {
+                return Ok(data.len());
+            }
+            let n = data.len().min(buflen);
+            copy_to_user(buffer, &data[..n]).map_err(|e| e.as_errno())?;
+            Ok(n)
+        }
+        KEYCTL_INSTANTIATE => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let payload_user = ctx.args[2];
+            let plen = ctx.args[3];
+            let keyring_id = KeyId(ctx.args[4] as i32);
+            let mut payload = vec![0u8; plen];
+            if plen > 0 {
+                copy_from_user(payload_user, &mut payload).map_err(|e| e.as_errno())?;
+            }
+            manager.instantiate(key_id, payload, true, keyring_id, None, now)?;
+            Ok(0)
+        }
+        KEYCTL_NEGATE => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let timeout = ctx.args[2] as u64;
+            let keyring_id = KeyId(ctx.args[3] as i32);
+            manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
+            Ok(0)
+        }
+        KEYCTL_REJECT => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let timeout = ctx.args[2] as u64;
+            let keyring_id = KeyId(ctx.args[4] as i32);
+            manager.instantiate(key_id, Vec::new(), false, keyring_id, Some(timeout), now)?;
+            Ok(0)
+        }
+        KEYCTL_SET_REQKEY_KEYRING => {
+            // 记录默认请求 keyring 偏好；本内核支持默认链，接受但不切换。
+            let _reqkey = ctx.args[1];
+            Ok(0)
+        }
+        KEYCTL_SET_TIMEOUT => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            manager.set_timeout(key_id, ctx.args[2] as u64, &cred, now)?;
+            Ok(0)
+        }
+        KEYCTL_ASSUME_AUTHORITY => {
+            // 置/清 reqkey_auth（upcall 进程用它认领授权 key）。
+            let key_arg = ctx.args[1] as i32;
+            let process = process_keyrings(ctx);
+            if key_arg == 0 {
+                *process.reqkey_auth.lock() = None;
+                Ok(0)
+            } else if key_arg == KEY_SPEC_REQKEY_AUTH_KEY {
+                Ok(process.reqkey_auth.lock().map(|id| id.0 as usize).unwrap_or(0))
+            } else {
+                *process.reqkey_auth.lock() = Some(KeyId(key_arg));
+                Ok(0)
+            }
+        }
+        KEYCTL_GET_SECURITY => {
+            let key_id = KeyId(ctx.args[1] as i32);
+            let buffer = ctx.args[2];
+            let buflen = ctx.args[3];
+            // 无 LSM：返回空的安全标签（Linux 无 LSM 时的行为）。
+            let _ = manager.describe(key_id, &cred)?;
+            keyctl_copy_string(buffer, buflen, "")
+        }
+        KEYCTL_SESSION_TO_PARENT => Err(Errno::EOPNOTSUPP),
+        KEYCTL_INSTANTIATE_IOV => {
+            // iovec 版 instantiate：聚合成单个负载。
+            let key_id = KeyId(ctx.args[1] as i32);
+            let iov_user = ctx.args[2];
+            let iovcnt = ctx.args[3];
+            let keyring_id = KeyId(ctx.args[4] as i32);
+            let payload = read_iovec_payload(iov_user, iovcnt)?;
+            manager.instantiate(key_id, payload, true, keyring_id, None, now)?;
+            Ok(0)
+        }
+        KEYCTL_INVALIDATE => {
+            manager.invalidate(KeyId(ctx.args[1] as i32), &cred)?;
+            Ok(0)
+        }
+        KEYCTL_GET_PERSISTENT => {
+            let uid = ctx.args[1] as u32;
+            let _keyring = ctx.args[2] as i32;
+            let id = manager.user_keyring(uid, &cred)?;
+            Ok(id.0 as usize)
+        }
+        KEYCTL_RESTRICT_KEYRING => {
+            // 限制 keyring 可链接的 key 类型；本内核 key 类型固定，接受空限制。
+            let keyring_id = KeyId(ctx.args[1] as i32);
+            let type_user = ctx.args[2];
+            if type_user != 0 {
+                let name = copy_cstr_from_user(type_user, 32).map_err(|e| e.as_errno())?;
+                if KeyType::parse(&name).is_none() {
+                    return Err(Errno::ENODEV);
+                }
+            }
+            let keyring = manager.key(keyring_id)?;
+            if !keyring.is_keyring() {
+                return Err(Errno::ENOTDIR);
+            }
+            Ok(0)
+        }
+        KEYCTL_CAPABILITIES => {
+            let buffer = ctx.args[1];
+            let buflen = ctx.args[2];
+            // Linux `keyctl_capabilities`：bit0 = capabilities 命令可用。
+            let caps: [u8; 1] = [1];
+            if buffer == 0 || buflen == 0 {
+                return Ok(caps.len());
+            }
+            let n = caps.len().min(buflen);
+            copy_to_user(buffer, &caps[..n]).map_err(|e| e.as_errno())?;
+            Ok(n)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 从 `KEY_SPEC_*` 或序列号解析 keyring；`0` 使用默认链。
+fn resolve_keyring(
+    manager: &KeyManager,
+    process: &ProcessKeyrings,
+    spec: i32,
+    cred: &vfs::cred::Credentials,
+    now: u64,
+) -> Result<KeyId, Errno> {
+    if spec == 0 {
+        return Ok(general::ipc::keys::default_keyring_chain(process, cred, manager, now));
+    }
+    manager.resolve_spec(spec, process, cred, now).map(|key| key.id)
+}
+
+/// 复制以 NUL 结尾的字符串到用户缓冲区；返回包含 NUL 的长度（Linux 语义）。
+fn keyctl_copy_string(buffer: usize, buflen: usize, value: &str) -> Result<usize, Errno> {
+    if buffer == 0 || buflen == 0 {
+        return Ok(value.len() + 1);
+    }
+    let bytes = value.as_bytes();
+    let n = bytes.len().min(buflen.saturating_sub(1));
+    copy_to_user(buffer, &bytes[..n]).map_err(|e| e.as_errno())?;
+    let nul = [0u8];
+    copy_to_user(buffer + n, &nul).map_err(|e| e.as_errno())?;
+    Ok(n + 1)
+}
+
+/// 读取 `struct iovec` 数组并聚合成一个负载缓冲区。
+fn read_iovec_payload(iov_user: usize, iovcnt: usize) -> Result<Vec<u8>, Errno> {
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let mut total = 0usize;
+    let mut payload = Vec::new();
+    for index in 0..iovcnt {
+        let address = iov_user.checked_add(index * 16).ok_or(Errno::EFAULT)?;
+        let mut raw = [0u8; 16];
+        copy_from_user(address, &mut raw).map_err(|e| e.as_errno())?;
+        let base = read_u64(&raw, 0) as usize;
+        let len = read_u64(&raw, 8) as usize;
+        if base == 0 && len != 0 {
+            return Err(Errno::EINVAL);
+        }
+        total = total.checked_add(len).ok_or(Errno::EINVAL)?;
+        if total > 1024 * 1024 {
+            return Err(Errno::E2BIG);
+        }
+        let start = payload.len();
+        payload.resize(total, 0);
+        if len > 0 {
+            copy_from_user(base, &mut payload[start..start + len]).map_err(|e| e.as_errno())?;
+        }
+    }
+    Ok(payload)
 }
 
 pub(super) fn sys_io_pgetevents(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -997,6 +1434,36 @@ fn sem_manager() -> Arc<SemManager> {
     let manager = Arc::new(SemManager::default());
     *slot = Some(Arc::clone(&manager));
     manager
+}
+
+fn keys_manager() -> Arc<KeyManager> {
+    let mut slot = SYSV_KEYS_MANAGER.lock();
+    if let Some(manager) = slot.as_ref() {
+        return Arc::clone(manager);
+    }
+    let manager = Arc::new(KeyManager::default());
+    *slot = Some(Arc::clone(&manager));
+    manager
+}
+
+/// 取当前任务的 keyring 引用集；不存在时惰性创建并挂载。
+fn process_keyrings(ctx: &SyscallContext<'_>) -> Arc<ProcessKeyrings> {
+    if let Some(process) = ctx
+        .task()
+        .ext_lookup(TASKEXT_KEYRINGS)
+        .and_then(|payload| payload.downcast::<ProcessKeyrings>().ok())
+    {
+        return process;
+    }
+    let process = Arc::new(ProcessKeyrings::new());
+    let erased: Arc<dyn core::any::Any + Send + Sync> = process.clone();
+    ctx.task().ext_install(TASKEXT_KEYRINGS, erased);
+    process
+}
+
+/// 单调时钟的当前秒数（key 到期时间戳使用）。
+fn now_sec_u64() -> u64 {
+    crate::vdso::clock_time_ns(1).unwrap_or(0) as u64 / 1_000_000_000
 }
 
 fn msg_manager() -> Arc<MsgManager> {

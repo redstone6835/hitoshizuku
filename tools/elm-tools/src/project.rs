@@ -1991,8 +1991,18 @@ fn migrate_standard_root_workspace(input: &str) -> Result<String, String> {
             .unwrap_or_else(|| "2024".to_string());
         let output = replace_workspace_package_inheritance(input, &version, &edition);
         let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
-        lines.retain(|line| line.trim() != "[workspace]");
-        lines.retain(|line| line.trim() != "[workspace.package]");
+        // 整段删除 [workspace] 与 [workspace.package]（保留内容行会残留孤儿键）。
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        if let Some(range) = manifest_section_range(&lines, "[workspace]") {
+            ranges.push(range);
+        }
+        if let Some(range) = manifest_section_range(&lines, "[workspace.package]") {
+            ranges.push(range);
+        }
+        ranges.sort_by_key(|range| core::cmp::Reverse(range.0));
+        for (start, end) in ranges {
+            lines.drain(start..end);
+        }
         let mut result = lines.join("\n");
         if output.ends_with('\n') {
             result.push('\n');
