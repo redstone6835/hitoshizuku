@@ -18,7 +18,8 @@ fn main() {
     generate_elm_build_bound(&root, &out_dir, &target);
     generate_soyo_trust_policy(&root, &out_dir);
     link_integrated_components();
-    select_kernel_linker_script(&root, &target);
+    generate_linker_variants(&root, &out_dir);
+    select_kernel_linker_script(&root, &out_dir, &target);
 
     println!("cargo:rerun-if-env-changed=INITRAMFS");
     println!("cargo:rerun-if-env-changed=ELM_TRUST_ANCHORS_FILE");
@@ -38,36 +39,170 @@ fn main() {
     println!("cargo:rustc-env=ELM_RUSTC_VERSION={}", rustc_version_line());
 }
 
+/// 生成派生链接脚本（debug ELF 与板级变体）。
+///
+/// 每个架构只手维护一份规范脚本（`qemu-loongarch64.ld` /
+/// `qemu-riscv64.ld`），全部变体只差头注释、`OUTPUT_FORMAT`、
+/// `BASE_ADDRESS`/`VIRTUAL_BASE_ADDRESS` 与调试段集合，统一在这里按
+/// 精确字符串替换生成到 `$OUT_DIR/linker/`，避免多份近重复脚本漂移
+/// （此前 RV 的 debug 脚本就因手改而残留 PECOFF 段、缺失 trap 段）。
+/// 任何替换失败都直接 panic，防止悄悄产出错误布局。
+fn generate_linker_variants(root: &Path, out_dir: &Path) {
+    let linker_dir = out_dir.join("linker");
+    std::fs::create_dir_all(&linker_dir)
+        .unwrap_or_else(|err| panic!("创建生成链接脚本目录失败：{err}"));
+
+    // ── LoongArch64 ──
+    let la_source = root.join("kernel/linker/qemu-loongarch64.ld");
+    println!("cargo:rerun-if-changed={}", la_source.display());
+    let la = std::fs::read_to_string(&la_source)
+        .unwrap_or_else(|err| panic!("读取 {} 失败：{err}", la_source.display()));
+
+    // 板级变体：2K1000LA 板 fork U-Boot 装载于物理 0x200000。
+    let board = replace_exact(
+        &la,
+        "BASE_ADDRESS = 0x90000000;",
+        "BASE_ADDRESS = 0x200000;",
+    );
+    let board = replace_exact(
+        &board,
+        "VIRTUAL_BASE_ADDRESS = 0x9000000090000000;",
+        "VIRTUAL_BASE_ADDRESS = 0x9000000002000000;",
+    );
+    let board = replace_first_comment(&board, LS2K1000_BOARD_HEADER);
+    std::fs::write(linker_dir.join("ls2k1000.ld"), board)
+        .unwrap_or_else(|err| panic!("写入 ls2k1000.ld 失败：{err}"));
+
+    // 调试变体：ELF 输出 + 完整调试段（QEMU loongarch64 -kernel 只接受 ELF）。
+    let debug_la = replace_exact(
+        &la,
+        "OUTPUT_FORMAT(binary)",
+        "OUTPUT_FORMAT(elf64-loongarch)",
+    );
+    let debug_la = replace_debug_sections(&debug_la);
+    let debug_la = replace_first_comment(&debug_la, LA_DEBUG_HEADER);
+    std::fs::write(linker_dir.join("qemu-loongarch64-debug.ld"), debug_la)
+        .unwrap_or_else(|err| panic!("写入 qemu-loongarch64-debug.ld 失败：{err}"));
+
+    // ── RISC-V64 ──
+    let rv_source = root.join("kernel/linker/qemu-riscv64.ld");
+    println!("cargo:rerun-if-changed={}", rv_source.display());
+    let rv = std::fs::read_to_string(&rv_source)
+        .unwrap_or_else(|err| panic!("读取 {} 失败：{err}", rv_source.display()));
+
+    // 调试变体：布局与 release 完全一致，仅保留完整调试段（release 已是 ELF）。
+    let debug_rv = replace_debug_sections(&rv);
+    let debug_rv = replace_first_comment(&debug_rv, RV_DEBUG_HEADER);
+    std::fs::write(linker_dir.join("qemu-riscv64-debug.ld"), debug_rv)
+        .unwrap_or_else(|err| panic!("写入 qemu-riscv64-debug.ld 失败：{err}"));
+}
+
+/// 2K1000LA 板级脚本头注释。
+const LS2K1000_BOARD_HEADER: &str =
+    "/* 生成文件：由 qemu-loongarch64.ld 派生（kernel/build.rs），勿手改。
+   龙芯 2K1000LA 开发板（LS2K1000-DP-FACTORY / BPI1001）fork U-Boot 装载基址。
+   板载 U-Boot 2022.04（Loongson fork）经 bootm 传统镜像把内核解压到物理
+   0x200000 后跳转（实测 \"Load Address: 00200000\"）。虚拟基址落在 DMW1
+   直映窗口（0x9000_0000_0000_0000 起，映射物理 0 起）。 */";
+
+/// LoongArch64 调试脚本头注释。
+const LA_DEBUG_HEADER: &str =
+    "/* 生成文件：由 qemu-loongarch64.ld 派生（kernel/build.rs），勿手改。
+   与 release 版同构，仅输出 ELF 并保留完整 .debug_* 段，供 QEMU/gdb 调试；
+   QEMU loongarch64 virt 的 -kernel 只接受 ELF。 */";
+
+/// RISC-V64 调试脚本头注释。
+const RV_DEBUG_HEADER: &str = "/* 生成文件：由 qemu-riscv64.ld 派生（kernel/build.rs），勿手改。
+   与 release 版同构，仅保留完整 .debug_* 段，供 QEMU/gdb 调试。 */";
+
+/// release 脚本中的最小调试段占位块。
+const RELEASE_DEBUG_LINE_BLOCK: &str = "    .debug_line : {\n        KEEP(*(.debug_line))\n    }";
+
+/// 调试变体使用的完整调试段（VMA 0，不占装载映像）。
+const DEBUG_SECTIONS: &str = "    .debug_info     0 : { *(.debug_info) }
+    .debug_abbrev   0 : { *(.debug_abbrev) }
+    .debug_line     0 : { *(.debug_line) }
+    .debug_str      0 : { *(.debug_str) }
+    .debug_ranges   0 : { *(.debug_ranges) }
+    .debug_aranges  0 : { *(.debug_aranges) }
+    .debug_frame    0 : { *(.debug_frame) }
+    .debug_loc      0 : { *(.debug_loc) }
+
+    /DISCARD/ : {
+        *(.comment)
+        *(.note*)
+    }";
+
+/// 精确替换；旧文本必须恰好出现一次，防止规范脚本改动后静默产出错误变体。
+fn replace_exact(text: &str, from: &str, to: &str) -> String {
+    let mut parts = text.split(from);
+    let head = parts.next().expect("split 至少产生一段");
+    let mut output = String::with_capacity(text.len());
+    output.push_str(head);
+    let mut count = 0usize;
+    for part in parts {
+        count += 1;
+        output.push_str(to);
+        output.push_str(part);
+    }
+    assert_eq!(count, 1, "链接脚本变体替换锚点 {from:?} 应恰好出现一次");
+    output
+}
+
+/// 替换（或前置）脚本头部注释块。
+fn replace_first_comment(text: &str, comment: &str) -> String {
+    let Some(start) = text.find("/*") else {
+        return format!("{comment}\n{text}");
+    };
+    let relative = &text[start..];
+    let end = relative.find("*/").expect("链接脚本注释块缺少结束符") + start + 2;
+    format!("{}{}{}", &text[..start], comment, &text[end..])
+}
+
+/// 把 release 的 `.debug_line` 占位块替换为完整调试段集合。
+fn replace_debug_sections(text: &str) -> String {
+    replace_exact(text, RELEASE_DEBUG_LINE_BLOCK, DEBUG_SECTIONS)
+}
+
 /// 按目标架构选择内核链接脚本，并作为 bin 链接参数注入。
 ///
 /// 链接脚本原先硬编码在 `.cargo/config.toml` 的 rustflags 中；移到 build.rs
-/// 后可以用环境变量选择板级脚本：
+/// 后可以用环境变量选择板级/调试脚本。每个架构只手维护一份规范脚本
+/// （见 [`generate_linker_variants`]），变体生成到 `$OUT_DIR/linker/`：
 ///
-/// - riscv64：`qemu-riscv64.ld`（QEMU virt / OpenSBI 直启）。
+/// - riscv64：默认 `qemu-riscv64.ld`（QEMU virt / OpenSBI 直启）；
+///   - `MYGO_RV_DEBUG_LINKER=1` → 生成的 `qemu-riscv64-debug.ld`（完整
+///     `.debug_*` 段，gdb 用）。
 /// - loongarch64：默认 `qemu-loongarch64.ld`（QEMU virt 直启）；
-///   - `MYGO_LA_BOARD=ls2k1000` → `ls2k1000.ld`（2K1000LA 板 fork U-Boot
-///     装载于物理 0x200000）；
-///   - `MYGO_LA_DEBUG_LINKER=1` → `qemu-loongarch64-debug.ld`（ELF 输出，
-///     QEMU loongarch64 virt 的 `-kernel` 只接受 ELF）。
-fn select_kernel_linker_script(root: &Path, target: &str) {
+///   - `MYGO_LA_BOARD=ls2k1000` → 生成的 `ls2k1000.ld`（2K1000LA 板 fork
+///     U-Boot 装载于物理 0x200000）；
+///   - `MYGO_LA_DEBUG_LINKER=1` → 生成的 `qemu-loongarch64-debug.ld`
+///     （ELF 输出，QEMU loongarch64 virt 的 `-kernel` 只接受 ELF）。
+fn select_kernel_linker_script(root: &Path, out_dir: &Path, target: &str) {
     println!("cargo:rerun-if-env-changed=MYGO_LA_BOARD");
     println!("cargo:rerun-if-env-changed=MYGO_LA_DEBUG_LINKER");
+    println!("cargo:rerun-if-env-changed=MYGO_RV_DEBUG_LINKER");
+    let generated = |name: &str| out_dir.join("linker").join(name);
     let script = match target {
-        "riscv64gc-unknown-none-elf" => "kernel/linker/qemu-riscv64.ld",
+        "riscv64gc-unknown-none-elf" => {
+            if std::env::var_os("MYGO_RV_DEBUG_LINKER").is_some_and(|v| v == "1") {
+                generated("qemu-riscv64-debug.ld")
+            } else {
+                root.join("kernel/linker/qemu-riscv64.ld")
+            }
+        }
         "loongarch64-unknown-none" => {
             if std::env::var_os("MYGO_LA_DEBUG_LINKER").is_some_and(|v| v == "1") {
-                "kernel/linker/qemu-loongarch64-debug.ld"
+                generated("qemu-loongarch64-debug.ld")
             } else if std::env::var_os("MYGO_LA_BOARD").is_some_and(|v| v == "ls2k1000") {
-                "kernel/linker/ls2k1000.ld"
+                generated("ls2k1000.ld")
             } else {
-                "kernel/linker/qemu-loongarch64.ld"
+                root.join("kernel/linker/qemu-loongarch64.ld")
             }
         }
         _ => return,
     };
-    let path = root.join(script);
-    println!("cargo:rerun-if-changed={}", path.display());
-    println!("cargo:rustc-link-arg-bin=kernel=-T{}", path.display());
+    println!("cargo:rustc-link-arg-bin=kernel=-T{}", script.display());
 }
 
 struct ConfiguredBuildBoundModule {

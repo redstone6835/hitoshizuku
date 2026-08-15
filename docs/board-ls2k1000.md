@@ -31,7 +31,8 @@ qemu-system-loongarch64 -machine virt -cpu la464 -m 1G -nographic \
 使用 fork U-Boot 的 mkimage（/tmp/uboot-full，v2025.04）：
 
 ```sh
-# 板级内核已按 0x200000 链接（ls2k1000.ld），传统镜像入口即内核入口
+# 板级内核已按 0x200000 链接（ls2k1000.ld 由 qemu-loongarch64.ld 在
+# kernel/build.rs 生成），传统镜像入口即内核入口
 /tmp/uboot-full/tools/mkimage -A loongarch64 -O linux -T kernel \
   -C none -a 0x200000 -e 0x200000 -n "mygo-ls2k1000" \
   -d build/loongarch64/kernel uImage
