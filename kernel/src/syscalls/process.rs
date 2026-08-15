@@ -10,6 +10,8 @@ use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy
 use general::syscall::SyscallContext;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
+use general::vfs::nsfs::ProcNsKind;
+use ns::UtsNamespace;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
@@ -85,6 +87,11 @@ static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_F
 
 pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = ctx.task();
+    // Linux：getpid 返回调用者 pid 命名空间中的 pid。
+    let ns = Arc::clone(&crate::ns::task_ns(task).pid);
+    if let Some(pid) = task.pid_in(&ns) {
+        return Ok(pid as usize);
+    }
     Ok(task
         .tgid_cached()
         .or_else(|| task.pid_root_cached())
@@ -284,6 +291,7 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         installed.commit();
     }
     ptrace_notify_fork(ctx.task(), flags, outcome.pid);
+    clone_install_namespaces(ctx.task(), &outcome.child, flags)?;
     Ok(outcome.pid as usize)
 }
 
@@ -347,6 +355,7 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         installed.commit();
     }
     ptrace_notify_fork(ctx.task(), args.flags, outcome.pid);
+    clone_install_namespaces(ctx.task(), &outcome.child, args.flags)?;
     Ok(outcome.pid as usize)
 }
 
@@ -1048,15 +1057,27 @@ fn clock_time_ns_for_task(task: &Arc<Task>, clock_id: usize) -> Option<u64> {
 }
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let uts = Arc::clone(&crate::ns::task_ns(ctx.task()).uts);
     let mut out = [0u8; 65 * 6];
     write_uts_field(&mut out, 0, b"MyGo");
-    write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"mygo");
+    let hostname = uts.hostname();
+    write_uts_ns_field(&mut out, 1, &hostname, b"mygo");
     write_uts_field(&mut out, 2, b"10.1.0");
     write_uts_field(&mut out, 3, b"MyGo kernel");
     write_uts_field(&mut out, 4, hal::platform::arch_name().as_bytes());
-    write_uts_dynamic_field(&mut out, 5, &UTS_DOMAINNAME, b"localdomain");
+    let domainname = uts.domainname();
+    write_uts_ns_field(&mut out, 5, &domainname, b"localdomain");
     copy_to_user(ctx.args[0], &out).map_err(|e| e.as_errno())?;
     Ok(0)
+}
+
+/// 写 `utsname` 字段：命名空间值非空时优先。
+fn write_uts_ns_field(out: &mut [u8], index: usize, value: &[u8], default: &[u8]) {
+    if value.iter().all(|byte| *byte == 0) {
+        write_uts_field(out, index, default);
+    } else {
+        write_uts_field(out, index, value);
+    }
 }
 
 pub(super) fn sys_getcpu(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -4680,8 +4701,9 @@ pub(super) fn sys_futex_requeue(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     )
 }
 
-pub(super) fn sys_unshare(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_unshare(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    crate::ns::unshare(ctx.task(), ctx.args[0] as u64)?;
+    Ok(0)
 }
 
 pub(super) fn sys_kexec_load(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -5127,6 +5149,90 @@ pub(crate) fn ptrace_singlestep_trap_hook(pc: usize) -> bool {
     true
 }
 
+/// clone 后安装命名空间：`CLONE_NEWUTS/NEWIPC/NEWTIME/NEWCGROUP` 换子进程
+/// 的引用集，`CLONE_NEWNS` 换子进程的 VFS 上下文，`CLONE_NEWPID` 已在
+/// clone 前经 pending 命名空间生效。
+fn clone_install_namespaces(
+    parent: &Arc<Task>,
+    child: &Arc<Task>,
+    flags: CloneFlags,
+) -> Result<(), Errno> {
+    use sched::clone_flags::CloneFlags as F;
+
+    let ns_flags = flags.raw()
+        & (F::CLONE_NEWNS
+            | F::CLONE_NEWCGROUP
+            | F::CLONE_NEWUTS
+            | F::CLONE_NEWIPC
+            | F::CLONE_NEWPID);
+    if ns_flags == 0 {
+        return Ok(());
+    }
+    if !parent.credentials().has_cap(sched::ids::Capability::SysAdmin) {
+        return Err(Errno::EPERM);
+    }
+    let parent_ns = crate::ns::task_ns(parent);
+    if flags.has(F::CLONE_NEWPID) {
+        // 子进程进新 pid 命名空间（sched 的 child_pid_ns hook 已消费）。
+        // 无需额外动作；验证子进程确实注册进了新 ns。
+    }
+    if flags.has(F::CLONE_NEWNS)
+        || flags.has(F::CLONE_NEWCGROUP)
+        || flags.has(F::CLONE_NEWUTS)
+        || flags.has(F::CLONE_NEWIPC)
+    {
+        let mut proxy = crate::ns::NsProxy {
+            uts: Arc::clone(&parent_ns.uts),
+            ipc: Arc::clone(&parent_ns.ipc),
+            time: Arc::clone(&parent_ns.time),
+            cgroup: Arc::clone(&parent_ns.cgroup),
+            pid: crate::ns::child_pid_namespace(parent),
+            pending_pid: sched::sync::Spinlock::new(None),
+        };
+        if flags.has(F::CLONE_NEWUTS) {
+            proxy.uts = ns::UtsNamespace::new(&parent_ns.uts.hostname(), &parent_ns.uts.domainname());
+        }
+        if flags.has(F::CLONE_NEWIPC) {
+            proxy.ipc = crate::ns::IpcNamespace::new();
+        }
+        if flags.has(F::CLONE_NEWCGROUP) {
+            proxy.cgroup = ns::CgroupNamespace::new();
+        }
+        let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(proxy);
+        child.ext_install(crate::ns::TASKEXT_NS, erased);
+        if flags.has(F::CLONE_NEWNS) {
+            if let Some(vfs_ctx) = child
+                .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
+                .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
+            {
+                if let Ok(forked) = vfs_ctx.clone_with_new_ns() {
+                    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(forked);
+                    child.ext_install(sched::TASKEXT_VFS_CONTEXT, erased);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 命名空间 provider（procfs `/proc/<pid>/ns/*` 使用）。
+pub(crate) fn ns_provider(pid: i32, kind: ProcNsKind) -> Option<Arc<dyn ns::Namespace>> {
+    let task = sched::operation::lookup_pid(pid).ok()?;
+    let proxy = crate::ns::task_ns(&task);
+    match kind {
+        ProcNsKind::Uts => Some(proxy.uts.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Ipc => Some(proxy.ipc.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Time => Some(proxy.time.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Cgroup => Some(proxy.cgroup.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Pid => Some(proxy.pid.clone() as Arc<dyn ns::Namespace>),
+        ProcNsKind::Mount => task
+            .ext_lookup(sched::TASKEXT_VFS_CONTEXT)
+            .and_then(|payload| payload.downcast::<general::vfs::VfsContext>().ok())
+            .map(|ctx| Arc::clone(&ctx.mount_ns) as Arc<dyn ns::Namespace>),
+        ProcNsKind::User | ProcNsKind::Net => None,
+    }
+}
+
 /// `PTRACE_O_TRACEFORK/VFORK/CLONE`：克隆事件通知（父进程停止）。
 fn ptrace_notify_fork(parent: &Arc<Task>, flags: CloneFlags, child_pid: i32) {
     const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
@@ -5238,11 +5344,37 @@ pub(super) fn sys_getresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 }
 
 pub(super) fn sys_sethostname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    set_uts_field(ctx, &UTS_HOSTNAME)
+    require_cap(ctx.task(), Capability::SysAdmin)?;
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    crate::ns::task_ns(ctx.task())
+        .uts
+        .set_hostname(&value[..len])
+        .map(|_| 0)
 }
 
 pub(super) fn sys_setdomainname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    set_uts_field(ctx, &UTS_DOMAINNAME)
+    require_cap(ctx.task(), Capability::SysAdmin)?;
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    crate::ns::task_ns(ctx.task())
+        .uts
+        .set_domainname(&value[..len])
+        .map(|_| 0)
 }
 
 pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -5275,8 +5407,21 @@ pub(super) fn sys_clock_adjtime(_ctx: &mut SyscallContext<'_>) -> Result<usize, 
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_setns(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_setns(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd_raw = ctx.args[0] as isize;
+    let nstype = ctx.args[1] as u64;
+    if fd_raw < 0 {
+        return Err(Errno::EBADF);
+    }
+    let fdt = general::vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt
+        .get_file(vfs::fdtable::Fd::from_raw(fd_raw as u32))
+        .ok_or(Errno::EBADF)?;
+    let ns_file = file
+        .downcast_ops::<general::vfs::nsfs::NsfsFileOps>()
+        .ok_or(Errno::EBADF)?;
+    crate::ns::setns(ctx.task(), Arc::clone(ns_file.namespace()), nstype)?;
+    Ok(0)
 }
 
 pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

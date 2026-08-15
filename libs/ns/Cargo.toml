@@ -1,0 +1,13 @@
+[package]
+name = "ns"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+errno = { path = "../errno", default-features = false }
+sched = { path = "../sched", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+[lib]
+name = "ns"
+path = "src/lib.rs"

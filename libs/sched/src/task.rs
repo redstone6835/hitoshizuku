@@ -766,6 +766,8 @@ struct Relations {
     /// `pid_in_ns[0]` 是根 ns 的 pid（对应 Linux `task->pid`）。
     /// 无 pid 注册时可保持空 —— 调度核心完全不依赖该字段。
     pid_in_ns: Vec<(Arc<PidNamespace>, PidT)>,
+    /// 任务所在的 pid 命名空间。
+    pid_ns: Arc<PidNamespace>,
 }
 
 /// 内核任务。
@@ -1046,6 +1048,7 @@ impl Task {
                 thread_group,
                 process_group,
                 pid_in_ns: Vec::new(),
+                pid_ns: crate::root_pid_ns(),
             }),
             native_owner: Spinlock::new(None),
             kstack: Spinlock::new(None),
@@ -2214,6 +2217,15 @@ impl Task {
     ///
     /// 多 ns 共享同一任务时多次调用：祖先 ns 在前、自身 ns 在后。重复登记
     /// 同一 namespace 视作配置错误（debug_assert）。
+    /// 任务所在的 pid 命名空间（spawn 前由调用方设置）。
+    pub fn set_pid_ns(&self, ns: Arc<PidNamespace>) {
+        self.rel.lock().pid_ns = ns;
+    }
+
+    pub fn pid_ns(&self) -> Arc<PidNamespace> {
+        Arc::clone(&self.rel.lock().pid_ns)
+    }
+
     pub fn register_pid(&self, ns: Arc<PidNamespace>, pid: PidT) {
         let mut rel = self.rel.lock();
         debug_assert!(

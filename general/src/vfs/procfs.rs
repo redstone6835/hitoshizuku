@@ -29,6 +29,7 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
+use super::nsfs::ProcNsKind;
 use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
@@ -88,6 +89,7 @@ const TASK_SLOT_ENVIRON: u64 = 9;
 const TASK_SLOT_COMM: u64 = 10;
 const TASK_SLOT_MAPS: u64 = 11;
 const TASK_SLOT_FD_DIR: u64 = 12;
+const TASK_SLOT_NS_DIR: u64 = 11;
 const TASK_SLOT_TASK_DIR: u64 = 13;
 const TASK_SLOT_MOUNTINFO: u64 = 14;
 const TASK_SLOT_MOUNTS: u64 = 15;
@@ -1370,6 +1372,7 @@ struct ProcTaskDirOps {
 impl InodeOps for ProcTaskDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
+            "ns" => Ok(proc_ns_dir_inode(self.fs_id, &self.weak_sb, self.pid)),
             "exe" => Ok(proc_task_link_inode(
                 self.fs_id,
                 &self.weak_sb,
@@ -3291,3 +3294,135 @@ fn render_pnp() -> String {
     }
     out
 }
+
+// ── /proc/<pid>/ns ───────────────────────────────────────────────────────────
+
+/// `/proc/<pid>/ns` 目录 inode。
+fn proc_ns_dir_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    pid: PidT,
+) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        proc_task_base(pid) + TASK_SLOT_NS_DIR,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcNsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+            pid,
+        }),
+    )
+}
+
+struct ProcNsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+    pid: PidT,
+}
+
+impl ProcNsDirOps {
+    fn ns_file_inode(&self, kind: ProcNsKind) -> Arc<Inode> {
+        mk_inode(
+            self.fs_id,
+            &self.weak_sb,
+            proc_ns_file_ino(self.pid, kind),
+            FileType::Regular,
+            0o444,
+            1,
+            Arc::new(ProcNsFileOps { pid: self.pid, kind }),
+        )
+    }
+}
+
+fn proc_ns_file_ino(pid: PidT, kind: ProcNsKind) -> u64 {
+    let base = match kind {
+        ProcNsKind::Uts => 0x60,
+        ProcNsKind::Ipc => 0x61,
+        ProcNsKind::Time => 0x62,
+        ProcNsKind::Cgroup => 0x63,
+        ProcNsKind::Pid => 0x64,
+        ProcNsKind::Mount => 0x65,
+        ProcNsKind::User => 0x66,
+        ProcNsKind::Net => 0x67,
+    };
+    PROC_FD_BASE + pid as u64 * 1_000_000 + base
+}
+
+impl InodeOps for ProcNsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        if name == "." || name == ".." {
+            return Err(VfsError::NotFound);
+        }
+        let kind = ProcNsKind::ALL
+            .iter()
+            .find(|kind| kind.name() == name)
+            .ok_or(VfsError::NotFound)?;
+        Ok(self.ns_file_inode(*kind))
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(8)
+            .map_err(|_| VfsError::NoSpace)?;
+        for kind in ProcNsKind::ALL {
+            snapshot.push(DirEntry {
+                ino: proc_ns_file_ino(self.pid, kind),
+                name: SmallStr::new(kind.name()),
+                kind: FileType::Regular,
+            });
+        }
+        Ok(Box::new(ProcDirFile { snapshot }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// `/proc/<pid>/ns/<type>` 文件：打开时经 provider 取命名空间。
+struct ProcNsFileOps {
+    pid: PidT,
+    kind: ProcNsKind,
+}
+
+impl InodeOps for ProcNsFileOps {
+    fn lookup(&self, _: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let provider = super::nsfs::ns_provider().ok_or(VfsError::NotFound)?;
+        let namespace = provider(self.pid, self.kind).ok_or(VfsError::NotFound)?;
+        Ok(Box::new(super::nsfs::NsfsFileOps::new(namespace)))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        let provider = super::nsfs::ns_provider().ok_or(VfsError::NotFound)?;
+        let namespace = provider(self.pid, self.kind).ok_or(VfsError::NotFound)?;
+        Ok(super::nsfs::ns_file_content(namespace.as_ref()))
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+

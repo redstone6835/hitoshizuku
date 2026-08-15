@@ -3,6 +3,7 @@ pub mod device_files;
 pub mod devpts;
 pub mod devtmpfs;
 pub mod mount_source;
+pub mod nsfs;
 pub mod mqueue;
 pub mod pidfd;
 pub mod procfs;

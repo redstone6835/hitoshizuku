@@ -104,7 +104,7 @@ pub(super) fn sys_shmget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let flags = ctx.args[2] as u32;
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
 
-    let manager = shm_manager();
+    let manager = Arc::clone(&task_ipc(ctx).shm);
     let id = manager.shmget(key, size, flags, &cred)?;
     Ok(id.0 as usize)
 }
@@ -130,7 +130,7 @@ pub(super) fn sys_shmat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
 
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let manager = shm_manager();
+    let manager = Arc::clone(&task_ipc(ctx).shm);
     let object = manager.attach(shmid, flags, &cred)?;
     let size = usize::try_from(object.len()).map_err(|_| Errno::EINVAL)?;
     let len = align_up(size, page_size).ok_or(Errno::EINVAL)?;
@@ -169,7 +169,7 @@ pub(super) fn sys_shmdt(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
     let (range, shmid_raw) = vm.sysv_shm_mapping_at(addr).ok_or(Errno::EINVAL)?;
     vm.unmap(range)?;
-    shm_manager().note_detach(ShmId(shmid_raw), task_pid(ctx), now_sec());
+    Arc::clone(&task_ipc(ctx).shm).note_detach(ShmId(shmid_raw), task_pid(ctx), now_sec());
     Ok(0)
 }
 
@@ -179,7 +179,7 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let cmd = raw_cmd & !IPC_64;
     let buf = ctx.args[2];
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let manager = shm_manager();
+    let manager = Arc::clone(&task_ipc(ctx).shm);
 
     match cmd {
         IPC_STAT => {
@@ -613,7 +613,7 @@ pub(super) fn sys_msgget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let key = MsgKey(ctx.args[0] as i32);
     let flags = ctx.args[1] as u32;
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let id = msg_manager().msgget(key, flags, &cred)?;
+    let id = Arc::clone(&task_ipc(ctx).msg).msgget(key, flags, &cred)?;
     Ok(id.0 as usize)
 }
 
@@ -623,7 +623,7 @@ pub(super) fn sys_msgctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let cmd = raw_cmd & !IPC_64;
     let buf = ctx.args[2];
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let manager = msg_manager();
+    let manager = Arc::clone(&task_ipc(ctx).msg);
 
     match cmd {
         IPC_STAT => {
@@ -682,7 +682,7 @@ pub(super) fn sys_msgrcv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EFAULT);
     }
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let queue = msg_manager().queue_for_operation(id)?;
+    let queue = Arc::clone(&task_ipc(ctx).msg).queue_for_operation(id)?;
     let task = Arc::clone(ctx.task());
     let pid = task_pid(ctx);
 
@@ -758,7 +758,7 @@ pub(super) fn sys_msgsnd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         copy_from_user(msgp + 8, &mut data).map_err(|e| e.as_errno())?;
     }
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let queue = msg_manager().queue_for_operation(id)?;
+    let queue = Arc::clone(&task_ipc(ctx).msg).queue_for_operation(id)?;
     let task = Arc::clone(ctx.task());
     let pid = task_pid(ctx);
 
@@ -804,7 +804,7 @@ pub(super) fn sys_semget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let nsems = ctx.args[1];
     let flags = ctx.args[2] as u32;
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let id = sem_manager().semget(key, nsems, flags, &cred, now_sec())?;
+    let id = Arc::clone(&task_ipc(ctx).sem).semget(key, nsems, flags, &cred, now_sec())?;
     Ok(id.0 as usize)
 }
 
@@ -814,7 +814,7 @@ pub(super) fn sys_semctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let cmd = (ctx.args[2] as u32) & !IPC_64;
     let arg = ctx.args[3];
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let manager = sem_manager();
+    let manager = Arc::clone(&task_ipc(ctx).sem);
     let pid = task_pid(ctx);
     let now = now_sec();
 
@@ -1436,6 +1436,11 @@ fn sem_manager() -> Arc<SemManager> {
     manager
 }
 
+/// 当前任务的 SysV IPC 命名空间（shm/sem/msg 管理器）。
+fn task_ipc(ctx: &SyscallContext<'_>) -> Arc<crate::ns::IpcNamespace> {
+    Arc::clone(&crate::ns::task_ns(ctx.task()).ipc)
+}
+
 fn keys_manager() -> Arc<KeyManager> {
     let mut slot = SYSV_KEYS_MANAGER.lock();
     if let Some(manager) = slot.as_ref() {
@@ -1487,7 +1492,7 @@ fn sys_semop_common(
         None => None,
     };
     let cred = vfs_cred_from_sched(&ctx.task().credentials());
-    let set = sem_manager().set_for_operation(id)?;
+    let set = Arc::clone(&task_ipc(ctx).sem).set_for_operation(id)?;
     let task = Arc::clone(ctx.task());
     let pid = task_pid(ctx);
     // 当前等待周期内登记的阻塞统计；每个周期结束注销，重新登记时可能指向
@@ -1618,7 +1623,7 @@ pub(super) fn apply_sem_undo_on_exit(task: &Arc<sched::Task>) {
     }
     let cred = vfs_cred_from_sched(&task.credentials());
     let pid = task.pid_root().unwrap_or(0);
-    let manager = sem_manager();
+    let manager = Arc::clone(&crate::ns::task_ns(task).ipc.sem);
     table.apply_on_exit(&manager, &cred, pid, now_sec(), task);
 }
 

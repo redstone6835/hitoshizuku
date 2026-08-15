@@ -468,6 +468,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_PIDFD_SEND_SIGNAL, signal::sys_pidfd_send_signal);
 
     ipc::register_mq_notify_dispatcher_once();
+    general::vfs::nsfs::register_ns_provider(process::ns_provider);
     #[cfg(target_arch = "riscv64")]
     arch::riscv64::trap::exception::register_user_break_hook(process::ptrace_singlestep_trap_hook);
     #[cfg(target_arch = "loongarch64")]

@@ -86,16 +86,24 @@ pub fn getegid() -> Gid {
 
 // ── 进程组 / 会话 ────────────────────────────────────────────────────────────
 
-/// 按根 pid 命名空间的 pid 查找任务（内核内部通知/辅助路径使用）。
+/// 按 pid 查找任务：从调用者自身的 pid 命名空间向根逐层解析
+/// （Linux `find_task_by_vpid` 语义）。
 pub fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
     if pid == 0 {
         return Ok(current_task());
     }
-    root_pid_ns()
-        .registry()
-        .lookup(pid)
-        .and_then(|w| w.upgrade())
-        .ok_or(Errno::ESRCH)
+    let me = current_task();
+    let mut ns = me.pid_ns();
+    loop {
+        if let Some(task) = ns.registry().lookup(pid).and_then(|w| w.upgrade()) {
+            return Ok(task);
+        }
+        match ns.parent() {
+            Some(parent) => ns = Arc::clone(parent),
+            None => break,
+        }
+    }
+    Err(Errno::ESRCH)
 }
 
 pub fn getpgid(pid: PidT) -> Result<PidT, Errno> {
@@ -1055,14 +1063,13 @@ pub(crate) fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_IO
         | CloneFlags::CLONE_CLEAR_SIGHAND;
+    // NEWUSER/NEWNET 未实现（能力语义改造/网络栈 per-ns）；NEWTIME 只能经
+    // unshare(2) 使用（clone 报 EINVAL）。NEWNS/NEWCGROUP/NEWUTS/NEWIPC/
+    // NEWPID 由 kernel 侧在 clone 完成后安装命名空间。
     const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWCGROUP
-        | CloneFlags::CLONE_NEWUTS
-        | CloneFlags::CLONE_NEWIPC
         | CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNET
+        | CloneFlags::CLONE_NEWTIME
         | CloneFlags::CLONE_IO;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
         return Err(Errno::EINVAL);

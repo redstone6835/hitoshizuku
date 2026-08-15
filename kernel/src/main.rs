@@ -28,6 +28,7 @@ mod kcsan_runtime;
 mod native_runtime;
 mod net_runtime;
 mod net_stack;
+mod ns;
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 mod net_tests;
 mod panic;

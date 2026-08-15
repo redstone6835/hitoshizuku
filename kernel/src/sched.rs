@@ -1409,7 +1409,10 @@ pub fn boot_init() -> Arc<Task> {
 
         init.ext_install(TASKEXT_VFS_CONTEXT, vfs_ctx);
         init.ext_install(TASKEXT_VFS_FDTABLE, fdtable);
-        log::info!("[sched][boot] init ext: vfs ctx + fdtable + stdio installed");
+        // 根命名空间（uts/ipc/time/cgroup/pid）。
+        let root_ns: Arc<dyn core::any::Any + Send + Sync> = crate::ns::NsProxy::root();
+        init.ext_install(crate::ns::TASKEXT_NS, root_ns);
+        log::info!("[sched][boot] init ext: vfs ctx + fdtable + stdio + ns installed");
     } else {
         log::info!("[sched][boot] BOOT_VFS_PARTS empty — init has no vfs ext");
     }
@@ -1421,6 +1424,10 @@ pub fn boot_init() -> Arc<Task> {
     // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
+    // pid 命名空间：子进程的命名空间由 kernel 的 NsProxy.pending_pid 决定。
+    sched::spawn::register_child_pid_ns_hook(|parent| {
+        crate::ns::task_ns(parent).pending_pid.lock().take()
+    });
     crate::native_runtime::register();
 
     init
