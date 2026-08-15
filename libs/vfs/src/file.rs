@@ -689,6 +689,15 @@ impl File {
         if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
+        // fanotify 权限事件：FAN_ACCESS_PERM 在读取前裁决。
+        if crate::fsnotify::perm_enabled() {
+            crate::fsnotify::emit_perm_at(
+                &self.inode,
+                Some(self.mount()),
+                crate::fsnotify::FAN_ACCESS_PERM,
+            )
+            .map_deny()?;
+        }
         let _pos_guard = self.pos_lock.lock();
         let offset = self.pos.load(Ordering::Acquire);
         let n = self.ops.read_at(buf, offset)?;
@@ -697,7 +706,13 @@ impl File {
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
         if n > 0 && crate::fsnotify::is_enabled() {
-            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_ACCESS, 0);
+            crate::fsnotify::emit_at_with_parents(
+                &self.inode,
+                Some(&self.dentry),
+                Some(self.mount()),
+                crate::fsnotify::IN_ACCESS,
+                0,
+            );
         }
         Ok(n)
     }
@@ -736,7 +751,13 @@ impl File {
             Ok(n)
         };
         if result.is_ok() && !buf.is_empty() && crate::fsnotify::is_enabled() {
-            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_MODIFY, 0);
+            crate::fsnotify::emit_at_with_parents(
+                &self.inode,
+                Some(&self.dentry),
+                Some(self.mount()),
+                crate::fsnotify::IN_MODIFY,
+                0,
+            );
         }
         result
     }
@@ -813,7 +834,13 @@ impl File {
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
         if n > 0 && crate::fsnotify::is_enabled() {
-            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_MODIFY, 0);
+            crate::fsnotify::emit_at_with_parents(
+                &self.inode,
+                Some(&self.dentry),
+                Some(self.mount()),
+                crate::fsnotify::IN_MODIFY,
+                0,
+            );
         }
         Ok(n)
     }
@@ -1056,7 +1083,13 @@ impl File {
             } else {
                 crate::fsnotify::IN_CLOSE_NOWRITE
             };
-            crate::fsnotify::emit(&self.inode, mask, 0);
+            crate::fsnotify::emit_at_with_parents(
+                &self.inode,
+                Some(&self.dentry),
+                Some(self.mount()),
+                mask,
+                0,
+            );
         }
     }
 

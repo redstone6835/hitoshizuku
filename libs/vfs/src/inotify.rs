@@ -116,7 +116,13 @@ impl InotifyInstance {
             flags,
             unlinked: core::sync::atomic::AtomicBool::new(false),
             inode: Arc::downgrade(inode),
+            dentry: alloc::sync::Weak::new(),
+            mount: alloc::sync::Weak::new(),
             target: self.self_weak.lock().clone(),
+            scope: fsnotify::WatchScope::Inode,
+            ignored_mask: core::sync::atomic::AtomicU32::new(0),
+            perm: false,
+            named_requires_echild: false,
         });
         watches.insert(wd, Arc::clone(&watch));
         drop(watches);
@@ -164,15 +170,13 @@ impl InotifyInstance {
         use core::fmt::Write;
         let watches = self.watches.lock();
         for watch in watches.values() {
-            let ino = watch
-                .inode
-                .upgrade()
-                .map(|i| i.ino())
-                .unwrap_or(0);
+            let ino = watch.inode.upgrade().map(|i| i.ino()).unwrap_or(0);
             let _ = writeln!(
                 out,
                 "inotify wd:{} ino:{:x} sdev:00000000 mask:{:08x} ignored_mask:00000000",
-                watch.wd, ino, watch.mask.load(Ordering::Acquire)
+                watch.wd,
+                ino,
+                watch.mask.load(Ordering::Acquire)
             );
         }
     }

@@ -50,6 +50,12 @@ if [ -x /bin/xattr-test ]; then
     status=$?
     echo "[init][fs-tests] xattr tests exit=$status"
 fi
+if [ -x /bin/fanotify-test ]; then
+    echo "[init][fs-tests] running fanotify tests"
+    /bin/fanotify-test
+    status=$?
+    echo "[init][fs-tests] fanotify tests exit=$status"
+fi
 if [ -x /bin/loongarch-sxe-test ]; then
     echo "[init][lazy-sxe-tests] running LoongArch FP/LSX state tests"
     /bin/loongarch-sxe-test

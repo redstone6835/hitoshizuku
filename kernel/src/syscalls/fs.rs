@@ -602,10 +602,7 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 }
 
 /// TIOCGPTPEER:返回指向 pty master 的 slave 的新 fd(Linux 语义)。
-fn sys_tiocgptpeer(
-    ctx: &mut SyscallContext<'_>,
-    file: &vfs::file::File,
-) -> Result<usize, Errno> {
+fn sys_tiocgptpeer(ctx: &mut SyscallContext<'_>, file: &vfs::file::File) -> Result<usize, Errno> {
     let Some(master) = file.downcast_ops::<general::dev::tty::PtyMasterFileOps>() else {
         return Err(Errno::ENOTTY);
     };
@@ -621,7 +618,11 @@ fn sys_tiocgptpeer(
     };
     let slave = general::dev::tty::open_slave_file(&pair, opts, vfs_ctx.cred().clone())
         .map_err(|e| e.to_errno())?;
-    let fd_flags = if opts.cloexec { FdFlags::CLOEXEC } else { FdFlags::default() };
+    let fd_flags = if opts.cloexec {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::default()
+    };
     let fd = fdt.alloc_fd(slave, fd_flags).map_err(|e| e.to_errno())?;
     Ok(fd.as_raw() as usize)
 }
@@ -2724,8 +2725,8 @@ fn copy_xattr_name(user: usize) -> Result<Vec<u8>, Errno> {
     if user == 0 {
         return Err(Errno::EFAULT);
     }
-    let name = copy_cstr_from_user(user, vfs::xattr::XATTR_NAME_MAX + 1)
-        .map_err(|e| e.as_errno())?;
+    let name =
+        copy_cstr_from_user(user, vfs::xattr::XATTR_NAME_MAX + 1).map_err(|e| e.as_errno())?;
     let bytes = name.as_bytes();
     if bytes.is_empty() {
         return Err(Errno::EINVAL);
@@ -2853,8 +2854,8 @@ pub(super) fn sys_listxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let list = ctx.args[1];
     let size = ctx.args[2];
     let vfs_ctx = vfs_ctx_or_err()?;
-    let names = operation::listxattr(&vfs_ctx, &Dirfd::Cwd, &path, false)
-        .map_err(|e| e.to_errno())?;
+    let names =
+        operation::listxattr(&vfs_ctx, &Dirfd::Cwd, &path, false).map_err(|e| e.to_errno())?;
     let data = vfs::xattr::encode_list(&names);
     copy_xattr_out(list, size, &data)
 }
@@ -2864,8 +2865,8 @@ pub(super) fn sys_llistxattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let list = ctx.args[1];
     let size = ctx.args[2];
     let vfs_ctx = vfs_ctx_or_err()?;
-    let names = operation::listxattr(&vfs_ctx, &Dirfd::Cwd, &path, true)
-        .map_err(|e| e.to_errno())?;
+    let names =
+        operation::listxattr(&vfs_ctx, &Dirfd::Cwd, &path, true).map_err(|e| e.to_errno())?;
     let data = vfs::xattr::encode_list(&names);
     copy_xattr_out(list, size, &data)
 }
@@ -2885,8 +2886,7 @@ pub(super) fn sys_removexattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let path = copy_path_from_user(ctx.args[0])?;
     let name = copy_xattr_name(ctx.args[1])?;
     let vfs_ctx = vfs_ctx_or_err()?;
-    operation::removexattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, false)
-        .map_err(|e| e.to_errno())?;
+    operation::removexattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, false).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -2894,8 +2894,7 @@ pub(super) fn sys_lremovexattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let path = copy_path_from_user(ctx.args[0])?;
     let name = copy_xattr_name(ctx.args[1])?;
     let vfs_ctx = vfs_ctx_or_err()?;
-    operation::removexattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, true)
-        .map_err(|e| e.to_errno())?;
+    operation::removexattr(&vfs_ctx, &Dirfd::Cwd, &path, &name, true).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -2992,8 +2991,7 @@ pub(super) fn sys_removexattrat(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         return Ok(0);
     }
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW as u32) != 0;
-    operation::removexattr(&vfs_ctx, &dirfd, &path, &name, no_follow)
-        .map_err(|e| e.to_errno())?;
+    operation::removexattr(&vfs_ctx, &dirfd, &path, &name, no_follow).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -3010,8 +3008,6 @@ fn dirfd_as_fd(dirfd: &Dirfd, fdt: &vfs::fdtable::FdTable) -> Option<Fd> {
             .map(|(raw, _)| Fd::from_raw(raw)),
     }
 }
-
-
 
 pub(super) fn sys_lookup_dcookie(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
@@ -3067,11 +3063,11 @@ pub(super) fn sys_inotify_add_watch(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let instance = vfs::inotify::instance_from_file(&file).ok_or(Errno::EINVAL)?;
     let no_follow = (mask & IN_DONT_FOLLOW) != 0;
     let onlydir = (mask & IN_ONLYDIR) != 0;
-    let inode =
-        operation::lookup_watch_inode(&vfs_ctx, &Dirfd::Cwd, &path, no_follow, onlydir)
-            .map_err(|e| e.to_errno())?;
+    let inode = operation::lookup_watch_inode(&vfs_ctx, &Dirfd::Cwd, &path, no_follow, onlydir)
+        .map_err(|e| e.to_errno())?;
     let watch_mask = mask & IN_EVENT_BITS;
-    let watch_flags = mask & (IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | IN_ONESHOT);
+    let watch_flags =
+        mask & (IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | IN_ONESHOT);
     let wd = instance.add_watch(&inode, watch_mask, watch_flags)?;
     Ok(wd as usize)
 }
@@ -3290,12 +3286,61 @@ pub(super) fn sys_acct(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(0)
 }
 
-pub(super) fn sys_fanotify_init(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_fanotify_init(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let flags = ctx.args[0] as u32;
+    let event_f_flags = ctx.args[1] as u32;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fd = vfs::fanotify::create_group(&fdt, vfs_ctx.cred(), flags, event_f_flags)?;
+    Ok(fd.as_raw() as usize)
 }
 
-pub(super) fn sys_fanotify_mark(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_fanotify_mark(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let flags = ctx.args[1] as u32;
+    let mask = ctx.args[2] as u32;
+    let dirfd = ctx.args[3];
+    let path_user = ctx.args[4];
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let file = file_for_fd(fd)?;
+    let group = vfs::fanotify::group_from_file(&file).ok_or(Errno::EINVAL)?;
+    let has_sysadmin = vfs_ctx.cred().has_cap(vfs::cred::Capability::SysAdmin);
+
+    // pathname == NULL → 标记 dirfd 指向的对象本身（inode 作用域）。
+    let (inode, mount, sb_id) = if path_user == 0 {
+        let df = file_for_fd(fd_arg(dirfd)?)?;
+        let inode = Arc::clone(df.inode());
+        let sb_id = inode
+            .superblock()
+            .map(|sb| sb.fs_id.raw() as u64)
+            .unwrap_or(0);
+        (Some(inode), Some(Arc::clone(df.mount())), sb_id)
+    } else {
+        let path = copy_path_from_user(path_user)?;
+        let dirfd = dirfd_arg(dirfd, &fdt)?;
+        let no_follow = (flags & vfs::fanotify::FAN_MARK_DONT_FOLLOW) != 0;
+        let onlydir = (flags & vfs::fanotify::FAN_MARK_ONLYDIR) != 0;
+        let (inode, mount, sb_id) =
+            operation::lookup_for_fanotify(&vfs_ctx, &dirfd, &path, no_follow, onlydir)
+                .map_err(|e| e.to_errno())?;
+        (Some(inode), Some(mount), sb_id)
+    };
+    let (i_ref, m_ref) = match (inode, mount) {
+        (Some(i), Some(m)) => (Some(i), Some(m)),
+        _ => (None, None),
+    };
+    vfs::fanotify::mark(
+        &group,
+        flags,
+        mask,
+        i_ref.as_ref(),
+        None,
+        m_ref.as_ref(),
+        sb_id,
+        has_sysadmin,
+    )?;
+    Ok(0)
 }
 
 pub(super) fn sys_name_to_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3572,8 +3617,6 @@ pub(super) fn sys_statmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 pub(super) fn sys_listmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
-
-
 
 pub(super) fn sys_open_tree_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
