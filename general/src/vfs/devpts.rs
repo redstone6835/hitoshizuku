@@ -12,13 +12,13 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::boxed::Box;
 use vfs::dentry::{Dentry, SmallStr};
 use vfs::error::{VfsError, VfsResult};
-use alloc::boxed::Box;
 use vfs::file::{DirEntry, FileOps, OpenOptions, PollEvents};
 use vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
-use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::mount::MountFlags;
+use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
@@ -273,7 +273,12 @@ impl DevPtsSuperblockOps {
 
     /// 在实例中创建 `/dev/pts/N` 节点。
     fn publish_slave(&self, pair: &Arc<PtyPair>) -> VfsResult<()> {
-        let sb = self.sb.lock().as_ref().and_then(Weak::upgrade).ok_or(VfsError::NoDevice)?;
+        let sb = self
+            .sb
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(VfsError::NoDevice)?;
         let root = sb.root_inode.clone();
         let ops = root
             .downcast_ops::<DevPtsRootOps>()
@@ -283,7 +288,10 @@ impl DevPtsSuperblockOps {
         name.try_reserve(8).ok();
         name.push_str(&index.to_string());
         let inode = Inode::new(
-            InodeId { fs_id: self.fs_id, ino: self.alloc_ino() },
+            InodeId {
+                fs_id: self.fs_id,
+                ino: self.alloc_ino(),
+            },
             FileType::CharDevice,
             device_numbers::pty_rdev(index),
             DEVPTS_NAME_MAX as u32,
@@ -299,7 +307,10 @@ impl DevPtsSuperblockOps {
                 ctime: Timespec::now(),
                 blocks: 0,
             },
-            Arc::new(DevPtsNodeOps { index, node_mode: self.options.node_mode }),
+            Arc::new(DevPtsNodeOps {
+                index,
+                node_mode: self.options.node_mode,
+            }),
             Arc::downgrade(&sb),
         );
         let mut nodes = ops.nodes.lock();
@@ -329,7 +340,13 @@ impl DevPtsSuperblockOps {
 
     /// 从实例中删除 `/dev/pts/N` 节点。
     fn unpublish_slave(&self, index: u32) {
-        let Ok(sb) = self.sb.lock().as_ref().and_then(Weak::upgrade).ok_or(VfsError::NoDevice) else {
+        let Ok(sb) = self
+            .sb
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(VfsError::NoDevice)
+        else {
             return;
         };
         let Some(ops) = sb.root_inode.downcast_ops::<DevPtsRootOps>() else {
@@ -468,7 +485,11 @@ pub fn open_slave_file(
     let mut name = String::new();
     name.try_reserve(8).ok();
     name.push_str(&index.to_string());
-    let dentry = Dentry::new_positive(&name, Some(Arc::clone(&sb.root_dentry)), Arc::clone(&node_inode));
+    let dentry = Dentry::new_positive(
+        &name,
+        Some(Arc::clone(&sb.root_dentry)),
+        Arc::clone(&node_inode),
+    );
     let mount = vfs::mount::Mount::new(
         Arc::clone(&sb),
         Arc::clone(&sb.root_dentry),
@@ -478,11 +499,6 @@ pub fn open_slave_file(
     );
     let ops = crate::vfs::devtmpfs::char_dev_file_ops(pair.slave_char_device()?, opts.nonblock)?;
     Ok(Arc::new(vfs::file::File::new(
-        node_inode,
-        opts,
-        cred,
-        ops,
-        dentry,
-        mount,
+        node_inode, opts, cred, ops, dentry, mount,
     )))
 }

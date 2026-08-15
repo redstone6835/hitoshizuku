@@ -165,8 +165,10 @@ impl PtyPair {
 
     fn note_master_open(&self, delta: i32) {
         let count = self.master_open.load(Ordering::Acquire) as i64;
-        self.master_open
-            .store((count + i64::from(delta)).clamp(0, i64::from(u32::MAX)) as u32, Ordering::Release);
+        self.master_open.store(
+            (count + i64::from(delta)).clamp(0, i64::from(u32::MAX)) as u32,
+            Ordering::Release,
+        );
         self.check_destroy();
     }
 
@@ -238,7 +240,10 @@ impl PtyMasterFileOps {
     }
 
     /// 打开 slave 并返回其 FileOps(供 TIOCGPTPEER 与 devpts 节点复用)。
-    pub fn open_slave_ops(&self, nonblock: bool) -> crate::vfs::error::VfsResult<Box<dyn FileOps + Send + Sync>> {
+    pub fn open_slave_ops(
+        &self,
+        nonblock: bool,
+    ) -> crate::vfs::error::VfsResult<Box<dyn FileOps + Send + Sync>> {
         let dev = self.pair.slave_char_device()?;
         crate::vfs::devtmpfs::char_dev_file_ops(dev, nonblock)
     }
@@ -415,19 +420,17 @@ impl TerminalDriver for PtySlaveTerminalDriver {
 
     fn control(&self, req: TtyControlRequest) -> TtyIoResult<TtyControlResponse> {
         match req {
-            TtyControlRequest::DrainTx | TtyControlRequest::FlushTx => {
-                Ok(TtyControlResponse::Done)
-            }
+            TtyControlRequest::DrainTx | TtyControlRequest::FlushTx => Ok(TtyControlResponse::Done),
             TtyControlRequest::FlushRx | TtyControlRequest::FlushBoth => {
                 self.pair.in_ring.lock().clear();
                 Ok(TtyControlResponse::Done)
             }
-            TtyControlRequest::GetInputQueueLen => {
-                Ok(TtyControlResponse::U32(self.pair.in_ring.lock().len() as u32))
-            }
-            TtyControlRequest::GetOutputQueueLen => {
-                Ok(TtyControlResponse::U32(self.pair.out_ring.lock().len() as u32))
-            }
+            TtyControlRequest::GetInputQueueLen => Ok(TtyControlResponse::U32(
+                self.pair.in_ring.lock().len() as u32,
+            )),
+            TtyControlRequest::GetOutputQueueLen => Ok(TtyControlResponse::U32(
+                self.pair.out_ring.lock().len() as u32,
+            )),
             TtyControlRequest::SetSerialConfig { .. } | TtyControlRequest::SendBreak { .. } => {
                 Err(TtyIoError::Unsupported)
             }
@@ -488,12 +491,12 @@ impl crate::dev::char::CharDriver for PtySlaveCharDriver {
                 self.pair.in_ring.lock().clear();
                 Ok(CharControlResponse::Done)
             }
-            CharControlRequest::GetInputQueueLen => {
-                Ok(CharControlResponse::U32(self.pair.in_ring.lock().len() as u32))
-            }
-            CharControlRequest::GetOutputQueueLen => {
-                Ok(CharControlResponse::U32(self.pair.out_ring.lock().len() as u32))
-            }
+            CharControlRequest::GetInputQueueLen => Ok(CharControlResponse::U32(
+                self.pair.in_ring.lock().len() as u32,
+            )),
+            CharControlRequest::GetOutputQueueLen => Ok(CharControlResponse::U32(
+                self.pair.out_ring.lock().len() as u32,
+            )),
             _ => Err(ControlError::Unsupported),
         }
     }
@@ -538,9 +541,7 @@ impl PtyManager {
                 if slots.len() >= PTY_MAX as usize {
                     return Err(Errno::EAGAIN);
                 }
-                slots
-                    .try_reserve(1)
-                    .map_err(|_| Errno::ENOMEM)?;
+                slots.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
                 let pos = slots.len() as u32;
                 slots.push(None);
                 pos
@@ -564,12 +565,7 @@ impl PtyManager {
 
     /// 当前全部存活 pty 对(devpts 挂载补建节点用)。
     pub fn live_pairs(&self) -> Vec<Arc<PtyPair>> {
-        self.slots
-            .lock()
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
+        self.slots.lock().iter().flatten().cloned().collect()
     }
 
     fn destroy(&self, index: u32) {
@@ -618,8 +614,9 @@ pub fn note_pty_opened(dev: &CharDevice, delta: i32) {
 impl PtyPair {
     /// slave 的字符设备(每次调用构造新句柄,行规程按 fw_name 共享)。
     pub fn slave_char_device(self: &Arc<Self>) -> crate::vfs::error::VfsResult<CharDevice> {
-        let driver: Arc<dyn crate::dev::char::CharDriver> =
-            Arc::new(PtySlaveCharDriver { pair: Arc::clone(self) });
+        let driver: Arc<dyn crate::dev::char::CharDriver> = Arc::new(PtySlaveCharDriver {
+            pair: Arc::clone(self),
+        });
         Ok(CharDevice::from_arc(self.name().into_boxed_str(), driver))
     }
 }

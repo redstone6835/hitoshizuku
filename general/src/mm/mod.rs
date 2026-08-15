@@ -16,9 +16,11 @@
 //! - [`smoketest`] —— 启动期自检（debug 模式下编入）。
 
 pub mod fault;
+pub mod memstat;
 pub mod ops;
 mod resident_map;
 pub mod smoketest;
+pub mod swap;
 pub mod user_access;
 pub mod vm_space;
 

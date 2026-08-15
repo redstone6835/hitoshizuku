@@ -14,7 +14,7 @@ use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use errno::Errno;
 use sched::operation;
@@ -24,8 +24,7 @@ use vfs::sync::Spinlock;
 use crate::dev::char::{CharDevice, CharIoError};
 use crate::dev::control::{CharControlRequest, CharControlResponse, ControlError};
 use crate::dev::tty::core::{
-    TerminalDriver, TtyControlRequest, TtyControlResponse, TtyIoError, TtyIoResult,
-    lookup_tty_core,
+    TerminalDriver, TtyControlRequest, TtyControlResponse, TtyIoError, TtyIoResult, lookup_tty_core,
 };
 use crate::vfs::user_api::ioctl::{read_bytes_from_user, write_bytes_to_user, write_i32_to_user};
 use crate::vfs::user_api::tty::TtyIoctlState;
@@ -284,9 +283,7 @@ impl TerminalDriver for VtDevice {
 
     fn control(&self, req: TtyControlRequest) -> TtyIoResult<TtyControlResponse> {
         match req {
-            TtyControlRequest::DrainTx | TtyControlRequest::FlushTx => {
-                Ok(TtyControlResponse::Done)
-            }
+            TtyControlRequest::DrainTx | TtyControlRequest::FlushTx => Ok(TtyControlResponse::Done),
             TtyControlRequest::FlushRx | TtyControlRequest::FlushBoth => {
                 self.state.lock().input.clear();
                 Ok(TtyControlResponse::Done)
@@ -294,9 +291,9 @@ impl TerminalDriver for VtDevice {
             TtyControlRequest::GetInputQueueLen => {
                 Ok(TtyControlResponse::U32(self.state.lock().input.len() as u32))
             }
-            TtyControlRequest::GetOutputQueueLen => {
-                Ok(TtyControlResponse::U32(self.state.lock().screen.len() as u32))
-            }
+            TtyControlRequest::GetOutputQueueLen => Ok(TtyControlResponse::U32(
+                self.state.lock().screen.len() as u32,
+            )),
             TtyControlRequest::SetSerialConfig { .. } | TtyControlRequest::SendBreak { .. } => {
                 Err(TtyIoError::Unsupported)
             }
@@ -422,9 +419,10 @@ impl VtManager {
         let mut vts = leaked.vts.lock();
         for index in 1..VT_COUNT {
             let vt = Arc::new(VtDevice::new(index as u8, leaked));
-            let driver: Arc<dyn crate::dev::char::CharDriver> =
-    Arc::new(VtCharDriver { vt: Arc::clone(&vt) });
-let dev = CharDevice::from_arc(vt.name().into_boxed_str(), driver);
+            let driver: Arc<dyn crate::dev::char::CharDriver> = Arc::new(VtCharDriver {
+                vt: Arc::clone(&vt),
+            });
+            let dev = CharDevice::from_arc(vt.name().into_boxed_str(), driver);
             vt.dev.lock().replace(dev);
             vts.push(vt);
         }
@@ -448,10 +446,7 @@ let dev = CharDevice::from_arc(vt.name().into_boxed_str(), driver);
         if index == 0 || index >= VT_COUNT {
             return None;
         }
-        self.vts
-            .lock()
-            .get(index - 1)
-            .cloned()
+        self.vts.lock().get(index - 1).cloned()
     }
 
     /// 当前活动 VT。
@@ -513,9 +508,7 @@ let dev = CharDevice::from_arc(vt.name().into_boxed_str(), driver);
             if current == target {
                 return Ok(());
             }
-            let need_release = self
-                .vt(current)
-                .is_some_and(|vt| vt.needs_release_wait());
+            let need_release = self.vt(current).is_some_and(|vt| vt.needs_release_wait());
             if !need_release {
                 break;
             }
@@ -593,14 +586,7 @@ pub fn vt_from_char_device(dev: &CharDevice) -> Option<Arc<VtDevice>> {
 
 // ── ioctl 处理 ────────────────────────────────────────────────────────────────
 
-fn pack_vt_mode(
-    mode: u8,
-    waitv: u8,
-    relsig: u16,
-    acqsig: u16,
-    frsig: u16,
-    out: &mut [u8],
-) {
+fn pack_vt_mode(mode: u8, waitv: u8, relsig: u16, acqsig: u16, frsig: u16, out: &mut [u8]) {
     out[0] = mode;
     out[1] = waitv;
     out[2..4].copy_from_slice(&relsig.to_le_bytes());

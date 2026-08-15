@@ -32,6 +32,28 @@ impl VmFlags {
     /// 已被 mlock/munlockall 状态标记为常驻。当前无换出回收时仅作为策略位。
     pub const LOCKED: u32 = 1 << 12;
 
+    // ── 策略/生命周期标志（Linux VM_* 语义对齐） ─────────────────────────────
+    /// fork 时不复制该 VMA（对应 Linux `VM_DONTCOPY`，`madvise(MADV_DONTFORK)`）。
+    pub const DONTFORK: u32 = 1 << 13;
+    /// fork 后子进程该 VMA 内容清零（对应 `VM_WIPEONFORK`，`MADV_WIPEONFORK`）。
+    pub const WIPEONFORK: u32 = 1 << 14;
+    /// core dump / `/proc/*/smaps` 排除该区域（对应 `VM_DONTDUMP`，`MADV_DONTDUMP`）。
+    pub const DONTDUMP: u32 = 1 << 15;
+    /// 允许 KSM 合并（对应 `VM_MERGEABLE`，`MADV_MERGEABLE`）。本内核无 KSM，
+    /// 仅保留标记供观测与 API 兼容。
+    pub const MERGEABLE: u32 = 1 << 16;
+    /// 建议使用大页（对应 `VM_HUGEPAGE`，`MADV_HUGEPAGE`）。本内核无 THP，
+    /// 仅保留标记。
+    pub const HUGEPAGE: u32 = 1 << 17;
+    /// mseal 密封：禁止后续 mprotect/munmap/mremap/MAP_FIXED 覆盖（对应
+    /// Linux 6.10+ `VM_SEALED`）。
+    pub const SEALED: u32 = 1 << 18;
+    /// MAP_DROPPABLE：内容随时可丢弃、读回零页（Linux 6.6+）。当前匿名页
+    /// 不做回收，语义上等价匿名映射，仅保留标记与校验。
+    pub const DROPPABLE: u32 = 1 << 19;
+    /// MAP_NORESERVE：不为该映射预留下述 overcommit 记账（仅影响记账策略）。
+    pub const NORESERVE: u32 = 1 << 20;
+
     /// 从裸位构造。不做语义校验；校验留给 VmSpace 层。
     pub const fn from_bits(bits: u32) -> Self {
         Self(bits)

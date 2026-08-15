@@ -11,12 +11,13 @@ pub mod core;
 pub mod pty;
 pub mod vt;
 
-pub use core::{resolve_ctty_cookie,
+pub use core::{
     CharDeviceTerminalDriver, TerminalDriver, TtyControlRequest, TtyControlResponse, TtyCore,
-    TtyIoError, TtyIoResult, active_tty_cores, lookup_tty_core, shared_tty_core,
+    TtyIoError, TtyIoResult, active_tty_cores, lookup_tty_core, resolve_ctty_cookie,
+    shared_tty_core,
 };
 pub use pty::{
-    PTY_MAX, PtyMasterFileOps, PtyPair, TIOCGPTN, TIOCGPTPEER, TIOCGPTLCK, TIOCSIG, TIOCSPTLCK,
+    PTY_MAX, PtyMasterFileOps, PtyPair, TIOCGPTLCK, TIOCGPTN, TIOCGPTPEER, TIOCSIG, TIOCSPTLCK,
     lookup_pair, note_pty_opened, open_ptmx, open_slave_file,
 };
 pub use vt::{VtDevice, VtManager, handle_vt_ioctl, vt_from_char_device};
