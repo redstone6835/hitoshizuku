@@ -2021,4 +2021,78 @@ mod tests {
         }
         assert_eq!(offset, payload.len() + 8);
     }
+    #[test]
+    fn reuse_port_group_distributes_unicast_by_hash() {
+        let mut table = UdpEndpointTable::new([23; 40]);
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 9090,
+        };
+        let first = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 1,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Datagram,
+        ));
+        let second = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 2,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Datagram,
+        ));
+        let first_id = table
+            .bind_facade(local, None, None, Arc::clone(&first))
+            .unwrap();
+        let second_id = table
+            .bind_facade(local, None, None, Arc::clone(&second))
+            .unwrap();
+
+        // 多个不同源端点的单播包：hash 分发应把包分散到两个接收端，
+        // 且每个包只投递到一个接收端（Linux reuse_port 语义）。
+        let mut first_count = 0usize;
+        let mut second_count = 0usize;
+        for source_port in 41000..41032u16 {
+            let sender = Arc::new(SocketFacade::new(
+                SocketId {
+                    boot_nonce: 7,
+                    counter: u64::from(source_port),
+                },
+                AddressFamily::Ipv4,
+                SocketKind::Datagram,
+            ));
+            let source = Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: source_port,
+            };
+            let payload = sender.test_udp_tx_lease(&[0x55], local);
+            let flow = table
+                .ingest_local(
+                    InterfaceId(1),
+                    source,
+                    local,
+                    &payload,
+                    1,
+                    2,
+                    0,
+                    65_535,
+                    20,
+                )
+                .expect("单播包应被分发");
+            payload.complete();
+            if flow == first_id {
+                first_count += 1;
+            } else if flow == second_id {
+                second_count += 1;
+            }
+        }
+        // 32 个不同四元组应分布到两个 socket（各自至少 1 个，总和 32）。
+        assert!(first_count >= 1, "第一个 reuse_port socket 未收到任何包");
+        assert!(second_count >= 1, "第二个 reuse_port socket 未收到任何包");
+        assert_eq!(first_count + second_count, 32);
+    }
+
 }
