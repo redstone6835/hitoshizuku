@@ -5420,17 +5420,214 @@ pub(super) fn sys_settimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     Ok(0)
 }
 
-pub(super) fn sys_adjtimex(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// 时钟整定状态（Linux `struct timex` 的核心字段 + 返回状态）。
+struct ClockDiscipline {
+    offset_usec: i64,
+    freq_ppm: i64,
+    maxerror: u64,
+    esterror: u64,
+    status: u32,
+    constant: i64,
+    precision: u64,
+    tick_usec: i64,
+    nanosecond: bool,
+}
+
+static CLOCK_DISCIPLINE: Spinlock<ClockDiscipline> = Spinlock::new(ClockDiscipline {
+    offset_usec: 0,
+    freq_ppm: 0,
+    maxerror: 16_000_000,
+    esterror: 16_000_000,
+    status: 0,
+    constant: 0,
+    precision: 1,
+    tick_usec: 10_000,
+    nanosecond: false,
+});
+
+/// `struct timex`（64 位布局，160 字节）字段偏移。
+const TIMEX_MODES: usize = 0;
+const TIMEX_OFFSET: usize = 8;
+const TIMEX_FREQ: usize = 16;
+const TIMEX_MAXERROR: usize = 24;
+const TIMEX_ESTERROR: usize = 32;
+const TIMEX_STATUS: usize = 40;
+const TIMEX_CONSTANT: usize = 48;
+const TIMEX_PRECISION: usize = 56;
+const TIMEX_TICK: usize = 64;
+const TIMEX_TIME: usize = 72; // struct timeval { tv_sec, tv_usec }
+const TIMEX_STATE: usize = 88;
+
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_SETOFFSET: u32 = 0x0100;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+
+const STA_PLL: u32 = 0x0001;
+const STA_UNSYNC: u32 = 0x0040;
+
+const TIME_OK: i32 = 0;
+const TIME_ERROR: i32 = 5;
+
+fn read_timex(user: usize) -> Result<[u8; 160], Errno> {
+    let mut raw = [0u8; 160];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(raw)
+}
+
+fn write_timex(user: usize, raw: &[u8; 160]) -> Result<(), Errno> {
+    copy_to_user(user, raw).map_err(|e| e.as_errno())
+}
+
+fn timex_state() -> i32 {
+    let guard = CLOCK_DISCIPLINE.lock();
+    if guard.status & STA_UNSYNC != 0 {
+        TIME_ERROR
+    } else {
+        TIME_OK
+    }
+}
+
+/// `adjtimex`/`clock_adjtime` 公共实现（`clock_id` 仅 `CLOCK_REALTIME` 支持）。
+fn clock_adjtime_common(
+    ctx: &mut SyscallContext<'_>,
+    clock_id: usize,
+    user: usize,
+) -> Result<usize, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if clock_id != 0 {
+        // Linux：clock_adjtime 只支持 CLOCK_REALTIME 的整定。
+        return Err(Errno::EINVAL);
+    }
+    let raw = read_timex(user)?;
+    let modes = read_u32(&raw, TIMEX_MODES);
+    if modes & !(ADJ_OFFSET
+        | ADJ_FREQUENCY
+        | ADJ_MAXERROR
+        | ADJ_ESTERROR
+        | ADJ_STATUS
+        | ADJ_TIMECONST
+        | ADJ_SETOFFSET
+        | ADJ_MICRO
+        | ADJ_NANO
+        | ADJ_TICK)
+        != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut guard = CLOCK_DISCIPLINE.lock();
+    // 时间单位：ADJ_NANO 之后永久使用纳秒（Linux 语义）。
+    let nanosecond = guard.nanosecond;
+    if modes & ADJ_NANO != 0 {
+        guard.nanosecond = true;
+    }
+    if modes & ADJ_MICRO != 0 && !guard.nanosecond {
+        guard.nanosecond = false;
+    }
+
+    // 需要特权的模式。
+    let privileged = modes
+        & (ADJ_OFFSET | ADJ_FREQUENCY | ADJ_MAXERROR | ADJ_ESTERROR | ADJ_STATUS
+            | ADJ_TIMECONST | ADJ_SETOFFSET | ADJ_TICK)
+        != 0;
+    if privileged && !ctx.task().credentials().has_cap(Capability::SysTime) {
+        return Err(Errno::EPERM);
+    }
+
+    let scale = if nanosecond { 1i64 } else { 1000i64 };
+    if modes & ADJ_OFFSET != 0 {
+        let offset = read_i64(&raw, TIMEX_OFFSET);
+        let offset_ns = offset
+            .checked_mul(scale)
+            .ok_or(Errno::EINVAL)?;
+        // 应用偏移：直接调整真实时间（无 PLL 硬件时采用立即校正，
+        // 并把 STA_UNSYNC 清除表示已整定）。
+        crate::vdso::adjust_realtime_ns(offset_ns);
+        guard.offset_usec = offset;
+        guard.status &= !STA_UNSYNC;
+    }
+    if modes & ADJ_FREQUENCY != 0 {
+        let freq = read_i64(&raw, TIMEX_FREQ);
+        if freq < -512_000_000 || freq > 512_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        guard.freq_ppm = freq;
+    }
+    if modes & ADJ_MAXERROR != 0 {
+        guard.maxerror = read_u64(&raw, TIMEX_MAXERROR);
+    }
+    if modes & ADJ_ESTERROR != 0 {
+        guard.esterror = read_u64(&raw, TIMEX_ESTERROR);
+    }
+    if modes & ADJ_STATUS != 0 {
+        guard.status = read_u32(&raw, TIMEX_STATUS) & (STA_PLL | STA_UNSYNC);
+    }
+    if modes & ADJ_TIMECONST != 0 {
+        guard.constant = read_i64(&raw, TIMEX_CONSTANT);
+        if guard.constant < 0 || guard.constant > 10 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if modes & ADJ_TICK != 0 {
+        let tick = read_i64(&raw, TIMEX_TICK);
+        if tick < 900_000 || tick > 1_100_000 {
+            return Err(Errno::EINVAL);
+        }
+        guard.tick_usec = tick;
+    }
+    if modes & ADJ_SETOFFSET != 0 {
+        let sec = read_i64(&raw, TIMEX_TIME);
+        let usec = read_i64(&raw, TIMEX_TIME + 8);
+        let offset_ns = sec
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(usec.saturating_mul(1000)))
+            .ok_or(Errno::EINVAL)?;
+        crate::vdso::adjust_realtime_ns(offset_ns);
+        guard.status &= !STA_UNSYNC;
+    }
+
+    // 写回当前状态。
+    let mut out = raw;
+    let state = timex_state();
+    write_i64(&mut out, TIMEX_OFFSET, guard.offset_usec);
+    write_i64(&mut out, TIMEX_FREQ, guard.freq_ppm);
+    write_u64(&mut out, TIMEX_MAXERROR, guard.maxerror);
+    write_u64(&mut out, TIMEX_ESTERROR, guard.esterror);
+    write_u32(&mut out, TIMEX_STATUS, guard.status);
+    write_i64(&mut out, TIMEX_CONSTANT, guard.constant);
+    write_u64(&mut out, TIMEX_PRECISION, guard.precision);
+    write_i64(&mut out, TIMEX_TICK, guard.tick_usec);
+    write_i32(&mut out, TIMEX_STATE, state);
+    drop(guard);
+    write_timex(user, &out)?;
+    Ok(state as usize)
+}
+
+pub(super) fn sys_adjtimex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    clock_adjtime_common(ctx, 0, ctx.args[0])
+}
+
+pub(super) fn sys_clock_adjtime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    clock_adjtime_common(ctx, ctx.args[0], ctx.args[1])
+}
+
+pub(super) fn sys_clock_adjtime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    clock_adjtime_common(ctx, ctx.args[0], ctx.args[1])
 }
 
 pub(super) fn sys_perf_event_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_clock_adjtime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
-}
 
 pub(super) fn sys_setns(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd_raw = ctx.args[0] as isize;
@@ -5691,9 +5888,6 @@ pub(super) fn sys_clock_settime64(ctx: &mut SyscallContext<'_>) -> Result<usize,
     clock_settime_common(ctx)
 }
 
-pub(super) fn sys_clock_adjtime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
-}
 
 pub(super) fn sys_clock_getres_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     sys_clock_getres(ctx)
@@ -6566,6 +6760,22 @@ fn waitid_code(status: WaitStatus) -> i32 {
     } else {
         0
     }
+}
+
+fn write_i64(out: &mut [u8], off: usize, value: i64) {
+    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u32(raw: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(raw[off..off + 4].try_into().unwrap())
+}
+
+fn read_u64(raw: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(raw[off..off + 8].try_into().unwrap())
+}
+
+fn read_i64(raw: &[u8], off: usize) -> i64 {
+    i64::from_le_bytes(raw[off..off + 8].try_into().unwrap())
 }
 
 fn write_i32(out: &mut [u8], off: usize, value: i32) {
