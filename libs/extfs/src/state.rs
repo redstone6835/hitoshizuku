@@ -34,7 +34,7 @@ const BLOCK_CACHE_CAP: usize = 8192;
 
 struct BlockCacheSlot {
     block: u64,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     referenced: bool,
     occupied: bool,
     dirty: bool,
@@ -44,7 +44,7 @@ struct BlockCacheSlot {
 #[derive(Clone)]
 struct DirtyBlockSnapshot {
     block: u64,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     version: u64,
 }
 
@@ -55,7 +55,7 @@ enum PartialWriteOutcome {
 }
 
 struct PendingBlockWriteback {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     version: u64,
     /// `true` 表示恰有一个调用方负责把当前块写回后端。
     ///
@@ -103,7 +103,7 @@ impl BlockCache {
         for _ in 0..capacity {
             slots.push(BlockCacheSlot {
                 block: 0,
-                data: vec![0u8; bs],
+                data: Arc::new(vec![0u8; bs]),
                 referenced: false,
                 occupied: false,
                 dirty: false,
@@ -166,11 +166,11 @@ impl BlockCache {
         if let Some(&idx) = self.index.get(&block) {
             let slot = &mut self.slots[idx];
             slot.referenced = true;
-            out.copy_from_slice(&slot.data);
+            out.copy_from_slice(slot.data.as_slice());
             return true;
         }
         if let Some(pending) = self.pending_writebacks.get(&block) {
-            out.copy_from_slice(&pending.data);
+            out.copy_from_slice(pending.data.as_slice());
             return true;
         }
         false
@@ -185,7 +185,7 @@ impl BlockCache {
         if let Some(&idx) = self.index.get(&block) {
             let version = self.next_version();
             let slot = &mut self.slots[idx];
-            slot.data[offset..offset + src.len()].copy_from_slice(src);
+            Arc::make_mut(&mut slot.data)[offset..offset + src.len()].copy_from_slice(src);
             slot.referenced = true;
             slot.dirty = true;
             slot.version = version;
@@ -211,7 +211,7 @@ impl BlockCache {
             return PartialWriteOutcome::Done(None);
         }
         if let Some(pending) = self.pending_writebacks.get(&block) {
-            base.copy_from_slice(&pending.data);
+            base.copy_from_slice(pending.data.as_slice());
         } else if self.has_active_direct(block) {
             return PartialWriteOutcome::Wait;
         } else if self.coherence_stamp_in_range(block, 1) != read_stamp {
@@ -270,9 +270,9 @@ impl BlockCache {
             if let Some(&idx) = self.index.get(&block) {
                 let slot = &mut self.slots[idx];
                 slot.referenced = true;
-                out[off..off + self.block_size].copy_from_slice(&slot.data);
+                out[off..off + self.block_size].copy_from_slice(slot.data.as_slice());
             } else if let Some(pending) = self.pending_writebacks.get(&block) {
-                out[off..off + self.block_size].copy_from_slice(&pending.data);
+                out[off..off + self.block_size].copy_from_slice(pending.data.as_slice());
             }
         }
         true
@@ -337,10 +337,10 @@ impl BlockCache {
                 let slot = &mut self.slots[idx];
                 slot.referenced = true;
                 let off = i as usize * self.block_size;
-                out[off..off + self.block_size].copy_from_slice(&slot.data);
+                out[off..off + self.block_size].copy_from_slice(slot.data.as_slice());
             } else if let Some(pending) = self.pending_writebacks.get(&block) {
                 let off = i as usize * self.block_size;
-                out[off..off + self.block_size].copy_from_slice(&pending.data);
+                out[off..off + self.block_size].copy_from_slice(pending.data.as_slice());
             }
         }
     }
@@ -408,7 +408,7 @@ impl BlockCache {
             if let Some(&idx) = self.index.get(&block) {
                 let off = i as usize * self.block_size;
                 let slot = &mut self.slots[idx];
-                slot.data.copy_from_slice(&data[off..off + self.block_size]);
+                Arc::make_mut(&mut slot.data).copy_from_slice(&data[off..off + self.block_size]);
                 slot.referenced = true;
                 // I/O 成功前保持 dirty；失败时即可由 sync 重试。
                 slot.dirty = true;
@@ -471,7 +471,7 @@ impl BlockCache {
             self.pending_writebacks.insert(
                 block,
                 PendingBlockWriteback {
-                    data: data[off..off + self.block_size].to_vec(),
+                    data: Arc::new(data[off..off + self.block_size].to_vec()),
                     version,
                     in_flight: false,
                 },
@@ -487,7 +487,7 @@ impl BlockCache {
         match self.pending_writebacks.entry(snapshot.block) {
             Entry::Vacant(entry) => {
                 entry.insert(PendingBlockWriteback {
-                    data: snapshot.data.clone(),
+                    data: Arc::clone(&snapshot.data),
                     version: snapshot.version,
                     in_flight: !direct_active,
                 });
@@ -505,7 +505,7 @@ impl BlockCache {
                     pending.in_flight = true;
                     Some(DirtyBlockSnapshot {
                         block: snapshot.block,
-                        data: pending.data.clone(),
+                        data: Arc::clone(&pending.data),
                         version: pending.version,
                     })
                 }
@@ -525,7 +525,7 @@ impl BlockCache {
         }
         Some(DirtyBlockSnapshot {
             block,
-            data: pending.data.clone(),
+            data: Arc::clone(&pending.data),
             version: pending.version,
         })
     }
@@ -549,7 +549,7 @@ impl BlockCache {
         pending.in_flight = true;
         Some(DirtyBlockSnapshot {
             block,
-            data: pending.data.clone(),
+            data: Arc::clone(&pending.data),
             version: pending.version,
         })
     }
@@ -566,7 +566,7 @@ impl BlockCache {
         pending.in_flight = true;
         Some(DirtyBlockSnapshot {
             block,
-            data: pending.data.clone(),
+            data: Arc::clone(&pending.data),
             version: pending.version,
         })
     }
@@ -592,7 +592,7 @@ impl BlockCache {
         // 命中：原地更新
         if let Some(&idx) = self.index.get(&block) {
             let slot = &mut self.slots[idx];
-            slot.data.copy_from_slice(data);
+            Arc::make_mut(&mut slot.data).copy_from_slice(data);
             slot.referenced = true;
             slot.dirty = true;
             slot.version = version;
@@ -603,7 +603,7 @@ impl BlockCache {
             let idx = self.slots.len();
             self.slots.push(BlockCacheSlot {
                 block,
-                data: Vec::from(data),
+                data: Arc::new(Vec::from(data)),
                 referenced: true,
                 occupied: true,
                 dirty: true,
@@ -622,7 +622,7 @@ impl BlockCache {
             let slot = &mut self.slots[i];
             if !slot.occupied {
                 slot.block = block;
-                slot.data.copy_from_slice(data);
+                Arc::make_mut(&mut slot.data).copy_from_slice(data);
                 slot.referenced = true;
                 slot.occupied = true;
                 slot.dirty = true;
@@ -638,13 +638,13 @@ impl BlockCache {
                     if slot.dirty {
                         evicted = Some(DirtyBlockSnapshot {
                             block: old_block,
-                            data: slot.data.clone(),
+                            data: Arc::clone(&slot.data),
                             version: slot.version,
                         });
                     }
                     self.index.remove(&old_block);
                     slot.block = block;
-                    slot.data.copy_from_slice(data);
+                    Arc::make_mut(&mut slot.data).copy_from_slice(data);
                     slot.referenced = true;
                     slot.dirty = true;
                     slot.version = version;
@@ -658,13 +658,13 @@ impl BlockCache {
             if slot.dirty {
                 evicted = Some(DirtyBlockSnapshot {
                     block: old_block,
-                    data: slot.data.clone(),
+                    data: Arc::clone(&slot.data),
                     version: slot.version,
                 });
             }
             self.index.remove(&old_block);
             slot.block = block;
-            slot.data.copy_from_slice(data);
+            Arc::make_mut(&mut slot.data).copy_from_slice(data);
             slot.referenced = true;
             slot.dirty = true;
             slot.version = version;
@@ -705,7 +705,7 @@ impl BlockCache {
         // 命中：原地更新
         if let Some(&idx) = self.index.get(&block) {
             let slot = &mut self.slots[idx];
-            slot.data.copy_from_slice(data);
+            Arc::make_mut(&mut slot.data).copy_from_slice(data);
             slot.referenced = true;
             if dirty {
                 slot.dirty = true;
@@ -718,7 +718,7 @@ impl BlockCache {
             let idx = self.slots.len();
             self.slots.push(BlockCacheSlot {
                 block,
-                data: Vec::from(data),
+                data: Arc::new(Vec::from(data)),
                 referenced: true,
                 occupied: true,
                 dirty,
@@ -736,7 +736,7 @@ impl BlockCache {
             let slot = &mut self.slots[i];
             if !slot.occupied {
                 slot.block = block;
-                slot.data.copy_from_slice(data);
+                Arc::make_mut(&mut slot.data).copy_from_slice(data);
                 slot.referenced = true;
                 slot.occupied = true;
                 slot.dirty = dirty;
@@ -751,11 +751,11 @@ impl BlockCache {
                     // 保险：兜底 LRU 化淘汰
                     let old_block = slot.block;
                     if slot.dirty {
-                        flush(old_block, &slot.data)?;
+                        flush(old_block, slot.data.as_slice())?;
                     }
                     self.index.remove(&old_block);
                     slot.block = block;
-                    slot.data.copy_from_slice(data);
+                    Arc::make_mut(&mut slot.data).copy_from_slice(data);
                     slot.referenced = true;
                     slot.dirty = dirty;
                     slot.version = version;
@@ -767,11 +767,11 @@ impl BlockCache {
             // 命中淘汰
             let old_block = slot.block;
             if slot.dirty {
-                flush(old_block, &slot.data)?;
+                flush(old_block, slot.data.as_slice())?;
             }
             self.index.remove(&old_block);
             slot.block = block;
-            slot.data.copy_from_slice(data);
+            Arc::make_mut(&mut slot.data).copy_from_slice(data);
             slot.referenced = true;
             slot.dirty = dirty;
             slot.version = version;
@@ -795,7 +795,7 @@ impl BlockCache {
         if let Some(&idx) = self.index.get(&block) {
             let version = if dirty { self.next_version() } else { 0 };
             let slot = &mut self.slots[idx];
-            slot.data.copy_from_slice(data);
+            Arc::make_mut(&mut slot.data).copy_from_slice(data);
             slot.referenced = true;
             if dirty {
                 slot.dirty = true;
@@ -808,7 +808,7 @@ impl BlockCache {
             let version = if dirty { self.next_version() } else { 0 };
             self.slots.push(BlockCacheSlot {
                 block,
-                data: Vec::from(data),
+                data: Arc::new(Vec::from(data)),
                 referenced: true,
                 occupied: true,
                 dirty,
@@ -833,7 +833,7 @@ impl BlockCache {
                     self.index.remove(&old_block);
                 }
                 slot.block = block;
-                slot.data.copy_from_slice(data);
+                Arc::make_mut(&mut slot.data).copy_from_slice(data);
                 slot.referenced = true;
                 slot.occupied = true;
                 slot.dirty = dirty;
@@ -857,7 +857,7 @@ impl BlockCache {
             if slot.occupied && slot.dirty {
                 dirty.push(DirtyBlockSnapshot {
                     block: slot.block,
-                    data: slot.data.clone(),
+                    data: Arc::clone(&slot.data),
                     version: slot.version,
                 });
             }
@@ -1681,7 +1681,7 @@ impl FsState {
                 &self.ext_sb,
                 current.block,
                 1,
-                &current.data,
+                current.data.as_slice(),
             ) {
                 self.block_cache.lock().fail_pending(current.block);
                 return Err(err);
@@ -2718,6 +2718,22 @@ mod tests {
     }
 
     #[test]
+    fn evicted_snapshot_shares_immutable_buffer_with_pending_writeback() {
+        const BLOCK_SIZE: usize = 64;
+        let mut cache = BlockCache::with_capacity(BLOCK_SIZE as u32, 1);
+        assert!(cache.insert_wb(10, &vec![0x11; BLOCK_SIZE]).is_none());
+
+        let snapshot = cache
+            .insert_wb(11, &vec![0x22; BLOCK_SIZE])
+            .expect("dirty eviction must produce a writeback owner");
+        let pending = cache
+            .pending_writebacks
+            .get(&snapshot.block)
+            .expect("evicted block must remain pending");
+        assert!(Arc::ptr_eq(&snapshot.data, &pending.data));
+    }
+
+    #[test]
     fn coherence_stamp_wrap_changes_epoch_and_prevents_zero_aba() {
         let mut cache = BlockCache::with_capacity(64, 1);
         cache.coherence_epoch = 7;
@@ -2805,7 +2821,7 @@ mod tests {
         cache.pending_writebacks.insert(
             10,
             PendingBlockWriteback {
-                data: vec![0x11; BLOCK_SIZE],
+                data: Arc::new(vec![0x11; BLOCK_SIZE]),
                 version: u64::MAX,
                 in_flight: true,
             },
@@ -2818,14 +2834,14 @@ mod tests {
             cache
                 .remember_pending(DirtyBlockSnapshot {
                     block: 10,
-                    data: vec![0x82; BLOCK_SIZE],
+                    data: Arc::new(vec![0x82; BLOCK_SIZE]),
                     version: wrapped_version,
                 })
                 .is_none()
         );
         let pending = &cache.pending_writebacks[&10];
         assert_eq!(pending.version, 1);
-        assert_eq!(pending.data, vec![0x82; BLOCK_SIZE]);
+        assert_eq!(pending.data.as_slice(), vec![0x82; BLOCK_SIZE].as_slice());
     }
 
     #[test]
