@@ -175,9 +175,15 @@ unsafe fn set_current_task_raw(task_ptr: usize, cpu_work_ptr: usize) {
     unsafe { crate::riscv64::specific::set_current_task_ptr(task_ptr, cpu_work_ptr) };
 }
 
+#[inline(always)]
+fn current_task_ptr_raw() -> usize {
+    crate::riscv64::specific::current_task_ptr() as usize
+}
+
 static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
     set_current_task: set_current_task_raw,
+    current_task_ptr: current_task_ptr_raw,
 };
 
 static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {

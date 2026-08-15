@@ -239,6 +239,7 @@ fn arch_current_cpu_id() -> usize {
 static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
     set_current_task: set_current_task_raw,
+    current_task_ptr: current_task_ptr_raw,
 };
 
 static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
@@ -322,6 +323,10 @@ unsafe fn set_kernel_trap_stack_raw(stack_top: usize) {
 
 /// LoongArch64 暂不使用 borrowed-current 架构槽，保留契约以维持通用调度层布局。
 unsafe fn set_current_task_raw(_task_ptr: usize, _cpu_work_ptr: usize) {}
+
+fn current_task_ptr_raw() -> usize {
+    0
+}
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 

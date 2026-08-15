@@ -20,6 +20,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+#[cfg(test)]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch_hooks;
@@ -136,6 +138,8 @@ struct TimedSleeper {
 
 static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
 static HAS_TIMED_SLEEPERS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static SLEEPER_EVENT_SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// 由调度定时器在指定 deadline 到期后定向通知的对象。
 pub trait DeadlineObserver: Send + Sync {
@@ -178,6 +182,8 @@ struct RealtimeItimer {
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 static HAS_REALTIME_ITIMERS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static REALTIME_EVENT_SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEADLINE_STATE_GENERATION: AtomicU64 = AtomicU64::new(1);
 static DEADLINE_CACHE_GENERATION: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
 static DEADLINE_CACHE_VALUE: [AtomicU64; NR_CPUS] = [const { AtomicU64::new(0) }; NR_CPUS];
@@ -273,6 +279,21 @@ fn cpu() -> usize {
     let id = arch_hooks::current_cpu_id_or_boot();
     debug_assert!(id < NR_CPUS, "[sched] cpu id {} >= NR_CPUS", id);
     if id < NR_CPUS { id } else { 0 }
+}
+
+#[inline(always)]
+pub(crate) fn select_current_task_ptr(
+    local: *mut Task,
+    fallback: impl FnOnce() -> *mut Task,
+) -> *mut Task {
+    if local.is_null() { fallback() } else { local }
+}
+
+/// 优先读取架构本地 current 槽；启动期和未实现该槽的架构沿用 per-CPU 槽。
+#[inline(always)]
+fn current_task_ptr_fast() -> *mut Task {
+    let local = arch_hooks::current_task_ptr_or_null() as *mut Task;
+    select_current_task_ptr(local, || SCHEDULER.cpu_or_boot(cpu()).current_raw())
 }
 
 fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
@@ -564,8 +585,7 @@ pub fn current_task() -> Arc<Task> {
 ///
 /// 该接口不增加引用计数，也不加锁；调用方不能把返回引用保存到可能调度之后。
 pub fn try_current_task_ref() -> Option<&'static Task> {
-    let id = cpu();
-    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         return None;
     }
@@ -638,8 +658,7 @@ impl core::ops::Deref for BorrowedCurrentTask {
 /// 通过通用 per-CPU current 槽借用当前任务。
 #[inline]
 pub fn borrow_current_task_internal() -> BorrowedCurrentTask {
-    let id = cpu();
-    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
+    let ptr = current_task_ptr_fast();
     // Safety: current_raw 指向槽位持有的 Arc；句柄不可跨 CPU，当前执行栈在
     // 调度切走期间本身也持有任务生命周期，恢复后仍回到同一任务。
     unsafe { BorrowedCurrentTask::from_current_raw(ptr) }
@@ -656,8 +675,7 @@ pub fn current_task_fast() -> Arc<Task> {
 /// 内核常驻代码使用的 current 快入口，不经过 ELM 导出包装。
 #[inline]
 pub fn current_task_fast_internal() -> Arc<Task> {
-    let id = cpu();
-    let ptr = SCHEDULER.cpu_or_boot(id).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         panic!("[sched] current_task_fast called before sched::init() on this CPU");
     }
@@ -680,7 +698,7 @@ pub fn current_task_id() -> u64 {
     if !INIT_READY.load(Ordering::Acquire) {
         return 0;
     }
-    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         return 0;
     }
@@ -693,7 +711,7 @@ pub fn current_profile_session_id() -> u64 {
     if !INIT_READY.load(Ordering::Acquire) {
         return 0;
     }
-    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         return 0;
     }
@@ -706,7 +724,7 @@ pub fn current_profile_image(pc: usize) -> (u64, usize) {
     if !INIT_READY.load(Ordering::Acquire) {
         return (0, 0);
     }
-    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         return (0, 0);
     }
@@ -719,7 +737,7 @@ pub fn current_profile_span_id() -> u64 {
     if !INIT_READY.load(Ordering::Acquire) {
         return 0;
     }
-    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         return 0;
     }
@@ -732,7 +750,7 @@ pub fn set_current_profile_span_id(span_id: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
-    let ptr = SCHEDULER.cpu_or_boot(cpu()).current_raw();
+    let ptr = current_task_ptr_fast();
     if ptr.is_null() {
         return;
     }
@@ -2399,6 +2417,8 @@ fn take_expired_sleepers(now_ns: u64, cpu_id: usize) -> Vec<Arc<Task>> {
     if !HAS_TIMED_SLEEPERS.load(Ordering::Acquire) {
         return Vec::new();
     }
+    #[cfg(test)]
+    SLEEPER_EVENT_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut expired = Vec::new();
     let mut sleepers = TIMED_SLEEPERS.lock();
     let mut index = 0;
@@ -2446,6 +2466,8 @@ fn fire_expired_realtime_itimers(now_ns: u64, cpu_id: usize) -> bool {
     if !HAS_REALTIME_ITIMERS.load(Ordering::Acquire) {
         return false;
     }
+    #[cfg(test)]
+    REALTIME_EVENT_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
     let expired = {
         let mut timers = REALTIME_ITIMERS.lock();
         let mut expired = Vec::new();
@@ -3423,19 +3445,44 @@ fn on_timer_tick_inner(now_ns: u64) -> bool {
 }
 
 fn service_expired_timer_events(now_ns: u64, cpu_id: usize) -> bool {
-    let had_scheduler_deadline =
-        HAS_TIMED_SLEEPERS.load(Ordering::Acquire) || HAS_REALTIME_ITIMERS.load(Ordering::Acquire);
     fire_expired_deadline_observers(now_ns);
-    let deadline_fired = wake_expired_sleepers(now_ns, cpu_id);
-    let realtime_fired = fire_expired_realtime_itimers(now_ns, cpu_id);
+    let state_deadline_due = cached_state_deadline(cpu_id.min(NR_CPUS - 1))
+        .is_some_and(|deadline_ns| deadline_ns <= now_ns);
+    let (deadline_fired, realtime_fired) = if state_deadline_due {
+        (
+            wake_expired_sleepers(now_ns, cpu_id),
+            fire_expired_realtime_itimers(now_ns, cpu_id),
+        )
+    } else {
+        (false, false)
+    };
     #[cfg(feature = "performance-profile")]
     let profile_deadline = profiling::enabled() && profiling::sampling_enabled();
     #[cfg(not(feature = "performance-profile"))]
     let profile_deadline = false;
-    if had_scheduler_deadline || profile_deadline {
+    if state_deadline_due || profile_deadline {
         reprogram_deadline_timer();
     }
     deadline_fired || realtime_fired
+}
+
+#[cfg(test)]
+pub(crate) fn service_expired_timer_events_for_test(now_ns: u64, cpu_id: usize) -> bool {
+    service_expired_timer_events(now_ns, cpu_id)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_timer_event_scan_counts_for_test() {
+    SLEEPER_EVENT_SCAN_COUNT.store(0, Ordering::Release);
+    REALTIME_EVENT_SCAN_COUNT.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn timer_event_scan_counts_for_test() -> (usize, usize) {
+    (
+        SLEEPER_EVENT_SCAN_COUNT.load(Ordering::Acquire),
+        REALTIME_EVENT_SCAN_COUNT.load(Ordering::Acquire),
+    )
 }
 
 /// 周期性负载均衡的最小间隔。
@@ -3747,11 +3794,11 @@ mod deadline_observer_tests {
             deadline,
             Arc::downgrade(&subscriber),
         ));
-        fire_expired_deadline_observers(deadline - 1);
+        service_expired_timer_events(deadline - 1, 0);
         assert_eq!(observer.0.load(Ordering::Acquire), 0);
-        fire_expired_deadline_observers(deadline);
+        service_expired_timer_events(deadline, 0);
         assert_eq!(observer.0.load(Ordering::Acquire), 1);
-        fire_expired_deadline_observers(deadline + 10);
+        service_expired_timer_events(deadline + 10, 0);
         assert_eq!(observer.0.load(Ordering::Acquire), 2);
     }
 
