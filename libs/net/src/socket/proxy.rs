@@ -549,6 +549,23 @@ impl NetSocketProxy {
         self.facade.tfo_cookie()
     }
 
+    /// ICMP6_FILTER（RFC 3542 §3）。
+    pub fn set_icmp6_filter(&self, filter: [u32; 8]) {
+        self.facade.set_icmp6_filter(filter);
+    }
+
+    pub fn icmp6_filter(&self) -> Option<[u32; 8]> {
+        self.facade.icmp6_filter()
+    }
+
+    pub fn set_ipv6_checksum_offset(&self, offset: Option<u16>) {
+        self.facade.set_ipv6_checksum_offset(offset);
+    }
+
+    pub fn ipv6_checksum_offset(&self) -> Option<u16> {
+        self.facade.ipv6_checksum_offset()
+    }
+
     pub fn recv_stream_to(
         &self,
         output_len: usize,

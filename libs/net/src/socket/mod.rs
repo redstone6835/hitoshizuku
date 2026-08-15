@@ -2804,6 +2804,9 @@ pub struct SocketFacade {
     tfo_cookie: Mutex<Option<[u8; 8]>>,
     /// TCP_FASTOPEN_CONNECT：connect() 时携带缓存的 TFO cookie。
     tfo_connect_enabled: AtomicBool,
+    /// ICMP6_FILTER：原始 ICMPv6 socket 的类型位图（RFC 3542 §3）。
+    icmp6_filter: Mutex<Option<[u32; 8]>>,
+    ipv6_checksum_offset: Mutex<Option<u16>>,
     multicast_memberships: Mutex<Vec<MulticastMembership>>,
     multicast_interface: AtomicU32,
     multicast_hops: AtomicU16,
@@ -2978,6 +2981,8 @@ impl SocketFacade {
             ip_options: Mutex::new(crate::ip_options::IpOptions::empty()),
             tfo_cookie: Mutex::new(None),
             tfo_connect_enabled: AtomicBool::new(false),
+            icmp6_filter: Mutex::new(None),
+            ipv6_checksum_offset: Mutex::new(None),
             multicast_memberships: Mutex::new(Vec::new()),
             multicast_interface: AtomicU32::new(0),
             multicast_hops: AtomicU16::new(1),
@@ -3099,6 +3104,51 @@ impl SocketFacade {
 
     pub fn stream_connected(&self) -> bool {
         self.stream_connected.load(Ordering::Acquire)
+    }
+
+    /// ICMP6_FILTER：设置原始 ICMPv6 socket 的类型位图（RFC 3542 §3）。
+    pub fn set_icmp6_filter(&self, filter: [u32; 8]) {
+        *self.icmp6_filter.lock() = Some(filter);
+    }
+
+    /// SOL_RAW IPV6_CHECKSUM：IPv6 raw 发送时由内核计算校验和的偏移（None = 关闭）。
+    pub fn set_ipv6_checksum_offset(&self, offset: Option<u16>) {
+        *self.ipv6_checksum_offset.lock() = offset;
+    }
+
+    pub fn ipv6_checksum_offset(&self) -> Option<u16> {
+        *self.ipv6_checksum_offset.lock()
+    }
+
+    pub fn icmp6_filter(&self) -> Option<[u32; 8]> {
+        *self.icmp6_filter.lock()
+    }
+
+    /// 原始 ICMPv6 递送前按类型位图过滤（未设置过滤器或非 ICMPv6 包不拦截）。
+    ///
+    /// RFC 3542 §3.1 / glibc netinet/icmp6.h 语义：位 = 1 表示**阻止**该消息类型，
+    /// 位 = 0 表示放行（ICMP6_FILTER_SETPASS 清位、SETBLOCK 置位）。
+    pub fn icmp6_filter_rejects(&self, packet: &crate::pipeline::FrontendPacket) -> bool {
+        let guard = self.icmp6_filter.lock();
+        let Some(filter) = guard.as_ref() else {
+            return false;
+        };
+        let Some(ip) = packet.parsed.ip else {
+            return false;
+        };
+        if ip.next_header != 58 {
+            return false;
+        }
+        let mut type_byte = [0u8; 1];
+        if packet
+            .chain
+            .copy_out(usize::from(ip.payload_offset), &mut type_byte)
+            .is_err()
+        {
+            return false;
+        }
+        let kind = usize::from(type_byte[0]);
+        filter[kind / 32] & (1 << (kind % 32)) != 0
     }
 
     /// TCP_FASTOPEN_CONNECT：后续 connect() 携带缓存的 cookie。

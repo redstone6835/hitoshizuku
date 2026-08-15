@@ -31,13 +31,18 @@ ip link set eth0 up 2>/dev/null || true
 
 # 等待 DHCP 租约写入 DNS，然后生成 /etc/resolv.conf。
 # 内核 DHCP 的 DNS 列表通过 /proc/net/dns 导出（一行一个 nameserver）。
+# QEMU 用户态网络下 DHCP 租约通常需要 30-60s 才能落地，轮询窗口放宽到 75s。
+# （busybox 无 seq applet，用 POSIX while 循环代替。）
 resolv_ready=0
-for i in $(seq 1 20); do
-    if [ -s /proc/net/dns ]; then
+resolv_wait=0
+while [ "$resolv_wait" -lt 75 ]; do
+    # procfs 虚拟文件的 st_size 可能为 0，不能只用 -s，需读内容判断。
+    if [ -r /proc/net/dns ] && [ -n "$(cat /proc/net/dns 2>/dev/null)" ]; then
         resolv_ready=1
         break
     fi
     sleep 1
+    resolv_wait=$((resolv_wait + 1))
 done
 if [ "$resolv_ready" = "1" ]; then
     {

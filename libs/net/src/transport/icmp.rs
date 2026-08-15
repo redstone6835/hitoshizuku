@@ -161,6 +161,8 @@ pub fn handle_control_packet(
                     interface,
                     local_mac,
                     config,
+                    neighbors,
+                    now_ns,
                 )
             } else {
                 handle_icmpv4(packet, packet_offset, packet_len)
@@ -317,6 +319,8 @@ fn handle_icmpv6(
     interface: InterfaceId,
     local_mac: [u8; 6],
     config: &ConfigSnapshot,
+    neighbors: &mut NeighborTable,
+    now_ns: u64,
 ) -> ControlPacketResult {
     if len < 8 {
         return ControlPacketResult::Drop(DropReason::MalformedIpv6, packet.chain);
@@ -349,6 +353,19 @@ fn handle_icmpv6(
             return ControlPacketResult::Drop(DropReason::MalformedIpv6, packet.chain);
         }
         return handle_neighbor_solicitation(packet, offset, len, interface, local_mac, config);
+    }
+    // Neighbor Advertisement（RFC 4861 §4.4）：观测发送者的链路层地址，
+    // 用于解析待发送队列（ping6 等目标在链路本地时依赖 NS/NA 交换）。
+    if icmp[0] == 136 {
+        return handle_neighbor_advertisement(
+            packet,
+            offset,
+            len,
+            interface,
+            config,
+            neighbors,
+            now_ns,
+        );
     }
     if icmp[0] != 128 {
         return match parse_icmpv6_error(&packet.chain, offset, len) {
@@ -485,6 +502,48 @@ fn handle_neighbor_solicitation(
     ControlPacketResult::Reply(packet.chain)
 }
 
+fn handle_neighbor_advertisement(
+    packet: FrontendPacket,
+    offset: u16,
+    len: u32,
+    interface: InterfaceId,
+    config: &ConfigSnapshot,
+    neighbors: &mut NeighborTable,
+    now_ns: u64,
+) -> ControlPacketResult {
+    if len < 24 {
+        return ControlPacketResult::Drop(DropReason::MalformedIpv6, packet.chain);
+    }
+    let mut advertisement = [0u8; 32];
+    let readable = (len as usize).min(advertisement.len());
+    if packet
+        .chain
+        .copy_out(usize::from(offset), &mut advertisement[..readable])
+        .is_err()
+    {
+        return ControlPacketResult::Drop(DropReason::MalformedIpv6, packet.chain);
+    }
+    let target = Ipv6Addr(advertisement[8..24].try_into().unwrap());
+    // 目标为本机地址的 NA 不写入邻居表（DAD/地址冲突由控制面另行处理）。
+    if config.is_local_address(interface, IpAddr::V6(target)) {
+        return ControlPacketResult::Consumed(packet.chain);
+    }
+    // 链路层地址选项（RFC 4861 §4.6.1）：type=2 length=1，MAC 占 6 字节。
+    let has_link_layer = readable >= 32 && advertisement[24] == 2 && advertisement[25] == 1;
+    if has_link_layer {
+        let mac = advertisement[26..32].try_into().unwrap();
+        let _ = neighbors.observe(
+            NeighborKey {
+                interface,
+                address: IpAddr::V6(target),
+            },
+            mac,
+            now_ns,
+        );
+    }
+    ControlPacketResult::Consumed(packet.chain)
+}
+
 fn parse_icmpv4_error(
     packet: &PacketChain,
     offset: u16,
@@ -592,4 +651,179 @@ fn quoted_error_target(
         },
     )
     .map(ControlErrorTarget::Flow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{AddressEntry, InterfaceSnapshot, RouteEntry};
+
+    /// 构造一个发给本机的 IPv6 NA 帧（type 136，目标 fe80::2，带链路层选项）。
+    fn build_neighbor_advertisement_packet(
+        target: Ipv6Addr,
+        advertiser_mac: [u8; 6],
+    ) -> FrontendPacket {
+        let router = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut frame = alloc::vec![0u8; 14 + 40 + 32];
+        frame[0..6].copy_from_slice(&advertiser_mac);
+        frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+        frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&32u16.to_be_bytes());
+        frame[20] = 58;
+        frame[21] = 255;
+        frame[22..38].copy_from_slice(&router.0);
+        frame[38..54].copy_from_slice(&target.0);
+        frame[54] = 136;
+        frame[55] = 0x40; // Solicited 标志。
+        frame[62..78].copy_from_slice(&target.0);
+        frame[78] = 2;
+        frame[79] = 1;
+        frame[80..86].copy_from_slice(&advertiser_mac);
+        // 计算 ICMPv6 校验和，否则入口校验会丢弃。
+        let chain = crate::buf::PacketChain::from_owned(frame);
+        let checksum = crate::pipeline::transport_checksum(
+            &chain,
+            54,
+            32,
+            IpAddr::V6(router),
+            IpAddr::V6(target),
+            58,
+        )
+        .expect("校验和应可计算");
+        let mut frame = alloc::vec![0u8; chain.total_len()];
+        chain.copy_out(0, &mut frame).unwrap();
+        frame[56..58].copy_from_slice(&checksum.to_be_bytes());
+        let chain = crate::buf::PacketChain::from_owned(frame);
+        let parsed = crate::pipeline::ParsedPacket {
+            ethernet: crate::pipeline::EthernetHeader {
+                destination: [0x02, 0, 0, 0, 0, 0x01],
+                source: advertiser_mac,
+                ethertype: 0x86dd,
+            },
+            ip: Some(crate::pipeline::IpPacket {
+                source: IpAddr::V6(router),
+                destination: IpAddr::V6(target),
+                next_header: 58,
+                header_len: 40,
+                payload_offset: 54,
+                payload_len: 32,
+                hop_limit: 255,
+                traffic_class: 0,
+                fragment: None,
+            }),
+            tcp: None,
+            udp: None,
+            flow: None,
+            rss_hash: None,
+            disposition: crate::pipeline::FrontendDisposition::Control(
+                crate::pipeline::ControlPacket::Icmp {
+                    ipv6: true,
+                    packet_offset: 54,
+                    packet_len: 32,
+                },
+            ),
+        };
+        crate::pipeline::FrontendPacket {
+            chain,
+            parsed,
+            metadata: crate::buf::PacketMetadata::default(),
+        }
+    }
+
+    fn local_config() -> ConfigSnapshot {
+        ConfigSnapshot::new(
+            1,
+            alloc::vec![InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 0x01],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            alloc::vec![AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V6(Ipv6Addr([
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+                ])),
+                prefix_len: 64,
+                primary: true,
+            }],
+            alloc::vec![RouteEntry {
+                table: 0,
+                network: IpAddr::V6(Ipv6Addr([
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ])),
+                prefix_len: 64,
+                gateway: None,
+                interface: InterfaceId(1),
+                metric: 0,
+                mtu: Some(1500),
+            }],
+            alloc::vec::Vec::new(),
+        )
+        .expect("配置应合法")
+    }
+
+    /// NA 携带链路层选项时应观测邻居，待解析队列即可继续发送。
+    #[test]
+    fn neighbor_advertisement_observes_link_layer_address() {
+        let target = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router_mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        let packet = build_neighbor_advertisement_packet(target, router_mac);
+        let config = local_config();
+        let mut neighbors = NeighborTable::new([7; 16]);
+        let result = handle_icmpv6(
+            packet,
+            54,
+            32,
+            InterfaceId(1),
+            config.interfaces[0].mac_address,
+            &config,
+            &mut neighbors,
+            1_000_000,
+        );
+        assert!(matches!(result, ControlPacketResult::Consumed(_)));
+        let observed = neighbors
+            .lookup(
+                NeighborKey {
+                    interface: InterfaceId(1),
+                    address: IpAddr::V6(target),
+                },
+                1_100_000,
+            )
+            .expect("NA 应写入邻居表");
+        assert_eq!(observed.0, router_mac);
+    }
+
+    /// 目标为本机地址的 NA 不应污染邻居表。
+    #[test]
+    fn neighbor_advertisement_for_local_address_is_ignored() {
+        let local = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let other_mac = [0xde, 0xad, 0xbe, 0xef, 0, 1];
+        let packet = build_neighbor_advertisement_packet(local, other_mac);
+        let config = local_config();
+        let mut neighbors = NeighborTable::new([8; 16]);
+        let result = handle_icmpv6(
+            packet,
+            54,
+            32,
+            InterfaceId(1),
+            config.interfaces[0].mac_address,
+            &config,
+            &mut neighbors,
+            1_000_000,
+        );
+        assert!(matches!(result, ControlPacketResult::Consumed(_)));
+        assert!(neighbors
+            .lookup(
+                NeighborKey {
+                    interface: InterfaceId(1),
+                    address: IpAddr::V6(local),
+                },
+                1_100_000,
+            )
+            .is_none());
+    }
 }

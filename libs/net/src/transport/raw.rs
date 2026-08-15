@@ -42,6 +42,8 @@ pub struct PreparedRawTx {
     pub traffic_class: u8,
     /// IP_OPTIONS：随 IPv4 头携带的选项（header_included 时忽略）。
     pub ip_options: crate::ip_options::IpOptions,
+    /// SOL_RAW IPV6_CHECKSUM：IPv6 raw 发送时内核计算并填充的校验和偏移。
+    pub ipv6_checksum_offset: Option<u16>,
     pub completion: CompletionToken,
 }
 
@@ -205,6 +207,11 @@ impl RawEndpointTable {
                 undelivered: None,
             };
         };
+        // Linux 语义：IPv4 原始套接字收 IP 头，IPv6 原始套接字收不到 IPv6 头
+        // （SOCK_RAW AF_INET6 的接收数据从传输头开始，RFC 3542 §3）。
+        // 本路径的 chain 已剥掉以太网头（从 IP 头开始）。
+        let ipv6 = matches!(source.addr, IpAddr::V6(_));
+        let payload_offset: u16 = if ipv6 { 40 } else { 0 };
         let mut delivered = 0;
         let mut copied_bytes = 0;
         for endpoint in self
@@ -212,10 +219,14 @@ impl RawEndpointTable {
             .into_iter()
             .take(RAW_FANOUT_LIMIT)
         {
+            // ICMP6_FILTER（RFC 3542 §3）：按类型位图过滤原始 ICMPv6 递送。
+            if endpoint.facade.icmp6_filter_rejects(packet) {
+                continue;
+            }
             let chain = PacketChain::from_owned(bytes.clone());
             let datagram = raw_datagram(
                 chain,
-                0,
+                payload_offset,
                 source,
                 destination,
                 hop_limit,
@@ -256,6 +267,11 @@ impl RawEndpointTable {
             addr: ip.destination,
             port: 0,
         };
+        // IPv6 原始套接字接收数据从传输头开始（不包含 IPv6 头）。
+        // 首接收者使用原始帧（含以太网头），拷贝则从 IP 头开始。
+        let ipv6 = matches!(ip.source, IpAddr::V6(_));
+        let original_offset: u16 = if ipv6 { 54 } else { 14 };
+        let copy_offset: u16 = if ipv6 { 40 } else { 0 };
         let timestamp = packet.metadata.rx_timestamp_ns;
         let metadata = packet.metadata;
         let parsed = packet.parsed;
@@ -268,7 +284,7 @@ impl RawEndpointTable {
                 let packet = original.take().expect("首个 raw receiver 取得原包");
                 raw_datagram(
                     packet.chain,
-                    14,
+                    original_offset,
                     source,
                     destination,
                     ip.hop_limit,
@@ -284,7 +300,7 @@ impl RawEndpointTable {
                 copied_bytes += bytes.len();
                 raw_datagram(
                     PacketChain::from_owned(bytes.clone()),
-                    0,
+                    copy_offset,
                     source,
                     destination,
                     ip.hop_limit,
@@ -701,6 +717,7 @@ mod tests {
             unresolved_neighbor: None,
             protocol: 99,
             header_included: true,
+            ipv6_checksum_offset: None,
             hop_limit: 64,
             traffic_class: 0,
             ip_options: crate::ip_options::IpOptions::empty(),

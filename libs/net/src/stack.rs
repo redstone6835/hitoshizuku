@@ -835,6 +835,16 @@ impl TxPlanPayload {
 }
 
 /// `net.stack.shard-turn` 返回的一份完整报文发送计划。
+/// SOL_RAW IPV6_CHECKSUM 回填：payload 内校验和字段偏移与 pseudo-header 参数。
+/// 设备路径在物化帧时清零、计算并回填（RFC 3542 §8.1）。
+#[derive(Clone, Copy, Debug)]
+pub struct RawTxChecksumFixup {
+    pub payload_offset: u16,
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub protocol: u8,
+}
+
 pub struct TxPlan {
     pub interface: InterfaceId,
     pub facade: Arc<SocketFacade>,
@@ -847,6 +857,8 @@ pub struct TxPlan {
     pub checksum: TxChecksum,
     pub layout: PacketLayout,
     pub low_latency: bool,
+    /// raw IPv6 发送时内核计算的传输层校验和回填（None = 关闭）。
+    pub checksum_fixup: Option<RawTxChecksumFixup>,
 }
 
 impl TxPlan {
@@ -1333,6 +1345,7 @@ fn build_tcp_tx_plan(work: PreparedTcpTx) -> Result<TxPlan, SocketError> {
         checksum: TxChecksum::Complete,
         layout: PacketLayout::Plain,
         low_latency: work.low_latency,
+        checksum_fixup: None,
     })
 }
 
@@ -1408,6 +1421,7 @@ fn build_udp_tx_plan(work: PreparedUdpTx) -> Result<TxPlan, SocketError> {
         checksum: TxChecksum::Complete,
         layout: PacketLayout::Plain,
         low_latency: false,
+        checksum_fixup: None,
     })
 }
 
@@ -1483,6 +1497,7 @@ fn append_udp_fragment_plans(
                 checksum: TxChecksum::Complete,
                 layout: PacketLayout::Plain,
                 low_latency: false,
+                checksum_fixup: None,
             })
             .map_err(|_| SocketError::WouldBlock)?;
         if fragment.more_fragments == 0 {
@@ -1526,7 +1541,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
     let mut header = [0u8; NET_STACK_TX_HEADER_CAPACITY];
     header[..6].copy_from_slice(&work.destination_mac);
     header[6..12].copy_from_slice(&work.source_mac);
-    let (header_len, payload_offset, payload_len) = if work.header_included {
+    let (header_len, payload_offset, payload_len, checksum_fixup) = if work.header_included {
         let mut ip = [0u8; 60];
         work.payload.copy_range(0, &mut ip[..20])?;
         let ip_header_len = usize::from(ip[0] & 0x0f) * 4;
@@ -1563,6 +1578,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
             14 + ip_header_len,
             ip_header_len as u32,
             u32::from(work.payload.len) - ip_header_len as u32,
+            None,
         )
     } else {
         let payload_len = usize::from(work.payload.len);
@@ -1589,7 +1605,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
                 ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
                 let checksum = checksum_bytes(ip);
                 ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-                (34 + ip_opt_len, 0, payload_len as u32)
+                (34 + ip_opt_len, 0, payload_len as u32, None)
             }
             (IpAddr::V6(source), IpAddr::V6(destination)) => {
                 let payload_len_u16 =
@@ -1607,7 +1623,24 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
                 ip[7] = work.hop_limit;
                 ip[8..24].copy_from_slice(&source.0);
                 ip[24..40].copy_from_slice(&destination.0);
-                (54, 0, payload_len as u32)
+                // SOL_RAW IPV6_CHECKSUM：物化帧时内核计算并回填传输层校验和。
+                let checksum_fixup = work.ipv6_checksum_offset.and_then(|offset| {
+                    usize::from(offset)
+                        .checked_add(2)
+                        .is_some_and(|end| end <= payload_len)
+                        .then_some(RawTxChecksumFixup {
+                            payload_offset: offset,
+                            source: IpAddr::V6(source),
+                            destination: IpAddr::V6(destination),
+                            protocol: work.protocol,
+                        })
+                });
+                (
+                    54,
+                    0,
+                    payload_len as u32,
+                    checksum_fixup,
+                )
             }
             _ => return Err(SocketError::InvalidState),
         }
@@ -1624,6 +1657,7 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
         checksum: TxChecksum::Complete,
         layout: PacketLayout::Plain,
         low_latency: false,
+        checksum_fixup,
     })
 }
 
@@ -1671,6 +1705,7 @@ fn append_raw_fragment_plans(
                 checksum: TxChecksum::Complete,
                 layout: PacketLayout::Plain,
                 low_latency: false,
+                checksum_fixup: None,
             })
             .map_err(|_| SocketError::WouldBlock)?;
         if fragment.more_fragments == 0 {
@@ -7435,5 +7470,187 @@ mod tests {
             lifecycle.activate(NetStackHandle(2), 11, 2),
             Err(NetStackRegisterErrorKind::AlreadyActive)
         );
+    }
+
+    /// ICMP6_FILTER 位图语义（RFC 3542 §3.1 / glibc icmp6.h）：
+    /// 位 = 1 阻止、位 = 0 放行（ICMP6_FILTER_SETPASS 清位）。
+    #[test]
+    fn icmp6_filter_blocks_set_bits_and_passes_cleared_bits() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 2,
+            },
+            crate::AddressFamily::Ipv6,
+            crate::SocketKind::Raw,
+        ));
+        // busybox ping6 风格：SETBLOCKALL（全 1）+ SETPASS(ICMP6_ECHO_REPLY)。
+        let mut filter = [0xffff_ffffu32; 8];
+        filter[129 / 32] &= !(1 << (129 % 32));
+        facade.set_icmp6_filter(filter);
+
+        let echo_reply = build_icmp6_test_packet(129);
+        assert!(
+            !facade.icmp6_filter_rejects(&echo_reply),
+            "129（echo reply）位已清，应放行"
+        );
+        let echo_request = build_icmp6_test_packet(128);
+        assert!(
+            facade.icmp6_filter_rejects(&echo_request),
+            "128（echo request）位已置，应阻止"
+        );
+        // 未设置过滤器时全部放行。
+        let unfiltered = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 3,
+            },
+            crate::AddressFamily::Ipv6,
+            crate::SocketKind::Raw,
+        ));
+        assert!(!unfiltered.icmp6_filter_rejects(&build_icmp6_test_packet(128)));
+    }
+
+    /// 构造 ICMPv6 类型为 kind 的入站包（以太网 + IPv6 + ICMPv6 头）。
+    fn build_icmp6_test_packet(kind: u8) -> crate::pipeline::FrontendPacket {
+        let source = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]));
+        let destination = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]));
+        let mut frame = alloc::vec![0u8; 14 + 40 + 8];
+        frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&8u16.to_be_bytes());
+        frame[20] = 58;
+        frame[21] = 64;
+        let IpAddr::V6(source_v6) = source else { unreachable!() };
+        let IpAddr::V6(destination_v6) = destination else { unreachable!() };
+        frame[22..38].copy_from_slice(&source_v6.0);
+        frame[38..54].copy_from_slice(&destination_v6.0);
+        frame[54] = kind;
+        let chain = PacketChain::from_owned(frame);
+        crate::pipeline::FrontendPacket {
+            chain,
+            parsed: crate::pipeline::ParsedPacket {
+                ethernet: crate::pipeline::EthernetHeader {
+                    destination: [0x02, 0, 0, 0, 0, 1],
+                    source: [0x02, 0, 0, 0, 0, 2],
+                    ethertype: 0x86dd,
+                },
+                ip: Some(crate::pipeline::IpPacket {
+                    source,
+                    destination,
+                    next_header: 58,
+                    header_len: 40,
+                    payload_offset: 54,
+                    payload_len: 8,
+                    hop_limit: 64,
+                    traffic_class: 0,
+                    fragment: None,
+                }),
+                tcp: None,
+                udp: None,
+                flow: None,
+                rss_hash: None,
+                disposition: crate::pipeline::FrontendDisposition::Control(
+                    crate::pipeline::ControlPacket::Icmp {
+                        ipv6: true,
+                        packet_offset: 54,
+                        packet_len: 8,
+                    },
+                ),
+            },
+            metadata: PacketMetadata::default(),
+        }
+    }
+
+    /// SOL_RAW IPV6_CHECKSUM：plan 携带校验和回填参数（RFC 3542 §8.1）。
+    #[test]
+    fn raw_ipv6_plan_carries_checksum_fixup() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 1,
+            },
+            crate::AddressFamily::Ipv6,
+            crate::SocketKind::Raw,
+        ));
+        facade.set_ipv6_checksum_offset(Some(2));
+        let source = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]));
+        let destination = IpAddr::V6(Ipv6Addr([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]));
+        let payload = facade.test_udp_tx_lease(
+            &[128, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+            Endpoint {
+                addr: destination,
+                port: 0,
+            },
+        );
+        let plan = build_raw_tx_plan(PreparedRawTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface: InterfaceId(1),
+                source,
+                next_hop: destination,
+                mtu: 1280,
+                table: 0,
+            },
+            destination,
+            source_mac: [0x02, 0, 0, 0, 0, 1],
+            destination_mac: [0x02, 0, 0, 0, 0, 2],
+            unresolved_neighbor: None,
+            protocol: 58,
+            header_included: false,
+            hop_limit: 64,
+            traffic_class: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
+            ipv6_checksum_offset: Some(2),
+            completion: CompletionToken(1),
+        })
+        .expect("IPv6 raw plan 应构建成功");
+        let fixup = plan.checksum_fixup.expect("启用 IPV6_CHECKSUM 应带回填参数");
+        assert_eq!(fixup.payload_offset, 2);
+        assert_eq!(fixup.source, source);
+        assert_eq!(fixup.destination, destination);
+        assert_eq!(fixup.protocol, 58);
+        assert_eq!(plan.payload_offset, 0);
+        assert_eq!(plan.header_len, 54);
+        // 未启用时无回填参数。
+        facade.set_ipv6_checksum_offset(None);
+        let payload = facade.test_udp_tx_lease(
+            &[128, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+            Endpoint {
+                addr: destination,
+                port: 0,
+            },
+        );
+        let plan = build_raw_tx_plan(PreparedRawTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface: InterfaceId(1),
+                source,
+                next_hop: destination,
+                mtu: 1280,
+                table: 0,
+            },
+            destination,
+            source_mac: [0x02, 0, 0, 0, 0, 1],
+            destination_mac: [0x02, 0, 0, 0, 0, 2],
+            unresolved_neighbor: None,
+            protocol: 58,
+            header_included: false,
+            hop_limit: 64,
+            traffic_class: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
+            ipv6_checksum_offset: None,
+            completion: CompletionToken(1),
+        })
+        .expect("IPv6 raw plan 应构建成功");
+        assert!(plan.checksum_fixup.is_none());
     }
 }

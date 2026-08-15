@@ -1579,6 +1579,7 @@ impl FlowShard {
             hop_limit: facade.ip_hop_limit(),
             traffic_class: facade.ip_traffic_class(),
             ip_options: facade.ip_options(),
+            ipv6_checksum_offset: facade.ipv6_checksum_offset(),
             completion: {
                 let completion = CompletionToken(self.next_completion);
                 self.next_completion = self.next_completion.wrapping_add(1).max(1);

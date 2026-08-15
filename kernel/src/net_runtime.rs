@@ -5422,7 +5422,7 @@ impl NetWorkerContext {
             primary: true,
         });
         let mut routes = current.routes.entries().to_vec();
-        routes.push(RouteEntry {
+        let onlink = RouteEntry {
             table: 0,
             network: IpAddr::V6(ipv6_network(address, prefix_len)),
             prefix_len,
@@ -5434,7 +5434,11 @@ impl NetWorkerContext {
                 .iter()
                 .find(|entry| entry.id == interface)
                 .map(|entry| entry.mtu),
-        });
+        };
+        // RA on-link 路由可能已携带相同前缀：去重。
+        if !routes.contains(&onlink) {
+            routes.push(onlink);
+        }
         if let Ok(next) = ConfigSnapshot::new_with_dns(
             current.generation.saturating_add(1),
             current.interfaces.clone(),
@@ -8536,21 +8540,33 @@ fn build_neighbor_probe(
             Some(frame)
         }
         IpAddr::V6(target) => {
+            // RFC 4861 §7.1.2：NS 应优先使用链路本地源地址；没有链路本地时退回
+            // 任意 primary IPv6 地址。
             let source = if dad {
                 Ipv6Addr::UNSPECIFIED
             } else {
-                config
-                    .addresses
-                    .iter()
-                    .find_map(|entry| {
-                        (entry.interface == key.interface && entry.primary)
-                            .then_some(entry.address)
-                            .and_then(|address| match address {
-                                IpAddr::V6(address) => Some(address),
-                                IpAddr::V4(_) => None,
-                            })
-                    })
-                    .unwrap_or(Ipv6Addr::UNSPECIFIED)
+                let mut fallback = Ipv6Addr::UNSPECIFIED;
+                let mut selected = None;
+                for entry in config.addresses.iter() {
+                    if entry.interface != key.interface {
+                        continue;
+                    }
+                    let IpAddr::V6(address) = entry.address else {
+                        continue;
+                    };
+                    if !entry.primary {
+                        continue;
+                    }
+                    if address.0[0] == 0xfe && address.0[1] & 0xc0 == 0x80 {
+                        // fe80::/10 链路本地优先。
+                        selected = Some(address);
+                        break;
+                    }
+                    if fallback.is_unspecified() {
+                        fallback = address;
+                    }
+                }
+                selected.unwrap_or(fallback)
             };
             let mut destination = [0u8; 16];
             destination[0] = 0xff;
@@ -8984,7 +9000,10 @@ impl WorkerContext {
             direct = None;
         }
 
-        if !self.queue.as_ref().unwrap().caps().scatter_gather {
+        // IPV6_CHECKSUM 回填需要可变字节，强制走连续拷贝路径。
+        if !self.queue.as_ref().unwrap().caps().scatter_gather
+            || plan.checksum_fixup.is_some()
+        {
             let frame_len = usize::from(plan.header_len).saturating_add(payload_len);
             let Ok(frame_len) = u16::try_from(frame_len) else {
                 plan.facade.set_pending_error(SocketError::MessageTooLarge);
@@ -9008,6 +9027,28 @@ impl WorkerContext {
             {
                 plan.facade.set_pending_error(SocketError::Buffer);
                 return Ok(());
+            }
+            // SOL_RAW IPV6_CHECKSUM（RFC 3542 §8.1）：清零字段、按 pseudo-header
+            // 计算校验和并回填。
+            if let Some(fixup) = &plan.checksum_fixup {
+                let position = header_len + usize::from(fixup.payload_offset);
+                let checksum_len = plan.payload_len as usize;
+                if position + 2 <= header_len + checksum_len {
+                    bytes[position] = 0;
+                    bytes[position + 1] = 0;
+                    let chain = net::buf::PacketChain::from_owned(bytes.to_vec());
+                    if let Ok(checksum) = net::pipeline::transport_checksum(
+                        &chain,
+                        header_len,
+                        checksum_len,
+                        fixup.source,
+                        fixup.destination,
+                        fixup.protocol,
+                    ) {
+                        bytes[position..position + 2]
+                            .copy_from_slice(&checksum.to_be_bytes());
+                    }
+                }
             }
             drop(pool);
             self.tx_batch

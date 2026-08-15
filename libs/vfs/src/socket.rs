@@ -1388,6 +1388,10 @@ fn parse_accept_flags(flags: usize) -> Result<(bool, bool), Errno> {
 
 const SOL_IP: i32 = 0;
 const SOL_IPV6: i32 = 41;
+const SOL_ICMPV6: i32 = 58;
+const SOL_RAW: i32 = 255;
+const ICMP6_FILTER: i32 = 1;
+const IPV6_CHECKSUM: i32 = 7;
 
 const IP_TOS: i32 = 1;
 const IP_TTL: i32 = 2;
@@ -1656,6 +1660,25 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 .to_vec()),
             IP_MULTICAST_TTL => Ok((i32::from(opts.multicast_hops)).to_ne_bytes().to_vec()),
             IP_MULTICAST_LOOP => Ok((opts.multicast_loop as i32).to_ne_bytes().to_vec()),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_ICMPV6 => match optname {
+            ICMP6_FILTER => Ok(net_ops
+                .proxy()
+                .icmp6_filter()
+                .unwrap_or([0u32; 8])
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .collect()),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_RAW if net_ops.family() == crate::addr::AF_INET6 => match optname {
+            // Linux 语义：默认 -1（关闭），启用时为 ICMPv6 校验和字段偏移。
+            IPV6_CHECKSUM => Ok(
+                (i32::from(net_ops.proxy().ipv6_checksum_offset().map_or(-1, |offset| i32::from(offset))))
+                    .to_ne_bytes()
+                    .to_vec(),
+            ),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
@@ -2020,6 +2043,43 @@ fn inet_setsockopt(
                     net_ops.proxy().drop_multicast_membership(membership)
                 }
                 .map_err(crate::net_socket::map_socket_error_public)
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_ICMPV6 => match optname {
+            ICMP6_FILTER => {
+                // RFC 3542 §3：8 个 u32 的类型位图（原始 ICMPv6 socket）。
+                if net_ops.family() != crate::addr::AF_INET6 {
+                    return Err(Errno::ENOPROTOOPT);
+                }
+                if value.len() != 32 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut filter = [0u32; 8];
+                for (index, word) in filter.iter_mut().enumerate() {
+                    *word =
+                        u32::from_ne_bytes(value[index * 4..index * 4 + 4].try_into().unwrap());
+                }
+                net_ops.proxy().set_icmp6_filter(filter);
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_RAW if net_ops.family() == crate::addr::AF_INET6 => match optname {
+            // RFC 3542 §8.1：-1 关闭自动校验和；非负值为 ICMPv6 校验和字段偏移。
+            IPV6_CHECKSUM => {
+                let offset = parse_int_opt(value)?;
+                if offset < -1 {
+                    return Err(Errno::EINVAL);
+                }
+                net_ops
+                    .proxy()
+                    .set_ipv6_checksum_offset(if offset < 0 {
+                        None
+                    } else {
+                        Some(offset as u16)
+                    });
+                Ok(())
             }
             _ => Err(Errno::ENOPROTOOPT),
         },
