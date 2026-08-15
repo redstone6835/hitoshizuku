@@ -56,6 +56,12 @@ if [ -x /bin/fanotify-test ]; then
     status=$?
     echo "[init][fs-tests] fanotify tests exit=$status"
 fi
+if [ -x /bin/direct-io-test ]; then
+    echo "[init][fs-tests] running direct-io tests"
+    /bin/direct-io-test
+    status=$?
+    echo "[init][fs-tests] direct-io tests exit=$status"
+fi
 if [ -x /bin/loongarch-sxe-test ]; then
     echo "[init][lazy-sxe-tests] running LoongArch FP/LSX state tests"
     /bin/loongarch-sxe-test

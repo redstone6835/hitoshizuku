@@ -4267,6 +4267,7 @@ fn write_from_user_at(
     if len == 0 {
         return Ok(0);
     }
+    check_direct_alignment(file, user, offset, len)?;
     let Some(vm) = current_vm_space() else {
         return write_from_user_at_fallback(file, user, len, offset);
     };
@@ -4332,6 +4333,7 @@ fn write_from_user_at_fallback(
     len: usize,
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    check_direct_alignment(file, user, offset, len)?;
     let mut remaining = len;
     let mut user_ptr = user;
     let mut pos = offset.unwrap_or(0);
@@ -4381,6 +4383,34 @@ fn write_from_user_at_fallback(
     Ok(written)
 }
 
+/// O_DIRECT 对齐校验（Linux 语义）：用户缓冲区、偏移、长度均须按 512 字节
+/// 对齐，否则 read/write 返回 EINVAL。
+fn check_direct_alignment(
+    file: &vfs::file::File,
+    user: usize,
+    offset: Option<u64>,
+    len: usize,
+) -> Result<(), Errno> {
+    if !file.flags().direct {
+        return Ok(());
+    }
+    // 只有支持直接 I/O 的文件系统执行对齐校验：Linux 上 tmpfs 等对
+    // fcntl(F_SETFL, O_DIRECT) 设置后的 I/O 保持普通路径，不受对齐约束。
+    let supports = file
+        .inode()
+        .superblock()
+        .map(|sb| sb.ops.supports_direct_io())
+        .unwrap_or(false);
+    if !supports {
+        return Ok(());
+    }
+    let off = offset.unwrap_or_else(|| file.pos());
+    if (user & 511) != 0 || (off & 511) != 0 || (len & 511) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 fn read_to_user(
     file: &vfs::file::File,
     user: usize,
@@ -4409,6 +4439,7 @@ fn read_to_user_windows(
     len: usize,
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    check_direct_alignment(file, user, offset, len)?;
     let mut remaining = len;
     let mut user_ptr = user;
     let mut pos = offset.unwrap_or(0);
@@ -4453,6 +4484,7 @@ fn read_to_user_fallback(
     len: usize,
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    check_direct_alignment(file, user, offset, len)?;
     let mut remaining = len;
     let mut user_ptr = user;
     let mut pos = offset.unwrap_or(0);

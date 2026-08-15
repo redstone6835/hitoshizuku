@@ -223,6 +223,7 @@ ACCT_TEST_SRC := userland/tests/acct.c
 XATTR_TEST_SRC := userland/tests/xattr_test.c
 INOTIFY_TEST_SRC := userland/tests/inotify_test.c
 FANOTIFY_TEST_SRC := userland/tests/fanotify_test.c
+DIRECT_IO_TEST_SRC := userland/tests/direct_io_test.c
 SYSCALL_BENCH_SRC := userland/tests/syscall_bench.c
 MM_BENCH_SRC := userland/tests/mm_fault_bench.c
 RISCV_WEIGHT_SRC := userland/tests/riscv_instruction_weight_probe.c
@@ -418,12 +419,16 @@ define build_fs_tests
 		$(INOTIFY_TEST_SRC) -o $(BUILD_DIR)/$(1)/fs-user/inotify-test; \
 	$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
 		$(FANOTIFY_TEST_SRC) -o $(BUILD_DIR)/$(1)/fs-user/fanotify-test; \
+	$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		$(DIRECT_IO_TEST_SRC) -o $(BUILD_DIR)/$(1)/fs-user/direct-io-test; \
 	$(3)strip $(BUILD_DIR)/$(1)/fs-user/xattr-test || true; \
 	$(3)strip $(BUILD_DIR)/$(1)/fs-user/inotify-test || true; \
 	$(3)strip $(BUILD_DIR)/$(1)/fs-user/fanotify-test || true; \
+	$(3)strip $(BUILD_DIR)/$(1)/fs-user/direct-io-test || true; \
 	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/xattr-test $(2)/bin/; \
 	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/inotify-test $(2)/bin/; \
-	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/fanotify-test $(2)/bin/;
+	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/fanotify-test $(2)/bin/; \
+	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/direct-io-test $(2)/bin/;
 endef
 
 define build_loongarch_sxe_tests

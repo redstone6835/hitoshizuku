@@ -195,6 +195,23 @@ pub fn openat(
 ///
 /// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
 /// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+/// O_DIRECT 打开校验：文件系统不支持直接 I/O 时拒绝（Linux tmpfs 等
+/// 对 `open(O_DIRECT)` 返回 EINVAL）。
+pub fn check_direct_io_supported(inode: &Inode, direct: bool) -> VfsResult<()> {
+    if !direct {
+        return Ok(());
+    }
+    let supports = inode
+        .superblock()
+        .map(|sb| sb.ops.supports_direct_io())
+        .unwrap_or(false);
+    if supports {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgument)
+    }
+}
+
 #[kernel_symbols::export(
     name = "vfs.operation.openat_with_lookup_flags",
     contract = "kernel.vfs.operation@1",
@@ -322,6 +339,9 @@ pub fn openat_with_lookup_flags(
     {
         return Err(VfsError::OperationNotPermitted);
     }
+
+    // ── O_DIRECT 支持校验：内存/伪文件系统拒绝（Linux 语义）──
+    check_direct_io_supported(&inode, flags.direct)?;
 
     // ── 只读挂载检查 ──
     if flags.writable() {
