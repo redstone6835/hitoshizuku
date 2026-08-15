@@ -976,7 +976,21 @@ pub(crate) fn commit_exec(
             source.suppress_drop_notifications_for_exec();
         }
     }
+    ptrace_notify_exec(task);
     Ok(())
+}
+
+/// `PTRACE_O_TRACEEXEC`：exec 完成事件（消息为 0）。
+fn ptrace_notify_exec(task: &Arc<Task>) {
+    const PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+    const PTRACE_EVENT_EXEC: u16 = 4;
+    if !task.is_ptrace_traced() || task.ptrace_options() & PTRACE_O_TRACEEXEC == 0 {
+        return;
+    }
+    task.set_ptrace_event_msg(0);
+    task.set_ptrace_stop_event(PTRACE_EVENT_EXEC);
+    task.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(task, sched::SignalNumber::SIGTRAP);
 }
 
 #[cfg(feature = "kernel-tests")]

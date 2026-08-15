@@ -600,8 +600,27 @@ fn handle_user_illegal_instruction(tf_ptr: usize, code: usize) -> usize {
     }
 }
 
+static USER_BREAK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 注册用户态断点陷阱钩子（ptrace 单步补丁法使用）。
+pub fn register_user_break_hook(hook: fn(usize) -> bool) {
+    USER_BREAK_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
 fn handle_breakpoint(tf_ptr: usize, code: usize, from_user: bool) -> usize {
     if from_user {
+        let sepc = {
+            let tf = unsafe { trap_frame_ref(tf_ptr) };
+            tf.sepc
+        };
+        let hook = USER_BREAK_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if hook != 0 {
+            // Safety: register_user_break_hook 只写入 fn(usize) -> bool 指针。
+            let hook_fn: fn(usize) -> bool = unsafe { core::mem::transmute(hook) };
+            if hook_fn(sepc) {
+                return finish_trap_return(tf_ptr, true);
+            }
+        }
         return terminate_user_exception(code, sched::SignalNumber::SIGTRAP, tf_ptr, true);
     }
     if let Some(recovered) = try_recover_elm_kernel_fault(tf_ptr, code, "native breakpoint") {

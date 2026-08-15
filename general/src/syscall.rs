@@ -25,6 +25,7 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use errno::Errno;
+use sched::SignalNumber;
 
 use crate::TrapFramePtr;
 
@@ -480,6 +481,57 @@ fn complete_native_external_control_at_boundary(task: &Arc<sched::Task>) -> bool
     }
 }
 
+/// `PTRACE_SYSCALL` 的 entry-stop：在 syscall 主体执行前停止被跟踪任务。
+///
+/// stop 后任务由 tracer `PTRACE_CONT` 恢复；恢复时用户态重入 syscall 指令
+/// （trap frame 的 PC 未推进），重入后不再 entry-stop，而是在 syscall 出口
+/// 产生 exit-stop。`PTRACE_O_TRACESYSGOOD` 时停止信号编码为 `0x80|SIGTRAP`。
+fn ptrace_syscall_entry(ctx: &SyscallContext<'_>) -> bool {
+    let task = ctx.task();
+    if !task.is_ptrace_traced() || !task.ptrace_syscall_stop_enabled() {
+        return false;
+    }
+    task.set_ptrace_syscall_stop(false);
+    task.set_ptrace_syscall_reenable(true);
+    task.record_syscall_entry(ctx.nr, ctx.args);
+    task.set_ptrace_stop_event(0);
+    task.clear_ptrace_last_siginfo();
+    let raw_sig = if task.ptrace_options() & PTRACE_O_TRACESYSGOOD != 0 {
+        SignalNumber::SIGTRAP.raw() as i32 | 0x80
+    } else {
+        SignalNumber::SIGTRAP.raw() as i32
+    };
+    sched::operation::ptrace_mark_stopped_raw(task, raw_sig);
+    true
+}
+
+/// `PTRACE_SYSCALL` 的 exit-stop：syscall 已执行完毕（返回值已算好），
+/// 停止任务；恢复后正常返回用户态。
+fn ptrace_syscall_exit(ctx: &SyscallContext<'_>, ret: isize) -> bool {
+    let task = ctx.task();
+    if !task.is_ptrace_traced() {
+        return false;
+    }
+    if task.ptrace_syscall_reenable() {
+        // 重入后的放行路径：本次执行结束，产生 exit-stop。
+        task.set_ptrace_syscall_reenable(false);
+        task.record_syscall_exit(ret);
+        task.set_ptrace_stop_event(0);
+        task.clear_ptrace_last_siginfo();
+        let raw_sig = if task.ptrace_options() & PTRACE_O_TRACESYSGOOD != 0 {
+            SignalNumber::SIGTRAP.raw() as i32 | 0x80
+        } else {
+            SignalNumber::SIGTRAP.raw() as i32
+        };
+        sched::operation::ptrace_mark_stopped_raw(task, raw_sig);
+        return true;
+    }
+    // 普通 ptrace 任务（非 SYSCALL 模式）不产生 exit-stop。
+    false
+}
+
+const PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
+
 fn dispatch_tomori_for_task(
     tf: TrapFramePtr,
     ops: &'static SyscallFrameOps,
@@ -495,6 +547,10 @@ fn dispatch_tomori_for_task(
     let mut syscall_profile = profiling::syscall_scope(nr);
 
     let mut ctx = SyscallContext::new(nr, args, tf, task);
+
+    if ptrace_syscall_entry(&ctx) {
+        return;
+    }
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
@@ -535,6 +591,10 @@ fn dispatch_tomori_for_task(
     drop(invoke_profile);
 
     complete_group_exit_at_boundary(&mut ctx);
+
+    if !ctx.frame_finalized() && ptrace_syscall_exit(&ctx, ret) {
+        return;
+    }
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {

@@ -213,6 +213,18 @@ fn terminate_user_exception(
         sig.raw()
     );
 
+    // ptrace 单步补丁法：用户态断点陷阱优先交给钩子消费（命中则任务已停止）。
+    if from_user && code == ECODE_BRK {
+        let hook = USER_BREAK_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if hook != 0 {
+            // Safety: register_user_break_hook 只写入 fn(usize) -> bool 指针。
+            let hook_fn: fn(usize) -> bool = unsafe { core::mem::transmute(hook) };
+            if hook_fn(era) {
+                return tf_ptr;
+            }
+        }
+    }
+
     if sched::is_ready() {
         let me = sched::current_task();
         if me.user_abi_kind() == sched::UserAbiKind::MygoNative {
@@ -231,6 +243,13 @@ fn terminate_user_exception(
     }
 
     tf_ptr
+}
+
+static USER_BREAK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 注册用户态断点陷阱钩子（ptrace 单步补丁法使用）。
+pub fn register_user_break_hook(hook: fn(usize) -> bool) {
+    USER_BREAK_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
 /// LoongArch64 统一异常入口（Rust 端）。

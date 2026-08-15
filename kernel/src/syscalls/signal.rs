@@ -312,6 +312,24 @@ fn signal_number(raw: usize) -> Result<Option<SignalNumber>, Errno> {
     }
 }
 
+/// `PTRACE_SETSIGINFO` 用：读任意 siginfo（不校验信号号）。
+pub(super) fn read_queued_siginfo_raw(user: usize) -> Result<sched::SigInfo, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 128];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let signo = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let sig = SignalNumber::from_raw(signo).ok_or(Errno::EINVAL)?;
+    Ok(sched::SigInfo {
+        sig,
+        code: i32::from_le_bytes(raw[8..12].try_into().unwrap()),
+        sender_pid: i32::from_le_bytes(raw[12..16].try_into().unwrap()),
+        sender_uid: Uid(u32::from_le_bytes(raw[16..20].try_into().unwrap())),
+        raw: Some(raw),
+    })
+}
+
 fn read_queued_siginfo(user: usize, sig: SignalNumber) -> Result<sched::SigInfo, Errno> {
     if user == 0 {
         return Err(Errno::EFAULT);
@@ -371,7 +389,7 @@ fn write_sigaction(user: usize, action: SigAction) -> Result<(), Errno> {
     copy_to_user(user, &raw).map_err(|e| e.as_errno())
 }
 
-fn write_siginfo(user: usize, info: &sched::SigInfo) -> Result<(), Errno> {
+pub(super) fn write_siginfo(user: usize, info: &sched::SigInfo) -> Result<(), Errno> {
     if let Some(raw) = info.raw {
         return copy_to_user(user, &raw).map_err(|e| e.as_errno());
     }

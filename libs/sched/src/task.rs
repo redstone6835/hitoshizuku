@@ -27,7 +27,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU16, AtomicU8, AtomicU32, AtomicU64,
+    AtomicUsize, Ordering,
 };
 
 use crate::arch_hooks;
@@ -802,6 +803,34 @@ pub struct Task {
     /// ptrace 的最小状态位。当前只区分任务是否处于 traced 模式，用于把
     /// 信号投递转换成父进程可 wait 的 signal-delivery-stop。
     ptrace_traced: AtomicU8,
+    /// `PTRACE_SETOPTIONS` 的 `PTRACE_O_*` 选项位。
+    ptrace_options: AtomicU64,
+    /// 最近一次 `PTRACE_EVENT_*` 的 event 消息（子 pid / 退出码）。
+    ptrace_event_msg: AtomicI64,
+    /// 最近一次 stop 是否带 `PTRACE_EVENT_*` 编码（0 = 普通 signal-delivery-stop）。
+    ptrace_stop_event: AtomicU16,
+    /// 是否由 `PTRACE_SEIZE` 附着（影响初始 stop 与 `PTRACE_INTERRUPT` 语义）。
+    ptrace_seized: AtomicU8,
+    /// `PTRACE_SYSCALL` 之后每个 syscall 边界是否需要 stop。
+    ptrace_syscall_stop: AtomicU8,
+    /// entry-stop 后经用户态重入恢复执行（CONT 后重入时不再次 entry-stop）。
+    ptrace_syscall_reenable: AtomicU8,
+    /// 最近一次 signal-delivery-stop 的 siginfo（`PTRACE_GETSIGINFO`）。
+    ptrace_last_siginfo: Spinlock<Option<crate::signal::SigInfo>>,
+    /// `PTRACE_GET_SYSCALL_INFO` 的三态记录（0=none 1=entry 2=exit 3=seccomp）。
+    ptrace_syscall_state: AtomicU8,
+    /// entry 时的 syscall 号与参数。
+    ptrace_syscall_nr: AtomicI64,
+    ptrace_syscall_args: Spinlock<[u64; 6]>,
+    /// exit 时的返回值。
+    ptrace_syscall_ret: AtomicI64,
+    /// `PR_SET_DUMPABLE` 状态（0/1/2）；ptrace 访问权限使用。
+    dumpable: AtomicU8,
+    /// `PTRACE_SINGLESTEP` 补丁法单步：已把断点指令写入目标地址。
+    ptrace_singlestep: AtomicU8,
+    /// 被替换指令的地址与原指令（32 位）。
+    ptrace_singlestep_addr: AtomicUsize,
+    ptrace_singlestep_insn: Spinlock<Option<u32>>,
     pub exit_waiters: WaitQueue,
     rel: Spinlock<Relations>,
     /// Native child 的线程组 owner；与 POSIX `parent` 解耦，避免调用线程退出
@@ -983,6 +1012,21 @@ impl Task {
             root_pid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             tgid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             ptrace_traced: AtomicU8::new(0),
+            ptrace_options: AtomicU64::new(0),
+            ptrace_event_msg: AtomicI64::new(0),
+            ptrace_stop_event: AtomicU16::new(0),
+            ptrace_seized: AtomicU8::new(0),
+            ptrace_syscall_stop: AtomicU8::new(0),
+            ptrace_syscall_reenable: AtomicU8::new(0),
+            ptrace_last_siginfo: Spinlock::new(None),
+            ptrace_syscall_state: AtomicU8::new(0),
+            ptrace_syscall_nr: AtomicI64::new(0),
+            ptrace_syscall_args: Spinlock::new([0; 6]),
+            ptrace_syscall_ret: AtomicI64::new(0),
+            dumpable: AtomicU8::new(1),
+            ptrace_singlestep: AtomicU8::new(0),
+            ptrace_singlestep_addr: AtomicUsize::new(0),
+            ptrace_singlestep_insn: Spinlock::new(None),
             exit_waiters: WaitQueue::new_with_reason(WaitReason::ProcessExit),
             rel: Spinlock::new(Relations {
                 parent,
@@ -1325,6 +1369,143 @@ impl Task {
 
     pub fn is_ptrace_traced(&self) -> bool {
         self.ptrace_traced.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_ptrace_options(&self, options: u64) {
+        self.ptrace_options.store(options, Ordering::Release);
+    }
+
+    pub fn ptrace_options(&self) -> u64 {
+        self.ptrace_options.load(Ordering::Acquire)
+    }
+
+    pub fn set_ptrace_event_msg(&self, message: i64) {
+        self.ptrace_event_msg.store(message, Ordering::Release);
+    }
+
+    pub fn ptrace_event_msg(&self) -> i64 {
+        self.ptrace_event_msg.load(Ordering::Acquire)
+    }
+
+    /// 记录本次 stop 的 `PTRACE_EVENT_*`（0 表示普通 signal-delivery-stop）。
+    pub fn set_ptrace_stop_event(&self, event: u16) {
+        self.ptrace_stop_event.store(event, Ordering::Release);
+    }
+
+    pub fn ptrace_stop_event(&self) -> u16 {
+        self.ptrace_stop_event.load(Ordering::Acquire)
+    }
+
+    pub fn set_ptrace_seized(&self, seized: bool) {
+        self.ptrace_seized.store(seized as u8, Ordering::Release);
+    }
+
+    pub fn is_ptrace_seized(&self) -> bool {
+        self.ptrace_seized.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_ptrace_syscall_stop(&self, enabled: bool) {
+        self.ptrace_syscall_stop.store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn ptrace_syscall_stop_enabled(&self) -> bool {
+        self.ptrace_syscall_stop.load(Ordering::Acquire) != 0
+    }
+
+    /// entry-stop 消费后标记：下一次 syscall 重入直接放行并在出口停止。
+    pub fn set_ptrace_syscall_reenable(&self, enabled: bool) {
+        self.ptrace_syscall_reenable
+            .store(enabled as u8, Ordering::Release);
+    }
+
+    pub fn ptrace_syscall_reenable(&self) -> bool {
+        self.ptrace_syscall_reenable.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_ptrace_last_siginfo(&self, info: crate::signal::SigInfo) {
+        *self.ptrace_last_siginfo.lock() = Some(info);
+    }
+
+    pub fn take_ptrace_last_siginfo(&self) -> Option<crate::signal::SigInfo> {
+        self.ptrace_last_siginfo.lock().take()
+    }
+
+    pub fn clear_ptrace_last_siginfo(&self) {
+        *self.ptrace_last_siginfo.lock() = None;
+    }
+
+    /// `PTRACE_GET_SYSCALL_INFO` 的 entry 记录。
+    pub fn record_syscall_entry(&self, nr: usize, args: [usize; 6]) {
+        self.ptrace_syscall_state.store(1, Ordering::Release);
+        self.ptrace_syscall_nr.store(nr as i64, Ordering::Release);
+        *self.ptrace_syscall_args.lock() = [
+            args[0] as u64,
+            args[1] as u64,
+            args[2] as u64,
+            args[3] as u64,
+            args[4] as u64,
+            args[5] as u64,
+        ];
+    }
+
+    /// `PTRACE_GET_SYSCALL_INFO` 的 exit 记录。
+    pub fn record_syscall_exit(&self, ret: isize) {
+        self.ptrace_syscall_state.store(2, Ordering::Release);
+        self.ptrace_syscall_ret.store(ret as i64, Ordering::Release);
+    }
+
+    pub fn record_syscall_seccomp(&self, nr: usize, args: [usize; 6]) {
+        self.ptrace_syscall_state.store(3, Ordering::Release);
+        self.ptrace_syscall_nr.store(nr as i64, Ordering::Release);
+        *self.ptrace_syscall_args.lock() = [
+            args[0] as u64,
+            args[1] as u64,
+            args[2] as u64,
+            args[3] as u64,
+            args[4] as u64,
+            args[5] as u64,
+        ];
+    }
+
+    pub fn ptrace_syscall_info(&self) -> (u8, i64, [u64; 6], i64) {
+        (
+            self.ptrace_syscall_state.load(Ordering::Acquire),
+            self.ptrace_syscall_nr.load(Ordering::Acquire),
+            *self.ptrace_syscall_args.lock(),
+            self.ptrace_syscall_ret.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::Release);
+    }
+
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Acquire)
+    }
+
+    /// 进入 `PTRACE_SINGLESTEP`：记录被替换指令的位置与原文。
+    pub fn arm_singlestep(&self, addr: usize, insn: u32) {
+        self.ptrace_singlestep.store(1, Ordering::Release);
+        self.ptrace_singlestep_addr.store(addr, Ordering::Release);
+        *self.ptrace_singlestep_insn.lock() = Some(insn);
+    }
+
+    pub fn singlestep_armed(&self) -> bool {
+        self.ptrace_singlestep.load(Ordering::Acquire) != 0
+    }
+
+    pub fn singlestep_addr(&self) -> usize {
+        self.ptrace_singlestep_addr.load(Ordering::Acquire)
+    }
+
+    pub fn take_singlestep_insn(&self) -> Option<u32> {
+        self.ptrace_singlestep_insn.lock().take()
+    }
+
+    pub fn clear_singlestep(&self) {
+        self.ptrace_singlestep.store(0, Ordering::Release);
+        *self.ptrace_singlestep_insn.lock() = None;
     }
 
     pub fn parent(&self) -> Option<Arc<Task>> {
@@ -1717,6 +1898,12 @@ impl Task {
 
     /// 标记任务因 stop 信号进入停止态，并记录一次可被 `wait(WUNTRACED)` 观察的事件。
     pub(crate) fn mark_stopped(&self, sig: SignalNumber) -> bool {
+        self.mark_stopped_with_raw_sig(sig.raw() as i32)
+    }
+
+    /// 同 [`Self::mark_stopped`]，但允许记录 `PTRACE_O_TRACESYSGOOD` 的
+    /// `0x80|SIGTRAP` 原始编码（低 7 位之外的位会原样进入 wait status）。
+    pub(crate) fn mark_stopped_with_raw_sig(&self, raw_sig: i32) -> bool {
         loop {
             let state = self.state();
             match state {
@@ -1732,8 +1919,7 @@ impl Task {
 
         self.signal.mark_user_return_work();
 
-        self.wait_stop_sig
-            .store(sig.raw() as i32, Ordering::Release);
+        self.wait_stop_sig.store(raw_sig, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
         self.wait_stop_pending.store(1, Ordering::Release);
         if let Some(parent) = self.parent() {
@@ -1784,9 +1970,18 @@ impl Task {
         if pending == 0 {
             return None;
         }
-        let sig = SignalNumber::from_raw(self.wait_stop_sig.load(Ordering::Acquire))
-            .unwrap_or(SignalNumber::SIGSTOP);
-        Some(WaitStatus::from_stop(sig))
+        let raw_sig = self.wait_stop_sig.load(Ordering::Acquire);
+        let event = self.ptrace_stop_event();
+        if event != 0 {
+            let sig = SignalNumber::from_raw(raw_sig).unwrap_or(SignalNumber::SIGTRAP);
+            Some(WaitStatus::from_stop_event(sig, event))
+        } else if raw_sig & 0x80 != 0 {
+            // TRACESYSGOOD：把 0x80|SIGTRAP 原样编码进 status。
+            Some(WaitStatus::from_stop_raw(raw_sig))
+        } else {
+            let sig = SignalNumber::from_raw(raw_sig).unwrap_or(SignalNumber::SIGSTOP);
+            Some(WaitStatus::from_stop(sig))
+        }
     }
 
     /// 返回并按需消费一次 continued wait 事件。

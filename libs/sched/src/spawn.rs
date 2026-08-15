@@ -620,6 +620,11 @@ fn reparent_native_children_to_init(owner: &Arc<ThreadGroup>) {
 /// 投递给父，唤醒 vfork_done。**不**释放 pid 槽——zombie 期间父按 pid 仍能查到。
 ///
 /// 不切换 CPU；调用方决定何时调 [`schedule_once`]。
+/// `PTRACE_O_TRACEEXIT` 选项位。
+pub const PTRACE_O_TRACEEXIT: u64 = 0x0000_0040;
+/// `PTRACE_EVENT_EXIT` 事件号。
+pub const PTRACE_EVENT_EXIT: u16 = 5;
+
 #[kernel_symbols::export(name = "sched.spawn.exit_task", contract = "kernel.sched.task-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     if task.is_idle_task() {
@@ -635,6 +640,18 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     let preserve_exec_identity = task.exec_sibling_exit_preserves_identity();
 
     task.cleanup_before_exit();
+
+    // TRACEEXIT：退出前停一次，tracer 处理完（PTRACE_CONT）后才继续退出。
+    if task.is_ptrace_traced() && task.ptrace_options() & PTRACE_O_TRACEEXIT != 0 {
+        task.set_ptrace_event_msg(code.0 as i64);
+        task.set_ptrace_stop_event(PTRACE_EVENT_EXIT);
+        task.clear_ptrace_last_siginfo();
+        let _ = task.mark_stopped_with_raw_sig(crate::signal::SignalNumber::SIGTRAP.raw() as i32);
+        while task.state() == crate::task::TaskState::Stopped {
+            crate::scheduler::schedule_once(crate::scheduler::now_ns_public());
+        }
+    }
+
     crate::scheduler::deadline_admission().release(task);
 
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。

@@ -283,6 +283,7 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if let Some(installed) = installed_pidfd {
         installed.commit();
     }
+    ptrace_notify_fork(ctx.task(), flags, outcome.pid);
     Ok(outcome.pid as usize)
 }
 
@@ -345,6 +346,7 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if let Some(installed) = installed_pidfd {
         installed.commit();
     }
+    ptrace_notify_fork(ctx.task(), args.flags, outcome.pid);
     Ok(outcome.pid as usize)
 }
 
@@ -4563,6 +4565,7 @@ pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let request = ctx.args[0];
     let pid = ctx.args[1] as i32;
+    let addr = ctx.args[2];
     let data = ctx.args[3];
 
     match request {
@@ -4574,8 +4577,23 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_attach(pid)?;
             Ok(0)
         }
-        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
+        PTRACE_SEIZE => {
+            sched::operation::ptrace_seize(pid)?;
+            Ok(0)
+        }
+        PTRACE_CONT => {
             sched::operation::ptrace_cont(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SYSCALL => {
+            sched::operation::ptrace_syscall(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SINGLESTEP => {
+            let target = ptrace_target_task(pid)?;
+            // 指令补丁法单步：把目标 PC 处的指令替换为断点指令。
+            arm_singlestep(&target)?;
+            sched::operation::ptrace_singlestep(pid, ptrace_signal_arg(data)?)?;
             Ok(0)
         }
         PTRACE_KILL => {
@@ -4586,9 +4604,8 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_detach(pid, ptrace_signal_arg(data)?)?;
             Ok(0)
         }
-        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => Ok(0),
-        PTRACE_SEIZE => {
-            sched::operation::ptrace_seize(pid)?;
+        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => {
+            ptrace_set_options(pid, data as u64)?;
             Ok(0)
         }
         PTRACE_INTERRUPT => {
@@ -4599,30 +4616,451 @@ pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             sched::operation::ptrace_cont(pid, None)?;
             Ok(0)
         }
-        PTRACE_PEEKTEXT
-        | PTRACE_PEEKDATA
-        | PTRACE_PEEKUSR
-        | PTRACE_POKETEXT
-        | PTRACE_POKEDATA
-        | PTRACE_POKEUSR
-        | PTRACE_GETFDPIC
-        | PTRACE_GETEVENTMSG
-        | PTRACE_GETSIGINFO
-        | PTRACE_SETSIGINFO
-        | PTRACE_GETREGSET
-        | PTRACE_SETREGSET
-        | PTRACE_PEEKSIGINFO
-        | PTRACE_GETSIGMASK
-        | PTRACE_SETSIGMASK
-        | PTRACE_SECCOMP_GET_FILTER
-        | PTRACE_SECCOMP_GET_METADATA
-        | PTRACE_GET_SYSCALL_INFO
-        | PTRACE_GET_RSEQ_CONFIGURATION
-        | PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            let target = ptrace_target_task(pid)?;
+            let vm = ptrace_target_vm(&target)?;
+            let mut raw = [0u8; 8];
+            vm.copy_user_bytes_in(addr, &mut raw)?;
+            copy_to_user(data, &raw).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_POKETEXT | PTRACE_POKEDATA => {
+            let target = ptrace_target_task(pid)?;
+            let vm = ptrace_target_vm(&target)?;
+            let mut raw = [0u8; 8];
+            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
+            vm.copy_user_bytes_out(addr, &raw)?;
+            if request == PTRACE_POKETEXT {
+                <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+            }
+            Ok(0)
+        }
+        PTRACE_PEEKUSR => {
+            let target = ptrace_target_task(pid)?;
+            let value = ptrace_peek_usr(&target, addr)?;
+            copy_to_user(data, &value.to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_POKEUSR => {
+            let target = ptrace_target_task(pid)?;
+            let mut raw = [0u8; 8];
+            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
+            ptrace_poke_usr(&target, addr, usize::from_ne_bytes(raw))?;
+            Ok(0)
+        }
+        PTRACE_GETREGSET | PTRACE_SETREGSET => {
+            let target = ptrace_target_task(pid)?;
+            let note_type = addr;
+            let iov_user = data;
+            ptrace_regset(&target, note_type, request == PTRACE_SETREGSET, iov_user)?;
+            Ok(0)
+        }
+        PTRACE_GETSIGINFO => {
+            let info = sched::operation::ptrace_getsiginfo(pid)?;
+            super::signal::write_siginfo(data, &info)?;
+            Ok(0)
+        }
+        PTRACE_SETSIGINFO => {
+            let info = super::signal::read_queued_siginfo_raw(data)?;
+            sched::operation::ptrace_setsiginfo(pid, info)?;
+            Ok(0)
+        }
+        PTRACE_GETEVENTMSG => {
+            let message = sched::operation::ptrace_geteventmsg(pid)?;
+            copy_to_user(data, &(message as u64).to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_GETSIGMASK => {
+            let mask = sched::operation::ptrace_get_sigmask(pid)?;
+            copy_to_user(data, &mask.raw().to_ne_bytes()).map_err(|e| e.as_errno())?;
+            Ok(0)
+        }
+        PTRACE_SETSIGMASK => {
+            let mut raw = [0u8; 8];
+            copy_from_user(data, &mut raw).map_err(|e| e.as_errno())?;
+            let mask = sched::SigSet::from_raw(u64::from_ne_bytes(raw));
+            sched::operation::ptrace_set_sigmask(pid, mask)?;
+            Ok(0)
+        }
+        PTRACE_PEEKSIGINFO => {
+            // 位图式 pending 信号不保留排队 siginfo；按 Linux 语义返回
+            // 已拷贝数量（本实现无排队信号 → 0）。
+            let mut args = [0u8; 16];
+            copy_from_user(addr, &mut args).map_err(|e| e.as_errno())?;
+            let flags = u32::from_le_bytes(args[8..12].try_into().unwrap());
+            if flags != 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
+        PTRACE_GET_SYSCALL_INFO => {
+            let target = ptrace_target_task(pid)?;
+            write_ptrace_syscall_info(&target, data)?;
+            Ok(0)
+        }
+        PTRACE_GET_RSEQ_CONFIGURATION => {
+            let target = ptrace_target_task(pid)?;
+            write_ptrace_rseq_configuration(&target, data)?;
+            Ok(0)
+        }
+        PTRACE_GETFDPIC => Err(Errno::EINVAL),
+        PTRACE_SECCOMP_GET_FILTER | PTRACE_SECCOMP_GET_METADATA => Err(Errno::EINVAL),
+        PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
         | PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG
-        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EIO),
+        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EINVAL),
         _ => Err(Errno::EIO),
     }
+}
+
+/// 校验 `PTRACE_SETOPTIONS` 的选项位并安装到目标。
+fn ptrace_set_options(pid: i32, options: u64) -> Result<(), Errno> {
+    const PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
+    const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+    const PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+    const PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+    const PTRACE_O_TRACEEXIT: u64 = 0x0000_0040;
+    const PTRACE_O_TRACESECCOMP: u64 = 0x0000_0080;
+    const PTRACE_O_EXITKILL: u64 = 0x0010_0000;
+    const PTRACE_O_SUSPEND_SECCOMP: u64 = 0x0020_0000;
+    const KNOWN: u64 = PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACEFORK
+        | PTRACE_O_TRACEVFORK
+        | PTRACE_O_TRACECLONE
+        | PTRACE_O_TRACEEXEC
+        | PTRACE_O_TRACEEXIT
+        | PTRACE_O_TRACESECCOMP
+        | PTRACE_O_EXITKILL
+        | PTRACE_O_SUSPEND_SECCOMP;
+    if options & !KNOWN != 0 {
+        return Err(Errno::EINVAL);
+    }
+    sched::operation::ptrace_set_options(pid, options)?;
+    Ok(())
+}
+
+/// 取 ptrace 目标（已跟踪 + 权限）。
+fn ptrace_target_task(pid: i32) -> Result<Arc<Task>, Errno> {
+    let target = sched::operation::lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    let me = sched::current_task_direct();
+    if !sched::operation::ptrace_may_access(&me, &target) {
+        return Err(Errno::EPERM);
+    }
+    Ok(target)
+}
+
+fn ptrace_target_vm(target: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
+    task_vm_space(target).ok_or(Errno::EIO)
+}
+
+/// 取目标停止时保存的用户 trap frame。
+fn ptrace_target_frame(target: &Arc<Task>) -> Result<hal::user_context::UserTrapFrame, Errno> {
+    let frame = target
+        .ext_lookup(sched::TASKEXT_USER_TRAP_FRAME)
+        .and_then(|payload| payload.downcast::<hal::user_context::UserTrapFrame>().ok())
+        .ok_or(Errno::EIO)?;
+    Ok(*frame)
+}
+
+/// 写回目标 trap frame（POKEUSR 使用）。
+fn ptrace_store_frame(target: &Arc<Task>, frame: hal::user_context::UserTrapFrame) {
+    let erased: Arc<dyn core::any::Any + Send + Sync> = Arc::new(frame);
+    target.ext_install(sched::TASKEXT_USER_TRAP_FRAME, erased);
+}
+
+/// `PTRACE_PEEKUSR`：按 mcontext 布局读寄存器字（pc@0、regs@8、每项 8 字节）。
+fn ptrace_peek_usr(target: &Arc<Task>, offset: usize) -> Result<usize, Errno> {
+    let frame = ptrace_target_frame(target)?;
+    let mut mcontext = [0u8; 1024];
+    if !frame.write_linux_mcontext(&mut mcontext) {
+        return Err(Errno::EIO);
+    }
+    // mcontext 布局：pc@0；regs@8（32 项）；可能还有 flags 等尾部。
+    let regs_len = 8 + 32 * 8;
+    if offset < 8 {
+        return Ok(u64::from_ne_bytes(mcontext[0..8].try_into().unwrap()) as usize);
+    }
+    if offset < regs_len && (offset - 8) % 8 == 0 {
+        let index = (offset - 8) / 8;
+        let start = 8 + index * 8;
+        return Ok(u64::from_ne_bytes(mcontext[start..start + 8].try_into().unwrap()) as usize);
+    }
+    Err(Errno::EIO)
+}
+
+/// `PTRACE_POKEUSR`：按 mcontext 布局写寄存器字。
+fn ptrace_poke_usr(target: &Arc<Task>, offset: usize, value: usize) -> Result<(), Errno> {
+    let mut frame = ptrace_target_frame(target)?;
+    let mut mcontext = [0u8; 1024];
+    if !frame.write_linux_mcontext(&mut mcontext) {
+        return Err(Errno::EIO);
+    }
+    let regs_len = 8 + 32 * 8;
+    if offset < 8 {
+        mcontext[0..8].copy_from_slice(&(value as u64).to_ne_bytes());
+    } else if offset < regs_len && (offset - 8) % 8 == 0 {
+        let index = (offset - 8) / 8;
+        let start = 8 + index * 8;
+        mcontext[start..start + 8].copy_from_slice(&(value as u64).to_ne_bytes());
+    } else {
+        return Err(Errno::EIO);
+    }
+    if !frame.apply_linux_mcontext(&mcontext) {
+        return Err(Errno::EIO);
+    }
+    ptrace_store_frame(target, frame);
+    Ok(())
+}
+
+/// `PTRACE_GETREGSET`/`SETREGSET`：`struct iovec { base, len }` 指向的数据区。
+fn ptrace_regset(
+    target: &Arc<Task>,
+    note_type: usize,
+    set: bool,
+    iov_user: usize,
+) -> Result<(), Errno> {
+    let mut iov = [0u8; 16];
+    copy_from_user(iov_user, &mut iov).map_err(|e| e.as_errno())?;
+    let base = u64::from_le_bytes(iov[0..8].try_into().unwrap()) as usize;
+    let mut len = u64::from_le_bytes(iov[8..16].try_into().unwrap()) as usize;
+
+    const NT_PRSTATUS: usize = 1;
+    const NT_FPREGSET: usize = 2;
+
+    match note_type {
+        NT_PRSTATUS => {
+            let frame = ptrace_target_frame(target)?;
+            let mut mcontext = [0u8; 1024];
+            if !frame.write_linux_mcontext(&mut mcontext) {
+                return Err(Errno::EIO);
+            }
+            let size = linux_mcontext_size();
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = [0u8; 1024];
+                copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
+                let mut frame = ptrace_target_frame(target)?;
+                if !frame.apply_linux_mcontext(&input) {
+                    return Err(Errno::EIO);
+                }
+                ptrace_store_frame(target, frame);
+            } else {
+                if len < size {
+                    len = size;
+                    write_iov_len(iov_user, len)?;
+                    return Ok(());
+                }
+                copy_to_user(base, &mcontext[..size]).map_err(|e| e.as_errno())?;
+            }
+            Ok(())
+        }
+        NT_FPREGSET => {
+            // 本内核的 trap frame 不保存浮点寄存器（FPU 状态由用户态维护）；
+            // 按 Linux ABI 提供全零的寄存器集。
+            let size = linux_fpregset_size();
+            if set {
+                if len < size {
+                    return Err(Errno::EIO);
+                }
+                let mut input = [0u8; 1024];
+                copy_from_user(base, &mut input[..size]).map_err(|e| e.as_errno())?;
+                // 忽略写入值（架构无内核侧 FP 状态）。
+                Ok(())
+            } else {
+                if len < size {
+                    len = size;
+                    write_iov_len(iov_user, len)?;
+                    return Ok(());
+                }
+                let zeros = [0u8; 1024];
+                copy_to_user(base, &zeros[..size]).map_err(|e| e.as_errno())?;
+                Ok(())
+            }
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn write_iov_len(iov_user: usize, len: usize) -> Result<(), Errno> {
+    copy_to_user(iov_user + 8, &(len as u64).to_ne_bytes()).map_err(|e| e.as_errno())
+}
+
+/// Linux `struct user_regs_struct`（mcontext 布局）的大小。
+fn linux_mcontext_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        8 + 32 * 8 + 4 // pc + regs + flags
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        8 + 32 * 8 // pc + regs
+    }
+}
+
+/// Linux `struct user_fpregs_struct` 的大小。
+fn linux_fpregset_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        33 * 8 // 32 FPR + fcc
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        33 * 8 + 4 // 32 FPR + fcsr + pad
+    }
+}
+
+/// 单步断点：把目标 PC 处的指令替换为断点指令。
+fn arm_singlestep(target: &Arc<Task>) -> Result<(), Errno> {
+    if target.singlestep_armed() {
+        return Ok(());
+    }
+    let frame = ptrace_target_frame(target)?;
+    let pc = frame.pc();
+    let vm = ptrace_target_vm(target)?;
+    let mut insn = [0u8; 4];
+    vm.copy_user_bytes_in(pc, &mut insn)?;
+    let original = u32::from_ne_bytes(insn);
+    let breakpoint = breakpoint_insn();
+    vm.copy_user_bytes_out(pc, &breakpoint.to_ne_bytes())?;
+    <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    target.arm_singlestep(pc, original);
+    Ok(())
+}
+
+/// 架构断点指令（loongarch64 `break 0` / riscv64 `ebreak`）。
+fn breakpoint_insn() -> u32 {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        0x2a000000 // break 0
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        0x00100073 // ebreak
+    }
+}
+
+/// 单步断点陷阱钩子（arch 的 break trap 在用户态调用）：命中则恢复原指令
+/// 并把目标置为 `SIGTRAP` stop。
+pub(crate) fn ptrace_singlestep_trap_hook(pc: usize) -> bool {
+    let me = sched::current_task_direct();
+    if !me.singlestep_armed() {
+        return false;
+    }
+    if me.singlestep_addr() != pc {
+        me.clear_singlestep();
+        return false;
+    }
+    let insn = me.take_singlestep_insn();
+    me.clear_singlestep();
+    if let Some(insn) = insn {
+        if let Some(vm) = task_vm_space(&me) {
+            let _ = vm.copy_user_bytes_out(pc, &insn.to_ne_bytes());
+        }
+        <arch::CurrentTaskOps as general::TaskOps>::sync_icache();
+    }
+    me.set_ptrace_stop_event(0);
+    me.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(&me, sched::SignalNumber::SIGTRAP);
+    true
+}
+
+/// `PTRACE_O_TRACEFORK/VFORK/CLONE`：克隆事件通知（父进程停止）。
+fn ptrace_notify_fork(parent: &Arc<Task>, flags: CloneFlags, child_pid: i32) {
+    const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+    const PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+    const PTRACE_EVENT_FORK: u16 = 1;
+    const PTRACE_EVENT_VFORK: u16 = 2;
+    const PTRACE_EVENT_CLONE: u16 = 3;
+
+    if !parent.is_ptrace_traced() {
+        return;
+    }
+    let options = parent.ptrace_options();
+    let (event, mask) = if flags.has(CloneFlags::CLONE_VFORK) {
+        (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
+    } else if flags.has(CloneFlags::CLONE_THREAD) {
+        (PTRACE_EVENT_CLONE, PTRACE_O_TRACECLONE)
+    } else {
+        (PTRACE_EVENT_FORK, PTRACE_O_TRACEFORK)
+    };
+    if options & mask == 0 {
+        return;
+    }
+    parent.set_ptrace_event_msg(child_pid as i64);
+    parent.set_ptrace_stop_event(event);
+    parent.clear_ptrace_last_siginfo();
+    sched::operation::ptrace_mark_stopped(parent, sched::SignalNumber::SIGTRAP);
+}
+
+/// `PTRACE_GET_SYSCALL_INFO`：`struct ptrace_syscall_info`（80 字节）。
+fn write_ptrace_syscall_info(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
+    const PTRACE_SYSCALL_INFO_NONE: u8 = 0;
+    const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+    const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
+    const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
+    #[cfg(target_arch = "loongarch64")]
+    const AUDIT_ARCH: u32 = 0x4000_0102; // AUDIT_ARCH_LOONGARCH64
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0x4000_00f3; // AUDIT_ARCH_RISCV64
+
+    let (state, nr, args, ret) = target.ptrace_syscall_info();
+    let frame = ptrace_target_frame(target)?;
+    let ip = frame.pc() as u64;
+    let sp = frame.sp() as u64;
+    let mut raw = [0u8; 80];
+    match state {
+        PTRACE_SYSCALL_INFO_ENTRY => {
+            raw[0] = PTRACE_SYSCALL_INFO_ENTRY;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(nr as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate() {
+                raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+        }
+        PTRACE_SYSCALL_INFO_EXIT => {
+            raw[0] = PTRACE_SYSCALL_INFO_EXIT;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(ret as u64).to_le_bytes());
+            raw[32] = (ret < 0 && ret > -4096) as u8; // is_error
+        }
+        PTRACE_SYSCALL_INFO_SECCOMP => {
+            raw[0] = PTRACE_SYSCALL_INFO_SECCOMP;
+            raw[4..8].copy_from_slice(&AUDIT_ARCH.to_le_bytes());
+            raw[8..16].copy_from_slice(&ip.to_le_bytes());
+            raw[16..24].copy_from_slice(&sp.to_le_bytes());
+            raw[24..32].copy_from_slice(&(nr as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate() {
+                raw[32 + index * 8..40 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+        }
+        _ => raw[0] = PTRACE_SYSCALL_INFO_NONE,
+    }
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())?;
+    Ok(())
+}
+
+/// `PTRACE_GET_RSEQ_CONFIGURATION`：`struct ptrace_rseq_configuration`（24 字节）。
+fn write_ptrace_rseq_configuration(target: &Arc<Task>, user: usize) -> Result<(), Errno> {
+    let mut raw = [0u8; 24];
+    let (abi_pointer, abi_size, signature) = target
+        .rseq_registration_if_registered()
+        .map(|registration| (registration.ptr, registration.len, registration.signature))
+        .unwrap_or((0, 0, 0));
+    raw[0..8].copy_from_slice(&(abi_pointer as u64).to_le_bytes());
+    raw[8..12].copy_from_slice(&abi_size.to_le_bytes());
+    raw[12..16].copy_from_slice(&signature.to_le_bytes());
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())?;
+    Ok(())
 }
 
 pub(super) fn sys_getresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
