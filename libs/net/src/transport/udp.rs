@@ -144,6 +144,8 @@ pub struct PreparedUdpTx {
     pub unresolved_neighbor: Option<crate::control::NeighborKey>,
     pub hop_limit: u8,
     pub traffic_class: u8,
+    /// IP_OPTIONS：随 IPv4 头携带的选项。
+    pub ip_options: crate::ip_options::IpOptions,
     pub mark: u32,
     pub completion: CompletionToken,
 }
@@ -864,6 +866,7 @@ pub fn build_udp_packet(
         64,
         0,
         false,
+        crate::ip_options::IpOptions::empty(),
     )
 }
 
@@ -877,10 +880,12 @@ pub fn build_udp_packet_with_options(
     hop_limit: u8,
     traffic_class: u8,
     checksum_offload: bool,
+    ip_options: crate::ip_options::IpOptions,
 ) -> Result<PacketChain, (UdpTxError, PacketChain)> {
     let payload_len = payload.total_len();
+    let ip_opt_len = ip_options.wire_len();
     let (header_len, protocol_header_len) = match (route.source, destination.addr) {
-        (IpAddr::V4(_), IpAddr::V4(_)) => (42usize, 28usize),
+        (IpAddr::V4(_), IpAddr::V4(_)) => (42usize + ip_opt_len, 28usize + ip_opt_len),
         (IpAddr::V6(_), IpAddr::V6(_)) => (62usize, 48usize),
         _ => return Err((UdpTxError::AddressFamily, payload)),
     };
@@ -900,18 +905,24 @@ pub fn build_udp_packet_with_options(
     match (route.source, destination.addr) {
         (IpAddr::V4(source), IpAddr::V4(destination_address)) => {
             ethernet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            let mut header = [0u8; 28];
-            header[0] = 0x45;
+            let mut header = alloc::vec![0u8; 28 + ip_opt_len];
+            header[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
             header[1] = traffic_class;
-            header[2..4].copy_from_slice(&((payload_len + 28) as u16).to_be_bytes());
+            header[2..4].copy_from_slice(&((payload_len + 28 + ip_opt_len) as u16).to_be_bytes());
             header[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
             header[8] = hop_limit;
             header[9] = IP_PROTOCOL_UDP;
             header[12..16].copy_from_slice(&source.0);
             header[16..20].copy_from_slice(&destination_address.0);
-            let checksum = crate::pipeline::checksum_bytes(&header[..20]);
+            header[20..20 + ip_opt_len].copy_from_slice(ip_options.wire_slice());
+            let checksum = crate::pipeline::checksum_bytes(&header[..20 + ip_opt_len]);
             header[10..12].copy_from_slice(&checksum.to_be_bytes());
-            write_udp_header(&mut header[20..28], source_port, destination.port, udp_len);
+            write_udp_header(
+                &mut header[20 + ip_opt_len..28 + ip_opt_len],
+                source_port,
+                destination.port,
+                udp_len,
+            );
             if payload.copy_in(0, &ethernet).is_err() || payload.copy_in(14, &header).is_err() {
                 return Err((UdpTxError::Buffer, payload));
             }
@@ -928,7 +939,7 @@ pub fn build_udp_packet_with_options(
             } else {
                 let Ok(checksum) = transport_checksum(
                     &payload,
-                    34,
+                    34 + ip_opt_len,
                     usize::from(udp_len),
                     route.source,
                     destination.addr,
@@ -939,7 +950,10 @@ pub fn build_udp_packet_with_options(
                 checksum
             };
             let checksum = if checksum == 0 { 0xffff } else { checksum };
-            if payload.copy_in(40, &checksum.to_be_bytes()).is_err() {
+            if payload
+                .copy_in(40 + ip_opt_len, &checksum.to_be_bytes())
+                .is_err()
+            {
                 return Err((UdpTxError::Buffer, payload));
             }
         }
@@ -2070,17 +2084,7 @@ mod tests {
             };
             let payload = sender.test_udp_tx_lease(&[0x55], local);
             let flow = table
-                .ingest_local(
-                    InterfaceId(1),
-                    source,
-                    local,
-                    &payload,
-                    1,
-                    2,
-                    0,
-                    65_535,
-                    20,
-                )
+                .ingest_local(InterfaceId(1), source, local, &payload, 1, 2, 0, 65_535, 20)
                 .expect("单播包应被分发");
             payload.complete();
             if flow == first_id {
@@ -2094,5 +2098,4 @@ mod tests {
         assert!(second_count >= 1, "第二个 reuse_port socket 未收到任何包");
         assert_eq!(first_count + second_count, 32);
     }
-
 }

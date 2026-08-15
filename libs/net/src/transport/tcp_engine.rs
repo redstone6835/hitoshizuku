@@ -69,6 +69,8 @@ pub struct PreparedTcpTx {
     pub window: u16,
     /// 紧急指针（URG 段；否则为 0）。
     pub urgent_pointer: u16,
+    /// IP_OPTIONS：随 IPv4 头携带的选项。
+    pub ip_options: crate::ip_options::IpOptions,
     pub options: [u8; 40],
     pub options_len: u8,
     pub parsed_options: crate::transport::TcpOptions,
@@ -1186,7 +1188,7 @@ impl TcpEndpointTable {
                 flow.path.route.mtu,
                 flow.local.addr,
                 flow.peer_mss,
-                options_len,
+                options_len.saturating_add(flow.facade.ip_options_wire_len()),
             );
             let unsent = unsent_hint.unwrap_or_else(|| flow.facade.stream_unsent_len());
             if (flow.facade.tcp_cork() || flow.facade.tcp_more())
@@ -2476,6 +2478,7 @@ impl TcpEndpointTable {
             flags: transmit.flags,
             window: wire_window,
             urgent_pointer: transmit.urgent_pointer,
+            ip_options: flow.facade.ip_options(),
             options,
             options_len,
             parsed_options,

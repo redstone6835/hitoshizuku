@@ -1615,6 +1615,7 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 Ok((opts.header_included as i32).to_ne_bytes().to_vec())
             }
             IP_PKTINFO => Ok((opts.pktinfo as i32).to_ne_bytes().to_vec()),
+            IP_OPTIONS => Ok(net_ops.proxy().ip_options().as_slice().to_vec()),
             IP_RECVTTL => Ok((opts.recvttl as i32).to_ne_bytes().to_vec()),
             IP_RECVTOS => Ok((opts.recvtos as i32).to_ne_bytes().to_vec()),
             IP_RECVERR => Ok((opts.receive_errors_v4 as i32).to_ne_bytes().to_vec()),
@@ -1836,10 +1837,13 @@ fn inet_setsockopt(
                 Ok(())
             }
             IP_OPTIONS => {
-                if value.is_empty() || value.iter().all(|byte| *byte == 0) {
-                    Ok(())
-                } else {
-                    Err(Errno::EOPNOTSUPP)
+                // Linux ip_options_compile 语义：结构非法的选项列表返回 EINVAL。
+                match net::ip_options::IpOptions::parse(value) {
+                    Ok(options) => {
+                        net_ops.proxy().set_ip_options(options);
+                        Ok(())
+                    }
+                    Err(_) => Err(Errno::EINVAL),
                 }
             }
             IP_PKTINFO => {

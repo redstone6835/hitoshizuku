@@ -834,13 +834,22 @@ impl FlowShard {
             };
             mac_address
         };
-        let packet = match build_udp_packet(
+        let facade = self.udp.facade(flow);
+        let packet = match crate::transport::build_udp_packet_with_options(
             payload,
             route,
             destination,
             endpoint.local.port,
             interface.mac_address,
             destination_mac,
+            facade.as_ref().map_or(64, |facade| facade.ip_hop_limit()),
+            facade
+                .as_ref()
+                .map_or(0, |facade| facade.ip_traffic_class()),
+            false,
+            facade.map_or(crate::ip_options::IpOptions::empty(), |facade| {
+                facade.ip_options()
+            }),
         ) {
             Ok(packet) => packet,
             Err((error, payload)) => {
@@ -1444,6 +1453,7 @@ impl FlowShard {
                 facade.ip_hop_limit()
             },
             traffic_class: facade.ip_traffic_class(),
+            ip_options: facade.ip_options(),
             mark,
             completion: {
                 let completion = CompletionToken(self.next_completion);
@@ -1535,6 +1545,7 @@ impl FlowShard {
             header_included: facade.raw_header_included(),
             hop_limit: facade.ip_hop_limit(),
             traffic_class: facade.ip_traffic_class(),
+            ip_options: facade.ip_options(),
             completion: {
                 let completion = CompletionToken(self.next_completion);
                 self.next_completion = self.next_completion.wrapping_add(1).max(1);

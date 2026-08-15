@@ -2790,6 +2790,8 @@ pub struct SocketFacade {
     v6_only: AtomicBool,
     ip_hop_limit: AtomicU16,
     ip_traffic_class: AtomicU16,
+    /// IP_OPTIONS：随发出的 IPv4 头携带的选项。
+    ip_options: Mutex<crate::ip_options::IpOptions>,
     multicast_memberships: Mutex<Vec<MulticastMembership>>,
     multicast_interface: AtomicU32,
     multicast_hops: AtomicU16,
@@ -2961,6 +2963,7 @@ impl SocketFacade {
             v6_only: AtomicBool::new(false),
             ip_hop_limit: AtomicU16::new(64),
             ip_traffic_class: AtomicU16::new(0),
+            ip_options: Mutex::new(crate::ip_options::IpOptions::empty()),
             multicast_memberships: Mutex::new(Vec::new()),
             multicast_interface: AtomicU32::new(0),
             multicast_hops: AtomicU16::new(1),
@@ -3055,6 +3058,20 @@ impl SocketFacade {
     pub fn set_ip_traffic_class(&self, value: u8) {
         self.ip_traffic_class
             .store(u16::from(value), Ordering::Release);
+    }
+
+    /// setsockopt(IP_OPTIONS)：设置随 IPv4 头携带的选项（已校验的规范化形式）。
+    pub fn set_ip_options(&self, options: crate::ip_options::IpOptions) {
+        *self.ip_options.lock() = options;
+    }
+
+    pub fn ip_options(&self) -> crate::ip_options::IpOptions {
+        *self.ip_options.lock()
+    }
+
+    /// IP 选项的 4 字节对齐长度（MSS 计算用）。
+    pub fn ip_options_wire_len(&self) -> u8 {
+        self.ip_options.lock().wire_len() as u8
     }
 
     pub fn add_multicast_membership(

@@ -1281,24 +1281,27 @@ fn build_tcp_tx_plan(work: PreparedTcpTx) -> Result<TxPlan, SocketError> {
     header[6..12].copy_from_slice(&work.path.source_mac);
     let header_len = match (work.path.route.source, work.remote.addr) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            let total_len = 20usize
+            let ip_opt_len = work.ip_options.wire_len();
+            let total_len = (20usize + ip_opt_len)
                 .checked_add(tcp_header_len)
                 .and_then(|len| len.checked_add(payload.len()))
                 .and_then(|len| u16::try_from(len).ok())
                 .ok_or(SocketError::MessageTooLarge)?;
             header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            let ip = &mut header[14..34];
-            ip[0] = 0x45;
+            let ip = &mut header[14..34 + ip_opt_len];
+            ip[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
             ip[2..4].copy_from_slice(&total_len.to_be_bytes());
             ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
             ip[8] = 64;
             ip[9] = 6;
             ip[12..16].copy_from_slice(&source.0);
             ip[16..20].copy_from_slice(&destination.0);
+            ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
             let checksum = checksum_bytes(ip);
             ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-            header[34..34 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
-            34 + tcp_header_len
+            header[34 + ip_opt_len..34 + ip_opt_len + tcp_header_len]
+                .copy_from_slice(&tcp[..tcp_header_len]);
+            34 + ip_opt_len + tcp_header_len
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             let transport_len = tcp_header_len
@@ -1355,14 +1358,15 @@ fn build_udp_tx_plan(work: PreparedUdpTx) -> Result<TxPlan, SocketError> {
     header[6..12].copy_from_slice(&work.source_mac);
     let header_len = match (work.route.source, work.destination.addr) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            let ip_opt_len = work.ip_options.wire_len();
             let total_len = payload
                 .len()
-                .checked_add(28)
+                .checked_add(28 + ip_opt_len)
                 .and_then(|len| u16::try_from(len).ok())
                 .ok_or(SocketError::MessageTooLarge)?;
             header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-            let ip = &mut header[14..34];
-            ip[0] = 0x45;
+            let ip = &mut header[14..34 + ip_opt_len];
+            ip[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
             ip[1] = work.traffic_class;
             ip[2..4].copy_from_slice(&total_len.to_be_bytes());
             ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
@@ -1370,10 +1374,11 @@ fn build_udp_tx_plan(work: PreparedUdpTx) -> Result<TxPlan, SocketError> {
             ip[9] = 17;
             ip[12..16].copy_from_slice(&source.0);
             ip[16..20].copy_from_slice(&destination.0);
+            ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
             let checksum = checksum_bytes(ip);
             ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-            header[34..42].copy_from_slice(&udp);
-            42
+            header[34 + ip_opt_len..34 + ip_opt_len + 8].copy_from_slice(&udp);
+            42 + ip_opt_len
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             header[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
@@ -1563,16 +1568,17 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
         let payload_len = usize::from(work.payload.len);
         match (work.route.source, work.destination) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                let ip_opt_len = work.ip_options.wire_len();
                 let total_len = payload_len
-                    .checked_add(20)
+                    .checked_add(20 + ip_opt_len)
                     .and_then(|len| u16::try_from(len).ok())
                     .ok_or(SocketError::MessageTooLarge)?;
-                if payload_len + 20 > work.route.mtu as usize {
+                if payload_len + 20 + ip_opt_len > work.route.mtu as usize {
                     return Err(SocketError::MessageTooLarge);
                 }
                 header[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-                let ip = &mut header[14..34];
-                ip[0] = 0x45;
+                let ip = &mut header[14..34 + ip_opt_len];
+                ip[0] = 0x45 | ((ip_opt_len / 4) as u8) << 4;
                 ip[1] = work.traffic_class;
                 ip[2..4].copy_from_slice(&total_len.to_be_bytes());
                 ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
@@ -1580,9 +1586,10 @@ fn build_raw_tx_plan(work: PreparedRawTx) -> Result<TxPlan, SocketError> {
                 ip[9] = work.protocol;
                 ip[12..16].copy_from_slice(&source.0);
                 ip[16..20].copy_from_slice(&destination.0);
+                ip[20..20 + ip_opt_len].copy_from_slice(work.ip_options.wire_slice());
                 let checksum = checksum_bytes(ip);
                 ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-                (34, 0, payload_len as u32)
+                (34 + ip_opt_len, 0, payload_len as u32)
             }
             (IpAddr::V6(source), IpAddr::V6(destination)) => {
                 let payload_len_u16 =
@@ -5353,6 +5360,7 @@ mod tests {
         let destination = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let plan = build_tcp_tx_plan(PreparedTcpTx {
             urgent_pointer: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
             flow: FlowId(1),
             flow_generation: 1,
             facade_generation: 1,
@@ -5393,6 +5401,73 @@ mod tests {
         assert_eq!(
             crate::pipeline::transport_checksum(&packet, 34, 20, source, destination, 6),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn tcp_tx_plan_includes_ip_options() {
+        // IP_OPTIONS：选项出现在 IPv4 头中，IHL/total_len/校验和与 TCP 偏移同步。
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 2,
+                counter: 1,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Stream,
+        ));
+        let source = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let destination = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        // RR（7 字节）→ 4 字节对齐后 8 字节。
+        let options = crate::ip_options::IpOptions::parse(&[7, 7, 4, 0, 0, 0, 0]).unwrap();
+        assert_eq!(options.wire_len(), 8);
+        let plan = build_tcp_tx_plan(PreparedTcpTx {
+            urgent_pointer: 0,
+            ip_options: options,
+            flow: FlowId(1),
+            flow_generation: 1,
+            facade_generation: 1,
+            facade,
+            payload: None,
+            path: TcpPath {
+                route: crate::control::RouteDecision {
+                    interface: InterfaceId(1),
+                    source,
+                    next_hop: destination,
+                    mtu: 65_535,
+                    table: 0,
+                },
+                source_mac: [0x02, 0, 0, 0, 0, 1],
+                destination_mac: [0x02, 0, 0, 0, 0, 2],
+                unresolved_neighbor: None,
+                config_generation: 1,
+            },
+            remote: Endpoint {
+                addr: destination,
+                port: 19_004,
+            },
+            local_port: 40_000,
+            sequence: crate::transport::TcpSequence(10),
+            acknowledgement: crate::transport::TcpSequence(20),
+            flags: TcpFlags::ACK | TcpFlags::PSH,
+            window: 32_768,
+            options: [0; 40],
+            options_len: 0,
+            parsed_options: crate::transport::TcpOptions::default(),
+            completion: 8,
+            low_latency: false,
+        })
+        .unwrap();
+        // 14(eth) + 28(IP 含 8 字节选项) + 20(TCP)。
+        assert_eq!(plan.header_len, 62);
+        let ip = &plan.header[14..42];
+        assert_eq!(ip[0], 0x45 | (2 << 4), "IHL 必须包含选项");
+        assert_eq!(&ip[20..28], options.wire_slice(), "选项原样携带");
+        assert_eq!(crate::pipeline::checksum_bytes(ip), 0, "IP 校验和覆盖选项");
+        let packet = PacketChain::from_owned(plan.header_bytes().to_vec());
+        assert_eq!(
+            crate::pipeline::transport_checksum(&packet, 42, 20, source, destination, 6),
+            Ok(0),
+            "TCP 校验和按偏移 42 计算",
         );
     }
 
@@ -5778,6 +5853,7 @@ mod tests {
             unresolved_neighbor: None,
             hop_limit: 64,
             traffic_class: 7,
+            ip_options: crate::ip_options::IpOptions::empty(),
             mark: 0,
             completion: CompletionToken(1),
         };
@@ -5803,6 +5879,53 @@ mod tests {
         assert_eq!(work.payload.copy_out(&mut copied), Ok(bytes.len()));
         assert_eq!(copied, bytes);
         work.payload.complete();
+    }
+
+    #[test]
+    fn udp_tx_plan_includes_ip_options() {
+        // UDP 计划同样携带 IP_OPTIONS：IHL、total_len、校验和与 UDP 偏移同步。
+        let sender = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 6,
+                counter: 9,
+            },
+            crate::AddressFamily::Ipv4,
+            crate::SocketKind::Datagram,
+        ));
+        let destination = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            port: 9_000,
+        };
+        let bytes = [0x4d; 32];
+        let payload = sender.test_udp_tx_lease(&bytes, destination);
+        let options = crate::ip_options::IpOptions::parse(&[7, 7, 4, 0, 0, 0, 0]).unwrap();
+        let work = PreparedUdpTx {
+            payload,
+            route: crate::control::RouteDecision {
+                interface: InterfaceId(1),
+                source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                next_hop: destination.addr,
+                mtu: 65_535,
+                table: 0,
+            },
+            destination,
+            source_port: 40_000,
+            source_mac: [0; 6],
+            destination_mac: [0; 6],
+            unresolved_neighbor: None,
+            hop_limit: 64,
+            traffic_class: 0,
+            ip_options: options,
+            mark: 0,
+            completion: CompletionToken(3),
+        };
+        let plan = build_udp_tx_plan(work).unwrap();
+        // 14(eth) + 28(IP 含选项) + 8(UDP)。
+        assert_eq!(plan.header_len, 50);
+        let ip = &plan.header[14..42];
+        assert_eq!(ip[0], 0x45 | (2 << 4));
+        assert_eq!(&ip[20..28], options.wire_slice());
+        assert_eq!(crate::pipeline::checksum_bytes(ip), 0);
     }
 
     #[test]

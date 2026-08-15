@@ -40,6 +40,8 @@ pub struct PreparedRawTx {
     pub header_included: bool,
     pub hop_limit: u8,
     pub traffic_class: u8,
+    /// IP_OPTIONS：随 IPv4 头携带的选项（header_included 时忽略）。
+    pub ip_options: crate::ip_options::IpOptions,
     pub completion: CompletionToken,
 }
 
@@ -701,6 +703,7 @@ mod tests {
             header_included: true,
             hop_limit: 64,
             traffic_class: 0,
+            ip_options: crate::ip_options::IpOptions::empty(),
             completion: CompletionToken(1),
         };
         assert_eq!(

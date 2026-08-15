@@ -508,6 +508,15 @@ impl NetSocketProxy {
         self.facade.oob_pending()
     }
 
+    /// setsockopt(IP_OPTIONS)。
+    pub fn set_ip_options(&self, options: crate::ip_options::IpOptions) {
+        self.facade.set_ip_options(options);
+    }
+
+    pub fn ip_options(&self) -> crate::ip_options::IpOptions {
+        self.facade.ip_options()
+    }
+
     pub fn recv_stream_to(
         &self,
         output_len: usize,

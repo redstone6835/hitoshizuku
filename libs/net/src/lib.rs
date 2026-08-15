@@ -9,14 +9,15 @@ extern crate alloc;
 extern crate std;
 
 pub mod address;
-pub mod bpf;
 pub mod boot;
+pub mod bpf;
 pub mod buf;
 pub mod control;
 pub mod device;
 pub mod elm;
 pub mod flow;
 pub mod id;
+pub mod ip_options;
 pub mod pipeline;
 pub mod queue;
 pub mod ring;
