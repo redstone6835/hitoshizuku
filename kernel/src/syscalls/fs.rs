@@ -83,7 +83,12 @@ const MS_NOEXEC: usize = 1 << 3;
 const MS_SYNCHRONOUS: usize = 1 << 4;
 const MS_REMOUNT: usize = 1 << 5;
 const MS_BIND: usize = 1 << 12;
+const MS_MOVE: usize = 1 << 13;
 const MS_REC: usize = 1 << 14;
+const MS_UNBINDABLE: usize = 1 << 17;
+const MS_PRIVATE: usize = 1 << 18;
+const MS_SLAVE: usize = 1 << 19;
+const MS_SHARED: usize = 1 << 20;
 const MS_SILENT: usize = 1 << 15;
 const MS_NOATIME: usize = 1 << 10;
 const MS_NODIRATIME: usize = 1 << 11;
@@ -1100,7 +1105,12 @@ pub(super) fn sys_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         | MS_NOATIME
         | MS_NODIRATIME
         | MS_BIND
+        | MS_MOVE
         | MS_REC
+        | MS_UNBINDABLE
+        | MS_PRIVATE
+        | MS_SLAVE
+        | MS_SHARED
         | MS_SILENT
         | MS_RELATIME
         | MS_STRICTATIME
@@ -1162,6 +1172,85 @@ pub(super) fn sys_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             .remount_at(&mountpoint.dentry, flags)
             .map_err(|e| e.to_errno())?;
         return Ok(0);
+    }
+    // ── bind / move / 传播类型设置（不创建新文件系统）──
+    if (mount_flags_raw & MS_BIND) != 0 {
+        // mount --bind：源路径的子树绑定到目标（共享文件系统实例）。
+        if source.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        let src = vfs::path::lookup(&vfs_ctx, &dirfd, &source, LookupFlags::default())
+            .map_err(|e| e.to_errno())?;
+        let dst = vfs::path::lookup(
+            &vfs_ctx,
+            &dirfd,
+            &target,
+            LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+        )
+        .map_err(|e| e.to_errno())?;
+        let src_mount = match vfs_ctx.mount_ns.lookup_mount(&src.dentry) {
+            Some(m) => m,
+            None => Arc::clone(&src.mount),
+        };
+        vfs_ctx
+            .mount_ns
+            .bind_at(
+                Arc::clone(&dst.dentry),
+                Arc::clone(&dst.mount),
+                Arc::clone(&src_mount.superblock),
+                Arc::clone(&src.dentry),
+                flags,
+                Some(&src_mount),
+                true,
+            )
+            .map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+    if (mount_flags_raw & MS_MOVE) != 0 {
+        // mount --move：把 source 上的挂载迁移到 target。
+        if source.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        let src = vfs::path::lookup(&vfs_ctx, &dirfd, &source, LookupFlags::NO_MOUNT_LAST)
+            .map_err(|e| e.to_errno())?;
+        let m = vfs_ctx
+            .mount_ns
+            .lookup_mount(&src.dentry)
+            .ok_or(Errno::ENOENT)?;
+        let dst = vfs::path::lookup(
+            &vfs_ctx,
+            &dirfd,
+            &target,
+            LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+        )
+        .map_err(|e| e.to_errno())?;
+        vfs_ctx
+            .mount_ns
+            .move_mount_at(&m, Arc::clone(&dst.dentry), Arc::clone(&dst.mount))
+            .map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+    let rec = (mount_flags_raw & MS_REC) != 0;
+    for (bit, kind) in [
+        (MS_SHARED, vfs::mount::PROP_SHARED),
+        (MS_PRIVATE, vfs::mount::PROP_PRIVATE),
+        (MS_SLAVE, vfs::mount::PROP_SLAVE),
+        (MS_UNBINDABLE, vfs::mount::PROP_UNBINDABLE),
+    ] {
+        if (mount_flags_raw & bit) != 0 {
+            let dst = vfs::path::lookup(
+                &vfs_ctx,
+                &dirfd,
+                &target,
+                LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+            )
+            .map_err(|e| e.to_errno())?;
+            vfs_ctx
+                .mount_ns
+                .set_propagation_at(&dst.dentry, kind, rec)
+                .map_err(|e| e.to_errno())?;
+            return Ok(0);
+        }
     }
     if fs_type.is_empty() || fs_type == "auto" {
         return mount_autodetect(&vfs_ctx, &dirfd, &target, flags, dev, &data);

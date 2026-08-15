@@ -511,7 +511,17 @@ impl FanotifyGroup {
             None => crate::vfs::dentry::Dentry::new_positive("", None, Arc::clone(&inode)),
         };
         let mount = event.mount.upgrade().ok_or(Errno::ENOENT)?;
-        let file = Arc::new(File::new(inode, opts, Arc::clone(cred), ops, dentry, mount));
+        let file = Arc::new(File::new(
+            inode,
+            opts,
+            Arc::clone(cred),
+            ops,
+            dentry,
+            Arc::clone(&mount),
+        ));
+        // 与 File drop 的 dec_open 配对：事件 fd 也计入挂载活跃引用，
+        // 避免 close 时无符号下溢导致 is_busy() 恒真（umount 恒 EBUSY）。
+        mount.inc_open();
         let fd = fdt
             .alloc_fd(file, FdFlags::default())
             .map_err(|e| e.to_errno())?;

@@ -62,6 +62,12 @@ if [ -x /bin/direct-io-test ]; then
     status=$?
     echo "[init][fs-tests] direct-io tests exit=$status"
 fi
+if [ -x /bin/mount-test ]; then
+    echo "[init][fs-tests] running mount tests"
+    /bin/mount-test
+    status=$?
+    echo "[init][fs-tests] mount tests exit=$status"
+fi
 if [ -x /bin/loongarch-sxe-test ]; then
     echo "[init][lazy-sxe-tests] running LoongArch FP/LSX state tests"
     /bin/loongarch-sxe-test
