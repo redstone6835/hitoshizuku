@@ -2596,10 +2596,26 @@ impl AnonStoreFaultAround {
             record_anon_fault_around_prepare(requested, 0, true);
             return Ok(());
         }
+        let mut batch = [None; ANON_STORE_FAULT_AROUND_PAGES];
+        let _batch_count = alloc_uninitialized_user_page_batch(&mut batch[..requested]);
+        let virt = allocator::KERNEL_ALLOCATOR.load_phys_to_virt();
         for index in 0..requested {
             let delta = index.checked_mul(page_size).ok_or(Errno::EINVAL)?;
             let vaddr = self.fault_page.checked_add(delta).ok_or(Errno::EINVAL)?;
-            let paddr = if index == 0 {
+            let paddr = if let Some(allocation) = batch[index].take() {
+                let Some(virt) = virt else {
+                    let _ = allocator::KERNEL_ALLOCATOR.try_free_untracked_physical(allocation);
+                    for allocation in batch.iter_mut().filter_map(Option::take) {
+                        let _ = allocator::KERNEL_ALLOCATOR.try_free_untracked_physical(allocation);
+                    }
+                    break;
+                };
+                #[cfg(feature = "performance-profile")]
+                let _profile = profiling::scope(profiling::Event::MemZeroAnonPage).bytes(page_size);
+                // Safety: 批量分配返回独占且尚未发布的完整基础页。
+                unsafe { zero_unpublished_user_pages(virt(allocation.paddr), page_size) };
+                Some(allocation.paddr)
+            } else if index == 0 {
                 alloc_zeroed_user_page()
             } else {
                 let order = user_page_order().ok_or(Errno::EINVAL)?;
@@ -5714,13 +5730,17 @@ fn load_private_file_page_batch(
     let mut candidates = PrivateFilePageBatch::new();
     let mut pages = PrivateFilePageBatch::new();
 
-    for _ in &owners {
-        // Safety: 候选页在读满有效前缀并清零 EOF 尾部前不会进入 cache 或页表。
-        let Some(paddr) = (unsafe { alloc_uninitialized_user_page() }) else {
-            abort_private_file_page_loads(&owners, None);
-            return Ok(PrivateFilePageBatchLoad::Fallback);
-        };
-        candidates.push(ResidentPage::new_private_file(paddr));
+    let mut allocations = [None; PRIVATE_FILE_BATCH_MAX_PAGES];
+    let allocated = alloc_uninitialized_user_page_batch(&mut allocations[..owners.len()]);
+    if allocated != owners.len() {
+        for allocation in allocations[..allocated].iter_mut().filter_map(Option::take) {
+            let _ = allocator::KERNEL_ALLOCATOR.try_free_untracked_physical(allocation);
+        }
+        abort_private_file_page_loads(&owners, None);
+        return Ok(PrivateFilePageBatchLoad::Fallback);
+    }
+    for allocation in allocations[..allocated].iter_mut().filter_map(Option::take) {
+        candidates.push(ResidentPage::new_private_file(allocation.paddr));
     }
     debug_assert!(!candidates.spilled());
     let Some(owner_capacity) = owners.len().checked_mul(page_size) else {
@@ -6257,6 +6277,16 @@ unsafe fn alloc_uninitialized_user_page() -> Option<usize> {
             return Some(paddr);
         }
     }
+}
+
+fn alloc_uninitialized_user_page_batch(
+    output: &mut [Option<allocator::PhysicalAllocation>],
+) -> usize {
+    if user_page_order() != Some(0) || page_size() != allocator::PAGE_SIZE {
+        output.fill(None);
+        return 0;
+    }
+    allocator::KERNEL_ALLOCATOR.allocate_untracked_order0_batch(output)
 }
 
 fn try_alloc_user_page(order: usize, size: usize) -> Option<usize> {
