@@ -527,6 +527,15 @@ impl FileOps for NetlinkSocketFileOps {
     }
 }
 
+impl Drop for NetlinkSocketFileOps {
+    fn drop(&mut self) {
+        // 出表：与广播读取共用表锁，保证广播期间表内指针存活。
+        NETLINK_SOCKETS
+            .lock()
+            .retain(|entry| entry.0 != self as *const NetlinkSocketFileOps);
+    }
+}
+
 /// 创建 netlink socket。返回 Box 以保证对象地址稳定（注册表持有裸指针，
 /// 栈上对象的地址在返回值拷贝后不保证不变）。
 pub fn create_netlink_socket(protocol: u32, nonblock: bool) -> Box<NetlinkSocketFileOps> {

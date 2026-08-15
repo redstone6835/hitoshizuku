@@ -3069,6 +3069,38 @@ fn procfs_neighbor_snapshot() -> Vec<net::control::NeighborSnapshotEntry> {
     net::control::neighbor_snapshot()
 }
 
+// ── AF_PACKET 发送与接口查询 ─────────────────────────────────────────────────
+
+/// packet socket 发送入口：把完整 L2 帧推送到指定接口的 egress。
+fn packet_tx_frame(interface: InterfaceId, bytes: Vec<u8>) -> Result<(), i32> {
+    let starts = NET_WORKER_STARTS.lock();
+    for slot in starts.iter().flatten() {
+        if let Some(index) = slot.runtime.egress_index(interface) {
+            if let Some(target) = slot.runtime.egress(index) {
+                let work = EgressWork::ControlFrame(bytes);
+                match target.try_push(work) {
+                    Ok(()) => {
+                        slot.cluster.coordinator().publish_work();
+                        return Ok(());
+                    }
+                    Err(_) => return Err(-i32::from(Errno::ENOBUFS)),
+                }
+            }
+        }
+    }
+    Err(-i32::from(Errno::ENODEV))
+}
+
+/// 接口 MAC 查询（SOCK_DGRAM packet socket 构造源地址用）。
+fn packet_interface_mac(interface: InterfaceId) -> [u8; 6] {
+    DEVICES
+        .lock()
+        .iter()
+        .find(|device| device.snapshot.id.raw() == interface.0)
+        .map(|device| device.snapshot.mac_address)
+        .unwrap_or([0; 6])
+}
+
 fn procfs_dns_snapshot() -> Vec<IpAddr> {
     CONFIG_STORE
         .lock()
@@ -3572,6 +3604,8 @@ pub fn start_workers() {
     general::vfs::procfs::install_proc_net_route_provider(netlink_route_snapshot);
     general::vfs::procfs::install_proc_net_neighbor_provider(procfs_neighbor_snapshot);
     general::vfs::procfs::install_proc_net_dns_provider(procfs_dns_snapshot);
+    vfs::packet_socket::install_packet_tx_handler(packet_tx_frame);
+    vfs::packet_socket::install_packet_interface_mac(packet_interface_mac);
     vfs::net_socket::install_net_realtime_clock(crate::vdso::realtime_ns);
     let boot = net::stack::boot_config().expect("网络 stack 启动配置未安装");
     let online = sched::online_cpu_mask();
@@ -8182,6 +8216,29 @@ impl WorkerContext {
         for index in 0..self.rx_batch.len() {
             if let Some(packet) = self.rx_batch.packet(index) {
                 self.observe_arp_reply(packet);
+            }
+        }
+        // AF_PACKET 投递：存在活跃 packet socket 时，把原始帧复制给匹配者。
+        if vfs::packet_socket::packet_socket_active() {
+            for index in 0..self.rx_batch.len() {
+                if let Some(packet) = self.rx_batch.packet(index) {
+                    let mut header = [0u8; 14];
+                    if packet.copy_out(0, &mut header).is_ok() {
+                        let ethertype =
+                            u16::from_be_bytes([header[12], header[13]]);
+                        let frame_len = packet.total_len();
+                        let copy_len = frame_len.min(2048);
+                        let mut frame = alloc::vec![0u8; copy_len];
+                        if packet.copy_out(0, &mut frame).is_ok() {
+                            vfs::packet_socket::packet_socket_deliver(
+                                self.interface,
+                                ethertype,
+                                &frame,
+                                self.local_mac,
+                            );
+                        }
+                    }
+                }
             }
         }
         self.enqueue_rx_batch();

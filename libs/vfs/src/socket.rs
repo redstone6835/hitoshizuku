@@ -513,6 +513,22 @@ fn new_net_socket_file(ops: NetSocketFileOps, cred: Arc<Credentials>, nonblock: 
     Arc::new(file)
 }
 
+fn new_packet_socket_file(
+    ops: Box<crate::packet_socket::PacketSocketFileOps>,
+    cred: Arc<Credentials>,
+    nonblock: bool,
+) -> Arc<File> {
+    let (mount, inode, dentry) = get_or_init_socket_fs();
+    let flags = OpenOptions {
+        access: crate::vfs::file::AccessMode::ReadWrite,
+        nonblock,
+        ..Default::default()
+    };
+    let file = File::new(inode, flags, cred, ops, dentry, Arc::clone(&mount));
+    mount.inc_open();
+    Arc::new(file)
+}
+
 fn new_netlink_socket_file(
     ops: Box<crate::netlink_socket::NetlinkSocketFileOps>,
     cred: Arc<Credentials>,
@@ -648,12 +664,17 @@ pub fn socket(
             let file = new_socket_file(socket, Arc::clone(&cred), nonblock);
             fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
         }
-        17 => {
-            // AF_PACKET: 使用 raw socket 实现 L3 级别的数据包收发
-            let protocol = protocol as u16;
-            let ops =
-                crate::net_socket::create_net_socket(17, SOCK_RAW as u16, protocol, nonblock)?;
-            let file = new_net_socket_file(ops, Arc::clone(&cred), nonblock);
+        crate::addr::AF_PACKET => {
+            // AF_PACKET：L2 原始帧收发（SOCK_RAW 完整帧 / SOCK_DGRAM 补剥头）。
+            if !matches!(kind, SocketType::Raw | SocketType::Datagram) {
+                return Err(Errno::EINVAL);
+            }
+            let ops = crate::packet_socket::create_packet_socket(
+                protocol as u16,
+                kind == SocketType::Raw,
+                nonblock,
+            );
+            let file = new_packet_socket_file(ops, Arc::clone(&cred), nonblock);
             fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
         }
         _ => Err(Errno::EAFNOSUPPORT),
@@ -708,6 +729,9 @@ pub fn bind(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Result<
     }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return nl_ops.bind(raw_addr);
+    }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        return packet_ops.bind(raw_addr);
     }
     let socket = socket_from_file(&file)?;
     let resolved = resolve_bind_address(ctx, raw_addr)?;
@@ -822,6 +846,9 @@ pub fn getsockname(fdt: &FdTable, fd: Fd) -> Result<Vec<u8>, Errno> {
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return Ok(nl_ops.local_address().to_vec());
     }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        return Ok(packet_ops.local_address().to_vec());
+    }
     let socket = socket_from_file(&file)?;
     Ok(encode_sockaddr_un(&socket.local_address()))
 }
@@ -904,6 +931,10 @@ pub fn send(
     }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return nl_ops.write_at(data, 0).map_err(|e| e.to_errno());
+    }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        let dest = raw_addr.unwrap_or(&[]);
+        return packet_ops.sendto(data, dest);
     }
     let socket = socket_from_file(&file)?;
     let decoded = decode_send_control(ctx, fdt, &file, &socket, control)?;
@@ -1016,6 +1047,26 @@ fn recv_inner(
     validate_recv_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
 
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        let mut sll = [0u8; 20];
+        let len = packet_ops.recvfrom(
+            data,
+            &mut sll,
+            file.flags().nonblock || (flags & MSG_DONTWAIT) != 0,
+            deadline_ns,
+        )?;
+        let address = if want_addr {
+            Some(sll.to_vec())
+        } else {
+            None
+        };
+        return Ok(RecvOutput {
+            len,
+            address,
+            control: Vec::new(),
+            msg_flags: 0,
+        });
+    }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         let len = nl_ops.recv(
             data,
@@ -1999,6 +2050,65 @@ fn inet_setsockopt(
 }
 
 // ── AF_NETLINK sockopt 已移至 netlink_socket.rs（真实实现）───────────────
+
+// ── cBPF 过滤器（SO_ATTACH_FILTER 等）────────────────────────────────────────
+
+pub const SO_ATTACH_FILTER: i32 = 26;
+pub const SO_DETACH_FILTER: i32 = 27;
+pub const SO_LOCK_FILTER: i32 = 44;
+
+/// SO_ATTACH_FILTER：安装 cBPF 过滤器到 INET 或 packet socket。
+pub fn socket_attach_filter(
+    fdt: &FdTable,
+    fd: Fd,
+    instructions: alloc::vec::Vec<net::bpf::CbpfInsn>,
+) -> Result<(), Errno> {
+    let file = file_from_fd(fdt, fd)?;
+    let program = net::bpf::CbpfProgram::compile(instructions).map_err(|_| Errno::EINVAL)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.attach_filter(program);
+    }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        return packet_ops.attach_filter(program);
+    }
+    Err(Errno::ENOTSOCK)
+}
+
+/// SO_DETACH_FILTER：卸载过滤器。
+pub fn socket_detach_filter(fdt: &FdTable, fd: Fd) -> Result<(), Errno> {
+    let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.detach_filter();
+    }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        return packet_ops.detach_filter();
+    }
+    Err(Errno::ENOTSOCK)
+}
+
+/// SO_LOCK_FILTER：锁定过滤器。
+pub fn socket_lock_filter(fdt: &FdTable, fd: Fd) -> Result<(), Errno> {
+    let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.lock_filter();
+    }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        return packet_ops.lock_filter();
+    }
+    Err(Errno::ENOTSOCK)
+}
+
+/// SO_GET_FILTER：读取已安装过滤器指令（未安装为空）。
+pub fn socket_get_filter(fdt: &FdTable, fd: Fd) -> Result<alloc::vec::Vec<net::bpf::CbpfInsn>, Errno> {
+    let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return Ok(net_ops.get_filter());
+    }
+    if let Some(packet_ops) = file.downcast_ops::<crate::packet_socket::PacketSocketFileOps>() {
+        return Ok(packet_ops.get_filter());
+    }
+    Err(Errno::ENOTSOCK)
+}
 
 pub fn validate_send_flags(flags: usize) -> Result<(), Errno> {
     let allowed =

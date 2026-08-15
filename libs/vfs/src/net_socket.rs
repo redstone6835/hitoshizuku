@@ -170,6 +170,10 @@ pub struct NetSocketFileOps {
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
     options: Mutex<SocketOptions>,
+    /// SO_ATTACH_FILTER 安装的 cBPF 程序（作用于网络层报文）。
+    filter: Mutex<Option<alloc::sync::Arc<net::bpf::CbpfProgram>>>,
+    /// SO_LOCK_FILTER：禁止替换/卸载过滤器。
+    filter_locked: AtomicBool,
 }
 
 impl net::ReadinessObserver for PollSource {
@@ -660,7 +664,50 @@ impl NetSocketFileOps {
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             options: Mutex::new(options),
+            filter: Mutex::new(None),
+            filter_locked: AtomicBool::new(false),
         }
+    }
+
+    /// SO_ATTACH_FILTER：安装 cBPF 过滤器（已锁定则 EPERM）。
+    pub fn attach_filter(&self, program: net::bpf::CbpfProgram) -> Result<(), Errno> {
+        if self.filter_locked.load(Ordering::Acquire) {
+            return Err(Errno::EPERM);
+        }
+        *self.filter.lock() = Some(alloc::sync::Arc::new(program));
+        Ok(())
+    }
+
+    /// SO_DETACH_FILTER：卸载过滤器（已锁定则 EPERM）。
+    pub fn detach_filter(&self) -> Result<(), Errno> {
+        if self.filter_locked.load(Ordering::Acquire) {
+            return Err(Errno::EPERM);
+        }
+        *self.filter.lock() = None;
+        Ok(())
+    }
+
+    /// SO_LOCK_FILTER：锁定当前过滤器，禁止后续替换/卸载。
+    pub fn lock_filter(&self) -> Result<(), Errno> {
+        self.filter_locked.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// SO_GET_FILTER：读取已安装的过滤器指令（未安装返回空）。
+    pub fn get_filter(&self) -> alloc::vec::Vec<net::bpf::CbpfInsn> {
+        self.filter
+            .lock()
+            .as_ref()
+            .map(|program| program.instructions().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// 在接收路径执行过滤器（数据为网络层报文）。返回 false 表示丢弃。
+    pub fn filter_accepts(&self, packet: &[u8]) -> bool {
+        let Some(filter) = self.filter.lock().as_ref().cloned() else {
+            return true;
+        };
+        filter.run(packet) != 0
     }
 }
 
