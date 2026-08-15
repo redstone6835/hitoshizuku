@@ -4554,14 +4554,22 @@ impl VmSpace {
         }
         let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
         {
+            // Linux 语义：范围必须**整体**落在本状态对象的 WP 登记区域内。
             let regions = self.uffd_regions.lock();
-            let covered = regions.iter().any(|region| {
-                Arc::ptr_eq(&region.state, state)
-                    && region.mode & UFFDIO_REGISTER_MODE_WP != 0
-                    && region.range.start < end
-                    && start < region.range.end
-            });
-            if !covered {
+            let mut cursor = start;
+            for region in regions.iter() {
+                if !Arc::ptr_eq(&region.state, state)
+                    || region.mode & UFFDIO_REGISTER_MODE_WP == 0
+                    || region.range.start > cursor
+                {
+                    continue;
+                }
+                cursor = cursor.max(region.range.end);
+                if cursor >= end {
+                    break;
+                }
+            }
+            if cursor < end {
                 return Err(Errno::EINVAL);
             }
         }
@@ -7053,15 +7061,23 @@ fn remove_cached_file_page(cache: &WeakFilePageCache, key: FilePageKey, page: &R
 /// 本内核的页缓存由两部分构成：私有干净文件页强缓存（`PRIVATE_FILE_PAGES`，
 /// 含未映射的缓存页）与共享文件页缓存（`SHARED_FILE_PAGES`，驻留页的弱引用表）。
 /// 返回 `(cached_pages, dirty_pages)`；写回中/最近回收的计数没有对应状态，
-/// 恒为 0。`file_key` 来自 [`FileLike::cache_key`]。
-pub fn file_cache_stat(file_key: usize, off: u64, len: u64) -> (u64, u64) {
+/// 恒为 0。
+///
+/// 两类缓存的键不同：共享缓存用 [`FileLike::cache_key`]（inode 身份），私有
+/// 缓存用 [`FileLike::private_page_cache_key`]（独立分配的缓存 id）。
+pub fn file_cache_stat(
+    shared_key: usize,
+    private_key: Option<usize>,
+    off: u64,
+    len: u64,
+) -> (u64, u64) {
     let end = off.saturating_add(len);
     let mut cached = 0u64;
     let mut dirty = 0u64;
     {
         let pages = SHARED_FILE_PAGES.lock();
         for (key, weak) in pages.iter() {
-            if key.file_key != file_key || key.offset < off || key.offset >= end {
+            if key.file_key != shared_key || key.offset < off || key.offset >= end {
                 continue;
             }
             if let Some(page) = weak.upgrade() {
@@ -7072,16 +7088,18 @@ pub fn file_cache_stat(file_key: usize, off: u64, len: u64) -> (u64, u64) {
             }
         }
     }
-    for shard in &PRIVATE_FILE_PAGES.shards {
-        let shard = shard.lock();
-        for (key, entry) in shard.pages.entries.iter() {
-            if key.file_key != file_key || key.offset < off || key.offset >= end {
-                continue;
-            }
-            if let PrivateFilePageCacheEntry::Ready(ready) = entry {
-                cached += 1;
-                if ready.page.is_dirty() {
-                    dirty += 1;
+    if let Some(private_key) = private_key {
+        for shard in &PRIVATE_FILE_PAGES.shards {
+            let shard = shard.lock();
+            for (key, entry) in shard.pages.entries.iter() {
+                if key.file_key != private_key || key.offset < off || key.offset >= end {
+                    continue;
+                }
+                if let PrivateFilePageCacheEntry::Ready(ready) = entry {
+                    cached += 1;
+                    if ready.page.is_dirty() {
+                        dirty += 1;
+                    }
                 }
             }
         }

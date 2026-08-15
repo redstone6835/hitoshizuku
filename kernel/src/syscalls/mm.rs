@@ -1154,11 +1154,11 @@ pub(super) fn sys_cachestat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if !file.flags().readable() {
         return Err(Errno::EBADF);
     }
-    let file_key = {
+    let (shared_key, private_key) = {
         let file_like: &dyn mm::FileLike = file.as_ref();
-        file_like.cache_key()
+        (file_like.cache_key(), file_like.private_page_cache_key())
     };
-    let (nr_cache, nr_dirty) = file_cache_stat(file_key, off, len);
+    let (nr_cache, nr_dirty) = file_cache_stat(shared_key, private_key, off, len);
     let mut out = [0u8; 40];
     for (slot, value) in [nr_cache, nr_dirty, 0, 0, 0].iter().enumerate() {
         out[slot * 8..slot * 8 + 8].copy_from_slice(&value.to_le_bytes());
