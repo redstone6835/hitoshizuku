@@ -47,3 +47,5 @@ strip = false
 
 [profile.dev]
 panic = "abort"
+
+[workspace]

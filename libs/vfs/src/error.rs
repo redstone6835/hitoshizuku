@@ -136,6 +136,9 @@ pub enum VfsError {
     /// 管道写端已关闭，读端返回 EOF；或读端已关闭，写端收到 SIGPIPE（EPIPE）。
     BrokenPipe,
 
+    /// 消息（mqueue）长度超过接收缓冲区上限（EMSGSIZE）。
+    MessageTooLong,
+
     /// 连接被对端重置（ECONNRESET）。
     ConnectionReset,
 }
@@ -174,6 +177,7 @@ impl VfsError {
             VfsError::WouldBlock => Errno::EAGAIN,
             VfsError::TimedOut => Errno::ETIMEDOUT,
             VfsError::BrokenPipe => Errno::EPIPE,
+            VfsError::MessageTooLong => Errno::EMSGSIZE,
             VfsError::ConnectionReset => Errno::ECONNRESET,
         }
     }

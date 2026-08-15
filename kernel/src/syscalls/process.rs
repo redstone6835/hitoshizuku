@@ -5323,6 +5323,7 @@ fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
     pi_release_owned_futexes(task);
     exit_robust_list(task);
     clear_child_tid_and_wake(task);
+    super::ipc::apply_sem_undo_on_exit(task);
     #[cfg(feature = "trace-task-lifecycle")]
     log::info!(
         "[syscall][exit-cleanup] futex-done pid={:?}",

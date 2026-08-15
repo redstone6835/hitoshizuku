@@ -3,6 +3,7 @@ pub mod device_files;
 pub mod devpts;
 pub mod devtmpfs;
 pub mod mount_source;
+pub mod mqueue;
 pub mod pidfd;
 pub mod procfs;
 pub mod sysfs;
@@ -19,6 +20,10 @@ pub use blockfs::{
 pub use devpts::DevPtsDriver;
 pub use devtmpfs::DevTmpfsDriver;
 pub use mount_source::{MountSource, resolve_block_mount_source};
+pub use mqueue::{
+    MqFsDriver, MqNotifyDispatcher, dispatch_mq_notification, mq_registry,
+    register_mq_notify_dispatcher,
+};
 pub use procfs::ProcFsDriver;
 pub use sysfs::SysFsDriver;
 pub use tmpfs::TmpfsDriver;

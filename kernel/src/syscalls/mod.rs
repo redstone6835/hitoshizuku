@@ -7,7 +7,7 @@
 //! `register_all()` 在 `kernel::sched::boot_init` 的末尾调用一次。
 
 mod fs;
-mod ipc;
+pub(crate) mod ipc;
 mod mm;
 mod nr;
 mod process;
@@ -466,6 +466,8 @@ pub fn register_all() {
         signal::sys_rt_sigtimedwait_time64,
     );
     register_syscall(nr::SYS_PIDFD_SEND_SIGNAL, signal::sys_pidfd_send_signal);
+
+    ipc::register_mq_notify_dispatcher_once();
 
     let registered = general::syscall::registered_count();
     log::info!("[syscalls] registered {} entries", registered);

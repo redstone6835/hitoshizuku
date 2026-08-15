@@ -1968,6 +1968,40 @@ fn migrate_standard_root_workspace(input: &str) -> Result<String, String> {
         ));
     };
 
+    // 空 `[workspace]` 表（无任何键/成员）表示"本 package 是独立的 workspace
+    // 根"，是 cargo 官方推荐的仓库隔离写法。规范形态同时携带
+    // `[workspace.package] version/edition`：cargo 会把本 workspace 目录树内
+    // 的 path 依赖（`.elm/framework/*` 与 `.elm/kernel-source/**` 的 crate）
+    // 吸收为 workspace 成员；这些 crate 的 manifest 使用
+    // `version.workspace = true`/`edition.workspace = true` 继承，缺少
+    // workspace.package 时会在依赖解析阶段直接失败。
+    let empty_workspace = lines[workspace.0 + 1..workspace.1]
+        .iter()
+        .all(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with('#') || line == "]"
+        });
+    if empty_workspace {
+        let package_range = manifest_section_range(&lines, "[workspace.package]");
+        let version = package_range
+            .and_then(|range| manifest_string_assignment(&lines[range.0 + 1..range.1], "version"))
+            .unwrap_or_else(|| "0.1.0".to_string());
+        let edition = package_range
+            .and_then(|range| manifest_string_assignment(&lines[range.0 + 1..range.1], "edition"))
+            .unwrap_or_else(|| "2024".to_string());
+        let output = replace_workspace_package_inheritance(input, &version, &edition);
+        let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
+        lines.retain(|line| line.trim() != "[workspace]");
+        lines.retain(|line| line.trim() != "[workspace.package]");
+        let mut result = lines.join("\n");
+        if output.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str("[workspace]\n\n[workspace.package]\n");
+        result.push_str(&format!("version = {version:?}\nedition = {edition:?}\n"));
+        return Ok(result);
+    }
+
     for line in &lines[workspace.0 + 1..workspace.1] {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line == "]" {

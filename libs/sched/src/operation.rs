@@ -86,7 +86,8 @@ pub fn getegid() -> Gid {
 
 // ── 进程组 / 会话 ────────────────────────────────────────────────────────────
 
-fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
+/// 按根 pid 命名空间的 pid 查找任务（内核内部通知/辅助路径使用）。
+pub fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
     if pid == 0 {
         return Ok(current_task());
     }

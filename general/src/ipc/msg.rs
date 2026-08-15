@@ -130,6 +130,7 @@ struct MsgPerm {
     uid: Uid,
     gid: Gid,
     cuid: Uid,
+    cgid: Gid,
     mode: FileMode,
 }
 
@@ -140,6 +141,7 @@ impl MsgPerm {
             uid: cred.euid,
             gid: cred.egid,
             cuid: cred.euid,
+            cgid: cred.egid,
             mode: mode_from_flags(flags),
         }
     }
@@ -267,7 +269,7 @@ impl MsgQueue {
         cred: &Credentials,
         pid: i32,
         now_sec: i64,
-    ) -> Result<Result<ReceivedMsg, MsgOpAttempt>, Errno> {
+    ) -> Result<MsgRecvOutcome, Errno> {
         if flags & !(MSG_NOERROR | MSG_EXCEPT | MSG_COPY | MSG_TRUNC | IPC_NOWAIT) != 0 {
             return Err(Errno::EINVAL);
         }
@@ -327,7 +329,7 @@ impl MsgQueue {
             if flags & IPC_NOWAIT != 0 {
                 return Err(Errno::EAGAIN);
             }
-            return Ok(Err(MsgOpAttempt::WouldBlock));
+            return Ok(MsgRecvOutcome::WouldBlock);
         };
 
         let message = &inner.messages[index];
@@ -350,7 +352,7 @@ impl MsgQueue {
             inner.rtime = now_sec;
             inner.lrpid = pid;
         }
-        Ok(Ok(received))
+        Ok(MsgRecvOutcome::Received(received))
     }
 
     fn check_requested_mode(&self, flags: u32, cred: &Credentials) -> Result<(), Errno> {
@@ -361,13 +363,24 @@ impl MsgQueue {
         check_mode_request(cred, &inner.perm, flags)
     }
 
-    /// `msgctl(IPC_STAT)` 快照。
+    /// `msgctl(IPC_STAT)` 快照（要求读权限）。
     pub fn stat(&self, cred: &Credentials) -> Result<MsgMetadata, Errno> {
+        self.stat_inner(cred, true)
+    }
+
+    /// `msgctl(MSG_STAT_ANY)` 快照（不检查读权限）。
+    pub fn stat_any(&self) -> Result<MsgMetadata, Errno> {
+        self.stat_inner(&Credentials::root(), false)
+    }
+
+    fn stat_inner(&self, cred: &Credentials, check_perms: bool) -> Result<MsgMetadata, Errno> {
         let inner = self.inner.lock();
         if inner.removed {
             return Err(Errno::EIDRM);
         }
-        check_operation_permissions(cred, &inner.perm, Access::Receive)?;
+        if check_perms {
+            check_operation_permissions(cred, &inner.perm, Access::Receive)?;
+        }
         Ok(MsgMetadata {
             perm: inner.perm,
             stime: inner.stime,
@@ -446,6 +459,9 @@ impl MsgMetadata {
     pub fn cuid(&self) -> Uid {
         self.perm.cuid
     }
+    pub fn cgid(&self) -> Gid {
+        self.perm.cgid
+    }
     pub fn mode(&self) -> FileMode {
         self.perm.mode
     }
@@ -521,6 +537,18 @@ impl MsgManager {
             .get(&id)
             .cloned()
             .ok_or(Errno::EINVAL)
+    }
+
+    /// `MSG_STAT`/`MSG_STAT_ANY`：按 id 排序后的序号取队列，返回 (真实 id, 队列)。
+    pub fn queue_by_index(&self, index: i32) -> Result<(MsgId, Arc<MsgQueue>), Errno> {
+        if index < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let state = self.state.lock();
+        let Some((&id, queue)) = state.by_id.iter().nth(index as usize) else {
+            return Err(Errno::EINVAL);
+        };
+        Ok((id, Arc::clone(queue)))
     }
 
     /// 删除队列并标记稳定对象，使已阻塞任务返回 `EIDRM`。
@@ -650,6 +678,25 @@ mod tests {
         );
     }
 
+    /// 期望队列中必有消息的接收 helper。
+    fn recv(
+        queue: &MsgQueue,
+        msgtyp: i64,
+        msgsz: usize,
+        flags: u32,
+        cred: &Credentials,
+        pid: i32,
+        now_sec: i64,
+    ) -> ReceivedMsg {
+        match queue
+            .try_receive(msgtyp, msgsz, flags, cred, pid, now_sec)
+            .expect("接收")
+        {
+            MsgRecvOutcome::Received(received) => received,
+            MsgRecvOutcome::WouldBlock => panic!("队列应有消息"),
+        }
+    }
+
     #[ktest]
     fn message_type_selection_and_order() {
         let manager = MsgManager::new();
@@ -665,37 +712,22 @@ mod tests {
         send(&manager, id, 3, b"c2", 0);
 
         // msgtyp = 0：队首（插入顺序）。
-        let got = queue
-            .try_receive(0, 16, 0, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let got = recv(&queue, 0, 16, 0, &cred, 2, 0);
         assert_eq!((got.mtype, got.data.as_slice()), (3, b"c".as_slice()));
 
         // msgtyp > 0：该类型第一条（3 的 c2 排在 1/2 之前）。
-        let got = queue
-            .try_receive(2, 16, 0, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let got = recv(&queue, 2, 16, 0, &cred, 2, 0);
         assert_eq!((got.mtype, got.data.as_slice()), (2, b"b".as_slice()));
 
         // msgtyp < 0：类型 <= |msgtyp| 的最小类型。
-        let got = queue
-            .try_receive(-2, 16, 0, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let got = recv(&queue, -2, 16, 0, &cred, 2, 0);
         assert_eq!((got.mtype, got.data.as_slice()), (1, b"a".as_slice()));
 
         // MSG_EXCEPT：类型 != 3 的第一条（现在队首是 3/c2）。
-        let got = queue
-            .try_receive(3, 16, MSG_EXCEPT, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let got = recv(&queue, 3, 16, MSG_EXCEPT, &cred, 2, 0);
         assert_eq!((got.mtype, got.data.as_slice()), (3, b"c2".as_slice()));
 
-        let got = queue
-            .try_receive(0, 16, 0, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let got = recv(&queue, 0, 16, 0, &cred, 2, 0);
         assert_eq!(got.mtype, 3);
     }
 
@@ -714,25 +746,16 @@ mod tests {
             queue.try_receive(0, 4, 0, &cred, 2, 0),
             Err(Errno::E2BIG)
         );
-        let got = queue
-            .try_receive(0, 4, MSG_NOERROR, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let got = recv(&queue, 0, 4, MSG_NOERROR, &cred, 2, 0);
         assert_eq!(got.data, b"0123");
         assert_eq!(got.full_size, 10);
 
         // 重新入队并验证 MSG_COPY 不取走消息。
         send(&manager, id, 5, b"hello", 0);
-        let copied = queue
-            .try_receive(0, 16, MSG_COPY | IPC_NOWAIT, &cred, 2, 0)
-            .expect("拷贝")
-            .expect("有消息");
+        let copied = recv(&queue, 0, 16, MSG_COPY | IPC_NOWAIT, &cred, 2, 0);
         assert!(copied.copied);
         assert_eq!(copied.data, b"hello");
-        let again = queue
-            .try_receive(0, 16, 0, &cred, 2, 0)
-            .expect("接收")
-            .expect("有消息");
+        let again = recv(&queue, 0, 16, 0, &cred, 2, 0);
         assert_eq!(again.data, b"hello");
 
         // MSG_TRUNC 仅与 MSG_COPY 同用。
