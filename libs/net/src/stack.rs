@@ -2489,6 +2489,22 @@ pub enum NetStackControlCommand {
         now_ns: u64,
         output: Option<DhcpRunOutput>,
     },
+    RunRouterSolicit {
+        now_ns: u64,
+        output: Option<RouterSolicitRunOutput>,
+    },
+    HandleRouterAdvertisement {
+        interface: InterfaceId,
+        packet: Option<FrontendPacket>,
+        now_ns: u64,
+        output: Option<RouterAdvertisementOutput>,
+    },
+    AddDadState {
+        interface: InterfaceId,
+        address: Ipv6Addr,
+        now_ns: u64,
+        output: Option<()>,
+    },
     HandleDhcpPacket {
         interface: InterfaceId,
         packet: Option<FrontendPacket>,
@@ -2635,6 +2651,42 @@ pub struct DhcpPacketOutput {
     pub lease_change: Option<DhcpLeaseChange>,
 }
 
+/// Router Solicitation（RFC 4861 §6.3.7）本轮输出。
+/// RFC 4861 §6.3.7：最多重试次数。
+pub const MAX_ROUTER_SOLICITATIONS: u8 = 3;
+
+pub struct RouterSolicitRunOutput {
+    /// 需要发出 RS 的接口。
+    pub probes: Vec<InterfaceId>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+/// Router Advertisement（RFC 4861 §4.2）解析出的前缀。
+pub struct SlaacPrefix {
+    pub prefix: Ipv6Addr,
+    pub prefix_len: u8,
+    /// L 标志：on-link。
+    pub onlink: bool,
+    /// A 标志：可用于 SLAAC。
+    pub autonomous: bool,
+    pub valid_seconds: u32,
+}
+
+/// Router Advertisement 的解析结果（控制面不保存路由器状态，由 host 持有）。
+pub struct RouterAdvertisementOutput {
+    pub router: Ipv6Addr,
+    pub mac: Option<[u8; 6]>,
+    pub lifetime_seconds: u32,
+    pub prefixes: alloc::vec::Vec<SlaacPrefix>,
+}
+
+/// Router Solicitation 重试状态（RFC 4861：最多 3 次，间隔 1s/2s/4s）。
+struct RouterSolicitState {
+    interface: InterfaceId,
+    attempts: u8,
+    next_send_ns: u64,
+}
+
 /// 由 `net.stack` ELM 独占的全局控制面状态。
 pub struct NetStackControlPlane {
     bind_registry: BindRegistry,
@@ -2649,6 +2701,8 @@ pub struct NetStackControlPlane {
     dhcp: Mutex<Vec<DhcpClient>>,
     /// 内核 DHCP 客户端关闭开关（启动参数 net.dhcp=0）。
     dhcp_disabled: bool,
+    /// IPv6 Router Solicitation（无默认路由器时发现路由器）。
+    router_solicits: Mutex<alloc::vec::Vec<RouterSolicitState>>,
     multicast_refs: Mutex<BTreeMap<(InterfaceId, IpAddr), usize>>,
     multicast_bindings: Mutex<BTreeMap<(SocketId, MulticastMembership), InterfaceId>>,
 }
@@ -2676,6 +2730,7 @@ impl NetStackControlPlane {
             dad_errors: Mutex::new(BTreeMap::new()),
             dhcp: Mutex::new(Vec::new()),
             dhcp_disabled,
+            router_solicits: Mutex::new(Vec::new()),
             multicast_refs: Mutex::new(BTreeMap::new()),
             multicast_bindings: Mutex::new(BTreeMap::new()),
         }
@@ -2757,6 +2812,20 @@ impl NetStackControlPlane {
         } else {
             initial_dhcp_clients(config, now_ns)
         };
+        // IPv6 Router Solicitation：运行中的非回环接口（有 link-local）在未发现
+        // 默认路由器前周期性重试（RFC 4861 §6.3.7，最多 3 次）。
+        *self.router_solicits.lock() = config
+            .interfaces
+            .iter()
+            .filter(|interface| {
+                !interface.loopback && interface.running && interface.mac_address != [0; 6]
+            })
+            .map(|interface| RouterSolicitState {
+                interface: interface.id,
+                attempts: 0,
+                next_send_ns: now_ns,
+            })
+            .collect();
     }
 
     fn run_dad(&self, now_ns: u64) -> DadRunOutput {
@@ -2883,6 +2952,136 @@ impl NetStackControlPlane {
             lease_changes,
             next_deadline_ns: dhcp.iter().map(|client| client.next_action_ns).min(),
         }
+    }
+
+    fn run_router_solicit(&self, now_ns: u64) -> RouterSolicitRunOutput {
+        let mut router_solicits = self.router_solicits.lock();
+        let mut probes = Vec::new();
+        let mut next = None;
+        let mut index = 0;
+        while index < router_solicits.len() {
+            let state = &mut router_solicits[index];
+            if state.attempts >= MAX_ROUTER_SOLICITATIONS {
+                router_solicits.remove(index);
+                continue;
+            }
+            if state.next_send_ns > now_ns {
+                next = Some(next.map_or(state.next_send_ns, |n: u64| n.min(state.next_send_ns)));
+                index += 1;
+                continue;
+            }
+            probes.push(state.interface);
+            state.attempts += 1;
+            // RFC 4861 §6.3.7：重试间隔 1s、2s、4s。
+            let delay = 1_000_000_000u64 << (state.attempts - 1);
+            state.next_send_ns = now_ns.saturating_add(delay);
+            next = Some(next.map_or(state.next_send_ns, |n: u64| n.min(state.next_send_ns)));
+            index += 1;
+        }
+        RouterSolicitRunOutput {
+            probes,
+            next_deadline_ns: next,
+        }
+    }
+
+    fn handle_router_advertisement(
+        &self,
+        interface: InterfaceId,
+        packet: &FrontendPacket,
+        now_ns: u64,
+    ) -> RouterAdvertisementOutput {
+        let _ = interface;
+        let _ = now_ns;
+        let empty = RouterAdvertisementOutput {
+            router: Ipv6Addr::UNSPECIFIED,
+            mac: None,
+            lifetime_seconds: 0,
+            prefixes: Vec::new(),
+        };
+        let Some(ip) = packet.parsed.ip else {
+            return empty;
+        };
+        let IpAddr::V6(router) = ip.source else {
+            return empty;
+        };
+        let offset = usize::from(ip.payload_offset);
+        let len = ip.payload_len as usize;
+        // ICMPv6 RA：type(1) code(1) checksum(2) hoplimit(1) flags(1) lifetime(2)
+        // reachable(4) retrans(4) = 16 字节，随后是选项。
+        if len < 16 {
+            return empty;
+        }
+        let mut header = [0u8; 16];
+        if packet.chain.copy_out(offset, &mut header).is_err() || header[0] != 134 {
+            return empty;
+        }
+        let lifetime_seconds = u32::from(u16::from_be_bytes([header[6], header[7]]));
+        let mut mac = None;
+        let mut prefixes = Vec::new();
+        let mut cursor = offset + 16;
+        let end = offset + len;
+        while cursor + 8 <= end {
+            let mut option = [0u8; 32];
+            let available = (end - cursor).min(32);
+            if packet
+                .chain
+                .copy_out(cursor, &mut option[..available])
+                .is_err()
+            {
+                break;
+            }
+            let kind = option[0];
+            let option_len = usize::from(option[1]) * 8;
+            if option_len < 8 || cursor + option_len > end {
+                break;
+            }
+            match kind {
+                1 if option_len == 8 => {
+                    // Source Link-Layer Address。
+                    mac = Some(option[2..8].try_into().unwrap());
+                }
+                3 if option_len == 32 => {
+                    // Prefix Information。
+                    let prefix_len = option[2];
+                    let flags = option[3];
+                    let valid_seconds = u32::from_be_bytes(option[4..8].try_into().unwrap());
+                    if prefix_len <= 128 {
+                        prefixes.push(SlaacPrefix {
+                            prefix: Ipv6Addr(option[16..32].try_into().unwrap()),
+                            prefix_len,
+                            onlink: flags & 0x80 != 0,
+                            autonomous: flags & 0x40 != 0,
+                            valid_seconds,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            cursor += option_len;
+        }
+        RouterAdvertisementOutput {
+            router,
+            mac,
+            lifetime_seconds,
+            prefixes,
+        }
+    }
+
+    fn add_dad_state(&self, interface: InterfaceId, address: Ipv6Addr, now_ns: u64) {
+        let mut dad = self.dad.lock();
+        if dad
+            .iter()
+            .any(|state| state.interface == interface && state.address == address)
+        {
+            return;
+        }
+        dad.push(DadState {
+            interface,
+            address,
+            probe_sent: false,
+            conflict: false,
+            deadline_ns: now_ns.saturating_add(1_000_000_000),
+        });
     }
 
     fn handle_dhcp_packet(
@@ -3033,6 +3232,9 @@ impl NetStackControlPlane {
     fn remove_autoconfig_interface(&self, interface: InterfaceId) -> Option<DhcpLeaseChange> {
         self.dad.lock().retain(|state| state.interface != interface);
         self.dad_errors.lock().remove(&interface);
+        self.router_solicits
+            .lock()
+            .retain(|state| state.interface != interface);
         let mut dhcp = self.dhcp.lock();
         let index = dhcp
             .iter()
@@ -3434,6 +3636,29 @@ pub fn dispatch_control_plane_call(
                 return;
             };
             *output = Some(plane.handle_dhcp_packet(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::RunRouterSolicit { now_ns, output } => {
+            *output = Some(plane.run_router_solicit(*now_ns));
+        }
+        NetStackControlCommand::HandleRouterAdvertisement {
+            interface,
+            packet,
+            now_ns,
+            output,
+        } => {
+            let Some(packet) = packet.as_ref() else {
+                return;
+            };
+            *output = Some(plane.handle_router_advertisement(*interface, packet, *now_ns));
+        }
+        NetStackControlCommand::AddDadState {
+            interface,
+            address,
+            now_ns,
+            output,
+        } => {
+            plane.add_dad_state(*interface, *address, *now_ns);
+            *output = Some(());
         }
         NetStackControlCommand::RemoveAutoconfigInterface { interface, output } => {
             *output = Some(plane.remove_autoconfig_interface(*interface));
@@ -6170,6 +6395,125 @@ mod tests {
         assert!(plane.run_dhcp(&config, 100).frames.is_empty());
         // 关闭开关不影响 DAD（IPv6 自动配置）。
         assert_eq!(plane.run_dad(100).probes.len(), 1);
+    }
+
+    #[test]
+    fn router_solicit_retries_three_times_then_stops() {
+        // RFC 4861 §6.3.7：最多 3 次 RS，间隔 1s/2s/4s。
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![crate::control::InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: crate::NetDeviceId(1),
+                mac_address: [0x02, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        plane.initialize_autoconfig(&config, 100);
+        let first = plane.run_router_solicit(100);
+        assert_eq!(first.probes.len(), 1);
+        assert_eq!(plane.run_router_solicit(100).probes.len(), 0, "同刻不重发");
+        let second = plane.run_router_solicit(1_100_000_100);
+        assert_eq!(second.probes.len(), 1, "1s 后重试");
+        let third = plane.run_router_solicit(3_100_000_100);
+        assert_eq!(third.probes.len(), 1, "3s 后（2s 间隔）重试");
+        let exhausted = plane.run_router_solicit(7_100_000_100);
+        assert_eq!(exhausted.probes.len(), 0, "3 次后停止");
+        assert_eq!(exhausted.next_deadline_ns, None);
+    }
+
+    #[test]
+    fn router_advertisement_parses_prefixes_and_router() {
+        // 构造一个 RA 帧：type 134 + 源链路层 + 前缀信息（L/A 标志，/64）。
+        let interface = InterfaceId(1);
+        let mac = [0x02, 0, 0, 0, 0, 0x01];
+        let router = Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut frame = alloc::vec![0u8; 14 + 40 + 16 + 8 + 32];
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&((16 + 8 + 32) as u16).to_be_bytes());
+        frame[20] = 58;
+        frame[22..38].copy_from_slice(&router.0);
+        let offset = 54usize;
+        frame[offset] = 134;
+        frame[offset + 6..offset + 8].copy_from_slice(&1800u16.to_be_bytes());
+        // 选项 1：源链路层。
+        frame[offset + 16] = 1;
+        frame[offset + 17] = 1;
+        frame[offset + 18..offset + 24].copy_from_slice(&mac);
+        // 选项 3：前缀信息。
+        frame[offset + 24] = 3;
+        frame[offset + 25] = 4;
+        frame[offset + 26] = 64;
+        frame[offset + 27] = 0xC0; // L + A
+        frame[offset + 28..offset + 32].copy_from_slice(&604_800u32.to_be_bytes());
+        let prefix = Ipv6Addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        frame[offset + 40..offset + 56].copy_from_slice(&prefix.0);
+        let chain = crate::buf::PacketChain::from_owned(frame);
+        let parsed = crate::pipeline::ParsedPacket {
+            ethernet: crate::pipeline::EthernetHeader {
+                destination: [0x33, 0x33, 0, 0, 0, 0x01],
+                source: mac,
+                ethertype: 0x86dd,
+            },
+            ip: Some(crate::pipeline::IpPacket {
+                source: IpAddr::V6(router),
+                destination: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                next_header: 58,
+                header_len: 40,
+                payload_offset: 54,
+                payload_len: (16 + 8 + 32) as u32,
+                hop_limit: 255,
+                traffic_class: 0,
+                fragment: None,
+            }),
+            tcp: None,
+            udp: None,
+            flow: None,
+            rss_hash: None,
+            disposition: crate::pipeline::FrontendDisposition::Control(
+                crate::pipeline::ControlPacket::Icmp {
+                    ipv6: true,
+                    packet_offset: 54,
+                    packet_len: (16 + 8 + 32) as u32,
+                },
+            ),
+        };
+        let packet = crate::pipeline::FrontendPacket {
+            chain,
+            parsed,
+            metadata: crate::buf::PacketMetadata::default(),
+        };
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        let output = plane.handle_router_advertisement(interface, &packet, 200);
+        assert_eq!(output.router, router);
+        assert_eq!(output.mac, Some(mac));
+        assert_eq!(output.lifetime_seconds, 1800);
+        assert_eq!(output.prefixes.len(), 1);
+        assert!(output.prefixes[0].onlink);
+        assert!(output.prefixes[0].autonomous);
+        assert_eq!(output.prefixes[0].prefix, prefix);
+        assert_eq!(output.prefixes[0].prefix_len, 64);
+        assert_eq!(output.prefixes[0].valid_seconds, 604_800);
+    }
+
+    #[test]
+    fn add_dad_state_queues_duplicate_free_probe() {
+        let plane = NetStackControlPlane::new_with_options(1, [3; 40], &[5; 16], true);
+        let address = Ipv6Addr([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        plane.add_dad_state(InterfaceId(1), address, 100);
+        plane.add_dad_state(InterfaceId(1), address, 200);
+        assert_eq!(
+            plane.run_dad(1_100_000_100).probes.len(),
+            1,
+            "重复地址只排一次"
+        );
     }
 
     #[test]

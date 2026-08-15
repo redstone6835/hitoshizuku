@@ -3208,6 +3208,19 @@ struct PendingWorker {
     arp_probe_enabled: bool,
 }
 
+/// 从 Router Advertisement 学到的 IPv6 路由器状态（host 侧，控制面不保存）。
+struct RouterState {
+    interface: InterfaceId,
+    router: Ipv6Addr,
+    mac: Option<[u8; 6]>,
+    /// 路由器生命周期截止（ns）。
+    expires_ns: u64,
+    /// SLAAC 前缀（A 标志）。
+    slaac_prefix: Option<(Ipv6Addr, u8)>,
+    /// 由该路由器分配的 SLAAC 地址（等待 DAD / 已安装）。
+    slaac_address: Option<(Ipv6Addr, u8)>,
+}
+
 struct NetWorkerContext {
     runtime: Arc<ProtocolRuntime>,
     cluster: Arc<ProtocolCluster>,
@@ -3241,6 +3254,10 @@ struct NetWorkerContext {
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
     physical_udp_probe_polls_remaining: u8,
     local_queues: Vec<Box<WorkerContext>>,
+    /// 每接口的 IPv6 路由器状态（RA 学习）。
+    router_states: Vec<RouterState>,
+    /// 等待 DAD 的 SLAAC 地址：(interface, address, prefix_len)。
+    slaac_pending: Vec<(InterfaceId, Ipv6Addr, u8)>,
 }
 
 enum TurnCommandMeta {
@@ -3371,6 +3388,11 @@ enum TurnControlMeta {
         interface: InterfaceId,
         local_mac: [u8; 6],
     },
+    RouterSolicit,
+    RouterAdvertisement {
+        interface: InterfaceId,
+    },
+    AddDadState,
     RemoveAutoconfigInterface,
     ReleaseBinding {
         facade: Option<Arc<SocketFacade>>,
@@ -3716,6 +3738,8 @@ pub fn start_workers() {
                 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
                 physical_udp_probe_polls_remaining: 0,
                 local_queues: Vec::new(),
+                router_states: Vec::new(),
+                slaac_pending: Vec::new(),
             })));
             slot
         };
@@ -5336,6 +5360,14 @@ impl NetWorkerContext {
                 output: None,
             });
         self.turn_control_meta.push(TurnControlMeta::Dhcp);
+        // IPv6 Router Solicitation（发现路由器）。
+        self.turn_control_commands
+            .0
+            .push(NetStackControlCommand::RunRouterSolicit {
+                now_ns,
+                output: None,
+            });
+        self.turn_control_meta.push(TurnControlMeta::RouterSolicit);
     }
 
     fn finish_dad_turn(&mut self, output: net::stack::DadRunOutput) -> Option<u64> {
@@ -5358,20 +5390,28 @@ impl NetWorkerContext {
         {
             return;
         }
+        // SLAAC 前缀长度（RA 排队的地址）；link-local 回退 64。
+        let prefix_len = self
+            .slaac_pending
+            .iter()
+            .position(|(candidate, entry, _)| *candidate == interface && *entry == address)
+            .map(|index| {
+                let (_, _, prefix_len) = self.slaac_pending.remove(index);
+                prefix_len
+            })
+            .unwrap_or(64);
         let mut addresses = current.addresses.clone();
         addresses.push(AddressEntry {
             interface,
             address: IpAddr::V6(address),
-            prefix_len: 64,
+            prefix_len,
             primary: true,
         });
         let mut routes = current.routes.entries().to_vec();
         routes.push(RouteEntry {
             table: 0,
-            network: IpAddr::V6(Ipv6Addr([
-                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ])),
-            prefix_len: 64,
+            network: IpAddr::V6(ipv6_network(address, prefix_len)),
+            prefix_len,
             gateway: None,
             interface,
             metric: 0,
@@ -5381,6 +5421,225 @@ impl NetWorkerContext {
                 .find(|entry| entry.id == interface)
                 .map(|entry| entry.mtu),
         });
+        if let Ok(next) = ConfigSnapshot::new_with_dns(
+            current.generation.saturating_add(1),
+            current.interfaces.clone(),
+            addresses,
+            routes,
+            current.policy.clone(),
+            current.dns_servers.clone(),
+        ) {
+            if self.config.publish(next).is_ok() {
+                self.emit_interface_multicast_reports(interface);
+            }
+        }
+    }
+
+    fn finish_router_solicit_turn(
+        &mut self,
+        output: net::stack::RouterSolicitRunOutput,
+        config: &ConfigSnapshot,
+    ) -> Option<u64> {
+        for interface in output.probes {
+            if let Some(frame) = build_router_solicitation(interface, config) {
+                self.emit_control_frame(interface, frame);
+            }
+        }
+        // 路由器过期回收与 RS 重试 deadline 合并。
+        let expiry = self.expire_router_states(config, sched::now_ns_direct());
+        match (output.next_deadline_ns, expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// 路由器生命周期过期：移除默认路由与 SLAAC 地址。
+    fn expire_router_states(&mut self, config: &ConfigSnapshot, now_ns: u64) -> Option<u64> {
+        let mut next = None;
+        let mut changed = false;
+        let current = self.config.snapshot();
+        let mut addresses = current.addresses.clone();
+        let mut routes = current.routes.entries().to_vec();
+        let interface_mtu = |interface: InterfaceId| -> u32 {
+            config
+                .interfaces
+                .iter()
+                .find(|entry| entry.id == interface)
+                .map(|entry| entry.mtu)
+                .unwrap_or(1500)
+        };
+        let mut index = 0;
+        while index < self.router_states.len() {
+            let state = &self.router_states[index];
+            if state.expires_ns != 0 && state.expires_ns > now_ns {
+                next = Some(next.map_or(state.expires_ns, |n: u64| n.min(state.expires_ns)));
+                index += 1;
+                continue;
+            }
+            let default = RouteEntry {
+                table: 0,
+                network: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                prefix_len: 0,
+                gateway: Some(IpAddr::V6(state.router)),
+                interface: state.interface,
+                metric: 100,
+                mtu: Some(interface_mtu(state.interface)),
+            };
+            if let Some(route_index) = routes.iter().rposition(|route| *route == default) {
+                routes.remove(route_index);
+            }
+            if let Some((address, prefix_len)) = state.slaac_address {
+                let entry = AddressEntry {
+                    interface: state.interface,
+                    address: IpAddr::V6(address),
+                    prefix_len,
+                    primary: true,
+                };
+                if let Some(address_index) =
+                    addresses.iter().rposition(|candidate| *candidate == entry)
+                {
+                    addresses.remove(address_index);
+                }
+                let onlink = RouteEntry {
+                    table: 0,
+                    network: IpAddr::V6(ipv6_network(address, prefix_len)),
+                    prefix_len,
+                    gateway: None,
+                    interface: state.interface,
+                    metric: 0,
+                    mtu: Some(interface_mtu(state.interface)),
+                };
+                if let Some(route_index) = routes.iter().rposition(|route| *route == onlink) {
+                    routes.remove(route_index);
+                }
+            }
+            self.router_states.remove(index);
+            changed = true;
+        }
+        if changed
+            && let Ok(snapshot) = ConfigSnapshot::new_with_dns(
+                current.generation.saturating_add(1),
+                current.interfaces.clone(),
+                addresses,
+                routes,
+                current.policy.clone(),
+                current.dns_servers.clone(),
+            )
+        {
+            let _ = self.config.publish(snapshot);
+        }
+        next
+    }
+
+    /// 处理 Router Advertisement：安装默认路由、on-link 前缀路由，
+    /// 计算 SLAAC 地址并排队 DAD。
+    fn finish_router_advertisement(
+        &mut self,
+        interface: InterfaceId,
+        output: net::stack::RouterAdvertisementOutput,
+        config: &ConfigSnapshot,
+        now_ns: u64,
+    ) {
+        if output.router.is_unspecified() {
+            return;
+        }
+        let expires_ns = if output.lifetime_seconds == 0 {
+            0
+        } else {
+            now_ns.saturating_add(u64::from(output.lifetime_seconds).saturating_mul(1_000_000_000))
+        };
+        let slaac_prefix = output.prefixes.iter().find_map(|prefix| {
+            (prefix.autonomous && prefix.valid_seconds != 0)
+                .then_some((prefix.prefix, prefix.prefix_len))
+        });
+        let state = match self
+            .router_states
+            .iter_mut()
+            .find(|state| state.interface == interface && state.router == output.router)
+        {
+            Some(state) => state,
+            None => {
+                self.router_states.push(RouterState {
+                    interface,
+                    router: output.router,
+                    mac: output.mac,
+                    expires_ns,
+                    slaac_prefix,
+                    slaac_address: None,
+                });
+                self.router_states.last_mut().unwrap()
+            }
+        };
+        state.mac = output.mac.or(state.mac);
+        state.expires_ns = expires_ns;
+        state.slaac_prefix = slaac_prefix.or(state.slaac_prefix);
+        let interface_mtu = config
+            .interfaces
+            .iter()
+            .find(|entry| entry.id == interface)
+            .map(|entry| entry.mtu)
+            .unwrap_or(1500);
+        let current = self.config.snapshot();
+        let mut addresses = current.addresses.clone();
+        let mut routes = current.routes.entries().to_vec();
+        let default = RouteEntry {
+            table: 0,
+            network: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            prefix_len: 0,
+            gateway: Some(IpAddr::V6(output.router)),
+            interface,
+            metric: 100,
+            mtu: Some(interface_mtu),
+        };
+        if output.lifetime_seconds != 0 {
+            if !routes.contains(&default) {
+                routes.push(default);
+            }
+        } else if let Some(index) = routes.iter().rposition(|route| *route == default) {
+            routes.remove(index);
+        }
+        for prefix in &output.prefixes {
+            if prefix.onlink || prefix.autonomous {
+                let onlink_route = RouteEntry {
+                    table: 0,
+                    network: IpAddr::V6(ipv6_network(prefix.prefix, prefix.prefix_len)),
+                    prefix_len: prefix.prefix_len,
+                    gateway: None,
+                    interface,
+                    metric: 0,
+                    mtu: Some(interface_mtu),
+                };
+                if !routes.contains(&onlink_route) {
+                    routes.push(onlink_route);
+                }
+            }
+            if prefix.autonomous
+                && prefix.valid_seconds != 0
+                && let Some(snapshot) = config.interfaces.iter().find(|entry| entry.id == interface)
+            {
+                let address = slaac_address(prefix.prefix, prefix.prefix_len, snapshot.mac_address);
+                let present = addresses.iter().any(|entry| {
+                    entry.interface == interface && entry.address == IpAddr::V6(address)
+                }) || self
+                    .slaac_pending
+                    .iter()
+                    .any(|(candidate, entry, _)| *candidate == interface && *entry == address);
+                if !present {
+                    self.slaac_pending
+                        .push((interface, address, prefix.prefix_len));
+                    // 下一轮 autoconfig turn 执行 DAD。
+                    self.turn_control_commands
+                        .0
+                        .push(NetStackControlCommand::AddDadState {
+                            interface,
+                            address,
+                            now_ns: sched::now_ns_direct(),
+                            output: None,
+                        });
+                    self.turn_control_meta.push(TurnControlMeta::AddDadState);
+                }
+            }
+        }
         if let Ok(next) = ConfigSnapshot::new_with_dns(
             current.generation.saturating_add(1),
             current.interfaces.clone(),
@@ -5964,6 +6223,36 @@ impl NetWorkerContext {
                             .flatten()
                             .min();
                     }
+                    (
+                        NetStackControlCommand::RunRouterSolicit {
+                            output: Some(output),
+                            ..
+                        },
+                        TurnControlMeta::RouterSolicit,
+                    ) => {
+                        control_deadline = [
+                            control_deadline,
+                            self.finish_router_solicit_turn(output, config),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min();
+                    }
+                    (
+                        NetStackControlCommand::HandleRouterAdvertisement {
+                            output: Some(output),
+                            ..
+                        },
+                        TurnControlMeta::RouterAdvertisement { interface },
+                    ) => {
+                        self.finish_router_advertisement(
+                            interface,
+                            output,
+                            config,
+                            sched::now_ns_direct(),
+                        );
+                    }
+                    (NetStackControlCommand::AddDadState { .. }, TurnControlMeta::AddDadState) => {}
                     (
                         NetStackControlCommand::ObserveDadConflict { .. },
                         TurnControlMeta::DadConflict,
@@ -7457,23 +7746,47 @@ impl NetWorkerContext {
             .parsed
             .udp
             .is_some_and(|udp| udp.source_port == 67 && udp.destination_port == 68);
-        if !is_dhcp_reply {
-            self.frontend_packets.push(packet);
+        if is_dhcp_reply {
+            self.turn_control_commands
+                .0
+                .push(NetStackControlCommand::HandleDhcpPacket {
+                    interface,
+                    packet: Some(packet),
+                    now_ns: sched::now_ns_direct(),
+                    output: None,
+                });
+            self.turn_control_meta.push(TurnControlMeta::DhcpPacket {
+                egress,
+                interface,
+                local_mac,
+            });
             return;
         }
-        self.turn_control_commands
-            .0
-            .push(NetStackControlCommand::HandleDhcpPacket {
-                interface,
-                packet: Some(packet),
-                now_ns: sched::now_ns_direct(),
-                output: None,
-            });
-        self.turn_control_meta.push(TurnControlMeta::DhcpPacket {
-            egress,
-            interface,
-            local_mac,
+        // IPv6 Router Advertisement（ICMPv6 type 134）→ 控制面解析（SLAAC/默认路由）。
+        let mut ra_type = [0u8; 1];
+        let is_router_advertisement = packet.parsed.ip.is_some_and(|ip| {
+            ip.next_header == 58
+                && ip.payload_len >= 16
+                && packet
+                    .chain
+                    .copy_out(usize::from(ip.payload_offset), &mut ra_type)
+                    .is_ok()
+                && ra_type[0] == 134
         });
+        if is_router_advertisement {
+            self.turn_control_commands
+                .0
+                .push(NetStackControlCommand::HandleRouterAdvertisement {
+                    interface,
+                    packet: Some(packet),
+                    now_ns: sched::now_ns_direct(),
+                    output: None,
+                });
+            self.turn_control_meta
+                .push(TurnControlMeta::RouterAdvertisement { interface });
+            return;
+        }
+        self.frontend_packets.push(packet);
     }
 
     fn queue_frontend_batch(
@@ -7925,6 +8238,82 @@ fn unspecified_address(family: AddressFamily) -> IpAddr {
         AddressFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         AddressFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     }
+}
+
+/// 计算 SLAAC 地址：前缀 + EUI-64 IID（翻转 U/L 位，插入 ff:fe）。
+fn slaac_address(prefix: Ipv6Addr, prefix_len: u8, mac: [u8; 6]) -> Ipv6Addr {
+    let mut iid = [0u8; 8];
+    iid[0] = mac[0] ^ 0x02;
+    iid[1] = mac[1];
+    iid[2] = mac[2];
+    iid[3] = 0xff;
+    iid[4] = 0xfe;
+    iid[5] = mac[3];
+    iid[6] = mac[4];
+    iid[7] = mac[5];
+    let mut bytes = [0u8; 16];
+    bytes[8..16].copy_from_slice(&iid);
+    let prefix_bits = u128::from_be_bytes(prefix.0);
+    let iid_bits = u128::from_be_bytes(bytes);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix_len))
+    };
+    Ipv6Addr(((prefix_bits & mask) | (iid_bits & !mask)).to_be_bytes())
+}
+
+fn ipv6_network(address: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
+    let bits = u128::from_be_bytes(address.0);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix_len))
+    };
+    Ipv6Addr((bits & mask).to_be_bytes())
+}
+
+/// Router Solicitation（ICMPv6 type 133，目的 ff02::2）。
+fn build_router_solicitation(interface: InterfaceId, config: &ConfigSnapshot) -> Option<Vec<u8>> {
+    let snapshot = config
+        .interfaces
+        .iter()
+        .find(|entry| entry.id == interface)?;
+    let Some(IpAddr::V6(source)) = config.addresses.iter().find_map(|entry| {
+        (entry.interface == interface && matches!(entry.address, IpAddr::V6(_)))
+            .then_some(entry.address)
+    }) else {
+        return None;
+    };
+    let mut frame = alloc::vec![0; 14 + 40 + 16];
+    // ff02::2 的组播 MAC：33:33:00:00:00:02。
+    frame[0..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 0x02]);
+    frame[6..12].copy_from_slice(&snapshot.mac_address);
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    frame[18..20].copy_from_slice(&16u16.to_be_bytes());
+    frame[20] = 58;
+    frame[21] = 255;
+    frame[22..38].copy_from_slice(&source.0);
+    frame[38..54].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    frame[54] = 133;
+    // 选项：源链路层地址（type 1，len 1）。
+    frame[62] = 1;
+    frame[63] = 1;
+    frame[64..70].copy_from_slice(&snapshot.mac_address);
+    let chain = PacketChain::from_owned(frame.clone());
+    let destination = Ipv6Addr([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    let checksum = net::pipeline::transport_checksum(
+        &chain,
+        54,
+        16,
+        IpAddr::V6(source),
+        IpAddr::V6(destination),
+        58,
+    )
+    .ok()?;
+    frame[56..58].copy_from_slice(&checksum.to_be_bytes());
+    Some(frame)
 }
 
 fn build_neighbor_probe(
