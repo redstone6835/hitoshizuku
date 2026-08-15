@@ -565,6 +565,9 @@ impl MountNamespace {
             parent.remove_child(&mount);
         }
         drop(data);
+        // fsnotify：被卸载文件系统上的全部监视收到 IN_UNMOUNT 并被移除。
+        let sb_id = mount.superblock.fs_id.raw();
+        crate::fsnotify::unmount_sb(sb_id);
         Ok(())
     }
 

@@ -3017,16 +3017,72 @@ pub(super) fn sys_lookup_dcookie(_ctx: &mut SyscallContext<'_>) -> Result<usize,
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_inotify_init1(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_inotify_init1(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // IN_CLOEXEC = O_CLOEXEC、IN_NONBLOCK = O_NONBLOCK（Linux 语义）。
+    const IN_NONBLOCK: usize = O_NONBLOCK;
+    const IN_CLOEXEC: usize = O_CLOEXEC;
+    let flags = ctx.args[0];
+    if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fd = vfs::inotify::create(
+        &fdt,
+        vfs_ctx.cred(),
+        (flags & IN_NONBLOCK) != 0,
+        (flags & IN_CLOEXEC) != 0,
+    )?;
+    Ok(fd.as_raw() as usize)
 }
 
-pub(super) fn sys_inotify_add_watch(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_inotify_add_watch(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    use vfs::fsnotify::*;
+    let fd = fd_arg(ctx.args[0])?;
+    let path = copy_path_from_user(ctx.args[1])?;
+    let mask = ctx.args[2] as u32;
+    if mask & !IN_ADD_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // 至少包含一个事件位（Linux 语义）。
+    const IN_EVENT_BITS: u32 = IN_ACCESS
+        | IN_MODIFY
+        | IN_ATTRIB
+        | IN_CLOSE_WRITE
+        | IN_CLOSE_NOWRITE
+        | IN_OPEN
+        | IN_MOVED_FROM
+        | IN_MOVED_TO
+        | IN_CREATE
+        | IN_DELETE
+        | IN_DELETE_SELF
+        | IN_MOVE_SELF
+        | IN_UNMOUNT;
+    if mask & IN_EVENT_BITS == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let file = file_for_fd(fd)?;
+    let instance = vfs::inotify::instance_from_file(&file).ok_or(Errno::EINVAL)?;
+    let no_follow = (mask & IN_DONT_FOLLOW) != 0;
+    let onlydir = (mask & IN_ONLYDIR) != 0;
+    let inode =
+        operation::lookup_watch_inode(&vfs_ctx, &Dirfd::Cwd, &path, no_follow, onlydir)
+            .map_err(|e| e.to_errno())?;
+    let watch_mask = mask & IN_EVENT_BITS;
+    let watch_flags = mask & (IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | IN_ONESHOT);
+    let wd = instance.add_watch(&inode, watch_mask, watch_flags)?;
+    Ok(wd as usize)
 }
 
-pub(super) fn sys_inotify_rm_watch(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_inotify_rm_watch(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let wd = ctx.args[1] as i32;
+    let file = file_for_fd(fd)?;
+    let instance = vfs::inotify::instance_from_file(&file).ok_or(Errno::EINVAL)?;
+    instance.rm_watch(wd)?;
+    Ok(0)
 }
 
 pub(super) fn sys_ioprio_set(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

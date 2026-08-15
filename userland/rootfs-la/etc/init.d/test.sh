@@ -38,6 +38,12 @@ if [ -x /bin/pthread-smp-test ]; then
     status=$?
     echo "[init][smp-tests] pthread SMP tests exit=$status"
 fi
+if [ -x /bin/inotify-test ]; then
+    echo "[init][fs-tests] running inotify tests"
+    /bin/inotify-test
+    status=$?
+    echo "[init][fs-tests] inotify tests exit=$status"
+fi
 if [ -x /bin/xattr-test ]; then
     echo "[init][fs-tests] running xattr tests"
     /bin/xattr-test

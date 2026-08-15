@@ -256,6 +256,9 @@ pub fn openat_with_lookup_flags(
                 .ops
                 .create(&parent_inode, name, effective_mode, &cred)?;
             install_child_acl(&new_inode, child_acl);
+            // fsnotify：父目录 IN_CREATE（带名字）+ 新文件 IN_OPEN。
+            crate::fsnotify::emit_named(&parent_inode, &new_inode, crate::fsnotify::IN_CREATE, name.as_bytes(), 0);
+            crate::fsnotify::emit(&new_inode, crate::fsnotify::IN_OPEN, 0);
 
             let canonical = cache_new_inode(&parent_dentry, name, new_inode);
 
@@ -265,6 +268,7 @@ pub fn openat_with_lookup_flags(
     };
 
     let inode = dentry.inode().ok_or(VfsError::NotFound)?;
+    crate::fsnotify::emit(&inode, crate::fsnotify::IN_OPEN, 0);
 
     // ── 类型检查 ──
     if flags.directory && inode.kind != stat::FileType::Directory {
@@ -419,6 +423,7 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
         .ops
         .mkdir(&parent_inode, name, effective_mode, &cred)?;
     install_child_acl(&new_inode, child_acl);
+    crate::fsnotify::emit_named(&parent_inode, &new_inode, crate::fsnotify::IN_CREATE, name.as_bytes(), 0);
 
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())
@@ -460,6 +465,8 @@ pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.rmdir(&parent_inode, name, &child_inode)?;
+    // fsnotify：父目录 IN_DELETE（目录），被删目录自身 IN_DELETE_SELF。
+    crate::fsnotify::emit_named(&parent_inode, &child_inode, crate::fsnotify::IN_DELETE, name.as_bytes(), 0);
     // 常见空目录只逐出根键；若失败 lookup 留下负向子项，则一并清掉这些不可达引用，
     // 否则它们会长期保活 nlink=0 的 inode，导致磁盘位图和目录计数无法回收。
     DCACHE.invalidate_removed_directory(&target.dentry);
@@ -501,6 +508,8 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.unlink(&parent_inode, name, &child_inode)?;
+    // fsnotify：父目录 IN_DELETE（带名字），被删文件自身 IN_DELETE_SELF。
+    crate::fsnotify::emit_named(&parent_inode, &child_inode, crate::fsnotify::IN_DELETE, name.as_bytes(), 0);
     unregister_socket_inode(&child_inode);
     DCACHE.invalidate_dentry(&target.dentry);
     target.dentry.invalidate();
@@ -617,6 +626,11 @@ pub fn renameat(
         }
         retire_inode(replaced_inode);
     }
+    // fsnotify：MOVED_FROM/MOVED_TO 配对同一 cookie（+ MOVE_SELF）。
+    let cookie = crate::fsnotify::next_cookie();
+    crate::fsnotify::emit_named(&old_parent_inode, &old_inode, crate::fsnotify::IN_MOVED_FROM, old_name.as_bytes(), cookie);
+    // TO 侧不再投递 MOVE_SELF（避免重复；Linux 每个 rename 只发一次）。
+    crate::fsnotify::emit_named_no_self(&new_parent_inode, crate::fsnotify::IN_MOVED_TO, new_name.as_bytes(), cookie);
     Ok(())
 }
 
@@ -725,6 +739,7 @@ fn chmod_inode(ctx: &VfsContext, inode: &Arc<Inode>, mut mode: FileMode) -> VfsR
     }
 
     inode.ops.chmod(inode, mode)?;
+    crate::fsnotify::emit(inode, crate::fsnotify::IN_ATTRIB, 0);
     // POSIX ACL 同步：chmod 的组权限位写入 ACL mask（Linux 语义）。
     if inode.has_xattrs() {
         if let Ok(Some(bytes)) = inode.ops.getxattr(crate::acl::ACL_ACCESS_XATTR) {
@@ -840,6 +855,7 @@ fn chown_inode(
             inode.ops.chmod(inode, new_mode)?;
         }
     }
+    crate::fsnotify::emit(inode, crate::fsnotify::IN_ATTRIB, 0);
 
     Ok(())
 }
@@ -1044,6 +1060,7 @@ pub fn symlinkat(ctx: &VfsContext, target: &str, dirfd: &Dirfd, link_path: &str)
     let new_inode = parent_inode
         .ops
         .symlink(&parent_inode, name, target, &cred)?;
+    crate::fsnotify::emit_named(&parent_inode, &new_inode, crate::fsnotify::IN_CREATE, name.as_bytes(), 0);
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())
 }
@@ -1079,6 +1096,7 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
     };
     let _data_mutation = inode.begin_data_mutation();
     inode.ops.truncate(&inode, size)?;
+    crate::fsnotify::emit(&inode, crate::fsnotify::IN_MODIFY, 0);
     Ok(())
 }
 
@@ -1136,7 +1154,30 @@ fn utimens_inode(
     {
         return Err(VfsError::PermissionDenied);
     }
-    inode.ops.utimes(inode, atime, mtime)
+    inode.ops.utimes(inode, atime, mtime)?;
+    crate::fsnotify::emit(inode, crate::fsnotify::IN_ATTRIB, 0);
+    Ok(())
+}
+
+// ── inotify 辅助 ───────────────────────────────────────────────────────────────
+
+/// `inotify_add_watch` 的路径解析（`IN_DONT_FOLLOW`/`IN_ONLYDIR`）。
+pub fn lookup_watch_inode(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+    no_follow: bool,
+    onlydir: bool,
+) -> VfsResult<Arc<Inode>> {
+    let mut flags = LookupFlags::default();
+    if no_follow {
+        flags = flags.with(LookupFlags::NO_FOLLOW);
+    }
+    if onlydir {
+        flags = flags.with(LookupFlags::DIRECTORY);
+    }
+    let result = path::lookup(ctx, dirfd, path, flags)?;
+    result.dentry.inode().ok_or(VfsError::NotFound)
 }
 
 // ── xattr ─────────────────────────────────────────────────────────────────────
@@ -1344,6 +1385,11 @@ pub fn linkat(
     new_parent_inode
         .ops
         .link(&new_parent_inode, &old_inode, new_name)?;
+    // fsnotify：新父目录 IN_CREATE（带名字）；目标 inode IN_ATTRIB
+    // （nlink 变化）；EXCL_UNLINK 失效监视恢复。
+    crate::fsnotify::emit_named(&new_parent_inode, &old_inode, crate::fsnotify::IN_CREATE, new_name.as_bytes(), 0);
+    crate::fsnotify::emit(&old_inode, crate::fsnotify::IN_ATTRIB, 0);
+    crate::fsnotify::rearm(&old_inode);
 
     let new_dentry = dentry::Dentry::new_positive(
         new_name,
@@ -1403,6 +1449,7 @@ pub fn mknodat(
             .ops
             .mknod(&parent_inode, name, kind, effective_mode, dev, &cred)?;
     install_child_acl(&new_inode, child_acl);
+    crate::fsnotify::emit_named(&parent_inode, &new_inode, crate::fsnotify::IN_CREATE, name.as_bytes(), 0);
 
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())

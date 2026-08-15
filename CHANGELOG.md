@@ -2,6 +2,8 @@
 
 ## 2026-08-15
 ### feat/fs-time-full
+- `feat(vfs)`：inotify 全套——fsnotify 事件核心（libs/vfs/src/fsnotify.rs：inode 监视注册表 `(fs_id,ino)`→Weak<Watch>、全局原子门控零开销、ONESHOT/EXCL_UNLINK/IGNORED 语义、DELETE_SELF 移除、rename cookie 配对、unmount 全量 IN_UNMOUNT）+ inotify 实例（libs/vfs/src/inotify.rs：wd 分配/复用、IN_MASK_ADD 合并、16384 队列上限 + Q_OVERFLOW、read EINVAL/EAGAIN、PollSource 等待、fdinfo watch 列表）+ 3 syscall（init1/add_watch/rm_watch）+ 全部注入点（open/close/read/write/pread/pwrite/truncate/chmod/chown/utimens/unlink/rmdir/rename/mkdir/mknod/symlink/link/umount）+ `/proc/self/fdinfo/<fd>` 基础设施（FileOps::show_fdinfo 默认方法 + procfs fdinfo 目录）
+- `test(vfs)`：宿主单测 10 个（掩码过滤/MASK_ADD/ONESHOT/队列溢出/read 语义/DELETE_SELF/EXCL_UNLINK/cookie 配对/ONLYDIR）+ QEMU 运行时自测 ALL PASS（userland/tests/inotify_test.c：12 事件全序列断言 + fdinfo + rm_watch + ONESHOT）
 - `feat(vfs)`：扩展属性（xattr）全套与 POSIX ACL——16 个 syscall（set/get/list/removexattr × path/l/fd + set/get/list/removexattrat 带 AT_EMPTY_PATH/NOFOLLOW）；VFS 语义层（user./trusted./security./system.posix_acl_* 命名空间、权限模型、目录 sticky 规则、XATTR_CREATE/REPLACE、ERANGE/E2BIG/ENODATA）；POSIX ACL 二进制格式（version 2 + tag/perm/id 条目）、校验、`posix_acl_permission` 强制（能力绕过优先）与 `posix_acl_create`（default ACL 派生 + mode 调整）；extfs 用 ext4 兼容 xattr 块（magic 0xea020000、name_index 1/2/3/4/6、值区块尾分配、i_file_acl 读写）；tmpfs 用内存表；chmod↔ACL mask 双向同步；创建路径继承 default ACL
 - `test(vfs)`：宿主单测 + QEMU 运行时自测（userland/tests/xattr_test.c，tmpfs 后端 ALL PASS，覆盖权限模型/ACL/默认 ACL/双向同步）
 

@@ -221,6 +221,7 @@ ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 PTHREAD_SMP_TEST_SRC := userland/tests/pthread_smp.c
 ACCT_TEST_SRC := userland/tests/acct.c
 XATTR_TEST_SRC := userland/tests/xattr_test.c
+INOTIFY_TEST_SRC := userland/tests/inotify_test.c
 SYSCALL_BENCH_SRC := userland/tests/syscall_bench.c
 MM_BENCH_SRC := userland/tests/mm_fault_bench.c
 RISCV_WEIGHT_SRC := userland/tests/riscv_instruction_weight_probe.c
@@ -412,8 +413,12 @@ define build_fs_tests
 	mkdir -p $(BUILD_DIR)/$(1)/fs-user $(2)/bin; \
 	$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
 		$(XATTR_TEST_SRC) -o $(BUILD_DIR)/$(1)/fs-user/xattr-test; \
+	$(3)gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		$(INOTIFY_TEST_SRC) -o $(BUILD_DIR)/$(1)/fs-user/inotify-test; \
 	$(3)strip $(BUILD_DIR)/$(1)/fs-user/xattr-test || true; \
-	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/xattr-test $(2)/bin/;
+	$(3)strip $(BUILD_DIR)/$(1)/fs-user/inotify-test || true; \
+	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/xattr-test $(2)/bin/; \
+	install -m 0755 $(BUILD_DIR)/$(1)/fs-user/inotify-test $(2)/bin/;
 endef
 
 define build_loongarch_sxe_tests

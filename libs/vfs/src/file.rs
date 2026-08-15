@@ -589,6 +589,16 @@ impl File {
         StatusFlags(self.status_flags.load(Ordering::Acquire)).apply(self.flags)
     }
 
+    /// 当前状态标志（O_APPEND/O_NONBLOCK/O_DIRECT 等，fdinfo 输出用）。
+    pub fn status_flags(&self) -> u32 {
+        self.status_flags.load(Ordering::Acquire)
+    }
+
+    /// `/proc/self/fdinfo/<fd>` 驱动专属行（默认无）。
+    pub fn show_fdinfo(&self, out: &mut alloc::string::String) {
+        self.ops.show_fdinfo(out);
+    }
+
     pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool, direct: bool) {
         let mut bits = 0u32;
         if append {
@@ -686,6 +696,9 @@ impl File {
             .store(offset.saturating_add(n as u64), Ordering::Release);
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
+        if n > 0 && crate::fsnotify::is_enabled() {
+            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_ACCESS, 0);
+        }
         Ok(n)
     }
 
@@ -706,7 +719,7 @@ impl File {
         }
         let _pos_guard = self.pos_lock.lock();
         let _data_mutation = (!buf.is_empty()).then(|| self.inode.begin_data_mutation());
-        if flags.append {
+        let result = if flags.append {
             let n = self.ops.write_at(buf, u64::MAX)?;
             let new_eof = self.inode.size();
             self.pos.store(new_eof, Ordering::Release);
@@ -721,7 +734,11 @@ impl File {
             #[cfg(feature = "performance-profile")]
             profile.set_bytes(n);
             Ok(n)
+        };
+        if result.is_ok() && !buf.is_empty() && crate::fsnotify::is_enabled() {
+            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_MODIFY, 0);
         }
+        result
     }
 
     /// 在指定偏移量处读取，不改变描述符的当前偏移量（`pread64`）。
@@ -743,6 +760,9 @@ impl File {
         let n = self.ops.read_at(buf, offset)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
+        if n > 0 && crate::fsnotify::is_enabled() {
+            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_ACCESS, 0);
+        }
         Ok(n)
     }
 
@@ -792,6 +812,9 @@ impl File {
         let n = self.ops.write_at(buf, offset)?;
         #[cfg(feature = "performance-profile")]
         profile.set_bytes(n);
+        if n > 0 && crate::fsnotify::is_enabled() {
+            crate::fsnotify::emit(&self.inode, crate::fsnotify::IN_MODIFY, 0);
+        }
         Ok(n)
     }
 
@@ -1025,7 +1048,16 @@ impl File {
     }
 
     pub fn on_fd_closed(&self, fd: u32) {
-        self.ops.on_fd_closed(fd)
+        self.ops.on_fd_closed(fd);
+        // fsnotify：每次 close 投递 IN_CLOSE_WRITE / IN_CLOSE_NOWRITE。
+        if crate::fsnotify::is_enabled() {
+            let mask = if self.flags().writable() {
+                crate::fsnotify::IN_CLOSE_WRITE
+            } else {
+                crate::fsnotify::IN_CLOSE_NOWRITE
+            };
+            crate::fsnotify::emit(&self.inode, mask, 0);
+        }
     }
 
     pub fn on_file_description_closed(&self, file: &Arc<File>) {
@@ -1282,6 +1314,12 @@ pub trait FileOps {
     /// 与 `Inode::evict` 的区别：`release` 在每次最终 `close`（Arc 计数归零）
     /// 时调用；`evict` 只在 inode 引用计数降至零时调用一次。
     fn release(&self);
+
+    /// 输出 `/proc/self/fdinfo/<fd>` 的驱动专属行（默认无）。
+    ///
+    /// 调用方（procfs）先写出 pos/flags/mnt_id 等通用行，再调用本方法追加
+    /// 驱动行（如 inotify 的 watch 列表、fanotify 的 marks）。
+    fn show_fdinfo(&self, _out: &mut alloc::string::String) {}
 
     /// 返回 `self` 的 `&dyn Any` 引用，用于向下转型到具体驱动类型。
     ///
