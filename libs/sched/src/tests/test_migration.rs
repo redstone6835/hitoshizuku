@@ -55,23 +55,19 @@ fn migration_context(generation: u64) -> MigrationContext {
 #[ktest]
 fn migration_rejects_stale_topology_generation() {
     let context = migration_context(4);
-    let topology = TopologySnapshot {
-        topology: SchedTopology::bootstrap(),
-        generation: 5,
-        active: CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
-    };
+    let topology = TopologySnapshot::for_test(
+        SchedTopology::bootstrap(),
+        5,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+    );
 
-    assert!(validate_migration_target(context, topology, CpuMask::SUPPORTED).is_err());
+    assert!(validate_migration_target(context, &topology, CpuMask::SUPPORTED).is_err());
 }
 
 #[ktest]
 fn migration_rejects_offline_target_cpu() {
     let context = migration_context(4);
-    let topology = TopologySnapshot {
-        topology: SchedTopology::bootstrap(),
-        generation: 4,
-        active: CpuMask::BOOT,
-    };
+    let topology = TopologySnapshot::for_test(SchedTopology::bootstrap(), 4, CpuMask::BOOT);
 
-    assert!(validate_migration_target(context, topology, CpuMask::SUPPORTED).is_err());
+    assert!(validate_migration_target(context, &topology, CpuMask::SUPPORTED).is_err());
 }

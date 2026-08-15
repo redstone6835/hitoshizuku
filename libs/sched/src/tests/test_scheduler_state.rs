@@ -281,6 +281,21 @@ fn scheduler_state_installs_topology_and_online_cpu_together() {
 }
 
 #[ktest]
+fn topology_snapshots_share_immutable_storage_until_replacement() {
+    let core = Scheduler::new();
+    let first = core.topology_snapshot();
+    let second = core.topology_snapshot();
+    assert!(first.shares_topology_storage_with(&second));
+
+    core.install_topology(SchedTopology::with_cpu_domains());
+    let replacement = core.topology_snapshot();
+
+    assert!(!first.shares_topology_storage_with(&replacement));
+    assert_eq!(first.topology(), &SchedTopology::bootstrap());
+    assert_eq!(replacement.topology(), &SchedTopology::with_cpu_domains());
+}
+
+#[ktest]
 fn scheduler_state_deactivates_cpu_before_removing_online_state() {
     let scheduler = two_cpu_scheduler();
     let cpu1 = CpuId::new(1).expect("cpu1");
@@ -745,6 +760,6 @@ fn two_cpu_scheduler() -> Scheduler {
 fn bind_to_cpu(scheduler: &Scheduler, task: &crate::Task, cpu_id: usize) {
     let cpu = CpuId::new(cpu_id).expect("cpu");
     let snapshot = scheduler.topology_snapshot();
-    let domain = snapshot.topology.domain_for_cpu(cpu).expect("cpu domain");
+    let domain = snapshot.topology().domain_for_cpu(cpu).expect("cpu domain");
     task.bind_placement(cpu, domain.id(), snapshot.generation);
 }

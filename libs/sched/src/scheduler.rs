@@ -333,9 +333,9 @@ fn bind_task_to_cpu_on(scheduler: &crate::Scheduler, task: &Task, cpu_id: usize)
     }
     let snapshot = scheduler.topology_snapshot();
     let domain_id = snapshot
-        .topology
+        .topology()
         .domain_for_cpu(cpu)
-        .unwrap_or_else(|| snapshot.topology.root_domain())
+        .unwrap_or_else(|| snapshot.topology().root_domain())
         .id();
     task.bind_placement(cpu, domain_id, snapshot.generation);
 }
@@ -924,7 +924,7 @@ fn active_cpu_set() -> CpuMask {
 }
 
 pub(crate) fn cpu_capacity(cpu: CpuId) -> u64 {
-    SCHEDULER.topology_snapshot().topology.cpu_capacity(cpu)
+    SCHEDULER.topology_snapshot().topology().cpu_capacity(cpu)
 }
 
 pub(crate) fn deadline_admission() -> &'static DeadlineAdmission {
@@ -972,9 +972,9 @@ pub(crate) fn refresh_task_placement(scheduler: &crate::Scheduler, task: &Task) 
         return false;
     }
     let domain_id = snapshot
-        .topology
+        .topology()
         .domain_for_cpu(cpu)
-        .unwrap_or_else(|| snapshot.topology.root_domain())
+        .unwrap_or_else(|| snapshot.topology().root_domain())
         .id();
     if source.topology_generation == snapshot.generation && source.domain_id == domain_id {
         return true;
@@ -1235,12 +1235,12 @@ pub(crate) fn offline_cpu_with_scheduler(
                 .iter()
                 .filter(|target| {
                     planned_deadline[target.get()].saturating_add(deadline_utilization)
-                        <= snapshot.topology.cpu_capacity(*target)
+                        <= snapshot.topology().cpu_capacity(*target)
                 })
                 .min_by_key(|target| planned_load.load_of(*target))
         } else {
             snapshot
-                .topology
+                .topology()
                 .select_cpu(allowed, snapshot.active, None, false, |target| {
                     planned_load.load_of(target)
                 })
@@ -1257,9 +1257,9 @@ pub(crate) fn offline_cpu_with_scheduler(
                 planned_deadline[target_cpu.get()].saturating_add(deadline_utilization);
         }
         let target_domain = snapshot
-            .topology
+            .topology()
             .domain_for_cpu(target_cpu)
-            .unwrap_or_else(|| snapshot.topology.root_domain())
+            .unwrap_or_else(|| snapshot.topology().root_domain())
             .id();
         tasks.push(CpuOfflineTask {
             task: Arc::clone(task),
@@ -1280,7 +1280,7 @@ pub(crate) fn offline_cpu_with_scheduler(
     }
 
     for (index, item) in tasks.iter().enumerate() {
-        let capacity = snapshot.topology.cpu_capacity(item.target_cpu);
+        let capacity = snapshot.topology().cpu_capacity(item.target_cpu);
         if scheduler
             .deadline_admission()
             .migrate(&item.task, cpu, item.target_cpu, capacity, || {
@@ -2567,9 +2567,9 @@ fn migration_context(
         return Err(errno::Errno::EAGAIN);
     }
     let target_domain = topology
-        .topology
+        .topology()
         .domain_for_cpu(target)
-        .unwrap_or_else(|| topology.topology.root_domain())
+        .unwrap_or_else(|| topology.topology().root_domain())
         .id();
     if !task.begin_migration(source) {
         return Err(errno::Errno::EBUSY);
@@ -2601,7 +2601,7 @@ fn rollback_migration(task: &Arc<Task>, context: MigrationContext, requeue_sourc
 
 pub(crate) fn validate_migration_target(
     context: MigrationContext,
-    topology: TopologySnapshot,
+    topology: &TopologySnapshot,
     affinity: CpuMask,
 ) -> Result<(), errno::Errno> {
     if topology.generation != context.topology_generation {
@@ -2629,7 +2629,7 @@ fn attach_migrated_task_locked(
 ) -> Result<(), errno::Errno> {
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let topology = SCHEDULER.topology_snapshot();
-    if let Err(error) = validate_migration_target(context, topology, affinity) {
+    if let Err(error) = validate_migration_target(context, &topology, affinity) {
         rollback_migration(task, context, source_detached);
         return Err(error);
     }
@@ -2648,12 +2648,12 @@ fn attach_migrated_task_locked(
     }
     let commit_topology = SCHEDULER.topology_snapshot();
     let commit_affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
-    if validate_migration_target(context, commit_topology, commit_affinity).is_err() {
+    if validate_migration_target(context, &commit_topology, commit_affinity).is_err() {
         rollback_migration(task, context, true);
         return Err(errno::Errno::EAGAIN);
     }
     let source_cpu = context.source.cpu.unwrap_or_else(CpuId::boot);
-    let target_capacity = topology.topology.cpu_capacity(context.target_cpu);
+    let target_capacity = topology.topology().cpu_capacity(context.target_cpu);
     let result = SCHEDULER.deadline_admission().migrate(
         task,
         source_cpu,
@@ -2737,7 +2737,7 @@ pub fn balance_once(cpu_id: usize) -> bool {
     }
 
     let topology_snapshot = SCHEDULER.topology_snapshot();
-    let topology = &topology_snapshot.topology;
+    let topology = topology_snapshot.topology();
     let allowed = CpuMask::single(local_cpu).bits();
     let load_snapshot = {
         let _snapshot_guard = RUNQUEUE_SNAPSHOT_LOCK.lock();
@@ -2778,9 +2778,9 @@ pub fn balance_once(cpu_id: usize) -> bool {
     let source = task.placement();
     let topology_snapshot = SCHEDULER.topology_snapshot();
     let target_domain = topology_snapshot
-        .topology
+        .topology()
         .domain_for_cpu(local_cpu)
-        .unwrap_or_else(|| topology_snapshot.topology.root_domain())
+        .unwrap_or_else(|| topology_snapshot.topology().root_domain())
         .id();
     if source.state != crate::PlacementState::Bound
         || source.topology_generation != topology_snapshot.generation
