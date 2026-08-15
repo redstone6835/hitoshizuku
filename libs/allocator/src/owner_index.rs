@@ -134,7 +134,7 @@ impl OwnerRangeNode {
         }
     }
 
-    fn from_record(record: AllocationRecord, end: usize) -> Self {
+    fn from_record(record: &AllocationRecord, end: usize) -> Self {
         Self {
             start: record.ptr,
             end,
@@ -327,7 +327,7 @@ impl OwnerAllocationIndex {
         inner.free_nodes = address;
     }
 
-    pub fn track(&self, record: AllocationRecord) -> Result<(), OwnerIndexError> {
+    pub fn track(&self, record: &AllocationRecord) -> Result<(), OwnerIndexError> {
         let owner = record.accounting_owner();
         if owner == 0 {
             return Ok(());
@@ -401,7 +401,7 @@ impl OwnerAllocationIndex {
         Ok(())
     }
 
-    pub fn untrack(&self, record: AllocationRecord) -> Result<(), OwnerIndexError> {
+    pub fn untrack(&self, record: &AllocationRecord) -> Result<(), OwnerIndexError> {
         let owner = record.accounting_owner();
         if owner == 0 {
             return Ok(());
@@ -496,8 +496,8 @@ impl OwnerAllocationIndex {
 
     pub fn update(
         &self,
-        old: AllocationRecord,
-        new: AllocationRecord,
+        old: &AllocationRecord,
+        new: &AllocationRecord,
     ) -> Result<(), OwnerIndexError> {
         let owner = old.accounting_owner();
         if owner == 0 || new.accounting_owner() == 0 {
@@ -688,7 +688,7 @@ impl Default for OwnerAllocationIndex {
     }
 }
 
-fn add_stats(stats: &mut AllocationOwnerStats, record: AllocationRecord) {
+fn add_stats(stats: &mut AllocationOwnerStats, record: &AllocationRecord) {
     let usable = record.usable_size.max(record.size);
     stats.records = stats.records.saturating_add(1);
     stats.requested_bytes = stats.requested_bytes.saturating_add(record.size);

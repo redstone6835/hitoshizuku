@@ -94,6 +94,7 @@ pub mod stats;
 mod vmem;
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -107,6 +108,102 @@ use spin::relax::RelaxStrategy;
 pub struct AllocatorRelax;
 
 pub(crate) type Mutex<T> = spin::mutex::Mutex<T, AllocatorRelax>;
+
+const ORDER0_PAGE_CACHE_CAPACITY: usize = 64;
+const ORDER0_PAGE_CACHE_REFILL: usize = 32;
+const ORDER0_PAGE_CACHE_DRAIN: usize = 32;
+
+struct Order0PageCacheState {
+    pages: [usize; ORDER0_PAGE_CACHE_CAPACITY],
+    len: usize,
+}
+
+impl Order0PageCacheState {
+    const fn new() -> Self {
+        Self {
+            pages: [0; ORDER0_PAGE_CACHE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, paddr: usize) -> bool {
+        if self.len >= self.pages.len() {
+            return false;
+        }
+        self.pages[self.len] = paddr;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        let paddr = self.pages[self.len];
+        self.pages[self.len] = 0;
+        Some(paddr)
+    }
+
+    fn drain_into(&mut self, output: &mut [usize]) -> usize {
+        self.pop_into(output)
+    }
+
+    fn pop_into(&mut self, output: &mut [usize]) -> usize {
+        let mut count = 0usize;
+        for slot in output {
+            let Some(paddr) = self.pop() else {
+                break;
+            };
+            *slot = paddr;
+            count += 1;
+        }
+        count
+    }
+}
+
+struct Order0PageCache {
+    inner: Mutex<Order0PageCacheState>,
+}
+
+impl Order0PageCache {
+    const fn new() -> Self {
+        Self {
+            inner: Mutex::new(Order0PageCacheState::new()),
+        }
+    }
+}
+
+struct PublishedPageCacheIndex {
+    value: UnsafeCell<PageCacheIndex>,
+    ready: AtomicBool,
+}
+
+unsafe impl Sync for PublishedPageCacheIndex {}
+
+impl PublishedPageCacheIndex {
+    const fn new() -> Self {
+        Self {
+            value: UnsafeCell::new(PageCacheIndex::empty()),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    fn publish(&self, index: PageCacheIndex) {
+        assert!(
+            !self.ready.load(Ordering::Relaxed),
+            "physical page cache index published twice"
+        );
+        unsafe { *self.value.get() = index };
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn load(&self) -> Option<PageCacheIndex> {
+        self.ready
+            .load(Ordering::Acquire)
+            .then(|| unsafe { *self.value.get() })
+    }
+}
 
 static URGENT_POLL_FN: AtomicUsize = AtomicUsize::new(0);
 static URGENT_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -143,7 +240,7 @@ static OWNED_ALLOCATION_LOCKS: [Mutex<()>; OWNED_ALLOCATION_LOCK_COUNT] =
     [const { Mutex::new(()) }; OWNED_ALLOCATION_LOCK_COUNT];
 
 use boot::BootAllocator;
-use buddy::BuddyAllocator;
+use buddy::{BuddyAllocator, PageCacheIndex, PageCacheTransitionError};
 use kheap::KernelHeap;
 use metadata::MetadataAllocator;
 use owner_index::OwnerAllocationIndex;
@@ -288,6 +385,8 @@ pub struct AllocStats {
 pub struct KernelMemorySubsystem {
     boot: BootAllocator,
     phys: Mutex<BuddyAllocator>,
+    order0_page_caches: [Order0PageCache; MAX_CPUS],
+    page_cache_index: PublishedPageCacheIndex,
     vmem: KernelAddressSpace,
     kheap: KernelHeap,
     tracked_kheap: KernelHeap,
@@ -410,6 +509,8 @@ impl KernelMemorySubsystem {
         Self {
             boot: BootAllocator::new(),
             phys: Mutex::new(BuddyAllocator::new()),
+            order0_page_caches: [const { Order0PageCache::new() }; MAX_CPUS],
+            page_cache_index: PublishedPageCacheIndex::new(),
             vmem: KernelAddressSpace::new(),
             kheap: KernelHeap::new(crate::space::ArenaKind::Kernel),
             tracked_kheap: KernelHeap::new(crate::space::ArenaKind::Tracked),
@@ -535,6 +636,7 @@ impl KernelMemorySubsystem {
                 buddy::BuddyInitError::EmptyMemoryMap => InitError::InvalidMemoryMap,
                 buddy::BuddyInitError::MetadataOutOfMemory => InitError::MetadataOutOfMemory,
             })?;
+        self.page_cache_index.publish(phys.page_cache_index());
         Ok(())
     }
 
@@ -599,15 +701,30 @@ impl KernelMemorySubsystem {
 
     pub fn init_slab(&self, cpu_count: usize) {
         let _guard = self.init_lock.lock();
-        let kernel_region = self
-            .load_kernel_heap_region_fn()
-            .map(|region| region())
-            .unwrap_or((0, 0));
+        let (slab_owner_index, kernel_direct_map) = {
+            let phys = self.phys.lock();
+            (
+                phys.slab_owner_index(),
+                self.vmem.direct_map_region(&phys).is_some(),
+            )
+        };
         let tracked_region = self
             .load_tracked_heap_region_fn()
             .map(|region| region())
             .unwrap_or((0, 0));
-        self.slab.init(cpu_count, kernel_region);
+        if kernel_direct_map {
+            let virt_to_phys = self
+                .load_virt_to_phys()
+                .expect("direct slab requires virt_to_phys callback");
+            self.slab
+                .init_direct(cpu_count, slab_owner_index, virt_to_phys);
+        } else {
+            let kernel_region = self
+                .load_kernel_heap_region_fn()
+                .map(|region| region())
+                .unwrap_or((0, 0));
+            self.slab.init(cpu_count, kernel_region);
+        }
         self.tracked_slab.init(cpu_count, tracked_region);
     }
 
@@ -970,13 +1087,23 @@ impl KernelMemorySubsystem {
                 &self.vmem,
             ));
         }
+        let order0_cached_pages = if request.reclaim_physical_deferred {
+            self.drain_order0_page_caches()
+        } else {
+            0
+        };
         let phys = if request.reclaim_physical_deferred {
             self.phys.lock().reclaim_deferred()
         } else {
             BuddyReclaimStats::default()
         };
 
-        Ok(AllocatorReclaimStats { kheap, slab, phys })
+        Ok(AllocatorReclaimStats {
+            kheap,
+            slab,
+            phys,
+            order0_cached_pages,
+        })
     }
 
     pub fn reclaim_caches(&self) -> Result<AllocatorReclaimStats, AllocationError> {
@@ -1107,7 +1234,7 @@ impl KernelMemorySubsystem {
         {
             let record = physical_record_from_allocation(request, allocation, accounting_owner);
             match self.registry.register_result(&self.boot, record) {
-                Ok(()) => match self.owner_index.track(record) {
+                Ok(()) => match self.owner_index.track(&record) {
                     Ok(()) => Ok(allocation),
                     Err(owner_err) => {
                         match self.registry.remove_result(record.ptr) {
@@ -1161,13 +1288,71 @@ impl KernelMemorySubsystem {
             .validate()
             .map_err(buddy_alloc_error_from_request)?
             .without_external_accounting();
+        let use_order0_cache = request.page_policy == PagePolicy::BaseOnly
+            && request.placement == MemoryPlacement::Any
+            && request.required_order() == Ok(0)
+            && self.page_cache_index.load().is_some();
         let active = self.active.load(Ordering::Relaxed);
-        let mut allocation = self.allocate_physical_raw(request);
+        let mut allocation = if use_order0_cache {
+            self.allocate_cached_order0_physical()
+        } else {
+            self.allocate_physical_raw(request)
+        };
         if allocation.is_err() && active {
             let _ = self.reclaim_allocator_caches_for_retry();
-            allocation = self.allocate_physical_raw(request);
+            allocation = if use_order0_cache {
+                self.allocate_cached_order0_physical()
+            } else {
+                self.allocate_physical_raw(request)
+            };
         }
         allocation
+    }
+
+    /// 批量分配普通基础页，供缺页预取等保留精确句柄的内核路径使用。
+    ///
+    /// cache 命中只获取一次当前 CPU cache 锁；不足部分在一次 buddy 临界区内补齐。
+    /// 返回值是 `output` 中从零开始已经初始化的连续前缀长度。
+    pub fn allocate_untracked_order0_batch(
+        &self,
+        output: &mut [Option<PhysicalAllocation>],
+    ) -> usize {
+        output.fill(None);
+        if output.is_empty() {
+            return 0;
+        }
+        let Some(index) = self.page_cache_index.load() else {
+            return 0;
+        };
+        let cpu = self.current_cpu_id().min(MAX_CPUS - 1);
+        let mut count = 0usize;
+        {
+            let mut cache = self.order0_page_caches[cpu].inner.lock();
+            while count < output.len() {
+                let Some(paddr) = cache.pop() else {
+                    break;
+                };
+                if index.try_activate(paddr).is_err() {
+                    let restored = cache.push(paddr);
+                    debug_assert!(restored);
+                    break;
+                }
+                output[count] = Some(order0_allocation(paddr));
+                count += 1;
+            }
+        }
+
+        if count < output.len() {
+            let mut phys = self.phys.lock();
+            while count < output.len() {
+                let Some(allocation) = phys.alloc_cacheable_order0() else {
+                    break;
+                };
+                output[count] = Some(allocation);
+                count += 1;
+            }
+        }
+        count
     }
 
     /// 释放由 [`KernelMemorySubsystem::allocate_untracked_physical`] 返回的完整句柄。
@@ -1179,6 +1364,27 @@ impl KernelMemorySubsystem {
         &self,
         allocation: PhysicalAllocation,
     ) -> Result<(), PhysicalFreeError> {
+        if allocation.order == 0
+            && allocation.size == PAGE_SIZE
+            && allocation.page_size == PAGE_SIZE
+            && let Some(index) = self.page_cache_index.load()
+        {
+            match index.try_cache(allocation) {
+                Ok(()) => {
+                    self.cache_freed_order0_page(allocation.paddr);
+                    return Ok(());
+                }
+                Err(PageCacheTransitionError::NotEligible) => {}
+                Err(PageCacheTransitionError::NotAllocated) => {
+                    return Err(PhysicalFreeError::Buddy(
+                        buddy::BuddyFreeError::NotAllocated,
+                    ));
+                }
+                Err(PageCacheTransitionError::Invalid(error)) => {
+                    return Err(PhysicalFreeError::Buddy(error));
+                }
+            }
+        }
         self.try_free_physical_raw(allocation)
             .map_err(PhysicalFreeError::Buddy)
     }
@@ -1226,7 +1432,7 @@ impl KernelMemorySubsystem {
             Err(RegistryError::UnknownPointer) => return Err(PhysicalFreeError::UnknownPointer),
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
-        if let Err(err) = self.owner_index.untrack(record) {
+        if let Err(err) = self.owner_index.untrack(&record) {
             panic!(
                 "[alloc][invariant] owner index rejected physical free: paddr={:#x} owner={} err={:?}",
                 paddr,
@@ -1291,7 +1497,7 @@ impl KernelMemorySubsystem {
             Err(err) => return Err(PhysicalFreeError::Registry(err)),
         };
 
-        if let Err(err) = self.owner_index.untrack(record) {
+        if let Err(err) = self.owner_index.untrack(&record) {
             panic!(
                 "[alloc][invariant] owner index rejected physical free: paddr={:#x} owner={} err={:?}",
                 allocation.paddr,
@@ -1688,7 +1894,7 @@ impl KernelMemorySubsystem {
             .registry
             .get(ptr)
             .ok_or(DeallocationError::UnknownPointer)?;
-        if let Err(err) = self.owner_index.untrack(record) {
+        if let Err(err) = self.owner_index.untrack(&record) {
             panic!(
                 "[alloc][invariant] owner index rejected tracked free: ptr={:#x} owner={} err={:?}",
                 ptr,
@@ -1699,7 +1905,7 @@ impl KernelMemorySubsystem {
         let record = match self.registry.remove_result(ptr) {
             Ok(record) => record,
             Err(err) => {
-                if let Err(restore_err) = self.owner_index.track(record) {
+                if let Err(restore_err) = self.owner_index.track(&record) {
                     panic!(
                         "[alloc][invariant] failed to restore owner index after registry remove failure: ptr={:#x} remove={:?} restore={:?}",
                         ptr, err, restore_err
@@ -1979,9 +2185,13 @@ impl KernelMemorySubsystem {
         }
         if old_small.is_none()
             && new_small.is_none()
-            && self
-                .kheap
-                .can_reuse_layout(ptr as usize, old_layout, new_layout, &self.vmem)
+            && self.kheap.can_reuse_layout(
+                ptr as usize,
+                old_layout,
+                new_layout,
+                &self.phys,
+                &self.vmem,
+            )
         {
             return ptr;
         }
@@ -1989,8 +2199,13 @@ impl KernelMemorySubsystem {
         let old_valid = if let Some(old_zone_idx) = old_small {
             self.slab.owns_in_class(old_zone_idx, ptr as usize)
         } else {
-            self.kheap
-                .can_reuse_layout(ptr as usize, old_layout, old_layout, &self.vmem)
+            self.kheap.can_reuse_layout(
+                ptr as usize,
+                old_layout,
+                old_layout,
+                &self.phys,
+                &self.vmem,
+            )
         };
         if !old_valid {
             self.record_ownership_failure();
@@ -2167,6 +2382,105 @@ impl KernelMemorySubsystem {
         phys.alloc_pages_with(&request)
     }
 
+    fn allocate_cached_order0_physical(
+        &self,
+    ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
+        let index = self
+            .page_cache_index
+            .load()
+            .ok_or(buddy::BuddyAllocError::NotInitialized)?;
+        let cpu = self.current_cpu_id().min(MAX_CPUS - 1);
+        if let Some(paddr) = self.order0_page_caches[cpu].inner.lock().pop() {
+            if let Err(error) = index.try_activate(paddr) {
+                let restored = self.order0_page_caches[cpu].inner.lock().push(paddr);
+                debug_assert!(restored);
+                return Err(match error {
+                    buddy::BuddyFreeError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
+                    _ => buddy::BuddyAllocError::InvalidAddress,
+                });
+            }
+            return Ok(order0_allocation(paddr));
+        }
+
+        let mut refill = [None; ORDER0_PAGE_CACHE_REFILL];
+        let mut refill_count = 0usize;
+        {
+            let mut phys = self.phys.lock();
+            for slot in &mut refill {
+                let Some(allocation) = phys.alloc_cacheable_order0() else {
+                    break;
+                };
+                *slot = Some(allocation);
+                refill_count += 1;
+            }
+        }
+        if refill_count == 0 {
+            return Err(buddy::BuddyAllocError::Fragmented);
+        }
+
+        let allocation = refill[0].take().expect("non-empty page cache refill");
+        let mut spill = [0usize; ORDER0_PAGE_CACHE_REFILL - 1];
+        let mut spill_count = 0usize;
+        {
+            let mut cache = self.order0_page_caches[cpu].inner.lock();
+            for entry in refill[1..refill_count].iter().flatten() {
+                index
+                    .try_cache(*entry)
+                    .expect("fresh buddy page must enter the order-0 cache");
+                if !cache.push(entry.paddr) {
+                    spill[spill_count] = entry.paddr;
+                    spill_count += 1;
+                }
+            }
+        }
+        self.release_cached_order0_pages(&spill[..spill_count]);
+        Ok(allocation)
+    }
+
+    fn cache_freed_order0_page(&self, paddr: usize) {
+        let cpu = self.current_cpu_id().min(MAX_CPUS - 1);
+        let mut drain = [0usize; ORDER0_PAGE_CACHE_DRAIN];
+        let drain_count = {
+            let mut cache = self.order0_page_caches[cpu].inner.lock();
+            if cache.push(paddr) {
+                return;
+            }
+            let existing = cache.drain_into(&mut drain[..ORDER0_PAGE_CACHE_DRAIN - 1]);
+            drain[existing] = paddr;
+            existing + 1
+        };
+        self.release_cached_order0_pages(&drain[..drain_count]);
+    }
+
+    fn release_cached_order0_pages(&self, pages: &[usize]) {
+        if pages.is_empty() {
+            return;
+        }
+        let index = self
+            .page_cache_index
+            .load()
+            .expect("page cache index must remain published");
+        let mut phys = self.phys.lock();
+        for &paddr in pages {
+            index
+                .try_activate(paddr)
+                .expect("cached order-0 page must be activatable");
+            phys.free_allocation(order0_allocation(paddr))
+                .expect("activated order-0 page must return to buddy");
+        }
+    }
+
+    fn drain_order0_page_caches(&self) -> usize {
+        let mut total = 0usize;
+        for cache in &self.order0_page_caches {
+            let mut pages = [0usize; ORDER0_PAGE_CACHE_CAPACITY];
+            let count = cache.inner.lock().drain_into(&mut pages);
+            self.release_cached_order0_pages(&pages[..count]);
+            total = total.saturating_add(count);
+        }
+        total
+    }
+
     fn free_physical_raw(&self, allocation: PhysicalAllocation) -> bool {
         self.try_free_physical_raw(allocation).is_ok()
     }
@@ -2337,7 +2651,7 @@ impl KernelMemorySubsystem {
     ) where
         F: FnOnce(),
     {
-        if let Err(err) = self.owner_index.untrack(expected) {
+        if let Err(err) = self.owner_index.untrack(&expected) {
             cleanup_new();
             panic!(
                 "[alloc][invariant] reallocate could not remove old owner range: ptr={:#x} err={:?}",
@@ -2347,7 +2661,7 @@ impl KernelMemorySubsystem {
         let removed = match self.registry.remove_result(ptr) {
             Ok(record) => record,
             Err(err) => {
-                if let Err(restore_err) = self.owner_index.track(expected) {
+                if let Err(restore_err) = self.owner_index.track(&expected) {
                     cleanup_new();
                     panic!(
                         "[alloc][invariant] reallocate owner range restore failed: ptr={:#x} remove={:?} restore={:?}",
@@ -2397,7 +2711,7 @@ impl KernelMemorySubsystem {
             let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
             return Err(err);
         }
-        if let Err(err) = self.owner_index.update(record, updated) {
+        if let Err(err) = self.owner_index.update(&record, &updated) {
             let _ = self.registry.update_existing_result(ptr, record);
             let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
             panic!(
@@ -2429,7 +2743,7 @@ impl KernelMemorySubsystem {
     }
 
     fn restore_owner_index_or_panic(&self, record: AllocationRecord, context: &str) {
-        if let Err(err) = self.owner_index.track(record) {
+        if let Err(err) = self.owner_index.track(&record) {
             panic!(
                 "[alloc][invariant] {}: owner index restore failed ptr={:#x} owner={} err={:?}",
                 context,
@@ -2459,7 +2773,7 @@ impl KernelMemorySubsystem {
         F: FnOnce(),
     {
         match self.registry.register_result(&self.boot, record) {
-            Ok(()) => match self.owner_index.track(record) {
+            Ok(()) => match self.owner_index.track(&record) {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     if let Err(remove_err) = self.registry.remove_result(record.ptr) {
@@ -2611,6 +2925,16 @@ fn buddy_alloc_error_from_request(err: AllocationRequestError) -> buddy::BuddyAl
         | AllocationRequestError::SizeOverflow
         | AllocationRequestError::UnsupportedOrder => buddy::BuddyAllocError::InvalidOrder,
         AllocationRequestError::InvalidPlacement => buddy::BuddyAllocError::InvalidAddress,
+    }
+}
+
+#[inline]
+const fn order0_allocation(paddr: usize) -> PhysicalAllocation {
+    PhysicalAllocation {
+        paddr,
+        size: PAGE_SIZE,
+        order: 0,
+        page_size: PAGE_SIZE,
     }
 }
 
@@ -2849,7 +3173,7 @@ mod tests;
 mod host_tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{KernelMemorySubsystem, PagePolicy};
+    use super::{KernelMemorySubsystem, Order0PageCacheState, PagePolicy};
 
     static TRACKED_REGION_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TRACKED_REGION_START: AtomicUsize = AtomicUsize::new(0x4000);
@@ -2874,6 +3198,41 @@ mod host_tests {
 
     fn unmap_range(_vaddr: usize, _size: usize) -> bool {
         true
+    }
+
+    #[test]
+    fn order0_page_cache_preserves_lifo_and_bounded_drain() {
+        let mut cache = Order0PageCacheState::new();
+        for page in 1..=4 {
+            assert!(cache.push(page * super::PAGE_SIZE));
+        }
+        assert_eq!(cache.pop(), Some(4 * super::PAGE_SIZE));
+
+        let mut drained = [0usize; 2];
+        assert_eq!(cache.drain_into(&mut drained), 2);
+        assert_eq!(drained, [3 * super::PAGE_SIZE, 2 * super::PAGE_SIZE]);
+        assert_eq!(cache.pop(), Some(super::PAGE_SIZE));
+        assert_eq!(cache.pop(), None);
+    }
+
+    #[test]
+    fn order0_page_cache_pops_batch_under_one_guard() {
+        let mut cache = Order0PageCacheState::new();
+        for page in 1..=4 {
+            assert!(cache.push(page * super::PAGE_SIZE));
+        }
+
+        let mut pages = [0usize; 3];
+        assert_eq!(cache.pop_into(&mut pages), 3);
+        assert_eq!(
+            pages,
+            [
+                4 * super::PAGE_SIZE,
+                3 * super::PAGE_SIZE,
+                2 * super::PAGE_SIZE
+            ]
+        );
+        assert_eq!(cache.pop(), Some(super::PAGE_SIZE));
     }
 
     #[test]

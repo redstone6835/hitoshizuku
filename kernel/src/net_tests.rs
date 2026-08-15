@@ -18,6 +18,8 @@ static DETACH_READER_RESULT: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(i32::MIN);
 
 const BLOCKING_STREAM_BYTES: usize = 256 * 1024;
+const UDP_STRESS_DATAGRAMS: u32 = 64;
+const UDP_STRESS_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
 
 unsafe extern "C" fn udp_stress_writer(_arg: usize) -> ! {
     let sender = STRESS_SENDER
@@ -26,7 +28,7 @@ unsafe extern "C" fn udp_stress_writer(_arg: usize) -> ! {
         .cloned()
         .expect("UDP stress sender 未安装");
     let task = sched::current_task_fast();
-    for sequence in 0..256u32 {
+    for sequence in 0..UDP_STRESS_DATAGRAMS {
         assert!(
             task.begin_execution_scope(sched::ExecutionScopeKind::Syscall),
             "UDP stress writer 不能嵌套进入 syscall 执行作用域"
@@ -998,6 +1000,9 @@ fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
 fn udp_blocking_reader_writer_stress() {
     STRESS_WRITER_DONE.store(false, core::sync::atomic::Ordering::Release);
     let receiver = net::new_socket_facade(net::AddressFamily::Ipv4).expect("创建 UDP receiver");
+    // 每个 ring 数据报至少占用一个 4 KiB chunk；测试必须为整轮无损顺序校验
+    // 提供足够容量，不能把 UDP 接收队列满时的合法丢包误判成乱序。
+    receiver.set_buffer_limits(None, Some(UDP_STRESS_RECEIVE_BUFFER_BYTES));
     let local = net::Endpoint {
         addr: net::IpAddr::V4(net::Ipv4Addr::LOCALHOST),
         port: 19_003,
@@ -1021,7 +1026,7 @@ fn udp_blocking_reader_writer_stress() {
     );
     sched::activate_task(&writer).expect("启动 UDP stress writer");
     let deadline = sched::now_ns_direct().saturating_add(5_000_000_000);
-    for expected in 0..256u32 {
+    for expected in 0..UDP_STRESS_DATAGRAMS {
         let mut bytes = [0u8; 4];
         let received = receiver
             .recv(&mut bytes, false, false, false, Some(deadline))

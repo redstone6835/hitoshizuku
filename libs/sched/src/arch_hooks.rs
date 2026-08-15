@@ -633,6 +633,11 @@ pub struct ArchTrapOps {
     /// `cpu_work_ptr` 必须指向生命周期覆盖内核运行期的 `AtomicU32`。本函数只能
     /// 为正在执行发布操作的本 CPU 更新本地状态。
     pub set_current_task: unsafe fn(task_ptr: usize, cpu_work_ptr: usize),
+    /// 读取架构本地发布的 current task 裸指针；未实现本地槽的架构返回 0。
+    ///
+    /// 返回的指针只可在当前执行栈不发生异步移交的范围内借用。其生命周期由
+    /// 调度器 current 槽或当前暂停栈持有的任务引用保证。
+    pub current_task_ptr: fn() -> usize,
 }
 
 // Safety: 仅函数指针。
@@ -654,6 +659,17 @@ pub fn trap() -> Option<&'static ArchTrapOps> {
     } else {
         // Safety: register_trap 仅接受 'static；Acquire/Release 配对。
         Some(unsafe { &*(ptr as *const ArchTrapOps) })
+    }
+}
+
+/// 读取架构本地 current task，未注册或架构不支持时返回 0。
+#[inline(always)]
+pub(crate) fn current_task_ptr_or_null() -> usize {
+    let ptr = TRAP_OPS.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        0
+    } else {
+        unsafe { ((*ptr).current_task_ptr)() }
     }
 }
 

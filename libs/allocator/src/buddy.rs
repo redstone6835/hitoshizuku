@@ -18,6 +18,7 @@
 use core::alloc::Layout;
 use core::mem::size_of;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::boot::BootAllocator;
 use crate::request::{
@@ -120,6 +121,7 @@ pub struct BuddyStats {
     pub metadata_pages: usize,
     pub segment_count: usize,
     pub max_order: usize,
+    pub pfn_index_slots: usize,
     pub hash_bucket_count: usize,
     pub nonempty_hash_bucket_count: usize,
     pub node_capacity: usize,
@@ -237,6 +239,7 @@ impl BuddyStats {
             metadata_pages: 0,
             segment_count: 0,
             max_order: 0,
+            pfn_index_slots: 0,
             hash_bucket_count: 0,
             nonempty_hash_bucket_count: 0,
             node_capacity: 0,
@@ -303,6 +306,7 @@ struct BuddySegment {
     total_pages: usize,
     max_order: usize,
     fl_type: usize,
+    node_base: usize,
 }
 
 impl BuddySegment {
@@ -312,46 +316,283 @@ impl BuddySegment {
             total_pages: 0,
             max_order: 0,
             fl_type: VM_FREELIST_DEFAULT,
+            node_base: 0,
         }
     }
 }
 
-#[derive(Clone, Copy)]
 struct BlockNode {
     start: usize,
     order: u8,
     seg_idx: u32,
     fl_type: u8,
-    is_free: bool,
+    state: AtomicU8,
+    cache_eligible: bool,
     ref_count: u16,
     slab_zone_id: u16,
     free_next: usize,
     free_prev: usize,
-    hash_next: usize,
 }
 
 impl BlockNode {
-    const fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             start: 0,
             order: 0,
             seg_idx: 0,
             fl_type: 0,
-            is_free: false,
+            state: AtomicU8::new(NODE_INACTIVE),
+            cache_eligible: false,
             ref_count: 0,
             slab_zone_id: 0,
             free_next: 0,
             free_prev: 0,
-            hash_next: 0,
         }
     }
 }
 
+const NODE_INACTIVE: u8 = 0;
+const NODE_FREE: u8 = 1;
+const NODE_ALLOCATED: u8 = 2;
+const NODE_CACHED: u8 = 3;
 const FREE_HEADS: usize = VM_NFREELIST * (MAX_TRACKED_ORDER + 1);
-const TARGET_HASH_CHAIN: usize = 4;
-const MAX_HASH_BUCKETS: usize = 1_048_576;
-const MIN_HASH_BUCKETS: usize = 1_024;
 const METADATA_RANGE_COUNT: usize = 1;
+
+#[derive(Clone, Copy)]
+pub(crate) struct PageCacheIndex {
+    segments: *const BuddySegment,
+    segment_count: usize,
+    nodes: *mut BlockNode,
+    node_capacity: usize,
+}
+
+/// PFN 到普通 slab 节点的无锁旁路索引。
+///
+/// owner 数组与 buddy 的 PFN 槽一一对应，但生命周期独立于会被拆分、合并和复用的
+/// `BlockNode`。因此 slab 清除 owner 后，buddy 可以立即重写块描述符，而并发查询仍只
+/// 访问稳定的原子槽，不会与描述符重置形成数据竞争。
+#[derive(Clone, Copy)]
+pub(crate) struct SlabOwnerIndex {
+    segments: *const BuddySegment,
+    segment_count: usize,
+    owners: *mut AtomicUsize,
+    owner_capacity: usize,
+}
+
+unsafe impl Send for SlabOwnerIndex {}
+unsafe impl Sync for SlabOwnerIndex {}
+
+impl SlabOwnerIndex {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            segments: core::ptr::null(),
+            segment_count: 0,
+            owners: null_mut(),
+            owner_capacity: 0,
+        }
+    }
+
+    pub(crate) fn publish_range(self, paddr: usize, size: usize, owner: usize) -> bool {
+        let Some(slots) = self.range_slots(paddr, size) else {
+            return false;
+        };
+        if owner == 0
+            || slots
+                .clone()
+                .any(|slot| self.owner(slot).load(Ordering::Acquire) != 0)
+        {
+            return false;
+        }
+
+        let mut published = 0usize;
+        for slot in slots {
+            if self
+                .owner(slot)
+                .compare_exchange(0, owner, Ordering::Release, Ordering::Acquire)
+                .is_err()
+            {
+                for rollback in self
+                    .range_slots(paddr, published * PAGE_SIZE)
+                    .into_iter()
+                    .flatten()
+                {
+                    let cleared = self.owner(rollback).compare_exchange(
+                        owner,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    debug_assert!(cleared.is_ok());
+                }
+                return false;
+            }
+            published += 1;
+        }
+        true
+    }
+
+    pub(crate) fn clear_range(self, paddr: usize, size: usize, owner: usize) -> bool {
+        let Some(slots) = self.range_slots(paddr, size) else {
+            return false;
+        };
+        let mut cleared = true;
+        for slot in slots {
+            if self
+                .owner(slot)
+                .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                cleared = false;
+            }
+        }
+        cleared
+    }
+
+    pub(crate) fn owns_range(self, paddr: usize, size: usize, owner: usize) -> bool {
+        self.range_slots(paddr, size).is_some_and(|mut slots| {
+            slots.all(|slot| self.owner(slot).load(Ordering::Acquire) == owner)
+        })
+    }
+
+    pub(crate) fn covers_range(self, paddr: usize, size: usize) -> bool {
+        self.range_slots(paddr, size).is_some()
+    }
+
+    #[inline]
+    pub(crate) fn lookup(self, paddr: usize) -> Option<usize> {
+        let slot = self.slot_for_addr(paddr)?;
+        let owner = self.owner(slot).load(Ordering::Acquire);
+        (owner != 0).then_some(owner)
+    }
+
+    fn range_slots(self, paddr: usize, size: usize) -> Option<core::ops::Range<usize>> {
+        if size == 0 || !paddr.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        let start = self.slot_for_addr(paddr)?;
+        let pages = size / PAGE_SIZE;
+        let end = start.checked_add(pages)?;
+        if end > self.owner_capacity || self.slot_for_addr(paddr.checked_add(size - 1)?)? + 1 != end
+        {
+            return None;
+        }
+        Some(start..end)
+    }
+
+    fn slot_for_addr(self, paddr: usize) -> Option<usize> {
+        if self.segments.is_null() || self.owners.is_null() {
+            return None;
+        }
+        for segment in 0..self.segment_count {
+            let segment = unsafe { &*self.segments.add(segment) };
+            if paddr < segment.range.start || paddr >= segment.range.end() {
+                continue;
+            }
+            let page = (paddr - segment.range.start) / PAGE_SIZE;
+            let slot = segment.node_base.checked_add(page)?;
+            return (slot < self.owner_capacity).then_some(slot);
+        }
+        None
+    }
+
+    #[inline]
+    fn owner(self, slot: usize) -> &'static AtomicUsize {
+        debug_assert!(!self.owners.is_null() && slot < self.owner_capacity);
+        unsafe { &*self.owners.add(slot) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageCacheTransitionError {
+    Invalid(BuddyFreeError),
+    NotEligible,
+    NotAllocated,
+}
+
+unsafe impl Send for PageCacheIndex {}
+unsafe impl Sync for PageCacheIndex {}
+
+impl PageCacheIndex {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            segments: core::ptr::null(),
+            segment_count: 0,
+            nodes: null_mut(),
+            node_capacity: 0,
+        }
+    }
+
+    pub(crate) fn try_cache(
+        self,
+        allocation: PhysicalAllocation,
+    ) -> Result<(), PageCacheTransitionError> {
+        if allocation.order != 0
+            || allocation.size != PAGE_SIZE
+            || allocation.page_size != PAGE_SIZE
+        {
+            return Err(PageCacheTransitionError::Invalid(
+                BuddyFreeError::OrderMismatch,
+            ));
+        }
+        let node = self
+            .node_for_addr(allocation.paddr)
+            .map_err(PageCacheTransitionError::Invalid)?;
+        node.state
+            .compare_exchange(
+                NODE_ALLOCATED,
+                NODE_CACHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| PageCacheTransitionError::NotAllocated)?;
+        if node.order == 0 && node.cache_eligible {
+            return Ok(());
+        }
+        let restored = node.state.compare_exchange(
+            NODE_CACHED,
+            NODE_ALLOCATED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(restored.is_ok());
+        Err(PageCacheTransitionError::NotEligible)
+    }
+
+    pub(crate) fn try_activate(self, paddr: usize) -> Result<(), BuddyFreeError> {
+        let node = self.node_for_addr(paddr)?;
+        node.state
+            .compare_exchange(
+                NODE_CACHED,
+                NODE_ALLOCATED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| BuddyFreeError::NotAllocated)
+    }
+
+    fn node_for_addr(self, addr: usize) -> Result<&'static BlockNode, BuddyFreeError> {
+        if self.segments.is_null() || self.nodes.is_null() || addr % PAGE_SIZE != 0 {
+            return Err(BuddyFreeError::InvalidAddress);
+        }
+        for seg_idx in 0..self.segment_count {
+            let seg = unsafe { &*self.segments.add(seg_idx) };
+            if addr < seg.range.start || addr >= seg.range.end() {
+                continue;
+            }
+            let page_idx = (addr - seg.range.start) / PAGE_SIZE;
+            let node_idx = seg
+                .node_base
+                .checked_add(page_idx)
+                .ok_or(BuddyFreeError::InvalidAddress)?;
+            if node_idx >= self.node_capacity {
+                return Err(BuddyFreeError::InvalidAddress);
+            }
+            return Ok(unsafe { &*self.nodes.add(node_idx) });
+        }
+        Err(BuddyFreeError::InvalidAddress)
+    }
+}
 
 struct MetadataBump {
     cursor: usize,
@@ -386,14 +627,11 @@ pub struct BuddyAllocator {
     reserved_range_count: usize,
     metadata_ranges: *mut MemorySegment,
     metadata_range_count: usize,
-    hash_buckets: *mut usize,
-    hash_bucket_count: usize,
-    nonempty_hash_bucket_count: usize,
     nodes: *mut BlockNode,
+    slab_owners: *mut AtomicUsize,
     node_capacity: usize,
     node_used: usize,
     free_heads: [usize; FREE_HEADS],
-    node_freelist: usize,
     initialized: bool,
     stats: BuddyStats,
 }
@@ -408,14 +646,11 @@ impl BuddyAllocator {
             reserved_range_count: 0,
             metadata_ranges: null_mut(),
             metadata_range_count: 0,
-            hash_buckets: null_mut(),
-            hash_bucket_count: 0,
-            nonempty_hash_bucket_count: 0,
             nodes: null_mut(),
+            slab_owners: null_mut(),
             node_capacity: 0,
             node_used: 0,
             free_heads: [0; FREE_HEADS],
-            node_freelist: 0,
             initialized: false,
             stats: BuddyStats::new(),
         }
@@ -449,15 +684,9 @@ impl BuddyAllocator {
             .iter()
             .filter(|(start, end)| end > start)
             .count();
-        let bucket_count = choose_hash_bucket_count(total_pages);
         let node_capacity = total_pages;
-        let metadata_bytes = buddy_metadata_bytes(
-            effective_count,
-            stored_reserved,
-            bucket_count,
-            node_capacity,
-        )
-        .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let metadata_bytes = buddy_metadata_bytes(effective_count, stored_reserved, node_capacity)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
         let metadata_start_ns = now_ns();
         let metadata_range = carve_metadata_range(segments, reserved_regions, metadata_bytes)
             .ok_or(BuddyInitError::MetadataOutOfMemory)?;
@@ -486,27 +715,29 @@ impl BuddyAllocator {
         unsafe {
             metadata_range_ptr.write(metadata_range);
         }
-        let bucket_ptr = metadata
-            .alloc_array::<usize>(bucket_count)
-            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
         let node_ptr = metadata
             .alloc_array::<BlockNode>(node_capacity)
             .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let slab_owner_ptr = metadata
+            .alloc_array::<AtomicUsize>(node_capacity)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        for idx in 0..node_capacity {
+            unsafe { slab_owner_ptr.add(idx).write(AtomicUsize::new(0)) };
+        }
         let metadata_us = elapsed_us(metadata_start_ns);
 
         self.segments = segment_ptr;
-        self.hash_buckets = bucket_ptr;
-        self.hash_bucket_count = bucket_count;
-        self.nonempty_hash_bucket_count = 0;
         self.reserved_ranges = reserved_ptr;
         self.metadata_ranges = metadata_range_ptr;
         self.metadata_range_count = 1;
         self.nodes = node_ptr;
+        self.slab_owners = slab_owner_ptr;
         self.node_capacity = node_capacity;
         self.node_used = 0;
 
         let segment_start_ns = now_ns();
         let mut seg_out = 0usize;
+        let mut node_base = 0usize;
         for &raw_segment in segments {
             for_each_effective_segment(raw_segment, |segment, fl_type| {
                 let total_pages = segment.size / PAGE_SIZE;
@@ -516,6 +747,7 @@ impl BuddyAllocator {
                     total_pages,
                     max_order: max_order_for_pages(total_pages),
                     fl_type,
+                    node_base,
                 };
                 self.stats.total_pages = self
                     .stats
@@ -523,13 +755,14 @@ impl BuddyAllocator {
                     .checked_add(total_pages)
                     .unwrap_or(usize::MAX);
                 self.stats.max_order = self.stats.max_order.max(seg.max_order);
+                node_base += total_pages;
                 seg_out += 1;
             });
         }
         self.segment_count = seg_out;
         self.stats.segment_count = seg_out;
         self.stats.metadata_pages = metadata_range.size / PAGE_SIZE;
-        self.stats.hash_bucket_count = self.hash_bucket_count;
+        self.stats.pfn_index_slots = self.node_capacity;
         self.stats.node_capacity = self.node_capacity;
         let segment_us = elapsed_us(segment_start_ns);
 
@@ -560,13 +793,12 @@ impl BuddyAllocator {
         self.initialized = true;
 
         log::info!(
-            "[alloc][buddy] initialized sections={} total_ram={} MiB metadata={} KiB metadata_phys={:#x} nodes={} buckets={}",
+            "[alloc][buddy] initialized sections={} total_ram={} MiB metadata={} KiB metadata_phys={:#x} pfn_slots={}",
             self.segment_count,
             (self.stats.total_pages * PAGE_SIZE) / (1024 * 1024),
             metadata_bytes / 1024,
             metadata_range.start,
             self.node_capacity,
-            self.hash_bucket_count,
         );
         log::info!(
             "[alloc][buddy][timing] total={} us metadata={} us segments={} us reserved={} us seed={} us",
@@ -697,11 +929,64 @@ impl BuddyAllocator {
         })
     }
 
+    pub(crate) fn alloc_cacheable_order0(&mut self) -> Option<PhysicalAllocation> {
+        let paddr = self.alloc_pages(0)?;
+        let node_addr = self.hash_find(paddr);
+        if node_addr == 0 {
+            return None;
+        }
+        let node = node_mut(node_addr);
+        if node_state(node) != NODE_ALLOCATED || node.order != 0 {
+            return None;
+        }
+        node.cache_eligible = true;
+        Some(PhysicalAllocation {
+            paddr,
+            size: PAGE_SIZE,
+            order: 0,
+            page_size: PAGE_SIZE,
+        })
+    }
+
+    pub(crate) fn page_cache_index(&self) -> PageCacheIndex {
+        PageCacheIndex {
+            segments: self.segments,
+            segment_count: self.segment_count,
+            nodes: self.nodes,
+            node_capacity: self.node_capacity,
+        }
+    }
+
+    pub(crate) fn slab_owner_index(&self) -> SlabOwnerIndex {
+        SlabOwnerIndex {
+            segments: self.segments,
+            segment_count: self.segment_count,
+            owners: self.slab_owners,
+            owner_capacity: self.node_capacity,
+        }
+    }
+
     pub fn free_allocation(
         &mut self,
         allocation: PhysicalAllocation,
     ) -> Result<(), BuddyFreeError> {
         self.free_pages(allocation.paddr, allocation.order)
+    }
+
+    pub(crate) fn allocated_range(&self, paddr: usize) -> Option<PhysicalAllocation> {
+        let node_addr = self.node_addr_for(paddr)?;
+        let node = node_ref(node_addr);
+        if node_state(node) != NODE_ALLOCATED || node.start != paddr {
+            return None;
+        }
+        let order = node.order as usize;
+        let size = (1usize << order).checked_mul(PAGE_SIZE)?;
+        Some(PhysicalAllocation {
+            paddr,
+            size,
+            order,
+            page_size: size,
+        })
     }
 
     pub fn alloc_pages_exact(
@@ -762,7 +1047,7 @@ impl BuddyAllocator {
             return Err(BuddyFreeError::NotAllocated);
         }
         let node = node_ref(node_addr);
-        if node.is_free {
+        if node_state(node) != NODE_ALLOCATED {
             return Err(BuddyFreeError::NotAllocated);
         }
         if node.order as usize != order {
@@ -777,12 +1062,6 @@ impl BuddyAllocator {
             return Err(BuddyFreeError::InvalidOrder);
         }
 
-        self.stats.free_requests += 1;
-        self.stats.allocated_pages = self.stats.allocated_pages.saturating_sub(1usize << order);
-        self.stats.free_pages += 1usize << order;
-
-        self.hash_remove(node_addr);
-
         let mut merged_addr = addr;
         let mut merged_order = order;
         let fl_type = seg.fl_type;
@@ -791,6 +1070,14 @@ impl BuddyAllocator {
         if defer_coalesce {
             self.stats.deferred_coalesce_count += 1;
         }
+
+        if !self.deactivate_node(node_addr, NODE_ALLOCATED) {
+            return Err(BuddyFreeError::NotAllocated);
+        }
+        self.recycle_node(node_addr);
+        self.stats.free_requests += 1;
+        self.stats.allocated_pages = self.stats.allocated_pages.saturating_sub(1usize << order);
+        self.stats.free_pages += 1usize << order;
 
         while !defer_coalesce && merged_order < seg.max_order {
             let block_pages = 1usize << merged_order;
@@ -810,7 +1097,7 @@ impl BuddyAllocator {
                 break;
             }
             let buddy = node_ref(buddy_node_addr);
-            if !buddy.is_free
+            if node_state(buddy) != NODE_FREE
                 || buddy.order as usize != merged_order
                 || buddy.seg_idx as usize != seg_idx
                 || buddy.fl_type as usize != fl_type
@@ -818,8 +1105,11 @@ impl BuddyAllocator {
                 break;
             }
 
+            if !self.deactivate_node(buddy_node_addr, NODE_FREE) {
+                self.note_chain_corruption();
+                break;
+            }
             self.remove_from_free_list(buddy_node_addr);
-            self.hash_remove(buddy_node_addr);
             self.recycle_node(buddy_node_addr);
 
             merged_addr = merged_addr.min(buddy_addr);
@@ -827,20 +1117,10 @@ impl BuddyAllocator {
             self.stats.coalesce_count += 1;
         }
 
-        let node = node_mut(node_addr);
-        node.start = merged_addr;
-        node.order = merged_order as u8;
-        node.seg_idx = seg_idx as u32;
-        node.fl_type = fl_type as u8;
-        node.is_free = true;
-        node.ref_count = 0;
-        node.slab_zone_id = 0;
-        node.free_next = 0;
-        node.free_prev = 0;
-        node.hash_next = 0;
-
-        self.hash_insert(node_addr);
-        self.add_to_free_list(node_addr);
+        let merged_node = self
+            .new_node(merged_addr, merged_order, seg_idx, fl_type, true)
+            .ok_or(BuddyFreeError::CorruptTail)?;
+        self.add_to_free_list(merged_node);
         Ok(())
     }
 
@@ -889,7 +1169,7 @@ impl BuddyAllocator {
 
     fn coalesce_free_node(&mut self, node_addr: usize) -> u64 {
         let node = node_ref(node_addr);
-        if !node.is_free {
+        if node_state(node) != NODE_FREE {
             return 0;
         }
         let seg_idx = node.seg_idx as usize;
@@ -901,8 +1181,11 @@ impl BuddyAllocator {
         let mut merged_order = node.order as usize;
         let mut merged_count = 0u64;
 
+        if !self.deactivate_node(node_addr, NODE_FREE) {
+            return 0;
+        }
         self.remove_from_free_list(node_addr);
-        self.hash_remove(node_addr);
+        self.recycle_node(node_addr);
 
         while merged_order < seg.max_order {
             let block_pages = 1usize << merged_order;
@@ -922,7 +1205,7 @@ impl BuddyAllocator {
                 break;
             }
             let buddy = node_ref(buddy_node_addr);
-            if !buddy.is_free
+            if node_state(buddy) != NODE_FREE
                 || buddy.order as usize != merged_order
                 || buddy.seg_idx as usize != seg_idx
                 || buddy.fl_type as usize != fl_type
@@ -930,8 +1213,11 @@ impl BuddyAllocator {
                 break;
             }
 
+            if !self.deactivate_node(buddy_node_addr, NODE_FREE) {
+                self.note_chain_corruption();
+                break;
+            }
             self.remove_from_free_list(buddy_node_addr);
-            self.hash_remove(buddy_node_addr);
             self.recycle_node(buddy_node_addr);
 
             merged_addr = merged_addr.min(buddy_addr);
@@ -940,20 +1226,11 @@ impl BuddyAllocator {
             self.stats.coalesce_count += 1;
         }
 
-        let node = node_mut(node_addr);
-        node.start = merged_addr;
-        node.order = merged_order as u8;
-        node.seg_idx = seg_idx as u32;
-        node.fl_type = fl_type as u8;
-        node.is_free = true;
-        node.ref_count = 0;
-        node.slab_zone_id = 0;
-        node.free_next = 0;
-        node.free_prev = 0;
-        node.hash_next = 0;
-
-        self.hash_insert(node_addr);
-        self.add_to_free_list(node_addr);
+        let Some(merged_node) = self.new_node(merged_addr, merged_order, seg_idx, fl_type, true)
+        else {
+            return 0;
+        };
+        self.add_to_free_list(merged_node);
         merged_count
     }
 
@@ -979,7 +1256,7 @@ impl BuddyAllocator {
             return;
         }
         let node = node_mut(node_addr);
-        if !node.is_free {
+        if node_state(node) == NODE_ALLOCATED {
             node.ref_count = node.ref_count.saturating_add(1);
         }
     }
@@ -990,7 +1267,7 @@ impl BuddyAllocator {
             return false;
         }
         let node = node_mut(node_addr);
-        if node.is_free || node.ref_count == 0 {
+        if node_state(node) != NODE_ALLOCATED || node.ref_count == 0 {
             return false;
         }
         node.ref_count -= 1;
@@ -1005,7 +1282,6 @@ impl BuddyAllocator {
     pub fn stats(&self) -> BuddyStats {
         let mut stats = self.stats;
         stats.node_used = self.node_used;
-        stats.nonempty_hash_bucket_count = self.nonempty_hash_bucket_count;
         stats
     }
 
@@ -1016,9 +1292,8 @@ impl BuddyAllocator {
         }
 
         self.audit_segments(&mut audit);
-        self.audit_hash_buckets(&mut audit);
+        self.audit_pfn_index(&mut audit);
         self.audit_free_lists(&mut audit);
-        self.audit_node_freelist(&mut audit);
         self.audit_accounting(&mut audit);
         audit
     }
@@ -1107,7 +1382,7 @@ impl BuddyAllocator {
             return;
         }
         let node = node_mut(node_addr);
-        if !node.is_free {
+        if node_state(node) == NODE_ALLOCATED {
             node.slab_zone_id = zone_id;
         }
     }
@@ -1140,43 +1415,20 @@ impl BuddyAllocator {
         }
     }
 
-    fn audit_hash_buckets(&self, audit: &mut BuddyAudit) {
-        let mut nonempty_seen = 0usize;
-        for bucket in 0..self.hash_bucket_count {
-            let mut node_addr = self.bucket_head(bucket);
-            if node_addr == 0 {
+    fn audit_pfn_index(&self, audit: &mut BuddyAudit) {
+        for node_idx in 0..self.node_capacity {
+            let node = unsafe { &*self.nodes.add(node_idx) };
+            if node_state(node) == NODE_INACTIVE {
                 continue;
             }
-            nonempty_seen += 1;
-            audit.scanned_nonempty_hash_buckets =
-                audit.scanned_nonempty_hash_buckets.saturating_add(1);
-            let mut visited = 0usize;
-            while node_addr != 0 {
-                if visited >= self.node_used {
-                    audit.flags.insert(BuddyAuditFlags::HASH_CHAIN_LOOP);
-                    break;
-                }
-                visited += 1;
-
-                if !self.node_addr_is_allocated_slot(node_addr) {
-                    audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
-                    break;
-                }
-
-                let node = node_ref(node_addr);
-                if hash_bucket(node.start, self.hash_bucket_count) != bucket {
-                    audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
-                }
-                self.audit_hash_node(node, audit);
-                node_addr = node.hash_next;
+            let Some(node_addr) = self.node_addr_for(node.start) else {
+                audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+                continue;
+            };
+            if node_addr != node as *const BlockNode as usize {
+                audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
             }
-            audit.scanned_max_hash_chain_len = audit.scanned_max_hash_chain_len.max(visited);
-            if nonempty_seen >= self.nonempty_hash_bucket_count {
-                break;
-            }
-        }
-        if nonempty_seen != self.nonempty_hash_bucket_count {
-            audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+            self.audit_hash_node(node, audit);
         }
     }
 
@@ -1188,18 +1440,20 @@ impl BuddyAllocator {
             return;
         };
 
-        if node.is_free {
+        if node_state(node) == NODE_FREE {
             audit.scanned_hash_free_nodes += 1;
             audit.scanned_free_pages = audit.scanned_free_pages.saturating_add(block_pages);
             if node.ref_count != 0 {
                 audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
             }
-        } else {
+        } else if matches!(node_state(node), NODE_ALLOCATED | NODE_CACHED) {
             audit.scanned_allocated_pages =
                 audit.scanned_allocated_pages.saturating_add(block_pages);
             if node.ref_count == 0 || node.free_next != 0 || node.free_prev != 0 {
                 audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
             }
+        } else {
+            audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
         }
     }
 
@@ -1222,11 +1476,11 @@ impl BuddyAllocator {
                     }
 
                     let node = node_ref(node_addr);
-                    if !node.is_free
+                    if node_state(node) != NODE_FREE
                         || node.order as usize != order
                         || node.fl_type as usize != fl_type
                         || node.free_prev != prev
-                        || !self.hash_chain_contains_node(node_addr, node.start)
+                        || self.node_addr_for(node.start) != Some(node_addr)
                     {
                         audit.flags.insert(BuddyAuditFlags::FREE_LIST_NODE_INVALID);
                     }
@@ -1241,34 +1495,6 @@ impl BuddyAllocator {
                     node_addr = node.free_next;
                 }
             }
-        }
-    }
-
-    fn audit_node_freelist(&self, audit: &mut BuddyAudit) {
-        let mut node_addr = self.node_freelist;
-        let mut visited = 0usize;
-        while node_addr != 0 {
-            if visited >= self.node_used {
-                audit.flags.insert(BuddyAuditFlags::NODE_FREELIST_LOOP);
-                break;
-            }
-            visited += 1;
-
-            if !self.node_addr_is_allocated_slot(node_addr) {
-                audit
-                    .flags
-                    .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
-                break;
-            }
-
-            let node = node_ref(node_addr);
-            if node.is_free || node.free_next != 0 || node.free_prev != 0 {
-                audit
-                    .flags
-                    .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
-            }
-            audit.scanned_recycled_nodes += 1;
-            node_addr = node.hash_next;
         }
     }
 
@@ -1294,12 +1520,7 @@ impl BuddyAllocator {
                 .flags
                 .insert(BuddyAuditFlags::PAGE_ACCOUNTING_MISMATCH);
         }
-        if audit
-            .scanned_hash_nodes
-            .saturating_add(audit.scanned_recycled_nodes)
-            != self.node_used
-            || self.node_used > self.node_capacity
-        {
+        if audit.scanned_hash_nodes != self.node_used || self.node_used > self.node_capacity {
             audit
                 .flags
                 .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
@@ -1309,13 +1530,6 @@ impl BuddyAllocator {
             || audit.scanned_free_count_per_order != self.stats.free_count_per_order
         {
             audit.flags.insert(BuddyAuditFlags::FREE_COUNT_MISMATCH);
-        }
-        if audit.scanned_nonempty_hash_buckets != self.nonempty_hash_bucket_count
-            || self.nonempty_hash_bucket_count > self.hash_bucket_count
-        {
-            audit
-                .flags
-                .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
         }
     }
 
@@ -1348,7 +1562,7 @@ impl BuddyAllocator {
             return false;
         }
         let base = self.nodes as usize;
-        let Some(used_bytes) = self.node_used.checked_mul(size_of::<BlockNode>()) else {
+        let Some(used_bytes) = self.node_capacity.checked_mul(size_of::<BlockNode>()) else {
             return false;
         };
         let Some(end) = base.checked_add(used_bytes) else {
@@ -1360,26 +1574,6 @@ impl BuddyAllocator {
         (node_addr - base).is_multiple_of(size_of::<BlockNode>())
     }
 
-    fn hash_chain_contains_node(&self, expected_node: usize, start: usize) -> bool {
-        if self.hash_bucket_count == 0 {
-            return false;
-        }
-        let bucket = hash_bucket(start, self.hash_bucket_count);
-        let mut node_addr = self.bucket_head(bucket);
-        let mut visited = 0usize;
-        while node_addr != 0 {
-            if visited >= self.node_used || !self.node_addr_is_allocated_slot(node_addr) {
-                return false;
-            }
-            if node_addr == expected_node {
-                return true;
-            }
-            visited += 1;
-            node_addr = node_ref(node_addr).hash_next;
-        }
-        false
-    }
-
     fn reset(&mut self) {
         self.segments = null_mut();
         self.segment_count = 0;
@@ -1387,14 +1581,11 @@ impl BuddyAllocator {
         self.reserved_range_count = 0;
         self.metadata_ranges = null_mut();
         self.metadata_range_count = 0;
-        self.hash_buckets = null_mut();
-        self.hash_bucket_count = 0;
-        self.nonempty_hash_bucket_count = 0;
         self.nodes = null_mut();
+        self.slab_owners = null_mut();
         self.node_capacity = 0;
         self.node_used = 0;
         self.free_heads = [0; FREE_HEADS];
-        self.node_freelist = 0;
         self.initialized = false;
         self.stats = BuddyStats::new();
     }
@@ -1516,7 +1707,6 @@ impl BuddyAllocator {
             let node_addr = self
                 .new_node(start, order, seg_idx, seg.fl_type, true)
                 .ok_or(BuddyInitError::MetadataOutOfMemory)?;
-            self.hash_insert(node_addr);
             self.add_to_free_list(node_addr);
             self.stats.free_pages += block_pages;
             current += block_pages;
@@ -1549,50 +1739,49 @@ impl BuddyAllocator {
     fn allocate_from_free_node(&mut self, node_addr: usize, target_order: usize) -> Option<usize> {
         let node = node_ref(node_addr);
         let current_order = node.order as usize;
-        if current_order < target_order || !node.is_free {
+        if current_order < target_order || node_state(node) != NODE_FREE {
             return None;
         }
 
         let needed = current_order - target_order;
-        let mut split_nodes = [0usize; MAX_TRACKED_ORDER + 1];
-        if !self.preallocate_nodes(needed, &mut split_nodes) {
-            return None;
-        }
-
-        self.remove_from_free_list(node_addr);
-        self.hash_remove(node_addr);
-
-        let node = node_mut(node_addr);
         let seg_idx = node.seg_idx as usize;
         let fl_type = node.fl_type as usize;
         let current_start = node.start;
 
+        for depth in 0..needed {
+            let split_order = current_order - depth - 1;
+            let right_start = current_start + ((1usize << split_order) * PAGE_SIZE);
+            if !self.node_slot_is_inactive(right_start) {
+                return None;
+            }
+        }
+
+        if !self.deactivate_node(node_addr, NODE_FREE) {
+            self.note_chain_corruption();
+            return None;
+        }
+        self.remove_from_free_list(node_addr);
+        self.recycle_node(node_addr);
+
         (0..needed).for_each(|depth| {
             let split_order = current_order - depth - 1;
             let right_start = current_start + ((1usize << split_order) * PAGE_SIZE);
-            let buddy_addr = split_nodes[depth];
-            initialize_node(buddy_addr, right_start, split_order, seg_idx, fl_type, true);
-            self.hash_insert(buddy_addr);
-            self.add_to_free_list(buddy_addr);
+            let buddy_node = self
+                .new_node(right_start, split_order, seg_idx, fl_type, true)
+                .expect("direct PFN split slot must be available");
+            self.add_to_free_list(buddy_node);
             self.stats.split_count += 1;
-            node_mut(node_addr).order = split_order as u8;
         });
 
-        let node = node_mut(node_addr);
-        node.start = current_start;
-        node.order = target_order as u8;
-        node.is_free = false;
-        node.ref_count = 1;
-        node.slab_zone_id = 0;
-        node.free_next = 0;
-        node.free_prev = 0;
-        node.hash_next = 0;
-        self.hash_insert(node_addr);
+        let allocated_node = self
+            .new_node(current_start, target_order, seg_idx, fl_type, false)
+            .expect("direct PFN allocation slot must be available");
+        debug_assert_eq!(node_ref(allocated_node).start, current_start);
 
         let block_pages = 1usize << target_order;
         self.stats.allocated_pages += block_pages;
         self.stats.free_pages = self.stats.free_pages.saturating_sub(block_pages);
-        Some(node.start)
+        Some(current_start)
     }
 
     fn try_alloc_pages_exact_from_free(
@@ -1619,7 +1808,7 @@ impl BuddyAllocator {
                 continue;
             }
             let node = node_ref(node_addr);
-            if !node.is_free
+            if node_state(node) != NODE_FREE
                 || node.order as usize != current_order
                 || node.seg_idx as usize != seg_idx
             {
@@ -1645,87 +1834,52 @@ impl BuddyAllocator {
         let seg = *self.segment(seg_idx)?;
         let mut current_start = node.start;
         let needed = current_order.saturating_sub(target_order);
+        let original_start = current_start;
+        let mut buddy_starts = [0usize; MAX_TRACKED_ORDER + 1];
 
-        let mut split_nodes = [0usize; MAX_TRACKED_ORDER + 1];
-        if !self.preallocate_nodes(needed, &mut split_nodes) {
-            return None;
-        }
-
-        self.remove_from_free_list(node_addr);
-        self.hash_remove(node_addr);
-
-        (0..needed).for_each(|depth| {
+        for (depth, buddy_start) in buddy_starts.iter_mut().enumerate().take(needed) {
             let split_order = current_order - depth - 1;
             let half_size = (1usize << split_order) * PAGE_SIZE;
             let left_start = current_start;
             let right_start = left_start + half_size;
 
             if target_addr < right_start {
-                let buddy_addr = split_nodes[depth];
-                initialize_node(
-                    buddy_addr,
-                    right_start,
-                    split_order,
-                    seg_idx,
-                    seg.fl_type,
-                    true,
-                );
-                self.hash_insert(buddy_addr);
-                self.add_to_free_list(buddy_addr);
+                *buddy_start = right_start;
             } else {
-                let buddy_addr = split_nodes[depth];
-                initialize_node(
-                    buddy_addr,
-                    left_start,
-                    split_order,
-                    seg_idx,
-                    seg.fl_type,
-                    true,
-                );
-                self.hash_insert(buddy_addr);
-                self.add_to_free_list(buddy_addr);
+                *buddy_start = left_start;
                 current_start = right_start;
             }
-            self.stats.split_count += 1;
-        });
+        }
+        if buddy_starts[..needed]
+            .iter()
+            .chain(core::iter::once(&current_start))
+            .any(|start| *start != original_start && !self.node_slot_is_inactive(*start))
+        {
+            return None;
+        }
 
-        let node = node_mut(node_addr);
-        node.start = current_start;
-        node.order = target_order as u8;
-        node.is_free = false;
-        node.ref_count = 1;
-        node.slab_zone_id = 0;
-        node.free_next = 0;
-        node.free_prev = 0;
-        node.hash_next = 0;
-        self.hash_insert(node_addr);
+        if !self.deactivate_node(node_addr, NODE_FREE) {
+            self.note_chain_corruption();
+            return None;
+        }
+        self.remove_from_free_list(node_addr);
+        self.recycle_node(node_addr);
+
+        for (depth, buddy_start) in buddy_starts.iter().copied().enumerate().take(needed) {
+            let split_order = current_order - depth - 1;
+            let buddy_node = self
+                .new_node(buddy_start, split_order, seg_idx, seg.fl_type, true)
+                .expect("direct PFN exact split slot must be available");
+            self.add_to_free_list(buddy_node);
+            self.stats.split_count += 1;
+        }
+        self.new_node(current_start, target_order, seg_idx, seg.fl_type, false)
+            .expect("direct PFN exact allocation slot must be available");
 
         let block_pages = 1usize << target_order;
         self.stats.allocated_pages += block_pages;
         self.stats.free_pages = self.stats.free_pages.saturating_sub(block_pages);
-        Some(node.start)
-    }
-
-    fn preallocate_nodes(
-        &mut self,
-        count: usize,
-        out: &mut [usize; MAX_TRACKED_ORDER + 1],
-    ) -> bool {
-        if count == 0 {
-            return true;
-        }
-
-        for idx in 0..count {
-            let Some(node_addr) = self.alloc_node_raw() else {
-                (0..idx).for_each(|rollback| {
-                    self.recycle_node(out[rollback]);
-                    out[rollback] = 0;
-                });
-                return false;
-            };
-            out[idx] = node_addr;
-        }
-        true
+        Some(current_start)
     }
 
     fn new_node(
@@ -1736,37 +1890,19 @@ impl BuddyAllocator {
         fl_type: usize,
         is_free: bool,
     ) -> Option<usize> {
-        let node_addr = self.alloc_node_raw()?;
+        let node_addr = self.node_addr_for(start)?;
+        if node_state(node_ref(node_addr)) != NODE_INACTIVE {
+            return None;
+        }
         initialize_node(node_addr, start, order, seg_idx, fl_type, is_free);
+        self.node_used = self.node_used.saturating_add(1);
         Some(node_addr)
     }
 
-    fn alloc_node_raw(&mut self) -> Option<usize> {
-        if self.node_freelist != 0 {
-            let node_addr = self.node_freelist;
-            self.node_freelist = node_ref(node_addr).hash_next;
-            let node = node_mut(node_addr);
-            *node = BlockNode::empty();
-            return Some(node_addr);
-        }
-
-        if self.nodes.is_null() || self.node_used >= self.node_capacity {
-            None
-        } else {
-            let ptr = unsafe { self.nodes.add(self.node_used) } as usize;
-            self.node_used += 1;
-            unsafe {
-                (ptr as *mut BlockNode).write(BlockNode::empty());
-            }
-            Some(ptr)
-        }
-    }
-
     fn recycle_node(&mut self, node_addr: usize) {
+        debug_assert_eq!(node_state(node_ref(node_addr)), NODE_INACTIVE);
         let node = node_mut(node_addr);
         *node = BlockNode::empty();
-        node.hash_next = self.node_freelist;
-        self.node_freelist = node_addr;
     }
 
     fn add_to_free_list(&mut self, node_addr: usize) {
@@ -1776,7 +1912,7 @@ impl BuddyAllocator {
         let head = self.free_head(fl_type, order);
 
         let node = node_mut(node_addr);
-        node.is_free = true;
+        node.state.store(NODE_FREE, Ordering::Relaxed);
         node.free_prev = 0;
         node.free_next = head;
 
@@ -1811,97 +1947,42 @@ impl BuddyAllocator {
             self.stats.free_count_per_order[order].saturating_sub(1);
     }
 
-    fn hash_find(&mut self, start: usize) -> usize {
-        if self.hash_bucket_count == 0 {
+    #[inline]
+    fn hash_find(&self, start: usize) -> usize {
+        let Some(node_addr) = self.node_addr_for(start) else {
             return 0;
+        };
+        let node = node_ref(node_addr);
+        if node_state(node) == NODE_INACTIVE || node.start != start {
+            0
+        } else {
+            node_addr
         }
-        let bucket = hash_bucket(start, self.hash_bucket_count);
-        let mut node_addr = self.bucket_head(bucket);
-        let mut visited = 0usize;
-        while node_addr != 0 {
-            if visited >= self.node_used {
-                self.note_chain_corruption();
-                return 0;
-            }
-            visited += 1;
-
-            let node = node_ref(node_addr);
-            if node.start == start {
-                return node_addr;
-            }
-            node_addr = node.hash_next;
-        }
-        0
     }
 
-    fn hash_insert(&mut self, node_addr: usize) {
-        let bucket = hash_bucket(node_ref(node_addr).start, self.hash_bucket_count);
-        let head = self.bucket_head(bucket);
-        let node = node_mut(node_addr);
-        node.hash_next = head;
-        self.set_bucket_head(bucket, node_addr);
-    }
-
-    fn hash_remove(&mut self, node_addr: usize) {
-        if self.hash_bucket_count == 0 {
-            return;
+    #[inline]
+    fn deactivate_node(&mut self, node_addr: usize, expected_state: u8) -> bool {
+        let node = node_ref(node_addr);
+        if node
+            .state
+            .compare_exchange(
+                expected_state,
+                NODE_INACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
         }
-        let start = node_ref(node_addr).start;
-        let bucket = hash_bucket(start, self.hash_bucket_count);
-        let mut current = self.bucket_head(bucket);
-        let mut prev = 0usize;
-        let mut visited = 0usize;
-
-        while current != 0 {
-            if visited >= self.node_used {
-                self.note_chain_corruption();
-                return;
-            }
-            visited += 1;
-
-            if current == node_addr {
-                let next = node_ref(current).hash_next;
-                if prev == 0 {
-                    self.set_bucket_head(bucket, next);
-                } else {
-                    node_mut(prev).hash_next = next;
-                }
-                node_mut(current).hash_next = 0;
-                return;
-            }
-            prev = current;
-            current = node_ref(current).hash_next;
-        }
+        self.node_used = self.node_used.saturating_sub(1);
+        true
     }
 
     fn note_chain_corruption(&mut self) {
-        // buddy 是物理页账本的底层结构，hash/free 链一旦损坏不能在持锁路径无限遍历。
+        // buddy 是物理页账本的底层结构，free 链一旦损坏不能在持锁路径无限遍历。
         // 这里保留计数给诊断和审计，让异常以 allocator invariant 的形式暴露。
         self.stats.chain_corruptions = self.stats.chain_corruptions.saturating_add(1);
-    }
-
-    fn bucket_head(&self, bucket: usize) -> usize {
-        if self.hash_buckets.is_null() {
-            0
-        } else {
-            unsafe { *self.hash_buckets.add(bucket) }
-        }
-    }
-
-    fn set_bucket_head(&mut self, bucket: usize, head: usize) {
-        let old = self.bucket_head(bucket);
-        unsafe {
-            *self.hash_buckets.add(bucket) = head;
-        }
-        match (old == 0, head == 0) {
-            (true, false) => {
-                self.nonempty_hash_bucket_count = self.nonempty_hash_bucket_count.saturating_add(1);
-            }
-            (false, true) => {
-                self.nonempty_hash_bucket_count = self.nonempty_hash_bucket_count.saturating_sub(1);
-            }
-            _ => {}
-        }
     }
 
     fn free_head(&self, fl_type: usize, order: usize) -> usize {
@@ -1933,33 +2014,37 @@ impl BuddyAllocator {
         None
     }
 
+    #[inline]
+    fn node_addr_for(&self, addr: usize) -> Option<usize> {
+        if addr % PAGE_SIZE != 0 {
+            return None;
+        }
+        let (seg_idx, page_idx) = self.page_location(addr)?;
+        let seg = self.segment(seg_idx)?;
+        let node_idx = seg.node_base.checked_add(page_idx)?;
+        if self.nodes.is_null() || node_idx >= self.node_capacity {
+            return None;
+        }
+        Some(unsafe { self.nodes.add(node_idx) } as usize)
+    }
+
+    #[inline]
+    fn node_slot_is_inactive(&self, addr: usize) -> bool {
+        self.node_addr_for(addr)
+            .map(|node_addr| node_state(node_ref(node_addr)) == NODE_INACTIVE)
+            .unwrap_or(false)
+    }
+
     fn any_tracked_block_overlaps(&self, start: usize, end: usize) -> bool {
-        let mut nonempty_seen = 0usize;
-        for bucket in 0..self.hash_bucket_count {
-            let mut node_addr = self.bucket_head(bucket);
-            if node_addr == 0 {
+        for node_idx in 0..self.node_capacity {
+            let node = unsafe { &*self.nodes.add(node_idx) };
+            if node_state(node) == NODE_INACTIVE {
                 continue;
             }
-            nonempty_seen += 1;
-
-            let mut visited = 0usize;
-            while node_addr != 0 {
-                if visited >= self.node_used {
-                    return true;
-                }
-                visited += 1;
-
-                let node = node_ref(node_addr);
-                let size = (1usize << (node.order as usize)).saturating_mul(PAGE_SIZE);
-                let node_end = node.start.saturating_add(size);
-                if node.start < end && start < node_end {
-                    return true;
-                }
-                node_addr = node.hash_next;
-            }
-
-            if nonempty_seen >= self.nonempty_hash_bucket_count {
-                break;
+            let size = (1usize << (node.order as usize)).saturating_mul(PAGE_SIZE);
+            let node_end = node.start.saturating_add(size);
+            if node.start < end && start < node_end {
+                return true;
             }
         }
         false
@@ -2125,13 +2210,18 @@ fn initialize_node(
         order: order as u8,
         seg_idx: seg_idx as u32,
         fl_type: fl_type as u8,
-        is_free,
+        state: AtomicU8::new(if is_free { NODE_FREE } else { NODE_ALLOCATED }),
+        cache_eligible: false,
         ref_count: if is_free { 0 } else { 1 },
         slab_zone_id: 0,
         free_next: 0,
         free_prev: 0,
-        hash_next: 0,
     };
+}
+
+#[inline]
+fn node_state(node: &BlockNode) -> u8 {
+    node.state.load(Ordering::Acquire)
 }
 
 fn count_effective_segments(segments: &[MemorySegment]) -> usize {
@@ -2205,15 +2295,14 @@ fn normalize_segment(segment: MemorySegment) -> MemorySegment {
 fn buddy_metadata_bytes(
     segment_count: usize,
     reserved_count: usize,
-    bucket_count: usize,
     node_capacity: usize,
 ) -> Option<usize> {
     let mut cursor = 0usize;
     bump_metadata_size::<BuddySegment>(&mut cursor, segment_count)?;
     bump_metadata_size::<MemorySegment>(&mut cursor, reserved_count)?;
     bump_metadata_size::<MemorySegment>(&mut cursor, METADATA_RANGE_COUNT)?;
-    bump_metadata_size::<usize>(&mut cursor, bucket_count)?;
     bump_metadata_size::<BlockNode>(&mut cursor, node_capacity)?;
+    bump_metadata_size::<AtomicUsize>(&mut cursor, node_capacity)?;
     align_up_checked(cursor, PAGE_SIZE)
 }
 
@@ -2406,27 +2495,6 @@ fn free_head_index(fl_type: usize, order: usize) -> usize {
 }
 
 #[inline]
-fn hash_bucket(start: usize, bucket_count: usize) -> usize {
-    let mut x = start >> PAGE_SHIFT;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51afd7ed558ccdusize);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ceb9fe1a85ec53usize);
-    x ^= x >> 33;
-    x & (bucket_count - 1)
-}
-
-fn choose_hash_bucket_count(total_pages: usize) -> usize {
-    let mut buckets = total_pages
-        .div_ceil(TARGET_HASH_CHAIN)
-        .clamp(MIN_HASH_BUCKETS, MAX_HASH_BUCKETS);
-    if !buckets.is_power_of_two() {
-        buckets = buckets.next_power_of_two();
-    }
-    buckets
-}
-
-#[inline]
 fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
 }
@@ -2490,4 +2558,174 @@ fn align_down_checked(value: usize, align: usize) -> Option<usize> {
         return None;
     }
     Some(value & !(align - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::alloc::Layout;
+    use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
+
+    use super::{BuddyAllocator, MemorySegment, PAGE_SIZE};
+    use crate::boot::BootAllocator;
+
+    const TEST_MEMORY_SIZE: usize = 32 * 1024 * 1024;
+
+    struct TestMemory {
+        ptr: *mut u8,
+        layout: Layout,
+    }
+
+    impl TestMemory {
+        fn new() -> Self {
+            let layout = Layout::from_size_align(TEST_MEMORY_SIZE, PAGE_SIZE).unwrap();
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            Self { ptr, layout }
+        }
+
+        fn segment(&self) -> MemorySegment {
+            MemorySegment {
+                start: self.ptr as usize,
+                size: self.layout.size(),
+            }
+        }
+    }
+
+    impl Drop for TestMemory {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.ptr, self.layout) };
+        }
+    }
+
+    fn identity(address: usize) -> usize {
+        address
+    }
+
+    fn test_buddy() -> (TestMemory, BuddyAllocator) {
+        let memory = TestMemory::new();
+        let mut buddy = BuddyAllocator::new();
+        buddy
+            .init(&[memory.segment()], &[], identity, &BootAllocator::new())
+            .unwrap();
+        (memory, buddy)
+    }
+
+    #[test]
+    fn cacheable_order0_page_has_atomic_cached_lifecycle() {
+        let (_memory, mut buddy) = test_buddy();
+        let allocation = buddy.alloc_cacheable_order0().unwrap();
+        let index = buddy.page_cache_index();
+
+        index.try_cache(allocation).unwrap();
+        assert!(buddy.free_allocation(allocation).is_err());
+        index.try_activate(allocation.paddr).unwrap();
+        buddy.free_allocation(allocation).unwrap();
+
+        assert!(buddy.audit().is_consistent());
+    }
+
+    #[test]
+    fn exact_allocation_returns_requested_address_across_split_and_coalesce() {
+        let (_memory, mut buddy) = test_buddy();
+        let pair = buddy
+            .alloc_pages_with(&crate::PhysicalAllocRequest::new(
+                PAGE_SIZE * 2,
+                PAGE_SIZE * 2,
+            ))
+            .unwrap();
+        buddy.free_allocation(pair).unwrap();
+
+        let left = buddy
+            .alloc_pages_with(
+                &crate::PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE)
+                    .with_placement(crate::MemoryPlacement::ExactPhys(pair.paddr)),
+            )
+            .unwrap();
+        let right = buddy
+            .alloc_pages_with(
+                &crate::PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE)
+                    .with_placement(crate::MemoryPlacement::ExactPhys(pair.paddr + PAGE_SIZE)),
+            )
+            .unwrap();
+        assert_eq!(left.paddr, pair.paddr);
+        assert_eq!(right.paddr, pair.paddr + PAGE_SIZE);
+        buddy.free_allocation(right).unwrap();
+        buddy.free_allocation(left).unwrap();
+
+        let reunited = buddy
+            .alloc_pages_with(
+                &crate::PhysicalAllocRequest::new(PAGE_SIZE * 2, PAGE_SIZE * 2)
+                    .with_placement(crate::MemoryPlacement::ExactPhys(pair.paddr)),
+            )
+            .unwrap();
+        assert_eq!(reunited.paddr, pair.paddr);
+        buddy.free_allocation(reunited).unwrap();
+
+        let stats = buddy.stats();
+        assert_eq!(stats.pfn_index_slots, stats.total_pages);
+        assert!(buddy.audit().is_consistent());
+    }
+
+    #[test]
+    fn exact_allocation_returns_requested_right_half_address() {
+        let (_memory, mut buddy) = test_buddy();
+        let source = buddy
+            .alloc_pages_with(&crate::PhysicalAllocRequest::new(
+                PAGE_SIZE * 4,
+                PAGE_SIZE * 4,
+            ))
+            .unwrap();
+        buddy.free_allocation(source).unwrap();
+
+        let target = source.paddr + PAGE_SIZE * 2;
+        let right_half = buddy
+            .alloc_pages_with(
+                &crate::PhysicalAllocRequest::new(PAGE_SIZE * 2, PAGE_SIZE * 2)
+                    .with_placement(crate::MemoryPlacement::ExactPhys(target)),
+            )
+            .unwrap();
+        assert_eq!(right_half.paddr, target);
+
+        buddy.free_allocation(right_half).unwrap();
+        assert!(buddy.audit().is_consistent());
+    }
+
+    #[test]
+    fn slab_owner_index_covers_every_page_and_clears_before_reuse() {
+        const OWNER: usize = 0x1234_5000;
+
+        let (_memory, mut buddy) = test_buddy();
+        let allocation = buddy
+            .alloc_pages_with(&crate::PhysicalAllocRequest::new(
+                PAGE_SIZE * 4,
+                PAGE_SIZE * 4,
+            ))
+            .unwrap();
+        let index = buddy.slab_owner_index();
+
+        assert!(index.publish_range(allocation.paddr, allocation.size, OWNER));
+        for offset in (0..allocation.size).step_by(PAGE_SIZE) {
+            assert_eq!(index.lookup(allocation.paddr + offset), Some(OWNER));
+        }
+        assert!(index.clear_range(allocation.paddr, allocation.size, OWNER));
+        for offset in (0..allocation.size).step_by(PAGE_SIZE) {
+            assert_eq!(index.lookup(allocation.paddr + offset), None);
+        }
+
+        buddy.free_allocation(allocation).unwrap();
+        let reused = buddy
+            .alloc_pages_with(
+                &crate::PhysicalAllocRequest::new(PAGE_SIZE * 4, PAGE_SIZE * 4)
+                    .with_placement(crate::MemoryPlacement::ExactPhys(allocation.paddr)),
+            )
+            .unwrap();
+        assert_eq!(reused.paddr, allocation.paddr);
+        assert_eq!(index.lookup(reused.paddr), None);
+        buddy.free_allocation(reused).unwrap();
+        assert!(buddy.audit().is_consistent());
+    }
 }

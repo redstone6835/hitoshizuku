@@ -10,8 +10,8 @@ use crate::boot::BootAllocator;
 use crate::buddy::{DEFERRED_ORDER0_COALESCE_TARGET, DEFERRED_ORDER0_MIN_FREE_PERCENT};
 use crate::registry::AllocationRegistry;
 use crate::request::{
-    AllocationKind, AllocationRecord, MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy,
-    PhysicalAllocRequest, Zeroing,
+    AllocationArena, AllocationKind, AllocationRecord, MemoryDomain, MemoryPlacement,
+    MemoryRequest, PagePolicy, PhysicalAllocRequest, Zeroing,
 };
 use crate::{
     ALLOCATOR_API_VERSION, AllocationError, AllocationRegistryAuditFlags, AllocatorAuditFlags,
@@ -74,6 +74,43 @@ fn global_owner_zero_zeroed_allocation_preserves_contents() {
             .is_err()
     );
     unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, ptr, layout) };
+}
+
+/// 普通大对象使用 direct-map 后端，不应消耗 kernel vmem；显式 tracked 分配仍应消耗。
+#[ktest]
+fn direct_large_allocation_bypasses_only_kernel_vmem() {
+    let layout = Layout::from_size_align(4 * PAGE_SIZE, PAGE_SIZE).expect("valid large layout");
+    let before = KERNEL_ALLOCATOR.address_space_stats();
+    let ptr = unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, layout) };
+    assert!(!ptr.is_null());
+    let direct = KERNEL_ALLOCATOR.address_space_stats();
+    assert_eq!(direct.kernel.alloc_count, before.kernel.alloc_count);
+    assert_eq!(direct.kernel.allocated_size, before.kernel.allocated_size);
+
+    let tracked = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(
+            MemoryDomain::Kernel,
+            4 * PAGE_SIZE,
+            PAGE_SIZE,
+        ))
+        .expect("tracked large allocation");
+    assert_eq!(tracked.arena, Some(AllocationArena::Tracked));
+    assert_eq!(
+        KERNEL_ALLOCATOR.query_tracked_allocation(tracked.ptr),
+        Ok(tracked)
+    );
+
+    KERNEL_ALLOCATOR
+        .deallocate(tracked.ptr)
+        .expect("deallocate tracked large allocation");
+    unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, ptr, layout) };
+    let after = KERNEL_ALLOCATOR.address_space_stats();
+    assert_eq!(after.kernel.allocated_size, before.kernel.allocated_size);
+    assert!(
+        KERNEL_ALLOCATOR
+            .query_tracked_allocation(tracked.ptr)
+            .is_err()
+    );
 }
 
 /// 显式分配接口仍应进入资源账本。

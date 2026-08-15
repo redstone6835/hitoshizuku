@@ -7,14 +7,19 @@ use ktest::ktest;
 use super::test_thread_metadata::make_task;
 use crate::ArchDeadlineTimerOps;
 use crate::scheduler::{
-    cancel_sleep_deadline, earliest_deadline_for_test, register_sleep_deadline,
-    register_sleep_deadline_for_test, reprogram_current_deadline, set_realtime_itimer,
-    take_expired_sleepers_for_test, timer_fired_for_test,
+    cached_state_deadline_call_count_for_test, cancel_sleep_deadline, earliest_deadline_for_test,
+    register_sleep_deadline, register_sleep_deadline_for_test, reprogram_current_deadline,
+    reset_timer_event_scan_counts_for_test, service_expired_timer_events_for_test,
+    set_realtime_itimer, take_expired_sleepers_for_test, timer_event_scan_counts_for_test,
+    timer_fired_for_test,
 };
+use crate::sync::Spinlock;
 
 const NO_DEADLINE: u64 = u64::MAX;
 static LAST_DEADLINE: AtomicU64 = AtomicU64::new(NO_DEADLINE);
 static REPROGRAM_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 这些测试共享全局软件定时器表和唯一的架构定时器钩子，必须串行执行。
+static DEADLINE_TEST_LOCK: Spinlock<()> = Spinlock::new(());
 
 fn record_deadline(deadline_ns: Option<u64>) {
     LAST_DEADLINE.store(deadline_ns.unwrap_or(NO_DEADLINE), Ordering::Release);
@@ -27,6 +32,7 @@ static TEST_DEADLINE_TIMER_OPS: ArchDeadlineTimerOps = ArchDeadlineTimerOps {
 
 #[ktest]
 fn deadline_timer_tracks_earliest_source_and_cancellation() {
+    let _test_guard = DEADLINE_TEST_LOCK.lock();
     crate::arch_hooks::register_deadline_timer(&TEST_DEADLINE_TIMER_OPS);
     LAST_DEADLINE.store(NO_DEADLINE, Ordering::Release);
     REPROGRAM_COUNT.store(0, Ordering::Release);
@@ -78,6 +84,7 @@ fn deadline_timer_tracks_earliest_source_and_cancellation() {
 
 #[ktest]
 fn expired_sleepers_are_taken_in_one_cpu_local_batch() {
+    let _test_guard = DEADLINE_TEST_LOCK.lock();
     let first = make_task();
     let second = make_task();
     let future = make_task();
@@ -105,4 +112,39 @@ fn expired_sleepers_are_taken_in_one_cpu_local_batch() {
 
     cancel_sleep_deadline(&future);
     cancel_sleep_deadline(&remote);
+}
+
+#[ktest]
+fn future_deadline_skips_event_table_scans_until_expiry() {
+    let _test_guard = DEADLINE_TEST_LOCK.lock();
+    let sleeper = make_task();
+
+    assert!(register_sleep_deadline_for_test(&sleeper, 300, 0));
+    reset_timer_event_scan_counts_for_test();
+
+    assert!(!service_expired_timer_events_for_test(100, 0));
+    assert!(!service_expired_timer_events_for_test(299, 0));
+    assert_eq!(timer_event_scan_counts_for_test(), (0, 0));
+    assert_eq!(earliest_deadline_for_test(0), Some(300));
+
+    assert!(!service_expired_timer_events_for_test(300, 0));
+    assert_eq!(timer_event_scan_counts_for_test(), (1, 0));
+    assert_eq!(earliest_deadline_for_test(0), None);
+
+    let _ = set_realtime_itimer(&sleeper, 200, 0);
+    reset_timer_event_scan_counts_for_test();
+
+    assert!(!service_expired_timer_events_for_test(199, 0));
+    assert_eq!(timer_event_scan_counts_for_test(), (0, 0));
+
+    let _ = set_realtime_itimer(&sleeper, 0, 0);
+}
+
+#[ktest]
+fn timer_tick_without_deadline_skips_cached_deadline_lookup() {
+    let _test_guard = DEADLINE_TEST_LOCK.lock();
+    reset_timer_event_scan_counts_for_test();
+
+    assert!(!service_expired_timer_events_for_test(100, 0));
+    assert_eq!(cached_state_deadline_call_count_for_test(), 0);
 }

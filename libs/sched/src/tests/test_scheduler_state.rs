@@ -13,7 +13,8 @@ use crate::ids::Uid;
 use crate::scheduler::{
     cpu_ready_for_activation, dequeue_for_state_change_on, enqueue_task_on_scheduler,
     offline_cpu_with_scheduler, record_deferred_timer_tick, refresh_task_placement,
-    requeue_balance_task_on, take_deferred_timer_tick, task_runqueue_cpu_on,
+    requeue_balance_task_on, select_current_task_ptr, take_deferred_timer_tick,
+    task_runqueue_cpu_on,
 };
 use crate::{
     BorrowedCurrentTask, CpuId, CpuMask, HandoffReason, HandoffTarget, PlacementState,
@@ -61,6 +62,21 @@ fn borrowed_current_survives_raw_slot_replacement_with_prev_owner() {
     assert!(Arc::ptr_eq(borrowed.as_arc(), &suspended_stack_prev));
     let promoted = borrowed.to_arc();
     assert!(Arc::ptr_eq(&promoted, &suspended_stack_prev));
+}
+
+#[ktest]
+fn architecture_local_current_pointer_bypasses_global_fallback() {
+    let task = make_task();
+    let local = Arc::as_ptr(&task) as *mut _;
+    let fallback_called = AtomicBool::new(false);
+
+    let selected = select_current_task_ptr(local, || {
+        fallback_called.store(true, Ordering::Relaxed);
+        core::ptr::null_mut()
+    });
+
+    assert_eq!(selected, local);
+    assert!(!fallback_called.load(Ordering::Relaxed));
 }
 
 #[ktest]
@@ -262,6 +278,21 @@ fn scheduler_state_installs_topology_and_online_cpu_together() {
     assert!(core.online_set().contains(CpuId::boot()));
     assert!(core.online_set().contains(CpuId::new(1).unwrap()));
     assert!(core.active_set().contains(CpuId::new(1).unwrap()));
+}
+
+#[ktest]
+fn topology_snapshots_share_immutable_storage_until_replacement() {
+    let core = Scheduler::new();
+    let first = core.topology_snapshot();
+    let second = core.topology_snapshot();
+    assert!(first.shares_topology_storage_with(&second));
+
+    core.install_topology(SchedTopology::with_cpu_domains());
+    let replacement = core.topology_snapshot();
+
+    assert!(!first.shares_topology_storage_with(&replacement));
+    assert_eq!(first.topology(), &SchedTopology::bootstrap());
+    assert_eq!(replacement.topology(), &SchedTopology::with_cpu_domains());
 }
 
 #[ktest]
@@ -729,6 +760,6 @@ fn two_cpu_scheduler() -> Scheduler {
 fn bind_to_cpu(scheduler: &Scheduler, task: &crate::Task, cpu_id: usize) {
     let cpu = CpuId::new(cpu_id).expect("cpu");
     let snapshot = scheduler.topology_snapshot();
-    let domain = snapshot.topology.domain_for_cpu(cpu).expect("cpu domain");
+    let domain = snapshot.topology().domain_for_cpu(cpu).expect("cpu domain");
     task.bind_placement(cpu, domain.id(), snapshot.generation);
 }

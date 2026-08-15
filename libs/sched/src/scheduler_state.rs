@@ -370,17 +370,67 @@ pub struct Scheduler {
     domain_stats: Spinlock<[SchedDomainStats; MAX_SCHED_DOMAINS]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct TopologyState {
-    topology: SchedTopology,
+    topology: TopologyStorage,
     generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 启动期拓扑必须保持 const 初始化；运行时安装的拓扑用 Arc 保活，使拿到旧快照的
+/// 迁移和诊断路径不必复制整棵固定容量拓扑，也不会看到已释放的旧配置。
+#[derive(Debug, Clone)]
+enum TopologyStorage {
+    Bootstrap,
+    Installed(Arc<SchedTopology>),
+}
+
+impl TopologyStorage {
+    #[inline]
+    fn topology(&self) -> &SchedTopology {
+        match self {
+            Self::Bootstrap => &BOOTSTRAP_TOPOLOGY,
+            Self::Installed(topology) => topology,
+        }
+    }
+
+    #[cfg(test)]
+    fn same_storage(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bootstrap, Self::Bootstrap) => true,
+            (Self::Installed(left), Self::Installed(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+static BOOTSTRAP_TOPOLOGY: SchedTopology = SchedTopology::bootstrap();
+
+#[derive(Debug, Clone)]
 pub struct TopologySnapshot {
-    pub topology: SchedTopology,
+    topology: TopologyStorage,
     pub generation: u64,
     pub active: CpuMask,
+}
+
+impl TopologySnapshot {
+    #[inline]
+    pub fn topology(&self) -> &SchedTopology {
+        self.topology.topology()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(topology: SchedTopology, generation: u64, active: CpuMask) -> Self {
+        Self {
+            topology: TopologyStorage::Installed(Arc::new(topology)),
+            generation,
+            active,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_topology_storage_with(&self, other: &Self) -> bool {
+        self.topology.same_storage(&other.topology)
+    }
 }
 
 /// 一个调度域在指定拓扑代际下的聚合负载与有效容量。
@@ -429,7 +479,7 @@ impl Scheduler {
             active: AtomicU64::new(CpuMask::BOOT.bits()),
             topology_generation: AtomicU64::new(1),
             topology: Spinlock::new(TopologyState {
-                topology: SchedTopology::bootstrap(),
+                topology: TopologyStorage::Bootstrap,
                 generation: 1,
             }),
             domain_stats: Spinlock::new([SchedDomainStats::empty(); MAX_SCHED_DOMAINS]),
@@ -511,7 +561,7 @@ impl Scheduler {
     }
 
     pub fn topology(&self) -> SchedTopology {
-        self.topology.lock().topology
+        self.topology.lock().topology.topology().clone()
     }
 
     pub fn topology_generation(&self) -> u64 {
@@ -519,9 +569,9 @@ impl Scheduler {
     }
 
     pub fn topology_snapshot(&self) -> TopologySnapshot {
-        let state = *self.topology.lock();
+        let state = self.topology.lock();
         TopologySnapshot {
-            topology: state.topology,
+            topology: state.topology.clone(),
             generation: state.generation,
             active: self.active_set(),
         }
@@ -533,8 +583,8 @@ impl Scheduler {
         cpu_loads: &[RunqueueClassLoad; MAX_CPUS],
     ) {
         let mut stats = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
-        for domain_id in 0..snapshot.topology.len() {
-            let Some(domain) = snapshot.topology.domain(domain_id) else {
+        for domain_id in 0..snapshot.topology().len() {
+            let Some(domain) = snapshot.topology().domain(domain_id) else {
                 continue;
             };
             let cpus = domain.span().intersection(snapshot.active);
@@ -571,7 +621,7 @@ impl Scheduler {
         // 先发布新代际，让并发观察者在旧拓扑失效后进入带锁慢路径。
         self.topology_generation
             .store(generation, Ordering::Release);
-        state.topology = topology;
+        state.topology = TopologyStorage::Installed(Arc::new(topology));
         state.generation = generation;
         drop(state);
         *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
